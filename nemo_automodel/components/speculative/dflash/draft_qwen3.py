@@ -29,7 +29,7 @@ mask that enforces this is built by the trainer wrapper in
 
 from __future__ import annotations
 
-from typing import Callable, Optional, Tuple
+from typing import Callable, Tuple
 
 import torch
 from torch import nn
@@ -46,6 +46,8 @@ from transformers.models.qwen3.modeling_qwen3 import (
     eager_attention_forward,
     rotate_half,
 )
+
+from nemo_automodel.components.speculative.dflash.target import resolve_text_config
 
 
 def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
@@ -71,6 +73,81 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     q_embed = (q * cos[..., -q_len:, :]) + (rotate_half(q) * sin[..., -q_len:, :])
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
+
+
+# Layer kinds whose cache a rejected block can be rewound out of by dropping KV
+# rows. Anything else -- notably the ``linear_attention`` layers the Qwen3.5
+# family interleaves -- carries a recurrent state that cropping cannot rewind.
+_REWINDABLE_LAYER_TYPES = frozenset({"full_attention", "sliding_attention", "chunked_attention"})
+
+
+def assert_target_supports_rollback(target: nn.Module) -> None:
+    """Reject targets whose cache cannot be rewound after a rejected block.
+
+    Speculative decoding verifies a whole block and then rewinds the target to
+    the accepted prefix. For attention layers that is just dropping KV rows, but
+    a linear-attention layer keeps a recurrent state that has already absorbed
+    the rejected tokens; ``Cache.crop`` truncates the KV entries and leaves that
+    state where it is. The target then predicts from a corrupted state, so the
+    "lossless" guarantee quietly stops holding -- greedy decoding drifts away
+    from the target's own output instead of reproducing it.
+
+    Training is unaffected: it is a single forward with no cache and no rewind.
+
+    Args:
+        target: The frozen verifier.
+
+    Raises:
+        ValueError: If the target has any layer whose state cropping cannot
+            rewind.
+    """
+    config = getattr(target, "config", None)
+    if config is None:
+        return
+    text_config = resolve_text_config(config)
+    layer_types = getattr(text_config, "layer_types", None)
+    if not layer_types:
+        return
+    unsupported = sorted(set(layer_types) - _REWINDABLE_LAYER_TYPES)
+    if unsupported:
+        raise ValueError(
+            f"Speculative decoding cannot verify against this target: its {', '.join(unsupported)} layers keep a "
+            "recurrent state that cropping the KV cache does not rewind, so a rejected block permanently corrupts "
+            "the target and the decoded output stops matching the target's own. Training against such a target is "
+            "fine (a single forward, no cache); serve the trained draft with an engine that rewinds hybrid state."
+        )
+
+
+def _sliding_window_mask(query: torch.Tensor, key: torch.Tensor, sliding_window: int) -> torch.Tensor:
+    """Band mask keeping keys within ``sliding_window`` of each query's position.
+
+    The draft's queries are the trailing ``q_len`` positions of the concatenated
+    ``[context | noise-block]`` key axis, so a query at row ``i`` sits at key
+    position ``k_len - q_len + i``. Both bounds are strict, matching transformers'
+    ``sliding_window_overlay`` and the reference DFlash decode mask. The draft is
+    non-causal, so the band is symmetric; the forward half is inert in practice
+    because the block is far shorter than any real window.
+
+    Args:
+        query: Tensor of shape [batch, heads, query, head_dim].
+        key: Tensor of shape [batch, kv_heads, key, head_dim], where ``key``
+            spans the context followed by the draft block.
+        sliding_window: Maximum absolute position distance, exclusive.
+
+    Returns:
+        Floating-point tensor of shape [1, 1, query, key], in ``query.dtype``;
+        ``0`` where attention is kept and ``-inf`` elsewhere. This additive
+        representation has the same semantics for eager, SDPA, and the dense
+        score-mask path of FlexAttention.
+    """
+    q_len, k_len = query.shape[-2], key.shape[-2]
+    query_position = torch.arange(q_len, device=query.device).unsqueeze(-1) + (k_len - q_len)
+    key_position = torch.arange(k_len, device=query.device).unsqueeze(0)
+    distance = query_position - key_position
+    keep = ((distance < sliding_window) & (-distance < sliding_window))[None, None]
+    zero = torch.zeros((), dtype=query.dtype, device=query.device)
+    neg_inf = torch.full((), float("-inf"), dtype=query.dtype, device=query.device)
+    return torch.where(keep, zero, neg_inf)
 
 
 class Qwen3DFlashAttention(nn.Module):
@@ -104,18 +181,25 @@ class Qwen3DFlashAttention(nn.Module):
         )
         self.q_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.sliding_window = None
+        # Training enforces the same window through the block mask
+        # (``components/attention/dflash_mask.py``); this covers the decode path,
+        # where no explicit mask is supplied. ``is_causal`` stays False regardless --
+        # the draft is non-causal by construction.
+        layer_types = getattr(config, "layer_types", None)
+        layer_type = layer_types[layer_idx] if layer_types else "full_attention"
+        window = getattr(config, "sliding_window", None)
+        self.sliding_window = int(window) if layer_type == "sliding_attention" and window else None
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         target_hidden: torch.Tensor,
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
-        attention_mask: Optional[torch.Tensor],
-        past_key_values: Optional[Cache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
+        attention_mask: torch.Tensor | None,
+        past_key_values: Cache | None = None,
+        cache_position: torch.LongTensor | None = None,
         **kwargs,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor | None]:
         bsz, q_len = hidden_states.shape[:-1]
         ctx_len = target_hidden.shape[1]
         q = self.q_proj(hidden_states).view(bsz, q_len, -1, self.head_dim)
@@ -133,6 +217,8 @@ class Qwen3DFlashAttention(nn.Module):
         if past_key_values is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs)
+        if attention_mask is None and self.sliding_window is not None:
+            attention_mask = _sliding_window_mask(q, k, self.sliding_window)
         attn_fn: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
             attn_fn = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
@@ -164,14 +250,14 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
 
     def forward(
         self,
-        target_hidden: Optional[torch.Tensor] = None,
-        hidden_states: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Cache] = None,
-        use_cache: Optional[bool] = False,
-        cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        target_hidden: torch.Tensor | None = None,
+        hidden_states: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_value: Cache | None = None,
+        use_cache: bool | None = False,
+        cache_position: torch.LongTensor | None = None,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs,
     ) -> torch.Tensor:
         residual = hidden_states
@@ -191,6 +277,52 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         return residual + hidden_states
+
+
+def build_qwen3_dflash_draft_config(
+    target_config,
+    *,
+    num_draft_layers: int,
+    num_target_layers: int,
+    block_size: int,
+    dflash_config: dict,
+    attention_backend: str,
+) -> Qwen3Config:
+    """Build the DFlash draft config for a Qwen3-shaped target.
+
+    The draft is a small non-causal Qwen3 stack that reuses the target's
+    architecture defaults (head_dim, rope_theta, rms_norm_eps, ...) and only
+    shrinks the depth.
+
+    Args:
+        target_config: The target's config.
+        num_draft_layers: Number of draft decoder layers.
+        num_target_layers: Depth of the target; recorded so a reloaded draft
+            config still describes which target it was trained on.
+        block_size: DFlash block size.
+        dflash_config: The recipe's DFlash block (``mask_token_id``,
+            ``target_layer_ids``, and any subclass extras such as Domino's
+            projector fields).
+        attention_backend: The draft's attention implementation; must agree with
+            the mask format the trainer builds.
+
+    Returns:
+        The draft ``Qwen3Config``.
+    """
+    draft_config = target_config.to_dict()
+    draft_config["architectures"] = ["Qwen3DFlashDraftModel"]
+    draft_config["num_hidden_layers"] = num_draft_layers
+    # ``layer_types``/``max_window_layers`` are sized to the target's depth;
+    # rebuild them for the (shallower) draft. The DFlash attention never uses
+    # sliding windows, so every draft layer is full attention.
+    draft_config["layer_types"] = ["full_attention"] * num_draft_layers
+    draft_config["max_window_layers"] = num_draft_layers
+    draft_config["num_target_layers"] = num_target_layers
+    draft_config["block_size"] = block_size
+    draft_config["dflash_config"] = dflash_config
+    draft_config_obj = Qwen3Config.from_dict(draft_config)
+    draft_config_obj._attn_implementation = attention_backend
+    return draft_config_obj
 
 
 def build_target_layer_ids(num_target_layers: int, num_draft_layers: int) -> list[int]:
@@ -218,12 +350,15 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
 
     config_class = Qwen3Config
     _no_split_modules = ["Qwen3DFlashDecoderLayer"]
+    # Block class the stack is built from. DFlash 2 swaps in a block that wraps
+    # each sublayer in a two-tap convolution; everything else is unchanged.
+    decoder_layer_cls: type[Qwen3DFlashDecoderLayer] = Qwen3DFlashDecoderLayer
 
     def __init__(self, config) -> None:
         super().__init__(config)
         self.config = config
         self.layers = nn.ModuleList(
-            [Qwen3DFlashDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            [self.decoder_layer_cls(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         dflash_config = getattr(config, "dflash_config", {}) or {}
         self.target_layer_ids = dflash_config.get(
@@ -234,7 +369,15 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
         self.rotary_emb = Qwen3RotaryEmbedding(config)
         self.fc = nn.Linear(len(self.target_layer_ids) * config.hidden_size, config.hidden_size, bias=False)
         self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.block_size = config.block_size
+        # The published drafters (DFlash and DFlash 2 alike) keep ``block_size``
+        # inside ``dflash_config`` and carry no top-level key, so read it there
+        # first; the top-level attribute is what this repo's own recipes have
+        # always written, and stays the fallback for checkpoints saved that way.
+        self.block_size = dflash_config.get("block_size", getattr(config, "block_size", None))
+        if self.block_size is None:
+            raise ValueError(
+                "DFlash draft config carries no block_size, neither in dflash_config nor at the top level."
+            )
         self.mask_token_id = dflash_config.get("mask_token_id", None)
         # Optional Domino correction head (ported from SpecForge#571). DFlash drafts
         # a block in parallel and is non-causal; the Domino head adds a *causal*
@@ -296,10 +439,10 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
     def forward(
         self,
         position_ids: torch.LongTensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        noise_embedding: Optional[torch.Tensor] = None,
-        target_hidden: Optional[torch.Tensor] = None,
-        past_key_values: Optional[Cache] = None,
+        attention_mask: torch.Tensor | None = None,
+        noise_embedding: torch.Tensor | None = None,
+        target_hidden: torch.Tensor | None = None,
+        past_key_values: Cache | None = None,
         use_cache: bool = False,
         **kwargs,
     ) -> torch.Tensor:
@@ -325,11 +468,12 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
         target: nn.Module,
         input_ids: torch.LongTensor,
         max_new_tokens: int,
-        stop_token_ids: Optional[list[int]],
+        stop_token_ids: list[int] | None,
         temperature: float,
     ) -> torch.LongTensor:
         """Block-parallel speculative decoding: draft a block, verify with the target, accept the matching prefix."""
         self.eval()
+        assert_target_supports_rollback(target)
         num_input_tokens = input_ids.shape[1]
         max_length = num_input_tokens + max_new_tokens
         block_size = self.block_size
@@ -338,8 +482,11 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
             (1, max_length + block_size), self.mask_token_id, dtype=torch.long, device=target.device
         )
         position_ids = torch.arange(output_ids.shape[1], device=target.device).unsqueeze(0)
-        past_key_values_target = DynamicCache()
-        past_key_values_draft = DynamicCache()
+        # See the DFlash 2 draft's spec_generate: a bare ``DynamicCache()`` gives
+        # every layer a plain attention cache, which a hybrid target (the Qwen3.5
+        # family interleaves ``linear_attention`` with ``full_attention``) rejects.
+        past_key_values_target = DynamicCache(config=getattr(target, "config", None))
+        past_key_values_draft = DynamicCache(config=self.config)
 
         # Prefill the target on the prompt.
         output = target(

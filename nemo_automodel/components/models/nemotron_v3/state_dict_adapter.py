@@ -89,6 +89,8 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
     Note: NemotronV3 uses 'mixer' instead of 'mlp' in layer paths.
     """
 
+    _supports_write_through_checkpoint_load = True
+
     def __init__(
         self,
         config,
@@ -146,7 +148,7 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
             key,
         )
 
-    def to_hf(self, state_dict: dict[str, Any], exclude_key_regex: Optional[str] = None, **kwargs) -> dict[str, Any]:
+    def to_hf(self, state_dict: dict[str, Any], exclude_key_regex: str | None = None, **kwargs) -> dict[str, Any]:
         """Convert from internal model state dict to HuggingFace format.
 
         Args:

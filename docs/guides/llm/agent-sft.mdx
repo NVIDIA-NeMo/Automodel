@@ -1,62 +1,185 @@
 ---
 title: "Multi-Turn Agent (Tool-Calling) SFT with NeMo AutoModel"
-description: "End-to-end multi-turn, function-calling SFT on Qwen2.5-3B with the glaive_toolcall dataset"
+description: "End-to-end multi-turn, function-calling SFT on Qwen2.5-3B with the glaive_toolcall and SynthTraces datasets"
 position: 4
 ---
 
-This guide fine-tunes **Qwen2.5-3B** for **multi-turn agentic tool use** with [NeMo AutoModel](https://github.com/NVIDIA-NeMo/Automodel): given a set of tool definitions and a conversation that interleaves tool calls and tool responses, the model learns to emit correct `tool_calls` (tool name + arguments) and to use the returned results across several turns.
+This guide explains how to fine-tune **Qwen2.5-3B** for **multi-turn agentic tool use** with [NeMo AutoModel](https://github.com/NVIDIA-NeMo/Automodel). The model receives tool definitions and a conversation that interleaves tool calls and responses. It learns to emit correct `tool_calls` (tool name and arguments) and use the returned results across several turns.
 
 <Note>
-This is the **multi-turn** counterpart to the single-turn [Function Calling with FunctionGemma](/recipes-e2e-examples/function-calling) guide. That guide maps one user query to one set of tool calls via `make_xlam_dataset`; this guide handles full multi-turn agent traces (`user → tool_call → tool response → assistant → ...`) via `make_agent_chat_dataset`.
+This is the **multi-turn** counterpart to the single-turn [Function Calling with FunctionGemma](/recipes-e2e-examples/function-calling) guide. That guide maps one user query to one set of tool calls using `make_xlam_dataset`. This guide handles full multi-turn agent traces (`user → tool_call → tool response → assistant → ...`) using `make_agent_chat_dataset`.
+
 </Note>
 
-## What is Multi-Turn Agent SFT?
+## Multi-Turn Agent SFT
 
-A multi-turn agent trace contains, in order:
+A multi-turn agent trace contains the following elements in order:
 
-- a **user** request,
-- one or more **assistant** turns that may emit `tool_calls` (with parallel calls in a single turn),
-- **tool** responses paired back to those calls, and
-- a final **assistant** answer that uses the tool results.
+- A **user** request
+- One or more **assistant** turns that might emit `tool_calls` (with parallel calls in a single turn)
+- **Tool** responses paired back to those calls
+- A final **assistant** answer that uses the tool results
 
-The training data is a set of such traces plus the **tool schema** available to the model. The dataset adapter renders each trace through the tokenizer's chat template with `answer_only_loss_mask=True`, so **only assistant and tool-call tokens contribute to the loss** — `user` and `tool` tokens are masked out.
+The training data is a set of such traces plus the **tool schema** available to the model. The dataset adapter renders each trace through the tokenizer's chat template with `answer_only_loss_mask=True`. Only assistant and tool-call tokens contribute to the loss. The adapter masks `user` and `tool` tokens.
 
-## The Task
+## Define the Fine-Tuning Task
 
-We fine-tune on the [llamafactory/glaive_toolcall_en](https://huggingface.co/datasets/llamafactory/glaive_toolcall_en) dataset (ShareGPT function-calling traces).
+You fine-tune on the [llamafactory/glaive_toolcall_en](https://huggingface.co/datasets/llamafactory/glaive_toolcall_en) dataset, which contains ShareGPT function-calling traces.
 
-| | Behavior |
+The following table compares the target behavior with the base model's behavior:
+
+| Model | Behavior |
 |---|---|
 | **Base model** | Often answers in free-form text, invents tool names, or emits malformed argument JSON. |
 | **After SFT** | Emits structured `tool_calls` whose names and arguments match the provided tool schema, and chains them across turns. |
 
-## Guide Overview
+## Generate Coding-Agent Traces on NeMo Repositories
 
-| Step | Description |
-|------|-------------|
-| **Step 0** | Environment setup |
-| **Step 1** | Explore the `glaive_toolcall` dataset |
-| **Step 2** | Evaluate the base model (before fine-tuning) |
-| **Step 3** | Training configuration |
-| **Step 4** | Launch fine-tuning |
-| **Step 5** | Evaluate the fine-tuned model |
-| **Step 6** | Compare results |
+The [`julien-c/synthtraces`](https://github.com/julien-c/synthtraces) generator pairs a Pi coding agent with a local user model. The coding agent inspects a checked-out repository with `read` and `bash`, while the user model asks follow-up questions. Pi writes each completed session as a trace under `dataset/sessions`.
+
+To generate NeMo-specific traces, fork that generator and configure its repository matrix for these repositories:
+
+```text
+https://github.com/NVIDIA-NeMo/Automodel.git
+https://github.com/NVIDIA/NeMo.git
+```
+
+The upstream generator lists bare repository names in `src/constants.ts` (`TOP_HF_REPOS`) and hard-codes the owner when it builds the clone URL in `src/pull.ts`, which resolves every entry against `https://github.com/huggingface/<name>.git`. Because the NeMo repositories live under different owners, change both locations in your fork so each matrix entry carries a complete owner and repository pair and `pull.ts` uses that owner instead of the fixed one. Keep the generated Pi session files unchanged. Hugging Face converts those trace files into the OpenAI-format `messages` rows consumed by `make_agent_chat_dataset`.
+
+After configuring the matrix, install and prepare the generator:
+
+```bash
+npm install
+```
+
+```bash
+npm run pull
+```
+
+The coding agent runs on the Hugging Face router, so export a token before generating. `src/single-session.ts` raises `HF_TOKEN is not set` without it:
+
+```bash
+export HF_TOKEN=<your-hugging-face-token>
+```
+
+The user model runs locally under llama.cpp. Serve the first entry of `LOCAL_MODELS` on the port the generator expects:
+
+```bash
+llama-server -hf ggml-org/Qwen3.6-27B-GGUF:Q8_0 --port 8080
+```
+
+`src/constants.ts` reads `LLAMA_BASE_URL` and falls back to `http://localhost:8080/v1`, so set that variable if you serve the model elsewhere. `src/generate.ts` always picks `LOCAL_MODELS[0]` as the user model, so serve that entry rather than another one from the list.
+
+<Tip>
+**Serving the user model with vLLM or SGLang.** llama.cpp is not a requirement. `src/single-session.ts` registers the user model as a generic OpenAI provider (`api: "openai-completions"`) whose base URL is `LLAMA_BASE_URL`, so any OpenAI-compatible server works and no generator code has to change:
+
+```bash
+vllm serve Qwen/Qwen3.6-27B --served-model-name Qwen/Qwen3.6-27B --port 8080 --default-chat-template-kwargs '{"enable_thinking": false}'
+```
+
+```bash
+export LLAMA_BASE_URL=http://localhost:8080/v1
+```
+
+Disable thinking on the server, as shown above. The generator registers the user model with `reasoning: false` and opens its session with `thinkingLevel: "off"`, so it never sends the control that would turn thinking off at inference time. The packaged GGUF build answers without thinking anyway, which is why llama.cpp needs no flag, but a stock Qwen checkpoint served directly has it enabled by default. Leave it on and every generated user turn arrives wrapped in `</think>` and runs to thousands of characters instead of a short question, which lands in the persisted trace and then in the training data. The thinking block also stays in the message content rather than in a separate reasoning field, because the provider registration declares no reasoning support and the server parses none, so `lastAssistantText()` picks it up along with the question. On SGLang, disable thinking through the equivalent server-side option. As an alternative to the server flag, register the user model with Qwen chat-template compatibility (`reasoning: true` plus `compat.thinkingFormat: "qwen-chat-template"`) and keep the session thinking level off.
+
+Two things to keep aligned. `LOCAL_MODELS` ships GGUF repository ids, which vLLM supports only partially and SGLang does not serve, so replace `LOCAL_MODELS[0]` with the unquantized repository you actually serve. The generator sends that entry as the model id, so the served model name has to match it exactly. The placeholder `apiKey: "no-key"` in the provider registration is harmless, because neither server requires a key by default.
+
+</Tip>
+
+<Warning>
+**Make provider failures fail the run.** `runSession` awaits each `prompt()` without inspecting the
+result, so a provider error (an exhausted quota, a rate limit, an HTTP 402 or 429) produces an
+assistant message whose `stopReason` is `error`, and the loop moves on. The process still exits 0,
+still prints `Trace saved to ...`, and the batch path still counts the session as complete, so a
+truncated conversation reaches the dataset looking like a finished one. Add the check in your fork,
+next to the matrix changes above:
+
+```ts
+function assertCompleted(session: AgentSession, who: string) {
+	const last = session.messages.findLast((message) => message.role === "assistant");
+	if (last?.role === "assistant" && (last.stopReason === "error" || last.stopReason === "aborted")) {
+		throw new Error(`${who} turn ended with stopReason=${last.stopReason}`);
+	}
+}
+```
+
+Call it after each `prompt()` in the turn loop. The run then exits non-zero on the first failed
+turn instead of printing `Trace saved to ...`, so the batch path cannot count it as complete. Pi
+streams the session file as the conversation goes, so a partial file still lands on disk and
+should be discarded rather than uploaded.
+
+</Warning>
+
+With the server up, generate a small validation batch before scaling up:
+
+```bash
+BATCH_SIZE=8 CONCURRENCY=2 node src/generate.ts
+```
+
+Upload the generated dataset with the current Hugging Face CLI:
+
+```bash
+hf upload <owner>/<dataset> dataset . --repo-type dataset --exclude '.git/*'
+```
+
+### Train on the Generated Traces
+
+Use the ready-made config at [`examples/llm_finetune/agent/qwen2_5_3b_synthtraces.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/agent/qwen2_5_3b_synthtraces.yaml). It reads `julien-c/synthtraces` through `refs/convert/parquet` and renders traces with [`qwen2_5_synthtraces_chat_template.jinja`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/agent/qwen2_5_synthtraces_chat_template.jinja):
+
+```bash
+automodel --nproc-per-node=8 examples/llm_finetune/agent/qwen2_5_3b_synthtraces.yaml 2>&1 | tee train_synthtraces.log
+```
+
+To train on your own generated dataset instead, override `dataset.dataset_name` and `validation_dataset.dataset_name`. The dataset must expose parsed OpenAI-format rows through its normal dataset revision or through `refs/convert/parquet`.
+
+A short run of this recipe produces training output in this shape:
+
+```text
+step  0 | epoch 0 | loss 1.2708 | grad_norm 3.0633 | lr 4.00e-06 | mem 34.45 GiB | tps 210.68/gpu  | num_label_tokens 4707
+step  6 | epoch 0 | loss 1.3184 | grad_norm 2.0623 | lr 9.52e-06 | mem 35.89 GiB | tps 2734.08/gpu | num_label_tokens 42963
+step  9 | epoch 0 | loss 1.1696 | grad_norm 1.6721 | lr 8.59e-06 | mem 48.55 GiB | tps 2075.14/gpu | num_label_tokens 38437
+step 10 | epoch 0 | loss 1.2296 | grad_norm 1.6987 | lr 8.19e-06 | mem 36.24 GiB | tps 830.26/gpu  | num_label_tokens 46638
+
+Updated LOWEST_VAL checkpoint symlink to epoch_0_step_29 (val_loss=1.1862)
+```
+
+<Warning>
+This recipe reports `loss` and `val_loss` only. It declares no `tool_call_eval` block, so none of the `tool_call/*` metrics described in [Monitor Training](#monitor-training) appear in its logs. Those metrics belong to the `glaive_toolcall` walkthrough below, which supplies the evaluator and the tool schema it scores against.
+
+</Warning>
+
+<Warning>
+The SynthTraces chat template renders assistant `reasoning_content` as `<think>` inside its `{% generation %}` block, and `mask_reasoning_content` defaults to `false`. Reasoning tokens therefore contribute to the loss, and the fine-tuned model learns to emit `<think>` blocks. In the published `julien-c/synthtraces` training split, roughly two-thirds of the traces carry reasoning content, so this is the common case rather than an edge case. Set `dataset.mask_reasoning_content: true` to keep reasoning in the prompt but out of the loss, or `dataset.drop_history_reasoning_content: true` to strip prior-turn reasoning from the prompt entirely.
+
+</Warning>
+
+<Note>
+Trace generation is intentionally maintained by the SynthTraces project. NeMo AutoModel consumes the generated traces and does not vendor the Pi runtime, llama.cpp server, or remote inference provider.
+
+</Note>
 
 ## Hardware Requirements
 
-- **Full-parameter SFT**: the example below shards across 8 GPUs with FSDP2. Qwen2.5-3B is small enough to also train on a single 80 GB GPU, which runs unsharded (FSDP2 only applies across multiple GPUs).
-- **LoRA / PEFT**: trainable on a single GPU (see the [PEFT variant](#peft-lora-variant) at the end).
-- `glaive_toolcall_en` is small (a few thousand traces), so a full pass is fast.
+Review the following hardware requirements:
+
+- **Full-parameter SFT**: Both recipes shard across 8 GPUs with FSDP2. Qwen2.5-3B can also train unsharded on a single 80 GB GPU because FSDP2 applies only across multiple GPUs.
+- **PEFT with LoRA**: You can train on a single GPU. See [Use PEFT with LoRA](#use-peft-with-lora).
+- **Dataset size**: Both datasets hold a few thousand traces, so a full pass is fast. SynthTraces traces are long multi-turn coding sessions, so its recipe uses `seq_length: 8192` against `4096` for `glaive_toolcall_en`.
+
+The rest of this guide walks through the `glaive_toolcall_en` recipe, which pairs a tool schema with a generation-based tool-call accuracy evaluator. The SynthTraces recipe covered in [Train on the Generated Traces](#train-on-the-generated-traces) shares the same adapter and training loop, but supplies no tool schema, so it reports `loss` and `val_loss` only.
 
 ---
 
-## Step 0 — Environment Setup
+## Set Up Your Environment
 
 This guide runs **inside** the NeMo AutoModel Docker container:
 
 ```bash
 docker run -it --rm --gpus all --ipc=host --network host -v $(pwd):/workspace nvcr.io/nvidia/nemo-automodel:26.06.00
 ```
+
+After the container starts, log in to Hugging Face and change to the repository directory:
 
 ```bash
 huggingface-cli login   # for gated model/dataset access if needed
@@ -65,11 +188,12 @@ cd /opt/Automodel
 
 <Tip>
 Outside the container, install from source with `uv` (the project standard): `uv sync` from a checkout of the repo. Avoid `pip install` for development setups.
+
 </Tip>
 
 ---
 
-## Step 1 — Explore the `glaive_toolcall` Dataset
+## Explore the `glaive_toolcall` Dataset
 
 Each row carries a `tools` schema (JSON string) and a ShareGPT `conversations` list whose `from` field is one of `human`, `gpt`, `function_call`, or `observation`.
 
@@ -87,9 +211,9 @@ for turn in ex["conversations"]:
     print(f"  {turn['from']:>14} | {turn['value'][:70]}")
 ```
 
-Illustrative output:
+The following output is illustrative:
 
-```
+```text
 train: 5000 traces
 fields: ['conversations', 'tools', 'system']
 
@@ -101,9 +225,9 @@ tools: [{"name": "get_stock_price", "description": "Get the current stock price"
               gpt | The current stock price of Apple (AAPL) is $150.75.
 ```
 
-### How the adapter renders a trace
+### Review How the Adapter Renders a Trace
 
-`make_agent_chat_dataset` converts each trace to OpenAI chat-completions format (merging consecutive `function_call` turns into one assistant message with parallel `tool_calls`, pairing `observation` turns back to those calls), then tokenizes with `answer_only_loss_mask=True`:
+`make_agent_chat_dataset` converts each trace to the OpenAI chat-completions format. It merges consecutive `function_call` turns into one assistant message with parallel `tool_calls` and pairs `observation` turns with those calls. The following example demonstrates this process and tokenizes the trace with `answer_only_loss_mask=True`:
 
 ```python
 from transformers import AutoTokenizer
@@ -115,7 +239,7 @@ dataset = make_agent_chat_dataset(
     dataset_name="llamafactory/glaive_toolcall_en",
     split="train[:100]",
     seq_length=4096,
-    truncation=True,   # see the seq_length note in Step 3
+    truncation=True,   # See the seq_length note in Configure Your Training.
 )
 
 sample = dataset[0]
@@ -124,20 +248,20 @@ supervised = sum(1 for x in sample["labels"] if x != -100)
 print(f"supervised tokens: {supervised} / {len(sample['labels'])}")
 ```
 
-This prints (the dataset injects a 4th `___PAD_TOKEN_IDS___` key alongside the standard three):
+The code prints the following output, including the fourth `___PAD_TOKEN_IDS___` key that the dataset injects:
 
 ```text
 keys: ['input_ids', 'labels', 'attention_mask', '___PAD_TOKEN_IDS___']
 supervised tokens: 127 / 502
 ```
 
-Only the assistant/tool-call spans are supervised; the user prompt and tool responses are `-100` in `labels`.
+Only the assistant and tool-call spans are supervised. The user prompt and tool responses are `-100` in `labels`.
 
 ---
 
-## Step 2 — Evaluate the Base Model (Before Fine-Tuning)
+## Evaluate the Base Model Before Fine-Tuning
 
-Render a held-out prompt **up to the point the model should call a tool**, pass the `tools` schema through the chat template, and generate:
+Use the following code to render a held-out prompt **up to the point the model should call a tool**, pass the `tools` schema through the chat template, and generate the response:
 
 ```python
 import json
@@ -185,28 +309,30 @@ I'm looking up Apple's stock price. 🚀
 ... (the HTML block repeats until the token budget is exhausted)
 ```
 
-Instead of a clean `get_stock_price(symbol="AAPL")` tool call, the base model answers in prose and fabricates content — exactly the failure fine-tuning fixes.
+Instead of a clean `get_stock_price(symbol="AAPL")` tool call, the base model answers in prose and fabricates content. Fine-tuning corrects this failure.
 
 <Note>
-Greedy output is deterministic for a given model snapshot + Transformers version, so you may see slight variation from the trace above.
+Greedy output is deterministic for a given model snapshot and Transformers version, so you might see slight variation from the trace above.
+
 </Note>
 
 <Note>
-For a rigorous, repeatable score, NeMo AutoModel ships a generation-based **tool-call accuracy** evaluator (`nemo_automodel.components.eval.tool_call_evaluator.ToolCallAccuracyEvaluator`) that builds held-out prompts with `make_agent_chat_eval_samples`, parses generated tool calls with `nemo_automodel.components.eval.tool_call_parser`, and compares against the ground-truth calls. Step 4 wires it to run automatically during training.
+For a rigorous, repeatable score, NeMo AutoModel ships a generation-based **tool-call accuracy** evaluator (`nemo_automodel.components.eval.tool_call_evaluator.ToolCallAccuracyEvaluator`). It builds held-out prompts with `make_agent_chat_eval_samples`, parses generated tool calls with `nemo_automodel.components.eval.tool_call_parser`, and compares them with the ground-truth calls. The [Launch Fine-Tuning](#launch-fine-tuning) workflow runs it automatically during training.
+
 </Note>
 
 ---
 
-## Step 3 — Training Configuration
+## Configure Your Training
 
-Use the ready-made config at [`examples/llm_finetune/agent/qwen2_5_3b_function_calling.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/agent/qwen2_5_3b_function_calling.yaml). The key blocks:
+Use the ready-made config at [`examples/llm_finetune/agent/qwen2_5_3b_function_calling.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/agent/qwen2_5_3b_function_calling.yaml). The configuration file contains the following key blocks:
 
 ```yaml
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: Qwen/Qwen2.5-3B
   attn_implementation: sdpa
-  output_hidden_states: true   # required by FusedLinearCrossEntropy below
+  output_hidden_states: true   # Required by FusedLinearCrossEntropy below.
 
 loss_fn:
   _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
@@ -219,7 +345,7 @@ dataset:
   tokenizer:
     pretrained_model_name_or_path: Qwen/Qwen2.5-3B
 
-# Generation-based tool-call accuracy eval, runs at every val step alongside val_loss.
+# The generation-based tool-call accuracy evaluation runs at every validation step alongside val_loss.
 tool_call_eval:
   _target_: nemo_automodel.components.eval.tool_call_evaluator.ToolCallAccuracyEvaluator
   dataset_name: llamafactory/glaive_toolcall_en
@@ -230,57 +356,65 @@ tool_call_eval:
 ```
 
 <Note>
-**Why `answer_only_loss_mask`?** The agent dataset supervises only the tokens the model must *produce* — assistant text and `tool_calls`. User turns and tool responses are masked to `-100`, so the model is never trained to "predict the environment". This is on by default inside `make_agent_chat_dataset`.
+**Why `answer_only_loss_mask`?** The agent dataset uses `answer_only_loss_mask` to supervise only the tokens that the model must *produce* (assistant text and `tool_calls`). User turns and tool responses are masked to `-100`, so the model is never trained to "predict the environment." This behavior is enabled by default in `make_agent_chat_dataset`.
+
 </Note>
 
 <Tip>
 `make_agent_chat_dataset` exposes three flags worth knowing for agent traces:
 
-- `train_on_last_turn_only` — supervise only the final assistant turn (`mask_history`).
-- `mask_reasoning_content` — render assistant `reasoning_content` (thinking) into the prompt but exclude it from the loss.
-- `drop_history_reasoning_content` — strip prior-turn thinking from the prompt entirely (matches inference). Most coherent together with `train_on_last_turn_only=true`.
+- `train_on_last_turn_only`: Supervises only the final assistant turn (`mask_history`).
+- `mask_reasoning_content`: Renders assistant `reasoning_content` (thinking) into the prompt but excludes it from the loss. Defaults to `false`, so a chat template that emits `reasoning_content` inside its `{% generation %}` block trains the model to reproduce that reasoning. The SynthTraces template does exactly this; see the warning in [Train on the Generated Traces](#train-on-the-generated-traces).
+- `drop_history_reasoning_content`: Strips prior-turn thinking from the prompt entirely to match inference. This option works best with `train_on_last_turn_only=true`.
+
 </Tip>
 
 <Warning>
-`seq_length` only takes effect when **`truncation: true`** (to cap length) or `padding: max_length` (to pad). With the defaults (`truncation: false`, `padding: false`), `seq_length` is ignored and long traces pass through uncapped — risking OOM. Set `truncation: true` if you want a hard cap.
+`seq_length` only takes effect when **`truncation: true`** (to cap length) or `padding: max_length` (to pad). With the defaults (`truncation: false`, `padding: false`), `seq_length` is ignored, and long traces pass through uncapped. This behavior risks an out-of-memory error. Set `truncation: true` if you want a hard cap.
+
 </Warning>
 
 ---
 
-## Step 4 — Launch Fine-Tuning
+## Launch Fine-Tuning
 
 ```bash
 automodel --nproc-per-node=8 examples/llm_finetune/agent/qwen2_5_3b_function_calling.yaml 2>&1 | tee train_agent_sft.log
 ```
 
-### What to watch
+### Monitor Training
+
+Monitor the following metrics:
 
 - **`loss`** should fall steadily as the model learns the tool-call format.
-- **`tool_call/accuracy`** (and related `tool_call/*` keys) report generation-based tool-call correctness at each validation step — this is the metric that distinguishes "format learned" from "tools actually correct".
+- **`val_loss`** is reported at every validation step.
 
 <Note>
-Under **FSDP2** (the default strategy here), the in-loop generation eval is skipped unless you set `tool_call_eval.run_on_fsdp2: true`, because in-loop generation with sharded weights is expensive. If you keep it off, evaluate tool-call accuracy from a saved checkpoint instead (Step 5).
+The command above runs under **FSDP2**, where the in-loop generation evaluation is skipped by default because generation with sharded weights is expensive. `tool_call_eval.run_on_fsdp2` defaults to `false`, so **`tool_call/accuracy` and the other `tool_call/*` keys do not appear in the logs of the command above**. Set `tool_call_eval.run_on_fsdp2: true` to compute them in-loop, or evaluate tool-call accuracy from a saved checkpoint as described in [Evaluate the Fine-Tuned Model](#evaluate-the-fine-tuned-model).
+
 </Note>
 
-Illustrative training log (replace with your run):
+The training log has this shape. Values depend on your run:
 
-```
+```text
 step    0 | loss 1.84 | grad_norm 12.1 | lr 1.0e-6 | mem 41 GiB | tps/gpu 380
 step   50 | loss 0.42 | grad_norm  4.3 | lr 9.8e-6 | mem 41 GiB | tps/gpu 410
 step  200 | loss 0.21 | grad_norm  2.1 | lr 7.4e-6 | mem 41 GiB | tps/gpu 412
 step  500 | loss 0.14 | grad_norm  1.6 | lr 3.1e-6 | mem 41 GiB | tps/gpu 415
 
 Validation:
-  step 100 | val_loss 0.23 | tool_call/accuracy 0.61
-  step 300 | val_loss 0.18 | tool_call/accuracy 0.78
-  step 500 | val_loss 0.16 | tool_call/accuracy 0.83
+  step 100 | val_loss 0.23
+  step 300 | val_loss 0.18
+  step 500 | val_loss 0.16
 ```
 
-The example does not override checkpoint settings, so checkpoints are written under the default `checkpoints/` root with `save_consolidated: final`. Every Safetensors checkpoint includes `model/consolidate.sh`, but only the final checkpoint is exported inline to `model/consolidated/`. The root also contains `LATEST` and `LOWEST_VAL` symlinks.
+With `tool_call_eval.run_on_fsdp2: true`, each validation line also carries the `tool_call/*` keys.
+
+The example does not override checkpoint settings, so checkpoints are written under the default `checkpoints/` root with `save_consolidated: final`. Every Safetensors checkpoint includes `model/consolidate.sh`. Only the final checkpoint is exported inline to `model/consolidated/`. The root also contains `LATEST` and `LOWEST_VAL` symlinks.
 
 ---
 
-## Step 5 — Evaluate the Fine-Tuned Model
+## Evaluate the Fine-Tuned Model
 
 `LOWEST_VAL` can point to an intermediate sharded checkpoint. Consolidate that checkpoint before loading it with Hugging Face:
 
@@ -288,7 +422,7 @@ The example does not override checkpoint settings, so checkpoints are written un
 bash checkpoints/LOWEST_VAL/model/consolidate.sh
 ```
 
-Then load the generated HF-compatible directory and re-run the Step 2 prompt; the fine-tuned model should now emit a clean tool call:
+Use the following code to load the generated Hugging Face-compatible directory and rerun the base-model evaluation prompt:
 
 ```python
 import os, torch
@@ -300,20 +434,20 @@ consolidated = os.path.join(CKPT, "model", "consolidated")
 tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-3B")
 model = AutoModelForCausalLM.from_pretrained(consolidated, torch_dtype=torch.bfloat16, device_map="auto").eval()
 
-# same `messages` + `tools` as Step 2
+# Use the same messages and tools from the base-model evaluation.
 inputs = tok.apply_chat_template(messages, tools=tools, add_generation_prompt=True, return_tensors="pt", return_dict=True).to(model.device)
 with torch.inference_mode():
     out = model.generate(**inputs, max_new_tokens=256, do_sample=False)
 print(tok.decode(out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True))
 ```
 
-Expected (fine-tuned): a structured call such as `get_stock_price` with `{"symbol": "AAPL"}`.
+The fine-tuned model should emit a structured call such as `get_stock_price` with `{"symbol": "AAPL"}`.
 
 ---
 
-## Step 6 — Results Comparison
+## Compare Results
 
-Illustrative tool-call accuracy on a held-out slice (replace with your run):
+Replace the placeholders in the following table with tool-call accuracy values from your run:
 
 | Metric | Base | Fine-Tuned |
 |--------|------|-----------|
@@ -322,12 +456,13 @@ Illustrative tool-call accuracy on a held-out slice (replace with your run):
 | Overall tool-call accuracy | ~0.20 | ~0.83 |
 
 <Note>
-The numbers above are placeholders to show the expected *shape* of the result (base low, fine-tuned high). Fill in your own from the `tool_call/*` metrics in the training log or a checkpoint eval.
+The numbers above are placeholders that show the expected *shape* of the result (low for the base model and high for the fine-tuned model). Replace them with values from the `tool_call/*` metrics in the training log or a checkpoint evaluation.
+
 </Note>
 
 ---
 
-## PEFT (LoRA) variant
+## Use PEFT with LoRA
 
 For a single-GPU run, use the LoRA config [`examples/llm_finetune/agent/qwen2_5_3b_function_calling_lora.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/agent/qwen2_5_3b_function_calling_lora.yaml), which adds a `peft` block on top of the same dataset and eval setup:
 

@@ -1,9 +1,9 @@
 ---
 title: "GLM-5 / GLM-5.1 / GLM-5.2 (MoE + DSA)"
-description: ""
+description: "Fine-tune GLM-5, GLM-5.1, and GLM-5.2 mixture-of-experts models with DeepSeek-style MLA and DSA on NeMo AutoModel."
 slug: model-coverage/large-language-models/thudm/glm-5-moe-dsa
 ---
-[GLM-5](https://huggingface.co/zai-org/GLM-5), [GLM-5.1](https://huggingface.co/zai-org/GLM-5.1), and [GLM-5.2](https://huggingface.co/zai-org/GLM-5.2) are Zhipu AI's open-source large Mixture-of-Experts models featuring a DeepSeek-style MLA (Multi-head Latent Attention) + DSA (Dynamic Sparse Attention) architecture. GLM-5.2 uses the same `glm_moe_dsa` AutoModel architecture with IndexShare DSA support, optional TileLang sparse kernels, packed-sequence training, and context-parallel long-context recipes.
+[GLM-5](https://huggingface.co/zai-org/GLM-5), [GLM-5.1](https://huggingface.co/zai-org/GLM-5.1), and [GLM-5.2](https://huggingface.co/zai-org/GLM-5.2) are Zhipu AI's open-source large Mixture-of-Experts models featuring a DeepSeek-style MLA (Multi-head Latent Attention) + DSA (Dynamic Sparse Attention) architecture. GLM-5.2 uses the same `glm_moe_dsa` AutoModel architecture with IndexShare DSA support, optional TileLang or cuDNN sparse kernels, packed-sequence training, and context-parallel long-context recipes.
 
 <Info>
 
@@ -11,24 +11,27 @@ slug: model-coverage/large-language-models/thudm/glm-5-moe-dsa
 |---|---|
 | **Task** | Text Generation (MoE) |
 | **Architecture** | `GlmMoeDsaForCausalLM` |
-| **Parameters** | large MoE, routed sparse experts |
+| **Parameters** | Large MoE, routed sparse experts |
 | **HF Org** | [zai-org](https://huggingface.co/zai-org) |
 
 </Info>
 
 ## Key Features
 
-- **Mixture of Experts (MoE)** with DeepSeek-style MLA and sparse DSA attention
-- **IndexShare DSA for GLM-5.2**: shared DSA layers reuse the previous full layer's top-k sparse attention selection, including pipeline-parallel carry support
-- **Optional TileLang kernels** for GLM-5.2 DSA indexer and sparse MLA paths through `backend.attn: tilelang`
-- **Packed-sequence and context-parallel recipes** for 4K and 32K Tulu3-style SFT runs
-- **Large-scale parallelism** with FSDP2, Expert Parallelism, Pipeline Parallelism, and optional Context Parallelism
+GLM-5 family models in NeMo AutoModel include the following capabilities:
+
+- **Mixture-of-Experts (MoE)**: DeepSeek-style MLA and sparse DSA attention
+- **IndexShare DSA for GLM-5.2**: Shared DSA layers reuse the previous full layer's top-k sparse attention selection, including pipeline-parallel carry support
+- **Optional TileLang kernels**: GLM-5.2 DSA indexer and sparse MLA paths through `backend.attn: tilelang`
+- **Optional cuDNN DSA indexer and FlashMLA sparse attention**: Available on SM90+ GPUs through `backend.attn: cudnn`
+- **Packed-sequence and context-parallel recipes**: Support for 4K and 32K Tulu3-style SFT runs
+- **Large-scale parallelism**: FSDP2, Expert Parallelism, Pipeline Parallelism, and optional Context Parallelism
 
 ## Available Models
 
 - **GLM-5** (`GlmMoeDsaForCausalLM`)
-- **GLM-5.1** (`GlmMoeDsaForCausalLM`): updated weights
-- **GLM-5.2** (`GlmMoeDsaForCausalLM`): IndexShare DSA, TileLang sparse-kernel recipes, and long-context CP coverage
+- **GLM-5.1** (`GlmMoeDsaForCausalLM`): Updated weights
+- **GLM-5.2** (`GlmMoeDsaForCausalLM`): IndexShare DSA, TileLang and cuDNN sparse kernels, and long-context CP coverage
 
 ## Example HF Models
 
@@ -42,15 +45,16 @@ slug: model-coverage/large-language-models/thudm/glm-5-moe-dsa
 
 | Recipe | Description |
 |---|---|
-| [glm_5.2_tulu3_32k_tilelang_cp8.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.2_tulu3_32k_tilelang_cp8.yaml) | SFT — GLM-5.2 on Tulu3 with packed 32K sequences, CP=8, TileLang DSA, EP=64, PP=4 |
-| [glm_5.2_tulu3_4k_tilelang_100k.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.2_tulu3_4k_tilelang_100k.yaml) | SFT — GLM-5.2 on Tulu3 with packed 4K sequences and TileLang DSA |
-| [glm_5.2_hellaswag_pp.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.2_hellaswag_pp.yaml) | SFT — GLM-5.2 on HellaSwag with EP=64, PP=4 on 32 nodes |
-| [glm_5_hellaswag_pp.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5_hellaswag_pp.yaml) | SFT — GLM-5 with EP=64, PP=4 on 32 nodes |
-| [glm_5.1_hellaswag_pp.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.1_hellaswag_pp.yaml) | SFT — GLM-5.1 with EP=64, PP=4 on 32 nodes |
+| [glm_5.2_tulu3_32k_tilelang_cp8.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.2_tulu3_32k_tilelang_cp8.yaml) | SFT for GLM-5.2 on Tulu3 with packed 32K sequences, CP=8, TileLang DSA, EP=64, and PP=4 |
+| [glm_5.2_tulu3_4k_tilelang_100k.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.2_tulu3_4k_tilelang_100k.yaml) | SFT for GLM-5.2 on Tulu3 with packed 4K sequences and TileLang DSA |
+| [glm_5.2_tulu3_4k_cudnn_100k.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.2_tulu3_4k_cudnn_100k.yaml) | SFT for GLM-5.2 on Tulu3 with packed 4K sequences and cuDNN DSA + FlashMLA |
+| [glm_5.2_hellaswag_pp.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.2_hellaswag_pp.yaml) | SFT for GLM-5.2 on HellaSwag with EP=64 and PP=4 on 32 nodes |
+| [glm_5_hellaswag_pp.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5_hellaswag_pp.yaml) | SFT for GLM-5 with EP=64 and PP=4 on 32 nodes |
+| [glm_5.1_hellaswag_pp.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.1_hellaswag_pp.yaml) | SFT for GLM-5.1 with EP=64 and PP=4 on 32 nodes |
 
 ## Parallel Setup
 
-The HellaSwag recipes scale training using Expert Parallelism and Pipeline Parallelism (EP=64, PP=4 across 32 nodes of 8× H100 GPUs). The long-context GLM-5.2 recipe additionally enables CP=8, packed THD batches, and the TileLang DSA path.
+The HellaSwag recipes scale training using Expert Parallelism and Pipeline Parallelism (EP=64, PP=4 across 32 nodes of 8× H100 GPUs). The long-context GLM-5.2 recipe also enables CP=8, packed THD batches, and the TileLang DSA path.
 
 ```yaml
 distributed:
@@ -81,17 +85,17 @@ distributed:
 model:
   pretrained_model_name_or_path: zai-org/GLM-5.2
   backend:
-    attn: tilelang
+    attn: tilelang  # Use cudnn for the cuDNN DSA + FlashMLA path.
     linear: torch
     rms_norm: torch_fp32
     rope_fusion: false
-    enable_deepep: true
+    dispatcher: hybridep
     gate_precision: float32
 ```
 
 ## Try with NeMo AutoModel
 
-**1. Clone and install from source** ([full instructions](/get-started/installation)):
+1. Clone and install from source ([full instructions](/get-started/installation)):
 
 ```bash
 git clone https://github.com/NVIDIA-NeMo/Automodel.git
@@ -99,19 +103,30 @@ cd Automodel
 uv sync --locked --all-groups --all-extras
 ```
 
+The cuDNN backend also requires FlashMLA's `flash_mla_sparse_fwd`, which is not
+published as a complete source distribution on PyPI. Install the tested revision with its
+submodules before selecting `backend.attn: cudnn`:
+
+```bash
+git clone --recursive https://github.com/deepseek-ai/FlashMLA.git /tmp/FlashMLA
+git -C /tmp/FlashMLA checkout b7643bd54521f563b839b98289b5cd048c062ba2
+git -C /tmp/FlashMLA submodule update --init --recursive
+uv pip install --no-build-isolation /tmp/FlashMLA
+```
+
 <Note>
 This is a long-context multi-node recipe that uses CP=8, EP=64, and PP=4. See the [Launcher Guide](/job-launchers/slurm-cluster) for multi-node setup.
 
 </Note>
 
-**2. Run the recipe** from inside the repo:
+2. Run the recipe from inside the repo:
 
 ```bash
 uv run automodel --nproc-per-node=8 examples/llm_finetune/glm/glm_5.2_tulu3_32k_tilelang_cp8.yaml
 ```
 
 <Accordion title="Run with Docker">
-**1. Pull the container** and mount a checkpoint directory:
+1. Pull the container and mount a checkpoint directory:
 
 ```bash
 docker run --gpus all -it --rm \
@@ -120,13 +135,13 @@ docker run --gpus all -it --rm \
   nvcr.io/nvidia/nemo-automodel:26.06.00
 ```
 
-**2.** Navigate to the AutoModel directory (where the recipes are):
+2. Navigate to the AutoModel directory (where the recipes are):
 
 ```bash
 cd /opt/Automodel
 ```
 
-**3. Run the recipe**:
+3. Run the recipe:
 
 ```bash
 automodel --nproc-per-node=8 examples/llm_finetune/glm/glm_5.2_tulu3_32k_tilelang_cp8.yaml

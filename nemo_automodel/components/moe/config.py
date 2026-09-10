@@ -15,7 +15,7 @@
 """MoE model configuration."""
 
 from dataclasses import dataclass
-from typing import Literal, Optional
+from typing import Literal
 
 import torch
 
@@ -93,5 +93,5 @@ class MoEMetricsConfig:
 
     enabled: bool = False
     mode: str = "brief"
-    detailed_every_steps: Optional[int] = None
+    detailed_every_steps: int | None = None
     top_k_experts: int = 0

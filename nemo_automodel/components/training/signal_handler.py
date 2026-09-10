@@ -16,7 +16,7 @@ import logging
 import signal
 import types
 from collections.abc import Sequence
-from typing import Any, Optional
+from typing import Any
 
 import torch
 import torch.distributed
@@ -24,7 +24,7 @@ import torch.distributed
 SignalLike = int | str | signal.Signals
 
 
-def get_device(local_rank: Optional[int] = None) -> torch.device:
+def get_device(local_rank: int | None = None) -> torch.device:
     """
     Get the appropriate torch device based on the distributed backend.
 
@@ -54,9 +54,9 @@ def get_device(local_rank: Optional[int] = None) -> torch.device:
 def all_gather_item(
     item: Any,
     dtype: torch.dtype,
-    group: Optional[torch.distributed.ProcessGroup] = None,
+    group: torch.distributed.ProcessGroup | None = None,
     async_op: bool = False,
-    local_rank: Optional[int] = None,
+    local_rank: int | None = None,
 ) -> list[Any]:
     """Perform an all_gather operation on a single Python object.
 
@@ -163,7 +163,7 @@ class DistributedSignalHandler:
         self._signal_received = False
         self.released = False
 
-        def handler(signum: int, frame: Optional[Any]) -> None:
+        def handler(signum: int, frame: Any | None) -> None:
             logging.info("Received signal {}, initiating graceful stop".format(signum))
             self._signal_received = True
 
@@ -175,7 +175,7 @@ class DistributedSignalHandler:
         return self
 
     def __exit__(
-        self, exc_type: Optional[type], exc_val: BaseException | None, exc_tb: types.TracebackType | None
+        self, exc_type: type | None, exc_val: BaseException | None, exc_tb: types.TracebackType | None
     ) -> None:  # noqa: E501
         """
         Release the signal handler and restore the original handler.

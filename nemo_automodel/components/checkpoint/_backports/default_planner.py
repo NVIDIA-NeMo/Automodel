@@ -22,7 +22,7 @@ import logging
 import operator
 from collections import ChainMap
 from functools import reduce
-from typing import Any, Optional, Union, cast
+from typing import Any, Union, cast
 
 import torch
 from torch.distributed._shard._utils import narrow_tensor_by_index
@@ -87,7 +87,7 @@ class DefaultSavePlanner(SavePlanner):
         self,
         flatten_state_dict: bool = True,
         flatten_sharded_tensors: bool = True,
-        dedup_replicated_tensors: Optional[bool] = None,
+        dedup_replicated_tensors: bool | None = None,
         dedup_save_to_lowest_rank: bool = False,
         enable_plan_caching: bool = False,
     ) -> None:
@@ -107,7 +107,7 @@ class DefaultSavePlanner(SavePlanner):
     def set_up_planner(
         self,
         state_dict: STATE_DICT_TYPE,
-        storage_meta: Optional[StorageMeta] = None,
+        storage_meta: StorageMeta | None = None,
         is_coordinator: bool = False,
     ) -> None:
         if self.flatten_state_dict:
@@ -297,7 +297,7 @@ class DefaultLoadPlanner(LoadPlanner):
     def set_up_planner(
         self,
         state_dict: STATE_DICT_TYPE,
-        metadata: Optional[Metadata] = None,
+        metadata: Metadata | None = None,
         is_coordinator: bool = False,
     ) -> None:
         _init_state_dict(state_dict)
@@ -422,7 +422,7 @@ class _EmptyStateDictLoadPlanner(DefaultLoadPlanner):
     def set_up_planner(
         self,
         state_dict: STATE_DICT_TYPE,
-        metadata: Optional[Metadata] = None,
+        metadata: Metadata | None = None,
         is_coordinator: bool = False,
     ) -> None:
         assert not state_dict

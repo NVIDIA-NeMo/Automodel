@@ -23,7 +23,7 @@ import mmap
 import os
 import queue
 import re
-from typing import Any, Optional
+from typing import Any
 
 import torch
 from torch.distributed._shard._utils import narrow_tensor_by_index
@@ -93,15 +93,15 @@ class _HuggingFaceStorageWriter(FsspecWriter):
     def __init__(
         self,
         path: str,
-        fqn_to_index_mapping: Optional[dict[str, int]] = None,
+        fqn_to_index_mapping: dict[str, int] | None = None,
         thread_count: int = 1,
-        token: Optional[str] = None,
+        token: str | None = None,
         save_sharded: bool = False,
-        consolidated_output_path: Optional[str] = None,
-        num_threads_consolidation: Optional[int] = None,
-        staging_dir: Optional[str] = None,
+        consolidated_output_path: str | None = None,
+        num_threads_consolidation: int | None = None,
+        staging_dir: str | None = None,
         diffusers_compatible: bool = False,
-        fqn_to_dtype_mapping: Optional[dict[str, str]] = None,
+        fqn_to_dtype_mapping: dict[str, str] | None = None,
     ) -> None:
         """
         Initialize the huggingface writer pointing to path.
@@ -137,7 +137,7 @@ class _HuggingFaceStorageWriter(FsspecWriter):
                 path=path,
                 serialization_format=SerializationFormat.SAFETENSORS,
             )
-        self._fqn_to_index_mapping: Optional[dict[str, int]] = fqn_to_index_mapping
+        self._fqn_to_index_mapping: dict[str, int] | None = fqn_to_index_mapping
         self._save_sharded = save_sharded
         self._consolidated_output_path = consolidated_output_path
         self._staging_dir = staging_dir
@@ -179,8 +179,8 @@ class _HuggingFaceStorageWriter(FsspecWriter):
 
         # storage_plan is a map from key to file index
         storage_data: dict[str, Any] = plan.storage_data
-        storage_plan: Optional[dict[str, int]] = None
-        shard_index: Optional[int] = None
+        storage_plan: dict[str, int] | None = None
+        shard_index: int | None = None
         if "fqn_to_index_mapping" in storage_data:
             storage_plan = storage_data["fqn_to_index_mapping"]
         if "shard_index" in storage_data:
@@ -227,7 +227,7 @@ class _HuggingFaceStorageWriter(FsspecWriter):
             json.dump(metadata_to_write, metadata_file, indent=2)
 
     def _split_by_storage_plan(
-        self, storage_plan: Optional[dict[str, int]], items: list[WriteItem]
+        self, storage_plan: dict[str, int] | None, items: list[WriteItem]
     ) -> dict[int, list[WriteItem]]:
         # storage_plan is a map from key to index
         if storage_plan is None:
@@ -257,7 +257,7 @@ class _HuggingFaceStorageReader(FsspecReader):
     Fsspec registration of the storage solution is required.
     """
 
-    def __init__(self, path: str, token: Optional[str] = None, key_mapping: Optional[dict[str, str]] = None) -> None:
+    def __init__(self, path: str, token: str | None = None, key_mapping: dict[str, str] | None = None) -> None:
         """
         Initialize the huggingface reader pointing to path.
 
@@ -482,7 +482,7 @@ def _extract_file_index_with_status(filename: str) -> tuple[int, bool]:
 
 
 def get_fqn_to_file_index_mapping(
-    reference_model_path: str, key_mapping: Optional[dict[str, str]] = None
+    reference_model_path: str, key_mapping: dict[str, str] | None = None
 ) -> dict[str, int]:
     """
     Get the FQN to file index mapping from the metadata.
@@ -545,7 +545,7 @@ def get_fqn_to_file_index_mapping(
     return fqn_to_file_index_mapping
 
 
-def get_fqn_to_dtype_mapping(reference_model_path: str, key_mapping: Optional[dict[str, str]] = None) -> dict[str, str]:
+def get_fqn_to_dtype_mapping(reference_model_path: str, key_mapping: dict[str, str] | None = None) -> dict[str, str]:
     """
     Get the FQN to original safetensors dtype mapping from HF shard headers.
 
@@ -585,7 +585,7 @@ def get_fqn_to_dtype_mapping(reference_model_path: str, key_mapping: Optional[di
 # the following function is taken from https://github.com/huggingface/transformers/blob/b85ed49e0a5f1bd9fd887f497d055b22b9319a12/src/transformers/modeling_utils.py#L4989-L5047
 def _get_key_renaming_mapping(
     key: str,
-    key_mapping: Optional[dict[str, str]] = None,
+    key_mapping: dict[str, str] | None = None,
 ) -> str:
     if key_mapping is None:
         return key

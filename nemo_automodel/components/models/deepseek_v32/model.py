@@ -20,7 +20,7 @@ the use of DeepseekV32MLA (with Indexer) instead of the standard MLA.
 """
 
 from dataclasses import dataclass
-from typing import Any, Optional, Union
+from typing import Any, Union
 
 import torch
 import torch.nn as nn
@@ -254,7 +254,7 @@ class DeepseekV32ForCausalLM(DeepseekV3ForCausalLM):
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
-        output_hidden_states: Optional[bool] = None,
+        output_hidden_states: bool | None = None,
         **attn_kwargs: Any,
     ) -> CausalLMOutputWithPast:
         """Forward pass returning :class:`CausalLMOutputWithPast`.

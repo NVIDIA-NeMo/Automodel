@@ -22,8 +22,6 @@ compatibility.
 
 from __future__ import annotations
 
-from typing import Optional
-
 import torch
 import torch.nn as nn
 from transformers import PretrainedConfig, PreTrainedModel
@@ -229,8 +227,8 @@ class LlamaEagleDraftModel(PreTrainedModel):
         input_ids: torch.Tensor,
         target_hidden_states: torch.Tensor,
         attention_mask: torch.Tensor,
-        position_ids: Optional[torch.Tensor] = None,
-        seq_lens: Optional[torch.Tensor] = None,
+        position_ids: torch.Tensor | None = None,
+        seq_lens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Predict the next-step target hidden state for each position.
 

@@ -85,10 +85,20 @@ LLM recipes use the causal-LM harness, while `examples/vlm_finetune/` recipes us
 `AutoModelForImageTextToText`. VLM parity currently exercises the language path with text-only `input_ids`; real-image
 multimodal parity is a separate follow-up.
 
-The resume oracle is deliberately distinct from independent-run reproducibility. It checks exact optimizer/scheduler
-position, LR and weight decay, RNG state, stateful-dataloader state, and per-rank batch identity before comparing the
-first post-resume loss with `resume_first_loss_threshold` (default `1e-6`) and later BF16 optimizer steps with
-`resume_loss_threshold` (default `5e-3`). Use `no_check_resume: true` only for an explicitly documented restore blocker.
+The resume oracle is deliberately distinct from independent-run reproducibility. It checks scheduler position,
+complete optimizer parameter-group settings, LR and weight decay, RNG state, and per-rank batch identity. On the first
+shared step, after both branches have entered the same FSDP unshard/reshard lifecycle but before the optimizer update,
+it requires exact rank-local model parameters and optimizer tensors. Persistent buffers and gradients at that point,
+plus post-update model/optimizer fingerprints, are recorded diagnostically so a numerical divergence can be localized.
+Exact loss deltas and diagnostic comparisons are written for successful and failed runs.
+
+Select a shared scale-aware loss envelope with `resume_tolerance_profile`. Each stage allows
+`atol + rtol * max(abs(uninterrupted_loss), abs(resumed_loss))`: `strict` uses `1e-6 + 0%` for both stages;
+`standard` (default) uses `1e-5 + 0.2%` for the first step and `5e-3 + 0.2%` later; `relaxed` uses
+`1e-4 + 0.75%` first and `1e-2 + 0.75%` later. Prefer profiles over model-specific calibration, and use `relaxed`
+only for demonstrated distributed or low-precision drift after the exact state gates pass. `resume_first_loss_threshold`
+and `resume_loss_threshold` remain authoritative absolute-only overrides for exceptional cases. Use
+`no_check_resume: true` only for an explicitly documented restore blocker.
 
 CI also reuses the normal finetune that already precedes checkpoint robustness as a separate, non-blocking training-
 reproducibility metric; it does not launch another baseline. Normal finetune and checkpoint Phase 1 record per-rank

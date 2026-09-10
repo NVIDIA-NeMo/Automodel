@@ -36,8 +36,9 @@
 #   5. FusedLinearCrossEntropy -- avoids materializing the full [S, 262k] logits.
 #
 # Dense CP requires attn_implementation=sdpa (the ring swaps SDPA) and no TE
-# backend. TP is unavailable for E2B/E4B (HF per-layer-input merge crashes under
-# DTensor), so scale with dp_shard x cp only.
+# backend. E2B/E4B now support model-owned TP2, but this fixed 16-GPU recipe
+# deliberately spends every rank on CP16. Keeping both CP16 and TP2 would need
+# 32 GPUs; reducing CP to 8 would double the already tight local sequence to 8k.
 
 recipe: FinetuneRecipeForVLM
 

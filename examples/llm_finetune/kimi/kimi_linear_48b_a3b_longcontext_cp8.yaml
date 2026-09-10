@@ -13,14 +13,14 @@
 # limitations under the License.
 
 # Long-context Kimi Linear fine-tuning: 32k packed sequences split across a
-# context-parallel group of 2, with EP=8 over the same 8 GPUs.
+# context-parallel group of 8, with EP=8 over the same 8 GPUs.
 #
 # Kimi Linear shards the sequence into contiguous per-rank slices (KDA's recurrent
 # state is passed rank to rank by FLA, MLA gathers the compressed KV latent), and
 # document boundaries from the packed collater are honored by both layer types.
 #
 # To run this recipe:
-#   HF_HOME=$PWD/.hf_cache automodel examples/llm_finetune/kimi/kimi_linear_48b_a3b_longcontext_cp2.yaml --nproc-per-node 8
+#   HF_HOME=$PWD/.hf_cache automodel examples/llm_finetune/kimi/kimi_linear_48b_a3b_longcontext_cp8.yaml --nproc-per-node 8
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
@@ -59,6 +59,7 @@ model:
   trust_remote_code: true
   torch_dtype: bfloat16
   load_base_model: true
+  output_hidden_states: true
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: eager
@@ -73,14 +74,14 @@ model:
 
 checkpoint:
   enabled: false
-  checkpoint_dir: checkpoints/kimi_linear_48b_a3b_longcontext_cp2
+  checkpoint_dir: checkpoints/kimi_linear_48b_a3b_longcontext_cp8
   model_save_format: safetensors
   save_consolidated: false
 
 distributed:
   strategy: fsdp2
   tp_size: 1
-  cp_size: 2                 # 32k tokens -> 16k per rank
+  cp_size: 8                 # 32k tokens -> 4k per rank
   pp_size: 1
   ep_size: 8                 # EP and CP overlap on the device mesh
   sequence_parallel: false
@@ -90,7 +91,7 @@ distributed:
     wrap_outer_model: false
 
 loss_fn:
-  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
@@ -139,7 +140,7 @@ optimizer:
 wandb:
   enable: false
   project: automodel-kimi-linear
-  name: kimi_linear_48b_a3b_longcontext_cp2
+  name: kimi_linear_48b_a3b_longcontext_cp8
   mode: online
   dir: result/wandb
 

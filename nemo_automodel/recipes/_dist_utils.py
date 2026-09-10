@@ -22,7 +22,7 @@ first, then pass the resulting world size here.
 """
 
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 from nemo_automodel.components.distributed.config import (
     DistributedSetup,
@@ -102,8 +102,8 @@ def parse_distributed_section(cfg_dict: dict) -> dict:
     }
 
     # -- sub-configs --------------------------------------------------------
-    pipeline_dict: Optional[dict] = cfg.pop("pipeline", None)
-    moe_dict: Optional[dict] = cfg.pop("moe", None)
+    pipeline_dict: dict | None = cfg.pop("pipeline", None)
+    moe_dict: dict | None = cfg.pop("moe", None)
     activation_checkpointing = _normalize_activation_checkpointing(cfg.pop("activation_checkpointing", False))
 
     # Strip Hydra / OmegaConf meta keys (e.g. ``_target_``, ``_recursive_``,
@@ -303,7 +303,7 @@ def _dist_env_timeout_minutes(cfg: Any | None) -> int | None:
 
 def create_distributed_setup_from_config(
     cfg: Any | None = None,
-    world_size: Optional[int] = None,
+    world_size: int | None = None,
     *,
     timeout_minutes: int | None = None,
     ranks: list[int] | tuple[int, ...] | None = None,

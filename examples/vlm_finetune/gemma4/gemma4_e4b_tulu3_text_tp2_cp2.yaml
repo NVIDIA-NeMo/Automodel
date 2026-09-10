@@ -1,0 +1,137 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Gemma 4 E4B text-only SFT on one 8xH100-80GB node: dp2 x tp2 x cp2.
+#
+# TP2 is the maximum standard head-wise TP degree for E4B because it has only
+# two KV heads. The model-owned plan shards both the tied token embedding and
+# the 2.8B-parameter packed per-layer embedding table. The Gemma4-specific
+# fused CE gathers only the tied LM-head weight, not [B, S, 262k] logits.
+#
+# Validated for 50 Tulu3 SFT steps with a full cached google/gemma-4-E4B-it
+# checkpoint and deterministic 2048-token packed batches. The Gemma4-safe
+# selective activation-checkpointing policy recomputes each decoder layer's MLP
+# and norms while leaving attention out because E4B shares mutable K/V state
+# across layers. With fused CE and master-weight FusedAdam with parameter
+# remainders and FP32 moments, TP2 x CP2, LBS4 / GBS16 completed at 50.03 GiB
+# per GPU. Its loss stayed aligned with the exact-data FSDP2-only baseline.
+#
+# torchrun --nproc-per-node=8 nemo_automodel/recipes/vlm/finetune.py \
+#   -c examples/vlm_finetune/gemma4/gemma4_e4b_tulu3_text_tp2_cp2.yaml
+
+recipe: FinetuneRecipeForVLM
+
+step_scheduler:
+  global_batch_size: 16
+  local_batch_size: 4
+  ckpt_every_steps: 500
+  val_every_steps: 500
+  max_steps: 1000
+  num_epochs: 1
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 42
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
+  pretrained_model_name_or_path: google/gemma-4-E4B-it
+  torch_dtype: torch.bfloat16
+  attn_implementation: sdpa
+  use_liger_kernel: false
+  use_sdpa_patching: false
+  text_config:
+    use_cache: false
+    output_hidden_states: true
+
+processor:
+  padding_side: right
+
+checkpoint:
+  enabled: false
+
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 2
+  cp_size: 2
+  sequence_parallel: false
+  # E4B shares K/V across layers through one mutable store, so its model-owned
+  # selective policy checkpoints only the MLP and norms in those layers.
+  activation_checkpointing: selective
+
+loss_fn:
+  _target_: nemo_automodel.components.models.gemma4_moe.loss.Gemma4TensorParallelFusedLinearCrossEntropy
+  logit_softcapping: 30.0
+  reduction: sum
+
+dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_tulu3_dataset
+  path_or_dataset: allenai/tulu-3-sft-mixture
+  split: train
+  # Exact tokenization can reveal samples longer than the length estimate.
+  # Truncate those deterministically instead of randomly replacing them so
+  # parity runs keep identical data across DP/TP/CP topologies.
+  truncate: true
+  inject_fake_images: false
+
+packed_sequence:
+  pretokenize: true
+  max_length: 2048
+  pack_size: 2048
+  collate_max_length: 2048
+  packing_ratio: 0.9
+  drop_long_samples: true
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 4
+  persistent_workers: true
+  pin_memory: true
+
+optimizer:
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+  betas: [0.9, 0.95]
+  eps: 1e-8
+  lr: 2e-5
+  weight_decay: 0.01
+  master_weights: true
+  store_param_remainders: true
+  exp_avg_dtype: torch.float32
+  exp_avg_sq_dtype: torch.float32
+
+freeze_config:
+  freeze_embeddings: true
+  freeze_vision_tower: true
+  freeze_audio_tower: true
+  freeze_language_model: false
+
+wandb:
+  enable: false
+  project: <your_wandb_project>
+  entity: <your_wandb_entity>
+  name: <your_wandb_name>
+  dir: <your_wandb_save_dir>
+
+ci:
+  recipe_owner: athitten
+  nodes: 1
+  time: "01:00:00"
+  env_vars:
+    PYTORCH_ALLOC_CONF: "expandable_segments:True"

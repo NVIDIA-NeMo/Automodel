@@ -21,6 +21,8 @@ KL divergence.
 Launch: torchrun --nproc-per-node=<N> -m <this_module> --config <config.yaml>
     [--cosine_threshold <float>] [--hf_cosine_threshold <float>]
     [--check_hf_reload] [--check_resume]
+    [--resume_tolerance_profile <strict|standard|relaxed>]
+    [--resume_first_loss_threshold <float>] [--resume_loss_threshold <float>]
 """
 
 from __future__ import annotations
@@ -45,11 +47,12 @@ from tests.functional_tests.checkpoint_robustness.resume_trajectory import (
     _load_reference_trajectory,
     _persist_reference_trajectory,
     _persist_training_reproducibility,
+    _report_resume_comparison,
     _report_training_reproducibility,
+    _resolve_resume_loss_tolerance,
     _restored_state_mismatch,
     _resume_plan_from_config,
     _TrainingReproducibilityRecorder,
-    _trajectory_mismatch,
     _TrajectoryRecorder,
 )
 from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm import (
@@ -70,6 +73,7 @@ def _extract_custom_args(argv: list[str]) -> tuple[dict[str, str | bool], list[s
         "--training_reproducibility_loss_threshold",
         "--resume_first_loss_threshold",
         "--resume_loss_threshold",
+        "--resume_tolerance_profile",
     }
     boolean_keys = {"--check_hf_reload", "--check_resume"}
     custom: dict[str, str | bool] = {}
@@ -169,8 +173,11 @@ def test_checkpoint_robustness_biencoder():
     check_hf_reload = bool(custom_args.get("check_hf_reload", False))
     check_resume = bool(custom_args.get("check_resume", False))
     training_reproducibility_loss_threshold = float(custom_args.get("training_reproducibility_loss_threshold", "5e-2"))
-    resume_first_loss_threshold = float(custom_args.get("resume_first_loss_threshold", "1e-6"))
-    resume_loss_threshold = float(custom_args.get("resume_loss_threshold", "5e-3"))
+    resume_tolerance = _resolve_resume_loss_tolerance(
+        str(custom_args.get("resume_tolerance_profile", "standard")),
+        first_step_override=custom_args.get("resume_first_loss_threshold"),
+        later_step_override=custom_args.get("resume_loss_threshold"),
+    )
 
     # ------------------------------------------------------------------
     # Phase 1: Train biencoder and checkpoint
@@ -337,19 +344,22 @@ def test_checkpoint_robustness_biencoder():
         resumed_recorder.attach(resume_trainer)
         resume_trainer.run_train_validation_loop()
         resumed_trajectory = resumed_recorder.to_dict()
-        local_failure = _trajectory_mismatch(
+        comparison_report = _report_resume_comparison(
+            resume_plan,
             reference_trajectory,
             resumed_trajectory,
-            first_loss_threshold=resume_first_loss_threshold,
-            later_loss_threshold=resume_loss_threshold,
+            resume_tolerance,
         )
+        local_failure = comparison_report["blocking_failure"]
         failure_message = _gather_rank_failures(local_failure, check="shared_trajectory")
         _raise_distributed_failure(failure_message)
         if _rank0():
             print(
                 f"[Resume correctness] Retrieval shared trajectory verified for "
-                f"{resume_plan.continuation_steps} steps; first-step threshold={resume_first_loss_threshold:.3e}, "
-                f"later-step threshold={resume_loss_threshold:.3e}"
+                f"{resume_plan.continuation_steps} steps; profile={resume_tolerance.profile}, "
+                f"first-step atol/rtol={resume_tolerance.first_step_atol:.3e}/"
+                f"{resume_tolerance.first_step_rtol:.3e}, later-step atol/rtol="
+                f"{resume_tolerance.later_step_atol:.3e}/{resume_tolerance.later_step_rtol:.3e}"
             )
 
         del resume_trainer

@@ -45,6 +45,8 @@ class Glm4MoeStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
       model.layers.{L}.mlp.shared_expert.down_proj.weight
     """
 
+    _supports_write_through_checkpoint_load = True
+
     def __init__(
         self,
         config: Any,
@@ -59,7 +61,7 @@ class Glm4MoeStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
         self._uses_model_prefix = True
 
     def to_hf(
-        self, state_dict: dict[str, Any], exclude_key_regex: Optional[str] = None, quantization: bool = False, **kwargs
+        self, state_dict: dict[str, Any], exclude_key_regex: str | None = None, quantization: bool = False, **kwargs
     ) -> dict[str, Any]:
         hf_state_dict = {}
         for fqn, tensor in state_dict.items():

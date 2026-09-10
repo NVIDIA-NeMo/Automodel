@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Full-parameter Qwen3.8-Max text SFT run validated on 256 GPUs:
+# Full-parameter Qwen3.8-2.4T-A95B text SFT run validated on 256 GPUs:
 #   64 nodes x 4 GPUs, EP32 x PP8, DP32, 100 steps, lr=1e-5.
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
@@ -36,7 +36,7 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: Qwen/Qwen3.8-Max
+  pretrained_model_name_or_path: Qwen/Qwen3.8-2.4T-A95B
   trust_remote_code: true
   num_nextn_predict_layers: 0
   torch_dtype: bfloat16
@@ -56,7 +56,7 @@ model:
 
 checkpoint:
   enabled: false
-  checkpoint_dir: checkpoints/qwen3_8_max_hellaswag_ep32_pp8
+  checkpoint_dir: checkpoints/qwen3_8_2_4t_a95b_hellaswag_ep32_pp8
   model_save_format: safetensors
   save_consolidated: false
 
@@ -115,8 +115,8 @@ optimizer:
 
 wandb:
   enable: false
-  project: qwen3_8_max_sft
-  name: qwen3_8_max_hellaswag_ep32_pp8
+  project: qwen3_8_2_4t_a95b_sft
+  name: qwen3_8_2_4t_a95b_hellaswag_ep32_pp8
   dir: wandb
 
 clip_grad_norm:

@@ -19,7 +19,7 @@ import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar, Dict, Iterator, List, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, Iterator, List, Sequence, Union
 
 from datasets import VerificationMode, load_dataset
 
@@ -56,7 +56,7 @@ def _as_iter(val: Union[str, Sequence[str]]) -> Iterator[str]:
 _SPLIT_SLICE_RE = re.compile(r"^(\w+)\[(\d*):(\d*)\]$")
 
 
-def _parse_split_slice(split: Optional[str]):
+def _parse_split_slice(split: str | None):
     """Parse a split string like ``"train[1024:]"`` into ``(base_split, slice | None)``."""
     if split is None:
         return split, None
@@ -71,9 +71,9 @@ def _parse_split_slice(split: Optional[str]):
 
 def _load_openai_messages(
     path_or_dataset_id: Union[str, Sequence[str]],
-    split: Optional[str] = None,
-    name: Optional[str] = None,
-    shuffle_seed: Optional[int] = None,
+    split: str | None = None,
+    name: str | None = None,
+    shuffle_seed: int | None = None,
     skip_invalid_samples: bool = False,
 ):
     """Load OpenAI chat messages datasets from HF or local JSON/JSONL files.
@@ -388,14 +388,14 @@ class ChatDataset(Dataset):
         path_or_dataset_id: Union[str, Sequence[str]],
         tokenizer,
         *,
-        split: Optional[str] = None,
-        name: Optional[str] = None,
-        seq_length: Optional[int] = None,
+        split: str | None = None,
+        name: str | None = None,
+        seq_length: int | None = None,
         padding: Union[str, bool] = "do_not_pad",
         truncation: Union[str, bool] = "do_not_truncate",
-        start_of_turn_token: Optional[str] = None,
-        chat_template: Optional[str] = None,
-        shuffle_seed: Optional[int] = None,
+        start_of_turn_token: str | None = None,
+        chat_template: str | None = None,
+        shuffle_seed: int | None = None,
         mask_reasoning_content: bool = False,
         mask_history: bool = False,
         unshifted: bool = False,

@@ -1,6 +1,6 @@
 # Checkpoint Robustness Test Status
 
-Resume policy last updated: 2026-08-04 UTC
+Resume policy last updated: 2026-08-17 UTC
 
 Historical model matrix last measured: 2026-04-02 UTC
 
@@ -10,12 +10,16 @@ Historical model matrix last measured: 2026-04-02 UTC
 
 Enabled LLM, VLM, and retrieval resume coverage now compares a restored trainer
 with the uninterrupted continuation of the same checkpoint-producing training
-trajectory. The check requires exact optimizer/scheduler position, LR and
-weight-decay state, and RNG state. Stateful-dataloader position is verified by
-exact per-rank post-resume batch identity because a loader may normalize its
-equivalent serialized state during restore. The first post-resume loss uses a
-separate strict threshold; the existing `resume_loss_threshold` applies only to
-later BF16 optimizer steps. Independently calibrated historical envelopes are
+trajectory. The check requires exact optimizer/scheduler position, complete
+optimizer parameter-group settings, and RNG state. Stateful-dataloader position
+is verified by exact per-rank post-resume batch identity because a loader may
+normalize its equivalent serialized state during restore. On the first shared
+step, exact rank-local model parameters and optimizer tensors are required
+immediately before the update. Gradients, persistent buffers, and post-update
+state are recorded diagnostically. Loss thresholds use scale-aware absolute
+plus relative envelopes selected by the shared `strict`, `standard`, and
+`relaxed` profiles; the existing numeric fields remain authoritative
+absolute-only overrides. Independently calibrated historical envelopes are
 retained as the non-blocking `training_reproducibility_loss_threshold` metric
 instead of weakening the shared-trajectory resume oracle.
 
@@ -95,7 +99,7 @@ parameters); they require focused fixes before resume coverage is enabled.
 8. **Mistral3 3B** — FP8 scalar params vs FSDP2
 
 ### Infrastructure improvements:
-10. **`--resume_loss_threshold`** flag — DONE (added, default 5e-3)
+10. **Shared resume tolerance profiles and numeric overrides** — DONE
 11. **Memory thresholds** for remaining models (Llama, GPT-OSS, Nano V3 still missing)
 
 ## Commits on branch `adil-a/checkpoint-robustness-test`

@@ -16,7 +16,7 @@ import inspect
 import logging
 from collections import deque
 from collections.abc import Callable
-from typing import Any, Optional
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -25,7 +25,7 @@ from transformers import AutoConfig
 logger = logging.getLogger(__name__)
 
 
-def resolve_get_rope_index(model: nn.Module) -> Optional[Callable]:
+def resolve_get_rope_index(model: nn.Module) -> Callable | None:
     """Locate a model's mRoPE position-id builder.
 
     Transformers does not keep ``get_rope_index`` at a fixed depth, and a plain
@@ -93,13 +93,13 @@ def resolve_get_rope_index(model: nn.Module) -> Optional[Callable]:
 
 def _should_load_before_shard(
     *,
-    autopipeline: Optional[object],
+    autopipeline: object | None,
     tp_size: int,
     ep_size: int,
     dp_shard_size: int = 1,
     pretrained_model_name_or_path: str,
     load_base_model: bool,
-    peft_config: Optional[object],
+    peft_config: object | None,
 ) -> bool:
     """Decide whether to load the checkpoint before FSDP/TP/EP sharding.
 

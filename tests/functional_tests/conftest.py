@@ -120,6 +120,7 @@ _OVERRIDES = [
     "deploy_mode",
     "max_new_tokens",
     "hf_adapter_ignored_key_prefix",
+    "resume_tolerance_profile",
 ]
 
 _BOOLEAN_OVERRIDES = [

@@ -21,7 +21,7 @@ recipe body only ever sees typed component configs and calls
 
 Known sections are exposed as cached, typed attributes that own a ``build()`` or
 ``apply()``: ``wandb``/``mlflow``/``step_scheduler``/``lr_scheduler``/``prewarm``/
-``embedding_row_repair`` map to component config dataclasses; the ``optimizer``
+``embedding_row_repair``/``mfu`` map to component config dataclasses; the ``optimizer``
 and ``loss_fn`` blocks resolve to a component
 :class:`~nemo_automodel.components.optim.optimizer.OptimizerConfig` /
 :class:`~nemo_automodel.components.loss.loss.LossConfig` via
@@ -51,6 +51,7 @@ from nemo_automodel.components.optim.optimizer import LRSchedulerConfig
 from nemo_automodel.components.training.step_scheduler import StepSchedulerConfig
 
 if TYPE_CHECKING:
+    from nemo_automodel._transformers.mfu import MFUConfig
     from nemo_automodel.components.checkpoint.config import CheckpointingConfig
     from nemo_automodel.components.config.loader import ConfigNode
     from nemo_automodel.components.datasets.diffusion.loader import DiffusionDataloaderConfig
@@ -618,6 +619,13 @@ class RecipeConfig:
 
         node = self._raw.get("prewarm", None)
         return PrewarmConfig(**_section_kwargs(node)) if node else None
+
+    @cached_property
+    def mfu(self) -> "MFUConfig":
+        from nemo_automodel._transformers.mfu import MFUConfig
+
+        node = self._raw.get("mfu", None)
+        return MFUConfig(**_section_kwargs(node)) if node else MFUConfig()
 
     @cached_property
     def embedding_row_repair(self) -> "EmbeddingRowRepairConfig | None":

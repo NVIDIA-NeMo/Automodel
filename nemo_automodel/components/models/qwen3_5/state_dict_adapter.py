@@ -27,7 +27,7 @@ loadable via ``transformers.AutoModelForImageTextToText.from_pretrained``.
 from __future__ import annotations
 
 import re
-from typing import Any, Optional
+from typing import Any
 
 from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
 from nemo_automodel.components.models.common.gated_delta_net_fp32 import (
@@ -75,6 +75,8 @@ def map_qwen3_5_mtp_to_hf_key(key: str) -> str:
 class Qwen3_5DenseStateDictAdapter(StateDictAdapter):
     """Adapter that hides the ``_fp32_params`` wrapping in saved checkpoints."""
 
+    _supports_write_through_checkpoint_load = True
+
     def __init__(self, *, route_linear_attn_fp32_params: bool = True) -> None:
         self.route_linear_attn_fp32_params = route_linear_attn_fp32_params
 
@@ -88,7 +90,7 @@ class Qwen3_5DenseStateDictAdapter(StateDictAdapter):
     def from_hf(
         self,
         hf_state_dict: dict[str, Any],
-        device_mesh: Optional[Any] = None,
+        device_mesh: Any | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
         del device_mesh, kwargs

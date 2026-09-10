@@ -68,6 +68,7 @@ class CPRingAttentionContext:
     kwargs: dict[str, Any]
     metadata: dict[str, torch.Tensor | None]
     metadata_seq_dims: dict[str, int]
+    use_vision_bidirectional: bool = False
 
 
 def gemma4_vision_group_ids(mm_token_type_ids: torch.Tensor) -> torch.Tensor:
@@ -78,6 +79,11 @@ def gemma4_vision_group_ids(mm_token_type_ids: torch.Tensor) -> torch.Tensor:
     new_vision_starts = is_vision & ~is_prev_vision
     group_ids = torch.cumsum(new_vision_starts.int(), dim=1) - 1
     return torch.where(is_vision, group_ids, torch.full_like(group_ids, -1))
+
+
+def _config_uses_vision_bidirectional(attention_module: torch.nn.Module) -> bool:
+    """Whether the rank-uniform module config enables bidirectional vision attention."""
+    return getattr(getattr(attention_module, "config", None), "use_bidirectional_attention", None) == "vision"
 
 
 # create_block_mask (~7.6ms/call) depends only on attention type + sequence geometry +
@@ -210,18 +216,22 @@ def _route_kv_grads_to_owners(
     cp_group: Any,
     cp_rank: int,
     cp_size: int,
+    n_prior: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Sum each KV owner's dK/dV from every rank whose queries attended it.
 
     In the ring forward, rank ``r``'s queries attend the chunks owned by ranks
-    ``r, r-1, ..., 0``, so backward produces a dK/dV contribution for each of those
-    owners on rank ``r``. This sends each owner's contribution back to that owner
-    (p2p) and sums them, returning the local rank's accumulated ``(grad_key,
-    grad_value)``. Shared by the Flex and FFPA-varlen ring backward passes.
+    ``r, r-1, ..., r-n_prior``, so backward produces a dK/dV contribution for each of
+    those owners on rank ``r``. This sends each owner's contribution back (p2p) and sums
+    them, returning the local ``(grad_key, grad_value)``. Shared by the Flex, FFPA-varlen
+    and local-kernel ring backward passes. ``n_prior`` MUST match the forward's
+    :func:`_ring_num_prior_chunks`; defaults to the full rotation (``cp_size - 1``).
     """
+    if n_prior is None:
+        n_prior = cp_size - 1
     grad_key = grad_key_by_owner[cp_rank].contiguous()
     grad_value = grad_value_by_owner[cp_rank].contiguous()
-    for distance in range(1, cp_size):
+    for distance in range(1, n_prior + 1):
         send_owner = (cp_rank - distance) % cp_size
         recv_query_rank = (cp_rank + distance) % cp_size
         recv_grad_key = torch.empty_like(grad_key)
@@ -282,9 +292,7 @@ def _run_gemma4_flex_chunk(
         vision_group_ids_kv = gemma4_vision_group_ids(metadata_chunk["mm_token_type_ids"])
 
     sliding_window = getattr(attention_module, "sliding_window", None)
-    config_uses_vision_bidir = (
-        getattr(getattr(attention_module, "config", None), "use_bidirectional_attention", None) == "vision"
-    )
+    config_uses_vision_bidir = _config_uses_vision_bidirectional(attention_module)
     use_vision_bidirectional = (
         sliding_window is not None
         and config_uses_vision_bidir
@@ -430,6 +438,27 @@ def _run_gemma4_flex_chunk(
         ) from flex_err
 
 
+def _ring_num_prior_chunks(ctx: Any) -> int:
+    """Number of *prior* KV chunks a rank must ring-collect (own chunk excluded).
+
+    Global layers and vision-bidirectional layers take the full ``cp_size - 1`` rotation.
+    A vision group can cross the sliding window and CP rank boundaries in either direction.
+    For ordinary sliding-window layers a query reaches only ``window_left`` tokens back, so
+    at most ``ceil(window_left/seq_local)`` preceding chunks hold any in-window key; collecting
+    the rest just ships KV the mask discards. Forward collection and backward dK/dV routing
+    both derive their hop count from here so they stay symmetric.
+    """
+    full = ctx.cp_size - 1
+    attention_module = getattr(ctx, "module", None)
+    window_left = getattr(attention_module, "sliding_window", None)
+    if getattr(ctx, "use_vision_bidirectional", False):
+        return full
+    if not window_left:  # global / full-attention layer: needs the full rotation
+        return full
+    n_prior = math.ceil(int(window_left) / ctx.seq_local)
+    return max(0, min(full, n_prior))
+
+
 def _collect_ring_kv_chunks(ctx: Any) -> list[tuple[int, torch.Tensor, torch.Tensor, dict[str, torch.Tensor | None]]]:
     current_key = ctx.key.contiguous()
     current_value = ctx.value.contiguous()
@@ -437,10 +466,11 @@ def _collect_ring_kv_chunks(ctx: Any) -> list[tuple[int, torch.Tensor, torch.Ten
     current_owner = ctx.cp_rank
     chunks = []
 
-    for step in range(ctx.cp_size):
+    n_prior = _ring_num_prior_chunks(ctx)
+    for step in range(n_prior + 1):
         chunks.append((current_owner, current_key, current_value, current_metadata))
 
-        if step == ctx.cp_size - 1:
+        if step == n_prior:
             break
 
         recv_key = torch.empty_like(current_key)
@@ -999,7 +1029,12 @@ class _Gemma4FFPAVarlenRingAttention(torch.autograd.Function):
         # so a one-rank raise desyncs the ring). Forward returned 0 for these rows too.
 
         grad_key, grad_value = _route_kv_grads_to_owners(
-            grad_key_by_owner, grad_value_by_owner, cp_group=ring_ctx.cp_group, cp_rank=cp_rank, cp_size=cp_size
+            grad_key_by_owner,
+            grad_value_by_owner,
+            cp_group=ring_ctx.cp_group,
+            cp_rank=cp_rank,
+            cp_size=cp_size,
+            n_prior=_ring_num_prior_chunks(ring_ctx),
         )
         return grad_query.to(query.dtype), grad_key, grad_value, None
 
@@ -1081,6 +1116,50 @@ class _Gemma4FlexRingAttention(torch.autograd.Function):
             cp_group=ring_ctx.cp_group,
             cp_rank=ring_ctx.cp_rank,
             cp_size=ring_ctx.cp_size,
+            n_prior=_ring_num_prior_chunks(ring_ctx),
+        )
+        return grad_query, grad_key, grad_value, None
+
+
+class _Gemma4LocalKernelRingAttention(torch.autograd.Function):
+    """Sliding-window CP ring driven by a local FlashAttention kernel instead of compiled flex.
+
+    Reuses :class:`_Gemma4FlexRingAttention`'s p2p ring collection
+    (:func:`_collect_ring_kv_chunks`) and dK/dV routing (:func:`_route_kv_grads_to_owners`)
+    unchanged; only the per-shard compute differs: it concatenates the causal window
+    neighborhood and issues one FlashAttention call
+    (:func:`cp_local_ring.sliding_ring_compute_fa_fwd`) instead of per-chunk flex + softmax
+    merge. Backward is no-recompute: the forward saves the kernel context (out, LSE, RNG) and
+    the backward runs FlashAttention's own backward, then routes dK/dV to owners.
+    """
+
+    @staticmethod
+    def forward(autograd_ctx, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, ring_ctx: Any):
+        from nemo_automodel.components.models.gemma4_moe.cp_local_ring import sliding_ring_compute_fa_fwd
+
+        runtime_ctx = replace(ring_ctx, query=query, key=key, value=value)
+        chunks = _collect_ring_kv_chunks(runtime_ctx)
+        autograd_ctx.ring_ctx = replace(
+            ring_ctx, query=None, key=None, value=None, metadata=_detach_metadata(ring_ctx.metadata)
+        )
+        out, autograd_ctx.fa_saved = sliding_ring_compute_fa_fwd(runtime_ctx, chunks)
+        return out
+
+    @staticmethod
+    def backward(autograd_ctx, grad_output: torch.Tensor):
+        from nemo_automodel.components.models.gemma4_moe.cp_local_ring import sliding_ring_compute_fa_bwd
+
+        ring_ctx = autograd_ctx.ring_ctx
+        grad_query, grad_key_by_owner, grad_value_by_owner = sliding_ring_compute_fa_bwd(
+            autograd_ctx.fa_saved, grad_output
+        )
+        grad_key, grad_value = _route_kv_grads_to_owners(
+            grad_key_by_owner,
+            grad_value_by_owner,
+            cp_group=ring_ctx.cp_group,
+            cp_rank=ring_ctx.cp_rank,
+            cp_size=ring_ctx.cp_size,
+            n_prior=_ring_num_prior_chunks(ring_ctx),
         )
         return grad_query, grad_key, grad_value, None
 
@@ -1102,6 +1181,18 @@ def _run_gemma4_cp_ring_attention(attention_module: torch.nn.Module, ctx: Any) -
     """
     if _ring_use_ffpa_varlen(attention_module, ctx):
         return _Gemma4FFPAVarlenRingAttention.apply(ctx.query, ctx.key, ctx.value, ctx)
+    # Sliding-window layers: optional FlashAttention-2 backend off compiled flex, fully
+    # autograd (no analytical backward, no recompute). Only the plain causal+window+packed
+    # case; vision-bidirectional batches stay on flex. The gate is rank-uniform because the
+    # backend, layer type, model config, and full-sequence vision-input flag are identical
+    # across CP ranks.
+    sliding_backend = getattr(attention_module, "_gemma4_cp_sliding_backend", "flex")
+    if (
+        sliding_backend == "fa"
+        and getattr(attention_module, "sliding_window", None) is not None
+        and not getattr(ctx, "use_vision_bidirectional", False)
+    ):
+        return _Gemma4LocalKernelRingAttention.apply(ctx.query, ctx.key, ctx.value, ctx)
     return _Gemma4FlexRingAttention.apply(ctx.query, ctx.key, ctx.value, ctx)
 
 
@@ -1135,7 +1226,9 @@ def _gemma4_cp_manual_attention(
     if query.shape[1] != key.shape[1]:
         enable_gqa = True
 
-    local_metadata = getattr(attention_module, "_cp_manual_metadata", {})
+    captured_metadata = getattr(attention_module, "_cp_manual_metadata", {})
+    has_vision_tokens = bool(captured_metadata.get("_gemma4_has_vision_tokens", False))
+    local_metadata = {name: value for name, value in captured_metadata.items() if name != "_gemma4_has_vision_tokens"}
     metadata_seq_dims = getattr(attention_module, "_cp_manual_metadata_seq_dims", {})
     ctx = CPRingAttentionContext(
         module=attention_module,
@@ -1157,6 +1250,7 @@ def _gemma4_cp_manual_attention(
         kwargs=kwargs,
         metadata=local_metadata,
         metadata_seq_dims=metadata_seq_dims,
+        use_vision_bidirectional=_config_uses_vision_bidirectional(attention_module) and has_vision_tokens,
     )
     return _run_gemma4_cp_ring_attention(attention_module, ctx)
 
@@ -1227,7 +1321,9 @@ def _install_gemma4_cp_ring_sdpa(attention_module: torch.nn.Module, cp_mesh) -> 
     attention_module.register_forward_hook(_post_hook, always_call=True)
 
 
-def attach_gemma4_cp_ring_attention(attention_module: torch.nn.Module, *, use_ffpa: bool = False) -> None:
+def attach_gemma4_cp_ring_attention(
+    attention_module: torch.nn.Module, *, use_ffpa: bool = False, sliding_backend: str = "flex"
+) -> None:
     """Register Gemma4's model-owned p2p ring CP attention on a self-attention module.
 
     Declares the metadata keys the ring needs and exposes ``setup_cp_attention(cp_mesh)``
@@ -1241,11 +1337,15 @@ def attach_gemma4_cp_ring_attention(attention_module: torch.nn.Module, *, use_ff
     the FFPA kernel is unavailable.
     """
     attention_module._gemma4_cp_use_ffpa = bool(use_ffpa)
+    # Sliding-window CP kernel: "flex" (default, compiled FlexAttention ring) | "fa"
+    # (FlashAttention-2 local kernel over the contiguous ring, see cp_local_ring).
+    attention_module._gemma4_cp_sliding_backend = str(sliding_backend).lower()
     attention_module._cp_manual_metadata_keys = (
         "mm_token_type_ids",
         "_packed_seq_ids",
         "padding_mask",
         "_gemma4_vision_group_ids",
+        "_gemma4_has_vision_tokens",
     )
     attention_module._cp_manual_metadata_seq_dims = {
         "mm_token_type_ids": 1,

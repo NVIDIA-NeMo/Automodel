@@ -30,6 +30,7 @@ from nemo_automodel.components.moe.experts import (
     _apply_bias,
     _DeterministicBiasRepeatInterleave,
     _permute_tokens_for_grouped_mm,
+    _stabilize_empty_routing_probs_dtype,
     _torch_mm_experts_fwd,
     get_expert_activation_for_deepep,
     is_gated_activation,
@@ -831,6 +832,17 @@ class TestGroupedExpertsDeepEP:
         assert experts.expert_bias == moe_config.expert_bias
         expected_shape = (moe_config.n_routed_experts, moe_config.dim, moe_config.moe_inter_dim * 2)
         assert experts.gate_and_up_projs.shape == expected_shape
+
+    def test_empty_routing_probs_match_activation_dtype(self):
+        """Empty DeepEP metadata is stable across checkpoint recomputation."""
+        empty_probs = torch.empty(0, dtype=torch.float32)
+        nonempty_probs = torch.ones(1, dtype=torch.float32)
+
+        stabilized = _stabilize_empty_routing_probs_dtype(empty_probs, torch.bfloat16)
+
+        assert stabilized.shape == empty_probs.shape
+        assert stabilized.dtype == torch.bfloat16
+        assert _stabilize_empty_routing_probs_dtype(nonempty_probs, torch.bfloat16) is nonempty_probs
 
     def test_grouped_experts_deepep_token_dispatcher_init(self, moe_config):
         """Test token dispatcher initialization."""

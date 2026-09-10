@@ -15,7 +15,7 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import List, Literal, Optional, Tuple
+from typing import List, Literal, Tuple
 
 import torch
 from torch import nn
@@ -119,11 +119,11 @@ class _DeepepManager(_DispatchManager):
         group: torch.distributed.ProcessGroup,
         router_topk: int,
         permute_fusion: bool = False,
-        capacity_factor: Optional[float] = None,
-        num_experts: Optional[int] = None,
-        num_local_experts: Optional[int] = None,
-        router_dtype: Optional[str] = None,
-        moe_router_expert_pad_multiple: Optional[int] = None,
+        capacity_factor: float | None = None,
+        num_experts: int | None = None,
+        num_local_experts: int | None = None,
+        router_dtype: str | None = None,
+        moe_router_expert_pad_multiple: int | None = None,
         _dispatch_fn=None,
         _combine_fn=None,
     ):
@@ -137,8 +137,8 @@ class _DeepepManager(_DispatchManager):
         self.moe_router_expert_pad_multiple = moe_router_expert_pad_multiple
 
         # Metadata
-        self.token_indices: Optional[torch.Tensor] = None
-        self.token_probs: Optional[torch.Tensor] = None
+        self.token_indices: torch.Tensor | None = None
+        self.token_probs: torch.Tensor | None = None
         # Handle used for combine operation
         self.handle = None
 
@@ -385,8 +385,8 @@ class _HybridEPManager(_DispatchManager):
         self.num_permuted_tokens = None
 
         # Metadata
-        self.token_probs: Optional[torch.Tensor] = None
-        self.routing_map: Optional[torch.Tensor] = None
+        self.token_probs: torch.Tensor | None = None
+        self.routing_map: torch.Tensor | None = None
         # Handle used for combine operation
         self.handle = None
         self.pad_multiple = None
@@ -499,14 +499,14 @@ class TokenDispatcherConfig:
     moe_permute_fusion: bool = False
     """Fuse token rearrangement ops during token dispatching."""
 
-    moe_expert_capacity_factor: Optional[float] = None
+    moe_expert_capacity_factor: float | None = None
     """moe_expert_capacity_factor (float): The capacity factor for each expert, None means no token
     will be dropped. The default is None."""
 
     moe_router_topk: int = 2
     """Number of experts to route to for each token."""
 
-    moe_router_expert_pad_multiple: Optional[int] = None
+    moe_router_expert_pad_multiple: int | None = None
     """Number of tokens to pad to a multiple of for each expert."""
 
     num_moe_experts: int = 64
@@ -531,7 +531,7 @@ class TokenDispatcherConfig:
     """Share one communication manager instance across MoE layers for the configured backend."""
 
     moe_deepep_async_dispatch: bool = False
-    """Use asynchronous DeepEP/UCCL-EP dispatch and allocate dispatched tensors on the communication stream."""
+    """Use asynchronous DeepEP/UCCL-EP dispatch/combine and communication-stream allocations."""
 
 
 class MoEFlexTokenDispatcher:
@@ -569,7 +569,7 @@ class MoEFlexTokenDispatcher:
 
         self.num_local_experts = num_local_experts
         self.local_expert_indices = local_expert_indices
-        self.hybridep_metadata_processor: Optional[_HybridEPMetadataProcessor] = None
+        self.hybridep_metadata_processor: _HybridEPMetadataProcessor | None = None
         assert self.tp_size * self.ep_size > 1, "Flex token dispatcher requires TPxEP > 1"
 
         backend = self.config.moe_flex_dispatcher_backend
@@ -838,7 +838,12 @@ class MoEFlexTokenDispatcher:
         3. Post-process the combined tokens to match the original input shape
         """
         hidden_states = self.combine_preprocess(hidden_states)
-        hidden_states = self.combine_all_to_all(hidden_states, False, False)
+        async_combine = isinstance(self._comm_manager, _DeepepManager) and self.config.moe_deepep_async_dispatch
+        hidden_states = self.combine_all_to_all(
+            hidden_states,
+            async_finish=async_combine,
+            allocate_on_comm_stream=async_combine,
+        )
         hidden_states = self.combine_postprocess(hidden_states)
 
         return hidden_states

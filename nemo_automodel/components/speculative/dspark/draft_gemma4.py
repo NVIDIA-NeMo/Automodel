@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -105,11 +104,11 @@ class Gemma4DSparkAttention(nn.Module):
         hidden_states: torch.Tensor,
         target_hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        attention_mask: Optional[torch.Tensor],
-        past_key_values: Optional[Cache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
+        attention_mask: torch.Tensor | None,
+        past_key_values: Cache | None = None,
+        cache_position: torch.LongTensor | None = None,
         **kwargs,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         bsz, q_len = hidden_states.shape[:-1]
         ctx_len = target_hidden_states.shape[1]
         q = self.q_proj(hidden_states).view(
@@ -210,15 +209,15 @@ class Gemma4DSparkDecoderLayer(GradientCheckpointingLayer):
 
     def forward(
         self,
-        target_hidden_states: Optional[torch.Tensor] = None,
-        hidden_states: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Cache] = None,
-        output_attentions: Optional[bool] = False,
-        use_cache: Optional[bool] = False,
-        cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        target_hidden_states: torch.Tensor | None = None,
+        hidden_states: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_value: Cache | None = None,
+        output_attentions: bool | None = False,
+        use_cache: bool | None = False,
+        cache_position: torch.LongTensor | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs,
     ) -> torch.Tensor:
         del position_ids, output_attentions, use_cache
@@ -361,8 +360,8 @@ class Gemma4DSparkModel(Gemma4PreTrainedModel):
     def predict_confidence_step(
         self,
         hidden_states: torch.Tensor,
-        prev_token_ids: Optional[torch.Tensor] = None,
-    ) -> Optional[torch.Tensor]:
+        prev_token_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor | None:
         if self.confidence_head is None:
             return None
         if self.confidence_head_with_markov:
@@ -379,7 +378,7 @@ class Gemma4DSparkModel(Gemma4PreTrainedModel):
         *,
         first_prev_token_ids: torch.Tensor,
         temperature: float = 0.0,
-        hidden_states: Optional[torch.Tensor] = None,
+        hidden_states: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, proposal_len = base_logits.shape[:2]
         if proposal_len == 0:
@@ -405,7 +404,7 @@ class Gemma4DSparkModel(Gemma4PreTrainedModel):
         *,
         prev_token_ids: torch.Tensor,
         temperature: float = 0.0,
-        hidden_states: Optional[torch.Tensor] = None,
+        hidden_states: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         assert base_logits.ndim == 2, (
             f"sample_draft_token_step expects base_logits shaped [batch, vocab], got {tuple(base_logits.shape)}."
@@ -428,10 +427,10 @@ class Gemma4DSparkModel(Gemma4PreTrainedModel):
         self,
         *,
         position_ids: torch.LongTensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        noise_embedding: Optional[torch.Tensor] = None,
-        target_hidden_states: Optional[torch.Tensor] = None,
-        past_key_values: Optional[Cache] = None,
+        attention_mask: torch.Tensor | None = None,
+        noise_embedding: torch.Tensor | None = None,
+        target_hidden_states: torch.Tensor | None = None,
+        past_key_values: Cache | None = None,
         use_cache: bool = False,
         **kwargs,
     ) -> torch.Tensor:
@@ -460,7 +459,7 @@ class Gemma4DSparkModel(Gemma4PreTrainedModel):
         input_ids: torch.Tensor,
         target_hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
-        target_last_hidden_states: Optional[torch.Tensor] = None,
+        target_last_hidden_states: torch.Tensor | None = None,
     ) -> DSparkForwardOutput:
         bsz, seq_len = input_ids.shape
         device = input_ids.device

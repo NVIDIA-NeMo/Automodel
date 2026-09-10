@@ -31,6 +31,7 @@ from generate import (  # noqa: E402
     IDLMSampler,
     LLaDA2Sampler,
     LLaDASampler,
+    SCDDSampler,
     encode_generation_prompts,
     generate_gemma,
     generate_llada2,
@@ -458,3 +459,173 @@ def test_translate_adapter_reparents_gemma_module_paths(tmp_path):
     cfg = json.loads((out / "adapter_config.json").read_text())
     assert cfg["target_modules"] == ["model.decoder.layers.3.self_attn.q_proj"]
     assert cfg["r"] == 2  # non-key fields untouched
+
+
+class _FakeSCDDDenoiser(torch.nn.Module):
+    """Denoiser that puts (almost) all mass on one token, position-independent.
+
+    ``switch_after`` flips the prediction from ``target`` to ``revised`` once
+    that many forward passes have run, which simulates a model changing its mind
+    about tokens it already committed.
+    """
+
+    def __init__(self, target: int, vocab_size: int = 16, revised: int | None = None, switch_after: int = 0):
+        super().__init__()
+        self.anchor = torch.nn.Parameter(torch.zeros(1))
+        self.target = target
+        self.revised = revised
+        self.switch_after = switch_after
+        self.vocab_size = vocab_size
+        self.calls = 0
+
+    def forward(self, x, attention_mask=None):
+        """Run the fake denoiser.
+
+        Args:
+            x: Token IDs of shape ``[batch, sequence]``.
+            attention_mask: Binary mask of shape ``[batch, sequence]``; unused.
+
+        Returns:
+            Namespace whose ``logits`` have shape ``[batch, sequence, vocab]``.
+        """
+        B, L = x.shape
+        token = self.target
+        if self.revised is not None and self.calls >= self.switch_after:
+            token = self.revised
+        self.calls += 1
+        logits = torch.zeros(B, L, self.vocab_size)
+        logits[:, :, token] = 30.0
+        return types.SimpleNamespace(logits=logits)
+
+
+def test_scdd_sampler_is_registered():
+    assert SAMPLERS["scdd"] is SCDDSampler
+    cfg = SCDDSampler.default_config
+    # Ancestral sampling must be stochastic, and every position is rewritten each
+    # step so there is nothing to cache.
+    assert cfg.temperature == 1.0
+    assert cfg.use_kv_cache is False
+
+
+def test_scdd_rejects_kv_cache():
+    sampler = SCDDSampler(_FakeSCDDDenoiser(target=7), mask_id=9, eos_id=0)
+    with pytest.raises(ValueError, match="use_kv_cache"):
+        sampler.sample([[1, 2]], use_kv_cache=True)
+
+
+def test_scdd_leaves_no_mask_tokens_and_preserves_the_prompt():
+    mask_id = 9
+    sampler = SCDDSampler(
+        _FakeSCDDDenoiser(target=7),
+        mask_id=mask_id,
+        eos_id=0,
+        steps=8,
+        max_new_tokens=6,
+        temperature=1.0,
+        uniform_ratio=0.1,
+    )
+
+    out = sampler.sample([[1, 2]])
+
+    assert out.shape == (1, 8)
+    assert torch.equal(out[0, :2], torch.tensor([1, 2])), "the prompt must never be resampled"
+    assert (out == mask_id).sum().item() == 0, "residual [MASK] survived the final denoise"
+    assert (out[0, 2:] == 7).all(), "a near-deterministic denoiser should drive every canvas position"
+
+
+def test_scdd_corrects_tokens_it_already_committed():
+    """The defining SCDD behaviour: a non-[MASK] token the denoiser no longer
+    agrees with is overwritten. An absorbing sampler, which only ever fills
+    [MASK], would leave the stale token in place."""
+    mask_id = 9
+    model = _FakeSCDDDenoiser(target=3, revised=7, switch_after=2)
+    sampler = SCDDSampler(model, mask_id=mask_id, eos_id=0, steps=16, max_new_tokens=4, uniform_ratio=0.2)
+
+    torch.manual_seed(0)
+    out = sampler.sample([[1]])
+
+    assert model.calls > 2, "the switch must happen mid-decode for this to test anything"
+    assert (out[0, 1:] == 7).all(), "positions committed as 3 were never revised to 7"
+
+
+def test_scdd_infill_is_rejected_before_loading(monkeypatch, capsys):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["generate.py", "--checkpoint", "unused", "--prompt", "hello", "--sampler", "scdd", "--infill"],
+    )
+    with pytest.raises(SystemExit, match="2"):
+        main()
+    assert "--infill is not supported by the SCDD sampler" in capsys.readouterr().err
+
+
+def test_scdd_schedule_flags_reach_the_sampler_config(monkeypatch):
+    captured = {}
+
+    def _fake_load(checkpoint_path, sampler_name="llada", mask_id_override=None):
+        return _FakeSCDDDenoiser(target=7), _FakeChatTokenizer(), 9, 0
+
+    import generate as generate_mod
+
+    monkeypatch.setattr(generate_mod, "load_model_and_tokenizer", _fake_load)
+    monkeypatch.setattr(generate_mod, "resolve_checkpoint", lambda p: p)
+    monkeypatch.setattr(
+        generate_mod,
+        "encode_generation_prompts",
+        lambda tokenizer, prompts, raw: (_ for _ in ()).throw(_Captured(captured)),
+    )
+
+    class _Captured(Exception):
+        def __init__(self, store):
+            super().__init__("stop")
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "generate.py",
+            "--checkpoint",
+            "unused",
+            "--prompt",
+            "hello",
+            "--sampler",
+            "scdd",
+            "--uniform_ratio",
+            "0.3",
+            "--schedule_shape",
+            "2.0",
+            "--schedule_peak",
+            "0.25",
+        ],
+    )
+    with pytest.raises(_Captured):
+        main()
+
+
+def test_scdd_zero_temperature_collapses_the_denoiser():
+    """``temperature=0`` must give a one-hot distribution over the argmax and
+    never put mass on [MASK] — the path the final residual-mask denoise uses."""
+    mask_id = 9
+    sampler = SCDDSampler(_FakeSCDDDenoiser(target=7), mask_id=mask_id, eos_id=0)
+    x = torch.tensor([[1, mask_id, mask_id]])
+    attention_mask = torch.ones_like(x)
+
+    log_p = sampler._denoiser_log_probs(x, attention_mask, 0.0)
+    probs = log_p.exp()
+
+    assert torch.allclose(probs.sum(-1), torch.ones(1, 3), atol=1e-5)
+    assert (probs.argmax(-1) == 7).all()
+    assert torch.allclose(probs[..., mask_id], torch.zeros(1, 3)), "[MASK] must be outside the domain"
+
+
+def test_scdd_degenerate_schedule_still_terminates():
+    """uniform_ratio=0 removes the correction channel, which makes the
+    visible-token posterior unreachable; the sampler must fall back to keeping
+    the current token rather than handing multinomial an all-zero row."""
+    mask_id = 9
+    sampler = SCDDSampler(
+        _FakeSCDDDenoiser(target=7), mask_id=mask_id, eos_id=0, steps=4, max_new_tokens=4, uniform_ratio=0.0
+    )
+    out = sampler.sample([[1]])
+    assert out.shape == (1, 5)
+    assert (out == mask_id).sum().item() == 0

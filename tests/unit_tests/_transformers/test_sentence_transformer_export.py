@@ -70,14 +70,24 @@ def test_generated_sentence_transformer_assets_regenerate_semantics_and_preserve
         "max_seq_length": 8192,
         "do_lower_case": False,
     }
-    assert json.loads((metadata_dir / "modules.json").read_text())[-1] == {
+    modules = json.loads((metadata_dir / "modules.json").read_text())
+    assert [module["type"] for module in modules] == [
+        "sentence_transformers.base.modules.transformer.Transformer",
+        "sentence_transformers.sentence_transformer.modules.pooling.Pooling",
+        "sentence_transformers.sentence_transformer.modules.normalize.Normalize",
+    ]
+    assert modules[-1] == {
         "idx": 2,
         "name": "2",
         "path": "2_Normalize",
-        "type": "sentence_transformers.models.Normalize",
+        "type": "sentence_transformers.sentence_transformer.modules.normalize.Normalize",
     }
     pooling_config = json.loads((metadata_dir / "1_Pooling" / "config.json").read_text())
-    assert pooling_config["pooling_mode_mean_tokens"] is True
+    assert pooling_config == {
+        "embedding_dimension": 8,
+        "pooling_mode": "mean",
+        "include_prompt": True,
+    }
 
 
 def test_inferred_sentence_transformer_max_seq_length_uses_smallest_finite_capability():
@@ -375,6 +385,168 @@ def test_sentence_transformer_source_with_unsupported_module_is_rejected(tmp_pat
     (tmp_path / "1_Pooling" / "config.json").write_text(json.dumps({"pooling_mode_mean_tokens": True}))
 
     with pytest.raises(ValueError, match="exact supported module stack"):
+        sentence_transformer_export._load_sentence_transformer_wrapper_options(str(tmp_path), {})
+
+
+@pytest.mark.parametrize("module_count", [0, 1, 4])
+def test_sentence_transformer_source_with_invalid_stack_length_is_rejected(tmp_path, module_count):
+    (tmp_path / "1_Pooling").mkdir()
+    module_types = [
+        "sentence_transformers.models.Transformer",
+        "sentence_transformers.models.Pooling",
+        "sentence_transformers.models.Normalize",
+        "sentence_transformers.models.Dense",
+    ]
+    modules = [
+        {
+            "idx": index,
+            "path": "" if index == 0 else ("1_Pooling" if index == 1 else str(index)),
+            "type": module_type,
+        }
+        for index, module_type in enumerate(module_types[:module_count])
+    ]
+    (tmp_path / "modules.json").write_text(json.dumps(modules))
+    (tmp_path / "1_Pooling" / "config.json").write_text(json.dumps({"pooling_mode_mean_tokens": True}))
+
+    with pytest.raises(ValueError, match="exact supported module stack"):
+        sentence_transformer_export._load_sentence_transformer_wrapper_options(str(tmp_path), {})
+
+
+@pytest.mark.parametrize(
+    "module_types, expected_normalize",
+    [
+        (
+            [
+                "sentence_transformers.base.modules.transformer.Transformer",
+                "sentence_transformers.sentence_transformer.modules.pooling.Pooling",
+            ],
+            False,
+        ),
+        (
+            [
+                "sentence_transformers.base.modules.transformer.Transformer",
+                "sentence_transformers.sentence_transformer.modules.pooling.Pooling",
+                "sentence_transformers.sentence_transformer.modules.normalize.Normalize",
+            ],
+            True,
+        ),
+    ],
+)
+def test_sentence_transformer_source_accepts_canonical_module_paths(tmp_path, module_types, expected_normalize):
+    (tmp_path / "1_Pooling").mkdir()
+    modules = [
+        {
+            "idx": index,
+            "path": "" if index == 0 else ("1_Pooling" if index == 1 else "2_Normalize"),
+            "type": module_type,
+        }
+        for index, module_type in enumerate(module_types)
+    ]
+    (tmp_path / "modules.json").write_text(json.dumps(modules))
+    (tmp_path / "1_Pooling" / "config.json").write_text(json.dumps({"pooling_mode_mean_tokens": True}))
+
+    options = sentence_transformer_export._load_sentence_transformer_wrapper_options(str(tmp_path), {})
+
+    assert options is not None
+    assert options.pooling == "avg"
+    assert options.l2_normalize is expected_normalize
+
+
+@pytest.mark.parametrize(
+    "module_types",
+    [
+        [
+            "sentence_transformers.base.modules.transformer.Transformer",
+            "sentence_transformers.models.Pooling",
+        ],
+        [
+            "sentence_transformers.models.Transformer",
+            "sentence_transformers.sentence_transformer.modules.pooling.Pooling",
+        ],
+    ],
+)
+def test_sentence_transformer_source_accepts_mixed_module_path_generations(tmp_path, module_types):
+    (tmp_path / "1_Pooling").mkdir()
+    (tmp_path / "modules.json").write_text(
+        json.dumps(
+            [
+                {"idx": 0, "path": "", "type": module_types[0]},
+                {"idx": 1, "path": "1_Pooling", "type": module_types[1]},
+            ]
+        )
+    )
+    (tmp_path / "1_Pooling" / "config.json").write_text(json.dumps({"pooling_mode_mean_tokens": True}))
+
+    options = sentence_transformer_export._load_sentence_transformer_wrapper_options(str(tmp_path), {})
+
+    assert options is not None
+    assert options.pooling == "avg"
+    assert options.l2_normalize is False
+
+
+@pytest.mark.parametrize(
+    "pooling_config, expected_pooling",
+    [
+        ({"pooling_mode": "mean"}, "avg"),
+        ({"pooling_mode": "cls"}, "cls"),
+        ({"pooling_mode": "lasttoken"}, "last"),
+    ],
+)
+def test_sentence_transformer_source_accepts_canonical_pooling_config(tmp_path, pooling_config, expected_pooling):
+    (tmp_path / "1_Pooling").mkdir()
+    (tmp_path / "modules.json").write_text(
+        json.dumps(
+            [
+                {
+                    "idx": 0,
+                    "path": "",
+                    "type": "sentence_transformers.base.modules.transformer.Transformer",
+                },
+                {
+                    "idx": 1,
+                    "path": "1_Pooling",
+                    "type": "sentence_transformers.sentence_transformer.modules.pooling.Pooling",
+                },
+            ]
+        )
+    )
+    (tmp_path / "1_Pooling" / "config.json").write_text(json.dumps(pooling_config))
+
+    options = sentence_transformer_export._load_sentence_transformer_wrapper_options(str(tmp_path), {})
+
+    assert options is not None
+    assert options.pooling == expected_pooling
+    assert options.l2_normalize is False
+
+
+@pytest.mark.parametrize(
+    "pooling_config",
+    [
+        {"pooling_mode": ["mean", "cls"]},
+        {"pooling_mode": "max"},
+    ],
+)
+def test_sentence_transformer_source_rejects_unrepresentable_canonical_pooling_config(tmp_path, pooling_config):
+    (tmp_path / "1_Pooling").mkdir()
+    (tmp_path / "modules.json").write_text(
+        json.dumps(
+            [
+                {
+                    "idx": 0,
+                    "path": "",
+                    "type": "sentence_transformers.base.modules.transformer.Transformer",
+                },
+                {
+                    "idx": 1,
+                    "path": "1_Pooling",
+                    "type": "sentence_transformers.sentence_transformer.modules.pooling.Pooling",
+                },
+            ]
+        )
+    )
+    (tmp_path / "1_Pooling" / "config.json").write_text(json.dumps(pooling_config))
+
+    with pytest.raises(ValueError, match="single NeMo avg, cls, or last mode"):
         sentence_transformer_export._load_sentence_transformer_wrapper_options(str(tmp_path), {})
 
 

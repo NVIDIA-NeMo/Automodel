@@ -36,7 +36,7 @@ env:
 
 jobs:
   pre-flight:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@c1a0837f362a1a696e647238ab1cf916b2a7cf4a # v1.8.6
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@cf5acebace78c7c339bc1f804357a991336f1c4d # v1.8.10
     with:
       default_runner_prefix: ${{ vars.DEFAULT_RUNNER_PREFIX }}
       non_nvidia_runner_prefix: ${{ vars.NON_NVIDIA_RUNNER_PREFIX }}
@@ -459,8 +459,8 @@ jobs:
       matrix:
         include:
           - test-name: L2_Pretrain_and_KD
-            test-folder: llm_pretrain_and_kd
-            timeout: 20
+            test-folder: llm_pretrain_and_kd,speculative
+            timeout: 30
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           - test-name: L2_HF_DCP
@@ -508,9 +508,21 @@ jobs:
             timeout: 20
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
+          - test-name: L2_Diffusion
+            test-folder: diffusion,dllm
+            timeout: 30
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}
+            test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           - test-name: L2_MoE
             test-folder: moe
             timeout: 20
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}
+            test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
+          - test-name: L2_Parallelism
+            test-folder: parallelism
+            # Each parity test runs the proxy twice (1-rank baseline + 2-rank
+            # parallel), so the budget is roughly double a single smoke test.
+            timeout: 40
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
     needs: [pre-flight, cicd-unit-tests]
@@ -591,6 +603,9 @@ jobs:
           - test-name: L2_MoE
             test-folder: moe
             timeout: 20
+          - test-name: L2_Parallelism
+            test-folder: parallelism
+            timeout: 40
     needs: [pre-flight, cicd-unit-tests, cicd-container-build]
     runs-on: ${{ matrix.runner || 'nemo-ci-gcp-gpu-x2' }}
     name: gb200_${{ matrix.test-name }}
@@ -650,7 +665,6 @@ jobs:
         shell: bash -x -e -u -o pipefail {0}
         env:
           GH_TOKEN: ${{ github.token }}
-          RUN_ID: ${{ github.run_id }}
           SKIPPING_IS_ALLOWED: ${{ needs.pre-flight.outputs.docs_only == 'true' || needs.pre-flight.outputs.is_deployment_workflow == 'true' || needs.pre-flight.outputs.is_ci_workload == 'true' }}
           IS_MEMBER: ${{ needs.pre-flight.outputs.is_member }}
           DISABLE_GB200_TESTS: ${{ vars.DISABLE_GB200_TESTS }}

@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import logging
-from typing import Optional
 
 from torch.distributed.device_mesh import DeviceMesh
 
@@ -33,6 +32,25 @@ from nemo_automodel.components.distributed.parallelizer import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def fsdp2_sharding_enabled(device_mesh: DeviceMesh) -> bool:
+    """Report whether :meth:`FSDP2Manager.parallelize` shards the model for this mesh.
+
+    Parallelization is skipped on a single-rank world or a single-element mesh, which
+    also skips every side effect of ``fully_shard`` — most importantly the
+    ``MixedPrecisionPolicy`` cast of parameters to the compute dtype. Callers that
+    depend on that cast must check this instead of assuming FSDP2 is active.
+
+    Args:
+        device_mesh: Device mesh the ``FSDP2Manager`` was constructed with.
+
+    Returns:
+        True when ``fully_shard`` is applied, False when parallelization is skipped.
+    """
+    if get_world_size_safe() == 1 or device_mesh.size() == 1:
+        return False
+    return True
 
 
 def _patch_is_packed_sequence_for_training() -> None:
@@ -91,7 +109,7 @@ class FSDP2Manager:
         self,
         config: FSDP2Config,
         device_mesh: DeviceMesh,
-        moe_mesh: Optional[DeviceMesh] = None,
+        moe_mesh: DeviceMesh | None = None,
     ):
         self.config = config
         self.device_mesh = device_mesh
@@ -123,7 +141,7 @@ class FSDP2Manager:
         Returns:
             The parallelized model.
         """
-        if get_world_size_safe() == 1 or self.device_mesh.size() == 1:
+        if not fsdp2_sharding_enabled(self.device_mesh):
             logger.info("World size or FSDP mesh size is 1, skipping parallelization.")
             if self.activation_checkpointing:
                 if is_selective_activation_checkpointing(self.activation_checkpointing):

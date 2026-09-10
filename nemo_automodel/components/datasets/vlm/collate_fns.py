@@ -13,7 +13,7 @@
 # limitations under the License.
 import logging
 import random
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 from unittest.mock import MagicMock
 
 import torch
@@ -218,7 +218,7 @@ def build_labels(
 # ---------------------------------------------------------------------------
 
 
-def _get_assistant_marker(tokenizer) -> Optional[List[int]]:
+def _get_assistant_marker(tokenizer) -> List[int] | None:
     """Return the token-id sequence that introduces an assistant turn.
 
     For Qwen-family models the marker is ``[<|im_start|>, assistant, \\n]``.
@@ -236,7 +236,7 @@ def _get_assistant_marker(tokenizer) -> Optional[List[int]]:
         return None
 
 
-def _get_stop_token_id(tokenizer) -> Optional[int]:
+def _get_stop_token_id(tokenizer) -> int | None:
     """Return the token id of the turn-ending marker (``<|im_end|>``)."""
     try:
         tid = tokenizer.convert_tokens_to_ids("<|im_end|>")
@@ -713,7 +713,7 @@ def qwen3_omni_collate_fn(
 def kimi_vl_collate_fn(
     examples: Sequence[Dict[str, Any]],
     processor,
-    max_length: Optional[int] = None,
+    max_length: int | None = None,
 ) -> Dict[str, torch.Tensor]:
     """Collate function for KimiVL processors."""
     conversations = [example["conversation"] for example in examples]
@@ -848,7 +848,7 @@ def _expand_image_tokens(
 def kimi_k25_vl_collate_fn(
     examples: Sequence[Dict[str, Any]],
     processor,
-    max_length: Optional[int] = None,
+    max_length: int | None = None,
     drop_overlong: bool = False,
 ) -> Dict[str, torch.Tensor]:
     """Collate function for Kimi K2.5 VL processors with pre-expanded image tokens.
@@ -1253,7 +1253,7 @@ def _drop_overlong_samples(conversations, processor, max_length):
 def default_collate_fn(
     examples: Sequence[Dict[str, Any]],
     processor,
-    max_length: Optional[int] = None,
+    max_length: int | None = None,
     drop_overlong: bool = False,
     _post_tokenize_hook=None,
 ) -> dict[str, Any]:
@@ -1381,7 +1381,7 @@ def _merge_media_values(values: list[Any]) -> torch.Tensor | list[Any]:
 def pad_collate_fn(
     examples: Sequence[Dict[str, Any]],
     processor,
-    max_length: Optional[int] = None,
+    max_length: int | None = None,
 ) -> Dict[str, torch.Tensor]:
     """Collate function for pre-tokenized samples (from :class:`PreTokenizedDatasetWrapper`).
 
@@ -1773,7 +1773,7 @@ def packed_sequence_thd_vlm_collater(
 def nemotron_omni_collate_fn(
     examples: Sequence[Dict[str, Any]],
     processor,
-    max_length: Optional[int] = None,
+    max_length: int | None = None,
     max_video_frames: int = 8,
 ) -> Dict[str, torch.Tensor]:
     """Collate for NemotronOmni (image / video / audio).
@@ -1813,12 +1813,12 @@ def nemotron_omni_collate_fn(
         sample_audio[idx] = waveform
 
     all_images: List[List[Any]] = []
-    all_videos: List[Optional[Tuple[List[Any], Optional[VideoMetadata]]]] = []
+    all_videos: List[Tuple[List[Any], VideoMetadata | None] | None] = []
     texts: List[str] = []
 
     for conversation in conversations:
         conv_images: List[Any] = []
-        conv_video: Optional[Tuple[List[Any], Optional[VideoMetadata]]] = None
+        conv_video: Tuple[List[Any], VideoMetadata | None] | None = None
         text_conversation = []
         for message in conversation:
             content = message.get("content")
@@ -2115,10 +2115,58 @@ def gemma4_inject_thinking_prefix(
     return _inject_thinking_prefix_tokens(batch, tokenizer)
 
 
+# Batch entries whose axis 1 is the text-token axis. Everything else in a VLM
+# batch is indexed by patch/frame and must not be sliced to a token count.
+_TOKEN_AXIS_KEYS: tuple[str, ...] = (
+    "input_ids",
+    "attention_mask",
+    "labels",
+    "token_type_ids",
+    "mm_token_type_ids",
+)
+
+
+def _truncate_token_axis(batch: Dict[str, torch.Tensor], max_length: int) -> None:
+    """Truncate the text-token axis of a batch in place.
+
+    Only the tensors listed in ``_TOKEN_AXIS_KEYS`` are indexed on axis 1 by text
+    token. Media tensors such as ``pixel_values`` of shape
+    ``[batch, patches, patch_dim]`` and ``image_position_ids`` of shape
+    ``[batch, patches, 2]`` are indexed by *patch*, so slicing them to a token
+    count silently decouples the image features from the placeholder tokens that
+    address them. Truncating by an allowlist keeps new media keys safe by default;
+    the previous denylist only spared ``pixel_values`` and clipped
+    ``image_position_ids`` alongside the text.
+
+    Args:
+        batch: Collated batch. Token-aligned entries have shape
+            ``[batch, sequence]``; media entries keep their own axis 1 and are
+            left untouched.
+        max_length: Maximum number of text tokens to keep.
+
+    Raises:
+        ValueError: If truncating would drop multimodal placeholder tokens, which
+            would leave more image features than positions to scatter them into.
+    """
+    media_marker = batch.get("mm_token_type_ids")
+    if isinstance(media_marker, torch.Tensor) and media_marker.dim() >= 2 and media_marker.size(1) > max_length:
+        if bool((media_marker[:, max_length:] != 0).any()):
+            raise ValueError(
+                f"max_length={max_length} cuts into multimodal tokens, which would leave image features "
+                "with no placeholder tokens to scatter into. Raise max_length above the prompt's image "
+                "token span, or drop the corresponding images before collation."
+            )
+
+    for key in _TOKEN_AXIS_KEYS:
+        value = batch.get(key)
+        if isinstance(value, torch.Tensor) and value.dim() >= 2 and value.size(1) > max_length:
+            batch[key] = value[:, :max_length]
+
+
 def gemma4_prefix_collate_fn(
     examples: Sequence[Dict[str, Any]],
     processor,
-    max_length: Optional[int] = None,
+    max_length: int | None = None,
 ) -> Dict[str, torch.Tensor]:
     """Collate function for Gemma4 models with thinking-channel prefix.
 
@@ -2132,10 +2180,7 @@ def gemma4_prefix_collate_fn(
     def _inject(batch, proc):
         batch = gemma4_inject_thinking_prefix(batch, proc)
         if max_length is not None and batch["input_ids"].size(1) > max_length:
-            for key in list(batch.keys()):
-                v = batch[key]
-                if isinstance(v, torch.Tensor) and v.dim() >= 2 and v.size(1) > max_length and key != "pixel_values":
-                    batch[key] = v[:, :max_length]
+            _truncate_token_axis(batch, max_length)
         return batch
 
     return default_collate_fn(examples, processor, max_length, _post_tokenize_hook=_inject)

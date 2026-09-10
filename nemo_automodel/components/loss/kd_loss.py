@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional
 
 import torch
 import torch.distributed.nn.functional as dist_nn_func
@@ -29,7 +28,7 @@ except Exception:
     _HAVE_DTENSOR = False
 
 
-def _infer_tp_group_from_dtensor(logits: torch.Tensor) -> Optional[torch.distributed.ProcessGroup]:
+def _infer_tp_group_from_dtensor(logits: torch.Tensor) -> torch.distributed.ProcessGroup | None:
     """If *logits* is a DTensor sharded on the vocab (last) dimension, return its TP process group.
 
     Iterates over the DTensor placements to find the mesh dimension that holds a vocab-dim
@@ -170,7 +169,7 @@ class KDLoss(nn.Module):
         ignore_index: int = -100,
         temperature: float = 1.0,
         fp32_upcast: bool = True,
-        tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        tp_group: torch.distributed.ProcessGroup | None = None,
         chunk_size: int = 0,
     ):
         super().__init__()

@@ -14,7 +14,7 @@
 
 import contextlib
 from functools import partial
-from typing import Any, List, Optional, Set
+from typing import Any, List, Set
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
@@ -118,7 +118,7 @@ def create_context_parallel_ctx(
     cp_buffers: List[torch.Tensor],
     cp_seq_dims: List[int],
     cp_no_restore_buffers: Set[torch.Tensor],
-    cp_rotate_method: Optional[str] = None,
+    cp_rotate_method: str | None = None,
 ):
     """
     Create a context parallel context.
@@ -387,7 +387,7 @@ def _prepare_cp_sharder(
     num_chunks: int = 1,
     loss_mask: torch.Tensor | None = None,
     invoke_pre_embed: bool = True,
-    extra_seq_buffers: Optional[dict[str, int]] = None,
+    extra_seq_buffers: dict[str, int] | None = None,
 ) -> ContextParallelSharder:
     """Resolve and configure a CP sharder for its public constructor.
 
@@ -464,14 +464,14 @@ def _prepare_cp_sharder(
 
 def _resolve_cp_sharder(
     cp_mesh,
-    model_sharder: Optional[ContextParallelSharder],
+    model_sharder: ContextParallelSharder | None,
     *,
     magi,
     is_thd: bool,
     num_chunks: int,
     seq_lens_padding_value: int,
     model,
-    extra_seq_buffers: Optional[dict[str, int]] = None,
+    extra_seq_buffers: dict[str, int] | None = None,
 ) -> ContextParallelSharder:
     """Resolve the ContextParallelSharder for this forward: model-owned > magi > TE > generic > none.
 
@@ -616,8 +616,8 @@ def _make_cp_batch_and_ctx(
     seq_lens_padding_value: int = -1000,
     magi=None,
     model=None,
-    cp_sharder: Optional[ContextParallelSharder] = None,
-    extra_seq_buffers: Optional[dict[str, int]] = None,
+    cp_sharder: ContextParallelSharder | None = None,
+    extra_seq_buffers: dict[str, int] | None = None,
 ):
     """
     Resolve a ContextParallelSharder and shard the batch; a no-op when no CP prep applies.

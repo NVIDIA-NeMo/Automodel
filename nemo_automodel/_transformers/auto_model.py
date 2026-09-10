@@ -132,7 +132,7 @@ def _reject_separate_distributed_kwargs(kwargs: dict) -> None:
 
 def _resolve_distributed_setup(
     *,
-    distributed_setup: Optional[DistributedSetup],
+    distributed_setup: DistributedSetup | None,
     device_mesh: Optional["DeviceMesh"] = None,
 ) -> DistributedSetup:
     """Return a setup, upcasting raw mesh inputs into topology-only setup."""
@@ -647,15 +647,15 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         *model_args,
         use_liger_kernel: bool = True,
         use_sdpa_patching: bool = True,
-        sdpa_method: Optional[List[Union[SDPBackend, str]]] = None,
+        sdpa_method: List[Union[SDPBackend, str]] | None = None,
         torch_dtype="auto",
         attn_implementation: str = DEFAULT_ATTN_IMPLEMENTATION,
         quantization_config=None,
         force_hf: bool = False,
-        distributed_setup: Optional[DistributedSetup] = None,
+        distributed_setup: DistributedSetup | None = None,
         device_mesh: Optional["DeviceMesh"] = None,
-        qat_config: Optional[QATConfig] = None,
-        peft_config: Optional[dict] = None,
+        qat_config: QATConfig | None = None,
+        peft_config: dict | None = None,
         fp8_config: Optional["FP8Config"] = None,
         compile_config: Optional["CompileConfig"] = None,
         **kwargs,
@@ -789,15 +789,15 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         *model_args,
         use_liger_kernel: bool = True,
         use_sdpa_patching: bool = True,
-        sdpa_method: Optional[List[Union[SDPBackend, str]]] = None,
+        sdpa_method: List[Union[SDPBackend, str]] | None = None,
         torch_dtype: Union[str, torch.dtype] = "auto",
         attn_implementation: str = DEFAULT_ATTN_IMPLEMENTATION,
         quantization_config=None,
         force_hf: bool = False,
-        distributed_setup: Optional[DistributedSetup] = None,
+        distributed_setup: DistributedSetup | None = None,
         device_mesh: Optional["DeviceMesh"] = None,
-        qat_config: Optional[QATConfig] = None,
-        peft_config: Optional[dict] = None,
+        qat_config: QATConfig | None = None,
+        peft_config: dict | None = None,
         fp8_config: Optional["FP8Config"] = None,
         compile_config: Optional["CompileConfig"] = None,
         **kwargs,
@@ -1061,7 +1061,7 @@ class _NeMoAutoModelForRetrievalBase:
     from ``nemo_automodel._transformers.retrieval``.
     """
 
-    _ENCODER_CLS_NAME: Optional[str] = None  # "BiEncoderModel" or "CrossEncoderModel"
+    _ENCODER_CLS_NAME: str | None = None  # "BiEncoderModel" or "CrossEncoderModel"
 
     @classmethod
     def from_pretrained(
@@ -1070,12 +1070,12 @@ class _NeMoAutoModelForRetrievalBase:
         attn_implementation: str = DEFAULT_ATTN_IMPLEMENTATION,
         use_liger_kernel: bool = True,
         use_sdpa_patching: bool = True,
-        sdpa_method: Optional[List[SDPBackend]] = None,
+        sdpa_method: List[SDPBackend] | None = None,
         torch_dtype="auto",
-        distributed_setup: Optional[DistributedSetup] = None,
+        distributed_setup: DistributedSetup | None = None,
         device_mesh: Optional["DeviceMesh"] = None,
         compile_config: Optional["CompileConfig"] = None,
-        peft_config: Optional[dict] = None,
+        peft_config: dict | None = None,
         **kwargs,
     ) -> PreTrainedModel:
         """Load an encoder model with infrastructure (FSDP, PEFT, kernel patching, etc.).

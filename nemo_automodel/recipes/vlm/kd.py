@@ -43,7 +43,7 @@ import logging
 import pathlib
 import time
 from contextlib import nullcontext
-from typing import Any, Optional
+from typing import Any
 
 import torch
 import wandb
@@ -413,7 +413,7 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
             if is_train:
                 (local_loss * self._get_dp_group_size(include_cp=True)).backward()
 
-    def _run_train_optim_step(self, batches, max_grad_norm: Optional[float] = None):
+    def _run_train_optim_step(self, batches, max_grad_norm: float | None = None):
         """Execute a single training step with KD loss tracking."""
         num_label_tokens = torch.tensor(
             sum((batch["labels"] != -100).sum().item() for batch in batches), dtype=torch.long

@@ -26,6 +26,28 @@ class StateDictAdapter(ABC):
     state dict format and other model state dict formats.
     """
 
+    _supports_write_through_checkpoint_load: bool = False
+    _supports_checkpoint_load_without_full_copy: bool = False
+
+    @property
+    def supports_write_through_checkpoint_load(self) -> bool:
+        """Whether every checkpoint tensor is loaded directly into the model's existing weight memory.
+
+        Enable this only when writing every tensor returned by ``to_hf`` for base-checkpoint loading updates the
+        model itself. This lets the loader skip a complete CPU copy of the checkpoint.
+        """
+        return self._supports_write_through_checkpoint_load
+
+    @property
+    def supports_checkpoint_load_without_full_copy(self) -> bool:
+        """Whether DCP can load this adapter without another full set of model weights.
+
+        Large checkpoint tensors must be loaded into the model's existing weight memory. Small temporary tensors are
+        allowed when they can be applied and discarded without making a model-sized copy. For example, Gemma4 loads
+        a scale tensor and applies it to already-loaded expert weights.
+        """
+        return self._supports_checkpoint_load_without_full_copy
+
     @abstractmethod
     def to_hf(self, state_dict: dict[str, Any], **kwargs) -> dict[str, Any]:
         """Convert from native model state dict to HuggingFace format.
@@ -84,3 +106,20 @@ class StateDictAdapter(ABC):
             Hugging Face state-dict keys in adapter iteration order.
         """
         return list(self.to_hf(state_dict, exclude_key_regex=r".*_extra_state.*", quantization=False))
+
+    def map_peft_target_module_to_hf(self, name: str) -> str:
+        """Translate a PEFT target-module name to the HuggingFace layout.
+
+        adapter_config.json's target_modules are collected from native module
+        names. Adapters whose ``to_hf`` renames modules (e.g. Kimi K3's
+        ``mlp.experts.{E}.gate_proj`` -> ``block_sparse_moe.experts.{E}.w1``)
+        should override this with the same renames so PEFT can resolve the
+        entries against the converted checkpoint.
+
+        Args:
+            name: A target-module name in native layout.
+
+        Returns:
+            The name in HuggingFace layout. Defaults to the name unchanged.
+        """
+        return name

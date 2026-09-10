@@ -42,6 +42,8 @@ class Qwen3VLMoeStateDictAdapter(StateDictAdapter):
                  shard, and wraps in DTensor via create_dtensor_from_local.
     """
 
+    _supports_write_through_checkpoint_load = True
+
     def __init__(
         self,
         config: Any,
@@ -56,7 +58,7 @@ class Qwen3VLMoeStateDictAdapter(StateDictAdapter):
         self._uses_model_prefix = True
 
     def to_hf(
-        self, state_dict: dict[str, Any], exclude_key_regex: Optional[str] = None, quantization: bool = False, **kwargs
+        self, state_dict: dict[str, Any], exclude_key_regex: str | None = None, quantization: bool = False, **kwargs
     ) -> dict[str, Any]:
         """Rename native keys to HF keys. Tensors passed through as-is (no comms)."""
         hf_state_dict = {}

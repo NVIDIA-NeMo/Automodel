@@ -345,6 +345,7 @@ def test_end_to_end_fixture_keys_not_applied_as_overrides(tmp_path):
         "    hf_adapter_ignored_key_prefix: base_model.model.mtp.  # fixture arg, must NOT become top-level\n"
         "    hf_kl_threshold: 5e-3                       # fixture arg, must NOT become top-level\n"
         "    training_reproducibility_loss_threshold: 1e-2  # fixture arg, must NOT become top-level\n"
+        "    resume_tolerance_profile: relaxed             # fixture arg, must NOT become top-level\n"
         "    resume_first_loss_threshold: 1e-6           # fixture arg, must NOT become top-level\n"
         "    source_load_kl_threshold: 1e-2              # fixture arg, must NOT become top-level\n"
         "    source_load_mean_kl_threshold: 1e-3         # fixture arg, must NOT become top-level\n"
@@ -367,6 +368,7 @@ def test_end_to_end_fixture_keys_not_applied_as_overrides(tmp_path):
     assert "skip_hf_logit_parity" not in resolved
     assert "hf_adapter_ignored_key_prefix" not in resolved
     assert "training_reproducibility_loss_threshold" not in resolved
+    assert "resume_tolerance_profile" not in resolved
     assert "resume_first_loss_threshold" not in resolved
     assert "source_load_kl_threshold" not in resolved
     assert "source_load_mean_kl_threshold" not in resolved
@@ -378,6 +380,7 @@ def test_end_to_end_fixture_keys_not_applied_as_overrides(tmp_path):
     assert resolved["ci"]["checkpoint_robustness"]["skip_hf_logit_parity"] is True
     assert resolved["ci"]["checkpoint_robustness"]["hf_adapter_ignored_key_prefix"] == "base_model.model.mtp."
     assert resolved["ci"]["checkpoint_robustness"]["training_reproducibility_loss_threshold"] == 1e-2
+    assert resolved["ci"]["checkpoint_robustness"]["resume_tolerance_profile"] == "relaxed"
     assert resolved["ci"]["checkpoint_robustness"]["resume_first_loss_threshold"] == 1e-6
     assert resolved["ci"]["checkpoint_robustness"]["source_load_kl_threshold"] == 1e-2
     assert resolved["ci"]["checkpoint_robustness"]["source_load_mean_kl_threshold"] == 1e-3

@@ -33,7 +33,6 @@ import glob
 import json
 import logging
 import os
-from typing import Optional
 
 import requests
 import torch
@@ -111,7 +110,7 @@ def apply_peft_to_model(model: NeMoAutoModelForImageTextToText, checkpoint_path:
 
 def load_model_from_checkpoint(
     checkpoint_path: str,
-    base_model_path: Optional[str] = None,
+    base_model_path: str | None = None,
     use_liger_kernel: bool = False,
 ) -> NeMoAutoModelForImageTextToText:
     """Load a VLM model from a checkpoint.

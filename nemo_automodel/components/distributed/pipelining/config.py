@@ -32,7 +32,7 @@ Usage:
 """
 
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Literal, Optional
+from typing import Any, Callable, Dict, List, Literal
 
 import torch
 
@@ -85,20 +85,20 @@ class PipelineConfig:
             shape inference. If None, it will be inferred from the dataset config.
     """
 
-    pp_schedule: Optional[str] = "1f1b"
-    pp_schedule_csv: Optional[str] = None
+    pp_schedule: str | None = "1f1b"
+    pp_schedule_csv: str | None = None
     pp_microbatch_size: int = 1
     pp_batch_size: int = 1
-    layers_per_stage: Optional[int] = None
-    round_virtual_stages_to_pp_multiple: Optional[Literal["up", "down"]] = None
-    module_fqns_per_model_part: Optional[List[List[str]]] = None
+    layers_per_stage: int | None = None
+    round_virtual_stages_to_pp_multiple: Literal["up", "down"] | None = None
+    module_fqns_per_model_part: List[List[str]] | None = None
     patch_inner_model: bool = True
     patch_causal_lm_model: bool = True
     patch_stage_backward_maybe_with_nosync: bool = False
-    dtype: Optional[torch.dtype] = None
+    dtype: torch.dtype | None = None
     scale_grads_in_schedule: bool = False
-    loss_fn: Optional[Callable] = None
-    pp_seq_len: Optional[int] = None
+    loss_fn: Callable | None = None
+    pp_seq_len: int | None = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert config to dictionary."""

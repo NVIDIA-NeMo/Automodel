@@ -44,6 +44,47 @@ def test_sharegpt_to_chatml_rejects_unknown_role():
         agent_chat._sharegpt_to_chatml([{"from": "narrator", "value": "x"}])
 
 
+@pytest.mark.parametrize(
+    "example",
+    [
+        {"messages": [{"role": "user", "content": "question"}, {"role": "assistant", "content": "answer"}]},
+        {"conversations": [{"from": "human", "value": "question"}, {"from": "gpt", "value": "answer"}]},
+    ],
+)
+def test_has_assistant_message_accepts_supported_schemas(example):
+    assert agent_chat._has_assistant_message(example)
+
+
+@pytest.mark.parametrize(
+    "example",
+    [
+        {},
+        {"messages": "invalid"},
+        {"messages": [{"role": "user", "content": "question"}, "invalid"]},
+        {"conversations": "invalid"},
+        {"conversations": [{"from": "human", "value": "question"}, "invalid"]},
+    ],
+)
+def test_has_assistant_message_rejects_incomplete_examples(example):
+    assert not agent_chat._has_assistant_message(example)
+
+
+def test_trim_after_last_assistant_removes_incomplete_tail():
+    messages = [
+        {"role": "user", "content": "question"},
+        {"role": "assistant", "content": "answer"},
+        {"role": "user", "content": "unfinished"},
+    ]
+
+    assert agent_chat._trim_after_last_assistant(messages) == messages[:2]
+
+
+def test_trim_after_last_assistant_leaves_user_only_trace_unchanged():
+    messages = [{"role": "user", "content": "question"}]
+
+    assert agent_chat._trim_after_last_assistant(messages) is messages
+
+
 def test_convert_messages_collapses_parallel_tool_calls_and_pairs_responses():
     messages = [
         {"role": "user", "content": "weather in BJ and SH?"},
@@ -81,6 +122,78 @@ def test_convert_messages_passes_string_arguments_through_unchanged():
     ]
     out = agent_chat._convert_messages(messages)
     assert out[1]["tool_calls"][0]["function"]["arguments"] == raw_args
+
+
+def test_convert_messages_preserves_openai_tool_calls_and_results():
+    messages = [
+        {"role": "user", "content": "Inspect the repository."},
+        {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "I should list the files.",
+            "tool_calls": [
+                {
+                    "id": "call_synth_1",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": {"command": "ls"}},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_synth_1", "name": "bash", "content": "README.md"},
+        {"role": "assistant", "content": "The repository contains a README."},
+    ]
+
+    out = agent_chat._convert_messages(messages, example_id="session")
+
+    assert out[1] == {
+        "role": "assistant",
+        "content": "",
+        "reasoning_content": "I should list the files.",
+        "tool_calls": [
+            {
+                "id": "call_synth_1",
+                "type": "function",
+                "function": {"name": "bash", "arguments": '{"command": "ls"}'},
+            }
+        ],
+    }
+    assert out[2] == {"role": "tool", "content": "README.md", "tool_call_id": "call_synth_1", "name": "bash"}
+
+
+def test_convert_messages_generates_missing_openai_tool_call_id():
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"type": "function", "function": {"name": "read", "arguments": {"path": "a.py"}}}],
+        },
+        {"role": "tool", "content": "contents"},
+    ]
+
+    out = agent_chat._convert_messages(messages, example_id="trace")
+
+    assert out[0]["tool_calls"][0]["id"] == "call_trace_0"
+    assert out[1]["tool_call_id"] == "call_trace_0"
+
+
+def test_convert_messages_accepts_empty_openai_tool_calls():
+    out = agent_chat._convert_messages([{"role": "assistant", "content": "done", "tool_calls": []}])
+
+    assert out == [{"role": "assistant", "content": "done", "tool_calls": []}]
+
+
+@pytest.mark.parametrize(
+    ("tool_calls", "match"),
+    [
+        ({}, "must be a list"),
+        (["bad"], "must be an object"),
+        ([{}], "missing `function`"),
+        ([{"function": {}}], "missing function `name`"),
+    ],
+)
+def test_convert_messages_rejects_malformed_openai_tool_calls(tool_calls, match):
+    with pytest.raises(ValueError, match=match):
+        agent_chat._convert_messages([{"role": "assistant", "content": "", "tool_calls": tool_calls}])
 
 
 def test_convert_messages_merges_tool_calls_into_prior_assistant_turn():
@@ -211,6 +324,32 @@ def test_format_example_supports_sharegpt_input(monkeypatch):
     assert [m["role"] for m in captured["formatted_text"]] == ["user", "assistant"]
 
 
+def test_format_example_trims_incomplete_last_turn(monkeypatch):
+    captured = {}
+
+    def fake_format_chat_template(**kwargs):
+        captured.update(kwargs)
+        return {}
+
+    monkeypatch.setattr(agent_chat, "format_chat_template", fake_format_chat_template)
+
+    class Tok:
+        eos_token_id = 0
+        pad_token_id = 0
+
+    example = {
+        "messages": [
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": "answer"},
+            {"role": "user", "content": "unfinished"},
+        ]
+    }
+
+    agent_chat._format_example(example, Tok(), 0, 0, trim_incomplete_last_turn=True)
+
+    assert captured["formatted_text"] == example["messages"][:2]
+
+
 def test_format_example_rejects_missing_messages_and_conversations():
     class Tok:
         eos_token_id = 0
@@ -243,7 +382,11 @@ def test_make_agent_chat_dataset_requires_exactly_one_source():
 
 def test_make_agent_chat_dataset_loads_hub_split_with_limit(monkeypatch):
     rows = [
-        {"id": 0, "messages": [{"role": "user", "content": "q0"}], "tools": []},
+        {
+            "id": 0,
+            "messages": [{"role": "user", "content": "q0"}, {"role": "assistant", "content": "a0"}],
+            "tools": [],
+        },
         {"id": 1, "messages": [{"role": "user", "content": "q1"}], "tools": []},
     ]
     captured_load = {}
@@ -258,10 +401,14 @@ def test_make_agent_chat_dataset_loads_hub_split_with_limit(monkeypatch):
         def __len__(self):
             return len(self.items)
 
-    def fake_load_dataset(name_or_loader, split=None, data_files=None):
+        def filter(self, predicate):
+            return DummyDataset([item for item in self.items if predicate(item)])
+
+    def fake_load_dataset(name_or_loader, split=None, data_files=None, revision=None):
         captured_load["name"] = name_or_loader
         captured_load["split"] = split
         captured_load["data_files"] = data_files
+        captured_load["revision"] = revision
         return DummyDataset(rows)
 
     monkeypatch.setattr(agent_chat, "load_dataset", fake_load_dataset)
@@ -275,12 +422,99 @@ def test_make_agent_chat_dataset_loads_hub_split_with_limit(monkeypatch):
         tokenizer=Tok(),
         dataset_name="dummy/agent",
         split="train",
+        revision="refs/convert/parquet",
+        filter_no_assistant=True,
         limit_dataset_samples=2,
     )
 
     assert captured_load["name"] == "dummy/agent"
     assert captured_load["split"] == "train[:2]"
-    assert [ds[i] for i in range(len(ds))] == [{"formatted": 0}, {"formatted": 1}]
+    assert captured_load["revision"] == "refs/convert/parquet"
+    assert [ds[i] for i in range(len(ds))] == [{"formatted": 0}]
+
+
+def test_make_agent_chat_dataset_filters_overlong_examples(monkeypatch):
+    rows = [
+        {"id": 0, "messages": [{"role": "assistant", "content": "short"}], "tools": []},
+        {"id": 1, "messages": [{"role": "assistant", "content": "long"}], "tools": []},
+        {"id": 2, "messages": [{"role": "assistant", "content": "exact"}], "tools": []},
+    ]
+
+    class DummyDataset:
+        def __init__(self, items):
+            self.items = items
+
+        def __getitem__(self, idx):
+            return self.items[idx]
+
+        def __len__(self):
+            return len(self.items)
+
+        def filter(self, predicate):
+            return DummyDataset([item for item in self.items if predicate(item)])
+
+    monkeypatch.setattr(agent_chat, "load_dataset", lambda *args, **kwargs: DummyDataset(rows))
+    monkeypatch.setattr(agent_chat, "_add_pad_token", lambda tokenizer: 0)
+
+    def fake_format(example, *args, seq_length=None, truncation=False, **kwargs):
+        length = {0: 2, 1: 6, 2: 4}[example["id"]]
+        if truncation and seq_length is not None:
+            length = min(length, seq_length)
+        return {"input_ids": list(range(length)), "labels": list(range(length))}
+
+    monkeypatch.setattr(agent_chat, "_format_example", fake_format)
+
+    ds = agent_chat.make_agent_chat_dataset(
+        tokenizer=object(),
+        dataset_name="dummy/agent",
+        seq_length=4,
+        truncation=True,
+        filter_overlong=True,
+    )
+
+    # id=1 renders to seq_length + 1 tokens under the probe budget and is dropped;
+    # id=2 lands on exactly seq_length, which fits, so it is kept.
+    assert len(ds) == 2
+    assert ds[0]["input_ids"] == [0, 1]
+    assert ds[1]["input_ids"] == [0, 1, 2, 3]
+
+
+def test_make_agent_chat_dataset_filter_overlong_requires_seq_length():
+    with pytest.raises(ValueError, match="requires `seq_length`"):
+        agent_chat.make_agent_chat_dataset(
+            tokenizer=object(),
+            dataset_name="dummy/agent",
+            filter_overlong=True,
+        )
+
+
+def test_make_agent_chat_dataset_applies_chat_template_override(monkeypatch, tmp_path):
+    template_path = tmp_path / "chat_template.jinja"
+    template_path.write_text("{% generation %}{{ message.reasoning_content }}{% endgeneration %}")
+
+    class DummyDataset:
+        def __getitem__(self, idx):
+            return {"id": idx}
+
+        def __len__(self):
+            return 1
+
+    monkeypatch.setattr(agent_chat, "load_dataset", lambda *args, **kwargs: DummyDataset())
+    monkeypatch.setattr(agent_chat, "_add_pad_token", lambda tokenizer: 0)
+    monkeypatch.setattr(agent_chat, "_format_example", lambda example, *args, **kwargs: example)
+
+    class Tokenizer:
+        eos_token_id = 0
+        chat_template = "original"
+
+    tokenizer = Tokenizer()
+    agent_chat.make_agent_chat_dataset(
+        tokenizer=tokenizer,
+        dataset_name="dummy/agent",
+        chat_template=str(template_path),
+    )
+
+    assert tokenizer.chat_template == template_path.read_text()
 
 
 def test_convert_messages_orphan_tool_response_gets_synthetic_id():
@@ -667,7 +901,11 @@ class _LenTok:
         truncation=None,
         max_length=None,
     ):
+        self.max_lengths = getattr(self, "max_lengths", [])
+        self.max_lengths.append(max_length)
         n = sum(len(str(m.get("content", "")).split()) for m in messages)
+        if truncation and max_length is not None:
+            n = min(n, max_length)
         return {"input_ids": list(range(n)), "attention_mask": [1] * n}
 
 
@@ -710,6 +948,7 @@ def test_truncate_messages_to_fit_returns_final_exchange_when_nothing_fits():
     out = agent_chat._truncate_messages_to_fit(tok, messages, None, seq_length=4)
     assert [m["role"] for m in out] == ["system", "user", "assistant"]
     assert out[1]["content"] == "c c c c c"
+    assert set(tok.max_lengths) == {5}
 
 
 def test_truncate_messages_to_fit_no_user_boundary_unchanged():
@@ -852,9 +1091,7 @@ def test_reasoning_content_coerced_to_str_via_both_paths():
     # Non-string reasoning_content is coerced consistently whether it enters
     # through the sharegpt converter or the chatml message converter.
     sharegpt = agent_chat._sharegpt_to_chatml([{"from": "gpt", "value": "hi", "reasoning_content": 123}])
-    chatml = agent_chat._convert_messages(
-        [{"role": "assistant", "content": "hi", "reasoning_content": 123}]
-    )
+    chatml = agent_chat._convert_messages([{"role": "assistant", "content": "hi", "reasoning_content": 123}])
     assert sharegpt[0]["reasoning_content"] == "123"
     assert chatml[0]["reasoning_content"] == "123"
 

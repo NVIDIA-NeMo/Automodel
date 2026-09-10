@@ -105,6 +105,11 @@ class NemotronOmniStateDictAdapter(StateDictAdapter):
     and MoE expert merging) and handles vision/audio components directly.
     """
 
+    @property
+    def supports_write_through_checkpoint_load(self) -> bool:
+        """Whether the embedded language adapter and all wrapper renames preserve storage."""
+        return self._llm_adapter.supports_write_through_checkpoint_load
+
     def __init__(
         self,
         config,
@@ -250,7 +255,7 @@ class NemotronOmniStateDictAdapter(StateDictAdapter):
     def to_hf(
         self,
         state_dict: dict[str, Any],
-        exclude_key_regex: Optional[str] = None,
+        exclude_key_regex: str | None = None,
         **kwargs,
     ) -> dict[str, Any]:
         """Convert custom Automodel state dict to HF format.

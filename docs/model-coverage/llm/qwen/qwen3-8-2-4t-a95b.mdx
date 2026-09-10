@@ -1,16 +1,16 @@
 ---
-title: "Qwen3.8-Max"
-description: "Fine-tune Qwen3.8-Max text checkpoints with FSDP2, expert parallelism, and pipeline parallelism."
-slug: model-coverage/large-language-models/qwen/qwen3-8-max
+title: "Qwen3.8-2.4T-A95B"
+description: "Fine-tune Qwen3.8-2.4T-A95B text checkpoints with FSDP2, expert parallelism, and pipeline parallelism."
+slug: model-coverage/large-language-models/qwen/qwen3-8-2-4t-a95b
 ---
-[Qwen3.8-Max](https://huggingface.co/Qwen/Qwen3.8-Max) is Alibaba Cloud's sparse Qwen3.8 text backbone. NeMo AutoModel provides a native CausalLM implementation for full-parameter fine-tuning with FSDP2, expert parallelism, and pipeline parallelism.
+[Qwen3.8-2.4T-A95B](https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B) is Alibaba Cloud's sparse Qwen3.8 text backbone. NeMo AutoModel provides a native CausalLM implementation for full-parameter fine-tuning with FSDP2, expert parallelism, and pipeline parallelism.
 
 <Info>
 
 | | |
 |---|---|
 | **Task** | Text Generation (MoE, hybrid attention) |
-| **Architecture** | Qwen3.8-Max CausalLM |
+| **Architecture** | Qwen3.8-2.4T-A95B CausalLM |
 | **Parameters** | 2.4T total |
 | **Layers** | 92 |
 | **Experts** | 512 routed experts, top-10 routing |
@@ -21,7 +21,7 @@ slug: model-coverage/large-language-models/qwen/qwen3-8-max
 
 ## Architecture
 
-- The text entry point uses the native Qwen3.8-Max CausalLM path.
+- The text entry point uses the native Qwen3.8-2.4T-A95B CausalLM path.
 - The decoder combines attention, GatedDeltaNet linear attention, routed experts, shared experts, and optional multi-token prediction.
 - The HF state-dict adapter handles both grouped BF16 expert checkpoints and split block-FP8 per-expert checkpoints.
 - GatedDeltaNet state tensors that require fp32 precision keep the expected checkpoint contract.
@@ -43,19 +43,19 @@ The validated 64-node run loaded the public split-FP8 checkpoint and completed a
 
 | Recipe | Description |
 |---|---|
-| [qwen3_8_max_hellaswag_ep32_pp8.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen3_8_max_hellaswag_ep32_pp8.yaml) | 100-step full-parameter SFT on HellaSwag with FSDP2, EP32, and PP8 |
+| [qwen3_8_2_4t_a95b_hellaswag_ep32_pp8.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen3_8_2_4t_a95b_hellaswag_ep32_pp8.yaml) | 100-step full-parameter SFT on HellaSwag with FSDP2, EP32, and PP8 |
 
 ## Run the Recipe
 
 Allocate 64 GB200 nodes with four GPUs per node through your cluster launcher, then run:
 
 ```bash
-uv run automodel --nproc-per-node=4 examples/llm_finetune/qwen/qwen3_8_max_hellaswag_ep32_pp8.yaml
+uv run automodel --nproc-per-node=4 examples/llm_finetune/qwen/qwen3_8_2_4t_a95b_hellaswag_ep32_pp8.yaml
 ```
 
 See the [Slurm Launcher Guide](/job-launchers/slurm-cluster) for multi-node setup and the [Large MoE Fine-Tuning Guide](/recipes-e2e-examples/large-moe-fine-tuning) for distributed MoE configuration.
 
 ## References
 
-- [Qwen3.8-Max model card](https://huggingface.co/Qwen/Qwen3.8-Max)
-- [Qwen3.8-Max announcement](https://qwen.ai/blog?id=qwen3.8)
+- [Qwen3.8-2.4T-A95B model card](https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B)
+- [Qwen3.8-2.4T-A95B announcement](https://qwen.ai/blog?id=qwen3.8)

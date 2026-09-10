@@ -37,7 +37,6 @@ from __future__ import annotations
 import logging
 import time
 from contextlib import nullcontext
-from typing import Optional
 
 import mlflow
 import torch
@@ -431,6 +430,9 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
                 num_diffusion_tokens=num_diffusion_tokens,
                 num_ar_tokens=num_ar_tokens if has_causal else None,
                 causal_logits=causal_logits,
+                # Mixed forward kernels (scdd) score the corrupted token itself,
+                # which noise_mask alone cannot recover; absorbing losses ignore it.
+                noisy_input_ids=noisy_input_ids,
             )
             microbatch_loss = loss_result.total_loss
             dllm_loss = loss_result.dllm_loss.detach().clone()
@@ -458,7 +460,7 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
             num_diffusion_tokens = num_supervised_tokens
         return num_diffusion_tokens, num_supervised_tokens
 
-    def _run_train_optim_step(self, batches, max_grad_norm: Optional[float] = None):
+    def _run_train_optim_step(self, batches, max_grad_norm: float | None = None):
         """Execute a single training step with dLLM loss.
 
         Follows the parent pattern but uses loss_mask from the collate wrapper
@@ -599,7 +601,12 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
                 step_flops = self._dp_allreduce(
                     torch.tensor(step_flops, dtype=torch.float64, device=self.dist_env.device), include_cp=True
                 ).item()
-                mfu = calculate_mfu(step_flops / 1e12, self.dist_env.world_size, time_delta)
+                mfu = calculate_mfu(
+                    step_flops / 1e12,
+                    self.dist_env.world_size,
+                    time_delta,
+                    reference_mfu=mfu_calculator.reference_mfu,
+                )
 
         total_loss = torch.sum(torch.stack(loss_buffer))
         total_loss = self._dp_allreduce(total_loss, include_cp=True).cpu().item()

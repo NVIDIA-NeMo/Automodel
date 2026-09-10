@@ -150,6 +150,7 @@ class TestParsing:
                         "enabled": True,
                         "mesh_dims": ["cp"],
                         "min_tokens": 0,
+                        "min_local_patch_rows": 128,
                         "cost_alpha": 0,
                     }
                 }
@@ -163,6 +164,7 @@ class TestParsing:
             enabled=True,
             mesh_dims=("cp",),
             min_tokens=0,
+            min_local_patch_rows=128,
             cost_alpha=0,
         )
         assert cfg["multimodal"]["vision"]["frame_sharding"]["mesh_dims"] == ["cp"]
