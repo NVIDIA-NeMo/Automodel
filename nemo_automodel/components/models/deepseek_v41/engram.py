@@ -202,15 +202,37 @@ class DeepseekV41EngramHasher(nn.Module):
     segment. Look-back stops at segment boundaries and at masked tokens, so
     an n-gram never spans a document boundary or a padding/image token.
 
-    The token map is tokenizer-derived and has to be attached before the first
-    forward (:meth:`set_token_map` / :meth:`set_tokenizer`).  When the
-    compressed vocabulary equals the model vocabulary (tiny test configs) an
-    identity map is used automatically.
+    The complete token map is derived from the required tokenizer during
+    construction. Its immutable integer values are retained for restoration
+    after meta-device materialization, without retaining the tokenizer object.
     """
 
-    def __init__(self, config: DeepseekV41Config, layout: EngramLayout):
+    def __init__(self, config: DeepseekV41Config, layout: EngramLayout, tokenizer: PreTrainedTokenizerFast) -> None:
+        """Construct hashes from the checkpoint tokenizer's complete vocabulary.
+
+        Args:
+            config: Engram dimensions, compressed vocabulary size, and raw pad ID.
+            layout: Per-layer prime buckets and logical table capacities.
+            tokenizer: Required fast tokenizer used to normalize every raw token.
+
+        Raises:
+            TypeError: The tokenizer is not a fast tokenizer.
+            ValueError: The compressed vocabulary differs from the configuration,
+                the pad ID lies outside the tokenizer, or a table cannot hold its buckets.
+        """
         super().__init__()
         self.layout = layout
+        lookup, self.compressed_vocab_size = build_compressed_token_map(tokenizer)
+        self._token_map_values = tuple(lookup)
+        if self.compressed_vocab_size != config.engram_compressed_vocab_size:
+            raise ValueError(
+                "Engram compressed tokenizer vocabulary mismatch: "
+                f"got {self.compressed_vocab_size}, expected {config.engram_compressed_vocab_size}; "
+                "hash multipliers depend on this size"
+            )
+        if not 0 <= config.engram_pad_token_id < len(self._token_map_values):
+            raise ValueError(f"Engram pad token ID {config.engram_pad_token_id} lies outside the tokenizer vocabulary")
+        self.pad_id = self._token_map_values[config.engram_pad_token_id]
         for layer_hash_index, layer_id in enumerate(layout.layer_ids):
             bucket_span = layout.bucket_span(layer_hash_index)
             num_embeddings = layout.num_embeddings[layer_hash_index]
@@ -219,10 +241,6 @@ class DeepseekV41EngramHasher(nn.Module):
                     f"Engram layer {layer_id} requires {bucket_span} rows for its hash buckets, "
                     f"but engram_num_embeddings specifies {num_embeddings}"
                 )
-        self.vocab_size = int(config.vocab_size)
-        self.compressed_vocab_size = int(config.engram_compressed_vocab_size) or self.vocab_size
-        self.raw_pad_token_id = int(config.engram_pad_token_id)
-        self._token_map_values: tuple[int, ...] = ()
         # Keep deterministic source values outside device buffers, so meta ->
         # materialized construction cannot erase the hash identities.
         with torch.device("cpu"):
@@ -240,46 +258,7 @@ class DeepseekV41EngramHasher(nn.Module):
             torch.tensor(self._multiplier_values, dtype=torch.int64),
             persistent=False,
         )
-        self.register_buffer("token_map", torch.empty(0, dtype=torch.int64), persistent=False)
-        if self.compressed_vocab_size == self.vocab_size:
-            self.set_token_map(list(range(self.vocab_size)), self.vocab_size)
-
-    @property
-    def has_token_map(self) -> bool:
-        return self.token_map.numel() > 0
-
-    def set_token_map(self, lookup: list[int] | torch.Tensor, compressed_vocab_size: int) -> None:
-        """Attach the compressed token IDs without retaining a tokenizer object.
-
-        Args:
-            lookup: Integer list or materialized tensor [vocabulary], containing
-                IDs in [0, compressed_vocab_size). Its input storage is not mutated.
-            compressed_vocab_size: Number of compressed IDs; must match the hash configuration.
-        """
-        if int(compressed_vocab_size) != self.compressed_vocab_size:
-            raise ValueError(
-                "Engram compressed vocabulary mismatch: tokenizer yields "
-                f"{compressed_vocab_size} ids but config.engram_compressed_vocab_size is "
-                f"{self.compressed_vocab_size}. Every hash multiplier derives from this size."
-            )
-        if isinstance(lookup, torch.Tensor) and lookup.is_meta:
-            raise ValueError("Engram token-map setup requires materialized integer values")
-        lookup = torch.as_tensor(lookup, dtype=torch.int64, device="cpu")
-        if lookup.ndim != 1:
-            raise ValueError("Engram token map must be a one-dimensional lookup")
-        if lookup.numel() < self.vocab_size:
-            raise ValueError(f"Engram token map covers {lookup.numel()} ids, expected at least {self.vocab_size}")
-        selected = lookup[: self.vocab_size]
-        if torch.any((selected < 0) | (selected >= self.compressed_vocab_size)):
-            raise ValueError("Engram token-map IDs must be within the compressed vocabulary")
-        self._token_map_values = tuple(selected.tolist())
-        self.token_map = selected.to(self.primes.device)
-        self.pad_id = self._token_map_values[self.raw_pad_token_id]
-
-    def set_tokenizer(self, tokenizer: PreTrainedTokenizerFast) -> None:
-        """Derive and attach the compressed token map from a HuggingFace tokenizer."""
-        lookup, size = build_compressed_token_map(tokenizer)
-        self.set_token_map(lookup, size)
+        self.register_buffer("token_map", torch.tensor(self._token_map_values, dtype=torch.int64), persistent=False)
 
     @torch.no_grad()
     def init_weights(self, buffer_device: torch.device | None = None) -> None:
@@ -289,7 +268,7 @@ class DeepseekV41EngramHasher(nn.Module):
             buffer_device: Destination device, or the current primes device.
                 Restores int64 primes [layers, ngram_orders, heads], offsets
                 [layers, hash_columns], multipliers [layers, max_ngram_size],
-                and token_map [vocabulary] (empty until explicit tokenizer setup).
+                and token_map [complete tokenizer vocabulary].
                 Matching buffer storage is updated in place; otherwise it is replaced.
         """
         device = self.primes.device if buffer_device is None else buffer_device
@@ -328,15 +307,9 @@ class DeepseekV41EngramHasher(nn.Module):
             corresponding layers' logical table ranges.
 
         Raises:
-            RuntimeError: The compressed token map has not been attached.
             ValueError: Raw token IDs have an invalid shape, dtype, or range,
                 or positions have an invalid shape or dtype.
         """
-        if not self.has_token_map:
-            raise RuntimeError(
-                "DeepseekV41EngramHasher has no token map. Call model.set_engram_tokenizer(tokenizer) "
-                "or set config.engram_compressed_vocab_size to the model vocab size for identity hashing."
-            )
         if input_ids.ndim != 2 or input_ids.dtype not in (torch.int32, torch.int64):
             raise ValueError("Engram input_ids must be an int32/int64 tensor of shape [batch, sequence]")
         if input_ids.numel() and bool(((input_ids < 0) | (input_ids >= self.token_map.numel())).any()):

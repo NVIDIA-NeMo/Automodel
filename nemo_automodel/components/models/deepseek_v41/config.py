@@ -375,7 +375,7 @@ class DeepseekV41Config(PretrainedConfig):
                 if type(value) is not int or value <= 0:
                     raise ValueError(f"{name} must be a positive integer, got {value!r}")
             if type(self.engram_compressed_vocab_size) is not int or self.engram_compressed_vocab_size < 0:
-                raise ValueError("engram_compressed_vocab_size must be non-negative; zero selects identity hashing")
+                raise ValueError("engram_compressed_vocab_size must be non-negative")
             if type(self.engram_max_ngram_size) is not int or self.engram_max_ngram_size < 2:
                 raise ValueError("engram_max_ngram_size must be at least 2 when Engram is enabled")
             if type(self.engram_pad_token_id) is not int or not 0 <= self.engram_pad_token_id < self.vocab_size:
@@ -398,8 +398,8 @@ class DeepseekV41Config(PretrainedConfig):
         """Load the pinned fast tokenizer used to build Engram's compressed IDs.
 
         The tokenizer is a runtime construction input and is never stored on
-        this configuration. Explicit model.set_engram_tokenizer injection is
-        available for checkpoint-free configurations without a source path.
+        this configuration. Models constructed without a checkpoint source
+        must receive an explicit tokenizer in their constructor.
 
         Returns:
             The checkpoint's fast tokenizer, using the resolved config commit.

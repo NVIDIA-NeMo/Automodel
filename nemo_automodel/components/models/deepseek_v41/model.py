@@ -137,15 +137,11 @@ class DeepseekV41Model(nn.Module):
             raise ValueError("DeepSeek V4.1 requires MoEConfig.combine_in_fp32=True for released expert arithmetic")
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, dtype=model_dtype)
-        self.engram_layout = EngramLayout.from_config(config)
-        self.engram_hasher = (
-            DeepseekV41EngramHasher(config, self.engram_layout) if self.engram_layout is not None else None
-        )
-        if self.engram_hasher is not None:
-            if tokenizer is not None:
-                self.set_engram_tokenizer(tokenizer)
-            elif not self.engram_hasher.has_token_map and config._name_or_path:
-                self.set_engram_tokenizer(config.build_tokenizer())
+        active_engram = config.engram_enabled and any(i < config.num_hidden_layers for i in config.engram_layer_ids)
+        if active_engram and tokenizer is None:
+            raise ValueError("DeepSeek V4.1 Engram requires its original fast tokenizer for compressed N-gram hashing")
+        self.engram_layout = EngramLayout.from_config(config) if active_engram else None
+        self.engram_hasher = DeepseekV41EngramHasher(config, self.engram_layout, tokenizer) if active_engram else None
         self.layers = nn.ModuleDict()
         for layer_id in range(config.num_hidden_layers):
             self.layers[str(layer_id)] = DeepseekV41Block(
@@ -173,19 +169,6 @@ class DeepseekV41Model(nn.Module):
             partial_rotary_factor=partial_rotary_factor,
             rope_scaling=getattr(config, "rope_scaling", None),
         )
-
-    def set_engram_tokenizer(self, tokenizer: PreTrainedTokenizerFast) -> None:
-        """Attach the tokenizer-derived compressed token map used by Engram hashing."""
-        if self.engram_hasher is not None:
-            self.engram_hasher.set_tokenizer(tokenizer)
-
-    def _ensure_engram_token_map(self) -> None:
-        """Require setup to finish before the numerical forward; perform no tokenizer I/O."""
-        if self.engram_hasher is not None and not self.engram_hasher.has_token_map:
-            raise RuntimeError(
-                "Engram needs the tokenizer-derived token map before forward: call "
-                "model.set_engram_tokenizer(tokenizer), or construct the model with a checkpoint name_or_path."
-            )
 
     def forward(
         self,
@@ -225,7 +208,6 @@ class DeepseekV41Model(nn.Module):
         engram_hash_ids = None
         engram_mask = None
         if self.engram_hasher is not None:
-            self._ensure_engram_token_map()
             engram_mask = seq_ids > 0
             if vision_token_types is not None:
                 engram_mask = engram_mask & (vision_token_types < 0)
@@ -364,6 +346,12 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         )
         if engram_process_group is None and dist.is_available() and dist.is_initialized():
             engram_process_group = dist.group.WORLD
+        if (
+            tokenizer is None
+            and config.engram_enabled
+            and any(i < config.num_hidden_layers for i in config.engram_layer_ids)
+        ):
+            tokenizer = config.build_tokenizer()
         moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = DeepseekV41Model(
             config,
@@ -404,10 +392,6 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
-
-    def set_engram_tokenizer(self, tokenizer: PreTrainedTokenizerFast) -> None:
-        """Attach the tokenizer used to derive the Engram compressed token map."""
-        self.model.set_engram_tokenizer(tokenizer)
 
     def _image_embeddings(
         self,
