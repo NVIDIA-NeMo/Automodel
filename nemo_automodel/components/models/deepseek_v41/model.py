@@ -36,7 +36,7 @@ state-dict adapter.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any, Union
 
 import torch
@@ -120,6 +120,7 @@ class DeepseekV41Model(nn.Module):
             train_gate=True,
             gate_bias_update_factor=1e-3,
             score_func="sqrtsoftplus",
+            router_weights_fp32=True,
             route_scale=config.routed_scaling_factor,
             aux_loss_coeff=0,
             norm_topk_prob=config.norm_topk_prob,
@@ -263,13 +264,10 @@ class DeepseekV41Model(nn.Module):
         moe_padding_mask = padding_mask.to(device) if padding_mask is not None else None
 
         for layer in self.layers.values():
-            # Checkpoint recomputation must not observe later layers' assignments.
-            # A shallow copy preserves shared tensors and their autograd history.
-            state = replace(state)
             layer_hash_ids = None
             if engram_hash_ids is not None and layer.engram is not None:
                 layer_hash_ids = engram_hash_ids[:, :, layer.engram.layer_hash_index, :]
-            h, pre_mix = layer(
+            h, pre_mix, state = layer(
                 h,
                 pre_mix,
                 padding_mask=moe_padding_mask,

@@ -39,7 +39,7 @@ The model shares their tensors while isolating assignments during recomputation.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
@@ -747,7 +747,8 @@ class DeepseekV41Block(nn.Module):
         self.hc_mult = int(config.hc_mult)
         model_dtype = get_dtype(config.torch_dtype, torch.bfloat16)
         self.self_attn = DeepseekV41Attention(config, layer_idx, backend=backend)
-        self.mlp = MoE(moe_config, backend)
+        moe_backend = replace(backend, gate_precision=torch.float32) if backend.gate_precision is None else backend
+        self.mlp = MoE(moe_config, moe_backend)
         self.input_layernorm = initialize_rms_norm_module(
             backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, dtype=model_dtype
         )
@@ -778,8 +779,9 @@ class DeepseekV41Block(nn.Module):
         padding_mask: torch.Tensor | None = None,
         engram_hash_ids: torch.Tensor | None = None,
         engram_mask: torch.Tensor | None = None,
+        state: DeepseekV41SharedState,
         **attn_kwargs: Any,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, DeepseekV41SharedState]:
         """Transform the HC streams.
 
         Args:
@@ -788,23 +790,30 @@ class DeepseekV41Block(nn.Module):
             padding_mask: ``[B, S]`` bool, ``True`` at padding (MoE token mask).
             engram_hash_ids: ``[B, S, n_hash_cols]`` hash ids for this layer's Engram.
             engram_mask: ``[B, S]`` bool, ``False`` where Engram must not write.
+            state: Shared tensors with layouts documented in DeepseekV41SharedState.
+                Assignments are made to a shallow copy; input tensors retain their history.
 
         Returns:
-            Updated streams and the mix for the next block's attention site.
+            Updated streams of shape [batch, sequence, hc_mult, hidden], FP32 mix
+            of shape [batch, sequence, hc_mult], and the updated shared state.
+            State tensor layouts are documented in DeepseekV41SharedState.
         """
+        # Own assignments locally and return them explicitly: FSDP may copy inputs.
+        # Retaining tensor aliases preserves gradients through shared KV.
+        state = replace(state)
         if self.engram is not None:
             if engram_hash_ids is None:
                 raise ValueError(f"layer {self.layer_idx} has an Engram module but received no hash ids")
             x = self.engram(x, engram_hash_ids, engram_mask)
 
         attn_pre, attn_post, attn_comb = self.attn_hc(x)
-        attn_out = self.self_attn(self.input_layernorm(hc_collapse(x, pre_mix)), **attn_kwargs)
+        attn_out = self.self_attn(self.input_layernorm(hc_collapse(x, pre_mix)), state=state, **attn_kwargs)
         x = hc_expand(attn_out, x, attn_post, attn_comb)
 
         ffn_pre, ffn_post, ffn_comb = self.ffn_hc(x)
         mlp_out = self.mlp(self.post_attention_layernorm(hc_collapse(x, attn_pre)), padding_mask)
         x = hc_expand(mlp_out, x, ffn_post, ffn_comb)
-        return x, ffn_pre
+        return x, ffn_pre, state
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
         self.input_layernorm.reset_parameters()

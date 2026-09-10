@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import torch
 from torch import nn
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
@@ -236,6 +238,12 @@ def fully_shard_deepseek_v4(module: nn.Module, mesh, mp_policy, offload_policy=N
     the explicitly listed reference-sensitive islands and let the parent block
     use the caller's bf16 policy.
     """
+    block = getattr(module, "_checkpoint_wrapped_module", module)
+    if block.__class__.__name__ == "DeepseekV41Block" and isinstance(mp_policy, MixedPrecisionPolicy):
+        # The block owns mixed activation dtypes: residuals may be BF16, while
+        # pre_mix and shared indexer state must retain their original precision.
+        mp_policy = replace(mp_policy, cast_forward_inputs=False, output_dtype=None)
+
     is_dsv4 = _is_deepseek_v4_module(module)
     if is_dsv4:
         _attach_hca_param_sync_group(module, mesh)
