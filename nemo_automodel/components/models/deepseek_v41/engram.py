@@ -410,6 +410,7 @@ class DeepseekV41Engram(nn.Module):
         self.hc_mult = int(config.hc_mult)
         self.n_hash_cols = layout.n_hash_cols
         self.eps = float(config.rms_norm_eps)
+        self.initializer_range = config.initializer_range
         self.clamp_value = 1e-6
         model_dtype = get_dtype(config.torch_dtype, torch.bfloat16)
         self.num_embeddings = layout.num_embeddings[self.layer_hash_index]
@@ -418,12 +419,9 @@ class DeepseekV41Engram(nn.Module):
         table_config = Qwen3_8_FlashNextEngramTableConfig(
             num_embeddings=padded_rows,
             embedding_dim=layout.head_dim,
-            # Preserve nn.Embedding's constructor initialization; model-level
-            # init_weights supplies config.initializer_range afterwards.
-            initializer_range=1.0,
+            initializer_range=config.initializer_range,
         )
         self.embed = table_config.build(process_group=engram_process_group, dtype=model_dtype)
-        self._zero_padding_rows()
         self.wkv = initialize_linear_module(
             backend.linear,
             layout.n_hash_cols * layout.head_dim,
@@ -433,22 +431,23 @@ class DeepseekV41Engram(nn.Module):
         )
         self.q_weight = nn.Parameter(torch.ones(self.hc_mult, self.dim, dtype=model_dtype))
         self.k_weight = nn.Parameter(torch.ones(self.hc_mult, self.dim, dtype=model_dtype))
+        self.init_weights()
 
-    def init_weights(self, init_std: float = 0.02) -> None:
+    @torch.no_grad()
+    def init_weights(self) -> None:
         """Initialize local table storage and projections, leaving padded rows zero."""
-        local_weight = self.embed.weight.to_local() if isinstance(self.embed.weight, DTensor) else self.embed.weight
-        nn.init.normal_(local_weight, mean=0.0, std=init_std)
+        self.embed.reset_parameters()
         self._zero_padding_rows()
-        self.embed.mark_sharding_contract()
-        nn.init.trunc_normal_(self.wkv.weight, mean=0.0, std=init_std)
+        nn.init.normal_(self.wkv.weight, mean=0.0, std=self.initializer_range)
         nn.init.ones_(self.q_weight)
         nn.init.ones_(self.k_weight)
+        self.embed.mark_sharding_contract()
 
     @torch.no_grad()
     def _zero_padding_rows(self) -> None:
         """Clear physical rows beyond the logical checkpoint on their local owner."""
         local_weight = self.embed.weight.to_local() if isinstance(self.embed.weight, DTensor) else self.embed.weight
-        valid_local_rows = max(0, self.num_embeddings - self.embed.global_row_start)
+        valid_local_rows = max(0, min(local_weight.shape[0], self.num_embeddings - self.embed.global_row_start))
         local_weight[valid_local_rows:].zero_()
 
     def forward(self, x: torch.Tensor, hash_ids: torch.Tensor, token_mask: torch.Tensor | None = None) -> torch.Tensor:

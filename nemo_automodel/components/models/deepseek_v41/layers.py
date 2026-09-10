@@ -1080,4 +1080,4 @@ class DeepseekV41Block(nn.Module):
         self.attn_hc.init_weights(init_std)
         self.ffn_hc.init_weights(init_std)
         if self.engram is not None:
-            self.engram.init_weights(init_std)
+            self.engram.init_weights()
