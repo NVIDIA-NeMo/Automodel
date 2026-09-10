@@ -398,10 +398,10 @@ class DeepseekV41Engram(nn.Module):
             layer_idx: Decoder layer containing this Engram.
             layout: Logical hash-table row ranges for all Engram layers.
             backend: Projection backend selected for the enclosing model.
-            engram_process_group: Runtime row owners, defaulting to WORLD when
-                distributed world size exceeds one. Without distributed owners,
-                the complete table is local. Physical rows are padded evenly
-                across owners without changing the logical hash ranges.
+            engram_process_group: Runtime row-owner group. None keeps the
+                complete table local, even when distributed execution is
+                initialized. Physical rows are padded evenly across explicit
+                owners without changing the logical hash ranges.
         """
         super().__init__()
         self.layer_idx = layer_idx
@@ -413,8 +413,6 @@ class DeepseekV41Engram(nn.Module):
         self.clamp_value = 1e-6
         model_dtype = get_dtype(config.torch_dtype, torch.bfloat16)
         self.num_embeddings = layout.num_embeddings[self.layer_hash_index]
-        if engram_process_group is None and dist.is_initialized() and dist.get_world_size() > 1:
-            engram_process_group = dist.group.WORLD
         owner_world_size = dist.get_world_size(engram_process_group) if engram_process_group is not None else 1
         padded_rows = (self.num_embeddings + owner_world_size - 1) // owner_world_size * owner_world_size
         table_config = Qwen3_8_FlashNextEngramTableConfig(

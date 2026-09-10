@@ -342,8 +342,9 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     """DeepSeek V4.1 causal LM with optional vision and an fp32 ``lm_head``.
 
     ``engram_process_group`` explicitly selects contiguous row owners for the
-    Engram tables. By default, distributed models use WORLD; single-rank models
-    retain local tables. FSDP's shard mesh must match the owner group exactly.
+    Engram tables. Distributed models default to WORLD, including a one-rank
+    WORLD. Without distributed initialization, tables remain local. FSDP's
+    shard mesh must match the owner group exactly.
     """
 
     config_class: type[DeepseekV41Config] = DeepseekV41Config
@@ -421,6 +422,8 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             experts="torch_mm" if torch.cuda.is_available() else "torch",
             dispatcher="hybridep" if torch.cuda.is_available() else "torch",
         )
+        if engram_process_group is None and dist.is_available() and dist.is_initialized():
+            engram_process_group = dist.group.WORLD
         moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = DeepseekV41Model(
             config,
@@ -531,7 +534,7 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         """
         parameters: set[nn.Parameter] = set()
         for layer in self.model.layers.values():
-            if layer.engram is None or layer.engram.embed.process_group is None:
+            if layer.engram is None:
                 continue
             parameters.add(layer.engram.embed.parallelize_weight(fsdp_mesh))
         return parameters
