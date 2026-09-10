@@ -47,11 +47,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from transformers import PreTrainedTokenizerFast
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from nemo_automodel.components.models.common import (
-    BackendConfig,
-    initialize_linear_module,
-    initialize_rms_norm_module,
-)
+from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
@@ -68,6 +64,7 @@ from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41Conf
 from nemo_automodel.components.models.deepseek_v41.engram import DeepseekV41EngramHasher, EngramLayout
 from nemo_automodel.components.models.deepseek_v41.layers import (
     DeepseekV41Block,
+    DeepseekV41RMSNorm,
     DeepseekV41RotaryEmbedding,
     DeepseekV41SharedState,
     build_window_topk_indices,
@@ -173,9 +170,7 @@ class DeepseekV41Model(nn.Module):
                 engram_layout=self.engram_layout,
                 engram_process_group=engram_process_group,
             )
-        self.norm = initialize_rms_norm_module(
-            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, dtype=model_dtype
-        )
+        self.norm = DeepseekV41RMSNorm(config.hidden_size, eps=config.rms_norm_eps, dtype=model_dtype)
 
         # Base rope (no YaRN) for pure sliding-window layers, compress rope (YaRN)
         # for every CSA2 layer and for the pooled latents (reference ``Attention.__init__``).

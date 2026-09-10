@@ -48,7 +48,7 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
-from nemo_automodel.components.models.common import BackendConfig, initialize_rms_norm_module
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
 from nemo_automodel.components.models.deepseek_v4.layers import (
     DeepseekV4FP32Parameter,
@@ -74,6 +74,7 @@ __all__ = [
     "DeepseekV41Block",
     "DeepseekV41Compressor",
     "DeepseekV41Indexer",
+    "DeepseekV41RMSNorm",
     "DeepseekV41RotaryEmbedding",
     "DeepseekV41SharedState",
     "build_compressed_visibility",
@@ -85,6 +86,32 @@ __all__ = [
     "make_identity_pre_mix",
     "select_candidate_blocks",
 ]
+
+
+class DeepseekV41RMSNorm(nn.Module):
+    """Normalize in FP32 and multiply the scale before casting the result."""
+
+    def __init__(self, dim: int, eps: float, dtype: torch.dtype) -> None:
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim, dtype=dtype))
+
+    def reset_parameters(self) -> None:
+        """Initialize the scale after construction or meta materialization."""
+        nn.init.ones_(self.weight)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Apply the released reference's RMS normalization.
+
+        Args:
+            hidden_states: Tensor of shape [..., hidden], with arbitrary leading dimensions.
+
+        Returns:
+            Tensor of shape [..., hidden], with the input dtype.
+        """
+        value = hidden_states.float()
+        value = value * torch.rsqrt(value.square().mean(-1, keepdim=True) + self.eps)
+        return (self.weight.float() * value).to(hidden_states.dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -540,7 +567,7 @@ class DeepseekV41Compressor(nn.Module):
             if self.compress_ratio > 1
             else None
         )
-        self.norm = initialize_rms_norm_module("torch_fp32", self.head_dim, eps=config.rms_norm_eps, dtype=model_dtype)
+        self.norm = DeepseekV41RMSNorm(self.head_dim, eps=config.rms_norm_eps, dtype=model_dtype)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """``[B, S, hidden] -> [B, S // ratio, head_dim]`` (a trailing partial group is dropped)."""
@@ -597,9 +624,7 @@ class DeepseekV41Indexer(nn.Module):
         self.weights_proj = nn.Linear(config.hidden_size, self.n_heads, bias=False, dtype=model_dtype)
         if self.owns_k:
             self.wk = nn.Linear(config.head_dim, self.head_dim, bias=False, dtype=model_dtype)
-            self.k_norm = initialize_rms_norm_module(
-                "torch_fp32", self.head_dim, eps=config.rms_norm_eps, dtype=model_dtype
-            )
+            self.k_norm = DeepseekV41RMSNorm(self.head_dim, eps=config.rms_norm_eps, dtype=model_dtype)
         else:
             self.wk = None
             self.k_norm = None
@@ -741,14 +766,10 @@ class DeepseekV41Attention(nn.Module):
         model_dtype = get_dtype(config.torch_dtype, torch.bfloat16)
 
         self.wq_a = nn.Linear(config.hidden_size, config.q_lora_rank, bias=False, dtype=model_dtype)
-        self.q_norm = initialize_rms_norm_module(
-            "torch_fp32", config.q_lora_rank, eps=config.rms_norm_eps, dtype=model_dtype
-        )
+        self.q_norm = DeepseekV41RMSNorm(config.q_lora_rank, eps=config.rms_norm_eps, dtype=model_dtype)
         self.wq_b = nn.Linear(config.q_lora_rank, self.num_heads * self.head_dim, bias=False, dtype=model_dtype)
         self.wkv = nn.Linear(config.hidden_size, self.head_dim, bias=False, dtype=model_dtype)
-        self.kv_norm = initialize_rms_norm_module(
-            "torch_fp32", self.head_dim, eps=config.rms_norm_eps, dtype=model_dtype
-        )
+        self.kv_norm = DeepseekV41RMSNorm(self.head_dim, eps=config.rms_norm_eps, dtype=model_dtype)
         self.wo_a = DeepseekV4GroupedLinear(
             self.num_heads * self.head_dim // config.o_groups,
             config.o_groups * config.o_lora_rank,
@@ -954,11 +975,9 @@ class DeepseekV41Block(nn.Module):
             gate_precision=moe_backend.gate_precision,
             hash_routing=False,
         )
-        self.input_layernorm = initialize_rms_norm_module(
-            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, dtype=model_dtype
-        )
-        self.post_attention_layernorm = initialize_rms_norm_module(
-            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, dtype=model_dtype
+        self.input_layernorm = DeepseekV41RMSNorm(config.hidden_size, eps=config.rms_norm_eps, dtype=model_dtype)
+        self.post_attention_layernorm = DeepseekV41RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps, dtype=model_dtype
         )
         hc_kwargs = dict(
             hc_mult=self.hc_mult,
