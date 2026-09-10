@@ -15,10 +15,10 @@
 """Configuration for DeepSeek V4.1 (``deepseek-ai/DeepSeek-V4.1-Flash``).
 
 The released ``config.json`` nests the language backbone under ``text_config``
-and the vision tower under ``vision_config``.  AutoModel trains the text
-backbone only, so this config flattens ``text_config`` onto the top level
-(the field names below are exactly the ``text_config`` keys) and keeps
-``vision_config`` as an opaque dict for round-tripping.
+and the vision tower under ``vision_config``. This config preserves the flat
+text-field API used by the decoder and materializes vision metadata as a typed
+configuration. Omitting vision metadata keeps checkpoint-free text models small;
+loading the released vision metadata enables its tower unless explicitly disabled.
 
 Architecture summary (see ``DeepSeek_V41_Tech_Report.pdf``):
 
@@ -43,15 +43,69 @@ Architecture summary (see ``DeepSeek_V41_Tech_Report.pdf``):
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from transformers import PretrainedConfig
 
 
+class DeepseekV41VisionConfig(PretrainedConfig):
+    """Configuration of the released 2D-RoPE vision encoder and image sizing."""
+
+    model_type = "deepseek_v41_vision"
+    base_config_key = "vision_config"
+
+    def __init__(
+        self,
+        num_hidden_layers: int = 32,
+        hidden_size: int = 1024,
+        num_attention_heads: int = 16,
+        intermediate_size: int = 2816,
+        patch_size: int = 14,
+        rope_theta: float = 10000.0,
+        downsample_ratio: int = 3,
+        max_image_tokens: int = 1024,
+        min_pixels: int = 295936,
+        max_wh_ratio: float | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.num_hidden_layers = num_hidden_layers
+        self.hidden_size = hidden_size
+        self.num_attention_heads = num_attention_heads
+        self.intermediate_size = intermediate_size
+        self.patch_size = patch_size
+        self.rope_theta = rope_theta
+        self.downsample_ratio = downsample_ratio
+        self.max_image_tokens = max_image_tokens
+        self.min_pixels = min_pixels
+        self.max_wh_ratio = max_wh_ratio
+        for name, value in (
+            ("hidden_size", hidden_size),
+            ("num_attention_heads", num_attention_heads),
+            ("intermediate_size", intermediate_size),
+            ("patch_size", patch_size),
+            ("downsample_ratio", downsample_ratio),
+            ("max_image_tokens", max_image_tokens),
+            ("min_pixels", min_pixels),
+        ):
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"vision {name} must be a positive integer, got {value!r}")
+        if type(num_hidden_layers) is not int or num_hidden_layers < 0:
+            raise ValueError("vision num_hidden_layers must be a non-negative integer")
+        if hidden_size % num_attention_heads or hidden_size // num_attention_heads % 4:
+            raise ValueError("vision hidden_size must yield an integer head dimension divisible by 4 for 2D RoPE")
+        if not math.isfinite(rope_theta) or rope_theta <= 0:
+            raise ValueError("vision rope_theta must be finite and positive")
+        if max_wh_ratio is not None and (not math.isfinite(max_wh_ratio) or max_wh_ratio < 1):
+            raise ValueError("vision max_wh_ratio must be None or finite and at least 1")
+
+
 class DeepseekV41Config(PretrainedConfig):
-    """Configuration class for the DeepSeek V4.1 text backbone."""
+    """Flat text configuration with an optional typed DeepSeek V4.1 vision tower."""
 
     model_type = "deepseek_v41"
+    sub_configs = {"vision_config": DeepseekV41VisionConfig}
     keys_to_ignore_at_inference = ["past_key_values"]
 
     def __init__(
@@ -120,9 +174,9 @@ class DeepseekV41Config(PretrainedConfig):
         dspark_markov_rank: int = 256,
         dspark_n_routed_experts: int = 0,
         dspark_num_experts_per_tok: int = 0,
-        # Multimodal bridge metadata (text-only training ignores it)
+        # Multimodal bridge metadata; zero vision layers disable the tower
         image_token_id: int = 129264,
-        vision_config: dict[str, Any] | None = None,
+        vision_config: dict[str, Any] | DeepseekV41VisionConfig | None = None,
         # AutoModel training knobs
         engram_enabled: bool = True,
         engram_trainable: bool = False,
@@ -200,6 +254,12 @@ class DeepseekV41Config(PretrainedConfig):
         self.dspark_n_routed_experts = dspark_n_routed_experts
         self.dspark_num_experts_per_tok = dspark_num_experts_per_tok
         self.image_token_id = image_token_id
+        if vision_config is None:
+            vision_config = DeepseekV41VisionConfig(num_hidden_layers=0)
+        elif isinstance(vision_config, dict):
+            vision_config = DeepseekV41VisionConfig(**vision_config)
+        elif not isinstance(vision_config, DeepseekV41VisionConfig):
+            raise TypeError("vision_config must be a DeepseekV41VisionConfig, dictionary, or None")
         self.vision_config = vision_config
         self.engram_enabled = engram_enabled
         self.engram_trainable = engram_trainable

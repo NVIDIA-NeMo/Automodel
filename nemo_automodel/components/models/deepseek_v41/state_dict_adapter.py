@@ -43,10 +43,14 @@ Key mapping (HF -> internal):
   layers.{i}.hc_attn_{fn,base,scale}     -> model.layers.{i}.attn_hc.{fn,base,scale}
   layers.{i}.hc_ffn_{fn,base,scale}      -> model.layers.{i}.ffn_hc.{fn,base,scale}
   layers.{i}.engram.*                    -> model.layers.{i}.engram.*
+  layers.{i}.ffn.gate.bias_vl             -> model.layers.{i}.mlp.gate.bias_vl
+  vision.* / aligner.*                   -> model.vision.* / model.aligner.*
+  image_{start,end,newline}              -> model.image_{start,end,newline}
 
-Dropped on load: ``mtp.*`` (DSpark draft), ``vision.*`` / ``aligner.*`` /
-``image_*`` (vision tower) and ``ffn.gate.bias_vl`` (image-token routing
-bias); ``engram.*`` when the config disables Engram.
+Dropped on load/export: ``mtp.*`` (DSpark draft), the unconstructed
+``image_pad`` tensor, vision tower/delimiters when vision is disabled, and
+``engram.*`` when the config disables Engram. The visual router bias remains
+part of every text gate even when no vision tower is constructed.
 """
 
 from __future__ import annotations
@@ -79,6 +83,9 @@ FP8_BLOCK_SIZE = 32
 ENGRAM_SCALE_BLOCK = 32
 
 _HF_TO_INTERNAL_RENAMES: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"^vision\.(.+)$"), r"model.vision.\1"),
+    (re.compile(r"^aligner\.(.+)$"), r"model.aligner.\1"),
+    (re.compile(r"^(image_start|image_end|image_newline)$"), r"model.\1"),
     (re.compile(r"^embed\.(.+)$"), r"model.embed_tokens.\1"),
     (re.compile(r"^norm\.(.+)$"), r"model.norm.\1"),
     (re.compile(r"^head\.(.+)$"), r"lm_head.\1"),
@@ -97,6 +104,9 @@ _HF_TO_INTERNAL_RENAMES: list[tuple[re.Pattern, str]] = [
 ]
 
 _INTERNAL_TO_HF_RENAMES: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"^model\.vision\.(.+)$"), r"vision.\1"),
+    (re.compile(r"^model\.aligner\.(.+)$"), r"aligner.\1"),
+    (re.compile(r"^model\.(image_start|image_end|image_newline|image_pad)$"), r"\1"),
     (re.compile(r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.gate_proj\.(.+)$"), r"layers.\1.ffn.experts.\2.w1.\3"),
     (re.compile(r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.up_proj\.(.+)$"), r"layers.\1.ffn.experts.\2.w3.\3"),
     (re.compile(r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.down_proj\.(.+)$"), r"layers.\1.ffn.experts.\2.w2.\3"),
@@ -132,9 +142,8 @@ _FP8_ON_DISK_PATTERNS = [
 ]
 _ENGRAM_EMBED_PATTERN = re.compile(r"^layers\.(\d+)\.engram\.embed\.weight$")
 _ENGRAM_PATTERN = re.compile(r"^layers\.\d+\.engram\.")
-_GATE_BIAS_VL_PATTERN = re.compile(r"^layers\.\d+\.ffn\.gate\.bias_vl$")
-_DROPPED_PREFIXES = ("mtp.", "vision.", "aligner.")
-_DROPPED_KEYS = {"image_start", "image_end", "image_newline", "image_pad"}
+_VISION_PREFIXES = ("vision.", "aligner.")
+_VISION_DELIMITERS = {"image_start", "image_end", "image_newline"}
 
 
 def _rename_hf_key(key: str) -> str:
@@ -404,7 +413,7 @@ class DeepSeekV41StateDictAdapter(MoESplitExpertsStateDictMixin, DeepSeekV4State
         """
         keys = []
         for fqn in state_dict:
-            if fqn.startswith("mtp.") or "_extra_state" in fqn:
+            if "_extra_state" in fqn or not self._keep_hf_key(_internal_key_to_hf(fqn)):
                 continue
             expert = re.fullmatch(r"model\.layers\.(\d+)\.mlp\.experts\.(gate_and_up_projs|down_projs)", fqn)
             if expert:
@@ -586,9 +595,12 @@ class DeepSeekV41StateDictAdapter(MoESplitExpertsStateDictMixin, DeepSeekV4State
     # ------------------------------------------------------------------
 
     def _keep_hf_key(self, key: str) -> bool:
-        if key.startswith(_DROPPED_PREFIXES) or key in _DROPPED_KEYS:
+        """Select released tensors for the configured backbone and optional towers."""
+        if key.startswith(("mtp.", "model.mtp.")) or key == "image_pad":
             return False
-        if _GATE_BIAS_VL_PATTERN.match(key):
+        if self.config.vision_config.num_hidden_layers == 0 and (
+            key.startswith(_VISION_PREFIXES) or key in _VISION_DELIMITERS
+        ):
             return False
         if not self.engram_enabled and _ENGRAM_PATTERN.match(key):
             return False
@@ -792,7 +804,7 @@ class DeepSeekV41StateDictAdapter(MoESplitExpertsStateDictMixin, DeepSeekV4State
         )
         if exclude_key_regex:
             result = [(k, v) for k, v in result if not re.match(exclude_key_regex, k)]
-        result = [(_internal_key_to_hf(k), v) for k, v in result]
+        result = [(_internal_key_to_hf(k), v) for k, v in result if self._keep_hf_key(_internal_key_to_hf(k))]
         for index, (key, value) in enumerate(result):
             match = _ENGRAM_EMBED_PATTERN.match(key)
             if match:
@@ -879,7 +891,9 @@ class DeepSeekV41StateDictAdapter(MoESplitExpertsStateDictMixin, DeepSeekV4State
         return {
             _internal_key_to_hf(key): "float32"
             for key, value in state_dict.items()
-            if isinstance(value, torch.Tensor) and value.dtype == torch.float32
+            if isinstance(value, torch.Tensor)
+            and value.dtype == torch.float32
+            and self._keep_hf_key(_internal_key_to_hf(key))
         }
 
     @classmethod

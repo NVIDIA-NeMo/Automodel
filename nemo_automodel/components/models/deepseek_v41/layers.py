@@ -49,6 +49,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from nemo_automodel.components.models.common import BackendConfig, initialize_rms_norm_module
+from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
 from nemo_automodel.components.models.deepseek_v4.layers import (
     DeepseekV4FP32Parameter,
     DeepseekV4GroupedLinear,
@@ -57,6 +58,7 @@ from nemo_automodel.components.models.deepseek_v4.layers import (
     _dsv4_kernel_backend,
     _dsv4_sinkhorn_backend,
 )
+from nemo_automodel.components.models.deepseek_v4.model import DeepseekV4VisionGate
 from nemo_automodel.components.models.deepseek_v4.optimized_kernels import (
     dsv4_sinkhorn_normalize,
     dsv4_sparse_attention,
@@ -946,6 +948,12 @@ class DeepseekV41Block(nn.Module):
         self.self_attn = DeepseekV41Attention(config, layer_idx, backend=backend)
         moe_backend = replace(backend, gate_precision=torch.float32) if backend.gate_precision is None else backend
         self.mlp = MoE(moe_config, moe_backend)
+        self.mlp.gate = DeepseekV4VisionGate(
+            DeepseekV4Config(vocab_size=config.vocab_size),
+            moe_config,
+            gate_precision=moe_backend.gate_precision,
+            hash_routing=False,
+        )
         self.input_layernorm = initialize_rms_norm_module(
             backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, dtype=model_dtype
         )
@@ -976,6 +984,7 @@ class DeepseekV41Block(nn.Module):
         padding_mask: torch.Tensor | None = None,
         engram_hash_ids: torch.Tensor | None = None,
         engram_mask: torch.Tensor | None = None,
+        vision_token_types: torch.Tensor | None = None,
         state: DeepseekV41SharedState,
         **attn_kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor, DeepseekV41SharedState]:
@@ -987,6 +996,8 @@ class DeepseekV41Block(nn.Module):
             padding_mask: ``[B, S]`` bool, ``True`` at padding (MoE token mask).
             engram_hash_ids: ``[B, S, n_hash_cols]`` hash ids for this layer's Engram.
             engram_mask: ``[B, S]`` bool, ``False`` where Engram must not write.
+            vision_token_types: Optional integer tensor [batch, sequence],
+                with -1 for text and nonnegative image-token types.
             state: Shared tensors with layouts documented in DeepseekV41SharedState.
                 Assignments are made to a shallow copy; input tensors retain their history.
 
@@ -1008,6 +1019,7 @@ class DeepseekV41Block(nn.Module):
         x = hc_expand(attn_out, x, attn_post, attn_comb)
 
         ffn_pre, ffn_post, ffn_comb = self.ffn_hc(x)
+        self.mlp.gate.set_routing_context(None, vision_token_types)
         mlp_out = self.mlp(self.post_attention_layernorm(hc_collapse(x, attn_pre)), padding_mask)
         x = hc_expand(mlp_out, x, ffn_post, ffn_comb)
         return x, ffn_pre, state
@@ -1017,6 +1029,7 @@ class DeepseekV41Block(nn.Module):
         self.post_attention_layernorm.reset_parameters()
         self.self_attn.init_weights(buffer_device, init_std=init_std)
         self.mlp.init_weights(buffer_device, init_std=init_std)
+        self.mlp.gate.init_dsv4_weights()
         self.attn_hc.init_weights(init_std)
         self.ffn_hc.init_weights(init_std)
         if self.engram is not None:
