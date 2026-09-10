@@ -98,6 +98,9 @@ _HF_TO_INTERNAL_RENAMES: list[tuple[re.Pattern, str]] = [
     (re.compile(r"^layers\.(\d+)\.ffn\.shared_experts\.w1\.(.+)$"), r"model.layers.\1.mlp.shared_experts.gate_proj.\2"),
     (re.compile(r"^layers\.(\d+)\.ffn\.shared_experts\.w3\.(.+)$"), r"model.layers.\1.mlp.shared_experts.up_proj.\2"),
     (re.compile(r"^layers\.(\d+)\.ffn\.shared_experts\.w2\.(.+)$"), r"model.layers.\1.mlp.shared_experts.down_proj.\2"),
+    (re.compile(r"^layers\.(\d+)\.ffn\.experts\.(\d+)\.w1\.(.+)$"), r"model.layers.\1.mlp.experts.\2.gate_proj.\3"),
+    (re.compile(r"^layers\.(\d+)\.ffn\.experts\.(\d+)\.w3\.(.+)$"), r"model.layers.\1.mlp.experts.\2.up_proj.\3"),
+    (re.compile(r"^layers\.(\d+)\.ffn\.experts\.(\d+)\.w2\.(.+)$"), r"model.layers.\1.mlp.experts.\2.down_proj.\3"),
     (re.compile(r"^layers\.(\d+)\.hc_attn_(base|fn|scale)$"), r"model.layers.\1.attn_hc.\2"),
     (re.compile(r"^layers\.(\d+)\.hc_ffn_(base|fn|scale)$"), r"model.layers.\1.ffn_hc.\2"),
     (re.compile(r"^layers\.(\d+)\.engram\.(.+)$"), r"model.layers.\1.engram.\2"),
@@ -369,8 +372,9 @@ def dequantize_engram_table(weight: torch.Tensor, scale: torch.Tensor, dtype: to
 class DeepSeekV41StateDictAdapter(MoESplitExpertsStateDictMixin, DeepSeekV4StateDictAdapter):
     """Convert released V4.1 layouts and stream directly into prepared model storage.
 
-    The inherited DCP/export path retains V4 projection conversion. Explicit
-    streaming initialization uses shared MoE views and copies one bounded
+    Floating DCP initialization uses shared MoE views and skips rebuilding
+    experts already written into model storage. Export and quantized layouts
+    retain V4 conversion. Explicit streaming initialization copies one bounded
     quantized chunk at a time, without gathering experts or Engram owner rows.
     """
 
@@ -604,31 +608,39 @@ class DeepSeekV41StateDictAdapter(MoESplitExpertsStateDictMixin, DeepSeekV4State
     ) -> dict[str, Any]:
         """Convert the released HF checkpoint to the internal format.
 
-        Steps: drop out-of-scope tensors, dequantize FP8 / FP4 weights, stack the
-        routed experts, restore Engram owner padding, rename.
+        Steps: drop out-of-scope tensors, dequantize FP8 / FP4 weights, restore
+        Engram owner padding, rename, and merge the routed experts that were
+        not already loaded through views into model storage.
 
         Args:
-            hf_state_dict: Released-name tensors in the layouts documented in
-                this module. Engram tables have logical shape [rows, channels]
+            hf_state_dict: Released-name tensors. Per-expert projections have
+                shape [output, input], with FP4 input columns packed two per
+                byte before dequantization. Engram tables have logical shape [rows, channels]
                 and optionally placement Shard(0) on a one-dimensional owner
-                mesh, with uneven local shape [local_rows, channels].
-            device_mesh: Expert aggregation mesh.
+                mesh, with uneven local shape [local_rows, channels]. Other
+                tensors retain the layouts documented in this module.
+            device_mesh: Optional expert mesh selecting local expert IDs and
+                retaining any inner-axis expert FSDP sharding.
             **kwargs: Additional checkpoint protocol arguments.
 
         Returns:
             Internal-name tensors. Engram DTensors have global shape
             [ceil(rows / owners) * owners, channels] with equal local row counts
-            and zero padding. Other layouts follow the base adapter. Floating
-            tensors can alias input storage when no conversion is needed.
+            and zero padding. Grouped experts have global shapes
+            [experts, hidden, 2 * intermediate] and [experts, intermediate, hidden],
+            with rank-local shards following the expert mesh. Experts already
+            loaded through model-storage views are omitted and recorded in
+            view_loaded_native_keys. Other tensors retain their layouts and
+            can alias input storage when no conversion is needed.
         """
         filtered = {key: value for key, value in hf_state_dict.items() if self._keep_hf_key(key)}
         filtered = self._dequantize(filtered)
-        filtered = self._aggregate_experts(filtered, device_mesh)
         for key, value in filtered.items():
             match = _ENGRAM_EMBED_PATTERN.match(key)
             if match:
                 filtered[key] = self._restore_engram_padding(value, int(match.group(1)))
-        return {_rename_hf_key(key): value for key, value in filtered.items()}
+        converted = {_rename_hf_key(key): value for key, value in filtered.items()}
+        return self._from_hf_w_merged_experts(converted, device_mesh)
 
     def _engram_checkpoint_tensor(self, tensor: torch.Tensor, layer_id: int) -> torch.Tensor:
         """Expose logical checkpoint rows without gathering owner storage.
@@ -791,6 +803,7 @@ class DeepSeekV41StateDictAdapter(MoESplitExpertsStateDictMixin, DeepSeekV4State
             tensor,
             for_checkpoint_load=kwargs.get("for_checkpoint_load", False),
             preserve_dtensor_load_views=kwargs.get("preserve_dtensor_load_views", False),
+            quantization=quantization,
         )
         if exclude_key_regex:
             result = [(k, v) for k, v in result if not re.match(exclude_key_regex, k)]
@@ -834,6 +847,7 @@ class DeepSeekV41StateDictAdapter(MoESplitExpertsStateDictMixin, DeepSeekV4State
         *,
         for_checkpoint_load: bool = False,
         preserve_dtensor_load_views: bool = False,
+        quantization: bool = False,
     ) -> list[tuple[str, torch.Tensor]]:
         """Split released projections, optionally preserving live load views.
 
@@ -848,22 +862,30 @@ class DeepSeekV41StateDictAdapter(MoESplitExpertsStateDictMixin, DeepSeekV4State
                 checkpoint initialization outside an active autograd graph.
             preserve_dtensor_load_views: Use the shared expert splitter to
                 retain non-contiguous local storage aliases for direct loading.
-                Ordinary DCP and export retain the inherited V4 conversion.
+                Ordinary DCP retains contiguous conversion for inner-axis
+                DTensor shards and rebuilds those experts after reading.
+            quantization: Split matrices will be replaced by independent
+                quantized load targets, so they must not be recorded as views
+                that load directly into model storage.
 
         Returns:
             Released expert names and [output, input] projection tensors, or
-            the unchanged native name/tensor for non-experts. Explicit direct
-            load views preserve global shape, mesh, placements and local aliases.
+            the unchanged native name/tensor for non-experts. Unquantized load
+            views alias model storage for ordinary local expert matrices and,
+            when explicitly enabled, inner-axis DTensor shards. Global shape,
+            mesh, placements and dtype are preserved. Export retains the V4
+            projection conversion.
         """
-        if not preserve_dtensor_load_views:
-            return super()._split_merged_expert(fqn, tensor)
-        if not for_checkpoint_load:
+        if preserve_dtensor_load_views and not for_checkpoint_load:
             raise ValueError("Preserving DTensor load views requires for_checkpoint_load=True")
+        if not for_checkpoint_load:
+            return super()._split_merged_expert(fqn, tensor)
         result = self._convert_single_merged_expert_to_hf_split_experts(
             fqn,
             tensor,
             for_checkpoint_load=for_checkpoint_load,
             preserve_dtensor_load_views=preserve_dtensor_load_views,
+            quantization=quantization,
         )
         return [(fqn, tensor)] if result is None else [(_internal_key_to_hf(key), value) for key, value in result]
 
