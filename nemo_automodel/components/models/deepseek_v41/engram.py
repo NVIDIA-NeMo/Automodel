@@ -36,7 +36,6 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 from torch import nn
 from torch.distributed.tensor import DTensor
 from transformers import PreTrainedTokenizerFast
@@ -199,9 +198,9 @@ class DeepseekV41EngramHasher(nn.Module):
     """Map each position to the hash ids of the n-grams ending there.
 
     Training is stateless: the whole sequence is visible, so look-back is a
-    shift along the sequence axis.  Look-back stops at the start of each
-    document (``position_ids == 0``) and at masked tokens, so an n-gram never
-    spans a document boundary or a padding/image token.
+    shift along the sequence axis. A non-increasing position starts a new
+    segment. Look-back stops at segment boundaries and at masked tokens, so
+    an n-gram never spans a document boundary or a padding/image token.
 
     The token map is tokenizer-derived and has to be attached before the first
     forward (:meth:`set_token_map` / :meth:`set_tokenizer`).  When the
@@ -319,7 +318,9 @@ class DeepseekV41EngramHasher(nn.Module):
         Args:
             input_ids: Int32 or int64 raw token IDs ``[B, L]``, each within the
                 token-map vocabulary. The input tensor is not modified.
-            position_ids: ``[B, L]`` document-relative positions (``0`` starts a document).
+            position_ids: Int32 or int64 positions ``[B, L]`` matching input_ids.
+                A position less than or equal to its predecessor starts a new
+                segment. The input tensor is not modified.
             token_mask: ``[B, L]`` bool, ``False`` for tokens that take no part in an n-gram.
 
         Returns:
@@ -328,7 +329,8 @@ class DeepseekV41EngramHasher(nn.Module):
 
         Raises:
             RuntimeError: The compressed token map has not been attached.
-            ValueError: Raw token IDs have an invalid shape, dtype, or range.
+            ValueError: Raw token IDs have an invalid shape, dtype, or range,
+                or positions have an invalid shape or dtype.
         """
         if not self.has_token_map:
             raise RuntimeError(
@@ -339,19 +341,26 @@ class DeepseekV41EngramHasher(nn.Module):
             raise ValueError("Engram input_ids must be an int32/int64 tensor of shape [batch, sequence]")
         if input_ids.numel() and bool(((input_ids < 0) | (input_ids >= self.token_map.numel())).any()):
             raise ValueError("Engram input_ids contains a token ID outside the tokenizer vocabulary")
+        if position_ids.shape != input_ids.shape or position_ids.dtype not in (torch.int32, torch.int64):
+            raise ValueError("Engram position_ids must be int32/int64 with the same shape as input_ids")
+        batch, sequence = input_ids.shape
         compressed = self.token_map[input_ids.long()]
         if token_mask is not None:
             compressed = torch.where(token_mask, compressed, torch.full_like(compressed, _DEAD_TOKEN))
 
+        positions = torch.arange(sequence, device=input_ids.device).expand(batch, sequence)
+        starts = torch.cat(
+            (torch.ones_like(position_ids[:, :1], dtype=torch.bool), position_ids[:, 1:] <= position_ids[:, :-1]),
+            dim=1,
+        )
+        segment_start = torch.cummax(torch.where(starts, positions, 0), dim=1).values
         tokens = []
-        blocked = torch.zeros_like(compressed, dtype=torch.bool)
+        blocked = torch.zeros_like(positions, dtype=torch.bool)
         for shift in range(self.layout.max_ngram_size):
-            if shift == 0:
-                source = compressed
-            else:
-                source = F.pad(compressed, (shift, 0), value=_DEAD_TOKEN)[:, : compressed.shape[1]]
-            blocked = blocked | (position_ids < shift) | (source == _DEAD_TOKEN)
-            tokens.append(torch.where(blocked, torch.full_like(source, self.pad_id), source))
+            source_positions = positions - shift
+            source = compressed.gather(1, source_positions.clamp_min(0))
+            blocked = blocked | (source_positions < segment_start) | (source == _DEAD_TOKEN)
+            tokens.append(torch.where(blocked, self.pad_id, source))
         tokens = torch.stack(tokens, dim=-1)  # [B, L, max_ngram_size]
 
         # XOR the multiplied ids together one lookback at a time, so the running value after
