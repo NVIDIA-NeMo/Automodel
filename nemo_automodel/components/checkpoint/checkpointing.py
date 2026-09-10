@@ -202,6 +202,11 @@ def _should_dequantize_base_checkpoint(model: nn.Module, requested: bool | None)
 def _get_shared_parameter_names(model_parts: list[nn.Module]) -> list[list[str]]:
     """Find checkpoint names referring to the same live parameter.
 
+    This primarily safeguards HF initialization for encoder-decoder models
+    sharing embeddings across both stacks. ModelState already handles ordinary
+    input-embedding/LM-head tying; safetensors may omit additional aliases that
+    the loader must restore without accepting genuinely missing parameters.
+
     Args:
         model_parts: Model or pipeline parts after state-dict normalization.
 
