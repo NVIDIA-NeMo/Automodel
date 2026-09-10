@@ -7,12 +7,12 @@
 #SBATCH --gpus-per-node=8
 #SBATCH --exclusive
 #SBATCH --mem=0
-#SBATCH --time=01:00:00
+#SBATCH --time=02:00:00
 #SBATCH --output=slurm_jobs/%x_%j.out
 
-# Ten-step production-shaped pilot for the 170M memory-only LMM. It trains on
-# 5.24M FineWeb-Edu tokens with the paper's effective global batch and writes
-# a checkpoint. Run cwdfw_titans_fineweb_edu_prepare.sbatch first.
+# Ten-step production-shaped pilot for the 170M memory-only LMM. It prepares
+# and caches 64M FineWeb-Edu tokens when needed, then trains on 5.24M tokens
+# with the paper's effective global batch and writes a checkpoint.
 
 set -euo pipefail
 
@@ -25,11 +25,7 @@ VALIDATION_ROOT=$DATA_ROOT/validation-health
 READY_MARKER=$DATA_ROOT/READY
 CHECKPOINT_ROOT=$TITANS_WORK_ROOT/outputs/titans-170m-lmm-pilot-$SLURM_JOB_ID
 
-mkdir -p "$TITANS_WORK_ROOT"/{cache,logs,outputs} "$AUTOMODEL_CHECKOUT/slurm_jobs"
-test -s "$READY_MARKER"
-test -s "$TRAIN_DATA"
-test -s "${TRAIN_DATA%.bin}.bos.idx"
-test -s "$VALIDATION_ROOT/validation/fineweb_edu_smoke.bin"
+mkdir -p "$TITANS_WORK_ROOT"/{cache,logs,outputs} "$DATA_ROOT/train" "$AUTOMODEL_CHECKOUT/slurm_jobs"
 
 export TITANS_DATA_ROOT=$DATA_ROOT
 export TITANS_CHECKPOINT_ROOT=$CHECKPOINT_ROOT
@@ -50,6 +46,30 @@ srun \
   bash -lc "
     set -euo pipefail
     export PYTHONPATH='$AUTOMODEL_CHECKOUT'
+
+    if [[ ! -s '$READY_MARKER' || ! -s '$TRAIN_DATA' || ! -s '\${TRAIN_DATA%.bin}.bos.idx' ]]; then
+      python tools/nanogpt_data_processor.py \
+        --dataset HuggingFaceFW/fineweb-edu \
+        --set-name sample-10BT \
+        --tokenizer NousResearch/Llama-2-7b-hf \
+        --output-dir '$DATA_ROOT/train/fineweb_edu' \
+        --data-cache-dir '$TITANS_WORK_ROOT/cache/fineweb-edu' \
+        --max-tokens 64M \
+        --num-workers 32 \
+        --chunk-size 128 \
+        --prefetch 2
+      test -s '$TRAIN_DATA'
+      test -s '\${TRAIN_DATA%.bin}.bos.idx'
+      printf 'dataset=HuggingFaceFW/fineweb-edu\\nconfig=sample-10BT\\ntokenizer=NousResearch/Llama-2-7b-hf\\nmax_tokens=64000000\\n' \
+        > '$READY_MARKER'
+    fi
+
+    python tools/make_titans_smoke_data.py \
+      --output-dir '$VALIDATION_ROOT' \
+      --seq-len 4096 \
+      --train-documents 16 \
+      --validation-documents 16 \
+      --vocab-size 32000
 
     torchrun \
       --standalone \

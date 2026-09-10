@@ -116,12 +116,13 @@ After the 4K gate, launch the production-shaped pilot with:
 tools/submit_titans_cwdfw.sh --pilot
 ```
 
-This submits a CPU preparation job that streams `HuggingFaceFW/fineweb-edu`
-(`sample-10BT`) through AutoModel's NanoGPT processor with the public
-`NousResearch/Llama-2-7b-hf` tokenizer. Once 64M tokens and the validation
-health shard are ready, that job submits a ten-step, eight-H100 pilot
-automatically. The pilot trains on 5,242,880 tokens, validates distributed
-control flow, and writes a job-specific checkpoint. It is not a paper result.
+This submits an eight-H100 pilot that first streams
+`HuggingFaceFW/fineweb-edu` (`sample-10BT`) through AutoModel's NanoGPT
+processor with the public `NousResearch/Llama-2-7b-hf` tokenizer when the
+cached 64M-token shard is absent. It then trains on 5,242,880 tokens, validates
+distributed control flow, and writes a job-specific checkpoint. Dataset
+preparation uses the GPU allocation because `cw-dfw` does not currently grant
+this account CPU-partition capacity. The pilot is not a paper result.
 
 Defaults:
 

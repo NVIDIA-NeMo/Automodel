@@ -27,12 +27,12 @@ for argument in "$@"; do
 done
 
 if [[ $MODE == pilot ]]; then
-  SBATCH_SCRIPT=examples/llm_pretrain/slurm/cwdfw_titans_fineweb_edu_prepare.sbatch
-  JOB_NAME=titans-fineweb-prepare
-  PARTITION=cpu
-  CPUS_PER_TASK=64
-  GPUS=0
-  TIME_LIMIT=4:00:00
+  SBATCH_SCRIPT=examples/llm_pretrain/slurm/cwdfw_titans_170m_pilot.sbatch
+  JOB_NAME=titans-170m-pilot
+  PARTITION=batch
+  CPUS_PER_TASK=128
+  GPUS=8
+  TIME_LIMIT=2:00:00
 else
   SBATCH_SCRIPT=examples/llm_pretrain/slurm/cwdfw_titans_170m_4k_smoke.sbatch
   JOB_NAME=titans-170m-4k-smoke
