@@ -41,15 +41,18 @@ class DeepSeekV4SparseAttention(torch.autograd.Function):
         attn_sink: torch.Tensor,
         topk_idxs: torch.Tensor,
         sm_scale: float | None = None,
+        reference_rounding: bool = False,
     ) -> torch.Tensor:
         """Run the vendored sparse attention forward kernel."""
-        output, lse = sparse_mla_fwd.sparse_mqa_fwd_interface(q, kv, attn_sink, topk_idxs, sm_scale=sm_scale)
+        output, lse = sparse_mla_fwd.sparse_mqa_fwd_interface(
+            q, kv, attn_sink, topk_idxs, sm_scale=sm_scale, reference_rounding=reference_rounding
+        )
         ctx.save_for_backward(q, kv, attn_sink, topk_idxs, output, lse)
         ctx.sm_scale = sm_scale
         return output
 
     @staticmethod
-    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, None, None]:
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, None, None, None]:
         """Run the vendored sparse attention backward kernel."""
         q, kv, attn_sink, topk_idxs, output, lse = ctx.saved_tensors
         grad_output = grad_output.contiguous()
@@ -63,7 +66,10 @@ class DeepSeekV4SparseAttention(torch.autograd.Function):
             lse,
             sm_scale=ctx.sm_scale,
         )
-        return grad_q, grad_kv, grad_attn_sink, None, None
+        gradients = (grad_q, grad_kv, grad_attn_sink, None, None, None)
+        # Direct .apply callers may omit optional arguments. Autograd requires
+        # one entry per argument actually supplied, including optional flags.
+        return gradients[: len(ctx.needs_input_grad)]
 
 
 def sparse_attn_tilelang(
@@ -72,9 +78,10 @@ def sparse_attn_tilelang(
     attn_sink: torch.Tensor,
     topk_idxs: torch.Tensor,
     sm_scale: float | None = None,
+    reference_rounding: bool = False,
 ) -> torch.Tensor:
     """Run vendored Miles DeepSeek V4 TileLang sparse attention."""
-    return DeepSeekV4SparseAttention.apply(q, kv, attn_sink, topk_idxs, sm_scale)
+    return DeepSeekV4SparseAttention.apply(q, kv, attn_sink, topk_idxs, sm_scale, reference_rounding)
 
 
 class DeepSeekV4SparseAttentionHeadChunked(torch.autograd.Function):
@@ -89,18 +96,23 @@ class DeepSeekV4SparseAttentionHeadChunked(torch.autograd.Function):
         topk_idxs: torch.Tensor,
         max_heads_per_kernel: int,
         sm_scale: float | None = None,
+        reference_rounding: bool = False,
     ) -> torch.Tensor:
         """Run the vendored sparse attention forward kernel over head chunks."""
         output = q.new_empty(q.shape)
         lse = torch.empty(q.shape[:3], dtype=torch.float32, device=q.device)
-        for start in range(0, q.shape[2], max_heads_per_kernel):
-            end = min(start + max_heads_per_kernel, q.shape[2])
+        # Preserve the original 64-head forward reduction layout for its exact
+        # rounding contract. Backward retains the smaller memory-bounded chunks.
+        forward_heads = max(max_heads_per_kernel, 64) if reference_rounding else max_heads_per_kernel
+        for start in range(0, q.shape[2], forward_heads):
+            end = min(start + forward_heads, q.shape[2])
             chunk_output, chunk_lse = sparse_mla_fwd.sparse_mqa_fwd_interface(
                 q[:, :, start:end, :].contiguous(),
                 kv,
                 attn_sink[start:end].contiguous(),
                 topk_idxs,
                 sm_scale=sm_scale,
+                reference_rounding=reference_rounding,
             )
             output[:, :, start:end, :].copy_(chunk_output)
             lse[:, :, start:end].copy_(chunk_lse)
@@ -110,7 +122,9 @@ class DeepSeekV4SparseAttentionHeadChunked(torch.autograd.Function):
         return output
 
     @staticmethod
-    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, None, None, None]:
+    def backward(
+        ctx, grad_output: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, None, None, None, None]:
         """Run chunked backward and accumulate shared KV gradients in fp32."""
         q, kv, attn_sink, topk_idxs, output, lse = ctx.saved_tensors
         grad_output = grad_output.contiguous()
@@ -134,14 +148,16 @@ class DeepSeekV4SparseAttentionHeadChunked(torch.autograd.Function):
             grad_q_full[:, :, start:end, :].copy_(grad_q_chunk)
             grad_kv += grad_kv_chunk
             grad_attn_sink_full[start:end].copy_(grad_attn_sink)
-        return (
+        gradients = (
             grad_q_full,
             grad_kv.to(kv.dtype),
             grad_attn_sink_full,
             None,
             None,
             None,
+            None,
         )
+        return gradients[: len(ctx.needs_input_grad)]
 
 
 def sparse_attn_tilelang_head_chunked(
@@ -151,6 +167,9 @@ def sparse_attn_tilelang_head_chunked(
     topk_idxs: torch.Tensor,
     max_heads_per_kernel: int,
     sm_scale: float | None = None,
+    reference_rounding: bool = False,
 ) -> torch.Tensor:
     """Run vendored Miles sparse attention in TileLang head chunks."""
-    return DeepSeekV4SparseAttentionHeadChunked.apply(q, kv, attn_sink, topk_idxs, max_heads_per_kernel, sm_scale)
+    return DeepSeekV4SparseAttentionHeadChunked.apply(
+        q, kv, attn_sink, topk_idxs, max_heads_per_kernel, sm_scale, reference_rounding
+    )

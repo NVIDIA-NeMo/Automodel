@@ -45,12 +45,13 @@ def sparse_mqa_fwd(
     block_I=64,
     num_stages=2,
     threads=256,
+    reference_rounding=False,
 ):
     assert dim == tilelang.math.next_power_of_2(dim), f"dim must be power of 2, got {dim}"
     assert topk % block_I == 0, f"topk ({topk}) must be divisible by block_I ({block_I})"
     if sm_scale is None:
-        sm_scale = (1.0 / dim) ** 0.5 * 1.44269504  # log2(e)
-    else:
+        sm_scale = (1.0 / dim) ** 0.5
+    if not reference_rounding:
         sm_scale = sm_scale * 1.44269504  # log2(e)
 
     batch = T.dynamic("batch")
@@ -110,7 +111,7 @@ def sparse_mqa_fwd(
 
             T.fill(acc_o, 0)
             T.fill(sumexp, 0)
-            T.fill(m_i, -(2**30))
+            T.fill(m_i, -1e30 if reference_rounding else -(2**30))
 
             b_i = by
             s_i = bx if REPLICATE_H == 1 else (bx // REPLICATE_H)
@@ -137,14 +138,26 @@ def sparse_mqa_fwd(
                 )
                 for h_i, bi_i in T.Parallel(H_per_block, BI):
                     acc_s[h_i, bi_i] = T.if_then_else(mask[bi_i], acc_s[h_i, bi_i], -T.infinity(acc_s.dtype))
+                if reference_rounding:
+                    # The original inference kernel rounds scaled logits before
+                    # its maximum reduction and subtraction. Scaling raw logits
+                    # separately inside exp2 changes BF16 probability rounding.
+                    for h_i, bi_i in T.Parallel(H_per_block, BI):
+                        acc_s[h_i, bi_i] *= sm_scale
                 T.copy(m_i, m_i_prev)
                 T.reduce_max(acc_s, m_i, dim=1, clear=False)
                 for h_i in T.Parallel(H_per_block):
                     m_i[h_i] = T.max(m_i[h_i], m_i_prev[h_i])
-                for h_i in T.Parallel(H_per_block):
-                    alpha[h_i] = T.exp2((m_i_prev[h_i] - m_i[h_i]) * sm_scale)
-                for h_i, bi_i in T.Parallel(H_per_block, BI):
-                    acc_s[h_i, bi_i] = T.exp2(acc_s[h_i, bi_i] * sm_scale - m_i[h_i] * sm_scale)
+                if reference_rounding:
+                    for h_i in T.Parallel(H_per_block):
+                        alpha[h_i] = T.exp(m_i_prev[h_i] - m_i[h_i])
+                    for h_i, bi_i in T.Parallel(H_per_block, BI):
+                        acc_s[h_i, bi_i] = T.exp(acc_s[h_i, bi_i] - m_i[h_i])
+                else:
+                    for h_i in T.Parallel(H_per_block):
+                        alpha[h_i] = T.exp2((m_i_prev[h_i] - m_i[h_i]) * sm_scale)
+                    for h_i, bi_i in T.Parallel(H_per_block, BI):
+                        acc_s[h_i, bi_i] = T.exp2(acc_s[h_i, bi_i] * sm_scale - m_i[h_i] * sm_scale)
                 T.reduce_sum(acc_s, sumexp_i, dim=1)
                 for h_i in T.Parallel(H_per_block):
                     sumexp[h_i] = sumexp[h_i] * alpha[h_i] + sumexp_i[h_i]
@@ -157,14 +170,21 @@ def sparse_mqa_fwd(
             # attn_sink: add exp(attn_sink[h] - max_scaled) to softmax denominator
             # attn_sink is a pre-scaled logit (same space as scores*sm_scale), so only convert to log2 base
             for h_i in T.Parallel(H_per_block):
-                sumexp[h_i] += T.exp2(AttnSink[H0 + h_i] * 1.44269504 - m_i[h_i] * sm_scale)
+                if reference_rounding:
+                    sumexp[h_i] += T.exp(AttnSink[H0 + h_i] - m_i[h_i])
+                else:
+                    sumexp[h_i] += T.exp2(AttnSink[H0 + h_i] * 1.44269504 - m_i[h_i] * sm_scale)
 
             # Rescale output
             for h_i, d_i in T.Parallel(H_per_block, D):
                 acc_o[h_i, d_i] /= sumexp[h_i]
             # LSE = log2(sumexp) + m_i * sm_scale (in log2 space)
             for h_i in T.Parallel(H_per_block):
-                sumexp[h_i] = T.log2(sumexp[h_i]) + m_i[h_i] * sm_scale
+                if reference_rounding:
+                    # Backward consumes base-two LSE in both arithmetic modes.
+                    sumexp[h_i] = T.log2(sumexp[h_i]) + m_i[h_i] * 1.44269504
+                else:
+                    sumexp[h_i] = T.log2(sumexp[h_i]) + m_i[h_i] * sm_scale
 
             T.copy(acc_o, Output[b_i, s_i, H0:H1, :])
             T.copy(sumexp, Lse[b_i, s_i, H0:H1])
@@ -172,7 +192,9 @@ def sparse_mqa_fwd(
     return main
 
 
-def sparse_mqa_fwd_interface(q, kv, attn_sink, topk_idxs, sm_scale=None, block_I=64, num_stages=2, threads=256):
+def sparse_mqa_fwd_interface(
+    q, kv, attn_sink, topk_idxs, sm_scale=None, block_I=64, num_stages=2, threads=256, reference_rounding=False
+):
     """Forward interface for V4 sparse MQA attention.
 
     Args:
@@ -181,6 +203,8 @@ def sparse_mqa_fwd_interface(q, kv, attn_sink, topk_idxs, sm_scale=None, block_I
         attn_sink: [H] fp32
         topk_idxs: [B, S, topk] int32
         sm_scale:  float or None (defaults to 1/sqrt(D))
+        reference_rounding: Match the original inference kernel's scaled-logit
+            FP32 arithmetic while retaining log2 LSE for the existing backward.
 
     Returns:
         out: [B, S, H, D] bf16
@@ -210,6 +234,7 @@ def sparse_mqa_fwd_interface(q, kv, attn_sink, topk_idxs, sm_scale=None, block_I
         block_I=block_I,
         num_stages=num_stages,
         threads=threads,
+        reference_rounding=reference_rounding,
     )
     out, lse = kernel(q, kv, attn_sink, topk_idxs, valid_mask)
     return out, lse

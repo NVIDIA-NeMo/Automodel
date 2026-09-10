@@ -766,6 +766,11 @@ class MoE(nn.Module):
         """
         super().__init__()
         self.backend = backend
+        self.combine_in_fp32 = config.combine_in_fp32
+        if self.combine_in_fp32 and backend.dispatcher not in ("torch", "hybridep"):
+            raise ValueError("combine_in_fp32 requires dispatcher='torch' or 'hybridep'")
+        if self.combine_in_fp32 and config.moe_latent_size is not None:
+            raise ValueError("combine_in_fp32 does not support a latent projection")
         self.dim = config.dim
         self.n_routed_experts = config.n_routed_experts
         self.n_activated_experts = config.n_activated_experts
@@ -789,7 +794,7 @@ class MoE(nn.Module):
             )
             self.experts = GroupedExperts(config, backend=backend)
         elif backend.dispatcher in ("deepep", "hybridep", "uccl_ep"):
-            if backend.experts in ("gmm", "torch_mm", "torch_mm_mxfp8"):
+            if backend.experts in ("gmm", "torch_mm", "torch_mm_mxfp8", "torch_linear"):
                 self.experts = GroupedExpertsDeepEP(
                     config,
                     backend=backend,
@@ -908,6 +913,11 @@ class MoE(nn.Module):
             # Routed experts on the main stream.
             y = self.experts(x_latent, token_mask, weights, indices)
 
+        if self.combine_in_fp32 and y.dtype != torch.float32:
+            raise TypeError(
+                "combine_in_fp32 requires FP32 expert outputs; configure FSDP output_dtype=None "
+                "to preserve the routed accumulation until shared expert addition"
+            )
         if self.fc2_latent_proj is not None:
             # ``self.experts`` is its own FSDP unit; an ``output_dtype`` in the FSDP
             # MixedPrecisionPolicy (NeMo-RL uses float32) casts its output above the
@@ -917,6 +927,8 @@ class MoE(nn.Module):
             y = self.fc2_latent_proj(y.to(x_latent.dtype))
         if z is not None:
             y = y + z
+        if self.combine_in_fp32:
+            y = y.to(x.dtype)
         return y.view(shape)
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:

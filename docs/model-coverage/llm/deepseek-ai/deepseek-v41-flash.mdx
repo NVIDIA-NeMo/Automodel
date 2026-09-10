@@ -1,0 +1,88 @@
+---
+title: "DeepSeek-V4.1 Flash"
+description: "DeepSeek V4.1 backbone fine-tuning with expert parallelism and sharded Engram memory."
+slug: model-coverage/large-language-models/deepseek-ai/deepseek-v41-flash
+---
+
+[DeepSeek-V4.1 Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash)
+uses a 40-layer causal encoder/decoder backbone with 384 routed experts, one
+shared expert, and six selected experts per token. Its CSA2 attention shares
+compressed KV and index state between Full, Reuse, and Reindex layers.
+Single-pass mHC carries four residual streams, and two trainable Engram tables
+provide tokenizer-dependent N-gram memory.
+
+| Setting | Value |
+|---|---|
+| **Architecture** | `DeepseekV41ForCausalLM` |
+| Model ID | `deepseek-ai/DeepSeek-V4.1-Flash` |
+| Reference revision | `df42c109f1defefcbfcedbe7d905718a12266e40` |
+| Training recipe | [HellaSwag EP128](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_hellaswag_ep128.yaml) |
+| Recipe topology | 32 nodes × 4 GB200 GPUs; EP128, TP1, PP1, CP1 |
+
+## Fine-tuning
+
+The recipe trains all 40 text-backbone layers and both Engram tables. Dense
+parameters use FSDP; routed experts use the shared AutoModel MoE implementation
+with HybridEP dispatch. Engram reuses the Qwen3.8 Flash Next row-owner embedding
+and distributes each table across the same world ranks without a full-table
+all-gather. The text recipe disables the vision tower; the model also provides
+the released image encoder and projector using the existing DeepSeek V4 modules.
+
+Use `attn: tilelang`, `experts: torch_linear`, and `dispatcher: hybridep` for the
+released arithmetic. TileLang and TileKernels are the optional dependencies
+already used by DeepSeek V4. The explicit `torch_linear` expert backend preserves
+separate gate/up/down projections and eager FP32 SwiGLU. The model enables FP32
+routed accumulation and shared-expert addition, casting once at the MoE output.
+
+FSDP mixed precision must use `param_dtype: bfloat16`, `reduce_dtype: float32`,
+`output_dtype: null`, and `cast_forward_inputs: false`. Set
+`lm_head_precision: float32`. These settings preserve FP32 mHC coefficients and
+expert accumulation across module boundaries.
+
+The checkpoint adapter decodes the released FP8 dense weights, FP4 experts,
+and FP8 Engram tables into trainable parameters. The recipe sets
+`dequantize_base_checkpoint: true`; trained checkpoints retain the released
+parameter names with floating-point weights.
+
+See the [Slurm launcher guide](/job-launchers/slurm-cluster) for running the
+multi-node recipe, and the [installation guide](/get-started/installation) for
+the development environment.
+
+## Validation and scope
+
+Numerical parity uses the pinned checkpoint's official `inference/` code.
+The functional runners in `tests/functional_tests/models/deepseek_v41` audit
+checkpoint tensors and compare every position and vocabulary entry in the
+selected prefix. Separate runners cover decoder attention ownership, Engram,
+and EP/FSDP training with checkpoint resume.
+
+The pretrained first-four-layer comparison passes with bitwise-identical logits
+over 4,096 tokens and all 129,280 vocabulary entries: KL is zero and top-1
+agreement is 100%. It compares official TP1 with native EP4 using one valid
+global sample; auxiliary native ranks have masked inputs and participate in
+the required communication. All four ranks pass their complete weight audits.
+
+Layers 20–24 also match every intermediate activation and logit exactly when
+started from the official encoder's 20-layer prefix state. This separately
+validates the decoder window; it does not establish full-native-backbone parity.
+
+A separate continuous 40-layer comparison also matches all 205 observed
+intermediate tensors and final 4,096 × 129,280 logits exactly. The native run
+streams one EP4/FSDP block at a time while preserving its own mHC and CSA2 state;
+embedding, final norm, and output head are replicated. Each rank passes its
+1,006/1,006 state audit and BF16/protected-FP32 parameter storage checks. This
+extends numerical coverage to the complete backbone with streamed weights;
+resident multi-node training is a separate execution check.
+
+A reduced-width 40-layer EP2 training run restores all checkpoint state exactly.
+TileLang backward is not bitwise deterministic: both resumed training and an
+independent uninterrupted repeat have different numerical trajectories. Strict
+trajectory comparisons remain reported as failures, separately from successful
+checkpoint restoration and finite-gradient validation.
+
+Training currently uses unpacked, right-padded, zero-based sequences. TP, PP,
+CP, packed sequences, incremental generation caches, and million-token training
+are outside the validated path. Indexers remain frozen because their hard
+top-k selection has no language-model gradient. Indexer distillation, DSpark
+draft training, and the report's Engram pretraining optimizer are outside this
+fine-tuning implementation.
