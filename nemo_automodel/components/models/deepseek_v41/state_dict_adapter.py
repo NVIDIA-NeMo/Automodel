@@ -898,7 +898,10 @@ class DeepSeekV41StateDictAdapter(MoESplitExpertsStateDictMixin, DeepSeekV4State
 
     @classmethod
     def _fp8_cast(cls, value: Any) -> Any:
+        """Create FP8 storage while retaining the global layout of uneven shards."""
         if is_dtensor(value):
             local = cls._empty_or_cast_fp8(value.to_local())
-            return DTensor.from_local(local, value.device_mesh, value.placements)
+            return DTensor.from_local(
+                local, value.device_mesh, value.placements, shape=value.shape, stride=value.stride()
+            )
         return cls._empty_or_cast_fp8(value)
