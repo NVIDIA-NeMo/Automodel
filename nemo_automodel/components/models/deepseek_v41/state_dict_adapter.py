@@ -32,18 +32,18 @@ Key mapping (HF -> internal):
   embed.weight                           -> model.embed_tokens.weight
   norm.weight                            -> model.norm.weight
   head.weight                            -> lm_head.weight
-  layers.{i}.attn_norm.weight            -> model.layers.{i}.input_layernorm.weight
-  layers.{i}.ffn_norm.weight             -> model.layers.{i}.post_attention_layernorm.weight
-  layers.{i}.attn.attn_sink              -> model.layers.{i}.self_attn.sinks_param.weight
-  layers.{i}.attn.*                      -> model.layers.{i}.self_attn.*   (compressor.*, indexer.* keep their names)
-  layers.{i}.ffn.gate.bias               -> model.layers.{i}.mlp.gate.e_score_correction_bias
-  layers.{i}.ffn.gate.weight             -> model.layers.{i}.mlp.gate.weight
-  layers.{i}.ffn.shared_experts.w1/w3/w2 -> model.layers.{i}.mlp.shared_experts.gate_proj/up_proj/down_proj
-  layers.{i}.ffn.experts.{j}.w1/w3/w2    -> stacked into model.layers.{i}.mlp.experts.gate_and_up_projs / down_projs
+  layers.{i}.attn_norm.weight            -> model.layers.{i}.attn_norm.weight
+  layers.{i}.ffn_norm.weight             -> model.layers.{i}.ffn_norm.weight
+  layers.{i}.attn.attn_sink              -> model.layers.{i}.attn.sinks_param.weight
+  layers.{i}.attn.*                      -> model.layers.{i}.attn.*   (compressor.*, indexer.* keep their names)
+  layers.{i}.ffn.gate.bias               -> model.layers.{i}.ffn.gate.e_score_correction_bias
+  layers.{i}.ffn.gate.weight             -> model.layers.{i}.ffn.gate.weight
+  layers.{i}.ffn.shared_experts.w1/w3/w2 -> model.layers.{i}.ffn.shared_experts.gate_proj/up_proj/down_proj
+  layers.{i}.ffn.experts.{j}.w1/w3/w2    -> stacked into model.layers.{i}.ffn.experts.gate_and_up_projs / down_projs
   layers.{i}.hc_attn_{fn,base,scale}     -> model.layers.{i}.attn_hc.{fn,base,scale}
   layers.{i}.hc_ffn_{fn,base,scale}      -> model.layers.{i}.ffn_hc.{fn,base,scale}
   layers.{i}.engram.*                    -> model.layers.{i}.engram.*
-  layers.{i}.ffn.gate.bias_vl             -> model.layers.{i}.mlp.gate.bias_vl
+  layers.{i}.ffn.gate.bias_vl             -> model.layers.{i}.ffn.gate.bias_vl
   vision.* / aligner.*                   -> model.vision.* / model.aligner.*
   image_{start,end,newline}              -> model.image_{start,end,newline}
 
@@ -82,18 +82,18 @@ _HF_TO_INTERNAL_RENAMES: list[tuple[re.Pattern, str]] = [
     (re.compile(r"^embed\.(.+)$"), r"model.embed_tokens.\1"),
     (re.compile(r"^norm\.(.+)$"), r"model.norm.\1"),
     (re.compile(r"^head\.(.+)$"), r"lm_head.\1"),
-    (re.compile(r"^layers\.(\d+)\.attn_norm\.(.+)$"), r"model.layers.\1.input_layernorm.\2"),
-    (re.compile(r"^layers\.(\d+)\.ffn_norm\.(.+)$"), r"model.layers.\1.post_attention_layernorm.\2"),
-    (re.compile(r"^layers\.(\d+)\.attn\.attn_sink$"), r"model.layers.\1.self_attn.sinks_param.weight"),
-    (re.compile(r"^layers\.(\d+)\.attn\.(.+)$"), r"model.layers.\1.self_attn.\2"),
-    (re.compile(r"^layers\.(\d+)\.ffn\.gate\.bias$"), r"model.layers.\1.mlp.gate.e_score_correction_bias"),
-    (re.compile(r"^layers\.(\d+)\.ffn\.gate\.(.+)$"), r"model.layers.\1.mlp.gate.\2"),
-    (re.compile(r"^layers\.(\d+)\.ffn\.shared_experts\.w1\.(.+)$"), r"model.layers.\1.mlp.shared_experts.gate_proj.\2"),
-    (re.compile(r"^layers\.(\d+)\.ffn\.shared_experts\.w3\.(.+)$"), r"model.layers.\1.mlp.shared_experts.up_proj.\2"),
-    (re.compile(r"^layers\.(\d+)\.ffn\.shared_experts\.w2\.(.+)$"), r"model.layers.\1.mlp.shared_experts.down_proj.\2"),
-    (re.compile(r"^layers\.(\d+)\.ffn\.experts\.(\d+)\.w1\.(.+)$"), r"model.layers.\1.mlp.experts.\2.gate_proj.\3"),
-    (re.compile(r"^layers\.(\d+)\.ffn\.experts\.(\d+)\.w3\.(.+)$"), r"model.layers.\1.mlp.experts.\2.up_proj.\3"),
-    (re.compile(r"^layers\.(\d+)\.ffn\.experts\.(\d+)\.w2\.(.+)$"), r"model.layers.\1.mlp.experts.\2.down_proj.\3"),
+    (re.compile(r"^layers\.(\d+)\.attn_norm\.(.+)$"), r"model.layers.\1.attn_norm.\2"),
+    (re.compile(r"^layers\.(\d+)\.ffn_norm\.(.+)$"), r"model.layers.\1.ffn_norm.\2"),
+    (re.compile(r"^layers\.(\d+)\.attn\.attn_sink$"), r"model.layers.\1.attn.sinks_param.weight"),
+    (re.compile(r"^layers\.(\d+)\.attn\.(.+)$"), r"model.layers.\1.attn.\2"),
+    (re.compile(r"^layers\.(\d+)\.ffn\.gate\.bias$"), r"model.layers.\1.ffn.gate.e_score_correction_bias"),
+    (re.compile(r"^layers\.(\d+)\.ffn\.gate\.(.+)$"), r"model.layers.\1.ffn.gate.\2"),
+    (re.compile(r"^layers\.(\d+)\.ffn\.shared_experts\.w1\.(.+)$"), r"model.layers.\1.ffn.shared_experts.gate_proj.\2"),
+    (re.compile(r"^layers\.(\d+)\.ffn\.shared_experts\.w3\.(.+)$"), r"model.layers.\1.ffn.shared_experts.up_proj.\2"),
+    (re.compile(r"^layers\.(\d+)\.ffn\.shared_experts\.w2\.(.+)$"), r"model.layers.\1.ffn.shared_experts.down_proj.\2"),
+    (re.compile(r"^layers\.(\d+)\.ffn\.experts\.(\d+)\.w1\.(.+)$"), r"model.layers.\1.ffn.experts.\2.gate_proj.\3"),
+    (re.compile(r"^layers\.(\d+)\.ffn\.experts\.(\d+)\.w3\.(.+)$"), r"model.layers.\1.ffn.experts.\2.up_proj.\3"),
+    (re.compile(r"^layers\.(\d+)\.ffn\.experts\.(\d+)\.w2\.(.+)$"), r"model.layers.\1.ffn.experts.\2.down_proj.\3"),
     (re.compile(r"^layers\.(\d+)\.hc_attn_(base|fn|scale)$"), r"model.layers.\1.attn_hc.\2"),
     (re.compile(r"^layers\.(\d+)\.hc_ffn_(base|fn|scale)$"), r"model.layers.\1.ffn_hc.\2"),
     (re.compile(r"^layers\.(\d+)\.engram\.(.+)$"), r"model.layers.\1.engram.\2"),
@@ -103,25 +103,25 @@ _INTERNAL_TO_HF_RENAMES: list[tuple[re.Pattern, str]] = [
     (re.compile(r"^model\.vision\.(.+)$"), r"vision.\1"),
     (re.compile(r"^model\.aligner\.(.+)$"), r"aligner.\1"),
     (re.compile(r"^model\.(image_start|image_end|image_newline|image_pad)$"), r"\1"),
-    (re.compile(r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.gate_proj\.(.+)$"), r"layers.\1.ffn.experts.\2.w1.\3"),
-    (re.compile(r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.up_proj\.(.+)$"), r"layers.\1.ffn.experts.\2.w3.\3"),
-    (re.compile(r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.down_proj\.(.+)$"), r"layers.\1.ffn.experts.\2.w2.\3"),
+    (re.compile(r"^model\.layers\.(\d+)\.ffn\.experts\.(\d+)\.gate_proj\.(.+)$"), r"layers.\1.ffn.experts.\2.w1.\3"),
+    (re.compile(r"^model\.layers\.(\d+)\.ffn\.experts\.(\d+)\.up_proj\.(.+)$"), r"layers.\1.ffn.experts.\2.w3.\3"),
+    (re.compile(r"^model\.layers\.(\d+)\.ffn\.experts\.(\d+)\.down_proj\.(.+)$"), r"layers.\1.ffn.experts.\2.w2.\3"),
     (re.compile(r"^model\.embed_tokens\.(.+)$"), r"embed.\1"),
     (re.compile(r"^model\.norm\.(.+)$"), r"norm.\1"),
     (re.compile(r"^lm_head\.(.+)$"), r"head.\1"),
-    (re.compile(r"^model\.layers\.(\d+)\.input_layernorm\.(.+)$"), r"layers.\1.attn_norm.\2"),
-    (re.compile(r"^model\.layers\.(\d+)\.post_attention_layernorm\.(.+)$"), r"layers.\1.ffn_norm.\2"),
-    (re.compile(r"^model\.layers\.(\d+)\.self_attn\.sinks_param\.weight$"), r"layers.\1.attn.attn_sink"),
-    (re.compile(r"^model\.layers\.(\d+)\.self_attn\.(.+)$"), r"layers.\1.attn.\2"),
-    (re.compile(r"^model\.layers\.(\d+)\.mlp\.gate\.e_score_correction_bias$"), r"layers.\1.ffn.gate.bias"),
-    (re.compile(r"^model\.layers\.(\d+)\.mlp\.gate\.(.+)$"), r"layers.\1.ffn.gate.\2"),
+    (re.compile(r"^model\.layers\.(\d+)\.attn_norm\.(.+)$"), r"layers.\1.attn_norm.\2"),
+    (re.compile(r"^model\.layers\.(\d+)\.ffn_norm\.(.+)$"), r"layers.\1.ffn_norm.\2"),
+    (re.compile(r"^model\.layers\.(\d+)\.attn\.sinks_param\.weight$"), r"layers.\1.attn.attn_sink"),
+    (re.compile(r"^model\.layers\.(\d+)\.attn\.(.+)$"), r"layers.\1.attn.\2"),
+    (re.compile(r"^model\.layers\.(\d+)\.ffn\.gate\.e_score_correction_bias$"), r"layers.\1.ffn.gate.bias"),
+    (re.compile(r"^model\.layers\.(\d+)\.ffn\.gate\.(.+)$"), r"layers.\1.ffn.gate.\2"),
     (
-        re.compile(r"^model\.layers\.(\d+)\.mlp\.shared_experts\.gate_proj\.(.+)$"),
+        re.compile(r"^model\.layers\.(\d+)\.ffn\.shared_experts\.gate_proj\.(.+)$"),
         r"layers.\1.ffn.shared_experts.w1.\2",
     ),
-    (re.compile(r"^model\.layers\.(\d+)\.mlp\.shared_experts\.up_proj\.(.+)$"), r"layers.\1.ffn.shared_experts.w3.\2"),
+    (re.compile(r"^model\.layers\.(\d+)\.ffn\.shared_experts\.up_proj\.(.+)$"), r"layers.\1.ffn.shared_experts.w3.\2"),
     (
-        re.compile(r"^model\.layers\.(\d+)\.mlp\.shared_experts\.down_proj\.(.+)$"),
+        re.compile(r"^model\.layers\.(\d+)\.ffn\.shared_experts\.down_proj\.(.+)$"),
         r"layers.\1.ffn.shared_experts.w2.\2",
     ),
     (re.compile(r"^model\.layers\.(\d+)\.attn_hc\.(fn|base|scale)$"), r"layers.\1.hc_attn_\2"),
@@ -283,7 +283,7 @@ def dequantize_checkpoint_weight(
     return output
 
 
-class DeepSeekV41StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
+class DeepseekV41StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
     """Convert released V4.1 layouts and stream directly into prepared model storage.
 
     Floating DCP initialization uses shared MoE views and skips rebuilding
@@ -311,6 +311,10 @@ class DeepSeekV41StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
         self._uses_model_prefix = True
         self._engram_rows = dict(zip(config.engram_layer_ids, config.engram_num_embeddings))
 
+    @property
+    def _expert_path_segment(self) -> str:
+        return "ffn.experts"
+
     def get_hf_state_dict_keys(self, state_dict: dict[str, Any]) -> list[str]:
         """Return global checkpoint names without inspecting owner-local values.
 
@@ -326,7 +330,7 @@ class DeepSeekV41StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
         for fqn in state_dict:
             if fqn.startswith("mtp.") or "_extra_state" in fqn:
                 continue
-            expert = re.fullmatch(r"model\.layers\.(\d+)\.mlp\.experts\.(gate_and_up_projs|down_projs)", fqn)
+            expert = re.fullmatch(r"model\.layers\.(\d+)\.ffn\.experts\.(gate_and_up_projs|down_projs)", fqn)
             if expert:
                 projections = (1, 3) if expert[2] == "gate_and_up_projs" else (2,)
                 keys.extend(

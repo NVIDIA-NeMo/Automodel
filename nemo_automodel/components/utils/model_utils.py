@@ -721,7 +721,7 @@ def freeze_unused_kv_sharing_params(model):
 _DEEPSEEK_V4_INDEXER_PARAM_MARKERS = {
     # DeepSeek V4 nests the indexer under the compressor; V4.1 keeps it as an attention sibling.
     "deepseek_v4": ".self_attn.compressor.indexer.",
-    "deepseek_v41": ".self_attn.indexer.",
+    "deepseek_v41": ".attn.indexer.",
 }
 
 

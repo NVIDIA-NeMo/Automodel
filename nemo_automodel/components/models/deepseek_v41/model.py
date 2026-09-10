@@ -75,7 +75,7 @@ from nemo_automodel.components.models.deepseek_v41.processing import (
     IMAGE_START,
     image_inputs_from_batch,
 )
-from nemo_automodel.components.models.deepseek_v41.state_dict_adapter import DeepSeekV41StateDictAdapter
+from nemo_automodel.components.models.deepseek_v41.state_dict_adapter import DeepseekV41StateDictAdapter
 from nemo_automodel.components.models.deepseek_v41.vision import (
     DeepseekV41VisionAligner,
     DeepseekV41VisionTransformer,
@@ -245,8 +245,8 @@ class DeepseekV41Model(nn.Module):
     def update_moe_gate_bias(self) -> None:
         with torch.no_grad():
             for block in self.layers.values():
-                if isinstance(block.mlp, MoE) and self.moe_config.gate_bias_update_factor > 0:
-                    block.mlp.gate.update_bias()
+                if isinstance(block.ffn, MoE) and self.moe_config.gate_bias_update_factor > 0:
+                    block.ffn.gate.update_bias()
 
     @torch.no_grad()
     def init_weights(self, buffer_device: torch.device | None = None) -> None:
@@ -282,11 +282,11 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
         "ffn_hc.fn",
         "ffn_hc.base",
         "ffn_hc.scale",
-        "self_attn.sinks",
+        "attn.sinks_param",
         # Compressor weights stay fp32 in storage. Projection uses the incoming
         # activation dtype via _InputDtypeLinear; pooling remains fp32.
-        "self_attn.compressor.wkv",
-        "self_attn.compressor.wgate",
+        "attn.compressor.wkv",
+        "attn.compressor.wgate",
         "e_score_correction_bias",
         "bias_vl",
         "vision.norm",
@@ -350,7 +350,7 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
         )
         self.moe_config = self.model.moe_config
         if self.backend.enable_hf_state_dict_adapter:
-            self.state_dict_adapter = DeepSeekV41StateDictAdapter(
+            self.state_dict_adapter = DeepseekV41StateDictAdapter(
                 self.config,
                 self.model.moe_config,
                 self.backend,

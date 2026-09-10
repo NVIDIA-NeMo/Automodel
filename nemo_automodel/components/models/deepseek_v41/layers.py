@@ -990,19 +990,17 @@ class DeepseekV41Block(nn.Module):
         self.layer_idx = layer_idx
         self.hc_mult = int(config.hc_mult)
         model_dtype = get_dtype(config.torch_dtype, torch.bfloat16)
-        self.self_attn = DeepseekV41Attention(config, layer_idx, backend=backend)
+        self.attn = DeepseekV41Attention(config, layer_idx, backend=backend)
         moe_backend = replace(backend, gate_precision=torch.float32)
-        self.mlp = MoE(moe_config, moe_backend)
-        self.mlp.gate = DeepseekV4VisionGate(
+        self.ffn = MoE(moe_config, moe_backend)
+        self.ffn.gate = DeepseekV4VisionGate(
             DeepseekV4Config(vocab_size=config.vocab_size),
             moe_config,
             gate_precision=moe_backend.gate_precision,
             hash_routing=False,
         )
-        self.input_layernorm = DeepseekV41RMSNorm(config.hidden_size, eps=config.rms_norm_eps, dtype=model_dtype)
-        self.post_attention_layernorm = DeepseekV41RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps, dtype=model_dtype
-        )
+        self.attn_norm = DeepseekV41RMSNorm(config.hidden_size, eps=config.rms_norm_eps, dtype=model_dtype)
+        self.ffn_norm = DeepseekV41RMSNorm(config.hidden_size, eps=config.rms_norm_eps, dtype=model_dtype)
         hc_kwargs = dict(
             hc_mult=self.hc_mult,
             hidden_size=config.hidden_size,
@@ -1018,6 +1016,11 @@ class DeepseekV41Block(nn.Module):
             if layer_idx in config.engram_layer_ids
             else None
         )
+
+    @property
+    def mlp(self) -> MoE:
+        """Expose shared MoE parallelization without duplicate module registration."""
+        return self.ffn
 
     def forward(
         self,
@@ -1060,21 +1063,21 @@ class DeepseekV41Block(nn.Module):
             x = self.engram(x, engram_hash_ids, token_mask=engram_mask)
 
         attn_pre, attn_post, attn_comb = self.attn_hc(x)
-        attn_out = self.self_attn(self.input_layernorm(hc_collapse(x, pre_mix)), state=state, **attn_kwargs)
+        attn_out = self.attn(self.attn_norm(hc_collapse(x, pre_mix)), state=state, **attn_kwargs)
         x = hc_expand(attn_out.hidden_states, x, attn_post, attn_comb)
 
         ffn_pre, ffn_post, ffn_comb = self.ffn_hc(x)
-        self.mlp.gate.set_routing_context(None, vision_token_types)
-        mlp_out = self.mlp(self.post_attention_layernorm(hc_collapse(x, attn_pre)), padding_mask)
+        self.ffn.gate.set_routing_context(None, vision_token_types)
+        mlp_out = self.ffn(self.ffn_norm(hc_collapse(x, attn_pre)), padding_mask)
         x = hc_expand(mlp_out, x, ffn_post, ffn_comb)
         return x, ffn_pre, attn_out.state
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
-        self.input_layernorm.reset_parameters()
-        self.post_attention_layernorm.reset_parameters()
-        self.self_attn.init_weights(buffer_device, init_std=init_std)
-        self.mlp.init_weights(buffer_device, init_std=init_std)
-        self.mlp.gate.init_dsv4_weights()
+        self.attn_norm.reset_parameters()
+        self.ffn_norm.reset_parameters()
+        self.attn.init_weights(buffer_device, init_std=init_std)
+        self.ffn.init_weights(buffer_device, init_std=init_std)
+        self.ffn.gate.init_dsv4_weights()
         self.attn_hc.init_weights(init_std)
         self.ffn_hc.init_weights(init_std)
         if self.engram is not None:
