@@ -123,7 +123,7 @@ class DeepseekV41Model(nn.Module):
             norm_topk_prob=config.norm_topk_prob,
             dtype=model_dtype,
             # Routed and shared experts use clamped SwiGLU in fp32 (reference ``Expert.forward``).
-            swiglu_limit=float(getattr(config, "swiglu_limit", 0.0) or 0.0),
+            swiglu_limit=float(config.swiglu_limit),
         )
         if moe_overrides:
             moe_defaults.update(moe_overrides)
@@ -290,7 +290,7 @@ class DeepseekV41Model(nn.Module):
     @torch.no_grad()
     def init_weights(self, buffer_device: torch.device | None = None) -> None:
         buffer_device = buffer_device or torch.device(f"cuda:{torch.cuda.current_device()}")
-        init_std = float(getattr(self.config, "initializer_range", 0.02))
+        init_std = float(self.config.initializer_range)
         with buffer_device:
             nn.init.normal_(self.embed_tokens.weight)
             self.norm.reset_parameters()

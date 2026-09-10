@@ -158,7 +158,7 @@ class EngramLayout:
     @classmethod
     def from_config(cls, config: DeepseekV41Config) -> EngramLayout | None:
         layer_ids = tuple(int(i) for i in config.engram_layer_ids)
-        if not layer_ids or not getattr(config, "engram_enabled", True):
+        if not layer_ids or not config.engram_enabled:
             return None
         max_ngram_size, n_heads = int(config.engram_max_ngram_size), int(config.engram_n_heads)
         primes: list[tuple[tuple[int, ...], ...]] = []
@@ -207,10 +207,11 @@ class DeepseekV41EngramHasher(nn.Module):
         self.vocab_size = int(config.vocab_size)
         self.compressed_vocab_size = int(config.engram_compressed_vocab_size) or self.vocab_size
         self.raw_pad_token_id = int(config.engram_pad_token_id)
-        flat = [[p for per_ngram in layer for p in per_ngram] for layer in layout.primes]
-        offsets = [np.cumsum([0, *sizes[:-1]]) for sizes in flat]
-        self.register_buffer("primes", torch.tensor(layout.primes, dtype=torch.int64), persistent=False)
-        self.register_buffer("offsets", torch.tensor(np.array(offsets), dtype=torch.int64), persistent=False)
+        primes = torch.tensor(layout.primes, dtype=torch.int64)  # [n_layers, n_ngrams, n_heads]
+        flat_primes = primes.flatten(1)
+        self.register_buffer("primes", primes, persistent=False)
+        # Exclusive prefix sum: each (n-gram size, head) column owns its own bucket range.
+        self.register_buffer("offsets", flat_primes.cumsum(1) - flat_primes, persistent=False)
         self.register_buffer(
             "multipliers",
             compute_hash_multipliers(layout.layer_ids, layout.max_ngram_size, self.compressed_vocab_size),
@@ -306,7 +307,7 @@ class DeepseekV41Engram(nn.Module):
         model_dtype = get_dtype(config.torch_dtype, torch.bfloat16)
         num_embeddings = layout.num_embeddings[self.layer_hash_index]
         self.embed = nn.Embedding(num_embeddings, layout.head_dim, dtype=model_dtype)
-        self.embed.weight.requires_grad_(bool(getattr(config, "engram_trainable", False)))
+        self.embed.weight.requires_grad_(bool(config.engram_trainable))
         self.wkv = nn.Linear(
             layout.n_hash_cols * layout.head_dim, self.dim * (self.hc_mult + 1), bias=False, dtype=model_dtype
         )

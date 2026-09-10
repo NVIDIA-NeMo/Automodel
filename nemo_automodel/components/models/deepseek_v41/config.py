@@ -43,7 +43,6 @@ Architecture summary (see ``DeepSeek_V41_Tech_Report.pdf``):
 
 from __future__ import annotations
 
-import inspect
 from typing import Any
 
 from transformers import PretrainedConfig
@@ -136,16 +135,6 @@ class DeepseekV41Config(PretrainedConfig):
         torch_dtype: str | None = None,
         **kwargs,
     ):
-        # The released config nests the backbone under ``text_config``; hoist its
-        # entries over the explicit arguments and re-enter with one flat call so
-        # nested checkpoints and flat YAML configs share the same code path.
-        text_config = kwargs.pop("text_config", None)
-        if isinstance(text_config, dict):
-            explicit = {name: value for name, value in locals().items() if name in _INIT_PARAMS}
-            merged = {**explicit, **{k: v for k, v in text_config.items() if k != "model_type"}, **kwargs}
-            self.__init__(**merged)
-            return
-
         dtype = kwargs.pop("dtype", None)
         resolved_dtype = dtype if dtype is not None else torch_dtype
         if resolved_dtype is None:
@@ -216,9 +205,6 @@ class DeepseekV41Config(PretrainedConfig):
         self.engram_trainable = engram_trainable
         self.kv_cache_fake_quant = kv_cache_fake_quant
         self.pretraining_tp = pretraining_tp
-        # DeepSeek V4.1 has no hash-routed layers; the shared DSV4 helpers read this.
-        self.num_hash_layers = 0
-
         if len(self.engram_layer_ids) != len(self.engram_num_embeddings):
             raise ValueError(
                 "engram_layer_ids and engram_num_embeddings must have the same length, got "
@@ -234,6 +220,20 @@ class DeepseekV41Config(PretrainedConfig):
             dtype=resolved_dtype,
             **kwargs,
         )
+
+    @classmethod
+    def from_dict(cls, config_dict: dict[str, Any], **kwargs) -> "DeepseekV41Config":
+        """Build the config from a checkpoint-style dict, hoisting the nested ``text_config``.
+
+        The released ``config.json`` nests the backbone fields under ``text_config``;
+        they are flattened onto the top level here so ``from_pretrained`` and the
+        flat constructor share one field protocol.
+        """
+        text_config = config_dict.get("text_config")
+        if isinstance(text_config, dict):
+            config_dict = {**config_dict, **{k: v for k, v in text_config.items() if k != "model_type"}}
+            config_dict.pop("text_config")
+        return super().from_dict(config_dict, **kwargs)
 
     # ------------------------------------------------------------------
     # Derived per-layer helpers
@@ -295,8 +295,3 @@ class DeepseekV41Config(PretrainedConfig):
                 raise ValueError(f"Reuse layer {layer_idx} has no index source computed against its KV source")
         if self.candidate_source_layer_id >= 0 and not self.is_index_source(self.candidate_source_layer_id):
             raise ValueError("candidate_source_layer_id must be an index source layer")
-
-
-_INIT_PARAMS = frozenset(
-    name for name in inspect.signature(DeepseekV41Config.__init__).parameters if name not in ("self", "kwargs")
-)

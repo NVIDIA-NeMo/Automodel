@@ -280,6 +280,8 @@ def _build_pair(engram: bool, attn_backend: str, seed: int = 0):
         dispatcher="torch",
         experts="torch_mm",
         enable_hf_state_dict_adapter=True,
+        # The reference scores the router in fp32 (``linear(x.float(), weight.float())``).
+        gate_precision=torch.float32,
     )
     model = DeepseekV41ForCausalLM(config, backend=backend)
     cast_model_to_dtype(model, torch.bfloat16)
@@ -322,6 +324,18 @@ def test_logits_match_reference(engram: bool, attn_backend: str):
     ref_model, model = _build_pair(engram, attn_backend)
     torch.manual_seed(1234)
     tokens = torch.randint(0, VOCAB, (2, 37), device="cuda")
+
+    # Per-layer diagnostics: capture the HC streams leaving every block on both sides.
+    ref_streams: list[torch.Tensor] = []
+    our_streams: list[torch.Tensor] = []
+    hooks = [
+        layer.register_forward_hook(lambda _m, _i, out: ref_streams.append(out[0].detach().float()))
+        for layer in ref_model.layers
+    ]
+    hooks += [
+        layer.register_forward_hook(lambda _m, _i, out: our_streams.append(out[0].detach().float()))
+        for layer in model.model.layers.values()
+    ]
     prev_device = torch.get_default_device()
     torch.set_default_device("cuda")
     try:
@@ -331,5 +345,11 @@ def test_logits_match_reference(engram: bool, attn_backend: str):
         torch.set_default_device(prev_device)
     with torch.no_grad():
         logits = model(tokens).logits
+    for hook in hooks:
+        hook.remove()
+    for idx, (ref_h, our_h) in enumerate(zip(ref_streams, our_streams)):
+        cos = torch.nn.functional.cosine_similarity(ref_h.flatten(2), our_h.flatten(2), dim=-1)
+        rel = ((ref_h - our_h).norm() / ref_h.norm()).item()
+        print(f"  layer {idx} ({model.config.csa2_mode(idx)}): min_cos={cos.min().item():.5f} rel_err={rel:.5f}")
     assert logits.shape == ref_logits.shape == (2, 37, VOCAB)
     _compare(ref_logits, logits, f"engram={engram} attn={attn_backend}")

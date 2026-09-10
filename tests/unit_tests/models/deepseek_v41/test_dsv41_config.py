@@ -62,7 +62,7 @@ _RELEASED_STYLE_CONFIG = {
 
 class TestConfigFlattening:
     def test_text_config_is_hoisted(self):
-        config = DeepseekV41Config(**_RELEASED_STYLE_CONFIG)
+        config = DeepseekV41Config.from_dict(_RELEASED_STYLE_CONFIG)
         assert config.model_type == "deepseek_v41"
         assert config.hidden_size == 5120
         assert config.num_hidden_layers == 40
@@ -72,11 +72,10 @@ class TestConfigFlattening:
         assert config.vision_config["num_hidden_layers"] == 32
         assert config.image_token_id == 129264
         assert config.pad_token_id == 2
-        assert config.num_hash_layers == 0
         assert not hasattr(config, "quantization_config") or config.quantization_config is None
 
     def test_dtype_resolution(self):
-        assert DeepseekV41Config(**_RELEASED_STYLE_CONFIG).torch_dtype == torch.bfloat16
+        assert DeepseekV41Config.from_dict(_RELEASED_STYLE_CONFIG).torch_dtype == torch.bfloat16
         assert DeepseekV41Config(torch_dtype="float32").torch_dtype == torch.float32
         assert DeepseekV41Config().torch_dtype == torch.bfloat16
 
@@ -100,7 +99,7 @@ class TestConfigFlattening:
 
 class TestLayerLayout:
     def test_released_layout_modes(self):
-        config = DeepseekV41Config(**_RELEASED_STYLE_CONFIG)
+        config = DeepseekV41Config.from_dict(_RELEASED_STYLE_CONFIG)
         config.validate_layer_layout()
         modes = [config.csa2_mode(i) for i in range(40)]
         assert modes[:2] == ["swa", "swa"]

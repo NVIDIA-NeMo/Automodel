@@ -200,13 +200,14 @@ class TestIndexer:
         x = torch.randn(batch, seq_len, config.hidden_size)
         qr = torch.randn(batch, seq_len, config.q_lora_rank)
         _, (cos, sin) = _rope_tables(config, torch.arange(seq_len).unsqueeze(0))
-        index_k = torch.randn(batch, pool, config.index_head_dim)
         allowed = torch.ones(batch, seq_len, pool, dtype=torch.bool)
         allowed[:, :, 6:] = False
         state = DeepseekV41SharedState(compress_ratio=1)
+        state.index_k = torch.randn(batch, pool, config.index_head_dim)
+        state.allowed = allowed
         state.candidates = torch.zeros(batch, seq_len, pool, dtype=torch.bool)
         state.candidates[:, :, [0, 3]] = True
-        topk = indexer(x, qr, cos, sin, index_k, allowed, state)
+        topk = indexer(x, qr, cos, sin, state)
         assert topk.shape == (batch, seq_len, 3)
         valid = topk[topk >= 0]
         assert set(valid.tolist()) <= {0, 3}
@@ -225,9 +226,10 @@ class TestIndexer:
         x = torch.randn(1, seq_len, config.hidden_size)
         qr = torch.randn(1, seq_len, config.q_lora_rank)
         _, (cos, sin) = _rope_tables(config, torch.arange(seq_len).unsqueeze(0))
-        allowed = torch.ones(1, seq_len, pool, dtype=torch.bool)
         state = DeepseekV41SharedState(compress_ratio=1)
-        topk = indexer(x, qr, cos, sin, keys, allowed, state)
+        state.index_k = keys
+        state.allowed = torch.ones(1, seq_len, pool, dtype=torch.bool)
+        topk = indexer(x, qr, cos, sin, state)
         assert state.candidates is not None and state.candidates.shape == (1, seq_len, pool)
         # candidate_topk_blocks=2 blocks of 4 positions cover the whole pool here
         assert state.candidates.all()
@@ -237,16 +239,13 @@ class TestIndexer:
         config = tiny_config()
         indexer = DeepseekV41Indexer(config, layer_idx=5, backend=tiny_backend()).float()
         _, (cos, sin) = _rope_tables(config, torch.arange(2).unsqueeze(0))
+        state = DeepseekV41SharedState(compress_ratio=1)
+        with pytest.raises(RuntimeError, match="no published index keys"):
+            indexer(torch.randn(1, 2, config.hidden_size), torch.randn(1, 2, config.q_lora_rank), cos, sin, state)
+        state.index_k = torch.randn(1, 4, config.index_head_dim)
+        state.allowed = torch.ones(1, 2, 4, dtype=torch.bool)
         with pytest.raises(RuntimeError, match="candidate pool"):
-            indexer(
-                torch.randn(1, 2, config.hidden_size),
-                torch.randn(1, 2, config.q_lora_rank),
-                cos,
-                sin,
-                torch.randn(1, 4, config.index_head_dim),
-                torch.ones(1, 2, 4, dtype=torch.bool),
-                DeepseekV41SharedState(compress_ratio=1),
-            )
+            indexer(torch.randn(1, 2, config.hidden_size), torch.randn(1, 2, config.q_lora_rank), cos, sin, state)
 
 
 class TestAttentionStateSharing:
@@ -283,11 +282,22 @@ class TestAttentionStateSharing:
         assert state.compress_kv.shape == (1, seq_len // 2, config.head_dim)
         assert state.index_k.shape == (1, seq_len // 2, config.index_head_dim)
         assert state.topk_idxs.shape[:2] == (1, seq_len)
+        assert state.allowed.shape == (1, seq_len, seq_len // 2)
+        assert state.window_topk_idxs.shape == (1, seq_len, min(seq_len, config.sliding_window))
         # Query 0 has no complete group yet, so every compressed slot is empty.
         assert (state.topk_idxs[0, 0] == -1).all()
         out_reuse = reuse(x, state=state, **kwargs)
         assert out_reuse.shape == (1, seq_len, config.hidden_size)
         assert torch.isfinite(out_reuse).all()
+
+    def test_short_sequence_has_empty_pool(self):
+        config = tiny_config()
+        full = DeepseekV41Attention(config, layer_idx=2, backend=tiny_backend()).float()
+        kwargs = self._attention_inputs(config, 1)
+        state = DeepseekV41SharedState()
+        out = full(torch.randn(1, 1, config.hidden_size), state=state, **kwargs)
+        assert out.shape == (1, 1, config.hidden_size)
+        assert state.compress_kv.shape[1] == 0 and state.topk_idxs.shape[-1] == 0
 
     def test_reuse_without_source_raises(self):
         config = tiny_config()

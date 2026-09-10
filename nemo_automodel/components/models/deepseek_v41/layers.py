@@ -135,9 +135,11 @@ def _round_to_e2m1(x: torch.Tensor) -> torch.Tensor:
     grid = x.new_tensor(_FP4_E2M1_GRID)
     midpoints = (grid[:-1] + grid[1:]) / 2
     magnitude = x.abs()
-    idx_down = torch.bucketize(magnitude, midpoints, right=False)  # ties -> lower grid point
-    idx_up = torch.bucketize(magnitude, midpoints, right=True)  # ties -> upper grid point
-    idx = torch.where(idx_down % 2 == 0, idx_down, idx_up)
+    idx = torch.bucketize(magnitude, midpoints, right=False)  # ties -> lower grid point
+    tie_to_upper = (
+        (idx % 2 == 1) & (idx < midpoints.numel()) & (magnitude == midpoints[idx.clamp(max=midpoints.numel() - 1)])
+    )
+    idx = idx + tie_to_upper.to(idx.dtype)
     return grid[idx] * torch.sign(x)
 
 
@@ -315,9 +317,11 @@ class DeepseekV41SharedState:
     index_k: torch.Tensor | None = None  # [B, P, index_head_dim]
     pool_seq_ids: torch.Tensor | None = None  # [B, P] document id per pooled group (0 = invalid)
     pool_positions: torch.Tensor | None = None  # [B, P] document-relative group index
+    allowed: torch.Tensor | None = None  # [B, S, P] bool visibility of pooled positions
     topk_idxs: torch.Tensor | None = None  # [B, S, K] pooled positions, -1 = none
     candidates: torch.Tensor | None = None  # [B, S, P] bool
     compress_ratio: int = 0
+    window_topk_idxs: torch.Tensor | None = None  # [B, S, W] sliding-window key positions, shared by all layers
 
 
 # ---------------------------------------------------------------------------
@@ -397,7 +401,7 @@ class DeepseekV41Indexer(nn.Module):
         self.rope_head_dim = int(config.qk_rope_head_dim)
         self.index_topk = int(config.index_topk)
         self.softmax_scale = self.head_dim**-0.5
-        self.fake_quant = bool(getattr(config, "kv_cache_fake_quant", True))
+        self.fake_quant = bool(config.kv_cache_fake_quant)
         model_dtype = get_dtype(config.torch_dtype, torch.bfloat16)
         self.wq_b = nn.Linear(config.q_lora_rank, self.n_heads * self.head_dim, bias=False, dtype=model_dtype)
         self.weights_proj = nn.Linear(config.hidden_size, self.n_heads, bias=False, dtype=model_dtype)
@@ -426,8 +430,6 @@ class DeepseekV41Indexer(nn.Module):
         q_residual: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
-        index_k: torch.Tensor,
-        allowed: torch.Tensor,
         state: DeepseekV41SharedState,
     ) -> torch.Tensor:
         """Return ``[B, S, K]`` pooled positions per query (``-1`` for empty slots).
@@ -436,10 +438,12 @@ class DeepseekV41Indexer(nn.Module):
             hidden_states: ``[B, S, hidden]`` attention input (feeds ``weights_proj``).
             q_residual: ``[B, S, q_lora_rank]`` normalized query latent.
             cos, sin: query RoPE tables ``[B, S, qk_rope_head_dim]``.
-            index_k: ``[B, P, index_head_dim]`` shared index keys.
-            allowed: ``[B, S, P]`` bool visibility of pooled positions.
-            state: Shared state carrying the candidate pool between layers.
+            state: Shared state providing ``index_k`` (``[B, P, index_head_dim]``),
+                ``allowed`` (``[B, S, P]`` bool visibility) and the candidate pool.
         """
+        if state.index_k is None or state.allowed is None:
+            raise RuntimeError(f"Indexer of layer {self.layer_idx} found no published index keys")
+        index_k, allowed = state.index_k, state.allowed
         batch, seq_len, _ = hidden_states.shape
         q = self.wq_b(q_residual).view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         q = _apply_partial_rope(q, cos, sin, self.rope_head_dim).transpose(1, 2)  # [B, S, H, D]
@@ -508,7 +512,7 @@ class DeepseekV41Attention(nn.Module):
         self.rope_head_dim = int(config.qk_rope_head_dim)
         self.sliding_window = int(config.sliding_window)
         self.scaling = self.head_dim**-0.5
-        self.fake_quant = bool(getattr(config, "kv_cache_fake_quant", True))
+        self.fake_quant = bool(config.kv_cache_fake_quant)
         model_dtype = get_dtype(config.torch_dtype, torch.bfloat16)
 
         self.wq_a = nn.Linear(config.hidden_size, config.q_lora_rank, bias=False, dtype=model_dtype)
@@ -552,9 +556,9 @@ class DeepseekV41Attention(nn.Module):
             ready_len=n_pooled * ratio,
             ratio=ratio,
         )
-        if pool_seq_ids is None:
-            pool_seq_ids = seq_ids.new_ones((seq_ids.shape[0], n_pooled))
-            pool_positions = torch.arange(n_pooled, device=seq_ids.device).unsqueeze(0).expand(seq_ids.shape[0], -1)
+        if pool_seq_ids is None:  # no complete group yet (sequence shorter than the ratio)
+            pool_seq_ids = seq_ids.new_zeros((seq_ids.shape[0], 0))
+            pool_positions = seq_ids.new_zeros((seq_ids.shape[0], 0))
         # A latent stands for the first token of its group, so group j takes position j * ratio.
         cos_p, sin_p = rotary_compress(latent, (pool_positions * ratio).to(latent.device))
         if self.indexer is not None and self.indexer.owns_k:
@@ -567,6 +571,7 @@ class DeepseekV41Attention(nn.Module):
         state.pool_seq_ids = pool_seq_ids
         state.pool_positions = pool_positions
         state.compress_ratio = ratio
+        state.allowed = build_compressed_visibility(position_ids, seq_ids, pool_seq_ids, pool_positions, ratio)
         state.topk_idxs = None
         state.candidates = None
 
@@ -607,7 +612,9 @@ class DeepseekV41Attention(nn.Module):
             kv = fake_quant_fp8(kv, 32)
 
         keys = kv
-        topk_idxs = build_window_topk_indices(seq_ids, self.sliding_window)
+        if state.window_topk_idxs is None:
+            state.window_topk_idxs = build_window_topk_indices(seq_ids, self.sliding_window)
+        topk_idxs = state.window_topk_idxs
         if self.compress_ratio:
             if self.is_kv_source:
                 self._publish_compressed_kv(hidden_states, rotary_compress, position_ids, seq_ids, state)
@@ -616,19 +623,14 @@ class DeepseekV41Attention(nn.Module):
                     f"layer {self.layer_idx} (ratio {self.compress_ratio}) found no matching compressed KV; "
                     "check kv_source_layer_ids / compress_ratios"
                 )
-            allowed = build_compressed_visibility(
-                position_ids, seq_ids, state.pool_seq_ids, state.pool_positions, self.compress_ratio
-            )
             if self.is_index_source:
-                if state.index_k is None:
-                    raise RuntimeError(f"layer {self.layer_idx} runs an indexer but no index keys were published")
-                state.topk_idxs = self.indexer(hidden_states, q_residual, cos, sin, state.index_k, allowed, state)
+                state.topk_idxs = self.indexer(hidden_states, q_residual, cos, sin, state)
             elif state.topk_idxs is None:
                 raise RuntimeError(f"Reuse layer {self.layer_idx} found no Top-K indices from an index source")
             compressed_idxs = torch.where(
                 state.topk_idxs >= 0, state.topk_idxs + seq_len, torch.full_like(state.topk_idxs, -1)
             )
-            keys = torch.cat([kv, state.compress_kv.to(kv.dtype)], dim=1)
+            keys = torch.cat([kv, state.compress_kv], dim=1)
             topk_idxs = torch.cat([topk_idxs, compressed_idxs], dim=-1)
 
         attn_output = dsv4_sparse_attention(

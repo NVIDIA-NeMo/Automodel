@@ -62,7 +62,6 @@ from torch.distributed.tensor import DTensor
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.deepseek_v3.state_dict_adapter import dequantize_from_fp8
 from nemo_automodel.components.models.deepseek_v4.state_dict_adapter import (
-    FP4_COL_BLOCK,
     DeepSeekV4StateDictAdapter,
     _ExpertQuantLayout,
 )
@@ -161,7 +160,7 @@ def infer_fp8_block_size(weight_shape: tuple[int, ...], scale_shape: tuple[int, 
     """Return the square block size that maps ``weight_shape`` onto ``scale_shape``."""
     rows, cols = weight_shape[-2], weight_shape[-1]
     block_rows, block_cols = scale_shape[-2], scale_shape[-1]
-    for block_size in (FP8_BLOCK_SIZE, 128, 64, 16):
+    for block_size in (FP8_BLOCK_SIZE, 128):
         if math.ceil(rows / block_size) == block_rows and math.ceil(cols / block_size) == block_cols:
             return block_size
     raise ValueError(f"Cannot infer an FP8 block size for weight {tuple(weight_shape)} and scale {tuple(scale_shape)}")
@@ -171,23 +170,21 @@ def dequantize_fp8_blocks(
     weight: torch.Tensor, scale: torch.Tensor, dtype: torch.dtype, name: str = ""
 ) -> torch.Tensor:
     """Dequantize a 2D FP8 weight with square block scales of any block size."""
+    block_size = infer_fp8_block_size(tuple(weight.shape), tuple(scale.shape))
     scale_f32 = _scale_to_float(scale.to_local() if is_dtensor(scale) else scale)
-    weight_local = weight.to_local() if is_dtensor(weight) else weight
     if is_dtensor(weight) or is_dtensor(scale):
         # Let the shared V3 helper handle DTensor slicing of the scale grid.
-        block_size = infer_fp8_block_size(tuple(weight.shape), tuple(scale.shape))
         return dequantize_from_fp8(weight, scale_f32, dtype=dtype, BLOCK_SIZE=block_size, name=name)
-    block_size = infer_fp8_block_size(tuple(weight_local.shape), tuple(scale_f32.shape))
-    rows, cols = weight_local.shape
+    rows, cols = weight.shape
     pad_rows, pad_cols = (-rows) % block_size, (-cols) % block_size
-    w = weight_local.float()
+    w = weight.float()
     if pad_rows or pad_cols:
         w = torch.nn.functional.pad(w, (0, pad_cols, 0, pad_rows))
     block_rows, block_cols = w.shape[0] // block_size, w.shape[1] // block_size
-    w = w.view(block_rows, block_size, block_cols, block_size) * scale_f32.to(w.device).view(
-        block_rows, 1, block_cols, 1
+    w.view(block_rows, block_size, block_cols, block_size).mul_(
+        scale_f32.to(w.device).view(block_rows, 1, block_cols, 1)
     )
-    return w.view(block_rows * block_size, block_cols * block_size)[:rows, :cols].to(dtype)
+    return w[:rows, :cols].to(dtype)
 
 
 def dequantize_engram_table(weight: torch.Tensor, scale: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
@@ -201,8 +198,15 @@ def dequantize_engram_table(weight: torch.Tensor, scale: torch.Tensor, dtype: to
             f"(expected per-row / {ENGRAM_SCALE_BLOCK}-column scales)"
         )
     scale_f32 = _scale_to_float(scale_local).to(weight_local.device)
-    values = weight_local.float().view(rows, dim // ENGRAM_SCALE_BLOCK, ENGRAM_SCALE_BLOCK) * scale_f32.unsqueeze(-1)
-    out = values.view(rows, dim).to(dtype)
+    # Tables have hundreds of millions of rows: dequantize in row chunks so the fp32
+    # temporaries stay bounded instead of materializing the whole table twice.
+    out = torch.empty(rows, dim, dtype=dtype, device=weight_local.device)
+    chunk = max(1, (1 << 28) // dim)
+    for start in range(0, rows, chunk):
+        end = min(start + chunk, rows)
+        values = weight_local[start:end].float().view(-1, dim // ENGRAM_SCALE_BLOCK, ENGRAM_SCALE_BLOCK)
+        values.mul_(scale_f32[start:end].unsqueeze(-1))
+        out[start:end] = values.view(-1, dim).to(dtype)
     if is_dtensor(weight):
         return DTensor.from_local(out, weight.device_mesh, weight.placements)
     return out
@@ -219,9 +223,7 @@ class DeepSeekV41StateDictAdapter(DeepSeekV4StateDictAdapter):
         dtype: torch.dtype = torch.float32,
     ):
         super().__init__(config, moe_config, backend, dtype=dtype)
-        self.engram_enabled = bool(getattr(config, "engram_enabled", True)) and bool(
-            getattr(config, "engram_layer_ids", [])
-        )
+        self.engram_enabled = bool(config.engram_enabled) and bool(config.engram_layer_ids)
 
     # ------------------------------------------------------------------
     # from_hf
@@ -262,19 +264,16 @@ class DeepSeekV41StateDictAdapter(DeepSeekV4StateDictAdapter):
                 continue
             weight = state_dict[key]
             scale = state_dict.pop(scale_key)
-            if self._is_expert_weight_key(key):
-                if self._expert_quant_layout_from_tensors(weight, scale) is _ExpertQuantLayout.FP4:
-                    state_dict[key] = self._dequantize_expert_fp4(weight, scale, self.dtype)
-                else:
-                    state_dict[key] = dequantize_fp8_blocks(weight, scale, self.dtype, name=key)
+            if (
+                self._is_expert_weight_key(key)
+                and self._expert_quant_layout_from_tensors(weight, scale) is _ExpertQuantLayout.FP4
+            ):
+                state_dict[key] = self._dequantize_expert_fp4(weight, scale, self.dtype)
             elif _ENGRAM_EMBED_PATTERN.match(key):
                 state_dict[key] = dequantize_engram_table(weight, scale, self.dtype)
             else:
                 state_dict[key] = dequantize_fp8_blocks(weight, scale, self.dtype, name=key)
         return state_dict
-
-    def _rename_all(self, state_dict: dict[str, Any]) -> dict[str, Any]:
-        return {_rename_hf_key(k): v for k, v in state_dict.items()}
 
     # ------------------------------------------------------------------
     # to_hf
@@ -286,11 +285,6 @@ class DeepSeekV41StateDictAdapter(DeepSeekV4StateDictAdapter):
     @staticmethod
     def _is_fp8_on_disk(hf_key: str) -> bool:
         return any(pattern.match(hf_key) for pattern in _FP8_ON_DISK_PATTERNS)
-
-    def _is_non_quantized(self, hf_key: str) -> bool:
-        return not (
-            self._is_fp8_on_disk(hf_key) or _ENGRAM_EMBED_PATTERN.match(hf_key) or self._is_expert_weight_key(hf_key)
-        )
 
     @staticmethod
     def _fp8_block_scale_placeholder(value: Any) -> torch.Tensor:
@@ -359,7 +353,3 @@ class DeepSeekV41StateDictAdapter(DeepSeekV4StateDictAdapter):
             local = cls._empty_or_cast_fp8(value.to_local())
             return DTensor.from_local(local, value.device_mesh, value.placements)
         return cls._empty_or_cast_fp8(value)
-
-    def _expert_scale_shape(self, weight: torch.Tensor) -> tuple[int, int]:
-        rows, cols = weight.shape
-        return (rows, (cols + FP4_COL_BLOCK - 1) // FP4_COL_BLOCK)
