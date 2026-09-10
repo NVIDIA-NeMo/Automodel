@@ -184,15 +184,32 @@ class _MSABackwardSm100Kernel:
         self.threads_per_warp = 32
         self.threads_per_cta = 512
 
-        # register budget: 4*32*(R_compute + R_reduce) + 32*(3*48 + 5*24) <= 512*128
+        # Register budget.  The whole-SM sum is only a necessary condition; the binding one is
+        # per SMSP, because warp i runs on SMSP i%4 and each SMSP owns a quarter of the file:
+        #   sum of regs/thread over the four warps on one SMSP <= 512.
+        # Today that is 24 + R_compute + R_reduce + 48 = 424 on SMSP 0..2 and 400 on SMSP 3.
+        # This is what rules out a second compute warpgroup on the idle warps 0-3: that shape needs
+        # 2*R_compute + R_reduce + 48 <= 512, i.e. R_compute <= 168.  All three terms are measured
+        # floors, not estimates -- compute spills at 176/168/160 (STACK 48/40/24) and does so
+        # identically with the chunk loop halved, so 184 is not the unroll's live set; reduce spills
+        # at 120; and mma/load/scalar spill at 32 and 24.  2*184 + 128 + 48 = 544 > 512 with no
+        # movable term.  See dev_md/v9/ing/msa-bwd-sm100-v9r3-dual-compute-warpgroup-design.
         self.num_regs_compute = 184
-        self.num_regs_reduce = 168  # 184 deadlocks in setmaxnreg.inc on B200 though the budget fits
+        # reduce drains TMEM in `reduce_pass_cols`-wide passes and packs each pass before loading
+        # the next, so its live set is one pass of accumulators plus the packed dQ words instead of
+        # a whole 128-column tile; 128 is the smallest budget that still compiles spill-free (120
+        # spills 32 bytes).  Raising it back to 184 deadlocks in setmaxnreg.inc on B200.
+        self.num_regs_reduce = 128
         self.num_regs_mma = 48
         self.num_regs_load = 48
         self.num_regs_scalar = 48
         self.num_regs_empty = 24
         # compute processes S^T/dP^T in 32-column chunks to bound registers
         self.compute_chunk_cols = 32
+        # reduce drains dQ^T / dV / dK in column passes for the same reason.  Ld32x32bOp already
+        # issued one LDTM per 32 columns, so the pass loop costs no extra instruction; it only
+        # shortens the lifetime of the accumulator registers.
+        self.reduce_pass_cols = 32
         self.num_compute_chunks = TILE_N // self.compute_chunk_cols
         # mma hand-off stages of the 4-chunk loop: chunk sizes (2, 1, 1)
         self.chunk_stage_starts = (0, 2, 3)
@@ -480,7 +497,13 @@ class _MSABackwardSm100Kernel:
     # ---- helpers shared by device functions ----
     @cute.jit
     def _task_fields(self, mTaskMeta: cute.Tensor, row: Int32):
-        b = mTaskMeta[row, 0]
+        # Column 0 is the batch coordinate and is structurally zero: the launcher builds mQ/mdO as
+        # q.unsqueeze(0).transpose(1, 2) from the contract's [T, 64, 128], so the batch mode has
+        # extent 1, and msa_task_build_sm100 writes the column as a literal Int32(0).  Folding it in
+        # here drops one warp-uniform LDG per task in each of the four warps that decode a task, and
+        # two more per _same_bucket call -- the metadata loads whose ISETP carries the long-scoreboard
+        # samples that NCU's uncoalesced-access rule points at.  The task table itself is unchanged.
+        b = Int32(0)
         index_head = mTaskMeta[row, 1]
         kb = mTaskMeta[row, 2]
         valid = mTaskMeta[row, 3]
@@ -488,8 +511,9 @@ class _MSABackwardSm100Kernel:
 
     @cute.jit
     def _same_bucket(self, mTaskMeta: cute.Tensor, row_a: Int32, row_b: Int32) -> cutlass.Boolean:
+        # column 0 is the constant batch coordinate (see _task_fields): only 1 and 2 can differ
         same = cutlass.Boolean(True)
-        for c in cutlass.range_constexpr(3):
+        for c in cutlass.range_constexpr(1, 3):
             same = same & (mTaskMeta[row_a, c] == mTaskMeta[row_b, c])
         return same
 
@@ -817,7 +841,12 @@ class _MSABackwardSm100Kernel:
                 self.tmem_dealloc_barrier.arrive()
 
         elif warp_idx in self.reduce_warp_id:
-            cute.arch.setmaxregister_increase(self.num_regs_reduce)
+            # setmaxnreg.inc may only raise and .dec may only lower, so the direction follows the
+            # 128-register default allocation; reduce sits below it once its T2R runs pass-wise.
+            if cutlass.const_expr(self.num_regs_reduce >= 128):
+                cute.arch.setmaxregister_increase(self.num_regs_reduce)
+            else:
+                cute.arch.setmaxregister_decrease(self.num_regs_reduce)
             tmem.wait_for_alloc()
             tmem_ptr_base = tmem.retrieve_ptr(self.acc_dtype)
             tStS, tdPtdP, tdQtdQ, tdVtdV, tdKtdK = self.get_tmem_tensors(
@@ -1320,9 +1349,8 @@ class _MSABackwardSm100Kernel:
             gather_row_pipeline.consumer_wait(row_state)
             ridx = row_state.index
 
-            # S^T(t) lands first; the dP wait is deferred to chunk 0 to overlap G2.
-            mma_compute_S_pipeline.consumer_wait(s_state)
-            # all chunk stages are free once the previous tile's G3/G4/G5 have drained
+            # all chunk stages are free once the previous tile's G3/G4/G5 have drained; that
+            # happens before S^T(t) lands, so take them (and chunk 0's scalars) off the S wait.
             for st in cutlass.range_constexpr(len(self.chunk_stage_starts)):
                 compute_mma_chunk_pipeline.producer_acquire(chunk_acq_state)
                 chunk_acq_state.advance()
@@ -1330,22 +1358,43 @@ class _MSABackwardSm100Kernel:
             # causal predicate row: the thread's datapath row is its key row
             key_pos_thr = key_base + tTR_cS[0][0]
 
-            for c in cutlass.range_constexpr(NCHUNK):
-                rLse = cute.make_rmem_tensor(tTR_cS.shape, self.acc_dtype)
-                rDelta = cute.make_rmem_tensor(tTR_cS.shape, self.acc_dtype)
-                rQpos = cute.make_rmem_tensor(tTR_cS.shape, cutlass.Int32)
+            def load_lse(c):
+                r = cute.make_rmem_tensor(tTR_cS.shape, self.acc_dtype)
                 for i in cutlass.range_constexpr(cute.size(tTR_cS)):
-                    n_col = Int32(c * CHUNK) + tTR_cS[i][1]
-                    rLse[i] = sLSE[n_col, ridx]
-                    rDelta[i] = sDelta[n_col, ridx]
-                    rQpos[i] = sQPos[n_col // mpp, ridx]
+                    r[i] = sLSE[Int32(c * CHUNK) + tTR_cS[i][1], ridx]
+                return r
 
-                # ---- S / dP chunk -> registers (chunk 0 defers its dP load) ----
+            def load_delta(c):
+                r = cute.make_rmem_tensor(tTR_cS.shape, self.acc_dtype)
+                for i in cutlass.range_constexpr(cute.size(tTR_cS)):
+                    r[i] = sDelta[Int32(c * CHUNK) + tTR_cS[i][1], ridx]
+                return r
+
+            def load_qpos(c):
+                r = cute.make_rmem_tensor(tTR_cS.shape, cutlass.Int32)
+                for i in cutlass.range_constexpr(cute.size(tTR_cS)):
+                    r[i] = sQPos[(Int32(c * CHUNK) + tTR_cS[i][1]) // mpp, ridx]
+                return r
+
+            # sQPos carries one entry per query slot, so a chunk's 32 lanes read at most two
+            # distinct words and every chunk's causal predicate is already decided here.  Hoisting
+            # all NCHUNK loads above the S wait lets ptxas collapse them to one register per slot
+            # and takes the compare off each chunk's critical path -- the PC-sampled profile put
+            # 307 short-scoreboard samples on that single ISETP.
+            rQpos = [load_qpos(c) for c in range(NCHUNK)]
+            rLse = [None] * NCHUNK
+            rDelta = [None] * NCHUNK
+            rLse[0] = load_lse(0)
+            rDelta[0] = load_delta(0)
+
+            # S^T(t) lands first; the dP wait is deferred to chunk 0 to overlap G2.
+            mma_compute_S_pipeline.consumer_wait(s_state)
+
+            for c in cutlass.range_constexpr(NCHUNK):
+                # ---- S chunk -> registers ----
                 tTR_rS = cute.make_rmem_tensor(tTR_cS.shape, self.acc_dtype)
                 tTR_rdP = cute.make_rmem_tensor(tTR_cS.shape, self.acc_dtype)
                 cute.copy(tiled_t2r, tTR_tS[c], tTR_rS)
-                if cutlass.const_expr(c > 0):
-                    cute.copy(tiled_t2r, tTR_tdP[c], tTR_rdP)
 
                 if cutlass.const_expr(c > 0 and c in self.chunk_stage_starts):
                     # publish the previous stage; its store latency hides behind this T2R
@@ -1355,10 +1404,30 @@ class _MSABackwardSm100Kernel:
                     chunk_state.advance()
 
                 # ---- S chunk -> P chunk (branchless, vectorized) ----
-                # invalid slots carry lse = -inf (exp2 -> +0); causal masks qpos = -1
-                v = tTR_rS.load() * scale_log2e + rLse.load()
-                cond = rQpos.load() >= key_pos_thr
-                tTR_rS.store(cute.where(cond, cute.math.exp2(v, fastmath=True), Float32(0.0)))
+                # invalid slots carry lse = -inf (exp2 -> +0); the causal mask uses the same identity:
+                # a -inf bias on the exponent (one select per query slot, CSE'd) instead of a per-element
+                # select on the result, so the mask costs an FADD2 on the FMA pipe, not a SEL on the ALU.
+                v = tTR_rS.load() * scale_log2e + rLse[c].load()
+                # Chunk c+1's lse is issued the instant chunk c's dies, so its SMEM latency hides
+                # behind this chunk's exp2 chain instead of stalling the FFMA2 at the head of the
+                # next one (515 short-scoreboard samples).  Peak liveness is unchanged: the
+                # register pair rotates, it does not accumulate.
+                if cutlass.const_expr(c + 1 < NCHUNK):
+                    rLse[c + 1] = load_lse(c + 1)
+                cond = rQpos[c].load() >= key_pos_thr
+                bias = cute.where(cond, cute.full_like(v, 0.0), cute.full_like(v, float("-inf")))
+                tTR_rS.store(cute.math.exp2(v + bias, fastmath=True))
+                # dP^T lands here rather than at the chunk head, so the T2R sits between MUFU.EX2
+                # and its first consumer instead of ahead of the whole chain.  783 of compute's
+                # PC samples sit in `wait` on MUFU.EX2 while `math_pipe_throttle` is ~0 -- the XU is
+                # idle and the warp is serialised on latency, so what it needs is one more
+                # independent instruction in that gap.  The quantize and R2T below are ample cover
+                # for the read itself (LDTM carried only 82 short-scoreboard samples).
+                # Do not justify this by MUFU run-length: a later card raised that statistic and got
+                # slower (round-2 ledger 6.3).  It is kept because the A/B measured it.
+                if cutlass.const_expr(c == 0):
+                    mma_compute_dP_pipeline.consumer_wait(dp_state)
+                cute.copy(tiled_t2r, tTR_tdP[c], tTR_rdP)
                 # P^T chunk -> TMEM (A operand of G3)
                 rP_f16 = self.quantize(tTR_rS, 4)
                 rP_words = cute.make_rmem_tensor(tRT_cP.shape, self.acc_dtype)
@@ -1368,12 +1437,14 @@ class _MSABackwardSm100Kernel:
                 cute.copy(tiled_r2t, rP_words, tRT_tP[c])
 
                 # ---- dP chunk -> dS chunk ----
-                if cutlass.const_expr(c == 0):
-                    mma_compute_dP_pipeline.consumer_wait(dp_state)
-                    cute.copy(tiled_t2r, tTR_tdP[c], tTR_rdP)
-                ds = tTR_rS.load() * (tTR_rdP.load() - rDelta.load())
+                ds = tTR_rS.load() * (tTR_rdP.load() - rDelta[c].load())
+                if cutlass.const_expr(c + 1 < NCHUNK):
+                    rDelta[c + 1] = load_delta(c + 1)
                 tTR_rdP.store(ds)
-                # softmax scale folded into dS: dQ/dK writeouts need no scale
+                # The softmax scale rides on dS, not on P.  Folding it into the exp2 bias instead
+                # would drop this FMUL, but it also moves what dV's operand rounds to: BF16(s*P)
+                # scaled back at the flush is a different grid from BF16(P), and it cost dV
+                # +0.2..0.4% l2_relative on all four cases.  See the v9 precision guardrails doc.
                 rdS_f16 = self.quantize(tTR_rdP, 4, softmax_scale)
                 # dS^T chunk -> TMEM (A operand of G4)
                 rdS_words = cute.make_rmem_tensor(tRT_cP.shape, self.acc_dtype)
@@ -1430,20 +1501,35 @@ class _MSABackwardSm100Kernel:
         dkv_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.mma_reduce_dKV_stage)
         row_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.gather_row_stage)
 
-        tdQtdQ_v = tdQtdQ[(None, None), 0, 0]
-        tdVtdV_v = tdVtdV[(None, None), 0, 0]
-        tdKtdK_v = tdKtdK[(None, None), 0, 0]
+        # Drain the three 128-column accumulators PASS columns at a time.  A single-shot T2R of a
+        # 128x128 tile puts 128 FP32 in every thread, and that peak -- not the dQ path alone -- is
+        # what sets this warp's register quota, because the segment flush reuses the same tensor.
+        # Per-pass views cost no extra LDTM (Repetition(32) already emitted one per 32 columns).
+        PASS = self.reduce_pass_cols
+        NPASS = TILE_N // PASS
+        pass_shape = (cute.make_layout((TILE_M, PASS)), 1, 1)
+        acc_pass_layout = cute.composition(tdQtdQ, pass_shape).layout
 
-        tmem_load_atom = cute.make_copy_atom(tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), self.acc_dtype)
-        tiled_t2r = tcgen05.make_tmem_copy(tmem_load_atom, tdQtdQ_v)
+        tmem_load_atom = cute.make_copy_atom(tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(PASS)), self.acc_dtype)
+        tdQ0 = cute.make_tensor(tdQtdQ.iterator, acc_pass_layout)
+        tiled_t2r = tcgen05.make_tmem_copy(tmem_load_atom, tdQ0[(None, None), 0, 0])
         thr_t2r = tiled_t2r.get_slice(dp_idx)
 
-        cAcc = cute.make_identity_tensor((TILE_M, TILE_N))
+        # cAcc is pass-local: a global column is `c * PASS + tTR_cAcc[i][1]`.
+        cAcc = cute.make_identity_tensor((TILE_M, PASS))
         tTR_cAcc = thr_t2r.partition_D(cAcc)
-        tTR_tdQ = thr_t2r.partition_S(tdQtdQ_v)
-        tTR_tdV = thr_t2r.partition_S(tdVtdV_v)
-        tTR_tdK = thr_t2r.partition_S(tdKtdK_v)
+        tTR_tdQ = []
+        tTR_tdV = []
+        tTR_tdK = []
+        for c in cutlass.range_constexpr(NPASS):
+            for acc, views in ((tdQtdQ, tTR_tdQ), (tdVtdV, tTR_tdV), (tdKtdK, tTR_tdK)):
+                acc_c = cute.make_tensor(acc.iterator + c * PASS, acc_pass_layout)
+                views.append(thr_t2r.partition_S(acc_c[(None, None), 0, 0]))
         tTR_r = cute.make_rmem_tensor(tTR_cAcc.shape, self.acc_dtype)
+
+        PAIRS_PER_SLOT = self.main_per_index // 2
+        PACKS_PER_PASS = PASS // 2
+        GROUPS_PER_PASS = PASS // (2 * PAIRS_PER_SLOT)
 
         mpp = Int32(self.main_per_index)
         row = row_lo
@@ -1459,8 +1545,19 @@ class _MSABackwardSm100Kernel:
             row_state.advance()
 
             # ---- dQ^T of this tile ----
+            # Every pass is packed to 16-bit words as soon as it lands, so the accumulator
+            # registers of pass c die before pass c+1 loads.  All NPASS T2Rs still precede the
+            # barrier below: named barrier 5 guards TMEM cols [128,256) against the next tile's
+            # dP^T write, and pushing it behind the RED stream would stall the mma warp there.
             mma_reduce_dQ_pipeline.consumer_wait(dq_state)
-            cute.copy(tiled_t2r, tTR_tdQ, tTR_r)
+            pk = cute.make_rmem_tensor((NPASS * PACKS_PER_PASS,), cutlass.Uint32)
+            for c in cutlass.range_constexpr(NPASS):
+                cute.copy(tiled_t2r, tTR_tdQ[c], tTR_r)
+                for j in cutlass.range_constexpr(PACKS_PER_PASS):
+                    if cutlass.const_expr(mdQ.element_type == cutlass.Float16):
+                        pk[c * PACKS_PER_PASS + j] = _pack_f16x2(tTR_r[2 * j], tTR_r[2 * j + 1])
+                    else:
+                        pk[c * PACKS_PER_PASS + j] = _pack_bf16x2(tTR_r[2 * j], tTR_r[2 * j + 1])
             cute.arch.fence_view_async_tmem_load()
             # T2R done: unblock the mma warp's next dP write before the slow atomics
             self.t2r_dQ_done_barrier.arrive()
@@ -1471,29 +1568,23 @@ class _MSABackwardSm100Kernel:
             # 4-byte RED per pair, no lane exchange. The L2 evict-last hint keeps the pool lines
             # resident for the read-modify-writes of later tasks.
             policy = _l2_policy_evict_last()
-            pk = cute.make_rmem_tensor((8,), cutlass.Uint32)
-            PAIRS_PER_SLOT = self.main_per_index // 2
             hp0 = index_head * Int32(PAIRS_PER_SLOT)
             d_row = tTR_cAcc[0][0]
-            for g in cutlass.range_constexpr(cute.size(tTR_r) // (2 * PAIRS_PER_SLOT)):
-                for pp in cutlass.range_constexpr(PAIRS_PER_SLOT):
-                    e = 2 * (g * PAIRS_PER_SLOT + pp)
-                    if cutlass.const_expr(mdQ.element_type == cutlass.Float16):
-                        pk[pp] = _pack_f16x2(tTR_r[e], tTR_r[e + 1])
-                    else:
-                        pk[pp] = _pack_bf16x2(tTR_r[e], tTR_r[e + 1])
-                n_col0 = tTR_cAcc[2 * g * PAIRS_PER_SLOT][1]
-                q_slot = n_col0 // mpp
-                if q_slot < valid:
-                    q_row = rQRow[q_slot]
-                    base = mdQ.iterator + cute.crd2idx((b, q_row, hp0, d_row, Int32(0)), mdQ.layout)
-                    for pp in cutlass.range_constexpr(PAIRS_PER_SLOT):
-                        hoff = tTR_cAcc[2 * (g * PAIRS_PER_SLOT + pp)][1] - n_col0
-                        dq_ptr = base + (hoff // 2) * Int32(2 * HEAD_DIM)
-                        if cutlass.const_expr(mdQ.element_type == cutlass.Float16):
-                            _red_add_f16x2_hint(dq_ptr, pk[pp], policy)
-                        else:
-                            _red_add_bf16x2_hint(dq_ptr, pk[pp], policy)
+            for c in cutlass.range_constexpr(NPASS):
+                for g in cutlass.range_constexpr(GROUPS_PER_PASS):
+                    p0 = c * PACKS_PER_PASS + g * PAIRS_PER_SLOT
+                    n_col0 = Int32(c * PASS) + tTR_cAcc[2 * g * PAIRS_PER_SLOT][1]
+                    q_slot = n_col0 // mpp
+                    if q_slot < valid:
+                        q_row = rQRow[q_slot]
+                        base = mdQ.iterator + cute.crd2idx((b, q_row, hp0, d_row, Int32(0)), mdQ.layout)
+                        for pp in cutlass.range_constexpr(PAIRS_PER_SLOT):
+                            hoff = tTR_cAcc[2 * (g * PAIRS_PER_SLOT + pp)][1] - tTR_cAcc[2 * g * PAIRS_PER_SLOT][1]
+                            dq_ptr = base + (hoff // 2) * Int32(2 * HEAD_DIM)
+                            if cutlass.const_expr(mdQ.element_type == cutlass.Float16):
+                                _red_add_f16x2_hint(dq_ptr, pk[p0 + pp], policy)
+                            else:
+                                _red_add_bf16x2_hint(dq_ptr, pk[p0 + pp], policy)
 
             # ---- segment flush: dV^T / dK^T ----
             is_seg_end = cutlass.Boolean(row + 1 >= row_hi)
@@ -1522,28 +1613,36 @@ class _MSABackwardSm100Kernel:
                 c0 = sel0.load() != 0
                 c1 = sel1.load() != 0
 
-                cute.copy(tiled_t2r, tTR_tdV, tTR_r)
-                cute.arch.fence_view_async_tmem_load()
+                # Same pass loop as dQ: one PASS-wide slice of the accumulator is transposed and
+                # flushed before the next loads, so the flush no longer sets this warp's register
+                # peak.  Block m of pass c covers d columns [c*PASS + 16m, +16).
+                BLK_PER_PASS = PASS // 16
                 dv_rows = [mdV.iterator + cute.crd2idx((b, kv_head, quad_row + k, 0), mdV.layout) for k in range(4)]
-                for m in cutlass.range_constexpr(cute.size(tTR_r) // 16):
-                    blk = [tTR_r4[None, 4 * m + k] for k in range(4)]
-                    self._quad_transpose4(blk, c0, c1)
-                    for k in cutlass.range_constexpr(4):
-                        dv_ptr = dv_rows[k] + (16 * m) + d_off
-                        cute.arch.atomic_add(dv_ptr.llvm_ptr, blk[k].load())
+                for c in cutlass.range_constexpr(NPASS):
+                    cute.copy(tiled_t2r, tTR_tdV[c], tTR_r)
+                    cute.arch.fence_view_async_tmem_load()
+                    for m in cutlass.range_constexpr(BLK_PER_PASS):
+                        blk = [tTR_r4[None, 4 * m + k] for k in range(4)]
+                        self._quad_transpose4(blk, c0, c1)
+                        for k in cutlass.range_constexpr(4):
+                            dv_ptr = dv_rows[k] + (c * PASS + 16 * m) + d_off
+                            cute.arch.atomic_add(dv_ptr.llvm_ptr, blk[k].load())
 
-                cute.copy(tiled_t2r, tTR_tdK, tTR_r)
-                cute.arch.fence_view_async_tmem_load()
-                # both accumulators are in registers: free the TMEM columns first
-                mma_reduce_dKV_pipeline.consumer_release(dkv_state)
-                dkv_state.advance()
                 dk_rows = [mdK.iterator + cute.crd2idx((b, kv_head, quad_row + k, 0), mdK.layout) for k in range(4)]
-                for m in cutlass.range_constexpr(cute.size(tTR_r) // 16):
-                    blk = [tTR_r4[None, 4 * m + k] for k in range(4)]
-                    self._quad_transpose4(blk, c0, c1)
-                    for k in cutlass.range_constexpr(4):
-                        dk_ptr = dk_rows[k] + (16 * m) + d_off
-                        cute.arch.atomic_add(dk_ptr.llvm_ptr, blk[k].load())
+                for c in cutlass.range_constexpr(NPASS):
+                    cute.copy(tiled_t2r, tTR_tdK[c], tTR_r)
+                    cute.arch.fence_view_async_tmem_load()
+                    if cutlass.const_expr(c == NPASS - 1):
+                        # every dV/dK column has now been read: free the TMEM before the last
+                        # pass's atomics, which is the earliest point the release is legal.
+                        mma_reduce_dKV_pipeline.consumer_release(dkv_state)
+                        dkv_state.advance()
+                    for m in cutlass.range_constexpr(BLK_PER_PASS):
+                        blk = [tTR_r4[None, 4 * m + k] for k in range(4)]
+                        self._quad_transpose4(blk, c0, c1)
+                        for k in cutlass.range_constexpr(4):
+                            dk_ptr = dk_rows[k] + (c * PASS + 16 * m) + d_off
+                            cute.arch.atomic_add(dk_ptr.llvm_ptr, blk[k].load())
 
                 self.reduce_sync_barrier.arrive_and_wait()
 
@@ -1705,11 +1804,22 @@ def _round_up(n: int, m: int = 256) -> int:
     return (n + m - 1) // m * m
 
 
+def _contiguous_stride(shape) -> tuple[int, ...]:
+    out, acc = [], 1
+    for n in reversed(shape):
+        out.append(acc)
+        acc *= int(n)
+    return tuple(reversed(out))
+
+
 def _alloc_call_buffers(q_c: torch.Tensor, k_c: torch.Tensor, v_c: torch.Tensor, schedule: _MSABackwardSchedule):
     """One internal allocation per call (freed when the plan dies), carved into: the 16-bit dQ
     head-pair pool ``[T, Hq/2, D, 2]`` + the FP32 dK/dV pool (cleared by ``zero()``), the FP32
     ``delta [T, 64]``, and the int32 scratch / tables of the task build. One block of one
-    size per call keeps the caching allocator from splitting and re-growing."""
+    size per call keeps the caching allocator from splitting and re-growing.
+
+    The first returned tensor is the gradient pool as ``int64`` -- the widest view ``zero()`` can
+    clear it through; every other returned tensor is a typed view of the same allocation."""
     num_dk, num_dv = k_c.numel(), v_c.numel()
     dq_bytes = q_c.numel() * _DQ_ACCUM_TORCH_DTYPE.itemsize  # multiple of 256: keeps the FP32 pool 16-byte aligned
     pool_bytes = dq_bytes + (num_dk + num_dv) * 4
@@ -1720,21 +1830,40 @@ def _alloc_call_buffers(q_c: torch.Tensor, k_c: torch.Tensor, v_c: torch.Tensor,
     tables_off = _round_up(scratch_off + scratch_words * 4)
     total = _round_up(tables_off + table_words * 4)
     raw = torch.empty(total, dtype=torch.uint8, device=q_c.device)
-    pool = raw[:pool_bytes]
-    dq_pool = pool[:dq_bytes].view(_DQ_ACCUM_TORCH_DTYPE).view(q_c.shape[0], NUM_Q_HEADS // 2, HEAD_DIM, 2)
-    grad_pool = pool[dq_bytes:].view(torch.float32)
-    delta = raw[delta_off : delta_off + delta_bytes].view(torch.float32).view(q_c.shape[0], NUM_Q_HEADS)
-    scratch = raw[scratch_off : scratch_off + scratch_words * 4].view(torch.int32)
-    tables = raw[tables_off : tables_off + table_words * 4].view(torch.int32)
+    # ``zero()`` clears the pool through a 64-bit view: the byte view fills one element per
+    # thread and runs at 3.8 TB/s, the 64-bit one at 7.3 TB/s (80 MB at s4096: 21.9 us -> 11.4 us).
+    # pool_bytes = T*64*D*itemsize + (num_dk+num_dv)*4 is a multiple of 4096 for every legal shape,
+    # so the view is always exact; assert it rather than silently falling back to a partial clear.
+    assert pool_bytes % 8 == 0, f"grad pool {pool_bytes} bytes is not 8-byte sized"
+    # Carve with one ``as_strided`` per region off a base retyped once, rather than the
+    # ``raw[a:b].view(dtype).view(shape)`` chain this used to be.  The eight regions are the same
+    # eight; the host cost is not.  Measured on this machine: slice 1.13 us, view 0.85, as_strided
+    # 1.09, so the three-op chain is 2.57 us against 1.09 -- and this runs on every backward call,
+    # where the whole wrapper only has ~171 us of host time to give (see the v9r5 ledger).
+    # ``as_strided`` takes an ABSOLUTE storage offset, so this is only correct while ``raw`` starts
+    # at zero; it is a fresh allocation, and the assert keeps it that way.
+    assert raw.storage_offset() == 0, "carve offsets are absolute: raw must own its storage"
+    num_tokens = q_c.shape[0]
+    pool64, pool_dq, pool_f32, pool_i32 = (
+        raw.view(torch.int64),
+        raw.view(_DQ_ACCUM_TORCH_DTYPE),
+        raw.view(torch.float32),
+        raw.view(torch.int32),
+    )
+    grad_off = dq_bytes // 4  # fp32 elements of dQ pool ahead of the dK/dV pool
     return (
-        pool,
-        dq_pool,
-        grad_pool,
-        grad_pool[:num_dk].view(k_c.shape),
-        grad_pool[num_dk:].view(v_c.shape),
-        delta,
-        scratch,
-        tables,
+        pool64.as_strided((pool_bytes // 8,), (1,), 0),
+        pool_dq.as_strided(
+            (num_tokens, NUM_Q_HEADS // 2, HEAD_DIM, 2),
+            (NUM_Q_HEADS * HEAD_DIM, HEAD_DIM * 2, 2, 1),
+            0,
+        ),
+        pool_f32.as_strided((num_dk + num_dv,), (1,), grad_off),
+        pool_f32.as_strided(tuple(k_c.shape), _contiguous_stride(k_c.shape), grad_off),
+        pool_f32.as_strided(tuple(v_c.shape), _contiguous_stride(v_c.shape), grad_off + num_dk),
+        pool_f32.as_strided((num_tokens, NUM_Q_HEADS), (NUM_Q_HEADS, 1), delta_off // 4),
+        pool_i32.as_strided((scratch_words,), (1,), scratch_off // 4),
+        pool_i32.as_strided((table_words,), (1,), tables_off // 4),
     )
 
 
@@ -1777,6 +1906,7 @@ class _MSABackwardPlan:
     pools, delta, task scratch and tables) and the main compiled executable. The preprocess,
     task-build and grad-finalize executables are fetched from their own module-level caches inside
     ``preprocess``/``build_tasks``/``cast``, so the very first call of a process compiles there.
+    ``zero`` clears the dQ/dK/dV pool through a 64-bit view of it (``pool``).
     ``zero`` and ``build_tasks`` must both run before ``launch_main``; ``build_tasks``
     sets ``tables``, whose ``desc`` carries the exact task count and the CTA walk. A schedule
     without tasks yields zero gradients through the same launches. Methods are bound on access,

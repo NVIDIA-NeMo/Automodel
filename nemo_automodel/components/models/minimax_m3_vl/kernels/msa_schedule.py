@@ -28,7 +28,13 @@ _NUM_INDEX_HEADS = 4
 _QUERY_CHUNK = 8
 _ROWS_PER_CTA_SMALL = 4
 _ROWS_PER_CTA_SWITCH = 2400
-_ROWS_PER_CTA_LARGE = 32
+# 64, not 32: a CTA flushes dK/dV once per bucket run it walks, so the flush count is
+# ~= buckets + CTAs.  At s4096 there are only 128 buckets against 881 CTAs, i.e. 7.7 flushes
+# per bucket -- nearly all of the flush work is CTA-boundary splitting, and every split
+# re-does the whole flush (dK/dV T2R + quad transpose + FP32 atomics).  Halving the CTA count
+# halves that redundancy.  64 is where it stops paying: 96 and 128 cut splits further but lose
+# more to the shrinking wave count (128 is +3.6% at s4096, which runs only 1.3 waves).
+_ROWS_PER_CTA_LARGE = 64
 
 
 @dataclass(frozen=True, slots=True)

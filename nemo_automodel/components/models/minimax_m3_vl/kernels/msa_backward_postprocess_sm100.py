@@ -53,6 +53,9 @@ _COMPILE_CACHE: dict[tuple[Any, ...], Any] = {}
 class _MSAGradFinalizeSm100:
     def __init__(self, interleaved: bool):
         self.interleaved = interleaved  # pool row = (d, e) pairs of one head pair (else 256 plain elements)
+        # 16 values per thread on the interleaved path so each of its two per-e stores is 128-bit
+        self.vals_per_thread = 16 if interleaved else 8
+        self.rows_per_cta = NUM_THREADS // (POOL_ROW // self.vals_per_thread)
 
     @cute.jit
     def __call__(
@@ -65,23 +68,25 @@ class _MSAGradFinalizeSm100:
         num_kv_blocks: Int32,
         stream: cuda.CUstream,
     ):
-        in_bits = mDQPool.element_type.width
         in_copy = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), mDQPool.element_type, num_bits_per_copy=128)
-        # lane c of warp r reads pool[r, 8c : 8c + 8] (16 B) and writes out[r, e, 4c : 4c + 4] (8 B)
-        thr_layout = cute.make_ordered_layout((DQ_ROWS_PER_CTA, 32), order=(1, 0))
-        tiled_in = cute.make_tiled_copy_tv(in_copy, thr_layout, cute.make_layout((1, 128 // in_bits)))
-        if cutlass.const_expr(self.interleaved):
-            out_copy = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16, num_bits_per_copy=64)
-            tiled_out = cute.make_tiled_copy_tv(out_copy, thr_layout, cute.make_layout((1, 4)))
-        else:
-            out_copy = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16, num_bits_per_copy=128)
-            tiled_out = cute.make_tiled_copy_tv(out_copy, thr_layout, cute.make_layout((1, 8)))
+        # A pool row holds (d, e) pairs, so one head's 8 consecutive outputs come from 16 consecutive
+        # pool elements.  Giving the interleaved path 16 lanes per row (16 values each) instead of 32
+        # (8 each) makes both per-e stores 128-bit; at 8 values per thread they were 64-bit, i.e. the
+        # store side ran at half the load side's width.
+        rows = self.rows_per_cta
+        lanes = POOL_ROW // self.vals_per_thread
+        thr_layout = cute.make_ordered_layout((rows, lanes), order=(1, 0))
+        tiled_in = cute.make_tiled_copy_tv(in_copy, thr_layout, cute.make_layout((1, self.vals_per_thread)))
+        out_copy = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16, num_bits_per_copy=128)
+        tiled_out = cute.make_tiled_copy_tv(
+            out_copy, thr_layout, cute.make_layout((1, self.vals_per_thread // (2 if self.interleaved else 1)))
+        )
         kv_copy = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), Float32, num_bits_per_copy=128)
         kv_thr = cute.make_layout((1, NUM_THREADS))
         tiled_kv_in = cute.make_tiled_copy_tv(kv_copy, kv_thr, cute.make_layout((1, 8)))
         kv_out_copy = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16, num_bits_per_copy=128)
         tiled_kv_out = cute.make_tiled_copy_tv(kv_out_copy, kv_thr, cute.make_layout((1, 8)))
-        dq_blocks = cute.ceil_div(num_dq_rows, DQ_ROWS_PER_CTA)
+        dq_blocks = cute.ceil_div(num_dq_rows, self.rows_per_cta)
         blocks = dq_blocks
         if num_kv_blocks > blocks:
             blocks = num_kv_blocks
@@ -106,12 +111,12 @@ class _MSAGradFinalizeSm100:
         tidx, _, _ = cute.arch.thread_idx()
         bidx, role, _ = cute.arch.block_idx()
         if role == 0:
-            if bidx * Int32(DQ_ROWS_PER_CTA) < num_dq_rows:
-                gIn = cute.local_tile(mDQPool, (DQ_ROWS_PER_CTA, POOL_ROW), (bidx, 0))
+            if bidx * Int32(self.rows_per_cta) < num_dq_rows:
+                gIn = cute.local_tile(mDQPool, (self.rows_per_cta, POOL_ROW), (bidx, 0))
                 thr_in = tiled_in.get_slice(tidx)
                 tIn = thr_in.partition_S(gIn)
                 frag = cute.make_rmem_tensor_like(tIn)
-                row = bidx * Int32(DQ_ROWS_PER_CTA) + tidx // 32
+                row = bidx * Int32(self.rows_per_cta) + tidx // Int32(POOL_ROW // self.vals_per_thread)
                 if row < num_dq_rows:
                     cute.copy(tiled_in, tIn, frag)
                     thr_out = tiled_out.get_slice(tidx)
@@ -120,14 +125,14 @@ class _MSAGradFinalizeSm100:
                         frag_flat = cute.make_tensor(frag.iterator, cute.make_layout(cute.size(frag)))
                         frag2 = cute.logical_divide(frag_flat, cute.make_layout(2))  # (e, d-local)
                         for e in cutlass.range_constexpr(2):
-                            gOut = cute.local_tile(mDQOut, (DQ_ROWS_PER_CTA, HEAD_DIM), (bidx, e))
+                            gOut = cute.local_tile(mDQOut, (self.rows_per_cta, HEAD_DIM), (bidx, e))
                             tOut = thr_out.partition_D(gOut)
                             packed = cute.make_rmem_tensor_like(tOut)
                             packed_flat = cute.make_tensor(packed.iterator, cute.make_layout(cute.size(packed)))
                             packed_flat.store(frag2[e, None].load().to(cutlass.BFloat16))
                             cute.copy(tiled_out, packed, tOut)
                     else:
-                        gOut = cute.local_tile(mDQOut, (DQ_ROWS_PER_CTA, POOL_ROW), (bidx, 0))
+                        gOut = cute.local_tile(mDQOut, (self.rows_per_cta, POOL_ROW), (bidx, 0))
                         tOut = thr_out.partition_D(gOut)
                         packed = cute.make_rmem_tensor_like(tOut)
                         packed.store(frag.load().to(cutlass.BFloat16))

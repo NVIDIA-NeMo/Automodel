@@ -53,8 +53,24 @@ from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 
 THREADS = 256
 SCAN_THREADS = 1024
+# The two single-CTA scans stage one tile of int32 in SMEM at a time (32 KiB) so their
+# global traffic is striped -- i.e. coalesced -- while the scan itself keeps the blocked
+# partition it needs.  SCAN_PER is the constexpr slot count per thread: unrolling the
+# striped passes is what puts more than one load per thread in flight, which is what the
+# kernels are actually short of on a single SM.
+SCAN_TILE = 8192
+SCAN_PER = SCAN_TILE // SCAN_THREADS
 DESC_WORDS = 8
-MAX_BINS = 1 << 20
+MAX_BINS = 1 << 22
+# `assign_segments` already resolves every task through `_decode_task`; `scatter_tables` used to
+# repeat the identical binary search for the same task index.  Three int32 of scratch per task
+# carry the rest of the decode across instead.  Only three, because `head` and `kblock` are
+# already inside the segment id that scatter_tables reads anyway --
+# `segment = (head * num_windows + query_window) * num_kblocks + kblock` inverts exactly -- and
+# the write side is what limits this trade: at five words assign_segments gave back most of what
+# scatter_tables saved.
+DEC_WORDS = 3
+DEC_VALID, DEC_EDGE, DEC_DOC = 0, 1, 2
 # descriptor words (int32[8])
 DESC_NUM_TASK_ROWS = 0
 DESC_ROWS_PER_CTA = 1
@@ -73,7 +89,15 @@ BIN_OFFSETS = 3
 _INT32_MAX = 2**31 - 1
 
 # Locality window in queries: a wave of CTAs stays inside one, so its Q/dO/dQ rows are hit in L2.
-_LOCALITY_WINDOW = 2048
+# 512, not 2048: the window is the reuse distance of one CTA's own Q/dO/dQ fetch stream, and
+# shrinking it raises the L2 read hit rate 73.0% -> 81.1% and cuts DRAM read 389.8 -> 259.5 MB at
+# s4096.  Measured -1.27 / -1.22 / -0.41 / -1.01 % on the four M3 cases (interleaved forward and
+# reverse passes, disjoint value ranges at s4096).  The curve has an interior optimum: 256 costs
+# +6.78% at s8192 because the extra dK/dV segment flushes push Q/dO back out of L2, and 4096 costs
+# +1.44% at s32768.  The optimum is an absolute query count -- it does not scale with T or with
+# rows/CTA.  Bins are 4 * ceil(T/window) * (W/128), so a smaller window needs a larger MAX_BINS to
+# hold the supported token count; the two constants move together.
+_LOCALITY_WINDOW = 512
 
 _COMPILE_CACHE: dict[tuple[Any, ...], Any] = {}
 
@@ -107,7 +131,8 @@ def _task_build_sizes(
     num_kblocks = workspace_rows // _BLOCK_SIZE
     bins = _NUM_INDEX_HEADS * num_windows * max(num_kblocks, 1)
     work_capacity = int(schedule.scheduler_metadata.shape[0])
-    return capacity, bins, DESC_WORDS + work_capacity + capacity + 4 * bins, capacity * (4 + 2 * _QUERY_CHUNK)
+    scratch_words = DESC_WORDS + work_capacity + capacity + 4 * bins + DEC_WORDS * capacity
+    return capacity, bins, scratch_words, capacity * (4 + 2 * _QUERY_CHUNK)
 
 
 @cute.jit
@@ -194,6 +219,7 @@ class _MSATaskBuildSm100:
         mDocStarts: cute.Tensor,  # [documents] int32 workspace starts
         mTaskSegments: cute.Tensor,  # [capacity] int32 scratch: segment of each source task
         mBins: cute.Tensor,  # [4, bins] int32 scratch: counts, first tasks, last tasks, offsets
+        mTaskDecode: cute.Tensor,  # [capacity, DEC_WORDS] int32 scratch: assign_segments' decode
         mTaskMeta: cute.Tensor,  # [capacity, 4] int32 out
         mQRows: cute.Tensor,  # [capacity, 8] int32 out
         mQPos: cute.Tensor,  # [capacity, 8] int32 out
@@ -217,6 +243,7 @@ class _MSATaskBuildSm100:
             mDocStarts,
             mTaskSegments,
             mBins,
+            mTaskDecode,
             mDesc,
             num_windows,
             num_kblocks,
@@ -224,18 +251,18 @@ class _MSATaskBuildSm100:
         ).launch(grid=[cute.ceil_div(capacity, THREADS), 1, 1], block=[THREADS, 1, 1], stream=stream)
         self.scan_bins_kernel(mBins, mDesc).launch(grid=[1, 1, 1], block=[SCAN_THREADS, 1, 1], stream=stream)
         self.scatter_tables_kernel(
-            mWorkMeta,
-            mTaskEnds,
-            mRowPtr,
             mQIdx,
             mCuSeqlens,
             mDocStarts,
             mTaskSegments,
             mBins,
+            mTaskDecode,
             mTaskMeta,
             mQRows,
             mQPos,
             mDesc,
+            num_windows,
+            num_kblocks,
             num_sms,
         ).launch(grid=[cute.ceil_div(capacity, THREADS), 1, 1], block=[THREADS, 1, 1], stream=stream)
 
@@ -256,22 +283,66 @@ class _MSATaskBuildSm100:
             num_work = n
         if num_work < Int32(0):
             num_work = Int32(0)
-        per = (num_work + Int32(SCAN_THREADS - 1)) // Int32(SCAN_THREADS)
-        lo = tidx * per
-        hi = lo + per
-        if hi > num_work:
-            hi = num_work
-        local = Int32(0)
-        w = lo
-        while w < hi:
-            local = local + (mWorkMeta[w, 3] + Int32(_QUERY_CHUNK - 1)) // Int32(_QUERY_CHUNK)
-            w = w + 1
-        running, total = _cta_exclusive_scan(local, tidx, with_total=True)
-        w = lo
-        while w < hi:
-            running = running + (mWorkMeta[w, 3] + Int32(_QUERY_CHUNK - 1)) // Int32(_QUERY_CHUNK)
-            mTaskEnds[w] = running
-            w = w + 1
+        # A prefix sum wants a blocked partition (thread t owns a contiguous run), but reading a
+        # blocked partition straight from global gives each warp 32 distinct sectors per load,
+        # reads the column twice, and leaves one load per thread in flight -- and this is a single
+        # CTA, i.e. one SM's share of L2.  Two coalesced shapes replace it:
+        #   * up to one SMEM tile, scan a CTA-wide round at a time and carry between rounds.  Every
+        #     access is striped, and each element is read once.
+        #   * beyond that, stage a tile in SMEM through unrolled striped passes and keep the
+        #     blocked scan inside SMEM, so one CTA scan is amortised over SCAN_TILE elements
+        #     instead of over SCAN_THREADS.
+        # Both carry the running total the same way, so the tables are bit-identical.
+        total = Int32(0)
+        if num_work <= Int32(SCAN_TILE):
+            base = Int32(0)
+            while base < num_work:
+                w = base + tidx
+                v = Int32(0)
+                if w < num_work:
+                    v = (mWorkMeta[w, 3] + Int32(_QUERY_CHUNK - 1)) // Int32(_QUERY_CHUNK)
+                off, round_total = _cta_exclusive_scan(v, tidx, with_total=True)
+                if w < num_work:
+                    mTaskEnds[w] = total + off + v
+                total = total + round_total
+                base = base + Int32(SCAN_THREADS)
+        else:
+            sVal = cute.make_tensor(cute.arch.alloc_smem(Int32, SCAN_TILE), cute.make_layout(SCAN_TILE))
+            c0 = Int32(0)
+            while c0 < num_work:
+                m = num_work - c0
+                if m > Int32(SCAN_TILE):
+                    m = Int32(SCAN_TILE)
+                for u in cutlass.range_constexpr(SCAN_PER):
+                    i = tidx + Int32(u * SCAN_THREADS)
+                    if i < m:
+                        sVal[i] = (mWorkMeta[c0 + i, 3] + Int32(_QUERY_CHUNK - 1)) // Int32(_QUERY_CHUNK)
+                cute.arch.sync_threads()
+                per = (m + Int32(SCAN_THREADS - 1)) // Int32(SCAN_THREADS)
+                lo = tidx * per
+                hi = lo + per
+                if hi > m:
+                    hi = m
+                local = Int32(0)
+                w = lo
+                while w < hi:
+                    local = local + sVal[w]
+                    w = w + 1
+                off, chunk_total = _cta_exclusive_scan(local, tidx, with_total=True)
+                running = off + total
+                w = lo
+                while w < hi:
+                    running = running + sVal[w]
+                    sVal[w] = running
+                    w = w + 1
+                cute.arch.sync_threads()
+                for u in cutlass.range_constexpr(SCAN_PER):
+                    i = tidx + Int32(u * SCAN_THREADS)
+                    if i < m:
+                        mTaskEnds[c0 + i] = sVal[i]
+                cute.arch.sync_threads()
+                total = total + chunk_total
+                c0 = c0 + Int32(SCAN_TILE)
         if tidx == Int32(0):
             mDesc[DESC_NUM_WORK] = num_work
             mDesc[DESC_NUM_TASKS] = total
@@ -295,6 +366,7 @@ class _MSATaskBuildSm100:
         mDocStarts: cute.Tensor,
         mTaskSegments: cute.Tensor,
         mBins: cute.Tensor,
+        mTaskDecode: cute.Tensor,
         mDesc: cute.Tensor,
         num_windows: Int32,
         num_kblocks: Int32,
@@ -309,12 +381,18 @@ class _MSATaskBuildSm100:
         if num_tasks > capacity:
             num_tasks = capacity
         if task < num_tasks:
-            head, doc, kblock_local, _valid, edge_start = _decode_task(mWorkMeta, mTaskEnds, mRowPtr, num_work, task)
+            head, doc, kblock_local, valid, edge_start = _decode_task(mWorkMeta, mTaskEnds, mRowPtr, num_work, task)
             # slot 0 is always valid and queries ascend inside a bucket: the task's first query
             first_query = mCuSeqlens[doc] + mQIdx[head, edge_start]
             kblock = mDocStarts[doc] // Int32(_BLOCK_SIZE) + kblock_local
             segment = (head * num_windows + first_query // locality_window) * num_kblocks + kblock
             mTaskSegments[task] = segment
+            # Hand the decode to scatter_tables rather than make it redo the binary search: the
+            # search is ~log2(num_work) dependent global loads, and both kernels are indexed by
+            # the same forward-order `task`.
+            mTaskDecode[task, DEC_VALID] = valid
+            mTaskDecode[task, DEC_EDGE] = edge_start
+            mTaskDecode[task, DEC_DOC] = doc
             cute.arch.atomic_add(mBins.iterator + cute.crd2idx((Int32(BIN_COUNTS), segment), mBins.layout), Int32(1))
             cute.arch.atomic_min(mBins.iterator + cute.crd2idx((Int32(BIN_FIRST_TASKS), segment), mBins.layout), task)
             cute.arch.atomic_max(mBins.iterator + cute.crd2idx((Int32(BIN_LAST_TASKS), segment), mBins.layout), task)
@@ -328,51 +406,99 @@ class _MSATaskBuildSm100:
         """Exclusive bin offsets; flag segments that are not contiguous source runs."""
         tidx, _, _ = cute.arch.thread_idx()
         n = Int32(cute.size(mBins, mode=[1]))
-        per = (n + Int32(SCAN_THREADS - 1)) // Int32(SCAN_THREADS)
-        lo = tidx * per
-        hi = lo + per
-        if hi > n:
-            hi = n
-        local = Int32(0)
+        # Same two coalesced shapes as scan_work, and the same reason to need them: `bins` is
+        # (index heads) * (tokens / window) * (workspace rows / 128), so it grows quadratically
+        # with the sequence and this single CTA was scanning 65 536 entries at s32768 with one
+        # outstanding load per thread.  The contiguity check reads first/last unconditionally so a
+        # slot's three loads are independent -- empty bins carry INT32_MAX / -1 and the comparison
+        # is discarded, so the flag is unchanged.
         bad = Int32(0)
-        b = lo
-        while b < hi:
-            count = mBins[BIN_COUNTS, b]
-            local = local + count
-            if count > Int32(0):
-                if mBins[BIN_LAST_TASKS, b] - mBins[BIN_FIRST_TASKS, b] + Int32(1) != count:
-                    bad = Int32(1)
-            b = b + 1
-        running = _cta_exclusive_scan(local, tidx)
-        b = lo
-        while b < hi:
-            mBins[BIN_OFFSETS, b] = running
-            running = running + mBins[BIN_COUNTS, b]
-            b = b + 1
+        if n <= Int32(SCAN_TILE):
+            carry = Int32(0)
+            base = Int32(0)
+            while base < n:
+                b = base + tidx
+                count = Int32(0)
+                if b < n:
+                    count = mBins[BIN_COUNTS, b]
+                    last = mBins[BIN_LAST_TASKS, b]
+                    first = mBins[BIN_FIRST_TASKS, b]
+                    if count > Int32(0):
+                        if last - first + Int32(1) != count:
+                            bad = Int32(1)
+                off, round_total = _cta_exclusive_scan(count, tidx, with_total=True)
+                if b < n:
+                    mBins[BIN_OFFSETS, b] = carry + off
+                carry = carry + round_total
+                base = base + Int32(SCAN_THREADS)
+        else:
+            sCount = cute.make_tensor(cute.arch.alloc_smem(Int32, SCAN_TILE), cute.make_layout(SCAN_TILE))
+            carry = Int32(0)
+            c0 = Int32(0)
+            while c0 < n:
+                m = n - c0
+                if m > Int32(SCAN_TILE):
+                    m = Int32(SCAN_TILE)
+                for u in cutlass.range_constexpr(SCAN_PER):
+                    i = tidx + Int32(u * SCAN_THREADS)
+                    if i < m:
+                        count = mBins[BIN_COUNTS, c0 + i]
+                        last = mBins[BIN_LAST_TASKS, c0 + i]
+                        first = mBins[BIN_FIRST_TASKS, c0 + i]
+                        sCount[i] = count
+                        if count > Int32(0):
+                            if last - first + Int32(1) != count:
+                                bad = Int32(1)
+                cute.arch.sync_threads()
+                per = (m + Int32(SCAN_THREADS - 1)) // Int32(SCAN_THREADS)
+                lo = tidx * per
+                hi = lo + per
+                if hi > m:
+                    hi = m
+                local = Int32(0)
+                b = lo
+                while b < hi:
+                    local = local + sCount[b]
+                    b = b + 1
+                off, chunk_total = _cta_exclusive_scan(local, tidx, with_total=True)
+                running = off + carry
+                b = lo
+                while b < hi:
+                    count = sCount[b]
+                    sCount[b] = running
+                    running = running + count
+                    b = b + 1
+                cute.arch.sync_threads()
+                for u in cutlass.range_constexpr(SCAN_PER):
+                    i = tidx + Int32(u * SCAN_THREADS)
+                    if i < m:
+                        mBins[BIN_OFFSETS, c0 + i] = sCount[i]
+                cute.arch.sync_threads()
+                carry = carry + chunk_total
+                c0 = c0 + Int32(SCAN_TILE)
         if bad > Int32(0):
             cute.arch.atomic_or(mDesc.iterator + DESC_FLAGS, Int32(FLAG_NONCONTIGUOUS_SEGMENTS))
 
     @cute.kernel
     def scatter_tables_kernel(
         self,
-        mWorkMeta: cute.Tensor,
-        mTaskEnds: cute.Tensor,
-        mRowPtr: cute.Tensor,
         mQIdx: cute.Tensor,
         mCuSeqlens: cute.Tensor,
         mDocStarts: cute.Tensor,
         mTaskSegments: cute.Tensor,
         mBins: cute.Tensor,
+        mTaskDecode: cute.Tensor,
         mTaskMeta: cute.Tensor,
         mQRows: cute.Tensor,
         mQPos: cute.Tensor,
         mDesc: cute.Tensor,
+        num_windows: Int32,
+        num_kblocks: Int32,
         num_sms: Int32,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         task = bidx * Int32(THREADS) + tidx
-        num_work = mDesc[DESC_NUM_WORK]
         total = mDesc[DESC_NUM_TASKS]
         flags = mDesc[DESC_FLAGS]
         capacity = Int32(cute.size(mTaskSegments))
@@ -384,12 +510,20 @@ class _MSATaskBuildSm100:
             output_row = task  # source (bucket-major) order when the segments are not contiguous runs
             if (flags & Int32(FLAG_NONCONTIGUOUS_SEGMENTS)) == Int32(0):
                 output_row = mBins[BIN_OFFSETS, segment] + (task - mBins[BIN_FIRST_TASKS, segment])
-            head, doc, kblock_local, valid, edge_start = _decode_task(mWorkMeta, mTaskEnds, mRowPtr, num_work, task)
+            # assign_segments already ran _decode_task for this same task index.  Read the three
+            # words it left instead of repeating the binary search, which is ~log2(num_work)
+            # DEPENDENT global loads -- the reason this kernel cost 6.4 us at s4096 to write 2 MB.
+            valid = mTaskDecode[task, DEC_VALID]
+            edge_start = mTaskDecode[task, DEC_EDGE]
+            doc = mTaskDecode[task, DEC_DOC]
+            # head and kblock come back out of the segment id, so they cost no scratch traffic
+            kblock = segment - (segment // num_kblocks) * num_kblocks
+            head = (segment // num_kblocks) // num_windows
             compact_start = mCuSeqlens[doc]
             workspace_start = mDocStarts[doc]
             mTaskMeta[output_row, 0] = Int32(0)
             mTaskMeta[output_row, 1] = head
-            mTaskMeta[output_row, 2] = workspace_start // Int32(_BLOCK_SIZE) + kblock_local
+            mTaskMeta[output_row, 2] = kblock
             mTaskMeta[output_row, 3] = valid
             for s in cutlass.range_constexpr(_QUERY_CHUNK):
                 qrow = Int32(-1)
@@ -461,6 +595,7 @@ def _compile(device: torch.device) -> Any:
             tensor((n_docs,)),
             tensor((n_cap,)),
             tensor((4, n_bins)),
+            tensor((n_cap, DEC_WORDS)),
             tensor((n_cap, 4), align=16),
             task_rows,
             task_rows,
@@ -533,17 +668,24 @@ def build_backward_tasks(
     work_count = schedule.work_count.contiguous()
     if scratch is None or scratch.numel() < scratch_words:
         scratch = torch.empty(scratch_words, dtype=torch.int32, device=device)
-    desc = scratch[:DESC_WORDS]
     segments_start = DESC_WORDS + work_capacity
     bins_start = segments_start + capacity
-    task_ends = scratch[DESC_WORDS:segments_start]
-    task_segments = scratch[segments_start:bins_start]
-    segment_bins = scratch[bins_start:scratch_words].view(4, bins)
+    decode_start = bins_start + 4 * bins
     if tables is None or tables.numel() < table_words:
         tables = torch.empty(table_words, dtype=torch.int32, device=device)
-    task_meta = tables[: 4 * capacity].view(capacity, 4)
-    task_qrows = tables[4 * capacity : (4 + _QUERY_CHUNK) * capacity].view(capacity, _QUERY_CHUNK)
-    task_qpos = tables[(4 + _QUERY_CHUNK) * capacity : table_words].view(capacity, _QUERY_CHUNK)
+    # One ``as_strided`` per region instead of a slice (+ a reshape for the 2-D ones): the carve
+    # runs on every backward call and the slice-plus-view pair costs about twice a single
+    # ``as_strided``.  Offsets are ABSOLUTE storage offsets, so the caller's own offset has to be
+    # added -- ``scratch``/``tables`` are normally windows into the one per-call allocation.
+    s0, t0 = scratch.storage_offset(), tables.storage_offset()
+    desc = scratch.as_strided((DESC_WORDS,), (1,), s0)
+    task_ends = scratch.as_strided((work_capacity,), (1,), s0 + DESC_WORDS)
+    task_segments = scratch.as_strided((capacity,), (1,), s0 + segments_start)
+    segment_bins = scratch.as_strided((4, bins), (bins, 1), s0 + bins_start)
+    task_decode = scratch.as_strided((capacity, DEC_WORDS), (DEC_WORDS, 1), s0 + decode_start)
+    task_meta = tables.as_strided((capacity, 4), (4, 1), t0)
+    task_qrows = tables.as_strided((capacity, _QUERY_CHUNK), (_QUERY_CHUNK, 1), t0 + 4 * capacity)
+    task_qpos = tables.as_strided((capacity, _QUERY_CHUNK), (_QUERY_CHUNK, 1), t0 + (4 + _QUERY_CHUNK) * capacity)
     tensors = (
         meta,
         work_count,
@@ -554,6 +696,7 @@ def build_backward_tasks(
         dws,
         task_segments,
         segment_bins,
+        task_decode,
         task_meta,
         task_qrows,
         task_qpos,
