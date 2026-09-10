@@ -19,7 +19,7 @@ AUTOMODEL_CHECKOUT=${AUTOMODEL_CHECKOUT:-$PWD}
 TITANS_WORK_ROOT=${TITANS_WORK_ROOT:-/lustre/fsw/portfolios/coreai/users/ffrujeri/titans-automodel}
 TITANS_IMAGE=${TITANS_IMAGE:-nvcr.io#nvidia/nemo-automodel:26.04}
 DATA_ROOT=$TITANS_WORK_ROOT/data/fineweb-edu-llama2-pilot
-TRAIN_DATA=$DATA_ROOT/train/fineweb_edu_max_tokens_64000000/dataset.bin
+TRAIN_DATA=$DATA_ROOT/train/fineweb_edu_max_tokens_64M/dataset.bin
 VALIDATION_ROOT=$DATA_ROOT/validation-health
 READY_MARKER=$DATA_ROOT/READY
 
