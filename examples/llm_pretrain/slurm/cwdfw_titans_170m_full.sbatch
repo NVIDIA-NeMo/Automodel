@@ -33,7 +33,14 @@ mkdir -p "$TITANS_WORK_ROOT"/{cache,logs,outputs} "$TITANS_CHECKPOINT_ROOT" \
 test -s "$TITANS_DATA_ROOT/READY"
 CURRENT_SHA=$(git -C "$AUTOMODEL_CHECKOUT" rev-parse HEAD)
 if [[ -s "$RUN_SHA_FILE" ]]; then
-  test "$(cat "$RUN_SHA_FILE")" = "$CURRENT_SHA"
+  RECORDED_SHA=$(cat "$RUN_SHA_FILE")
+  if [[ "$RECORDED_SHA" != "$CURRENT_SHA" ]]; then
+    if [[ -e "$TITANS_CHECKPOINT_ROOT/LATEST" ]]; then
+      echo "refusing to resume checkpoints from $RECORDED_SHA with source $CURRENT_SHA" >&2
+      exit 1
+    fi
+    printf '%s\n' "$CURRENT_SHA" >"$RUN_SHA_FILE"
+  fi
 else
   printf '%s\n' "$CURRENT_SHA" >"$RUN_SHA_FILE"
 fi
