@@ -434,6 +434,40 @@ def _engram_meta_dtensor_lifecycle_worker(rank: int, world_size: int, store_path
         table.mark_sharding_contract()
         assert torch.isfinite(table.weight.to_local()).all()
         assert hasattr(table.weight, "_nemo_model_owned_grad_divisor")
+
+        # from_config performs one final parent-model device conversion after
+        # initialize_weights has stamped the contract. DTensor swapping can
+        # drop attributes even when this conversion keeps the Parameter id.
+        parent = nn.Sequential(table)
+        initial = table.weight.to_local().detach().clone()
+        parent.to(torch.device("cpu"), non_blocking=True)
+        assert table.weight is parameter
+        assert table.weight._nemo_model_owned_grad_divisor == float(world_size)
+        torch.testing.assert_close(table.weight.to_local(), initial, rtol=0, atol=0)
+        parent.to(dtype=torch.bfloat16)
+        assert table.weight is parameter
+        assert table.weight._nemo_model_owned_grad_divisor == float(world_size)
+        torch.testing.assert_close(table.weight.to_local(), initial.bfloat16(), rtol=0, atol=0)
+        parent.float()
+        assert table.weight._nemo_model_owned_grad_divisor == float(world_size)
+        parent.to_empty(device=torch.device("cpu"))
+        assert table.weight is parameter
+        assert table.weight._nemo_model_owned_grad_divisor == float(world_size)
+        table.reset_parameters()
+
+        # Verify the actual training consumer averages each owner's summed
+        # lookup gradient exactly once, before any optimizer is constructed.
+        from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
+
+        global_ids = torch.tensor([rank, rank + 6, rank + 6])
+        parent(global_ids).sum().backward()
+        scale_grads_and_clip_grad_norm(None, [parent], dp_group_size=world_size)
+        expected = torch.zeros(12, 3)
+        expected[:world_size] = 1.0 / world_size
+        expected[6 : 6 + world_size] = 2.0 / world_size
+        torch.testing.assert_close(
+            table.weight.grad.to_local(), expected[table.vocab_start_index : table.vocab_end_index], rtol=0, atol=0
+        )
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()
