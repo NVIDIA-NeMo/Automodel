@@ -154,18 +154,24 @@ class QwenImageProcessor(BaseModelProcessor):
         Returns:
             Dict containing:
                 - prompt_embeds: Qwen2 hidden states [1, seq_len, hidden_dim]
+                - prompt_embeds_mask: Attention mask [1, seq_len]
         """
         pipeline = models["pipeline"]
 
         with torch.no_grad():
-            prompt_embeds, _ = pipeline.encode_prompt(
+            prompt_embeds, prompt_embeds_mask = pipeline.encode_prompt(
                 prompt=prompt,
                 device=device,
             )
 
-        return {
-            "prompt_embeds": prompt_embeds.detach().cpu().to(torch.bfloat16),
-        }
+        # Persist the attention mask encode_prompt returns (as the docstring promises).
+        # Without it, downstream collation falls back to an all-ones mask synthesized from
+        # the embedding's raw sequence length, which is only correct if that length already
+        # equals the true, unpadded prompt length — encode_prompt does not guarantee that.
+        encodings = {"prompt_embeds": prompt_embeds.detach().cpu().to(torch.bfloat16)}
+        if prompt_embeds_mask is not None:
+            encodings["prompt_embeds_mask"] = prompt_embeds_mask.detach().cpu().to(torch.long)
+        return encodings
 
     def verify_latent(
         self,
@@ -230,7 +236,7 @@ class QwenImageProcessor(BaseModelProcessor):
         Returns:
             Dict to save with torch.save()
         """
-        return {
+        cache = {
             # Image latent
             "latent": latent,
             # Text embeddings
@@ -246,3 +252,8 @@ class QwenImageProcessor(BaseModelProcessor):
             # Model info
             "model_type": self.model_type,
         }
+        # Carry the positive-prompt attention mask through to the cache when present, so the
+        # dataset uses the real mask instead of synthesizing an all-ones one downstream.
+        if "prompt_embeds_mask" in text_encodings:
+            cache["prompt_embeds_mask"] = text_encodings["prompt_embeds_mask"]
+        return cache
