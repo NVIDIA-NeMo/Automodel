@@ -187,6 +187,30 @@ def make_parser():
         default=32768,
         help="Maximum length of the tokens to encode. If the text's token length exceeds this, it will be truncated.",
     )
+    parser.add_argument(
+        "--tokens-per-shard",
+        type=_parse_tokens_arg,
+        default=None,
+        help="Rotate output files at document boundaries before this token count.",
+    )
+    parser.add_argument(
+        "--output-prefix",
+        type=str,
+        default="dataset",
+        help="Filename prefix when --tokens-per-shard is enabled.",
+    )
+    parser.add_argument(
+        "--validation-dir",
+        type=str,
+        default=None,
+        help="Optional directory for held-out validation shards.",
+    )
+    parser.add_argument(
+        "--validation-tokens",
+        type=_parse_tokens_arg,
+        default=0,
+        help="Route the first complete documents covering this token budget to validation.",
+    )
     return parser
 
 
@@ -299,6 +323,52 @@ class BinaryDataWriter:
         return self.bytes_written // self.dtype.itemsize
 
 
+class ShardedBinaryDataWriter:
+    """Rotate ``BinaryDataWriter`` instances without splitting documents."""
+
+    def __init__(self, output_dir, prefix, tokens_per_shard, bos_token_id, vocab_size):
+        if tokens_per_shard <= 0 or tokens_per_shard >= 2**31:
+            raise ValueError("tokens_per_shard must be positive and less than 2**31")
+        self.output_dir = output_dir
+        self.prefix = prefix
+        self.tokens_per_shard = int(tokens_per_shard)
+        self.bos_token_id = bos_token_id
+        self.vocab_size = vocab_size
+        self.total_items_written = 0
+        self.shard_index = 0
+        self.writer = None
+        os.makedirs(output_dir, exist_ok=True)
+
+    def _open_writer(self):
+        filename = os.path.join(self.output_dir, f"{self.prefix}_{self.shard_index:05d}.bin")
+        self.writer = BinaryDataWriter(filename, self.bos_token_id, self.vocab_size)
+
+    def write(self, tokens):
+        token_count = len(tokens)
+        if token_count > self.tokens_per_shard:
+            raise ValueError(
+                f"document has {token_count} tokens, exceeding tokens_per_shard={self.tokens_per_shard}"
+            )
+        if self.writer is None:
+            self._open_writer()
+        elif self.writer.items_written and self.writer.items_written + token_count > self.tokens_per_shard:
+            self.writer.close()
+            self.shard_index += 1
+            self._open_writer()
+        written = self.writer.write(tokens)
+        self.total_items_written += token_count
+        return written
+
+    def close(self):
+        if self.writer is not None:
+            self.writer.close()
+            self.writer = None
+
+    @property
+    def items_written(self):
+        return self.total_items_written
+
+
 def dataset_reader(
     dataset_name: str,
     set_name: str,
@@ -398,6 +468,16 @@ def tokenize_chunk(chunk: list[dict], tokenizer_name: str, max_length: int) -> l
     return out
 
 
+def write_tokenized_documents(documents, writer, validation_writer=None, validation_tokens=0):
+    """Route an exact token prefix to validation and later documents to training."""
+    for tokens in documents:
+        if validation_writer is not None and validation_writer.items_written < validation_tokens:
+            remaining = validation_tokens - validation_writer.items_written
+            validation_writer.write(tokens[:remaining])
+        else:
+            writer.write(tokens)
+
+
 def main(args):
     """
     Main function to run the data preprocessing pipeline.
@@ -421,7 +501,7 @@ def main(args):
         output_dir = os.path.join(os.path.dirname(__file__), args.dataset.split("/")[1])
     else:
         output_dir = args.output_dir
-    if args.max_tokens:
+    if args.max_tokens and args.tokens_per_shard is None:
         output_dir += f"_max_tokens_{str(args.max_tokens)}"
 
     os.makedirs(output_dir, exist_ok=True)
@@ -452,53 +532,98 @@ def main(args):
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
-    writer = BinaryDataWriter(
-        os.path.join(output_dir, "dataset.bin"), bos_token_id=tokenizer.bos_token_id, vocab_size=tokenizer.vocab_size
-    )
+    if args.tokens_per_shard is None:
+        writer = BinaryDataWriter(
+            os.path.join(output_dir, "dataset.bin"),
+            bos_token_id=tokenizer.bos_token_id,
+            vocab_size=tokenizer.vocab_size,
+        )
+    else:
+        writer = ShardedBinaryDataWriter(
+            output_dir,
+            args.output_prefix,
+            args.tokens_per_shard,
+            tokenizer.bos_token_id,
+            tokenizer.vocab_size,
+        )
+    validation_writer = None
+    if args.validation_tokens:
+        if args.validation_dir is None:
+            raise ValueError("--validation-dir is required when --validation-tokens is nonzero")
+        if args.tokens_per_shard is None:
+            raise ValueError("--tokens-per-shard is required when writing validation data")
+        validation_writer = ShardedBinaryDataWriter(
+            args.validation_dir,
+            args.output_prefix,
+            min(args.tokens_per_shard, args.validation_tokens),
+            tokenizer.bos_token_id,
+            tokenizer.vocab_size,
+        )
     del tokenizer
 
     # Parallel tokenisation workers
     futures: list[concurrent.futures.Future] = []
-    with concurrent.futures.ProcessPoolExecutor(max_workers=args.num_workers) as executor:
-        # Keep looping until dataset stream is exhausted *and* all futures done.
-        stream_finished = False
-        while not stream_finished or futures:
-            # Pull raw samples from the queue to build chunks
-            while not stream_finished or len(futures) < args.num_workers * args.prefetch:
-                try:
-                    chunk = data_queue.get(block=False)
-                except queue.Empty:  # No new sample available right now - proceed to consume futures.
-                    break
-                if chunk is None:  # Sentinel received - no more data coming.
-                    stream_finished = True
-                    break
-                futures.append(executor.submit(tokenize_chunk, chunk, args.tokenizer, args.max_length))
+    try:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=args.num_workers) as executor:
+            # Keep looping until dataset stream is exhausted *and* all futures done.
+            stream_finished = False
+            while not stream_finished or futures:
+                # Pull raw samples from the queue to build chunks.
+                while not stream_finished and len(futures) < args.num_workers * args.prefetch:
+                    try:
+                        chunk = data_queue.get(block=False)
+                    except queue.Empty:  # No new sample available right now - proceed to consume futures.
+                        break
+                    if chunk is None:  # Sentinel received - no more data coming.
+                        stream_finished = True
+                        break
+                    futures.append(executor.submit(tokenize_chunk, chunk, args.tokenizer, args.max_length))
 
-            # Consume completed futures to write tokens to disk
-            max_i = 0
-            for i in range(len(futures)):
-                if not futures[i].done():  # early exit if future is not done
+                # Consume completed futures in submission order for deterministic routing.
+                max_i = 0
+                for i in range(len(futures)):
+                    if not futures[i].done():
+                        break
+                    write_tokenized_documents(
+                        futures[i].result(),
+                        writer,
+                        validation_writer,
+                        args.validation_tokens,
+                    )
+                    max_i = i + 1
+                futures = futures[max_i:]
+
+                # Stop after the requested number of training tokens; validation
+                # is an additional held-out prefix and is never counted here.
+                if writer.items_written >= args.max_tokens:
+                    for fut in futures:
+                        fut.cancel()
                     break
-                for tokens in futures[i].result():
-                    writer.write(tokens)
-                max_i = i + 1
-            futures = futures[max_i:]
+    finally:
+        writer.close()
+        if validation_writer is not None:
+            validation_writer.close()
+        del futures
+        # Explicitly close queue to prevent leaked semaphores at interpreter shutdown.
+        if reader_proc.is_alive():
+            reader_proc.terminate()
+            reader_proc.join()
+        assert not reader_proc.is_alive()
+        data_queue.close()
+        data_queue.join_thread()
 
-            # Stop early if token budget exhausted
-            if writer.items_written >= args.max_tokens:
-                for fut in futures:
-                    fut.cancel()
-                break
-
-    del futures
-    # Explicitly close queue to prevent leaked semaphores at interpreter shutdown.
-    if reader_proc.is_alive():
-        reader_proc.terminate()
-        reader_proc.join()
-    assert not reader_proc.is_alive()
-    # close queue
-    data_queue.close()
-    data_queue.join_thread()
+    manifest = {
+        "dataset": args.dataset,
+        "set_name": args.set_name,
+        "split": args.split,
+        "tokenizer": args.tokenizer,
+        "training_tokens": writer.items_written,
+        "validation_tokens": validation_writer.items_written if validation_writer is not None else 0,
+        "tokens_per_shard": int(args.tokens_per_shard) if args.tokens_per_shard is not None else None,
+        "output_prefix": args.output_prefix,
+    }
+    with open(os.path.join(output_dir, "manifest.json"), "w") as f:
+        json.dump(manifest, f, indent=4)
 
 
 if __name__ == "__main__":

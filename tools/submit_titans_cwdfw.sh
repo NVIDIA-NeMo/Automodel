@@ -16,17 +16,27 @@ for argument in "$@"; do
     --pilot)
       MODE=pilot
       ;;
+    --full)
+      MODE=full
+      ;;
     --wait)
       WAIT=true
       ;;
     *)
-      echo "usage: $0 [--pilot] [--wait]" >&2
+      echo "usage: $0 [--pilot|--full] [--wait]" >&2
       exit 2
       ;;
   esac
 done
 
-if [[ $MODE == pilot ]]; then
+if [[ $MODE == full ]]; then
+  SBATCH_SCRIPT=examples/llm_pretrain/slurm/cwdfw_titans_fineweb_edu_full_prepare.sbatch
+  JOB_NAME=titans-full-data
+  PARTITION=batch
+  CPUS_PER_TASK=128
+  GPUS=8
+  TIME_LIMIT=4:00:00
+elif [[ $MODE == pilot ]]; then
   SBATCH_SCRIPT=examples/llm_pretrain/slurm/cwdfw_titans_170m_pilot.sbatch
   JOB_NAME=titans-170m-pilot
   PARTITION=batch

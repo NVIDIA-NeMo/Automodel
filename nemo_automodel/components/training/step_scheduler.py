@@ -72,6 +72,7 @@ class StepScheduler(Stateful):
         start_epoch: int = 0,
         num_epochs: Optional[int] = None,
         max_steps: Optional[int] = None,
+        max_steps_per_run: Optional[int] = None,
     ):
         """
         Initialize the StepScheduler.
@@ -94,6 +95,10 @@ class StepScheduler(Stateful):
             start_epoch (int): Initial epoch. Used when resuming from checkpoint. Default: 0.
             num_epochs (Optional[int]): Total number of epochs. Default: None or calculated from max_steps if num_epochs is None or 10 if max_steps and num_epochs are both None.
             max_steps (Optional[int]): Maximum number of steps to run. If None, calculated from num_epochs.
+            max_steps_per_run (Optional[int]): Stop after this many additional
+                optimizer steps while preserving ``max_steps`` as the global
+                training and LR-schedule horizon. The boundary triggers a
+                checkpoint and is recomputed when checkpoint state is loaded.
         """
         if global_batch_size <= 0:
             raise ValueError(f"global_batch_size must be greater than 0, got {global_batch_size}")
@@ -158,6 +163,10 @@ class StepScheduler(Stateful):
         self.max_steps = max_steps
         if max_steps <= 0:
             raise ValueError(f"max_steps must be greater than 0, got {max_steps}")
+        if max_steps_per_run is not None and max_steps_per_run <= 0:
+            raise ValueError(f"max_steps_per_run must be greater than 0 if provided, got {max_steps_per_run}")
+        self.max_steps_per_run = max_steps_per_run
+        self._set_run_stop_step()
 
         if ckpt_every_steps is None:
             if self.epoch_len is None:
@@ -173,6 +182,13 @@ class StepScheduler(Stateful):
         self.sig_handler = DistributedSignalHandler().__enter__()
         self.sigterm_flag = False
 
+    def _set_run_stop_step(self) -> None:
+        """Set this process invocation's exclusive global-step boundary."""
+        if self.max_steps_per_run is None:
+            self.run_stop_step = self.max_steps
+        else:
+            self.run_stop_step = min(self.max_steps, self.step + self.max_steps_per_run)
+
     def __iter__(self):
         """
         Iterates over dataloader while keeping track of counters.
@@ -183,7 +199,7 @@ class StepScheduler(Stateful):
         Yields:
             dict: batch
         """
-        if self.step >= self.max_steps:
+        if self.step >= self.run_stop_step:
             return
         batch_buffer = []
         for batch in self.dataloader:
@@ -192,7 +208,7 @@ class StepScheduler(Stateful):
                 yield batch_buffer
                 self.step += 1
                 batch_buffer = []
-                if self.step >= self.max_steps or self.sigterm_flag:
+                if self.step >= self.run_stop_step or self.sigterm_flag:
                     return
         if batch_buffer:
             yield batch_buffer
@@ -234,7 +250,7 @@ class StepScheduler(Stateful):
         """
         is_ckpt_step = (self.step % self.ckpt_every_steps) == self.ckpt_every_steps - 1
         is_epoch_boundary = self.save_checkpoint_every_epoch and self.is_last_batch
-        return is_ckpt_step or is_epoch_boundary or self.is_last_step or self.sigterm_received
+        return is_ckpt_step or is_epoch_boundary or self.is_last_step or self.is_last_run_step or self.sigterm_received
 
     @property
     def is_gc_step(self):
@@ -268,6 +284,11 @@ class StepScheduler(Stateful):
         return False
 
     @property
+    def is_last_run_step(self) -> bool:
+        """Whether the yielded step reaches this invocation's boundary."""
+        return self.step + 1 >= self.run_stop_step
+
+    @property
     def is_last_batch(self):
         """
         Returns whether this is the last batch for this epoch.
@@ -294,7 +315,7 @@ class StepScheduler(Stateful):
         """
         epoch = self.epoch
         for e in range(epoch, self.num_epochs):
-            if self.step >= self.max_steps or self.sigterm_received:
+            if self.step >= self.run_stop_step or self.sigterm_received:
                 return
             yield e
 
@@ -319,6 +340,7 @@ class StepScheduler(Stateful):
             s (dict): Dictionary containing 'step' and 'epoch'.
         """
         self.step, self.epoch = s["step"], s["epoch"]
+        self._set_run_stop_step()
 
 
 # ---------------------------------------------------------------------------
@@ -340,6 +362,8 @@ class StepSchedulerConfig:
             derives it from ``max_steps``.  Default: 10.
         max_steps: Hard cap on optimizer steps.  ``None`` means derive from
             ``num_epochs * epoch_len``.
+        max_steps_per_run: Optional cap on additional optimizer steps in one
+            process invocation, for wall-time-bounded resumable jobs.
         ckpt_every_steps: Save a checkpoint every N optimizer steps.
             ``None`` defaults to once per epoch.
         save_checkpoint_every_epoch: Also checkpoint at every epoch boundary.
@@ -357,6 +381,7 @@ class StepSchedulerConfig:
     global_batch_size: int = 32
     num_epochs: int | None = 10
     max_steps: int | None = None
+    max_steps_per_run: int | None = None
     ckpt_every_steps: int | None = 100
     save_checkpoint_every_epoch: bool = True
     val_every_steps: int | None = None

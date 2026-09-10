@@ -88,7 +88,11 @@ Validated on 2026-09-08 with RTX 6000 Ada GPUs:
   fixed. Checkpointing reduced the measured allocation to about 22.4 GiB/H100,
   but the per-chunk Python reference backend then exceeded the 30-minute NCCL
   watchdog. The production recipe now selects the vectorized public backend
-  and its Triton associative scan; that path still requires this gate.
+  and its Triton associative scan.
+- cw-dfw job `18245782` completed the ten-step production-shaped pilot on
+  2026-09-09: 5,242,880 FineWeb-Edu tokens, loss 16.2104 → 8.5571,
+  approximately 89.5K aggregate tokens/s, 4.51 GiB/GPU peak allocation,
+  finite distributed validation, and a resumable checkpoint.
 
 The next execution gate is a full-shape, 4096-token, one-node FSDP2 smoke on
 the target cluster. Do not start the 15B-token run until that job establishes
@@ -123,6 +127,21 @@ cached 64M-token shard is absent. It then trains on 5,242,880 tokens, validates
 distributed control flow, and writes a job-specific checkpoint. Dataset
 preparation uses the GPU allocation because `cw-dfw` does not currently grant
 this account CPU-partition capacity. The pilot is not a paper result.
+
+The full run uses the same wrapper after the pilot gate:
+
+```bash
+tools/submit_titans_cwdfw.sh --full
+```
+
+The first job creates sixteen document-aligned ~1B-token training shards from
+FineWeb-Edu `sample-100BT` and one exact 4,194,304-token held-out shard. It then
+starts a chain of 1,800-step jobs against one fixed checkpoint directory.
+AutoModel restores model, optimizer, LR scheduler, dataloader, RNG, and global
+step from `LATEST`; the global cosine horizon remains 28,610 steps across every
+segment. W&B uses the stable run ID `titans170m15bv1`:
+
+<https://wandb.ai/nvidia/titans-paper-reproduction/runs/titans170m15bv1>
 
 Defaults:
 

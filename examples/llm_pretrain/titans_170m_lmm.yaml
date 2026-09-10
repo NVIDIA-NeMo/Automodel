@@ -78,7 +78,9 @@ validation_dataset:
   file_pattern: "${TITANS_DATA_ROOT}/validation/fineweb_edu_*.bin"
   seq_len: 4096
   shuffle_files: false
-  align_to_bos: true
+  # Equal contiguous ranges keep every distributed rank on the same number of
+  # validation collectives; the held-out shard is exactly world_size aligned.
+  align_to_bos: false
   bos_token: 1
   repeat: false
 

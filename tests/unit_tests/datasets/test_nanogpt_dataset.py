@@ -17,6 +17,7 @@ from unittest.mock import Mock, patch
 
 import numpy as np
 import torch
+from torchdata.stateful_dataloader import StatefulDataLoader
 
 from nemo_automodel.components.datasets.llm.nanogpt_dataset import (
     MAGIC,
@@ -27,7 +28,11 @@ from nemo_automodel.components.datasets.llm.nanogpt_dataset import (
     _get_worker_id_and_total_workers,
     load_bin_shard,
 )
-from tools.nanogpt_data_processor import BinaryDataWriter
+from tools.nanogpt_data_processor import (
+    BinaryDataWriter,
+    ShardedBinaryDataWriter,
+    write_tokenized_documents,
+)
 
 
 def _make_fake_shard(tmpdir: Path, tokens: np.ndarray) -> Path:
@@ -96,6 +101,48 @@ def test_binary_writer_bos_index_round_trip(tmp_path):
     assert sample["labels"] == [2, 3, bos, 4]
 
 
+def test_sharded_binary_writer_rotates_on_document_boundaries(tmp_path):
+    writer = ShardedBinaryDataWriter(
+        tmp_path,
+        prefix="fineweb_edu",
+        tokens_per_shard=6,
+        bos_token_id=1,
+        vocab_size=32_000,
+    )
+    writer.write([1, 2, 3])
+    writer.write([1, 4, 5])
+    writer.write([1, 6, 7, 8])
+    writer.close()
+
+    shards = sorted(tmp_path.glob("fineweb_edu_*.bin"))
+    assert [len(load_bin_shard(shard)) for shard in shards] == [6, 4]
+    assert [np.fromfile(shard.with_suffix(".bos.idx"), dtype=np.int32).tolist() for shard in shards] == [
+        [0, 3],
+        [0],
+    ]
+    assert writer.items_written == 10
+
+
+def test_tokenized_document_routing_writes_exact_heldout_prefix(tmp_path):
+    train = ShardedBinaryDataWriter(tmp_path / "train", "fineweb_edu", 10, 1, 32_000)
+    validation = ShardedBinaryDataWriter(tmp_path / "validation", "fineweb_edu", 5, 1, 32_000)
+
+    write_tokenized_documents(
+        [[1, 2, 3], [1, 4, 5, 6], [1, 7, 8]],
+        train,
+        validation,
+        validation_tokens=5,
+    )
+    train.close()
+    validation.close()
+
+    validation_tokens = load_bin_shard(tmp_path / "validation/fineweb_edu_00000.bin")
+    train_tokens = load_bin_shard(tmp_path / "train/fineweb_edu_00000.bin")
+    assert validation_tokens.tolist() == [1, 2, 3, 1, 4]
+    # The rest of the boundary document is discarded, preventing split leakage.
+    assert train_tokens.tolist() == [1, 7, 8]
+
+
 def test_nanogpt_dataset_len():
     # Test that __len__ raises NotImplementedError
     bos = 50256
@@ -119,6 +166,25 @@ def test_nanogpt_dataset_can_stop_after_one_pass(tmp_path):
     samples = [sample for sample in NanogptDataset(str(shard), seq_len=4, repeat=False)]
 
     assert len(samples) == 2
+
+
+def test_nanogpt_dataset_stateful_loader_resumes_next_sample(tmp_path):
+    shard = _make_fake_shard(tmp_path, np.arange(25, dtype=np.uint16))
+    reference = NanogptDataset(str(shard), seq_len=4, repeat=True)
+    reference_loader = StatefulDataLoader(reference, batch_size=None)
+    reference_iterator = iter(reference_loader)
+    next(reference_iterator)
+    next(reference_iterator)
+    loader_state = reference_loader.state_dict()
+    expected = next(reference_iterator)
+
+    resumed = StatefulDataLoader(
+        NanogptDataset(str(shard), seq_len=4, repeat=True),
+        batch_size=None,
+    )
+    resumed.load_state_dict(loader_state)
+
+    assert next(iter(resumed)) == expected
 
 
 def test_load_bin_shard():

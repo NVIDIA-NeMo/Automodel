@@ -141,6 +141,45 @@ def test_resume(max_steps, ckpt_every_steps):
     assert len(ref_outputs) == 0
 
 
+def test_max_steps_per_run_stops_and_checkpoints_across_resume():
+    dataloader = SizedDataLoader(num_batches=20)
+
+    def build():
+        return StepScheduler(
+            global_batch_size=1,
+            local_batch_size=1,
+            dp_size=1,
+            ckpt_every_steps=100,
+            dataloader=dataloader,
+            num_epochs=1,
+            max_steps=10,
+            max_steps_per_run=3,
+        )
+
+    first = build()
+    first_steps = []
+    first_state = None
+    for _ in first:
+        first_steps.append((first.step, first.is_ckpt_step, first.is_last_step))
+        if first.is_ckpt_step:
+            first_state = first.state_dict()
+
+    assert first_steps == [(0, False, False), (1, False, False), (2, True, False)]
+    assert first_state == {"step": 3, "epoch": 0}
+
+    resumed = build()
+    resumed.load_state_dict(first_state)
+    resumed_steps = []
+    resumed_state = None
+    for _ in resumed:
+        resumed_steps.append((resumed.step, resumed.is_ckpt_step, resumed.is_last_step))
+        if resumed.is_ckpt_step:
+            resumed_state = resumed.state_dict()
+
+    assert resumed_steps == [(3, False, False), (4, False, False), (5, True, False)]
+    assert resumed_state == {"step": 6, "epoch": 0}
+
+
 @pytest.mark.parametrize(
     "max_steps, ckpt_every_steps, global_batch_size, local_batch_size, is_ckpt_step",
     [

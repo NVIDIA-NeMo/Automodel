@@ -128,11 +128,9 @@ def _find_next_bos_with_index(bos_positions: np.ndarray, start_pos: int, max_pos
     Returns:
         Position of next BOS token, or max_pos if none found.
     """
-    # Find BOS positions that are >= start_pos and < max_pos
-    valid_positions = bos_positions[(bos_positions >= start_pos) & (bos_positions < max_pos)]
-
-    if len(valid_positions) > 0:
-        return int(valid_positions[0])
+    index = int(np.searchsorted(bos_positions, start_pos, side="left"))
+    if index < len(bos_positions) and bos_positions[index] < max_pos:
+        return int(bos_positions[index])
 
     return max_pos
 
@@ -315,6 +313,8 @@ class NanogptDataset(IterableDataset):
         self.shuffle_files = shuffle_files
         self.align_to_bos = align_to_bos
         self.repeat = repeat
+        self._num_yielded = 0
+        self._resume_samples = 0
         if self.align_to_bos and bos_token is None:
             raise ValueError("bos_token must be provided when align_to_bos is True")
         self.bos_token = bos_token
@@ -328,14 +328,11 @@ class NanogptDataset(IterableDataset):
         """
         # Worker-specific setup
         worker = get_worker_info()
-        rng = random.Random()
-        if worker is not None:
-            # Ensure each worker gets a *different* but deterministic view by seeding based on worker_id.
-            rng.seed(worker.id + 12345)
-        else:
-            rng.seed(os.getpid())
-
         global_worker_id, total_workers = _get_worker_id_and_total_workers(worker)
+        rng = random.Random()
+        # Every DDP × DataLoader worker must reconstruct the same file order on
+        # resume before fast-forwarding its saved sample cursor.
+        rng.seed(global_worker_id + 12345)
         # Slice the file list so that each global worker gets roughly equal number of shards.
         worker_files = files[global_worker_id::total_workers].copy()
         if not worker_files:
@@ -357,7 +354,12 @@ class NanogptDataset(IterableDataset):
         return worker_files, rng, split_single_file, file_start_pos, file_end_pos
 
     def _process_file_tokens(
-        self, file: str, split_single_file: bool, file_start_pos: int, file_end_pos: int
+        self,
+        file: str,
+        split_single_file: bool,
+        file_start_pos: int,
+        file_end_pos: int,
+        skip_samples: int = 0,
     ) -> Iterator[dict]:
         """
         Process tokens from a single file and yield training samples.
@@ -397,18 +399,27 @@ class NanogptDataset(IterableDataset):
             end = pos + self.seq_len + 1  # +1 for target shift
             if end > max_pos:
                 break
+            # Advance
+            if self.align_to_bos:
+                # Find next BOS token for the start of the next sample
+                next_pos = _get_next_bos_position(tokens, self.bos_token, bos_positions, end, max_pos)
+            else:
+                next_pos = end
+
+            if skip_samples:
+                skip_samples -= 1
+                pos = next_pos
+                continue
+
             buf = tokens[pos:end]
             assert len(buf) == self.seq_len + 1
             inputs = buf[:-1].to(torch.int32).tolist()
             labels = buf[1:].to(torch.int64).tolist()
+            self._num_yielded += 1
             yield dict(input_ids=inputs, labels=labels)
+            pos = next_pos
 
-            # Advance
-            if self.align_to_bos:
-                # Find next BOS token for the start of the next sample
-                pos = _get_next_bos_position(tokens, self.bos_token, bos_positions, end, max_pos)
-            else:
-                pos = end
+        return skip_samples
 
     def _get_file_iterator(
         self,
@@ -417,6 +428,7 @@ class NanogptDataset(IterableDataset):
         split_single_file: bool,
         file_start_pos: int,
         file_end_pos: int,
+        skip_samples: int = 0,
     ) -> Iterator[dict]:
         """
         Generate training samples from all assigned files, handling infinite iteration.
@@ -433,7 +445,13 @@ class NanogptDataset(IterableDataset):
         """
         while True:
             for file in worker_files:
-                yield from self._process_file_tokens(file, split_single_file, file_start_pos, file_end_pos)
+                skip_samples = yield from self._process_file_tokens(
+                    file,
+                    split_single_file,
+                    file_start_pos,
+                    file_end_pos,
+                    skip_samples,
+                )
 
             if not self.repeat:
                 return
@@ -452,7 +470,25 @@ class NanogptDataset(IterableDataset):
             self.files, self.shuffle_files
         )
 
-        yield from self._get_file_iterator(worker_files, rng, split_single_file, file_start_pos, file_end_pos)
+        skip_samples = self._resume_samples
+        self._resume_samples = 0
+        yield from self._get_file_iterator(
+            worker_files,
+            rng,
+            split_single_file,
+            file_start_pos,
+            file_end_pos,
+            skip_samples,
+        )
+
+    def state_dict(self) -> dict[str, int]:
+        """Return the process-local sample cursor for StatefulDataLoader."""
+        return {"num_yielded": self._num_yielded}
+
+    def load_state_dict(self, state_dict: dict[str, int]) -> None:
+        """Restore by fast-forwarding positions without materializing skipped samples."""
+        self._num_yielded = int(state_dict["num_yielded"])
+        self._resume_samples = self._num_yielded
 
     def __len__(self) -> int:  # type: ignore[override]
         raise NotImplementedError("__len__ is not implemented for NanogptDataset.")
