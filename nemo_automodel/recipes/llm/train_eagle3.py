@@ -51,9 +51,9 @@ from nemo_automodel.components.datasets.llm.eagle3_cache import (
     read_manifest,
 )
 from nemo_automodel.components.datasets.llm.offline_cache import ensure_supervision_options_match
+from nemo_automodel.components.distributed.ddp import fp32_allreduce_hook
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
-from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
-from nemo_automodel.components.distributed.tp_replicas import broadcast_tp_replicas, synchronize_tp_replica_gradients
+from nemo_automodel.components.distributed.mesh_utils import get_dp_tp_group, get_flat_mesh
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.wandb_utils import init_wandb_run, suppress_wandb_log_messages
 from nemo_automodel.components.models.common import BackendConfig
@@ -744,29 +744,21 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                 lk_kl_decay=float(recipe_cfg.get("lk_kl_decay", 3.0)),
             ).to(self.device)
         if self.dist_env.world_size > 1:
-            # Under context parallelism the draft is replicated across cp ranks
-            # (it runs on the full gathered sequence), so restrict the gradient
-            # all-reduce to the dp sub-axis to avoid redundant cp all-reduces.
-            # With cp_size==1 the dp group spans the whole world -> process_group
-            # is None -> today's full-world DDP, unchanged.
-            dp_process_group = (
-                self.dp_mesh.get_group()
-                if self.dp_mesh is not None and self.dp_mesh.size() < self.dist_env.world_size
-                else None
-            )
+            # DDP owns means across DP and TP. CP is deliberately excluded:
+            # the draft's existing CP path sums its partial contributions.
             trainer_module = DistributedDataParallel(
                 trainer_module,
                 device_ids=[self.device.index] if self.device.type == "cuda" else None,
                 output_device=self.device.index if self.device.type == "cuda" else None,
-                broadcast_buffers=False,
+                broadcast_buffers=True,
                 find_unused_parameters=False,
-                process_group=dp_process_group,
+                process_group=get_dp_tp_group(self.device_mesh),
             )
+            # Include buffers in DDP's initialization sync, not in every forward.
+            trainer_module.broadcast_buffers = False
+            if self.device_mesh is not None and self.device_mesh["tp"].size() > 1:
+                trainer_module.register_comm_hook(trainer_module.process_group, fp32_allreduce_hook)
         self.trainer_module = trainer_module
-        # DDP broadcasts only inside the DP subgroup. The draft is replicated
-        # across TP, so align those independently initialized copies before the
-        # optimizer captures them and TP replica gradients are averaged.
-        broadcast_tp_replicas([self.trainer_module], self.device_mesh)
 
         opt_cfg = self.cfg.optimizer
         self.peak_lr = float(opt_cfg.lr)
@@ -1157,8 +1149,9 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             self.device_mesh = self.dist_setup.mesh_context.device_mesh
             self.moe_mesh = self.dist_setup.mesh_context.moe_mesh
             # Capture the cp/dp submeshes: the target forward runs CP on "cp",
-            # while the draft DDP group, dataloader sampler, and checkpointer key
-            # on "dp" (cp ranks within a dp group share data and draft weights).
+            # while the dataloader sampler and checkpointer key on "dp".
+            # Draft DDP includes both DP and TP; its CP gradients are summed
+            # separately after backward.
             # Tensor parallelism (distributed.tp_size>1) needs no submesh here: the
             # target's linears are sharded in place by ``from_pretrained`` below
             # (its FSDP2 parallelize plan), the wrapper gathers the resulting
@@ -1457,8 +1450,8 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
 
         The draft runs sequence-sharded across cp, so each rank holds only its shard's
         gradient contribution; summing yields the full-sequence gradient (the loss is
-        already globally normalized by the trainer). DDP has averaged over dp, and
-        sum-over-cp / avg-over-dp commute, so the cp replicas end up identical.
+        already globally normalized by the trainer). DDP has averaged over DP/TP,
+        which commutes with the CP sum.
         """
         for p in self._module().parameters():
             if p.grad is not None:
@@ -2071,10 +2064,6 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                     if pending_micro_batches == self.grad_accumulation_steps:
                         if getattr(self, "cp_group", None) is not None:
                             self._all_reduce_draft_grads_over_cp()
-                        synchronize_tp_replica_gradients(
-                            [self.trainer_module],
-                            getattr(self, "device_mesh", None),
-                        )
                         grad_norm = torch.nn.utils.clip_grad_norm_(self.trainer_module.parameters(), self.max_grad_norm)
                         self.optimizer.step()
                         self.lr_scheduler.step()
@@ -2168,10 +2157,6 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                 # cp replicas of the draft desync permanently from here on.
                 if getattr(self, "cp_group", None) is not None:
                     self._all_reduce_draft_grads_over_cp()
-                synchronize_tp_replica_gradients(
-                    [self.trainer_module],
-                    getattr(self, "device_mesh", None),
-                )
                 scale = float(self.grad_accumulation_steps) / float(pending_micro_batches)
                 for p in self.trainer_module.parameters():
                     if p.grad is not None:

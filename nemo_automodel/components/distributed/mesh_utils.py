@@ -38,6 +38,7 @@ __all__ = [
     "get_flat_mesh",
     "get_submesh",
     "get_fsdp_dp_mesh",
+    "get_dp_tp_group",
 ]
 
 
@@ -545,6 +546,31 @@ def get_submesh(device_mesh: "DeviceMesh", names: tuple) -> "DeviceMesh":
         f"No parent flattened mesh found for dims {names} with target size {target}. "
         f"Available: {set(root._flatten_mapping)}"
     )
+
+
+def get_dp_tp_group(device_mesh: DeviceMesh | None) -> dist.ProcessGroup | None:
+    """Return the DDP group for a model replicated over both DP and TP.
+
+    This differs from the data-sampling group: TP columns consume the same
+    samples but still need identical initialization and optimizer updates.
+    Averaging across DP and TP is equivalent to DP-mean followed by TP-mean.
+    CP and PP coordinates stay separate because their gradients may represent
+    partial contributions or different parameters.
+
+    Args:
+        device_mesh: Root FSDP2/Megatron mesh, or None for ordinary world DDP.
+
+    Returns:
+        Process group spanning DP and TP at the current CP/PP coordinate, or
+        None when the default world group already has those exact ranks.
+    """
+    if device_mesh is None:
+        return None
+    axes = tuple(axis for axis in device_mesh.mesh_dim_names if axis not in ("pp", "cp"))
+    replica_mesh = device_mesh[axes]
+    if replica_mesh.size() == dist.get_world_size():
+        return None
+    return replica_mesh._flatten().get_group()
 
 
 def get_fsdp_dp_mesh(

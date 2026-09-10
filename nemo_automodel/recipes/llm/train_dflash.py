@@ -49,9 +49,9 @@ from nemo_automodel.components.checkpoint.checkpointing import (
 from nemo_automodel.components.checkpoint.utils import find_latest_checkpoint, resolve_restore_from_to_checkpoint_dir
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.eagle3 import build_eagle3_dataloader
+from nemo_automodel.components.distributed.ddp import fp32_allreduce_hook
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
-from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
-from nemo_automodel.components.distributed.tp_replicas import broadcast_tp_replicas, synchronize_tp_replica_gradients
+from nemo_automodel.components.distributed.mesh_utils import get_dp_tp_group, get_flat_mesh
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.wandb_utils import init_wandb_run, suppress_wandb_log_messages
 from nemo_automodel.components.speculative.dflash.core import DFlashTrainerModule, NoValidAnchorsError
@@ -334,21 +334,21 @@ class TrainDFlashRecipe(BaseRecipe):
             # The frozen target lm_head / embed_tokens are held as non-registered
             # references on the trainer, so DDP only sees the plain draft params
             # (no sharded DTensor params to broadcast). The draft's gradient
-            # all-reduce is restricted to the "dp" sub-axis (see
-            # ``_draft_ddp_process_group``).
+            # all-reduce includes both DP and TP replicas (see
+            # ``_draft_ddp_process_group``); sampling still uses DP only.
             trainer_module = DistributedDataParallel(
                 trainer_module,
                 device_ids=[self.device.index] if self.device.type == "cuda" else None,
                 output_device=self.device.index if self.device.type == "cuda" else None,
-                broadcast_buffers=False,
+                broadcast_buffers=True,
                 find_unused_parameters=False,
                 process_group=self._draft_ddp_process_group(),
             )
+            # Include buffers in DDP's initialization sync, not in every forward.
+            trainer_module.broadcast_buffers = False
+            if self.device_mesh is not None and self.device_mesh["tp"].size() > 1:
+                trainer_module.register_comm_hook(trainer_module.process_group, fp32_allreduce_hook)
         self.trainer_module = trainer_module
-        # DDP broadcasts only inside the DP subgroup. The draft is replicated
-        # across TP, so align those independently initialized copies before the
-        # optimizer captures them and TP replica gradients are averaged.
-        broadcast_tp_replicas([self.trainer_module], self.device_mesh)
 
         opt_cfg = self.cfg.optimizer
         self.peak_lr = float(opt_cfg.lr)
@@ -497,17 +497,8 @@ class TrainDFlashRecipe(BaseRecipe):
         return target_model
 
     def _draft_ddp_process_group(self):
-        """Process group for the draft's gradient all-reduce.
-
-        With tensor parallelism the draft is replicated across tp ranks, so a
-        full-world all-reduce would average duplicate gradients; restrict it to
-        the "dp" sub-axis (which excludes tp) so it reduces only across real data
-        replicas. Without a mesh (tp_size=1) ``dp_mesh`` is None -> return None ->
-        the default full-world group, unchanged.
-        """
-        if self.dp_mesh is not None and self.dp_mesh.size() < self.dist_env.world_size:
-            return self.dp_mesh.get_group()
-        return None
+        """Let DDP initialize and mean-reduce every DP/TP draft replica."""
+        return get_dp_tp_group(self.device_mesh)
 
     def _build_target_wrapper(self, target_layer_ids: list[int]) -> HFDFlashTargetModel:
         """Build the frozen-target hidden-state capture wrapper.
@@ -1093,10 +1084,6 @@ class TrainDFlashRecipe(BaseRecipe):
                     pending_micro_batches += 1
 
                     if pending_micro_batches == self.grad_accumulation_steps:
-                        synchronize_tp_replica_gradients(
-                            [self.trainer_module],
-                            getattr(self, "device_mesh", None),
-                        )
                         torch.nn.utils.clip_grad_norm_(self.trainer_module.parameters(), self.max_grad_norm)
                         self.optimizer.step()
                         self.optimizer.zero_grad(set_to_none=True)
@@ -1154,10 +1141,6 @@ class TrainDFlashRecipe(BaseRecipe):
                 # Flush the trailing partial accumulation window (see EAGLE recipes
                 # for the rescale rationale).
                 if pending_micro_batches > 0:
-                    synchronize_tp_replica_gradients(
-                        [self.trainer_module],
-                        getattr(self, "device_mesh", None),
-                    )
                     scale = float(self.grad_accumulation_steps) / float(pending_micro_batches)
                     for p in self.trainer_module.parameters():
                         if p.grad is not None:

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Characterize replicated DTensor parameters; experimental, not a replacement fix.
+"""Regression coverage for DTensor replica contracts and native-owner exclusion.
 
 Equivalent to TorchTitan's NoParallel boundaries for a tiny linear layer. A
 controlled rank-dependent upstream gradient stands in for divergent computation;
