@@ -297,18 +297,6 @@ def dequantize_checkpoint_weight(
     return output
 
 
-def _scale_to_float(scale: torch.Tensor) -> torch.Tensor:
-    """Decode an ``e8m0`` (or any float) scale tensor to fp32.
-
-    ``e8m0`` stores ``2 ** (bits - 127)`` with ``bits == 0`` meaning zero; decode
-    explicitly so the adapter does not depend on PyTorch's e8m0 cast support.
-    """
-    if scale.dtype == torch.float8_e8m0fnu:
-        bits = scale.contiguous().view(torch.uint8).int()
-        return torch.where(bits == 0, torch.zeros_like(bits, dtype=torch.float32), torch.pow(2.0, (bits - 127).float()))
-    return scale.to(torch.float32)
-
-
 def infer_fp8_block_size(weight_shape: tuple[int, ...], scale_shape: tuple[int, ...]) -> int:
     """Return the square block size that maps ``weight_shape`` onto ``scale_shape``."""
     rows, cols = weight_shape[-2], weight_shape[-1]
@@ -341,7 +329,9 @@ def dequantize_fp8_blocks(
     block_size = infer_fp8_block_size(tuple(weight.shape), tuple(scale.shape))
     if block_size == FP8_BLOCK_SIZE:
         return dequantize_checkpoint_weight(weight, scale, dtype=dtype)
-    scale_f32 = _scale_to_float(scale.to_local() if is_dtensor(scale) else scale)
+    # Use the same dtype conversion as the released 32x32 decoder: E8M0
+    # byte 0 is 2**-127, and byte 255 represents NaN.
+    scale_f32 = (scale.to_local() if is_dtensor(scale) else scale).float()
     if is_dtensor(weight) or is_dtensor(scale):
         # Let the shared V3 helper handle DTensor slicing of the scale grid.
         return dequantize_from_fp8(weight, scale_f32, dtype=dtype, BLOCK_SIZE=block_size, name=name)
