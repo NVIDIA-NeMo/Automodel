@@ -132,7 +132,7 @@ class DeepseekV41Model(nn.Module):
             raise ValueError("DeepSeek V4.1 requires MoEConfig.combine_in_fp32=True for released expert arithmetic")
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, dtype=model_dtype)
-        active_engram = config.engram_enabled and any(i < config.num_hidden_layers for i in config.engram_layer_ids)
+        active_engram = any(i < config.num_hidden_layers for i in config.engram_layer_ids)
         if active_engram and tokenizer is None:
             raise ValueError("DeepSeek V4.1 Engram requires its original fast tokenizer for compressed N-gram hashing")
         self.engram_layout = EngramLayout.from_config(config) if active_engram else None
@@ -327,11 +327,7 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
         )
         if engram_process_group is None and dist.is_available() and dist.is_initialized():
             engram_process_group = dist.group.WORLD
-        if (
-            tokenizer is None
-            and config.engram_enabled
-            and any(i < config.num_hidden_layers for i in config.engram_layer_ids)
-        ):
+        if tokenizer is None and any(i < config.num_hidden_layers for i in config.engram_layer_ids):
             tokenizer = config.build_tokenizer()
         self.model = DeepseekV41Model(
             config,

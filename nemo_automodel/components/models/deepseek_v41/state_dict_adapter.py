@@ -312,7 +312,7 @@ class DeepSeekV41StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
         self.backend = backend
         self.dtype = dtype
         self._uses_model_prefix = True
-        self.engram_enabled = bool(config.engram_enabled) and bool(config.engram_layer_ids)
+        self.engram_enabled = bool(config.engram_layer_ids)
         self._engram_rows = dict(zip(config.engram_layer_ids, config.engram_num_embeddings))
 
     def get_hf_state_dict_keys(self, state_dict: dict[str, Any]) -> list[str]:

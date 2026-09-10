@@ -165,7 +165,7 @@ class EngramLayout:
     @classmethod
     def from_config(cls, config: DeepseekV41Config) -> EngramLayout | None:
         layer_ids = tuple(int(i) for i in config.engram_layer_ids)
-        if not layer_ids or not config.engram_enabled:
+        if not layer_ids:
             return None
         max_ngram_size, n_heads = int(config.engram_max_ngram_size), int(config.engram_n_heads)
         primes: list[tuple[tuple[int, ...], ...]] = []

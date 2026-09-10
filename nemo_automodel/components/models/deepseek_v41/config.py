@@ -182,10 +182,6 @@ class DeepseekV41Config(PretrainedConfig):
         # Multimodal bridge metadata; zero vision layers disable the tower
         image_token_id: int = 129264,
         vision_config: dict[str, Any] | DeepseekV41VisionConfig | None = None,
-        # AutoModel training knobs
-        engram_enabled: bool = True,
-        engram_trainable: bool = False,
-        kv_cache_fake_quant: bool = True,
         # Standard options
         pad_token_id: int | None = 2,
         bos_token_id: int = 0,
@@ -286,9 +282,6 @@ class DeepseekV41Config(PretrainedConfig):
         elif not isinstance(vision_config, DeepseekV41VisionConfig):
             raise TypeError("vision_config must be a DeepseekV41VisionConfig, dictionary, or None")
         self.vision_config = vision_config
-        self.engram_enabled = engram_enabled
-        self.engram_trainable = engram_trainable
-        self.kv_cache_fake_quant = kv_cache_fake_quant
         self.pretraining_tp = pretraining_tp
         if len(self.engram_layer_ids) != len(self.engram_num_embeddings):
             raise ValueError(
@@ -366,7 +359,7 @@ class DeepseekV41Config(PretrainedConfig):
             or self.dspark_block_size < 0
         ):
             raise ValueError("num_nextn_predict_layers and dspark_block_size must be non-negative")
-        if self.engram_enabled and self.engram_layer_ids:
+        if self.engram_layer_ids:
             for name, value in (
                 ("engram_n_heads", self.engram_n_heads),
                 ("engram_head_dim", self.engram_head_dim),
