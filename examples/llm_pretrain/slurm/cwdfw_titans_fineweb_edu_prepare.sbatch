@@ -20,6 +20,7 @@ TITANS_WORK_ROOT=${TITANS_WORK_ROOT:-/lustre/fsw/portfolios/coreai/users/ffrujer
 TITANS_IMAGE=${TITANS_IMAGE:-nvcr.io#nvidia/nemo-automodel:26.04}
 DATA_ROOT=$TITANS_WORK_ROOT/data/fineweb-edu-llama2-pilot
 TRAIN_DATA=$DATA_ROOT/train/fineweb_edu_max_tokens_64M/dataset.bin
+TRAIN_INDEX=${TRAIN_DATA%.bin}.bos.idx
 VALIDATION_ROOT=$DATA_ROOT/validation-health
 READY_MARKER=$DATA_ROOT/READY
 
@@ -37,7 +38,7 @@ srun \
     set -euo pipefail
     export PYTHONPATH='$AUTOMODEL_CHECKOUT'
 
-    if [[ ! -s '$TRAIN_DATA' || ! -s '\${TRAIN_DATA%.bin}.bos.idx' ]]; then
+    if [[ ! -s '$TRAIN_DATA' || ! -s '$TRAIN_INDEX' ]]; then
       python tools/nanogpt_data_processor.py \
         --dataset HuggingFaceFW/fineweb-edu \
         --set-name sample-10BT \
@@ -58,7 +59,7 @@ srun \
       --vocab-size 32000
 
     test -s '$TRAIN_DATA'
-    test -s '\${TRAIN_DATA%.bin}.bos.idx'
+    test -s '$TRAIN_INDEX'
     test -s '$VALIDATION_ROOT/validation/fineweb_edu_smoke.bin'
     printf 'dataset=HuggingFaceFW/fineweb-edu\\nconfig=sample-10BT\\ntokenizer=NousResearch/Llama-2-7b-hf\\nmax_tokens=64000000\\n' \
       > '$READY_MARKER'
