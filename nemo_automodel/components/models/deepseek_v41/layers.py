@@ -514,13 +514,17 @@ class DeepseekV41Indexer(nn.Module):
         if self.fake_quant:
             q = fake_quant_fp4(q, 32, "e8m0")
         weights = self.weights_proj(hidden_states).float() * (self.n_heads**-0.5)
+        # The indexer is frozen and forward-only, so it always scores in torch: the
+        # Miles TileLang indexer kernel is tuned for the V4 head layout and requests
+        # more dynamic shared memory than pre-Hopper GPUs offer at V4.1's
+        # 32 x 128 indexer heads.  The sparse-attention kernel still honours the backend.
         scores = dsv4_indexer_scores(
             q,
             index_k,
             weights,
             compress_ratio=max(state.compress_ratio, 1),
             softmax_scale=self.softmax_scale,
-            backend=_dsv4_kernel_backend(self.backend),
+            backend="torch",
         ).float()
         scores = scores.masked_fill(~allowed, float("-inf"))
 
