@@ -1,0 +1,220 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Full-parameter SFT of Qwen/Qwen3.6-35B-A3B on the text-only agentic corpus
+# vuhaian/v4_88k. Single node, 8 x H200 (141 GB), FSDP2 + EP8 + DeepEP.
+#
+# Derived from examples/vlm_finetune/qwen3_5_moe/qwen3_6_35b.yaml (the shipped EP8
+# recipe for this checkpoint), with the loss/data path from
+# examples/vlm_finetune/gemma4/gemma4_e4b_tulu3_text_cp16_64k.yaml (text-only
+# conversations through the VLM recipe).
+#
+# Prerequisites:
+#   export HF_TOKEN=...                       # the repo does not read .env
+#   uv run --no-project ... scripts/prefilter_v4_88k.py --max-seq-len 40960 \
+#       --out data/v4_88k_filtered            # drops the ~0.3% over-length rows
+#
+# To run this recipe:
+#   automodel examples/vlm_finetune/qwen3_5_moe/qwen3_6_35b_v4_88k_ep8.yaml --nproc-per-node 8
+
+recipe: FinetuneRecipeForVLM
+
+# Live seed key. The `rng:` block carried by older examples is not read by the
+# recipe, so the seed goes here.
+seed: 1234
+
+step_scheduler:
+  # dp_size = world(8) / (tp 1 * cp 1 * pp 1) = 8, so
+  #   grad_accum = global_batch_size / (local_batch_size * dp_size) = 32 / 8 = 4.
+  # ~87.3k rows after pre-filtering => ~2,728 optimizer steps per epoch.
+  global_batch_size: 32
+  # One conversation per rank. Samples average ~9.7k tokens, so a batch of 1 is
+  # already a substantial workload, and it makes batch padding exactly zero --
+  # the collator pads to the longest sample in the batch, which is the sample.
+  local_batch_size: 1
+  num_epochs: 2
+  ckpt_every_steps: 200
+  val_every_steps: 100
+  log_remote_every_steps: 1
+  save_checkpoint_every_epoch: false
+  validate_on_checkpoint: true
+
+dist_env:
+  backend: nccl
+  # The first step pays DeepEP buffer allocation and FLA autotuning.
+  timeout_minutes: 120
+
+model:
+  # Routes on config.architectures[0] == "Qwen3_5MoeForConditionalGeneration" to
+  # nemo_automodel.components.models.qwen3_5_moe.model:Qwen3_5MoeForConditionalGeneration.
+  # The text-only Qwen3_5MoeForCausalLM cannot consume this checkpoint: the state-dict
+  # adapter only strips the "language_model." prefix inside its fused-expert branches.
+  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen3.6-35B-A3B
+  torch_dtype: torch.bfloat16
+  text_config:
+    # Keep the MTP head. Disabling it sets self.mtp = None, so the checkpoint's 19
+    # mtp.* tensors never reach the consolidated export while the exported
+    # config.json still declares mtp_num_hidden_layers: 1 -- the result no longer
+    # matches the base architecture and loads with missing keys.
+    num_nextn_predict_layers: 1
+    # FusedLinearCrossEntropy consumes the decoder hidden states directly.
+    output_hidden_states: true
+    use_cache: false
+    # NOTE: do not set mtp_expert_hf_layout here. Qwen3.6-35B-A3B stores MTP expert
+    # projections fused (mtp.layers.0.mlp.experts.gate_up_proj), unlike Qwen3.5-122B
+    # which needs "split". Leaving it unset lets the adapter infer the layout.
+  mtp_loss_scaling_factor: 0.1
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    # TransformerEngine DotProductAttention (cuDNN-fused / FlashAttention) for the
+    # 10 full-attention layers. The other 30 layers are GatedDeltaNet and use FLA
+    # regardless of this setting -- see the install note above.
+    attn: te
+    linear: te
+    # GatedDeltaNet stability: keep norms in fp32.
+    rms_norm: torch_fp32
+    rope_fusion: false
+    # Repo bake-off (examples/llm_benchmark/qwen/qwen3_moe_30b_te_deepep_gb200.yaml):
+    # te 26.27% > gmm 26.12% > torch_mm 25.45% MFU. `te`/`gmm` require a
+    # DeepEP-family dispatcher or BackendConfig silently rewrites both fields.
+    experts: te
+    # Correct on Hopper. `hybridep` appears only in *_gb200.yaml as a workaround for
+    # DeepEP failing EP-buffer init on Blackwell.
+    dispatcher: deepep
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+
+processor:
+  _target_: transformers.AutoProcessor.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen3.6-35B-A3B
+  padding_side: right
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints/qwen3_6_35b_v4_88k_ep8/
+  model_save_format: safetensors
+  # One HF-loadable export at the end; "every" would write ~70 GB per checkpoint.
+  save_consolidated: final
+  max_recent_checkpoints: 3
+  # restore_from: checkpoints/qwen3_6_35b_v4_88k_ep8/epoch_0_step_800
+
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  dp_replicate_size: 1
+  # Qwen3_5Moe*.ModelCapabilities.supports_tp is False.
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  # 256 routed experts % 8 == 0, and dp_size(8) * cp_size(1) % 8 == 0.
+  ep_size: 8
+  sequence_parallel: false
+  activation_checkpointing: true
+  # Reduce-scatter gradients every micro-batch. The FSDP2 default accumulates the
+  # full UNSHARDED gradient across all 4 accumulation steps. Numerically identical.
+  defer_fsdp_grad_sync: false
+  multimodal:
+    # Every rank gets text-only batches, so the frozen vision tower is skipped
+    # uniformly and per-layer sharding of the frozen params is safe.
+    frozen_sharding: per_layer
+  moe:
+    # The EP dimension is not re-gathered, so keeping expert shards resident is
+    # cheap and saves communication.
+    reshard_after_forward: false
+    wrap_outer_model: true
+    # Recomputed top-k routing can disagree with the forward pass and raise
+    # CheckpointError under activation checkpointing.
+    ignore_router_for_ac: true
+
+freeze_config:
+  freeze_vision_tower: true
+  freeze_audio_tower: true
+  freeze_language_model: false
+
+loss_fn:
+  # vocab_size is 248,320: MaskedCrossEntropy would materialize a
+  # [1, seq_len, 248320] fp32 logits tensor (~40 GiB at 40,960 tokens).
+  # This fuses lm_head + CE over the final hidden state instead.
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
+
+dataset:
+  _target_: examples/vlm_finetune/qwen3_5_moe/v4_88k.py:make_v4_88k_dataset
+  path_or_dataset: data/v4_88k_filtered/train.parquet
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 4
+  pin_memory: true
+  persistent_workers: true
+  drop_last: true
+  shuffle: true
+  collate_fn:
+    # Supervises only the final assistant turn. The shipped label builder matches
+    # the marker "<|im_start|>assistant\n" and supervises EVERY assistant turn,
+    # which is wrong on this turn-exploded corpus.
+    #
+    # Deliberately no `max_length` here: default_collate_fn switches to
+    # padding="max_length" whenever it is set, which would pad every sample to that
+    # length. The length cap is enforced offline by scripts/prefilter_v4_88k.py.
+    _target_: examples/vlm_finetune/qwen3_5_moe/v4_88k.py:last_turn_collate_fn
+
+validation_dataset:
+  _target_: examples/vlm_finetune/qwen3_5_moe/v4_88k.py:make_v4_88k_dataset
+  path_or_dataset: data/v4_88k_filtered/val.parquet
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 2
+  pin_memory: true
+  drop_last: true
+  shuffle: false
+  collate_fn:
+    _target_: examples/vlm_finetune/qwen3_5_moe/v4_88k.py:last_turn_collate_fn
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-5
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  weight_decay: 0.1
+
+lr_scheduler:
+  # Typed block: no _target_. lr_decay_steps defaults to the total step count.
+  lr_warmup_steps: 50
+  lr_decay_style: cosine
+  max_lr: 1.0e-5
+  min_lr: 1.0e-6
+
+clip_grad_norm:
+  max_norm: 1.0
+
+prewarm:
+  # Initialize lazy CUDA state before step 1 hits peak activation memory.
+  cublas_backward: true
+  fla_gdn_autotune: true
+  comm_groups: true
+
+moe_metrics:
+  # Router load-balance telemetry: the direct check that DeepEP routing is healthy
+  # and experts are not collapsing.
+  enabled: true
+
+# Uncomment and configure for W&B logging
+# wandb:
+#   project: <your_wandb_project>
+#   entity: <your_wandb_entity>
+#   name: qwen3_6_35b_v4_88k_ep8
+#   dir: <your_wandb_save_dir>
