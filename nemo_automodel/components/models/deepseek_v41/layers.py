@@ -41,7 +41,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import Any, Literal
 
 import torch
 import torch.distributed as dist
@@ -53,7 +53,6 @@ from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
 from nemo_automodel.components.models.deepseek_v4.layers import (
     DeepseekV4FP32Parameter,
     DeepseekV4GroupedLinear,
-    DeepseekV4HyperConnection,
 )
 from nemo_automodel.components.models.deepseek_v4.model import DeepseekV4VisionGate
 from nemo_automodel.components.models.deepseek_v4.optimized_kernels import (
@@ -79,8 +78,6 @@ __all__ = [
     "build_window_topk_indices",
     "fake_quant_fp4",
     "fake_quant_fp8",
-    "hc_collapse",
-    "hc_expand",
     "make_identity_pre_mix",
     "select_candidate_blocks",
 ]
@@ -322,35 +319,101 @@ def fake_quant_fp4(x: torch.Tensor, block_size: int, scale_format: str) -> torch
 # ---------------------------------------------------------------------------
 
 
-class DeepseekV41HyperConnection(DeepseekV4HyperConnection):
-    """Reuse V4 parameter ownership with the V4.1 reference's FP32 operation order."""
+@dataclass(frozen=True)
+class DeepseekV41Mix:
+    """FP32 coefficients: pre/post [batch, sequence, streams], comb [batch, sequence, streams, streams]."""
 
-    def compute_weights(self, hidden_streams: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Project streams before RMS scaling and apply the fused affine map.
+    pre: torch.Tensor
+    post: torch.Tensor
+    comb: torch.Tensor
+
+
+class DeepseekV41HyperConnection(nn.Module):
+    """Predict one sublayer's residual mixing coefficients in FP32."""
+
+    def __init__(
+        self, config: DeepseekV41TextConfig, *, sinkhorn_backend: Literal["torch", "tilelang"] = "torch"
+    ) -> None:
+        super().__init__()
+        if sinkhorn_backend not in ("torch", "tilelang"):
+            raise ValueError("DeepSeek V4.1 mHC supports 'torch' or 'tilelang' Sinkhorn backends")
+        self.sinkhorn_backend = sinkhorn_backend
+        self.streams = config.hc_mult
+        self.iterations = config.hc_sinkhorn_iters
+        self.eps = config.hc_eps
+        self.norm_eps = config.rms_norm_eps
+        width = self.streams * (self.streams + 2)
+        self.fn = nn.Parameter(torch.empty(width, self.streams * config.hidden_size, dtype=torch.float32))
+        self.base = nn.Parameter(torch.zeros(width, dtype=torch.float32))
+        self.scale = nn.Parameter(torch.ones(3, dtype=torch.float32))
+        self.reset_parameters(config.initializer_range)
+
+    @torch.no_grad()
+    def reset_parameters(self, std: float = 0.02) -> None:
+        """Initialize all coefficients before checkpoint-free execution."""
+        nn.init.normal_(self.fn, std=std)
+        self.base.zero_()
+        self.scale.fill_(1)
+
+    def forward(self, hidden_states: torch.Tensor) -> DeepseekV41Mix:
+        """Predict coefficients, preserving projection-before-RMS arithmetic.
 
         Args:
-            hidden_streams: Tensor of shape [batch, sequence, streams, hidden].
+            hidden_states: Tensor of shape [batch, sequence, streams, hidden].
 
         Returns:
-            FP32 pre/post tensors of shape [batch, sequence, streams] and
-            combination coefficients [batch, sequence, input_streams, output_streams].
+            Coefficients with pre/post tensors of shape [batch, sequence, streams]
+            and comb of shape [batch, sequence, streams, streams]. All use FP32.
         """
-        flat = hidden_streams.flatten(2).float()
+        flat = hidden_states.flatten(2).float()
         mixes = F.linear(flat, self.fn.float()) * torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.norm_eps)
-        streams = self.hc_mult
+        streams = self.streams
         scales = torch.cat(
             (self.scale[0].expand(streams), self.scale[1].expand(streams), self.scale[2].expand(streams * streams))
-        ).float()
-        logits = torch.addcmul(self.base.float(), mixes, scales)
-        pre = torch.sigmoid(logits[..., :streams]) + self.hc_eps
+        )
+        # The released kernel fuses the affine multiply/add before sigmoid and
+        # Sinkhorn. Separate operations round its FP32 coefficients differently;
+        # these differences can survive the subsequent BF16 stream collapse.
+        logits = torch.addcmul(self.base, mixes, scales)
+        pre = torch.sigmoid(logits[..., :streams]) + self.eps
         post = 2 * torch.sigmoid(logits[..., streams : 2 * streams])
         comb = dsv4_sinkhorn_normalize(
             logits[..., 2 * streams :].unflatten(-1, (streams, streams)),
             backend=self.sinkhorn_backend,
-            repeat=self.hc_sinkhorn_iters,
-            eps=self.hc_eps,
+            repeat=self.iterations,
+            eps=self.eps,
         )
-        return pre, post, comb
+        return DeepseekV41Mix(pre, post, comb)
+
+    @staticmethod
+    def collapse(hidden_states: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:
+        """Collapse streams using the preceding sublayer's coefficients.
+
+        Args:
+            hidden_states: Tensor of shape [batch, sequence, streams, hidden].
+            pre_mix: FP32 tensor of shape [batch, sequence, streams].
+
+        Returns:
+            Tensor of shape [batch, sequence, hidden], with the input dtype.
+        """
+        return (pre_mix.unsqueeze(-1) * hidden_states.float()).sum(2).to(hidden_states.dtype)
+
+    @staticmethod
+    def expand(output: torch.Tensor, residual: torch.Tensor, mix: DeepseekV41Mix) -> torch.Tensor:
+        """Mix the sublayer output and residual in the source's coefficient orientation.
+
+        Args:
+            output: Tensor of shape [batch, sequence, hidden].
+            residual: Tensor of shape [batch, sequence, streams, hidden].
+            mix: FP32 pre/post tensors of shape [batch, sequence, streams] and
+                comb of shape [batch, sequence, input_streams, output_streams].
+
+        Returns:
+            Tensor of shape [batch, sequence, streams, hidden], with output's dtype.
+        """
+        update = mix.post.unsqueeze(-1) * output.unsqueeze(-2)
+        mixed = (mix.comb.unsqueeze(-1) * residual.unsqueeze(-2)).sum(2)
+        return (update + mixed).to(output.dtype)
 
 
 def make_identity_pre_mix(x: torch.Tensor, hc_mult: int) -> torch.Tensor:
@@ -358,29 +421,6 @@ def make_identity_pre_mix(x: torch.Tensor, hc_mult: int) -> torch.Tensor:
     pre_mix = x.new_zeros(x.shape[0], x.shape[1], hc_mult, dtype=torch.float32)
     pre_mix[:, :, 0] = 1.0
     return pre_mix
-
-
-def hc_collapse(x: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:
-    """Collapse the hc copies into one sublayer input. ``[B,S,hc,d] x [B,S,hc] -> [B,S,d]``."""
-    return torch.sum(pre_mix.float().unsqueeze(-1) * x.float(), dim=2).to(x.dtype)
-
-
-def hc_expand(y: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor) -> torch.Tensor:
-    """Expand a sublayer output back to hc copies and mix the residual in through ``comb``.
-
-    Args:
-        y: Tensor of shape [batch, sequence, hidden].
-        residual: Tensor of shape [batch, sequence, streams, hidden].
-        post: FP32 tensor of shape [batch, sequence, streams].
-        comb: FP32 tensor of shape [batch, sequence, input_streams, output_streams].
-
-    Returns:
-        Tensor of shape [batch, sequence, streams, hidden], in y's dtype.
-        Products reduce over input streams in the reference's operation order.
-    """
-    mixed = post.float().unsqueeze(-1) * y.float().unsqueeze(-2)
-    mixed = mixed + (comb.float().unsqueeze(-1) * residual.float().unsqueeze(-2)).sum(2)
-    return mixed.to(y.dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -1000,16 +1040,9 @@ class DeepseekV41Block(nn.Module):
         )
         self.attn_norm = DeepseekV41RMSNorm(config.hidden_size, eps=config.rms_norm_eps, dtype=model_dtype)
         self.ffn_norm = DeepseekV41RMSNorm(config.hidden_size, eps=config.rms_norm_eps, dtype=model_dtype)
-        hc_kwargs = dict(
-            hc_mult=self.hc_mult,
-            hidden_size=config.hidden_size,
-            hc_sinkhorn_iters=int(config.hc_sinkhorn_iters),
-            hc_eps=float(config.hc_eps),
-            rms_norm_eps=float(config.rms_norm_eps),
-            sinkhorn_backend="tilelang" if backend.attn == "tilelang" else "torch",
-        )
-        self.attn_hc = DeepseekV41HyperConnection(**hc_kwargs)
-        self.ffn_hc = DeepseekV41HyperConnection(**hc_kwargs)
+        sinkhorn_backend = "tilelang" if backend.attn == "tilelang" else "torch"
+        self.attn_hc = DeepseekV41HyperConnection(config, sinkhorn_backend=sinkhorn_backend)
+        self.ffn_hc = DeepseekV41HyperConnection(config, sinkhorn_backend=sinkhorn_backend)
         self.engram = (
             DeepseekV41Engram(config, layer_idx, backend, process_group=engram_process_group)
             if layer_idx in config.engram_layer_ids
@@ -1061,15 +1094,15 @@ class DeepseekV41Block(nn.Module):
                 raise ValueError(f"layer {self.layer_idx} has an Engram module but received no hash ids")
             x = self.engram(x, engram_hash_ids, token_mask=engram_mask)
 
-        attn_pre, attn_post, attn_comb = self.attn_hc(x)
-        attn_out = self.attn(self.attn_norm(hc_collapse(x, pre_mix)), state=state, **attn_kwargs)
-        x = hc_expand(attn_out.hidden_states, x, attn_post, attn_comb)
+        attn_mix = self.attn_hc(x)
+        attn_out = self.attn(self.attn_norm(self.attn_hc.collapse(x, pre_mix)), state=state, **attn_kwargs)
+        x = self.attn_hc.expand(attn_out.hidden_states, x, attn_mix)
 
-        ffn_pre, ffn_post, ffn_comb = self.ffn_hc(x)
+        ffn_mix = self.ffn_hc(x)
         self.ffn.gate.set_routing_context(None, vision_token_types)
-        mlp_out = self.ffn(self.ffn_norm(hc_collapse(x, attn_pre)), padding_mask)
-        x = hc_expand(mlp_out, x, ffn_post, ffn_comb)
-        return x, ffn_pre, attn_out.state
+        mlp_out = self.ffn(self.ffn_norm(self.ffn_hc.collapse(x, attn_mix.pre)), padding_mask)
+        x = self.ffn_hc.expand(mlp_out, x, ffn_mix)
+        return x, ffn_mix.pre, attn_out.state
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
         self.attn_norm.reset_parameters()
@@ -1077,7 +1110,7 @@ class DeepseekV41Block(nn.Module):
         self.attn.init_weights(buffer_device, init_std=init_std)
         self.ffn.init_weights(buffer_device, init_std=init_std)
         self.ffn.gate.init_dsv4_weights()
-        self.attn_hc.init_weights(init_std)
-        self.ffn_hc.init_weights(init_std)
+        self.attn_hc.reset_parameters(init_std)
+        self.ffn_hc.reset_parameters(init_std)
         if self.engram is not None:
             self.engram.init_weights()

@@ -61,11 +61,11 @@ from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41Conf
 from nemo_automodel.components.models.deepseek_v41.engram import DeepseekV41NgramHash
 from nemo_automodel.components.models.deepseek_v41.layers import (
     DeepseekV41Block,
+    DeepseekV41HyperConnection,
     DeepseekV41RMSNorm,
     DeepseekV41RotaryEmbedding,
     DeepseekV41SharedState,
     build_window_topk_indices,
-    hc_collapse,
     make_identity_pre_mix,
 )
 from nemo_automodel.components.models.deepseek_v41.processing import (
@@ -236,7 +236,7 @@ class DeepseekV41Model(nn.Module):
                 state=state,
             )
 
-        h = hc_collapse(h, pre_mix)
+        h = DeepseekV41HyperConnection.collapse(h, pre_mix)
         return self.norm(h), None if captured is None else tuple(captured)
 
     def update_moe_gate_bias(self) -> None:
