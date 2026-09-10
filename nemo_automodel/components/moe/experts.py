@@ -472,8 +472,8 @@ class GroupedExperts(nn.Module):
                 Shape is [num_tokens, num_activated_experts].
 
         Returns:
-            torch.Tensor: Output tensor after expert computation.
-                Shape is [num_tokens, model_dim]
+            torch.Tensor: Output of shape [num_tokens, model_dim], in FP32
+                when combine_in_fp32 is enabled and otherwise in the input dtype.
         """
         assert not isinstance(x, DTensor)
         input_dtype = x.dtype
@@ -602,7 +602,7 @@ class GroupedExperts(nn.Module):
 
         if self.config.apply_router_weight_after_down:
             y = y.sum(dim=1)
-        return y.to(input_dtype)
+        return y if self.config.combine_in_fp32 else y.to(input_dtype)
 
     def _forward_loop(
         self,
@@ -993,6 +993,7 @@ class GroupedExpertsDeepEP(nn.Module):
             moe_share_token_dispatcher=self.dispatcher_share_token_dispatcher,
             moe_deepep_async_dispatch=self.dispatcher_async_dispatch,
             moe_benchmark_static_routing=self.static_routing,
+            moe_combine_in_fp32=self.config.combine_in_fp32,
         )
 
         self.n_routed_experts = self.config.n_routed_experts
@@ -1038,8 +1039,8 @@ class GroupedExpertsDeepEP(nn.Module):
                 Shape is [num_tokens, num_activated_experts].
 
         Returns:
-            torch.Tensor: Output tensor after expert computation.
-                Shape is [num_tokens, model_dim]
+            torch.Tensor: Output of shape [num_tokens, model_dim], in FP32
+                when combine_in_fp32 is enabled and otherwise in the input dtype.
         """
         assert not isinstance(x, DTensor)
 
@@ -1565,6 +1566,7 @@ class GroupedExpertsTE(nn.Module):
             moe_share_token_dispatcher=self.dispatcher_share_token_dispatcher,
             moe_deepep_async_dispatch=self.dispatcher_async_dispatch,
             moe_benchmark_static_routing=self.static_routing,
+            moe_combine_in_fp32=self.config.combine_in_fp32,
         )
 
         local_expert_indices_offset = self.ep_rank * self.num_local_experts

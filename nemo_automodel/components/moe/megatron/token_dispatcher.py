@@ -33,6 +33,11 @@ from .fused_a2a import (
 from .fused_indices_converter import (
     fused_indices_to_multihot,
 )
+from .hybridep_fp32_combine import (
+    HybridEPCombineMetadata,
+    build_hybridep_combine_metadata,
+    hybridep_combine_in_fp32,
+)
 from .moe_utils import (
     permute,
     unpermute,
@@ -381,13 +386,16 @@ class _HybridEPManager(_DispatchManager):
         permute_fusion: bool = False,
         moe_hybridep_num_sms: int = 24,
         benchmark_static_routing: bool = False,
-    ):
+        combine_in_fp32: bool = False,
+    ) -> None:
         self.group = group
         self.num_local_experts = num_local_experts
         self.num_experts = num_experts
         self.router_topk = router_topk
         self.permute_fusion = permute_fusion
         self.moe_hybridep_num_sms = moe_hybridep_num_sms
+        self.combine_in_fp32 = combine_in_fp32
+        self.combine_metadata: HybridEPCombineMetadata | None = None
         # Benchmark-only (TokenDispatcherConfig.moe_benchmark_static_routing):
         # persist num_permuted_tokens across dispatches, see dispatch()/reset.
         self.benchmark_static_routing = benchmark_static_routing
@@ -450,6 +458,19 @@ class _HybridEPManager(_DispatchManager):
         async_finish: bool = True,  # noqa: ARG002 - not supported by HybridEP backend
         allocate_on_comm_stream: bool = True,  # noqa: ARG002 - not supported by HybridEP backend
     ) -> torch.Tensor:
+        """Dispatch local tokens and retain inverse routes for their combine.
+
+        Args:
+            hidden_states: BF16 activations of shape [local_tokens, hidden].
+                Owners may supply different token counts; internal rows are
+                padded to the common aligned extent before dispatch.
+            async_finish: Compatibility argument unused by HybridEP.
+            allocate_on_comm_stream: Compatibility argument unused by HybridEP.
+
+        Returns:
+            BF16 activations of shape [padded_expert_rows, hidden], grouped by
+            local expert with the row counts returned by the dispatch handle.
+        """
         # Reset num_permuted_tokens to None to avoid reusing cached state from a prior dispatch.
         # This can happen in non-reentrant activation checkpointing mode.
         # Benchmark-only exception: with static routing every dispatch permutes the same
@@ -495,6 +516,10 @@ class _HybridEPManager(_DispatchManager):
         )
 
         self.tokens_per_expert = tokens_per_expert
+        if self.combine_in_fp32:
+            self.combine_metadata = build_hybridep_combine_metadata(
+                self.routing_map, tokens_per_expert, self.get_unpadded_tokens_per_expert(), self.group
+            )
         self.num_permuted_tokens = self.tokens_per_expert.sum()
         if self.benchmark_static_routing and getattr(self, "_static_num_permuted_tokens", None) is None:
             self._static_num_permuted_tokens = self.num_permuted_tokens
@@ -507,12 +532,31 @@ class _HybridEPManager(_DispatchManager):
         async_finish: bool = True,  # noqa: ARG002 - not supported by HybridEP backend
         allocate_on_comm_stream: bool = True,  # noqa: ARG002 - not supported by HybridEP backend
     ) -> torch.Tensor:
-        hidden_states = hybrid_ep_combine(
-            x=hidden_states,
-            handle=self.handle,
-            num_permuted_tokens=self.num_permuted_tokens,
-            pad_multiple=self.pad_multiple,
-        )
+        """Return expert contributions to the original local token order.
+
+        Args:
+            hidden_states: Expert outputs [padded_expert_rows, hidden] in the
+                same expert-major row layout produced by the active dispatch.
+            async_finish: Compatibility argument unused by HybridEP.
+            allocate_on_comm_stream: Compatibility argument unused by HybridEP.
+
+        Returns:
+            Tensor [local_tokens, hidden], with internal token padding removed.
+            FP32 combine retains FP32 routed sums; the default preserves the
+            input dtype. The active dispatch handle is released after combine.
+        """
+        if self.combine_in_fp32:
+            if self.combine_metadata is None:
+                raise RuntimeError("HybridEP FP32 combine requires a preceding dispatch")
+            hidden_states = hybridep_combine_in_fp32(hidden_states, self.combine_metadata)
+            self.combine_metadata = None
+        else:
+            hidden_states = hybrid_ep_combine(
+                x=hidden_states,
+                handle=self.handle,
+                num_permuted_tokens=self.num_permuted_tokens,
+                pad_multiple=self.pad_multiple,
+            )
         self.handle = None
         self.num_permuted_tokens = None
         if self.num_unpadded_tokens is not None:
@@ -531,6 +575,17 @@ class _HybridEPManager(_DispatchManager):
 
     def get_number_of_tokens_per_expert(self) -> torch.Tensor:
         return self.tokens_per_expert
+
+    def get_unpadded_tokens_per_expert(self) -> torch.Tensor:
+        """Return real GEMM rows [local experts] for the current dispatch.
+
+        The public HybridEP handle stores these counts separately from the
+        padded counts returned by dispatch. The tensor is read-only metadata
+        and remains valid until its dispatch is combined.
+        """
+        if self.handle is None:
+            raise RuntimeError("Unpadded expert counts require an active HybridEP dispatch")
+        return self.handle[7]
 
 
 @dataclass
@@ -570,6 +625,10 @@ class TokenDispatcherConfig:
 
     moe_hybridep_num_sms: int = 24
     """Number of SMs to use for HybridEP dispatch and combine APIs."""
+
+    moe_combine_in_fp32: bool = False
+    """Preserve per-expert contributions through sparse NCCL return and FP32 sum.
+    Uses the existing HybridEP forward dispatch; other flex backends reject this option."""
 
     moe_share_token_dispatcher: bool = True
     """Share one communication manager instance across MoE layers for the configured backend."""
@@ -623,6 +682,8 @@ class MoEFlexTokenDispatcher:
         assert self.tp_size * self.ep_size > 1, "Flex token dispatcher requires TPxEP > 1"
 
         backend = self.config.moe_flex_dispatcher_backend
+        if self.config.moe_combine_in_fp32 and backend != "hybridep":
+            raise ValueError("FP32 flex-dispatcher combine is supported only with HybridEP")
 
         if backend == "uccl_ep":
             if set_uccl_num_sms is not None:
@@ -685,8 +746,11 @@ class MoEFlexTokenDispatcher:
                         permute_fusion=self.config.moe_permute_fusion,
                         moe_hybridep_num_sms=self.config.moe_hybridep_num_sms,
                         benchmark_static_routing=self.config.moe_benchmark_static_routing,
+                        combine_in_fp32=self.config.moe_combine_in_fp32,
                     )
                 self._comm_manager = MoEFlexTokenDispatcher.shared_hybridep_manager
+                if self._comm_manager.combine_in_fp32 != self.config.moe_combine_in_fp32:
+                    raise ValueError("Shared HybridEP managers must use the same combine precision")
             else:
                 self._comm_manager = _HybridEPManager(
                     group=ep_group,
@@ -696,6 +760,7 @@ class MoEFlexTokenDispatcher:
                     permute_fusion=self.config.moe_permute_fusion,
                     moe_hybridep_num_sms=self.config.moe_hybridep_num_sms,
                     benchmark_static_routing=self.config.moe_benchmark_static_routing,
+                    combine_in_fp32=self.config.moe_combine_in_fp32,
                 )
             self.hybridep_metadata_processor = _HybridEPMetadataProcessor(
                 num_experts=self.tp_size * self.config.num_moe_experts,

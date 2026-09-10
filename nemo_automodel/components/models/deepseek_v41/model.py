@@ -124,6 +124,7 @@ class DeepseekV41Model(nn.Module):
             gate_bias_update_factor=1e-3,
             score_func="sqrtsoftplus",
             router_weights_fp32=True,
+            combine_in_fp32=True,
             route_scale=config.routed_scaling_factor,
             aux_loss_coeff=0,
             norm_topk_prob=config.norm_topk_prob,
