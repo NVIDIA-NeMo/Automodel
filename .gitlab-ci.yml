@@ -19,6 +19,8 @@ default:
   interruptible: true
   cache:
     key:
+      # Keep lightweight checks from restoring the much larger CPU-test cache.
+      prefix: "$CI_JOB_NAME"
       files:
         - uv.lock
     paths:
@@ -53,6 +55,39 @@ lint:
     - uv run --no-sync ruff check --verbose .
     - uv run --no-sync ruff format --check --verbose .
     - uv run --no-sync bandit -r app.py nemo_automodel examples scripts tools tutorials -t B614
+    - uv run --no-sync lint-imports --debug --verbose --no-cache
+
+secret-detection:
+  stage: lint
+  variables:
+    UV_PYTHON: "3.10"
+    GIT_DEPTH: "0"
+  timeout: 5 minutes
+  script:
+    - |-
+      set -o pipefail
+      git diff --name-only --diff-filter=ACMRT -z \
+        "$CI_MERGE_REQUEST_DIFF_BASE_SHA" "$CI_COMMIT_SHA" -- \
+        | xargs -0 -r uv tool run --from detect-secrets==1.5.0 \
+          detect-secrets-hook --no-verify --baseline .github/workflows/config/.secrets.baseline --
+
+recipe-validation:
+  stage: lint
+  variables:
+    UV_PYTHON: "3.10"
+    GIT_DEPTH: "0"
+  timeout: 5 minutes
+  before_script:
+    - uv venv .venv
+    - uv pip install --python .venv/bin/python PyYAML==6.0.3 ruamel.yaml==0.19.1
+  script:
+    - uv run --no-sync python tests/ci_tests/utils/validate_nightly_recipes.py --automodel-dir .
+    - uv run --no-sync python tests/ci_tests/utils/validate_generate_ci.py --automodel-dir .
+    - |-
+      set -o pipefail
+      git diff --name-only --diff-filter=A -z \
+        "$CI_MERGE_REQUEST_DIFF_BASE_SHA" "$CI_COMMIT_SHA" -- examples/ \
+        | xargs -0 -r uv run --no-sync python tests/ci_tests/utils/validate_new_recipe_ci.py --automodel-dir . --
 
 retrieval-unit-tests:
   stage: test
@@ -62,8 +97,25 @@ retrieval-unit-tests:
   timeout: 20 minutes
   before_script:
     # The retrieval processors register torchvision-backed Hugging Face classes at import time.
-    - uv sync --locked --no-default-groups --group build --group test --extra diffusion
+    - uv sync --locked --no-default-groups --group build --group test --group linting --extra diffusion
   script:
+    - uv run --no-sync ty --version
+    - |-
+      uv run --no-sync python - <<'PY'
+      import subprocess
+      import tomllib
+      from pathlib import Path
+
+      config = tomllib.loads(Path("pyproject.toml").read_text())
+      targets = sorted({
+          pattern.removesuffix("/**")
+          for override in config["tool"]["ty"]["overrides"]
+          for pattern in override["include"]
+      })
+      if not targets:
+          raise SystemExit("No ty check targets configured in pyproject.toml")
+      subprocess.run(["ty", "check", "--verbose", *targets], check=True)
+      PY
     - >-
       uv run --no-sync pytest
       --cpu
