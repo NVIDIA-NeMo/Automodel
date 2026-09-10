@@ -42,6 +42,7 @@ from typing import Any, Union
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.distributed.device_mesh import DeviceMesh
 from transformers import PreTrainedTokenizerFast
 from transformers.modeling_outputs import CausalLMOutputWithPast
@@ -346,6 +347,8 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     retain local tables. FSDP's shard mesh must match the owner group exactly.
     """
 
+    config_class: type[DeepseekV41Config] = DeepseekV41Config
+    base_model_prefix: str = "model"
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
     # Reference-sensitive tensors that must stay fp32 regardless of the outer cast policy.
     _keep_in_fp32_modules_strict = [
@@ -541,6 +544,7 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
+        labels: torch.Tensor | None = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
         output_hidden_states: bool | None = None,
         pixel_values: torch.Tensor | None = None,
@@ -555,6 +559,9 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             position_ids: ``[B, S]`` document-relative positions.
             attention_mask: ``[B, S]`` valid-token mask.
             padding_mask: ``[B, S]`` bool padding mask.
+            labels: Optional int64 targets [batch, sequence] for unpacked inputs.
+                Logits at positions 0..S-2 predict labels at positions 1..S-1;
+                targets equal to -100 are ignored. Requires logits_to_keep=0.
             logits_to_keep: Number or positions of logits to retain.
             output_hidden_states: Whether to expose the final hidden states.
             pixel_values: Image patches [all_patches, 3, patch_size, patch_size].
@@ -564,7 +571,13 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 
         Returns:
             CausalLMOutputWithPast with logits [batch, kept_sequence, vocab]
-            (or [tokens, vocab] for packed text) and optional final hidden states.
+            (with a restored batch dimension for packed text), optional final
+            hidden states [batch, sequence, hidden], and scalar FP32 mean loss
+            when labels are supplied. Input labels are not modified.
+
+        Raises:
+            ValueError: Labels use packed inputs/metadata, do not match the full
+                input sequence, or request a selected subset of logits.
         """
         if attn_kwargs.pop("_pre_embed_only", False):
             # Context parallelism is not supported; there is no model-owned CP batch prep.
@@ -573,6 +586,20 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             output_hidden_states = getattr(getattr(self, "config", None), "output_hidden_states", False)
         thd_mode = attn_kwargs.get("qkv_format") == "thd"
         inputs_embeds = attn_kwargs.pop("inputs_embeds", None)
+        if labels is not None:
+            packed_metadata = any(
+                value is not None
+                and (key in ("packed_seq_ids", "seq_lens", "seq_lens_padded") or key.startswith("cu_seqlens"))
+                for key, value in attn_kwargs.items()
+            )
+            if thd_mode or packed_metadata or (input_ids is not None and input_ids.ndim != 2):
+                raise ValueError("labels require unpacked inputs without packed sequence metadata")
+            if labels.ndim != 2 or (input_ids is not None and labels.shape != input_ids.shape):
+                raise ValueError("labels must match the full input shape [batch, sequence]")
+            if inputs_embeds is not None and (inputs_embeds.ndim != 3 or labels.shape != inputs_embeds.shape[:2]):
+                raise ValueError("labels require full unpacked inputs_embeds [batch, sequence, hidden]")
+            if not isinstance(logits_to_keep, int) or logits_to_keep != 0:
+                raise ValueError("labels require logits_to_keep=0 to project every input position")
         if pixel_values is not None:
             if input_ids is None or input_ids.ndim != 2:
                 raise ValueError("Image inputs require unpacked input_ids [batch, sequence]")
@@ -599,13 +626,23 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         )
         # The head owns FP32 storage and compute. Keep its FP32 output instead
         # of using the helper's fp32_lm_head mode, which rounds back to BF16.
-        return compute_lm_head_logits(
+        projected = compute_lm_head_logits(
             self.lm_head,
             hidden_states,
             logits_to_keep,
             is_thd=thd_mode,
             output_hidden_states=bool(output_hidden_states),
         )
+        if labels is None:
+            return projected
+        if projected.logits is None or projected.logits.shape[:2] != labels.shape:
+            raise ValueError("labels require logits for every input position")
+        loss = F.cross_entropy(
+            projected.logits[:, :-1].float().reshape(-1, self.config.vocab_size),
+            labels[:, 1:].reshape(-1),
+            ignore_index=-100,
+        )
+        return CausalLMOutputWithPast(loss=loss, logits=projected.logits, hidden_states=projected.hidden_states)
 
     def update_moe_gate_bias(self) -> None:
         self.model.update_moe_gate_bias()
