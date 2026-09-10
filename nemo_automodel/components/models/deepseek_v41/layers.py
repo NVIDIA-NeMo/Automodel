@@ -68,6 +68,7 @@ from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 __all__ = [
     "DeepseekV41Attention",
+    "DeepseekV41AttentionOutput",
     "DeepseekV41Block",
     "DeepseekV41Compressor",
     "DeepseekV41Indexer",
@@ -466,13 +467,14 @@ def select_candidate_blocks(
 # ---------------------------------------------------------------------------
 
 
-@dataclass
+@dataclass(frozen=True)
 class DeepseekV41SharedState:
-    """What attention layers hand down the stack instead of recomputing.
+    """CSA2 state owned by one full-sequence model forward.
 
-    Layers run in order and every source writes before its consumers read.
     ``compress_kv`` / ``index_k`` come from KV source layers, ``topk_idxs`` from
     index source layers and ``candidates`` from the candidate source layer.
+    Tensor fields retain autograd history and are never modified by consumers.
+    A model creates an empty state for every forward, including every microbatch.
     """
 
     compress_kv: torch.Tensor | None = None  # [B, P, head_dim], post-RoPE (fake-quantized) latent
@@ -484,6 +486,19 @@ class DeepseekV41SharedState:
     candidates: torch.Tensor | None = None  # [B, S, P] bool
     compress_ratio: int = 0
     window_topk_idxs: torch.Tensor | None = None  # [B, S, W] sliding-window key positions, shared by all layers
+
+
+@dataclass(frozen=True)
+class DeepseekV41AttentionOutput:
+    """Attention result and the shared state for the next layer.
+
+    Attributes:
+        hidden_states: Tensor of shape [batch, sequence, hidden].
+        state: Shared tensor layouts documented by DeepseekV41SharedState.
+    """
+
+    hidden_states: torch.Tensor
+    state: DeepseekV41SharedState
 
 
 # ---------------------------------------------------------------------------
@@ -768,7 +783,7 @@ class DeepseekV41Attention(nn.Module):
         position_ids: torch.Tensor,
         seq_ids: torch.Tensor,
         state: DeepseekV41SharedState,
-    ) -> None:
+    ) -> DeepseekV41SharedState:
         """Publish consecutive absolute compression groups without rewriting padded latents.
 
         Args:
@@ -777,7 +792,10 @@ class DeepseekV41Attention(nn.Module):
             position_ids: Contiguous zero-based positions [batch, sequence] or [1, sequence].
             seq_ids: Binary valid-token mask [batch, sequence], with zero for right padding.
             state: Shared attention tensors, with layouts documented by DeepseekV41SharedState.
-                This layer replaces fields without modifying the referenced tensors in place.
+
+        Returns:
+            New state containing this source's compressed tensors. The input state
+            and its tensors are never modified.
         """
         ratio = self.compress_ratio
         batch, seq_len, _ = hidden_states.shape
@@ -786,18 +804,23 @@ class DeepseekV41Attention(nn.Module):
         pool_seq_ids = seq_ids[:, : n_pooled * ratio].bool().unflatten(1, (n_pooled, ratio)).all(dim=-1)
         pool_positions = torch.arange(n_pooled, device=hidden_states.device).view(1, -1).expand(batch, -1)
         cos_p, sin_p = rotary_compress(latent, position_ids[:, : n_pooled * ratio : ratio])
+        index_k = None
         if self.indexer is not None and self.indexer.owns_k:
-            state.index_k = self.indexer(latent=latent, cos_p=cos_p, sin_p=sin_p)
+            index_k = self.indexer(latent=latent, cos_p=cos_p, sin_p=sin_p)
         latent = _apply_partial_rope(latent, cos_p, sin_p, self.rope_head_dim)
         # Compressed KV uses groups of 16 with E4M3 scales; the indexer uses 32 with E8M0.
         latent = fake_quant_fp4(latent, 16, "e4m3")
-        state.compress_kv = latent
-        state.pool_seq_ids = pool_seq_ids
-        state.pool_positions = pool_positions
-        state.compress_ratio = ratio
-        state.allowed = build_compressed_visibility(position_ids, seq_ids, pool_seq_ids, pool_positions, ratio)
-        state.topk_idxs = None
-        state.candidates = None
+        return replace(
+            state,
+            compress_kv=latent,
+            index_k=index_k,
+            pool_seq_ids=pool_seq_ids,
+            pool_positions=pool_positions,
+            compress_ratio=ratio,
+            allowed=build_compressed_visibility(position_ids, seq_ids, pool_seq_ids, pool_positions, ratio),
+            topk_idxs=None,
+            candidates=None,
+        )
 
     def forward(
         self,
@@ -810,7 +833,7 @@ class DeepseekV41Attention(nn.Module):
         seq_ids: torch.Tensor,
         state: DeepseekV41SharedState,
         attention_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ) -> DeepseekV41AttentionOutput:
         """Run one attention layer.
 
         Args:
@@ -822,6 +845,11 @@ class DeepseekV41Attention(nn.Module):
             seq_ids: Binary valid-token mask ``[B, S]``, used when attention_mask is omitted.
             state: cross-layer shared state.
             attention_mask: Optional original binary right-padding mask ``[B, S]``.
+
+        Returns:
+            Output with hidden_states [batch, sequence, hidden] and the new state,
+            whose tensors use the layouts in DeepseekV41SharedState. Input tensors
+            and the input state are never mutated.
         """
         batch, seq_len, _ = hidden_states.shape
         if seq_len == 0:
@@ -853,24 +881,27 @@ class DeepseekV41Attention(nn.Module):
         kv = fake_quant_fp8(kv, 32)
 
         keys = kv
-        state.window_topk_idxs = build_window_topk_indices(valid_tokens, self.sliding_window)
-        topk_idxs = state.window_topk_idxs
+        next_state = state
+        topk_idxs = build_window_topk_indices(valid_tokens, self.sliding_window)
         if self.compress_ratio:
+            width = seq_len // self.compress_ratio
             if self.is_kv_source:
-                self._publish_compressed_kv(hidden_states, rotary_compress, position_ids, valid_tokens, state)
-            if state.compress_kv is None or state.compress_ratio != self.compress_ratio:
-                raise RuntimeError(
-                    f"layer {self.layer_idx} (ratio {self.compress_ratio}) found no matching compressed KV; "
-                    "check kv_source_layer_ids / compress_ratios"
+                next_state = self._publish_compressed_kv(
+                    hidden_states, rotary_compress, position_ids, valid_tokens, next_state
                 )
+            elif next_state.compress_kv is None or next_state.compress_ratio != self.compress_ratio:
+                raise ValueError("A CSA2 consumer requires a preceding Full layer with the same compression ratio")
             if self.is_index_source:
-                state.topk_idxs, state.candidates = self.indexer(hidden_states, q_residual, cos, sin, state)
-            elif state.topk_idxs is None:
-                raise RuntimeError(f"Reuse layer {self.layer_idx} found no Top-K indices from an index source")
+                selected, candidates = self.indexer(hidden_states, q_residual, cos, sin, next_state)
+                next_state = replace(next_state, topk_idxs=selected, candidates=candidates)
+            if next_state.topk_idxs is None or next_state.compress_kv is None:
+                raise ValueError("A Reuse CSA2 layer requires compressed KV and indices from its source")
+            if next_state.compress_kv.shape[:2] != (batch, width) or next_state.topk_idxs.shape[:2] != (batch, seq_len):
+                raise ValueError("CSA2 state belongs to a different batch or sequence")
             compressed_idxs = torch.where(
-                state.topk_idxs >= 0, state.topk_idxs + seq_len, torch.full_like(state.topk_idxs, -1)
+                next_state.topk_idxs >= 0, next_state.topk_idxs + seq_len, torch.full_like(next_state.topk_idxs, -1)
             )
-            keys = torch.cat([kv, state.compress_kv], dim=1)
+            keys = torch.cat([kv, next_state.compress_kv], dim=1)
             topk_idxs = torch.cat([topk_idxs, compressed_idxs], dim=-1)
 
         if self.backend.attn == "tilelang":
@@ -919,7 +950,7 @@ class DeepseekV41Attention(nn.Module):
         attn_output = _apply_partial_rope(attn_output.transpose(1, 2), cos, -sin, self.rope_head_dim).transpose(1, 2)
         grouped = attn_output.reshape(batch, seq_len, self.config.o_groups, -1)
         output = self.wo_b(self.wo_a(grouped).flatten(2))
-        return output.masked_fill(~valid_tokens.unsqueeze(-1), 0)
+        return DeepseekV41AttentionOutput(output.masked_fill(~valid_tokens.unsqueeze(-1), 0), next_state)
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
         for module in self.modules():
@@ -1011,7 +1042,7 @@ class DeepseekV41Block(nn.Module):
             vision_token_types: Optional integer tensor [batch, sequence],
                 with -1 for text and nonnegative image-token types.
             state: Shared tensors with layouts documented in DeepseekV41SharedState.
-                Assignments are made to a shallow copy; input tensors retain their history.
+                The input state and its tensors retain their history and are never mutated.
 
         Returns:
             Updated streams of shape [batch, sequence, hc_mult, hidden], FP32 mix
@@ -1023,9 +1054,6 @@ class DeepseekV41Block(nn.Module):
                 "Single-pass mHC requires FP32 carried coefficients. Configure the FSDP mixed precision policy "
                 "with cast_forward_inputs=False and output_dtype=None."
             )
-        # Own assignments locally and return them explicitly: FSDP may copy inputs.
-        # Retaining tensor aliases preserves gradients through shared KV.
-        state = replace(state)
         if self.engram is not None:
             if engram_hash_ids is None:
                 raise ValueError(f"layer {self.layer_idx} has an Engram module but received no hash ids")
@@ -1033,13 +1061,13 @@ class DeepseekV41Block(nn.Module):
 
         attn_pre, attn_post, attn_comb = self.attn_hc(x)
         attn_out = self.self_attn(self.input_layernorm(hc_collapse(x, pre_mix)), state=state, **attn_kwargs)
-        x = hc_expand(attn_out, x, attn_post, attn_comb)
+        x = hc_expand(attn_out.hidden_states, x, attn_post, attn_comb)
 
         ffn_pre, ffn_post, ffn_comb = self.ffn_hc(x)
         self.mlp.gate.set_routing_context(None, vision_token_types)
         mlp_out = self.mlp(self.post_attention_layernorm(hc_collapse(x, attn_pre)), padding_mask)
         x = hc_expand(mlp_out, x, ffn_post, ffn_comb)
-        return x, ffn_pre, state
+        return x, ffn_pre, attn_out.state
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
         self.input_layernorm.reset_parameters()
