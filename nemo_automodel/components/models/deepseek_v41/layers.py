@@ -204,8 +204,21 @@ class _StraightThrough(torch.autograd.Function):
 
 
 def _pow2_ceil_scale(amax: torch.Tensor, max_value: float) -> torch.Tensor:
-    """``2 ** ceil(log2(amax / max_value))`` (the MX-style power-of-two scale)."""
-    return torch.exp2(torch.ceil(torch.log2(amax / max_value)))
+    """Compute MX scale exponents without logarithm rounding at bin boundaries.
+
+    Args:
+        amax: Positive FP32 maxima of shape [..., groups, 1], with arbitrary
+            leading dimensions. Callers clamp to the format's minimum scale.
+        max_value: Maximum representable magnitude in the quantized format.
+
+    Returns:
+        FP32 power-of-two scales with the same shape as amax, matching the
+        reference's reciprocal multiplication and IEEE754 mantissa test.
+    """
+    bits = (amax * (1 / max_value)).contiguous().view(torch.int32)
+    exponent = (bits >> 23) & 255
+    increment = (bits & ((1 << 23) - 1)) != 0
+    return ((exponent + increment.to(torch.int32)) << 23).view(torch.float32)
 
 
 def _round_to_e2m1(x: torch.Tensor) -> torch.Tensor:
@@ -213,6 +226,12 @@ def _round_to_e2m1(x: torch.Tensor) -> torch.Tensor:
 
     Even grid indices (``0, 1, 2, 4``) carry an even mantissa, so a value exactly
     halfway between two grid points resolves to the even-indexed neighbour.
+
+    Args:
+        x: FP32 tensor of arbitrary shape with magnitudes at most 6.
+
+    Returns:
+        Tensor of the same shape and dtype, preserving the sign of zero.
     """
     grid = x.new_tensor(_FP4_E2M1_GRID)
     midpoints = (grid[:-1] + grid[1:]) / 2
@@ -222,7 +241,7 @@ def _round_to_e2m1(x: torch.Tensor) -> torch.Tensor:
         (idx % 2 == 1) & (idx < midpoints.numel()) & (magnitude == midpoints[idx.clamp(max=midpoints.numel() - 1)])
     )
     idx = idx + tie_to_upper.to(idx.dtype)
-    return grid[idx] * torch.sign(x)
+    return torch.copysign(grid[idx], x)
 
 
 def fake_quant_fp8(x: torch.Tensor, block_size: int = 32) -> torch.Tensor:
