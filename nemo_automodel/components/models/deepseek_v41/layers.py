@@ -751,6 +751,8 @@ class DeepseekV41Attention(nn.Module):
         self.backend = backend or BackendConfig()
         if self.backend.attn not in ("eager", "sdpa", "tilelang"):
             raise ValueError("DeepSeek V4.1 attention supports backend.attn='eager', 'sdpa', or 'tilelang'")
+        if self.backend.attn == "tilelang" and config.attention_dropout:
+            raise ValueError("The TileLang sparse attention backend requires attention_dropout=0")
         if self.backend.linear != "torch" or self.backend.rms_norm != "torch_fp32":
             raise ValueError("DeepSeek V4.1 attention requires torch linear layers and torch_fp32 RMSNorm")
         self.layer_idx = layer_idx
@@ -763,6 +765,7 @@ class DeepseekV41Attention(nn.Module):
         self.head_dim = int(config.head_dim)
         self.rope_head_dim = int(config.qk_rope_head_dim)
         self.sliding_window = int(config.sliding_window)
+        self.attention_dropout = config.attention_dropout
         self.scaling = self.head_dim**-0.5
         self.fake_quant = bool(config.kv_cache_fake_quant)
         model_dtype = get_dtype(config.torch_dtype, torch.bfloat16)
@@ -944,11 +947,13 @@ class DeepseekV41Attention(nn.Module):
                     keys.unsqueeze(1),
                     keys.unsqueeze(1),
                     attn_mask=bias,
+                    dropout_p=self.attention_dropout if self.training else 0.0,
                     scale=self.scaling,
                 ).transpose(1, 2)
             else:
                 logits = torch.einsum("bshd,btd->bhst", q.float(), keys.float()) * self.scaling
                 probabilities = (logits + bias).softmax(dim=-1)
+                probabilities = F.dropout(probabilities, p=self.attention_dropout, training=self.training)
                 attn_output = torch.einsum("bhst,btd->bshd", probabilities, keys.float()).to(q.dtype)
 
         # Undo the query rotation on the output so the cache can stay in one shared rotated form.
