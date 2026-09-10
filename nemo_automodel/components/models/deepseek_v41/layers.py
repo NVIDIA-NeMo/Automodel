@@ -355,6 +355,19 @@ class DeepseekV41SharedState:
 # ---------------------------------------------------------------------------
 
 
+class _WeightDtypeLinear(nn.Linear):
+    """``nn.Linear`` that casts its input to the weight dtype inside ``forward``.
+
+    Under FSDP2 the sharded parameter dtype (fp32 master) and the unsharded compute
+    dtype can differ, and the parameter is only unsharded once this module's own
+    pre-forward hook has run, so the cast has to happen here rather than at the call site.
+    """
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """``x``: ``[..., in_features]`` in any float dtype; returns ``[..., out_features]`` in the weight dtype."""
+        return F.linear(x.to(self.weight.dtype), self.weight, self.bias)
+
+
 class DeepseekV41Compressor(nn.Module):
     """Pool ``compress_ratio`` consecutive tokens into one KV latent with a learned softmax gate.
 
@@ -372,7 +385,11 @@ class DeepseekV41Compressor(nn.Module):
         self.head_dim = int(config.head_dim)
         model_dtype = get_dtype(config.torch_dtype, torch.bfloat16)
         proj_dtype = torch.float32 if self.compress_ratio > 1 else model_dtype
-        self.wkv = nn.Linear(config.hidden_size, self.head_dim, bias=False, dtype=proj_dtype)
+        # Ratio-1 projections take whatever dtype the keep-in-fp32 / FSDP policies leave
+        # the weight in; the input is matched inside the module's own forward, where FSDP2
+        # has already unsharded the parameter.
+        linear_cls = nn.Linear if self.compress_ratio > 1 else _WeightDtypeLinear
+        self.wkv = linear_cls(config.hidden_size, self.head_dim, bias=False, dtype=proj_dtype)
         self.wgate = (
             nn.Linear(config.hidden_size, self.head_dim, bias=False, dtype=torch.float32)
             if self.compress_ratio > 1
@@ -389,7 +406,7 @@ class DeepseekV41Compressor(nn.Module):
             # sharded parameter dtype can differ from the unsharded compute dtype.  Read
             # the parameter inside forward (unsharded) and project in the activation
             # dtype, which is what the reference does for ratio-1 compressors.
-            latent = F.linear(hidden_states, self.wkv.weight.to(hidden_states.dtype))
+            latent = self.wkv(hidden_states).to(hidden_states.dtype)
             return self.norm(latent)
         x = hidden_states.float()
         usable = (x.shape[1] // ratio) * ratio
