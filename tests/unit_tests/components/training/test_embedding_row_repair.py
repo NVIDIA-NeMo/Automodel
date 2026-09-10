@@ -26,6 +26,10 @@ from nemo_automodel.components.training.embedding_row_repair import (
 )
 from nemo_automodel.recipes._typed_config import RecipeConfig
 
+# Over the default 5s budget on purpose: this module spawns worker processes; every child re-imports torch from scratch.
+# Shrink the work or the process count before raising this further.
+pytestmark = pytest.mark.timeout(60)
+
 
 class _TinyLM(torch.nn.Module):
     def __init__(self) -> None:

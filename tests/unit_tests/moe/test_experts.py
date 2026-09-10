@@ -37,6 +37,10 @@ from nemo_automodel.components.moe.experts import (
     swiglu_clamped_deepep,
 )
 
+# Over the default 5s budget on purpose: this module launches a fresh interpreter, which re-imports torch from scratch.
+# Shrink the work or the process count before raising this further.
+pytestmark = pytest.mark.timeout(60)
+
 
 @pytest.fixture
 def device():

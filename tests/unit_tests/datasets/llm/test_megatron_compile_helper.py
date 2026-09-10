@@ -29,7 +29,13 @@ import subprocess
 import sys
 from unittest.mock import patch
 
+import pytest
+
 from nemo_automodel.components.datasets.llm.megatron.megatron_utils import compile_helper
+
+# Over the default 5s budget on purpose: this module launches a fresh interpreter, which re-imports torch from scratch.
+# Shrink the work or the process count before raising this further.
+pytestmark = pytest.mark.timeout(60)
 
 
 def test_compile_helper_passes_active_python_to_make():

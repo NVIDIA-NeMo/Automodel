@@ -26,7 +26,12 @@ import torch.multiprocessing as mp
 
 from nemo_automodel.components.models.glm_moe_dsa.cp import glm_dsa_cp_all_gather
 
-pytestmark = pytest.mark.run_only_on("GPU")
+# Over the default 5s budget on purpose: this module spawns worker processes; every child re-imports torch from scratch.
+# Shrink the work or the process count before raising this further.
+pytestmark = [
+    pytest.mark.timeout(60),
+    pytest.mark.run_only_on("GPU"),
+]
 
 _WORLD_SIZE = 2
 

@@ -16,6 +16,7 @@
 
 from pathlib import Path
 
+import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -25,6 +26,10 @@ from torch.distributed.tensor import DTensor, Shard
 
 from nemo_automodel.components.models.qwen3_8_flash_next.engram import Qwen3_8_FlashNextEngramTableConfig
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
+
+# Over the default 5s budget on purpose: this module spawns worker processes; every child re-imports torch from scratch.
+# Shrink the work or the process count before raising this further.
+pytestmark = pytest.mark.timeout(60)
 
 
 class _EngramOnlyModel(nn.Module):

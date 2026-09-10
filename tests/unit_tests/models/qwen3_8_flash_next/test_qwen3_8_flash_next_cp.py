@@ -51,6 +51,10 @@ from nemo_automodel.components.models.qwen3_8_flash_next.model import (
 )
 from nemo_automodel.components.models.qwen3_8_flash_next.qsa import select_qsa_token_ids
 
+# Over the default 5s budget on purpose: this module spawns worker processes; every child re-imports torch from scratch.
+# Shrink the work or the process count before raising this further.
+pytestmark = pytest.mark.timeout(60)
+
 
 class _FakeMesh:
     """Minimal mesh used only for fail-before-collective validation tests."""

@@ -28,6 +28,10 @@ if str(SCRIPTS_DIR) not in sys.path:
 
 import config_resolver  # noqa: E402
 
+# Over the default 5s budget on purpose: this module launches a fresh interpreter, which re-imports torch from scratch.
+# Shrink the work or the process count before raising this further.
+pytestmark = pytest.mark.timeout(60)
+
 yaml = YAML()
 
 

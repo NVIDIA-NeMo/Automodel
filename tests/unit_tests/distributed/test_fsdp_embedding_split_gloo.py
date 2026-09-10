@@ -32,6 +32,10 @@ from torch.distributed.tensor import DTensor
 
 from nemo_automodel.components.distributed.parallelizer import _fully_shard_untied_input_output_embeddings
 
+# Over the default 5s budget on purpose: this module spawns worker processes; every child re-imports torch from scratch.
+# Shrink the work or the process count before raising this further.
+pytestmark = pytest.mark.timeout(60)
+
 
 class _ToyLM(nn.Module):
     def __init__(self, *, tied: bool) -> None:

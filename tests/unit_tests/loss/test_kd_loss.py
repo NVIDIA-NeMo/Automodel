@@ -17,7 +17,6 @@ tensor-parallel helpers.
 """
 
 import sys
-from typing import Optional
 
 import pytest
 import torch
@@ -32,6 +31,10 @@ from nemo_automodel.components.loss.kd_loss import (
     _kl_forward_tp,
 )
 
+# Over the default 5s budget on purpose: this module spawns worker processes; every child re-imports torch from scratch.
+# Shrink the work or the process count before raising this further.
+pytestmark = pytest.mark.timeout(60)
+
 # ---------------------------------------------------------------------------
 # Reference implementation
 # ---------------------------------------------------------------------------
@@ -43,7 +46,7 @@ def _reference_kd_loss(
     labels: torch.Tensor,
     ignore_index: int = -100,
     temperature: float = 1.0,
-    num_batch_labels: Optional[int] = None,
+    num_batch_labels: int | None = None,
 ) -> torch.Tensor:
     """Compute a trusted forward-KL reference.
 
@@ -567,7 +570,7 @@ def test_infer_tp_group_plain_tensor_returns_none():
 # ---------------------------------------------------------------------------
 
 
-def _init_single_process_group() -> Optional[torch.distributed.ProcessGroup]:
+def _init_single_process_group() -> torch.distributed.ProcessGroup | None:
     """Initialise (or reuse) a trivial gloo group for single-process TP tests."""
     if not torch.distributed.is_available():
         return None
