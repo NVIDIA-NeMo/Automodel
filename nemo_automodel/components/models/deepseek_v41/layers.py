@@ -524,7 +524,7 @@ class DeepseekV41SharedState:
 
 
 class _InputDtypeLinear(nn.Linear):
-    """Keep ratio-one projection compute in the incoming activation dtype.
+    """Keep compressor projection compute in the incoming activation dtype.
 
     FSDP may preserve FP32 weight storage. Select the compute dtype after this
     module's own pre-forward hook has made that weight available.
@@ -547,9 +547,9 @@ class DeepseekV41Compressor(nn.Module):
     """Pool ``compress_ratio`` consecutive tokens into one KV latent with a learned softmax gate.
 
     Returns the latent *before* RoPE; the indexer needs the unrotated form and
-    the attention rotates afterwards.  ``compress_ratio == 1`` is a plain
-    projection kept in the model dtype; ratios above 1 pool in fp32 with fp32
-    projection weights, matching the released checkpoint.
+    the attention rotates afterwards. Projection weights stay in FP32 storage.
+    ``compress_ratio == 1`` computes in the activation dtype; ratios above 1
+    project and pool in FP32, matching the released checkpoint.
     """
 
     def __init__(self, config: DeepseekV41Config, compress_ratio: int):
@@ -559,11 +559,7 @@ class DeepseekV41Compressor(nn.Module):
         self.compress_ratio = int(compress_ratio)
         self.head_dim = int(config.head_dim)
         model_dtype = get_dtype(config.torch_dtype, torch.bfloat16)
-        proj_dtype = torch.float32 if self.compress_ratio > 1 else model_dtype
-        # Ratio-1 compute follows the activation dtype even when FSDP preserves
-        # FP32 storage; larger ratios retain FP32 projection and pooling.
-        linear_cls = nn.Linear if self.compress_ratio > 1 else _InputDtypeLinear
-        self.wkv = linear_cls(config.hidden_size, self.head_dim, bias=False, dtype=proj_dtype)
+        self.wkv = _InputDtypeLinear(config.hidden_size, self.head_dim, bias=False, dtype=torch.float32)
         self.wgate = (
             nn.Linear(config.hidden_size, self.head_dim, bias=False, dtype=torch.float32)
             if self.compress_ratio > 1
@@ -590,9 +586,9 @@ class DeepseekV41Compressor(nn.Module):
         return self.norm(pooled.to(hidden_states.dtype))
 
     def init_weights(self, init_std: float = 0.02) -> None:
-        nn.init.trunc_normal_(self.wkv.weight, mean=0.0, std=init_std)
+        nn.init.normal_(self.wkv.weight, mean=0.0, std=init_std)
         if self.wgate is not None:
-            nn.init.trunc_normal_(self.wgate.weight, mean=0.0, std=init_std)
+            nn.init.normal_(self.wgate.weight, mean=0.0, std=init_std)
         self.norm.reset_parameters()
 
 
@@ -725,10 +721,10 @@ class DeepseekV41Indexer(nn.Module):
         return torch.where(valid, indices, torch.full_like(indices, -1)), candidates
 
     def init_weights(self, init_std: float = 0.02) -> None:
-        nn.init.trunc_normal_(self.wq_b.weight, mean=0.0, std=init_std)
-        nn.init.trunc_normal_(self.weights_proj.weight, mean=0.0, std=init_std)
+        nn.init.normal_(self.wq_b.weight, mean=0.0, std=init_std)
+        nn.init.normal_(self.weights_proj.weight, mean=0.0, std=init_std)
         if self.wk is not None:
-            nn.init.trunc_normal_(self.wk.weight, mean=0.0, std=init_std)
+            nn.init.normal_(self.wk.weight, mean=0.0, std=init_std)
             self.k_norm.reset_parameters()
 
 
@@ -779,7 +775,7 @@ class DeepseekV41Attention(nn.Module):
             self.num_heads * self.head_dim // config.o_groups,
             config.o_groups * config.o_lora_rank,
             config.o_groups,
-        )
+        ).to(dtype=model_dtype)
         self.wo_b = nn.Linear(config.o_groups * config.o_lora_rank, config.hidden_size, bias=False, dtype=model_dtype)
         self.sinks_param = DeepseekV4FP32Parameter(torch.zeros(self.num_heads, dtype=torch.float32))
         self.compressor = DeepseekV41Compressor(config, self.compress_ratio) if self.is_kv_source else None
@@ -961,15 +957,12 @@ class DeepseekV41Attention(nn.Module):
         return output.masked_fill((seq_ids <= 0).unsqueeze(-1), 0)
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
-        for linear in (self.wq_a, self.wq_b, self.wkv, self.wo_b, self.wo_a):
-            nn.init.trunc_normal_(linear.weight, mean=0.0, std=init_std)
-        for norm in (self.q_norm, self.kv_norm):
-            norm.reset_parameters()
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, mean=0.0, std=init_std)
+            elif isinstance(module, DeepseekV41RMSNorm):
+                nn.init.ones_(module.weight)
         nn.init.zeros_(self.sinks_param.weight)
-        if self.compressor is not None:
-            self.compressor.init_weights(init_std)
-        if self.indexer is not None:
-            self.indexer.init_weights(init_std)
 
 
 # ---------------------------------------------------------------------------
