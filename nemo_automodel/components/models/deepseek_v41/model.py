@@ -327,12 +327,13 @@ class DeepseekV41Model(nn.Module):
 
     @torch.no_grad()
     def init_weights(self, buffer_device: torch.device | None = None) -> None:
-        buffer_device = buffer_device or torch.device(f"cuda:{torch.cuda.current_device()}")
+        if buffer_device is None:
+            buffer_device = self.embed_tokens.weight.device
         init_std = float(self.config.initializer_range)
         if self.engram_hasher is not None:
             self.engram_hasher.init_weights(buffer_device)
         with buffer_device:
-            nn.init.normal_(self.embed_tokens.weight)
+            nn.init.normal_(self.embed_tokens.weight, std=init_std)
             self.norm.reset_parameters()
         for layer in self.layers.values():
             layer.init_weights(buffer_device=buffer_device, init_std=init_std)
@@ -620,15 +621,7 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 self.model.aligner.init_weights(self.config.initializer_range)
                 for name in ("image_start", "image_end", "image_newline"):
                     nn.init.normal_(getattr(self.model, name), std=self.config.initializer_range)
-            final_out_std = self.config.hidden_size**-0.5
-            cutoff_factor = 3
-            nn.init.trunc_normal_(
-                self.lm_head.weight,
-                mean=0.0,
-                std=final_out_std,
-                a=-cutoff_factor * final_out_std,
-                b=cutoff_factor * final_out_std,
-            )
+            nn.init.normal_(self.lm_head.weight, std=self.config.initializer_range)
         cast_model_to_dtype(self, dtype)
         for layer in self.model.layers.values():
             if layer.engram is not None:
