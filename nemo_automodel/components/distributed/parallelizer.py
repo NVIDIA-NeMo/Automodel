@@ -1143,7 +1143,6 @@ class QwenImageEditParallelizationStrategy(DefaultParallelizationStrategy):
 PARALLELIZATION_STRATEGIES: Dict[str, ParallelizationStrategy] = {
     "NemotronHForCausalLM": NemotronHParallelizationStrategy(),
     "DeepseekV4ForCausalLM": DeepseekV4ParallelizationStrategy(),
-    "DeepseekV41ForCausalLM": DeepseekV4ParallelizationStrategy(),
     "Qwen3_5ForConditionalGeneration": Qwen3_5ParallelizationStrategy(),
     "Qwen3_5ForCausalLM": Qwen3_5ParallelizationStrategy(),
     "WanTransformer3DModel": WanParallelizationStrategy(),
@@ -2021,7 +2020,6 @@ def _get_model_layer_group_specs() -> Dict[Any, Dict[str, List[str]]]:
             "language": ["model.layers"],
             "vision": ["model.vision.blocks"],
         },
-        "DeepseekV41ForCausalLM": {"language": ["model.layers"]},
         # BAGEL (text-to-image + understanding). String-keyed to avoid an
         # import cycle: parallelizer is core distributed code, the BAGEL
         # model lives under components/models/bagel/. Lists both the Qwen2
