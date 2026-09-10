@@ -232,6 +232,7 @@ class DeepseekV41Model(nn.Module):
                 h,
                 pre_mix,
                 padding_mask=moe_padding_mask,
+                attention_mask=attention_mask,
                 engram_hash_ids=layer_hash_ids,
                 engram_mask=engram_mask,
                 vision_token_types=vision_token_types,

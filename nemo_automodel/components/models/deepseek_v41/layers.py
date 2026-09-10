@@ -54,7 +54,6 @@ from nemo_automodel.components.models.deepseek_v4.layers import (
     DeepseekV4FP32Parameter,
     DeepseekV4GroupedLinear,
     DeepseekV4HyperConnection,
-    _compressed_window_metadata,
 )
 from nemo_automodel.components.models.deepseek_v4.model import DeepseekV4VisionGate
 from nemo_automodel.components.models.deepseek_v4.optimized_kernels import (
@@ -392,9 +391,7 @@ def build_window_topk_indices(seq_ids: torch.Tensor, window_size: int) -> torch.
     """Sliding-window key indices per query, ``-1`` where a slot holds nothing.
 
     Args:
-        seq_ids: ``[B, S]`` document ids (``0`` marks padding).  Documents are
-            contiguous, so "same document and at most ``window_size - 1`` tokens
-            back" is exactly the document-relative sliding window.
+        seq_ids: Binary valid-token mask ``[B, S]``, with zero marking right padding.
         window_size: Number of keys (including the query itself) in the window.
 
     Returns:
@@ -409,7 +406,7 @@ def build_window_topk_indices(seq_ids: torch.Tensor, window_size: int) -> torch.
     k_idx = k_idx.unsqueeze(0).expand(batch, -1, -1)
     safe = k_idx.clamp(min=0)
     key_seq = torch.gather(seq_ids, 1, safe.reshape(batch, -1)).view(batch, seq_len, width)
-    valid = (k_idx >= 0) & (key_seq == seq_ids.unsqueeze(-1)) & (seq_ids > 0).unsqueeze(-1)
+    valid = (k_idx >= 0) & key_seq.bool()
     return torch.where(valid, k_idx, torch.full_like(k_idx, -1))
 
 
@@ -420,77 +417,48 @@ def build_compressed_visibility(
     pool_positions: torch.Tensor,
     compress_ratio: int,
 ) -> torch.Tensor:
-    """Which compressed positions each query may attend to.
+    """Apply the reference's absolute compressed-position visibility.
 
-    A pooled group ``j`` (document-relative group index ``pool_positions``) is
-    visible to a query at document-relative position ``i`` once the query has
-    passed the group's last token: ``j < (i + 1) // ratio``.  Groups from other
-    documents, mixed groups (``pool_seq_ids == 0``) and padded queries are invisible.
+    Group ``j`` is visible after its last token: ``j < (i + 1) // ratio``.
+    ``pool_seq_ids`` stores whether every token of that group is valid. Query
+    padding does not change indexer scores; attention masks its final output.
+    ``q_seq_ids`` remains accepted for the existing helper interface.
 
     Returns:
         ``[B, S, P]`` bool mask.
     """
     threshold = ((q_positions + 1) // compress_ratio).unsqueeze(-1)
     allowed = pool_positions.unsqueeze(1) < threshold
-    allowed = allowed & (pool_seq_ids.unsqueeze(1) == q_seq_ids.unsqueeze(-1)) & (q_seq_ids > 0).unsqueeze(-1)
-    return allowed
+    return allowed & pool_seq_ids.bool().unsqueeze(1)
 
 
 def select_candidate_blocks(
     scores: torch.Tensor,
-    allowed: torch.Tensor,
+    visible_lengths: torch.Tensor,
     topk_blocks: int,
     block_size: int,
-    *,
-    pool_positions: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Keep the highest-scoring document-relative blocks for each query.
-
-    The block containing the newest visible key is pinned because it may be partial.
+    """Keep high-scoring absolute blocks and the latest causally visible block.
 
     Args:
         scores: Tensor of shape [batch, sequence, pooled], with unreachable entries at -inf.
-        allowed: Boolean tensor of shape [batch, sequence, pooled], selecting causal,
-            same-document keys.
+        visible_lengths: Integer tensor [batch, sequence, 1], counting causally
+            visible compressed positions independently of padding.
         topk_blocks: Maximum number of candidate blocks per query.
         block_size: Number of pooled positions in each block.
-        pool_positions: Optional tensor of shape [batch, pooled] of document-relative
-            key positions. None preserves absolute block alignment.
 
     Returns:
         Boolean tensor of shape [batch, sequence, pooled] selecting candidate positions.
     """
-    batch, seq_len, width = scores.shape
-    if width == 0:
-        return allowed.clone()
-    positions = torch.arange(width, device=scores.device)
-    inverse_order = None
-    if pool_positions is not None:
-        # Rotate each query's document origin onto a block boundary. Entries from
-        # other documents remain masked; undo the rotation after selecting blocks.
-        latest = torch.where(allowed, positions, -1).amax(dim=-1).clamp_min(0)
-        origin = latest - pool_positions.gather(1, latest)
-        shift = origin.remainder(block_size).unsqueeze(-1)
-        order = (positions + shift).remainder(width)
-        inverse_order = (positions - shift).remainder(width)
-        scores = scores.gather(-1, order)
-        allowed = allowed.gather(-1, order)
-    pad = (-width) % block_size
-    block_scores = torch.nn.functional.pad(scores, (0, pad), value=float("-inf"))
-    block_scores = block_scores.unflatten(-1, (-1, block_size)).amax(dim=-1)  # [B, S, n_blocks]
-    n_blocks = block_scores.shape[-1]
-
-    last_visible = torch.where(allowed, positions, torch.full_like(positions, -1)).amax(dim=-1)  # [B, S]
-    last_block = torch.div(last_visible, block_size, rounding_mode="floor")
-    pin = torch.arange(n_blocks, device=scores.device) == last_block.unsqueeze(-1)
-    block_scores = block_scores.masked_fill(pin & (last_visible >= 0).unsqueeze(-1), float("inf"))
-
-    top = block_scores.topk(min(topk_blocks, n_blocks), dim=-1)
-    keep = torch.zeros_like(block_scores, dtype=torch.bool).scatter_(-1, top.indices, top.values > float("-inf"))
-    candidates = keep.repeat_interleave(block_size, dim=-1)[..., :width]
-    if inverse_order is not None:
-        candidates = candidates.gather(-1, inverse_order)
-    return candidates
+    width = scores.shape[-1]
+    block_scores = F.pad(scores, (0, -width % block_size), value=-torch.inf)
+    block_scores = block_scores.unflatten(-1, (-1, block_size)).amax(dim=-1)
+    last_block = (visible_lengths - 1) // block_size
+    block_ids = torch.arange(block_scores.shape[-1], device=scores.device)
+    block_scores = block_scores.masked_fill(block_ids == last_block, torch.inf)
+    selected = block_scores.topk(min(topk_blocks, block_scores.shape[-1]), dim=-1)
+    keep = torch.zeros_like(block_scores, dtype=torch.bool).scatter(-1, selected.indices, selected.values > -torch.inf)
+    return keep.repeat_interleave(block_size, dim=-1)[..., :width]
 
 
 # ---------------------------------------------------------------------------
@@ -509,8 +477,8 @@ class DeepseekV41SharedState:
 
     compress_kv: torch.Tensor | None = None  # [B, P, head_dim], post-RoPE (fake-quantized) latent
     index_k: torch.Tensor | None = None  # [B, P, index_head_dim]
-    pool_seq_ids: torch.Tensor | None = None  # [B, P] document id per pooled group (0 = invalid)
-    pool_positions: torch.Tensor | None = None  # [B, P] document-relative group index
+    pool_seq_ids: torch.Tensor | None = None  # [B, P] complete valid-group flags (0 = invalid)
+    pool_positions: torch.Tensor | None = None  # [B, P] absolute group index, including invalid groups
     allowed: torch.Tensor | None = None  # [B, S, P] bool visibility of pooled positions
     topk_idxs: torch.Tensor | None = None  # [B, S, K] pooled positions, -1 = none
     candidates: torch.Tensor | None = None  # [B, S, P] bool
@@ -689,6 +657,13 @@ class DeepseekV41Indexer(nn.Module):
             raise RuntimeError(f"Indexer of layer {self.layer_idx} found no published index keys")
         index_k, allowed = state.index_k, state.allowed
         batch, seq_len, _ = hidden_states.shape
+        if index_k.shape[1] == 0:
+            candidates = (
+                torch.empty(batch, seq_len, 0, dtype=torch.bool, device=hidden_states.device)
+                if self.is_candidate_source
+                else state.candidates
+            )
+            return torch.empty(batch, seq_len, 0, dtype=torch.long, device=hidden_states.device), candidates
         q = self.wq_b(q_residual).view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         q = _apply_partial_rope(q, cos, sin, self.rope_head_dim).transpose(1, 2)  # [B, S, H, D]
         q = fake_quant_fp4(q, 32, "e8m0")
@@ -701,15 +676,16 @@ class DeepseekV41Indexer(nn.Module):
 
         candidates = state.candidates
         if self.is_candidate_source:
+            lengths = torch.arange(1, seq_len + 1, device=hidden_states.device) // state.compress_ratio
+            visible_lengths = lengths.view(1, seq_len, 1).expand(batch, -1, -1)
             candidates = select_candidate_blocks(
                 scores,
-                allowed,
+                visible_lengths,
                 self.candidate_topk_blocks,
                 self.candidate_block_size,
-                pool_positions=state.pool_positions,
             )
         elif self.uses_candidates:
-            if candidates is None:
+            if candidates is None or candidates.shape != scores.shape:
                 raise RuntimeError(f"Indexer of layer {self.layer_idx} expects a candidate pool from an earlier layer")
             scores = scores.masked_fill(~candidates, float("-inf"))
 
@@ -793,52 +769,23 @@ class DeepseekV41Attention(nn.Module):
         seq_ids: torch.Tensor,
         state: DeepseekV41SharedState,
     ) -> None:
-        """Publish document-aligned compressed KV and index keys into the layer's state.
+        """Publish consecutive absolute compression groups without rewriting padded latents.
 
         Args:
             hidden_states: Tensor of shape [batch, sequence, hidden].
-            rotary_compress: Rotary module accepting latents and document-relative positions.
-            position_ids: Tensor of shape [batch, sequence], with consecutive positions per document.
-            seq_ids: Tensor of shape [batch, sequence], with positive document IDs and zero padding.
+            rotary_compress: Rotary module accepting latents and absolute positions.
+            position_ids: Contiguous zero-based positions [batch, sequence] or [1, sequence].
+            seq_ids: Binary valid-token mask [batch, sequence], with zero for right padding.
             state: Shared attention tensors, with layouts documented by DeepseekV41SharedState.
                 This layer replaces fields without modifying the referenced tensors in place.
         """
         ratio = self.compress_ratio
-        if ratio > 1:
-            # Select complete document-relative groups, not absolute packed blocks.
-            # There are at most floor(sequence / ratio) complete groups per row.
-            batch, seq_len, hidden = hidden_states.shape
-            positions = torch.arange(seq_len, device=hidden_states.device).expand(batch, -1)
-            starts = (positions - ratio + 1).clamp_min(0)
-            complete = (
-                (position_ids.remainder(ratio) == ratio - 1)
-                & (positions >= ratio - 1)
-                & (seq_ids > 0)
-                & (seq_ids.gather(1, starts) == seq_ids)
-                & (position_ids.gather(1, starts) == position_ids - ratio + 1)
-            )
-            ends = positions.masked_fill(~complete, seq_len).topk(seq_len // ratio, largest=False, sorted=True).values
-            valid = ends < seq_len
-            offsets = torch.arange(1 - ratio, 1, device=hidden_states.device)
-            groups = (ends.unsqueeze(-1) + offsets).clamp(0, seq_len - 1).flatten(1)
-            hidden_states = hidden_states.gather(1, groups.unsqueeze(-1).expand(-1, -1, hidden))
-            position_ids_pooled = position_ids.gather(1, groups)
-            seq_ids_pooled = seq_ids.gather(1, groups).masked_fill(~valid.repeat_interleave(ratio, dim=1), 0)
-        else:
-            position_ids_pooled, seq_ids_pooled = position_ids, seq_ids
+        batch, seq_len, _ = hidden_states.shape
+        n_pooled = seq_len // ratio
         latent = self.compressor(hidden_states)  # [B, P, head_dim], pre-RoPE
-        n_pooled = latent.shape[1]
-        pool_seq_ids, pool_positions = _compressed_window_metadata(
-            seq_ids=seq_ids_pooled,
-            position_ids=position_ids_pooled,
-            ready_len=n_pooled * ratio,
-            ratio=ratio,
-        )
-        if pool_seq_ids is None:  # no complete group yet (sequence shorter than the ratio)
-            pool_seq_ids = seq_ids.new_zeros((seq_ids.shape[0], 0))
-            pool_positions = seq_ids.new_zeros((seq_ids.shape[0], 0))
-        # A latent stands for the first token of its group, so group j takes position j * ratio.
-        cos_p, sin_p = rotary_compress(latent, (pool_positions * ratio).to(latent.device))
+        pool_seq_ids = seq_ids[:, : n_pooled * ratio].bool().unflatten(1, (n_pooled, ratio)).all(dim=-1)
+        pool_positions = torch.arange(n_pooled, device=hidden_states.device).view(1, -1).expand(batch, -1)
+        cos_p, sin_p = rotary_compress(latent, position_ids[:, : n_pooled * ratio : ratio])
         if self.indexer is not None and self.indexer.owns_k:
             state.index_k = self.indexer(latent=latent, cos_p=cos_p, sin_p=sin_p)
         latent = _apply_partial_rope(latent, cos_p, sin_p, self.rope_head_dim)
@@ -862,6 +809,7 @@ class DeepseekV41Attention(nn.Module):
         position_ids: torch.Tensor,
         seq_ids: torch.Tensor,
         state: DeepseekV41SharedState,
+        attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run one attention layer.
 
@@ -870,11 +818,28 @@ class DeepseekV41Attention(nn.Module):
             position_embeddings: main RoPE ``(cos, sin)`` for pure sliding-window layers.
             position_embeddings_compress: compress RoPE (YaRN) ``(cos, sin)`` for CSA2 layers.
             rotary_compress: compress rotary module, used to rotate pooled latents.
-            position_ids: ``[B, S]`` document-relative positions.
-            seq_ids: ``[B, S]`` document ids, ``0`` for padding.
+            position_ids: Contiguous zero-based positions ``[B, S]`` or ``[1, S]``.
+            seq_ids: Binary valid-token mask ``[B, S]``, used when attention_mask is omitted.
             state: cross-layer shared state.
+            attention_mask: Optional original binary right-padding mask ``[B, S]``.
         """
         batch, seq_len, _ = hidden_states.shape
+        if seq_len == 0:
+            raise ValueError("DeepSeek V4.1 attention requires a nonempty full sequence")
+        positions = torch.arange(seq_len, device=hidden_states.device)
+        if position_ids.shape not in ((1, seq_len), (batch, seq_len)) or not torch.equal(
+            position_ids, positions.expand_as(position_ids)
+        ):
+            raise ValueError("DeepSeek V4.1 attention supports only contiguous zero-based full-sequence position_ids")
+        if attention_mask is None:
+            attention_mask = seq_ids
+        if attention_mask.shape != (batch, seq_len):
+            raise ValueError("DeepSeek V4.1 attention_mask must have shape [batch, sequence]")
+        if not torch.all((attention_mask == 0) | (attention_mask == 1)):
+            raise ValueError("DeepSeek V4.1 attention_mask must contain only zero and one")
+        valid_tokens = attention_mask.bool()
+        if torch.any(valid_tokens[:, 1:] & ~valid_tokens[:, :-1]):
+            raise ValueError("DeepSeek V4.1 compression supports right padding only")
         # Compress-ratio layers rotate Q/KV with the compress rope (theta=160000 + YaRN),
         # pure sliding-window layers with the base rope (reference ``Attention.__init__``).
         cos, sin = position_embeddings_compress if self.compress_ratio else position_embeddings
@@ -888,12 +853,11 @@ class DeepseekV41Attention(nn.Module):
         kv = fake_quant_fp8(kv, 32)
 
         keys = kv
-        if state.window_topk_idxs is None:
-            state.window_topk_idxs = build_window_topk_indices(seq_ids, self.sliding_window)
+        state.window_topk_idxs = build_window_topk_indices(valid_tokens, self.sliding_window)
         topk_idxs = state.window_topk_idxs
         if self.compress_ratio:
             if self.is_kv_source:
-                self._publish_compressed_kv(hidden_states, rotary_compress, position_ids, seq_ids, state)
+                self._publish_compressed_kv(hidden_states, rotary_compress, position_ids, valid_tokens, state)
             if state.compress_kv is None or state.compress_ratio != self.compress_ratio:
                 raise RuntimeError(
                     f"layer {self.layer_idx} (ratio {self.compress_ratio}) found no matching compressed KV; "
@@ -910,6 +874,7 @@ class DeepseekV41Attention(nn.Module):
             topk_idxs = torch.cat([topk_idxs, compressed_idxs], dim=-1)
 
         if self.backend.attn == "tilelang":
+            topk_idxs = topk_idxs.masked_fill(~valid_tokens.unsqueeze(-1), -1)
             attn_output = dsv4_sparse_attention(
                 q,
                 keys.contiguous(),
@@ -954,7 +919,7 @@ class DeepseekV41Attention(nn.Module):
         attn_output = _apply_partial_rope(attn_output.transpose(1, 2), cos, -sin, self.rope_head_dim).transpose(1, 2)
         grouped = attn_output.reshape(batch, seq_len, self.config.o_groups, -1)
         output = self.wo_b(self.wo_a(grouped).flatten(2))
-        return output.masked_fill((seq_ids <= 0).unsqueeze(-1), 0)
+        return output.masked_fill(~valid_tokens.unsqueeze(-1), 0)
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
         for module in self.modules():
