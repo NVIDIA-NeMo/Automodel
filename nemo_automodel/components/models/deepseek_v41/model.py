@@ -54,7 +54,6 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     reject_unsupported_tie_word_embeddings,
 )
 from nemo_automodel.components.models.common.utils import (
-    _has_dtensor_params,
     cast_model_to_dtype,
     compute_lm_head_logits,
 )
@@ -646,7 +645,9 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     def initialize_weights(
         self, buffer_device: torch.device | None = None, dtype: torch.dtype = torch.bfloat16
     ) -> None:
-        buffer_device = buffer_device or torch.device(f"cuda:{torch.cuda.current_device()}")
+        """Initialize on the model's device and honor dtype after sharding."""
+        if buffer_device is None:
+            buffer_device = self.model.embed_tokens.weight.device
         with buffer_device:
             self.model.init_weights(buffer_device=buffer_device)
             if self.model.vision is not None:
@@ -663,10 +664,7 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 a=-cutoff_factor * final_out_std,
                 b=cutoff_factor * final_out_std,
             )
-        # After FSDP2 wrapping, parameter dtypes must already be correct from
-        # construction-time metadata; a blanket cast would downcast fp32 DTensors.
-        if not _has_dtensor_params(self):
-            cast_model_to_dtype(self, dtype)
+        cast_model_to_dtype(self, dtype)
         for layer in self.model.layers.values():
             if layer.engram is not None:
                 layer.engram.embed.mark_sharding_contract()
