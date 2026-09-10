@@ -21,21 +21,22 @@ accompanied by 196B Engram parameters.
 
 <Note>
 The numerical results below belong to the original implementation at commit
-`0d5919a5a506dd35dc4f55769410feb98ae854b8`. Final validation of the current PR
-implementation remains pending. The 16-node and 32-node validation runs are
-also pending; neither establishes successful resident 100-update training.
+`0d5919a5a506dd35dc4f55769410feb98ae854b8`. Distributed GPU validation of the
+current PR implementation remains pending. The 16-node and 32-node validation
+runs are also pending; neither establishes successful resident 100-update training.
+
 </Note>
 
-## Fine-tuning
+## Fine-Tuning
 
 Both recipes train all 40 text-backbone layers and both Engram tables. Dense
-parameters use generic FSDP2; routed experts use the shared AutoModel MoE
+parameters use generic FSDP2; routed experts use the shared NeMo AutoModel MoE
 implementation with HybridEP dispatch. Engram reuses the Qwen3.8 Flash Next
 row-owner embedding and distributes each table across the same world ranks
 without a full-table all-gather. Its gradients return to the row owners and
 receive the owner divisor once before clipping.
 
-| Recipe | Topology and batch | Optimizer moments and checkpoints |
+| Recipe | Topology and Batch | Optimizer Moments and Checkpoints |
 |---|---|---|
 | [HellaSwag EP64](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_hellaswag_ep64_16nodes.yaml) | 16 nodes × 4 GB200; EP64, owner64, TP1/PP1/CP1; global batch 64, local batch 1 | BF16 moments; checkpoint saving disabled |
 | [HellaSwag EP128](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_hellaswag_ep128.yaml) | 32 nodes × 4 GB200; EP128, owner128, TP1/PP1/CP1; global batch 128, local batch 1 | FP32 moments; checkpoints every 50 updates |
@@ -75,7 +76,7 @@ allocation spans partial or unequal NVL72 domains. Every training rank must
 inherit it. The EP64 single-domain allocation uses its verified 64-rank domain
 instead of this four-rank override.
 
-Set `DS41_CHECKPOINT` to the absolute path of the shared local HF snapshot for
+Set `DS41_CHECKPOINT` to the absolute path of the shared local Hugging Face snapshot for
 revision `df42c109f1defefcbfcedbe7d905718a12266e40`, using the same directory for
 parity and training. Pass both snapshot overrides to the training command:
 
@@ -113,7 +114,7 @@ See the [Slurm launcher guide](/job-launchers/slurm-cluster),
 for the surrounding workflow. Compilation caches and communication prewarming
 must match the chosen backend, topology, and local input shapes.
 
-## Historical validation and current scope
+## Historical Validation and Current Scope
 
 The original `torch_mm` comparison at commit
 `0d5919a5a506dd35dc4f55769410feb98ae854b8` covers all 40 layers, 4,096 positions,
@@ -127,7 +128,7 @@ residual, mHC, and CSA2 state. Embedding, final norm, and output head weights ar
 replicated. This is complete-backbone streamed-forward evidence; it does not
 establish resident multi-node training or a new parity result for this PR.
 
-| Metric | Original streamed-40 `torch_mm` result |
+| Metric | Original Streamed-40 `torch_mm` Result |
 |---|---:|
 | Mean KL | 0.0017376351 |
 | P95 KL | 0.0005163713 |
