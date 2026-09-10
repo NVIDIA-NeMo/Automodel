@@ -41,6 +41,7 @@ from torch import nn
 from torch.distributed.tensor import DTensor
 from transformers import PreTrainedTokenizerFast
 
+from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41Config
 from nemo_automodel.components.models.qwen3_8_flash_next.engram import Qwen3_8_FlashNextEngramTableConfig
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
@@ -356,6 +357,7 @@ class DeepseekV41Engram(nn.Module):
         config: DeepseekV41Config,
         layer_idx: int,
         layout: EngramLayout,
+        backend: BackendConfig,
         *,
         engram_process_group: dist.ProcessGroup | None = None,
     ) -> None:
@@ -365,6 +367,7 @@ class DeepseekV41Engram(nn.Module):
             config: Model dimensions and the existing table trainability setting.
             layer_idx: Decoder layer containing this Engram.
             layout: Logical hash-table row ranges for all Engram layers.
+            backend: Projection backend selected for the enclosing model.
             engram_process_group: Runtime row owners, defaulting to WORLD when
                 distributed world size exceeds one. Without distributed owners,
                 the complete table is local. Physical rows are padded evenly
@@ -394,8 +397,12 @@ class DeepseekV41Engram(nn.Module):
         self.embed = table_config.build(process_group=engram_process_group, dtype=model_dtype)
         self.embed.weight.requires_grad_(bool(config.engram_trainable))
         self._zero_padding_rows()
-        self.wkv = nn.Linear(
-            layout.n_hash_cols * layout.head_dim, self.dim * (self.hc_mult + 1), bias=False, dtype=model_dtype
+        self.wkv = initialize_linear_module(
+            backend.linear,
+            layout.n_hash_cols * layout.head_dim,
+            self.dim * (self.hc_mult + 1),
+            bias=False,
+            dtype=model_dtype,
         )
         self.q_weight = nn.Parameter(torch.ones(self.hc_mult, self.dim, dtype=model_dtype))
         self.k_weight = nn.Parameter(torch.ones(self.hc_mult, self.dim, dtype=model_dtype))
@@ -478,7 +485,7 @@ class DeepseekV41Engram(nn.Module):
         if not mask_valid:
             raise ValueError("Engram token_mask must be bool [batch, sequence] on the table device on every owner rank")
         rows = self.embed(hash_ids)  # [B, L, n_hash_cols, head_dim]
-        kv = self.wkv(rows.flatten(-2).to(self.wkv.weight.dtype))
+        kv = self.wkv(rows.flatten(-2).to(x.dtype))
         key, value = kv.split([self.hc_mult * self.dim, self.dim], dim=-1)
         key = key.float().unflatten(-1, (self.hc_mult, self.dim))
         weight = self.q_weight.float() * self.k_weight.float()  # only ever used as a product

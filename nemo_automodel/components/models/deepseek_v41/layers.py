@@ -989,7 +989,7 @@ class DeepseekV41Block(nn.Module):
         self.attn_hc = DeepseekV41HyperConnection(**hc_kwargs)
         self.ffn_hc = DeepseekV41HyperConnection(**hc_kwargs)
         self.engram = (
-            DeepseekV41Engram(config, layer_idx, engram_layout, engram_process_group=engram_process_group)
+            DeepseekV41Engram(config, layer_idx, engram_layout, backend, engram_process_group=engram_process_group)
             if engram_layout is not None and layer_idx in engram_layout.layer_ids
             else None
         )
