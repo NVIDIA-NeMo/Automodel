@@ -245,19 +245,6 @@ class DeepseekV41Model(nn.Module):
                 if isinstance(block.ffn, MoE) and self.moe_config.gate_bias_update_factor > 0:
                     block.ffn.gate.update_bias()
 
-    @torch.no_grad()
-    def init_weights(self, buffer_device: torch.device | None = None) -> None:
-        if buffer_device is None:
-            buffer_device = self.embed_tokens.weight.device
-        init_std = float(self.config.initializer_range)
-        if self.engram_hash is not None:
-            self.engram_hash.init_weights()
-        with buffer_device:
-            nn.init.normal_(self.embed_tokens.weight, std=init_std)
-            self.norm.reset_parameters()
-        for layer in self.layers.values():
-            layer.init_weights(buffer_device=buffer_device, init_std=init_std)
-
 
 class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
     """DeepSeek V4.1 causal LM with optional vision and an fp32 ``lm_head``.
@@ -504,17 +491,30 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
     def initialize_weights(
         self, buffer_device: torch.device | None = None, dtype: torch.dtype = torch.bfloat16
     ) -> None:
-        """Initialize on the model's device and honor dtype after sharding."""
+        """Initialize every trainable backbone weight after meta materialization."""
         if buffer_device is None:
             buffer_device = self.model.embed_tokens.weight.device
-        with buffer_device:
-            self.model.init_weights(buffer_device=buffer_device)
-            if self.model.vision is not None:
-                self.model.vision.init_weights(self.config.text_config.initializer_range)
-                self.model.aligner.init_weights(self.config.text_config.initializer_range)
-                for name in ("image_start", "image_end", "image_newline"):
-                    nn.init.normal_(getattr(self.model, name), std=self.config.text_config.initializer_range)
-            nn.init.normal_(self.lm_head.weight, std=self.config.text_config.initializer_range)
+        std = self.config.text_config.initializer_range
+        nn.init.normal_(self.model.embed_tokens.weight, std=std)
+        nn.init.normal_(self.lm_head.weight, std=std)
+        if self.model.vision is not None:
+            self.model.vision.init_weights(std)
+            self.model.aligner.init_weights(std)
+            for parameter in (self.model.image_start, self.model.image_end, self.model.image_newline):
+                nn.init.normal_(parameter, std=std)
+        if self.model.engram_hash is not None:
+            self.model.engram_hash.init_weights()
+        for layer in self.model.layers.values():
+            layer.ffn.init_weights(buffer_device, init_std=std)
+            layer.attn_hc.reset_parameters(std)
+            layer.ffn_hc.reset_parameters(std)
+            nn.init.ones_(layer.attn_norm.weight)
+            nn.init.ones_(layer.ffn_norm.weight)
+            layer.ffn.gate.bias_vl.zero_()
+            layer.attn.init_weights(buffer_device, init_std=std)
+            if layer.engram is not None:
+                layer.engram.init_weights()
+        nn.init.ones_(self.model.norm.weight)
         cast_model_to_dtype(self, dtype)
         for layer in self.model.layers.values():
             if layer.engram is not None:

@@ -1103,14 +1103,3 @@ class DeepseekV41Block(nn.Module):
         mlp_out = self.ffn(self.ffn_norm(self.ffn_hc.collapse(x, attn_mix.pre)), padding_mask)
         x = self.ffn_hc.expand(mlp_out, x, ffn_mix)
         return x, ffn_mix.pre, attn_out.state
-
-    def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
-        self.attn_norm.reset_parameters()
-        self.ffn_norm.reset_parameters()
-        self.attn.init_weights(buffer_device, init_std=init_std)
-        self.ffn.init_weights(buffer_device, init_std=init_std)
-        self.ffn.gate.init_dsv4_weights()
-        self.attn_hc.reset_parameters(init_std)
-        self.ffn_hc.reset_parameters(init_std)
-        if self.engram is not None:
-            self.engram.init_weights()
