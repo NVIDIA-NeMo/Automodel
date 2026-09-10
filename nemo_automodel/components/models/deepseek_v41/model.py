@@ -359,14 +359,8 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         super().__init__()
         self.config = config
         reject_unsupported_tie_word_embeddings(type(self), config)
-        # The distributed CUDA path needs HybridEP's FP32 combination contract.
-        # CPU construction retains the small, local PyTorch reference backend.
         self.backend = backend or BackendConfig(
-            attn="tilelang" if torch.cuda.is_available() else "sdpa",
-            linear="torch",
-            rms_norm="torch_fp32",
-            experts="torch_mm" if torch.cuda.is_available() else "torch",
-            dispatcher="hybridep" if torch.cuda.is_available() else "torch",
+            attn="tilelang", linear="torch", rms_norm="torch_fp32", experts="torch_linear", dispatcher="hybridep"
         )
         if engram_process_group is None and dist.is_available() and dist.is_initialized():
             engram_process_group = dist.group.WORLD
