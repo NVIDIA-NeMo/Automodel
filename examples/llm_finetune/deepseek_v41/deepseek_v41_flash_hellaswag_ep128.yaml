@@ -64,7 +64,7 @@ model:
     attn: tilelang
     linear: torch
     rms_norm: torch_fp32
-    experts: torch_linear
+    experts: torch_mm
     dispatcher: hybridep
     gate_precision: float32
     rope_fusion: false
