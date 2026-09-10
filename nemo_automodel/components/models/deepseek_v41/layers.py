@@ -492,17 +492,24 @@ class DeepseekV41SharedState:
 # ---------------------------------------------------------------------------
 
 
-class _WeightDtypeLinear(nn.Linear):
-    """``nn.Linear`` that casts its input to the weight dtype inside ``forward``.
+class _InputDtypeLinear(nn.Linear):
+    """Keep ratio-one projection compute in the incoming activation dtype.
 
-    Under FSDP2 the sharded parameter dtype (fp32 master) and the unsharded compute
-    dtype can differ, and the parameter is only unsharded once this module's own
-    pre-forward hook has run, so the cast has to happen here rather than at the call site.
+    FSDP may preserve FP32 weight storage. Select the compute dtype after this
+    module's own pre-forward hook has made that weight available.
     """
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """``x``: ``[..., in_features]`` in any float dtype; returns ``[..., out_features]`` in the weight dtype."""
-        return F.linear(x.to(self.weight.dtype), self.weight, self.bias)
+        """Project without changing the registered weight's storage dtype.
+
+        Args:
+            x: Tensor of shape [..., in_features], with arbitrary leading dimensions.
+
+        Returns:
+            Tensor of shape [..., out_features], with x's dtype.
+        """
+        bias = self.bias.to(x.dtype) if self.bias is not None else None
+        return F.linear(x, self.weight.to(x.dtype), bias)
 
 
 class DeepseekV41Compressor(nn.Module):
@@ -522,10 +529,9 @@ class DeepseekV41Compressor(nn.Module):
         self.head_dim = int(config.head_dim)
         model_dtype = get_dtype(config.torch_dtype, torch.bfloat16)
         proj_dtype = torch.float32 if self.compress_ratio > 1 else model_dtype
-        # Ratio-1 projections take whatever dtype the keep-in-fp32 / FSDP policies leave
-        # the weight in; the input is matched inside the module's own forward, where FSDP2
-        # has already unsharded the parameter.
-        linear_cls = nn.Linear if self.compress_ratio > 1 else _WeightDtypeLinear
+        # Ratio-1 compute follows the activation dtype even when FSDP preserves
+        # FP32 storage; larger ratios retain FP32 projection and pooling.
+        linear_cls = nn.Linear if self.compress_ratio > 1 else _InputDtypeLinear
         self.wkv = linear_cls(config.hidden_size, self.head_dim, bias=False, dtype=proj_dtype)
         self.wgate = (
             nn.Linear(config.hidden_size, self.head_dim, bias=False, dtype=torch.float32)
