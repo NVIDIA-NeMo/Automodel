@@ -60,6 +60,7 @@ def calculate_mtp_loss(
     seq_idx: torch.Tensor | None = None,
     lm_weight: torch.Tensor | None = None,
     grad_reduce_group: dist.ProcessGroup | None = None,
+    loss_weights: torch.Tensor | None = None,
     return_per_depth: Literal[False] = False,
 ) -> torch.Tensor: ...
 
@@ -80,6 +81,7 @@ def calculate_mtp_loss(
     seq_idx: torch.Tensor | None = None,
     lm_weight: torch.Tensor | None = None,
     grad_reduce_group: dist.ProcessGroup | None = None,
+    loss_weights: torch.Tensor | None = None,
     return_per_depth: Literal[True],
 ) -> MTPLossOutput: ...
 
@@ -100,6 +102,7 @@ def calculate_mtp_loss(
     seq_idx: torch.Tensor | None = None,
     lm_weight: torch.Tensor | None = None,
     grad_reduce_group: dist.ProcessGroup | None = None,
+    loss_weights: torch.Tensor | None = None,
     return_per_depth: bool,
 ) -> torch.Tensor | MTPLossOutput: ...
 
@@ -119,6 +122,7 @@ def calculate_mtp_loss(
     seq_idx: torch.Tensor | None = None,
     lm_weight: torch.Tensor | None = None,
     grad_reduce_group: dist.ProcessGroup | None = None,
+    loss_weights: torch.Tensor | None = None,
     return_per_depth: bool = False,
 ) -> torch.Tensor | MTPLossOutput:
     """Compute the DeepSeek-V3 Multi-Token Prediction auxiliary loss.
@@ -164,6 +168,8 @@ def calculate_mtp_loss(
             ``full_tensor()`` gather on the FusedLinearCrossEntropy path.
         grad_reduce_group: Group that contributes independent loss shards when
             the shared LM-head weight is a DTensor.
+        loss_weights: Optional per-token objective multipliers matching
+            ``labels.shape``.
         return_per_depth: Return the aggregate loss together with the unscaled
             loss for each MTP depth. Defaults to ``False`` to preserve the
             scalar return expected by existing callers.
@@ -276,6 +282,7 @@ def calculate_mtp_loss(
                 labels=masked,
                 model=model,
                 num_label_tokens=num_label_tokens,
+                loss_weights=loss_weights,
             )
         elif isinstance(loss_fn, FusedLinearCrossEntropy):
             depth_loss = calculate_loss(
@@ -286,6 +293,7 @@ def calculate_mtp_loss(
                 lm_weight=lm_weight,
                 num_label_tokens=num_label_tokens,
                 grad_reduce_group=grad_reduce_group,
+                loss_weights=loss_weights,
             )
         else:
             lm_head = _get_lm_head_module(model)
@@ -297,6 +305,7 @@ def calculate_mtp_loss(
                 labels=masked,
                 model=model,
                 num_label_tokens=num_label_tokens,
+                loss_weights=loss_weights,
             )
         per_depth_losses.append(depth_loss)
         total = total + depth_loss

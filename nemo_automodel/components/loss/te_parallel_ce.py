@@ -148,6 +148,15 @@ class TEParallelCrossEntropy:
 
         Returns:
             Computed loss tensor
+
+        Note:
+            This loss deliberately does NOT accept ``loss_weights``. TE's Triton
+            backward reads ``grad_output`` as a single scalar
+            (``tl.load(grad_output_ptr)`` with no program-id offset), so a
+            per-token upstream gradient would silently collapse to the first
+            token's value: the loss would look right while every token trained
+            with one sample's multiplier. Omitting the parameter makes
+            ``_supports_loss_weights`` reject this class at recipe setup instead.
         """
         if not HAVE_TE_PARALLEL_CE:
             raise ImportError(MISSING_TE_PARALLEL_CE_MSG)
@@ -185,7 +194,7 @@ class TEParallelCrossEntropy:
         elif self.reduction == "sum":
             loss = te_loss.sum()
             if num_label_tokens is not None:
-                loss = loss / num_label_tokens
+                loss = loss * 0.0 if num_label_tokens == 0 else loss / num_label_tokens
             return loss
         else:
             raise ValueError(f"Invalid reduction: {self.reduction}. Must be one of 'none', 'mean', 'sum'")

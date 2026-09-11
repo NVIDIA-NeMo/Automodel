@@ -127,3 +127,75 @@ def test_masked_cross_entropy_num_label_tokens_normalization():
     assert torch.allclose(loss_masked, expected_loss, atol=1e-6), (
         f"Expected normalized loss {expected_loss.item()}, but got {loss_masked.item()}."
     )
+
+
+def test_masked_cross_entropy_per_token_weights_match_loss_and_gradient_reference():
+    """Per-token objective multipliers must scale both loss and logits gradients."""
+    torch.manual_seed(17)
+    logits = torch.randn(2, 3, 7, requires_grad=True)
+    reference_logits = logits.detach().clone().requires_grad_()
+    labels = torch.tensor([[1, 2, -100], [3, 4, 5]])
+    loss_weights = torch.tensor([[0.5, 0.5, 0.5], [1.5, 1.5, 1.5]])
+
+    loss = MaskedCrossEntropy(fp32_upcast=False)(
+        logits,
+        labels,
+        num_label_tokens=5,
+        loss_weights=loss_weights,
+    )
+    per_token = F.cross_entropy(
+        reference_logits.reshape(-1, reference_logits.shape[-1]),
+        labels.reshape(-1),
+        ignore_index=-100,
+        reduction="none",
+    ).reshape_as(labels)
+    reference = (per_token * loss_weights).sum() / 5
+
+    torch.testing.assert_close(loss, reference)
+    loss.backward()
+    reference.backward()
+    torch.testing.assert_close(logits.grad, reference_logits.grad)
+    with torch.no_grad():
+        logits -= 0.1 * logits.grad
+        reference_logits -= 0.1 * reference_logits.grad
+    torch.testing.assert_close(logits, reference_logits)
+
+
+@pytest.mark.parametrize("ignore_index", [-100, -1, 0])
+def test_masked_cross_entropy_honors_configured_ignore_index(ignore_index):
+    """The configured ignore_index must reach F.cross_entropy on every path.
+
+    Before this was threaded through, ``F.cross_entropy`` always used PyTorch's
+    -100 default while the mask branch filled masked positions with
+    ``self.ignore_index``: with any non-default value those positions were
+    trained against a real class instead of being excluded.
+    """
+    torch.manual_seed(0)
+    logits = torch.randn(2, 4, 6)
+    labels = torch.randint(1, 6, (2, 4))
+    mask = torch.tensor([[1, 1, 0, 0], [1, 0, 1, 0]])
+
+    loss = MaskedCrossEntropy(ignore_index=ignore_index, reduction="sum")(logits, labels.clone(), mask=mask)
+
+    expected_labels = labels.clone()
+    expected_labels[mask == 0] = ignore_index
+    reference = F.cross_entropy(
+        logits.reshape(-1, logits.shape[-1]).float(),
+        expected_labels.reshape(-1),
+        ignore_index=ignore_index,
+        reduction="sum",
+    )
+    torch.testing.assert_close(loss, reference)
+
+
+def test_masked_cross_entropy_excludes_only_the_configured_ignore_index():
+    """A non-default ignore_index must not also silently exclude -100."""
+    torch.manual_seed(0)
+    logits = torch.randn(1, 3, 5)
+    labels = torch.tensor([[1, 2, 3]])
+
+    excluded = MaskedCrossEntropy(ignore_index=2, reduction="sum")(logits, labels.clone())
+    reference = F.cross_entropy(logits.reshape(-1, 5).float(), labels.reshape(-1), ignore_index=2, reduction="sum")
+    torch.testing.assert_close(excluded, reference)
+    # position 1 (label == 2) is excluded, the other two contribute
+    assert excluded.item() < F.cross_entropy(logits.reshape(-1, 5).float(), labels.reshape(-1), reduction="sum").item()
