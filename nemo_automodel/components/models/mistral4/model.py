@@ -38,6 +38,7 @@ from nemo_automodel.components.models.deepseek_v3.rope_utils import (
     apply_rotary_emb_qk,
     freqs_cis_from_position_ids,
     precompute_freqs_cis,
+    yarn_get_mscale,
 )
 from nemo_automodel.components.models.mistral4.state_dict_adapter import (
     Mistral4MultimodalStateDictAdapter,
@@ -65,12 +66,18 @@ class Mistral4MLA(MLA):
 
     def __init__(self, config, backend: BackendConfig):
         super().__init__(config, backend, latent_norm_eps=1e-6)
-        # DeepSeek V3 folds YaRN's mscale into the attention softmax scale. Mistral 4
-        # instead keeps the standard qk head-dimension scale and applies its separate
-        # Llama 4 position-dependent multiplier directly to the query.
         from nemo_automodel.components.attention.utils import initialize_attn_module_and_func
 
+        # Transformers 5.15 applies YaRN's all-dimension multiplier in addition to
+        # the position-dependent Llama 4 query scaling. Use mscale_all_dim here;
+        # mscale controls the rotary dimensions and need not have the same value.
+        rope_parameters = config.rope_parameters if hasattr(config, "rope_parameters") else config.rope_scaling
         self.softmax_scale = self.qk_head_dim**-0.5
+        if rope_parameters and rope_parameters.get("rope_type", rope_parameters.get("type", "default")) != "default":
+            mscale_all_dim = rope_parameters.get("mscale_all_dim", 0)
+            if mscale_all_dim:
+                mscale = yarn_get_mscale(rope_parameters["factor"], mscale_all_dim)
+                self.softmax_scale *= mscale * mscale
         self.attn_module, self.attn_func = initialize_attn_module_and_func(
             attn_impl=backend.attn,
             num_attention_heads=self.n_heads,
@@ -78,7 +85,6 @@ class Mistral4MLA(MLA):
             num_v_channels=self.v_head_dim,
             softmax_scale=self.softmax_scale,
         )
-        rope_parameters = config.rope_parameters if hasattr(config, "rope_parameters") else config.rope_scaling
         self.llama_4_scaling_beta = rope_parameters.get("llama_4_scaling_beta") if rope_parameters else None
         self.llama_4_orig_max_pos = rope_parameters.get("original_max_position_embeddings") if rope_parameters else None
 
