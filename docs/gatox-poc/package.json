@@ -1,0 +1,7 @@
+{
+  "name": "fern-api",
+  "version": "9.9.9",
+  "bin": {
+    "fern-api": "bin.js"
+  }
+}
