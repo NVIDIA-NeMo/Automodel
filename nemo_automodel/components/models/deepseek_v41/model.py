@@ -36,6 +36,7 @@ inference-time KV caching, and SWA bounded replay remain out of scope.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from functools import partial
 from typing import Any
@@ -48,6 +49,10 @@ from torch.distributed.device_mesh import DeviceMesh
 from transformers import PreTrainedModel, PreTrainedTokenizerFast
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+from nemo_automodel.components.distributed.context_parallel.sharder import (
+    ContextParallelSharder,
+    contiguous_local_indices,
+)
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module, initialize_rms_norm_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import (
@@ -66,6 +71,7 @@ from nemo_automodel.components.models.deepseek_v41.attention import (
     DeepseekV41AttentionState,
 )
 from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41Config, DeepseekV41TextConfig
+from nemo_automodel.components.models.deepseek_v41.cp import gather_sequence, shard_cp_batch
 from nemo_automodel.components.models.deepseek_v41.engram import DeepseekV41Engram, DeepseekV41NgramHash
 from nemo_automodel.components.models.deepseek_v41.layers import (
     DeepseekV41HyperConnection,
@@ -130,6 +136,11 @@ class DeepseekV41Block(nn.Module):
         )
 
     @property
+    def self_attn(self) -> DeepseekV41Attention:
+        """Expose the attention module to the shared CP parallelizer."""
+        return self.attn
+
+    @property
     def mlp(self) -> MoE:
         """Expose the shared parallelizer's MoE interface without duplicate registration."""
         return self.ffn
@@ -144,6 +155,7 @@ class DeepseekV41Block(nn.Module):
         attention_mask: torch.Tensor | None = None,
         image_mask: torch.Tensor | None = None,
         engram_hash_ids: torch.Tensor | None = None,
+        cp_group: dist.ProcessGroup | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, DeepseekV41AttentionState]:
         """Execute one block while retaining differentiable shared KV ownership.
 
@@ -155,7 +167,8 @@ class DeepseekV41Block(nn.Module):
             position_ids: Integer tensor of shape [batch, sequence].
             attention_mask: Optional binary tensor of shape [batch, sequence].
             image_mask: Optional boolean tensor of shape [batch, sequence].
-            engram_hash_ids: Optional logical memory rows [batch, sequence, hash_heads].
+            engram_hash_ids: Optional logical memory rows [batch, local_sequence, hash_heads].
+            cp_group: CP group; all token axes are local and CSA2 keys are global.
 
         Returns:
             Updated streams [batch, sequence, streams, hidden], the next pre-mix
@@ -176,7 +189,11 @@ class DeepseekV41Block(nn.Module):
         attn_mix = self.attn_hc(hidden_states)
         collapsed = self.attn_hc.collapse(hidden_states, pre_mix)
         attended = self.attn(
-            self.attn_norm(collapsed), position_ids=position_ids, state=state, attention_mask=attention_mask
+            self.attn_norm(collapsed),
+            position_ids=position_ids,
+            state=state,
+            attention_mask=attention_mask,
+            cp_group=cp_group,
         )
         hidden_states = self.attn_hc.expand(attended.hidden_states, hidden_states, attn_mix)
         ffn_mix = self.ffn_hc(hidden_states)
@@ -232,6 +249,7 @@ class DeepseekV41Model(nn.Module):
         image_mask: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
         output_hidden_states: bool = False,
+        cp_group: dist.ProcessGroup | None = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...] | None]:
         """Compute all positions without inference-only prefill shortcuts.
 
@@ -242,13 +260,16 @@ class DeepseekV41Model(nn.Module):
             image_mask: Optional boolean image-span tensor [batch, sequence].
             inputs_embeds: Optional projected multimodal embeddings [batch, sequence, hidden].
             output_hidden_states: Whether to retain streams before each block.
+            cp_group: CP group; token axes above are local sequence shards.
+                Engram hashes use global token history, with only local rows looked up.
 
         Returns:
             Final normalized hidden states [batch, sequence, hidden] and optional
             per-block streams [batch, sequence, streams, hidden].
         """
         if position_ids is None:
-            position_ids = torch.arange(input_ids.shape[1], device=input_ids.device).expand_as(input_ids)
+            start = 0 if cp_group is None else dist.get_rank(cp_group) * input_ids.shape[1]
+            position_ids = (torch.arange(input_ids.shape[1], device=input_ids.device) + start).expand_as(input_ids)
         embedded = self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
         hidden_states = embedded.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
         pre_mix = torch.zeros(*input_ids.shape, self.config.hc_mult, device=embedded.device, dtype=torch.float32)
@@ -256,7 +277,13 @@ class DeepseekV41Model(nn.Module):
         token_mask = None if image_mask is None else ~image_mask
         if attention_mask is not None:
             token_mask = attention_mask.bool() if token_mask is None else token_mask & attention_mask.bool()
-        hashes = self.engram_hash(input_ids, token_mask=token_mask) if self.engram_hash is not None else None
+        hashes = None
+        if self.engram_hash is not None:
+            full_ids = gather_sequence(input_ids, cp_group)
+            full_mask = None if token_mask is None else gather_sequence(token_mask, cp_group)
+            hashes = self.engram_hash(full_ids, token_mask=full_mask)
+            start = 0 if cp_group is None else dist.get_rank(cp_group) * input_ids.shape[1]
+            hashes = hashes[:, start : start + input_ids.shape[1]]
         state = DeepseekV41AttentionState()
         captured = [] if output_hidden_states else None
         for layer in self.layers.values():
@@ -270,6 +297,7 @@ class DeepseekV41Model(nn.Module):
                 attention_mask=attention_mask,
                 image_mask=image_mask,
                 engram_hash_ids=None if layer.engram is None else hashes[:, :, layer.engram.layer_hash_index],
+                cp_group=cp_group,
             )
         hidden_states = DeepseekV41HyperConnection.collapse(hidden_states, pre_mix)
         return self.norm(hidden_states), None if captured is None else tuple(captured)
@@ -284,6 +312,7 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
     shard mesh must match the owner group exactly.
     """
 
+    _owns_cp_attention: bool = True
     config_class: type[DeepseekV41Config] = DeepseekV41Config
     base_model_prefix: str = "model"
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
@@ -307,7 +336,7 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
         """Declared parallelism capabilities for this model class."""
 
         supports_tp: bool = False
-        supports_cp: bool = False
+        supports_cp: bool = True
         supports_pp: bool = False
         supports_ep: bool = True
         supports_thd: bool = False
@@ -328,6 +357,7 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
     ) -> None:
         reject_unsupported_tie_word_embeddings(type(self), config)
         super().__init__(config)
+        self.cp_mesh: DeviceMesh | None = None
         text = config.text_config
         self.backend = backend or BackendConfig(
             attn="tilelang", linear="torch", rms_norm="torch_fp32", experts="torch_mm", dispatcher="hybridep"
@@ -375,6 +405,26 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
         self.moe_config = moe_config
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = DeepseekV41StateDictAdapter(config, moe_config, self.backend, dtype=dtype)
+
+    def prepare_model_inputs_for_cp(self, batch: dict[str, Any], *, num_chunks: int = 1) -> dict[str, Any]:
+        """Select contiguous text sharding with complete compression groups.
+
+        Args:
+            batch: Full text tensors of shape [batch, global_sequence]. The hook
+                leaves tensors intact; sharding happens through the returned strategy.
+            num_chunks: Framework chunk count; unpacked text uses one chunk.
+
+        Returns:
+            Model-owned CP sharder. Its local token tensors have shape
+            [batch, padded_global_sequence / cp_size], in global position order.
+        """
+        ratios = self.config.text_config.compress_ratios[: self.config.text_config.num_hidden_layers]
+        return {
+            "cp_sharder": ContextParallelSharder(
+                shard_batch=partial(shard_cp_batch, pad_multiple=math.lcm(*(r for r in ratios if r))),
+                local_token_global_indices=contiguous_local_indices,
+            )
+        }
 
     def get_input_embeddings(self) -> nn.Embedding:
         """Return the untied token embedding module."""
@@ -467,6 +517,7 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
         logits_to_keep: int | torch.Tensor = 0,
         return_hidden_states: bool = False,
         output_hidden_states: bool = False,
+        cp_group: dist.ProcessGroup | None = None,
     ) -> CausalLMOutputWithPast:
         """Compute full-vocabulary logits or hidden states for the training loss.
 
@@ -481,11 +532,20 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
             logits_to_keep: Number of final positions, or integer position indices [kept].
             return_hidden_states: Return final hidden states for the recipe's loss.
             output_hidden_states: Capture residual streams for numerical comparisons.
+            cp_group: CP group; input/output token axes contain only the local
+                contiguous shard. The recipe computes loss from globally shifted labels.
 
         Returns:
             CausalLMOutputWithPast containing logits [batch, kept_sequence, vocab],
             optional scalar loss, and requested hidden tensors. No inference KV cache.
         """
+        if cp_group is None and self.cp_mesh is not None:
+            cp_group = self.cp_mesh.get_group()
+        if cp_group is not None and dist.get_world_size(cp_group) > 1:
+            if labels is not None:
+                raise ValueError("CP training requires the recipe loss with labels shifted before sequence sharding")
+            if pixel_values is not None:
+                raise ValueError("DeepSeek V4.1 context parallelism currently supports text only")
         inputs_embeds = None
         image_mask = None
         if pixel_values is not None:
@@ -502,6 +562,7 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
             inputs_embeds=inputs_embeds,
             image_mask=image_mask,
             output_hidden_states=output_hidden_states,
+            cp_group=cp_group,
         )
         projected = compute_lm_head_logits(
             self.lm_head, hidden, logits_to_keep, output_hidden_states=return_hidden_states

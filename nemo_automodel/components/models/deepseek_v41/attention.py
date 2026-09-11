@@ -30,13 +30,16 @@ from dataclasses import dataclass, replace
 from functools import partial
 
 import torch
+import torch.distributed as dist
 from torch import nn
+from torch.distributed.device_mesh import DeviceMesh
 from torch.nn import functional as F
 
 from nemo_automodel.components.models.common import BackendConfig, initialize_rms_norm_module
 from nemo_automodel.components.models.deepseek_v4.layers import DeepseekV4FP32Parameter, DeepseekV4GroupedLinear
 from nemo_automodel.components.models.deepseek_v4.optimized_kernels import dsv4_sparse_attention
 from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41TextConfig
+from nemo_automodel.components.models.deepseek_v41.cp import gather_sequence
 from nemo_automodel.components.models.deepseek_v41.layers import DeepseekV41RMSNorm
 from nemo_automodel.components.models.deepseek_v41.quantization import quantize_cache
 from nemo_automodel.shared.utils import dtype_from_str
@@ -54,6 +57,9 @@ class DeepseekV41AttentionState:
         candidates: Optional candidate mask of shape [batch, sequence, compressed].
         compressed_valid: Optional valid-group mask of shape [batch, compressed].
         compression_ratio: Number of tokens represented by a compressed position.
+
+    Under CP, compressed and index-key axes span the global sequence while
+    sequence axes in topk_indices and candidates contain only local queries.
 
     Tensor fields retain autograd history and are never modified by consumers.
     A model creates an empty state for every forward, including every microbatch.
@@ -267,6 +273,8 @@ class _Indexer(nn.Module):
         angles: torch.Tensor,
         compressed_angles: torch.Tensor,
         state: DeepseekV41AttentionState,
+        position_ids: torch.Tensor | None = None,
+        cp_group: dist.ProcessGroup | None = None,
     ) -> DeepseekV41AttentionState:
         """Produce index keys when owned, then replace the current selection.
 
@@ -277,6 +285,9 @@ class _Indexer(nn.Module):
             angles: FP32 rotary angles of shape [batch, sequence, rotary_pairs].
             compressed_angles: FP32 angles of shape [batch, compressed, rotary_pairs].
             state: Shared tensors with layouts in DeepseekV41AttentionState.
+            position_ids: Optional global positions [batch, local_sequence].
+            cp_group: Optional CP group; latent and compressed_angles contain
+                local complete groups, while state index keys span all ranks.
 
         Returns:
             New state with index_keys [batch, compressed, index_head_dim],
@@ -290,6 +301,7 @@ class _Indexer(nn.Module):
             keys = quantize_cache(
                 _apply_rope(self.k_norm(self.wk(latent)), compressed_angles), format="mxfp4", block_size=32
             )
+            keys = gather_sequence(keys, cp_group)
         if keys is None:
             raise ValueError("A Reindex CSA2 layer requires index keys from a preceding Full layer")
         batch, sequence, _ = hidden_states.shape
@@ -311,8 +323,10 @@ class _Indexer(nn.Module):
         # Preserve the reference's BF16 matmul result and reduction boundaries.
         scores = torch.einsum("bshd,btd->bsht", queries, keys)
         scores = (scores.relu() * weights.unsqueeze(-1)).sum(dim=2)
-        lengths = torch.arange(1, sequence + 1, device=hidden_states.device) // state.compression_ratio
-        visible_lengths = lengths.view(1, sequence, 1).expand(batch, -1, -1)
+        if position_ids is None:
+            position_ids = torch.arange(sequence, device=hidden_states.device).unsqueeze(0)
+        lengths = (position_ids + 1) // state.compression_ratio
+        visible_lengths = lengths.unsqueeze(-1).expand(batch, -1, -1)
         allowed = torch.arange(width, device=hidden_states.device) < visible_lengths
         if state.compressed_valid is not None:
             allowed = allowed & state.compressed_valid.unsqueeze(1)
@@ -342,8 +356,9 @@ class DeepseekV41Attention(nn.Module):
 
     The training implementation supports eager, SDPA and TileLang attention with
     torch linear layers and eager FP32 or TE RMSNorm. Packed sequences, left padding, KV-cache
-    decoding, and sequence/context/tensor sharding require additional state rules
-    and are rejected rather than silently using incorrect compression boundaries.
+    decoding and tensor sharding remain unsupported. Context parallelism keeps
+    contiguous local queries and exchanges window KV and shared compressed KV.
+    Every local sequence must contain complete compression groups.
     """
 
     def __init__(self, config: DeepseekV41TextConfig, layer_idx: int, backend: BackendConfig) -> None:
@@ -355,6 +370,7 @@ class DeepseekV41Attention(nn.Module):
         if backend.linear != "torch" or backend.rms_norm not in ("torch_fp32", "te"):
             raise ValueError("DeepSeek V4.1 attention requires torch linear layers and torch_fp32 or te RMSNorm")
         self.backend = backend
+        self.cp_group: dist.ProcessGroup | None = None
         self.layer_idx = layer_idx
         self.compress_ratio = config.compress_ratios[layer_idx]
         self.num_heads = config.num_attention_heads
@@ -395,6 +411,10 @@ class DeepseekV41Attention(nn.Module):
             if self.is_index_source
             else None
         )
+
+    def setup_cp_attention(self, cp_mesh: DeviceMesh) -> None:
+        """Configure the model-owned KV transport through the shared CP hook."""
+        self.cp_group = cp_mesh.get_group()
 
     @property
     def attn_sink(self) -> nn.Parameter:
@@ -437,18 +457,22 @@ class DeepseekV41Attention(nn.Module):
         position_ids: torch.Tensor,
         state: DeepseekV41AttentionState,
         attention_mask: torch.Tensor | None = None,
+        cp_group: dist.ProcessGroup | None = None,
     ) -> DeepseekV41AttentionOutput:
         """Apply attention and publish immutable state for the next layer.
 
         Args:
             hidden_states: Tensor of shape [batch, sequence, hidden].
             position_ids: Integer tensor of shape [batch, sequence] or [1, sequence],
-                containing contiguous zero-based positions. Packed/reset and
-                incremental positions are unsupported.
+                containing contiguous global positions; CP rank r starts at
+                r * local_sequence. Packed/reset and incremental positions
+                are unsupported.
             state: Per-forward tensors documented in DeepseekV41AttentionState.
                 Consumers must receive the state from their preceding layer.
             attention_mask: Optional binary right-padding mask of shape
-                [batch, sequence], with one for tokens and zero for padding.
+                [batch, local_sequence], with one for tokens and zero for padding.
+            cp_group: Optional CP group, overriding setup_cp_attention. Hidden
+                states and positions are local shards; shared KV state is global.
 
         Returns:
             Output with hidden_states [batch, sequence, hidden] and the new state,
@@ -458,7 +482,13 @@ class DeepseekV41Attention(nn.Module):
         batch, sequence, _ = hidden_states.shape
         if sequence == 0:
             raise ValueError("DeepSeek V4.1 attention requires a nonempty full sequence")
-        positions = torch.arange(sequence, device=hidden_states.device)
+        cp_group = self.cp_group if cp_group is None else cp_group
+        cp_size = 1 if cp_group is None else dist.get_world_size(cp_group)
+        cp_rank = 0 if cp_group is None else dist.get_rank(cp_group)
+        if cp_size > 1 and self.compress_ratio and sequence % self.compress_ratio:
+            raise ValueError("DeepSeek V4.1 CP shards must contain complete compression groups")
+        global_sequence = sequence * cp_size
+        positions = torch.arange(sequence, device=hidden_states.device) + cp_rank * sequence
         if position_ids.shape not in ((1, sequence), (batch, sequence)) or not torch.equal(
             position_ids, positions.expand_as(position_ids)
         ):
@@ -472,29 +502,39 @@ class DeepseekV41Attention(nn.Module):
             valid_tokens = attention_mask.bool()
             if torch.any(valid_tokens[:, 1:] & ~valid_tokens[:, :-1]):
                 raise ValueError("DeepSeek V4.1 compression supports right padding only")
+        global_valid = gather_sequence(valid_tokens, cp_group)
+        if torch.any(global_valid[:, 1:] & ~global_valid[:, :-1]):
+            raise ValueError("DeepSeek V4.1 compression supports right padding only across CP ranks")
         angles = self.rotary_emb(position_ids)
         query_latent = self.q_norm(self.wq_a(hidden_states))
         query = _apply_rope(self.wq_b(query_latent).unflatten(-1, (self.num_heads, self.head_dim)), angles)
         kv = quantize_cache(_apply_rope(self.kv_norm(self.wkv(hidden_states)), angles), format="fp8", block_size=32)
-        local_allowed = (positions.unsqueeze(0) <= positions.unsqueeze(1)) & (
-            positions.unsqueeze(0) > positions.unsqueeze(1) - self.window_size
+        kv = gather_sequence(kv, cp_group)
+        key_positions = torch.arange(global_sequence, device=positions.device)
+        local_allowed = (key_positions.unsqueeze(0) <= positions.unsqueeze(1)) & (
+            key_positions.unsqueeze(0) > positions.unsqueeze(1) - self.window_size
         )
-        allowed = local_allowed.unsqueeze(0) & valid_tokens.unsqueeze(1)
+        allowed = local_allowed.unsqueeze(0) & global_valid.unsqueeze(1)
         next_state = state
         if self.compress_ratio:
-            width = sequence // self.compress_ratio
-            compressed_angles = self.rotary_emb(position_ids[:, : width * self.compress_ratio : self.compress_ratio])
+            width = global_sequence // self.compress_ratio
+            local_width = sequence // self.compress_ratio
+            compressed_angles = self.rotary_emb(
+                position_ids[:, : local_width * self.compress_ratio : self.compress_ratio]
+            )
             latent = None
             if self.compressor is not None:
                 latent = self.compressor(hidden_states)
                 compressed_valid = (
-                    valid_tokens[:, : width * self.compress_ratio]
-                    .unflatten(1, (width, self.compress_ratio))
+                    valid_tokens[:, : local_width * self.compress_ratio]
+                    .unflatten(1, (local_width, self.compress_ratio))
                     .all(dim=-1)
                 )
                 next_state = DeepseekV41AttentionState(
-                    compressed_kv=quantize_cache(_apply_rope(latent, compressed_angles), format="nvfp4", block_size=16),
-                    compressed_valid=compressed_valid,
+                    compressed_kv=gather_sequence(
+                        quantize_cache(_apply_rope(latent, compressed_angles), format="nvfp4", block_size=16), cp_group
+                    ),
+                    compressed_valid=gather_sequence(compressed_valid, cp_group),
                     compression_ratio=self.compress_ratio,
                 )
             elif next_state.compressed_kv is None or next_state.compression_ratio != self.compress_ratio:
@@ -507,6 +547,8 @@ class DeepseekV41Attention(nn.Module):
                     angles=angles,
                     compressed_angles=compressed_angles,
                     state=next_state,
+                    position_ids=position_ids,
+                    cp_group=cp_group,
                 )
             if next_state.topk_indices is None or next_state.compressed_kv is None:
                 raise ValueError("A Reuse CSA2 layer requires compressed KV and indices from its source")
@@ -526,14 +568,14 @@ class DeepseekV41Attention(nn.Module):
             # Preserve the released sparse slot order and reuse V4's trainable
             # online-softmax kernel, including its BF16 probability boundary.
             slots = (positions - self.window_size + 1).clamp_min(0).unsqueeze(-1)
-            slots = slots + torch.arange(min(sequence, self.window_size), device=positions.device)
+            slots = slots + torch.arange(min(global_sequence, self.window_size), device=positions.device)
             visible = slots <= positions.unsqueeze(-1)
             slots = slots.expand(batch, -1, -1)
-            visible = visible.unsqueeze(0) & valid_tokens.gather(1, slots.flatten(1)).view_as(slots)
+            visible = visible.unsqueeze(0) & global_valid.gather(1, slots.flatten(1)).view_as(slots)
             indices = torch.where(visible, slots, -1)
             if self.compress_ratio:
                 selected = next_state.topk_indices
-                indices = torch.cat((indices, torch.where(selected >= 0, selected + sequence, -1)), dim=-1)
+                indices = torch.cat((indices, torch.where(selected >= 0, selected + global_sequence, -1)), dim=-1)
             indices = indices.masked_fill(~valid_tokens.unsqueeze(-1), -1)
             indices = F.pad(indices, (0, -indices.shape[-1] % 64), value=-1)
             attended = dsv4_sparse_attention(

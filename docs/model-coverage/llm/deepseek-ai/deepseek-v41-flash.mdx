@@ -67,6 +67,29 @@ See the [Slurm launcher guide](/job-launchers/slurm-cluster) and
 and communication prewarming must match the backend, topology, and local
 input shapes.
 
+## Context Parallelism
+
+Unpacked, right-padded text supports context parallelism with contiguous sequence
+shards. Set `distributed.cp_size` and retain the same global batch size when
+comparing CP sizes. The model's sharder pads the global sequence so each rank
+owns complete compression groups and preserves global position IDs. Shift
+labels before sharding and use the recipe's external loss; direct `labels=`
+loss is unavailable when CP is active.
+
+Queries and hidden activations remain local. Window KV, newly compressed KV,
+and index keys are gathered across the CP group; reused compressed KV retains
+its gradient history across layers. Engram gathers integer token history for
+N-gram hashing, then looks up only the local tokens through the existing row
+owners. CP does not gather full Engram tables. TP, PP, packed documents, and
+image inputs remain outside this CP path.
+
+The [Tulu3 CP recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_tulu3_cp.yaml)
+uses 4,096-token sequences, TE RMSNorm, EP64 and 64 Engram owners. At global
+batch 64 and local batch 1, CP1 uses one microbatch per update and CP8 uses
+eight. Both runs must use the same prepared Arrow data, tokenizer, initial
+checkpoint, optimizer, and seed. The provided chat template follows the
+released chat-mode message format and masks loss to assistant content.
+
 ## Loading and Inputs
 
 Set `DS41_CHECKPOINT` to the shared local Hugging Face snapshot of revision
@@ -170,7 +193,7 @@ restoration, or full-model convergence.
 
 ## Current Scope
 
-THD packing, TP, PP, CP, incremental generation caches, bounded decoder replay,
+THD packing, TP, PP, incremental generation caches, bounded decoder replay,
 and million-token training are unsupported. Image inputs also require
 unpacked batches. Indexers remain frozen because hard top-k selection has no
 language-model gradient; indexer distillation and DSpark draft training are
