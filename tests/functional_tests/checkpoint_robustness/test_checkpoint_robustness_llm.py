@@ -35,11 +35,11 @@ import os
 import sys
 import time
 import traceback
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import timedelta
-from functools import wraps
+from functools import cache, wraps
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
@@ -51,6 +51,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor
 
+from nemo_automodel.components.attention.flex_attention import FlexAttention
 from nemo_automodel.components.checkpoint.checkpointing import (
     _MODELS_REQUIRING_BUFFER_REINIT,
     _reinit_non_persistent_buffers,
@@ -2112,20 +2113,101 @@ def _get_logits_pp(trainer, input_ids, device) -> torch.Tensor:
     return buf.cpu()
 
 
-def _get_logits(model, input_ids, device, trainer=None) -> torch.Tensor:
-    """Forward pass returning float32 logits on CPU."""
-    if trainer is not None and getattr(trainer, "pp_enabled", False):
-        return _get_logits_pp(trainer, input_ids, device)
+@cache
+def _parity_flex_attention() -> Callable[..., torch.Tensor | tuple[torch.Tensor, torch.Tensor]]:
+    """Compile one static, fixed-tile FlexAttention callable per test process.
 
-    model.eval()
-    ids = torch.tensor([input_ids], device=device)
-    attention_mask = torch.ones_like(ids)
-    with torch.no_grad():
-        out = model(input_ids=ids, attention_mask=attention_mask, use_cache=False)
-        logits = out.logits if hasattr(out, "logits") else out
-        if isinstance(logits, DTensor):
-            logits = logits.full_tensor()
-        return logits.float().cpu()
+    The compiler retains specializations for the parity input geometries for the
+    lifetime of this process. Training continues to use the original callable.
+    """
+    from torch.nn.attention.flex_attention import BlockMask, flex_attention
+
+    # A distinct code object keeps training's recompilations out of the parity
+    # cache budget. Full-graph mode rejects fallback to unfused attention.
+    @torch.compile(dynamic=False, fullgraph=True)
+    def attention(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        block_mask: BlockMask,
+        scale: float | None = None,
+        enable_gqa: bool = False,
+        return_lse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Run fixed-tile attention through a dedicated compiler entry point.
+
+        Args:
+            q: Tensor of shape [batch, query_heads, query_sequence, head_dim].
+            k: Tensor of shape [batch, kv_heads, key_sequence, head_dim].
+            v: Tensor of shape [batch, kv_heads, key_sequence, value_dim].
+            block_mask: BlockMask describing allowed positions of shape
+                [batch, query_heads, query_sequence, key_sequence].
+            scale: Optional query/key scale; defaults to inverse sqrt(head_dim).
+            enable_gqa: Allow query_heads to be a multiple of kv_heads.
+            return_lse: Also return the attention log-sum-exp for attention sinks.
+
+        Returns:
+            Output of shape [batch, query_heads, query_sequence, value_dim], or
+            that output and log-sum-exp of shape [batch, query_heads, query_sequence].
+        """
+        return flex_attention(
+            q,
+            k,
+            v,
+            block_mask=block_mask,
+            scale=scale,
+            enable_gqa=enable_gqa,
+            return_lse=return_lse,
+            kernel_options={"BLOCK_M": 64, "BLOCK_N": 64},
+        )
+
+    return attention
+
+
+@contextmanager
+def _fixed_flex_attention_for_parity(model_parts: Sequence[torch.nn.Module]) -> Iterator[None]:
+    """Keep shared FlexAttention numerics consistent across parity forwards.
+
+    Training can generalize the compiled shapes and select different tiles from
+    a fresh reload. Fix both policies for reference and candidate forwards; even
+    small attention differences can change MoE routes. The override is local to
+    these serial test forwards and is restored on both success and failure.
+
+    Args:
+        model_parts: Local model parts, including every local pipeline stage.
+            Models using other attention implementations are left untouched.
+
+    Yields:
+        None while the shared FlexAttention callable is temporarily replaced.
+    """
+    if not any(isinstance(module, FlexAttention) for part in model_parts for module in part.modules()):
+        yield
+        return
+    original = FlexAttention.flex_attn
+    FlexAttention.flex_attn = _parity_flex_attention()
+    try:
+        yield
+    finally:
+        FlexAttention.flex_attn = original
+
+
+def _get_logits(model, input_ids, device, trainer=None) -> torch.Tensor:
+    """Run a parity forward and return float32 CPU logits of shape [1, sequence, vocab]."""
+    model_parts = trainer.model_parts if trainer is not None else [model]
+    with _fixed_flex_attention_for_parity(model_parts):
+        if trainer is not None and getattr(trainer, "pp_enabled", False):
+            return _get_logits_pp(trainer, input_ids, device)
+
+        model.eval()
+        ids = torch.tensor([input_ids], device=device)
+        attention_mask = torch.ones_like(ids)
+        with torch.no_grad():
+            out = model(input_ids=ids, attention_mask=attention_mask, use_cache=False)
+            logits = out.logits if hasattr(out, "logits") else out
+            if isinstance(logits, DTensor):
+                logits = logits.full_tensor()
+            return logits.float().cpu()
 
 
 def _reinit_rotary_per_module(model, default_device):
