@@ -136,6 +136,7 @@ class TestBuildMoeConfig:
         assert moe_config.score_func == "softmax_with_bias"
         assert moe_config.dim == 64
         assert moe_config.moe_inter_dim == 32
+        assert moe_config.router_weights_fp32 is True
 
 
 # ---------------------------------------------------------------------------

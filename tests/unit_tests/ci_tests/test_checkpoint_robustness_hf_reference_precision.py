@@ -12,8 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
+
 import pytest
 import torch
+from transformers.models.mistral4 import modeling_mistral4 as hf_module
 from transformers.models.mistral4.configuration_mistral4 import Mistral4Config
 from transformers.models.mistral4.modeling_mistral4 import Mistral4TopkRouter
 
@@ -21,11 +24,12 @@ from nemo_automodel.components.config.loader import ConfigNode
 from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm import (
     _extract_custom_args,
     _hf_reference_context,
+    _with_fp32_rotary_application,
 )
 
 
 def _reference_config(enabled: bool = True) -> ConfigNode:
-    return ConfigNode({"ci": {"checkpoint_robustness": {"hf_router_scores_fp32": enabled}}})
+    return ConfigNode({"ci": {"checkpoint_robustness": {"hf_reference_compute_fp32": enabled}}})
 
 
 def _router(dtype=torch.bfloat16):
@@ -135,8 +139,8 @@ def test_tracked_recipe_selects_precision_context_without_relaxing_source_or_aut
 
     cfg = ConfigNode(yaml.safe_load(recipe.read_text()))
     custom, remaining = _extract_custom_args(["--config", str(recipe)])
-    assert "hf_router_scores_fp32" not in custom
-    assert not any("hf_router_scores_fp32" in value for value in remaining)
+    assert "hf_reference_compute_fp32" not in custom
+    assert not any("hf_reference_compute_fp32" in value for value in remaining)
     assert custom["parity_tolerance_profile_overrides"] == {"hf_reload": "relaxed"}
     assert "parity_threshold_overrides" not in custom
     router = _router()
@@ -154,3 +158,165 @@ def test_reference_precision_can_be_disabled_explicitly():
     with _hf_reference_context(_reference_config(enabled=False), router):
         assert router(hidden)[1].dtype == torch.bfloat16
     assert "forward" not in router.__dict__
+
+
+def test_reference_norm_delays_rounding_and_preserves_weight_gradients():
+    torch.manual_seed(12)
+    norm = hf_module.Mistral4RMSNorm(32).bfloat16()
+    with torch.no_grad():
+        norm.weight.uniform_(0.1, 4.0)
+    hidden = torch.randn(3, 17, 32, dtype=torch.bfloat16, requires_grad=True)
+    model = torch.nn.ModuleList([_router(), norm])
+    native = norm(hidden)
+    original_weight = norm.weight
+    x64 = hidden.detach().double()
+    oracle = (
+        x64 * torch.rsqrt(x64.square().mean(-1, keepdim=True) + norm.variance_epsilon) * norm.weight.double()
+    ).bfloat16()
+    reference = copy.deepcopy(norm).float()
+    reference_input = hidden.detach().float().requires_grad_()
+    with _hf_reference_context(_reference_config(), model):
+        actual = norm(hidden)
+        assert actual.dtype == hidden.dtype
+        assert (actual.float() - oracle.float()).square().sum() < (native.float() - oracle.float()).square().sum()
+        torch.testing.assert_close(actual, oracle, atol=0, rtol=0)
+        gradient = torch.randn_like(actual)
+        actual.backward(gradient)
+        reference(reference_input).bfloat16().backward(gradient)
+    assert norm.weight is original_weight and norm.weight.dtype == torch.bfloat16
+    torch.testing.assert_close(hidden.grad, reference_input.grad.bfloat16(), atol=0, rtol=0)
+    torch.testing.assert_close(norm.weight.grad, reference.weight.grad.bfloat16(), atol=0, rtol=0)
+    torch.testing.assert_close(norm(hidden), native, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("interleave", [False, True])
+def test_reference_rotation_matches_fp64_math_and_gradients(interleave):
+    torch.manual_seed(12)
+    q = torch.randn(2, 3, 11, 8, dtype=torch.bfloat16, requires_grad=True)
+    k = torch.randn(2, 1, 11, 8, dtype=torch.bfloat16, requires_grad=True)
+    angles = torch.randn(2, 11, 4)
+    cos = torch.cat([angles.cos()] * 2, -1)
+    sin = torch.cat([angles.sin()] * 2, -1)
+    function = hf_module.apply_rotary_pos_emb_interleave if interleave else hf_module.apply_rotary_pos_emb
+    actual = _with_fp32_rotary_application(function)(q, k, cos, sin)
+    for x, rotated in zip((q, k), actual):
+        x64 = x.detach().double().requires_grad_()
+        a, b = (x64[..., 0::2], x64[..., 1::2]) if interleave else x64.chunk(2, dim=-1)
+        c, s = cos[..., :4].double().unsqueeze(1), sin[..., :4].double().unsqueeze(1)
+        oracle = torch.cat((a * c - b * s, b * c + a * s), dim=-1).bfloat16()
+        # FP32 subtraction can straddle a BF16 midpoint near cancellation.
+        torch.testing.assert_close(rotated, oracle, atol=2e-7, rtol=0)
+        gradient = torch.randn_like(rotated)
+        rotated.backward(gradient)
+        oracle.backward(gradient)
+        torch.testing.assert_close(x.grad, x64.grad.bfloat16(), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("interleave", [False, True])
+def test_reference_attention_uses_fp32_tables_and_restores_native_dispatch(interleave):
+    torch.manual_seed(12)
+    config = Mistral4Config(
+        hidden_size=16,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        q_lora_rank=8,
+        kv_lora_rank=8,
+        qk_nope_head_dim=4,
+        qk_rope_head_dim=4,
+        v_head_dim=8,
+        rope_interleave=interleave,
+    )
+    config._attn_implementation = "sdpa"
+    attention = hf_module.Mistral4Attention(config, layer_idx=0).bfloat16()
+    rotary = hf_module.Mistral4RotaryEmbedding(config)
+    model = torch.nn.ModuleList([_router(), attention, rotary])
+    unaffected = copy.deepcopy(attention)
+    hidden = torch.randn(2, 7, 16, dtype=torch.bfloat16, requires_grad=True)
+    position_ids = torch.arange(8192, 8199).unsqueeze(0).expand(2, -1)
+    native_tables = rotary(hidden, position_ids)
+    expected_tables = rotary(hidden.float(), position_ids)
+    native = unaffected(hidden, native_tables, None, position_ids)[0]
+    original_functions = (hf_module.apply_rotary_pos_emb, hf_module.apply_rotary_pos_emb_interleave)
+    with _hf_reference_context(_reference_config(), model):
+        tables = rotary(hidden, position_ids)
+        for actual, expected in zip(tables, expected_tables):
+            assert actual.dtype == torch.float32
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        actual = attention(hidden, tables, None, position_ids)[0]
+        assert actual.shape == hidden.shape and actual.dtype == hidden.dtype
+        actual.square().mean().backward()
+        assert torch.isfinite(hidden.grad).all() and torch.count_nonzero(hidden.grad) > 0
+        assert (hf_module.apply_rotary_pos_emb, hf_module.apply_rotary_pos_emb_interleave) == original_functions
+        torch.testing.assert_close(unaffected(hidden, native_tables, None, position_ids)[0], native, atol=0, rtol=0)
+        with pytest.raises(AttributeError):
+            attention(None, tables, None, position_ids)
+        assert (hf_module.apply_rotary_pos_emb, hf_module.apply_rotary_pos_emb_interleave) == original_functions
+    assert all("forward" not in module.__dict__ for module in model.modules())
+    assert rotary(hidden, position_ids)[0].dtype == torch.bfloat16
+
+
+def test_mistral4_gate_retains_fp32_selected_weights_and_reference_gradients():
+    from nemo_automodel.components.models.mistral4.configuration import Mistral4Config as AMConfig
+    from nemo_automodel.components.models.mistral4.model import _build_moe_config
+    from nemo_automodel.components.moe.layers import Gate
+
+    reference = _router()
+    config = AMConfig(hidden_size=16, n_routed_experts=8, num_experts_per_tok=2, n_group=1, topk_group=1)
+    assert _build_moe_config(config, {"router_weights_fp32": False}).router_weights_fp32 is False
+    gate = Gate(_build_moe_config(config))
+    with torch.no_grad():
+        gate.weight.copy_(reference.weight)
+        gate.e_score_correction_bias.zero_()
+    x = torch.randn(10, 16, dtype=torch.bfloat16, requires_grad=True)
+    reference_x = x.detach().clone().requires_grad_()
+    weights, indices, _ = gate(x, torch.ones(10, dtype=torch.bool), None)
+    assert weights.dtype == torch.float32 and gate.weight.dtype == torch.bfloat16
+    with _hf_reference_context(_reference_config(), reference):
+        _, expected_weights, expected_indices = reference(reference_x)
+    actual = torch.zeros(10, 8).scatter(1, indices, weights)
+    expected = torch.zeros(10, 8).scatter(1, expected_indices, expected_weights)
+    torch.testing.assert_close(actual, expected, atol=1e-7, rtol=1e-6)
+    gradient = torch.randn_like(actual)
+    actual.backward(gradient)
+    expected.backward(gradient)
+    torch.testing.assert_close(x.grad, reference_x.grad, atol=1e-6, rtol=1e-3)
+    torch.testing.assert_close(gate.weight.grad, reference.weight.grad, atol=1e-6, rtol=1e-3)
+
+
+def test_reference_expert_sum_matches_fp64_accumulation_of_native_projections():
+    torch.manual_seed(42)
+    config = Mistral4Config(hidden_size=16, moe_intermediate_size=8, num_local_experts=4)
+    config._experts_implementation = "eager"
+    experts = hf_module.Mistral4Experts(config).bfloat16()
+    with torch.no_grad():
+        for parameter in experts.parameters():
+            parameter.normal_(std=0.5)
+    hidden = torch.randn(13, 16, dtype=torch.bfloat16, requires_grad=True)
+    indices = torch.arange(4).expand(13, -1)
+    weights = torch.randn(13, 4).softmax(-1).requires_grad_()
+    native = experts(hidden, indices, weights)
+    original_weights = tuple(experts.parameters())
+    contributions = []
+    for e in range(4):
+        gate, up = torch.nn.functional.linear(hidden, experts.gate_up_proj[e]).chunk(2, -1)
+        down = torch.nn.functional.linear(torch.nn.functional.silu(gate) * up, experts.down_proj[e])
+        assert down.dtype == torch.bfloat16
+        contributions.append((down * weights[:, e, None]).double())
+    oracle = torch.stack(contributions).sum(0).bfloat16()
+    model = torch.nn.ModuleList([_router(), experts])
+    with _hf_reference_context(_reference_config(), model):
+        actual = experts(hidden, indices, weights)
+        assert actual.dtype == hidden.dtype
+        torch.testing.assert_close(actual, oracle, atol=0, rtol=0)
+        assert (actual.float() - oracle.float()).square().sum() < (native.float() - oracle.float()).square().sum()
+        gradient = torch.randn_like(actual)
+        parameters = (hidden, weights, *experts.parameters())
+        actual_grad = torch.autograd.grad(actual, parameters, gradient, retain_graph=True)
+        expected_grad = torch.autograd.grad(oracle, parameters, gradient)
+        for actual_g, expected_g in zip(actual_grad, expected_grad):
+            torch.testing.assert_close(actual_g, expected_g, atol=1e-6, rtol=1e-5)
+    assert all(
+        actual is original and actual.dtype == torch.bfloat16
+        for actual, original in zip(experts.parameters(), original_weights)
+    )
+    torch.testing.assert_close(experts(hidden, indices, weights), native, atol=0, rtol=0)

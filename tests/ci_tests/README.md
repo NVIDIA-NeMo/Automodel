@@ -258,17 +258,23 @@ profile and numeric override mappings remain available for measured one-model ex
 
 ### Explicit HF reference precision
 
-`ci.checkpoint_robustness.hf_router_scores_fp32: true` enables a test-harness adjustment alongside the existing
-FP32 tensor-loading treatment. It currently supports HF Mistral4 routers and rejects models without those routers.
-The original HF forward uses FP32 softmax, normalization, and selected weights while retaining native projection
-and checkpoint-storage dtypes. Tensor preservation acts at load time; this option controls scoring at forward time.
+`ci.checkpoint_robustness.hf_reference_compute_fp32: true` promotes sensitive operations in the test's HF
+reference alongside the existing FP32 tensor-loading treatment. It currently supports Mistral4 RMSNorm, RoPE,
+router scoring, and expert accumulation, and rejects models without Mistral4 routers. It runs the original HF algorithms
+with FP32 normalization through the norm-weight multiply, FP32 rotary tables/rotation, FP32 router softmax/selected
+weights, and FP32 expert accumulation. Projections, activations, and checkpoint storage retain their native dtypes;
+this does not load the whole model in FP32.
 
-The harness applies the adjustment to source and export-reload forwards, including repeatability and shape
-diagnostics, and restores the original instance forwards even if a comparison fails. Omitting the option or setting
-it to false retains native HF computation. Enabling it logs an explicit modified-reference message. All adjustment
-code lives in the checkpoint test harness; it affects neither AutoModel training nor other HF modules. This is a
-precision-controlled comparison, not proof of the author's intended training precision or of full-model parity.
-Source and reload thresholds are still enforced; reference precision settings must not implicitly relax them.
+These choices are corroborated by vLLM's CUDA RMSNorm, FlashInfer DeepSeek RoPE, fused top-k, and CUDA expert-sum paths at
+[vLLM 9dd969d](https://github.com/vllm-project/vllm/tree/9dd969da096e37256ee37e24f6a4689d860f39ce).
+The native vLLM fallback paths can differ; this is not a claim of bitwise equivalence to every inference backend.
+
+The harness applies the adjustment to source and export-reload forwards, repeats, and shape diagnostics. It preserves
+existing device-map wrappers and restores instance forwards after success or failure. HF's rotary free functions are
+patched only during the wrapped attention call and restored before the sequential harness evaluates another model.
+Omitting the option or setting it to false retains native HF computation. Enabling it logs a modified-reference
+message. The adjustment lives entirely in the test harness; other model families require separate validation before
+opting in. Source and reload thresholds remain enforced, independently of reference precision.
 
 Retrieval checkpoint robustness uses the same phase contract for Phases 1–4. Because a biencoder produces embeddings
 rather than language-model logits, its Phase 2 AutoModel reload gates the selected profile's same-implementation

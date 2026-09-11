@@ -123,11 +123,11 @@ ci:
   checkpoint_robustness:
     # PP=4 with pp_microbatch_size=1 requires at least four pipeline microbatches.
     step_scheduler.local_batch_size: 4
-    # HF 5.15.1 scores this router in BF16. Compare with its original algorithm
-    # using FP32 softmax/normalization/weights, as corroborated by vLLM's router.
-    # Projection and checkpoint storage stay unchanged.
+    # Promote HF RMSNorm, RoPE, router scoring, and expert accumulation to FP32.
+    # Corroborated by vLLM CUDA norm/router/expert-sum and FlashInfer RoPE paths.
+    # Projections, activations, and checkpoint storage retain their native dtypes.
     # Reference precision audit: https://linear.app/nvidia/issue/AM-821
-    hf_router_scores_fp32: true
+    hf_reference_compute_fp32: true
     # Retain only the HF reload calibration (#3620): mean/p95 KL 0.0203/0.0725.
     # Source and AutoModel reload use standard; recent AutoModel reloads are exact.
     parity_tolerance_profile_overrides:

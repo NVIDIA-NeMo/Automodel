@@ -214,6 +214,9 @@ def _build_moe_config(config, moe_overrides: dict | None = None) -> MoEConfig:
         route_scale=config.routed_scaling_factor,
         aux_loss_coeff=0,
         norm_topk_prob=config.norm_topk_prob,
+        # vLLM's Mistral router retains FP32 selected probabilities. Preserve
+        # our FP32 scoring result through dispatch instead of rounding to BF16.
+        router_weights_fp32=True,
         dtype=get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16),
     )
     if moe_overrides:
