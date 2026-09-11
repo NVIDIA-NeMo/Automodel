@@ -240,21 +240,6 @@ def build_deepseek_v4_target(
     return target_config, target_model, distributed_setup
 
 
-def build_deepseek_v41_backend(recipe_cfg) -> BackendConfig:
-    """Build the frozen V4.1 target backend used by DSpark training."""
-    return BackendConfig(
-        attn=str(recipe_cfg.get("target_attn_backend", "tilelang")),
-        linear="torch",
-        rms_norm="torch_fp32",
-        rope_fusion=False,
-        gate_precision="float32",
-        dispatcher=str(recipe_cfg.get("target_dispatcher", "hybridep")),
-        experts=str(recipe_cfg.get("target_experts", "torch_mm")),
-        enable_hf_state_dict_adapter=True,
-        enable_fsdp_optimizations=bool(recipe_cfg.get("target_enable_fsdp_optimizations", True)),
-    )
-
-
 def build_deepseek_v41_target(
     *,
     cfg: Any,
@@ -292,7 +277,17 @@ def build_deepseek_v41_target(
     )
     target_model = NeMoAutoModelForCausalLM.from_config(
         config=target_config,
-        backend=build_deepseek_v41_backend(recipe_cfg),
+        backend=BackendConfig(
+            attn=str(recipe_cfg.get("target_attn_backend", "tilelang")),
+            linear="torch",
+            rms_norm="torch_fp32",
+            rope_fusion=False,
+            gate_precision="float32",
+            dispatcher=str(recipe_cfg.get("target_dispatcher", "hybridep")),
+            experts=str(recipe_cfg.get("target_experts", "torch_mm")),
+            enable_hf_state_dict_adapter=True,
+            enable_fsdp_optimizations=bool(recipe_cfg.get("target_enable_fsdp_optimizations", True)),
+        ),
         distributed_setup=distributed_setup,
         load_base_model=True,
         torch_dtype=compute_dtype,
@@ -492,7 +487,6 @@ def build_kimi_k3_target(
 __all__ = [
     "build_deepseek_v4_backend",
     "build_deepseek_v4_target",
-    "build_deepseek_v41_backend",
     "build_deepseek_v41_target",
     "build_glm_5_2_backend",
     "build_glm_5_2_target",
