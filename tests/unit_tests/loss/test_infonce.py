@@ -431,6 +431,52 @@ def test_infonce_module_learnable_temperature():
     assert torch.allclose(loss_fn.current_temperature(), torch.tensor(0.05), atol=ATOL)
 
 
+@pytest.mark.parametrize("direction", ["q2d", "symmetric"])
+@pytest.mark.parametrize("in_batch", [False, True])
+@pytest.mark.parametrize("mask_kind", ["all_valid", "ragged", "all_padding"])
+def test_infonce_learnable_temperature_with_masked_negatives(direction, in_batch, mask_kind):
+    torch.manual_seed(42)
+    inputs = [torch.randn(*shape, requires_grad=True) for shape in [(3, 8), (3, 8), (3, 2, 8)]]
+    mask = torch.tensor([[1, 0], [0, 0], [1, 1]], dtype=torch.bool)
+    if mask_kind == "all_valid":
+        mask.fill_(True)
+    elif mask_kind == "all_padding":
+        mask.fill_(False)
+    loss_fn = InfoNCELoss(
+        temperature=0.2,
+        learnable_temperature=True,
+        direction=direction,
+        use_in_batch_negatives=in_batch,
+        cross_device_negatives=False,
+    )
+    reference_inputs = [x.detach().clone().requires_grad_() for x in inputs]
+    log_inv_tau = loss_fn.log_inv_tau.detach().clone().requires_grad_()
+    q, d, negatives = [torch.nn.functional.normalize(x, dim=-1) for x in reference_inputs]
+
+    def reference_side(query, docs, include_negatives):
+        losses = []
+        for i in range(len(query)):
+            candidates = docs if in_batch else docs[i : i + 1]
+            if include_negatives:
+                candidates = torch.cat([candidates, negatives[i, mask[i]]])
+            scores = (candidates @ query[i]) * log_inv_tau.exp()
+            positive = i if in_batch else 0
+            losses.append(torch.logsumexp(scores, dim=0) - scores[positive])
+        return torch.stack(losses).mean()
+
+    expected = reference_side(q, d, True)
+    if direction == "symmetric":
+        expected = (expected + reference_side(d, q, False)) / 2
+    expected.backward()
+    actual = loss_fn(*inputs, hard_negatives_mask=mask)
+    actual.backward()
+
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(loss_fn.log_inv_tau.grad, log_inv_tau.grad)
+    for actual_input, reference_input in zip(inputs, reference_inputs):
+        torch.testing.assert_close(actual_input.grad, reference_input.grad)
+
+
 # ---------------------------------------------------------------------------
 # InfoNCEDistillLoss module
 # ---------------------------------------------------------------------------

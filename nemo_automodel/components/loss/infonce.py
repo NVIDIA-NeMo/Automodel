@@ -70,14 +70,14 @@ def infonce_loss(
             logits = pos
             target = torch.zeros(batch, device=device, dtype=torch.long)
 
+        logits = logits / temperature
         if neg is not None:
-            sim_qn = torch.einsum("bd,bkd->bk", query, neg)
+            sim_qn = torch.einsum("bd,bkd->bk", query, neg) / temperature
             if hard_negatives_mask is not None:
                 pad = hard_negatives_mask.to(sim_qn.dtype) == 0
                 sim_qn = sim_qn.masked_fill(pad, float("-inf"))
             logits = torch.cat([logits, sim_qn], dim=-1)
 
-        logits = logits / temperature
         return F.cross_entropy(logits, target)
 
     if direction == "q2d":
