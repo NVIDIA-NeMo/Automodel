@@ -48,6 +48,14 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 
+def pytest_collection_modifyitems(items):
+    """Give unit tests a 5s default while preserving explicit overrides."""
+    unit_tests_root = Path(__file__).parent
+    for item in items:
+        if unit_tests_root in item.path.parents and item.get_closest_marker("timeout") is None:
+            item.add_marker(pytest.mark.timeout(5))
+
+
 def pytest_addoption(parser):
     """Additional command-line arguments passed to pytest.
     For now:

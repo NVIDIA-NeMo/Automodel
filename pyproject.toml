@@ -402,11 +402,6 @@ requires-dist = ["torch", "packaging", "ninja", "setuptools"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
-# A unit test that needs more than 5s is either doing too much work or is stuck.
-# Modules that legitimately need longer -- almost always because they launch
-# subprocesses that each re-import torch -- override this with an explicit
-# `pytestmark = pytest.mark.timeout(N)` and a comment saying why.
-timeout = 5
 
 [tool.coverage.paths]
 source = ["nemo_automodel", "/opt/Automodel/nemo_automodel", "/home/runner/work/Automodel/Automodel/nemo_automodel"]
