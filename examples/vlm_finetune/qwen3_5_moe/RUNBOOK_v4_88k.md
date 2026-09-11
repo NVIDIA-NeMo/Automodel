@@ -45,6 +45,7 @@ Each was verified against the source and each fails **silently** if reverted.
 | Enable packing while keeping `attn: te` | `supports_sequence_packing` *accepts* `te`, and `supports_cp_with_sequence_packing` short-circuits to `True` at `cp_size <= 1` — but the model declares `_packed_cp_attn_backends = ("sdpa",)` and `supports_thd: False`. TE has no route to the 4-D block-causal mask, so attention would bleed across document boundaries with no error. |
 | Run without `flash-linear-attention` | The GatedDeltaNet layers fall back to a pure-PyTorch reference path behind a bare `except ImportError`, **with no warning** (`qwen3_5_moe/cp_linear_attn.py:126-142`). That silently degrades 30 of 40 layers. |
 | Use `experts: gmm`/`te` without a DeepEP-family dispatcher | `BackendConfig.__post_init__` silently rewrites the pair to `(torch_mm, torch)`. |
+| Narrow `_resolve_markers` to the thinking-enabled suffix only | Final turns render `<think>\n\n</think>\n\n`, which never contains the `<think>\n` token pair, so the trim silently stops firing and the empty think block goes back into the loss. See rung 2. |
 
 ---
 
@@ -83,6 +84,11 @@ uv sync --locked --all-groups --extra moe --extra vlm --extra vlm-media
 #      + deep_ep                        <- NOT in the `all` extra
 ```
 
+If you drop `--all-groups` (it also pulls the `magi` group, a long MagiAttention source
+build this run does not use), keep `--group dev`: `FusedLinearCrossEntropy` imports
+`cut_cross_entropy`, which is only in the `dev` group. Without it the run fails with an
+`ImportError` at loss construction, after the model has already loaded.
+
 Pre-stage the weights so eight ranks do not race the same download:
 
 ```bash
@@ -117,9 +123,19 @@ token counts should look like the final-turn distribution: **p50 ≈ 163, p90 �
 max ≈ 1,801**. If they instead look like thousands of tokens per row, the wrapper is not
 taking effect.
 
-The script prints the derived generation-prompt suffix. Expect `'<think>\n'` (ids
-`[248068, 198]`) or, with thinking disabled, `'<think>\n\n</think>\n\n'` (ids
-`[248068, 271, 248069, 271]`).
+The script prints both derived generation-prompt suffixes: `'<think>\n\n</think>\n\n'`
+(thinking disabled, ids `[248068, 271, 248069, 271]`) and `'<think>\n'` (thinking
+enabled, ids `[248068, 198]`).
+
+> **Masking decision (2026-09-11): the empty think block is masked.** The current
+> corpus has no `reasoning_content`, so the chat template renders every final
+> assistant turn as `<think>\n\n</think>\n\n` + content. `\n\n` is a single token
+> (271), so the thinking-enabled `<think>\n` suffix never matches; the first
+> version of the wrapper looked only for that one, trimmed nothing, and left the
+> whole block in the loss (rung 2 failed 8/8). The wrapper now strips whichever
+> known suffix the final span starts with, longest first. On this corpus that is
+> the full empty block, so **only the content is supervised and the model is
+> trained for `enable_thinking=False` inference.** Serve it with thinking disabled.
 
 ### Rung 3 — pre-filter (CPU, ~10 min)
 
@@ -161,9 +177,15 @@ plumbing against this driver/torch stack without touching 70 GB of weights.
 automodel examples/vlm_finetune/qwen3_5_moe/qwen3_6_35b_v4_88k_ep8.yaml \
   --nproc-per-node 8 \
   --step_scheduler.max_steps 5 \
+  --lr_scheduler.lr_warmup_steps 1 \
   --checkpoint.enabled false \
   2>&1 | tee smoke.log
 ```
+
+The warmup override is required for any run shorter than the recipe's 50 warmup steps:
+`lr_decay_steps` defaults to the total step count, and `OptimizerParamScheduler` asserts
+`lr_warmup_steps < lr_decay_steps` (`components/optim/scheduler.py:100`), so
+`max_steps 5` alone fails at setup, after the model has already loaded.
 
 Check **all** of:
 
@@ -228,8 +250,27 @@ In this order, re-running rung 6 after each:
 3. `--distributed.moe.reshard_after_forward true`.
 4. `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` (should already be set).
 
-Predicted steady state ≈ 80 GiB/GPU: ~52 GiB fixed (params 8.8 + grads 8.7 + AdamW
-fp32 moments 34.6) plus activations. H200 has 141 GiB.
+Predicted fixed memory per GPU on 8 GPUs: params 8.8 + grads 8.7 + optimizer moments
+≈ 8.7 GiB with `torchao.optim.AdamW8bit` (1 byte per moment per param; torch AdamW on
+the bf16 params would keep bf16 moments, ≈ 17.4 GiB), plus activations. H200 has 141 GiB.
+On 2 GPUs (EP2) multiply the fixed part by 4.
+
+**Blackwell (B200/B300, SM 10.x): keep `attn: te`, but TE's fused attention needs
+TE >= 2.18 and cuDNN >= 9.23.** cuDNN fused-attention backward for head_dim 256 on
+SM 10.x arrived in TE 2.18 (TE PR #3056) and needs cuDNN 9.23 for BSHD. Without it TE
+silently selects `UnfusedDotProductAttention`, which materializes `[heads, seq, seq]`
+scores: ~45 GiB for a ~39k-token row, ~259 GiB at 32k in isolation.
+
+- Install TE 2.18.0 (build `transformer-engine-torch` with `NVTE_WITH_NCCL_EP=0`: its
+  NCCL-EP code includes a header that torch 2.10 lacks) and `nvidia-cudnn-cu13>=9.23`.
+  Both are outside `uv.lock`, so an exact `uv sync` reverts them.
+- Point TE at the pip cuDNN: `export CUDNN_HOME=<venv>/lib/python3.12/site-packages/nvidia/cudnn`.
+  TE prefers a "system" cuDNN and otherwise dlopens `libcudnn.so`, which on the NGC-style
+  base image is an apt cuDNN 9.8. Also put the venv's `nvidia/cudnn/lib` and
+  `nvidia/nccl/lib` first on `LD_LIBRARY_PATH`.
+- Confirm with `NVTE_DEBUG=1 NVTE_DEBUG_LEVEL=2`: expect `Selected backend = FusedAttention`.
+  Measured on B300 at 32k tokens (16/2 heads, d=256, fwd+bwd): TE fused 26.6 ms / 2.6 GiB,
+  vs. PyTorch SDPA flash 93.5 ms / 2.6 GiB.
 
 ---
 
@@ -252,8 +293,12 @@ fp32 moments 34.6) plus activations. H200 has 141 GiB.
 - **Dataset revision.** The corpus is migrating to a format where the `THOUGHT:` prose
   moves into `reasoning_content` and only the action stays in `content`. Measured
   impact: sequences ~3% shorter, keep-rate at 40,960 goes 99.73% → 99.82%, and the
-  masking design is unaffected (the wrapper derives the generation-prompt prefix from
-  the tokenizer, so it adapts automatically). Re-run rungs 2 and 3 when it lands.
+  masking design is unaffected (the wrapper derives the generation-prompt prefixes from
+  the tokenizer, so it adapts automatically). Note the semantics change, though: final
+  turns will render `<think>\n` + reasoning, so only `<think>\n` is masked and the
+  reasoning becomes supervised — the model is then trained for thinking-enabled
+  inference instead of thinking-disabled (see the rung 2 decision note). Re-run rungs 2
+  and 3 when it lands.
 
 ---
 

@@ -668,6 +668,39 @@ def test_step_method(dummy_optimizer):
     assert math.isclose(dummy_optimizer.param_groups[0]["weight_decay"], expected_wd_151, rel_tol=1e-6)
 
 
+def test_step_updates_tensor_lr_in_place():
+    """
+    Tests that a tensor-valued lr (as kept by torchao's low-bit AdamW, which rejects
+    a float reassignment) is updated in place rather than replaced by a float.
+    """
+    model = torch.nn.Linear(10, 1)
+    optimizer = Adam(model.parameters(), lr=torch.tensor(0.001))
+    lr_tensor = optimizer.param_groups[0]["lr"]
+    scheduler = OptimizerParamScheduler(
+        optimizer=optimizer,
+        init_lr=1e-5,
+        max_lr=1e-3,
+        min_lr=1e-6,
+        lr_warmup_steps=100,
+        lr_decay_steps=1000,
+        lr_decay_style="linear",
+        start_wd=0.01,
+        end_wd=0.1,
+        wd_incr_steps=500,
+        wd_incr_style="linear",
+    )
+
+    scheduler.step(increment=50)  # Warmup phase
+    assert optimizer.param_groups[0]["lr"] is lr_tensor
+    assert math.isclose(lr_tensor.item(), 1e-5 + (1e-3 - 1e-5) * 50 / 100, rel_tol=1e-6)
+
+    optimizer.param_groups[0]["lr_mult"] = 2.0
+    scheduler.step(increment=100)  # Decay phase, with the per-group multiplier
+    assert optimizer.param_groups[0]["lr"] is lr_tensor
+    expected_lr_150 = (1e-3 - (1e-3 - 1e-6) * ((150 - 100) / (1000 - 100))) * 2.0
+    assert math.isclose(lr_tensor.item(), expected_lr_150, rel_tol=1e-6)
+
+
 def test_state_dict(dummy_optimizer):
     """
     Tests the `state_dict` method to ensure it returns the correct state.

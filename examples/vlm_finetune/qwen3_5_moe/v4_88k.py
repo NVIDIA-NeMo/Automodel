@@ -96,24 +96,32 @@ def make_v4_88k_dataset(
     return dataset.map(_to_conversation, remove_columns=dataset.column_names)
 
 
-def _resolve_markers(tokenizer) -> tuple[list[int], list[int]]:
-    """Return the assistant-turn marker and the generation-prompt suffix that follows it.
+def _resolve_markers(tokenizer) -> tuple[list[int], list[list[int]]]:
+    """Return the assistant-turn marker and the generation-prompt suffixes that can follow it.
 
-    The suffix is whatever the chat template emits after ``<|im_start|>assistant\\n``
-    when asked for a generation prompt -- ``<think>\\n`` for Qwen3.6, or
-    ``<think>\\n\\n</think>\\n\\n`` when thinking is disabled. Those tokens are supplied
-    by the prompt at inference, so training on them teaches the model to re-emit a tag
-    it was already given.
+    A suffix is whatever the chat template emits after ``<|im_start|>assistant\\n``
+    when asked for a generation prompt -- ``<think>\\n`` for Qwen3.6 with thinking
+    enabled, ``<think>\\n\\n</think>\\n\\n`` with thinking disabled. Those tokens are
+    supplied by the prompt at inference, so training on them teaches the model to
+    re-emit a tag it was already given.
 
-    Deriving this from the tokenizer keeps the same code correct for both the current
-    corpus (no reasoning content) and the revision that moves THOUGHT into
-    ``reasoning_content``.
+    Both variants are returned because a training render can start with either:
+
+    * Current corpus (no ``reasoning_content``): the template renders every final
+      assistant turn with an empty think block, which tokenizes exactly as the
+      thinking-disabled suffix. ``\\n\\n`` is a single token, so the thinking-enabled
+      ``<think>\\n`` never matches it. Masking the whole block supervises the content
+      only, i.e. the model is trained for thinking-disabled inference.
+    * ``reasoning_content`` revision: the final turn renders ``<think>\\n`` followed by
+      the reasoning, which the thinking-enabled suffix matches, so only the opening
+      tag is masked and the reasoning stays supervised.
 
     Args:
         tokenizer: Tokenizer carrying the chat template.
 
     Returns:
-        ``(assistant_marker_ids, generation_prompt_suffix_ids)``.
+        ``(assistant_marker_ids, suffixes)`` with ``suffixes`` deduplicated and ordered
+        longest first, so the most specific match wins.
     """
     cached = getattr(tokenizer, _MARKER_ATTR, None)
     if cached is not None:
@@ -122,21 +130,26 @@ def _resolve_markers(tokenizer) -> tuple[list[int], list[int]]:
     marker = [tokenizer.convert_tokens_to_ids("<|im_start|>")] + tokenizer.encode(
         "assistant\n", add_special_tokens=False
     )
-    rendered = tokenizer.apply_chat_template(
-        [{"role": "user", "content": "u"}],
-        tokenize=True,
-        return_dict=True,
-        add_generation_prompt=True,
-    )
-    ids = list(rendered["input_ids"])
 
-    suffix: list[int] = []
-    for start in range(len(ids) - len(marker), -1, -1):
-        if ids[start : start + len(marker)] == marker:
-            suffix = ids[start + len(marker) :]
-            break
+    suffixes: list[list[int]] = []
+    for enable_thinking in (True, False):
+        rendered = tokenizer.apply_chat_template(
+            [{"role": "user", "content": "u"}],
+            tokenize=True,
+            return_dict=True,
+            add_generation_prompt=True,
+            enable_thinking=enable_thinking,
+        )
+        ids = list(rendered["input_ids"])
+        for start in range(len(ids) - len(marker), -1, -1):
+            if ids[start : start + len(marker)] == marker:
+                suffix = ids[start + len(marker) :]
+                if suffix and suffix not in suffixes:
+                    suffixes.append(suffix)
+                break
+    suffixes.sort(key=len, reverse=True)
 
-    markers = (marker, suffix)
+    markers = (marker, suffixes)
     try:
         setattr(tokenizer, _MARKER_ATTR, markers)
     except AttributeError:
@@ -209,10 +222,9 @@ def last_turn_collate_fn(
     keep = _keep_last_supervised_run(labels)
 
     tokenizer = getattr(processor, "tokenizer", processor)
-    _, suffix = _resolve_markers(tokenizer)
-    if suffix:
+    _, suffixes = _resolve_markers(tokenizer)
+    if suffixes:
         input_ids = batch["input_ids"]
-        suffix_tensor = torch.tensor(suffix, dtype=input_ids.dtype, device=input_ids.device)
         for row in range(keep.shape[0]):
             selected = keep[row].nonzero(as_tuple=True)[0]
             if selected.numel() == 0:
@@ -223,9 +235,13 @@ def last_turn_collate_fn(
             # input_ids position p + 1. The label positions to drop are still
             # [start, start + len(suffix)); the tokens they predict start one later.
             token_start = start + 1
-            token_end = token_start + len(suffix)
-            if token_end <= input_ids.shape[1] and torch.equal(input_ids[row, token_start:token_end], suffix_tensor):
-                keep[row, start : start + len(suffix)] = False
+            # Longest first: on the current corpus the span opens with the full empty
+            # think block, which only the thinking-disabled suffix covers.
+            for suffix in suffixes:
+                token_end = token_start + len(suffix)
+                if input_ids[row, token_start:token_end].tolist() == suffix:
+                    keep[row, start : start + len(suffix)] = False
+                    break
 
     batch["labels"] = labels.masked_fill(~keep, IGNORE_INDEX)
     return batch

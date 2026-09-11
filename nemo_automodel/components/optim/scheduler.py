@@ -8,6 +8,7 @@ import logging
 import math
 from typing import Any, TypeVar
 
+import torch
 from torch.optim.optimizer import Optimizer
 
 _T = TypeVar("_T")
@@ -256,8 +257,14 @@ class OptimizerParamScheduler:
         self.num_steps += increment
         new_wd = self.get_wd()
         for param_group in self.optimizer.param_groups:
-            new_lr = self.get_lr(param_group)
-            param_group["lr"] = new_lr * param_group.get("lr_mult", 1.0)
+            new_lr = self.get_lr(param_group) * param_group.get("lr_mult", 1.0)
+            if isinstance(param_group["lr"], torch.Tensor):
+                # Optimizers such as torchao's low-bit AdamW keep lr as a tensor (so a
+                # compiled step does not recompile per lr value) and reject a float
+                # reassignment; update it in place instead.
+                param_group["lr"].fill_(new_lr)
+            else:
+                param_group["lr"] = new_lr
             param_group["weight_decay"] = new_wd * param_group.get("wd_mult", 1.0)
 
     def state_dict(self) -> dict[str, Any]:

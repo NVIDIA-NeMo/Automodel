@@ -83,8 +83,9 @@ def main() -> None:
     processor = AutoProcessor.from_pretrained(args.model, padding_side="right")
     tokenizer = getattr(processor, "tokenizer", processor)
 
-    _, suffix = adapter._resolve_markers(tokenizer)
-    print(f"generation-prompt suffix after the assistant marker: {tokenizer.decode(suffix)!r} ids={suffix}")
+    _, suffixes = adapter._resolve_markers(tokenizer)
+    for suffix in suffixes:
+        print(f"generation-prompt suffix after the assistant marker: {tokenizer.decode(suffix)!r} ids={suffix}")
 
     dataset = load_dataset(args.dataset, split=args.split).shuffle(seed=0).select(range(args.n))
 
@@ -118,12 +119,15 @@ def main() -> None:
             expected = (messages[-1]["content"] or "").strip()
             if not decoded.replace("<|im_end|>", "").strip().endswith(expected[-120:]):
                 status = "FAIL supervised span does not match the final assistant message"
-            elif suffix and start + 1 >= len(suffix):
+            elif suffixes:
                 # Labels are shifted against input_ids by default_collate_fn, so the
                 # supervised span starting at label position `start` begins at token
-                # `start + 1`; the generation-prompt suffix sits immediately before it.
-                prefix = wrapped["input_ids"][0, start + 1 - len(suffix) : start + 1].tolist()
-                if prefix != suffix:
+                # `start + 1`; a generation-prompt suffix sits immediately before it.
+                # Untrimmed, the tokens before the span end in "assistant\n", which
+                # matches neither suffix.
+                token_start = start + 1
+                preceding = wrapped["input_ids"][0, :token_start].tolist()
+                if not any(len(s) <= token_start and preceding[-len(s) :] == s for s in suffixes):
                     status = "FAIL generation-prompt prefix was not excluded from the loss"
 
         if status != "ok":

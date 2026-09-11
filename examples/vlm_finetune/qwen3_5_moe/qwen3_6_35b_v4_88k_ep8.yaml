@@ -185,7 +185,11 @@ validation_dataloader:
     _target_: examples/vlm_finetune/qwen3_5_moe/v4_88k.py:last_turn_collate_fn
 
 optimizer:
-  _target_: torch.optim.AdamW
+  # torchao 8-bit AdamW: block-wise (256-element) quantized exp_avg / exp_avg_sq,
+  # ~1 byte per moment per param instead of 2 (the model params are bf16, so
+  # torch.optim.AdamW would keep bf16 moments). Built through the factory path;
+  # works on FSDP2/EP DTensor params and round-trips through DCP save/load.
+  _target_: torchao.optim.AdamW8bit
   lr: 1.0e-5
   betas: [0.9, 0.95]
   eps: 1.0e-8
