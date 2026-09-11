@@ -24,7 +24,7 @@ architecture details and the other recipes.
 
 Spider contains 10,181 natural-language questions over 200 databases spanning 138 domains. The Hugging Face
 release ships the questions and gold SQL for 7,000 training questions (140 databases) and 1,034 validation
-questions (20 databases), and the two sets of databases are disjoint, so the validation split measures how
+questions (20 databases). The two sets of databases are disjoint, so the validation split measures how
 well the model writes SQL for schemas it has never seen.
 
 | Column | Example |
@@ -33,7 +33,7 @@ well the model writes SQL for schemas it has never seen.
 | `question` | How many heads of the departments are older than 56 ? |
 | `query` | `SELECT count(*) FROM head WHERE age > 56` |
 
-The **base model** answers such a question with a paragraph of reasoning that may or may not end in a
+The **base model** answers such a question with a paragraph of reasoning that might not end in a
 query. After fine-tuning, it outputs **exactly one SQL query** against the schema it is given.
 
 ## Guide Overview
@@ -83,9 +83,9 @@ so that all 8 ranks read from the shared cache.
 
 ## Step 1 — Explore Spider and Render the Database Schemas
 
-The Spider rows carry only `db_id`, `question` and `query`; the database schemas come from
+The Spider rows carry only `db_id`, `question`, and `query`; the database schemas come from
 [`richardr1126/spider-schema`](https://huggingface.co/datasets/richardr1126/spider-schema), one row per
-database with its tables, columns, column types, primary keys and foreign keys.
+database with its tables, columns, column types, primary keys, and foreign keys.
 
 ```python
 from datasets import load_dataset
@@ -111,7 +111,7 @@ department_management | How many heads of the departments are older than 56 ? | 
 department : Department_ID (number) , Name (text) , Creation (text) , Ranking (number) , Budget_in_Billions (number) , Num_Employees (number) | head : head_ID (number) , name (text) , born_state (text) , age (number) | management : department_ID (number) , head_ID (number) , temporary_acting (text)
 ```
 
-### Schema as `CREATE TABLE` statements
+### Schema as CREATE TABLE Statements
 
 `make_spider_dataset` (in `nemo_automodel.components.datasets.vlm.datasets`) renders every database as
 `CREATE TABLE` statements with primary and foreign keys (`spider_schema_to_ddl`), puts the schema and the
@@ -233,9 +233,9 @@ optimizer:
   exp_avg_sq_dtype: torch.bfloat16
 ```
 
-Rank-64 LoRA adapters are trained on the LLM's linear projections (Mamba `in_proj`/`out_proj`, attention
-`q/k/v/o_proj`, MoE latent projections and shared-expert MLPs): 272 modules, 177M trainable parameters
-(0.15% of the model). The vision tower, projector and `lm_head` are excluded.
+Rank-64 LoRA adapters are trained on 272 LLM linear projections (177M parameters, 0.15% of the model).
+The targets include Mamba `in_proj`/`out_proj`; attention `q_proj`/`k_proj`/`v_proj`/`o_proj`; MoE latent
+projections; and shared-expert MLPs. The vision tower, projector, and `lm_head` are excluded.
 
 ### Collate Function
 
@@ -279,8 +279,8 @@ Validation:
   step 399 | val_loss 0.2480
 ```
 
-400 steps take ~15 min on 8 H100 including the four validation passes. Training loss keeps falling while
-validation loss on the unseen databases is lowest after the first 100 steps and then drifts up slightly;
+The 400-step run takes about 15 min on 8 H100, including the four validation passes. Training loss keeps falling while
+validation loss on the unseen databases is lowest after the first 100 steps and then drifts up slightly.
 Step 5 shows that the later checkpoints nevertheless decode more queries correctly, so evaluate both.
 
 ### Checkpoints Saved
@@ -405,9 +405,9 @@ a paragraph of reasoning before (or instead of) the query.
 
 ## Step 5 — Results
 
-### Evaluation on 20 Spider validation questions (13 unseen databases)
+### Evaluation on 20 Spider Validation Questions (13 Unseen Databases)
 
-| Model | Exact match | Mean similarity | Median similarity | Similarity above 0.9 |
+| Model | Exact Match | Mean Similarity | Median Similarity | Similarity above 0.9 |
 |---|---|---|---|---|
 | Base (`NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained`) | 0/20 | 0.140 | 0.141 | 0/20 |
 | LoRA, step 99 (`LOWEST_VAL`, val loss 0.230) | 7/20 | 0.847 | 0.956 | 12/20 |
@@ -415,7 +415,7 @@ a paragraph of reasoning before (or instead of) the query.
 
 The base model never returns a bare query: it reasons about the schema in prose ("We need to count the number
 of singers. The table singer has Singer_ID as primary key. So we can count distinct Singer_ID or just count
-rows...") and, when it does write SQL, wraps it in a code fence. After LoRA fine-tuning every prediction is a
+rows...") and, when it does write SQL, wraps it in a code fence. After LoRA fine-tuning, every prediction is a
 single SQL statement against the given schema.
 
 Exact string match understates the fine-tuned model: of the 10 step-399 mismatches, 7 are semantically
@@ -428,7 +428,7 @@ match and similarity above are a conservative proxy.
 
 ### Sample Predictions (Fine-Tuned, Step 399, `LATEST`)
 
-| Database | Question | Prediction vs. gold query | Similarity |
+| Database | Question | Prediction Compared to Gold Query | Similarity |
 |----------|----------|---------------------------|------------|
 | `concert_singer` | How many singers do we have? | Exact match | 1.00 |
 | `pets_1` | Find number of pets owned by students who are older than 20. | Same join, tables listed in the other order (aliases swapped) | 0.90 |
@@ -447,6 +447,6 @@ match and similarity above are a conservative proxy.
 | Learning rate | 2e-4 (TE FusedAdam, fp32 master weights) |
 | GPU memory | ~36 GiB / GPU (8 GPUs) |
 | Training time | ~15 min for 400 steps on 1x8 H100 |
-| Validation loss | 0.230 (step 99) → 0.248 (step 399) |
+| Validation loss | 0.230 (step 99) to 0.248 (step 399) |
 | Checkpoint size | ~355 MB per adapter |
-| Exact matches (20 val questions, unseen databases) | 0/20 base → 7/20 at step 99 → 10/20 at step 399 |
+| Exact matches (20 val questions, unseen databases) | 0/20 base to 7/20 at step 99 to 10/20 at step 399 |
