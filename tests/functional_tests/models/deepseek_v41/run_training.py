@@ -71,7 +71,7 @@ class TrainingConfig:
     checkpoint_step: int | None = None
     sequence_length: int = 32
     seed: int = 42
-    experts: str = "torch_linear"
+    experts: str = "torch_mm"
     attention_backend: str = "tilelang"
     activation_checkpointing: bool = True
     diagnostic_continuation: bool = False
@@ -558,7 +558,7 @@ def main() -> None:
     parser.add_argument("--checkpoint-step", type=int)
     parser.add_argument("--sequence-length", type=int, default=32)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--experts", choices=("torch_linear", "torch_mm", "gmm"), default="torch_linear")
+    parser.add_argument("--experts", choices=("torch_mm", "gmm"), default="torch_mm")
     parser.add_argument("--attention-backend", choices=("sdpa", "tilelang"), default="tilelang")
     parser.add_argument("--activation-checkpointing", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(

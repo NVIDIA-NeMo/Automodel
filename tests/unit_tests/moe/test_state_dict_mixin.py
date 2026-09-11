@@ -1078,7 +1078,6 @@ class TestInplaceLoadViews:
             ("gmm", True),
             ("torch_mm", True),
             ("torch_mm_mxfp8", True),
-            ("torch_linear", True),
             ("te", False),
             ("torch", False),
         ],

@@ -447,7 +447,7 @@ def main() -> int:
     parser.add_argument("--num-layers", type=int, default=40)
     parser.add_argument("--sequence-length", type=int, default=4096)
     parser.add_argument("--metric-chunk-size", type=int, default=32)
-    parser.add_argument("--expert-backend", choices=("torch_mm", "torch_linear"), default="torch_mm")
+    parser.add_argument("--expert-backend", choices=("torch_mm",), default="torch_mm")
     args = parser.parse_args()
     rank, world = int(os.environ.get("RANK", "0")), int(os.environ.get("WORLD_SIZE", "1"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))

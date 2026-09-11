@@ -300,7 +300,6 @@ class BackendConfig:
             integrated for Llama-family rotary embeddings.
         rope_fusion: Whether to use fused RoPE (requires TE).
         experts: MoE expert GEMM backend. "torch" uses per-expert loop,
-            "torch_linear" uses separate gate/up/down linears with eager SwiGLU,
             "te" uses TE GroupedLinear, "gmm" uses grouped_gemm.ops.gmm,
             "torch_mm" uses torch._grouped_mm, "torch_mm_mxfp8" uses torch._grouped_mm
             dispatch but routes the expert grouped GEMMs through torchao's MXFP8
@@ -356,9 +355,7 @@ class BackendConfig:
     rms_norm: Literal["torch", "torch_fp32", "te", "quack"] = "torch_fp32"
     rope: Literal["torch", "quack"] = "torch"
     rope_fusion: bool = HAVE_TE and torch.cuda.is_available()
-    # torch_linear preserves separate gate/up/down projection and eager
-    # activation rounding for architectures sensitive to fused expert math.
-    experts: Literal["torch", "te", "gmm", "torch_mm", "torch_mm_mxfp8", "torch_linear"] = (
+    experts: Literal["torch", "te", "gmm", "torch_mm", "torch_mm_mxfp8"] = (
         "torch_mm" if torch.cuda.is_available() else "torch"
     )
     dispatcher: Literal["torch", "deepep", "hybridep", "uccl_ep", "mok"] = (
@@ -445,9 +442,6 @@ class BackendConfig:
 
         if isinstance(self.gate_precision, str):
             self.gate_precision = dtype_from_str(self.gate_precision, default=None)
-
-        if self.experts == "torch_linear" and self.dispatcher not in ("torch", "hybridep"):
-            raise ValueError("experts='torch_linear' supports dispatcher='torch' or 'hybridep'")
 
         # enable_deepep was removed. It is no longer honored; warn (once, on rank 0) if a stale
         # config still sets it so the user migrates to explicit dispatcher/experts. The field is

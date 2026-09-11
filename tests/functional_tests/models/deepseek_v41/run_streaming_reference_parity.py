@@ -330,7 +330,7 @@ def main() -> int:
     parser.add_argument("--input-text", type=Path)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--attention-backend", choices=("eager", "sdpa", "tilelang"), default="sdpa")
-    parser.add_argument("--expert-backend", choices=("torch", "torch_mm", "torch_linear"))
+    parser.add_argument("--expert-backend", choices=("torch", "torch_mm"))
     parser.add_argument(
         "--native-global-batch-one",
         action="store_true",

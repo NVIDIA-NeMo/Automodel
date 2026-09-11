@@ -38,7 +38,7 @@ from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41Conf
 from nemo_automodel.components.models.deepseek_v41.model import DeepseekV41ForCausalLM
 
 
-def audit(checkpoint: Path, output_dir: Path, ep_size: int, experts: str = "torch_linear") -> None:
+def audit(checkpoint: Path, output_dir: Path, ep_size: int, experts: str = "torch_mm") -> None:
     """Compare every native destination against the complete pinned shard index."""
     source_manifest = _native_source_manifest()
     if ep_size < 1:
@@ -229,6 +229,6 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--ep-size", type=int, default=128)
-    parser.add_argument("--experts", choices=("torch_linear", "torch_mm", "torch"), default="torch_linear")
+    parser.add_argument("--experts", choices=("torch_mm", "torch"), default="torch_mm")
     args = parser.parse_args()
     audit(args.checkpoint, args.output_dir, args.ep_size, args.experts)

@@ -102,7 +102,7 @@ class MoESplitExpertsStateDictMixin:
             return True
         if get_world_size_safe() == 1:
             return True
-        return self.backend.experts in {"gmm", "torch_mm", "torch_mm_mxfp8", "torch_linear"}
+        return self.backend.experts in {"gmm", "torch_mm", "torch_mm_mxfp8"}
 
     @property
     def _is_gated_moe(self) -> bool:

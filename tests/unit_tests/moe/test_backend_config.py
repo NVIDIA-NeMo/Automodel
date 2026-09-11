@@ -53,17 +53,6 @@ class TestBackendConfigGatePrecision:
 class TestBackendConfigExpertsDispatcherValidation:
     """Test BackendConfig validation for experts and dispatcher fields."""
 
-    @pytest.mark.parametrize("dispatcher", ["torch", "hybridep"])
-    def test_torch_linear_keeps_explicit_backend(self, dispatcher):
-        config = BackendConfig(experts="torch_linear", dispatcher=dispatcher)
-        assert config.experts == "torch_linear"
-        assert config.dispatcher == dispatcher
-
-    @pytest.mark.parametrize("dispatcher", ["deepep", "uccl_ep", "mok"])
-    def test_torch_linear_rejects_unimplemented_dispatch_padding(self, dispatcher):
-        with pytest.raises(ValueError, match="torch_linear.*dispatcher"):
-            BackendConfig(experts="torch_linear", dispatcher=dispatcher)
-
     def test_te_experts_falls_back_to_torch(self):
         """Test that BackendConfig falls back te experts to torch_mm when dispatcher is not deepep."""
         config = BackendConfig(experts="te", dispatcher="torch")

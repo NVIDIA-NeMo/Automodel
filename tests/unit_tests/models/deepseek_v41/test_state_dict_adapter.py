@@ -457,7 +457,7 @@ def _quantized_checkpointer_worker(rank: int, rendezvous: str, expert_shard_size
             if expert_shard_size > 1
             else init_device_mesh("cpu", (2,), mesh_dim_names=("ep",))
         )
-        adapter = _adapter(17, second_engram_rows=19, dtype=torch.bfloat16, experts="torch_linear", dim=dim)
+        adapter = _adapter(17, second_engram_rows=19, dtype=torch.bfloat16, experts="torch_mm", dim=dim)
         source = {}
         expected = {}
         for layer, rows in ((1, 17), (14, 19)):

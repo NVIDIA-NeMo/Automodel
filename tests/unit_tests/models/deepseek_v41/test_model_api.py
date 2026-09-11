@@ -64,7 +64,7 @@ def test_default_policy_is_explicit_and_routing_correction_is_fixed() -> None:
     assert model.config_class is DeepseekV41Config and model.base_model_prefix == "model"
     assert model.backend.attn == "tilelang"
     assert model.backend.linear == "torch" and model.backend.rms_norm == "torch_fp32"
-    assert model.backend.dispatcher == "hybridep" and model.backend.experts == "torch_linear"
+    assert model.backend.dispatcher == "hybridep" and model.backend.experts == "torch_mm"
     assert model.moe_config.combine_in_fp32 and model.moe_config.gate_bias_update_factor == 0
 
 

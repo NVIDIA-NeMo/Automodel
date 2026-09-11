@@ -737,7 +737,7 @@ def main() -> int:
     parser.add_argument("--input-text", type=Path)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--attention-backend", choices=("eager", "sdpa", "tilelang"), default="sdpa")
-    parser.add_argument("--expert-backend", choices=("torch", "torch_mm", "torch_linear"))
+    parser.add_argument("--expert-backend", choices=("torch", "torch_mm"))
     parsed = parser.parse_args()
     options = _Options(**{**vars(parsed), "reference_dir": parsed.reference_dir or parsed.checkpoint / "inference"})
     if options.sequence_length <= 0 or options.metric_chunk_size <= 0 or options.num_layers <= 0:

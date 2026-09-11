@@ -324,7 +324,7 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
         if moe_config is not None and not moe_config.combine_in_fp32:
             raise ValueError("DeepSeek V4.1 requires MoEConfig.combine_in_fp32=True for released expert arithmetic")
         self.backend = backend or BackendConfig(
-            attn="tilelang", linear="torch", rms_norm="torch_fp32", experts="torch_linear", dispatcher="hybridep"
+            attn="tilelang", linear="torch", rms_norm="torch_fp32", experts="torch_mm", dispatcher="hybridep"
         )
         dtype = dtype_from_str(text.dtype, torch.bfloat16)
         if engram_process_group is None and dist.is_available() and dist.is_initialized():

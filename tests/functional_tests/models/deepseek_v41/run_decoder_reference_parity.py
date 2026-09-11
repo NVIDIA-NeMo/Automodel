@@ -528,7 +528,7 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=113)
     parser.add_argument("--candidate-topk-blocks", type=int, default=80)
     parser.add_argument("--attention-backend", choices=("eager", "sdpa", "tilelang"), default="sdpa")
-    parser.add_argument("--expert-backend", choices=("torch_mm", "torch_linear"), default="torch_mm")
+    parser.add_argument("--expert-backend", choices=("torch_mm",), default="torch_mm")
     parser.add_argument("--check-layout-only", action="store_true")
     parser.add_argument("--reference-artifact", type=Path)
     parser.add_argument(
