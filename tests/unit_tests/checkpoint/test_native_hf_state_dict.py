@@ -31,6 +31,10 @@ from nemo_automodel.components.models.llama.model import LlamaForCausalLM
 from nemo_automodel.components.models.qwen2.model import Qwen2ForCausalLM
 from nemo_automodel.components.models.qwen3.model import Qwen3ForCausalLM
 
+# Over the default 5s budget on purpose: this module repeatedly saves, loads, and exports full model state.
+# Shrink the checkpoint round trips before raising this further.
+pytestmark = pytest.mark.timeout(60)
+
 
 @pytest.fixture(params=[LlamaForCausalLM, Qwen2ForCausalLM, Qwen3ForCausalLM], ids=["llama", "qwen2", "qwen3"])
 def native_model_class(request) -> type[PreTrainedModel]:
