@@ -347,10 +347,15 @@ recipe authoring or existing recipe modifications.
 
 Create an example config under `examples/llm_finetune/<name>/` (or `examples/vlm_finetune/<name>/`):
 
+For new full-parameter Adam/AdamW examples, set `model.dtype: float32`.
+See [training precision](../nemo-automodel-recipe-development/SKILL.md#full-parameter-training-precision)
+for compute precision and other training modes.
+
 ```yaml
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: <org>/<model-name>
+  dtype: float32
 
 trainer:
   max_steps: 100
