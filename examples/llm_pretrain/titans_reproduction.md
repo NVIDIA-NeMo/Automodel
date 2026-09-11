@@ -11,8 +11,10 @@ the authoritative target for the added 1.3B/100B-token and RULER results.
 - Tokenizer: Llama 2, vocabulary size 32K.
 - Training sequence length: 4096 tokens (2048 for sliding-window attention).
 - Neural-memory chunk size: 16.
-- Deep-memory update: public `titans-pytorch` chunk-aggregated semantics, with
-  the full 4096-token training sequence as one gradient-anchor batch.
+- Deep-memory update: public `titans-pytorch` chunk-aggregated semantics. The
+  canonical LMM uses one 4224-token gradient-anchor batch (128 persistent
+  vectors followed by the 4096 data tokens); the `no_persistent` ablation uses
+  one 4096-token anchor batch.
 - Persistent memory: 128 learned vectors prepended once to the model input,
   following Equation 6. Their hidden states are discarded before the LM head.
   This is the recorded operational choice for LMM; hybrids will use persistent
