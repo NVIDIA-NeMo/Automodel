@@ -69,6 +69,11 @@ class TitansModel(TitansPreTrainedModel):
         super().__init__(config)
         dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, dtype=dtype)
+        if config.num_persistent_memory_tokens:
+            self.persistent_memory = nn.Parameter(
+                torch.empty(config.num_persistent_memory_tokens, config.hidden_size, dtype=dtype)
+            )
+            nn.init.trunc_normal_(self.persistent_memory, mean=0.0, std=config.initializer_range)
         self.layers = nn.ModuleList([TitansBlock(config, dtype=dtype) for _ in range(config.num_hidden_layers)])
         self.norm = TitansRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.gradient_checkpointing = False
@@ -76,12 +81,17 @@ class TitansModel(TitansPreTrainedModel):
 
     def forward(self, input_ids: torch.Tensor, inputs_embeds: torch.Tensor | None = None) -> torch.Tensor:
         h = inputs_embeds if inputs_embeds is not None else self.embed_tokens(input_ids)
+        persistent_length = self.config.num_persistent_memory_tokens
+        if persistent_length:
+            persistent = self.persistent_memory.unsqueeze(0).expand(h.shape[0], -1, -1)
+            h = torch.cat((persistent, h), dim=1)
         for layer in self.layers:
             if self.gradient_checkpointing and self.training:
                 h = self._gradient_checkpointing_func(layer.__call__, h)
             else:
                 h = layer(h)
-        return self.norm(h)
+        h = self.norm(h)
+        return h[:, persistent_length:]
 
 
 class TitansForCausalLM(HFCheckpointingMixin, TitansPreTrainedModel):
@@ -163,6 +173,8 @@ class TitansForCausalLM(HFCheckpointingMixin, TitansPreTrainedModel):
         std = self.config.initializer_range
         with buffer_device:
             nn.init.trunc_normal_(self.model.embed_tokens.weight, mean=0.0, std=std)
+            if self.config.num_persistent_memory_tokens:
+                nn.init.trunc_normal_(self.model.persistent_memory, mean=0.0, std=std)
             self.model.norm.reset_parameters()
             for layer in self.model.layers:
                 layer.init_weights(std)

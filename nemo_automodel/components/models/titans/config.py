@@ -67,6 +67,8 @@ class TitansConfig(PretrainedConfig):
         memory_batch_size: Number of tokens sharing one deep-memory gradient
             anchor for the ``"titans_pytorch"`` backend. Must be divisible by
             ``chunk_size``. ``None`` uses the full input sequence.
+        num_persistent_memory_tokens: Number of learned, input-independent
+            vectors prepended to every sequence before the decoder stack.
         tie_word_embeddings: Whether ``lm_head`` shares weights with ``embed_tokens``.
         initializer_range: Stddev for truncated-normal weight init.
         torch_dtype: Default compute dtype (``A_log`` / ``dt_bias`` always stay fp32).
@@ -95,6 +97,7 @@ class TitansConfig(PretrainedConfig):
         chunk_size: int = 16,
         deep_memory_backend: str = "reference",
         memory_batch_size: int | None = None,
+        num_persistent_memory_tokens: int = 0,
         tie_word_embeddings: bool = True,
         initializer_range: float = 0.02,
         torch_dtype: str = "bfloat16",
@@ -122,6 +125,7 @@ class TitansConfig(PretrainedConfig):
         self.chunk_size = chunk_size
         self.deep_memory_backend = deep_memory_backend
         self.memory_batch_size = memory_batch_size
+        self.num_persistent_memory_tokens = num_persistent_memory_tokens
         self.initializer_range = initializer_range
         self.torch_dtype = torch_dtype
 
@@ -148,6 +152,11 @@ class TitansConfig(PretrainedConfig):
                     "TitansConfig: memory_batch_size must be divisible by chunk_size; "
                     f"got {memory_batch_size} and {chunk_size}."
                 )
+        if num_persistent_memory_tokens < 0:
+            raise ValueError(
+                "TitansConfig: num_persistent_memory_tokens must be non-negative; "
+                f"got {num_persistent_memory_tokens}."
+            )
 
         super().__init__(
             pad_token_id=pad_token_id,

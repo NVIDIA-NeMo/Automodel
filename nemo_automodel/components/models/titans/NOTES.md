@@ -130,6 +130,16 @@ The deep path reuses the shared output tail (gated RMSNorm + `o_proj`), so
 `model.py` / `TitansBlock` are untouched. `mem_depth=1` (linear) is byte-for-byte
 unchanged.
 
+## Persistent memory
+
+`num_persistent_memory_tokens > 0` creates learned, input-independent vectors
+that are prepended once before the decoder stack, following Equation 6 of the
+paper. They condition every causal layer but are removed before the LM head, so
+logits and labels retain the original sequence length. The 170M baseline uses
+128 vectors; `num_persistent_memory_tokens=0` is the corresponding component
+ablation. Hybrid attention variants will use persistent K/V slots instead and
+are intentionally a separate interface.
+
 ## Memory-module API (contract, both phases)
 
 `NeuralMemory` (in `layers.py`) is the shared `nn.Module` both phases converge on:

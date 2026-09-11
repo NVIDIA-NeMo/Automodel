@@ -13,7 +13,10 @@ the authoritative target for the added 1.3B/100B-token and RULER results.
 - Neural-memory chunk size: 16.
 - Deep-memory update: public `titans-pytorch` chunk-aggregated semantics, with
   the full 4096-token training sequence as one gradient-anchor batch.
-- Persistent memory: 128 tokens.
+- Persistent memory: 128 learned vectors prepended once to the model input,
+  following Equation 6. Their hidden states are discarded before the LM head.
+  This is the recorded operational choice for LMM; hybrids will use persistent
+  attention K/V slots and receive separate parity tests.
 - Long-term-memory output: 256 memory tokens for hybrid architectures.
 - Memory MLP: two layers by default, expansion factor 4, GELU, residual
   connection, and layer normalization.
@@ -93,6 +96,9 @@ Validated on 2026-09-08 with RTX 6000 Ada GPUs:
   2026-09-09: 5,242,880 FineWeb-Edu tokens, loss 16.2104 → 8.5571,
   approximately 89.5K aggregate tokens/s, 4.51 GiB/GPU peak allocation,
   finite distributed validation, and a resumable checkpoint.
+- The first 15B chain (`titans170m15bv1`) was launched before persistent
+  prefixing landed. Preserve it as the paper's `no_persistent` component
+  ablation; do not report it as the canonical LMM baseline.
 
 The next execution gate is a full-shape, 4096-token, one-node FSDP2 smoke on
 the target cluster. Do not start the 15B-token run until that job establishes
@@ -143,11 +149,35 @@ segment. W&B uses the stable run ID `titans170m15bv1`:
 
 <https://wandb.ai/nvidia/titans-paper-reproduction/runs/titans170m15bv1>
 
+### Multi-node component ablations
+
+The Table 4 component runners use immutable, commit-addressed cluster checkouts
+so preparing the next experiments cannot alter an active chain:
+
+```bash
+tools/submit_titans_ablation_cwdfw.sh baseline --pilot --nodes 2
+tools/submit_titans_ablation_cwdfw.sh no_convolution --pilot --nodes 2
+tools/submit_titans_ablation_cwdfw.sh no_momentum --pilot --nodes 2
+tools/submit_titans_ablation_cwdfw.sh no_weight_decay --pilot --nodes 2
+tools/submit_titans_ablation_cwdfw.sh depth3 --pilot --nodes 2
+tools/submit_titans_ablation_cwdfw.sh depth4 --pilot --nodes 2
+```
+
+Replace `--pilot` with `--full` only after the two-node checkpoint-resume gate
+passes. Each node runs one `torchrun` launcher with eight workers and c10d
+rendezvous. Global batch remains 128, so gradient accumulation changes from 16
+on one node to 8 on two nodes without changing tokens per optimizer step.
+
+The `linear_memory` entry is intentionally launch-blocked: with momentum
+enabled, that path still uses a 4096-iteration Python recurrence. It needs a
+vectorized kernel before a paper-scale allocation is responsible.
+
 Defaults:
 
 - account: `coreai_dlalgo_compeval`;
 - partition: `batch`;
-- allocation: one node with eight GPUs for one hour;
+- current LMM allocation: one node with eight GPUs for four hours per segment;
+- ablation allocation: configurable one or two nodes, eight GPUs per node;
 - image: `nvcr.io#nvidia/nemo-automodel:26.04`;
 - work root:
   `/lustre/fsw/portfolios/coreai/users/ffrujeri/titans-automodel`.

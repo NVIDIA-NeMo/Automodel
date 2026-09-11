@@ -82,6 +82,29 @@ def test_titans_activation_checkpointing_wraps_neural_memory():
     assert all(isinstance(layer.memory, CheckpointWrapper) for layer in model.model.layers)
 
 
+def test_persistent_memory_is_prepended_without_changing_logit_length():
+    config = _tiny_config(
+        mem_depth=2,
+        chunk_size=4,
+        memory_batch_size=12,
+        num_persistent_memory_tokens=4,
+    )
+    model = TitansForCausalLM(config)
+    input_ids = torch.randint(0, config.vocab_size, (2, 8))
+
+    output = model(input_ids).logits
+    output.sum().backward()
+
+    assert output.shape == (2, 8, config.vocab_size)
+    assert model.model.persistent_memory.shape == (4, config.hidden_size)
+    assert model.model.persistent_memory.grad is not None
+
+
+def test_persistent_memory_token_count_must_be_nonnegative():
+    with pytest.raises(ValueError, match="num_persistent_memory_tokens must be non-negative"):
+        _tiny_config(num_persistent_memory_tokens=-1)
+
+
 # --------------------------------------------------------------------------- #
 # (c) Reduction check: Titans (eta=0) == Gated DeltaNet (fla)
 # --------------------------------------------------------------------------- #
@@ -348,14 +371,31 @@ def test_170m_lmm_recipe_matches_paper_scale():
     assert model["qkv_conv_kernel_size"] == 4
     assert model["chunk_size"] == 16
     assert model["deep_memory_backend"] == "titans_pytorch"
-    assert model["memory_batch_size"] == 4096
+    assert model["memory_batch_size"] == 4224
+    assert model["num_persistent_memory_tokens"] == 128
     assert model["torch_dtype"] == "float32"
     assert recipe["dataset"]["seq_len"] == 4096
 
     config_values = {key: value for key, value in model.items() if key not in {"_target_", "architectures"}}
     with torch.device("meta"):
         instantiated = TitansForCausalLM(TitansConfig(**config_values))
-    assert sum(parameter.numel() for parameter in instantiated.parameters()) == 173_597_376
+    assert sum(parameter.numel() for parameter in instantiated.parameters()) == 173_695_680
+
+
+def test_multinode_ablation_runner_preserves_paper_batch_and_uses_c10d():
+    root = Path(__file__).parents[4]
+    runner = (root / "examples/llm_pretrain/slurm/cwdfw_titans_170m_ablation.sbatch").read_text()
+    submitter = (root / "tools/submit_titans_ablation_cwdfw.sh").read_text()
+
+    assert "--standalone" not in runner
+    assert "--rdzv-backend=c10d" in runner
+    assert "--nnodes=\\$SLURM_NNODES" in runner
+    assert "WORLD_SIZE=$((NODES * 8))" in runner
+    assert "128 % WORLD_SIZE" in runner
+    assert "--gpus 8" in submitter
+    assert "checkouts/$LOCAL_SHA" in submitter
+    for variant in ("no_persistent", "no_convolution", "no_momentum", "no_weight_decay", "depth3", "depth4"):
+        assert f"{variant})" in runner
 
 
 # --------------------------------------------------------------------------- #
