@@ -129,7 +129,7 @@ from nemo_automodel.components.distributed.optimized_tp_plans import (
     get_decilm_nemotron_tp_plan,
     get_llama_nemotron_super_tp_plan,
 )
-from nemo_automodel.components.distributed.parallel_styles import translate_to_lora
+from nemo_automodel.components.distributed.parallel_styles import ReplicatedWithGradAllReduce, translate_to_lora
 from nemo_automodel.shared.import_utils import UnavailableMeta, safe_import_from
 
 _MEGATRON_FSDP_050_REQUIRED_MSG = (
@@ -1556,13 +1556,7 @@ def get_hf_tp_shard_plan(model):
         if (k == "lm_head" or k == "language_model.lm_head") and v == "colwise_rep":
             translated_plan[k] = ColwiseParallel(output_layouts=Shard(-1), use_local_output=False)
         else:
-            style = translate_to_torch_parallel_style(v)
-            # Translator returns None for styles that should be skipped (e.g.
-            # "replicated_with_grad_allreduce" under FSDP where leaving the
-            # param un-wrapped is equivalent).
-            if style is None:
-                continue
-            translated_plan[k] = style
+            translated_plan[k] = translate_to_torch_parallel_style(v)
 
     logger.info(f"Hugging Face tp plan: {translated_plan}")
     return translated_plan
@@ -1628,12 +1622,7 @@ def translate_to_torch_parallel_style(style: str):
     elif style == "sequence_parallel":
         return SequenceParallel()
     elif style == "replicated_with_grad_allreduce":
-        # transformers v5 style for norm weights (q_norm, k_norm, etc.) that are
-        # replicated across TP ranks but need gradient all-reduce. Under FSDP+TP,
-        # leaving the param un-wrapped (no TP style) is equivalent: FSDP handles
-        # grad sync on its DP/DP_shard mesh, and since the param is replicated on
-        # the TP mesh, no TP-level collective is needed in forward.
-        return None
+        return ReplicatedWithGradAllReduce()
     else:
         raise ValueError(f"Unknown parallel style: {style}")
 

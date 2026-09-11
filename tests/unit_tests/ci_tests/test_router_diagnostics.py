@@ -82,7 +82,9 @@ def _gate() -> Gate:
         force_e_score_correction_bias=True,
         dtype=torch.float32,
     )
-    return Gate(config, gate_precision=torch.float32)
+    gate = Gate(config, gate_precision=torch.float32)
+    nn.init.zeros_(gate.weight)
+    return gate
 
 
 def _capture(router_logits, indices):

@@ -275,10 +275,12 @@ def clip_grad_norm(
     foreach: bool = True,
     use_torch_clip_grad_norm: bool = False,
 ) -> torch.Tensor | float:
-    """Common gradient clipping helper.
+    """Apply sharding-aware gradient clipping.
 
     Handles all parallelism strategies (TP, PP, EP/MoE) with automatic sharding-aware grouping.
     Returns the gradient norm as a scalar tensor on the gradients' device, or 0.0 if clipping is skipped.
+    This function does not synchronize TP-replicated gradients; optimizer loops
+    must do that exactly once before calling this function.
 
     This function automatically:
     - Groups parameters by sharding pattern (device mesh + placements)
@@ -432,7 +434,10 @@ def scale_grads_and_clip_grad_norm(
     expert_tp_replication_factor: int = 1,
     use_torch_clip_grad_norm: bool = False,
 ) -> torch.Tensor | float:
-    """Scale gradients for PP/EP in a single pass, then clip.
+    """Scale gradients for PP/EP and model-owned shards, then clip.
+
+    The caller must synchronize TP-replicated gradients once after accumulation
+    and before calling this function. This helper does not synchronize replicas.
 
     - PP scaling: divide all local grads by (num_label_tokens / dp_group_size).
     - EP scaling: for parameters on the expert axis, divide grads by

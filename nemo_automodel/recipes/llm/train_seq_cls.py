@@ -30,6 +30,7 @@ _HAS_WANDB, wandb = safe_import(
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
+from nemo_automodel.components.distributed.tp_replicas import synchronize_tp_replica_gradients
 from nemo_automodel.components.distributed.utils import FirstRankPerNode
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
@@ -252,7 +253,8 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             all_labels.append(labels.view(-1).detach())
             (loss * self._get_dp_group_size(include_cp=True)).backward()
 
-        # Calculate gradient norm (distributed-aware)
+        # Synchronize unsharded TP replicas, then calculate the distributed-aware gradient norm.
+        synchronize_tp_replica_gradients(self.model_parts, self.device_mesh)
         grad_norm = clip_grad_norm(
             max_grad_norm=self.max_grad_norm,
             model_parts=self.model_parts,

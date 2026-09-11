@@ -360,6 +360,12 @@ def apply_ep(model: nn.Module, ep_mesh: DeviceMesh, moe_mesh: DeviceMesh | None 
         # skip distribute_module entirely and just initialize token dispatcher.
         if isinstance(moe_module.experts, GroupedExpertsTE):
             moe_module.experts.init_token_dispatcher(ep_mesh=ep_mesh, moe_mesh=moe_mesh)
+            # TE creates rank-local parameters for the experts owned by this EP
+            # rank. A combined MoE mesh may fold physical TP peers into EP, so
+            # these plain tensors are different expert shards, not TP replicas.
+            from nemo_automodel.components.distributed.tp_replicas import exclude_from_tp_replica_sync
+
+            exclude_from_tp_replica_sync(moe_module.experts)
         else:
             parallelize_module(
                 module=moe_module.experts,
@@ -1084,12 +1090,10 @@ def parallelize_model(
         # get_expert_tp_replication_factor reads this marker to remove that
         # factor in scale_grads_and_clip_grad_norm.
         model._nemo_moe_tp_requires_replica_sync = True
-        # The replicated paths have no gradient synchronization of their own;
-        # they stay identical across TP ranks only when every rank starts from
-        # the same complete pretrained checkpoint. This marker makes
-        # apply_model_infrastructure and checkpoint loading fail closed on
-        # random/from-config initialization or partial checkpoints. It applies
-        # equally to registered and explicit custom-MoE plans.
+        # The custom-MoE TP support contract requires a complete pretrained base
+        # model and excludes PEFT because adapter and initialization ownership are
+        # undefined across combined TP/EP. This marker enforces that contract for
+        # both registered and explicit plans during setup and checkpoint loading.
         model._nemo_moe_tp_requires_pretrained_weights = True
         # PEFT is applied before distributed sharding. Translate each style so
         # LoRA-wrapped shared-expert/lm-head modules keep the same TP semantics.

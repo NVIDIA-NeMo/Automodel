@@ -469,6 +469,7 @@ class TestBenchmarkingRecipeRunBenchmark:
         """Test that optimizer step is called once per iteration."""
         mock_recipe._get_dp_group_size = MagicMock(return_value=8)
         graph_manager = MagicMock()
+        sync_tp_replicas = MagicMock()
         mock_recipe.partial_cuda_graph_manager = graph_manager
         mock_recipe._partial_cuda_graph_capture_pending = True
 
@@ -504,11 +505,19 @@ class TestBenchmarkingRecipeRunBenchmark:
             )
         )
 
-        with patch("torch.distributed.barrier"):
+        with (
+            patch("torch.distributed.barrier"),
+            patch(
+                "nemo_automodel.recipes.llm.benchmark.synchronize_tp_replica_gradients",
+                sync_tp_replicas,
+            ),
+        ):
             mock_recipe.run_benchmark()
 
             # Should be called 30 times (once per iteration)
             assert mock_recipe.optimizer[0].step.call_count == 30
+            assert sync_tp_replicas.call_count == 30
+            sync_tp_replicas.assert_called_with(mock_recipe.model_parts, mock_recipe.device_mesh)
             graph_manager.capture.assert_called_once_with()
             assert mock_recipe._partial_cuda_graph_capture_pending is False
 

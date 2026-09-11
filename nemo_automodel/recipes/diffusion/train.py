@@ -33,6 +33,7 @@ from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
 from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
 from nemo_automodel.components.distributed.fsdp2 import fsdp2_sharding_enabled
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
+from nemo_automodel.components.distributed.tp_replicas import broadcast_tp_replicas, synchronize_tp_replica_gradients
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.flow_matching.pipeline import FlowMatchingPipeline, create_adapter
 from nemo_automodel.components.loggers.log_utils import setup_logging
@@ -698,6 +699,10 @@ class TrainDiffusionRecipe(BaseRecipe):
         )
 
         self.model = self.pipe.transformer
+        # LoRA and random-pretraining parameters are initialized before TP is
+        # applied. Align their replicated local storage before the optimizer
+        # captures the sharded model parameters.
+        broadcast_tp_replicas([self.model], self.device_mesh)
 
         # FSDP2's MixedPrecisionPolicy is what casts parameters to compute_dtype, and
         # parallelization is skipped entirely on a single-rank mesh. Autocast covers
@@ -1067,7 +1072,13 @@ class TrainDiffusionRecipe(BaseRecipe):
                     if microbatch_idx == 0:
                         prepare_after_first_microbatch()
 
-                grad_norm = clip_grad_norm(self.clip_grad_max_norm, [self.model], foreach=self.grad_clip_foreach)
+                synchronize_tp_replica_gradients([self.model], getattr(self, "device_mesh", None))
+                grad_norm = clip_grad_norm(
+                    self.clip_grad_max_norm,
+                    [self.model],
+                    device_mesh=getattr(self, "device_mesh", None),
+                    foreach=self.grad_clip_foreach,
+                )
                 grad_norm = float(grad_norm) if torch.is_tensor(grad_norm) else grad_norm
 
                 # ── LoRA gradient diagnostic (step 1 only) ───────────────────
