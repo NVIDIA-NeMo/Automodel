@@ -55,16 +55,11 @@ configuration.
 
 from __future__ import annotations
 
-import json
 import math
 import re
-from contextlib import ExitStack
-from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 import torch
-from safetensors import safe_open
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Partial, Shard
 
@@ -119,17 +114,6 @@ def _released_key(key: str) -> str:
     if key.endswith(".ffn.gate.e_score_correction_bias"):
         key = key.removesuffix(".e_score_correction_bias") + ".bias"
     return key
-
-
-@dataclass(frozen=True)
-class CheckpointLoadAudit:
-    """Local streaming-load coverage and byte counts, excluding model storage."""
-
-    loaded_keys: tuple[str, ...]
-    source_bytes: int
-    loaded_bytes: int
-    max_chunk_source_bytes: int
-    max_chunk_output_bytes: int
 
 
 def _local_offsets(tensor: DTensor) -> tuple[int, ...]:
@@ -257,17 +241,14 @@ def dequantize_checkpoint_weight(
 
 
 class DeepseekV41StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
-    """Convert released V4.1 layouts and stream directly into prepared model storage.
+    """Convert released V4.1 checkpoint layouts for DCP loading and export.
 
     Floating DCP initialization uses shared MoE views and skips rebuilding
     experts already written into model storage. Quantized load targets use the
     released V4.1 layout; floating export uses the shared expert splitter.
-    Explicit streaming initialization copies one bounded quantized chunk at a
-    time, without gathering experts or Engram owner rows.
     """
 
-    # Quantized DCP loads still allocate converted tensors. The explicit
-    # streaming API below owns its bounded direct copies independently.
+    # Quantized DCP loads still allocate converted tensors.
     _supports_low_memory_dcp_load = False
 
     def __init__(
@@ -314,169 +295,6 @@ class DeepseekV41StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
             else:
                 keys.append(_released_key(fqn))
         return keys
-
-    @torch.no_grad()
-    def load_from_checkpoint(
-        self,
-        model: torch.nn.Module,
-        checkpoint_path: str | Path,
-        device_mesh: DeviceMesh | None = None,
-    ) -> CheckpointLoadAudit:
-        """Stream released safetensors into materialized, rank-owned parameters.
-
-        Args:
-            model: Prepared native model. Grouped expert tensors must alias
-                model storage, and Engram owner tables must be Shard(0)
-                DTensors when distributed. No meta parameters are accepted.
-            checkpoint_path: Local snapshot containing the safetensors index
-                and shards, or a directory with one ``model.safetensors``.
-            device_mesh: Expert mesh accepted for checkpoint API consistency;
-                ownership is read from the already distributed parameters.
-
-        Returns:
-            Actual local source keys and transferred/storage byte counts.
-            Per-chunk counts exclude model storage and decoder scratch, which
-            is bounded separately by ``dequantize_checkpoint_weight``. No
-            checkpoint tensor or Engram table is gathered across ranks.
-
-        Raises:
-            ValueError: A tensor is missing, has incompatible dimensions, or
-                its backend exposes temporary rather than model-owned experts.
-        """
-        del device_mesh
-        if not self._expert_checkpoint_tensors_use_model_storage:
-            raise ValueError("Streaming checkpoint loading requires experts with model-owned grouped storage")
-        root = Path(checkpoint_path)
-        index_path = root / "model.safetensors.index.json"
-        if index_path.is_file():
-            weight_map = json.loads(index_path.read_text())["weight_map"]
-        else:
-            with safe_open(root / "model.safetensors", framework="pt", device="cpu") as reader:
-                weight_map = {key: "model.safetensors" for key in reader.keys()}
-        loaded_keys: set[str] = set()
-        source_bytes = loaded_bytes = max_source = max_output = 0
-        strict_fp32 = getattr(model, "_keep_in_fp32_modules_strict", ()) or ()
-        # Shared expert splitting records DCP views. This method performs the
-        # copies itself, so those records must not leak into a later DCP load.
-        previous_inplace = set(getattr(self, "_inplace_loaded_native_keys", None) or ())
-        try:
-            with ExitStack() as stack:
-                readers = {}
-                for fqn, tensor in model.state_dict().items():
-                    if not isinstance(tensor, torch.Tensor):
-                        continue
-                    if tensor.is_meta:
-                        raise ValueError(f"Streaming checkpoint destination {fqn} has not been materialized")
-                    if tensor.is_floating_point() and any(keyword in fqn for keyword in strict_fp32):
-                        local = tensor.to_local() if isinstance(tensor, DTensor) else tensor
-                        if tensor.dtype != torch.float32 or local.dtype != torch.float32:
-                            raise ValueError(
-                                f"Strict FP32 checkpoint destination {fqn} has dtype {tensor.dtype} "
-                                f"and local storage dtype {local.dtype}; prepare FP32 storage before loading"
-                            )
-                    engram = re.fullmatch(r"model\.layers\.(\d+)\.engram\.embed\.weight", fqn)
-                    if engram and isinstance(tensor, DTensor):
-                        row_start = _local_offsets(tensor)[0]
-                        valid_rows = max(0, self._engram_rows[int(engram[1])] - row_start)
-                        tensor.to_local()[valid_rows:].zero_()
-                    destinations = self.convert_single_tensor_to_hf(
-                        fqn,
-                        tensor,
-                        for_checkpoint_load=True,
-                        preserve_dtensor_load_views=True,
-                        quantization=False,
-                        exclude_key_regex=r".*_extra_state.*",
-                    )
-                    for key, destination in destinations:
-                        local = destination.to_local() if isinstance(destination, DTensor) else destination
-                        if f".{self._expert_path_segment}." in fqn and local.numel():
-                            native_local = tensor.to_local() if isinstance(tensor, DTensor) else tensor
-                            if (
-                                local.device != native_local.device
-                                or local.untyped_storage().data_ptr() != native_local.untyped_storage().data_ptr()
-                            ):
-                                raise ValueError(
-                                    f"Streaming expert destination {key} does not alias model storage {fqn}"
-                                )
-                        if key not in weight_map:
-                            raise ValueError(f"Checkpoint is missing model tensor {key}")
-                        shard_name = weight_map[key]
-                        if shard_name not in readers:
-                            readers[shard_name] = stack.enter_context(
-                                safe_open(root / shard_name, framework="pt", device="cpu")
-                            )
-                        source = readers[shard_name].get_slice(key)
-                        scale_key = key.removesuffix(".weight") + ".scale"
-                        scale_source = None
-                        if key.endswith(".weight") and scale_key in weight_map:
-                            shard_name = weight_map[scale_key]
-                            if shard_name not in readers:
-                                readers[shard_name] = stack.enter_context(
-                                    safe_open(root / shard_name, framework="pt", device="cpu")
-                                )
-                            scale_source = readers[shard_name].get_slice(scale_key)
-                        packed = source.get_dtype() == "I8" and scale_source is not None
-                        source_shape = list(source.get_shape())
-                        if packed:
-                            source_shape[1] *= 2
-                        if tuple(source_shape) != tuple(destination.shape):
-                            raise ValueError(
-                                f"Checkpoint {key} has decoded shape {tuple(source_shape)}, "
-                                f"expected {tuple(destination.shape)}"
-                            )
-                        offsets = _local_offsets(destination) if isinstance(destination, DTensor) else (0,) * local.ndim
-                        if scale_source is not None and local.ndim != 2:
-                            raise ValueError(f"Quantized checkpoint tensor {key} must be two-dimensional")
-                        row_step = max(1, (4 * 1024 * 1024) // max(1, math.prod(local.shape[1:])))
-                        row_step = max(32, row_step // 32 * 32) if scale_source is not None else row_step
-                        rows = local.shape[0] if local.ndim else 1
-                        for begin in range(0, rows, row_step):
-                            end = min(rows, begin + row_step)
-                            if scale_source is None:
-                                slices = tuple(slice(start, start + size) for start, size in zip(offsets, local.shape))
-                                if local.ndim:
-                                    slices = (slice(offsets[0] + begin, offsets[0] + end), *slices[1:])
-                                chunk = source[slices]
-                                if chunk.dtype in (torch.int8, torch.float8_e4m3fn):
-                                    raise ValueError(f"Quantized checkpoint tensor {key} is missing its scale")
-                                target = local[begin:end] if local.ndim else local
-                                target.copy_(chunk)
-                                chunk_source = chunk.numel() * chunk.element_size()
-                                chunk_output = target.numel() * target.element_size()
-                            else:
-                                rowwise = packed or ".engram.embed." in key
-                                row_block = 1 if rowwise else 32
-                                r0 = (offsets[0] + begin) // row_block * row_block
-                                r1 = min(source_shape[0], (offsets[0] + end + row_block - 1) // row_block * row_block)
-                                c0 = offsets[1] // 32 * 32
-                                c1 = min(source_shape[1], (offsets[1] + local.shape[1] + 31) // 32 * 32)
-                                divisor = 2 if packed else 1
-                                raw = source[r0:r1, c0 // divisor : c1 // divisor]
-                                scales = scale_source[
-                                    r0 // row_block : (r1 + row_block - 1) // row_block, c0 // 32 : (c1 + 31) // 32
-                                ]
-                                chunk_source = raw.numel() * raw.element_size() + scales.numel() * scales.element_size()
-                                decoded = dequantize_checkpoint_weight(
-                                    raw.to(local.device), scales.to(local.device), dtype=local.dtype, rowwise=rowwise
-                                )
-                                local[begin:end].copy_(
-                                    decoded[
-                                        offsets[0] + begin - r0 : offsets[0] + end - r0,
-                                        offsets[1] - c0 : offsets[1] - c0 + local.shape[1],
-                                    ]
-                                )
-                                chunk_output = decoded.numel() * decoded.element_size()
-                                del raw, scales, decoded
-                            source_bytes += chunk_source
-                            max_source = max(max_source, chunk_source)
-                            max_output = max(max_output, chunk_output)
-                        loaded_bytes += local.numel() * local.element_size()
-                        loaded_keys.add(key)
-                        if scale_source is not None:
-                            loaded_keys.add(scale_key)
-        finally:
-            self._inplace_loaded_native_keys = previous_inplace
-        return CheckpointLoadAudit(tuple(sorted(loaded_keys)), source_bytes, loaded_bytes, max_source, max_output)
 
     # ------------------------------------------------------------------
     # from_hf
@@ -735,8 +553,7 @@ class DeepseekV41StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
             exclude_key_regex: Optional regular expression for excluded HF keys.
             quantization: Whether initialization needs packed checkpoint targets.
             **kwargs: Compatibility options from checkpointing, including
-                for_checkpoint_load for destinations overwritten by DCP and
-                preserve_dtensor_load_views for direct streaming initialization.
+                for_checkpoint_load for destinations overwritten by DCP.
 
         Returns:
             Released mapping with split expert matrices [output, input]. DTensor
@@ -772,8 +589,7 @@ class DeepseekV41StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
                 owner mesh with equal local row counts. Other tensors retain
                 their arbitrary registered shapes.
             **kwargs: Checkpoint protocol options, including quantization,
-                exclude_key_regex, for_checkpoint_load and the explicit
-                preserve_dtensor_load_views direct-loader contract.
+                exclude_key_regex and for_checkpoint_load.
 
         Returns:
             Released-name tensor pairs, with split experts in [output, input]

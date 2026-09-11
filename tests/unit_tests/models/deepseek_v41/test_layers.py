@@ -15,12 +15,10 @@
 """Independent mHC equations and RMSNorm backend construction/checkpoint contracts."""
 
 from dataclasses import replace
-from pathlib import Path
 
 import pytest
 import torch
 import torch.nn.functional as F
-from safetensors.torch import save_file
 
 from nemo_automodel.components.models.deepseek_v41.layers import (
     DeepseekV41HyperConnection,
@@ -129,7 +127,7 @@ def test_mhc_coefficients_collapse_expand_and_gradients_match_released_equations
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_te_norms_preserve_meta_storage_initialization_and_checkpoint_keys(dtype: torch.dtype, tmp_path: Path) -> None:
+def test_te_norms_preserve_meta_storage_initialization_and_checkpoint_keys(dtype: torch.dtype) -> None:
     # This checks real optional TE modules on meta/CPU, without invoking CUDA
     # kernels. Environments without TE still run the eager mathematical tests.
     te = pytest.importorskip("transformer_engine.pytorch.module.rmsnorm")
@@ -190,9 +188,9 @@ def test_te_norms_preserve_meta_storage_initialization_and_checkpoint_keys(dtype
             parameter.fill_(-13.5)
     exported = eager.state_dict_adapter.to_hf(eager.state_dict(), exclude_key_regex=r".*_extra_state.*")
     assert not any("_extra_state" in name for name in exported)
-    save_file(exported, tmp_path / "model.safetensors")
-    audit = fused.state_dict_adapter.load_from_checkpoint(fused, tmp_path)
-    assert set(audit.loaded_keys) == set(exported)
+    restored = fused.state_dict_adapter.from_hf(exported)
+    restored.update(extra_state)
+    fused.load_state_dict(restored)
     assert identities == {name: id(parameter) for name, parameter in fused.named_parameters()}
     loaded = fused.state_dict()
     for name, expected in eager.state_dict().items():

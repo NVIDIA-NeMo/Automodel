@@ -232,76 +232,6 @@ def test_global_key_audit_accepts_owner_local_meta_tables() -> None:
             assert f"layers.0.ffn.experts.{index}.w{projection}.weight" in keys
 
 
-def test_stream_load_copies_quantized_sources_into_grouped_views(tmp_path: Path) -> None:
-    adapter = _adapter()
-    state = {
-        "model.layers.0.attn.wq_a.weight": torch.zeros(33, 64),
-        "model.layers.0.ffn.experts.gate_and_up_projs": torch.zeros(2, 32, 64),
-        "model.layers.0.ffn.experts.down_projs": torch.zeros(2, 32, 32),
-        "model.norm.weight": torch.zeros(32),
-    }
-    source = adapter.to_hf(state, quantization=True, for_checkpoint_load=True)
-    for key, value in source.items():
-        if value.dtype == torch.int8:
-            value.fill_(0x44)
-        else:
-            value.copy_(torch.full(value.shape, 2.0 if key.endswith(".scale") else 1.0))
-    save_file(source, tmp_path / "model.safetensors")
-    model = _checkpoint_model(state)
-    audit = adapter.load_from_checkpoint(model, tmp_path)
-    assert set(audit.loaded_keys) == set(source)
-    assert audit.loaded_bytes == sum(t.numel() * t.element_size() for t in state.values())
-    assert audit.source_bytes == sum(t.numel() * t.element_size() for t in source.values())
-    assert audit.max_chunk_source_bytes < 4 * 1024 * 1024
-    assert audit.max_chunk_output_bytes < 16 * 1024 * 1024
-    assert (state["model.layers.0.attn.wq_a.weight"] == 2).all()
-    assert (state["model.layers.0.ffn.experts.gate_and_up_projs"] == 4).all()
-    assert (state["model.layers.0.ffn.experts.down_projs"] == 4).all()
-    assert (state["model.norm.weight"] == 1).all()
-    assert not getattr(adapter, "_inplace_loaded_native_keys", None)
-
-
-def test_streaming_checkpoint_rejects_reduced_precision_strict_storage(tmp_path) -> None:
-    adapter = _adapter()
-    original = torch.tensor([1.001, -2.003, 0.3333, 17.125])
-    save_file({"layers.0.attn.attn_sink": original}, tmp_path / "model.safetensors")
-    fqn = "model.layers.0.attn.sinks_param.weight"
-    model = _checkpoint_model({fqn: torch.zeros_like(original, dtype=torch.bfloat16)})
-    model._keep_in_fp32_modules_strict = ["attn.sinks_param"]
-    with pytest.raises(ValueError, match="Strict FP32 checkpoint destination.*local storage dtype torch.bfloat16"):
-        adapter.load_from_checkpoint(model, tmp_path)
-    model = _checkpoint_model({fqn: torch.zeros_like(original)})
-    model._keep_in_fp32_modules_strict = ["attn.sinks_param"]
-    adapter.load_from_checkpoint(model, tmp_path)
-    assert torch.equal(model.state_dict()[fqn], original)
-
-
-def test_streaming_checkpoint_rejects_detached_expert_destinations(tmp_path, monkeypatch) -> None:
-    adapter = _adapter()
-    state = {"model.layers.0.ffn.experts.gate_and_up_projs": torch.full((2, 32, 64), -101.0)}
-    save_file(adapter.to_hf(state), tmp_path / "model.safetensors")
-    convert = adapter.convert_single_tensor_to_hf
-
-    def detached_destinations(fqn, tensor, **kwargs):
-        """Simulate projection copies that cannot update grouped model storage.
-
-        Args:
-            fqn: Native expert parameter name.
-            tensor: Grouped expert tensor [experts, hidden, 2 * intermediate].
-            **kwargs: Forwarded checkpoint conversion options.
-
-        Returns:
-            Released names and detached-storage projection matrices [output, input], preserving the source
-            dtype and values. Each matrix has storage distinct from the model parameter.
-        """
-        return [(key, value.clone()) for key, value in convert(fqn, tensor, **kwargs)]
-
-    monkeypatch.setattr(adapter, "convert_single_tensor_to_hf", detached_destinations)
-    with pytest.raises(ValueError, match="does not alias model storage"):
-        adapter.load_from_checkpoint(_checkpoint_model(state), tmp_path)
-    assert (state["model.layers.0.ffn.experts.gate_and_up_projs"] == -101).all()
-
-
 def test_quantized_load_destinations_match_dump_and_do_not_alias_model() -> None:
     adapter = _adapter()
     native = {
@@ -380,29 +310,11 @@ def _owner_checkpoint_worker(rank: int, rendezvous: str) -> None:
         else:
             assert decoded[0, 0] == 4 and decoded[-1, -1] == 32
         checkpoint = Path(rendezvous).parent
-        if rank == 0:
-            table_source = torch.full((17, 64), 2.0)
-            table_source[9:] = 4.0
-            save_file(
-                {
-                    "layers.1.engram.embed.weight": table_source.to(torch.float8_e4m3fn),
-                    "layers.1.engram.embed.scale": torch.full((17, 2), 2.0).to(torch.float8_e8m0fnu),
-                    "layers.0.attn.wq_a.weight": torch.ones(65, 64).to(torch.float8_e4m3fn),
-                    "layers.0.attn.wq_a.scale": scales,
-                },
-                checkpoint / "model.safetensors",
-            )
-        dist.barrier()
-        dense = DTensor.from_local(
-            torch.zeros_like(decoded), mesh, (Shard(0),), shape=torch.Size((65, 64)), stride=(64, 1)
-        )
-        model = _checkpoint_model({key: native, "model.layers.0.attn.wq_a.weight": dense})
-        audit = adapter.load_from_checkpoint(model, checkpoint)
-        assert len(audit.loaded_keys) == 4
-        assert (native.to_local()[:valid] == (4 if rank == 0 else 8)).all()
+        native.to_local()[:valid].fill_(4 if rank == 0 else 8)
         if rank == 1:
-            assert (native.to_local()[-1] == 0).all()
-        torch.testing.assert_close(dense.to_local(), decoded)
+            native.to_local()[-1].zero_()
+        dense = DTensor.from_local(decoded.clone(), mesh, (Shard(0),), shape=torch.Size((65, 64)), stride=(64, 1))
+        model = _checkpoint_model({key: native, "model.layers.0.attn.wq_a.weight": dense})
         expected = {name: value.to_local().clone() for name, value in model.state_dict().items()}
         dcp.save(adapter.to_hf(model.state_dict()), checkpoint_id=checkpoint / "dcp")
         for value in model.state_dict().values():
@@ -446,7 +358,7 @@ def test_uneven_engram_owner_rows_and_misaligned_dense_shards(tmp_path: Path) ->
 
 
 def _quantized_checkpointer_worker(rank: int, rendezvous: str, expert_shard_size: int = 1) -> None:
-    """Read a real quantized HF dump through streaming and DCP, then round-trip SafeTensors."""
+    """Read a real quantized HF dump through DCP, then round-trip SafeTensors."""
     world_size = 2 * expert_shard_size
     dim = 32 * expert_shard_size
     dist.init_process_group("gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=world_size)
@@ -553,34 +465,6 @@ def _quantized_checkpointer_worker(rank: int, rendezvous: str, expert_shard_size
             )
         model = _CheckpointOnlyV41(adapter.config, tensors)
         model.state_dict_adapter = adapter
-        if expert_shard_size > 1:
-            for key, tensor in model.state_dict().items():
-                if ".ffn.experts." not in key:
-                    continue
-                pointer = tensor.to_local().untyped_storage().data_ptr()
-                # Only an explicitly enabled floating load can keep the inner-sharded views.
-                for loading, quantized, preserve, aliases in (
-                    (True, False, True, True),
-                    (True, False, False, False),
-                    (False, False, True, False),
-                    (True, True, True, False),
-                ):
-                    converted = adapter.convert_single_tensor_to_hf(
-                        key,
-                        tensor,
-                        for_checkpoint_load=loading,
-                        quantization=quantized,
-                        preserve_dtensor_load_views=preserve,
-                    )
-                    for _, destination in converted:
-                        assert isinstance(destination, DTensor)
-                        assert (destination.to_local().untyped_storage().data_ptr() == pointer) == aliases
-        adapter.load_from_checkpoint(model, checkpoint, device_mesh=expert_mesh)
-        for key, tensor in model.state_dict().items():
-            reference = local_expected[key]
-            assert tensor.dtype == reference.dtype and tensor.to_local().dtype == reference.dtype
-            torch.testing.assert_close(tensor.to_local(), reference, rtol=0, atol=0)
-            tensor.to_local().fill_(-101)
         checkpointer = Checkpointer(
             CheckpointingConfig(
                 checkpoint_dir=str(root),
@@ -624,45 +508,6 @@ def test_real_quantized_hf_initialization_and_safetensors_resume(tmp_path: Path,
         nprocs=2 * expert_shard_size,
         join=True,
     )
-
-
-@pytest.mark.parametrize("failure", ["missing_key", "missing_scale", "wrong_shape"])
-def test_stream_load_rejects_incomplete_or_incompatible_source(tmp_path: Path, failure: str) -> None:
-    """Malformed source weights fail before the sentinel destination is copied."""
-    key = "layers.0.attn.wq_a.weight"
-    source = {key: torch.ones(32, 32, dtype=torch.float32)}
-    message = "missing model tensor"
-    if failure == "missing_key":
-        source = {"norm.weight": torch.ones(32)}
-    elif failure == "missing_scale":
-        source[key] = source[key].to(torch.float8_e4m3fn)
-        message = "missing its scale"
-    else:
-        source[key] = torch.ones(31, 32)
-        message = "decoded shape"
-    save_file(source, tmp_path / "model.safetensors")
-    target = torch.full((32, 32), -101.0)
-    with pytest.raises(ValueError, match=message):
-        _adapter().load_from_checkpoint(_checkpoint_model({"model.layers.0.attn.wq_a.weight": target}), tmp_path)
-    assert torch.equal(target, torch.full_like(target, -101.0))
-
-
-def test_stream_load_chunks_source_larger_than_decode_budget(tmp_path: Path) -> None:
-    """A matrix beyond 4M elements is loaded in bounded, exact BF16 chunks."""
-    shape = (4112, 1024)
-    raw = torch.full(shape, 1.5).to(torch.float8_e4m3fn)
-    scales = torch.full((129, 32), 2.0).to(torch.float8_e8m0fnu)
-    save_file({"layers.0.attn.wq_a.weight": raw, "layers.0.attn.wq_a.scale": scales}, tmp_path / "model.safetensors")
-    target = torch.full(shape, -101.0, dtype=torch.bfloat16)
-    audit = _adapter(dtype=torch.bfloat16).load_from_checkpoint(
-        _checkpoint_model({"model.layers.0.attn.wq_a.weight": target}), tmp_path
-    )
-    assert torch.equal(target, torch.full_like(target, 3.0))
-    assert audit.source_bytes == raw.numel() + scales.numel()
-    assert audit.loaded_bytes == target.numel() * target.element_size()
-    assert audit.max_chunk_source_bytes < audit.source_bytes
-    assert audit.max_chunk_output_bytes == 4 * 1024 * 1024 * target.element_size()
-    assert audit.max_chunk_output_bytes < audit.loaded_bytes
 
 
 @pytest.mark.parametrize("scale_byte", [0, 255], ids=["smallest_exponent", "nan"])

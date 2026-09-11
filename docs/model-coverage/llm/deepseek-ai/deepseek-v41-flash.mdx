@@ -93,18 +93,8 @@ preserves released parameter names, required FP32 weights, and logical Engram
 rows while removing the original quantization metadata. Quantized re-export
 is not supported.
 
-For an already materialized model with its final FSDP, expert, and Engram
-ownership, bounded direct initialization is available outside an active
-training graph:
-
-```python
-audit = model.state_dict_adapter.load_from_checkpoint(model, checkpoint_path)
-```
-
-This copies bounded slices into model-owned storage without gathering an
-Engram table or materializing the whole checkpoint. It rejects missing keys,
-shape mismatches, and incompatible destination storage. Normal recipe loading
-uses the NeMo wrapper's internal Checkpointer and DCP path.
+Recipe initialization uses the NeMo wrapper's internal Checkpointer and DCP
+path to load the base checkpoint into the distributed model.
 
 Text inputs use unpacked `input_ids [batch, sequence]`, right padding, and
 zero-based positions. The optional `labels [batch, sequence]` API computes
@@ -158,9 +148,10 @@ trainable gradients were present and finite, including nonzero Engram and
 expert gradients. This check performed no clipping or optimizer updates and
 does not establish training behavior for native HybridEP combine.
 
-The native-combine forward was measured before the custom combine code was
-removed. These records identify the tested commits; they do not claim a new
-GPU run for that removal or full-resident 40-layer PR training.
+The historical streamed forward used a diagnostic direct-loading entry point
+that has since been removed. These records identify the tested commits; they
+do not claim a new GPU run after removing that loader or the custom combine
+code, or full-resident 40-layer PR training.
 
 ## Original Implementation Training Result
 

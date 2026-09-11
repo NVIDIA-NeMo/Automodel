@@ -1010,9 +1010,8 @@ class MoESplitExpertsStateDictMixin:
         *,
         prefix_override: str | None = None,
         for_checkpoint_load: bool = False,
-        preserve_dtensor_load_views: bool = False,
         **kwargs,
-    ) -> list[tuple[str, torch.Tensor]] | None:
+    ) -> list[tuple[str, torch.Tensor]]:
         """Convert one grouped expert tensor to Hugging Face's per-expert layout.
 
         During checkpoint loading, DCP can write into contiguous or non-contiguous views. A view into model weight
@@ -1021,30 +1020,17 @@ class MoESplitExpertsStateDictMixin:
 
         Args:
             fqn: Fully qualified name of the tensor in native format.
-            tensor: Grouped gated weights [experts, hidden, 2 * intermediate],
-                non-gated weights [experts, hidden, intermediate], or down
-                projections [experts, intermediate, hidden]. Expert LoRA
-                tensors retain the layout documented by the existing LoRA
-                conversion helpers. A DTensor may shard the expert axis and
-                an inner matrix axis across separate mesh dimensions; its
-                local tensor contains only the rank-owned experts and slices.
+            tensor: The tensor to convert.
             prefix_override: When provided, replaces ``self._hf_prefix`` in
                 emitted HF keys. Used to route conversions through namespaces
                 outside the main backbone, e.g. ``"mtp."`` for the MTP head.
             for_checkpoint_load: Return views that DCP will completely overwrite. Save/export callers leave this
                 disabled so converted tensors preserve their current values in contiguous storage.
-            preserve_dtensor_load_views: Also retain non-contiguous DTensor views for unquantized checkpoint
-                destinations. Streaming loaders that copy directly into model storage opt in; ordinary DCP and
-                export callers retain the existing contiguous conversion and reconstruction behavior.
             **kwargs: Absorbed for forward-compatibility with base callers
                 that forward arbitrary state-dict kwargs (e.g. ``exclude_key_regex``).
 
         Returns:
-            Released-name projection tensors [output, input] for rank-owned
-            experts, or None for non-expert tensors. An inner matrix shard
-            retains DTensor global shape, mesh and adjusted Shard placements.
-            Explicit unquantized load views can alias native storage; other
-            conversions retain the existing contiguous checkpoint layout.
+            List of (fqn, tensor) tuples in HuggingFace format, or None if not an expert tensor.
         """
         n_experts = self.moe_config.n_routed_experts
         inter_dim = self.moe_config.moe_inter_dim
@@ -1087,23 +1073,10 @@ class MoESplitExpertsStateDictMixin:
         )
 
         def checkpoint_load_destination(view: torch.Tensor, source: torch.Tensor) -> torch.Tensor:
-            """Choose an aliasing load view or a contiguous projection tensor.
-
-            Args:
-                view: Released projection [output, input], possibly a DTensor whose local matrix aliases the
-                    grouped expert storage. Its dtype is unchanged.
-                source: Per-expert native matrix [input, output] or [input, 2 * output], used to distinguish
-                    ordinary local tensors from DTensors that retain an inner-axis shard.
-
-            Returns:
-                The same projection view for an unquantized load when the source is local or DTensor views are
-                explicitly enabled; otherwise its contiguous equivalent. DTensor global/local shapes, mesh,
-                placements and dtype are preserved. Making a non-contiguous projection contiguous copies its
-                storage, so callers using that result must reconstruct the native tensor after loading.
-            """
+            """Return the checkpoint-layout view that DCP will fill."""
             nonlocal reused_checkpoint_load_views
 
-            if for_checkpoint_load and not quantization and (not is_dtensor(source) or preserve_dtensor_load_views):
+            if for_checkpoint_load and not quantization and not is_dtensor(source):
                 reused_checkpoint_load_views = True
                 return view
 
