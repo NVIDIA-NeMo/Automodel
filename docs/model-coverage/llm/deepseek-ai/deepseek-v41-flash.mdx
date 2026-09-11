@@ -35,8 +35,9 @@ receive the owner divisor once before clipping.
 The configuration requests 100 updates with validation every 50 updates,
 activation checkpointing, and reshard-after-forward. It uses no gradient
 accumulation or additional expert FSDP shard axis, and requests a one-hour
-allocation with online W&B logging. TE FusedAdam retains FP32 master-weight
-precision through int16 remainders for BF16 parameters.
+allocation. W&B logging is disabled by default; set `wandb.enable: true` to
+enable online logging. TE FusedAdam retains FP32 master-weight precision
+through int16 remainders for BF16 parameters.
 
 <Note>
 Checkpoint saving is disabled because exporting BF16 optimizer moments expands
