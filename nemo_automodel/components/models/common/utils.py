@@ -25,6 +25,7 @@ from torch.distributed.fsdp import FSDPModule
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel.shared.import_utils import safe_import, safe_import_from
+from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 from nemo_automodel.shared.utils import dtype_from_str
 
 logger = logging.getLogger(__name__)
@@ -707,31 +708,44 @@ def cast_model_to_dtype(
     Respects ``_keep_in_fp32_modules`` / ``_keep_in_fp32_modules_strict`` on
     the model (the same attributes HuggingFace transformers uses).
 
-    Applies the dtype conversion once per tensor, without first rounding fp32
-    state to the target dtype. When the model is already FSDP2-sharded
-    (parameters are DTensors), strict fp32 modules remain in fp32 because
+    Uses ``nn.Module.to()`` which is safe for both plain tensors and DTensors
+    (FSDP2 sharded parameters).  When the model is already FSDP2-sharded
+    (parameters are DTensors), strict fp32 modules are restored to fp32 because
     they are expected to be isolated as uniform fp32 FSDP units. Non-strict fp32
-    hints only preserve matching buffers, since their parameters may share an
+    hints only restore matching buffers, since their parameters may share an
     FSDP unit with lower-precision parameters.
 
     Args:
         model: The model whose parameters should be cast.
         dtype: Target dtype (e.g. ``torch.bfloat16``).
         skip_modules: Names of immediate submodules to leave entirely untouched
-            (kept at their current dtype). These are detached during the cast so
-            it never visits their parameters or buffers, including tensors that
-            would otherwise be promoted to fp32. The caller must guarantee each
-            skipped submodule is its own dtype-uniform FSDP group (e.g.
-            Qwen3.5's ``_fp32_params``
+            (kept at their current dtype). Unlike the ``_keep_in_fp32_modules``
+            restore path, these are *detached* during the cast so ``model.to()``
+            never visits them — the only reliable way to preserve an fp32
+            parameter once it is FSDP2-sharded (post-shard ``.data`` reassignment
+            does not stick). The caller must guarantee each skipped submodule is
+            its own dtype-uniform FSDP group (e.g. Qwen3.5's ``_fp32_params``
             holder, sharded separately in fp32), so leaving it fp32 cannot break
             FSDP's uniform-dtype rule.
     """
     fp32_keywords = _get_fp32_module_keywords(model)
     strict_fp32_keywords = _get_strict_fp32_module_keywords(model)
-    if not dtype.is_floating_point and not dtype.is_complex:
-        raise TypeError(f"nn.Module.to only accepts floating point or complex dtypes, but got desired dtype={dtype}")
+    has_dtensor_params = _has_dtensor_params(model)
 
-    # Detach skip_modules so the conversion does not descend into them. This
+    if has_dtensor_params:
+        fp32_snapshots = _snapshot_fp32_tensors(
+            model,
+            parameter_keywords=strict_fp32_keywords,
+            buffer_keywords=fp32_keywords,
+        )
+    else:
+        fp32_snapshots = _snapshot_fp32_tensors(
+            model,
+            parameter_keywords=fp32_keywords,
+            buffer_keywords=fp32_keywords,
+        )
+
+    # Detach skip_modules so ``model.to(dtype)`` does not descend into them. This
     # preserves their exact dtype (e.g. fp32 master weights) through the cast.
     detached: list[tuple[nn.Module, str, nn.Module]] = []
     if skip_modules:
@@ -742,62 +756,38 @@ def cast_model_to_dtype(
                     parent._modules[child_name] = None
 
     try:
-        # FSDP's _apply reshards before conversion. Do that before collecting
-        # identities too: an unsharded module currently registers different
-        # Parameter objects from the DTensors the callback will receive.
-        for module in model.modules():
-            if isinstance(module, FSDPModule):
-                module.reshard()
-        has_dtensor_params = _has_dtensor_params(model)
-        parameter_keywords = strict_fp32_keywords if has_dtensor_params else fp32_keywords
-        fp32_tensor_ids: set[int] = set()
-        # Include every alias: a tied parameter may have a protected name even
-        # if its first registration does not match the fp32 declaration.
-        for name, param in model.named_parameters(remove_duplicate=False):
-            if param.is_floating_point() and any(keyword in name for keyword in parameter_keywords):
-                fp32_tensor_ids.add(id(param))
-                if param.grad is not None:
-                    fp32_tensor_ids.add(id(param.grad))
-        for name, buf in model.named_buffers(remove_duplicate=False):
-            if buf.is_floating_point() and any(keyword in name for keyword in fp32_keywords):
-                fp32_tensor_ids.add(id(buf))
-
-        def convert(tensor: torch.Tensor) -> torch.Tensor:
-            """Cast an arbitrary-rank tensor using the enclosing dtype policy.
-
-            Args:
-                tensor: Parameter, gradient, or buffer of any rank and dtype;
-                    may be a DTensor.
-
-            Returns:
-                Tensor with unchanged shape and device. Floating-point or complex
-                inputs use FP32 when their identity is protected, otherwise ``dtype``;
-                integer and boolean inputs are returned unchanged. For DTensors,
-                global/local shapes, mesh, and placements are unchanged. The result
-                is the input object and aliases its storage when no cast is needed;
-                a dtype change allocates new storage.
-            """
-            if not tensor.is_floating_point() and not tensor.is_complex():
-                return tensor
-            return tensor.to(torch.float32 if id(tensor) in fp32_tensor_ids else dtype)
-
-        # Use Module's conversion machinery so DTensor parameters retain their
-        # identity and FSDP refreshes its local shard metadata. Restoring a saved
-        # DTensor via ``param.data = snapshot`` after a broad cast only restores
-        # the outer dtype; its local shard can remain rounded to the cast dtype.
-        model._apply(convert)
+        model.to(dtype)
     finally:
         for parent, child_name, child in detached:
             parent._modules[child_name] = child
 
-    if has_dtensor_params:
-        buffer_only_keywords = [kw for kw in fp32_keywords if kw not in strict_fp32_keywords]
-        if buffer_only_keywords:
-            logger.warning(
-                "Model parameters are DTensors (FSDP2) — skipping fp32 parameter "
-                "preservation for non-strict keywords=%s. Only buffers will remain in fp32. "
-                "FSDP2 requires uniform dtype within each parameter group.",
-                buffer_only_keywords,
+    if fp32_keywords:
+        if has_dtensor_params:
+            if strict_fp32_keywords:
+                _restore_fp32_tensor_snapshots(
+                    model,
+                    parameter_snapshots=fp32_snapshots[0],
+                    buffer_snapshots={},
+                )
+
+            buffer_only_keywords = [kw for kw in fp32_keywords if kw not in strict_fp32_keywords]
+            if buffer_only_keywords:
+                logger.warning(
+                    "Model parameters are DTensors (FSDP2) — skipping fp32 parameter "
+                    "restoration for non-strict keywords=%s. Only buffers will be restored to fp32. "
+                    "FSDP2 requires uniform dtype within each parameter group.",
+                    buffer_only_keywords,
+                )
+            _restore_fp32_tensor_snapshots(
+                model,
+                parameter_snapshots={},
+                buffer_snapshots=fp32_snapshots[1],
+            )
+        else:
+            _restore_fp32_tensor_snapshots(
+                model,
+                parameter_snapshots=fp32_snapshots[0],
+                buffer_snapshots=fp32_snapshots[1],
             )
 
 
@@ -819,15 +809,15 @@ def yield_fp32_model(model: nn.Module, restore_dtype: torch.dtype | None = None)
     per-element perturbation that preserves the init statistics. Wrap the body of a model's
     ``initialize_weights`` to keep that round-trip in one place.
 
-    Works whether or not the model is already FSDP2-sharded: each FSDP group remains uniform,
-    including the separately sharded strict fp32 modules. In
+    Works whether or not the model is already FSDP2-sharded: both casts are *uniform* whole-model
+    casts, so FSDP2's invariant that every parameter in a group shares one dtype is preserved. In
     the AutoModel pipeline ``initialize_weights`` actually runs after sharding (via
     ``checkpointer.initialize_model_weights``), i.e. on DTensor params, which is supported.
 
     ``_keep_in_fp32_modules`` / ``_keep_in_fp32_modules_strict`` handling is delegated to
-    ``cast_model_to_dtype``: on an unsharded model those modules' params and buffers remain
-    in fp32 on exit; on a sharded model, strict fp32 modules remain in fp32 while non-strict modules
-    only have their buffers preserved.
+    ``cast_model_to_dtype``: on an unsharded model those modules' params and buffers are restored
+    to fp32 on exit; on a sharded model, strict fp32 modules are restored while non-strict modules
+    only have their buffers restored.
 
     Args:
         model: The model to run in fp32 within the context.
@@ -888,6 +878,66 @@ def _has_dtensor_params(model: nn.Module) -> bool:
     except ImportError:
         return False
     return any(isinstance(p, DTensor) for p in model.parameters())
+
+
+def _snapshot_fp32_tensors(
+    model: nn.Module,
+    *,
+    parameter_keywords: list[str],
+    buffer_keywords: list[str],
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    """Clone fp32-preserved tensors before a broad dtype cast.
+
+    Casting ``fp32 -> bf16 -> fp32`` restores the dtype but not the original
+    values. Snapshot the matching tensors first so strict fp32 state such as
+    router correction bias or recurrent-decay parameters is restored exactly.
+    """
+    parameter_snapshots = {
+        name: param.detach().to(torch.float32).clone()
+        for name, param in model.named_parameters()
+        if param.is_floating_point() and any(keyword in name for keyword in parameter_keywords)
+    }
+    buffer_snapshots = {
+        name: buf.detach().to(torch.float32).clone()
+        for name, buf in model.named_buffers(remove_duplicate=False)
+        if buf.is_floating_point() and any(keyword in name for keyword in buffer_keywords)
+    }
+    return parameter_snapshots, buffer_snapshots
+
+
+def _restore_fp32_tensor_snapshots(
+    model: nn.Module,
+    *,
+    parameter_snapshots: dict[str, torch.Tensor],
+    buffer_snapshots: dict[str, torch.Tensor],
+) -> None:
+    """Restore fp32-preserved tensors from pre-cast snapshots."""
+    named_parameters = dict(model.named_parameters())
+    for name, snapshot in parameter_snapshots.items():
+        param = named_parameters.get(name)
+        if param is None:
+            continue
+        param.data = snapshot.to(dtype=torch.float32)
+
+    for name, snapshot in buffer_snapshots.items():
+        # ActivationWrapper forwards __getattr__ / __setattr__ to the wrapped
+        # module. Try the literal FQN first for buffers registered on the wrapped
+        # leaf, then strip the wrapper alias as a fallback for forwarded names.
+        candidate_names = [name]
+        stripped_name = canonical_parameter_fqn(name)
+        if stripped_name != name:
+            candidate_names.append(stripped_name)
+
+        for candidate_name in candidate_names:
+            module_name, _, buffer_name = candidate_name.rpartition(".")
+            try:
+                module = model.get_submodule(module_name) if module_name else model
+            except AttributeError:
+                continue
+            if buffer_name not in module._buffers:
+                continue
+            module._buffers[buffer_name] = snapshot.to(dtype=torch.float32)
+            break
 
 
 def _restore_fp32_modules(model: nn.Module, fp32_keywords: list[str]) -> None:

@@ -16,17 +16,25 @@
 
 import copy
 from dataclasses import replace
+from datetime import timedelta
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 import torch.nn.functional as F
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy, fully_shard
+from torch.distributed.tensor import DTensor, Shard, distribute_tensor
 
 from nemo_automodel._transformers.capabilities import _is_deepseek_v4
 from nemo_automodel.components.distributed.parallelizer import (
     DefaultParallelizationStrategy,
     get_parallelization_strategy,
 )
+from nemo_automodel.components.distributed.parallelizer_utils import fully_shard_by_dtype
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.deepseek_v4 import fsdp as dsv4_fsdp
@@ -346,3 +354,80 @@ def test_v41_uses_generic_moe_parallelization() -> None:
     for layer in model.model.layers.values():
         assert layer.mlp is layer.ffn
         assert all(".mlp." not in name for name in model.state_dict())
+
+
+def _fsdp_initialization_worker(rank: int, rendezvous: str, storage_dtype: torch.dtype) -> None:
+    dist.init_process_group(
+        "gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2, timeout=timedelta(seconds=90)
+    )
+    try:
+        config = _tiny_config()
+        config.text_config.dtype = storage_dtype
+        with torch.device("meta"):
+            model = DeepseekV41ForCausalLM(config, backend=_backend())
+        model.to_empty(device="cpu")
+        expected_dtypes = {name: parameter.dtype for name, parameter in model.named_parameters()}
+        strict_names = model._keep_in_fp32_modules_strict
+        for name, parameter in model.named_parameters():
+            protected = any(keyword in name for keyword in strict_names)
+            assert parameter.dtype == (torch.float32 if protected else storage_dtype), name
+
+        mesh = init_device_mesh("cpu", (2,))
+        policy = MixedPrecisionPolicy(
+            param_dtype=torch.bfloat16, reduce_dtype=torch.float32, output_dtype=None, cast_forward_inputs=False
+        )
+        for module in model.model.layers.values():
+            fully_shard_by_dtype(
+                module,
+                mesh=mesh,
+                mp_policy=policy,
+                offload_policy=None,
+                fp32_compute_module_names=tuple(strict_names),
+                reshard_after_forward=True,
+            )
+        fully_shard(model.model.embed_tokens, mesh=mesh, mp_policy=policy, reshard_after_forward=True)
+        fully_shard(
+            model.lm_head,
+            mesh=mesh,
+            mp_policy=MixedPrecisionPolicy(param_dtype=torch.float32, reduce_dtype=torch.float32),
+            reshard_after_forward=True,
+        )
+        fully_shard(model, mesh=mesh, mp_policy=policy, reshard_after_forward=False)
+        assert isinstance(model, FSDPModule)
+        assert all(isinstance(layer, FSDPModule) for layer in model.model.layers.values())
+        parameters = dict(model.named_parameters())
+        assert all(isinstance(parameter, DTensor) for parameter in parameters.values())
+
+        torch.manual_seed(419 + rank)
+        # This covers real CPU FSDP wrapping and initialization, not a CUDA
+        # all-gather or forward. The requested compute dtype must not replace
+        # either BF16 storage or explicitly requested FP32 master storage.
+        model.initialize_weights(torch.device("cpu"), dtype=torch.bfloat16)
+        for name, parameter in model.named_parameters():
+            assert parameter is parameters[name], name
+            assert parameter.dtype == parameter.to_local().dtype == expected_dtypes[name], name
+            assert torch.isfinite(parameter.to_local()).all(), name
+            if name.endswith((".attn_hc.fn", ".ffn_hc.fn")):
+                local = parameter.to_local()
+                assert torch.any(local != local.bfloat16().float()), name
+
+        name = "model.layers.0.attn_hc.fn"
+        # A checkpoint value deliberately between BF16 representable numbers
+        # must reach the actual FSDP local shard without rounding or replacement.
+        source = torch.full(parameters[name].shape, 1.00123, dtype=torch.float32)
+        state = model.state_dict()
+        state[name] = distribute_tensor(source, mesh, [Shard(0)])
+        model.load_state_dict(state, strict=True)
+        for key, parameter in model.named_parameters():
+            assert parameter is parameters[key], key
+            assert parameter.dtype == parameter.to_local().dtype == expected_dtypes[key], key
+        torch.testing.assert_close(parameters[name].to_local(), source.chunk(2, dim=0)[rank], rtol=0, atol=0)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("storage_dtype", [torch.bfloat16, torch.float32], ids=["bf16", "fp32_master"])
+def test_fsdp_initialization_preserves_local_storage_dtype_and_checkpoint_values(
+    tmp_path: Path, storage_dtype: torch.dtype
+) -> None:
+    mp.spawn(_fsdp_initialization_worker, args=(str(tmp_path / "rendezvous"), storage_dtype), nprocs=2, join=True)

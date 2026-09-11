@@ -55,6 +55,7 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     reject_unsupported_tie_word_embeddings,
 )
 from nemo_automodel.components.models.common.utils import (
+    _has_dtensor_params,
     cast_model_to_dtype,
     compute_lm_head_logits,
 )
@@ -550,7 +551,10 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
             if layer.engram is not None:
                 layer.engram.init_weights()
         nn.init.ones_(self.model.norm.weight)
-        cast_model_to_dtype(self, dtype)
+        # As in DeepSeek V4, construction fixes storage dtypes before sharding.
+        # Casting again here would round strict FP32 DTensor storage.
+        if not _has_dtensor_params(self):
+            cast_model_to_dtype(self, dtype)
         for layer in self.model.layers.values():
             if layer.engram is not None:
                 layer.engram.embed.mark_sharding_contract()

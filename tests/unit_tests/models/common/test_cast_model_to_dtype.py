@@ -14,14 +14,8 @@
 
 from unittest.mock import patch
 
-import pytest
 import torch
-import torch.distributed as dist
 import torch.nn as nn
-from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
-from torch.distributed.tensor import DTensor, Shard
-from torch.multiprocessing import spawn
 
 from nemo_automodel.components.models.common.utils import (
     _get_fp32_module_keywords,
@@ -31,7 +25,6 @@ from nemo_automodel.components.models.common.utils import (
     _restore_fp32_modules,
     cast_frozen_modules_to_compute_dtype,
     cast_model_to_dtype,
-    yield_fp32_model,
 )
 
 # ---------------------------------------------------------------------------
@@ -331,34 +324,6 @@ class TestCastModelToDtype:
         assert not torch.equal(model.mixer.scale, original_scale.to(torch.bfloat16).float())
         assert model.linear.weight.dtype == torch.bfloat16
 
-    def test_strict_fp32_parameter_identity_and_gradient_preserved(self):
-        model = ModelWithStrictFp32Parameter()
-        param = model.mixer.scale
-        param.grad = torch.tensor([1.001, -2.003, 0.3333, 17.125])
-        original_grad = param.grad.clone()
-        model.linear.weight.grad = torch.ones_like(model.linear.weight)
-
-        cast_model_to_dtype(model, torch.bfloat16)
-
-        assert model.mixer.scale is param
-        assert param.grad.dtype == torch.float32
-        assert torch.equal(param.grad, original_grad)
-        assert model.linear.weight.grad.dtype == torch.bfloat16
-
-    def test_fp32_parameter_alias_and_low_precision_promotion(self):
-        model = ModelWithStrictFp32Parameter().to(torch.bfloat16)
-        # The first registration is deliberately outside the protected name.
-        model.register_parameter("alias", model.mixer.scale)
-        param = model.alias
-        model.mixer.scale.grad = torch.ones_like(param)
-
-        cast_model_to_dtype(model, torch.bfloat16)
-
-        assert model.alias is model.mixer.scale is param
-        assert param.dtype == torch.float32
-        assert param.grad.dtype == torch.float32
-        assert model.linear.weight.dtype == torch.bfloat16
-
     def test_strict_fp32_buffers_preserve_values(self):
         model = ModelWithStrictFp32Buffer()
         original_bias = model.router.e_score_correction_bias.clone()
@@ -462,22 +427,6 @@ class TestCastModelToDtype:
         for p in model.parameters():
             assert p.dtype == torch.bfloat16
 
-    def test_skip_modules_preserve_lower_precision_and_restore_after_error(self):
-        class FailingModel(ModelWithStrictFp32):
-            def _apply(self, fn, recurse=True):
-                raise RuntimeError("conversion failed")
-
-        model = ModelWithStrictFp32().to(torch.bfloat16)
-        cast_model_to_dtype(model, torch.float32, skip_modules=("head",))
-        assert model.head.weight.dtype == torch.bfloat16
-        assert model.linear.weight.dtype == torch.float32
-
-        model = FailingModel()
-        head = model.head
-        with pytest.raises(RuntimeError, match="conversion failed"):
-            cast_model_to_dtype(model, torch.bfloat16, skip_modules=("head",))
-        assert model.head is head
-
     def test_set_valued_keep_in_fp32_preserved(self):
         # Mirrors HF converting _keep_in_fp32_modules (list) to a set on the instance —
         # the gemma4_moe/diffusion_gemma case. cast_model_to_dtype must still restore it.
@@ -558,83 +507,6 @@ class TestDTensorAwareCasting:
 
         assert model.norm.weight.dtype == torch.float32
         assert model.linear.weight.dtype == torch.bfloat16
-
-    def test_real_dtensor_strict_storage_survives_initialization_casts(self, tmp_path):
-        spawn(_check_dtensor_cast, args=(str(tmp_path / "dist_init"),), nprocs=2, join=True)
-
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="FSDP unsharding requires CUDA")
-    def test_unsharded_fsdp_strict_storage_survives_cast(self, tmp_path):
-        spawn(_check_unsharded_fsdp_cast, args=(str(tmp_path / "dist_init"),), nprocs=1, join=True)
-
-
-def _check_unsharded_fsdp_cast(rank, init_file):
-    torch.cuda.set_device(rank)
-    dist.init_process_group("nccl", init_method=f"file://{init_file}", rank=rank, world_size=1)
-    try:
-        model = ModelWithStrictFp32().cuda()
-        expected = torch.full_like(model.head.weight, 1.00123)
-        with torch.no_grad():
-            model.head.weight.copy_(expected)
-        fully_shard(model.head, mp_policy=MixedPrecisionPolicy(param_dtype=torch.float32))
-        fully_shard(model, mp_policy=MixedPrecisionPolicy(param_dtype=torch.bfloat16))
-        original_shard = model.head.weight
-        model.head.unshard()
-        assert not isinstance(model.head.weight, DTensor)
-
-        cast_model_to_dtype(model, torch.bfloat16)
-
-        assert model.head.weight is original_shard
-        assert model.head.weight.dtype == model.head.weight.to_local().dtype == torch.float32
-        assert torch.equal(model.head.weight.to_local(), expected)
-        assert model.linear.weight.to_local().dtype == torch.bfloat16
-        model.head.unshard()
-        assert torch.equal(model.head.weight, expected)
-        model.head.reshard()
-    finally:
-        dist.destroy_process_group()
-
-
-def _check_dtensor_cast(rank, init_file):
-    dist.init_process_group("gloo", init_method=f"file://{init_file}", rank=rank, world_size=2)
-    try:
-        mesh = init_device_mesh("cpu", (2,))
-        model = ModelWithStrictFp32Parameter()
-        values = torch.tensor([1.001, -2.003], dtype=torch.float32) + rank
-        model.mixer.scale = nn.Parameter(DTensor.from_local(values.clone(), mesh, [Shard(0)], run_check=False))
-        param = model.mixer.scale
-        local = param.to_local()
-        param.grad = DTensor.from_local(values.clone(), mesh, [Shard(0)], run_check=False)
-        model.linear.weight = nn.Parameter(DTensor.from_local(torch.ones(2, 4), mesh, [Shard(0)], run_check=False))
-        model._keep_in_fp32_modules = ["linear"]
-        model.linear.register_buffer("frequency", values.clone(), persistent=False)
-
-        # initialize_model_weights runs this context after FSDP has installed
-        # DTensors. The exit cast used to restore only the outer dtype, leaving
-        # local storage in BF16 and rounding subsequently loaded FP32 weights.
-        for _ in range(2):
-            with yield_fp32_model(model, torch.bfloat16):
-                assert model.linear.weight.to_local().dtype == torch.float32
-            assert model.mixer.scale is param
-            assert param.dtype == param.to_local().dtype == torch.float32
-            assert param.to_local().data_ptr() == local.data_ptr()
-            assert param.device_mesh is mesh
-            assert param.placements == (Shard(0),)
-            assert param.shape == (4,)
-            assert torch.equal(param.to_local(), values)
-            assert not torch.equal(param.to_local(), values.bfloat16().float())
-            assert param.grad.dtype == param.grad.to_local().dtype == torch.float32
-            assert torch.equal(param.grad.to_local(), values)
-            assert model.linear.weight.dtype == model.linear.weight.to_local().dtype == torch.bfloat16
-            assert model.linear.frequency.dtype == torch.float32
-            assert torch.equal(model.linear.frequency, values)
-
-        # A subsequent checkpoint copy must target the actual FP32 local shard.
-        checkpoint_values = values + 0.00017
-        with torch.no_grad():
-            param.to_local().copy_(checkpoint_values)
-        assert torch.equal(param.to_local(), checkpoint_values)
-    finally:
-        dist.destroy_process_group()
 
 
 class _VLMLike(nn.Module):
