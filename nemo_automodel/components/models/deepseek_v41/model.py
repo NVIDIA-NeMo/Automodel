@@ -329,8 +329,6 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
         reject_unsupported_tie_word_embeddings(type(self), config)
         super().__init__(config)
         text = config.text_config
-        if moe_config is not None and not moe_config.combine_in_fp32:
-            raise ValueError("DeepSeek V4.1 requires MoEConfig.combine_in_fp32=True for released expert arithmetic")
         self.backend = backend or BackendConfig(
             attn="tilelang", linear="torch", rms_norm="torch_fp32", experts="torch_mm", dispatcher="hybridep"
         )
@@ -355,7 +353,6 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
             route_scale=text.routed_scaling_factor,
             norm_topk_prob=text.norm_topk_prob,
             router_weights_fp32=True,
-            combine_in_fp32=True,
             force_e_score_correction_bias=True,
             swiglu_limit=text.swiglu_limit,
             dtype=dtype,

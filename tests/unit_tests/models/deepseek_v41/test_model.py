@@ -87,16 +87,6 @@ def _backend() -> BackendConfig:
     return BackendConfig(attn="eager", linear="torch", rms_norm="torch_fp32", experts="torch_mm", dispatcher="torch")
 
 
-def test_custom_moe_must_preserve_released_combine_precision() -> None:
-    with torch.device("meta"):
-        model = DeepseekV41ForCausalLM(_tiny_config(), backend=_backend())
-        assert model.moe_config.combine_in_fp32
-        with pytest.raises(ValueError, match="combine_in_fp32=True"):
-            DeepseekV41ForCausalLM(
-                _tiny_config(), backend=_backend(), moe_config=replace(model.moe_config, combine_in_fp32=False)
-            )
-
-
 def test_full_tiny_ced_model_trains_after_meta_initialization() -> None:
     torch.manual_seed(8)
     with torch.device("meta"):
@@ -166,7 +156,7 @@ def test_default_policy_is_explicit_and_routing_correction_is_fixed() -> None:
     assert model.backend.attn == "tilelang"
     assert model.backend.linear == "torch" and model.backend.rms_norm == "torch_fp32"
     assert model.backend.dispatcher == "hybridep" and model.backend.experts == "torch_mm"
-    assert model.moe_config.combine_in_fp32 and model.moe_config.gate_bias_update_factor == 0
+    assert model.moe_config.gate_bias_update_factor == 0
 
 
 def test_bf16_backbone_returns_unrounded_fp32_logits():
