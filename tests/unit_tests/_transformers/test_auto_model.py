@@ -33,7 +33,10 @@ from nemo_automodel._transformers.auto_model import (
     _patch_remote_code_compat,
     _resolve_distributed_setup,
 )
-from nemo_automodel._transformers.infrastructure import _apply_peft_and_lower_precision, instantiate_infrastructure
+from nemo_automodel._transformers.infrastructure import (
+    _apply_peft_and_lower_precision,
+    instantiate_infrastructure,
+)
 from nemo_automodel._transformers.model_init import (
     _filter_kwargs_for_init,
     _filter_meta_device_from_init_context,
@@ -798,6 +801,58 @@ class TestApplyPeftAndLowerPrecision:
 
             assert mock_peft_config.use_triton is False
             assert "Disabling Triton with Pipeline Parallelism" in caplog.text
+
+    def test_apply_peft_applies_mxfp4_after_lora(self):
+        """MXFP4 expert storage is applied after LoRA module injection."""
+        model = MagicMock()
+        peft_config = MagicMock()
+        peft_config.expert_weight_format = "mxfp4"
+        events = []
+
+        with (
+            patch(
+                "nemo_automodel._transformers.infrastructure.apply_lora_to_linear_modules",
+                side_effect=lambda *args, **kwargs: events.append("lora"),
+            ) as apply_lora,
+            patch(
+                "nemo_automodel._transformers.infrastructure.apply_mxfp4_to_moe_experts",
+                side_effect=lambda model, **kwargs: events.append("mxfp4") or model,
+            ) as apply_mxfp4,
+        ):
+            _apply_peft_and_lower_precision(
+                model,
+                tp_size=1,
+                autopipeline=None,
+                peft_config=peft_config,
+                quantization_config=None,
+                fp8_config=None,
+                qat_quantizer=None,
+            )
+
+        apply_lora.assert_called_once()
+        apply_mxfp4.assert_called_once_with(model, passthrough=True)
+        assert events == ["lora", "mxfp4"]
+
+    def test_apply_peft_skips_mxfp4_for_bf16_experts(self):
+        model = MagicMock()
+        peft_config = MagicMock()
+        peft_config.expert_weight_format = "bf16"
+
+        with (
+            patch("nemo_automodel._transformers.infrastructure.apply_lora_to_linear_modules"),
+            patch("nemo_automodel._transformers.infrastructure.apply_mxfp4_to_moe_experts") as apply_mxfp4,
+        ):
+            _apply_peft_and_lower_precision(
+                model,
+                tp_size=1,
+                autopipeline=None,
+                peft_config=peft_config,
+                quantization_config=None,
+                fp8_config=None,
+                qat_quantizer=None,
+            )
+
+        apply_mxfp4.assert_not_called()
 
     def test_apply_fp8_when_configured(self):
         """When fp8_config provided, calls apply_fp8_to_model."""
