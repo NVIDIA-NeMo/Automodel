@@ -256,6 +256,19 @@ Legacy positive `check_*` controls, generic numeric cosine fields, and max-KL th
 All live recipes use default-on phases, semantic `skip_*` controls, and named profiles. The optional structured
 profile and numeric override mappings remain available for measured one-model exceptions.
 
+### Explicit HF reference precision
+
+`ci.checkpoint_robustness.hf_reference_context` optionally supplies a model-owned context manager using the existing
+`_target_` configuration syntax. The harness passes the loaded HF model as `model`; the context surrounds source and
+export-reload forwards, including repeatability and shape diagnostics, and is closed even if a forward fails.
+Omitting it retains the native HF compute policy. Configured contexts are logged explicitly as modified references.
+
+The Mistral4 recipe selects `nemo_automodel.components.models.mistral4.reference_precision.fp32_router_scores`.
+It executes the original HF router with FP32 softmax, normalization, and selected weights, while retaining native
+projection and checkpoint-storage dtypes. It affects neither AutoModel training nor other HF modules. This is a
+precision-controlled comparison, not proof of the author's intended training precision or of full-model parity.
+Source and reload thresholds are still enforced; reference precision settings must not implicitly relax them.
+
 Retrieval checkpoint robustness uses the same phase contract for Phases 1–4. Because a biencoder produces embeddings
 rather than language-model logits, its Phase 2 AutoModel reload gates the selected profile's same-implementation
 cosine threshold, and its Phase 3 vanilla-HF reload gates the cross-framework cosine threshold. KL gates do not apply

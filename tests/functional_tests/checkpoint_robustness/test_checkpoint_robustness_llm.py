@@ -224,7 +224,7 @@ def _extract_custom_args(argv: list[str]) -> tuple[dict[str, object], list[str]]
         for k, v in ci_robustness.items():
             if k in default_on_control_keys:
                 continue
-            if k == "shape_diagnostic":
+            if k in {"shape_diagnostic", "hf_reference_context"}:
                 continue
             if k not in custom:
                 if "." in k:
@@ -1471,6 +1471,17 @@ def _keep_hf_modules_in_fp32(hf_config: object):
         setattr(PreTrainedModel, attr, previous)
 
 
+def _hf_reference_context(cfg: ConfigNode, model: torch.nn.Module) -> AbstractContextManager[None]:
+    """Select an explicit model-owned reference context from the CI configuration."""
+    context_config = cfg.get("ci.checkpoint_robustness.hf_reference_context")
+    if context_config is None:
+        return nullcontext()
+    if not isinstance(context_config, ConfigNode):
+        raise ValueError("ci.checkpoint_robustness.hf_reference_context must be a _target_ configuration")
+    print(f"[HF reference] Explicit precision context: {context_config.get_as_string('_target_')}; not vanilla HF")
+    return context_config.instantiate(model=model)
+
+
 def _preinit_global_rank() -> int:
     """Return the torchrun global rank before torch.distributed is initialized."""
     if dist.is_initialized():
@@ -1896,37 +1907,38 @@ def _prepare_source_load_reference_rank0(
         if should_fix_rotary_embeddings([hf_model]):
             fix_rotary_embeddings([hf_model])
 
-    with _router_diagnostic_capture_context(
-        hf_model,
-        _robustness_artifact_dir(cfg),
-        framework="hf",
-        enabled=capture_router_diagnostics,
-    ):
-        hf_logits = _get_logits(hf_model, input_ids, device)
-    repeated_hf_logits = _get_logits(hf_model, input_ids, device)
-    _compare_logits(
-        _robustness_artifact_dir(cfg),
-        hf_logits,
-        repeated_hf_logits,
-        _repeatability_policy(
-            phase="phase_0",
-            comparison="hf_source_self_repeat",
-            profile=parity_tolerance_profile,
-        ),
-    )
-    del repeated_hf_logits
-    if shape_diagnostic is not None:
-        _run_hf_shape_diagnostic(
+    with _hf_reference_context(cfg, hf_model):
+        with _router_diagnostic_capture_context(
             hf_model,
-            input_ids,
-            device,
+            _robustness_artifact_dir(cfg),
+            framework="hf",
+            enabled=capture_router_diagnostics,
+        ):
+            hf_logits = _get_logits(hf_model, input_ids, device)
+        repeated_hf_logits = _get_logits(hf_model, input_ids, device)
+        _compare_logits(
+            _robustness_artifact_dir(cfg),
             hf_logits,
-            artifact_dir=artifact_dir,
-            config=shape_diagnostic,
-            gate_sequence_length=cross_framework_gate_sequence_length,
-            capture_router_diagnostics=capture_router_diagnostics,
-            phase="phase_0",
+            repeated_hf_logits,
+            _repeatability_policy(
+                phase="phase_0",
+                comparison="hf_source_self_repeat",
+                profile=parity_tolerance_profile,
+            ),
         )
+        del repeated_hf_logits
+        if shape_diagnostic is not None:
+            _run_hf_shape_diagnostic(
+                hf_model,
+                input_ids,
+                device,
+                hf_logits,
+                artifact_dir=artifact_dir,
+                config=shape_diagnostic,
+                gate_sequence_length=cross_framework_gate_sequence_length,
+                capture_router_diagnostics=capture_router_diagnostics,
+                phase="phase_0",
+            )
     hf_aliased = _lm_head_embedding_aliased(hf_model)
     explicit_tie_word_embeddings = _explicit_tie_word_embeddings(hf_model.config)
     del hf_model
@@ -2595,27 +2607,28 @@ def _run_vanilla_hf_reload(
                     "[HF reload] Saved adapter tensors absent from vanilla HF were allowed by the configured prefix "
                     f"{hf_adapter_ignored_key_prefix!r} ({ignored_adapter_tensors} tensors)"
                 )
-            hf_logits = _get_logits(peft_model, input_ids, device)
-            repeated_hf_logits = _get_logits(peft_model, input_ids, device)
-            _compare_logits(
-                _robustness_artifact_dir(cfg),
-                hf_logits,
-                repeated_hf_logits,
-                _repeatability_policy(
-                    phase="phase_3",
-                    comparison="hf_export_self_repeat",
-                    profile=_comparison_profile(custom_args, "hf_reload"),
-                ),
-            )
-            del repeated_hf_logits
-            diagnostics, diagnostic_failure = _collect_hf_reload_shape_diagnostics(
-                peft_model,
-                input_ids,
-                device,
-                hf_logits,
-                artifact_dir=artifact_dir,
-                custom_args=custom_args,
-            )
+            with _hf_reference_context(cfg, peft_model):
+                hf_logits = _get_logits(peft_model, input_ids, device)
+                repeated_hf_logits = _get_logits(peft_model, input_ids, device)
+                _compare_logits(
+                    _robustness_artifact_dir(cfg),
+                    hf_logits,
+                    repeated_hf_logits,
+                    _repeatability_policy(
+                        phase="phase_3",
+                        comparison="hf_export_self_repeat",
+                        profile=_comparison_profile(custom_args, "hf_reload"),
+                    ),
+                )
+                del repeated_hf_logits
+                diagnostics, diagnostic_failure = _collect_hf_reload_shape_diagnostics(
+                    peft_model,
+                    input_ids,
+                    device,
+                    hf_logits,
+                    artifact_dir=artifact_dir,
+                    custom_args=custom_args,
+                )
 
             if check_fused_qkv_keys:
                 from safetensors import safe_open
@@ -2648,27 +2661,28 @@ def _run_vanilla_hf_reload(
 
                 if should_fix_rotary_embeddings([hf_model]):
                     fix_rotary_embeddings([hf_model])
-            hf_logits = _get_logits(hf_model, input_ids, device)
-            repeated_hf_logits = _get_logits(hf_model, input_ids, device)
-            _compare_logits(
-                _robustness_artifact_dir(cfg),
-                hf_logits,
-                repeated_hf_logits,
-                _repeatability_policy(
-                    phase="phase_3",
-                    comparison="hf_export_self_repeat",
-                    profile=_comparison_profile(custom_args, "hf_reload"),
-                ),
-            )
-            del repeated_hf_logits
-            diagnostics, diagnostic_failure = _collect_hf_reload_shape_diagnostics(
-                hf_model,
-                input_ids,
-                device,
-                hf_logits,
-                artifact_dir=artifact_dir,
-                custom_args=custom_args,
-            )
+            with _hf_reference_context(cfg, hf_model):
+                hf_logits = _get_logits(hf_model, input_ids, device)
+                repeated_hf_logits = _get_logits(hf_model, input_ids, device)
+                _compare_logits(
+                    _robustness_artifact_dir(cfg),
+                    hf_logits,
+                    repeated_hf_logits,
+                    _repeatability_policy(
+                        phase="phase_3",
+                        comparison="hf_export_self_repeat",
+                        profile=_comparison_profile(custom_args, "hf_reload"),
+                    ),
+                )
+                del repeated_hf_logits
+                diagnostics, diagnostic_failure = _collect_hf_reload_shape_diagnostics(
+                    hf_model,
+                    input_ids,
+                    device,
+                    hf_logits,
+                    artifact_dir=artifact_dir,
+                    custom_args=custom_args,
+                )
             del hf_model
 
         hf_reload_error = _compare_logits(

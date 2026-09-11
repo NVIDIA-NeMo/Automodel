@@ -123,25 +123,15 @@ ci:
   checkpoint_robustness:
     # PP=4 with pp_microbatch_size=1 requires at least four pipeline microbatches.
     step_scheduler.local_batch_size: 4
-    # HF 5.15.1 and vLLM agree on the corrected YaRN attention scale. Residual
-    # BF16 cross-framework drift includes router, RMSNorm, and RoPE rounding
-    # differences; keep AutoModel's FP32 router computation. HF has no router
-    # dtype option, so aligning reference precision needs more than a load flag.
-    # EOS job 435589444 (PP4/EP8, 2048 tokens) measured mean/p95 KL and cosine:
-    # source 0.02096/0.08178/0.99214; HF reload 0.06219/0.23885/0.98142.
-    # Calibrate only the HF comparisons; these gates still reject the original
-    # scale regression in job 435198219. AutoModel reload and resume are unchanged.
-    # Revisit after the precision audit (including a higher-precision HF reference):
-    # https://linear.app/nvidia/issue/AM-821/audit-and-align-moe-router-precision-with-reference-implementations
+    # HF 5.15.1 scores this router in BF16. Compare with its original algorithm
+    # using FP32 softmax/normalization/weights, as corroborated by vLLM's router.
+    # Projection and checkpoint storage stay unchanged; all previous gates remain.
+    # Reference precision audit: https://linear.app/nvidia/issue/AM-821
+    hf_reference_context:
+      _target_: nemo_automodel.components.models.mistral4.reference_precision.fp32_router_scores
     parity_tolerance_profile_overrides:
-      source_load: relaxed
       automodel_reload: relaxed
       hf_reload: relaxed
-    parity_threshold_overrides:
-      hf_reload:
-        mean_kl: 0.08
-        p95_kl: 0.30
-        cosine_similarity: 0.975
     hf_device_map_auto: true
     # Transformers' load-time dequantization leaves Mistral4 expert weights in
     # FP8, while native forward requires an optional kernel absent from CI.
