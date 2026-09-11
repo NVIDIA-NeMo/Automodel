@@ -84,6 +84,7 @@ recipe_args:
   target_layer_ids: [37, 38, 39]
   freeze_embeddings: true
   markov_rank: 256
+  markov_head_type: vanilla
   confidence_head_alpha: 1.0
   confidence_head_with_markov: true
 
