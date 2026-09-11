@@ -178,44 +178,6 @@ def build_deepseek_v4_draft_config(target_config, model_args):
     return draft_config
 
 
-def build_deepseek_v41_draft_config(target_config, model_args):
-    """Build the released native DeepSeek V4.1 DSpark configuration.
-
-    Unlike the configurable dense drafters, V4.1 stores a specific three-stage
-    MoE DSpark architecture in its text config. Recipe values must agree with
-    that checkpoint contract; only the number of sampled training anchors and
-    confidence-loss enablement are added here.
-    """
-    if getattr(target_config, "model_type", None) != "deepseek_v41":
-        raise ValueError(f"DeepSeek V4.1 DSpark expects model_type='deepseek_v41', got {target_config.model_type!r}")
-    draft_config = copy.deepcopy(target_config.text_config)
-    target_layer_ids = validate_target_layer_ids(
-        model_args.target_layer_ids,
-        draft_config.num_hidden_layers,
-    )
-    expected = {
-        "num_draft_layers": draft_config.num_nextn_predict_layers,
-        "block_size": draft_config.dspark_block_size,
-        "mask_token_id": draft_config.dspark_noise_token_id,
-        "markov_rank": draft_config.dspark_markov_rank,
-    }
-    for name, expected_value in expected.items():
-        actual_value = int(getattr(model_args, name))
-        if actual_value != expected_value:
-            raise ValueError(
-                f"DeepSeek V4.1 DSpark requires {name}={expected_value} from the target checkpoint, got {actual_value}"
-            )
-    if target_layer_ids != draft_config.dspark_target_layer_ids:
-        raise ValueError(
-            "DeepSeek V4.1 DSpark target_layer_ids must match the target checkpoint: "
-            f"expected {draft_config.dspark_target_layer_ids}, got {target_layer_ids}"
-        )
-    draft_config.architectures = ["DeepseekV41DSparkModel"]
-    draft_config.dspark_num_anchors = int(model_args.num_anchors)
-    draft_config.dspark_enable_confidence_head = float(model_args.confidence_head_alpha) > 0.0
-    return draft_config
-
-
 def get_kimi_k3_text_config(target_config):
     """Return a deep copy of a Kimi K3 target's text configuration."""
     if target_config.model_type == "kimi_linear":
@@ -394,7 +356,6 @@ __all__ = [
     "build_draft_config",
     "build_gemma4_draft_config",
     "build_deepseek_v4_draft_config",
-    "build_deepseek_v41_draft_config",
     "build_glm_5_2_draft_config",
     "build_kimi_k3_draft_config",
     "get_gemma4_text_config",

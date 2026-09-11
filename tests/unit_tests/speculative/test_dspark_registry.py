@@ -17,7 +17,6 @@
 import pytest
 
 from nemo_automodel.components.speculative.dspark.draft_deepseek_v4 import DeepseekV4DSparkModel
-from nemo_automodel.components.speculative.dspark.draft_deepseek_v41 import DeepseekV41DSparkModel
 from nemo_automodel.components.speculative.dspark.draft_gemma4 import Gemma4DSparkModel
 from nemo_automodel.components.speculative.dspark.draft_glm_5_2 import Glm5_2DSparkModel
 from nemo_automodel.components.speculative.dspark.draft_minimax_m3 import MiniMaxM3DSparkModel
@@ -35,10 +34,6 @@ def test_resolve_qwen3():
 
 def test_resolve_deepseek_v4():
     assert resolve_dspark_draft_spec(["DeepseekV4ForCausalLM"]).draft_cls is DeepseekV4DSparkModel
-
-
-def test_resolve_deepseek_v41():
-    assert resolve_dspark_draft_spec(["DeepseekV41ForCausalLM"]).draft_cls is DeepseekV41DSparkModel
 
 
 def test_resolve_glm_5_2():

@@ -21,11 +21,11 @@ string so adding a target family is a one-line append, with no recipe change.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Protocol, runtime_checkable
 
 from torch import nn
 
 from nemo_automodel.components.speculative.dspark.draft_deepseek_v4 import DeepseekV4DSparkModel
-from nemo_automodel.components.speculative.dspark.draft_deepseek_v41 import DeepseekV41DSparkModel
 from nemo_automodel.components.speculative.dspark.draft_gemma4 import Gemma4DSparkModel
 from nemo_automodel.components.speculative.dspark.draft_glm_5_2 import Glm5_2DSparkModel
 from nemo_automodel.components.speculative.dspark.draft_kimi_k3 import KimiK3DSparkModel
@@ -42,6 +42,14 @@ class DraftSpec:
     draft_cls: type[nn.Module]
 
 
+@runtime_checkable
+class ModelOwnedDSparkProvider(Protocol):
+    """Target config that owns construction of its architecture-specific draft."""
+
+    def build_dspark_draft(self, options: object) -> nn.Module:
+        """Build a draft from the generic recipe's declarative options."""
+
+
 # Qwen3-style dense (and MoE) targets: the draft only consumes the target's
 # post-block hidden states, so an MoE backbone is handled like a dense one.
 _DENSE_ARCHITECTURES: tuple[str, ...] = (
@@ -56,9 +64,6 @@ DSPARK_DRAFT_REGISTRY: dict[str, DraftSpec] = {
 # grouped O-LoRA, interleaved partial RoPE), registered separately from the
 # Qwen3-style drafts because its backbone differs.
 DSPARK_DRAFT_REGISTRY["DeepseekV4ForCausalLM"] = DraftSpec(draft_cls=DeepseekV4DSparkModel)
-# DeepSeek V4.1 ships a native three-stage MoE DSpark module under ``mtp.*``.
-# Its architecture is intentionally separate from the older dense V4 draft.
-DSPARK_DRAFT_REGISTRY["DeepseekV41ForCausalLM"] = DraftSpec(draft_cls=DeepseekV41DSparkModel)
 # GLM-5.2 target (HF arch GlmMoeDsaForCausalLM): a dense GLM MLA draft (DeepSeek-V3-style
 # Q-LoRA + compressed KV latent + interleaved complex RoPE), with the DSA indexer and MoE
 # dropped. Registered separately because its MLA backbone differs from V4's.
@@ -108,4 +113,10 @@ def build_target_layer_ids(num_target_layers: int, num_feature_layers: int) -> l
     return ids
 
 
-__all__ = ["DraftSpec", "DSPARK_DRAFT_REGISTRY", "resolve_dspark_draft_spec", "build_target_layer_ids"]
+__all__ = [
+    "DraftSpec",
+    "DSPARK_DRAFT_REGISTRY",
+    "ModelOwnedDSparkProvider",
+    "resolve_dspark_draft_spec",
+    "build_target_layer_ids",
+]

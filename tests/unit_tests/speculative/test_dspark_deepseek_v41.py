@@ -21,8 +21,7 @@ from nemo_automodel.components.models.deepseek_v41.config import (
     DeepseekV41TextConfig,
     DeepseekV41VisionConfig,
 )
-from nemo_automodel.components.speculative.dspark.config import build_deepseek_v41_draft_config
-from nemo_automodel.components.speculative.dspark.draft_deepseek_v41 import DeepseekV41DSparkModel
+from nemo_automodel.components.models.deepseek_v41.dspark import DeepseekV41DSparkModel
 from nemo_automodel.components.speculative.dspark.loss import compute_dspark_loss
 
 
@@ -70,14 +69,24 @@ def _args(**overrides) -> _Args:
         "num_anchors": 2,
         "mask_token_id": 31,
         "markov_rank": 4,
+        "markov_head_type": "vanilla",
         "confidence_head_alpha": 1.0,
+        "confidence_head_with_markov": True,
     }
     values.update(overrides)
     return _Args(values)
 
 
 def test_builder_preserves_released_native_contract() -> None:
-    config = build_deepseek_v41_draft_config(_target_config(), _args())
+    target_config = _target_config()
+    original = target_config.to_dict()
+    model = target_config.build_dspark_draft(_args())
+    second_model = target_config.build_dspark_draft(_args())
+    config = model.config
+    assert isinstance(model, DeepseekV41DSparkModel)
+    assert isinstance(second_model, DeepseekV41DSparkModel)
+    assert model is not second_model
+    assert target_config.to_dict() == original
     assert config.architectures == ["DeepseekV41DSparkModel"]
     assert config.num_nextn_predict_layers == 3
     assert config.dspark_block_size == 5
@@ -94,17 +103,19 @@ def test_builder_preserves_released_native_contract() -> None:
         ({"mask_token_id": 30}, "mask_token_id=31"),
         ({"markov_rank": 3}, "markov_rank=4"),
         ({"target_layer_ids": [0]}, "target_layer_ids must match"),
+        ({"markov_head_type": "gated"}, "markov_head_type='vanilla'"),
+        ({"confidence_head_with_markov": False}, "confidence_head_with_markov=true"),
+        ({"confidence_head_alpha": -1.0}, "confidence_head_alpha"),
     ],
 )
 def test_builder_rejects_recipe_checkpoint_mismatch(override: dict, message: str) -> None:
     with pytest.raises(ValueError, match=message):
-        build_deepseek_v41_draft_config(_target_config(), _args(**override))
+        _target_config().build_dspark_draft(_args(**override))
 
 
 def test_training_forward_uses_shared_loss_and_stops_target_gradients() -> None:
     torch.manual_seed(31)
-    config = build_deepseek_v41_draft_config(_target_config(), _args())
-    model = DeepseekV41DSparkModel(config)
+    model = _target_config().build_dspark_draft(_args())
     embedding = nn.Embedding(32, 16)
     head = nn.Linear(16, 32, bias=False)
     model.initialize_embeddings_and_head(embed_tokens=embedding, lm_head=head)
