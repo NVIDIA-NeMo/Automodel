@@ -1,14 +1,14 @@
 ---
 title: "Nemotron 3.5 Super VL"
-description: ""
+description: "Nemotron 3.5 Super VL model coverage: architecture, Hugging Face checkpoints, and NeMo AutoModel fine-tuning recipes."
 slug: model-coverage/omni/nvidia/nemotron-3-5-super-vl
 ---
 [NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained)
-pairs a "Nemotron Super" NemotronH (hybrid Mamba-2 + Attention) MoE language
+pairs a Nemotron Super NemotronH (hybrid Mamba-2 and Attention) Mixture-of-Experts (MoE) language
 backbone with a RADIO v2.5-H vision encoder, sharing its `NemotronH_Omni_Reasoning_V3`
 architecture and vision stack with [Nemotron-3-Nano-Omni](/model-coverage/omni/nvidia/nemotron-omni).
-This midtrain checkpoint is vision-pretrained only (`sound_config` is absent, so
-there is no audio encoder / audio inputs are not supported on this checkpoint).
+This midtrain checkpoint is vision-pretrained only (`sound_config` is absent).
+There is no audio encoder, so audio inputs are not supported on this checkpoint.
 
 <Info>
 
@@ -27,9 +27,9 @@ there is no audio encoder / audio inputs are not supported on this checkpoint).
 
 ## Architecture
 
-- `NemotronH_Omni_Reasoning_V3` — reuses the same `NemotronOmniForConditionalGeneration`
+- `NemotronH_Omni_Reasoning_V3` reuses the same `NemotronOmniForConditionalGeneration`
   wrapper, vision tower, and state-dict adapter as `NemotronH_Nano_Omni_Reasoning_V3`;
-  only the LLM sub-config scale differs (Super vs. Nano). The `sound_encoder` /
+  only the LLM sub-config scale differs (Super compared to Nano). The `sound_encoder` and
   `sound_projection` submodules are constructed only when the checkpoint's
   `sound_config` is present, so this checkpoint loads with audio disabled.
 
@@ -39,15 +39,15 @@ there is no audio encoder / audio inputs are not supported on this checkpoint).
 |---|---|---|
 | [nemotron_3_5_super_vl_tulu3_text_100steps.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_tulu3_text_100steps.yaml) | Tulu-3 | Full SFT, text-only (vision/audio towers frozen and unused) |
 | [nemotron_3_5_super_vl_tulu3_packed_cp8_100steps.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_tulu3_packed_cp8_100steps.yaml) | Tulu-3 (packed, THD) | Context-parallel parity test, `cp_size=8`; text-only packs (`inject_fake_images: false`) |
-| [nemotron_3_5_super_vl_cord_v2_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_cord_v2_peft.yaml) | CORD-v2 | LoRA (rank 64) on the LLM linear projections, base model frozen — receipt image → structured field tokens; single node |
+| [nemotron_3_5_super_vl_cord_v2_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_cord_v2_peft.yaml) | CORD-v2 | LoRA (rank 64) on the LLM linear projections, base model frozen; receipt image to structured field tokens; single node |
 
 ### LoRA on CORD-v2
 
 `nemotron_3_5_super_vl_cord_v2_peft.yaml` fine-tunes the model on CORD-v2 receipt field extraction
 (the same task as the [NemotronOmni CORD-v2 guide](/recipes-e2e-examples/nemotron-omni)) with LoRA adapters
-instead of full SFT. Because the base weights are frozen there are no fp32 master weights or optimizer
+instead of full SFT. Because the base weights are frozen, there are no fp32 master weights or optimizer
 states for them, so the 121B model trains on a single node of 8 H100 (`cp_size 1`, `ep_size 8`) instead of the
-4 nodes full SFT needs.
+4 nodes that full SFT needs.
 
 | | |
 |---|---|
