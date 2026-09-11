@@ -360,6 +360,7 @@ class TestNeatPackedVlmCollater:
         assert result["position_ids"].shape == (2, 4)
         assert result["attention_mask"].shape == (2, 1, 4, 4)
         assert result["attention_mask"].dtype == torch.bool
+        assert "packed_token_indices" not in result
 
         # pixel_values concatenated: 1 + 2 = 3
         assert result["pixel_values"].shape[0] == 3

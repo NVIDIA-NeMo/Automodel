@@ -80,6 +80,29 @@ def test_kimi_cp_sharder_keeps_contiguous_tokens_and_global_document_map():
     assert layout.padded_seq_len == 8
 
 
+def test_kimi_cp_sharder_consumes_dataset_packing_metadata():
+    batch = {
+        "input_ids": torch.arange(8).unsqueeze(0),
+        "labels": torch.arange(8).unsqueeze(0),
+        "attention_mask": torch.ones(1, 1, 8, 8, dtype=torch.bool),
+        "_packed_seq_ids": torch.tensor([[1, 1, 1, 2, 2, 2, 0, 0]]),
+        "packed_token_indices": torch.arange(6),
+        "cu_seqlens": torch.tensor([0, 3, 6], dtype=torch.int32),
+        "max_seqlen": 3,
+    }
+
+    _, local_batch, _ = shard_batch_for_kimi_cp(_FakeCPMesh(), None, batch)
+
+    assert local_batch["kimi_packed_doc_ids"].tolist() == [[1, 1, 1, 2, 2, 2, 0, 0]]
+    assert not {
+        "attention_mask",
+        "_packed_seq_ids",
+        "packed_token_indices",
+        "cu_seqlens",
+        "max_seqlen",
+    } & set(local_batch)
+
+
 def test_pipeline_microbatches_chunk_kimi_document_map():
     batch = {
         "input_ids": torch.arange(16).reshape(2, 8),

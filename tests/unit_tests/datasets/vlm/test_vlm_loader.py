@@ -13,12 +13,14 @@
 # limitations under the License.
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 from transformers import ProcessorMixin
 
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.datasets.llm.chat_dataset import ChatDatasetConfig
+from nemo_automodel.components.datasets.packing import DEFAULT_PACKED_SEQUENCE_CONTRACT
 from nemo_automodel.components.datasets.vlm.collate_fns import (
     neat_packed_vlm_collater,
     packed_sequence_thd_vlm_collater,
@@ -272,7 +274,7 @@ def test_vlm_dataloader_selects_thd_collater(monkeypatch):
     assert packing_kwargs["cp_size"] == 4
 
 
-def test_vlm_dataloader_skips_dense_neat_packing_mask_under_cp(monkeypatch):
+def test_vlm_dataloader_neat_packing_uses_default_contract(monkeypatch):
     processor = DummyProcessor()
     monkeypatch.setattr(PreTokenizedDatasetWrapperConfig, "build", lambda self, dataset, processor: dataset)
     monkeypatch.setattr(NeatPackConfig, "build", lambda self, dataset, **kwargs: dataset)
@@ -289,12 +291,38 @@ def test_vlm_dataloader_skips_dense_neat_packing_mask_under_cp(monkeypatch):
         dp_rank=0,
         dp_world_size=1,
         batch_size=2,
-        packing_attn_implementation="sdpa",
+    )
+
+    assert result.dataloader.collate_fn.keywords["packing"] is DEFAULT_PACKED_SEQUENCE_CONTRACT
+
+
+def test_vlm_dataloader_skips_dense_neat_packing_mask_under_cp(monkeypatch):
+    processor = DummyProcessor()
+    monkeypatch.setattr(PreTokenizedDatasetWrapperConfig, "build", lambda self, dataset, processor: dataset)
+    monkeypatch.setattr(NeatPackConfig, "build", lambda self, dataset, **kwargs: dataset)
+    config = VlmDataloaderConfig(
+        dataset_config=StaticDatasetConfig([]),
+        processor_config=VlmProcessorConfig(factory=lambda: processor),
+        pretokenization=PreTokenizedDatasetWrapperConfig(),
+        packing=NeatPackConfig(),
+        shuffle=False,
+    )
+
+    packing = SimpleNamespace(
+        packed_mask_type="block_causal",
+        requires_packed_sequence_metadata=False,
+    )
+    result = config.build(
+        pretrained_model_name_or_path="unused",
+        dp_rank=0,
+        dp_world_size=1,
+        batch_size=2,
+        packing_contract=packing,
         cp_size=32,
     )
 
     assert result.dataloader.collate_fn.func is neat_packed_vlm_collater
-    assert result.dataloader.collate_fn.keywords["attn_implementation"] == "sdpa"
+    assert result.dataloader.collate_fn.keywords["packing"] is packing
     assert result.dataloader.collate_fn.keywords["materialize_4d_mask"] is False
 
 

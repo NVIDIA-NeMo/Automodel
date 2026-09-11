@@ -23,8 +23,7 @@ all-reduce, or narrowing to the wrong shard) shows up immediately.
 
 from __future__ import annotations
 
-import os
-import socket
+from pathlib import Path
 
 import pytest
 import torch
@@ -43,20 +42,13 @@ LOCAL_LEN = 3
 HIDDEN = 4
 
 
-def _free_port() -> int:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.bind(("127.0.0.1", 0))
-    port = sock.getsockname()[1]
-    sock.close()
-    return port
-
-
-def _init_gloo(rank: int, world_size: int, port: int) -> None:
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
-    os.environ["RANK"] = str(rank)
-    os.environ["WORLD_SIZE"] = str(world_size)
-    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+def _init_gloo(rank: int, world_size: int, store_path: str) -> None:
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{store_path}",
+        rank=rank,
+        world_size=world_size,
+    )
 
 
 def _global_sequence() -> torch.Tensor:
@@ -69,9 +61,9 @@ def _upstream_for(rank: int) -> torch.Tensor:
     return (rank + 1) * torch.arange(1, WORLD_SIZE * LOCAL_LEN * HIDDEN + 1, dtype=torch.float32).reshape(1, -1, HIDDEN)
 
 
-def _all_gather_worker(rank: int, world_size: int, port: int) -> None:
+def _all_gather_worker(rank: int, world_size: int, store_path: str) -> None:
     try:
-        _init_gloo(rank, world_size, port)
+        _init_gloo(rank, world_size, store_path)
 
         full = _global_sequence()
         start = rank * LOCAL_LEN
@@ -93,9 +85,9 @@ def _all_gather_worker(rank: int, world_size: int, port: int) -> None:
             dist.destroy_process_group()
 
 
-def _sharder_worker(rank: int, world_size: int, port: int) -> None:
+def _sharder_worker(rank: int, world_size: int, store_path: str) -> None:
     try:
-        _init_gloo(rank, world_size, port)
+        _init_gloo(rank, world_size, store_path)
         from torch.distributed.device_mesh import init_device_mesh
 
         cp_mesh = init_device_mesh("cpu", (world_size,), mesh_dim_names=("cp",))["cp"]
@@ -129,9 +121,9 @@ def _sharder_worker(rank: int, world_size: int, port: int) -> None:
             dist.destroy_process_group()
 
 
-def test_all_gather_sequence_round_trips_and_reduces_gradients():
-    mp.spawn(_all_gather_worker, args=(WORLD_SIZE, _free_port()), nprocs=WORLD_SIZE, join=True)
+def test_all_gather_sequence_round_trips_and_reduces_gradients(tmp_path: Path):
+    mp.spawn(_all_gather_worker, args=(WORLD_SIZE, str(tmp_path / "all_gather_store")), nprocs=WORLD_SIZE, join=True)
 
 
-def test_shard_batch_matches_the_collective_layout_on_a_real_mesh():
-    mp.spawn(_sharder_worker, args=(WORLD_SIZE, _free_port()), nprocs=WORLD_SIZE, join=True)
+def test_shard_batch_matches_the_collective_layout_on_a_real_mesh(tmp_path: Path):
+    mp.spawn(_sharder_worker, args=(WORLD_SIZE, str(tmp_path / "sharder_store")), nprocs=WORLD_SIZE, join=True)

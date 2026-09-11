@@ -14,55 +14,16 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
+from nemo_automodel.components.datasets.packing import get_unpad_data
 from nemo_automodel.components.models.common.packing import (
     _passthrough_create_causal_mask,
     _patch_preprocess_mask_arguments_for_packing,
     configure_packing,
-    get_attn_implementation,
-    get_seqlens_in_batch,
-    get_unpad_data,
+    flatten_packed_sequence_metadata,
+    get_model_attn_implementation,
+    get_packing_capabilities,
 )
-
-# ---------------------------------------------------------------------------
-# get_seqlens_in_batch
-# ---------------------------------------------------------------------------
-
-
-class TestGetSeqlensInBatch:
-    def test_single_sequence(self):
-        mask = torch.tensor([[1, 1, 1, 0, 0]])
-        result = get_seqlens_in_batch(mask)
-        assert result.tolist() == [3]
-
-    def test_packed_sequences(self):
-        mask = torch.tensor([[1, 1, 2, 2, 2, 0]])
-        result = get_seqlens_in_batch(mask)
-        assert sorted(result.tolist()) == [2, 3]
-
-    def test_no_padding(self):
-        mask = torch.tensor([[1, 1, 1]])
-        result = get_seqlens_in_batch(mask)
-        assert result.tolist() == [3]
-
-
-# ---------------------------------------------------------------------------
-# get_unpad_data
-# ---------------------------------------------------------------------------
-
-
-class TestGetUnpadData:
-    def test_basic(self):
-        mask = torch.tensor([[1, 1, 0]])
-        indices, cu_seqlens, max_seqlen = get_unpad_data(mask)
-        assert max_seqlen == 2
-        assert cu_seqlens.tolist() == [0, 2]
-
-    def test_packed(self):
-        mask = torch.tensor([[1, 1, 2, 2, 0]])
-        indices, cu_seqlens, max_seqlen = get_unpad_data(mask)
-        assert max_seqlen == 2
-        assert indices.tolist() == [0, 1, 2, 3]
-
+from nemo_automodel.components.models.common.utils import BackendConfig
 
 # ---------------------------------------------------------------------------
 # _passthrough_create_causal_mask
@@ -115,74 +76,53 @@ class TestPassthroughCreateCausalMask:
 
 
 # ---------------------------------------------------------------------------
-# get_attn_implementation
+# get_model_attn_implementation
 # ---------------------------------------------------------------------------
 
 
 class TestGetAttnImplementation:
     def test_from_backend_config(self):
-        cfg = SimpleNamespace(backend=SimpleNamespace(attn="te"))
-        assert get_attn_implementation(cfg) == "te"
+        model = torch.nn.Module()
+        model.backend = BackendConfig(attn="te")
+        assert get_model_attn_implementation(model) == "te"
 
     def test_from_attn_implementation(self):
-        cfg = MagicMock()
-        del cfg.backend
-        cfg.get.return_value = "flash_attention_2"
-        assert get_attn_implementation(cfg) == "flash_attention_2"
+        model = torch.nn.Module()
+        model.config = SimpleNamespace(_attn_implementation="flash_attention_2")
+        assert get_model_attn_implementation(model) == "flash_attention_2"
 
     def test_default_sdpa(self):
-        assert get_attn_implementation(None) == "sdpa"
+        assert get_model_attn_implementation(torch.nn.Module()) == "sdpa"
 
     def test_backend_takes_precedence(self):
-        cfg = SimpleNamespace(backend=SimpleNamespace(attn="te"))
-        cfg.get = MagicMock(return_value="flash_attention_2")
-        assert get_attn_implementation(cfg) == "te"
-
-    def test_built_model_wins_over_stale_config(self):
-        """A packed run force-switches the model to flash; the config keeps saying sdpa."""
-        cfg = MagicMock()
-        del cfg.backend
-        cfg.get.return_value = "sdpa"
-        model = SimpleNamespace(config=SimpleNamespace(_attn_implementation="flash_attention_2"))
-        assert get_attn_implementation(cfg, model=model) == "flash_attention_2"
-
-    def test_backend_config_wins_over_built_model(self):
-        """Custom models keep naming their backend; ``te`` inits through sdpa."""
-        cfg = SimpleNamespace(backend=SimpleNamespace(attn="te"))
-        model = SimpleNamespace(config=SimpleNamespace(_attn_implementation="sdpa"))
-        assert get_attn_implementation(cfg, model=model) == "te"
+        model = torch.nn.Module()
+        model.backend = BackendConfig(attn="te")
+        model.config = SimpleNamespace(_attn_implementation="sdpa")
+        assert get_model_attn_implementation(model) == "te"
 
     def test_reads_through_ddp_wrapper(self):
         """DDP holds the model as ``.module`` and does not proxy attribute access."""
-        cfg = MagicMock()
-        del cfg.backend
-        cfg.get.return_value = "sdpa"
-        inner = SimpleNamespace(config=SimpleNamespace(_attn_implementation="flash_attention_2"))
-        assert get_attn_implementation(cfg, model=SimpleNamespace(module=inner)) == "flash_attention_2"
+        inner = torch.nn.Module()
+        inner.config = SimpleNamespace(_attn_implementation="flash_attention_2")
+        wrapper = torch.nn.Module()
+        wrapper.module = inner
+        assert get_model_attn_implementation(wrapper) == "flash_attention_2"
 
     def test_kernels_hub_id_maps_back_to_mainline_flash(self):
         """Transformers records a kernels-hub id when only ``kernels`` provides FA2."""
-        cfg = MagicMock()
-        del cfg.backend
-        cfg.get.return_value = "flash_attention_2"
-        model = SimpleNamespace(config=SimpleNamespace(_attn_implementation="kernels-community/flash-attn2"))
-        assert get_attn_implementation(cfg, model=model) == "flash_attention_2"
+        model = torch.nn.Module()
+        model.config = SimpleNamespace(_attn_implementation="kernels-community/flash-attn2")
+        assert get_model_attn_implementation(model) == "flash_attention_2"
 
-    @pytest.mark.parametrize(
-        "model",
-        [
-            SimpleNamespace(),
-            SimpleNamespace(config=SimpleNamespace()),
-            SimpleNamespace(config=SimpleNamespace(_attn_implementation=None)),
-            # A dispatch key naming no layout packing knows about must not select one.
-            SimpleNamespace(config=SimpleNamespace(_attn_implementation="some_future_backend")),
-        ],
-    )
-    def test_falls_back_to_config_when_model_names_no_known_backend(self, model):
-        cfg = MagicMock()
-        del cfg.backend
-        cfg.get.return_value = "eager"
-        assert get_attn_implementation(cfg, model=model) == "eager"
+    @pytest.mark.parametrize("implementation", ["magi", "some_future_backend"])
+    def test_preserves_live_dispatch_key(self, implementation):
+        model = torch.nn.Module()
+        model.config = SimpleNamespace(_attn_implementation=implementation)
+        assert get_model_attn_implementation(model) == implementation
+
+    def test_requires_built_model(self):
+        with pytest.raises(TypeError, match="built torch.nn.Module"):
+            get_model_attn_implementation(SimpleNamespace())
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +131,28 @@ class TestGetAttnImplementation:
 
 
 class TestConfigurePacking:
+    def test_model_semantics_select_document_ids_and_explicit_metadata(self):
+        model = SimpleNamespace(
+            packed_mask_type="document_ids",
+            requires_packed_sequence_metadata=True,
+        )
+
+        capabilities = get_packing_capabilities("sdpa", model=model)
+
+        assert capabilities.packed_mask_type == "document_ids"
+        assert capabilities.requires_packed_sequence_metadata is True
+
+    def test_batch_major_metadata_flattens_after_microbatch_splitting(self):
+        indices, cu_seqlens = flatten_packed_sequence_metadata(
+            torch.tensor([[0, 1, 2, -1]]),
+            torch.tensor([[0, 1, 3]], dtype=torch.int32),
+            batch_size=1,
+            sequence_length=4,
+        )
+
+        assert indices.tolist() == [0, 1, 2]
+        assert cu_seqlens.tolist() == [0, 1, 3]
+
     @pytest.mark.parametrize("attn_implementation", ["sdpa", "eager"])
     def test_noop_for_unsupported_backends(self, attn_implementation, monkeypatch):
         """configure_packing should not install flash-attn shims for unsupported backends."""
@@ -214,7 +176,7 @@ class TestConfigurePacking:
         original_preprocess = masking_utils._preprocess_mask_arguments
         original_flag = getattr(masking_utils, "_nemo_automodel_packing_preprocess_patched", None)
         try:
-            configure_packing(attn_implementation)
+            configure_packing(attn_implementation, unpad_data=get_unpad_data)
             assert fa_utils._get_unpad_data is get_unpad_data
         finally:
             fa_utils._get_unpad_data = original
@@ -278,7 +240,7 @@ class TestConfigurePacking:
             return args
 
         try:
-            configure_packing("flash_attention_2")
+            configure_packing("flash_attention_2", unpad_data=get_unpad_data)
             mask = torch.tensor([[1, 1, 2, 2, 0]], dtype=torch.long)
             probe_mask = torch.zeros(1, 1, 1, 1, dtype=torch.bool)
             expected_template = original_preprocess(*build_args(probe_mask, torch.arange(5)))
@@ -314,7 +276,7 @@ class TestConfigurePacking:
         original_preprocess = masking_utils._preprocess_mask_arguments
         original_flag = getattr(masking_utils, "_nemo_automodel_packing_preprocess_patched", None)
         try:
-            configure_packing("flash_attention_2")
+            configure_packing("flash_attention_2", unpad_data=get_unpad_data)
             mask = torch.tensor([[1, 1, 2, 2, 0]], dtype=torch.long)
             result = modeling_qwen3.create_causal_mask(
                 config=SimpleNamespace(_attn_implementation="flash_attention_2"),
@@ -372,7 +334,7 @@ class TestConfigurePacking:
         fake_mod_name = "transformers.models.qwen3_vl.modeling_qwen3_vl"
         sys.modules[fake_mod_name] = fake_mod
         try:
-            configure_packing("flash_attention_2")
+            configure_packing("flash_attention_2", unpad_data=get_unpad_data)
             assert fake_mod.create_causal_mask is _passthrough_create_causal_mask
         finally:
             fa_utils._get_unpad_data = original_unpad
@@ -394,7 +356,7 @@ class TestConfigurePackingFA3FA4:
 
         original = fa_utils._get_unpad_data
         try:
-            configure_packing(impl)
+            configure_packing(impl, unpad_data=get_unpad_data)
             assert fa_utils._get_unpad_data is get_unpad_data
         finally:
             fa_utils._get_unpad_data = original

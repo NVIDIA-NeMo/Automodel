@@ -3087,11 +3087,11 @@ class TestMakeRobustCollate:
 
 
 # ---------------------------------------------------------------------------
-# neat_packed_vlm_collater — attn_implementation variants
+# neat_packed_vlm_collater — structural packing contracts
 # ---------------------------------------------------------------------------
 
 
-class TestNeatPackedVlmCollaterAttnImpl:
+class TestNeatPackedVlmCollaterPackingContract:
     def _make_packed_sample(self, seq_len=16, n_images=1):
         """Create a minimal packed sample dict."""
         input_ids = torch.randint(100, 30000, (seq_len,))
@@ -3110,30 +3110,40 @@ class TestNeatPackedVlmCollaterAttnImpl:
             sample["image_grid_thw"] = torch.tensor([[1, 2, 2]] * n_images)
         return sample
 
-    def test_flash_attention_2_returns_2d_mask(self):
+    @staticmethod
+    def _packing(*, packed_mask_type="block_causal", requires_metadata=False):
+        return types.SimpleNamespace(
+            packed_mask_type=packed_mask_type,
+            requires_packed_sequence_metadata=requires_metadata,
+        )
+
+    def test_document_ids_contract_returns_2d_mask(self):
         from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
 
         batch = [self._make_packed_sample(16, 0), self._make_packed_sample(12, 0)]
-        result = neat_packed_vlm_collater(batch, attn_implementation="flash_attention_2")
-        # Flash attention keeps the 2D indexed mask
+        result = neat_packed_vlm_collater(
+            batch,
+            packing=self._packing(packed_mask_type="document_ids"),
+        )
+
         assert result["attention_mask"].ndim == 2
 
-    def test_sdpa_returns_4d_mask(self):
+    def test_block_causal_contract_returns_4d_mask(self):
         from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
 
         batch = [self._make_packed_sample(16, 0), self._make_packed_sample(12, 0)]
-        result = neat_packed_vlm_collater(batch, attn_implementation="sdpa")
-        # SDPA produces 4D block-causal mask
+        result = neat_packed_vlm_collater(batch, packing=self._packing())
+
         assert result["attention_mask"].ndim == 4
 
-    def test_sdpa_cp_keeps_compact_document_ids(self):
+    def test_cp_can_keep_compact_document_ids_without_changing_contract(self):
         from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
 
         batch = [self._make_packed_sample(16, 0)]
         result = neat_packed_vlm_collater(
             batch,
             max_length=32,
-            attn_implementation="sdpa",
+            packing=self._packing(),
             materialize_4d_mask=False,
         )
 
@@ -3148,14 +3158,18 @@ class TestNeatPackedVlmCollaterAttnImpl:
         from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
 
         batch = [self._make_packed_sample(4, 0)]
-        result = neat_packed_vlm_collater(batch, max_length=6, attn_implementation="sdpa")
+        result = neat_packed_vlm_collater(batch, max_length=6, packing=self._packing())
         assert "_packed_seq_ids" not in result
 
     def test_fixed_max_length_pads_to_max(self):
         from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
 
         batch = [self._make_packed_sample(10, 0)]
-        result = neat_packed_vlm_collater(batch, max_length=32, attn_implementation="flash_attention_2")
+        result = neat_packed_vlm_collater(
+            batch,
+            max_length=32,
+            packing=self._packing(packed_mask_type="document_ids"),
+        )
         assert result["input_ids"].shape[1] == 32
 
     def test_concatenates_pixel_values(self):
@@ -3163,9 +3177,31 @@ class TestNeatPackedVlmCollaterAttnImpl:
 
         s1 = self._make_packed_sample(16, n_images=2)
         s2 = self._make_packed_sample(12, n_images=1)
-        result = neat_packed_vlm_collater([s1, s2], attn_implementation="flash_attention_2")
+        result = neat_packed_vlm_collater(
+            [s1, s2],
+            packing=self._packing(packed_mask_type="document_ids"),
+        )
         assert result["pixel_values"].shape[0] == 3  # 2 + 1
         assert result["image_grid_thw"].shape[0] == 3
+
+    def test_metadata_contract_emits_generic_varlen_fields(self):
+        from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
+
+        sample = self._make_packed_sample(5, 0)
+        sample["attention_mask"] = torch.tensor([1, 1, 2, 2, 2])
+        result = neat_packed_vlm_collater(
+            [sample],
+            max_length=7,
+            packing=self._packing(
+                packed_mask_type="document_ids",
+                requires_metadata=True,
+            ),
+        )
+
+        assert result["packed_token_indices"].tolist() == [[0, 1, 2, 3, 4, -1, -1]]
+        assert result["cu_seqlens"].tolist() == [[0, 2, 5]]
+        assert result["max_seqlen"] == 3
+        assert result["_packed_seq_ids"].tolist() == [[1, 1, 2, 2, 2, 0, 0]]
 
 
 # ---------------------------------------------------------------------------
