@@ -127,8 +127,9 @@ ci:
     # using FP32 softmax/normalization/weights, as corroborated by vLLM's router.
     # Projection and checkpoint storage stay unchanged; all previous gates remain.
     # Reference precision audit: https://linear.app/nvidia/issue/AM-821
-    hf_reference_context:
-      _target_: nemo_automodel.components.models.mistral4.reference_precision.fp32_router_scores
+    hf_router_scores_fp32: true
+    # Existing reload calibration (#3620): AutoModel cosine 0.998487 < 0.999;
+    # HF mean/p95 KL 0.0203/0.0725 exceeded standard. Source stays standard.
     parity_tolerance_profile_overrides:
       automodel_reload: relaxed
       hf_reload: relaxed

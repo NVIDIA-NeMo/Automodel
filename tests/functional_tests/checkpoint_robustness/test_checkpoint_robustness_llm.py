@@ -35,13 +35,13 @@ import os
 import sys
 import time
 import traceback
-from collections.abc import Callable
-from contextlib import AbstractContextManager, contextmanager, nullcontext
+from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import timedelta
 from functools import wraps
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     from nemo_automodel.recipes.base_recipe import BaseRecipe
@@ -50,6 +50,7 @@ import datasets
 import torch
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor
+from torch.overrides import TorchFunctionMode
 
 from nemo_automodel.components.checkpoint.checkpointing import (
     _MODELS_REQUIRING_BUFFER_REINIT,
@@ -57,6 +58,7 @@ from nemo_automodel.components.checkpoint.checkpointing import (
 )
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.shared.import_utils import safe_import
 from nemo_automodel.shared.utils import dtype_from_str
 from tests.functional_tests.checkpoint_robustness.parity_metrics import (
     _apply_parity_threshold_overrides,
@@ -224,7 +226,7 @@ def _extract_custom_args(argv: list[str]) -> tuple[dict[str, object], list[str]]
         for k, v in ci_robustness.items():
             if k in default_on_control_keys:
                 continue
-            if k in {"shape_diagnostic", "hf_reference_context"}:
+            if k in {"shape_diagnostic", "hf_router_scores_fp32"}:
                 continue
             if k not in custom:
                 if "." in k:
@@ -1471,15 +1473,96 @@ def _keep_hf_modules_in_fp32(hf_config: object):
         setattr(PreTrainedModel, attr, previous)
 
 
-def _hf_reference_context(cfg: ConfigNode, model: torch.nn.Module) -> AbstractContextManager[None]:
-    """Select an explicit model-owned reference context from the CI configuration."""
-    context_config = cfg.get("ci.checkpoint_robustness.hf_reference_context")
-    if context_config is None:
-        return nullcontext()
-    if not isinstance(context_config, ConfigNode):
-        raise ValueError("ci.checkpoint_robustness.hf_reference_context must be a _target_ configuration")
-    print(f"[HF reference] Explicit precision context: {context_config.get_as_string('_target_')}; not vanilla HF")
-    return context_config.instantiate(model=model)
+class _FP32RouterSoftmax(TorchFunctionMode):
+    """Change only the dtype argument of the router's native HF softmax."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def __torch_function__(
+        self, func: Callable, types: tuple[type, ...], args: tuple = (), kwargs: dict | None = None
+    ) -> Any:
+        """Dispatch native operations, promoting the router softmax.
+
+        Args:
+            func: Original torch operation.
+            types: Tensor types supplied by torch's dispatch protocol.
+            args: Framework operands of arbitrary layouts. The intercepted softmax
+                receives router logits of shape [tokens, experts] and its axis.
+            kwargs: Original operation keywords, including an optional dtype.
+
+        Returns:
+            The native operation's result with its original layout. Router softmax
+            returns FP32 probabilities of shape [tokens, experts]; all other
+            operations retain their native dispatch and dtype behavior.
+        """
+        kwargs = dict(kwargs or {})
+        if func is torch.Tensor.softmax:
+            kwargs["dtype"] = torch.float32
+            self.calls += 1
+        return func(*args, **kwargs)
+
+
+def _with_fp32_scores(forward: Callable) -> Callable:
+    @wraps(forward)
+    def wrapped(hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run the original HF router with FP32 score arithmetic.
+
+        Args:
+            hidden_states: Tensor of shape [..., hidden], with arbitrary leading
+                dimensions and the native router projection's input dtype.
+
+        Returns:
+            Native projection logits of shape [tokens, experts], FP32 normalized
+            routing weights of shape [tokens, top_k], and integer expert indices
+            of shape [tokens, top_k]. Tokens flatten the input's leading axes.
+        """
+        with _FP32RouterSoftmax() as mode:
+            result = forward(hidden_states)
+        if mode.calls != 1:
+            raise RuntimeError(f"HF Mistral4 router softmax contract changed: expected one call, got {mode.calls}")
+        return result
+
+    return wrapped
+
+
+@contextmanager
+def _hf_reference_context(cfg: ConfigNode, model: torch.nn.Module) -> Iterator[None]:
+    """Temporarily apply the test's explicit HF router scoring precision.
+
+    The opt-in currently supports Mistral4. Projection and stored weights retain
+    their native dtypes; softmax, normalization, and selected weights use FP32.
+    The original HF algorithm runs with instance-local wrappers that preserve
+    device-map dispatch and are restored on success or failure.
+
+    Args:
+        cfg: Recipe configuration containing checkpoint-robustness controls.
+        model: Loaded HF reference model, including any PEFT wrapper.
+
+    Yields:
+        Control to source or reload reference forwards with the selected precision.
+    """
+    enabled = cfg.get("ci.checkpoint_robustness.hf_router_scores_fp32", False)
+    if not _parse_boolean_fixture_value(enabled, key="hf_router_scores_fp32"):
+        yield
+        return
+
+    available, hf_module = safe_import("transformers.models.mistral4.modeling_mistral4")
+    if not available:
+        raise ImportError("FP32 Mistral4 reference scoring requires Transformers with Mistral4 support")
+    routers = [module for module in model.modules() if isinstance(module, hf_module.Mistral4TopkRouter)]
+    if not routers:
+        raise ValueError("FP32 Mistral4 reference scoring found no HF Mistral4 routers")
+    print("[HF reference] Mistral4 FP32 router scoring enabled; not vanilla HF")
+    with ExitStack() as stack:
+        for router in routers:
+            original = router.forward
+            if "forward" in router.__dict__:
+                stack.callback(setattr, router, "forward", original)
+            else:
+                stack.callback(delattr, router, "forward")
+            router.forward = _with_fp32_scores(original)
+        yield
 
 
 def _preinit_global_rank() -> int:
