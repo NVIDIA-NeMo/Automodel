@@ -297,7 +297,7 @@ class BackendConfig:
             CUDA BF16; CPU execution retains the PyTorch numerical oracle.
         sparse_attn: Sparse-attention backend. "generic" preserves each model's
             existing sparse mask plus ``attn`` path; "msa" selects the optional
-            MiniMax M3 SM100 MSA implementation for sparse layers only.
+            SM100 MSA kernels a model provides for its sparse layers only.
         linear: Linear layer backend ("torch", "te", or "quack").
         rms_norm: RMSNorm backend ("torch", "torch_fp32", "te", or "quack").
         rope: Rotary embedding backend ("torch" or "quack"). QuACK is currently

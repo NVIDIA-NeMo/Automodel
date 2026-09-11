@@ -26,13 +26,13 @@ import pytest
 import torch
 
 from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.minimax_m3_vl._msa import _MSAPackedLayout
 from nemo_automodel.components.models.minimax_m3_vl.config import MiniMaxM3VLTextConfig
 from nemo_automodel.components.models.minimax_m3_vl.layers import (
     MiniMaxM3Indexer,
     build_block_sparse_attn_mask,
     select_sparse_blocks,
 )
+from nemo_automodel.components.models.minimax_m3_vl.msa import MSAMicrobatch
 from tests.unit_tests.models.minimax_m3_vl._msa_select_reference import select_blocks_reference_for
 
 
@@ -143,12 +143,12 @@ def test_indexer_document_local_support(
     )
     indexer = MiniMaxM3Indexer(sparse_text_config, sparse_cfg, backend)
     documents = torch.tensor([[1] * 14 + [0] + [2] * 10])
-    layout = _MSAPackedLayout.build(documents)
+    microbatch = MSAMicrobatch.from_document_map(documents, forced_blocks=(indexer.init_blocks, indexer.local_blocks))
     query = torch.zeros(24, indexer.num_index_heads, indexer.index_head_dim)
     query[..., 0] = 1
     key = torch.zeros(24, 1, indexer.index_head_dim)
     key[:, 0, 0] = torch.tensor([9.0] * 4 + [2.0] * 4 + [5.0] * 4 + [-1.0] * 2 + [1.0] * 4 + [8.0] * 4 + [-1.0] * 2)
-    support = select_blocks_reference_for(indexer, layout, query, key)
+    support = select_blocks_reference_for(indexer, microbatch, query, key)
     assert support.shape == (indexer.num_index_heads, 24, 2)
     assert support.dtype == torch.int32 and support.is_contiguous()
     assert support[:, 0, 0].eq(0).all() and support[:, 0, 1].eq(-1).all()

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Model-private MSA kernels, loaded lazily by _msa; no eager CuTe imports.
+"""Model-private MSA kernels, bound lazily by ``msa_bindings.kernels``; no eager CuTe imports.
 
 The SM100 kernel modules are CuTe DSL source and call ``require_cute_dsl`` before their first DSL
 import, so a host without the msa extra sees ``UnavailableError`` instead of ``ModuleNotFoundError``.
@@ -35,9 +35,8 @@ MSA_KERNEL_IMPORT_ERROR = (
 def sm_capability(device: torch.device) -> tuple[int, int]:
     """Return the memoized CUDA compute capability of ``device``.
 
-    ``torch.cuda.get_device_capability`` costs about 1.6 us and one MSA backward calls it eight
-    times: the SM100 guard plus four compile-cache keys, three of which are reached twice. A
-    device's capability cannot change, so look it up once per device.
+    ``torch.cuda.get_device_capability`` costs about 1.6 us and ``require_sm100`` runs on every MSA
+    forward; a device's capability cannot change, so look it up once per device.
 
     Args:
         device: CUDA device taken from a tensor, which always carries an explicit index.
@@ -46,6 +45,19 @@ def sm_capability(device: torch.device) -> tuple[int, int]:
         The ``(major, minor)`` compute capability of that device.
     """
     return torch.cuda.get_device_capability(device)
+
+
+@lru_cache
+def sm_count(device: torch.device) -> int:
+    """Return the memoized streaming-multiprocessor count of ``device``; it sizes the backward CTA walk.
+
+    Args:
+        device: CUDA device taken from a tensor, which always carries an explicit index.
+
+    Returns:
+        The number of streaming multiprocessors of that device.
+    """
+    return torch.cuda.get_device_properties(device).multi_processor_count
 
 
 def require_sm100(device: torch.device) -> None:
@@ -72,7 +84,7 @@ def require_cute_dsl() -> None:
     need ``cutlass`` and ``cuda.bindings`` while the module loads, and the CI import walker imports
     every module of the package on hosts without the msa extra. Each kernel module calls this before
     its first DSL import so absence surfaces as ``UnavailableError``, the signal both the walker and
-    ``_msa._resolve_msa_backward`` understand. It is the software twin of ``require_sm100``: one gates
+    ``msa_bindings.kernels`` understand. It is the software twin of ``require_sm100``: one gates
     the toolchain at import, the other the device at launch.
 
     Raises:

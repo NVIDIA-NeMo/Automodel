@@ -25,11 +25,13 @@ Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao;
 BSD-3-Clause), specialized to the fixed ``[T, 64, 128]`` MSA layout.
 """
 
+from functools import lru_cache
 from typing import Any
 
 import torch
 
-from nemo_automodel.components.models.minimax_m3_vl.kernels import require_cute_dsl, sm_capability
+from nemo_automodel.components.models.minimax_m3_vl.kernels import require_cute_dsl
+from nemo_automodel.components.models.minimax_m3_vl.kernels.msa_schedule import HEAD_DIM, NUM_Q_HEADS
 
 # Bind the CuTe DSL only after proving it is importable, so a host without the msa extra sees
 # UnavailableError here instead of ModuleNotFoundError from the imports below.
@@ -41,15 +43,11 @@ from cuda.bindings import driver as cuda
 from cutlass import Float32
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 
-HEAD_DIM = 128
-NUM_Q_HEADS = 64
 TILE_M = 128
 NUM_THREADS = 256
 COPY_BITS = 128
 COPY_ELEMS = COPY_BITS // cutlass.BFloat16.width  # 8 BF16 elements per thread copy
 THREADS_PER_ROW = HEAD_DIM // COPY_ELEMS  # 16 lanes cover one 128-element row
-
-_COMPILE_CACHE: dict[tuple[Any, ...], Any] = {}
 
 
 # Adapted from https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/cute/flash_bwd_preprocess.py
@@ -141,49 +139,31 @@ class _MSABackwardPreprocessSm100:
                     gDelta[row] = row_sums[m]
 
 
-def _run_msa_backward_preprocess(
-    out: torch.Tensor, grad_out: torch.Tensor, delta: torch.Tensor | None = None
-) -> torch.Tensor:
-    """Reduce contiguous, 16-byte-aligned BF16 rows to FP32 ``[T, 64]`` delta (into ``delta`` when given)."""
-    if out.device.type != "cuda" or grad_out.device != out.device:
-        raise ValueError("MiniMax M3 MSA delta preprocess requires CUDA tensors on one device")
-    if out.dtype != torch.bfloat16 or grad_out.dtype != torch.bfloat16:
-        raise ValueError(f"out and grad_out must be BF16, got {out.dtype} and {grad_out.dtype}")
-    if out.ndim != 3 or out.shape[1] != NUM_Q_HEADS or out.shape[2] != HEAD_DIM or out.shape[0] <= 0:
-        raise ValueError(f"out must have shape [T, {NUM_Q_HEADS}, {HEAD_DIM}] with T > 0, got {tuple(out.shape)}")
-    if grad_out.shape != out.shape:
-        raise ValueError(f"grad_out must match out, got {tuple(grad_out.shape)} vs {tuple(out.shape)}")
-    if not out.is_contiguous() or not grad_out.is_contiguous():
-        raise ValueError("out and grad_out must be contiguous")
-    if out.data_ptr() % 16 != 0 or grad_out.data_ptr() % 16 != 0:
-        raise ValueError("out and grad_out must have 16-byte-aligned storage")
-
-    if delta is None:
-        delta = torch.empty((out.shape[0], NUM_Q_HEADS), dtype=torch.float32, device=out.device)
-    elif delta.shape != (out.shape[0], NUM_Q_HEADS) or delta.dtype != torch.float32 or not delta.is_contiguous():
-        raise ValueError(
-            f"delta must be a contiguous FP32 [T, {NUM_Q_HEADS}] tensor, got {tuple(delta.shape)} {delta.dtype}"
-        )
-    preprocess_executable(out.device, out.dtype)(out, grad_out, delta)
-    return delta
+@lru_cache(maxsize=1)
+def _compile() -> Any:
+    """Compile the delta reduction once per process with a dynamic token count."""
+    num_tokens = cute.sym_int32(symbol="num_tokens")
+    # stride_order[i] is the rank of mode i, 0 = innermost: row-major THD.
+    fake_rows = make_fake_compact_tensor(
+        cutlass.BFloat16, (num_tokens, NUM_Q_HEADS, HEAD_DIM), stride_order=(2, 1, 0), assumed_align=16
+    )
+    fake_delta = make_fake_compact_tensor(Float32, (num_tokens, NUM_Q_HEADS), stride_order=(1, 0), assumed_align=16)
+    return cute.compile(
+        _MSABackwardPreprocessSm100(),
+        fake_rows,
+        fake_rows,
+        fake_delta,
+        make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--enable-tvm-ffi",
+    )
 
 
-def preprocess_executable(device: torch.device, dtype: torch.dtype) -> Any:
-    """Compile (once per device capability and dtype) and return the delta executable."""
-    key = ("minimax-m3-msa-backward-preprocess-sm100", sm_capability(device), dtype)
-    if key not in _COMPILE_CACHE:
-        num_tokens = cute.sym_int32(symbol="num_tokens")
-        # stride_order[i] is the rank of mode i, 0 = innermost: row-major THD.
-        fake_rows = make_fake_compact_tensor(
-            cutlass.BFloat16, (num_tokens, NUM_Q_HEADS, HEAD_DIM), stride_order=(2, 1, 0), assumed_align=16
-        )
-        fake_delta = make_fake_compact_tensor(Float32, (num_tokens, NUM_Q_HEADS), stride_order=(1, 0), assumed_align=16)
-        _COMPILE_CACHE[key] = cute.compile(
-            _MSABackwardPreprocessSm100(),
-            fake_rows,
-            fake_rows,
-            fake_delta,
-            make_fake_stream(use_tvm_ffi_env_stream=True),
-            options="--enable-tvm-ffi",
-        )
-    return _COMPILE_CACHE[key]
+def run_preprocess(out: torch.Tensor, grad_out: torch.Tensor, delta: torch.Tensor) -> None:
+    """Enqueue ``delta[t, h] = sum_d out[t, h, d] * grad_out[t, h, d]``.
+
+    Args:
+        out: Contiguous BF16 ``[T, 64, 128]`` forward output.
+        grad_out: Contiguous BF16 ``[T, 64, 128]`` output gradient, on the same device.
+        delta: Contiguous FP32 ``[T, 64]`` written in place.
+    """
+    _compile()(out, grad_out, delta)

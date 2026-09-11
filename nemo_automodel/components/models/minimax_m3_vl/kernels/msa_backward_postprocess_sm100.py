@@ -14,7 +14,7 @@
 
 """Gradient finalize for the MiniMax M3 MSA SM100 backward (one launch).
 
-* dQ: the main kernel accumulates dQ with packed 16-bit atomics (fp16 or bf16) either into
+* dQ: the main kernel accumulates dQ with packed 16-bit atomics (``DQ_ACCUM_DTYPE``) either into
   a head-pair interleaved pool ``[T, Hq/2, D, 2]`` -- de-interleaved here: pool row
   ``(t, hp)`` of 256 elements becomes rows ``2hp`` and ``2hp + 1`` of the BF16 ``[T, Hq, D]``
   gradient (16-byte loads, 8-byte stores) -- or into a plain ``[T, Hq, D]`` pool, which is
@@ -25,11 +25,13 @@ Grid ``[max(dq_blocks, kv_blocks), 2]``: ``blockIdx.y == 0`` does 8 dQ rows, ``1
 2048-element dK/dV chunk; both roles are predicated on their own extents.
 """
 
+from functools import lru_cache
 from typing import Any
 
 import torch
 
-from nemo_automodel.components.models.minimax_m3_vl.kernels import require_cute_dsl, sm_capability
+from nemo_automodel.components.models.minimax_m3_vl.kernels import require_cute_dsl
+from nemo_automodel.components.models.minimax_m3_vl.kernels.msa_schedule import HEAD_DIM
 
 # Bind the CuTe DSL only after proving it is importable, so a host without the msa extra sees
 # UnavailableError here instead of ModuleNotFoundError from the imports below.
@@ -41,13 +43,10 @@ from cuda.bindings import driver as cuda
 from cutlass import Float32, Int32
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 
-HEAD_DIM = 128
 POOL_ROW = 2 * HEAD_DIM  # (d, e) pairs of one head pair
 NUM_THREADS = 256
 DQ_ROWS_PER_CTA = NUM_THREADS // 32  # one warp per pool row
 KV_PER_CTA = NUM_THREADS * 8  # 8 fp32 per thread
-
-_COMPILE_CACHE: dict[tuple[Any, ...], Any] = {}
 
 
 class _MSAGradFinalizeSm100:
@@ -152,48 +151,41 @@ class _MSAGradFinalizeSm100:
                 cute.copy(tiled_kv_out, out, tKVOut)
 
 
-def grad_finalize_executable(device: torch.device, dq_dtype: torch.dtype, interleaved: bool) -> Any:
-    """Compile (once per device capability, pool dtype and layout) and return the finalize executable."""
-    key = ("minimax-m3-msa-grad-finalize-sm100", sm_capability(device), dq_dtype, interleaved)
-    if key not in _COMPILE_CACHE:
-        in_dtype = {torch.float16: cutlass.Float16, torch.bfloat16: cutlass.BFloat16}[dq_dtype]
-        n_rows = cute.sym_int32(symbol="dq_rows")
-        n_kv = cute.sym_int32(symbol="kv_blocks")
-        fake_pool = make_fake_compact_tensor(in_dtype, (n_rows, POOL_ROW), stride_order=(1, 0), assumed_align=16)
-        fake_out = make_fake_compact_tensor(cutlass.BFloat16, (n_rows, POOL_ROW), stride_order=(1, 0), assumed_align=16)
-        fake_kv = make_fake_compact_tensor(Float32, (n_kv, KV_PER_CTA), stride_order=(1, 0), assumed_align=16)
-        fake_kv_out = make_fake_compact_tensor(
-            cutlass.BFloat16, (n_kv, KV_PER_CTA), stride_order=(1, 0), assumed_align=16
-        )
-        _COMPILE_CACHE[key] = cute.compile(
-            _MSAGradFinalizeSm100(interleaved),
-            fake_pool,
-            fake_out,
-            fake_kv,
-            fake_kv_out,
-            Int32(0),
-            Int32(0),
-            make_fake_stream(use_tvm_ffi_env_stream=True),
-            options="--enable-tvm-ffi",
-        )
-    return _COMPILE_CACHE[key]
+@lru_cache(maxsize=None)
+def _compile(dq_dtype: torch.dtype, interleaved: bool) -> Any:
+    """Compile the finalize once per dQ pool dtype and layout."""
+    in_dtype = {torch.float16: cutlass.Float16, torch.bfloat16: cutlass.BFloat16}[dq_dtype]
+    n_rows = cute.sym_int32(symbol="dq_rows")
+    n_kv = cute.sym_int32(symbol="kv_blocks")
+    fake_pool = make_fake_compact_tensor(in_dtype, (n_rows, POOL_ROW), stride_order=(1, 0), assumed_align=16)
+    fake_out = make_fake_compact_tensor(cutlass.BFloat16, (n_rows, POOL_ROW), stride_order=(1, 0), assumed_align=16)
+    fake_kv = make_fake_compact_tensor(Float32, (n_kv, KV_PER_CTA), stride_order=(1, 0), assumed_align=16)
+    fake_kv_out = make_fake_compact_tensor(cutlass.BFloat16, (n_kv, KV_PER_CTA), stride_order=(1, 0), assumed_align=16)
+    return cute.compile(
+        _MSAGradFinalizeSm100(interleaved),
+        fake_pool,
+        fake_out,
+        fake_kv,
+        fake_kv_out,
+        Int32(0),
+        Int32(0),
+        make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--enable-tvm-ffi",
+    )
 
 
 def run_grad_finalize(dq_pool: torch.Tensor, dq_out: torch.Tensor, kv_pool: torch.Tensor, kv_out: torch.Tensor) -> None:
-    """``dq_pool`` ``[T, Hq/2, D, 2]`` or ``[T, Hq, D]`` (fp16/bf16) -> ``dq_out [T, Hq, D]`` bf16; ``kv_pool [N]`` fp32 -> ``kv_out [N]`` bf16."""
-    interleaved = dq_pool.dim() == 4
-    if interleaved:
-        T, half_heads, dim, two = dq_pool.shape
-        assert dim == HEAD_DIM and two == 2 and dq_out.shape == (T, 2 * half_heads, dim)
-    else:
-        assert dq_out.shape == dq_pool.shape and dq_pool.shape[-1] == HEAD_DIM
-    assert dq_out.dtype == torch.bfloat16 and dq_pool.numel() % POOL_ROW == 0
-    assert dq_pool.is_contiguous() and dq_out.is_contiguous() and kv_pool.is_contiguous() and kv_out.is_contiguous()
-    assert kv_pool.dtype == torch.float32 and kv_out.dtype == torch.bfloat16 and kv_pool.numel() == kv_out.numel()
-    assert kv_pool.numel() % KV_PER_CTA == 0, kv_pool.numel()
+    """Cast the accumulation pools to the BF16 gradients in one launch.
+
+    Args:
+        dq_pool: Contiguous 16-bit ``[T, Hq/2, D, 2]`` head-pair pool, or a plain ``[T, Hq, D]`` pool.
+        dq_out: Contiguous BF16 ``[T, Hq, D]`` written in place.
+        kv_pool: Contiguous FP32 ``[N]`` dK/dV pool, ``N`` a multiple of 2048.
+        kv_out: Contiguous BF16 ``[N]`` written in place.
+    """
     num_dq_rows = dq_pool.numel() // POOL_ROW
     num_kv_blocks = kv_pool.numel() // KV_PER_CTA
-    grad_finalize_executable(dq_pool.device, dq_pool.dtype, interleaved)(
+    _compile(dq_pool.dtype, dq_pool.dim() == 4)(
         dq_pool.view(num_dq_rows, POOL_ROW),
         dq_out.view(num_dq_rows, POOL_ROW),
         kv_pool.view(num_kv_blocks, KV_PER_CTA),

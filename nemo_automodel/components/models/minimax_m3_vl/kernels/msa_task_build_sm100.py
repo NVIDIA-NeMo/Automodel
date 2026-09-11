@@ -24,21 +24,29 @@ intervals.
 """
 
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any
 
 import torch
 
-from nemo_automodel.components.models.minimax_m3_vl.kernels import require_cute_dsl, sm_capability
+from nemo_automodel.components.models.minimax_m3_vl.kernels import require_cute_dsl
 from nemo_automodel.components.models.minimax_m3_vl.kernels.msa_schedule import (
-    _BLOCK_SIZE,
-    _NUM_INDEX_HEADS,
-    _QUERY_CHUNK,
-    _ROWS_PER_CTA_LARGE,
-    _ROWS_PER_CTA_SMALL,
-    _ROWS_PER_CTA_SWITCH,
-    _check_schedule,
-    _grid_launch_bound,
-    _MSABackwardSchedule,
+    BLOCK_SIZE,
+    NUM_INDEX_HEADS,
+    QUERY_CHUNK,
+    ROWS_PER_CTA_LARGE,
+    ROWS_PER_CTA_SMALL,
+    ROWS_PER_CTA_SWITCH,
+    MSABackwardSchedule,
+    grid_launch_bound,
+)
+
+# The kernel body is a verbatim mirror of flash-msa-dev and reads the topology under its own names.
+_BLOCK_SIZE, _QUERY_CHUNK = BLOCK_SIZE, QUERY_CHUNK
+_ROWS_PER_CTA_SMALL, _ROWS_PER_CTA_SWITCH, _ROWS_PER_CTA_LARGE = (
+    ROWS_PER_CTA_SMALL,
+    ROWS_PER_CTA_SWITCH,
+    ROWS_PER_CTA_LARGE,
 )
 
 # Bind the CuTe DSL only after proving it is importable, so a host without the msa extra sees
@@ -99,8 +107,6 @@ _INT32_MAX = 2**31 - 1
 # hold the supported token count; the two constants move together.
 _LOCALITY_WINDOW = 512
 
-_COMPILE_CACHE: dict[tuple[Any, ...], Any] = {}
-
 
 @dataclass(frozen=True, slots=True)
 class _MSABackwardTaskTables:
@@ -117,22 +123,20 @@ class _MSABackwardTaskTables:
     grid_launch: int  # CTAs to launch for the main kernel
 
 
-def _task_capacity(schedule: _MSABackwardSchedule) -> int:
+def _task_capacity(schedule: MSABackwardSchedule) -> int:
     """Upper bound of the task count from the schedule shapes (disjoint work items)."""
-    return _NUM_INDEX_HEADS * schedule.q_indices.shape[1] // _QUERY_CHUNK + schedule.scheduler_metadata.shape[0]
+    return NUM_INDEX_HEADS * schedule.q_indices.shape[1] // QUERY_CHUNK + schedule.scheduler_metadata.shape[0]
 
 
-def _task_build_sizes(
-    schedule: _MSABackwardSchedule, num_tokens: int, workspace_rows: int
-) -> tuple[int, int, int, int]:
+def _task_build_sizes(schedule: MSABackwardSchedule, num_tokens: int, workspace_rows: int) -> tuple[int, int, int, int]:
     """``(capacity, bins, scratch_words, table_words)`` of the build for this schedule (host shape math only)."""
     capacity = _task_capacity(schedule)
     num_windows = (num_tokens + _LOCALITY_WINDOW - 1) // _LOCALITY_WINDOW
-    num_kblocks = workspace_rows // _BLOCK_SIZE
-    bins = _NUM_INDEX_HEADS * num_windows * max(num_kblocks, 1)
+    num_kblocks = workspace_rows // BLOCK_SIZE
+    bins = NUM_INDEX_HEADS * num_windows * max(num_kblocks, 1)
     work_capacity = int(schedule.scheduler_metadata.shape[0])
     scratch_words = DESC_WORDS + work_capacity + capacity + 4 * bins + DEC_WORDS * capacity
-    return capacity, bins, scratch_words, capacity * (4 + 2 * _QUERY_CHUNK)
+    return capacity, bins, scratch_words, capacity * (4 + 2 * QUERY_CHUNK)
 
 
 @cute.jit
@@ -535,7 +539,7 @@ class _MSATaskBuildSm100:
                 mQRows[output_row, s] = qrow
                 mQPos[output_row, s] = qpos
         if task == Int32(0):
-            # device mirror of msa_schedule._select_rows_per_cta(num_rows) / _chunk_map(num_rows, rows_per_cta, num_sms)
+            # device mirror of msa_schedule.rows_per_cta(num_rows) / chunk_map(num_rows, rows_per_cta, num_sms)
             num_rows = num_tasks
             overflow = Int32(0)
             if total > capacity:
@@ -568,78 +572,76 @@ class _MSATaskBuildSm100:
             mDesc[DESC_FLAGS] = flags | overflow
 
 
-def _compile(device: torch.device) -> Any:
-    key = ("minimax-m3-msa-task-build-sm100", sm_capability(device))
-    if key not in _COMPILE_CACHE:
-        n_work = cute.sym_int32(symbol="work_capacity")
-        n_rows = cute.sym_int32(symbol="rows_plus_one")
-        n_edges = cute.sym_int32(symbol="edge_capacity")
-        n_docs = cute.sym_int32(symbol="documents")
-        n_docs1 = cute.sym_int32(symbol="documents_plus_one")
-        n_cap = cute.sym_int32(symbol="capacity")
-        n_bins = cute.sym_int32(symbol="bins")
+@lru_cache(maxsize=1)
+def _compile() -> Any:
+    """Compile the four-launch build once per process with dynamic work, row, edge, document and bin counts."""
+    n_work = cute.sym_int32(symbol="work_capacity")
+    n_rows = cute.sym_int32(symbol="rows_plus_one")
+    n_edges = cute.sym_int32(symbol="edge_capacity")
+    n_docs = cute.sym_int32(symbol="documents")
+    n_docs1 = cute.sym_int32(symbol="documents_plus_one")
+    n_cap = cute.sym_int32(symbol="capacity")
+    n_bins = cute.sym_int32(symbol="bins")
 
-        def tensor(shape, align=4):
-            return make_fake_compact_tensor(
-                Int32, shape, stride_order=tuple(reversed(range(len(shape)))), assumed_align=align
-            )
-
-        task_rows = tensor((n_cap, _QUERY_CHUNK), align=16)
-        tensors = (
-            tensor((n_work, 6)),
-            tensor((1,)),
-            tensor((n_work,)),
-            tensor((_NUM_INDEX_HEADS, n_rows)),
-            tensor((_NUM_INDEX_HEADS, n_edges)),
-            tensor((n_docs1,)),
-            tensor((n_docs,)),
-            tensor((n_cap,)),
-            tensor((4, n_bins)),
-            tensor((n_cap, DEC_WORDS)),
-            tensor((n_cap, 4), align=16),
-            task_rows,
-            task_rows,
-            tensor((DESC_WORDS,)),
+    def tensor(shape, align=4):
+        return make_fake_compact_tensor(
+            Int32, shape, stride_order=tuple(reversed(range(len(shape)))), assumed_align=align
         )
-        # num_windows, num_kblocks, locality_window, num_sms
-        scalars = (Int32(0), Int32(0), Int32(0), Int32(0))
-        _COMPILE_CACHE[key] = cute.compile(
-            _MSATaskBuildSm100(),
-            *tensors,
-            *scalars,
-            make_fake_stream(use_tvm_ffi_env_stream=True),
-            options="--enable-tvm-ffi",
-        )
-    return _COMPILE_CACHE[key]
+
+    task_rows = tensor((n_cap, QUERY_CHUNK), align=16)
+    tensors = (
+        tensor((n_work, 6)),
+        tensor((1,)),
+        tensor((n_work,)),
+        tensor((NUM_INDEX_HEADS, n_rows)),
+        tensor((NUM_INDEX_HEADS, n_edges)),
+        tensor((n_docs1,)),
+        tensor((n_docs,)),
+        tensor((n_cap,)),
+        tensor((4, n_bins)),
+        tensor((n_cap, DEC_WORDS)),
+        tensor((n_cap, 4), align=16),
+        task_rows,
+        task_rows,
+        tensor((DESC_WORDS,)),
+    )
+    # num_windows, num_kblocks, locality_window, num_sms
+    scalars = (Int32(0), Int32(0), Int32(0), Int32(0))
+    return cute.compile(
+        _MSATaskBuildSm100(),
+        *tensors,
+        *scalars,
+        make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--enable-tvm-ffi",
+    )
 
 
-def task_build_storage(schedule: _MSABackwardSchedule, num_tokens: int, workspace_rows: int) -> tuple[int, int]:
+def task_build_storage(schedule: MSABackwardSchedule, num_tokens: int, workspace_rows: int) -> tuple[int, int]:
     """Required scratch/table int32 words; the caller owns and may reuse both buffers."""
     return _task_build_sizes(schedule, num_tokens, workspace_rows)[2:]
 
 
 def build_backward_tasks(
-    schedule: _MSABackwardSchedule,
+    schedule: MSABackwardSchedule,
     num_tokens: int,
     workspace_rows: int,
     *,
     num_sms: int,
-    scratch: torch.Tensor | None = None,
-    tables: torch.Tensor | None = None,
+    scratch: torch.Tensor,
+    tables: torch.Tensor,
 ) -> _MSABackwardTaskTables:
     """Enqueue the four build launches without a host sync; return the tables and the CTA walk.
 
     Args:
-        schedule: Forward-derived int32 schedule (see ``_MSABackwardSchedule``), all on one CUDA device.
+        schedule: Forward-derived int32 schedule (see ``MSABackwardSchedule``), all on one CUDA device.
         num_tokens: Compact token count ``T`` of the backward call.
         workspace_rows: Aligned K/V workspace length ``W``, a multiple of 128.
         num_sms: Streaming multiprocessors of the device; sizes the CTA walk.
-        scratch: Optional int32 buffer of at least ``task_build_storage(...)[0]`` words on the schedule
-            device, carved as ``descriptor | task ends | task segments | bins``; replaced when missing
-            or undersized. The descriptor stays at offset zero to keep its 16-byte alignment.
-        tables: Optional int32 buffer of at least ``task_build_storage(...)[1]`` words on the schedule
-            device, carved as ``task_meta [capacity, 4] | task_qrows [capacity, 8] | task_qpos
-            [capacity, 8]``; replaced when missing or undersized.
+        scratch: Int32 buffer of ``task_build_storage(...)[0]`` words on the schedule device, carved as
+            ``descriptor | task ends | task segments | bins``. The descriptor stays at offset zero to keep
+            its 16-byte alignment.
+        tables: Int32 buffer of ``task_build_storage(...)[1]`` words on the schedule device, carved as
+            ``task_meta [capacity, 4] | task_qrows [capacity, 8] | task_qpos [capacity, 8]``.
 
     Returns:
         The three task tables (views into ``tables``), the device descriptor (a view into
@@ -648,31 +650,25 @@ def build_backward_tasks(
     Raises:
         ValueError: If the locality bins exceed ``MAX_BINS``, which happens past roughly 250k tokens.
     """
-    _check_schedule(schedule)
     capacity, bins, scratch_words, table_words = _task_build_sizes(schedule, num_tokens, workspace_rows)
     if bins > MAX_BINS:
         raise ValueError(
             f"MiniMax M3 MSA backward supports at most {MAX_BINS} locality bins per microbatch, got {bins} "
             f"for {num_tokens} tokens and {workspace_rows} workspace rows."
         )
-    device = schedule.row_ptr.device
     num_windows = (num_tokens + _LOCALITY_WINDOW - 1) // _LOCALITY_WINDOW
-    num_kblocks = workspace_rows // _BLOCK_SIZE
+    num_kblocks = workspace_rows // BLOCK_SIZE
     meta = schedule.scheduler_metadata.contiguous()
     work_capacity = int(meta.shape[0])
-    exe = _compile(device)
+    exe = _compile()
     row_ptr = schedule.row_ptr.contiguous()
     q_idx = schedule.q_indices.contiguous()
     cu = schedule.cu_seqlens.contiguous()
     dws = schedule.document_workspace_starts.contiguous()
     work_count = schedule.work_count.contiguous()
-    if scratch is None or scratch.numel() < scratch_words:
-        scratch = torch.empty(scratch_words, dtype=torch.int32, device=device)
     segments_start = DESC_WORDS + work_capacity
     bins_start = segments_start + capacity
     decode_start = bins_start + 4 * bins
-    if tables is None or tables.numel() < table_words:
-        tables = torch.empty(table_words, dtype=torch.int32, device=device)
     # One ``as_strided`` per region instead of a slice (+ a reshape for the 2-D ones): the carve
     # runs on every backward call and the slice-plus-view pair costs about twice a single
     # ``as_strided``.  Offsets are ABSOLUTE storage offsets, so the caller's own offset has to be
@@ -684,8 +680,8 @@ def build_backward_tasks(
     segment_bins = scratch.as_strided((4, bins), (bins, 1), s0 + bins_start)
     task_decode = scratch.as_strided((capacity, DEC_WORDS), (DEC_WORDS, 1), s0 + decode_start)
     task_meta = tables.as_strided((capacity, 4), (4, 1), t0)
-    task_qrows = tables.as_strided((capacity, _QUERY_CHUNK), (_QUERY_CHUNK, 1), t0 + 4 * capacity)
-    task_qpos = tables.as_strided((capacity, _QUERY_CHUNK), (_QUERY_CHUNK, 1), t0 + (4 + _QUERY_CHUNK) * capacity)
+    task_qrows = tables.as_strided((capacity, QUERY_CHUNK), (QUERY_CHUNK, 1), t0 + 4 * capacity)
+    task_qpos = tables.as_strided((capacity, QUERY_CHUNK), (QUERY_CHUNK, 1), t0 + (4 + QUERY_CHUNK) * capacity)
     tensors = (
         meta,
         work_count,
@@ -704,4 +700,4 @@ def build_backward_tasks(
     )
     scalars = (Int32(num_windows), Int32(num_kblocks), Int32(_LOCALITY_WINDOW), Int32(num_sms))
     exe(*tensors, *scalars)
-    return _MSABackwardTaskTables(task_meta, task_qrows, task_qpos, desc, _grid_launch_bound(capacity, num_sms))
+    return _MSABackwardTaskTables(task_meta, task_qrows, task_qpos, desc, grid_launch_bound(capacity, num_sms))

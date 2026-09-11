@@ -17,7 +17,8 @@
 The ``Installation Test`` workflow imports every module of the installed package on macOS, where
 neither ``nvidia-cutlass-dsl`` nor ``cuda-bindings`` ships a wheel, and counts a module as gracefully
 handled only when the traceback carries ``UnavailableError``. These tests replay that rule on CPU by
-refusing every import of ``cutlass`` and ``cuda`` through a ``sys.meta_path`` finder. Patching
+refusing every import of the msa extra (``cutlass``, ``cuda``, ``fmha_sm100``) through a
+``sys.meta_path`` finder. Patching
 ``builtins.__import__`` (the technique of the TileLang precedent tests) is not enough here because
 ``safe_import`` goes through ``importlib.import_module``; and the real ``cutlass`` must be restored
 on teardown rather than re-imported, since loading its MLIR extension twice aborts the interpreter.
@@ -29,15 +30,15 @@ import sys
 
 import pytest
 
-from nemo_automodel.components.models.minimax_m3_vl import _msa, kernels
+from nemo_automodel.components.models.minimax_m3_vl import kernels, msa_bindings
 from nemo_automodel.shared.import_utils import UnavailableError
 
-_DSL_PACKAGES = ("cutlass", "cuda")
+_DSL_PACKAGES = ("cutlass", "cuda", "fmha_sm100")
 _KERNEL_MODULES = sorted(f"{kernels.__name__}.{module.name}" for module in pkgutil.iter_modules(kernels.__path__))
 
 
 class _BlockCuteDsl:
-    """Meta-path finder that refuses every import of the CuTe DSL and the CUDA driver bindings."""
+    """Meta-path finder that refuses every import of the CuTe DSL, the CUDA driver bindings and official MSA."""
 
     def find_spec(self, name, path=None, target=None):
         if name.partition(".")[0] in _DSL_PACKAGES:
@@ -51,9 +52,9 @@ def without_cute_dsl(monkeypatch):
     for name in [name for name in sys.modules if name.partition(".")[0] in _DSL_PACKAGES]:
         monkeypatch.delitem(sys.modules, name)
     monkeypatch.setattr(sys, "meta_path", [_BlockCuteDsl(), *sys.meta_path])
-    _msa._resolve_msa_backward.cache_clear()
+    msa_bindings.kernels.cache_clear()
     yield
-    _msa._resolve_msa_backward.cache_clear()
+    msa_bindings.kernels.cache_clear()
 
 
 @pytest.mark.parametrize("module_name", _KERNEL_MODULES)
@@ -74,11 +75,12 @@ def test_require_cute_dsl_names_the_msa_extra(without_cute_dsl):
         kernels.require_cute_dsl()
 
 
-def test_backward_launcher_resolves_to_none_without_the_dsl(without_cute_dsl, monkeypatch):
-    monkeypatch.delitem(sys.modules, _msa._MSA_BACKWARD_MODULE, raising=False)
-    assert _msa._resolve_msa_backward() is None
+def test_kernels_raise_unavailable_without_the_msa_extra(without_cute_dsl, monkeypatch):
+    # Already-imported kernel modules would bypass require_cute_dsl; a host without the extra has none.
+    for module_name in _KERNEL_MODULES:
+        monkeypatch.delitem(sys.modules, module_name, raising=False)
     with pytest.raises(UnavailableError, match=r"uv sync --extra msa"):
-        _msa._require_msa_backward()
+        msa_bindings.kernels()
 
 
 def test_require_cute_dsl_passes_with_the_dsl_installed():

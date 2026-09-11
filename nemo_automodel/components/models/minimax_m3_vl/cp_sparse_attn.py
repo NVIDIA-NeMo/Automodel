@@ -270,7 +270,6 @@ class MiniMaxM3CPSparseAttention(MiniMaxM3Attention):
         attention_mask: torch.Tensor | None = None,
         **attn_kwargs: Any,
     ) -> torch.Tensor:
-        """Map local x[B,S,H], freqs_cis[B,S,R] and mask[B,S] or [B,1,S,S] to local output[B,S,H]."""
         cp_mesh = self._cp_mesh
         if cp_mesh is None or cp_mesh.size() <= 1 or self.indexer is None:
             return super().forward(x, freqs_cis=freqs_cis, attention_mask=attention_mask, **attn_kwargs)
@@ -301,7 +300,7 @@ class MiniMaxM3CPSparseAttention(MiniMaxM3Attention):
         if self.q_norm is not None:
             q = self.q_norm(q)
             k = self.k_norm(k)
-        q, k = apply_rotary_emb_qk(q, k, freqs_cis, format="bshd", rope_fusion=self._rope_fusion)
+        q, k = apply_rotary_emb_qk(q, k, freqs_cis, format="bshd", rope_fusion=self.backend.rope_fusion)
 
         # 2. all-gather k/v (autograd-safe), reorder rank-major -> global slot order.
         k_g = _AllGatherConcatFn.apply(k, cp_group, 1).index_select(1, sort_order)  # [B, T_global, n_kv, D]
@@ -352,7 +351,9 @@ class MiniMaxM3CPSparseAttention(MiniMaxM3Attention):
                 idxer.index_q_proj(x).view(bsz, t_local, idxer.num_index_heads, idxer.index_head_dim)
             )
             idx_k = idxer.index_k_norm(idxer.index_k_proj(x).view(bsz, t_local, 1, idxer.index_head_dim))
-            idx_q, idx_k = apply_rotary_emb_qk(idx_q, idx_k, freqs_cis, format="bshd", rope_fusion=idxer._rope_fusion)
+            idx_q, idx_k = apply_rotary_emb_qk(
+                idx_q, idx_k, freqs_cis, format="bshd", rope_fusion=idxer.backend.rope_fusion
+            )
             idx_k_g = _all_gather_concat_nograd(idx_k, cp_group, dim=1).index_select(1, sort_order)  # [B,T_global,1,D]
             block_sel = select_sparse_blocks(
                 idx_q,

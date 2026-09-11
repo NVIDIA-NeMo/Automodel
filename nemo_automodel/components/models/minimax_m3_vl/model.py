@@ -26,7 +26,6 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from torch.utils.weak import WeakIdKeyDictionary
 
 from nemo_automodel.components.distributed.context_parallel.sharder import (
     ContextParallelSharder,
@@ -46,14 +45,9 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
 )
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding, position_ids_to_freqs_cis
-from nemo_automodel.components.models.minimax_m3_vl._msa import (
-    _MSAPackedLayout,
-    _reject_unsupported_msa_runtime,
-    _resolve_canonical_document_map,
-)
 from nemo_automodel.components.models.minimax_m3_vl.config import MiniMaxM3VLConfig, MiniMaxM3VLTextConfig
-from nemo_automodel.components.models.minimax_m3_vl.layers import Block, MiniMaxM3RMSNorm
-from nemo_automodel.components.models.minimax_m3_vl.msa_attn import MiniMaxM3MSAAttention
+from nemo_automodel.components.models.minimax_m3_vl.layers import Block, MiniMaxM3MSAAttention, MiniMaxM3RMSNorm
+from nemo_automodel.components.models.minimax_m3_vl.msa import MSAMicrobatch
 from nemo_automodel.components.models.minimax_m3_vl.mtp import MiniMaxM3MTP
 from nemo_automodel.components.models.minimax_m3_vl.state_dict_adapter import (
     MiniMaxM3StateDictAdapter,
@@ -113,39 +107,6 @@ def build_moe_config(config: Any, dtype: torch.dtype) -> MoEConfig:
     )
 
 
-_MSA_LAYOUT_MEMO: WeakIdKeyDictionary = WeakIdKeyDictionary()
-
-
-def _memoized_msa_layout(doc_ids: torch.Tensor, packed_seq_ids: torch.Tensor | None) -> _MSAPackedLayout:
-    """Build the packed MSA layout once per microbatch, shared by that microbatch's pipeline stages.
-
-    ``_MSAPackedLayout.build`` costs about 1.6 ms and forces one device-to-host sync, while this
-    model's ``forward`` runs once per virtual pipeline stage, so an unmemoized build repeats the
-    same layout ``stages_per_rank`` times for one microbatch. ``packed_seq_ids`` is the batch
-    tensor the pipeline runtime hands unchanged to every stage, and ``doc_ids`` is derived from it,
-    so its identity keys the layout without any staleness risk. The memo holds it weakly, so the
-    entry disappears with the batch.
-
-    Args:
-        doc_ids: Tensor of shape [batch, sequence], int64, on the compute device; 0 marks padding
-            and positive values index documents within a row.
-        packed_seq_ids: The batch tensor of shape [batch, sequence] that ``doc_ids`` was derived
-            from, or None when the collator emitted none. Only its identity is used; the layout is
-            rebuilt on every call when it is None -- and so, in turn, is that microbatch's selection
-            plan, which is keyed on the layout.
-
-    Returns:
-        The ``_MSAPackedLayout`` for ``doc_ids``, shared with every other stage of this microbatch.
-    """
-    if packed_seq_ids is None:
-        return _MSAPackedLayout.build(doc_ids)
-    layout = _MSA_LAYOUT_MEMO.get(packed_seq_ids)
-    if layout is None:
-        layout = _MSAPackedLayout.build(doc_ids)
-        _MSA_LAYOUT_MEMO[packed_seq_ids] = layout
-    return layout
-
-
 class MiniMaxM3TextModel(nn.Module):
     """Embedding + decoder stack + final norm for the M3 text backbone."""
 
@@ -164,8 +125,6 @@ class MiniMaxM3TextModel(nn.Module):
         # before the decoder/MTP blocks (which build the MoE gates) are constructed.
         if self.backend.gate_precision is None:
             self.backend.gate_precision = torch.float32
-        self._attn_impl = backend.attn
-        self._rope_fusion = backend.rope_fusion
         self.config = config
         self.config.num_experts = getattr(config, "num_local_experts", getattr(config, "num_experts", None))
 
@@ -177,20 +136,19 @@ class MiniMaxM3TextModel(nn.Module):
         self.layers = torch.nn.ModuleDict()
         for layer_id in range(config.num_hidden_layers):
             self.layers[str(layer_id)] = Block(layer_id, config, self.moe_config, backend)
-        self._msa_layer_ids = frozenset(
-            layer_id for layer_id, block in self.layers.items() if isinstance(block.self_attn, MiniMaxM3MSAAttention)
+        msa_layers = [b.self_attn for b in self.layers.values() if isinstance(b.self_attn, MiniMaxM3MSAAttention)]
+        # Decided here, on the whole model, so every pipeline stage's deep copy carries the same answer.
+        self.uses_msa = bool(msa_layers)
+        self._msa_forced_blocks = (
+            (msa_layers[0].indexer.init_blocks, msa_layers[0].indexer.local_blocks) if msa_layers else (0, 0)
         )
-        self._msa_model_has_dense_layers = len(self._msa_layer_ids) != len(self.layers)
-        if self._msa_layer_ids and int(getattr(config, "num_mtp_modules", 0) or 0) > 0:
+        if self.uses_msa and int(getattr(config, "num_mtp_modules", 0) or 0) > 0:
             raise NotImplementedError("MiniMax M3 MSA sparse attention supports MTP0 only; set num_mtp_modules=0")
-        # `_msa_model_has_dense_layers` is vacuously true when there are no MSA layers at all, so the
-        # `_msa_layer_ids` conjunct is load-bearing: without it every sparse_attn='generic' model
-        # stops constructing.
-        if self._msa_layer_ids and self._msa_model_has_dense_layers and self._attn_impl != "te":
+        if self.uses_msa and len(msa_layers) != len(self.layers) and backend.attn != "te":
             raise NotImplementedError(
                 "MiniMax M3 backend.sparse_attn='msa' packs its dense attention layers to [tokens, hidden], "
                 "so they isolate documents with cu_seqlens and need a varlen backend: set backend.attn='te' "
-                f"(got backend.attn={self._attn_impl!r}). backend.attn='sdpa' ignores cu_seqlens entirely "
+                f"(got backend.attn={backend.attn!r}). backend.attn='sdpa' ignores cu_seqlens entirely "
                 "and backend.attn='flex' rejects grouped-query attention."
             )
 
@@ -230,7 +188,7 @@ class MiniMaxM3TextModel(nn.Module):
             self.rotary_emb,
             position_ids,
             qkv_format=attn_kwargs.get("qkv_format", "bshd"),
-            for_fused_rope=self._rope_fusion,
+            for_fused_rope=self.backend.rope_fusion,
             cp_size=attn_kwargs.get("cp_size", 1),
         )
 
@@ -244,14 +202,7 @@ class MiniMaxM3TextModel(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         **attn_kwargs: Any,
     ) -> torch.Tensor:
-        """Map ids/positions/padding[B,S], embeds[B,S,H] and mask[B,S] or [B,1,S,S] to hidden[B,S,H]; own MSA layout."""
-        if "_msa_layout" in attn_kwargs:
-            raise TypeError("_msa_layout is model-owned and cannot be supplied by callers.")
-
-        use_msa = bool(self._msa_layer_ids)
-        if use_msa:
-            _reject_unsupported_msa_runtime(attn_kwargs)
-
+        """Map ids/positions/padding[B,S], embeds[B,S,H] and mask[B,S] or [B,1,S,S] to hidden[B,S,H]."""
         # Pipeline stages after the first receive the previous stage's hidden
         # states in the input_ids slot (a float tensor) with embed_tokens=None.
         if inputs_embeds is None and input_ids is not None and torch.is_floating_point(input_ids):
@@ -262,36 +213,34 @@ class MiniMaxM3TextModel(nn.Module):
         if position_ids is None:
             position_ids = torch.arange(0, h.shape[1], device=h.device).unsqueeze(0).expand(h.shape[0], -1)
 
-        msa_layout: _MSAPackedLayout | None = None
-        if use_msa:
-            packed_seq_ids = attn_kwargs.pop("_packed_seq_ids", None)
-            doc_ids = _resolve_canonical_document_map(
+        msa = None
+        if self.uses_msa:
+            # Every stage builds it (memoized on the batch tensor): with 28 virtual stages over 60 layers,
+            # virtual stage 0 holds only the dense layers 0-2 and still needs it to pack them.
+            msa = MSAMicrobatch.build(
                 h,
-                packed_seq_ids=packed_seq_ids,
+                packed_seq_ids=attn_kwargs.pop("_packed_seq_ids", None),
                 attention_mask=attention_mask,
                 padding_mask=padding_mask,
+                attn_kwargs=attn_kwargs,
+                forced_blocks=self._msa_forced_blocks,
             )
-            # Every stage builds the layout: with 28 virtual stages over 60 layers, virtual stage 0
-            # holds only the dense layers 0-2 and still needs it to pack them.
-            msa_layout = _memoized_msa_layout(doc_ids, packed_seq_ids)
             # Canonical ids still own padding for the MoE router. Every attention layer packs, so
             # document isolation travels as cu_seqlens and no attention mask may survive: a non-None
             # mask makes the TE backend silently drop cu_seqlens (attention/utils.py:135-143).
-            padding_mask = doc_ids == 0
-            attention_mask = None
-            attn_kwargs["cu_seqlens"] = msa_layout.cu_seqlens
-            attn_kwargs["max_seqlen"] = msa_layout.max_seqlen
+            attention_mask, padding_mask = None, msa.padding_mask
+            attn_kwargs["cu_seqlens"], attn_kwargs["max_seqlen"] = msa.cu_seqlens, msa.max_seqlen
 
         freqs_cis = self.make_freqs_cis(position_ids, **attn_kwargs)
 
-        for layer_id, layer in self.layers.items():
+        for layer in self.layers.values():
             h = layer(
                 x=h,
                 freqs_cis=freqs_cis,
                 attention_mask=attention_mask,
                 padding_mask=padding_mask,
                 # Dense layers pack too: they isolate documents with cu_seqlens, not a 4-D mask.
-                _msa_layout=msa_layout,
+                msa=msa,
                 # Forwarded so CP-aware sparse attention can derive per-document
                 # boundaries (position_ids reset to 0 per packed document) for
                 # block-diagonal masking; ignored/popped by the eager path.
@@ -397,6 +346,12 @@ class MiniMaxM3SparseForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
                 dtype=get_dtype(getattr(config, "torch_dtype", "bfloat16"), torch.bfloat16),
             )
 
+    @property
+    def consumes_packed_seq_ids(self) -> bool:
+        """Whether the packed loader should hand this model ``_packed_seq_ids`` (the compact document map)
+        for every pack, single-document ones included, instead of a ``[batch, 1, sequence, sequence]`` mask."""
+        return self.model.uses_msa
+
     def get_input_embeddings(self):
         return self.model.embed_tokens
 
@@ -419,9 +374,6 @@ class MiniMaxM3SparseForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
         **attn_kwargs: Any,
     ) -> torch.Tensor | MiniMaxM3CausalLMOutput:
         """Map ids/positions/padding[B,S] and mask[B,S] or [B,1,S,S] to logits[B,S,V] or MTP logits; MSA uses BSHD."""
-        use_msa = bool(self.model._msa_layer_ids)
-        if use_msa:
-            _reject_unsupported_msa_runtime(attn_kwargs)
         if attn_kwargs.get("qkv_format") == "thd":
             input_ids, position_ids, padding_mask, attn_kwargs = squeeze_input_for_thd(
                 input_ids, position_ids, padding_mask, attn_kwargs
@@ -572,6 +524,12 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
                 self.backend,
                 dtype=get_dtype(getattr(text_config, "torch_dtype", "bfloat16"), torch.bfloat16),
             )
+
+    @property
+    def consumes_packed_seq_ids(self) -> bool:
+        """Whether the packed loader should hand this model ``_packed_seq_ids`` (the compact document map)
+        for every pack, single-document ones included, instead of a ``[batch, 1, sequence, sequence]`` mask."""
+        return self.model.uses_msa
 
     @property
     def language_model(self):

@@ -25,16 +25,20 @@ import torch
 from torch.utils.checkpoint import checkpoint
 
 from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.minimax_m3_vl import _msa as msa
+from nemo_automodel.components.models.minimax_m3_vl import msa, msa_bindings
 from nemo_automodel.components.models.minimax_m3_vl.config import MiniMaxM3VLTextConfig
-from nemo_automodel.components.models.minimax_m3_vl.layers import MiniMaxM3Attention, MiniMaxM3Indexer
+from nemo_automodel.components.models.minimax_m3_vl.layers import (
+    MiniMaxM3Attention,
+    MiniMaxM3Indexer,
+    MiniMaxM3MSAAttention,
+)
 from nemo_automodel.components.models.minimax_m3_vl.model import MiniMaxM3SparseForCausalLM
-from nemo_automodel.components.models.minimax_m3_vl.msa_attn import MiniMaxM3MSAAttention
 from nemo_automodel.shared.import_utils import UnavailableError
 from tests.unit_tests.models.minimax_m3_vl._msa_select_reference import select_blocks_reference_for
 
 _BLOCK, _HEADS, _KV_HEADS, _DIM, _TOPK = 128, 64, 4, 128, 16
 _SCALE = _DIM**-0.5
+_FORCED = (0, 1)  # (init_blocks, local_blocks) of _config's indexer
 _PP_WORKER = __name__ == "__main__" and "--pp-worker" in sys.argv
 
 
@@ -42,8 +46,7 @@ def _unavailable() -> str | None:
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0):
         return "requires an SM100 GPU"
     try:
-        msa._require_msa()
-        msa._require_msa_backward()
+        msa_bindings.kernels()
     except UnavailableError:
         return "requires uv sync --extra msa"
     return None
@@ -136,19 +139,19 @@ def _reference(
 
 
 def _check_flat_attention(
-    layout: msa._MSAPackedLayout,
+    microbatch: msa.MSAMicrobatch,
     support: torch.Tensor,
     lengths: tuple[int, ...],
     rows: torch.Tensor,
 ) -> None:
-    """Check compact O/dQ/dK/dV for layout, support[4,tokens,16] and selected query rows[selected]."""
+    """Check compact O/dQ/dK/dV for microbatch, support[4,tokens,16] and selected query rows[selected]."""
     device = support.device
     generator = torch.Generator(device=device).manual_seed(20260902)
     qkv = [
         torch.randn(sum(lengths), h, _DIM, device=device, dtype=torch.bfloat16, generator=generator, requires_grad=True)
         for h in (_HEADS, _KV_HEADS, _KV_HEADS)
     ]
-    out = msa._MSAFlatAttention(_SCALE)(*qkv, support, layout=layout)
+    out = msa.sparse_attention(*qkv, support, microbatch)
     selected_grad = torch.randn(rows.numel(), _HEADS, _DIM, device=device, dtype=torch.bfloat16, generator=generator)
     out.backward(torch.zeros_like(out).index_copy(0, rows, selected_grad))
     reference_qkv = [tensor.detach().float().requires_grad_() for tensor in qkv]
@@ -174,15 +177,15 @@ def test_packed_forward_backward_parity() -> None:
         blocks = torch.arange(_TOPK, device=device)[None, :]
         support_rows.append(torch.where(blocks <= current, blocks, -1))
     support = torch.cat(support_rows).expand(_KV_HEADS, -1, -1).to(torch.int32).contiguous()
-    _check_flat_attention(
-        msa._MSAPackedLayout.build(documents), support, lengths, torch.arange(sum(lengths), device=device)
-    )
+    microbatch = msa.MSAMicrobatch.from_document_map(documents, forced_blocks=_FORCED)
+    _check_flat_attention(microbatch, support, lengths, torch.arange(sum(lengths), device=device))
 
 
 def test_top16_truncation_large_schedule_parity() -> None:
     device = torch.device("cuda", torch.cuda.current_device())
     tokens = 17 * _BLOCK + 1
-    layout = msa._MSAPackedLayout.build(torch.ones(1, tokens, dtype=torch.int64, device=device))
+    documents = torch.ones(1, tokens, dtype=torch.int64, device=device)
+    microbatch = msa.MSAMicrobatch.from_document_map(documents, forced_blocks=_FORCED)
     config = _config()
     with device:
         indexer = MiniMaxM3Indexer(config, config.sparse_attention_config, _backend())
@@ -195,10 +198,10 @@ def test_top16_truncation_large_schedule_parity() -> None:
     )
     index_k = torch.zeros(tokens, 1, _DIM, dtype=torch.bfloat16, device=device)
     index_k[:, 0, 0] = scores.repeat_interleave(_BLOCK)[:tokens]
-    support = select_blocks_reference_for(indexer, layout, index_q, index_k)
+    support = select_blocks_reference_for(indexer, microbatch, index_q, index_k)
     final = support[0, -1]
     assert set(final.tolist()) == set(range(18)) - {0, 2}
-    _check_flat_attention(layout, support, (tokens,), torch.arange(tokens - 8, tokens, device=device))
+    _check_flat_attention(microbatch, support, (tokens,), torch.arange(tokens - 8, tokens, device=device))
 
 
 def test_checkpointed_layer_projection_gradient_parity() -> None:
@@ -206,13 +209,13 @@ def test_checkpointed_layer_projection_gradient_parity() -> None:
     config = _config()
     torch.manual_seed(20260903)
     with device:
-        actual_layer = MiniMaxM3MSAAttention(config, _backend(), is_sparse_attention_layer=True)
+        actual_layer = MiniMaxM3MSAAttention(config, _backend())
         reference_layer = MiniMaxM3Attention(config, _backend("generic"), is_sparse_attention_layer=True)
     reference_layer.load_state_dict(actual_layer.state_dict())
     documents = torch.ones(2, 16, dtype=torch.int64, device=device)
     documents[0, -1] = 0
     keep = documents > 0
-    layout = msa._MSAPackedLayout.build(documents)
+    microbatch = msa.MSAMicrobatch.from_document_map(documents, forced_blocks=_FORCED)
     positions = torch.arange(16, device=device).view(1, -1, 1)
     inv_freq = 10_000 ** (-torch.arange(0, 64, 2, dtype=torch.float32, device=device) / 64)
     angles = positions * inv_freq
@@ -223,7 +226,7 @@ def test_checkpointed_layer_projection_gradient_parity() -> None:
 
     def recompute(hidden: torch.Tensor) -> torch.Tensor:
         """Map BF16 hidden[batch,sequence,hidden] to attention output with the same shape."""
-        return actual_layer(hidden, freqs_cis=frequencies, _msa_layout=layout)
+        return actual_layer(hidden, freqs_cis=frequencies, msa=microbatch)
 
     actual = checkpoint(recompute, actual_x, use_reentrant=False)
     expected = reference_layer(reference_x, freqs_cis=frequencies, attention_mask=keep)
@@ -231,8 +234,8 @@ def test_checkpointed_layer_projection_gradient_parity() -> None:
     expected.backward(upstream)
     assert torch.count_nonzero(actual[~keep]) == 0
     assert torch.count_nonzero(actual_x.grad[~keep]) == torch.count_nonzero(reference_x.grad[~keep]) == 0
-    _assert_error(layout.pack(actual), layout.pack(expected), 0.04, 0.008)
-    _assert_error(layout.pack(actual_x.grad), layout.pack(reference_x.grad), 0.04, 0.012)
+    _assert_error(microbatch.pack(actual), microbatch.pack(expected), 0.04, 0.008)
+    _assert_error(microbatch.pack(actual_x.grad), microbatch.pack(reference_x.grad), 0.04, 0.012)
     actual_parameters = dict(actual_layer.named_parameters())
     expected_parameters = dict(reference_layer.named_parameters())
     for name, tolerance in (
@@ -284,12 +287,10 @@ def _run_pp_worker() -> None:
         generator = torch.Generator().manual_seed(20260907)
         input_ids = torch.randint(1, 64, (2, 8), generator=generator).to(device)
         documents = torch.tensor([[1, 1, 1, 1, 2, 2, 2, 2], [7, 7, 7, 9, 9, 9, 9, 9]], device=device)
-        same_document = documents.unsqueeze(-1) == documents.unsqueeze(-2)
-        mask = (same_document & torch.ones(8, 8, dtype=torch.bool, device=device).tril()).unsqueeze(1)
         upstream = torch.randn(2, 8, 64, generator=generator).to(device=device, dtype=torch.bfloat16)
         losses = [] if pipeline.info.has_last_stage else None
-        actual = pipeline.step(input_ids, target=upstream, losses=losses, attention_mask=mask)
-        expected = reference(input_ids, attention_mask=mask)
+        actual = pipeline.step(input_ids, target=upstream, losses=losses, _packed_seq_ids=documents)
+        expected = reference(input_ids, _packed_seq_ids=documents)
         expected_loss = loss_fn(expected, upstream)
         expected_loss.backward()
         if pipeline.info.has_last_stage:
@@ -335,6 +336,9 @@ def test_full_model_runs_dense_layers_through_a_varlen_backend() -> None:
     model.to_empty(device=device)
     model.initialize_weights(buffer_device=device, dtype=torch.bfloat16)
     model.train()
+    # The from_pretrained path skips initialize_weights, so the scorer warm-up must not live there:
+    # it runs at the first block selection of the process, whichever path built the model.
+    msa._warm_scorer.cache_clear()
 
     lengths = (200, 184)
     sequence = sum(lengths)
@@ -343,11 +347,10 @@ def test_full_model_runs_dense_layers_through_a_varlen_backend() -> None:
     for document, length in enumerate(lengths, start=1):
         documents[0, position : position + length] = document
         position += length
-    same_document = documents.unsqueeze(-1) == documents.unsqueeze(-2)
-    mask = (same_document & torch.ones(sequence, sequence, dtype=torch.bool, device=device).tril()).unsqueeze(1)
-    logits = model(torch.randint(1, 64, (1, sequence), device=device), attention_mask=mask)
+    logits = model(torch.randint(1, 64, (1, sequence), device=device), _packed_seq_ids=documents)
 
     assert logits.shape == (1, sequence, 64) and torch.isfinite(logits).all()
+    assert msa._warm_scorer.cache_info().currsize == 1
     logits.float().pow(2).sum().backward()
     gradients = {name: parameter.grad for name, parameter in model.named_parameters()}
     # MSA selects blocks under no_grad, so the indexer is frozen on this path and nothing else is.

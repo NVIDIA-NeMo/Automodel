@@ -23,14 +23,14 @@ it is sized for tests and not for a real microbatch.
 import torch
 import torch.nn.functional as F
 
-from nemo_automodel.components.models.minimax_m3_vl._msa import _MSAPackedLayout
+from nemo_automodel.components.models.minimax_m3_vl.msa import MSAMicrobatch
 
 _NEGATIVE_INFINITY = float("-inf")
 
 
 @torch.no_grad()
 def block_scores_reference(
-    layout: _MSAPackedLayout,
+    microbatch: MSAMicrobatch,
     index_q: torch.Tensor,
     index_k: torch.Tensor,
     *,
@@ -48,7 +48,7 @@ def block_scores_reference(
     block when ``local_blocks`` is non-zero.
 
     Args:
-        layout: The packed-microbatch layout the tokens came from.
+        microbatch: The packed microbatch the tokens came from.
         index_q: Index queries [tokens, index_heads, index_dim], post norm and RoPE.
         index_k: Shared index key [tokens, 1, index_dim], post norm and RoPE.
         block_size: Keys per block.
@@ -61,10 +61,11 @@ def block_scores_reference(
         coordinates: block ``b`` spans workspace rows ``[b * block_size, (b + 1) * block_size)``.
     """
     num_tokens, index_heads, index_dim = index_q.shape
-    query_positions, document_starts = layout._workspace_positions, layout._query_doc_starts
+    query_positions = microbatch.workspace_positions
+    document_starts = query_positions - microbatch.document_positions
     if index_k.dim() != 3 or index_k.shape[0] != num_tokens or index_k.shape[1] != 1:
         raise ValueError(f"index_k must have shape [{num_tokens}, 1, index_dim], got {tuple(index_k.shape)}")
-    workspace_rows = int(layout._workspace_size)
+    workspace_rows = microbatch.workspace_size
     keys = index_k.new_zeros((workspace_rows, index_dim)).index_copy_(
         0, query_positions, index_k.reshape(num_tokens, index_dim)
     )
@@ -87,7 +88,7 @@ def block_scores_reference(
 
 
 def select_blocks_reference(
-    layout: _MSAPackedLayout,
+    microbatch: MSAMicrobatch,
     index_q: torch.Tensor,
     index_k: torch.Tensor,
     *,
@@ -99,14 +100,14 @@ def select_blocks_reference(
 ) -> torch.Tensor:
     """Keep each query's ``topk_blocks`` highest-ranked blocks, as document-local ids.
 
-    This is the definition ``kernels.msa_forward_select.select_blocks`` is checked against. It ranks
+    This is the definition ``MSAMicrobatch.select_blocks`` is checked against. It ranks
     in workspace block coordinates and subtracts the document's first block at the end, where the
     production rule works in document-local coordinates throughout; the two agreeing is what the
     SM100 comparison tests, and is the one deliberate duplication of this rule. Ties resolve as
     ``torch.topk`` orders them.
 
     Args:
-        layout, index_q, index_k, block_size, init_blocks, local_blocks, score_type: As for
+        microbatch, index_q, index_k, block_size, init_blocks, local_blocks, score_type: As for
             ``block_scores_reference``.
         topk_blocks: Blocks each query keeps.
 
@@ -114,7 +115,7 @@ def select_blocks_reference(
         Document-local block ids [index_heads, tokens, topk_blocks], int32, padded with -1.
     """
     ranked = block_scores_reference(
-        layout,
+        microbatch,
         index_q,
         index_k,
         block_size=block_size,
@@ -125,16 +126,16 @@ def select_blocks_reference(
     if ranked.shape[-1] < topk_blocks:
         ranked = F.pad(ranked, (0, topk_blocks - ranked.shape[-1]), value=_NEGATIVE_INFINITY)
     values, indices = ranked.topk(topk_blocks, dim=-1)
-    first_block = (layout._query_doc_starts // block_size)[None, :, None]
+    first_block = ((microbatch.workspace_positions - microbatch.document_positions) // block_size)[None, :, None]
     return torch.where(values == _NEGATIVE_INFINITY, -1, indices - first_block).to(torch.int32).contiguous()
 
 
 def select_blocks_reference_for(
-    indexer: torch.nn.Module, layout: _MSAPackedLayout, index_q: torch.Tensor, index_k: torch.Tensor
+    indexer: torch.nn.Module, microbatch: MSAMicrobatch, index_q: torch.Tensor, index_k: torch.Tensor
 ) -> torch.Tensor:
     """Run the reference with the five selection values ``indexer`` carries."""
     return select_blocks_reference(
-        layout,
+        microbatch,
         index_q,
         index_k,
         block_size=indexer.block_size,

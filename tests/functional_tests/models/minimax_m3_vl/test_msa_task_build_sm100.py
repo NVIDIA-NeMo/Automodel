@@ -21,11 +21,14 @@ disagrees with the host rule; this pins both, including work counts on either si
 switch.
 """
 
+from typing import Any
+
 import pytest
 import torch
 
-from nemo_automodel.components.models.minimax_m3_vl import _msa as msa
+from nemo_automodel.components.models.minimax_m3_vl import msa, msa_bindings
 from nemo_automodel.components.models.minimax_m3_vl.kernels import msa_schedule as sched
+from nemo_automodel.components.models.minimax_m3_vl.kernels import sm_count
 from nemo_automodel.shared.import_utils import UnavailableError
 
 _BLOCK, _KV_HEADS, _TOPK, _QUERY_HEADS = 128, 4, 16, 64
@@ -35,7 +38,7 @@ def _unavailable() -> str | None:
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0):
         return "requires an SM100 GPU"
     try:
-        msa._require_msa()
+        msa_bindings.kernels()
     except UnavailableError:
         return "requires uv sync --extra msa"
     return None
@@ -48,10 +51,9 @@ if _SKIP_REASON is None:
     # Both modules import cutlass at module scope, which only the msa extra provides. Importing them
     # unconditionally would make this file a collection error on a runner that should skip it.
     from nemo_automodel.components.models.minimax_m3_vl.kernels import msa_task_build_sm100 as tb
-    from nemo_automodel.components.models.minimax_m3_vl.kernels.msa_backward_sm100 import _num_sms
 
 
-def _packed_schedule(lengths: tuple[int, ...]) -> tuple[sched._MSABackwardSchedule, int, int]:
+def _packed_schedule(lengths: tuple[int, ...]) -> tuple[sched.MSABackwardSchedule, int, int]:
     """Build the forward CSR schedule for one packed row of documents; return it with its shapes."""
     device = torch.device("cuda", torch.cuda.current_device())
     num_tokens = sum(lengths)
@@ -60,7 +62,7 @@ def _packed_schedule(lengths: tuple[int, ...]) -> tuple[sched._MSABackwardSchedu
     for document, length in enumerate(lengths, start=1):
         documents[0, position : position + length] = document
         position += length
-    layout = msa._MSAPackedLayout.build(documents)
+    microbatch = msa.MSAMicrobatch.from_document_map(documents, forced_blocks=(0, 1))
     # Fully causal top-k support: every query selects every earlier key block of its own document.
     support_rows = [
         torch.where(
@@ -71,31 +73,31 @@ def _packed_schedule(lengths: tuple[int, ...]) -> tuple[sched._MSABackwardSchedu
         for length in lengths
     ]
     support = torch.cat(support_rows).expand(_KV_HEADS, -1, -1).to(torch.int32).contiguous()
-    workspace_rows = int(layout._workspace_size)
-    row_ptr, q_indices, forward_schedule = msa._require_msa().build_k2q_csr(
+    workspace_rows = microbatch.workspace_size
+    row_ptr, q_indices, forward_schedule = msa_bindings.kernels().build_k2q_csr(
         support,
-        layout.cu_seqlens,
-        layout.cu_seqlens,
+        microbatch.cu_seqlens,
+        microbatch.cu_seqlens,
         _BLOCK,
         total_k=num_tokens,
-        max_seqlen_q=layout.max_seqlen,
-        max_seqlen_k=layout.max_seqlen,
+        max_seqlen_q=microbatch.max_seqlen,
+        max_seqlen_k=microbatch.max_seqlen,
         total_rows=workspace_rows // _BLOCK,
         qhead_per_kv=_QUERY_HEADS // _KV_HEADS,
         return_schedule=True,
     )
-    schedule = sched._MSABackwardSchedule(
+    schedule = sched.MSABackwardSchedule(
         row_ptr=row_ptr,
         q_indices=q_indices,
         scheduler_metadata=forward_schedule.scheduler_metadata,
         work_count=forward_schedule.work_count,
-        cu_seqlens=layout.cu_seqlens,
-        document_workspace_starts=layout._document_workspace_starts,
+        cu_seqlens=microbatch.cu_seqlens,
+        document_workspace_starts=microbatch.document_workspace_starts,
     )
     return schedule, num_tokens, workspace_rows
 
 
-def _reference_tasks(schedule: sched._MSABackwardSchedule) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def _reference_tasks(schedule: sched.MSABackwardSchedule) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """The Torch definition of the task tables, in forward work-item order.
 
     Splits every work item of ``schedule.scheduler_metadata`` at multiples of eight queries and
@@ -104,10 +106,9 @@ def _reference_tasks(schedule: sched._MSABackwardSchedule) -> tuple[torch.Tensor
     ``[num_tasks, 8]`` holding the compact tensor rows / workspace positions of the task's queries,
     padded with -1.
     """
-    sched._check_schedule(schedule)
     device = schedule.row_ptr.device
     work_capacity = schedule.scheduler_metadata.shape[0]
-    chunk = sched._QUERY_CHUNK
+    chunk = sched.QUERY_CHUNK
 
     work_ids = torch.arange(work_capacity, dtype=torch.int32, device=device)
     q_counts = torch.where(work_ids < schedule.work_count[0], schedule.scheduler_metadata[:, 3], 0)
@@ -148,7 +149,7 @@ def _reference_tasks(schedule: sched._MSABackwardSchedule) -> tuple[torch.Tensor
     task_qrows = torch.where(valid_slots, compact_document_starts.view(-1, 1) + query_local, -1)
     task_qpos = torch.where(valid_slots, workspace_document_starts.view(-1, 1) + query_local, -1)
 
-    global_kblocks = torch.div(workspace_document_starts, sched._BLOCK_SIZE, rounding_mode="floor") + task_work[:, 5]
+    global_kblocks = torch.div(workspace_document_starts, sched.BLOCK_SIZE, rounding_mode="floor") + task_work[:, 5]
     task_meta = torch.stack(
         (torch.zeros(num_tasks, dtype=torch.int32, device=device), task_heads, global_kblocks, task_valid), dim=-1
     )
@@ -166,26 +167,33 @@ def _reference_order(
     kblock = task_meta[:, 2].to(torch.int64)
     qmin = task_qrows[:, 0].to(torch.int64)
     num_windows = (num_tokens + window - 1) // window
-    num_kblocks = workspace_rows // sched._BLOCK_SIZE
+    num_kblocks = workspace_rows // sched.BLOCK_SIZE
     key = ((head * num_windows + qmin // window) * num_kblocks + kblock) * window + qmin % window
     order = torch.argsort(key)
     return task_meta.index_select(0, order), task_qrows.index_select(0, order), task_qpos.index_select(0, order)
 
 
-def _check_build(schedule: sched._MSABackwardSchedule, num_tokens: int, workspace_rows: int, num_sms: int) -> int:
+def _build(schedule: sched.MSABackwardSchedule, num_tokens: int, workspace_rows: int, num_sms: int) -> Any:
+    """Run the device build into freshly allocated scratch and table buffers of the required sizes."""
+    scratch_words, table_words = tb.task_build_storage(schedule, num_tokens, workspace_rows)
+    device = schedule.row_ptr.device
+    scratch = torch.empty(scratch_words, dtype=torch.int32, device=device)
+    tables = torch.empty(table_words, dtype=torch.int32, device=device)
+    return tb.build_backward_tasks(
+        schedule, num_tokens, workspace_rows, num_sms=num_sms, scratch=scratch, tables=tables
+    )
+
+
+def _check_build(schedule: sched.MSABackwardSchedule, num_tokens: int, workspace_rows: int, num_sms: int) -> int:
     """Assert the device tables, descriptor and launch bound for one schedule; return the task count."""
     expected = _reference_order(*_reference_tasks(schedule), num_tokens, workspace_rows)
     num_tasks = int(expected[0].shape[0])
-    tables = tb.build_backward_tasks(schedule, num_tokens, workspace_rows, num_sms=num_sms)
+    tables = _build(schedule, num_tokens, workspace_rows, num_sms)
     for actual, reference in zip((tables.task_meta, tables.task_qrows, tables.task_qpos), expected, strict=True):
         assert torch.equal(actual[:num_tasks], reference)
     desc = tables.desc.tolist()
-    rows_per_cta = sched._select_rows_per_cta(num_tasks)
-    assert desc[: tb.DESC_GRID_CTAS + 1] == [
-        num_tasks,
-        rows_per_cta,
-        *sched._chunk_map(num_tasks, rows_per_cta, num_sms),
-    ]
+    walk_rows = sched.rows_per_cta(num_tasks)
+    assert desc[: tb.DESC_GRID_CTAS + 1] == [num_tasks, walk_rows, *sched.chunk_map(num_tasks, walk_rows, num_sms)]
     assert desc[tb.DESC_NUM_TASKS] == num_tasks and desc[tb.DESC_FLAGS] == 0
     assert tables.grid_launch >= desc[tb.DESC_GRID_CTAS]
     return num_tasks
@@ -195,25 +203,25 @@ def _check_build(schedule: sched._MSABackwardSchedule, num_tokens: int, workspac
 @pytest.mark.parametrize("lengths", ((127, 129, 1, 2, 3, 5, 128), (4093,)))
 def test_device_task_tables_match_the_torch_reference(lengths: tuple[int, ...], num_sms: int | None) -> None:
     schedule, num_tokens, workspace_rows = _packed_schedule(lengths)
-    resolved = num_sms or _num_sms(schedule.row_ptr.device)
+    resolved = num_sms or sm_count(schedule.row_ptr.device)
     assert _check_build(schedule, num_tokens, workspace_rows, resolved) > 0
 
 
 def test_truncated_work_counts_keep_the_tables_and_the_walk_exact() -> None:
-    # 4096 tokens put the task count above _ROWS_PER_CTA_SWITCH, so truncating the work count walks
+    # 4096 tokens put the task count above ROWS_PER_CTA_SWITCH, so truncating the work count walks
     # the build through both rows/CTA regimes as well as the over/half/zero edges.
     schedule, num_tokens, workspace_rows = _packed_schedule((4096,))
     device = schedule.row_ptr.device
-    num_sms = _num_sms(device)
+    num_sms = sm_count(device)
     work_count = int(schedule.work_count[0])
     # Padding rows past the count are live storage for the over-count case; zero them so the extra
     # work items contribute no tasks and the comparison stays meaningful.
     metadata = schedule.scheduler_metadata.clone()
     metadata[work_count:] = 0
-    tasks_per_work = (metadata[:work_count, 3] + sched._QUERY_CHUNK - 1) // sched._QUERY_CHUNK
+    tasks_per_work = (metadata[:work_count, 3] + sched.QUERY_CHUNK - 1) // sched.QUERY_CHUNK
     prefix = tasks_per_work.cumsum(0).tolist()
-    assert prefix[-1] > sched._ROWS_PER_CTA_SWITCH, prefix[-1]
-    switch = sched._ROWS_PER_CTA_SWITCH
+    assert prefix[-1] > sched.ROWS_PER_CTA_SWITCH, prefix[-1]
+    switch = sched.ROWS_PER_CTA_SWITCH
     counts = {
         "over_count": int(metadata.shape[0]) + 7,
         "zero_count": 0,
@@ -222,7 +230,7 @@ def test_truncated_work_counts_keep_the_tables_and_the_walk_exact() -> None:
     }
     observed = {}
     for label, count in counts.items():
-        truncated = sched._MSABackwardSchedule(
+        truncated = sched.MSABackwardSchedule(
             row_ptr=schedule.row_ptr,
             q_indices=schedule.q_indices,
             scheduler_metadata=metadata,
@@ -241,6 +249,6 @@ def test_too_many_locality_bins_raise_before_any_launch(monkeypatch: pytest.Monk
     # instead of degrading, and it refuses before compiling or launching anything.
     schedule, num_tokens, workspace_rows = _packed_schedule((128,))
     monkeypatch.setattr(tb, "MAX_BINS", 1)
-    monkeypatch.setattr(tb, "_compile", lambda device: pytest.fail("compiled after rejecting the schedule"))
+    monkeypatch.setattr(tb, "_compile", lambda: pytest.fail("compiled after rejecting the schedule"))
     with pytest.raises(ValueError, match="locality bins"):
-        tb.build_backward_tasks(schedule, num_tokens, workspace_rows, num_sms=8)
+        _build(schedule, num_tokens, workspace_rows, 8)

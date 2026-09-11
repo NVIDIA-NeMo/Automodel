@@ -19,20 +19,30 @@ tile) bucketed by (batch, index_head, key_block), with K/V TMA-resident per
 bucket and Q/dO TMA-loaded per tile (one load warp, 8-row gathers). One mma warp
 issues all five tcgen05 GEMMs transposed (S^T, dP^T, dV, dK, dQ^T) over four
 128-column TMEM allocations; dV/dK accumulate per bucket segment and are flushed
-with fp32 vector atomics, dQ^T per tile with packed 16-bit atomics (fp16 by
-default, ``MSA_M3_DQ_ACCUM=bf16``) into a head-pair-interleaved pool that
+with fp32 vector atomics, dQ^T per tile with packed bf16 atomics into a
+head-pair-interleaved pool that
 ``msa_backward_postprocess_sm100`` casts to the bf16 gradient. The task tables come
-from ``msa_task_build_sm100``.
+from ``msa_task_build_sm100``; ``run_backward`` is the host entry point.
 """
 
 import math
-import os
+from functools import lru_cache
 from typing import Any
 
 import torch
 
-from nemo_automodel.components.models.minimax_m3_vl.kernels import require_cute_dsl, sm_capability
-from nemo_automodel.components.models.minimax_m3_vl.kernels.msa_schedule import _MSABackwardSchedule
+from nemo_automodel.components.models.minimax_m3_vl.kernels import require_cute_dsl, sm_count
+from nemo_automodel.components.models.minimax_m3_vl.kernels.msa_schedule import (
+    BLOCK_SIZE,
+    DQ_ACCUM_DTYPE,
+    HEAD_DIM,
+    NUM_INDEX_HEADS,
+    NUM_KV_HEADS,
+    NUM_Q_HEADS,
+    QUERY_CHUNK,
+    SOFTMAX_SCALE,
+    MSABackwardSchedule,
+)
 
 # Bind the CuTe DSL only after proving it is importable, so a host without the msa extra sees
 # UnavailableError here instead of ModuleNotFoundError from the imports below.
@@ -56,7 +66,7 @@ from nemo_automodel.components.models.minimax_m3_vl.kernels.msa_backward_postpro
     run_grad_finalize,
 )
 from nemo_automodel.components.models.minimax_m3_vl.kernels.msa_backward_preprocess_sm100 import (
-    _run_msa_backward_preprocess,
+    run_preprocess,
 )
 from nemo_automodel.components.models.minimax_m3_vl.kernels.msa_task_build_sm100 import (
     DESC_WORDS,
@@ -64,23 +74,9 @@ from nemo_automodel.components.models.minimax_m3_vl.kernels.msa_task_build_sm100
     task_build_storage,
 )
 
-BLOCK_SIZE = 128
 TILE_M = 128  # keys per tile (= one key block)
 TILE_N = 128  # folded (q_slot, head) rows per tile
-HEAD_DIM = 128
-NUM_Q_HEADS = 64
-NUM_KV_HEADS = 4
-# Packed 16-bit dQ atomics: fp16 has 10 mantissa bits but saturates at 65504, bf16 keeps the FP32 range.
-_DQ_ACCUM = os.environ.get("MSA_M3_DQ_ACCUM", "fp16")
-if _DQ_ACCUM not in ("fp16", "bf16"):
-    raise ValueError(f"MSA_M3_DQ_ACCUM must be 'fp16' or 'bf16', got {_DQ_ACCUM!r}")
-_DQ_ACCUM_TORCH_DTYPE = {"fp16": torch.float16, "bf16": torch.bfloat16}[_DQ_ACCUM]
-_DQ_ACCUM_CUTLASS_DTYPE = {"fp16": cutlass.Float16, "bf16": cutlass.BFloat16}[_DQ_ACCUM]
-NUM_INDEX_HEADS = 4
 MAIN_HEADS_PER_INDEX = NUM_Q_HEADS // NUM_INDEX_HEADS
-QUERY_CHUNK = TILE_N // MAIN_HEADS_PER_INDEX
-
-_COMPILE_CACHE = {}
 
 
 @dsl_user_op
@@ -255,7 +251,7 @@ class _MSABackwardSm100Kernel:
     @cute.jit
     def __call__(
         self,
-        # Head-major views built by _run_msa_backward; T, W, num_tasks are dynamic.
+        # Head-major views built by run_backward; T, W, num_tasks are dynamic.
         mQ: cute.Tensor,  # [1, Hq, T, D] view of [T, Hq, D]
         mK: cute.Tensor,  # [1, Hkv, W, D] view of [W, Hkv, D]
         mV: cute.Tensor,  # [1, Hkv, W, D] view of [W, Hkv, D]
@@ -265,7 +261,7 @@ class _MSABackwardSm100Kernel:
         mTaskMeta: cute.Tensor,  # [num_tasks, 4] int32
         mTaskQRows: cute.Tensor,  # [num_tasks, 8] int32, compact Q/dO/dQ rows
         mTaskQPos: cute.Tensor,  # [num_tasks, 8] int32, aligned causal positions
-        mdQ: cute.Tensor,  # [1, T, Hq/2, D, 2] fp16 head-pair pool: (t, hp, d, e) = dQ[t, 2*hp + e, d]
+        mdQ: cute.Tensor,  # [1, T, Hq/2, D, 2] 16-bit head-pair pool: (t, hp, d, e) = dQ[t, 2*hp + e, d]
         mdK: cute.Tensor,  # [1, Hkv, W, D] fp32 view of [W, Hkv, D]
         mdV: cute.Tensor,  # [1, Hkv, W, D] fp32 view of [W, Hkv, D]
         mDesc: cute.Tensor,  # [8] int32 CTA-walk descriptor (msa_task_build_sm100.DESC_*)
@@ -1692,72 +1688,13 @@ class _MSABackwardSm100Kernel:
             s1.store(cute.where(c1, s1.load(), recv.load()))
 
 
-_NUM_SMS: dict[int, int] = {}
+@lru_cache(maxsize=1)
+def _compile() -> Any:
+    """Compile the backward once per process with dynamic token, workspace, and task counts.
 
-
-def _num_sms(device: torch.device) -> int:
-    device_index = torch.cuda.current_device() if device.index is None else device.index
-    if device_index not in _NUM_SMS:
-        _NUM_SMS[device_index] = torch.cuda.get_device_properties(device_index).multi_processor_count
-    return _NUM_SMS[device_index]
-
-
-def _validate_inputs(
-    q: torch.Tensor,
-    k_aligned: torch.Tensor,
-    v_aligned: torch.Tensor,
-    grad_out: torch.Tensor,
-    lse: torch.Tensor,
-    out: torch.Tensor,
-    softmax_scale: float,
-) -> None:
-    """Check device, dtype, 16-byte alignment, and THD shapes before launch."""
-    names = ("q", "k_aligned", "v_aligned", "grad_out", "lse", "out")
-    tensors = (q, k_aligned, v_aligned, grad_out, lse, out)
-    if q.device.type != "cuda":
-        raise ValueError("MiniMax M3 MSA backward requires CUDA tensors")
-    if any(tensor.device != q.device for tensor in tensors):
-        raise ValueError("all MiniMax M3 MSA backward tensors must be on one CUDA device")
-    if sm_capability(q.device) != (10, 0):
-        raise NotImplementedError("MiniMax M3 MSA backward requires an SM100 CUDA device")
-    misaligned = [name for name, tensor in zip(names, tensors, strict=True) if tensor.data_ptr() % 16 != 0]
-    if misaligned:
-        raise ValueError(
-            "MiniMax M3 MSA backward requires 16-byte-aligned storage for its compiled tensor ABI; "
-            f"misaligned tensors={misaligned}."
-        )
-
-    for name, tensor in zip(names, tensors, strict=True):
-        if name != "lse" and tensor.dtype != torch.bfloat16:
-            raise TypeError(f"{name} must be BF16, got {tensor.dtype}")
-    if lse.dtype != torch.float32:
-        raise TypeError(f"lse must be FP32, got {lse.dtype}")
-
-    if q.ndim != 3 or q.shape[1] != NUM_Q_HEADS or q.shape[2] != HEAD_DIM:
-        raise ValueError(f"q must have shape [T, {NUM_Q_HEADS}, {HEAD_DIM}], got {tuple(q.shape)}")
-    if q.shape[0] <= 0:
-        raise ValueError("q must contain at least one compact token")
-    for name, tensor in (("k_aligned", k_aligned), ("v_aligned", v_aligned)):
-        if tensor.ndim != 3 or tensor.shape[1] != NUM_KV_HEADS or tensor.shape[2] != HEAD_DIM:
-            raise ValueError(f"{name} must have shape [W, {NUM_KV_HEADS}, {HEAD_DIM}], got {tuple(tensor.shape)}")
-    if k_aligned.shape != v_aligned.shape:
-        raise ValueError("k_aligned and v_aligned must have identical shapes")
-    if k_aligned.shape[0] <= 0 or k_aligned.shape[0] % BLOCK_SIZE != 0:
-        raise ValueError(f"aligned K/V workspace length must be a positive multiple of {BLOCK_SIZE}")
-    if grad_out.shape != q.shape or out.shape != q.shape:
-        raise ValueError("grad_out and out must have the same shape as q")
-    if lse.shape != q.shape[:2]:
-        raise ValueError(f"lse must have shape {tuple(q.shape[:2])}, got {tuple(lse.shape)}")
-    if not math.isfinite(softmax_scale) or softmax_scale <= 0.0:
-        raise ValueError(f"softmax_scale must be finite and positive, got {softmax_scale}")
-
-
-def _compile_backward() -> Any:
-    """Compile the backward once with dynamic token, workspace, and task counts.
-
-    The fake tensors describe the head-major views ``_run_msa_backward`` builds;
-    ``stride_order[i]`` is the rank of mode ``i``, ``0`` innermost. Returns an executable
-    taking the kernel's positional arguments minus the trailing stream.
+    The fake tensors describe the head-major views ``run_backward`` builds; ``stride_order[i]`` is the
+    rank of mode ``i``, ``0`` innermost. Returns an executable taking the kernel's positional arguments
+    minus the trailing stream.
     """
     num_tokens = cute.sym_int32(symbol="num_tokens")
     workspace_rows = cute.sym_int32(divisibility=BLOCK_SIZE, symbol="workspace_rows")
@@ -1785,7 +1722,7 @@ def _compile_backward() -> Any:
         tasks(QUERY_CHUNK),
         tasks(QUERY_CHUNK),
         make_fake_compact_tensor(
-            _DQ_ACCUM_CUTLASS_DTYPE,
+            {torch.float16: cutlass.Float16, torch.bfloat16: cutlass.BFloat16}[DQ_ACCUM_DTYPE],
             (1, num_tokens, NUM_Q_HEADS // 2, HEAD_DIM, 2),
             stride_order=(4, 3, 2, 1, 0),
             assumed_align=16,
@@ -1812,239 +1749,102 @@ def _contiguous_stride(shape) -> tuple[int, ...]:
     return tuple(reversed(out))
 
 
-def _alloc_call_buffers(q_c: torch.Tensor, k_c: torch.Tensor, v_c: torch.Tensor, schedule: _MSABackwardSchedule):
-    """One internal allocation per call (freed when the plan dies), carved into: the 16-bit dQ
-    head-pair pool ``[T, Hq/2, D, 2]`` + the FP32 dK/dV pool (cleared by ``zero()``), the FP32
-    ``delta [T, 64]``, and the int32 scratch / tables of the task build. One block of one
-    size per call keeps the caching allocator from splitting and re-growing.
-
-    The first returned tensor is the gradient pool as ``int64`` -- the widest view ``zero()`` can
-    clear it through; every other returned tensor is a typed view of the same allocation."""
-    num_dk, num_dv = k_c.numel(), v_c.numel()
-    dq_bytes = q_c.numel() * _DQ_ACCUM_TORCH_DTYPE.itemsize  # multiple of 256: keeps the FP32 pool 16-byte aligned
-    pool_bytes = dq_bytes + (num_dk + num_dv) * 4
-    delta_off = _round_up(pool_bytes)
-    delta_bytes = q_c.shape[0] * NUM_Q_HEADS * 4
-    scratch_off = _round_up(delta_off + delta_bytes)
-    scratch_words, table_words = task_build_storage(schedule, int(q_c.shape[0]), int(k_c.shape[0]))
-    tables_off = _round_up(scratch_off + scratch_words * 4)
-    total = _round_up(tables_off + table_words * 4)
-    raw = torch.empty(total, dtype=torch.uint8, device=q_c.device)
-    # ``zero()`` clears the pool through a 64-bit view: the byte view fills one element per
-    # thread and runs at 3.8 TB/s, the 64-bit one at 7.3 TB/s (80 MB at s4096: 21.9 us -> 11.4 us).
-    # pool_bytes = T*64*D*itemsize + (num_dk+num_dv)*4 is a multiple of 4096 for every legal shape,
-    # so the view is always exact; assert it rather than silently falling back to a partial clear.
-    assert pool_bytes % 8 == 0, f"grad pool {pool_bytes} bytes is not 8-byte sized"
-    # Carve with one ``as_strided`` per region off a base retyped once, rather than the
-    # ``raw[a:b].view(dtype).view(shape)`` chain this used to be.  The eight regions are the same
-    # eight; the host cost is not.  Measured on this machine: slice 1.13 us, view 0.85, as_strided
-    # 1.09, so the three-op chain is 2.57 us against 1.09 -- and this runs on every backward call,
-    # where the whole wrapper only has ~171 us of host time to give (see the v9r5 ledger).
-    # ``as_strided`` takes an ABSOLUTE storage offset, so this is only correct while ``raw`` starts
-    # at zero; it is a fresh allocation, and the assert keeps it that way.
-    assert raw.storage_offset() == 0, "carve offsets are absolute: raw must own its storage"
-    num_tokens = q_c.shape[0]
-    pool64, pool_dq, pool_f32, pool_i32 = (
-        raw.view(torch.int64),
-        raw.view(_DQ_ACCUM_TORCH_DTYPE),
-        raw.view(torch.float32),
-        raw.view(torch.int32),
-    )
-    grad_off = dq_bytes // 4  # fp32 elements of dQ pool ahead of the dK/dV pool
-    return (
-        pool64.as_strided((pool_bytes // 8,), (1,), 0),
-        pool_dq.as_strided(
-            (num_tokens, NUM_Q_HEADS // 2, HEAD_DIM, 2),
-            (NUM_Q_HEADS * HEAD_DIM, HEAD_DIM * 2, 2, 1),
-            0,
-        ),
-        pool_f32.as_strided((num_dk + num_dv,), (1,), grad_off),
-        pool_f32.as_strided(tuple(k_c.shape), _contiguous_stride(k_c.shape), grad_off),
-        pool_f32.as_strided(tuple(v_c.shape), _contiguous_stride(v_c.shape), grad_off + num_dk),
-        pool_f32.as_strided((num_tokens, NUM_Q_HEADS), (NUM_Q_HEADS, 1), delta_off // 4),
-        pool_i32.as_strided((scratch_words,), (1,), scratch_off // 4),
-        pool_i32.as_strided((table_words,), (1,), tables_off // 4),
-    )
+def _head_major(rows: torch.Tensor) -> torch.Tensor:
+    """View a row-major ``[T, H, ...]`` tensor as the kernel's ``[1, H, T, ...]`` operand without a copy."""
+    return rows.unsqueeze(0).transpose(1, 2)
 
 
-def _run_msa_backward(
+def _operand(tensor: torch.Tensor) -> torch.Tensor:
+    """Return ``tensor`` detached, contiguous and on 16-byte-aligned storage, copying only when it is not."""
+    tensor = tensor.detach().contiguous()
+    return tensor if tensor.data_ptr() % 16 == 0 else tensor.clone()
+
+
+def run_backward(
+    *,
     q: torch.Tensor,
     k_aligned: torch.Tensor,
     v_aligned: torch.Tensor,
     grad_out: torch.Tensor,
     lse: torch.Tensor,
     out: torch.Tensor,
-    schedule: _MSABackwardSchedule,
-    *,
-    softmax_scale: float,
+    schedule: MSABackwardSchedule,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Run the SM100 main-attention backward on THD-contract tensors.
+    """Run the SM100 main-attention backward on THD-contract tensors of one CUDA device.
 
-    ``q``/``grad_out``/``out`` are BF16 ``[T, 64, 128]`` (compact tokens, heads,
-    head_dim), ``lse`` is FP32 ``[T, 64]``, and ``k_aligned``/``v_aligned`` are BF16
-    ``[W, 4, 128]`` with ``W`` a multiple of 128. Every kernel operand must have
-    contiguous, 16-byte-aligned storage. Returns BF16 ``(dq, dk_aligned, dv_aligned)`` in
-    those same layouts, zero outside the support. The kernel's head-major operands are
-    strided views built here, so no transposed copies are made.
+    Args:
+        q: BF16 ``[T, 64, 128]`` compact queries.
+        k_aligned: BF16 ``[W, 4, 128]`` keys in the 128-aligned workspace, ``W`` a positive multiple of 128.
+        v_aligned: BF16 ``[W, 4, 128]`` values in the same workspace.
+        grad_out: BF16 ``[T, 64, 128]`` output gradient.
+        lse: FP32 ``[T, 64]`` forward log-sum-exp.
+        out: BF16 ``[T, 64, 128]`` forward output.
+        schedule: Forward-derived task schedule of this call.
 
-    The Delta preprocess and the pool clear are issued first (they depend only on the
-    inputs) so the GPU is busy while the host issues the task build.
+    Returns:
+        BF16 ``(dq [T, 64, 128], dk_aligned [W, 4, 128], dv_aligned [W, 4, 128])``, zero outside the
+        support. The compiled ABI reads contiguous 16-byte-aligned storage; an operand that is neither is
+        copied once here, and the kernel's head-major operands are strided views, so no transposed copies
+        are made.
     """
-    plan = _plan_msa_backward(
-        q, k_aligned, v_aligned, grad_out, lse, out, schedule, softmax_scale=softmax_scale, build_tasks_now=False
+    q, k, v = _operand(q), _operand(k_aligned), _operand(v_aligned)
+    grad_out, lse, out = _operand(grad_out), _operand(lse), _operand(out)
+    device, num_tokens, workspace_rows = q.device, int(q.shape[0]), int(k.shape[0])
+    exe = _compile()
+    # One internal allocation per call, carved into the 16-bit dQ head-pair pool ``[T, Hq/2, D, 2]`` and
+    # the FP32 dK/dV pool (cleared together), the FP32 ``delta [T, 64]`` and the int32 scratch / tables of
+    # the task build. One block of one size per call keeps the caching allocator from splitting and
+    # re-growing. Each region is one ``as_strided`` off a base retyped once: about half the host cost of
+    # a slice-plus-view chain (1.09 us against 2.57 us here), on a path with ~171 us of host time in
+    # total. The offsets are absolute storage offsets, exact because ``raw`` is a fresh allocation.
+    num_dk, num_dv = k.numel(), v.numel()
+    dq_bytes = q.numel() * DQ_ACCUM_DTYPE.itemsize  # multiple of 256: keeps the FP32 pool 16-byte aligned
+    pool_bytes = dq_bytes + (num_dk + num_dv) * 4
+    delta_off = _round_up(pool_bytes)
+    scratch_off = _round_up(delta_off + num_tokens * NUM_Q_HEADS * 4)
+    scratch_words, table_words = task_build_storage(schedule, num_tokens, workspace_rows)
+    tables_off = _round_up(scratch_off + scratch_words * 4)
+    raw = torch.empty(_round_up(tables_off + table_words * 4), dtype=torch.uint8, device=device)
+    pool_f32, pool_i32 = raw.view(torch.float32), raw.view(torch.int32)
+    grad_off = dq_bytes // 4  # fp32 elements of dQ pool ahead of the dK/dV pool
+    dq_pool = raw.view(DQ_ACCUM_DTYPE).as_strided(
+        (num_tokens, NUM_Q_HEADS // 2, HEAD_DIM, 2), (NUM_Q_HEADS * HEAD_DIM, HEAD_DIM * 2, 2, 1), 0
     )
-    plan.preprocess()
-    plan.zero()
-    plan.build_tasks()
-    plan.launch_main()
-    plan.cast()
-    return plan.outputs()
+    grad_pool = pool_f32.as_strided((num_dk + num_dv,), (1,), grad_off)
+    dk = pool_f32.as_strided(tuple(k.shape), _contiguous_stride(k.shape), grad_off)
+    dv = pool_f32.as_strided(tuple(v.shape), _contiguous_stride(v.shape), grad_off + num_dk)
+    delta = pool_f32.as_strided((num_tokens, NUM_Q_HEADS), (NUM_Q_HEADS, 1), delta_off // 4)
+    scratch = pool_i32.as_strided((scratch_words,), (1,), scratch_off // 4)
+    task_tables = pool_i32.as_strided((table_words,), (1,), tables_off // 4)
+    dq = torch.empty_like(q)
+    grad_bf16 = torch.empty(num_dk + num_dv, dtype=torch.bfloat16, device=device)
 
-
-class _MSABackwardPlan:
-    """One backward call minus its launches: validated inputs, one internal buffer (dQ/dK/dV
-    pools, delta, task scratch and tables) and the main compiled executable. The preprocess,
-    task-build and grad-finalize executables are fetched from their own module-level caches inside
-    ``preprocess``/``build_tasks``/``cast``, so the very first call of a process compiles there.
-    ``zero`` clears the dQ/dK/dV pool through a 64-bit view of it (``pool``).
-    ``zero`` and ``build_tasks`` must both run before ``launch_main``; ``build_tasks``
-    sets ``tables``, whose ``desc`` carries the exact task count and the CTA walk. A schedule
-    without tasks yields zero gradients through the same launches. Methods are bound on access,
-    so the plan holds no reference cycle and its buffers return to the caching allocator as soon
-    as it is dropped."""
-
-    def __init__(
-        self,
-        *,
-        exe,
-        args_before_tasks,
-        args_after_tasks,
-        out_c,
-        grad_out_c,
-        delta,
-        pool,
-        dq_pool,
-        dq_bf16,
-        grad_pool,
-        grad_pool_bf16,
-        num_dk,
-        k_shape,
-        v_shape,
-        schedule,
-        num_tokens,
-        workspace_rows,
-        num_sms,
-        scratch,
-        tables_buf,
-        softmax_scale,
-    ):
-        self._exe = exe
-        self._softmax_scale = float(softmax_scale)
-        self._args_before_tasks = args_before_tasks
-        self._args_after_tasks = args_after_tasks
-        self._out_c, self._grad_out_c, self._delta = out_c, grad_out_c, delta
-        self._pool, self._dq_pool, self._dq_bf16 = pool, dq_pool, dq_bf16
-        self.grad_pool, self._grad_pool_bf16 = grad_pool, grad_pool_bf16
-        self._num_dk, self._k_shape, self._v_shape = num_dk, k_shape, v_shape
-        self._schedule, self._num_tokens, self._workspace_rows, self._num_sms = (
-            schedule,
-            num_tokens,
-            workspace_rows,
-            num_sms,
-        )
-        self._scratch, self._tables_buf = scratch, tables_buf
-        self.tables = None
-
-    def build_tasks(self):
-        self.tables = build_backward_tasks(
-            self._schedule,
-            self._num_tokens,
-            self._workspace_rows,
-            num_sms=self._num_sms,
-            scratch=self._scratch,
-            tables=self._tables_buf,
-        )
-
-    def preprocess(self):
-        _run_msa_backward_preprocess(self._out_c, self._grad_out_c, self._delta)
-
-    def zero(self):
-        self._pool.zero_()
-
-    def launch_main(self):
-        tables = self.tables
-        if tables is None:
-            raise RuntimeError("build_tasks() must run before launch_main()")
-        if tables.grid_launch <= 0:
-            return  # no task can exist: the cleared pools already hold the zero gradients
-        self._exe(
-            *self._args_before_tasks,
+    # Delta and the pool clear depend only on the inputs, so the GPU works on them while the host issues
+    # the task build. The clear runs through a 64-bit view of the pool: 7.3 TB/s against 3.8 TB/s for the
+    # byte view (80 MB at s4096: 21.9 us -> 11.4 us); pool_bytes is a multiple of 4096 for every legal
+    # shape, so the view is exact.
+    run_preprocess(out, grad_out, delta)
+    raw.view(torch.int64).as_strided((pool_bytes // 8,), (1,), 0).zero_()
+    tables = build_backward_tasks(
+        schedule, num_tokens, workspace_rows, num_sms=sm_count(device), scratch=scratch, tables=task_tables
+    )
+    if tables.grid_launch > 0:  # otherwise no task can exist and the cleared pools already hold the zero gradients
+        exe(
+            _head_major(q),
+            _head_major(k),
+            _head_major(v),
+            _head_major(grad_out),
+            _head_major(lse),
+            _head_major(delta),
             tables.task_meta,
             tables.task_qrows,
             tables.task_qpos,
-            *self._args_after_tasks,
+            dq_pool.unsqueeze(0),
+            _head_major(dk),
+            _head_major(dv),
             tables.desc,
             Int32(tables.grid_launch),
-            Float32(self._softmax_scale),
+            Float32(SOFTMAX_SCALE),
         )
-
-    def cast(self):
-        run_grad_finalize(self._dq_pool, self._dq_bf16, self.grad_pool, self._grad_pool_bf16)
-
-    def outputs(self):
-        return (
-            self._dq_bf16,
-            self._grad_pool_bf16[: self._num_dk].view(self._k_shape),
-            self._grad_pool_bf16[self._num_dk :].view(self._v_shape),
-        )
-
-
-def _plan_msa_backward(q, k_aligned, v_aligned, grad_out, lse, out, schedule, *, softmax_scale, build_tasks_now=True):
-    """Build a :class:`_MSABackwardPlan` (validation, one internal buffer, compiled executables);
-    ``build_tasks_now=False`` leaves the task build to the caller."""
-    _validate_inputs(q, k_aligned, v_aligned, grad_out, lse, out, softmax_scale=softmax_scale)
-    q_c, k_c, v_c = q.detach().contiguous(), k_aligned.detach().contiguous(), v_aligned.detach().contiguous()
-    grad_out_c, lse_c, out_c = grad_out.detach().contiguous(), lse.detach().contiguous(), out.detach().contiguous()
-    device = q.device
-    num_sms = _num_sms(device)
-    num_tokens, workspace_rows = int(q_c.shape[0]), int(k_c.shape[0])
-    num_dk = k_c.numel()
-    pool, dq_pool, grad_pool, dk, dv, delta, scratch, tables_buf = _alloc_call_buffers(q_c, k_c, v_c, schedule)
-    dq_bf16 = torch.empty_like(q_c)
-    grad_pool_bf16 = torch.empty_like(grad_pool, dtype=torch.bfloat16)
-    q_v, grad_out_v, k_v, v_v, dk_v, dv_v = (
-        t.unsqueeze(0).transpose(1, 2) for t in (q_c, grad_out_c, k_c, v_c, dk, dv)
-    )
-    dq_v = dq_pool.unsqueeze(0)
-    lse_v = lse_c.unsqueeze(0).transpose(1, 2)
-    delta_v = delta.unsqueeze(0).transpose(1, 2)
-    key = ("minimax-m3-msa-backward-sm100", sm_capability(device), q_c.dtype, _DQ_ACCUM)
-    if key not in _COMPILE_CACHE:
-        _COMPILE_CACHE[key] = _compile_backward()
-    exe = _COMPILE_CACHE[key]
-    plan = _MSABackwardPlan(
-        exe=exe,
-        args_before_tasks=(q_v, k_v, v_v, grad_out_v, lse_v, delta_v),
-        args_after_tasks=(dq_v, dk_v, dv_v),
-        out_c=out_c,
-        grad_out_c=grad_out_c,
-        delta=delta,
-        pool=pool,
-        dq_pool=dq_pool,
-        dq_bf16=dq_bf16,
-        grad_pool=grad_pool,
-        grad_pool_bf16=grad_pool_bf16,
-        num_dk=num_dk,
-        k_shape=k_c.shape,
-        v_shape=v_c.shape,
-        schedule=schedule,
-        num_tokens=num_tokens,
-        workspace_rows=workspace_rows,
-        num_sms=num_sms,
-        scratch=scratch,
-        tables_buf=tables_buf,
-        softmax_scale=softmax_scale,
-    )
-    if build_tasks_now:
-        plan.build_tasks()
-    return plan
+    run_grad_finalize(dq_pool, dq, grad_pool, grad_bf16)
+    return dq, grad_bf16[:num_dk].view(k.shape), grad_bf16[num_dk:].view(v.shape)
