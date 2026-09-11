@@ -52,7 +52,7 @@ class _IdentityGather:
         return x
 
 
-def _run_blockdiag_cp(Q, K, V, doc_ids, world, enable_gqa=False):
+def _run_blockdiag_cp(Q, K, V, doc_ids, world, enable_gqa=False, window_size=None):
     """Simulate ``world`` CP ranks in-process; returns the concatenated local outputs.
 
     Args:
@@ -62,6 +62,7 @@ def _run_blockdiag_cp(Q, K, V, doc_ids, world, enable_gqa=False):
         doc_ids: Per-position document ids ``[B, S]`` (0 == padding).
         world: Number of simulated CP ranks.
         enable_gqa: Forwarded to the SDPA under test.
+        window_size: Optional sliding-attention window.
 
     Returns:
         Concatenated per-rank outputs ``[B, Hq, S, D]``.
@@ -83,7 +84,15 @@ def _run_blockdiag_cp(Q, K, V, doc_ids, world, enable_gqa=False):
             token = bd_state._CP_BLOCKDIAG_STATE.set(state)
             try:
                 q_local = Q[:, :, r * L : (r + 1) * L, :]
-                outs.append(bd_runtime.cp_blockdiag_sdpa(q_local, K, V, enable_gqa=enable_gqa))
+                outs.append(
+                    bd_runtime.cp_blockdiag_sdpa(
+                        q_local,
+                        K,
+                        V,
+                        enable_gqa=enable_gqa,
+                        window_size=window_size,
+                    )
+                )
             finally:
                 bd_state._CP_BLOCKDIAG_STATE.reset(token)
     finally:
@@ -169,6 +178,29 @@ def test_blockdiag_mask_expected_matrix():
     assert torch.equal(got, expected)
 
 
+def test_blockdiag_mask_applies_sliding_window_within_each_document():
+    doc_ids = _doc_ids()
+    got = bd_kernels._cp_blockdiag_mask(doc_ids, 0, 8, 8, 1, window_size=(1, 0))
+    expected = torch.eye(8, dtype=torch.bool)
+    expected[1, 0] = True
+    expected[2, 1] = True
+    expected[4, 3] = True
+    expected[5, 4] = True
+
+    assert torch.equal(got, expected.view(1, 1, 8, 8))
+
+
+def test_blockdiag_doc_ids_expand_thd_lengths_and_preserve_padding():
+    batch = {
+        "seq_lens": torch.tensor([[3, 2, -1000]]),
+        "seq_lens_padded": torch.tensor([[4, 2, -1000]]),
+    }
+
+    got = bd_batch._cp_blockdiag_doc_ids(batch, seq_len=8, device=torch.device("cpu"), batch_size=1)
+
+    assert torch.equal(got, torch.tensor([[1, 1, 1, 0, 2, 2, 0, 0]]))
+
+
 @pytest.mark.parametrize("world", [2, 4])
 def test_blockdiag_sdpa_parity_vs_full_attention(world):
     """cp=world block-diagonal attention == cp=1 full attention on identical inputs."""
@@ -203,6 +235,23 @@ def test_blockdiag_sdpa_parity_gqa(world):
     assert cp_out.shape == full_out.shape == (B, Hq, S, D)
     max_diff = (cp_out - full_out).abs().max().item()
     assert max_diff < 1e-5, f"GQA world={world} CP-vs-full SDPA max_diff={max_diff}"
+
+
+@pytest.mark.parametrize("world", [2, 4])
+def test_blockdiag_sdpa_sliding_window_parity(world):
+    torch.manual_seed(2)
+    B, H, S, D = 1, 4, 8, 16
+    query = torch.randn(B, H, S, D, dtype=torch.float32)
+    key = torch.randn(B, H, S, D, dtype=torch.float32)
+    value = torch.randn(B, H, S, D, dtype=torch.float32)
+    doc_ids = _doc_ids()
+    window_size = (1, 0)
+
+    cp_out = _run_blockdiag_cp(query, key, value, doc_ids, world=world, window_size=window_size)
+    mask = bd_kernels._cp_blockdiag_mask(doc_ids, 0, S, S, B, window_size=window_size)
+    reference = bd_runtime._ORIGINAL_SDPA(query, key, value, attn_mask=mask, is_causal=False)
+
+    torch.testing.assert_close(cp_out, reference, atol=1e-6, rtol=1e-6)
 
 
 def test_blockdiag_sdpa_noop_without_state():
