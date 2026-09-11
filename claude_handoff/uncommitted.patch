@@ -1,0 +1,356 @@
+diff --git a/examples/vlm_finetune/qwen3_5_moe/RUNBOOK_v4_88k.md b/examples/vlm_finetune/qwen3_5_moe/RUNBOOK_v4_88k.md
+index 155ab0126..89bf59922 100644
+--- a/examples/vlm_finetune/qwen3_5_moe/RUNBOOK_v4_88k.md
++++ b/examples/vlm_finetune/qwen3_5_moe/RUNBOOK_v4_88k.md
+@@ -45,6 +45,7 @@ Each was verified against the source and each fails **silently** if reverted.
+ | Enable packing while keeping `attn: te` | `supports_sequence_packing` *accepts* `te`, and `supports_cp_with_sequence_packing` short-circuits to `True` at `cp_size <= 1` — but the model declares `_packed_cp_attn_backends = ("sdpa",)` and `supports_thd: False`. TE has no route to the 4-D block-causal mask, so attention would bleed across document boundaries with no error. |
+ | Run without `flash-linear-attention` | The GatedDeltaNet layers fall back to a pure-PyTorch reference path behind a bare `except ImportError`, **with no warning** (`qwen3_5_moe/cp_linear_attn.py:126-142`). That silently degrades 30 of 40 layers. |
+ | Use `experts: gmm`/`te` without a DeepEP-family dispatcher | `BackendConfig.__post_init__` silently rewrites the pair to `(torch_mm, torch)`. |
++| Narrow `_resolve_markers` to the thinking-enabled suffix only | Final turns render `<think>\n\n</think>\n\n`, which never contains the `<think>\n` token pair, so the trim silently stops firing and the empty think block goes back into the loss. See rung 2. |
+ 
+ ---
+ 
+@@ -83,6 +84,11 @@ uv sync --locked --all-groups --extra moe --extra vlm --extra vlm-media
+ #      + deep_ep                        <- NOT in the `all` extra
+ ```
+ 
++If you drop `--all-groups` (it also pulls the `magi` group, a long MagiAttention source
++build this run does not use), keep `--group dev`: `FusedLinearCrossEntropy` imports
++`cut_cross_entropy`, which is only in the `dev` group. Without it the run fails with an
++`ImportError` at loss construction, after the model has already loaded.
++
+ Pre-stage the weights so eight ranks do not race the same download:
+ 
+ ```bash
+@@ -117,9 +123,19 @@ token counts should look like the final-turn distribution: **p50 ≈ 163, p90 
+ max ≈ 1,801**. If they instead look like thousands of tokens per row, the wrapper is not
+ taking effect.
+ 
+-The script prints the derived generation-prompt suffix. Expect `'<think>\n'` (ids
+-`[248068, 198]`) or, with thinking disabled, `'<think>\n\n</think>\n\n'` (ids
+-`[248068, 271, 248069, 271]`).
++The script prints both derived generation-prompt suffixes: `'<think>\n\n</think>\n\n'`
++(thinking disabled, ids `[248068, 271, 248069, 271]`) and `'<think>\n'` (thinking
++enabled, ids `[248068, 198]`).
++
++> **Masking decision (2026-09-11): the empty think block is masked.** The current
++> corpus has no `reasoning_content`, so the chat template renders every final
++> assistant turn as `<think>\n\n</think>\n\n` + content. `\n\n` is a single token
++> (271), so the thinking-enabled `<think>\n` suffix never matches; the first
++> version of the wrapper looked only for that one, trimmed nothing, and left the
++> whole block in the loss (rung 2 failed 8/8). The wrapper now strips whichever
++> known suffix the final span starts with, longest first. On this corpus that is
++> the full empty block, so **only the content is supervised and the model is
++> trained for `enable_thinking=False` inference.** Serve it with thinking disabled.
+ 
+ ### Rung 3 — pre-filter (CPU, ~10 min)
+ 
+@@ -161,10 +177,16 @@ plumbing against this driver/torch stack without touching 70 GB of weights.
+ automodel examples/vlm_finetune/qwen3_5_moe/qwen3_6_35b_v4_88k_ep8.yaml \
+   --nproc-per-node 8 \
+   --step_scheduler.max_steps 5 \
++  --lr_scheduler.lr_warmup_steps 1 \
+   --checkpoint.enabled false \
+   2>&1 | tee smoke.log
+ ```
+ 
++The warmup override is required for any run shorter than the recipe's 50 warmup steps:
++`lr_decay_steps` defaults to the total step count, and `OptimizerParamScheduler` asserts
++`lr_warmup_steps < lr_decay_steps` (`components/optim/scheduler.py:100`), so
++`max_steps 5` alone fails at setup, after the model has already loaded.
++
+ Check **all** of:
+ 
+ | Check | Expected |
+@@ -228,8 +250,27 @@ In this order, re-running rung 6 after each:
+ 3. `--distributed.moe.reshard_after_forward true`.
+ 4. `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` (should already be set).
+ 
+-Predicted steady state ≈ 80 GiB/GPU: ~52 GiB fixed (params 8.8 + grads 8.7 + AdamW
+-fp32 moments 34.6) plus activations. H200 has 141 GiB.
++Predicted fixed memory per GPU on 8 GPUs: params 8.8 + grads 8.7 + optimizer moments
++≈ 8.7 GiB with `torchao.optim.AdamW8bit` (1 byte per moment per param; torch AdamW on
++the bf16 params would keep bf16 moments, ≈ 17.4 GiB), plus activations. H200 has 141 GiB.
++On 2 GPUs (EP2) multiply the fixed part by 4.
++
++**Blackwell (B200/B300, SM 10.x): keep `attn: te`, but TE's fused attention needs
++TE >= 2.18 and cuDNN >= 9.23.** cuDNN fused-attention backward for head_dim 256 on
++SM 10.x arrived in TE 2.18 (TE PR #3056) and needs cuDNN 9.23 for BSHD. Without it TE
++silently selects `UnfusedDotProductAttention`, which materializes `[heads, seq, seq]`
++scores: ~45 GiB for a ~39k-token row, ~259 GiB at 32k in isolation.
++
++- Install TE 2.18.0 (build `transformer-engine-torch` with `NVTE_WITH_NCCL_EP=0`: its
++  NCCL-EP code includes a header that torch 2.10 lacks) and `nvidia-cudnn-cu13>=9.23`.
++  Both are outside `uv.lock`, so an exact `uv sync` reverts them.
++- Point TE at the pip cuDNN: `export CUDNN_HOME=<venv>/lib/python3.12/site-packages/nvidia/cudnn`.
++  TE prefers a "system" cuDNN and otherwise dlopens `libcudnn.so`, which on the NGC-style
++  base image is an apt cuDNN 9.8. Also put the venv's `nvidia/cudnn/lib` and
++  `nvidia/nccl/lib` first on `LD_LIBRARY_PATH`.
++- Confirm with `NVTE_DEBUG=1 NVTE_DEBUG_LEVEL=2`: expect `Selected backend = FusedAttention`.
++  Measured on B300 at 32k tokens (16/2 heads, d=256, fwd+bwd): TE fused 26.6 ms / 2.6 GiB,
++  vs. PyTorch SDPA flash 93.5 ms / 2.6 GiB.
+ 
+ ---
+ 
+@@ -252,8 +293,12 @@ fp32 moments 34.6) plus activations. H200 has 141 GiB.
+ - **Dataset revision.** The corpus is migrating to a format where the `THOUGHT:` prose
+   moves into `reasoning_content` and only the action stays in `content`. Measured
+   impact: sequences ~3% shorter, keep-rate at 40,960 goes 99.73% → 99.82%, and the
+-  masking design is unaffected (the wrapper derives the generation-prompt prefix from
+-  the tokenizer, so it adapts automatically). Re-run rungs 2 and 3 when it lands.
++  masking design is unaffected (the wrapper derives the generation-prompt prefixes from
++  the tokenizer, so it adapts automatically). Note the semantics change, though: final
++  turns will render `<think>\n` + reasoning, so only `<think>\n` is masked and the
++  reasoning becomes supervised — the model is then trained for thinking-enabled
++  inference instead of thinking-disabled (see the rung 2 decision note). Re-run rungs 2
++  and 3 when it lands.
+ 
+ ---
+ 
+diff --git a/examples/vlm_finetune/qwen3_5_moe/check_masking_v4_88k.py b/examples/vlm_finetune/qwen3_5_moe/check_masking_v4_88k.py
+index 3cd2be823..26e2ebe57 100644
+--- a/examples/vlm_finetune/qwen3_5_moe/check_masking_v4_88k.py
++++ b/examples/vlm_finetune/qwen3_5_moe/check_masking_v4_88k.py
+@@ -83,8 +83,9 @@ def main() -> None:
+     processor = AutoProcessor.from_pretrained(args.model, padding_side="right")
+     tokenizer = getattr(processor, "tokenizer", processor)
+ 
+-    _, suffix = adapter._resolve_markers(tokenizer)
+-    print(f"generation-prompt suffix after the assistant marker: {tokenizer.decode(suffix)!r} ids={suffix}")
++    _, suffixes = adapter._resolve_markers(tokenizer)
++    for suffix in suffixes:
++        print(f"generation-prompt suffix after the assistant marker: {tokenizer.decode(suffix)!r} ids={suffix}")
+ 
+     dataset = load_dataset(args.dataset, split=args.split).shuffle(seed=0).select(range(args.n))
+ 
+@@ -118,12 +119,15 @@ def main() -> None:
+             expected = (messages[-1]["content"] or "").strip()
+             if not decoded.replace("<|im_end|>", "").strip().endswith(expected[-120:]):
+                 status = "FAIL supervised span does not match the final assistant message"
+-            elif suffix and start + 1 >= len(suffix):
++            elif suffixes:
+                 # Labels are shifted against input_ids by default_collate_fn, so the
+                 # supervised span starting at label position `start` begins at token
+-                # `start + 1`; the generation-prompt suffix sits immediately before it.
+-                prefix = wrapped["input_ids"][0, start + 1 - len(suffix) : start + 1].tolist()
+-                if prefix != suffix:
++                # `start + 1`; a generation-prompt suffix sits immediately before it.
++                # Untrimmed, the tokens before the span end in "assistant\n", which
++                # matches neither suffix.
++                token_start = start + 1
++                preceding = wrapped["input_ids"][0, :token_start].tolist()
++                if not any(len(s) <= token_start and preceding[-len(s) :] == s for s in suffixes):
+                     status = "FAIL generation-prompt prefix was not excluded from the loss"
+ 
+         if status != "ok":
+diff --git a/examples/vlm_finetune/qwen3_5_moe/qwen3_6_35b_v4_88k_ep8.yaml b/examples/vlm_finetune/qwen3_5_moe/qwen3_6_35b_v4_88k_ep8.yaml
+index b1a3029b6..6d6f5ddb9 100644
+--- a/examples/vlm_finetune/qwen3_5_moe/qwen3_6_35b_v4_88k_ep8.yaml
++++ b/examples/vlm_finetune/qwen3_5_moe/qwen3_6_35b_v4_88k_ep8.yaml
+@@ -185,7 +185,11 @@ validation_dataloader:
+     _target_: examples/vlm_finetune/qwen3_5_moe/v4_88k.py:last_turn_collate_fn
+ 
+ optimizer:
+-  _target_: torch.optim.AdamW
++  # torchao 8-bit AdamW: block-wise (256-element) quantized exp_avg / exp_avg_sq,
++  # ~1 byte per moment per param instead of 2 (the model params are bf16, so
++  # torch.optim.AdamW would keep bf16 moments). Built through the factory path;
++  # works on FSDP2/EP DTensor params and round-trips through DCP save/load.
++  _target_: torchao.optim.AdamW8bit
+   lr: 1.0e-5
+   betas: [0.9, 0.95]
+   eps: 1.0e-8
+diff --git a/examples/vlm_finetune/qwen3_5_moe/v4_88k.py b/examples/vlm_finetune/qwen3_5_moe/v4_88k.py
+index 0e4a9d89a..fc9758f84 100644
+--- a/examples/vlm_finetune/qwen3_5_moe/v4_88k.py
++++ b/examples/vlm_finetune/qwen3_5_moe/v4_88k.py
+@@ -96,24 +96,32 @@ def make_v4_88k_dataset(
+     return dataset.map(_to_conversation, remove_columns=dataset.column_names)
+ 
+ 
+-def _resolve_markers(tokenizer) -> tuple[list[int], list[int]]:
+-    """Return the assistant-turn marker and the generation-prompt suffix that follows it.
+-
+-    The suffix is whatever the chat template emits after ``<|im_start|>assistant\\n``
+-    when asked for a generation prompt -- ``<think>\\n`` for Qwen3.6, or
+-    ``<think>\\n\\n</think>\\n\\n`` when thinking is disabled. Those tokens are supplied
+-    by the prompt at inference, so training on them teaches the model to re-emit a tag
+-    it was already given.
+-
+-    Deriving this from the tokenizer keeps the same code correct for both the current
+-    corpus (no reasoning content) and the revision that moves THOUGHT into
+-    ``reasoning_content``.
++def _resolve_markers(tokenizer) -> tuple[list[int], list[list[int]]]:
++    """Return the assistant-turn marker and the generation-prompt suffixes that can follow it.
++
++    A suffix is whatever the chat template emits after ``<|im_start|>assistant\\n``
++    when asked for a generation prompt -- ``<think>\\n`` for Qwen3.6 with thinking
++    enabled, ``<think>\\n\\n</think>\\n\\n`` with thinking disabled. Those tokens are
++    supplied by the prompt at inference, so training on them teaches the model to
++    re-emit a tag it was already given.
++
++    Both variants are returned because a training render can start with either:
++
++    * Current corpus (no ``reasoning_content``): the template renders every final
++      assistant turn with an empty think block, which tokenizes exactly as the
++      thinking-disabled suffix. ``\\n\\n`` is a single token, so the thinking-enabled
++      ``<think>\\n`` never matches it. Masking the whole block supervises the content
++      only, i.e. the model is trained for thinking-disabled inference.
++    * ``reasoning_content`` revision: the final turn renders ``<think>\\n`` followed by
++      the reasoning, which the thinking-enabled suffix matches, so only the opening
++      tag is masked and the reasoning stays supervised.
+ 
+     Args:
+         tokenizer: Tokenizer carrying the chat template.
+ 
+     Returns:
+-        ``(assistant_marker_ids, generation_prompt_suffix_ids)``.
++        ``(assistant_marker_ids, suffixes)`` with ``suffixes`` deduplicated and ordered
++        longest first, so the most specific match wins.
+     """
+     cached = getattr(tokenizer, _MARKER_ATTR, None)
+     if cached is not None:
+@@ -122,21 +130,26 @@ def _resolve_markers(tokenizer) -> tuple[list[int], list[int]]:
+     marker = [tokenizer.convert_tokens_to_ids("<|im_start|>")] + tokenizer.encode(
+         "assistant\n", add_special_tokens=False
+     )
+-    rendered = tokenizer.apply_chat_template(
+-        [{"role": "user", "content": "u"}],
+-        tokenize=True,
+-        return_dict=True,
+-        add_generation_prompt=True,
+-    )
+-    ids = list(rendered["input_ids"])
+-
+-    suffix: list[int] = []
+-    for start in range(len(ids) - len(marker), -1, -1):
+-        if ids[start : start + len(marker)] == marker:
+-            suffix = ids[start + len(marker) :]
+-            break
+ 
+-    markers = (marker, suffix)
++    suffixes: list[list[int]] = []
++    for enable_thinking in (True, False):
++        rendered = tokenizer.apply_chat_template(
++            [{"role": "user", "content": "u"}],
++            tokenize=True,
++            return_dict=True,
++            add_generation_prompt=True,
++            enable_thinking=enable_thinking,
++        )
++        ids = list(rendered["input_ids"])
++        for start in range(len(ids) - len(marker), -1, -1):
++            if ids[start : start + len(marker)] == marker:
++                suffix = ids[start + len(marker) :]
++                if suffix and suffix not in suffixes:
++                    suffixes.append(suffix)
++                break
++    suffixes.sort(key=len, reverse=True)
++
++    markers = (marker, suffixes)
+     try:
+         setattr(tokenizer, _MARKER_ATTR, markers)
+     except AttributeError:
+@@ -209,10 +222,9 @@ def last_turn_collate_fn(
+     keep = _keep_last_supervised_run(labels)
+ 
+     tokenizer = getattr(processor, "tokenizer", processor)
+-    _, suffix = _resolve_markers(tokenizer)
+-    if suffix:
++    _, suffixes = _resolve_markers(tokenizer)
++    if suffixes:
+         input_ids = batch["input_ids"]
+-        suffix_tensor = torch.tensor(suffix, dtype=input_ids.dtype, device=input_ids.device)
+         for row in range(keep.shape[0]):
+             selected = keep[row].nonzero(as_tuple=True)[0]
+             if selected.numel() == 0:
+@@ -223,9 +235,13 @@ def last_turn_collate_fn(
+             # input_ids position p + 1. The label positions to drop are still
+             # [start, start + len(suffix)); the tokens they predict start one later.
+             token_start = start + 1
+-            token_end = token_start + len(suffix)
+-            if token_end <= input_ids.shape[1] and torch.equal(input_ids[row, token_start:token_end], suffix_tensor):
+-                keep[row, start : start + len(suffix)] = False
++            # Longest first: on the current corpus the span opens with the full empty
++            # think block, which only the thinking-disabled suffix covers.
++            for suffix in suffixes:
++                token_end = token_start + len(suffix)
++                if input_ids[row, token_start:token_end].tolist() == suffix:
++                    keep[row, start : start + len(suffix)] = False
++                    break
+ 
+     batch["labels"] = labels.masked_fill(~keep, IGNORE_INDEX)
+     return batch
+diff --git a/nemo_automodel/components/optim/scheduler.py b/nemo_automodel/components/optim/scheduler.py
+index 3031857cb..4338360f2 100644
+--- a/nemo_automodel/components/optim/scheduler.py
++++ b/nemo_automodel/components/optim/scheduler.py
+@@ -8,6 +8,7 @@ import logging
+ import math
+ from typing import Any, TypeVar
+ 
++import torch
+ from torch.optim.optimizer import Optimizer
+ 
+ _T = TypeVar("_T")
+@@ -256,8 +257,14 @@ class OptimizerParamScheduler:
+         self.num_steps += increment
+         new_wd = self.get_wd()
+         for param_group in self.optimizer.param_groups:
+-            new_lr = self.get_lr(param_group)
+-            param_group["lr"] = new_lr * param_group.get("lr_mult", 1.0)
++            new_lr = self.get_lr(param_group) * param_group.get("lr_mult", 1.0)
++            if isinstance(param_group["lr"], torch.Tensor):
++                # Optimizers such as torchao's low-bit AdamW keep lr as a tensor (so a
++                # compiled step does not recompile per lr value) and reject a float
++                # reassignment; update it in place instead.
++                param_group["lr"].fill_(new_lr)
++            else:
++                param_group["lr"] = new_lr
+             param_group["weight_decay"] = new_wd * param_group.get("wd_mult", 1.0)
+ 
+     def state_dict(self) -> dict[str, Any]:
+diff --git a/tests/unit_tests/optim/test_scheduler.py b/tests/unit_tests/optim/test_scheduler.py
+index 5ce5b4be9..e379fbac7 100644
+--- a/tests/unit_tests/optim/test_scheduler.py
++++ b/tests/unit_tests/optim/test_scheduler.py
+@@ -668,6 +668,39 @@ def test_step_method(dummy_optimizer):
+     assert math.isclose(dummy_optimizer.param_groups[0]["weight_decay"], expected_wd_151, rel_tol=1e-6)
+ 
+ 
++def test_step_updates_tensor_lr_in_place():
++    """
++    Tests that a tensor-valued lr (as kept by torchao's low-bit AdamW, which rejects
++    a float reassignment) is updated in place rather than replaced by a float.
++    """
++    model = torch.nn.Linear(10, 1)
++    optimizer = Adam(model.parameters(), lr=torch.tensor(0.001))
++    lr_tensor = optimizer.param_groups[0]["lr"]
++    scheduler = OptimizerParamScheduler(
++        optimizer=optimizer,
++        init_lr=1e-5,
++        max_lr=1e-3,
++        min_lr=1e-6,
++        lr_warmup_steps=100,
++        lr_decay_steps=1000,
++        lr_decay_style="linear",
++        start_wd=0.01,
++        end_wd=0.1,
++        wd_incr_steps=500,
++        wd_incr_style="linear",
++    )
++
++    scheduler.step(increment=50)  # Warmup phase
++    assert optimizer.param_groups[0]["lr"] is lr_tensor
++    assert math.isclose(lr_tensor.item(), 1e-5 + (1e-3 - 1e-5) * 50 / 100, rel_tol=1e-6)
++
++    optimizer.param_groups[0]["lr_mult"] = 2.0
++    scheduler.step(increment=100)  # Decay phase, with the per-group multiplier
++    assert optimizer.param_groups[0]["lr"] is lr_tensor
++    expected_lr_150 = (1e-3 - (1e-3 - 1e-6) * ((150 - 100) / (1000 - 100))) * 2.0
++    assert math.isclose(lr_tensor.item(), expected_lr_150, rel_tol=1e-6)
++
++
+ def test_state_dict(dummy_optimizer):
+     """
+     Tests the `state_dict` method to ensure it returns the correct state.

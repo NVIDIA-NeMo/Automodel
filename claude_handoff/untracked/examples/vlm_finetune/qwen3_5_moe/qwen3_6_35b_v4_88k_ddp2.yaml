@@ -1,0 +1,162 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Pure-DDP variant of qwen3_6_35b_v4_88k_ep8.yaml for one node of 2 x B300 (268 GiB).
+# Same data, masking, loss, optimizer, and schedule; only the parallelism differs.
+#
+# What DDP changes, and why each setting below is what it is:
+#   * strategy: ddp replicates the WHOLE model on every GPU. DDP does not support
+#     expert parallelism (mesh_utils requires ep_size=1 for ddp), so all 256 experts
+#     live on each GPU and FSDP2's HSDP "replicate" route is not available either
+#     (FSDP2 rejects dp_replicate_size == dp_size).
+#   * Memory per GPU before activations: ~70 GB bf16 params + ~70 GB grads
+#     (gradient_as_bucket_view avoids a second copy) + ~70 GB torchao 8-bit AdamW
+#     moments = ~210 GB. That leaves ~55 GB for activations, so this starts at
+#     local_batch_size 1 with activation checkpointing on. Probe the worst case with
+#     --dataset.path_or_dataset data/v4_88k_filtered/longest256.parquet.
+#   * Experts run locally: dispatcher "torch" + experts "torch_mm" (torch._grouped_mm).
+#     The deepep/te pair needs an EP mesh that DDP never builds.
+#   * FSDP2-only keys (multimodal, defer_fsdp_grad_sync, sequence_parallel, moe,
+#     enable_fsdp_optimizations) are dropped: DDPConfig rejects unknown fields.
+#
+# To run:
+#   . /workspace/automodel_env.sh
+#   automodel examples/vlm_finetune/qwen3_5_moe/qwen3_6_35b_v4_88k_ddp2.yaml --nproc-per-node 2
+
+recipe: FinetuneRecipeForVLM
+
+seed: 1234
+
+step_scheduler:
+  # dp_size = 2, so grad_acc = 32 / (1 * 2) = 16 micro-batches per optimizer step.
+  global_batch_size: 32
+  local_batch_size: 1
+  num_epochs: 2
+  ckpt_every_steps: 200
+  val_every_steps: 100
+  log_remote_every_steps: 1
+  save_checkpoint_every_epoch: false
+  validate_on_checkpoint: true
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 120
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen3.6-35B-A3B
+  torch_dtype: torch.bfloat16
+  text_config:
+    # Keep the MTP head so the export matches the base architecture.
+    num_nextn_predict_layers: 1
+    output_hidden_states: true
+    use_cache: false
+  mtp_loss_scaling_factor: 0.1
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    # TE fused attention (needs TE >= 2.18 + cuDNN >= 9.23 on Blackwell; see the runbook).
+    attn: te
+    linear: te
+    rms_norm: torch_fp32
+    rope_fusion: false
+    # Local experts: no expert parallelism under DDP.
+    experts: torch_mm
+    dispatcher: torch
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+
+processor:
+  _target_: transformers.AutoProcessor.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen3.6-35B-A3B
+  padding_side: right
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints/qwen3_6_35b_v4_88k_ddp2/
+  model_save_format: safetensors
+  save_consolidated: final
+  max_recent_checkpoints: 3
+
+distributed:
+  strategy: ddp
+  dp_size: none
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 1
+  activation_checkpointing: true
+  # Make each param's .grad a view into DDP's all-reduce bucket instead of a separate
+  # buffer; with a full replica per GPU that saves ~70 GB.
+  gradient_as_bucket_view: true
+  # All expert weights are one stacked tensor per layer, so every trainable parameter
+  # receives a gradient each step; the frozen vision tower has requires_grad=False.
+  find_unused_parameters: false
+
+freeze_config:
+  freeze_vision_tower: true
+  freeze_audio_tower: true
+  freeze_language_model: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
+
+dataset:
+  _target_: examples/vlm_finetune/qwen3_5_moe/v4_88k.py:make_v4_88k_dataset
+  path_or_dataset: data/v4_88k_filtered/train.parquet
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 4
+  pin_memory: true
+  persistent_workers: true
+  drop_last: true
+  shuffle: true
+  collate_fn:
+    # Supervises only the final assistant turn; no max_length (see the ep8 recipe).
+    _target_: examples/vlm_finetune/qwen3_5_moe/v4_88k.py:last_turn_collate_fn
+
+validation_dataset:
+  _target_: examples/vlm_finetune/qwen3_5_moe/v4_88k.py:make_v4_88k_dataset
+  path_or_dataset: data/v4_88k_filtered/val.parquet
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 2
+  pin_memory: true
+  drop_last: true
+  shuffle: false
+  collate_fn:
+    _target_: examples/vlm_finetune/qwen3_5_moe/v4_88k.py:last_turn_collate_fn
+
+optimizer:
+  # torchao 8-bit AdamW (same as the ep8 recipe); plain tensors under DDP.
+  _target_: torchao.optim.AdamW8bit
+  lr: 1.0e-5
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  weight_decay: 0.1
+
+lr_scheduler:
+  lr_warmup_steps: 50
+  lr_decay_style: cosine
+  max_lr: 1.0e-5
+  min_lr: 1.0e-6
+
+clip_grad_norm:
+  max_norm: 1.0
+
+prewarm:
+  cublas_backward: true
+  fla_gdn_autotune: true
+  comm_groups: true

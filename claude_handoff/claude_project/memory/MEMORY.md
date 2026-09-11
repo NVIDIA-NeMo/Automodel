@@ -1,0 +1,3 @@
+- [RunPod 2xB300 env setup](runpod-b300-env-setup.md) — CUDA 13 via apt, TE 2.18 + cuDNN 9.26 + CUDNN_HOME, never install libnvidia-ml-dev, orphaned-rank kill gotcha, env script
+- [v4_88k SFT status](v4-88k-sft-status.md) — rung results, user decisions, perf numbers, GPU0 hardware fault (blocked 2026-09-11), next steps
+- [User working preferences](user-working-preferences.md) — minimal attention/codebase changes, predefined components, learnability first, ask before numerics changes

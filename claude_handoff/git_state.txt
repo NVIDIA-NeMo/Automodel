@@ -1,0 +1,9 @@
+branch: trungvd-zenai/feat/qwen3-6-v4-88k-sft
+base commit: e7fe7158c336c1561d348d6bd4a107c080042413
+ M examples/vlm_finetune/qwen3_5_moe/RUNBOOK_v4_88k.md
+ M examples/vlm_finetune/qwen3_5_moe/check_masking_v4_88k.py
+ M examples/vlm_finetune/qwen3_5_moe/qwen3_6_35b_v4_88k_ep8.yaml
+ M examples/vlm_finetune/qwen3_5_moe/v4_88k.py
+ M nemo_automodel/components/optim/scheduler.py
+ M tests/unit_tests/optim/test_scheduler.py
+?? examples/vlm_finetune/qwen3_5_moe/qwen3_6_35b_v4_88k_ddp2.yaml
