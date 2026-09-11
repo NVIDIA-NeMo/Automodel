@@ -207,7 +207,7 @@ def _run(args: argparse.Namespace, device: torch.device, rank: int, world: int) 
     backend = BackendConfig(
         attn="tilelang",
         linear="torch",
-        rms_norm="torch_fp32",
+        rms_norm=args.rms_norm,
         experts=args.expert_backend,
         dispatcher="hybridep",
         gate_precision="float32",
@@ -229,6 +229,18 @@ def _run(args: argparse.Namespace, device: torch.device, rank: int, world: int) 
     # changes only residency; no production module or forward is substituted.
     with torch.device("meta"):
         shared = DeepseekV41ForCausalLM(config, backend=backend, tokenizer=tokenizer)
+    norm_classes = {
+        name: f"{type(module).__module__}.{type(module).__qualname__}"
+        for name, module in shared.named_modules()
+        if name.rsplit(".", 1)[-1] in ("attn_norm", "ffn_norm", "q_norm", "kv_norm", "k_norm", "norm")
+    }
+    expected_norm_class = (
+        "transformer_engine.pytorch.module.rmsnorm.RMSNorm"
+        if args.rms_norm == "te"
+        else "nemo_automodel.components.models.deepseek_v41.layers.DeepseekV41RMSNorm"
+    )
+    if not norm_classes or any(name != expected_norm_class for name in norm_classes.values()):
+        raise RuntimeError(f"Requested RMSNorm backend {args.rms_norm} does not match actual modules: {norm_classes}")
     pending = {int(index): block for index, block in shared.model.layers.items()}
     shared.model.layers = nn.ModuleDict()
     shared.to_empty(device=device)
@@ -389,6 +401,8 @@ def _run(args: argparse.Namespace, device: torch.device, rank: int, world: int) 
             "native_dispatcher": "hybridep",
             "expert_backend": args.expert_backend,
             "attention_backend": "tilelang",
+            "rms_norm_backend": args.rms_norm,
+            "rms_norm_module_classes": norm_classes,
             "shared_embedding_norm_head": "replicated",
             "block_fsdp": True,
             "native_global_valid_batch": 1,
@@ -448,6 +462,7 @@ def main() -> int:
     parser.add_argument("--sequence-length", type=int, default=4096)
     parser.add_argument("--metric-chunk-size", type=int, default=32)
     parser.add_argument("--expert-backend", choices=("torch_mm",), default="torch_mm")
+    parser.add_argument("--rms-norm", choices=("torch_fp32", "te"), default="torch_fp32")
     args = parser.parse_args()
     rank, world = int(os.environ.get("RANK", "0")), int(os.environ.get("WORLD_SIZE", "1"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))

@@ -27,12 +27,13 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, replace
+from functools import partial
 
 import torch
 from torch import nn
 from torch.nn import functional as F
 
-from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.common import BackendConfig, initialize_rms_norm_module
 from nemo_automodel.components.models.deepseek_v4.layers import DeepseekV4FP32Parameter, DeepseekV4GroupedLinear
 from nemo_automodel.components.models.deepseek_v4.optimized_kernels import dsv4_sparse_attention
 from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41TextConfig
@@ -167,11 +168,18 @@ class _CompressorLinear(nn.Linear):
 class _Compressor(nn.Module):
     """Non-overlapping channelwise softmax pooling; ratio one is a projection."""
 
-    def __init__(self, config: DeepseekV41TextConfig, *, ratio: int, dtype: torch.dtype) -> None:
+    def __init__(
+        self, config: DeepseekV41TextConfig, *, ratio: int, dtype: torch.dtype, rms_norm: str = "torch_fp32"
+    ) -> None:
         super().__init__()
         self.ratio = ratio
         self.wkv = _CompressorLinear(config.hidden_size, config.head_dim, bias=False, dtype=torch.float32)
-        self.norm = DeepseekV41RMSNorm(config.head_dim, eps=config.rms_norm_eps, dtype=dtype)
+        norm = (
+            partial(initialize_rms_norm_module, "te", device=self.wkv.weight.device)
+            if rms_norm == "te"
+            else DeepseekV41RMSNorm
+        )
+        self.norm = norm(config.head_dim, eps=config.rms_norm_eps, dtype=dtype)
         if ratio > 1:
             self.wgate = nn.Linear(config.hidden_size, config.head_dim, bias=False, dtype=torch.float32)
 
@@ -225,7 +233,9 @@ def _select_candidate_blocks(
 class _Indexer(nn.Module):
     """Frozen released CSA2 indexer with shared keys and hierarchical selection."""
 
-    def __init__(self, config: DeepseekV41TextConfig, *, layer_idx: int, dtype: torch.dtype) -> None:
+    def __init__(
+        self, config: DeepseekV41TextConfig, *, layer_idx: int, dtype: torch.dtype, rms_norm: str = "torch_fp32"
+    ) -> None:
         super().__init__()
         self.owns_keys = layer_idx in config.kv_source_layer_ids
         self.is_candidate_source = layer_idx == config.candidate_source_layer_id
@@ -239,7 +249,12 @@ class _Indexer(nn.Module):
         self.weights_proj = nn.Linear(config.hidden_size, self.num_heads, bias=False, dtype=dtype)
         if self.owns_keys:
             self.wk = nn.Linear(config.head_dim, self.head_dim, bias=False, dtype=dtype)
-            self.k_norm = DeepseekV41RMSNorm(self.head_dim, eps=config.rms_norm_eps, dtype=dtype)
+            norm = (
+                partial(initialize_rms_norm_module, "te", device=self.wk.weight.device)
+                if rms_norm == "te"
+                else DeepseekV41RMSNorm
+            )
+            self.k_norm = norm(self.head_dim, eps=config.rms_norm_eps, dtype=dtype)
         self.requires_grad_(False)
 
     @torch.no_grad()
@@ -325,8 +340,8 @@ class _Indexer(nn.Module):
 class DeepseekV41Attention(nn.Module):
     """Full-sequence CSA2 with local KV, shared compressed KV, and an attention sink.
 
-    The initial training implementation supports eager and SDPA attention with
-    torch linear layers and FP32 RMSNorm. Packed sequences, left padding, KV-cache
+    The training implementation supports eager, SDPA and TileLang attention with
+    torch linear layers and eager FP32 or TE RMSNorm. Packed sequences, left padding, KV-cache
     decoding, and sequence/context/tensor sharding require additional state rules
     and are rejected rather than silently using incorrect compression boundaries.
     """
@@ -337,8 +352,8 @@ class DeepseekV41Attention(nn.Module):
             raise ValueError("DeepSeek V4.1 attention supports backend.attn='eager', 'sdpa', or 'tilelang'")
         if backend.attn == "tilelang" and config.attention_dropout:
             raise ValueError("The TileLang sparse attention backend requires attention_dropout=0")
-        if backend.linear != "torch" or backend.rms_norm != "torch_fp32":
-            raise ValueError("DeepSeek V4.1 attention requires torch linear layers and torch_fp32 RMSNorm")
+        if backend.linear != "torch" or backend.rms_norm not in ("torch_fp32", "te"):
+            raise ValueError("DeepSeek V4.1 attention requires torch linear layers and torch_fp32 or te RMSNorm")
         self.backend = backend
         self.layer_idx = layer_idx
         self.compress_ratio = config.compress_ratios[layer_idx]
@@ -351,10 +366,17 @@ class DeepseekV41Attention(nn.Module):
         self.is_index_source = layer_idx in config.index_source_layer_ids
         dtype = dtype_from_str(config.torch_dtype, torch.bfloat16)
         self.wq_a = nn.Linear(config.hidden_size, config.q_lora_rank, bias=False, dtype=dtype)
-        self.q_norm = DeepseekV41RMSNorm(config.q_lora_rank, eps=config.rms_norm_eps, dtype=dtype)
+        # TE defaults to CUDA when device is omitted, including under a meta
+        # construction context. Use the projection's actual device explicitly.
+        norm = (
+            partial(initialize_rms_norm_module, "te", device=self.wq_a.weight.device)
+            if backend.rms_norm == "te"
+            else DeepseekV41RMSNorm
+        )
+        self.q_norm = norm(config.q_lora_rank, eps=config.rms_norm_eps, dtype=dtype)
         self.wq_b = nn.Linear(config.q_lora_rank, self.num_heads * self.head_dim, bias=False, dtype=dtype)
         self.wkv = nn.Linear(config.hidden_size, self.head_dim, bias=False, dtype=dtype)
-        self.kv_norm = DeepseekV41RMSNorm(self.head_dim, eps=config.rms_norm_eps, dtype=dtype)
+        self.kv_norm = norm(self.head_dim, eps=config.rms_norm_eps, dtype=dtype)
         self.wo_a = DeepseekV4GroupedLinear(
             self.num_heads * self.head_dim // self.num_groups,
             self.num_groups * config.o_lora_rank,
@@ -363,8 +385,16 @@ class DeepseekV41Attention(nn.Module):
         self.wo_b = nn.Linear(self.num_groups * config.o_lora_rank, config.hidden_size, bias=False, dtype=dtype)
         self.sinks_param = DeepseekV4FP32Parameter(torch.zeros(self.num_heads, dtype=torch.float32))
         self.rotary_emb = _RotaryEmbedding(config, compressed=bool(self.compress_ratio))
-        self.compressor = _Compressor(config, ratio=self.compress_ratio, dtype=dtype) if self.is_kv_source else None
-        self.indexer = _Indexer(config, layer_idx=layer_idx, dtype=dtype) if self.is_index_source else None
+        self.compressor = (
+            _Compressor(config, ratio=self.compress_ratio, dtype=dtype, rms_norm=backend.rms_norm)
+            if self.is_kv_source
+            else None
+        )
+        self.indexer = (
+            _Indexer(config, layer_idx=layer_idx, dtype=dtype, rms_norm=backend.rms_norm)
+            if self.is_index_source
+            else None
+        )
 
     @property
     def attn_sink(self) -> nn.Parameter:
@@ -380,8 +410,12 @@ class DeepseekV41Attention(nn.Module):
         for module in self.modules():
             if isinstance(module, nn.Linear):
                 nn.init.normal_(module.weight, mean=0.0, std=init_std)
-            elif isinstance(module, DeepseekV41RMSNorm):
-                nn.init.ones_(module.weight)
+        for norm in (self.q_norm, self.kv_norm):
+            nn.init.ones_(norm.weight)
+        if self.compressor is not None:
+            nn.init.ones_(self.compressor.norm.weight)
+        if self.indexer is not None and self.indexer.owns_keys:
+            nn.init.ones_(self.indexer.k_norm.weight)
         nn.init.zeros_(self.attn_sink)
 
     def _project_output(self, attended: torch.Tensor, angles: torch.Tensor, valid_tokens: torch.Tensor) -> torch.Tensor:

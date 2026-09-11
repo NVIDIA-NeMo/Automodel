@@ -48,6 +48,9 @@ training configuration require separate memory and restoration validation.
 Place all 64 ranks in one verified NVLink domain with static rank ordering.
 The model and recipe use `attn: tilelang`, `linear: torch`,
 `rms_norm: torch_fp32`, `experts: torch_mm`, and `dispatcher: hybridep`.
+Set `model.backend.rms_norm: te` to use Transformer Engine RMSNorm for the
+text backbone, attention projections, compressor, and indexer. This preserves
+parameter names and dtypes; the default retains eager FP32 normalization.
 TileLang and TileKernels are the optional dependencies also used by DeepSeek V4.
 Shared MoE combines routed contributions and the shared-expert output in FP32,
 then casts once at the MoE output. Router correction biases remain fixed during

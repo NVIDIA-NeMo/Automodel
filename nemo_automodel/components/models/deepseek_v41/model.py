@@ -37,6 +37,7 @@ inference-time KV caching, and SWA bounded replay remain out of scope.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 from typing import Any
 
 import torch
@@ -47,7 +48,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from transformers import PreTrainedModel, PreTrainedTokenizerFast
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
+from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module, initialize_rms_norm_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
@@ -111,8 +112,13 @@ class DeepseekV41Block(nn.Module):
             gate_precision=torch.float32,
             hash_routing=False,
         )
-        self.attn_norm = DeepseekV41RMSNorm(config.hidden_size, config.rms_norm_eps, dtype)
-        self.ffn_norm = DeepseekV41RMSNorm(config.hidden_size, config.rms_norm_eps, dtype)
+        norm = (
+            partial(initialize_rms_norm_module, "te", device=self.attn.wq_a.weight.device)
+            if backend.rms_norm == "te"
+            else DeepseekV41RMSNorm
+        )
+        self.attn_norm = norm(config.hidden_size, eps=config.rms_norm_eps, dtype=dtype)
+        self.ffn_norm = norm(config.hidden_size, eps=config.rms_norm_eps, dtype=dtype)
         sinkhorn_backend = "tilelang" if backend.attn == "tilelang" else "torch"
         self.attn_hc = DeepseekV41HyperConnection(config, sinkhorn_backend=sinkhorn_backend)
         self.ffn_hc = DeepseekV41HyperConnection(config, sinkhorn_backend=sinkhorn_backend)
@@ -209,7 +215,12 @@ class DeepseekV41Model(nn.Module):
                 for i in range(config.num_hidden_layers)
             }
         )
-        self.norm = DeepseekV41RMSNorm(config.hidden_size, config.rms_norm_eps, dtype)
+        norm = (
+            partial(initialize_rms_norm_module, "te", device=self.embed_tokens.weight.device)
+            if backend.rms_norm == "te"
+            else DeepseekV41RMSNorm
+        )
+        self.norm = norm(config.hidden_size, eps=config.rms_norm_eps, dtype=dtype)
 
     def forward(
         self,
