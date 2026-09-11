@@ -872,6 +872,14 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
     tie_word_embeddings_support: TieSupport = TieSupport.BOTH
     _tied_weights_keys = {"lm_head.weight": "model.language_model.embed_tokens.weight"}
 
+    # ``cast_model_to_dtype`` snapshots/restores matched fp32 buffers around its
+    # bulk cast, and ``cast_frozen_modules_to_compute_dtype`` exempts matched
+    # names, so this keeps the vision tower's rotary ``inv_freq`` buffer at its
+    # exact fp32 values under shared bf16/fp16 casts (including the frozen-vision
+    # recipes' cast). Class-level: ``super().__init__()`` runs ``post_init`` ->
+    # ``initialize_weights`` -> the first cast before the constructor body.
+    _keep_in_fp32_modules: list[str] = ["rotary_pos_emb"]
+
     @dataclass(frozen=True)
     class ModelCapabilities:
         """Declared parallelism capabilities for this model class."""
