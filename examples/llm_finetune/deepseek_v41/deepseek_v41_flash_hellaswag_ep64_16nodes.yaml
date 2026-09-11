@@ -64,7 +64,7 @@ model:
     _target_: nemo_automodel.components.models.deepseek_v41.config.DeepseekV41Config.from_pretrained
     pretrained_model_name_or_path: deepseek-ai/DeepSeek-V4.1-Flash
     name_or_path: deepseek-ai/DeepSeek-V4.1-Flash
-    revision: df42c109f1defefcbfcedbe7d905718a12266e40
+    revision: df42c109f1defefcbfcedbe7d905718a12266e40  # pragma: allowlist secret (public model commit SHA)
     vision_config:
       _target_: nemo_automodel.components.models.deepseek_v41.config.DeepseekV41VisionConfig
       num_hidden_layers: 0
@@ -127,7 +127,7 @@ dataset:
   tokenizer:
     _target_: transformers.AutoTokenizer.from_pretrained
     pretrained_model_name_or_path: deepseek-ai/DeepSeek-V4.1-Flash
-    revision: df42c109f1defefcbfcedbe7d905718a12266e40
+    revision: df42c109f1defefcbfcedbe7d905718a12266e40  # pragma: allowlist secret (public model commit SHA)
     trust_remote_code: false
 
 packed_sequence:
@@ -150,7 +150,7 @@ validation_dataset:
   tokenizer:
     _target_: transformers.AutoTokenizer.from_pretrained
     pretrained_model_name_or_path: deepseek-ai/DeepSeek-V4.1-Flash
-    revision: df42c109f1defefcbfcedbe7d905718a12266e40
+    revision: df42c109f1defefcbfcedbe7d905718a12266e40  # pragma: allowlist secret (public model commit SHA)
     trust_remote_code: false
 
 validation_dataloader:
@@ -186,6 +186,7 @@ clip_grad_norm:
   max_norm: 1.0
 
 wandb:
+  enable: false
   project: deepseek-v41
   name: ds41-ep64-bf16-moments
   mode: online
