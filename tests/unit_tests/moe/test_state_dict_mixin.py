@@ -1166,6 +1166,35 @@ class TestInplaceLoadViews:
             assert not v.is_contiguous(), f"in-place view for {k} must be the strided transpose, not a copy"
         assert "model.layers.0.mlp.experts.gate_and_up_projs" in mixin._inplace_loaded_native_keys
 
+    @pytest.mark.parametrize("projection", ["gate_and_up_projs", "down_projs"])
+    def test_export_materializes_expert_tensors_without_registering_loaded_keys(self, projection):
+        mixin = MockMoEStateDictMixin(n_experts=2, inter_dim=3)
+        shape = (2, 4, 6) if projection == "gate_and_up_projs" else (2, 3, 4)
+        local_storage = torch.arange(48 if projection == "gate_and_up_projs" else 24).reshape(shape).float()
+        mock_dtensor = Mock(spec=["ndim", "shape", "is_meta"])
+        mock_dtensor.ndim = 3
+        mock_dtensor.shape = shape
+        mock_dtensor.is_meta = False
+
+        result = self._run_inplace_conversion(
+            mixin,
+            f"model.layers.0.mlp.experts.{projection}",
+            mock_dtensor,
+            list(local_storage.unbind()),
+            for_checkpoint_load=False,
+        )
+
+        assert result is not None
+        for key, tensor in result:
+            assert tensor.is_contiguous()
+            assert tensor.untyped_storage().data_ptr() != local_storage.untyped_storage().data_ptr()
+            expert_id = int(key.split(".")[-3])
+            expected = local_storage[expert_id]
+            if projection == "gate_and_up_projs":
+                expected = expected[:, :3] if key.endswith("gate_proj.weight") else expected[:, 3:]
+            torch.testing.assert_close(tensor, expected.T)
+        assert not getattr(mixin, "_inplace_loaded_native_keys", set())
+
     def test_inplace_load_down_projs_returns_views(self):
         mixin = MockMoEStateDictMixin(n_experts=2, inter_dim=512)
         # local[i] for down has shape (inter=512, dim=1024).

@@ -14,10 +14,12 @@
 
 """Merge a LoRA/QLoRA adapter into a base HuggingFace model and save the result.
 
-Supports both dense and Mixture-of-Experts (MoE) models. For QLoRA adapters the
-base model is loaded in 4-bit, dequantized, and only then merged so that the
-adapter delta is applied to the correct weight representation (avoids the
-"naive merge" quality degradation described in
+Pass ``--automodel-native-export`` for AutoModel PEFT-v5 grouped-expert
+checkpoints so model-family state-dict adapters can reconstruct native fused
+expert LoRA tensors. All adapters use the Hugging Face PEFT merge path by
+default. For QLoRA adapters the base model is loaded in 4-bit, dequantized, and
+only then merged so that the adapter delta is applied to the correct weight
+representation (avoids the "naive merge" quality degradation described in
 https://kaitchup.substack.com/p/lora-adapters-when-a-naive-merge).
 
 Usage examples
@@ -45,6 +47,14 @@ MoE model merge::
         --adapter-path checkpoints/adapter/ \
         --output-dir merged_model/
 
+AutoModel PEFT-v5 grouped-expert merge::
+
+    python tools/merge_lora.py \
+        --base-model deepseek-ai/DeepSeek-V2-Lite \
+        --adapter-path checkpoints/adapter/ \
+        --output-dir merged_model/ \
+        --automodel-native-export
+
 Embedding / non-CausalLM model merge (auto-detected from adapter task_type)::
 
     python tools/merge_lora.py \
@@ -67,6 +77,7 @@ import gc
 import json
 import logging
 import os
+from dataclasses import fields
 
 import torch
 
@@ -81,6 +92,89 @@ TASK_TYPE_TO_AUTO_CLASS = {
     "QUESTION_ANS": "AutoModelForQuestionAnswering",
     "FEATURE_EXTRACTION": "AutoModel",
 }
+
+
+def _load_automodel_peft_config(adapter_path: str):
+    """Restore AutoModel's typed PEFT config from its two checkpoint metadata files."""
+    from nemo_automodel.components._peft.lora import PeftConfig
+
+    adapter_config_path = os.path.join(adapter_path, "adapter_config.json")
+    automodel_config_path = os.path.join(adapter_path, "automodel_peft_config.json")
+    with open(adapter_config_path, encoding="utf-8") as adapter_config_file:
+        adapter_config = json.load(adapter_config_file)
+    with open(automodel_config_path, encoding="utf-8") as automodel_config_file:
+        automodel_config = json.load(automodel_config_file)
+
+    if adapter_config.get("peft_type") != "LORA":
+        raise ValueError(
+            f"AutoModel merged export only supports LORA checkpoints, got {adapter_config.get('peft_type')!r}"
+        )
+    if adapter_config.get("task_type", "CAUSAL_LM") != "CAUSAL_LM":
+        raise ValueError(
+            "AutoModel merged export currently supports causal language models; "
+            f"checkpoint task_type={adapter_config.get('task_type')!r}"
+        )
+
+    peft_config_fields = {config_field.name for config_field in fields(PeftConfig)}
+    config_values = {key: value for key, value in automodel_config.items() if key in peft_config_fields}
+    config_values["dim"] = adapter_config["r"]
+    config_values["alpha"] = adapter_config["lora_alpha"]
+    return PeftConfig(**config_values)
+
+
+def _merge_automodel_lora(
+    base_model: str,
+    adapter_path: str,
+    output_dir: str,
+    *,
+    torch_dtype: torch.dtype,
+    device: str,
+    trust_remote_code: bool,
+    model_class: str | None,
+    save_tokenizer: bool,
+) -> None:
+    """Merge an AutoModel-native causal-LM adapter through its state-dict adapter."""
+    if device == "cpu":
+        raise ValueError("AutoModel PEFT merged export requires a CUDA device; --device=cpu is not supported")
+    if model_class not in (None, "AutoModelForCausalLM"):
+        raise ValueError(
+            "AutoModel PEFT merged export currently uses NeMoAutoModelForCausalLM; "
+            f"--model-class={model_class!r} is not supported"
+        )
+    if device.startswith("cuda:"):
+        torch.cuda.set_device(int(device.split(":", 1)[1]))
+
+    from nemo_automodel import NeMoAutoModelForCausalLM, export_merged_peft_checkpoint
+    from nemo_automodel.components.models.common import BackendConfig
+
+    peft_config = _load_automodel_peft_config(adapter_path)
+    logger.info("Loading base model with AutoModel PEFT topology: %s", base_model)
+    model = NeMoAutoModelForCausalLM.from_pretrained(
+        base_model,
+        peft_config=peft_config,
+        backend=BackendConfig(linear="torch"),
+        torch_dtype=torch_dtype,
+        trust_remote_code=trust_remote_code,
+        use_liger_kernel=False,
+        use_sdpa_patching=False,
+        attn_implementation="sdpa",
+    )
+    logger.info("Restoring and merging AutoModel adapter from %s", adapter_path)
+    export_merged_peft_checkpoint(model, adapter_path=adapter_path, output_dir=output_dir)
+
+    if save_tokenizer:
+        try:
+            from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
+
+            tokenizer = NeMoAutoTokenizer.from_pretrained(base_model, trust_remote_code=trust_remote_code)
+            tokenizer.save_pretrained(output_dir)
+        except Exception as e:
+            logger.warning("Could not save tokenizer: %s", e)
+
+    del model
+    torch.cuda.empty_cache()
+    gc.collect()
+    logger.info("Merge complete.")
 
 
 def _resolve_auto_cls(adapter_path: str, model_class: str | None = None):
@@ -338,6 +432,12 @@ def parse_args() -> argparse.Namespace:
         help="Load base model in 4-bit and dequantize before merging (for QLoRA adapters).",
     )
     parser.add_argument(
+        "--automodel-native-export",
+        action="store_true",
+        default=False,
+        help="Restore and merge an AutoModel PEFT-v5 grouped-expert adapter through its state-dict adapter.",
+    )
+    parser.add_argument(
         "--dtype",
         choices=["float16", "bfloat16", "float32"],
         default="float16",
@@ -375,6 +475,21 @@ def main():
     """Run LoRA adapter merging from the command line."""
 
     args = parse_args()
+    if args.automodel_native_export:
+        if args.qlora:
+            raise ValueError("--qlora cannot be combined with --automodel-native-export")
+        _merge_automodel_lora(
+            args.base_model,
+            args.adapter_path,
+            args.output_dir,
+            torch_dtype=getattr(torch, args.dtype),
+            device=args.device,
+            trust_remote_code=args.trust_remote_code,
+            model_class=args.model_class,
+            save_tokenizer=not args.no_save_tokenizer,
+        )
+        return
+
     merge_lora(
         base_model=args.base_model,
         adapter_path=args.adapter_path,
