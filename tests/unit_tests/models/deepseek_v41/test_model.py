@@ -288,7 +288,7 @@ def test_dspark_target_features_are_attention_input_stream_means() -> None:
     assert batch.target_last_hidden_states.shape == (1, 4, model.config.text_config.hidden_size)
 
 
-@pytest.mark.parametrize("layer_ids", [[0, 0], [1, 0], [-1], [1]])
+@pytest.mark.parametrize("layer_ids", [[0, 0], [1, 0], [-1], [6]])
 def test_dspark_target_feature_modules_reject_invalid_layer_ids(layer_ids: list[int]) -> None:
     with pytest.raises(ValueError, match="DSpark target layer IDs"):
         _model().get_dspark_target_feature_modules(layer_ids)
