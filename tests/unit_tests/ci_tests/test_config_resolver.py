@@ -630,9 +630,9 @@ def test_vlm_checkpoint_robustness_recipes_resolve(tmp_path, recipe_path):
         assert robustness["hf_device_map_auto"] is True
     if "/mistral4/" in recipe_path:
         assert robustness["hf_source_post_load_dequantize"] is True
+        assert robustness["hf_reference_compute_fp32"] is True
         assert "parity_tolerance_profile" not in robustness
         assert robustness["parity_tolerance_profile_overrides"] == {
-            "automodel_reload": "relaxed",
             "hf_reload": "relaxed",
         }
         for key in (

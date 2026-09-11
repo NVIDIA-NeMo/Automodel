@@ -209,7 +209,8 @@ def test_reference_rotation_matches_fp64_math_and_gradients(interleave):
         gradient = torch.randn_like(rotated)
         rotated.backward(gradient)
         oracle.backward(gradient)
-        torch.testing.assert_close(x.grad, x64.grad.bfloat16(), atol=0, rtol=0)
+        # The same cancellation/midpoint rounding applies to the backward sum.
+        torch.testing.assert_close(x.grad, x64.grad.bfloat16(), atol=2e-7, rtol=0)
 
 
 @pytest.mark.parametrize("interleave", [False, True])
@@ -283,10 +284,11 @@ def test_mistral4_gate_retains_fp32_selected_weights_and_reference_gradients():
     torch.testing.assert_close(gate.weight.grad, reference.weight.grad, atol=1e-6, rtol=1e-3)
 
 
-def test_reference_expert_sum_matches_fp64_accumulation_of_native_projections():
+@pytest.mark.parametrize("implementation", ["eager", "batched_mm"])
+def test_reference_expert_sum_matches_fp64_accumulation_of_native_projections(implementation):
     torch.manual_seed(42)
     config = Mistral4Config(hidden_size=16, moe_intermediate_size=8, num_local_experts=4)
-    config._experts_implementation = "eager"
+    config._experts_implementation = implementation
     experts = hf_module.Mistral4Experts(config).bfloat16()
     with torch.no_grad():
         for parameter in experts.parameters():
@@ -308,15 +310,66 @@ def test_reference_expert_sum_matches_fp64_accumulation_of_native_projections():
         actual = experts(hidden, indices, weights)
         assert actual.dtype == hidden.dtype
         torch.testing.assert_close(actual, oracle, atol=0, rtol=0)
-        assert (actual.float() - oracle.float()).square().sum() < (native.float() - oracle.float()).square().sum()
+        if implementation == "eager":
+            # Batched/grouped experts already reduce in FP32; eager needs promotion.
+            assert (actual.float() - oracle.float()).square().sum() < (native.float() - oracle.float()).square().sum()
         gradient = torch.randn_like(actual)
         parameters = (hidden, weights, *experts.parameters())
         actual_grad = torch.autograd.grad(actual, parameters, gradient, retain_graph=True)
         expected_grad = torch.autograd.grad(oracle, parameters, gradient)
         for actual_g, expected_g in zip(actual_grad, expected_grad):
             torch.testing.assert_close(actual_g, expected_g, atol=1e-6, rtol=1e-5)
+    assert config._experts_implementation == implementation
     assert all(
         actual is original and actual.dtype == torch.bfloat16
         for actual, original in zip(experts.parameters(), original_weights)
     )
     torch.testing.assert_close(experts(hidden, indices, weights), native, atol=0, rtol=0)
+
+
+def test_reference_precision_survives_hf_save_reload_and_device_hooks(tmp_path):
+    from accelerate.hooks import AlignDevicesHook, add_hook_to_module
+
+    torch.manual_seed(42)
+    config = Mistral4Config(
+        vocab_size=32,
+        hidden_size=16,
+        intermediate_size=16,
+        moe_intermediate_size=8,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        q_lora_rank=8,
+        kv_lora_rank=8,
+        qk_nope_head_dim=4,
+        qk_rope_head_dim=4,
+        v_head_dim=8,
+        n_routed_experts=4,
+        num_experts_per_tok=2,
+    )
+    original = hf_module.Mistral4ForCausalLM(config).bfloat16().eval()
+    original.save_pretrained(tmp_path)
+    reloaded = hf_module.Mistral4ForCausalLM.from_pretrained(
+        tmp_path, dtype=torch.bfloat16, attn_implementation="sdpa", experts_implementation="batched_mm"
+    ).eval()
+    for name, value in original.state_dict().items():
+        torch.testing.assert_close(reloaded.state_dict()[name], value, atol=0, rtol=0)
+    experts = reloaded.model.layers[0].mlp.experts
+    add_hook_to_module(experts, AlignDevicesHook(execution_device="cpu"))
+    device_forward = experts.forward
+    ids = torch.tensor([[1, 2, 3, 4]])
+    with torch.no_grad():
+        native = reloaded(ids).logits
+        with _hf_reference_context(_reference_config(), original):
+            expected = original(ids).logits
+        with _hf_reference_context(_reference_config(), reloaded):
+            torch.testing.assert_close(reloaded(ids).logits, expected, atol=0, rtol=0)
+        assert experts.config._experts_implementation == "batched_mm"
+        assert experts.forward is device_forward
+        with pytest.raises(RuntimeError, match="sentinel"):
+            with _hf_reference_context(_reference_config(), reloaded):
+                torch.testing.assert_close(reloaded(ids).logits, expected, atol=0, rtol=0)
+                raise RuntimeError("sentinel")
+        assert experts.config._experts_implementation == "batched_mm"
+        assert experts.forward is device_forward
+        torch.testing.assert_close(reloaded(ids).logits, native, atol=0, rtol=0)

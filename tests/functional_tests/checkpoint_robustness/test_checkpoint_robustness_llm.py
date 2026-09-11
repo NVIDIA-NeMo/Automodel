@@ -1602,6 +1602,7 @@ def _hf_reference_context(cfg: ConfigNode, model: torch.nn.Module) -> Iterator[N
     """Temporarily promote sensitive operations in the test's HF reference.
 
     The opt-in supports Mistral4 RMSNorm, RoPE, router scoring, and expert sums.
+    Experts temporarily use the eager backend whose accumulator is promoted.
     Projections, activations, and stored weights retain their native dtypes.
     The original HF algorithms run through instance wrappers that preserve
     device-map dispatch and are restored on success or failure. This is a
@@ -1625,7 +1626,7 @@ def _hf_reference_context(cfg: ConfigNode, model: torch.nn.Module) -> Iterator[N
     routers = [module for module in model.modules() if isinstance(module, hf_module.Mistral4TopkRouter)]
     if not routers:
         raise ValueError("FP32 Mistral4 reference scoring found no HF Mistral4 routers")
-    print("[HF reference] Mistral4 FP32 RMSNorm, RoPE, router scoring, and expert sums; modified HF reference")
+    print("[HF reference] Mistral4 FP32 RMSNorm, RoPE, router scoring, and eager expert sums; modified HF reference")
     with ExitStack() as stack:
         for module in model.modules():
             original = module.forward
@@ -1638,6 +1639,15 @@ def _hf_reference_context(cfg: ConfigNode, model: torch.nn.Module) -> Iterator[N
             elif isinstance(module, hf_module.Mistral4Attention):
                 wrapped = _with_fp32_rotary_attention(original, hf_module)
             elif isinstance(module, hf_module.Mistral4Experts):
+                # Source FP8 dequantization selects eager, but BF16 reload can
+                # default to grouped_mm. Select the same native algorithm for
+                # both phases: only eager creates the zeros_like accumulator
+                # that this wrapper promotes. Restore the dispatch on exit.
+                if module.config._experts_implementation != "eager":
+                    stack.callback(
+                        setattr, module.config, "_experts_implementation", module.config._experts_implementation
+                    )
+                    module.config._experts_implementation = "eager"
                 wrapped = _with_fp32_expert_sum(original)
             else:
                 continue
