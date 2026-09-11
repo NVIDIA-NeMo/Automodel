@@ -19,7 +19,11 @@ import logging
 
 import torch
 from torch.distributed.tensor import DTensor, Replicate, Shard
-from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
+
+try:  # private torch helper; if it moves, degrade to "leave the row as initialized" below
+    from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
+except ImportError:  # pragma: no cover - depends on the torch build
+    compute_local_shape_and_global_offset = None  # type: ignore[assignment]
 
 try:  # FSDP2 x TP shards parameters with _StridedShard on the FSDP mesh dim
     from torch.distributed.tensor.placement_types import _StridedShard
@@ -70,6 +74,8 @@ def zero_embedding_row_(weight: torch.Tensor, row: int) -> bool:
         )
         return False
     try:
+        if compute_local_shape_and_global_offset is None:
+            raise ImportError("torch.distributed.tensor._utils.compute_local_shape_and_global_offset is unavailable")
         local_shape, global_offset = compute_local_shape_and_global_offset(
             tuple(weight.shape), weight.device_mesh, placements
         )
