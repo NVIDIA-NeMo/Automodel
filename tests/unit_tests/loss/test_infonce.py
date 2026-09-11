@@ -91,6 +91,43 @@ def test_infonce_loss_no_in_batch_with_hard_negatives():
     assert torch.isfinite(loss)
 
 
+@pytest.mark.parametrize("direction", ["d2q", "symmetric"])
+def test_infonce_loss_no_in_batch_rejects_document_side_direction(direction):
+    """``d2q`` can only draw candidates from the batch, so dropping them is not a valid config."""
+    torch.manual_seed(0)
+    q = torch.randn(4, 8)
+    d = torch.randn(4, 8)
+    n = torch.randn(4, 3, 8)
+
+    with pytest.raises(ValueError, match="no candidates at all"):
+        infonce_loss(q, d, hard_negatives=n, direction=direction, use_in_batch_negatives=False)
+
+
+@pytest.mark.parametrize(
+    "direction, use_in_batch_negatives",
+    [("q2d", True), ("q2d", False), ("d2q", True), ("symmetric", True)],
+)
+def test_infonce_loss_accepted_configs_score_real_candidates(direction, use_in_batch_negatives):
+    """Every accepted config must score >1 candidate: a 1-class CE is 0 with no gradient."""
+    torch.manual_seed(0)
+    q = torch.randn(4, 8, requires_grad=True)
+    d = torch.randn(4, 8, requires_grad=True)
+    n = torch.randn(4, 3, 8, requires_grad=True)
+
+    loss = infonce_loss(
+        q,
+        d,
+        hard_negatives=n,
+        direction=direction,
+        use_in_batch_negatives=use_in_batch_negatives,
+    )
+    loss.backward()
+
+    assert loss.item() > 0.0
+    assert q.grad.abs().sum().item() > 0.0
+    assert d.grad.abs().sum().item() > 0.0
+
+
 def test_infonce_loss_without_normalize():
     torch.manual_seed(0)
     q = torch.randn(4, 8)
@@ -398,6 +435,49 @@ def test_distill_loss_no_negatives_error():
         infonce_distill_loss(s_q, s_d, t_q, t_d, use_in_batch_negatives=False)
 
 
+@pytest.mark.parametrize("direction", ["d2q", "symmetric"])
+def test_distill_loss_no_in_batch_rejects_document_side_direction(direction):
+    """The document-to-query candidate set is the batch; without it the divergence is 0."""
+    s_q, s_d, t_q, t_d, s_n, t_n = _distill_inputs()
+
+    with pytest.raises(ValueError, match="a single candidate"):
+        infonce_distill_loss(
+            s_q,
+            s_d,
+            t_q,
+            t_d,
+            student_hard_negatives=s_n,
+            teacher_hard_negatives=t_n,
+            direction=direction,
+            use_in_batch_negatives=False,
+        )
+
+
+@pytest.mark.parametrize(
+    "direction, use_in_batch_negatives",
+    [("q2d", True), ("q2d", False), ("d2q", True), ("symmetric", True)],
+)
+def test_distill_loss_accepted_configs_score_real_candidates(direction, use_in_batch_negatives):
+    """A degenerate 1-candidate set makes both distributions one-hot and the divergence 0."""
+    s_q, s_d, t_q, t_d, s_n, t_n = _distill_inputs(requires_grad=True)
+
+    loss = infonce_distill_loss(
+        s_q,
+        s_d,
+        t_q,
+        t_d,
+        student_hard_negatives=s_n,
+        teacher_hard_negatives=t_n,
+        direction=direction,
+        use_in_batch_negatives=use_in_batch_negatives,
+    )
+    loss.backward()
+
+    assert loss.item() > 0.0
+    assert s_q.grad.abs().sum().item() > 0.0
+    assert s_d.grad.abs().sum().item() > 0.0
+
+
 # ---------------------------------------------------------------------------
 # InfoNCELoss module
 # ---------------------------------------------------------------------------
@@ -410,6 +490,18 @@ def test_infonce_module_forward():
     loss = loss_fn(q, d)
 
     assert torch.isfinite(loss)
+
+
+def test_infonce_module_surfaces_document_side_direction_conflict():
+    """The recipe builds this module straight from YAML, so the config path must fail loudly."""
+    torch.manual_seed(0)
+    loss_fn = InfoNCELoss(direction="symmetric", use_in_batch_negatives=False)
+    q = torch.randn(4, 8)
+    d = torch.randn(4, 8)
+    n = torch.randn(4, 3, 8)
+
+    with pytest.raises(ValueError, match="no candidates at all"):
+        loss_fn(q, d, hard_negatives=n)
 
 
 def test_infonce_module_rejects_nonpositive_temperature():
