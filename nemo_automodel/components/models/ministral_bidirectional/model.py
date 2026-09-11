@@ -11,6 +11,7 @@ remains available for ``ministral3_bidirec`` checkpoints.
 """
 
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 from transformers import AutoConfig, AutoModel
@@ -29,26 +30,33 @@ class Ministral3BidirectionalConfig(Ministral3Config):
 
     model_type = "ministral3_bidirec"
 
-    def __init__(self, pooling: str = "avg", temperature: float = 1.0, **kwargs) -> None:
+    def __init__(
+        self,
+        pooling: str = "avg",
+        temperature: float = 1.0,
+        is_causal: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        """Configure text attention and retrieval pooling.
+
+        Args:
+            pooling: Retrieval pooling strategy.
+            temperature: Temperature for scaling retrieval logits.
+            is_causal: Whether to use causal rather than bidirectional attention.
+            **kwargs: Additional Hugging Face Ministral3 configuration options.
+        """
         self.pooling = pooling
         self.temperature = temperature
-        super().__init__(**kwargs)
+        super().__init__(is_causal=is_causal, **kwargs)
 
 
 class Ministral3BidirectionalModel(Ministral3Model):
-    """
-    Ministral3Model modified to use bidirectional (non-causal) attention.
+    """Legacy Ministral3 retrieval model with configurable attention.
 
     This class is not selected automatically for standard ``ministral3`` embedding
-    checkpoints. It remains registered for explicit and legacy use.
-
-    In causal Ministral3, each token can only attend to previous tokens (causal
-    attention). This model removes that restriction, allowing each token to attend
-    to all tokens in the sequence, which is useful for embedding tasks.
-
-    The key modifications are:
-        1. Setting is_causal=False on all attention layers
-        2. Using a bidirectional attention mask instead of causal mask
+    checkpoints. It remains registered for explicit and legacy use, defaults to
+    bidirectional attention, and delegates to the Hugging Face causal path when
+    ``config.is_causal`` is true.
 
     Loading a Mistral3 VLM checkpoint (e.g. ``mistralai/Ministral-3-3B-Base-2512``
     or ``mistralai/Ministral-3-3B-Instruct-2512``) requires extracting the language
@@ -73,8 +81,9 @@ class Ministral3BidirectionalModel(Ministral3Model):
 
     def __init__(self, config) -> None:
         super().__init__(config)
+        is_causal = getattr(config, "is_causal", False)
         for layer in self.layers:
-            layer.self_attn.is_causal = False
+            layer.self_attn.is_causal = is_causal
 
     def forward(
         self,
@@ -85,13 +94,41 @@ class Ministral3BidirectionalModel(Ministral3Model):
         inputs_embeds: torch.FloatTensor | None = None,
         use_cache: bool | None = None,
         cache_position: torch.LongTensor | None = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> BaseModelOutputWithPast:
-        """Forward pass with bidirectional attention.
+        """Forward pass with the attention mode stored in the model config.
 
-        Identical to Ministral3Model.forward() except the causal mask is replaced
-        with a bidirectional mask, allowing all tokens to attend to each other.
+        Causal mode delegates to the Hugging Face parent implementation. Non-causal
+        mode uses the retrieval-specific bidirectional mask.
+
+        Args:
+            input_ids: Integer token IDs [batch, sequence], exclusive with inputs_embeds.
+            attention_mask: Optional padding mask [batch, sequence], with zero for padding.
+            position_ids: Integer positions [batch, sequence] or [1, sequence].
+            past_key_values: Optional Transformers cache in its native layout.
+            inputs_embeds: Floating-point embeddings [batch, sequence, hidden].
+            use_cache: Whether to populate the returned cache.
+            cache_position: Integer cache positions [sequence].
+            **kwargs: Additional Hugging Face forward options.
+
+        Returns:
+            Output with floating-point last_hidden_state [batch, sequence, hidden],
+            where hidden is config.hidden_size, and the optional Transformers cache.
+            In causal mode, optional hidden states and attentions follow the Hugging
+            Face Ministral3Model.forward output contract.
         """
+        if getattr(self.config, "is_causal", False):
+            return super().forward(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                **kwargs,
+            )
+
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 

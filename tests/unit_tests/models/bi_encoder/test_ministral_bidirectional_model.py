@@ -25,7 +25,12 @@ import torch.nn as nn
 pytest.importorskip("transformers.models.ministral3", reason="Ministral3 not available in this transformers version")
 
 from nemo_automodel._transformers.registry import ModelRegistry
-from nemo_automodel._transformers.retrieval import BiEncoderModel, _init_encoder_common, configure_encoder_metadata
+from nemo_automodel._transformers.retrieval import (
+    SUPPORTED_BACKBONES,
+    BiEncoderModel,
+    _init_encoder_common,
+    configure_encoder_metadata,
+)
 from nemo_automodel.components.models.ministral_bidirectional.model import (
     Ministral3BidirectionalConfig,
     Ministral3BidirectionalModel,
@@ -114,6 +119,25 @@ def test_ministral3_bidirectional_attention_symmetric():
     )
 
 
+def test_ministral3_causal_attention_blocks_future_token_influence():
+    """Causal Ministral3 prevents a future token from changing an earlier position."""
+    cfg = tiny_bidirectional_config()
+    cfg.is_causal = True
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(42)
+        model = Ministral3BidirectionalModel(cfg).eval()
+    input_ids = torch.tensor([[1, 2, 3, 4]])
+    modified = input_ids.clone()
+    modified[0, -1] = (modified[0, -1] + 1) % cfg.vocab_size
+
+    with torch.no_grad():
+        original = model(input_ids=input_ids).last_hidden_state
+        changed = model(input_ids=modified).last_hidden_state
+
+    assert all(layer.self_attn.is_causal is True for layer in model.layers)
+    torch.testing.assert_close(original[0, 0], changed[0, 0])
+
+
 def test_ministral3_bidirectional_forward_paths():
     cfg = tiny_bidirectional_config()
     model = Ministral3BidirectionalModel(cfg)
@@ -164,8 +188,9 @@ def test_encoder_build_legacy_ministral_registry_path(tmp_path, monkeypatch):
         def from_pretrained(cls, *args, **kwargs):
             return cls(hidden=16)
 
-    ModelRegistry.model_arch_name_to_cls["Ministral3BidirectionalModel"] = FakeBidirectionalModel
-    monkeypatch.setattr(ModelRegistry, "model_arch_name_to_cls", ModelRegistry.model_arch_name_to_cls)
+    monkeypatch.setattr(
+        ModelRegistry, "model_arch_name_to_cls", {"Ministral3BidirectionalModel": FakeBidirectionalModel}
+    )
 
     model_dir = tmp_path / "model"
     model_dir.mkdir()
@@ -184,8 +209,6 @@ def test_encoder_build_legacy_ministral_registry_path(tmp_path, monkeypatch):
 
 
 def test_ministral_dispatch_uses_custom_class_only_for_legacy_checkpoints():
-    from nemo_automodel._transformers.retrieval import SUPPORTED_BACKBONES
-
     assert "ministral3" not in SUPPORTED_BACKBONES
     assert SUPPORTED_BACKBONES["ministral3_bidirec"]["embedding"] == "Ministral3BidirectionalModel"
 
