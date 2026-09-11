@@ -64,16 +64,51 @@ def _official_attention_reference(
     position_ids: torch.Tensor,
     attention_mask: torch.Tensor,
 ) -> torch.Tensor:
-    """Translate the released cache path into equivalent cache-free tensor operations."""
+    """Translate the released cache path into equivalent cache-free tensor operations.
+
+    Args:
+        layer: DSpark attention module under test.
+        hidden_states: Draft states of shape [batch, draft_sequence, hidden].
+        target_hidden_states: Target states of shape [batch, context_sequence, hidden].
+        position_ids: Positions of shape [batch, context_sequence + draft_sequence].
+        attention_mask: Additive mask of shape [batch, 1, draft_sequence,
+            context_sequence + draft_sequence].
+
+    Returns:
+        Projected attention output of shape [batch, draft_sequence, hidden].
+    """
+
+    def rotate(values: torch.Tensor, angles: torch.Tensor, *, inverse: bool = False) -> torch.Tensor:
+        """Apply the released adjacent-pair complex rotation.
+
+        Args:
+            values: Tensor of shape [batch, sequence, channels] or
+                [batch, sequence, heads, channels].
+            angles: Rotation angles of shape [batch, sequence, rotary_pairs].
+            inverse: Whether to conjugate the rotation.
+
+        Returns:
+            Rotated tensor with the same shape and dtype as ``values``.
+        """
+        rotary_dim = angles.shape[-1] * 2
+        pairs = torch.view_as_complex(values[..., -rotary_dim:].float().unflatten(-1, (-1, 2)).contiguous())
+        rotations = torch.polar(torch.ones_like(angles), angles)
+        if values.ndim == 4:
+            rotations = rotations.unsqueeze(2)
+        if inverse:
+            rotations = rotations.conj()
+        rotated = torch.view_as_real(pairs * rotations).flatten(-2).to(values.dtype)
+        return torch.cat((values[..., :-rotary_dim], rotated), dim=-1)
+
     context_sequence = target_hidden_states.shape[1]
     target_angles = layer.rotary_emb(position_ids[:, :context_sequence])
     draft_angles = layer.rotary_emb(position_ids[:, context_sequence:])
     query = layer.wq_b(layer.q_norm(layer.wq_a(hidden_states))).unflatten(-1, (layer.num_heads, layer.head_dim))
-    query = layer._apply_rotary(query, draft_angles)
+    query = rotate(query, draft_angles)
 
-    target_kv = layer._apply_rotary(layer.kv_norm(layer.wkv(target_hidden_states)), target_angles)
+    target_kv = rotate(layer.kv_norm(layer.wkv(target_hidden_states)), target_angles)
     target_kv = quantize_cache(target_kv, format="fp8", block_size=32)
-    draft_kv = layer._apply_rotary(layer.kv_norm(layer.wkv(hidden_states)), draft_angles)
+    draft_kv = rotate(layer.kv_norm(layer.wkv(hidden_states)), draft_angles)
     draft_kv = quantize_cache(draft_kv, format="fp8", block_size=32)
     kv = torch.cat((target_kv, draft_kv, target_kv.new_zeros(target_kv.shape[0], 1, layer.head_dim)), dim=1)
 
@@ -82,8 +117,9 @@ def _official_attention_reference(
     logits = torch.einsum("bshd,btd->bhst", query.float(), kv.float()) * layer.head_dim**-0.5
     probabilities = (logits + torch.cat((bias, sink), dim=-1)).softmax(dim=-1)
     attended = torch.einsum("bhst,btd->bshd", probabilities, kv.float()).to(query.dtype)
-    valid_tokens = torch.ones(query.shape[:2], dtype=torch.bool, device=query.device)
-    return layer._project_output(attended, draft_angles, valid_tokens)
+    attended = rotate(attended, draft_angles, inverse=True)
+    attended = attended.reshape(*attended.shape[:2], layer.num_groups, -1)
+    return layer.wo_b(layer.wo_a(attended).flatten(2))
 
 
 def test_released_stage_ownership_and_draft_moe_shape() -> None:
@@ -118,9 +154,7 @@ def test_cache_free_backbone_forward_and_backward() -> None:
         position_ids=position_ids,
         attention_mask=attention_mask,
     )
-    assert output.hidden_states.shape == (1, draft_sequence, 16)
     assert output.normalized_hidden_states.shape == (1, draft_sequence, 16)
-    assert torch.isfinite(output.hidden_states).all()
     assert torch.isfinite(output.normalized_hidden_states).all()
     output.normalized_hidden_states.square().mean().backward()
     assert noise_embeddings.grad is not None and torch.isfinite(noise_embeddings.grad).all()
@@ -152,12 +186,6 @@ def test_sdpa_matches_eager_attention() -> None:
         target_hidden_states,
         position_ids=position_ids,
         attention_mask=attention_mask,
-    )
-    torch.testing.assert_close(
-        sdpa_output.hidden_states,
-        eager_output.hidden_states,
-        rtol=1e-5,
-        atol=1e-6,
     )
     torch.testing.assert_close(
         sdpa_output.normalized_hidden_states,

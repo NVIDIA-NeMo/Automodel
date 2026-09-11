@@ -459,7 +459,18 @@ class DeepseekV41Config(PretrainedConfig):
         Returns:
             Native DeepSeek V4.1 DSpark model ready for device placement.
         """
-        return DeepseekV41DSparkConfig.from_target(self.text_config, options).build()
+        return DeepseekV41DSparkConfig(
+            text_config=self.text_config,
+            num_draft_layers=int(options.num_draft_layers),
+            target_layer_ids=tuple(int(layer_id) for layer_id in options.target_layer_ids),
+            block_size=int(options.block_size),
+            num_anchors=int(options.num_anchors),
+            mask_token_id=int(options.mask_token_id),
+            markov_rank=int(options.markov_rank),
+            markov_head_type=str(options.markov_head_type),
+            confidence_head_alpha=float(options.confidence_head_alpha),
+            confidence_head_with_markov=bool(options.confidence_head_with_markov),
+        ).build()
 
 
 @dataclass(frozen=True)
@@ -476,34 +487,6 @@ class DeepseekV41DSparkConfig:
     markov_head_type: str
     confidence_head_alpha: float
     confidence_head_with_markov: bool
-
-    @classmethod
-    def from_target(
-        cls,
-        text_config: DeepseekV41TextConfig,
-        options: _DSparkDraftOptions,
-    ) -> DeepseekV41DSparkConfig:
-        """Create an immutable DSpark config from target and recipe settings.
-
-        Args:
-            text_config: Released DeepSeek V4.1 text checkpoint configuration.
-            options: Declarative DSpark recipe settings.
-
-        Returns:
-            Immutable model-owned DSpark configuration.
-        """
-        return cls(
-            text_config=text_config,
-            num_draft_layers=int(options.num_draft_layers),
-            target_layer_ids=tuple(int(layer_id) for layer_id in options.target_layer_ids),
-            block_size=int(options.block_size),
-            num_anchors=int(options.num_anchors),
-            mask_token_id=int(options.mask_token_id),
-            markov_rank=int(options.markov_rank),
-            markov_head_type=str(options.markov_head_type),
-            confidence_head_alpha=float(options.confidence_head_alpha),
-            confidence_head_with_markov=bool(options.confidence_head_with_markov),
-        )
 
     def build(self) -> DeepseekV41DSparkModel:
         """Validate the released contract and build its training adapter.
@@ -548,6 +531,8 @@ class DeepseekV41DSparkConfig:
 
         draft_config = copy.deepcopy(self.text_config)
         draft_config.architectures = ["DeepseekV41DSparkModel"]
-        draft_config.dspark_num_anchors = self.num_anchors
-        draft_config.dspark_enable_confidence_head = self.confidence_head_alpha > 0
-        return DeepseekV41DSparkModel(draft_config)
+        return DeepseekV41DSparkModel(
+            draft_config,
+            num_anchors=self.num_anchors,
+            enable_confidence_head=self.confidence_head_alpha > 0,
+        )

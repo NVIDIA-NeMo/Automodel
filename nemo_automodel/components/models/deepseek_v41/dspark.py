@@ -35,7 +35,7 @@ from torch.nn import functional as F
 from nemo_automodel.components.models.common import BackendConfig, initialize_rms_norm_module
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
 from nemo_automodel.components.models.deepseek_v4.model import DeepseekV4VisionGate
-from nemo_automodel.components.models.deepseek_v41.attention import DeepseekV41Attention
+from nemo_automodel.components.models.deepseek_v41.attention import DeepseekV41Attention, _apply_rope
 from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41TextConfig
 from nemo_automodel.components.models.deepseek_v41.layers import DeepseekV41HyperConnection, DeepseekV41RMSNorm
 from nemo_automodel.components.models.deepseek_v41.quantization import quantize_cache
@@ -55,8 +55,6 @@ class DeepseekV41DSparkBackboneOutput:
     """Native draft states consumed by the released output heads.
 
     Attributes:
-        hidden_states: Collapsed pre-normalization states of shape [batch,
-            draft_sequence, hidden]. The confidence head consumes these states.
         normalized_hidden_states: Final-normalized states of shape [batch,
             draft_sequence, hidden]. The frozen target LM head consumes these
             states to produce base token logits.
@@ -66,7 +64,6 @@ class DeepseekV41DSparkBackboneOutput:
             draft_sequence].
     """
 
-    hidden_states: torch.Tensor
     normalized_hidden_states: torch.Tensor
     transition_logits: torch.Tensor | None = None
     confidence_pred: torch.Tensor | None = None
@@ -78,7 +75,6 @@ class _DeepseekV41DSparkStageOutput(NamedTuple):
     streams: torch.Tensor
     pre_mix: torch.Tensor
     target_hidden_states: torch.Tensor
-    hidden_states: torch.Tensor | None = None
     normalized_hidden_states: torch.Tensor | None = None
     transition_logits: torch.Tensor | None = None
     confidence_pred: torch.Tensor | None = None
@@ -101,7 +97,7 @@ class _DeepseekV41DSparkAttention(DeepseekV41Attention):
         *,
         position_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-    ) -> DeepseekV41DSparkBackboneOutput:
+    ) -> torch.Tensor:
         """Attend draft queries to target context and their own parallel block.
 
         Args:
@@ -131,11 +127,11 @@ class _DeepseekV41DSparkAttention(DeepseekV41Attention):
         draft_angles = self.rotary_emb(position_ids[:, context_sequence:])
         query_latent = self.q_norm(self.wq_a(hidden_states))
         query = self.wq_b(query_latent).unflatten(-1, (self.num_heads, self.head_dim))
-        query = self._apply_rotary(query, draft_angles)
+        query = _apply_rope(query, draft_angles)
 
-        target_kv = self._apply_rotary(self.kv_norm(self.wkv(target_hidden_states)), target_angles)
+        target_kv = _apply_rope(self.kv_norm(self.wkv(target_hidden_states)), target_angles)
         target_kv = quantize_cache(target_kv, format="fp8", block_size=32)
-        draft_kv = self._apply_rotary(self.kv_norm(self.wkv(hidden_states)), draft_angles)
+        draft_kv = _apply_rope(self.kv_norm(self.wkv(hidden_states)), draft_angles)
         draft_kv = quantize_cache(draft_kv, format="fp8", block_size=32)
         kv = torch.cat((target_kv, draft_kv), dim=1)
 
@@ -315,7 +311,6 @@ class _DeepseekV41DSparkBlock(nn.Module):
             streams,
             ffn_mix.pre,
             target_hidden_states,
-            hidden_states,
             normalized_hidden_states,
             transition_logits,
             confidence_pred,
@@ -492,7 +487,7 @@ class DeepseekV41DSparkBackbone(nn.Module):
             enable_confidence_head: Whether the final stage computes confidence.
 
         Returns:
-            Pre-normalization and normalized draft states. Both tensors have
+            Final draft states and optional head outputs. Normalized states have
             shape [batch, draft_sequence, hidden].
         """
         hidden_states = noise_embeddings.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
@@ -516,10 +511,9 @@ class DeepseekV41DSparkBackbone(nn.Module):
             hidden_states = stage_output.streams
             pre_mix = stage_output.pre_mix
             target_hidden_states = stage_output.target_hidden_states
-        if stage_output.hidden_states is None or stage_output.normalized_hidden_states is None:
+        if stage_output.normalized_hidden_states is None:
             raise RuntimeError("The final DSpark stage did not produce output states")
         return DeepseekV41DSparkBackboneOutput(
-            hidden_states=stage_output.hidden_states,
             normalized_hidden_states=stage_output.normalized_hidden_states,
             transition_logits=stage_output.transition_logits,
             confidence_pred=stage_output.confidence_pred,
@@ -538,7 +532,14 @@ class DeepseekV41DSparkModel(DeepseekV41DSparkBackbone):
         "confidence_head",
     ]
 
-    def __init__(self, config: DeepseekV41TextConfig, backend: BackendConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: DeepseekV41TextConfig,
+        backend: BackendConfig | None = None,
+        *,
+        num_anchors: int,
+        enable_confidence_head: bool,
+    ) -> None:
         backend = backend or BackendConfig(
             attn="sdpa",
             linear="torch",
@@ -549,8 +550,6 @@ class DeepseekV41DSparkModel(DeepseekV41DSparkBackbone):
         super().__init__(config, backend)
         if config.dspark_markov_rank <= 0:
             raise ValueError("DeepSeek V4.1 DSpark requires dspark_markov_rank > 0")
-        if not hasattr(config, "dspark_num_anchors"):
-            raise ValueError("DeepSeek V4.1 DSpark config requires dspark_num_anchors")
         dtype = dtype_from_str(config.dtype, torch.bfloat16)
         self.embed_tokens = nn.Embedding(
             config.vocab_size,
@@ -559,10 +558,10 @@ class DeepseekV41DSparkModel(DeepseekV41DSparkBackbone):
             dtype=dtype,
         )
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False, dtype=dtype)
-        self.num_anchors = int(config.dspark_num_anchors)
-        self.enable_confidence_head = bool(getattr(config, "dspark_enable_confidence_head", True))
+        self.num_anchors = int(num_anchors)
+        self.enable_confidence_head = bool(enable_confidence_head)
         if self.num_anchors <= 0:
-            raise ValueError("dspark_num_anchors must be positive")
+            raise ValueError("num_anchors must be positive")
         if not self.enable_confidence_head:
             self.mtp[-1].confidence_head.requires_grad_(False)
         self.initialize_weights(self.embed_tokens.weight.device)
@@ -723,4 +722,4 @@ class DeepseekV41DSparkModel(DeepseekV41DSparkBackbone):
         )
 
 
-__all__ = ["DeepseekV41DSparkBackbone", "DeepseekV41DSparkBackboneOutput", "DeepseekV41DSparkModel"]
+__all__ = ["DeepseekV41DSparkModel"]

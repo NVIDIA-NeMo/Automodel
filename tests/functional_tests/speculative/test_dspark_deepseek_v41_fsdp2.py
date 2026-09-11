@@ -40,7 +40,7 @@ def _free_port() -> int:
 
 
 def _config() -> DeepseekV41TextConfig:
-    config = DeepseekV41TextConfig(
+    return DeepseekV41TextConfig(
         vocab_size=32,
         hidden_size=16,
         moe_intermediate_size=16,
@@ -66,9 +66,6 @@ def _config() -> DeepseekV41TextConfig:
         dspark_num_experts_per_tok=2,
         dtype="bfloat16",
     )
-    config.dspark_num_anchors = 1
-    config.dspark_enable_confidence_head = True
-    return config
 
 
 def _worker(rank: int, port: int) -> None:
@@ -81,6 +78,8 @@ def _worker(rank: int, port: int) -> None:
         model = DeepseekV41DSparkModel(
             _config(),
             BackendConfig(attn="eager", linear="torch", rms_norm="torch_fp32", experts="torch", dispatcher="torch"),
+            num_anchors=1,
+            enable_confidence_head=True,
         )
         model.set_embedding_head_trainable(False)
         policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)

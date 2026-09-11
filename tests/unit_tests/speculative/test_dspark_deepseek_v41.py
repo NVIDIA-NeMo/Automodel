@@ -92,7 +92,7 @@ def test_builder_preserves_released_native_contract() -> None:
     assert config.dspark_block_size == 5
     assert config.dspark_noise_token_id == 31
     assert config.dspark_target_layer_ids == [0, 1]
-    assert config.dspark_num_anchors == 2
+    assert model.num_anchors == 2
 
 
 @pytest.mark.parametrize(
