@@ -100,14 +100,18 @@ class TestNemotronV3StateDictAdapter:
         adapter._uses_model_prefix = True
         assert adapter._hf_prefix == "model."
 
-    def test_peft_target_module_mapping_tracks_hf_prefix(self, config, moe_config, backend):
-        """PEFT target-module metadata uses the same public namespace as exported tensors."""
+    def test_peft_target_module_mapping_tracks_export_format(self, config, moe_config, backend):
+        """Default PEFT targets the built-in model; v4 preserves the source namespace."""
         adapter = NemotronV3StateDictAdapter(config, moe_config, backend)
         native_name = "model.layers.0.mixer.in_proj"
 
-        assert adapter.map_peft_target_module_to_hf(native_name) == "backbone.layers.0.mixer.in_proj"
+        assert adapter.map_peft_target_module_to_hf(native_name) == native_name
+        assert (
+            adapter.map_peft_target_module_to_hf(native_name, v4_compatible=True) == "backbone.layers.0.mixer.in_proj"
+        )
         adapter._uses_model_prefix = True
         assert adapter.map_peft_target_module_to_hf(native_name) == native_name
+        assert adapter.map_peft_target_module_to_hf(native_name, v4_compatible=True) == native_name
 
     def test_expert_path_segment_property(self, config, moe_config, backend):
         """Test _expert_path_segment property returns 'mixer.experts'."""
@@ -240,17 +244,32 @@ class TestNemotronV3AdapterDense:
         )
         assert exported[0][0] == "mtp.layers.0.mixer.A_log"
 
-    def test_peft_outer_prefix_round_trip(self, adapter):
-        hf_key = "base_model.model.backbone.layers.0.mixer.in_proj.lora_A.weight"
+    @pytest.mark.parametrize("v4_compatible", [False, True])
+    def test_peft_outer_prefix_round_trip(self, adapter, v4_compatible):
+        prefix = "backbone" if v4_compatible else "model"
+        hf_key = f"base_model.model.{prefix}.layers.0.mixer.in_proj.lora_A.weight"
         native_key = "base_model.model.model.layers.0.mixer.in_proj.lora_A.weight"
         tensor = torch.randn(8, 256)
 
-        exported = adapter.to_hf({native_key: tensor})
+        exported = adapter.to_hf({native_key: tensor}, v4_compatible=v4_compatible)
+        assert adapter._uses_model_prefix is False, "PEFT export must not change the full-checkpoint layout"
         restored = adapter.from_hf(dict(exported))
 
         assert list(exported) == [hf_key]
         assert list(restored) == [native_key]
         torch.testing.assert_close(restored[native_key], tensor)
+
+    def test_legacy_peft_adapter_loads_and_reexports_for_v5(self, adapter):
+        """A saved backbone adapter remains loadable and can be exported to built-in HF."""
+        old_key = "base_model.model.backbone.layers.0.mixer.in_proj.lora_A.weight"
+        tensor = torch.randn(8, 256)
+
+        native = adapter.from_hf({old_key: tensor})
+        exported = adapter.to_hf(native)
+
+        key = "base_model.model.model.layers.0.mixer.in_proj.lora_A.weight"
+        assert set(exported) == {key}
+        torch.testing.assert_close(exported[key], tensor, rtol=0, atol=0)
 
 
 class TestNemotronV3AdapterMTP:
@@ -792,7 +811,7 @@ class TestNemotronV3AdapterMixerExperts:
         result = adapter.convert_single_tensor_to_hf("model.layers.0.mixer.experts.lora_gate_and_up_A", tensor)
 
         keys = {key for key, _ in result}
-        assert keys == {"backbone.layers.0.mixer.experts.base_layer.lora_A.weight"}
+        assert keys == {"model.layers.0.mixer.experts.base_layer.lora_A.weight"}
         assert adapter._v5_peft_target_parameters == ("mixer.experts.up_proj", "mixer.experts.down_proj")
 
     def test_legacy_layout_option_restores_the_pre_flip_suffix(self, config, moe_config, backend):
@@ -804,7 +823,7 @@ class TestNemotronV3AdapterMixerExperts:
         )
 
         keys = {key for key, _ in result}
-        assert keys == {"backbone.layers.0.mixer.experts.base_layer.lora_B.weight"}
+        assert keys == {"model.layers.0.mixer.experts.base_layer.lora_B.weight"}
 
     def test_v4_lora_export_stays_per_expert_for_non_gated_experts(self, config, moe_config, backend):
         """Explicit v4 compatibility retains the per-expert up projection."""

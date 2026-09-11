@@ -1074,7 +1074,13 @@ class TestInplaceLoadViews:
     @pytest.mark.parametrize("dispatcher", ["deepep", "hybridep", "uccl_ep"])
     @pytest.mark.parametrize(
         ("experts", "expected"),
-        [("gmm", True), ("torch_mm", True), ("torch_mm_mxfp8", True), ("te", False), ("torch", False)],
+        [
+            ("gmm", True),
+            ("torch_mm", True),
+            ("torch_mm_mxfp8", True),
+            ("te", False),
+            ("torch", False),
+        ],
     )
     def test_expert_checkpoint_storage_capability_matches_grouped_storage_aliasing(self, dispatcher, experts, expected):
         mixin = MockMoEStateDictMixin()
@@ -1108,12 +1114,13 @@ class TestInplaceLoadViews:
 
         assert mixin.supports_low_memory_dcp_load is False
         hf_state = mixin._to_hf_w_split_experts(dict(native))
-        assert hf_state["model.layers.0.mlp.experts.gate_up_proj_bias"] is native[
-            "model.layers.0.mlp.experts.gate_up_proj_bias"
-        ]
-        assert hf_state["model.layers.0.mlp.experts.down_proj_bias"] is native[
-            "model.layers.0.mlp.experts.down_proj_bias"
-        ]
+        assert (
+            hf_state["model.layers.0.mlp.experts.gate_up_proj_bias"]
+            is native["model.layers.0.mlp.experts.gate_up_proj_bias"]
+        )
+        assert (
+            hf_state["model.layers.0.mlp.experts.down_proj_bias"] is native["model.layers.0.mlp.experts.down_proj_bias"]
+        )
 
         restored = mixin._from_hf_w_merged_experts(dict(hf_state))
         assert set(restored) == set(native)
@@ -1125,9 +1132,7 @@ class TestInplaceLoadViews:
         mixin.moe_config.expert_bias = True
 
         with pytest.raises(NotImplementedError, match="per-expert bias"):
-            mixin._from_hf_w_merged_experts(
-                {"model.layers.0.mlp.experts.0.gate_proj.bias": torch.randn(3)}
-            )
+            mixin._from_hf_w_merged_experts({"model.layers.0.mlp.experts.0.gate_proj.bias": torch.randn(3)})
 
     def _run_inplace_conversion(self, mixin, fqn, mock_dtensor, splits, *, for_checkpoint_load=False):
         mixin._split_experts_weights = Mock(return_value=splits)

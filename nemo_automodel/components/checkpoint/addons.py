@@ -560,9 +560,11 @@ def _extract_target_modules(
     # state-dict keys on save, so adapter_config.json's target_modules must get
     # the same treatment or PEFT can't resolve them against the real model.
     # The base method defaults to the identity; legacy adapters that don't
-    # subclass StateDictAdapter (llama, qwen2/3, kimivl) skip it, as before.
+    # subclass StateDictAdapter (e.g. kimivl) skip it, as before.
     if isinstance(adapter, StateDictAdapter):
-        final_target_modules = {adapter.map_peft_target_module_to_hf(name) for name in final_target_modules}
+        final_target_modules = {
+            adapter.map_peft_target_module_to_hf(name, v4_compatible=v4_compatible) for name in final_target_modules
+        }
 
     # Under pipeline parallelism each rank only holds the local stage's layers,
     # so named_modules() above yields layer-specific target names for that stage

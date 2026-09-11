@@ -67,7 +67,6 @@ from nemo_automodel.components.models.llama.rope_utils import (
     apply_rotary_pos_emb_fused,
     apply_rotary_pos_emb_quack,
 )
-from nemo_automodel.components.models.qwen2.state_dict_adapter import Qwen2StateDictAdapter
 from nemo_automodel.shared.import_utils import get_check_model_inputs_decorator, safe_import_from
 
 __all__ = ["Qwen2ForCausalLM"]
@@ -541,10 +540,6 @@ class Qwen2ForCausalLM(HFCheckpointingMixin, Qwen2PreTrainedModel):
         self.model = Qwen2Model(config=config, backend=self.backend)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-
-        # Create state_dict_adapter if enabled (needed to convert HF checkpoints)
-        if self.backend.enable_hf_state_dict_adapter:
-            self.state_dict_adapter = Qwen2StateDictAdapter(config=self.config)
 
         # Initialize weights and apply final processing
         self.post_init()

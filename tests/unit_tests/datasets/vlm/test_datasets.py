@@ -2174,3 +2174,65 @@ class TestPreTokenizedDatasetWrapperReplacementDeterminism:
     def test_different_samples_get_different_substitute_streams(self):
         draws = {ds._replacement_rng(idx).randint(0, 10**9) for idx in range(32)}
         assert len(draws) > 1
+
+
+class _FakeSqlDataset:
+    """Minimal stand-in for an Arrow ``Dataset`` with ``map`` / ``column_names``."""
+
+    def __init__(self, rows):
+        self.rows = rows
+        self.column_names = list(rows[0].keys()) if rows else []
+
+    def __iter__(self):
+        return iter(self.rows)
+
+    def map(self, fn, remove_columns=None):
+        return [fn(r) for r in self.rows]
+
+
+def test_spider_schema_to_ddl_renders_tables_keys_and_underscored_names():
+    row = {
+        "db_id": "perpetrator",
+        "Schema (values (type))": "perpetrator : Perpetrator_ID (number) , People_ID (number) | people : People_ID (number) , Home Town (text)",
+        "Primary Keys": "perpetrator : Perpetrator_ID | people : People_ID",
+        "Foreign Keys": "perpetrator : People_ID equals people : People_ID",
+    }
+    ddl = ds.spider_schema_to_ddl(row)
+    assert ddl.splitlines() == [
+        "CREATE TABLE perpetrator (Perpetrator_ID NUMBER, People_ID NUMBER, PRIMARY KEY (Perpetrator_ID), "
+        "FOREIGN KEY (People_ID) REFERENCES people(People_ID))",
+        "CREATE TABLE people (People_ID NUMBER, Home_Town TEXT, PRIMARY KEY (People_ID))",
+    ]
+
+
+def test_make_spider_dataset_joins_schema_and_collapses_query_whitespace(monkeypatch):
+    spider_rows = [
+        {"db_id": "perpetrator", "question": "How many perpetrators?", "query": "SELECT  count(*)  FROM perpetrator"}
+    ]
+    schema_rows = [
+        {
+            "db_id": "perpetrator",
+            "Schema (values (type))": "perpetrator : Perpetrator_ID (number)",
+            "Primary Keys": "perpetrator : Perpetrator_ID",
+            "Foreign Keys": "",
+        }
+    ]
+    calls = []
+
+    def fake_load_dataset(*args, **kwargs):
+        calls.append((args, kwargs))
+        return _FakeSqlDataset(schema_rows if "schema" in str(args) + str(kwargs) else spider_rows)
+
+    monkeypatch.setattr(ds, "load_dataset", fake_load_dataset)
+
+    result = ds.make_spider_dataset(split="validation[:1]")
+
+    assert calls[0] == (("xlangai/spider",), {"split": "validation[:1]"})
+    assert calls[1] == (("richardr1126/spider-schema",), {"split": "train"})
+    user_turn, assistant_turn = result[0]["conversation"]
+    assert (
+        "CREATE TABLE perpetrator (Perpetrator_ID NUMBER, PRIMARY KEY (Perpetrator_ID))"
+        in user_turn["content"][0]["text"]
+    )
+    assert "How many perpetrators?" in user_turn["content"][0]["text"]
+    assert assistant_turn["content"][0]["text"] == "SELECT count(*) FROM perpetrator"
