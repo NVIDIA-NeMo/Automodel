@@ -40,6 +40,10 @@ from nemo_automodel.components.speculative.eagle.peagle_data import (
 )
 from nemo_automodel.components.speculative.eagle.peagle_trainer import PEagleTrainerModule
 
+# Over the default 5s budget on purpose: CUDA FlexAttention compilation takes longer on a cold worker.
+# Reduce cold compiler startup before lowering this further.
+pytestmark = pytest.mark.timeout(60)
+
 # P-EAGLE's draft forward runs flex_attention, whose autograd is not implemented
 # on CPU in the CI torch build (even the forward errors once the inputs require
 # grad). Tests that drive the draft forward therefore run on CUDA and are skipped

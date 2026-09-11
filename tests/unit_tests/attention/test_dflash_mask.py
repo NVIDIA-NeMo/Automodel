@@ -22,6 +22,10 @@ import torch
 import nemo_automodel.components.attention.dflash_mask as dflash_mask
 from nemo_automodel.components.attention.dflash_mask import create_dflash_block_mask, create_dflash_sdpa_mask
 
+# Over the default 5s budget on purpose: CUDA FlexAttention compilation takes longer on a cold worker.
+# Reduce cold compiler startup before lowering this further.
+pytestmark = pytest.mark.timeout(60)
+
 
 def _reference_dflash_mask(anchor_positions, block_keep_mask, ctx_len, block_size, causal=False, sliding_window=None):
     """Element-level reference mask (pure Python loops, obviously correct).
