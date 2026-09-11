@@ -18,9 +18,9 @@
 #
 # Measured with this exact configuration (64 nodes, 12 iterations, recipe
 # summary = mean over the 9 iterations after 3 warm-up iterations):
-# 538.8 tok/s/GPU at 60.8 s/iteration, Average MFU 13.6% on the recipe's
+# 538.8 tok/s/GPU at 60.8 s/iteration, Average MFU 13.5% on the recipe's
 # config-derived FLOPs basis against the 2.5 PF GB200 BF16 dense peak (the run
-# printed 15.1% with the earlier 2.25 PF setting; 13.6% is that figure rescaled
+# printed 15.1% with the earlier 2.25 PF setting; 13.5% is that figure rescaled
 # to the corrected peak; 13.4% on tok/s/GPU * 6 * 104e9 / 2.5e15). Peak memory
 # 139.8 GiB per GPU (44 GiB headroom on 184 GiB HBM). Run the file through
 # nemo_automodel/recipes/llm/benchmark.py --config <this file> for the
