@@ -45,7 +45,8 @@ the regenerated JSONL or a Hugging Face dataset id.
 ## Run it
 
 Example configs live under `examples/speculative/dspark/`
-(`qwen3_0.6b_dspark.yaml`, `gemma4_12b_dspark.yaml`). Multi-GPU defaults to
+(`qwen3_0.6b_dspark.yaml`, `gemma4_12b_dspark.yaml`, and
+`deepseek_v41_flash_dspark.yaml`). Multi-GPU defaults to
 **FSDP2** (`distributed.strategy: fsdp2`); set it to `ddp` for simple data
 parallelism.
 
@@ -72,4 +73,34 @@ are reduced across data-parallel ranks and written to
 | `markov_rank` / `markov_head_type` | serial head size and variant (`vanilla` / `gated` / `rnn`) |
 | `confidence_head_alpha` / `confidence_head_with_markov` | confidence-head weight and conditioning |
 
-Supported targets: Qwen3 (dense and MoE) and Gemma4.
+## DeepSeek V4.1 Flash
+
+DeepSeek V4.1 uses the native DSpark architecture stored under the checkpoint's
+`mtp.*` namespace rather than the configurable dense draft used for DeepSeek
+V4. The implementation reuses AutoModel's V4.1 mHC, MLA, RoPE, MoE routing,
+normalization, and distributed-training components. The target remains frozen;
+only the three draft stages, target-feature projection, Markov head, and
+confidence head receive DSpark gradients.
+
+The following settings are fixed by the released checkpoint and the recipe
+rejects mismatches:
+
+| Field | DeepSeek V4.1 value |
+|-------|---------------------|
+| `draft_num_hidden_layers` | `3` |
+| `block_size` | `5` |
+| `target_layer_ids` | `[37, 38, 39]` |
+| `mask_token_id` | `128799` |
+| `markov_rank` | `256` |
+| draft attention | bidirectional five-position block plus a 128-token target window |
+| draft MoE | 128 routed experts, top-3 |
+
+Use the production-scale
+[`deepseek_v41_flash_dspark.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/speculative/dspark/deepseek_v41_flash_dspark.yaml)
+as the starting point. It uses FSDP2 for the trainable draft and the model's
+distributed EP/FSDP path for the frozen target. Pipeline parallelism, context
+parallelism, sequence packing, image inputs, and the serving-time dynamic
+verification scheduler are not part of this training path.
+
+Supported targets include Qwen3 (dense and MoE), Gemma4, DeepSeek V4 and V4.1,
+GLM-5.2, Kimi K3, and MiniMax M3.
