@@ -370,6 +370,14 @@ def _quantized_checkpointer_worker(rank: int, rendezvous: str, expert_shard_size
             else init_device_mesh("cpu", (2,), mesh_dim_names=("ep",))
         )
         adapter = _adapter(17, second_engram_rows=19, dtype=torch.bfloat16, experts="torch_mm", dim=dim)
+        # Match the released checkpoint metadata used to select quantized DCP load targets.
+        adapter.config.quantization_config = {
+            "quant_method": "fp8",
+            "activation_scheme": "dynamic",
+            "weight_block_size": [32, 32],
+            "scale_fmt": "ue8m0",
+            "expert_dtype": "fp4",
+        }
         source = {}
         expected = {}
         for layer, rows in ((1, 17), (14, 19)):
