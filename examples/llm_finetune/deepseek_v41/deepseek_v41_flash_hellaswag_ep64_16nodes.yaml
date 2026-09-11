@@ -17,9 +17,9 @@
 # EP=64, Engram row owners=64, TP=PP=CP=1. Dense parameters use FSDP2;
 # experts have no additional FSDP shard axis. GBS=64/LBS=1 gives no accumulation.
 #
-# This is a validation configuration, not a demonstrated memory-fit result:
-# the previous full-resident run completed optimizer update 0, then OOMed
-# during the next backward despite activation checkpointing and resharding.
+# The original implementation at 0d5919a5 completed this topology's 100-update
+# validation with BF16 optimizer moments. This is not a resident full-model
+# training result for the current implementation; see the model coverage page.
 # The requested schedule is 100 updates, with validation at 50/100.
 # Optimizer moments use BF16. Checkpoint saving is temporarily disabled because
 # TE state_dict expands both moments to FP32 on GPU before DCP offload.
