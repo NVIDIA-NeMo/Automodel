@@ -1078,7 +1078,13 @@ class TestInplaceLoadViews:
     @pytest.mark.parametrize("dispatcher", ["deepep", "hybridep", "uccl_ep"])
     @pytest.mark.parametrize(
         ("experts", "expected"),
-        [("gmm", True), ("torch_mm", True), ("torch_mm_mxfp8", True), ("te", False), ("torch", False)],
+        [
+            ("gmm", True),
+            ("torch_mm", True),
+            ("torch_mm_mxfp8", True),
+            ("te", False),
+            ("torch", False),
+        ],
     )
     def test_expert_checkpoint_storage_capability_matches_grouped_storage_aliasing(self, dispatcher, experts, expected):
         mixin = MockMoEStateDictMixin()

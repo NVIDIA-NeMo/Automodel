@@ -1,0 +1,179 @@
+---
+title: "DeepSeek-V4.1 Flash"
+description: "DeepSeek V4.1 backbone fine-tuning with expert parallelism and sharded Engram memory."
+slug: model-coverage/large-language-models/deepseek-ai/deepseek-v41-flash
+---
+
+[DeepSeek-V4.1 Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash)
+uses a 40-layer causal encoder/decoder backbone with 384 routed experts, one
+shared expert, and six selected experts per token. Its CSA2 attention shares
+compressed KV and index state between Full, Reuse, and Reindex layers.
+Single-pass mHC carries four residual streams, and two trainable Engram tables
+at layers 1 and 14 provide tokenizer-dependent N-gram memory. The approximately
+552B backbone is accompanied by 196B Engram parameters.
+
+| Setting | Value |
+|---|---|
+| **Architecture** | `DeepseekV41ForCausalLM` |
+| Model ID | `deepseek-ai/DeepSeek-V4.1-Flash` |
+| Reference revision | `df42c109f1defefcbfcedbe7d905718a12266e40` |
+| Configuration | `DeepseekV41Config` with typed `text_config` and `vision_config` |
+
+## Fine-Tuning
+
+The recipe trains all 40 text-backbone layers and both Engram tables. Dense
+parameters use generic FSDP2; routed experts use the shared NeMo AutoModel MoE
+implementation with native HybridEP dispatch and combine. Engram reuses the
+Qwen3.8 Flash Next row-owner embedding, distributing each table across the same world ranks
+without a full-table all-gather. Its gradients return to the row owners and
+receive the owner divisor once before clipping.
+
+| Recipe | Topology and Batch | Optimizer Moments and Checkpoints |
+|---|---|---|
+| [HellaSwag EP64](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_hellaswag_ep64_16nodes.yaml) | 16 nodes × 4 GB200; EP64, owner64, TP1/PP1/CP1; global batch 64, local batch 1 | BF16 moments; checkpoint saving disabled |
+
+The configuration requests 100 updates with validation every 50 updates,
+activation checkpointing, and reshard-after-forward. It uses no gradient
+accumulation or additional expert FSDP shard axis, and requests a one-hour
+allocation. W&B logging is disabled by default; set `wandb.enable: true` to
+enable online logging. TE FusedAdam retains FP32 master-weight precision
+through int16 remainders for BF16 parameters.
+
+<Note>
+Checkpoint saving is disabled because exporting BF16 optimizer moments expands
+them to FP32 on the GPU before checkpoint offload. Saving and resuming this
+training configuration require separate memory and restoration validation.
+
+</Note>
+
+Place all 64 ranks in one verified NVLink domain with static rank ordering.
+The model and recipe use `attn: tilelang`, `linear: torch`,
+`rms_norm: torch_fp32`, `experts: torch_mm`, and `dispatcher: hybridep`.
+Set `model.backend.rms_norm: te` to use Transformer Engine RMSNorm for the
+text backbone, attention projections, compressor, and indexer. This preserves
+parameter names and dtypes; the default retains eager FP32 normalization.
+TileLang and TileKernels are the optional dependencies also used by DeepSeek V4.
+HybridEP provides both token dispatch and expert-output combine. Router
+correction biases remain fixed during fine-tuning through
+`gate_bias_update_factor: 0`.
+
+FSDP mixed precision must use `param_dtype: bfloat16`, `reduce_dtype: float32`,
+`output_dtype: null`, and `cast_forward_inputs: false`. Set
+`lm_head_precision: float32`. These settings preserve FP32 mHC coefficients
+across module boundaries; the language-model head returns FP32 logits.
+
+See the [Slurm launcher guide](/job-launchers/slurm-cluster) and
+[installation guide](/get-started/installation) for setup. Compilation caches
+and communication prewarming must match the backend, topology, and local
+input shapes.
+
+## Loading and Inputs
+
+Set `DS41_CHECKPOINT` to the shared local Hugging Face snapshot of revision
+`df42c109f1defefcbfcedbe7d905718a12266e40`, using the same directory for parity
+and training. Pass both overrides to the recipe launcher:
+
+```bash
+--model.config.pretrained_model_name_or_path="$DS41_CHECKPOINT" \
+--model.config.name_or_path="$DS41_CHECKPOINT"
+```
+
+Text architecture settings belong to `config.text_config`; vision settings
+belong to `config.vision_config`. Enabled Engram layers require the checkpoint's
+fast tokenizer during construction. Configuration-owned loading uses the
+resolved checkpoint revision, or callers can supply the tokenizer explicitly.
+Materialization restores the tokenizer-derived map and deterministic hash
+buffers. `engram_layer_ids` selects the enabled tables; disabling a table
+changes the model function.
+
+The checkpoint adapter decodes released FP8 dense weights, FP4 experts, and
+FP8 Engram tables into floating-point parameters. Retain the original config's
+quantization metadata for automatic base-weight dequantization; the recipe
+also sets `dequantize_base_checkpoint: true`. Floating-point checkpoint export
+preserves released parameter names, required FP32 weights, and logical Engram
+rows while removing the original quantization metadata. Quantized re-export
+is not supported.
+
+Recipe initialization uses the NeMo wrapper's internal Checkpointer and DCP
+path to load the base checkpoint into the distributed model.
+
+Text inputs use unpacked `input_ids [batch, sequence]`, right padding, and
+zero-based positions. The optional `labels [batch, sequence]` API computes
+shifted causal cross-entropy with `-100` ignored. Attention KV and index
+quantize/dequantize boundaries remain part of every forward and use
+straight-through gradients; there is no quantization toggle.
+
+The released vision tower is enabled by the default model configuration and
+disabled by the HellaSwag recipe. `DeepseekV41Processor` supports ordinary
+text/image conversations and save/reload. Image inputs require unpacked
+`input_ids [batch, sequence]`, `pixel_values [all_patches, 3, patch_size, patch_size]`,
+`image_grid_hws [images, 2]`, and `vision_token_types [batch, sequence]`.
+The image encoder and projector reuse DeepSeek V4 modules; image delimiters
+and visual router bias are retained. Specialized tool/reasoning formatting
+should be rendered with the official encoder before processing.
+
+## Numerical Validation
+
+At PR commit `d5c8b5e45176bd6de54c139b311937516be4e0d2`, a real-weight comparison
+covered all 40 layers, 4,096 positions, and all 129,280 vocabulary entries
+against the pinned checkpoint's unchanged official `inference/` implementation.
+Official TP1 was compared with native EP4 and four Engram owners using
+`torch_mm`, native HybridEP dispatch and combine, and TileLang. Dense and expert
+reference weights were decoded for BF16 compute, with the original cache/index quantization retained;
+this was not a default FP8/FP4 GEMM comparison.
+
+The native execution streamed one production block at a time while carrying
+its own residual, mHC, and CSA2 state. Embedding, final norm, and head weights
+were replicated. Rank 0 supplied the single valid sample; other ranks used
+masked inputs and participated in communication. The input repeated one
+145-token passage to fill 4,096 positions, so these metrics describe that
+sample rather than broad prompt coverage.
+
+| Metric | PR `d5c8b5e4` Native-Combine Streamed-40 Result |
+|---|---:|
+| Mean KL(reference‖native) | 0.0034285025 |
+| P95 KL | 0.0003751850 |
+| Maximum KL | 3.8604531288 |
+| Logit cosine | 0.9939242168 |
+| Top-1 agreement | 99.53613281% |
+
+The fixed gates still failed: mean KL exceeded 0.001 and cosine was below
+0.999. P95 KL and top-1 agreement passed their 0.002 and 98% thresholds.
+This is a measured baseline, not a strict parity pass.
+
+An earlier PR commit, `ae380ea74b8417a000c1639ebd64991aafeb42b8`, completed
+three resident forward/backward iterations using the now-removed custom FP32
+combine. It used four GB200 GPUs, the released first four layers and full
+layer-1 Engram table, EP4, activation checkpointing, and resharding. All local
+trainable gradients were present and finite, including nonzero Engram and
+expert gradients. This check performed no clipping or optimizer updates and
+does not establish training behavior for native HybridEP combine.
+
+The historical streamed forward used a diagnostic direct-loading entry point
+that has since been removed. These records identify the tested commits; they
+do not claim a new GPU run after removing that loader or the custom combine
+code, or full-resident 40-layer PR training.
+
+## Original Implementation Training Result
+
+The original implementation at `0d5919a5a506dd35dc4f55769410feb98ae854b8`
+completed 100 HellaSwag optimizer updates on 16 nodes × 4 GB200 with EP64,
+64 Engram owners, the now-removed custom FP32 combine, BF16 optimizer moments,
+and checkpoint saving disabled.
+Training loss changed from 2.9959 at update 1 to 1.8177 at update 100;
+validation losses were 2.0687 and 2.0173 after updates 50 and 100.
+All logged loss and gradient-norm values were finite, the job exited
+successfully, and W&B received every training step and both validations.
+This full-resident training result belongs to the original commit and does
+not establish training behavior for native HybridEP combine, checkpoint
+restoration, or full-model convergence.
+
+## Current Scope
+
+THD packing, TP, PP, CP, incremental generation caches, bounded decoder replay,
+and million-token training are unsupported. Image inputs also require
+unpacked batches. Indexers remain frozen because hard top-k selection has no
+language-model gradient; indexer distillation and DSpark draft training are
+outside this implementation. Fine-tuning does not reproduce the report's
+Engram pretraining optimizer. Bitwise training continuation is not established
+for the TileLang backward kernels.
