@@ -1603,6 +1603,83 @@ def test_load_model_uses_state_dict_adapter_from_ddp_module(tmp_path):
     torch.testing.assert_close(encoder.model.weight, checkpoint_weight)
 
 
+@pytest.mark.parametrize(
+    ("checkpoint_weight_key", "key_mapping"),
+    [
+        pytest.param("weight", None, id="matching-keys"),
+        pytest.param("checkpoint.weight", {r"^checkpoint\.weight$": "weight"}, id="mapped-key"),
+    ],
+)
+def test_single_device_standard_hf_safetensors_loads_with_dcp(tmp_path, checkpoint_weight_key, key_mapping):
+    """A real HF reader loads matching or mapped keys without materializing the full CPU checkpoint."""
+    model = torch.nn.Linear(3, 2)
+    checkpoint_weight = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    checkpoint_bias = torch.tensor([7.0, 8.0])
+    model_path = tmp_path / "model"
+    model_path.mkdir()
+    save_file(
+        {
+            checkpoint_weight_key: checkpoint_weight,
+            "bias": checkpoint_bias,
+        },
+        model_path / "model.safetensors",
+    )
+    config = CheckpointingConfig(
+        enabled=True,
+        checkpoint_dir=str(tmp_path),
+        model_save_format="safetensors",
+        model_cache_dir=str(tmp_path / "cache"),
+        model_repo_id="test/standard-hf",
+        save_consolidated=False,
+        is_peft=False,
+    )
+    with patch("torch.distributed.is_initialized", return_value=False):
+        checkpointer = Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
+
+    with patch(
+        "nemo_automodel.components.checkpoint.checkpointing._load_hf_checkpoint_preserving_dtype"
+    ) as full_cpu_load:
+        checkpointer.load_model(model, model_path=str(model_path), is_init_step=True, key_mapping=key_mapping)
+
+    full_cpu_load.assert_not_called()
+    torch.testing.assert_close(model.weight, checkpoint_weight)
+    torch.testing.assert_close(model.bias, checkpoint_bias)
+
+
+def test_single_device_native_model_without_adapter_loads_with_dcp(tmp_path):
+    """Native models without conversion adapters load directly into model storage."""
+
+    class NativeModel(torch.nn.Linear):
+        __module__ = "nemo_automodel.components.models.test.model"
+
+    model = NativeModel(3, 2)
+    checkpoint_weight = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    checkpoint_bias = torch.tensor([7.0, 8.0])
+    model_path = tmp_path / "model"
+    model_path.mkdir()
+    save_file({"weight": checkpoint_weight, "bias": checkpoint_bias}, model_path / "model.safetensors")
+    config = CheckpointingConfig(
+        enabled=True,
+        checkpoint_dir=str(tmp_path),
+        model_save_format="safetensors",
+        model_cache_dir=str(tmp_path / "cache"),
+        model_repo_id="test/native",
+        save_consolidated=False,
+        is_peft=False,
+    )
+    with patch("torch.distributed.is_initialized", return_value=False):
+        checkpointer = Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
+
+    with patch(
+        "nemo_automodel.components.checkpoint.checkpointing._load_hf_checkpoint_preserving_dtype"
+    ) as full_cpu_load:
+        checkpointer.load_model(model, model_path=str(model_path), is_init_step=True)
+
+    full_cpu_load.assert_not_called()
+    torch.testing.assert_close(model.weight, checkpoint_weight)
+    torch.testing.assert_close(model.bias, checkpoint_bias)
+
+
 def test_single_device_gemma4_loads_into_model_weights_without_full_copy(tmp_path):
     """A real HF storage reader loads and scales Gemma4 experts without a materialized fallback."""
 
@@ -1682,12 +1759,20 @@ def test_single_device_gemma4_loads_into_model_weights_without_full_copy(tmp_pat
     )
 
 
-@pytest.mark.parametrize(("is_init_step", "expected_quantization"), [(True, True), (False, False)])
+@pytest.mark.parametrize(
+    ("is_init_step", "quantization_config", "expected_quantization"),
+    [
+        (True, {"quant_method": "fp8"}, True),
+        (True, None, False),
+        (False, {"quant_method": "fp8"}, False),
+    ],
+)
 def test_load_model_only_requests_quantized_adapter_keys_for_base_checkpoint(
-    tmp_path, is_init_step, expected_quantization
+    tmp_path, is_init_step, quantization_config, expected_quantization
 ):
     """FP8 source metadata is requested for base initialization, not training resume."""
     model = torch.nn.Linear(2, 2, bias=False)
+    model.config = SimpleNamespace(quantization_config=quantization_config)
     adapter = MagicMock()
     model_state_dict = model.state_dict()
     adapter.to_hf.return_value = model_state_dict
@@ -1786,12 +1871,11 @@ def test_training_checkpoint_resume_ignores_base_fp8_metadata(tmp_path):
 
 
 class TestLoadModelCustomModelGuard:
-    """Verify custom-model load routing across sharded and single-device loads.
+    """Verify base-checkpoint routing across standard and custom models.
 
-    Under multi-rank (sharded) loading, custom models use the standard DCP path so each
-    rank slices its local DTensor shard. On a single device (world_size == 1) there is no
-    sharding, so adapters that need large temporary tensors take the frugal full-state path
-    instead. Adapters that need zero or small temporary tensors use DCP.
+    Standard HF safetensors use DCP without adapter conversion. Under multi-rank loading,
+    custom models also use DCP so each rank slices its local DTensor shard. On one device,
+    custom adapters use DCP only when they need zero or small temporary tensors.
     """
 
     def _make_checkpointer(self):
@@ -1813,22 +1897,55 @@ class TestLoadModelCustomModelGuard:
     @patch("nemo_automodel.components.checkpoint.checkpointing._is_safetensors_checkpoint", return_value=True)
     @patch("nemo_automodel.components.checkpoint.checkpointing._load_hf_checkpoint_preserving_dtype")
     @patch("nemo_automodel.components.checkpoint.checkpointing._load_full_state_dict_into_model")
-    def test_non_custom_model_uses_fast_path(self, mock_load_full, mock_load_hf, mock_is_st):
-        """Non-custom (HF) models use the fast safetensors loading path."""
+    @pytest.mark.parametrize("world_size", [1, 2])
+    @pytest.mark.parametrize("dequantize_base_checkpoint", [None, True])
+    def test_standard_hf_safetensors_use_dcp(
+        self, mock_load_full, mock_load_hf, mock_is_st, world_size, dequantize_base_checkpoint
+    ):
+        """Unquantized standard HF weights load with DCP even when dequantization is permitted."""
         checkpointer = self._make_checkpointer()
+        checkpointer.config.dequantize_base_checkpoint = dequantize_base_checkpoint
         model = torch.nn.Linear(4, 4)
+        model.config = SimpleNamespace(quantization_config=None)
 
+        loaded_state = {"weight": torch.randn(4, 4), "bias": torch.randn(4)}
+
+        with (
+            patch("os.path.exists", return_value=True),
+            patch("torch.distributed.is_initialized", return_value=False),
+            patch.dict("os.environ", {"WORLD_SIZE": str(world_size)}),
+            patch.object(checkpointer, "_get_storage_reader", return_value=MagicMock()),
+            patch.object(checkpointer, "_do_load", return_value=loaded_state) as mock_dcp_load,
+        ):
+            checkpointer.load_model(model, model_path="/fake/path", is_init_step=True)
+
+        mock_load_full.assert_not_called()
+        mock_load_hf.assert_not_called()
+        mock_dcp_load.assert_called_once()
+        torch.testing.assert_close(model.weight, loaded_state["weight"])
+        torch.testing.assert_close(model.bias, loaded_state["bias"])
+
+    @patch("nemo_automodel.components.checkpoint.checkpointing._is_safetensors_checkpoint", return_value=True)
+    @patch("nemo_automodel.components.checkpoint.checkpointing._load_hf_checkpoint_preserving_dtype")
+    @patch("nemo_automodel.components.checkpoint.checkpointing._load_full_state_dict_into_model")
+    def test_quantized_standard_hf_model_keeps_full_state_path(self, mock_load_full, mock_load_hf, mock_is_st):
+        """A standard HF model keeps the CPU path when checkpoint dequantization is required."""
+        checkpointer = self._make_checkpointer()
+        checkpointer.config.dequantize_base_checkpoint = True
+        model = torch.nn.Linear(4, 4)
+        model.config = SimpleNamespace(quantization_config={"quant_method": "fp8"})
         mock_load_hf.return_value = {"weight": torch.randn(4, 4), "bias": torch.randn(4)}
 
         with (
             patch("os.path.exists", return_value=True),
+            patch("torch.distributed.is_initialized", return_value=False),
+            patch.dict("os.environ", {"WORLD_SIZE": "1"}),
             patch.object(checkpointer, "_do_load") as mock_dcp_load,
         ):
             checkpointer.load_model(model, model_path="/fake/path", is_init_step=True)
 
-        # Fast path should be used: _load_full_state_dict_into_model called
         mock_load_full.assert_called_once()
-        # DCP path should NOT be used
+        mock_load_hf.assert_called_once()
         mock_dcp_load.assert_not_called()
 
     @patch("nemo_automodel.components.checkpoint.checkpointing._is_safetensors_checkpoint", return_value=False)
@@ -1914,6 +2031,9 @@ class TestLoadModelCustomModelGuard:
         CustomModel.__module__ = "nemo_automodel.components.models.nemotron_v3.model"
         model = CustomModel()
         model.layer = torch.nn.Linear(4, 4)
+        model.state_dict_adapter = SimpleNamespace(
+            from_hf=lambda state_dict, **kwargs: state_dict,
+        )
         assert _is_custom_model(model) is True
 
         mock_load_hf.return_value = {"layer.weight": torch.randn(4, 4), "layer.bias": torch.randn(4)}
@@ -1938,20 +2058,31 @@ class TestLoadModelCustomModelGuard:
     @patch("nemo_automodel.components.checkpoint.checkpointing._is_safetensors_checkpoint", return_value=True)
     @patch("nemo_automodel.components.checkpoint.checkpointing._load_hf_checkpoint_preserving_dtype")
     @patch("nemo_automodel.components.checkpoint.checkpointing._load_full_state_dict_into_model")
-    @pytest.mark.parametrize("dequantize_base_checkpoint", [False, True])
-    def test_single_device_low_memory_dcp_routes_by_quantization(
+    @pytest.mark.parametrize(
+        ("dequantize_base_checkpoint", "quantization_config", "expect_full_cpu"),
+        [
+            (False, {"quant_method": "fp8"}, False),
+            (True, None, False),
+            (True, {"quant_method": "fp8"}, True),
+            (None, {"quant_method": "fp8"}, True),
+        ],
+    )
+    def test_single_device_low_memory_dcp_routes_by_required_dequantization(
         self,
         mock_load_full,
         mock_load_hf,
         mock_is_st,
         caplog,
         dequantize_base_checkpoint,
+        quantization_config,
+        expect_full_cpu,
     ):
-        """Quantized conversion keeps the full CPU fallback despite low-memory DCP support."""
+        """Only an enabled conversion of quantized source weights keeps the full CPU fallback."""
         CustomModel = type("CustomModel", (torch.nn.Module,), {})
         CustomModel.__module__ = "nemo_automodel.components.models.nemotron_v3.model"
         model = CustomModel()
         model.layer = torch.nn.Linear(4, 4)
+        model.config = SimpleNamespace(quantization_config=quantization_config)
         model.state_dict_adapter = MagicMock(spec=StateDictAdapter)
         model.state_dict_adapter.supports_low_memory_dcp_load = True
         mock_state_dict = {"layer.weight": torch.randn(4, 4), "layer.bias": torch.randn(4)}
@@ -1982,7 +2113,7 @@ class TestLoadModelCustomModelGuard:
 
             checkpointer.load_model(model, model_path="/fake/path", is_init_step=True)
 
-        if dequantize_base_checkpoint:
+        if expect_full_cpu:
             mock_load_full.assert_called_once()
             mock_load_hf.assert_called_once()
             mock_dcp_load.assert_not_called()
@@ -2036,8 +2167,8 @@ class TestLoadModelCheckpointKeySubset:
                 side_effect=lambda module, state_dict, **kwargs: state_dict,
             ),
             patch(
-                "nemo_automodel.components.checkpoint.checkpointing._get_checkpoint_metadata_keys",
-                return_value={"layer.weight"},
+                "nemo_automodel.components.checkpoint.checkpointing._get_checkpoint_metadata",
+                return_value=MagicMock(state_dict_metadata=dict.fromkeys({"layer.weight"})),
             ),
             patch.object(checkpointer, "_do_load", side_effect=fake_do_load),
         ):
@@ -2075,8 +2206,8 @@ class TestLoadModelCheckpointKeySubset:
                 side_effect=lambda module, state_dict, **kwargs: state_dict,
             ),
             patch(
-                "nemo_automodel.components.checkpoint.checkpointing._get_checkpoint_metadata_keys",
-                return_value={"unrelated.weight"},
+                "nemo_automodel.components.checkpoint.checkpointing._get_checkpoint_metadata",
+                return_value=MagicMock(state_dict_metadata=dict.fromkeys({"unrelated.weight"})),
             ),
         ):
             mock_model_state = mock_model_state_cls.return_value
@@ -2106,8 +2237,10 @@ class TestLoadModelCheckpointKeySubset:
                 side_effect=lambda module, state_dict, **kwargs: state_dict,
             ),
             patch(
-                "nemo_automodel.components.checkpoint.checkpointing._get_checkpoint_metadata_keys",
-                return_value={"language_model.layer.weight", "vision_tower.block.weight"},
+                "nemo_automodel.components.checkpoint.checkpointing._get_checkpoint_metadata",
+                return_value=MagicMock(
+                    state_dict_metadata=dict.fromkeys({"language_model.layer.weight", "vision_tower.block.weight"})
+                ),
             ),
         ):
             mock_model_state = mock_model_state_cls.return_value
@@ -2143,8 +2276,8 @@ class TestLoadModelCheckpointKeySubset:
                 side_effect=lambda module, state_dict, **kwargs: {**state_dict, "stray.weight": torch.ones(1)},
             ),
             patch(
-                "nemo_automodel.components.checkpoint.checkpointing._get_checkpoint_metadata_keys",
-                return_value={"layer.weight"},
+                "nemo_automodel.components.checkpoint.checkpointing._get_checkpoint_metadata",
+                return_value=MagicMock(state_dict_metadata=dict.fromkeys({"layer.weight"})),
             ),
             patch.object(checkpointer, "_do_load", side_effect=lambda state_dict, *args, **kwargs: state_dict),
         ):
@@ -2165,6 +2298,53 @@ class TestLoadModelCheckpointKeySubset:
 
 class TestLoadModelExtraState:
     """Test checkpoint load compatibility for module extra-state keys."""
+
+    @pytest.mark.parametrize("model_save_format", ["safetensors", "torch_save"])
+    @pytest.mark.parametrize("tensor_metadata, initial_metadata_size", [(False, 0), (True, 0), (True, 1), (True, 2)])
+    def test_module_metadata_save_and_resume(self, tmp_path, model_save_format, tensor_metadata, initial_metadata_size):
+        """HF exports omit module metadata; native DCP preserves it, and both resume strictly."""
+
+        class ExtraStateLinear(torch.nn.Linear):
+            def __init__(self, version):
+                super().__init__(2, 2)
+                self.metadata = torch.tensor([version], dtype=torch.uint8) if tensor_metadata else {"version": version}
+
+            def get_extra_state(self):
+                return self.metadata
+
+            def set_extra_state(self, state):
+                self.metadata = state
+
+        model = ExtraStateLinear(9)
+        checkpointer = Checkpointer(
+            CheckpointingConfig(
+                enabled=True,
+                checkpoint_dir=str(tmp_path),
+                model_cache_dir=str(tmp_path / "cache"),
+                model_repo_id="test/model",
+                model_save_format=model_save_format,
+                save_consolidated=False,
+            ),
+            dp_rank=0,
+            tp_rank=0,
+            pp_rank=0,
+            moe_mesh=None,
+        )
+        checkpointer.save_model(model, str(tmp_path / "saved"))
+        resumed = ExtraStateLinear(3)
+        if tensor_metadata:
+            resumed.metadata = torch.full((initial_metadata_size,), 3, dtype=torch.uint8)
+        checkpointer.load_model(resumed, str(tmp_path / "saved/model"))
+        torch.testing.assert_close(resumed.weight, model.weight, rtol=0, atol=0)
+        torch.testing.assert_close(resumed.bias, model.bias, rtol=0, atol=0)
+        expected_version = 3 if model_save_format == "safetensors" else 9
+        if tensor_metadata:
+            expected_size = initial_metadata_size if model_save_format == "safetensors" else 1
+            torch.testing.assert_close(
+                resumed.metadata, torch.full((expected_size,), expected_version, dtype=torch.uint8), rtol=0, atol=0
+            )
+        else:
+            assert resumed.metadata == {"version": expected_version}
 
     def _make_checkpointer(self):
         config = CheckpointingConfig(
@@ -2206,8 +2386,8 @@ class TestLoadModelExtraState:
                 side_effect=lambda module, state_dict, **kwargs: state_dict,
             ),
             patch(
-                "nemo_automodel.components.checkpoint.checkpointing._get_checkpoint_metadata_keys",
-                return_value={"layer.weight"},
+                "nemo_automodel.components.checkpoint.checkpointing._get_checkpoint_metadata",
+                return_value=MagicMock(state_dict_metadata=dict.fromkeys({"layer.weight"})),
             ),
             patch.object(checkpointer, "_do_load", side_effect=fake_do_load),
         ):

@@ -86,7 +86,7 @@ compare_tensors(hf_sin, nemo_sin, name="rope_sin")
 
 ## 6. Tied weights (tie_word_embeddings)
 
-When `tie_word_embeddings=True` in the model config, `lm_head.weight` should be the same tensor as `model.embed_tokens.weight`. If the state dict adapter does not handle this, the model ends up with two independent copies, doubling the parameter count and producing wrong logits.
+When `tie_word_embeddings=True`, `lm_head.weight` and `model.embed_tokens.weight` must be the same parameter. The model establishes this tie, and checkpoint loading must preserve it, with or without a state dict adapter. Independent copies add redundant parameters and can diverge during training.
 
 **Symptom:** Model loads without error but produces slightly different logits. Parameter count is higher than expected. After training, `lm_head.weight` and `embed_tokens.weight` diverge because they receive different gradient updates.
 

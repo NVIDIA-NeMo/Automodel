@@ -194,7 +194,7 @@ class KimiK3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
         lora = match.group("lora") or ""
         return f"{match.group('prefix')}.mlp.experts.{match.group('expert')}.{projection}{lora}.weight"
 
-    def map_peft_target_module_to_hf(self, name: str) -> str:
+    def map_peft_target_module_to_hf(self, name: str, *, v4_compatible: bool = False) -> str:
         """Convert a native PEFT target-module path to the checkpoint layout.
 
         adapter_config.json's target_modules must name modules that exist in the
@@ -203,6 +203,13 @@ class KimiK3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
         block_sparse_moe, and the other MoE-owned children (shared_experts,
         routed_expert_*, gate) move from mlp. to block_sparse_moe. as well.
         Dense-layer mlp paths pass through unchanged.
+
+        Args:
+            name: A target-module name in native layout.
+            v4_compatible: Legacy export selection; K3 uses the same module names in both formats.
+
+        Returns:
+            Target-module name in the HF K3 layout.
         """
         # Same segment renames as _native_moe_key_to_hf, but target-module paths
         # can END at the segment (e.g. ...mlp.routed_expert_up_proj), which the
