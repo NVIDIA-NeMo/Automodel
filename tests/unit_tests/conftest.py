@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import importlib
+import multiprocessing
 import os
 import sys
 import types
@@ -206,6 +207,30 @@ def _fail_on_leaked_process_group():
             "calls init_process_group without a matching destroy_process_group",
             pytrace=False,
         )
+
+
+@pytest.fixture(autouse=True)
+def _kill_leaked_child_processes():
+    """Kill worker processes a test left behind, so a hung worker cannot stall the session.
+
+    pytest-timeout's signal method only interrupts the pytest process. ``mp.spawn(join=True)``
+    starts non-daemonic workers, and when the timeout fires inside its ``join`` those workers
+    keep running. Python then waits for them at interpreter exit, so a single hung worker holds
+    the CI job until the workflow timeout, the failure mode the per-test budget exists to bound.
+    """
+    yield
+    leaked = multiprocessing.active_children()
+    if not leaked:
+        return
+    for process in leaked:
+        process.kill()
+    for process in leaked:
+        process.join(timeout=5)
+    pytest.fail(
+        f"test left {len(leaked)} child process(es) running (pids {[process.pid for process in leaked]}); "
+        "they were killed. Join or terminate spawned workers before the test returns",
+        pytrace=False,
+    )
 
 
 def pytest_configure(config):
