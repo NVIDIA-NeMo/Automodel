@@ -138,7 +138,7 @@ if [[ "$NO_EFA" -eq 1 ]]; then
 fi
 
 # Install into the active Python environment.
-${BUILD_EXTRA_ARGS:+env $BUILD_EXTRA_ARGS} python setup.py install
+TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" ${BUILD_EXTRA_ARGS:+env $BUILD_EXTRA_ARGS} python setup.py install
 
 popd > /dev/null
 
