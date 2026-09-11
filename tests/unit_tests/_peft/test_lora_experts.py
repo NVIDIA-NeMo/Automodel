@@ -194,6 +194,64 @@ def test_grouped_experts_deepep_lora_preserves_dispatcher_settings(moe_config):
     assert lora_experts.use_mxfp8 is True
 
 
+@pytest.mark.parametrize("storage_device", ["cpu", "meta"])
+@pytest.mark.parametrize("lora_dtype", [None, torch.float32])
+def test_deepep_lora_preserves_base_storage(moe_config, storage_device, lora_dtype):
+    """Wrapping BF16 experts outside the construction dtype context preserves storage."""
+    assert torch.get_default_dtype() == torch.float32
+    moe_config.expert_bias = True
+    with torch.device(storage_device):
+        original = GroupedExpertsDeepEP(moe_config).to(torch.bfloat16)
+        # A dense noncontiguous projection catches accidental layout changes.
+        original.down_projs = nn.Parameter(original.down_projs.transpose(1, 2).contiguous().transpose(1, 2))
+        with torch.no_grad():
+            for parameter in original.parameters():
+                parameter.normal_(std=0.02)
+        adapted = patch_moe_module(original, dim=8, alpha=32, lora_dtype=lora_dtype)
+    for name, source in original.named_parameters():
+        target = adapted.get_parameter(name)
+        assert target is not source
+        assert target.dtype == source.dtype == torch.bfloat16
+        assert target.device == source.device
+        assert target.shape == source.shape and target.stride() == source.stride()
+        assert not target.requires_grad
+        if storage_device == "cpu":
+            assert target.data_ptr() != source.data_ptr()
+            torch.testing.assert_close(target, source, rtol=0, atol=0)
+    adapters = [parameter for name, parameter in adapted.named_parameters() if "lora_" in name]
+    assert len(adapters) == 4
+    assert all(parameter.dtype == (lora_dtype or torch.bfloat16) for parameter in adapters)
+    assert all(parameter.device.type == storage_device and parameter.requires_grad for parameter in adapters)
+
+
+@pytest.mark.parametrize("lora_dtype", [None, torch.float32])
+def test_bf16_expert_lora_cpu_backward(moe_config, lora_dtype):
+    """Exercise the ordinary CPU expert loop with BF16 base and optional FP32 adapters."""
+    moe_config.dtype = torch.bfloat16
+    original = GroupedExperts(moe_config)
+    with torch.no_grad():
+        original.init_weights(buffer_device=torch.device("cpu"), init_std=0.02)
+    adapted = patch_moe_module(original, dim=8, alpha=32, lora_dtype=lora_dtype)
+    with torch.no_grad():
+        adapted.lora_gate_and_up_B.normal_(std=0.02)
+        adapted.lora_down_B.normal_(std=0.02)
+    inputs = torch.randn(8, 16, dtype=torch.bfloat16, requires_grad=True)
+    weights = torch.full((8, 2), 0.5, dtype=torch.float32, requires_grad=True)
+    indices = torch.arange(16).reshape(8, 2) % 4
+    output = adapted(inputs, torch.ones(8, dtype=torch.bool), weights, indices)
+    (output.float() * torch.randn_like(output.float())).sum().backward()
+    assert torch.isfinite(output).all()
+    assert inputs.grad is not None and torch.isfinite(inputs.grad).all()
+    assert weights.grad is not None and torch.isfinite(weights.grad).all()
+    for name, parameter in adapted.named_parameters():
+        if "lora_" in name:
+            assert parameter.dtype == (lora_dtype or torch.bfloat16)
+            assert parameter.grad is not None and torch.isfinite(parameter.grad).all()
+            assert torch.count_nonzero(parameter.grad) > 0
+        else:
+            assert not parameter.requires_grad and parameter.grad is None
+
+
 def test_pad_lora_rank_for_grouped_mm_aligns_bf16_rank():
     """Test rank padding for torch._grouped_mm stride alignment."""
     lora_A = torch.randn(2, 16, 4, dtype=torch.bfloat16)

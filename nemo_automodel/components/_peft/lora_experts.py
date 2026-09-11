@@ -424,12 +424,14 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
             dispatcher_async_dispatch=orig_module.dispatcher_async_dispatch,
         )
 
-        self.gate_and_up_projs.data.copy_(orig_module.gate_and_up_projs.data)
-        self.down_projs.data.copy_(orig_module.down_projs.data)
+        # PEFT injection can run after the model's construction dtype context.
+        # Keep independent frozen storage with the original dtype/device/layout.
+        self.gate_and_up_projs = nn.Parameter(orig_module.gate_and_up_projs.detach().clone(), requires_grad=False)
+        self.down_projs = nn.Parameter(orig_module.down_projs.detach().clone(), requires_grad=False)
 
         if self.expert_bias:
-            self.gate_up_proj_bias.data.copy_(orig_module.gate_up_proj_bias.data)
-            self.down_proj_bias.data.copy_(orig_module.down_proj_bias.data)
+            self.gate_up_proj_bias = nn.Parameter(orig_module.gate_up_proj_bias.detach().clone(), requires_grad=False)
+            self.down_proj_bias = nn.Parameter(orig_module.down_proj_bias.detach().clone(), requires_grad=False)
 
         # Copy DeepEP state from orig_module (set by init_token_dispatcher, not __init__)
         self.n_routed_experts = getattr(orig_module, "n_routed_experts", self.config.n_routed_experts)
