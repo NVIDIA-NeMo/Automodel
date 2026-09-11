@@ -26,6 +26,9 @@ class StateDictAdapter(ABC):
 
     This class defines the interface for converting between native model
     state dict format and other model state dict formats.
+
+    Most custom models need an adapter. Models whose HF weight names and tensor
+    layouts already match can omit it.
     """
 
     _supports_low_memory_dcp_load: bool = False

@@ -111,6 +111,7 @@ class CheckpointingConfig:
     cpu_offload: bool = False  # If True, move DCP model and optimizer state dict tensors to CPU before saving.
     # Permit pickle-based loading of legacy training state. Enable only for checkpoints from a trusted source.
     allow_legacy_pickle_restore: bool = False
+    # None or True permits dequantization when the source model config declares quantized weights; False disables it.
     dequantize_base_checkpoint: bool | None = None
     original_model_root_dir: str | None = None
     skip_task_head_prefixes_for_base_model: list[str] | None = (
