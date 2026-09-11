@@ -242,7 +242,11 @@ def test_build_target_rejects_minimax():
 
 @pytest.mark.parametrize(
     "model_type,builder_attr",
-    [(pdd._DEEPSEEK_V4_MODEL_TYPE, "build_deepseek_v4_target"), (pdd._GLM_5_2_MODEL_TYPE, "build_glm_5_2_target")],
+    [
+        (pdd._DEEPSEEK_V4_MODEL_TYPE, "build_deepseek_v4_target"),
+        (pdd._DEEPSEEK_V41_MODEL_TYPE, "build_deepseek_v41_target"),
+        (pdd._GLM_5_2_MODEL_TYPE, "build_glm_5_2_target"),
+    ],
 )
 def test_build_target_dispatches_sharded_builders(monkeypatch, model_type, builder_attr):
     captured = {}
