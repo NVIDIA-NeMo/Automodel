@@ -220,7 +220,7 @@ class OptimizerConfig:
 
     # Per-group LR/WD overrides matched by parameter name. Empty = single group
     # (unchanged behavior). Honored by the standard torch optimizers (typed configs
-    # and the factory path). Dion-family configs do their own grouping and warn if
+    # and the optim_cls path). Dion-family configs do their own grouping and warn if
     # this is set.
     param_group_overrides: list[ParamGroupOverride] = field(default_factory=list)
 
@@ -606,7 +606,7 @@ class OptimizerFromFactoryConfig(OptimizerConfig):
         *,
         device_mesh: DeviceMesh | None = None,
     ) -> torch.optim.Optimizer:
-        assert callable(self.optim_cls), "OptimizerFromFactoryConfig.factory must be a callable"
+        assert callable(self.optim_cls), "OptimizerFromFactoryConfig.optim_cls must be a callable"
         foreach = _foreach_for_mesh(device_mesh)
 
         kwargs = dict(self.kwargs)
@@ -830,7 +830,7 @@ def _drop_empty_local_shards(params: list[Any]) -> list[Any]:
 
 
 def _accepts_foreach(optim_cls: type["torch.optim.Optimizer"]) -> bool:
-    """Return ``True`` if ``factory`` accepts a ``foreach`` kwarg.
+    """Return ``True`` if ``optim_cls`` accepts a ``foreach`` kwarg.
 
     ``torch.optim`` optimizers take ``foreach``; external factories such as TE
     ``FusedAdam`` do not, so passing it would raise ``TypeError``.
@@ -928,7 +928,7 @@ def build_optimizer_config(
         return target(**kwargs)
     # Dion-family optimizers need parameter grouping; route a resolved dion class
     # (e.g. YAML ``_target_: dion.Muon``) to its typed config rather than the flat-params
-    # factory escape hatch, which would lose grouping and leak grouping-only kwargs.
+    # optim_cls escape hatch, which would lose grouping and leak grouping-only kwargs.
     if is_dion_optimizer(target):
         dion_config = _DION_CONFIG_FOR.get(getattr(target, "__name__", ""))
         if dion_config is None:
