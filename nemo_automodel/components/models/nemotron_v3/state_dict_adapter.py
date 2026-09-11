@@ -128,12 +128,16 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
         """Nemotron V3 exposes fused non-gated expert parameters in Transformers v5."""
         return ("mixer.experts.up_proj", "mixer.experts.down_proj")
 
-    def _native_key_to_hf(self, key: str) -> str:
+    def _native_key_to_hf(self, key: str, *, v4_compatible: bool = False) -> str:
         """Normalize a native Nemotron V3 key to its public HF namespace."""
         key = _strip_mamba_fp32_holder_key(key)
+        # Base checkpoints may still use the remote-code backbone namespace.
+        # Default PEFT exports target the built-in Transformers v5 model, whose
+        # modules live under model regardless of the base checkpoint's keys.
+        hf_prefix = "model." if ".lora_" in key and not v4_compatible else self._hf_prefix
         key = re.sub(
             r"^(?P<outer>base_model\.model\.)?model\.",
-            lambda match: f"{match.group('outer') or ''}{self._hf_prefix}",
+            lambda match: f"{match.group('outer') or ''}{hf_prefix}",
             key,
         )
         hf_root = re.escape(self._hf_prefix.rstrip("."))
@@ -141,9 +145,19 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
         key = re.sub(rf"^{hf_root}\.embed_tokens\.weight$", f"{self._hf_prefix}embeddings.weight", key)
         return key
 
-    def map_peft_target_module_to_hf(self, module_name: str) -> str:
-        """Map native PEFT target modules to the public Nemotron-H namespace."""
-        return self._native_key_to_hf(module_name)
+    def map_peft_target_module_to_hf(self, module_name: str, *, v4_compatible: bool = False) -> str:
+        """Map PEFT targets to the same namespace as the exported adapter weights.
+
+        Args:
+            module_name: A target-module name in native layout.
+            v4_compatible: Preserve the source checkpoint's legacy namespace.
+
+        Returns:
+            Target-module name for the selected HF export format.
+        """
+        if v4_compatible:
+            return self._native_key_to_hf(module_name, v4_compatible=True)
+        return _strip_mamba_fp32_holder_key(module_name)
 
     def _hf_key_to_native(self, key: str) -> str:
         """Normalize a public HF Nemotron V3 key to its native namespace."""
@@ -300,6 +314,7 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
             List of (fqn, tensor) tuples in HuggingFace format
         """
         exclude_key_regex = kwargs.get("exclude_key_regex", None)
+        v4_compatible = kwargs.get("v4_compatible", False)
 
         # MTP keys live in their own ``mtp.*`` namespace; route them through
         # the standard expert-split path with the prefix overridden so
@@ -332,10 +347,10 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
         if expert_result is not None:
             # The shared expert converter preserves the native input prefix for
             # LoRA keys. Route every result through Nemotron's adapter-specific
-            # model -> backbone normalization just like ordinary tensors.
-            result = [(self._native_key_to_hf(key), value) for key, value in expert_result]
+            # normalization for the selected PEFT export format.
+            result = [(self._native_key_to_hf(key, v4_compatible=v4_compatible), value) for key, value in expert_result]
         else:
-            new_fqn = self._native_key_to_hf(fqn)
+            new_fqn = self._native_key_to_hf(fqn, v4_compatible=v4_compatible)
             result = [(new_fqn, _upcast_mamba_fp32_state_tensor(new_fqn, tensor))]
 
         if exclude_key_regex:
