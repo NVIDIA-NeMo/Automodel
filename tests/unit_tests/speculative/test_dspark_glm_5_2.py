@@ -29,6 +29,10 @@ from nemo_automodel.components.speculative.dspark.draft_glm_5_2 import Glm5_2DSp
 from nemo_automodel.components.speculative.dspark.loss import compute_dspark_loss
 from nemo_automodel.components.speculative.dspark.registry import resolve_dspark_draft_spec
 
+# Over the default 5s budget on purpose: this module runs full draft-model forwards and backwards.
+# Shrink the model fixtures before raising this further.
+pytestmark = pytest.mark.timeout(60)
+
 VOCAB = 128
 HIDDEN = 64
 TARGET_LAYER_IDS = [1, 3]

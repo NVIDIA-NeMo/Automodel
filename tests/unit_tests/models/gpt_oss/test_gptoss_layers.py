@@ -24,6 +24,10 @@ from nemo_automodel.components.models.gpt_oss.layers import (
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.shared.import_utils import is_te_min_version
 
+# Over the default 5s budget on purpose: CUDA FlexAttention compilation takes longer on a cold worker.
+# Reduce cold compiler startup before lowering this further.
+pytestmark = pytest.mark.timeout(60)
+
 
 @pytest.fixture
 def device():

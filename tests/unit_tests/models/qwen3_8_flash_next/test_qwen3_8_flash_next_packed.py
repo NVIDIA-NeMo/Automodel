@@ -28,6 +28,10 @@ from nemo_automodel.components.models.qwen3_8_flash_next.config import Qwen3_8_F
 from nemo_automodel.components.models.qwen3_8_flash_next.layers import Qwen3_8_FlashNextQSAAttention
 from nemo_automodel.components.models.qwen3_8_flash_next.qsa import Qwen3_8_FlashNextQSAIndexer
 
+# Over the default 5s budget on purpose: this module spawns worker processes; every child re-imports torch from scratch.
+# Shrink the work or the process count before raising this further.
+pytestmark = pytest.mark.timeout(60)
+
 _CU_SEQLENS = (0, 5, 12, 20)
 
 

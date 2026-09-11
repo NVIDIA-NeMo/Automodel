@@ -47,6 +47,10 @@ from nemo_automodel.components.models.deepseek_v41.config import (
 from nemo_automodel.components.models.deepseek_v41.model import DeepseekV41ForCausalLM
 from nemo_automodel.components.moe.parallelizer import _is_deepseek_v4_model, apply_ac
 
+# Over the default 5s budget on purpose: this module runs full-model forwards and distributed FSDP checks.
+# Shrink the model fixtures and process startup before lowering this further.
+pytestmark = pytest.mark.timeout(60)
+
 
 def _tiny_config() -> DeepseekV41Config:
     return DeepseekV41Config(

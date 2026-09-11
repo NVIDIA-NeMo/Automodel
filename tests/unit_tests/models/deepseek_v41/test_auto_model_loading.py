@@ -38,6 +38,10 @@ from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41Config, DeepseekV41TextConfig
 from nemo_automodel.components.models.deepseek_v41.model import DeepseekV41ForCausalLM
 
+# Over the default 5s budget on purpose: distributed checkpoint initialization spawns Gloo workers.
+# Shrink process startup and checkpoint round trips before lowering this further.
+pytestmark = pytest.mark.timeout(60)
+
 
 def _config(quantized: bool) -> DeepseekV41Config:
     """Build a complete one-layer backbone with a partial FP8 row block."""

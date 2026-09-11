@@ -29,10 +29,15 @@ import torch.multiprocessing as mp
 
 from nemo_automodel.components.speculative.eagle.ring_attention import HAVE_FLASH_ATTN
 
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or not HAVE_FLASH_ATTN,
-    reason="ring attention needs CUDA + flash-attn",
-)
+# Over the default 5s budget on purpose: this module spawns worker processes; every child re-imports torch from scratch.
+# Shrink the work or the process count before raising this further.
+pytestmark = [
+    pytest.mark.timeout(60),
+    pytest.mark.skipif(
+        not torch.cuda.is_available() or not HAVE_FLASH_ATTN,
+        reason="ring attention needs CUDA + flash-attn",
+    ),
+]
 
 
 def _eager_cached_reference(q, cache_k, cache_v, scale):

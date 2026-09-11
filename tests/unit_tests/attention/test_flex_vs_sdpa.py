@@ -21,6 +21,10 @@ from torch.nn.attention.flex_attention import flex_attention
 
 from nemo_automodel.components.attention.flex_attention import FlexAttention
 
+# Over the default 5s budget on purpose: CUDA FlexAttention compilation takes longer on a cold worker.
+# Reduce cold compiler startup before lowering this further.
+pytestmark = pytest.mark.timeout(60)
+
 
 def test_flex_attention_without_sinks_matches_causal_sdpa(monkeypatch: pytest.MonkeyPatch) -> None:
     torch.manual_seed(371)

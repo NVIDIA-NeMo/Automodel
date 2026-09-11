@@ -14,9 +14,14 @@
 
 from pathlib import Path
 
+import pytest
 from ruamel.yaml import YAML
 
 from tests.ci_tests.utils.generate_ci_tests import generate_job, generate_pipeline
+
+# Over the default 5s budget on purpose: this module parses every example config under examples/.
+# Shrink the work or the process count before raising this further.
+pytestmark = pytest.mark.timeout(60)
 
 
 def test_example_checkpoint_robustness_configs_do_not_use_removed_fields():

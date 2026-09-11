@@ -51,6 +51,10 @@ import yaml
 
 from tests.unit_tests._transformers.test_doc_coverage import _DOC_ARCH_ALIASES
 
+# Over the default 5s budget on purpose: this module scans every recipe YAML and every docs page.
+# Shrink the work or the process count before raising this further.
+pytestmark = pytest.mark.timeout(60)
+
 
 def _repo_root() -> pathlib.Path:
     return pathlib.Path(__file__).resolve().parents[3]
