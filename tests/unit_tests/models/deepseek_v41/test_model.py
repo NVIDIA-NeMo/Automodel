@@ -46,6 +46,7 @@ from nemo_automodel.components.models.deepseek_v41.config import (
 )
 from nemo_automodel.components.models.deepseek_v41.model import DeepseekV41ForCausalLM
 from nemo_automodel.components.moe.parallelizer import _is_deepseek_v4_model, apply_ac
+from nemo_automodel.components.speculative.dspark.target import HFDSparkTargetModel
 
 # Over the default 5s budget on purpose: this module runs full-model forwards and distributed FSDP checks.
 # Shrink the model fixtures and process startup before lowering this further.
@@ -254,6 +255,43 @@ def test_captured_streams_and_final_hidden_states_have_distinct_contracts() -> N
     assert len(captured.hidden_states) == 1
     assert captured.hidden_states[0].shape == (1, 4, 4, 16)
     torch.testing.assert_close(final.logits, captured.logits, rtol=0, atol=0)
+
+
+def test_dspark_target_features_are_attention_input_stream_means() -> None:
+    model = _model()
+    feature_module = model.get_dspark_target_feature_modules([0])[0]
+    observed: list[torch.Tensor] = []
+
+    def capture_attention_input(_module: torch.nn.Module, inputs: tuple[torch.Tensor, ...]) -> None:
+        """Record the attention input.
+
+        Args:
+            _module: Hyper-connection module producing the attention mix.
+            inputs: Tuple whose first item is a tensor of shape
+                [batch, sequence, streams, hidden].
+        """
+        observed.append(inputs[0].detach().clone())
+
+    handle = feature_module.register_forward_pre_hook(capture_attention_input)
+    tokens = torch.tensor([[3, 4, 5, 6]])
+    try:
+        batch = HFDSparkTargetModel(model, target_layer_ids=[0]).generate_batch(
+            tokens,
+            torch.ones_like(tokens),
+            torch.ones_like(tokens),
+        )
+    finally:
+        handle.remove()
+
+    assert len(observed) == 1
+    torch.testing.assert_close(batch.target_hidden_states, observed[0].mean(dim=2), rtol=0, atol=0)
+    assert batch.target_last_hidden_states.shape == (1, 4, model.config.text_config.hidden_size)
+
+
+@pytest.mark.parametrize("layer_ids", [[0, 0], [1, 0], [-1], [1]])
+def test_dspark_target_feature_modules_reject_invalid_layer_ids(layer_ids: list[int]) -> None:
+    with pytest.raises(ValueError, match="DSpark target layer IDs"):
+        _model().get_dspark_target_feature_modules(layer_ids)
 
 
 def _build_model(config=None):

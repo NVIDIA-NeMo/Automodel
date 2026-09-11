@@ -384,6 +384,36 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
         """Return the independent vocabulary projection."""
         return self.lm_head
 
+    def get_dspark_target_feature_modules(self, layer_ids: list[int]) -> tuple[nn.Module, ...]:
+        """Return modules whose inputs are the released DSpark target features.
+
+        The reference implementation captures the residual streams immediately
+        before attention in each selected layer, after that layer's optional
+        Engram update. The attention hyper-connection is the first module to
+        consume those streams, so its forward input is the exact capture point.
+
+        Args:
+            layer_ids: Strictly increasing decoder-layer indices in
+                ``[0, num_hidden_layers)``.
+
+        Returns:
+            Modules ordered like ``layer_ids``. Each receives a tensor of shape
+            [batch, sequence, streams, hidden] as its first forward argument.
+
+        Raises:
+            ValueError: If the indices are duplicated, unsorted, or outside the
+                active decoder depth.
+        """
+        if layer_ids != sorted(set(layer_ids)):
+            raise ValueError("DSpark target layer IDs must be strictly increasing")
+        if any(
+            type(layer_id) is not int or layer_id < 0 or layer_id >= len(self.model.layers) for layer_id in layer_ids
+        ):
+            raise ValueError(
+                f"DSpark target layer IDs must be integers in [0, {len(self.model.layers)}), got {layer_ids}"
+            )
+        return tuple(self.model.layers[str(layer_id)].attn_hc for layer_id in layer_ids)
+
     def _image_embeddings(
         self,
         input_ids: torch.Tensor,
