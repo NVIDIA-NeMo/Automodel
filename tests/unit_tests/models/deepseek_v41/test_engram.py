@@ -43,6 +43,10 @@ from nemo_automodel.components.models.qwen3_8_flash_next.engram import Qwen3_8_F
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
 from nemo_automodel.shared.multimodal_fsdp import ignored_params_for_root
 
+# Over the default 5s budget on purpose: distributed owner and checkpoint tests spawn Gloo workers.
+# Shrink process startup and checkpoint round trips before lowering this further.
+pytestmark = pytest.mark.timeout(60)
+
 
 def _tiny_config() -> DeepseekV41TextConfig:
     return DeepseekV41TextConfig(
