@@ -132,16 +132,6 @@ def test_hash_matches_official_fixture_with_compressed_tokens_and_image_barriers
     torch.testing.assert_close(hasher(input_ids, token_mask=mask), expected, rtol=0, atol=0)
 
 
-def test_packed_hashes_equal_individual_documents() -> None:
-    hasher = DeepseekV41NgramHash(_tiny_config(), _tokenizer())
-    first, second = torch.tensor([[7, 4, 8]]), torch.tensor([[1, 7, 6, 5]])
-    packed_ids = torch.cat((first, second), dim=1)
-    positions = torch.tensor([[0, 1, 2, 0, 1, 2, 3]])
-    expected = torch.cat((hasher(first), hasher(second)), dim=1)
-    torch.testing.assert_close(hasher(packed_ids, position_ids=positions), expected, rtol=0, atol=0)
-    assert not torch.equal(hasher(packed_ids), expected)
-
-
 def test_hash_metadata_restored_after_meta_materialization() -> None:
     tokenizer = _tokenizer()
     reference = DeepseekV41NgramHash(_tiny_config(), tokenizer)

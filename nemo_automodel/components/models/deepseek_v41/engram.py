@@ -162,20 +162,15 @@ class DeepseekV41NgramHash(nn.Module):
         input_ids: torch.Tensor,
         *,
         token_mask: torch.Tensor | None = None,
-        position_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Hash tokens without crossing image, padding, or packed-document boundaries.
+        """Hash unpacked sequences without crossing image or padding boundaries.
 
         Args:
             input_ids: Integer tensor of shape [batch, sequence] containing raw
-                tokenizer IDs. Under CP this is the replicated global sequence;
-                the caller slices the output before the distributed lookup.
+                tokenizer IDs for complete, unpacked sequences.
             token_mask: Optional boolean tensor of shape [batch, sequence].
                 False marks image or padding tokens and blocks all lookback
                 through those positions. The caller also masks their residual gate.
-            position_ids: Optional integer tensor of shape [batch, sequence].
-                A non-increasing position marks a new packed document. Omit for
-                unpacked sequences; a CP-local slice alone lacks preceding context.
 
         Returns:
             Integer tensor of shape [batch, sequence, engram_layers, hash_heads],
@@ -193,21 +188,12 @@ class DeepseekV41NgramHash(nn.Module):
                 raise ValueError("Engram token_mask must be bool with the same [batch, sequence] shape as input_ids")
             compressed = torch.where(token_mask, compressed, -1)
         positions = torch.arange(sequence, device=input_ids.device).expand(batch, sequence)
-        segment_start = torch.zeros_like(positions)
-        if position_ids is not None:
-            if position_ids.shape != input_ids.shape or position_ids.dtype not in (torch.int32, torch.int64):
-                raise ValueError("Engram position_ids must be int32/int64 with the same shape as input_ids")
-            starts = torch.cat(
-                (torch.ones_like(position_ids[:, :1], dtype=torch.bool), position_ids[:, 1:] <= position_ids[:, :-1]),
-                dim=1,
-            )
-            segment_start = torch.cummax(torch.where(starts, positions, 0), dim=1).values
         blocked = torch.zeros_like(positions, dtype=torch.bool)
         tokens = []
         for shift in range(self.max_ngram_size):
             source_positions = positions - shift
             source = compressed.gather(1, source_positions.clamp_min(0))
-            blocked = blocked | (source_positions < segment_start) | (source == -1)
+            blocked = blocked | (source_positions < 0) | (source == -1)
             tokens.append(torch.where(blocked, self.pad_id, source))
         products = torch.stack(tokens, dim=-1).unsqueeze(2) * self.multipliers
         rolling, hashes = products[..., 0], []

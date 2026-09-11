@@ -255,11 +255,7 @@ class DeepseekV41Model(nn.Module):
         token_mask = None if image_mask is None else ~image_mask
         if attention_mask is not None:
             token_mask = attention_mask.bool() if token_mask is None else token_mask & attention_mask.bool()
-        hashes = (
-            self.engram_hash(input_ids, token_mask=token_mask, position_ids=position_ids)
-            if self.engram_hash is not None
-            else None
-        )
+        hashes = self.engram_hash(input_ids, token_mask=token_mask) if self.engram_hash is not None else None
         state = DeepseekV41AttentionState()
         captured = [] if output_hidden_states else None
         for layer in self.layers.values():
