@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Union
 
 import torch
@@ -192,6 +192,11 @@ class Mistral4Block(Block):
     """Block using Mistral4MLA instead of MLA."""
 
     def __init__(self, layer_idx, config, moe_config, backend):
+        # HF Mistral4 keeps router projection and softmax in the model dtype.
+        # The shared gate otherwise promotes scoring to FP32, which changes
+        # BF16 routing probabilities and can select different experts.
+        if backend.gate_precision is None:
+            backend = replace(backend, gate_precision=get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16))
         super().__init__(layer_idx, config, moe_config, backend)
         # Replace the MLA with Mistral4MLA
         self.self_attn = Mistral4MLA(config, backend)
