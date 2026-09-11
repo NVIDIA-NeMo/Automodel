@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from inspect import unwrap
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -163,7 +164,7 @@ def _make_adapter_and_state(family: str, rank: int):
     return adapter, moe_config, state_dict
 
 
-def test_nemotron_linear_adapter_export_loads_into_hf(tmp_path: Path) -> None:
+def test_nemotron_linear_adapter_export_loads_into_hf(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Base checkpoints with backbone keys must export loadable linear adapters.
 
     Exercise Mamba input, latent projections, shared experts, and lm_head using
@@ -172,8 +173,15 @@ def test_nemotron_linear_adapter_export_loads_into_hf(tmp_path: Path) -> None:
     """
     from peft import LoraConfig, PeftModel, get_peft_model_state_dict
     from safetensors.torch import save_file
+    from transformers.models.nemotron_h import modeling_nemotron_h
     from transformers.models.nemotron_h.configuration_nemotron_h import NemotronHConfig
     from transformers.models.nemotron_h.modeling_nemotron_h import NemotronHForCausalLM
+
+    # Transformers prefers installed causal-conv1d/mamba-ssm kernels even on
+    # CPU. Use its real PyTorch reference functions for this no-cache forward;
+    # use_mamba_kernels=False does not control this newer dispatch path.
+    for name in ("causal_conv1d_fn", "mamba2_chunk_scan"):
+        monkeypatch.setattr(modeling_nemotron_h, name, unwrap(getattr(modeling_nemotron_h, name)))
 
     torch.manual_seed(42)
     config = NemotronHConfig(
@@ -188,7 +196,6 @@ def test_nemotron_linear_adapter_export_loads_into_hf(tmp_path: Path) -> None:
         num_experts_per_tok=1,
         n_group=1,
         topk_group=1,
-        use_mamba_kernels=False,
         mamba_num_heads=8,
         mamba_head_dim=4,
         n_groups=1,
