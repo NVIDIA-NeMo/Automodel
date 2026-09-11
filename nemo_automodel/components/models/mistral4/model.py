@@ -717,7 +717,9 @@ if _HF_MISTRAL3_AVAILABLE:
         # Head lives in the Mistral4 text backbone (separate lm_head, no tie
         # mechanism); the controlling flag is on the nested text_config.
         tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
-        _keep_in_fp32_modules_strict = ["e_score_correction_bias"]
+        # The checkpoint initializer casts the whole wrapper to the parameter dtype.
+        # Preserve rotary frequencies before that cast; upcasting afterward loses precision.
+        _keep_in_fp32_modules_strict = ["e_score_correction_bias", "freqs_cis"]
 
         @dataclass(frozen=True)
         class ModelCapabilities:
