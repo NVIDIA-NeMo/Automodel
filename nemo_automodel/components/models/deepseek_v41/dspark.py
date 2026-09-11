@@ -37,6 +37,7 @@ from nemo_automodel.components.models.deepseek_v4.model import DeepseekV4VisionG
 from nemo_automodel.components.models.deepseek_v41.attention import DeepseekV41Attention
 from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41TextConfig
 from nemo_automodel.components.models.deepseek_v41.layers import DeepseekV41HyperConnection, DeepseekV41RMSNorm
+from nemo_automodel.components.models.deepseek_v41.quantization import quantize_cache
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import MoE
 from nemo_automodel.components.speculative.dspark.common import (
@@ -113,9 +114,11 @@ class _DeepseekV41DSparkAttention(DeepseekV41Attention):
         query = self.wq_b(query_latent).unflatten(-1, (self.num_heads, self.head_dim))
         query = self._apply_rotary(query, draft_angles)
 
-        kv_source = torch.cat((target_hidden_states, hidden_states), dim=1)
-        kv_angles = torch.cat((target_angles, draft_angles), dim=1)
-        kv = self._apply_rotary(self.kv_norm(self.wkv(kv_source)), kv_angles)
+        target_kv = self._apply_rotary(self.kv_norm(self.wkv(target_hidden_states)), target_angles)
+        target_kv = quantize_cache(target_kv, format="fp8", block_size=32)
+        draft_kv = self._apply_rotary(self.kv_norm(self.wkv(hidden_states)), draft_angles)
+        draft_kv = quantize_cache(draft_kv, format="fp8", block_size=32)
+        kv = torch.cat((target_kv, draft_kv), dim=1)
 
         # The synthetic zero-valued key contributes only the learned sink logit
         # to the softmax denominator, matching the released sparse-attention op.
@@ -327,19 +330,15 @@ class DeepseekV41DSparkBackbone(nn.Module):
 
         Returns:
             Integer tensor [batch, context_sequence + num_anchors * block_size].
-            Draft positions are ``anchor + 1`` through ``anchor + block_size``;
-            the anchor token occupies the first draft input slot but predicts the
-            following position in the released implementation.
+            Draft positions are ``anchor`` through ``anchor + block_size - 1``.
+            The target feature at ``anchor - 1`` predicts the anchor token that
+            occupies the first draft input slot.
         """
         if anchor_positions.ndim != 2:
             raise ValueError("DSpark anchor_positions must have shape [batch, num_anchors]")
         batch, num_anchors = anchor_positions.shape
         context = torch.arange(context_sequence, device=anchor_positions.device).view(1, -1).expand(batch, -1)
-        offsets = torch.arange(
-            1,
-            self.config.dspark_block_size + 1,
-            device=anchor_positions.device,
-        ).view(1, 1, -1)
+        offsets = torch.arange(self.config.dspark_block_size, device=anchor_positions.device).view(1, 1, -1)
         draft = (anchor_positions.unsqueeze(-1) + offsets).reshape(batch, num_anchors * self.config.dspark_block_size)
         return torch.cat((context, draft), dim=1)
 
@@ -352,7 +351,7 @@ class DeepseekV41DSparkBackbone(nn.Module):
     ) -> torch.Tensor:
         """Build the released SWA-128 multi-anchor training mask.
 
-        Every query sees the target window ending at and including its anchor,
+        Every query sees the target window ending immediately before its anchor,
         plus every parallel input in its own draft block. It cannot see another
         anchor's block. Invalid padding blocks retain their own in-block keys so
         no attention row is fully masked; their losses are discarded later.
@@ -380,7 +379,7 @@ class DeepseekV41DSparkBackbone(nn.Module):
         query_block = query_index // block_size
         anchor = anchor_positions.view(batch, 1, num_anchors, 1).repeat_interleave(block_size, dim=2)
         is_context = key_index < context_sequence
-        context_visible = is_context & (key_index <= anchor) & (key_index > anchor - self.config.sliding_window)
+        context_visible = is_context & (key_index < anchor) & (key_index >= anchor - self.config.sliding_window)
 
         is_draft = key_index >= context_sequence
         key_block = (key_index - context_sequence) // block_size

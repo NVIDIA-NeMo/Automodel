@@ -18,6 +18,7 @@ import torch
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41TextConfig
 from nemo_automodel.components.models.deepseek_v41.dspark import DeepseekV41DSparkBackbone
+from nemo_automodel.components.models.deepseek_v41.quantization import quantize_cache
 
 
 def _config() -> DeepseekV41TextConfig:
@@ -54,6 +55,35 @@ def _model(attn: str = "eager") -> DeepseekV41DSparkBackbone:
     model = DeepseekV41DSparkBackbone(_config(), backend)
     model.initialize_weights(torch.device("cpu"))
     return model
+
+
+def _official_attention_reference(
+    layer: torch.nn.Module,
+    hidden_states: torch.Tensor,
+    target_hidden_states: torch.Tensor,
+    position_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Translate the released cache path into equivalent cache-free tensor operations."""
+    context_sequence = target_hidden_states.shape[1]
+    target_angles = layer.rotary_emb(position_ids[:, :context_sequence])
+    draft_angles = layer.rotary_emb(position_ids[:, context_sequence:])
+    query = layer.wq_b(layer.q_norm(layer.wq_a(hidden_states))).unflatten(-1, (layer.num_heads, layer.head_dim))
+    query = layer._apply_rotary(query, draft_angles)
+
+    target_kv = layer._apply_rotary(layer.kv_norm(layer.wkv(target_hidden_states)), target_angles)
+    target_kv = quantize_cache(target_kv, format="fp8", block_size=32)
+    draft_kv = layer._apply_rotary(layer.kv_norm(layer.wkv(hidden_states)), draft_angles)
+    draft_kv = quantize_cache(draft_kv, format="fp8", block_size=32)
+    kv = torch.cat((target_kv, draft_kv, target_kv.new_zeros(target_kv.shape[0], 1, layer.head_dim)), dim=1)
+
+    bias = attention_mask.expand(-1, layer.num_heads, -1, -1).float()
+    sink = layer.sinks_param(query).view(1, layer.num_heads, 1, 1).expand(query.shape[0], -1, query.shape[1], -1)
+    logits = torch.einsum("bshd,btd->bhst", query.float(), kv.float()) * layer.head_dim**-0.5
+    probabilities = (logits + torch.cat((bias, sink), dim=-1)).softmax(dim=-1)
+    attended = torch.einsum("bhst,btd->bshd", probabilities, kv.float()).to(query.dtype)
+    valid_tokens = torch.ones(query.shape[:2], dtype=torch.bool, device=query.device)
+    return layer._project_output(attended, draft_angles, valid_tokens)
 
 
 def test_released_stage_ownership_and_draft_moe_shape() -> None:
@@ -137,6 +167,32 @@ def test_sdpa_matches_eager_attention() -> None:
     )
 
 
+def test_attention_matches_official_post_rope_fp8_reference() -> None:
+    torch.manual_seed(29)
+    model = _model("eager").eval()
+    layer = model.mtp[0].attn
+    hidden_states = torch.randn(1, 5, 16)
+    target_hidden_states = torch.randn(1, 4, 16)
+    position_ids = torch.tensor([[0, 1, 2, 3, 1, 2, 3, 4, 5]])
+    attention_mask = torch.zeros(1, 1, 5, 9)
+    attention_mask[..., 3] = -torch.inf
+
+    expected = _official_attention_reference(
+        layer,
+        hidden_states,
+        target_hidden_states,
+        position_ids,
+        attention_mask,
+    )
+    actual = layer(
+        hidden_states,
+        target_hidden_states,
+        position_ids=position_ids,
+        attention_mask=attention_mask,
+    )
+    torch.testing.assert_close(actual, expected, rtol=2e-6, atol=2e-7)
+
+
 def test_markov_and_confidence_heads_follow_released_shapes() -> None:
     model = _model()
     final = model.mtp[-1]
@@ -149,21 +205,23 @@ def test_markov_and_confidence_heads_follow_released_shapes() -> None:
     assert confidence.dtype == torch.float32
 
 
-def test_official_positions_and_swa_mask_include_anchor_context() -> None:
+def test_official_positions_and_swa_mask_end_before_anchor() -> None:
     model = _model()
     anchors = torch.tensor([[1, 5]])
     keep = torch.tensor([[True, True]])
     positions = model.build_position_ids(anchors, context_sequence=8)
-    assert positions.tolist() == [[0, 1, 2, 3, 4, 5, 6, 7, 2, 3, 4, 5, 6, 6, 7, 8, 9, 10]]
+    assert positions.tolist() == [[0, 1, 2, 3, 4, 5, 6, 7, 1, 2, 3, 4, 5, 5, 6, 7, 8, 9]]
 
     mask = model.build_attention_mask(anchors, keep, context_sequence=8, dtype=torch.float32)
     visible = mask[:, 0] == 0
-    # Both blocks see their anchor in target context and every slot in their
-    # own parallel draft block, but cannot see the other block.
-    assert visible[0, 0, 1]
+    # Both blocks see target context only through the position before their
+    # anchor and every slot in their own parallel draft block.
+    assert visible[0, 0, 0]
+    assert not visible[0, 0, 1]
     assert visible[0, 0, 8:13].all()
     assert not visible[0, 0, 13:].any()
-    assert visible[0, 5, 5]
+    assert visible[0, 5, :5].all()
+    assert not visible[0, 5, 5]
     assert visible[0, 5, 13:18].all()
     assert not visible[0, 5, 8:13].any()
 
