@@ -48,8 +48,17 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 
-def pytest_collection_modifyitems(items):
-    """Give unit tests a 5s default while preserving explicit overrides."""
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    """Give unmarked unit tests a 5s fallback timeout.
+
+    pytest-timeout resolves a test's timeout as marker, then ``--timeout``, then
+    ``PYTEST_TIMEOUT``, then the ``timeout`` ini option. The fallback is installed
+    as a marker, so it would outrank all three global settings; it is therefore
+    skipped entirely when any of them was set explicitly. Genuine per-test or
+    per-module ``timeout`` markers are always preserved.
+    """
+    if config.getoption("timeout") is not None or "PYTEST_TIMEOUT" in os.environ or config.getini("timeout"):
+        return
     unit_tests_root = Path(__file__).parent
     for item in items:
         if unit_tests_root in item.path.parents and item.get_closest_marker("timeout") is None:
