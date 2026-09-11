@@ -125,13 +125,12 @@ ci:
     step_scheduler.local_batch_size: 4
     # HF 5.15.1 scores this router in BF16. Compare with its original algorithm
     # using FP32 softmax/normalization/weights, as corroborated by vLLM's router.
-    # Projection and checkpoint storage stay unchanged; all previous gates remain.
+    # Projection and checkpoint storage stay unchanged.
     # Reference precision audit: https://linear.app/nvidia/issue/AM-821
     hf_router_scores_fp32: true
-    # Existing reload calibration (#3620): AutoModel cosine 0.998487 < 0.999;
-    # HF mean/p95 KL 0.0203/0.0725 exceeded standard. Source stays standard.
+    # Retain only the HF reload calibration (#3620): mean/p95 KL 0.0203/0.0725.
+    # Source and AutoModel reload use standard; recent AutoModel reloads are exact.
     parity_tolerance_profile_overrides:
-      automodel_reload: relaxed
       hf_reload: relaxed
     hf_device_map_auto: true
     # Transformers' load-time dequantization leaves Mistral4 expert weights in
