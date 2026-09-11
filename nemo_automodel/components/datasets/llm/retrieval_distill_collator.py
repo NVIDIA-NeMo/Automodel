@@ -213,19 +213,23 @@ class BiEncoderDistillCollator:
         neg_lists_raw = [docs[1:] for docs in doc_lists]
         neg_lists = [[self._apply_passage_prefix(n, pi) for n in negs] for negs, pi in zip(neg_lists_raw, passage_inst)]
 
+        token_type_kwargs = {}
+        if "token_type_ids" in getattr(self.tokenizer, "model_input_names", []):
+            token_type_kwargs["return_token_type_ids"] = False
+
         q_enc = self.tokenizer(
             query_texts,
             max_length=self.q_max_len,
             padding=PaddingStrategy.DO_NOT_PAD,
             truncation=True,
-            return_token_type_ids=False,
+            **token_type_kwargs,
         )
         d_enc = self.tokenizer(
             pos_docs,
             max_length=self.p_max_len,
             padding=PaddingStrategy.DO_NOT_PAD,
             truncation=True,
-            return_token_type_ids=False,
+            **token_type_kwargs,
         )
 
         q_features = [{k: q_enc[k][i] for k in q_enc.keys()} for i in range(len(query_texts))]
@@ -300,7 +304,7 @@ class BiEncoderDistillCollator:
             max_length=self.p_max_len,
             padding=PaddingStrategy.DO_NOT_PAD,
             truncation=True,
-            return_token_type_ids=False,
+            **token_type_kwargs,
         )
         n_features = [{k: n_enc[k][i] for k in n_enc.keys()} for i in range(len(flat_negs))]
         n_batch = self.tokenizer.pad(
