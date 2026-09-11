@@ -161,6 +161,21 @@ dataloader:
   persistent_workers: true
   drop_last: true
   shuffle: true
+  # Optional: group similar-length conversations into the same batch. Measured on
+  # 8xH200 (EP8, local_batch_size 2, 50 steps, identical otherwise):
+  #   random batching : 22,258 tok/s | val 0.6561 @24, 0.5605 @49 | grad_norm max 8.50
+  #   length-grouped  : 34,796 tok/s | val 0.6642 @24, 0.5718 @49 | grad_norm max 13.28
+  # +56% throughput (padding 31.7% -> 0%, and the slowest-rank token count per step
+  # drops ~45%), but validation is consistently ~2% worse and gradient norms are
+  # larger, because a length-homogeneous batch averages the gradient over a narrower
+  # slice of the corpus. Left OFF pending a longer A/B; enable only deliberately.
+  # NOTE: grouping also makes the worst-case batch certain rather than rare -- the
+  # longest rows are placed together by construction (81,842 padded tokens/rank at
+  # lbs 2, 163,684 at lbs 4), so re-measure the memory ceiling before enabling.
+  # length_grouped_sampler:
+  #   seed: 1234
+  #   length_key: n_tokens
+
   collate_fn:
     # Supervises only the final assistant turn. The shipped label builder matches
     # the marker "<|im_start|>assistant\n" and supervises EVERY assistant turn,

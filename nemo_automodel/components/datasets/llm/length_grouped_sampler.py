@@ -35,6 +35,7 @@ from __future__ import annotations
 import itertools
 import logging
 import time
+from collections.abc import Sequence
 from typing import Any, Dict, Iterator
 
 import torch
@@ -66,6 +67,13 @@ class LengthGroupedSampler(Sampler[int]):
         rank: This rank's index (default: current rank).
         drop_last: Drop the tail indices that don't fill a full batch
             across all ranks.
+        lengths: Optional per-sample token counts, indexed like ``dataset``.
+            When given, these are used verbatim instead of reading
+            ``input_ids`` from every sample. Use this when exact lengths are
+            already known (for example a pre-filter that tokenized the corpus)
+            or when the dataset is not pre-tokenized, in which case the
+            ``input_ids`` lookup would silently yield zero for every sample and
+            disable grouping.
     """
 
     def __init__(
@@ -76,6 +84,7 @@ class LengthGroupedSampler(Sampler[int]):
         num_replicas: int | None = None,
         rank: int | None = None,
         drop_last: bool = True,
+        lengths: Sequence[int] | None = None,
     ) -> None:
         if num_replicas is None:
             num_replicas = dist.get_world_size() if dist.is_initialized() else 1
@@ -93,7 +102,15 @@ class LengthGroupedSampler(Sampler[int]):
         self._next_yielded: int | None = None
 
         # Compute lengths
-        self.lengths = self._compute_lengths(dataset)
+        if lengths is not None:
+            if len(lengths) != len(dataset):
+                raise ValueError(
+                    f"lengths has {len(lengths)} entries but dataset has {len(dataset)} samples; "
+                    "they must be indexed identically."
+                )
+            self.lengths = list(lengths)
+        else:
+            self.lengths = self._compute_lengths(dataset)
 
         # Sort by length (descending) and shard across ranks
         sorted_all = sorted(range(len(dataset)), key=lambda i: self.lengths[i], reverse=True)
@@ -162,6 +179,12 @@ class LengthGroupedSampler(Sampler[int]):
                 )
 
         logger.info("Length computation done in %.1fs", time.monotonic() - t0)
+        if n and not any(lengths):
+            logger.warning(
+                "LengthGroupedSampler: every sample reported length 0, so grouping is a no-op. "
+                "The dataset has no 'input_ids' key (it is probably not pre-tokenized) -- "
+                "pass explicit per-sample token counts via the 'lengths' argument instead."
+            )
         return lengths
 
     def set_epoch(self, epoch: int) -> None:

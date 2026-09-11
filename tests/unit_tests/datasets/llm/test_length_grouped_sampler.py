@@ -171,3 +171,70 @@ class TestYieldedTracking:
         # Second iteration without another load_state_dict should yield all
         second = _collect(sampler)
         assert len(second) == len(sampler)
+
+
+# ---------------------------------------------------------------------------
+# Explicit lengths source
+# ---------------------------------------------------------------------------
+
+
+class TestExplicitLengths:
+    def test_explicit_lengths_group_similar_sizes_without_input_ids(self):
+        """A dataset with no ``input_ids`` still groups when lengths are supplied."""
+        # Interleave short and long samples so a length-blind sampler cannot group them.
+        lengths = [10, 1000, 20, 2000, 30, 3000, 40, 4000]
+        dataset = [{"conversation": []} for _ in lengths]
+
+        sampler = LengthGroupedSampler(dataset=dataset, batch_size=2, seed=0, lengths=lengths)
+        order = _collect(sampler)
+
+        assert sorted(order) == list(range(len(lengths)))
+        # Each emitted batch pairs samples adjacent in sorted order, so the spread
+        # inside a batch stays small relative to the corpus-wide spread.
+        for start in range(0, len(order), 2):
+            batch = [lengths[i] for i in order[start : start + 2]]
+            assert max(batch) / min(batch) <= 2.0
+
+    def test_explicit_lengths_beat_input_ids_fallback_on_untokenized_data(self):
+        """Without lengths an untokenized dataset yields no grouping at all."""
+        lengths = [10, 1000, 20, 2000]
+        dataset = [{"conversation": []} for _ in lengths]
+
+        blind = LengthGroupedSampler(dataset=dataset, batch_size=2, seed=0)
+        # Every length reads back as 0, so the sort is index order, not length order.
+        assert blind.lengths == [0, 0, 0, 0]
+
+        informed = LengthGroupedSampler(dataset=dataset, batch_size=2, seed=0, lengths=lengths)
+        assert informed.lengths == lengths
+
+    def test_length_mismatch_raises(self):
+        dataset = [{"input_ids": [0]} for _ in range(4)]
+        try:
+            LengthGroupedSampler(dataset=dataset, batch_size=2, lengths=[1, 2, 3])
+        except ValueError as exc:
+            assert "3 entries" in str(exc) and "4 samples" in str(exc)
+        else:
+            raise AssertionError("expected ValueError for mismatched lengths")
+
+    def test_ranks_receive_disjoint_equal_shards(self):
+        """Interleaved sharding gives each rank a distinct, equally sized slice."""
+        lengths = [100 * i for i in range(1, 17)]
+        dataset = [{"conversation": []} for _ in lengths]
+
+        shards = [
+            set(
+                LengthGroupedSampler(
+                    dataset=dataset,
+                    batch_size=2,
+                    seed=0,
+                    num_replicas=4,
+                    rank=r,
+                    lengths=lengths,
+                )
+            )
+            for r in range(4)
+        ]
+
+        assert all(len(shard) == 4 for shard in shards)
+        union = set().union(*shards)
+        assert len(union) == sum(len(shard) for shard in shards) == 16

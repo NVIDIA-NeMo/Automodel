@@ -34,6 +34,9 @@ from nemo_automodel.components.datasets.vlm.collate_fns import default_collate_f
 
 IGNORE_INDEX = -100
 
+_LENGTH_COLUMN = "n_tokens"
+"""Exact rendered token count per row, written by ``scripts/prefilter_v4_88k.py``."""
+
 _ROLES = frozenset({"system", "user", "assistant"})
 
 # Attribute used to memoize (assistant marker ids, generation-prompt suffix ids) on the
@@ -66,8 +69,12 @@ def make_v4_88k_dataset(
             dataset target do not raise.
 
     Returns:
-        datasets.Dataset: Rows with a single ``conversation`` column, each a list of
-        ``{"role": ..., "content": [{"type": "text", "text": ...}]}`` turns.
+        datasets.Dataset: Rows with a ``conversation`` column, each a list of
+        ``{"role": ..., "content": [{"type": "text", "text": ...}]}`` turns, plus the
+        ``n_tokens`` column when the source carries it (written by
+        ``scripts/prefilter_v4_88k.py``). ``n_tokens`` is the exact rendered length
+        from the real tokenizer and chat template, so ``dataloader.length_grouped_sampler``
+        can group by it instead of estimating.
     """
     if str(path_or_dataset).endswith(".parquet"):
         dataset = load_dataset("parquet", data_files=str(path_or_dataset), split="train")
@@ -93,7 +100,11 @@ def make_v4_88k_dataset(
             conversation.append(turn)
         return {"conversation": conversation}
 
-    return dataset.map(_to_conversation, remove_columns=dataset.column_names)
+    # Keep the pre-filter's exact rendered token count when present: it is what
+    # dataloader.length_grouped_sampler.length_key reads. Everything else is dropped,
+    # since the collator only consumes "conversation".
+    dropped = [name for name in dataset.column_names if name != _LENGTH_COLUMN]
+    return dataset.map(_to_conversation, remove_columns=dropped)
 
 
 def _resolve_markers(tokenizer) -> tuple[list[int], list[list[int]]]:

@@ -372,7 +372,11 @@ class RecipeConfig:
 
         from nemo_automodel.components.datasets.loader import make_dataset_config
         from nemo_automodel.components.datasets.vlm.datasets import PreTokenizedDatasetWrapperConfig
-        from nemo_automodel.components.datasets.vlm.loader import VlmCollatorConfig, VlmDataloaderConfig
+        from nemo_automodel.components.datasets.vlm.loader import (
+            LengthGroupedSamplerConfig,
+            VlmCollatorConfig,
+            VlmDataloaderConfig,
+        )
         from nemo_automodel.components.datasets.vlm.neat_packing_vlm import NeatPackConfig
 
         target, dataset_kwargs = _callable_and_kwargs(dataset_node)
@@ -455,6 +459,19 @@ class RecipeConfig:
                 raise TypeError(f"VLM collate_fn must resolve to a callable, got {factory!r}")
             collator = VlmCollatorConfig(factory=factory, kwargs=collate_kwargs)
 
+        sampler_node = loader_kwargs.pop("length_grouped_sampler", None)
+        length_grouped_sampler = None
+        if sampler_node is not None:
+            sampler_kwargs = _as_dict(sampler_node)
+            sampler_fields = {"seed", "length_key"}
+            unknown_sampler = sorted(set(sampler_kwargs) - sampler_fields)
+            if unknown_sampler:
+                raise TypeError(f"Unexpected VLM length_grouped_sampler config field(s): {', '.join(unknown_sampler)}")
+            length_grouped_sampler = LengthGroupedSamplerConfig(
+                seed=sampler_kwargs.get("seed", 42),
+                length_key=sampler_kwargs.get("length_key", None),
+            )
+
         loader_fields = {
             "shuffle",
             "num_workers",
@@ -480,6 +497,7 @@ class RecipeConfig:
             persistent_workers=loader_kwargs.pop("persistent_workers", False),
             prefetch_factor=loader_kwargs.pop("prefetch_factor", None),
             drop_last=loader_kwargs.pop("drop_last", False),
+            length_grouped_sampler=length_grouped_sampler,
         )
 
     @cached_property

@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from functools import partial
 from typing import Protocol, runtime_checkable
 
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Sampler
 from torch.utils.data.distributed import DistributedSampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoProcessor, ProcessorMixin
@@ -150,6 +150,69 @@ class VlmDataloaderBuild:
     processor: ProcessorMixin | None
 
 
+@dataclass(frozen=True)
+class LengthGroupedSamplerConfig:
+    """Declarative config for length-grouped batching.
+
+    Groups samples of similar token count into the same batch so the collator pads
+    less, and shards the sorted order across ranks so every rank's batch ``K`` holds
+    comparable lengths. That keeps the data-parallel ranks from waiting on whichever
+    rank drew the longest sample.
+
+    Attributes:
+        seed: Base seed for the per-epoch chunk shuffle. Must match on every rank.
+        length_key: Optional dataset column holding exact per-sample token counts.
+            When set, those counts are used instead of measuring ``input_ids``,
+            which a non-pre-tokenized dataset does not have.
+    """
+
+    seed: int = 42
+    length_key: str | None = None
+
+    def build(
+        self,
+        *,
+        dataset: Sized,
+        dp_rank: int,
+        dp_world_size: int,
+        batch_size: int,
+        drop_last: bool,
+    ) -> "Sampler[int]":
+        """Build the sampler for one rank.
+
+        Args:
+            dataset: Sized dataset the sampler indexes into.
+            dp_rank: Rank within the data-parallel group.
+            dp_world_size: Size of the data-parallel group.
+            batch_size: Runtime local batch size; sets the length-grouping chunk width.
+            drop_last: Whether to drop the tail that cannot fill a batch on every rank.
+
+        Returns:
+            Sampler yielding indices into ``dataset`` for this rank.
+        """
+        from nemo_automodel.components.datasets.llm.length_grouped_sampler import LengthGroupedSampler
+
+        lengths = None
+        if self.length_key is not None:
+            column = getattr(dataset, "column_names", None)
+            if column is None or self.length_key not in column:
+                raise ValueError(
+                    f"length_key={self.length_key!r} is not a column of the dataset "
+                    f"(columns: {sorted(column) if column else 'unknown'})."
+                )
+            lengths = list(dataset.with_format(None)[self.length_key])
+
+        return LengthGroupedSampler(
+            dataset=dataset,
+            batch_size=batch_size,
+            seed=self.seed,
+            num_replicas=dp_world_size,
+            rank=dp_rank,
+            drop_last=drop_last,
+            lengths=lengths,
+        )
+
+
 @dataclass
 class VlmDataloaderConfig:
     """Typed construction config for the complete VLM input pipeline."""
@@ -166,6 +229,7 @@ class VlmDataloaderConfig:
     persistent_workers: bool = False
     prefetch_factor: int | None = None
     drop_last: bool = False
+    length_grouped_sampler: LengthGroupedSamplerConfig | None = None
 
     def resolve_packing_attn_implementation(
         self,
@@ -327,12 +391,27 @@ class VlmDataloaderConfig:
 
         if not isinstance(dataset, Sized):
             raise TypeError(f"VLM dataloaders require a sized dataset, got {type(dataset).__name__}")
-        sampler = DistributedSampler(
-            dataset,
-            num_replicas=dp_world_size,
-            rank=dp_rank,
-            shuffle=self.shuffle,
-        )
+        if self.length_grouped_sampler is not None:
+            logger.info(
+                "Using length-grouped batching (length_key=%r); dataloader.shuffle=%s is superseded by "
+                "the sampler's per-epoch chunk shuffle.",
+                self.length_grouped_sampler.length_key,
+                self.shuffle,
+            )
+            sampler = self.length_grouped_sampler.build(
+                dataset=dataset,
+                dp_rank=dp_rank,
+                dp_world_size=dp_world_size,
+                batch_size=batch_size,
+                drop_last=self.drop_last,
+            )
+        else:
+            sampler = DistributedSampler(
+                dataset,
+                num_replicas=dp_world_size,
+                rank=dp_rank,
+                shuffle=self.shuffle,
+            )
         dataloader = StatefulDataLoader(
             dataset=dataset,
             sampler=sampler,
