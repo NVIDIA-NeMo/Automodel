@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from torch import nn
 
 from nemo_automodel.components.speculative.dspark.draft_deepseek_v4 import DeepseekV4DSparkModel
+from nemo_automodel.components.speculative.dspark.draft_deepseek_v41 import DeepseekV41DSparkModel
 from nemo_automodel.components.speculative.dspark.draft_gemma4 import Gemma4DSparkModel
 from nemo_automodel.components.speculative.dspark.draft_glm_5_2 import Glm5_2DSparkModel
 from nemo_automodel.components.speculative.dspark.draft_kimi_k3 import KimiK3DSparkModel
@@ -55,6 +56,9 @@ DSPARK_DRAFT_REGISTRY: dict[str, DraftSpec] = {
 # grouped O-LoRA, interleaved partial RoPE), registered separately from the
 # Qwen3-style drafts because its backbone differs.
 DSPARK_DRAFT_REGISTRY["DeepseekV4ForCausalLM"] = DraftSpec(draft_cls=DeepseekV4DSparkModel)
+# DeepSeek V4.1 ships a native three-stage MoE DSpark module under ``mtp.*``.
+# Its architecture is intentionally separate from the older dense V4 draft.
+DSPARK_DRAFT_REGISTRY["DeepseekV41ForCausalLM"] = DraftSpec(draft_cls=DeepseekV41DSparkModel)
 # GLM-5.2 target (HF arch GlmMoeDsaForCausalLM): a dense GLM MLA draft (DeepSeek-V3-style
 # Q-LoRA + compressed KV latent + interleaved complex RoPE), with the DSA indexer and MoE
 # dropped. Registered separately because its MLA backbone differs from V4's.
