@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CPU mathematical and gradient checks for the dequantized CSA2 training path."""
+"""Attention lifecycle and independent RoPE, compressor and indexer arithmetic."""
 
 import copy
+import math
+from dataclasses import FrozenInstanceError, replace
 
 import pytest
 import torch
@@ -27,11 +29,13 @@ from nemo_automodel.components.models.deepseek_v41.attention import (
     DeepseekV41AttentionState,
     _apply_rope,
     _Compressor,
+    _Indexer,
     _RotaryEmbedding,
     _select_candidate_blocks,
 )
 from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41TextConfig
 from nemo_automodel.components.models.deepseek_v41.quantization import quantize_cache
+from tests.unit_tests.models.deepseek_v41.test_quantization import _independent_mx_scale
 
 
 def _config(dtype: str = "float32") -> DeepseekV41TextConfig:
@@ -350,3 +354,241 @@ def test_missing_source_and_unsupported_positions_masks_and_backends_fail() -> N
         )
     with pytest.raises(ValueError, match="eager.*sdpa"):
         DeepseekV41Attention(_config(), 1, _backend("te"))
+
+
+@pytest.mark.parametrize("backend", ["eager", "sdpa"])
+def test_attention_dropout_is_training_only_and_keeps_gradients_finite(backend):
+    torch.manual_seed(107)
+    config = _config()
+    config.attention_dropout = 0.5
+    layer = DeepseekV41Attention(config, 0, _backend(backend))
+    inputs = torch.randn(2, 8, config.hidden_size, requires_grad=True)
+    kwargs = dict(position_ids=torch.arange(8)[None], state=DeepseekV41AttentionState())
+    layer.eval()
+    expected = layer(inputs, **kwargs).hidden_states
+    torch.testing.assert_close(layer(inputs, **kwargs).hidden_states, expected, atol=0, rtol=0)
+    layer.train()
+    torch.manual_seed(108)
+    actual = layer(inputs, **kwargs).hidden_states
+    assert not torch.equal(actual, expected)
+    torch.manual_seed(108)
+    torch.testing.assert_close(layer(inputs, **kwargs).hidden_states, actual, atol=0, rtol=0)
+    actual.square().sum().backward()
+    assert inputs.grad is not None and torch.isfinite(inputs.grad).all()
+    assert layer.sinks_param.weight.grad is not None
+    assert torch.isfinite(layer.sinks_param.weight.grad).all()
+    layer.eval()
+    torch.testing.assert_close(layer(inputs, **kwargs).hidden_states, expected, atol=0, rtol=0)
+
+
+def test_tilelang_requires_zero_dropout_and_attention_requires_supported_projections():
+    config = _config()
+    config.attention_dropout = 0.1
+    with pytest.raises(ValueError, match="attention_dropout=0"):
+        DeepseekV41Attention(config, 0, _backend("tilelang"))
+    config.attention_dropout = 0
+    with pytest.raises(ValueError, match="torch linear"):
+        DeepseekV41Attention(config, 0, replace(_backend(), linear="te"))
+    with pytest.raises(ValueError, match="torch_fp32"):
+        DeepseekV41Attention(config, 0, replace(_backend(), rms_norm="torch"))
+
+
+@pytest.mark.parametrize("batch,sequence", [(2, 6), (1, 5)])
+def test_reuse_rejects_state_from_another_batch_or_sequence(batch, sequence):
+    config = _config()
+    full = DeepseekV41Attention(config, 1, _backend())
+    reuse = DeepseekV41Attention(config, 2, _backend())
+    source = full(
+        torch.randn(1, 6, config.hidden_size),
+        position_ids=torch.arange(6)[None],
+        state=DeepseekV41AttentionState(),
+    )
+    with pytest.raises(ValueError, match="different batch or sequence"):
+        reuse(
+            torch.randn(batch, sequence, config.hidden_size),
+            position_ids=torch.arange(sequence)[None],
+            state=source.state,
+        )
+    with pytest.raises(ValueError, match="same compression ratio"):
+        reuse(
+            torch.randn(1, 6, config.hidden_size),
+            position_ids=torch.arange(6)[None],
+            state=replace(source.state, compression_ratio=1),
+        )
+    with pytest.raises(FrozenInstanceError):
+        source.state.compression_ratio = 1
+
+
+def test_indexer_rejects_missing_latent_keys_and_candidates():
+    config = _config()
+    x = torch.randn(1, 4, config.hidden_size)
+    kwargs = dict(
+        query_latent=torch.randn(1, 4, config.q_lora_rank),
+        latent=None,
+        angles=torch.zeros(1, 4, config.qk_rope_head_dim // 2),
+        compressed_angles=torch.zeros(1, 3, config.qk_rope_head_dim // 2),
+    )
+    full = _Indexer(config, layer_idx=1, dtype=torch.float32)
+    reindex = _Indexer(config, layer_idx=4, dtype=torch.float32)
+    with pytest.raises(ValueError, match="unrotated compressed latent"):
+        full(x, **kwargs, state=DeepseekV41AttentionState())
+    with pytest.raises(ValueError, match="index keys"):
+        reindex(x, **kwargs, state=DeepseekV41AttentionState())
+    state = DeepseekV41AttentionState(compression_ratio=1, index_keys=torch.randn(1, 3, config.index_head_dim))
+    with pytest.raises(ValueError, match="requires candidates"):
+        reindex(x, **kwargs, state=state)
+    with pytest.raises(ValueError, match="requires candidates"):
+        reindex(x, **kwargs, state=replace(state, candidates=torch.ones(1, 4, 2, dtype=torch.bool)))
+
+
+def test_candidate_blocks_with_no_visible_keys():
+    scores = torch.full((2, 3, 7), -torch.inf)
+    lengths = torch.zeros(2, 3, 1, dtype=torch.long)
+    assert not _select_candidate_blocks(scores, lengths, topk_blocks=2, block_size=4).any()
+
+
+def _arithmetic_config(**overrides):
+    values = _config().to_dict()
+    # HF serializes a canonical rope_parameters field alongside the legacy
+    # rope_scaling alias; do not let the old canonical value mask an override.
+    if "rope_scaling" in overrides:
+        values.pop("rope_parameters", None)
+    values.update(head_dim=64, index_head_dim=32, qk_rope_head_dim=16, rms_norm_eps=1e-6, hc_sinkhorn_iters=4)
+    values.update(overrides)
+    return DeepseekV41TextConfig(**values)
+
+
+def _reference_frequencies(positions, dim, theta, scaling):
+    frequencies = 1 / theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim)
+    if scaling:
+        original = scaling["original_max_position_embeddings"]
+        low = max(
+            math.floor(dim * math.log(original / (scaling["beta_fast"] * 2 * math.pi)) / (2 * math.log(theta))), 0
+        )
+        high = min(
+            math.ceil(dim * math.log(original / (scaling["beta_slow"] * 2 * math.pi)) / (2 * math.log(theta))), dim - 1
+        )
+        ramp = ((torch.arange(dim // 2).float() - low) / max(high - low, 1e-3)).clamp(0, 1)
+        frequencies = frequencies / scaling["factor"] * ramp + frequencies * (1 - ramp)
+    angles = positions.float().unsqueeze(-1) * frequencies
+    return torch.polar(torch.ones_like(angles), angles)
+
+
+@pytest.mark.parametrize("use_yarn", [False, True])
+@pytest.mark.parametrize("heads", [None, 3])
+def test_rotary_matches_complex_reference_after_bf16_cast_and_backward(use_yarn, heads):
+    torch.manual_seed(94)
+    config = _arithmetic_config(
+        rope_scaling={
+            "factor": 4,
+            "original_max_position_embeddings": 64,
+            "beta_fast": 32,
+            "beta_slow": 1,
+        }
+    )
+    scaling = config.rope_scaling if use_yarn else None
+    theta = config.compress_rope_theta if use_yarn else config.rope_theta
+    module = _RotaryEmbedding(config, compressed=use_yarn).bfloat16()
+    positions = torch.tensor([[0, 1, 63, 64, 257, 4096], [0, 3, 0, 1, 9, 65536]])
+    shape = (2, 6, 64) if heads is None else (2, 6, heads, 64)
+    x = torch.randn(shape, dtype=torch.bfloat16, requires_grad=True)
+    reference_x = x.detach().clone().requires_grad_()
+    phases = _reference_frequencies(positions, 16, theta, scaling)
+    angles = module(positions)
+    assert angles.dtype == torch.float32
+    actual_phases = torch.polar(torch.ones_like(angles), angles)
+    torch.testing.assert_close(actual_phases, phases, rtol=0, atol=0)
+    if heads is not None:
+        phases = phases.unsqueeze(2)
+    for inverse in (False, True):
+        actual = _apply_rope(x, angles, inverse=inverse)
+        pairs = torch.view_as_complex(reference_x[..., -16:].float().reshape(*shape[:-1], 8, 2))
+        rotated = torch.view_as_real(pairs * (phases.conj() if inverse else phases)).flatten(-2).bfloat16()
+        expected = torch.cat([reference_x[..., :-16], rotated], -1)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        upstream = torch.randn_like(actual)
+        actual.backward(upstream, retain_graph=True)
+        expected.backward(upstream, retain_graph=True)
+        torch.testing.assert_close(x.grad, reference_x.grad, rtol=0, atol=0)
+        x.grad = reference_x.grad = None
+
+
+@pytest.mark.parametrize("ratio", [1, 2])
+def test_compressor_cast_boundary_and_all_gradients_match_literal_projection(ratio):
+    torch.manual_seed(73)
+    config = _arithmetic_config(dtype="bfloat16")
+    module = _Compressor(config, ratio=ratio, dtype=torch.bfloat16)
+    # Strict FSDP storage can promote the ratio-1 projection while its compute
+    # must follow the BF16 activation. Ordinary norm weight stays BF16.
+    module.wkv.float()
+    reference = {name: p.detach().clone().requires_grad_() for name, p in module.named_parameters()}
+    x = torch.randn(2, 5, config.hidden_size, dtype=torch.bfloat16, requires_grad=True)
+    reference_x = x.detach().clone().requires_grad_()
+    if ratio == 1:
+        latent = F.linear(reference_x, reference["wkv.weight"].bfloat16())
+    else:
+        chunks = reference_x[:, :4].float().reshape(2, 2, 2, config.hidden_size)
+        kv = F.linear(chunks, reference["wkv.weight"])
+        logits = F.linear(chunks, reference["wgate.weight"])
+        latent = (kv * logits.softmax(2)).sum(2).bfloat16()
+    expected = F.rms_norm(
+        latent.float(), (config.head_dim,), reference["norm.weight"].float(), config.rms_norm_eps
+    ).bfloat16()
+    actual = module(x)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    upstream = torch.randn_like(actual)
+    actual.backward(upstream)
+    expected.backward(upstream)
+    torch.testing.assert_close(x.grad, reference_x.grad, atol=0.015625, rtol=0.015625)
+    if ratio == 2:
+        assert not x.grad[:, -1].any()
+    for name, parameter in module.named_parameters():
+        assert parameter.grad is not None and torch.isfinite(parameter.grad).all()
+        torch.testing.assert_close(parameter.grad, reference[name].grad, atol=0.0625, rtol=0.02)
+
+
+def test_indexer_uses_bf16_scores_and_returns_sorted_positions_with_empty_queries():
+    torch.manual_seed(83)
+    config = _arithmetic_config(dtype="bfloat16", index_topk=3)
+    module = _Indexer(config, layer_idx=4, dtype=torch.bfloat16)
+    x = torch.randn(2, 8, config.hidden_size, dtype=torch.bfloat16)
+    qr = torch.randn(2, 8, config.q_lora_rank, dtype=torch.bfloat16)
+    # Identity RoPE isolates projection, mandatory query QAT, BF16 score
+    # boundaries, causal/candidate visibility, and frozen ownership.
+    angles = torch.zeros(2, 8, config.qk_rope_head_dim // 2)
+    keys = torch.randn(2, 7, config.index_head_dim, dtype=torch.bfloat16)
+    compressed_valid = torch.ones(2, 7, dtype=torch.bool)
+    compressed_valid[:, 0] = False
+    candidates = torch.zeros(2, 8, 7, dtype=torch.bool)
+    candidates[:, :, [0, 2, 4, 6]] = True
+    state = DeepseekV41AttentionState(
+        compression_ratio=1,
+        index_keys=keys,
+        compressed_valid=compressed_valid,
+        candidates=candidates,
+    )
+    actual = module(x, query_latent=qr, latent=None, angles=angles, compressed_angles=angles[:, :7], state=state)
+    q = F.linear(qr, module.wq_b.weight).reshape(2, 8, config.index_n_heads, config.index_head_dim)
+    # Independent nearest-grid rounding, with exact frexp scale selection.
+    quantized = torch.empty_like(q)
+    grid = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
+    for output, row in zip(quantized.reshape(-1, 32), q.reshape(-1, 32)):
+        scale = _independent_mx_scale(max(float(row.abs().max()), 6 * 2.0**-126), 6)
+        values = []
+        for value in (row.float() / scale).tolist():
+            index = min(range(len(grid)), key=lambda i: (abs(abs(value) - grid[i]), i % 2))
+            values.append(math.copysign(grid[index] * scale, value))
+        output.copy_(torch.tensor(values, dtype=torch.bfloat16))
+    weights = F.linear(x, module.weights_proj.weight) * (config.index_head_dim**-0.5 * config.index_n_heads**-0.5)
+    scores = torch.einsum("bshd,btd->bsht", quantized, keys).relu()
+    scores = (scores * weights[..., None]).sum(2)
+    allowed = torch.arange(7)[None, None, :] < torch.arange(1, 9)[None, :, None]
+    scores = scores.masked_fill(~(allowed & compressed_valid[:, None, :] & candidates), -torch.inf)
+    selected = scores.topk(3, sorted=False).indices.sort(-1).values
+    expected = torch.where(torch.isfinite(scores.gather(-1, selected)), selected, -1)
+    torch.testing.assert_close(actual.topk_indices, expected, rtol=0, atol=0)
+    assert actual.candidates is candidates
+    assert actual.index_keys is keys
+    assert not actual.topk_indices[:, 0].ge(0).any()
+    assert state.topk_indices is None
+    assert all(not parameter.requires_grad for parameter in module.parameters())

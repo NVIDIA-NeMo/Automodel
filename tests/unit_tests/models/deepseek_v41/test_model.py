@@ -12,21 +12,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Backbone construction, single-pass residual behavior and training checks."""
+"""Backbone construction, model API, routing precision and distributed ownership contracts."""
 
+import copy
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.nn.functional as F
 
+from nemo_automodel._transformers.capabilities import _is_deepseek_v4
+from nemo_automodel.components.distributed.parallelizer import (
+    DefaultParallelizationStrategy,
+    get_parallelization_strategy,
+)
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype
+from nemo_automodel.components.models.deepseek_v4 import fsdp as dsv4_fsdp
+from nemo_automodel.components.models.deepseek_v41.attention import DeepseekV41AttentionState
 from nemo_automodel.components.models.deepseek_v41.config import (
     DeepseekV41Config,
     DeepseekV41TextConfig,
     DeepseekV41VisionConfig,
 )
-from nemo_automodel.components.models.deepseek_v41.layers import DeepseekV41HyperConnection, DeepseekV41Mix
 from nemo_automodel.components.models.deepseek_v41.model import DeepseekV41ForCausalLM
+from nemo_automodel.components.moe.parallelizer import _is_deepseek_v4_model, apply_ac
 
 
 def _tiny_config() -> DeepseekV41Config:
@@ -78,40 +89,6 @@ def test_custom_moe_must_preserve_released_combine_precision() -> None:
             )
 
 
-def test_mhc_combination_orientation_and_explicit_predecessor_mix() -> None:
-    streams = torch.tensor([[[[1.0, 2.0], [3.0, 4.0]]]], requires_grad=True)
-    previous_pre = torch.tensor([[[1.0, 0.0]]], requires_grad=True)
-    current_pre = torch.tensor([[[0.0, 1.0]]], requires_grad=True)
-    mix = DeepseekV41Mix(
-        current_pre,
-        torch.tensor([[[2.0, 3.0]]]),
-        torch.tensor([[[[0.1, 0.9], [0.6, 0.4]]]]),
-    )
-    collapsed = DeepseekV41HyperConnection.collapse(streams, previous_pre)
-    torch.testing.assert_close(collapsed, torch.tensor([[[1.0, 2.0]]]))
-    result = DeepseekV41HyperConnection.expand(collapsed, streams, mix)
-    # Residual output0 = .1*stream0 + .6*stream1; output1 = .9*stream0 + .4*stream1.
-    expected = torch.tensor([[[[3.9, 6.6], [5.1, 9.4]]]])
-    torch.testing.assert_close(result, expected)
-    result.sum().backward()
-    assert previous_pre.grad is not None
-    assert current_pre.grad is None  # It belongs to the following sublayer's input.
-
-
-def test_mhc_coefficients_and_gradients_are_finite() -> None:
-    torch.manual_seed(42)
-    module = DeepseekV41HyperConnection(_tiny_config().text_config)
-    streams = torch.randn(2, 3, 4, 16, requires_grad=True)
-    mix = module(streams)
-    assert torch.all(mix.pre > 0)
-    assert torch.all((mix.post > 0) & (mix.post < 2))
-    torch.testing.assert_close(mix.comb.sum(-1), torch.ones(2, 3, 4), atol=1e-4, rtol=0)
-    torch.testing.assert_close(mix.comb.sum(-2), torch.ones(2, 3, 4), atol=1e-4, rtol=0)
-    (mix.pre.square().sum() + mix.post.square().sum() + mix.comb.square().sum()).backward()
-    assert torch.isfinite(streams.grad).all()
-    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in module.parameters())
-
-
 def test_full_tiny_ced_model_trains_after_meta_initialization() -> None:
     torch.manual_seed(8)
     with torch.device("meta"):
@@ -141,3 +118,231 @@ def test_tied_embeddings_are_rejected() -> None:
     config.tie_word_embeddings = True
     with pytest.raises(NotImplementedError, match="tie_word_embeddings"):
         DeepseekV41ForCausalLM(config, backend=_backend())
+
+
+def _model(dtype: str = "float32") -> DeepseekV41ForCausalLM:
+    config = DeepseekV41Config(
+        text_config=DeepseekV41TextConfig(
+            vocab_size=17,
+            hidden_size=16,
+            moe_intermediate_size=16,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            head_dim=8,
+            qk_rope_head_dim=4,
+            q_lora_rank=8,
+            o_lora_rank=8,
+            o_groups=1,
+            n_routed_experts=4,
+            num_experts_per_tok=2,
+            compress_ratios=[0],
+            kv_source_layer_ids=[],
+            index_source_layer_ids=[],
+            candidate_source_layer_id=-1,
+            engram_layer_ids=[],
+            dtype=dtype,
+        ),
+        vision_config=DeepseekV41VisionConfig(num_hidden_layers=0),
+    )
+    backend = BackendConfig(attn="eager", linear="torch", rms_norm="torch_fp32", experts="torch", dispatcher="torch")
+    model = DeepseekV41ForCausalLM(config, backend=backend)
+    model.initialize_weights(torch.device("cpu"), dtype=getattr(torch, dtype))
+    return model
+
+
+def test_default_policy_is_explicit_and_routing_correction_is_fixed() -> None:
+    config = _model().config
+    with torch.device("meta"):
+        model = DeepseekV41ForCausalLM(config)
+    assert model.config_class is DeepseekV41Config and model.base_model_prefix == "model"
+    assert model.backend.attn == "tilelang"
+    assert model.backend.linear == "torch" and model.backend.rms_norm == "torch_fp32"
+    assert model.backend.dispatcher == "hybridep" and model.backend.experts == "torch_mm"
+    assert model.moe_config.combine_in_fp32 and model.moe_config.gate_bias_update_factor == 0
+
+
+def test_bf16_backbone_returns_unrounded_fp32_logits():
+    torch.manual_seed(31)
+    model = _model("bfloat16")
+    with torch.no_grad():
+        model.lm_head.weight.copy_(
+            torch.linspace(-0.04321, 0.05137, model.lm_head.weight.numel()).view_as(model.lm_head.weight)
+        )
+    result = model(torch.tensor([[3, 5, 7, 9]]), return_hidden_states=True)
+    assert result.hidden_states.dtype == torch.bfloat16
+    assert result.logits.dtype == torch.float32
+    expected = F.linear(result.hidden_states.float(), model.lm_head.weight)
+    torch.testing.assert_close(result.logits, expected, rtol=0, atol=0)
+    assert torch.count_nonzero(result.logits != result.logits.bfloat16().float()) > 0
+    result.logits.square().mean().backward()
+    assert model.lm_head.weight.grad.dtype == torch.float32
+    assert torch.isfinite(model.lm_head.weight.grad).all()
+
+
+def test_labels_match_independent_shifted_logprob_and_head_gradient():
+    torch.manual_seed(17)
+    model = _model()
+    ids = torch.tensor([[3, 4, 5, 6], [7, 8, 9, 10]])
+    labels = ids.clone()
+    labels[0, 2] = -100
+    original = labels.clone()
+    result = model(ids, labels=labels, return_hidden_states=True)
+    # Compare API variants under the same grad mode and before backward.
+    plain = model(ids, return_hidden_states=True)
+    assert plain.loss is None
+    torch.testing.assert_close(plain.logits, result.logits, rtol=0, atol=0)
+    reference = result.logits.detach().clone().requires_grad_()
+    targets = labels[:, 1:]
+    valid = targets != -100
+    probabilities = reference[:, :-1].log_softmax(-1)
+    expected = -probabilities.gather(-1, targets.clamp_min(0).unsqueeze(-1)).squeeze(-1)[valid].mean()
+    torch.testing.assert_close(result.loss, expected, rtol=1e-6, atol=1e-7)
+    assert result.loss.dtype == torch.float32 and result.loss.ndim == 0
+    assert result.hidden_states.shape == (2, 4, model.config.text_config.hidden_size)
+    assert "loss" in result and torch.equal(labels, original)
+    result.logits.retain_grad()
+    result.loss.backward()
+    expected.backward()
+    torch.testing.assert_close(result.logits.grad, reference.grad, rtol=1e-6, atol=1e-8)
+    assert torch.count_nonzero(result.logits.grad[:, -1]) == 0
+    assert torch.count_nonzero(result.logits.grad[0, 1]) == 0
+    assert torch.isfinite(model.lm_head.weight.grad).all()
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"qkv_format": "thd"},
+        {"packed_seq_ids": torch.ones(1, 4, dtype=torch.long)},
+        {"seq_lens": torch.tensor([2, 2])},
+        {"cu_seqlens": torch.tensor([0, 2, 4])},
+        {"cu_seqlens_q": torch.tensor([0, 2, 4])},
+    ],
+)
+def test_labels_reject_packing_before_numerical_forward(metadata):
+    model = _model()
+    ids = torch.tensor([[3, 4, 5, 6]])
+    with pytest.raises(TypeError, match="unexpected keyword"):
+        model(ids, labels=ids, **metadata)
+
+
+@pytest.mark.parametrize("logits_to_keep", [1, torch.tensor([0, 2])])
+def test_labels_require_full_ordered_logits(logits_to_keep):
+    model = _model()
+    ids = torch.tensor([[3, 4, 5, 6]])
+    with pytest.raises(ValueError, match="logits for every input position"):
+        model(ids, labels=ids, logits_to_keep=logits_to_keep)
+
+
+def test_labels_shape_and_inputs_embeds_contract() -> None:
+    model = _model()
+    ids = torch.tensor([[3, 4, 5, 6]])
+    with pytest.raises(ValueError, match="logits for every input position"):
+        model(ids, labels=ids[:, :-1])
+    with pytest.raises(TypeError, match="unexpected keyword"):
+        model(ids, inputs_embeds=model.get_input_embeddings()(ids), labels=ids)
+
+
+def test_captured_streams_and_final_hidden_states_have_distinct_contracts() -> None:
+    model = _model()
+    ids = torch.tensor([[3, 4, 5, 6]])
+    final = model(ids, return_hidden_states=True)
+    captured = model(ids, output_hidden_states=True)
+    assert final.hidden_states.shape == (1, 4, 16)
+    assert len(captured.hidden_states) == 1
+    assert captured.hidden_states[0].shape == (1, 4, 4, 16)
+    torch.testing.assert_close(final.logits, captured.logits, rtol=0, atol=0)
+
+
+def _build_model(config=None):
+    model = DeepseekV41ForCausalLM(config or _tiny_config(), backend=_backend())
+    model.initialize_weights(torch.device("cpu"), dtype=torch.float32)
+    return model
+
+
+def test_default_bf16_router_matches_fp32_reference():
+    config = _tiny_config()
+    config.text_config.n_routed_experts = 384
+    config.text_config.num_experts_per_tok = 6
+    model = _build_model(config)
+    cast_model_to_dtype(model, torch.bfloat16)
+    gate = model.model.layers["2"].ffn.gate
+    generator = torch.Generator().manual_seed(123)
+    x = torch.randn(2048, config.text_config.hidden_size, generator=generator).bfloat16()
+    with torch.no_grad():
+        gate.e_score_correction_bias.copy_(torch.linspace(-0.04, 0.04, 384))
+    scores = F.softplus(F.linear(x.float(), gate.weight.float())).sqrt()
+    indices = (scores + gate.e_score_correction_bias).topk(6, dim=-1).indices
+    expected = scores.gather(1, indices)
+    expected = expected / (expected.sum(-1, keepdim=True) + 1e-20) * config.text_config.routed_scaling_factor
+    weights, actual, _ = gate(x, torch.ones(2048, dtype=torch.bool), None)
+    assert weights.dtype == torch.float32
+    torch.testing.assert_close(actual, indices, atol=0, rtol=0)
+    torch.testing.assert_close(weights, expected, atol=0, rtol=0)
+    assert model.backend.gate_precision is None
+
+
+@pytest.mark.parametrize("checkpoint", [False, True])
+def test_copied_layer_inputs_preserve_shared_state_and_gradients(checkpoint):
+    torch.manual_seed(91)
+    reference = _build_model()
+    model = copy.deepcopy(reference)
+    parameters = dict(model.named_parameters())
+    snapshots = []
+
+    def copy_state(module, args, kwargs):
+        state = args[2]
+        snapshots.append((state, vars(state).copy()))
+        return (*args[:2], replace(state)), kwargs
+
+    for layer in model.model.layers.values():
+        layer.register_forward_pre_hook(copy_state, with_kwargs=True)
+    if checkpoint:
+        apply_ac(model)
+    tokens = torch.tensor([[5, 6, 7, 8, 9, 10, 11, 12]])
+    expected = reference(tokens).logits
+    actual = model(tokens).logits
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    expected.square().mean().backward()
+    actual.square().mean().backward()
+    for state, fields in snapshots:
+        assert all(getattr(state, name) is value for name, value in fields.items())
+    for name, parameter in reference.named_parameters():
+        grad = parameters[name].grad
+        if parameter.grad is None:
+            assert grad is None
+        else:
+            torch.testing.assert_close(grad, parameter.grad, atol=0, rtol=0)
+    assert model.model.layers["2"].attn.compressor.wkv.weight.grad is not None
+
+
+def test_block_rejects_rounded_carried_coefficients():
+    model = _build_model()
+    block = model.model.layers["0"]
+    streams = torch.randn(1, 4, model.config.text_config.hc_mult, model.config.text_config.hidden_size)
+    with pytest.raises(TypeError, match="FP32 carried coefficients"):
+        block(
+            streams,
+            torch.zeros(1, 4, model.config.text_config.hc_mult, dtype=torch.bfloat16),
+            DeepseekV41AttentionState(),
+            position_ids=torch.arange(4)[None],
+        )
+
+
+def test_indexers_are_frozen_by_the_model_constructor() -> None:
+    model = DeepseekV41ForCausalLM(_tiny_config(), backend=_backend())
+    frozen = {name for name, parameter in model.named_parameters() if not parameter.requires_grad}
+    expected = {name for name, _ in model.named_parameters() if ".attn.indexer." in name}
+    assert expected and frozen == expected
+
+
+def test_v41_uses_generic_moe_parallelization() -> None:
+    model = DeepseekV41ForCausalLM(_tiny_config(), backend=_backend())
+    assert not _is_deepseek_v4_model(model)
+    assert type(get_parallelization_strategy(model)) is DefaultParallelizationStrategy
+    assert not dsv4_fsdp._is_deepseek_v4_module(model)
+    assert not _is_deepseek_v4(model)
+    assert _is_deepseek_v4(SimpleNamespace(config=SimpleNamespace(model_type="deepseek_v4")))
+    for layer in model.model.layers.values():
+        assert layer.mlp is layer.ffn
+        assert all(".mlp." not in name for name in model.state_dict())
