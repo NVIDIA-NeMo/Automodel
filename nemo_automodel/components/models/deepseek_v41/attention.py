@@ -401,6 +401,21 @@ class DeepseekV41Attention(nn.Module):
         """Return the checkpoint's per-head FP32 attention sink parameter."""
         return self.sinks_param.weight
 
+    @staticmethod
+    def _apply_rotary(values: torch.Tensor, angles: torch.Tensor, *, inverse: bool = False) -> torch.Tensor:
+        """Apply this attention family's adjacent-pair rotary transform.
+
+        Args:
+            values: Tensor of shape [batch, sequence, channels] or
+                [batch, sequence, heads, channels].
+            angles: FP32 tensor of shape [batch, sequence, rotary_pairs].
+            inverse: Whether to apply the conjugate rotation.
+
+        Returns:
+            Tensor with the same shape and dtype as ``values``.
+        """
+        return _apply_rope(values, angles, inverse=inverse)
+
     def reset_parameters(self, init_std: float = 0.02) -> None:
         """Initialize every attention parameter after construction or meta materialization.
 

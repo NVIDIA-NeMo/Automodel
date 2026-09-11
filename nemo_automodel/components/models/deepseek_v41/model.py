@@ -30,8 +30,10 @@ Snapshots share tensors and preserve the state needed for activation recomputati
 
 The optional vision tower inserts projected image patches and learned image
 delimiters into the text sequence. Text and image batches use full sequences
-with two-dimensional token layouts. DSpark draft layers (``mtp.*``),
-inference-time KV caching, and SWA bounded replay remain out of scope.
+with two-dimensional token layouts. DSpark draft layers (``mtp.*``) are built
+separately by :mod:`nemo_automodel.components.models.deepseek_v41.dspark` so
+their objective cannot backpropagate into this backbone. Inference-time KV
+caching and SWA bounded replay remain out of scope.
 """
 
 from __future__ import annotations
