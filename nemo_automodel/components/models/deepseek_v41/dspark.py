@@ -26,6 +26,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import partial
+from typing import NamedTuple
 
 import torch
 from torch import nn
@@ -59,10 +60,28 @@ class DeepseekV41DSparkBackboneOutput:
         normalized_hidden_states: Final-normalized states of shape [batch,
             draft_sequence, hidden]. The frozen target LM head consumes these
             states to produce base token logits.
+        transition_logits: Optional Markov logits of shape [batch,
+            draft_sequence, vocab].
+        confidence_pred: Optional FP32 confidence logits of shape [batch,
+            draft_sequence].
     """
 
     hidden_states: torch.Tensor
     normalized_hidden_states: torch.Tensor
+    transition_logits: torch.Tensor | None = None
+    confidence_pred: torch.Tensor | None = None
+
+
+class _DeepseekV41DSparkStageOutput(NamedTuple):
+    """Internal stage state kept within each stage's FSDP forward boundary."""
+
+    streams: torch.Tensor
+    pre_mix: torch.Tensor
+    target_hidden_states: torch.Tensor
+    hidden_states: torch.Tensor | None = None
+    normalized_hidden_states: torch.Tensor | None = None
+    transition_logits: torch.Tensor | None = None
+    confidence_pred: torch.Tensor | None = None
 
 
 class _DeepseekV41DSparkAttention(DeepseekV41Attention):
@@ -243,7 +262,9 @@ class _DeepseekV41DSparkBlock(nn.Module):
         *,
         position_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        previous_token_ids: torch.Tensor | None = None,
+        enable_confidence_head: bool = True,
+    ) -> _DeepseekV41DSparkStageOutput:
         """Apply one native DSpark stage.
 
         Args:
@@ -253,11 +274,16 @@ class _DeepseekV41DSparkBlock(nn.Module):
             position_ids: Integer tensor of shape [batch, context_sequence + draft_sequence].
             attention_mask: Additive tensor of shape [batch, 1, draft_sequence,
                 context_sequence + draft_sequence].
+            previous_token_ids: Optional integer tensor of shape [batch,
+                draft_sequence] used by the final Markov head.
+            enable_confidence_head: Whether the final stage computes confidence.
 
         Returns:
-            Updated streams of shape [batch, draft_sequence, streams, hidden] and
-            the next FP32 pre-mix of shape [batch, draft_sequence, streams].
+            Stage state containing updated streams, target features, and any
+            final-stage head outputs.
         """
+        if hasattr(self, "main_proj"):
+            target_hidden_states = self.main_norm(self.main_proj(target_hidden_states))
         residual = hidden_states
         attn_mix = self.attn_hc(hidden_states)
         collapsed = self.attn_hc.collapse(hidden_states, pre_mix)
@@ -273,7 +299,27 @@ class _DeepseekV41DSparkBlock(nn.Module):
         collapsed = self.ffn_hc.collapse(hidden_states, attn_mix.pre)
         self.ffn.gate.set_routing_context(None, None)
         output = self.ffn(self.ffn_norm(collapsed), None)
-        return self.ffn_hc.expand(output, residual, ffn_mix), ffn_mix.pre
+        streams = self.ffn_hc.expand(output, residual, ffn_mix)
+        if not hasattr(self, "norm"):
+            return _DeepseekV41DSparkStageOutput(streams, ffn_mix.pre, target_hidden_states)
+
+        hidden_states = DeepseekV41HyperConnection.collapse(streams, ffn_mix.pre)
+        normalized_hidden_states = self.norm(hidden_states)
+        transition_logits = None
+        confidence_pred = None
+        if previous_token_ids is not None:
+            transition_logits, markov_embeddings = self.markov_head(previous_token_ids)
+            if enable_confidence_head:
+                confidence_pred = self.confidence_head(hidden_states, markov_embeddings)
+        return _DeepseekV41DSparkStageOutput(
+            streams,
+            ffn_mix.pre,
+            target_hidden_states,
+            hidden_states,
+            normalized_hidden_states,
+            transition_logits,
+            confidence_pred,
+        )
 
 
 class DeepseekV41DSparkBackbone(nn.Module):
@@ -427,6 +473,8 @@ class DeepseekV41DSparkBackbone(nn.Module):
         *,
         position_ids: torch.Tensor,
         attention_mask: torch.Tensor,
+        previous_token_ids: torch.Tensor | None = None,
+        enable_confidence_head: bool = True,
     ) -> torch.Tensor:
         """Run the cache-free draft backbone for sampled anchors.
 
@@ -439,13 +487,14 @@ class DeepseekV41DSparkBackbone(nn.Module):
             position_ids: Integer tensor of shape [batch, context_sequence + draft_sequence].
             attention_mask: Additive tensor of shape [batch, 1, draft_sequence,
                 context_sequence + draft_sequence].
+            previous_token_ids: Optional integer tensor of shape [batch,
+                draft_sequence] used by the final Markov head.
+            enable_confidence_head: Whether the final stage computes confidence.
 
         Returns:
             Pre-normalization and normalized draft states. Both tensors have
             shape [batch, draft_sequence, hidden].
         """
-        first = self.mtp[0]
-        target_hidden_states = first.main_norm(first.main_proj(target_hidden_states))
         hidden_states = noise_embeddings.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
         pre_mix = torch.zeros(
             *noise_embeddings.shape[:2],
@@ -455,17 +504,25 @@ class DeepseekV41DSparkBackbone(nn.Module):
         )
         pre_mix[..., 0] = 1
         for layer in self.mtp:
-            hidden_states, pre_mix = layer(
+            stage_output = layer(
                 hidden_states,
                 pre_mix,
                 target_hidden_states,
                 position_ids=position_ids,
                 attention_mask=attention_mask,
+                previous_token_ids=previous_token_ids,
+                enable_confidence_head=enable_confidence_head,
             )
-        hidden_states = DeepseekV41HyperConnection.collapse(hidden_states, pre_mix)
+            hidden_states = stage_output.streams
+            pre_mix = stage_output.pre_mix
+            target_hidden_states = stage_output.target_hidden_states
+        if stage_output.hidden_states is None or stage_output.normalized_hidden_states is None:
+            raise RuntimeError("The final DSpark stage did not produce output states")
         return DeepseekV41DSparkBackboneOutput(
-            hidden_states=hidden_states,
-            normalized_hidden_states=self.mtp[-1].norm(hidden_states),
+            hidden_states=stage_output.hidden_states,
+            normalized_hidden_states=stage_output.normalized_hidden_states,
+            transition_logits=stage_output.transition_logits,
+            confidence_pred=stage_output.confidence_pred,
         )
 
 
@@ -587,6 +644,21 @@ class DeepseekV41DSparkModel(DeepseekV41DSparkBackbone):
             num_anchors=self.num_anchors,
             device=input_ids.device,
         )
+        num_blocks = anchor_positions.shape[1]
+        block_size = self.config.dspark_block_size
+        offsets = torch.arange(1, block_size + 1, device=input_ids.device).view(1, 1, -1)
+        label_indices = anchor_positions.unsqueeze(-1) + offsets
+        safe_label_indices = label_indices.clamp(max=sequence - 1)
+        safe_label_indices = torch.where(
+            block_keep_mask.unsqueeze(-1), safe_label_indices, torch.zeros_like(safe_label_indices)
+        )
+        target_ids = torch.gather(
+            input_ids.unsqueeze(1).expand(-1, num_blocks, -1),
+            2,
+            safe_label_indices,
+        )
+        anchor_token_ids = torch.gather(input_ids, 1, anchor_positions)
+        previous_token_ids = torch.cat((anchor_token_ids.unsqueeze(-1), target_ids[:, :, :-1]), dim=-1)
         noise_embeddings = create_noise_embed(
             self.embed_tokens,
             input_ids,
@@ -607,23 +679,11 @@ class DeepseekV41DSparkModel(DeepseekV41DSparkBackbone):
             target_hidden_states.detach(),
             position_ids=position_ids,
             attention_mask=attention_mask,
+            previous_token_ids=previous_token_ids.reshape(batch, -1),
+            enable_confidence_head=self.enable_confidence_head,
         )
 
-        num_blocks = anchor_positions.shape[1]
-        block_size = self.config.dspark_block_size
-        hidden = backbone_output.hidden_states.reshape(batch, num_blocks, block_size, -1)
         normalized = backbone_output.normalized_hidden_states.reshape(batch, num_blocks, block_size, -1)
-        offsets = torch.arange(1, block_size + 1, device=input_ids.device).view(1, 1, -1)
-        label_indices = anchor_positions.unsqueeze(-1) + offsets
-        safe_label_indices = label_indices.clamp(max=sequence - 1)
-        safe_label_indices = torch.where(
-            block_keep_mask.unsqueeze(-1), safe_label_indices, torch.zeros_like(safe_label_indices)
-        )
-        target_ids = torch.gather(
-            input_ids.unsqueeze(1).expand(-1, num_blocks, -1),
-            2,
-            safe_label_indices,
-        )
         eval_mask = build_eval_mask(
             seq_len=sequence,
             loss_mask=loss_mask,
@@ -644,12 +704,14 @@ class DeepseekV41DSparkModel(DeepseekV41DSparkBackbone):
             )
             aligned_target_logits = self.compute_logits(aligned_hidden.detach())
 
-        anchor_token_ids = torch.gather(input_ids, 1, anchor_positions)
-        previous_token_ids = torch.cat((anchor_token_ids.unsqueeze(-1), target_ids[:, :, :-1]), dim=-1)
-        transition_logits, markov_embeddings = self.mtp[-1].markov_head(previous_token_ids)
+        if backbone_output.transition_logits is None:
+            raise RuntimeError("The final DSpark stage did not produce Markov logits")
+        transition_logits = backbone_output.transition_logits.reshape(batch, num_blocks, block_size, -1)
         draft_logits = self.compute_logits(normalized) + transition_logits.float()
         confidence_pred = (
-            self.mtp[-1].confidence_head(hidden, markov_embeddings) if self.enable_confidence_head else None
+            backbone_output.confidence_pred.reshape(batch, num_blocks, block_size)
+            if backbone_output.confidence_pred is not None
+            else None
         )
         return DSparkForwardOutput(
             draft_logits=draft_logits,

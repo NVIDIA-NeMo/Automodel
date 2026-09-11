@@ -66,6 +66,7 @@ from nemo_automodel.components.distributed.activation_checkpointing import (
 from nemo_automodel.components.distributed.config import FSDP2Config
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
+from nemo_automodel.components.distributed.parallelizer_utils import fully_shard_by_dtype
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
@@ -1154,8 +1155,17 @@ class TrainDSparkRecipe(BaseRecipe):
                 shard_kwargs = {"mp_policy": mp_policy}
                 if self.dp_mesh is not None:
                     shard_kwargs["mesh"] = self.dp_mesh
+                fp32_compute_module_names = tuple(
+                    getattr(trainer_module.draft_model, "_keep_in_fp32_modules_strict", ())
+                )
                 for layer in trainer_module.draft_model.layers:
-                    fully_shard(layer, **shard_kwargs)
+                    fully_shard_by_dtype(
+                        layer,
+                        mesh=self.dp_mesh,
+                        mp_policy=mp_policy,
+                        offload_policy=None,
+                        fp32_compute_module_names=fp32_compute_module_names,
+                    )
                 fully_shard(trainer_module, **shard_kwargs)
             elif strategy == "ddp":
                 trainer_module = DistributedDataParallel(
