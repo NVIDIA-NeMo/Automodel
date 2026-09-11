@@ -5,8 +5,13 @@
 cold VM to a finished, HF-loadable checkpoint.
 
 Everything here was derived by reading this checkout and measuring the real dataset on
-a machine with no GPU. **Nothing below has run on a GPU yet.** Treat every "expected"
-value as a hypothesis to confirm, and stop at the first rung that disagrees.
+a machine with no GPU. Treat every "expected" value as a hypothesis to confirm, and stop
+at the first rung that disagrees.
+
+**Rungs 1-6 have since been run on 2 × B300.** See `BRINGUP_2xB300_v4_88k.md` for what
+held, what did not (rung 2 failed and the masking was fixed; TE silently fell back to
+unfused attention on Blackwell), the measured throughput and memory ceilings, and the
+environment gotchas.
 
 ---
 
