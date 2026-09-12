@@ -333,9 +333,18 @@ def test_ling_score_correction_bias_survives_a_model_cast(config_fn, first_moe_l
     gate = model.model.layers[str(first_moe_layer)].mlp.gate
     assert gate.e_score_correction_bias.dtype is torch.float32
 
+    torch.manual_seed(0)
+    gate.e_score_correction_bias.normal_(mean=0.2, std=0.02)
+    before = gate.e_score_correction_bias.detach().clone()
+
     cast_model_to_dtype(model, torch.bfloat16)
 
     assert gate.e_score_correction_bias.dtype is torch.float32
+    # Values, not just dtype: a cast that round-tripped through bf16 and landed
+    # back in fp32 would keep the dtype assertion above green while quietly
+    # quantizing the bias. test_ling_score_correction_bias_is_precision_critical
+    # measures what that would cost.
+    assert torch.equal(gate.e_score_correction_bias, before)
     assert gate.weight.dtype is torch.bfloat16  # Param does follow the cast
 
 
@@ -364,6 +373,43 @@ def test_ling_router_storage_policy_wins_over_incoming_dtypes(config_fn, first_m
 
     assert gate.weight.dtype is torch.bfloat16
     assert gate.e_score_correction_bias.dtype is torch.float32
+    # The bias is widened, never rounded: bf16 -> fp32 is exact, so every incoming
+    # value must survive the coercion bit for bit.
+    assert torch.equal(gate.e_score_correction_bias, incoming["e_score_correction_bias"].to(torch.float32))
+
+
+def test_ling_score_correction_bias_is_precision_critical():
+    """Why the bias is pinned to fp32, measured rather than asserted.
+
+    The two tests above protect the bias across a cast and a load. This one shows
+    what they are protecting: demoting it to bf16 and back -- the exact damage a
+    raw ``.to(dtype=...)`` does -- reroutes a measurable share of tokens to
+    different experts. Run at the published routing shape, where 256 experts are
+    packed closely enough for a ~1e-4 perturbation to change the ordering.
+
+    Measured on this build: 27 of 512 tokens change expert set, max routing-weight
+    delta 4.75e-02. The thresholds below are deliberately slack, since the exact
+    count depends on the seed; the point is that the effect is real, not tiny.
+    """
+    cfg = _router_config(n_routed_experts=256, n_activated_experts=8, n_expert_groups=8, n_limited_groups=4)
+
+    def route(demote_bias):
+        torch.manual_seed(0)
+        gate = Gate(cfg, gate_precision=torch.float32)
+        gate.weight.data.normal_(std=0.02)
+        gate.e_score_correction_bias.normal_(mean=0.2, std=0.02)
+        if demote_bias:
+            gate.e_score_correction_bias.copy_(gate.e_score_correction_bias.to(torch.bfloat16).to(torch.float32))
+        x = torch.randn(512, cfg.dim, dtype=torch.bfloat16)
+        weights, indices, _ = gate(x, torch.ones(512, dtype=torch.bool), None)
+        return weights, indices.sort(dim=1).values
+
+    w_fp32, i_fp32 = route(demote_bias=False)
+    w_bf16, i_bf16 = route(demote_bias=True)
+
+    changed = (i_fp32 != i_bf16).any(dim=1).sum().item()
+    assert changed > 5, f"bf16 bias changed routing for only {changed}/512 tokens"
+    assert (w_fp32 - w_bf16).abs().max() > 1e-3
 
 
 # Revision of inclusionAI/Ling-mini-2.0 whose modeling_bailing_moe_v2.py the
