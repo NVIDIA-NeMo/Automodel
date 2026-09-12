@@ -82,6 +82,13 @@ normalization, and distributed-training components. The target remains frozen;
 only the three draft stages, target-feature projection, Markov head, and
 confidence head receive DSpark gradients.
 
+The recipe starts those trainable DSpark weights from a fresh initialization
+and copies only the frozen embedding and LM head from the target. Use
+`checkpoint.restore_from` to resume a DSpark checkpoint produced by AutoModel.
+The V4.1 technical report does not name the dataset used for the dedicated
+DSpark stage, so the example data path is illustrative rather than a claim
+about the released model's training data.
+
 The following settings are fixed by the released checkpoint and the recipe
 rejects mismatches:
 

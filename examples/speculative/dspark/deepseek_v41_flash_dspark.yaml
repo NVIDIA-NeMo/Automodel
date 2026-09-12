@@ -6,6 +6,10 @@
 # noise token 128799. These fields are checkpoint contracts and cannot be
 # changed by this recipe.
 #
+# The trainable DSpark weights start from a fresh initialization; only the
+# frozen embedding and LM head are copied from the target. Use restore_from
+# below to resume an AutoModel DSpark training checkpoint.
+#
 # The frozen 40-layer target and its 384 experts are sharded with EP/FSDP2. The
 # 128-expert draft is independently FSDP2-sharded and is the only trainable
 # model. TP, PP, CP, sequence packing, image inputs, and the serving-time
