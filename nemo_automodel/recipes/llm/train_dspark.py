@@ -117,6 +117,7 @@ from nemo_automodel.components.speculative.dspark.target_utils import (
     read_target_model_type as _read_target_model_type,
 )
 from nemo_automodel.components.training.rng import StatefulRNG
+from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
 from nemo_automodel.components.utils.model_utils import VLM_INPUT_KEYS
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config, parse_distributed_section
 from nemo_automodel.recipes.base_recipe import (
@@ -1669,7 +1670,7 @@ class TrainDSparkRecipe(BaseRecipe):
                     pending_micro_batches += 1
 
                     if pending_micro_batches == self.grad_accumulation_steps:
-                        torch.nn.utils.clip_grad_norm_(self.trainer_module.parameters(), self.max_grad_norm)
+                        scale_grads_and_clip_grad_norm(self.max_grad_norm, [self.trainer_module])
                         self.optimizer.step()
                         self.optimizer.zero_grad(set_to_none=True)
                         self.lr_scheduler.step()
@@ -1733,7 +1734,7 @@ class TrainDSparkRecipe(BaseRecipe):
                     for p in self.trainer_module.parameters():
                         if p.grad is not None:
                             p.grad.mul_(scale)
-                    torch.nn.utils.clip_grad_norm_(self.trainer_module.parameters(), self.max_grad_norm)
+                    scale_grads_and_clip_grad_norm(self.max_grad_norm, [self.trainer_module])
                     self.optimizer.step()
                     self.optimizer.zero_grad(set_to_none=True)
                     self.lr_scheduler.step()
