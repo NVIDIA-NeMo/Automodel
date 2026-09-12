@@ -77,6 +77,7 @@ from nemo_automodel.components.models.deepseek_v41.layers import (
     DeepseekV41HyperConnection,
     DeepseekV41RMSNorm,
 )
+from nemo_automodel.components.models.deepseek_v41.packing import packed_layout
 from nemo_automodel.components.models.deepseek_v41.processing import (
     IMAGE,
     IMAGE_END,
@@ -156,6 +157,7 @@ class DeepseekV41Block(nn.Module):
         image_mask: torch.Tensor | None = None,
         engram_hash_ids: torch.Tensor | None = None,
         cp_group: dist.ProcessGroup | None = None,
+        packed_seq_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, DeepseekV41AttentionState]:
         """Execute one block while retaining differentiable shared KV ownership.
 
@@ -169,6 +171,7 @@ class DeepseekV41Block(nn.Module):
             image_mask: Optional boolean tensor of shape [batch, sequence].
             engram_hash_ids: Optional logical memory rows [batch, local_sequence, hash_heads].
             cp_group: CP group; all token axes are local and CSA2 keys are global.
+            packed_seq_ids: Optional document IDs [batch, local_sequence], zero for padding.
 
         Returns:
             Updated streams [batch, sequence, streams, hidden], the next pre-mix
@@ -194,6 +197,7 @@ class DeepseekV41Block(nn.Module):
             state=state,
             attention_mask=attention_mask,
             cp_group=cp_group,
+            packed_seq_ids=packed_seq_ids,
         )
         hidden_states = self.attn_hc.expand(attended.hidden_states, hidden_states, attn_mix)
         ffn_mix = self.ffn_hc(hidden_states)
@@ -250,6 +254,7 @@ class DeepseekV41Model(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         output_hidden_states: bool = False,
         cp_group: dist.ProcessGroup | None = None,
+        packed_seq_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...] | None]:
         """Compute all positions without inference-only prefill shortcuts.
 
@@ -260,6 +265,7 @@ class DeepseekV41Model(nn.Module):
             image_mask: Optional boolean image-span tensor [batch, sequence].
             inputs_embeds: Optional projected multimodal embeddings [batch, sequence, hidden].
             output_hidden_states: Whether to retain streams before each block.
+            packed_seq_ids: Optional document IDs [batch, local_sequence], zero for padding.
             cp_group: CP group; token axes above are local sequence shards.
                 Engram hashes use global token history, with only local rows looked up.
 
@@ -281,7 +287,8 @@ class DeepseekV41Model(nn.Module):
         if self.engram_hash is not None:
             full_ids = gather_sequence(input_ids, cp_group)
             full_mask = None if token_mask is None else gather_sequence(token_mask, cp_group)
-            hashes = self.engram_hash(full_ids, token_mask=full_mask)
+            full_seq_ids = None if packed_seq_ids is None else gather_sequence(packed_seq_ids, cp_group)
+            hashes = self.engram_hash(full_ids, token_mask=full_mask, sequence_ids=full_seq_ids)
             start = 0 if cp_group is None else dist.get_rank(cp_group) * input_ids.shape[1]
             hashes = hashes[:, start : start + input_ids.shape[1]]
         state = DeepseekV41AttentionState()
@@ -298,6 +305,7 @@ class DeepseekV41Model(nn.Module):
                 image_mask=image_mask,
                 engram_hash_ids=None if layer.engram is None else hashes[:, :, layer.engram.layer_hash_index],
                 cp_group=cp_group,
+                packed_seq_ids=packed_seq_ids,
             )
         hidden_states = DeepseekV41HyperConnection.collapse(hidden_states, pre_mix)
         return self.norm(hidden_states), None if captured is None else tuple(captured)
@@ -339,7 +347,7 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
         supports_cp: bool = True
         supports_pp: bool = False
         supports_ep: bool = True
-        supports_thd: bool = False
+        supports_thd: bool = True
 
     @classmethod
     def from_config(cls, config: DeepseekV41Config, **kwargs: Any) -> DeepseekV41ForCausalLM:
@@ -359,6 +367,8 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
         super().__init__(config)
         self.cp_mesh: DeviceMesh | None = None
         text = config.text_config
+        ratios = text.compress_ratios[: text.num_hidden_layers]
+        self._packed_alignment = math.lcm(*(r for r in ratios if r))
         self.backend = backend or BackendConfig(
             attn="tilelang", linear="torch", rms_norm="torch_fp32", experts="torch_mm", dispatcher="hybridep"
         )
@@ -412,7 +422,7 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
         Args:
             batch: Full text tensors of shape [batch, global_sequence]. The hook
                 leaves tensors intact; sharding happens through the returned strategy.
-            num_chunks: Framework chunk count; unpacked text uses one chunk.
+            num_chunks: Framework chunk count; this model uses one chunk.
 
         Returns:
             Model-owned CP sharder. Its local token tensors have shape
@@ -421,7 +431,12 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
         ratios = self.config.text_config.compress_ratios[: self.config.text_config.num_hidden_layers]
         return {
             "cp_sharder": ContextParallelSharder(
-                shard_batch=partial(shard_cp_batch, pad_multiple=math.lcm(*(r for r in ratios if r))),
+                shard_batch=partial(
+                    shard_cp_batch,
+                    pad_multiple=math.lcm(*(r for r in ratios if r)),
+                    packed_alignment=self._packed_alignment,
+                    sync_packed_length=self.backend.dispatcher == "hybridep",
+                ),
                 local_token_global_indices=contiguous_local_indices,
             )
         }
@@ -518,6 +533,10 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
         return_hidden_states: bool = False,
         output_hidden_states: bool = False,
         cp_group: dist.ProcessGroup | None = None,
+        packed_seq_ids: torch.Tensor | None = None,
+        seq_lens: torch.Tensor | None = None,
+        seq_lens_padded: torch.Tensor | None = None,
+        qkv_format: str | None = None,
     ) -> CausalLMOutputWithPast:
         """Compute full-vocabulary logits or hidden states for the training loss.
 
@@ -532,6 +551,11 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
             logits_to_keep: Number of final positions, or integer position indices [kept].
             return_hidden_states: Return final hidden states for the recipe's loss.
             output_hidden_states: Capture residual streams for numerical comparisons.
+            seq_lens: Optional real document lengths [batch, documents] for packed text.
+            seq_lens_padded: Optional physical document spans [batch, documents].
+            qkv_format: Optional "thd" marker from packed_sequence_thd_collater.
+            packed_seq_ids: Prepared document IDs [batch, local_sequence], zero for padding.
+                The model-owned CP sharder supplies these after aligning and sharding a pack.
             cp_group: CP group; input/output token axes contain only the local
                 contiguous shard. The recipe computes loss from globally shifted labels.
 
@@ -546,6 +570,36 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
                 raise ValueError("CP training requires the recipe loss with labels shifted before sequence sharding")
             if pixel_values is not None:
                 raise ValueError("DeepSeek V4.1 context parallelism currently supports text only")
+        if packed_seq_ids is not None:
+            if labels is not None:
+                raise ValueError("Prepared packed input requires the recipe loss with independently shifted labels")
+            if position_ids is None or attention_mask is None:
+                raise ValueError(
+                    "Prepared packed input requires document-local position_ids and a binary attention_mask"
+                )
+            if packed_seq_ids.shape != input_ids.shape or packed_seq_ids.dtype not in (torch.int32, torch.int64):
+                raise ValueError("packed_seq_ids must be an integer tensor with shape [batch, local_sequence]")
+        layout = None
+        if seq_lens is not None:
+            if pixel_values is not None or packed_seq_ids is not None:
+                raise ValueError("Packed text requires seq_lens or prepared packed_seq_ids, without image inputs")
+            if cp_group is not None and dist.get_world_size(cp_group) > 1:
+                raise ValueError("Packed CP input must pass through the model-owned ContextParallelSharder")
+            layout = packed_layout(
+                seq_lens,
+                seq_lens_padded=seq_lens_padded,
+                input_shape=tuple(input_ids.shape),
+                alignment=self._packed_alignment,
+                minimum_length=input_ids.shape[1],
+            )
+            input_ids = layout.pack(input_ids, fill=self.config.text_config.pad_token_id or 0)
+            position_ids = layout.position_ids
+            packed_seq_ids = layout.sequence_ids
+            attention_mask = packed_seq_ids > 0
+        elif seq_lens_padded is not None or (qkv_format == "thd" and packed_seq_ids is None):
+            raise ValueError("Packed text requires seq_lens")
+        if qkv_format not in (None, "thd"):
+            raise ValueError("DeepSeek V4.1 qkv_format must be omitted or 'thd'")
         inputs_embeds = None
         image_mask = None
         if pixel_values is not None:
@@ -563,7 +617,11 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
             image_mask=image_mask,
             output_hidden_states=output_hidden_states,
             cp_group=cp_group,
+            packed_seq_ids=packed_seq_ids,
         )
+        if layout is not None:
+            hidden = layout.restore(hidden)
+            captured = None if captured is None else tuple(layout.restore(values) for values in captured)
         projected = compute_lm_head_logits(
             self.lm_head, hidden, logits_to_keep, output_hidden_states=return_hidden_states
         )
@@ -571,10 +629,18 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
         if labels is not None:
             if projected.logits is None or projected.logits.shape[:2] != labels.shape:
                 raise ValueError("labels require logits for every input position")
+            targets = labels[:, 1:]
+            if layout is not None:
+                original_ids = layout.restore(layout.sequence_ids)
+                same_document = (original_ids[:, 1:] > 0) & (original_ids[:, 1:] == original_ids[:, :-1])
+                targets = targets.masked_fill(~same_document, -100)
             loss = F.cross_entropy(
                 projected.logits[:, :-1].float().reshape(-1, self.config.text_config.vocab_size),
-                labels[:, 1:].reshape(-1),
+                targets.reshape(-1),
+                reduction="sum" if layout is not None else "mean",
             )
+            if layout is not None:
+                loss = loss / (targets != -100).sum().clamp_min(1)
         return CausalLMOutputWithPast(
             loss=loss,
             logits=projected.logits,

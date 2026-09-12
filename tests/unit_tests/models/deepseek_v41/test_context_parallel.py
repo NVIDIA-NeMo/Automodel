@@ -144,8 +144,8 @@ def _cpu_worker(rank, rendezvous):
                 state=DeepseekV41AttentionState(),
                 cp_group=dist.group.WORLD,
             )
-        with pytest.raises(ValueError, match="unpacked"):
-            shard_cp_batch(mesh, None, {"input_ids": ids, "labels": labels, "seq_lens": torch.tensor([13])})
+        with pytest.raises(ValueError, match="physical spans"):
+            shard_cp_batch(mesh, None, {"input_ids": ids, "labels": labels, "seq_lens": torch.tensor([14])})
     finally:
         dist.destroy_process_group()
 
