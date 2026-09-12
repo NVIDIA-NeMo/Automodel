@@ -20,6 +20,10 @@ from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41Text
 from nemo_automodel.components.models.deepseek_v41.dspark import DeepseekV41DSparkBackbone
 from nemo_automodel.components.models.deepseek_v41.quantization import quantize_cache
 
+# Over the default 5s budget on purpose: this module runs full draft forwards and a backward pass.
+# Shrink the model fixtures and compilation cost before lowering this further.
+pytestmark = pytest.mark.timeout(60)
+
 
 def _config() -> DeepseekV41TextConfig:
     return DeepseekV41TextConfig(
