@@ -470,7 +470,7 @@ class DeepseekV41DSparkBackbone(nn.Module):
         attention_mask: torch.Tensor,
         previous_token_ids: torch.Tensor | None = None,
         enable_confidence_head: bool = True,
-    ) -> torch.Tensor:
+    ) -> DeepseekV41DSparkBackboneOutput:
         """Run the cache-free draft backbone for sampled anchors.
 
         Args:
@@ -487,8 +487,10 @@ class DeepseekV41DSparkBackbone(nn.Module):
             enable_confidence_head: Whether the final stage computes confidence.
 
         Returns:
-            Final draft states and optional head outputs. Normalized states have
-            shape [batch, draft_sequence, hidden].
+            Draft backbone output containing normalized states of shape [batch,
+            draft_sequence, hidden], optional Markov logits of shape [batch,
+            draft_sequence, vocab], and optional FP32 confidence logits of shape
+            [batch, draft_sequence].
         """
         hidden_states = noise_embeddings.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
         pre_mix = torch.zeros(
