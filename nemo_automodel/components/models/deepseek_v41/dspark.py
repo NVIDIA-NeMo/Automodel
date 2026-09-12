@@ -564,6 +564,11 @@ class DeepseekV41DSparkModel(DeepseekV41DSparkBackbone):
             raise ValueError("num_anchors must be positive")
         if not self.enable_confidence_head:
             self.mtp[-1].confidence_head.requires_grad_(False)
+        from nemo_automodel.components.models.deepseek_v41.state_dict_adapter import (
+            DeepseekV41DSparkStateDictAdapter,
+        )
+
+        self.state_dict_adapter = DeepseekV41DSparkStateDictAdapter(config, self.moe_config, backend, dtype=dtype)
         self.initialize_weights(self.embed_tokens.weight.device)
 
     @property
