@@ -1339,6 +1339,25 @@ def default_collate_fn(
     return batch
 
 
+def _merge_media_values(values: list[Any]) -> torch.Tensor | list[Any]:
+    """Merge fixed-shape patch tensors or preserve variable-resolution media lists."""
+    if not values:
+        raise ValueError("Media merge requires at least one value.")
+    if all(isinstance(value, torch.Tensor) for value in values):
+        return torch.cat(values, dim=0).to(torch.bfloat16)
+    # At least one pack carries variable-resolution media as a list: flatten
+    # every pack to one tensor per image (a stacked [N, ...] tensor splits along dim 0).
+    flat = []
+    for value in values:
+        if isinstance(value, torch.Tensor):
+            flat.extend(value.to(torch.bfloat16))
+        elif isinstance(value, (list, tuple)):
+            flat.extend(item.to(torch.bfloat16) if isinstance(item, torch.Tensor) else item for item in value)
+        else:
+            raise TypeError(f"VLM media values must be tensors or lists, got {type(value).__name__}.")
+    return flat
+
+
 def pad_collate_fn(
     examples: Sequence[Dict[str, Any]],
     processor,
@@ -1426,7 +1445,7 @@ def pad_collate_fn(
     for key in ("pixel_values", "pixel_values_videos"):
         tensors = [ex[key] for ex in examples if key in ex and ex[key] is not None]
         if tensors:
-            batch[key] = torch.cat(tensors, dim=0).to(torch.bfloat16)
+            batch[key] = _merge_media_values(tensors)
 
     # Per-sample image counts from image_grid_thw shapes (before concat)
     image_grid_per_sample = [
@@ -1582,7 +1601,7 @@ def neat_packed_vlm_collater(
     for key in ("pixel_values", "pixel_values_videos"):
         tensors = [x[key] for x in batch if key in x and x[key] is not None]
         if tensors:
-            result[key] = torch.cat(tensors, dim=0).to(torch.bfloat16)
+            result[key] = _merge_media_values(tensors)
 
     for key in ("image_grid_thw", "image_position_ids", "video_grid_thw", "second_per_grid_ts"):
         tensors = [x[key] for x in batch if key in x and x[key] is not None]
@@ -1721,7 +1740,7 @@ def packed_sequence_thd_vlm_collater(
     for key in ("pixel_values", "pixel_values_videos"):
         tensors = [x[key] for x in batch if key in x and x[key] is not None]
         if tensors:
-            result[key] = torch.cat(tensors, dim=0).to(torch.bfloat16)
+            result[key] = _merge_media_values(tensors)
 
     for key in ("image_grid_thw", "image_position_ids", "video_grid_thw", "second_per_grid_ts"):
         tensors = [x[key] for x in batch if key in x and x[key] is not None]
