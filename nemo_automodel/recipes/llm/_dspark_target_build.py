@@ -39,6 +39,7 @@ from transformers import AutoConfig, PretrainedConfig
 from nemo_automodel._transformers import NeMoAutoModelForCausalLM
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
+from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41Config
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
 
 logger = logging.getLogger(__name__)
@@ -239,6 +240,64 @@ def build_deepseek_v4_target(
     return target_config, target_model, distributed_setup
 
 
+def build_deepseek_v41_target(
+    *,
+    cfg: Any,
+    world_size: int,
+    device: torch.device,
+    compute_dtype: torch.dtype,
+    target_path: str,
+    recipe_cfg,
+    trust_remote_code: bool,
+):
+    """Load the text-only V4.1 target through its EP/FSDP infrastructure.
+
+    The vision tower is disabled because DSpark training currently consumes
+    text batches only. Native ``mtp.*`` checkpoint tensors are not part of the
+    frozen target model; the recipe constructs and trains a separate DSpark
+    module while copying only the target embedding and LM head.
+
+    Returns ``(target_config, target_model, distributed_setup)``.
+    """
+    if device.type != "cuda":
+        raise RuntimeError(
+            "DeepSeek V4.1 DSpark target requires CUDA: the target is loaded "
+            "with the expert-parallel / FSDP distributed path."
+        )
+    if recipe_cfg.get("target_num_hidden_layers", None) is not None:
+        raise ValueError(
+            "DeepSeek V4.1 DSpark does not support target_num_hidden_layers: "
+            "the released target feature contract requires layers 37, 38, and 39"
+        )
+    distributed_setup = create_distributed_setup_from_config(cfg, world_size=world_size)
+    target_config = DeepseekV41Config.from_pretrained(
+        target_path,
+        name_or_path=target_path,
+        vision_config={"num_hidden_layers": 0},
+    )
+    target_model = NeMoAutoModelForCausalLM.from_config(
+        config=target_config,
+        backend=BackendConfig(
+            attn=str(recipe_cfg.get("target_attn_backend", "tilelang")),
+            linear="torch",
+            rms_norm="torch_fp32",
+            rope_fusion=False,
+            gate_precision="float32",
+            dispatcher=str(recipe_cfg.get("target_dispatcher", "hybridep")),
+            experts=str(recipe_cfg.get("target_experts", "torch_mm")),
+            enable_hf_state_dict_adapter=True,
+            enable_fsdp_optimizations=bool(recipe_cfg.get("target_enable_fsdp_optimizations", True)),
+        ),
+        distributed_setup=distributed_setup,
+        load_base_model=True,
+        torch_dtype=compute_dtype,
+        trust_remote_code=trust_remote_code,
+        use_liger_kernel=False,
+        use_sdpa_patching=False,
+    )
+    return target_config, target_model, distributed_setup
+
+
 def build_glm_5_2_backend(recipe_cfg) -> BackendConfig:
     """Build the GLM-5.2 target BackendConfig (mirrors the GLM finetune recipe).
 
@@ -428,6 +487,7 @@ def build_kimi_k3_target(
 __all__ = [
     "build_deepseek_v4_backend",
     "build_deepseek_v4_target",
+    "build_deepseek_v41_target",
     "build_glm_5_2_backend",
     "build_glm_5_2_target",
     "build_kimi_k3_backend",

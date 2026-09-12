@@ -73,6 +73,9 @@ from nemo_automodel.components.speculative.dspark.target_utils import (
     DEEPSEEK_V4_MODEL_TYPE as _DEEPSEEK_V4_MODEL_TYPE,
 )
 from nemo_automodel.components.speculative.dspark.target_utils import (
+    DEEPSEEK_V41_MODEL_TYPE as _DEEPSEEK_V41_MODEL_TYPE,
+)
+from nemo_automodel.components.speculative.dspark.target_utils import (
     GEMMA4_MODEL_TYPES as _GEMMA4_MODEL_TYPES,
 )
 from nemo_automodel.components.speculative.dspark.target_utils import (
@@ -92,6 +95,7 @@ from nemo_automodel.components.speculative.dspark.target_utils import (
 )
 from nemo_automodel.recipes.llm._dspark_target_build import (
     build_deepseek_v4_target,
+    build_deepseek_v41_target,
     build_glm_5_2_target,
     build_kimi_k3_target,
     gather_full_weight_module,
@@ -156,7 +160,7 @@ def _build_target(
 ):
     """Build the frozen target for capture, dispatching on model type.
 
-    DeepSeek V4 / GLM-5.2 / Kimi K3 load through the sharded EP/FSDP path; other
+    DeepSeek V4/V4.1, GLM-5.2, and Kimi K3 load through the sharded EP/FSDP path; other
     single-process text targets (Qwen3, Gemma4) load replicated for data-parallel
     throughput.
     Returns ``(target_config, target_model)``.
@@ -168,6 +172,17 @@ def _build_target(
         )
     if model_type == _DEEPSEEK_V4_MODEL_TYPE:
         target_config, target_model, _ = build_deepseek_v4_target(
+            cfg=cfg,
+            world_size=world_size,
+            device=device,
+            compute_dtype=compute_dtype,
+            target_path=target_path,
+            recipe_cfg=recipe_cfg,
+            trust_remote_code=trust_remote_code,
+        )
+        return target_config, target_model
+    if model_type == _DEEPSEEK_V41_MODEL_TYPE:
+        target_config, target_model, _ = build_deepseek_v41_target(
             cfg=cfg,
             world_size=world_size,
             device=device,
@@ -266,7 +281,11 @@ def run(cfg) -> int:
     tokenizer = NeMoAutoTokenizer.from_pretrained(target_path, trust_remote_code=trust_remote_code)
     _apply_target_chat_template(tokenizer, recipe_cfg.get("chat_template", None))
 
-    target_text_config = target_config.text_config if model_type in _GEMMA4_MODEL_TYPES else target_config
+    target_text_config = (
+        target_config.text_config
+        if model_type in _GEMMA4_MODEL_TYPES or model_type == _DEEPSEEK_V41_MODEL_TYPE
+        else target_config
+    )
     num_target_layers = int(target_text_config.num_hidden_layers)
     draft_num_hidden_layers = int(recipe_cfg.get("draft_num_hidden_layers", 5))
     target_layer_ids = list(

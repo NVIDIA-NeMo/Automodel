@@ -1,0 +1,126 @@
+# Native DSpark training for DeepSeek-V4.1-Flash.
+#
+# This recipe follows the architecture embedded in the released checkpoint:
+# three SWA-128 mHC + MLA + MoE draft stages, five parallel draft positions,
+# target features from layers 37/38/39, a rank-256 Markov head, and the reserved
+# noise token 128799. These fields are checkpoint contracts and cannot be
+# changed by this recipe.
+#
+# The trainable DSpark weights start from a fresh initialization; only the
+# frozen embedding and LM head are copied from the target. Use restore_from
+# below to resume an AutoModel DSpark training checkpoint.
+#
+# The frozen 40-layer target and its 384 experts are sharded with EP/FSDP2. The
+# 128-expert draft is independently FSDP2-sharded and is the only trainable
+# model. TP, PP, CP, sequence packing, image inputs, and the serving-time
+# confidence scheduler are not supported by the DSpark training path.
+#
+# This is a production-scale configuration. Adapt the node count, EP size,
+# accumulation, data paths, and checkpoint path to the cluster. EP size must
+# divide the target's 384 routed experts; keep pp_size=cp_size=1 because target
+# feature capture runs one non-pipelined full-sequence forward.
+#
+# Launch the same command on every node and vary --node-rank:
+#   torchrun --nnodes=16 --node-rank=0 --nproc_per_node=4 \
+#     --master-addr=<NODE0_IP> --master-port=29500 \
+#     -m nemo_automodel.recipes.llm.train_dspark \
+#     -c examples/speculative/dspark/deepseek_v41_flash_dspark.yaml
+
+recipe: TrainDSparkRecipe
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 120
+
+wandb:
+  enable: false            # opt-in: flip to true to log this run (needs W&B credentials)
+  project: deepseek-v41-dspark
+  group: perfectblend-regenerated
+  tags: [dspark, deepseek-v41-flash, perfectblend, hybridep]
+
+distributed:
+  strategy: fsdp2
+  defer_fsdp_grad_sync: true
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 64
+  activation_checkpointing: true
+  moe:
+    reshard_after_forward: true
+    wrap_outer_model: true
+    lm_head_precision: float32
+    mp_policy:
+      _target_: torch.distributed.fsdp.MixedPrecisionPolicy
+      param_dtype: bfloat16
+      reduce_dtype: float32
+      output_dtype: null
+      cast_forward_inputs: false
+
+recipe_args:
+  target_model_name_or_path: deepseek-ai/DeepSeek-V4.1-Flash
+  # Or a local path to a downloaded V4.1-Flash checkpoint:
+  # target_model_name_or_path: /path/to/DeepSeek-V4.1-Flash
+  train_data_path: /path/to/open-perfectblend-regenerated
+  train_split: "train[4096:]"
+  val_data_path: /path/to/open-perfectblend-regenerated
+  val_split: "train[:4096]"
+  output_dir: ./outputs/dspark_deepseek_v41_flash
+  seq_length: 4096
+  micro_batch_size: 1
+  grad_accumulation_steps: 8
+  num_workers: 2
+  num_epochs: 10
+  ckpt_every_steps: 500
+  save_checkpoint_every_epoch: true
+
+  # --- chat template (REQUIRED for V4.1-Flash) ---
+  # The released tokenizer has no chat template. This is DeepSeek's non-thinking
+  # conversation framing and marks assistant spans for loss.
+  chat_template: |-
+    {{ bos_token }}{% for message in messages %}{% if message['role'] == 'system' %}{{ message['content'] }}{% elif message['role'] == 'user' %}{{ '<｜User｜>' + message['content'] }}{% elif message['role'] == 'assistant' %}{{ '<｜Assistant｜></think>' }}{% generation %}{{ message['content'] }}{{ eos_token }}{% endgeneration %}{% else %}{{ raise_exception('Unsupported role: ' + message['role']) }}{% endif %}{% endfor %}{% if add_generation_prompt is defined and add_generation_prompt and (messages|length == 0 or messages[-1]['role'] != 'assistant') %}{{ '<｜Assistant｜></think>' }}{% endif %}
+
+  # --- native checkpoint-owned DSpark architecture ---
+  draft_num_hidden_layers: 3
+  block_size: 5
+  num_anchors: 512
+  mask_token_id: 128799
+  target_layer_ids: [37, 38, 39]
+  freeze_embeddings: true
+  markov_rank: 256
+  markov_head_type: vanilla
+  confidence_head_alpha: 1.0
+  confidence_head_with_markov: true
+
+  # --- frozen DeepSeek V4.1 target backend ---
+  # Use eager for a slower PyTorch numerical path when
+  # the fused TileLang kernels are unavailable on the deployment.
+  target_attn_backend: tilelang
+  target_dispatcher: hybridep
+  target_experts: torch_mm
+  target_enable_fsdp_optimizations: true
+
+  # --- objective: L = ce_alpha * L_ce + l1_alpha * L_tv + conf_alpha * L_conf ---
+  ce_loss_alpha: 0.1
+  l1_loss_alpha: 0.9
+  loss_decay_gamma: 4.0
+
+  trust_remote_code: false
+  shuffle_seed: 42
+  log_every_steps: 10
+  max_grad_norm: 1.0
+
+optimizer:
+  lr: 6.0e-4
+  betas: [0.9, 0.95]
+  weight_decay: 0.0
+  warmup_ratio: 0.04
+  min_lr_ratio: 0.1
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: ./outputs/dspark_deepseek_v41_flash/checkpoints
+  model_save_format: safetensors
+  save_consolidated: final
+  dequantize_base_checkpoint: true
+  # restore_from: LATEST

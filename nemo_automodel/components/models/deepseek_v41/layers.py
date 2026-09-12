@@ -20,8 +20,7 @@ each sublayer consumes the pre-mix produced by the preceding sublayer.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, NamedTuple
 
 import torch
 from torch import nn
@@ -53,8 +52,7 @@ class DeepseekV41RMSNorm(nn.Module):
         return (self.weight.float() * value).to(hidden_states.dtype)
 
 
-@dataclass(frozen=True)
-class DeepseekV41Mix:
+class DeepseekV41Mix(NamedTuple):
     """FP32 coefficients: pre/post [batch, sequence, streams], comb [batch, sequence, streams, streams]."""
 
     pre: torch.Tensor

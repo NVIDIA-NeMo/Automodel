@@ -21,6 +21,7 @@ string so adding a target family is a one-line append, with no recipe change.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Protocol, runtime_checkable
 
 from torch import nn
 
@@ -39,6 +40,14 @@ class DraftSpec:
     # Constructed as ``draft_cls(draft_config)``; some drafts are HF PreTrainedModel
     # subclasses (Qwen3, Gemma4) while others are plain modules (V4, GLM, MiniMax M3).
     draft_cls: type[nn.Module]
+
+
+@runtime_checkable
+class ModelOwnedDSparkProvider(Protocol):
+    """Target config that owns construction of its architecture-specific draft."""
+
+    def build_dspark_draft(self, options: object) -> nn.Module:
+        """Build a draft from the generic recipe's declarative options."""
 
 
 # Qwen3-style dense (and MoE) targets: the draft only consumes the target's
@@ -104,4 +113,10 @@ def build_target_layer_ids(num_target_layers: int, num_feature_layers: int) -> l
     return ids
 
 
-__all__ = ["DraftSpec", "DSPARK_DRAFT_REGISTRY", "resolve_dspark_draft_spec", "build_target_layer_ids"]
+__all__ = [
+    "DraftSpec",
+    "DSPARK_DRAFT_REGISTRY",
+    "ModelOwnedDSparkProvider",
+    "resolve_dspark_draft_spec",
+    "build_target_layer_ids",
+]

@@ -1,0 +1,732 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Native DeepSeek V4.1 DSpark draft backbone.
+
+The released draft is stored under ``mtp.0`` through ``mtp.2`` but is not the
+autoregressive MTP objective used by earlier DeepSeek models. It is a parallel
+five-position drafter whose three blocks use sliding-window MLA, routed MoE and
+single-pass mHC. This module implements the trainable, cache-free backbone; the
+shared frozen embedding/LM head and anchor sampling remain owned by the generic
+DSpark trainer.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from functools import partial
+from typing import NamedTuple
+
+import torch
+from torch import nn
+from torch.nn import functional as F
+
+from nemo_automodel.components.models.common import BackendConfig, initialize_rms_norm_module
+from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
+from nemo_automodel.components.models.deepseek_v4.model import DeepseekV4VisionGate
+from nemo_automodel.components.models.deepseek_v41.attention import DeepseekV41Attention, _apply_rope
+from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41TextConfig
+from nemo_automodel.components.models.deepseek_v41.layers import DeepseekV41HyperConnection, DeepseekV41RMSNorm
+from nemo_automodel.components.models.deepseek_v41.quantization import quantize_cache
+from nemo_automodel.components.moe.config import MoEConfig
+from nemo_automodel.components.moe.layers import MoE
+from nemo_automodel.components.speculative.dspark.common import (
+    DSparkForwardOutput,
+    build_eval_mask,
+    create_noise_embed,
+    sample_anchor_positions,
+)
+from nemo_automodel.shared.utils import dtype_from_str
+
+
+@dataclass(frozen=True)
+class DeepseekV41DSparkBackboneOutput:
+    """Native draft states consumed by the released output heads.
+
+    Attributes:
+        normalized_hidden_states: Final-normalized states of shape [batch,
+            draft_sequence, hidden]. The frozen target LM head consumes these
+            states to produce base token logits.
+        transition_logits: Optional Markov logits of shape [batch,
+            draft_sequence, vocab].
+        confidence_pred: Optional FP32 confidence logits of shape [batch,
+            draft_sequence].
+    """
+
+    normalized_hidden_states: torch.Tensor
+    transition_logits: torch.Tensor | None = None
+    confidence_pred: torch.Tensor | None = None
+
+
+class _DeepseekV41DSparkStageOutput(NamedTuple):
+    """Internal stage state kept within each stage's FSDP forward boundary."""
+
+    streams: torch.Tensor
+    pre_mix: torch.Tensor
+    target_hidden_states: torch.Tensor
+    normalized_hidden_states: torch.Tensor | None = None
+    transition_logits: torch.Tensor | None = None
+    confidence_pred: torch.Tensor | None = None
+
+
+class _DeepseekV41DSparkAttention(DeepseekV41Attention):
+    """Cache-free DSpark attention over target context and parallel draft blocks."""
+
+    def __init__(self, config: DeepseekV41TextConfig, layer_idx: int, backend: BackendConfig) -> None:
+        if backend.attn not in ("eager", "sdpa"):
+            raise ValueError("DeepSeek V4.1 DSpark attention supports backend.attn='eager' or 'sdpa'")
+        super().__init__(config, layer_idx, backend)
+        if self.compress_ratio != 0 or self.compressor is not None or self.indexer is not None:
+            raise ValueError("DeepSeek V4.1 DSpark layers must be SWA-only with compress_ratio=0")
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+        *,
+        position_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Attend draft queries to target context and their own parallel block.
+
+        Args:
+            hidden_states: Draft tensor of shape [batch, draft_sequence, hidden].
+            target_hidden_states: Projected target tensor of shape
+                [batch, context_sequence, hidden].
+            position_ids: Integer tensor of shape [batch, context_sequence +
+                draft_sequence], containing absolute positions for both regions.
+            attention_mask: Additive tensor broadcastable to shape [batch, heads,
+                draft_sequence, context_sequence + draft_sequence], with zero for
+                visible keys and negative infinity for masked keys.
+
+        Returns:
+            Tensor of shape [batch, draft_sequence, hidden]. Inputs are not mutated.
+        """
+        batch, draft_sequence, _ = hidden_states.shape
+        context_sequence = target_hidden_states.shape[1]
+        if target_hidden_states.shape[0] != batch:
+            raise ValueError("DSpark target and draft hidden states must have the same batch size")
+        if position_ids.shape != (batch, context_sequence + draft_sequence):
+            raise ValueError("DSpark position_ids must cover the concatenated target and draft sequences")
+        expected_mask_shape = (batch, 1, draft_sequence, context_sequence + draft_sequence)
+        if attention_mask.shape != expected_mask_shape:
+            raise ValueError(f"DSpark attention_mask must have shape {expected_mask_shape}")
+
+        target_angles = self.rotary_emb(position_ids[:, :context_sequence])
+        draft_angles = self.rotary_emb(position_ids[:, context_sequence:])
+        query_latent = self.q_norm(self.wq_a(hidden_states))
+        query = self.wq_b(query_latent).unflatten(-1, (self.num_heads, self.head_dim))
+        query = _apply_rope(query, draft_angles)
+
+        target_kv = _apply_rope(self.kv_norm(self.wkv(target_hidden_states)), target_angles)
+        target_kv = quantize_cache(target_kv, format="fp8", block_size=32)
+        draft_kv = _apply_rope(self.kv_norm(self.wkv(hidden_states)), draft_angles)
+        draft_kv = quantize_cache(draft_kv, format="fp8", block_size=32)
+        kv = torch.cat((target_kv, draft_kv), dim=1)
+
+        # The synthetic zero-valued key contributes only the learned sink logit
+        # to the softmax denominator, matching the released sparse-attention op.
+        kv = torch.cat((kv, kv.new_zeros(batch, 1, self.head_dim)), dim=1)
+        bias = attention_mask.expand(-1, self.num_heads, -1, -1).float()
+        sink = self.sinks_param(query).view(1, self.num_heads, 1, 1).expand(batch, -1, draft_sequence, -1)
+        bias = torch.cat((bias, sink), dim=-1)
+        if self.backend.attn == "sdpa":
+            attended = F.scaled_dot_product_attention(
+                query.transpose(1, 2),
+                kv.unsqueeze(1),
+                kv.unsqueeze(1),
+                attn_mask=bias,
+                dropout_p=self.attention_dropout if self.training else 0.0,
+                scale=self.head_dim**-0.5,
+            ).transpose(1, 2)
+        else:
+            logits = torch.einsum("bshd,btd->bhst", query.float(), kv.float()) * self.head_dim**-0.5
+            probabilities = (logits + bias).softmax(dim=-1)
+            probabilities = F.dropout(probabilities, p=self.attention_dropout, training=self.training)
+            attended = torch.einsum("bhst,btd->bshd", probabilities, kv.float()).to(query.dtype)
+        valid_tokens = torch.ones(batch, draft_sequence, dtype=torch.bool, device=hidden_states.device)
+        return self._project_output(attended, draft_angles, valid_tokens)
+
+
+class _DeepseekV41DSparkMarkovHead(nn.Module):
+    """Rank-factorized first-order token-transition bias."""
+
+    def __init__(self, vocab_size: int, rank: int, dtype: torch.dtype) -> None:
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, rank, dtype=dtype)
+        self.head = nn.Linear(rank, vocab_size, bias=False, dtype=dtype)
+
+    def forward(self, token_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute the transition bias and its conditioning embedding.
+
+        Args:
+            token_ids: Integer tensor of shape [...] containing preceding tokens.
+
+        Returns:
+            Transition logits of shape [..., vocab] and embeddings of shape
+            [..., markov_rank].
+        """
+        embedding = self.embed(token_ids)
+        return self.head(embedding), embedding
+
+
+class _DeepseekV41DSparkConfidenceHead(nn.Module):
+    """Predict conditional acceptance logits in FP32."""
+
+    def __init__(self, hidden_size: int, markov_rank: int) -> None:
+        super().__init__()
+        self.proj = nn.Linear(hidden_size + markov_rank, 1, bias=False, dtype=torch.float32)
+
+    def forward(self, hidden_states: torch.Tensor, markov_embeddings: torch.Tensor) -> torch.Tensor:
+        """Predict a conditional acceptance logit for every draft position.
+
+        Args:
+            hidden_states: Tensor of shape [..., hidden].
+            markov_embeddings: Tensor of shape [..., markov_rank] with matching
+                leading dimensions.
+
+        Returns:
+            FP32 tensor of shape [...] containing uncalibrated confidence logits.
+        """
+        if hidden_states.shape[:-1] != markov_embeddings.shape[:-1]:
+            raise ValueError("DSpark hidden states and Markov embeddings must have matching leading dimensions")
+        return self.proj(torch.cat((hidden_states.float(), markov_embeddings.float()), dim=-1)).squeeze(-1)
+
+
+class _DeepseekV41DSparkBlock(nn.Module):
+    """One released DSpark stage with MLA, MoE, mHC and stage-owned heads."""
+
+    def __init__(
+        self,
+        config: DeepseekV41TextConfig,
+        stage_idx: int,
+        backend: BackendConfig,
+        moe_config: MoEConfig,
+    ) -> None:
+        super().__init__()
+        dtype = dtype_from_str(config.dtype, torch.bfloat16)
+        layer_idx = config.num_hidden_layers + stage_idx
+        self.attn = _DeepseekV41DSparkAttention(config, layer_idx, backend)
+        self.ffn = MoE(moe_config, backend)
+        self.ffn.gate = DeepseekV4VisionGate(
+            DeepseekV4Config(vocab_size=config.vocab_size),
+            moe_config,
+            gate_precision=torch.float32,
+            hash_routing=False,
+        )
+        norm = (
+            partial(initialize_rms_norm_module, "te", device=self.attn.wq_a.weight.device)
+            if backend.rms_norm == "te"
+            else DeepseekV41RMSNorm
+        )
+        self.attn_norm = norm(config.hidden_size, eps=config.rms_norm_eps, dtype=dtype)
+        self.ffn_norm = norm(config.hidden_size, eps=config.rms_norm_eps, dtype=dtype)
+        sinkhorn_backend = "tilelang" if backend.attn == "tilelang" else "torch"
+        self.attn_hc = DeepseekV41HyperConnection(config, sinkhorn_backend=sinkhorn_backend)
+        self.ffn_hc = DeepseekV41HyperConnection(config, sinkhorn_backend=sinkhorn_backend)
+        if stage_idx == 0:
+            self.main_proj = nn.Linear(
+                config.hidden_size * len(config.dspark_target_layer_ids), config.hidden_size, bias=False, dtype=dtype
+            )
+            self.main_norm = norm(config.hidden_size, eps=config.rms_norm_eps, dtype=dtype)
+        if stage_idx == config.num_nextn_predict_layers - 1:
+            self.norm = norm(config.hidden_size, eps=config.rms_norm_eps, dtype=dtype)
+            self.markov_head = _DeepseekV41DSparkMarkovHead(config.vocab_size, config.dspark_markov_rank, dtype)
+            self.confidence_head = _DeepseekV41DSparkConfidenceHead(config.hidden_size, config.dspark_markov_rank)
+
+    @property
+    def mlp(self) -> MoE:
+        """Expose the shared parallelizer's MoE interface without duplicate registration."""
+        return self.ffn
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        pre_mix: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+        *,
+        position_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        previous_token_ids: torch.Tensor | None = None,
+        enable_confidence_head: bool = True,
+    ) -> _DeepseekV41DSparkStageOutput:
+        """Apply one native DSpark stage.
+
+        Args:
+            hidden_states: Tensor of shape [batch, draft_sequence, streams, hidden].
+            pre_mix: FP32 tensor of shape [batch, draft_sequence, streams].
+            target_hidden_states: Tensor of shape [batch, context_sequence, hidden].
+            position_ids: Integer tensor of shape [batch, context_sequence + draft_sequence].
+            attention_mask: Additive tensor of shape [batch, 1, draft_sequence,
+                context_sequence + draft_sequence].
+            previous_token_ids: Optional integer tensor of shape [batch,
+                draft_sequence] used by the final Markov head.
+            enable_confidence_head: Whether the final stage computes confidence.
+
+        Returns:
+            Stage state containing updated streams, target features, and any
+            final-stage head outputs.
+        """
+        if hasattr(self, "main_proj"):
+            target_hidden_states = self.main_norm(self.main_proj(target_hidden_states))
+        residual = hidden_states
+        attn_mix = self.attn_hc(hidden_states)
+        collapsed = self.attn_hc.collapse(hidden_states, pre_mix)
+        attended = self.attn(
+            self.attn_norm(collapsed),
+            target_hidden_states,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+        )
+        hidden_states = self.attn_hc.expand(attended, residual, attn_mix)
+        residual = hidden_states
+        ffn_mix = self.ffn_hc(hidden_states)
+        collapsed = self.ffn_hc.collapse(hidden_states, attn_mix.pre)
+        self.ffn.gate.set_routing_context(None, None)
+        output = self.ffn(self.ffn_norm(collapsed), None)
+        streams = self.ffn_hc.expand(output, residual, ffn_mix)
+        if not hasattr(self, "norm"):
+            return _DeepseekV41DSparkStageOutput(streams, ffn_mix.pre, target_hidden_states)
+
+        hidden_states = DeepseekV41HyperConnection.collapse(streams, ffn_mix.pre)
+        normalized_hidden_states = self.norm(hidden_states)
+        transition_logits = None
+        confidence_pred = None
+        if previous_token_ids is not None:
+            transition_logits, markov_embeddings = self.markov_head(previous_token_ids)
+            if enable_confidence_head:
+                confidence_pred = self.confidence_head(hidden_states, markov_embeddings)
+        return _DeepseekV41DSparkStageOutput(
+            streams,
+            ffn_mix.pre,
+            target_hidden_states,
+            normalized_hidden_states,
+            transition_logits,
+            confidence_pred,
+        )
+
+
+class DeepseekV41DSparkBackbone(nn.Module):
+    """Three-stage native drafter operating on prepared target and noise tensors."""
+
+    def __init__(
+        self,
+        config: DeepseekV41TextConfig,
+        backend: BackendConfig,
+        moe_config: MoEConfig | None = None,
+    ) -> None:
+        super().__init__()
+        if config.num_nextn_predict_layers <= 0:
+            raise ValueError("DeepSeek V4.1 DSpark requires at least one draft layer")
+        required_schedule = config.num_hidden_layers + config.num_nextn_predict_layers
+        if len(config.compress_ratios) < required_schedule:
+            raise ValueError(
+                f"DeepSeek V4.1 DSpark requires compress_ratios for {required_schedule} backbone and draft layers"
+            )
+        dtype = dtype_from_str(config.dtype, torch.bfloat16)
+        self.config = config
+        self.moe_config = moe_config or MoEConfig(
+            dim=config.hidden_size,
+            inter_dim=config.moe_intermediate_size,
+            moe_inter_dim=config.moe_intermediate_size,
+            n_routed_experts=config.dspark_n_routed_experts,
+            n_shared_experts=config.n_shared_experts,
+            n_activated_experts=config.dspark_num_experts_per_tok,
+            n_expert_groups=0,
+            n_limited_groups=0,
+            train_gate=True,
+            gate_bias_update_factor=0.0,
+            aux_loss_coeff=0.0,
+            score_func="sqrtsoftplus",
+            route_scale=config.routed_scaling_factor,
+            norm_topk_prob=config.norm_topk_prob,
+            router_weights_fp32=True,
+            force_e_score_correction_bias=True,
+            swiglu_limit=config.swiglu_limit,
+            dtype=dtype,
+        )
+        self.mtp = nn.ModuleList(
+            _DeepseekV41DSparkBlock(config, stage_idx, backend, self.moe_config)
+            for stage_idx in range(config.num_nextn_predict_layers)
+        )
+
+    def build_position_ids(self, anchor_positions: torch.Tensor, context_sequence: int) -> torch.Tensor:
+        """Build official target-context and draft-query positions.
+
+        Args:
+            anchor_positions: Integer tensor [batch, num_anchors] containing the
+                target token that seeds each draft block.
+            context_sequence: Number of target-context tokens.
+
+        Returns:
+            Integer tensor [batch, context_sequence + num_anchors * block_size].
+            Draft positions are ``anchor`` through ``anchor + block_size - 1``.
+            The target feature at ``anchor - 1`` predicts the anchor token that
+            occupies the first draft input slot.
+        """
+        if anchor_positions.ndim != 2:
+            raise ValueError("DSpark anchor_positions must have shape [batch, num_anchors]")
+        batch, num_anchors = anchor_positions.shape
+        context = torch.arange(context_sequence, device=anchor_positions.device).view(1, -1).expand(batch, -1)
+        offsets = torch.arange(self.config.dspark_block_size, device=anchor_positions.device).view(1, 1, -1)
+        draft = (anchor_positions.unsqueeze(-1) + offsets).reshape(batch, num_anchors * self.config.dspark_block_size)
+        return torch.cat((context, draft), dim=1)
+
+    def build_attention_mask(
+        self,
+        anchor_positions: torch.Tensor,
+        block_keep_mask: torch.Tensor,
+        context_sequence: int,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Build the released SWA-128 multi-anchor training mask.
+
+        Every query sees the target window ending immediately before its anchor,
+        plus every parallel input in its own draft block. It cannot see another
+        anchor's block. Invalid padding blocks retain their own in-block keys so
+        no attention row is fully masked; their losses are discarded later.
+
+        Args:
+            anchor_positions: Integer tensor [batch, num_anchors].
+            block_keep_mask: Boolean tensor [batch, num_anchors].
+            context_sequence: Number of target-context tokens.
+            dtype: Floating dtype of the returned additive mask.
+
+        Returns:
+            Additive tensor [batch, 1, num_anchors * block_size,
+            context_sequence + num_anchors * block_size].
+        """
+        if anchor_positions.ndim != 2 or block_keep_mask.shape != anchor_positions.shape:
+            raise ValueError("DSpark anchors and block_keep_mask must have matching [batch, num_anchors] shapes")
+        batch, num_anchors = anchor_positions.shape
+        block_size = self.config.dspark_block_size
+        draft_sequence = num_anchors * block_size
+        kv_sequence = context_sequence + draft_sequence
+        device = anchor_positions.device
+
+        query_index = torch.arange(draft_sequence, device=device).view(1, 1, -1, 1)
+        key_index = torch.arange(kv_sequence, device=device).view(1, 1, 1, -1)
+        query_block = query_index // block_size
+        anchor = anchor_positions.view(batch, 1, num_anchors, 1).repeat_interleave(block_size, dim=2)
+        is_context = key_index < context_sequence
+        context_visible = is_context & (key_index < anchor) & (key_index >= anchor - self.config.sliding_window)
+
+        is_draft = key_index >= context_sequence
+        key_block = (key_index - context_sequence) // block_size
+        own_block_visible = is_draft & (query_block == key_block)
+        keep = block_keep_mask.view(batch, 1, num_anchors, 1).repeat_interleave(block_size, dim=2)
+        visible = (context_visible & keep) | own_block_visible
+        return torch.where(
+            visible,
+            torch.tensor(0.0, device=device, dtype=dtype),
+            torch.tensor(float("-inf"), device=device, dtype=dtype),
+        )
+
+    @torch.no_grad()
+    def initialize_weights(self, buffer_device: torch.device | None = None) -> None:
+        """Initialize every draft parameter for checkpoint-free training.
+
+        Args:
+            buffer_device: Device used by grouped expert initialization. Defaults
+                to the first attention projection's device.
+        """
+        if buffer_device is None:
+            buffer_device = self.mtp[0].attn.wq_a.weight.device
+        std = self.config.initializer_range
+        for layer in self.mtp:
+            layer.ffn.init_weights(buffer_device, init_std=std)
+            layer.attn_hc.reset_parameters(std)
+            layer.ffn_hc.reset_parameters(std)
+            nn.init.ones_(layer.attn_norm.weight)
+            nn.init.ones_(layer.ffn_norm.weight)
+            layer.ffn.gate.bias_vl.zero_()
+            layer.attn.reset_parameters(std)
+        first = self.mtp[0]
+        nn.init.normal_(first.main_proj.weight, std=std)
+        nn.init.ones_(first.main_norm.weight)
+        last = self.mtp[-1]
+        nn.init.ones_(last.norm.weight)
+        nn.init.normal_(last.markov_head.embed.weight, std=std)
+        nn.init.normal_(last.markov_head.head.weight, std=std)
+        nn.init.normal_(last.confidence_head.proj.weight, std=std)
+
+    def forward(
+        self,
+        noise_embeddings: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+        *,
+        position_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        previous_token_ids: torch.Tensor | None = None,
+        enable_confidence_head: bool = True,
+    ) -> DeepseekV41DSparkBackboneOutput:
+        """Run the cache-free draft backbone for sampled anchors.
+
+        Args:
+            noise_embeddings: Tensor of shape [batch, draft_sequence, hidden],
+                containing an anchor embedding followed by noise embeddings in
+                each fixed-width block.
+            target_hidden_states: Concatenated target features of shape [batch,
+                context_sequence, target_layers * hidden].
+            position_ids: Integer tensor of shape [batch, context_sequence + draft_sequence].
+            attention_mask: Additive tensor of shape [batch, 1, draft_sequence,
+                context_sequence + draft_sequence].
+            previous_token_ids: Optional integer tensor of shape [batch,
+                draft_sequence] used by the final Markov head.
+            enable_confidence_head: Whether the final stage computes confidence.
+
+        Returns:
+            Draft backbone output containing normalized states of shape [batch,
+            draft_sequence, hidden], optional Markov logits of shape [batch,
+            draft_sequence, vocab], and optional FP32 confidence logits of shape
+            [batch, draft_sequence].
+        """
+        hidden_states = noise_embeddings.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
+        pre_mix = torch.zeros(
+            *noise_embeddings.shape[:2],
+            self.config.hc_mult,
+            device=noise_embeddings.device,
+            dtype=torch.float32,
+        )
+        pre_mix[..., 0] = 1
+        for layer in self.mtp:
+            stage_output = layer(
+                hidden_states,
+                pre_mix,
+                target_hidden_states,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                previous_token_ids=previous_token_ids,
+                enable_confidence_head=enable_confidence_head,
+            )
+            hidden_states = stage_output.streams
+            pre_mix = stage_output.pre_mix
+            target_hidden_states = stage_output.target_hidden_states
+        if stage_output.normalized_hidden_states is None:
+            raise RuntimeError("The final DSpark stage did not produce output states")
+        return DeepseekV41DSparkBackboneOutput(
+            normalized_hidden_states=stage_output.normalized_hidden_states,
+            transition_logits=stage_output.transition_logits,
+            confidence_pred=stage_output.confidence_pred,
+        )
+
+
+class DeepseekV41DSparkModel(DeepseekV41DSparkBackbone):
+    """Model-owned adapter from the native draft to the shared DSpark loss contract."""
+
+    _no_split_modules = ["_DeepseekV41DSparkBlock"]
+    _keep_in_fp32_modules_strict = [
+        "attn_hc",
+        "ffn_hc",
+        "attn.sinks_param",
+        "bias_vl",
+        "confidence_head",
+    ]
+
+    def __init__(
+        self,
+        config: DeepseekV41TextConfig,
+        backend: BackendConfig | None = None,
+        *,
+        num_anchors: int,
+        enable_confidence_head: bool,
+    ) -> None:
+        backend = backend or BackendConfig(
+            attn="sdpa",
+            linear="torch",
+            rms_norm="torch_fp32",
+            experts="torch",
+            dispatcher="torch",
+        )
+        super().__init__(config, backend)
+        if config.dspark_markov_rank <= 0:
+            raise ValueError("DeepSeek V4.1 DSpark requires dspark_markov_rank > 0")
+        dtype = dtype_from_str(config.dtype, torch.bfloat16)
+        self.embed_tokens = nn.Embedding(
+            config.vocab_size,
+            config.hidden_size,
+            padding_idx=config.pad_token_id,
+            dtype=dtype,
+        )
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False, dtype=dtype)
+        self.num_anchors = int(num_anchors)
+        self.enable_confidence_head = bool(enable_confidence_head)
+        if self.num_anchors <= 0:
+            raise ValueError("num_anchors must be positive")
+        if not self.enable_confidence_head:
+            self.mtp[-1].confidence_head.requires_grad_(False)
+        from nemo_automodel.components.models.deepseek_v41.state_dict_adapter import (
+            DeepseekV41DSparkStateDictAdapter,
+        )
+
+        self.state_dict_adapter = DeepseekV41DSparkStateDictAdapter(config, self.moe_config, backend, dtype=dtype)
+        self.initialize_weights(self.embed_tokens.weight.device)
+
+    @property
+    def layers(self) -> nn.ModuleList:
+        """Expose native MTP stages to the shared AC/FSDP helpers."""
+        return self.mtp
+
+    def initialize_embeddings_and_head(
+        self,
+        *,
+        embed_tokens: nn.Module,
+        lm_head: nn.Module,
+        freeze: bool = True,
+    ) -> None:
+        """Copy the target's embedding and vocabulary projection.
+
+        Args:
+            embed_tokens: Target embedding with weight of shape [vocab, hidden].
+            lm_head: Target output projection with weight of shape [vocab, hidden].
+            freeze: Disable gradients for both copied modules when true.
+        """
+        if not freeze:
+            raise ValueError("DeepSeek V4.1 DSpark requires frozen copied embedding and LM-head weights")
+        if self.embed_tokens.weight.shape != embed_tokens.weight.shape:
+            raise ValueError("DSpark and target embedding shapes must match")
+        if self.lm_head.weight.shape != lm_head.weight.shape:
+            raise ValueError("DSpark and target LM-head shapes must match")
+        with torch.no_grad():
+            self.embed_tokens.weight.copy_(embed_tokens.weight.detach())
+            self.lm_head.weight.copy_(lm_head.weight.detach())
+        self.set_embedding_head_trainable(False)
+
+    def set_embedding_head_trainable(self, trainable: bool) -> None:
+        """Set whether the copied embedding and LM head receive gradients."""
+        self.embed_tokens.requires_grad_(trainable)
+        self.lm_head.requires_grad_(trainable)
+
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Project hidden states through the frozen vocabulary head in FP32.
+
+        Args:
+            hidden_states: Tensor of shape [batch, sequence, hidden].
+
+        Returns:
+            FP32 tensor of shape [batch, sequence, vocab].
+        """
+        return F.linear(hidden_states.float(), self.lm_head.weight.float())
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+        loss_mask: torch.Tensor,
+        target_last_hidden_states: torch.Tensor | None = None,
+    ) -> DSparkForwardOutput:
+        """Run native V4.1 DSpark training for sampled anchors.
+
+        Args:
+            input_ids: Target-token tensor of shape [batch, sequence].
+            target_hidden_states: Concatenated target-feature tensor of shape
+                [batch, sequence, target_layers * hidden].
+            loss_mask: Supervision tensor of shape [batch, sequence].
+            target_last_hidden_states: Optional frozen target-state tensor of
+                shape [batch, sequence, hidden] used by the probability-distance loss.
+
+        Returns:
+            Shared DSpark loss inputs. Draft logits have shape [batch,
+            num_anchors, block_size, vocab]; token, mask, and confidence tensors
+            have shape [batch, num_anchors, block_size].
+        """
+        batch, sequence = input_ids.shape
+        if target_hidden_states.shape[:2] != (batch, sequence):
+            raise ValueError("target_hidden_states must match input_ids [batch, sequence]")
+        anchor_positions, block_keep_mask = sample_anchor_positions(
+            seq_len=sequence,
+            loss_mask=loss_mask,
+            num_anchors=self.num_anchors,
+            device=input_ids.device,
+        )
+        num_blocks = anchor_positions.shape[1]
+        block_size = self.config.dspark_block_size
+        offsets = torch.arange(1, block_size + 1, device=input_ids.device).view(1, 1, -1)
+        label_indices = anchor_positions.unsqueeze(-1) + offsets
+        safe_label_indices = label_indices.clamp(max=sequence - 1)
+        safe_label_indices = torch.where(
+            block_keep_mask.unsqueeze(-1), safe_label_indices, torch.zeros_like(safe_label_indices)
+        )
+        target_ids = torch.gather(
+            input_ids.unsqueeze(1).expand(-1, num_blocks, -1),
+            2,
+            safe_label_indices,
+        )
+        anchor_token_ids = torch.gather(input_ids, 1, anchor_positions)
+        previous_token_ids = torch.cat((anchor_token_ids.unsqueeze(-1), target_ids[:, :, :-1]), dim=-1)
+        noise_embeddings = create_noise_embed(
+            self.embed_tokens,
+            input_ids,
+            anchor_positions,
+            block_keep_mask,
+            mask_token_id=self.config.dspark_noise_token_id,
+            block_size=self.config.dspark_block_size,
+        )
+        position_ids = self.build_position_ids(anchor_positions, sequence)
+        attention_mask = self.build_attention_mask(
+            anchor_positions,
+            block_keep_mask,
+            sequence,
+            noise_embeddings.dtype,
+        )
+        backbone_output = super().forward(
+            noise_embeddings,
+            target_hidden_states.detach(),
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            previous_token_ids=previous_token_ids.reshape(batch, -1),
+            enable_confidence_head=self.enable_confidence_head,
+        )
+
+        normalized = backbone_output.normalized_hidden_states.reshape(batch, num_blocks, block_size, -1)
+        eval_mask = build_eval_mask(
+            seq_len=sequence,
+            loss_mask=loss_mask,
+            label_indices=label_indices,
+            safe_label_indices=safe_label_indices,
+            block_keep_mask=block_keep_mask,
+        )
+
+        aligned_target_logits = None
+        if target_last_hidden_states is not None:
+            if target_last_hidden_states.shape[:2] != (batch, sequence):
+                raise ValueError("target_last_hidden_states must match input_ids [batch, sequence]")
+            target_prediction_indices = (safe_label_indices - 1).clamp(min=0)
+            aligned_hidden = torch.gather(
+                target_last_hidden_states.unsqueeze(1).expand(-1, num_blocks, -1, -1),
+                2,
+                target_prediction_indices.unsqueeze(-1).expand(-1, -1, -1, target_last_hidden_states.shape[-1]),
+            )
+            aligned_target_logits = self.compute_logits(aligned_hidden.detach())
+
+        if backbone_output.transition_logits is None:
+            raise RuntimeError("The final DSpark stage did not produce Markov logits")
+        transition_logits = backbone_output.transition_logits.reshape(batch, num_blocks, block_size, -1)
+        draft_logits = self.compute_logits(normalized) + transition_logits.float()
+        confidence_pred = (
+            backbone_output.confidence_pred.reshape(batch, num_blocks, block_size)
+            if backbone_output.confidence_pred is not None
+            else None
+        )
+        return DSparkForwardOutput(
+            draft_logits=draft_logits,
+            target_ids=target_ids,
+            eval_mask=eval_mask,
+            block_keep_mask=block_keep_mask,
+            confidence_pred=confidence_pred,
+            aligned_target_logits=aligned_target_logits,
+        )
+
+
+__all__ = ["DeepseekV41DSparkModel"]

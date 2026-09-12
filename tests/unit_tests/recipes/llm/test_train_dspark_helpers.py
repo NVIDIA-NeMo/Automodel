@@ -759,6 +759,73 @@ def test_build_deepseek_v4_backend_defaults():
     assert backend.enable_hf_state_dict_adapter is True
 
 
+def test_build_deepseek_v41_target_uses_text_only_distributed_loader(monkeypatch):
+    import nemo_automodel.recipes.llm._dspark_target_build as tb
+
+    target_config = SimpleNamespace()
+    captured = {}
+    monkeypatch.setattr(
+        tb.DeepseekV41Config,
+        "from_pretrained",
+        staticmethod(lambda *args, **kwargs: target_config),
+    )
+    monkeypatch.setattr(tb, "create_distributed_setup_from_config", lambda cfg, world_size: "distributed-setup")
+
+    def _from_config(**kwargs):
+        captured.update(kwargs)
+        return "target-model"
+
+    monkeypatch.setattr(tb.NeMoAutoModelForCausalLM, "from_config", _from_config)
+    config, model, setup = tb.build_deepseek_v41_target(
+        cfg=SimpleNamespace(),
+        world_size=64,
+        device=SimpleNamespace(type="cuda"),
+        compute_dtype=torch.bfloat16,
+        target_path="deepseek-v41",
+        recipe_cfg=_opt_cfg(),
+        trust_remote_code=False,
+    )
+    assert config is target_config
+    assert model == "target-model"
+    assert setup == "distributed-setup"
+    assert captured["config"] is target_config
+    assert captured["load_base_model"] is True
+    assert captured["distributed_setup"] == "distributed-setup"
+    assert captured["torch_dtype"] == torch.bfloat16
+    backend = captured["backend"]
+    assert backend.attn == "tilelang"
+    assert backend.experts == "torch_mm"
+    assert backend.dispatcher == "hybridep"
+    assert backend.gate_precision == torch.float32
+    assert backend.enable_hf_state_dict_adapter is True
+
+
+def test_build_deepseek_v41_target_requires_full_cuda_target():
+    import nemo_automodel.recipes.llm._dspark_target_build as tb
+
+    with pytest.raises(RuntimeError, match="requires CUDA"):
+        tb.build_deepseek_v41_target(
+            cfg=SimpleNamespace(),
+            world_size=1,
+            device=SimpleNamespace(type="cpu"),
+            compute_dtype=torch.float32,
+            target_path="deepseek-v41",
+            recipe_cfg=_opt_cfg(),
+            trust_remote_code=False,
+        )
+
+    with pytest.raises(ValueError, match="target_num_hidden_layers"):
+        tb.build_deepseek_v41_target(
+            cfg=SimpleNamespace(),
+            world_size=64,
+            device=SimpleNamespace(type="cuda"),
+            compute_dtype=torch.bfloat16,
+            target_path="deepseek-v41",
+            recipe_cfg=_opt_cfg(target_num_hidden_layers=4),
+            trust_remote_code=False,
+        )
+
+
 def test_gather_full_weight_module_passthrough_and_full_tensor():
     plain = torch.nn.Linear(2, 2)
     assert gather_full_weight_module(plain) is plain  # plain .weight -> unchanged
