@@ -12,9 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from pathlib import Path
+
 import pytest
 import torch
+from safetensors.torch import save_file
 
+from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41TextConfig
 from nemo_automodel.components.models.deepseek_v41.dspark import DeepseekV41DSparkBackbone, DeepseekV41DSparkModel
@@ -25,11 +29,11 @@ from nemo_automodel.components.models.deepseek_v41.quantization import quantize_
 pytestmark = pytest.mark.timeout(60)
 
 
-def _config() -> DeepseekV41TextConfig:
+def _config(*, hidden_size: int = 16, quantization_config: dict[str, object] | None = None) -> DeepseekV41TextConfig:
     return DeepseekV41TextConfig(
         vocab_size=32,
-        hidden_size=16,
-        moe_intermediate_size=16,
+        hidden_size=hidden_size,
+        moe_intermediate_size=hidden_size,
         num_hidden_layers=2,
         num_attention_heads=2,
         head_dim=8,
@@ -51,6 +55,7 @@ def _config() -> DeepseekV41TextConfig:
         dspark_n_routed_experts=4,
         dspark_num_experts_per_tok=2,
         dtype="float32",
+        quantization_config=quantization_config,
     )
 
 
@@ -162,9 +167,7 @@ def test_released_checkpoint_roundtrip() -> None:
 
 def test_released_quantized_checkpoint_targets() -> None:
     backend = BackendConfig(attn="eager", linear="torch", rms_norm="torch_fp32", experts="torch", dispatcher="torch")
-    config = _config()
-    config.hidden_size = 32
-    config.moe_intermediate_size = 32
+    config = _config(hidden_size=32)
     model = DeepseekV41DSparkModel(config, backend, num_anchors=1, enable_confidence_head=True)
 
     released = model.state_dict_adapter.to_hf(model.state_dict(), quantization=True, for_checkpoint_load=True)
@@ -174,6 +177,59 @@ def test_released_quantized_checkpoint_targets() -> None:
     assert released["mtp.0.ffn.experts.0.w1.weight"].shape == (32, 16)
     assert released["mtp.0.ffn.experts.0.w1.scale"].shape == (32, 1)
     assert released["mtp.2.confidence_head.proj.weight"].dtype == torch.float32
+
+
+def test_quantized_checkpoint_load_and_training_resume(tmp_path: Path) -> None:
+    config = _config(hidden_size=32, quantization_config={"quant_method": "fp8"})
+    backend = BackendConfig(attn="eager", linear="torch", rms_norm="torch_fp32", experts="torch", dispatcher="torch")
+    model = DeepseekV41DSparkModel(config, backend, num_anchors=1, enable_confidence_head=True)
+
+    source = {}
+    for key, tensor in model.state_dict_adapter.to_hf(
+        model.state_dict(), quantization=True, for_checkpoint_load=True
+    ).items():
+        if key.endswith(".scale"):
+            source[key] = torch.full(tensor.shape, 4.0, dtype=torch.float32).to(tensor.dtype)
+        elif tensor.dtype == torch.int8:
+            source[key] = torch.full(tensor.shape, 0x44, dtype=torch.int8)
+        elif tensor.dtype == torch.float8_e4m3fn:
+            source[key] = torch.full(tensor.shape, 2.0, dtype=torch.float32).to(tensor.dtype)
+        else:
+            source[key] = torch.full_like(tensor, 3).contiguous()
+    checkpoint = tmp_path / "released"
+    checkpoint.mkdir()
+    save_file(source, checkpoint / "model.safetensors")
+
+    checkpointer = Checkpointer(
+        CheckpointingConfig(
+            checkpoint_dir=str(tmp_path),
+            model_save_format="safetensors",
+            save_consolidated=False,
+            model_cache_dir=str(tmp_path / "cache"),
+            model_repo_id="test/deepseek-v41-dspark",
+            dequantize_base_checkpoint=True,
+        ),
+        dp_rank=0,
+        tp_rank=0,
+        pp_rank=0,
+    )
+    try:
+        checkpointer.load_model(model, str(checkpoint), is_init_step=True)
+        loaded = {key: value.detach().clone() for key, value in model.state_dict().items()}
+        assert (loaded["mtp.0.attn.wq_a.weight"] == 8).all()
+        assert (loaded["mtp.0.ffn.experts.gate_and_up_projs"] == 8).all()
+        assert (loaded["embed_tokens.weight"] == 3).all()
+        assert (loaded["mtp.2.confidence_head.proj.weight"] == 3).all()
+
+        trained = tmp_path / "trained"
+        checkpointer.save_model(model, str(trained))
+        for parameter in model.parameters():
+            parameter.detach().zero_()
+        checkpointer.load_model(model, str(trained / "model"))
+        for key, value in model.state_dict().items():
+            torch.testing.assert_close(value, loaded[key], rtol=0, atol=0)
+    finally:
+        checkpointer.close()
 
 
 def test_cache_free_backbone_forward_and_backward() -> None:
