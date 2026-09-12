@@ -34,12 +34,13 @@ from __future__ import annotations
 
 import itertools
 import logging
-import time
 from typing import Any, Dict, Iterator
 
 import torch
 import torch.distributed as dist
 from torch.utils.data import Dataset, Sampler
+
+from nemo_automodel.components.datasets.llm.sample_lengths import compute_sample_lengths
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +94,7 @@ class LengthGroupedSampler(Sampler[int]):
         self._next_yielded: int | None = None
 
         # Compute lengths
-        self.lengths = self._compute_lengths(dataset)
+        self.lengths = compute_sample_lengths(dataset)
 
         # Sort by length (descending) and shard across ranks
         sorted_all = sorted(range(len(dataset)), key=lambda i: self.lengths[i], reverse=True)
@@ -130,39 +131,6 @@ class LengthGroupedSampler(Sampler[int]):
             self.batch_size,
             len(self.sorted_indices) // max(self.batch_size, 1),
         )
-
-    @staticmethod
-    def _compute_lengths(dataset: Dataset) -> list[int]:
-        """Compute token lengths for all samples."""
-        # Fast path: access underlying list directly if available
-        raw = dataset
-        while hasattr(raw, "dataset"):
-            raw = raw.dataset
-        if not isinstance(raw, list):
-            raw = None
-
-        n = len(dataset)
-        logger.info("Computing token lengths for %d samples...", n)
-        t0 = time.monotonic()
-        lengths = [0] * n
-
-        for i in range(n):
-            sample = raw[i] if raw is not None else dataset[i]
-            ids = sample.get("input_ids")
-            if ids is not None:
-                lengths[i] = len(ids) if isinstance(ids, list) else ids.numel()
-            if (i + 1) % 100_000 == 0 or i == n - 1:
-                elapsed = time.monotonic() - t0
-                logger.info(
-                    "  %d/%d samples (%.1fs, %.0f samples/s)",
-                    i + 1,
-                    n,
-                    elapsed,
-                    (i + 1) / max(elapsed, 1e-6),
-                )
-
-        logger.info("Length computation done in %.1fs", time.monotonic() - t0)
-        return lengths
 
     def set_epoch(self, epoch: int) -> None:
         """Set the epoch for deterministic per-epoch shuffling."""

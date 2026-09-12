@@ -1,0 +1,99 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Chat SFT with a token-budget batch sampler instead of a fixed micro-batch size.
+#
+# `dataloader.dynamic_batching` fills every micro-batch up to max_tokens_per_batch
+# padded tokens, so a batch of short turns holds many samples and a batch of long
+# ones holds few. Two consequences drive the setting:
+#
+#   * the activation-memory peak is max_tokens_per_batch, not local_batch_size times
+#     the longest sample in the dataset, so a long-tail chat corpus stops sizing the
+#     whole run for its worst sample;
+#   * the same data takes markedly fewer optimizer steps, because short-sequence
+#     batches are no longer padded out to a fixed sample count.
+#
+# `local_batch_size` no longer sizes a micro-batch (the sampler does), but it is NOT
+# ignored: `StepScheduler` still derives the gradient-accumulation count from
+# `global_batch_size // (local_batch_size * dp_size)`, so the pair below decides how
+# many dynamic micro-batches are accumulated per optimizer step. `global_batch_size`
+# therefore stops bounding the samples per step: a step of short-sequence batches can
+# hold far more than 64 samples. Gradients stay correct regardless, because the recipe
+# normalizes by the globally all-reduced label-token count, not by the batch count.
+#
+# To run this recipe:
+#   automodel finetune llm -c examples/llm_finetune/qwen/qwen3_4b_chat_dynamic_batching.yaml --nproc-per-node 8
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
+step_scheduler:
+  global_batch_size: 64
+  local_batch_size: 8
+  ckpt_every_steps: 500
+  num_epochs: 1
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1111
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen3-4B
+
+checkpoint:
+  enabled: false
+
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 1
+  cp_size: 1
+  sequence_parallel: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
+  path_or_dataset_id: /path/to/chat-sft-parquet   # <-- messages-format chat data
+  split: train
+  seq_length: 4096
+
+packed_sequence:
+  packed_sequence_size: 0
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  dynamic_batching:
+    # Padded-token ceiling per micro-batch. Size it the way local_batch_size *
+    # seq_length would have been sized: this is the real memory knob.
+    max_tokens_per_batch: 16384
+    # Guard against a batch of very short samples becoming huge in sample count.
+    max_batch_size: 64
+    # Samples sorted together before batching. Larger keeps batches more
+    # length-homogeneous; smaller keeps the order closer to a pure shuffle.
+    sort_window: 2048
+
+optimizer:
+  _target_: torch.optim.AdamW
+  betas: [0.9, 0.95]
+  eps: 1e-8
+  lr: 1.0e-5
+  weight_decay: 0.0
