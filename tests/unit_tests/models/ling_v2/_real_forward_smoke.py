@@ -99,6 +99,23 @@ def main(argv: list[str] | None = None) -> int:
         hf_sd.update(load_file(s, device="cpu"))
     print(f"  {len(hf_sd)} HF tensors")
 
+    # Checkpoint-side dtype evidence, read from the loaded safetensors before any
+    # conversion or cast can launder it. The published layout is deliberately mixed:
+    # a BF16 router weight sitting beside an F32 correction bias, while ordinary
+    # weights around them (layernorms, projections) are all BF16. So the Param stage
+    # asserted below matches what the checkpoint stores -- it is not a policy
+    # Automodel imposes on it. Treat a change here as the upstream layout moving.
+    first_moe = cfg.first_k_dense_replace
+    w_key = f"model.layers.{first_moe}.mlp.gate.weight"
+    b_key = f"model.layers.{first_moe}.mlp.gate.expert_bias"
+    print("\nstored checkpoint dtypes (pre-conversion):")
+    for k in (w_key, b_key):
+        print(f"  {k} = {hf_sd[k].dtype if k in hf_sd else '<absent>'}")
+    stored_ok = hf_sd.get(w_key) is not None and hf_sd[w_key].dtype is torch.bfloat16
+    stored_ok = stored_ok and hf_sd.get(b_key) is not None and hf_sd[b_key].dtype is torch.float32
+    if not stored_ok:
+        print("  MISMATCH: expected BF16 gate weight and F32 expert_bias")
+
     adapter = BailingMoeV2StateDictAdapter(cfg, moe_cfg, backend, dtype=torch.bfloat16)
     native_sd = adapter.from_hf(hf_sd, device_mesh=None)
     print(f"  {len(native_sd)} native tensors after grouping")
@@ -155,7 +172,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  argmax sample (first 10): {top1[0, :10].tolist()}")
     print(f"\ndone in {elapsed:.1f}s")
 
-    ok = finite and missing == [] and unexpected == [] and top1_unique > 1 and router_ok
+    ok = finite and missing == [] and unexpected == [] and top1_unique > 1 and router_ok and stored_ok
     print(f"\n{'PASS' if ok else 'FAIL'}")
     return 0 if ok else 1
 
