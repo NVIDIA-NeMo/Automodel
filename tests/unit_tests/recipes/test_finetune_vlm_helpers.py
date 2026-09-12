@@ -1540,6 +1540,7 @@ class _MockPPInfo:
                     kwargs["losses"].append(torch.tensor(0.5))
 
         self.schedule.step = MagicMock(side_effect=step_side_effect)
+        self.schedule.eval = MagicMock(side_effect=step_side_effect)
 
 
 class _MockAutoPipeline:
@@ -1573,6 +1574,25 @@ class _MockAutoPipeline:
         self.step_batches.append(dict(kwargs))
         schedule_args = (model_input,) if self.info.has_first_stage else ()
         return self.info.schedule.step(*schedule_args, target=target, losses=losses, **kwargs)
+
+    def eval(self, model_input, *, target=None, losses=None, **kwargs):
+        """Record and forward a forward-only AutoPipeline step.
+
+        Args:
+            model_input: Tensor of shape [batch, ...] containing the first
+                pipeline stage's input.
+            target: Optional tensor of shape [batch, sequence] containing loss
+                targets.
+            losses: Optional mutable list populated with scalar loss tensors.
+            **kwargs: Keyword schedule inputs. Tensor values have arbitrary
+                model-defined layouts.
+
+        Returns:
+            The value returned by the schedule mock.
+        """
+        self.step_batches.append(dict(kwargs))
+        schedule_args = (model_input,) if self.info.has_first_stage else ()
+        return self.info.schedule.eval(*schedule_args, target=target, losses=losses, **kwargs)
 
 
 def _create_pp_recipe(model=None):
@@ -1610,8 +1630,8 @@ class TestForwardBackwardStepPP:
         """Create a recipe configured for PP testing."""
         return _create_pp_recipe()
 
-    def test_pp_skips_validation_forward(self, pp_recipe, monkeypatch):
-        """Test that PP mode skips forward pass during validation."""
+    def test_pp_validation_runs_forward_only(self, pp_recipe, monkeypatch):
+        """Validation under PP runs the schedule's forward-only entry point."""
         pp_recipe.pp = _MockAutoPipeline()
 
         monkeypatch.setattr(
@@ -1625,7 +1645,6 @@ class TestForwardBackwardStepPP:
         }
         loss_buffer = []
 
-        # Should return early without error
         pp_recipe._forward_backward_step(
             idx=0,
             batch=batch,
@@ -1635,8 +1654,39 @@ class TestForwardBackwardStepPP:
             is_train=False,  # Validation mode
         )
 
-        # Loss buffer should be empty (no forward pass)
-        assert len(loss_buffer) == 0
+        # Forward-only: eval() drives the schedule, step() must stay untouched so
+        # validation never enqueues backward work.
+        pp_recipe.pp.info.schedule.eval.assert_called_once()
+        pp_recipe.pp.info.schedule.step.assert_not_called()
+        # Two mock microbatch losses of 0.5 each, summed on the last stage.
+        assert len(loss_buffer) == 1
+        assert loss_buffer[0].item() == pytest.approx(1.0)
+
+    def test_pp_training_runs_step_not_eval(self, pp_recipe, monkeypatch):
+        """The training path must keep using the backward-capable entry point."""
+        pp_recipe.pp = _MockAutoPipeline()
+
+        monkeypatch.setattr(
+            "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch, None),
+        )
+
+        batch = {
+            "labels": torch.tensor([[1, 2]]),
+            "input_ids": torch.tensor([[1, 2]]),
+        }
+        loss_buffer = []
+
+        pp_recipe._forward_backward_step(
+            idx=0,
+            batch=batch,
+            loss_buffer=loss_buffer,
+            num_label_tokens=2,
+            num_batches=1,
+        )
+
+        pp_recipe.pp.info.schedule.step.assert_called_once()
+        pp_recipe.pp.info.schedule.eval.assert_not_called()
 
     def test_pp_vlm_chunking_equal_images_and_batch(self, pp_recipe, monkeypatch):
         """Test VLM pixel_values chunking when n_images == batch_size."""
@@ -2973,6 +3023,104 @@ def test_vlm_setup_threads_pp_group_to_checkpointer(monkeypatch):
     trainer.setup()
 
     assert build_kwargs["pp_group"] is pp_group
+
+
+def _make_pp_validation_recipe(monkeypatch, *, allreduce_calls, broadcast_calls, step_calls, losses):
+    """Build a PP recipe stub whose collectives and forward step are recorded.
+
+    Args:
+        allreduce_calls: List extended with ``(value, include_cp)`` per DP all-reduce.
+        broadcast_calls: List extended with each scalar tensor handed to the PP broadcast.
+        step_calls: List extended with the keyword arguments of each forward step.
+        losses: Per-batch scalar loss values the stubbed forward step reports.
+
+    Returns:
+        A ``FinetuneRecipeForVLM`` instance wired for ``_run_validation_epoch``.
+    """
+    recipe = FinetuneRecipeForVLM.__new__(FinetuneRecipeForVLM)
+    recipe.pp_enabled = True
+    recipe.dist_env = SimpleNamespace(device=torch.device("cpu"), is_main=True)
+    recipe.model_parts = [SimpleNamespace(eval=MagicMock())]
+    recipe.step_scheduler = SimpleNamespace(step=4, epoch=0)
+    recipe.optimizer = [SimpleNamespace(param_groups=[{"lr": 0.001}])]
+
+    remaining = list(losses)
+
+    def _fake_forward_backward_step(idx, batch, **kwargs):
+        step_calls.append({"idx": idx, **kwargs})
+        kwargs["loss_buffer"].append(torch.tensor(remaining.pop(0)))
+
+    def _fake_allreduce(tensor, include_cp=False):
+        allreduce_calls.append((tensor.item(), include_cp))
+        return tensor
+
+    recipe._forward_backward_step = _fake_forward_backward_step
+    recipe._dp_allreduce = _fake_allreduce
+    recipe._broadcast_from_last_pp_stage = lambda tensor: broadcast_calls.append(tensor.item()) or tensor
+    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.ScopedRNG", lambda **kwargs: nullcontext())
+    return recipe
+
+
+def test_vlm_pp_validation_reports_mean_loss_per_supervised_token(monkeypatch):
+    """PP microbatch losses are unnormalized sums, so the epoch divides once at the end."""
+    allreduce_calls = []
+    broadcast_calls = []
+    step_calls = []
+    recipe = _make_pp_validation_recipe(
+        monkeypatch,
+        allreduce_calls=allreduce_calls,
+        broadcast_calls=broadcast_calls,
+        step_calls=step_calls,
+        losses=[3.0, 2.0],
+    )
+    batches = [
+        {"labels": torch.tensor([[1, 2, -100, 4]])},
+        {"labels": torch.tensor([[-100, 5, 6]])},
+    ]
+
+    metrics = recipe._run_validation_epoch(batches)
+
+    # 5.0 summed loss over 3 + 2 supervised tokens.
+    assert metrics.metrics["val_loss"] == pytest.approx(1.0)
+    assert metrics.metrics["num_label_tokens"] == 5
+    # Every batch is one whole pipeline outer batch, normalized once outside.
+    assert [(call["idx"], call["num_batches"], call["num_label_tokens"]) for call in step_calls] == [
+        (0, 1, None),
+        (0, 1, None),
+    ]
+    assert all(call["is_train"] is False for call in step_calls)
+    # Loss spans CP because it is reassembled from CP shards; the token count was
+    # measured pre-shard on every CP rank, so summing it over CP would inflate it.
+    assert allreduce_calls == [(5.0, True), (5, False)]
+    assert broadcast_calls == [pytest.approx(1.0), 5]
+
+
+@pytest.mark.parametrize(
+    "batches",
+    [
+        [],
+        [{"labels": torch.tensor([[-100, -100]])}],
+    ],
+)
+def test_vlm_pp_validation_handles_zero_global_denominator_like_llm(monkeypatch, batches):
+    """PP validation follows LLM's finite zero-loss behavior when no labels are supervised."""
+    allreduce_calls = []
+    broadcast_calls = []
+    step_calls = []
+    recipe = _make_pp_validation_recipe(
+        monkeypatch,
+        allreduce_calls=allreduce_calls,
+        broadcast_calls=broadcast_calls,
+        step_calls=step_calls,
+        losses=[0.0],
+    )
+
+    metrics = recipe._run_validation_epoch(batches)
+
+    assert metrics.metrics["val_loss"] == 0.0
+    assert metrics.metrics["num_label_tokens"] == 0
+    assert allreduce_calls == [(0.0, True), (0, False)]
+    assert broadcast_calls == [0.0, 0]
 
 
 def test_vlm_rope_fusion_disabled_when_cp_gt_1(monkeypatch):

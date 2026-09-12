@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Parallel-vs-single-rank training parity validator.
+"""Parallel-vs-single-rank training and validation parity validator.
 
-Compares two ``training.jsonl`` logs produced by the same recipe and seed: a
-single-rank baseline and a run with one parallelism axis enabled (TP, PP, CP, or
-EP). Both runs must follow the same loss and gradient-norm trajectory.
+Compares two metric logs produced by the same recipe and seed: a single-rank
+baseline and a run with one parallelism axis enabled (TP, PP, CP, or EP).
+Training logs must follow the same loss and gradient-norm trajectory;
+validation logs compare their validation loss.
 
 This is the generic net for parallelism correctness. A smoke test only fails on
 a crash or a hang, but wrong stage metadata, a gradient that syncs over the
@@ -32,12 +33,14 @@ Called by the ``L2_Parallelism_*`` scripts after two torchrun invocations.
 
 Usage:
     python compare_parallel_parity.py baseline.jsonl pp2.jsonl --axis pp
+    python compare_parallel_parity.py baseline-validation.jsonl pp2-validation.jsonl --axis pp --metric val_loss
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 
 # Both runs share a seed and a data order, so step 1 differs only by floating-
 # point reduction order. Later steps accumulate that difference through the
@@ -54,15 +57,16 @@ DEFAULT_GRAD_NORM_RTOL = 0.05
 MIN_LOSS_SPREAD = 1e-4
 
 
-def read_metrics(jsonl_path: str) -> dict[int, dict[str, float]]:
-    """Read per-step training metrics from a ``training.jsonl`` log.
+def read_metrics(jsonl_path: str, *, metric: str = "loss") -> dict[int, dict[str, float]]:
+    """Read per-step loss metrics from a JSONL log.
 
     Args:
-        jsonl_path: Path to a ``training.jsonl`` written by ``MetricLogger``.
+        jsonl_path: Path to a metric JSONL written by ``MetricLogger``.
+        metric: Loss field to read: ``loss`` for training or ``val_loss`` for validation.
 
     Returns:
-        Mapping of step index to a dict with the ``loss`` key and, when the
-        recipe reported it, ``grad_norm``.
+        Mapping of step index to a dict whose ``loss`` key holds the requested
+        metric and, when the recipe reported it, ``grad_norm``.
     """
     entries: dict[int, dict[str, float]] = {}
     with open(jsonl_path) as f:
@@ -71,9 +75,9 @@ def read_metrics(jsonl_path: str) -> dict[int, dict[str, float]]:
             if not line:
                 continue
             record = json.loads(line)
-            if "step" not in record or "loss" not in record:
+            if "step" not in record or metric not in record:
                 continue
-            sample: dict[str, float] = {"loss": float(record["loss"])}
+            sample: dict[str, float] = {"loss": float(record[metric])}
             grad_norm = record.get("grad_norm")
             if grad_norm is not None:
                 sample["grad_norm"] = float(grad_norm)
@@ -85,6 +89,8 @@ def _assert_both_runs_trained(
     baseline: dict[int, dict[str, float]],
     parallel: dict[int, dict[str, float]],
     common_steps: list[int],
+    *,
+    metric: str = "loss",
 ) -> None:
     """Reject a comparison where neither run actually trained.
 
@@ -98,10 +104,11 @@ def _assert_both_runs_trained(
         baseline: Per-step metrics from the baseline run.
         parallel: Per-step metrics from the parallel run.
         common_steps: Steps present in both runs.
+        metric: Loss field the comparison ran on, used to explain a flat curve.
 
     Raises:
         AssertionError: If either run shows a zero gradient norm, or the loss
-            does not move across steps that saw different batches.
+            does not move across steps.
     """
     for name, metrics in (("baseline", baseline), ("parallel", parallel)):
         dead = [step for step in common_steps if metrics[step].get("grad_norm") == 0.0]
@@ -111,26 +118,39 @@ def _assert_both_runs_trained(
             "above proves nothing. Check that the model's weights were initialized."
         )
 
-    # Needs at least two steps to have anything to compare against, and the
-    # steps must have seen different batches -- true for every recipe here,
-    # which draw from a multi-sample dataset without repeating.
+    # Needs at least two steps to have anything to compare against. Training
+    # steps each see a different batch -- true for every recipe here, which draw
+    # from a multi-sample dataset without repeating -- and validation replays one
+    # dataset against weights that training has moved in between.
     if len(common_steps) < 2:
         return
     losses = [baseline[step]["loss"] for step in common_steps]
     spread = max(losses) - min(losses)
+    why_it_should_move = (
+        "Each step sees a different batch, so a loss that never moves means the model's output "
+        "does not depend on its input"
+        if metric == "loss"
+        else "Training updates the weights between validation runs, so a validation loss that "
+        "never moves means validation is not reading the trained model"
+    )
     assert spread > MIN_LOSS_SPREAD, (
-        f"The baseline loss is flat across {len(common_steps)} steps (spread {spread:.3e} <= "
-        f"{MIN_LOSS_SPREAD}). Each step sees a different batch, so a loss that never moves means "
-        "the model's output does not depend on its input and the comparison above proves nothing."
+        f"The baseline {metric} is flat across {len(common_steps)} steps (spread {spread:.3e} <= "
+        f"{MIN_LOSS_SPREAD}). {why_it_should_move} and the comparison above proves nothing."
     )
 
 
 def main() -> None:
     """Compare a single-rank baseline log against a parallel-run log."""
-    parser = argparse.ArgumentParser(description="Compare single-rank vs parallel training parity")
-    parser.add_argument("baseline_jsonl", help="training.jsonl from the single-rank baseline run")
-    parser.add_argument("parallel_jsonl", help="training.jsonl from the parallel run")
+    parser = argparse.ArgumentParser(description="Compare single-rank vs parallel training/validation parity")
+    parser.add_argument("baseline_jsonl", help="Metric JSONL from the single-rank baseline run")
+    parser.add_argument("parallel_jsonl", help="Metric JSONL from the parallel run")
     parser.add_argument("--axis", required=True, help="Parallelism axis under test, e.g. pp/tp/cp/ep")
+    parser.add_argument(
+        "--metric",
+        choices=("loss", "val_loss"),
+        default="loss",
+        help="Loss field to compare; val_loss performs validation loss-only parity",
+    )
     parser.add_argument("--loss-tol", type=float, default=DEFAULT_LOSS_TOL, help="Absolute per-step loss tolerance")
     parser.add_argument(
         "--grad-norm-rtol",
@@ -140,11 +160,18 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    baseline = read_metrics(args.baseline_jsonl)
-    parallel = read_metrics(args.parallel_jsonl)
+    baseline = read_metrics(args.baseline_jsonl, metric=args.metric)
+    parallel = read_metrics(args.parallel_jsonl, metric=args.metric)
 
-    assert len(baseline) > 0, f"No training records in {args.baseline_jsonl}"
-    assert len(parallel) > 0, f"No training records in {args.parallel_jsonl}"
+    assert len(baseline) > 0, f"No {args.metric} records in {args.baseline_jsonl}"
+    assert len(parallel) > 0, f"No {args.metric} records in {args.parallel_jsonl}"
+    if args.metric == "val_loss":
+        # Validation runs on a fixed cadence, so a leg that silently skipped it
+        # would otherwise pass on whatever handful of steps still overlap.
+        assert set(baseline) == set(parallel), (
+            f"Validation steps differ between {args.baseline_jsonl} (steps {sorted(baseline)}) "
+            f"and {args.parallel_jsonl} (steps {sorted(parallel)})"
+        )
 
     common_steps = sorted(set(baseline) & set(parallel))
     assert len(common_steps) > 0, (
@@ -156,21 +183,35 @@ def main() -> None:
     grad_norm_failures: list[str] = []
     compared_grad_norms = 0
 
-    print(f"=== {args.axis} parity: {len(common_steps)} common steps ===")
+    print(f"=== {args.axis} {args.metric} parity: {len(common_steps)} common steps ===")
     print(f"{'step':>6}  {'baseline':>12}  {'parallel':>12}  {'delta':>12}")
     for step in common_steps:
         base_loss = baseline[step]["loss"]
         par_loss = parallel[step]["loss"]
-        delta = abs(base_loss - par_loss)
-        print(f"{step:>6}  {base_loss:>12.6f}  {par_loss:>12.6f}  {delta:>12.6f}")
-        if delta > args.loss_tol:
-            loss_failures.append(f"step {step}: baseline={base_loss:.6f} {args.axis}={par_loss:.6f} delta={delta:.6f}")
+        if not math.isfinite(base_loss) or not math.isfinite(par_loss):
+            # NaN compares unequal to everything, so the delta check below would
+            # never fire on a run that diverged into non-finite loss.
+            loss_failures.append(
+                f"step {step}: non-finite {args.metric}: baseline={base_loss!r} {args.axis}={par_loss!r}"
+            )
+        else:
+            delta = abs(base_loss - par_loss)
+            print(f"{step:>6}  {base_loss:>12.6f}  {par_loss:>12.6f}  {delta:>12.6f}")
+            if delta > args.loss_tol:
+                loss_failures.append(
+                    f"step {step}: baseline={base_loss:.6f} {args.axis}={par_loss:.6f} delta={delta:.6f}"
+                )
 
         base_norm = baseline[step].get("grad_norm")
         par_norm = parallel[step].get("grad_norm")
         if base_norm is None or par_norm is None:
             continue
         compared_grad_norms += 1
+        if not math.isfinite(base_norm) or not math.isfinite(par_norm):
+            grad_norm_failures.append(
+                f"step {step}: non-finite gradient norm: baseline={base_norm!r} {args.axis}={par_norm!r}"
+            )
+            continue
         scale = max(abs(base_norm), 1e-8)
         norm_delta = abs(base_norm - par_norm) / scale
         if norm_delta > args.grad_norm_rtol:
@@ -187,15 +228,19 @@ def main() -> None:
         f"relative in gradient norm:\n  " + "\n  ".join(grad_norm_failures)
     )
 
-    # A log without grad_norm would silently reduce this to a loss-only check.
-    assert compared_grad_norms > 0, (
-        "Neither log reported grad_norm, so the gradient-sync half of this check did not run. "
-        "Confirm the recipe logs grad_norm to training.jsonl."
+    if args.metric == "loss":
+        # A training log without grad_norm would silently reduce this to a
+        # loss-only check. Validation logs carry no grad_norm by design.
+        assert compared_grad_norms > 0, (
+            "Neither log reported grad_norm, so the gradient-sync half of this check did not run. "
+            "Confirm the recipe logs grad_norm to training.jsonl."
+        )
+
+    _assert_both_runs_trained(baseline, parallel, common_steps, metric=args.metric)
+
+    print(
+        f"{args.axis} {args.metric} parity OK: {len(common_steps)} steps, {compared_grad_norms} gradient norms compared"
     )
-
-    _assert_both_runs_trained(baseline, parallel, common_steps)
-
-    print(f"{args.axis} parity OK: {len(common_steps)} steps, {compared_grad_norms} gradient norms compared")
 
 
 if __name__ == "__main__":
