@@ -36,13 +36,17 @@ seed: 1234
 
 step_scheduler:
   # dp_size = world(8) / (tp 1 * cp 1 * pp 1) = 8, so
-  #   grad_accum = global_batch_size / (local_batch_size * dp_size) = 32 / 8 = 4.
+  #   grad_accum = global_batch_size / (local_batch_size * dp_size) = 32 / 16 = 2.
   # ~87.3k rows after pre-filtering => ~2,728 optimizer steps per epoch.
   global_batch_size: 32
-  # One conversation per rank. Samples average ~9.7k tokens, so a batch of 1 is
-  # already a substantial workload, and it makes batch padding exactly zero --
-  # the collator pads to the longest sample in the batch, which is the sample.
-  local_batch_size: 1
+  # Two conversations per rank. Measured on 8xH200 over 50 steps with everything
+  # else identical: 22,258 tok/s at lbs 2 vs 18,749 tok/s at lbs 1 (+19%), same
+  # loss curve and the same validation loss (0.5605 vs 0.5608 at step 49).
+  # Peak memory 72.4 GiB of 141 GiB on a typical step, 76.8 GiB on a worst-case
+  # batch of the longest rows in the corpus. lbs 4 also runs (105.4 GiB peak on an
+  # ordinary window) but its worst-case batch is twice the tokens, which does not
+  # fit -- see the activation_checkpointing note below.
+  local_batch_size: 2
   num_epochs: 2
   ckpt_every_steps: 200
   val_every_steps: 100
@@ -122,9 +126,12 @@ distributed:
   # 256 routed experts % 8 == 0, and dp_size(8) * cp_size(1) % 8 == 0.
   ep_size: 8
   sequence_parallel: false
+  # Full recomputation. `selective` is faster per step but not survivable here:
+  # on a worst-case batch of the longest rows it peaks at 121.4 GiB of 141 GiB
+  # (vs 76.8 GiB with full AC) and OOMs outright at lbs 4.
   activation_checkpointing: true
   # Reduce-scatter gradients every micro-batch. The FSDP2 default accumulates the
-  # full UNSHARDED gradient across all 4 accumulation steps. Numerically identical.
+  # full UNSHARDED gradient across both accumulation steps. Numerically identical.
   defer_fsdp_grad_sync: false
   multimodal:
     # Every rank gets text-only batches, so the frozen vision tower is skipped
