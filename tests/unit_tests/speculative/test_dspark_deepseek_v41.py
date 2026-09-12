@@ -79,6 +79,7 @@ def _args(**overrides) -> _Args:
 
 def test_builder_preserves_released_native_contract() -> None:
     target_config = _target_config()
+    target_config.quantization_config = {"quant_method": "fp8"}
     original = target_config.to_dict()
     model = target_config.build_dspark_draft(_args())
     second_model = target_config.build_dspark_draft(_args())
@@ -92,6 +93,8 @@ def test_builder_preserves_released_native_contract() -> None:
     assert config.dspark_block_size == 5
     assert config.dspark_noise_token_id == 31
     assert config.dspark_target_layer_ids == [0, 1]
+    assert config.quantization_config == target_config.quantization_config
+    assert config.quantization_config is not target_config.quantization_config
     assert model.num_anchors == 2
 
 

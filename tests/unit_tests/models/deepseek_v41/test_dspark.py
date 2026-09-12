@@ -17,7 +17,7 @@ import torch
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41TextConfig
-from nemo_automodel.components.models.deepseek_v41.dspark import DeepseekV41DSparkBackbone
+from nemo_automodel.components.models.deepseek_v41.dspark import DeepseekV41DSparkBackbone, DeepseekV41DSparkModel
 from nemo_automodel.components.models.deepseek_v41.quantization import quantize_cache
 
 # Over the default 5s budget on purpose: this module runs full draft forwards and a backward pass.
@@ -140,6 +140,40 @@ def test_released_stage_ownership_and_draft_moe_shape() -> None:
     assert model.moe_config.n_activated_experts == 2
     assert model.mtp[-1].confidence_head.proj.weight.dtype == torch.float32
     assert all(torch.isfinite(parameter).all() for parameter in model.parameters())
+
+
+def test_released_checkpoint_roundtrip() -> None:
+    backend = BackendConfig(attn="eager", linear="torch", rms_norm="torch_fp32", experts="torch", dispatcher="torch")
+    model = DeepseekV41DSparkModel(_config(), backend, num_anchors=1, enable_confidence_head=True)
+    expected = {key: value.detach().clone() for key, value in model.state_dict().items()}
+
+    released = model.state_dict_adapter.to_hf(model.state_dict())
+    assert "embed.weight" in released
+    assert "head.weight" in released
+    assert "mtp.0.ffn.experts.0.w1.weight" in released
+    assert "mtp.2.confidence_head.proj.weight" in released
+
+    restored = model.state_dict_adapter.from_hf(released)
+    assert released == {}
+    assert restored.keys() == expected.keys()
+    for key, value in expected.items():
+        torch.testing.assert_close(restored[key], value, rtol=0, atol=0)
+
+
+def test_released_quantized_checkpoint_targets() -> None:
+    backend = BackendConfig(attn="eager", linear="torch", rms_norm="torch_fp32", experts="torch", dispatcher="torch")
+    config = _config()
+    config.hidden_size = 32
+    config.moe_intermediate_size = 32
+    model = DeepseekV41DSparkModel(config, backend, num_anchors=1, enable_confidence_head=True)
+
+    released = model.state_dict_adapter.to_hf(model.state_dict(), quantization=True, for_checkpoint_load=True)
+    assert released["mtp.0.attn.wq_a.weight"].dtype == torch.float8_e4m3fn
+    assert released["mtp.0.attn.wq_a.scale"].dtype == torch.float8_e8m0fnu
+    assert released["mtp.0.ffn.experts.0.w1.weight"].dtype == torch.int8
+    assert released["mtp.0.ffn.experts.0.w1.weight"].shape == (32, 16)
+    assert released["mtp.0.ffn.experts.0.w1.scale"].shape == (32, 1)
+    assert released["mtp.2.confidence_head.proj.weight"].dtype == torch.float32
 
 
 def test_cache_free_backbone_forward_and_backward() -> None:
