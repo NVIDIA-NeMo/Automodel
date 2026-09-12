@@ -196,3 +196,10 @@ docs/fern/versions/v0.4/pages/
 docs/fern/versions/v0.5/pages/
 
 training_logs/
+
+# Local training output. `checkpoints/` is the default checkpoint_dir of the
+# example recipes and `data/` is where the prefilter scripts write; both are
+# many GB per run. Anchored to the repo root so the tracked helper scripts
+# under examples/*/data/ and tests/data/ are unaffected.
+/checkpoints/
+/data/

@@ -13,6 +13,11 @@ held, what did not (rung 2 failed and the masking was fixed; TE silently fell ba
 unfused attention on Blackwell), the measured throughput and memory ceilings, and the
 environment gotchas.
 
+**The recipe has since been swept on 8 × H200.** See `SWEEP_8xH200_v4_88k.md` for the
+measurements behind `local_batch_size: 2` and full activation checkpointing, the
+worst-case memory ceilings per configuration, why `tok/s` is the wrong metric to compare
+configs with, and the length-grouped batching option (1.70× faster, shipped disabled).
+
 ---
 
 ## 0. What this run is
