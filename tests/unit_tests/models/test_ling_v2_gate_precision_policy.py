@@ -573,8 +573,8 @@ def test_ling_gate_matches_reference_router_grouped(bias_mean, bias_std, router_
     assert torch.equal(w_am_sorted, w_ref_sorted)
 
 
-def _weight_grad(cfg: MoEConfig, *, use_reference: bool, cotangent: torch.Tensor, x: torch.Tensor):
-    """Gradient w.r.t. the gate weight under a fixed cotangent.
+def _router_grads(cfg: MoEConfig, *, use_reference: bool, cotangent: torch.Tensor, x: torch.Tensor):
+    """Gradients w.r.t. the gate weight and the router input, under a fixed cotangent.
 
     The loss is (weights * g).sum() with a fixed g, not weights.sum(): with
     norm_topk_prob the selected weights sum to exactly route_scale per token, so
@@ -593,14 +593,18 @@ def _weight_grad(cfg: MoEConfig, *, use_reference: bool, cotangent: torch.Tensor
             the Proj/Score/Out casts under test are the ones that run.
 
     Returns:
-        Tuple of (grad, indices). grad is an fp32 Tensor of shape
-        [n_routed_experts, dim], the gradient w.r.t. the gate weight; indices is an
+        Tuple of (weight_grad, input_grad, indices). weight_grad is an fp32 Tensor of
+        shape [n_routed_experts, dim]; input_grad is an fp32 Tensor of shape
+        [tokens, dim], the gradient flowing back into the router input; indices is an
         int64 Tensor of shape [tokens, n_activated_experts], ascending per row so the
         two implementations' expert sets are directly comparable.
     """
     gate, ref = _paired_gates(cfg, bias_mean=0.2, bias_std=0.02)
     module = ref if use_reference else gate
     module.weight.requires_grad_(True)
+    # A fresh leaf per call: the caller hands the same x to both implementations, and
+    # a shared leaf would accumulate one side's input gradient onto the other's.
+    x = x.detach().clone().requires_grad_(True)
 
     if use_reference:
         indices, weights, _ = module(x)
@@ -609,7 +613,11 @@ def _weight_grad(cfg: MoEConfig, *, use_reference: bool, cotangent: torch.Tensor
 
     order = indices.argsort(dim=1)
     (weights.gather(1, order) * cotangent).sum().backward()
-    return module.weight.grad.detach().float(), indices.gather(1, order)
+    return (
+        module.weight.grad.detach().float(),
+        x.grad.detach().float(),
+        indices.gather(1, order),
+    )
 
 
 def test_ling_gate_gradients_match_reference():
@@ -626,14 +634,34 @@ def test_ling_gate_gradients_match_reference():
     x = torch.randn(64, cfg.dim, dtype=torch.bfloat16)
     g = torch.randn(64, cfg.n_activated_experts)
 
-    grad_ref, idx_ref = _weight_grad(cfg, use_reference=True, cotangent=g, x=x)
-    grad_am, idx_am = _weight_grad(cfg, use_reference=False, cotangent=g, x=x)
+    grad_ref, _, idx_ref = _router_grads(cfg, use_reference=True, cotangent=g, x=x)
+    grad_am, _, idx_am = _router_grads(cfg, use_reference=False, cotangent=g, x=x)
 
     assert torch.equal(idx_am, idx_ref)  # same experts, or the grads are not comparable
     # Bit-identical to the reference, not merely close: measured max delta 0.0,
     # against 8.38e-03 with the policy off. torch.equal rather than allclose,
     # since a tolerance here would understate what the fp32 path achieves.
     assert torch.equal(grad_am, grad_ref)
+
+
+def test_ling_gate_input_gradients_match_reference():
+    """The backward path into the router input, not only into the gate weight.
+
+    The weight gradient is what trains the router; the input gradient is what the
+    router hands back to the rest of the block, so a precision policy could get one
+    right and still corrupt the other. Both are pinned against the same reference.
+    """
+    cfg = _router_config(dtype=torch.float32)
+    torch.manual_seed(1)
+    x = torch.randn(64, cfg.dim, dtype=torch.bfloat16)
+    g = torch.randn(64, cfg.n_activated_experts)
+
+    _, xgrad_ref, idx_ref = _router_grads(cfg, use_reference=True, cotangent=g, x=x)
+    _, xgrad_am, idx_am = _router_grads(cfg, use_reference=False, cotangent=g, x=x)
+
+    assert torch.equal(idx_am, idx_ref)  # same experts, or the grads are not comparable
+    assert xgrad_am.shape == x.shape
+    assert torch.equal(xgrad_am, xgrad_ref)
 
 
 def test_ling_gate_gradients_diverge_without_out_policy():
@@ -648,9 +676,9 @@ def test_ling_gate_gradients_diverge_without_out_policy():
     x = torch.randn(64, cfg_on.dim, dtype=torch.bfloat16)
     g = torch.randn(64, cfg_on.n_activated_experts)
 
-    grad_ref, _ = _weight_grad(cfg_on, use_reference=True, cotangent=g, x=x)
-    grad_on, _ = _weight_grad(cfg_on, use_reference=False, cotangent=g, x=x)
-    grad_off, _ = _weight_grad(cfg_off, use_reference=False, cotangent=g, x=x)
+    grad_ref, xgrad_ref, _ = _router_grads(cfg_on, use_reference=True, cotangent=g, x=x)
+    grad_on, xgrad_on, _ = _router_grads(cfg_on, use_reference=False, cotangent=g, x=x)
+    grad_off, xgrad_off, _ = _router_grads(cfg_off, use_reference=False, cotangent=g, x=x)
 
     delta_on = (grad_on - grad_ref).abs().max()
     delta_off = (grad_off - grad_ref).abs().max()
@@ -659,6 +687,14 @@ def test_ling_gate_gradients_diverge_without_out_policy():
     # pass vacuously. Assert the two sides separately instead.
     assert delta_on == 0.0, f"policy-on path is no longer bit-exact: {delta_on:.3e}"
     assert delta_off > 1e-4, f"policy made no difference: off={delta_off:.3e}"
+
+    # The input gradient carries the same truncation, so the control covers both
+    # backward paths rather than only the one that trains the router. Measured
+    # 0.0 with the policy on, 2.44e-04 with it off.
+    x_delta_on = (xgrad_on - xgrad_ref).abs().max()
+    x_delta_off = (xgrad_off - xgrad_ref).abs().max()
+    assert x_delta_on == 0.0, f"policy-on input grad is no longer bit-exact: {x_delta_on:.3e}"
+    assert x_delta_off > 1e-5, f"policy made no difference to the input grad: {x_delta_off:.3e}"
 
 
 def test_ling_v2_has_a_single_construction_path():
