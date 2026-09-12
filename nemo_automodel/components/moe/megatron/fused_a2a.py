@@ -409,6 +409,7 @@ class HybridEPDispatch(torch.autograd.Function):
         num_sms_combine_api=24,
         num_permuted_tokens=None,
         pad_multiple=None,
+        permute_fusion=False,
     ):
         """Forward pass of fused dispatch of the HybridEP backend."""
         if _hybrid_ep_buffer is None:
@@ -439,10 +440,12 @@ class HybridEPDispatch(torch.autograd.Function):
             pad_multiple=pad_multiple,
             num_permuted_tokens=num_permuted_tokens,
             non_blocking=non_blocking,
+            fuse_permute_dispatch=permute_fusion,
         )
 
         ctx.handle = handle
         ctx.pad_multiple = pad_multiple
+        ctx.permute_fusion = permute_fusion
         return (
             dispatched_hidden,
             dispatched_probs,
@@ -456,23 +459,31 @@ class HybridEPDispatch(torch.autograd.Function):
         """Backward pass of fused dispatch of the HybridEP backend."""
         handle = ctx.handle
         combined_hidden, combined_probs = _hybrid_ep_buffer.combine_with_unpermute(
-            hidden=grad_x, probs=grad_probs, handle=handle, pad_multiple=ctx.pad_multiple
+            hidden=grad_x,
+            probs=grad_probs,
+            handle=handle,
+            pad_multiple=ctx.pad_multiple,
+            fuse_unpermute_combine=ctx.permute_fusion,
         )
-        return combined_hidden, None, combined_probs, None, None, None, None, None, None
+        return combined_hidden, None, combined_probs, None, None, None, None, None, None, None
 
 
 class HybridEPCombine(torch.autograd.Function):
     """Fused combine operation for permute + combine a2a + permute using the HybridEP backend."""
 
     @staticmethod
-    def forward(ctx, x, handle, num_permuted_tokens=None, pad_multiple=None):
+    def forward(ctx, x, handle, num_permuted_tokens=None, pad_multiple=None, permute_fusion=False):
         """Forward pass of fused combine of the HybridEP backend."""
         combined_hidden, _ = _hybrid_ep_buffer.combine_with_unpermute(
-            hidden=x, handle=handle, pad_multiple=pad_multiple
+            hidden=x,
+            handle=handle,
+            pad_multiple=pad_multiple,
+            fuse_unpermute_combine=permute_fusion,
         )
         ctx.handle = handle
         ctx.pad_multiple = pad_multiple
         ctx.num_permuted_tokens = num_permuted_tokens
+        ctx.permute_fusion = permute_fusion
         return combined_hidden
 
     @staticmethod
@@ -485,8 +496,9 @@ class HybridEPCombine(torch.autograd.Function):
             handle=handle,
             pad_multiple=ctx.pad_multiple,
             num_permuted_tokens=ctx.num_permuted_tokens,
+            fuse_permute_dispatch=ctx.permute_fusion,
         )
-        return dispatched_hidden, None, None, None
+        return dispatched_hidden, None, None, None, None
 
 
 if HAVE_HYBRIDEP:
@@ -501,6 +513,7 @@ if HAVE_HYBRIDEP:
         num_sms_combine_api=24,
         num_permuted_tokens=None,
         pad_multiple=None,
+        permute_fusion=False,
     ):
         """Perform fused dispatch for permute + dispatch a2a + permute using the HybridEP backend."""
         return HybridEPDispatch.apply(
@@ -513,11 +526,12 @@ if HAVE_HYBRIDEP:
             num_sms_combine_api,
             num_permuted_tokens,
             pad_multiple,
+            permute_fusion,
         )
 
-    def hybrid_ep_combine(x, handle, num_permuted_tokens=None, pad_multiple=None):
+    def hybrid_ep_combine(x, handle, num_permuted_tokens=None, pad_multiple=None, permute_fusion=False):
         """Perform fused combine for unpermute + combine a2a + unpermute using the HybridEP backend."""
-        return HybridEPCombine.apply(x, handle, num_permuted_tokens, pad_multiple)
+        return HybridEPCombine.apply(x, handle, num_permuted_tokens, pad_multiple, permute_fusion)
 
 else:
     hybrid_ep_dispatch = None
