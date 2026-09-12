@@ -36,12 +36,13 @@ import sys
 import time
 import traceback
 from collections.abc import Callable, Iterator, Sequence
-from contextlib import AbstractContextManager, contextmanager, nullcontext
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import timedelta
 from functools import cache, wraps
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
+from unittest.mock import patch
 
 if TYPE_CHECKING:
     from nemo_automodel.recipes.base_recipe import BaseRecipe
@@ -50,6 +51,7 @@ import datasets
 import torch
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor
+from torch.overrides import TorchFunctionMode
 
 from nemo_automodel.components.attention.flex_attention import FlexAttention
 from nemo_automodel.components.checkpoint.checkpointing import (
@@ -58,6 +60,7 @@ from nemo_automodel.components.checkpoint.checkpointing import (
 )
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.shared.import_utils import safe_import
 from nemo_automodel.shared.utils import dtype_from_str
 from tests.functional_tests.checkpoint_robustness.parity_metrics import (
     _apply_parity_threshold_overrides,
@@ -225,7 +228,7 @@ def _extract_custom_args(argv: list[str]) -> tuple[dict[str, object], list[str]]
         for k, v in ci_robustness.items():
             if k in default_on_control_keys:
                 continue
-            if k == "shape_diagnostic":
+            if k in {"shape_diagnostic", "hf_reference_compute_fp32"}:
                 continue
             if k not in custom:
                 if "." in k:
@@ -1472,6 +1475,190 @@ def _keep_hf_modules_in_fp32(hf_config: object):
         setattr(PreTrainedModel, attr, previous)
 
 
+class _FP32ReferenceOperation(TorchFunctionMode):
+    """Change only the dtype argument of one explicitly selected HF operation."""
+
+    def __init__(self, operation: Callable) -> None:
+        self.operation = operation
+        self.calls = 0
+
+    def __torch_function__(
+        self, func: Callable, types: tuple[type, ...], args: tuple = (), kwargs: dict | None = None
+    ) -> Any:
+        """Dispatch native operations, promoting the selected one.
+
+        Args:
+            func: Original torch operation.
+            types: Tensor types supplied by torch's dispatch protocol.
+            args: Framework operands of arbitrary layouts. The selected operation
+                receives router logits [tokens, experts] or expert inputs [tokens, hidden].
+            kwargs: Original operation keywords, including an optional dtype.
+
+        Returns:
+            The native result with its original layout. The selected operation
+            returns FP32; other operations retain their native dtype behavior.
+        """
+        kwargs = dict(kwargs or {})
+        if func is self.operation:
+            kwargs["dtype"] = torch.float32
+            self.calls += 1
+        return func(*args, **kwargs)
+
+
+def _with_fp32_scores(forward: Callable) -> Callable:
+    @wraps(forward)
+    def wrapped(hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run the original HF router with FP32 score arithmetic.
+
+        Args:
+            hidden_states: Tensor of shape [..., hidden], with arbitrary leading
+                dimensions and the native router projection's input dtype.
+
+        Returns:
+            Native projection logits of shape [tokens, experts], FP32 normalized
+            routing weights of shape [tokens, top_k], and integer expert indices
+            of shape [tokens, top_k]. Tokens flatten the input's leading axes.
+        """
+        with _FP32ReferenceOperation(torch.Tensor.softmax) as mode:
+            result = forward(hidden_states)
+        if mode.calls != 1:
+            raise RuntimeError(f"HF Mistral4 router softmax contract changed: expected one call, got {mode.calls}")
+        return result
+
+    return wrapped
+
+
+def _with_fp32_expert_sum(forward: Callable) -> Callable:
+    @wraps(forward)
+    def wrapped(hidden_states: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+        """Sum routed experts [tokens, hidden] in FP32, restoring the activation dtype."""
+        # The native eager expert forward creates its accumulator with zeros_like.
+        # Keep its BF16 projections/activation and native indexing, but avoid BF16
+        # rounding after every expert addition. vLLM's CUDA moe_sum uses float acc.
+        with _FP32ReferenceOperation(torch.zeros_like) as mode:
+            result = forward(hidden_states, *args, **kwargs)
+        if mode.calls != 1:
+            raise RuntimeError(f"HF Mistral4 expert accumulator contract changed: expected one call, got {mode.calls}")
+        return result.to(hidden_states.dtype)
+
+    return wrapped
+
+
+def _with_fp32_norm(forward: Callable) -> Callable:
+    @wraps(forward)
+    def wrapped(hidden_states: torch.Tensor) -> torch.Tensor:
+        """Normalize [..., hidden] in FP32, returning the original activation dtype."""
+        # HF otherwise rounds before multiplying by the norm weight. CUDA vLLM
+        # RMSNorm and AutoModel's TE/FP32 RMSNorm cast only after that multiply.
+        return forward(hidden_states.float()).to(hidden_states.dtype)
+
+    return wrapped
+
+
+def _with_fp32_rotary_embedding(forward: Callable) -> Callable:
+    @wraps(forward)
+    def wrapped(x: torch.Tensor, *args, **kwargs) -> tuple[torch.Tensor, torch.Tensor]:
+        """Generate FP32 cos/sin [batch, sequence, rotary_dim] from native HF frequencies."""
+        # Upcasting already-rounded BF16 tables cannot recover their precision.
+        return forward(x.float(), *args, **kwargs)
+
+    return wrapped
+
+
+def _with_fp32_rotary_application(forward: Callable) -> Callable:
+    @wraps(forward)
+    def wrapped(
+        q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, *args, **kwargs
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Rotate Q/K [..., rotary_dim] in FP32 and restore each input's dtype and layout."""
+        q_out, k_out = forward(q.float(), k.float(), cos.float(), sin.float(), *args, **kwargs)
+        return q_out.to(q.dtype), k_out.to(k.dtype)
+
+    return wrapped
+
+
+def _with_fp32_rotary_attention(forward: Callable, hf_module: Any) -> Callable:
+    rotary_functions = {
+        name: _with_fp32_rotary_application(getattr(hf_module, name))
+        for name in ("apply_rotary_pos_emb", "apply_rotary_pos_emb_interleave")
+    }
+
+    @wraps(forward)
+    def wrapped(*args, **kwargs) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Preserve native HF attention inputs/outputs, changing only rotary arithmetic."""
+        # HF calls free functions for rotation. Patch only while this reference
+        # instance is executing; restore before any other model can be evaluated
+        # by this sequential harness, including when the forward raises.
+        with ExitStack() as stack:
+            for name, rotary_forward in rotary_functions.items():
+                stack.enter_context(patch.object(hf_module, name, rotary_forward))
+            return forward(*args, **kwargs)
+
+    return wrapped
+
+
+@contextmanager
+def _hf_reference_context(cfg: ConfigNode, model: torch.nn.Module) -> Iterator[None]:
+    """Temporarily promote sensitive operations in the test's HF reference.
+
+    The opt-in supports Mistral4 RMSNorm, RoPE, router scoring, and expert sums.
+    Experts temporarily use the eager backend whose accumulator is promoted.
+    Projections, activations, and stored weights retain their native dtypes.
+    The original HF algorithms run through instance wrappers that preserve
+    device-map dispatch and are restored on success or failure. This is a
+    sequential test context.
+
+    Args:
+        cfg: Recipe configuration containing checkpoint-robustness controls.
+        model: Loaded HF reference model, including any PEFT wrapper.
+
+    Yields:
+        Control to source or reload reference forwards with the selected precision.
+    """
+    enabled = cfg.get("ci.checkpoint_robustness.hf_reference_compute_fp32", False)
+    if not _parse_boolean_fixture_value(enabled, key="hf_reference_compute_fp32"):
+        yield
+        return
+
+    available, hf_module = safe_import("transformers.models.mistral4.modeling_mistral4")
+    if not available:
+        raise ImportError("FP32 Mistral4 reference computation requires Transformers with Mistral4 support")
+    routers = [module for module in model.modules() if isinstance(module, hf_module.Mistral4TopkRouter)]
+    if not routers:
+        raise ValueError("FP32 Mistral4 reference scoring found no HF Mistral4 routers")
+    print("[HF reference] Mistral4 FP32 RMSNorm, RoPE, router scoring, and eager expert sums; modified HF reference")
+    with ExitStack() as stack:
+        for module in model.modules():
+            original = module.forward
+            if isinstance(module, hf_module.Mistral4TopkRouter):
+                wrapped = _with_fp32_scores(original)
+            elif isinstance(module, hf_module.Mistral4RMSNorm):
+                wrapped = _with_fp32_norm(original)
+            elif isinstance(module, hf_module.Mistral4RotaryEmbedding):
+                wrapped = _with_fp32_rotary_embedding(original)
+            elif isinstance(module, hf_module.Mistral4Attention):
+                wrapped = _with_fp32_rotary_attention(original, hf_module)
+            elif isinstance(module, hf_module.Mistral4Experts):
+                # Source FP8 dequantization selects eager, but BF16 reload can
+                # default to grouped_mm. Select the same native algorithm for
+                # both phases: only eager creates the zeros_like accumulator
+                # that this wrapper promotes. Restore the dispatch on exit.
+                if module.config._experts_implementation != "eager":
+                    stack.callback(
+                        setattr, module.config, "_experts_implementation", module.config._experts_implementation
+                    )
+                    module.config._experts_implementation = "eager"
+                wrapped = _with_fp32_expert_sum(original)
+            else:
+                continue
+            if "forward" in module.__dict__:
+                stack.callback(setattr, module, "forward", original)
+            else:
+                stack.callback(delattr, module, "forward")
+            module.forward = wrapped
+        yield
+
+
 def _preinit_global_rank() -> int:
     """Return the torchrun global rank before torch.distributed is initialized."""
     if dist.is_initialized():
@@ -1897,37 +2084,38 @@ def _prepare_source_load_reference_rank0(
         if should_fix_rotary_embeddings([hf_model]):
             fix_rotary_embeddings([hf_model])
 
-    with _router_diagnostic_capture_context(
-        hf_model,
-        _robustness_artifact_dir(cfg),
-        framework="hf",
-        enabled=capture_router_diagnostics,
-    ):
-        hf_logits = _get_logits(hf_model, input_ids, device)
-    repeated_hf_logits = _get_logits(hf_model, input_ids, device)
-    _compare_logits(
-        _robustness_artifact_dir(cfg),
-        hf_logits,
-        repeated_hf_logits,
-        _repeatability_policy(
-            phase="phase_0",
-            comparison="hf_source_self_repeat",
-            profile=parity_tolerance_profile,
-        ),
-    )
-    del repeated_hf_logits
-    if shape_diagnostic is not None:
-        _run_hf_shape_diagnostic(
+    with _hf_reference_context(cfg, hf_model):
+        with _router_diagnostic_capture_context(
             hf_model,
-            input_ids,
-            device,
+            _robustness_artifact_dir(cfg),
+            framework="hf",
+            enabled=capture_router_diagnostics,
+        ):
+            hf_logits = _get_logits(hf_model, input_ids, device)
+        repeated_hf_logits = _get_logits(hf_model, input_ids, device)
+        _compare_logits(
+            _robustness_artifact_dir(cfg),
             hf_logits,
-            artifact_dir=artifact_dir,
-            config=shape_diagnostic,
-            gate_sequence_length=cross_framework_gate_sequence_length,
-            capture_router_diagnostics=capture_router_diagnostics,
-            phase="phase_0",
+            repeated_hf_logits,
+            _repeatability_policy(
+                phase="phase_0",
+                comparison="hf_source_self_repeat",
+                profile=parity_tolerance_profile,
+            ),
         )
+        del repeated_hf_logits
+        if shape_diagnostic is not None:
+            _run_hf_shape_diagnostic(
+                hf_model,
+                input_ids,
+                device,
+                hf_logits,
+                artifact_dir=artifact_dir,
+                config=shape_diagnostic,
+                gate_sequence_length=cross_framework_gate_sequence_length,
+                capture_router_diagnostics=capture_router_diagnostics,
+                phase="phase_0",
+            )
     hf_aliased = _lm_head_embedding_aliased(hf_model)
     explicit_tie_word_embeddings = _explicit_tie_word_embeddings(hf_model.config)
     del hf_model
@@ -2677,27 +2865,28 @@ def _run_vanilla_hf_reload(
                     "[HF reload] Saved adapter tensors absent from vanilla HF were allowed by the configured prefix "
                     f"{hf_adapter_ignored_key_prefix!r} ({ignored_adapter_tensors} tensors)"
                 )
-            hf_logits = _get_logits(peft_model, input_ids, device)
-            repeated_hf_logits = _get_logits(peft_model, input_ids, device)
-            _compare_logits(
-                _robustness_artifact_dir(cfg),
-                hf_logits,
-                repeated_hf_logits,
-                _repeatability_policy(
-                    phase="phase_3",
-                    comparison="hf_export_self_repeat",
-                    profile=_comparison_profile(custom_args, "hf_reload"),
-                ),
-            )
-            del repeated_hf_logits
-            diagnostics, diagnostic_failure = _collect_hf_reload_shape_diagnostics(
-                peft_model,
-                input_ids,
-                device,
-                hf_logits,
-                artifact_dir=artifact_dir,
-                custom_args=custom_args,
-            )
+            with _hf_reference_context(cfg, peft_model):
+                hf_logits = _get_logits(peft_model, input_ids, device)
+                repeated_hf_logits = _get_logits(peft_model, input_ids, device)
+                _compare_logits(
+                    _robustness_artifact_dir(cfg),
+                    hf_logits,
+                    repeated_hf_logits,
+                    _repeatability_policy(
+                        phase="phase_3",
+                        comparison="hf_export_self_repeat",
+                        profile=_comparison_profile(custom_args, "hf_reload"),
+                    ),
+                )
+                del repeated_hf_logits
+                diagnostics, diagnostic_failure = _collect_hf_reload_shape_diagnostics(
+                    peft_model,
+                    input_ids,
+                    device,
+                    hf_logits,
+                    artifact_dir=artifact_dir,
+                    custom_args=custom_args,
+                )
 
             if check_fused_qkv_keys:
                 from safetensors import safe_open
@@ -2730,27 +2919,28 @@ def _run_vanilla_hf_reload(
 
                 if should_fix_rotary_embeddings([hf_model]):
                     fix_rotary_embeddings([hf_model])
-            hf_logits = _get_logits(hf_model, input_ids, device)
-            repeated_hf_logits = _get_logits(hf_model, input_ids, device)
-            _compare_logits(
-                _robustness_artifact_dir(cfg),
-                hf_logits,
-                repeated_hf_logits,
-                _repeatability_policy(
-                    phase="phase_3",
-                    comparison="hf_export_self_repeat",
-                    profile=_comparison_profile(custom_args, "hf_reload"),
-                ),
-            )
-            del repeated_hf_logits
-            diagnostics, diagnostic_failure = _collect_hf_reload_shape_diagnostics(
-                hf_model,
-                input_ids,
-                device,
-                hf_logits,
-                artifact_dir=artifact_dir,
-                custom_args=custom_args,
-            )
+            with _hf_reference_context(cfg, hf_model):
+                hf_logits = _get_logits(hf_model, input_ids, device)
+                repeated_hf_logits = _get_logits(hf_model, input_ids, device)
+                _compare_logits(
+                    _robustness_artifact_dir(cfg),
+                    hf_logits,
+                    repeated_hf_logits,
+                    _repeatability_policy(
+                        phase="phase_3",
+                        comparison="hf_export_self_repeat",
+                        profile=_comparison_profile(custom_args, "hf_reload"),
+                    ),
+                )
+                del repeated_hf_logits
+                diagnostics, diagnostic_failure = _collect_hf_reload_shape_diagnostics(
+                    hf_model,
+                    input_ids,
+                    device,
+                    hf_logits,
+                    artifact_dir=artifact_dir,
+                    custom_args=custom_args,
+                )
             del hf_model
 
         hf_reload_error = _compare_logits(
