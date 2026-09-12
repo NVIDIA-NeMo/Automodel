@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import replace
 
 import pytest
@@ -673,6 +674,65 @@ def test_cudnn_sparse_attention_dispatches_padded_forward_and_exact_backward(
     torch.testing.assert_close(kv_latent.grad, torch.full_like(kv_latent, 5))
     assert fake_flash_mla.called
     assert fake_dsa.called
+
+
+def test_shared_cudnn_sparse_attention_propagates_learnable_sink_gradient(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The shared adapter forwards sink logits and reconstructs their exact gradient."""
+    heads = 2
+    tokens = 2
+    sink = torch.tensor([0.0, math.log(2.0)], dtype=torch.float32, requires_grad=True)
+
+    def fake_flash_mla(
+        q: torch.Tensor,
+        kv_latent: torch.Tensor,
+        indices: torch.Tensor,
+        softmax_scale: float,
+        *,
+        d_v: int,
+        attn_sink: torch.Tensor,
+        topk_length: torch.Tensor,
+        indexer_topk: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        assert q.shape == (tokens, 64, QK_DIM)
+        torch.testing.assert_close(attn_sink[:heads], sink.detach())
+        assert torch.isneginf(attn_sink[heads:]).all()
+        output = torch.zeros(tokens, 64, VALUE_DIM, dtype=torch.bfloat16)
+        output[:, :heads] = 1
+        lse = torch.zeros(tokens, 64, dtype=torch.float32)
+        lse[:, 0] = math.log(4.0)
+        lse[:, 1] = math.log(8.0)
+        return output, torch.zeros_like(lse), lse
+
+    class FakeDsa:
+        def sparse_attention_backward_wrapper(self, q, kv, out, d_out, lse, attn_sink, indices, **kwargs):
+            torch.testing.assert_close(attn_sink[:heads], sink.detach())
+            return {"dq": torch.zeros_like(q), "dkv": torch.zeros_like(kv)}
+
+    monkeypatch.setattr(shared_cudnn, "_HAS_CUDNN_DSA", True)
+    monkeypatch.setattr(shared_cudnn, "_HAS_FLASH_MLA", True)
+    monkeypatch.setattr(shared_cudnn, "_CUDNN_DSA", FakeDsa())
+    monkeypatch.setattr(shared_cudnn, "_FLASH_MLA_SPARSE_FWD", fake_flash_mla)
+    monkeypatch.setattr(shared_cudnn, "_require_cuda_tensors", _accept_cpu_tensors)
+
+    q = torch.ones(tokens, heads, QK_DIM, dtype=torch.bfloat16, requires_grad=True)
+    kv_latent = torch.ones(tokens, 1, QK_DIM, dtype=torch.bfloat16, requires_grad=True)
+    topk_indices = torch.tensor([[[0]], [[0]]], dtype=torch.int32)
+    output = shared_cudnn.cudnn_sparse_attention(
+        q,
+        kv_latent,
+        topk_indices,
+        softmax_scale=0.125,
+        all_rows_nonempty=True,
+        attn_sink=sink,
+    )
+    output.sum().backward()
+
+    # FlashMLA returns LSE without the sink: for both heads
+    # p_sink = exp(sink) / (exp(lse) + exp(sink)) = 1/5. Each of the two
+    # queries contributes dot(dO, O)=512.
+    torch.testing.assert_close(sink.grad, torch.full_like(sink, -204.8))
 
 
 def test_shared_cudnn_sparse_attention_accepts_glm53_dimensions(monkeypatch: pytest.MonkeyPatch) -> None:
