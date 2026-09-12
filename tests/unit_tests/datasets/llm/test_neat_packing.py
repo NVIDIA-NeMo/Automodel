@@ -407,7 +407,7 @@ class TestNeatPackedCollater:
 
 
 class TestNeatPackedCollaterFlashVersions:
-    """The indexed 2D mask must be kept for every flash-attention version (4D only for sdpa/eager)."""
+    """Flash emits typed FlashAttentionKwargs (no attention_mask); sdpa/eager get a 4D mask."""
 
     def _batch(self):
         return [
@@ -420,10 +420,16 @@ class TestNeatPackedCollaterFlashVersions:
         ]
 
     @pytest.mark.parametrize("impl", ["flash_attention_2", "flash_attention_3", "flash_attention_4"])
-    def test_flash_versions_keep_indexed_2d_mask(self, impl):
+    def test_flash_versions_emit_varlen_kwargs_and_no_mask(self, impl):
         out = neat_packed_collater(self._batch(), attn_implementation=impl)
-        assert out["attention_mask"].dim() == 2
-        assert out["attention_mask"].tolist() == [[1, 1, 2, 2]]
+        # No attention_mask so HF takes the varlen-kwargs branch (not _upad_input).
+        assert "attention_mask" not in out
+        # cu_seqlens spans the full flattened batch: doc1 (2) + doc2 (2) = 4 tokens.
+        assert out["cu_seq_lens_q"].tolist() == [0, 2, 4]
+        assert torch.equal(out["cu_seq_lens_q"], out["cu_seq_lens_k"])
+        assert out["max_length_q"] == out["max_length_k"] == 2
+        # Per-document ids preserved for loss / context-parallel consumers.
+        assert out["_packed_seq_ids"].tolist() == [[1, 1, 2, 2]]
 
     def test_sdpa_gets_4d_mask(self):
         out = neat_packed_collater(self._batch(), attn_implementation="sdpa")
