@@ -12,13 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CPU/Gloo regression for the mixed-dtype DeepSeek V4.1 DSpark FSDP path."""
+"""Real CPU/Gloo regression for the mixed-dtype DeepSeek V4.1 DSpark FSDP path."""
 
 from __future__ import annotations
 
 import os
 import socket
 
+import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -29,6 +30,10 @@ from nemo_automodel.components.distributed.parallelizer_utils import fully_shard
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41TextConfig
 from nemo_automodel.components.models.deepseek_v41.dspark import DeepseekV41DSparkModel
+
+# Over the default 5s budget on purpose: this module spawns two worker processes that import torch.
+# Shrink the model fixture or process count before lowering this further.
+pytestmark = pytest.mark.timeout(60)
 
 _WORLD_SIZE = 2
 
