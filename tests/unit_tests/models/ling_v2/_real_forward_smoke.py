@@ -19,8 +19,9 @@ Strategy: load weights on CPU first (the framework's expert-tensor stacking
 needs ~2x peak working memory which OOMs an 80 GB GPU for the 16B-A1.4B Mini
 when load+stack happen on-device), assemble the full NeMo model in CPU RAM,
 then move to GPU for inference.  Verifies that the real checkpoint loads
-without missing/unexpected keys and that the forward pass produces finite,
-non-degenerate logits.
+without missing/unexpected keys, that the model-owned router precision policy
+(Param / Proj / Score / Out) survives a real load and cast, and that the forward
+pass produces finite, non-degenerate logits.
 
 Run inside the dev container::
 
@@ -49,10 +50,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     from nemo_automodel.components.models.common import BackendConfig
+    from nemo_automodel.components.models.common.utils import cast_model_to_dtype
     from nemo_automodel.components.models.ling_v2.config import BailingMoeV2Config
     from nemo_automodel.components.models.ling_v2.model import BailingMoeV2ForCausalLM
     from nemo_automodel.components.models.ling_v2.state_dict_adapter import BailingMoeV2StateDictAdapter
-    from nemo_automodel.components.moe.config import MoEConfig
 
     t0 = time.time()
     cfg = BailingMoeV2Config.from_pretrained(args.hf_model)
@@ -72,37 +73,20 @@ def main(argv: list[str] | None = None) -> int:
         rope_fusion=False,
     )
 
-    # Construct the NeMo model directly on CPU.  We must NOT go through
-    # NeMoAutoModelForCausalLM.from_pretrained because that pulls in the full
-    # infrastructure layer (FSDP2 manager, mesh, etc.) and lands tensors on GPU
-    # early, which triggers the expert-stack OOM on a single 80 GB device.
+    # Build directly on CPU: NeMoAutoModelForCausalLM.from_pretrained pulls in the
+    # infrastructure layer (FSDP2 manager, mesh) and lands tensors on GPU early,
+    # which OOMs the expert stack on a single 80 GB device.
+    #
+    # No moe_config on purpose: BailingMoeV2Model resolves
+    # ``moe_config or MoEConfig(**moe_defaults)``, so passing one bypasses
+    # moe_defaults and silently restores router_weights_fp32=False -- the bug this
+    # run exists to disprove. The adapter reuses the model's resolved config below.
     print("\nbuilding empty NeMo model on CPU ...")
-    moe_cfg = MoEConfig(
-        dim=cfg.hidden_size,
-        inter_dim=cfg.intermediate_size,
-        moe_inter_dim=cfg.moe_intermediate_size,
-        n_routed_experts=cfg.num_experts,
-        n_shared_experts=cfg.num_shared_experts,
-        n_activated_experts=cfg.num_experts_per_tok,
-        n_expert_groups=cfg.n_group,
-        n_limited_groups=cfg.topk_group,
-        train_gate=True,
-        gate_bias_update_factor=0.0,
-        force_e_score_correction_bias=bool(cfg.moe_router_enable_expert_bias),
-        score_func=cfg.score_function,
-        route_scale=cfg.routed_scaling_factor,
-        aux_loss_coeff=0.0,
-        norm_topk_prob=cfg.norm_topk_prob,
-        router_bias=False,
-        expert_bias=False,
-        expert_activation="swiglu",
-        shared_expert_inter_dim=cfg.moe_intermediate_size,
-        shared_expert_activation="swiglu",
-        softmax_before_topk=False,
-        dtype=torch.bfloat16,
-    )
-    model = BailingMoeV2ForCausalLM(cfg, moe_config=moe_cfg, backend=backend)
-    model = model.to(dtype=torch.bfloat16)
+    model = BailingMoeV2ForCausalLM(cfg, backend=backend)
+    # Not model.to(dtype=...): raw .to() casts every float buffer and would demote
+    # e_score_correction_bias, defeating _keep_in_fp32_modules_strict.
+    cast_model_to_dtype(model, torch.bfloat16)
+    moe_cfg = model.model.moe_config
 
     n_params = sum(p.numel() for p in model.parameters())
     print(f"model params: {n_params / 1e9:.2f} B")
@@ -127,6 +111,27 @@ def main(argv: list[str] | None = None) -> int:
     if unexpected:
         print(f"    unexpected example: {unexpected[:3]}")
 
+    # Router precision policy on the real checkpoint's own gate, after a real
+    # load. tests/unit_tests/models/test_ling_v2_gate_precision_policy.py pins the
+    # same four stages on tiny configs; this is the checkpoint-side counterpart.
+    first_moe_layer = str(cfg.first_k_dense_replace)
+    gate = model.model.layers[first_moe_layer].mlp.gate
+    router_stages = {
+        "Param(weight)": gate.weight.dtype is torch.bfloat16,
+        "Param(bias)": gate.e_score_correction_bias.dtype is torch.float32,
+        "Proj": gate.gate_precision is torch.float32,
+        "Score": gate.score_dtype is torch.float32,
+        "Out": bool(gate.router_weights_fp32),
+    }
+    router_ok = all(router_stages.values())
+    print(f"\nrouter policy @ layer {first_moe_layer} (first MoE layer):")
+    print(
+        f"  weight={gate.weight.dtype} bias={gate.e_score_correction_bias.dtype} "
+        f"proj={gate.gate_precision} score={gate.score_dtype} out_fp32={gate.router_weights_fp32}"
+    )
+    if not router_ok:
+        print(f"  FAILED stages: {[k for k, v in router_stages.items() if not v]}")
+
     print(f"\nmoving model to {args.out_device} ...")
     model = model.to(args.out_device).eval()
     print(f"GPU mem after move: {torch.cuda.memory_allocated() / 1e9:.1f} GB")
@@ -150,7 +155,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  argmax sample (first 10): {top1[0, :10].tolist()}")
     print(f"\ndone in {elapsed:.1f}s")
 
-    ok = finite and missing == [] and unexpected == [] and top1_unique > 1
+    ok = finite and missing == [] and unexpected == [] and top1_unique > 1 and router_ok
     print(f"\n{'PASS' if ok else 'FAIL'}")
     return 0 if ok else 1
 
