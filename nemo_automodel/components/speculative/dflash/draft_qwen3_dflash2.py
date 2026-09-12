@@ -61,11 +61,15 @@ from transformers.cache_utils import Cache
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import (
+    GREEDY_TEMPERATURE_EPS,
     Qwen3DFlashDecoderLayer,
     Qwen3DFlashDraftModel,
     assert_target_supports_rollback,
     extract_context_feature,
+    resolve_output_head,
     sample,
+    sampling_probs,
+    validate_sampling,
 )
 
 
@@ -267,10 +271,13 @@ class CandidateSelector(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Trace one coherent path through the per-position candidate lists.
 
-        Greedy (``temperature == 0``) follows the best successor at each step;
-        otherwise the step is sampled from the softmax over the candidate scores,
-        and the returned per-step distribution is the draft proposal ``q`` that
-        :func:`dflash2_rejection_sample` needs to stay lossless.
+        Below ``GREEDY_TEMPERATURE_EPS`` (matching ``sample``'s own greedy
+        threshold -- dividing by a positive-but-tiny temperature blows the scores
+        up enough that the softmax can turn to NaN) this follows the best
+        successor at each step; otherwise the step is sampled from the softmax
+        over the candidate scores, and the returned per-step distribution is the
+        draft proposal ``q`` that :func:`dflash2_rejection_sample` needs to stay
+        lossless.
 
         Args:
             hidden: Tensor of shape [batch, draft, hidden]; the draft hidden states
@@ -279,7 +286,8 @@ class CandidateSelector(nn.Module):
                 positions.
             anchor_ids: Long tensor of shape [batch]; the last verified token, i.e.
                 the predecessor of draft position 0.
-            temperature: Sampling temperature; ``0`` selects greedily.
+            temperature: Sampling temperature; below ``GREEDY_TEMPERATURE_EPS``
+                selects greedily.
 
         Returns:
             Tuple ``(path, candidate_ids, draft_probs)``: ``path`` is a Long tensor
@@ -287,7 +295,7 @@ class CandidateSelector(nn.Module):
             ``candidate_ids`` a Long tensor of shape [batch, draft, candidates] with
             the scored candidates; ``draft_probs`` a Tensor of shape
             [batch, draft, candidates] with the per-position proposal distribution
-            over those candidates, or ``None`` when ``temperature == 0``.
+            over those candidates, or ``None`` when decoding greedily.
         """
         unary, candidate_ids = torch.topk(logits, self.top_k, dim=-1)
         gate_hidden = self.hidden_projection(hidden)
@@ -299,7 +307,7 @@ class CandidateSelector(nn.Module):
             scores = unary[:, position] + torch.einsum(
                 "br,bkr->bk", gate, F.embedding(candidate_ids[:, position], self.successor_codebook)
             )
-            if temperature > 0:
+            if temperature >= GREEDY_TEMPERATURE_EPS:
                 probs = torch.softmax(scores.float() / temperature, dim=-1)
                 choice = torch.multinomial(probs, num_samples=1).squeeze(-1)
                 prob_rows.append(probs)
@@ -540,14 +548,17 @@ class Qwen3DFlash2DraftModel(Qwen3DFlashDraftModel):
         max_new_tokens: int,
         stop_token_ids: list[int] | None,
         temperature: float,
+        top_p: float = 1.0,
+        top_k: int = 0,
     ) -> torch.LongTensor:
         """Block-parallel speculative decoding with pairwise path selection.
 
         Each cycle drafts one block in a single draft forward, walks the selector
         over the per-position candidates to pick a coherent path, and verifies the
-        whole block with one target forward. ``temperature == 0`` accepts the
-        longest exact-match prefix; ``temperature > 0`` accepts via rejection
-        sampling, so the emitted tokens follow the target's own distribution.
+        whole block with one target forward. Below ``GREEDY_TEMPERATURE_EPS`` this
+        accepts the longest exact-match prefix, matching ``sample``'s own greedy
+        threshold; above it, it accepts via rejection sampling, so the emitted
+        tokens follow the target's own distribution.
 
         Args:
             target: The frozen verifier; must expose ``model.embed_tokens``,
@@ -556,13 +567,19 @@ class Qwen3DFlash2DraftModel(Qwen3DFlashDraftModel):
             max_new_tokens: Maximum number of tokens to generate.
             stop_token_ids: Token ids that end generation, or ``None``.
             temperature: Sampling temperature; ``0`` decodes greedily.
+            top_p: Nucleus mass to keep, in ``(0, 1]``; truncates the *target's*
+                distribution, which is what the emitted tokens must follow. The
+                draft proposes from plain temperature, as the reference does.
+            top_k: Candidates to keep, ``0`` for the whole vocabulary.
 
         Returns:
             Long tensor of shape [1, prompt + generated] containing the prompt
             followed by the accepted tokens.
         """
         self.eval()
+        validate_sampling(temperature, top_p, top_k)
         assert_target_supports_rollback(target)
+        output_head = resolve_output_head(target)
         num_input_tokens = input_ids.shape[1]
         max_length = num_input_tokens + max_new_tokens
         block_size = self.block_size
@@ -590,14 +607,17 @@ class Qwen3DFlash2DraftModel(Qwen3DFlashDraftModel):
             output_hidden_states=True,
         )
         output_ids[:, :num_input_tokens] = input_ids
-        output_ids[:, num_input_tokens : num_input_tokens + 1] = sample(output.logits, temperature)
+        output_ids[:, num_input_tokens : num_input_tokens + 1] = sample(output.logits, temperature, top_p, top_k)
         target_hidden = extract_context_feature(output.hidden_states, self.target_layer_ids)
 
+        stop_tokens = (
+            torch.tensor(stop_token_ids, dtype=output_ids.dtype, device=output_ids.device) if stop_token_ids else None
+        )
         start = num_input_tokens
         while start < max_length:
             block_output_ids = output_ids[:, start : start + block_size].clone()
             block_position_ids = position_ids[:, start : start + block_size]
-            noise_embedding = target.model.embed_tokens(block_output_ids)
+            noise_embedding = self.embed_noise_block(target, block_output_ids)
             draft_hidden = self(
                 target_hidden=target_hidden,
                 noise_embedding=noise_embedding,
@@ -610,7 +630,7 @@ class Qwen3DFlash2DraftModel(Qwen3DFlashDraftModel):
             # Block position 0 holds the last verified token; it is the predecessor
             # the selector starts its walk from, not something the draft predicts.
             draft_tokens, candidate_ids, draft_probs = self.candidate_selector.walk(
-                draft_hidden, target.lm_head(draft_hidden), block_output_ids[:, 0], temperature
+                draft_hidden, self.compute_logits(draft_hidden, output_head), block_output_ids[:, 0], temperature
             )
             block_output_ids[:, 1:] = draft_tokens
 
@@ -621,13 +641,13 @@ class Qwen3DFlash2DraftModel(Qwen3DFlashDraftModel):
                 use_cache=True,
                 output_hidden_states=True,
             )
-            if temperature > 0:
-                target_probs = torch.softmax(output.logits.float() / temperature, dim=-1)
+            if temperature >= GREEDY_TEMPERATURE_EPS:
+                target_probs = sampling_probs(output.logits, temperature, top_p, top_k)
                 acceptance_length, bonus = dflash2_rejection_sample(
                     draft_tokens, target_probs, draft_probs, candidate_ids
                 )
             else:
-                posterior = sample(output.logits, temperature)
+                posterior = sample(output.logits, temperature, top_p, top_k)
                 acceptance_length = (block_output_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)[0].item()
                 bonus = posterior[0, acceptance_length]
             output_ids[:, start : start + acceptance_length + 1] = block_output_ids[:, : acceptance_length + 1]
@@ -637,8 +657,8 @@ class Qwen3DFlash2DraftModel(Qwen3DFlashDraftModel):
             target_hidden = extract_context_feature(output.hidden_states, self.target_layer_ids)[
                 :, : acceptance_length + 1, :
             ]
-            if stop_token_ids is not None and any(
-                stop_id in output_ids[:, num_input_tokens:] for stop_id in stop_token_ids
+            if stop_tokens is not None and bool(
+                torch.isin(output_ids[0, start - acceptance_length - 1 : start + 1], stop_tokens).any()
             ):
                 break
 
@@ -646,9 +666,8 @@ class Qwen3DFlash2DraftModel(Qwen3DFlashDraftModel):
         # produced at the end of the previous block), so the generated sequence is
         # exactly ``[0, start]``; everything past it is still MASK padding.
         output_ids = output_ids[:, : min(start + 1, max_length)]
-        if stop_token_ids is not None:
-            stop_ids = torch.tensor(stop_token_ids, device=output_ids.device)
-            stop_indices = torch.isin(output_ids[0][num_input_tokens:], stop_ids).nonzero(as_tuple=True)[0]
+        if stop_tokens is not None:
+            stop_indices = torch.isin(output_ids[0, num_input_tokens:], stop_tokens).nonzero(as_tuple=True)[0]
             if stop_indices.numel() > 0:
                 output_ids = output_ids[:, : num_input_tokens + stop_indices[0] + 1]
         return output_ids

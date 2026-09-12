@@ -147,6 +147,12 @@ class _ConstantTarget(torch.nn.Module):
         self.forced_token_id = forced_token_id
         self.device = torch.device("cpu")
 
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
     def forward(
         self,
         input_ids,

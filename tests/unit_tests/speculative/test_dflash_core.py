@@ -35,7 +35,9 @@ BLOCK_SIZE = 4
 MASK_ID = VOCAB - 1
 
 
-def _build_trainer(num_anchors=8, loss_decay_gamma=None, attention_backend="sdpa", sliding_window=None):
+def _build_trainer(
+    num_anchors=8, loss_decay_gamma=None, attention_backend="sdpa", sliding_window=None, input_embedding_scale=1.0
+):
     cfg = Qwen3Config(
         vocab_size=VOCAB,
         hidden_size=HIDDEN,
@@ -51,7 +53,11 @@ def _build_trainer(num_anchors=8, loss_decay_gamma=None, attention_backend="sdpa
     )
     cfg.num_target_layers = NUM_TARGET_LAYERS
     cfg.block_size = BLOCK_SIZE
-    cfg.dflash_config = {"mask_token_id": MASK_ID, "target_layer_ids": TARGET_LAYER_IDS}
+    cfg.dflash_config = {
+        "mask_token_id": MASK_ID,
+        "target_layer_ids": TARGET_LAYER_IDS,
+        "input_embedding_scale": input_embedding_scale,
+    }
     cfg._attn_implementation = attention_backend
     draft = Qwen3DFlashDraftModel(cfg)
     lm_head = torch.nn.Linear(HIDDEN, VOCAB, bias=False)
@@ -132,6 +138,25 @@ def test_noise_embed_keeps_anchor_token_and_masks_rest():
     assert (ids[0, 1:BLOCK_SIZE] == MASK_ID).all()
     # block 1 invalid: every position is MASK
     assert (ids[0, BLOCK_SIZE : 2 * BLOCK_SIZE] == MASK_ID).all()
+
+
+def _assert_noise_embed_scales(trainer, embed_fn):
+    """Training must see the same input_embedding_scale spec_generate applies in
+    embed_noise_block, or a target that sets it trains the draft on unscaled
+    noise embeddings and serves it scaled ones."""
+    unscaled = embed_fn()
+    trainer.draft_model.input_embedding_scale = 2.5
+    scaled = embed_fn()
+    torch.testing.assert_close(scaled, unscaled * 2.5)
+
+
+def test_noise_embed_scales_by_input_embedding_scale():
+    trainer = _build_trainer()
+    seq_len = 20
+    input_ids = torch.arange(1, seq_len + 1).view(1, seq_len)
+    anchors = torch.tensor([[2, 8]])
+    keep = torch.tensor([[True, False]])
+    _assert_noise_embed_scales(trainer, lambda: trainer._create_noise_embed(input_ids, anchors, keep))
 
 
 def test_position_ids_are_anchor_plus_offset():
@@ -262,6 +287,16 @@ def test_vp_noise_embed_fills_visible_prefix_with_real_tokens():
     assert ids[0, 3].item() == MASK_ID
     # block 1 invalid: every position is MASK regardless of its prefix.
     assert (ids[0, BLOCK_SIZE : 2 * BLOCK_SIZE] == MASK_ID).all()
+
+
+def test_vp_noise_embed_scales_by_input_embedding_scale():
+    trainer = _build_vp_trainer()
+    seq_len = 20
+    input_ids = torch.arange(1, seq_len + 1).view(1, seq_len)
+    anchors = torch.tensor([[2, 8]])
+    keep = torch.tensor([[True, False]])
+    prefixes = torch.tensor([[3, 2]])
+    _assert_noise_embed_scales(trainer, lambda: trainer._create_vp_noise_embed(input_ids, anchors, keep, prefixes))
 
 
 def test_variable_prefix_loss_matches_naive_reference():

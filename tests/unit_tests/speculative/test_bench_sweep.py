@@ -221,6 +221,7 @@ def _sweep_args(**overrides):
         max_new_tokens=64,
         temperature=0.0,
         top_p=1.0,
+        top_k=0,
         num_steps=None,
         shuffle_seed=None,
         timeout_s=1.0,
