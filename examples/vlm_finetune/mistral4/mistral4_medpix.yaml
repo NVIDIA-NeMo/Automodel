@@ -126,6 +126,7 @@ ci:
     # Promote HF RMSNorm, RoPE, router scoring, and expert accumulation to FP32.
     # Corroborated by vLLM CUDA norm/router/expert-sum and FlashInfer RoPE paths.
     # Projections, activations, and checkpoint storage retain their native dtypes.
+    # The reference context selects eager experts for both source and reload.
     # Reference precision audit: https://linear.app/nvidia/issue/AM-821
     hf_reference_compute_fp32: true
     # Retain only the HF reload calibration (#3620): mean/p95 KL 0.0203/0.0725.
