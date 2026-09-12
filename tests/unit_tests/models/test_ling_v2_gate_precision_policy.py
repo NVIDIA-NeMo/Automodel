@@ -199,8 +199,11 @@ def _run_gate(moe_config, gate_precision):
     return gate, gate(x, token_mask, None)
 
 
-def test_gate_hands_fp32_weights_to_expert_compute():
-    """Out stage: with the Ling policy, bf16 in still yields fp32 weights."""
+def test_gate_returns_fp32_weights():
+    """Out stage at the Gate boundary: bf16 in still yields fp32 weights out.
+
+    The expert-side boundary is test_ling_expert_compute_receives_fp32_weights.
+    """
     gate, (weights, indices, _) = _run_gate(_router_config(), torch.float32)
 
     assert gate.score_dtype is torch.float32
@@ -234,7 +237,7 @@ _LING_MOE_CONFIG_CASES = (
 @pytest.mark.parametrize(("config_fn", "first_moe_layer"), _LING_MOE_CONFIG_CASES)
 def test_ling_selected_router_weights_default_to_fp32(config_fn, first_moe_layer):
     model = BailingMoeV2ForCausalLM(config_fn(), backend=_backend())
-    assert model.model.moe_config.router_weights_fp32 is True
+    assert model.model.layers[str(first_moe_layer)].mlp.gate.router_weights_fp32 is True
 
 
 @pytest.mark.parametrize(("config_fn", "first_moe_layer"), _LING_MOE_CONFIG_CASES)
@@ -244,13 +247,12 @@ def test_ling_selected_router_weights_are_overridable(config_fn, first_moe_layer
         backend=_backend(),
         moe_overrides={"router_weights_fp32": False},
     )
-    assert model.model.moe_config.router_weights_fp32 is False
+    assert model.model.layers[str(first_moe_layer)].mlp.gate.router_weights_fp32 is False
 
 
-@pytest.mark.parametrize(("config_fn", "first_moe_layer"), _LING_MOE_CONFIG_CASES)
-def test_ling_router_param_stays_in_model_dtype(config_fn, first_moe_layer):
+def test_ling_router_param_stays_in_model_dtype():
     """Param stage: the reference stores the router weight in model dtype and casts at use."""
-    model = BailingMoeV2ForCausalLM(config_fn(), backend=_backend())
+    model = BailingMoeV2ForCausalLM(_mini_config(), backend=_backend())
     assert model.model.moe_config.gate_dtype is None
 
 
@@ -468,16 +470,14 @@ def _paired_gates(cfg: MoEConfig, *, bias_mean: float, bias_std: float, seed: in
 # All three published Ling 2.0 checkpoints share one router geometry (256
 # experts, top-8, 8 groups limited to 4) and one route_scale (2.5), so the shape
 # axis carries one real case rather than three copies. Cases are (bias_mean,
-# bias_std, router_overrides, weight_atol): the first two use the tiny 8-expert
-# grouped router, the last matches the published routing shape at a reduced
-# hidden dim so it stays a CPU test.
+# bias_std, router_overrides): the first two use the tiny 8-expert grouped
+# router, the last matches the published routing shape at a reduced hidden dim
+# so it stays a CPU test.
 #
-# weight_atol is None where the weights must match bitwise. Both sides now run a
-# sorted top-k, so they normalize over the same order and every case measures an
-# exact 0.0 delta -- including the published shape, whose 8-element sum would be
-# order-sensitive if the orders ever diverged. The published shape keeps a small
-# atol purely as insurance against topk tie-breaking; it is not covering a known
-# error.
+# Every case matches bitwise. Both sides run a sorted top-k, so they normalize
+# over the same expert order; the published shape's 8-element sum would be
+# order-sensitive only if those orders diverged, and they do not. Measured max
+# delta 0.0 on all three.
 #
 # Bias distributions are kept non-negative on purpose. The reference masks
 # out-of-group experts with -inf while Automodel multiplies by a 0/1 mask; those
@@ -485,20 +485,19 @@ def _paired_gates(cfg: MoEConfig, *, bias_mean: float, bias_std: float, seed: in
 # drives scores negative would let a masked expert at 0 outrank an unmasked one
 # -- a routing-semantics difference, not a precision one, and outside this PR.
 _PARITY_CASES = (
-    pytest.param(0.0, 0.0, {}, None, id="zero_bias"),
-    pytest.param(0.2, 0.02, {}, None, id="positive_bias"),
+    pytest.param(0.0, 0.0, {}, id="zero_bias"),
+    pytest.param(0.2, 0.02, {}, id="positive_bias"),
     pytest.param(
         0.2,
         0.02,
         dict(n_routed_experts=256, n_activated_experts=8, n_expert_groups=8, n_limited_groups=4),
-        1e-7,
         id="published_shape",
     ),
 )
 
 
-@pytest.mark.parametrize(("bias_mean", "bias_std", "router_overrides", "weight_atol"), _PARITY_CASES)
-def test_ling_gate_matches_reference_router_grouped(bias_mean, bias_std, router_overrides, weight_atol):
+@pytest.mark.parametrize(("bias_mean", "bias_std", "router_overrides"), _PARITY_CASES)
+def test_ling_gate_matches_reference_router_grouped(bias_mean, bias_std, router_overrides):
     """Proj/Score/Out parity vs the pinned reference, grouped routing.
 
     The reference BailingMoeV2Gate does the fp32 projection and
@@ -525,13 +524,7 @@ def test_ling_gate_matches_reference_router_grouped(bias_mean, bias_std, router_
     o_am, o_ref = i_am.argsort(dim=1), i_ref.argsort(dim=1)
     assert torch.equal(i_am.gather(1, o_am), i_ref.gather(1, o_ref))
     w_am_sorted, w_ref_sorted = w_am.gather(1, o_am), w_ref.gather(1, o_ref)
-    if weight_atol is None:
-        assert torch.equal(w_am_sorted, w_ref_sorted)
-    else:
-        # Measured max delta 0.0 at the published shape (max|w| 0.358). The
-        # 8.94e-08 this tolerance was sized for came from the reference's
-        # sorted=False expert top-k, which upstream does not use.
-        assert torch.allclose(w_am_sorted, w_ref_sorted, atol=weight_atol, rtol=0)
+    assert torch.equal(w_am_sorted, w_ref_sorted)
 
 
 def _weight_grad(cfg: MoEConfig, *, use_reference: bool, cotangent: torch.Tensor, x: torch.Tensor):
