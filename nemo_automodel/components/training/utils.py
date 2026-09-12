@@ -107,6 +107,25 @@ def count_tail_padding(labels, ignore_label=-100):
     return prod_mask.view(-1).sum().item()
 
 
+def _gradient_norm_chunks(gradient: torch.Tensor) -> Iterable[torch.Tensor]:
+    """Yield gradient views with bounded temporary storage for norm reduction.
+
+    Args:
+        gradient: Local gradient with arbitrary shape and strides.
+
+    Yields:
+        Views with at most 2**20 elements, covering the gradient exactly once.
+        Splitting a dimension preserves noncontiguous storage without a full copy.
+    """
+    if gradient.numel() <= 2**20:
+        yield gradient
+        return
+    dim = max(range(gradient.ndim), key=lambda axis: gradient.shape[axis])
+    other_elements = gradient.numel() // gradient.shape[dim]
+    for part in gradient.split(max(1, 2**20 // other_elements), dim=dim):
+        yield from _gradient_norm_chunks(part)
+
+
 @torch.no_grad()
 def _clip_grad_norm_impl(
     parameters: torch.Tensor | Iterable[torch.Tensor],
@@ -195,8 +214,9 @@ def _clip_grad_norm_impl(
                 g = g.full_tensor() if has_partial else g.to_local()
             if g.numel() == 0:
                 continue
-            g_abs_max = g.detach().abs().max().to(device=target_device, dtype=torch.float64)
-            local_max = torch.maximum(local_max, g_abs_max)
+            for chunk in _gradient_norm_chunks(g.detach()):
+                g_abs_max = chunk.abs().max().to(device=target_device, dtype=torch.float64)
+                local_max = torch.maximum(local_max, g_abs_max)
 
         if is_dtensor and not has_partial:
             mesh = first.device_mesh
@@ -217,11 +237,14 @@ def _clip_grad_norm_impl(
                 g = g.full_tensor() if has_partial else g.to_local()
             if g.numel() == 0:
                 continue
-            g = g.detach().abs().div(scale)
-            if norm_type == 2.0:
-                local_val = local_val + g.square().sum(dtype=torch.float64)
-            else:
-                local_val = local_val + g.pow(norm_type).sum(dtype=torch.float64)
+            # Engram owner gradients can be several GiB. Bound the abs/div/pow
+            # temporaries while preserving scaled scalar reductions and collectives.
+            for chunk in _gradient_norm_chunks(g.detach()):
+                scaled = chunk.abs().div(scale)
+                if norm_type == 2.0:
+                    local_val = local_val + scaled.square().sum(dtype=torch.float64)
+                else:
+                    local_val = local_val + scaled.pow(norm_type).sum(dtype=torch.float64)
 
         if is_dtensor and not has_partial:
             mesh = first.device_mesh

@@ -725,3 +725,22 @@ class TestScaleGradsAndClipGradNorm:
         # Non-expert params: only PP scaling -> 4
         assert torch.allclose(model.gate.weight.grad, torch.ones_like(model.gate.weight) * 4.0)
         assert torch.allclose(expert_param.grad, torch.ones_like(expert_param) * 2.0)
+
+
+@pytest.mark.parametrize("norm_type", [1.0, 2.0, 3.0, float("inf")])
+@pytest.mark.parametrize("transposed", [False, True])
+def test_clip_large_gradient_matches_dense_float64_reference(norm_type, transposed):
+    """Cross chunk boundaries with strided storage and check the actual clipped gradient."""
+    torch.manual_seed(4128)
+    gradient = torch.randn(1025, 2049)
+    if transposed:
+        gradient = gradient.t()
+    parameter = torch.nn.Parameter(torch.empty_like(gradient))
+    parameter.grad = gradient.clone(memory_format=torch.preserve_format)
+    reference_norm = torch.linalg.vector_norm(gradient.double(), ord=norm_type)
+    reference = gradient * (0.3 / (reference_norm + 1e-6)).clamp(max=1.0)
+    from nemo_automodel.components.training.utils import _clip_grad_norm_impl
+
+    actual_norm = _clip_grad_norm_impl([parameter], 0.3, norm_type=norm_type)
+    torch.testing.assert_close(actual_norm, reference_norm, atol=0, rtol=2e-7)
+    torch.testing.assert_close(parameter.grad, reference, atol=0, rtol=3e-7)
