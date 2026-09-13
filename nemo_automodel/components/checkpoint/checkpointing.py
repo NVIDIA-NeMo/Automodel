@@ -48,6 +48,7 @@ from safetensors.torch import load as safetensors_load
 from safetensors.torch import load_file, save_file
 from safetensors.torch import save as safetensors_save
 from torch import nn
+from torch.distributed.checkpoint.metadata import Metadata, TensorStorageMetadata
 from torch.distributed.checkpoint.storage import StorageReader, StorageWriter
 from torch.distributed.device_mesh import DeviceMesh
 from torch.nn.parallel import DistributedDataParallel
@@ -170,6 +171,55 @@ def _unwrap_ddp_model(model: nn.Module) -> nn.Module:
     if isinstance(model, DistributedDataParallel):
         return model.module
     return model
+
+
+def _should_dequantize_base_checkpoint(model: nn.Module, requested: bool | None) -> bool:
+    """Return whether this load requires checkpoint dequantization.
+
+    ``requested`` permits dequantization unless it is explicitly ``False``.
+    The conversion is needed only when the source model config declares a
+    quantization method; a stale ``True`` setting must not route BF16 weights
+    through the quantized full-CPU loading path.
+
+    Args:
+        model: Model whose source checkpoint metadata is being loaded.
+        requested: Configured dequantization preference.
+
+    Returns:
+        Whether the source checkpoint declares quantized weights that should
+        be converted while loading.
+    """
+    if requested is False:
+        return False
+
+    quantization_config = getattr(getattr(_unwrap_ddp_model(model), "config", None), "quantization_config", None)
+    if isinstance(quantization_config, dict):
+        quantization_method = quantization_config.get("quant_method")
+    else:
+        quantization_method = getattr(quantization_config, "quant_method", None)
+    return quantization_method is not None
+
+
+def _get_shared_parameter_names(model_parts: list[nn.Module]) -> list[list[str]]:
+    """Find checkpoint names referring to the same live parameter.
+
+    This primarily safeguards HF initialization for encoder-decoder models
+    sharing embeddings across both stacks. ModelState already handles ordinary
+    input-embedding/LM-head tying; safetensors may omit additional aliases that
+    the loader must restore without accepting genuinely missing parameters.
+
+    Args:
+        model_parts: Model or pipeline parts after state-dict normalization.
+
+    Returns:
+        Groups of canonical names sharing one parameter object. Equal-valued
+        independent parameters are not aliases, including after sharding.
+    """
+    names_by_parameter: dict[int, list[str]] = {}
+    for part in model_parts:
+        for name, parameter in _unwrap_ddp_model(part).named_parameters(remove_duplicate=False):
+            names_by_parameter.setdefault(id(parameter), []).append(canonical_parameter_fqn(name))
+    return [names for names in names_by_parameter.values() if len(names) > 1]
 
 
 def _normalize_dtype_mapping_to_state_dict_keys(
@@ -314,14 +364,13 @@ def _summarize_state_dict_key_diff(
     }
 
 
-def _get_checkpoint_metadata_keys(
+def _get_checkpoint_metadata(
     path: str,
     storage_reader: StorageReader | None = None,
-) -> set[str]:
-    """Return checkpoint FQNs present in metadata."""
+) -> Metadata:
+    """Read checkpoint metadata, including saved tensor sizes and dtypes."""
     reader = storage_reader if storage_reader is not None else FileSystemReader(path)
-    metadata = reader.read_metadata()
-    return set(metadata.state_dict_metadata.keys())
+    return reader.read_metadata()
 
 
 if _is_geq_torch_2_9():
@@ -626,6 +675,9 @@ class Checkpointer:
             v4_compatible=self.config.v4_compatible,
             legacy_paramwrapper_layout=self.config.legacy_paramwrapper_layout,
         )
+        if self.config.model_save_format == SerializationFormat.SAFETENSORS:
+            # Module metadata (e.g. Transformer Engine state) is not part of HF weights.
+            state_dict = {key: value for key, value in state_dict.items() if not key.endswith("_extra_state")}
         # MoE adapters return non-contiguous views; safetensors.save rejects those.
         _materialize_to_hf_views_for_save(state_dict)
         # Build the consolidated model.safetensors.index.json if needed
@@ -806,6 +858,10 @@ class Checkpointer:
             cpu_offload=self.config.cpu_offload,
             has_expert_parallelism=self.moe_mesh is not None,
         )
+        should_dequantize_base_checkpoint = bool(
+            is_init_step
+            and _should_dequantize_base_checkpoint(model_state.model[0], self.config.dequantize_base_checkpoint)
+        )
 
         # Check if this model requires tensor merging (e.g., Mixtral with grouped experts)
         model_type = getattr(getattr(model_state.model[0], "config", None), "model_type", None)
@@ -829,17 +885,13 @@ class Checkpointer:
                 _load_full_state_dict_into_model(model_state.model, converted_state_dict)
                 return
 
-        # When loading base model for a single model and the checkpoint is safetensors (not DCP),
-        # load the full state dict on every rank and use set_model_state_dict with
-        # full_state_dict=True (no broadcast) so each rank independently slices its
-        # local DTensor shard.  This avoids NCCL collectives entirely, side-stepping
-        # the broadcast_from_rank0 hang where rank 0's synchronous CPU→GPU copies
-        # fall behind other ranks' async allocations.
+        # Keep a full-state CPU path for legacy .bin checkpoints and base-checkpoint conversions that cannot safely
+        # expose DCP destinations. Standard HF safetensors and explicitly low-memory adapters use DCP below.
         is_safetensors = _is_safetensors_checkpoint(model_path)
         is_custom_model = _is_custom_model(model_state.model[0])
-        # Custom models traditionally loaded the complete checkpoint on the host because model-specific conversion
-        # could otherwise create a second full copy on the GPU. Use DCP when most tensors load into model weight memory
-        # and any temporary tensors are small. Other custom adapters and quantized initialization keep the host fallback.
+        # Models with standard HF state-dict keys need no conversion, so DCP can load their tensors directly. Custom
+        # adapters may also opt in when most tensors load into model weight memory and any temporary tensors are small.
+        # Quantized initialization and other adapter conversions keep the host fallback on one device.
         # World size inline (not via components.distributed) so the checkpoint component stays
         # independent per the import-linter contract.
         if torch.distributed.is_initialized():
@@ -847,22 +899,18 @@ class Checkpointer:
         else:
             world_size = int(os.environ.get("WORLD_SIZE", "1"))
         state_dict_adapter = getattr(_unwrap_ddp_model(model_state.model[0]), "state_dict_adapter", None)
-        can_use_low_memory_dcp = (
-            isinstance(state_dict_adapter, StateDictAdapter)
-            and state_dict_adapter.supports_low_memory_dcp_load
-            and not self.config.dequantize_base_checkpoint
+        uses_standard_hf_state_dict = state_dict_adapter is None
+        can_use_low_memory_dcp = not should_dequantize_base_checkpoint and (
+            uses_standard_hf_state_dict
+            or (isinstance(state_dict_adapter, StateDictAdapter) and state_dict_adapter.supports_low_memory_dcp_load)
         )
-        single_device_custom_safetensors = (
-            is_safetensors and is_custom_model and world_size == 1 and not can_use_low_memory_dcp
+        safetensors_requires_full_cpu = (
+            is_safetensors and not can_use_low_memory_dcp and (not is_custom_model or world_size == 1)
         )
         if (
             is_init_step
             and len(model_state.model) == 1
-            and (
-                _is_bin_checkpoint(model_path)
-                or (is_safetensors and not is_custom_model)
-                or single_device_custom_safetensors
-            )
+            and (_is_bin_checkpoint(model_path) or safetensors_requires_full_cpu)
         ):
             t0 = time.monotonic()
             # Full-state safetensors remain mmap-backed. Prefault only when the
@@ -951,7 +999,7 @@ class Checkpointer:
             state_dict,
             # Training checkpoints are saved from the dequantized native model.
             # Only base-checkpoint initialization needs FP8 scale destinations.
-            quantization=bool(is_init_step and self.config.dequantize_base_checkpoint),
+            quantization=should_dequantize_base_checkpoint,
             device_mesh=self.moe_mesh,
             for_checkpoint_load=True,
         )
@@ -970,15 +1018,35 @@ class Checkpointer:
             and isinstance(lm_head_param_name, str)
             and lm_head_param_name in state_dict
         )
+        checkpoint_metadata = {}
         checkpoint_metadata_keys: set[str] = set()
         extra_state_keys = sorted(key for key in state_dict if key.endswith("_extra_state"))
-        if should_try_tied_lm_head_compat or allow_checkpoint_key_subset or extra_state_keys:
-            checkpoint_metadata_keys = _get_checkpoint_metadata_keys(model_path, storage_reader)
+        preserved_extra_state = {}
+        shared_parameter_names = (
+            _get_shared_parameter_names(model_state.model) if is_init_step and uses_standard_hf_state_dict else []
+        )
+        if should_try_tied_lm_head_compat or allow_checkpoint_key_subset or extra_state_keys or shared_parameter_names:
+            checkpoint_metadata = _get_checkpoint_metadata(model_path, storage_reader).state_dict_metadata
+            checkpoint_metadata_keys = set(checkpoint_metadata)
         if extra_state_keys:
-            missing_extra_state_keys = [key for key in extra_state_keys if key not in checkpoint_metadata_keys]
+            # Serialized module metadata can grow after training (e.g. TE FP8 scaling history).
+            # Allocate its saved representation; parameter and buffer destinations retain strict shape checks.
+            for key in extra_state_keys:
+                value = state_dict[key]
+                saved = checkpoint_metadata.get(key)
+                if isinstance(value, torch.Tensor) and isinstance(saved, TensorStorageMetadata):
+                    if value.shape != saved.size or value.dtype != saved.properties.dtype:
+                        state_dict[key] = value.new_empty(saved.size, dtype=saved.properties.dtype)
+            # DCP flattens dictionary metadata into dotted child keys.
+            missing_extra_state_keys = [
+                key
+                for key in extra_state_keys
+                if key not in checkpoint_metadata_keys
+                and not any(name.startswith(f"{key}.") for name in checkpoint_metadata_keys)
+            ]
             if missing_extra_state_keys:
                 for key in missing_extra_state_keys:
-                    state_dict.pop(key, None)
+                    preserved_extra_state[key] = state_dict.pop(key)
                 logging.warning(
                     "Checkpoint %s is missing %d requested module _extra_state keys. Keeping current module "
                     "extra state for those entries (examples=%s).",
@@ -1010,6 +1078,18 @@ class Checkpointer:
                         lm_head_param_name,
                     )
                     state_dict.pop(lm_head_param_name, None)
+
+        # HF safetensors can omit any alias of a shared parameter, not just the LM head. Only omit a destination
+        # when the same live parameter has a saved source; genuinely missing parameters must still fail DCP planning.
+        shared_alias_sources: dict[str, str] = {}
+        for names in shared_parameter_names:
+            source_name = next((name for name in names if name in checkpoint_metadata_keys), None)
+            if source_name is None:
+                continue
+            for name in names:
+                if name in state_dict and name not in checkpoint_metadata_keys:
+                    state_dict.setdefault(source_name, state_dict.pop(name))
+                    shared_alias_sources[name] = source_name
 
         if allow_checkpoint_key_subset:
             missing_checkpoint_keys = sorted(key for key in state_dict if key not in checkpoint_metadata_keys)
@@ -1057,6 +1137,13 @@ class Checkpointer:
         if compat_tied_lm_head_source_key is not None and isinstance(lm_head_param_name, str):
             state_dict[lm_head_param_name] = state_dict.pop(compat_tied_lm_head_source_key)
 
+        for alias_name, source_name in shared_alias_sources.items():
+            state_dict[alias_name] = state_dict[source_name]
+        # A checkpoint may keep only an alias omitted from the original destinations (e.g. a local tied LM head).
+        # It was needed for the read, but restore the original key set for installation and mismatch reporting.
+        for source_name in set(shared_alias_sources.values()) - expected_keys:
+            state_dict.pop(source_name)
+
         state_dict = _maybe_adapt_state_dict_from_hf(
             model_state.model[0],
             state_dict,
@@ -1098,6 +1185,8 @@ class Checkpointer:
                 key_diff["missing_examples"],
                 key_diff["unexpected_examples"],
             )
+        # Omitted module metadata stays local while strict installation still checks real weights.
+        state_dict.update(preserved_extra_state)
         model_state.load_state_dict(
             state_dict,
             strict=not (len(model_state.model) > 1 or has_state_dict_adapter or allow_checkpoint_key_subset),
@@ -1704,7 +1793,8 @@ fi
 
         Args:
             model_state: Wrapper exposing the primary model part.
-            state_dict: The state dict that will be saved.
+            state_dict: Current pipeline stage's subset of the exported state dict. Each value is a tensor of
+                arbitrary shape representing its full logical tensor, including when its per-rank storage is sharded.
 
         Returns:
             Mapping from FQN to shard index, or None when not consolidating.
@@ -1729,13 +1819,20 @@ fi
             pre_shard_hf_state_dict_keys = (
                 getattr(model, "_pre_shard_hf_state_dict_keys", None) or self.config.model_state_dict_keys
             )
+            fallback_key_sizes = None
             if pre_shard_hf_state_dict_keys is None:
-                pre_shard_hf_state_dict_keys = list(state_dict.keys())
+                fallback_key_sizes = _collect_global_tensor_sizes(state_dict, self.pp_group)
+                pre_shard_hf_state_dict_keys = list(fallback_key_sizes)
             if model_type and requires_tensor_merging(model_type) and not hasattr(model_part, "state_dict_adapter"):
                 # in this case, Transformers performed weight conversion so we will save the converted format in the checkpoint
                 num_shards = max(fqn_to_file_index_mapping.values()) if fqn_to_file_index_mapping else 1
                 fqn_to_file_index_mapping = _equally_divide_layers(num_shards, pre_shard_hf_state_dict_keys)
             else:
+                # Decide whether the size metadata collective is needed from inputs that are
+                # identical on every PP rank. Rank-local exclusions below must not control
+                # collective participation, or one stage could wait forever for another.
+                if set(fqn_to_file_index_mapping).isdisjoint(pre_shard_hf_state_dict_keys):
+                    fallback_key_sizes = fallback_key_sizes or _collect_global_tensor_sizes(state_dict, self.pp_group)
                 # some HF models like Moonlight-16B have non-persistent buffers in the base checkpoint
                 # however, HF initializes buffers with persistent=False, so we need to make sure these
                 # buffer keys are not saved during checkpointing
@@ -1751,15 +1848,35 @@ fi
                 excluded_keys.update(keys_to_remove)
                 for key in keys_to_remove:
                     fqn_to_file_index_mapping.pop(key, None)
+                if not fqn_to_file_index_mapping:
+                    fallback_keys = [
+                        key
+                        for key in (pre_shard_hf_state_dict_keys or list(state_dict.keys()))
+                        if key not in excluded_keys
+                    ]
+                    fqn_to_file_index_mapping = _divide_keys_by_size(
+                        fallback_keys,
+                        state_dict,
+                        _DEFAULT_HF_CONSOLIDATED_SHARD_SIZE_BYTES,
+                        key_size_mapping=fallback_key_sizes,
+                    )
+                    if is_rank_0():
+                        logger.info(
+                            "Original HF shard mapping for %s contained no exported model keys; using size-based "
+                            "consolidated shard mapping instead.",
+                            self.config.model_repo_id,
+                        )
         else:
             pre_shard_hf_state_dict_keys = getattr(model, "_pre_shard_hf_state_dict_keys", None)
             if pre_shard_hf_state_dict_keys is None:
                 pre_shard_hf_state_dict_keys = self.config.model_state_dict_keys
-            fallback_keys = pre_shard_hf_state_dict_keys or list(state_dict.keys())
+            global_key_sizes = _collect_global_tensor_sizes(state_dict, self.pp_group)
+            fallback_keys = pre_shard_hf_state_dict_keys or list(global_key_sizes)
             fqn_to_file_index_mapping = _divide_keys_by_size(
                 fallback_keys,
                 state_dict,
                 _DEFAULT_HF_CONSOLIDATED_SHARD_SIZE_BYTES,
+                key_size_mapping=global_key_sizes,
             )
             num_shards = max(fqn_to_file_index_mapping.values()) if fqn_to_file_index_mapping else 1
             if is_rank_0():
@@ -1775,7 +1892,7 @@ fi
         # These will go to the same file as the last file (or file 1 for single-file models).
         # The global keys keep mappings complete under PP, while the current keys preserve
         # parameters registered after parallelization, such as test- or application-owned weights.
-        # Use default of 1 when mapping is empty (e.g., encoder models with different key prefixes)
+        # Use default of 1 only when the exported state dict itself has no mapped tensor keys.
         default_index = max(fqn_to_file_index_mapping.values()) if fqn_to_file_index_mapping else 1
 
         # add any additional keys that are not in the base checkpoint
@@ -2603,8 +2720,25 @@ def _divide_keys_by_size(
     keys: list[str],
     state_dict: dict[str, torch.Tensor],
     target_shard_bytes: int,
+    key_size_mapping: dict[str, int] | None = None,
 ) -> dict[str, int]:
-    """Assign keys to deterministic size-based shards."""
+    """Assign keys to deterministic size-based shards.
+
+    Args:
+        keys: Ordered tensor names to assign.
+        state_dict: Mapping of tensor names to tensors of arbitrary shape. Each value represents its full logical
+            tensor, including when its per-rank storage is sharded, and is read only for its logical byte size when
+            ``key_size_mapping`` is not provided.
+        target_shard_bytes: Positive target size for each shard in bytes.
+        key_size_mapping: Optional mapping of tensor names to logical byte sizes, including tensors not present in
+            the rank-local ``state_dict``.
+
+    Returns:
+        Mapping from every input key to a positive, one-based shard index.
+
+    Raises:
+        ValueError: If ``target_shard_bytes`` is not positive.
+    """
     if target_shard_bytes <= 0:
         raise ValueError(f"target_shard_bytes must be > 0, got {target_shard_bytes}")
 
@@ -2614,7 +2748,13 @@ def _divide_keys_by_size(
 
     for key in keys:
         tensor = state_dict.get(key)
-        tensor_bytes = estimate_tensor_bytes(tensor) if tensor is not None else 0
+        tensor_bytes = (
+            key_size_mapping.get(key, 0)
+            if key_size_mapping is not None
+            else estimate_tensor_bytes(tensor)
+            if tensor is not None
+            else 0
+        )
         if current_shard_bytes > 0 and current_shard_bytes + tensor_bytes > target_shard_bytes:
             current_shard += 1
             current_shard_bytes = 0
@@ -2623,6 +2763,54 @@ def _divide_keys_by_size(
         current_shard_bytes += tensor_bytes
 
     return fqn_to_index_mapping
+
+
+def _collect_global_tensor_sizes(
+    state_dict: dict[str, torch.Tensor],
+    process_group: torch.distributed.ProcessGroup | None,
+) -> dict[str, int]:
+    """Collect logical tensor sizes across pipeline stages without moving tensor data.
+
+    Args:
+        state_dict: Current pipeline stage's key subset, mapping names to tensors of arbitrary shape. Each value must
+            report the full logical element count through ``numel()``; for example, a DTensor reports its global
+            logical size rather than its per-rank TP/FSDP shard size. Tensors remain on their existing devices and
+            their placements are not changed.
+        process_group: Pipeline-parallel process group whose ranks collectively own the logical state dict, or
+            ``None`` for a local-only size mapping.
+
+    Returns:
+        Mapping from tensor names to logical byte sizes, merged across all ranks in ``process_group``.
+
+    Raises:
+        RuntimeError: If a participating pipeline rank does not provide its size mapping.
+        ValueError: If pipeline ranks report different logical sizes for the same tensor name.
+    """
+    local_sizes = {key: estimate_tensor_bytes(tensor) for key, tensor in state_dict.items()}
+    if (
+        process_group is None
+        or not torch.distributed.is_available()
+        or not torch.distributed.is_initialized()
+        or torch.distributed.get_world_size(group=process_group) == 1
+    ):
+        return local_sizes
+
+    world_size = torch.distributed.get_world_size(group=process_group)
+    gathered_sizes: list[dict[str, int] | None] = [None] * world_size
+    torch.distributed.all_gather_object(gathered_sizes, local_sizes, group=process_group)
+
+    global_sizes: dict[str, int] = {}
+    for rank, rank_sizes in enumerate(gathered_sizes):
+        if rank_sizes is None:
+            raise RuntimeError(f"Pipeline rank {rank} did not provide tensor sizes for consolidated export")
+        for key, tensor_bytes in rank_sizes.items():
+            if key in global_sizes and global_sizes[key] != tensor_bytes:
+                raise ValueError(
+                    f"Conflicting logical sizes for {key!r} across pipeline ranks: "
+                    f"{global_sizes[key]} and {tensor_bytes} bytes"
+                )
+            global_sizes[key] = tensor_bytes
+    return global_sizes
 
 
 def _model_has_dtensors(module: nn.Module) -> bool:

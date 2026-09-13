@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import torch
+from transformers.utils import is_mistral_common_available
 
 from nemo_automodel.components.datasets.llm.retrieval_distill_collator import (
     BiEncoderDistillCollator,
@@ -75,9 +76,10 @@ class _TokenizerWithoutTokenTypeIds(_TinyTokenizer):
 
 
 @pytest.mark.parametrize("tokenizer_file", ["mistral_instruct_tokenizer_240323.model.v3", "tekken_240911.json"])
+@pytest.mark.skipif(not is_mistral_common_available(), reason="requires Transformers' optional Mistral backend")
 def test_distill_collator_with_mistral_common(tokenizer_file):
     # Mistral's backend is optional; the tokenizers are bundled with mistral-common.
-    mistral_common = pytest.importorskip("mistral_common")
+    import mistral_common
     from transformers import MistralCommonBackend
 
     tokenizer = MistralCommonBackend(Path(mistral_common.__file__).parent / "data" / tokenizer_file)

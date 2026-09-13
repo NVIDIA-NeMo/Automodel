@@ -115,7 +115,6 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             # Preserve the pre-freeze_config behavior for existing PEFT sequence
             # classification recipes; new configs declare this selector directly.
             freeze_config = FreezeConfig(unfreeze_modules=[ModuleSelector(glob="*classifier")])
-        # fp32 master-weight default planned to be enabled in follow-up PR (resolve_storage_dtype).
         model = build_model(
             cfg_model=self.cfg.model,
             cfg_peft=self.peft_config,
