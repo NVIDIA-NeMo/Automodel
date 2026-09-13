@@ -40,6 +40,7 @@ from nemo_automodel.components.models.deepseek_v4.layers import DeepseekV4FP32Pa
 from nemo_automodel.components.models.deepseek_v4.optimized_kernels import dsv4_sparse_attention
 from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41TextConfig
 from nemo_automodel.components.models.deepseek_v41.cp import gather_sequence
+from nemo_automodel.components.models.deepseek_v41.indexer import indexer_scores
 from nemo_automodel.components.models.deepseek_v41.layers import DeepseekV41RMSNorm
 from nemo_automodel.components.models.deepseek_v41.quantization import quantize_cache
 from nemo_automodel.shared.utils import dtype_from_str
@@ -242,9 +243,16 @@ class _Indexer(nn.Module):
     """Frozen released CSA2 indexer with shared keys and hierarchical selection."""
 
     def __init__(
-        self, config: DeepseekV41TextConfig, *, layer_idx: int, dtype: torch.dtype, rms_norm: str = "torch_fp32"
+        self,
+        config: DeepseekV41TextConfig,
+        *,
+        layer_idx: int,
+        dtype: torch.dtype,
+        rms_norm: str = "torch_fp32",
+        attn_backend: str = "eager",
     ) -> None:
         super().__init__()
+        self.attn_backend = attn_backend
         self.owns_keys = layer_idx in config.kv_source_layer_ids
         self.is_candidate_source = layer_idx == config.candidate_source_layer_id
         self.uses_candidates = 0 <= config.candidate_source_layer_id < layer_idx
@@ -324,9 +332,6 @@ class _Indexer(nn.Module):
         queries = self.wq_b(query_latent).unflatten(-1, (self.num_heads, self.head_dim))
         queries = quantize_cache(_apply_rope(queries, angles), format="mxfp4", block_size=32)
         weights = self.weights_proj(hidden_states) * (self.head_dim**-0.5 * self.num_heads**-0.5)
-        # Preserve the reference's BF16 matmul result and reduction boundaries.
-        scores = torch.einsum("bshd,btd->bsht", queries, keys)
-        scores = (scores.relu() * weights.unsqueeze(-1)).sum(dim=2)
         if position_ids is None:
             position_ids = torch.arange(sequence, device=hidden_states.device).unsqueeze(0)
         lengths = (position_ids + 1) // state.compression_ratio
@@ -339,7 +344,13 @@ class _Indexer(nn.Module):
                 raise ValueError("Packed CSA2 state requires compressed document IDs")
             allowed = allowed & (packed_seq_ids.unsqueeze(-1) == state.compressed_seq_ids.unsqueeze(1))
             allowed = allowed & (packed_seq_ids.unsqueeze(-1) > 0)
-        scores = scores.masked_fill(~allowed, -torch.inf)
+        if self.attn_backend == "tilelang":
+            scores = indexer_scores(queries, keys, weights, allowed)
+        else:
+            # Preserve the reference's BF16 matmul result and reduction boundaries.
+            scores = torch.einsum("bshd,btd->bsht", queries, keys)
+            scores = (scores.relu() * weights.unsqueeze(-1)).sum(dim=2)
+            scores = scores.masked_fill(~allowed, -torch.inf)
         if packed_seq_ids is not None:
             return self._select_packed(scores, packed_seq_ids, replace(state, index_keys=keys))
         candidates = state.candidates
@@ -474,7 +485,7 @@ class DeepseekV41Attention(nn.Module):
             else None
         )
         self.indexer = (
-            _Indexer(config, layer_idx=layer_idx, dtype=dtype, rms_norm=backend.rms_norm)
+            _Indexer(config, layer_idx=layer_idx, dtype=dtype, rms_norm=backend.rms_norm, attn_backend=backend.attn)
             if self.is_index_source
             else None
         )
