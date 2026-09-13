@@ -131,7 +131,7 @@ def test_reference_context_rejects_other_model_families():
             pass
 
 
-def test_tracked_recipe_selects_precision_context_without_relaxing_source_or_automodel_reload():
+def test_tracked_recipe_selects_precision_context_with_cross_framework_profiles():
     from pathlib import Path
 
     recipe = Path(__file__).resolve().parents[3] / "examples/vlm_finetune/mistral4/mistral4_medpix.yaml"
@@ -141,7 +141,7 @@ def test_tracked_recipe_selects_precision_context_without_relaxing_source_or_aut
     custom, remaining = _extract_custom_args(["--config", str(recipe)])
     assert "hf_reference_compute_fp32" not in custom
     assert not any("hf_reference_compute_fp32" in value for value in remaining)
-    assert custom["parity_tolerance_profile_overrides"] == {"hf_reload": "relaxed"}
+    assert custom["parity_tolerance_profile_overrides"] == {"source_load": "relaxed", "hf_reload": "relaxed"}
     assert "parity_threshold_overrides" not in custom
     router = _router()
     hidden = torch.ones(2, 16, dtype=torch.bfloat16)

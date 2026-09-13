@@ -633,6 +633,7 @@ def test_vlm_checkpoint_robustness_recipes_resolve(tmp_path, recipe_path):
         assert robustness["hf_reference_compute_fp32"] is True
         assert "parity_tolerance_profile" not in robustness
         assert robustness["parity_tolerance_profile_overrides"] == {
+            "source_load": "relaxed",
             "hf_reload": "relaxed",
         }
         for key in (

@@ -129,9 +129,12 @@ ci:
     # The reference context selects eager experts for both source and reload.
     # Reference precision audit: https://linear.app/nvidia/issue/AM-821
     hf_reference_compute_fp32: true
-    # Retain only the HF reload calibration (#3620): mean/p95 KL 0.0203/0.0725.
-    # Source and AutoModel reload use standard; recent AutoModel reloads are exact.
+    # BF16 fused expert arithmetic and equivalent reduction orders perturb
+    # hard top-k choices across 36 layers, even with aligned FP32 scoring.
+    # Full-depth router replay passes standard; independent HF arithmetic
+    # variants reproduce the remaining drift. Keep AutoModel reload standard.
     parity_tolerance_profile_overrides:
+      source_load: relaxed
       hf_reload: relaxed
     hf_device_map_auto: true
     # Transformers' load-time dequantization leaves Mistral4 expert weights in

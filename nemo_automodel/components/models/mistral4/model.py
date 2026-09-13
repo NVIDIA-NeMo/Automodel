@@ -209,7 +209,12 @@ def _build_moe_config(config, moe_overrides: dict | None = None) -> MoEConfig:
         n_expert_groups=config.n_group,
         n_limited_groups=config.topk_group,
         train_gate=True,
-        gate_bias_update_factor=1e-3,
+        # HF and vLLM use bias-free Mistral4 routing. Learning a DeepSeek-style
+        # correction changes routing after export because HF ignores that tensor.
+        gate_bias_update_factor=0.0,
+        # Preserve the buffer when reading older AutoModel checkpoints; new
+        # training keeps it zero unless bias updates are explicitly requested.
+        force_e_score_correction_bias=True,
         score_func="softmax_with_bias",
         route_scale=config.routed_scaling_factor,
         aux_loss_coeff=0,
@@ -317,7 +322,7 @@ class Mistral4Model(nn.Module):
     def update_moe_gate_bias(self) -> None:
         with torch.no_grad():
             for _, block in self.layers.named_children():
-                if isinstance(block.mlp, MoE):
+                if isinstance(block.mlp, MoE) and block.mlp.gate.bias_update_factor > 0:
                     block.mlp.gate.update_bias()
 
     @torch.no_grad()
@@ -462,7 +467,7 @@ class Mistral4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     def update_moe_gate_bias(self) -> None:
         with torch.no_grad():
             for _, block in self.model.layers.named_children():
-                if isinstance(block.mlp, MoE):
+                if isinstance(block.mlp, MoE) and block.mlp.gate.bias_update_factor > 0:
                     block.mlp.gate.update_bias()
 
     @torch.no_grad()
@@ -905,7 +910,7 @@ if _HF_MISTRAL3_AVAILABLE:
         def update_moe_gate_bias(self) -> None:
             with torch.no_grad():
                 for _, block in self.model.language_model.layers.named_children():
-                    if isinstance(block.mlp, MoE):
+                    if isinstance(block.mlp, MoE) and block.mlp.gate.bias_update_factor > 0:
                         block.mlp.gate.update_bias()
 
         @torch.no_grad()
