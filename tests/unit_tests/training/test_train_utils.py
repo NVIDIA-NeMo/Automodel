@@ -730,7 +730,7 @@ class TestScaleGradsAndClipGradNorm:
 @pytest.mark.parametrize("norm_type", [1.0, 2.0, 3.0, float("inf")])
 @pytest.mark.parametrize("transposed", [False, True])
 def test_clip_large_gradient_matches_dense_float64_reference(norm_type, transposed):
-    """Cross chunk boundaries with strided storage and check the actual clipped gradient."""
+    """Check large contiguous/strided gradients and clipping against a dense FP64 reference."""
     torch.manual_seed(4128)
     gradient = torch.randn(1025, 2049)
     if transposed:

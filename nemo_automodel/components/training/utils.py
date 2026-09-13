@@ -22,6 +22,9 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Partial, Replicate
 
 from nemo_automodel.components.models.common.utils import set_is_first_microbatch, set_is_optim_step
+from nemo_automodel.shared.import_utils import safe_import
+
+_HAVE_TE_OPTIMIZERS, te_optimizers = safe_import("transformer_engine.pytorch.optimizers")
 
 # Regex pattern to match expert parameters in GroupedExpertsTE.
 # Matches FQNs like:
@@ -107,23 +110,60 @@ def count_tail_padding(labels, ignore_label=-100):
     return prod_mask.view(-1).sum().item()
 
 
-def _gradient_norm_chunks(gradient: torch.Tensor) -> Iterable[torch.Tensor]:
-    """Yield gradient views with bounded temporary storage for norm reduction.
+def _local_l2_norm(gradients: list[torch.Tensor], target_device: torch.device) -> torch.Tensor:
+    """Reduce local gradients, using TE directly on eligible gradient storage.
 
     Args:
-        gradient: Local gradient with arbitrary shape and strides.
+        gradients: Plain local tensors of arbitrary shape, without DTensor placements.
+            Contiguous CUDA FP16/BF16/FP32 tensors use TE, grouped by device and dtype.
+            Other layouts/devices/dtypes use PyTorch's FP64 vector norm. Inputs are
+            read-only and may alias parameter gradients.
+        target_device: Device for the returned scalar; only scalars move between devices.
 
-    Yields:
-        Views with at most 2**20 elements, covering the gradient exactly once.
-        Splitting a dimension preserves noncontiguous storage without a full copy.
+    Returns:
+        Independent scalar FP64 L2 norm on target_device. TE squares and accumulates
+        in FP32; PyTorch retries tiny/non-finite TE results in FP64 to preserve finite
+        norms outside FP32's squared-norm range. This check synchronizes the CUDA scalar.
+        Unsupported inputs and exceptional results may allocate widened gradient storage.
     """
-    if gradient.numel() <= 2**20:
-        yield gradient
-        return
-    dim = max(range(gradient.ndim), key=lambda axis: gradient.shape[axis])
-    other_elements = gradient.numel() // gradient.shape[dim]
-    for part in gradient.split(max(1, 2**20 // other_elements), dim=dim):
-        yield from _gradient_norm_chunks(part)
+    norms: list[torch.Tensor] = []
+    te_groups: dict[tuple[torch.device, torch.dtype], list[torch.Tensor]] = {}
+    for gradient in gradients:
+        if gradient.numel() == 0:
+            continue
+        if (
+            _HAVE_TE_OPTIMIZERS
+            and type(gradient) is torch.Tensor
+            and gradient.is_cuda
+            and gradient.is_contiguous()
+            and gradient.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        ):
+            te_groups.setdefault((gradient.device, gradient.dtype), []).append(gradient)
+        elif gradient.dtype in (torch.float64, torch.complex128):
+            # FP64 input can exceed even an FP64 sum-of-squares range. Preserve
+            # the scaled reduction used by the generic path for these tensors.
+            maximum = gradient.abs().max()
+            scale = torch.where(torch.isfinite(maximum) & maximum.ne(0), maximum, torch.ones_like(maximum))
+            norms.append((maximum * torch.linalg.vector_norm(gradient / scale)).to(target_device))
+        else:
+            dtype = torch.complex128 if gradient.is_complex() else torch.float64
+            norms.append(torch.linalg.vector_norm(gradient, dtype=dtype).to(target_device))
+
+    for (device, _), group in te_groups.items():
+        overflow = torch.zeros(1, dtype=torch.int32, device=device)
+        norm, _ = te_optimizers.multi_tensor_applier(te_optimizers.multi_tensor_l2norm, overflow, [group], False)
+        norm = norm.reshape(()).to(dtype=torch.float64)
+        # Bound the contribution that FP32 squared subnormals could lose. Retry
+        # when it could exceed FP32 epsilon, or when the squared sum overflows.
+        finfo = torch.finfo(torch.float32)
+        minimum_squared_norm = sum(g.numel() for g in group) * finfo.tiny / finfo.eps
+        if not bool(torch.isfinite(norm) & norm.square().gt(minimum_squared_norm)):
+            norm = torch.linalg.vector_norm(
+                torch.stack([torch.linalg.vector_norm(g, dtype=torch.float64) for g in group])
+            )
+        norms.append(norm.to(target_device))
+
+    return _combine_norms(norms, 2.0, target_device)
 
 
 @torch.no_grad()
@@ -136,6 +176,10 @@ def _clip_grad_norm_impl(
     pp_mesh: DeviceMesh | None = None,
 ) -> torch.Tensor:
     """Compute and clip the norm of local and DTensor gradients.
+
+    L2 uses Transformer Engine for contiguous CUDA FP16/BF16/FP32 local gradients,
+    with a PyTorch FP64 fallback. Partial placements retain materialization before
+    norm computation; other norm orders retain the scaled reduction path.
 
     Args:
         parameters: One parameter tensor or an iterable of parameter tensors
@@ -207,6 +251,31 @@ def _clip_grad_norm_impl(
         # those per-grad (each full_tensor() is a same-shape collective, safe).
         has_partial = is_dtensor and any(isinstance(pl, Partial) for pl in first.placements)
 
+        if norm_type == 2.0 and not has_partial:
+            local_gradients = [
+                (p.grad.to_local() if isinstance(p.grad, DTensor) else p.grad).detach() for p in group_params
+            ]
+            local_norm = _local_l2_norm(local_gradients, target_device)
+            if is_dtensor:
+                # Keep a scaled, scalar-only MAX/SUM schedule on every rank,
+                # including empty shards and ranks that use the PyTorch fallback.
+                maximum = local_norm.clone()
+                for dim_idx, placement in enumerate(first.placements):
+                    if not isinstance(placement, Replicate):
+                        maximum = _all_reduce_scalar(
+                            maximum, torch.distributed.ReduceOp.MAX, first.device_mesh, dim_idx
+                        )
+                scale = torch.where(torch.isfinite(maximum) & maximum.ne(0), maximum, torch.ones_like(maximum))
+                sum_squares = local_norm.div(scale).square()
+                for dim_idx, placement in enumerate(first.placements):
+                    if not isinstance(placement, Replicate):
+                        sum_squares = _all_reduce_scalar(
+                            sum_squares, torch.distributed.ReduceOp.SUM, first.device_mesh, dim_idx
+                        )
+                local_norm = maximum * sum_squares.sqrt()
+            group_norms.append(local_norm)
+            continue
+
         local_max = torch.zeros((), dtype=torch.float64, device=target_device)
         for p in group_params:
             g = p.grad
@@ -214,9 +283,8 @@ def _clip_grad_norm_impl(
                 g = g.full_tensor() if has_partial else g.to_local()
             if g.numel() == 0:
                 continue
-            for chunk in _gradient_norm_chunks(g.detach()):
-                g_abs_max = chunk.abs().max().to(device=target_device, dtype=torch.float64)
-                local_max = torch.maximum(local_max, g_abs_max)
+            g_abs_max = g.detach().abs().max().to(device=target_device, dtype=torch.float64)
+            local_max = torch.maximum(local_max, g_abs_max)
 
         if is_dtensor and not has_partial:
             mesh = first.device_mesh
@@ -237,14 +305,11 @@ def _clip_grad_norm_impl(
                 g = g.full_tensor() if has_partial else g.to_local()
             if g.numel() == 0:
                 continue
-            # Engram owner gradients can be several GiB. Bound the abs/div/pow
-            # temporaries while preserving scaled scalar reductions and collectives.
-            for chunk in _gradient_norm_chunks(g.detach()):
-                scaled = chunk.abs().div(scale)
-                if norm_type == 2.0:
-                    local_val = local_val + scaled.square().sum(dtype=torch.float64)
-                else:
-                    local_val = local_val + scaled.pow(norm_type).sum(dtype=torch.float64)
+            g = g.detach().abs().div(scale)
+            if norm_type == 2.0:
+                local_val = local_val + g.square().sum(dtype=torch.float64)
+            else:
+                local_val = local_val + g.pow(norm_type).sum(dtype=torch.float64)
 
         if is_dtensor and not has_partial:
             mesh = first.device_mesh
@@ -320,8 +385,8 @@ def clip_grad_norm(
         use_torch_clip_grad_norm: Use PyTorch's optimized regular-tensor clipping path when possible.
 
     Returns:
-        Scalar tensor containing the total gradient norm without synchronizing it to the host,
-        or 0.0 when clipping is disabled.
+        Scalar tensor containing the total gradient norm, or 0.0 when clipping is disabled.
+        The TE L2 path checks its scalar result on the host for FP64 fallback.
     """
     if max_grad_norm is None:
         return 0.0
@@ -465,8 +530,8 @@ def scale_grads_and_clip_grad_norm(
     - Finally, perform grad clipping with PP/EP-aware reductions.
 
     Returns:
-        Scalar tensor containing the total gradient norm without synchronizing it to the host,
-        or 0.0 when clipping is disabled.
+        Scalar tensor containing the total gradient norm, or 0.0 when clipping is disabled.
+        The TE L2 path checks its scalar result on the host for FP64 fallback.
     """
 
     # Precompute scale factors
