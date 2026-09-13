@@ -129,8 +129,9 @@ rng:
   seed: 42
 
 model:
-  _target_: nemo_automodel.models.llm.NemotronHForCausalLM
-  name_or_path: meta-llama/Llama-3.2-1B
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
+  dtype: float32
   # additional model kwargs passed to the constructor
 
 compile:
@@ -176,6 +177,17 @@ lr_scheduler:
   warmup_steps: 50
   min_lr: 1.0e-6
 ```
+
+### Full-Parameter Training Precision
+
+For new full-parameter training with `torch.optim.Adam`/`AdamW`, explicitly set
+`model.dtype: float32` on `NeMoAutoModel` loaders for fp32 master weights and
+Adam moments. Configure compute precision separately (FSDP2: `distributed.mp_policy`).
+
+PEFT, TE FusedAdam, and diffusion need separate precision choices; see the
+[mixed-precision guide](../../docs/guides/mixed-precision-training.mdx).
+Validate memory, training behavior, and checkpoint/resume when migrating existing
+configs.
 
 ### The `_target_` Pattern
 
