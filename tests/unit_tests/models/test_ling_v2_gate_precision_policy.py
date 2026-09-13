@@ -277,6 +277,9 @@ def test_ling_router_stages_on_constructed_model(config_fn, first_moe_layer):
     assert indices.shape == (16, model.model.moe_config.n_activated_experts)
 
 
+# Over the default 5s budget on purpose: the first parametrized case pays the cold CPU
+# inductor compile of ``weighted_swiglu`` behind the torch experts path; later cases reuse it.
+@pytest.mark.timeout(60)
 @pytest.mark.parametrize(("config_fn", "first_moe_layer"), _LING_MOE_CONFIG_CASES)
 def test_ling_expert_compute_receives_fp32_weights(config_fn, first_moe_layer):
     """Out is defined at the expert boundary, not the Gate boundary.
