@@ -15,7 +15,7 @@
 """MXFP4-resident expert LoRA implementations."""
 
 import torch
-from torch.distributed.tensor import DTensor, Partial, Shard
+from torch.distributed.tensor import DTensor
 
 from nemo_automodel.components._peft.lora_experts import (
     GroupedExpertsDeepEPLoRA,
@@ -76,7 +76,7 @@ class GroupedExpertsLoRAMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsLoRA):
     def forward(self, x: torch.Tensor, token_mask: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor):
         """Forward pass with mxfp4 base weights and LoRA injection.
 
-        Mirrors GroupedExpertsLoRA.forward, replacing the base grouped GEMMs with
+        Preserves the tensor and EP contract of GroupedExperts.forward, replacing the base grouped GEMMs with
         MXFP4GroupedMM over the packed weights. Falls back to the parent (bf16)
         path while packing is still deferred.
         """
@@ -99,24 +99,15 @@ class GroupedExpertsLoRAMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsLoRA):
 
         assert self.n_routed_experts % ep_size == 0
 
-        if ep_size > 1:
-            x = DTensor.from_local(x, device_mesh=ep_mesh, placements=[Shard(0)]).full_tensor(
-                grad_placements=[Partial()]
-            )
-            weights = DTensor.from_local(weights.float(), device_mesh=ep_mesh, placements=[Shard(0)]).full_tensor(
-                grad_placements=[Partial()]
-            )
-            indices = DTensor.from_local(indices, device_mesh=ep_mesh, placements=[Shard(0)]).full_tensor()
-            token_mask = DTensor.from_local(token_mask, device_mesh=ep_mesh, placements=[Shard(0)]).full_tensor()
+        ep_inputs = self._gather_ep_inputs(x, token_mask, weights, indices, ep_mesh=ep_mesh)
+        x, token_mask, weights, indices = ep_inputs.x, ep_inputs.token_mask, ep_inputs.weights, ep_inputs.indices
 
         n_local_experts = self.n_routed_experts // ep_size
         experts_start_idx = ep_rank * n_local_experts
 
         y = self._forward_grouped_mm_mxfp4(x, token_mask, weights, indices, n_local_experts, experts_start_idx)
 
-        if ep_size > 1:
-            y = DTensor.from_local(y, device_mesh=ep_mesh, placements=[Partial()])
-            y = y.redistribute(placements=[Shard(0)]).to_local()
+        y = self._combine_ep_output(y, ep_inputs)
 
         return y.to(input_dtype)
 
@@ -235,7 +226,7 @@ class GroupedExpertsDeepEPLoRAMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsDeepE
     ):
         """Forward with mxfp4 base weights, DeepEP dispatch, and LoRA injection.
 
-        Mirrors ``GroupedExpertsDeepEPLoRA.forward`` (torch_mm branch), replacing the base
+        Preserves the tensor and EP contract of GroupedExpertsDeepEP.forward, replacing the base
         grouped GEMMs with ``MXFP4GroupedMM`` over the packed weights. Falls back to the
         bf16 parent while packing is still deferred.
         """
@@ -246,14 +237,10 @@ class GroupedExpertsDeepEPLoRAMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsDeepE
         assert self.use_torch_mm, "mxfp4-resident DeepEP experts require the torch_mm experts backend."
         assert self.n_routed_experts % self.ep_size == 0
 
-        indices = indices.masked_fill(~token_mask.unsqueeze(-1), -1)
-        (permuted_local_hidden_states, tokens_per_expert, permuted_probs) = self.token_dispatcher.token_permutation2(
-            hidden_states=x,
-            num_local_tokens=x.size(0),
-            token_probs=weights,
-            token_indices=indices,
-        )
-        permuted_probs = permuted_probs.unsqueeze(-1)
+        dispatched = self._dispatch_tokens(x, token_mask, weights, indices)
+        permuted_local_hidden_states = dispatched.hidden_states
+        tokens_per_expert = dispatched.tokens_per_expert
+        permuted_probs = dispatched.probs
 
         # Match the activation dtype for the LoRA grouped GEMMs (the base dequantizes to
         # x.dtype inside MXFP4GroupedMM; adapters may be fp32 — see GroupedExpertsLoRAMXFP4).

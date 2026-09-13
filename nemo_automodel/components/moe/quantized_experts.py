@@ -72,14 +72,20 @@ class MXFP4ExpertStorageMixin:
     # registration helper is format-driven rather than hardcoding two names.
     _PACKED_SUFFIXES: tuple[str, ...] = ("_packed", "_scales")
 
-    def _init_mxfp4_storage(self) -> None:
-        """Validate the backend and pack immediately if base weights are materialized."""
+    def _validate_mxfp4_config(self) -> None:
+        """Reject execution modes that the packed expert computation does not implement."""
+        if self.config.apply_router_weight_after_down:
+            raise NotImplementedError("MXFP4 experts do not support apply_router_weight_after_down=True.")
         if not self.use_torch_mm:
             raise NotImplementedError(
                 "mxfp4-resident expert weights require the torch_mm experts backend (backend.experts='torch_mm'). "
                 "The grouped_gemm path (backend.experts='gmm') has no packed variant; with DeepEP dispatch use "
                 "backend.dispatcher='deepep' together with backend.experts='torch_mm'."
             )
+
+    def _init_mxfp4_storage(self) -> None:
+        """Validate the backend and pack immediately if base weights are materialized."""
+        self._validate_mxfp4_config()
         self._mxfp4_resident = False
         if not _to_local(getattr(self, self._MXFP4_BASE_NAMES[0])).is_meta:
             self.pack_base_weights()
@@ -93,6 +99,7 @@ class MXFP4ExpertStorageMixin:
         shared by the torch (``GroupedExpertsMXFP4``) and DeepEP
         (``GroupedExpertsDeepEPMXFP4``) frozen variants.
         """
+        self._validate_mxfp4_config()
         cfg = self.config
         block = MXFP4_BLOCK_SIZE
         up_proj_dim = cfg.moe_inter_dim * 2 if self.is_gated else cfg.moe_inter_dim
@@ -223,7 +230,10 @@ class GroupedExpertsMXFP4(MXFP4ExpertStorageMixin, GroupedExperts):
         weights: torch.Tensor,
         indices: torch.Tensor,
     ) -> torch.Tensor:
-        """Forward over mxfp4 base weights. Falls back to bf16 until packing is done."""
+        """Compute packed experts with the tensor and EP contract of GroupedExperts.forward.
+
+        Falls back to the BF16 parent until packing is done.
+        """
         if not self._mxfp4_resident:
             return super().forward(x, token_mask, weights, indices)
 
@@ -242,28 +252,15 @@ class GroupedExpertsMXFP4(MXFP4ExpertStorageMixin, GroupedExperts):
 
         assert self.n_routed_experts % ep_size == 0
 
-        if ep_size > 1:
-            from torch.distributed.tensor import Partial, Shard
-
-            x = DTensor.from_local(x, device_mesh=ep_mesh, placements=[Shard(0)]).full_tensor(
-                grad_placements=[Partial()]
-            )
-            weights = DTensor.from_local(weights.float(), device_mesh=ep_mesh, placements=[Shard(0)]).full_tensor(
-                grad_placements=[Partial()]
-            )
-            indices = DTensor.from_local(indices, device_mesh=ep_mesh, placements=[Shard(0)]).full_tensor()
-            token_mask = DTensor.from_local(token_mask, device_mesh=ep_mesh, placements=[Shard(0)]).full_tensor()
+        ep_inputs = self._gather_ep_inputs(x, token_mask, weights, indices, ep_mesh=ep_mesh)
+        x, token_mask, weights, indices = ep_inputs.x, ep_inputs.token_mask, ep_inputs.weights, ep_inputs.indices
 
         n_local_experts = self.n_routed_experts // ep_size
         experts_start_idx = ep_rank * n_local_experts
 
         y = self._forward_grouped_mm_mxfp4(x, token_mask, weights, indices, n_local_experts, experts_start_idx)
 
-        if ep_size > 1:
-            from torch.distributed.tensor import Partial, Shard
-
-            y = DTensor.from_local(y, device_mesh=ep_mesh, placements=[Partial()])
-            y = y.redistribute(placements=[Shard(0)]).to_local()
+        y = self._combine_ep_output(y, ep_inputs)
 
         return y.to(input_dtype)
 
@@ -357,7 +354,7 @@ class GroupedExpertsDeepEPMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsDeepEP):
     ) -> torch.Tensor:
         """Forward over mxfp4 base weights with DeepEP dispatch.
 
-        Mirrors ``GroupedExpertsDeepEP.forward``, replacing the two base
+        Preserves the tensor and EP contract of ``GroupedExpertsDeepEP.forward``, replacing the two base
         ``torch._grouped_mm`` calls with ``MXFP4GroupedMM`` over the packed weights.
         Falls back to the bf16 parent while packing is still deferred.
         """
@@ -370,14 +367,10 @@ class GroupedExpertsDeepEPMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsDeepEP):
             f"Number of experts must be divisible by ep_size (ep_size={self.ep_size})"
         )
 
-        indices = indices.masked_fill(~token_mask.unsqueeze(-1), -1)
-        (permuted_local_hidden_states, tokens_per_expert, permuted_probs) = self.token_dispatcher.token_permutation2(
-            hidden_states=x,
-            num_local_tokens=x.size(0),
-            token_probs=weights,
-            token_indices=indices,
-        )
-        permuted_probs = permuted_probs.unsqueeze(-1)
+        dispatched = self._dispatch_tokens(x, token_mask, weights, indices)
+        permuted_local_hidden_states = dispatched.hidden_states
+        tokens_per_expert = dispatched.tokens_per_expert
+        permuted_probs = dispatched.probs
 
         if torch.count_nonzero(tokens_per_expert) > 0:
             tokens_per_expert_gpu = tokens_per_expert.to(device=permuted_local_hidden_states.device, non_blocking=True)
