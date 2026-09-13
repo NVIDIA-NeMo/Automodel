@@ -174,10 +174,12 @@ def _clip_grad_norm_impl(
     error_if_nonfinite: bool = False,
     foreach: bool | None = None,
     pp_mesh: DeviceMesh | None = None,
+    *,
+    use_te: bool = False,
 ) -> torch.Tensor:
     """Compute and clip the norm of local and DTensor gradients.
 
-    L2 uses Transformer Engine for contiguous CUDA FP16/BF16/FP32 local gradients,
+    Opt-in L2 uses Transformer Engine for contiguous CUDA FP16/BF16/FP32 local gradients,
     with a PyTorch FP64 fallback. Partial placements retain materialization before
     norm computation; other norm orders retain the scaled reduction path.
 
@@ -190,6 +192,7 @@ def _clip_grad_norm_impl(
         error_if_nonfinite: Whether to raise for a non-finite global norm.
         foreach: Optional foreach implementation preference for clipping.
         pp_mesh: Optional pipeline mesh over which the scalar norm is reduced.
+        use_te: Opt into TE local L2 reduction. False preserves the native scaled reduction.
 
     Returns:
         Scalar tensor containing the pre-clipping global gradient norm.
@@ -251,7 +254,7 @@ def _clip_grad_norm_impl(
         # those per-grad (each full_tensor() is a same-shape collective, safe).
         has_partial = is_dtensor and any(isinstance(pl, Partial) for pl in first.placements)
 
-        if norm_type == 2.0 and not has_partial:
+        if use_te and norm_type == 2.0 and not has_partial:
             local_gradients = [
                 (p.grad.to_local() if isinstance(p.grad, DTensor) else p.grad).detach() for p in group_params
             ]
@@ -362,6 +365,7 @@ def clip_grad_norm(
     pp_axis_name: str | None = None,
     foreach: bool = True,
     use_torch_clip_grad_norm: bool = False,
+    use_te: bool = False,
 ) -> torch.Tensor | float:
     """Common gradient clipping helper.
 
@@ -383,6 +387,7 @@ def clip_grad_norm(
         pp_axis_name: Pipeline parallel axis name.
         foreach: Whether to use foreach implementation for clipping.
         use_torch_clip_grad_norm: Use PyTorch's optimized regular-tensor clipping path when possible.
+        use_te: Opt into TE local L2 reduction; takes precedence over the PyTorch fast path.
 
     Returns:
         Scalar tensor containing the total gradient norm, or 0.0 when clipping is disabled.
@@ -400,7 +405,7 @@ def clip_grad_norm(
         assert pp_axis_name is not None, "pp_axis_name must be provided when pp_enabled is True"
         pp_mesh = device_mesh[pp_axis_name] if device_mesh is not None else None
 
-    can_use_torch_clip = use_torch_clip_grad_norm and pp_mesh is None
+    can_use_torch_clip = use_torch_clip_grad_norm and not use_te and pp_mesh is None
     if can_use_torch_clip:
         for p in parameters:
             if (
@@ -428,6 +433,7 @@ def clip_grad_norm(
             error_if_nonfinite=False,
             foreach=foreach,
             pp_mesh=pp_mesh,
+            use_te=use_te,
         )
 
     return grad_norm
@@ -519,6 +525,7 @@ def scale_grads_and_clip_grad_norm(
     dp_group_size: int | None = None,
     expert_tp_replication_factor: int = 1,
     use_torch_clip_grad_norm: bool = False,
+    use_te: bool = False,
 ) -> torch.Tensor | float:
     """Scale gradients for PP/EP in a single pass, then clip.
 
@@ -528,6 +535,24 @@ def scale_grads_and_clip_grad_norm(
     - Owner-sharded scaling: divide each marked gradient by the explicit factor
       declared by its model-owned sharding contract.
     - Finally, perform grad clipping with PP/EP-aware reductions.
+
+    Args:
+        max_grad_norm: Maximum global gradient norm, or None to skip clipping.
+        model_parts: Model modules whose parameters have gradients of arbitrary shape.
+            Gradients retain their original local or DTensor layout and are scaled in place.
+        norm_type: Norm order.
+        pp_enabled: Whether pipeline-parallel normalization is required.
+        device_mesh: Training mesh used for gradient norm reductions.
+        moe_mesh: Expert-parallel mesh used to normalize expert gradients.
+        ep_axis_name: Expert axis in the parameter mesh.
+        pp_axis_name: Pipeline axis in the training mesh.
+        foreach: Whether to use foreach for in-place clipping.
+        num_label_tokens: Global supervised-token count for PP normalization.
+        dp_group_size: Data-parallel group size, including CP when configured.
+        expert_tp_replication_factor: Number of identical TP copies of expert tokens.
+        use_torch_clip_grad_norm: Prefer PyTorch's regular-tensor clipping fast path.
+        use_te: Opt into TE local L2 reduction, taking precedence over the PyTorch fast path.
+            False preserves the native scaled reduction.
 
     Returns:
         Scalar tensor containing the total gradient norm, or 0.0 when clipping is disabled.
@@ -599,6 +624,7 @@ def scale_grads_and_clip_grad_norm(
         pp_axis_name=pp_axis_name,
         foreach=foreach,
         use_torch_clip_grad_norm=use_torch_clip_grad_norm,
+        use_te=use_te,
     )
 
 
