@@ -292,7 +292,9 @@ class BailingMoeV2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
 
     # ``e_score_correction_bias`` must stay in fp32 even when the rest of the
     # model is bf16; tiny quantization errors in the bias change routing.
-    _keep_in_fp32_modules_strict = ["e_score_correction_bias"]
+    # The checkpoint-owned HF implementation names the same buffer expert_bias.
+    # Include that name for the checkpoint-parity harness's HF load contract.
+    _keep_in_fp32_modules_strict = ["e_score_correction_bias", "expert_bias"]
 
     # PP compatibility: our forward computes ``freqs_cis`` inline and threads it
     # through the decoder blocks (gpt_oss-style rotary convention).  The generic

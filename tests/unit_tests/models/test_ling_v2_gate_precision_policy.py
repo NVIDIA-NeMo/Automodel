@@ -27,6 +27,7 @@ Out. All four are pinned so a later shared-router change cannot silently move
 them back.
 """
 
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -40,6 +41,7 @@ from nemo_automodel.components.models.ling_v2.config import BailingMoeV2Config
 from nemo_automodel.components.models.ling_v2.model import BailingMoeV2ForCausalLM
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import Gate
+from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm import _keep_hf_modules_in_fp32
 
 # One construction path, so no class parametrization: BailingMoeV2ForCausalLM is
 # the only entry point and BailingMoeV2Model is the only inner model.
@@ -93,6 +95,34 @@ def test_ling_gate_precision_respects_explicit_override():
 
 def test_ling_declares_the_score_correction_bias_as_strict_fp32():
     assert "e_score_correction_bias" in BailingMoeV2ForCausalLM._keep_in_fp32_modules_strict
+
+
+def test_ling_hf_reference_preserves_expert_bias(tmp_path: Path) -> None:
+    """The HF checkpoint's expert_bias must survive the parity harness's BF16 load."""
+    from transformers import PretrainedConfig, PreTrainedModel
+
+    class TinyReferenceConfig(PretrainedConfig):
+        model_type = "ling-reference-dtype-test"
+
+    class TinyReference(PreTrainedModel):
+        config_class = TinyReferenceConfig
+
+        def __init__(self, config: TinyReferenceConfig) -> None:
+            super().__init__(config)
+            self.gate = nn.Linear(2, 2, bias=False)
+            self.gate.register_buffer("expert_bias", torch.tensor([0.200123, 0.201234]))
+            self.post_init()
+
+    reference = TinyReference(TinyReferenceConfig())
+    expected_bias = reference.gate.expert_bias.clone()
+    reference.save_pretrained(tmp_path)
+    hf_config = SimpleNamespace(architectures=["BailingMoeV2ForCausalLM"])
+    with _keep_hf_modules_in_fp32(hf_config):
+        loaded = TinyReference.from_pretrained(tmp_path, dtype=torch.bfloat16)
+
+    assert loaded.gate.weight.dtype is torch.bfloat16
+    assert loaded.gate.expert_bias.dtype is torch.float32
+    assert torch.equal(loaded.gate.expert_bias, expected_bias)
 
 
 # These cases construct for real, so a Gate exists and every stage can be
