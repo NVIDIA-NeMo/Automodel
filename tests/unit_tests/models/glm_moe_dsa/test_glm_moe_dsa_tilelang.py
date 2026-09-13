@@ -30,6 +30,10 @@ from nemo_automodel.components.models.glm_moe_dsa.layers import GlmMoeDsaIndexer
 from nemo_automodel.components.models.glm_moe_dsa.model import GlmMoeDsaForCausalLM
 from nemo_automodel.shared.import_utils import UnavailableError
 
+# Over the default 5s budget on purpose: TileLang compilation takes up to about 46s on a cold worker.
+# Reduce cold compiler startup before lowering this further.
+pytestmark = pytest.mark.timeout(120)
+
 # GLM-5.2 DSA kernel dims (kv_lora_rank + qk_rope_head_dim == 576 is hard-coded in the kernel).
 KV_LORA = 512
 ROPE = 64

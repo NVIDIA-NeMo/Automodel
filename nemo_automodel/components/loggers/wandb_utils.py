@@ -31,8 +31,16 @@ def init_wandb_run(wandb_cfg: dict, full_config: dict, default_name: str = ""):
     Returns:
         The initialized ``wandb.Run``.
     """
-    import wandb
-    from wandb import Settings
+    try:
+        import wandb
+        from wandb import Settings
+    except ImportError as e:
+        raise ImportError(
+            "wandb is not installed. To enable W&B experiment tracking, run:\n"
+            "  uv add nemo-automodel[wandb]\n"
+            "or to install all tracking backends:\n"
+            "  uv add nemo-automodel[tracking]"
+        ) from e
 
     kwargs = dict(wandb_cfg)
     if not kwargs.get("name"):

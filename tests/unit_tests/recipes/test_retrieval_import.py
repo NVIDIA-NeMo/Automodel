@@ -16,6 +16,12 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
+# Over the default 5s budget on purpose: this module launches a fresh interpreter, which re-imports torch from scratch.
+# Shrink the work or the process count before raising this further.
+pytestmark = pytest.mark.timeout(60)
+
 
 def test_retrieval_package_imports_without_wandb():
     probe = """
