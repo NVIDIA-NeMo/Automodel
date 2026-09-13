@@ -25,8 +25,8 @@
 # The 100-update schedule, learning rate, data, BF16 optimizer moments,
 # activation checkpointing and resharding match the full fine-tuning recipe.
 # Checkpoint saving/resume remains disabled and unvalidated for this variant.
-# Released FP8/FP4 weights are dequantized by DCP for BF16 base storage with
-# the model's FP32 exceptions. This is LoRA, without QLoRA weight storage.
+# Released FP8/FP4 weights are dequantized during DCP loading. This recipe
+# uses the existing expert LoRA implementation, without QLoRA weight storage.
 #
 # Launch all ranks in one verified NVLink domain. Supply a shared snapshot:
 #   --model.config.pretrained_model_name_or_path="$DS41_CHECKPOINT"
