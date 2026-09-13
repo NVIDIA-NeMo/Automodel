@@ -1610,28 +1610,8 @@ def main(config_path=None):
         config_path = pathlib.Path(__file__).parent.resolve() / "llama_3_2_1b_hellaswag.yaml"
     cfg = parse_args_and_load_config(config_path)
     trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
-    try:
-        trainer.setup()
-        trainer.run_train_validation_loop()
-    finally:
-        # Tear down the distributed process group so the process exits cleanly.
-        # Without this, NCCL/the elastic agent waits on the still-initialized
-        # group and the run hangs at shutdown after the final step.
-        _destroy_process_group_if_initialized()
-
-
-def _destroy_process_group_if_initialized() -> None:
-    """Best-effort barrier + ``destroy_process_group`` so ranks exit together."""
-    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
-        return
-    try:
-        torch.distributed.barrier()
-    except Exception as exc:  # a rank may have already exited; destroy anyway
-        logger.warning("Barrier before process-group teardown failed: %s", exc)
-    try:
-        torch.distributed.destroy_process_group()
-    except Exception as exc:
-        logger.warning("destroy_process_group failed during teardown: %s", exc)
+    trainer.setup()
+    trainer.run_train_validation_loop()
 
 
 if __name__ == "__main__":
