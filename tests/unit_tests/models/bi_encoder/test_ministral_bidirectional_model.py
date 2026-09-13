@@ -31,6 +31,10 @@ from nemo_automodel.components.models.ministral_bidirectional.model import (
     Ministral3BidirectionalModel,
 )
 
+# Over the default 5s budget on purpose: this module launches a fresh interpreter, which re-imports torch from scratch.
+# Shrink the work or the process count before raising this further.
+pytestmark = pytest.mark.timeout(60)
+
 
 def tiny_bidirectional_config() -> Ministral3BidirectionalConfig:
     cfg = Ministral3BidirectionalConfig(

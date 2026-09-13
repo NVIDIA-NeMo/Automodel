@@ -73,14 +73,13 @@ if [[ -n "$MEDIA_EXTRA" ]]; then
     uv pip install ".[$MEDIA_EXTRA]"
 fi
 
+# Default pytest capture reports module progress and includes stdout, stderr, and logs only for failed tests.
 coverage run \
     -m pytest \
     --durations 32 \
     --durations-min=0 \
     "${TEST_DIRS[@]}" \
-    -o log_cli=true \
-    -o log_cli_level=INFO \
-    -vs -m "not pleasefixme" --tb=short -rA \
+    -m "not pleasefixme" --tb=short -rfE \
     $SHARD_ARGS \
     $ADDITIONAL_ARGS
 coverage combine -q
