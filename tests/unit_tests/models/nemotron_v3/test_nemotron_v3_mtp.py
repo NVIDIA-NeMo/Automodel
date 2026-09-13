@@ -182,6 +182,12 @@ class TestRollTensor:
         rolled = roll_tensor(t, shifts=1, dim=-1)
         assert rolled.tolist() == [[0, 0, 1, 2, 3, 4, 5, 6]]
 
+    def test_shift_larger_than_dimension_zeros_everything(self):
+        t = torch.arange(3).unsqueeze(0)
+
+        assert roll_tensor(t, shifts=-8, dim=-1).tolist() == [[0, 0, 0]]
+        assert roll_tensor(t, shifts=8, dim=-1).tolist() == [[0, 0, 0]]
+
 
 class TestMTPConfig:
     def test_disabled_when_zero_layers(self):
