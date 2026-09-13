@@ -23,7 +23,7 @@
 # packed_sequence_size=32768). Documents retain their own positions and labels.
 # The model consumes the THD collator's [batch, sequence] tokens and document spans.
 #
-# Native sharded checkpoints permit continuation across 30-minute allocations.
+# Native sharded checkpoints permit continuation across one-hour allocations.
 # The cluster launcher sends SIGUSR1 to training ranks before the time limit;
 # StepScheduler saves at an optimizer boundary. Resume uses checkpoint.restore_from.
 # Keep the same data, batch size, seed and 100-step LR schedule on every segment.
@@ -175,4 +175,4 @@ wandb:
 ci:
   recipe_owner: huiyingl
   nodes: 16
-  time: "00:30:00"
+  time: "01:00:00"
