@@ -1367,32 +1367,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             total_loss = torch.tensor(0.0, dtype=torch.float32, device=self.dist_env.device)
             total_num_label_tokens = 0
 
-            # Keep every rank in lockstep over validation batches. The MoE expert
-            # forward issues collectives over the EP group; with uneven per-rank
-            # validation shard sizes, ranks would issue those collectives a
-            # different number of times and deadlock (observed at end-of-training
-            # validation on EP MoE models). Drive the loop by a global-MIN
-            # "does every rank still have a batch?" all-reduce so all ranks run
-            # exactly the same number of forwards (= global-min batch count).
-            # ``len(dataloader)`` is not relied upon (StatefulDataLoader may not
-            # define it).
-            dist_active = torch.distributed.is_available() and torch.distributed.is_initialized()
-            val_iter = iter(val_dataloader)
-            while True:
-                try:
-                    batch = next(val_iter)
-                    has_batch = 1
-                except StopIteration:
-                    batch = None
-                    has_batch = 0
-                if dist_active:
-                    flag = torch.tensor(has_batch, dtype=torch.long, device=self.dist_env.device)
-                    torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MIN)
-                    if int(flag.item()) == 0:
-                        break
-                elif has_batch == 0:
-                    break
-
+            for batch in val_dataloader:
                 loss_buffer = []
                 num_label_tokens = (batch["labels"] != -100).sum().item()
                 self._forward_backward_step(
