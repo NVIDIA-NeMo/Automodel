@@ -565,3 +565,54 @@ def test_compute_mrope_position_ids_passes_sample_mm_token_type_ids_through():
 
     assert pos.shape == (3, 4)
     assert captured["mm"].tolist() == [[0, 1, 1, 0]]
+
+
+class TestVariableResolutionImagePacking:
+    def test_mismatched_image_shapes_are_kept_as_per_image_list(self):
+        samples = [
+            {
+                "input_ids": torch.tensor([1, 2]),
+                "labels": torch.tensor([10, 20]),
+                "pixel_values": torch.randn(2, 3, 8, 8),  # two 8x8 images
+            },
+            {
+                "input_ids": torch.tensor([3]),
+                "labels": torch.tensor([30]),
+                "pixel_values": torch.randn(1, 3, 12, 4),  # one 12x4 image
+            },
+        ]
+        result = _build_packed_vlm_sample(samples, pack_size=4, padding_idx=0)
+
+        assert isinstance(result["pixel_values"], list)
+        assert [tuple(v.shape) for v in result["pixel_values"]] == [(3, 8, 8), (3, 8, 8), (3, 12, 4)]
+
+    @pytest.mark.parametrize("collater", ["neat_packed_vlm_collater", "packed_sequence_thd_vlm_collater"])
+    def test_variable_resolution_packs_reach_training_collater(self, collater):
+        """Packing and collation preserve image order, values, and token boundaries."""
+        from nemo_automodel.components.datasets.vlm import collate_fns
+
+        images = [torch.full((1, 3, 8, 8), 1.0), torch.full((1, 3, 12, 4), 2.0)]
+        samples = [
+            {"input_ids": torch.tensor([i + 1]), "labels": torch.tensor([i + 11]), "pixel_values": image}
+            for i, image in enumerate(images)
+        ]
+        ragged = _build_packed_vlm_sample(samples, pack_size=4, padding_idx=0)
+        uniform = _build_packed_vlm_sample(samples[:1], pack_size=4, padding_idx=0)
+
+        batch = getattr(collate_fns, collater)([ragged, uniform], padding_idx=0, max_length=4)
+
+        assert batch["input_ids"].tolist() == [[1, 2, 0, 0], [1, 0, 0, 0]]
+        assert batch["labels"].tolist() == [[11, 12, -100, -100], [11, -100, -100, -100]]
+        assert isinstance(batch["pixel_values"], list)
+        assert len(batch["pixel_values"]) == 3
+        for actual, expected in zip(batch["pixel_values"], [images[0][0], images[1][0], images[0][0]]):
+            torch.testing.assert_close(actual, expected.to(torch.bfloat16), rtol=0, atol=0)
+
+    def test_matching_image_shapes_still_concatenate(self):
+        samples = [
+            {"input_ids": torch.tensor([1]), "labels": torch.tensor([10]), "pixel_values": torch.randn(2, 3, 8, 8)},
+            {"input_ids": torch.tensor([2]), "labels": torch.tensor([20]), "pixel_values": torch.randn(1, 3, 8, 8)},
+        ]
+        result = _build_packed_vlm_sample(samples, pack_size=4, padding_idx=0)
+        assert isinstance(result["pixel_values"], torch.Tensor)
+        assert tuple(result["pixel_values"].shape) == (3, 3, 8, 8)

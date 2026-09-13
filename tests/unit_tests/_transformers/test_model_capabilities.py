@@ -230,6 +230,8 @@ def test_query_returns_canonical_type_for_static_class():
     assert caps.supports_cp is False
     assert caps.supports_ep is False
     assert caps.supports_thd is True
+    assert caps.supports_mtp_cp is False
+    assert caps.supports_mtp_cp_pp is False
     assert caps.supports_cp_vision_frame_sharding is False
 
 
