@@ -26,6 +26,9 @@ class StateDictAdapter(ABC):
 
     This class defines the interface for converting between native model
     state dict format and other model state dict formats.
+
+    Most custom models need an adapter. Models whose HF weight names and tensor
+    layouts already match can omit it.
     """
 
     _supports_low_memory_dcp_load: bool = False
@@ -103,7 +106,7 @@ class StateDictAdapter(ABC):
         }
         return list(self.to_hf(shape_only_state, exclude_key_regex=r".*_extra_state.*", quantization=False))
 
-    def map_peft_target_module_to_hf(self, name: str) -> str:
+    def map_peft_target_module_to_hf(self, name: str, *, v4_compatible: bool = False) -> str:
         """Translate a PEFT target-module name to the HuggingFace layout.
 
         adapter_config.json's target_modules are collected from native module
@@ -114,6 +117,7 @@ class StateDictAdapter(ABC):
 
         Args:
             name: A target-module name in native layout.
+            v4_compatible: Whether to target the legacy Transformers v4 layout.
 
         Returns:
             The name in HuggingFace layout. Defaults to the name unchanged.
