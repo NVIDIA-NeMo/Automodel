@@ -45,8 +45,6 @@ from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM, Qwen3ForS
 from nemo_automodel.components.models.baichuan.model import BaichuanForCausalLM
 from nemo_automodel.components.models.llama.model import LlamaForCausalLM as CustomLlamaForCausalLM
 from nemo_automodel.components.models.mistral3_vlm.model import Mistral3FP8VLMForConditionalGeneration
-from nemo_automodel.components.models.qwen2.model import Qwen2ForCausalLM as CustomQwen2ForCausalLM
-from nemo_automodel.components.models.qwen3.model import Qwen3ForCausalLM as CustomQwen3ForCausalLM
 
 if TYPE_CHECKING:
     from nemo_automodel.components.models.mistral3.model import Ministral3ForCausalLM
@@ -754,8 +752,9 @@ PARALLELIZE_FUNCTIONS: Dict[str, Callable[..., Dict[str, ParallelStyle]]] = {
     _get_class_qualname(PhiForCausalLM): _parallelize_phi,
     _get_class_qualname(Phi3ForCausalLM): _parallelize_phi3,
     _get_class_qualname(CustomLlamaForCausalLM): _parallelize_llama,
-    _get_class_qualname(CustomQwen2ForCausalLM): _parallelize_qwen,
-    _get_class_qualname(CustomQwen3ForCausalLM): _parallelize_qwen,
+    # Register native Qwen classes without importing their checkpoint adapters into the distributed component.
+    "nemo_automodel.components.models.qwen2.model.Qwen2ForCausalLM": _parallelize_qwen,
+    "nemo_automodel.components.models.qwen3.model.Qwen3ForCausalLM": _parallelize_qwen,
     # trust_remote_code models — matched by bare class __name__ in parallelizer
     # because their qualname includes a snapshot-hash-bearing module path.
     "NemotronFlashForCausalLM": _parallelize_llama,

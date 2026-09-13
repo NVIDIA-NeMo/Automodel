@@ -45,6 +45,10 @@ from nemo_automodel.components.datasets.llm import retrieval_dataset_normalized 
 from tools.retrieval import prepare_normalized_vl_retrieval_data as prep_norm
 from tools.retrieval import warm_retrieval_hf_cache as warm
 
+# Over the default 5s budget on purpose: this module launches a fresh interpreter, which re-imports torch from scratch.
+# Shrink the work or the process count before raising this further.
+pytestmark = pytest.mark.timeout(60)
+
 
 class _DummyImage:
     size = (2, 2)

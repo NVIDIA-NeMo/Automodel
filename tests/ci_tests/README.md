@@ -154,6 +154,15 @@ harness fails with an actionable error instead of repeating content if a request
 document. Pipeline-parallel runs resize their stage activation buffers to the configured parity length; reduce the
 length only when a model has a documented memory limit.
 
+Parity forwards through AutoModel's shared `FlexAttention` wrapper use static compilation and fixed 64-by-64
+query/key tiles. A separate compiler entry point keeps training's recompilations out of the parity cache budget;
+full-graph compilation raises instead of silently falling back to unfused attention. The trained reference and
+reloaded model therefore use the same attention policy even when training has generalized shapes or autotuned
+different kernels. This temporary override also applies to AutoModel
+source-parity forwards and is restored afterward; training, native resume, other attention backends, and vanilla-HF
+attention retain their normal execution. It improves reload consistency without guaranteeing bitwise equality
+across different topologies or closer agreement with HF. Existing numerical thresholds still apply.
+
 For a diagnosed cross-framework instability, `cross_framework_gate_sequence_length` can gate Phases 0 and 3 on a
 prefix of the same long forward. It does not launch a shorter forward: the harness still runs and reports all
 `parity_sequence_length` tokens, while mean KL, p95 KL, and cosine use the configured prefix for pass/fail. Phase 2,
