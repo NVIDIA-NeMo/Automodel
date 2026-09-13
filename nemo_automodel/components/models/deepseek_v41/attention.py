@@ -582,13 +582,6 @@ class DeepseekV41Attention(nn.Module):
         query = _apply_rope(self.wq_b(query_latent).unflatten(-1, (self.num_heads, self.head_dim)), angles)
         kv = quantize_cache(_apply_rope(self.kv_norm(self.wkv(hidden_states)), angles), format="fp8", block_size=32)
         kv = gather_sequence(kv, cp_group)
-        key_positions = torch.arange(global_sequence, device=positions.device)
-        local_allowed = (key_positions.unsqueeze(0) <= positions.unsqueeze(1)) & (
-            key_positions.unsqueeze(0) > positions.unsqueeze(1) - self.window_size
-        )
-        allowed = local_allowed.unsqueeze(0) & global_valid.unsqueeze(1)
-        if packed_seq_ids is not None:
-            allowed = allowed & (packed_seq_ids.unsqueeze(-1) == global_seq_ids.unsqueeze(1))
         next_state = state
         if self.compress_ratio:
             width = global_sequence // self.compress_ratio
@@ -637,12 +630,6 @@ class DeepseekV41Attention(nn.Module):
                 sequence,
             ):
                 raise ValueError("CSA2 state belongs to a different batch or sequence")
-            # A separate sentinel column makes -1 masking safe when valid index 0
-            # also occurs in the row; boolean scatter must never overwrite it.
-            compressed_allowed = torch.zeros(batch, sequence, width + 1, dtype=torch.bool, device=hidden_states.device)
-            indices = next_state.topk_indices
-            compressed_allowed = compressed_allowed.scatter(-1, torch.where(indices >= 0, indices, width), True)
-            allowed = torch.cat((allowed, compressed_allowed[..., :width]), dim=-1)
             kv = torch.cat((kv, next_state.compressed_kv), dim=1)
         if self.backend.attn == "tilelang":
             # Preserve the released sparse slot order and reuse V4's trainable
@@ -673,6 +660,21 @@ class DeepseekV41Attention(nn.Module):
                 reference_rounding=True,
             )
             return DeepseekV41AttentionOutput(self._project_output(attended, angles, valid_tokens), next_state)
+        # Dense masks are needed only by the eager/SDPA fallback; TileLang uses sparse indices.
+        key_positions = torch.arange(global_sequence, device=positions.device)
+        local_allowed = (key_positions.unsqueeze(0) <= positions.unsqueeze(1)) & (
+            key_positions.unsqueeze(0) > positions.unsqueeze(1) - self.window_size
+        )
+        allowed = local_allowed.unsqueeze(0) & global_valid.unsqueeze(1)
+        if packed_seq_ids is not None:
+            allowed = allowed & (packed_seq_ids.unsqueeze(-1) == global_seq_ids.unsqueeze(1))
+        if self.compress_ratio:
+            # A separate sentinel column makes -1 masking safe when valid index 0
+            # also occurs in the row; boolean scatter must never overwrite it.
+            compressed_allowed = torch.zeros(batch, sequence, width + 1, dtype=torch.bool, device=hidden_states.device)
+            indices = next_state.topk_indices
+            compressed_allowed = compressed_allowed.scatter(-1, torch.where(indices >= 0, indices, width), True)
+            allowed = torch.cat((allowed, compressed_allowed[..., :width]), dim=-1)
         # A zero-valued extra key contributes exp(attn_sink) only to the softmax
         # denominator. It keeps fully padded query rows numerically well-defined.
         kv = torch.cat((kv, kv.new_zeros(batch, 1, self.head_dim)), dim=1)
