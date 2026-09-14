@@ -33,6 +33,7 @@ from types import SimpleNamespace
 import torch
 import torch.distributed as dist
 from huggingface_hub import constants as hf_constants
+from torch.distributed.device_mesh import init_device_mesh
 from torch.nn.parallel import DistributedDataParallel
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from transformers import AutoConfig, PretrainedConfig
@@ -1152,23 +1153,23 @@ class TrainDSparkRecipe(BaseRecipe):
                 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 
                 mp_policy = MixedPrecisionPolicy(param_dtype=self.compute_dtype, reduce_dtype=torch.float32)
-                # Shard over "dp" (not the world) under CP so the draft stays replicated
-                # across cp ranks; without a mesh (cp_size=1) this is the world default.
-                shard_kwargs = {"mp_policy": mp_policy}
-                if self.dp_mesh is not None:
-                    shard_kwargs["mesh"] = self.dp_mesh
+                # CP keeps the draft replicated across CP ranks. Otherwise use a
+                # named WORLD mesh so checkpoint adapters can resolve FSDP shards.
+                draft_mesh = self.dp_mesh
+                if draft_mesh is None:
+                    draft_mesh = init_device_mesh(self.device.type, (self.dist_env.world_size,), mesh_dim_names=("dp",))
                 fp32_compute_module_names = tuple(
                     getattr(trainer_module.draft_model, "_keep_in_fp32_modules_strict", ())
                 )
                 for layer in trainer_module.draft_model.layers:
                     fully_shard_by_dtype(
                         layer,
-                        mesh=self.dp_mesh,
+                        mesh=draft_mesh,
                         mp_policy=mp_policy,
                         offload_policy=None,
                         fp32_compute_module_names=fp32_compute_module_names,
                     )
-                fully_shard(trainer_module, **shard_kwargs)
+                fully_shard(trainer_module, mesh=draft_mesh, mp_policy=mp_policy)
             elif strategy == "ddp":
                 trainer_module = DistributedDataParallel(
                     trainer_module,

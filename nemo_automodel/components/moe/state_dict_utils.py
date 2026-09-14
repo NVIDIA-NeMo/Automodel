@@ -41,9 +41,7 @@ def _get_expert_mesh_dim_index(dtensor: DTensor) -> int | None:
     Returns:
         Index of the expert-partitioning mesh dimension, or ``None`` when every rank retains all experts.
     """
-    # ``fully_shard`` without an explicit mesh builds a default mesh that carries no
-    # dimension names; the CP-free DSpark draft is sharded that way.
-    mesh_dim_names = tuple(dtensor.device_mesh.mesh_dim_names or ())
+    mesh_dim_names = tuple(dtensor.device_mesh.mesh_dim_names)
     if "ep" in mesh_dim_names:
         return mesh_dim_names.index("ep")
 
@@ -87,18 +85,8 @@ def get_expert_slice_for_rank(experts_tensor: torch.Tensor, n_experts: int) -> t
     if expert_mesh_dim_idx is None:
         return local_tensor, 0, n_experts
 
-    if device_mesh.mesh_dim_names is None:
-        # An unnamed mesh cannot be sliced by name. The default ``fully_shard`` mesh is
-        # one-dimensional, so the whole mesh is the expert partition.
-        if device_mesh.ndim != 1:
-            raise ValueError(
-                "Cannot locate the expert partition on an unnamed multi-dimensional device mesh; "
-                f"got ndim={device_mesh.ndim}."
-            )
-        expert_mesh = device_mesh
-    else:
-        expert_mesh_dim_name = device_mesh.mesh_dim_names[expert_mesh_dim_idx]
-        expert_mesh = get_submesh(device_mesh, (expert_mesh_dim_name,))
+    expert_mesh_dim_name = device_mesh.mesh_dim_names[expert_mesh_dim_idx]
+    expert_mesh = get_submesh(device_mesh, (expert_mesh_dim_name,))
     placement = dtensor.placements[expert_mesh_dim_idx]
     if isinstance(placement, Shard) and placement.dim == 0:
         # Tensor is sharded along expert dimension
@@ -160,9 +148,7 @@ def split_experts_weights_dtensor_aware(weight: torch.Tensor, n_experts: int) ->
     if is_weight_dtensor:
         device_mesh = weight.device_mesh
         original_placements = weight.placements
-        # The default ``fully_shard`` mesh has no dimension names; with nothing left to
-        # keep a DTensor on, the per-expert slices below fall back to plain tensors.
-        mesh_dim_names = list(weight.device_mesh.mesh_dim_names or ())
+        mesh_dim_names = list(weight.device_mesh.mesh_dim_names)
 
         # Remove the mesh dimension that partitions experts. With EP disabled, this may be an FSDP dimension.
         expert_mesh_dim_idx = _get_expert_mesh_dim_index(weight)

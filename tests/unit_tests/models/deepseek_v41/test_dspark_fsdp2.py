@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import socket
+from pathlib import Path
 
 import pytest
 import torch
@@ -25,7 +26,9 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
+from torch.distributed.tensor import DTensor
 
+from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 from nemo_automodel.components.distributed.activation_checkpointing import apply_submodule_checkpointing
 from nemo_automodel.components.distributed.parallelizer_utils import fully_shard_by_dtype
 from nemo_automodel.components.models.common import BackendConfig
@@ -90,7 +93,7 @@ def _fully_shard_model(model: DeepseekV41DSparkModel, mesh: DeviceMesh, dtype: t
     fully_shard(model, mesh=mesh, mp_policy=policy)
 
 
-def _worker(rank: int, port: int, activation_checkpointing: bool) -> None:
+def _worker(rank: int, port: int, activation_checkpointing: bool, checkpoint_dir: str) -> None:
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
     dist.init_process_group("gloo", rank=rank, world_size=_WORLD_SIZE)
@@ -119,19 +122,54 @@ def _worker(rank: int, port: int, activation_checkpointing: bool) -> None:
         assert model.mtp[0].main_proj.weight.grad is not None
         assert model.mtp[-1].markov_head.head.weight.grad is not None
         assert model.mtp[-1].confidence_head.proj.weight.grad is not None
+        torch.optim.SGD(model.parameters(), lr=0.01).step()
+
+        # Exercise the real HF/DCP save and resume path, including rank-local
+        # expert splitting on the named, EP-free FSDP mesh.
+        expert_weight = model.mtp[0].ffn.experts.gate_and_up_projs
+        assert isinstance(expert_weight, DTensor)
+        assert expert_weight.device_mesh.mesh_dim_names == ("dp",)
+        expected = {
+            key: (value.to_local() if isinstance(value, DTensor) else value).clone()
+            for key, value in model.state_dict().items()
+        }
+        checkpointer = Checkpointer(
+            CheckpointingConfig(
+                checkpoint_dir=checkpoint_dir,
+                model_save_format="safetensors",
+                save_consolidated=False,
+                model_cache_dir=str(Path(checkpoint_dir) / "cache"),
+                model_repo_id="test/deepseek-v41-dspark",
+            ),
+            dp_rank=rank,
+            tp_rank=0,
+            pp_rank=0,
+            process_group=dist.group.WORLD,
+        )
+        try:
+            trained = Path(checkpoint_dir) / "trained"
+            checkpointer.save_model(model, str(trained))
+            for value in model.state_dict().values():
+                (value.to_local() if isinstance(value, DTensor) else value).zero_()
+            checkpointer.load_model(model, str(trained / "model"))
+            for key, value in model.state_dict().items():
+                local_value = value.to_local() if isinstance(value, DTensor) else value
+                torch.testing.assert_close(local_value, expected[key], rtol=0, atol=0)
+        finally:
+            checkpointer.close()
         dist.barrier()
     finally:
         dist.destroy_process_group()
 
 
 @pytest.mark.parametrize("activation_checkpointing", [False, True])
-def test_bf16_dspark_fsdp_forward_backward(
-    monkeypatch: pytest.MonkeyPatch, activation_checkpointing: bool
+def test_bf16_dspark_fsdp_forward_backward_checkpoint_roundtrip(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, activation_checkpointing: bool
 ) -> None:
     # Other unit-test modules disable compilation during collection. Spawned workers
     # import the fullgraph MoE activation afresh, so explicitly enable its compiler.
     monkeypatch.setenv("TORCH_COMPILE_DISABLE", "0")
-    mp.spawn(_worker, args=(_free_port(), activation_checkpointing), nprocs=_WORLD_SIZE, join=True)
+    mp.spawn(_worker, args=(_free_port(), activation_checkpointing, str(tmp_path)), nprocs=_WORLD_SIZE, join=True)
 
 
 def _parity_worker(rank: int, port: int) -> None:
