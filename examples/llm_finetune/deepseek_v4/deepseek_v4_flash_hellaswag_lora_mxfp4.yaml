@@ -164,3 +164,9 @@ optimizer:
   store_param_remainders: true
   exp_avg_dtype: torch.float32
   exp_avg_sq_dtype: torch.float32
+
+ci:
+  # EP8 fits one CI node with 8 H100 GPUs.
+  recipe_owner: excepshenal
+  nodes: 1
+  time: "00:30:00"

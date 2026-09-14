@@ -184,3 +184,9 @@ wandb:
   group: pr-2548
   tags: [deepseek-v4-flash, mxfp4, lora, hybridep, te-fusedadam]
   mode: online
+
+ci:
+  # EP8 fits one CI node with 8 H100 GPUs.
+  recipe_owner: excepshenal
+  nodes: 1
+  time: "00:30:00"
