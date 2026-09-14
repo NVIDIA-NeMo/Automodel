@@ -72,6 +72,7 @@ are reduced across data-parallel ranks and written to
 | `mask_token_id` | reserved token id filling non-anchor block positions |
 | `markov_rank` / `markov_head_type` | serial head size and variant (`vanilla` / `gated` / `rnn`) |
 | `confidence_head_alpha` / `confidence_head_with_markov` | confidence-head weight and conditioning |
+| `confidence_head_stop_gradient` | DeepSeek V4.1 only: train the confidence head on detached inputs so its loss cannot back-propagate into the draft backbone (default `false`) |
 
 ## DeepSeek V4.1 Flash
 

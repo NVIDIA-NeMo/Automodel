@@ -1034,6 +1034,7 @@ class TrainDSparkRecipe(BaseRecipe):
                 markov_head_type=str(recipe_cfg.get("markov_head_type", "vanilla")),
                 confidence_head_alpha=confidence_head_alpha,
                 confidence_head_with_markov=bool(recipe_cfg.get("confidence_head_with_markov", True)),
+                confidence_head_stop_gradient=bool(recipe_cfg.get("confidence_head_stop_gradient", False)),
             )
             draft_model = target_config.build_dspark_draft(margs)
         elif (

@@ -256,6 +256,43 @@ def test_cache_free_backbone_forward_and_backward() -> None:
     assert model.mtp[0].ffn.experts.gate_and_up_projs.grad is not None
 
 
+@pytest.mark.parametrize("stop_gradient", [False, True])
+def test_confidence_head_stop_gradient_isolates_the_backbone(stop_gradient: bool) -> None:
+    """With stop_gradient the confidence loss trains only the head; without it, it reaches the backbone."""
+    torch.manual_seed(19)
+    model = _model()
+    draft_sequence = 5
+    noise_embeddings = torch.randn(1, draft_sequence, 16, requires_grad=True)
+    target_hidden_states = torch.randn(1, 6, 32)
+    position_ids = torch.tensor([[0, 1, 2, 3, 4, 5, 2, 3, 4, 5, 6]])
+    attention_mask = torch.zeros(1, 1, draft_sequence, 11)
+    previous_token_ids = torch.tensor([[1, 2, 3, 4, 5]])
+
+    output = model(
+        noise_embeddings,
+        target_hidden_states,
+        position_ids=position_ids,
+        attention_mask=attention_mask,
+        previous_token_ids=previous_token_ids,
+        confidence_head_stop_gradient=stop_gradient,
+    )
+    assert output.confidence_pred is not None
+    output.confidence_pred.square().mean().backward()
+
+    final = model.mtp[-1]
+    assert final.confidence_head.proj.weight.grad is not None
+    backbone_grads = [
+        noise_embeddings.grad,
+        model.mtp[0].main_proj.weight.grad,
+        model.mtp[0].ffn.experts.gate_and_up_projs.grad,
+        final.markov_head.embed.weight.grad,
+    ]
+    if stop_gradient:
+        assert all(grad is None for grad in backbone_grads)
+    else:
+        assert all(grad is not None for grad in backbone_grads)
+
+
 def test_sdpa_matches_eager_attention() -> None:
     torch.manual_seed(23)
     eager = _model("eager").eval()

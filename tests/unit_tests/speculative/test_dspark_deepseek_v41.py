@@ -72,9 +72,18 @@ def _args(**overrides) -> _Args:
         "markov_head_type": "vanilla",
         "confidence_head_alpha": 1.0,
         "confidence_head_with_markov": True,
+        "confidence_head_stop_gradient": False,
     }
     values.update(overrides)
     return _Args(values)
+
+
+def test_builder_forwards_confidence_head_stop_gradient() -> None:
+    config = _target_config()
+    assert config.build_dspark_draft(_args()).confidence_head_stop_gradient is False
+    model = config.build_dspark_draft(_args(confidence_head_stop_gradient=True))
+    assert model.confidence_head_stop_gradient is True
+    assert model.mtp[-1].confidence_head.proj.weight.requires_grad
 
 
 def test_builder_preserves_released_native_contract() -> None:

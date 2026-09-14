@@ -260,6 +260,7 @@ class _DeepseekV41DSparkBlock(nn.Module):
         attention_mask: torch.Tensor,
         previous_token_ids: torch.Tensor | None = None,
         enable_confidence_head: bool = True,
+        confidence_head_stop_gradient: bool = False,
     ) -> _DeepseekV41DSparkStageOutput:
         """Apply one native DSpark stage.
 
@@ -273,6 +274,8 @@ class _DeepseekV41DSparkBlock(nn.Module):
             previous_token_ids: Optional integer tensor of shape [batch,
                 draft_sequence] used by the final Markov head.
             enable_confidence_head: Whether the final stage computes confidence.
+            confidence_head_stop_gradient: Whether the confidence head reads
+                detached inputs, so its loss trains only ``confidence_head``.
 
         Returns:
             Stage state containing updated streams, target features, and any
@@ -306,7 +309,13 @@ class _DeepseekV41DSparkBlock(nn.Module):
         if previous_token_ids is not None:
             transition_logits, markov_embeddings = self.markov_head(previous_token_ids)
             if enable_confidence_head:
-                confidence_pred = self.confidence_head(hidden_states, markov_embeddings)
+                # The released head reads the raw collapsed residual stream (no norm), so an
+                # unbounded activation can turn the BCE gradient into a spike that reaches the
+                # backbone. Detaching keeps the served input unchanged and trains only the head.
+                confidence_inputs = (hidden_states, markov_embeddings)
+                if confidence_head_stop_gradient:
+                    confidence_inputs = (hidden_states.detach(), markov_embeddings.detach())
+                confidence_pred = self.confidence_head(*confidence_inputs)
         return _DeepseekV41DSparkStageOutput(
             streams,
             ffn_mix.pre,
@@ -470,6 +479,7 @@ class DeepseekV41DSparkBackbone(nn.Module):
         attention_mask: torch.Tensor,
         previous_token_ids: torch.Tensor | None = None,
         enable_confidence_head: bool = True,
+        confidence_head_stop_gradient: bool = False,
     ) -> DeepseekV41DSparkBackboneOutput:
         """Run the cache-free draft backbone for sampled anchors.
 
@@ -485,6 +495,8 @@ class DeepseekV41DSparkBackbone(nn.Module):
             previous_token_ids: Optional integer tensor of shape [batch,
                 draft_sequence] used by the final Markov head.
             enable_confidence_head: Whether the final stage computes confidence.
+            confidence_head_stop_gradient: Whether the confidence head reads
+                detached inputs.
 
         Returns:
             Draft backbone output containing normalized states of shape [batch,
@@ -509,6 +521,7 @@ class DeepseekV41DSparkBackbone(nn.Module):
                 attention_mask=attention_mask,
                 previous_token_ids=previous_token_ids,
                 enable_confidence_head=enable_confidence_head,
+                confidence_head_stop_gradient=confidence_head_stop_gradient,
             )
             hidden_states = stage_output.streams
             pre_mix = stage_output.pre_mix
@@ -541,6 +554,7 @@ class DeepseekV41DSparkModel(DeepseekV41DSparkBackbone):
         *,
         num_anchors: int,
         enable_confidence_head: bool,
+        confidence_head_stop_gradient: bool = False,
     ) -> None:
         backend = backend or BackendConfig(
             attn="sdpa",
@@ -562,6 +576,7 @@ class DeepseekV41DSparkModel(DeepseekV41DSparkBackbone):
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False, dtype=dtype)
         self.num_anchors = int(num_anchors)
         self.enable_confidence_head = bool(enable_confidence_head)
+        self.confidence_head_stop_gradient = bool(confidence_head_stop_gradient)
         if self.num_anchors <= 0:
             raise ValueError("num_anchors must be positive")
         if not self.enable_confidence_head:
@@ -687,6 +702,7 @@ class DeepseekV41DSparkModel(DeepseekV41DSparkBackbone):
             attention_mask=attention_mask,
             previous_token_ids=previous_token_ids.reshape(batch, -1),
             enable_confidence_head=self.enable_confidence_head,
+            confidence_head_stop_gradient=self.confidence_head_stop_gradient,
         )
 
         normalized = backbone_output.normalized_hidden_states.reshape(batch, num_blocks, block_size, -1)

@@ -39,6 +39,7 @@ class _DSparkDraftOptions(Protocol):
     markov_head_type: str
     confidence_head_alpha: float
     confidence_head_with_markov: bool
+    confidence_head_stop_gradient: bool
 
 
 class DeepseekV41TextConfig(PretrainedConfig):
@@ -470,6 +471,7 @@ class DeepseekV41Config(PretrainedConfig):
             markov_head_type=str(options.markov_head_type),
             confidence_head_alpha=float(options.confidence_head_alpha),
             confidence_head_with_markov=bool(options.confidence_head_with_markov),
+            confidence_head_stop_gradient=bool(options.confidence_head_stop_gradient),
             quantization_config=copy.deepcopy(getattr(self, "quantization_config", None)),
         ).build()
 
@@ -488,6 +490,7 @@ class DeepseekV41DSparkConfig:
     markov_head_type: str
     confidence_head_alpha: float
     confidence_head_with_markov: bool
+    confidence_head_stop_gradient: bool = False
     quantization_config: dict[str, Any] | None = None
 
     def build(self) -> DeepseekV41DSparkModel:
@@ -538,4 +541,5 @@ class DeepseekV41DSparkConfig:
             draft_config,
             num_anchors=self.num_anchors,
             enable_confidence_head=self.confidence_head_alpha > 0,
+            confidence_head_stop_gradient=self.confidence_head_stop_gradient,
         )
