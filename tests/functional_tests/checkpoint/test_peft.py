@@ -235,8 +235,8 @@ def get_test_hf_peft_checkpoint_expected_keys():
 @pytest.mark.parametrize(
     "force_hf,use_triton",
     [
-        (pytest.param(True, id="force_hf"), pytest.param(False, id="no_force_hf")),
-        (pytest.param(False, id="no_force_hf"), pytest.param(False, id="no_use_triton")),
+        pytest.param(True, False, id="force_hf-no_use_triton"),
+        pytest.param(False, False, id="no_force_hf-no_use_triton"),
     ],
 )
 def test_hf_peft_checkpoint(force_hf, use_triton):
@@ -269,6 +269,7 @@ def test_hf_peft_checkpoint(force_hf, use_triton):
         "dropout": 0.0,
         "dropout_position": "post",
         "exclude_modules": [],
+        "expert_weight_format": "bf16",
         "lora_A_init": "xavier",
         "lora_dtype": None,
         "match_all_linear": True,
