@@ -3110,13 +3110,15 @@ class TestNeatPackedVlmCollaterAttnImpl:
             sample["image_grid_thw"] = torch.tensor([[1, 2, 2]] * n_images)
         return sample
 
-    def test_flash_attention_2_returns_2d_mask(self):
+    def test_flash_attention_2_emits_varlen_kwargs_instead_of_mask(self):
         from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
 
         batch = [self._make_packed_sample(16, 0), self._make_packed_sample(12, 0)]
         result = neat_packed_vlm_collater(batch, attn_implementation="flash_attention_2")
-        # Flash attention keeps the 2D indexed mask
-        assert result["attention_mask"].ndim == 2
+        # Dropping the mask is what routes HF to flash_attn_varlen_func; the cumulative
+        # boundaries themselves are checked in test_neat_packing_vlm.py.
+        assert "attention_mask" not in result
+        assert "cu_seq_lens_q" in result
 
     def test_sdpa_returns_4d_mask(self):
         from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
