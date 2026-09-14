@@ -36,6 +36,7 @@ from transformers.configuration_utils import PretrainedConfig
 from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 from transformers.models.llava.modeling_llava import LlavaCausalLMOutputWithPast
 
+from nemo_automodel.components.distributed.parallel_spec import ParallelSpec
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 
@@ -891,6 +892,12 @@ class KimiK25VLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDP
     """KimiK25VL model with backend-aware DeepseekV3 language model."""
 
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+    parallel_spec: ParallelSpec = ParallelSpec(
+        layer_groups={
+            "language": ("model.language_model.layers",),
+            "vision": ("model.vision_tower.encoder.blocks",),
+        }
+    )
 
     # RoPE freqs/inv_freq must stay fp32: from_pretrained casts the model to bf16 and
     # nn.Module.to rounds floating buffers; routing through cast_model_to_dtype restores

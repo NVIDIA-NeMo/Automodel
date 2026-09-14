@@ -18,6 +18,8 @@ import torch
 from torch import nn
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 
+from nemo_automodel.components.distributed.parallelizer import DefaultParallelizationStrategy
+
 _DSV4_CLASS_NAMES = {
     "DeepseekV4ForCausalLM",
     "DeepseekV4Model",
@@ -282,3 +284,16 @@ def fully_shard_deepseek_v4(module: nn.Module, mesh, mp_policy, offload_policy=N
         fp32_policy=False,
         **parent_kwargs,
     )
+
+
+class DeepseekV4ParallelizationStrategy(DefaultParallelizationStrategy):
+    """DeepSeek-V4 keeps a small set of reference-sensitive parameters in fp32."""
+
+    def parallelize(self, model, device_mesh, dp_shard_cp_mesh_name="dp_shard_cp", **kwargs):
+        return super().parallelize(
+            model,
+            device_mesh,
+            dp_shard_cp_mesh_name=dp_shard_cp_mesh_name,
+            fully_shard_fn=fully_shard_deepseek_v4,
+            **kwargs,
+        )

@@ -23,6 +23,7 @@ from transformers.generation import GenerationConfig, GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel._transformers.model_capabilities import ModelCapabilities
+from nemo_automodel.components.distributed.parallel_spec import ParallelSpec
 from nemo_automodel.components.models.common import (
     BackendConfig,
     HFCheckpointingMixin,
@@ -44,6 +45,7 @@ from nemo_automodel.components.models.nemotron_v3.mtp import (
     build_mtp_config_from_hf,
     build_nemotron_v3_mtp,
 )
+from nemo_automodel.components.models.nemotron_v3.parallelization import NEMOTRON_H_PARALLEL_SPEC
 from nemo_automodel.components.models.nemotron_v3.state_dict_adapter import NemotronV3StateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
@@ -308,6 +310,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
     """
 
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+    parallel_spec: ParallelSpec = NEMOTRON_H_PARALLEL_SPEC
 
     # Hybrid Mamba2/Attention uses NemotronHybridCache, not DynamicCache.
     _is_stateful: bool = True

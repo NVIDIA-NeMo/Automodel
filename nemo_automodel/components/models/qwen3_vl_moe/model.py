@@ -30,6 +30,7 @@ from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
     Qwen3VLMoeVisionRotaryEmbedding,
 )
 
+from nemo_automodel.components.distributed.parallel_spec import ParallelSpec
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module, initialize_rms_norm_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import (
@@ -457,6 +458,9 @@ class Qwen3VLMoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLMoeForCo
     """Qwen3-VL conditional generation model using the Qwen3-MoE backend components."""
 
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+    parallel_spec: ParallelSpec = ParallelSpec(
+        layer_groups={"language": ("model.language_model.layers",), "vision": ("model.visual.blocks",)}
+    )
 
     # forward() pulls per-microbatch pixel_values from _vlm_pixel_values_chunks;
     # patch_hf_model_for_pp must not replace it under PP.

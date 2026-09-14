@@ -26,6 +26,8 @@ from transformers.models.siglip.configuration_siglip import SiglipVisionConfig
 from transformers.models.siglip.modeling_siglip import SiglipVisionModel
 from transformers.utils import logging
 
+from nemo_automodel.components.distributed.parallel_spec import ParallelSpec
+
 logger = logging.get_logger(__name__)
 
 # ============================================================================
@@ -384,6 +386,16 @@ class LlamaNemotronVLModel(PreTrainedModel):
     Combines a vision encoder (SigLIP) with a bidirectional language model (LLaMA)
     for cross-modal reranking tasks.
     """
+
+    parallel_spec: ParallelSpec = ParallelSpec(
+        layer_groups={
+            "language": ("language_model.layers",),
+            "vision": (
+                "vision_model.vision_model.encoder.layers",
+                "vision_model.encoder.layers",
+            ),
+        }
+    )
 
     @dataclass(frozen=True)
     class ModelCapabilities:

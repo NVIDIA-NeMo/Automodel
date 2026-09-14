@@ -43,6 +43,8 @@ from transformers.models.mistral3.modeling_mistral3 import (
     Mistral3ForConditionalGeneration as _HFMistral3ForConditionalGeneration,
 )
 
+from nemo_automodel._transformers.hf_parallel_specs import MISTRAL3_VLM_PARALLEL_SPEC
+from nemo_automodel.components.distributed.parallel_spec import ParallelSpec
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -122,6 +124,8 @@ class Mistral3FP8VLMForConditionalGeneration(_HFMistral3ForConditionalGeneration
     # the from_pretrained flip guard, not at construction.
     tie_word_embeddings_support: TieSupport = TieSupport.BOTH
     _tied_weights_keys = {"lm_head.weight": "model.language_model.embed_tokens.weight"}
+    # Same tree as the transformers Mistral3 VLM, whose plan the HF bridge owns.
+    parallel_spec: ParallelSpec = MISTRAL3_VLM_PARALLEL_SPEC
 
     # See checkpointing.py:initialize_model_weights — gate on this attribute
     # to skip HF's ``initialize_weights()``. The upcoming adapter load will

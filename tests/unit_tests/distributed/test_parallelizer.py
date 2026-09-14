@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+import subprocess
 import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock, create_autospec, patch
@@ -30,7 +31,8 @@ from torch.distributed.tensor.placement_types import Replicate, Shard
 from transformers.models.gemma3.modeling_gemma3 import Gemma3ForConditionalGeneration
 
 import nemo_automodel.components.distributed.parallelizer as parallelizer
-from nemo_automodel.components.distributed.optimized_tp_plans import _get_class_qualname
+from nemo_automodel._transformers.model_init import _get_mixin_wrapped_class
+from nemo_automodel.components.distributed.parallel_spec import ParallelSpec
 from nemo_automodel.components.distributed.parallelizer import (
     _attention_is_head_sharded,
     _extract_model_layer_groups,
@@ -44,6 +46,7 @@ from nemo_automodel.components.distributed.parallelizer import (
     import_class_from_path,
     megatron_fsdp_strategy_parallelize,
 )
+from nemo_automodel.components.models.bagel import parallelization as bagel_parallelization
 
 
 def test_fsdp_accumulated_grad_guard_only_handles_missing_unsharded_param(monkeypatch):
@@ -175,22 +178,6 @@ class MockGemma3Model(nn.Module):
         return x
 
 
-def create_gemma3_mock():
-    """Factory function to create a mock that passes Gemma3 type checks."""
-
-    # Create a simple hybrid class like in the functional test
-    class MockGemma3ModelWithTypeCheck(MockGemma3Model, Gemma3ForConditionalGeneration):
-        """Mock Gemma3 model that properly inherits from Gemma3ForConditionalGeneration."""
-
-        def __init__(self, num_attention_heads=8, num_key_value_heads=8):
-            # Explicitly call only MockGemma3Model.__init__ to avoid MRO issues
-            MockGemma3Model.__init__(self, num_attention_heads, num_key_value_heads)
-
-    # Create an instance of the hybrid class
-    mock = MockGemma3ModelWithTypeCheck()
-    return mock
-
-
 class _CheckpointWrapped(nn.Module):
     """Minimal checkpoint wrapper used by BAGEL activation-checkpointing tests."""
 
@@ -203,8 +190,14 @@ class _CheckpointWrapped(nn.Module):
         return self._checkpoint_wrapped_module(x)
 
 
+def _bridged(model):
+    """Bind the ParallelSpec NeMo Auto attaches when it wraps this class (native declaration or HF bridge)."""
+    model.__class__ = _get_mixin_wrapped_class(type(model))
+    return model
+
+
 def _make_bagel_model(num_language_layers: int = 2, num_vision_layers: int = 3):
-    """Build the nested layer containers used by BAGEL without importing BAGEL."""
+    """Build the nested layer containers used by BAGEL without instantiating BAGEL."""
 
     class BagelForUnifiedMultimodal(nn.Module):
         """Stand-in with the exact class name used by the production mapper."""
@@ -222,7 +215,7 @@ def _make_bagel_model(num_language_layers: int = 2, num_vision_layers: int = 3):
                 [_FakeLayer() for _ in range(num_vision_layers)]
             )
 
-    return BagelForUnifiedMultimodal()
+    return _bridged(BagelForUnifiedMultimodal())
 
 
 @pytest.fixture
@@ -371,25 +364,6 @@ def mock_distributed_env(monkeypatch):
         "fsdp": fsdp_mock,
         "tensor_parallel": tp_parallel_mock,
     }
-
-
-@pytest.fixture
-def mock_optimized_tp_plans(monkeypatch):
-    """Mock the PARALLELIZE_FUNCTIONS dictionary."""
-    mock_plans = {}
-
-    def mock_llama_plan(model, sequence_parallel=False):
-        return {"model.layers.0.self_attn.q_proj": ColwiseParallel()}
-
-    def mock_gemma3_plan(model, sequence_parallel=False):
-        return {"language_model.layers.0.self_attn.q_proj": ColwiseParallel()}
-
-    # Mock the import to avoid actual dependency
-    with patch("nemo_automodel.components.distributed.parallelizer.PARALLELIZE_FUNCTIONS", mock_plans):
-        # Add mock functions for different model types
-        mock_plans[type(MockModel())] = mock_llama_plan
-        mock_plans[type(create_gemma3_mock())] = mock_gemma3_plan
-        yield mock_plans
 
 
 class FakeMegatronFSDPMixedPrecisionPolicy:
@@ -1135,7 +1109,7 @@ class TestGetHfTpShardPlan:
         """Gemma3 instance with exact class identity but no HF ``__init__``."""
         model = Gemma3ForConditionalGeneration.__new__(Gemma3ForConditionalGeneration)
         nn.Module.__init__(model)
-        return model
+        return _bridged(model)
 
     def test_gemma3_pre_standardization_tree_uses_language_model_prefix(self):
         """Old Gemma3 (transformers <= 4.51) hangs the text tower off a top-level
@@ -1623,92 +1597,48 @@ class TestUnshardFsdp2Model:
             assert test_fsdp_module.reshard_called is True
 
 
-class TestGetParallelPlanClassNameFallback:
-    """Test that _get_parallel_plan matches by qualified class name (module.qualname)."""
+class TestQueryParallelSpecResolution:
+    """``query_parallel_spec`` reads the ``parallel_spec`` class attribute and nothing else, so the
+    contract must reach every class shape the runtime produces: the declaring class and the
+    dynamically created subclasses ``_get_mixin_wrapped_class`` / ``attach_capabilities_and_validate``
+    swap in."""
 
-    def test_identity_match(self):
-        """Exact class qualname in PARALLELIZE_FUNCTIONS is found."""
+    def test_class_attribute_selects_plan(self):
         sentinel_plan = {"layer": ColwiseParallel()}
-        model = MockModel()
-
-        with patch(
-            "nemo_automodel.components.distributed.parallelizer.PARALLELIZE_FUNCTIONS",
-            {_get_class_qualname(type(model)): lambda m, sp: sentinel_plan},
-        ):
-            plan = _get_parallel_plan(model, sequence_parallel=False, tp_shard_plan=None)
+        with patch.object(MockModel, "parallel_spec", ParallelSpec(tp_plan=lambda m, sp: sentinel_plan), create=True):
+            plan = _get_parallel_plan(MockModel(), sequence_parallel=False, tp_shard_plan=None)
         assert plan is sentinel_plan
 
-    def test_class_name_fallback(self):
-        """A different class object with the same module.qualname still matches.
+    def test_runtime_wrapper_subclasses_inherit_class_attribute(self):
+        spec = ParallelSpec(tp_plan=lambda m, sp: {})
 
-        With the old class-object-keyed dict, identity was required. With the new
-        string-keyed dict, two distinct class objects that share ``__module__`` and
-        ``__qualname__`` resolve to the same key and both match — which is exactly
-        the NeMo-RL wrapping scenario this fix targets.
-        """
-        sentinel_plan = {"layer": ColwiseParallel()}
+        class _Mixin:
+            pass
 
-        # Create a *different* class object with the same name (and therefore the same
-        # module.qualname since both are defined in this test module).
-        DuplicateMockModel = type("MockModel", (nn.Module,), {"forward": lambda self, x: x})
-        assert DuplicateMockModel is not MockModel
-        assert _get_class_qualname(DuplicateMockModel) == _get_class_qualname(MockModel)
-
-        model = MockModel()
-        model.__class__ = DuplicateMockModel  # model's type is the duplicate
-
-        with patch(
-            "nemo_automodel.components.distributed.parallelizer.PARALLELIZE_FUNCTIONS",
-            {_get_class_qualname(MockModel): lambda m, sp: sentinel_plan},
-        ):
-            plan = _get_parallel_plan(model, sequence_parallel=False, tp_shard_plan=None)
-        # Matches because module.qualname is the same, even though the class object differs
-        assert plan is sentinel_plan
-
-    def test_nemo_rl_wrapped_class_match(self):
-        """A different class object with the same module and qualname still matches.
-
-        This simulates the NeMo-RL scenario: _get_mixin_wrapped_class() creates a new
-        class via type(...) that preserves __module__ and __qualname__ from the original.
-        Both the original and the wrapper resolve to the same _get_class_qualname() key.
-        """
-        sentinel_plan = {"layer": ColwiseParallel()}
-        original_cls = type(MockModel())
-
-        # Simulate _get_mixin_wrapped_class: create a *new* class object that copies
-        # __module__ and __qualname__ from the original (same qualname, different object)
-        WrappedCls = type(
-            original_cls.__name__,
-            (nn.Module,),
-            {
-                "forward": lambda self, x: x,
-                "__module__": original_cls.__module__,
-                "__qualname__": original_cls.__qualname__,
-            },
+        mixin_wrapper = type(
+            MockModel.__name__,
+            (_Mixin, MockModel),
+            {"__module__": MockModel.__module__, "__qualname__": MockModel.__qualname__},
         )
-        assert WrappedCls is not original_cls
-        assert _get_class_qualname(WrappedCls) == _get_class_qualname(original_cls)
+        capability_wrapper = type(MockModel.__name__, (MockModel,), {})
+        with patch.object(MockModel, "parallel_spec", spec, create=True):
+            for wrapper in (mixin_wrapper, capability_wrapper):
+                model = MockModel()
+                model.__class__ = wrapper
+                assert parallelizer.query_parallel_spec(model) is spec
 
-        model = MockModel()
-        model.__class__ = WrappedCls  # model's type is the wrapper
+    def test_same_named_class_without_declaration_gets_defaults(self):
+        """Names mean nothing to the parallelizer: only the attribute binds a contract."""
+        spec = ParallelSpec(tp_plan=lambda m, sp: {})
+        twin = type("MockModel", (nn.Module,), {"forward": lambda self, x: x})
+        with patch.object(MockModel, "parallel_spec", spec, create=True):
+            assert parallelizer.query_parallel_spec(twin()) is parallelizer._DEFAULT_SPEC
 
-        with patch(
-            "nemo_automodel.components.distributed.parallelizer.PARALLELIZE_FUNCTIONS",
-            {_get_class_qualname(original_cls): lambda m, sp: sentinel_plan},
-        ):
-            plan = _get_parallel_plan(model, sequence_parallel=False, tp_shard_plan=None)
-        assert plan is sentinel_plan
-
-    def test_no_match_falls_through_to_default(self):
-        """Completely unknown class qualname falls through to the default plan."""
+    def test_no_declaration_falls_through_to_default_plan(self):
         model = MockModel()
         model.__class__ = type("UnknownModel", (nn.Module,), {"forward": lambda self, x: x})
 
-        with patch(
-            "nemo_automodel.components.distributed.parallelizer.PARALLELIZE_FUNCTIONS",
-            {_get_class_qualname(MockModel): lambda m, sp: {"x": ColwiseParallel()}},
-        ):
-            plan = _get_parallel_plan(model, sequence_parallel=False, tp_shard_plan=None)
+        plan = _get_parallel_plan(model, sequence_parallel=False, tp_shard_plan=None)
         # Should get the default Llama3-style plan (has q_proj, k_proj, etc.)
         assert "model.layers.*.self_attn.q_proj" in plan
 
@@ -1985,6 +1915,10 @@ class TestActivationCheckpointingKVSharing:
             lambda module, **kwargs: _Wrapped(module, **kwargs),
         )
         monkeypatch.setattr(
+            "nemo_automodel.components.models.bagel.parallelization.checkpoint_wrapper",
+            lambda module, **kwargs: _Wrapped(module, **kwargs),
+        )
+        monkeypatch.setattr(
             "nemo_automodel.components.distributed.activation_checkpointing.checkpoint_wrapper",
             _Wrapped,
         )
@@ -2211,7 +2145,7 @@ class TestActivationCheckpointingKVSharing:
         class BiEncoderModel(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.model = LlamaNemotronVLModel()
+                self.model = _bridged(LlamaNemotronVLModel())
                 self.config = SimpleNamespace(use_cache=True, text_config=SimpleNamespace(num_kv_shared_layers=0))
 
             def forward(self, x):
@@ -2241,7 +2175,7 @@ class TestActivationCheckpointingKVSharing:
         class BiEncoderModel(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.model = LlamaNemotronVLModel()
+                self.model = _bridged(LlamaNemotronVLModel())
                 self.config = SimpleNamespace(use_cache=True, text_config=SimpleNamespace(num_kv_shared_layers=0))
 
             def forward(self, x):
@@ -2271,7 +2205,7 @@ class TestActivationCheckpointingKVSharing:
         class BiEncoderModel(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.model = LlamaNemotronVLModel()
+                self.model = _bridged(LlamaNemotronVLModel())
                 self.config = SimpleNamespace(use_cache=True, text_config=SimpleNamespace(num_kv_shared_layers=0))
 
             def forward(self, x):
@@ -2860,15 +2794,13 @@ class TestExtractModelLayers:
     def _bare_instance(cls):
         """Instantiate an HF model class without running HF ``__init__``.
 
-        Needed because ``MODEL_CLS_TO_LAYERS`` is keyed by exact class identity
-        (no subclass match), but the real classes require a config to
-        construct. ``__new__`` + manual ``nn.Module.__init__`` gives us an
-        instance where ``type(model) is cls`` while skipping the expensive
-        construction path.
+        The real classes require a config to construct; ``__new__`` + manual
+        ``nn.Module.__init__`` skips that, and ``_bridged`` binds the ParallelSpec the
+        HF bridge attaches to the wrapper class NeMo Auto creates.
         """
         obj = cls.__new__(cls)
         nn.Module.__init__(obj)
-        return obj
+        return _bridged(obj)
 
     def test_class_keyed_single_fqn_flattens_modulelist(self):
         """GPT2LMHeadModel entry ``["transformer.h"]`` → individual layers.
@@ -2908,7 +2840,7 @@ class TestExtractModelLayers:
                 self.backbone = backbone
 
         layers = self._make_layers(4)
-        result = _extract_model_layers(NemotronHForCausalLM(layers))
+        result = _extract_model_layers(_bridged(NemotronHForCausalLM(layers)))
 
         assert len(result) == 4
         assert all(r is layers[i] for i, r in enumerate(result))
@@ -3191,19 +3123,16 @@ class TestExtractModelLayers:
         with pytest.raises(ValueError, match="no ModuleList or ModuleDict found"):
             _extract_model_layers(UnknownWithAdapterRegistry())
 
-    def test_string_keyed_mistral3_fp8_vlm(self):
-        """The ``"Mistral3FP8VLMForConditionalGeneration"`` string-key entry
-        catches the runtime class produced by ``_get_mixin_wrapped_class``
-        (``HFCheckpointingMixin``), which has the same ``__name__`` as our
-        custom class but a distinct identity. Without this entry, the model
-        falls through to the largest-ModuleList heuristic and crashes.
-
-        Validates the elif ``model_cls.__name__ in MODEL_CLS_TO_LAYERS`` branch.
+    def test_subclass_of_bridged_architecture_inherits_layer_groups(self):
+        """``Mistral3FP8VLMForConditionalGeneration`` subclasses HF's Mistral3 class, so the HF
+        bridge must find the ``"Mistral3ForConditionalGeneration"`` contract by walking the MRO
+        when it wraps the class. Otherwise the model falls through to the largest-ModuleList
+        heuristic.
         """
+        Mistral3ForConditionalGeneration = type("Mistral3ForConditionalGeneration", (nn.Module,), {})
 
-        class Mistral3FP8VLMForConditionalGeneration(nn.Module):
-            """Stand-in named exactly like the registered string key —
-            mirrors the wrapper class that NeMo Auto creates at runtime."""
+        class Mistral3FP8VLMForConditionalGeneration(Mistral3ForConditionalGeneration):
+            """Stand-in for the FP8 subclass, named like the runtime wrapper."""
 
             def __init__(self):
                 super().__init__()
@@ -3222,7 +3151,7 @@ class TestExtractModelLayers:
             def _mklayers(n):
                 return nn.ModuleList([_FakeLayer() for _ in range(n)])
 
-        model = Mistral3FP8VLMForConditionalGeneration()
+        model = _bridged(Mistral3FP8VLMForConditionalGeneration())
         result = _extract_model_layers(model)
 
         # 3 text-decoder + 2 vision tower layers, all flattened.
@@ -3249,7 +3178,7 @@ class TestExtractModelLayers:
         class BiEncoderModel(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.model = LlamaNemotronVLModel()
+                self.model = _bridged(LlamaNemotronVLModel())
 
         model = BiEncoderModel()
 
@@ -3272,7 +3201,7 @@ class TestExtractModelLayers:
         class BiEncoderModel(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.model = Ministral3BidirectionalModel()
+                self.model = _bridged(Ministral3BidirectionalModel())
 
         model = BiEncoderModel()
 
@@ -3389,12 +3318,12 @@ class TestExtractModelLayers:
                 self.model.vision_model.transformer = nn.Module()
                 self.model.vision_model.transformer.resblocks = _layers(2)
 
-        _assert_counts(KimiVLForConditionalGeneration(), 3, 2)
-        _assert_counts(KimiK25VLForConditionalGeneration(), 4, 2)
-        _assert_counts(MiniMaxM3SparseForConditionalGeneration(), 5, 2)
-        _assert_counts(Qwen3_5MoeForConditionalGeneration(), 6, 3)
-        _assert_counts(Qwen3VLMoeForConditionalGeneration(), 8, 3)
-        _assert_counts(Step3p7ForConditionalGeneration(), 7, 2)
+        _assert_counts(_bridged(KimiVLForConditionalGeneration()), 3, 2)
+        _assert_counts(_bridged(KimiK25VLForConditionalGeneration()), 4, 2)
+        _assert_counts(_bridged(MiniMaxM3SparseForConditionalGeneration()), 5, 2)
+        _assert_counts(_bridged(Qwen3_5MoeForConditionalGeneration()), 6, 3)
+        _assert_counts(_bridged(Qwen3VLMoeForConditionalGeneration()), 8, 3)
+        _assert_counts(_bridged(Step3p7ForConditionalGeneration()), 7, 2)
 
     def test_string_keyed_bagel_extracts_language_and_vision_layers(self):
         """BAGEL exposes Qwen decoder layers and SigLIP encoder layers."""
@@ -3416,10 +3345,10 @@ class TestBagelFullLayerActivationCheckpointing:
         """Nested FQN lookup returns the module or None for missing paths."""
         model = _make_bagel_model()
 
-        result = parallelizer._get_module_by_fqn(model, "model.vit_model.vision_model.encoder.layers")
+        result = bagel_parallelization._get_module_by_fqn(model, "model.vit_model.vision_model.encoder.layers")
 
         assert result is model.model.vit_model.vision_model.encoder.layers
-        assert parallelizer._get_module_by_fqn(model, "model.missing.layers") is None
+        assert bagel_parallelization._get_module_by_fqn(model, "model.missing.layers") is None
 
     def test_apply_bagel_full_layer_activation_checkpointing_wraps_each_layer(self, monkeypatch):
         """BAGEL wraps Qwen and SigLIP layers once and skips already wrapped layers."""
@@ -3430,9 +3359,9 @@ class TestBagelFullLayerActivationCheckpointing:
             wrap_calls.append((module, kwargs))
             return _CheckpointWrapped(module, **kwargs)
 
-        monkeypatch.setattr(parallelizer, "checkpoint_wrapper", _fake_checkpoint_wrapper)
+        monkeypatch.setattr(bagel_parallelization, "checkpoint_wrapper", _fake_checkpoint_wrapper)
 
-        assert parallelizer._apply_bagel_full_layer_activation_checkpointing(model) is True
+        assert bagel_parallelization.apply_bagel_full_layer_activation_checkpointing(model) is True
 
         language_layers = model.model.language_model.model.layers
         vision_layers = model.model.vit_model.vision_model.encoder.layers
@@ -3441,9 +3370,22 @@ class TestBagelFullLayerActivationCheckpointing:
         assert all(isinstance(layer, _CheckpointWrapped) for layer in wrapped_layers)
         assert all(call_kwargs["checkpoint_impl"].name == "NO_REENTRANT" for _, call_kwargs in wrap_calls)
 
-        assert parallelizer._apply_bagel_full_layer_activation_checkpointing(model) is False
+        assert bagel_parallelization.apply_bagel_full_layer_activation_checkpointing(model) is False
         assert len(wrap_calls) == 5
 
-    def test_apply_bagel_full_layer_activation_checkpointing_ignores_other_models(self):
+    def test_other_models_declare_no_full_layer_hook(self):
         """Non-BAGEL models continue through the generic checkpointing path."""
-        assert parallelizer._apply_bagel_full_layer_activation_checkpointing(nn.Module()) is False
+        assert parallelizer.query_parallel_spec(nn.Module()).apply_activation_checkpointing is None
+
+
+@pytest.mark.timeout(120)
+def test_parallelizer_import_pulls_no_transformers_model_modules():
+    """``components.distributed`` reads contracts off the model class, so importing it must not
+    load any ``transformers.models.*`` module (see components/distributed/AGENTS.md)."""
+    code = (
+        "import sys\n"
+        "import nemo_automodel.components.distributed.parallelizer\n"
+        "print(sorted(m for m in sys.modules if m.startswith('transformers.models.')))\n"
+    )
+    result = subprocess.run([sys.executable, "-c", code], check=True, capture_output=True, text=True)
+    assert result.stdout.strip() == "[]", result.stdout

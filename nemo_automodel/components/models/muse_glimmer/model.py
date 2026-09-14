@@ -47,6 +47,7 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
     shard_sequence_for_cp_round_robin,
 )
 from nemo_automodel.components.distributed.context_parallel.utils import cp_dispatcher_suspended
+from nemo_automodel.components.distributed.parallel_spec import ParallelSpec
 from nemo_automodel.components.models.common import BackendConfig, compute_lm_head_logits
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import (
@@ -54,7 +55,10 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     reject_unsupported_tie_word_embeddings,
 )
 from nemo_automodel.components.models.muse_glimmer.config import MuseGlimmerConfig
-from nemo_automodel.components.models.muse_glimmer.parallelization import register_muse_glimmer_parallel_strategy
+from nemo_automodel.components.models.muse_glimmer.parallelization import (
+    MuseGlimmerParallelizationStrategy,
+    muse_glimmer_tp_plan,
+)
 from nemo_automodel.components.models.muse_glimmer.state_dict_adapter import MuseGlimmerStateDictAdapter
 from nemo_automodel.components.models.muse_glimmer.vision import MuseGlimmerVisionAdapter, MuseGlimmerVisionEncoder
 
@@ -681,6 +685,9 @@ class MuseGlimmerForConditionalGeneration(HFCheckpointingMixin, MuseGlimmerPreTr
     _tp_plan = {"lm_head": "colwise_rep"}
     _keep_in_fp32_modules = ["rotary_emb"]
     supports_thd = True
+    parallel_spec: ParallelSpec = ParallelSpec(
+        tp_plan=muse_glimmer_tp_plan, strategy=MuseGlimmerParallelizationStrategy()
+    )
 
     @dataclass(frozen=True)
     class ModelCapabilities:
@@ -938,5 +945,4 @@ class MuseGlimmerForConditionalGeneration(HFCheckpointingMixin, MuseGlimmerPreTr
         return output if return_dict else output.to_tuple()
 
 
-register_muse_glimmer_parallel_strategy()
 ModelClass = MuseGlimmerForConditionalGeneration

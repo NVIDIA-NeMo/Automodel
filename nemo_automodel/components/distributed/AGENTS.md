@@ -44,19 +44,21 @@ rather than assuming (see below).
 
 Pick whichever fits the use:
 
-**Registry keys** -- use the literal qualname string, not the class object:
+**Per-model contracts** -- declare them on the model class, not in this directory:
 
 ```python
-# Good
-"transformers.models.gemma3.modeling_gemma3.Gemma3ForCausalLM": _parallelize_gemma3,
-
-# Bad -- forces the import
-_get_class_qualname(Gemma3ForCausalLM): _parallelize_gemma3,
+# components/models/<name>/model.py
+class NewModelForCausalLM(HFCheckpointingMixin, nn.Module):
+    parallel_spec: ParallelSpec = ParallelSpec(tp_plan=_new_model_tp_plan)
 ```
 
-Generate the literal by running `_get_class_qualname` on the real class rather
-than writing it by hand; aliased imports resolve to their true module path (e.g.
-`CustomLlamaForCausalLM` -> `nemo_automodel.components.models.llama.model.LlamaForCausalLM`).
+`ParallelSpec` (`parallel_spec.py`) carries the TP plan, layer groups, text-config
+path, HF `_tp_plan` root, validators and strategy override; `parallelizer.py` only
+ever reads the `parallel_spec` class attribute (`query_parallel_spec`). Architectures
+the repository does not own -- stock `transformers` classes, `trust_remote_code`
+checkpoints, `diffusers` transformers -- get theirs from the bridge that wraps them:
+`_transformers/hf_parallel_specs.py` (bound in `_get_mixin_wrapped_class`) and
+`_diffusers/parallelization.py`. Nothing in this directory names a model.
 
 **Type annotations** -- put the import under `if TYPE_CHECKING:`. That needs
 `from __future__ import annotations` at the top of the file so annotations are
@@ -76,6 +78,6 @@ python -X importtime -c "import nemo_automodel.components.distributed.paralleliz
 python -c "import nemo_automodel.components.distributed.parallelizer"
 ```
 
-If you touch `PARALLELIZE_FUNCTIONS` or `_get_model_layer_group_specs`, prove
-equivalence by serializing both before and after your change and diffing them --
-they must be byte-identical.
+If you touch a `parallel_spec` (or the bridge tables), prove equivalence by serializing
+the resolved spec fields for every affected class before and after your change and
+diffing them -- they must be identical.

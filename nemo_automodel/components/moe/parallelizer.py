@@ -267,20 +267,15 @@ def _resolve_moe_tp_plan(
             tp_size=tp_size,
         )
     else:
-        from nemo_automodel.components.distributed.optimized_tp_plans import (
-            PARALLELIZE_FUNCTIONS,
-            _get_class_qualname,
-        )
+        from nemo_automodel.components.distributed.parallelizer import query_parallel_spec
 
         model_cls = type(model)
-        plan_factory = PARALLELIZE_FUNCTIONS.get(_get_class_qualname(model_cls))
-        if plan_factory is None:
-            plan_factory = PARALLELIZE_FUNCTIONS.get(model_cls.__name__)
+        plan_factory = query_parallel_spec(model).tp_plan
         if plan_factory is None:
             raise ValueError(
                 f"No safe tensor-parallel plan is registered for custom MoE model "
-                f"'{model_cls.__name__}' at tp_size={tp_size}. Register a non-expert plan in "
-                "PARALLELIZE_FUNCTIONS or pass tp_shard_plan explicitly; routed experts must remain EP-owned."
+                f"'{model_cls.__name__}' at tp_size={tp_size}. Declare a non-expert plan in the model's "
+                "ParallelSpec or pass tp_shard_plan explicitly; routed experts must remain EP-owned."
             )
         try:
             plan = plan_factory(model, False)

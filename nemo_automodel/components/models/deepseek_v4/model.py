@@ -51,6 +51,7 @@ import torch.nn as nn
 from torch.distributed.tensor import DTensor
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+from nemo_automodel.components.distributed.parallel_spec import ParallelSpec
 from nemo_automodel.components.models.common import (
     BackendConfig,
     initialize_linear_module,
@@ -76,6 +77,7 @@ from nemo_automodel.components.models.deepseek_v4.cp import (
     dsv4_cp_size,
     make_dsv4_contiguous_shard_cp_batch_and_ctx,
 )
+from nemo_automodel.components.models.deepseek_v4.fsdp import DeepseekV4ParallelizationStrategy
 from nemo_automodel.components.models.deepseek_v4.layers import (
     DeepseekV4Attention,
     DeepseekV4HyperConnection,
@@ -1077,6 +1079,10 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     # of modular_deepseek_v4.py) plus the existing ``e_score_correction_bias``
     # entry that is specific to KAutomodel's shared Gate buffer.
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+    parallel_spec: ParallelSpec = ParallelSpec(
+        layer_groups={"language": ("model.layers",), "vision": ("model.vision.blocks",)},
+        strategy=DeepseekV4ParallelizationStrategy(),
+    )
     _keep_in_fp32_modules_strict = [
         "attn_hc.fn",
         "attn_hc.base",

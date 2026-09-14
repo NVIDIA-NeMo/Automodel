@@ -20,13 +20,11 @@ import pytest
 import torch.nn as nn
 
 import nemo_automodel.components.distributed.parallelizer as parallelizer
-from nemo_automodel.components.distributed.optimized_tp_plans import (
-    PARALLELIZE_FUNCTIONS,
-    _parallelize_qwen3_5_vlm,
-)
+from nemo_automodel._transformers.model_init import _get_mixin_wrapped_class
 from nemo_automodel.components.distributed.parallelizer import (
     translate_to_torch_parallel_style,
 )
+from nemo_automodel.components.models.qwen3_5.parallelization import QWEN3_5_VLM_PARALLEL_SPEC, qwen3_5_tp_plan
 
 
 class TestTranslateToTorchParallelStyleReplicatedWithGradAllreduce:
@@ -74,17 +72,11 @@ class TestGetHfTpShardPlanSkipsNoneStyles:
 
 
 class TestParallelizeQwen35VlmRegistered:
-    """_parallelize_qwen3_5_vlm is registered in PARALLELIZE_FUNCTIONS and
-    delegates to get_hf_tp_shard_plan so transformers' native base_model_tp_plan
-    is reused."""
+    """qwen3_5_tp_plan is the native class's declared plan and delegates to
+    get_hf_tp_shard_plan so transformers' native base_model_tp_plan is reused."""
 
-    def test_qwen3_5_vlm_entry_present_in_registry(self):
-        # Use the hard-coded qualname string to avoid importing
-        # transformers.models.qwen3_5 at test-collection time, which would
-        # defeat other tests that stub that module before first import.
-        key = "transformers.models.qwen3_5.modeling_qwen3_5.Qwen3_5ForConditionalGeneration"
-        assert key in PARALLELIZE_FUNCTIONS
-        assert PARALLELIZE_FUNCTIONS[key] is _parallelize_qwen3_5_vlm
+    def test_qwen3_5_vlm_declares_plan(self):
+        assert QWEN3_5_VLM_PARALLEL_SPEC.tp_plan is qwen3_5_tp_plan
 
     def test_delegates_to_get_hf_tp_shard_plan(self, monkeypatch):
         sentinel_plan = {"probe": "value"}
@@ -96,7 +88,7 @@ class TestParallelizeQwen35VlmRegistered:
 
         monkeypatch.setattr(parallelizer, "get_hf_tp_shard_plan", fake_get_hf_tp_shard_plan)
         dummy = object()
-        result = _parallelize_qwen3_5_vlm(dummy, sequence_parallel=False)
+        result = qwen3_5_tp_plan(dummy, sequence_parallel=False)
         assert result is sentinel_plan
         assert calls == [dummy]
 
@@ -104,21 +96,21 @@ class TestParallelizeQwen35VlmRegistered:
 class TestExtractModelLayersStringFallbackAndNoneSafe:
     """Two guarantees on _extract_model_layers:
 
-    1. The string-key fallback for Qwen3.5 fires when class identity fails
-       (defensive against lazy-module / deepcopy class drift).
+    1. A same-named stand-in gets the native Qwen3.5 layer groups once the HF bridge
+       wraps it (defensive against lazy-module / deepcopy class drift).
     2. The internal _reduce_attrs tolerates None intermediate attributes
        (which happen after PP stage split strips unused sub-modules).
     """
 
     def _make_fake_qwen35(self, visual_is_none: bool, layers_as_module_dict: bool = False):
-        """Build a stand-in object whose type().__name__ is
-        'Qwen3_5ForConditionalGeneration' but is NOT the real class — this
-        mimics the lazy-import / deepcopy class-identity drift case."""
+        """Build a stand-in whose type().__name__ is 'Qwen3_5ForConditionalGeneration'
+        but is NOT the real class -- the lazy-import / deepcopy class-identity drift case."""
 
         class Qwen3_5ForConditionalGeneration(nn.Module):  # noqa: N801  (name intentional)
             pass
 
         model = Qwen3_5ForConditionalGeneration()
+        model.__class__ = _get_mixin_wrapped_class(type(model))  # binds the native class's ParallelSpec by name
         model.model = nn.Module()
         model.model.language_model = nn.Module()
         if layers_as_module_dict:

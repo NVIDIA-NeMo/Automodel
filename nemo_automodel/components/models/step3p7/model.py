@@ -29,6 +29,7 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
     shard_batch_aux_only,
     shard_sequence_for_cp_round_robin,
 )
+from nemo_automodel.components.distributed.parallel_spec import ParallelSpec
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.mtp import roll_tensor
@@ -323,6 +324,12 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
     """Native Step3.7 VLM implementation for MedPix fine-tuning with EP and PP."""
 
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+    parallel_spec: ParallelSpec = ParallelSpec(
+        layer_groups={
+            "language": ("model.language_model.layers",),
+            "vision": ("model.vision_model.transformer.resblocks",),
+        }
+    )
 
     _keep_in_fp32_modules = ["rotary_emb"]
 

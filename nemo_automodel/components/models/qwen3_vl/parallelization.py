@@ -12,29 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Dense Qwen3-VL distributed-parallelization registration."""
+"""Dense Qwen3-VL distributed-parallelization contract."""
 
 from __future__ import annotations
 
+from nemo_automodel.components.distributed.parallelizer import DefaultParallelizationStrategy
 
-def register_qwen3_vl_parallel_strategy() -> None:
-    """Register the dense Qwen3-VL FSDP2 strategy once."""
-    from nemo_automodel.components.distributed.parallelizer import (
-        PARALLELIZATION_STRATEGIES,
-        DefaultParallelizationStrategy,
-        register_parallel_strategy,
-    )
 
-    name = "Qwen3VLForConditionalGeneration"
-    if name in PARALLELIZATION_STRATEGIES:
-        return
+class Qwen3VLParallelizationStrategy(DefaultParallelizationStrategy):
+    """Install the CP submesh used by Qwen3-VL's model-owned forward."""
 
-    @register_parallel_strategy(name=name)
-    class Qwen3VLParallelizationStrategy(DefaultParallelizationStrategy):
-        """Install the CP submesh used by Qwen3-VL's model-owned forward."""
-
-        def parallelize(self, model, device_mesh, **kwargs):
-            result = super().parallelize(model, device_mesh, **kwargs)
-            cp_mesh = device_mesh["cp"] if "cp" in device_mesh.mesh_dim_names else None
-            model.cp_mesh = cp_mesh if cp_mesh is not None and cp_mesh.size() > 1 else None
-            return result
+    def parallelize(self, model, device_mesh, **kwargs):
+        result = super().parallelize(model, device_mesh, **kwargs)
+        cp_mesh = device_mesh["cp"] if "cp" in device_mesh.mesh_dim_names else None
+        model.cp_mesh = cp_mesh if cp_mesh is not None and cp_mesh.size() > 1 else None
+        return result

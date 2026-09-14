@@ -133,15 +133,17 @@ def _get_mixin_wrapped_class(model_class: type) -> type:
     if issubclass(model_class, HFCheckpointingMixin):
         return model_class
 
-    # Create wrapper class that looks identical to original
-    return type(
-        model_class.__name__,
-        (HFCheckpointingMixin, model_class),
-        {
-            "__module__": model_class.__module__,
-            "__qualname__": model_class.__qualname__,
-        },
-    )
+    # Create wrapper class that looks identical to original. Classes the repository does not
+    # own get their parallelization contract here, so components.distributed only ever reads
+    # the ``parallel_spec`` class attribute.
+    namespace = {"__module__": model_class.__module__, "__qualname__": model_class.__qualname__}
+    if not hasattr(model_class, "parallel_spec"):
+        from nemo_automodel._transformers.hf_parallel_specs import parallel_spec_for
+
+        spec = parallel_spec_for(model_class)
+        if spec is not None:
+            namespace["parallel_spec"] = spec
+    return type(model_class.__name__, (HFCheckpointingMixin, model_class), namespace)
 
 
 @contextmanager
