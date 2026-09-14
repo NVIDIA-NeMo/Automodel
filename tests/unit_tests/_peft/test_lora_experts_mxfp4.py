@@ -332,7 +332,8 @@ def test_lora_passthrough_init_packed_base_with_trainable_adapters(moe_config):
     assert trainable == {"lora_gate_and_up_A", "lora_gate_and_up_B", "lora_down_A", "lora_down_B"}
 
 
-def test_apply_mxfp4_passthrough_configures_adapter_and_storage(moe_config):
+@pytest.mark.parametrize("lora", (False, True))
+def test_apply_mxfp4_passthrough_configures_adapter_and_storage(moe_config, lora):
     class Adapter:
         def __init__(self):
             self.expert_storage_format = "bf16"
@@ -349,11 +350,16 @@ def test_apply_mxfp4_passthrough_configures_adapter_and_storage(moe_config):
 
     with torch.device("meta"):
         model = TinyModel()
-        result = apply_mxfp4_to_moe_experts(model, passthrough=True)
+        if lora:
+            model.experts = patch_moe_module(model.experts, expert_weight_format="mxfp4")
+        original_experts = model.experts
+        result = apply_mxfp4_to_moe_experts(model)
 
     assert result is model
     assert model.state_dict_adapter.expert_storage_format == "mxfp4"
-    assert isinstance(model.experts, GroupedExpertsMXFP4)
+    assert isinstance(model.experts, GroupedExpertsLoRAMXFP4 if lora else GroupedExpertsMXFP4)
+    if lora:
+        assert model.experts is original_experts
     assert model.experts._mxfp4_resident
     assert not hasattr(model.experts, "gate_and_up_projs")
     assert model.experts.gate_and_up_projs_packed.is_meta
@@ -369,14 +375,15 @@ def test_apply_mxfp4_passthrough_requires_adapter_capability(moe_config):
     with torch.device("meta"):
         model = TinyModel()
         with pytest.raises(NotImplementedError, match="set_expert_storage_format"):
-            apply_mxfp4_to_moe_experts(model, passthrough=True)
+            apply_mxfp4_to_moe_experts(model)
 
     assert type(model.experts) is GroupedExperts
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_apply_mxfp4_to_moe_experts(moe_config, device):
+def test_apply_mxfp4_to_moe_experts(moe_config):
     import torch.nn as nn
+
+    device = torch.device("cpu")
 
     class TinyModel(nn.Module):
         def __init__(self):

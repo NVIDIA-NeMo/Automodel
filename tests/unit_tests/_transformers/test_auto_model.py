@@ -830,7 +830,7 @@ class TestApplyPeftAndLowerPrecision:
             )
 
         apply_lora.assert_called_once()
-        apply_mxfp4.assert_called_once_with(model, passthrough=True)
+        apply_mxfp4.assert_called_once_with(model)
         assert events == ["lora", "mxfp4"]
 
     def test_apply_peft_skips_mxfp4_for_bf16_experts(self):

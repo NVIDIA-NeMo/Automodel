@@ -37,11 +37,7 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor.parallel import parallelize_module
 from torch.utils.checkpoint import checkpoint
 
-from nemo_automodel.components._peft.lora_experts import GroupedExpertsDeepEPLoRA, GroupedExpertsLoRA
-from nemo_automodel.components._peft.lora_experts_mxfp4 import (
-    GroupedExpertsDeepEPLoRAMXFP4,
-    GroupedExpertsLoRAMXFP4,
-)
+from nemo_automodel.components._peft.lora import patch_moe_module
 from nemo_automodel.components.distributed.init_utils import destroy_global_state, initialize_distributed
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.moe.config import MoEConfig
@@ -94,12 +90,13 @@ def _model(variant: str, dispatcher: str, device: torch.device) -> torch.nn.Modu
             source = dequantize_mxfp4(packed, scales, torch.bfloat16).transpose(-2, -1)
             param.copy_(source.to(device=device, dtype=param.dtype))
     if "lora" in variant:
-        if device.type == "cpu" or variant == "lora":
-            cls = GroupedExpertsDeepEPLoRA if deep else GroupedExpertsLoRA
-        else:
-            cls = GroupedExpertsDeepEPLoRAMXFP4 if deep else GroupedExpertsLoRAMXFP4
         with torch.device(device):
-            model = cls(orig, lora_dim=8, alpha=16)
+            model = patch_moe_module(
+                orig,
+                dim=8,
+                alpha=16,
+                expert_weight_format="mxfp4" if device.type == "cuda" and variant == "mxfp4_lora" else "bf16",
+            )
         with torch.no_grad():
             for name, param in model.named_parameters():
                 if name.startswith("lora_"):

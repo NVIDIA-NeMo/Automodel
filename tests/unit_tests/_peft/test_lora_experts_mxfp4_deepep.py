@@ -183,9 +183,10 @@ def test_passthrough_deepep_registers_packed_params_on_meta(moe_config):
     assert [n for n, p in mx.named_parameters() if p.requires_grad] == []
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_apply_mxfp4_to_moe_experts_handles_deepep(moe_config, device):
+def test_apply_mxfp4_to_moe_experts_handles_deepep(moe_config):
     import torch.nn as nn
+
+    device = torch.device("cpu")
 
     class TinyModel(nn.Module):
         def __init__(self):

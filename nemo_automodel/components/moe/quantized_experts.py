@@ -196,10 +196,6 @@ class GroupedExpertsMXFP4(MXFP4ExpertStorageMixin, GroupedExperts):
                 weights to be meta (i.e. loaded later from a packed checkpoint).
         """
         super().__init__(orig_module.config, backend=None)
-        if not self.use_torch_mm and not orig_module.use_torch_mm:
-            raise NotImplementedError(
-                "mxfp4-resident expert weights require the torch_mm experts backend (backend.experts='torch_mm')."
-            )
         self.use_torch_mm = orig_module.use_torch_mm
 
         if passthrough:
@@ -213,7 +209,7 @@ class GroupedExpertsMXFP4(MXFP4ExpertStorageMixin, GroupedExperts):
             self._init_packed_placeholders()
             return
 
-        if not getattr(orig_module, "gate_and_up_projs", None).is_meta:
+        if not orig_module.gate_and_up_projs.is_meta:
             self.gate_and_up_projs.data = _to_local(orig_module.gate_and_up_projs).clone()
             self.down_projs.data = _to_local(orig_module.down_projs).clone()
         if self.expert_bias:
@@ -395,17 +391,17 @@ class GroupedExpertsDeepEPMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsDeepEP):
         return y
 
 
-def apply_mxfp4_to_moe_experts(model: nn.Module, *, passthrough: bool = False) -> nn.Module:
+def apply_mxfp4_to_moe_experts(model: nn.Module) -> nn.Module:
     """Apply MXFP4-resident storage to the model's common routed-expert modules.
 
     Call this after LoRA injection and before distributed sharding. LoRA-targeted
     experts that are already MXFP4-resident are preserved; remaining plain
     ``GroupedExperts`` and ``GroupedExpertsDeepEP`` modules are replaced in place.
 
-    When ``passthrough=True``, packed placeholders are registered before checkpoint
-    loading and every model state-dict adapter must explicitly opt into the MXFP4
-    expert storage format. This lets model-specific adapters translate their own
-    checkpoint layouts while this function owns the common model surgery.
+    Meta experts receive packed placeholders for direct checkpoint loading, and
+    their model state-dict adapter must opt into the MXFP4 expert storage format.
+    Already materialized expert weights are quantized without changing the adapter's
+    checkpoint loading mode. Model-specific adapters own checkpoint layouts.
     """
     model_parts = list(model.parts) if hasattr(model, "parts") else [model]
 
@@ -421,13 +417,19 @@ def apply_mxfp4_to_moe_experts(model: nn.Module, *, passthrough: bool = False) -
             "use backend.experts='torch_mm'."
         )
 
-    if passthrough:
-        for model_part in model_parts:
+    for model_part in model_parts:
+        needs_checkpoint = any(
+            param.is_meta
+            for module in model_part.modules()
+            if isinstance(module, (GroupedExperts, GroupedExpertsDeepEP))
+            for param in module.parameters(recurse=False)
+        )
+        if needs_checkpoint:
             adapter = getattr(model_part, "state_dict_adapter", None)
             set_storage_format = getattr(adapter, "set_expert_storage_format", None)
             if not callable(set_storage_format):
                 raise NotImplementedError(
-                    "MXFP4 checkpoint passthrough requires the model state-dict adapter to implement "
+                    "Loading an MXFP4 expert checkpoint requires the model state-dict adapter to implement "
                     "set_expert_storage_format()."
                 )
             set_storage_format("mxfp4")
@@ -444,7 +446,7 @@ def apply_mxfp4_to_moe_experts(model: nn.Module, *, passthrough: bool = False) -
             new_cls = frozen_conversions.get(type(module))
             if new_cls is None:
                 continue
-            new_module = new_cls(module, passthrough=passthrough)
+            new_module = new_cls(module, passthrough=module.gate_and_up_projs.is_meta)
             parent_name, _, child_name = name.rpartition(".")
             parent = model_part.get_submodule(parent_name) if parent_name else model_part
             setattr(parent, child_name, new_module)
@@ -452,15 +454,3 @@ def apply_mxfp4_to_moe_experts(model: nn.Module, *, passthrough: bool = False) -
 
     logger.info("Applied MXFP4-resident storage to %d frozen expert module(s)", num_converted)
     return model
-
-
-def pack_mxfp4_expert_base_weights(model: nn.Module) -> int:
-    """Pack any deferred MXFP4 expert base weights after checkpoint loading."""
-    num_packed = 0
-    model_parts = list(model.parts) if hasattr(model, "parts") else [model]
-    for model_part in model_parts:
-        for module in model_part.modules():
-            if isinstance(module, MXFP4ExpertStorageMixin) and not module._mxfp4_resident:
-                module.pack_base_weights()
-                num_packed += 1
-    return num_packed

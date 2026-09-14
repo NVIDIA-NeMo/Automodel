@@ -159,8 +159,8 @@ def _apply_peft_and_lower_precision(
             peft_config.use_triton = False
         # Skip freeze here - will do global freeze after checkpoint loading
         apply_lora_to_linear_modules(model, peft_config, quantization_config=quantization_config, skip_freeze=True)
-        if getattr(peft_config, "expert_weight_format", "bf16") == "mxfp4":
-            model = apply_mxfp4_to_moe_experts(model, passthrough=True)
+        if peft_config.expert_weight_format == "mxfp4":
+            model = apply_mxfp4_to_moe_experts(model)
 
     # FP8
     if fp8_config is not None:
