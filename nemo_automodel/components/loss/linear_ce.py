@@ -261,5 +261,10 @@ class FusedLinearCrossEntropy(nn.Module):
         )
         if num_label_tokens is not None:
             assert self.reduction == "sum", "num_label_tokens is only supported when reduction is 'sum'"
+            if num_label_tokens == 0:
+                # A batch with no supervised tokens sums to 0.0; dividing by 0
+                # would make it NaN and poison every gradient. Matches
+                # MaskedCrossEntropy.
+                return loss * 0.0
             loss = loss / num_label_tokens
         return loss
