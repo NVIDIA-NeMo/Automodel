@@ -205,7 +205,16 @@ def _build_selective_ac_save_ops() -> frozenset:
     return frozenset(save_ops)
 
 
-_SELECTIVE_AC_MUST_SAVE_OPS = _build_selective_ac_save_ops()
+@functools.lru_cache(maxsize=1)
+def _selective_ac_must_save_ops() -> frozenset:
+    """Save-set for selective AC, built on first use so importing this module stays cheap.
+
+    ``_build_selective_ac_save_ops`` reaches into ``torch._functorch.partitioners`` (and so
+    inductor / dynamo); resolving it here rather than at module scope keeps that off the import
+    path of every process that merely imports the parallelizer.
+    """
+    return _build_selective_ac_save_ops()
+
 
 _SELECTIVE_AC_TO_COPY_OP = _resolve_torch_op("aten._to_copy")
 
@@ -360,6 +369,7 @@ def make_selective_checkpoint_context_fn():
     ensure_fsdp_ops_sac_ignored()
 
     def selective_checkpointing_context_fn():
+        must_save_ops = _selective_ac_must_save_ops()
         # Count matmuls separately for the forward and recompute passes. torch
         # calls ``context_fn`` once per checkpointed region, so a single shared
         # counter would continue from the forward count into recompute and flip
@@ -377,7 +387,7 @@ def make_selective_checkpoint_context_fn():
                     if mm_counts[ctx.is_recompute] % 2 == 0
                     else CheckpointPolicy.MUST_SAVE
                 )
-            elif func in _SELECTIVE_AC_MUST_SAVE_OPS or _is_cuda_to_cpu_copy(func, args, kwargs):
+            elif func in must_save_ops or _is_cuda_to_cpu_copy(func, args, kwargs):
                 decision = CheckpointPolicy.MUST_SAVE
             else:
                 decision = CheckpointPolicy.PREFER_RECOMPUTE

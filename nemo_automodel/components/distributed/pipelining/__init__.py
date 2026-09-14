@@ -1,4 +1,4 @@
-# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,6 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPipeline
+"""Pipeline-parallel building blocks.
+
+``AutoPipeline`` is resolved lazily: importing the light ``pipelining.config`` (re-exported by
+``components.distributed``) must not load ``torch.distributed.pipelining`` and, through it,
+``torch._dynamo``.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPipeline
 
 __all__ = ["AutoPipeline"]
+
+
+def __getattr__(name: str) -> Any:
+    if name == "AutoPipeline":
+        from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPipeline
+
+        return AutoPipeline
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

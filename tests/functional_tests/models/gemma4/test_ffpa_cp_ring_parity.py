@@ -79,10 +79,10 @@ def test_ffpa_vs_eager_bf16_parity(Hq, Hkv):
 
 def test_ffpa_forward_ops_join_selective_ac_save_set():
     """FFPA forward ops join the declarative selective-AC save-set (MUST_SAVE)."""
-    from nemo_automodel.components.distributed.activation_checkpointing import _SELECTIVE_AC_MUST_SAVE_OPS
+    from nemo_automodel.components.distributed.activation_checkpointing import _selective_ac_must_save_ops
 
-    assert torch.ops.ffpa_attn._fwd_cute.default in _SELECTIVE_AC_MUST_SAVE_OPS
-    assert torch.ops.ffpa_attn._varlen_fwd_cute.default in _SELECTIVE_AC_MUST_SAVE_OPS
+    assert torch.ops.ffpa_attn._fwd_cute.default in _selective_ac_must_save_ops()
+    assert torch.ops.ffpa_attn._varlen_fwd_cute.default in _selective_ac_must_save_ops()
 
 
 # --------------------------------------------------------------------------- #

@@ -137,11 +137,8 @@ def test_selective_checkpointing_to_layers_preserves_transformer_engine_attentio
     """The shared selective-AC wrapper must preserve TE's checkpoint op sequence."""
     attention_cache = {"attention_params": None, "backend": None}
     monkeypatch.setattr(ac, "_get_transformer_engine_attention_backend_cache", lambda: attention_cache)
-    monkeypatch.setattr(
-        ac,
-        "_SELECTIVE_AC_MUST_SAVE_OPS",
-        ac._SELECTIVE_AC_MUST_SAVE_OPS | {torch.ops.aten.ne.Tensor},
-    )
+    extended_save_ops = ac._selective_ac_must_save_ops() | {torch.ops.aten.ne.Tensor}
+    monkeypatch.setattr(ac, "_selective_ac_must_save_ops", lambda: extended_save_ops)
 
     class Attention(nn.Module):
         def forward(self, x: torch.Tensor) -> torch.Tensor:

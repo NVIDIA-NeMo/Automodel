@@ -68,6 +68,13 @@ file you are editing does not.
 **Runtime use** (`isinstance`, attribute access) -- import inside the function.
 After the first call it is a `sys.modules` lookup.
 
+**Keep the compiler out of the import path too.** `torch._dynamo` (+ triton, +0.5 s) enters
+through `torch.distributed.pipelining` and `torch._functorch.partitioners`; both are deferred
+on purpose -- `pipelining/__init__.py` resolves `AutoPipeline` lazily, and
+`activation_checkpointing.py` builds the selective-AC save-set on first use. Do not add a
+module-scope import of either, or a module-scope call that reaches them.
+`tests/unit_tests/test_import_hygiene.py` fails if they load.
+
 ### Verifying a change
 
 ```bash

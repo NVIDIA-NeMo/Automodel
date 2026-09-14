@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import logging
-import subprocess
 import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock, create_autospec, patch
@@ -2700,7 +2699,7 @@ class TestSelectiveCheckpointSaveOps:
 
     def test_save_ops_include_compute_and_comm_ops(self):
         """The save-set covers matmuls, attention, and communication collectives."""
-        from nemo_automodel.components.distributed.activation_checkpointing import _SELECTIVE_AC_MUST_SAVE_OPS
+        from nemo_automodel.components.distributed.activation_checkpointing import _selective_ac_must_save_ops
 
         expected = [
             torch.ops.aten.mm.default,
@@ -2712,7 +2711,7 @@ class TestSelectiveCheckpointSaveOps:
             torch.ops._c10d_functional.all_to_all_single.default,
         ]
         for op in expected:
-            assert op in _SELECTIVE_AC_MUST_SAVE_OPS, f"{op} missing from save-op set"
+            assert op in _selective_ac_must_save_ops(), f"{op} missing from save-op set"
 
     def test_save_ops_seeded_from_partitioner(self):
         """The set is seeded from PyTorch's compute-intensive op list, not hardcoded."""
@@ -3376,16 +3375,3 @@ class TestBagelFullLayerActivationCheckpointing:
     def test_other_models_declare_no_full_layer_hook(self):
         """Non-BAGEL models continue through the generic checkpointing path."""
         assert parallelizer.query_parallel_spec(nn.Module()).apply_activation_checkpointing is None
-
-
-@pytest.mark.timeout(120)
-def test_parallelizer_import_pulls_no_transformers_model_modules():
-    """``components.distributed`` reads contracts off the model class, so importing it must not
-    load any ``transformers.models.*`` module (see components/distributed/AGENTS.md)."""
-    code = (
-        "import sys\n"
-        "import nemo_automodel.components.distributed.parallelizer\n"
-        "print(sorted(m for m in sys.modules if m.startswith('transformers.models.')))\n"
-    )
-    result = subprocess.run([sys.executable, "-c", code], check=True, capture_output=True, text=True)
-    assert result.stdout.strip() == "[]", result.stdout
