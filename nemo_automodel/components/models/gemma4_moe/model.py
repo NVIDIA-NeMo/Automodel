@@ -131,6 +131,11 @@ class _Gemma4KVShareHolder:
         # (kv_length, kv_offset): no cache -> kv spans the current query, zero offset.
         return query_length, 0
 
+    def get_query_offset(self, layer_idx=None) -> int:
+        # No cache -> queries start at position 0. transformers >=5.15 calls this
+        # unguarded from _preprocess_mask_arguments (is_sliding stays hasattr-guarded).
+        return 0
+
     def update(self, key_states, value_states, layer_idx, *args, **kwargs):
         return key_states, value_states
 
@@ -342,7 +347,6 @@ class Gemma4MoEDecoderLayer(nn.Module):
 
         # Reuse HF modules
         self.self_attn = Gemma4Attention(config=config, layer_idx=layer_idx)
-        attach_gemma4_cp_ring_attention(self.self_attn)
         self.mlp = Gemma4MLP(config, layer_idx)
 
         # Norms
@@ -793,13 +797,14 @@ class Gemma4MoETextModelBackend(nn.Module):
             # local-query/global-key Gemma4 mask from model metadata.
             causal_mask_mapping = {"full_attention": None, "sliding_attention": None}
         elif use_vision_bidirectional_mask and packed_seq_ids is not None:
+            full_attention_head_dim = self.config.per_layer_config["full_attention"].head_dim
             causal_mask_mapping = _build_packed_gemma4_causal_mask_mapping(
                 packed_seq_ids.to(device=inputs_embeds.device),
                 mm_token_type_ids.to(device=inputs_embeds.device),
                 dtype=inputs_embeds.dtype,
                 sliding_window=getattr(self.config, "sliding_window", None),
                 as_block_mask=getattr(self.config, "_attn_implementation", None) == "flex_attention",
-                flex_block_size=(32, 32) if getattr(self.config, "head_dim", 0) > 256 else 128,
+                flex_block_size=(32, 32) if full_attention_head_dim > 256 else 128,
             )
         elif use_vision_bidirectional_mask:
             causal_mask_mapping = _build_unpacked_gemma4_causal_mask_mapping(
@@ -890,6 +895,22 @@ class Gemma4MoEModel(HFGemma4Model):
 class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditionalGeneration, MoEFSDPSyncMixin):
     tie_word_embeddings_support: TieSupport = TieSupport.TIED_ONLY
     supports_gradient_checkpointing = True
+    # Gemma4 owns CP batch sharding and its decoder-layer p2p attention ring.
+    _owns_cp_attention = True
+    # Whole-block activation checkpointing replays each decoder layer during backward.
+    # E2B/E4B tolerate that for two separate reasons, one per kind of layer:
+    #   * non-shared layers are the ones that call `past_key_values.update()`. A
+    #     training forward supplies no cache, so this class injects
+    #     `_Gemma4KVShareHolder`, whose `update()` returns its inputs unchanged --
+    #     the replay writes nothing and no `DynamicCache` is ever built.
+    #   * shared layers do not touch the cache at all; they read their source
+    #     layer's K/V out of HF's separate `shared_kv_states` mapping. Backward
+    #     recomputes blocks in reverse order, so a shared layer replays before its
+    #     source layer rewrites that entry, and reads the forward-era tensors.
+    # The claim is specific to this class: the sibling Gemma4 wrappers
+    # (`gemma4_unified`, `gemma4_drafter`) ride plain HF with an accumulating
+    # `DynamicCache` and must not set this.
+    kv_sharing_survives_checkpoint_replay = True
     # RoPE inv_freq must stay fp32: initialize_weights casts the model to bf16 and
     # nn.Module.to rounds floating buffers; cast_model_to_dtype restores keep-fp32
     # modules afterwards (see llama/rope_utils.py).
@@ -1041,6 +1062,25 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             padding_token_id=padding_token_id,
         )
 
+    def _apply_cp_attention_backend_policy(self) -> None:
+        """Apply the model-owned CP attention backend policy to the final module tree."""
+        text_config = getattr(self.config, "text_config", self.config)
+        full_backend = str(getattr(text_config, "cp_full_attn_backend", "flex")).lower()
+        sliding_backend = str(getattr(text_config, "cp_sliding_attn_backend", "flex")).lower()
+
+        if full_backend not in {"flex", "ffpa"}:
+            raise ValueError(f"Unsupported cp_full_attn_backend: {full_backend!r}")
+        if sliding_backend not in {"flex", "fa"}:
+            raise ValueError(f"Unsupported cp_sliding_attn_backend: {sliding_backend!r}")
+
+        for module in self.modules():
+            if isinstance(module, Gemma4Attention):
+                attach_gemma4_cp_ring_attention(
+                    module,
+                    use_ffpa=full_backend == "ffpa",
+                    sliding_backend=sliding_backend,
+                )
+
     def __init__(
         self,
         config: Gemma4Config,
@@ -1099,19 +1139,7 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         self.pad_token_id = pad_token_id if pad_token_id is not None else -1
 
         if not enable_moe:
-            # Dense Gemma4 — keep vanilla HF model. Attach the model-owned p2p ring
-            # CP attention to each HF self-attn so setup_cp_attention can install it
-            # when CP is enabled. (The MoE path attaches it per Gemma4MoEDecoderLayer.)
-            # ``cp_full_attn_backend: ffpa`` routes the full-attention head_dim=512
-            # ring chunks through the FFPA CuTeDSL kernel (eligibility re-checked per
-            # call in _ring_use_ffpa_varlen); default "flex" preserves prior behavior.
-            use_ffpa_cp = str(getattr(text_config, "cp_full_attn_backend", "flex")).lower() == "ffpa"
-            # ``cp_sliding_attn_backend``: "flex" (default) | "fa" — kernel for the
-            # sliding-window CP layers (see cp_local_ring). fa gets off compiled flex.
-            sliding_cp_backend = str(getattr(text_config, "cp_sliding_attn_backend", "flex")).lower()
-            for module in self.modules():
-                if isinstance(module, Gemma4Attention):
-                    attach_gemma4_cp_ring_attention(module, use_ffpa=use_ffpa_cp, sliding_backend=sliding_cp_backend)
+            self._apply_cp_attention_backend_policy()
             return
 
         # --- MoE path: replace the text model ---
@@ -1123,6 +1151,7 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             moe_config=moe_config,
             moe_overrides=moe_overrides,
         )
+        self._apply_cp_attention_backend_policy()
 
         # Expose moe_config for the MoE parallelizer assertion
         self.model.moe_config = self.model.language_model.moe_config
@@ -1385,6 +1414,10 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
                 image_features = self.model.get_image_features(
                     pixel_values, image_position_ids=image_position_ids, return_dict=True
                 ).pooler_output
+                # transformers >=5.15 returns one tensor per image; earlier versions
+                # return them already stacked.
+                if not torch.is_tensor(image_features):
+                    image_features = torch.cat(image_features, dim=0)
                 image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
 
                 if mm_token_type_ids is not None:
@@ -1585,6 +1618,10 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             image_features = self.model.get_image_features(
                 pixel_values, image_position_ids=image_position_ids, return_dict=True
             ).pooler_output
+            # transformers >=5.15 returns one tensor per image; earlier versions
+            # return them already stacked.
+            if not torch.is_tensor(image_features):
+                image_features = torch.cat(image_features, dim=0)
             image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
             image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_features)

@@ -56,7 +56,6 @@ __all__ = [
 ]
 
 _LAZY_ATTRS = {
-    "resolve_storage_dtype": (".precision_warnings", "resolve_storage_dtype"),
     "warn_if_torch_adam_with_bf16_params": (".precision_warnings", "warn_if_torch_adam_with_bf16_params"),
 }
 

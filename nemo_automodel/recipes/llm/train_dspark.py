@@ -57,11 +57,10 @@ from nemo_automodel.components.datasets import (
     build_cached_dspark_dataloader,
     build_dspark_vlm_dataloader,
     build_eagle3_dataloader,
+    ensure_supervision_options_match,
     read_target_weight_modules,
 )
-from nemo_automodel.components.datasets import (
-    dspark_read_manifest as read_manifest,
-)
+from nemo_automodel.components.datasets import dspark_read_manifest as read_manifest
 from nemo_automodel.components.distributed import (
     FSDP2Config,
     apply_selective_checkpointing_to_layers,
@@ -919,6 +918,7 @@ class TrainDSparkRecipe(BaseRecipe):
                     distributed=self.dist_env.world_size > 1,
                     shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
                     mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
+                    mask_generation_prompt=recipe_cfg.get("mask_generation_prompt", False),
                     packed_sequence_size=self.packed_sequence_size,
                     dp_mesh=self.dp_mesh,
                 )
@@ -935,6 +935,7 @@ class TrainDSparkRecipe(BaseRecipe):
                         distributed=self.dist_env.world_size > 1,
                         shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
                         mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
+                        mask_generation_prompt=recipe_cfg.get("mask_generation_prompt", False),
                         packed_sequence_size=self.packed_sequence_size,
                     )
         else:
@@ -948,6 +949,17 @@ class TrainDSparkRecipe(BaseRecipe):
                 target_model_type=target_model_type,
                 seq_length=recipe_cfg.seq_length,
                 compute_dtype=self.compute_dtype,
+            )
+            # The cached loss masks are used as stored, so the options that shaped them must match.
+            ensure_supervision_options_match(
+                manifest,
+                {
+                    "mask_reasoning_content": recipe_cfg.get("mask_reasoning_content", False),
+                    "mask_generation_prompt": recipe_cfg.get("mask_generation_prompt", False),
+                },
+                cache_name="DSpark",
+                cache_dir=self.cached_target_path,
+                producer_name="precompute_dspark (or precompute_dspark_dist)",
             )
             embed_src, head_src = read_target_weight_modules(self.cached_target_path)
             self.train_dataloader = build_cached_dspark_dataloader(

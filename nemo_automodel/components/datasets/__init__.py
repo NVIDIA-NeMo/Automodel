@@ -61,6 +61,7 @@ _LAZY_ATTRS = {
     "eagle3_read_manifest": (".llm.eagle3_cache", "read_manifest"),
     "eagle3_write_manifest": (".llm.eagle3_cache", "write_manifest"),
     "eagle3_write_shard": (".llm.eagle3_cache", "write_shard"),
+    "ensure_supervision_options_match": (".llm.offline_cache", "ensure_supervision_options_match"),
     "has_chat_template": (".llm.formatting_utils", "_has_chat_template"),
     "is_compressed": (".llm.eagle3_cache", "is_compressed"),
     "load_datasets": (".llm.retrieval_dataset", "load_datasets"),

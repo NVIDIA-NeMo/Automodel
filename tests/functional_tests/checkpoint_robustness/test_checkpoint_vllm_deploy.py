@@ -93,6 +93,7 @@ def _resolve_args(custom_args):
     model_cfg = cfg.get("model", {})
     tokenizer_cfg = cfg.get("tokenizer", {})
     ci_cfg = cfg.get("ci", {})
+    ckpt_robustness_cfg = ci_cfg.get("checkpoint_robustness") or {}
 
     # -- model_path and adapter_path --
     if mode == "peft":
@@ -115,6 +116,8 @@ def _resolve_args(custom_args):
     # -- tokenizer --
     if "tokenizer" in custom_args:
         tokenizer = custom_args["tokenizer"]
+    elif ckpt_robustness_cfg.get("tokenizer_name"):
+        tokenizer = ckpt_robustness_cfg["tokenizer_name"]
     elif tokenizer_cfg.get("pretrained_model_name_or_path"):
         tokenizer = tokenizer_cfg["pretrained_model_name_or_path"]
     else:
@@ -123,7 +126,6 @@ def _resolve_args(custom_args):
     # -- flags --
     # trust_remote_code placement varies: top-level `model:` or nested under
     # `ci.checkpoint_robustness:`. Accept any source that says true.
-    ckpt_robustness_cfg = ci_cfg.get("checkpoint_robustness") or {}
     trust_remote_code = bool(
         custom_args.get("trust_remote_code")
         or model_cfg.get("trust_remote_code")

@@ -37,6 +37,10 @@ from nemo_automodel.components.checkpoint._backports.hf_storage import (
 )
 from nemo_automodel.components.checkpoint._backports.hf_utils import CUSTOM_METADATA_KEY
 
+# Over the default 5s budget on purpose: this module spawns worker processes; every child re-imports torch from scratch.
+# Shrink the work or the process count before raising this further.
+pytestmark = pytest.mark.timeout(60)
+
 
 @pytest.mark.run_only_on("CPU")
 def test_write_scalar_tensor(tmp_path):

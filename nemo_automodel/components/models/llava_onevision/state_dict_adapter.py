@@ -45,7 +45,7 @@ _NEMO_TO_HF_RULES = [
 
 
 class LlavaOneVisionStateDictAdapter(StateDictAdapter):
-    _supports_write_through_checkpoint_load = True
+    _supports_low_memory_dcp_load = True
 
     def __init__(self, config: Any = None, **kwargs):
         self.config = config

@@ -64,6 +64,7 @@ _RENAME_PAIRS_HF_TO_NATIVE: tuple[tuple[str, str], ...] = (
 )
 
 _LAYER_QKV_RE = re.compile(r"^(?P<prefix>(?:.*\.)?layers\.\d+)\.attention\.query_key_value\.weight$")
+_NATIVE_LAYER_QKV_RE = re.compile(r"^(?P<prefix>(?:.*\.)?layers\.\d+)\.self_attn\.(?P<projection>[qkv])_proj\.weight$")
 
 
 def _rename_hf_to_native(key: str) -> str:
@@ -86,6 +87,8 @@ def _rename_native_to_hf(key: str) -> str:
 class BailingMoeV2StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
     """State-dict adapter for BailingMoeV2 / Ling 2.0 checkpoints."""
 
+    _supports_low_memory_dcp_load = True
+
     def __init__(
         self,
         config: BailingMoeV2Config,
@@ -98,6 +101,11 @@ class BailingMoeV2StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapt
         self.backend = backend
         self.dtype = dtype
         self._uses_model_prefix = True
+
+    @property
+    def supports_low_memory_dcp_load(self) -> bool:
+        """Whether Ling's DCP load needs only small fused-QKV temporary tensors."""
+        return self.moe_config is not None and super().supports_low_memory_dcp_load
 
     # ---- HF -> native ----------------------------------------------------
 
@@ -167,9 +175,9 @@ class BailingMoeV2StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapt
                     hf_state_dict[k] = v
                 continue
 
-            m = re.match(r"^(?P<prefix>(?:.*\.)?layers\.\d+)\.self_attn\.(?P<proj>[qkv])_proj\.weight$", fqn)
+            m = _NATIVE_LAYER_QKV_RE.match(fqn)
             if m:
-                pending_qkv.setdefault(m.group("prefix"), {})[m.group("proj")] = tensor
+                pending_qkv.setdefault(m.group("prefix"), {})[m.group("projection")] = tensor
                 continue
 
             hf_state_dict[_rename_native_to_hf(fqn)] = tensor
@@ -201,8 +209,8 @@ class BailingMoeV2StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapt
         if converted is not None:
             return converted
 
-        m = re.match(r"^(?P<prefix>(?:.*\.)?layers\.\d+)\.self_attn\.(?P<proj>[qkv])_proj\.weight$", fqn)
+        m = _NATIVE_LAYER_QKV_RE.match(fqn)
         if m:
-            return [(f"{m.group('prefix')}.attention.{m.group('proj')}_proj.weight", tensor)]
+            return [(f"{m.group('prefix')}.attention.{m.group('projection')}_proj.weight", tensor)]
 
         return [(_rename_native_to_hf(fqn), tensor)]
