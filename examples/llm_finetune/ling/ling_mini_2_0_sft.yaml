@@ -113,6 +113,12 @@ ci:
     tokenizer_name: inclusionAI/Ling-mini-2.0
     trust_remote_code: true
     hf_device_map_auto: true
+    # The trained checkpoint matches HF in FP32 at 256 tokens (mean KL ~1e-10).
+    # BF16 rounding changes router choices: full-2K mean KL is ~0.007, and HF
+    # itself reaches ~0.003 across input lengths. Keep native policies unchanged.
+    parity_tolerance_profile_overrides:
+      source_load: relaxed
+      hf_reload: relaxed
     step_scheduler.global_batch_size: 8
     step_scheduler.local_batch_size: 1
     dataset.num_samples_limit: 500
