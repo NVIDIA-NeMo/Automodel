@@ -95,7 +95,7 @@ def _model(variant: str, dispatcher: str, device: torch.device) -> torch.nn.Modu
                 orig,
                 dim=8,
                 alpha=16,
-                expert_weight_format="mxfp4" if device.type == "cuda" and variant == "mxfp4_lora" else "bf16",
+                expert_weight_format="mxfp4" if device.type == "cuda" and variant == "mxfp4_lora" else "unquantized",
             )
         with torch.no_grad():
             for name, param in model.named_parameters():

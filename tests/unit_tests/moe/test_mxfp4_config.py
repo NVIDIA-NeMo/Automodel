@@ -123,7 +123,7 @@ def test_unquantized_storage_supports_fp32(moe_config: MoEConfig) -> None:
     original = GroupedExperts(moe_config)
     with torch.no_grad():
         original.init_weights(torch.device("cpu"))
-    patched = patch_moe_module(original, dim=4, expert_weight_format="bf16")
+    patched = patch_moe_module(original, dim=4, expert_weight_format="unquantized")
     assert patched.gate_and_up_projs.dtype == torch.float32
     assert patched.lora_gate_and_up_A.dtype == torch.float32
     x_ref = torch.randn(4, 64, requires_grad=True)

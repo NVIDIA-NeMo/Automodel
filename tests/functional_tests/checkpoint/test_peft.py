@@ -269,7 +269,7 @@ def test_hf_peft_checkpoint(force_hf, use_triton):
         "dropout": 0.0,
         "dropout_position": "post",
         "exclude_modules": [],
-        "expert_weight_format": "bf16",
+        "expert_weight_format": "unquantized",
         "lora_A_init": "xavier",
         "lora_dtype": None,
         "match_all_linear": True,

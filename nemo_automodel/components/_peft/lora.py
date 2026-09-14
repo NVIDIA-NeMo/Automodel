@@ -64,10 +64,10 @@ class PeftConfig:
     use_memory_efficient_lora: bool = True
     use_triton: bool = False
     moe_rank_scaling: bool = False
-    # Storage mode, not a torch dtype: "bf16" uses the ordinary floating-point
+    # Storage mode, not a torch dtype: "unquantized" uses the ordinary floating-point
     # experts with the model's configured precision (including FP32). "mxfp4"
     # stores frozen expert bases as fp4-e2m1 + e8m0 scales and requires torch_mm.
-    expert_weight_format: Literal["bf16", "mxfp4"] = "bf16"
+    expert_weight_format: Literal["unquantized", "mxfp4"] = "unquantized"
 
     def to_dict(self):
         return self.__dict__.copy()
@@ -88,7 +88,7 @@ class PeftConfig:
             use_memory_efficient_lora=d.get("use_memory_efficient_lora", True),
             use_triton=d.get("use_triton", False),
             moe_rank_scaling=d.get("moe_rank_scaling", False),
-            expert_weight_format=d.get("expert_weight_format", "bf16"),
+            expert_weight_format=d.get("expert_weight_format", "unquantized"),
         )
 
 
@@ -538,7 +538,7 @@ def patch_moe_module(
     alpha: int = 32,
     lora_A_init_method: str = "xavier",
     lora_dtype: torch.dtype | str | None = None,
-    expert_weight_format: Literal["bf16", "mxfp4"] = "bf16",
+    expert_weight_format: Literal["unquantized", "mxfp4"] = "unquantized",
 ) -> nn.Module:
     """
     Patches a custom MoE module (GroupedExperts or GroupedExpertsDeepEP) with LoRA.
@@ -550,18 +550,18 @@ def patch_moe_module(
         lora_A_init_method (str, optional): Initialization method for LoRA A matrix. Defaults to "xavier".
         lora_dtype (torch.dtype or str, optional): Data type for LoRA weights. Defaults to None.
         expert_weight_format (str, optional): Storage mode, not a torch dtype.
-            "bf16" uses ordinary floating-point experts with the model's configured
-            precision, including FP32; it does not cast weights to BF16. "mxfp4"
+            "unquantized" uses ordinary floating-point experts with the model's configured
+            precision, including FP32. "mxfp4"
             stores frozen bases as fp4-e2m1 + e8m0 block scales. Meta experts receive
             packed placeholders for direct checkpoint loading; already materialized
-            weights are quantized in place of the floating-point base. Defaults to "bf16".
+            weights are quantized in place of the floating-point base. Defaults to "unquantized".
 
     Returns:
         nn.Module: The LoRA-wrapped MoE module.
     """
-    if expert_weight_format not in ("bf16", "mxfp4"):
+    if expert_weight_format not in ("unquantized", "mxfp4"):
         raise ValueError(
-            f"Unsupported expert_weight_format: {expert_weight_format!r}. Expected 'bf16' or 'mxfp4' "
+            f"Unsupported expert_weight_format: {expert_weight_format!r}. Expected 'unquantized' or 'mxfp4' "
             "as the storage mode; floating-point dtype is controlled by the model's precision configuration."
         )
     common = dict(lora_dim=dim, alpha=alpha, lora_A_init_method=lora_A_init_method, lora_dtype=lora_dtype)

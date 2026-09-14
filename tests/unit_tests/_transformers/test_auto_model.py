@@ -833,10 +833,10 @@ class TestApplyPeftAndLowerPrecision:
         apply_mxfp4.assert_called_once_with(model)
         assert events == ["lora", "mxfp4"]
 
-    def test_apply_peft_skips_mxfp4_for_bf16_experts(self):
+    def test_apply_peft_skips_mxfp4_for_unquantized_experts(self):
         model = MagicMock()
         peft_config = MagicMock()
-        peft_config.expert_weight_format = "bf16"
+        peft_config.expert_weight_format = "unquantized"
 
         with (
             patch("nemo_automodel._transformers.infrastructure.apply_lora_to_linear_modules"),
