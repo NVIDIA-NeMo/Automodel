@@ -22,9 +22,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Partial, Replicate
 
 from nemo_automodel.components.models.common.utils import set_is_first_microbatch, set_is_optim_step
-from nemo_automodel.shared.import_utils import safe_import
-
-_HAVE_TE_OPTIMIZERS, te_optimizers = safe_import("transformer_engine.pytorch.optimizers")
+from nemo_automodel.shared.import_utils import safe_import, safe_import_te
 
 # Regex pattern to match expert parameters in GroupedExpertsTE.
 # Matches FQNs like:
@@ -111,7 +109,7 @@ def count_tail_padding(labels, ignore_label=-100):
 
 
 def _local_l2_norm(gradients: list[torch.Tensor], target_device: torch.device) -> torch.Tensor:
-    """Reduce local gradients, using TE directly on eligible gradient storage.
+    """Reduce local gradients, lazily loading TE for eligible gradient storage.
 
     Args:
         gradients: Plain local tensors of arbitrary shape, without DTensor placements.
@@ -132,8 +130,7 @@ def _local_l2_norm(gradients: list[torch.Tensor], target_device: torch.device) -
         if gradient.numel() == 0:
             continue
         if (
-            _HAVE_TE_OPTIMIZERS
-            and type(gradient) is torch.Tensor
+            type(gradient) is torch.Tensor
             and gradient.is_cuda
             and gradient.is_contiguous()
             and gradient.dtype in (torch.float16, torch.bfloat16, torch.float32)
@@ -150,6 +147,14 @@ def _local_l2_norm(gradients: list[torch.Tensor], target_device: torch.device) -
             norms.append(torch.linalg.vector_norm(gradient, dtype=dtype).to(target_device))
 
     for (device, _), group in te_groups.items():
+        # Load TE only for eligible CUDA gradients. Its shared loader handles
+        # known binary incompatibilities, preserving the optional fallback.
+        have_te, te_optimizers = (
+            safe_import("transformer_engine.pytorch.optimizers") if safe_import_te()[0] else (False, None)
+        )
+        if not have_te:
+            norms.extend(torch.linalg.vector_norm(g, dtype=torch.float64).to(target_device) for g in group)
+            continue
         overflow = torch.zeros(1, dtype=torch.int32, device=device)
         norm, _ = te_optimizers.multi_tensor_applier(te_optimizers.multi_tensor_l2norm, overflow, [group], False)
         norm = norm.reshape(()).to(dtype=torch.float64)

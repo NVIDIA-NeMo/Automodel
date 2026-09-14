@@ -26,9 +26,10 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor, Partial, Replicate, Shard, distribute_tensor
 
 from nemo_automodel.components.training import utils
+from nemo_automodel.shared.import_utils import safe_import_te
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or not utils._HAVE_TE_OPTIMIZERS,
+    not torch.cuda.is_available() or not safe_import_te()[0],
     reason="Requires CUDA and Transformer Engine",
 )
 
@@ -48,7 +49,8 @@ def _reference_norm(gradients):
 @pytest.mark.parametrize("use_te", [True, False])
 def test_norm_clipped_gradients_and_optimizer_step(layout, use_te, monkeypatch):
     """Compare norm, clipping, and an SGD update to an independent FP64 reference."""
-    monkeypatch.setattr(utils, "_HAVE_TE_OPTIMIZERS", use_te)
+    if not use_te:
+        monkeypatch.setattr(utils, "safe_import_te", lambda: (False, None))
     torch.manual_seed(23)
     parameters, references, gradients = [], [], []
     for dtype in (torch.float16, torch.bfloat16, torch.float32, torch.float64, torch.complex64, torch.complex128):
