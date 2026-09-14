@@ -28,6 +28,8 @@ swapping the mixin's primitives.
 import logging
 
 import torch
+import torch.distributed as dist
+import torch.distributed.nn.functional as dist_nn_f
 import torch.nn as nn
 from torch.distributed.tensor import DTensor
 
@@ -248,15 +250,26 @@ class GroupedExpertsMXFP4(MXFP4ExpertStorageMixin, GroupedExperts):
 
         assert self.n_routed_experts % ep_size == 0
 
-        ep_inputs = self._gather_ep_inputs(x, token_mask, weights, indices, ep_mesh=ep_mesh)
-        x, token_mask, weights, indices = ep_inputs.x, ep_inputs.token_mask, ep_inputs.weights, ep_inputs.indices
+        if ep_size > 1:
+            ep_group = ep_mesh.get_group()
+            local_num_tokens = x.size(0)
+            x, weights, indices, token_mask, gathered_lens = self._gather_ep_inputs(
+                x, token_mask, weights, indices, ep_group=ep_group, ep_size=ep_size
+            )
 
         n_local_experts = self.n_routed_experts // ep_size
         experts_start_idx = ep_rank * n_local_experts
 
         y = self._forward_grouped_mm_mxfp4(x, token_mask, weights, indices, n_local_experts, experts_start_idx)
 
-        y = self._combine_ep_output(y, ep_inputs)
+        if ep_size > 1:
+            # Keep the differentiable all-gather path attached to x without materializing a full-size zero tensor.
+            y.add_(x.sum(dtype=torch.float32) * 0.0)
+
+            # Reduce and narrow to the original per-rank token boundaries.
+            y = dist_nn_f.all_reduce(y, op=dist.ReduceOp.SUM, group=ep_group)
+            start = sum(gathered_lens[:ep_rank])
+            y = y.narrow(0, start, local_num_tokens).contiguous()
 
         return y.to(input_dtype)
 
@@ -363,10 +376,9 @@ class GroupedExpertsDeepEPMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsDeepEP):
             f"Number of experts must be divisible by ep_size (ep_size={self.ep_size})"
         )
 
-        dispatched = self._dispatch_tokens(x, token_mask, weights, indices)
-        permuted_local_hidden_states = dispatched.hidden_states
-        tokens_per_expert = dispatched.tokens_per_expert
-        permuted_probs = dispatched.probs
+        permuted_local_hidden_states, tokens_per_expert, permuted_probs = self._dispatch_tokens(
+            x, token_mask, weights, indices
+        )
 
         if torch.count_nonzero(tokens_per_expert) > 0:
             tokens_per_expert_gpu = tokens_per_expert.to(device=permuted_local_hidden_states.device, non_blocking=True)

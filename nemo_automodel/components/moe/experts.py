@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
 from functools import partial
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
@@ -397,45 +396,6 @@ def _apply_bias(value, bias, tokens_per_expert, permuted_probs=None):
     return (flat_value + expanded_bias).view(shape).to(value.dtype)
 
 
-@dataclass
-class _EPInputs:
-    """Gathered inputs and the original rank's token boundaries.
-
-    Attributes:
-        x: Tensor of shape [gathered_tokens, hidden], concatenated in EP rank order.
-        token_mask: Tensor of shape [gathered_tokens], marking valid tokens.
-        weights: Tensor of shape [gathered_tokens, topk], with differentiable routing probabilities.
-        indices: Tensor of shape [gathered_tokens, topk], containing global expert IDs.
-        group: EP process group, or None for local execution.
-        local_start: First token belonging to this rank in the gathered tensors.
-        local_length: Number of tokens originally supplied by this rank.
-    """
-
-    x: torch.Tensor
-    token_mask: torch.Tensor
-    weights: torch.Tensor
-    indices: torch.Tensor
-    group: dist.ProcessGroup | None
-    local_start: int
-    local_length: int
-
-
-@dataclass
-class _DispatchedTokens:
-    """Expert-sorted tokens returned by the DeepEP/HybridEP dispatcher.
-
-    Attributes:
-        hidden_states: Tensor of shape [dispatched_tokens, hidden], sorted by local expert.
-        tokens_per_expert: Tensor of shape [local_experts], giving each expert's token count.
-        probs: Tensor of shape [dispatched_tokens, 1], retaining nonempty router precision.
-            Empty probabilities use the dispatched activation dtype for stable recomputation.
-    """
-
-    hidden_states: torch.Tensor
-    tokens_per_expert: torch.Tensor
-    probs: torch.Tensor
-
-
 class GroupedExperts(nn.Module):
     """
     Sparse MoE implementation using all-gather/reduce-scatter primitives.
@@ -499,86 +459,68 @@ class GroupedExperts(nn.Module):
         weights: torch.Tensor,
         indices: torch.Tensor,
         *,
-        ep_mesh: DeviceMesh | None,
-    ) -> _EPInputs:
-        """Gather unequal token shards without detaching activation or router gradients.
+        ep_group: dist.ProcessGroup,
+        ep_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[int]]:
+        """Gather unequal token shards across the expert-parallel group.
 
         Args:
-            x: Tensor of shape [local_tokens, hidden], containing this EP rank's activations.
+            x: Tensor of shape [local_tokens, hidden], containing local activations.
             token_mask: Tensor of shape [local_tokens], marking valid tokens.
             weights: Tensor of shape [local_tokens, topk], containing routing probabilities.
             indices: Tensor of shape [local_tokens, topk], containing global expert IDs.
-            ep_mesh: One-dimensional expert mesh. Tokens may differ in count across ranks;
-                expert parameters are sharded along their expert axis on this mesh.
+            ep_group: Expert-parallel process group.
+            ep_size: Number of ranks in ep_group.
 
         Returns:
-            Gathered activations, mask, routing weights and IDs with the layouts documented
-            by _EPInputs, plus the original local token boundaries. Local execution aliases
-            the inputs; multi-rank execution concatenates in rank order and gathers weights
-            in FP32. Activations and weights retain their autograd connections.
+            Activations [gathered_tokens, hidden], routing weights [gathered_tokens, topk],
+            expert IDs [gathered_tokens, topk], mask [gathered_tokens], and per-rank token counts,
+            concatenated in rank order without padding. Activations and FP32 routing weights
+            retain their autograd connections.
         """
-        local_length = x.size(0)
-        if ep_mesh is None or ep_mesh.size() == 1:
-            return _EPInputs(x, token_mask, weights, indices, None, 0, local_length)
+        local_num_tokens = x.size(0)
 
-        group = ep_mesh.get_group()
-        local_len = torch.tensor([local_length], device=x.device, dtype=torch.int64)
-        lengths = [torch.zeros_like(local_len) for _ in range(ep_mesh.size())]
-        dist.all_gather(lengths, local_len, group=group)
-        gathered_lens = [int(length.item()) for length in lengths]
+        # Exchange per-rank token counts
+        local_len_t = torch.tensor([local_num_tokens], device=x.device, dtype=torch.int64)
+        gathered_len_t = [torch.zeros_like(local_len_t) for _ in range(ep_size)]
+        dist.all_gather(gathered_len_t, local_len_t, group=ep_group)
+        gathered_lens = [int(t.item()) for t in gathered_len_t]
         max_len = max(gathered_lens)
 
-        def gather(tensor: torch.Tensor, *, differentiable: bool) -> torch.Tensor:
+        def _all_gather_dim0_var(local_tensor: torch.Tensor, *, differentiable: bool) -> torch.Tensor:
             """Gather along the token axis, padding only for communication.
 
             Args:
-                tensor: Tensor of shape [local_tokens, ...], with arbitrary trailing axes
-                    that must match across EP ranks.
-                differentiable: Whether backward must reduce gradients to the source rank.
+                local_tensor: Tensor of shape [local_tokens, ...], with matching trailing axes across ranks.
+                differentiable: Whether backward reduces gradients to each source rank.
 
             Returns:
-                Tensor of shape [gathered_tokens, ...], concatenated in EP rank order.
+                Tensor of shape [gathered_tokens, ...], concatenated in rank order without padding.
             """
             if differentiable:
-                return _AllGatherConcatVarlenFn.apply(tensor, group, gathered_lens, max_len)
-            if max_len > tensor.size(0):
-                pad = tensor.new_zeros((max_len - tensor.size(0),) + tuple(tensor.shape[1:]))
-                tensor = torch.cat([tensor, pad], dim=0)
-            gathered = [torch.empty_like(tensor) for _ in gathered_lens]
-            dist.all_gather(gathered, tensor, group=group)
-            return torch.cat([part[:length] for part, length in zip(gathered, gathered_lens)], dim=0)
+                return _AllGatherConcatVarlenFn.apply(local_tensor, ep_group, gathered_lens, max_len)
+            if max_len > local_tensor.size(0):
+                pad_shape = (max_len - local_tensor.size(0),) + tuple(local_tensor.shape[1:])
+                pad = torch.zeros(pad_shape, dtype=local_tensor.dtype, device=local_tensor.device)
+                local_padded = torch.cat([local_tensor, pad], dim=0)
+            else:
+                local_padded = local_tensor
+            gathered = [torch.empty_like(local_padded) for _ in range(ep_size)]
+            dist.all_gather(gathered, local_padded, group=ep_group)
+            gathered = [g[:n] for g, n in zip(gathered, gathered_lens)]
+            return torch.cat(gathered, dim=0)
 
-        return _EPInputs(
-            gather(x, differentiable=True),
-            gather(token_mask, differentiable=False),
-            gather(weights.float(), differentiable=True),
-            gather(indices, differentiable=False),
-            group,
-            sum(gathered_lens[: ep_mesh.get_local_rank()]),
-            local_length,
-        )
+        x = _all_gather_dim0_var(x, differentiable=True)
+        # Routing probabilities participate in the main-loss gradient.
+        # A plain ``dist.all_gather`` detaches every gathered tensor and
+        # silently leaves the router trainable only through auxiliary
+        # losses.  Use the same autograd-safe variable-length gather as
+        # activations so each source rank receives its local weight grad.
+        weights = _all_gather_dim0_var(weights.float(), differentiable=True)
+        indices = _all_gather_dim0_var(indices, differentiable=False)
+        token_mask = _all_gather_dim0_var(token_mask, differentiable=False)
 
-    @staticmethod
-    def _combine_ep_output(output: torch.Tensor, inputs: _EPInputs) -> torch.Tensor:
-        """Sum expert contributions and restore this rank's original token boundaries.
-
-        Args:
-            output: Tensor of shape [gathered_tokens, hidden] or [gathered_tokens, topk, hidden],
-                holding this rank's partial expert results in independent writable storage.
-                The zero-valued autograd dependency is added in place.
-            inputs: Gathered activations [gathered_tokens, hidden], mask [gathered_tokens],
-                weights and IDs [gathered_tokens, topk], and EP boundaries from _gather_ep_inputs.
-
-        Returns:
-            Tensor of shape [local_tokens, hidden] or [local_tokens, topk, hidden], with expert
-            contributions summed. Local execution aliases output. Empty local routing still
-            participates in activation-gather backward on every EP rank.
-        """
-        if inputs.group is None:
-            return output
-        output.add_(inputs.x.sum(dtype=torch.float32) * 0.0)
-        output = dist_nn_f.all_reduce(output, op=dist.ReduceOp.SUM, group=inputs.group)
-        return output.narrow(0, inputs.local_start, inputs.local_length).contiguous()
+        return x, weights, indices, token_mask, gathered_lens
 
     def forward(
         self,
@@ -651,8 +593,14 @@ class GroupedExperts(nn.Module):
             else None
         )
 
-        ep_inputs = self._gather_ep_inputs(x, token_mask, weights, indices, ep_mesh=ep_mesh)
-        x, token_mask, weights, indices = ep_inputs.x, ep_inputs.token_mask, ep_inputs.weights, ep_inputs.indices
+        # EP variable-length all-gather
+        if ep_size > 1:
+            ep_group = ep_mesh.get_group()
+            local_num_tokens = x.size(0)
+
+            x, weights, indices, token_mask, gathered_lens = self._gather_ep_inputs(
+                x, token_mask, weights, indices, ep_group=ep_group, ep_size=ep_size
+            )
 
         n_local_experts = self.n_routed_experts // ep_size
         experts_start_idx = ep_rank * n_local_experts
@@ -686,7 +634,14 @@ class GroupedExperts(nn.Module):
                 experts_end_idx,
             )
 
-        y = self._combine_ep_output(y, ep_inputs)
+        if ep_size > 1:
+            # Keep the differentiable all-gather path attached to x without materializing a full-size zero tensor.
+            y.add_(x.sum(dtype=torch.float32) * 0.0)
+
+            # Reduce and narrow to the original per-rank token boundaries.
+            y = dist_nn_f.all_reduce(y, op=dist.ReduceOp.SUM, group=ep_group)
+            start = sum(gathered_lens[:ep_rank])
+            y = y.narrow(0, start, local_num_tokens).contiguous()
 
         if self.config.apply_router_weight_after_down:
             y = y.sum(dim=1)
@@ -1112,29 +1067,31 @@ class GroupedExpertsDeepEP(nn.Module):
         token_mask: torch.Tensor,
         weights: torch.Tensor,
         indices: torch.Tensor,
-    ) -> _DispatchedTokens:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Dispatch valid tokens and stabilize empty probabilities for recomputation.
 
         Args:
-            x: Tensor of shape [local_tokens, hidden], containing this rank's activations.
+            x: Tensor of shape [local_tokens, hidden], containing local activations.
             token_mask: Tensor of shape [local_tokens], marking valid tokens.
             weights: Tensor of shape [local_tokens, topk], containing routing probabilities.
             indices: Tensor of shape [local_tokens, topk], containing global expert IDs.
 
         Returns:
             Expert-sorted activations [dispatched_tokens, hidden], counts [local_experts],
-            and probabilities [dispatched_tokens, 1], as documented by _DispatchedTokens.
-            Nonempty probabilities retain the dispatcher's dtype and autograd connection.
+            and probabilities [dispatched_tokens, 1]. Nonempty probabilities retain the
+            dispatcher's dtype and autograd connection; empty probabilities use the
+            dispatched activation dtype.
         """
         indices = indices.masked_fill(~token_mask.unsqueeze(-1), -1)
-        hidden_states, tokens_per_expert, probs = self.token_dispatcher.token_permutation2(
+        (permuted_local_hidden_states, tokens_per_expert, permuted_probs) = self.token_dispatcher.token_permutation2(
             hidden_states=x,
             num_local_tokens=x.size(0),
             token_probs=weights,
             token_indices=indices,
         )
-        probs = _stabilize_empty_routing_probs_dtype(probs, hidden_states.dtype)
-        return _DispatchedTokens(hidden_states, tokens_per_expert, probs.unsqueeze(-1))
+        permuted_probs = _stabilize_empty_routing_probs_dtype(permuted_probs, permuted_local_hidden_states.dtype)
+        permuted_probs = permuted_probs.unsqueeze(-1)
+        return permuted_local_hidden_states, tokens_per_expert, permuted_probs
 
     def forward(
         self,
@@ -1165,10 +1122,9 @@ class GroupedExpertsDeepEP(nn.Module):
             f"Number of experts must be divisible by ep_size (ep_size={self.ep_size})"
         )
 
-        dispatched = self._dispatch_tokens(x, token_mask, weights, indices)
-        permuted_local_hidden_states = dispatched.hidden_states
-        tokens_per_expert = dispatched.tokens_per_expert
-        permuted_probs = dispatched.probs
+        permuted_local_hidden_states, tokens_per_expert, permuted_probs = self._dispatch_tokens(
+            x, token_mask, weights, indices
+        )
         activation_probs = (
             torch.ones_like(permuted_probs) if self.config.apply_router_weight_after_down else permuted_probs
         )

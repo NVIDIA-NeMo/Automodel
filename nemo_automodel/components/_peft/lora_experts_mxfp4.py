@@ -15,6 +15,8 @@
 """MXFP4-resident expert LoRA implementations."""
 
 import torch
+import torch.distributed as dist
+import torch.distributed.nn.functional as dist_nn_f
 from torch.distributed.tensor import DTensor
 
 from nemo_automodel.components._peft.lora_experts import (
@@ -99,15 +101,26 @@ class GroupedExpertsLoRAMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsLoRA):
 
         assert self.n_routed_experts % ep_size == 0
 
-        ep_inputs = self._gather_ep_inputs(x, token_mask, weights, indices, ep_mesh=ep_mesh)
-        x, token_mask, weights, indices = ep_inputs.x, ep_inputs.token_mask, ep_inputs.weights, ep_inputs.indices
+        if ep_size > 1:
+            ep_group = ep_mesh.get_group()
+            local_num_tokens = x.size(0)
+            x, weights, indices, token_mask, gathered_lens = self._gather_ep_inputs(
+                x, token_mask, weights, indices, ep_group=ep_group, ep_size=ep_size
+            )
 
         n_local_experts = self.n_routed_experts // ep_size
         experts_start_idx = ep_rank * n_local_experts
 
         y = self._forward_grouped_mm_mxfp4(x, token_mask, weights, indices, n_local_experts, experts_start_idx)
 
-        y = self._combine_ep_output(y, ep_inputs)
+        if ep_size > 1:
+            # Keep the differentiable all-gather path attached to x without materializing a full-size zero tensor.
+            y.add_(x.sum(dtype=torch.float32) * 0.0)
+
+            # Reduce and narrow to the original per-rank token boundaries.
+            y = dist_nn_f.all_reduce(y, op=dist.ReduceOp.SUM, group=ep_group)
+            start = sum(gathered_lens[:ep_rank])
+            y = y.narrow(0, start, local_num_tokens).contiguous()
 
         return y.to(input_dtype)
 
@@ -237,10 +250,9 @@ class GroupedExpertsDeepEPLoRAMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsDeepE
         assert self.use_torch_mm, "mxfp4-resident DeepEP experts require the torch_mm experts backend."
         assert self.n_routed_experts % self.ep_size == 0
 
-        dispatched = self._dispatch_tokens(x, token_mask, weights, indices)
-        permuted_local_hidden_states = dispatched.hidden_states
-        tokens_per_expert = dispatched.tokens_per_expert
-        permuted_probs = dispatched.probs
+        permuted_local_hidden_states, tokens_per_expert, permuted_probs = self._dispatch_tokens(
+            x, token_mask, weights, indices
+        )
 
         # Match the activation dtype for the LoRA grouped GEMMs (the base dequantizes to
         # x.dtype inside MXFP4GroupedMM; adapters may be fp32 — see GroupedExpertsLoRAMXFP4).

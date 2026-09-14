@@ -15,6 +15,8 @@
 import math
 
 import torch
+import torch.distributed as dist
+import torch.distributed.nn.functional as dist_nn_f
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed.tensor import DTensor
@@ -153,8 +155,8 @@ class GroupedExpertsLoRA(GroupedExperts):
     def forward(self, x: torch.Tensor, token_mask: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor):
         """Forward pass for GroupedExpertsLoRA with LoRA injection.
 
-        Preserves the tensor layouts and EP input/output contract documented by
-        GroupedExperts.forward; adds LoRA at the expert projections.
+        Mirrors GroupedExperts.forward but injects LoRA computations into
+        the expert processing at the projection level.
         """
         assert not isinstance(x, DTensor)
         input_dtype = x.dtype
@@ -180,8 +182,12 @@ class GroupedExpertsLoRA(GroupedExperts):
         lora_down_A = _to_grouped_mm_operand(self.lora_down_A, compute_dtype)
         lora_down_B = _to_grouped_mm_operand(self.lora_down_B, compute_dtype)
 
-        ep_inputs = self._gather_ep_inputs(x, token_mask, weights, indices, ep_mesh=ep_mesh)
-        x, token_mask, weights, indices = ep_inputs.x, ep_inputs.token_mask, ep_inputs.weights, ep_inputs.indices
+        local_num_tokens = x.size(0)
+        if ep_size > 1:
+            ep_group = ep_mesh.get_group()
+            x, weights, indices, token_mask, gathered_lens = self._gather_ep_inputs(
+                x, token_mask, weights, indices, ep_group=ep_group, ep_size=ep_size
+            )
 
         n_local_experts = self.n_routed_experts // ep_size
         experts_start_idx = ep_rank * n_local_experts
@@ -223,7 +229,13 @@ class GroupedExpertsLoRA(GroupedExperts):
                 experts_end_idx,
             )
 
-        y = self._combine_ep_output(y, ep_inputs)
+        if ep_size > 1:
+            # Ragged-aware combine, mirroring GroupedExperts.forward:
+            # redistribute(Shard(0)) would split the gathered output into equal chunks.
+            y.add_(x.sum(dtype=torch.float32) * 0.0)  # keep the differentiable gather attached
+            y = dist_nn_f.all_reduce(y, op=dist.ReduceOp.SUM, group=ep_group)
+            start = sum(gathered_lens[:ep_rank])
+            y = y.narrow(0, start, local_num_tokens).contiguous()
 
         return y.to(input_dtype)
 
@@ -480,16 +492,15 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
     ) -> torch.Tensor:
         """Forward pass for GroupedExpertsDeepEPLoRA with LoRA injection.
 
-        Preserves the tensor layouts and EP input/output contract documented by
-        GroupedExpertsDeepEP.forward; adds LoRA at the expert projections.
+        Mirrors GroupedExpertsDeepEP.forward but injects LoRA computations
+        into the expert processing at the projection level.
         """
         assert not isinstance(x, DTensor)
         assert self.n_routed_experts % self.ep_size == 0
 
-        dispatched = self._dispatch_tokens(x, token_mask, weights, indices)
-        permuted_local_hidden_states = dispatched.hidden_states
-        tokens_per_expert = dispatched.tokens_per_expert
-        permuted_probs = dispatched.probs
+        permuted_local_hidden_states, tokens_per_expert, permuted_probs = self._dispatch_tokens(
+            x, token_mask, weights, indices
+        )
 
         compute_dtype = x.dtype
         gate_and_up_projs = _to_grouped_mm_operand(self.gate_and_up_projs, compute_dtype)
