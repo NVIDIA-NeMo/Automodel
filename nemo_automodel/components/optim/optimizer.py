@@ -38,10 +38,12 @@ Megatron-FSDP sharding).  Subclasses only implement the small
 
 from __future__ import annotations
 
+import functools
 import importlib
 import inspect
 import logging
 import re
+import sys
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar
@@ -220,7 +222,7 @@ class OptimizerConfig:
 
     # Per-group LR/WD overrides matched by parameter name. Empty = single group
     # (unchanged behavior). Honored by the standard torch optimizers (typed configs
-    # and the optim_cls path). Dion-family configs do their own grouping and warn if
+    # and the factory escape hatch). Dion-family configs do their own grouping and warn if
     # this is set.
     param_group_overrides: list[ParamGroupOverride] = field(default_factory=list)
 
@@ -373,13 +375,21 @@ class FusedAdamConfig(OptimizerConfig):
     adam_w_mode: bool = True
     bias_correction: bool = True
     master_weights: bool = True
-    master_weight_dtype: str = "fp32"
+    # TE only accepts fp32/fp16 masters (and ``store_param_remainders`` needs fp32), so the
+    # default is explicit rather than ``None``: the old ``None`` default was forwarded
+    # verbatim and made TE raise "FusedAdam only supports fp32/fp16 master weights".
+    # An explicit ``null`` still means "let TE pick its own default".
+    master_weight_dtype: str | None = "fp32"
 
     def _build_optimizer(self, params, *, foreach: bool | None = None) -> torch.optim.Optimizer:
         from transformer_engine.pytorch.optimizers import FusedAdam
 
         kwargs = self._constructor_kwargs()
-        kwargs["master_weight_dtype"] = dtype_from_str(kwargs["master_weight_dtype"])
+        master_weight_dtype = kwargs.pop("master_weight_dtype", None)
+        if master_weight_dtype is not None:
+            # ``dtype_from_str`` falls back to bf16 for non-strings, so only convert an
+            # actual value; ``None`` drops the kwarg and defers to TE's own default.
+            kwargs["master_weight_dtype"] = dtype_from_str(master_weight_dtype)
         optimizer = FusedAdam(_drop_empty_local_shards(params), **kwargs)
         _avoid_redundant_te_master_weights_for_fp32_params(optimizer)
         return optimizer
@@ -552,10 +562,10 @@ class OptimizerFromFactoryConfig(OptimizerConfig):
     as the typed configs, so :func:`build_optimizer` never has to special-case it.
 
     Hyperparameters live in :attr:`kwargs`; the inherited ``lr``/``weight_decay``
-    fields are unused.  The factory is called as ``factory(params=..., **kwargs)``;
+    fields are unused.  The class is called as ``optim_cls(params=..., **kwargs)``;
     Dion-family optimizers (which need parameter grouping) should use the typed
     :class:`MuonConfig` instead.  A ``param_group_overrides`` entry in
-    :attr:`kwargs` is consumed here (not forwarded to the factory) to drive
+    :attr:`kwargs` is consumed here (not forwarded to :attr:`optim_cls`) to drive
     per-group LR/WD, matching the typed-config behavior.
     """
 
@@ -569,11 +579,11 @@ class OptimizerFromFactoryConfig(OptimizerConfig):
         device_mesh: DeviceMesh | None = None,
         is_peft: bool = False,
     ) -> list[torch.optim.Optimizer]:
-        assert callable(self.optim_cls), "OptimizerFromFactoryConfig.factory must be a callable"
+        assert callable(self.optim_cls), "OptimizerFromFactoryConfig.optim_cls must be a callable"
         foreach = _foreach_for_mesh(device_mesh)
 
         kwargs = dict(self.kwargs)
-        # For the optim_cls path, per-group overrides normally arrive inside ``kwargs``
+        # On this path, per-group overrides normally arrive inside ``kwargs``
         # (like every other hyperparameter, since the typed ``lr``/``weight_decay``
         # fields are unused here); pop them so they drive grouping rather than being
         # forwarded to the optimizer constructor. Fall back to the inherited field
@@ -585,7 +595,7 @@ class OptimizerFromFactoryConfig(OptimizerConfig):
             if isinstance(val, str):
                 kwargs[attr] = dtype_from_str(val)
         # Only inject ``foreach`` for factories that actually accept it. The TP>1 path sets
-        # ``foreach=False`` via ``_foreach_for_mesh``; passing it to a optim_cls that does not take
+        # ``foreach=False`` via ``_foreach_for_mesh``; passing it to an optimizer class that does not take
         # ``foreach`` (e.g. TE ``FusedAdam``) would raise.  Honour an explicit user-provided value.
         if foreach is not None and "foreach" not in kwargs and _accepts_foreach(self.optim_cls):
             kwargs["foreach"] = foreach
@@ -596,6 +606,13 @@ class OptimizerFromFactoryConfig(OptimizerConfig):
             # trainable parameters, and returns either a flat param list or the
             # per-group dicts.
             params = _trainable_params_or_groups(part, overrides)
+            # TE FusedAdam's multi_tensor_apply faults on zero-numel local shards; see
+            # _drop_empty_local_shards.  Same guard as FusedAdamConfig, for the ~30 shipped
+            # YAMLs that reach TE FusedAdam through the dotted
+            # ``_target_: transformer_engine...FusedAdam`` escape hatch rather than the
+            # ``fused_adam`` registry name.
+            if _is_te_fused_adam(self.optim_cls):
+                params = _drop_empty_local_shards(params)
             optimizers.append(self.optim_cls(params=params, **kwargs))
         warn_if_torch_adam_with_bf16_params(optimizer=optimizers, is_peft=is_peft, context="optim", logger=logger)
         return optimizers
@@ -617,6 +634,8 @@ class OptimizerFromFactoryConfig(OptimizerConfig):
         if foreach is not None and "foreach" not in kwargs and _accepts_foreach(self.optim_cls):
             kwargs["foreach"] = foreach
 
+        if _is_te_fused_adam(self.optim_cls):
+            param_groups = _drop_empty_local_shards(param_groups)
         return self.optim_cls(params=param_groups, **kwargs)
 
 
@@ -829,6 +848,28 @@ def _drop_empty_local_shards(params: list[Any]) -> list[Any]:
     return filtered
 
 
+def _is_te_fused_adam(optim_cls: Callable[..., Any]) -> bool:
+    """Return ``True`` if ``optim_cls`` is TransformerEngine's ``FusedAdam`` (or a subclass).
+
+    ``functools.partial`` wrappers are unwrapped (iteratively, for nested
+    partials) before the identity check, so ``partial(FusedAdam, ...)``
+    callables are recognized.  Other wrapper callables (closures, custom
+    factory functions) are opaque and are NOT recognized; such callables must
+    guard against zero-numel local shards themselves.
+
+    Identity-based and import-free: TE is an optional dependency, so this never
+    imports it.  If TE has not been imported yet, ``optim_cls`` cannot be TE's
+    ``FusedAdam`` class and the check is trivially ``False``.
+    """
+    while isinstance(optim_cls, functools.partial):
+        optim_cls = optim_cls.func
+    te_optimizers = sys.modules.get("transformer_engine.pytorch.optimizers")
+    if te_optimizers is None:
+        return False
+    te_fused_adam = getattr(te_optimizers, "FusedAdam", None)
+    return isinstance(te_fused_adam, type) and isinstance(optim_cls, type) and issubclass(optim_cls, te_fused_adam)
+
+
 def _accepts_foreach(optim_cls: type["torch.optim.Optimizer"]) -> bool:
     """Return ``True`` if ``optim_cls`` accepts a ``foreach`` kwarg.
 
@@ -928,7 +969,7 @@ def build_optimizer_config(
         return target(**kwargs)
     # Dion-family optimizers need parameter grouping; route a resolved dion class
     # (e.g. YAML ``_target_: dion.Muon``) to its typed config rather than the flat-params
-    # optim_cls escape hatch, which would lose grouping and leak grouping-only kwargs.
+    # escape hatch, which would lose grouping and leak grouping-only kwargs.
     if is_dion_optimizer(target):
         dion_config = _DION_CONFIG_FOR.get(getattr(target, "__name__", ""))
         if dion_config is None:

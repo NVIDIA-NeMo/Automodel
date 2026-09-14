@@ -522,7 +522,7 @@ class TestBuildOptimizerFactoryConfig:
             instantiate_calls.append(params)
             return "regular_opt"
 
-        optimizers = build_optimizer(model, OptimizerFromFactoryConfig(factory=fake_optimizer_factory))
+        optimizers = build_optimizer(model, OptimizerFromFactoryConfig(optim_cls=fake_optimizer_factory))
 
         assert len(instantiate_calls) == 1
         assert len(instantiate_calls[0]) > 0  # trainable params passed
@@ -538,7 +538,7 @@ class TestBuildOptimizerFactoryConfig:
             instantiate_calls.append(params)
             return f"opt_{len(instantiate_calls)}"
 
-        optimizers = build_optimizer(model, OptimizerFromFactoryConfig(factory=fake_optimizer_factory))
+        optimizers = build_optimizer(model, OptimizerFromFactoryConfig(optim_cls=fake_optimizer_factory))
 
         assert len(instantiate_calls) == 2
         assert len(optimizers) == 2
