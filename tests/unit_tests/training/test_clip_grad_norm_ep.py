@@ -45,7 +45,12 @@ from torch import nn
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.tensor import DTensor, Shard
 
-pytestmark = pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is required")
+# Over the default 5s budget on purpose: this module spawns worker processes; every child re-imports torch from scratch.
+# Shrink the work or the process count before raising this further.
+pytestmark = [
+    pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is required"),
+    pytest.mark.timeout(60),
+]
 
 MAX_NORM = 1.0
 _WORLD = 4
