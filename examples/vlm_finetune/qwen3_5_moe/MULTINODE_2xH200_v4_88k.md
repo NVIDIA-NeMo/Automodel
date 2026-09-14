@@ -28,6 +28,13 @@ for it is `qwen3_6_35b_v4_88k_2node_ep8.yaml`.
 Everything below is per node unless stated. `node_setup.sh` (not committed; the commands
 are inline here) did it with `sudo`.
 
+> **The `chilaingoc` account is shared.** During the run in §6, other SSH sessions on
+> node-2 (from two other IPs, working in `/mnt/fast/shared/120_Affine`) installed packages
+> and created directories under `/mnt/fast/shared`, and `/mnt/fast/hf/hub` (the 67 GB of
+> base weights) was deleted by something outside this work; it needed no `sudo`, so it
+> left no log. The weights were restored from node-3's copy. Coordinate GPU use with
+> whoever else has the account, and keep a second copy of anything you cannot re-download.
+
 ### 1.1 Storage
 
 The boot disk is 194 GB. The 32 local SSDs (375 GB each, `nvme_card*`, no partitions)
@@ -313,20 +320,85 @@ Reference from `SWEEP_8xH200_v4_88k.md` (8 GPUs, one node): lbs 2 grouped 9.79 s
 
 ---
 
-## 6. Recommended configuration
+## 6. End-to-end run with checkpointing (the recommended config)
 
-`qwen3_6_35b_v4_88k_2node_ep8.yaml`: `ep_size: 8`, `local_batch_size: 4`,
-`global_batch_size: 64`, `length_grouped_sampler` on, `AdamW8bit`, `max_lr: 5e-6`.
-Expected: ~1,355 steps/epoch × 7.1 s ≈ 2.7 h/epoch, ≈ 5.5 h for 2 epochs, plus ~12 min of
-first-epoch autotune stalls.
+`qwen3_6_35b_v4_88k_2node_ep8.yaml` (`ep_size: 8`, `local_batch_size: 4`,
+`global_batch_size: 64`, `length_grouped_sampler` on, `AdamW8bit`, `max_lr: 5e-6`,
+`moe.reshard_after_forward: true`) was run for 266 of a planned 350 steps with checkpointing
+and validation live, then stopped to exercise the export.
 
-Not yet verified before a full run:
+### 6.1 The checkpoint bug
 
-1. **A checkpoint save at 88% occupancy.** Every run above had `checkpoint.enabled false`.
-   The sweep notes the state-dict gather allocates on top of the training peak. Run
-   ~250 steps with `ckpt_every_steps: 200` first; if it OOMs, `moe.reshard_after_forward:
-   true` or lbs 2 / gbs 32 (77 GiB, 4.9 samples/s).
-2. **The lower LR.**
+The first attempt (with `moe.reshard_after_forward: false`, the single-node recipe's value)
+died at the step-200 save with `KeyError: 11` inside DCP's `get_optimizer_state_dict`:
+the model shards were written, the optimizer was not. Mechanism: at `ep_size 8` on 16 GPUs
+the experts are FSDP-sharded over the 2-way `ep_shard` mesh; FSDP2 reshards only in the
+post-backward hook, so the forward-only validation pass that precedes each save
+(`validate_on_checkpoint`) leaves the expert parameters unsharded, and DCP's identity
+mapping between optimizer params and `model.named_parameters()` fails on the first expert
+weight. The single-node recipe never sees this because at `ep_size == world_size` the
+experts are not FSDP-wrapped. With the flag on, saves after validation complete (a 4-step
+probe with saves at steps 1 and 3, then the real run). The flag costs no throughput
+(8.6 s/step either way) and lowers peak memory from 124 to 113 GiB (80%).
+
+### 6.2 Results (266 steps)
+
+| block | mean loss | grad_norm mean | s/step | torch peak |
+|---|---|---|---|---|
+| 0–49 | 0.830 | 5.2 | 8.6 | 94 GiB |
+| 50–99 | 0.655 | 2.4 | 9.0 | 83 GiB |
+| 100–149 | 0.633 | 2.8 (one spike to 18.3) | 9.9 | 90 GiB |
+| 150–199 | 0.604 | 2.4 | 9.6 | 88 GiB |
+| 200–266 | ~0.58 | 2.3 | 9.3 | 50 GiB |
+
+Validation 0.5567 @ 99 → 0.5318 @ 199. nvidia-smi peak 112.7 / 114.4 GiB. Stalls
+(§4.5) still account for ~25% of wall time this run, ~14 per 50 steps; they are the
+same autotune events and fade with the shared cache, but slower than a single-run
+measurement suggests. Speed excluding them: 6.4–7 s/step (9–10 samples/s).
+
+**Checkpoint at step 199:** ~30 s save, ~75 s pause including validation. Contents: 16
+sharded model safetensors (67 GiB, all 1,045 tensors, byte count equal to the base),
+16 optimizer DCP shards (13 GB; 8-bit state), dataloader, rng, scheduler, `config.yaml`,
+`losses.json`; `LATEST` and `LOWEST_VAL` symlinks. No `.incomplete` marker.
+
+### 6.3 Export
+
+The stock consolidation (`checkpoint.save_consolidated: final`, or the `consolidate.sh`
+the checkpoint carries) merges the weights correctly (26 shards in the base's layout,
+1,045 tensors, every shape right, 37 s with 16 CPU workers) but the result is **not** a
+drop-in for the base, which the runbook requires:
+
+- 60 tensors are fp32 (`A_log`, `dt_bias` in the 30 GDN layers; the model keeps them fp32
+  and `.hf_metadata/fqn_to_dtype_mapping.json` marks them "intrinsically fp32", so even
+  `CAST_DTYPE=bf16` leaves them). The base ships them bf16.
+- `config.json`, `generation_config.json` and the tokenizer files are re-serialized from
+  the runtime config: `use_cache: false`, `output_hidden_states: true`, the vision
+  `model_type` renamed, `transformers_version` bumped, and the sampling defaults
+  (`do_sample`, `temperature`, `top_k`, `top_p`, the two-entry `eos_token_id`) dropped.
+- `preprocessor_config.json`, `video_preprocessor_config.json`, `vocab.json`, `merges.txt`
+  are not written.
+
+`export_hf_v4_88k.sh <ckpt>/model <out>` produces the base-identical layout: it remaps
+those 60 entries to bf16 in the dtype mapping, runs the offline consolidation with
+`--cast-dtype bf16`, overlays the base snapshot's metadata files, fixes the index's
+`total_size`, and asserts name/shape/dtype parity for all 1,045 tensors plus byte
+equality of `config.json`, `generation_config.json` and `tokenizer_config.json`. ~40 s.
+
+`check_export_v4_88k.py <out>` is rung 9: loads the export with plain `transformers`
+(`Qwen3_5MoeForConditionalGeneration`, 35.107 B params), checks the 333 frozen vision
+tensors are bit-identical to the base, checks trained tensors differ (after 200 steps:
+max |Δ| ≈ 5e-4), and generates. On the step-199 export: **all pass**, greedy output to
+"what does `git rebase --onto` do?" was a correct one-sentence answer. (`A_log` shows no
+change: its fp32 updates over 200 steps are below bf16 resolution.)
+
+Note the HF model class has no MTP module, so `state_dict()` reports 1,026 tensors; the
+19 `mtp.*` tensors are in the files and are ignored on load, exactly as with the base.
+
+### 6.4 Still open
+
+1. **Resume.** `checkpoint.restore_from` on `epoch_0_step_199` has not been exercised
+   (loss/LR/step should continue seamlessly). Needed before trusting spot recovery.
+2. **The lower LR** is a judgement, not an A/B.
 
 To go faster: add nodes. With EP8 the expert all-to-all never leaves a node, so nodes 0
 and 1 would add near-linearly (`--nnodes 4`, gbs 128): ~18 samples/s, ~1.4 h/epoch.
@@ -346,5 +418,7 @@ accumulation (same throughput, fewer optimizer steps).
 | `qwen3_6_35b_v4_88k_ep16_2node.yaml` | EP16 variant, kept as the measured reference |
 | `launch_2node_v4_88k.sh` | per-node launcher (container, gIB NCCL, NVSHMEM rails, caches) |
 | `comm_check_2node.py` | 16-rank NCCL all-reduce + DeepEP dispatch/combine smoke test |
+| `export_hf_v4_88k.sh`, `export_hf_v4_88k_helper.py` | base-identical HF export of a sharded checkpoint (§6.3) |
+| `check_export_v4_88k.py` | rung 9: load the export with `transformers`, compare to base, generate |
 | `deepep564/Dockerfile`, `deepep564/deepep_4214430_backport564.patch` | the patched image |
 | `logs/prof_rank0_*.txt` on node-2 | the `py-spy` profiles behind §4.5 (not committed) |
