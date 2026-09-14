@@ -748,6 +748,38 @@ def test_apply_ac_warns_when_router_is_recomputed(monkeypatch):
     logger_mock.warning.assert_not_called()
 
 
+@pytest.mark.parametrize("selective", [False, True])
+def test_apply_ac_replays_hybridep_layout_for_full_and_selective_ac(monkeypatch, selective):
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    expert = P.GroupedExpertsDeepEP()
+    expert.dispatcher_backend = "hybridep"
+
+    class HybridEPModel(DummyModel):
+        def modules(self):
+            return iter((self, expert))
+
+    if selective:
+        activation_checkpointing_stub = sys.modules["nemo_automodel.components.distributed.activation_checkpointing"]
+        activation_checkpointing_stub.make_selective_checkpoint_context_fn = lambda: (
+            lambda: (nullcontext(), nullcontext())
+        )
+        activation_checkpointing_stub.SELECTIVE_AC_WRAPPER_FLAG = "_nemo_selective_ac"
+
+    replay_wrapper = MagicMock(side_effect=lambda context_fn: context_fn)
+    monkeypatch.setattr(P, "_replay_hybridep_dispatch_on_recompute", replay_wrapper)
+    monkeypatch.setattr(P, "ptd_checkpoint_wrapper", MagicMock(side_effect=lambda block, **kwargs: block))
+
+    P.apply_ac(
+        HybridEPModel([DummyBlock()]),
+        ignore_router=True,
+        hidden_size=7168,
+        num_experts=384,
+        selective=selective,
+    )
+
+    replay_wrapper.assert_called_once()
+
+
 def test_apply_ac_uses_generic_wrapper_even_when_block_local_checkpointing_is_available(monkeypatch):
     P = _import_parallelizer_with_stubs(monkeypatch)
 
