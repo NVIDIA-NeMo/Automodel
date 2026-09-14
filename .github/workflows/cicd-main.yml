@@ -584,8 +584,9 @@ jobs:
           # Merged with hf_transformer_llm + data, mirroring cicd-e2e-tests
           # (2.4 + 3.8 + 4.3 = 10.5 min median, under the 13.2 min L2_Context_Parallel
           # floor). Leaves this matrix at 9 entries, one slot of headroom.
+          # Include models/minimax_m3_vl here; its runtime is not part of the 10.5 min median.
           - test-name: L2_HF_Transformer
-            test-folder: hf_transformer,hf_transformer_llm,data
+            test-folder: hf_transformer,hf_transformer_llm,data,models/minimax_m3_vl
             timeout: 40
           - test-name: L2_HF_Transformer_Finetune
             test-folder: hf_transformer_finetune
