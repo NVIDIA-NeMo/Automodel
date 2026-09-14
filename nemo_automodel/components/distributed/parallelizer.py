@@ -46,21 +46,6 @@ from torch.distributed.tensor.parallel import (
     parallelize_module,
 )
 from torch.distributed.tensor.placement_types import Replicate, Shard
-from transformers.models.gemma3.modeling_gemma3 import (
-    Gemma3ForConditionalGeneration,
-)
-
-try:
-    from transformers.models.gemma4.modeling_gemma4 import (
-        Gemma4ForConditionalGeneration,
-    )
-except (ImportError, ModuleNotFoundError):
-
-    class Gemma4ForConditionalGeneration:  # type: ignore[no-redef]
-        """Placeholder when the installed transformers build has no Gemma4."""
-
-        pass
-
 
 from nemo_automodel.components.distributed.activation_checkpointing import (
     SELECTIVE_AC_WRAPPER_FLAG,
@@ -97,28 +82,24 @@ def _is_transformers_v5_or_higher() -> bool:
     return major_version >= 5
 
 
-from transformers.models.gpt2.modeling_gpt2 import GPT2LMHeadModel
-from transformers.models.llama4.modeling_llama4 import Llama4ForConditionalGeneration
-from transformers.models.llava.modeling_llava import LlavaForConditionalGeneration
-from transformers.models.llava_next.modeling_llava_next import (
-    LlavaNextForConditionalGeneration,
-)
-from transformers.models.llava_next_video.modeling_llava_next_video import (
-    LlavaNextVideoForConditionalGeneration,
-)
-from transformers.models.llava_onevision.modeling_llava_onevision import (
-    LlavaOnevisionForConditionalGeneration,
-)
-from transformers.models.mistral3.modeling_mistral3 import (
-    Mistral3ForConditionalGeneration,
-)
-from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
-    Qwen2_5_VLForConditionalGeneration,
-)
-from transformers.models.qwen2_vl.modeling_qwen2_vl import (
-    Qwen2VLForConditionalGeneration,
-)
-from transformers.models.smolvlm.modeling_smolvlm import SmolVLMForConditionalGeneration
+@lru_cache(maxsize=1)
+def _gemma4_for_conditional_generation() -> type:
+    """Return Gemma4ForConditionalGeneration, or a placeholder on older transformers.
+
+    Cached so the placeholder branch yields one stable class object, which the
+    callers rely on for identity comparisons and as a dict key.
+    """
+    try:
+        from transformers.models.gemma4.modeling_gemma4 import Gemma4ForConditionalGeneration
+
+        return Gemma4ForConditionalGeneration
+    except (ImportError, ModuleNotFoundError):
+
+        class Gemma4ForConditionalGeneration:  # type: ignore[no-redef]
+            """Placeholder when the installed transformers build has no Gemma4."""
+
+        return Gemma4ForConditionalGeneration
+
 
 from nemo_automodel._transformers.v4_patches.rotary import _is_nemotron_flash_config
 from nemo_automodel.components.distributed.optimized_tp_plans import (
@@ -1461,6 +1442,26 @@ def get_hf_tp_shard_plan(model):
     Raises:
         AssertionError: If no TP plan is found
     """
+    # Imported inside the function, not at module scope: pulling in a single
+    # ``transformers.models.*.modeling_*`` module drags the whole model-zoo
+    # dependency graph along with it (sklearn -> pandas/scipy, torchvision,
+    # opentelemetry). That cost more than ``import torch`` itself and was paid
+    # by every process that so much as touched this module -- including each
+    # ``mp.spawn`` child in the unit-test suite, which re-imports from scratch.
+    from transformers.models.gemma3.modeling_gemma3 import Gemma3ForConditionalGeneration
+    from transformers.models.llama4.modeling_llama4 import Llama4ForConditionalGeneration
+    from transformers.models.llava.modeling_llava import LlavaForConditionalGeneration
+    from transformers.models.llava_next.modeling_llava_next import LlavaNextForConditionalGeneration
+    from transformers.models.llava_next_video.modeling_llava_next_video import (
+        LlavaNextVideoForConditionalGeneration,
+    )
+    from transformers.models.llava_onevision.modeling_llava_onevision import (
+        LlavaOnevisionForConditionalGeneration,
+    )
+    from transformers.models.mistral3.modeling_mistral3 import Mistral3ForConditionalGeneration
+    from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
+    from transformers.models.qwen2_vl.modeling_qwen2_vl import Qwen2VLForConditionalGeneration
+
     model_cls = type(model)
 
     # Handle VL models structure
@@ -1730,8 +1731,27 @@ def validate_tp_mesh(model, tp_mesh):
     """
     Validate that attention heads and key value heads are divisible by TP size
     """
+    # Imported here rather than at module scope; see get_hf_tp_shard_plan.
+
     if tp_mesh.size() == 1:
         return  # if tp_mesh.size() == 1, we don't need to validate
+
+    from transformers.models.gemma3.modeling_gemma3 import Gemma3ForConditionalGeneration
+
+    Gemma4ForConditionalGeneration = _gemma4_for_conditional_generation()
+    from transformers.models.llama4.modeling_llama4 import Llama4ForConditionalGeneration
+    from transformers.models.llava.modeling_llava import LlavaForConditionalGeneration
+    from transformers.models.llava_next.modeling_llava_next import LlavaNextForConditionalGeneration
+    from transformers.models.llava_next_video.modeling_llava_next_video import (
+        LlavaNextVideoForConditionalGeneration,
+    )
+    from transformers.models.llava_onevision.modeling_llava_onevision import (
+        LlavaOnevisionForConditionalGeneration,
+    )
+    from transformers.models.mistral3.modeling_mistral3 import Mistral3ForConditionalGeneration
+    from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
+    from transformers.models.qwen2_vl.modeling_qwen2_vl import Qwen2VLForConditionalGeneration
+    from transformers.models.smolvlm.modeling_smolvlm import SmolVLMForConditionalGeneration
 
     model_cls = type(model)
 
@@ -1876,6 +1896,25 @@ def _extend_layers(layers: List[nn.Module], modules: Sequence[nn.Module]) -> Non
 
 
 def _get_model_layer_group_specs() -> Dict[Any, Dict[str, List[str]]]:
+    # Imported here rather than at module scope; see get_hf_tp_shard_plan.
+    from transformers.models.gemma3.modeling_gemma3 import Gemma3ForConditionalGeneration
+    from transformers.models.gpt2.modeling_gpt2 import GPT2LMHeadModel
+
+    Gemma4ForConditionalGeneration = _gemma4_for_conditional_generation()
+    from transformers.models.llama4.modeling_llama4 import Llama4ForConditionalGeneration
+    from transformers.models.llava.modeling_llava import LlavaForConditionalGeneration
+    from transformers.models.llava_next.modeling_llava_next import LlavaNextForConditionalGeneration
+    from transformers.models.llava_next_video.modeling_llava_next_video import (
+        LlavaNextVideoForConditionalGeneration,
+    )
+    from transformers.models.llava_onevision.modeling_llava_onevision import (
+        LlavaOnevisionForConditionalGeneration,
+    )
+    from transformers.models.mistral3.modeling_mistral3 import Mistral3ForConditionalGeneration
+    from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
+    from transformers.models.qwen2_vl.modeling_qwen2_vl import Qwen2VLForConditionalGeneration
+    from transformers.models.smolvlm.modeling_smolvlm import SmolVLMForConditionalGeneration
+
     # Each group lists every known location of its layer container across
     # transformers releases; ``_extract_model_layer_groups`` takes the first
     # candidate that resolves, so the specs need no version gating. The VLM
