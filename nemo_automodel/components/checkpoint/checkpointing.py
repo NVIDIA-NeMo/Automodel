@@ -2230,6 +2230,7 @@ def _init_peft_adapters(model: nn.Module, peft_init_method: str) -> None:
 
 _MODELS_REQUIRING_BUFFER_REINIT: frozenset[str] = frozenset(
     {
+        "bailing_moe",
         "gemma3",
         "nemotron-nas",
     }
@@ -2250,8 +2251,8 @@ def _reinit_non_persistent_buffers(model: nn.Module, device: torch.device, model
 
     Handles four patterns:
 
-    1. **Standard RoPE** — single ``inv_freq`` buffer with ``rope_init_fn`` +
-       ``rope_kwargs`` (e.g. Nemotron-NAS).
+    1. **Standard RoPE** — single ``inv_freq`` buffer with ``rope_init_fn`` and
+       optional legacy ``rope_kwargs`` (e.g. Nemotron-NAS, Ling).
     2. **Per-layer-type RoPE** — ``{layer_type}_inv_freq`` buffers via
        ``compute_default_rope_parameters`` (e.g. Gemma3RotaryEmbedding).
     3. **Scaled embedding** — ``embed_scale`` buffer on ``ScaledWordEmbedding``
@@ -2269,10 +2270,11 @@ def _reinit_non_persistent_buffers(model: nn.Module, device: torch.device, model
         return
 
     for name, module in model.named_modules():
-        # Pattern 1: standard RoPE with rope_init_fn + rope_kwargs (Nemotron-NAS)
-        if hasattr(module, "rope_init_fn") and hasattr(module, "inv_freq") and hasattr(module, "rope_kwargs"):
+        # Pattern 1: legacy standard RoPE. Ling's checkpoint code computes this
+        # buffer only in __init__, so HF meta loading leaves it uninitialized.
+        if hasattr(module, "rope_init_fn") and hasattr(module, "inv_freq"):
             try:
-                inv_freq, _ = module.rope_init_fn(module.config, device, **module.rope_kwargs)
+                inv_freq, _ = module.rope_init_fn(module.config, device, **getattr(module, "rope_kwargs", {}))
                 module.inv_freq = inv_freq
                 if hasattr(module, "original_inv_freq"):
                     module.original_inv_freq = inv_freq.clone()
