@@ -119,7 +119,10 @@ def _worker(rank: int, port: int) -> None:
         dist.destroy_process_group()
 
 
-def test_bf16_dspark_fsdp_forward_backward() -> None:
+def test_bf16_dspark_fsdp_forward_backward(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Other unit-test modules disable compilation during collection. Spawned workers
+    # import the fullgraph MoE activation afresh, so explicitly enable its compiler.
+    monkeypatch.setenv("TORCH_COMPILE_DISABLE", "0")
     mp.spawn(_worker, args=(_free_port(),), nprocs=_WORLD_SIZE, join=True)
 
 
@@ -190,5 +193,7 @@ def _parity_worker(rank: int, port: int) -> None:
         dist.destroy_process_group()
 
 
-def test_fp32_dspark_fsdp_gradient_and_step_parity() -> None:
+def test_fp32_dspark_fsdp_gradient_and_step_parity(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Restore the caller's environment after spawning, without changing other tests.
+    monkeypatch.setenv("TORCH_COMPILE_DISABLE", "0")
     mp.spawn(_parity_worker, args=(_free_port(),), nprocs=_WORLD_SIZE, join=True)
