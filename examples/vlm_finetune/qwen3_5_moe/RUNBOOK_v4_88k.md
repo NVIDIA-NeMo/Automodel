@@ -18,6 +18,12 @@ measurements behind `local_batch_size: 2` and full activation checkpointing, the
 worst-case memory ceilings per configuration, why `tok/s` is the wrong metric to compare
 configs with, and the length-grouped batching option (1.70× faster, shipped disabled).
 
+**The recipe now runs on 2 × 8 × H200.** See `MULTINODE_2xH200_v4_88k.md` for the GCP
+node setup, the patched container (DeepEP PR #564, torchao 0.14), the launcher, the five
+failures met on the way and their fixes, and the measurements behind
+`qwen3_6_35b_v4_88k_2node_ep8.yaml` (EP8, lbs 4, gbs 64, length-grouped: 9.0 samples/s,
+2.3× the single-node sweep).
+
 ---
 
 ## 0. What this run is
