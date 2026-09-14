@@ -16,13 +16,17 @@
 
 Sharding is contiguous -- rank ``r`` owns global positions ``[r * L, (r + 1) * L)`` --
 rather than the framework's default load-balanced round-robin layout. Two reasons: the
-UPipe all-to-all reassembles the sequence in rank order, and the block short convolutions
-will need contiguous neighbors once their halo exchange lands.
+UPipe all-to-all reassembles the sequence in rank order, and the residual-stream short
+convolutions take their ``K - 1`` token left halo from the previous rank, which is only
+the correct left context under contiguous sharding.
 
 ``attention_mask`` is deliberately left at full length. The short convolutions inside
 attention run *after* the all-to-all, on the complete sequence, so they need the padding
 map for positions this rank does not own. It is one bit per token, so replicating it
 costs nothing next to the activations.
+
+Packed sequences are not supported: the halo is not document-aware, so the convolution
+raises rather than leaking tokens across a document boundary at a shard seam.
 """
 
 from __future__ import annotations
@@ -127,12 +131,15 @@ def setup_inkling_cp(model: torch.nn.Module, cp_mesh: Any) -> None:
     treatment. ``k_sconv`` / ``v_sconv`` run inside attention *after* the all-to-all, on
     the full sequence, and consume the full-length mask as-is. ``attn_sconv`` /
     ``mlp_sconv`` run on the residual stream, which stays sequence-sharded, so they are
-    told their rank in order to slice the same full-length mask down to their own window.
+    told their rank in order to slice the same full-length mask down to their own window,
+    and given the CP group so they can fetch their ``K - 1`` token left halo from the
+    previous rank.
 
     Idempotent: the parallelizer may also reach ``setup_cp_attention`` directly.
     """
     cp_rank = cp_mesh.get_local_rank()
     cp_size = cp_mesh.size()
+    cp_group = cp_mesh.get_group()
     for layer in _text_layers(model):
         setup = getattr(layer.self_attn, "setup_cp_attention", None)
         if setup is not None:
@@ -140,7 +147,7 @@ def setup_inkling_cp(model: torch.nn.Module, cp_mesh: Any) -> None:
         for name in ("attn_sconv", "mlp_sconv"):
             sconv = getattr(layer, name, None)
             if sconv is not None:
-                sconv.set_cp_shard(cp_rank, cp_size)
+                sconv.set_cp_shard(cp_rank, cp_size, cp_group)
 
 
 def _text_layers(model: torch.nn.Module):

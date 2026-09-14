@@ -27,7 +27,9 @@ Two properties of Inkling make this work:
   ``v_sconv`` are depthwise, and ``rel_logits_proj`` contracts only over ``d_rel``.
 * The short convolutions run *after* the all-to-all, where the sequence is complete, so
   they need no halo exchange. This is why ``conv_mask`` must reach every rank at full
-  length rather than being sharded.
+  length rather than being sharded. (The residual-stream convolutions, ``attn_sconv`` and
+  ``mlp_sconv``, do stay sequence-sharded and get their left context from
+  :mod:`~nemo_automodel.components.distributed.context_parallel.causal_conv_halo`.)
 
 The relative-position bias is expressed as a FlexAttention ``score_mod`` rather than
 materialized: HF builds ``rel_logits`` densely at ``[B, H, S, rel_extent]``, which is

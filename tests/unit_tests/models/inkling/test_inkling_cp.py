@@ -12,18 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Correctness tests for Inkling's head-chunked UPipe context parallelism.
+"""Correctness tests for Inkling's context parallelism.
 
-Four layers of checking, cheapest first:
+Seven layers of checking, cheapest first:
 
 1. Head geometry -- pure arithmetic, no torch.distributed. Every ``(stage, rank)`` pair
    must hand a rank a query head belonging to the KV group of its co-resident KV head.
 2. All-to-all -- two gloo ranks on CPU. ``cp2hp`` must deliver the right global slice and
    ``hp2cp`` must invert it, with gradients flowing back to the right rank.
-3. FlexAttention translation -- one GPU. The ``score_mod`` / ``mask_mod`` pair must
+3. Conv halo primitive -- gloo on CPU at 2 and 4 ranks. The left halo must equal the
+   previous rank's tail, be zero on rank 0, and send its gradient back to its owner.
+4. Short-convolution parity -- two gloo ranks on CPU. The sequence-sharded residual
+   convolution plus halo must match the single-device convolution on the full sequence.
+5. FlexAttention translation -- one GPU. The ``score_mod`` / ``mask_mod`` pair must
    reproduce ``InklingRelativeLogits`` plus ``eager_attention_forward`` densely.
-4. Module parity -- two GPUs, CP=2. The gate: UPipe ``InklingAttention`` forward *and*
-   backward must match the single-device module on the same weights and inputs.
+6. Attention parity -- two GPUs, CP=2. UPipe ``InklingAttention`` forward *and* backward
+   must match the single-device module on the same weights and inputs.
+7. Full-model parity -- two GPUs, CP=2, the gate. A tiny
+   ``InklingForConditionalGeneration`` must match single-device logits and every
+   parameter gradient, with and without activation checkpointing.
 """
 
 from __future__ import annotations
@@ -185,6 +192,165 @@ def test_all_to_all_moves_sequence_to_heads_and_back():
 
 
 # ---------------------------------------------------------------------------
+# 3. Causal-convolution left halo
+# ---------------------------------------------------------------------------
+
+HALO = 3
+
+
+def _halo_worker(rank: int, world_size: int, port: int) -> None:
+    try:
+        _init_pg(rank, world_size, port, "gloo")
+        torch.set_num_threads(1)
+        from nemo_automodel.components.distributed.context_parallel.causal_conv_halo import causal_conv_left_halo
+
+        group = dist.group.WORLD
+        seq_local, channels = 5, 3
+        seq_full = seq_local * world_size
+
+        # Distinct value per (batch, position, channel), so a halo arriving from the
+        # wrong neighbor cannot alias into a passing comparison.
+        base = torch.arange(BATCH * seq_full * channels, dtype=torch.float32)
+        full = base.reshape(BATCH, seq_full, channels)
+        start = rank * seq_local
+        local = full[:, start : start + seq_local].clone().requires_grad_(True)
+
+        halo = causal_conv_left_halo(local, group, HALO)
+        assert halo.shape == (BATCH, HALO, channels)
+        expected = torch.zeros(BATCH, HALO, channels) if rank == 0 else full[:, start - HALO : start]
+        torch.testing.assert_close(halo, expected)
+
+        # Weight the halo by a rank-specific constant, so the value that lands on a
+        # sender's tail names the receiver it came from.
+        (halo * float(rank + 1)).sum().backward()
+
+        # This rank's tail is consumed by rank + 1, which weighted it by rank + 2. The
+        # last rank is consumed by rank 0, whose halo is a constant and contributes zero.
+        expected_grad = torch.zeros(BATCH, seq_local, channels)
+        if rank != world_size - 1:
+            expected_grad[:, seq_local - HALO :] = float(rank + 2)
+        torch.testing.assert_close(local.grad, expected_grad)
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_conv_halo_carries_neighbor_tokens_and_their_gradients(world_size):
+    mp.spawn(_halo_worker, args=(world_size, _free_port()), nprocs=world_size, join=True)
+
+
+def _halo_rejects_short_shard_worker(rank: int, world_size: int, port: int) -> None:
+    try:
+        _init_pg(rank, world_size, port, "gloo")
+        torch.set_num_threads(1)
+        from nemo_automodel.components.distributed.context_parallel.causal_conv_halo import causal_conv_left_halo
+
+        # A shard shorter than the halo would have to reach past its immediate neighbor.
+        with pytest.raises(ValueError, match="shorter than the convolution halo"):
+            causal_conv_left_halo(torch.zeros(1, HALO - 1, 4), dist.group.WORLD, HALO)
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def test_conv_halo_rejects_shard_shorter_than_the_halo():
+    mp.spawn(_halo_rejects_short_shard_worker, args=(2, _free_port()), nprocs=2, join=True)
+
+
+# ---------------------------------------------------------------------------
+# 4. Residual-stream short-convolution parity
+# ---------------------------------------------------------------------------
+
+
+class _ConvSource(torch.nn.Module):
+    """The attribute surface ``InklingShortConvolution`` reads off an HF conv module."""
+
+    def __init__(self, hidden: int, kernel: int) -> None:
+        super().__init__()
+        self.layer_idx = 0
+        self.conv_idx = 0
+        self.conv_kernel_size = kernel
+        self.conv1d = torch.nn.Conv1d(hidden, hidden, kernel, groups=hidden, bias=False, padding=kernel - 1)
+
+
+def _sconv_parity_worker(rank: int, world_size: int, port: int) -> None:
+    try:
+        _init_pg(rank, world_size, port, "gloo")
+        torch.set_num_threads(1)
+        from nemo_automodel.components.models.inkling.layers import InklingShortConvolution
+
+        group = dist.group.WORLD
+        torch.manual_seed(0)
+        hidden, kernel, seq_full = 8, 4, 16
+        seq_local = seq_full // world_size
+
+        source = _ConvSource(hidden, kernel)
+        torch.nn.init.normal_(source.conv1d.weight, std=0.5)
+        reference = InklingShortConvolution(source)
+        cp_module = copy.deepcopy(reference)
+        cp_module.set_cp_shard(rank, world_size, group)
+
+        x_full = torch.randn(BATCH, seq_full, hidden)
+        grad_seed = torch.randn(BATCH, seq_full, hidden)
+        # `apply_mask_to_padding_states` no-ops at batch size 1, so padding only becomes
+        # observable once a second sequence is present.
+        conv_mask = torch.ones(BATCH, seq_full, dtype=torch.bool)
+        conv_mask[1, -3:] = False
+
+        ref_input = x_full.clone().requires_grad_(True)
+        ref_out = reference(ref_input, conv_mask=conv_mask)
+        (ref_out * grad_seed).sum().backward()
+
+        local_slice = slice(rank * seq_local, (rank + 1) * seq_local)
+        cp_input = x_full[:, local_slice].clone().requires_grad_(True)
+        # The mask arrives full length under CP and is sliced inside the module.
+        cp_out = cp_module(cp_input, conv_mask=conv_mask)
+        (cp_out * grad_seed[:, local_slice]).sum().backward()
+
+        torch.testing.assert_close(cp_out, ref_out[:, local_slice])
+        torch.testing.assert_close(cp_input.grad, ref_input.grad[:, local_slice])
+
+        # Each rank sees a disjoint set of output positions, so the true weight gradient
+        # is the sum across ranks.
+        weight_grad = cp_module._fp32_params.weight.grad.clone()
+        dist.all_reduce(weight_grad, op=dist.ReduceOp.SUM)
+        torch.testing.assert_close(weight_grad, reference._fp32_params.weight.grad)
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def test_short_convolution_with_halo_matches_single_device():
+    pytest.importorskip("transformers.models.inkling", reason="transformers build without the Inkling model")
+    mp.spawn(_sconv_parity_worker, args=(2, _free_port()), nprocs=2, join=True)
+
+
+def _sconv_rejects_packing_worker(rank: int, world_size: int, port: int) -> None:
+    try:
+        _init_pg(rank, world_size, port, "gloo")
+        torch.set_num_threads(1)
+        from nemo_automodel.components.models.inkling.layers import InklingShortConvolution
+
+        module = InklingShortConvolution(_ConvSource(8, 4))
+        module.set_cp_shard(rank, world_size, dist.group.WORLD)
+        hidden = torch.randn(BATCH, 8, 8)
+
+        # The halo is not document-aware, so packing must fail loudly rather than leak
+        # tokens across a document boundary at the shard seam.
+        with pytest.raises(NotImplementedError, match="Packed sequences"):
+            module(hidden, seq_idx=torch.zeros(BATCH, 8, dtype=torch.int32))
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def test_short_convolution_rejects_packing_under_cp():
+    pytest.importorskip("transformers.models.inkling", reason="transformers build without the Inkling model")
+    mp.spawn(_sconv_rejects_packing_worker, args=(2, _free_port()), nprocs=2, join=True)
+
+
+# ---------------------------------------------------------------------------
 # Shared config + module construction for the attention tests
 # ---------------------------------------------------------------------------
 
@@ -248,7 +414,7 @@ def _dense_additive_mask(seq_len: int, sliding_window: int | None, device) -> to
 
 
 # ---------------------------------------------------------------------------
-# 3. FlexAttention translation of the relative-position bias
+# 5. FlexAttention translation of the relative-position bias
 # ---------------------------------------------------------------------------
 
 
@@ -315,7 +481,7 @@ def test_flex_mods_reproduce_dense_relative_bias(sliding_window):
 
 
 # ---------------------------------------------------------------------------
-# 4. Module-level CP parity (the gate)
+# 6. Module-level CP parity
 # ---------------------------------------------------------------------------
 
 
@@ -392,3 +558,179 @@ def _attention_parity_worker(rank: int, world_size: int, port: int, layer_idx: i
 def test_upipe_attention_matches_single_device(layer_idx, label):
     del label
     mp.spawn(_attention_parity_worker, args=(2, _free_port(), layer_idx), nprocs=2, join=True)
+
+
+# ---------------------------------------------------------------------------
+# 7. Full-model CP parity (the gate)
+# ---------------------------------------------------------------------------
+
+FULL_MODEL_SEQ_LEN = 128
+
+
+def _tiny_full_config():
+    """A four-layer multimodal Inkling: global and sliding attention, MoE and dense MLP."""
+    from transformers.models.inkling.configuration_inkling import InklingConfig
+
+    text = dict(
+        hidden_size=HIDDEN,
+        num_hidden_layers=4,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=32,
+        swa_num_attention_heads=4,
+        swa_num_key_value_heads=2,
+        swa_head_dim=32,
+        sliding_window_size=16,
+        d_rel=8,
+        rel_extent=32,
+        vocab_size=128,
+        unpadded_vocab_size=None,
+        layer_types=["hybrid", "hybrid_sliding", "hybrid", "hybrid_sliding"],
+        moe_intermediate_size=32,
+        n_routed_experts=4,
+        num_experts_per_tok=2,
+        n_shared_experts=1,
+        route_scale=8.0,
+        dense_intermediate_size=64,
+        dense_mlp_idx=2,
+        conv_kernel_size=4,
+        max_position_embeddings=256,
+        logits_mup_width_multiplier=4.0,
+        # Exercised on the global layers, so the tau path is inside the gate.
+        log_scaling_n_floor=32,
+        log_scaling_alpha=0.1,
+        attention_dropout=0.0,
+    )
+    return InklingConfig(
+        text_config=text,
+        vision_config=dict(patch_size=8, temporal_patch_size=2, num_channels=3, n_layers=2),
+        audio_config=dict(n_mel_bins=8, mel_vocab_size=16),
+        image_token_id=126,
+        audio_token_id=127,
+        torch_dtype="float32",
+        _attn_implementation="eager",
+    )
+
+
+def _randomize_parameters(model, seed: int = 0) -> None:
+    """Give every parameter a deterministic value.
+
+    Several Inkling tensors (``rel_logits_proj.proj``, the grouped expert weights) are
+    allocated with ``torch.empty`` and are not covered by HF's initializer, so a parity
+    comparison over uninitialized memory would be meaningless. Norm weights are pinned to
+    one to keep activations in a sane range.
+    """
+    generator = torch.Generator().manual_seed(seed)
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            if param.dim() == 1 and "norm" in name:
+                param.fill_(1.0)
+                continue
+            values = torch.empty(param.shape, dtype=torch.float32).normal_(0.0, 0.02, generator=generator)
+            param.copy_(values.to(device=param.device, dtype=param.dtype))
+
+
+def _wrap_layers_in_activation_checkpointing(model) -> None:
+    """Mirror the parallelizer's per-decoder-block checkpointing on this tiny model."""
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
+
+    layers = model.model.language_model.layers
+    for idx in range(len(layers)):
+        layers[idx] = checkpoint_wrapper(layers[idx], preserve_rng_state=True)
+
+
+def _full_model_parity_worker(rank: int, world_size: int, port: int, use_activation_checkpointing: bool) -> None:
+    try:
+        _init_pg(rank, world_size, port, "nccl")
+        from torch.distributed.device_mesh import init_device_mesh
+
+        from nemo_automodel.components.models.common import BackendConfig
+        from nemo_automodel.components.models.inkling.cp import setup_inkling_cp, shard_batch_for_inkling_cp
+        from nemo_automodel.components.models.inkling.model import InklingForConditionalGeneration
+
+        device = torch.device(f"cuda:{rank}")
+        config = _tiny_full_config()
+        # `dispatcher` is what selects the expert implementation: anything but "torch"
+        # builds the expert-parallel TE path, which needs an EP mesh this test does not
+        # create. EP is deliberately off here so CP is the only thing under test.
+        backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch", experts="torch", dispatcher="torch")
+
+        # Constructed from the same seed on every rank, so the CP replica and the
+        # reference hold bit-identical weights without any broadcast.
+        torch.manual_seed(0)
+        reference = InklingForConditionalGeneration.from_config(config, backend=backend)
+        reference = reference.to(device=device, dtype=torch.float32).train()
+        _randomize_parameters(reference)
+
+        cp_model = copy.deepcopy(reference)
+        cp_mesh = init_device_mesh("cuda", (world_size,), mesh_dim_names=("cp",))["cp"]
+        cp_model.cp_mesh = cp_mesh
+        setup_inkling_cp(cp_model, cp_mesh)
+        cp_model.model.language_model._cp_enabled = True
+        if use_activation_checkpointing:
+            _wrap_layers_in_activation_checkpointing(cp_model)
+
+        # Built on CPU under a shared seed, so every rank starts from the same batch.
+        cpu_seed = torch.Generator().manual_seed(1234)
+        text_vocab = min(config.text_config.vocab_size, config.image_token_id) - 1
+        input_ids = torch.randint(0, text_vocab, (BATCH, FULL_MODEL_SEQ_LEN), generator=cpu_seed).to(device)
+        attention_mask = torch.ones(BATCH, FULL_MODEL_SEQ_LEN, dtype=torch.long, device=device)
+        grad_seed = torch.randn(BATCH, FULL_MODEL_SEQ_LEN, config.text_config.vocab_size, generator=cpu_seed).to(device)
+
+        seq_local = FULL_MODEL_SEQ_LEN // world_size
+        local_slice = slice(rank * seq_local, (rank + 1) * seq_local)
+
+        # --- reference: full sequence, single device ---
+        ref_logits = reference(input_ids=input_ids, attention_mask=attention_mask).logits
+        (ref_logits * grad_seed).sum().backward()
+
+        # --- CP: contiguous shard through the model's own sharder ---
+        _, sharded, _ = shard_batch_for_inkling_cp(
+            cp_mesh, None, {"input_ids": input_ids.clone(), "attention_mask": attention_mask.clone()}
+        )
+        assert sharded["input_ids"].shape[1] == seq_local
+        # The padding map stays full length; the convolutions after the all-to-all need it.
+        assert sharded["attention_mask"].shape[1] == FULL_MODEL_SEQ_LEN
+
+        cp_logits = cp_model(input_ids=sharded["input_ids"], attention_mask=sharded["attention_mask"]).logits
+        (cp_logits * grad_seed[:, local_slice]).sum().backward()
+
+        assert cp_logits.shape == (BATCH, seq_local, config.text_config.vocab_size)
+        assert torch.isfinite(cp_logits).all()
+
+        logit_diff = (cp_logits - ref_logits[:, local_slice]).abs()
+        assert logit_diff.mean().item() < 1e-4, f"logit mean diff {logit_diff.mean().item():.3e}"
+        assert logit_diff.max().item() < 5e-3, f"logit max diff {logit_diff.max().item():.3e}"
+
+        # Every rank holds a replica of the weights over a disjoint set of tokens, so the
+        # true parameter gradient is the sum of the per-rank ones.
+        ref_params = dict(reference.named_parameters())
+        compared = 0
+        for name, param in cp_model.named_parameters():
+            expected = ref_params[name.replace("._checkpoint_wrapped_module", "")].grad
+            if param.grad is None:
+                # The vision and audio towers see no input in a text-only batch.
+                assert expected is None, f"gradient reached {name} on the reference but not under CP"
+                continue
+            assert expected is not None, f"gradient reached {name} under CP but not on the reference"
+            summed = param.grad.clone()
+            dist.all_reduce(summed, op=dist.ReduceOp.SUM)
+            scale = max(expected.abs().max().item(), 1.0)
+            diff = (summed - expected).abs().max().item() / scale
+            assert diff < 5e-3, f"gradient mismatch for {name}: relative max diff {diff:.3e}"
+            compared += 1
+        assert compared > 0, "no parameter gradients were compared"
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+@pytest.mark.skipif(CUDA_DEVICES < 2, reason="Inkling full-model CP parity needs 2 GPUs")
+@pytest.mark.parametrize("use_activation_checkpointing", [False, True])
+def test_full_model_cp_matches_single_device(use_activation_checkpointing):
+    mp.spawn(
+        _full_model_parity_worker,
+        args=(2, _free_port(), use_activation_checkpointing),
+        nprocs=2,
+        join=True,
+    )

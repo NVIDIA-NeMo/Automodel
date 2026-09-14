@@ -28,6 +28,7 @@ from __future__ import annotations
 from typing import Any
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -44,6 +45,7 @@ except ImportError as exc:  # transformers < 5.14 does not ship the Inkling mode
         "The Inkling model requires a transformers build that ships transformers.models.inkling (transformers >= 5.14)."
     ) from exc
 
+from nemo_automodel.components.distributed.context_parallel.causal_conv_halo import prepend_left_halo
 from nemo_automodel.components.models.common.utils import BackendConfig
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import MoE
@@ -62,6 +64,11 @@ class _InklingShortConvolutionFP32(nn.Module):
             source.conv1d.weight.detach(),
             requires_grad=source.conv1d.weight.requires_grad,
         )
+        self._cp_group: dist.ProcessGroup | None = None
+
+    def set_cp_group(self, cp_group: dist.ProcessGroup | None) -> None:
+        """Enable the left-halo exchange over ``cp_group``, or disable it with ``None``."""
+        self._cp_group = cp_group
 
     def forward(
         self,
@@ -88,6 +95,15 @@ class _InklingShortConvolutionFP32(nn.Module):
         residual = hidden_states
         hidden_states = apply_mask_to_padding_states(hidden_states, conv_mask)
         seq_len = hidden_states.shape[1]
+        seq_idx = kwargs.get("seq_idx")
+
+        halo_size = 0
+        if self._cp_group is not None:
+            halo_size = self._checked_halo_size(past_key_values, seq_idx, kwargs)
+            # Exchanged after masking, so the halo arrives already zeroed at padded
+            # positions; masking is positionwise, so the order does not matter.
+            hidden_states = prepend_left_halo(hidden_states, self._cp_group, halo_size)
+
         hidden_states = hidden_states.transpose(1, 2)
         weight = self.weight.squeeze(1)
 
@@ -105,11 +121,30 @@ class _InklingShortConvolutionFP32(nn.Module):
                     state_idx=self.conv_idx,
                     conv_kernel_size=self.conv_kernel_size,
                 )
-            hidden_states = causal_conv1d_fn(hidden_states, weight, None, seq_idx=kwargs.get("seq_idx"))
+            hidden_states = causal_conv1d_fn(hidden_states, weight, None, seq_idx=seq_idx)
             if use_precomputed_states:
                 hidden_states = hidden_states[:, :, -seq_len:]
 
+        if halo_size:
+            hidden_states = hidden_states[:, :, halo_size:]
+
+        # The residual predates the halo and stays purely local, which is what the
+        # positionwise add requires.
         return hidden_states.transpose(1, 2) + residual
+
+    def _checked_halo_size(self, past_key_values: Any | None, seq_idx: Any, kwargs: dict[str, Any]) -> int:
+        """Validate that this call is one the halo exchange can serve, and size it."""
+        if past_key_values is not None:
+            raise ValueError(
+                "Inkling context parallelism is training-only; a KV/conv cache reached the "
+                "sequence-sharded short convolution, whose left context lives on another rank."
+            )
+        if seq_idx is not None or kwargs.get("cu_seqlens") is not None:
+            raise NotImplementedError(
+                "Packed sequences are not supported by the context-parallel short convolution: "
+                "the left halo is not document-aware and would leak across document boundaries."
+            )
+        return self.conv_kernel_size - 1
 
 
 class InklingShortConvolution(nn.Module):
@@ -120,15 +155,33 @@ class InklingShortConvolution(nn.Module):
         self._fp32_params = _InklingShortConvolutionFP32(source)
         self._cp_shard: tuple[int, int] | None = None
 
-    def set_cp_shard(self, cp_rank: int, cp_size: int) -> None:
+    def set_cp_shard(self, cp_rank: int, cp_size: int, cp_group: dist.ProcessGroup | None) -> None:
         """Declare that this convolution sees only one contiguous sequence shard.
 
-        Under context parallelism ``conv_mask`` stays full length, because the
-        convolutions inside attention run after the all-to-all and need the whole
-        sequence. The residual-stream convolutions do not: they still see ``S / cp``
-        tokens, so they must slice the mask down to their own window.
+        Two consequences follow. First, ``conv_mask`` stays full length under context
+        parallelism, because the convolutions inside attention run after the all-to-all
+        and need the whole sequence; a sequence-sharded convolution must therefore slice
+        the mask down to its own window. Second, its causal kernel reaches ``K - 1``
+        tokens to the left of the shard, which live on the previous rank, so it needs a
+        halo exchange over ``cp_group``.
+
+        Args:
+            cp_rank: This rank's index within the context-parallel group.
+            cp_size: Context-parallel size; ``<= 1`` disables both behaviors.
+            cp_group: Process group used for the halo exchange.
+
+        Raises:
+            ValueError: If context parallelism is active but no group was supplied, which
+                would silently leave the shard boundaries consuming zero-padding.
         """
-        self._cp_shard = None if cp_size <= 1 else (cp_rank, cp_size)
+        if cp_size <= 1:
+            self._cp_shard = None
+            self._fp32_params.set_cp_group(None)
+            return
+        if cp_group is None:
+            raise ValueError(f"cp_size={cp_size} requires a cp_group for the short-convolution halo exchange")
+        self._cp_shard = (cp_rank, cp_size)
+        self._fp32_params.set_cp_group(cp_group)
 
     def _local_conv_mask(self, conv_mask: torch.Tensor | None, seq_len: int) -> torch.Tensor | None:
         if conv_mask is None or self._cp_shard is None or conv_mask.ndim != 2:
