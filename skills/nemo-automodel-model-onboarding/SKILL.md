@@ -161,6 +161,7 @@ components/models/<name>/
   config.py            # Only if HF config is insufficient
   layers.py            # Only for MoE / MLA / other non-standard layers
   rope_utils.py        # Only for custom RoPE
+  parallelization.py   # Only when the TP plan, layer groups, or FSDP2 strategy differ from the llama-style defaults
 ```
 
 ### 2.2 Implementation order
@@ -175,6 +176,11 @@ Implement files in dependency order:
    performance as part of the implementation, and evaluate the low-memory DCP
    capability as described in Section 2.6.
 6. **__init__.py** -- Re-export the main model class
+
+If the architecture needs a custom TP plan, several layer containers (VLM towers),
+a nested text config, or its own FSDP2 strategy, declare a `parallel_spec: ParallelSpec`
+class attribute on the model (see `docs/guides/parallelizer-api.mdx`). Never add the
+model to `components/distributed/`.
 
 See the pattern files for detailed implementation guidance:
 
