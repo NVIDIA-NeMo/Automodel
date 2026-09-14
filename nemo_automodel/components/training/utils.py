@@ -23,21 +23,10 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Partial, Replicate
 
 from nemo_automodel.components.models.common.utils import set_is_first_microbatch, set_is_optim_step
-
-try:
-    from nemo_automodel.components.training.triton.grad_norm import (
-        HAVE_TRITON as _HAVE_TRITON,
-    )
-    from nemo_automodel.components.training.triton.grad_norm import (
-        multi_tensor_absmax,
-        multi_tensor_sumsq,
-    )
-
-    HAVE_FUSED_GRAD_NORM = _HAVE_TRITON
-except ImportError:  # pragma: no cover - Triton not installed
-    HAVE_FUSED_GRAD_NORM = False
-    multi_tensor_absmax = multi_tensor_sumsq = None
-
+from nemo_automodel.components.training.triton.grad_norm import (
+    HAVE_TRITON as HAVE_FUSED_GRAD_NORM,
+)
+from nemo_automodel.components.training.triton.grad_norm import multi_tensor_absmax, multi_tensor_sumsq
 
 # Regex pattern to match expert parameters in GroupedExpertsTE.
 # Matches FQNs like:

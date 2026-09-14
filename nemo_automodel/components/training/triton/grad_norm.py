@@ -46,29 +46,18 @@ overflow dance unnecessary, so the 2-norm needs a single pass over the
 gradients instead of two.
 """
 
+from __future__ import annotations
+
 from itertools import accumulate
 from typing import Sequence
 
 import torch
 
-from nemo_automodel.shared.import_utils import null_decorator
+from nemo_automodel.shared.import_utils import null_decorator, safe_import
 
-try:
-    import triton
-    import triton.language as tl
-
-    HAVE_TRITON = True
-except ImportError:  # pragma: no cover - depends on the environment
-    HAVE_TRITON = False
-    triton = None
-
-    class _TritonStub:
-        jit = staticmethod(null_decorator)
-
-        def __getattr__(self, _name):
-            raise RuntimeError("Triton is not available")
-
-    tl = _TritonStub()
+_HAVE_TRITON, triton = safe_import("triton")
+_HAVE_TRITON_LANGUAGE, tl = safe_import("triton.language")
+HAVE_TRITON = _HAVE_TRITON and _HAVE_TRITON_LANGUAGE
 
 
 # Elements handled by one program. Tuned on H100 to amortize launch and chunk
@@ -80,7 +69,7 @@ _REDUCE_SUMSQ = 0
 _REDUCE_ABSMAX = 1
 
 
-@triton.jit
+@(triton.jit if HAVE_TRITON else null_decorator)
 def _multi_tensor_reduce_kernel(
     ptrs_ptr,  # int64[num_tensors]  -- data_ptr() of each tensor
     numel_ptr,  # int64[num_tensors]
@@ -196,7 +185,7 @@ def _kernel_eligible(t: torch.Tensor) -> bool:
     * dtypes outside ``_DTYPE_IDS`` (notably the FP8 formats, whose reductions
       belong in a scaled path rather than a raw square anyway).
     """
-    return t.is_cuda and t.is_contiguous() and t.dtype in _DTYPE_IDS
+    return HAVE_TRITON and t.is_cuda and t.is_contiguous() and t.dtype in _DTYPE_IDS
 
 
 def _reduce_one_dtype(tensors: Sequence[torch.Tensor], reduce_op: int, device, dtype) -> torch.Tensor:
