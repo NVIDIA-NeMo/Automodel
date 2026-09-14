@@ -235,6 +235,8 @@ def _cp_worker(rank, rendezvous):
         dist.destroy_process_group()
 
 
+# Spawned workers import the model stack before running the CP collectives.
+@pytest.mark.timeout(60)
 def test_packed_cp2_forward_backward_with_activation_checkpointing(tmp_path: Path):
     mp.spawn(_cp_worker, args=(str(tmp_path / "packed-gloo"),), nprocs=2, join=True)
 
