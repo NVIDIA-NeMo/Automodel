@@ -1743,6 +1743,10 @@ def validate_tp_mesh(model, tp_mesh):
     Validate that attention heads and key value heads are divisible by TP size
     """
     # Imported here rather than at module scope; see get_hf_tp_shard_plan.
+
+    if tp_mesh.size() == 1:
+        return  # if tp_mesh.size() == 1, we don't need to validate
+
     from transformers.models.gemma3.modeling_gemma3 import Gemma3ForConditionalGeneration
 
     Gemma4ForConditionalGeneration = _gemma4_for_conditional_generation()
@@ -1759,9 +1763,6 @@ def validate_tp_mesh(model, tp_mesh):
     from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
     from transformers.models.qwen2_vl.modeling_qwen2_vl import Qwen2VLForConditionalGeneration
     from transformers.models.smolvlm.modeling_smolvlm import SmolVLMForConditionalGeneration
-
-    if tp_mesh.size() == 1:
-        return  # if tp_mesh.size() == 1, we don't need to validate
 
     model_cls = type(model)
 
