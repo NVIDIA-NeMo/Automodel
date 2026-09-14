@@ -243,6 +243,31 @@ class TestSplitExpertsWeightsDtensorAware:
         assert len(split_weights) == 2
         assert expert_ids == [2, 3]
 
+    @patch("nemo_automodel.components.moe.state_dict_utils.get_submesh")
+    @patch("nemo_automodel.components.moe.state_dict_utils.is_dtensor")
+    def test_unnamed_default_mesh_splits_to_plain_tensors(self, mock_is_dtensor, mock_get_submesh):
+        """A draft sharded by ``fully_shard`` without a mesh exports its experts as plain tensors."""
+        from torch.distributed._tensor.placement_types import Shard
+
+        mock_is_dtensor.return_value = True
+
+        mock_weight = Mock()
+        mock_local_tensor = torch.randn(2, 16, 32)
+        mock_weight.to_local.return_value = mock_local_tensor
+        mock_weight.device_mesh.mesh_dim_names = None
+        mock_weight.device_mesh.ndim = 1
+        mock_weight.device_mesh.get_local_rank.return_value = 1
+        mock_weight.device_mesh.size.return_value = 4
+        mock_weight.placements = (Shard(0),)
+
+        split_weights, expert_ids = split_experts_weights_dtensor_aware(mock_weight, 8)
+
+        mock_get_submesh.assert_not_called()
+        assert expert_ids == [2, 3]
+        assert all(isinstance(w, torch.Tensor) and not isinstance(w, Mock) for w in split_weights)
+        assert torch.equal(split_weights[0], mock_local_tensor[0])
+        assert torch.equal(split_weights[1], mock_local_tensor[1])
+
 
 class TestValidateDtensorExpertSharding:
     def test_regular_tensor_valid(self):

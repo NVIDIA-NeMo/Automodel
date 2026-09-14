@@ -160,7 +160,9 @@ def split_experts_weights_dtensor_aware(weight: torch.Tensor, n_experts: int) ->
     if is_weight_dtensor:
         device_mesh = weight.device_mesh
         original_placements = weight.placements
-        mesh_dim_names = list(weight.device_mesh.mesh_dim_names)
+        # The default ``fully_shard`` mesh has no dimension names; with nothing left to
+        # keep a DTensor on, the per-expert slices below fall back to plain tensors.
+        mesh_dim_names = list(weight.device_mesh.mesh_dim_names or ())
 
         # Remove the mesh dimension that partitions experts. With EP disabled, this may be an FSDP dimension.
         expert_mesh_dim_idx = _get_expert_mesh_dim_index(weight)
