@@ -613,9 +613,15 @@ class LagunaBlock(nn.Module):
 
 
 def _config_with_rope(config: LagunaConfig, rope_parameters: dict[str, Any]) -> LagunaConfig:
+    # ``LagunaConfig.__init__`` may merge the scalar ``partial_rotary_factor`` into the
+    # (possibly nested) ``rope_parameters`` mapping. transformers >= 5.17 treats any
+    # ``rope_parameters`` key matching a ``layer_types`` entry (e.g. ``full_attention`` /
+    # ``sliding_attention``) as a per-layer dict and validates every other value as a
+    # dict, so a bare float there breaks validation. Keep the scalar on a top-level
+    # config attribute and out of the nested dict passed to the RoPE init.
     rope_config = copy.deepcopy(config)
     rope_config.rope_parameters = dict(rope_parameters)
-    rope_config.partial_rotary_factor = rope_config.rope_parameters.get("partial_rotary_factor")
+    rope_config.partial_rotary_factor = rope_config.rope_parameters.pop("partial_rotary_factor", None)
     return rope_config
 
 
