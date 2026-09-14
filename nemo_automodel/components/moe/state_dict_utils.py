@@ -41,7 +41,9 @@ def _get_expert_mesh_dim_index(dtensor: DTensor) -> int | None:
     Returns:
         Index of the expert-partitioning mesh dimension, or ``None`` when every rank retains all experts.
     """
-    mesh_dim_names = tuple(dtensor.device_mesh.mesh_dim_names)
+    # ``fully_shard`` without an explicit mesh builds a default mesh that carries no
+    # dimension names; the CP-free DSpark draft is sharded that way.
+    mesh_dim_names = tuple(dtensor.device_mesh.mesh_dim_names or ())
     if "ep" in mesh_dim_names:
         return mesh_dim_names.index("ep")
 
@@ -85,8 +87,18 @@ def get_expert_slice_for_rank(experts_tensor: torch.Tensor, n_experts: int) -> t
     if expert_mesh_dim_idx is None:
         return local_tensor, 0, n_experts
 
-    expert_mesh_dim_name = device_mesh.mesh_dim_names[expert_mesh_dim_idx]
-    expert_mesh = get_submesh(device_mesh, (expert_mesh_dim_name,))
+    if device_mesh.mesh_dim_names is None:
+        # An unnamed mesh cannot be sliced by name. The default ``fully_shard`` mesh is
+        # one-dimensional, so the whole mesh is the expert partition.
+        if device_mesh.ndim != 1:
+            raise ValueError(
+                "Cannot locate the expert partition on an unnamed multi-dimensional device mesh; "
+                f"got ndim={device_mesh.ndim}."
+            )
+        expert_mesh = device_mesh
+    else:
+        expert_mesh_dim_name = device_mesh.mesh_dim_names[expert_mesh_dim_idx]
+        expert_mesh = get_submesh(device_mesh, (expert_mesh_dim_name,))
     placement = dtensor.placements[expert_mesh_dim_idx]
     if isinstance(placement, Shard) and placement.dim == 0:
         # Tensor is sharded along expert dimension
