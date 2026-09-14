@@ -12,10 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# LoRA fine-tuning recipe for deepseek-ai/DeepSeek-V4-Flash on HellaSwag.
-# LoRA target: 4 nodes x 8 H100-80GB = 32 GPUs, PP=1 EP=32 DP=32.
-# Estimate: routed-expert bf16 weights are ~550 GB; EP=32 gives 8 routed
-# experts/rank and avoids full base optimizer state.
+# LoRA fine-tuning of deepseek-ai/DeepSeek-V4-Flash on HellaSwag with the frozen
+# routed experts kept resident in mxfp4 (fp4-e2m1 + e8m0 block scales) and
+# dequantized on the fly in the grouped-GEMM forward/backward.
+#
+# Routed experts stay packed; other weights use their model-defined floating-point
+# dtypes, including the FP32 lm_head. The routed experts are ~90%+ of the
+# parameters, so packing them to ~4 bits cuts steady-state base-weight memory by
+# roughly 4x relative to the bf16 LoRA recipe.
+#
+# v1 constraint: mxfp4 experts require the torch_mm GroupedExperts backend, so
+# this recipe uses dispatcher=torch (NOT deepep). DeepEP + mxfp4 is a follow-up.
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
@@ -35,10 +42,13 @@ distributed:
   tp_size: 1
   cp_size: 1
   pp_size: 1
-  ep_size: 32
+  # Single node, 8x H200: ep_size must divide dp_size*cp_size (= world_size here).
+  ep_size: 8
 
   sequence_parallel: false
-  activation_checkpointing: false
+  # Recommended on: the 43-layer activation footprint, not the (now-packed) expert
+  # weights, is the steady-state pressure once experts are mxfp4.
+  activation_checkpointing: true
 
   moe:
     reshard_after_forward: false
@@ -63,7 +73,8 @@ model:
     linear: torch
     rms_norm: torch_fp32
     rope_fusion: false
-    dispatcher: hybridep
+    # mxfp4 experts run on the torch_mm grouped-GEMM path (DeepEP not yet supported).
+    dispatcher: torch
     experts: torch_mm
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
@@ -71,19 +82,37 @@ model:
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
   target_modules:
-    - "*wq_a"
-    - "*wq_b"
-    - "*wkv"
-    - "*wo_b"
+    # attention
+    - "*.self_attn.wq_a"
+    - "*.self_attn.wq_b"
+    - "*.self_attn.wkv"
+    - "*.self_attn.wo_b"
+    # routed experts: GroupedExperts -> GroupedExpertsLoRAMXFP4
+    # (frozen base stays mxfp4-packed; only the LoRA adapters train)
+    - "*mlp.experts"
+    # shared experts: dense MLP nn.Linear (base stays bf16, LoRA adapters bf16)
+    - "*shared_experts.gate_proj"
+    - "*shared_experts.up_proj"
+    - "*shared_experts.down_proj"
   dim: 8
   alpha: 32
   use_triton: True
+  # BF16 adapters match the BF16 base weights within FSDP-owned modules.
+  # FusedAdam below retains FP32 master-weight precision and optimizer states.
+  lora_dtype: bfloat16
+  # Keep the frozen routed experts packed as mxfp4 and dequantize on the fly.
+  expert_weight_format: mxfp4
 
 checkpoint:
   enabled: false
+  # The DSV4-Flash checkpoint is quantized: fp4 routed experts + fp8 non-expert
+  # projections. This enables quant-aware loading -- the fp8 non-expert weights are
+  # dequantized to bf16, while the fp4 experts are passed through packed (mxfp4,
+  # never materialized in bf16). Required to load this checkpoint.
   dequantize_base_checkpoint: true
 
 loss_fn:
+  # Use the model's FP32 lm_head projection and compute CE from full logits.
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
@@ -121,26 +150,23 @@ validation_dataloader:
   drop_last: true
 
 optimizer:
-  _target_: torch.optim.AdamW
-  fused: true
+  # Keep the BF16 adapter parameters/checkpoint while TE FusedAdam reconstructs
+  # FP32 master weights from the BF16 values plus their stored 16-bit remainders.
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
   betas: [0.9, 0.95]
   eps: 1e-8
   lr: 1e-5
   weight_decay: 0.1
+  adam_w_mode: true
+  bias_correction: true
+  master_weights: true
+  master_weight_dtype: torch.float32
+  store_param_remainders: true
+  exp_avg_dtype: torch.float32
+  exp_avg_sq_dtype: torch.float32
 
 ci:
-  # pp_size(1) * ep_size(32) = 32 GPUs => 4 nodes (8 H100/node).
-  recipe_owner: hemildesai
-  time: "01:00:00"
-  nodes: 4
-  checkpoint_robustness:
-    step_scheduler.global_batch_size: 32
-    step_scheduler.local_batch_size: 1
-    tokenizer_name: deepseek-ai/DeepSeek-V4-Flash
-    trust_remote_code: true
-    hf_device_map_auto: true
-    # EP32 sparse routing is inside the shared relaxed envelope; the separate
-    # vanilla-HF reload gate remains enabled so reference-load regressions still fail.
-    parity_tolerance_profile: relaxed
-    dataset.num_samples_limit: 500
-    validation_dataset.num_samples_limit: 500
+  # EP8 fits one CI node with 8 H100 GPUs.
+  recipe_owner: excepshenal
+  nodes: 1
+  time: "00:30:00"
