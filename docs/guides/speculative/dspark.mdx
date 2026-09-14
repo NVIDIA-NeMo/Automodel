@@ -83,6 +83,15 @@ normalization, and distributed-training components. The target remains frozen;
 only the three draft stages, target-feature projection, Markov head, and
 confidence head receive DSpark gradients.
 
+AutoModel feeds the final RMSNorm output into the V4.1 confidence head to
+reduce its sensitivity to residual magnitude. The example keeps
+`confidence_head_alpha: 1.0` and `confidence_head_stop_gradient: false` so the
+confidence loss still trains the draft backbone. This differs from the released
+confidence head, which reads the raw residual. Serving checkpoints trained with
+this recipe requires the same normalized confidence input; loading released
+confidence weights does not preserve their original predictions. Full-scale
+training stability with this normalization still requires validation.
+
 The recipe starts those trainable DSpark weights from a fresh initialization
 and copies only the frozen embedding and LM head from the target. Use
 `checkpoint.restore_from` to resume a DSpark checkpoint produced by AutoModel.

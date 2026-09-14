@@ -89,13 +89,12 @@ recipe_args:
   freeze_embeddings: true
   markov_rank: 256
   markov_head_type: vanilla
+  # Confidence uses the final normalized draft states. Serving a trained draft
+  # must apply the same normalization before its confidence head.
   confidence_head_alpha: 1.0
   confidence_head_with_markov: true
-  # The released V4.1 confidence head reads the un-normalized residual stream, so its
-  # BCE gradient can spike and reach the draft backbone. Detach its inputs during
-  # training: the head still learns, the backbone only sees the CE and TV terms, and
-  # the served input is unchanged.
-  confidence_head_stop_gradient: true
+  # Keep confidence gradients enabled to evaluate normalization on its own.
+  confidence_head_stop_gradient: false
 
   # --- frozen DeepSeek V4.1 target backend ---
   # Use eager for a slower PyTorch numerical path when

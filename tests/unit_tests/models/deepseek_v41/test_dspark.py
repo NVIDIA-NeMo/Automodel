@@ -285,6 +285,7 @@ def test_confidence_head_stop_gradient_isolates_the_backbone(stop_gradient: bool
         noise_embeddings.grad,
         model.mtp[0].main_proj.weight.grad,
         model.mtp[0].ffn.experts.gate_and_up_projs.grad,
+        final.norm.weight.grad,
         final.markov_head.embed.weight.grad,
     ]
     if stop_gradient:
@@ -362,6 +363,35 @@ def test_markov_and_confidence_heads_follow_released_shapes() -> None:
     assert markov_embeddings.shape == (1, 5, 4)
     assert confidence.shape == (1, 5)
     assert confidence.dtype == torch.float32
+
+
+def test_confidence_uses_normalized_states_and_trains_final_norm() -> None:
+    torch.manual_seed(41)
+    model = _model()
+    token_ids = torch.tensor([[1, 2, 3, 4, 5]])
+    # Large residuals make raw-state confidence logits explode; normalized ones stay bounded.
+    output = model(
+        torch.randn(1, 5, 16) * 10000.0,
+        torch.randn(1, 4, 32),
+        position_ids=torch.tensor([[0, 1, 2, 3, 2, 3, 4, 5, 6]]),
+        attention_mask=torch.zeros(1, 1, 5, 9),
+        previous_token_ids=token_ids,
+    )
+    final = model.mtp[-1]
+    with torch.no_grad():
+        _, markov_embeddings = final.markov_head(token_ids)
+        expected = final.confidence_head(output.normalized_hidden_states, markov_embeddings)
+    torch.testing.assert_close(output.confidence_pred, expected)
+    assert output.confidence_pred.abs().max() < 1.0
+
+    loss = torch.nn.functional.binary_cross_entropy_with_logits(
+        output.confidence_pred, torch.full_like(output.confidence_pred, 0.25)
+    )
+    loss.backward()
+    for parameter in (final.norm.weight, final.confidence_head.proj.weight, final.markov_head.embed.weight):
+        assert parameter.grad is not None
+        assert torch.isfinite(parameter.grad).all()
+        assert parameter.grad.abs().sum() > 0
 
 
 def test_official_positions_and_swa_mask_end_before_anchor() -> None:

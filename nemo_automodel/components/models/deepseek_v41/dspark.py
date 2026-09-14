@@ -182,7 +182,11 @@ class _DeepseekV41DSparkMarkovHead(nn.Module):
 
 
 class _DeepseekV41DSparkConfidenceHead(nn.Module):
-    """Predict conditional acceptance logits in FP32."""
+    """Predict conditional acceptance logits in FP32.
+
+    AutoModel-trained drafts feed the final RMSNorm output to this head. Serving
+    these checkpoints must use the same input instead of the released raw residual.
+    """
 
     def __init__(self, hidden_size: int, markov_rank: int) -> None:
         super().__init__()
@@ -192,7 +196,7 @@ class _DeepseekV41DSparkConfidenceHead(nn.Module):
         """Predict a conditional acceptance logit for every draft position.
 
         Args:
-            hidden_states: Tensor of shape [..., hidden].
+            hidden_states: Final RMSNorm output of shape [..., hidden].
             markov_embeddings: Tensor of shape [..., markov_rank] with matching
                 leading dimensions.
 
@@ -309,13 +313,10 @@ class _DeepseekV41DSparkBlock(nn.Module):
         if previous_token_ids is not None:
             transition_logits, markov_embeddings = self.markov_head(previous_token_ids)
             if enable_confidence_head:
-                # The released head reads the raw collapsed residual stream (no norm), so an
-                # unbounded activation can turn the BCE gradient into a spike that reaches the
-                # backbone. Detaching keeps the served input unchanged and trains only the head.
-                confidence_inputs = (hidden_states, markov_embeddings)
+                states, embeddings = normalized_hidden_states, markov_embeddings
                 if confidence_head_stop_gradient:
-                    confidence_inputs = (hidden_states.detach(), markov_embeddings.detach())
-                confidence_pred = self.confidence_head(*confidence_inputs)
+                    states, embeddings = states.detach(), embeddings.detach()
+                confidence_pred = self.confidence_head(states, embeddings)
         return _DeepseekV41DSparkStageOutput(
             streams,
             ffn_mix.pre,
