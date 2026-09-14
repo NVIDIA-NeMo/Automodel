@@ -46,7 +46,8 @@ overflow dance unnecessary, so the 2-norm needs a single pass over the
 gradients instead of two.
 """
 
-from typing import List, Sequence
+from itertools import accumulate
+from typing import Sequence
 
 import torch
 
@@ -70,10 +71,9 @@ except ImportError:  # pragma: no cover - depends on the environment
     tl = _TritonStub()
 
 
-# Elements handled by one program. Large enough that launch overhead is
-# amortized, small enough that a big parameter is split across programs (which
-# also bounds the fp32-within-tile error before the fp64 accumulate).
-_CHUNK = 8192
+# Elements handled by one program. Tuned on H100 to amortize launch and chunk
+# metadata overhead while retaining enough programs for large tensors.
+_CHUNK = 32_768
 _BLOCK = 1024
 
 _REDUCE_SUMSQ = 0
@@ -84,19 +84,31 @@ _REDUCE_ABSMAX = 1
 def _multi_tensor_reduce_kernel(
     ptrs_ptr,  # int64[num_tensors]  -- data_ptr() of each tensor
     numel_ptr,  # int64[num_tensors]
-    chunk_tensor_ptr,  # int32[num_chunks] -- which tensor this program reduces
-    chunk_start_ptr,  # int64[num_chunks] -- element offset within that tensor
+    chunk_end_ptr,  # int64[num_tensors] -- exclusive prefix sum of chunk counts
     partial_ptr,  # float64[num_chunks] -- one partial per program
     REDUCE_OP: tl.constexpr,
     DTYPE_ID: tl.constexpr,
+    NUM_TENSORS: tl.constexpr,
     CHUNK: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     """Reduce one chunk of one tensor into a single fp64 partial."""
     pid = tl.program_id(0)
 
-    tensor_idx = tl.load(chunk_tensor_ptr + pid)
-    start = tl.load(chunk_start_ptr + pid)
+    if NUM_TENSORS == 1:
+        tensor_idx = 0
+        first_chunk = 0
+    else:
+        lo = 0
+        hi = NUM_TENSORS
+        while lo < hi:
+            mid = (lo + hi) // 2
+            go_right = pid >= tl.load(chunk_end_ptr + mid)
+            lo = tl.where(go_right, mid + 1, lo)
+            hi = tl.where(go_right, hi, mid)
+        tensor_idx = lo
+        first_chunk = tl.load(chunk_end_ptr + tensor_idx - 1, mask=tensor_idx > 0, other=0)
+    start = (pid.to(tl.int64) - first_chunk) * CHUNK
     numel = tl.load(numel_ptr + tensor_idx)
     base_addr = tl.load(ptrs_ptr + tensor_idx)
 
@@ -158,19 +170,20 @@ _DTYPE_IDS = {
 }
 
 
-def _build_chunk_table(tensors: Sequence[torch.Tensor], device: torch.device):
-    """Host-side, size-only decomposition -- deterministic for a given layout."""
-    tensor_ids: List[int] = []
-    starts: List[int] = []
-    for i, t in enumerate(tensors):
-        n = t.numel()
-        for s in range(0, n, _CHUNK):
-            tensor_ids.append(i)
-            starts.append(s)
-    return (
-        torch.tensor(tensor_ids, dtype=torch.int32, device=device),
-        torch.tensor(starts, dtype=torch.int64, device=device),
-    )
+def _build_chunk_ends(tensors: Sequence[torch.Tensor], device: torch.device) -> tuple[torch.Tensor, int]:
+    """Build the exclusive upper chunk bound for each input tensor.
+
+    Args:
+        tensors: Tensors of arbitrary shape; only their element counts are read.
+        device: Device on which to create the metadata tensors.
+
+    Returns:
+        An int64 tensor of shape ``[tensors]`` containing cumulative chunk
+        counts and the total number of chunks.
+    """
+    counts = [(t.numel() + _CHUNK - 1) // _CHUNK for t in tensors]
+    chunk_ends = list(accumulate(counts))
+    return torch.tensor(chunk_ends, dtype=torch.int64, device=device), chunk_ends[-1]
 
 
 def _kernel_eligible(t: torch.Tensor) -> bool:
@@ -190,18 +203,21 @@ def _reduce_one_dtype(tensors: Sequence[torch.Tensor], reduce_op: int, device, d
     """Launch the kernel once for a set of same-dtype, kernel-eligible tensors."""
     ptrs = torch.tensor([t.data_ptr() for t in tensors], dtype=torch.int64, device=device)
     numels = torch.tensor([t.numel() for t in tensors], dtype=torch.int64, device=device)
-    chunk_tensor, chunk_start = _build_chunk_table(tensors, device)
-    num_chunks = chunk_tensor.numel()
+    if len(tensors) == 1:
+        chunk_ends = numels
+        num_chunks = (tensors[0].numel() + _CHUNK - 1) // _CHUNK
+    else:
+        chunk_ends, num_chunks = _build_chunk_ends(tensors, device)
 
     partials = torch.empty(num_chunks, dtype=torch.float64, device=device)
     _multi_tensor_reduce_kernel[(num_chunks,)](
         ptrs,
         numels,
-        chunk_tensor,
-        chunk_start,
+        chunk_ends,
         partials,
         REDUCE_OP=reduce_op,
         DTYPE_ID=_DTYPE_IDS[dtype],
+        NUM_TENSORS=len(tensors),
         CHUNK=_CHUNK,
         BLOCK=_BLOCK,
     )
@@ -226,7 +242,7 @@ def _reduce(tensors: Sequence[torch.Tensor], reduce_op: int) -> torch.Tensor:
     # compile-time element type, so a mixed-dtype batch would read (say) BF16
     # storage as FP32.
     by_dtype: dict = {}
-    ineligible: List[torch.Tensor] = []
+    ineligible: list[torch.Tensor] = []
     for t in tensors:
         if _kernel_eligible(t):
             by_dtype.setdefault(t.dtype, []).append(t)
