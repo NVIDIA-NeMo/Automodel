@@ -40,9 +40,8 @@ step_scheduler:
   # 86,767 train rows => ~1,355 optimizer steps per epoch.
   global_batch_size: 64
   # Measured over 100 length-grouped steps: 123.7 GiB nvidia-smi peak (88%), 106 GiB torch
-  # peak on a 4 x 40k-token chunk. lbs 8 OOMs even at EP16. A checkpoint save at this
-  # occupancy has not been exercised yet; if it OOMs, set moe.reshard_after_forward: true
-  # or drop to lbs 2 / global_batch_size 32 (77 GiB peak, 4.9 samples/s).
+  # peak on a 4 x 40k-token chunk. lbs 8 OOMs even at EP16. Fallback if memory becomes a
+  # problem: lbs 2 / global_batch_size 32 (77 GiB peak, 4.9 samples/s).
   local_batch_size: 4
   num_epochs: 2
   ckpt_every_steps: 200
@@ -109,7 +108,17 @@ distributed:
   multimodal:
     frozen_sharding: per_layer
   moe:
-    reshard_after_forward: false
+    # MUST be true on this topology. At ep_size 8 on 16 GPUs the experts are FSDP-sharded
+    # over the 2-way ep_shard mesh, and FSDP2 only reshards in the post-backward hook, so
+    # a forward-only pass (validation) leaves the expert parameters unsharded. The
+    # checkpoint that follows (validate_on_checkpoint) then calls DCP's
+    # get_optimizer_state_dict, which maps optimizer params to model params by identity
+    # and fails with `KeyError: 11` (the first expert weight); the model shards are
+    # written but the optimizer is not. Measured: with false, the step-200 save of a
+    # 350-step run died this way; with true, saves after validation complete (80 GB in
+    # ~40 s, optimizer shards present). The single-node recipe keeps false because at
+    # ep_size == world_size the experts are not FSDP-wrapped at all.
+    reshard_after_forward: true
     wrap_outer_model: true
     ignore_router_for_ac: true
 
