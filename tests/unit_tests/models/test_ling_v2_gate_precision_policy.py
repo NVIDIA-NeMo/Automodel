@@ -446,11 +446,8 @@ def test_ling_score_correction_bias_is_precision_critical():
 
 
 # Revision of inclusionAI/Ling-mini-2.0 whose modeling_bailing_moe_v2.py the
-# reference below was transcribed from. All three published Ling 2.0 checkpoints
-# ship the same router code.
-_REFERENCE_REVISION = "920c3fd9916e3d5e543fc4f609e827cad8a32983"
-
-
+# reference below was transcribed from: 920c3fd9916e3d5e543fc4f609e827cad8a32983.
+# All three published Ling 2.0 checkpoints ship the same router code.
 class _ReferenceBailingMoeV2Gate(nn.Module):
     """BailingMoeV2Gate, transcribed from the checkpoint-owned modeling file.
 
