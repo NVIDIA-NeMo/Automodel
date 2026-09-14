@@ -237,8 +237,14 @@ def _cp_worker(rank, rendezvous):
 
 # Spawned workers import the model stack before running the CP collectives.
 @pytest.mark.timeout(60)
-def test_packed_cp2_forward_backward_with_activation_checkpointing(tmp_path: Path):
-    mp.spawn(_cp_worker, args=(str(tmp_path / "packed-gloo"),), nprocs=2, join=True)
+def test_packed_cp2_forward_backward_with_activation_checkpointing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Other test modules disable compilation at collection time. Spawned workers
+    # need the default compiler state for the fullgraph expert activation.
+    with monkeypatch.context() as worker_env:
+        worker_env.delenv("TORCH_COMPILE_DISABLE", raising=False)
+        mp.spawn(_cp_worker, args=(str(tmp_path / "packed-gloo"),), nprocs=2, join=True)
 
 
 @pytest.mark.parametrize("lengths,spans", [([3], [2]), ([33], [33]), ([-2], [-2]), ([0], [4])])
