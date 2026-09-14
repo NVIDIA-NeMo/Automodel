@@ -75,12 +75,19 @@ both nodes, which DCP needs: each rank writes its own shards and rank 0 consolid
 - `data/v4_88k_longest/{train,val}.parquet`: the 192 + 32 longest rows (38,976–40,921
   tokens), for worst-case memory probes.
 
-### 1.3 Syncing the checkout from Windows
+### 1.3 The checkout on the nodes
 
-`git archive` from the Windows checkout emits CRLF. Use
-`git -c core.autocrlf=false archive HEAD | ssh node-2 'tar -x -C /mnt/fast/shared/Automodel'`
-for tracked files, and `sed -i 's/\r$//'` on anything copied with `scp`. A CR in
-`launch_2node_v4_88k.sh` or a YAML breaks the run in confusing ways.
+`/mnt/fast/shared/Automodel` is a git clone of
+`https://github.com/trungvd-zenai/Automodel.git`, branch
+`trungvd-zenai/feat/qwen3-6-v4-88k-sft`, on the NFS share, so both nodes see one tree. To
+update it: `cd /mnt/fast/shared/Automodel && git pull`. `git status` should show only
+`logs/` untracked (`.env`, `data/` and `checkpoints/` are ignored). Files written by the
+container (`logs/`, `data/`, `checkpoints/`) are owned by root.
+
+During the bring-up the tree was synced from a Windows checkout instead; if that is ever
+done again, note that `git archive` from Windows emits CRLF unless run with
+`-c core.autocrlf=false`, and a CR in `launch_2node_v4_88k.sh` or a YAML breaks the run
+in confusing ways (`sed -i 's/\r$//'` fixes a file).
 
 ### 1.4 Driver option (applied, not needed)
 
