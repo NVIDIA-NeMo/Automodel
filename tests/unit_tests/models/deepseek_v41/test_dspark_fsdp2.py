@@ -26,8 +26,10 @@ import torch.multiprocessing as mp
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 
+from nemo_automodel.components.distributed.activation_checkpointing import apply_submodule_checkpointing
 from nemo_automodel.components.distributed.parallelizer_utils import fully_shard_by_dtype
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41TextConfig
 from nemo_automodel.components.models.deepseek_v41.dspark import DeepseekV41DSparkModel
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
@@ -88,7 +90,7 @@ def _fully_shard_model(model: DeepseekV41DSparkModel, mesh: DeviceMesh, dtype: t
     fully_shard(model, mesh=mesh, mp_policy=policy)
 
 
-def _worker(rank: int, port: int) -> None:
+def _worker(rank: int, port: int, activation_checkpointing: bool) -> None:
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
     dist.init_process_group("gloo", rank=rank, world_size=_WORLD_SIZE)
@@ -101,7 +103,10 @@ def _worker(rank: int, port: int) -> None:
             num_anchors=1,
             enable_confidence_head=True,
         )
+        cast_model_to_dtype(model, torch.bfloat16)
         model.set_embedding_head_trainable(False)
+        if activation_checkpointing:
+            apply_submodule_checkpointing(list(model.layers), has_kv_sharing=False)
         _fully_shard_model(model, mesh, torch.bfloat16)
 
         input_ids = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8]])
@@ -119,11 +124,14 @@ def _worker(rank: int, port: int) -> None:
         dist.destroy_process_group()
 
 
-def test_bf16_dspark_fsdp_forward_backward(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("activation_checkpointing", [False, True])
+def test_bf16_dspark_fsdp_forward_backward(
+    monkeypatch: pytest.MonkeyPatch, activation_checkpointing: bool
+) -> None:
     # Other unit-test modules disable compilation during collection. Spawned workers
     # import the fullgraph MoE activation afresh, so explicitly enable its compiler.
     monkeypatch.setenv("TORCH_COMPILE_DISABLE", "0")
-    mp.spawn(_worker, args=(_free_port(),), nprocs=_WORLD_SIZE, join=True)
+    mp.spawn(_worker, args=(_free_port(), activation_checkpointing), nprocs=_WORLD_SIZE, join=True)
 
 
 def _parity_worker(rank: int, port: int) -> None:
