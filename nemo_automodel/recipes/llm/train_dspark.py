@@ -75,7 +75,7 @@ from nemo_automodel.components.loggers.wandb_utils import init_wandb_run, suppre
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
-from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41Config
+from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41Config, DeepseekV41DSparkTargetConfig
 from nemo_automodel.components.models.minimax_m3_vl.processing import build_minimax_m3_vl_processor
 from nemo_automodel.components.optim.optimizer import build_optimizer
 from nemo_automodel.components.speculative.dspark.common import validate_target_layer_ids
@@ -127,7 +127,6 @@ from nemo_automodel.recipes.base_recipe import (
 )
 from nemo_automodel.recipes.llm._dspark_target_build import (
     build_deepseek_v4_target,
-    build_deepseek_v41_target,
     build_glm_5_2_target,
     build_kimi_k3_target,
     distributed_section_dict,
@@ -700,15 +699,26 @@ class TrainDSparkRecipe(BaseRecipe):
             architectures = list(getattr(target_config, "architectures", None) or ["DeepseekV4ForCausalLM"])
         elif is_deepseek_v41_target:
             if self.cached_target_path is None:
-                target_config, self.target_model, self.distributed_setup = build_deepseek_v41_target(
-                    cfg=self.cfg,
-                    world_size=self.dist_env.world_size,
+                target_options = DeepseekV41DSparkTargetConfig(
+                    target_path=target_path,
+                    trust_remote_code=trust_remote_code,
+                    target_num_hidden_layers=recipe_cfg.get("target_num_hidden_layers", None),
+                )
+                target_options.attn_backend = str(recipe_cfg.get("target_attn_backend", target_options.attn_backend))
+                target_options.dispatcher = str(recipe_cfg.get("target_dispatcher", target_options.dispatcher))
+                target_options.experts = str(recipe_cfg.get("target_experts", target_options.experts))
+                target_options.enable_fsdp_optimizations = bool(
+                    recipe_cfg.get("target_enable_fsdp_optimizations", target_options.enable_fsdp_optimizations)
+                )
+                self.distributed_setup = create_distributed_setup_from_config(
+                    self.cfg, world_size=self.dist_env.world_size
+                )
+                self.target_model = target_options.build(
                     device=self.device,
                     compute_dtype=self.compute_dtype,
-                    target_path=target_path,
-                    recipe_cfg=recipe_cfg,
-                    trust_remote_code=trust_remote_code,
+                    distributed_setup=self.distributed_setup,
                 )
+                target_config = self.target_model.config
             else:
                 target_config = DeepseekV41Config.from_pretrained(
                     target_path,

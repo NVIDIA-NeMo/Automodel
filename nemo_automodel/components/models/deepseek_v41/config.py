@@ -24,7 +24,11 @@ from typing import TYPE_CHECKING, Any, Protocol
 from transformers import AutoTokenizer, PretrainedConfig, PreTrainedTokenizerFast
 
 if TYPE_CHECKING:
+    import torch
+
+    from nemo_automodel.components.distributed.config import DistributedSetup
     from nemo_automodel.components.models.deepseek_v41.dspark import DeepseekV41DSparkModel
+    from nemo_automodel.components.models.deepseek_v41.model import DeepseekV41ForCausalLM
 
 
 class _DSparkDraftOptions(Protocol):
@@ -542,4 +546,78 @@ class DeepseekV41DSparkConfig:
             num_anchors=self.num_anchors,
             enable_confidence_head=self.confidence_head_alpha > 0,
             confidence_head_stop_gradient=self.confidence_head_stop_gradient,
+        )
+
+
+@dataclass
+class DeepseekV41DSparkTargetConfig:
+    """Construction settings for the frozen, text-only V4.1 DSpark target.
+
+    The released feature contract requires the full target depth. The native
+    MTP tensors belong to the separately trained draft.
+    """
+
+    target_path: str
+    trust_remote_code: bool = False
+    target_num_hidden_layers: int | None = None
+    attn_backend: str = "tilelang"
+    dispatcher: str = "hybridep"
+    experts: str = "torch_mm"
+    enable_fsdp_optimizations: bool = True
+
+    def build(
+        self,
+        *,
+        device: torch.device,
+        compute_dtype: torch.dtype,
+        distributed_setup: DistributedSetup,
+    ) -> DeepseekV41ForCausalLM:
+        """Load the text target through the supplied EP/FSDP infrastructure.
+
+        Args:
+            device: Resolved execution device; the sharded target requires CUDA.
+            compute_dtype: Precision used to load and compute the frozen target.
+            distributed_setup: Runtime parallelism configuration composed by the recipe.
+
+        Returns:
+            The pretrained target with its vision tower disabled.
+        """
+        # The transformers bridge also imports model configs during registration.
+        from nemo_automodel._transformers import NeMoAutoModelForCausalLM
+        from nemo_automodel.components.models.common import BackendConfig
+
+        if device.type != "cuda":
+            raise RuntimeError(
+                "DeepSeek V4.1 DSpark target requires CUDA: the target is loaded "
+                "with the expert-parallel / FSDP distributed path."
+            )
+        if self.target_num_hidden_layers is not None:
+            raise ValueError(
+                "DeepSeek V4.1 DSpark does not support target_num_hidden_layers: "
+                "the released target feature contract requires layers 37, 38, and 39"
+            )
+        target_config = DeepseekV41Config.from_pretrained(
+            self.target_path,
+            name_or_path=self.target_path,
+            vision_config={"num_hidden_layers": 0},
+        )
+        return NeMoAutoModelForCausalLM.from_config(
+            config=target_config,
+            backend=BackendConfig(
+                attn=self.attn_backend,
+                linear="torch",
+                rms_norm="torch_fp32",
+                rope_fusion=False,
+                gate_precision="float32",
+                dispatcher=self.dispatcher,
+                experts=self.experts,
+                enable_hf_state_dict_adapter=True,
+                enable_fsdp_optimizations=self.enable_fsdp_optimizations,
+            ),
+            distributed_setup=distributed_setup,
+            load_base_model=True,
+            torch_dtype=compute_dtype,
+            trust_remote_code=self.trust_remote_code,
+            use_liger_kernel=False,
+            use_sdpa_patching=False,
         )
