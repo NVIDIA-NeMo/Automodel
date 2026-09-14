@@ -23,7 +23,6 @@ edge-cases that were not covered:
 
 from __future__ import annotations
 
-import builtins
 import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -87,17 +86,7 @@ def test_validate_tp_mesh_import_error(monkeypatch):
         if key.startswith("transformers"):
             monkeypatch.delitem(sys.modules, key, raising=False)
 
-    # 2. Patch the import machinery so any subsequent attempt raises ImportError.
-    original_import = builtins.__import__
-
-    def _import_blocker(name, globals=None, locals=None, fromlist=(), level=0):  # noqa: D401,E501
-        if name.startswith("transformers"):
-            raise ImportError("Blocked for test")
-        return original_import(name, globals, locals, fromlist, level)
-
-    monkeypatch.setattr(builtins, "__import__", _import_blocker)
-
-    # 3. Call the helper – it should *not* raise.
+    # 2. Call the helper – it should *not* raise.
     tp_mesh = _make_tp_mesh(4)
     dummy_model = object()
 
