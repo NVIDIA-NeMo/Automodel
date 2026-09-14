@@ -40,6 +40,10 @@ from nemo_automodel.components.models.qwen3_8_flash_next.engram import (
 from nemo_automodel.components.models.qwen3_8_flash_next.state_dict_adapter import Qwen3_8_FlashNextStateDictAdapter
 from nemo_automodel.components.moe.layers import MoEConfig
 
+# Over the default 5s budget on purpose: this module spawns worker processes; every child re-imports torch from scratch.
+# Shrink the work or the process count before raising this further.
+pytestmark = pytest.mark.timeout(60)
+
 _TABLE_KEY = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.weight"
 _TABLE_PREFIX = _TABLE_KEY.removesuffix(".weight")
 
