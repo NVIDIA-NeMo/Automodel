@@ -1,0 +1,97 @@
+From 9b24a4983b0d21164383dd8ded847300c1933753 Mon Sep 17 00:00:00 2001
+From: backport <backport@local>
+Date: Mon, 14 Sep 2026 09:20:55 +0000
+Subject: [PATCH] Backport DeepEP #564 (NVSHMEM 3.5+ runtime fixes) + automodel
+ deepep.patch onto 4214430
+
+---
+ csrc/kernels/configs.cuh      |  7 +++++++
+ csrc/kernels/ibgda_device.cuh | 23 +++++++++++++++++++----
+ setup.py                      |  4 ++--
+ 3 files changed, 28 insertions(+), 6 deletions(-)
+
+diff --git a/csrc/kernels/configs.cuh b/csrc/kernels/configs.cuh
+index 6c35c3c..a8c82a7 100644
+--- a/csrc/kernels/configs.cuh
++++ b/csrc/kernels/configs.cuh
+@@ -26,6 +26,13 @@
+ #define __CUDACC_RDC__ // NOLINT(*-reserved-identifier)
+ #endif
+ 
++// Define __CUDACC_RDC__ to ensure proper extern declarations for NVSHMEM device symbols
++#ifndef DISABLE_NVSHMEM
++#ifndef __CUDACC_RDC__
++#define __CUDACC_RDC__  // NOLINT(*-reserved-identifier)
++#endif
++#endif
++
+ // Remove Torch restrictions
+ #ifdef __CUDA_NO_HALF_CONVERSIONS__
+ #undef __CUDA_NO_HALF_CONVERSIONS__
+diff --git a/csrc/kernels/ibgda_device.cuh b/csrc/kernels/ibgda_device.cuh
+index 7fab70c..34e1d63 100644
+--- a/csrc/kernels/ibgda_device.cuh
++++ b/csrc/kernels/ibgda_device.cuh
+@@ -7,6 +7,8 @@
+ //  - nvshmem/src/include/non_abi/device/pt-to-pt/ibgda_device.cuh
+ #pragma once
+ 
++#include <type_traits>
++
+ #include "configs.cuh"
+ #include "exception.cuh"
+ #include "utils.cuh"
+@@ -73,11 +75,24 @@ nvshmemi_ibgda_device_state_t* ibgda_get_state() {
+     return &nvshmemi_ibgda_device_state_d;
+ }
+ 
+-__device__ static __forceinline__
+-nvshmemi_ibgda_device_qp_t* ibgda_get_rc(int pe, int id) {
++// Template helper to get RC - uses compile-time type checking with if constexpr (C++17)
++template <typename StateType>
++__device__ static __forceinline__ nvshmemi_ibgda_device_qp_t* ibgda_get_rc_impl(StateType* state, int pe, int id) {
++    const auto num_rc_per_pe = state->num_rc_per_pe;
++
++    if constexpr (std::is_same_v<StateType, nvshmemi_ibgda_device_state_v1>) {
++        // v1 implementation
++        return &state->globalmem
++                    .rcs[pe * num_rc_per_pe * state->num_devices_initialized + id % (num_rc_per_pe * state->num_devices_initialized)];
++    } else {
++        // v2 implementation (or any other type)
++        return &state->globalmem.rcs[pe + nvshmemi_device_state_d.npes * id];
++    }
++}
++
++__device__ static __forceinline__ nvshmemi_ibgda_device_qp_t* ibgda_get_rc(int pe, int id) {
+     auto state = ibgda_get_state();
+-    const auto num_rc_per_pe = ibgda_get_state()->num_rc_per_pe;
+-    return &state->globalmem.rcs[pe * num_rc_per_pe * state->num_devices_initialized + id % (num_rc_per_pe * state->num_devices_initialized)];
++    return ibgda_get_rc_impl(state, pe, id);
+ }
+ 
+ __device__ static __forceinline__
+diff --git a/setup.py b/setup.py
+index 2c91c6e..2d9dfaa 100644
+--- a/setup.py
++++ b/setup.py
+@@ -230,7 +230,7 @@ def get_extension_deep_ep_cpp():
+                  '-Wno-sign-compare', '-Wno-reorder', '-Wno-attributes']
+     nvcc_flags = ['-O3', '-Xcompiler', '-O3']
+     sources = ['csrc/deep_ep.cpp', 'csrc/kernels/runtime.cu', 'csrc/kernels/layout.cu', 'csrc/kernels/intranode.cu']
+-    include_dirs = ['csrc/']
++    include_dirs = ['csrc/', '/usr/local/cuda/include/cccl/']
+     library_dirs = []
+     nvcc_dlink = []
+     extra_link_args = ['-lcuda']
+@@ -322,7 +322,7 @@ if __name__ == '__main__':
+             include=['deep_ep']
+         ),
+         install_requires=[
+-            'pynvml',
++            'nvidia-ml-py>=12.0.0',
+         ],
+         ext_modules=[
+             get_extension_deep_ep_cpp(),
+-- 
+2.34.1
+
