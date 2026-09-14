@@ -18,7 +18,9 @@ For first-stage dense retrieval, see [Embedding Models](/model-coverage/embeddin
 
 ## Hugging Face Auto Backbones
 
-Any Hugging Face model loadable using `AutoModelForSequenceClassification` can be used as a reranking backbone. This fallback path uses the model's native attention; no bidirectional conversion is applied.
+Unregistered scoring architectures load through Hugging Face `AutoModelForSequenceClassification`. An explicit `model.is_causal` value overrides a saved text-config value. Without either setting, the fallback preserves the backbone's native attention mode. Verify that an unregistered architecture honors the selected policy before using it for retrieval training.
+
+Composite backbones must identify their text tower through matching `get_text_config(decoder=True)` and `get_decoder()` results. Only that tower's attention policy is changed.
 
 ## Supported Models
 

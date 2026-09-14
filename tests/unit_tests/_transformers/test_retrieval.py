@@ -16,28 +16,37 @@
 
 import inspect
 import json
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 import torch
 import torch.nn as nn
+from sentence_transformers import SentenceTransformer
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
 from transformers import (
     AutoModel,
+    BertConfig,
+    BertForSequenceClassification,
+    BertModel,
     LlamaConfig,
     Ministral3Config,
     Mistral3Config,
     PretrainedConfig,
     PreTrainedTokenizerFast,
+    Qwen2Config,
+    Qwen2Model,
 )
+from transformers.integrations import flash_attention
 from transformers.models.ministral3.modeling_ministral3 import (
     Ministral3ForSequenceClassification,
     Ministral3Model,
 )
 
+from nemo_automodel._transformers import auto_model, retrieval
+from nemo_automodel.components.checkpoint.config import CheckpointingConfig
 from nemo_automodel.components.models.llama_bidirectional.model import (
     LlamaBidirectionalConfig,
     LlamaBidirectionalForSequenceClassification,
@@ -50,9 +59,7 @@ from nemo_automodel.components.models.ministral_bidirectional.model import (
 
 
 def test_llama_nemotron_vl_supported_backbone_for_embedding():
-    from nemo_automodel._transformers.retrieval import SUPPORTED_BACKBONES
-
-    assert SUPPORTED_BACKBONES["llama_nemotron_vl"]["embedding"] == "LlamaNemotronVLModel"
+    assert retrieval.SUPPORTED_BACKBONES["llama_nemotron_vl"]["embedding"] == "LlamaNemotronVLModel"
 
 
 def _tiny_mistral3_vlm_config(text_model_type: str) -> Mistral3Config:
@@ -145,12 +152,10 @@ def _assert_no_language_model_prefix(model: nn.Module) -> None:
 @pytest.mark.parametrize(("kwargs", "expected_is_final"), [({}, False), ({"is_final_checkpoint": True}, True)])
 def test_save_encoder_pretrained_forwards_is_final_checkpoint(tmp_path, kwargs, expected_is_final):
     """Direct retrieval saves default to non-final unless the caller says otherwise."""
-    from nemo_automodel._transformers.retrieval import save_encoder_pretrained
-
     model = nn.Module()
     checkpointer = MagicMock()
 
-    save_encoder_pretrained(model, str(tmp_path), checkpointer=checkpointer, **kwargs)
+    retrieval.save_encoder_pretrained(model, str(tmp_path), checkpointer=checkpointer, **kwargs)
 
     checkpointer.save_model.assert_called_once_with(
         model=model,
@@ -162,8 +167,6 @@ def test_save_encoder_pretrained_forwards_is_final_checkpoint(tmp_path, kwargs, 
 
 
 def test_bi_encoder_public_api_excludes_export_format_overrides():
-    from nemo_automodel._transformers import auto_model, retrieval
-
     export_only_parameters = {
         "query_prompt",
         "document_prompt",
@@ -178,12 +181,25 @@ def test_bi_encoder_public_api_excludes_export_format_overrides():
     ):
         parameters = inspect.signature(callable_).parameters
         assert export_only_parameters.isdisjoint(parameters)
-        assert {"pooling", "l2_normalize"} <= parameters.keys()
+        assert {"pooling", "l2_normalize", "is_causal"} <= parameters.keys()
+
+
+def test_retrieval_public_apis_expose_is_causal():
+    for callable_ in (
+        retrieval.BiEncoderModel.__init__,
+        retrieval.BiEncoderModel.build,
+        retrieval.CrossEncoderModel.__init__,
+        retrieval.CrossEncoderModel.build,
+        auto_model.NeMoAutoModelBiEncoder.from_pretrained,
+        auto_model.NeMoAutoModelCrossEncoder.from_pretrained,
+    ):
+        assert "is_causal" in inspect.signature(callable_).parameters
+
+    cross_auto_signature = inspect.signature(auto_model.NeMoAutoModelCrossEncoder.from_pretrained)
+    assert cross_auto_signature.parameters["is_causal"].kind is inspect.Parameter.KEYWORD_ONLY
 
 
 def test_effective_pipeline_prompts_replace_restored_export_defaults():
-    from nemo_automodel._transformers import retrieval
-
     encoder = SimpleNamespace(
         sentence_transformer_export_config=retrieval.SentenceTransformerExportConfig(
             query_prompt="saved query: ",
@@ -202,8 +218,6 @@ def test_effective_pipeline_prompts_replace_restored_export_defaults():
 
 
 def test_direct_save_without_tokenizer_omits_sentence_transformer_metadata(tmp_path, caplog):
-    from nemo_automodel._transformers import retrieval
-
     backbone = LlamaBidirectionalModel(
         LlamaBidirectionalConfig(
             vocab_size=32,
@@ -226,8 +240,6 @@ def test_direct_save_without_tokenizer_omits_sentence_transformer_metadata(tmp_p
 
 
 def test_direct_save_omits_unrepresentable_sentence_transformer_metadata(tmp_path, caplog):
-    from nemo_automodel._transformers import retrieval
-
     backbone = LlamaBidirectionalModel(
         LlamaBidirectionalConfig(
             vocab_size=32,
@@ -255,8 +267,6 @@ def test_direct_save_omits_unrepresentable_sentence_transformer_metadata(tmp_pat
 
 
 def test_direct_standard_export_uses_general_sequence_capabilities(tmp_path):
-    from nemo_automodel._transformers import retrieval
-
     backbone = LlamaBidirectionalModel(
         LlamaBidirectionalConfig(
             vocab_size=32,
@@ -279,8 +289,6 @@ def test_direct_standard_export_uses_general_sequence_capabilities(tmp_path):
 
 
 def test_direct_standard_export_preserves_cached_source_deployment_limit(tmp_path):
-    from nemo_automodel._transformers import retrieval
-
     source_dir = tmp_path / "source"
     source_dir.mkdir()
     (source_dir / "sentence_bert_config.json").write_text('{"max_seq_length": 16}')
@@ -310,8 +318,6 @@ def test_direct_standard_export_preserves_cached_source_deployment_limit(tmp_pat
 
 def test_extract_submodel_embedding_fallback_is_bidirectional(tmp_path):
     """Extracted HuggingFace embedding fallbacks use bidirectional attention."""
-    from nemo_automodel._transformers import retrieval
-
     model_dir, language_state_dict = _save_tiny_vlm(tmp_path, "mistral")
 
     backbone = retrieval.build_encoder_backbone(
@@ -343,10 +349,281 @@ def test_extract_submodel_embedding_fallback_is_bidirectional(tmp_path):
     assert saved_config["is_causal"] is False
 
 
+@pytest.mark.parametrize("is_causal", [False, True])
+def test_generic_embedding_backbone_honors_and_persists_is_causal(tmp_path, is_causal):
+    """Generic Hugging Face backbones honor and persist both attention policies."""
+    config = Qwen2Config(
+        vocab_size=64,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=64,
+        attention_dropout=0.0,
+    )
+    model_dir = tmp_path / "qwen2"
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(1234)
+        Qwen2Model(config).eval().save_pretrained(model_dir)
+
+    backbone = retrieval.build_encoder_backbone(
+        model_name_or_path=str(model_dir),
+        task="embedding",
+        is_causal=is_causal,
+        attn_implementation="eager",
+    )
+
+    assert backbone.config.is_causal is is_causal
+    assert all(layer.self_attn.is_causal is is_causal for layer in backbone.layers)
+
+    input_ids = torch.tensor([[1, 2, 3, 0]])
+    modified_input_ids = torch.tensor([[1, 2, 5, 0]])
+    attention_mask = torch.tensor([[1, 1, 1, 0]])
+    backbone.eval()
+    with torch.no_grad():
+        original = backbone(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+        modified = backbone(input_ids=modified_input_ids, attention_mask=attention_mask).last_hidden_state
+
+    if is_causal:
+        torch.testing.assert_close(original[:, 0], modified[:, 0])
+    else:
+        assert not torch.allclose(original[:, 0], modified[:, 0], atol=1e-7, rtol=1e-7)
+
+    save_dir = tmp_path / "saved"
+    backbone.save_pretrained(save_dir)
+    assert json.loads((save_dir / "config.json").read_text())["is_causal"] is is_causal
+    reloaded = retrieval.build_encoder_backbone(str(save_dir), task="embedding", attn_implementation="eager").eval()
+    with torch.no_grad():
+        restored = reloaded(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+    torch.testing.assert_close(restored, original)
+    assert reloaded.config.is_causal is is_causal
+
+
+@pytest.mark.parametrize("encoder_class", ["bi", "cross"])
+@pytest.mark.parametrize("is_causal", [False, True])
+@pytest.mark.parametrize("attn_implementation", ["eager", "sdpa"])
+def test_encoder_only_backbones_apply_causality_policy(encoder_class, is_causal, attn_implementation):
+    """The policy changes the effective mask for encoder-only Hugging Face backbones."""
+    config = BertConfig(
+        vocab_size=32,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        hidden_dropout_prob=0.0,
+        attention_probs_dropout_prob=0.0,
+    )
+    config._attn_implementation = attn_implementation
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(42)
+        backbone = BertModel(config) if encoder_class == "bi" else BertForSequenceClassification(config)
+    if encoder_class == "bi":
+        retrieval.BiEncoderModel(backbone, is_causal=is_causal)
+        text_model = backbone
+    else:
+        retrieval.CrossEncoderModel(backbone, is_causal=is_causal)
+        text_model = backbone.bert
+
+    assert backbone.config.is_causal is is_causal
+    assert backbone.config.is_decoder is is_causal
+    assert all(layer.attention.self.is_causal is is_causal for layer in text_model.encoder.layer)
+
+    input_ids = torch.tensor([[1, 2, 3, 4]])
+    changed_ids = input_ids.clone()
+    changed_ids[0, -1] = 5
+    attention_mask = torch.ones_like(input_ids)
+    text_model.eval()
+    with torch.no_grad():
+        original = text_model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+        changed = text_model(input_ids=changed_ids, attention_mask=attention_mask).last_hidden_state
+
+    if is_causal:
+        torch.testing.assert_close(original[0, 0], changed[0, 0])
+    else:
+        assert not torch.allclose(original[0, 0], changed[0, 0], atol=1e-6)
+
+
+@pytest.mark.parametrize("attn_implementation", ["eager", "sdpa"])
+def test_cross_encoder_preserves_native_bert_decoder_mode(attn_implementation):
+    config = BertConfig(
+        vocab_size=32,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        is_decoder=True,
+    )
+    config._attn_implementation = attn_implementation
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(42)
+        backbone = BertForSequenceClassification(config).eval()
+    inputs = {"input_ids": torch.tensor([[1, 2, 3, 4]]), "attention_mask": torch.ones(1, 4, dtype=torch.long)}
+    with torch.no_grad():
+        expected = backbone(**inputs).logits
+
+    encoder = retrieval.CrossEncoderModel(backbone).eval()
+
+    assert encoder.is_causal is True
+    assert backbone.config.is_causal is True
+    assert backbone.config.is_decoder is True
+    assert all(layer.attention.self.is_causal is True for layer in backbone.bert.encoder.layer)
+    with torch.no_grad():
+        torch.testing.assert_close(encoder(**inputs).logits, expected)
+
+
+@pytest.fixture
+def tiny_bert_scorer():
+    """A real, deterministic CPU backbone shared by wrapper behavior tests."""
+    config = BertConfig(
+        vocab_size=32,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        hidden_dropout_prob=0.0,
+        attention_probs_dropout_prob=0.0,
+    )
+    config._attn_implementation = "eager"
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(42)
+        return BertForSequenceClassification(config).eval()
+
+
+@pytest.mark.parametrize("input_form", ["dict", "readonly_mapping", "kwargs"])
+@pytest.mark.parametrize("return_dict", [None, False], ids=["default_output", "tuple_output"])
+def test_cross_encoder_forward_preserves_backbone_outputs_and_inputs(tiny_bert_scorer, input_form, return_dict):
+    """Both calling conventions preserve scores, output format, and caller-owned inputs."""
+    encoder = retrieval.CrossEncoderModel(tiny_bert_scorer).eval()
+    inputs = {
+        "input_ids": torch.tensor([[1, 2, 3, 0], [4, 5, 6, 7]]),
+        "attention_mask": torch.tensor([[1, 1, 1, 0], [1, 1, 1, 1]]),
+    }
+    original_inputs = {key: value.clone() for key, value in inputs.items()}
+    if return_dict is not None:
+        inputs["return_dict"] = original_inputs["return_dict"] = return_dict
+
+    with torch.no_grad():
+        expected = tiny_bert_scorer(**inputs)
+        if input_form == "kwargs":
+            actual = encoder(**inputs)
+        else:
+            actual = encoder(MappingProxyType(inputs) if input_form == "readonly_mapping" else inputs)
+
+    if return_dict is False:
+        assert isinstance(actual, tuple)
+        torch.testing.assert_close(actual, expected)
+    else:
+        torch.testing.assert_close(actual.logits, expected.logits)
+    torch.testing.assert_close(inputs, original_inputs)
+
+
+@pytest.mark.parametrize("is_causal", [False, True])
+def test_cross_encoder_build_restores_saved_causality(tmp_path, tiny_bert_scorer, is_causal):
+    """Reload restores scores and attention, while an explicit override wins over saved policy."""
+    model_dir = tmp_path / "bert_score"
+    tiny_bert_scorer.save_pretrained(model_dir)
+
+    encoder = retrieval.CrossEncoderModel.build(str(model_dir), is_causal=is_causal).eval()
+    inputs = {"input_ids": torch.tensor([[1, 2, 3, 4]]), "attention_mask": torch.ones(1, 4, dtype=torch.long)}
+    changed_inputs = {**inputs, "input_ids": torch.tensor([[1, 2, 3, 5]])}
+    with torch.no_grad():
+        expected = encoder(**inputs).logits
+    save_dir = tmp_path / "saved_score"
+    encoder.save_pretrained(save_dir)
+    reloaded = retrieval.CrossEncoderModel.build(str(save_dir)).eval()
+
+    assert reloaded.is_causal is is_causal
+    assert reloaded.model.config.is_causal is is_causal
+    assert reloaded.model.config.is_decoder is is_causal
+    with torch.no_grad():
+        torch.testing.assert_close(reloaded(**inputs).logits, expected)
+
+    override_policy = not is_causal
+    overridden = retrieval.CrossEncoderModel.build(str(save_dir), is_causal=override_policy).eval()
+    assert overridden.is_causal is override_policy
+    with torch.no_grad():
+        original = overridden(**inputs, output_hidden_states=True).hidden_states[-1][:, 0]
+        changed = overridden(**changed_inputs, output_hidden_states=True).hidden_states[-1][:, 0]
+    if override_policy:
+        torch.testing.assert_close(original, changed)
+    else:
+        assert not torch.allclose(original, changed, atol=1e-6)
+
+
+@pytest.mark.parametrize("encoder_class", ["bi", "cross"])
+@pytest.mark.parametrize("policy_source", ["explicit", "saved"])
+def test_retrieval_rejects_non_boolean_policy(encoder_class, policy_source):
+    """String-valued policies must not silently enable attention through Python truthiness."""
+    backbone = nn.Module()
+    backbone.config = PretrainedConfig(**({"is_causal": "false"} if policy_source == "saved" else {}))
+    policy_kwargs = {"is_causal": "false"} if policy_source == "explicit" else {}
+    encoder_type = retrieval.BiEncoderModel if encoder_class == "bi" else retrieval.CrossEncoderModel
+    with pytest.raises(ValueError, match="must be a boolean"):
+        encoder_type(backbone, **policy_kwargs)
+
+
+@pytest.mark.parametrize("has_decoder_flag", [False, True])
+def test_mapping_config_restores_policy_and_accepts_explicit_override(has_decoder_flag):
+    """Mapping-backed text configs follow the same saved/explicit policy contract."""
+    backbone = nn.Module()
+    text_config = {"is_causal": True}
+    if has_decoder_flag:
+        text_config["is_decoder"] = False
+    backbone.config = PretrainedConfig(text_config=text_config)
+    backbone.main_input_name = "pixel_values"
+    backbone.text_tower = nn.Module()
+    backbone.text_tower.config = text_config
+    backbone.text_tower.is_causal = False
+    backbone.get_decoder = lambda: backbone.text_tower
+
+    restored = retrieval.BiEncoderModel(backbone)
+    assert restored.is_causal is True
+    assert backbone.text_tower.is_causal is True
+    assert text_config == {"is_causal": True, **({"is_decoder": True} if has_decoder_flag else {})}
+
+    overridden = retrieval.BiEncoderModel(backbone, is_causal=False)
+    assert overridden.is_causal is False
+    assert backbone.text_tower.is_causal is False
+    assert text_config == {"is_causal": False, **({"is_decoder": False} if has_decoder_flag else {})}
+
+
+@pytest.mark.parametrize(
+    "config_values, expected",
+    [({}, False), ({"is_decoder": False}, False), ({"is_decoder": True}, True), ({"is_causal": True}, True)],
+    ids=["unspecified", "encoder", "decoder", "causal_config"],
+)
+def test_native_policy_uses_config_when_modules_do_not_declare_attention(config_values, expected):
+    backbone = nn.Module()
+    backbone.config = SimpleNamespace(**config_values)
+
+    assert retrieval._get_native_text_backbone_is_causal(backbone) is expected
+    assert vars(backbone.config) == config_values
+
+
+@pytest.mark.parametrize(
+    "config_values, attention_policies, error",
+    [
+        ({"is_decoder": "false"}, (), "is_decoder policy must be a boolean"),
+        ({"is_causal": "false"}, (), "is_causal policy must be a boolean"),
+        ({}, (False, True), "inconsistent native is_causal policies"),
+    ],
+    ids=["invalid_decoder_flag", "invalid_attention_flag", "mixed_layer_policies"],
+)
+def test_native_policy_rejects_ambiguous_attention(config_values, attention_policies, error):
+    """Inference must reject malformed metadata and mixed modes instead of guessing."""
+    backbone = nn.Module()
+    backbone.config = SimpleNamespace(**config_values)
+    backbone.attentions = nn.ModuleList([nn.Module() for _ in attention_policies])
+    for attention, policy in zip(backbone.attentions, attention_policies, strict=True):
+        attention.is_causal = policy
+
+    with pytest.raises(ValueError, match=error):
+        retrieval._get_native_text_backbone_is_causal(backbone)
+
+
 def test_extract_submodel_dequantizes_native_fp8_for_training(monkeypatch):
     """FP8 parent checkpoints are materialized without scalar scale parameters."""
-    from nemo_automodel._transformers import retrieval
-
     config = SimpleNamespace(
         model_type="mistral3",
         quantization_config={"quant_method": "fp8", "dequantize": False},
@@ -381,8 +658,6 @@ def test_extract_submodel_dequantizes_native_fp8_for_training(monkeypatch):
 
 def test_extract_submodel_llama_embedding_from_local_vlm_converts_to_supported_backbone(tmp_path):
     """A supported extracted Llama text backbone becomes the retrieval Llama encoder."""
-    from nemo_automodel._transformers import retrieval
-
     model_dir, language_state_dict = _save_tiny_vlm(tmp_path, "llama")
 
     backbone = retrieval.build_encoder_backbone(
@@ -408,11 +683,9 @@ def test_extract_submodel_llama_embedding_from_local_vlm_converts_to_supported_b
 
 def test_embedding_fallback_forwards_hf_kwargs_and_disables_causal_attention(monkeypatch):
     """Embedding fallbacks preserve loader options and disable causal attention."""
-    from nemo_automodel._transformers import retrieval
-
-    config = MagicMock()
-    config.model_type = "mistral"
+    config = SimpleNamespace(model_type="mistral")
     backbone = MagicMock()
+    backbone.config = config
     auto_config_from_pretrained = MagicMock(return_value=config)
     auto_model_from_pretrained = MagicMock(return_value=backbone)
     monkeypatch.setattr(retrieval.AutoConfig, "from_pretrained", auto_config_from_pretrained)
@@ -456,8 +729,6 @@ def test_embedding_fallback_forwards_hf_kwargs_and_disables_causal_attention(mon
 
 def test_standard_ministral_score_uses_sequence_classification_model(tmp_path):
     """Standard Ministral score checkpoints retain the HuggingFace reranker path."""
-    from nemo_automodel._transformers import retrieval
-
     model_dir, source_state_dict = _save_tiny_ministral_text_model(tmp_path)
 
     backbone = retrieval.build_encoder_backbone(
@@ -469,6 +740,8 @@ def test_standard_ministral_score_uses_sequence_classification_model(tmp_path):
     assert type(backbone) is Ministral3ForSequenceClassification
     assert backbone.config.model_type == "ministral3"
     assert backbone.config.num_labels == 1
+    assert backbone.config.is_causal is True
+    assert all(layer.self_attn.is_causal is True for layer in backbone.model.layers)
     _assert_state_dict_equal(source_state_dict, backbone.model.state_dict())
 
     input_ids = torch.randint(0, backbone.config.vocab_size, (2, 4))
@@ -481,8 +754,6 @@ def test_standard_ministral_score_uses_sequence_classification_model(tmp_path):
 
 def test_ministral_embedding_preserves_hf_config_overrides(tmp_path):
     """Valid HuggingFace config overrides retain native loader behavior."""
-    from nemo_automodel._transformers import retrieval
-
     model_dir, _ = _save_tiny_ministral_text_model(tmp_path)
 
     backbone = retrieval.build_encoder_backbone(
@@ -496,9 +767,7 @@ def test_ministral_embedding_preserves_hf_config_overrides(tmp_path):
 
 def test_bi_encoder_build_forwards_native_hf_kwargs_to_config_and_backbone(monkeypatch):
     """The preliminary config load retains native HuggingFace loader behavior."""
-    from nemo_automodel._transformers import retrieval
-
-    config = PretrainedConfig()
+    config = PretrainedConfig(is_causal=True)
     config.model_type = "test"
     backbone = MagicMock(spec=nn.Module)
     backbone.config = config
@@ -531,6 +800,7 @@ def test_bi_encoder_build_forwards_native_hf_kwargs_to_config_and_backbone(monke
         "embedding",
         trust_remote_code=False,
         pooling="avg",
+        is_causal=True,
         loaded_config=config,
         revision="revision-a",
         output_attentions=True,
@@ -538,10 +808,57 @@ def test_bi_encoder_build_forwards_native_hf_kwargs_to_config_and_backbone(monke
     )
 
 
+def test_build_encoder_backbone_preserves_positional_loaded_config(monkeypatch):
+    """Adding attention policy does not reinterpret the existing loaded-config position."""
+    config = PretrainedConfig()
+    config.model_type = "test"
+    backbone = nn.Module()
+    backbone.config = config
+    auto_config_from_pretrained = MagicMock(return_value=config)
+    auto_model_from_pretrained = MagicMock(return_value=backbone)
+    monkeypatch.setattr(retrieval.AutoConfig, "from_pretrained", auto_config_from_pretrained)
+    monkeypatch.setattr(retrieval.AutoModel, "from_pretrained", auto_model_from_pretrained)
+
+    result = retrieval.build_encoder_backbone(
+        "org/model",
+        "embedding",
+        False,
+        None,
+        None,
+        None,
+        None,
+        config,
+    )
+
+    assert result is backbone
+    assert result.config.is_causal is False
+    auto_model_from_pretrained.assert_called_once_with("org/model", trust_remote_code=False)
+
+
+def test_bi_encoder_build_preserves_positional_trust_remote_code(monkeypatch):
+    """Adding attention policy does not reinterpret the existing remote-code position."""
+    config = PretrainedConfig()
+    config.model_type = "test"
+    backbone = MagicMock(spec=nn.Module)
+    backbone.config = config
+    backbone.main_input_name = "input_ids"
+    backbone.forward = MagicMock()
+    auto_config_from_pretrained = MagicMock(return_value=config)
+    build_encoder_backbone = MagicMock(return_value=backbone)
+    monkeypatch.setattr(retrieval.AutoConfig, "from_pretrained", auto_config_from_pretrained)
+    monkeypatch.setattr(retrieval, "build_encoder_backbone", build_encoder_backbone)
+    monkeypatch.setattr(retrieval, "_load_sentence_transformer_wrapper_options", MagicMock(return_value=None))
+    monkeypatch.setattr(retrieval, "_resolve_cached_source_model_path", MagicMock(return_value=None))
+
+    retrieval.BiEncoderModel.build("org/model", None, None, None, False, True, True)
+
+    auto_config_from_pretrained.assert_called_once_with("org/model", trust_remote_code=True)
+    assert build_encoder_backbone.call_args.kwargs["trust_remote_code"] is True
+    assert build_encoder_backbone.call_args.kwargs["is_causal"] is False
+
+
 @pytest.mark.parametrize("pooling", ["weighted_avg", "colbert", "multi_vector"])
 def test_bi_encoder_skips_standard_export_for_unrepresentable_pooling(pooling, tmp_path):
-    from nemo_automodel._transformers import retrieval
-
     backbone = LlamaBidirectionalModel(
         LlamaBidirectionalConfig(
             vocab_size=32,
@@ -562,18 +879,110 @@ def test_bi_encoder_skips_standard_export_for_unrepresentable_pooling(pooling, t
     assert not (save_dir / "modules.json").exists()
 
 
-def test_bi_encoder_skips_standard_export_for_multimodal_backbone():
-    from nemo_automodel._transformers import retrieval
+def test_bi_encoder_rejects_composite_without_text_config_contract():
+    """Unknown composite layouts fail before causality can leak into vision modules."""
+    backbone = nn.Module()
+    backbone.config = SimpleNamespace(is_composition=True, name_or_path="")
+
+    with pytest.raises(ValueError, match="must identify their text config"):
+        retrieval.BiEncoderModel(backbone, pooling="last", l2_normalize=True, is_causal=False)
+
+
+@pytest.mark.parametrize(
+    "decoder_contract, error",
+    [
+        ("missing", "must expose their text tower"),
+        ("not_a_module", "distinct text backbone module"),
+        ("root", "distinct text backbone module"),
+        ("mismatched_config", "must identify the same text backbone"),
+    ],
+)
+def test_invalid_composite_decoder_fails_before_mutating_attention(decoder_contract, error):
+    """Reject unsafe tower selection without modifying either text metadata or vision attention."""
+    text_config = PretrainedConfig()
+    backbone = nn.Module()
+    backbone.config = SimpleNamespace(is_composition=True, get_text_config=lambda decoder: text_config)
+    backbone.vision_tower = nn.Module()
+    backbone.vision_tower.is_causal = True
+    if decoder_contract == "not_a_module":
+        backbone.get_decoder = lambda: None
+    elif decoder_contract == "root":
+        backbone.get_decoder = lambda: backbone
+    elif decoder_contract == "mismatched_config":
+        backbone.text_tower = nn.Module()
+        backbone.text_tower.config = PretrainedConfig()
+        backbone.get_decoder = lambda: backbone.text_tower
+
+    with pytest.raises(ValueError, match=error):
+        retrieval.BiEncoderModel(backbone, is_causal=False)
+
+    assert "is_causal" not in vars(text_config)
+    assert backbone.vision_tower.is_causal is True
+
+
+@pytest.mark.parametrize("is_causal", [False, True])
+def test_bi_encoder_scopes_is_causal_to_composite_text_tower(is_causal):
+    """Composite bi-encoders update text attention without changing vision attention."""
+
+    class CompositeConfig:
+        is_composition = True
+        name_or_path = ""
+
+        def __init__(self):
+            self.text_config = PretrainedConfig(hidden_size=16)
+
+        def get_text_config(self, decoder=None, encoder=None):
+            return self.text_config if decoder else self
+
+        def to_dict(self):
+            return {"text_config": self.text_config.to_dict()}
+
+    class Tower(nn.Module):
+        def __init__(self, config=None):
+            super().__init__()
+            self.config = config
+            self.attention = nn.Module()
+            self.attention.is_causal = True
 
     class CompositeBackbone(nn.Module):
         main_input_name = "pixel_values"
 
         def __init__(self):
             super().__init__()
-            self.config = PretrainedConfig()
-            self.config.is_composition = True
+            self.config = CompositeConfig()
+            self.text_tower = Tower(self.config.text_config)
+            self.vision_tower = Tower()
+            self.vision_tower.attention.is_causal = not is_causal
+
+        def get_decoder(self):
+            return self.text_tower
+
+    backbone = CompositeBackbone()
+    encoder = retrieval.BiEncoderModel(backbone, pooling="last", l2_normalize=True, is_causal=is_causal)
+
+    assert encoder.is_causal is is_causal
+    assert backbone.config.text_config.is_causal is is_causal
+    assert backbone.text_tower.attention.is_causal is is_causal
+    assert backbone.vision_tower.attention.is_causal is (not is_causal)
+    assert "is_causal" not in vars(backbone.config)
+
+
+def test_bi_encoder_skips_standard_export_for_multimodal_backbone():
+    class CompositeBackbone(nn.Module):
+        main_input_name = "pixel_values"
+
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(is_composition=True, name_or_path="")
             self.config.llm_config = PretrainedConfig(hidden_size=16)
-            self.config.name_or_path = ""
+            self.config.get_text_config = lambda decoder=None, encoder=None: (
+                self.config.llm_config if decoder else self.config
+            )
+            self.language_model = nn.Module()
+            self.language_model.config = self.config.llm_config
+
+        def get_decoder(self):
+            return self.language_model
 
     encoder = retrieval.BiEncoderModel(CompositeBackbone(), pooling="last", l2_normalize=True)
 
@@ -582,8 +991,6 @@ def test_bi_encoder_skips_standard_export_for_multimodal_backbone():
 
 
 def test_bi_encoder_export_config_uses_deployable_hf_base_classes():
-    from nemo_automodel._transformers import retrieval
-
     backbone = LlamaBidirectionalModel(
         LlamaBidirectionalConfig(
             vocab_size=32,
@@ -611,8 +1018,6 @@ def test_bi_encoder_export_config_uses_deployable_hf_base_classes():
 
 
 def test_bi_encoder_export_config_uses_class_model_type_when_source_type_is_retained():
-    from nemo_automodel._transformers import retrieval
-
     config = Ministral3BidirectionalConfig.from_dict(
         {
             "model_type": "ministral3",
@@ -645,8 +1050,6 @@ def test_bi_encoder_export_config_uses_class_model_type_when_source_type_is_reta
 
 def test_ministral_embedding_uses_stock_bidirectional_model(tmp_path):
     """Standard Ministral checkpoints use and save the stock non-causal model."""
-    from nemo_automodel._transformers import retrieval
-
     model_dir, source_state_dict = _save_tiny_ministral_text_model(tmp_path)
 
     backbone = retrieval.build_encoder_backbone(
@@ -723,10 +1126,6 @@ def test_ministral_embedding_uses_stock_bidirectional_model(tmp_path):
 
 def test_ministral_embedding_uses_bidirectional_flash_attention(tmp_path, monkeypatch):
     """Stock Ministral selects non-causal attention at the FlashAttention kernel boundary."""
-    from transformers.integrations import flash_attention
-
-    from nemo_automodel._transformers import retrieval
-
     model_dir, _ = _save_tiny_ministral_text_model(tmp_path)
     backbone = retrieval.build_encoder_backbone(
         model_name_or_path=str(model_dir),
@@ -736,7 +1135,7 @@ def test_ministral_embedding_uses_bidirectional_flash_attention(tmp_path, monkey
     assert backbone.config.is_causal is False
     assert hasattr(backbone.config, "_attn_implementation")
     backbone.config._attn_implementation = "flash_attention_2"
-    assert all(layer.self_attn.is_causal is True for layer in backbone.layers)
+    assert all(layer.self_attn.is_causal is False for layer in backbone.layers)
 
     kernel_calls = []
 
@@ -783,11 +1182,6 @@ def test_sentence_transformers_and_nemo_round_trip_generated_ministral_checkpoin
     pooling,
     l2_normalize,
 ):
-    from sentence_transformers import SentenceTransformer
-
-    from nemo_automodel._transformers import auto_model as auto_model_module
-    from nemo_automodel._transformers import retrieval
-
     model_dir, _ = _save_tiny_ministral_text_model(tmp_path)
     backbone = retrieval.build_encoder_backbone(
         model_name_or_path=str(model_dir),
@@ -826,15 +1220,15 @@ def test_sentence_transformers_and_nemo_round_trip_generated_ministral_checkpoin
         moe_parallel_config=None,
         activation_checkpointing=None,
     )
-    monkeypatch.setattr(auto_model_module, "_resolve_distributed_setup", lambda **_: setup)
+    monkeypatch.setattr(auto_model, "_resolve_distributed_setup", lambda **_: setup)
     monkeypatch.setattr(
-        auto_model_module,
+        auto_model,
         "instantiate_infrastructure",
         lambda **_: (None, None, None, None),
     )
-    monkeypatch.setattr(auto_model_module.torch.cuda, "current_device", lambda: 0)
-    monkeypatch.setattr(auto_model_module, "apply_model_infrastructure", lambda model, **_: model)
-    nemo_reloaded = auto_model_module.NeMoAutoModelBiEncoder.from_pretrained(
+    monkeypatch.setattr(auto_model.torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(auto_model, "apply_model_infrastructure", lambda model, **_: model)
+    nemo_reloaded = auto_model.NeMoAutoModelBiEncoder.from_pretrained(
         str(save_dir),
         attn_implementation="eager",
         use_liger_kernel=False,
@@ -859,12 +1253,6 @@ def test_sentence_transformers_and_nemo_round_trip_generated_ministral_checkpoin
 
 
 def test_consolidated_checkpointer_round_trip_through_sentence_transformers_and_nemo(tmp_path, monkeypatch):
-    from sentence_transformers import SentenceTransformer
-
-    from nemo_automodel._transformers import auto_model as auto_model_module
-    from nemo_automodel._transformers import retrieval
-    from nemo_automodel.components.checkpoint.config import CheckpointingConfig
-
     model_dir, _ = _save_tiny_ministral_text_model(tmp_path)
     encoder = retrieval.BiEncoderModel.build(
         str(model_dir),
@@ -928,11 +1316,11 @@ def test_consolidated_checkpointer_round_trip_through_sentence_transformers_and_
         moe_parallel_config=None,
         activation_checkpointing=None,
     )
-    monkeypatch.setattr(auto_model_module, "_resolve_distributed_setup", lambda **_: setup)
-    monkeypatch.setattr(auto_model_module, "instantiate_infrastructure", lambda **_: (None, None, None, None))
-    monkeypatch.setattr(auto_model_module.torch.cuda, "current_device", lambda: 0)
-    monkeypatch.setattr(auto_model_module, "apply_model_infrastructure", lambda model, **_: model)
-    nemo_reloaded = auto_model_module.NeMoAutoModelBiEncoder.from_pretrained(
+    monkeypatch.setattr(auto_model, "_resolve_distributed_setup", lambda **_: setup)
+    monkeypatch.setattr(auto_model, "instantiate_infrastructure", lambda **_: (None, None, None, None))
+    monkeypatch.setattr(auto_model.torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(auto_model, "apply_model_infrastructure", lambda model, **_: model)
+    nemo_reloaded = auto_model.NeMoAutoModelBiEncoder.from_pretrained(
         str(consolidated_dir),
         attn_implementation="eager",
         use_liger_kernel=False,
@@ -953,8 +1341,6 @@ def test_consolidated_checkpointer_round_trip_through_sentence_transformers_and_
 
 
 def test_nemo_bi_encoder_explicit_options_override_sentence_transformer_metadata(tmp_path):
-    from nemo_automodel._transformers import retrieval
-
     model_dir, _ = _save_tiny_ministral_text_model(tmp_path)
     backbone = retrieval.build_encoder_backbone(
         model_name_or_path=str(model_dir),
@@ -976,8 +1362,6 @@ def test_nemo_bi_encoder_explicit_options_override_sentence_transformer_metadata
 
 
 def test_nemo_bi_encoder_saved_prompts_round_trip_through_reexport(tmp_path):
-    from nemo_automodel._transformers import retrieval
-
     model_dir, _ = _save_tiny_ministral_text_model(tmp_path)
     backbone = retrieval.build_encoder_backbone(
         model_name_or_path=str(model_dir),
@@ -1001,8 +1385,6 @@ def test_nemo_bi_encoder_saved_prompts_round_trip_through_reexport(tmp_path):
 
 
 def test_mean_pooling_alias_matches_avg():
-    from nemo_automodel._transformers import retrieval
-
     hidden_states = torch.tensor([[[1.0, 2.0], [3.0, 4.0], [100.0, 100.0]]])
     attention_mask = torch.tensor([[1, 1, 0]])
 
@@ -1013,8 +1395,6 @@ def test_mean_pooling_alias_matches_avg():
 
 
 def test_nemo_bi_encoder_uses_defaults_without_sentence_transformer_metadata():
-    from nemo_automodel._transformers import retrieval
-
     config = PretrainedConfig()
 
     assert retrieval._resolve_bi_encoder_options(config, None, None, None) == ("avg", True)
@@ -1023,8 +1403,6 @@ def test_nemo_bi_encoder_uses_defaults_without_sentence_transformer_metadata():
 
 
 def test_nemo_bi_encoder_build_canonicalizes_mean_pooling(tmp_path):
-    from nemo_automodel._transformers import retrieval
-
     model_dir, _ = _save_tiny_ministral_text_model(tmp_path)
 
     encoder = retrieval.BiEncoderModel.build(
@@ -1040,8 +1418,6 @@ def test_nemo_bi_encoder_build_canonicalizes_mean_pooling(tmp_path):
 
 def test_extract_submodel_ministral_embedding_from_local_vlm_converts_to_supported_backbone(tmp_path):
     """A Ministral3 VLM text backbone becomes a stock non-causal Ministral model."""
-    from nemo_automodel._transformers import retrieval
-
     model_dir, language_state_dict = _save_tiny_vlm(tmp_path, "ministral3")
 
     backbone = retrieval.build_encoder_backbone(
@@ -1069,8 +1445,6 @@ def test_extract_submodel_ministral_embedding_from_local_vlm_converts_to_support
 
 def test_extract_submodel_llama_score_from_local_vlm_converts_to_supported_cross_encoder(tmp_path):
     """A supported extracted Llama text backbone becomes the retrieval reranker."""
-    from nemo_automodel._transformers import retrieval
-
     model_dir, language_state_dict = _save_tiny_vlm(tmp_path, "llama")
 
     backbone = retrieval.build_encoder_backbone(
@@ -1099,8 +1473,6 @@ def test_extract_submodel_llama_score_from_local_vlm_converts_to_supported_cross
 
 def test_extract_submodel_ministral_score_from_local_vlm_converts_to_hf_cross_encoder(tmp_path):
     """Reranking still works when no registered score backbone exists for the text model."""
-    from nemo_automodel._transformers import retrieval
-
     model_dir, language_state_dict = _save_tiny_vlm(tmp_path, "ministral3")
 
     backbone = retrieval.build_encoder_backbone(
@@ -1131,10 +1503,8 @@ class _PlainSubmodule(nn.Module):
 
 def test_extract_submodel_without_config_raises():
     """The extracted object must carry a config so it can be saved/reloaded."""
-    from nemo_automodel._transformers.retrieval import _extract_submodel
-
     model = nn.Module()
     model.language_model = _PlainSubmodule()
 
     with pytest.raises(ValueError, match="has no .config attribute"):
-        _extract_submodel(model, "language_model")
+        retrieval._extract_submodel(model, "language_model")

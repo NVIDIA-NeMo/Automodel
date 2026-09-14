@@ -39,6 +39,7 @@ model:
   pretrained_model_name_or_path: nvidia/llama-nemotron-embed-vl-1b-v2
   pooling: avg
   l2_normalize: true
+  is_causal: false
   use_liger_kernel: true
   use_sdpa_patching: true
   torch_dtype: bfloat16
