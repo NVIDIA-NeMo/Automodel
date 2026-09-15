@@ -138,6 +138,46 @@ def _materialize_missing_adam_state(optimizer: torch.optim.Optimizer) -> None:
                 state["max_exp_avg_sq"] = _zeros_like_optimizer_param(param)
 
 
+def _restore_quantized_optimizer_state_specs(optimizer: torch.optim.Optimizer) -> int:
+    """Re-derive DTensor metadata for quantized optimizer state after a load.
+
+    ``Optimizer.load_state_dict`` casts every non-``step`` state tensor to its
+    parameter's dtype. torchao's low-bit state subclasses (e.g. ``OptimState8bit``)
+    ignore the dtype in ``_to_copy`` and stay float32 locally, but the wrapping
+    DTensor's spec still records the parameter dtype (bf16). torchao's compiled
+    Adam step then fails sharding propagation in ``lerp`` ("expected dtype
+    torch.bfloat16 for `end`, but got dtype torch.float32") on the first step
+    after resume. Rebuilding the DTensor from its local tensor restores the spec
+    without touching the quantized values.
+
+    Returns:
+        Number of state tensors rebuilt.
+    """
+    from torch.distributed.tensor import DTensor
+
+    rebuilt = 0
+    for state in optimizer.state.values():
+        for key, value in list(state.items()):
+            if not isinstance(value, DTensor):
+                continue
+            local = value._local_tensor
+            if not hasattr(local, "dequantize"):
+                continue
+            meta = value._spec.tensor_meta
+            if meta is not None and meta.dtype == local.dtype and value.dtype == local.dtype:
+                continue
+            state[key] = DTensor.from_local(
+                local,
+                device_mesh=value.device_mesh,
+                placements=value.placements,
+                run_check=False,
+                shape=value.shape,
+                stride=value.stride(),
+            )
+            rebuilt += 1
+    return rebuilt
+
+
 def _get_peft_state_dict(model: torch.nn.Module) -> dict[str, Any]:
     """Extract only trainable PEFT adapter weights, bypassing DCP.
 
@@ -719,6 +759,10 @@ class OptimizerState:
                 options=StateDictOptions(flatten_optimizer_state_dict=True),
             )
             list(map(func, self.model, self.optimizer))
+
+        rebuilt = sum(_restore_quantized_optimizer_state_specs(optimizer) for optimizer in self.optimizer)
+        if rebuilt:
+            logging.info("Restored float32 DTensor specs for %d quantized optimizer state tensors", rebuilt)
 
         # load the scheduler state if it exists
         if "sched" in state_dict and self.scheduler is not None:
