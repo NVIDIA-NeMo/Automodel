@@ -573,10 +573,7 @@ def test_te_attention_is_constructed_natively(monkeypatch):
     [1, 2],
 )
 def test_parallel_strategy_accepts_supported_tp_sizes(monkeypatch, tp_size):
-    from nemo_automodel.components.distributed.parallelizer import (
-        PARALLELIZATION_STRATEGIES,
-        DefaultParallelizationStrategy,
-    )
+    from nemo_automodel.components.distributed.parallelizer import DefaultParallelizationStrategy
 
     class _SubMesh:
         def __init__(self, size):
@@ -601,17 +598,14 @@ def test_parallel_strategy_accepts_supported_tp_sizes(monkeypatch, tp_size):
         backend=BackendConfig(attn="sdpa"),
     )
 
-    PARALLELIZATION_STRATEGIES["MuseGlimmerForConditionalGeneration"].parallelize(model, _Mesh())
+    MuseGlimmerForConditionalGeneration.parallel_spec.strategy.parallelize(model, _Mesh())
 
     assert all(not hasattr(layer.self_attn, "te_tp_replicated") for layer in model.model.layers)
 
 
 @pytest.mark.parametrize("tp_size", [4, 8])
 def test_parallel_strategy_rejects_tp_above_kv_head_count(monkeypatch, tp_size):
-    from nemo_automodel.components.distributed.parallelizer import (
-        PARALLELIZATION_STRATEGIES,
-        DefaultParallelizationStrategy,
-    )
+    from nemo_automodel.components.distributed.parallelizer import DefaultParallelizationStrategy
 
     class _SubMesh:
         def __init__(self, size):
@@ -637,4 +631,4 @@ def test_parallel_strategy_rejects_tp_above_kv_head_count(monkeypatch, tp_size):
     )
 
     with pytest.raises(ValueError, match=r"supports TP1 or TP2.*tp_size=[48]"):
-        PARALLELIZATION_STRATEGIES["MuseGlimmerForConditionalGeneration"].parallelize(model, _Mesh())
+        MuseGlimmerForConditionalGeneration.parallel_spec.strategy.parallelize(model, _Mesh())

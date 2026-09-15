@@ -62,6 +62,8 @@ import nemo_automodel.components.checkpoint.utils as checkpoint_utils
 import nemo_automodel.components.distributed.utils as dist_utils
 from nemo_automodel._transformers.registry import ModelRegistry, resolve_custom_config_cls
 from nemo_automodel.components.distributed.init_utils import get_local_world_size_preinit, get_world_size_safe
+from nemo_automodel.components.distributed.parallel_spec import ParallelSpec
+from nemo_automodel.components.models import MODEL_SPEC_ATTRIBUTES, declared_model_specs
 from nemo_automodel.components.models.common.gated_delta_net_fp32 import (
     has_gated_delta_net_fp32_checkpoint_contract,
     is_gated_delta_net_fp32_param_key,
@@ -117,6 +119,59 @@ _patched_get_init_context.__wrapped__ = _original_get_init_context
 PreTrainedModel.get_init_context = classmethod(_patched_get_init_context)
 
 
+def model_specs_for(model_class: type) -> dict[str, object]:
+    """Contracts for a class the repository does not own: ``{attribute: spec}`` over ``MODEL_SPEC_ATTRIBUTES``.
+
+    Serves transformers and diffusers classes alike. Walks the MRO so subclasses
+    (``HFCheckpointingMixin`` wrappers, FP8 variants, remote-code ports) inherit their base
+    architecture's contracts. Per class and per attribute, the declaration in the model package named
+    by :func:`nemo_automodel.components.models.model_family` wins; otherwise the native implementation
+    registered under the same architecture name is authoritative for its transformers twin. Attributes
+    nobody declares are absent, which selects the generic defaults.
+    """
+    specs: dict[str, object] = {}
+    for cls in model_class.__mro__:
+        declared = declared_model_specs(cls)
+        twin = (
+            ModelRegistry.get_model_cls_from_model_arch(cls.__name__)
+            if ModelRegistry.has_custom_model(cls.__name__)
+            else None
+        )
+        for attr in MODEL_SPEC_ATTRIBUTES:
+            if attr in specs:
+                continue
+            spec = declared.get(attr)
+            if spec is None and twin is not None:
+                spec = getattr(twin, attr, None)
+            if spec is not None:
+                specs[attr] = spec
+    return specs
+
+
+def parallel_spec_for(model_class: type) -> ParallelSpec | None:
+    """The ``parallel_spec`` :func:`model_specs_for` resolves for ``model_class``, or ``None``."""
+    return model_specs_for(model_class).get("parallel_spec")
+
+
+def bind_model_specs(model: torch.nn.Module) -> torch.nn.Module:
+    """Give an already-built ``model`` the contracts its class resolves to.
+
+    This is the instance-level form of what ``_get_mixin_wrapped_class`` does for the classes the
+    transformers loader wraps: ``model.__class__`` becomes a subclass carrying the resolved spec
+    attributes (same name, module and qualname), so ``query_parallel_spec`` and its siblings find them
+    without touching the upstream class. Attributes the class already declares are kept; a model that
+    resolves to nothing new is returned unchanged.
+    """
+    cls = type(model)
+    specs = {attr: spec for attr, spec in model_specs_for(cls).items() if not hasattr(cls, attr)}
+    if not specs:
+        return model
+    model.__class__ = type(
+        cls.__name__, (cls,), {**specs, "__module__": cls.__module__, "__qualname__": cls.__qualname__}
+    )
+    return model
+
+
 def _get_mixin_wrapped_class(model_class: type) -> type:
     """
     Get a class that combines HFCheckpointingMixin with the original model class.
@@ -133,15 +188,14 @@ def _get_mixin_wrapped_class(model_class: type) -> type:
     if issubclass(model_class, HFCheckpointingMixin):
         return model_class
 
-    # Create wrapper class that looks identical to original
-    return type(
-        model_class.__name__,
-        (HFCheckpointingMixin, model_class),
-        {
-            "__module__": model_class.__module__,
-            "__qualname__": model_class.__qualname__,
-        },
+    # Create wrapper class that looks identical to original. Classes the repository does not
+    # re-implement get their model-owned contracts here, so components.distributed only ever reads
+    # the spec class attributes.
+    namespace = {"__module__": model_class.__module__, "__qualname__": model_class.__qualname__}
+    namespace.update(
+        {attr: spec for attr, spec in model_specs_for(model_class).items() if not hasattr(model_class, attr)}
     )
+    return type(model_class.__name__, (HFCheckpointingMixin, model_class), namespace)
 
 
 @contextmanager

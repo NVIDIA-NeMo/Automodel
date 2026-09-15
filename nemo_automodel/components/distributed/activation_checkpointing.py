@@ -30,7 +30,8 @@ import logging
 import os
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from typing import List
+from dataclasses import dataclass
+from typing import List, Literal
 
 import torch
 import torch.nn.functional as F
@@ -48,6 +49,33 @@ from nemo_automodel.shared.import_utils import get_torch_version, safe_import
 logger = logging.getLogger(__name__)
 
 _TORCH_PROFILER_SAC_IGNORE_MIN_VERSION = (2, 13)
+
+
+@dataclass(frozen=True)
+class ActivationCheckpointingSpec:
+    """Model-owned activation checkpointing contract, separate from the parallelization one.
+
+    A model class declares it as an ``activation_checkpointing_spec`` class attribute; the wrapper
+    subclasses the loaders create inherit it, and architectures declared in
+    ``components/models/<family>/parallelization.py`` get it bound like ``parallel_spec``. The
+    all-default spec selects the generic wrappers.
+
+    Attributes:
+        granularity: ``"submodule"`` (default) wraps the attention / MLP children of every selected
+            layer; ``"layer"`` wraps each selected layer as one unit, for architectures whose blocks
+            must be recomputed whole (BAGEL's Qwen2 decoder and SigLIP encoder layers).
+    """
+
+    granularity: Literal["submodule", "layer"] = "submodule"
+
+
+_DEFAULT_ACTIVATION_CHECKPOINTING_SPEC = ActivationCheckpointingSpec()
+
+
+def query_activation_checkpointing_spec(model: nn.Module) -> ActivationCheckpointingSpec:
+    """Return the :class:`ActivationCheckpointingSpec` declared on ``model``'s class, or the all-default spec."""
+    spec = getattr(type(model), "activation_checkpointing_spec", None)
+    return _DEFAULT_ACTIVATION_CHECKPOINTING_SPEC if spec is None else spec
 
 
 def unwrap_checkpoint_wrapper(module: nn.Module) -> nn.Module:
@@ -205,7 +233,16 @@ def _build_selective_ac_save_ops() -> frozenset:
     return frozenset(save_ops)
 
 
-_SELECTIVE_AC_MUST_SAVE_OPS = _build_selective_ac_save_ops()
+@functools.lru_cache(maxsize=1)
+def _selective_ac_must_save_ops() -> frozenset:
+    """Save-set for selective AC, built on first use so importing this module stays cheap.
+
+    ``_build_selective_ac_save_ops`` reaches into ``torch._functorch.partitioners`` (and so
+    inductor / dynamo); resolving it here rather than at module scope keeps that off the import
+    path of every process that merely imports the parallelizer.
+    """
+    return _build_selective_ac_save_ops()
+
 
 _SELECTIVE_AC_TO_COPY_OP = _resolve_torch_op("aten._to_copy")
 
@@ -360,6 +397,7 @@ def make_selective_checkpoint_context_fn():
     ensure_fsdp_ops_sac_ignored()
 
     def selective_checkpointing_context_fn():
+        must_save_ops = _selective_ac_must_save_ops()
         # Count matmuls separately for the forward and recompute passes. torch
         # calls ``context_fn`` once per checkpointed region, so a single shared
         # counter would continue from the forward count into recompute and flip
@@ -377,7 +415,7 @@ def make_selective_checkpoint_context_fn():
                     if mm_counts[ctx.is_recompute] % 2 == 0
                     else CheckpointPolicy.MUST_SAVE
                 )
-            elif func in _SELECTIVE_AC_MUST_SAVE_OPS or _is_cuda_to_cpu_copy(func, args, kwargs):
+            elif func in must_save_ops or _is_cuda_to_cpu_copy(func, args, kwargs):
                 decision = CheckpointPolicy.MUST_SAVE
             else:
                 decision = CheckpointPolicy.PREFER_RECOMPUTE

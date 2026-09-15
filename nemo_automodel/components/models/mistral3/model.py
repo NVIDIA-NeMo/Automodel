@@ -17,6 +17,8 @@ from typing import Optional, Union
 
 import torch
 from torch import nn
+from torch.distributed.tensor.parallel import ColwiseParallel, ParallelStyle, RowwiseParallel, SequenceParallel
+from torch.distributed.tensor.placement_types import Replicate, Shard
 from transformers import AutoConfig, AutoModel, AutoModelForCausalLM, AutoModelForImageTextToText
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
@@ -37,6 +39,11 @@ from transformers.models.mistral3.modeling_mistral3 import Mistral3ForConditiona
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, can_return_tuple, logging
 
+from nemo_automodel.components.distributed.optimized_tp_plans import (
+    SequenceParallelAllGatherActivation,
+    VocabParallelEmbedding,
+)
+from nemo_automodel.components.distributed.parallel_spec import ParallelSpec
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
@@ -509,6 +516,33 @@ class Ministral3Model(Ministral3PreTrainedModel):
         )
 
 
+MINISTRAL3_TP_PLAN: dict[str, ParallelStyle] = {
+    "model.embed_tokens": VocabParallelEmbedding(input_layouts=Replicate()),
+    "model.layers.*.self_attn.q_proj": ColwiseParallel(),
+    "model.layers.*.self_attn.k_proj": ColwiseParallel(),
+    "model.layers.*.self_attn.v_proj": ColwiseParallel(),
+    "model.layers.*.self_attn.o_proj": RowwiseParallel(),
+    "model.layers.*.mlp.up_proj": ColwiseParallel(),
+    "model.layers.*.mlp.gate_proj": ColwiseParallel(),
+    "model.layers.*.mlp.down_proj": RowwiseParallel(),
+    "lm_head": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
+}
+
+MINISTRAL3_SEQUENCE_PARALLEL_PLAN: dict[str, ParallelStyle] = {
+    "model.embed_tokens": VocabParallelEmbedding(
+        input_layouts=Replicate(),
+        output_layouts=Shard(1),
+        use_local_output=False,
+    ),
+    "model.norm": SequenceParallel(),
+    "model.layers.*.input_layernorm": SequenceParallelAllGatherActivation(use_local_output=False),
+    "model.layers.*.self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1), use_local_output=False),
+    "model.layers.*.post_attention_layernorm": SequenceParallelAllGatherActivation(use_local_output=False),
+    "model.layers.*.mlp.down_proj": RowwiseParallel(output_layouts=Shard(1), use_local_output=False),
+    "lm_head": ColwiseParallel(input_layouts=Shard(1), output_layouts=Shard(-1), use_local_output=False),
+}
+
+
 class Ministral3ForCausalLM(HFCheckpointingMixin, Ministral3PreTrainedModel, GenerationMixin):
     # No checkpoint served through this arch is tied (config default is untied);
     # the 3B's text_config tie flag reaches the VLM class, not this one.
@@ -517,6 +551,9 @@ class Ministral3ForCausalLM(HFCheckpointingMixin, Ministral3PreTrainedModel, Gen
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
     _supports_streaming_fp8_checkpoint_load = True
+    parallel_spec: ParallelSpec = ParallelSpec(
+        tp_plan=MINISTRAL3_TP_PLAN, sequence_parallel_plan=MINISTRAL3_SEQUENCE_PARALLEL_PLAN
+    )
 
     @dataclass(frozen=True)
     class ModelCapabilities:

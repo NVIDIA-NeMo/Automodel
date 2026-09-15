@@ -524,6 +524,9 @@ navigation:
       - page: "Distributed Setup (Python API)"
         path: ../../guides/distributed-setup.mdx
         slug: distributed-setup
+      - page: "Parallelizer API (Model-Owned Parallel Specs)"
+        path: ../../guides/parallelizer-api.mdx
+        slug: parallelizer-api
       - page: "Pipeline Parallelism"
         path: ../../guides/pipelining.mdx
         slug: pipeline-parallelism

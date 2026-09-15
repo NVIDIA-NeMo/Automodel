@@ -18,7 +18,7 @@ The function selects a tensor-parallel sharding plan via the following priority:
 1. A *custom* plan supplied by the caller (either a dictionary ‑or- an import
    path to a dict/function).
 2. If requested, the HuggingFace-derived plan via ``get_hf_tp_shard_plan``.
-3. A model-specific plan located in ``PARALLELIZE_FUNCTIONS``; on failure, try HF.
+3. The model's ``ParallelSpec.tp_plan``; on failure, try HF.
 4. Otherwise, return a default base plan (with SP adjustments when enabled).
 
 This test module covers every branch, including error conditions.
@@ -27,7 +27,6 @@ This test module covers every branch, including error conditions.
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import Dict
 
 import pytest
 from torch.distributed.tensor.parallel import ColwiseParallel
@@ -35,13 +34,12 @@ from torch.distributed.tensor.placement_types import Replicate, Shard
 
 # Function under test and collaborators
 import nemo_automodel.components.distributed.parallelizer as parallelizer
-from nemo_automodel.components.distributed.optimized_tp_plans import (
-    LLAMA_NEMOTRON_SUPER_TP_PLAN_NAME,
-    _get_class_qualname,
-    get_decilm_nemotron_tp_plan,
-    get_llama_nemotron_super_tp_plan,
-)
+from nemo_automodel._transformers.model_init import _get_mixin_wrapped_class
+from nemo_automodel.components.distributed.optimized_tp_plans import LLAMA_NEMOTRON_SUPER_TP_PLAN_NAME
+from nemo_automodel.components.distributed.parallel_spec import ParallelSpec
 from nemo_automodel.components.distributed.parallelizer import _get_parallel_plan
+from nemo_automodel.components.models.llama.parallelization import LLAMA_PARALLEL_SPEC
+from nemo_automodel.components.models.nemotron_nas.parallelization import DeciLMForCausalLM as DeciLMDeclaration
 
 
 class _DummyModel:
@@ -51,15 +49,9 @@ class _DummyModel:
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
     """Ensure external state is isolated between tests."""
-    # Backup original global dicts so we can restore them after each test
-    original_plans: Dict = parallelizer.PARALLELIZE_FUNCTIONS.copy()
     original_model_cls = getattr(parallelizer, "model_cls", None)
 
     yield
-
-    # Restore module-level globals that we tamper with
-    parallelizer.PARALLELIZE_FUNCTIONS.clear()
-    parallelizer.PARALLELIZE_FUNCTIONS.update(original_plans)
 
     if original_model_cls is not None:
         monkeypatch.setattr(parallelizer, "model_cls", original_model_cls, raising=False)
@@ -139,31 +131,43 @@ def test_custom_plan_invalid_path(monkeypatch):
         _get_parallel_plan(_DummyModel(), tp_shard_plan="bad.path")
 
 
-# 3. Optimised plan in ``PARALLELIZE_FUNCTIONS``
+# 3. Optimised plan from the model's ParallelSpec
 def test_optimised_plan_success(monkeypatch):
     plan = {"opt": "plan"}
 
     # Register dummy entry
-    parallelizer.PARALLELIZE_FUNCTIONS[_get_class_qualname(_DummyModel)] = lambda m, sp: plan
+    monkeypatch.setattr(_DummyModel, "parallel_spec", ParallelSpec(tp_plan=plan), raising=False)
     _set_global_model_cls(monkeypatch, _DummyModel)
 
     result = _get_parallel_plan(_DummyModel(), sequence_parallel=False)
-    assert result is plan
+    assert result == plan
+    assert result is not plan  # the declaration is handed out as a copy
 
 
-def test_optimised_plan_fallback_to_hf(monkeypatch):
-    """If the optimised function raises, the helper should fallback to HF plan."""
-    sentinel = {"hf": "plan"}
-
-    def _broken_fn(model, seq):  # noqa: D401
-        raise RuntimeError("fail")
-
-    parallelizer.PARALLELIZE_FUNCTIONS[_get_class_qualname(_DummyModel)] = _broken_fn
-    monkeypatch.setattr(parallelizer, "get_hf_tp_shard_plan", lambda m: sentinel, raising=True)
+def test_declared_plan_wins_over_hf(monkeypatch):
+    """A declared plan is used even when the model also carries a translatable HF ``_tp_plan``."""
+    plan = {"opt": "plan"}
+    monkeypatch.setattr(_DummyModel, "parallel_spec", ParallelSpec(tp_plan=plan), raising=False)
+    monkeypatch.setattr(parallelizer, "get_hf_tp_shard_plan", lambda m: {"hf": "plan"}, raising=True)
     _set_global_model_cls(monkeypatch, _DummyModel)
+    assert _get_parallel_plan(_DummyModel(), sequence_parallel=False) == plan
 
-    result = _get_parallel_plan(_DummyModel(), sequence_parallel=False)
-    assert result is sentinel
+
+def test_sequence_parallel_overlay_and_missing_overlay_warning(monkeypatch, caplog):
+    """SP overlays the declared plan; a spec without an overlay logs that the request is ignored."""
+    base = {"lm_head": "base_head", "model.layers.*.mlp.down_proj": "down"}
+    overlay = {"lm_head": "sp_head", "model.norm": "norm"}
+    monkeypatch.setattr(
+        _DummyModel, "parallel_spec", ParallelSpec(tp_plan=base, sequence_parallel_plan=overlay), raising=False
+    )
+    _set_global_model_cls(monkeypatch, _DummyModel)
+    assert _get_parallel_plan(_DummyModel(), sequence_parallel=True) == {**base, **overlay}
+    assert _get_parallel_plan(_DummyModel(), sequence_parallel=False) == base
+
+    monkeypatch.setattr(_DummyModel, "parallel_spec", ParallelSpec(tp_plan=base), raising=False)
+    with caplog.at_level("WARNING"):
+        assert _get_parallel_plan(_DummyModel(), sequence_parallel=True) == base
+    assert "declares no sequence-parallel plan" in caplog.text
 
 
 # 4. HF plan is used when no optimised plan exists
@@ -174,7 +178,7 @@ def test_hf_fallback(monkeypatch):
     _set_global_model_cls(monkeypatch, _DummyModel)
 
     result = _get_parallel_plan(_DummyModel(), sequence_parallel=False)
-    assert result is hf_plan
+    assert result == hf_plan
 
 
 def test_hf_fallback_sequence_parallel_assert(monkeypatch):
@@ -188,46 +192,8 @@ def test_hf_fallback_sequence_parallel_assert(monkeypatch):
     assert "model.norm" in result
 
 
-def test_optimised_plan_and_hf_both_fail_raises_sp_false(monkeypatch):
-    """Optimised plan raises and HF raises → runtime error (SP=False)."""
-
-    def _broken_fn(model, seq):
-        raise RuntimeError("fail")
-
-    parallelizer.PARALLELIZE_FUNCTIONS[_get_class_qualname(_DummyModel)] = _broken_fn
-
-    def _raise_hf(_model):
-        raise RuntimeError("hf fail")
-
-    monkeypatch.setattr(parallelizer, "get_hf_tp_shard_plan", _raise_hf, raising=True)
-    _set_global_model_cls(monkeypatch, _DummyModel)
-
-    with pytest.raises(RuntimeError, match="hf fail"):
-        _get_parallel_plan(_DummyModel(), sequence_parallel=False)
-
-
-def test_optimised_plan_and_hf_both_fail_assert_sp_true(monkeypatch):
-    """Optimised plan raises then HF path asserts (SP=True)."""
-
-    def _broken_fn(model, seq):
-        raise RuntimeError("fail")
-
-    parallelizer.PARALLELIZE_FUNCTIONS[_get_class_qualname(_DummyModel)] = _broken_fn
-
-    def _raise_hf2(_model):
-        raise RuntimeError("hf fail")
-
-    monkeypatch.setattr(parallelizer, "get_hf_tp_shard_plan", _raise_hf2, raising=True)
-    _set_global_model_cls(monkeypatch, _DummyModel)
-
-    with pytest.raises(RuntimeError, match="hf fail"):
-        _get_parallel_plan(_DummyModel(), sequence_parallel=True)
-
-
 def test_not_registered_and_hf_fail_base_plan(monkeypatch):
     """No optimised plan and HF raises → base plan (with/without SP)."""
-    # Ensure dummy not in mapping
-    parallelizer.PARALLELIZE_FUNCTIONS.pop(_get_class_qualname(_DummyModel), None)
 
     def _raise_hf3(_model):
         raise RuntimeError("hf fail")
@@ -255,9 +221,10 @@ _RemoteCodeDummyModel.__module__ = "transformers_modules.fake_repo.modeling_fake
 
 def test_nemotron_flash_remote_code_uses_registered_tp_plan():
     """Nemotron Flash must retain its validated TP2 path after custom-code fail-fast checks."""
-    model_cls = type("NemotronFlashForCausalLM", (), {})
+    model_cls = type("NemotronFlashForCausalLM", (), {"config_class": SimpleNamespace(model_type="nemotron_flash")})
     model_cls.__module__ = "transformers_modules.nemotron_flash.modeling_nemotron_flash"
     model = model_cls()
+    model.__class__ = _get_mixin_wrapped_class(model_cls)  # what NeMo Auto does for remote-code classes
     model.config = type(
         "Config",
         (),
@@ -274,8 +241,9 @@ def test_nemotron_flash_remote_code_uses_registered_tp_plan():
 
 def test_nemotron_flash_drops_replicated_output_lm_head_plan():
     """Nemotron Flash must not mix replicated logits with a sharded lm_head norm."""
-    model_cls = type("NemotronFlashForCausalLM", (), {})
+    model_cls = type("NemotronFlashForCausalLM", (), {"config_class": SimpleNamespace(model_type="nemotron_flash")})
     model = model_cls()
+    model.__class__ = _get_mixin_wrapped_class(model_cls)
     model.config = SimpleNamespace(model_type="nemotron_flash")
     custom_plan = {"lm_head": ColwiseParallel(output_layouts=Replicate())}
 
@@ -294,7 +262,6 @@ def test_default_plan_fallthrough_raises_for_remote_code_at_tp_size_gt_1(monkeyp
     ``transformers_modules.*``), so users get an actionable error instead of an opaque
     PyTorch assertion. See https://github.com/NVIDIA-NeMo/Automodel/issues/2243.
     """
-    parallelizer.PARALLELIZE_FUNCTIONS.pop(_get_class_qualname(_RemoteCodeDummyModel), None)
 
     def _raise_hf(_model):
         raise RuntimeError("hf fail")
@@ -309,7 +276,7 @@ def test_default_plan_fallthrough_raises_for_remote_code_at_tp_size_gt_1(monkeyp
         msg = str(excinfo.value)
         # The error must name the offending class and the three supported registration paths.
         assert _RemoteCodeDummyModel.__name__ in msg
-        assert "PARALLELIZE_FUNCTIONS" in msg
+        assert "components/models/<model_type>/parallelization.py" in msg
         assert "_tp_plan" in msg
         assert "tp_shard_plan" in msg
 
@@ -321,8 +288,6 @@ def test_default_plan_fallthrough_known_hf_arch_warns_at_tp_size_gt_1(monkeypatc
     logs a warning and still returns the base plan rather than raising.
     """
     import logging as _logging
-
-    parallelizer.PARALLELIZE_FUNCTIONS.pop(_get_class_qualname(_DummyModel), None)
 
     def _raise_hf(_model):
         raise RuntimeError("hf fail")
@@ -347,7 +312,6 @@ def test_default_plan_fallthrough_remote_code_folds_translator_diagnostic(monkey
     "`_tp_plan` defined but unusable". See
     https://github.com/NVIDIA-NeMo/Automodel/pull/2244 discussion.
     """
-    parallelizer.PARALLELIZE_FUNCTIONS.pop(_get_class_qualname(_RemoteCodeDummyModel), None)
 
     def _raise_translator(_model):
         raise ValueError("Unknown parallel style: foo_bar")
@@ -362,7 +326,7 @@ def test_default_plan_fallthrough_remote_code_folds_translator_diagnostic(monkey
     # Diagnostic from get_hf_tp_shard_plan must be folded into the user-facing error.
     assert "Unknown parallel style: foo_bar" in msg
     # And the registration guidance must still be there.
-    assert "PARALLELIZE_FUNCTIONS" in msg
+    assert "components/models/<model_type>/parallelization.py" in msg
     assert "_tp_plan" in msg
     assert "tp_shard_plan" in msg
 
@@ -374,7 +338,6 @@ def test_default_plan_fallthrough_tp_size_1_still_returns_base_plan(monkeypatch)
     metadata never matters. This preserves backwards compatibility for callers that
     do not pass ``tp_size`` (default is 1), including for custom-code archs.
     """
-    parallelizer.PARALLELIZE_FUNCTIONS.pop(_get_class_qualname(_RemoteCodeDummyModel), None)
 
     def _raise_hf(_model):
         raise RuntimeError("hf fail")
@@ -395,12 +358,11 @@ def test_hf_native_plan_unaffected_at_tp_size_gt_1(monkeypatch):
     non-empty plan, that plan must be used regardless of ``tp_size``.
     """
     hf_plan = {"model.embed_tokens": "embed", "lm_head": "head"}
-    parallelizer.PARALLELIZE_FUNCTIONS.pop(_get_class_qualname(_RemoteCodeDummyModel), None)
     monkeypatch.setattr(parallelizer, "get_hf_tp_shard_plan", lambda _m: hf_plan, raising=True)
     _set_global_model_cls(monkeypatch, _RemoteCodeDummyModel)
 
     result = _get_parallel_plan(_RemoteCodeDummyModel(), sequence_parallel=False, tp_size=4)
-    assert result is hf_plan
+    assert result == hf_plan
 
 
 def test_custom_plan_imports_non_dict_raises(monkeypatch):
@@ -427,7 +389,7 @@ def test_named_plan_constant_value():
 
 class TestGetLlamaNemotronSuperTpPlan:
     def test_returns_expected_keys(self):
-        plan = get_llama_nemotron_super_tp_plan(sequence_parallel=False)
+        plan = LLAMA_PARALLEL_SPEC.resolved_tp_plan(sequence_parallel=False)
         assert isinstance(plan, dict)
         assert "model.embed_tokens" in plan
         assert "model.layers.*.self_attn.qkv_proj" in plan
@@ -437,7 +399,7 @@ class TestGetLlamaNemotronSuperTpPlan:
         assert "lm_head" in plan
 
     def test_sp_adds_norm_and_layernorm_entries(self):
-        plan = get_llama_nemotron_super_tp_plan(sequence_parallel=True)
+        plan = LLAMA_PARALLEL_SPEC.resolved_tp_plan(sequence_parallel=True)
         assert "model.norm" in plan
         assert "model.layers.*.input_layernorm" in plan
         assert "model.layers.*.post_attention_layernorm" in plan
@@ -445,7 +407,7 @@ class TestGetLlamaNemotronSuperTpPlan:
 
 class TestGetDecilmNemotronTpPlan:
     def test_returns_separate_qkv_projections(self):
-        plan = get_decilm_nemotron_tp_plan(sequence_parallel=False)
+        plan = DeciLMDeclaration.parallel_spec.resolved_tp_plan(sequence_parallel=False)
         assert isinstance(plan, dict)
         assert "model.layers.*.self_attn.q_proj" in plan
         assert "model.layers.*.self_attn.k_proj" in plan
@@ -460,7 +422,7 @@ class TestGetDecilmNemotronTpPlan:
         assert "model.layers.*.mlp.gate_up_proj" not in plan
 
     def test_sp_adds_norm_entries(self):
-        plan = get_decilm_nemotron_tp_plan(sequence_parallel=True)
+        plan = DeciLMDeclaration.parallel_spec.resolved_tp_plan(sequence_parallel=True)
         assert "model.norm" in plan
         assert "model.layers.*.input_layernorm" in plan
 
@@ -470,8 +432,17 @@ class TestGetDecilmNemotronTpPlan:
 # ---------------------------------------------------------------------------
 
 
+def _bridged_decilm() -> object:
+    """A trust_remote_code Nemotron-NAS stand-in after the HF bridge bound its ParallelSpec."""
+    model_cls = type("DeciLMForCausalLM", (), {"config_class": SimpleNamespace(model_type="nemotron-nas")})
+    model = model_cls()
+    model.__class__ = _get_mixin_wrapped_class(model_cls)
+    model.config = SimpleNamespace(architectures=["DeciLMForCausalLM"], model_type="nemotron-nas")
+    return model
+
+
 def test_named_plan_resolves_to_llama_for_generic_model():
-    """Named plan on a model without DeciLM config → fused Llama plan."""
+    """The legacy alias defers to the model; a spec-less model gets the fused-projection base plan."""
     model = _DummyModel()
     result = _get_parallel_plan(
         model,
@@ -482,12 +453,8 @@ def test_named_plan_resolves_to_llama_for_generic_model():
 
 
 def test_named_plan_resolves_to_decilm_for_nemotron_nas():
-    """Named plan on DeciLM/nemotron-nas model → separate-projection plan."""
-    model = _DummyModel()
-    model.config = SimpleNamespace(
-        architectures=["DeciLMForCausalLM"],
-        model_type="nemotron-nas",
-    )
+    """Legacy alias on a DeciLM/nemotron-nas model → its own separate-projection plan."""
+    model = _bridged_decilm()
     result = _get_parallel_plan(
         model,
         sequence_parallel=False,
@@ -512,12 +479,8 @@ def test_named_plan_llama_with_sequence_parallel():
 
 
 def test_named_plan_decilm_with_sequence_parallel():
-    """Named plan + SP on DeciLM model includes norm entries."""
-    model = _DummyModel()
-    model.config = SimpleNamespace(
-        architectures=["DeciLMForCausalLM"],
-        model_type="nemotron-nas",
-    )
+    """Legacy alias + SP on a DeciLM model includes norm entries."""
+    model = _bridged_decilm()
     result = _get_parallel_plan(
         model,
         sequence_parallel=True,
@@ -528,10 +491,7 @@ def test_named_plan_decilm_with_sequence_parallel():
 
 
 def test_decilm_remote_code_class_auto_selects_nemotron_plan():
-    class DeciLMForCausalLM:
-        config = SimpleNamespace(model_type="nemotron-nas")
-
-    result = _get_parallel_plan(DeciLMForCausalLM(), sequence_parallel=False, tp_size=2)
+    result = _get_parallel_plan(_bridged_decilm(), sequence_parallel=False, tp_size=2)
     assert "model.layers.*.self_attn.q_proj" in result
     assert "model.layers.*.self_attn.k_proj" in result
     assert "model.layers.*.self_attn.v_proj" in result

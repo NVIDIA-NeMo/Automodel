@@ -17,18 +17,79 @@ Currently includes:
     • build_gpt2_model – returns a GPT-2 causal language model (Flash-Attention-2 by default).
 """
 
+from __future__ import annotations
+
+import importlib
 import importlib.abc
 import pathlib
+import re
 import sys
 
 from .gpt2 import build_gpt2_model  # noqa: F401
 
 __all__ = [
+    "MODEL_SPEC_ATTRIBUTES",
     "build_gpt2_model",
+    "declared_model_specs",
+    "model_family",
 ]
 
 _MODELS_DIR = pathlib.Path(__file__).parent
 _PACKAGE_PREFIX = __name__ + "."
+
+
+_CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+
+# Class attributes through which a model class -- or the declaration standing in for an upstream
+# class -- publishes its model-owned contracts to ``components.distributed``.
+MODEL_SPEC_ATTRIBUTES = ("parallel_spec", "activation_checkpointing_spec")
+
+
+def model_family(model_class: type) -> str | None:
+    """Model package under ``components/models`` that may declare contracts for an upstream class.
+
+    transformers classes (stock or ``trust_remote_code``) map through the transformers module name
+    of their config's ``model_type``: ``gemma3`` for both ``gemma3`` and ``gemma3_text``,
+    ``nemotron_nas`` for a ``nemotron-nas`` checkpoint. diffusers models carry no ``model_type``;
+    their class name is the identifier and the package is its snake_case stem before
+    ``Transformer``: ``WanTransformer3DModel`` -> ``wan``, ``QwenImageTransformer2DModel`` ->
+    ``qwen_image``.
+
+    Returns:
+        The package name, or ``None`` for a class that belongs to neither library.
+    """
+    model_type = getattr(getattr(model_class, "config_class", None), "model_type", None)
+    if model_type:
+        from transformers.models.auto.configuration_auto import model_type_to_module_name
+
+        return model_type_to_module_name(model_type)
+    if getattr(model_class, "config_name", None):  # diffusers ``ModelMixin`` marker
+        return _CAMEL_BOUNDARY.sub("_", model_class.__name__.split("Transformer", 1)[0]).lower()
+    return None
+
+
+def declared_model_specs(model_class: type) -> dict[str, object]:
+    """Return the specs a model package declares for an upstream class it does not re-implement.
+
+    Architectures the repository only wraps -- stock ``transformers`` classes, ``trust_remote_code``
+    checkpoints, ``diffusers`` transformers -- keep their contracts in
+    ``components/models/<family>/parallelization.py`` (``<family>`` per :func:`model_family`) on a
+    class named after the upstream architecture::
+
+        class Gemma3ForConditionalGeneration:
+            parallel_spec = ParallelSpec(tp_plan=GEMMA3_TP_PLAN, ...)
+
+    Returns:
+        ``{attribute: spec}`` for each of :data:`MODEL_SPEC_ATTRIBUTES` the declaration sets; empty
+        when the package or the declaration does not exist.
+    """
+    family = model_family(model_class)
+    if not family or not family.isidentifier() or not (_MODELS_DIR / family / "parallelization.py").is_file():
+        return {}
+    declaration = getattr(
+        importlib.import_module(f"{_PACKAGE_PREFIX}{family}.parallelization"), model_class.__name__, None
+    )
+    return {attr: spec for attr in MODEL_SPEC_ATTRIBUTES if (spec := getattr(declaration, attr, None)) is not None}
 
 
 def _available_model_submodules() -> set[str]:

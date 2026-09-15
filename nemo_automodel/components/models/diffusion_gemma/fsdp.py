@@ -50,6 +50,8 @@ from __future__ import annotations
 from torch import nn
 from torch.distributed.fsdp import fully_shard
 
+from nemo_automodel.components.distributed.parallelizer import DefaultParallelizationStrategy
+
 
 def _has_fsdp_state(module: nn.Module) -> bool:
     """Return True if ``module`` has already been wrapped by ``fully_shard``."""
@@ -114,34 +116,18 @@ def fully_shard_diffusion_gemma(module: nn.Module, mesh, mp_policy, offload_poli
     )
 
 
-def register_diffusion_gemma_parallel_strategy() -> None:
-    """Register the ``diffusion_gemma`` FSDP2 strategy (idempotent).
+class DiffusionGemmaParallelizationStrategy(DefaultParallelizationStrategy):
+    """Pure-FSDP2 strategy that shards grouped experts as their own units.
 
-    Binds :func:`fully_shard_diffusion_gemma` as the per-module shard function
-    of a :class:`DefaultParallelizationStrategy` subclass, keyed on the model
-    class name so ``get_parallelization_strategy`` selects it at ``ep_size=1``.
-    Invoked at import of ``model.py`` (a torch-enabled context), which always
-    runs before the model is parallelized.
+    Binds :func:`fully_shard_diffusion_gemma` as the per-module shard function so the
+    generic flow selects it at ``ep_size=1``.
     """
-    from nemo_automodel.components.distributed.parallelizer import (
-        PARALLELIZATION_STRATEGIES,
-        DefaultParallelizationStrategy,
-        register_parallel_strategy,
-    )
 
-    name = "DiffusionGemmaForBlockDiffusion"
-    if name in PARALLELIZATION_STRATEGIES:
-        return
-
-    @register_parallel_strategy(name=name)
-    class DiffusionGemmaParallelizationStrategy(DefaultParallelizationStrategy):
-        """Pure-FSDP2 strategy that shards grouped experts as their own units."""
-
-        def parallelize(self, model, device_mesh, dp_shard_cp_mesh_name="dp_shard_cp", **kwargs):
-            return super().parallelize(
-                model,
-                device_mesh,
-                dp_shard_cp_mesh_name=dp_shard_cp_mesh_name,
-                fully_shard_fn=fully_shard_diffusion_gemma,
-                **kwargs,
-            )
+    def parallelize(self, model, device_mesh, dp_shard_cp_mesh_name="dp_shard_cp", **kwargs):
+        return super().parallelize(
+            model,
+            device_mesh,
+            dp_shard_cp_mesh_name=dp_shard_cp_mesh_name,
+            fully_shard_fn=fully_shard_diffusion_gemma,
+            **kwargs,
+        )

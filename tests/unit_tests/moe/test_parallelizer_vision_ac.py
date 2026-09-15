@@ -21,6 +21,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
 
+from nemo_automodel.components.distributed.parallel_spec import ParallelSpec
 from nemo_automodel.components.moe import parallelizer as moe_parallelizer
 
 _DIM = 8
@@ -90,7 +91,12 @@ class _InnerModel(nn.Module):
 
 
 class Qwen3VLMoeForConditionalGeneration(nn.Module):
-    """Tiny stand-in named after the real EP-MoE VLM so the layer-group mapping applies."""
+    """Tiny stand-in for the EP-MoE VLM, declaring the same layer groups as the native class."""
+
+    # Declared like the native class: the parallelizer reads layer groups off the spec, not the name.
+    parallel_spec = ParallelSpec(
+        layer_groups={"language": ("model.language_model.layers",), "vision": ("model.visual.blocks",)}
+    )
 
     def __init__(self):
         super().__init__()

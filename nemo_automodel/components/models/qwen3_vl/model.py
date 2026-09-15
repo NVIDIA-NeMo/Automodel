@@ -36,12 +36,13 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
 )
 from nemo_automodel.components.distributed.context_parallel.utils import cp_dispatcher_suspended
 from nemo_automodel.components.distributed.cp_vision_frame_shard import maybe_distribute_visual
+from nemo_automodel.components.distributed.parallel_spec import ParallelSpec
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
-from nemo_automodel.components.models.qwen3_vl.parallelization import register_qwen3_vl_parallel_strategy
+from nemo_automodel.components.models.qwen3_vl.parallelization import Qwen3VLParallelizationStrategy
 
 
 class Qwen3VLForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLForConditionalGeneration):
@@ -49,6 +50,7 @@ class Qwen3VLForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLForConditio
 
     tie_word_embeddings_support: TieSupport = TieSupport.BOTH
     _tied_weights_keys = {"lm_head.weight": "model.language_model.embed_tokens.weight"}
+    parallel_spec: ParallelSpec = ParallelSpec(strategy=Qwen3VLParallelizationStrategy())
 
     @dataclass(frozen=True)
     class ModelCapabilities:
@@ -421,5 +423,4 @@ class Qwen3VLForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLForConditio
         )
 
 
-register_qwen3_vl_parallel_strategy()
 ModelClass = Qwen3VLForConditionalGeneration

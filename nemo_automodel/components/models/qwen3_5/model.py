@@ -48,6 +48,7 @@ from nemo_automodel.components.distributed.cp_vision_frame_shard import (
     cp_vision_frame_sharding_active,
     maybe_distribute_visual,
 )
+from nemo_automodel.components.distributed.parallel_spec import ParallelSpec
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.mtp import MTPConfig, MTPModule, roll_tensor
@@ -60,6 +61,10 @@ from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.qwen3_5.packing import (
     GatedDeltaPackedMetadata,
     prepare_gated_delta_packed_metadata,
+)
+from nemo_automodel.components.models.qwen3_5.parallelization import (
+    QWEN3_5_CAUSAL_LM_PARALLEL_SPEC,
+    QWEN3_5_VLM_PARALLEL_SPEC,
 )
 from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import CPAwareGatedDeltaNet
 from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextRMSNorm
@@ -658,6 +663,7 @@ class Qwen3_5ForCausalLM(HFCheckpointingMixin, nn.Module):
 
     tie_word_embeddings_support: TieSupport = TieSupport.BOTH
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
+    parallel_spec: ParallelSpec = QWEN3_5_CAUSAL_LM_PARALLEL_SPEC
 
     @dataclass(frozen=True)
     class ModelCapabilities:
@@ -871,6 +877,7 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
 
     tie_word_embeddings_support: TieSupport = TieSupport.BOTH
     _tied_weights_keys = {"lm_head.weight": "model.language_model.embed_tokens.weight"}
+    parallel_spec: ParallelSpec = QWEN3_5_VLM_PARALLEL_SPEC
 
     @dataclass(frozen=True)
     class ModelCapabilities:

@@ -44,19 +44,28 @@ rather than assuming (see below).
 
 Pick whichever fits the use:
 
-**Registry keys** -- use the literal qualname string, not the class object:
+**Per-model contracts** -- declare them on the model class, not in this directory:
 
 ```python
-# Good
-"transformers.models.gemma3.modeling_gemma3.Gemma3ForCausalLM": _parallelize_gemma3,
-
-# Bad -- forces the import
-_get_class_qualname(Gemma3ForCausalLM): _parallelize_gemma3,
+# components/models/<name>/model.py
+class NewModelForCausalLM(HFCheckpointingMixin, nn.Module):
+    parallel_spec: ParallelSpec = ParallelSpec(tp_plan=_new_model_tp_plan)
 ```
 
-Generate the literal by running `_get_class_qualname` on the real class rather
-than writing it by hand; aliased imports resolve to their true module path (e.g.
-`CustomLlamaForCausalLM` -> `nemo_automodel.components.models.llama.model.LlamaForCausalLM`).
+`ParallelSpec` (`parallel_spec.py`) is pure data: the TP plan and its sequence-parallel
+overlay as dictionaries, layer groups, the `sharded_output_only` constraint and the strategy
+override (the one place for instance-dependent behaviour). It never points at a model attribute;
+what must come from the instance (HF `_tp_plan`, input embedding, text config) is read through
+the model's own API, and `ParallelSpec.from_hf_model` is the constructor for that case; `parallelizer.py` only
+ever reads the `parallel_spec` class attribute (`query_parallel_spec`); activation checkpointing
+has its own `ActivationCheckpointingSpec` (`activation_checkpointing.py`, read from the separate
+`activation_checkpointing_spec` attribute by `query_activation_checkpointing_spec`). Architectures
+the repository does not re-implement -- stock `transformers` classes, `trust_remote_code`
+checkpoints, `diffusers` transformers -- get a `components/models/<family>/parallelization.py`
+of their own that declares the spec on a class named after the upstream architecture; the
+loader resolver (`_transformers/model_init.py::model_specs_for`, shared by the diffusion
+pipeline) derives `<family>` from the class and binds every declared spec onto the wrapper. No table of model
+names exists anywhere, and nothing in this directory names a model.
 
 **Type annotations** -- put the import under `if TYPE_CHECKING:`. That needs
 `from __future__ import annotations` at the top of the file so annotations are
@@ -65,6 +74,13 @@ file you are editing does not.
 
 **Runtime use** (`isinstance`, attribute access) -- import inside the function.
 After the first call it is a `sys.modules` lookup.
+
+**Keep the compiler out of the import path too.** `torch._dynamo` (+ triton, +0.5 s) enters
+through `torch.distributed.pipelining` and `torch._functorch.partitioners`; both are deferred
+on purpose -- `pipelining/__init__.py` resolves `AutoPipeline` lazily, and
+`activation_checkpointing.py` builds the selective-AC save-set on first use. Do not add a
+module-scope import of either, or a module-scope call that reaches them.
+`tests/unit_tests/test_import_hygiene.py` fails if they load.
 
 ### Verifying a change
 
@@ -76,6 +92,6 @@ python -X importtime -c "import nemo_automodel.components.distributed.paralleliz
 python -c "import nemo_automodel.components.distributed.parallelizer"
 ```
 
-If you touch `PARALLELIZE_FUNCTIONS` or `_get_model_layer_group_specs`, prove
-equivalence by serializing both before and after your change and diffing them --
-they must be byte-identical.
+If you touch a `parallel_spec` (or the bridge tables), prove equivalence by serializing
+the resolved spec fields for every affected class before and after your change and
+diffing them -- they must be identical.

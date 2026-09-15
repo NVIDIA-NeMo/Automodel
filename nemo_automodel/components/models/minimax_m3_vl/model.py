@@ -33,6 +33,7 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
     shard_batch_aux_only,
     shard_sequence_for_cp_round_robin,
 )
+from nemo_automodel.components.distributed.parallel_spec import ParallelSpec
 from nemo_automodel.components.models.common import (
     BackendConfig,
     get_rope_config,
@@ -431,6 +432,12 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
     """
 
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+    parallel_spec: ParallelSpec = ParallelSpec(
+        layer_groups={
+            "language": ("model.layers",),
+            "vision": ("vision_tower.vision_model.encoder.layers",),
+        }
+    )
 
     # Pipeline-parallel routing: keep this VLM's own forward (which splices vision
     # features) instead of letting patch_hf_model_for_pp swap in the generic

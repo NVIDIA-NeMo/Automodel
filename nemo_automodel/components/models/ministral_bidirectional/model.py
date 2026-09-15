@@ -21,6 +21,8 @@ from transformers.models.ministral3.configuration_ministral3 import Ministral3Co
 from transformers.models.ministral3.modeling_ministral3 import Ministral3Model
 from transformers.utils import logging
 
+from nemo_automodel.components.distributed.parallel_spec import ParallelSpec
+
 logger = logging.get_logger(__name__)
 
 
@@ -61,6 +63,7 @@ class Ministral3BidirectionalModel(Ministral3Model):
     """
 
     config_class = Ministral3BidirectionalConfig
+    parallel_spec: ParallelSpec = ParallelSpec(layer_groups={"language": ("layers",)})
 
     @dataclass(frozen=True)
     class ModelCapabilities:

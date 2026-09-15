@@ -105,7 +105,7 @@ Below are examples for each pattern.
 
 ### NanoGPT Source and File-Path `_target_`
 
-Below is the minimal GPT‑2 [implementation](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/models/gpt2.py) used for this NanoGPT‑style pretraining flow.
+Below is the minimal GPT‑2 [implementation](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/models/gpt2/nanogpt.py) used for this NanoGPT‑style pretraining flow.
 It is a pure‑PyTorch model with tied embeddings and standard transformer blocks:
 
 ```
@@ -308,7 +308,7 @@ To use this exact implementation directly from a file path, point `_target_` to 
 
 ```yaml
 model:
-  _target_: /abs/path/to/repo/nemo_automodel/components/models/gpt2.py:build_gpt2_model
+  _target_: /abs/path/to/repo/nemo_automodel/components/models/gpt2/nanogpt.py:build_gpt2_model
   vocab_size: 50258
   n_positions: 2048
   n_embd: 768

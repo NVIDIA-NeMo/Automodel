@@ -560,7 +560,6 @@ def test_apply_parallelization_creates_managers_and_replaces_modules():
     with (
         patch(f"{MODULE_PATH}.torch.distributed.is_initialized", return_value=True),
         patch(f"{MODULE_PATH}._create_parallel_manager", return_value=mock_manager) as mock_create,
-        patch(f"{MODULE_PATH}._init_parallelizer"),
     ):
         managers = _apply_parallelization(pipe, {"unet": {"_manager_type": "fsdp2"}})
 
@@ -584,7 +583,6 @@ def test_apply_parallelization_skips_components_not_in_scheme():
     with (
         patch(f"{MODULE_PATH}.torch.distributed.is_initialized", return_value=True),
         patch(f"{MODULE_PATH}._create_parallel_manager", return_value=mock_manager),
-        patch(f"{MODULE_PATH}._init_parallelizer"),
     ):
         managers = _apply_parallelization(pipe, {"unet": {"_manager_type": "fsdp2"}})
 
@@ -609,7 +607,6 @@ def test_apply_parallelization_stamps_pre_shard_keys_on_parallelized_module():
     with (
         patch(f"{MODULE_PATH}.torch.distributed.is_initialized", return_value=True),
         patch(f"{MODULE_PATH}._create_parallel_manager", return_value=mock_manager),
-        patch(f"{MODULE_PATH}._init_parallelizer"),
     ):
         _apply_parallelization(pipe, {"unet": {"_manager_type": "fsdp2"}})
 
@@ -637,7 +634,6 @@ def test_apply_parallelization_stamps_pre_shard_keys_on_inner_module_for_ddp():
     with (
         patch(f"{MODULE_PATH}.torch.distributed.is_initialized", return_value=True),
         patch(f"{MODULE_PATH}._create_parallel_manager", return_value=mock_manager),
-        patch(f"{MODULE_PATH}._init_parallelizer"),
     ):
         _apply_parallelization(pipe, {"unet": {"_manager_type": "ddp"}})
 
@@ -725,7 +721,6 @@ def test_from_pretrained_parallel_scheme_applies_managers_and_sets_attrs():
         patch(f"{MODULE_PATH}.DiffusionPipeline", mock_diffusion_pipeline),
         patch(f"{MODULE_PATH}.torch.distributed.is_initialized", return_value=True),
         patch(f"{MODULE_PATH}._create_parallel_manager", side_effect=manager_sequence),
-        patch(f"{MODULE_PATH}._init_parallelizer"),
     ):
         # parallel_scheme values are now dicts (manager kwargs), not manager objects
         pipe, managers = NeMoAutoDiffusionPipeline.from_pretrained(
@@ -762,7 +757,6 @@ def test_from_pretrained_parallel_scheme_propagates_errors():
         patch(f"{MODULE_PATH}.DiffusionPipeline", mock_diffusion_pipeline),
         patch(f"{MODULE_PATH}.torch.distributed.is_initialized", return_value=True),
         patch(f"{MODULE_PATH}._create_parallel_manager", return_value=mgr),
-        patch(f"{MODULE_PATH}._init_parallelizer"),
     ):
         with pytest.raises(RuntimeError, match="boom"):
             NeMoAutoDiffusionPipeline.from_pretrained(
@@ -1267,7 +1261,6 @@ def test_apply_parallelization_enables_cp_before_parallelize(monkeypatch):
     manager = Mock()
     manager.parallelize = Mock(side_effect=lambda m: call_order.append("parallelize") or m)
     monkeypatch.setattr(adp, "_create_parallel_manager", Mock(return_value=manager))
-    monkeypatch.setattr(adp, "_init_parallelizer", Mock())
     monkeypatch.setattr(
         adp, "_enable_context_parallel", Mock(side_effect=lambda *a, **k: call_order.append("enable_cp"))
     )
@@ -1287,7 +1280,6 @@ def test_apply_parallelization_skips_cp_when_disabled(monkeypatch):
     manager = Mock()
     manager.parallelize = Mock(side_effect=lambda m: m)
     monkeypatch.setattr(adp, "_create_parallel_manager", Mock(return_value=manager))
-    monkeypatch.setattr(adp, "_init_parallelizer", Mock())
     enable_cp = Mock()
     monkeypatch.setattr(adp, "_enable_context_parallel", enable_cp)
     monkeypatch.setattr(adp.torch.distributed, "is_initialized", Mock(return_value=True))

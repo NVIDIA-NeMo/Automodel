@@ -37,6 +37,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention.flex_attention import create_block_mask
 
+from nemo_automodel.components.distributed.activation_checkpointing import ActivationCheckpointingSpec
+from nemo_automodel.components.distributed.parallel_spec import ParallelSpec
 from nemo_automodel.components.models.bagel.attention_masks import create_sparse_mask
 from nemo_automodel.components.models.bagel.configuration import (
     BagelBackendConfig,
@@ -226,6 +228,17 @@ class BagelForUnifiedMultimodal(HFCheckpointingMixin, nn.Module):
     # text_config (aliased as llm_config), and the inner Qwen2 LM owns the head.
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
     backend_config_resolver = staticmethod(resolve_bagel_backend)
+    # Both the Qwen2 decoder and the SigLIP encoder become their own FSDP units (matching
+    # upstream BAGEL's auto-wrap policy); without the SigLIP entry, Stage 2 OOMs on 8x80GB
+    # because the SigLIP layers sit in the root FSDP unit's all-gather peak.
+    parallel_spec: ParallelSpec = ParallelSpec(
+        layer_groups={
+            "language": ("model.language_model.model.layers",),
+            "vision": ("model.vit_model.vision_model.encoder.layers",),
+        },
+    )
+    # Whole Qwen2 decoder / SigLIP encoder layers are checkpointed as units, as upstream BAGEL does.
+    activation_checkpointing_spec: ActivationCheckpointingSpec = ActivationCheckpointingSpec(granularity="layer")
 
     @dataclass(frozen=True)
     class ModelCapabilities:

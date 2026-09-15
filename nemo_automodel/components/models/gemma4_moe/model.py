@@ -85,6 +85,7 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
     contiguous_local_indices,
     shard_sequence_for_cp_contiguous,
 )
+from nemo_automodel.components.distributed.parallel_spec import ParallelSpec
 from nemo_automodel.components.models.common import BackendConfig, compute_lm_head_logits
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import (
@@ -99,7 +100,7 @@ from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 from .cp_attention import attach_gemma4_cp_ring_attention, gemma4_vision_group_ids
 from .cp_batch import make_contiguous_aux_only_shard_cp_batch_and_ctx
-from .parallelization import register_gemma4_parallel_strategy
+from .parallelization import GEMMA4_PARALLEL_SPEC
 from .sdpa_fp32 import enable_gemma4_sdpa_fp32
 
 
@@ -895,6 +896,7 @@ class Gemma4MoEModel(HFGemma4Model):
 class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditionalGeneration, MoEFSDPSyncMixin):
     tie_word_embeddings_support: TieSupport = TieSupport.TIED_ONLY
     supports_gradient_checkpointing = True
+    parallel_spec: ParallelSpec = GEMMA4_PARALLEL_SPEC
     # Gemma4 owns CP batch sharding and its decoder-layer p2p attention ring.
     _owns_cp_attention = True
     # Whole-block activation checkpointing replays each decoder layer during backward.
@@ -1690,5 +1692,4 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
 
 
 if _GEMMA4_HF_AVAILABLE:
-    register_gemma4_parallel_strategy()
     ModelClass = Gemma4ForConditionalGeneration

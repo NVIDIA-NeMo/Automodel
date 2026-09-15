@@ -14,7 +14,7 @@
 
 """Unit tests for ``diffusion_gemma`` pure-FSDP2 (ep_size=1) sharding.
 
-These cover the registration of ``DiffusionGemmaParallelizationStrategy`` and
+These cover the model-declared ``DiffusionGemmaParallelizationStrategy`` and
 the per-module wrapping order of ``fully_shard_diffusion_gemma`` (grouped
 experts wrapped as their own FSDP unit before the rest of the layer). They use a
 monkeypatched ``fully_shard`` so no process group / GPU is required.
@@ -22,33 +22,15 @@ monkeypatched ``fully_shard`` so no process group / GPU is required.
 
 import torch.nn as nn
 
-from nemo_automodel.components.distributed import parallelizer as p
-from nemo_automodel.components.distributed.parallelizer import (
-    DefaultParallelizationStrategy,
-    ParallelizationStrategy,
-    get_parallelization_strategy,
-)
+from nemo_automodel.components.distributed.parallelizer import DefaultParallelizationStrategy
 from nemo_automodel.components.models.diffusion_gemma import fsdp as dg4_fsdp
+from nemo_automodel.components.models.diffusion_gemma.model import DiffusionGemmaForBlockDiffusion
 
 
-def test_register_strategy_is_idempotent_and_keyed_on_model_name():
-    original_registry = dict(p.PARALLELIZATION_STRATEGIES)
-    try:
-        dg4_fsdp.register_diffusion_gemma_parallel_strategy()
-        dg4_fsdp.register_diffusion_gemma_parallel_strategy()  # second call is a no-op
-
-        name = "DiffusionGemmaForBlockDiffusion"
-        assert name in p.PARALLELIZATION_STRATEGIES
-        strategy = p.PARALLELIZATION_STRATEGIES[name]
-        assert isinstance(strategy, ParallelizationStrategy)
-        assert isinstance(strategy, DefaultParallelizationStrategy)
-
-        # A model whose class name matches resolves to the registered strategy.
-        DiffusionGemmaForBlockDiffusion = type("DiffusionGemmaForBlockDiffusion", (nn.Module,), {})
-        assert get_parallelization_strategy(DiffusionGemmaForBlockDiffusion()) is strategy
-    finally:
-        p.PARALLELIZATION_STRATEGIES.clear()
-        p.PARALLELIZATION_STRATEGIES.update(original_registry)
+def test_model_declares_expert_aware_fsdp_strategy():
+    strategy = DiffusionGemmaForBlockDiffusion.parallel_spec.strategy
+    assert isinstance(strategy, dg4_fsdp.DiffusionGemmaParallelizationStrategy)
+    assert isinstance(strategy, DefaultParallelizationStrategy)
 
 
 def test_fully_shard_wraps_experts_before_the_layer(monkeypatch):

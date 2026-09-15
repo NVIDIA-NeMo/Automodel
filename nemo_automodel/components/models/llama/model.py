@@ -50,6 +50,7 @@ from nemo_automodel.components.attention.utils import (
     postprocess_output_for_attn,
     preprocess_args_and_kwargs_for_attn,
 )
+from nemo_automodel.components.distributed.parallel_spec import ParallelSpec
 from nemo_automodel.components.models.common import (
     BackendConfig,
     compute_lm_head_logits,
@@ -61,6 +62,7 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     reject_unsupported_tie_word_embeddings,
 )
 from nemo_automodel.components.models.deprecation import warn_deprecated_model_class
+from nemo_automodel.components.models.llama.parallelization import LLAMA_PARALLEL_SPEC
 from nemo_automodel.components.models.llama.rope_utils import (
     LlamaRotaryEmbedding,
     apply_rotary_pos_emb,
@@ -538,6 +540,7 @@ class LlamaForCausalLM(HFCheckpointingMixin, LlamaPreTrainedModel):
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
+    parallel_spec: ParallelSpec = LLAMA_PARALLEL_SPEC
 
     @dataclass(frozen=True)
     class ModelCapabilities:

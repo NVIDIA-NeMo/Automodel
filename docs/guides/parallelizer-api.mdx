@@ -1,0 +1,287 @@
+---
+title: "Parallelizer API (Model-Owned Parallel Specs)"
+description: "Declare how a model is tensor-parallelized, FSDP2-sharded, validated, and activation-checkpointed with ParallelSpec. The parallelizer itself never names a model."
+---
+
+`nemo_automodel.components.distributed.parallelizer` is infrastructure. It applies tensor
+parallelism, FSDP2 sharding, and activation checkpointing to any `nn.Module`, and the only
+architecture-specific input it reads is one object on the model **class**:
+
+```python
+from nemo_automodel.components.distributed.parallelizer import query_parallel_spec
+
+spec = query_parallel_spec(model)   # == type(model).parallel_spec, or the all-default spec
+```
+
+Who provides that object depends on who owns the class:
+
+| Class | Where its `ParallelSpec` comes from |
+|---|---|
+| A model NeMo AutoModel implements (`components/models/<name>/`) | The class declares `parallel_spec` itself. |
+| A stock `transformers` class or a `trust_remote_code` checkpoint | Its own `components/models/<family>/parallelization.py` declares it on a class named after the architecture; the loader binds it onto the wrapper class it creates. |
+| A `diffusers` transformer | The same layout and the same resolver; the diffusion pipeline binds it (`bind_model_specs`) before the component is sharded. |
+| Anything else | The all-default spec: llama-style layout (`model.layers`, `config.num_attention_heads`, HF `_tp_plan` rooted at `model`). |
+
+## When You Need a Spec
+
+A dense causal LM whose blocks live in `model.layers`, whose head counts are on
+`model.config`, and whose HuggingFace `_tp_plan` (or the base llama-style plan) shards it
+correctly needs **no** spec. Declare one when any of the following is true:
+
+| Symptom | Field to set |
+|---|---|
+| The optimized TP plan differs from HF's `_tp_plan` / the base plan (fused QKV, extra projections, replicated mixers, MLP-only sharding). | `tp_plan`, plus `sequence_parallel_plan` when the architecture has a sequence-parallel variant |
+| Transformer blocks are not at `model.layers`, or there are several groups (language + vision towers). | `layer_groups` |
+| A head's plan entry is only valid with a sharded output (e.g. weight-normalized logits). | `sharded_output_only` |
+| Whole logical layers must be checkpointed instead of the generic submodule wrappers. | Not a `ParallelSpec` field: declare an `activation_checkpointing_spec` (see below). |
+| The FSDP2 flow itself must change, or TP validity depends on the instance (per-layer block configs, per-variant plans). | `strategy` |
+
+## `ParallelSpec`
+
+`ParallelSpec` is a frozen dataclass in `nemo_automodel.components.distributed.parallel_spec`.
+Every field defaults to the generic behaviour, so a spec only states what differs — and every field
+is **data** (dictionaries of `ParallelStyle`, module names, paths). A spec never carries a function:
+behaviour that depends on the model instance belongs in a `ParallelizationStrategy`.
+
+| Field | Type | Default | Consumed by |
+|---|---|---|---|
+| `tp_plan` | `dict[str, ParallelStyle]` | `None` → HF `_tp_plan`, then the base plan | `_get_parallel_plan` |
+| `sequence_parallel_plan` | `dict[str, ParallelStyle]` overlaid on `tp_plan` when SP is requested | `None` → SP request is ignored with a warning | `_get_parallel_plan` via `spec.resolved_tp_plan(sequence_parallel)` |
+| `layer_groups` | `dict[str, tuple[str, ...]]` — role → candidate module FQNs | `None` → `model.layers` / largest `ModuleList` | FSDP2 per-layer wrapping, activation checkpointing scopes |
+| `sharded_output_only` | module FQNs | `()` | `_get_parallel_plan`, after the plan is chosen from any source: an entry for one of these modules is dropped unless its output is sharded |
+| `strategy` | `ParallelizationStrategy` instance | `None` → `DefaultParallelizationStrategy` | `fsdp2_strategy_parallelize` |
+
+`layer_groups` candidate tuples are tried in order and the first
+FQN that resolves wins, so one spec covers several `transformers` module-tree layouts without
+version gating. Put the canonical path first: standardized 4.x releases keep deprecated alias
+properties (`language_model`, `visual`) that also resolve.
+
+`spec.resolved_tp_plan(sequence_parallel)` is the plan the parallelizer applies: `tp_plan` with
+`sequence_parallel_plan` overlaid, with every style shallow-copied so the shared declaration is
+never mutated (LoRA translation rewrites a style's class in place). Plans are `parallelize_module`
+inputs: module FQNs with `*` wildcards; keys that match nothing (e.g. the fused `qkv_proj` of a
+native model on a separate-projection checkpoint) are simply unused.
+
+<Note>
+The attribute is inherited by every subclass, including the wrapper classes NeMo AutoModel
+swaps in at load time (`HFCheckpointingMixin`, capability injection), so a declaration on the
+model class is always the one the parallelizer sees. Class names are irrelevant to the
+parallelizer; only the attribute counts.
+</Note>
+
+## Declare a Spec on a Model You Own
+
+Keep the plan next to the model and reference it from the class body. The shared TP styles
+(`VocabParallelEmbedding`, `SequenceParallelAllGatherActivation`, `RotaryEmbedParallel`) come
+from `nemo_automodel.components.distributed.optimized_tp_plans`.
+
+```python
+# components/models/llama/parallelization.py
+from torch.distributed.tensor.parallel import ColwiseParallel, ParallelStyle, RowwiseParallel, SequenceParallel
+from torch.distributed.tensor.placement_types import Replicate, Shard
+
+from nemo_automodel.components.distributed.optimized_tp_plans import VocabParallelEmbedding
+from nemo_automodel.components.distributed.parallel_spec import ParallelSpec
+
+# Abridged: the shipped plan also covers the fused qkv_proj / gate_up_proj variants.
+LLAMA_TP_PLAN: dict[str, ParallelStyle] = {
+    "model.embed_tokens": RowwiseParallel(input_layouts=Replicate()),
+    "model.layers.*.self_attn.q_proj": ColwiseParallel(),
+    "model.layers.*.self_attn.k_proj": ColwiseParallel(),
+    "model.layers.*.self_attn.v_proj": ColwiseParallel(),
+    "model.layers.*.self_attn.o_proj": RowwiseParallel(),
+    "model.layers.*.mlp.gate_proj": ColwiseParallel(),
+    "model.layers.*.mlp.up_proj": ColwiseParallel(),
+    "model.layers.*.mlp.down_proj": RowwiseParallel(),
+    "lm_head": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
+}
+
+# Overlaid on LLAMA_TP_PLAN when sequence parallelism is requested.
+LLAMA_SEQUENCE_PARALLEL_PLAN: dict[str, ParallelStyle] = {
+    "model.norm": SequenceParallel(),
+    "model.layers.*.self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1), use_local_output=False),
+    ...
+}
+
+LLAMA_PARALLEL_SPEC = ParallelSpec(tp_plan=LLAMA_TP_PLAN, sequence_parallel_plan=LLAMA_SEQUENCE_PARALLEL_PLAN)
+```
+
+```python
+# components/models/llama/model.py
+class LlamaForCausalLM(HFCheckpointingMixin, nn.Module):
+    parallel_spec: ParallelSpec = LLAMA_PARALLEL_SPEC
+```
+
+`FSDP2Config.sequence_parallel` selects the overlay. An architecture whose plan *is* HF's own
+`_tp_plan` declares no `tp_plan` at all (Qwen3.5 does this: its GatedDeltaNet layers are not
+TP-shardable, so transformers' `base_model_tp_plan` is exactly right); the parallelizer then
+builds the spec from the model with `ParallelSpec.from_hf_model(model)`.
+
+Nothing in a spec points at a model attribute. What the parallelizer needs from the instance it
+asks the model for through APIs every `transformers` model has: the fully-qualified `_tp_plan`
+that `DistributedMixin.init_parallel_plans` assembles (class plan, the config's
+`base_model_tp_plan`, every child's plan under its attribute name), `get_input_embeddings()` for
+the embedding to row-shard, and `config.get_text_config()` for the head counts the TP validation
+checks. When a spec genuinely has to be *constructed* from such inputs, that is a classmethod —
+`from_hf_model` is the one such constructor today.
+
+A VLM usually needs the tree described as well:
+
+```python
+QWEN3_5_VLM_PARALLEL_SPEC = ParallelSpec(
+    layer_groups={"language": ("model.language_model.layers",), "vision": ("model.visual.blocks",)},
+    strategy=Qwen3_5ParallelizationStrategy(),
+)
+```
+
+### Override the Flow With a Strategy
+
+Set `strategy` when the generic FSDP2 flow itself is wrong for the architecture, or when a
+decision depends on the model *instance* rather than its class: per-layer head-count validation
+(Nemotron-NAS block configs), a plan that differs per checkpoint variant or carries per-instance
+state (Gemma 4). Subclass `DefaultParallelizationStrategy` and call `super().parallelize(...)`,
+typically to validate before sharding, to install a model-owned mesh afterwards, to pass a custom
+`fully_shard_fn`, or to hand a per-instance plan down as `tp_shard_plan`:
+
+```python
+from nemo_automodel.components.distributed.parallelizer import DefaultParallelizationStrategy
+
+
+class Qwen3VLParallelizationStrategy(DefaultParallelizationStrategy):
+    def parallelize(self, model, device_mesh, **kwargs):
+        result = super().parallelize(model, device_mesh, **kwargs)
+        cp_mesh = device_mesh["cp"] if "cp" in device_mesh.mesh_dim_names else None
+        model.cp_mesh = cp_mesh if cp_mesh is not None and cp_mesh.size() > 1 else None
+        return result
+```
+
+Prefer a data field when one fits: Nemotron-Flash needs no strategy because
+`sharded_output_only=("lm_head",)` states its constraint, and the parallelizer enforces it on
+whatever plan is finally chosen.
+
+## Activation Checkpointing Is a Separate Contract
+
+Activation checkpointing is a recompute policy, not parallelism, so it is not part of
+`ParallelSpec`. A model declares `activation_checkpointing_spec: ActivationCheckpointingSpec`
+(from `nemo_automodel.components.distributed.activation_checkpointing`), which the parallelizer
+reads through `query_activation_checkpointing_spec(model)` when it applies checkpointing. Its only
+field is `granularity`: `"submodule"` (default) wraps the attention / MLP children of every selected
+layer, `"layer"` wraps each selected layer as one unit (the selection — scope and frozen-layer
+filtering — is the same in both cases).
+
+```python
+# components/models/bagel/model.py
+class BagelForUnifiedMultimodal(HFCheckpointingMixin, nn.Module):
+    parallel_spec: ParallelSpec = ParallelSpec(layer_groups={...})
+    activation_checkpointing_spec: ActivationCheckpointingSpec = ActivationCheckpointingSpec(granularity="layer")
+```
+
+Architectures you do not re-implement declare it exactly like `parallel_spec`, on the class named
+after the upstream architecture in `components/models/<family>/parallelization.py`; the loaders bind
+every declared spec attribute onto the wrapper.
+
+<Warning>
+A model-specific plan, validator, or strategy belongs under `components/models/<name>/`.
+Do not add model names, tables, or `transformers.models.*` imports to `components/distributed/`;
+importing one modeling module there loads the whole model zoo into every process
+(see `components/distributed/AGENTS.md`).
+</Warning>
+
+## Architectures You Do Not Re-Implement
+
+Stock `transformers` classes, `trust_remote_code` checkpoints, and `diffusers` transformers
+cannot carry the attribute themselves, and nothing in `nemo_automodel` keeps a table of them.
+Such an architecture gets a model directory of its own that holds only the contract:
+
+```
+components/models/gemma3/
+├── __init__.py
+└── parallelization.py     # plan functions, validators, strategy, and the declaration below
+```
+
+```python
+# components/models/gemma3/parallelization.py
+class Gemma3ForConditionalGeneration:
+    """Contract for the transformers ``Gemma3ForConditionalGeneration``."""
+
+    parallel_spec: ParallelSpec = ParallelSpec(
+        tp_plan=GEMMA3_VLM_TP_PLAN,
+        sequence_parallel_plan=GEMMA3_VLM_SEQUENCE_PARALLEL_PLAN,
+        layer_groups=GEMMA3_LAYERS,
+    )
+```
+
+The class is a plain declaration named exactly like the upstream architecture; it is never
+instantiated. When the loader wraps an upstream class it derives the directory from the class
+and binds the declared spec onto the wrapper
+(`nemo_automodel._transformers.model_init.model_specs_for`; the diffusion pipeline binds the
+same result onto each component with `bind_model_specs` from the same module):
+
+| Upstream class | Directory | Derived from |
+|---|---|---|
+| `transformers` (stock or `trust_remote_code`) | `components/models/<family>/` | `config_class.model_type` through transformers' `model_type_to_module_name`: `gemma3` for both `gemma3` and `gemma3_text`, `nemotron_nas` for a `nemotron-nas` checkpoint. |
+| `diffusers` transformer (any class with diffusers' `config_name` marker) | `components/models/<stem>/` | snake_case of the class name before `Transformer`: `WanTransformer3DModel` → `wan`, `QwenImageTransformer2DModel` → `qwen_image`. |
+
+Resolution walks the class MRO, so an FP8 variant or a remote-code port of a transformers VLM
+inherits its base architecture's declaration. A class with no declaration falls back to the
+`parallel_spec` of the native NeMo AutoModel implementation registered under the same
+architecture name (a transformers `LlamaForCausalLM` inherits the native Llama contract), and
+otherwise to the all-default spec.
+
+To add one: create the directory, write `parallelization.py` with the plan, validator, or
+strategy the architecture needs plus the declaration class, and assert the resolution in a unit
+test (`parallel_spec_for(HFClass).tp_plan is my_tp_plan`). For an out-of-tree class you cannot
+ship a directory for, set the attribute on the class itself before building the model —
+`MyRemoteModel.parallel_spec = ParallelSpec(strategy=MyStrategy())` — and the wrapper inherits it.
+
+<Note>
+The name-keyed `register_parallel_strategy` decorator and the tables it wrote into are gone.
+Declare `parallel_spec` on the class (yours, or the upstream one) instead.
+</Note>
+
+## Override the Plan at Run Time
+
+`FSDP2Config.tp_plan` (`distributed.tp_plan` in YAML, forwarded to the strategy config) takes
+precedence over every declaration. It accepts a dictionary of `ParallelStyle` objects, or an
+import path to a dictionary or to a zero-argument function that returns one:
+
+```python
+config = FSDP2Config(tp_plan="my_package.plans.custom_llama_plan")
+```
+
+The resolution order inside `_get_parallel_plan` is:
+
+1. `tp_plan` passed explicitly (dict or import path);
+2. `spec.resolved_tp_plan(sequence_parallel)` — the declared plan with its sequence-parallel overlay;
+3. the HF `_tp_plan` transformers assembled on the model, as `ParallelSpec.from_hf_model(model)`;
+4. the base llama-style plan. At `tp_size > 1` a `trust_remote_code` class with no usable plan
+   raises instead, because the base plan's placements trip a DTensor redistribute assert.
+
+`spec.sharded_output_only` is then enforced on the chosen plan, and models built from the custom
+MoE layers are checked so that no TP entry claims a routed expert.
+
+<Note>
+`tp_plan: llama_nemotron_super_tp_plan` is a legacy alias. It now logs a deprecation warning
+and defers to the model's own plan, which is what the architectures it covered (Llama-style and
+Nemotron-NAS) declare anyway. Pass a dictionary or an import path to force a specific plan.
+</Note>
+
+## Verify a Declaration
+
+```python
+from nemo_automodel.components.distributed.parallelizer import query_parallel_spec
+
+spec = query_parallel_spec(model)
+assert spec.tp_plan is LLAMA_TP_PLAN
+```
+
+Add a unit test that asserts the declaration (`Model.parallel_spec.tp_plan is ...`, or the
+layer groups it resolves), and keep `python -X importtime -c "import nemo_automodel.components.distributed.parallelizer"`
+free of `transformers.models.*` entries; `tests/unit_tests/distributed/test_parallelizer.py`
+enforces the latter.
+
+## See Also
+
+- [Distributed Setup (Python API)](/development/distributed-setup): Build the `DistributedSetup` that drives the parallelizer.
+- [Gradient Checkpointing](/development/gradient-checkpointing): The activation checkpointing scopes a `layer_groups` declaration feeds.
+- [`parallel_spec.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/distributed/parallel_spec.py) and a contract-only model package, [`components/models/gemma3/parallelization.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/models/gemma3/parallelization.py).

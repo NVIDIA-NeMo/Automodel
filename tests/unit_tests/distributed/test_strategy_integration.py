@@ -22,9 +22,12 @@ import torch.nn as nn
 
 from nemo_automodel.components.distributed.parallelizer import (
     DefaultParallelizationStrategy,
-    NemotronHParallelizationStrategy,
     fsdp2_strategy_parallelize,
     get_parallelization_strategy,
+)
+from nemo_automodel.components.models.nemotron_v3.parallelization import (
+    NEMOTRON_H_PARALLEL_SPEC,
+    NemotronHParallelizationStrategy,
 )
 
 
@@ -58,6 +61,7 @@ class MockNemotronModel(nn.Module):
             supports_mtp_cp_pp=False,
         )
         self.__class__.__name__ = "NemotronHForCausalLM"
+        self.__class__.parallel_spec = NEMOTRON_H_PARALLEL_SPEC
 
     def _create_layer(self):
         layer = nn.Module()
@@ -145,8 +149,8 @@ def test_backward_compatibility_standard_model(
 
 
 @patch("torch.distributed.get_process_group_ranks", return_value=[0])
-@patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
-@patch("nemo_automodel.components.distributed.parallelizer.parallelize_module")
+@patch("nemo_automodel.components.models.nemotron_v3.parallelization.fully_shard")
+@patch("nemo_automodel.components.models.nemotron_v3.parallelization.parallelize_module")
 def test_backward_compatibility_nemotron_model(mock_parallelize_module, mock_fully_shard, mock_gpgr, mock_device_mesh):
     """Test that the refactored code maintains backward compatibility for NemotronH models."""
     mock_fully_shard.side_effect = lambda model, **kwargs: model
@@ -208,6 +212,12 @@ def test_no_runtime_errors_with_different_model_types(mock_device_mesh):
             "nemo_automodel.components.distributed.parallelizer.fully_shard", side_effect=lambda model, **kwargs: model
         ),
         patch("nemo_automodel.components.distributed.parallelizer.parallelize_module"),
+        # The NemotronH strategy lives with its model and reads these from its own module.
+        patch(
+            "nemo_automodel.components.models.nemotron_v3.parallelization.fully_shard",
+            side_effect=lambda model, **kwargs: model,
+        ),
+        patch("nemo_automodel.components.models.nemotron_v3.parallelization.parallelize_module"),
     ):
         with patch("nemo_automodel.components.distributed.parallelizer.apply_fsdp2_sharding_recursively"):
             with patch(

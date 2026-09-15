@@ -52,6 +52,7 @@ from transformers.models.diffusion_gemma.modeling_diffusion_gemma import (
 )
 
 from nemo_automodel._transformers.model_capabilities import ModelCapabilities
+from nemo_automodel.components.distributed.parallel_spec import ParallelSpec
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import (
@@ -62,7 +63,7 @@ from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 
-from .fsdp import register_diffusion_gemma_parallel_strategy
+from .fsdp import DiffusionGemmaParallelizationStrategy
 from .layers import (
     DiffusionGemmaMoEDecoderLayer,
     DiffusionGemmaRMSNorm,
@@ -332,6 +333,7 @@ class DiffusionGemmaForBlockDiffusion(HFCheckpointingMixin, MoEFSDPSyncMixin, Pr
     """
 
     config_class = DiffusionGemmaConfig
+    parallel_spec: ParallelSpec = ParallelSpec(strategy=DiffusionGemmaParallelizationStrategy())
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
     # RoPE inv_freq must stay fp32: initialize_weights casts the model to bf16 and
@@ -659,9 +661,3 @@ class DiffusionGemmaForBlockDiffusion(HFCheckpointingMixin, MoEFSDPSyncMixin, Pr
 
 
 ModelClass = DiffusionGemmaForBlockDiffusion
-
-# Register the pure-FSDP2 (ep_size=1) parallelization strategy so that
-# get_parallelization_strategy() selects it for this model. Done here (not in
-# the package __init__) so registration runs alongside model construction.
-
-register_diffusion_gemma_parallel_strategy()

@@ -48,6 +48,7 @@ from nemo_automodel.components.attention.utils import (
     postprocess_output_for_attn,
     preprocess_args_and_kwargs_for_attn,
 )
+from nemo_automodel.components.distributed.parallel_spec import ParallelSpec
 from nemo_automodel.components.models.common import (
     BackendConfig,
     compute_lm_head_logits,
@@ -67,6 +68,7 @@ from nemo_automodel.components.models.llama.rope_utils import (
     apply_rotary_pos_emb_fused,
     apply_rotary_pos_emb_quack,
 )
+from nemo_automodel.components.models.qwen2.parallelization import QWEN_PARALLEL_SPEC
 from nemo_automodel.shared.import_utils import get_check_model_inputs_decorator, safe_import_from
 
 __all__ = ["Qwen2ForCausalLM"]
@@ -518,6 +520,7 @@ class Qwen2ForCausalLM(HFCheckpointingMixin, Qwen2PreTrainedModel):
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
+    parallel_spec: ParallelSpec = QWEN_PARALLEL_SPEC
 
     @dataclass(frozen=True)
     class ModelCapabilities:

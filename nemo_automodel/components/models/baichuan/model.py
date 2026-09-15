@@ -39,6 +39,7 @@ from typing import List, Tuple, Union
 import torch
 import torch.utils.checkpoint
 from torch import nn
+from torch.distributed.tensor.parallel import ColwiseParallel, ParallelStyle, RowwiseParallel
 from torch.nn import CrossEntropyLoss
 from torch.nn import functional as F
 from transformers import GenerationMixin, PreTrainedModel
@@ -47,6 +48,7 @@ from transformers.cache_utils import DynamicCache
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from transformers.utils import logging
 
+from nemo_automodel.components.distributed.parallel_spec import ParallelSpec
 from nemo_automodel.components.models.baichuan.configuration import BaichuanConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import (
@@ -478,10 +480,21 @@ class BaichuanModel(BaichuanPreTrainedModel):
 # ---------------------------------------------------------------------------
 # Causal LM head
 # ---------------------------------------------------------------------------
+# Only the MLP is sharded. The attention path stays fully replicated because W_pack uses a non-interleaved [Q|K|V]
+# layout (ColwiseParallel would split it incorrectly) and NormHead (lm_head) is not nn.Linear (ColwiseParallel is
+# unsupported).
+BAICHUAN_TP_PLAN: dict[str, ParallelStyle] = {
+    "model.layers.*.mlp.gate_proj": ColwiseParallel(),
+    "model.layers.*.mlp.up_proj": ColwiseParallel(),
+    "model.layers.*.mlp.down_proj": RowwiseParallel(),
+}
+
+
 class BaichuanForCausalLM(HFCheckpointingMixin, BaichuanPreTrainedModel, GenerationMixin):
     # lm_head is a weight-normalizing NormHead, so tying it to embed_tokens is
     # semantically wrong; all shipped Baichuan checkpoints are untied.
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+    parallel_spec: ParallelSpec = ParallelSpec(tp_plan=BAICHUAN_TP_PLAN)
 
     @dataclass(frozen=True)
     class ModelCapabilities:
