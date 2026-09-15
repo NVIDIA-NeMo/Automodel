@@ -14,7 +14,6 @@
 
 import gc
 import math
-import os
 import re
 from typing import Iterable
 
@@ -112,20 +111,14 @@ def count_tail_padding(labels, ignore_label=-100):
     return prod_mask.view(-1).sum().item()
 
 
-_FUSED_GRAD_NORM_ENV = "NEMO_AUTOMODEL_FUSED_GRAD_NORM"
-
-
 def _use_fused_grad_norm(params, norm_type: float) -> bool:
     """Whether the fused multi-tensor reduction applies to this group.
 
     Only the 2-norm and inf-norm are implemented by the kernel, and the whole
     group has to be CUDA -- a mixed CPU/CUDA group would silently take two
-    different reduction paths. Set NEMO_AUTOMODEL_FUSED_GRAD_NORM=0 to force
-    the per-tensor path (useful when bisecting a numerics regression).
+    different reduction paths.
     """
     if not HAVE_FUSED_GRAD_NORM:
-        return False
-    if os.environ.get(_FUSED_GRAD_NORM_ENV, "1") == "0":
         return False
     if not (math.isinf(norm_type) or norm_type == 2.0):
         return False
