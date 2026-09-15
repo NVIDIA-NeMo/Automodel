@@ -446,7 +446,7 @@ schedule when continuing training.
 
 ## Step 6 — View the Training Loss in W&B
 
-Open the online W&B run and select **Charts**. In the `loss` panel, use **Step**
+Open your W&B run and select **Charts**. In the `loss` panel, use **Step**
 for the X axis and `loss` for the Y axis. Set **Smoothing** to `0` in the panel's
 settings. Open the panel in full-screen view to inspect all 200 training measurements
 and capture the chart for the tutorial.
@@ -456,12 +456,11 @@ and capture the chart for the tutorial.
 The DFW experiment completed **200 optimizer steps** and **8 held-out validation passes**,
 processing **26,214,400 target-token positions**.
 
-The [online W&B run](https://wandb.ai/Nemo-automodel/huiyingl_workspace/runs/cpt18614199)
-contains all 200 training losses and all eight validation losses. Every value was checked
-against the corresponding Slurm log entry within its printed precision. The screenshot
+All 200 training losses and eight validation losses were recorded in W&B and checked
+against the corresponding Slurm log entries within their printed precision. The screenshot
 below shows the W&B `loss` panel with smoothing set to `0`.
 
-![W&B raw training loss for Super 3.5 VL FineWeb continued pretraining](./nemotron-3-5-super-vl-fineweb-cpt-loss.png)
+<img src="./nemotron-3-5-super-vl-fineweb-cpt-loss.png" alt="W&B raw training loss for Super 3.5 VL FineWeb continued pretraining" width="25%" />
 
 | Measurement | Value |
 |---|---|
@@ -475,5 +474,4 @@ below shows the W&B `loss` panel with smoothing set to `0`.
 | Lowest sampled free GPU memory | 15.70 GiB |
 
 The screenshot uses W&B's logged steps 0–199, corresponding to 200 completed optimizer
-updates. Each point is the raw training loss for that step. Full-precision history is
-available from the linked W&B run.
+updates. Each point is the raw training loss for that step.
