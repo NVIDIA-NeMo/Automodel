@@ -467,7 +467,7 @@ _STRATEGY_MAP: Dict[str, _StrategyConfigClass] = {
 }
 
 
-def _resolve_strategy_config(
+def resolve_strategy_config(
     strategy: str | DistributedStrategyConfig,
     **strategy_kwargs: Any,
 ) -> DistributedStrategyConfig:
@@ -490,6 +490,9 @@ def _resolve_strategy_config(
     if unknown:
         raise ValueError(f"Unknown options for strategy '{strategy_name}': {sorted(unknown)}")
     return strategy_cls(**strategy_kwargs)
+
+
+_resolve_strategy_config = resolve_strategy_config
 
 
 __all__ = [

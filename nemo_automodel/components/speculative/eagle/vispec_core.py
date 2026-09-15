@@ -39,7 +39,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from nemo_automodel.components.loss.listmle import listmle_loss
+from nemo_automodel.components.loss import listmle_loss
 from nemo_automodel.components.speculative.eagle.core_v12 import FeatureNoiseConfig
 
 

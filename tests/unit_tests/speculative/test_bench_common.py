@@ -72,9 +72,7 @@ def _args(**overrides):
 
 def test_load_prompts_prompt_column_wraps_single_turn_user_message(monkeypatch):
     rows = [{"question": "2+2=?"}, {"question": "3+3=?"}]
-    monkeypatch.setattr(
-        "nemo_automodel.components.datasets.llm.chat_dataset._load_openai_messages", lambda *a, **k: rows
-    )
+    monkeypatch.setattr("nemo_automodel.components.datasets.load_openai_messages", lambda *a, **k: rows)
     prompts = _load_prompts(_args(prompt_column="question"))
     assert prompts == [
         [{"role": "user", "content": "2+2=?"}],
@@ -85,18 +83,14 @@ def test_load_prompts_prompt_column_wraps_single_turn_user_message(monkeypatch):
 def test_load_prompts_prompt_column_takes_precedence_over_messages_column(monkeypatch):
     """A dataset can carry both columns; --prompt-column wins when set."""
     rows = [{"question": "raw text", "messages": [{"role": "user", "content": "chat text"}]}]
-    monkeypatch.setattr(
-        "nemo_automodel.components.datasets.llm.chat_dataset._load_openai_messages", lambda *a, **k: rows
-    )
+    monkeypatch.setattr("nemo_automodel.components.datasets.load_openai_messages", lambda *a, **k: rows)
     prompts = _load_prompts(_args(prompt_column="question"))
     assert prompts == [[{"role": "user", "content": "raw text"}]]
 
 
 def test_load_prompts_prompt_column_drops_unusable_rows(monkeypatch):
     rows = [{"question": "ok"}, {"question": ""}, {"question": None}, {"other": "x"}]
-    monkeypatch.setattr(
-        "nemo_automodel.components.datasets.llm.chat_dataset._load_openai_messages", lambda *a, **k: rows
-    )
+    monkeypatch.setattr("nemo_automodel.components.datasets.load_openai_messages", lambda *a, **k: rows)
     prompts = _load_prompts(_args(prompt_column="question"))
     assert prompts == [[{"role": "user", "content": "ok"}]]
 
@@ -104,9 +98,7 @@ def test_load_prompts_prompt_column_drops_unusable_rows(monkeypatch):
 def test_load_prompts_prompt_column_list_field_uses_first_turn(monkeypatch):
     """MT-Bench-shaped rows: a list-of-turns column, first turn used."""
     rows = [{"turns": ["first", "second"]}]
-    monkeypatch.setattr(
-        "nemo_automodel.components.datasets.llm.chat_dataset._load_openai_messages", lambda *a, **k: rows
-    )
+    monkeypatch.setattr("nemo_automodel.components.datasets.load_openai_messages", lambda *a, **k: rows)
     prompts = _load_prompts(_args(prompt_column="turns"))
     assert prompts == [[{"role": "user", "content": "first"}]]
 
@@ -115,9 +107,7 @@ def test_load_prompts_no_prompt_column_attribute_falls_back_to_messages(monkeypa
     """Callers whose Namespace never sets prompt_column (the two single-dataset
     benchmarks' existing test fixtures) keep working via getattr's default."""
     rows = [{"messages": [{"role": "user", "content": "hi"}]}]
-    monkeypatch.setattr(
-        "nemo_automodel.components.datasets.llm.chat_dataset._load_openai_messages", lambda *a, **k: rows
-    )
+    monkeypatch.setattr("nemo_automodel.components.datasets.load_openai_messages", lambda *a, **k: rows)
     args = SimpleNamespace(
         input_data="d", split="train", dataset_name=None, shuffle_seed=None, messages_column="messages", num_prompts=10
     )  # no prompt_column attr at all
@@ -127,9 +117,7 @@ def test_load_prompts_no_prompt_column_attribute_falls_back_to_messages(monkeypa
 
 def test_load_prompts_prompt_column_respects_num_prompts_cap(monkeypatch):
     rows = [{"question": f"q{i}"} for i in range(5)]
-    monkeypatch.setattr(
-        "nemo_automodel.components.datasets.llm.chat_dataset._load_openai_messages", lambda *a, **k: rows
-    )
+    monkeypatch.setattr("nemo_automodel.components.datasets.load_openai_messages", lambda *a, **k: rows)
     prompts = _load_prompts(_args(prompt_column="question", num_prompts=2))
     assert len(prompts) == 2
 
@@ -142,9 +130,7 @@ def test_load_prompts_prompt_column_respects_num_prompts_cap(monkeypatch):
 def test_load_prompts_appends_context_column_when_present(monkeypatch):
     """Alpaca-shaped rows: instruction + non-empty input are joined into one prompt."""
     rows = [{"instruction": "Identify the odd one out.", "input": "Twitter, Instagram, Telegram."}]
-    monkeypatch.setattr(
-        "nemo_automodel.components.datasets.llm.chat_dataset._load_openai_messages", lambda *a, **k: rows
-    )
+    monkeypatch.setattr("nemo_automodel.components.datasets.load_openai_messages", lambda *a, **k: rows)
     prompts = _load_prompts(_args(prompt_column="instruction", prompt_context_column="input"))
     assert prompts == [[{"role": "user", "content": "Identify the odd one out.\n\nTwitter, Instagram, Telegram."}]]
 
@@ -152,9 +138,7 @@ def test_load_prompts_appends_context_column_when_present(monkeypatch):
 def test_load_prompts_omits_empty_context_column(monkeypatch):
     """A blank/missing context field leaves the bare instruction untouched."""
     rows = [{"instruction": "Name a color.", "input": ""}, {"instruction": "Name a fruit."}]
-    monkeypatch.setattr(
-        "nemo_automodel.components.datasets.llm.chat_dataset._load_openai_messages", lambda *a, **k: rows
-    )
+    monkeypatch.setattr("nemo_automodel.components.datasets.load_openai_messages", lambda *a, **k: rows)
     prompts = _load_prompts(_args(prompt_column="instruction", prompt_context_column="input"))
     assert prompts == [
         [{"role": "user", "content": "Name a color."}],
@@ -165,9 +149,7 @@ def test_load_prompts_omits_empty_context_column(monkeypatch):
 def test_load_prompts_context_column_attribute_optional(monkeypatch):
     """A Namespace that never sets prompt_context_column behaves as before (no append)."""
     rows = [{"instruction": "Name a color.", "input": "ignored"}]
-    monkeypatch.setattr(
-        "nemo_automodel.components.datasets.llm.chat_dataset._load_openai_messages", lambda *a, **k: rows
-    )
+    monkeypatch.setattr("nemo_automodel.components.datasets.load_openai_messages", lambda *a, **k: rows)
     args = _args(prompt_column="instruction")  # _args never sets prompt_context_column
     assert not hasattr(args, "prompt_context_column")
     prompts = _load_prompts(args)

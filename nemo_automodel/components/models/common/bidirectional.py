@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
+from nemo_automodel.components.checkpoint import StateDictAdapter
 
 
 class EncoderStateDictAdapter(StateDictAdapter):

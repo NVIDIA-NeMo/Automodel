@@ -31,16 +31,20 @@ _HAS_WANDB, wandb = safe_import(
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
 
 from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
-from nemo_automodel.components.distributed.fsdp2 import fsdp2_sharding_enabled
-from nemo_automodel.components.distributed.init_utils import initialize_distributed
-from nemo_automodel.components.distributed.tp_replicas import broadcast_tp_replicas, synchronize_tp_replica_gradients
-from nemo_automodel.components.distributed.utils import get_sync_ctx
-from nemo_automodel.components.flow_matching.pipeline import FlowMatchingPipeline, create_adapter
-from nemo_automodel.components.loggers.log_utils import setup_logging
-from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
-from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG, init_all_rng
-from nemo_automodel.components.training.utils import (
+from nemo_automodel.components.distributed import (
+    broadcast_tp_replicas,
+    fsdp2_sharding_enabled,
+    get_sync_ctx,
+    initialize_distributed,
+    synchronize_tp_replica_gradients,
+)
+from nemo_automodel.components.flow_matching import FlowMatchingPipeline, create_adapter
+from nemo_automodel.components.loggers import setup_logging, suppress_wandb_log_messages
+from nemo_automodel.components.training import (
+    ScopedRNG,
+    StatefulRNG,
     clip_grad_norm,
+    init_all_rng,
     prepare_after_first_microbatch,
     prepare_for_final_backward,
     prepare_for_grad_accumulation,
@@ -737,7 +741,7 @@ class TrainDiffusionRecipe(BaseRecipe):
             )
 
         if self.optimize_hunyuan_flash_varlen_mask:
-            from nemo_automodel.components.flow_matching.adapters.hunyuan import (
+            from nemo_automodel.components.flow_matching import (
                 enable_hunyuan_flash_varlen_mask_optimization,
             )
 

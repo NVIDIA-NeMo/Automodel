@@ -19,7 +19,7 @@ from __future__ import annotations
 
 def register_muse_glimmer_parallel_strategy() -> None:
     """Register the MuseGlimmer strategy and expose its CP mesh to model-owned embedding."""
-    from nemo_automodel.components.distributed.parallelizer import (
+    from nemo_automodel.components.distributed import (
         PARALLELIZATION_STRATEGIES,
         DefaultParallelizationStrategy,
         register_parallel_strategy,
@@ -50,7 +50,7 @@ def register_muse_glimmer_parallel_strategy() -> None:
             # MuseGlimmer is BSHD-capable (not THD-only), so keep that model-specific
             # setup here rather than broadening the generic infrastructure gate.
             if tp_size > 1 and cp_size <= 1 and model.backend.attn == "te":
-                from nemo_automodel.components.distributed.context_parallel.utils import (
+                from nemo_automodel.components.distributed import (
                     attach_te_context_parallel,
                 )
 

@@ -53,7 +53,7 @@ import torch
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 
-from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
+from nemo_automodel.components.checkpoint import StateDictAdapter
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.deepseek_v3.state_dict_adapter import (
     BLOCK_SIZE,

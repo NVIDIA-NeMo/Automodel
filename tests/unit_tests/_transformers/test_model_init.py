@@ -479,7 +479,7 @@ def test_remote_code_cache_serialization_uses_model_process_group(tmp_path):
     process_group = object()
 
     with (
-        patch("nemo_automodel._transformers.model_init.dist_utils.FirstRankPerNode") as first_rank,
+        patch("nemo_automodel._transformers.model_init.FirstRankPerNode") as first_rank,
         patch("transformers.dynamic_module_utils.get_cached_module_file", return_value="remote/modeling_remote.py"),
     ):
         first_rank.return_value.__enter__.return_value = True

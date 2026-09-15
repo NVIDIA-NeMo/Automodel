@@ -123,7 +123,7 @@ def register_diffusion_gemma_parallel_strategy() -> None:
     Invoked at import of ``model.py`` (a torch-enabled context), which always
     runs before the model is parallelized.
     """
-    from nemo_automodel.components.distributed.parallelizer import (
+    from nemo_automodel.components.distributed import (
         PARALLELIZATION_STRATEGIES,
         DefaultParallelizationStrategy,
         register_parallel_strategy,

@@ -499,7 +499,7 @@ def materialize_missing_tied_lm_head(
     return False
 
 
-def _get_checkpoint_tensor_dtypes(
+def get_checkpoint_tensor_dtypes(
     pretrained_model_name_or_path: str,
     hf_config: Any,
     load_kwargs: Mapping[str, object] | None = None,
@@ -558,3 +558,6 @@ def _get_checkpoint_tensor_dtypes(
             {name: tensor.dtype for name, tensor in state_dict.items() if isinstance(tensor, torch.Tensor)}
         )
     return checkpoint_dtypes
+
+
+_get_checkpoint_tensor_dtypes = get_checkpoint_tensor_dtypes

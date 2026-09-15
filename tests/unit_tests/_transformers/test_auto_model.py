@@ -1105,7 +1105,7 @@ class TestModelMappingKeyErrorFallback:
         with (
             patch("nemo_automodel._transformers.model_init.get_hf_config", return_value=fake_config),
             patch(
-                "nemo_automodel.components.checkpoint.utils._get_checkpoint_tensor_dtypes",
+                "nemo_automodel._transformers.model_init.get_checkpoint_tensor_dtypes",
                 return_value={
                     "linear.weight": torch.bfloat16,
                     "norm.weight": torch.float32,
@@ -1153,7 +1153,7 @@ class TestModelMappingKeyErrorFallback:
         with (
             patch("nemo_automodel._transformers.model_init.get_hf_config", return_value=fake_config),
             patch(
-                "nemo_automodel.components.checkpoint.utils._get_checkpoint_tensor_dtypes",
+                "nemo_automodel._transformers.model_init.get_checkpoint_tensor_dtypes",
                 return_value={
                     "linear.weight": torch.bfloat16,
                     "norm.weight": torch.float32,
@@ -1201,7 +1201,7 @@ class TestModelMappingKeyErrorFallback:
         with (
             patch("nemo_automodel._transformers.model_init.get_hf_config", return_value=fake_config),
             patch(
-                "nemo_automodel.components.checkpoint.utils._get_checkpoint_tensor_dtypes",
+                "nemo_automodel._transformers.model_init.get_checkpoint_tensor_dtypes",
                 return_value={
                     "linear.weight": torch.bfloat16,
                     "norm.weight": torch.float32,
@@ -1279,7 +1279,7 @@ class TestModelMappingKeyErrorFallback:
         with (
             patch("nemo_automodel._transformers.model_init.get_hf_config", return_value=fake_config),
             patch(
-                "nemo_automodel.components.checkpoint.utils._get_checkpoint_tensor_dtypes",
+                "nemo_automodel._transformers.model_init.get_checkpoint_tensor_dtypes",
                 return_value={"lm_head.weight": torch.bfloat16},
             ),
             patch("nemo_automodel._transformers.model_init._get_mixin_wrapped_class") as mock_wrap,

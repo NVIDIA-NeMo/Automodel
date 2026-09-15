@@ -1188,7 +1188,7 @@ def _cp_module():
 
 
 def _fsdp2_manager_mock():
-    from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
+    from nemo_automodel.components.distributed import FSDP2Manager
 
     manager = Mock(spec=FSDP2Manager)
     manager.device_mesh = Mock()
@@ -1197,11 +1197,10 @@ def _fsdp2_manager_mock():
 
 def test_enable_context_parallel_derives_mesh_and_enables(monkeypatch):
     from nemo_automodel._diffusers.auto_diffusion_pipeline import _enable_context_parallel
-    from nemo_automodel.components.distributed import mesh_utils
 
     cp_mesh = Mock()
     create_mesh = Mock(return_value=cp_mesh)
-    monkeypatch.setattr(mesh_utils, "create_ring_ulysses_mesh", create_mesh)
+    monkeypatch.setattr("nemo_automodel.components.distributed.create_ring_ulysses_mesh", create_mesh)
 
     module = _cp_module()
     manager = _fsdp2_manager_mock()
@@ -1217,7 +1216,7 @@ def test_enable_context_parallel_derives_mesh_and_enables(monkeypatch):
 
 def test_enable_context_parallel_rejects_ddp_manager():
     from nemo_automodel._diffusers.auto_diffusion_pipeline import _enable_context_parallel
-    from nemo_automodel.components.distributed.ddp import DDPManager
+    from nemo_automodel.components.distributed import DDPManager
 
     manager = Mock(spec=DDPManager)
     with pytest.raises(ValueError, match="requires the fsdp2 manager"):

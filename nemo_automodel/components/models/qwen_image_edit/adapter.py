@@ -21,7 +21,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from nemo_automodel.components.flow_matching.adapters.base import FlowMatchingContext, ModelAdapter
+from nemo_automodel.components.flow_matching import FlowMatchingContext, ModelAdapter
 
 
 class QwenImageEditAdapter(ModelAdapter):

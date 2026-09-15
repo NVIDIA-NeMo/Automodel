@@ -47,7 +47,7 @@ import torch
 import torch.nn as nn
 from transformers import PretrainedConfig, PreTrainedModel
 
-from nemo_automodel.components.datasets.llm.packed_sequence import build_block_causal_additive_mask
+from nemo_automodel.components.datasets import build_block_causal_additive_mask
 from nemo_automodel.components.models.common import initialize_rms_norm_module
 from nemo_automodel.components.models.deepseek_v3.rope_utils import (
     apply_rotary_emb,

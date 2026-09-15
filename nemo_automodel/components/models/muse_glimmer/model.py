@@ -40,13 +40,13 @@ from nemo_automodel.components.attention.utils import (
     postprocess_output_for_attn,
     preprocess_args_and_kwargs_for_attn,
 )
-from nemo_automodel.components.distributed.context_parallel.sharder import (
+from nemo_automodel.components.distributed import (
     ContextParallelSharder,
+    cp_dispatcher_suspended,
     round_robin_local_indices,
     shard_batch_aux_only,
     shard_sequence_for_cp_round_robin,
 )
-from nemo_automodel.components.distributed.context_parallel.utils import cp_dispatcher_suspended
 from nemo_automodel.components.models.common import BackendConfig, compute_lm_head_logits
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import (

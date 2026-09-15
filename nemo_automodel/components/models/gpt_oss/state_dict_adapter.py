@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Any, Optional
 import torch
 from transformers import GptOssConfig
 
-from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
+from nemo_automodel.components.checkpoint import StateDictAdapter
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.moe.config import MoEConfig
 

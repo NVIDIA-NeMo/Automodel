@@ -43,24 +43,34 @@ from transformers import AutoConfig
 
 from nemo_automodel._transformers import NeMoAutoModelForCausalLM
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
-from nemo_automodel.components.datasets.llm.dspark_cache import (
-    DTYPE_MAP,
+from nemo_automodel.components.datasets import (
+    DSPARK_DTYPE_MAP as DTYPE_MAP,
+)
+from nemo_automodel.components.datasets import (
     build_cache_manifest,
+    build_eagle3_dataloader,
     compute_batch_cache,
-    existing_shard_indices,
+    dataloader_from_sample,
     manifest_mismatch_fields,
-    manifest_path,
-    read_manifest,
+    resume_start_sample,
     tokenizer_chat_template_sha256,
-    write_manifest,
-    write_shard,
+    write_cache_shards,
     write_target_weights,
 )
-from nemo_automodel.components.datasets.llm.eagle3 import build_eagle3_dataloader
-from nemo_automodel.components.datasets.llm.offline_cache import (
-    dataloader_from_sample,
-    resume_start_sample,
-    write_cache_shards,
+from nemo_automodel.components.datasets import (
+    dspark_existing_shard_indices as existing_shard_indices,
+)
+from nemo_automodel.components.datasets import (
+    dspark_manifest_path as manifest_path,
+)
+from nemo_automodel.components.datasets import (
+    dspark_read_manifest as read_manifest,
+)
+from nemo_automodel.components.datasets import (
+    dspark_write_manifest as write_manifest,
+)
+from nemo_automodel.components.datasets import (
+    dspark_write_shard as write_shard,
 )
 from nemo_automodel.components.speculative.dspark.registry import build_target_layer_ids
 from nemo_automodel.components.speculative.dspark.target import HFDSparkTargetModel

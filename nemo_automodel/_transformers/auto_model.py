@@ -53,13 +53,15 @@ from transformers.initialization import no_init_weights  # noqa: E402
 from transformers.models.auto.auto_factory import _BaseAutoModelClass  # noqa: E402
 from transformers.utils import ContextManagers  # noqa: E402
 
-from nemo_automodel.components.distributed.config import DistributedSetup  # noqa: E402
-from nemo_automodel.components.distributed.ddp import DDPManager  # noqa: E402
-from nemo_automodel.components.distributed.init_utils import get_world_size_safe  # noqa: E402
-from nemo_automodel.components.distributed.megatron_fsdp import MegatronFSDPManager  # noqa: E402
-from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPipeline  # noqa: E402, F401
+from nemo_automodel.components.distributed import (
+    AutoPipeline,  # noqa: E402, F401
+    DDPManager,  # noqa: E402
+    DistributedSetup,  # noqa: E402
+    MegatronFSDPManager,  # noqa: E402
+    get_world_size_safe,  # noqa: E402
+)
 from nemo_automodel.components.quantization.qat import QATConfig  # noqa: E402
-from nemo_automodel.components.utils.model_utils import (  # noqa: E402
+from nemo_automodel.components.utils import (  # noqa: E402
     init_empty_weights,
     resolve_trust_remote_code,
 )
