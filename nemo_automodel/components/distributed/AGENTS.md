@@ -58,8 +58,8 @@ ever reads the `parallel_spec` class attribute (`query_parallel_spec`). Architec
 the repository does not re-implement -- stock `transformers` classes, `trust_remote_code`
 checkpoints, `diffusers` transformers -- get a `components/models/<family>/parallelization.py`
 of their own that declares the spec on a class named after the upstream architecture; the
-loaders (`_transformers/model_init.py`, `_diffusers/parallelization.py`) derive `<family>`
-from the class and bind the declaration onto the wrapper they create. No table of model
+loader resolver (`_transformers/model_init.py::parallel_spec_for`, shared by the diffusion
+pipeline) derives `<family>` from the class and binds the declaration onto the wrapper. No table of model
 names exists anywhere, and nothing in this directory names a model.
 
 **Type annotations** -- put the import under `if TYPE_CHECKING:`. That needs

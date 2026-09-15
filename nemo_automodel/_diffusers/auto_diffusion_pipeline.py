@@ -49,7 +49,6 @@ import torch
 import torch.nn as nn
 
 from nemo_automodel._diffusers._hf_cache import resolve_diffusion_model_dir
-from nemo_automodel._diffusers.parallelization import attach_parallel_spec
 from nemo_automodel.components.distributed import DistributedSetup, ParallelismSizes
 from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config
 from nemo_automodel.components.distributed.ddp import DDPManager
@@ -561,6 +560,9 @@ def _apply_parallelization(
 
     assert torch.distributed.is_initialized(), "Distributed environment must be initialized for parallelization"
 
+    # Same resolver/binder as the transformers loader; imported here so importing this module stays light.
+    from nemo_automodel._transformers.model_init import bind_parallel_spec
+
     for comp_name, comp_module in _iter_pipeline_modules(pipe):
         manager_args = parallel_scheme.get(comp_name)
         if manager_args is None:
@@ -573,7 +575,7 @@ def _apply_parallelization(
         # final module tree by name and FSDP2 wraps the hook-carrying modules.
         if int(manager_args.get("cp_size", 1)) > 1:
             _enable_context_parallel(comp_module, comp_name, manager, manager_args)
-        parallel_module = manager.parallelize(attach_parallel_spec(comp_module))
+        parallel_module = manager.parallelize(bind_parallel_spec(comp_module))
         if hasattr(manager, "maybe_compile"):
             manager.maybe_compile(parallel_module)
         if isinstance(manager, DDPManager):

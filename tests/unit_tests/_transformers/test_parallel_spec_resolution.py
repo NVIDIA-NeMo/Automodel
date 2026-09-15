@@ -24,7 +24,7 @@ from transformers.models.mistral3.modeling_mistral3 import Mistral3ForConditiona
 
 from nemo_automodel._transformers.model_init import _get_mixin_wrapped_class, parallel_spec_for
 from nemo_automodel.components.distributed.parallel_spec import ParallelSpec
-from nemo_automodel.components.models import declared_parallel_spec
+from nemo_automodel.components.models import declared_parallel_spec, model_family
 from nemo_automodel.components.models.gemma3 import parallelization as gemma3_parallelization
 from nemo_automodel.components.models.llama.model import LlamaForCausalLM as NativeLlamaForCausalLM
 from nemo_automodel.components.models.llama.parallelization import LLAMA_PARALLEL_SPEC
@@ -34,6 +34,7 @@ from nemo_automodel.components.models.nemotron_nas.parallelization import valida
 
 def test_declaration_resolves_from_the_model_type_family():
     """Both Gemma 3 heads live in ``components/models/gemma3`` although their ``model_type`` values differ."""
+    assert model_family(Gemma3ForCausalLM) == model_family(Gemma3ForConditionalGeneration) == "gemma3"
     causal = parallel_spec_for(Gemma3ForCausalLM)
     vlm = parallel_spec_for(Gemma3ForConditionalGeneration)
     assert causal is gemma3_parallelization.Gemma3ForCausalLM.parallel_spec
@@ -91,13 +92,13 @@ def test_attribute_set_on_an_upstream_class_is_the_out_of_tree_hook():
     assert _get_mixin_wrapped_class(upstream).parallel_spec is declared
 
 
-@pytest.mark.parametrize("family", ["does_not_exist", "..evil", "components.models", ""])
-def test_declared_parallel_spec_ignores_missing_or_malformed_families(family):
-    assert declared_parallel_spec(family, "Anything") is None
+@pytest.mark.parametrize("model_type", ["does_not_exist", "..evil", "components.models", ""])
+def test_declared_parallel_spec_ignores_missing_or_malformed_families(model_type):
+    double = type("Anything", (), {"config_class": SimpleNamespace(model_type=model_type)})
+    assert declared_parallel_spec(double) is None
 
 
 def test_declared_parallel_spec_reads_the_class_named_after_the_architecture():
-    assert (
-        declared_parallel_spec("gemma3", "Gemma3ForCausalLM") is gemma3_parallelization.Gemma3ForCausalLM.parallel_spec
-    )
-    assert declared_parallel_spec("gemma3", "Gemma3Model") is None
+    assert declared_parallel_spec(Gemma3ForCausalLM) is gemma3_parallelization.Gemma3ForCausalLM.parallel_spec
+    other_head = type("Gemma3Model", (), {"config_class": Gemma3ForCausalLM.config_class})
+    assert declared_parallel_spec(other_head) is None

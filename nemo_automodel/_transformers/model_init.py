@@ -37,7 +37,6 @@ try:
 except ImportError:
     StrictDataclassClassValidationError = ValueError
 from transformers.modeling_utils import PreTrainedModel
-from transformers.models.auto.configuration_auto import model_type_to_module_name
 
 # For models that still accesses config.pad_token_id after v5 removes it in PretrainedConfig
 if not hasattr(PretrainedConfig, "pad_token_id"):
@@ -123,23 +122,35 @@ PreTrainedModel.get_init_context = classmethod(_patched_get_init_context)
 def parallel_spec_for(model_class: type) -> ParallelSpec | None:
     """Contract for a class the repository does not own, or ``None`` when the generic defaults apply.
 
-    Walks the MRO so subclasses (``HFCheckpointingMixin`` wrappers, FP8 variants, remote-code
-    ports) inherit their base architecture's contract. Per class, a declaration in
-    ``components/models/<family>/parallelization.py`` wins, where ``<family>`` is the transformers
-    module name of the config's ``model_type`` (``gemma3`` for both ``gemma3`` and ``gemma3_text``,
-    ``nemotron_nas`` for a ``trust_remote_code`` ``nemotron-nas`` checkpoint); otherwise the native
-    implementation registered under the same architecture name is authoritative for its
-    transformers twin.
+    Serves transformers and diffusers classes alike. Walks the MRO so subclasses
+    (``HFCheckpointingMixin`` wrappers, FP8 variants, remote-code ports) inherit their base
+    architecture's contract. Per class, the declaration in the model package named by
+    :func:`nemo_automodel.components.models.model_family` wins; otherwise the native implementation
+    registered under the same architecture name is authoritative for its transformers twin.
     """
-    model_type = getattr(getattr(model_class, "config_class", None), "model_type", None)
-    family = model_type_to_module_name(model_type) if model_type else None
     for cls in model_class.__mro__:
-        spec = declared_parallel_spec(family, cls.__name__) if family else None
+        spec = declared_parallel_spec(cls)
         if spec is None and ModelRegistry.has_custom_model(cls.__name__):
             spec = getattr(ModelRegistry.get_model_cls_from_model_arch(cls.__name__), "parallel_spec", None)
         if spec is not None:
             return spec
     return None
+
+
+def bind_parallel_spec(model: torch.nn.Module) -> torch.nn.Module:
+    """Give an already-built ``model`` the contract its class resolves to.
+
+    This is the instance-level form of what ``_get_mixin_wrapped_class`` does for the classes the
+    transformers loader wraps: ``model.__class__`` becomes a subclass carrying ``parallel_spec`` (same
+    name, module and qualname), so ``query_parallel_spec`` finds it without touching the upstream
+    class. Models whose class already declares one, or resolves to none, are returned unchanged.
+    """
+    cls = type(model)
+    if hasattr(cls, "parallel_spec") or (spec := parallel_spec_for(cls)) is None:
+        return model
+    namespace = {"parallel_spec": spec, "__module__": cls.__module__, "__qualname__": cls.__qualname__}
+    model.__class__ = type(cls.__name__, (cls,), namespace)
+    return model
 
 
 def _get_mixin_wrapped_class(model_class: type) -> type:

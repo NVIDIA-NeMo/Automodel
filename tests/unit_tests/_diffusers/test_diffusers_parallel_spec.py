@@ -12,17 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The diffusion pipeline binds model-owned ParallelSpec declarations onto diffusers transformers."""
+"""The diffusion pipeline binds model-owned ParallelSpec declarations with the transformers loader's resolver."""
 
 import pytest
 import torch.nn as nn
 
-from nemo_automodel._diffusers.parallelization import attach_parallel_spec, diffusers_family
+from nemo_automodel._transformers.model_init import bind_parallel_spec, parallel_spec_for
 from nemo_automodel.components.distributed.parallelizer import get_parallelization_strategy, query_parallel_spec
+from nemo_automodel.components.models import model_family
 from nemo_automodel.components.models.hunyuan_video15.parallelization import HunyuanParallelizationStrategy
 from nemo_automodel.components.models.ltx2_video.parallelization import LTX2ParallelizationStrategy
 from nemo_automodel.components.models.qwen_image.parallelization import QwenImageEditParallelizationStrategy
 from nemo_automodel.components.models.wan.parallelization import WanParallelizationStrategy
+
+
+def _diffusers_double(class_name: str, *bases: type) -> type:
+    """A stand-in carrying the diffusers ``ModelMixin`` marker (``config_name``) the family rule keys on."""
+    return type(class_name, bases or (nn.Module,), {"config_name": "config.json"})
 
 
 @pytest.mark.parametrize(
@@ -36,7 +42,11 @@ from nemo_automodel.components.models.wan.parallelization import WanParallelizat
     ],
 )
 def test_diffusers_family_is_the_snake_case_stem_before_transformer(class_name, family):
-    assert diffusers_family(class_name) == family
+    assert model_family(_diffusers_double(class_name)) == family
+
+
+def test_modules_from_neither_library_have_no_family():
+    assert model_family(type("WanTransformer3DModel", (nn.Module,), {})) is None
 
 
 @pytest.mark.parametrize(
@@ -48,22 +58,23 @@ def test_diffusers_family_is_the_snake_case_stem_before_transformer(class_name, 
         ("QwenImageTransformer2DModel", QwenImageEditParallelizationStrategy),
     ],
 )
-def test_attach_binds_the_declared_strategy_onto_the_instance_class(class_name, strategy_cls):
-    upstream = type(class_name, (nn.Module,), {})
-    module = attach_parallel_spec(upstream())
+def test_bind_attaches_the_declared_strategy_onto_the_instance_class(class_name, strategy_cls):
+    upstream = _diffusers_double(class_name)
+    module = bind_parallel_spec(upstream())
     assert isinstance(module, upstream)
     assert type(module).__name__ == class_name
     assert type(get_parallelization_strategy(module)) is strategy_cls
+    assert type(module).parallel_spec is parallel_spec_for(upstream)
 
 
 def test_subclass_inherits_its_base_declaration():
-    base = type("WanTransformer3DModel", (nn.Module,), {})
-    module = attach_parallel_spec(type("WanVariant", (base,), {})())
+    base = _diffusers_double("WanTransformer3DModel")
+    module = bind_parallel_spec(type("WanVariant", (base,), {})())
     assert type(get_parallelization_strategy(module)) is WanParallelizationStrategy
 
 
 def test_modules_without_a_declaration_are_returned_unchanged():
     module = nn.Linear(2, 2)
-    assert attach_parallel_spec(module) is module
+    assert bind_parallel_spec(module) is module
     assert type(module) is nn.Linear
     assert query_parallel_spec(module).strategy is None
