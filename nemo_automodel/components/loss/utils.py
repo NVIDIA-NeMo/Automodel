@@ -37,7 +37,7 @@ def _get_lm_head_module(model: nn.Module) -> nn.Module | None:
     return None
 
 
-def _get_lm_head_weight(model: nn.Module) -> torch.Tensor:
+def get_lm_head_weight(model: nn.Module) -> torch.Tensor:
     """Return the model's LM-head weight without changing its distributed layout."""
     lm_head = _get_lm_head_module(model)
     if lm_head is not None:
@@ -46,6 +46,9 @@ def _get_lm_head_weight(model: nn.Module) -> torch.Tensor:
         if "lm_head" in name and name.endswith(".weight"):
             return param
     raise ValueError("lm_head.weight not found in model")
+
+
+_get_lm_head_weight = get_lm_head_weight
 
 
 def _get_final_hidden_states(model_output: Any) -> Any | None:

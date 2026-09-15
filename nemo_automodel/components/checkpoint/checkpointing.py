@@ -2449,7 +2449,7 @@ def _apply_key_mapping(
     return {_get_key_renaming_mapping(k, key_mapping): v for k, v in state_dict.items()}
 
 
-def _load_full_state_dict_into_model(
+def load_full_state_dict_into_model(
     model_parts: list[nn.Module],
     state_dict: dict[str, torch.Tensor],
 ) -> None:
@@ -2535,6 +2535,9 @@ def _load_full_state_dict_into_model(
             # device (a second full copy), OOMing a 30B model on one 80GB GPU.
             part.load_state_dict(state_dict, strict=False)
         ensure_tied_lm_head(part)
+
+
+_load_full_state_dict_into_model = load_full_state_dict_into_model
 
 
 def _convert_checkpoint_with_transformers(
@@ -2662,7 +2665,7 @@ def _convert_checkpoint_with_transformers(
         return None
 
 
-def _maybe_adapt_state_dict_to_hf(
+def maybe_adapt_state_dict_to_hf(
     model_part: nn.Module, state_dict: dict[str, torch.Tensor], quantization: bool = False, **kwargs
 ) -> dict[str, torch.Tensor]:
     """
@@ -2672,6 +2675,9 @@ def _maybe_adapt_state_dict_to_hf(
     if adapter:
         return adapter.to_hf(state_dict, exclude_key_regex=r".*_extra_state.*", quantization=quantization, **kwargs)
     return state_dict
+
+
+_maybe_adapt_state_dict_to_hf = maybe_adapt_state_dict_to_hf
 
 
 def _materialize_to_hf_views_for_save(state_dict: dict[str, torch.Tensor]) -> None:
@@ -2836,7 +2842,7 @@ def _is_custom_model(module: nn.Module) -> bool:
     )
 
 
-def _load_hf_checkpoint_preserving_dtype(
+def load_hf_checkpoint_preserving_dtype(
     model_path: str,
     *,
     prefault_safetensors: bool = False,
@@ -2857,6 +2863,9 @@ def _load_hf_checkpoint_preserving_dtype(
     elif _is_safetensors_checkpoint(model_path):
         return _load_hf_safetensors_checkpoint(model_path, prefault_mmap=prefault_safetensors)
     return None
+
+
+_load_hf_checkpoint_preserving_dtype = load_hf_checkpoint_preserving_dtype
 
 
 def _load_hf_safetensors_checkpoint(

@@ -13,6 +13,12 @@
 # limitations under the License.
 
 import importlib as _importlib
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .interactive import InteractiveLauncher
+    from .nemo_run.launcher import NemoRunLauncher
+    from .skypilot.launcher import SkyPilotLauncher
 
 _LAZY_ATTRS = {
     "InteractiveLauncher": (".interactive", "InteractiveLauncher"),

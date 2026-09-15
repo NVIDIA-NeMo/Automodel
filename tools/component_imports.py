@@ -239,43 +239,163 @@ def _read_exports(init_path: Path) -> frozenset[str]:
 
     tree = ast.parse(init_path.read_text(encoding="utf-8"), filename=str(init_path))
     values: dict[str, object] = {}
-    exports: set[str] = set()
 
     for statement in tree.body:
         if isinstance(statement, (ast.Assign, ast.AnnAssign)):
-            target = statement.targets[0] if isinstance(statement, ast.Assign) else statement.target
+            targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+            if len(targets) != 1 and any(_assigns_name(target, "__all__") for target in targets):
+                _unsupported_all(init_path, statement, "chained assignment")
             value_node = statement.value
-            if isinstance(target, ast.Name) and value_node is not None:
-                value = _static_value(value_node, values)
-                if value is not _UNKNOWN:
+            value = _static_value(value_node, values) if value_node is not None else _UNKNOWN
+            for target in targets:
+                if not isinstance(target, ast.Name):
+                    if _assigns_name(target, "__all__"):
+                        _unsupported_all(init_path, statement, "assignment")
+                    continue
+                if value is _UNKNOWN:
+                    values.pop(target.id, None)
+                    if target.id in {"__all__", "_LAZY_ATTRS"}:
+                        _unsupported_all(init_path, statement, f"{target.id} value")
+                else:
                     values[target.id] = value
                     if target.id == "__all__":
-                        exports = _string_set(value)
-        elif (
-            isinstance(statement, ast.AugAssign)
-            and isinstance(statement.target, ast.Name)
-            and statement.target.id == "__all__"
-            and isinstance(statement.op, ast.Add)
-        ):
+                        _string_list(init_path, statement, value)
+                    elif target.id == "_LAZY_ATTRS" and not isinstance(value, dict):
+                        _unsupported_all(init_path, statement, "_LAZY_ATTRS value")
+        elif isinstance(statement, ast.AugAssign) and isinstance(statement.target, ast.Name):
+            if statement.target.id != "__all__":
+                continue
+            if not isinstance(statement.op, ast.Add):
+                _unsupported_all(init_path, statement, "augmented assignment")
+            current = values.get("__all__", _UNKNOWN)
             value = _static_value(statement.value, values)
-            if value is not _UNKNOWN:
-                exports.update(_string_set(value))
+            if current is _UNKNOWN or value is _UNKNOWN:
+                _unsupported_all(init_path, statement, "augmented assignment")
+            if not isinstance(current, list):
+                _unsupported_all(init_path, statement, "augmented assignment target")
+            current.extend(_string_list(init_path, statement, value))
+        elif isinstance(statement, ast.Expr) and _is_all_call(statement.value):
+            _apply_all_call(init_path, statement, statement.value, values)
+        elif isinstance(
+            statement, (ast.If, ast.For, ast.AsyncFor, ast.While, ast.Try, ast.With, ast.AsyncWith, ast.Match)
+        ):
+            if _contains_all_mutation(statement):
+                _unsupported_all(init_path, statement, "conditional or nested mutation")
+        elif isinstance(statement, ast.Delete) and any(
+            _assigns_name(target, "__all__") for target in statement.targets
+        ):
+            _unsupported_all(init_path, statement, "deletion")
 
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
-            continue
-        if not isinstance(node.func.value, ast.Name) or node.func.value.id != "__all__":
-            continue
-        if node.func.attr == "append" and len(node.args) == 1:
-            value = _static_value(node.args[0], values)
-            if isinstance(value, str):
-                exports.add(value)
-        elif node.func.attr == "extend" and len(node.args) == 1:
-            value = _static_value(node.args[0], values)
-            if value is not _UNKNOWN:
-                exports.update(_string_set(value))
+    exports = _string_list(init_path, tree, values.get("__all__", []))
+    lazy_attrs = values.get("_LAZY_ATTRS")
+    if isinstance(lazy_attrs, dict):
+        lazy_exports = {key for key in lazy_attrs if isinstance(key, str)}
+        typed_exports = _read_type_checking_exports(tree)
+        if lazy_exports != typed_exports:
+            missing = ", ".join(sorted(lazy_exports - typed_exports)) or "none"
+            extra = ", ".join(sorted(typed_exports - lazy_exports)) or "none"
+            lazy_assignment = next(
+                statement
+                for statement in tree.body
+                if isinstance(statement, (ast.Assign, ast.AnnAssign))
+                and any(_assigns_name(target, "_LAZY_ATTRS") for target in _assignment_targets(statement))
+            )
+            raise ValueError(
+                f"{init_path}:{lazy_assignment.lineno}: TYPE_CHECKING exports do not match _LAZY_ATTRS "
+                f"(missing: {missing}; extra: {extra})"
+            )
 
     return frozenset(exports)
+
+
+def _assignment_targets(statement: ast.Assign | ast.AnnAssign) -> list[ast.expr]:
+    return statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+
+
+def _assigns_name(node: ast.AST, name: str) -> bool:
+    return any(isinstance(child, ast.Name) and child.id == name for child in ast.walk(node))
+
+
+def _is_all_call(node: ast.AST) -> bool:
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "__all__"
+    )
+
+
+def _apply_all_call(init_path: Path, statement: ast.stmt, call: ast.Call, values: dict[str, object]) -> None:
+    current = values.get("__all__", _UNKNOWN)
+    if current is _UNKNOWN or call.keywords or len(call.args) != 1:
+        _unsupported_all(init_path, statement, "method call")
+    if not isinstance(current, list):
+        _unsupported_all(init_path, statement, "method call target")
+    _string_list(init_path, statement, current)
+    if call.func.attr == "append":
+        value = _static_value(call.args[0], values)
+        if not isinstance(value, str):
+            _unsupported_all(init_path, statement, "append value")
+        current.append(value)
+    elif call.func.attr == "extend":
+        value = _static_value(call.args[0], values)
+        if value is _UNKNOWN:
+            _unsupported_all(init_path, statement, "extend value")
+        current.extend(_string_list(init_path, statement, value))
+    else:
+        _unsupported_all(init_path, statement, f"method {call.func.attr!r}")
+
+
+def _contains_all_mutation(node: ast.AST) -> bool:
+    class MutationFinder(ast.NodeVisitor):
+        found = False
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            return
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            return
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            return
+
+        def visit_Lambda(self, node: ast.Lambda) -> None:
+            return
+
+        def visit_Name(self, node: ast.Name) -> None:
+            if node.id == "__all__" and isinstance(node.ctx, (ast.Store, ast.Del)):
+                self.found = True
+
+        def visit_Call(self, node: ast.Call) -> None:
+            if _is_all_call(node):
+                self.found = True
+                return
+            self.generic_visit(node)
+
+    finder = MutationFinder()
+    finder.visit(node)
+    return finder.found
+
+
+def _read_type_checking_exports(tree: ast.Module) -> set[str]:
+    exports: set[str] = set()
+    for statement in tree.body:
+        if not isinstance(statement, ast.If) or not _is_type_checking_name(statement.test):
+            continue
+        for declaration in statement.body:
+            if isinstance(declaration, ast.ImportFrom):
+                exports.update(alias.asname or alias.name for alias in declaration.names if alias.name != "*")
+    return exports
+
+
+def _is_type_checking_name(node: ast.expr) -> bool:
+    return (isinstance(node, ast.Name) and node.id == "TYPE_CHECKING") or (
+        isinstance(node, ast.Attribute) and node.attr == "TYPE_CHECKING"
+    )
+
+
+def _unsupported_all(init_path: Path, node: ast.AST, shape: str) -> None:
+    raise ValueError(f"{init_path}:{node.lineno}: unsupported __all__ {shape}")
 
 
 _UNKNOWN = object()
@@ -339,7 +459,7 @@ def _static_value(node: ast.AST, values: dict[str, object]) -> object:
     return _UNKNOWN
 
 
-def _string_set(value: object) -> set[str]:
-    if not isinstance(value, (list, tuple, set, frozenset)):
-        return set()
-    return {item for item in value if isinstance(item, str)}
+def _string_list(init_path: Path, node: ast.AST, value: object) -> list[str]:
+    if not isinstance(value, (list, tuple, set, frozenset)) or not all(isinstance(item, str) for item in value):
+        _unsupported_all(init_path, node, "value")
+    return list(value)

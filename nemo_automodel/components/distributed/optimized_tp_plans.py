@@ -662,7 +662,7 @@ def _parallelize_phi3(
 LLAMA_NEMOTRON_SUPER_TP_PLAN_NAME = "llama_nemotron_super_tp_plan"
 
 
-def _get_class_qualname(cls: type) -> str:
+def get_class_qualname(cls: type) -> str:
     """Return the fully qualified name of a class as ``module.qualname``.
 
     Used as a stable dict key for PARALLELIZE_FUNCTIONS instead of the class
@@ -682,6 +682,9 @@ def _get_class_qualname(cls: type) -> str:
     correctly identifies the model class.
     """
     return f"{cls.__module__}.{cls.__qualname__}"
+
+
+_get_class_qualname = get_class_qualname
 
 
 def _parallelize_qwen3_5_vlm(

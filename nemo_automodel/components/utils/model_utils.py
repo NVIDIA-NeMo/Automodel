@@ -67,7 +67,7 @@ def _get_forward_signature(model: nn.Module) -> inspect.Signature | None:
         return None
 
 
-def _supports_logits_to_keep(model: nn.Module) -> bool:
+def supports_logits_to_keep(model: nn.Module) -> bool:
     """
     Check if the model supports logits_to_keep.
 
@@ -81,7 +81,10 @@ def _supports_logits_to_keep(model: nn.Module) -> bool:
     return sig is not None and "logits_to_keep" in sig.parameters
 
 
-def _supports_seq_lens(model: nn.Module) -> bool:
+_supports_logits_to_keep = supports_logits_to_keep
+
+
+def supports_seq_lens(model: nn.Module) -> bool:
     """
     Check if the model's forward() accepts seq_lens.
 
@@ -103,6 +106,9 @@ def _supports_seq_lens(model: nn.Module) -> bool:
         if param.kind == inspect.Parameter.VAR_KEYWORD:
             return True
     return False
+
+
+_supports_seq_lens = supports_seq_lens
 
 
 # Umbrella of multimodal kwarg names used by VLM forwards across families.

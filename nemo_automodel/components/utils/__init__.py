@@ -13,6 +13,31 @@
 # limitations under the License.
 
 import importlib as _importlib
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .compile_utils import build_compile_config, compile_model, compile_module_inplace
+    from .flops_utils import calculate_mfu, get_flops_formula_for_hf_config, nemotronh_mtp_flops
+    from .model_utils import (
+        VLM_INPUT_KEYS,
+        FreezeConfig,
+        ModuleSelector,
+        apply_parameter_freezing,
+        count_model_parameters,
+        enable_radio_vit_fused_attn,
+        filter_forward_kwargs,
+        freeze_deepseek_v4_indexer_params,
+        freeze_minimax_m3_indexer_params,
+        freeze_unused_kv_sharing_params,
+        init_empty_weights,
+        parse_freeze_config,
+        print_trainable_parameters,
+        resolve_trust_remote_code,
+        skip_random_init,
+        squeeze_input_for_thd,
+        supports_logits_to_keep,
+        supports_seq_lens,
+    )
 
 _LAZY_ATTRS = {
     "FreezeConfig": (".model_utils", "FreezeConfig"),
@@ -31,14 +56,14 @@ _LAZY_ATTRS = {
     "freeze_unused_kv_sharing_params": (".model_utils", "freeze_unused_kv_sharing_params"),
     "get_flops_formula_for_hf_config": (".flops_utils", "get_flops_formula_for_hf_config"),
     "init_empty_weights": (".model_utils", "init_empty_weights"),
-    "nemotronh_mtp_flops": (".flops_utils", "_nemotronh_mtp_flops"),
+    "nemotronh_mtp_flops": (".flops_utils", "nemotronh_mtp_flops"),
     "parse_freeze_config": (".model_utils", "parse_freeze_config"),
     "print_trainable_parameters": (".model_utils", "print_trainable_parameters"),
     "resolve_trust_remote_code": (".model_utils", "resolve_trust_remote_code"),
     "skip_random_init": (".model_utils", "skip_random_init"),
     "squeeze_input_for_thd": (".model_utils", "squeeze_input_for_thd"),
-    "supports_logits_to_keep": (".model_utils", "_supports_logits_to_keep"),
-    "supports_seq_lens": (".model_utils", "_supports_seq_lens"),
+    "supports_logits_to_keep": (".model_utils", "supports_logits_to_keep"),
+    "supports_seq_lens": (".model_utils", "supports_seq_lens"),
 }
 
 __all__ = sorted(_LAZY_ATTRS.keys())

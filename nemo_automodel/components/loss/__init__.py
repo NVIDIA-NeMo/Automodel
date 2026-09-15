@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import importlib as _importlib
+from typing import TYPE_CHECKING
 
 from nemo_automodel.components.loss.loss import (
     LOSS_CONFIG_REGISTRY,
@@ -25,6 +26,28 @@ from nemo_automodel.components.loss.loss import (
     build_loss_config,
     build_loss_module,
 )
+
+if TYPE_CHECKING:
+    from .dllm_loss import (
+        BlockDiffusionCrossEntropyLoss,
+        DFlashDecayLoss,
+        HybridDiffusionLLMLoss,
+        IDLMLoss,
+        MDLMCrossEntropyLoss,
+        SCDDLoss,
+        encoder_ar_loss,
+        scdd_schedule,
+    )
+    from .embedding_distill import EmbeddingDistillLoss, EmbeddingMSELoss, ScoreDistillLoss
+    from .infonce import InfoNCEDistillLoss, InfoNCELoss
+    from .intermediate_distill import IntermediateDistillLoss, LayerCapture
+    from .kd_loss import KDLoss
+    from .linear_ce import FusedLinearCrossEntropy
+    from .listmle import listmle_loss
+    from .masked_ce import MaskedCrossEntropy
+    from .mtp import MTPLossConfig, calculate_mtp_loss
+    from .soft_ce import masked_soft_cross_entropy
+    from .utils import calculate_loss, get_lm_head_weight
 
 __all__ = [
     "LOSS_CONFIG_REGISTRY",
@@ -59,7 +82,7 @@ _LAZY_ATTRS = {
     "calculate_loss": (".utils", "calculate_loss"),
     "calculate_mtp_loss": (".mtp", "calculate_mtp_loss"),
     "encoder_ar_loss": (".dllm_loss", "encoder_ar_loss"),
-    "get_lm_head_weight": (".utils", "_get_lm_head_weight"),
+    "get_lm_head_weight": (".utils", "get_lm_head_weight"),
     "listmle_loss": (".listmle", "listmle_loss"),
     "masked_soft_cross_entropy": (".soft_ce", "masked_soft_cross_entropy"),
     "scdd_schedule": (".dllm_loss", "scdd_schedule"),

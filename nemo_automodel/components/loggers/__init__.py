@@ -13,8 +13,15 @@
 # limitations under the License.
 
 import importlib as _importlib
+from typing import TYPE_CHECKING
 
 from nemo_automodel.components.loggers.loggers import CometConfig, MLflowConfig, WandbConfig
+
+if TYPE_CHECKING:
+    from .log_utils import setup_logging
+    from .metric_logger import DEFAULT_BUFFER_SIZE, MetricsSample, build_metric_logger
+    from .mlflow_utils import end_mlflow_active_run_as_killed, to_float_metrics
+    from .wandb_utils import init_wandb_run, suppress_wandb_log_messages
 
 __all__ = ["CometConfig", "MLflowConfig", "WandbConfig"]
 

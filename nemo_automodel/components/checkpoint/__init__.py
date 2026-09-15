@@ -12,10 +12,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import importlib as _importlib
+from typing import TYPE_CHECKING
 
 from ._torch_backports import apply_async_checkpoint_patch as _nemo__apply_async_patch
 from ._torch_backports import apply_patches as _nemo__apply_patches
 from .config import CheckpointingConfig, _is_geq_torch_2_9, _is_leq_torch_2_7_1
+
+if TYPE_CHECKING:
+    from .addons import save_generated_hf_assets
+    from .checkpointing import (
+        Checkpointer,
+        load_full_state_dict_into_model,
+        load_hf_checkpoint_preserving_dtype,
+        load_hf_safetensors_state_dict,
+        load_torch_ckpt,
+        maybe_adapt_state_dict_to_hf,
+        save_config,
+        save_losses,
+    )
+    from .state_dict_adapter import StateDictAdapter
+    from .utils import (
+        find_latest_checkpoint,
+        get_checkpoint_tensor_dtypes,
+        resolve_restore_from_to_checkpoint_dir,
+    )
 
 __all__ = ["CheckpointingConfig"]
 
@@ -29,15 +49,15 @@ _LAZY_ATTRS = {
     "Checkpointer": (".checkpointing", "Checkpointer"),
     "StateDictAdapter": (".state_dict_adapter", "StateDictAdapter"),
     "find_latest_checkpoint": (".utils", "find_latest_checkpoint"),
-    "get_checkpoint_tensor_dtypes": (".utils", "_get_checkpoint_tensor_dtypes"),
-    "load_full_state_dict_into_model": (".checkpointing", "_load_full_state_dict_into_model"),
-    "load_hf_checkpoint_preserving_dtype": (".checkpointing", "_load_hf_checkpoint_preserving_dtype"),
+    "get_checkpoint_tensor_dtypes": (".utils", "get_checkpoint_tensor_dtypes"),
+    "load_full_state_dict_into_model": (".checkpointing", "load_full_state_dict_into_model"),
+    "load_hf_checkpoint_preserving_dtype": (".checkpointing", "load_hf_checkpoint_preserving_dtype"),
     "load_hf_safetensors_state_dict": (".checkpointing", "load_hf_safetensors_state_dict"),
     "load_torch_ckpt": (".checkpointing", "load_torch_ckpt"),
-    "maybe_adapt_state_dict_to_hf": (".checkpointing", "_maybe_adapt_state_dict_to_hf"),
+    "maybe_adapt_state_dict_to_hf": (".checkpointing", "maybe_adapt_state_dict_to_hf"),
     "resolve_restore_from_to_checkpoint_dir": (".utils", "resolve_restore_from_to_checkpoint_dir"),
     "save_config": (".checkpointing", "save_config"),
-    "save_generated_hf_assets": (".addons", "_save_generated_hf_assets"),
+    "save_generated_hf_assets": (".addons", "save_generated_hf_assets"),
     "save_losses": (".checkpointing", "save_losses"),
 }
 

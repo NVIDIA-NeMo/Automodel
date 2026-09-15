@@ -1906,7 +1906,7 @@ def test_pp_autoconfig_failure_skips_masks(caplog):
     cfg_model = ConfigNode({"pretrained_model_name_or_path": "bad/model"})
     with (
         patch("nemo_automodel.recipes.llm.train_ft.AutoConfig.from_pretrained", side_effect=OSError("not found")),
-        patch("nemo_automodel.components.datasets.utils.add_causal_masks_to_batch") as add_masks,
+        patch("nemo_automodel.components.datasets.add_causal_masks_to_batch") as add_masks,
         caplog.at_level(logging.WARNING),
     ):
         collate_fn = _pp_loader(cfg_model, cfg_dl)
@@ -1932,7 +1932,7 @@ def test_pp_custom_sparse_model_skips_masks(caplog, model_type):
             "nemo_automodel.recipes.llm.train_ft.AutoConfig.from_pretrained",
             return_value=MagicMock(model_type=model_type),
         ),
-        patch("nemo_automodel.components.datasets.utils.add_causal_masks_to_batch") as add_masks,
+        patch("nemo_automodel.components.datasets.add_causal_masks_to_batch") as add_masks,
         caplog.at_level(logging.INFO),
     ):
         collate_fn = _pp_loader(cfg_model, cfg_dl)
@@ -1955,7 +1955,7 @@ def test_pp_autoconfig_success_chains_masks():
 
     with (
         patch("nemo_automodel.recipes.llm.train_ft.AutoConfig.from_pretrained", return_value=MagicMock()),
-        patch("nemo_automodel.components.datasets.utils.add_causal_masks_to_batch", side_effect=mock_add_masks),
+        patch("nemo_automodel.components.datasets.add_causal_masks_to_batch", side_effect=mock_add_masks),
     ):
         collate_fn = _pp_loader(cfg_model, cfg_dl)
 

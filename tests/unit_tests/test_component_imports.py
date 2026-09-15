@@ -13,10 +13,10 @@
 # limitations under the License.
 
 from pathlib import Path
-from unittest.mock import Mock
 
-from tools.component_imports import ComponentImport, find_component_imports
-from tools.import_linter_contracts import ComponentInterfaceContract
+import pytest
+
+from tools.component_imports import find_component_imports
 
 COMPONENTS = {"sample.components.alpha", "sample.components.beta"}
 
@@ -34,7 +34,11 @@ def test_component_imports_allow_symbols_exported_from_package(tmp_path):
     )
     _write(
         tmp_path / "sample/components/beta/__init__.py",
-        '_LAZY_ATTRS = {"PublicName": (".implementation", "PublicName")}\n__all__ = sorted(_LAZY_ATTRS.keys())\n',
+        "from typing import TYPE_CHECKING\n"
+        "if TYPE_CHECKING:\n"
+        "    from .implementation import PublicName\n"
+        '_LAZY_ATTRS = {"PublicName": (".implementation", "PublicName")}\n'
+        "__all__ = sorted(_LAZY_ATTRS.keys())\n",
     )
 
     component_imports = find_component_imports(tmp_path, COMPONENTS)
@@ -155,19 +159,66 @@ def test_component_imports_ignore_same_component_and_type_checking_imports(tmp_p
     assert find_component_imports(tmp_path, COMPONENTS) == []
 
 
-def test_component_contract_skips_importers_absent_from_import_graph():
-    graph = Mock()
-    graph.modules = set()
-    component_import = ComponentImport(
-        path=Path("sample/recipes/train.py"),
-        line_number=1,
-        importer="sample.recipes.train",
-        target_component="sample.components.beta",
-        imported_module="sample.components.beta",
-        imported_names=("PublicName",),
-        violation=None,
+def test_component_imports_require_types_for_lazy_exports(tmp_path):
+    _write(tmp_path / "sample/components/alpha/__init__.py", "")
+    _write(
+        tmp_path / "sample/components/beta/__init__.py",
+        '_LAZY_ATTRS = {"PublicName": (".implementation", "PublicName")}\n__all__ = sorted(_LAZY_ATTRS.keys())\n',
     )
 
-    ComponentInterfaceContract._remove_direct_import(graph, component_import)
+    with pytest.raises(ValueError, match=r"TYPE_CHECKING exports.*missing: PublicName"):
+        find_component_imports(tmp_path, COMPONENTS)
 
-    graph.find_modules_directly_imported_by.assert_not_called()
+
+def test_component_exports_follow_reset_order(tmp_path):
+    _write(tmp_path / "sample/components/alpha/__init__.py", "")
+    _write(
+        tmp_path / "sample/components/beta/__init__.py",
+        '__all__ = ["Old"]\n__all__.append("AlsoOld")\n__all__ = ["PublicName"]\n',
+    )
+    _write(
+        tmp_path / "sample/components/alpha/consumer.py",
+        "from sample.components.beta import AlsoOld, Old, PublicName\n",
+    )
+
+    [component_import] = find_component_imports(tmp_path, COMPONENTS)
+
+    assert component_import.violation == "AlsoOld, Old not exported by sample.components.beta.__all__"
+
+
+def test_component_exports_keep_augmented_values_through_later_expressions(tmp_path):
+    _write(tmp_path / "sample/components/alpha/__init__.py", "")
+    _write(
+        tmp_path / "sample/components/beta/__init__.py",
+        'EXTRA = ["Second"]\n__all__ = ["First"]\n__all__ += EXTRA\n__all__ = sorted(__all__)\n',
+    )
+    _write(
+        tmp_path / "sample/components/alpha/consumer.py",
+        "from sample.components.beta import First, Second\n",
+    )
+
+    [component_import] = find_component_imports(tmp_path, COMPONENTS)
+
+    assert component_import.is_public
+
+
+def test_component_exports_ignore_function_local_mutations(tmp_path):
+    _write(tmp_path / "sample/components/alpha/__init__.py", "")
+    _write(
+        tmp_path / "sample/components/beta/__init__.py",
+        '__all__ = ["PublicName"]\ndef mutate():\n    __all__.append("Nested")\n',
+    )
+    _write(tmp_path / "sample/components/alpha/consumer.py", "from sample.components.beta import Nested\n")
+
+    [component_import] = find_component_imports(tmp_path, COMPONENTS)
+
+    assert component_import.violation == "Nested not exported by sample.components.beta.__all__"
+
+
+def test_component_exports_reject_conditional_mutations(tmp_path):
+    init_path = tmp_path / "sample/components/beta/__init__.py"
+    _write(tmp_path / "sample/components/alpha/__init__.py", "")
+    _write(init_path, '__all__ = []\nif enabled:\n    __all__.append("Conditional")\n')
+
+    with pytest.raises(ValueError, match=rf"{init_path}:2: unsupported __all__ conditional or nested mutation"):
+        find_component_imports(tmp_path, COMPONENTS)

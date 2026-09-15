@@ -13,6 +13,11 @@
 # limitations under the License.
 
 import importlib as _importlib
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ._arg_parser import parse_args_and_load_config
+    from .loader import ConfigNode, config_to_yaml_str, resolve_yaml_env_vars
 
 _LAZY_ATTRS = {
     "ConfigNode": (".loader", "ConfigNode"),

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import importlib as _importlib
+from typing import TYPE_CHECKING
 
 from .dion import build_dion_optimizer, is_dion_optimizer
 from .optimizer import (
@@ -32,6 +33,9 @@ from .optimizer import (
     build_optimizer,
     build_optimizer_config,
 )
+
+if TYPE_CHECKING:
+    from .precision_warnings import warn_if_torch_adam_with_bf16_params
 from .scheduler import OptimizerParamScheduler
 
 __all__ = [

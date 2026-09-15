@@ -15,8 +15,31 @@
 """Training utilities shared across recipes."""
 
 import importlib as _importlib
+from typing import TYPE_CHECKING
 
 from nemo_automodel.components.training.step_scheduler import StepSchedulerConfig
+
+if TYPE_CHECKING:
+    from .ema import EMAManager, ShardedModelEMAManager
+    from .embedding_row_repair import EmbeddingRowRepairConfig
+    from .garbage_collection import GarbageCollection
+    from .model_output_utils import get_final_hidden_states
+    from .neftune import NEFTune
+    from .prewarm import PrewarmConfig
+    from .rng import ScopedRNG, StatefulRNG, init_all_rng
+    from .signal_handler import DistributedSignalHandler
+    from .step_scheduler import StepScheduler
+    from .timers import Timers
+    from .utils import (
+        ScopedModuleOffloading,
+        clip_grad_norm,
+        count_tail_padding,
+        get_expert_tp_replication_factor,
+        prepare_after_first_microbatch,
+        prepare_for_final_backward,
+        prepare_for_grad_accumulation,
+        scale_grads_and_clip_grad_norm,
+    )
 
 __all__ = ["StepSchedulerConfig"]
 

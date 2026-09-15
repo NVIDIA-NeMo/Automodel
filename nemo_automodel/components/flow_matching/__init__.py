@@ -20,6 +20,12 @@ diffusion models using the flow matching objective.
 """
 
 import importlib
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .adapters import FlowMatchingContext, FluxAdapter, HunyuanAdapter, ModelAdapter, SimpleAdapter
+    from .adapters.hunyuan import enable_hunyuan_flash_varlen_mask_optimization
+    from .pipeline import FlowMatchingPipeline, create_adapter, create_pipeline
 
 _LAZY_ATTRS = {
     "FlowMatchingPipeline": (".pipeline", "FlowMatchingPipeline"),

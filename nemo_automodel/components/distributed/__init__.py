@@ -29,7 +29,101 @@ from nemo_automodel.components.distributed.mesh_utils import get_fsdp_dp_mesh
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
 
 if TYPE_CHECKING:
-    from nemo_automodel.components.distributed.context_parallel.magi import make_magi_attn_func
+    from nemo_automodel.components.distributed.activation_checkpointing import (
+        SELECTIVE_AC_WRAPPER_FLAG,
+        apply_selective_checkpointing_to_layers,
+        apply_submodule_checkpointing,
+        ensure_fsdp_ops_sac_ignored,
+        ensure_profiler_ops_sac_ignored,
+        is_selective_activation_checkpointing,
+        make_selective_checkpoint_context_fn,
+        sdpa_backend_snapshot_context_fn,
+        transformer_engine_attention_backend_snapshot_context_fn,
+        unwrap_checkpoint_wrapper,
+    )
+    from nemo_automodel.components.distributed.blockdiag_cp import (
+        BlockdiagCpModelState,
+        cp_blockdiag_sdpa,
+        current_blockdiag_cp_state,
+        make_cp_blockdiag_batch_and_ctx,
+    )
+    from nemo_automodel.components.distributed.config import (
+        DistributedStrategyConfig,
+        MultimodalVisionConfig,
+        normalize_activation_checkpointing_scope,
+        resolve_strategy_config,
+    )
+    from nemo_automodel.components.distributed.context_parallel.magi import (
+        MagiState,
+        make_magi_attn_func,
+        setup_magi,
+    )
+    from nemo_automodel.components.distributed.context_parallel.mamba import MambaContextParallel
+    from nemo_automodel.components.distributed.context_parallel.sharder import (
+        ContextParallelSharder,
+        ShardLayout,
+        contiguous_local_indices,
+        convert_attention_mask_to_padding_mask,
+        round_robin_local_indices,
+        shard_batch_aux_only,
+        shard_batch_contiguous,
+        shard_sequence_for_cp_contiguous,
+        shard_sequence_for_cp_round_robin,
+    )
+    from nemo_automodel.components.distributed.context_parallel.utils import (
+        attach_context_parallel_hooks,
+        attach_cp_sdpa_hooks,
+        attach_te_context_parallel,
+        cp_dispatcher_suspended,
+        unshard_context_parallel_tensor,
+    )
+    from nemo_automodel.components.distributed.cp_vision_frame_shard import (
+        CpVisionFrameShardingConfig,
+        cp_vision_frame_sharding_active,
+        maybe_distribute_visual,
+        reset_cp_vision_group,
+        set_cp_vision_group,
+    )
+    from nemo_automodel.components.distributed.ddp import DDPManager
+    from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager, fsdp2_sharding_enabled
+    from nemo_automodel.components.distributed.init_utils import get_local_world_size_preinit, get_world_size_safe
+    from nemo_automodel.components.distributed.megatron_fsdp import (
+        MegatronFSDPManager,
+        maybe_shard_optimizer,
+        restore_distributed_param_attrs,
+        snapshot_distributed_param_attrs,
+    )
+    from nemo_automodel.components.distributed.mesh_utils import create_ring_ulysses_mesh, get_flat_mesh, get_submesh
+    from nemo_automodel.components.distributed.optimized_tp_plans import PARALLELIZE_FUNCTIONS, get_class_qualname
+    from nemo_automodel.components.distributed.parallel_styles import ReplicatedWithGradAllReduce, translate_to_lora
+    from nemo_automodel.components.distributed.parallelizer import (
+        PARALLELIZATION_STRATEGIES,
+        DefaultParallelizationStrategy,
+        HunyuanParallelizationStrategy,
+        WanParallelizationStrategy,
+        get_model_layer_groups,
+        get_parallel_plan,
+        register_parallel_strategy,
+    )
+    from nemo_automodel.components.distributed.parallelizer_utils import (
+        configure_fsdp_unused_param_reduction,
+        fully_shard_by_dtype,
+        get_internal_fsdp_mp_policy,
+        reject_unsupported_mtp_cp,
+        reject_unsupported_mtp_cp_pp,
+    )
+    from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPipeline
+    from nemo_automodel.components.distributed.pipelining.hf_utils import MULTIMODAL_SUFFIXES, get_text_module
+    from nemo_automodel.components.distributed.thd_utils import (
+        split_batch_into_thd_chunks,
+        thd_padding_mask_from_token_ids,
+    )
+    from nemo_automodel.components.distributed.tp_replicas import (
+        broadcast_tp_replicas,
+        exclude_from_tp_replica_sync,
+        synchronize_tp_replica_gradients,
+    )
+    from nemo_automodel.components.distributed.utils import FirstRankPerNode, dp_eval_sample_shard, get_sync_ctx
 
 __all__ = [
     "DDPConfig",
@@ -88,12 +182,12 @@ _LAZY_ATTRS = {
     "exclude_from_tp_replica_sync": (".tp_replicas", "exclude_from_tp_replica_sync"),
     "fsdp2_sharding_enabled": (".fsdp2", "fsdp2_sharding_enabled"),
     "fully_shard_by_dtype": (".parallelizer_utils", "fully_shard_by_dtype"),
-    "get_class_qualname": (".optimized_tp_plans", "_get_class_qualname"),
+    "get_class_qualname": (".optimized_tp_plans", "get_class_qualname"),
     "get_flat_mesh": (".mesh_utils", "get_flat_mesh"),
     "get_internal_fsdp_mp_policy": (".parallelizer_utils", "get_internal_fsdp_mp_policy"),
     "get_local_world_size_preinit": (".init_utils", "get_local_world_size_preinit"),
     "get_model_layer_groups": (".parallelizer", "get_model_layer_groups"),
-    "get_parallel_plan": (".parallelizer", "_get_parallel_plan"),
+    "get_parallel_plan": (".parallelizer", "get_parallel_plan"),
     "get_submesh": (".mesh_utils", "get_submesh"),
     "get_sync_ctx": (".utils", "get_sync_ctx"),
     "get_text_module": (".pipelining.hf_utils", "get_text_module"),
@@ -109,7 +203,7 @@ _LAZY_ATTRS = {
     "reject_unsupported_mtp_cp": (".parallelizer_utils", "reject_unsupported_mtp_cp"),
     "reject_unsupported_mtp_cp_pp": (".parallelizer_utils", "reject_unsupported_mtp_cp_pp"),
     "reset_cp_vision_group": (".cp_vision_frame_shard", "reset_cp_vision_group"),
-    "resolve_strategy_config": (".config", "_resolve_strategy_config"),
+    "resolve_strategy_config": (".config", "resolve_strategy_config"),
     "restore_distributed_param_attrs": (".megatron_fsdp", "restore_distributed_param_attrs"),
     "round_robin_local_indices": (".context_parallel.sharder", "round_robin_local_indices"),
     "sdpa_backend_snapshot_context_fn": (".activation_checkpointing", "sdpa_backend_snapshot_context_fn"),

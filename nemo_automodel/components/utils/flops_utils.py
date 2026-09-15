@@ -588,7 +588,7 @@ def _nemotronh_moe_layer_flops(config, gbs, seq_len):
     return routed_expert_flops + shared_expert_flops + gate_flops + latent_proj_flops
 
 
-def _nemotronh_mtp_flops(config, gbs, seq_len, num_mtp_layers, mtp_block_types, use_repeated_layer):
+def nemotronh_mtp_flops(config, gbs, seq_len, num_mtp_layers, mtp_block_types, use_repeated_layer):
     """Model FLOPs for the Multi-Token-Prediction (MTP) head of Nemotron-3 Super/Ultra.
 
     The head predicts ``num_mtp_layers`` (N) additional tokens. Each of the N depths runs
@@ -635,6 +635,9 @@ def _nemotronh_mtp_flops(config, gbs, seq_len, num_mtp_layers, mtp_block_types, 
     lm_head_flops = num_mtp_layers * 6 * num_tokens * hs * vocab_size
 
     return block_flops + eh_proj_flops + lm_head_flops
+
+
+_nemotronh_mtp_flops = nemotronh_mtp_flops
 
 
 def _non_mla_attn_layer_flops(config, gbs, seq_len):
