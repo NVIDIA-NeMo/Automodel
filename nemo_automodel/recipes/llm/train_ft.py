@@ -484,11 +484,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         Raises:
             NotImplemented: Raises if it tries to restore a checkpoint; will be removed.
         """
-        torch.cuda.reset_peak_memory_stats()
         self.dist_env = initialize_distributed(
             backend=self.cfg.get("dist_env", {}).get("backend", "nccl"),
             timeout_minutes=self.cfg.get("dist_env", {}).get("timeout_minutes", 1),
         )
+        # Select and initialize this rank's GPU before accessing allocator statistics.
+        torch.cuda.reset_peak_memory_stats()
         # setups logging and adds the rankfilter to logging
         setup_logging()
 
