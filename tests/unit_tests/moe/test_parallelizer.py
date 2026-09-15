@@ -1682,46 +1682,41 @@ def test_resolve_moe_tp_plan_rejects_sequence_parallel_fail_closed(monkeypatch):
         )
 
 
-def test_resolve_moe_tp_plan_uses_registered_factory_without_dense_fallback(monkeypatch):
+def test_resolve_moe_tp_plan_uses_declared_plan_without_dense_fallback(monkeypatch):
     P = _import_parallelizer_with_stubs(monkeypatch)
     parallelizer_stub = types.ModuleType("nemo_automodel.components.distributed.parallelizer")
-    factory = MagicMock(return_value={"lm_head": object()})
-    parallelizer_stub.query_parallel_spec = lambda model: types.SimpleNamespace(tp_plan=factory)
+    declared = {"lm_head": object()}
+    parallelizer_stub.query_parallel_spec = lambda model: types.SimpleNamespace(
+        resolved_tp_plan=lambda sequence_parallel=False: dict(declared)
+    )
     monkeypatch.setitem(
         sys.modules,
         "nemo_automodel.components.distributed.parallelizer",
         parallelizer_stub,
     )
-
-    model = type("RegisteredMoe", (), {})()
     plan = P._resolve_moe_tp_plan(
-        model,
+        type("RegisteredMoe", (), {})(),
         sequence_parallel=False,
         tp_shard_plan=None,
         tp_size=2,
     )
-
     assert set(plan) == {"lm_head"}
-    factory.assert_called_once_with(model, False)
 
 
-def test_resolve_moe_tp_plan_propagates_registered_factory_failure(monkeypatch):
+def test_resolve_moe_tp_plan_requires_a_declared_plan(monkeypatch):
     P = _import_parallelizer_with_stubs(monkeypatch)
     parallelizer_stub = types.ModuleType("nemo_automodel.components.distributed.parallelizer")
-
-    def broken_factory(model, sequence_parallel):
-        raise RuntimeError("architecture-specific plan failed")
-
-    parallelizer_stub.query_parallel_spec = lambda model: types.SimpleNamespace(tp_plan=broken_factory)
+    parallelizer_stub.query_parallel_spec = lambda model: types.SimpleNamespace(
+        resolved_tp_plan=lambda sequence_parallel=False: None
+    )
     monkeypatch.setitem(
         sys.modules,
         "nemo_automodel.components.distributed.parallelizer",
         parallelizer_stub,
     )
-
-    with pytest.raises(ValueError, match="architecture-specific plan failed"):
+    with pytest.raises(ValueError, match="No safe tensor-parallel plan"):
         P._resolve_moe_tp_plan(
-            type("BrokenMoe", (), {})(),
+            type("UndeclaredMoe", (), {})(),
             sequence_parallel=False,
             tp_shard_plan=None,
             tp_size=2,

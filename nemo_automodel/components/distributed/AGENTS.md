@@ -52,8 +52,10 @@ class NewModelForCausalLM(HFCheckpointingMixin, nn.Module):
     parallel_spec: ParallelSpec = ParallelSpec(tp_plan=_new_model_tp_plan)
 ```
 
-`ParallelSpec` (`parallel_spec.py`) carries the TP plan, layer groups, text-config
-path, HF `_tp_plan` root, validators and strategy override; `parallelizer.py` only
+`ParallelSpec` (`parallel_spec.py`) is pure data: the TP plan and its sequence-parallel
+overlay as dictionaries, layer groups, text-config path, HF `_tp_plan` root, the
+`sharded_output_only` constraint and the strategy override (the one place for instance-dependent
+behaviour); `parallelizer.py` only
 ever reads the `parallel_spec` class attribute (`query_parallel_spec`); activation checkpointing
 has its own `ActivationCheckpointingSpec` (`activation_checkpointing.py`, read from the separate
 `activation_checkpointing_spec` attribute by `query_activation_checkpointing_spec`). Architectures

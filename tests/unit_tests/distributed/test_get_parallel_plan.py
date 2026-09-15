@@ -38,8 +38,8 @@ from nemo_automodel._transformers.model_init import _get_mixin_wrapped_class
 from nemo_automodel.components.distributed.optimized_tp_plans import LLAMA_NEMOTRON_SUPER_TP_PLAN_NAME
 from nemo_automodel.components.distributed.parallel_spec import ParallelSpec
 from nemo_automodel.components.distributed.parallelizer import _get_parallel_plan
-from nemo_automodel.components.models.llama.parallelization import get_llama_nemotron_super_tp_plan
-from nemo_automodel.components.models.nemotron_nas.parallelization import get_decilm_nemotron_tp_plan
+from nemo_automodel.components.models.llama.parallelization import LLAMA_PARALLEL_SPEC
+from nemo_automodel.components.models.nemotron_nas.parallelization import DeciLMForCausalLM as DeciLMDeclaration
 
 
 class _DummyModel:
@@ -136,26 +136,38 @@ def test_optimised_plan_success(monkeypatch):
     plan = {"opt": "plan"}
 
     # Register dummy entry
-    monkeypatch.setattr(_DummyModel, "parallel_spec", ParallelSpec(tp_plan=lambda m, sp: plan), raising=False)
+    monkeypatch.setattr(_DummyModel, "parallel_spec", ParallelSpec(tp_plan=plan), raising=False)
     _set_global_model_cls(monkeypatch, _DummyModel)
 
     result = _get_parallel_plan(_DummyModel(), sequence_parallel=False)
-    assert result is plan
+    assert result == plan
+    assert result is not plan  # the declaration is handed out as a copy
 
 
-def test_optimised_plan_fallback_to_hf(monkeypatch):
-    """If the optimised function raises, the helper should fallback to HF plan."""
-    sentinel = {"hf": "plan"}
-
-    def _broken_fn(model, seq):  # noqa: D401
-        raise RuntimeError("fail")
-
-    monkeypatch.setattr(_DummyModel, "parallel_spec", ParallelSpec(tp_plan=_broken_fn), raising=False)
-    monkeypatch.setattr(parallelizer, "get_hf_tp_shard_plan", lambda m: sentinel, raising=True)
+def test_declared_plan_wins_over_hf(monkeypatch):
+    """A declared plan is used even when the model also carries a translatable HF ``_tp_plan``."""
+    plan = {"opt": "plan"}
+    monkeypatch.setattr(_DummyModel, "parallel_spec", ParallelSpec(tp_plan=plan), raising=False)
+    monkeypatch.setattr(parallelizer, "get_hf_tp_shard_plan", lambda m: {"hf": "plan"}, raising=True)
     _set_global_model_cls(monkeypatch, _DummyModel)
+    assert _get_parallel_plan(_DummyModel(), sequence_parallel=False) == plan
 
-    result = _get_parallel_plan(_DummyModel(), sequence_parallel=False)
-    assert result is sentinel
+
+def test_sequence_parallel_overlay_and_missing_overlay_warning(monkeypatch, caplog):
+    """SP overlays the declared plan; a spec without an overlay logs that the request is ignored."""
+    base = {"lm_head": "base_head", "model.layers.*.mlp.down_proj": "down"}
+    overlay = {"lm_head": "sp_head", "model.norm": "norm"}
+    monkeypatch.setattr(
+        _DummyModel, "parallel_spec", ParallelSpec(tp_plan=base, sequence_parallel_plan=overlay), raising=False
+    )
+    _set_global_model_cls(monkeypatch, _DummyModel)
+    assert _get_parallel_plan(_DummyModel(), sequence_parallel=True) == {**base, **overlay}
+    assert _get_parallel_plan(_DummyModel(), sequence_parallel=False) == base
+
+    monkeypatch.setattr(_DummyModel, "parallel_spec", ParallelSpec(tp_plan=base), raising=False)
+    with caplog.at_level("WARNING"):
+        assert _get_parallel_plan(_DummyModel(), sequence_parallel=True) == base
+    assert "declares no sequence-parallel plan" in caplog.text
 
 
 # 4. HF plan is used when no optimised plan exists
@@ -178,42 +190,6 @@ def test_hf_fallback_sequence_parallel_assert(monkeypatch):
     assert isinstance(result, dict)
     # SP-adjusted entries should be present
     assert "model.norm" in result
-
-
-def test_optimised_plan_and_hf_both_fail_raises_sp_false(monkeypatch):
-    """Optimised plan raises and HF raises → runtime error (SP=False)."""
-
-    def _broken_fn(model, seq):
-        raise RuntimeError("fail")
-
-    monkeypatch.setattr(_DummyModel, "parallel_spec", ParallelSpec(tp_plan=_broken_fn), raising=False)
-
-    def _raise_hf(_model):
-        raise RuntimeError("hf fail")
-
-    monkeypatch.setattr(parallelizer, "get_hf_tp_shard_plan", _raise_hf, raising=True)
-    _set_global_model_cls(monkeypatch, _DummyModel)
-
-    with pytest.raises(RuntimeError, match="hf fail"):
-        _get_parallel_plan(_DummyModel(), sequence_parallel=False)
-
-
-def test_optimised_plan_and_hf_both_fail_assert_sp_true(monkeypatch):
-    """Optimised plan raises then HF path asserts (SP=True)."""
-
-    def _broken_fn(model, seq):
-        raise RuntimeError("fail")
-
-    monkeypatch.setattr(_DummyModel, "parallel_spec", ParallelSpec(tp_plan=_broken_fn), raising=False)
-
-    def _raise_hf2(_model):
-        raise RuntimeError("hf fail")
-
-    monkeypatch.setattr(parallelizer, "get_hf_tp_shard_plan", _raise_hf2, raising=True)
-    _set_global_model_cls(monkeypatch, _DummyModel)
-
-    with pytest.raises(RuntimeError, match="hf fail"):
-        _get_parallel_plan(_DummyModel(), sequence_parallel=True)
 
 
 def test_not_registered_and_hf_fail_base_plan(monkeypatch):
@@ -413,7 +389,7 @@ def test_named_plan_constant_value():
 
 class TestGetLlamaNemotronSuperTpPlan:
     def test_returns_expected_keys(self):
-        plan = get_llama_nemotron_super_tp_plan(sequence_parallel=False)
+        plan = LLAMA_PARALLEL_SPEC.resolved_tp_plan(sequence_parallel=False)
         assert isinstance(plan, dict)
         assert "model.embed_tokens" in plan
         assert "model.layers.*.self_attn.qkv_proj" in plan
@@ -423,7 +399,7 @@ class TestGetLlamaNemotronSuperTpPlan:
         assert "lm_head" in plan
 
     def test_sp_adds_norm_and_layernorm_entries(self):
-        plan = get_llama_nemotron_super_tp_plan(sequence_parallel=True)
+        plan = LLAMA_PARALLEL_SPEC.resolved_tp_plan(sequence_parallel=True)
         assert "model.norm" in plan
         assert "model.layers.*.input_layernorm" in plan
         assert "model.layers.*.post_attention_layernorm" in plan
@@ -431,7 +407,7 @@ class TestGetLlamaNemotronSuperTpPlan:
 
 class TestGetDecilmNemotronTpPlan:
     def test_returns_separate_qkv_projections(self):
-        plan = get_decilm_nemotron_tp_plan(sequence_parallel=False)
+        plan = DeciLMDeclaration.parallel_spec.resolved_tp_plan(sequence_parallel=False)
         assert isinstance(plan, dict)
         assert "model.layers.*.self_attn.q_proj" in plan
         assert "model.layers.*.self_attn.k_proj" in plan
@@ -446,7 +422,7 @@ class TestGetDecilmNemotronTpPlan:
         assert "model.layers.*.mlp.gate_up_proj" not in plan
 
     def test_sp_adds_norm_entries(self):
-        plan = get_decilm_nemotron_tp_plan(sequence_parallel=True)
+        plan = DeciLMDeclaration.parallel_spec.resolved_tp_plan(sequence_parallel=True)
         assert "model.norm" in plan
         assert "model.layers.*.input_layernorm" in plan
 

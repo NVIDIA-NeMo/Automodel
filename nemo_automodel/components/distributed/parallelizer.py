@@ -361,12 +361,11 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                     _has_kv_sharing,
                     enable_compile=enable_compile,
                 )
-            elif (
-                ac_scopes == ("all",)
-                and (apply_model_owned_ac := query_activation_checkpointing_spec(model).apply) is not None
-                and apply_model_owned_ac(model)
-            ):
-                logger.info("Using model-owned full-layer activation checkpointing; skipping submodule wrappers.")
+            elif query_activation_checkpointing_spec(model).granularity == "layer":
+                apply_full_layer_checkpointing_to_layers(model, ac_layers)
+                logger.info(
+                    "Using the model's declared whole-layer activation checkpointing; skipping submodule wrappers."
+                )
             elif enable_compile:
                 # NO_REENTRANT is required for compile: REENTRANT's first forward runs under
                 # no_grad, causing AOT autograd to trace a forward-only graph that drops LoRA
@@ -729,6 +728,18 @@ def apply_fsdp2_sharding_recursively(
             )
 
 
+def has_hf_tp_plan(model: nn.Module) -> bool:
+    """Whether :func:`get_hf_tp_shard_plan` has a HuggingFace ``_tp_plan`` to translate.
+
+    Mirrors its sources: the class, the instance, and the text-model roots named by
+    ``ParallelSpec.hf_tp_plan_prefix``.
+    """
+    if getattr(type(model), "_tp_plan", None) is not None or getattr(model, "_tp_plan", None) is not None:
+        return True
+    roots = _reduce_attrs(model, list(query_parallel_spec(model).hf_tp_plan_prefix))
+    return any(getattr(root, "_tp_plan", None) is not None for root in roots)
+
+
 def get_hf_tp_shard_plan(model):
     """Get the Hugging Face tensor parallel plan from the model.
 
@@ -972,17 +983,13 @@ def validate_tp_mesh(model, tp_mesh):
         return  # if tp_mesh.size() == 1, we don't need to validate
 
     spec = query_parallel_spec(model)
-    if spec.validate_tp is not None:
-        spec.validate_tp(model, tp_mesh.size())
-        return
-
     # VLMs keep the attention head counts on a nested text config.
     if spec.text_config_path is not None:
         config = reduce(getattr, spec.text_config_path.split("."), model)
     else:
         config = getattr(model, "config", None)
-    num_attention_heads = getattr(config, "num_attention_heads", 0)
-    num_key_value_heads = getattr(config, "num_key_value_heads", 0)
+    num_attention_heads = getattr(config, "num_attention_heads", None) or 0
+    num_key_value_heads = getattr(config, "num_key_value_heads", None) or 0
 
     # TP sharding with enhanced plan generation
     # Validate that attention heads are divisible by TP size
@@ -1334,7 +1341,7 @@ def _get_parallel_plan(
 
     Priority order:
     1) If ``tp_shard_plan`` is provided as a dict or import path, use it.
-    2) If the model's ``ParallelSpec`` declares a ``tp_plan``, use it; on failure, fall back to HF plan.
+    2) If the model's ``ParallelSpec`` declares a ``tp_plan``, use it (with its sequence-parallel overlay).
     The legacy ``llama_nemotron_super_tp_plan`` alias is treated as "not provided" with a warning.
     3) Otherwise, prefer the model's HF-native ``_tp_plan`` (via ``get_hf_tp_shard_plan``).
     4) Otherwise, fall back to the default base plan.
@@ -1398,13 +1405,14 @@ def _get_parallel_plan(
                 f"Error: {e}"
             )
 
-    elif (func := spec.tp_plan) is not None:
-        try:
-            model_parallel_plan = func(model, sequence_parallel)
-            logger.info(f"Using optimized parallel plan for {model_cls.__name__}.")
-        except Exception as e:
-            logger.info(f"Optimized parallel plan not available: {e}. Falling back to the HF tp plan.")
-            model_parallel_plan = get_hf_tp_shard_plan(model)
+    elif (declared_plan := spec.resolved_tp_plan(sequence_parallel)) is not None:
+        if sequence_parallel and spec.sequence_parallel_plan is None:
+            logger.warning(
+                "%s declares no sequence-parallel plan; sequence_parallel=True is ignored for its tensor-parallel plan.",
+                model_cls.__name__,
+            )
+        model_parallel_plan = declared_plan
+        logger.info(f"Using optimized parallel plan for {model_cls.__name__}.")
 
     else:
         # Try HF's per-model _tp_plan first — it correctly handles multimodal
@@ -1490,8 +1498,18 @@ def _get_parallel_plan(
             model_parallel_plan = base_model_tp_plan
             logger.info("Using default base TP plan. Compatible with huggingface llama3-style models.")
 
-    if spec.adjust_tp_plan is not None:
-        model_parallel_plan = spec.adjust_tp_plan(model, model_parallel_plan)
+    for fqn in spec.sharded_output_only:
+        style = model_parallel_plan.get(fqn)
+        if style is None:
+            continue
+        output_layouts = getattr(style, "output_layouts", ())
+        if not isinstance(output_layouts, (tuple, list)):
+            output_layouts = (output_layouts,)
+        if not any(isinstance(layout, Shard) for layout in output_layouts):
+            model_parallel_plan.pop(fqn)
+            logger.info(
+                "Dropped the %s entry of the plan for %s: it requires a sharded output.", fqn, model_cls.__name__
+            )
 
     # EP=1 uses this generic FSDP2 path rather than the dedicated MoE
     # parallelizer. Apply the same routed-expert ownership validation here so

@@ -30,34 +30,41 @@ correctly needs **no** spec. Declare one when any of the following is true:
 
 | Symptom | Field to set |
 |---|---|
-| The optimized TP plan differs from HF's `_tp_plan` / the base plan (fused QKV, extra projections, replicated mixers, MLP-only sharding). | `tp_plan` |
+| The optimized TP plan differs from HF's `_tp_plan` / the base plan (fused QKV, extra projections, replicated mixers, MLP-only sharding). | `tp_plan`, plus `sequence_parallel_plan` when the architecture has a sequence-parallel variant |
 | Transformer blocks are not at `model.layers`, or there are several groups (language + vision towers). | `layer_groups` |
 | `num_attention_heads` / `num_key_value_heads` live on a nested config (`config.text_config`, `model.language_model.config`). | `text_config_path` |
 | HF `_tp_plan` keys are relative to a submodule other than `model` (VLM text backbones). | `hf_tp_plan_prefix` |
-| TP validity depends on more than head divisibility (per-layer head counts, block configs). | `validate_tp` |
-| The final plan must be post-processed whatever its source (e.g. a normalized `lm_head`). | `adjust_tp_plan` |
+| A head's plan entry is only valid with a sharded output (e.g. weight-normalized logits). | `sharded_output_only` |
 | Whole logical layers must be checkpointed instead of the generic submodule wrappers. | Not a `ParallelSpec` field: declare an `activation_checkpointing_spec` (see below). |
-| The FSDP2 flow itself must change (mixed-dtype sharding, model-owned CP mesh, custom `fully_shard`). | `strategy` |
+| The FSDP2 flow itself must change, or TP validity depends on the instance (per-layer block configs, per-variant plans). | `strategy` |
 
 ## `ParallelSpec`
 
 `ParallelSpec` is a frozen dataclass in `nemo_automodel.components.distributed.parallel_spec`.
-Every field defaults to the generic behaviour, so a spec only states what differs.
+Every field defaults to the generic behaviour, so a spec only states what differs — and every field
+is **data** (dictionaries of `ParallelStyle`, module names, paths). A spec never carries a function:
+behaviour that depends on the model instance belongs in a `ParallelizationStrategy`.
 
 | Field | Type | Default | Consumed by |
 |---|---|---|---|
-| `tp_plan` | `(model, sequence_parallel) -> dict[str, ParallelStyle]` | `None` → HF `_tp_plan`, then the base plan | `_get_parallel_plan` |
-| `adjust_tp_plan` | `(model, plan) -> plan` | `None` | `_get_parallel_plan`, after the plan is chosen from any source |
+| `tp_plan` | `dict[str, ParallelStyle]` | `None` → HF `_tp_plan`, then the base plan | `_get_parallel_plan` |
+| `sequence_parallel_plan` | `dict[str, ParallelStyle]` overlaid on `tp_plan` when SP is requested | `None` → SP request is ignored with a warning | `_get_parallel_plan` via `spec.resolved_tp_plan(sequence_parallel)` |
 | `layer_groups` | `dict[str, tuple[str, ...]]` — role → candidate module FQNs | `None` → `model.layers` / largest `ModuleList` | FSDP2 per-layer wrapping, activation checkpointing scopes |
 | `text_config_path` | dotted attribute path from the model | `None` → `model.config` | `validate_tp_mesh` head-divisibility check |
 | `hf_tp_plan_prefix` | candidate submodule FQNs | `("model",)` | `get_hf_tp_shard_plan` |
-| `validate_tp` | `(model, tp_size) -> None` | `None` → generic head check | `validate_tp_mesh` |
+| `sharded_output_only` | module FQNs | `()` | `_get_parallel_plan`, after the plan is chosen from any source: an entry for one of these modules is dropped unless its output is sharded |
 | `strategy` | `ParallelizationStrategy` instance | `None` → `DefaultParallelizationStrategy` | `fsdp2_strategy_parallelize` |
 
 Candidate tuples (`layer_groups` values, `hf_tp_plan_prefix`) are tried in order and the first
 FQN that resolves wins, so one spec covers several `transformers` module-tree layouts without
 version gating. Put the canonical path first: standardized 4.x releases keep deprecated alias
 properties (`language_model`, `visual`) that also resolve.
+
+`spec.resolved_tp_plan(sequence_parallel)` is the plan the parallelizer applies: `tp_plan` with
+`sequence_parallel_plan` overlaid, with every style shallow-copied so the shared declaration is
+never mutated (LoRA translation rewrites a style's class in place). Plans are `parallelize_module`
+inputs: module FQNs with `*` wildcards; keys that match nothing (e.g. the fused `qkv_proj` of a
+native model on a separate-projection checkpoint) are simply unused.
 
 <Note>
 The attribute is inherited by every subclass, including the wrapper classes NeMo AutoModel
@@ -74,33 +81,33 @@ from `nemo_automodel.components.distributed.optimized_tp_plans`.
 
 ```python
 # components/models/llama/parallelization.py
-from torch import nn
-from torch.distributed.tensor.parallel import ColwiseParallel, ParallelStyle, RowwiseParallel
+from torch.distributed.tensor.parallel import ColwiseParallel, ParallelStyle, RowwiseParallel, SequenceParallel
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
 from nemo_automodel.components.distributed.optimized_tp_plans import VocabParallelEmbedding
 from nemo_automodel.components.distributed.parallel_spec import ParallelSpec
 
+# Abridged: the shipped plan also covers the fused qkv_proj / gate_up_proj variants.
+LLAMA_TP_PLAN: dict[str, ParallelStyle] = {
+    "model.embed_tokens": RowwiseParallel(input_layouts=Replicate()),
+    "model.layers.*.self_attn.q_proj": ColwiseParallel(),
+    "model.layers.*.self_attn.k_proj": ColwiseParallel(),
+    "model.layers.*.self_attn.v_proj": ColwiseParallel(),
+    "model.layers.*.self_attn.o_proj": RowwiseParallel(),
+    "model.layers.*.mlp.gate_proj": ColwiseParallel(),
+    "model.layers.*.mlp.up_proj": ColwiseParallel(),
+    "model.layers.*.mlp.down_proj": RowwiseParallel(),
+    "lm_head": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
+}
 
-def llama_tp_plan(model: nn.Module | None, sequence_parallel: bool = False) -> dict[str, ParallelStyle]:
-    # Abridged: the shipped plan also covers the fused qkv_proj / gate_up_proj variants.
-    plan = {
-        "model.embed_tokens": RowwiseParallel(input_layouts=Replicate()),
-        "model.layers.*.self_attn.q_proj": ColwiseParallel(),
-        "model.layers.*.self_attn.k_proj": ColwiseParallel(),
-        "model.layers.*.self_attn.v_proj": ColwiseParallel(),
-        "model.layers.*.self_attn.o_proj": RowwiseParallel(),
-        "model.layers.*.mlp.gate_proj": ColwiseParallel(),
-        "model.layers.*.mlp.up_proj": ColwiseParallel(),
-        "model.layers.*.mlp.down_proj": RowwiseParallel(),
-        "lm_head": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
-    }
-    if sequence_parallel:
-        plan.update({...})  # SequenceParallel / all-gather variants of the norms and projections
-    return plan
+# Overlaid on LLAMA_TP_PLAN when sequence parallelism is requested.
+LLAMA_SEQUENCE_PARALLEL_PLAN: dict[str, ParallelStyle] = {
+    "model.norm": SequenceParallel(),
+    "model.layers.*.self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1), use_local_output=False),
+    ...
+}
 
-
-LLAMA_PARALLEL_SPEC = ParallelSpec(tp_plan=llama_tp_plan)
+LLAMA_PARALLEL_SPEC = ParallelSpec(tp_plan=LLAMA_TP_PLAN, sequence_parallel_plan=LLAMA_SEQUENCE_PARALLEL_PLAN)
 ```
 
 ```python
@@ -109,16 +116,15 @@ class LlamaForCausalLM(HFCheckpointingMixin, nn.Module):
     parallel_spec: ParallelSpec = LLAMA_PARALLEL_SPEC
 ```
 
-Plan keys are module FQNs with `*` wildcards, exactly as `torch.distributed.tensor.parallel.parallelize_module`
-expects; `sequence_parallel` is passed through from `FSDP2Config.sequence_parallel`. A plan that
-only needs HF's own `_tp_plan` can delegate:
-`return parallelizer.get_hf_tp_shard_plan(model)`.
+`FSDP2Config.sequence_parallel` selects the overlay. An architecture whose plan *is* HF's own
+`_tp_plan` declares no `tp_plan` at all (Qwen3.5 does this: its GatedDeltaNet layers are not
+TP-shardable, so transformers' `base_model_tp_plan` is exactly right) and the parallelizer
+translates the HF plan.
 
 A VLM usually needs the tree described as well:
 
 ```python
 QWEN3_5_VLM_PARALLEL_SPEC = ParallelSpec(
-    tp_plan=qwen3_5_tp_plan,
     layer_groups={"language": ("model.language_model.layers",), "vision": ("model.visual.blocks",)},
     hf_tp_plan_prefix=("model.language_model",),
     strategy=Qwen3_5ParallelizationStrategy(),
@@ -127,10 +133,12 @@ QWEN3_5_VLM_PARALLEL_SPEC = ParallelSpec(
 
 ### Override the Flow With a Strategy
 
-Set `strategy` only when the generic FSDP2 flow itself is wrong for the architecture.
-Subclass `DefaultParallelizationStrategy` and call `super().parallelize(...)`, typically to
-validate before sharding, to install a model-owned mesh afterwards, or to pass a custom
-`fully_shard_fn`:
+Set `strategy` when the generic FSDP2 flow itself is wrong for the architecture, or when a
+decision depends on the model *instance* rather than its class: per-layer head-count validation
+(Nemotron-NAS block configs), a plan that differs per checkpoint variant or carries per-instance
+state (Gemma 4). Subclass `DefaultParallelizationStrategy` and call `super().parallelize(...)`,
+typically to validate before sharding, to install a model-owned mesh afterwards, to pass a custom
+`fully_shard_fn`, or to hand a per-instance plan down as `tp_shard_plan`:
 
 ```python
 from nemo_automodel.components.distributed.parallelizer import DefaultParallelizationStrategy
@@ -144,8 +152,9 @@ class Qwen3VLParallelizationStrategy(DefaultParallelizationStrategy):
         return result
 ```
 
-Hooks are cheaper than a strategy when they fit: `validate_tp` replaces only the head check and
-`adjust_tp_plan` edits the final plan (Nemotron-NAS and Nemotron-Flash use these respectively).
+Prefer a data field when one fits: Nemotron-Flash needs no strategy because
+`sharded_output_only=("lm_head",)` states its constraint, and the parallelizer enforces it on
+whatever plan is finally chosen.
 
 ## Activation Checkpointing Is a Separate Contract
 
@@ -153,16 +162,15 @@ Activation checkpointing is a recompute policy, not parallelism, so it is not pa
 `ParallelSpec`. A model declares `activation_checkpointing_spec: ActivationCheckpointingSpec`
 (from `nemo_automodel.components.distributed.activation_checkpointing`), which the parallelizer
 reads through `query_activation_checkpointing_spec(model)` when it applies checkpointing. Its only
-field is `apply`, a `(model) -> bool` that checkpoints whole logical layers itself when the requested
-scope is `"all"`; returning `True` skips the generic submodule wrappers.
+field is `granularity`: `"submodule"` (default) wraps the attention / MLP children of every selected
+layer, `"layer"` wraps each selected layer as one unit (the selection — scope and frozen-layer
+filtering — is the same in both cases).
 
 ```python
 # components/models/bagel/model.py
 class BagelForUnifiedMultimodal(HFCheckpointingMixin, nn.Module):
     parallel_spec: ParallelSpec = ParallelSpec(layer_groups={...})
-    activation_checkpointing_spec: ActivationCheckpointingSpec = ActivationCheckpointingSpec(
-        apply=apply_bagel_full_layer_activation_checkpointing,
-    )
+    activation_checkpointing_spec: ActivationCheckpointingSpec = ActivationCheckpointingSpec(granularity="layer")
 ```
 
 Architectures you do not re-implement declare it exactly like `parallel_spec`, on the class named
@@ -242,13 +250,13 @@ config = FSDP2Config(tp_plan="my_package.plans.custom_llama_plan")
 The resolution order inside `_get_parallel_plan` is:
 
 1. `tp_plan` passed explicitly (dict or import path);
-2. `spec.tp_plan`, falling back to HF `_tp_plan` if it raises;
+2. `spec.resolved_tp_plan(sequence_parallel)` — the declared plan with its sequence-parallel overlay;
 3. HF `_tp_plan`, rooted at `spec.hf_tp_plan_prefix`;
 4. the base llama-style plan. At `tp_size > 1` a `trust_remote_code` class with no usable plan
    raises instead, because the base plan's placements trip a DTensor redistribute assert.
 
-`spec.adjust_tp_plan` then runs on the chosen plan, and models built from the custom MoE
-layers are checked so that no TP entry claims a routed expert.
+`spec.sharded_output_only` is then enforced on the chosen plan, and models built from the custom
+MoE layers are checked so that no TP entry claims a routed expert.
 
 <Note>
 `tp_plan: llama_nemotron_super_tp_plan` is a legacy alias. It now logs a deprecation warning
@@ -262,7 +270,7 @@ Nemotron-NAS) declare anyway. Pass a dictionary or an import path to force a spe
 from nemo_automodel.components.distributed.parallelizer import query_parallel_spec
 
 spec = query_parallel_spec(model)
-assert spec.tp_plan is llama_tp_plan
+assert spec.tp_plan is LLAMA_TP_PLAN
 ```
 
 Add a unit test that asserts the declaration (`Model.parallel_spec.tp_plan is ...`, or the

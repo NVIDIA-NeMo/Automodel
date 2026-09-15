@@ -45,7 +45,6 @@ from nemo_automodel.components.distributed.parallelizer import (
     import_class_from_path,
     megatron_fsdp_strategy_parallelize,
 )
-from nemo_automodel.components.models.bagel import parallelization as bagel_parallelization
 
 
 def test_fsdp_accumulated_grad_guard_only_handles_missing_unsharded_param(monkeypatch):
@@ -1604,12 +1603,13 @@ class TestQueryParallelSpecResolution:
 
     def test_class_attribute_selects_plan(self):
         sentinel_plan = {"layer": ColwiseParallel()}
-        with patch.object(MockModel, "parallel_spec", ParallelSpec(tp_plan=lambda m, sp: sentinel_plan), create=True):
+        with patch.object(MockModel, "parallel_spec", ParallelSpec(tp_plan=sentinel_plan), create=True):
             plan = _get_parallel_plan(MockModel(), sequence_parallel=False, tp_shard_plan=None)
-        assert plan is sentinel_plan
+        assert plan.keys() == sentinel_plan.keys()
+        assert type(plan["layer"]) is ColwiseParallel
 
     def test_runtime_wrapper_subclasses_inherit_class_attribute(self):
-        spec = ParallelSpec(tp_plan=lambda m, sp: {})
+        spec = ParallelSpec(tp_plan={})
 
         class _Mixin:
             pass
@@ -1628,7 +1628,7 @@ class TestQueryParallelSpecResolution:
 
     def test_same_named_class_without_declaration_gets_defaults(self):
         """Names mean nothing to the parallelizer: only the attribute binds a contract."""
-        spec = ParallelSpec(tp_plan=lambda m, sp: {})
+        spec = ParallelSpec(tp_plan={})
         twin = type("MockModel", (nn.Module,), {"forward": lambda self, x: x})
         with patch.object(MockModel, "parallel_spec", spec, create=True):
             assert parallelizer.query_parallel_spec(twin()) is parallelizer._DEFAULT_SPEC
@@ -1911,10 +1911,6 @@ class TestActivationCheckpointingKVSharing:
 
         monkeypatch.setattr(
             "nemo_automodel.components.distributed.parallelizer.checkpoint_wrapper",
-            lambda module, **kwargs: _Wrapped(module, **kwargs),
-        )
-        monkeypatch.setattr(
-            "nemo_automodel.components.models.bagel.parallelization.checkpoint_wrapper",
             lambda module, **kwargs: _Wrapped(module, **kwargs),
         )
         monkeypatch.setattr(
@@ -3338,43 +3334,16 @@ class TestExtractModelLayers:
 
 
 class TestBagelFullLayerActivationCheckpointing:
-    """Tests for native BAGEL-style whole-layer activation checkpointing."""
+    """BAGEL declares whole-layer activation checkpointing as data; the parallelizer applies it."""
 
-    def test_get_module_by_fqn_resolves_nested_module_and_missing_path(self):
-        """Nested FQN lookup returns the module or None for missing paths."""
-        model = _make_bagel_model()
+    def test_bagel_declares_layer_granularity(self):
+        from nemo_automodel.components.distributed.activation_checkpointing import query_activation_checkpointing_spec
 
-        result = bagel_parallelization._get_module_by_fqn(model, "model.vit_model.vision_model.encoder.layers")
+        assert query_activation_checkpointing_spec(_make_bagel_model()).granularity == "layer"
 
-        assert result is model.model.vit_model.vision_model.encoder.layers
-        assert bagel_parallelization._get_module_by_fqn(model, "model.missing.layers") is None
-
-    def test_apply_bagel_full_layer_activation_checkpointing_wraps_each_layer(self, monkeypatch):
-        """BAGEL wraps Qwen and SigLIP layers once and skips already wrapped layers."""
-        model = _make_bagel_model(num_language_layers=2, num_vision_layers=3)
-        wrap_calls = []
-
-        def _fake_checkpoint_wrapper(module, **kwargs):
-            wrap_calls.append((module, kwargs))
-            return _CheckpointWrapped(module, **kwargs)
-
-        monkeypatch.setattr(bagel_parallelization, "checkpoint_wrapper", _fake_checkpoint_wrapper)
-
-        assert bagel_parallelization.apply_bagel_full_layer_activation_checkpointing(model) is True
-
-        language_layers = model.model.language_model.model.layers
-        vision_layers = model.model.vit_model.vision_model.encoder.layers
-        wrapped_layers = list(language_layers) + list(vision_layers)
-        assert len(wrap_calls) == 5
-        assert all(isinstance(layer, _CheckpointWrapped) for layer in wrapped_layers)
-        assert all(call_kwargs["checkpoint_impl"].name == "NO_REENTRANT" for _, call_kwargs in wrap_calls)
-
-        assert bagel_parallelization.apply_bagel_full_layer_activation_checkpointing(model) is False
-        assert len(wrap_calls) == 5
-
-    def test_other_models_declare_no_full_layer_hook(self):
+    def test_other_models_use_submodule_granularity(self):
         """Non-BAGEL models continue through the generic checkpointing path."""
         from nemo_automodel.components.distributed.activation_checkpointing import query_activation_checkpointing_spec
 
-        assert query_activation_checkpointing_spec(nn.Module()).apply is None
+        assert query_activation_checkpointing_spec(nn.Module()).granularity == "submodule"
         assert not hasattr(parallelizer.query_parallel_spec(nn.Module()), "apply_activation_checkpointing")

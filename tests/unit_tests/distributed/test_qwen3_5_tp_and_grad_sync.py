@@ -24,7 +24,7 @@ from nemo_automodel._transformers.model_init import _get_mixin_wrapped_class
 from nemo_automodel.components.distributed.parallelizer import (
     translate_to_torch_parallel_style,
 )
-from nemo_automodel.components.models.qwen3_5.parallelization import QWEN3_5_VLM_PARALLEL_SPEC, qwen3_5_tp_plan
+from nemo_automodel.components.models.qwen3_5.parallelization import QWEN3_5_VLM_PARALLEL_SPEC
 
 
 class TestTranslateToTorchParallelStyleReplicatedWithGradAllreduce:
@@ -72,11 +72,11 @@ class TestGetHfTpShardPlanSkipsNoneStyles:
 
 
 class TestParallelizeQwen35VlmRegistered:
-    """qwen3_5_tp_plan is the native class's declared plan and delegates to
-    get_hf_tp_shard_plan so transformers' native base_model_tp_plan is reused."""
+    """Qwen3.5 declares no plan of its own, so the parallelizer translates transformers'
+    native base_model_tp_plan (self_attn + MLP; GatedDeltaNet layers stay replicated)."""
 
-    def test_qwen3_5_vlm_declares_plan(self):
-        assert QWEN3_5_VLM_PARALLEL_SPEC.tp_plan is qwen3_5_tp_plan
+    def test_qwen3_5_vlm_declares_no_plan(self):
+        assert QWEN3_5_VLM_PARALLEL_SPEC.tp_plan is None
 
     def test_delegates_to_get_hf_tp_shard_plan(self, monkeypatch):
         sentinel_plan = {"probe": "value"}
@@ -87,8 +87,8 @@ class TestParallelizeQwen35VlmRegistered:
             return sentinel_plan
 
         monkeypatch.setattr(parallelizer, "get_hf_tp_shard_plan", fake_get_hf_tp_shard_plan)
-        dummy = object()
-        result = qwen3_5_tp_plan(dummy, sequence_parallel=False)
+        dummy = type("Qwen3_5Stub", (nn.Module,), {"parallel_spec": QWEN3_5_VLM_PARALLEL_SPEC})()
+        result = parallelizer._get_parallel_plan(dummy, sequence_parallel=False, tp_size=2)
         assert result is sentinel_plan
         assert calls == [dummy]
 

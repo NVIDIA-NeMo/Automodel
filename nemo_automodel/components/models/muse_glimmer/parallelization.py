@@ -16,44 +16,27 @@
 
 from __future__ import annotations
 
-import warnings
-from typing import cast
-
 from torch.distributed.tensor.parallel import ColwiseParallel, ParallelStyle, RowwiseParallel
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
 from nemo_automodel.components.distributed.optimized_tp_plans import VocabParallelEmbedding
 from nemo_automodel.components.distributed.parallelizer import DefaultParallelizationStrategy
 
-
-def muse_glimmer_tp_plan(model, sequence_parallel: bool = False) -> dict[str, ParallelStyle]:
-    """TP plan for the native MuseGlimmer dense VLM.
-
-    The vision tower stays replicated. The language backbone and vocabulary
-    matrices contain nearly all trainable parameters and are tensor-sharded.
-    MuseGlimmer has two KV heads, so the model strategy limits this complete
-    Q/K/V-sharding plan to TP1 or TP2.
-    """
-    if sequence_parallel:
-        warnings.warn(
-            "sequence_parallel=True is not yet supported for MuseGlimmer and will be ignored.",
-            stacklevel=2,
-        )
-
-    plan: dict[str, ParallelStyle] = {
-        "model.embed_tokens": VocabParallelEmbedding(input_layouts=Replicate()),
-        "model.layers.*.self_attn.q_proj": ColwiseParallel(),
-        "model.layers.*.self_attn.k_proj": ColwiseParallel(),
-        "model.layers.*.self_attn.v_proj": ColwiseParallel(),
-        "model.layers.*.self_attn.output_gate_proj": ColwiseParallel(),
-        "model.layers.*.self_attn.o_proj": RowwiseParallel(),
-        "model.layers.*.mlp.up_proj": ColwiseParallel(),
-        "model.layers.*.mlp.gate_proj": ColwiseParallel(),
-        "model.layers.*.mlp.down_proj": RowwiseParallel(),
-        "lm_head": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
-    }
-
-    return cast(dict[str, ParallelStyle], plan)
+# The vision tower stays replicated. The language backbone and vocabulary matrices contain nearly all trainable
+# parameters and are tensor-sharded. MuseGlimmer has two KV heads, so the strategy limits this complete Q/K/V-sharding
+# plan to TP1 or TP2. No sequence-parallel variant.
+MUSE_GLIMMER_TP_PLAN: dict[str, ParallelStyle] = {
+    "model.embed_tokens": VocabParallelEmbedding(input_layouts=Replicate()),
+    "model.layers.*.self_attn.q_proj": ColwiseParallel(),
+    "model.layers.*.self_attn.k_proj": ColwiseParallel(),
+    "model.layers.*.self_attn.v_proj": ColwiseParallel(),
+    "model.layers.*.self_attn.output_gate_proj": ColwiseParallel(),
+    "model.layers.*.self_attn.o_proj": RowwiseParallel(),
+    "model.layers.*.mlp.up_proj": ColwiseParallel(),
+    "model.layers.*.mlp.gate_proj": ColwiseParallel(),
+    "model.layers.*.mlp.down_proj": RowwiseParallel(),
+    "lm_head": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
+}
 
 
 class MuseGlimmerParallelizationStrategy(DefaultParallelizationStrategy):

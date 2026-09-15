@@ -38,7 +38,11 @@ from nemo_automodel.components.distributed.parallelizer import (
     get_parallelization_strategy,
 )
 from nemo_automodel.components.models.hunyuan_video15.parallelization import HunyuanParallelizationStrategy
-from nemo_automodel.components.models.nemotron_nas.parallelization import validate_tp_mesh_for_nemotron_nas
+from nemo_automodel.components.models.nemotron_nas import parallelization as nas_parallelization
+from nemo_automodel.components.models.nemotron_nas.parallelization import (
+    NemotronNASParallelizationStrategy,
+    validate_tp_mesh_for_nemotron_nas,
+)
 from nemo_automodel.components.models.nemotron_v3.parallelization import (
     NEMOTRON_H_PARALLEL_SPEC,
     NemotronHParallelizationStrategy,
@@ -1446,18 +1450,32 @@ class TestDeciLMNemotronNASValidation:
 
         return _M(config)
 
-    def test_validate_tp_mesh_decilm_nas_calls_specialized_and_returns_early(self):
+    def test_nemotron_nas_strategy_validates_before_the_default_flow(self, monkeypatch):
+        """The per-layer block-config validation runs in the strategy, then the default flow is delegated to."""
         model = self._make_decilm_nas_model()
-        tp_mesh = MagicMock()
-        tp_mesh.size.return_value = 2
+        validated = []
+        monkeypatch.setattr(
+            nas_parallelization, "validate_tp_mesh_for_nemotron_nas", lambda m, tp_size: validated.append((m, tp_size))
+        )
+        delegated = {}
 
-        mock_spec = MagicMock(return_value=None)
-        with patch.object(type(model), "parallel_spec", ParallelSpec(validate_tp=mock_spec), create=True):
-            # should not raise despite incompatible num_key_value_heads
-            parallelizer_mod.validate_tp_mesh(model, tp_mesh)
+        def fake_parallelize(self, m, device_mesh, **kwargs):
+            delegated["model"] = m
+            delegated["tp_mesh_name"] = kwargs.get("tp_mesh_name")
+            return m
 
-        # the model-owned validator was called with (model, tp_size)
-        mock_spec.assert_called_once_with(model, 2)
+        monkeypatch.setattr(parallelizer_mod.DefaultParallelizationStrategy, "parallelize", fake_parallelize)
+        device_mesh = MagicMock()
+        device_mesh.mesh_dim_names = ("dp", "tp")
+        device_mesh.__getitem__.return_value.size.return_value = 2
+
+        assert NemotronNASParallelizationStrategy().parallelize(model, device_mesh) is model
+        assert validated == [(model, 2)]
+        assert delegated == {"model": model, "tp_mesh_name": "tp"}
+
+        device_mesh.__getitem__.return_value.size.return_value = 1
+        NemotronNASParallelizationStrategy().parallelize(model, device_mesh)
+        assert len(validated) == 1  # nothing to validate at tp_size=1
 
     def test_validate_tp_mesh_for_nemotron_nas_valid_config_passes(self):
         # a valid config covering linear, grouped, and noop attention cases

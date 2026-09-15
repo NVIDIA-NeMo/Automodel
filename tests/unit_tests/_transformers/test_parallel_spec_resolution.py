@@ -31,7 +31,7 @@ from nemo_automodel.components.models.gemma3 import parallelization as gemma3_pa
 from nemo_automodel.components.models.llama.model import LlamaForCausalLM as NativeLlamaForCausalLM
 from nemo_automodel.components.models.llama.parallelization import LLAMA_PARALLEL_SPEC
 from nemo_automodel.components.models.mistral3.parallelization import MISTRAL3_VLM_PARALLEL_SPEC
-from nemo_automodel.components.models.nemotron_nas.parallelization import validate_tp_mesh_for_nemotron_nas
+from nemo_automodel.components.models.nemotron_nas.parallelization import NemotronNASParallelizationStrategy
 
 
 def test_declaration_resolves_from_the_model_type_family():
@@ -42,7 +42,8 @@ def test_declaration_resolves_from_the_model_type_family():
     assert causal is gemma3_parallelization.Gemma3ForCausalLM.parallel_spec
     assert vlm is gemma3_parallelization.Gemma3ForConditionalGeneration.parallel_spec
     assert causal is not vlm
-    assert causal.tp_plan is vlm.tp_plan is gemma3_parallelization.gemma3_tp_plan
+    assert causal.tp_plan is gemma3_parallelization.GEMMA3_TP_PLAN
+    assert vlm.tp_plan is gemma3_parallelization.GEMMA3_VLM_TP_PLAN
 
 
 def test_native_implementation_is_authoritative_for_its_transformers_twin():
@@ -66,7 +67,7 @@ def test_remote_code_class_resolves_from_its_config_model_type():
     remote = type("DeciLMForCausalLM", (), {"config_class": SimpleNamespace(model_type="nemotron-nas")})
     remote.__module__ = "transformers_modules.nemotron_nas.modeling_decilm"
     spec = parallel_spec_for(remote)
-    assert spec.validate_tp is validate_tp_mesh_for_nemotron_nas
+    assert isinstance(spec.strategy, NemotronNASParallelizationStrategy)
     assert spec.tp_plan is not None
 
 
@@ -81,14 +82,14 @@ def test_wrapper_class_carries_the_spec_and_keeps_declared_ones():
     assert wrapped.parallel_spec is LLAMA_PARALLEL_SPEC
     assert wrapped.__name__ == "LlamaForCausalLM"
 
-    declared = ParallelSpec(tp_plan=lambda m, sp: {})
+    declared = ParallelSpec(tp_plan={})
     owner = type("LlamaForCausalLM", (nn.Module,), {"parallel_spec": declared})
     assert _get_mixin_wrapped_class(owner).parallel_spec is declared
 
 
 def test_attribute_set_on_an_upstream_class_is_the_out_of_tree_hook():
     """A class you cannot ship a package for gets the attribute directly; the wrapper inherits it."""
-    declared = ParallelSpec(tp_plan=lambda m, sp: {})
+    declared = ParallelSpec(tp_plan={})
     upstream = type("ThirdPartyForCausalLM", (nn.Module,), {})
     upstream.parallel_spec = declared
     assert _get_mixin_wrapped_class(upstream).parallel_spec is declared
@@ -109,8 +110,8 @@ def test_declared_model_specs_reads_the_class_named_after_the_architecture():
 
 def test_every_declared_spec_attribute_is_bound_and_declared_ones_are_kept(monkeypatch):
     """A declaration may publish the activation-checkpointing contract next to the parallel one."""
-    ac_spec = ActivationCheckpointingSpec(apply=lambda m: True)
-    tp_spec = ParallelSpec(tp_plan=lambda m, sp: {})
+    ac_spec = ActivationCheckpointingSpec(granularity="layer")
+    tp_spec = ParallelSpec(tp_plan={})
     upstream = type("ThirdPartyForCausalLM", (nn.Module,), {})
     monkeypatch.setattr(
         model_init,

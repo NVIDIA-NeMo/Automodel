@@ -56,8 +56,8 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
 )
 from nemo_automodel.components.models.muse_glimmer.config import MuseGlimmerConfig
 from nemo_automodel.components.models.muse_glimmer.parallelization import (
+    MUSE_GLIMMER_TP_PLAN,
     MuseGlimmerParallelizationStrategy,
-    muse_glimmer_tp_plan,
 )
 from nemo_automodel.components.models.muse_glimmer.state_dict_adapter import MuseGlimmerStateDictAdapter
 from nemo_automodel.components.models.muse_glimmer.vision import MuseGlimmerVisionAdapter, MuseGlimmerVisionEncoder
@@ -686,7 +686,7 @@ class MuseGlimmerForConditionalGeneration(HFCheckpointingMixin, MuseGlimmerPreTr
     _keep_in_fp32_modules = ["rotary_emb"]
     supports_thd = True
     parallel_spec: ParallelSpec = ParallelSpec(
-        tp_plan=muse_glimmer_tp_plan, strategy=MuseGlimmerParallelizationStrategy()
+        tp_plan=MUSE_GLIMMER_TP_PLAN, strategy=MuseGlimmerParallelizationStrategy()
     )
 
     @dataclass(frozen=True)

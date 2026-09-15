@@ -31,7 +31,7 @@ import os
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
-from typing import List
+from typing import List, Literal
 
 import torch
 import torch.nn.functional as F
@@ -61,12 +61,12 @@ class ActivationCheckpointingSpec:
     all-default spec selects the generic wrappers.
 
     Attributes:
-        apply: ``(model) -> bool`` that checkpoints whole logical layers itself when the requested
-            scope is ``"all"``. Return ``True`` once applied so the generic submodule wrappers are
-            skipped; ``False`` falls through to them.
+        granularity: ``"submodule"`` (default) wraps the attention / MLP children of every selected
+            layer; ``"layer"`` wraps each selected layer as one unit, for architectures whose blocks
+            must be recomputed whole (BAGEL's Qwen2 decoder and SigLIP encoder layers).
     """
 
-    apply: Callable[[nn.Module], bool] | None = None
+    granularity: Literal["submodule", "layer"] = "submodule"
 
 
 _DEFAULT_ACTIVATION_CHECKPOINTING_SPEC = ActivationCheckpointingSpec()

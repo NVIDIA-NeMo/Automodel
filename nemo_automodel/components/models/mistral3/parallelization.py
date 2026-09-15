@@ -19,42 +19,29 @@ The FP8 subclass in ``components/models/mistral3_vlm`` reuses :data:`MISTRAL3_VL
 
 from __future__ import annotations
 
-from typing import cast
-
-from torch import nn
 from torch.distributed.tensor.parallel import ColwiseParallel, ParallelStyle, RowwiseParallel
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
 from nemo_automodel.components.distributed.optimized_tp_plans import VocabParallelEmbedding
 from nemo_automodel.components.distributed.parallel_spec import ParallelSpec
 
-
-def mistral3_vlm_tp_plan(
-    model: nn.Module | None,
-    sequence_parallel: bool = False,
-) -> dict[str, ParallelStyle]:
-    """TP plan for Mistral3ForConditionalGeneration (and subclasses like
-    Mistral3FP8VLMForConditionalGeneration). The Ministral3 text backbone
-    lives at ``model.language_model.{embed_tokens, layers.*}``; vision_tower
-    and multi_modal_projector stay replicated across TP ranks.
-    """
-    model_prefix = "model.language_model"
-    base_model_tp_plan: dict[str, ParallelStyle] = {
-        f"{model_prefix}.embed_tokens": VocabParallelEmbedding(input_layouts=Replicate()),
-        f"{model_prefix}.layers.*.self_attn.q_proj": ColwiseParallel(),
-        f"{model_prefix}.layers.*.self_attn.k_proj": ColwiseParallel(),
-        f"{model_prefix}.layers.*.self_attn.v_proj": ColwiseParallel(),
-        f"{model_prefix}.layers.*.self_attn.o_proj": RowwiseParallel(),
-        f"{model_prefix}.layers.*.mlp.up_proj": ColwiseParallel(),
-        f"{model_prefix}.layers.*.mlp.gate_proj": ColwiseParallel(),
-        f"{model_prefix}.layers.*.mlp.down_proj": RowwiseParallel(),
-        "lm_head": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
-    }
-    return cast(dict[str, ParallelStyle], base_model_tp_plan)
+# The Ministral3 text backbone lives at ``model.language_model.{embed_tokens, layers.*}``; vision_tower and
+# multi_modal_projector stay replicated across TP ranks. No sequence-parallel variant.
+MISTRAL3_VLM_TP_PLAN: dict[str, ParallelStyle] = {
+    "model.language_model.embed_tokens": VocabParallelEmbedding(input_layouts=Replicate()),
+    "model.language_model.layers.*.self_attn.q_proj": ColwiseParallel(),
+    "model.language_model.layers.*.self_attn.k_proj": ColwiseParallel(),
+    "model.language_model.layers.*.self_attn.v_proj": ColwiseParallel(),
+    "model.language_model.layers.*.self_attn.o_proj": RowwiseParallel(),
+    "model.language_model.layers.*.mlp.up_proj": ColwiseParallel(),
+    "model.language_model.layers.*.mlp.gate_proj": ColwiseParallel(),
+    "model.language_model.layers.*.mlp.down_proj": RowwiseParallel(),
+    "lm_head": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
+}
 
 
 MISTRAL3_VLM_PARALLEL_SPEC = ParallelSpec(
-    tp_plan=mistral3_vlm_tp_plan,
+    tp_plan=MISTRAL3_VLM_TP_PLAN,
     layer_groups={
         "language": ("model.language_model.layers",),
         "vision": (

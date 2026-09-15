@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import List, Tuple, Union, cast
+from typing import List, Tuple, Union
 
 import torch
 import torch.utils.checkpoint
@@ -480,28 +480,21 @@ class BaichuanModel(BaichuanPreTrainedModel):
 # ---------------------------------------------------------------------------
 # Causal LM head
 # ---------------------------------------------------------------------------
-def _baichuan_tp_plan(model: BaichuanForCausalLM | None, sequence_parallel: bool = False) -> dict[str, ParallelStyle]:
-    """Tensor-parallel plan for :class:`BaichuanForCausalLM` (MLP-only).
-
-    Only the MLP is sharded. The attention path stays fully replicated because W_pack
-    uses a non-interleaved [Q|K|V] layout (ColwiseParallel would split it incorrectly)
-    and NormHead (lm_head) is not nn.Linear (ColwiseParallel is unsupported).
-    """
-    return cast(
-        dict[str, ParallelStyle],
-        {
-            "model.layers.*.mlp.gate_proj": ColwiseParallel(),
-            "model.layers.*.mlp.up_proj": ColwiseParallel(),
-            "model.layers.*.mlp.down_proj": RowwiseParallel(),
-        },
-    )
+# Only the MLP is sharded. The attention path stays fully replicated because W_pack uses a non-interleaved [Q|K|V]
+# layout (ColwiseParallel would split it incorrectly) and NormHead (lm_head) is not nn.Linear (ColwiseParallel is
+# unsupported).
+BAICHUAN_TP_PLAN: dict[str, ParallelStyle] = {
+    "model.layers.*.mlp.gate_proj": ColwiseParallel(),
+    "model.layers.*.mlp.up_proj": ColwiseParallel(),
+    "model.layers.*.mlp.down_proj": RowwiseParallel(),
+}
 
 
 class BaichuanForCausalLM(HFCheckpointingMixin, BaichuanPreTrainedModel, GenerationMixin):
     # lm_head is a weight-normalizing NormHead, so tying it to embed_tokens is
     # semantically wrong; all shipped Baichuan checkpoints are untied.
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
-    parallel_spec: ParallelSpec = ParallelSpec(tp_plan=_baichuan_tp_plan)
+    parallel_spec: ParallelSpec = ParallelSpec(tp_plan=BAICHUAN_TP_PLAN)
 
     @dataclass(frozen=True)
     class ModelCapabilities:

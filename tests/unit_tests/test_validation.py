@@ -241,7 +241,7 @@ class TestModelSupportsTP:
     def test_tp_true_with_optimized_plan(self):
         model = _Bare()
         _attach(model)
-        with patch.object(_Bare, "parallel_spec", ParallelSpec(tp_plan=lambda model, sp: {}), create=True):
+        with patch.object(_Bare, "parallel_spec", ParallelSpec(tp_plan={}), create=True):
             assert model.supports.supports_tp is True
 
     def test_tp_true_with_hf_native_plan(self):

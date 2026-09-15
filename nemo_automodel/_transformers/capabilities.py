@@ -209,11 +209,9 @@ class ModelSupports:
     @property
     def supports_tp(self) -> bool:
         """Model has an optimized or HF-native tensor-parallel plan."""
-        from nemo_automodel.components.distributed.parallelizer import query_parallel_spec
+        from nemo_automodel.components.distributed.parallelizer import has_hf_tp_plan, query_parallel_spec
 
-        return (
-            query_parallel_spec(self._model).tp_plan is not None or getattr(self._model, "_tp_plan", None) is not None
-        )
+        return query_parallel_spec(self._model).tp_plan is not None or has_hf_tp_plan(self._model)
 
     @property
     def supports_pp(self) -> bool:

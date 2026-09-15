@@ -16,11 +16,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import copy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from torch import nn
 from torch.distributed.tensor.parallel import ParallelStyle
 
 if TYPE_CHECKING:
@@ -29,21 +28,26 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class ParallelSpec:
-    """Everything ``fsdp2_strategy_parallelize`` needs to know about one architecture.
+    """Everything ``fsdp2_strategy_parallelize`` needs to know about one architecture, as data.
 
-    A model class declares its contract as a ``parallel_spec`` class attribute, which
-    every dynamically created wrapper subclass (``HFCheckpointingMixin``, capability
-    injection) inherits. For architectures Automodel does not own -- stock ``transformers``
-    classes, ``trust_remote_code`` checkpoints, ``diffusers`` transformers -- the
-    ``_transformers`` / ``_diffusers`` bridge sets the attribute on the wrapper class it
-    creates. Every field defaults to the generic llama-style behaviour, so a dense causal
-    LM with ``model.layers`` needs no spec.
+    A model class declares its contract as a ``parallel_spec`` class attribute, which every
+    dynamically created wrapper subclass (``HFCheckpointingMixin``, capability injection)
+    inherits. Architectures the repository does not re-implement declare it in
+    ``components/models/<family>/parallelization.py`` and the loaders bind it onto the wrapper
+    they create. Every field defaults to the generic llama-style behaviour, so a dense causal LM
+    with ``model.layers`` needs no spec.
+
+    Every field is declarative: plans are dictionaries, constraints are module names. Behaviour
+    that genuinely depends on the model instance belongs in a ``ParallelizationStrategy``
+    (``strategy``), never in the spec.
 
     Attributes:
-        tp_plan: ``(model, sequence_parallel) -> {module FQN pattern: ParallelStyle}``.
+        tp_plan: ``{module FQN pattern: ParallelStyle}`` applied under tensor parallelism.
             ``None`` falls back to the model's HuggingFace ``_tp_plan``, then the base plan.
-        adjust_tp_plan: ``(model, plan) -> plan`` applied to the final plan whatever its source
-            (explicit, optimized or fallback), for architectures whose forward constrains it.
+        sequence_parallel_plan: Entries overlaid on ``tp_plan`` when sequence parallelism is
+            requested (sequence-sharded norms, reduce-scattering projections). ``None`` means the
+            architecture has no sequence-parallel variant; the request is then ignored with a
+            warning.
         layer_groups: Transformer-block containers per role (``"language"``, ``"vision"``),
             each as candidate FQNs; the first that resolves wins, so one spec covers several
             ``transformers`` module-tree layouts. ``None`` uses ``model.model.layers`` or
@@ -53,15 +57,30 @@ class ParallelSpec:
             ``"config.text_config"``. ``None`` reads ``model.config``.
         hf_tp_plan_prefix: Candidate FQNs of the submodule whose ``_tp_plan`` keys are
             relative to it; the first that resolves is used and prefixes those keys.
-        validate_tp: ``(model, tp_size) -> None`` replacing the generic head-divisibility
-            check.
+        sharded_output_only: Module FQNs whose plan entry is dropped unless it produces a sharded
+            output, whatever the plan's source (declared, HuggingFace or user-supplied). A head
+            whose forward combines its output with a sharded weight (e.g. weight-normalized
+            logits) cannot take a replicated output, so it is left un-parallelized instead.
         strategy: Whole-flow ``ParallelizationStrategy`` override; ``None`` uses the default.
     """
 
-    tp_plan: Callable[[nn.Module, bool], dict[str, ParallelStyle]] | None = None
-    adjust_tp_plan: Callable[[nn.Module, dict[str, ParallelStyle]], dict[str, ParallelStyle]] | None = None
+    tp_plan: dict[str, ParallelStyle] | None = None
+    sequence_parallel_plan: dict[str, ParallelStyle] | None = None
     layer_groups: dict[str, tuple[str, ...]] | None = None
     text_config_path: str | None = None
     hf_tp_plan_prefix: tuple[str, ...] = ("model",)
-    validate_tp: Callable[[nn.Module, int], None] | None = None
+    sharded_output_only: tuple[str, ...] = ()
     strategy: ParallelizationStrategy | None = None
+
+    def resolved_tp_plan(self, sequence_parallel: bool = False) -> dict[str, ParallelStyle] | None:
+        """The declared plan for one run: ``tp_plan`` with ``sequence_parallel_plan`` overlaid when requested.
+
+        Styles are shallow-copied so the shared declaration is never mutated -- LoRA translation
+        rewrites a style's class in place -- and ``None`` is returned when no plan is declared.
+        """
+        if self.tp_plan is None:
+            return None
+        plan = dict(self.tp_plan)
+        if sequence_parallel and self.sequence_parallel_plan:
+            plan.update(self.sequence_parallel_plan)
+        return {fqn: copy.copy(style) for fqn, style in plan.items()}

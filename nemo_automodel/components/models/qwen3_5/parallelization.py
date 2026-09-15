@@ -19,7 +19,6 @@ from __future__ import annotations
 import logging
 
 from torch import nn
-from torch.distributed.tensor.parallel import ParallelStyle
 
 import nemo_automodel.components.distributed.parallelizer as parallelizer
 import nemo_automodel.components.distributed.parallelizer_utils as parallelizer_utils
@@ -33,19 +32,6 @@ from nemo_automodel.shared.multimodal_fsdp import (
 )
 
 logger = logging.getLogger(__name__)
-
-
-def qwen3_5_tp_plan(
-    model,
-    sequence_parallel: bool = False,
-) -> dict[str, ParallelStyle]:
-    """Parallelize Qwen3.5 VLM by reusing transformers' base_model_tp_plan.
-
-    Qwen3.5 has mixed attention: full self_attn (every 4th layer) + linear_attn
-    (GatedDeltaNet). The transformers-provided base_model_tp_plan covers only
-    self_attn + MLP — linear_attn is not TP-shardable with stock kernels.
-    """
-    return parallelizer.get_hf_tp_shard_plan(model)
 
 
 class Qwen3_5ParallelizationStrategy(DefaultParallelizationStrategy):
@@ -179,10 +165,12 @@ class Qwen3_5ParallelizationStrategy(DefaultParallelizationStrategy):
 
 QWEN3_5_LAYERS = {"language": ("model.language_model.layers",), "vision": ("model.visual.blocks",)}
 # The transformers class and this native port share name, plan and strategy.
+# No declared TP plan: Qwen3.5 mixes full self_attn (every 4th layer) with GatedDeltaNet ``linear_attn``, which
+# is not TP-shardable with stock kernels, so the loader translates transformers' own ``base_model_tp_plan``
+# (self_attn + MLP only).
 QWEN3_5_VLM_PARALLEL_SPEC = ParallelSpec(
-    tp_plan=qwen3_5_tp_plan,
     layer_groups=QWEN3_5_LAYERS,
     hf_tp_plan_prefix=("model.language_model",),
     strategy=Qwen3_5ParallelizationStrategy(),
 )
-QWEN3_5_CAUSAL_LM_PARALLEL_SPEC = ParallelSpec(tp_plan=qwen3_5_tp_plan, strategy=Qwen3_5ParallelizationStrategy())
+QWEN3_5_CAUSAL_LM_PARALLEL_SPEC = ParallelSpec(strategy=Qwen3_5ParallelizationStrategy())

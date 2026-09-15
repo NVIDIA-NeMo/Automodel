@@ -77,7 +77,7 @@ def declared_model_specs(model_class: type) -> dict[str, object]:
     class named after the upstream architecture::
 
         class Gemma3ForConditionalGeneration:
-            parallel_spec = ParallelSpec(tp_plan=gemma3_tp_plan, ...)
+            parallel_spec = ParallelSpec(tp_plan=GEMMA3_TP_PLAN, ...)
 
     Returns:
         ``{attribute: spec}`` for each of :data:`MODEL_SPEC_ATTRIBUTES` the declaration sets; empty

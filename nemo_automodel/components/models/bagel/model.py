@@ -51,7 +51,6 @@ from nemo_automodel.components.models.bagel.modeling_qwen2_packed import Qwen2Fo
 from nemo_automodel.components.models.bagel.modeling_siglip_navit import (
     SiglipVisionModel,
 )
-from nemo_automodel.components.models.bagel.parallelization import apply_bagel_full_layer_activation_checkpointing
 from nemo_automodel.components.models.bagel.state_dict_adapter import (
     BagelStateDictAdapter,
     load_bagel_checkpoint_state_dict,
@@ -239,9 +238,7 @@ class BagelForUnifiedMultimodal(HFCheckpointingMixin, nn.Module):
         },
     )
     # Whole Qwen2 decoder / SigLIP encoder layers are checkpointed as units, as upstream BAGEL does.
-    activation_checkpointing_spec: ActivationCheckpointingSpec = ActivationCheckpointingSpec(
-        apply=apply_bagel_full_layer_activation_checkpointing,
-    )
+    activation_checkpointing_spec: ActivationCheckpointingSpec = ActivationCheckpointingSpec(granularity="layer")
 
     @dataclass(frozen=True)
     class ModelCapabilities:
