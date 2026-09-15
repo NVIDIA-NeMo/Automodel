@@ -48,10 +48,6 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ),
         ),
         (
-            "BaichuanForCausalLM",
-            ("nemo_automodel.components.models.baichuan.model", "BaichuanForCausalLM"),
-        ),
-        (
             "BailingMoeV2ForCausalLM",
             ("nemo_automodel.components.models.ling_v2.model", "BailingMoeV2ForCausalLM"),
         ),
@@ -132,10 +128,6 @@ MODEL_ARCH_MAPPING = OrderedDict(
         (
             "KimiK3ForCausalLM",
             ("nemo_automodel.components.models.kimi_k3.model", "KimiK3ForCausalLM"),
-        ),
-        (
-            "KimiVLForConditionalGeneration",
-            ("nemo_automodel.components.models.kimivl.model", "KimiVLForConditionalGeneration"),
         ),
         (
             "KimiLinear48BForCausalLM",
@@ -249,10 +241,6 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.hy_mt2.model", "HyMT2ForCausalLM"),
         ),
         (
-            "Qwen2ForCausalLM",
-            ("nemo_automodel.components.models.qwen2.model", "Qwen2ForCausalLM"),
-        ),
-        (
             "Qwen3ForCausalLM",
             ("nemo_automodel.components.models.qwen3.model", "Qwen3ForCausalLM"),
         ),
@@ -350,7 +338,6 @@ MODEL_ARCH_MAPPING = OrderedDict(
 # AutoConfig.from_pretrained can resolve them without trust_remote_code.
 _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
     "bagel": ("nemo_automodel.components.models.bagel.configuration", "BagelConfig"),
-    "baichuan": ("nemo_automodel.components.models.baichuan.configuration", "BaichuanConfig"),
     "bailing_moe": ("nemo_automodel.components.models.ling_v2.config", "BailingMoeV2Config"),
     "deepseek_v4": ("nemo_automodel.components.models.deepseek_v4.config", "DeepseekV4Config"),
     "deepseek_v41": ("nemo_automodel.components.models.deepseek_v41.config", "DeepseekV41Config"),
@@ -365,7 +352,6 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
     "kimi_k3": ("nemo_automodel.components.models.kimi_k3.config", "KimiK3Config"),
     "kimi_linear": ("nemo_automodel.components.models.kimi_k3.config", "KimiK3TextConfig"),
     "kimi_linear_48b_a3b": ("nemo_automodel.components.models.kimi_linear.config", "KimiLinear48BConfig"),
-    "kimi_vl": ("nemo_automodel.components.models.kimivl.model", "KimiVLConfig"),
     "laguna": ("nemo_automodel.components.models.laguna.config", "LagunaConfig"),
     "llavaonevision1_5": ("nemo_automodel.components.models.llava_onevision.model", "Llavaonevision1_5Config"),
     "mimo_v2_flash": ("nemo_automodel.components.models.mimo_v2_flash.config", "MiMoV2FlashConfig"),

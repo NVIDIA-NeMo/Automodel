@@ -485,8 +485,6 @@ convention = "google"
 "__init__.py" = ["F401"]
 # Baseline existing public APIs that still need docstrings. New files and files
 # not listed here fail D101/D103 normally.
-"nemo_automodel/components/models/baichuan/configuration.py" = ["D101"]
-"nemo_automodel/components/models/baichuan/model.py" = ["D101"]
 "nemo_automodel/components/models/deepseek_v3/layers.py" = ["D101"]
 "nemo_automodel/components/models/deepseek_v3/model.py" = ["D101"]
 "nemo_automodel/components/models/deepseek_v3/rope_utils.py" = ["D103"]
@@ -502,7 +500,6 @@ convention = "google"
 "nemo_automodel/components/models/gpt_oss/rope_utils.py" = ["D101", "D103"]
 "nemo_automodel/components/models/gpt_oss/state_dict_adapter.py" = ["D101"]
 "nemo_automodel/components/models/hy_v3/model.py" = ["D101"]
-"nemo_automodel/components/models/kimivl/model.py" = ["D101"]
 "nemo_automodel/components/models/llama_bidirectional/export_onnx.py" = ["D103"]
 "nemo_automodel/components/models/llava_onevision/rice_vit.py" = ["D101", "D103"]
 "nemo_automodel/components/models/llava_onevision/state_dict_adapter.py" = ["D101"]

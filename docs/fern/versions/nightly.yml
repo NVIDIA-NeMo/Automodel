@@ -157,9 +157,6 @@ navigation:
           - page: "Aquila / Aquila2"
             path: ../../model-coverage/llm/baai/aquila.mdx
             slug: aquila-aquila2
-          - page: "Baichuan / Baichuan2"
-            path: ../../model-coverage/llm/baichuan-inc/baichuan.mdx
-            slug: baichuan-baichuan2
           - page: "Command-R"
             path: ../../model-coverage/llm/cohere/command-r.mdx
           - page: "Falcon"
@@ -216,8 +213,6 @@ navigation:
             slug: overview
           - page: "MuseGlimmer"
             path: ../../model-coverage/vlm/muse/muse_glimmer.mdx
-          - page: "Kimi-VL"
-            path: ../../model-coverage/vlm/moonshotai/kimi-vl.mdx
           - page: "Kimi-K3"
             path: ../../model-coverage/vlm/moonshotai/kimi-k3.mdx
           - page: "North Micro Vision"

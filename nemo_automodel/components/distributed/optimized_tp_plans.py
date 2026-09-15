@@ -51,7 +51,6 @@ if TYPE_CHECKING:
 
     # Same reason as above: these model modules import transformers' generation
     # stack, which reaches sklearn. Only the qualnames are needed at runtime.
-    from nemo_automodel.components.models.baichuan.model import BaichuanForCausalLM
     from nemo_automodel.components.models.mistral3.model import Ministral3ForCausalLM
 
 
@@ -286,27 +285,6 @@ def _parallelize_decilm_nemotron(
     if getattr(getattr(model, "config", None), "model_type", None) != "nemotron-nas":
         raise ValueError("DeciLM TP plan is only registered for Nemotron-NAS checkpoints")
     return get_decilm_nemotron_tp_plan(sequence_parallel=sequence_parallel)
-
-
-def _parallelize_baichuan(
-    model: BaichuanForCausalLM | None,
-    sequence_parallel: bool = False,
-) -> dict[str, ParallelStyle]:
-    """Parallelizes a BaichuanForCausalLM model (MLP-only).
-
-    Only the MLP is sharded. The attention path stays fully replicated
-    because W_pack uses a non-interleaved [Q|K|V] layout (ColwiseParallel
-    would split it incorrectly) and NormHead (lm_head) is not nn.Linear
-    (ColwiseParallel is unsupported).
-    """
-    return cast(
-        dict[str, ParallelStyle],
-        {
-            "model.layers.*.mlp.gate_proj": ColwiseParallel(),
-            "model.layers.*.mlp.up_proj": ColwiseParallel(),
-            "model.layers.*.mlp.down_proj": RowwiseParallel(),
-        },
-    )
 
 
 def _parallelize_llama(
@@ -727,7 +705,6 @@ def _parallelize_falcon_h1(
 
 # Keyed by qualified class name — see _get_class_qualname for why.
 PARALLELIZE_FUNCTIONS: Dict[str, Callable[..., Dict[str, ParallelStyle]]] = {
-    "nemo_automodel.components.models.baichuan.model.BaichuanForCausalLM": _parallelize_baichuan,
     "transformers.models.qwen2.modeling_qwen2.Qwen2ForCausalLM": _parallelize_qwen,
     "transformers.models.qwen3.modeling_qwen3.Qwen3ForCausalLM": _parallelize_qwen,
     "transformers.models.qwen3.modeling_qwen3.Qwen3ForSequenceClassification": _parallelize_qwen_classification,
@@ -760,7 +737,6 @@ PARALLELIZE_FUNCTIONS: Dict[str, Callable[..., Dict[str, ParallelStyle]]] = {
     "transformers.models.phi3.modeling_phi3.Phi3ForCausalLM": _parallelize_phi3,
     "nemo_automodel.components.models.llama.model.LlamaForCausalLM": _parallelize_llama,
     # Register native Qwen classes without importing their checkpoint adapters into the distributed component.
-    "nemo_automodel.components.models.qwen2.model.Qwen2ForCausalLM": _parallelize_qwen,
     "nemo_automodel.components.models.qwen3.model.Qwen3ForCausalLM": _parallelize_qwen,
     # trust_remote_code models — matched by bare class __name__ in parallelizer
     # because their qualname includes a snapshot-hash-bearing module path.

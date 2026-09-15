@@ -34,8 +34,6 @@ import pathlib
 # resolved from example YAMLs).
 _DOC_ARCH_ALIASES = {
     # HF ships the class as ``BaiChuanForCausalLM`` (CamelCase) — registry
-    # uses ``BaichuanForCausalLM``. Documented on the Baichuan page.
-    "BaichuanForCausalLM": "BaiChuanForCausalLM",
     # HF upstream renamed ``Gemma3nForConditionalGeneration`` between releases;
     # the "Gemma 3n" variant is covered on the Gemma 3 VL page.
     "Gemma3nForConditionalGeneration": "Gemma 3n",

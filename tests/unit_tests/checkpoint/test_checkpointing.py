@@ -1475,7 +1475,7 @@ class TestIsCustomModel:
     def test_subclass_of_custom_model_is_custom(self):
         """A subclass of a custom model class is also detected as custom."""
         Base = type("Base", (torch.nn.Module,), {})
-        Base.__module__ = "nemo_automodel.components.models.kimivl.model"
+        Base.__module__ = "nemo_automodel.components.models.kimi_k25_vl.model"
         Child = type("Child", (Base,), {})
         Child.__module__ = "some_other_module"
         instance = Child()
@@ -1977,7 +1977,7 @@ class TestLoadModelCustomModelGuard:
 
         # Create a model class in the custom namespace
         CustomModel = type("CustomModel", (torch.nn.Module,), {})
-        CustomModel.__module__ = "nemo_automodel.components.models.kimivl.model"
+        CustomModel.__module__ = "nemo_automodel.components.models.kimi_k25_vl.model"
         model = CustomModel()
         model.layer = torch.nn.Linear(4, 4)
 

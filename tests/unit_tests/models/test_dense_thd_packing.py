@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CPU parity coverage for dense Llama/Qwen2 packed THD execution."""
+"""CPU parity coverage for dense Llama/Qwen3 packed THD execution."""
 
 from __future__ import annotations
 
@@ -23,11 +23,11 @@ import pytest
 import torch
 import torch.nn.functional as F
 from torch import nn
-from transformers import LlamaConfig, Qwen2Config, Qwen3Config
+from transformers import LlamaConfig, Qwen3Config
 
 from nemo_automodel.components.models.common import BackendConfig
 
-MODEL_KINDS = ("llama", "qwen2", "qwen3")
+MODEL_KINDS = ("llama", "qwen3")
 
 
 def _create_causal_mask_without_cache_position(
@@ -118,20 +118,6 @@ def _build_model(
         module = importlib.import_module("nemo_automodel.components.models.llama.model")
         model_cls = module.LlamaForCausalLM
         config = LlamaConfig(
-            vocab_size=32,
-            hidden_size=16,
-            intermediate_size=32,
-            num_hidden_layers=1,
-            num_attention_heads=4,
-            num_key_value_heads=2,
-            max_position_embeddings=32,
-            attention_dropout=attention_dropout,
-            tie_word_embeddings=False,
-        )
-    elif model_kind == "qwen2":
-        module = importlib.import_module("nemo_automodel.components.models.qwen2.model")
-        model_cls = module.Qwen2ForCausalLM
-        config = Qwen2Config(
             vocab_size=32,
             hidden_size=16,
             intermediate_size=32,
@@ -263,7 +249,7 @@ def test_te_attention_preserves_configured_dropout(model_kind, monkeypatch):
     assert model.model.layers[0].self_attn.attn_module.attention_dropout == 0.25
 
 
-@pytest.mark.parametrize("model_kind", ("qwen2", "qwen3"))
+@pytest.mark.parametrize("model_kind", ("qwen3",))
 def test_packed_sliding_attention_matches_huggingface_window(model_kind, monkeypatch):
     """Packed THD must use the same inclusive token count as HF sliding attention."""
     torch.manual_seed(1234)

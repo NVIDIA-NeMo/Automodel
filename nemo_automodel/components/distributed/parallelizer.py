@@ -2039,10 +2039,6 @@ def _get_model_layer_group_specs() -> Dict[Any, Dict[str, List[str]]]:
         Gemma4ForConditionalGeneration: {"language": ["model.language_model.layers"]},
         # String fallback in case of class identity mismatch across imports.
         "Gemma4ForConditionalGeneration": {"language": ["model.language_model.layers"]},
-        "KimiVLForConditionalGeneration": {
-            "language": ["model.language_model.layers"],
-            "vision": ["model.vision_tower.encoder.blocks"],
-        },
         "KimiK25VLForConditionalGeneration": {
             "language": ["model.language_model.layers"],
             "vision": ["model.vision_tower.encoder.blocks"],

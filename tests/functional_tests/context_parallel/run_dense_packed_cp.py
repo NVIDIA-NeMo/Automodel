@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Packed-THD CP and composed TP+CP parity for dense Llama, Qwen2, and Qwen3.
+"""Packed-THD CP and composed TP+CP parity for dense Llama and Qwen3.
 
 Run with::
 
@@ -33,7 +33,7 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.parallel import parallelize_module
 from transformer_engine.pytorch import DotProductAttention
-from transformers import LlamaConfig, Qwen2Config, Qwen3Config
+from transformers import LlamaConfig, Qwen3Config
 
 from nemo_automodel.components.distributed.context_parallel.utils import (
     attach_te_context_parallel,
@@ -46,7 +46,6 @@ from nemo_automodel.components.distributed.parallelizer import (
 )
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.llama.model import LlamaForCausalLM
-from nemo_automodel.components.models.qwen2.model import Qwen2ForCausalLM
 from nemo_automodel.components.models.qwen3.model import Qwen3ForCausalLM
 
 NUM_HIDDEN_LAYERS = 2
@@ -87,9 +86,6 @@ def _build_model(
     if model_kind == "llama":
         config = LlamaConfig(**common)
         model_cls = LlamaForCausalLM
-    elif model_kind == "qwen2":
-        config = Qwen2Config(**common)
-        model_cls = Qwen2ForCausalLM
     else:
         config = Qwen3Config(**common, head_dim=8)
         model_cls = Qwen3ForCausalLM
@@ -300,11 +296,11 @@ def main() -> None:
     cp_mesh = mesh["cp"]
     tp_mesh = mesh["tp"]
     try:
-        for model_kind in ("llama", "qwen2", "qwen3"):
+        for model_kind in ("llama", "qwen3"):
             _run_model(model_kind, device, cp_mesh, tp_mesh)
             dist.barrier()
         if args.tp_size == 1:
-            for model_kind in ("qwen2", "qwen3"):
+            for model_kind in ("qwen3",):
                 _run_packed_sliding_attention(model_kind, device)
                 dist.barrier()
     finally:

@@ -60,7 +60,6 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
-from nemo_automodel.components.models.deprecation import warn_deprecated_model_class
 from nemo_automodel.components.models.llama.rope_utils import (
     LlamaRotaryEmbedding,
     apply_rotary_pos_emb,
@@ -563,7 +562,6 @@ class LlamaForCausalLM(HFCheckpointingMixin, LlamaPreTrainedModel):
         backend: BackendConfig | None = None,
     ):
         reject_unsupported_tie_word_embeddings(type(self), config)
-        warn_deprecated_model_class("LlamaForCausalLM")
         super().__init__(config)
         self.config = config
         self.backend = backend or BackendConfig()

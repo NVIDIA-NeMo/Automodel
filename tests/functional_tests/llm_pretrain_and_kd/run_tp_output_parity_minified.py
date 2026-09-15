@@ -21,7 +21,6 @@ variants of:
 - Qwen3ForSequenceClassification (HF)
 - Ministral3ForCausalLM (NeMo Automodel custom)
 - LlamaForCausalLM (NeMo Automodel custom, combined QKV + gate_up projections)
-- Qwen2ForCausalLM (NeMo Automodel custom, combined QKV + gate_up projections)
 - Nemotron Super (LlamaForCausalLM, 10-layer full-hidden, llama_nemotron_super_tp_plan)
 
 It also validates both tensor-parallel plans:
@@ -51,21 +50,18 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
-from torch.distributed.tensor.parallel import ColwiseParallel, RowwiseParallel, parallelize_module
+from torch.distributed.tensor.parallel import parallelize_module
 from torch.distributed.tensor.placement_types import Replicate
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM, Qwen3ForSequenceClassification
 
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.distributed.parallelizer import _get_parallel_plan, _update_attention_head_counts_for_tp
-from nemo_automodel.components.models.baichuan.configuration import BaichuanConfig
-from nemo_automodel.components.models.baichuan.model import BaichuanForCausalLM
 from nemo_automodel.components.models.common.utils import BackendConfig
 from nemo_automodel.components.models.llama.model import LlamaConfig, LlamaForCausalLM
 from nemo_automodel.components.models.mistral3.model import Ministral3Config, Ministral3ForCausalLM
-from nemo_automodel.components.models.qwen2.model import Qwen2Config, Qwen2ForCausalLM
 
-ModelKind = Literal["qwen3", "qwen3_seq_cls", "ministral3", "llama", "qwen2", "nemotron", "baichuan"]
+ModelKind = Literal["qwen3", "qwen3_seq_cls", "ministral3", "llama", "nemotron"]
 SPMode = Literal["true", "false", "both"]
 
 
@@ -346,65 +342,10 @@ def _build_minified_model(kind: ModelKind):
         model = _HFAutoCausalLM.from_config(cfg, trust_remote_code=True)
         return cfg, model
 
-    if kind == "qwen2":
-        num_layers = 2
-        backend = BackendConfig(rms_norm="torch")
-        cfg = Qwen2Config(
-            vocab_size=128,
-            hidden_size=64,
-            intermediate_size=256,
-            num_hidden_layers=num_layers,
-            num_attention_heads=4,
-            num_key_value_heads=2,
-            max_position_embeddings=128,
-            use_cache=False,
-            tie_word_embeddings=True,
-            use_sliding_window=False,
-            sliding_window=None,
-            layer_types=["full_attention"] * num_layers,
-            attn_implementation="sdpa",
-            torch_dtype=torch.bfloat16,
-        )
-        model = Qwen2ForCausalLM(cfg, backend=backend)
-        with torch.no_grad():
-            for _, module in model.named_modules():
-                if isinstance(module, torch.nn.Linear) and module.bias is not None:
-                    torch.nn.init.normal_(module.bias, mean=0.1, std=0.1)
-        return cfg, model
-
-    if kind == "baichuan":
-        cfg = BaichuanConfig(
-            vocab_size=128,
-            hidden_size=64,
-            intermediate_size=256,
-            num_hidden_layers=2,
-            num_attention_heads=4,
-            max_position_embeddings=128,
-            use_cache=False,
-            tie_word_embeddings=False,
-        )
-        return cfg, BaichuanForCausalLM(cfg)
-
     raise ValueError(f"Unknown model kind: {kind}")
 
 
-def _baichuan_tp_plan() -> dict:
-    """TP plan for Baichuan2.
-
-    Only the MLP is sharded.  The attention path stays fully replicated
-    because W_pack uses a non-interleaved [Q|K|V] layout (ColwiseParallel
-    would split it incorrectly) and NormHead (lm_head) is not nn.Linear
-    (ColwiseParallel is unsupported).  Keeping the attention replicated
-    also avoids DTensor from_local misinterpretation at o_proj.
-    """
-    return {
-        "model.layers.*.mlp.gate_proj": ColwiseParallel(),
-        "model.layers.*.mlp.up_proj": ColwiseParallel(),
-        "model.layers.*.mlp.down_proj": RowwiseParallel(),
-    }
-
-
-_SP_UNSUPPORTED_MODELS: set[ModelKind] = {"baichuan"}
+_SP_UNSUPPORTED_MODELS: set[ModelKind] = set()
 
 
 def _run_case(
@@ -453,8 +394,6 @@ def _run_case(
 
     if case.kind == "nemotron":
         tp_shard_plan = "llama_nemotron_super_tp_plan"
-    elif case.kind == "baichuan":
-        tp_shard_plan = _baichuan_tp_plan()
     else:
         tp_shard_plan = None
     tp_mesh = DeviceMesh(device_type, torch.arange(world_size, device="cpu"), mesh_dim_names=("tp",))
@@ -481,8 +420,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--models",
         nargs="+",
-        default=["qwen3", "qwen3_seq_cls", "ministral3", "llama", "qwen2", "nemotron"],
-        choices=["qwen3", "qwen3_seq_cls", "ministral3", "llama", "qwen2", "nemotron", "baichuan"],
+        default=["qwen3", "qwen3_seq_cls", "ministral3", "llama", "nemotron"],
+        choices=["qwen3", "qwen3_seq_cls", "ministral3", "llama", "nemotron"],
         help="Which models to test. 'nemotron' uses 10-layer full-hidden LlamaForCausalLM with llama_nemotron_super_tp_plan.",
     )
     parser.add_argument(
@@ -546,7 +485,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     all_ok = True
 
     for case in cases:
-        kl_threshold = args.kl_threshold if case.kind != "baichuan" else 1e-4
+        kl_threshold = args.kl_threshold
         # Keep ranks roughly in sync for cleaner output.
         dist.barrier()
         ok, kl = _run_case(case, device=device, device_type=device_type, kl_threshold=kl_threshold, dtype=dtype)

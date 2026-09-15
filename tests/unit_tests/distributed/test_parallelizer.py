@@ -3331,16 +3331,6 @@ class TestExtractModelLayers:
             assert len(groups["vision"]) == vision_count
             assert result == groups["language"] + groups["vision"]
 
-        class KimiVLForConditionalGeneration(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.model = nn.Module()
-                self.model.language_model = nn.Module()
-                self.model.language_model.layers = _layers(3)
-                self.model.vision_tower = nn.Module()
-                self.model.vision_tower.encoder = nn.Module()
-                self.model.vision_tower.encoder.blocks = _layers(2)
-
         class KimiK25VLForConditionalGeneration(nn.Module):
             def __init__(self):
                 super().__init__()
@@ -3389,7 +3379,6 @@ class TestExtractModelLayers:
                 self.model.vision_model.transformer = nn.Module()
                 self.model.vision_model.transformer.resblocks = _layers(2)
 
-        _assert_counts(KimiVLForConditionalGeneration(), 3, 2)
         _assert_counts(KimiK25VLForConditionalGeneration(), 4, 2)
         _assert_counts(MiniMaxM3SparseForConditionalGeneration(), 5, 2)
         _assert_counts(Qwen3_5MoeForConditionalGeneration(), 6, 3)
