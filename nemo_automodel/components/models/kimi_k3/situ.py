@@ -27,6 +27,14 @@ from typing import TYPE_CHECKING, Any
 import torch
 import torch.nn as nn  # noqa: F401 - kept for parity with model.py type usage
 
+from nemo_automodel.components.models.kimi_k3.situ_triton import (
+    HAVE_TRITON as _HAVE_SITU_TRITON,
+)
+from nemo_automodel.components.models.kimi_k3.situ_triton import (
+    situ_bwd_triton,
+    situ_fwd_triton,
+)
+
 if TYPE_CHECKING:
     from nemo_automodel.components.models.kimi_k3.model import KimiRMSNorm  # noqa: F401
 
@@ -208,11 +216,32 @@ _dense_situ_dispatch = _dense_situ_core
 
 
 def dense_situ(x: torch.Tensor, beta: float, linear_beta: float | None) -> torch.Tensor:
-    """Apply the dense SiTU activation through the (possibly compiled) module-level core."""
+    """Apply the dense SiTU activation through the Triton kernels or the (possibly compiled) core."""
+    if _situ_triton_applies(x.reshape(-1, x.shape[-1]) if x.dim() != 2 else x, None):
+        return _DenseSiTUFunction.apply(x, beta, linear_beta)
     return _dense_situ_dispatch(x, beta, linear_beta)
 
 
 _SITU_CORES_COMPILED = False
+_SITU_TRITON_ENABLED = False
+
+
+def _enable_situ_triton() -> None:
+    """Route the SiTU activation through the hand-written Triton kernels (``BackendConfig.situ_triton``).
+
+    Runs once per process. ``_WeightedSiTUFunction`` (row-aligned ``[rows, 1]`` weights on a
+    CUDA device) and ``SituAndMul`` then launch ``situ_triton.situ_fwd_triton`` /
+    ``situ_bwd_triton`` instead of the eager chunk loop or the ``compile_situ`` inductor
+    kernels; every other shape keeps its existing path. Without Triton the flag is a no-op
+    (the eager or compiled path stays in place). fp32 math and operation order match the
+    eager cores; only the routing-weight gradient's fp32 accumulation order differs.
+    """
+    global _SITU_TRITON_ENABLED
+    if _SITU_TRITON_ENABLED:
+        return
+    if not (_HAVE_SITU_TRITON and torch.cuda.is_available()):
+        return
+    _SITU_TRITON_ENABLED = True
 
 
 def _compile_situ_cores() -> None:
@@ -306,6 +335,44 @@ def _situ_rw_is_row_aligned(gate_up: torch.Tensor, routing_weights: torch.Tensor
     return routing_weights.dim() == gate_up.dim() and routing_weights.shape[:-1] == gate_up.shape[:-1]
 
 
+def _situ_triton_applies(gate_up2: torch.Tensor, routing_weights2: torch.Tensor | None) -> bool:
+    """Return True when the Triton SiTU kernels handle this ``[rows, 2 * intermediate]`` call.
+
+    Args:
+        gate_up2: Flattened gate+up projections of shape [rows, 2 * intermediate].
+        routing_weights2: Row-aligned weights of shape [rows, k], or None for the
+            dense activation. Only ``k == 1`` is routed to Triton.
+    """
+    if not _SITU_TRITON_ENABLED or not gate_up2.is_cuda or gate_up2.shape[0] == 0:
+        return False
+    if gate_up2.shape[-1] < 2 or gate_up2.shape[-1] % 2:
+        return False
+    if routing_weights2 is not None and (routing_weights2.dim() != 2 or routing_weights2.shape[-1] != 1):
+        return False
+    return True
+
+
+class _DenseSiTUFunction(torch.autograd.Function):
+    """Dense SiTU (no routing weights) on the Triton kernels, saving only the low-precision input."""
+
+    @staticmethod
+    def forward(ctx: Any, x: torch.Tensor, beta: float, linear_beta: float | None) -> torch.Tensor:
+        ctx.beta, ctx.linear_beta = beta, linear_beta
+        ctx.save_for_backward(x)
+        last = x.shape[-1]
+        x2 = x.reshape(-1, last)
+        return situ_fwd_triton(x2, None, beta, linear_beta).reshape(*x.shape[:-1], last // 2)
+
+    @staticmethod
+    def backward(ctx: Any, grad_out: torch.Tensor) -> tuple[torch.Tensor, None, None]:
+        (x,) = ctx.saved_tensors
+        last = x.shape[-1]
+        d_x2, _ = situ_bwd_triton(
+            x.reshape(-1, last), None, grad_out.reshape(-1, last // 2).contiguous(), ctx.beta, ctx.linear_beta, False
+        )
+        return d_x2.reshape(x.shape), None, None
+
+
 class _WeightedSiTUFunction(torch.autograd.Function):
     """Chunked fp32 weighted-SiTU that saves only the low-precision inputs.
 
@@ -348,6 +415,10 @@ class _WeightedSiTUFunction(torch.autograd.Function):
         gu2 = gate_up.reshape(-1, last)
         row_aligned = _situ_rw_is_row_aligned(gate_up, routing_weights)
         rw2 = routing_weights.reshape(-1, routing_weights.shape[-1]) if row_aligned else routing_weights
+        if row_aligned and _situ_triton_applies(gu2, rw2):
+            out = situ_fwd_triton(gu2, rw2.contiguous(), beta, linear_beta)
+            out_shape = torch.broadcast_shapes((*gate_up.shape[:-1], half), routing_weights.shape)
+            return out.reshape(out_shape)
         if _SITU_CORES_COMPILED and gu2.shape[0] > 0:
             out = _weighted_situ_fwd_fused_dispatch(gu2, rw2 if row_aligned else routing_weights, beta, linear_beta)
             out_shape = torch.broadcast_shapes((*gate_up.shape[:-1], half), routing_weights.shape)
@@ -391,6 +462,10 @@ class _WeightedSiTUFunction(torch.autograd.Function):
         row_aligned = _situ_rw_is_row_aligned(gate_up, routing_weights)
         rw2 = routing_weights.reshape(-1, routing_weights.shape[-1]) if row_aligned else routing_weights
         want_drw = ctx.needs_input_grad[1]
+        if row_aligned and _situ_triton_applies(gu2, rw2):
+            d_gu2, d_rw2 = situ_bwd_triton(gu2, rw2.contiguous(), go2.contiguous(), beta, linear_beta, want_drw)
+            d_rw = d_rw2.reshape(routing_weights.shape) if d_rw2 is not None else None
+            return d_gu2.reshape(gate_up.shape), d_rw, None, None
         if _SITU_CORES_COMPILED and gu2.shape[0] > 0:
             d_gu2, d_rw = _weighted_situ_bwd_fused_dispatch(
                 gu2, rw2 if row_aligned else routing_weights, go2, beta, linear_beta, want_drw
