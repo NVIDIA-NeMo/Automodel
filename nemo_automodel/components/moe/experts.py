@@ -959,6 +959,18 @@ class GroupedExpertsDeepEP(nn.Module):
         self.dispatcher_num_sms = dispatcher_num_sms
         self.dispatcher_share_token_dispatcher = dispatcher_share_token_dispatcher
         self.dispatcher_async_dispatch = dispatcher_async_dispatch
+        self.dispatcher_hybridep_permute_fusion = (
+            backend.dispatcher_hybridep_permute_fusion if backend is not None else False
+        )
+        self.dispatcher_hybridep_num_sms_preprocessing = (
+            backend.dispatcher_hybridep_num_sms_preprocessing if backend is not None else None
+        )
+        self.dispatcher_hybridep_num_blocks_permute = (
+            backend.dispatcher_hybridep_num_blocks_permute if backend is not None else None
+        )
+        self.dispatcher_hybridep_num_blocks_unpermute = (
+            backend.dispatcher_hybridep_num_blocks_unpermute if backend is not None else None
+        )
 
         # Allocate projection tensor - size depends on whether activation is gated
         # Gated (SwiGLU, Quick-GEGLU): [n_experts, dim, 2*inter_dim]
@@ -992,6 +1004,10 @@ class GroupedExpertsDeepEP(nn.Module):
             moe_hybridep_num_sms=self.dispatcher_num_sms,
             moe_share_token_dispatcher=self.dispatcher_share_token_dispatcher,
             moe_deepep_async_dispatch=self.dispatcher_async_dispatch,
+            moe_hybridep_permute_fusion=self.dispatcher_hybridep_permute_fusion,
+            moe_hybridep_num_sms_preprocessing=self.dispatcher_hybridep_num_sms_preprocessing,
+            moe_hybridep_num_blocks_permute=self.dispatcher_hybridep_num_blocks_permute,
+            moe_hybridep_num_blocks_unpermute=self.dispatcher_hybridep_num_blocks_unpermute,
             moe_benchmark_static_routing=self.static_routing,
         )
 
@@ -1254,6 +1270,18 @@ class GroupedExpertsTE(nn.Module):
         self.dispatcher_num_sms = dispatcher_num_sms
         self.dispatcher_share_token_dispatcher = dispatcher_share_token_dispatcher
         self.dispatcher_async_dispatch = dispatcher_async_dispatch
+        self.dispatcher_hybridep_permute_fusion = (
+            backend.dispatcher_hybridep_permute_fusion if backend is not None else False
+        )
+        self.dispatcher_hybridep_num_sms_preprocessing = (
+            backend.dispatcher_hybridep_num_sms_preprocessing if backend is not None else None
+        )
+        self.dispatcher_hybridep_num_blocks_permute = (
+            backend.dispatcher_hybridep_num_blocks_permute if backend is not None else None
+        )
+        self.dispatcher_hybridep_num_blocks_unpermute = (
+            backend.dispatcher_hybridep_num_blocks_unpermute if backend is not None else None
+        )
 
         # Gated (SwiGLU, Quick-GEGLU): out_features = moe_inter_dim * 2
         # Non-gated (ReLU²): out_features = moe_inter_dim
@@ -1564,6 +1592,10 @@ class GroupedExpertsTE(nn.Module):
             moe_hybridep_num_sms=self.dispatcher_num_sms,
             moe_share_token_dispatcher=self.dispatcher_share_token_dispatcher,
             moe_deepep_async_dispatch=self.dispatcher_async_dispatch,
+            moe_hybridep_permute_fusion=self.dispatcher_hybridep_permute_fusion,
+            moe_hybridep_num_sms_preprocessing=self.dispatcher_hybridep_num_sms_preprocessing,
+            moe_hybridep_num_blocks_permute=self.dispatcher_hybridep_num_blocks_permute,
+            moe_hybridep_num_blocks_unpermute=self.dispatcher_hybridep_num_blocks_unpermute,
             moe_benchmark_static_routing=self.static_routing,
         )
 
