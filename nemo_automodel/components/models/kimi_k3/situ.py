@@ -27,6 +27,16 @@ from typing import TYPE_CHECKING, Any
 import torch
 import torch.nn as nn  # noqa: F401 - kept for parity with model.py type usage
 
+from nemo_automodel.components.models.kimi_k3.attn_res_triton import (
+    MAX_ENTRIES as _ATTN_RES_MAX_ENTRIES,
+)
+from nemo_automodel.components.models.kimi_k3.attn_res_triton import (
+    MAX_HIDDEN as _ATTN_RES_MAX_HIDDEN,
+)
+from nemo_automodel.components.models.kimi_k3.attn_res_triton import (
+    attn_res_bwd_triton,
+    attn_res_fwd_triton,
+)
 from nemo_automodel.components.models.kimi_k3.situ_triton import (
     HAVE_TRITON as _HAVE_SITU_TRITON,
 )
@@ -224,6 +234,75 @@ def dense_situ(x: torch.Tensor, beta: float, linear_beta: float | None) -> torch
 
 _SITU_CORES_COMPILED = False
 _SITU_TRITON_ENABLED = False
+_ATTN_RES_TRITON_ENABLED = False
+
+
+def _enable_attn_res_triton() -> None:
+    """Route the attention-residual mix through the fused Triton kernels (``BackendConfig.attn_res_triton``).
+
+    Runs once per process. ``_apply_attn_res`` then launches ``attn_res_triton.attn_res_fwd_triton`` /
+    ``attn_res_bwd_triton`` (no ``torch.cat``, no fp32 copy of the stacked entries) for CUDA inputs with
+    at most ``attn_res_triton.MAX_ENTRIES`` block entries; every other call keeps the eager or
+    ``compile_situ`` chain. Without Triton the flag is a no-op. fp32 math matches ``_attn_res_core`` up
+    to fp32 accumulation order.
+    """
+    global _ATTN_RES_TRITON_ENABLED
+    if _ATTN_RES_TRITON_ENABLED:
+        return
+    if not (_HAVE_SITU_TRITON and torch.cuda.is_available()):
+        return
+    _ATTN_RES_TRITON_ENABLED = True
+
+
+def _attn_res_triton_applies(prefix_sum: torch.Tensor, block_residual: torch.Tensor) -> bool:
+    """Return True when the fused Triton kernels handle this attention-residual mix call.
+
+    Args:
+        prefix_sum: Current residual stream of shape [tokens, hidden].
+        block_residual: Prior block starts of shape [tokens, k, hidden].
+    """
+    if not _ATTN_RES_TRITON_ENABLED or not prefix_sum.is_cuda or not block_residual.is_cuda:
+        return False
+    if prefix_sum.dim() != 2 or block_residual.dim() != 3 or prefix_sum.shape[0] == 0:
+        return False
+    if block_residual.shape[0] != prefix_sum.shape[0] or block_residual.shape[2] != prefix_sum.shape[1]:
+        return False
+    if block_residual.shape[1] > _ATTN_RES_MAX_ENTRIES or prefix_sum.shape[1] > _ATTN_RES_MAX_HIDDEN:
+        return False
+    return True
+
+
+class _AttnResTritonFunction(torch.autograd.Function):
+    """Attention-residual mix on the fused Triton kernels; saves only the inputs and 3 x (k+1) fp32 stats per token."""
+
+    @staticmethod
+    def forward(
+        ctx: Any,
+        prefix_sum: torch.Tensor,
+        block_residual: torch.Tensor,
+        norm_weight: torch.Tensor,
+        proj_weight: torch.Tensor,
+        eps: float,
+    ) -> torch.Tensor:
+        prefix_sum = prefix_sum if prefix_sum.stride(-1) == 1 else prefix_sum.contiguous()
+        block_residual = block_residual if block_residual.stride(-1) == 1 else block_residual.contiguous()
+        out, stats = attn_res_fwd_triton(prefix_sum, block_residual, norm_weight, proj_weight, eps)
+        ctx.save_for_backward(prefix_sum, block_residual, norm_weight, proj_weight, stats)
+        return out
+
+    @staticmethod
+    def backward(
+        ctx: Any, grad_out: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None, None]:
+        prefix_sum, block_residual, norm_weight, proj_weight, stats = ctx.saved_tensors
+        grad_out = grad_out if grad_out.stride(-1) == 1 else grad_out.contiguous()
+        d_prefix, d_block, d_sw = attn_res_bwd_triton(
+            prefix_sum, block_residual, norm_weight, proj_weight, grad_out, stats
+        )
+        # score_weight = norm_weight.float() * proj_weight.float(): chain the fp32 gradient to both.
+        d_norm = (d_sw * proj_weight.float()).to(norm_weight.dtype) if ctx.needs_input_grad[2] else None
+        d_proj = (d_sw * norm_weight.float()).to(proj_weight.dtype) if ctx.needs_input_grad[3] else None
+        return d_prefix, d_block, d_norm, d_proj, None
 
 
 def _enable_situ_triton() -> None:
@@ -578,6 +657,14 @@ def _apply_attn_res(
     norm: KimiRMSNorm,
 ) -> torch.Tensor:
     """Mix ``[tokens, hidden]`` with prior ``[tokens, blocks, hidden]`` residuals."""
+    if _attn_res_triton_applies(prefix_sum, block_residual):
+        return _AttnResTritonFunction.apply(
+            prefix_sum,
+            block_residual,
+            norm.weight,
+            projection.weight.squeeze(0),
+            norm.variance_epsilon,
+        )
     values = torch.cat((block_residual, prefix_sum.unsqueeze(1)), dim=1)
     return _attn_res_core(
         values,
