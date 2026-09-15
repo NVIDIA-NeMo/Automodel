@@ -12,12 +12,51 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from numbers import Integral
 from typing import Any
 
 import torch
 import torch.nn as nn
 
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+
+_DATASET_IGNORE_INDEX = -100
+
+
+def _get_loss_ignore_index(loss_fn: object) -> int:
+    """Return the label sentinel consumed by ``loss_fn``."""
+    ignore_index = getattr(loss_fn, "ignore_index", _DATASET_IGNORE_INDEX)
+    return int(ignore_index) if isinstance(ignore_index, Integral) else _DATASET_IGNORE_INDEX
+
+
+def _normalize_loss_labels(labels: torch.Tensor, ignore_index: int) -> torch.Tensor:
+    """Map dataset padding to a loss's configured ignore index.
+
+    Args:
+        labels: Integer target tensor of any shape.
+        ignore_index: Label sentinel consumed by the loss.
+
+    Returns:
+        Target tensor with the same shape, dtype, and device as ``labels``.
+        The input is returned unchanged when ``ignore_index`` is ``-100``;
+        otherwise a new tensor maps dataset padding from ``-100`` to the
+        configured sentinel.
+    """
+    if ignore_index == _DATASET_IGNORE_INDEX:
+        return labels
+    return labels.masked_fill(labels == _DATASET_IGNORE_INDEX, ignore_index)
+
+
+def _count_label_tokens(labels: torch.Tensor, ignore_index: int) -> int:
+    """Count supervised entries in an integer target tensor of any shape.
+
+    Both the dataset's ``-100`` padding and the configured ``ignore_index``
+    are excluded. The return value is a Python integer.
+    """
+    valid = labels != _DATASET_IGNORE_INDEX
+    if ignore_index != _DATASET_IGNORE_INDEX:
+        valid = valid & (labels != ignore_index)
+    return int(valid.sum().item())
 
 
 def _get_lm_head_module(model: nn.Module) -> nn.Module | None:
@@ -87,9 +126,9 @@ def calculate_loss(loss_fn: nn.Module, **kwargs: Any) -> torch.Tensor:
         Scalar loss tensor that does not alias an input.
     """
     loss_fn_kwargs = {"num_label_tokens": kwargs.pop("num_label_tokens", None)}
+    labels = _normalize_loss_labels(kwargs.pop("labels"), _get_loss_ignore_index(loss_fn))
     if isinstance(loss_fn, FusedLinearCrossEntropy):
         model = kwargs.pop("model")
-        labels = kwargs.pop("labels")
         # Reuse a caller-materialized LM head when provided so a single
         # full_tensor() all-gather is shared across the main loss and every MTP
         # depth (see calculate_mtp_loss). Re-gathering the (vocab x hidden) head
@@ -112,7 +151,7 @@ def calculate_loss(loss_fn: nn.Module, **kwargs: Any) -> torch.Tensor:
         loss_fn_kwargs.update(
             {
                 "logits": kwargs.pop("logits"),
-                "labels": kwargs.pop("labels"),
+                "labels": labels,
             }
         )
 

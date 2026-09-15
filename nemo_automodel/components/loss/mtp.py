@@ -25,6 +25,7 @@ from nemo_automodel.components.loss.utils import (
     _get_final_hidden_states,
     _get_lm_head_module,
     _get_lm_head_weight,
+    _get_loss_ignore_index,
     calculate_loss,
 )
 from nemo_automodel.components.models.common.mtp import get_mtp_loss_scaling_factor, roll_tensor
@@ -55,7 +56,7 @@ def calculate_mtp_loss(
     model: nn.Module,
     scaling_factor: float = 0.1,
     num_label_tokens: int | None = None,
-    ignore_index: int = -100,
+    ignore_index: int | None = None,
     cu_seqlens: torch.Tensor | None = None,
     seq_idx: torch.Tensor | None = None,
     lm_weight: torch.Tensor | None = None,
@@ -75,7 +76,7 @@ def calculate_mtp_loss(
     model: nn.Module,
     scaling_factor: float = 0.1,
     num_label_tokens: int | None = None,
-    ignore_index: int = -100,
+    ignore_index: int | None = None,
     cu_seqlens: torch.Tensor | None = None,
     seq_idx: torch.Tensor | None = None,
     lm_weight: torch.Tensor | None = None,
@@ -95,7 +96,7 @@ def calculate_mtp_loss(
     model: nn.Module,
     scaling_factor: float = 0.1,
     num_label_tokens: int | None = None,
-    ignore_index: int = -100,
+    ignore_index: int | None = None,
     cu_seqlens: torch.Tensor | None = None,
     seq_idx: torch.Tensor | None = None,
     lm_weight: torch.Tensor | None = None,
@@ -114,7 +115,7 @@ def calculate_mtp_loss(
     model: nn.Module,
     scaling_factor: float = 0.1,
     num_label_tokens: int | None = None,
-    ignore_index: int = -100,
+    ignore_index: int | None = None,
     cu_seqlens: torch.Tensor | None = None,
     seq_idx: torch.Tensor | None = None,
     lm_weight: torch.Tensor | None = None,
@@ -150,7 +151,8 @@ def calculate_mtp_loss(
         num_label_tokens: Total non-ignore label-token count used for
             sum-reduction normalization.
         ignore_index: Label value masked out of the CE loss for the trailing
-            ``k+1`` rolled positions at depth ``k``.
+            ``k+1`` rolled positions at depth ``k``. Defaults to the configured
+            loss's ignore index and must match it when provided.
         cu_seqlens: Optional cumulative sequence lengths ``[num_seqs+1]``
             (THD-pack layout). When supplied and ``seq_idx`` is not, builds
             a per-token sub-sequence index via searchsorted. Without packing
@@ -173,6 +175,12 @@ def calculate_mtp_loss(
         :class:`MTPLossOutput` containing the scalar aggregate and scalar
         per-depth losses. All returned tensors retain their autograd graphs.
     """
+    loss_ignore_index = _get_loss_ignore_index(loss_fn)
+    if ignore_index is None:
+        ignore_index = loss_ignore_index
+    elif ignore_index != loss_ignore_index:
+        raise ValueError(f"MTP ignore_index must match the configured loss: got {ignore_index} and {loss_ignore_index}")
+
     if mtp_per_depth_logits is not None:
         if mtp_per_depth_h is not None:
             raise ValueError("Provide exactly one of mtp_per_depth_h or mtp_per_depth_logits")
@@ -323,14 +331,19 @@ class PipelineCausalLMLoss(nn.Module):
         loss_fn: nn.Module,
         model: nn.Module,
         scaling_factor: float | None = None,
-        ignore_index: int = -100,
+        ignore_index: int | None = None,
         grad_reduce_group: dist.ProcessGroup | None = None,
     ):
         super().__init__()
         self.loss_fn = loss_fn
         self.model = model
         self.scaling_factor = scaling_factor
-        self.ignore_index = ignore_index
+        loss_ignore_index = _get_loss_ignore_index(loss_fn)
+        if ignore_index is not None and ignore_index != loss_ignore_index:
+            raise ValueError(
+                f"MTP ignore_index must match the configured loss: got {ignore_index} and {loss_ignore_index}"
+            )
+        self.ignore_index = loss_ignore_index
         self.grad_reduce_group = grad_reduce_group
         # Legacy THD-pack fallback used when the model has no seq_idx tail.
         self.cu_seqlens: torch.Tensor | None = None
@@ -434,11 +447,12 @@ class MTPLossConfig:
     MTP is gated on the model emitting per-depth outputs; this config only
     carries its hyperparameters. ``scaling_factor=None`` keeps the
     model-provided value (``out.mtp_loss_scaling_factor`` /
-    ``get_mtp_loss_scaling_factor``); set it to override.
+    ``get_mtp_loss_scaling_factor``); set it to override. ``ignore_index=None``
+    inherits the configured loss's sentinel; an explicit value must match it.
     """
 
     scaling_factor: float | None = None
-    ignore_index: int = -100
+    ignore_index: int | None = None
 
     def build(
         self,
