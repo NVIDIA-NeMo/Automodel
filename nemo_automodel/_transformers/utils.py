@@ -245,7 +245,14 @@ def apply_cache_compatibility_patches():
             head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
             dim = int(head_dim * getattr(config, "partial_rotary_factor", 1.0))
             indices = torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float32)
-            return 1.0 / (config.rope_theta ** (indices / dim)), 1.0
+            # transformers >= 5.17 moved ``rope_theta`` off the config into
+            # ``config.rope_parameters["rope_theta"]``; read the legacy attribute first for
+            # backward compatibility, then the standardized location.
+            rope_theta = getattr(config, "rope_theta", None)
+            if rope_theta is None:
+                rope_parameters = getattr(config, "rope_parameters", None) or {}
+                rope_theta = rope_parameters.get("rope_theta", 10000.0)
+            return 1.0 / (rope_theta ** (indices / dim)), 1.0
 
         ROPE_INIT_FUNCTIONS["default"] = _default_rope_parameters
 
