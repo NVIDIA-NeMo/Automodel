@@ -22,6 +22,4 @@ class Llama4ForConditionalGeneration:
 
     parallel_spec: ParallelSpec = ParallelSpec(
         layer_groups={"language": ("language_model.model.layers",), "vision": ("vision_model.model.layers",)},
-        text_config_path="language_model.model.config",
-        hf_tp_plan_prefix=("language_model.model",),
     )

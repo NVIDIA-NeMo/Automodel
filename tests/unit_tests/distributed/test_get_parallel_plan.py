@@ -178,7 +178,7 @@ def test_hf_fallback(monkeypatch):
     _set_global_model_cls(monkeypatch, _DummyModel)
 
     result = _get_parallel_plan(_DummyModel(), sequence_parallel=False)
-    assert result is hf_plan
+    assert result == hf_plan
 
 
 def test_hf_fallback_sequence_parallel_assert(monkeypatch):
@@ -362,7 +362,7 @@ def test_hf_native_plan_unaffected_at_tp_size_gt_1(monkeypatch):
     _set_global_model_cls(monkeypatch, _RemoteCodeDummyModel)
 
     result = _get_parallel_plan(_RemoteCodeDummyModel(), sequence_parallel=False, tp_size=4)
-    assert result is hf_plan
+    assert result == hf_plan
 
 
 def test_custom_plan_imports_non_dict_raises(monkeypatch):

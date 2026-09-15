@@ -32,8 +32,6 @@ correctly needs **no** spec. Declare one when any of the following is true:
 |---|---|
 | The optimized TP plan differs from HF's `_tp_plan` / the base plan (fused QKV, extra projections, replicated mixers, MLP-only sharding). | `tp_plan`, plus `sequence_parallel_plan` when the architecture has a sequence-parallel variant |
 | Transformer blocks are not at `model.layers`, or there are several groups (language + vision towers). | `layer_groups` |
-| `num_attention_heads` / `num_key_value_heads` live on a nested config (`config.text_config`, `model.language_model.config`). | `text_config_path` |
-| HF `_tp_plan` keys are relative to a submodule other than `model` (VLM text backbones). | `hf_tp_plan_prefix` |
 | A head's plan entry is only valid with a sharded output (e.g. weight-normalized logits). | `sharded_output_only` |
 | Whole logical layers must be checkpointed instead of the generic submodule wrappers. | Not a `ParallelSpec` field: declare an `activation_checkpointing_spec` (see below). |
 | The FSDP2 flow itself must change, or TP validity depends on the instance (per-layer block configs, per-variant plans). | `strategy` |
@@ -50,12 +48,10 @@ behaviour that depends on the model instance belongs in a `ParallelizationStrate
 | `tp_plan` | `dict[str, ParallelStyle]` | `None` → HF `_tp_plan`, then the base plan | `_get_parallel_plan` |
 | `sequence_parallel_plan` | `dict[str, ParallelStyle]` overlaid on `tp_plan` when SP is requested | `None` → SP request is ignored with a warning | `_get_parallel_plan` via `spec.resolved_tp_plan(sequence_parallel)` |
 | `layer_groups` | `dict[str, tuple[str, ...]]` — role → candidate module FQNs | `None` → `model.layers` / largest `ModuleList` | FSDP2 per-layer wrapping, activation checkpointing scopes |
-| `text_config_path` | dotted attribute path from the model | `None` → `model.config` | `validate_tp_mesh` head-divisibility check |
-| `hf_tp_plan_prefix` | candidate submodule FQNs | `("model",)` | `get_hf_tp_shard_plan` |
 | `sharded_output_only` | module FQNs | `()` | `_get_parallel_plan`, after the plan is chosen from any source: an entry for one of these modules is dropped unless its output is sharded |
 | `strategy` | `ParallelizationStrategy` instance | `None` → `DefaultParallelizationStrategy` | `fsdp2_strategy_parallelize` |
 
-Candidate tuples (`layer_groups` values, `hf_tp_plan_prefix`) are tried in order and the first
+`layer_groups` candidate tuples are tried in order and the first
 FQN that resolves wins, so one spec covers several `transformers` module-tree layouts without
 version gating. Put the canonical path first: standardized 4.x releases keep deprecated alias
 properties (`language_model`, `visual`) that also resolve.
@@ -118,15 +114,22 @@ class LlamaForCausalLM(HFCheckpointingMixin, nn.Module):
 
 `FSDP2Config.sequence_parallel` selects the overlay. An architecture whose plan *is* HF's own
 `_tp_plan` declares no `tp_plan` at all (Qwen3.5 does this: its GatedDeltaNet layers are not
-TP-shardable, so transformers' `base_model_tp_plan` is exactly right) and the parallelizer
-translates the HF plan.
+TP-shardable, so transformers' `base_model_tp_plan` is exactly right); the parallelizer then
+builds the spec from the model with `ParallelSpec.from_hf_model(model)`.
+
+Nothing in a spec points at a model attribute. What the parallelizer needs from the instance it
+asks the model for through APIs every `transformers` model has: the fully-qualified `_tp_plan`
+that `DistributedMixin.init_parallel_plans` assembles (class plan, the config's
+`base_model_tp_plan`, every child's plan under its attribute name), `get_input_embeddings()` for
+the embedding to row-shard, and `config.get_text_config()` for the head counts the TP validation
+checks. When a spec genuinely has to be *constructed* from such inputs, that is a classmethod —
+`from_hf_model` is the one such constructor today.
 
 A VLM usually needs the tree described as well:
 
 ```python
 QWEN3_5_VLM_PARALLEL_SPEC = ParallelSpec(
     layer_groups={"language": ("model.language_model.layers",), "vision": ("model.visual.blocks",)},
-    hf_tp_plan_prefix=("model.language_model",),
     strategy=Qwen3_5ParallelizationStrategy(),
 )
 ```
@@ -202,10 +205,9 @@ class Gemma3ForConditionalGeneration:
     """Contract for the transformers ``Gemma3ForConditionalGeneration``."""
 
     parallel_spec: ParallelSpec = ParallelSpec(
-        tp_plan=gemma3_tp_plan,
+        tp_plan=GEMMA3_VLM_TP_PLAN,
+        sequence_parallel_plan=GEMMA3_VLM_SEQUENCE_PARALLEL_PLAN,
         layer_groups=GEMMA3_LAYERS,
-        text_config_path="config.text_config",
-        hf_tp_plan_prefix=("model", "language_model"),
     )
 ```
 
@@ -251,7 +253,7 @@ The resolution order inside `_get_parallel_plan` is:
 
 1. `tp_plan` passed explicitly (dict or import path);
 2. `spec.resolved_tp_plan(sequence_parallel)` — the declared plan with its sequence-parallel overlay;
-3. HF `_tp_plan`, rooted at `spec.hf_tp_plan_prefix`;
+3. the HF `_tp_plan` transformers assembled on the model, as `ParallelSpec.from_hf_model(model)`;
 4. the base llama-style plan. At `tp_size > 1` a `trust_remote_code` class with no usable plan
    raises instead, because the base plan's placements trip a DTensor redistribute assert.
 

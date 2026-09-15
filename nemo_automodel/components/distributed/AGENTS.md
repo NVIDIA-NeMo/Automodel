@@ -53,9 +53,10 @@ class NewModelForCausalLM(HFCheckpointingMixin, nn.Module):
 ```
 
 `ParallelSpec` (`parallel_spec.py`) is pure data: the TP plan and its sequence-parallel
-overlay as dictionaries, layer groups, text-config path, HF `_tp_plan` root, the
-`sharded_output_only` constraint and the strategy override (the one place for instance-dependent
-behaviour); `parallelizer.py` only
+overlay as dictionaries, layer groups, the `sharded_output_only` constraint and the strategy
+override (the one place for instance-dependent behaviour). It never points at a model attribute;
+what must come from the instance (HF `_tp_plan`, input embedding, text config) is read through
+the model's own API, and `ParallelSpec.from_hf_model` is the constructor for that case; `parallelizer.py` only
 ever reads the `parallel_spec` class attribute (`query_parallel_spec`); activation checkpointing
 has its own `ActivationCheckpointingSpec` (`activation_checkpointing.py`, read from the separate
 `activation_checkpointing_spec` attribute by `query_activation_checkpointing_spec`). Architectures

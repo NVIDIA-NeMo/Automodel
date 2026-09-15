@@ -23,6 +23,8 @@ from typing import TYPE_CHECKING
 from torch.distributed.tensor.parallel import ParallelStyle
 
 if TYPE_CHECKING:
+    from torch import nn
+
     from nemo_automodel.components.distributed.parallelizer import ParallelizationStrategy
 
 
@@ -52,11 +54,6 @@ class ParallelSpec:
             each as candidate FQNs; the first that resolves wins, so one spec covers several
             ``transformers`` module-tree layouts. ``None`` uses ``model.model.layers`` or
             the largest ``ModuleList`` in the model.
-        text_config_path: Dotted attribute path from the model to the config holding
-            ``num_attention_heads`` / ``num_key_value_heads`` for TP validation, e.g.
-            ``"config.text_config"``. ``None`` reads ``model.config``.
-        hf_tp_plan_prefix: Candidate FQNs of the submodule whose ``_tp_plan`` keys are
-            relative to it; the first that resolves is used and prefixes those keys.
         sharded_output_only: Module FQNs whose plan entry is dropped unless it produces a sharded
             output, whatever the plan's source (declared, HuggingFace or user-supplied). A head
             whose forward combines its output with a sharded weight (e.g. weight-normalized
@@ -67,8 +64,6 @@ class ParallelSpec:
     tp_plan: dict[str, ParallelStyle] | None = None
     sequence_parallel_plan: dict[str, ParallelStyle] | None = None
     layer_groups: dict[str, tuple[str, ...]] | None = None
-    text_config_path: str | None = None
-    hf_tp_plan_prefix: tuple[str, ...] = ("model",)
     sharded_output_only: tuple[str, ...] = ()
     strategy: ParallelizationStrategy | None = None
 
@@ -84,3 +79,19 @@ class ParallelSpec:
         if sequence_parallel and self.sequence_parallel_plan:
             plan.update(self.sequence_parallel_plan)
         return {fqn: copy.copy(style) for fqn, style in plan.items()}
+
+    @classmethod
+    def from_hf_model(cls, model: nn.Module) -> ParallelSpec | None:
+        """Spec for a model that declares nothing itself but ships a HuggingFace ``_tp_plan``.
+
+        transformers assembles the fully-qualified plan on the instance -- the class plan, the
+        config's ``base_model_tp_plan`` and every child's plan under the child's attribute name
+        (``DistributedMixin.init_parallel_plans``) -- so nothing about the model's layout has to be
+        declared here. The styles are translated to ``ParallelStyle`` objects and the input embedding
+        is row-sharded when the plan omits it (see ``get_hf_tp_shard_plan``). Returns ``None`` when the
+        translated plan is empty.
+        """
+        from nemo_automodel.components.distributed.parallelizer import get_hf_tp_shard_plan  # imports this module
+
+        plan = get_hf_tp_shard_plan(model)
+        return cls(tp_plan=plan) if plan else None

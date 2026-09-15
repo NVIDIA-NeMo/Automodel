@@ -33,8 +33,6 @@ LLAVA_LAYERS = {
 
 LLAVA_PARALLEL_SPEC = ParallelSpec(
     layer_groups=LLAVA_LAYERS,
-    text_config_path="language_model.config",
-    hf_tp_plan_prefix=("model.language_model",),
 )
 
 

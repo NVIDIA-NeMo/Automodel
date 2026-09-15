@@ -51,12 +51,15 @@ class TestGetHfTpShardPlanSkipsNoneStyles:
     returns None (the new 'replicated_with_grad_allreduce' case), not crash."""
 
     def _build_model_with_inner_plan(self, plan):
-        """Create a minimal model exposing an inner ``.model._tp_plan`` attribute."""
+        """A minimal model carrying the plan transformers assembles for an inner ``model`` child.
+
+        transformers merges a child's ``_tp_plan`` into the instance plan under the child's name, so
+        the instance plan is what the translator reads.
+        """
         model = nn.Module()
         model.config = SimpleNamespace(tie_word_embeddings=False)
-        inner = nn.Module()
-        inner._tp_plan = plan
-        model.model = inner
+        model.model = nn.Module()
+        model._tp_plan = {f"model.{key}": style for key, style in plan.items()}
         return model
 
     def test_none_styled_entry_is_skipped(self):
@@ -89,7 +92,7 @@ class TestParallelizeQwen35VlmRegistered:
         monkeypatch.setattr(parallelizer, "get_hf_tp_shard_plan", fake_get_hf_tp_shard_plan)
         dummy = type("Qwen3_5Stub", (nn.Module,), {"parallel_spec": QWEN3_5_VLM_PARALLEL_SPEC})()
         result = parallelizer._get_parallel_plan(dummy, sequence_parallel=False, tp_size=2)
-        assert result is sentinel_plan
+        assert result == sentinel_plan  # the HF-derived spec hands out a copy
         assert calls == [dummy]
 
 

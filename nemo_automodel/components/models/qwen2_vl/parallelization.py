@@ -27,8 +27,6 @@ QWEN2_VL_LAYERS = {
 # Shared with Qwen2.5-VL, whose module tree is identical.
 QWEN2_VL_PARALLEL_SPEC = ParallelSpec(
     layer_groups=QWEN2_VL_LAYERS,
-    text_config_path="language_model.config",
-    hf_tp_plan_prefix=("model.language_model",),
 )
 
 

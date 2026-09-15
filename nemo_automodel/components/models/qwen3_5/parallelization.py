@@ -170,7 +170,6 @@ QWEN3_5_LAYERS = {"language": ("model.language_model.layers",), "vision": ("mode
 # (self_attn + MLP only).
 QWEN3_5_VLM_PARALLEL_SPEC = ParallelSpec(
     layer_groups=QWEN3_5_LAYERS,
-    hf_tp_plan_prefix=("model.language_model",),
     strategy=Qwen3_5ParallelizationStrategy(),
 )
 QWEN3_5_CAUSAL_LM_PARALLEL_SPEC = ParallelSpec(strategy=Qwen3_5ParallelizationStrategy())

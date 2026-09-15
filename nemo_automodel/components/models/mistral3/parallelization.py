@@ -50,8 +50,6 @@ MISTRAL3_VLM_PARALLEL_SPEC = ParallelSpec(
             "model.vision_tower.transformer.layers",
         ),
     },
-    text_config_path="model.language_model.config",
-    hf_tp_plan_prefix=("model.language_model",),
 )
 
 

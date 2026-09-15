@@ -91,7 +91,4 @@ class Gemma3ForConditionalGeneration:
         tp_plan=GEMMA3_VLM_TP_PLAN,
         sequence_parallel_plan=GEMMA3_VLM_SEQUENCE_PARALLEL_PLAN,
         layer_groups=GEMMA3_LAYERS,
-        text_config_path="config.text_config",
-        # Pre-standardization releases hang the text tower off a top-level ``language_model``.
-        hf_tp_plan_prefix=("model", "language_model"),
     )

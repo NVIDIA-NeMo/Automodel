@@ -917,31 +917,38 @@ class TestUtilityFunctions:
 
 
 class TestGetHfTpShardPlan:
-    """Test suite for get_hf_tp_shard_plan function."""
+    """Test suite for get_hf_tp_shard_plan function.
+
+    transformers assembles the fully-qualified plan on the instance (class plan + config plan + every
+    child's plan under its attribute name), so the function reads the class and instance plans as they
+    are, adds the input embedding it finds through ``get_input_embeddings()``, and translates styles.
+    """
+
+    @staticmethod
+    def _with_embedding(model):
+        """Give a mock the input-embedding API the real models have."""
+        model.model.embed_tokens = nn.Embedding(4, 4)
+        model.get_input_embeddings = lambda: model.model.embed_tokens
+        return model
 
     def test_standard_model_with_class_tp_plan(self):
         """Test standard model with TP plan defined on model class."""
         model = MockModel()
         model_cls = type(model)
-
         # Add TP plan to model class
         model_cls._tp_plan = {
             "layers.0.self_attn.q_proj": "colwise",
             "layers.0.self_attn.k_proj": "colwise",
             "layers.0.mlp.gate_proj": "colwise",
         }
-
         # Mock config for tied embeddings test
         model.config.tie_word_embeddings = True
-
         try:
             result = get_hf_tp_shard_plan(model)
-
             # Verify TP plan was applied correctly
             assert len(result) > 0
             assert "layers.0.self_attn.q_proj" in result
             assert isinstance(result["layers.0.self_attn.q_proj"], ColwiseParallel)
-
         finally:
             # Clean up class attribute
             if hasattr(model_cls, "_tp_plan"):
@@ -949,84 +956,56 @@ class TestGetHfTpShardPlan:
 
     def test_standard_model_with_instance_tp_plan(self):
         """Test standard model with TP plan defined on model instance."""
-        model = MockModel()
-
+        model = self._with_embedding(MockModel())
         # Add TP plan to model instance
         model._tp_plan = {
             "layers.0.self_attn.q_proj": "rowwise",
             "layers.0.mlp.down_proj": "rowwise",
         }
         model.config.tie_word_embeddings = False
-
         result = get_hf_tp_shard_plan(model)
-
         # Verify TP plan was applied correctly
         assert len(result) > 0
         assert "layers.0.self_attn.q_proj" in result
         assert isinstance(result["layers.0.self_attn.q_proj"], RowwiseParallel)
-
-        # Should add embed_tokens since tie_word_embeddings=False
+        # The input embedding is located through the model's API and row-sharded
         assert "model.embed_tokens" in result
         assert isinstance(result["model.embed_tokens"], RowwiseParallel)
 
-    def test_standard_model_with_inner_model_tp_plan(self):
-        """Test standard model with TP plan defined on inner model."""
+    def test_inner_module_plans_are_not_re_rooted(self):
+        """transformers already merges child plans into the instance plan with the child's name as
+        prefix; the translator must not add a second copy from the inner module."""
         model = MockModel()
-
-        # Add TP plan to inner model
-        model.model._tp_plan = {
-            "layers.0.self_attn.v_proj": "colwise_rep",
-            "layers.0.self_attn.o_proj": "rowwise_rep",
-        }
-        model.config.tie_word_embeddings = False
-
+        model._tp_plan = {"model.layers.0.self_attn.v_proj": "colwise_rep"}  # what transformers assembles
+        model.model._tp_plan = {"layers.0.self_attn.v_proj": "colwise_rep"}  # the child's own, relative plan
+        model.config.tie_word_embeddings = True
         result = get_hf_tp_shard_plan(model)
-
-        # Verify TP plan was applied correctly with model prefix
-        assert len(result) > 0
-        assert "model.layers.0.self_attn.v_proj" in result
+        assert set(result) == {"model.layers.0.self_attn.v_proj"}
         assert isinstance(result["model.layers.0.self_attn.v_proj"], ColwiseParallel)
-        assert "model.layers.0.self_attn.o_proj" in result
-        assert isinstance(result["model.layers.0.self_attn.o_proj"], RowwiseParallel)
 
-    def test_multiple_tp_plan_sources_precedence(self):
-        """Test precedence when TP plans exist in multiple places."""
+    def test_instance_plan_takes_precedence_over_class_plan(self):
         model = MockModel()
         model_cls = type(model)
-
-        # Add TP plans to all possible sources
-        model_cls._tp_plan = {"layers.0.self_attn.q_proj": "colwise"}
-        model._tp_plan = {"layers.0.self_attn.k_proj": "rowwise"}
-        model.model._tp_plan = {"layers.0.self_attn.v_proj": "colwise_rep"}
+        model_cls._tp_plan = {"layers.0.self_attn.q_proj": "colwise", "lm_head": "colwise_rep"}
+        model._tp_plan = {"layers.0.self_attn.q_proj": "rowwise"}
         model.config.tie_word_embeddings = True
-
         try:
             result = get_hf_tp_shard_plan(model)
-
-            # All plans should be merged
-            assert "layers.0.self_attn.q_proj" in result  # from class
-            assert "layers.0.self_attn.k_proj" in result  # from instance
-            assert "model.layers.0.self_attn.v_proj" in result  # from inner model with prefix
-
-            # Instance plan should take precedence over class plan if same key exists
-            assert isinstance(result["layers.0.self_attn.q_proj"], ColwiseParallel)
+            assert isinstance(result["layers.0.self_attn.q_proj"], RowwiseParallel)  # instance wins
+            assert "lm_head" in result  # class-only entries are kept
         finally:
-            # Clean up class attribute
             if hasattr(model_cls, "_tp_plan"):
                 delattr(model_cls, "_tp_plan")
 
     def test_lm_head_optimization(self):
         """Test special optimization for lm_head with colwise_rep."""
         model = MockModel()
-
         model._tp_plan = {
             "lm_head": "colwise_rep",
             "layers.0.self_attn.q_proj": "colwise",
         }
         model.config.tie_word_embeddings = False
-
         result = get_hf_tp_shard_plan(model)
-
         # Verify lm_head gets special optimization
         assert "lm_head" in result
         lm_head_parallel = result["lm_head"]
@@ -1034,109 +1013,77 @@ class TestGetHfTpShardPlan:
         # The optimization should set output_layouts=Shard(-1) and use_local_output=False
         assert not lm_head_parallel.use_local_output
 
-    def test_lm_head_no_optimization_when_tied(self):
-        """Test lm_head doesn't get optimization when embeddings are tied."""
+    def test_embedding_added_from_get_input_embeddings(self):
+        """The embedding to row-shard is whatever ``get_input_embeddings()`` returns, wherever it lives."""
         model = MockModel()
-
-        model._tp_plan = {
-            "lm_head": "colwise_rep",
-            "layers.0.self_attn.q_proj": "colwise",
-        }
-        model.config.tie_word_embeddings = True
-
+        model.model.language_model = nn.Module()
+        model.model.language_model.embed_tokens = nn.Embedding(4, 4)
+        model.get_input_embeddings = lambda: model.model.language_model.embed_tokens
+        model._tp_plan = {"model.layers.0.self_attn.q_proj": "colwise"}
         result = get_hf_tp_shard_plan(model)
+        assert isinstance(result["model.language_model.embed_tokens"], RowwiseParallel)
+        assert "model.embed_tokens" not in result
 
-        # Verify lm_head gets standard translation, not optimization
-        assert "lm_head" in result
-        lm_head_parallel = result["lm_head"]
-        assert isinstance(lm_head_parallel, ColwiseParallel)
-
-    def test_embed_tokens_added_when_not_tied(self):
-        """Test embed_tokens is added when tie_word_embeddings=False."""
-        model = MockModel()
-
-        model._tp_plan = {"layers.0.self_attn.q_proj": "colwise"}
-        model.config.tie_word_embeddings = False
-
-        result = get_hf_tp_shard_plan(model)
-
-        assert "model.embed_tokens" in result
-        assert isinstance(result["model.embed_tokens"], RowwiseParallel)
+    def test_no_embedding_added_without_the_api(self):
+        model = MockModel()  # no get_input_embeddings()
+        model._tp_plan = {"model.layers.0.mlp": "colwise"}
+        assert set(get_hf_tp_shard_plan(model)) == {"model.layers.0.mlp"}
 
     def test_parallel_style_translations(self):
         """Test all parallel style string translations."""
         model = MockModel()
-
         model._tp_plan = {
             "layer1": "colwise",
             "layer2": "rowwise",
             "layer3": "colwise_rep",
             "layer4": "rowwise_rep",
             "layer5": "sequence_parallel",
+            "layer6": "embedding_rowwise",
         }
         model.config.tie_word_embeddings = True
-
         result = get_hf_tp_shard_plan(model)
-
         assert isinstance(result["layer1"], ColwiseParallel)
         assert isinstance(result["layer2"], RowwiseParallel)
         assert isinstance(result["layer3"], ColwiseParallel)
         assert isinstance(result["layer4"], RowwiseParallel)
         assert isinstance(result["layer5"], SequenceParallel)
+        assert isinstance(result["layer6"], RowwiseParallel)
+
+    def test_moe_only_styles_are_skipped(self):
+        """HF's MoE styles (including Llama 4's packed expert weights) leave the weights replicated."""
+        model = MockModel()
+        model._tp_plan = {
+            "model.layers.0.mlp": "colwise",
+            "model.layers.0.experts.gate_up_proj": "packed_rowwise",
+            "model.layers.0.experts.down_proj": "local_rowwise",
+            "model.layers.0.router": "ep_router",
+        }
+        assert set(get_hf_tp_shard_plan(model)) == {"model.layers.0.mlp"}
+
+    def test_unresolvable_entries_are_reported(self, caplog):
+        """A plan key that matches no module would be silently ignored by parallelize_module."""
+        model = MockModel()
+        model._tp_plan = {"model.layers.*.mlp": "colwise", "language_model.layers.*.mlp": "colwise"}
+        with caplog.at_level("WARNING"):
+            result = get_hf_tp_shard_plan(model)
+        assert set(result) == {"model.layers.*.mlp", "language_model.layers.*.mlp"}
+        assert "language_model.layers.*.mlp" in caplog.text
+        assert "model.layers.*.mlp']" in caplog.text or "['language_model.layers.*.mlp']" in caplog.text
 
     def test_no_tp_plan_error(self):
         """Test error when no TP plan is found."""
         model = MockModel()
         model.config.tie_word_embeddings = True
-
         with pytest.raises(AssertionError, match="Hugging Face tp plan is not supported"):
             get_hf_tp_shard_plan(model)
 
     def test_invalid_parallel_style_error(self):
         """Test error for invalid parallel style string."""
         model = MockModel()
-
         model._tp_plan = {"layers.0.self_attn.q_proj": "invalid_style"}
         model.config.tie_word_embeddings = True
-
         with pytest.raises(ValueError, match="Unknown parallel style"):
             get_hf_tp_shard_plan(model)
-
-    @staticmethod
-    def _bare_gemma3():
-        """Gemma3 instance with exact class identity but no HF ``__init__``."""
-        model = Gemma3ForConditionalGeneration.__new__(Gemma3ForConditionalGeneration)
-        nn.Module.__init__(model)
-        return _bridged(model)
-
-    def test_gemma3_pre_standardization_tree_uses_language_model_prefix(self):
-        """Old Gemma3 (transformers <= 4.51) hangs the text tower off a top-level
-        ``language_model``; the prefix must follow the registered child module,
-        not a transformers version gate.
-        """
-        model = self._bare_gemma3()
-        language_model = nn.Module()
-        language_model._tp_plan = {"model.layers.0.self_attn.q_proj": "colwise"}
-        model.language_model = language_model
-
-        result = get_hf_tp_shard_plan(model)
-
-        assert isinstance(result["language_model.model.layers.0.self_attn.q_proj"], ColwiseParallel)
-        assert "language_model.embed_tokens" in result
-
-    def test_gemma3_standardized_tree_uses_model_prefix(self):
-        """Standardized Gemma3 (transformers >= 4.52, incl. v5) nests everything
-        under ``model``; the prefix must resolve structurally to ``model``.
-        """
-        model = self._bare_gemma3()
-        inner = nn.Module()
-        inner._tp_plan = {"language_model.layers.0.self_attn.q_proj": "colwise"}
-        model.model = inner
-
-        result = get_hf_tp_shard_plan(model)
-
-        assert isinstance(result["model.language_model.layers.0.self_attn.q_proj"], ColwiseParallel)
-        assert "model.embed_tokens" in result
 
 
 class TestApplyFsdpShardingRecursively:

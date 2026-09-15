@@ -22,5 +22,4 @@ class SmolVLMForConditionalGeneration:
 
     parallel_spec: ParallelSpec = ParallelSpec(
         layer_groups={"language": ("model.text_model.layers",), "vision": ("model.vision_model.encoder.layers",)},
-        text_config_path="model.text_model.config",
     )

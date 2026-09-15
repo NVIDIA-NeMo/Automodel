@@ -306,6 +306,5 @@ class Gemma4ParallelizationStrategy(DefaultParallelizationStrategy):
 # The transformers Gemma4 class and this native port share the module tree and strategy.
 GEMMA4_PARALLEL_SPEC = ParallelSpec(
     layer_groups={"language": ("model.language_model.layers",)},
-    text_config_path="config.text_config",
     strategy=Gemma4ParallelizationStrategy(),
 )

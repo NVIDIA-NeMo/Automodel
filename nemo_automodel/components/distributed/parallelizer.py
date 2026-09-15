@@ -15,11 +15,12 @@
 import importlib
 import inspect
 import logging
+import re
 import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from contextlib import contextmanager
-from functools import lru_cache, reduce
+from functools import lru_cache
 from types import FunctionType
 from typing import Any, Dict, Generator, List, Sequence, Tuple, Union
 
@@ -729,24 +730,39 @@ def apply_fsdp2_sharding_recursively(
 
 
 def has_hf_tp_plan(model: nn.Module) -> bool:
-    """Whether :func:`get_hf_tp_shard_plan` has a HuggingFace ``_tp_plan`` to translate.
+    """Whether :func:`get_hf_tp_shard_plan` has a HuggingFace ``_tp_plan`` to translate (class or instance)."""
+    return getattr(type(model), "_tp_plan", None) is not None or getattr(model, "_tp_plan", None) is not None
 
-    Mirrors its sources: the class, the instance, and the text-model roots named by
-    ``ParallelSpec.hf_tp_plan_prefix``.
-    """
-    if getattr(type(model), "_tp_plan", None) is not None or getattr(model, "_tp_plan", None) is not None:
-        return True
-    roots = _reduce_attrs(model, list(query_parallel_spec(model).hf_tp_plan_prefix))
-    return any(getattr(root, "_tp_plan", None) is not None for root in roots)
+
+def _input_embedding_fqn(model: nn.Module) -> str | None:
+    """FQN of the module ``model.get_input_embeddings()`` returns, or ``None`` when the model has no such API."""
+    get_input_embeddings = getattr(model, "get_input_embeddings", None)
+    if not callable(get_input_embeddings):
+        return None
+    try:
+        embedding = get_input_embeddings()
+    except Exception:
+        return None
+    return next((name for name, module in model.named_modules() if module is embedding), None)
+
+
+def _plan_pattern_resolves(model: nn.Module, pattern: str) -> bool:
+    """Whether a ``parallelize_module`` key (``*`` = one path segment) matches at least one module of ``model``."""
+    regex = re.compile("^" + re.escape(pattern).replace(r"\*", r"[^.]+") + "$")
+    return any(regex.match(name) for name, _ in model.named_modules())
 
 
 def get_hf_tp_shard_plan(model):
-    """Get the Hugging Face tensor parallel plan from the model.
+    """Translate the HuggingFace ``_tp_plan`` transformers assembled on ``model`` into ``ParallelStyle`` objects.
 
-    This function:
-    - Retrieves TP strategies from model class, instance, and inner model levels.
-    - Handles special cases for `embed_tokens` and `lm_head` for speed up.
-    - Converts string-based parallel styles to DTensor parallelization strategies.
+    transformers copies the class plan onto the instance and merges the config's ``base_model_tp_plan``
+    and every child's plan under the child's attribute name (``DistributedMixin.init_parallel_plans``),
+    so the keys are already fully qualified and no model-specific root is needed. On top of that:
+
+    - the input embedding (``model.get_input_embeddings()``) is row-sharded when the plan omits it;
+    - ``lm_head`` keeps a vocab-sharded output instead of HF's replicated one (a speed-up);
+    - HF's MoE-only styles are skipped (their weights stay replicated, see below);
+    - keys that match no module are reported, since ``parallelize_module`` would silently ignore them.
 
     Taken and modified from: https://github.com/NVIDIA/NeMo/blob/6c6169db01bcca73ae8ad3ac35242fadbb9a78ba/nemo/lightning/pytorch/strategies/utils.py#L532
 
@@ -760,38 +776,22 @@ def get_hf_tp_shard_plan(model):
         AssertionError: If no TP plan is found
     """
     model_cls = type(model)
-    spec = query_parallel_spec(model)
-    # HF ``_tp_plan`` keys are relative to the text backbone, which VLMs nest differently
-    # per transformers release: take the first candidate root that resolves.
-    for model_prefix in spec.hf_tp_plan_prefix:
-        matches = _reduce_attrs(model, [model_prefix])
-        if matches:
-            inner_model = matches[0]
-            break
-    else:
-        raise AttributeError(f"{model_cls.__name__} has none of the expected text-model roots {spec.hf_tp_plan_prefix}")
-
     hf_tp_plan = {}
-
-    # model_cls._tp_plan will override model_cls after xxxForCausalLM.post_init() (transformers==4.51.3)
-    if hasattr(model_cls, "_tp_plan") and model_cls._tp_plan is not None:
+    if getattr(model_cls, "_tp_plan", None) is not None:
         assert isinstance(model_cls._tp_plan, dict), f"model_cls._tp_plan is not a dict: {model_cls._tp_plan}"
         hf_tp_plan.update(model_cls._tp_plan)
-
-    if hasattr(model, "_tp_plan") and model._tp_plan is not None:
+    if getattr(model, "_tp_plan", None) is not None:
         hf_tp_plan.update(model._tp_plan)
-
-    if hasattr(inner_model, "_tp_plan") and inner_model._tp_plan is not None:
-        hf_tp_plan.update({f"{model_prefix}.{k}": v for k, v in inner_model._tp_plan.items()})
 
     assert len(hf_tp_plan) > 0, (
         f"Hugging Face tp plan is not supported for {model_cls}, please set dtensor_cfg.tensor_parallel_size to 1 or provide a custom_parallel_plan. "
         "The usage example of custom_parallel_plan can refer to `docs/design-docs/fsdp2-parallel-plan.md`."
     )
 
-    # hf tp plan not contain embed_tokens, we add it and set to rowwise_rep
-    if f"{model_prefix}.embed_tokens" not in hf_tp_plan:
-        hf_tp_plan[f"{model_prefix}.embed_tokens"] = "rowwise_rep"
+    # HF plans rarely include the input embedding; shard it by vocabulary rows.
+    embedding_fqn = _input_embedding_fqn(model)
+    if embedding_fqn is not None and embedding_fqn not in hf_tp_plan:
+        hf_tp_plan[embedding_fqn] = "rowwise_rep"
 
     # Build translated plan, skipping HF's MoE-related styles.
     #
@@ -804,12 +804,13 @@ def get_hf_tp_shard_plan(model):
     # - ep_router: Modifies routing so each rank only computes with a subset of experts.
     #   This distributes compute but not memory.
     # - gather: All-reduces expert outputs across ranks.
+    # - packed_colwise/packed_rowwise: 3-D packed expert weights (Llama 4).
     #
     # Since these styles result in replicated expert weights (not sharded), and we don't
     # support HF's routing modification approach, we skip them entirely. The experts will
     # be replicated across all ranks and computed redundantly, which is correct but not
     # memory/compute efficient for large MoE models.
-    _hf_moe_styles = {"ep_router", "local_colwise", "local_rowwise", "gather"}
+    _hf_moe_styles = {"ep_router", "local_colwise", "local_rowwise", "gather", "packed_colwise", "packed_rowwise"}
     translated_plan = {}
     for k, v in hf_tp_plan.items():
         if isinstance(v, str) and (v.startswith("ep_") or v in _hf_moe_styles):
@@ -826,6 +827,11 @@ def get_hf_tp_shard_plan(model):
                 continue
             translated_plan[k] = style
 
+    unresolved = [k for k in translated_plan if not _plan_pattern_resolves(model, k)]
+    if unresolved:
+        logger.warning(
+            "HF tp plan entries for %s match no module and will shard nothing: %s", model_cls.__name__, unresolved
+        )
     logger.info(f"Hugging Face tp plan: {translated_plan}")
     return translated_plan
 
@@ -886,6 +892,10 @@ def translate_to_torch_parallel_style(style: str):
         # is the same as replicating it, so this matches "colwise_rep" above.
         return ColwiseParallel(output_layouts=Replicate())
     elif style == "rowwise_rep":
+        return RowwiseParallel(input_layouts=Replicate())
+    elif style == "embedding_rowwise":
+        # transformers v5 style for vocabulary-sharded embeddings: rows are sharded and the
+        # lookup result is all-reduced, which is the "rowwise_rep" embedding above.
         return RowwiseParallel(input_layouts=Replicate())
     elif style == "sequence_parallel":
         return SequenceParallel()
@@ -982,12 +992,12 @@ def validate_tp_mesh(model, tp_mesh):
     if tp_mesh.size() == 1:
         return  # if tp_mesh.size() == 1, we don't need to validate
 
-    spec = query_parallel_spec(model)
-    # VLMs keep the attention head counts on a nested text config.
-    if spec.text_config_path is not None:
-        config = reduce(getattr, spec.text_config_path.split("."), model)
-    else:
-        config = getattr(model, "config", None)
+    config = getattr(model, "config", None)
+    # Composite (VLM) configs keep the attention head counts on their text config; transformers
+    # exposes it uniformly, and non-composite configs return themselves.
+    get_text_config = getattr(config, "get_text_config", None)
+    if callable(get_text_config):
+        config = get_text_config()
     num_attention_heads = getattr(config, "num_attention_heads", None) or 0
     num_key_value_heads = getattr(config, "num_key_value_heads", None) or 0
 
@@ -1343,7 +1353,7 @@ def _get_parallel_plan(
     1) If ``tp_shard_plan`` is provided as a dict or import path, use it.
     2) If the model's ``ParallelSpec`` declares a ``tp_plan``, use it (with its sequence-parallel overlay).
     The legacy ``llama_nemotron_super_tp_plan`` alias is treated as "not provided" with a warning.
-    3) Otherwise, prefer the model's HF-native ``_tp_plan`` (via ``get_hf_tp_shard_plan``).
+    3) Otherwise, prefer the model's HF-native ``_tp_plan`` (``ParallelSpec.from_hf_model``).
     4) Otherwise, fall back to the default base plan.
 
     When ``tp_size > 1`` and the model falls through to path 4 *and* the
@@ -1422,10 +1432,12 @@ def _get_parallel_plan(
         hf_plan = None
         hf_plan_error: Exception | None = None
         try:
-            hf_plan = get_hf_tp_shard_plan(model)
+            hf_spec = ParallelSpec.from_hf_model(model)
         except Exception as e:
             hf_plan_error = e
             logger.info(f"HF tp plan not available ({e}). Falling back to default base plan.")
+        else:
+            hf_plan = hf_spec.resolved_tp_plan(sequence_parallel) if hf_spec is not None else None
 
         if hf_plan:
             model_parallel_plan = hf_plan
