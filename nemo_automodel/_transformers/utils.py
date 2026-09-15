@@ -243,14 +243,19 @@ def apply_cache_compatibility_patches():
             config: PretrainedConfig, device: torch.device | None = None, seq_len: int | None = None
         ) -> tuple[torch.Tensor, float]:
             head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
-            dim = int(head_dim * getattr(config, "partial_rotary_factor", 1.0))
+            # transformers >= 5.17 moved the RoPE spec off the config's top-level attributes
+            # into ``config.rope_parameters``; read the legacy attribute first for backward
+            # compatibility, then the standardized ``rope_parameters`` location.
+            rope_parameters = getattr(config, "rope_parameters", None) or {}
+            if not isinstance(rope_parameters, dict):
+                rope_parameters = getattr(rope_parameters, "__dict__", {}) or {}
+            partial_rotary_factor = getattr(config, "partial_rotary_factor", None)
+            if partial_rotary_factor is None:
+                partial_rotary_factor = rope_parameters.get("partial_rotary_factor", 1.0)
+            dim = int(head_dim * partial_rotary_factor)
             indices = torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float32)
-            # transformers >= 5.17 moved ``rope_theta`` off the config into
-            # ``config.rope_parameters["rope_theta"]``; read the legacy attribute first for
-            # backward compatibility, then the standardized location.
             rope_theta = getattr(config, "rope_theta", None)
             if rope_theta is None:
-                rope_parameters = getattr(config, "rope_parameters", None) or {}
                 rope_theta = rope_parameters.get("rope_theta", 10000.0)
             return 1.0 / (rope_theta ** (indices / dim)), 1.0
 
