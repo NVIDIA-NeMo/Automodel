@@ -393,6 +393,8 @@ def test_multinode_ablation_runner_preserves_paper_batch_and_uses_c10d():
     assert "WORLD_SIZE=$((NODES * 8))" in runner
     assert "128 % WORLD_SIZE" in runner
     assert "--gpus 8" in submitter
+    assert "--auto-account" in submitter
+    assert '--account="$SLURM_JOB_ACCOUNT"' in runner
     assert "checkouts/$LOCAL_SHA" in submitter
     for variant in ("no_persistent", "no_convolution", "no_momentum", "no_weight_decay", "depth3", "depth4"):
         assert f"{variant})" in runner

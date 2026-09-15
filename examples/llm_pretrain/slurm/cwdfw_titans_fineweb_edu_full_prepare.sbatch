@@ -74,6 +74,7 @@ fi
 
 TRAIN_JOB_ID=$(env -u SLURM_CPUS_PER_TASK -u SLURM_TRES_PER_TASK \
   sbatch --parsable \
+    --account="$SLURM_JOB_ACCOUNT" \
     --chdir="$AUTOMODEL_CHECKOUT" \
     examples/llm_pretrain/slurm/cwdfw_titans_170m_full.sbatch)
 echo "Dataset ready at $DATA_ROOT"

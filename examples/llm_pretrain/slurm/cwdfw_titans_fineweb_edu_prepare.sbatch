@@ -66,6 +66,7 @@ srun \
   "
 
 PILOT_JOB_ID=$(sbatch --parsable \
+  --account="$SLURM_JOB_ACCOUNT" \
   --chdir="$AUTOMODEL_CHECKOUT" \
   examples/llm_pretrain/slurm/cwdfw_titans_170m_pilot.sbatch)
 echo "Prepared $TRAIN_DATA"

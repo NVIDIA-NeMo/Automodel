@@ -115,7 +115,7 @@ SUBMIT_ARGS=(
   --script "$JOB_BODY"
   --name "$JOB_NAME"
   --partition "$PARTITION"
-  --account coreai_dlalgo_compeval
+  --auto-account
   --nodes 1
   --ntasks 1
   --cpus-per-task "$CPUS_PER_TASK"

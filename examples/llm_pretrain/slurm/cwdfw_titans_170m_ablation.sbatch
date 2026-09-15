@@ -155,7 +155,7 @@ if (( LATEST_STEP + 1 < TOTAL_STEPS )); then
   NEXT_JOB_ID=$(env -u SLURM_CPUS_PER_TASK -u SLURM_TRES_PER_TASK \
     sbatch --parsable \
       --partition=batch \
-      --account=coreai_dlalgo_compeval \
+      --account="$SLURM_JOB_ACCOUNT" \
       --nodes="$NODES" \
       --ntasks="$NODES" \
       --ntasks-per-node=1 \

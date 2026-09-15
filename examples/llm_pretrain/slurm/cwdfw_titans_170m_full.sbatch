@@ -94,7 +94,10 @@ LATEST_TARGET=$(readlink "$TITANS_CHECKPOINT_ROOT/LATEST")
 LATEST_STEP=${LATEST_TARGET##*_step_}
 if (( LATEST_STEP + 1 < TOTAL_STEPS )); then
   NEXT_JOB_ID=$(env -u SLURM_CPUS_PER_TASK -u SLURM_TRES_PER_TASK \
-    sbatch --parsable --chdir="$AUTOMODEL_CHECKOUT" "$0")
+    sbatch --parsable \
+      --account="$SLURM_JOB_ACCOUNT" \
+      --chdir="$AUTOMODEL_CHECKOUT" \
+      "$0")
   echo "Completed through step $LATEST_STEP; submitted continuation $NEXT_JOB_ID"
 else
   echo "Titans 170M reproduction completed at step $LATEST_STEP"

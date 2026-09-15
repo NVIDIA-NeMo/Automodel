@@ -120,7 +120,10 @@ tools/submit_titans_cwdfw.sh --wait
 The wrapper verifies that local `HEAD` equals the pushed branch, clones or
 fast-forwards the Lustre checkout through `slurm-cli shell`, submits through
 `slurm-cli job submit`, and prints reproducible status/log commands. It refuses
-dirty or unpushed source trees.
+dirty or unpushed source trees. The initial submission uses `--auto-account`:
+Slurm account associations are discovered with `sacctmgr`, the exact allocation
+is projected with `sbatch --test-only`, and `sshare`/`sprio` fair-share priority
+breaks near ties. Continuation segments retain the selected account.
 
 After the 4K gate, launch the production-shaped pilot with:
 
@@ -176,7 +179,8 @@ vectorized kernel before a paper-scale allocation is responsible.
 
 Defaults:
 
-- account: `coreai_dlalgo_compeval`;
+- account: automatically selected from the user's authorized `cw-dfw`
+  associations;
 - partition: `batch`;
 - current LMM allocation: one node with eight GPUs for four hours per segment;
 - ablation allocation: configurable one or two nodes, eight GPUs per node;

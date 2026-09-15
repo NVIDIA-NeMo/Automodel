@@ -121,7 +121,7 @@ SUBMIT_RESULT=$(slurm-cli --cluster "$CLUSTER" --json job submit \
   --script "$JOB_BODY" \
   --name "$JOB_NAME" \
   --partition batch \
-  --account coreai_dlalgo_compeval \
+  --auto-account \
   --nodes "$NODES" \
   --ntasks "$NODES" \
   --cpus-per-task 128 \
@@ -130,7 +130,7 @@ SUBMIT_RESULT=$(slurm-cli --cluster "$CLUSTER" --json job submit \
   --time 4:00:00 \
   --workdir "$REMOTE_CHECKOUT" \
   --output "$LOG_PATH")
-JOB_ID=$(printf '%s' "$SUBMIT_RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin)['data']['job_id'])")
+JOB_ID=$(printf '%s' "$SUBMIT_RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin)['job_id'])")
 
 echo "Submitted $VARIANT on $NODES node(s): job $JOB_ID"
 echo "Status: slurm-cli --cluster $CLUSTER job get $JOB_ID"
