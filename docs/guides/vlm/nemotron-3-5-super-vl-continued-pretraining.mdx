@@ -70,7 +70,7 @@ cd /path/to/Automodel
 export PYTHONPATH="$PWD:${PYTHONPATH:-}"
 
 # Install these only if they are absent from the environment.
-uv pip install --python "$(command -v python3)" huggingface_hub pyarrow matplotlib wandb
+uv pip install --python "$(command -v python3)" huggingface_hub pyarrow wandb
 ```
 
 The training environment also needs Transformer Engine, DeepEP, `mamba_ssm`,
@@ -413,8 +413,8 @@ export WANDB_API_KEY
 sbatch fineweb_cpt.sub
 ```
 
-The rank-zero log prints the online W&B run URL. On W&B, plot `loss` and `val_loss`
-against the optimizer step, with `lr` in a separate panel.
+The rank-zero log prints the online W&B run URL. View the `loss` panel against
+`Step` with smoothing set to `0` to inspect the raw training loss.
 
 ## Step 5 — Inspect the Checkpoint and Resume
 
@@ -444,123 +444,12 @@ checkpointed decay schedule by default: increasing `step_scheduler.max_steps` al
 not extend the saved learning-rate decay. For this recipe, keep the original 10,000-step
 schedule when continuing training.
 
-## Step 6 — Plot and Interpret the Recorded Loss
+## Step 6 — View the Training Loss in W&B
 
-Export the unsampled training and validation metrics from online W&B. The following
-script checks any available local JSONL records against W&B and writes the exported
-metrics to a separate plot directory.
-
-Set the measured run's checkpoint directory and W&B run path in your current shell;
-variables exported inside the batch job are not carried back to the submission shell.
-The following runs on a CPU compute allocation with access to W&B:
-
-```bash
-export CPT_CHECKPOINT_DIR=/path/to/shared/checkpoints/super35_cpt_JOB_ID
-export CPT_WANDB_RUN=Nemo-automodel/huiyingl_workspace/super35cptJOB_ID
-export CPT_PLOT_DIR="$CPT_CHECKPOINT_DIR/plots"
-python - <<'PY'
-import json
-import math
-import os
-from pathlib import Path
-import wandb
-
-root = Path(os.environ["CPT_CHECKPOINT_DIR"])
-out = Path(os.environ["CPT_PLOT_DIR"])
-out.mkdir(parents=True, exist_ok=True)
-run = wandb.Api().run(os.environ["CPT_WANDB_RUN"])
-history = list(run.scan_history(page_size=1000))
-(out / "wandb_history.jsonl").write_text(
-    "".join(json.dumps(row) + "\n" for row in history)
-)
-for filename, metric in [("training.jsonl", "loss"), ("validation.jsonl", "val_loss")]:
-    local_path = root / filename
-    local = {
-        row["step"]: row
-        for row in (
-            json.loads(line) for line in
-            (local_path.read_text().splitlines() if local_path.exists() else [])
-            if line.strip()
-        )
-    }
-    remote = {row["_step"]: row for row in history if row.get(metric) is not None}
-    assert remote, f"No {metric} data on W&B yet"
-    for step, row in local.items():
-        assert step in remote, f"W&B has not uploaded {filename} step {step}; retry after syncing"
-        assert math.isclose(row[metric], remote[step][metric], rel_tol=1e-7, abs_tol=1e-7)
-    # W&B merges training and validation at the same step. Select unambiguous fields:
-    # loss and val_loss remain separate; num_label_tokens/mem can be overwritten by validation.
-    merged = []
-    for step, row in sorted(remote.items()):
-        record = local.get(step, {"step": step, metric: row[metric], "lr": row.get("lr")})
-        if metric == "loss":
-            record.setdefault("tps", row.get("tps"))
-        merged.append(record)
-    assert all(math.isfinite(row[metric]) for row in merged)
-    if metric == "loss":
-        assert [row["step"] for row in merged] == list(range(len(merged)))
-    (out / filename).write_text("".join(json.dumps(row) + "\n" for row in merged))
-print(run.url)
-print("Exported metrics:", out)
-PY
-```
-
-Allow W&B synchronization to complete before exporting the metrics. Check that the
-exported step count matches the training log.
-
-The next script reads the exported metrics and writes a standalone plot and CSV.
-
-```bash
-export CPT_CHECKPOINT_DIR=/path/to/shared/checkpoints/super35_cpt_JOB_ID
-export CPT_PLOT_DIR="$CPT_CHECKPOINT_DIR/plots"
-python - <<'PY'
-import csv
-import json
-import os
-from pathlib import Path
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import numpy as np
-
-root = Path(os.environ["CPT_PLOT_DIR"])
-out = root
-out.mkdir(parents=True, exist_ok=True)
-def read(name):
-    return [json.loads(line) for line in (root / name).read_text().splitlines() if line.strip()]
-train, valid = read("training.jsonl"), read("validation.jsonl")
-steps = np.array([row["step"] + 1 for row in train])
-loss = np.array([row["loss"] for row in train])
-assert np.isfinite(loss).all()
-assert np.isfinite([row["val_loss"] for row in valid]).all()
-fig, (ax, lr_ax) = plt.subplots(2, 1, figsize=(10, 6.5), sharex=True,
-                               gridspec_kw={"height_ratios": [3, 1]}, constrained_layout=True)
-ax.plot(steps, loss, color="#3b82f6", alpha=0.35, linewidth=1, label="Training loss (raw)")
-window = min(20, len(train))
-ax.plot(steps[window - 1:], np.convolve(loss, np.ones(window) / window, mode="valid"),
-        color="#1d4ed8", linewidth=2, label=f"Training loss ({window}-step mean)")
-ax.plot([r["step"] + 1 for r in valid], [r["val_loss"] for r in valid],
-        "o-", color="#e76f00", linewidth=2, label="Held-out validation loss")
-ax.set(ylabel="Next-token cross entropy", title="Nemotron 3.5 Super VL · FineWeb continued pretraining")
-ax.legend()
-ax.grid(alpha=0.2)
-lr_ax.plot(steps, [r["lr"] for r in train], color="#6d28d9")
-lr_ax.set(xlabel="Completed optimizer steps", ylabel="Learning rate")
-lr_ax.ticklabel_format(axis="y", style="sci", scilimits=(0, 0))
-lr_ax.grid(alpha=0.2)
-fig.savefig(out / "nemotron-3-5-super-vl-fineweb-cpt-loss.png", dpi=180)
-plt.close(fig)
-with (out / "fineweb_cpt_metrics.csv").open("w", newline="") as handle:
-    fields = ["completed_steps", "training_loss", "validation_loss", "lr", "memory_gib", "tokens_per_second"]
-    writer = csv.DictWriter(handle, fieldnames=fields)
-    writer.writeheader()
-    validation = {r["step"]: r["val_loss"] for r in valid}
-    for r in train:
-        writer.writerow(dict(zip(fields, [r["step"] + 1, r["loss"], validation.get(r["step"], ""),
-                                          r["lr"], r.get("mem", ""), r.get("tps", "")])))
-print(out / "nemotron-3-5-super-vl-fineweb-cpt-loss.png")
-PY
-```
+Open the online W&B run and select **Charts**. In the `loss` panel, use **Step**
+for the X axis and `loss` for the Y axis. Set **Smoothing** to `0` in the panel's
+settings. Open the panel in full-screen view to inspect all 200 training measurements
+and capture the chart for the tutorial.
 
 ## Measured Results — 200 Steps
 
@@ -569,10 +458,10 @@ processing **26,214,400 target-token positions**.
 
 The [online W&B run](https://wandb.ai/Nemo-automodel/huiyingl_workspace/runs/cpt18614199)
 contains all 200 training losses and all eight validation losses. Every value was checked
-against the corresponding Slurm log entry within its printed precision. The plot uses
-full-precision values exported from unsampled W&B history.
+against the corresponding Slurm log entry within its printed precision. The screenshot
+below shows the W&B `loss` panel with smoothing set to `0`.
 
-![Super 3.5 VL FineWeb continued pretraining over 200 optimizer steps](./nemotron-3-5-super-vl-fineweb-cpt-loss.png)
+![W&B raw training loss for Super 3.5 VL FineWeb continued pretraining](./nemotron-3-5-super-vl-fineweb-cpt-loss.png)
 
 | Measurement | Value |
 |---|---|
@@ -585,10 +474,6 @@ full-precision values exported from unsampled W&B history.
 | Highest sampled total GPU memory | 63.41 GiB |
 | Lowest sampled free GPU memory | 15.70 GiB |
 
-The plot uses completed optimizer steps 1–200; raw logs and W&B use steps 0–199.
-The blue line averages 20 consecutive training losses. Validation evaluates the same
-128 held-out sequences every 25 optimizer steps.
-
-The [metrics CSV](./fineweb_cpt_metrics.csv) contains all 200 training measurements
-and the eight validation measurements used in the plot. Full-precision history is also
+The screenshot uses W&B's logged steps 0–199, corresponding to 200 completed optimizer
+updates. Each point is the raw training loss for that step. Full-precision history is
 available from the linked W&B run.
