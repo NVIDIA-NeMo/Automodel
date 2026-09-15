@@ -37,6 +37,7 @@ from nemo_automodel.components.datasets.loader import (
 )
 from nemo_automodel.components.distributed.utils import dp_eval_sample_shard
 from nemo_automodel.components.eval.tool_call_evaluator import ToolCallAccuracyEvaluator
+from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.loss.mtp import PipelineCausalLMLoss
 from nemo_automodel.components.models.deepseek_v4.cp import dsv4_cp_local_seq_multiple
 from nemo_automodel.components.optim.optimizer import build_optimizer_config
@@ -171,8 +172,6 @@ def dl_factory_capture(**kwargs):  # returns a sentinel while exposing passed kw
 
 
 def test_pipeline_causal_lm_loss_adds_mtp_tuple_output():
-    from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
-
     class DummyModel(nn.Module):
         def __init__(self):
             super().__init__()
@@ -203,7 +202,6 @@ def test_pipeline_causal_lm_loss_adds_mtp_tuple_output():
 
 
 def test_mtp_loss_config_defaults_and_override():
-    from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
     from nemo_automodel.components.loss.mtp import MTPLossConfig
 
     class DummyModel(nn.Module):
@@ -215,19 +213,19 @@ def test_mtp_loss_config_defaults_and_override():
         def get_output_embeddings(self):
             return self.lm_head
 
-    # Defaults: scaling_factor None (model-driven), ignore_index -100.
+    # Defaults: scaling_factor is model-driven and ignore_index is loss-driven.
     assert MTPLossConfig().scaling_factor is None
-    assert MTPLossConfig().ignore_index == -100
+    assert MTPLossConfig().ignore_index is None
 
     torch.manual_seed(123)
     model = DummyModel()
     model.train()
-    loss_fn = MaskedCrossEntropy(fp32_upcast=False, reduction="sum")
+    loss_fn = MaskedCrossEntropy(fp32_upcast=False, ignore_index=0, reduction="sum")
 
     logits = torch.randn(1, 4, 5)
     mtp_h = torch.randn(1, 4, 3)
-    labels = torch.tensor([[1, 2, 3, 4]])
-    shifted_labels = torch.tensor([[2, 3, 4, -100]])
+    labels = torch.tensor([[1, 2, 3, -100]])
+    shifted_labels = torch.tensor([[2, 3, 0, 0]])
     base = loss_fn(logits=logits, labels=labels)
     aux = loss_fn(logits=model.lm_head(mtp_h), labels=shifted_labels)
 
@@ -236,8 +234,13 @@ def test_mtp_loss_config_defaults_and_override():
     torch.testing.assert_close(got_override, base + 0.5 * aux)
 
     # The default (None) falls back to the model-provided 0.2.
-    got_default = MTPLossConfig().build(loss_fn, model)((logits, mtp_h), labels)
+    default_wrapper = MTPLossConfig().build(loss_fn, model)
+    assert default_wrapper.ignore_index == 0
+    got_default = default_wrapper((logits, mtp_h), labels)
     torch.testing.assert_close(got_default, base + 0.2 * aux)
+
+    with pytest.raises(ValueError, match="must match the configured loss"):
+        MTPLossConfig(ignore_index=-100).build(loss_fn, model)
 
 
 def test_validation_dataloaders_pp_enabled(caplog):
@@ -1260,18 +1263,18 @@ def test_maybe_downgrade_loss_fn(has_logits_to_keep, has_marker, pp_enabled, exp
     logits_to_keep and (under PP) advertises hidden-states emission via
     _pp_return_hidden_states_supported; otherwise it downgrades to MaskedCrossEntropy."""
     from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
-    from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
     from nemo_automodel.recipes.llm.train_ft import _maybe_downgrade_loss_fn
 
     probe = (_StageWithLogitsToKeep if has_logits_to_keep else _StageNoLogitsToKeep)()
     if has_marker:
         probe._pp_return_hidden_states_supported = True  # set by patch_hf_model_for_pp on the generic forward
 
-    result = _maybe_downgrade_loss_fn(FusedLinearCrossEntropy(), probe, pp_enabled=pp_enabled)
+    result = _maybe_downgrade_loss_fn(FusedLinearCrossEntropy(ignore_index=0), probe, pp_enabled=pp_enabled)
 
     assert isinstance(result, FusedLinearCrossEntropy) is expect_fused
     if not expect_fused:
         assert isinstance(result, MaskedCrossEntropy)
+        assert result.ignore_index == 0
 
 
 def test_run_train_validation_loop_calls_gc_hook_once_per_step():
@@ -1579,6 +1582,7 @@ def test_run_validation_epoch_pp_sends_loss_from_last_stage_to_main(monkeypatch)
 
     # Set up recipe attributes for validation - use object.__setattr__ to bypass state tracking
     object.__setattr__(recipe, "model_parts", [DummyModel()])
+    object.__setattr__(recipe, "loss_fn", MaskedCrossEntropy(ignore_index=0))
     object.__setattr__(recipe, "step_scheduler", SimpleNamespace(step=1, epoch=0))
     object.__setattr__(recipe, "optimizer", [SimpleNamespace(param_groups=[{"lr": 0.01}])])
 
@@ -1616,12 +1620,18 @@ def test_run_validation_epoch_pp_sends_loss_from_last_stage_to_main(monkeypatch)
     )
 
     # Create a simple dataloader that yields one batch
-    val_dataloader = [{"input_ids": torch.tensor([[1, 2, 3]]), "labels": torch.tensor([[1, 2, 3]])}]
+    val_dataloader = [
+        {
+            "input_ids": torch.tensor([[1, 2], [3, 4]]),
+            "labels": torch.tensor([[0, 1], [0, 2]]),
+        }
+    ]
 
     result = recipe._run_validation_epoch(val_dataloader)
 
     # Verify result is a MetricsSample with val_loss
     assert "val_loss" in result.metrics
+    assert result.metrics["num_label_tokens"] == 2
     # val_loss should be a float, not a tensor
     assert isinstance(result.metrics["val_loss"], float)
 
@@ -2332,6 +2342,23 @@ class TestRunTrainOptimStepSetsMoEScale:
 
         assert MoEAuxLossAutoScaler.main_loss_backward_scale is not None
         assert MoEAuxLossAutoScaler.main_loss_backward_scale.item() == pytest.approx(0.25)
+
+    def test_label_token_count_uses_loss_ignore_index(self, monkeypatch):
+        recipe = self._make_recipe(monkeypatch, pp_enabled=False, dp_group_size=1)
+        recipe.loss_fn = MaskedCrossEntropy(ignore_index=0)
+        seen_counts = []
+
+        def forward_backward_step(idx, batch, *, loss_buffer, num_label_tokens, num_batches, is_train=True):
+            seen_counts.append(num_label_tokens)
+            loss_buffer.append(torch.tensor(0.5))
+
+        monkeypatch.setattr(recipe, "_forward_backward_step", forward_backward_step)
+        batches = [{"labels": torch.tensor([[0, 1], [0, 2]])}]
+
+        metrics = recipe._run_train_optim_step(batches)
+
+        assert seen_counts == [2]
+        assert metrics.metrics["num_label_tokens"] == 2
 
     def test_non_pp_scale_restores_cp_sum(self, monkeypatch):
         from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler

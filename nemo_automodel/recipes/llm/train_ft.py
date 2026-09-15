@@ -83,7 +83,12 @@ from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_mes
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.loss.mtp import calculate_mtp_loss
-from nemo_automodel.components.loss.utils import _get_lm_head_weight, calculate_loss
+from nemo_automodel.components.loss.utils import (
+    _count_label_tokens,
+    _get_lm_head_weight,
+    _get_loss_ignore_index,
+    calculate_loss,
+)
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
@@ -169,7 +174,10 @@ def _maybe_downgrade_loss_fn(loss_fn: nn.Module, probe_module: nn.Module, pp_ena
     """Downgrade to MaskedCrossEntropy when the requested loss cannot run."""
     if not _supports_logits_to_keep(probe_module) and not isinstance(loss_fn, MaskedCrossEntropy):
         logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
-        return MaskedCrossEntropy()
+        return MaskedCrossEntropy(
+            ignore_index=_get_loss_ignore_index(loss_fn),
+            reduction=getattr(loss_fn, "reduction", "sum"),
+        )
     if (
         pp_enabled
         and isinstance(loss_fn, FusedLinearCrossEntropy)
@@ -179,7 +187,10 @@ def _maybe_downgrade_loss_fn(loss_fn: nn.Module, probe_module: nn.Module, pp_ena
             "FusedLinearCrossEntropy is not supported under pipeline parallelism for this "
             "model. Using MaskedCrossEntropy instead."
         )
-        return MaskedCrossEntropy()
+        return MaskedCrossEntropy(
+            ignore_index=_get_loss_ignore_index(loss_fn),
+            reduction=getattr(loss_fn, "reduction", "sum"),
+        )
     return loss_fn
 
 
@@ -1049,6 +1060,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             for k, v in batch.items()
         }
         model = self.model_parts[0] if hasattr(self, "model_parts") else None
+        ignore_index = _get_loss_ignore_index(getattr(self, "loss_fn", None))
         mtp_cp_enabled = not self.pp_enabled and self._get_cp_group_size() > 1 and model.supports.mtp_enabled
         mtp_cp_inputs = None
         if mtp_cp_enabled:
@@ -1059,7 +1071,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 )
             mtp_cp_inputs = model.prepare_mtp_inputs_for_cp(
                 batch,
-                ignore_index=self.cfg.mtp.ignore_index,
+                ignore_index=ignore_index,
             )
         cp_sharder = ContextParallelSharder(
             model,
@@ -1078,7 +1090,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 cp_sharder.shard_token_tensor(ids, seq_dim=1, fill=0) for ids in mtp_cp_inputs.position_ids
             )
             mtp_per_depth_targets = tuple(
-                cp_sharder.shard_token_tensor(targets, seq_dim=1, fill=self.cfg.mtp.ignore_index)
+                cp_sharder.shard_token_tensor(targets, seq_dim=1, fill=ignore_index)
                 for targets in mtp_cp_inputs.targets
             )
         labels = batch.pop("labels")
@@ -1198,7 +1210,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         model=model,
                         scaling_factor=scaling_factor,
                         num_label_tokens=num_label_tokens,
-                        ignore_index=mtp_cfg.ignore_index,
+                        ignore_index=ignore_index,
                         # mask cross-boundary MTP label rolls in THD packing (matches the PP path)
                         cu_seqlens=None if mtp_per_depth_targets is not None else batch.get("cu_seqlens"),
                         lm_weight=shared_lm_weight,
@@ -1223,8 +1235,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             max_grad_norm: Gradient clipping norm. Optional, if None will not clip gradients.
         """
 
+        ignore_index = _get_loss_ignore_index(getattr(self, "loss_fn", None))
         num_label_tokens = torch.tensor(
-            sum((batch["labels"] != -100).sum().item() for batch in batches), dtype=torch.long
+            sum(_count_label_tokens(batch["labels"], ignore_index) for batch in batches), dtype=torch.long
         )
         num_label_tokens = self._dp_allreduce(num_label_tokens).item()
 
@@ -1379,7 +1392,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
             for batch in val_dataloader:
                 loss_buffer = []
-                num_label_tokens = (batch["labels"] != -100).sum().item()
+                num_label_tokens = _count_label_tokens(
+                    batch["labels"], _get_loss_ignore_index(getattr(self, "loss_fn", None))
+                )
                 self._forward_backward_step(
                     0,
                     batch,
