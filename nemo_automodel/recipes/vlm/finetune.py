@@ -69,6 +69,7 @@ from nemo_automodel.components.distributed import (
     reset_cp_vision_group,
     set_cp_vision_group,
     setup_magi,
+    synchronize_tp_replica_gradients,
 )
 from nemo_automodel.components.loggers import (
     MetricsSample,
@@ -1110,6 +1111,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             if i == 0:
                 prepare_after_first_microbatch()
 
+        synchronize_tp_replica_gradients(self.model_parts, self.device_mesh)
         grad_norm = scale_grads_and_clip_grad_norm(
             max_grad_norm=max_grad_norm,
             model_parts=self.model_parts,

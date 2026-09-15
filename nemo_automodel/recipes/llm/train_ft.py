@@ -77,6 +77,7 @@ from nemo_automodel.components.distributed import (
     get_sync_ctx,
     initialize_distributed,
     setup_magi,
+    synchronize_tp_replica_gradients,
 )
 from nemo_automodel.components.loggers import (
     MetricsSample,
@@ -1265,6 +1266,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             if i == 0:
                 prepare_after_first_microbatch()
 
+        synchronize_tp_replica_gradients(self.model_parts, self.device_mesh)
         grad_norm = scale_grads_and_clip_grad_norm(
             max_grad_norm,
             self.model_parts,

@@ -27,7 +27,13 @@ from transformers import ProcessorMixin
 
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config import parse_args_and_load_config
-from nemo_automodel.components.distributed import DDPConfig, FirstRankPerNode, get_sync_ctx, initialize_distributed
+from nemo_automodel.components.distributed import (
+    DDPConfig,
+    FirstRankPerNode,
+    get_sync_ctx,
+    initialize_distributed,
+    synchronize_tp_replica_gradients,
+)
 from nemo_automodel.components.loggers import (
     DEFAULT_BUFFER_SIZE,
     MetricsSample,
@@ -583,6 +589,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
         for idx, batch in enumerate(batches):
             self._forward_backward_step(idx, batch, loss_buffer=loss_buffer, num_batches=len(batches), is_train=True)
 
+        synchronize_tp_replica_gradients(self.model_parts, self.device_mesh)
         grad_norm = scale_grads_and_clip_grad_norm(
             max_grad_norm,
             self.model_parts,

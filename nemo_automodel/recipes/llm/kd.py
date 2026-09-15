@@ -55,7 +55,13 @@ from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components.config import parse_args_and_load_config
-from nemo_automodel.components.distributed import ContextParallelSharder, DistributedSetup, PipelineConfig, get_sync_ctx
+from nemo_automodel.components.distributed import (
+    ContextParallelSharder,
+    DistributedSetup,
+    PipelineConfig,
+    get_sync_ctx,
+    synchronize_tp_replica_gradients,
+)
 from nemo_automodel.components.loggers import MetricsSample
 from nemo_automodel.components.loss import FusedLinearCrossEntropy, calculate_loss
 from nemo_automodel.components.training import (
@@ -805,6 +811,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             self._ce_loss_buffer.append(ce_loss)
             self._kd_loss_buffer.append(kd_loss)
 
+        synchronize_tp_replica_gradients(self.model_parts, self.device_mesh)
         grad_norm = scale_grads_and_clip_grad_norm(
             max_grad_norm,
             self.model_parts,
@@ -903,6 +910,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             if i == 0:
                 prepare_after_first_microbatch()
 
+        synchronize_tp_replica_gradients(self.model_parts, self.device_mesh)
         grad_norm = scale_grads_and_clip_grad_norm(
             max_grad_norm,
             self.model_parts,

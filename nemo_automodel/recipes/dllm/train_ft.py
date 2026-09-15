@@ -53,7 +53,11 @@ from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 
 from nemo_automodel.components.config import parse_args_and_load_config
 from nemo_automodel.components.datasets import DLLMCollator
-from nemo_automodel.components.distributed import ContextParallelSharder, get_sync_ctx
+from nemo_automodel.components.distributed import (
+    ContextParallelSharder,
+    get_sync_ctx,
+    synchronize_tp_replica_gradients,
+)
 from nemo_automodel.components.loggers import MetricsSample, to_float_metrics
 from nemo_automodel.components.loss import encoder_ar_loss
 from nemo_automodel.components.models.diffusion_gemma.attention_mask import build_block_diffusion_training_mask
@@ -546,6 +550,7 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
                 logging.warning("FLOPs measurement failed, skipping: %s", e)
                 self._step_flops_per_gpu = None
 
+        synchronize_tp_replica_gradients(self.model_parts, self.device_mesh)
         grad_norm = scale_grads_and_clip_grad_norm(
             max_grad_norm,
             self.model_parts,

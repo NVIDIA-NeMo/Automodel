@@ -246,6 +246,16 @@ def _resolve_custom_model_cls_for_config(config):
 
             return HyMT2ForCausalLM
 
+    # This architecture name is shared with the Mistral4 implementation in the
+    # registry, so try the Ministral3-backed VLM implementation first.
+    if arch_name == "Mistral3ForConditionalGeneration":
+        from nemo_automodel.components.models.mistral3_vlm.model import (
+            Mistral3FP8VLMForConditionalGeneration,
+        )
+
+        if Mistral3FP8VLMForConditionalGeneration.supports_config(config):
+            return Mistral3FP8VLMForConditionalGeneration
+
     if not ModelRegistry.has_custom_model(arch_name):
         return None
 

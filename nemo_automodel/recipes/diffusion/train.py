@@ -31,7 +31,13 @@ _HAS_WANDB, wandb = safe_import(
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
 
 from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
-from nemo_automodel.components.distributed import fsdp2_sharding_enabled, get_sync_ctx, initialize_distributed
+from nemo_automodel.components.distributed import (
+    broadcast_tp_replicas,
+    fsdp2_sharding_enabled,
+    get_sync_ctx,
+    initialize_distributed,
+    synchronize_tp_replica_gradients,
+)
 from nemo_automodel.components.flow_matching import FlowMatchingPipeline, create_adapter
 from nemo_automodel.components.loggers import setup_logging, suppress_wandb_log_messages
 from nemo_automodel.components.training import (
@@ -697,6 +703,10 @@ class TrainDiffusionRecipe(BaseRecipe):
         )
 
         self.model = self.pipe.transformer
+        # LoRA and random-pretraining parameters are initialized before TP is
+        # applied. Align their replicated local storage before the optimizer
+        # captures the sharded model parameters.
+        broadcast_tp_replicas([self.model], self.device_mesh)
 
         # FSDP2's MixedPrecisionPolicy is what casts parameters to compute_dtype, and
         # parallelization is skipped entirely on a single-rank mesh. Autocast covers
@@ -1066,7 +1076,13 @@ class TrainDiffusionRecipe(BaseRecipe):
                     if microbatch_idx == 0:
                         prepare_after_first_microbatch()
 
-                grad_norm = clip_grad_norm(self.clip_grad_max_norm, [self.model], foreach=self.grad_clip_foreach)
+                synchronize_tp_replica_gradients([self.model], getattr(self, "device_mesh", None))
+                grad_norm = clip_grad_norm(
+                    self.clip_grad_max_norm,
+                    [self.model],
+                    device_mesh=getattr(self, "device_mesh", None),
+                    foreach=self.grad_clip_foreach,
+                )
                 grad_norm = float(grad_norm) if torch.is_tensor(grad_norm) else grad_norm
 
                 # ── LoRA gradient diagnostic (step 1 only) ───────────────────

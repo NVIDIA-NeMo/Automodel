@@ -58,6 +58,7 @@ from nemo_automodel.components.distributed import (
     MeshContext,
     MoEParallelizerConfig,
     PipelineConfig,
+    broadcast_tp_replicas,
     get_world_size_safe,
     restore_distributed_param_attrs,
     snapshot_distributed_param_attrs,
@@ -115,18 +116,18 @@ def _validate_safe_moe_tp_weight_source(
 ) -> None:
     """Fail closed when replicated MoE-TP paths cannot start from identical weights.
 
-    The conservative plan intentionally leaves attention/router/norm modules
-    replicated across TP ranks.  Until those replicas have explicit gradient
-    synchronization, they may only be used for deterministic full-parameter
-    training from one successfully loaded shared base checkpoint.
+    The supported custom-MoE TP contract is pretrained, full-parameter training
+    without PEFT. Replica synchronization keeps the dense token path consistent,
+    but does not define adapter or initialization ownership across combined TP/EP,
+    so those unsupported sources must fail before model surgery.
     """
     parts = _safe_moe_tp_parts(model)
     if not parts:
         return
     if peft_config is not None:
         raise ValueError(
-            "Safe custom-MoE tensor parallelism does not support PEFT yet: "
-            "replicated adapters are rank-initialized and can diverge."
+            "Safe custom-MoE tensor parallelism does not support PEFT: "
+            "adapter ownership is undefined across the combined TP/EP mesh."
         )
     if not checkpoint_source_available:
         raise ValueError(
@@ -878,4 +879,10 @@ def apply_model_infrastructure(
     restore_distributed_param_attrs(model, mfsdp_param_attrs)
 
     model = _apply_runtime_compatibility_fixes(model)
+    synchronized_tp_replicas = broadcast_tp_replicas(
+        model.parts if hasattr(model, "parts") else [model],
+        mesh.device_mesh,
+    )
+    if synchronized_tp_replicas:
+        logger.info("Synchronized %d replicated tensors across TP ranks", synchronized_tp_replicas)
     return model

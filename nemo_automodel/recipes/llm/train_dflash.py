@@ -50,7 +50,12 @@ from nemo_automodel.components.checkpoint import (
 )
 from nemo_automodel.components.config import parse_args_and_load_config
 from nemo_automodel.components.datasets import build_eagle3_dataloader
-from nemo_automodel.components.distributed import get_flat_mesh, initialize_distributed
+from nemo_automodel.components.distributed import (
+    broadcast_tp_replicas,
+    get_flat_mesh,
+    initialize_distributed,
+    synchronize_tp_replica_gradients,
+)
 from nemo_automodel.components.loggers import init_wandb_run, setup_logging, suppress_wandb_log_messages
 from nemo_automodel.components.speculative.dflash.core import DFlashTrainerModule, NoValidAnchorsError
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import build_target_layer_ids
@@ -343,6 +348,10 @@ class TrainDFlashRecipe(BaseRecipe):
                 process_group=self._draft_ddp_process_group(),
             )
         self.trainer_module = trainer_module
+        # DDP broadcasts only inside the DP subgroup. The draft is replicated
+        # across TP, so align those independently initialized copies before the
+        # optimizer captures them and TP replica gradients are averaged.
+        broadcast_tp_replicas([self.trainer_module], self.device_mesh)
 
         opt_cfg = self.cfg.optimizer
         self.peak_lr = float(opt_cfg.lr)
@@ -1087,6 +1096,10 @@ class TrainDFlashRecipe(BaseRecipe):
                     pending_micro_batches += 1
 
                     if pending_micro_batches == self.grad_accumulation_steps:
+                        synchronize_tp_replica_gradients(
+                            [self.trainer_module],
+                            getattr(self, "device_mesh", None),
+                        )
                         torch.nn.utils.clip_grad_norm_(self.trainer_module.parameters(), self.max_grad_norm)
                         self.optimizer.step()
                         self.optimizer.zero_grad(set_to_none=True)
@@ -1144,6 +1157,10 @@ class TrainDFlashRecipe(BaseRecipe):
                 # Flush the trailing partial accumulation window (see EAGLE recipes
                 # for the rescale rationale).
                 if pending_micro_batches > 0:
+                    synchronize_tp_replica_gradients(
+                        [self.trainer_module],
+                        getattr(self, "device_mesh", None),
+                    )
                     scale = float(self.grad_accumulation_steps) / float(pending_micro_batches)
                     for p in self.trainer_module.parameters():
                         if p.grad is not None:
