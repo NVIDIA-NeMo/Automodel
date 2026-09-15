@@ -85,6 +85,7 @@ from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.loss.mtp import calculate_mtp_loss
 from nemo_automodel.components.loss.utils import _get_lm_head_weight, calculate_loss
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
+from nemo_automodel.components.training.domain_mixture import WEIGHTED_AGGREGATE_NAME
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.utils import (
@@ -216,7 +217,7 @@ def _validate_domain_sampling_weights(domain_mixture, dataloader_config: Dataloa
 
     from nemo_automodel.components.datasets.llm.megatron.megatron_utils import get_blend_from_list
 
-    blend_prefixes, blend_weights = get_blend_from_list(list(paths))
+    _, blend_weights = get_blend_from_list(list(paths))
     if blend_weights is None:
         raise ValueError("domain_mixture requires explicit sampling weights in dataset.paths")
     blend_total = sum(blend_weights)
@@ -231,35 +232,6 @@ def _validate_domain_sampling_weights(domain_mixture, dataloader_config: Dataloa
             "domain_mixture sampling weights must match the explicit weights in dataset.paths; "
             f"got dataset weights {normalized} and domain_mixture weights {domain_mixture.sampling_weights}"
         )
-    _validate_domain_blend_order(domain_mixture, blend_prefixes)
-
-
-def _validate_domain_blend_order(domain_mixture, blend_prefixes) -> None:
-    """Reject a domain list whose order does not match the blend order.
-
-    ``BlendedDataset`` assigns ``dataset_id`` strictly by blend position and
-    ``loss_multipliers`` is indexed by that integer, so a reordered
-    ``domains:`` list silently trains each corpus against another domain's
-    objective. The weight comparison alone cannot see this whenever two domains
-    share a sampling weight (50/50, 25/25/50, ...).
-
-    Names need not be derived from paths, so this only fires on evidence of an
-    actual mismatch: a name that matches some *other* position's prefix but not
-    its own. Names that match no prefix at all are unverifiable and pass.
-    """
-    if not isinstance(blend_prefixes, (list, tuple)) or len(blend_prefixes) != len(domain_mixture.names):
-        return
-    lowered = [str(prefix).lower() for prefix in blend_prefixes]
-    for position, name in enumerate(domain_mixture.names):
-        key = name.lower()
-        matches = [index for index, prefix in enumerate(lowered) if key in prefix]
-        if matches and position not in matches:
-            raise ValueError(
-                f"domain_mixture domain order must match the dataset.paths blend order: domain {name!r} "
-                f"is declared at position {position} (blend prefix {blend_prefixes[position]!r}) but its name "
-                f"matches position(s) {matches} instead. dataset_id is assigned by blend position, so this "
-                "would apply each domain's objective weight to the wrong corpus."
-            )
 
 
 def build_model(
@@ -662,8 +634,11 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 raise ValueError(
                     f"domain_mixture requires a loss function that accepts loss_weights, got {type(self.loss_fn).__name__}"
                 )
-            if getattr(self.loss_fn, "reduction", "sum") != "sum":
-                raise ValueError("domain_mixture requires a loss function with reduction='sum'")
+            reduction = getattr(self.loss_fn, "reduction", None)
+            if reduction != "sum":
+                raise ValueError(
+                    f"domain_mixture requires a loss function with explicit reduction='sum'; got {reduction!r}"
+                )
             _validate_domain_sampling_weights(self.domain_mixture, self.cfg.dataloader)
         if self.magi.hf_dispatch and isinstance(self.loss_fn, FusedLinearCrossEntropy):  # pragma: no cover
             raise ValueError(
@@ -880,7 +855,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             for name, dl_config in self.cfg.validation_dataloaders.items()
         }
         if self.domain_mixture is not None and self.val_dataloaders:
-            if "weighted" in self.val_dataloaders:
+            if WEIGHTED_AGGREGATE_NAME in self.val_dataloaders:
                 raise ValueError("validation_dataset_weighted is reserved for the domain_mixture aggregate")
             missing_validation_domains = [
                 name for name in self.domain_mixture.names if name not in self.val_dataloaders
@@ -905,7 +880,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self._warned_tool_call_eval_skipped = False
         self.best_metric_key = self.cfg.get(
             "checkpoint.best_metric_key",
-            "weighted" if self.domain_mixture is not None else "default",
+            WEIGHTED_AGGREGATE_NAME if self.domain_mixture is not None else "default",
         )
         # Scheduler — typed configs from RecipeConfig, built with runtime args here.
         self.step_scheduler = self.cfg.step_scheduler.build(
@@ -956,7 +931,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         )
         validation_logger_names = list(self.val_dataloaders)
         if self.domain_mixture is not None and self.val_dataloaders:
-            validation_logger_names.append("weighted")
+            validation_logger_names.append(WEIGHTED_AGGREGATE_NAME)
         self.metric_logger_valid = {
             name: build_metric_logger(
                 pathlib.Path(self.checkpointer.config.checkpoint_dir)
@@ -1140,7 +1115,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                             self.log_val_metrics(val_name, val_log_data, self.metric_logger_valid[val_name])
                         if self.domain_mixture is not None and val_losses:
                             weighted_loss = self.domain_mixture.weighted_validation_loss(val_losses)
-                            val_losses["weighted"] = weighted_loss
+                            val_losses[WEIGHTED_AGGREGATE_NAME] = weighted_loss
                             weighted_log_data = MetricsSample(
                                 step=self.step_scheduler.step,
                                 epoch=self.step_scheduler.epoch,
@@ -1152,9 +1127,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                                 },
                             )
                             self.log_val_metrics(
-                                "weighted",
+                                WEIGHTED_AGGREGATE_NAME,
                                 weighted_log_data,
-                                self.metric_logger_valid["weighted"],
+                                self.metric_logger_valid[WEIGHTED_AGGREGATE_NAME],
                             )
                         for mp in self.model_parts:
                             mp.train()

@@ -97,7 +97,7 @@ class MaskedCrossEntropy(nn.Module):
             labels = labels.full_tensor()
 
         reduction = "none" if loss_weights is not None else self.reduction
-        loss = F.cross_entropy(logits, labels, ignore_index=self.ignore_index, reduction=reduction)
+        loss = F.cross_entropy(logits, labels, reduction=reduction)
         if loss_weights is not None:
             loss = (loss * loss_weights).sum()
         if num_label_tokens is not None:

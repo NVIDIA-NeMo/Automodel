@@ -263,7 +263,7 @@ def test_fused_cross_entropy_applies_per_token_weights(monkeypatch):
         captured["reduction"] = kwargs["reduction"]
         return torch.tensor([[1.0, 2.0], [3.0, 4.0]])
 
-    monkeypatch.setattr(linear_ce_mod, "linear_cross_entropy", _fake_linear_ce)
+    monkeypatch.setattr(linear_ce_mod, "linear_cross_entropy", _fake_linear_ce, raising=False)
     loss_weights = torch.tensor([[0.5, 0.5], [1.5, 1.5]])
     out = linear_ce_mod.FusedLinearCrossEntropy(reduction="sum")(
         torch.randn(2, 2, 3),

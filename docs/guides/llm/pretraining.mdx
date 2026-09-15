@@ -322,6 +322,10 @@ Sampling weights control how often a domain appears in a batch. They do not
 need to be the same as the domain's desired contribution to the optimization
 objective. Configure both values with `domain_mixture`:
 
+See the complete runnable
+[`megatron_pretrain_gpt2_domain_mixture.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/megatron_pretrain_gpt2_domain_mixture.yaml)
+example for the full model, dataset, validation, optimizer, and scheduler setup.
+
 ```yaml
 dataset:
   _target_: nemo_automodel.components.datasets.llm.megatron_dataset.MegatronPretraining
@@ -368,8 +372,9 @@ per-domain validation loss, and reports their objective-weighted aggregate as
 
 The `sampling_weight` values must match the explicit weights in
 the `MegatronPretraining` dataset's `dataset.paths`, and domain order must
-match the blend order. JSON blend files and implicit unweighted blends are not
-supported. Sequence packing is not supported with `domain_mixture` because
+match the blend order. Domain names are positional labels and are not inferred
+from path text. JSON blend files and implicit unweighted blends are not supported.
+Sequence packing is not supported with `domain_mixture` because
 packed batches do not currently preserve per-token domain IDs. Pipeline
 parallelism is also not currently supported because its target contract does
 not carry per-token objective weights. Context parallelism is disabled until
@@ -388,8 +393,8 @@ scaled independently of loss magnitude, so its strength relative to the
 weighted CE varies with each microbatch's domain composition; an
 `aux_loss_coeff` tuned without `domain_mixture` may need revisiting.
 
-The logged `domain_mixture/<name>_label_tokens` counts exclude the configured
-loss `ignore_index`. Datasets that mark padding through a separate `loss_mask`
+The logged `domain_mixture/<name>_label_tokens` counts exclude labels equal to
+`-100`. Datasets that mark padding through a separate `loss_mask`
 rather than by writing `ignore_index` into `labels` (Megatron's GPT dataset
 does this) therefore report one supervised token per position, so the logged
 fraction equals the raw sample fraction.

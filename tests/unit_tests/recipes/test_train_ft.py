@@ -12,21 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 import inspect
 import logging
 import sys
 import types
 from contextlib import AbstractContextManager, nullcontext
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
-
-import functools
 
 import pytest
 import torch
 import torch.nn as nn
 
-from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.components.config.loader import ConfigNode, load_yaml_config
 
 # Skip decorator for tests that require CUDA
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -2991,6 +2991,11 @@ class _LossWithWeights(torch.nn.Module):
         return logits.sum()
 
 
+class _LossWithWeightsWithoutReduction(torch.nn.Module):
+    def forward(self, logits, labels, num_label_tokens=None, loss_weights=None):
+        return logits.sum()
+
+
 class _LossSwallowingKwargs(torch.nn.Module):
     reduction = "sum"
 
@@ -3042,48 +3047,115 @@ def test_domain_weight_config_rejects_reserved_aggregate_name():
         DomainWeightConfig(name=WEIGHTED_AGGREGATE_NAME, sampling_weight=0.5, objective_weight=0.5)
 
 
-def test_domain_mixture_rejects_blend_order_mismatch():
-    """Equal sampling weights must not let a reordered domains: list through."""
-    from nemo_automodel.components.datasets.llm.megatron_dataset import MegatronPretrainingConfig
-    from nemo_automodel.components.training.domain_mixture import DomainMixtureConfig, DomainWeightConfig
-
-    swapped = DomainMixtureConfig(
-        domains=(
-            DomainWeightConfig(name="code", sampling_weight=0.5, objective_weight=0.75),
-            DomainWeightConfig(name="web", sampling_weight=0.5, objective_weight=0.25),
-        )
-    ).build()
-    # 50/50 blend: the weight comparison alone cannot detect the swap.
-    dataloader = DataloaderConfig(
-        dataset_config=MegatronPretrainingConfig(paths=["50", "/data/web", "50", "/data/code"])
-    )
-    with pytest.raises(ValueError, match="domain order must match"):
-        _validate_domain_sampling_weights(swapped, dataloader)
-
-    correct = DomainMixtureConfig(
-        domains=(
-            DomainWeightConfig(name="web", sampling_weight=0.5, objective_weight=0.25),
-            DomainWeightConfig(name="code", sampling_weight=0.5, objective_weight=0.75),
-        )
-    ).build()
-    _validate_domain_sampling_weights(correct, dataloader)
-
-
-def test_domain_mixture_blend_order_allows_names_unrelated_to_paths():
-    """Names that match no prefix are unverifiable and must not be rejected."""
+def test_domain_mixture_order_validation_does_not_infer_names_from_paths():
+    """Domain names are positional labels, not substrings to infer from paths."""
     from nemo_automodel.components.datasets.llm.megatron_dataset import MegatronPretrainingConfig
     from nemo_automodel.components.training.domain_mixture import DomainMixtureConfig, DomainWeightConfig
 
     mixture = DomainMixtureConfig(
         domains=(
-            DomainWeightConfig(name="alpha", sampling_weight=0.5, objective_weight=0.5),
-            DomainWeightConfig(name="beta", sampling_weight=0.5, objective_weight=0.5),
+            DomainWeightConfig(name="code", sampling_weight=0.5, objective_weight=0.5),
+            DomainWeightConfig(name="web", sampling_weight=0.5, objective_weight=0.5),
         )
     ).build()
     dataloader = DataloaderConfig(
-        dataset_config=MegatronPretrainingConfig(paths=["1", "/data/corpus_a", "1", "/data/corpus_b"])
+        dataset_config=MegatronPretrainingConfig(
+            paths=["1", "/data/python/train", "1", "/data/web/encoded_text_document"]
+        )
     )
+
     _validate_domain_sampling_weights(mixture, dataloader)
+
+
+_DOMAIN_MIXTURE_EXAMPLE = Path(__file__).parents[3] / "examples/llm_pretrain/megatron_pretrain_gpt2_domain_mixture.yaml"
+
+
+def _patch_domain_mixture_example_setup(monkeypatch, cfg, loss_fn, *, cp_size=1, pp_enabled=False):
+    """Keep the example's typed configs while stubbing heavyweight setup work."""
+    typed_cfg = RecipeConfig(cfg)
+    dataloader = typed_cfg.dataloader
+    validation_dataloaders = typed_cfg.validation_dataloaders
+
+    _patch_setup_minimals(monkeypatch, lambda *args, **kwargs: None)
+    monkeypatch.setattr(RecipeConfig, "loss_fn", property(lambda self: SimpleNamespace(build=lambda: loss_fn)))
+    monkeypatch.setattr(RecipeConfig, "dataloader", property(lambda self: dataloader))
+    monkeypatch.setattr(RecipeConfig, "validation_dataloaders", property(lambda self: validation_dataloaders))
+    monkeypatch.setattr(DataloaderConfig, "build", lambda self, **kwargs: "dl")
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.llm.train_ft.create_distributed_setup_from_config",
+        lambda cfg, world_size: SimpleNamespace(
+            mesh_context=SimpleNamespace(
+                pp_enabled=pp_enabled,
+                device_mesh=None,
+                moe_mesh=None,
+                cp_size=cp_size,
+                pp_size=2 if pp_enabled else 1,
+            ),
+            strategy_config=None,
+            pipeline_config=None,
+            moe_parallel_config=None,
+            activation_checkpointing=False,
+        ),
+    )
+    return typed_cfg
+
+
+def test_domain_mixture_example_setup_smoke(monkeypatch):
+    cfg = load_yaml_config(_DOMAIN_MIXTURE_EXAMPLE)
+    typed_cfg = _patch_domain_mixture_example_setup(monkeypatch, cfg, _LossWithWeights())
+
+    trainer = TrainFinetuneRecipeForNextTokenPrediction(typed_cfg)
+    trainer.setup()
+
+    assert trainer.domain_mixture.names == ("web", "code")
+    assert set(trainer.val_dataloaders) == {"web", "code"}
+
+
+@pytest.mark.parametrize(
+    "loss_fn, reduction",
+    [
+        (_LossWithWeightsWithoutReduction(), None),
+        (_LossWithWeights(), "mean"),
+    ],
+)
+def test_domain_mixture_example_rejects_unsupported_loss_reduction(monkeypatch, loss_fn, reduction):
+    if reduction is not None:
+        loss_fn.reduction = reduction
+    cfg = load_yaml_config(_DOMAIN_MIXTURE_EXAMPLE)
+    typed_cfg = _patch_domain_mixture_example_setup(monkeypatch, cfg, loss_fn)
+
+    with pytest.raises(ValueError, match="explicit reduction='sum'"):
+        TrainFinetuneRecipeForNextTokenPrediction(typed_cfg).setup()
+
+
+def test_domain_mixture_example_rejects_sequence_packing(monkeypatch):
+    cfg = load_yaml_config(_DOMAIN_MIXTURE_EXAMPLE)
+    cfg.packed_sequence = ConfigNode({"packed_sequence_size": 1024, "packing_strategy": "thd"})
+    typed_cfg = _patch_domain_mixture_example_setup(monkeypatch, cfg, _LossWithWeights())
+
+    with pytest.raises(ValueError, match="does not support sequence packing"):
+        TrainFinetuneRecipeForNextTokenPrediction(typed_cfg).setup()
+
+
+@pytest.mark.parametrize(
+    "cp_size, pp_enabled, message",
+    [
+        (2, False, "does not currently support context parallelism"),
+        (1, True, "does not currently support pipeline parallelism"),
+    ],
+)
+def test_domain_mixture_example_rejects_parallelism(monkeypatch, cp_size, pp_enabled, message):
+    cfg = load_yaml_config(_DOMAIN_MIXTURE_EXAMPLE)
+    typed_cfg = _patch_domain_mixture_example_setup(
+        monkeypatch,
+        cfg,
+        _LossWithWeights(),
+        cp_size=cp_size,
+        pp_enabled=pp_enabled,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        TrainFinetuneRecipeForNextTokenPrediction(typed_cfg).setup()
 
 
 def test_default_collater_batches_per_sample_dataset_id():
