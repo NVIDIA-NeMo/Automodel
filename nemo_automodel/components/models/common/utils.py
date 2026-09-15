@@ -15,6 +15,7 @@
 import importlib.util
 import logging
 import math
+import os
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
@@ -85,7 +86,13 @@ def get_is_first_microbatch() -> bool | None:
     return IS_FIRST_MICROBATCH
 
 
-def generation_config_from_model_config(config) -> GenerationConfig:
+# Hub loading options ``PreTrainedModel.from_pretrained`` threads into every file it
+# reads for a checkpoint, the generation config included (see
+# ``GenerativePreTrainedModel.adjust_generation_fn``).
+HUB_LOADING_KWARGS = ("cache_dir", "force_download", "proxies", "local_files_only", "token", "revision", "subfolder")
+
+
+def generation_config_from_model_config(config: PretrainedConfig) -> GenerationConfig:
     """Generation config a custom causal LM starts with, seeded the way transformers does it.
 
     ``PreTrainedModel.__init__`` derives ``generation_config`` from the model config so
@@ -93,7 +100,7 @@ def generation_config_from_model_config(config) -> GenerationConfig:
     ``GenerationConfig()`` instead has no stop token, and because the consolidated
     export writes ``model.generation_config`` out as ``generation_config.json`` (which
     beats ``config.json`` on reload), the exported model never stops generating either.
-    Configs that are not ``PretrainedConfig`` instances (test doubles) fall back to the defaults.
+    Objects that are not ``PretrainedConfig`` instances (test doubles) get the defaults.
     """
     if not isinstance(config, PretrainedConfig):
         return GenerationConfig()
@@ -103,7 +110,11 @@ def generation_config_from_model_config(config) -> GenerationConfig:
         return GenerationConfig()
 
 
-def load_pretrained_generation_config(pretrained_model_name_or_path) -> GenerationConfig | None:
+def load_pretrained_generation_config(
+    pretrained_model_name_or_path: str | os.PathLike[str],
+    config: PretrainedConfig | None = None,
+    **loading_kwargs: Any,
+) -> GenerationConfig | None:
     """The generation config a checkpoint carries, or ``None`` when it carries none.
 
     Mirrors what ``PreTrainedModel.from_pretrained`` does once the weights are in:
@@ -112,34 +123,64 @@ def load_pretrained_generation_config(pretrained_model_name_or_path) -> Generati
     ``config.json``) and their sampling defaults. Without it, the generation fields of
     the raw ``config.json`` are used, as HF does for legacy checkpoints that still keep
     ``do_sample``/``temperature`` there (the in-memory config has already dropped them).
+
+    Args:
+        pretrained_model_name_or_path: Hub id or local directory of the checkpoint.
+        config: The model's in-memory config. Its explicit values (an ``eos_token_id``
+            passed to ``from_pretrained`` lands here) win over the ``config.json``
+            fallback, which cannot know about them.
+        **loading_kwargs: The ``HUB_LOADING_KWARGS`` the caller was loading with, so the
+            generation config is read from the same place as the weights.
     """
+    subfolder = loading_kwargs.pop("subfolder", None) or ""
+    if subfolder and os.path.isdir(pretrained_model_name_or_path):
+        # GenerationConfig.from_pretrained joins ``subfolder`` in front of an absolute
+        # local path, which resolves to the parent's file whenever one exists there
+        # (transformers 5.12.1), so resolve the directory here and let the child win.
+        pretrained_model_name_or_path = os.path.join(pretrained_model_name_or_path, subfolder)
+    elif subfolder:
+        loading_kwargs["subfolder"] = subfolder
+
     try:
-        return GenerationConfig.from_pretrained(pretrained_model_name_or_path)
+        return GenerationConfig.from_pretrained(pretrained_model_name_or_path, **loading_kwargs)
     except OSError:
         logger.info(
             "No generation_config.json in %s, using the generation fields of config.json.",
             pretrained_model_name_or_path,
         )
     try:
-        return GenerationConfig.from_pretrained(
-            pretrained_model_name_or_path, config_file_name="config.json", _from_model_config=True
+        generation_config = GenerationConfig.from_pretrained(
+            pretrained_model_name_or_path, config_file_name="config.json", _from_model_config=True, **loading_kwargs
         )
     except (OSError, TypeError):
         # transformers resolves a missing non-default config file to None and then
         # fails to open it (TypeError) instead of raising OSError.
         return None
+    if config is not None:
+        # The raw file only contributes the legacy sampling fields; the token ids and
+        # anything else set on the in-memory config, overrides included, stay on top.
+        generation_config.update(**generation_config_from_model_config(config).to_diff_dict())
+    return generation_config
 
 
-def restore_pretrained_generation_config(model: nn.Module, pretrained_model_name_or_path) -> None:
+def restore_pretrained_generation_config(
+    model: nn.Module, pretrained_model_name_or_path: str | os.PathLike[str], **loading_kwargs: Any
+) -> None:
     """Replace a model's ``generation_config`` with the one its checkpoint carries, if any.
 
     Applies only to models that expose a real ``GenerationConfig`` (the ones that can
     generate); a model without one, or a checkpoint without generation settings, is
-    left as it is.
+    left as it is. ``loading_kwargs`` are the ``HUB_LOADING_KWARGS`` the model was
+    loaded with.
     """
     if not isinstance(getattr(model, "generation_config", None), GenerationConfig):
         return
-    generation_config = load_pretrained_generation_config(pretrained_model_name_or_path)
+    config = getattr(model, "config", None)
+    generation_config = load_pretrained_generation_config(
+        pretrained_model_name_or_path,
+        config=config if isinstance(config, PretrainedConfig) else None,
+        **loading_kwargs,
+    )
     if generation_config is not None:
         model.generation_config = generation_config
 

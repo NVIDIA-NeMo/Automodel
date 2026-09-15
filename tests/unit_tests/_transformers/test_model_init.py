@@ -21,6 +21,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 import torch.nn as nn
+from transformers import PretrainedConfig
 from transformers.generation import GenerationConfig
 
 from nemo_automodel._transformers.model_init import (
@@ -39,7 +40,7 @@ from nemo_automodel._transformers.model_init import (
     _try_get_remote_code_model_cls,
     get_hf_config,
 )
-from nemo_automodel.components.models.common.utils import BackendConfig
+from nemo_automodel.components.models.common.utils import BackendConfig, generation_config_from_model_config
 
 
 class TestBackendModuleOverrides:
@@ -356,7 +357,8 @@ class TestCustomModelGenerationConfig:
         def __init__(self, config, **kwargs):
             super().__init__()
             self.config = config
-            self.generation_config = GenerationConfig()
+            # Seeded from the config like the real registry models.
+            self.generation_config = generation_config_from_model_config(config)
 
     def _make_config(self):
         config = MagicMock()
@@ -365,9 +367,9 @@ class TestCustomModelGenerationConfig:
         config.name_or_path = "fake/model"
         return config
 
-    def _init_from(self, mock_resolve_cls, mock_get_hf_config, source):
+    def _init_from(self, mock_resolve_cls, mock_get_hf_config, source, config=None, **kwargs):
         mock_resolve_cls.return_value = self._FakeModel
-        mock_get_hf_config.return_value = self._make_config()
+        mock_get_hf_config.return_value = config if config is not None else self._make_config()
         return _init_model(
             cls=MagicMock(),
             pretrained_model_name_or_path_or_config=source,
@@ -375,7 +377,44 @@ class TestCustomModelGenerationConfig:
             torch_dtype=torch.float32,
             quantization_config=None,
             force_hf=False,
+            **kwargs,
         )
+
+    @patch("nemo_automodel._transformers.model_init.get_hf_config")
+    @patch("nemo_automodel._transformers.model_init._download_model_weights")
+    @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")
+    def test_pretrained_path_honors_subfolder_for_the_generation_config(
+        self, mock_resolve_cls, _mock_download, mock_get_hf_config, tmp_path
+    ):
+        """The restore reads from the same subfolder the weights and config came from."""
+        GenerationConfig(eos_token_id=7).save_pretrained(tmp_path)
+        GenerationConfig(eos_token_id=[2, 11]).save_pretrained(tmp_path / "child")
+
+        _, model = self._init_from(mock_resolve_cls, mock_get_hf_config, str(tmp_path), subfolder="child")
+
+        assert model.generation_config.eos_token_id == [2, 11]
+
+    @pytest.mark.parametrize("disk_eos", [2, None], ids=["conflicting", "omitted"])
+    @patch("nemo_automodel._transformers.model_init.get_hf_config")
+    @patch("nemo_automodel._transformers.model_init._download_model_weights")
+    @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")
+    def test_explicit_eos_override_survives_the_config_json_fallback(
+        self, mock_resolve_cls, _mock_download, mock_get_hf_config, tmp_path, disk_eos
+    ):
+        """``eos_token_id=9`` at load time is a config override; the fallback must keep it."""
+        import json
+
+        raw = {"model_type": "llama"}
+        if disk_eos is not None:
+            raw["eos_token_id"] = disk_eos
+        (tmp_path / "config.json").write_text(json.dumps(raw))
+        # A real config declares eos_token_id, so the loader treats the kwarg as a config override.
+        config = PretrainedConfig(architectures=["SomeModel"], eos_token_id=1)
+
+        _, model = self._init_from(mock_resolve_cls, mock_get_hf_config, str(tmp_path), config=config, eos_token_id=9)
+
+        assert model.config.eos_token_id == 9
+        assert model.generation_config.eos_token_id == 9
 
     @patch("nemo_automodel._transformers.model_init.get_hf_config")
     @patch("nemo_automodel._transformers.model_init._download_model_weights")
