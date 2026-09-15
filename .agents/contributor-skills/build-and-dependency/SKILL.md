@@ -77,6 +77,7 @@ uv sync --locked --all-groups --extra diffusion        # diffusion models
 uv sync --locked --all-groups --extra diffusion-media  # + diffusion preprocessing/export (imageio-ffmpeg, opencv)
 uv sync --locked --all-groups --extra media            # vlm-media + diffusion-media (union)
 uv sync --locked --all-groups --extra delta-databricks # Delta Lake / Databricks
+uv sync --locked --all-groups --extra msa              # MiniMax M3 MSA sparse prefill (official MiniMax-AI/MSA with the model-private compatibility patch; Linux + SM100; run via `uv run` so torch finds `ninja`)
 uv sync --locked --all-groups --extra all              # all standard extras (EXCLUDES media — FFmpeg kept opt-in)
 ```
 
