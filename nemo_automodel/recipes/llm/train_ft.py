@@ -687,6 +687,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     else self.cfg.get("step_scheduler.local_batch_size", 1)
                 ),
                 pp_mesh=(self.device_mesh["pp"] if self.pp_enabled and self.device_mesh is not None else None),
+                stages=(self.pp.info.stages if self.pp is not None else None),
             )
 
         _packed_seq_size = self.cfg.get("packed_sequence.packed_sequence_size", 0)

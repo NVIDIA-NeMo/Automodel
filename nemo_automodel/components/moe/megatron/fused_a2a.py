@@ -17,7 +17,9 @@
 # Copyright (c) 2025 DeepSeek
 # Licensed under the MIT License - https://github.com/deepseek-ai/DeepEP/blob/main/LICENSE
 
+import logging
 import os
+import time
 
 try:
     from deep_ep import Buffer
@@ -47,6 +49,8 @@ import torch
 _buffer = None
 _nvshmem_available = None
 _uccl_buffer = None
+
+logger = logging.getLogger(__name__)
 
 
 def _is_nvshmem_available() -> bool:
@@ -411,7 +415,9 @@ class HybridEPDispatch(torch.autograd.Function):
         pad_multiple=None,
     ):
         """Forward pass of fused dispatch of the HybridEP backend."""
-        if _hybrid_ep_buffer is None:
+        first_call = _hybrid_ep_buffer is None
+        if first_call:
+            t_first = time.perf_counter()
             seq_len, hidden_dim = x.shape[-2:]
             fp8_dispatch = False
             init_hybrid_ep_buffer(
@@ -443,6 +449,13 @@ class HybridEPDispatch(torch.autograd.Function):
 
         ctx.handle = handle
         ctx.pad_multiple = pad_multiple
+        if first_call:
+            # One-time cost: buffer allocation + handle exchange + nvcc JIT of the preprocessing /
+            # dispatch / combine kernels (HybridEP compiles per process, so every job pays it).
+            torch.cuda.synchronize(x.device)
+            logger.info(
+                "HybridEP first dispatch (buffer init + kernel JIT + call): %.1f s", time.perf_counter() - t_first
+            )
         return (
             dispatched_hidden,
             dispatched_probs,
