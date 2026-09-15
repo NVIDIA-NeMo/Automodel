@@ -22,7 +22,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed.tensor import DTensor
 
-from nemo_automodel.components._peft.lora_experts import GroupedExpertsDeepEPLoRA, GroupedExpertsLoRA
+from nemo_automodel.components._peft.lora_experts import (
+    GroupedExpertsDeepEPLoRA,
+    GroupedExpertsLoRA,
+)
+from nemo_automodel.components._peft.lora_experts_mxfp4 import (
+    GroupedExpertsDeepEPLoRAMXFP4,
+    GroupedExpertsLoRAMXFP4,
+)
 from nemo_automodel.components._peft.lora_kernel import (
     lora_da_dx_update_wrapper,
     lora_db_update_wrapper,
@@ -57,6 +64,10 @@ class PeftConfig:
     use_memory_efficient_lora: bool = True
     use_triton: bool = False
     moe_rank_scaling: bool = False
+    # Storage mode, not a torch dtype: "unquantized" uses the ordinary floating-point
+    # experts with the model's configured precision (including FP32). "mxfp4"
+    # stores frozen expert bases as fp4-e2m1 + e8m0 scales and requires torch_mm.
+    expert_weight_format: Literal["unquantized", "mxfp4"] = "unquantized"
 
     def to_dict(self):
         return self.__dict__.copy()
@@ -77,6 +88,7 @@ class PeftConfig:
             use_memory_efficient_lora=d.get("use_memory_efficient_lora", True),
             use_triton=d.get("use_triton", False),
             moe_rank_scaling=d.get("moe_rank_scaling", False),
+            expert_weight_format=d.get("expert_weight_format", "unquantized"),
         )
 
 
@@ -521,12 +533,13 @@ def patch_linear_module(
 
 
 def patch_moe_module(
-    orig_module,
-    dim=8,
-    alpha=32,
-    lora_A_init_method="xavier",
-    lora_dtype=None,
-):
+    orig_module: nn.Module,
+    dim: int = 8,
+    alpha: int = 32,
+    lora_A_init_method: str = "xavier",
+    lora_dtype: torch.dtype | str | None = None,
+    expert_weight_format: Literal["unquantized", "mxfp4"] = "unquantized",
+) -> nn.Module:
     """
     Patches a custom MoE module (GroupedExperts or GroupedExpertsDeepEP) with LoRA.
 
@@ -536,30 +549,41 @@ def patch_moe_module(
         alpha (int, optional): LoRA scaling factor. Defaults to 32.
         lora_A_init_method (str, optional): Initialization method for LoRA A matrix. Defaults to "xavier".
         lora_dtype (torch.dtype or str, optional): Data type for LoRA weights. Defaults to None.
+        expert_weight_format (str, optional): Storage mode, not a torch dtype.
+            "unquantized" uses ordinary floating-point experts with the model's configured
+            precision, including FP32. "mxfp4"
+            stores frozen bases as fp4-e2m1 + e8m0 block scales. Meta experts receive
+            packed placeholders for direct checkpoint loading; already materialized
+            weights are quantized in place of the floating-point base. Defaults to "unquantized".
 
     Returns:
-        nn.Module: The LoRA-wrapped MoE module (GroupedExpertsLoRA or GroupedExpertsDeepEPLoRA).
+        nn.Module: The LoRA-wrapped MoE module.
     """
+    if expert_weight_format not in ("unquantized", "mxfp4"):
+        raise ValueError(
+            f"Unsupported expert_weight_format: {expert_weight_format!r}. Expected 'unquantized' or 'mxfp4' "
+            "as the storage mode; floating-point dtype is controlled by the model's precision configuration."
+        )
+    common = dict(lora_dim=dim, alpha=alpha, lora_A_init_method=lora_A_init_method, lora_dtype=lora_dtype)
+    mxfp4 = expert_weight_format == "mxfp4"
     if isinstance(orig_module, GroupedExpertsMoK):
         raise NotImplementedError("LoRA is not supported for Mixture-of-Kittens expert modules.")
     if isinstance(orig_module, GroupedExpertsTE):
         raise NotImplementedError("LoRA is not supported for Transformer Engine (TE) expert modules.")
     elif isinstance(orig_module, GroupedExpertsDeepEP):
-        new_module = GroupedExpertsDeepEPLoRA(
-            orig_module,
-            lora_dim=dim,
-            alpha=alpha,
-            lora_A_init_method=lora_A_init_method,
-            lora_dtype=lora_dtype,
-        )
+        if mxfp4:
+            new_module = GroupedExpertsDeepEPLoRAMXFP4(
+                orig_module, passthrough=orig_module.gate_and_up_projs.is_meta, **common
+            )
+        else:
+            new_module = GroupedExpertsDeepEPLoRA(orig_module, **common)
     elif isinstance(orig_module, GroupedExperts):
-        new_module = GroupedExpertsLoRA(
-            orig_module,
-            lora_dim=dim,
-            alpha=alpha,
-            lora_A_init_method=lora_A_init_method,
-            lora_dtype=lora_dtype,
-        )
+        if mxfp4:
+            new_module = GroupedExpertsLoRAMXFP4(
+                orig_module, passthrough=orig_module.gate_and_up_projs.is_meta, **common
+            )
+        else:
+            new_module = GroupedExpertsLoRA(orig_module, **common)
     else:
         raise NotImplementedError(f"Unsupported MoE module type: {type(orig_module)}")
 
@@ -646,13 +670,14 @@ def apply_lora_to_linear_modules(
                             moe_dim,
                         )
 
-                # Replace the module in the model
+                # MXFP4 meta experts receive packed checkpoint storage before sharding.
                 new_module = patch_moe_module(
                     module,
                     dim=moe_dim,
                     alpha=peft_config.alpha,
                     lora_A_init_method=peft_config.lora_A_init,
                     lora_dtype=lora_dtype,
+                    expert_weight_format=peft_config.expert_weight_format,
                 )
 
                 # Find parent and replace
