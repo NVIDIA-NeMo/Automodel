@@ -111,22 +111,7 @@ def _zeros_like_optimizer_param(param: torch.Tensor) -> torch.Tensor:
 
 
 def _materialize_missing_adam_state(optimizer: torch.optim.Optimizer) -> None:
-    """Initialize missing Adam state without taking an optimizer step."""
-    if HAS_TE and isinstance(optimizer, transformer_engine.pytorch.optimizers.FusedAdam):
-        # DCP otherwise creates dummy gradients in parameter dtype. FSDP2 can
-        # require FP32 gradients for BF16 parameters, so use TE's own lazy-state
-        # initializer without assigning gradients or taking an optimizer step.
-        for group in optimizer.param_groups:
-            if "step" not in group and group["params"]:
-                group["step"] = (
-                    torch.zeros(1, dtype=torch.int, device=group["params"][0].device) if optimizer.capturable else 0
-                )
-            for param in group["params"]:
-                if not optimizer.state[param]:
-                    optimizer.initialize_state(
-                        param, optimizer.store_param_remainders and param.dtype == torch.bfloat16
-                    )
-        return
+    """Create zero-valued Adam state for parameters that do not have state yet."""
     if not isinstance(optimizer, (torch.optim.Adam, torch.optim.AdamW)):
         return
 
