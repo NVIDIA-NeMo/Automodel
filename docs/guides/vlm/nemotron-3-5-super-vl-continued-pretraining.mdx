@@ -131,7 +131,7 @@ from huggingface_hub import hf_hub_download
 from transformers import AutoTokenizer
 
 root = Path(os.environ["CPT_DATA_ROOT"])
-revision = "9bb295ddab0e05d785b879661af7260fed5140fc"
+revision = "9bb295ddab0e05d785b879661af7260fed5140fc"  # pragma: allowlist secret (public FineWeb commit)
 source_name = "sample/10BT/000_00000.parquet"
 source = hf_hub_download(
     "HuggingFaceFW/fineweb",
@@ -291,8 +291,8 @@ The important data fields are:
 ```yaml
 dataset:
   _target_: nemo_automodel.components.datasets.llm.megatron_dataset.MegatronPretraining
-  paths: ${oc.env:FINEWEB_DATA_DIR}/fineweb_0_text_document
-  index_mapping_dir: ${oc.env:FINEWEB_DATA_DIR}/index_mapping
+  paths: /path/to/shared/super35_fineweb/megatron/fineweb_0_text_document
+  index_mapping_dir: /path/to/shared/super35_fineweb/megatron/index_mapping
   seq_length: 4096
   seed: 1234
   split: "99,1,0"
@@ -309,9 +309,9 @@ Set `paths` to the common prefix **without** `.bin` or `.idx`. These are Megatro
 indexed files, not NanoGPT binary shards. The loader already constructs fixed-length
 pretraining sequences, so this YAML does not enable the separate VLM/chat packing pipeline.
 
-Create an effective YAML that pins the model and both training tokenizers to the
-downloaded snapshot. Use this file for the launch so preprocessing and training cannot
-resolve different revisions:
+Create an effective YAML with the downloaded model snapshot, dataset paths, and W&B
+settings. The script reads the exported environment variables and writes their values
+directly into the YAML. Both training tokenizers use the same snapshot as preprocessing:
 
 ```bash
 export CPT_RECIPE="$PWD/fineweb_cpt_effective.yaml"
@@ -327,10 +327,15 @@ import yaml
 source = Path("examples/llm_pretrain/nemotron_3_5_super_vl/nemotron_3_5_super_vl_fineweb_cpt.yaml")
 config = yaml.safe_load(source.read_text())
 snapshot = os.environ["MODEL_SNAPSHOT"]
+data_dir = Path(os.environ["FINEWEB_DATA_DIR"])
 config["model"]["pretrained_model_name_or_path"] = snapshot
 for section in ["dataset", "validation_dataset"]:
+    config[section]["paths"] = str(data_dir / "fineweb_0_text_document")
+    config[section]["index_mapping_dir"] = str(data_dir / "index_mapping")
     config[section]["tokenizer"]["pretrained_model_name_or_path"] = snapshot
 config["wandb"]["enable"] = True
+config["wandb"]["entity"] = os.environ["WANDB_ENTITY"]
+config["wandb"]["project"] = os.environ["WANDB_PROJECT"]
 Path(os.environ["CPT_RECIPE"]).write_text(yaml.safe_dump(config, sort_keys=False))
 print(os.environ["CPT_RECIPE"])
 ```

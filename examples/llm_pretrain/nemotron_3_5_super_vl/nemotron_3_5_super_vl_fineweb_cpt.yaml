@@ -14,7 +14,7 @@
 
 # Continue pretraining the language model in the 121B Super 3.5 VL checkpoint.
 # FineWeb must be tokenized with this checkpoint's tokenizer into Megatron .bin/.idx.
-# Set FINEWEB_DATA_DIR to the directory containing fineweb_0_text_document.bin/.idx.
+# The tutorial generates a launch YAML with explicit dataset paths and W&B settings.
 # 8 nodes x 8 H100: cp4 / ep64 / dp16; global batch 32 = 2 microbatches per DP rank.
 # The tutorial reports 200 measured steps from this 10,000-step schedule/data horizon.
 # Periodic sharded checkpoints are retained; consolidate a selected checkpoint if needed.
@@ -90,8 +90,8 @@ loss_fn:
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.megatron_dataset.MegatronPretraining
-  paths: ${oc.env:FINEWEB_DATA_DIR}/fineweb_0_text_document
-  index_mapping_dir: ${oc.env:FINEWEB_DATA_DIR}/index_mapping
+  paths: /path/to/shared/super35_fineweb/megatron/fineweb_0_text_document
+  index_mapping_dir: /path/to/shared/super35_fineweb/megatron/index_mapping
   tokenizer:
     _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
     pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained
@@ -109,8 +109,8 @@ dataloader:
 
 validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.megatron_dataset.MegatronPretraining
-  paths: ${oc.env:FINEWEB_DATA_DIR}/fineweb_0_text_document
-  index_mapping_dir: ${oc.env:FINEWEB_DATA_DIR}/index_mapping
+  paths: /path/to/shared/super35_fineweb/megatron/fineweb_0_text_document
+  index_mapping_dir: /path/to/shared/super35_fineweb/megatron/index_mapping
   tokenizer:
     _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
     pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained
@@ -145,8 +145,8 @@ lr_scheduler:
 
 wandb:
   enable: false
-  entity: ${oc.env:WANDB_ENTITY,your-wandb-entity}
-  project: ${oc.env:WANDB_PROJECT,your-wandb-project}
+  entity: your-wandb-entity
+  project: your-wandb-project
   name: nemotron_3_5_super_vl_fineweb_cpt
   mode: online
 
