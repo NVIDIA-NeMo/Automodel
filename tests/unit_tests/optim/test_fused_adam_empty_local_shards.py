@@ -25,7 +25,6 @@ whole param group (rank-asymmetric ``param_groups`` desynchronize positional
 LR/WD scheduling) or the whole param list: those cases must raise.
 """
 
-import functools
 import logging
 import sys
 import types
@@ -110,7 +109,15 @@ class TestFusedAdamConfigDropsEmptyLocalShards:
 
         assert stub_te_fused_adam.last_params == [kept]
         assert stub_te_fused_adam.last_kwargs["lr"] == 1e-3
+        assert stub_te_fused_adam.last_kwargs.get("master_weight_dtype") == torch.float32
         assert "zero-numel local shards" in caplog.text
+
+    def test_explicit_master_weight_dtype_is_forwarded(self, stub_te_fused_adam):
+        kept = nn.Parameter(torch.ones(3))
+
+        FusedAdamConfig(master_weight_dtype="torch.float16")._build_optimizer([kept])
+
+        assert stub_te_fused_adam.last_kwargs["master_weight_dtype"] is torch.float16
 
     def test_flat_params_all_empty_raises(self, stub_te_fused_adam):
         with pytest.raises(ValueError, match="zero-numel local shard"):
@@ -174,63 +181,11 @@ class _TinyModel(nn.Module):
         self.empty = nn.Parameter(torch.empty(0))
 
 
-class _OnlyEmptyTrainableModel(nn.Module):
-    """Frozen linear; the sole trainable parameter has a zero-numel (local) shard."""
-
-    def __init__(self):
-        super().__init__()
-        self.linear = nn.Linear(3, 3)
-        self.linear.requires_grad_(False)
-        self.empty = nn.Parameter(torch.empty(0))
-
-
-class TestFactoryEscapeHatchDropsEmptyLocalShards:
-    def test_te_fused_adam_factory_drops_empty(self, stub_te_fused_adam):
-        cfg = OptimizerFromFactoryConfig(factory=stub_te_fused_adam, kwargs={"lr": 1e-3})
-
-        cfg.build(_TinyModel())
-
-        assert all(p.numel() > 0 for p in stub_te_fused_adam.last_params)
-        assert len(stub_te_fused_adam.last_params) == 2  # linear weight + bias
-
-    def test_partial_wrapped_te_fused_adam_factory_drops_empty(self, stub_te_fused_adam):
-        # functools.partial wrappers must be unwrapped by the TE FusedAdam identity
-        # check; without unwrapping, the empty shard would reach the constructor.
-        factory = functools.partial(stub_te_fused_adam, bias_correction=True)
-        cfg = OptimizerFromFactoryConfig(factory=factory, kwargs={"lr": 1e-3})
-
-        cfg.build(_TinyModel())
-
-        assert all(p.numel() > 0 for p in stub_te_fused_adam.last_params)
-        assert len(stub_te_fused_adam.last_params) == 2  # linear weight + bias
-        assert stub_te_fused_adam.last_kwargs["bias_correction"] is True
-
-    def test_te_fused_adam_factory_all_params_empty_raises(self, stub_te_fused_adam):
-        # The pre-filter `len(trainable_params) > 0` assert passes (one trainable
-        # param), so the post-filter empty list must raise the specific error, not
-        # torch's generic "optimizer got an empty parameter list".
-        cfg = OptimizerFromFactoryConfig(factory=stub_te_fused_adam, kwargs={"lr": 1e-3})
-
-        with pytest.raises(ValueError, match="zero-numel local shard"):
-            cfg.build(_OnlyEmptyTrainableModel())
-
-        assert stub_te_fused_adam.last_params is None
-
-    def test_te_fused_adam_factory_drops_empty_param_groups(self, stub_te_fused_adam):
-        cfg = OptimizerFromFactoryConfig(factory=stub_te_fused_adam, kwargs={"lr": 1e-3})
-        kept = nn.Parameter(torch.ones(3))
-
-        cfg.build_from_param_groups(
-            [
-                {"params": [nn.Parameter(torch.empty(0)), kept], "weight_decay": 0.1},
-            ]
-        )
-
-        assert stub_te_fused_adam.last_params == [{"params": [kept], "weight_decay": 0.1}]
-
-    def test_non_te_factory_is_not_filtered(self):
-        # torch.optim handles empty tensors; the guard must not change other factories.
-        cfg = OptimizerFromFactoryConfig(factory=torch.optim.SGD, kwargs={"lr": 0.01})
+class TestOptimizerFromFactoryConfig:
+    def test_all_params_forwarded_including_empty(self):
+        # The factory escape hatch does not filter zero-numel params; callers using
+        # TE FusedAdam should use FusedAdamConfig, which handles this automatically.
+        cfg = OptimizerFromFactoryConfig(optim_cls=torch.optim.SGD, kwargs={"lr": 0.01})
 
         opt = cfg.build(_TinyModel())[0]
 

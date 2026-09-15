@@ -28,7 +28,9 @@ from nemo_automodel.components.optim.optimizer import (
     OptimizerConfig,
     OptimizerFromFactoryConfig,
     ParamGroupOverride,
+    _avoid_redundant_te_master_weights_for_fp32_params,
     _drop_empty_local_shards,
+    _split_dtensor_and_plain_params,
     build_optimizer,
     build_optimizer_config,
 )
@@ -106,6 +108,20 @@ class TestAdamWConfig:
 
 
 class TestOptimizerConfigBase:
+    def test_isolates_plain_params_from_dtensor_foreach_group(self, monkeypatch):
+        import nemo_automodel.components.optim.optimizer as optimizer_module
+
+        class FakeDTensor:
+            pass
+
+        sharded = FakeDTensor()
+        plain = object()
+        monkeypatch.setattr(optimizer_module, "DTensor", FakeDTensor)
+
+        groups = _split_dtensor_and_plain_params([sharded, plain])
+
+        assert groups == [{"params": [sharded]}, {"params": [plain]}]
+
     def test_base_build_not_implemented(self):
         with pytest.raises(NotImplementedError):
             OptimizerConfig()._build_optimizer(_params())
@@ -123,6 +139,36 @@ class TestOptimizerConfigBase:
         assert isinstance(opt, torch.optim.AdamW)
         assert opt.param_groups[0]["weight_decay"] == 0.1
         assert opt.param_groups[1]["weight_decay"] == 0.0
+
+
+def test_te_master_ownership_uses_resident_fp32_parameter_directly_after_resume():
+    fp32_param = nn.Parameter(torch.ones(4, dtype=torch.float32))
+    bf16_param = nn.Parameter(torch.ones(4, dtype=torch.bfloat16))
+
+    class FakeFusedAdam(torch.optim.Optimizer):
+        def __init__(self):
+            super().__init__([fp32_param, bf16_param], {"lr": 1e-3})
+            self.master_weights = True
+            self._scales = {}
+
+        def _initialize_state(self, parameter, state_name, zero_buffer):
+            """Create one FP32 optimizer-state tensor matching ``parameter`` shape."""
+            assert zero_buffer
+            self.state[parameter][state_name] = torch.zeros_like(parameter, dtype=torch.float32)
+
+    optimizer = FakeFusedAdam()
+    _avoid_redundant_te_master_weights_for_fp32_params(optimizer)
+
+    assert set(optimizer.state[fp32_param]) == {"exp_avg", "exp_avg_sq"}
+    assert optimizer.state[bf16_param] == {}
+
+    optimizer.state[fp32_param]["master_param"] = fp32_param.detach().clone()
+    optimizer.state[bf16_param]["master_param"] = bf16_param.detach().float().clone()
+    checkpoint = optimizer.state_dict()
+    optimizer.load_state_dict(checkpoint)
+
+    assert set(optimizer.state[fp32_param]) == {"exp_avg", "exp_avg_sq"}
+    assert "master_param" in optimizer.state[bf16_param]
 
 
 # ---------------------------------------------------------------------------
@@ -175,7 +221,7 @@ class TestBuildOptimizer:
 class TestOptimizerFromFactoryConfig:
     def test_build_constructs_from_factory(self):
         cfg = OptimizerFromFactoryConfig(
-            factory=torch.optim.SGD,
+            optim_cls=torch.optim.SGD,
             kwargs={"lr": 0.01, "momentum": 0.9},
         )
         optimizers = cfg.build(_model())
@@ -191,18 +237,18 @@ class TestOptimizerFromFactoryConfig:
             return torch.optim.SGD(params, lr=kwargs.get("lr", 0.01))
 
         OptimizerFromFactoryConfig(
-            factory=fake_factory,
+            optim_cls=fake_factory,
             kwargs={"lr": 1e-3, "master_weight_dtype": "torch.bfloat16"},
         ).build(_model())
         assert captured["master_weight_dtype"] is torch.bfloat16
 
     def test_build_requires_callable_factory(self):
         with pytest.raises(AssertionError, match="must be a callable"):
-            OptimizerFromFactoryConfig(factory=None).build(_model())
+            OptimizerFromFactoryConfig(optim_cls=None).build(_model())
 
     def test_build_from_param_groups_uses_factory(self):
         cfg = OptimizerFromFactoryConfig(
-            factory=torch.optim.SGD,
+            optim_cls=torch.optim.SGD,
             kwargs={"lr": 0.01, "momentum": 0.9},
         )
         params = list(_model().parameters())
@@ -256,7 +302,7 @@ class TestBuildOptimizerTuple:
         build_optimizer(
             _model(),
             OptimizerFromFactoryConfig(
-                factory=fake_factory,
+                optim_cls=fake_factory,
                 kwargs={"lr": 1e-3, "master_weight_dtype": "torch.bfloat16", "exp_avg_dtype": "float16"},
             ),
         )
@@ -572,7 +618,7 @@ class TestParamGroupOverrides:
     def test_factory_reads_overrides_from_inherited_field(self):
         # Overrides set on the factory config's own field (not nested in kwargs) are honored.
         cfg = OptimizerFromFactoryConfig(
-            factory=torch.optim.AdamW,
+            optim_cls=torch.optim.AdamW,
             kwargs={"lr": 1e-3},
             param_group_overrides=[ParamGroupOverride("router", lr_mult=0.1)],
         )
