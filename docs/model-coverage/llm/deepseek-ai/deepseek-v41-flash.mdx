@@ -1,6 +1,6 @@
 ---
 title: "DeepSeek-V4.1 Flash"
-description: "DeepSeek V4.1 backbone fine-tuning with expert parallelism and sharded Engram memory."
+description: "DeepSeek-V4.1 Flash backbone fine-tuning with expert parallelism and sharded Engram memory."
 slug: model-coverage/large-language-models/deepseek-ai/deepseek-v41-flash
 ---
 
@@ -94,7 +94,7 @@ preserves released parameter names, required FP32 weights, and logical Engram
 rows while removing the original quantization metadata. Quantized re-export
 is not supported.
 
-Recipe initialization uses the NeMo wrapper's internal Checkpointer and DCP
+Recipe initialization uses the NeMo AutoModel wrapper's internal Checkpointer and DCP
 path to load the base checkpoint into the distributed model.
 
 Text inputs use unpacked `input_ids [batch, sequence]`, right padding, and
@@ -117,7 +117,7 @@ should be rendered with the official encoder before processing.
 At PR commit `d5c8b5e45176bd6de54c139b311937516be4e0d2`, a real-weight comparison
 covered all 40 layers, 4,096 positions, and all 129,280 vocabulary entries
 against the pinned checkpoint's unchanged official `inference/` implementation.
-Official TP1 was compared with native EP4 and four Engram owners using
+Official TP1 was compared with native EP4 and 4 Engram owners using
 `torch_mm`, native HybridEP dispatch and combine, and TileLang. Dense and expert
 reference weights were decoded for BF16 compute, with the original cache/index quantization retained;
 this was not a default FP8/FP4 GEMM comparison.
@@ -143,7 +143,7 @@ This is a measured baseline, not a strict parity pass.
 
 An earlier PR commit, `ae380ea74b8417a000c1639ebd64991aafeb42b8`, completed
 three resident forward/backward iterations using the now-removed custom FP32
-combine. It used four GB200 GPUs, the released first four layers and full
+combine. It used 4 GB200 GPUs, the released first four layers and full
 layer-1 Engram table, EP4, activation checkpointing, and resharding. All local
 trainable gradients were present and finite, including nonzero Engram and
 expert gradients. This check performed no clipping or optimizer updates and
