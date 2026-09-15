@@ -255,6 +255,8 @@ COPY --chown=${RUNTIME_UID}:${RUNTIME_GID} docker/common/update_pyproject_pytorc
 # Install Automodel
 ARG BASE_IMAGE=cuda
 ARG AUTOMODEL_INSTALL=all
+# `msa` is SM100-only so it stays out of `all`, but the image needs it: the MiniMax M3 MSA
+# recipe under examples/vlm_finetune/ is auto-discovered into release CI.
 ARG UV_SYNC_ARGS="--locked"
 # Preserve locally built wheels for source-only CUDA packages such as flash-attn,
 # causal-conv1d, mamba-ssm, and nv-grouped-gemm across BuildKit builds.
