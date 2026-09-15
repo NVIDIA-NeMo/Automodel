@@ -620,8 +620,16 @@ def _config_with_rope(config: LagunaConfig, rope_parameters: dict[str, Any]) -> 
     # dict, so a bare float there breaks validation. Keep the scalar on a top-level
     # config attribute and out of the nested dict passed to the RoPE init.
     rope_config = copy.deepcopy(config)
+    # ``rope_parameters`` here is always a flat per-layer mapping (the
+    # ``full_attention`` sub-dict or ``swa_rope_parameters``), never the
+    # layer_types-keyed nested mapping, so retaining the flat scalar
+    # ``partial_rotary_factor`` does not hit the >= 5.17 nested validation
+    # failure. Keep it in the mapping: ``LagunaRotaryEmbedding
+    # ._compute_default_rope_parameters`` reads the factor exclusively from
+    # ``config.rope_parameters``, so popping it would silently drop a non-default
+    # factor. Also mirror it to the top-level attribute.
     rope_config.rope_parameters = dict(rope_parameters)
-    rope_config.partial_rotary_factor = rope_config.rope_parameters.pop("partial_rotary_factor", None)
+    rope_config.partial_rotary_factor = rope_config.rope_parameters.get("partial_rotary_factor")
     return rope_config
 
 
