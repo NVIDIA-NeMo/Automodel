@@ -175,10 +175,13 @@ Each model lives under `components/models/<name>/` and contains:
 | File                    | Purpose                                           |
 |-------------------------|---------------------------------------------------|
 | `model.py`             | Model class (inherits `PreTrainedModel` + `HFCheckpointingMixin`) |
-| `state_dict_adapter.py`| Weight key mapping between HF and NeMo formats    |
+| `state_dict_adapter.py` (optional) | HF/native weight key or tensor-layout conversion |
 | `config.py` (optional) | Custom config class if HF config is insufficient  |
 | `layers.py` (optional) | Custom layer implementations                      |
 | `rope_utils.py` (optional) | Model-specific RoPE variants                  |
+
+Most custom models need a state dict adapter for HF weight conversion. Omit it
+only when HF weight names and tensor layouts already match.
 
 ### Inheritance
 

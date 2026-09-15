@@ -66,6 +66,10 @@ from nemo_automodel.components.models.deepseek_v4.vision import (
 )
 from nemo_automodel.components.moe.config import MoEConfig
 
+# Over the default 5s budget on purpose: TileLang compilation takes up to about 50s on a cold worker.
+# Reduce cold compiler startup before lowering this further.
+pytestmark = pytest.mark.timeout(120)
+
 
 def _can_run_tilelang_sparse_attention() -> bool:
     return (

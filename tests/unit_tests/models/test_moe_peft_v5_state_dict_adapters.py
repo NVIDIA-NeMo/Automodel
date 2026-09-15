@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from inspect import unwrap
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -150,9 +151,6 @@ def _make_adapter_and_state(family: str, rank: int):
         adapter = NemotronV3StateDictAdapter(
             SimpleNamespace(num_hidden_layers=1), moe_config, backend, dtype=torch.float32
         )
-        # This fixture uses Transformers v5's native ``model.*`` hierarchy;
-        # remote-code Nemotron-H checkpoints instead select ``backbone.*``.
-        adapter._uses_model_prefix = True
     expert_path, _ = _FAMILIES[family]
 
     base = f"base_model.model.model.layers.0.{expert_path}"
@@ -164,6 +162,95 @@ def _make_adapter_and_state(family: str, rank: int):
         f"{base}.lora_down_B": torch.randn(moe_config.n_routed_experts, rank, moe_config.dim),
     }
     return adapter, moe_config, state_dict
+
+
+def test_nemotron_linear_adapter_export_loads_into_hf(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Base checkpoints with backbone keys must export loadable linear adapters.
+
+    Exercise Mamba input, latent projections, shared experts, and lm_head using
+    the real export metadata and PEFT loader. Previously only lm_head loaded:
+    the built-in HF model silently skipped every backbone-prefixed target.
+    """
+    from peft import LoraConfig, PeftModel, get_peft_model_state_dict
+    from safetensors.torch import save_file
+    from transformers.models.nemotron_h import modeling_nemotron_h
+    from transformers.models.nemotron_h.configuration_nemotron_h import NemotronHConfig
+    from transformers.models.nemotron_h.modeling_nemotron_h import NemotronHForCausalLM
+
+    # Transformers prefers installed causal-conv1d/mamba-ssm kernels even on
+    # CPU. Use its real PyTorch reference functions for this no-cache forward;
+    # use_mamba_kernels=False does not control this newer dispatch path.
+    for name in ("causal_conv1d_fn", "mamba2_chunk_scan"):
+        monkeypatch.setattr(modeling_nemotron_h, name, unwrap(getattr(modeling_nemotron_h, name)))
+
+    torch.manual_seed(42)
+    config = NemotronHConfig(
+        vocab_size=32,
+        hidden_size=16,
+        layers_block_type=["mamba", "moe"],
+        num_hidden_layers=2,
+        n_routed_experts=2,
+        moe_intermediate_size=12,
+        moe_shared_expert_intermediate_size=12,
+        moe_latent_size=8,
+        num_experts_per_tok=1,
+        n_group=1,
+        topk_group=1,
+        mamba_num_heads=8,
+        mamba_head_dim=4,
+        n_groups=1,
+        ssm_state_size=4,
+        expand=2,
+    )
+    model = NemotronHForCausalLM(config).eval()
+    base_weights = {name: tensor.clone() for name, tensor in model.state_dict().items()}
+    backend = BackendConfig(linear="torch", attn="sdpa", rms_norm="torch")
+    # Ordinary linear adapters are sufficient for the reported failure; the
+    # grouped expert export and merge are exercised by the tests below.
+    adapter = NemotronV3StateDictAdapter(config, None, backend, dtype=torch.float32)
+    model.state_dict_adapter = adapter
+    peft_config = PeftConfig(exclude_modules=["*.out_proj"], dim=2, alpha=2, use_triton=False)
+    apply_lora_to_linear_modules(model, peft_config)
+    with torch.no_grad():
+        for name, parameter in model.named_parameters():
+            if ".lora_" in name:
+                parameter.normal_(std=0.01)
+    state = ModelState(model, is_peft=True)
+    metadata = _get_hf_peft_config(peft_config, state)
+    native_adapter = state.state_dict()
+    exported = adapter.to_hf(dict(native_adapter))
+    # Explicit legacy export must still preserve both backbone-prefixed
+    # target metadata and weight names for remote-code model consumers.
+    legacy_metadata = _get_hf_peft_config(peft_config, state, v4_compatible=True)
+    legacy_exported = adapter.to_hf(dict(native_adapter), v4_compatible=True)
+    assert "backbone.layers.0.mixer.in_proj" in legacy_metadata["target_modules"]
+    legacy_key = "base_model.model.backbone.layers.0.mixer.in_proj.lora_A.weight"
+    torch.testing.assert_close(
+        legacy_exported[legacy_key], exported[legacy_key.replace(".backbone.", ".model.")], rtol=0, atol=0
+    )
+    streamed = dict(
+        item for name, tensor in native_adapter.items() for item in adapter.convert_single_tensor_to_hf(name, tensor)
+    )
+    assert set(streamed) == set(exported)
+    for name in exported:
+        torch.testing.assert_close(streamed[name], exported[name], rtol=0, atol=0)
+    assert adapter._uses_model_prefix is False
+    LoraConfig(**metadata).save_pretrained(tmp_path)
+    save_file(exported, str(tmp_path / "adapter_model.safetensors"))
+
+    hf_model = NemotronHForCausalLM(config).eval()
+    hf_model.load_state_dict(base_weights)
+    loaded = PeftModel.from_pretrained(hf_model, str(tmp_path), key_mapping={}, autocast_adapter_dtype=False)
+    loaded_state = get_peft_model_state_dict(loaded, save_embedding_layers=False)
+    assert set(loaded_state) == set(exported)
+    for name in exported:
+        torch.testing.assert_close(loaded_state[name], exported[name], rtol=0, atol=0)
+
+    input_ids = torch.tensor([[1, 2, 3, 4]])
+    with torch.no_grad():
+        expected_logits = model(input_ids, use_cache=False).logits
+        actual_logits = loaded(input_ids, use_cache=False).logits
+    torch.testing.assert_close(actual_logits, expected_logits, rtol=1e-5, atol=1e-6)
 
 
 def _expected_hf_delta(lora_a: torch.Tensor, lora_b: torch.Tensor, scale: float) -> torch.Tensor:
