@@ -167,6 +167,16 @@ def test_situ_triton_flag_wires_decoder_layer(monkeypatch):
     assert calls == ["situ"]
 
 
+def test_attn_res_triton_flag_wires_decoder_layer(monkeypatch):
+    calls = []
+    monkeypatch.setattr(kimi_k3_model, "_enable_attn_res_triton", lambda: calls.append("attn_res"))
+    assert BackendConfig().attn_res_triton is False
+    layer = _build_decoder_layer(_torch_backend())
+    assert layer.use_attn_residuals and calls == []
+    _build_decoder_layer(_torch_backend(attn_res_triton=True))
+    assert calls == ["attn_res"]
+
+
 def test_compile_router_weight_defaults_false_and_wires_k3_moe(restore_situ_cores):
     assert BackendConfig().compile_router_weight is False
     optimized_ops._RW_CORES_COMPILED = False
