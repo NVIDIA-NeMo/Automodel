@@ -10,6 +10,8 @@ set -uo pipefail
 REPO=$(cd "$(dirname "$0")/../../.." && pwd)
 RUN_DIR=${RUN_DIR:-$(ls -td "$REPO"/logs/v5_130k-* | head -1)}
 RUN_NAME=${RUN_NAME:-v5_130k}
+# Last optimizer step the run logs; the watchdog exits cleanly once it appears.
+FINAL_STEP=${FINAL_STEP:-5020}
 PATTERN='OutOfMemoryError|CUDA out of memory|DeepEP error|Xid|CUDA error|NCCL.*(unhandled|aborting)'
 
 echo "watchdog: $RUN_DIR"
@@ -24,7 +26,7 @@ while true; do
   fi
   # Stop watching once the run is over.
   if ! pgrep -f "launch_2node_v4_88k.sh 0" > /dev/null 2>&1; then
-    grep -qE "step 5020 \|" "$RUN_DIR"/rank0.log 2>/dev/null && { echo "WATCHDOG_RUN_COMPLETE"; exit 0; }
+    grep -qE "step $FINAL_STEP \|" "$RUN_DIR"/rank0.log 2>/dev/null && { echo "WATCHDOG_RUN_COMPLETE"; exit 0; }
     sleep 30
     pgrep -f "launch_2node_v4_88k.sh 0" > /dev/null 2>&1 || { echo "WATCHDOG_RANK0_GONE"; exit 11; }
   fi
