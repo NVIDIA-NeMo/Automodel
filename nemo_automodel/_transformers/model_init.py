@@ -68,9 +68,11 @@ from nemo_automodel.components.models.common.gated_delta_net_fp32 import (
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.utils import (
+    HUB_LOADING_KWARGS,
     BackendConfig,
     initialize_linear_module,
     initialize_rms_norm_module,
+    restore_pretrained_generation_config,
 )
 from nemo_automodel.components.utils.model_utils import resolve_trust_remote_code, skip_random_init
 from nemo_automodel.shared.utils import dtype_from_str
@@ -1299,6 +1301,10 @@ def __init_model(
                 _download_model_weights(hf_config, pretrained_model_name_or_path, process_group=process_group)
             logger.info(f"Using custom model implementation for {architectures[0]}")
             kwargs.pop("trust_remote_code", None)
+            # Keep the hub loading options before the constructor-argument filter drops
+            # them: the generation-config restore below has to read from the same
+            # subfolder/revision the weights came from.
+            loading_kwargs = {key: kwargs[key] for key in HUB_LOADING_KWARGS if key in kwargs}
             # Treat config-related kwargs as config overrides (HF behavior) and
             # avoid forwarding them into model __init__.
             init_param_names = _get_init_param_names(model_cls)
@@ -1314,7 +1320,15 @@ def __init_model(
 
                     kwargs["backend"] = BackendConfig(**kwargs["backend"])
             with local_torch_dtype(torch_dtype, model_cls.__name__):
-                return True, model_cls(hf_config, *model_args, **kwargs)
+                model = model_cls(hf_config, *model_args, **kwargs)
+            if is_pretrained_init:
+                # Custom constructors only see the config. Restore the checkpoint's
+                # generation settings the way PreTrainedModel.from_pretrained does:
+                # generation_config.json carries stop tokens and sampling defaults that
+                # the config lacks, and the consolidated export writes
+                # model.generation_config back out.
+                restore_pretrained_generation_config(model, pretrained_model_name_or_path, **loading_kwargs)
+            return True, model
 
     # 3. fallback to HF model class wrapped with mixin
     model = None
