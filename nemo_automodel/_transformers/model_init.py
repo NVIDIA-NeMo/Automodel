@@ -37,6 +37,7 @@ try:
 except ImportError:
     StrictDataclassClassValidationError = ValueError
 from transformers.modeling_utils import PreTrainedModel
+from transformers.models.auto.configuration_auto import model_type_to_module_name
 
 # For models that still accesses config.pad_token_id after v5 removes it in PretrainedConfig
 if not hasattr(PretrainedConfig, "pad_token_id"):
@@ -62,6 +63,8 @@ import nemo_automodel.components.checkpoint.utils as checkpoint_utils
 import nemo_automodel.components.distributed.utils as dist_utils
 from nemo_automodel._transformers.registry import ModelRegistry, resolve_custom_config_cls
 from nemo_automodel.components.distributed.init_utils import get_local_world_size_preinit, get_world_size_safe
+from nemo_automodel.components.distributed.parallel_spec import ParallelSpec
+from nemo_automodel.components.models import declared_parallel_spec
 from nemo_automodel.components.models.common.gated_delta_net_fp32 import (
     has_gated_delta_net_fp32_checkpoint_contract,
     is_gated_delta_net_fp32_param_key,
@@ -117,6 +120,28 @@ _patched_get_init_context.__wrapped__ = _original_get_init_context
 PreTrainedModel.get_init_context = classmethod(_patched_get_init_context)
 
 
+def parallel_spec_for(model_class: type) -> ParallelSpec | None:
+    """Contract for a class the repository does not own, or ``None`` when the generic defaults apply.
+
+    Walks the MRO so subclasses (``HFCheckpointingMixin`` wrappers, FP8 variants, remote-code
+    ports) inherit their base architecture's contract. Per class, a declaration in
+    ``components/models/<family>/parallelization.py`` wins, where ``<family>`` is the transformers
+    module name of the config's ``model_type`` (``gemma3`` for both ``gemma3`` and ``gemma3_text``,
+    ``nemotron_nas`` for a ``trust_remote_code`` ``nemotron-nas`` checkpoint); otherwise the native
+    implementation registered under the same architecture name is authoritative for its
+    transformers twin.
+    """
+    model_type = getattr(getattr(model_class, "config_class", None), "model_type", None)
+    family = model_type_to_module_name(model_type) if model_type else None
+    for cls in model_class.__mro__:
+        spec = declared_parallel_spec(family, cls.__name__) if family else None
+        if spec is None and ModelRegistry.has_custom_model(cls.__name__):
+            spec = getattr(ModelRegistry.get_model_cls_from_model_arch(cls.__name__), "parallel_spec", None)
+        if spec is not None:
+            return spec
+    return None
+
+
 def _get_mixin_wrapped_class(model_class: type) -> type:
     """
     Get a class that combines HFCheckpointingMixin with the original model class.
@@ -134,12 +159,10 @@ def _get_mixin_wrapped_class(model_class: type) -> type:
         return model_class
 
     # Create wrapper class that looks identical to original. Classes the repository does not
-    # own get their parallelization contract here, so components.distributed only ever reads
-    # the ``parallel_spec`` class attribute.
+    # re-implement get their parallelization contract here, so components.distributed only ever
+    # reads the ``parallel_spec`` class attribute.
     namespace = {"__module__": model_class.__module__, "__qualname__": model_class.__qualname__}
     if not hasattr(model_class, "parallel_spec"):
-        from nemo_automodel._transformers.hf_parallel_specs import parallel_spec_for
-
         spec = parallel_spec_for(model_class)
         if spec is not None:
             namespace["parallel_spec"] = spec

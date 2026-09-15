@@ -14,8 +14,9 @@
 
 """Shared tensor-parallel styles used by model-owned TP plans.
 
-The plans themselves live with their models (``components/models/<name>/parallelization.py``)
-or, for architectures the repository does not implement, in ``_transformers/hf_parallel_specs.py``.
+The plans themselves live with their models in ``components/models/<name>/parallelization.py`` --
+including architectures the repository does not re-implement, which get a directory holding only
+that contract.
 """
 
 from __future__ import annotations

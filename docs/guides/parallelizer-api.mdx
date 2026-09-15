@@ -18,8 +18,8 @@ Who provides that object depends on who owns the class:
 | Class | Where its `ParallelSpec` comes from |
 |---|---|
 | A model NeMo AutoModel implements (`components/models/<name>/`) | The class declares `parallel_spec` itself. |
-| A stock `transformers` class or a `trust_remote_code` checkpoint | `nemo_automodel._transformers.hf_parallel_specs` binds one onto the wrapper class the loader creates. |
-| A `diffusers` transformer | `nemo_automodel._diffusers.parallelization` binds one before the component is sharded. |
+| A stock `transformers` class or a `trust_remote_code` checkpoint | Its own `components/models/<family>/parallelization.py` declares it on a class named after the architecture; the loader binds it onto the wrapper class it creates. |
+| A `diffusers` transformer | The same layout; `nemo_automodel._diffusers.parallelization.attach_parallel_spec` binds it before the component is sharded. |
 | Anything else | The all-default spec: llama-style layout (`model.layers`, `config.num_attention_heads`, HF `_tp_plan` rooted at `model`). |
 
 ## When You Need a Spec
@@ -156,34 +156,58 @@ importing one modeling module there loads the whole model zoo into every process
 (see `components/distributed/AGENTS.md`).
 </Warning>
 
-## Classes You Do Not Own
+## Architectures You Do Not Re-Implement
 
-Stock `transformers` classes and `trust_remote_code` checkpoints cannot carry an attribute, so
-`nemo_automodel._transformers.hf_parallel_specs.parallel_spec_for(model_cls)` resolves one when
-the loader wraps the class. It walks the class MRO and, for each class name, uses:
+Stock `transformers` classes, `trust_remote_code` checkpoints, and `diffusers` transformers
+cannot carry the attribute themselves, and nothing in `nemo_automodel` keeps a table of them.
+Such an architecture gets a model directory of its own that holds only the contract:
 
-1. an explicit `HF_PARALLEL_SPECS` entry (Gemma3, Phi, Llava, Qwen2-VL, DeciLM, ...), otherwise
-2. the `parallel_spec` of the native NeMo AutoModel implementation registered under the same
-   architecture name — so a transformers `LlamaForCausalLM` (or a same-named remote-code
-   class) inherits the native Llama contract.
-
-Subclasses inherit through the MRO, which is how an FP8 variant of a transformers VLM gets
-its base architecture's contract. For a third-party class you cannot edit, register a strategy
-by name before the model is built:
-
-```python
-from nemo_automodel import register_parallel_strategy
-from nemo_automodel.components.distributed.parallelizer import DefaultParallelizationStrategy
-
-
-@register_parallel_strategy(name="MyRemoteCodeForCausalLM")
-class MyRemoteCodeStrategy(DefaultParallelizationStrategy):
-    ...
+```
+components/models/gemma3/
+├── __init__.py
+└── parallelization.py     # plan functions, validators, strategy, and the declaration below
 ```
 
-`diffusers` transformers (`WanTransformer3DModel`, `HunyuanVideo15Transformer3DModel`,
-`LTX2VideoTransformer3DModel`, `QwenImageTransformer2DModel`) are bound the same way from
-`nemo_automodel._diffusers.parallelization.DIFFUSERS_PARALLEL_SPECS`.
+```python
+# components/models/gemma3/parallelization.py
+class Gemma3ForConditionalGeneration:
+    """Contract for the transformers ``Gemma3ForConditionalGeneration``."""
+
+    parallel_spec: ParallelSpec = ParallelSpec(
+        tp_plan=gemma3_tp_plan,
+        layer_groups=GEMMA3_LAYERS,
+        text_config_path="config.text_config",
+        hf_tp_plan_prefix=("model", "language_model"),
+    )
+```
+
+The class is a plain declaration named exactly like the upstream architecture; it is never
+instantiated. When the loader wraps an upstream class it derives the directory from the class
+and binds the declared spec onto the wrapper
+(`nemo_automodel._transformers.model_init.parallel_spec_for`,
+`nemo_automodel._diffusers.parallelization.attach_parallel_spec`):
+
+| Upstream class | Directory | Derived from |
+|---|---|---|
+| `transformers` (stock or `trust_remote_code`) | `components/models/<family>/` | `config_class.model_type` through transformers' `model_type_to_module_name`: `gemma3` for both `gemma3` and `gemma3_text`, `nemotron_nas` for a `nemotron-nas` checkpoint. |
+| `diffusers` transformer | `components/models/<stem>/` | snake_case of the class name before `Transformer`: `WanTransformer3DModel` → `wan`, `QwenImageTransformer2DModel` → `qwen_image`. |
+
+Resolution walks the class MRO, so an FP8 variant or a remote-code port of a transformers VLM
+inherits its base architecture's declaration. A class with no declaration falls back to the
+`parallel_spec` of the native NeMo AutoModel implementation registered under the same
+architecture name (a transformers `LlamaForCausalLM` inherits the native Llama contract), and
+otherwise to the all-default spec.
+
+To add one: create the directory, write `parallelization.py` with the plan, validator, or
+strategy the architecture needs plus the declaration class, and assert the resolution in a unit
+test (`parallel_spec_for(HFClass).tp_plan is my_tp_plan`). For an out-of-tree class you cannot
+ship a directory for, set the attribute on the class itself before building the model —
+`MyRemoteModel.parallel_spec = ParallelSpec(strategy=MyStrategy())` — and the wrapper inherits it.
+
+<Note>
+The name-keyed `register_parallel_strategy` decorator and the tables it wrote into are gone.
+Declare `parallel_spec` on the class (yours, or the upstream one) instead.
+</Note>
 
 ## Override the Plan at Run Time
 
@@ -230,4 +254,4 @@ enforces the latter.
 
 - [Distributed Setup (Python API)](/development/distributed-setup): Build the `DistributedSetup` that drives the parallelizer.
 - [Gradient Checkpointing](/development/gradient-checkpointing): The activation checkpointing scopes a `layer_groups` declaration feeds.
-- [`parallel_spec.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/distributed/parallel_spec.py) and [`hf_parallel_specs.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/_transformers/hf_parallel_specs.py) source code.
+- [`parallel_spec.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/distributed/parallel_spec.py) and a contract-only model package, [`components/models/gemma3/parallelization.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/models/gemma3/parallelization.py).

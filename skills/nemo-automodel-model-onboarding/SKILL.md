@@ -161,7 +161,8 @@ components/models/<name>/
   config.py            # Only if HF config is insufficient
   layers.py            # Only for MoE / MLA / other non-standard layers
   rope_utils.py        # Only for custom RoPE
-  parallelization.py   # Only when the TP plan, layer groups, or FSDP2 strategy differ from the llama-style defaults
+  parallelization.py   # Only when the TP plan, layer groups, or FSDP2 strategy differ from the llama-style defaults;
+                       # the only file for an architecture that is not re-implemented
 ```
 
 ### 2.2 Implementation order
@@ -181,6 +182,14 @@ If the architecture needs a custom TP plan, several layer containers (VLM towers
 a nested text config, or its own FSDP2 strategy, declare a `parallel_spec: ParallelSpec`
 class attribute on the model (see `docs/guides/parallelizer-api.mdx`). Never add the
 model to `components/distributed/`.
+
+If you are not re-implementing the architecture (a stock `transformers` class, a
+`trust_remote_code` checkpoint, or a `diffusers` transformer), still create
+`components/models/<family>/` with only `__init__.py` and `parallelization.py`, and declare
+the spec on a class named after the upstream architecture. `<family>` is the transformers
+module name of the config `model_type` (`gemma3`, `nemotron_nas`) or, for diffusers, the
+snake_case class stem (`wan`, `qwen_image`); the loader derives it from the class and binds
+the declaration onto the wrapper it creates.
 
 See the pattern files for detailed implementation guidance:
 

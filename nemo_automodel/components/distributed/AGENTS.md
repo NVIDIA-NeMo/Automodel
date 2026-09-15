@@ -55,10 +55,12 @@ class NewModelForCausalLM(HFCheckpointingMixin, nn.Module):
 `ParallelSpec` (`parallel_spec.py`) carries the TP plan, layer groups, text-config
 path, HF `_tp_plan` root, validators and strategy override; `parallelizer.py` only
 ever reads the `parallel_spec` class attribute (`query_parallel_spec`). Architectures
-the repository does not own -- stock `transformers` classes, `trust_remote_code`
-checkpoints, `diffusers` transformers -- get theirs from the bridge that wraps them:
-`_transformers/hf_parallel_specs.py` (bound in `_get_mixin_wrapped_class`) and
-`_diffusers/parallelization.py`. Nothing in this directory names a model.
+the repository does not re-implement -- stock `transformers` classes, `trust_remote_code`
+checkpoints, `diffusers` transformers -- get a `components/models/<family>/parallelization.py`
+of their own that declares the spec on a class named after the upstream architecture; the
+loaders (`_transformers/model_init.py`, `_diffusers/parallelization.py`) derive `<family>`
+from the class and bind the declaration onto the wrapper they create. No table of model
+names exists anywhere, and nothing in this directory names a model.
 
 **Type annotations** -- put the import under `if TYPE_CHECKING:`. That needs
 `from __future__ import annotations` at the top of the file so annotations are

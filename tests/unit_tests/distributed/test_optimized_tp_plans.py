@@ -36,8 +36,9 @@ from transformers.models.llama.modeling_llama import LlamaForCausalLM
 from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM, Qwen3ForSequenceClassification
 
-from nemo_automodel._transformers.hf_parallel_specs import HF_PARALLEL_SPECS, _gemma3_tp_plan, parallel_spec_for
+from nemo_automodel._transformers.model_init import parallel_spec_for
 from nemo_automodel.components.distributed.optimized_tp_plans import RotaryEmbedParallel
+from nemo_automodel.components.models.gemma3.parallelization import gemma3_tp_plan
 from nemo_automodel.components.models.llama.parallelization import llama_tp_plan
 from nemo_automodel.components.models.qwen2.model import Qwen2ForCausalLM as CustomQwen2ForCausalLM
 from nemo_automodel.components.models.qwen2.parallelization import qwen_tp_plan
@@ -45,7 +46,7 @@ from nemo_automodel.components.models.qwen3.model import Qwen3ForCausalLM as Cus
 
 
 def _tp_plan_of(cls):
-    """The tp_plan the runtime binds for ``cls``: its own declaration, else the HF bridge's."""
+    """The tp_plan the runtime binds for ``cls``: its own declaration, else the one its model package declares."""
     spec = getattr(cls, "parallel_spec", None) or parallel_spec_for(cls)
     return spec.tp_plan
 
@@ -197,10 +198,10 @@ class TestParallelizeFunctions:
     """Test suite for model-specific parallelization functions."""
 
     def test_parallelize_gemma3_causal_basic(self):
-        """Test _gemma3_tp_plan with Gemma3ForCausalLM."""
+        """Test gemma3_tp_plan with Gemma3ForCausalLM."""
         model = MockModel("gemma3_causal")
 
-        result = _gemma3_tp_plan(model, sequence_parallel=False)
+        result = gemma3_tp_plan(model, sequence_parallel=False)
 
         # Should return dict with proper module patterns
         assert isinstance(result, dict)
@@ -224,10 +225,10 @@ class TestParallelizeFunctions:
         assert isinstance(result["model.layers.*.self_attn.o_proj"], RowwiseParallel)
 
     def test_parallelize_gemma3_conditional_basic(self):
-        """Test _gemma3_tp_plan with Gemma3ForConditionalGeneration."""
+        """Test gemma3_tp_plan with Gemma3ForConditionalGeneration."""
         model = MockModel("gemma3_conditional")
 
-        result = _gemma3_tp_plan(model, sequence_parallel=False)
+        result = gemma3_tp_plan(model, sequence_parallel=False)
 
         # Should use "model.language_model" prefix for conditional generation
         expected_patterns = [
@@ -241,10 +242,10 @@ class TestParallelizeFunctions:
             assert pattern in result
 
     def test_parallelize_gemma3_with_sequence_parallel(self):
-        """Test _gemma3_tp_plan with sequence parallelism enabled."""
+        """Test gemma3_tp_plan with sequence parallelism enabled."""
         model = MockModel("gemma3_causal")
 
-        result = _gemma3_tp_plan(model, sequence_parallel=True)
+        result = gemma3_tp_plan(model, sequence_parallel=True)
 
         # Should include additional sequence parallel patterns
         sequence_patterns = [
@@ -405,10 +406,13 @@ class TestParallelizeFunctionsMapping:
         for model_type in expected_types:
             assert _tp_plan_of(model_type) is not None
 
-    def test_mapping_functions_are_callable(self):
-        """Test that all functions in the mapping are callable."""
-        for spec in HF_PARALLEL_SPECS.values():
-            assert spec.tp_plan is None or callable(spec.tp_plan)
+    def test_declared_plans_are_callable(self):
+        """Architectures that only get a contract (no re-implementation) still bind a callable plan."""
+        from transformers.models.phi.modeling_phi import PhiForCausalLM
+        from transformers.models.phi3.modeling_phi3 import Phi3ForCausalLM
+
+        for model_type in (PhiForCausalLM, Phi3ForCausalLM):
+            assert callable(_tp_plan_of(model_type))
 
     def test_mapping_functions_return_dict(self):
         """Test that all mapping functions return dictionaries."""
@@ -452,7 +456,7 @@ class TestParallelizeFunctionsMapping:
         conditional_func = _tp_plan_of(Gemma3ForConditionalGeneration)
 
         assert causal_func is conditional_func
-        assert causal_func is _gemma3_tp_plan
+        assert causal_func is gemma3_tp_plan
 
 
 class TestParallelPlanStructure:
@@ -463,7 +467,7 @@ class TestParallelPlanStructure:
         mock_models = [
             (MockModel("llama", tie_word_embeddings=False), llama_tp_plan),
             (MockModel("qwen2", tie_word_embeddings=False), qwen_tp_plan),
-            (MockModel("gemma3_causal"), _gemma3_tp_plan),
+            (MockModel("gemma3_causal"), gemma3_tp_plan),
         ]
 
         valid_styles = (
@@ -491,7 +495,7 @@ class TestParallelPlanStructure:
         mock_models = [
             (MockModel("llama", tie_word_embeddings=False), llama_tp_plan),
             (MockModel("qwen2", tie_word_embeddings=False), qwen_tp_plan),
-            (MockModel("gemma3_causal"), _gemma3_tp_plan),
+            (MockModel("gemma3_causal"), gemma3_tp_plan),
         ]
 
         for model, func in mock_models:
@@ -505,7 +509,7 @@ class TestParallelPlanStructure:
         mock_models = [
             (MockModel("llama", tie_word_embeddings=False), llama_tp_plan),
             (MockModel("qwen2", tie_word_embeddings=False), qwen_tp_plan),
-            (MockModel("gemma3_causal"), _gemma3_tp_plan),
+            (MockModel("gemma3_causal"), gemma3_tp_plan),
         ]
 
         for model, func in mock_models:
@@ -521,12 +525,12 @@ class TestParallelPlanStructure:
 
 
 class TestParallelizeMistral3Vlm:
-    """_mistral3_vlm_tp_plan + HF-bridge binding for Mistral3 VLM."""
+    """mistral3_vlm_tp_plan + the ``components/models/mistral3`` declaration for the Mistral3 VLM."""
 
     def test_paths_under_model_language_model_prefix(self):
-        from nemo_automodel._transformers.hf_parallel_specs import _mistral3_vlm_tp_plan
+        from nemo_automodel.components.models.mistral3.parallelization import mistral3_vlm_tp_plan
 
-        plan = _mistral3_vlm_tp_plan(model=None)
+        plan = mistral3_vlm_tp_plan(model=None)
         # Every text-decoder rule must be scoped to model.language_model.* —
         # without this prefix scoping (the original bug), MLP weights stayed
         # unsharded across TP and FP8 dequant OOMed.
@@ -538,9 +542,9 @@ class TestParallelizeMistral3Vlm:
     def test_attention_and_mlp_styles(self):
         from torch.distributed.tensor.parallel import ColwiseParallel, RowwiseParallel
 
-        from nemo_automodel._transformers.hf_parallel_specs import _mistral3_vlm_tp_plan
+        from nemo_automodel.components.models.mistral3.parallelization import mistral3_vlm_tp_plan
 
-        plan = _mistral3_vlm_tp_plan(model=None)
+        plan = mistral3_vlm_tp_plan(model=None)
         prefix = "model.language_model.layers.*"
         # qkv + gate + up are colwise; o + down are rowwise (Ministral3 GQA pattern).
         for k in (
@@ -560,9 +564,9 @@ class TestParallelizeMistral3Vlm:
     def test_lm_head_is_top_level_colwise(self):
         from torch.distributed.tensor.parallel import ColwiseParallel
 
-        from nemo_automodel._transformers.hf_parallel_specs import _mistral3_vlm_tp_plan
+        from nemo_automodel.components.models.mistral3.parallelization import mistral3_vlm_tp_plan
 
-        plan = _mistral3_vlm_tp_plan(model=None)
+        plan = mistral3_vlm_tp_plan(model=None)
         # lm_head sits at the top level (not nested under model.language_model)
         # in HF's Mistral3ForConditionalGeneration; sharding it on dim=-1
         # follows VocabParallelEmbedding to match the embed table sharding.
@@ -576,17 +580,17 @@ class TestParallelizeMistral3Vlm:
         stay unsharded."""
         from transformers.models.mistral3.modeling_mistral3 import Mistral3ForConditionalGeneration
 
-        from nemo_automodel._transformers.hf_parallel_specs import _mistral3_vlm_tp_plan
+        from nemo_automodel.components.models.mistral3.parallelization import mistral3_vlm_tp_plan
         from nemo_automodel.components.models.mistral3_vlm.model import (
             Mistral3FP8VLMForConditionalGeneration,
         )
 
-        assert parallel_spec_for(Mistral3ForConditionalGeneration).tp_plan is _mistral3_vlm_tp_plan
-        assert Mistral3FP8VLMForConditionalGeneration.parallel_spec.tp_plan is _mistral3_vlm_tp_plan
+        assert parallel_spec_for(Mistral3ForConditionalGeneration).tp_plan is mistral3_vlm_tp_plan
+        assert Mistral3FP8VLMForConditionalGeneration.parallel_spec.tp_plan is mistral3_vlm_tp_plan
 
 
 class TestParallelizeFalconH1:
-    """_falcon_h1_tp_plan + HF-bridge binding for Falcon-H1.
+    """falcon_h1_tp_plan + the ``components/models/falcon_h1`` declaration for Falcon-H1.
 
     Falcon-H1 is a hybrid Transformer + Mamba2 model. HF ships only
     ``_tp_plan = {"lm_head": "colwise_gather_output"}`` and names its MLP
@@ -596,9 +600,9 @@ class TestParallelizeFalconH1:
     """
 
     def test_attention_and_feed_forward_styles(self):
-        from nemo_automodel._transformers.hf_parallel_specs import _falcon_h1_tp_plan
+        from nemo_automodel.components.models.falcon_h1.parallelization import falcon_h1_tp_plan
 
-        plan = _falcon_h1_tp_plan(model=None)
+        plan = falcon_h1_tp_plan(model=None)
         prefix = "model.layers.*"
         # q/k/v + gate/up are colwise; o + down are rowwise (GQA pattern).
         for k in (
@@ -619,40 +623,43 @@ class TestParallelizeFalconH1:
         """The MLP must be addressed as ``feed_forward`` — the root cause of the
         OOM was the generic plan targeting ``mlp.*`` (which Falcon-H1 does not
         have), leaving the dominant MLP weights replicated."""
-        from nemo_automodel._transformers.hf_parallel_specs import _falcon_h1_tp_plan
+        from nemo_automodel.components.models.falcon_h1.parallelization import falcon_h1_tp_plan
 
-        plan = _falcon_h1_tp_plan(model=None)
+        plan = falcon_h1_tp_plan(model=None)
         assert any(k.startswith("model.layers.*.feed_forward.") for k in plan)
         assert not any(".mlp." in k for k in plan), "Falcon-H1 has no mlp.* modules"
 
     def test_mamba_branch_left_replicated(self):
         """The Mamba2 mixer is not TP-shardable with stock kernels and must be
         omitted from the plan (left replicated)."""
-        from nemo_automodel._transformers.hf_parallel_specs import _falcon_h1_tp_plan
+        from nemo_automodel.components.models.falcon_h1.parallelization import falcon_h1_tp_plan
 
-        plan = _falcon_h1_tp_plan(model=None)
+        plan = falcon_h1_tp_plan(model=None)
         assert not any(".mamba" in k for k in plan), "mamba.* must stay replicated"
 
     def test_sequence_parallel_is_ignored_not_crashing(self):
         # ParallelStyle objects have no __eq__, so compare structure (keys +
         # style types) rather than object identity.
-        from nemo_automodel._transformers.hf_parallel_specs import _falcon_h1_tp_plan
+        from nemo_automodel.components.models.falcon_h1.parallelization import falcon_h1_tp_plan
 
-        plan_off = _falcon_h1_tp_plan(model=None, sequence_parallel=False)
-        plan_on = _falcon_h1_tp_plan(model=None, sequence_parallel=True)
+        plan_off = falcon_h1_tp_plan(model=None, sequence_parallel=False)
+        plan_on = falcon_h1_tp_plan(model=None, sequence_parallel=True)
         assert plan_off.keys() == plan_on.keys()
         assert {k: type(v) for k, v in plan_off.items()} == {k: type(v) for k, v in plan_on.items()}
 
-    def test_class_registered_by_name(self):
+    def test_class_resolves_from_its_model_type(self):
         """Falcon-H1 may load natively (transformers.models.falcon_h1.*) or via
-        trust_remote_code (transformers_modules.<hash>.*); the HF bridge binds by
-        class name so both resolve to the dedicated plan, otherwise the parallelizer
-        falls through to the default plan whose paths don't match and weights stay
-        unsharded."""
-        from nemo_automodel._transformers.hf_parallel_specs import _falcon_h1_tp_plan
+        trust_remote_code (transformers_modules.<hash>.*); both carry
+        ``model_type="falcon_h1"``, so the loader finds
+        ``components/models/falcon_h1/parallelization.py`` either way and binds the
+        dedicated plan, otherwise the parallelizer falls through to the default plan
+        whose paths don't match and weights stay unsharded."""
+        from nemo_automodel.components.models.falcon_h1.parallelization import FalconH1ForCausalLM, falcon_h1_tp_plan
 
-        assert HF_PARALLEL_SPECS["FalconH1ForCausalLM"].tp_plan is _falcon_h1_tp_plan
-        assert parallel_spec_for(type("FalconH1ForCausalLM", (), {})).tp_plan is _falcon_h1_tp_plan
+        assert FalconH1ForCausalLM.parallel_spec.tp_plan is falcon_h1_tp_plan
+        remote = type("FalconH1ForCausalLM", (), {"config_class": SimpleNamespace(model_type="falcon_h1")})
+        remote.__module__ = "transformers_modules.falcon_h1.modeling_falcon_h1"
+        assert parallel_spec_for(remote).tp_plan is falcon_h1_tp_plan
 
 
 class TestParallelizeMuseGlimmer:

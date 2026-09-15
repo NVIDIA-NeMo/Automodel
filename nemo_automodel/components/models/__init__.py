@@ -17,18 +17,51 @@ Currently includes:
     • build_gpt2_model – returns a GPT-2 causal language model (Flash-Attention-2 by default).
 """
 
+from __future__ import annotations
+
+import importlib
 import importlib.abc
 import pathlib
 import sys
+from typing import TYPE_CHECKING
 
 from .gpt2 import build_gpt2_model  # noqa: F401
 
+if TYPE_CHECKING:
+    from nemo_automodel.components.distributed.parallel_spec import ParallelSpec
+
 __all__ = [
     "build_gpt2_model",
+    "declared_parallel_spec",
 ]
 
 _MODELS_DIR = pathlib.Path(__file__).parent
 _PACKAGE_PREFIX = __name__ + "."
+
+
+def declared_parallel_spec(family: str, class_name: str) -> ParallelSpec | None:
+    """Return the ``ParallelSpec`` a model package declares for an upstream class it does not re-implement.
+
+    Architectures the repository only wraps -- stock ``transformers`` classes, ``trust_remote_code``
+    checkpoints, ``diffusers`` transformers -- keep their contract in
+    ``components/models/<family>/parallelization.py`` on a class named after the upstream
+    architecture::
+
+        class Gemma3ForConditionalGeneration:
+            parallel_spec = ParallelSpec(tp_plan=gemma3_tp_plan, ...)
+
+    Args:
+        family: Model package name under ``components/models``; the caller derives it from the
+            upstream class (the transformers ``model_type`` module name, or a diffusers class-name stem).
+        class_name: Upstream architecture class name to look up in that package.
+
+    Returns:
+        The declared spec, or ``None`` when the package or the declaration does not exist.
+    """
+    if not family.isidentifier() or not (_MODELS_DIR / family / "parallelization.py").is_file():
+        return None
+    module = importlib.import_module(f"{_PACKAGE_PREFIX}{family}.parallelization")
+    return getattr(getattr(module, class_name, None), "parallel_spec", None)
 
 
 def _available_model_submodules() -> set[str]:

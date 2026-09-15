@@ -26,11 +26,6 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor.parallel import ColwiseParallel
 
 import nemo_automodel.components.models.nemotron_v3.parallelization as nemotron_parallelization
-
-# Import the components under test
-from nemo_automodel._diffusers import parallelization as diffusers_parallelization
-from nemo_automodel._diffusers.parallelization import HunyuanParallelizationStrategy, WanParallelizationStrategy
-from nemo_automodel._transformers.hf_parallel_specs import validate_tp_mesh_for_nemotron_nas
 from nemo_automodel.components.distributed import parallelizer as parallelizer_mod
 from nemo_automodel.components.distributed.activation_checkpointing import sdpa_backend_snapshot_context_fn
 from nemo_automodel.components.distributed.parallel_spec import ParallelSpec
@@ -42,12 +37,18 @@ from nemo_automodel.components.distributed.parallelizer import (
     fsdp2_strategy_parallelize,
     get_parallelization_strategy,
 )
+from nemo_automodel.components.models.hunyuan_video15.parallelization import HunyuanParallelizationStrategy
+from nemo_automodel.components.models.nemotron_nas.parallelization import validate_tp_mesh_for_nemotron_nas
 from nemo_automodel.components.models.nemotron_v3.parallelization import (
     NEMOTRON_H_PARALLEL_SPEC,
     NemotronHParallelizationStrategy,
     _nemotronh_decoder_blocks,
 )
 from nemo_automodel.components.models.qwen3_5.parallelization import Qwen3_5ParallelizationStrategy
+
+# Import the components under test
+from nemo_automodel.components.models.qwen_image import parallelization as qwen_image_parallelization
+from nemo_automodel.components.models.wan.parallelization import WanParallelizationStrategy
 
 
 class MockModel(nn.Module):
@@ -1086,27 +1087,27 @@ class TestWanParallelizationStrategy:
         # so we can assert the correct mesh is forwarded to apply_fsdp.
         if dp_mesh_sentinel is not None:
             monkeypatch.setattr(
-                "nemo_automodel._diffusers.parallelization.get_fsdp_dp_mesh",
+                "nemo_automodel.components.models.wan.parallelization.get_fsdp_dp_mesh",
                 lambda mesh, *a, **kw: dp_mesh_sentinel,
             )
 
         fully_shard_mock = MagicMock(side_effect=lambda model, **kwargs: model)
         monkeypatch.setattr(
-            "nemo_automodel._diffusers.parallelization.fully_shard",
+            "nemo_automodel.components.models.wan.parallelization.fully_shard",
             fully_shard_mock,
             raising=False,
         )
 
         apply_fsdp_mock = MagicMock()
         monkeypatch.setattr(
-            "nemo_automodel._diffusers.parallelization.apply_fsdp2_sharding_recursively",
+            "nemo_automodel.components.models.wan.parallelization.apply_fsdp2_sharding_recursively",
             apply_fsdp_mock,
             raising=False,
         )
 
         parallelize_module_mock = MagicMock(side_effect=lambda module, *_args, **_kwargs: module)
         monkeypatch.setattr(
-            "nemo_automodel._diffusers.parallelization.parallelize_module",
+            "nemo_automodel.components.models.wan.parallelization.parallelize_module",
             parallelize_module_mock,
             raising=False,
         )
@@ -1163,7 +1164,7 @@ class TestWanParallelizationStrategy:
 
         flaky_mock = MagicMock(side_effect=flaky_parallelize)
         monkeypatch.setattr(
-            "nemo_automodel._diffusers.parallelization.parallelize_module",
+            "nemo_automodel.components.models.wan.parallelization.parallelize_module",
             flaky_mock,
             raising=False,
         )
@@ -1220,24 +1221,24 @@ class TestHunyuanParallelizationStrategy:
         mesh = MagicMock()
         dp_mesh = MagicMock()
         monkeypatch.setattr(
-            "nemo_automodel._diffusers.parallelization.get_fsdp_dp_mesh",
+            "nemo_automodel.components.models.hunyuan_video15.parallelization.get_fsdp_dp_mesh",
             lambda *_args, **_kwargs: dp_mesh,
         )
         checkpoint_wrapper_mock = MagicMock(side_effect=lambda module, **_kwargs: module)
         apply_fsdp_mock = MagicMock()
         fully_shard_mock = MagicMock(side_effect=lambda model, **_kwargs: model)
         monkeypatch.setattr(
-            "nemo_automodel._diffusers.parallelization.checkpoint_wrapper",
+            "nemo_automodel.components.models.hunyuan_video15.parallelization.checkpoint_wrapper",
             checkpoint_wrapper_mock,
             raising=False,
         )
         monkeypatch.setattr(
-            "nemo_automodel._diffusers.parallelization.apply_fsdp2_sharding_recursively",
+            "nemo_automodel.components.models.hunyuan_video15.parallelization.apply_fsdp2_sharding_recursively",
             apply_fsdp_mock,
             raising=False,
         )
         monkeypatch.setattr(
-            "nemo_automodel._diffusers.parallelization.fully_shard",
+            "nemo_automodel.components.models.hunyuan_video15.parallelization.fully_shard",
             fully_shard_mock,
             raising=False,
         )
@@ -1498,8 +1499,8 @@ class TestQwenImageEditParallelizationStrategy:
         model = self._tiny_transformer()
         expected_state = {name: tensor.clone() for name, tensor in model.state_dict().items()}
 
-        diffusers_parallelization._apply_qwen_block_activation_checkpointing(model)
-        diffusers_parallelization._apply_qwen_block_activation_checkpointing(model)
+        qwen_image_parallelization._apply_qwen_block_activation_checkpointing(model)
+        qwen_image_parallelization._apply_qwen_block_activation_checkpointing(model)
 
         assert isinstance(model.transformer_blocks[0], CheckpointWrapper)
         actual_state = model.state_dict()
@@ -1530,7 +1531,7 @@ class TestQwenImageEditParallelizationStrategy:
             return model
 
         monkeypatch.setattr(parallelizer_mod.DefaultParallelizationStrategy, "parallelize", fake_parallelize)
-        result = diffusers_parallelization.QwenImageEditParallelizationStrategy().parallelize(
+        result = qwen_image_parallelization.QwenImageEditParallelizationStrategy().parallelize(
             model=model,
             device_mesh=object(),
             activation_checkpointing=True,
@@ -1546,10 +1547,15 @@ class TestQwenImageEditParallelizationStrategy:
         assert isinstance(inner_block.img_mlp, torch.nn.Module)
         assert isinstance(inner_block.txt_mlp, torch.nn.Module)
 
-    def test_strategy_is_statically_registered(self):
-        """Resolve the upstream transformer class name to the Qwen strategy."""
-        strategy = diffusers_parallelization.DIFFUSERS_PARALLEL_SPECS["QwenImageTransformer2DModel"].strategy
-        assert isinstance(strategy, diffusers_parallelization.QwenImageEditParallelizationStrategy)
+    def test_strategy_is_declared_for_the_upstream_class(self):
+        """The diffusion pipeline binds the Qwen strategy from the ``qwen_image`` package declaration."""
+        import torch
+
+        from nemo_automodel._diffusers.parallelization import attach_parallel_spec
+
+        module = attach_parallel_spec(type("QwenImageTransformer2DModel", (torch.nn.Module,), {})())
+        strategy = parallelizer_mod.get_parallelization_strategy(module)
+        assert type(strategy) is qwen_image_parallelization.QwenImageEditParallelizationStrategy
 
     def test_strategy_rejects_blocks_missing_text_branch(self):
         """Prevent silent omission of Qwen text-MLP parameters from sharding."""
@@ -1565,4 +1571,4 @@ class TestQwenImageEditParallelizationStrategy:
         model.transformer_blocks = torch.nn.ModuleList([IncompleteBlock()])
 
         with pytest.raises(TypeError, match="txt_mlp"):
-            diffusers_parallelization._validate_qwen_transformer_blocks(model)
+            qwen_image_parallelization._validate_qwen_transformer_blocks(model)

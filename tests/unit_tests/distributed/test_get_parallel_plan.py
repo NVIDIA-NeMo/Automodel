@@ -34,12 +34,12 @@ from torch.distributed.tensor.placement_types import Replicate, Shard
 
 # Function under test and collaborators
 import nemo_automodel.components.distributed.parallelizer as parallelizer
-from nemo_automodel._transformers.hf_parallel_specs import get_decilm_nemotron_tp_plan
 from nemo_automodel._transformers.model_init import _get_mixin_wrapped_class
 from nemo_automodel.components.distributed.optimized_tp_plans import LLAMA_NEMOTRON_SUPER_TP_PLAN_NAME
 from nemo_automodel.components.distributed.parallel_spec import ParallelSpec
 from nemo_automodel.components.distributed.parallelizer import _get_parallel_plan
 from nemo_automodel.components.models.llama.parallelization import get_llama_nemotron_super_tp_plan
+from nemo_automodel.components.models.nemotron_nas.parallelization import get_decilm_nemotron_tp_plan
 
 
 class _DummyModel:
@@ -245,7 +245,7 @@ _RemoteCodeDummyModel.__module__ = "transformers_modules.fake_repo.modeling_fake
 
 def test_nemotron_flash_remote_code_uses_registered_tp_plan():
     """Nemotron Flash must retain its validated TP2 path after custom-code fail-fast checks."""
-    model_cls = type("NemotronFlashForCausalLM", (), {})
+    model_cls = type("NemotronFlashForCausalLM", (), {"config_class": SimpleNamespace(model_type="nemotron_flash")})
     model_cls.__module__ = "transformers_modules.nemotron_flash.modeling_nemotron_flash"
     model = model_cls()
     model.__class__ = _get_mixin_wrapped_class(model_cls)  # what NeMo Auto does for remote-code classes
@@ -265,7 +265,7 @@ def test_nemotron_flash_remote_code_uses_registered_tp_plan():
 
 def test_nemotron_flash_drops_replicated_output_lm_head_plan():
     """Nemotron Flash must not mix replicated logits with a sharded lm_head norm."""
-    model_cls = type("NemotronFlashForCausalLM", (), {})
+    model_cls = type("NemotronFlashForCausalLM", (), {"config_class": SimpleNamespace(model_type="nemotron_flash")})
     model = model_cls()
     model.__class__ = _get_mixin_wrapped_class(model_cls)
     model.config = SimpleNamespace(model_type="nemotron_flash")
@@ -300,7 +300,7 @@ def test_default_plan_fallthrough_raises_for_remote_code_at_tp_size_gt_1(monkeyp
         msg = str(excinfo.value)
         # The error must name the offending class and the three supported registration paths.
         assert _RemoteCodeDummyModel.__name__ in msg
-        assert "PARALLEL_SPECS" in msg
+        assert "components/models/<model_type>/parallelization.py" in msg
         assert "_tp_plan" in msg
         assert "tp_shard_plan" in msg
 
@@ -350,7 +350,7 @@ def test_default_plan_fallthrough_remote_code_folds_translator_diagnostic(monkey
     # Diagnostic from get_hf_tp_shard_plan must be folded into the user-facing error.
     assert "Unknown parallel style: foo_bar" in msg
     # And the registration guidance must still be there.
-    assert "PARALLEL_SPECS" in msg
+    assert "components/models/<model_type>/parallelization.py" in msg
     assert "_tp_plan" in msg
     assert "tp_shard_plan" in msg
 
@@ -458,7 +458,7 @@ class TestGetDecilmNemotronTpPlan:
 
 def _bridged_decilm() -> object:
     """A trust_remote_code Nemotron-NAS stand-in after the HF bridge bound its ParallelSpec."""
-    model_cls = type("DeciLMForCausalLM", (), {})
+    model_cls = type("DeciLMForCausalLM", (), {"config_class": SimpleNamespace(model_type="nemotron-nas")})
     model = model_cls()
     model.__class__ = _get_mixin_wrapped_class(model_cls)
     model.config = SimpleNamespace(architectures=["DeciLMForCausalLM"], model_type="nemotron-nas")

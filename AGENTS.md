@@ -179,7 +179,7 @@ Each model lives under `components/models/<name>/` and contains:
 | `config.py` (optional) | Custom config class if HF config is insufficient  |
 | `layers.py` (optional) | Custom layer implementations                      |
 | `rope_utils.py` (optional) | Model-specific RoPE variants                  |
-| `parallelization.py` (optional) | `ParallelSpec`: TP plan, layer groups, FSDP2 strategy (see `docs/guides/parallelizer-api.mdx`) |
+| `parallelization.py` (optional) | `ParallelSpec`: TP plan, layer groups, FSDP2 strategy (see `docs/guides/parallelizer-api.mdx`); the only file for an architecture that is not re-implemented |
 
 Most custom models need a state dict adapter for HF weight conversion. Omit it
 only when HF weight names and tensor layouts already match.
