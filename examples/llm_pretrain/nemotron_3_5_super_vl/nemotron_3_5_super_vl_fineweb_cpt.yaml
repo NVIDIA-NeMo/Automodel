@@ -145,8 +145,8 @@ lr_scheduler:
 
 wandb:
   enable: false
-  entity: ${oc.env:WANDB_ENTITY,Nemo-automodel}
-  project: ${oc.env:WANDB_PROJECT,huiyingl_workspace}
+  entity: ${oc.env:WANDB_ENTITY,your-wandb-entity}
+  project: ${oc.env:WANDB_PROJECT,your-wandb-project}
   name: nemotron_3_5_super_vl_fineweb_cpt
   mode: online
 

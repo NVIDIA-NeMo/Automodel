@@ -87,14 +87,14 @@ export CPT_DATA_ROOT=/path/to/shared/super35_fineweb
 export FINEWEB_DATA_DIR="$CPT_DATA_ROOT/megatron"
 mkdir -p "$CPT_DATA_ROOT" "$FINEWEB_DATA_DIR"
 
-export WANDB_ENTITY=Nemo-automodel
-export WANDB_PROJECT=huiyingl_workspace
+export WANDB_ENTITY=your-wandb-entity
+export WANDB_PROJECT=your-wandb-project
 export WANDB_MODE=online
 export WANDB_CONSOLE=off
 ```
 
-Use your own W&B entity and project if needed. Authenticate Hugging Face if the model
-requires access. Download the base model once into the shared cache before starting a
+Replace the W&B entity and project placeholders with your values. Authenticate Hugging Face
+if the model requires access. Download the base model once into the shared cache before starting a
 multi-node allocation:
 
 ```bash
@@ -356,21 +356,17 @@ recorded data stream and learning-rate schedule: the Megatron loader builds its 
 indices for that horizon, and the cosine scheduler uses the same horizon after a
 10-step warmup. The 200-step curve covers the beginning of this schedule.
 
-The Slurm example below requests a 45-minute allocation as a resource time limit.
-
 ## Step 4 — Launch with Slurm and Online W&B
 
 The recipe's example default is `wandb.enable: false`, following the repository's opt-in
 convention. **The commands in this tutorial explicitly enable online W&B.**
 
-Create `fineweb_cpt.sub` on the shared filesystem. Adjust the account, shared paths, and
-container image to your cluster. The following uses one Slurm task per GPU; do not start
-an additional eight-process `torchrun` inside each task.
+Example `fineweb_cpt.sub`:
 
 ```bash
 #!/usr/bin/env bash
-#SBATCH --account=coreai_dlalgo_llm
-#SBATCH --partition=batch
+#SBATCH --account=YOUR_SLURM_ACCOUNT
+#SBATCH --partition=YOUR_GPU_PARTITION
 #SBATCH --nodes=8
 #SBATCH --gpus-per-node=8
 #SBATCH --ntasks-per-node=8
@@ -388,8 +384,8 @@ export CPT_RECIPE=/path/to/shared/Automodel/fineweb_cpt_effective.yaml
 export HF_HOME=/path/to/shared/hf_cache
 export FINEWEB_DATA_DIR=/path/to/shared/super35_fineweb/megatron
 export CPT_CHECKPOINT_DIR=/path/to/shared/checkpoints/super35_cpt_${SLURM_JOB_ID}
-export WANDB_ENTITY=Nemo-automodel
-export WANDB_PROJECT=huiyingl_workspace
+export WANDB_ENTITY=your-wandb-entity
+export WANDB_PROJECT=your-wandb-project
 export WANDB_MODE=online
 export WANDB_CONSOLE=off
 export WANDB_RUN_ID=super35cpt${SLURM_JOB_ID}
@@ -398,8 +394,8 @@ export MASTER_PORT=29577
 : "${WANDB_API_KEY:?Export WANDB_API_KEY before sbatch}"
 
 srun --kill-on-bad-exit=1 \
-  --container-image=/path/to/shared/auto2604.sqsh \
-  --container-mounts=/lustre:/lustre \
+  --container-image=/path/to/shared/automodel.sqsh \
+  --container-mounts=/path/to/shared:/path/to/shared \
   --no-container-mount-home \
   bash -c '
     set -euo pipefail
@@ -417,8 +413,7 @@ srun --kill-on-bad-exit=1 \
   '
 ```
 
-Submit from the login node after completing data preparation. Set the W&B key in this
-submission shell so `sbatch` passes it to the containers. For example:
+Submit:
 
 ```bash
 read -rsp "W&B API key: " WANDB_API_KEY
@@ -473,7 +468,7 @@ All 200 training losses and eight validation losses were recorded in W&B and che
 against the corresponding Slurm log entries within their printed precision. The screenshot
 below shows the W&B `loss` panel with smoothing set to `0`.
 
-<img src="./nemotron-3-5-super-vl-fineweb-cpt-loss.png" alt="W&B raw training loss for Super 3.5 VL FineWeb continued pretraining" width="25%" />
+<img src="./nemotron-3-5-super-vl-fineweb-cpt-loss.png" alt="W&B raw training loss for Super 3.5 VL FineWeb continued pretraining" width="50%" />
 
 | Measurement | Value |
 |---|---|
