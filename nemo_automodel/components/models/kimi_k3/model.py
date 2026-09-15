@@ -57,6 +57,7 @@ from nemo_automodel.components.models.kimi_k3.situ import (
     _apply_attn_res,
     _compile_norm_core,
     _compile_situ_cores,
+    _enable_situ_triton,
     _rms_norm,
     _weighted_situ,
     dense_situ,
@@ -1055,6 +1056,8 @@ class KimiK3MoE(MoE):
             self.gate = KimiK3Gate(moe_config, gate_precision=torch.float32)
         if backend.compile_situ:
             _compile_situ_cores()
+        if backend.situ_triton:
+            _enable_situ_triton()
         if backend.compile_norm:
             _compile_norm_core()
         expert_activation = partial(
