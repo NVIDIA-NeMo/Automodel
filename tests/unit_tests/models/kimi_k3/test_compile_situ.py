@@ -15,11 +15,12 @@
 import pytest
 import torch
 
+import nemo_automodel.components.models.kimi_k3.model as kimi_k3_model
 import nemo_automodel.components.models.kimi_k3.situ as kimi_k3_situ
 import nemo_automodel.components.moe.optimized_ops as optimized_ops
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.kimi_k3.config import KimiK3TextConfig
-from nemo_automodel.components.models.kimi_k3.model import KimiK3MoE, _build_moe_config
+from nemo_automodel.components.models.kimi_k3.model import KimiDecoderLayer, KimiK3MoE, _build_moe_config
 
 
 def _tiny_config() -> KimiK3TextConfig:
@@ -146,6 +147,24 @@ def test_compile_situ_wraps_cores_once(restore_situ_cores):
     assert kimi_k3_situ._weighted_situ_fwd_fused_dispatch is not kimi_k3_situ._weighted_situ_fwd_fused
     assert kimi_k3_situ._weighted_situ_bwd_fused_dispatch is not kimi_k3_situ._weighted_situ_bwd_fused
     assert kimi_k3_situ._dense_situ_dispatch is not kimi_k3_situ._dense_situ_core
+
+
+def _build_decoder_layer(backend: BackendConfig) -> KimiDecoderLayer:
+    config = _tiny_config()
+    moe_config = _build_moe_config(config, torch.float32, None)
+    # layer 1 is a full-attention MoE layer of the tiny config (first_k_dense_replace=0), with attention
+    # residuals on (attn_res_block_size=1), so both kernel flags have a call site to reach.
+    return KimiDecoderLayer(config, 1, moe_config, backend)
+
+
+def test_situ_triton_flag_wires_decoder_layer(monkeypatch):
+    calls = []
+    monkeypatch.setattr(kimi_k3_model, "_enable_situ_triton", lambda: calls.append("situ"))
+    assert BackendConfig().situ_triton is False
+    _build_decoder_layer(_torch_backend())
+    assert calls == []
+    _build_decoder_layer(_torch_backend(situ_triton=True))
+    assert calls == ["situ"]
 
 
 def test_compile_router_weight_defaults_false_and_wires_k3_moe(restore_situ_cores):
