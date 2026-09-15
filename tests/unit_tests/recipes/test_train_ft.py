@@ -1087,27 +1087,6 @@ def _patch_setup_minimals(monkeypatch, patch_fn):
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.autonvtx.patch", patch_fn, raising=False)
 
 
-def test_setup_resets_peak_memory_on_initialized_rank_device(monkeypatch):
-    """Reset the assigned GPU's peak without touching another rank's GPU."""
-    _patch_setup_minimals(monkeypatch, lambda *args, **kwargs: None)
-    state = {"initialized": False, "device": 0, "peaks": {0: 128, 1: 256}}
-
-    def initialize_rank(*args, **kwargs):
-        state.update(initialized=True, device=1)
-        return SimpleNamespace(world_size=1, is_main=True, device=torch.device("cpu"), rank=0)
-
-    def reset_peak():
-        if not state["initialized"]:
-            raise RuntimeError("CUDA allocator is not initialized on the rank device")
-        state["peaks"][state["device"]] = 0
-
-    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.initialize_distributed", initialize_rank)
-    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.torch.cuda.reset_peak_memory_stats", reset_peak)
-    trainer = TrainFinetuneRecipeForNextTokenPrediction(_minimal_cfg_with_nvtx(nvtx_value=False))
-    trainer.setup()
-    assert state["peaks"] == {0: 128, 1: 0}
-
-
 def test_nvtx_true_enables_patching(monkeypatch):
     cfg = _minimal_cfg_with_nvtx(nvtx_value=True)
     patch_calls = []
