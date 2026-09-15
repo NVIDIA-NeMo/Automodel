@@ -28,8 +28,8 @@ import torch
 import torch.nn as nn
 from torch.distributed.fsdp import MixedPrecisionPolicy
 
-import nemo_automodel.components.distributed.parallelizer_utils as parallelizer_utils
-from nemo_automodel.components.distributed.parallelizer_utils import fully_shard_by_dtype
+import nemo_automodel.components.distributed.fsdp2_extensions.utils as parallelizer_utils
+from nemo_automodel.components.distributed.fsdp2_extensions.utils import fully_shard_by_dtype
 
 
 def _mp_policy(param_dtype=torch.bfloat16):
