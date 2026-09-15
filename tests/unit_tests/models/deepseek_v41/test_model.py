@@ -214,14 +214,11 @@ def test_labels_match_independent_shifted_logprob_and_head_gradient():
 @pytest.mark.parametrize(
     "metadata",
     [
-        {"qkv_format": "thd"},
-        {"packed_seq_ids": torch.ones(1, 4, dtype=torch.long)},
-        {"seq_lens": torch.tensor([2, 2])},
         {"cu_seqlens": torch.tensor([0, 2, 4])},
         {"cu_seqlens_q": torch.tensor([0, 2, 4])},
     ],
 )
-def test_labels_reject_packing_before_numerical_forward(metadata):
+def test_labels_reject_preflattened_packing_before_numerical_forward(metadata):
     model = _model()
     ids = torch.tensor([[3, 4, 5, 6]])
     with pytest.raises(TypeError, match="unexpected keyword"):

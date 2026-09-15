@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib.util
 import math
 from datetime import timedelta
 from unittest.mock import Mock
@@ -729,3 +730,53 @@ class TestScaleGradsAndClipGradNorm:
         # Non-expert params: only PP scaling -> 4
         assert torch.allclose(model.gate.weight.grad, torch.ones_like(model.gate.weight) * 4.0)
         assert torch.allclose(expert_param.grad, torch.ones_like(expert_param) * 2.0)
+
+
+@pytest.mark.parametrize("norm_type", [1.0, 2.0, 3.0, float("inf")])
+@pytest.mark.parametrize("transposed", [False, True])
+def test_clip_large_gradient_matches_dense_float64_reference(norm_type, transposed):
+    """Check large contiguous/strided gradients and clipping against a dense FP64 reference."""
+    torch.manual_seed(4128)
+    gradient = torch.randn(1025, 2049)
+    if transposed:
+        gradient = gradient.t()
+    parameter = torch.nn.Parameter(torch.empty_like(gradient))
+    parameter.grad = gradient.clone(memory_format=torch.preserve_format)
+    reference_norm = torch.linalg.vector_norm(gradient.double(), ord=norm_type)
+    reference = gradient * (0.3 / (reference_norm + 1e-6)).clamp(max=1.0)
+    from nemo_automodel.components.training.utils import _clip_grad_norm_impl
+
+    actual_norm = _clip_grad_norm_impl([parameter], 0.3, norm_type=norm_type)
+    torch.testing.assert_close(actual_norm, reference_norm, atol=0, rtol=2e-7)
+    torch.testing.assert_close(parameter.grad, reference, atol=0, rtol=3e-7)
+
+
+@pytest.mark.parametrize("use_te", [False, True])
+def test_optional_te_is_not_loaded_for_import_or_cpu_clipping(monkeypatch, use_te):
+    """A broken optional TE binary must not prevent import or CPU gradient clipping."""
+    from nemo_automodel.components.training import utils
+    from nemo_automodel.shared import import_utils
+
+    original_import = import_utils.safe_import
+    te_imports = []
+
+    def import_with_broken_te(module, **kwargs):
+        if module.startswith("transformer_engine"):
+            te_imports.append(module)
+            raise OSError("undefined symbol: cublasLtGroupedMatrixLayoutInit_internal")
+        return original_import(module, **kwargs)
+
+    monkeypatch.setattr(import_utils, "safe_import", import_with_broken_te)
+    spec = importlib.util.spec_from_file_location("_training_utils_import_test", utils.__file__)
+    isolated_utils = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(isolated_utils)
+
+    parameter = nn.Parameter(torch.tensor([1.0, 2.0]))
+    parameter.grad = torch.tensor([3.0, 4.0])
+    norm = isolated_utils._clip_grad_norm_impl([parameter], 1.0, use_te=use_te)
+    torch.testing.assert_close(norm, torch.tensor(5.0, dtype=torch.float64))
+    expected_gradient = torch.tensor([3.0, 4.0]) / (5.0 + 1e-6)
+    torch.testing.assert_close(parameter.grad, expected_gradient)
+    torch.optim.SGD([parameter], lr=0.1).step()
+    torch.testing.assert_close(parameter, torch.tensor([1.0, 2.0]) - 0.1 * expected_gradient)
+    assert not te_imports
