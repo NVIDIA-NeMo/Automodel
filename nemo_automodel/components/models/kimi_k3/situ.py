@@ -119,24 +119,125 @@ def _situ_bwd_core(
     return d_g, d_u, red
 
 
+# Eager math cores captured at import time: the fused wrappers below inline them
+# under torch.compile even after _compile_situ_cores() swapped the module-level names.
+_SITU_FWD_MATH = _situ_fwd_core
+_SITU_BWD_MATH = _situ_bwd_core
+
+
+def _weighted_situ_fwd_fused(
+    gate_up2: torch.Tensor,
+    rw: torch.Tensor,
+    beta: float,
+    linear_beta: float | None,
+) -> torch.Tensor:
+    """Whole-tensor weighted-SiTU forward for the compiled path.
+
+    Low-precision in, low-precision out, fp32 math inside; under ``torch.compile``
+    the casts fuse into the elementwise kernel, so no fp32 intermediate exists and
+    the eager row-chunk loop is unnecessary.
+
+    Args:
+        gate_up2: Gate+up projections of shape [rows, 2 * intermediate].
+        rw: Routing weights, [rows, k] row-aligned or broadcastable to [rows, intermediate].
+        beta: SiTU beta applied to the gate branch.
+        linear_beta: Optional bounded-linear beta applied to the up branch.
+
+    Returns:
+        Tensor of shape [rows, intermediate] in ``gate_up2``'s dtype.
+    """
+    half = gate_up2.shape[-1] // 2
+    g = gate_up2[:, :half].float()
+    u0 = gate_up2[:, half:].float()
+    return _SITU_FWD_MATH(g, u0, rw.float(), beta, linear_beta).to(gate_up2.dtype)
+
+
+def _weighted_situ_bwd_fused(
+    gate_up2: torch.Tensor,
+    rw: torch.Tensor,
+    go2: torch.Tensor,
+    beta: float,
+    linear_beta: float | None,
+    want_drw: bool,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Whole-tensor weighted-SiTU backward for the compiled path.
+
+    Args:
+        gate_up2: Saved gate+up projections of shape [rows, 2 * intermediate].
+        rw: Saved routing weights (see :func:`_weighted_situ_fwd_fused`).
+        go2: Upstream gradient of shape [rows, intermediate].
+        beta: SiTU beta applied to the gate branch.
+        linear_beta: Optional bounded-linear beta applied to the up branch.
+        want_drw: Whether the routing-weight gradient is needed.
+
+    Returns:
+        ``(d_gate_up2, d_rw)`` in the inputs' dtypes; ``d_rw`` is ``None`` when not wanted.
+    """
+    half = gate_up2.shape[-1] // 2
+    g = gate_up2[:, :half].float()
+    u0 = gate_up2[:, half:].float()
+    d_g, d_u, red = _SITU_BWD_MATH(g, u0, rw.float(), go2.float(), beta, linear_beta, want_drw)
+    d_gu = torch.cat((d_g, d_u), dim=-1).to(gate_up2.dtype)
+    d_rw = red.sum_to_size(rw.shape).to(rw.dtype) if want_drw else None
+    return d_gu, d_rw
+
+
+def _dense_situ_core(x: torch.Tensor, beta: float, linear_beta: float | None) -> torch.Tensor:
+    """SiTU gated activation for dense / shared-expert MLPs (``SituAndMul``).
+
+    Args:
+        x: Gate+up projections of shape [..., 2 * intermediate].
+        beta: SiTU beta applied to the gate branch.
+        linear_beta: Optional bounded-linear beta applied to the up branch.
+
+    Returns:
+        Tensor of shape [..., intermediate] in ``x``'s dtype.
+    """
+    gate, up = x.chunk(2, dim=-1)
+    gate = gate.float()
+    up = up.float()
+    activated = beta * torch.tanh(gate / beta) * torch.sigmoid(gate)
+    if linear_beta is not None:
+        up = linear_beta * torch.tanh(up / linear_beta)
+    return (activated * up).to(x.dtype)
+
+
+_weighted_situ_fwd_fused_dispatch = _weighted_situ_fwd_fused
+_weighted_situ_bwd_fused_dispatch = _weighted_situ_bwd_fused
+_dense_situ_dispatch = _dense_situ_core
+
+
+def dense_situ(x: torch.Tensor, beta: float, linear_beta: float | None) -> torch.Tensor:
+    """Apply the dense SiTU activation through the (possibly compiled) module-level core."""
+    return _dense_situ_dispatch(x, beta, linear_beta)
+
+
 _SITU_CORES_COMPILED = False
 
 
 def _compile_situ_cores() -> None:
-    """Wrap the SiTU chunk cores and the attn-res core with ``torch.compile``.
+    """Wrap the SiTU cores and the attn-res core with ``torch.compile``.
 
     Runs once per process: the compiled functions replace the module-level
     eager cores, so every layer shares the same compiled kernels and repeated
     model construction does not recompile. Compilation itself is lazy (at
-    first call). Compiled numerics are allclose to eager, not
-    bitwise-identical.
+    first call). On this path ``_WeightedSiTUFunction`` runs each pass as one
+    fused whole-tensor kernel (the eager row-chunk loop, its casts and slice
+    copies are skipped) and ``SituAndMul`` uses the compiled dense core.
+    Compiled numerics are allclose to eager, not bitwise-identical.
     """
     global _situ_fwd_core, _situ_bwd_core, _attn_res_core, _SITU_CORES_COMPILED
+    global _weighted_situ_fwd_fused_dispatch, _weighted_situ_bwd_fused_dispatch, _dense_situ_dispatch
     if _SITU_CORES_COMPILED:
         return
     _situ_fwd_core = torch.compile(_situ_fwd_core, dynamic=True)
     _situ_bwd_core = torch.compile(_situ_bwd_core, dynamic=True)
     _attn_res_core = torch.compile(_attn_res_core, dynamic=True)
+    # Whole-tensor fused passes used by _WeightedSiTUFunction instead of the chunk loop,
+    # and the dense / shared-expert activation (SituAndMul).
+    _weighted_situ_fwd_fused_dispatch = torch.compile(_weighted_situ_fwd_fused, dynamic=True)
+    _weighted_situ_bwd_fused_dispatch = torch.compile(_weighted_situ_bwd_fused, dynamic=True)
+    _dense_situ_dispatch = torch.compile(_dense_situ_core, dynamic=True)
     _SITU_CORES_COMPILED = True
 
 
@@ -247,6 +348,10 @@ class _WeightedSiTUFunction(torch.autograd.Function):
         gu2 = gate_up.reshape(-1, last)
         row_aligned = _situ_rw_is_row_aligned(gate_up, routing_weights)
         rw2 = routing_weights.reshape(-1, routing_weights.shape[-1]) if row_aligned else routing_weights
+        if _SITU_CORES_COMPILED and gu2.shape[0] > 0:
+            out = _weighted_situ_fwd_fused_dispatch(gu2, rw2 if row_aligned else routing_weights, beta, linear_beta)
+            out_shape = torch.broadcast_shapes((*gate_up.shape[:-1], half), routing_weights.shape)
+            return out.reshape(out_shape)
         out = torch.empty((gu2.shape[0], half), dtype=gate_up.dtype, device=gate_up.device)
         for s in range(0, gu2.shape[0], _SITU_CHUNK_ROWS):
             e = min(s + _SITU_CHUNK_ROWS, gu2.shape[0])
@@ -285,8 +390,14 @@ class _WeightedSiTUFunction(torch.autograd.Function):
         go2 = grad_out.reshape(-1, half)
         row_aligned = _situ_rw_is_row_aligned(gate_up, routing_weights)
         rw2 = routing_weights.reshape(-1, routing_weights.shape[-1]) if row_aligned else routing_weights
-        d_gu2 = torch.empty_like(gu2)
         want_drw = ctx.needs_input_grad[1]
+        if _SITU_CORES_COMPILED and gu2.shape[0] > 0:
+            d_gu2, d_rw = _weighted_situ_bwd_fused_dispatch(
+                gu2, rw2 if row_aligned else routing_weights, go2, beta, linear_beta, want_drw
+            )
+            d_rw = d_rw.reshape(routing_weights.shape) if d_rw is not None else None
+            return d_gu2.reshape(gate_up.shape), d_rw, None, None
+        d_gu2 = torch.empty_like(gu2)
         d_rw2 = torch.empty_like(rw2) if (want_drw and row_aligned) else None
         d_rw_acc = (
             torch.zeros(routing_weights.shape, dtype=torch.float32, device=routing_weights.device)

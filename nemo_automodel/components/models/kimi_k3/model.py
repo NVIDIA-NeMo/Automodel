@@ -59,6 +59,7 @@ from nemo_automodel.components.models.kimi_k3.situ import (
     _compile_situ_cores,
     _rms_norm,
     _weighted_situ,
+    dense_situ,
 )
 from nemo_automodel.components.models.kimi_k3.state_dict_adapter import KimiK3StateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
@@ -169,14 +170,12 @@ class SituAndMul(nn.Module):
         self.linear_beta = linear_beta
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply SiTU to ``[... , 2 * intermediate]`` gate/up projections."""
-        gate, up = x.chunk(2, dim=-1)
-        gate = gate.float()
-        up = up.float()
-        activated = self.beta * torch.tanh(gate / self.beta) * torch.sigmoid(gate)
-        if self.linear_beta is not None:
-            up = self.linear_beta * torch.tanh(up / self.linear_beta)
-        return (activated * up).to(x.dtype)
+        """Apply SiTU to ``[... , 2 * intermediate]`` gate/up projections.
+
+        Runs through the module-level dense core in ``situ.py`` so that
+        ``BackendConfig.compile_situ`` fuses the fp32 chain into one kernel.
+        """
+        return dense_situ(x, self.beta, self.linear_beta)
 
 
 def _index_first_axis(x: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
