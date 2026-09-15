@@ -996,7 +996,7 @@ def _init_model_bnb_streaming(
     with no_init_weights(), init_empty_weights():
         model = cls._from_config_parent_class(
             hf_config,
-            torch_dtype=torch_dtype,
+            dtype=torch_dtype,
             attn_implementation=attn_implementation,
         )
 
@@ -1240,7 +1240,7 @@ def __init_model(
                 model = cls._from_pretrained_parent_class(
                     pretrained_model_name_or_path,
                     *model_args,
-                    torch_dtype=torch_dtype,
+                    dtype=torch_dtype,
                     attn_implementation=attn_implementation,
                     **kwargs,
                 )
@@ -1257,7 +1257,7 @@ def __init_model(
             model = cls._from_config_parent_class(
                 hf_config,
                 *model_args,
-                torch_dtype=torch_dtype,
+                dtype=torch_dtype,
                 attn_implementation=attn_implementation,
                 **kwargs,
             )
@@ -1356,7 +1356,7 @@ def __init_model(
             model = cls._from_pretrained_parent_class(
                 pretrained_model_name_or_path,
                 *model_args,
-                torch_dtype=torch_dtype,
+                dtype=torch_dtype,
                 attn_implementation=attn_implementation,
                 **kwargs,
             )
@@ -1373,7 +1373,7 @@ def __init_model(
         model = cls._from_config_parent_class(
             hf_config,
             *model_args,
-            torch_dtype=torch_dtype,
+            dtype=torch_dtype,
             attn_implementation=attn_implementation,
             **kwargs,
         )

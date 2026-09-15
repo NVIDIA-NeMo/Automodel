@@ -209,6 +209,11 @@ tracking = [
     "nemo-automodel[mlflow]",
     "nemo-automodel[wandb]",
 ]
+# Official MSA (Linux + SM100); the model-private patch supplies the CuTe DSL 4.6.2 fmax fix.
+msa = [
+    "fmha-sm100; sys_platform == 'linux'",
+    "nvidia-cutlass-dsl==4.6.2; sys_platform == 'linux'",
+]
 all = [
     "nemo-automodel[cli]",
     "nemo-automodel[cuda]",
@@ -252,6 +257,7 @@ test = [
     "coverage",
     "pytest",
     "pytest-shard",
+    "pytest-timeout",
     "peft>=0.19.1",
     "ruamel.yaml",
     "onnxruntime-gpu; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
@@ -330,6 +336,7 @@ deep_ep = { git = "https://github.com/deepseek-ai/DeepEP.git", rev = "4214430375
 cut-cross-entropy = { git = "https://github.com/apple/ml-cross-entropy.git", rev = "87a86aba72cfd2f0d8abecaf81c13c4528ea07d8" }
 magi_attention = { git = "https://github.com/SandAI-org/MagiAttention.git", rev = "d7ea8afd44c790b65fab68a04a6a0fdd5adbf182" }
 liger-kernel = { git = "https://github.com/linkedin/Liger-Kernel.git", rev = "1f1a4b8d6a6c3c1ddb3573a46480c41cef25bde6" }
+fmha-sm100 = { git = "https://github.com/MiniMax-AI/MSA.git", rev = "80434d7f67877c6570ca19cac444b84bc9855dac" }
 onnxruntime-gpu = { index = "onnxruntime-cuda-13" }
 torch = [
   { index = "pytorch-cpu", marker = "sys_platform != 'linux' and sys_platform != 'darwin'" },
@@ -544,8 +551,6 @@ modules = [
 ignore_imports = [
     # Dion needs the FSDP DP mesh resolver so its optimizer mesh matches parameter sharding.
     "nemo_automodel.components.optim.dion -> nemo_automodel.components.distributed.mesh_utils",
-    "nemo_automodel.components.distributed.optimized_tp_plans -> nemo_automodel.components.models.llama.model",
-    "nemo_automodel.components.distributed.optimized_tp_plans -> nemo_automodel.components.models.mistral3_vlm.model",
 ]
 
 # ty: type checking (https://github.com/astral-sh/ty)

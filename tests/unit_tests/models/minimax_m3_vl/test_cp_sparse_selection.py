@@ -25,10 +25,15 @@ square selection produces for those query rows. These tests verify that against
 import pytest
 import torch
 
+from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.minimax_m3_vl.config import MiniMaxM3VLTextConfig
 from nemo_automodel.components.models.minimax_m3_vl.layers import (
+    MiniMaxM3Indexer,
     build_block_sparse_attn_mask,
     select_sparse_blocks,
 )
+from nemo_automodel.components.models.minimax_m3_vl.msa import MSAMicrobatch
+from tests.unit_tests.models.minimax_m3_vl._msa_select_reference import select_blocks_reference_for
 
 
 def _rand_idx(seqlen, h_idx=4, dim=16, bsz=2, seed=0):
@@ -122,3 +127,31 @@ def test_eager_mask_consistent_with_selection():
     # every query attends to at least its own position (causal diagonal)
     diag = torch.arange(seqlen)
     assert keep[:, :, diag, diag].all()
+
+
+@pytest.mark.parametrize("score_type", ["max", "lse"])
+def test_indexer_document_local_support(
+    sparse_text_config: MiniMaxM3VLTextConfig, backend: BackendConfig, score_type: str
+) -> None:
+    sparse_cfg = dict(
+        sparse_text_config.sparse_attention_config,
+        sparse_block_size=4,
+        sparse_topk_blocks=2,
+        sparse_init_block=0,
+        sparse_local_block=1,
+        sparse_score_type=score_type,
+    )
+    indexer = MiniMaxM3Indexer(sparse_text_config, sparse_cfg, backend)
+    documents = torch.tensor([[1] * 14 + [0] + [2] * 10])
+    microbatch = MSAMicrobatch.from_document_map(documents, forced_blocks=(indexer.init_blocks, indexer.local_blocks))
+    query = torch.zeros(24, indexer.num_index_heads, indexer.index_head_dim)
+    query[..., 0] = 1
+    key = torch.zeros(24, 1, indexer.index_head_dim)
+    key[:, 0, 0] = torch.tensor([9.0] * 4 + [2.0] * 4 + [5.0] * 4 + [-1.0] * 2 + [1.0] * 4 + [8.0] * 4 + [-1.0] * 2)
+    support = select_blocks_reference_for(indexer, microbatch, query, key)
+    assert support.shape == (indexer.num_index_heads, 24, 2)
+    assert support.dtype == torch.int32 and support.is_contiguous()
+    assert support[:, 0, 0].eq(0).all() and support[:, 0, 1].eq(-1).all()
+    for head in range(indexer.num_index_heads):
+        assert set(support[head, 13].tolist()) == {0, 3}
+        assert set(support[head, 23].tolist()) == {1, 2}
