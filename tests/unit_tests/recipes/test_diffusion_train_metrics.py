@@ -411,10 +411,24 @@ def test_build_diffusion_parallel_manager_args_uses_shared_fsdp_defaults():
     assert manager_args["activation_checkpointing"] is True
     assert manager_args["defer_fsdp_grad_sync"] is True
     assert manager_args["enable_fsdp2_prefetch"] is True
-    assert manager_args["use_hf_tp_plan"] is False
+    assert "use_hf_tp_plan" not in manager_args
     assert manager_args["mp_policy"].param_dtype == torch.float16
     assert manager_args["mp_policy"].reduce_dtype == torch.float32
     assert manager_args["mp_policy"].output_dtype == torch.float16
+
+
+def test_build_diffusion_parallel_manager_args_warns_about_the_removed_hf_tp_plan_option(caplog):
+    with caplog.at_level(logging.WARNING):
+        manager_args = _build_diffusion_parallel_manager_args(
+            fsdp_cfg={"use_hf_tp_plan": False},
+            ddp_cfg=None,
+            world_size=8,
+            dtype=torch.float16,
+            lora_enabled=False,
+        )
+
+    assert "use_hf_tp_plan" not in manager_args
+    assert "use_hf_tp_plan has no effect" in caplog.text
 
 
 def test_build_diffusion_parallel_manager_args_keeps_lora_param_dtype_uncast():

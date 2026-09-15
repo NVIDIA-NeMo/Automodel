@@ -147,7 +147,3 @@ class RotaryEmbedParallel(SequenceParallel):
     @staticmethod
     def _prepare_output_fn(use_local_output, mod, outputs, device_mesh):
         return type(outputs)([o.to_local() if use_local_output else o for o in outputs])
-
-
-# Legacy YAML alias for ``tp_shard_plan``; ``_get_parallel_plan`` now defers to the model's own plan.
-LLAMA_NEMOTRON_SUPER_TP_PLAN_NAME = "llama_nemotron_super_tp_plan"

@@ -31,6 +31,7 @@ def test_spec_fields_are_plans_constraints_and_a_strategy():
         "sequence_parallel_plan",
         "layer_groups",
         "sharded_output_only",
+        "shard_by_dtype",
         "strategy",
     ]
 

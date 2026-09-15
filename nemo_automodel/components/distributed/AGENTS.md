@@ -53,19 +53,26 @@ class NewModelForCausalLM(HFCheckpointingMixin, nn.Module):
 ```
 
 `ParallelSpec` (`parallel_spec.py`) is pure data: the TP plan and its sequence-parallel
-overlay as dictionaries, layer groups, the `sharded_output_only` constraint and the strategy
-override (the one place for instance-dependent behaviour). It never points at a model attribute;
-what must come from the instance (HF `_tp_plan`, input embedding, text config) is read through
-the model's own API, and `ParallelSpec.from_hf_model` is the constructor for that case; `parallelizer.py` only
-ever reads the `parallel_spec` class attribute (`query_parallel_spec`); activation checkpointing
-has its own `ActivationCheckpointingSpec` (`activation_checkpointing.py`, read from the separate
-`activation_checkpointing_spec` attribute by `query_activation_checkpointing_spec`). Architectures
-the repository does not re-implement -- stock `transformers` classes, `trust_remote_code`
-checkpoints, `diffusers` transformers -- get a `components/models/<family>/parallelization.py`
-of their own that declares the spec on a class named after the upstream architecture; the
-loader resolver (`_transformers/model_init.py::model_specs_for`, shared by the diffusion
-pipeline) derives `<family>` from the class and binds every declared spec onto the wrapper. No table of model
-names exists anywhere, and nothing in this directory names a model.
+overlay as dictionaries, layer groups, the `sharded_output_only` constraint, the `shard_by_dtype`
+opt-in (dtype-aware per-block FSDP2 driven by the model's `_keep_in_fp32_modules_strict`) and the
+strategy override (the one place for instance-dependent behaviour; `DefaultParallelizationStrategy`
+exposes hooks such as `select_activation_checkpointing_layers` so a strategy narrows one step instead
+of re-implementing the flow). It never points at a model attribute; what must come from the instance
+(HF `_tp_plan`, input embedding, text config) is read through the model's own API, and
+`ParallelSpec.from_hf_model` is the constructor for that case. Layer groups are derived when not
+declared: containers of the blocks the model names in `_no_split_modules`, with the role taken from
+the multimodal tower they live under, else `language` for a model with `get_decoder()` and
+`backbone` otherwise (`_derive_layer_groups`; the same `_no_split_modules` feed the MegatronFSDP unit
+derivation). A wrapper that declares nothing resolves through the child its `base_model_prefix`
+names. `query_parallel_spec` (in `parallel_spec.py`) only ever reads the `parallel_spec` class
+attribute; activation checkpointing has its own `ActivationCheckpointingSpec`
+(`activation_checkpointing.py`, read from the separate `activation_checkpointing_spec` attribute by
+`query_activation_checkpointing_spec`). Architectures the repository does not re-implement -- stock
+`transformers` classes, `trust_remote_code` checkpoints, `diffusers` transformers -- get a
+`components/models/<family>/parallelization.py` of their own only when they need to declare
+something; the loader resolver (`_transformers/model_init.py::model_specs_for`, shared by the
+diffusion pipeline) derives `<family>` from the class and binds every declared spec onto the
+wrapper. No table of model names exists anywhere, and nothing in this directory names a model.
 
 **Type annotations** -- put the import under `if TYPE_CHECKING:`. That needs
 `from __future__ import annotations` at the top of the file so annotations are

@@ -35,7 +35,6 @@ from torch.distributed.tensor.placement_types import Replicate, Shard
 # Function under test and collaborators
 import nemo_automodel.components.distributed.parallelizer as parallelizer
 from nemo_automodel._transformers.model_init import _get_mixin_wrapped_class
-from nemo_automodel.components.distributed.optimized_tp_plans import LLAMA_NEMOTRON_SUPER_TP_PLAN_NAME
 from nemo_automodel.components.distributed.parallel_spec import ParallelSpec
 from nemo_automodel.components.distributed.parallelizer import _get_parallel_plan
 from nemo_automodel.components.models.llama.parallelization import LLAMA_PARALLEL_SPEC
@@ -383,8 +382,10 @@ def test_custom_plan_imports_non_dict_raises(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_named_plan_constant_value():
-    assert LLAMA_NEMOTRON_SUPER_TP_PLAN_NAME == "llama_nemotron_super_tp_plan"
+def test_legacy_alias_is_just_an_invalid_import_path():
+    """``llama_nemotron_super_tp_plan`` names no plan any more: the architectures it covered declare their own."""
+    with pytest.raises(ValueError, match="is not valid"):
+        _get_parallel_plan(_DummyModel(), sequence_parallel=False, tp_shard_plan="llama_nemotron_super_tp_plan")
 
 
 class TestGetLlamaNemotronSuperTpPlan:
@@ -439,55 +440,6 @@ def _bridged_decilm() -> object:
     model.__class__ = _get_mixin_wrapped_class(model_cls)
     model.config = SimpleNamespace(architectures=["DeciLMForCausalLM"], model_type="nemotron-nas")
     return model
-
-
-def test_named_plan_resolves_to_llama_for_generic_model():
-    """The legacy alias defers to the model; a spec-less model gets the fused-projection base plan."""
-    model = _DummyModel()
-    result = _get_parallel_plan(
-        model,
-        sequence_parallel=False,
-        tp_shard_plan=LLAMA_NEMOTRON_SUPER_TP_PLAN_NAME,
-    )
-    assert "model.layers.*.self_attn.qkv_proj" in result
-
-
-def test_named_plan_resolves_to_decilm_for_nemotron_nas():
-    """Legacy alias on a DeciLM/nemotron-nas model → its own separate-projection plan."""
-    model = _bridged_decilm()
-    result = _get_parallel_plan(
-        model,
-        sequence_parallel=False,
-        tp_shard_plan=LLAMA_NEMOTRON_SUPER_TP_PLAN_NAME,
-    )
-    assert "model.layers.*.self_attn.q_proj" in result
-    assert "model.layers.*.self_attn.k_proj" in result
-    assert "model.layers.*.self_attn.v_proj" in result
-    assert "model.layers.*.self_attn.qkv_proj" not in result
-
-
-def test_named_plan_llama_with_sequence_parallel():
-    """Named plan + SP on a generic model includes norm entries."""
-    model = _DummyModel()
-    result = _get_parallel_plan(
-        model,
-        sequence_parallel=True,
-        tp_shard_plan=LLAMA_NEMOTRON_SUPER_TP_PLAN_NAME,
-    )
-    assert "model.norm" in result
-    assert "model.layers.*.input_layernorm" in result
-
-
-def test_named_plan_decilm_with_sequence_parallel():
-    """Legacy alias + SP on a DeciLM model includes norm entries."""
-    model = _bridged_decilm()
-    result = _get_parallel_plan(
-        model,
-        sequence_parallel=True,
-        tp_shard_plan=LLAMA_NEMOTRON_SUPER_TP_PLAN_NAME,
-    )
-    assert "model.norm" in result
-    assert "model.layers.*.self_attn.q_proj" in result
 
 
 def test_decilm_remote_code_class_auto_selects_nemotron_plan():

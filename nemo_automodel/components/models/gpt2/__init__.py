@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""GPT-2 in NeMo AutoModel: the pure-PyTorch nanoGPT model and the contract for the transformers one."""
+"""GPT-2 in NeMo AutoModel: the pure-PyTorch nanoGPT pretraining model."""
 
 from nemo_automodel.components.models.gpt2.nanogpt import GPT2LMHeadModel, build_gpt2_model
 

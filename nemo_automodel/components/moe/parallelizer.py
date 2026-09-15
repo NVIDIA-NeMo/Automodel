@@ -43,7 +43,6 @@ from nemo_automodel.components.moe.mok_experts import GroupedExpertsMoK
 from nemo_automodel.components.moe.tp_plan_validation import _validate_moe_tp_plan
 from nemo_automodel.shared.model_utils import iter_transformer_and_mtp_blocks
 from nemo_automodel.shared.multimodal_fsdp import (
-    MULTIMODAL_TOWER_NAMES,
     FrozenMultimodalSharding,
     ignored_params_for_root,
     iter_multimodal_modules,
@@ -357,32 +356,21 @@ def apply_ep(model: nn.Module, ep_mesh: DeviceMesh, moe_mesh: DeviceMesh | None 
             )
 
 
-# Alias of the shared tower taxonomy. Previously a private copy that had drifted
-# from the other multimodal name lists in the tree.
-_MULTIMODAL_TOWER_ATTRS = MULTIMODAL_TOWER_NAMES
-
-
 def _has_trainable_multimodal_tower(model: nn.Module) -> bool:
-    """Return whether the model (or its inner ``.model``) exposes a trainable vision/audio tower.
+    """Return whether the model exposes a trainable multimodal (vision/audio) module.
 
-    Deliberately a cheap duck-typed gate, not a second owner of the tower
-    mapping: it only decides whether importing the heavy, transformers-aware
-    dense parallelizer is worthwhile, while the dense parallelizer's per-model
-    layer-group mapping remains the sole owner of which blocks get wrapped.
-    Requiring a trainable, parameter-bearing tower (rather than mere attribute
-    existence) keeps the import off text-only, frozen-tower, and duck-typed
-    stub-model call paths.
+    A cheap gate over the shared multimodal-module iterator, not a second owner of
+    the tower mapping: it only decides whether importing the heavy, transformers-aware
+    dense parallelizer is worthwhile, while that parallelizer's layer groups remain
+    the sole owner of which blocks get wrapped. Requiring trainable parameters keeps
+    the import off text-only and frozen-tower call paths.
     """
-    for owner in (model, getattr(model, "model", None)):
-        if owner is None:
-            continue
-        for attr in _MULTIMODAL_TOWER_ATTRS:
-            tower = getattr(owner, attr, None)
-            if tower is None or not hasattr(tower, "parameters"):
-                continue
-            if any(param.requires_grad for param in tower.parameters()):
-                return True
-    return False
+    return any(
+        param.requires_grad
+        for _, module in iter_multimodal_modules(model)
+        if hasattr(module, "parameters")
+        for param in module.parameters()
+    )
 
 
 def _apply_multimodal_tower_ac(model: nn.Module, scopes: tuple[str, ...]) -> None:

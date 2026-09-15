@@ -109,12 +109,12 @@ def test_strategy_selection_standard_model():
 
 
 def test_strategy_selection_nemotron_model():
-    """Test that NemotronH models use NemotronHParallelizationStrategy."""
+    """NemotronH models use NemotronHParallelizationStrategy, a specialization of the default flow."""
     model = MockNemotronModel()
     strategy = get_parallelization_strategy(model)
 
-    assert isinstance(strategy, NemotronHParallelizationStrategy)
-    assert not isinstance(strategy, DefaultParallelizationStrategy)
+    assert type(strategy) is NemotronHParallelizationStrategy
+    assert isinstance(strategy, DefaultParallelizationStrategy)
 
 
 @patch("torch.distributed.get_process_group_ranks", return_value=[0])
@@ -149,10 +149,13 @@ def test_backward_compatibility_standard_model(
 
 
 @patch("torch.distributed.get_process_group_ranks", return_value=[0])
-@patch("nemo_automodel.components.models.nemotron_v3.parallelization.fully_shard")
-@patch("nemo_automodel.components.models.nemotron_v3.parallelization.parallelize_module")
-def test_backward_compatibility_nemotron_model(mock_parallelize_module, mock_fully_shard, mock_gpgr, mock_device_mesh):
-    """Test that the refactored code maintains backward compatibility for NemotronH models."""
+@patch("nemo_automodel.components.distributed.parallelizer_utils.fully_shard_by_dtype")
+@patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
+@patch("nemo_automodel.components.distributed.parallelizer.parallelize_module")
+def test_backward_compatibility_nemotron_model(
+    mock_parallelize_module, mock_fully_shard, mock_fully_shard_by_dtype, mock_gpgr, mock_device_mesh
+):
+    """NemotronH runs the shared flow: dtype-aware per-block sharding, then the root unit."""
     mock_fully_shard.side_effect = lambda model, **kwargs: model
 
     model = MockNemotronModel()
@@ -172,7 +175,8 @@ def test_backward_compatibility_nemotron_model(mock_parallelize_module, mock_ful
         mock_parallelize_module.assert_called()  # For TP plans
     else:
         mock_parallelize_module.assert_not_called()
-    mock_fully_shard.assert_called()  # For FSDP
+    assert mock_fully_shard_by_dtype.call_count == len(model.backbone.layers)
+    mock_fully_shard.assert_called()  # For the root FSDP unit
 
 
 def test_function_signature_preserved():
@@ -212,12 +216,6 @@ def test_no_runtime_errors_with_different_model_types(mock_device_mesh):
             "nemo_automodel.components.distributed.parallelizer.fully_shard", side_effect=lambda model, **kwargs: model
         ),
         patch("nemo_automodel.components.distributed.parallelizer.parallelize_module"),
-        # The NemotronH strategy lives with its model and reads these from its own module.
-        patch(
-            "nemo_automodel.components.models.nemotron_v3.parallelization.fully_shard",
-            side_effect=lambda model, **kwargs: model,
-        ),
-        patch("nemo_automodel.components.models.nemotron_v3.parallelization.parallelize_module"),
     ):
         with patch("nemo_automodel.components.distributed.parallelizer.apply_fsdp2_sharding_recursively"):
             with patch(

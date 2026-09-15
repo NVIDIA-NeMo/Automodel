@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from nemo_automodel.components.distributed.activation_checkpointing import (
+    ActivationCheckpointingSpec,
+    query_activation_checkpointing_spec,
+)
 from nemo_automodel.components.distributed.config import (
     DDPConfig,
     DistributedSetup,
@@ -22,9 +26,11 @@ from nemo_automodel.components.distributed.config import (
 )
 from nemo_automodel.components.distributed.init_utils import DistInfo, initialize_distributed
 from nemo_automodel.components.distributed.mesh import MeshContext, ParallelismSizes
+from nemo_automodel.components.distributed.parallel_spec import ParallelSpec, query_parallel_spec
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
 
 __all__ = [
+    "ActivationCheckpointingSpec",
     "DDPConfig",
     "DistributedSetup",
     "DistInfo",
@@ -33,7 +39,10 @@ __all__ = [
     "MeshContext",
     "MoEParallelizerConfig",
     "MultimodalDistributedConfig",
+    "ParallelSpec",
     "ParallelismSizes",
     "PipelineConfig",
     "initialize_distributed",
+    "query_activation_checkpointing_spec",
+    "query_parallel_spec",
 ]

@@ -21,10 +21,11 @@ import torch.nn as nn
 
 import nemo_automodel.components.distributed.parallelizer as parallelizer
 from nemo_automodel._transformers.model_init import _get_mixin_wrapped_class
+from nemo_automodel.components.distributed.parallel_spec import ParallelSpec
 from nemo_automodel.components.distributed.parallelizer import (
     translate_to_torch_parallel_style,
 )
-from nemo_automodel.components.models.qwen3_5.parallelization import QWEN3_5_VLM_PARALLEL_SPEC
+from nemo_automodel.components.models.qwen3_5.parallelization import QWEN3_5_PARALLEL_SPEC
 
 
 class TestTranslateToTorchParallelStyleReplicatedWithGradAllreduce:
@@ -79,7 +80,7 @@ class TestParallelizeQwen35VlmRegistered:
     native base_model_tp_plan (self_attn + MLP; GatedDeltaNet layers stay replicated)."""
 
     def test_qwen3_5_vlm_declares_no_plan(self):
-        assert QWEN3_5_VLM_PARALLEL_SPEC.tp_plan is None
+        assert QWEN3_5_PARALLEL_SPEC.tp_plan is None
 
     def test_delegates_to_get_hf_tp_shard_plan(self, monkeypatch):
         sentinel_plan = {"probe": "value"}
@@ -90,7 +91,7 @@ class TestParallelizeQwen35VlmRegistered:
             return sentinel_plan
 
         monkeypatch.setattr(parallelizer, "get_hf_tp_shard_plan", fake_get_hf_tp_shard_plan)
-        dummy = type("Qwen3_5Stub", (nn.Module,), {"parallel_spec": QWEN3_5_VLM_PARALLEL_SPEC})()
+        dummy = type("Qwen3_5Stub", (nn.Module,), {"parallel_spec": QWEN3_5_PARALLEL_SPEC})()
         result = parallelizer._get_parallel_plan(dummy, sequence_parallel=False, tp_size=2)
         assert result == sentinel_plan  # the HF-derived spec hands out a copy
         assert calls == [dummy]
@@ -99,21 +100,21 @@ class TestParallelizeQwen35VlmRegistered:
 class TestExtractModelLayersStringFallbackAndNoneSafe:
     """Two guarantees on _extract_model_layers:
 
-    1. A same-named stand-in gets the native Qwen3.5 layer groups once the HF bridge
-       wraps it (defensive against lazy-module / deepcopy class drift).
+    1. The wrapper class the HF bridge creates inherits a declared ``layer_groups`` contract.
     2. The internal _reduce_attrs tolerates None intermediate attributes
        (which happen after PP stage split strips unused sub-modules).
     """
 
     def _make_fake_qwen35(self, visual_is_none: bool, layers_as_module_dict: bool = False):
-        """Build a stand-in whose type().__name__ is 'Qwen3_5ForConditionalGeneration'
-        but is NOT the real class -- the lazy-import / deepcopy class-identity drift case."""
+        """Build a Qwen3.5-VL-shaped stand-in that declares its language and vision containers."""
 
         class Qwen3_5ForConditionalGeneration(nn.Module):  # noqa: N801  (name intentional)
-            pass
+            parallel_spec = ParallelSpec(
+                layer_groups={"language": ("model.language_model.layers",), "vision": ("model.visual.blocks",)}
+            )
 
         model = Qwen3_5ForConditionalGeneration()
-        model.__class__ = _get_mixin_wrapped_class(type(model))  # binds the native class's ParallelSpec by name
+        model.__class__ = _get_mixin_wrapped_class(type(model))  # the wrapper inherits the declaration
         model.model = nn.Module()
         model.model.language_model = nn.Module()
         if layers_as_module_dict:

@@ -1578,7 +1578,7 @@ class TestQueryParallelSpecResolution:
         spec = ParallelSpec(tp_plan={})
         twin = type("MockModel", (nn.Module,), {"forward": lambda self, x: x})
         with patch.object(MockModel, "parallel_spec", spec, create=True):
-            assert parallelizer.query_parallel_spec(twin()) is parallelizer._DEFAULT_SPEC
+            assert parallelizer.query_parallel_spec(twin()) == ParallelSpec()
 
     def test_no_declaration_falls_through_to_default_plan(self):
         model = MockModel()
@@ -1683,8 +1683,8 @@ class TestUpdateAttentionHeadCountsForTP:
         for layer in model.model.layers:
             assert layer.self_attn.num_key_value_heads == 32  # same as local_num_attention_heads
 
-    def test_language_model_inner_path(self):
-        """Layers under model.language_model are found when model.model has no layers."""
+    def test_layers_come_from_the_language_layer_group(self):
+        """The attention layers are the ``language`` group, wherever the model keeps them."""
         model = nn.Module()
         model.config = SimpleNamespace(
             num_attention_heads=64,
@@ -1702,7 +1702,7 @@ class TestUpdateAttentionHeadCountsForTP:
             layers.append(layer)
         lang.layers = layers
         model.language_model = lang
-        _update_attention_head_counts_for_tp(model, tp_size=2)
+        _update_attention_head_counts_for_tp(model, tp_size=2, layer_groups={"language": list(lang.layers)})
         for layer in lang.layers:
             assert layer.self_attn.num_heads == 32
             assert layer.self_attn.num_key_value_heads == 4
@@ -1711,10 +1711,10 @@ class TestUpdateAttentionHeadCountsForTP:
         model = nn.Module()
         _update_attention_head_counts_for_tp(model, tp_size=2)
 
-    def test_noop_without_layers(self):
+    def test_noop_without_language_layers(self):
         model = nn.Module()
         model.config = SimpleNamespace(num_attention_heads=8, hidden_size=64)
-        _update_attention_head_counts_for_tp(model, tp_size=2)
+        _update_attention_head_counts_for_tp(model, tp_size=2, layer_groups={"vision": [nn.Module()]})
 
 
 class TestAttentionIsHeadSharded:
@@ -2085,6 +2085,8 @@ class TestActivationCheckpointingKVSharing:
                 self.vision_model.vision_model.encoder.layers = nn.ModuleList([_FakeLayer()])
 
         class BiEncoderModel(nn.Module):
+            base_model_prefix = "model"
+
             def __init__(self):
                 super().__init__()
                 self.model = _bridged(LlamaNemotronVLModel())
@@ -2115,6 +2117,8 @@ class TestActivationCheckpointingKVSharing:
                 self.vision_model.vision_model.encoder.layers = nn.ModuleList([_FakeLayer()])
 
         class BiEncoderModel(nn.Module):
+            base_model_prefix = "model"
+
             def __init__(self):
                 super().__init__()
                 self.model = _bridged(LlamaNemotronVLModel())
@@ -2145,6 +2149,8 @@ class TestActivationCheckpointingKVSharing:
                 self.vision_model.vision_model.encoder.layers = nn.ModuleList([_FakeLayer()])
 
         class BiEncoderModel(nn.Module):
+            base_model_prefix = "model"
+
             def __init__(self):
                 super().__init__()
                 self.model = _bridged(LlamaNemotronVLModel())
@@ -2722,15 +2728,35 @@ class TestSelectiveCheckpointSaveOps:
 class TestExtractModelLayers:
     """Tests for ``_extract_model_layers`` flattening of ModuleList results.
 
-    Covers the PR that replaced ``layers.extend(_reduce_attrs(...))`` with a
-    helper that flattens ModuleList elements so each decoder layer ends up as
-    its own list entry (what AC wrapping expects). PP splitting represents kept
-    layer subsets as ModuleDicts, and those layer containers should be flattened
-    the same way.
+    Layer groups come from the model's own declarations: containers whose children are the blocks named in
+    ``_no_split_modules`` (their role from the tower they live under, otherwise ``language``), or the
+    ``layer_groups`` a ``ParallelSpec`` declares. Either way each decoder layer ends up as its own list entry
+    (what AC wrapping expects), and the ModuleDicts pipeline splitting leaves behind are flattened the same way.
     """
 
-    def _make_layers(self, n: int) -> nn.ModuleList:
-        return nn.ModuleList([_FakeLayer() for _ in range(n)])
+    def _make_layers(self, n: int, block_name: str | None = None) -> nn.ModuleList:
+        """``n`` fake blocks; ``block_name`` names their class as ``_no_split_modules`` would list it."""
+        block_cls = _FakeLayer if block_name is None else type(block_name, (_FakeLayer,), {})
+        return nn.ModuleList([block_cls() for _ in range(n)])
+
+    # (decoder, vision-encoder) block names transformers assembles into ``_no_split_modules`` on an instance
+    # during ``__init__`` -- which ``_bare_instance`` skips, so the tests install them explicitly.
+    _VLM_BLOCK_NAMES = {
+        "Qwen2VLForConditionalGeneration": ("Qwen2VLDecoderLayer", "Qwen2VLVisionBlock"),
+        "Qwen2_5_VLForConditionalGeneration": ("Qwen2_5_VLDecoderLayer", "Qwen2_5_VLVisionBlock"),
+        "Gemma3ForConditionalGeneration": ("Gemma3DecoderLayer", "SiglipEncoderLayer"),
+        "LlavaForConditionalGeneration": ("LlamaDecoderLayer", "CLIPEncoderLayer"),
+        "LlavaNextForConditionalGeneration": ("LlamaDecoderLayer", "CLIPEncoderLayer"),
+        "LlavaNextVideoForConditionalGeneration": ("LlamaDecoderLayer", "CLIPEncoderLayer"),
+        "LlavaOnevisionForConditionalGeneration": ("Qwen2DecoderLayer", "SiglipEncoderLayer"),
+    }
+
+    @classmethod
+    def _block_names(cls, model) -> tuple[str, str]:
+        """Install and return the (decoder, vision-encoder) block names of a bare VLM instance."""
+        names = cls._VLM_BLOCK_NAMES[type(model).__name__]
+        model._no_split_modules = set(names)
+        return names
 
     @staticmethod
     def _bare_instance(cls):
@@ -2745,18 +2771,17 @@ class TestExtractModelLayers:
         return _bridged(obj)
 
     def test_class_keyed_single_fqn_flattens_modulelist(self):
-        """GPT2LMHeadModel entry ``["transformer.h"]`` → individual layers.
+        """GPT-2's ``transformer.h`` container of ``GPT2Block`` (its ``_no_split_modules``) → individual layers.
 
-        Before the fix, ``layers.extend(_reduce_attrs(...))`` put the ModuleList
-        itself into ``layers`` as one element; hasattr(layer, 'mlp') then failed
-        and AC silently skipped every layer. Flattening must restore the
-        per-layer elements so the AC loop can wrap them.
+        ``layers.extend(_reduce_attrs(...))`` once put the ModuleList itself into ``layers`` as one
+        element; hasattr(layer, 'mlp') then failed and AC silently skipped every layer. Flattening must
+        restore the per-layer elements so the AC loop can wrap them.
         """
         from transformers.models.gpt2.modeling_gpt2 import GPT2LMHeadModel
 
         model = self._bare_instance(GPT2LMHeadModel)
         transformer = nn.Module()
-        layers = self._make_layers(3)
+        layers = self._make_layers(3, "GPT2Block")
         transformer.h = layers
         model.transformer = transformer
 
@@ -2769,10 +2794,7 @@ class TestExtractModelLayers:
         assert not any(isinstance(r, nn.ModuleList) for r in result)
 
     def test_string_keyed_arm_flattens_modulelist(self):
-        """``NemotronHForCausalLM`` is string-keyed in MODEL_CLS_TO_LAYERS.
-
-        Hits the ``model_cls.__name__ in MODEL_CLS_TO_LAYERS`` branch.
-        """
+        """A declared ``layer_groups`` candidate that resolves to a ``ModuleList`` is flattened to its blocks."""
 
         class NemotronHForCausalLM(nn.Module):
             def __init__(self, layers):
@@ -2848,17 +2870,17 @@ class TestExtractModelLayers:
     def test_multi_fqn_flattens_each_modulelist(self):
         """Qwen2.5-VL pre-standardization tree (``model.layers`` + ``visual.blocks``).
 
-        Both groups resolve to ModuleLists; both must be flattened so all
-        decoder and vision blocks appear as individual elements in the final
-        list.
+        Both containers hold the blocks the class names in ``_no_split_modules``; both must be flattened so
+        all decoder and vision blocks appear as individual elements in the final list.
         """
         from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
             Qwen2_5_VLForConditionalGeneration,
         )
 
         model = self._bare_instance(Qwen2_5_VLForConditionalGeneration)
-        lang = self._make_layers(5)
-        vis = self._make_layers(2)
+        decoder_block, vision_block = self._block_names(model)
+        lang = self._make_layers(5, decoder_block)
+        vis = self._make_layers(2, vision_block)
         self._attach_qwen_vl_towers(model, lang, vis, nested=False)
 
         result = _extract_model_layers(model)
@@ -2887,8 +2909,9 @@ class TestExtractModelLayers:
 
         for cls in (Qwen2VLForConditionalGeneration, Qwen2_5_VLForConditionalGeneration):
             model = self._bare_instance(cls)
-            lang = self._make_layers(3)
-            vis = self._make_layers(2)
+            decoder_block, vision_block = self._block_names(model)
+            lang = self._make_layers(3, decoder_block)
+            vis = self._make_layers(2, vision_block)
             self._attach_qwen_vl_towers(model, lang, vis, nested=nested)
 
             groups = _extract_model_layer_groups(model)
@@ -2907,8 +2930,9 @@ class TestExtractModelLayers:
         )
 
         model = self._bare_instance(Qwen2VLForConditionalGeneration)
-        lang = self._make_layers(3)
-        vis = self._make_layers(2)
+        decoder_block, vision_block = self._block_names(model)
+        lang = self._make_layers(3, decoder_block)
+        vis = self._make_layers(2, vision_block)
         self._attach_qwen_vl_towers(model, lang, vis, nested=True)
         # Simulate the transformers 4.52-4.x deprecation aliases: the same
         # towers are reachable at the historical top-level paths too.
@@ -2932,8 +2956,9 @@ class TestExtractModelLayers:
         on 5.8.1/5.12.1.
         """
         model = self._bare_instance(Gemma3ForConditionalGeneration)
-        lang = self._make_layers(3)
-        vis = self._make_layers(2)
+        decoder_block, vision_block = self._block_names(model)
+        lang = self._make_layers(3, decoder_block)
+        vis = self._make_layers(2, vision_block)
         self._attach_language_vision_towers(model, lang, vis, shape=shape)
 
         groups = _extract_model_layer_groups(model)
@@ -2965,8 +2990,9 @@ class TestExtractModelLayers:
             LlavaOnevisionForConditionalGeneration,
         ):
             model = self._bare_instance(cls)
-            lang = self._make_layers(3)
-            vis = self._make_layers(2)
+            decoder_block, vision_block = self._block_names(model)
+            lang = self._make_layers(3, decoder_block)
+            vis = self._make_layers(2, vision_block)
             self._attach_language_vision_towers(model, lang, vis, shape=shape)
 
             groups = _extract_model_layer_groups(model)
@@ -2976,19 +3002,23 @@ class TestExtractModelLayers:
             assert [id(m) for m in groups["vision"]] == [id(item) for item in vis], cls.__name__
 
     def test_spec_resolving_no_modules_warns_and_returns_empty(self, caplog):
-        """A mapped model class whose spec FQNs all fail to resolve must warn.
+        """A declared ``layer_groups`` whose FQNs all fail to resolve must warn.
 
         This is the transformers-version-drift failure mode: extraction used to
         return ``{}`` silently and activation checkpointing became a no-op.
         """
-        from transformers.models.qwen2_vl.modeling_qwen2_vl import (
-            Qwen2VLForConditionalGeneration,
+        DriftedVLMForConditionalGeneration = type(
+            "DriftedVLMForConditionalGeneration",
+            (nn.Module,),
+            {
+                "parallel_spec": ParallelSpec(
+                    layer_groups={"language": ("model.language_model.layers",), "vision": ("model.visual.blocks",)}
+                )
+            },
         )
 
-        # A tree that matches no known Qwen2-VL shape: top-level
-        # `language_model.layers` (never a registered module path for this
-        # class; it only ever existed as a deprecation alias).
-        model = self._bare_instance(Qwen2VLForConditionalGeneration)
+        # A tree that matches neither declared path: top-level `language_model.layers`.
+        model = DriftedVLMForConditionalGeneration()
         language_model = nn.Module()
         language_model.layers = self._make_layers(2)
         model.language_model = language_model
@@ -2997,7 +3027,7 @@ class TestExtractModelLayers:
             groups = _extract_model_layer_groups(model)
 
         assert groups == {}
-        assert "Qwen2VLForConditionalGeneration" in caplog.text
+        assert "DriftedVLMForConditionalGeneration" in caplog.text
         assert "model.language_model.layers" in caplog.text
         assert "model.visual.blocks" in caplog.text
 
@@ -3023,9 +3053,7 @@ class TestExtractModelLayers:
         assert [id(r) for r in result] == [id(v) for v in layer_dict.values()]
 
     def test_fallback_branch_still_handles_modulelist(self):
-        """Non-MODEL_CLS_TO_LAYERS models hit the ``hasattr(model.model, 'layers')``
-        fallback, which is unchanged by the PR. Guard against accidental regression.
-        """
+        """A model declaring neither ``layer_groups`` nor ``_no_split_modules`` resolves ``model.layers``."""
 
         class GenericCausalLM(nn.Module):
             def __init__(self, layers):
@@ -3065,13 +3093,22 @@ class TestExtractModelLayers:
         with pytest.raises(ValueError, match="no ModuleList or ModuleDict found"):
             _extract_model_layers(UnknownWithAdapterRegistry())
 
-    def test_subclass_of_bridged_architecture_inherits_layer_groups(self):
+    def test_subclass_of_bridged_architecture_inherits_the_contract_and_derives_layer_groups(self):
         """``Mistral3FP8VLMForConditionalGeneration`` subclasses HF's Mistral3 class, so the HF
         bridge must find the ``"Mistral3ForConditionalGeneration"`` contract by walking the MRO
-        when it wraps the class. Otherwise the model falls through to the largest-ModuleList
-        heuristic.
+        when it wraps the class, and the layer groups follow from the inherited ``_no_split_modules``
+        rather than the largest-ModuleList heuristic.
         """
-        Mistral3ForConditionalGeneration = type("Mistral3ForConditionalGeneration", (nn.Module,), {})
+        from nemo_automodel.components.models.mistral3.parallelization import MISTRAL3_VLM_TP_PLAN
+
+        Mistral3ForConditionalGeneration = type(
+            "Mistral3ForConditionalGeneration",
+            (nn.Module,),
+            {
+                "_no_split_modules": ["MistralDecoderLayer", "PixtralAttentionLayer"],
+                "get_decoder": lambda self: self.model.language_model,
+            },
+        )
 
         class Mistral3FP8VLMForConditionalGeneration(Mistral3ForConditionalGeneration):
             """Stand-in for the FP8 subclass, named like the runtime wrapper."""
@@ -3080,23 +3117,27 @@ class TestExtractModelLayers:
                 super().__init__()
                 inner = nn.Module()
                 lang = nn.Module()
-                lang.layers = self._mklayers(3)
+                lang.layers = self._mklayers(3, "MistralDecoderLayer")
                 inner.language_model = lang
                 vt = nn.Module()
                 tx = nn.Module()
-                tx.layers = self._mklayers(2)
+                tx.layers = self._mklayers(2, "PixtralAttentionLayer")
                 vt.transformer = tx
                 inner.vision_tower = vt
                 self.model = inner
 
             @staticmethod
-            def _mklayers(n):
-                return nn.ModuleList([_FakeLayer() for _ in range(n)])
+            def _mklayers(n, block_name):
+                block_cls = type(block_name, (_FakeLayer,), {})
+                return nn.ModuleList([block_cls() for _ in range(n)])
 
         model = _bridged(Mistral3FP8VLMForConditionalGeneration())
+        groups = _extract_model_layer_groups(model)
         result = _extract_model_layers(model)
 
+        assert parallelizer.query_parallel_spec(model).tp_plan is MISTRAL3_VLM_TP_PLAN
         # 3 text-decoder + 2 vision tower layers, all flattened.
+        assert {name: len(layers) for name, layers in groups.items()} == {"language": 3, "vision": 2}
         assert len(result) == 5
         assert not any(isinstance(r, nn.ModuleList) for r in result)
 
@@ -3118,6 +3159,8 @@ class TestExtractModelLayers:
                 return nn.ModuleList([_FakeLayer() for _ in range(n)])
 
         class BiEncoderModel(nn.Module):
+            base_model_prefix = "model"
+
             def __init__(self):
                 super().__init__()
                 self.model = _bridged(LlamaNemotronVLModel())
@@ -3141,6 +3184,8 @@ class TestExtractModelLayers:
                 self.layers = nn.ModuleList([_FakeLayer() for _ in range(3)])
 
         class BiEncoderModel(nn.Module):
+            base_model_prefix = "model"
+
             def __init__(self):
                 super().__init__()
                 self.model = _bridged(Ministral3BidirectionalModel())

@@ -682,7 +682,6 @@ class MuseGlimmerForConditionalGeneration(HFCheckpointingMixin, MuseGlimmerPreTr
 
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
     _tied_weights_keys = []
-    _tp_plan = {"lm_head": "colwise_rep"}
     _keep_in_fp32_modules = ["rotary_emb"]
     supports_thd = True
     parallel_spec: ParallelSpec = ParallelSpec(

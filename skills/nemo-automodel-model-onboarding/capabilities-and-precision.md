@@ -82,7 +82,8 @@ attention-sink bias, and per-head `scale`.
 If the model has such params, declare `_keep_in_fp32_modules_strict` as
 parameter-name substrings. Sharding (`fully_shard_by_dtype`) reads this list and
 uses fp32 compute dtype for matching params while other params use
-`mp_policy.param_dtype`.
+`mp_policy.param_dtype`. The MoE parallelizer always shards this way; a dense
+model opts in with `ParallelSpec(shard_by_dtype=True)` (Qwen3.5, Nemotron-H).
 
 For a NeMo-native model class:
 

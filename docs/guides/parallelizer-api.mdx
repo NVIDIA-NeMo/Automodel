@@ -31,10 +31,11 @@ correctly needs **no** spec. Declare one when any of the following is true:
 | Symptom | Field to set |
 |---|---|
 | The optimized TP plan differs from HF's `_tp_plan` / the base plan (fused QKV, extra projections, replicated mixers, MLP-only sharding). | `tp_plan`, plus `sequence_parallel_plan` when the architecture has a sequence-parallel variant |
-| Transformer blocks are not at `model.layers`, or there are several groups (language + vision towers). | `layer_groups` |
+| The transformer blocks cannot be derived from the model's `_no_split_modules` (the class lists no blocks, or lists the wrong module, as SmolVLM does), or the derived roles are wrong. | `layer_groups` |
 | A head's plan entry is only valid with a sharded output (e.g. weight-normalized logits). | `sharded_output_only` |
+| Some parameters must compute in fp32 (`_keep_in_fp32_modules_strict`: Mamba `A_log`, GatedDeltaNet gates) and need their own FSDP units. | `shard_by_dtype` |
 | Whole logical layers must be checkpointed instead of the generic submodule wrappers. | Not a `ParallelSpec` field: declare an `activation_checkpointing_spec` (see below). |
-| The FSDP2 flow itself must change, or TP validity depends on the instance (per-layer block configs, per-variant plans). | `strategy` |
+| The FSDP2 flow itself must change, or TP validity depends on the instance (per-layer block configs, per-variant plans, context-parallel wiring). | `strategy` |
 
 ## `ParallelSpec`
 
@@ -47,14 +48,29 @@ behaviour that depends on the model instance belongs in a `ParallelizationStrate
 |---|---|---|---|
 | `tp_plan` | `dict[str, ParallelStyle]` | `None` → HF `_tp_plan`, then the base plan | `_get_parallel_plan` |
 | `sequence_parallel_plan` | `dict[str, ParallelStyle]` overlaid on `tp_plan` when SP is requested | `None` → SP request is ignored with a warning | `_get_parallel_plan` via `spec.resolved_tp_plan(sequence_parallel)` |
-| `layer_groups` | `dict[str, tuple[str, ...]]` — role → candidate module FQNs | `None` → `model.layers` / largest `ModuleList` | FSDP2 per-layer wrapping, activation checkpointing scopes |
+| `layer_groups` | `dict[str, tuple[str, ...]]` — role → candidate module FQNs | `None` → derived from the model's `_no_split_modules` (see below) | Activation checkpointing scopes, the TP head-count update, `get_model_layer_groups` |
 | `sharded_output_only` | module FQNs | `()` | `_get_parallel_plan`, after the plan is chosen from any source: an entry for one of these modules is dropped unless its output is sharded |
+| `shard_by_dtype` | `bool` | `False` | `apply_fsdp2_sharding_recursively`: each block is sharded with `fully_shard_by_dtype`, so parameters pinned by the model's `_keep_in_fp32_modules_strict` get an fp32 FSDP unit of their own |
 | `strategy` | `ParallelizationStrategy` instance | `None` → `DefaultParallelizationStrategy` | `fsdp2_strategy_parallelize` |
 
-`layer_groups` candidate tuples are tried in order and the first
-FQN that resolves wins, so one spec covers several `transformers` module-tree layouts without
-version gating. Put the canonical path first: standardized 4.x releases keep deprecated alias
-properties (`language_model`, `visual`) that also resolve.
+### Layer Groups
+
+Roles are `language`, `vision`, `audio` and `backbone` (`LAYER_ROLES`). Without a declaration the
+parallelizer derives the groups from what the model already states: every `ModuleList` (or the
+`ModuleDict` pipeline splitting leaves behind) whose children are blocks named in the model's
+`_no_split_modules` is a layer container; it is `vision`/`audio` when it sits under a multimodal tower
+(the tower attribute names in `nemo_automodel.shared.multimodal_fsdp`), otherwise `language` for a
+model that exposes `get_decoder()` and `backbone` for one that does not (a diffusion transformer).
+Blocks are recognised through the wrappers sharding adds (`checkpoint_wrapper`, FSDP2's
+`FSDP<Name>` subclass). A wrapper module that declares nothing of its own (the retrieval bi-/cross-
+encoders) resolves through the child named by the transformers convention `base_model_prefix`.
+
+Stock `transformers` VLMs (Gemma 3, LLaVA, Qwen2-VL, Llama 4, Mistral 3), `diffusers` transformers
+and every native model that declares `_no_split_modules` need no `layer_groups`. Declare them only
+when the derivation is unavailable or wrong: SmolVLM lists `SmolVLMVisionAttention` (a block's child)
+instead of its encoder layer, LTX-2 lists nothing, and Nemotron-H's blocks live at `backbone.layers`
+on the HF model but `model.layers` on the native port. Candidate tuples are tried in order and the
+first FQN that resolves wins, so one declaration covers several module-tree layouts.
 
 `spec.resolved_tp_plan(sequence_parallel)` is the plan the parallelizer applies: `tp_plan` with
 `sequence_parallel_plan` overlaid, with every style shallow-copied so the shared declaration is
@@ -125,13 +141,11 @@ the embedding to row-shard, and `config.get_text_config()` for the head counts t
 checks. When a spec genuinely has to be *constructed* from such inputs, that is a classmethod —
 `from_hf_model` is the one such constructor today.
 
-A VLM usually needs the tree described as well:
+Qwen3.5 also keeps its fp32 SSM-gate holders (`_keep_in_fp32_modules_strict = ["_fp32_params"]`)
+in their own FSDP units through the shared dtype-aware sharding rather than a private FSDP loop:
 
 ```python
-QWEN3_5_VLM_PARALLEL_SPEC = ParallelSpec(
-    layer_groups={"language": ("model.language_model.layers",), "vision": ("model.visual.blocks",)},
-    strategy=Qwen3_5ParallelizationStrategy(),
-)
+QWEN3_5_PARALLEL_SPEC = ParallelSpec(shard_by_dtype=True, strategy=Qwen3_5ParallelizationStrategy())
 ```
 
 ### Override the Flow With a Strategy
@@ -155,9 +169,35 @@ class Qwen3VLParallelizationStrategy(DefaultParallelizationStrategy):
         return result
 ```
 
+A strategy narrows a step of the shared flow through a hook instead of re-implementing the flow.
+`select_activation_checkpointing_layers(model, layer_groups, scope)` returns the layers to checkpoint;
+Nemotron-H overrides it to leave its attention blocks unwrapped while its TP plan, dtype-aware FSDP2
+and whole-block checkpointing are ordinary declarations:
+
+```python
+class NemotronHParallelizationStrategy(DefaultParallelizationStrategy):
+    def parallelize(self, model, device_mesh, sequence_parallel=False, **kwargs):
+        assert not sequence_parallel
+        _setup_context_parallel(model, device_mesh)  # Mamba / TE attention CP wiring
+        return super().parallelize(model, device_mesh, sequence_parallel=sequence_parallel, **kwargs)
+
+    def select_activation_checkpointing_layers(self, model, layer_groups, activation_checkpointing_scope):
+        layers, scopes = super().select_activation_checkpointing_layers(model, layer_groups, activation_checkpointing_scope)
+        return [layer for layer in layers if layer.block_type in ("mlp", "mamba")], scopes
+
+
+NEMOTRON_H_PARALLEL_SPEC = ParallelSpec(
+    tp_plan=NEMOTRON_H_TP_PLAN,
+    layer_groups={"language": ("backbone.layers", "model.layers")},
+    shard_by_dtype=True,
+    strategy=NemotronHParallelizationStrategy(),
+)
+```
+
 Prefer a data field when one fits: Nemotron-Flash needs no strategy because
 `sharded_output_only=("lm_head",)` states its constraint, and the parallelizer enforces it on
-whatever plan is finally chosen.
+whatever plan is finally chosen; the `diffusers` Wan transformer needs none because its TP plan is a
+dictionary and its whole-block checkpointing an `activation_checkpointing_spec`.
 
 ## Activation Checkpointing Is a Separate Contract
 
@@ -196,7 +236,7 @@ Such an architecture gets a model directory of its own that holds only the contr
 ```
 components/models/gemma3/
 ├── __init__.py
-└── parallelization.py     # plan functions, validators, strategy, and the declaration below
+└── parallelization.py     # plan dictionaries, validators, strategy, and the declaration below
 ```
 
 ```python
@@ -207,9 +247,11 @@ class Gemma3ForConditionalGeneration:
     parallel_spec: ParallelSpec = ParallelSpec(
         tp_plan=GEMMA3_VLM_TP_PLAN,
         sequence_parallel_plan=GEMMA3_VLM_SEQUENCE_PARALLEL_PLAN,
-        layer_groups=GEMMA3_LAYERS,
     )
 ```
+
+An architecture that only needs the generic flow needs no directory at all: its layer groups are
+derived and HF's `_tp_plan` is its TP plan (LLaVA, Qwen2-VL, Llama 4 and GPT-2 ship nothing).
 
 The class is a plain declaration named exactly like the upstream architecture; it is never
 instantiated. When the loader wraps an upstream class it derives the directory from the class
@@ -260,23 +302,23 @@ The resolution order inside `_get_parallel_plan` is:
 `spec.sharded_output_only` is then enforced on the chosen plan, and models built from the custom
 MoE layers are checked so that no TP entry claims a routed expert.
 
-<Note>
-`tp_plan: llama_nemotron_super_tp_plan` is a legacy alias. It now logs a deprecation warning
-and defers to the model's own plan, which is what the architectures it covered (Llama-style and
-Nemotron-NAS) declare anyway. Pass a dictionary or an import path to force a specific plan.
-</Note>
+The head-count validation (`num_attention_heads` / `num_key_value_heads` divisible by the TP size,
+read from `config.get_text_config()`) runs only when the chosen plan shards attention across heads;
+a plan that shards MLPs alone or keeps attention replicated places no such constraint.
 
 ## Verify a Declaration
 
 ```python
-from nemo_automodel.components.distributed.parallelizer import query_parallel_spec
+from nemo_automodel.components.distributed import query_parallel_spec
+from nemo_automodel.components.distributed.parallelizer import get_model_layer_groups
 
 spec = query_parallel_spec(model)
 assert spec.tp_plan is LLAMA_TP_PLAN
+assert set(get_model_layer_groups(model)) == {"language"}
 ```
 
-Add a unit test that asserts the declaration (`Model.parallel_spec.tp_plan is ...`, or the
-layer groups it resolves), and keep `python -X importtime -c "import nemo_automodel.components.distributed.parallelizer"`
+Add a unit test that asserts the declaration (`Model.parallel_spec.tp_plan is ...`) or the layer
+groups the model resolves to, and keep `python -X importtime -c "import nemo_automodel.components.distributed.parallelizer"`
 free of `transformers.models.*` entries; `tests/unit_tests/distributed/test_parallelizer.py`
 enforces the latter.
 

@@ -331,6 +331,8 @@ class GlmMoeDsaModel(nn.Module):
 
 class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+    # Context parallelism runs on the model-owned DSA attention, which exists for these backends only.
+    _cp_attention_backends = ("tilelang", "cudnn")
     _packed_cp_attn_backends = ("tilelang", "cudnn")
     _keep_in_fp32_modules_strict = ["e_score_correction_bias"]
 

@@ -57,7 +57,8 @@ DistributedStrategyConfig = Union["FSDP2Config", "MegatronFSDPConfig", "DDPConfi
 # Backwards-compatible alias for external / type-checking references.
 DistributedConfig = DistributedStrategyConfig
 
-_VALID_ACTIVATION_CHECKPOINTING_SCOPES = {"all", "language", "vision", "audio", "multimodal"}
+# Layer-group roles (``parallel_spec.LAYER_ROLES``) plus ``all`` and the ``multimodal`` alias for vision + audio.
+_VALID_ACTIVATION_CHECKPOINTING_SCOPES = {"all", "language", "vision", "audio", "backbone", "multimodal"}
 
 
 def normalize_activation_checkpointing_scope(value: Any) -> Tuple[str, ...]:

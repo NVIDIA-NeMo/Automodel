@@ -40,17 +40,8 @@ MISTRAL3_VLM_TP_PLAN: dict[str, ParallelStyle] = {
 }
 
 
-MISTRAL3_VLM_PARALLEL_SPEC = ParallelSpec(
-    tp_plan=MISTRAL3_VLM_TP_PLAN,
-    layer_groups={
-        "language": ("model.language_model.layers",),
-        "vision": (
-            "model.vision_tower.encoder.layers",
-            "model.vision_tower.vision_model.encoder.layers",
-            "model.vision_tower.transformer.layers",
-        ),
-    },
-)
+# The language and vision layer groups are derived from the class's ``_no_split_modules``.
+MISTRAL3_VLM_PARALLEL_SPEC = ParallelSpec(tp_plan=MISTRAL3_VLM_TP_PLAN)
 
 
 class Mistral3ForConditionalGeneration:

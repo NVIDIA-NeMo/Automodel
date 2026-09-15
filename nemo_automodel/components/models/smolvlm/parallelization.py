@@ -12,7 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Parallelization contract for the transformers ``SmolVLMForConditionalGeneration``."""
+"""Parallelization contract for the transformers ``SmolVLMForConditionalGeneration``.
+
+The layer groups cannot be derived: transformers lists ``SmolVLMVisionAttention`` (a block's attention child) in
+``_no_split_modules`` rather than the ``SmolVLMEncoderLayer`` blocks the vision tower stacks, so the vision group
+would be missed. Both containers are therefore declared.
+"""
 
 from nemo_automodel.components.distributed.parallel_spec import ParallelSpec
 

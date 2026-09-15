@@ -63,8 +63,7 @@ from nemo_automodel.components.models.qwen3_5.packing import (
     prepare_gated_delta_packed_metadata,
 )
 from nemo_automodel.components.models.qwen3_5.parallelization import (
-    QWEN3_5_CAUSAL_LM_PARALLEL_SPEC,
-    QWEN3_5_VLM_PARALLEL_SPEC,
+    QWEN3_5_PARALLEL_SPEC,
 )
 from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import CPAwareGatedDeltaNet
 from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextRMSNorm
@@ -663,7 +662,9 @@ class Qwen3_5ForCausalLM(HFCheckpointingMixin, nn.Module):
 
     tie_word_embeddings_support: TieSupport = TieSupport.BOTH
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-    parallel_spec: ParallelSpec = QWEN3_5_CAUSAL_LM_PARALLEL_SPEC
+    parallel_spec: ParallelSpec = QWEN3_5_PARALLEL_SPEC
+    # The SSM-gate holders compute in fp32; ``ParallelSpec.shard_by_dtype`` gives them their own FSDP units.
+    _keep_in_fp32_modules_strict = ["_fp32_params"]
 
     @dataclass(frozen=True)
     class ModelCapabilities:
@@ -877,7 +878,9 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
 
     tie_word_embeddings_support: TieSupport = TieSupport.BOTH
     _tied_weights_keys = {"lm_head.weight": "model.language_model.embed_tokens.weight"}
-    parallel_spec: ParallelSpec = QWEN3_5_VLM_PARALLEL_SPEC
+    parallel_spec: ParallelSpec = QWEN3_5_PARALLEL_SPEC
+    # The SSM-gate holders compute in fp32; ``ParallelSpec.shard_by_dtype`` gives them their own FSDP units.
+    _keep_in_fp32_modules_strict = ["_fp32_params"]
 
     @dataclass(frozen=True)
     class ModelCapabilities:

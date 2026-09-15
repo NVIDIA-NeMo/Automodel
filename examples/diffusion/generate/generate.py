@@ -182,7 +182,6 @@ def _build_parallel_scheme(scheme_cfg, dist_info):
         manager_args = {
             "backend": "nccl",
             "world_size": dist_info.world_size,
-            "use_hf_tp_plan": False,
         }
         # Copy parallelism sizes from config
         for key in ("tp_size", "cp_size", "pp_size", "dp_size", "dp_replicate_size"):

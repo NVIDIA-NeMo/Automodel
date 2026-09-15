@@ -20,12 +20,16 @@ import copy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from torch import nn
 from torch.distributed.tensor.parallel import ParallelStyle
 
 if TYPE_CHECKING:
-    from torch import nn
-
     from nemo_automodel.components.distributed.parallelizer import ParallelizationStrategy
+
+
+# Roles a layer group may take. Activation-checkpointing scopes select groups by role; the
+# HuggingFace-native gradient-checkpointing path applies only to language-only models.
+LAYER_ROLES = ("language", "vision", "audio", "backbone")
 
 
 @dataclass(frozen=True)
@@ -50,14 +54,24 @@ class ParallelSpec:
             requested (sequence-sharded norms, reduce-scattering projections). ``None`` means the
             architecture has no sequence-parallel variant; the request is then ignored with a
             warning.
-        layer_groups: Transformer-block containers per role (``"language"``, ``"vision"``),
-            each as candidate FQNs; the first that resolves wins, so one spec covers several
-            ``transformers`` module-tree layouts. ``None`` uses ``model.model.layers`` or
-            the largest ``ModuleList`` in the model.
+        layer_groups: Transformer-block containers per role, each as candidate FQNs; the first
+            that resolves wins, so one spec covers several ``transformers`` module-tree layouts.
+            Roles are :data:`LAYER_ROLES`: ``"language"`` (the decoder stack), ``"vision"`` /
+            ``"audio"`` (encoder towers) and ``"backbone"`` (the single stack of a model that is
+            not a language model, e.g. a diffusion transformer). ``None`` derives the groups from
+            the blocks the model declares in ``_no_split_modules``: containers under
+            ``get_decoder()`` are ``language``, containers under a vision/audio tower take that
+            role. Declare only when that derivation is wrong or unavailable.
         sharded_output_only: Module FQNs whose plan entry is dropped unless it produces a sharded
             output, whatever the plan's source (declared, HuggingFace or user-supplied). A head
             whose forward combines its output with a sharded weight (e.g. weight-normalized
             logits) cannot take a replicated output, so it is left un-parallelized instead.
+        shard_by_dtype: Shard every transformer block with ``fully_shard_by_dtype`` instead of one
+            ``fully_shard`` call, so parameters the model pins to fp32 through
+            ``_keep_in_fp32_modules_strict`` (Mamba ``A_log`` / ``dt_bias``, GatedDeltaNet gates,
+            MoE correction biases) keep their own fp32 FSDP unit and compute in fp32 while the rest
+            of the block computes in the mixed-precision ``param_dtype``. Off by default: it changes
+            numerics for any model that stores some parameters in fp32.
         strategy: Whole-flow ``ParallelizationStrategy`` override; ``None`` uses the default.
     """
 
@@ -65,7 +79,13 @@ class ParallelSpec:
     sequence_parallel_plan: dict[str, ParallelStyle] | None = None
     layer_groups: dict[str, tuple[str, ...]] | None = None
     sharded_output_only: tuple[str, ...] = ()
+    shard_by_dtype: bool = False
     strategy: ParallelizationStrategy | None = None
+
+    def __post_init__(self) -> None:
+        unknown = set(self.layer_groups or ()) - set(LAYER_ROLES)
+        if unknown:
+            raise ValueError(f"Unknown layer_groups role(s) {sorted(unknown)}; expected one of {LAYER_ROLES}.")
 
     def resolved_tp_plan(self, sequence_parallel: bool = False) -> dict[str, ParallelStyle] | None:
         """The declared plan for one run: ``tp_plan`` with ``sequence_parallel_plan`` overlaid when requested.
@@ -95,3 +115,16 @@ class ParallelSpec:
 
         plan = get_hf_tp_shard_plan(model)
         return cls(tp_plan=plan) if plan else None
+
+
+_DEFAULT_SPEC = ParallelSpec()
+
+
+def query_parallel_spec(model: nn.Module) -> ParallelSpec:
+    """Return the :class:`ParallelSpec` declared on ``model``'s class, or the all-default spec.
+
+    Reads only the ``parallel_spec`` class attribute, which every wrapper subclass the loaders create
+    inherits; class names play no part.
+    """
+    spec = getattr(type(model), "parallel_spec", None)
+    return _DEFAULT_SPEC if spec is None else spec

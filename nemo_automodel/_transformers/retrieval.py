@@ -491,6 +491,9 @@ class BiEncoderModel(nn.Module):
     """Bi-encoder model that produces embeddings using a bidirectional backbone."""
 
     _TASK = "embedding"
+    # The wrapped encoder owns the transformer blocks and the parallelization contract; the parallelizer
+    # resolves layer groups through this transformers convention rather than by wrapper class name.
+    base_model_prefix = "model"
 
     def __init__(
         self,
@@ -702,6 +705,7 @@ class CrossEncoderModel(nn.Module):
     """Cross-encoder model for scoring/classification tasks."""
 
     _TASK = "score"
+    base_model_prefix = "model"
 
     def __init__(self, model: PreTrainedModel):
         super().__init__()

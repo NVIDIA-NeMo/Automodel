@@ -57,7 +57,6 @@ fsdp:
   pp_size: 1
   cpu_offload: false
   activation_checkpointing: true
-  use_hf_tp_plan: false
 
 # Matches the LTX-2.3 reference SFT recipe: plain uniform sigma in
 # [0.001, 0.999], no flow shift, no sigma loss weighting, no CFG dropout.

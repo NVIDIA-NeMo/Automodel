@@ -71,6 +71,17 @@ def test_remote_code_class_resolves_from_its_config_model_type():
     assert spec.tp_plan is not None
 
 
+def test_smolvlm_declares_the_layer_groups_its_no_split_modules_cannot_derive():
+    """transformers lists the vision *attention* module, not the encoder layer, so the vision group is declared."""
+    from transformers.models.smolvlm.modeling_smolvlm import SmolVLMForConditionalGeneration
+
+    spec = parallel_spec_for(SmolVLMForConditionalGeneration)
+    assert spec.layer_groups == {
+        "language": ("model.text_model.layers",),
+        "vision": ("model.vision_model.encoder.layers",),
+    }
+
+
 def test_classes_without_a_declaration_have_no_contract():
     assert parallel_spec_for(type("SomethingElseForCausalLM", (nn.Module,), {})) is None
     unknown_head = type("LlamaForOddHead", (nn.Module,), {"config_class": SimpleNamespace(model_type="llama")})

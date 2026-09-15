@@ -62,7 +62,6 @@ fsdp:
   pp_size: 1
   cpu_offload: false
   activation_checkpointing: true
-  use_hf_tp_plan: false
 
 flow_matching:
   adapter_type: "hunyuan"

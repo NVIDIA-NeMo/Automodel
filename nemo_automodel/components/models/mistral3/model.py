@@ -62,16 +62,6 @@ class Ministral3Config(PretrainedConfig):
 
     model_type = "ministral3"
     keys_to_ignore_at_inference = ["past_key_values"]
-    # Default tensor parallel plan for base model `MistralModel`
-    base_model_tp_plan = {
-        "layers.*.self_attn.q_proj": "colwise",
-        "layers.*.self_attn.k_proj": "colwise",
-        "layers.*.self_attn.v_proj": "colwise",
-        "layers.*.self_attn.o_proj": "rowwise",
-        "layers.*.mlp.gate_proj": "colwise",
-        "layers.*.mlp.up_proj": "colwise",
-        "layers.*.mlp.down_proj": "rowwise",
-    }
     base_model_pp_plan = {
         "embed_tokens": (["input_ids"], ["inputs_embeds"]),
         "layers": (["hidden_states", "attention_mask"], ["hidden_states"]),
@@ -548,7 +538,6 @@ class Ministral3ForCausalLM(HFCheckpointingMixin, Ministral3PreTrainedModel, Gen
     # the 3B's text_config tie flag reaches the VLM class, not this one.
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-    _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
     _supports_streaming_fp8_checkpoint_load = True
     parallel_spec: ParallelSpec = ParallelSpec(

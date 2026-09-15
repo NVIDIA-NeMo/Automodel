@@ -196,7 +196,12 @@ def _build_diffusion_parallel_manager_args(
         }
 
     fsdp_options = dict(fsdp_cfg or {})
-    ignored_options = {"use_hf_tp_plan": fsdp_options.pop("use_hf_tp_plan", False)}
+    if "use_hf_tp_plan" in fsdp_options:
+        fsdp_options.pop("use_hf_tp_plan")
+        logging.warning(
+            "distributed.use_hf_tp_plan has no effect and is ignored: the transformer's parallel_spec decides "
+            "the tensor-parallel plan (its HuggingFace _tp_plan is the fallback). Remove the option."
+        )
     # Diffusion-specific CP knobs (consumed by _enable_context_parallel, not the
     # shared distributed parser): how the cp axis splits into ring x ulysses.
     cp_ring_degree = int(fsdp_options.pop("cp_ring_degree", 1))
@@ -241,7 +246,6 @@ def _build_diffusion_parallel_manager_args(
         "ep_size": parsed["ep_size"],
         **parsed["strategy_config"].to_dict(),
         "activation_checkpointing": parsed["activation_checkpointing"],
-        **ignored_options,
     }
 
 

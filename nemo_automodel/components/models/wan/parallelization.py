@@ -12,148 +12,36 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""FSDP2/TP strategy for the diffusers ``WanTransformer3DModel``."""
+"""Parallelization contract for the diffusers ``WanTransformer3DModel``.
+
+Its blocks (``blocks``, declared in diffusers' ``_no_split_modules``) form the ``backbone`` layer group the
+parallelizer derives, so only the TP plan and the whole-block activation checkpointing are declared here.
+"""
 
 from __future__ import annotations
 
-import logging
-from collections.abc import Callable
+from torch.distributed.tensor.parallel import ColwiseParallel, ParallelStyle, RowwiseParallel
 
-import torch
-from torch import nn
-from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointImpl, checkpoint_wrapper
-from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.fsdp import MixedPrecisionPolicy, OffloadPolicy, fully_shard
-from torch.distributed.tensor.parallel import ColwiseParallel, ParallelStyle, RowwiseParallel, parallelize_module
-
-from nemo_automodel.components.distributed.mesh_utils import get_fsdp_dp_mesh
+from nemo_automodel.components.distributed.activation_checkpointing import ActivationCheckpointingSpec
 from nemo_automodel.components.distributed.parallel_spec import ParallelSpec
-from nemo_automodel.components.distributed.parallelizer import ParallelizationStrategy, apply_fsdp2_sharding_recursively
 
-logger = logging.getLogger(__name__)
-
-
-class WanParallelizationStrategy(ParallelizationStrategy):
-    """Parallelization strategy for Wan-style transformer modules used in Diffusers.
-
-    Applies TP to condition embedders, FFN projections in each block, and final projection,
-    then applies FSDP sharding similarly to other strategies.
-    """
-
-    def parallelize(
-        self,
-        model: nn.Module,
-        device_mesh: DeviceMesh,
-        mp_policy: MixedPrecisionPolicy | None = None,
-        offload_policy: OffloadPolicy | None = None,
-        sequence_parallel: bool = False,
-        activation_checkpointing: bool = False,
-        tp_shard_plan: dict[str, ParallelStyle] | str | None = None,
-        dp_replicate_mesh_name: str = "dp_replicate",
-        dp_shard_cp_mesh_name: str = "dp_shard_cp",
-        tp_mesh_name: str = "tp",
-        reapply_trainability: Callable[[nn.Module], None] | None = None,
-        **kwargs,
-    ) -> nn.Module:
-        # Not using custom tp_shard_plan; apply Wan-specific plan
-        tp_mesh = device_mesh[tp_mesh_name]
-        dp_mesh = get_fsdp_dp_mesh(device_mesh, dp_replicate_mesh_name, dp_shard_cp_mesh_name)
-
-        # Apply TP only when TP group size > 1
-        if tp_mesh.size() > 1:
-            # Condition embedders if present
-            try:
-                if hasattr(model, "condition_embedder"):
-                    cond = model.condition_embedder
-                    if hasattr(cond, "text_embedder"):
-                        cond.text_embedder = parallelize_module(
-                            cond.text_embedder,
-                            tp_mesh,
-                            {
-                                "linear_1": ColwiseParallel(),
-                                "linear_2": RowwiseParallel(),
-                            },
-                        )
-                    if hasattr(cond, "time_embedder"):
-                        cond.time_embedder = parallelize_module(
-                            cond.time_embedder,
-                            tp_mesh,
-                            {
-                                "linear_1": ColwiseParallel(),
-                                "linear_2": RowwiseParallel(),
-                            },
-                        )
-                    if hasattr(cond, "time_proj"):
-                        cond.time_proj = parallelize_module(
-                            cond.time_proj,
-                            tp_mesh,
-                            {"": ColwiseParallel()},
-                        )
-            except Exception as e:
-                logger.warning(f"Wan strategy: failed to TP condition embedders: {e}")
-
-            # Blocks FFN and final projection
-            try:
-                if hasattr(model, "blocks"):
-                    for block in model.blocks:
-                        if hasattr(block, "ffn"):
-                            block.ffn = parallelize_module(
-                                block.ffn,
-                                tp_mesh,
-                                {
-                                    "net.0.proj": ColwiseParallel(),
-                                    "net.2": RowwiseParallel(),
-                                },
-                            )
-                if hasattr(model, "proj_out"):
-                    model.proj_out = parallelize_module(model.proj_out, tp_mesh, {"": RowwiseParallel()})
-            except Exception as e:
-                logger.warning(f"Wan strategy: failed to TP blocks/proj_out: {e}")
-
-        # Activation checkpointing wraps every WanTransformerBlock so its
-        # forward activations are recomputed on backward instead of being
-        # held in memory. Critical for Wan2.2-A14B (14B params, ~30k-token
-        # video sequence) — without this, fp32 layer-norm casts in the block
-        # forward will OOM even on 8x80GB H100.
-        if activation_checkpointing and hasattr(model, "blocks"):
-            for idx in range(len(model.blocks)):
-                model.blocks[idx] = checkpoint_wrapper(
-                    model.blocks[idx],
-                    checkpoint_impl=CheckpointImpl.NO_REENTRANT,
-                )
-
-        # Mixed precision default like Default strategy
-        if not mp_policy:
-            mp_policy = MixedPrecisionPolicy(
-                param_dtype=torch.bfloat16,
-                reduce_dtype=torch.float32,
-                output_dtype=torch.float32,
-            )
-
-        if reapply_trainability is not None:
-            reapply_trainability(model)
-
-        # Apply FSDP sharding recursively and to root
-        apply_fsdp2_sharding_recursively(
-            model,
-            dp_mesh,
-            mp_policy,
-            offload_policy,
-            kwargs.get("enable_fsdp2_prefetch", True),
-            kwargs.get("fsdp2_backward_prefetch_depth", 2),
-            kwargs.get("fsdp2_forward_prefetch_depth", 1),
-        )
-
-        return fully_shard(
-            model,
-            mesh=dp_mesh,
-            mp_policy=mp_policy,
-            offload_policy=offload_policy,
-            reshard_after_forward=False,
-        )
+# Condition embedders, the FFN of every block and the final projection; attention stays replicated.
+WAN_TP_PLAN: dict[str, ParallelStyle] = {
+    "condition_embedder.text_embedder.linear_1": ColwiseParallel(),
+    "condition_embedder.text_embedder.linear_2": RowwiseParallel(),
+    "condition_embedder.time_embedder.linear_1": ColwiseParallel(),
+    "condition_embedder.time_embedder.linear_2": RowwiseParallel(),
+    "condition_embedder.time_proj": ColwiseParallel(),
+    "blocks.*.ffn.net.0.proj": ColwiseParallel(),
+    "blocks.*.ffn.net.2": RowwiseParallel(),
+    "proj_out": RowwiseParallel(),
+}
 
 
 class WanTransformer3DModel:
     """Contract for the diffusers ``WanTransformer3DModel``; bound by the diffusion pipeline before sharding."""
 
-    parallel_spec: ParallelSpec = ParallelSpec(strategy=WanParallelizationStrategy())
+    parallel_spec: ParallelSpec = ParallelSpec(tp_plan=WAN_TP_PLAN)
+    # Every block is recomputed on backward as one unit: with ~30k video tokens (Wan2.2-A14B) the fp32
+    # layer-norm casts inside a block OOM even on 8x80GB when only its submodules are checkpointed.
+    activation_checkpointing_spec: ActivationCheckpointingSpec = ActivationCheckpointingSpec(granularity="layer")

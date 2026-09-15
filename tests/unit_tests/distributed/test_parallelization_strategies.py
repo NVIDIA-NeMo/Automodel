@@ -25,9 +25,13 @@ import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor.parallel import ColwiseParallel
 
-import nemo_automodel.components.models.nemotron_v3.parallelization as nemotron_parallelization
+from nemo_automodel._transformers.model_init import bind_model_specs
 from nemo_automodel.components.distributed import parallelizer as parallelizer_mod
-from nemo_automodel.components.distributed.activation_checkpointing import sdpa_backend_snapshot_context_fn
+from nemo_automodel.components.distributed.activation_checkpointing import (
+    apply_full_layer_checkpointing_to_layers,
+    query_activation_checkpointing_spec,
+    sdpa_backend_snapshot_context_fn,
+)
 from nemo_automodel.components.distributed.parallel_spec import ParallelSpec
 from nemo_automodel.components.distributed.parallelizer import (
     _DEFAULT_STRATEGY,
@@ -35,24 +39,28 @@ from nemo_automodel.components.distributed.parallelizer import (
     ParallelizationStrategy,
     _extract_model_layers,
     fsdp2_strategy_parallelize,
+    get_model_layer_groups,
     get_parallelization_strategy,
 )
-from nemo_automodel.components.models.hunyuan_video15.parallelization import HunyuanParallelizationStrategy
+from nemo_automodel.components.models.hunyuan_video15.parallelization import HunyuanVideo15Transformer3DModel
+from nemo_automodel.components.models.ltx2_video.parallelization import LTX2VideoTransformer3DModel
 from nemo_automodel.components.models.nemotron_nas import parallelization as nas_parallelization
 from nemo_automodel.components.models.nemotron_nas.parallelization import (
     NemotronNASParallelizationStrategy,
     validate_tp_mesh_for_nemotron_nas,
 )
 from nemo_automodel.components.models.nemotron_v3.parallelization import (
+    NEMOTRON_H_ACTIVATION_CHECKPOINTING_SPEC,
     NEMOTRON_H_PARALLEL_SPEC,
+    NEMOTRON_H_TP_PLAN,
     NemotronHParallelizationStrategy,
-    _nemotronh_decoder_blocks,
 )
-from nemo_automodel.components.models.qwen3_5.parallelization import Qwen3_5ParallelizationStrategy
-
-# Import the components under test
-from nemo_automodel.components.models.qwen_image import parallelization as qwen_image_parallelization
-from nemo_automodel.components.models.wan.parallelization import WanParallelizationStrategy
+from nemo_automodel.components.models.qwen3_5.parallelization import (
+    QWEN3_5_PARALLEL_SPEC,
+    Qwen3_5ParallelizationStrategy,
+)
+from nemo_automodel.components.models.qwen_image.parallelization import QwenImageTransformer2DModel
+from nemo_automodel.components.models.wan.parallelization import WAN_TP_PLAN, WanTransformer3DModel
 
 
 class MockModel(nn.Module):
@@ -127,6 +135,7 @@ class MockNemotronHModel(nn.Module):
         self.backbone = MockBackbone()
         self.__class__.__name__ = "NemotronHForCausalLM"
         self.__class__.parallel_spec = NEMOTRON_H_PARALLEL_SPEC
+        self.__class__.activation_checkpointing_spec = NEMOTRON_H_ACTIVATION_CHECKPOINTING_SPEC
 
     def forward(self, x):
         return x
@@ -151,6 +160,7 @@ class MockNemotronV3Model(nn.Module):
         self.model = MockInner()
         self.__class__.__name__ = "NemotronHForCausalLM"
         self.__class__.parallel_spec = NEMOTRON_H_PARALLEL_SPEC
+        self.__class__.activation_checkpointing_spec = NEMOTRON_H_ACTIVATION_CHECKPOINTING_SPEC
 
     def forward(self, x):
         return x
@@ -162,15 +172,13 @@ class TestNemotronHLayoutResolution:
     (``ModuleList``) and the native Nemotron-V3 model exposes ``model.layers``
     (``ModuleDict``)."""
 
-    def test_helper_hf_backbone_modulelist(self):
-        container, blocks = _nemotronh_decoder_blocks(MockNemotronHModel())
-        assert isinstance(container, nn.ModuleList)
-        assert len(blocks) == 2
+    def test_layer_groups_hf_backbone_modulelist(self):
+        model = MockNemotronHModel()
+        assert get_model_layer_groups(model) == {"language": list(model.backbone.layers)}
 
-    def test_helper_native_model_moduledict(self):
-        container, blocks = _nemotronh_decoder_blocks(MockNemotronV3Model(num_layers=4))
-        assert isinstance(container, nn.ModuleDict)
-        assert len(blocks) == 4  # ordered values of the ModuleDict
+    def test_layer_groups_native_model_moduledict(self):
+        model = MockNemotronV3Model(num_layers=4)
+        assert get_model_layer_groups(model) == {"language": list(model.model.layers.values())}
 
     def test_extract_model_layers_native_has_no_backbone(self):
         # Regression for AM-448: the registry still lists "backbone.layers", but the native
@@ -259,8 +267,8 @@ def mock_distributed_env(monkeypatch):
         raising=False,
     )
 
-    # Mock _get_parallel_plan
-    get_plan_mock = MagicMock(return_value={"test.layer": ColwiseParallel()})
+    # Mock _get_parallel_plan with a head-sharding plan (validation is skipped for plans that keep heads whole).
+    get_plan_mock = MagicMock(return_value={"model.layers.*.self_attn.q_proj": ColwiseParallel()})
     monkeypatch.setattr(
         "nemo_automodel.components.distributed.parallelizer._get_parallel_plan", get_plan_mock, raising=False
     )
@@ -466,6 +474,19 @@ class TestDefaultParallelizationStrategy:
         mock_distributed_env["get_plan"].assert_called_once()
         mock_distributed_env["parallelize_module"].assert_called_once()
 
+    def test_tp_validation_is_skipped_when_the_plan_keeps_heads_whole(
+        self, strategy, mock_device_mesh, mock_distributed_env
+    ):
+        """Head counts constrain the TP size only when attention is sharded across heads."""
+        mesh, _, _, tp_mesh = mock_device_mesh
+        tp_mesh.size.return_value = 2
+        mock_distributed_env["get_plan"].return_value = {"model.layers.*.mlp.up_proj": ColwiseParallel()}
+
+        strategy.parallelize(model=MockModel(), device_mesh=mesh)
+
+        mock_distributed_env["validate_tp"].assert_not_called()
+        mock_distributed_env["parallelize_module"].assert_called_once()
+
     def test_trainability_rebind_runs_after_tp_and_before_fsdp(self, strategy, mock_device_mesh, mock_distributed_env):
         """FSDP captures the selector result on the post-TP hierarchy."""
         mesh, _, _, tp_mesh = mock_device_mesh
@@ -661,11 +682,11 @@ class TestNemotronHParallelizationStrategy:
         cp_stream = object()
         monkeypatch.setattr(parallelizer_mod.torch.distributed, "get_process_group_ranks", get_cp_ranks)
         monkeypatch.setattr(parallelizer_mod.torch.cuda, "Stream", lambda: cp_stream)
-        monkeypatch.setattr(nemotron_parallelization, "fully_shard", lambda model, **_kwargs: model)
+        monkeypatch.setattr(parallelizer_mod, "fully_shard", lambda model, **_kwargs: model)
         monkeypatch.setattr(
             parallelizer_mod.parallelizer_utils,
             "fully_shard_by_dtype",
-            lambda model, **_kwargs: model,
+            lambda model, *_args, **_kwargs: model,
         )
 
         strategy.parallelize(model=nemotron_model, device_mesh=mesh)
@@ -795,56 +816,37 @@ class TestNemotronHParallelizationStrategy:
                 sequence_parallel=True,
             )
 
-    @patch("nemo_automodel.components.models.nemotron_v3.parallelization.fully_shard")
-    @patch("nemo_automodel.components.distributed.parallelizer_utils.fully_shard_by_dtype")
-    def test_custom_tp_plan_not_supported(
-        self,
-        fully_shard,
-        fully_shard_by_dtype,
-        strategy,
-        mock_device_mesh,
-        nemotron_model,
-        monkeypatch,
-        mock_distributed_env,
+    def test_custom_tp_plan_is_applied_by_the_shared_flow(
+        self, strategy, mock_device_mesh, nemotron_model, mock_distributed_env
     ):
-        """Test that passing a custom plan logs info and proceeds (no exception)."""
-        mesh, _, _, _ = mock_device_mesh
-        fully_shard.side_effect = lambda model, **kwargs: model
-        fully_shard_by_dtype.side_effect = lambda model, **kwargs: model
-        # Ensure logger is enabled; capture logs
-        import logging
+        """A user plan is honoured exactly as for any other model."""
+        mesh, _, _, tp_mesh = mock_device_mesh
+        tp_mesh.size.return_value = 2
+        custom_plan = {"test": ColwiseParallel()}
 
-        logger = logging.getLogger(nemotron_parallelization.__name__)
-        old_level = logger.level
-        logger.setLevel(logging.DEBUG)
-        try:
-            result = strategy.parallelize(
-                model=nemotron_model,
-                device_mesh=mesh,
-                tp_shard_plan={"test": ColwiseParallel()},
-            )
-            assert result is nemotron_model
-        finally:
-            logger.setLevel(old_level)
+        result = strategy.parallelize(model=nemotron_model, device_mesh=mesh, tp_shard_plan=custom_plan)
+
+        assert result is nemotron_model
+        assert mock_distributed_env["get_plan"].call_args.args[2] is custom_plan
 
     @pytest.mark.parametrize("tp_size", [1, 2])
-    @patch("nemo_automodel.components.models.nemotron_v3.parallelization.parallelize_module")
-    @patch("nemo_automodel.components.models.nemotron_v3.parallelization.fully_shard")
+    @patch("nemo_automodel.components.distributed.parallelizer.parallelize_module")
+    @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
     @patch("nemo_automodel.components.distributed.parallelizer_utils.fully_shard_by_dtype")
     def test_nemotron_specific_parallelization(
         self,
-        fully_shard,
         fully_shard_by_dtype,
+        fully_shard,
         mock_parallelize_module,
         strategy,
         mock_device_mesh,
         nemotron_model,
         tp_size,
     ):
-        """Test NemotronH-specific parallelization logic for tp_size 1 and 2."""
+        """The declared MLP-only plan is applied once and every block is sharded dtype-aware."""
         mesh, _, dp_shard_mesh, tp_mesh = mock_device_mesh
         fully_shard.side_effect = lambda model, **kwargs: model
-        fully_shard_by_dtype.side_effect = lambda model, **kwargs: model
+        fully_shard_by_dtype.side_effect = lambda model, *args, **kwargs: model
         tp_mesh.size.return_value = tp_size
 
         strategy.parallelize(
@@ -854,20 +856,20 @@ class TestNemotronHParallelizationStrategy:
         )
 
         if tp_size == 1:
-            # No TP parallelization when tp_size == 1
             assert mock_parallelize_module.call_count == 0
         else:
-            # Should call parallelize_module for model-level TP plan
-            expected_calls = (
-                len([layer for layer in nemotron_model.backbone.layers if layer.block_type == "mlp"]) + 1
-            )  # +1 for model level
-            assert mock_parallelize_module.call_count == expected_calls
+            mock_parallelize_module.assert_called_once()
+            applied_plan = mock_parallelize_module.call_args.args[2]
+            assert set(applied_plan) == set(NEMOTRON_H_TP_PLAN)
+            assert "backbone.layers.*.mixer.up_proj" in applied_plan
+            assert "model.layers.*.mixer.down_proj" in applied_plan
 
-        # Should call fully_shard for each layer and the root model regardless of TP size
-        expected_fully_shard_calls = len(nemotron_model.backbone.layers) + 1  # +1 for root
-        assert fully_shard_by_dtype.call_count + fully_shard.call_count == expected_fully_shard_calls
+        # Every decoder block is sharded by dtype (``shard_by_dtype``), the root by ``fully_shard``.
+        assert fully_shard_by_dtype.call_count == len(nemotron_model.backbone.layers)
+        assert [c.args[0] for c in fully_shard_by_dtype.call_args_list] == list(nemotron_model.backbone.layers)
+        assert fully_shard.call_count == 1
 
-    @patch("nemo_automodel.components.models.nemotron_v3.parallelization.fully_shard")
+    @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
     @patch("nemo_automodel.components.distributed.parallelizer_utils.fully_shard_by_dtype")
     def test_threads_reshard_after_forward_to_layer_sharding(
         self,
@@ -880,7 +882,7 @@ class TestNemotronHParallelizationStrategy:
         """Nemotron layers must honor explicit FSDP reshard overrides."""
         mesh, _, _, _ = mock_device_mesh
         fully_shard.side_effect = lambda model, **kwargs: model
-        fully_shard_by_dtype.side_effect = lambda model, **kwargs: model
+        fully_shard_by_dtype.side_effect = lambda model, *args, **kwargs: model
 
         strategy.parallelize(
             model=nemotron_model,
@@ -889,33 +891,36 @@ class TestNemotronHParallelizationStrategy:
             reshard_after_forward=True,
         )
 
+        assert fully_shard_by_dtype.call_count == len(nemotron_model.backbone.layers)
         for call_args in fully_shard_by_dtype.call_args_list:
             assert call_args.kwargs["reshard_after_forward"] is True
 
-    @patch("nemo_automodel.components.models.nemotron_v3.parallelization.checkpoint_wrapper")
-    @patch("nemo_automodel.components.models.nemotron_v3.parallelization.fully_shard")
+    @patch("nemo_automodel.components.distributed.activation_checkpointing.checkpoint_wrapper")
+    @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
     @patch("nemo_automodel.components.distributed.parallelizer_utils.fully_shard_by_dtype")
-    @patch("nemo_automodel.components.models.nemotron_v3.parallelization.parallelize_module")
     def test_activation_checkpointing(
         self,
-        mock_parallelize,
-        mock_fully_shard,
         mock_fully_shard_by_dtype,
+        mock_fully_shard,
         mock_checkpoint,
         strategy,
         mock_device_mesh,
         nemotron_model,
     ):
-        """Test activation checkpointing for NemotronH models."""
+        """Whole MLP and Mamba blocks are checkpointed; attention blocks are left unwrapped."""
         mesh, _, dp_shard_mesh, tp_mesh = mock_device_mesh
         mock_fully_shard.side_effect = lambda model, **kwargs: model
-        mock_fully_shard_by_dtype.side_effect = lambda model, **kwargs: model
-        mock_checkpoint.side_effect = lambda x: x
+        mock_fully_shard_by_dtype.side_effect = lambda model, *args, **kwargs: model
+        mock_checkpoint.side_effect = lambda x, **_kwargs: x
 
-        # Add a mamba layer to test mamba checkpointing
         mamba_layer = nn.Module()
-        setattr(mamba_layer, "block_type", "mamba")
+        mamba_layer.block_type = "mamba"
+        mamba_layer.mixer = nn.Linear(10, 10)
+        attention_layer = nn.Module()
+        attention_layer.block_type = "attention"
+        attention_layer.mixer = nn.Linear(10, 10)
         nemotron_model.backbone.layers.append(mamba_layer)
+        nemotron_model.backbone.layers.append(attention_layer)
 
         strategy.parallelize(
             model=nemotron_model,
@@ -923,9 +928,11 @@ class TestNemotronHParallelizationStrategy:
             activation_checkpointing=True,
         )
 
-        # Should apply checkpoint wrapper to both MLP and Mamba layers
-        expected_checkpoint_calls = 3  # 2 MLP (from MockNemotronHModel) + 1 Mamba layer
-        assert mock_checkpoint.call_count == expected_checkpoint_calls
+        wrapped = [c.args[0] for c in mock_checkpoint.call_args_list]
+        assert len(wrapped) == 3  # 2 MLP (from MockNemotronHModel) + 1 Mamba layer
+        assert mamba_layer in wrapped
+        assert attention_layer not in wrapped
+        assert all(c.kwargs["checkpoint_impl"] is not None for c in mock_checkpoint.call_args_list)
 
 
 class TestQwen3_5ParallelizationStrategy:
@@ -966,6 +973,8 @@ class TestQwen3_5ParallelizationStrategy:
                 self.vision_tower.layers = nn.ModuleList([nn.Linear(10, 10)])
 
         class MockQwen35Model(nn.Module):
+            parallel_spec = QWEN3_5_PARALLEL_SPEC
+
             def __init__(self):
                 super().__init__()
                 self.config = SimpleNamespace(num_attention_heads=8, num_key_value_heads=8, hidden_size=64)
@@ -994,6 +1003,37 @@ class TestQwen3_5ParallelizationStrategy:
             assert root_kwargs["ignored_params"] == frozen_vision_params
         else:
             assert "ignored_params" not in root_kwargs
+
+    def test_spec_opts_into_dtype_aware_sharding_with_the_default_flow(self):
+        assert QWEN3_5_PARALLEL_SPEC.shard_by_dtype is True
+        assert QWEN3_5_PARALLEL_SPEC.tp_plan is None
+        assert QWEN3_5_PARALLEL_SPEC.layer_groups is None
+        assert isinstance(QWEN3_5_PARALLEL_SPEC.strategy, DefaultParallelizationStrategy)
+
+    @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
+    @patch("nemo_automodel.components.distributed.parallelizer_utils.fully_shard_by_dtype")
+    def test_hands_the_cp_mesh_to_the_model_after_the_default_flow(
+        self, fully_shard_by_dtype, fully_shard, strategy, mock_device_mesh, monkeypatch
+    ):
+        mesh, dp_replicate_mesh, dp_shard_mesh, tp_mesh = mock_device_mesh
+        cp_mesh = MagicMock()
+        cp_mesh.size.return_value = 2
+        mesh.mesh_dim_names = ("dp_replicate", "dp_shard_cp", "cp", "tp")
+        mesh.__getitem__.side_effect = lambda key: {
+            "dp_replicate": dp_replicate_mesh,
+            "dp_shard_cp": dp_shard_mesh,
+            "cp": cp_mesh,
+            "tp": tp_mesh,
+            ("dp_replicate", "dp_shard_cp"): dp_shard_mesh,
+        }[key]
+        fully_shard.side_effect = lambda model, **kwargs: model
+        fully_shard_by_dtype.side_effect = lambda model, *args, **kwargs: model
+        monkeypatch.setattr(parallelizer_mod.parallelizer_utils, "configure_fsdp_unused_param_reduction", lambda m: 0)
+
+        model = MockModel("Qwen3_5ForCausalLM")
+        strategy.parallelize(model=model, device_mesh=mesh)
+
+        assert model.cp_mesh is cp_mesh
 
 
 class TestStrategyRegistry:
@@ -1032,12 +1072,8 @@ class TestStrategyRegistry:
         assert strategy is _DEFAULT_STRATEGY
 
 
-class TestWanParallelizationStrategy:
-    """Tests for WanParallelizationStrategy."""
-
-    @pytest.fixture
-    def wan_strategy(self):
-        return WanParallelizationStrategy()
+class TestWanDeclaration:
+    """The diffusers Wan transformer declares a TP plan and whole-block checkpointing; the shared flow applies them."""
 
     @pytest.fixture
     def wan_model(self):
@@ -1048,218 +1084,139 @@ class TestWanParallelizationStrategy:
                 self.time_embedder = nn.Linear(8, 8)
                 self.time_proj = nn.Linear(8, 8)
 
-        class Block(nn.Module):
+        class WanTransformerBlock(nn.Module):
             def __init__(self):
                 super().__init__()
                 self.ffn = nn.Linear(8, 8)
 
         class WanModel(nn.Module):
+            _no_split_modules = ["WanTransformerBlock"]
+            parallel_spec = WanTransformer3DModel.parallel_spec
+            activation_checkpointing_spec = WanTransformer3DModel.activation_checkpointing_spec
+
             def __init__(self):
                 super().__init__()
                 self.condition_embedder = ConditionEmbedder()
-                self.blocks = nn.ModuleList([Block(), Block()])
+                self.blocks = nn.ModuleList([WanTransformerBlock(), WanTransformerBlock()])
                 self.proj_out = nn.Linear(8, 8)
 
         return WanModel()
 
     @pytest.fixture
-    def mesh_tp1(self):
+    def mesh_tp2(self):
         mesh = MagicMock()
+        mesh.mesh_dim_names = ("dp_replicate", "dp_shard_cp", "tp")
+        tp_mesh = MagicMock()
+        tp_mesh.size.return_value = 2
+        dp_mesh = MagicMock()
+        dp_mesh.mesh_dim_names = ("dp_replicate", "dp_shard_cp")
+        mesh.__getitem__.side_effect = lambda key: {
+            "tp": tp_mesh,
+            ("dp_replicate", "dp_shard_cp"): dp_mesh,
+        }[key]
+        return mesh, dp_mesh, tp_mesh
+
+    def test_declares_the_plan_and_whole_block_checkpointing_only(self):
+        spec = WanTransformer3DModel.parallel_spec
+        assert spec.tp_plan is WAN_TP_PLAN
+        assert spec.strategy is None and spec.layer_groups is None
+        assert set(WAN_TP_PLAN) == {
+            "condition_embedder.text_embedder.linear_1",
+            "condition_embedder.text_embedder.linear_2",
+            "condition_embedder.time_embedder.linear_1",
+            "condition_embedder.time_embedder.linear_2",
+            "condition_embedder.time_proj",
+            "blocks.*.ffn.net.0.proj",
+            "blocks.*.ffn.net.2",
+            "proj_out",
+        }
+        assert WanTransformer3DModel.activation_checkpointing_spec.granularity == "layer"
+
+    def test_blocks_form_the_backbone_layer_group(self, wan_model):
+        assert get_model_layer_groups(wan_model) == {"backbone": list(wan_model.blocks)}
+
+    def test_shared_flow_applies_the_declared_plan_without_head_validation(self, wan_model, mesh_tp2, monkeypatch):
+        mesh, dp_mesh, tp_mesh = mesh_tp2
+        parallelize_module_mock = MagicMock()
+        validate_tp_mock = MagicMock()
+        apply_fsdp_mock = MagicMock()
+        monkeypatch.setattr(parallelizer_mod, "parallelize_module", parallelize_module_mock)
+        monkeypatch.setattr(parallelizer_mod, "validate_tp_mesh", validate_tp_mock)
+        monkeypatch.setattr(parallelizer_mod, "apply_fsdp2_sharding_recursively", apply_fsdp_mock)
+        monkeypatch.setattr(parallelizer_mod, "fully_shard", lambda model, **_kwargs: model)
+
+        result = fsdp2_strategy_parallelize(model=wan_model, device_mesh=mesh)
+
+        assert result is wan_model
+        parallelize_module_mock.assert_called_once()
+        applied_model, applied_mesh, applied_plan = parallelize_module_mock.call_args.args
+        assert applied_model is wan_model and applied_mesh is tp_mesh
+        assert set(applied_plan) == set(WAN_TP_PLAN)
+        # The plan shards no attention heads, so the head-count check does not apply.
+        validate_tp_mock.assert_not_called()
+        assert apply_fsdp_mock.call_args.args[:2] == (wan_model, dp_mesh)
+
+
+class TestDiffusersBlockCheckpointingDeclarations:
+    """Hunyuan-1.5 and LTX-2 only declare whole-block checkpointing; the shared flow wraps their blocks."""
+
+    def test_hunyuan_declares_only_whole_block_checkpointing(self):
+        assert not hasattr(HunyuanVideo15Transformer3DModel, "parallel_spec")
+        assert HunyuanVideo15Transformer3DModel.activation_checkpointing_spec.granularity == "layer"
+
+    def test_ltx2_names_its_block_container_and_whole_block_checkpointing(self):
+        # diffusers declares no ``_no_split_modules`` for LTX-2, so the container is declared.
+        assert LTX2VideoTransformer3DModel.parallel_spec.layer_groups == {"backbone": ("transformer_blocks",)}
+        assert LTX2VideoTransformer3DModel.activation_checkpointing_spec.granularity == "layer"
+
+    def test_shared_flow_wraps_whole_blocks_and_threads_prefetch_options(self, monkeypatch):
+        class HunyuanVideo15TransformerBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attn = nn.Linear(2, 2)
+
+        class HunyuanModel(nn.Module):
+            _no_split_modules = ["HunyuanVideo15TransformerBlock"]
+            activation_checkpointing_spec = HunyuanVideo15Transformer3DModel.activation_checkpointing_spec
+
+            def __init__(self):
+                super().__init__()
+                self.transformer_blocks = nn.ModuleList(
+                    [HunyuanVideo15TransformerBlock(), HunyuanVideo15TransformerBlock()]
+                )
+
+        model = HunyuanModel()
+        mesh = MagicMock()
+        mesh.mesh_dim_names = ("dp_replicate", "dp_shard_cp", "tp")
         tp_mesh = MagicMock()
         tp_mesh.size.return_value = 1
         dp_mesh = MagicMock()
-        mesh.__getitem__.side_effect = lambda key: {
-            "tp": tp_mesh,
-            ("dp_replicate", "dp_shard_cp"): dp_mesh,
-        }[key]
-        return mesh, dp_mesh, tp_mesh
-
-    @pytest.fixture
-    def mesh_tp2(self):
-        mesh = MagicMock()
-        tp_mesh = MagicMock()
-        tp_mesh.size.return_value = 2
-        dp_mesh = MagicMock()
-        mesh.__getitem__.side_effect = lambda key: {
-            "tp": tp_mesh,
-            ("dp_replicate", "dp_shard_cp"): dp_mesh,
-        }[key]
-        return mesh, dp_mesh, tp_mesh
-
-    def _mock_env(self, monkeypatch, dp_mesh_sentinel=None):
-        # Mock get_fsdp_dp_mesh to return the known dp_mesh sentinel from the fixture,
-        # so we can assert the correct mesh is forwarded to apply_fsdp.
-        if dp_mesh_sentinel is not None:
-            monkeypatch.setattr(
-                "nemo_automodel.components.models.wan.parallelization.get_fsdp_dp_mesh",
-                lambda mesh, *a, **kw: dp_mesh_sentinel,
-            )
-
-        fully_shard_mock = MagicMock(side_effect=lambda model, **kwargs: model)
-        monkeypatch.setattr(
-            "nemo_automodel.components.models.wan.parallelization.fully_shard",
-            fully_shard_mock,
-            raising=False,
-        )
-
-        apply_fsdp_mock = MagicMock()
-        monkeypatch.setattr(
-            "nemo_automodel.components.models.wan.parallelization.apply_fsdp2_sharding_recursively",
-            apply_fsdp_mock,
-            raising=False,
-        )
-
-        parallelize_module_mock = MagicMock(side_effect=lambda module, *_args, **_kwargs: module)
-        monkeypatch.setattr(
-            "nemo_automodel.components.models.wan.parallelization.parallelize_module",
-            parallelize_module_mock,
-            raising=False,
-        )
-
-        return {
-            "fully_shard": fully_shard_mock,
-            "apply_fsdp": apply_fsdp_mock,
-            "parallelize_module": parallelize_module_mock,
-        }
-
-    def test_no_tp_when_group_size_is_one(self, wan_strategy, wan_model, mesh_tp1, monkeypatch):
-        mesh, dp_mesh, tp_mesh = mesh_tp1
-        env = self._mock_env(monkeypatch, dp_mesh_sentinel=dp_mesh)
-
-        result = wan_strategy.parallelize(model=wan_model, device_mesh=mesh)
-
-        # No TP calls when tp size == 1
-        env["parallelize_module"].assert_not_called()
-        # FSDP still applies
-        env["apply_fsdp"].assert_called_once()
-        env["fully_shard"].assert_called()
-        assert result is wan_model
-
-    def test_tp_applied_to_condition_blocks_and_proj(self, wan_strategy, wan_model, mesh_tp2, monkeypatch):
-        mesh, dp_mesh, tp_mesh = mesh_tp2
-        env = self._mock_env(monkeypatch, dp_mesh_sentinel=dp_mesh)
-
-        result = wan_strategy.parallelize(model=wan_model, device_mesh=mesh)
-
-        # parallelize_module should be called for text_embedder, time_embedder, time_proj, each block.ffn, and proj_out
-        # There are 2 blocks with ffn → 2 calls + 3 condition embedder + 1 proj_out = 6
-        assert env["parallelize_module"].call_count == 6
-        # FSDP applied with the correct dp_mesh
-        from unittest.mock import ANY
-
-        env["apply_fsdp"].assert_called_once_with(wan_model, dp_mesh, ANY, None, True, 2, 1)
-        env["fully_shard"].assert_called()
-        assert result is wan_model
-
-    def test_exceptions_in_tp_paths_are_logged_and_ignored(
-        self, wan_strategy, wan_model, mesh_tp2, monkeypatch, caplog
-    ):
-        mesh, dp_mesh, tp_mesh = mesh_tp2
-        self._mock_env(monkeypatch, dp_mesh_sentinel=dp_mesh)
-
-        # Make parallelize_module raise once to hit logging branches
-        calls = {"count": 0}
-
-        def flaky_parallelize(module, *_args, **_kwargs):
-            calls["count"] += 1
-            if calls["count"] == 1:
-                raise RuntimeError("boom")
-            return module
-
-        flaky_mock = MagicMock(side_effect=flaky_parallelize)
-        monkeypatch.setattr(
-            "nemo_automodel.components.models.wan.parallelization.parallelize_module",
-            flaky_mock,
-            raising=False,
-        )
-
-        caplog.set_level(logging.WARNING)
-        result = wan_strategy.parallelize(model=wan_model, device_mesh=mesh)
-
-        # We should have logged a warning from one of the try/excepts
-        assert "Wan strategy: failed" in caplog.text
-        # Continue to finish and shard
-        assert result is wan_model
-
-    def test_custom_mesh_names(self, wan_strategy, wan_model, monkeypatch):
-        mesh = MagicMock()
-        mesh.mesh_dim_names = ("custom_dp_repl", "custom_dp_shard", "custom_tp")
-        tp_mesh = MagicMock()
-        tp_mesh.size.return_value = 2
-        dp_mesh = MagicMock()
-        env = self._mock_env(monkeypatch, dp_mesh_sentinel=dp_mesh)
-        mesh.__getitem__.side_effect = lambda key: {
-            "custom_tp": tp_mesh,
-            ("custom_dp_repl", "custom_dp_shard"): dp_mesh,
-        }[key]
-
-        result = wan_strategy.parallelize(
-            model=wan_model,
-            device_mesh=mesh,
-            dp_replicate_mesh_name="custom_dp_repl",
-            dp_shard_cp_mesh_name="custom_dp_shard",
-            tp_mesh_name="custom_tp",
-        )
-
-        # Ensure FSDP used the dp_mesh we provided via custom names
-        from unittest.mock import ANY
-
-        env["apply_fsdp"].assert_called_once_with(wan_model, dp_mesh, ANY, None, True, 2, 1)
-        assert result is wan_model
-
-
-class TestHunyuanParallelizationStrategy:
-    """Tests for HunyuanParallelizationStrategy."""
-
-    @pytest.fixture
-    def hunyuan_strategy(self):
-        return HunyuanParallelizationStrategy()
-
-    @pytest.fixture
-    def hunyuan_model(self):
-        model = nn.Module()
-        model.transformer_blocks = nn.ModuleList([nn.Linear(2, 2), nn.Linear(2, 2)])
-        return model
-
-    def test_passes_prefetch_options_to_recursive_fsdp(self, hunyuan_strategy, hunyuan_model, monkeypatch):
-        mesh = MagicMock()
-        dp_mesh = MagicMock()
-        monkeypatch.setattr(
-            "nemo_automodel.components.models.hunyuan_video15.parallelization.get_fsdp_dp_mesh",
-            lambda *_args, **_kwargs: dp_mesh,
-        )
+        dp_mesh.mesh_dim_names = ("dp_replicate", "dp_shard_cp")
+        mesh.__getitem__.side_effect = lambda key: {"tp": tp_mesh, ("dp_replicate", "dp_shard_cp"): dp_mesh}[key]
         checkpoint_wrapper_mock = MagicMock(side_effect=lambda module, **_kwargs: module)
         apply_fsdp_mock = MagicMock()
         fully_shard_mock = MagicMock(side_effect=lambda model, **_kwargs: model)
         monkeypatch.setattr(
-            "nemo_automodel.components.models.hunyuan_video15.parallelization.checkpoint_wrapper",
+            "nemo_automodel.components.distributed.activation_checkpointing.checkpoint_wrapper",
             checkpoint_wrapper_mock,
-            raising=False,
         )
-        monkeypatch.setattr(
-            "nemo_automodel.components.models.hunyuan_video15.parallelization.apply_fsdp2_sharding_recursively",
-            apply_fsdp_mock,
-            raising=False,
-        )
-        monkeypatch.setattr(
-            "nemo_automodel.components.models.hunyuan_video15.parallelization.fully_shard",
-            fully_shard_mock,
-            raising=False,
-        )
+        monkeypatch.setattr(parallelizer_mod, "apply_fsdp2_sharding_recursively", apply_fsdp_mock)
+        monkeypatch.setattr(parallelizer_mod, "fully_shard", fully_shard_mock)
 
-        result = hunyuan_strategy.parallelize(
-            model=hunyuan_model,
+        result = fsdp2_strategy_parallelize(
+            model=model,
             device_mesh=mesh,
+            activation_checkpointing=True,
             enable_fsdp2_prefetch=False,
             fsdp2_backward_prefetch_depth=5,
             fsdp2_forward_prefetch_depth=4,
         )
 
-        from unittest.mock import ANY
-
-        assert result is hunyuan_model
-        assert checkpoint_wrapper_mock.call_count == 2
-        apply_fsdp_mock.assert_called_once_with(hunyuan_model, dp_mesh, ANY, None, False, 5, 4)
+        assert result is model
+        assert [c.args[0] for c in checkpoint_wrapper_mock.call_args_list] == list(model.transformer_blocks)
+        apply_fsdp_mock.assert_called_once()
+        assert apply_fsdp_mock.call_args.args[:2] == (model, dp_mesh)
+        assert apply_fsdp_mock.call_args.args[4:7] == (False, 5, 4)
         fully_shard_mock.assert_called_once()
 
 
@@ -1284,30 +1241,27 @@ class TestFsdp2StrategyParallelizeIntegration:
         # Verify that default strategy functions were called
         mock_distributed_env["extract_layer_groups"].assert_called_once_with(model)
 
-    @patch("nemo_automodel.components.models.nemotron_v3.parallelization.parallelize_module")
-    @patch("nemo_automodel.components.models.nemotron_v3.parallelization.fully_shard")
+    @patch("nemo_automodel.components.distributed.parallelizer.parallelize_module")
+    @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
     @patch("nemo_automodel.components.distributed.parallelizer_utils.fully_shard_by_dtype")
     def test_delegates_to_nemotron_strategy(
-        self, fully_shard, fully_shard_by_dtype, mock_parallelize_module, mock_device_mesh
+        self, fully_shard_by_dtype, fully_shard, mock_parallelize_module, mock_device_mesh
     ):
-        """Test that fsdp2_strategy_parallelize uses NemotronH strategy for NemotronH models."""
+        """fsdp2_strategy_parallelize uses the NemotronH strategy, which runs the shared flow dtype-aware."""
         mesh, _, _, _ = mock_device_mesh
+        fully_shard.side_effect = lambda model, **kwargs: model
+        fully_shard_by_dtype.side_effect = lambda model, *args, **kwargs: model
+        model = MockNemotronHModel()
 
-        with patch("nemo_automodel.components.models.nemotron_v3.parallelization.parallelize_module"):
-            with patch(
-                "nemo_automodel.components.models.nemotron_v3.parallelization.fully_shard",
-                side_effect=lambda model, **kwargs: model,
-            ):
-                model = MockNemotronHModel()
+        result = fsdp2_strategy_parallelize(
+            model=model,
+            device_mesh=mesh,
+            sequence_parallel=False,
+            activation_checkpointing=False,
+        )
 
-                result = fsdp2_strategy_parallelize(
-                    model=model,
-                    device_mesh=mesh,
-                    sequence_parallel=False,
-                    activation_checkpointing=False,
-                )
-
-                assert result is model
+        assert result is model
+        assert fully_shard_by_dtype.call_count == len(model.backbone.layers)
 
     def test_backward_compatibility_arguments(self, mock_device_mesh, mock_distributed_env):
         """Test that all original function arguments are still supported."""
@@ -1489,24 +1443,41 @@ class TestDeciLMNemotronNASValidation:
         validate_tp_mesh_for_nemotron_nas(model, tp_size=2)
 
 
-class TestQwenImageEditParallelizationStrategy:
-    """Tests for the Qwen image-edit whole-block checkpointing strategy."""
+class TestQwenImageDeclaration:
+    """The diffusers Qwen image transformer declares whole-block checkpointing; the shared flow applies it."""
 
     @staticmethod
     def _tiny_transformer():
         """Build a one-block upstream Qwen transformer without downloading weights."""
         diffusers = pytest.importorskip("diffusers")
-        return diffusers.QwenImageTransformer2DModel(
-            patch_size=2,
-            in_channels=16,
-            out_channels=4,
-            num_layers=1,
-            attention_head_dim=8,
-            num_attention_heads=1,
-            joint_attention_dim=12,
-            axes_dims_rope=(2, 2, 4),
-            zero_cond_t=True,
+        return bind_model_specs(
+            diffusers.QwenImageTransformer2DModel(
+                patch_size=2,
+                in_channels=16,
+                out_channels=4,
+                num_layers=1,
+                attention_head_dim=8,
+                num_attention_heads=1,
+                joint_attention_dim=12,
+                axes_dims_rope=(2, 2, 4),
+                zero_cond_t=True,
+            )
         )
+
+    def test_declaration_is_whole_block_checkpointing_on_the_default_strategy(self):
+        assert not hasattr(QwenImageTransformer2DModel, "parallel_spec")
+        assert QwenImageTransformer2DModel.activation_checkpointing_spec.granularity == "layer"
+
+        import torch
+
+        upstream = type("QwenImageTransformer2DModel", (torch.nn.Module,), {"config_name": "config.json"})
+        module = bind_model_specs(upstream())
+        assert query_activation_checkpointing_spec(module).granularity == "layer"
+        assert get_parallelization_strategy(module) is _DEFAULT_STRATEGY
+
+    def test_blocks_form_the_backbone_layer_group(self):
+        model = self._tiny_transformer()
+        assert get_model_layer_groups(model) == {"backbone": list(model.transformer_blocks)}
 
     def test_whole_block_checkpointing_preserves_canonical_state_dict(self):
         """Keep upstream Diffusers keys and every dual-stream branch parameter."""
@@ -1517,8 +1488,8 @@ class TestQwenImageEditParallelizationStrategy:
         model = self._tiny_transformer()
         expected_state = {name: tensor.clone() for name, tensor in model.state_dict().items()}
 
-        qwen_image_parallelization._apply_qwen_block_activation_checkpointing(model)
-        qwen_image_parallelization._apply_qwen_block_activation_checkpointing(model)
+        apply_full_layer_checkpointing_to_layers(model, get_model_layer_groups(model)["backbone"])
+        apply_full_layer_checkpointing_to_layers(model, get_model_layer_groups(model)["backbone"])
 
         assert isinstance(model.transformer_blocks[0], CheckpointWrapper)
         actual_state = model.state_dict()
@@ -1534,60 +1505,28 @@ class TestQwenImageEditParallelizationStrategy:
         }
         assert expected_branch_parameters <= set(actual_state)
 
-    def test_strategy_checkpoints_blocks_before_standard_fsdp_flow(self, monkeypatch):
-        """Cover complete Qwen blocks before delegating to repository FSDP2."""
+    def test_shared_flow_checkpoints_complete_blocks(self, monkeypatch):
+        """Every dual-stream block is one checkpoint unit covering attention and both MLPs."""
         import torch
         from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
 
         model = self._tiny_transformer()
-        delegated = {}
+        mesh = MagicMock()
+        mesh.mesh_dim_names = ("dp_replicate", "dp_shard_cp", "tp")
+        tp_mesh = MagicMock()
+        tp_mesh.size.return_value = 1
+        dp_mesh = MagicMock()
+        dp_mesh.mesh_dim_names = ("dp_replicate", "dp_shard_cp")
+        mesh.__getitem__.side_effect = lambda key: {"tp": tp_mesh, ("dp_replicate", "dp_shard_cp"): dp_mesh}[key]
+        monkeypatch.setattr(parallelizer_mod, "apply_fsdp2_sharding_recursively", MagicMock())
+        monkeypatch.setattr(parallelizer_mod, "fully_shard", lambda model, **_kwargs: model)
 
-        def fake_parallelize(self, model, *args, **kwargs):
-            """Capture the model handed to the standard distributed strategy."""
-            delegated["model"] = model
-            delegated.update(kwargs)
-            return model
-
-        monkeypatch.setattr(parallelizer_mod.DefaultParallelizationStrategy, "parallelize", fake_parallelize)
-        result = qwen_image_parallelization.QwenImageEditParallelizationStrategy().parallelize(
-            model=model,
-            device_mesh=object(),
-            activation_checkpointing=True,
-        )
+        result = fsdp2_strategy_parallelize(model=model, device_mesh=mesh, activation_checkpointing=True)
 
         assert result is model
-        assert delegated["model"] is model
-        assert delegated["activation_checkpointing"] is False
         wrapped_block = model.transformer_blocks[0]
         assert isinstance(wrapped_block, CheckpointWrapper)
         inner_block = wrapped_block._checkpoint_wrapped_module
         assert isinstance(inner_block.attn, torch.nn.Module)
         assert isinstance(inner_block.img_mlp, torch.nn.Module)
         assert isinstance(inner_block.txt_mlp, torch.nn.Module)
-
-    def test_strategy_is_declared_for_the_upstream_class(self):
-        """The diffusion pipeline binds the Qwen strategy from the ``qwen_image`` package declaration."""
-        import torch
-
-        from nemo_automodel._transformers.model_init import bind_model_specs
-
-        upstream = type("QwenImageTransformer2DModel", (torch.nn.Module,), {"config_name": "config.json"})
-        module = bind_model_specs(upstream())
-        strategy = parallelizer_mod.get_parallelization_strategy(module)
-        assert type(strategy) is qwen_image_parallelization.QwenImageEditParallelizationStrategy
-
-    def test_strategy_rejects_blocks_missing_text_branch(self):
-        """Prevent silent omission of Qwen text-MLP parameters from sharding."""
-        import torch
-
-        class IncompleteBlock(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.attn = torch.nn.Linear(2, 2)
-                self.img_mlp = torch.nn.Linear(2, 2)
-
-        model = torch.nn.Module()
-        model.transformer_blocks = torch.nn.ModuleList([IncompleteBlock()])
-
-        with pytest.raises(TypeError, match="txt_mlp"):
-            qwen_image_parallelization._validate_qwen_transformer_blocks(model)

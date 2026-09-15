@@ -101,6 +101,7 @@ class _THDCapabilities:
 
 class _DeepseekV4Like(nn.Module):
     ModelCapabilities = _THDCapabilities
+    _cp_attention_backends = ("tilelang",)
 
     def __init__(self, backend_attn="tilelang"):
         super().__init__()
@@ -113,6 +114,7 @@ class _DeepseekV4Like(nn.Module):
 
 class _GlmMoeDsaLike(nn.Module):
     ModelCapabilities = _THDCapabilities
+    _cp_attention_backends = ("tilelang", "cudnn")
     _packed_cp_attn_backends = ("tilelang", "cudnn")
 
     def __init__(self, backend_attn="tilelang"):
@@ -657,10 +659,10 @@ class TestValidateForMesh:
 
     @pytest.mark.parametrize("backend_attn", ["te", "sdpa", "flex"])
     def test_cp_fails_deepseek_v4_non_tilelang(self, backend_attn):
-        """DSV4 + non-tilelang + cp>1 must point the user at tilelang, not TE."""
+        """DSV4 + non-tilelang + cp>1 must point the user at the backends its CP attention declares."""
         model = _DeepseekV4Like(backend_attn=backend_attn)
         _attach(model)
-        with pytest.raises(ValueError, match="Context parallelism.*TileLang attention backend"):
+        with pytest.raises(ValueError, match="Context parallelism.*attention backends tilelang"):
             validate_for_mesh(model, _mesh(cp=2))
 
     def test_cp_passes_deepseek_v4_tilelang(self):

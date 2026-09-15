@@ -26,10 +26,10 @@ from nemo_automodel.components.distributed.activation_checkpointing import (
 )
 from nemo_automodel.components.distributed.config import DDPConfig
 from nemo_automodel.components.distributed.parallelizer import (
-    _extract_model_layer_groups,
     _filter_layer_groups_for_activation_checkpointing,
     _should_use_hf_native_gradient_checkpointing,
     apply_selective_activation_checkpointing,
+    get_model_layer_groups,
 )
 
 logger = logging.getLogger(__name__)
@@ -122,7 +122,7 @@ class DDPManager:
                         activation_checkpointing_scope=self.activation_checkpointing_scope,
                     )
                 else:
-                    layer_groups = _extract_model_layer_groups(model)
+                    layer_groups = get_model_layer_groups(model)
                     layers, ac_scopes = _filter_layer_groups_for_activation_checkpointing(
                         layer_groups,
                         self.activation_checkpointing_scope,
@@ -144,7 +144,7 @@ class DDPManager:
                     activation_checkpointing_scope=self.activation_checkpointing_scope,
                 )
             else:
-                layer_groups = _extract_model_layer_groups(model)
+                layer_groups = get_model_layer_groups(model)
                 layers, _ = _filter_layer_groups_for_activation_checkpointing(
                     layer_groups,
                     self.activation_checkpointing_scope,

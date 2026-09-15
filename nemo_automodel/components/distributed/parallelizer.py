@@ -54,20 +54,19 @@ from nemo_automodel.components.distributed.activation_checkpointing import (
     detect_kv_sharing_and_maybe_disable_cache,
     is_selective_activation_checkpointing,
     query_activation_checkpointing_spec,
+    unwrap_checkpoint_wrapper,
 )
 from nemo_automodel.components.distributed.config import (
     ActivationCheckpointingScope,
     normalize_activation_checkpointing_scope,
 )
 from nemo_automodel.components.distributed.mesh_utils import get_fsdp_dp_mesh
-from nemo_automodel.components.distributed.optimized_tp_plans import (
-    LLAMA_NEMOTRON_SUPER_TP_PLAN_NAME,
-    VocabParallelEmbedding,
-)
-from nemo_automodel.components.distributed.parallel_spec import ParallelSpec
+from nemo_automodel.components.distributed.optimized_tp_plans import VocabParallelEmbedding
+from nemo_automodel.components.distributed.parallel_spec import ParallelSpec, query_parallel_spec
 from nemo_automodel.components.distributed.parallel_styles import translate_to_lora
 from nemo_automodel.shared.import_utils import UnavailableMeta, safe_import_from
 from nemo_automodel.shared.multimodal_fsdp import (
+    MULTIMODAL_TOWER_NAMES,
     FrozenMultimodalSharding,
     ignored_params_for_root,
     is_multimodal_module_name,
@@ -291,6 +290,7 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
 
         # Extract layers from the model for parallelization.
         layer_groups = _extract_model_layer_groups(model)
+        spec = query_parallel_spec(model)
 
         # TP sharding with enhanced plan generation
         if tp_mesh.size() > 1:
@@ -299,9 +299,6 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
             # so there is nothing for the micro-pipeline to overlap — force SP on.
             if enable_async_tensor_parallel and not sequence_parallel:
                 raise ValueError("enable_async_tensor_parallel=True requires sequence_parallel=True")
-
-            # Validate that attention heads are divisible by TP size
-            validate_tp_mesh(model, tp_mesh)
 
             # Generate or use tensor parallel plan
             model_parallel_plan = {
@@ -313,6 +310,12 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                     tp_size=tp_mesh.size(),
                 ).items()
             }
+
+            # Head counts must divide the TP size only when the plan splits attention across heads;
+            # a plan that shards MLPs alone (hybrid Mamba stacks, diffusion transformers) or keeps
+            # attention replicated places no such constraint.
+            if _attention_is_head_sharded(model_parallel_plan):
+                validate_tp_mesh(model, tp_mesh)
 
             # Apply tensor parallelism
             if model_parallel_plan:
@@ -329,7 +332,7 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                 # that disagree about the shared parameter.
                 ensure_tied_lm_head(model)
                 if _attention_is_head_sharded(model_parallel_plan):
-                    _update_attention_head_counts_for_tp(model, tp_mesh.size())
+                    _update_attention_head_counts_for_tp(model, tp_mesh.size(), layer_groups)
 
             if enable_async_tensor_parallel:
                 torch._inductor.config._micro_pipeline_tp = True
@@ -350,9 +353,8 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
         # Apply activation checkpointing to transformer blocks if requested
         if activation_checkpointing:
             _has_kv_sharing = detect_kv_sharing_and_maybe_disable_cache(model)
-            ac_layers, ac_scopes = _filter_layer_groups_for_activation_checkpointing(
-                layer_groups,
-                activation_checkpointing_scope,
+            ac_layers, ac_scopes = self.select_activation_checkpointing_layers(
+                model, layer_groups, activation_checkpointing_scope
             )
 
             if is_selective_activation_checkpointing(activation_checkpointing):
@@ -432,6 +434,8 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
             fully_shard_fn=fully_shard_fn,
             frozen_multimodal_sharding=frozen_multimodal_sharding,
             ignored_multimodal_params=ignored_multimodal_params,
+            shard_by_dtype=spec.shard_by_dtype,
+            fp32_compute_module_names=tuple(getattr(model, "_keep_in_fp32_modules_strict", None) or ()),
         )
 
         input_embedding_reshard_after_forward = (
@@ -469,6 +473,28 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
             )
 
         return model
+
+    def select_activation_checkpointing_layers(
+        self,
+        model: nn.Module,
+        layer_groups: Dict[str, List[nn.Module]],
+        activation_checkpointing_scope: ActivationCheckpointingScope | None,
+    ) -> Tuple[List[nn.Module], Tuple[str, ...]]:
+        """Choose the layers activation checkpointing wraps: the scope's trainable layer groups.
+
+        A strategy whose stack mixes block kinds narrows this selection instead of re-implementing
+        the flow (Nemotron-H checkpoints its MLP and Mamba blocks but not its attention blocks).
+
+        Args:
+            model: The model being parallelized.
+            layer_groups: Its transformer blocks by role (see :func:`get_model_layer_groups`).
+            activation_checkpointing_scope: The requested scope (``"all"``, roles or ``"multimodal"``).
+
+        Returns:
+            The selected layers and the normalized scope tuple.
+        """
+        del model
+        return _filter_layer_groups_for_activation_checkpointing(layer_groups, activation_checkpointing_scope)
 
 
 def _patch_dtensor_spec_hash_for_symint() -> None:
@@ -594,6 +620,8 @@ def apply_fsdp2_sharding_recursively(
     fully_shard_fn=None,
     frozen_multimodal_sharding: FrozenMultimodalSharding = "root",
     ignored_multimodal_params: set[nn.Parameter] | None = None,
+    shard_by_dtype: bool = False,
+    fp32_compute_module_names: Tuple[str, ...] = (),
 ) -> None:
     """
     Recursively apply FSDP2 sharding to modules, with optimizations for ModuleList.
@@ -622,6 +650,10 @@ def apply_fsdp2_sharding_recursively(
             owned by the root FSDP unit, sharded per layer, or replicated.
         ignored_multimodal_params: Accumulator for replicated frozen multimodal
             parameters that must be ignored by ancestor FSDP roots.
+        shard_by_dtype: Shard each layer with ``parallelizer_utils.fully_shard_by_dtype`` so
+            its fp32-pinned parameters get their own fp32 compute unit (``ParallelSpec.shard_by_dtype``).
+        fp32_compute_module_names: Parameter-name substrings that must compute in fp32 under
+            ``shard_by_dtype``; the model's ``_keep_in_fp32_modules_strict``.
     Note:
         This function modifies the module in-place by replacing modules with their
         FSDP2-subclassed versions.
@@ -660,6 +692,8 @@ def apply_fsdp2_sharding_recursively(
                 fully_shard_fn=fully_shard_fn,
                 frozen_multimodal_sharding=frozen_multimodal_sharding,
                 ignored_multimodal_params=ignored_multimodal_params,
+                shard_by_dtype=shard_by_dtype,
+                fp32_compute_module_names=fp32_compute_module_names,
             )
 
         for enum_id, (layer_key, child_module) in enumerate(flat_layer_items):
@@ -671,13 +705,24 @@ def apply_fsdp2_sharding_recursively(
                 layer_reshard_after_forward = False
             else:
                 layer_reshard_after_forward = enum_id < len(flat_layer_items) - 1
-            fully_shard_fn(
-                child_module,
-                mesh=mesh,
-                mp_policy=mp_policy,
-                reshard_after_forward=layer_reshard_after_forward,
-                offload_policy=offload_policy,
-            )
+            if shard_by_dtype:
+                parallelizer_utils.fully_shard_by_dtype(
+                    child_module,
+                    mesh,
+                    mp_policy,
+                    offload_policy,
+                    fp32_compute_module_names=fp32_compute_module_names,
+                    reshard_after_forward=layer_reshard_after_forward,
+                    fully_shard_fn=fully_shard_fn,
+                )
+            else:
+                fully_shard_fn(
+                    child_module,
+                    mesh=mesh,
+                    mp_policy=mp_policy,
+                    reshard_after_forward=layer_reshard_after_forward,
+                    offload_policy=offload_policy,
+                )
             module[layer_key] = child_module
 
         # Set up explicit forward/backward prefetch chains when layers are being resharded.
@@ -687,7 +732,9 @@ def apply_fsdp2_sharding_recursively(
         else:
             should_prefetch = not pp_enabled and enable_fsdp2_prefetch
         if should_prefetch:
-            fsdp_units = [c for _, c in flat_layer_items if not _is_container(c)]
+            # Only layers that became FSDP units take part: ``fully_shard_by_dtype`` leaves a layer whose
+            # parameters split into three or more compute dtypes unwrapped and shards its subtrees instead.
+            fsdp_units = [c for _, c in flat_layer_items if hasattr(c, "set_modules_to_forward_prefetch")]
             if fsdp2_forward_prefetch_depth > 0:
                 for i in range(len(fsdp_units) - 1):
                     targets = [
@@ -726,6 +773,8 @@ def apply_fsdp2_sharding_recursively(
                 fully_shard_fn=fully_shard_fn,
                 frozen_multimodal_sharding=frozen_multimodal_sharding,
                 ignored_multimodal_params=ignored_multimodal_params,
+                shard_by_dtype=shard_by_dtype,
+                fp32_compute_module_names=fp32_compute_module_names,
             )
 
 
@@ -937,24 +986,27 @@ def _attention_is_head_sharded(model_parallel_plan: dict) -> bool:
     return False
 
 
-def _update_attention_head_counts_for_tp(model: nn.Module, tp_size: int) -> None:
+def _update_attention_head_counts_for_tp(
+    model: nn.Module, tp_size: int, layer_groups: Dict[str, List[nn.Module]] | None = None
+) -> None:
     """
     After TP sharding, the Q/K/V outputs are split across ranks (each rank has
     num_heads/tp_size heads). Update the config and each attention layer's
     num_heads / num_key_value_heads so the forward uses the local head count
     instead of the global one (avoids shape mismatches in .view()).
+
+    The attention layers are the model's ``language`` layer group (``layer_groups`` when the
+    caller already resolved it, :func:`get_model_layer_groups` otherwise).
     """
     if tp_size <= 1:
         return
     config = getattr(model, "config", None)
     if config is None or not hasattr(config, "num_attention_heads"):
         return
-    inner = getattr(model, "model", model)
-    layers = getattr(inner, "layers", None)
-    if layers is None and hasattr(model, "language_model"):
-        inner = model.language_model
-        layers = getattr(inner, "layers", None)
-    if layers is None:
+    if layer_groups is None:
+        layer_groups = get_model_layer_groups(model)
+    layers = layer_groups.get("language", [])
+    if not layers:
         return
     # Preserve the true head_dim before dividing num_attention_heads.
     # RoPE utilities derive head_dim via getattr(config, "head_dim",
@@ -968,9 +1020,7 @@ def _update_attention_head_counts_for_tp(model: nn.Module, tp_size: int) -> None
     if hasattr(config, "num_key_value_heads") and config.num_key_value_heads is not None:
         local_num_key_value_heads = config.num_key_value_heads // tp_size
 
-    # PP converts ModuleList → ModuleDict; iterating a ModuleDict yields keys, not modules.
-    layer_iter = layers.values() if isinstance(layers, nn.ModuleDict) else layers
-    for layer in layer_iter:
+    for layer in layers:
         if hasattr(layer, "self_attn"):
             attn = layer.self_attn
             if hasattr(attn, "num_heads"):
@@ -1011,19 +1061,7 @@ def validate_tp_mesh(model, tp_mesh):
     )
 
 
-_DEFAULT_SPEC = ParallelSpec()
 _DEFAULT_STRATEGY = DefaultParallelizationStrategy()
-
-
-def query_parallel_spec(model: nn.Module) -> ParallelSpec:
-    """Return the :class:`ParallelSpec` declared on ``model``'s class, or the all-default spec.
-
-    Model classes declare ``parallel_spec`` themselves; for classes the repository does not
-    own, the ``_transformers`` / ``_diffusers`` bridge sets it on the wrapper class it
-    creates, so this module never needs to know an architecture by name.
-    """
-    spec = getattr(type(model), "parallel_spec", None)
-    return _DEFAULT_SPEC if spec is None else spec
 
 
 def get_parallelization_strategy(model: nn.Module) -> ParallelizationStrategy:
@@ -1109,15 +1147,72 @@ def _extend_layers(layers: List[nn.Module], modules: Sequence[nn.Module]) -> Non
             layers.append(m)
 
 
-def _extract_model_layer_groups(model: nn.Module) -> Dict[str, List[nn.Module]]:
-    """Extract transformer layers grouped by model role."""
-    model_cls = type(model)
-    if model_cls.__name__ in {"BiEncoderModel", "CrossEncoderModel", "FSDPBiEncoderModel"}:
-        inner_model = getattr(model, "model", None)
-        if isinstance(inner_model, nn.Module):
-            return _extract_model_layer_groups(inner_model)
+def _no_split_module_names(model: nn.Module) -> set[str]:
+    """Class names of the transformer blocks ``model`` declares in ``_no_split_modules``.
 
+    HF ``PreTrainedModel``, the native NeMo models and ``diffusers`` ``ModelMixin`` all declare the
+    attribute as a list of class *names* (``["LlamaDecoderLayer"]``); matching names rather than
+    classes makes a native port and its transformers twin (distinct classes sharing a name) resolve
+    alike. Empty when the model declares nothing.
+    """
+    return set(getattr(model, "_no_split_modules", None) or ())
+
+
+def _is_no_split_block(module: nn.Module, no_split_names: set[str]) -> bool:
+    """Whether ``module`` is one of the declared blocks, seen through the wrappers sharding adds.
+
+    ``checkpoint_wrapper`` nests the block and FSDP2 swaps its class for an ``FSDP<Name>`` subclass,
+    so the declared class is looked up on the MRO of the unwrapped module.
+    """
+    return any(cls.__name__ in no_split_names for cls in type(unwrap_checkpoint_wrapper(module)).__mro__)
+
+
+def _derive_layer_groups(model: nn.Module) -> Dict[str, List[nn.Module]]:
+    """Layer groups from what the model declares: its no-split blocks, its decoder API and its tower names.
+
+    A layer container is a ``ModuleList`` (or the ``ModuleDict`` pipeline splitting leaves behind) whose
+    children are all ``_no_split_modules`` blocks. Its role is the multimodal tower it lives under
+    (``vision`` / ``audio``, by the tower attribute names ``nemo_automodel.shared.multimodal_fsdp``
+    defines); otherwise ``language`` when the model exposes a decoder (``get_decoder``, i.e. it is a
+    language model) and ``backbone`` when it does not (a diffusion transformer). Empty when the model
+    declares no blocks or none of them sit in a container.
+    """
+    no_split_names = _no_split_module_names(model)
+    if not no_split_names:
+        return {}
+    is_language_model = callable(getattr(model, "get_decoder", None))
+    layer_groups: Dict[str, List[nn.Module]] = {}
+    for fqn, module in model.named_modules():
+        if not isinstance(module, (nn.ModuleList, nn.ModuleDict)) or len(module) == 0:
+            continue
+        children = list(module.values()) if isinstance(module, nn.ModuleDict) else list(module)
+        if not all(_is_no_split_block(child, no_split_names) for child in children):
+            continue
+        tower = next((part for part in fqn.split(".") if part in MULTIMODAL_TOWER_NAMES), None)
+        if tower is not None:
+            role = "audio" if "audio" in tower else "vision"
+        else:
+            role = "language" if is_language_model else "backbone"
+        layer_groups.setdefault(role, []).extend(children)
+    return layer_groups
+
+
+def _extract_model_layer_groups(model: nn.Module) -> Dict[str, List[nn.Module]]:
+    """Extract transformer layers grouped by model role.
+
+    Resolution order: the ``layer_groups`` the model's :class:`ParallelSpec` declares; else the groups
+    derived from the model's own declarations (:func:`_derive_layer_groups`); else the llama-style
+    ``model.layers`` container; else the largest ``ModuleList`` in the tree (role ``"unknown"``). A
+    wrapper that declares none of this resolves through the model its ``base_model_prefix`` names.
+    """
+    model_cls = type(model)
     layer_group_specs = query_parallel_spec(model).layer_groups
+    if layer_group_specs is None and not _no_split_module_names(model):
+        # A wrapper that declares nothing of its own defers to the model it holds, named by the transformers
+        # convention ``base_model_prefix`` (the retrieval bi-/cross-encoders keep their encoder at ``model``).
+        base_model = getattr(model, getattr(model, "base_model_prefix", ""), None)
+        if isinstance(base_model, nn.Module) and base_model is not model:
+            return _extract_model_layer_groups(base_model)
 
     layer_groups: Dict[str, List[nn.Module]] = {}
     if layer_group_specs is not None:
@@ -1142,6 +1237,8 @@ def _extract_model_layer_groups(model: nn.Module) -> Dict[str, List[nn.Module]]:
                 model_cls.__name__,
                 {group_name: list(fqns) for group_name, fqns in layer_group_specs.items()},
             )
+    elif derived_layer_groups := _derive_layer_groups(model):
+        layer_groups = derived_layer_groups
     elif hasattr(model, "model") and hasattr(model.model, "layers"):
         # Default case for all other models (assumed to be a causal LM).
         layer_groups["language"] = (
@@ -1177,11 +1274,12 @@ def _extract_model_layer_groups(model: nn.Module) -> Dict[str, List[nn.Module]]:
 
 
 def get_model_layer_groups(model: nn.Module) -> Dict[str, List[nn.Module]]:
-    """Return transformer layers grouped by model role (e.g. ``language``, ``vision``).
+    """Return transformer layers grouped by model role (``language``, ``vision``, ``audio``, ``backbone``).
 
-    Public accessor over the per-model layer-group mapping used for FSDP wrapping
-    and activation checkpointing, so other components (e.g. the MoE parallelizer)
-    can consume the grouping without importing private helpers.
+    The one accessor for a model's transformer blocks: activation checkpointing, the TP head-count
+    update, the FSDP2/DDP managers, the MoE parallelizer and pipeline splitting all read this mapping,
+    which comes from the model's ``ParallelSpec.layer_groups`` declaration or, absent one, from the
+    blocks the model declares in ``_no_split_modules`` (see :func:`_extract_model_layer_groups`).
 
     Args:
         model: Root model to extract grouped layers from.
@@ -1352,7 +1450,6 @@ def _get_parallel_plan(
     Priority order:
     1) If ``tp_shard_plan`` is provided as a dict or import path, use it.
     2) If the model's ``ParallelSpec`` declares a ``tp_plan``, use it (with its sequence-parallel overlay).
-    The legacy ``llama_nemotron_super_tp_plan`` alias is treated as "not provided" with a warning.
     3) Otherwise, prefer the model's HF-native ``_tp_plan`` (``ParallelSpec.from_hf_model``).
     4) Otherwise, fall back to the default base plan.
 
@@ -1378,16 +1475,6 @@ def _get_parallel_plan(
     model_parallel_plan = None
     model_cls = type(model)
     spec = query_parallel_spec(model)
-
-    if tp_shard_plan == LLAMA_NEMOTRON_SUPER_TP_PLAN_NAME:
-        # Legacy alias: the architectures it covered (Llama-style and Nemotron-NAS) now declare
-        # their optimized plan themselves, so defer to the model's ParallelSpec.
-        logger.warning(
-            "tp_shard_plan=%r is deprecated; the model's own tensor-parallel plan is used instead. "
-            "Pass a dict or an import path to force a specific plan.",
-            tp_shard_plan,
-        )
-        tp_shard_plan = None
 
     if isinstance(tp_shard_plan, dict):
         model_parallel_plan = tp_shard_plan
@@ -1706,14 +1793,13 @@ def _derive_megatron_fsdp_unit_modules(model: nn.Module) -> list[type[nn.Module]
             an actionable message instead of letting MegatronFSDP later fail with
             ``ZeroDivisionError`` (``total_fsdp_module=0``) when zero modules are wrapped.
     """
-    no_split_modules = getattr(model, "_no_split_modules", None)
-    if not no_split_modules:
+    no_split_names = _no_split_module_names(model)
+    if not no_split_names:
         raise ValueError(
             "distributed.megatron_fsdp_unit_modules was not provided and the model does not define a "
             "non-empty '_no_split_modules' to derive them from. Set distributed.megatron_fsdp_unit_modules "
             "explicitly to the transformer block class path(s) to wrap as MegatronFSDP units."
         )
-    no_split_names = set(no_split_modules)
     derived: list[type[nn.Module]] = []
     seen: set[type[nn.Module]] = set()
     for submodule in model.modules():

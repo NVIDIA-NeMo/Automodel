@@ -94,25 +94,6 @@ def _uses_magi_attention(model: "nn.Module") -> bool:
     return getattr(backend, "attn", None) == "magi"
 
 
-def _is_deepseek_v4(model: "nn.Module") -> bool:
-    """True when the model is a DeepSeek V4 custom model.
-
-    DSV4 owns its context-parallel attention (Miles-style contiguous query shard
-    plus all-gathered K/V), so its CP support is gated on the TileLang attention
-    backend rather than the generic TE/SDPA/Magi paths.
-    """
-    config = getattr(model, "config", None)
-    if getattr(config, "model_type", None) == "deepseek_v4":
-        return True
-    # Exact names: sibling architectures such as ``DeepseekV41*`` do not own a CP attention path.
-    return type(model).__name__ in ("DeepseekV4ForCausalLM", "DeepseekV4Model")
-
-
-def _is_glm_moe_dsa(model: "nn.Module") -> bool:
-    config = getattr(model, "config", None)
-    return getattr(config, "model_type", None) == "glm_moe_dsa" or type(model).__name__.startswith("GlmMoeDsa")
-
-
 def _is_hybrid(model: "nn.Module") -> bool:
     """True when the model mixes attention with non-attention layers (e.g. Mamba/SSM).
 
@@ -257,10 +238,11 @@ class ModelSupports:
             return True
         if _has_backend(self._model):
             backend_attn = getattr(getattr(self._model, "backend", None), "attn", None)
-            if _is_deepseek_v4(self._model):
-                return backend_attn == "tilelang"
-            if _is_glm_moe_dsa(self._model):
-                return backend_attn in ("tilelang", "cudnn")
+            cp_attention_backends = getattr(self._model, "_cp_attention_backends", None)
+            if cp_attention_backends is not None:
+                # The model owns a CP attention path that exists only for these backends (DeepSeek-V4's
+                # TileLang kernels, GLM-MoE-DSA's TileLang / cuDNN DSA attention).
+                return backend_attn in cp_attention_backends
             # Hybrids, and custom models that ship their own CP-aware attention and opt in
             # via ``_supports_cp_sdpa``, may run CP on either TE or SDPA attention.
             if _is_hybrid(self._model) or getattr(self._model, "_supports_cp_sdpa", False):
@@ -468,23 +450,14 @@ def validate_for_mesh(model: "nn.Module", mesh: "MeshContext") -> None:
                 f"distributed:\n"
                 f"  cp_size: 1"
             )
-        elif _is_deepseek_v4(model):
+        elif (cp_attention_backends := getattr(model, "_cp_attention_backends", None)) is not None:
             errors.append(
-                f"Context parallelism (cp_size={cp_size}) for {arch} requires "
-                f"the TileLang attention backend (backend.attn='tilelang').\n"
-                f"Please re-run with --distributed.cp_size=1 or switch to TileLang attention:\n"
-                f"model:\n"
-                f"  backend:\n"
-                f"    attn: tilelang"
-            )
-        elif _is_glm_moe_dsa(model):
-            errors.append(
-                f"Context parallelism (cp_size={cp_size}) for {arch} requires "
-                f"the TileLang or cuDNN DSA attention backend.\n"
+                f"Context parallelism (cp_size={cp_size}) for {arch} requires one of the attention "
+                f"backends {', '.join(cp_attention_backends)} (backend.attn).\n"
                 f"Please re-run with --distributed.cp_size=1 or switch attention backend:\n"
                 f"model:\n"
                 f"  backend:\n"
-                f"    attn: tilelang  # or cudnn"
+                f"    attn: {cp_attention_backends[0]}"
             )
         elif _has_backend(model):
             errors.append(

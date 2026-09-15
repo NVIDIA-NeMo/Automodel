@@ -1073,6 +1073,9 @@ class DeepseekV4Model(nn.Module):
 
 
 class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
+    # The model owns its context-parallel attention (contiguous query shard plus all-gathered K/V),
+    # which exists only for the TileLang kernels; ``capabilities.supports_cp`` reads this.
+    _cp_attention_backends = ("tilelang",)
     # Keep HC mixers and the MoE gate's correction bias in fp32 regardless of
     # the outer cast policy.  Matches HF PR 45616's
     # ``DeepseekV4PreTrainedModel._keep_in_fp32_modules_strict`` (lines 890-900
