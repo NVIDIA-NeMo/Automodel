@@ -55,9 +55,6 @@ class ParallelSpec:
             relative to it; the first that resolves is used and prefixes those keys.
         validate_tp: ``(model, tp_size) -> None`` replacing the generic head-divisibility
             check.
-        apply_activation_checkpointing: ``(model) -> bool`` model-owned whole-layer activation
-            checkpointing used when the scope is ``"all"``; return ``True`` once applied so the
-            generic submodule wrappers are skipped.
         strategy: Whole-flow ``ParallelizationStrategy`` override; ``None`` uses the default.
     """
 
@@ -67,5 +64,4 @@ class ParallelSpec:
     text_config_path: str | None = None
     hf_tp_plan_prefix: tuple[str, ...] = ("model",)
     validate_tp: Callable[[nn.Module, int], None] | None = None
-    apply_activation_checkpointing: Callable[[nn.Module], bool] | None = None
     strategy: ParallelizationStrategy | None = None

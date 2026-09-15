@@ -181,7 +181,8 @@ Implement files in dependency order:
 If the architecture needs a custom TP plan, several layer containers (VLM towers),
 a nested text config, or its own FSDP2 strategy, declare a `parallel_spec: ParallelSpec`
 class attribute on the model (see `docs/guides/parallelizer-api.mdx`). Never add the
-model to `components/distributed/`.
+model to `components/distributed/`. Model-owned whole-layer activation checkpointing is a
+separate `activation_checkpointing_spec: ActivationCheckpointingSpec` (same guide).
 
 If you are not re-implementing the architecture (a stock `transformers` class, a
 `trust_remote_code` checkpoint, or a `diffusers` transformer), still create

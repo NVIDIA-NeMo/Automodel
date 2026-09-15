@@ -37,6 +37,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention.flex_attention import create_block_mask
 
+from nemo_automodel.components.distributed.activation_checkpointing import ActivationCheckpointingSpec
 from nemo_automodel.components.distributed.parallel_spec import ParallelSpec
 from nemo_automodel.components.models.bagel.attention_masks import create_sparse_mask
 from nemo_automodel.components.models.bagel.configuration import (
@@ -236,7 +237,10 @@ class BagelForUnifiedMultimodal(HFCheckpointingMixin, nn.Module):
             "language": ("model.language_model.model.layers",),
             "vision": ("model.vit_model.vision_model.encoder.layers",),
         },
-        apply_activation_checkpointing=apply_bagel_full_layer_activation_checkpointing,
+    )
+    # Whole Qwen2 decoder / SigLIP encoder layers are checkpointed as units, as upstream BAGEL does.
+    activation_checkpointing_spec: ActivationCheckpointingSpec = ActivationCheckpointingSpec(
+        apply=apply_bagel_full_layer_activation_checkpointing,
     )
 
     @dataclass(frozen=True)

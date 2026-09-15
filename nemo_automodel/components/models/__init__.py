@@ -24,16 +24,13 @@ import importlib.abc
 import pathlib
 import re
 import sys
-from typing import TYPE_CHECKING
 
 from .gpt2 import build_gpt2_model  # noqa: F401
 
-if TYPE_CHECKING:
-    from nemo_automodel.components.distributed.parallel_spec import ParallelSpec
-
 __all__ = [
+    "MODEL_SPEC_ATTRIBUTES",
     "build_gpt2_model",
-    "declared_parallel_spec",
+    "declared_model_specs",
     "model_family",
 ]
 
@@ -42,6 +39,10 @@ _PACKAGE_PREFIX = __name__ + "."
 
 
 _CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+
+# Class attributes through which a model class -- or the declaration standing in for an upstream
+# class -- publishes its model-owned contracts to ``components.distributed``.
+MODEL_SPEC_ATTRIBUTES = ("parallel_spec", "activation_checkpointing_spec")
 
 
 def model_family(model_class: type) -> str | None:
@@ -67,11 +68,11 @@ def model_family(model_class: type) -> str | None:
     return None
 
 
-def declared_parallel_spec(model_class: type) -> ParallelSpec | None:
-    """Return the ``ParallelSpec`` a model package declares for an upstream class it does not re-implement.
+def declared_model_specs(model_class: type) -> dict[str, object]:
+    """Return the specs a model package declares for an upstream class it does not re-implement.
 
     Architectures the repository only wraps -- stock ``transformers`` classes, ``trust_remote_code``
-    checkpoints, ``diffusers`` transformers -- keep their contract in
+    checkpoints, ``diffusers`` transformers -- keep their contracts in
     ``components/models/<family>/parallelization.py`` (``<family>`` per :func:`model_family`) on a
     class named after the upstream architecture::
 
@@ -79,13 +80,16 @@ def declared_parallel_spec(model_class: type) -> ParallelSpec | None:
             parallel_spec = ParallelSpec(tp_plan=gemma3_tp_plan, ...)
 
     Returns:
-        The declared spec, or ``None`` when the package or the declaration does not exist.
+        ``{attribute: spec}`` for each of :data:`MODEL_SPEC_ATTRIBUTES` the declaration sets; empty
+        when the package or the declaration does not exist.
     """
     family = model_family(model_class)
     if not family or not family.isidentifier() or not (_MODELS_DIR / family / "parallelization.py").is_file():
-        return None
-    module = importlib.import_module(f"{_PACKAGE_PREFIX}{family}.parallelization")
-    return getattr(getattr(module, model_class.__name__, None), "parallel_spec", None)
+        return {}
+    declaration = getattr(
+        importlib.import_module(f"{_PACKAGE_PREFIX}{family}.parallelization"), model_class.__name__, None
+    )
+    return {attr: spec for attr in MODEL_SPEC_ATTRIBUTES if (spec := getattr(declaration, attr, None)) is not None}
 
 
 def _available_model_submodules() -> set[str]:

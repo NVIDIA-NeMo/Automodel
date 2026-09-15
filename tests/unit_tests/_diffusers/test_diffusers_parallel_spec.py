@@ -17,7 +17,7 @@
 import pytest
 import torch.nn as nn
 
-from nemo_automodel._transformers.model_init import bind_parallel_spec, parallel_spec_for
+from nemo_automodel._transformers.model_init import bind_model_specs, parallel_spec_for
 from nemo_automodel.components.distributed.parallelizer import get_parallelization_strategy, query_parallel_spec
 from nemo_automodel.components.models import model_family
 from nemo_automodel.components.models.hunyuan_video15.parallelization import HunyuanParallelizationStrategy
@@ -60,7 +60,7 @@ def test_modules_from_neither_library_have_no_family():
 )
 def test_bind_attaches_the_declared_strategy_onto_the_instance_class(class_name, strategy_cls):
     upstream = _diffusers_double(class_name)
-    module = bind_parallel_spec(upstream())
+    module = bind_model_specs(upstream())
     assert isinstance(module, upstream)
     assert type(module).__name__ == class_name
     assert type(get_parallelization_strategy(module)) is strategy_cls
@@ -69,12 +69,12 @@ def test_bind_attaches_the_declared_strategy_onto_the_instance_class(class_name,
 
 def test_subclass_inherits_its_base_declaration():
     base = _diffusers_double("WanTransformer3DModel")
-    module = bind_parallel_spec(type("WanVariant", (base,), {})())
+    module = bind_model_specs(type("WanVariant", (base,), {})())
     assert type(get_parallelization_strategy(module)) is WanParallelizationStrategy
 
 
 def test_modules_without_a_declaration_are_returned_unchanged():
     module = nn.Linear(2, 2)
-    assert bind_parallel_spec(module) is module
+    assert bind_model_specs(module) is module
     assert type(module) is nn.Linear
     assert query_parallel_spec(module).strategy is None

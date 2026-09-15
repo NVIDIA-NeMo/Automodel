@@ -52,6 +52,7 @@ from nemo_automodel.components.distributed.activation_checkpointing import (
     apply_submodule_checkpointing,
     detect_kv_sharing_and_maybe_disable_cache,
     is_selective_activation_checkpointing,
+    query_activation_checkpointing_spec,
 )
 from nemo_automodel.components.distributed.config import (
     ActivationCheckpointingScope,
@@ -273,7 +274,6 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
     ) -> nn.Module:
         """Apply the default parallelization flow."""
         frozen_multimodal_sharding = normalize_frozen_multimodal_sharding(frozen_multimodal_sharding)
-        spec = query_parallel_spec(model)
         tp_mesh = device_mesh[tp_mesh_name]
         if fully_shard_fn is None:
             fully_shard_fn = fully_shard
@@ -363,8 +363,8 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                 )
             elif (
                 ac_scopes == ("all",)
-                and spec.apply_activation_checkpointing is not None
-                and spec.apply_activation_checkpointing(model)
+                and (apply_model_owned_ac := query_activation_checkpointing_spec(model).apply) is not None
+                and apply_model_owned_ac(model)
             ):
                 logger.info("Using model-owned full-layer activation checkpointing; skipping submodule wrappers.")
             elif enable_compile:

@@ -30,6 +30,7 @@ import logging
 import os
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
+from dataclasses import dataclass
 from typing import List
 
 import torch
@@ -48,6 +49,33 @@ from nemo_automodel.shared.import_utils import get_torch_version, safe_import
 logger = logging.getLogger(__name__)
 
 _TORCH_PROFILER_SAC_IGNORE_MIN_VERSION = (2, 13)
+
+
+@dataclass(frozen=True)
+class ActivationCheckpointingSpec:
+    """Model-owned activation checkpointing contract, separate from the parallelization one.
+
+    A model class declares it as an ``activation_checkpointing_spec`` class attribute; the wrapper
+    subclasses the loaders create inherit it, and architectures declared in
+    ``components/models/<family>/parallelization.py`` get it bound like ``parallel_spec``. The
+    all-default spec selects the generic wrappers.
+
+    Attributes:
+        apply: ``(model) -> bool`` that checkpoints whole logical layers itself when the requested
+            scope is ``"all"``. Return ``True`` once applied so the generic submodule wrappers are
+            skipped; ``False`` falls through to them.
+    """
+
+    apply: Callable[[nn.Module], bool] | None = None
+
+
+_DEFAULT_ACTIVATION_CHECKPOINTING_SPEC = ActivationCheckpointingSpec()
+
+
+def query_activation_checkpointing_spec(model: nn.Module) -> ActivationCheckpointingSpec:
+    """Return the :class:`ActivationCheckpointingSpec` declared on ``model``'s class, or the all-default spec."""
+    spec = getattr(type(model), "activation_checkpointing_spec", None)
+    return _DEFAULT_ACTIVATION_CHECKPOINTING_SPEC if spec is None else spec
 
 
 def unwrap_checkpoint_wrapper(module: nn.Module) -> nn.Module:

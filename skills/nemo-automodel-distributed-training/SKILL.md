@@ -237,6 +237,9 @@ distributed:
 This is a model-build/training behavior flag, not mesh topology. Dense
 strategies read it from the strategy config; EP/MoE paths pass the recipe-level
 flag directly into model infrastructure.
+A model that must checkpoint whole logical layers itself declares an
+`activation_checkpointing_spec` (see `docs/guides/parallelizer-api.mdx`); it is a
+separate contract from `parallel_spec`.
 
 ### Gradient Sync Deferral
 

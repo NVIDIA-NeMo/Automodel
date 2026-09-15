@@ -19,7 +19,7 @@ Who provides that object depends on who owns the class:
 |---|---|
 | A model NeMo AutoModel implements (`components/models/<name>/`) | The class declares `parallel_spec` itself. |
 | A stock `transformers` class or a `trust_remote_code` checkpoint | Its own `components/models/<family>/parallelization.py` declares it on a class named after the architecture; the loader binds it onto the wrapper class it creates. |
-| A `diffusers` transformer | The same layout and the same resolver; the diffusion pipeline binds it (`bind_parallel_spec`) before the component is sharded. |
+| A `diffusers` transformer | The same layout and the same resolver; the diffusion pipeline binds it (`bind_model_specs`) before the component is sharded. |
 | Anything else | The all-default spec: llama-style layout (`model.layers`, `config.num_attention_heads`, HF `_tp_plan` rooted at `model`). |
 
 ## When You Need a Spec
@@ -36,7 +36,7 @@ correctly needs **no** spec. Declare one when any of the following is true:
 | HF `_tp_plan` keys are relative to a submodule other than `model` (VLM text backbones). | `hf_tp_plan_prefix` |
 | TP validity depends on more than head divisibility (per-layer head counts, block configs). | `validate_tp` |
 | The final plan must be post-processed whatever its source (e.g. a normalized `lm_head`). | `adjust_tp_plan` |
-| Whole logical layers must be checkpointed instead of the generic submodule wrappers. | `apply_activation_checkpointing` |
+| Whole logical layers must be checkpointed instead of the generic submodule wrappers. | Not a `ParallelSpec` field: declare an `activation_checkpointing_spec` (see below). |
 | The FSDP2 flow itself must change (mixed-dtype sharding, model-owned CP mesh, custom `fully_shard`). | `strategy` |
 
 ## `ParallelSpec`
@@ -52,7 +52,6 @@ Every field defaults to the generic behaviour, so a spec only states what differ
 | `text_config_path` | dotted attribute path from the model | `None` → `model.config` | `validate_tp_mesh` head-divisibility check |
 | `hf_tp_plan_prefix` | candidate submodule FQNs | `("model",)` | `get_hf_tp_shard_plan` |
 | `validate_tp` | `(model, tp_size) -> None` | `None` → generic head check | `validate_tp_mesh` |
-| `apply_activation_checkpointing` | `(model) -> bool` | `None` → generic wrappers | `DefaultParallelizationStrategy` when the AC scope is `"all"` |
 | `strategy` | `ParallelizationStrategy` instance | `None` → `DefaultParallelizationStrategy` | `fsdp2_strategy_parallelize` |
 
 Candidate tuples (`layer_groups` values, `hf_tp_plan_prefix`) are tried in order and the first
@@ -145,9 +144,30 @@ class Qwen3VLParallelizationStrategy(DefaultParallelizationStrategy):
         return result
 ```
 
-Hooks are cheaper than a strategy when they fit: `validate_tp` replaces only the head check,
-`apply_activation_checkpointing` replaces only the whole-layer AC step, and `adjust_tp_plan`
-edits the final plan (BAGEL, Nemotron-NAS, and Nemotron-Flash use these respectively).
+Hooks are cheaper than a strategy when they fit: `validate_tp` replaces only the head check and
+`adjust_tp_plan` edits the final plan (Nemotron-NAS and Nemotron-Flash use these respectively).
+
+## Activation Checkpointing Is a Separate Contract
+
+Activation checkpointing is a recompute policy, not parallelism, so it is not part of
+`ParallelSpec`. A model declares `activation_checkpointing_spec: ActivationCheckpointingSpec`
+(from `nemo_automodel.components.distributed.activation_checkpointing`), which the parallelizer
+reads through `query_activation_checkpointing_spec(model)` when it applies checkpointing. Its only
+field is `apply`, a `(model) -> bool` that checkpoints whole logical layers itself when the requested
+scope is `"all"`; returning `True` skips the generic submodule wrappers.
+
+```python
+# components/models/bagel/model.py
+class BagelForUnifiedMultimodal(HFCheckpointingMixin, nn.Module):
+    parallel_spec: ParallelSpec = ParallelSpec(layer_groups={...})
+    activation_checkpointing_spec: ActivationCheckpointingSpec = ActivationCheckpointingSpec(
+        apply=apply_bagel_full_layer_activation_checkpointing,
+    )
+```
+
+Architectures you do not re-implement declare it exactly like `parallel_spec`, on the class named
+after the upstream architecture in `components/models/<family>/parallelization.py`; the loaders bind
+every declared spec attribute onto the wrapper.
 
 <Warning>
 A model-specific plan, validator, or strategy belongs under `components/models/<name>/`.
@@ -184,8 +204,8 @@ class Gemma3ForConditionalGeneration:
 The class is a plain declaration named exactly like the upstream architecture; it is never
 instantiated. When the loader wraps an upstream class it derives the directory from the class
 and binds the declared spec onto the wrapper
-(`nemo_automodel._transformers.model_init.parallel_spec_for`; the diffusion pipeline binds the
-same result onto each component with `bind_parallel_spec` from the same module):
+(`nemo_automodel._transformers.model_init.model_specs_for`; the diffusion pipeline binds the
+same result onto each component with `bind_model_specs` from the same module):
 
 | Upstream class | Directory | Derived from |
 |---|---|---|

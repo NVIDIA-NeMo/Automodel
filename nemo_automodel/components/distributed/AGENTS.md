@@ -54,12 +54,14 @@ class NewModelForCausalLM(HFCheckpointingMixin, nn.Module):
 
 `ParallelSpec` (`parallel_spec.py`) carries the TP plan, layer groups, text-config
 path, HF `_tp_plan` root, validators and strategy override; `parallelizer.py` only
-ever reads the `parallel_spec` class attribute (`query_parallel_spec`). Architectures
+ever reads the `parallel_spec` class attribute (`query_parallel_spec`); activation checkpointing
+has its own `ActivationCheckpointingSpec` (`activation_checkpointing.py`, read from the separate
+`activation_checkpointing_spec` attribute by `query_activation_checkpointing_spec`). Architectures
 the repository does not re-implement -- stock `transformers` classes, `trust_remote_code`
 checkpoints, `diffusers` transformers -- get a `components/models/<family>/parallelization.py`
 of their own that declares the spec on a class named after the upstream architecture; the
-loader resolver (`_transformers/model_init.py::parallel_spec_for`, shared by the diffusion
-pipeline) derives `<family>` from the class and binds the declaration onto the wrapper. No table of model
+loader resolver (`_transformers/model_init.py::model_specs_for`, shared by the diffusion
+pipeline) derives `<family>` from the class and binds every declared spec onto the wrapper. No table of model
 names exists anywhere, and nothing in this directory names a model.
 
 **Type annotations** -- put the import under `if TYPE_CHECKING:`. That needs

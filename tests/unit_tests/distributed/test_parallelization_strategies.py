@@ -1551,10 +1551,10 @@ class TestQwenImageEditParallelizationStrategy:
         """The diffusion pipeline binds the Qwen strategy from the ``qwen_image`` package declaration."""
         import torch
 
-        from nemo_automodel._transformers.model_init import bind_parallel_spec
+        from nemo_automodel._transformers.model_init import bind_model_specs
 
         upstream = type("QwenImageTransformer2DModel", (torch.nn.Module,), {"config_name": "config.json"})
-        module = bind_parallel_spec(upstream())
+        module = bind_model_specs(upstream())
         strategy = parallelizer_mod.get_parallelization_strategy(module)
         assert type(strategy) is qwen_image_parallelization.QwenImageEditParallelizationStrategy
 

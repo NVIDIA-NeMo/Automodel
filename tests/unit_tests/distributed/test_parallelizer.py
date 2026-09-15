@@ -3374,4 +3374,7 @@ class TestBagelFullLayerActivationCheckpointing:
 
     def test_other_models_declare_no_full_layer_hook(self):
         """Non-BAGEL models continue through the generic checkpointing path."""
-        assert parallelizer.query_parallel_spec(nn.Module()).apply_activation_checkpointing is None
+        from nemo_automodel.components.distributed.activation_checkpointing import query_activation_checkpointing_spec
+
+        assert query_activation_checkpointing_spec(nn.Module()).apply is None
+        assert not hasattr(parallelizer.query_parallel_spec(nn.Module()), "apply_activation_checkpointing")

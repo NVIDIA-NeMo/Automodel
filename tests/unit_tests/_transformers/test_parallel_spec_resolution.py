@@ -22,9 +22,11 @@ from transformers.models.gemma3.modeling_gemma3 import Gemma3ForCausalLM, Gemma3
 from transformers.models.llama.modeling_llama import LlamaForCausalLM
 from transformers.models.mistral3.modeling_mistral3 import Mistral3ForConditionalGeneration
 
-from nemo_automodel._transformers.model_init import _get_mixin_wrapped_class, parallel_spec_for
+from nemo_automodel._transformers import model_init
+from nemo_automodel._transformers.model_init import _get_mixin_wrapped_class, bind_model_specs, parallel_spec_for
+from nemo_automodel.components.distributed.activation_checkpointing import ActivationCheckpointingSpec
 from nemo_automodel.components.distributed.parallel_spec import ParallelSpec
-from nemo_automodel.components.models import declared_parallel_spec, model_family
+from nemo_automodel.components.models import declared_model_specs, model_family
 from nemo_automodel.components.models.gemma3 import parallelization as gemma3_parallelization
 from nemo_automodel.components.models.llama.model import LlamaForCausalLM as NativeLlamaForCausalLM
 from nemo_automodel.components.models.llama.parallelization import LLAMA_PARALLEL_SPEC
@@ -93,12 +95,35 @@ def test_attribute_set_on_an_upstream_class_is_the_out_of_tree_hook():
 
 
 @pytest.mark.parametrize("model_type", ["does_not_exist", "..evil", "components.models", ""])
-def test_declared_parallel_spec_ignores_missing_or_malformed_families(model_type):
+def test_declared_model_specs_ignores_missing_or_malformed_families(model_type):
     double = type("Anything", (), {"config_class": SimpleNamespace(model_type=model_type)})
-    assert declared_parallel_spec(double) is None
+    assert declared_model_specs(double) == {}
 
 
-def test_declared_parallel_spec_reads_the_class_named_after_the_architecture():
-    assert declared_parallel_spec(Gemma3ForCausalLM) is gemma3_parallelization.Gemma3ForCausalLM.parallel_spec
+def test_declared_model_specs_reads_the_class_named_after_the_architecture():
+    specs = declared_model_specs(Gemma3ForCausalLM)
+    assert specs == {"parallel_spec": gemma3_parallelization.Gemma3ForCausalLM.parallel_spec}
     other_head = type("Gemma3Model", (), {"config_class": Gemma3ForCausalLM.config_class})
-    assert declared_parallel_spec(other_head) is None
+    assert declared_model_specs(other_head) == {}
+
+
+def test_every_declared_spec_attribute_is_bound_and_declared_ones_are_kept(monkeypatch):
+    """A declaration may publish the activation-checkpointing contract next to the parallel one."""
+    ac_spec = ActivationCheckpointingSpec(apply=lambda m: True)
+    tp_spec = ParallelSpec(tp_plan=lambda m, sp: {})
+    upstream = type("ThirdPartyForCausalLM", (nn.Module,), {})
+    monkeypatch.setattr(
+        model_init,
+        "declared_model_specs",
+        lambda cls: {"parallel_spec": tp_spec, "activation_checkpointing_spec": ac_spec} if cls is upstream else {},
+    )
+
+    wrapped = _get_mixin_wrapped_class(upstream)
+    assert wrapped.parallel_spec is tp_spec
+    assert wrapped.activation_checkpointing_spec is ac_spec
+
+    own_tp_spec = ParallelSpec()
+    declares_tp = type("ThirdPartyForCausalLM", (upstream,), {"parallel_spec": own_tp_spec})
+    bound = bind_model_specs(declares_tp())
+    assert type(bound).parallel_spec is own_tp_spec  # the class's own declaration is kept
+    assert type(bound).activation_checkpointing_spec is ac_spec  # the missing one is bound from the base's declaration
