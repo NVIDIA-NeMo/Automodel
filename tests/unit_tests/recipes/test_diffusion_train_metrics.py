@@ -382,6 +382,33 @@ def test_diffusion_recipe_does_not_reseed_rng_without_cp(monkeypatch):
     init_all_rng.assert_not_called()
 
 
+def test_diffusion_recipe_broadcasts_tp_replicas_before_optimizer_setup(monkeypatch):
+    """Diffusion aligns pre-parallelization initialization before optimization."""
+    _patch_lightweight_diffusion_recipe_setup(monkeypatch)
+    transformer = nn.Linear(1, 1)
+    monkeypatch.setattr(
+        diffusion_train,
+        "build_diffusion_pipeline",
+        MagicMock(return_value=(SimpleNamespace(transformer=transformer), None)),
+    )
+    broadcast = MagicMock()
+    monkeypatch.setattr(diffusion_train, "broadcast_tp_replicas", broadcast)
+
+    recipe = TrainDiffusionRecipe(
+        _minimal_diffusion_recipe_cfg(
+            adapter_type="simple",
+            attention_backend=None,
+            optimize_hunyuan_flash_varlen_mask=False,
+        )
+    )
+
+    with pytest.raises(ValueError, match="checkpoint config is required"):
+        recipe.setup()
+
+    broadcast.assert_called_once_with([transformer], None)
+    assert recipe.optimizer is not None
+
+
 class _TinyTransformer(nn.Module):
     def __init__(self):
         super().__init__()
@@ -692,6 +719,7 @@ def test_run_train_validation_loop_uses_hot_path_and_logs_perf_metrics(monkeypat
     monkeypatch.setattr(diffusion_train, "prepare_for_grad_accumulation", MagicMock())
     monkeypatch.setattr(diffusion_train, "prepare_for_final_backward", MagicMock())
     monkeypatch.setattr(diffusion_train, "prepare_after_first_microbatch", MagicMock())
+    monkeypatch.setattr(diffusion_train, "synchronize_tp_replica_gradients", MagicMock())
     monkeypatch.setattr(diffusion_train, "clip_grad_norm", MagicMock(return_value=torch.tensor(0.25)))
     sync_ctx_mock = MagicMock(wraps=diffusion_train.get_sync_ctx)
     monkeypatch.setattr(diffusion_train, "get_sync_ctx", sync_ctx_mock)
@@ -719,6 +747,7 @@ def test_run_train_validation_loop_uses_hot_path_and_logs_perf_metrics(monkeypat
     ]
     recipe.lr_scheduler = [SimpleNamespace(step=MagicMock())]
     recipe.model = model
+    recipe.device_mesh = object()
     recipe.device = torch.device("cpu")
     recipe.compute_dtype = torch.float32
     recipe.check_loss = True
@@ -754,11 +783,17 @@ def test_run_train_validation_loop_uses_hot_path_and_logs_perf_metrics(monkeypat
     diffusion_train.prepare_for_grad_accumulation.assert_called_once_with([model], pp_enabled=False)
     diffusion_train.prepare_for_final_backward.assert_called_once_with([model], pp_enabled=False)
     diffusion_train.prepare_after_first_microbatch.assert_called_once()
+    diffusion_train.synchronize_tp_replica_gradients.assert_called_once_with([model], recipe.device_mesh)
     assert sync_ctx_mock.call_args_list == [
         call(model, False, defer_fsdp_grad_sync=True),
         call(model, True, defer_fsdp_grad_sync=True),
     ]
-    diffusion_train.clip_grad_norm.assert_called_once_with(0.5, [model], foreach=False)
+    diffusion_train.clip_grad_norm.assert_called_once_with(
+        0.5,
+        [model],
+        device_mesh=recipe.device_mesh,
+        foreach=False,
+    )
     recipe.optimizer[0].zero_grad.assert_called_once_with(set_to_none=True)
     recipe.optimizer[0].step.assert_called_once()
     recipe.lr_scheduler[0].step.assert_called_once_with(1)
@@ -1009,6 +1044,7 @@ def test_run_train_validation_loop_validates_only_with_a_val_dataloader(monkeypa
     monkeypatch.setattr(diffusion_train, "prepare_for_grad_accumulation", MagicMock())
     monkeypatch.setattr(diffusion_train, "prepare_for_final_backward", MagicMock())
     monkeypatch.setattr(diffusion_train, "prepare_after_first_microbatch", MagicMock())
+    monkeypatch.setattr(diffusion_train, "synchronize_tp_replica_gradients", MagicMock())
     monkeypatch.setattr(diffusion_train, "clip_grad_norm", MagicMock(return_value=torch.tensor(0.25)))
     monkeypatch.setattr(diffusion_train.torch.cuda, "is_available", lambda: False)
     wandb_log = MagicMock()
