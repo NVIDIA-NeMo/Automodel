@@ -341,6 +341,9 @@ class BackendConfig:
             (currently Kimi K3), fusing cast/pow/mean/rsqrt/mul into one kernel.
             Same lazy once-per-process pattern as ``compile_situ``; numerics are
             allclose to eager but not bitwise-identical.
+        shared_expert_overlap: run the shared experts of opted-in MoE models (currently Kimi K3)
+            on a side CUDA stream so their GEMMs overlap the expert-parallel dispatch / combine
+            communication of the routed path; numerics unchanged. Default False.
         benchmark_static_routing: Benchmark-only. Requires ``fake_balanced_gate=True``
             with ``fake_gate_noise=0.0``, where routing metadata (tokens per expert,
             permuted token counts) is identical for every microbatch. Skips the
@@ -398,6 +401,11 @@ class BackendConfig:
     # same lazy once-per-process pattern as compile_situ. Numerics are allclose to eager,
     # not bitwise-identical. Default False.
     compile_norm: bool = False
+    # When True, models that opt in (currently Kimi K3) run their shared experts on a side CUDA
+    # stream, launched before the routed-expert path and joined after it, so the shared-expert
+    # GEMMs overlap the expert-parallel dispatch / combine communication (Megatron-Core's
+    # moe_shared_expert_overlap). Same math, only the execution order changes. Default False.
+    shared_expert_overlap: bool = False
     # Benchmark-only: cache per-microbatch routing metadata (tokens per expert, permuted
     # token counts) after the first microbatch to remove recurring device-to-host syncs.
     # Valid ONLY with fake_balanced_gate=True and fake_gate_noise=0.0 (enforced in
