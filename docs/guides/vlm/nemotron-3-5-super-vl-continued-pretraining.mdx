@@ -98,17 +98,11 @@ requires access. Download the base model once into the shared cache before start
 multi-node allocation:
 
 ```bash
-export MODEL_SNAPSHOT=$(python - <<'PY'
-import os
-from huggingface_hub import snapshot_download
-
-print(snapshot_download(
-    os.environ["MODEL"],
-    revision=os.environ["MODEL_REVISION"],
-    cache_dir=os.path.join(os.environ["HF_HOME"], "hub"),
-))
-PY
-)
+MODEL_SNAPSHOT=$(hf download "$MODEL" \
+  --revision "$MODEL_REVISION" \
+  --cache-dir "$HF_HOME/hub" \
+  --quiet)
+export MODEL_SNAPSHOT
 ```
 
 The base BF16 checkpoint is approximately 232 GiB (249 GB). A full sharded training
@@ -123,8 +117,9 @@ FineWeb is distributed as Parquet containing a `text` column. The raw download i
 Megatron training data. This example pins the dataset revision and takes the first 100,000
 rows from `sample/10BT/000_00000.parquet`. The source shard download is about 2.15 GB.
 
-```bash
-python - <<'PY'
+Save the following as `prepare_fineweb.py` in the repository root:
+
+```python
 import hashlib
 import json
 import os
@@ -179,7 +174,12 @@ manifest = {
 }
 (root / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
 print(json.dumps(manifest, indent=2))
-PY
+```
+
+Run the script from the same shell where you exported the shared paths:
+
+```bash
+python prepare_fineweb.py
 ```
 
 Use this model's tokenizer for preprocessing. Megatron files created for another tokenizer,
@@ -219,10 +219,9 @@ token IDs use 32 bits because the vocabulary has 131,072 entries. The output is 
 267 MiB of token data plus 2 MiB of index metadata. `index_mapping/` is created when
 the dataset loader builds deterministic document, sample, and shuffle indices.
 
-Inspect the result before training:
+Save the following as `inspect_fineweb.py` in the repository root to verify the indexed data:
 
-```bash
-python - <<'PY'
+```python
 import hashlib
 import json
 import os
@@ -263,7 +262,12 @@ print("documents:", len(dataset))
 print("tokens including EOD:", token_count)
 print("first document round-trip: passed")
 print(json.dumps(manifest["megatron"], indent=2))
-PY
+```
+
+Run the script from the same shell where you exported the shared paths:
+
+```bash
+python inspect_fineweb.py
 ```
 
 Expected counts are `100000` documents and `69756226` tokens. The manifest now
@@ -311,7 +315,11 @@ resolve different revisions:
 
 ```bash
 export CPT_RECIPE="$PWD/fineweb_cpt_effective.yaml"
-python - <<'PY'
+```
+
+Save the following as `prepare_cpt_config.py` in the repository root:
+
+```python
 import os
 from pathlib import Path
 import yaml
@@ -325,7 +333,12 @@ for section in ["dataset", "validation_dataset"]:
 config["wandb"]["enable"] = True
 Path(os.environ["CPT_RECIPE"]).write_text(yaml.safe_dump(config, sort_keys=False))
 print(os.environ["CPT_RECIPE"])
-PY
+```
+
+Generate the effective YAML:
+
+```bash
+python prepare_cpt_config.py
 ```
 
 The global batch calculation is:
