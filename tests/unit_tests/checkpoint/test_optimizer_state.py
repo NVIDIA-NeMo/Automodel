@@ -416,3 +416,64 @@ def test_model_owned_dtensor_optimizer_state_reshards_world_two_to_four(tmp_path
         nprocs=4,
         join=True,
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Transformer Engine FusedAdam requires CUDA")
+@pytest.mark.parametrize("store_param_remainders", [False, True])
+def test_fused_adam_resume_with_fp32_gradients(store_param_remainders):
+    """DCP must restore fresh TE state without assigning BF16 dummy gradients."""
+    from copy import deepcopy
+
+    from nemo_automodel.components.checkpoint.stateful_wrappers import HAS_TE
+
+    if not HAS_TE:
+        pytest.skip("Transformer Engine is unavailable")
+    from transformer_engine.pytorch.optimizers import FusedAdam
+
+    if not hasattr(torch.empty(1), "grad_dtype"):
+        pytest.skip("This PyTorch build does not expose mixed gradient dtypes")
+
+    def make_pair():
+        model = nn.Linear(4, 2, bias=False, device="cuda", dtype=torch.bfloat16)
+        model.weight.grad_dtype = torch.float32
+        optimizer = FusedAdam(
+            model.parameters(),
+            lr=1e-3,
+            master_weights=True,
+            store_param_remainders=store_param_remainders,
+            exp_avg_dtype=torch.bfloat16,
+            exp_avg_sq_dtype=torch.bfloat16,
+        )
+        return model, optimizer
+
+    model, optimizer = make_pair()
+    original = model.weight.detach().clone()
+    wrapped = OptimizerState(model, optimizer)
+    wrapped.state_dict()
+    assert model.weight.grad is None
+    assert optimizer.param_groups[0]["step"] == 0
+    torch.testing.assert_close(model.weight, original, rtol=0, atol=0)
+
+    gradient = torch.arange(8, device="cuda", dtype=torch.float32).reshape(2, 4) / 8
+    model.weight.grad = gradient.clone()
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    saved = deepcopy(wrapped.state_dict())
+
+    restored_model, restored_optimizer = make_pair()
+    restored_model.load_state_dict(model.state_dict())
+    restored = OptimizerState(restored_model, restored_optimizer)
+    # Materialize the same destination skeleton used by Checkpointer.load_optimizer.
+    restored.state_dict()
+    restored.load_state_dict(saved)
+    assert restored_model.weight.grad is None
+    assert restored_optimizer.param_groups[0]["step"] == optimizer.param_groups[0]["step"]
+    for key, value in optimizer.state_dict()["state"][0].items():
+        torch.testing.assert_close(restored_optimizer.state_dict()["state"][0][key], value, rtol=0, atol=0)
+
+    # Resumption must preserve the next update, not just produce matching keys.
+    model.weight.grad = gradient.clone()
+    restored_model.weight.grad = gradient.clone()
+    optimizer.step()
+    restored_optimizer.step()
+    torch.testing.assert_close(restored_model.weight, model.weight, rtol=0, atol=0)
