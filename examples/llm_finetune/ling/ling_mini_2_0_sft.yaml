@@ -96,3 +96,30 @@ optimizer:
 lr_scheduler:
   lr_decay_style: cosine
   min_lr: 2.0e-6
+
+ci:
+  recipe_owner: yuhez
+  nodes: 1
+  nproc_per_node: 8
+  time: "00:30:00"
+  release:
+    step_scheduler.max_steps: 10
+    step_scheduler.ckpt_every_steps: 10
+    step_scheduler.val_every_steps: 10
+    step_scheduler.global_batch_size: 8
+    step_scheduler.local_batch_size: 1
+    validation_dataset.num_samples_limit: 32
+  checkpoint_robustness:
+    tokenizer_name: inclusionAI/Ling-mini-2.0
+    trust_remote_code: true
+    hf_device_map_auto: true
+    # The trained checkpoint matches HF in FP32 at 256 tokens (mean KL ~1e-10).
+    # BF16 rounding changes router choices: full-2K mean KL is ~0.007, and HF
+    # itself reaches ~0.003 across input lengths. Keep native policies unchanged.
+    parity_tolerance_profile_overrides:
+      source_load: relaxed
+      hf_reload: relaxed
+    step_scheduler.global_batch_size: 8
+    step_scheduler.local_batch_size: 1
+    dataset.num_samples_limit: 500
+    validation_dataset.num_samples_limit: 32
