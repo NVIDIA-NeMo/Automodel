@@ -96,3 +96,29 @@ def test_dp_mesh_size_one_uses_single_replica(monkeypatch):
     assert isinstance(dl.sampler, eagle3.DistributedSampler)
     assert dl.sampler.num_replicas == 1
     assert dl.sampler.rank == 0
+
+
+def test_mask_flags_forwarded_to_chat_dataset(monkeypatch):
+    """Both loss-mask options reach ChatDataset on the padded and the packed path."""
+    seen = []
+
+    class _FakeDataset(list):
+        pad_token_id = 0
+
+        def __init__(self, *args, **kwargs):
+            super().__init__([{"input_ids": [0], "loss_mask": [0], "attention_mask": [1]}])
+            seen.append(kwargs)
+
+    monkeypatch.setattr(eagle3, "ChatDataset", _FakeDataset)
+    monkeypatch.setattr(eagle3, "build_packed_eagle3_dataset", lambda source, **kw: source)
+    monkeypatch.setattr(eagle3.torch.cuda, "is_available", lambda: False)
+
+    _build(mask_reasoning_content=True, mask_generation_prompt=True)
+    _build(mask_reasoning_content=True, mask_generation_prompt=True, packed_sequence_size=16)
+    _build()
+
+    assert [(k["mask_reasoning_content"], k["mask_generation_prompt"]) for k in seen] == [
+        (True, True),
+        (True, True),
+        (False, False),
+    ]

@@ -243,6 +243,17 @@ def _gemma4_tp_plan(model: nn.Module, sequence_parallel: bool = False) -> dict[s
     return plan
 
 
+def _get_attention_head_counts(text_config) -> set[tuple[int, int]]:
+    """Return every per-layer attention-head shape used by a Gemma4 config."""
+    return {
+        (
+            int(layer_config.num_attention_heads),
+            int(layer_config.num_key_value_heads),
+        )
+        for layer_config in text_config.per_layer_config
+    }
+
+
 def register_gemma4_parallel_strategy() -> None:
     """Register Gemma4's model-owned FSDP2 strategy once."""
     from nemo_automodel.components.distributed.parallelizer import (
@@ -278,13 +289,16 @@ def register_gemma4_parallel_strategy() -> None:
             if tp_size > 1:
                 if text_config.enable_moe_block:
                     raise ValueError("Gemma4 MoE does not support tensor parallelism; use expert parallelism instead.")
-                num_attention_heads = int(text_config.num_attention_heads)
-                num_key_value_heads = int(text_config.num_key_value_heads)
-                if num_attention_heads % tp_size != 0 or num_key_value_heads % tp_size != 0:
+                attention_head_counts = _get_attention_head_counts(text_config)
+                incompatible_head_counts = {
+                    head_counts
+                    for head_counts in attention_head_counts
+                    if head_counts[0] % tp_size != 0 or head_counts[1] % tp_size != 0
+                }
+                if incompatible_head_counts:
                     raise ValueError(
-                        "Gemma4 TP requires both attention head counts to be divisible by tp_size; "
-                        f"got num_attention_heads={num_attention_heads}, "
-                        f"num_key_value_heads={num_key_value_heads}, tp_size={tp_size}."
+                        "Gemma4 TP requires every layer attention head count to be divisible by tp_size; "
+                        f"got incompatible_head_counts={sorted(incompatible_head_counts)}, tp_size={tp_size}."
                     )
                 model._gemma4_tp_enabled = True
                 model._gemma4_tp_size = tp_size

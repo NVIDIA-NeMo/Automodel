@@ -1,6 +1,6 @@
 ---
 title: "Diffusion Model Fine-Tuning with NeMo AutoModel"
-description: ""
+description: "Fine-tune text-to-image and text-to-video diffusion models with NeMo AutoModel using flow matching, from dataset prep through multi-node training and inference."
 position: 16
 ---
 ## Introduction
@@ -45,8 +45,7 @@ All models use FSDP2 for distributed training and flow matching for loss computa
 
 ## Install NeMo AutoModel
 
-Diffusion fine-tuning needs the `diffusion` extra plus `diffusion-media` (OpenCV
-Diffusion fine-tuning requires the `diffusion` and `diffusion-media` extras. The `diffusion-media` extra provides OpenCV for image and video preprocessing and imageio-ffmpeg for T2V export:
+Diffusion fine-tuning requires the `diffusion` and `diffusion-media` extras. The `diffusion-media` extra provides OpenCV for image and video preprocessing, and `imageio-ffmpeg` for text-to-video export:
 
 ```bash
 uv venv
@@ -79,8 +78,7 @@ For the full set of installation methods, see the [installation guide](/get-star
 
 ## Prepare Your Dataset
 
-Diffusion models operate in latent space — a compressed representation of visual data — rather than directly on raw images or videos. To avoid re-encoding data on every training step, the preprocessing
-  pipeline encodes all inputs ahead of time and saves them as `.meta` or `.pt` cache files.
+Diffusion models operate in latent space (a compressed representation of visual data) rather than directly on raw images or videos. To avoid re-encoding data on every training step, the preprocessing pipeline encodes all inputs ahead of time and saves them as `.meta` or `.pt` cache files.
 
 Each cache file contains:
 
@@ -139,10 +137,8 @@ For the full set of arguments and input format details, see the [Diffusion Datas
 
 Fine-tuning is driven by two components:
 
-1. A recipe script (e.g., [`train.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/diffusion/train.py)) — the Python entry point that orchestrates the training loop: loading the model, building the dataloader, running forward/backward passes, computing the flow matching loss, checkpointing, and logging.
-2. A YAML configuration file — a text file in YAML format that specifies all settings the recipe uses: which model to fine-tune, where the data lives, optimizer hyperparameters, parallelism strategy, etc.
-1. A recipe script, for example [`train.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/diffusion/train.py), is the Python entry point that orchestrates the training loop: loading the model, building the data loader, running forward and backward passes, computing the flow matching loss, checkpointing, and logging.
-2. A YAML configuration file is a text file in YAML format that specifies all settings the recipe uses: which model to fine-tune, where the data lives, optimizer hyperparameters, parallelism strategy, and other settings. You customize training by editing this file rather than modifying code, allowing you to scale seamlessly from 1 to hundreds of GPUs.
+1. A recipe script, such as [`train.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/diffusion/train.py), orchestrates the training loop by loading the model, building the data loader, running forward and backward passes, computing the flow matching loss, checkpointing, and logging.
+2. A YAML configuration file is a text file in YAML format that specifies all settings the recipe uses: which model to fine-tune, where the data lives, optimizer hyperparameters, parallelism strategy, and other settings. You customize training by editing this file rather than modifying code, allowing you to scale seamlessly from one to hundreds of GPUs.
 
 The following annotated [`wan2_1_t2v_flow.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/wan2_1_t2v_flow.yaml) config explains each section:
 
@@ -245,7 +241,39 @@ checkpoint:
 | `flow_matching` | Yes | `adapter_type` must match the model (`simple` for Wan, `flux` for FLUX, `hunyuan` for HunyuanVideo, or `ltx2` for LTX-2.3). |
 | `fsdp` | Yes | Set `dp_size` to the number of GPUs on your node. |
 | `checkpoint` | Recommended | Set `checkpoint_dir` to a persistent path, especially in Docker. |
+| `data.validation_dataloader` | Optional | Held-out cache used for the periodic validation loss. Pair it with `step_scheduler.val_every_steps`; see [Validation Loss](#validation-loss). |
 | `wandb` | Optional | Configure to enable Weights & Biases logging. |
+
+### Validation Loss
+
+To track a held-out loss during training, add a `data.validation_dataloader` block and set
+`step_scheduler.val_every_steps`:
+
+```yaml
+step_scheduler:
+  val_every_steps: 500       # Run validation every N optimizer steps
+
+data:
+  dataloader:
+    _target_: nemo_automodel.components.datasets.diffusion.build_video_multiresolution_dataloader
+    cache_dir: PATH_TO_YOUR_DATA
+    model_type: wan
+  validation_dataloader:
+    _target_: nemo_automodel.components.datasets.diffusion.build_video_multiresolution_dataloader
+    cache_dir: PATH_TO_YOUR_VAL_DATA
+    model_type: wan
+    shuffle: false
+```
+
+The validation loader takes the same builders and fields as the training one and is sharded across
+data-parallel ranks the same way. Validation scores the held-out set with the training flow-matching
+objective in `eval()` mode under `torch.no_grad()`, and logs `val_loss` to the console and to
+Weights & Biases, on the same scale as `train_loss`.
+
+Timesteps and noise are drawn under a fixed seed, and the training RNG state is restored afterward. The curve therefore reflects the model rather than the sampling. Enabling validation does not change the training trajectory.
+
+The two keys are independent: a `validation_dataloader` without `val_every_steps` validates on
+checkpoint steps only, and `val_every_steps` without a loader logs a warning and skips validation.
 
 ## Fine-Tune the Model
 
@@ -267,7 +295,7 @@ When a single node does not provide enough GPUs or memory for your workload, you
 
 The main change is in the `fsdp` section. Set `dp_size` to the **total number of GPUs across all nodes**, and optionally increase `dp_replicate_size` for gradient replication across nodes.
 
-For example, to train on 2 nodes with 8 GPUs each (16 GPUs total):
+For example, to train on two nodes with eight GPUs each (16 GPUs total):
 
 ```yaml
 fsdp:
@@ -305,7 +333,7 @@ Use the following table to select a model for your use case:
 
 | Use Case | Model | Why Choose It |
 |----------|-------|---------------|
-| **Video generation on limited hardware** | [Wan 2.1 T2V 1.3B](#wan-21-t2v-13b) | Smallest model (1.3B params) — fast iteration, fits on a single A100 40GB |
+| **Video generation on limited hardware** | [Wan 2.1 T2V 1.3B](#wan-21-t2v-13b) | Smallest model (1.3B params): fast iteration, fits on a single A100 40 GB |
 | **High-quality image generation** | [FLUX.1-dev](#flux1-dev-text-to-image) | State-of-the-art text-to-image with 12B params and guidance-based control |
 | **High-quality video generation** | [HunyuanVideo 1.5](#hunyuanvideo-15) | Larger video model with condition-latent support for richer motion and detail |
 | **Synchronized video and audio generation** | [LTX-2.3](#ltx-23) | Jointly denoises video and audio latents with a dual-stream transformer |

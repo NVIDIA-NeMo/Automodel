@@ -25,6 +25,7 @@ import torch.nn as nn
 from nemo_automodel._transformers.model_init import (
     _apply_backend_module_overrides,
     _consume_config_overrides,
+    _get_bnb_modules_to_not_convert,
     _has_safetensors,
     _init_model,
     _load_config_with_layer_types_fix,
@@ -753,6 +754,26 @@ class _TiedHeadModel(nn.Module):
         self.head.weight = self.embed.weight
 
 
+class _HfStyleOutputHeadModel(nn.Module):
+    """Small HF-like causal LM shell for BnB output-head skip tests."""
+
+    all_tied_weights_keys = {"lm_head.weight": "embed_tokens.weight"}
+
+    def __init__(self):
+        super().__init__()
+        self.embed_tokens = nn.Embedding(16, 8)
+        self.body = nn.Linear(8, 8)
+        self.lm_head = nn.Linear(8, 16, bias=False)
+        self.norm = nn.LayerNorm(8)
+        self.tie_weights()
+
+    def tie_weights(self):
+        self.lm_head.weight = self.embed_tokens.weight
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+
 def _save_safetensors(path, tensors: dict):
     from safetensors.torch import save_file
 
@@ -869,6 +890,63 @@ class TestStreamLoadBnbWeights:
         torch.testing.assert_close(model.running_scale, torch.arange(8, dtype=torch.float32))
         assert model.lin.weight.device.type == "cpu"
         assert model.lin.bias.device.type == "cpu"
+
+    def test_disable_mmap_stages_one_tensor_from_safe_open(self, tmp_path):
+        with torch.device("meta"):
+            model = _TinyModelOnMeta()
+
+        _save_safetensors(
+            tmp_path / "model.safetensors",
+            {
+                "lin.weight": torch.randn(8, 4),
+                "lin.bias": torch.randn(8),
+                "running_scale": torch.zeros(8),
+                "unused.extra": torch.ones(3, 3),
+            },
+        )
+
+        original_clone = torch.Tensor.clone
+        cloned_shapes = []
+
+        def record_clone(tensor, *args, **kwargs):
+            cloned_shapes.append(tuple(tensor.shape))
+            return original_clone(tensor, *args, **kwargs)
+
+        with (
+            patch("safetensors.torch.load", side_effect=AssertionError("full-file load should not be used")),
+            patch("safetensors.torch.load_file", side_effect=AssertionError("load_file should not be used")),
+            patch.object(torch.Tensor, "clone", record_clone),
+        ):
+            _stream_load_bnb_weights(model, str(tmp_path), torch.device("cpu"), torch.float32, disable_mmap=True)
+
+        assert model.lin.weight.device.type == "cpu"
+        assert model.running_scale.device.type == "cpu"
+        assert cloned_shapes.count((8, 4)) == 1
+        assert cloned_shapes.count((8,)) == 2
+        assert (3, 3) not in cloned_shapes
+
+
+class TestBnbModulesToNotConvert:
+    """Streaming BnB should use the same module skip list HF uses."""
+
+    def test_defaults_skip_tied_embeddings_and_output_head(self):
+        model = _HfStyleOutputHeadModel()
+        quantization_config = types.SimpleNamespace(llm_int8_skip_modules=None)
+
+        modules_to_not_convert = set(_get_bnb_modules_to_not_convert(model, quantization_config))
+
+        assert "embed_tokens" in modules_to_not_convert
+        assert "lm_head" in modules_to_not_convert
+        assert "body" not in modules_to_not_convert
+
+    def test_explicit_skip_modules_match_hf_override_semantics(self):
+        model = _HfStyleOutputHeadModel()
+        model._keep_in_fp32_modules = ["norm"]
+        quantization_config = types.SimpleNamespace(llm_int8_skip_modules=["body"])
+
+        modules_to_not_convert = set(_get_bnb_modules_to_not_convert(model, quantization_config))
+
+        assert modules_to_not_convert == {"body", "norm"}
 
 
 class TestStreamingBnbSupported:

@@ -63,6 +63,34 @@ Only load configuration files and `_target_` values from trusted sources. A YAML
 
 The `distributed:` section is **not** instantiated using `_target_`. Recipes parse it with a fixed schema. Use `strategy: fsdp2`, `strategy: ddp`, or `strategy: megatron_fsdp`. You can also configure parallelism sizes, such as `dp_size`, `tp_size`, and `pp_size`, and strategy-specific options. When pipeline parallelism is enabled (`pp_size > 1`), add a `pipeline:` subsection with options such as `pp_schedule`, `pp_microbatch_size`, and `layers_per_stage`. For examples, see the [Pipeline Parallelism with AutoPipeline](/development/pipeline-parallelism) guide and the recipe configs.
 
+## Select Trainable Modules
+
+The LLM and VLM fine-tuning recipes accept a `freeze_config:` section. Use `freeze_modules` and `unfreeze_modules` with typed selectors to control which modules are trainable:
+
+```yaml
+freeze_config:
+  freeze_modules:
+  - path: vision_tower        # exact canonical module path
+  - path: audio_tower         # repeat the key to select more exact module paths
+  - glob: "*.speech_encoder"  # case-sensitive shell-style glob on the full module path
+  unfreeze_modules:
+  - path: multi_modal_projector
+```
+
+Each selector is a mapping with exactly one key — `path` matches one module by its exact fully qualified name, while `glob` matches module names with `fnmatch`-style wildcards (`*` crosses `.` separators, so `*_proj` matches projection modules at any depth). List entries are additive: repeat `path` or `glob` entries to select several modules, and a single entry combining both keys is rejected. Matching is recursive: a selected module's entire subtree is frozen or unfrozen. Bare strings are rejected; unknown options and selectors that match no parameters raise an error before training starts.
+
+Trainability is resolved in a fixed order. Full fine-tuning preserves the model's existing `requires_grad` state, including intentionally frozen model-owned parameters; PEFT establishes a LoRA-trainable, base-frozen baseline. `freeze_modules` selectors then freeze their modules, and `unfreeze_modules` selectors unfreeze theirs, winning on overlap — this makes combinations such as LoRA plus a fully trainable multimodal projector a two-line configuration. Freezing only controls `requires_grad`; it never changes a parameter's storage dtype. The policy is validated on the complete model, re-resolved after tensor/expert parallel and activation-checkpointing surgery immediately before DDP/FSDP construction, and resolved once more after checkpoint loading before optimizer construction.
+
+The modality-specific booleans `freeze_vision_tower`, `freeze_audio_tower`, `freeze_language_model`, and `freeze_video_embedder` remain supported and keep their established attribute and substring matching, applied before `unfreeze_modules`:
+
+```yaml
+freeze_config:
+  freeze_vision_tower: true
+  freeze_audio_tower: true
+```
+
+Legacy-only configurations retain the implicit `freeze_vision_tower: true` default. A configuration that declares `freeze_modules` or `unfreeze_modules`, even as an empty list, uses explicit-selector semantics and does not implicitly freeze vision modules; add a vision selector (for example, `glob: "*vision*"`) when such a configuration should also freeze the vision tower. Omit both selector fields to retain legacy behavior; `null`, `false`, and numeric values are rejected.
+
 ## Prewarm One-Time CUDA Initialization
 
 {/* docs-review-start: mamba-ssd-prewarm */}

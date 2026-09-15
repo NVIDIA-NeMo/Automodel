@@ -153,13 +153,14 @@ def test_kd_fused_loss_preserves_tensor_valued_hidden_states(monkeypatch, recipe
 
 
 @pytest.mark.parametrize("recipe_module,recipe_cls,parent_cls", _RECIPE_CASES)
-def test_kd_setup_defaults_torch_optimizer_storage_to_fp32(monkeypatch, recipe_module, recipe_cls, parent_cls):
+@pytest.mark.parametrize("model_settings", [{}, {"dtype": "bfloat16"}, {"torch_dtype": "float32"}])
+def test_kd_setup_preserves_requested_storage_dtype(monkeypatch, recipe_module, recipe_cls, parent_cls, model_settings):
     class SetupStopped(Exception):
         pass
 
     cfg = ConfigNode(
         {
-            "model": {},
+            "model": model_settings,
             "teacher_model": {},
             "optimizer": {"_target_": "torch.optim.AdamW", "lr": 0.01},
         }
@@ -177,7 +178,7 @@ def test_kd_setup_defaults_torch_optimizer_storage_to_fp32(monkeypatch, recipe_m
     with pytest.raises(SetupStopped):
         recipe.setup()
 
-    assert cfg.model.torch_dtype == "float32"
+    assert cfg.model.to_dict() == model_settings
 
 
 @pytest.mark.parametrize("recipe_module,recipe_cls,_", _RECIPE_CASES)

@@ -79,7 +79,6 @@ distributed:
 
 # Freeze vision + projector; train only the language_model (standard MedPix setup).
 freeze_config:
-  freeze_embeddings: true
   freeze_vision_tower: true
   freeze_language_model: false
 

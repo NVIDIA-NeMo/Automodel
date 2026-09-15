@@ -24,6 +24,7 @@ from torch.autograd import Function
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 
+from nemo_automodel.components.moe.optimized_ops import _apply_router_weight_fp32
 from nemo_automodel.components.moe.state_dict_utils import create_dtensor_from_local
 
 try:
@@ -163,6 +164,34 @@ def is_gated_activation(activation: str) -> bool:
     with shape [n_experts, dim, inter_dim] - 50% memory savings.
     """
     return activation in ("swiglu", "swigluoai", "quick_geglu", "geglu")
+
+
+def _resolve_m_splits(
+    tokens_per_expert: torch.Tensor | list | tuple,
+    static_routing: bool,
+    cached_m_splits: list | None,
+) -> list:
+    """Resolve the per-expert split sizes for TE's grouped GEMM.
+
+    Args:
+        tokens_per_expert: Per-local-expert token counts of shape [num_local_experts]
+            (CUDA tensor from the flex dispatcher, or an already-materialized sequence).
+        static_routing: Benchmark-only static-routing mode (see
+            ``BackendConfig.benchmark_static_routing``) under which the counts are
+            constant for every microbatch.
+        cached_m_splits: The first microbatch's split list, or None before it is known.
+
+    Returns:
+        The split sizes as a Python list. Under static routing with a warm cache the
+        cached list is returned as-is — skipping the per-call device-to-host
+        ``.tolist()`` sync (and its repeat under activation-checkpoint recompute);
+        otherwise the counts are materialized from ``tokens_per_expert``.
+    """
+    if static_routing and cached_m_splits is not None:
+        return cached_m_splits
+    if isinstance(tokens_per_expert, torch.Tensor):
+        return tokens_per_expert.tolist()
+    return list(tokens_per_expert)
 
 
 def _permute_tokens_for_grouped_mm(
@@ -727,7 +756,9 @@ class GroupedExperts(nn.Module):
                 )
 
             if self.config.apply_router_weight_after_down:
-                output2 = output2.float() * permuted_probs.float()
+                # Chunked custom-autograd multiply (saves the raw inputs only);
+                # the fp32 output feeds the fp32 scatter_add unchanged.
+                output2 = _apply_router_weight_fp32(output2, permuted_probs, torch.float32)
                 scatter_ids = sorted_slot_ids.unsqueeze(1).expand_as(output2)
                 y.view(-1, x.size(1)).scatter_add_(0, scatter_ids, output2.float())
             else:
@@ -918,6 +949,10 @@ class GroupedExpertsDeepEP(nn.Module):
         # GEMMs through torchao's MXFP8 kernel (see _torch_mm_experts_fwd).
         self.use_torch_mm = backend is not None and backend.experts in ("torch_mm", "torch_mm_mxfp8")
         self.use_mxfp8 = backend is not None and backend.experts == "torch_mm_mxfp8"
+        # Benchmark-only (BackendConfig.benchmark_static_routing, validated there): routing
+        # metadata is identical per microbatch, so host copies of it can be cached.
+        self.static_routing = backend is not None and backend.benchmark_static_routing
+        self._static_tokens_per_expert_cpu: torch.Tensor | None = None
         self.expert_bias = config.expert_bias
         self.is_gated = is_gated_activation(config.expert_activation)
         self.dispatcher_backend = dispatcher_backend
@@ -957,6 +992,7 @@ class GroupedExpertsDeepEP(nn.Module):
             moe_hybridep_num_sms=self.dispatcher_num_sms,
             moe_share_token_dispatcher=self.dispatcher_share_token_dispatcher,
             moe_deepep_async_dispatch=self.dispatcher_async_dispatch,
+            moe_benchmark_static_routing=self.static_routing,
         )
 
         self.n_routed_experts = self.config.n_routed_experts
@@ -1033,7 +1069,10 @@ class GroupedExpertsDeepEP(nn.Module):
         gate_and_up_projs = self.gate_and_up_projs.to_local().to(compute_dtype)
         down_projs = self.down_projs.to_local().to(compute_dtype)
 
-        if torch.count_nonzero(tokens_per_expert) > 0:
+        # With static routing (forced balance, no noise) every expert receives tokens by
+        # construction, so the count_nonzero device-to-host read (one per microbatch, and
+        # again per activation-checkpoint recompute) can be skipped.
+        if self.static_routing or torch.count_nonzero(tokens_per_expert) > 0:
             if self.use_torch_mm:
                 tokens_per_expert_gpu = tokens_per_expert.to(
                     device=permuted_local_hidden_states.device, non_blocking=True
@@ -1074,7 +1113,15 @@ class GroupedExpertsDeepEP(nn.Module):
                         use_mxfp8=self.use_mxfp8,
                     )
             else:
-                tokens_per_expert = tokens_per_expert.to("cpu")
+                # ops.gmm sizes its launches from a CPU copy of tokens_per_expert; under
+                # static routing the first microbatch's copy is reused to avoid the
+                # per-microbatch device-to-host transfer.
+                if self.static_routing and self._static_tokens_per_expert_cpu is not None:
+                    tokens_per_expert = self._static_tokens_per_expert_cpu
+                else:
+                    tokens_per_expert = tokens_per_expert.to("cpu")
+                    if self.static_routing:
+                        self._static_tokens_per_expert_cpu = tokens_per_expert
                 output1 = ops.gmm(
                     permuted_local_hidden_states,
                     gate_and_up_projs,
@@ -1105,7 +1152,9 @@ class GroupedExpertsDeepEP(nn.Module):
         if self.config.apply_router_weight_after_down:
             # HybridEP/DeepEP combine expects the expert activation dtype. Keep
             # the multiply in fp32, then cast each routed expert output back.
-            output2 = (output2.float() * permuted_probs.float()).to(compute_dtype)
+            # Chunked custom-autograd path: saves the raw inputs only, instead
+            # of the full-size fp32 intermediates autograd would keep alive.
+            output2 = _apply_router_weight_fp32(output2, permuted_probs, compute_dtype)
 
         y = self.token_dispatcher.token_unpermutation(output2)
         return y
@@ -1165,7 +1214,8 @@ class GroupedExpertsTE(nn.Module):
 
         Args:
             config: MoE configuration containing expert parameters.
-            backend: Backend configuration (reserved for future use).
+            backend: Backend configuration; reads ``benchmark_static_routing``
+                (cache the per-microbatch split list under forced-balanced routing).
             dispatcher_backend: Backend for the flex token dispatcher ("deepep" or "hybridep").
             dispatcher_num_sms: Number of SMs to use for the dispatcher backend.
             dispatcher_share_token_dispatcher: Whether to share a flex dispatcher communication manager across layers.
@@ -1195,6 +1245,11 @@ class GroupedExpertsTE(nn.Module):
         self.dim = config.dim
         self.moe_inter_dim = config.moe_inter_dim
         self.is_gated = is_gated_activation(config.expert_activation)
+        # Benchmark-only (BackendConfig.benchmark_static_routing, validated there): the
+        # per-microbatch tokens_per_expert.tolist() host sync is replaced by a cached
+        # first-microbatch copy, since forced-balanced routing makes it constant.
+        self.static_routing = backend is not None and backend.benchmark_static_routing
+        self._static_m_splits: list | None = None
         self.dispatcher_backend = dispatcher_backend
         self.dispatcher_num_sms = dispatcher_num_sms
         self.dispatcher_share_token_dispatcher = dispatcher_share_token_dispatcher
@@ -1509,6 +1564,7 @@ class GroupedExpertsTE(nn.Module):
             moe_hybridep_num_sms=self.dispatcher_num_sms,
             moe_share_token_dispatcher=self.dispatcher_share_token_dispatcher,
             moe_deepep_async_dispatch=self.dispatcher_async_dispatch,
+            moe_benchmark_static_routing=self.static_routing,
         )
 
         local_expert_indices_offset = self.ep_rank * self.num_local_experts
@@ -1561,10 +1617,9 @@ class GroupedExpertsTE(nn.Module):
         )
         permuted_probs = permuted_probs.unsqueeze(-1)
 
-        if isinstance(tokens_per_expert, torch.Tensor):
-            m_splits = tokens_per_expert.tolist()
-        else:
-            m_splits = list(tokens_per_expert)
+        m_splits = _resolve_m_splits(tokens_per_expert, self.static_routing, self._static_m_splits)
+        if self.static_routing and self._static_m_splits is None:
+            self._static_m_splits = m_splits
 
         from transformer_engine.pytorch.quantization import FP8GlobalStateManager
 
