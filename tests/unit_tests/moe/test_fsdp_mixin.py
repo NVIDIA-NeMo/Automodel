@@ -565,8 +565,59 @@ class TestRunPostBackwardHooks:
         # Verify post_backward was called only for state with param_group
         mock_state1._fsdp_param_group.post_backward.assert_called_once()
 
-        # Verify callback is returned (not called yet)
-        assert result is mock_callback
+        # Verify the final callback is deferred until the returned callable runs
+        mock_callback.assert_not_called()
+        result()
+        mock_callback.assert_called_once()
+
+    @patch("nemo_automodel.components.moe.fsdp_mixin.fully_shard")
+    def test_skips_states_that_never_ran_forward(self, mock_fully_shard):
+        """A never-forwarded FSDP module (e.g. lm_head consumed inside
+        FusedLinearCrossEntropy under PP) has no comm context; its
+        post_backward raises AttributeError and must be skipped without
+        aborting the remaining states."""
+        fsdp_module = MockFSDPModule()
+
+        never_forwarded = Mock()
+        never_forwarded._fsdp_param_group.post_backward.side_effect = AttributeError(
+            "'FSDPCommContext' object has no attribute 'post_forward_order'"
+        )
+        forwarded = Mock()
+
+        mock_state_ctx = Mock()
+        mock_state_ctx.all_states = [never_forwarded, forwarded]
+
+        mock_fsdp_state = Mock()
+        mock_fsdp_state._state_ctx = mock_state_ctx
+
+        mock_fully_shard.state.return_value = mock_fsdp_state
+
+        result = _run_post_backward_hooks(fsdp_module)
+
+        forwarded._fsdp_param_group.post_backward.assert_called_once()
+        result()
+        mock_fsdp_state._root_post_backward_final_callback.assert_called_once()
+
+    @patch("nemo_automodel.components.moe.fsdp_mixin.fully_shard")
+    def test_final_callback_tolerates_uninitialized_root(self, mock_fully_shard):
+        fsdp_module = MockFSDPModule()
+
+        mock_state_ctx = Mock()
+        mock_state_ctx.all_states = []
+
+        mock_fsdp_state = Mock()
+        mock_fsdp_state._state_ctx = mock_state_ctx
+        mock_fsdp_state._root_post_backward_final_callback.side_effect = AttributeError(
+            "'FSDPCommContext' object has no attribute 'post_forward_order'"
+        )
+
+        mock_fully_shard.state.return_value = mock_fsdp_state
+
+        result = _run_post_backward_hooks(fsdp_module)
+
+        # Must not propagate the AttributeError of a never-forwarded root.
+        result()
+        mock_fsdp_state._root_post_backward_final_callback.assert_called_once()
 
 
 class TestDisableFsdpForMoeModule:
@@ -863,3 +914,30 @@ class TestPatchedBackwardMaybeWithNosync:
                 assert False, "Should have raised RuntimeError"
             except RuntimeError as e:
                 assert "Unknown backward type" in str(e)
+
+
+def test_run_post_backward_hooks_reraises_unrelated_attribute_error(monkeypatch):
+    """The never-forwarded guard must not swallow unrelated AttributeErrors."""
+    import pytest
+
+    from nemo_automodel.components.moe import fsdp_mixin as m
+
+    class _Group:
+        def post_backward(self):
+            raise AttributeError("'SomeOtherThing' object has no attribute 'unrelated_attr'")
+
+    class _State:
+        _fsdp_param_group = _Group()
+
+    class _StateCtx:
+        all_states = [_State()]
+
+    class _FsdpState:
+        _state_ctx = _StateCtx()
+
+        def _root_post_backward_final_callback(self):
+            pass
+
+    monkeypatch.setattr(m.fully_shard, "state", lambda module: _FsdpState())
+    with pytest.raises(AttributeError, match="unrelated_attr"):
+        m._run_post_backward_hooks(object())

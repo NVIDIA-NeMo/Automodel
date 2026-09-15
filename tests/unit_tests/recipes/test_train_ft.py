@@ -854,6 +854,41 @@ class _FlagCM(AbstractContextManager):
         return False
 
 
+def test_build_model_passes_freeze_config(monkeypatch):
+    """LLM model construction forwards freeze_config to NeMoAutoModel."""
+    from nemo_automodel._transformers import NeMoAutoModelForCausalLM
+
+    captured_kwargs = {}
+
+    class CapturingModelConfig:
+        def __init__(self):
+            self._target_ = NeMoAutoModelForCausalLM.from_pretrained
+
+        def instantiate(self, **kwargs):
+            captured_kwargs.update(kwargs)
+            return DummyModel()
+
+        def get(self, key, default=None):
+            return getattr(self, key, default)
+
+    freeze_config = ConfigNode(
+        {
+            "unfreeze_modules": [{"path": "layer2"}],
+        }
+    )
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.ScopedRNG", lambda **kwargs: nullcontext())
+
+    build_model(
+        cfg_model=CapturingModelConfig(),
+        cfg_peft=None,
+        cfg_freeze=freeze_config,
+        seed=123,
+    )
+
+    # ConfigNode is unwrapped at the recipe boundary; downstream receives a mapping.
+    assert captured_kwargs["freeze_config"] == {"unfreeze_modules": [{"path": "layer2"}]}
+
+
 @requires_cuda
 def test_force_hf_true_disables_meta_init(monkeypatch):
     """When cfg_model.force_hf=True, meta-device init (init_empty_weights) should not be used.
@@ -1107,6 +1142,50 @@ def test_setup_does_not_change_storage_dtype_for_non_kd_recipe(monkeypatch):
     trainer.setup()
 
     assert not hasattr(cfg.model, "torch_dtype")
+
+
+def test_freeze_config_applies_before_optimizer_build(monkeypatch):
+    """The optimizer sees the trainability selected through freeze_config."""
+    from nemo_automodel.components.utils.model_utils import apply_parameter_freezing, parse_freeze_config
+
+    cfg = _minimal_cfg_with_nvtx(nvtx_value=False)
+    cfg.freeze_config = ConfigNode(
+        {
+            "freeze_modules": [{"glob": "layer*"}],
+            "unfreeze_modules": [{"glob": "*2"}],
+        }
+    )
+    _patch_setup_minimals(monkeypatch, lambda *args, **kwargs: None)
+
+    model = DummyModel()
+    freeze_configs = []
+
+    def _build_model(*args, cfg_freeze=None, **kwargs):
+        freeze_configs.append(cfg_freeze)
+        if cfg_freeze is not None:
+            apply_parameter_freezing(model, parse_freeze_config(cfg_freeze.to_dict()))
+        return model
+
+    trainable_at_optimizer_build = []
+
+    def _build_optimizer(model, *args, **kwargs):
+        trainable_at_optimizer_build.extend(
+            name for name, parameter in model.named_parameters() if parameter.requires_grad
+        )
+        return [SimpleNamespace(param_groups=[{"lr": 0.01}], step=lambda: None, zero_grad=lambda: None)]
+
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_model", _build_model)
+    monkeypatch.setattr(
+        "nemo_automodel.recipes._typed_config.RecipeConfig.optimizer",
+        property(lambda self: SimpleNamespace(build=_build_optimizer)),
+    )
+
+    trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
+    trainer.setup()
+
+    assert freeze_configs[0] is not None
+    assert freeze_configs[0].to_dict() == cfg.freeze_config.to_dict()
+    assert trainable_at_optimizer_build == ["layer2.weight"]
 
 
 def test_nvtx_true_pipeline_patches_all_parts(monkeypatch):
@@ -2051,6 +2130,7 @@ class TestRunTrainOptimStepSetsMoEScale:
         dp_group_size=4,
         cp_group_size=1,
         pp_microbatches=1,
+        world_size=1,
     ):
         from nemo_automodel.components.config.loader import ConfigNode
 
@@ -2076,7 +2156,11 @@ class TestRunTrainOptimStepSetsMoEScale:
         monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.setup_logging", lambda: None)
         recipe = TrainFinetuneRecipeForNextTokenPrediction(cfg)
 
-        object.__setattr__(recipe, "dist_env", SimpleNamespace(device=torch.device("cpu"), rank=0, is_main=True))
+        object.__setattr__(
+            recipe,
+            "dist_env",
+            SimpleNamespace(device=torch.device("cpu"), rank=0, is_main=True, world_size=world_size),
+        )
         object.__setattr__(recipe, "device_mesh", None)
         object.__setattr__(recipe, "moe_mesh", None)
         object.__setattr__(recipe, "pp_enabled", pp_enabled)
@@ -2135,6 +2219,82 @@ class TestRunTrainOptimStepSetsMoEScale:
         object.__setattr__(recipe, "timestamp", 0.0)
         return recipe
 
+    @pytest.mark.parametrize("pp_enabled", [False, True])
+    @pytest.mark.parametrize("accumulation_steps", [1, 3])
+    @pytest.mark.parametrize("max_grad_norm", [None, 0.5])
+    def test_tp_sync_precedes_scaling_clipping_and_step(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        pp_enabled: bool,
+        accumulation_steps: int,
+        max_grad_norm: float | None,
+    ) -> None:
+        """Full and partial accumulation windows synchronize once before normalization."""
+        from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
+
+        recipe = self._make_recipe(monkeypatch, pp_enabled=pp_enabled, dp_group_size=1)
+        model = nn.Linear(1, 1, bias=False)
+        with torch.no_grad():
+            model.weight.fill_(1.0)
+        recipe.model_parts = [model]
+        recipe.optimizer = [torch.optim.SGD(model.parameters(), lr=0.1)]
+        sync_inputs = []
+
+        def forward_backward_step(
+            idx: int,
+            batch: dict[str, torch.Tensor],
+            *,
+            loss_buffer: list[torch.Tensor],
+            num_label_tokens: int,
+            num_batches: int,
+            is_train: bool = True,
+        ) -> None:
+            """Accumulate one scalar loss in the tiny reference model.
+
+            Args:
+                idx: Microbatch index.
+                batch: Mapping containing labels of shape [batch, sequence].
+                loss_buffer: List of scalar loss tensors; appended in place.
+                num_label_tokens: Total supervised tokens in the update.
+                num_batches: Number of accumulated microbatches.
+                is_train: Whether this is a training step.
+            """
+            loss = model(torch.ones(1, 1)).sum()
+            loss.backward()
+            loss_buffer.append(loss.detach())
+
+        def synchronize(
+            model_parts: list[nn.Module], device_mesh: torch.distributed.device_mesh.DeviceMesh | None
+        ) -> None:
+            assert model_parts == [model]
+            assert device_mesh is recipe.device_mesh
+            sync_inputs.append(model.weight.grad.clone())
+            # Model a second TP rank's equal partial contribution. Real
+            # collectives are covered by parallelism/test_tp_replicas.py.
+            model.weight.grad.mul_(2.0)
+
+        monkeypatch.setattr(recipe, "_forward_backward_step", forward_backward_step)
+        monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.synchronize_tp_replica_gradients", synchronize)
+        monkeypatch.setattr(
+            "nemo_automodel.recipes.llm.train_ft.scale_grads_and_clip_grad_norm",
+            scale_grads_and_clip_grad_norm,
+        )
+        batches = [{"labels": torch.tensor([[1, 2, 3, -100]])} for _ in range(accumulation_steps)]
+
+        metrics = recipe._run_train_optim_step(batches, max_grad_norm=max_grad_norm)
+
+        assert len(sync_inputs) == 1
+        torch.testing.assert_close(sync_inputs[0], torch.full_like(model.weight, float(accumulation_steps)))
+        expected_gradient = float(2 * accumulation_steps)
+        if pp_enabled:
+            expected_gradient /= 3 * accumulation_steps
+        expected_norm = expected_gradient if max_grad_norm is not None else 0.0
+        assert float(metrics.metrics["grad_norm"]) == pytest.approx(expected_norm)
+        if max_grad_norm is not None:
+            expected_gradient *= min(1.0, max_grad_norm / (expected_gradient + 1e-6))
+        torch.testing.assert_close(model.weight, torch.full_like(model.weight, 1.0 - 0.1 * expected_gradient))
+        assert model.weight.grad is None
+
     def test_pp_scale_includes_pipeline_microbatches_and_token_normalization(self, monkeypatch):
         from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 
@@ -2189,6 +2349,31 @@ class TestRunTrainOptimStepSetsMoEScale:
         recipe._run_train_optim_step(batches)
 
         assert MoEAuxLossAutoScaler.main_loss_backward_scale.item() == pytest.approx(0.5)
+
+    def test_tps_per_gpu_divides_global_tps_by_world_size(self, monkeypatch):
+        """Under pp>1 the per-GPU divisor must be the full world size, not dp*cp.
+
+        With dp=4, cp=2, pp=2 (world size 16) dividing by dp*cp alone would
+        report a per-GPU tps inflated by the pp factor.
+        """
+        recipe = self._make_recipe(
+            monkeypatch,
+            pp_enabled=True,
+            dp_group_size=4,
+            cp_group_size=2,
+            pp_microbatches=2,
+            world_size=16,
+        )
+
+        batches = [
+            {"input_ids": torch.tensor([[1, 2, 3, 4]]), "labels": torch.tensor([[1, 2, 3, -100]])},
+        ]
+
+        metrics = recipe._run_train_optim_step(batches)
+
+        tps = metrics.metrics["tps"]
+        assert tps > 0
+        assert metrics.metrics["tps_per_gpu"] == pytest.approx(tps / 16)
 
 
 # -----------------------------------------------------------------------------

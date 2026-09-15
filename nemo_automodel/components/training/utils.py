@@ -116,6 +116,21 @@ def _clip_grad_norm_impl(
     foreach: bool | None = None,
     pp_mesh: DeviceMesh | None = None,
 ) -> torch.Tensor:
+    """Compute and clip the norm of local and DTensor gradients.
+
+    Args:
+        parameters: One parameter tensor or an iterable of parameter tensors
+            with arbitrary shapes. DTensors retain their declared mesh and
+            placements.
+        max_norm: Maximum allowed global gradient norm.
+        norm_type: Norm exponent, including ``inf``.
+        error_if_nonfinite: Whether to raise for a non-finite global norm.
+        foreach: Optional foreach implementation preference for clipping.
+        pp_mesh: Optional pipeline mesh over which the scalar norm is reduced.
+
+    Returns:
+        Scalar tensor containing the pre-clipping global gradient norm.
+    """
     if isinstance(parameters, torch.Tensor):
         parameters = [parameters]
     else:
@@ -260,10 +275,12 @@ def clip_grad_norm(
     foreach: bool = True,
     use_torch_clip_grad_norm: bool = False,
 ) -> torch.Tensor | float:
-    """Common gradient clipping helper.
+    """Apply sharding-aware gradient clipping.
 
     Handles all parallelism strategies (TP, PP, EP/MoE) with automatic sharding-aware grouping.
     Returns the gradient norm as a scalar tensor on the gradients' device, or 0.0 if clipping is skipped.
+    This function does not synchronize TP-replicated gradients; optimizer loops
+    must do that exactly once before calling this function.
 
     This function automatically:
     - Groups parameters by sharding pattern (device mesh + placements)
@@ -300,7 +317,11 @@ def clip_grad_norm(
     can_use_torch_clip = use_torch_clip_grad_norm and pp_mesh is None
     if can_use_torch_clip:
         for p in parameters:
-            if isinstance(p, DTensor) or isinstance(p.grad, DTensor):
+            if (
+                isinstance(p, DTensor)
+                or isinstance(p.grad, DTensor)
+                or getattr(p, "_nemo_model_owned_grad_divisor", None) is not None
+            ):
                 can_use_torch_clip = False
                 break
 
@@ -413,11 +434,16 @@ def scale_grads_and_clip_grad_norm(
     expert_tp_replication_factor: int = 1,
     use_torch_clip_grad_norm: bool = False,
 ) -> torch.Tensor | float:
-    """Scale gradients for PP/EP in a single pass, then clip.
+    """Scale gradients for PP/EP and model-owned shards, then clip.
+
+    The caller must synchronize TP-replicated gradients once after accumulation
+    and before calling this function. This helper does not synchronize replicas.
 
     - PP scaling: divide all local grads by (num_label_tokens / dp_group_size).
     - EP scaling: for parameters on the expert axis, divide grads by
       ``(dp_group_size / ep_shard_size) * expert_tp_replication_factor``.
+    - Owner-sharded scaling: divide each marked gradient by the explicit factor
+      declared by its model-owned sharding contract.
     - Finally, perform grad clipping with PP/EP-aware reductions.
 
     Returns:
@@ -444,14 +470,23 @@ def scale_grads_and_clip_grad_norm(
             ep_ratio = float(dp_group_size) / float(ep_shard_size)
             ep_ratio *= float(expert_tp_replication_factor)
 
+    has_model_owned_sharded_params = any(
+        getattr(parameter, "_nemo_model_owned_grad_divisor", None) is not None
+        for model_part in model_parts
+        for parameter in model_part.parameters()
+    )
+
     # Single pass over parameters to apply both scalings where applicable
-    if pp_divisor is not None or ep_ratio is not None:
+    if pp_divisor is not None or ep_ratio is not None or has_model_owned_sharded_params:
         for mp in model_parts:
             for name, p in mp.named_parameters():
                 if p.grad is None:
                     continue
                 if pp_divisor is not None:
                     p.grad.div_(pp_divisor)
+                owner_divisor = getattr(p, "_nemo_model_owned_grad_divisor", None)
+                if owner_divisor is not None:
+                    p.grad.div_(float(owner_divisor))
                 if ep_ratio is not None:
                     # Scale expert gradients by the FSDP/EP ratio and by any
                     # identical TP token replicas that were gathered inside EP.
@@ -468,7 +503,7 @@ def scale_grads_and_clip_grad_norm(
                         and isinstance(p.grad, torch.Tensor)
                         and _TE_EXPERT_PARAM_PATTERN.search(name) is not None
                     )
-                    if is_ep_sharded_dtensor or is_expert_param:
+                    if owner_divisor is None and (is_ep_sharded_dtensor or is_expert_param):
                         p.grad.div_(ep_ratio)
 
     # Clip with the existing PP/EP-aware helper

@@ -20,6 +20,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+import nemo_automodel.components.training.utils as training_utils
 from nemo_automodel.components.training.utils import (
     ScopedModuleOffloading,
     _all_reduce_scalar,
@@ -29,6 +30,10 @@ from nemo_automodel.components.training.utils import (
     move_to_device,
     scale_grads_and_clip_grad_norm,
 )
+
+# Over the default 5s budget on purpose: this module spawns worker processes; every child re-imports torch from scratch.
+# Shrink the work or the process count before raising this further.
+pytestmark = pytest.mark.timeout(60)
 
 
 def test_docstring_example():
@@ -177,6 +182,28 @@ def test_clip_grad_norm_uses_torch_fast_path_when_requested(monkeypatch):
     assert clip_grad_norm_mock.call_args.kwargs["error_if_nonfinite"] is False
     assert clip_grad_norm_mock.call_args.kwargs["foreach"] is True
     clip_grads_with_norm_mock.assert_not_called()
+
+
+def test_clip_grad_norm_disables_torch_fast_path_for_owner_shard(monkeypatch):
+    """A model-owned local shard requires the contract's global norm group."""
+    model = torch.nn.Linear(2, 1, bias=False)
+    model.weight.grad = torch.tensor([[3.0, 4.0]])
+    model.weight._nemo_model_owned_grad_divisor = 1.0
+
+    torch_clip_mock = Mock(return_value=torch.tensor(-1.0))
+    sharding_aware_clip_mock = Mock()
+    monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", torch_clip_mock)
+    monkeypatch.setattr(torch.nn.utils, "clip_grads_with_norm_", sharding_aware_clip_mock)
+
+    grad_norm = clip_grad_norm(
+        max_grad_norm=10.0,
+        model_parts=[model],
+        use_torch_clip_grad_norm=True,
+    )
+
+    torch.testing.assert_close(grad_norm, torch.tensor(5.0, dtype=torch.float64))
+    torch_clip_mock.assert_not_called()
+    sharding_aware_clip_mock.assert_called_once()
 
 
 def test_clip_grad_norm_returns_zero_when_max_grad_norm_is_none():
@@ -551,6 +578,20 @@ class _MoEModule(nn.Module):
 class TestScaleGradsAndClipGradNorm:
     """Tests for scale_grads_and_clip_grad_norm with EP scaling."""
 
+    def test_owner_shard_uses_explicit_gradient_divisor(self):
+        """Owner scaling is declared by the model and independent of DP arguments."""
+        model = nn.Linear(2, 1, bias=False)
+        model.weight.grad = torch.full_like(model.weight, 8.0)
+        model.weight._nemo_model_owned_grad_divisor = 4.0
+
+        scale_grads_and_clip_grad_norm(
+            max_grad_norm=None,
+            model_parts=[model],
+            dp_group_size=999,
+        )
+
+        torch.testing.assert_close(model.weight.grad, torch.full_like(model.weight, 2.0))
+
     def test_ep_scaling_for_expert_params_by_name(self):
         """Test that expert params are scaled by EP ratio based on param name."""
         model = _MoEModule()
@@ -598,9 +639,8 @@ class TestScaleGradsAndClipGradNorm:
 
         # Base EP divisor = 4/2 = 2; replicated TP tokens add another 2.
         assert torch.allclose(expert_param.grad, torch.ones_like(expert_param) * 2.0)
-        # Router/dense replicas stay identical across TP ranks via the
-        # fail-closed identical-pretrained-weights invariant (no separate
-        # sync) and must never receive the expert-only divisor.
+        # Router/dense replicas must never receive the expert-only divisor;
+        # their TP synchronization is owned separately at the optimizer boundary.
         assert torch.allclose(model.gate.weight.grad, torch.ones_like(model.gate.weight) * 8.0)
 
     @pytest.mark.parametrize(

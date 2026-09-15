@@ -29,8 +29,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 from torch.nn.attention.flex_attention import flex_attention as _eager_flex
+from transformers.models.gemma4.configuration_gemma4 import Gemma4Config, Gemma4TextConfig
 
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.gemma4_moe import cp_attention as cpa
+from nemo_automodel.components.models.gemma4_moe.model import Gemma4Attention, Gemma4ForConditionalGeneration
 
 
 def _flex_module(sliding_window=None):
@@ -270,27 +273,44 @@ def _elig_module(sliding_window=None, use_ffpa=True):
     return SimpleNamespace(_gemma4_cp_use_ffpa=use_ffpa, sliding_window=sliding_window)
 
 
-def _elig_ctx(*, head_dim=512, packed=True):
+def _elig_ctx(*, head_dim=512, packed=True, dropout_p=0.0):
     md = {"_packed_seq_ids": torch.tensor([[1, 1, 1, 1]])} if packed else {}
     return SimpleNamespace(
-        is_causal=True, metadata=md, query=torch.zeros(1, 1, 4, head_dim, dtype=torch.bfloat16), scale=0.0625
+        is_causal=True,
+        metadata=md,
+        query=torch.zeros(1, 1, 4, head_dim, dtype=torch.bfloat16),
+        scale=0.0625,
+        dropout_p=dropout_p,
     )
 
 
 @pytest.mark.parametrize(
     "avail,mod_kw,ctx_kw,expected",
     [
-        (True, {}, {}, True),  # happy path
+        (True, {}, {}, True),  # zero-dropout happy path
         (True, {}, {"packed": False}, False),  # no _packed_seq_ids
         (True, {"sliding_window": 512}, {}, False),  # sliding-window layer
         (True, {"use_ffpa": False}, {}, False),  # backend flag off
         (True, {}, {"head_dim": 256}, False),  # wrong head_dim
+        (True, {"sliding_window": 512}, {"dropout_p": 0.1}, False),  # dropout on non-FFPA layer
+        (True, {}, {"head_dim": 256, "dropout_p": 0.1}, False),  # dropout with wrong head_dim
         (False, {}, {}, False),  # kernel unavailable
     ],
 )
 def test_ring_use_ffpa_varlen(monkeypatch, avail, mod_kw, ctx_kw, expected):
     monkeypatch.setattr(cpa, "_ffpa_varlen_ring_available", lambda: avail)
     assert cpa._ring_use_ffpa_varlen(_elig_module(**mod_kw), _elig_ctx(**ctx_kw)) is expected
+
+
+def test_ring_use_ffpa_varlen_rejects_dropout_before_kernel_probe(monkeypatch):
+    monkeypatch.setattr(
+        cpa,
+        "_ffpa_varlen_ring_available",
+        lambda: pytest.fail("FFPA availability must not be queried for unsupported dropout"),
+    )
+
+    with pytest.raises(NotImplementedError, match=r"ffpa-attn requires dropout_p=0\.0, got 0\.1"):
+        cpa._ring_use_ffpa_varlen(_elig_module(), _elig_ctx(dropout_p=0.1))
 
 
 # Flex ring forward (eager flex kernel, no GPU)
@@ -366,6 +386,27 @@ def test_ring_dispatch_routes_to_flex_when_not_eligible(monkeypatch):
     assert cpa._run_gemma4_cp_ring_attention(ctx.module, ctx).shape == ctx.query.shape
 
 
+def test_ring_dispatch_rejects_ffpa_dropout_before_ring_work(monkeypatch):
+    monkeypatch.setattr(
+        cpa,
+        "_collect_ring_kv_chunks",
+        lambda _ctx: pytest.fail("ring chunks must not be collected for unsupported dropout"),
+    )
+    ctx = _make_ctx(
+        _elig_module(), seq=4, head_dim=512, metadata={"_packed_seq_ids": torch.ones(1, 4, dtype=torch.long)}
+    )
+    ctx = cpa.replace(
+        ctx,
+        query=ctx.query.to(torch.bfloat16),
+        key=ctx.key.to(torch.bfloat16),
+        value=ctx.value.to(torch.bfloat16),
+        dropout_p=0.1,
+    )
+
+    with pytest.raises(NotImplementedError, match="Gemma4 FFPA ring CP does not support attention dropout"):
+        cpa._run_gemma4_cp_ring_attention(ctx.module, ctx)
+
+
 def test_ring_dispatch_routes_to_varlen_when_eligible(monkeypatch):
     # Two distinct documents in the shard => not single-doc => varlen (THD) path.
     monkeypatch.setattr(cpa, "_ring_use_ffpa_varlen", lambda m, c: True)
@@ -392,3 +433,70 @@ def test_attach_sets_ffpa_flag_and_cp_seam():
     default = torch.nn.Module()
     cpa.attach_gemma4_cp_ring_attention(default)
     assert default._gemma4_cp_use_ffpa is False
+
+
+def _make_cp_policy_model(*, enable_moe_block, full_backend=None, sliding_backend=None):
+    text_config_kwargs = dict(
+        vocab_size=32,
+        hidden_size=16,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=8,
+        global_head_dim=8,
+        num_hidden_layers=1,
+        intermediate_size=32,
+        moe_intermediate_size=8,
+        num_experts=2,
+        top_k_experts=1,
+        enable_moe_block=enable_moe_block,
+        layer_types=["full_attention"],
+        sliding_window=8,
+    )
+    if full_backend is not None:
+        text_config_kwargs["cp_full_attn_backend"] = full_backend
+    if sliding_backend is not None:
+        text_config_kwargs["cp_sliding_attn_backend"] = sliding_backend
+
+    config = Gemma4Config(
+        text_config=Gemma4TextConfig(**text_config_kwargs),
+        vision_config={"num_hidden_layers": 1},
+    )
+    backend = BackendConfig(
+        linear="torch",
+        attn="sdpa",
+        rms_norm="torch",
+        experts="torch",
+        dispatcher="torch",
+        enable_hf_state_dict_adapter=False,
+    )
+
+    with torch.device("meta"):
+        return Gemma4ForConditionalGeneration(config, backend=backend)
+
+
+@pytest.mark.parametrize("enable_moe_block", [False, True])
+@pytest.mark.parametrize(
+    "backend_kwargs,expected_policy",
+    [({}, (False, "flex")), ({"full_backend": "FFPA", "sliding_backend": "FA"}, (True, "fa"))],
+)
+def test_model_applies_cp_attention_backend_policy(enable_moe_block, backend_kwargs, expected_policy):
+    model = _make_cp_policy_model(enable_moe_block=enable_moe_block, **backend_kwargs)
+    attention_modules = [module for module in model.modules() if isinstance(module, Gemma4Attention)]
+
+    assert len(attention_modules) == model.config.text_config.num_hidden_layers
+    assert all(
+        (module._gemma4_cp_use_ffpa, module._gemma4_cp_sliding_backend) == expected_policy
+        for module in attention_modules
+    )
+
+
+@pytest.mark.parametrize(
+    "backend_kwargs,match",
+    [
+        ({"full_backend": "invalid"}, "cp_full_attn_backend"),
+        ({"sliding_backend": "invalid"}, "cp_sliding_attn_backend"),
+    ],
+)
+def test_model_rejects_unsupported_cp_attention_backend(backend_kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        _make_cp_policy_model(enable_moe_block=False, **backend_kwargs)

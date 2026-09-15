@@ -108,7 +108,6 @@ lr_scheduler:
   min_lr: 5.0e-7
 
 freeze_config:
-  freeze_embeddings: true      # NO-OP in this path (apply_parameter_freezing ignores it); kept for parity
   freeze_vision_tower: true
   freeze_audio_tower: true
   freeze_language_model: false # embeddings + tied LM head trainable — required to learn tokens 48/49/52

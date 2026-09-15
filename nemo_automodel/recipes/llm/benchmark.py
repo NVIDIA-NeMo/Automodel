@@ -19,6 +19,7 @@ import pathlib
 import torch
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.distributed.tp_replicas import synchronize_tp_replica_gradients
 from nemo_automodel.components.training.timers import Timers
 from nemo_automodel.components.training.utils import (
     prepare_after_first_microbatch,
@@ -374,6 +375,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
 
                 # Optimizer step
                 with self.timers("optimizer", log_level=2):
+                    synchronize_tp_replica_gradients(self.model_parts, self.device_mesh)
                     for opt in self.optimizer:
                         opt.step()
                     logger.debug("Optimizer step")
@@ -412,6 +414,8 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                     f"Max Memory Allocated: {torch.cuda.max_memory_allocated() / 1024**3:.2f} GB | "
                     f"loss={reporting_loss:.4f}"
                 )
+                if self._wandb_enabled and self.wandb_run is not None:
+                    self.wandb_run.log({"loss": reporting_loss}, step=i)
 
             # Collect and log MoE load balance metrics (inherited from train_ft)
             self._collect_moe_load_balance()

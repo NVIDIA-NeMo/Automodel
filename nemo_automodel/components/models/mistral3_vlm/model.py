@@ -152,9 +152,8 @@ class Mistral3FP8VLMForConditionalGeneration(_HFMistral3ForConditionalGeneration
         # the linear swap by flipping ``dequantize=True`` on the config
         # (see transformers/integrations/finegrained_fp8.py:742, which early-
         # returns from replace_with_fp8_linear when dequantize is truthy).
-        # ``apply_model_infrastructure`` still sees hasattr(config,
-        # 'quantization_config'), so ``dequantize_base_checkpoint`` is set
-        # to True and our adapter's ``to_hf(quantization=True)`` path runs.
+        # The checkpoint loader sees the declared FP8 quantization method, so
+        # our adapter's ``to_hf(quantization=True)`` path still runs.
         qc = getattr(config, "quantization_config", None)
         if qc is not None:
             if isinstance(qc, dict):

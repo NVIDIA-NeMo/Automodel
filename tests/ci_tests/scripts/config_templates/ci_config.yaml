@@ -124,10 +124,21 @@ fixture_keys:
     - hf_device_map_max_memory_gib
     - hf_reload_timeout_seconds
     - hf_source_post_load_dequantize
+    # Optional routed-MoE evidence to determine whether parity outliers are
+    # caused by numerically fragile router choices. Currently implemented only
+    # for GLM 4.7 Flash.
+    - capture_router_diagnostics
+    # Optional HF self-comparison across sequence lengths, used to distinguish
+    # shape-sensitive numerics from a cross-framework loading or parity bug. A
+    # shorter cross-framework gate measures its gate length automatically.
+    - shape_diagnostic
     # Full-logit parity defaults to 2048 tokens from the repository's fixed
     # long-form document. Named profiles gate mean KL, p95 KL, and cosine.
     # Max KL, JSD, and absolute-difference metrics are report-only.
     - parity_sequence_length
+    # Optional prefix of the same long forward used to gate cross-framework
+    # source/HF-reload parity. Full-sequence metrics remain report-only.
+    - cross_framework_gate_sequence_length
     - parity_tolerance_profile
     # Optional source_load, automodel_reload, hf_reload, or cross_tp profile
     # selections. Unspecified comparisons inherit parity_tolerance_profile.

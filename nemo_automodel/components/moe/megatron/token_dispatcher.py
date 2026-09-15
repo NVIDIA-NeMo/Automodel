@@ -380,6 +380,7 @@ class _HybridEPManager(_DispatchManager):
         router_topk: int,
         permute_fusion: bool = False,
         moe_hybridep_num_sms: int = 24,
+        benchmark_static_routing: bool = False,
     ):
         self.group = group
         self.num_local_experts = num_local_experts
@@ -387,6 +388,9 @@ class _HybridEPManager(_DispatchManager):
         self.router_topk = router_topk
         self.permute_fusion = permute_fusion
         self.moe_hybridep_num_sms = moe_hybridep_num_sms
+        # Benchmark-only (TokenDispatcherConfig.moe_benchmark_static_routing):
+        # persist num_permuted_tokens across dispatches, see dispatch()/reset.
+        self.benchmark_static_routing = benchmark_static_routing
         self.num_permuted_tokens = None
 
         # Metadata
@@ -448,7 +452,13 @@ class _HybridEPManager(_DispatchManager):
     ) -> torch.Tensor:
         # Reset num_permuted_tokens to None to avoid reusing cached state from a prior dispatch.
         # This can happen in non-reentrant activation checkpointing mode.
-        self.num_permuted_tokens = None
+        # Benchmark-only exception: with static routing every dispatch permutes the same
+        # count, so reusing the first dispatch's value keeps hybrid_ep_dispatch on its
+        # non-blocking path and removes a per-microbatch host wait on a device-side flag.
+        if self.benchmark_static_routing and getattr(self, "_static_num_permuted_tokens", None) is not None:
+            self.num_permuted_tokens = self._static_num_permuted_tokens
+        else:
+            self.num_permuted_tokens = None
         if self.token_probs.dtype != torch.float32:
             self.token_probs = self.token_probs.float()
 
@@ -486,6 +496,8 @@ class _HybridEPManager(_DispatchManager):
 
         self.tokens_per_expert = tokens_per_expert
         self.num_permuted_tokens = self.tokens_per_expert.sum()
+        if self.benchmark_static_routing and getattr(self, "_static_num_permuted_tokens", None) is None:
+            self._static_num_permuted_tokens = self.num_permuted_tokens
 
         return dispatched_hidden
 
@@ -564,6 +576,12 @@ class TokenDispatcherConfig:
 
     moe_deepep_async_dispatch: bool = False
     """Use asynchronous DeepEP/UCCL-EP dispatch/combine and communication-stream allocations."""
+
+    moe_benchmark_static_routing: bool = False
+    """Benchmark-only (mirrors BackendConfig.benchmark_static_routing, validated there):
+    routing is forced-balanced with no noise, so every dispatch permutes the same token
+    count. Persist num_permuted_tokens across dispatches to keep HybridEP on its
+    non-blocking size path instead of waiting on a device-side count per microbatch."""
 
 
 class MoEFlexTokenDispatcher:
@@ -666,6 +684,7 @@ class MoEFlexTokenDispatcher:
                         router_topk=self.tp_size * self.config.moe_router_topk,
                         permute_fusion=self.config.moe_permute_fusion,
                         moe_hybridep_num_sms=self.config.moe_hybridep_num_sms,
+                        benchmark_static_routing=self.config.moe_benchmark_static_routing,
                     )
                 self._comm_manager = MoEFlexTokenDispatcher.shared_hybridep_manager
             else:
@@ -676,6 +695,7 @@ class MoEFlexTokenDispatcher:
                     router_topk=self.tp_size * self.config.moe_router_topk,
                     permute_fusion=self.config.moe_permute_fusion,
                     moe_hybridep_num_sms=self.config.moe_hybridep_num_sms,
+                    benchmark_static_routing=self.config.moe_benchmark_static_routing,
                 )
             self.hybridep_metadata_processor = _HybridEPMetadataProcessor(
                 num_experts=self.tp_size * self.config.num_moe_experts,
