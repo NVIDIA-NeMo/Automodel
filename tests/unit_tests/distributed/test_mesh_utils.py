@@ -93,15 +93,18 @@ def test_init_named_mesh_omits_backend_override_for_cpu(monkeypatch):
     assert captured["backend_override"] is None
 
 
-def test_flattened_axes_inherit_nccl_timeout():
+def test_flattened_axes_inherit_nccl_timeout(monkeypatch):
     flattened_mesh = Mock()
     source_mesh = Mock()
     source_mesh.device_type = "cuda"
+    source_mesh.size = Mock(return_value=4)
     source_mesh._flatten = Mock(return_value=flattened_mesh)
     device_mesh = Mock()
     device_mesh.device_type = "cuda"
     device_mesh._flatten_mapping = {}
     device_mesh.__getitem__ = Mock(return_value=source_mesh)
+    monkeypatch.setattr(mesh_utils.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(mesh_utils.dist, "get_world_size", lambda: 8)
 
     _register_flattened_axes(
         device_mesh,
@@ -112,6 +115,31 @@ def test_flattened_axes_inherit_nccl_timeout():
     backend, options = source_mesh._flatten.call_args.kwargs["backend_override"]
     assert backend == "nccl"
     assert options._timeout == datetime.timedelta(minutes=30)
+    assert device_mesh._flatten_mapping[MeshAxisName.DP_CP] is flattened_mesh
+
+
+def test_flattened_world_axis_reuses_default_process_group(monkeypatch):
+    flattened_mesh = Mock()
+    source_mesh = Mock()
+    source_mesh.size = Mock(return_value=8)
+    source_mesh._flatten = Mock(return_value=flattened_mesh)
+    device_mesh = Mock()
+    device_mesh.device_type = "cuda"
+    device_mesh._flatten_mapping = {}
+    device_mesh.__getitem__ = Mock(return_value=source_mesh)
+    monkeypatch.setattr(mesh_utils.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(mesh_utils.dist, "get_world_size", lambda: 8)
+
+    _register_flattened_axes(
+        device_mesh,
+        {MeshAxisName.DP_CP: (MeshAxisName.DP_SHARD, MeshAxisName.CP)},
+        timeout_minutes=30,
+    )
+
+    source_mesh._flatten.assert_called_once_with(
+        mesh_dim_name=MeshAxisName.DP_CP,
+        backend_override=None,
+    )
     assert device_mesh._flatten_mapping[MeshAxisName.DP_CP] is flattened_mesh
 
 
@@ -148,11 +176,13 @@ def test_fsdp2_forwards_nccl_timeout_to_moe_mesh(monkeypatch):
         device_mesh,
         ep_shard_size=4,
         ep_size=2,
+        pp_size=1,
         timeout_minutes=30,
+        ranks=None,
     )
 
 
-def test_moe_ep_groups_inherit_nccl_timeout():
+def test_moe_ep_groups_inherit_nccl_timeout(monkeypatch):
     moe_mesh = Mock()
     flat_mesh = Mock()
     flat_mesh.device_type = "cuda"
@@ -162,6 +192,8 @@ def test_moe_ep_groups_inherit_nccl_timeout():
     device_mesh = Mock()
     device_mesh.device_type = "cuda"
     device_mesh.__getitem__ = Mock(return_value=source_mesh)
+    monkeypatch.setattr(mesh_utils.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(mesh_utils.dist, "get_world_size", lambda: 64)
 
     result = _create_moe_mesh(device_mesh, ep_shard_size=4, ep_size=32, timeout_minutes=30)
 
@@ -171,6 +203,29 @@ def test_moe_ep_groups_inherit_nccl_timeout():
         backend, options = unflatten_override[axis]
         assert backend == "nccl"
         assert options._timeout == datetime.timedelta(minutes=30)
+    assert result is moe_mesh
+
+
+def test_moe_world_size_ep_reuses_default_process_group(monkeypatch):
+    moe_mesh = Mock()
+    flat_mesh = Mock()
+    flat_mesh.device_type = "cuda"
+    flat_mesh._unflatten = Mock(return_value=moe_mesh)
+    source_mesh = Mock()
+    source_mesh._flatten = Mock(return_value=flat_mesh)
+    device_mesh = Mock()
+    device_mesh.device_type = "cuda"
+    device_mesh.__getitem__ = Mock(return_value=source_mesh)
+    monkeypatch.setattr(mesh_utils.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(mesh_utils.dist, "get_world_size", lambda: 8)
+
+    result = _create_moe_mesh(device_mesh, ep_shard_size=1, ep_size=8, timeout_minutes=30)
+
+    unflatten_override = flat_mesh._unflatten.call_args.kwargs["backend_override"]
+    assert set(unflatten_override) == {MeshAxisName.EP_SHARD}
+    backend, options = unflatten_override[MeshAxisName.EP_SHARD]
+    assert backend == "nccl"
+    assert options._timeout == datetime.timedelta(minutes=30)
     assert result is moe_mesh
 
 
@@ -645,3 +700,35 @@ class TestGetFsdpDpMesh:
 
         mock_get_submesh.assert_called_once_with(mesh, ("my_rep", "my_shard_cp"))
         assert result is submesh_sentinel
+
+
+# ---------------------------------------------------------------------------
+# create_ring_ulysses_mesh
+# ---------------------------------------------------------------------------
+
+
+class TestCreateRingUlyssesMesh:
+    def _mesh_with_cp(self, cp_size):
+        cp_mesh = Mock()
+        cp_mesh.size = Mock(return_value=cp_size)
+        device_mesh = Mock()
+        device_mesh.__getitem__ = Mock(return_value=cp_mesh)
+        return device_mesh, cp_mesh
+
+    def test_reshapes_cp_axis_into_ring_ulysses(self, monkeypatch):
+        device_mesh, cp_mesh = self._mesh_with_cp(4)
+        result_sentinel = Mock()
+        unflatten = Mock(return_value=result_sentinel)
+        monkeypatch.setattr(mesh_utils, "_unflatten_compat", unflatten)
+
+        result = mesh_utils.create_ring_ulysses_mesh(device_mesh, ring_degree=2, ulysses_degree=2)
+
+        device_mesh.__getitem__.assert_called_once_with(MeshAxisName.CP)
+        unflatten.assert_called_once_with(cp_mesh, 0, (2, 2), ("ring", "ulysses"))
+        assert result is result_sentinel
+
+    def test_rejects_mismatched_ring_ulysses_product(self):
+        device_mesh, _ = self._mesh_with_cp(4)
+
+        with pytest.raises(ValueError, match="must equal"):
+            mesh_utils.create_ring_ulysses_mesh(device_mesh, ring_degree=2, ulysses_degree=4)

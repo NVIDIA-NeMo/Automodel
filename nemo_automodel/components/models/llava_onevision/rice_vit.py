@@ -17,7 +17,7 @@ Ported from lmms-lab/LLaVA-OneVision-1.5's modeling_llavaonevision1_5.py.
 """
 
 import math
-from typing import Optional, Tuple
+from typing import Tuple
 
 import torch
 import torch.nn as nn
@@ -128,7 +128,7 @@ class RiceAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         seq_length = hidden_states.shape[0]
         q, k, v = self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)

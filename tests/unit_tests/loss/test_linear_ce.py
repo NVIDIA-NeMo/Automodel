@@ -21,6 +21,65 @@ from nemo_automodel.components.loss.linear_ce import (
 )
 
 
+class _FakeMesh:
+    ndim = 1
+
+    @staticmethod
+    def size():
+        return 2
+
+
+class _FakeDTensor:
+    requires_grad = True
+    device_mesh = _FakeMesh()
+
+    def __init__(self):
+        self.grad_placements = None
+        self.full = torch.ones(4, requires_grad=True)
+
+    def full_tensor(self, *, grad_placements=None):
+        self.grad_placements = grad_placements
+        return self.full
+
+
+def test_flce_materialized_weight_reduces_partial_gradient_into_shard(monkeypatch):
+    from torch.distributed.tensor import Partial
+
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
+    weight = _FakeDTensor()
+    raw_grads = []
+
+    def capture_raw_grad(grad):
+        raw_grads.append(grad)
+        return grad
+
+    weight.full.register_hook(capture_raw_grad)
+
+    full = FusedLinearCrossEntropy.materialize_lm_weight(
+        weight,
+        grad_reduce_group=object(),
+    )
+    full.square().sum().backward()
+
+    assert len(weight.grad_placements) == 1
+    assert isinstance(weight.grad_placements[0], Partial)
+    # The normalization hook must return a new tensor instead of modifying the
+    # gradient object received by earlier hooks.
+    assert torch.equal(raw_grads[0], torch.full_like(weight.full, 2.0))
+    # Raw grad is 2; divide by the two-rank reduction world size restores 1.
+    assert torch.equal(weight.full.grad, torch.ones_like(weight.full))
+
+
+def test_flce_materialized_weight_rejects_mismatched_reduction_group(monkeypatch):
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 4)
+
+    with pytest.raises(ValueError, match="mesh size=2, reduction group size=4"):
+        FusedLinearCrossEntropy.materialize_lm_weight(
+            _FakeDTensor(),
+            grad_reduce_group=object(),
+        )
+
+
 @pytest.mark.skipif(not HAVE_CUT_CROSS_ENTROPY, reason="Linear loss CE is not installed")
 def test_fused_cross_entropy():
     """Tests FusedLinearCrossEntropy against PyTorch's CE.
@@ -113,50 +172,54 @@ def test_fused_cross_entropy_raises_when_dependency_missing(monkeypatch):
 def test_is_triton_greater_or_equal(monkeypatch):
     """Unit test for new_is_triton_greater_or_equal helper (lines 89-99).
 
-    We monkeypatch pkg_resources.get_distribution to control the installed
+    We monkeypatch importlib.metadata.version to control the installed
     version string and assert the comparison logic works as intended.
     """
 
-    import pkg_resources
-    from nemo_automodel.components.loss.linear_ce import new_is_triton_greater_or_equal
+    from importlib.metadata import PackageNotFoundError
 
-    class _DummyDist:
-        def __init__(self, version):
-            self.version = version
+    from nemo_automodel.components.loss import linear_ce as linear_ce_mod
+
+    def _metadata_version(versions):
+        def _version(package_name):
+            try:
+                return versions[package_name]
+            except KeyError:
+                raise PackageNotFoundError(package_name)
+
+        return _version
 
     # Case 1: installed version is higher ⇒ function returns True
-    monkeypatch.setattr(pkg_resources, "get_distribution", lambda _: _DummyDist("3.5.0"))
-    assert new_is_triton_greater_or_equal("3.1.0") is True
+    monkeypatch.setattr(linear_ce_mod, "metadata_version", _metadata_version({"pytorch-triton": "3.5.0"}))
+    assert linear_ce_mod.new_is_triton_greater_or_equal("3.1.0") is True
 
     # Case 2: installed version is lower ⇒ returns False
-    monkeypatch.setattr(pkg_resources, "get_distribution", lambda _: _DummyDist("2.9.0"))
-    assert new_is_triton_greater_or_equal("3.1.0") is False
+    monkeypatch.setattr(linear_ce_mod, "metadata_version", _metadata_version({"pytorch-triton": "2.9.0"}))
+    assert linear_ce_mod.new_is_triton_greater_or_equal("3.1.0") is False
 
-    # Case 3: package not installed ⇒ DistributionNotFound ⇒ returns False
-    def _raise_dist_not_found(_):
-        raise pkg_resources.DistributionNotFound
+    # Case 3: pytorch-triton package missing, but triton is installed ⇒ use triton
+    monkeypatch.setattr(linear_ce_mod, "metadata_version", _metadata_version({"triton": "3.5.0"}))
+    assert linear_ce_mod.new_is_triton_greater_or_equal("3.1.0") is True
 
-    monkeypatch.setattr(pkg_resources, "get_distribution", _raise_dist_not_found)
-    assert new_is_triton_greater_or_equal("3.1.0") is False
+    # Case 4: package not installed ⇒ PackageNotFoundError ⇒ returns False
+    def _raise_package_not_found(package_name):
+        raise PackageNotFoundError(package_name)
+
+    monkeypatch.setattr(linear_ce_mod, "metadata_version", _raise_package_not_found)
+    assert linear_ce_mod.new_is_triton_greater_or_equal("3.1.0") is False
 
 
 def test_is_triton_greater_or_equal_3_2_0(monkeypatch):
     """Ensure the convenience wrapper compares against 3.1.0 (despite name)."""
 
-    import pkg_resources
-    from nemo_automodel.components.loss.linear_ce import (
-        new_is_triton_greater_or_equal_3_2_0,
-    )
+    from nemo_automodel.components.loss import linear_ce as linear_ce_mod
 
-    class _DummyDist:
-        def __init__(self, version):
-            self.version = version
+    monkeypatch.setattr(linear_ce_mod, "metadata_version", lambda _: "3.5.0")
+    assert linear_ce_mod.new_is_triton_greater_or_equal_3_2_0() is True
 
-    monkeypatch.setattr(pkg_resources, "get_distribution", lambda _: _DummyDist("3.5.0"))
-    assert new_is_triton_greater_or_equal_3_2_0() is True
+    monkeypatch.setattr(linear_ce_mod, "metadata_version", lambda _: "3.0.0")
+    assert linear_ce_mod.new_is_triton_greater_or_equal_3_2_0() is False
 
-    monkeypatch.setattr(pkg_resources, "get_distribution", lambda _: _DummyDist("3.0.0"))
-    assert new_is_triton_greater_or_equal_3_2_0() is False
 
 def test_fused_cross_entropy_normalizes_by_num_tokens(monkeypatch):
     """When num_label_tokens is passed and reduction='sum', the returned loss
@@ -173,7 +236,7 @@ def test_fused_cross_entropy_normalizes_by_num_tokens(monkeypatch):
     def _fake_linear_ce(hidden, weight, targets=None, **kwargs):  # noqa: D401,E501 - signature match not required
         return torch.tensor(20.0)
 
-    monkeypatch.setattr(linear_ce_mod, "linear_cross_entropy", _fake_linear_ce)
+    monkeypatch.setattr(linear_ce_mod, "linear_cross_entropy", _fake_linear_ce, raising=False)
 
     loss_fn = linear_ce_mod.FusedLinearCrossEntropy(reduction="sum")
 

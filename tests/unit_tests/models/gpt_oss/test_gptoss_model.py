@@ -22,7 +22,7 @@ from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.gpt_oss.model import Block, GptOssForCausalLM, GptOssModel
 from nemo_automodel.components.moe.config import MoEConfig
-from nemo_automodel.components.moe.layers import MLP, MoE
+from nemo_automodel.components.moe.layers import MoE
 
 
 @pytest.fixture
@@ -194,43 +194,6 @@ class TestBlock:
             else:
                 padding_mask = kwargs.get("padding_mask")
             assert padding_mask is not None
-
-    def test_mlp_handling_regular_mlp(self, gpt_config, backend_config, device):
-        """Test _mlp method with regular MLP."""
-        # Create a config that would result in regular MLP
-        moe_config = MoEConfig(
-            dim=128,
-            inter_dim=256,
-            moe_inter_dim=256,
-            n_routed_experts=0,
-            n_shared_experts=1,
-            n_activated_experts=1,
-            n_expert_groups=1,
-            n_limited_groups=1,
-            train_gate=True,
-            gate_bias_update_factor=0,
-            score_func="softmax",
-            route_scale=1.0,
-            aux_loss_coeff=0.01,
-            norm_topk_prob=False,
-            expert_bias=True,
-            router_bias=True,
-            expert_activation="quick_geglu",
-            activation_alpha=1.702,
-            activation_limit=7.0,
-        )
-
-        block = Block(0, gpt_config, moe_config, backend_config)
-
-        # Manually replace with regular MLP for testing
-        block.mlp = MLP(dim=128, inter_dim=256, backend="torch")
-        block = block.to(device)
-
-        x = torch.randn(2, 8, 128, dtype=torch.bfloat16, device=device)
-        output = block._mlp(x, padding_mask=None)
-
-        assert output.shape == x.shape
-        assert output.device == device
 
     def test_init_weights(self, gpt_config, moe_config, backend_config, device):
         """Test Block weight initialization."""
@@ -499,6 +462,40 @@ class TestGptOssForCausalLM:
             assert output.ndim == 3
             assert output.shape == (batch_size, seq_len, gpt_config.vocab_size)
 
+    def test_forward_infers_thd_from_cu_seqlens(self, gpt_config, backend_config, device):
+        """Packed THD metadata should be enough to select the THD model path."""
+        model = GptOssForCausalLM(gpt_config, backend=backend_config)
+        model = model.to(device)
+
+        total_tokens = 16
+        input_ids = torch.randint(0, gpt_config.vocab_size, (1, total_tokens), dtype=torch.long, device=device)
+        position_ids = torch.arange(total_tokens, device=device).unsqueeze(0)
+        attention_mask = torch.ones(1, total_tokens, dtype=torch.bool, device=device)
+        cu_seqlens = torch.tensor([[0, 8, 16]], dtype=torch.int32, device=device)
+
+        with patch.object(model.model, "forward") as mock_model:
+            mock_model.return_value = torch.randn(
+                total_tokens, gpt_config.hidden_size, dtype=torch.bfloat16, device=device
+            )
+
+            output = model(
+                input_ids,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                cu_seqlens=cu_seqlens,
+                output_hidden_states=True,
+            )
+
+        actual_input_ids = mock_model.call_args.args[0]
+        actual_kwargs = mock_model.call_args.kwargs
+        assert actual_input_ids.shape == (total_tokens,)
+        assert actual_kwargs["position_ids"].shape == (total_tokens,)
+        assert actual_kwargs["attention_mask"] is None
+        assert actual_kwargs["qkv_format"] == "thd"
+        assert torch.equal(actual_kwargs["cu_seqlens"], torch.tensor([0, 8, 16], dtype=torch.int32, device=device))
+        assert output.logits.shape == (1, total_tokens, gpt_config.vocab_size)
+        assert output.hidden_states.shape == (1, total_tokens, gpt_config.hidden_size)
+
     def test_initialize_weights(self, gpt_config, backend_config, device):
         """Test weight initialization."""
         model = GptOssForCausalLM(gpt_config, backend=backend_config)
@@ -635,6 +632,50 @@ class TestGptOssAttentionTHD:
             # Output should be 2D [T, hidden] (THD flattened)
             assert output.ndim == 2
             assert output.shape[0] == total_tokens
+
+    def test_thd_metadata_clears_attention_mask_before_backend(self, gpt_config, backend_config, device):
+        """THD cu_seqlens must take precedence over padding-mask style TE preprocessing."""
+        import nemo_automodel.components.models.gpt_oss.layers as gpt_oss_layers
+        from nemo_automodel.components.models.gpt_oss.layers import GptOssAttention
+
+        attn = GptOssAttention(gpt_config, backend=backend_config).to(device)
+        attn.backend.attn = "te"
+        total_tokens = 16
+        x = torch.randn(1, total_tokens, gpt_config.hidden_size, dtype=torch.bfloat16, device=device)
+        freqs_cis = torch.randn(total_tokens, gpt_config.head_dim, dtype=torch.bfloat16, device=device)
+        cu_seqlens = torch.tensor([0, 8, 16], dtype=torch.int32, device=device)
+        attention_mask = torch.ones(1, total_tokens, dtype=torch.bool, device=device)
+        captured = {}
+
+        def fake_preprocess(q, k, v, attention_mask, attn_impl, **kwargs):
+            captured["attention_mask"] = attention_mask
+            captured["attn_impl"] = attn_impl
+            captured["kwargs"] = dict(kwargs)
+            return q, k, v, {}
+
+        with (
+            patch.object(gpt_oss_layers, "apply_rotary_emb_qk", side_effect=lambda q, k, *args, **kwargs: (q, k)),
+            patch.object(gpt_oss_layers, "preprocess_args_and_kwargs_for_attn", side_effect=fake_preprocess),
+            patch.object(attn, "attn_func") as mock_attn,
+        ):
+            mock_attn.return_value = torch.randn(
+                total_tokens,
+                gpt_config.num_attention_heads,
+                gpt_config.head_dim,
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            output = attn(
+                x,
+                freqs_cis=freqs_cis,
+                attention_mask=attention_mask,
+                cu_seqlens=cu_seqlens,
+            )
+
+        assert captured["attention_mask"] is None
+        assert captured["kwargs"]["qkv_format"] == "thd"
+        assert torch.equal(captured["kwargs"]["cu_seqlens"], cu_seqlens)
+        assert output.shape == (total_tokens, gpt_config.hidden_size)
 
 
 class TestRopeUtilsTHD:

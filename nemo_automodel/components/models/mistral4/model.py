@@ -13,13 +13,12 @@
 # limitations under the License.
 
 from dataclasses import dataclass
-from typing import Any, Optional, Union
+from typing import Any, Union
 
 import torch
 import torch.nn as nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from nemo_automodel.components.checkpoint.utils import reject_unsupported_tied_word_embeddings
 from nemo_automodel.components.models.common import (
     BackendConfig,
     compute_lm_head_logits,
@@ -28,12 +27,18 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.deepseek_v3.layers import MLA
 from nemo_automodel.components.models.deepseek_v3.model import Block
 from nemo_automodel.components.models.deepseek_v3.rope_utils import (
     apply_rotary_emb_qk,
     freqs_cis_from_position_ids,
     precompute_freqs_cis,
+    yarn_get_mscale,
 )
 from nemo_automodel.components.models.mistral4.state_dict_adapter import (
     Mistral4MultimodalStateDictAdapter,
@@ -55,13 +60,31 @@ def _get_llama_4_attn_scale(position_ids: torch.Tensor, beta: float, max_positio
 class Mistral4MLA(MLA):
     """MLA with Llama 4 attention scaling for Mistral 4.
 
-    Compared to DeepSeek V3 MLA, adds position-dependent scaling to q_pe after RoPE
+    Compared to DeepSeek V3 MLA, adds position-dependent scaling to the query after RoPE
     (llama_4_scaling_beta). RoPE itself uses the same complex-number approach as DSV3.
     """
 
     def __init__(self, config, backend: BackendConfig):
-        super().__init__(config, backend)
+        super().__init__(config, backend, latent_norm_eps=1e-6)
+        from nemo_automodel.components.attention.utils import initialize_attn_module_and_func
+
+        # Transformers 5.15 applies YaRN's all-dimension multiplier in addition to
+        # the position-dependent Llama 4 query scaling. Use mscale_all_dim here;
+        # mscale controls the rotary dimensions and need not have the same value.
         rope_parameters = config.rope_parameters if hasattr(config, "rope_parameters") else config.rope_scaling
+        self.softmax_scale = self.qk_head_dim**-0.5
+        if rope_parameters and rope_parameters.get("rope_type", rope_parameters.get("type", "default")) != "default":
+            mscale_all_dim = rope_parameters.get("mscale_all_dim", 0)
+            if mscale_all_dim:
+                mscale = yarn_get_mscale(rope_parameters["factor"], mscale_all_dim)
+                self.softmax_scale *= mscale * mscale
+        self.attn_module, self.attn_func = initialize_attn_module_and_func(
+            attn_impl=backend.attn,
+            num_attention_heads=self.n_heads,
+            num_qk_channels=self.qk_head_dim,
+            num_v_channels=self.v_head_dim,
+            softmax_scale=self.softmax_scale,
+        )
         self.llama_4_scaling_beta = rope_parameters.get("llama_4_scaling_beta") if rope_parameters else None
         self.llama_4_orig_max_pos = rope_parameters.get("original_max_position_embeddings") if rope_parameters else None
 
@@ -71,7 +94,20 @@ class Mistral4MLA(MLA):
         freqs_cis: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         **attn_kwargs: Any,
-    ):
+    ) -> torch.Tensor:
+        """Apply Mistral 4 multi-head latent attention.
+
+        Args:
+            x: Tensor of shape [batch, sequence, hidden] for BSHD input or [tokens, hidden] for THD input.
+            freqs_cis: Rotary frequencies of shape [batch, sequence, rope_dim / 2] for non-fused BSHD,
+                [tokens, rope_dim / 2] for non-fused THD, or [sequence, 1, 1, rope_dim] for fused RoPE.
+            attention_mask: Optional tensor of shape [batch, sequence] or an explicit mask broadcastable to
+                [batch, heads, query_sequence, key_sequence].
+            **attn_kwargs: Backend metadata such as packed-sequence offsets, position IDs, and CP rank information.
+
+        Returns:
+            Tensor of shape [batch, sequence, hidden] for BSHD input or [tokens, hidden] for THD input.
+        """
         from nemo_automodel.components.attention.utils import (
             postprocess_output_for_attn,
             preprocess_args_and_kwargs_for_attn,
@@ -116,18 +152,18 @@ class Mistral4MLA(MLA):
             cp_rank=attn_kwargs.get("cp_rank", 0),
         )
 
-        # Llama 4 attention scaling on q_pe (no-op for positions < orig_max_pos)
+        q = torch.cat([q_nope, q_pe], dim=-1)
+
+        # Llama 4 attention scaling on the full query (no-op for positions < orig_max_pos).
         if self.llama_4_scaling_beta is not None:
             position_ids = attn_kwargs.get("position_ids", None)
             if position_ids is not None:
                 attn_scale = _get_llama_4_attn_scale(
                     position_ids, self.llama_4_scaling_beta, self.llama_4_orig_max_pos
-                ).to(q_pe.dtype)
-                q_pe = q_pe * attn_scale.unsqueeze(-1)
+                ).to(q.dtype)
+                q = q * attn_scale.unsqueeze(-1)
 
         k_pe = k_pe.squeeze(head_unsqueeze_dim)
-
-        q = torch.cat([q_nope, q_pe], dim=-1)
 
         kv = self.kv_b_proj(kv)
         if qkv_format == "thd":
@@ -173,11 +209,19 @@ def _build_moe_config(config, moe_overrides: dict | None = None) -> MoEConfig:
         n_expert_groups=config.n_group,
         n_limited_groups=config.topk_group,
         train_gate=True,
-        gate_bias_update_factor=1e-3,
+        # HF and vLLM use bias-free Mistral4 routing. Learning a DeepSeek-style
+        # correction changes routing after export because HF ignores that tensor.
+        gate_bias_update_factor=0.0,
+        # Preserve the buffer when reading older AutoModel checkpoints; new
+        # training keeps it zero unless bias updates are explicitly requested.
+        force_e_score_correction_bias=True,
         score_func="softmax_with_bias",
         route_scale=config.routed_scaling_factor,
         aux_loss_coeff=0,
         norm_topk_prob=config.norm_topk_prob,
+        # vLLM's Mistral router retains FP32 selected probabilities. Preserve
+        # our FP32 scoring result through dispatch instead of rounding to BF16.
+        router_weights_fp32=True,
         dtype=get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16),
     )
     if moe_overrides:
@@ -278,7 +322,7 @@ class Mistral4Model(nn.Module):
     def update_moe_gate_bias(self) -> None:
         with torch.no_grad():
             for _, block in self.layers.named_children():
-                if isinstance(block.mlp, MoE):
+                if isinstance(block.mlp, MoE) and block.mlp.gate.bias_update_factor > 0:
                     block.mlp.gate.update_bias()
 
     @torch.no_grad()
@@ -305,6 +349,9 @@ class Mistral4Model(nn.Module):
 
 
 class Mistral4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
+    tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+    _keep_in_fp32_modules_strict = ["e_score_correction_bias"]
+
     @dataclass(frozen=True)
     class ModelCapabilities:
         """Declared parallelism capabilities for this model class."""
@@ -348,7 +395,7 @@ class Mistral4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         super().__init__()
         # Reject an unsupported tied request on the controlling top-level flag
         # before unwrapping to text_config below.
-        reject_unsupported_tied_word_embeddings(config, type(self).__name__)
+        reject_unsupported_tie_word_embeddings(type(self), config)
         # Extract text_config if this is a multimodal wrapper config
         config = getattr(config, "text_config", config)
         self.config = config
@@ -389,7 +436,7 @@ class Mistral4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
-        output_hidden_states: Optional[bool] = None,
+        output_hidden_states: bool | None = None,
         **attn_kwargs: Any,
     ) -> CausalLMOutputWithPast:
         output_hidden_states = (
@@ -420,7 +467,7 @@ class Mistral4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     def update_moe_gate_bias(self) -> None:
         with torch.no_grad():
             for _, block in self.model.layers.named_children():
-                if isinstance(block.mlp, MoE):
+                if isinstance(block.mlp, MoE) and block.mlp.gate.bias_update_factor > 0:
                     block.mlp.gate.update_bias()
 
     @torch.no_grad()
@@ -441,7 +488,7 @@ class Mistral4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                     b=cutoff_factor * final_out_std,
                 )
 
-        self.to(dtype)
+        cast_model_to_dtype(self, dtype)
         with buffer_device:
             rope_theta, rope_scaling, _ = get_rope_config(self.config)
             self.model.freqs_cis = precompute_freqs_cis(
@@ -675,6 +722,13 @@ if _HF_MISTRAL3_AVAILABLE:
         (not HF PreTrainedModel) to avoid FSDP conflicts.
         """
 
+        # Head lives in the Mistral4 text backbone (separate lm_head, no tie
+        # mechanism); the controlling flag is on the nested text_config.
+        tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+        # The checkpoint initializer casts the whole wrapper to the parameter dtype.
+        # Preserve rotary frequencies before that cast; upcasting afterward loses precision.
+        _keep_in_fp32_modules_strict = ["e_score_correction_bias", "freqs_cis"]
+
         @dataclass(frozen=True)
         class ModelCapabilities:
             """Declared parallelism capabilities for this model class."""
@@ -720,6 +774,9 @@ if _HF_MISTRAL3_AVAILABLE:
             **kwargs,
         ):
             super().__init__()
+            # Read the nested text_config flag: the composite Mistral3Config top-level
+            # defaults to tie=True and does not reflect the untied Mistral4 backbone.
+            reject_unsupported_tie_word_embeddings(type(self), config.text_config)
             backend = backend or BackendConfig()
             num_hidden_layers = kwargs.pop("num_hidden_layers", None)
             if num_hidden_layers is not None:
@@ -853,7 +910,7 @@ if _HF_MISTRAL3_AVAILABLE:
         def update_moe_gate_bias(self) -> None:
             with torch.no_grad():
                 for _, block in self.model.language_model.layers.named_children():
-                    if isinstance(block.mlp, MoE):
+                    if isinstance(block.mlp, MoE) and block.mlp.gate.bias_update_factor > 0:
                         block.mlp.gate.update_bias()
 
         @torch.no_grad()
@@ -876,7 +933,7 @@ if _HF_MISTRAL3_AVAILABLE:
                         b=cutoff_factor * final_out_std,
                     )
 
-            self.to(dtype)
+            cast_model_to_dtype(self, dtype)
 
 
 ModelClass = Mistral4ForCausalLM

@@ -24,6 +24,10 @@ from nemo_automodel.components.models.gpt_oss.layers import (
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.shared.import_utils import is_te_min_version
 
+# Over the default 5s budget on purpose: CUDA FlexAttention compilation takes longer on a cold worker.
+# Reduce cold compiler startup before lowering this further.
+pytestmark = pytest.mark.timeout(60)
+
 
 @pytest.fixture
 def device():
@@ -231,6 +235,7 @@ class TestGptOssAttention:
 
         assert attention.yarn_concentration is None
 
+    @pytest.mark.skip(reason="TE fused RoPE force-disabled globally in BackendConfig.__post_init__; see #3027")
     def test_yarn_concentration_set_with_rope_fusion(self, gpt_config_with_rope_scaling, backend_config_with_rope_fusion):
         """Test that yarn_concentration is correctly computed when rope_fusion is True."""
         import math
@@ -241,6 +246,7 @@ class TestGptOssAttention:
         expected_concentration = 0.1 * math.log(2.0) + 1.0
         assert abs(attention.yarn_concentration - expected_concentration) < 1e-6
 
+    @pytest.mark.skip(reason="TE fused RoPE force-disabled globally in BackendConfig.__post_init__; see #3027")
     def test_yarn_concentration_different_scaling_factors(self, backend_config_with_rope_fusion):
         """Test yarn_concentration with different scaling factors."""
         import math

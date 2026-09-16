@@ -197,7 +197,7 @@ class GPTOSSStateDictAdapter(StateDictAdapter):
         return out
 
     def to_hf(
-        self, state_dict: dict[str, Any], exclude_key_regex: Optional[str] = None, quantization: bool = False, **kwargs
+        self, state_dict: dict[str, Any], exclude_key_regex: str | None = None, quantization: bool = False, **kwargs
     ) -> dict[str, Any]:
         """Convert from native model state dict to HuggingFace format."""
         hf_state_dict = {}

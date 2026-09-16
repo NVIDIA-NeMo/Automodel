@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional
 
 import torch
 
@@ -117,7 +116,7 @@ class TEParallelCrossEntropy:
         self,
         ignore_index: int = -100,
         reduction: str = "sum",
-        tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        tp_group: torch.distributed.ProcessGroup | None = None,
     ):
         """
         Cross entropy loss module based on TransformerEngine's parallel cross entropy triton kernel.
@@ -135,8 +134,8 @@ class TEParallelCrossEntropy:
         self,
         logits: torch.Tensor,
         labels: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
-        num_label_tokens: Optional[int] = None,
+        mask: torch.Tensor | None = None,
+        num_label_tokens: int | None = None,
     ) -> torch.Tensor:
         """
         Compute parallel cross entropy loss that matches PyTorch's cross_entropy behavior.

@@ -12,8 +12,35 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
+from dataclasses import dataclass
+
 import torch
 from torch.utils.data import IterableDataset
+
+
+@dataclass
+class MockIterableDatasetConfig:
+    """Construction-time configuration for :class:`MockIterableDataset`."""
+
+    vocab_size: int = 1024
+    """Size of the vocabulary for generating random tokens."""
+    seq_len: int = 1024
+    """Sequence length for each sample."""
+    num_samples: int = 1000000
+    """Total number of samples to generate (1M for an infinite-like dataset)."""
+    batch_size: int = 1
+    """Batch size to yield (1 for unbatched samples)."""
+
+    def build(self) -> "MockIterableDataset":
+        """Build a :class:`MockIterableDataset` from this :class:`MockIterableDatasetConfig`."""
+        return MockIterableDataset(
+            vocab_size=self.vocab_size,
+            seq_len=self.seq_len,
+            num_samples=self.num_samples,
+            batch_size=self.batch_size,
+        )
 
 
 class MockIterableDataset(IterableDataset):

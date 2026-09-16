@@ -15,7 +15,46 @@
 import pytest
 from datasets import Dataset
 
-from nemo_automodel.components.datasets.llm.packed_sequence import pack_dataset
+from nemo_automodel.components.datasets.llm.packed_sequence import pack_dataset, tokenize_dataset_parallel
+
+
+class _FakeTokenizingDataset:
+    """Minimal map-style dataset that "tokenizes" lazily in ``__getitem__``.
+
+    Each row is a deterministic function of the index so that both order and
+    per-index content can be asserted after parallel materialization. Defined at
+    module scope so it is picklable to ``datasets.map`` worker processes.
+    """
+
+    def __init__(self, n: int, with_loss_mask: bool = True):
+        self.n = n
+        self.with_loss_mask = with_loss_mask
+
+    def __len__(self) -> int:
+        return self.n
+
+    def __getitem__(self, idx: int) -> dict:
+        # Sequence protocol: raise IndexError so ``for row in ds`` terminates.
+        if idx >= self.n:
+            raise IndexError(idx)
+        row = {"input_ids": [idx, idx + 1, idx + 2], "labels": [-100, idx + 1, idx + 2]}
+        if self.with_loss_mask:
+            row["loss_mask"] = [0, 1, 1]
+        return row
+
+
+class _RemappingDataset(_FakeTokenizingDataset):
+    """``__getitem__`` returns a different index's content (skip-advance style).
+
+    Mirrors ``ColumnMappedTextInstructionDataset``'s fallback where ``ds[i]`` may
+    return a neighbouring row, so ``__getitem__`` is not the identity on ``idx``.
+    Parallel materialization must still reproduce ``ds[i]`` exactly.
+    """
+
+    def __getitem__(self, idx: int) -> dict:
+        if idx >= self.n:
+            raise IndexError(idx)
+        return super().__getitem__((idx + 1) % self.n)
 
 
 @pytest.fixture
@@ -539,3 +578,80 @@ def test_cp_aware_packing_multiple_sequences():
     # All should be divisible by 2*cp_size = 4
     for length in seq_lens_padded:
         assert length % 4 == 0
+
+
+def _materialize_serial(ds):
+    """Reference: exactly what the serial packing loop consumes."""
+    return [ds[i] for i in range(len(ds))]
+
+
+@pytest.mark.parametrize("num_proc", [1, 2])
+def test_tokenize_dataset_parallel_matches_serial(num_proc):
+    """Parallel materialization is row-for-row identical to serial iteration."""
+    ds = _FakeTokenizingDataset(n=13)
+    serial = _materialize_serial(ds)
+
+    materialized = tokenize_dataset_parallel(ds, num_proc=num_proc)
+
+    assert len(materialized) == len(serial)
+    for i in range(len(serial)):
+        row = materialized[i]
+        assert set(row.keys()) == set(serial[i].keys())
+        for key in serial[i]:
+            assert list(row[key]) == list(serial[i][key]), (i, key)
+
+
+def test_tokenize_dataset_parallel_preserves_getitem_semantics():
+    """A dataset whose __getitem__ remaps the index is reproduced faithfully."""
+    ds = _RemappingDataset(n=7)
+    serial = _materialize_serial(ds)
+
+    materialized = tokenize_dataset_parallel(ds, num_proc=2)
+
+    assert [row["input_ids"] for row in materialized] == [row["input_ids"] for row in serial]
+    # Row i must carry row (i+1)'s content, not row i's raw index.
+    assert materialized[0]["input_ids"] == [1, 2, 3]
+
+
+def test_tokenize_dataset_parallel_no_loss_mask():
+    """Datasets without a loss_mask column materialize without inventing keys."""
+    ds = _FakeTokenizingDataset(n=5, with_loss_mask=False)
+
+    materialized = tokenize_dataset_parallel(ds, num_proc=2)
+
+    assert set(materialized.column_names) == {"input_ids", "labels"}
+    assert len(materialized) == 5
+
+
+@pytest.mark.parametrize("with_loss_mask", [False, True])
+def test_pack_over_pretokenized_matches_lazy(with_loss_mask):
+    """thd packing the pre-tokenized dataset yields identical packs to packing the lazy one.
+
+    Covers the ``loss_mask`` branch (``sample.pop("loss_mask")``) once rows come
+    from a materialized HF ``Dataset`` column instead of the lazy dict.
+    """
+    ds = _FakeTokenizingDataset(n=20, with_loss_mask=with_loss_mask)
+
+    packs_lazy = pack_dataset(ds, split="train", packed_sequence_size=8)
+    packs_pre = pack_dataset(tokenize_dataset_parallel(ds, num_proc=2), split="train", packed_sequence_size=8)
+
+    assert len(packs_lazy) == len(packs_pre)
+    for i in range(len(packs_lazy)):
+        for key in ("input_ids", "labels", "position_ids", "seq_lens"):
+            assert list(packs_lazy[i][key]) == list(packs_pre[i][key]), (i, key)
+
+
+def test_neat_pack_over_pretokenized_matches_lazy():
+    """neat (greedy-knapsack) packing is identical whether tokenized lazily or in parallel."""
+    from nemo_automodel.components.datasets.llm.neat_packing import neat_pack_dataset
+
+    ds = _FakeTokenizingDataset(n=20, with_loss_mask=True)
+
+    packs_lazy = neat_pack_dataset(ds, split="train", pack_size=8)
+    packs_pre = neat_pack_dataset(tokenize_dataset_parallel(ds, num_proc=2), split="train", pack_size=8)
+
+    assert len(packs_lazy) == len(packs_pre)
+    assert packs_lazy.column_names == packs_pre.column_names
+    for i in range(len(packs_lazy)):
+        for key in packs_lazy.column_names:
+            assert list(packs_lazy[i][key]) == list(packs_pre[i][key]), (i, key)

@@ -9,8 +9,9 @@
 # before the first forward (resident-weight peak, not fixable by seq_length /
 # activation_checkpointing). target_num_hidden_layers=4 loads only the first 4 layers
 # so the whole EP / hidden-capture / draft-training pipeline runs end to end on one
-# node. target_layer_ids=[1,2,3] is the 4-layer equivalent of the full target's late
-# layers [40,41,42]. A draft trained here is a pipeline check, not a usable drafter.
+# node. target_layer_ids=[0,1,2] is the 4-layer equivalent of the full target's late
+# layers [39,40,41] (kept within [0, N-2] for SGLang servability). A draft trained here
+# is a pipeline check, not a usable drafter.
 #
 # Prereq: DeepEP (or HybridEP) installed, 8x>=80GB GPUs, V4-Flash weights local.
 # Run via: tests/functional_tests/speculative/run_deepseek_v4_flash_smoke.sh
@@ -56,7 +57,7 @@ recipe_args:
   block_size: 5
   num_anchors: 16                # smoke: few anchors per sequence
   mask_token_id: 128799
-  target_layer_ids: [1, 2, 3]    # 4-layer equivalent of the full target's late layers [40,41,42]
+  target_layer_ids: [0, 1, 2]    # 4-layer equivalent of the full target's late layers [39,40,41] (within [0, N-2] for SGLang servability)
   freeze_embeddings: true
 
   # --- frozen V4 target backend (the real EP path) ---

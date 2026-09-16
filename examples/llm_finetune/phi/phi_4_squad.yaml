@@ -108,7 +108,6 @@ ci:
   node_multiplier: true
   vllm_deploy: true
   checkpoint_robustness:
-    hf_kl_threshold: 2e-3
     tokenizer_name: microsoft/phi-4
     dataset.limit_dataset_samples: 500
     validation_dataset.limit_dataset_samples: 500

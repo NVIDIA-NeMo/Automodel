@@ -25,14 +25,16 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+import torch.nn as nn
 
 from nemo_automodel._transformers.capabilities import ModelSupports, _uses_magi_attention
 
 
-class _BackendModel:
+class _BackendModel(nn.Module):
     """Custom-model stand-in carrying a BackendConfig-like ``backend.attn``."""
 
     def __init__(self, attn: str):
+        super().__init__()
         self.backend = SimpleNamespace(attn=attn)
         self.config = SimpleNamespace()  # no hybrid markers
 

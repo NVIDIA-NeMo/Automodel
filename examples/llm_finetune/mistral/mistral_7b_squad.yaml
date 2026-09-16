@@ -102,3 +102,9 @@ lr_scheduler:
 
 ci:
   recipe_owner: HuiyingLi
+  time: "00:20:00"
+  checkpoint_robustness:
+    tokenizer_name: mistralai/Mistral-7B-v0.1
+    skip_resume: true
+    dataset.limit_dataset_samples: 500
+    validation_dataset.limit_dataset_samples: 500

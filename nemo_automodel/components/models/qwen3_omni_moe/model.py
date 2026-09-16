@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass
-from typing import Any, Optional, Union
+from typing import Any, Union
 
 import torch
 import torch.nn as nn
@@ -29,9 +29,12 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeThinkerTextRotaryEmbedding as HFQwen3OmniMoeThinkerTextRotaryEmbedding,
 )
 
-from nemo_automodel.components.checkpoint.utils import reject_unsupported_tied_word_embeddings
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module, initialize_rms_norm_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
 from nemo_automodel.components.models.qwen3_moe.model import Block
 from nemo_automodel.components.models.qwen3_omni_moe.state_dict_adapter import Qwen3OmniMoeStateDictAdapter
@@ -220,6 +223,8 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
 ):
     """Qwen3OmniMoe Thinker for Conditional Generation with multimodal support."""
 
+    tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+
     @dataclass(frozen=True)
     class ModelCapabilities:
         """Declared parallelism capabilities for this model class."""
@@ -258,7 +263,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
     ):
         base_config = config.thinker_config if hasattr(config, "thinker_config") else config
         backend = backend or BackendConfig()
-        reject_unsupported_tied_word_embeddings(config, type(self).__name__)
+        reject_unsupported_tie_word_embeddings(type(self), config)
 
         # _init_model() only overrides the top-level hf_config.torch_dtype; for
         # Omni configs the real params live under thinker_config.text_config /
@@ -339,7 +344,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         use_audio_in_video: bool | None = None,
         video_second_per_grid: torch.Tensor | None = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
-        output_hidden_states: Optional[bool] = None,
+        output_hidden_states: bool | None = None,
         **attn_kwargs: Any,
     ) -> torch.Tensor | dict | CausalLMOutputWithPast:
         """Forward pass with multimodal fusion.
@@ -451,7 +456,11 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         # Images
         if pixel_values is not None:
             image_features = self.get_image_features(pixel_values, image_grid_thw)
+            # transformers >=5.15 returns one tensor per image; earlier versions
+            # return them already stacked.
             image_embeds = image_features.pooler_output
+            if not torch.is_tensor(image_embeds):
+                image_embeds = torch.cat(image_embeds, dim=0)
             image_embeds_multiscale = image_features.deepstack_features
             image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             image_mask, _, _ = self.get_placeholder_mask(
@@ -464,7 +473,11 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         # Videos
         if pixel_values_videos is not None:
             video_features = self.get_video_features(pixel_values_videos, video_grid_thw)
+            # transformers >=5.15 returns one tensor per video; earlier versions
+            # return them already stacked.
             video_embeds = video_features.pooler_output
+            if not torch.is_tensor(video_embeds):
+                video_embeds = torch.cat(video_embeds, dim=0)
             video_embeds_multiscale = video_features.deepstack_features
             video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             _, video_mask, _ = self.get_placeholder_mask(

@@ -11,13 +11,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
+
 import logging
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, ClassVar
 
 from datasets import load_dataset
+
+if TYPE_CHECKING:
+    from transformers import PreTrainedTokenizerBase
 
 from nemo_automodel.components.datasets.lazy_mapped_dataset import LazyMappedDataset
 from nemo_automodel.components.datasets.llm.formatting_utils import (
     _add_pad_token,
+    _resolve_chat_template,
     format_chat_template,
     format_prompt_completion,
 )
@@ -74,6 +82,7 @@ def make_squad_dataset(
     dataset_name="squad",
     padding=False,
     truncation=False,
+    chat_template: str | None = None,
 ):
     """
     Load and preprocess a SQuAD-style QA dataset for model fine-tuning.
@@ -100,6 +109,7 @@ def make_squad_dataset(
             (default "rajpurkar/squad").
         padding (Optional[str|bool]): Optional padding strategy.
         truncation (Optional[str|bool]): Optional truncation strategy.
+        chat_template: Optional Jinja template string or path overriding ``tokenizer.chat_template``.
 
     Returns:
         A Hugginggth Face Dataset where each example is a dict with keys:
@@ -117,6 +127,8 @@ def make_squad_dataset(
     dataset = load_dataset(dataset_name, split=split)
 
     # format the dataset
+    if chat_template is not None:
+        tokenizer.chat_template = _resolve_chat_template(chat_template)
     chat_template = getattr(tokenizer, "chat_template", None)
     eos_token_id = getattr(tokenizer, "eos_token_id", 0)
     # if pad_token_id is not set, use eos_token_id
@@ -134,3 +146,41 @@ def make_squad_dataset(
 
     # map the dataset
     return LazyMappedDataset(dataset, fmt_fn)
+
+
+@dataclass
+class SquadConfig:
+    """Construction-time configuration for the SQuAD dataset (tokenizer is a build arg)."""
+
+    accepts_tokenizer: ClassVar[bool] = True
+
+    seq_length: int | None = None
+    """If set, pad/truncate each example to this length."""
+    limit_dataset_samples: int | None = None
+    """If set, limit the number of examples loaded from the split."""
+    fp8: bool = False
+    """Flag reserved for future mixed-precision use (currently unused)."""
+    split: str = "train"
+    """Which split of the dataset to load (e.g. ``train``, ``validation``)."""
+    dataset_name: str = "squad"
+    """Identifier for the HuggingFace dataset to load."""
+    padding: bool | str = False
+    """Optional padding strategy."""
+    truncation: bool | str = False
+    """Optional truncation strategy."""
+    chat_template: str | None = None
+    """Optional Jinja template string or path overriding ``tokenizer.chat_template``."""
+
+    def build(self, *, tokenizer: "PreTrainedTokenizerBase | None") -> LazyMappedDataset:
+        """Build the SQuAD :class:`LazyMappedDataset` from this :class:`SquadConfig` and a runtime tokenizer."""
+        return make_squad_dataset(
+            tokenizer=tokenizer,
+            seq_length=self.seq_length,
+            limit_dataset_samples=self.limit_dataset_samples,
+            fp8=self.fp8,
+            split=self.split,
+            dataset_name=self.dataset_name,
+            padding=self.padding,
+            truncation=self.truncation,
+            chat_template=self.chat_template,
+        )

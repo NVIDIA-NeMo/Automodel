@@ -1,6 +1,7 @@
 ---
 title: "FLUX.1-dev"
 description: ""
+slug: model-coverage/diffusion/black-forest-labs/flux-1-dev
 ---
 [FLUX.1-dev](https://huggingface.co/black-forest-labs/FLUX.1-dev) is a 12B parameter text-to-image diffusion transformer from Black Forest Labs, trained with flow matching. It produces high-fidelity images and is designed for non-commercial research and development use.
 
@@ -38,23 +39,18 @@ description: ""
 
 ## Try with NeMo AutoModel
 
-**1. Install** ([full instructions](/get-started/installation)):
-
-```bash
-pip install "nemo-automodel[diffusion,diffusion-media]"
-```
-
-**2. Clone the repo** to get the example recipes:
+**1. Clone and install from source** ([full instructions](/get-started/installation)):
 
 ```bash
 git clone https://github.com/NVIDIA-NeMo/Automodel.git
 cd Automodel
+uv sync --locked --all-groups --all-extras --extra diffusion-media
 ```
 
-**3. Run the recipe** from inside the repo:
+**2. Run the recipe** from inside the repo:
 
 ```bash
-torchrun --nproc-per-node=8 \
+uv run torchrun --nproc-per-node=8 \
   examples/diffusion/finetune/finetune.py \
   -c examples/diffusion/finetune/flux_t2i_flow.yaml
 ```

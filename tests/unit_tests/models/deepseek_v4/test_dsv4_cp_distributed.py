@@ -39,7 +39,12 @@ from nemo_automodel.components.models.deepseek_v4.layers import (
 # Run only on the GPU job. Each test mp.spawns two gloo worker processes that
 # re-import the full package (~6s/test, ~18s total on the CPU unit-test job).
 # These are context-parallel tests (a multi-GPU feature), so skip them on CPU.
-pytestmark = pytest.mark.run_only_on("GPU")
+# Over the default 5s budget on purpose: this module spawns worker processes; every child re-imports torch from scratch.
+# Shrink the work or the process count before raising this further.
+pytestmark = [
+    pytest.mark.timeout(60),
+    pytest.mark.run_only_on("GPU"),
+]
 
 
 def _free_port() -> int:

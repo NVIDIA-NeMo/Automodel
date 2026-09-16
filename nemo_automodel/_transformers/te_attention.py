@@ -254,7 +254,8 @@ def _detect_causal_mask(
     per-sample padding, has an unexpected shape, or is not a float additive mask.
     The caller should fall back to native SDPA in that case.
 
-    Detection is O(S) per call (two row reductions of length S_k):
+    Detection is O(S) per call (two row reductions of length S_k) and transfers
+    one combined validation result to the host:
     1. Upper-right corner scalar check: must be < -1e4 (causal-like).
     2. First-row visible-key count across all batch items must equal 1
        (each first query token can only attend to itself).
@@ -286,22 +287,6 @@ def _detect_causal_mask(
 
     # Scalar guard: upper-right corner must indicate "masked" (causal structure).
     # bool mask: False = masked; float mask: < -1e4 = masked.
-    corner = attn_mask[0, 0, 0, -1]
-    diag = attn_mask[0, 0, 0, 0]
-    if is_bool:
-        corner_masked = not corner.item()
-        diag_visible = diag.item()
-    else:
-        corner_masked = corner.item() < -1e4
-        diag_visible = diag.item() > -1e4
-
-    if not corner_masked:
-        logger.debug("_detect_causal_mask: upper-right corner not masked → None")
-        return None
-    if not diag_visible:
-        logger.debug("_detect_causal_mask: diagonal masked → None")
-        return None
-
     # Count visible keys per row for all batch items.
     # bool: True = visible; float: > -1e4 = visible.
     first_row = attn_mask[:, 0, 0, :]
@@ -313,34 +298,35 @@ def _detect_causal_mask(
         visible_first = (first_row > -1e4).sum(dim=-1)
         visible_last = (last_row > -1e4).sum(dim=-1)
 
-    logger.debug(
-        "_detect_causal_mask: S=%d visible_first=%s visible_last=%s window_size=%s",
-        S,
-        visible_first.tolist(),
-        visible_last.tolist(),
-        window_size,
-    )
+    expected_last = S if window_size[0] < 0 else min(S, window_size[0] + 1)
+    corner = attn_mask[0, 0, 0, -1]
+    diag = attn_mask[0, 0, 0, 0]
+    if is_bool:
+        corner_masked = ~corner
+        diag_visible = diag
+    else:
+        corner_masked = corner < -1e4
+        diag_visible = diag > -1e4
+    first_valid = (visible_first == 1).all()
+    last_valid = (visible_last == expected_last).all()
+    mask_valid = corner_masked & diag_visible & first_valid & last_valid
 
-    if not (visible_first == 1).all().item():
-        logger.debug("_detect_causal_mask: visible_first check failed → None")
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            "_detect_causal_mask: S=%d visible_first=%s visible_last=%s window_size=%s",
+            S,
+            visible_first.tolist(),
+            visible_last.tolist(),
+            window_size,
+        )
+
+    if not mask_valid.item():
+        logger.debug("_detect_causal_mask: structural validation failed → None")
         return None
 
     if window_size[0] < 0:
-        if not (visible_last == S).all().item():
-            logger.debug("_detect_causal_mask: visible_last %s != S=%d → None", visible_last.tolist(), S)
-            return None
         return "causal", (-1, 0)
-    else:
-        W = window_size[0] + 1
-        expected = min(S, W)
-        if not (visible_last == expected).all().item():
-            logger.debug(
-                "_detect_causal_mask: visible_last %s != expected=%d → None",
-                visible_last.tolist(),
-                expected,
-            )
-            return None
-        return "causal", window_size
+    return "causal", window_size
 
 
 # ---------------------------------------------------------------------------

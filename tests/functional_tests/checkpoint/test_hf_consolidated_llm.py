@@ -996,7 +996,7 @@ def test_consolidated_llm_checkpoint():
         "optim",
         "step_scheduler.pt",
         "dataloader/dataloader_dp_rank_0.pt",
-        "rng/rng_dp_rank_0.pt",
+        *[f"rng/rng_global_rank_{global_rank}.pt" for global_rank in range(torch.distributed.get_world_size())],
         "model/shard-00001-model-00001-of-00001.safetensors",
         "model/shard-00002-model-00001-of-00001.safetensors",
         "model/consolidated/model-00001-of-00001.safetensors",
@@ -1016,7 +1016,6 @@ def test_consolidated_llm_checkpoint():
     ]
     if trainer._get_dp_group_size() > 1:
         output_files.append("dataloader/dataloader_dp_rank_1.pt")
-        output_files.append("rng/rng_dp_rank_1.pt")
 
     for file in output_files:
         path = Path(trainer.checkpointer.config.checkpoint_dir) / "epoch_0_step_9" / file

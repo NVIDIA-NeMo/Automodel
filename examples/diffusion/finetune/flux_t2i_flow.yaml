@@ -8,14 +8,13 @@ model:
   transformer_engine_fp8_amax_history_len: 1024
   transformer_engine_fp8_amax_compute_algo: "max"
 
-optim:
-  learning_rate: 2e-5
-
-  optimizer:
-    weight_decay: 0.01
-    betas: [0.9, 0.999]
-    foreach: false
-    fused: true
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 2e-5
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+  foreach: false
+  fused: true
 
 performance:
   check_loss: false
@@ -58,7 +57,7 @@ step_scheduler:
   local_batch_size: 4
   global_batch_size: 32
   ckpt_every_steps: 500
-  log_every: 1
+  log_remote_every_steps: 1
   # max_steps: null  # Set to limit training to a specific number of steps
   save_checkpoint_every_epoch: false
 

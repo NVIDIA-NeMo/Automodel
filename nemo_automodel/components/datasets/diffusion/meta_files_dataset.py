@@ -16,16 +16,60 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Tuple
 
 import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
 
+from nemo_automodel.components.datasets.diffusion.loader import DiffusionDataloaderBuild
+
 from .text_to_video_dataset import collate_optional_video_fields, load_optional_video_fields
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class MetaFilesDatasetConfig:
+    """Construction-time configuration for :class:`MetaFilesDataset`."""
+
+    meta_folder: str
+    """Path to the folder containing `.meta` files."""
+    device: str = "cpu"
+    """Device to load tensors to."""
+    max_files: int | None = None
+    """Maximum number of `.meta` files to use (None means no limit)."""
+
+    def build(
+        self,
+        *,
+        transform_text: Callable[[torch.Tensor], torch.Tensor] | None = None,
+        transform_video: Callable[[torch.Tensor], torch.Tensor] | None = None,
+        filter_fn: Callable[[dict[str, object]], bool] | None = None,
+    ) -> "MetaFilesDataset":
+        """Build a :class:`MetaFilesDataset` from this :class:`MetaFilesDatasetConfig`.
+
+        Args:
+            transform_text: Optional transform of text embeddings shaped ``[1, S, E]``, where ``S`` is text
+                sequence length and ``E`` is embedding width. It must return the same semantic axis order.
+            transform_video: Optional transform of video latents shaped ``[1, C, T, Y, X]``, where ``C`` is
+                latent channels, ``T`` is latent frames, and ``Y``/``X`` are spatial height/width. It must
+                return the same semantic axis order.
+            filter_fn: Optional callable that filters samples by their metadata dict.
+
+        Returns:
+            Dataset loading tensors on the configured device.
+        """
+        return MetaFilesDataset(
+            meta_folder=self.meta_folder,
+            transform_text=transform_text,
+            transform_video=transform_video,
+            filter_fn=filter_fn,
+            device=self.device,
+            max_files=self.max_files,
+        )
 
 
 class MetaFilesDataset(Dataset):
@@ -34,11 +78,11 @@ class MetaFilesDataset(Dataset):
     def __init__(
         self,
         meta_folder: str,
-        transform_text: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
-        transform_video: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
-        filter_fn: Optional[Callable[[Dict], bool]] = None,
+        transform_text: Callable[[torch.Tensor], torch.Tensor] | None = None,
+        transform_video: Callable[[torch.Tensor], torch.Tensor] | None = None,
+        filter_fn: Callable[[Dict], bool] | None = None,
         device: str = "cpu",
-        max_files: Optional[int] = None,
+        max_files: int | None = None,
     ) -> None:
         self.meta_folder = Path(meta_folder)
         self.transform_text = transform_text
@@ -163,7 +207,7 @@ def build_node_parallel_sampler(
     dp_rank: int,
     dp_world_size: int,
     shuffle: bool = True,
-) -> Optional["DistributedSampler"]:
+) -> "DistributedSampler" | None:
     """Build a distributed sampler when torch.distributed is initialized."""
     if not dist.is_initialized():
         return None
@@ -177,6 +221,43 @@ def build_node_parallel_sampler(
     )
 
 
+@dataclass
+class MetaFilesDataloaderConfig:
+    """Construction-time configuration for a pre-encoded diffusion dataloader."""
+
+    meta_folder: str
+    shuffle: bool = True
+    num_workers: int = 2
+    device: str = "cpu"
+    transform_text: Callable[[torch.Tensor], torch.Tensor] | None = None
+    transform_video: Callable[[torch.Tensor], torch.Tensor] | None = None
+    filter_fn: Callable[[dict[str, object]], bool] | None = None
+    max_files: int | None = None
+
+    def build(self, *, dp_rank: int, dp_world_size: int, batch_size: int) -> DiffusionDataloaderBuild:
+        """Build the configured metadata dataset, sampler, and dataloader."""
+        dataset = MetaFilesDatasetConfig(
+            meta_folder=self.meta_folder,
+            device=self.device,
+            max_files=self.max_files,
+        ).build(
+            transform_text=self.transform_text,
+            transform_video=self.transform_video,
+            filter_fn=self.filter_fn,
+        )
+        sampler = build_node_parallel_sampler(dataset, dp_rank, dp_world_size, shuffle=self.shuffle)
+        dataloader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=sampler is None and self.shuffle,
+            sampler=sampler,
+            num_workers=self.num_workers,
+            collate_fn=collate_fn,
+            pin_memory=self.device == "cpu",
+        )
+        return DiffusionDataloaderBuild(dataloader=dataloader, sampler=sampler)
+
+
 def build_dataloader(
     *,
     meta_folder: str,
@@ -186,42 +267,34 @@ def build_dataloader(
     shuffle: bool = True,
     num_workers: int = 2,
     device: str = "cpu",
-    transform_text: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
-    transform_video: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
-    filter_fn: Optional[Callable[[Dict], bool]] = None,
-    max_files: Optional[int] = None,
-) -> Tuple[DataLoader, Optional[DistributedSampler]]:
+    transform_text: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    transform_video: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    filter_fn: Callable[[Dict], bool] | None = None,
+    max_files: int | None = None,
+) -> Tuple[DataLoader, DistributedSampler | None]:
     """Build a dataloader for pre-encoded diffusion metadata files."""
-    dataset = MetaFilesDataset(
+    result = MetaFilesDataloaderConfig(
         meta_folder=meta_folder,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        device=device,
         transform_text=transform_text,
         transform_video=transform_video,
         filter_fn=filter_fn,
-        device=device,
         max_files=max_files,
-    )
-
-    sampler = build_node_parallel_sampler(dataset, dp_rank, dp_world_size, shuffle=shuffle)
-
-    use_pin_memory = device == "cpu"
-    dataloader = DataLoader(
-        dataset,
+    ).build(
         batch_size=batch_size,
-        shuffle=(sampler is None and shuffle),
-        sampler=sampler,
-        num_workers=num_workers,
-        collate_fn=collate_fn,
-        pin_memory=use_pin_memory,
+        dp_rank=dp_rank,
+        dp_world_size=dp_world_size,
     )
-
-    return dataloader, sampler
+    return result.dataloader, result.sampler
 
 
 def create_dataloader(
     meta_folder: str,
     batch_size: int,
     num_nodes: int,
-) -> Tuple[DataLoader, Optional[DistributedSampler]]:
+) -> Tuple[DataLoader, DistributedSampler | None]:
     """Create a default metadata dataloader for node-parallel loading."""
     return build_dataloader(
         meta_folder=meta_folder,

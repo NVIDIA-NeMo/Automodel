@@ -27,9 +27,58 @@ from nemo_automodel.components.models.common.utils import (
     get_is_first_microbatch,
     get_is_optim_step,
     get_rope_config,
+    initialize_linear_module,
+    initialize_rms_norm_module,
     set_is_first_microbatch,
     set_is_optim_step,
 )
+
+
+class TestQuackBackend:
+    def test_quack_linear_preserves_linear_contract(self):
+        class FakeQuackLinear(nn.Linear):
+            pass
+
+        with patch(
+            "nemo_automodel.components.models.common.utils.safe_import_from",
+            return_value=(True, FakeQuackLinear),
+        ):
+            module = initialize_linear_module("quack", 8, 16, bias=True, device="cpu", dtype=torch.float32)
+
+        assert isinstance(module, FakeQuackLinear)
+        assert module.weight.shape == (16, 8)
+        assert module.bias.shape == (16,)
+
+    def test_quack_rms_norm_preserves_rms_norm_contract(self):
+        class FakeQuackRMSNorm(nn.RMSNorm):
+            pass
+
+        with patch(
+            "nemo_automodel.components.models.common.utils.safe_import_from",
+            return_value=(True, FakeQuackRMSNorm),
+        ):
+            module = initialize_rms_norm_module("quack", 8, eps=1e-6, device="cpu", dtype=torch.float32)
+
+        assert isinstance(module, FakeQuackRMSNorm)
+        assert module.weight.shape == (8,)
+        assert module.eps == 1e-6
+
+    @pytest.mark.parametrize(
+        ("initializer", "args", "match"),
+        [
+            (initialize_linear_module, ("quack", 8, 16), "linear='quack'"),
+            (initialize_rms_norm_module, ("quack", 8), "rms_norm='quack'"),
+        ],
+    )
+    def test_quack_backend_reports_missing_optional_dependency(self, initializer, args, match):
+        with (
+            patch(
+                "nemo_automodel.components.models.common.utils.safe_import_from",
+                return_value=(False, object()),
+            ),
+            pytest.raises(ImportError, match=match),
+        ):
+            initializer(*args)
 
 
 class TestIsOptimStep:
@@ -302,6 +351,44 @@ class TestComputeLmHeadLogits:
         hidden = torch.randn(7, self.HIDDEN, dtype=torch.bfloat16)
         out = compute_lm_head_logits(None, hidden, fp32_lm_head=True)
         assert out.logits is hidden
+
+    def test_lm_head_dtype_casts_after_slicing(self):
+        lm_head = self._lm_head().to(torch.bfloat16)
+        hidden = torch.randn(2, 5, self.HIDDEN, dtype=torch.float32)
+
+        out = compute_lm_head_logits(lm_head, hidden, logits_to_keep=2)
+
+        expected = lm_head(hidden[:, -2:, :].to(torch.bfloat16))
+        assert out.logits.shape == (2, 2, self.VOCAB)
+        assert out.logits.dtype == torch.bfloat16
+        torch.testing.assert_close(out.logits, expected)
+
+    def test_fsdp_lm_head_uses_policy_compute_dtype(self):
+        hidden_size = self.HIDDEN
+        vocab_size = self.VOCAB
+
+        class FakeFSDPHead(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = nn.Parameter(torch.randn(vocab_size, hidden_size, dtype=torch.float32))
+
+            def _get_fsdp_state(self):
+                return SimpleNamespace(_mp_policy=SimpleNamespace(param_dtype=torch.bfloat16))
+
+            def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+                """Project hidden states of shape [batch, sequence, hidden]."""
+                assert hidden_states.dtype == torch.bfloat16
+                return hidden_states @ self.weight.to(hidden_states.dtype).T
+
+        lm_head = FakeFSDPHead()
+        hidden = torch.randn(2, 5, self.HIDDEN, dtype=torch.float32)
+
+        with patch("nemo_automodel.components.models.common.utils.FSDPModule", FakeFSDPHead):
+            out = compute_lm_head_logits(lm_head, hidden, logits_to_keep=2)
+
+        assert lm_head.weight.dtype == torch.float32
+        assert out.logits.shape == (2, 2, self.VOCAB)
+        assert out.logits.dtype == torch.bfloat16
 
     def test_output_hidden_states_attaches_hidden(self):
         """output_hidden_states attaches the final hidden states; default leaves them None."""

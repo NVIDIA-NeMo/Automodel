@@ -11,6 +11,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from pathlib import Path
+
 import pytest
 
 from nemo_automodel.components.datasets.llm import formatting_utils
@@ -52,23 +54,23 @@ def _conversation():
     ]
 
 
-def test_multiturn_mask_full_length_matches_recompute():
-    # Passing full_length must produce a byte-identical mask to the recompute path.
+def test_multiturn_mask_unpadded_full_ids_matches_recompute():
+    # Passing unpadded_full_ids must produce a byte-identical mask to the recompute path.
     formatted = _conversation()
     input_ids = list(range(2 * len(formatted)))
 
     baseline = formatting_utils._build_multiturn_assistant_mask(_CountingTokenizer(), formatted, input_ids)
     optimized = formatting_utils._build_multiturn_assistant_mask(
-        _CountingTokenizer(), formatted, input_ids, full_length=len(input_ids)
+        _CountingTokenizer(), formatted, input_ids, unpadded_full_ids=list(input_ids)
     )
     assert optimized == baseline
     # assistant turns at idx 1 (tokens [2, 4)) and idx 3 (tokens [6, 8))
     assert baseline == [0, 0, 1, 1, 0, 0, 1, 1]
 
 
-def test_multiturn_mask_full_length_skips_full_retokenize():
+def test_multiturn_mask_unpadded_full_ids_skips_full_retokenize():
     # When the dialogue ends on an assistant turn, the closing boundary is the
-    # full conversation and must be served from full_length, not a fresh call.
+    # full conversation and must be served from unpadded_full_ids, not a fresh call.
     formatted = _conversation()
     input_ids = list(range(2 * len(formatted)))
 
@@ -76,7 +78,9 @@ def test_multiturn_mask_full_length_skips_full_retokenize():
     formatting_utils._build_multiturn_assistant_mask(baseline_tok, formatted, input_ids)
 
     optimized_tok = _CountingTokenizer()
-    formatting_utils._build_multiturn_assistant_mask(optimized_tok, formatted, input_ids, full_length=len(input_ids))
+    formatting_utils._build_multiturn_assistant_mask(
+        optimized_tok, formatted, input_ids, unpadded_full_ids=list(input_ids)
+    )
     assert optimized_tok.calls == baseline_tok.calls - 1
 
 
@@ -111,3 +115,260 @@ def test_mask_labels_to_last_turn_on_binary_mask():
     mask = [0, 1, 1, 0, 1, 1, 1, 0]
     formatting_utils._mask_labels_to_last_turn(mask, ignore_index=0)
     assert mask == [0, 0, 0, 0, 1, 1, 1, 0]
+
+
+def test_is_consistent_render_prefix():
+    is_prefix = formatting_utils._is_consistent_render_prefix
+    assert is_prefix([], [1, 2, 3])  # empty prefix is trivially consistent
+    assert is_prefix([1], [1, 2, 3])  # single-token exact prefix
+    assert is_prefix([1, 2], [1, 2, 3])  # exact token prefix
+    assert not is_prefix([9], [1, 2, 3])  # single-token divergence still moves the boundary
+    assert not is_prefix([1, 9], [1, 2, 3])  # divergence at the final prefix token
+    assert not is_prefix([1, 9, 3], [1, 2, 3])  # divergence before the final token
+    assert not is_prefix([1, 2, 3, 4], [1, 2, 3])  # prefix render longer than the full render
+    assert is_prefix([1, 9], [1, 2, 3], trailing_token_id=9)  # known standalone terminator
+    assert not is_prefix([9], [1, 2, 3], trailing_token_id=9)  # no content to validate before terminator
+
+
+class _RewritingTokenizer:
+    """Simulates Qwen3-style chat templates that rewrite earlier turns.
+
+    Assistant reasoning tokens render only for turns after the last user
+    message. Once a later user turn arrives, earlier assistant turns re-render
+    without their reasoning tokens, so a prefix render is not a token prefix of
+    the full-conversation render.
+    """
+
+    _ROLE_TOKEN = 90
+    _REASONING_TOKEN = 91
+    eos_token_id = 2
+    chat_template = "<dummy reasoning_content template without generation keyword>"
+
+    def __init__(self):
+        self._vocab = {}
+        self._cursor = 100
+
+    def _id_for_token(self, tok):
+        if tok not in self._vocab:
+            self._vocab[tok] = self._cursor
+            self._cursor += 1
+        return self._vocab[tok]
+
+    def apply_chat_template(self, messages, **kwargs):
+        last_user = max((i for i, msg in enumerate(messages) if msg["role"] == "user"), default=-1)
+        ids = []
+        for i, msg in enumerate(messages):
+            ids.append(self._ROLE_TOKEN)
+            if msg["role"] == "assistant" and i > last_user and msg.get("reasoning_content"):
+                ids.extend([self._REASONING_TOKEN] * len(msg["reasoning_content"].split()))
+            ids.extend(self._id_for_token(tok) for tok in str(msg["content"]).split())
+        return {"input_ids": ids, "attention_mask": [1] * len(ids)}
+
+
+def _rewriting_conversation():
+    return [
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "a1 done", "reasoning_content": "step one two"},
+        {"role": "user", "content": "q2"},
+        {"role": "assistant", "content": "a2 done", "reasoning_content": "step three"},
+    ]
+
+
+def test_multiturn_mask_raises_on_rewriting_template():
+    # A prefix render that is not a token prefix of the full render would put
+    # assistant spans at the wrong positions; the builder must refuse instead.
+    tok = _RewritingTokenizer()
+    formatted = _rewriting_conversation()
+    full_ids = tok.apply_chat_template(formatted)["input_ids"]
+
+    with pytest.raises(ValueError, match="rewrites earlier turns"):
+        formatting_utils._build_multiturn_assistant_mask(tok, formatted, full_ids)
+
+
+def test_format_chat_template_raises_on_rewriting_template():
+    # End to end: the default answer-only path surfaces the template problem
+    # instead of silently supervising tool/user tokens.
+    tok = _RewritingTokenizer()
+    with pytest.raises(ValueError, match="rewrites earlier turns"):
+        formatting_utils.format_chat_template(
+            tok,
+            formatted_text=_rewriting_conversation(),
+            eos_token_id=tok.eos_token_id,
+            pad_token_id=tok.eos_token_id,
+            answer_only_loss_mask=True,
+        )
+
+
+def test_reasoning_mask_ignores_absent_rewritten_turns_and_masks_stable_ones(caplog):
+    # The early assistant turn is re-rendered without reasoning in the full
+    # conversation (nothing to mask there); the final turn is stable and its
+    # reasoning tokens must still be masked.
+    tok = _RewritingTokenizer()
+    formatted = _rewriting_conversation()
+    full_ids = tok.apply_chat_template(formatted)["input_ids"]
+
+    with caplog.at_level("WARNING"):
+        mask = formatting_utils._build_reasoning_mask(tok, formatted, full_ids)
+
+    assert "Could not isolate reasoning_content tokens for assistant message 1" in caplog.text
+    reasoning_positions = [i for i, token in enumerate(full_ids) if token == tok._REASONING_TOKEN]
+    assert reasoning_positions  # the final turn's reasoning is rendered
+    assert [i for i, value in enumerate(mask) if value] == reasoning_positions
+
+    # Passing the reference render explicitly must not change the result.
+    explicit = formatting_utils._build_reasoning_mask(tok, formatted, full_ids, unpadded_full_ids=list(full_ids))
+    assert explicit == mask
+
+
+class _HeaderRewritingTokenizer(_RewritingTokenizer):
+    """Rewrites a header based on message count while preserving all reasoning."""
+
+    truncation_side = "right"
+
+    def apply_chat_template(self, messages, **kwargs):
+        ids = [len(messages)]
+        for msg in messages:
+            ids.append(self._ROLE_TOKEN)
+            if msg["role"] == "assistant" and msg.get("reasoning_content"):
+                ids.extend([self._REASONING_TOKEN] * len(msg["reasoning_content"].split()))
+            ids.extend(self._id_for_token(tok) for tok in str(msg["content"]).split())
+        if kwargs.get("truncation") is True and kwargs.get("max_length") is not None:
+            if self.truncation_side == "left":
+                ids = ids[-kwargs["max_length"] :]
+            else:
+                ids = ids[: kwargs["max_length"]]
+        return {"input_ids": ids, "attention_mask": [1] * len(ids)}
+
+
+def test_reasoning_mask_uses_full_render_when_prefix_header_is_rewritten():
+    tok = _HeaderRewritingTokenizer()
+    formatted = _rewriting_conversation()
+    full_ids = tok.apply_chat_template(formatted)["input_ids"]
+
+    mask = formatting_utils._build_reasoning_mask(tok, formatted, full_ids)
+
+    reasoning_positions = [i for i, token in enumerate(full_ids) if token == tok._REASONING_TOKEN]
+    assert reasoning_positions
+    assert [i for i, value in enumerate(mask) if value] == reasoning_positions
+
+
+def test_reasoning_mask_maps_untruncated_span_into_right_truncated_render():
+    tok = _HeaderRewritingTokenizer()
+    formatted = _rewriting_conversation()
+    full_ids = tok.apply_chat_template(formatted, truncation=True, max_length=8)["input_ids"]
+
+    mask = formatting_utils._build_reasoning_mask(
+        tok,
+        formatted,
+        full_ids,
+        truncation=True,
+        seq_length=8,
+        unpadded_full_ids=full_ids,
+    )
+
+    reasoning_positions = [i for i, token in enumerate(full_ids) if token == tok._REASONING_TOKEN]
+    assert reasoning_positions
+    assert [i for i, value in enumerate(mask) if value] == reasoning_positions
+
+
+def test_reasoning_mask_maps_untruncated_span_into_left_truncated_render():
+    tok = _HeaderRewritingTokenizer()
+    tok.truncation_side = "left"
+    formatted = _rewriting_conversation()
+    full_ids = tok.apply_chat_template(formatted, truncation=True, max_length=8)["input_ids"]
+
+    mask = formatting_utils._build_reasoning_mask(
+        tok,
+        formatted,
+        full_ids,
+        truncation=True,
+        seq_length=8,
+        unpadded_full_ids=full_ids,
+    )
+
+    reasoning_positions = [i for i, token in enumerate(full_ids) if token == tok._REASONING_TOKEN]
+    assert reasoning_positions
+    assert [i for i, value in enumerate(mask) if value] == reasoning_positions
+
+
+def test_reasoning_mask_rejects_noncontiguous_truncation_window():
+    tok = _HeaderRewritingTokenizer()
+
+    with pytest.raises(ValueError, match="not a contiguous prefix or suffix"):
+        formatting_utils._build_reasoning_mask(
+            tok,
+            _rewriting_conversation(),
+            [12345],
+            truncation=True,
+            seq_length=1,
+            unpadded_full_ids=[12345],
+        )
+
+
+class _GenerationBlockTokenizer(_RewritingTokenizer):
+    """A rewriting template that ALSO wraps assistant turns in ``{% generation %}``.
+
+    Same rewrite behavior as :class:`_RewritingTokenizer` (a prefix render is not a
+    token prefix of the full render, so ``_build_multiturn_assistant_mask`` would
+    refuse), but because the template contains the generation keyword the tokenizer
+    returns ``assistant_masks`` directly and the prefix-arithmetic fallback is never
+    consulted. This is the contract the shipped Gemma4 CoderForge template relies on.
+    """
+
+    chat_template = "<dummy template with {% generation %}...{% endgeneration %}>"
+
+    def apply_chat_template(self, messages, return_assistant_tokens_mask=False, **kwargs):
+        last_user = max((i for i, msg in enumerate(messages) if msg["role"] == "user"), default=-1)
+        ids, amask = [], []
+        for i, msg in enumerate(messages):
+            is_asst = msg["role"] == "assistant"
+            ids.append(self._ROLE_TOKEN)  # role header is the generation prompt, never supervised
+            amask.append(0)
+            if is_asst and i > last_user and msg.get("reasoning_content"):
+                reasoning = [self._REASONING_TOKEN] * len(msg["reasoning_content"].split())
+                ids.extend(reasoning)
+                amask.extend([1] * len(reasoning))
+            content = [self._id_for_token(tok) for tok in str(msg["content"]).split()]
+            ids.extend(content)
+            amask.extend([1 if is_asst else 0] * len(content))
+        out = {"input_ids": ids, "attention_mask": [1] * len(ids)}
+        if return_assistant_tokens_mask:
+            out["assistant_masks"] = amask
+        return out
+
+
+def test_format_chat_template_generation_block_uses_direct_assistant_mask():
+    # The same conversation that raises with a no-generation template
+    # (test_format_chat_template_raises_on_rewriting_template) now succeeds: a
+    # generation-block template returns the assistant mask directly, so the
+    # prefix-arithmetic fallback is never reached and labels supervise exactly the
+    # assistant tokens (role header and user/tool tokens stay -100).
+    tok = _GenerationBlockTokenizer()
+    formatted = _rewriting_conversation()
+
+    out = formatting_utils.format_chat_template(
+        tok,
+        formatted_text=formatted,
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.eos_token_id,
+        answer_only_loss_mask=True,
+    )
+
+    full = tok.apply_chat_template(formatted, return_assistant_tokens_mask=True)
+    ids, amask = full["input_ids"], full["assistant_masks"]
+    # Standard shifted NTP: labels drop the first token; labels[i] supervises ids[i+1].
+    expected = [ids[i + 1] if amask[i + 1] else -100 for i in range(len(ids) - 1)]
+    assert out["labels"] == expected
+    assert any(label != -100 for label in out["labels"])  # assistant content is supervised
+    assert tok._ROLE_TOKEN not in out["labels"]  # role-header/scaffolding tokens are not
+
+
+def test_shipped_gemma4_coderforge_template_has_generation_block():
+    # Guard the shipped artifact: the recipe/validate/check_masking point ChatDataset
+    # at this file, and it must trip the generation-keyword path (GENERATION_REGEX)
+    # with balanced tags, or ChatDataset silently falls back to the guarded builder.
+    template = (
+        Path(__file__).parents[4] / "examples/long_context_validation/gemma4_31B/gemma4_coderforge_chat_template.jinja"
+    ).read_text()
+    assert formatting_utils.GENERATION_REGEX.search(template) is not None
+    assert template.count("{% generation %}") == template.count("{% endgeneration %}") >= 1

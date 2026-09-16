@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List
 
@@ -19,7 +22,18 @@ import torch
 
 from .base_dataset import BaseMultiresolutionDataset
 
-VIDEO_OPTIONAL_FIELDS = ("text_mask", "text_embeddings_2", "text_mask_2", "image_embeds")
+VIDEO_OPTIONAL_FIELDS = (
+    "text_mask",
+    "text_embeddings_2",
+    "text_mask_2",
+    "image_embeds",
+    # LTX-2 dual-stream cache keys: audio latents [1, 8, L, 16] and the
+    # audio-stream text conditioning [1, T, D_a]. L is constant across a
+    # dataset preprocessed with a fixed num_frames, so torch.cat collation
+    # in collate_optional_video_fields stays valid.
+    "audio_latents",
+    "audio_text_embeddings",
+)
 
 
 def load_optional_video_fields(data: dict, device: str = "cpu") -> dict:
@@ -38,6 +52,26 @@ def collate_optional_video_fields(batch: List[Dict], result: dict) -> None:
     for key in VIDEO_OPTIONAL_FIELDS:
         if key in batch[0]:
             result[key] = torch.cat([item[key] for item in batch], dim=0)
+
+
+@dataclass
+class TextToVideoDatasetConfig:
+    """Construction-time configuration for :class:`TextToVideoDataset`."""
+
+    cache_dir: str
+    """Directory containing preprocessed cache (metadata.json + shards + WxH/*.meta)."""
+    model_type: str = "wan"
+    """Model type for model-specific fields (e.g. 'wan', 'hunyuan')."""
+    device: str = "cpu"
+    """Device to load tensors to."""
+
+    def build(self) -> "TextToVideoDataset":
+        """Build a :class:`TextToVideoDataset` from this :class:`TextToVideoDatasetConfig`."""
+        return TextToVideoDataset(
+            cache_dir=self.cache_dir,
+            model_type=self.model_type,
+            device=self.device,
+        )
 
 
 class TextToVideoDataset(BaseMultiresolutionDataset):

@@ -12,7 +12,7 @@ NeMo AutoModel provides several ways to launch training. The right choice depend
 | **Local Workstation** | Getting started, debugging, single-node training | 1-8 on one machine | [Run on Your Local Workstation](/job-launchers/local-workstation) |
 | **NeMo-Run** | Managed execution on Slurm, Kubernetes, Docker, local | 1+ | [NeMo-Run](/job-launchers/nemo-run) |
 | **SkyPilot** | Cloud training or Kubernetes clusters | Any | [SkyPilot](/job-launchers/skypilot) |
-| **Slurm** | Multi-node batch jobs on HPC clusters | 8+ across nodes | [Run on a Cluster](/job-launchers/slurm-cluster) |
+| **Slurm** | Scheduled batch jobs on HPC clusters, single- or multi-node | 1+ | [Run on a Cluster](/job-launchers/slurm-cluster) |
 
 ### I Have 1–2 GPUs on My Workstation
 
@@ -26,11 +26,18 @@ See the [Run on Your Local Workstation](/job-launchers/local-workstation) guide.
 
 ### I Have Access to a Slurm Cluster
 
-Add a `slurm:` section to your YAML config and submit with the same `automodel` command. The CLI generates the `torchrun` invocation and calls `sbatch` for you:
+From the repository root, copy the reference `slurm.sub`, edit the copy for
+your cluster and recipe, and submit it directly with `sbatch`:
 
 ```bash
-automodel config_with_slurm.yaml
+cp slurm.sub my_cluster.sub
+# Edit CONFIG, the #SBATCH directives, container image, and mount paths.
+sbatch my_cluster.sub
 ```
+
+The submission script launches `torchrun` across the Slurm allocation and runs
+the recipe selected by its `CONFIG` variable. Do not add a `slurm:` section to
+the recipe YAML; the `automodel` CLI does not dispatch Slurm jobs.
 
 See the [Run on a Cluster](/job-launchers/slurm-cluster) guide.
 
@@ -46,7 +53,10 @@ See the [NeMo-Run](/job-launchers/nemo-run) guide.
 
 ### I Want to Train on the Cloud
 
-Add a `skypilot:` section to your YAML config. SkyPilot provisions VMs on any major cloud and handles spot-instance preemption automatically:
+Add a `skypilot:` section to your YAML config. SkyPilot provisions VMs on any
+major cloud. AutoModel submits with unmanaged `sky.launch`, so spot instances
+can be preempted and this path does not recover them automatically. Managed
+recovery requires SkyPilot's jobs API, which this launcher does not use:
 
 ```bash
 automodel config_with_skypilot.yaml
@@ -66,4 +76,8 @@ See the [SkyPilot + Kubernetes tutorial](/job-launchers/skypilot-k8s).
 
 ## All Launchers Use the Same Config
 
-Every launcher shares the same YAML recipe format. The only difference is an optional launcher section (`slurm:`, `nemo_run:`, or `skypilot:`) that tells the CLI where to run. Without a launcher section, training runs interactively on the current machine.
+Every launch path shares the same YAML recipe format. The `automodel` CLI
+recognizes `nemo_run:` and `skypilot:` as optional launcher sections; without
+either section, training runs interactively on the current machine. Slurm is a
+separate submission path: configure the repository-root `slurm.sub`, point its
+`CONFIG` variable at the recipe YAML, and submit the script with `sbatch`.

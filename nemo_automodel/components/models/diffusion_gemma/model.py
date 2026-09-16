@@ -42,43 +42,27 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-
-from nemo_automodel.shared.import_utils import UnavailableError, UnavailableMeta
-
-
-def _make_missing(name: str):
-    return UnavailableMeta(name, (), {"_msg": "transformers diffusion_gemma backbone is not available."})
-
-
-try:
-    from transformers import PreTrainedModel
-    from transformers.modeling_outputs import CausalLMOutputWithPast
-    from transformers.models.diffusion_gemma.configuration_diffusion_gemma import (
-        DiffusionGemmaConfig as DiffusionGemmaConfig,
-    )
-    from transformers.models.diffusion_gemma.configuration_diffusion_gemma import (
-        DiffusionGemmaTextConfig as DiffusionGemmaTextConfig,
-    )
-    from transformers.models.diffusion_gemma.modeling_diffusion_gemma import (
-        DiffusionGemmaTextScaledWordEmbedding as ScaledWordEmbedding,
-    )
-
-    _TRANSFORMERS_AVAILABLE = True
-except (ModuleNotFoundError, ImportError):
-    _TRANSFORMERS_AVAILABLE = False
-    PreTrainedModel = _make_missing("PreTrainedModel")
-    CausalLMOutputWithPast = _make_missing("CausalLMOutputWithPast")
-    DiffusionGemmaConfig = _make_missing("DiffusionGemmaConfig")
-    DiffusionGemmaTextConfig = _make_missing("DiffusionGemmaTextConfig")
-    ScaledWordEmbedding = _make_missing("ScaledWordEmbedding")
+from transformers import PreTrainedModel
+from transformers.models.diffusion_gemma.configuration_diffusion_gemma import (
+    DiffusionGemmaConfig,
+    DiffusionGemmaTextConfig,
+)
+from transformers.models.diffusion_gemma.modeling_diffusion_gemma import (
+    DiffusionGemmaTextScaledWordEmbedding as ScaledWordEmbedding,
+)
 
 from nemo_automodel._transformers.model_capabilities import ModelCapabilities
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 
+from .fsdp import register_diffusion_gemma_parallel_strategy
 from .layers import (
     DiffusionGemmaMoEDecoderLayer,
     DiffusionGemmaRMSNorm,
@@ -355,7 +339,10 @@ class DiffusionGemmaForBlockDiffusion(HFCheckpointingMixin, MoEFSDPSyncMixin, Pr
     # modules afterwards (see llama/rope_utils.py).
     _keep_in_fp32_modules = ["rotary_emb"]
     _no_split_modules = ["DiffusionGemmaMoEDecoderLayer"]
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
+    # lm_head is hard-tied to the shared embedding; the adapter drops it on export
+    # and rebuilds it from the embedding on load, so untying is unsupported.
+    tie_word_embeddings_support: TieSupport = TieSupport.TIED_ONLY
 
     @classmethod
     def get_capabilities(cls, config: "DiffusionGemmaConfig") -> "ModelCapabilities":
@@ -392,8 +379,7 @@ class DiffusionGemmaForBlockDiffusion(HFCheckpointingMixin, MoEFSDPSyncMixin, Pr
         freeze_router: bool | None = None,
         **kwargs: Any,
     ):
-        if not _TRANSFORMERS_AVAILABLE:
-            raise UnavailableError("transformers is not available; cannot construct DiffusionGemmaForBlockDiffusion.")
+        reject_unsupported_tie_word_embeddings(type(self), config)
         # ``canvas_length`` is a declared field on the reference config (and round-trips),
         # so a YAML/from_pretrained override is written back onto it. The training-only
         # flags are NOT reference-config fields (it is a strict dataclass), so they live on
@@ -428,9 +414,7 @@ class DiffusionGemmaForBlockDiffusion(HFCheckpointingMixin, MoEFSDPSyncMixin, Pr
 
         self.model = DiffusionGemmaBackbone(text_config, self.backend, moe_config=moe_config)
         self.lm_head = nn.Linear(text_config.hidden_size, text_config.vocab_size, bias=False)
-        # lm_head is tied to the shared embedding (HF resolves this via
-        # _tied_weights_keys + get_output_embeddings).
-        self.lm_head.weight = self.model.embed_tokens.weight
+        self.tie_weights()
 
         # Expose moe_config for the MoE parallelizer assertion path.
         self.moe_config = self.model.moe_config
@@ -458,6 +442,10 @@ class DiffusionGemmaForBlockDiffusion(HFCheckpointingMixin, MoEFSDPSyncMixin, Pr
 
     def get_output_embeddings(self) -> nn.Module:
         return self.lm_head
+
+    def tie_weights(self, *_args: object, **_kwargs: object) -> None:
+        """Tie ``lm_head`` to the shared diffusion text embedding."""
+        self.lm_head.weight = self.model.embed_tokens.weight
 
     def freeze_router_params(self) -> None:
         """Freeze the MoE router/gate (design v2 item 9).
@@ -670,13 +658,10 @@ class DiffusionGemmaForBlockDiffusion(HFCheckpointingMixin, MoEFSDPSyncMixin, Pr
         return DiffusionGemmaOutput(logits=logits, encoder_logits=encoder_logits)
 
 
-if _TRANSFORMERS_AVAILABLE:
-    ModelClass = DiffusionGemmaForBlockDiffusion
+ModelClass = DiffusionGemmaForBlockDiffusion
 
-    # Register the pure-FSDP2 (ep_size=1) parallelization strategy so that
-    # get_parallelization_strategy() selects it for this model. Done here (not in
-    # the package __init__) so the parallelizer import — which pulls torch/FSDP —
-    # only runs in a torch-enabled environment, alongside model construction.
-    from .fsdp import register_diffusion_gemma_parallel_strategy
+# Register the pure-FSDP2 (ep_size=1) parallelization strategy so that
+# get_parallelization_strategy() selects it for this model. Done here (not in
+# the package __init__) so registration runs alongside model construction.
 
-    register_diffusion_gemma_parallel_strategy()
+register_diffusion_gemma_parallel_strategy()

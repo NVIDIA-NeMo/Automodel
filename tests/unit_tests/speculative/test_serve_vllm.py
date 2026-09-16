@@ -559,3 +559,67 @@ def test_main_execv_path_replaces_process(tmp_path: Path, monkeypatch):
 
     assert captured["path"] == captured["cmd"][0]
     assert "vllm.entrypoints.openai.api_server" in captured["cmd"]
+
+
+def _write_prefixed_dflash_checkpoint(model_dir: Path) -> Path:
+    """A DFlash draft saved by Automodel: ``model.``-prefixed weights, no ``causal`` stamp."""
+    model_dir.mkdir(parents=True, exist_ok=True)
+    save_file(
+        {
+            "model.fc.weight": torch.zeros(2, 6),
+            "model.layers.0.self_attn.q_proj.weight": torch.zeros(2, 2),
+            "model.norm.weight": torch.zeros(2),
+        },
+        str(model_dir / "model.safetensors"),
+        metadata={"format": "pt"},
+    )
+    config_path = model_dir / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen3DFlashDraftModel"],
+                "model_type": "qwen3",
+                "block_size": 16,
+                "dflash_config": {"mask_token_id": 151669, "projector_type": "jetspec"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    return config_path
+
+
+def test_dflash_causal_reaches_the_exported_config(tmp_path: Path):
+    """``--dflash-causal`` must survive the remapping export, not only the in-place rewrite.
+
+    The flag exists for JetSpec checkpoints trained before the recipe stamped
+    ``causal``. Those come from Automodel, so their weights carry the ``model.``
+    prefix and they always take the export branch: dropping the flag there made
+    it a no-op in exactly the case it was added for, silently serving the draft
+    with the wrong attention semantics.
+    """
+    model_dir = tmp_path / "epoch_0_step_10" / "model" / "consolidated"
+    _write_prefixed_dflash_checkpoint(model_dir)
+
+    draft_path, _ = resolve_draft_artifacts(str(model_dir), dflash_causal=True)
+
+    exported = json.loads((Path(draft_path) / "config.json").read_text(encoding="utf-8"))
+    assert Path(draft_path).name == "vllm_export"
+    assert exported["dflash_config"]["causal"] is True
+
+
+def test_export_is_rebuilt_when_dflash_causal_changes(tmp_path: Path):
+    """The cache keys on the exported config, not just source mtimes.
+
+    ``--dflash-causal`` never touches the source checkpoint, so an mtime-only
+    freshness check would keep serving the previous launch's export.
+    """
+    model_dir = tmp_path / "epoch_0_step_10" / "model" / "consolidated"
+    _write_prefixed_dflash_checkpoint(model_dir)
+
+    def _causal_of(dflash_causal: bool):
+        path, _ = resolve_draft_artifacts(str(model_dir), dflash_causal=dflash_causal)
+        return json.loads((Path(path) / "config.json").read_text(encoding="utf-8"))["dflash_config"].get("causal")
+
+    assert _causal_of(True) is True
+    assert _causal_of(False) is None
+    assert _causal_of(True) is True

@@ -22,7 +22,7 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 import numpy
 import torch
@@ -55,24 +55,24 @@ class BlendedMegatronDatasetConfig:
     sequence_length: int
     """The sequence length."""
 
-    blend: Optional[Tuple[List[str], Optional[List[float]]]] = None
+    blend: Tuple[List[str], List[float] | None] | None = None
     """The blend, consisting of a list of dataset prefixes and optionally a list of dataset
        weights. For example, [["dataset-path1", "dataset-path2"], [0.3, 0.7]]. When the weights are
        None, they are inferred from the lengths of the contributing datasets. Not to be used with
        'blend_per_split'. Defaults to None.
     """
 
-    blend_per_split: Optional[List[Optional[Tuple[List[str], Optional[List[float]]]]]] = None
+    blend_per_split: List[Tuple[List[str], List[float] | None] | None] | None = None
     """A set of blends, as defined above, one for each split distribution. Not to be used with
        'blend'. Defauls to None.
     """
 
-    split: Optional[str] = None
+    split: str | None = None
     """The split string, a comma separated weighting for the dataset splits when drawing samples
        from a single distribution. Not to be used with 'blend_per_split'.  Defaults to None.
     """
 
-    split_matrix: Optional[List[Tuple[float, float]]] = field(init=False, default=None)
+    split_matrix: List[Tuple[float, float]] | None = field(init=False, default=None)
     """The split matrix consisting of non-overlapping book-ends of each split in order. For more
        information, refer to 'convert_split_vector_to_split_matrix'. Created automatically from
        'split'. Not to be passed in to the constructor.
@@ -81,7 +81,7 @@ class BlendedMegatronDatasetConfig:
     num_dataset_builder_threads: int = 1
     """The number of threads to use for dataset building."""
 
-    path_to_cache: Optional[str] = None
+    path_to_cache: str | None = None
     """Where all re-useable dataset indices are to be cached."""
 
     mmap_bin_files: bool = True
@@ -93,7 +93,7 @@ class BlendedMegatronDatasetConfig:
        constructor.
     """
 
-    tokenizer: Optional[PreTrainedTokenizerBase] = None
+    tokenizer: PreTrainedTokenizerBase | None = None
     """The PreTrainedTokenizerBase instance. Required for datasets that do online tokenization."""
 
     mid_level_dataset_surplus: float = 0.005
@@ -104,7 +104,7 @@ class BlendedMegatronDatasetConfig:
        datasets(s).
     """
 
-    object_storage_config: Optional[ObjectStorageConfig] = None
+    object_storage_config: ObjectStorageConfig | None = None
     """When set, the .idx files are downloaded to path_to_idx_cache and .bin files are streamed
        from S3/MSC via chunked GETs. mmap_bin_files is automatically overridden to False.
     """
@@ -144,13 +144,13 @@ class BlendedMegatronDatasetConfig:
 class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     """Configuration object for Megatron Core GPT datasets"""
 
-    reset_position_ids: Optional[bool] = None
+    reset_position_ids: bool | None = None
     """Option to reset the position IDs in the dataset at an interval"""
 
-    reset_attention_mask: Optional[bool] = None
+    reset_attention_mask: bool | None = None
     """Option to reset the attention mask from the dataset"""
 
-    eod_mask_loss: Optional[bool] = None
+    eod_mask_loss: bool | None = None
     """Option to enable the EOD mask loss"""
 
     create_attention_mask: bool = True
@@ -198,8 +198,8 @@ def parse_and_normalize_split(split: str) -> List[float]:
 
 
 def convert_split_vector_to_split_matrix(
-    vector_a: List[float], vector_b: Optional[List[float]] = None
-) -> List[Optional[Tuple[float, float]]]:
+    vector_a: List[float], vector_b: List[float] | None = None
+) -> List[Tuple[float, float] | None]:
     """Build the split matrix from one or optionally two contributing split vectors.
 
     Ex. a standard conversion:
@@ -264,9 +264,9 @@ class GPTDataset(torch.utils.data.Dataset):
     def __init__(
         self,
         indexed_dataset: IndexedDataset,
-        dataset_path: Optional[str],
+        dataset_path: str | None,
         indexed_indices: numpy.ndarray,
-        num_samples: Optional[int],
+        num_samples: int | None,
         index_split: Split,
         config: GPTDatasetConfig,
     ) -> None:
@@ -384,7 +384,7 @@ class GPTDataset(torch.utils.data.Dataset):
             return total
         return min(self.num_samples, total)
 
-    def __getitem__(self, idx: Optional[int]) -> dict[str, torch.Tensor]:
+    def __getitem__(self, idx: int | None) -> dict[str, torch.Tensor]:
         """Abstract method implementation
 
         Args:

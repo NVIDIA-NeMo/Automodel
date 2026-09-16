@@ -76,7 +76,7 @@ FP8 training via torchao for reduced memory and higher throughput on supported m
 </Card>
 
 <Card title="Multi-Node with SLURM">
-Add a `slurm:` section to any YAML config and launch with the `automodel` CLI. See the [Cluster guide](/job-launchers/slurm-cluster).
+Copy the checked-in `slurm.sub` or download it from Github (available [here](https://github.com/NVIDIA-NeMo/Automodel/blob/main/slurm.sub)), edit its `CONFIG` and `#SBATCH` directives for your cluster, and submit it with `sbatch`. See the [Cluster guide](/job-launchers/slurm-cluster).
 </Card>
 
 </Cards>
@@ -129,7 +129,7 @@ Components are modular, self-contained building blocks that recipes assemble:
 | `moe/` | Mixture of Experts routing and DeepEP integration |
 | `optim/` | Optimizers and LR schedulers |
 | `loss/` | Cross-entropy, linear cross-entropy, KD loss |
-| `launcher/` | SLURM and interactive job launch |
+| `launcher/` | Interactive, SkyPilot, and NeMo-Run job launch; Slurm uses the root-level `slurm.sub` script |
 
 Each component can be used independently and has no cross-module imports.
 

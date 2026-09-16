@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import torch
@@ -612,7 +612,7 @@ class MineHardNegativesRecipe:
 
         return np.concatenate(parts, axis=0)
 
-    def _load_cached_chunk(self, cache_path: Path) -> Optional[np.ndarray]:
+    def _load_cached_chunk(self, cache_path: Path) -> np.ndarray | None:
         """Load a fully-assembled chunk cache if it exists.
 
         In distributed mode, only rank0 loads the cache to avoid redundant IO.
@@ -700,7 +700,7 @@ class MineHardNegativesRecipe:
     def _encode_chunk_local(
         self,
         texts: List[str],
-        cache_path: Optional[Path],
+        cache_path: Path | None,
     ) -> np.ndarray:
         """Encode a chunk of documents locally (single-process).
 
@@ -724,7 +724,7 @@ class MineHardNegativesRecipe:
     def _encode_documents_chunk(
         self,
         doc_indices: List[int],
-        cache_path: Optional[Path] = None,
+        cache_path: Path | None = None,
     ) -> np.ndarray:
         """Encode a chunk of documents into embeddings.
 
@@ -802,7 +802,7 @@ class MineHardNegativesRecipe:
             return np.concatenate(all_embeddings, axis=0)
         return np.empty((0, 0), dtype=np.float32)
 
-    def _load_embeddings_from_cache(self) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    def _load_embeddings_from_cache(self) -> Tuple[np.ndarray | None, np.ndarray | None]:
         """Load query and document embeddings from cache.
 
         Returns:
@@ -970,8 +970,8 @@ class MineHardNegativesRecipe:
         pos_doc_indices: List[List[int]],
         batch_size: int,
         num_negs: int,
-        hard_neg_margin: Optional[float] = None,
-        hard_neg_margin_type: Optional[str] = None,
+        hard_neg_margin: float | None = None,
+        hard_neg_margin_type: str | None = None,
     ) -> Tuple[List[List[int]], List[List[float]], List[List[float]]]:
         """Mine hard negatives for each query.
 

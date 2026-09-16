@@ -21,7 +21,7 @@ step_scheduler:
   local_batch_size: 1
   ckpt_every_steps: 1000
   num_epochs: 100
-  log_every: 2
+  log_remote_every_steps: 2
   # max_steps: null  # Set to limit training to a specific number of steps
   save_checkpoint_every_epoch: false
 
@@ -36,12 +36,12 @@ data:
     drop_last: false
     num_workers: 2
 
-optim:
-  learning_rate: 5e-6
-  optimizer:
-    weight_decay: 0.01
-    betas: [0.9, 0.999]
-    foreach: true
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 5e-6
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+  foreach: true
 
 performance:
   check_loss: false
@@ -71,6 +71,10 @@ flow_matching:
 
 fsdp:
   tp_size: 1
+  # Context parallelism (Ulysses attention via diffusers>=0.39): set cp_size > 1 to
+  # shard the video token sequence across GPUs for long sequences. The post-patchify
+  # sequence length must be divisible by cp_size, and dp_size must satisfy
+  # dp * tp * cp * pp == world size (e.g. dp_size: 4, cp_size: 2 on 8 GPUs).
   cp_size: 1
   pp_size: 1
   dp_replicate_size: 1

@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Callable, Optional
+from typing import Callable
 
 import torch
 from torch import nn
@@ -35,6 +35,7 @@ from nemo_automodel.components.speculative.dspark.common import (
     AcceptRatePredictor,
     DSparkForwardOutput,
     build_eval_mask,
+    context_doc_ids,
     create_noise_embed,
     create_position_ids,
     pin_rope_inv_freq_fp32,
@@ -93,11 +94,11 @@ class Qwen3DSparkAttention(nn.Module):
         hidden_states: torch.Tensor,
         target_hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        attention_mask: Optional[torch.Tensor],
-        past_key_values: Optional[Cache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
+        attention_mask: torch.Tensor | None,
+        past_key_values: Cache | None = None,
+        cache_position: torch.LongTensor | None = None,
         **kwargs: Unpack[FlashAttentionKwargs],
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         bsz, q_len = hidden_states.shape[:-1]
         ctx_len = target_hidden_states.shape[1]
         q = self.q_proj(hidden_states).view(bsz, q_len, self.num_attention_heads, self.head_dim)
@@ -155,17 +156,17 @@ class Qwen3DSparkDecoderLayer(GradientCheckpointingLayer):
 
     def forward(
         self,
-        target_hidden_states: Optional[torch.Tensor] = None,
-        hidden_states: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Cache] = None,
-        output_attentions: Optional[bool] = False,
-        use_cache: Optional[bool] = False,
-        cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        target_hidden_states: torch.Tensor | None = None,
+        hidden_states: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_value: Cache | None = None,
+        output_attentions: bool | None = False,
+        use_cache: bool | None = False,
+        cache_position: torch.LongTensor | None = None,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs: Unpack[FlashAttentionKwargs],
-    ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+    ) -> Tuple[torch.FloatTensor, Tuple[torch.FloatTensor, torch.FloatTensor] | None]:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(
@@ -286,8 +287,8 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
     def predict_confidence_step(
         self,
         hidden_states: torch.Tensor,
-        prev_token_ids: Optional[torch.Tensor] = None,
-    ) -> Optional[torch.Tensor]:
+        prev_token_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor | None:
         if self.confidence_head is None:
             return None
         if self.confidence_head_with_markov:
@@ -304,7 +305,7 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
         *,
         first_prev_token_ids: torch.Tensor,
         temperature: float = 0.0,
-        hidden_states: Optional[torch.Tensor] = None,
+        hidden_states: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, proposal_len = base_logits.shape[:2]
         if proposal_len == 0:
@@ -330,7 +331,7 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
         *,
         prev_token_ids: torch.Tensor,
         temperature: float = 0.0,
-        hidden_states: Optional[torch.Tensor] = None,
+        hidden_states: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         assert base_logits.ndim == 2, (
             f"sample_draft_token_step expects base_logits shaped [batch, vocab], got {tuple(base_logits.shape)}."
@@ -353,10 +354,10 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
         self,
         *,
         position_ids: torch.LongTensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        noise_embedding: Optional[torch.Tensor] = None,
-        target_hidden_states: Optional[torch.Tensor] = None,
-        past_key_values: Optional[Cache] = None,
+        attention_mask: torch.Tensor | None = None,
+        noise_embedding: torch.Tensor | None = None,
+        target_hidden_states: torch.Tensor | None = None,
+        past_key_values: Cache | None = None,
         use_cache: bool = False,
         **kwargs,
     ) -> torch.Tensor:
@@ -381,16 +382,29 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
         input_ids: torch.Tensor,
         target_hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
-        target_last_hidden_states: Optional[torch.Tensor] = None,
+        target_last_hidden_states: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        seq_lens: torch.Tensor | None = None,
+        doc_remaining: torch.Tensor | None = None,
     ) -> DSparkForwardOutput:
+        """Run one DSpark training forward.
+
+        Sequence packing (``position_ids`` ``[B, S]`` per-document reset positions,
+        ``seq_lens`` ``[B, max_docs]``, ``doc_remaining`` ``[B, S]``) keeps every block
+        inside its anchor's document: the anchor's first target must be in-document,
+        the block's context prefix and supervision are restricted to that document,
+        and the draft's RoPE uses the per-document positions.
+        """
         bsz, seq_len = input_ids.shape
         device = input_ids.device
+        packed = seq_lens is not None
 
         anchor_positions, block_keep_mask = sample_anchor_positions(
             seq_len=seq_len,
             loss_mask=loss_mask,
             num_anchors=self.num_anchors,
             device=device,
+            doc_remaining=doc_remaining if packed else None,
         )
         noise_embedding = create_noise_embed(
             self.embed_tokens,
@@ -400,16 +414,38 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
             mask_token_id=self.mask_token_id,
             block_size=self.block_size,
         )
-        context_position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(bsz, -1)
-        draft_position_ids = create_position_ids(anchor_positions, self.block_size)
+        if packed:
+            context_position_ids = position_ids
+            ctx_doc_id = context_doc_ids(seq_lens, seq_len, device)
+            anchor_doc_id = torch.gather(ctx_doc_id, 1, anchor_positions)
+        else:
+            context_position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(bsz, -1)
+            ctx_doc_id = None
+            anchor_doc_id = None
+        draft_position_ids = create_position_ids(
+            anchor_positions, self.block_size, context_position_ids if packed else None
+        )
         full_position_ids = torch.cat([context_position_ids, draft_position_ids], dim=1)
         if self.config._attn_implementation == "flex_attention":
             dspark_attn_mask = create_dflash_block_mask(
-                anchor_positions, block_keep_mask, seq_len, self.block_size, device
+                anchor_positions,
+                block_keep_mask,
+                seq_len,
+                self.block_size,
+                device,
+                ctx_doc_id=ctx_doc_id,
+                anchor_doc_id=anchor_doc_id,
             )
         else:
             dspark_attn_mask = create_dflash_sdpa_mask(
-                anchor_positions, block_keep_mask, seq_len, self.block_size, device, noise_embedding.dtype
+                anchor_positions,
+                block_keep_mask,
+                seq_len,
+                self.block_size,
+                device,
+                noise_embedding.dtype,
+                ctx_doc_id=ctx_doc_id,
+                anchor_doc_id=anchor_doc_id,
             )
         output_hidden = self._forward_backbone(
             position_ids=full_position_ids,
@@ -459,6 +495,8 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
             label_indices=label_indices,
             safe_label_indices=safe_label_indices,
             block_keep_mask=block_keep_mask,
+            doc_remaining=doc_remaining if packed else None,
+            anchor_positions=anchor_positions if packed else None,
         )
         anchor_token_ids = torch.gather(
             input_ids,

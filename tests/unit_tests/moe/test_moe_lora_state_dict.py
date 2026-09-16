@@ -18,12 +18,17 @@ Verifies that GroupedExpertsLoRA adapter weights are correctly converted to
 per-expert HF PEFT format and back, enabling merge via AutoPeftModelForCausalLM.
 """
 
+import re
+
 import pytest
 import torch
 import torch.nn as nn
 
 from nemo_automodel.components._peft.lora import PeftConfig, apply_lora_to_linear_modules
-from nemo_automodel.components.checkpoint.addons import _extract_target_modules
+from nemo_automodel.components.checkpoint.addons import (
+    _extract_target_modules,
+    _extract_target_parameters,
+)
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import GroupedExperts
 from nemo_automodel.components.moe.state_dict_mixin import MoESplitExpertsStateDictMixin
@@ -58,6 +63,18 @@ class _Adapter(MoESplitExpertsStateDictMixin):
         self._uses_model_prefix = uses_model_prefix
         self._last_expert_ids = []
 
+    @property
+    def _v5_peft_target_parameters(self):
+        return ("mlp.experts.gate_up_proj", "mlp.experts.down_proj")
+
+
+class _LegacyAdapter(_Adapter):
+    """Representative unvalidated adapter that must retain v4-style export."""
+
+    @property
+    def _v5_peft_target_parameters(self):
+        return ()
+
 
 def _make_moe_config():
     return MoEConfig(
@@ -84,13 +101,14 @@ def _make_moe_config():
     )
 
 
-def _make_tiny_moe_model(device="cpu"):
+def _make_tiny_moe_model(device="cpu", target_modules=None):
     """Build a 2-layer toy model with GroupedExperts + LoRA on experts."""
     moe_cfg = _make_moe_config()
 
     class TinyMoE(nn.Module):
         def __init__(self):
             super().__init__()
+            self.dense = nn.Linear(DIM, DIM, bias=False)
             self.layers = nn.ModuleList()
             for _ in range(N_LAYERS):
                 layer = nn.Module()
@@ -106,7 +124,7 @@ def _make_tiny_moe_model(device="cpu"):
     model = TinyMoE().to(device)
     model.state_dict_adapter = _Adapter()
     peft_config = PeftConfig(
-        target_modules=["*experts*"],
+        target_modules=["*experts*"] if target_modules is None else target_modules,
         dim=LORA_DIM,
         alpha=LORA_ALPHA,
     )
@@ -139,7 +157,7 @@ class TestMoELoRAToHF:
         tensor = torch.randn(N_EXPERTS, DIM, LORA_DIM)
         fqn = "model.layers.0.mlp.experts.lora_gate_and_up_A"
 
-        result = adapter._convert_single_merged_expert_to_hf_split_experts(fqn, tensor)
+        result = adapter._convert_single_merged_expert_to_hf_split_experts(fqn, tensor, v4_compatible=True)
 
         assert result is not None
         keys = [k for k, _ in result]
@@ -153,7 +171,7 @@ class TestMoELoRAToHF:
         tensor = torch.randn(N_EXPERTS, DIM, LORA_DIM)
         fqn = "model.layers.0.mlp.experts.lora_gate_and_up_A"
 
-        result = dict(adapter._convert_single_merged_expert_to_hf_split_experts(fqn, tensor))
+        result = dict(adapter._convert_single_merged_expert_to_hf_split_experts(fqn, tensor, v4_compatible=True))
 
         for eid in range(N_EXPERTS):
             gate_A = result[f"model.layers.0.mlp.experts.{eid}.gate_proj.lora_A.weight"]
@@ -171,7 +189,7 @@ class TestMoELoRAToHF:
         tensor = torch.randn(N_EXPERTS, LORA_DIM, 2 * MOE_INTER_DIM)
         fqn = "model.layers.0.mlp.experts.lora_gate_and_up_B"
 
-        result = dict(adapter._convert_single_merged_expert_to_hf_split_experts(fqn, tensor))
+        result = dict(adapter._convert_single_merged_expert_to_hf_split_experts(fqn, tensor, v4_compatible=True))
 
         for eid in range(N_EXPERTS):
             gate_B = result[f"model.layers.0.mlp.experts.{eid}.gate_proj.lora_B.weight"]
@@ -187,7 +205,7 @@ class TestMoELoRAToHF:
         tensor = torch.randn(N_EXPERTS, MOE_INTER_DIM, LORA_DIM)
         fqn = "model.layers.0.mlp.experts.lora_down_A"
 
-        result = dict(adapter._convert_single_merged_expert_to_hf_split_experts(fqn, tensor))
+        result = dict(adapter._convert_single_merged_expert_to_hf_split_experts(fqn, tensor, v4_compatible=True))
 
         for eid in range(N_EXPERTS):
             down_A = result[f"model.layers.0.mlp.experts.{eid}.down_proj.lora_A.weight"]
@@ -199,7 +217,7 @@ class TestMoELoRAToHF:
         tensor = torch.randn(N_EXPERTS, LORA_DIM, DIM)
         fqn = "model.layers.0.mlp.experts.lora_down_B"
 
-        result = dict(adapter._convert_single_merged_expert_to_hf_split_experts(fqn, tensor))
+        result = dict(adapter._convert_single_merged_expert_to_hf_split_experts(fqn, tensor, v4_compatible=True))
 
         for eid in range(N_EXPERTS):
             down_B = result[f"model.layers.0.mlp.experts.{eid}.down_proj.lora_B.weight"]
@@ -212,7 +230,7 @@ class TestMoELoRAToHF:
         tensor = torch.randn(N_EXPERTS, DIM, LORA_DIM)
         fqn = "base_model.model.model.layers.0.mlp.experts.lora_gate_and_up_A"
 
-        result = dict(adapter._convert_single_merged_expert_to_hf_split_experts(fqn, tensor))
+        result = dict(adapter._convert_single_merged_expert_to_hf_split_experts(fqn, tensor, v4_compatible=True))
 
         assert "base_model.model.model.layers.0.mlp.experts.0.gate_proj.lora_A.weight" in result
 
@@ -236,14 +254,18 @@ class TestMoELoRAToHF:
 class TestMoELoRAFromHF:
     """Verify _recombine_lora_expert_keys correctly recombines per-expert LoRA keys."""
 
-    def test_round_trip_lora_gate_and_up_A(self):
+    def test_round_trip_lora_gate_and_up_A_v4(self):
         adapter = _Adapter()
         original = torch.randn(N_EXPERTS, DIM, LORA_DIM)
 
-        # to_hf
-        hf = dict(adapter._convert_single_merged_expert_to_hf_split_experts(
-            "model.layers.0.mlp.experts.lora_gate_and_up_A", original,
-        ))
+        # to_hf (v4 mode)
+        hf = dict(
+            adapter._convert_single_merged_expert_to_hf_split_experts(
+                "model.layers.0.mlp.experts.lora_gate_and_up_A",
+                original,
+                v4_compatible=True,
+            )
+        )
 
         # from_hf
         result = adapter._recombine_lora_expert_keys(hf)
@@ -252,13 +274,17 @@ class TestMoELoRAFromHF:
         assert key in result
         torch.testing.assert_close(result[key], original)
 
-    def test_round_trip_lora_gate_and_up_B(self):
+    def test_round_trip_lora_gate_and_up_B_v4(self):
         adapter = _Adapter()
         original = torch.randn(N_EXPERTS, LORA_DIM, 2 * MOE_INTER_DIM)
 
-        hf = dict(adapter._convert_single_merged_expert_to_hf_split_experts(
-            "model.layers.0.mlp.experts.lora_gate_and_up_B", original,
-        ))
+        hf = dict(
+            adapter._convert_single_merged_expert_to_hf_split_experts(
+                "model.layers.0.mlp.experts.lora_gate_and_up_B",
+                original,
+                v4_compatible=True,
+            )
+        )
 
         result = adapter._recombine_lora_expert_keys(hf)
 
@@ -266,13 +292,17 @@ class TestMoELoRAFromHF:
         assert key in result
         torch.testing.assert_close(result[key], original)
 
-    def test_round_trip_lora_down_A(self):
+    def test_round_trip_lora_down_A_v4(self):
         adapter = _Adapter()
         original = torch.randn(N_EXPERTS, MOE_INTER_DIM, LORA_DIM)
 
-        hf = dict(adapter._convert_single_merged_expert_to_hf_split_experts(
-            "model.layers.0.mlp.experts.lora_down_A", original,
-        ))
+        hf = dict(
+            adapter._convert_single_merged_expert_to_hf_split_experts(
+                "model.layers.0.mlp.experts.lora_down_A",
+                original,
+                v4_compatible=True,
+            )
+        )
 
         result = adapter._recombine_lora_expert_keys(hf)
 
@@ -280,13 +310,17 @@ class TestMoELoRAFromHF:
         assert key in result
         torch.testing.assert_close(result[key], original)
 
-    def test_round_trip_lora_down_B(self):
+    def test_round_trip_lora_down_B_v4(self):
         adapter = _Adapter()
         original = torch.randn(N_EXPERTS, LORA_DIM, DIM)
 
-        hf = dict(adapter._convert_single_merged_expert_to_hf_split_experts(
-            "model.layers.0.mlp.experts.lora_down_B", original,
-        ))
+        hf = dict(
+            adapter._convert_single_merged_expert_to_hf_split_experts(
+                "model.layers.0.mlp.experts.lora_down_B",
+                original,
+                v4_compatible=True,
+            )
+        )
 
         result = adapter._recombine_lora_expert_keys(hf)
 
@@ -294,15 +328,15 @@ class TestMoELoRAFromHF:
         assert key in result
         torch.testing.assert_close(result[key], original)
 
-    def test_round_trip_all_lora_keys_with_prefix(self):
-        """Full round-trip for all 4 LoRA parameter types, with PEFT prefix."""
+    def test_round_trip_all_lora_keys_with_prefix_v4(self):
+        """Full round-trip for all 4 LoRA parameter types, with PEFT prefix (v4 mode)."""
         adapter = _Adapter()
         original = _make_grouped_lora_state_dict(prefix="base_model.model.")
 
-        # to_hf: convert all keys
+        # to_hf: convert all keys (v4 mode)
         hf_sd = {}
         for fqn, tensor in original.items():
-            converted = adapter._convert_single_merged_expert_to_hf_split_experts(fqn, tensor)
+            converted = adapter._convert_single_merged_expert_to_hf_split_experts(fqn, tensor, v4_compatible=True)
             if converted:
                 for k, v in converted:
                     hf_sd[k] = v
@@ -322,6 +356,33 @@ class TestMoELoRAFromHF:
         # Verify all original keys are restored
         for k, v in original.items():
             assert k in result, f"Missing key after round-trip: {k}"
+            torch.testing.assert_close(result[k], v, msg=f"Value mismatch for {k}")
+
+    def test_round_trip_v5_paramwrapper(self):
+        """Test v5 ParamWrapper round-trip for all 4 LoRA types."""
+        adapter = _Adapter()
+        original = _make_grouped_lora_state_dict(prefix="base_model.model.")
+
+        # to_hf: convert to ParamWrapper (v5) format
+        pw_sd = {}
+        for fqn, tensor in original.items():
+            converted = adapter._convert_single_merged_expert_to_hf_split_experts(fqn, tensor, v4_compatible=False)
+            if converted:
+                for k, v in converted:
+                    pw_sd[k] = v
+            else:
+                pw_sd[fqn] = tensor
+
+        # Verify ParamWrapper format: keys use lora_[AB].weight pattern
+        for fqn in pw_sd:
+            assert "lora_A.weight" in fqn or "lora_B.weight" in fqn, f"Unexpected key: {fqn}"
+
+        # from_hf: convert back (via _convert_paramwrapper_to_native)
+        result = adapter._convert_paramwrapper_to_native(pw_sd)
+
+        # Verify all original keys are restored
+        for k, v in original.items():
+            assert k in result, f"Missing key after v5 round-trip: {k}"
             torch.testing.assert_close(result[k], v, msg=f"Value mismatch for {k}")
 
     def test_passthrough_non_lora_keys(self):
@@ -359,10 +420,10 @@ class TestMoELoRAFromHF:
 class TestExtractTargetModulesWithMoELoRA:
     """Verify that _extract_target_modules includes per-expert HF module names."""
 
-    def test_includes_per_expert_projections(self):
+    def test_includes_per_expert_projections_v4(self):
         model = _make_tiny_moe_model()
 
-        target_modules = _extract_target_modules(model)
+        target_modules = _extract_target_modules(model, v4_compatible=True)
 
         for layer_idx in range(N_LAYERS):
             for eid in range(N_EXPERTS):
@@ -371,14 +432,97 @@ class TestExtractTargetModulesWithMoELoRA:
                 assert f"{base}.up_proj" in target_modules, f"Missing {base}.up_proj"
                 assert f"{base}.down_proj" in target_modules, f"Missing {base}.down_proj"
 
-    def test_no_grouped_lora_names_in_targets(self):
+    def test_no_grouped_lora_names_in_targets_v4(self):
         model = _make_tiny_moe_model()
 
-        target_modules = _extract_target_modules(model)
+        target_modules = _extract_target_modules(model, v4_compatible=True)
 
         for name in target_modules:
             assert "lora_gate_and_up" not in name
             assert "lora_down" not in name
+
+
+class TestExtractTargetsV5Defaults:
+    """v5 (``v4_compatible=False``) is the production default.
+
+    The v4 tests above all pass ``v4_compatible=True``, so the defaults that
+    actually ship were unasserted: ``target_parameters`` carries the fused
+    ParamWrapper paths and ``target_modules`` skips the per-expert expansion.
+    CPU-only — none of this touches a device.
+    """
+
+    def test_target_parameters_are_the_fused_expert_paths(self):
+        model = _make_tiny_moe_model()
+
+        assert _extract_target_parameters(model) == [
+            "mlp.experts.gate_up_proj",
+            "mlp.experts.down_proj",
+        ]
+
+    def test_target_parameters_empty_in_v4_mode(self):
+        """v4 expresses experts through target_modules instead."""
+        model = _make_tiny_moe_model()
+
+        assert _extract_target_parameters(model, v4_compatible=True) == []
+
+    def test_no_per_expert_expansion_in_v5(self):
+        """The v4 path emits layers.N.mlp.experts.<eid>.*; v5 must not."""
+        model = _make_tiny_moe_model()
+
+        target_modules = _extract_target_modules(model)
+
+        assert not [n for n in target_modules if re.search(r"experts\.\d+\.", n)]
+
+    def test_v4_and_v5_are_mutually_exclusive(self):
+        """Exactly one of the two mechanisms describes the experts."""
+        model = _make_tiny_moe_model()
+
+        v5_modules = _extract_target_modules(model)
+        v5_params = _extract_target_parameters(model)
+        v4_modules = _extract_target_modules(model, v4_compatible=True)
+        v4_params = _extract_target_parameters(model, v4_compatible=True)
+
+        assert v5_params and not v5_modules
+        assert v4_modules and not v4_params
+
+    def test_target_parameters_empty_without_a_moe_adapter(self):
+        """A non-MoE model must not gain fused expert paths."""
+        assert _extract_target_parameters(nn.Module()) == []
+
+    def test_target_parameters_empty_when_only_dense_lora_is_injected(self):
+        """A v5-capable model must not advertise expert paths for dense-only LoRA."""
+        model = _make_tiny_moe_model(target_modules=["dense"])
+
+        assert _extract_target_parameters(model) == []
+        assert _extract_target_modules(model) == ["dense"]
+
+    def test_accepts_a_list_of_pp_parts(self):
+        """Under PP the caller passes this rank's stages; the first is representative."""
+        model = _make_tiny_moe_model()
+
+        assert _extract_target_parameters([model]) == _extract_target_parameters(model)
+
+    def test_unvalidated_adapter_keeps_legacy_targets_by_default(self):
+        model = _make_tiny_moe_model()
+        model.state_dict_adapter = _LegacyAdapter()
+
+        assert _extract_target_parameters(model) == []
+        targets = _extract_target_modules(model)
+        assert "layers.0.mlp.experts.0.gate_proj" in targets
+        assert "layers.0.mlp.experts.0.up_proj" in targets
+        assert "layers.0.mlp.experts.0.down_proj" in targets
+
+    def test_unvalidated_adapter_keeps_legacy_state_dict_format_by_default(self):
+        adapter = _LegacyAdapter()
+        tensor = torch.randn(N_EXPERTS, DIM, LORA_DIM)
+
+        converted = adapter._convert_single_merged_expert_to_hf_split_experts(
+            "model.layers.0.mlp.experts.lora_gate_and_up_A", tensor
+        )
+
+        keys = {key for key, _ in converted}
+        assert "model.layers.0.mlp.experts.0.gate_proj.lora_A.weight" in keys
+        assert not any("base_layer.lora_A.weight" in key for key in keys)
 
 
 # ---------------------------------------------------------------------------
@@ -391,12 +535,20 @@ class TestExtractTargetModulesWithMoELoRA:
 # ---------------------------------------------------------------------------
 
 
-def _convert_grouped_to_hf(grouped_sd):
-    """Helper: convert a grouped LoRA state dict to per-expert HF format."""
+def _convert_grouped_to_hf(grouped_sd, v4_compatible=True):
+    """Helper: convert a grouped LoRA state dict to HF format.
+
+    Args:
+        grouped_sd: Grouped native LoRA state dict.
+        v4_compatible: If True, produce per-expert split format (v4).
+            If False, produce ParamWrapper fused format (v5).
+    """
     adapter_obj = _Adapter()
     hf_sd = {}
     for fqn, tensor in grouped_sd.items():
-        converted = adapter_obj._convert_single_merged_expert_to_hf_split_experts(fqn, tensor)
+        converted = adapter_obj._convert_single_merged_expert_to_hf_split_experts(
+            fqn, tensor, v4_compatible=v4_compatible
+        )
         if converted:
             for k, v in converted:
                 hf_sd[k] = v
@@ -437,6 +589,7 @@ def _make_hf_expert_model():
 def _write_adapter_dir(tmp_path, hf_lora_sd, lora_r, lora_alpha, target_modules):
     """Persist adapter_model.safetensors + adapter_config.json to *tmp_path*."""
     import json
+
     from safetensors.torch import save_file
 
     save_file(hf_lora_sd, str(tmp_path / "adapter_model.safetensors"))
@@ -523,8 +676,7 @@ class TestMoELoRASaveRestoreMergeHF:
 
         expected = N_LAYERS * N_EXPERTS * 3  # gate, up, down per expert
         assert changed == expected, (
-            f"Expected all {expected} expert weight tensors to change after merge, "
-            f"got {changed}"
+            f"Expected all {expected} expert weight tensors to change after merge, got {changed}"
         )
 
     # ---- test: merged weights equal base + B @ A * scale exactly ----
@@ -578,3 +730,179 @@ class TestMoELoRASaveRestoreMergeHF:
             assert "lora_" not in name, f"LoRA param {name} should be absent after merge"
         for name, _ in merged.named_modules():
             assert "lora_" not in name, f"LoRA module {name} should be absent after merge"
+
+
+class TestParamWrapperLayoutVersions:
+    """peft flipped the ParamWrapper layout for 3-D expert params in 0.19.1
+    (huggingface/peft#3165). Export emits the corrected layout by default with
+    an explicit legacy option; import resolves the layout from the checkpoint's
+    metadata stamp first, then from tensor shapes, and fails clearly when
+    neither settles it.
+    """
+
+    def _native(self):
+        base = "model.layers.0.mlp.experts"
+        return {
+            f"{base}.lora_gate_and_up_A": torch.randn(N_EXPERTS, DIM, LORA_DIM),
+            f"{base}.lora_gate_and_up_B": torch.randn(N_EXPERTS, LORA_DIM, 2 * MOE_INTER_DIM),
+            f"{base}.lora_down_A": torch.randn(N_EXPERTS, MOE_INTER_DIM, LORA_DIM),
+            f"{base}.lora_down_B": torch.randn(N_EXPERTS, LORA_DIM, DIM),
+        }
+
+    def _export(self, adapter, native, legacy=False):
+        out = {}
+        for fqn, tensor in native.items():
+            for key, value in adapter._convert_lora_to_paramwrapper(fqn, tensor.clone(), legacy_layout=legacy):
+                out[key] = value
+        return out
+
+    def test_default_export_uses_the_corrected_layout(self):
+        out = self._export(_Adapter(), self._native())
+
+        base = "model.layers.0.mlp.experts"
+        assert out[f"{base}.base_layer.lora_A.weight"].shape == (LORA_DIM * N_EXPERTS, DIM)
+        assert out[f"{base}.base_layer.lora_B.weight"].shape == (2 * MOE_INTER_DIM, LORA_DIM * N_EXPERTS)
+        assert out[f"{base}.lora_A.weight"].shape == (LORA_DIM * N_EXPERTS, MOE_INTER_DIM)
+        assert out[f"{base}.lora_B.weight"].shape == (DIM, LORA_DIM * N_EXPERTS)
+
+    def test_legacy_option_keeps_the_pre_flip_layout(self):
+        out = self._export(_Adapter(), self._native(), legacy=True)
+
+        base = "model.layers.0.mlp.experts"
+        assert out[f"{base}.base_layer.lora_A.weight"].shape == (LORA_DIM * N_EXPERTS, 2 * MOE_INTER_DIM)
+        assert out[f"{base}.base_layer.lora_B.weight"].shape == (DIM, LORA_DIM * N_EXPERTS)
+        assert out[f"{base}.lora_A.weight"].shape == (LORA_DIM * N_EXPERTS, DIM)
+        assert out[f"{base}.lora_B.weight"].shape == (MOE_INTER_DIM, LORA_DIM * N_EXPERTS)
+
+    @pytest.mark.parametrize("legacy", [False, True])
+    def test_round_trip_is_exact_for_both_layouts(self, legacy):
+        adapter = _Adapter()
+        native = self._native()
+        back = adapter._convert_paramwrapper_to_native(self._export(adapter, native, legacy=legacy))
+
+        assert set(back) == set(native)
+        for key in native:
+            torch.testing.assert_close(back[key], native[key])
+
+    def test_import_detects_the_layout_from_shapes(self):
+        """A legacy-layout file loads correctly with no metadata stamp."""
+        adapter = _Adapter()
+        native = self._native()
+        back = adapter._convert_paramwrapper_to_native(self._export(adapter, native, legacy=True))
+
+        assert set(back) == set(native)
+        for key in native:
+            torch.testing.assert_close(back[key], native[key])
+
+    def test_unambiguous_tensors_decide_the_layout_for_the_whole_file(self):
+        """A legacy MiniMax-M2-style file loads fully correctly without metadata.
+
+        With dim == 2 * moe_inter the gate_up pair is shape-ambiguous, but the
+        down pair is not; its vote decides the layout for the whole file.
+        """
+        adapter = _Adapter()
+        adapter.moe_config.dim = 2 * MOE_INTER_DIM
+        base = "model.layers.0.mlp.experts"
+        native = {
+            f"{base}.lora_gate_and_up_A": torch.randn(N_EXPERTS, 2 * MOE_INTER_DIM, LORA_DIM),
+            f"{base}.lora_gate_and_up_B": torch.randn(N_EXPERTS, LORA_DIM, 2 * MOE_INTER_DIM),
+            f"{base}.lora_down_A": torch.randn(N_EXPERTS, MOE_INTER_DIM, LORA_DIM),
+            f"{base}.lora_down_B": torch.randn(N_EXPERTS, LORA_DIM, 2 * MOE_INTER_DIM),
+        }
+        back = adapter._convert_paramwrapper_to_native(self._export(adapter, native, legacy=True))
+
+        assert set(back) == set(native)
+        for key in native:
+            torch.testing.assert_close(back[key], native[key])
+
+    @pytest.mark.parametrize("layout, expect_key", [("peft-0.18", "lora_down_B"), ("peft-0.19.1", "lora_down_A")])
+    def test_metadata_hint_resolves_ambiguous_shapes(self, layout, expect_key):
+        """When shapes cannot distinguish the layouts, the metadata stamp decides."""
+        adapter = _Adapter()
+        adapter.moe_config.dim = MOE_INTER_DIM  # the down pair becomes shape-ambiguous
+        adapter._paramwrapper_layout_hint = layout
+        base = "model.layers.0.mlp.experts"
+
+        back = adapter._convert_paramwrapper_to_native(
+            {f"{base}.lora_A.weight": torch.randn(LORA_DIM * N_EXPERTS, MOE_INTER_DIM)}
+        )
+
+        assert list(back) == [f"{base}.{expect_key}"]
+
+    def test_ambiguous_shapes_without_metadata_fail_clearly(self):
+        adapter = _Adapter()
+        adapter.moe_config.dim = MOE_INTER_DIM
+        base = "model.layers.0.mlp.experts"
+
+        with pytest.raises(ValueError, match="huggingface/peft#3165"):
+            adapter._convert_paramwrapper_to_native(
+                {f"{base}.lora_A.weight": torch.randn(LORA_DIM * N_EXPERTS, MOE_INTER_DIM)}
+            )
+
+    @pytest.mark.parametrize("legacy, stamp", [(False, "peft-0.19.1"), (True, "peft-0.18")])
+    def test_metadata_stamp_agreeing_with_shapes_loads(self, legacy, stamp):
+        adapter = _Adapter()
+        native = self._native()
+        adapter._paramwrapper_layout_hint = stamp
+
+        back = adapter._convert_paramwrapper_to_native(self._export(adapter, native, legacy=legacy))
+
+        assert set(back) == set(native)
+        for key in native:
+            torch.testing.assert_close(back[key], native[key])
+
+    def test_unknown_metadata_stamp_fails_clearly(self):
+        """Only the two known layout ids are accepted; anything else is an error, not 'modern'."""
+        adapter = _Adapter()
+        adapter._paramwrapper_layout_hint = "peft-0.21"
+
+        with pytest.raises(ValueError, match="Unknown peft ParamWrapper layout 'peft-0.21'"):
+            adapter._convert_paramwrapper_to_native(self._export(adapter, self._native()))
+
+    @pytest.mark.parametrize("file_is_legacy, stamp", [(True, "peft-0.19.1"), (False, "peft-0.18")])
+    def test_metadata_stamp_contradicting_shapes_fails_clearly(self, file_is_legacy, stamp):
+        """A stamp the tensor shapes rule out must not win silently, in either direction."""
+        adapter = _Adapter()
+        exported = self._export(adapter, self._native(), legacy=file_is_legacy)
+        adapter._paramwrapper_layout_hint = stamp
+
+        with pytest.raises(ValueError, match="do not belong together"):
+            adapter._convert_paramwrapper_to_native(exported)
+
+    @pytest.mark.parametrize("stamp", [None, "peft-0.19.1", "peft-0.18"])
+    def test_tensors_disagreeing_about_the_layout_fail_even_with_a_valid_stamp(self, stamp):
+        """A file mixing both layouts is corrupt; a valid stamp must not mask that."""
+        adapter = _Adapter()
+        native = self._native()
+        mixed = self._export(adapter, native, legacy=True)
+        modern_down_b = {
+            key: value
+            for key, value in self._export(adapter, native).items()
+            if key.endswith(".lora_B.weight") and "base_layer" not in key
+        }
+        mixed.update(modern_down_b)
+        adapter._paramwrapper_layout_hint = stamp
+
+        with pytest.raises(ValueError, match="disagree about their layout"):
+            adapter._convert_paramwrapper_to_native(mixed)
+
+    @pytest.mark.parametrize("legacy", [False, True])
+    def test_non_gated_experts_round_trip_for_both_layouts(self, legacy):
+        """Nemotron-V3-style non-gated experts (gate_up width == moe_inter)."""
+        adapter = _Adapter()
+        adapter.moe_config.expert_activation = "relu2"
+        base = "model.layers.0.mlp.experts"
+        native = {
+            f"{base}.lora_gate_and_up_A": torch.randn(N_EXPERTS, DIM, LORA_DIM),
+            f"{base}.lora_gate_and_up_B": torch.randn(N_EXPERTS, LORA_DIM, MOE_INTER_DIM),
+            f"{base}.lora_down_A": torch.randn(N_EXPERTS, MOE_INTER_DIM, LORA_DIM),
+            f"{base}.lora_down_B": torch.randn(N_EXPERTS, LORA_DIM, DIM),
+        }
+        exported = self._export(adapter, native, legacy=legacy)
+        if not legacy:
+            assert exported[f"{base}.base_layer.lora_A.weight"].shape == (LORA_DIM * N_EXPERTS, DIM)
+        back = adapter._convert_paramwrapper_to_native(exported)
+
+        assert set(back) == set(native)
+        for key in native:
+            torch.testing.assert_close(back[key], native[key])

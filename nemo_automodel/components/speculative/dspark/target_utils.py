@@ -24,6 +24,7 @@ GEMMA4_MODEL_TYPES = ("gemma4", "gemma4_unified")
 DEEPSEEK_V4_MODEL_TYPE = "deepseek_v4"
 GLM_5_2_MODEL_TYPE = "glm_moe_dsa"
 MINIMAX_M3_MODEL_TYPES = ("minimax_m3_vl",)
+KIMI_K3_MODEL_TYPES = ("kimi_k3", "kimi_linear")
 
 
 def read_target_model_type(target_path: str, trust_remote_code: bool) -> str:

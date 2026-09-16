@@ -15,13 +15,16 @@
 import logging
 import signal
 import types
-from typing import Any, Optional
+from collections.abc import Sequence
+from typing import Any
 
 import torch
 import torch.distributed
 
+SignalLike = int | str | signal.Signals
 
-def get_device(local_rank: Optional[int] = None) -> torch.device:
+
+def get_device(local_rank: int | None = None) -> torch.device:
     """
     Get the appropriate torch device based on the distributed backend.
 
@@ -51,9 +54,9 @@ def get_device(local_rank: Optional[int] = None) -> torch.device:
 def all_gather_item(
     item: Any,
     dtype: torch.dtype,
-    group: Optional[torch.distributed.ProcessGroup] = None,
+    group: torch.distributed.ProcessGroup | None = None,
     async_op: bool = False,
-    local_rank: Optional[int] = None,
+    local_rank: int | None = None,
 ) -> list[Any]:
     """Perform an all_gather operation on a single Python object.
 
@@ -98,25 +101,48 @@ class DistributedSignalHandler:
     The original signal handler is restored upon exiting the context.
 
     Args:
-        sig: The signal number to handle (e.g., signal.SIGTERM).
-             Defaults to signal.SIGTERM.
+        sig: One or more signals to handle, each given as a signal number,
+            name (e.g. "SIGTERM"), or ``signal.Signals`` member. Accepts a
+            single value or a sequence. Defaults to signal.SIGTERM.
+        group: Process group whose ranks participate in signal propagation.
+            Defaults to the global process group.
     """
 
-    def __init__(self, sig: int = signal.SIGTERM) -> None:
+    def __init__(
+        self,
+        sig: SignalLike | Sequence[SignalLike] = signal.SIGTERM,
+        group: torch.distributed.ProcessGroup | None = None,
+    ) -> None:
         """
         Constructor for the DistributedSignalHandler.
 
         Args:
-            sig (int, optional): The signal to handle. Defaults to signal.SIGTERM.
+            sig (SignalLike | Sequence[SignalLike], optional): One or more signals to handle,
+                each given as a signal number, name (e.g. "SIGTERM"), or ``signal.Signals``
+                member. Defaults to signal.SIGTERM.
+            group: Process group whose ranks participate in signal propagation.
+                Defaults to the global process group.
         """
-        self.sig = sig
+        specs = sig if isinstance(sig, (list, tuple)) else [sig]
+        sigs = [resolve_signal(s) for s in specs]
+        if len(sigs) == 0:
+            raise ValueError("At least one signal must be provided")
+        if len(set(sigs)) != len(sigs):
+            raise ValueError(f"Duplicate signals provided: {[s.name for s in sigs]}")
+        self.sigs = sigs
+        self.group = group
         self._signal_received = False
         self.released = False
-        self.original_handler = None
+        self.original_handlers = {}
+
+    @property
+    def sig(self) -> signal.Signals:
+        """Backward-compatible accessor for the first configured signal."""
+        return self.sigs[0]
 
     def signals_received(self) -> list[bool]:
         """
-        Check if any rank in the default group received the signal.
+        Check if any rank in the configured group received the signal.
 
         Uses all_gather to collect the signal status from all ranks.
 
@@ -124,7 +150,7 @@ class DistributedSignalHandler:
             A list of booleans, where each element indicates if the
             corresponding rank received the signal.
         """
-        all_received = all_gather_item(self._signal_received, dtype=torch.int32)
+        all_received = all_gather_item(self._signal_received, dtype=torch.int32, group=self.group)
         return all_received
 
     def __enter__(self) -> "DistributedSignalHandler":
@@ -136,19 +162,20 @@ class DistributedSignalHandler:
         """
         self._signal_received = False
         self.released = False
-        self.original_handler = signal.getsignal(self.sig)
 
-        def handler(signum: int, frame: Optional[Any]) -> None:
+        def handler(signum: int, frame: Any | None) -> None:
             logging.info("Received signal {}, initiating graceful stop".format(signum))
             self._signal_received = True
 
-        signal.signal(self.sig, handler)
-        logging.info("Signal handler installed for {}".format(self.sig))
+        for s in self.sigs:
+            self.original_handlers[s] = signal.getsignal(s)
+            signal.signal(s, handler)
+            logging.info("Signal handler installed for {}".format(s.name))
 
         return self
 
     def __exit__(
-        self, exc_type: Optional[type], exc_val: BaseException | None, exc_tb: types.TracebackType | None
+        self, exc_type: type | None, exc_val: BaseException | None, exc_tb: types.TracebackType | None
     ) -> None:  # noqa: E501
         """
         Release the signal handler and restore the original handler.
@@ -165,6 +192,48 @@ class DistributedSignalHandler:
         if self.released:
             return False
 
-        signal.signal(self.sig, self.original_handler)
+        for s, original in self.original_handlers.items():
+            signal.signal(s, original)
         self.released = True
         return True
+
+
+def resolve_signal(sig: SignalLike) -> signal.Signals:
+    """
+    Resolve a user-provided signal specification to "signal.Signals" member.
+
+    Accepts integers (e.g. "15"), "signal.Signals" members (e.g. "signal.SIGTERM")
+    and case-insensitive string names with or without the "SIG" prefix (e.g. "SIGTERM",
+    "sigusr1", "USR2"). String support allows the pre-emption signal to be configured from YAML.
+
+    Args:
+        sig: The signal specification to resolve.
+
+    Returns:
+        The corresponding "signal.Signals" member.
+
+    Raises:
+        ValueError: If the specification does not name a valid signal.
+        TypeError: If sig is not an int, str, or "signal.Signals".
+    """
+
+    if isinstance(sig, signal.Signals):
+        return sig
+    if isinstance(sig, bool):
+        # bool is a subclass of int; reject it before the int branch so
+        # True/False don't silently resolve to SIGHUP / an invalid number.
+        raise TypeError(f"Signal must be an int, str or signal.Signals, got bool: {sig!r}")
+    if isinstance(sig, int):
+        try:
+            return signal.Signals(sig)
+        except ValueError as e:
+            raise ValueError(f"Invalid signal number: {sig}") from e
+    if isinstance(sig, str):
+        name = sig.strip().upper()
+        if not name.startswith("SIG"):
+            name = "SIG" + name
+        try:
+            return signal.Signals[name]
+        except KeyError as e:
+            raise ValueError(f"Unknown signal name: {sig!r}") from e
+    raise TypeError(f"Signal must be an int, str or signal.Signals, got {type(sig).__name__}")

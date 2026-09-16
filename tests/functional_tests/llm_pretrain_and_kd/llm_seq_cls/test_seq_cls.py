@@ -18,6 +18,7 @@ from tests.utils.test_utils import run_test_script
 
 TEST_FOLDER = "llm_pretrain_and_kd/llm_seq_cls/"
 SEQ_CLS_MOCK_FILENAME = "L2_Seq_Cls_Mock.sh"
+SEQ_CLS_LORA_FP32_FILENAME = "L2_Seq_Cls_LoRA_FP32.sh"
 
 
 class TestSequenceClassification:
@@ -26,3 +27,9 @@ class TestSequenceClassification:
             run_test_script(TEST_FOLDER, SEQ_CLS_MOCK_FILENAME)
         finally:
             shutil.rmtree("checkpoints_seq_cls_test/", ignore_errors=True)
+
+    def test_seq_cls_lora_with_fp32_storage(self):
+        try:
+            run_test_script(TEST_FOLDER, SEQ_CLS_LORA_FP32_FILENAME)
+        finally:
+            shutil.rmtree("checkpoints_seq_cls_lora_fp32_test/", ignore_errors=True)

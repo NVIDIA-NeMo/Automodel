@@ -47,7 +47,7 @@ checkpoint:
   enabled: true
   checkpoint_dir: result/checkpoints/qwen2_5_omni_asr_ami_7b
   model_save_format: safetensors
-  save_consolidated: true
+  save_consolidated: final
 
 distributed:
   strategy: fsdp2
@@ -62,7 +62,6 @@ distributed:
 # Full fine-tune: audio tower + language model trainable; vision tower frozen
 # (we never feed images on AMI).
 freeze_config:
-  freeze_embeddings: false
   freeze_vision_tower: true
   freeze_audio_tower: false
   freeze_language_model: false

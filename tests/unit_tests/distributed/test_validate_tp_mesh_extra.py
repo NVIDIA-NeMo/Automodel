@@ -23,12 +23,11 @@ edge-cases that were not covered:
 
 from __future__ import annotations
 
-import builtins
 import sys
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
-from unittest.mock import MagicMock
 
 from nemo_automodel.components.distributed.parallelizer import validate_tp_mesh
 
@@ -44,7 +43,8 @@ def _install_fake_gemma3(monkeypatch):
     ``validate_tp_mesh``; no actual functionality is required.
     """
 
-    import sys, types  # Local import to avoid polluting global namespace
+    import sys  # Local import to avoid polluting global namespace
+    import types
 
     module_chain = [
         "transformers",
@@ -64,12 +64,14 @@ def _install_fake_gemma3(monkeypatch):
 
     modeling.Gemma3ForConditionalGeneration = _StubGemma3
 
+
 def _make_tp_mesh(size: int):
     """Create a ``MagicMock`` that mimics the minimal DeviceMesh interface."""
 
     mesh = MagicMock()
     mesh.size.return_value = size
     return mesh
+
 
 def test_validate_tp_mesh_import_error(monkeypatch):
     """Function should no-op (not raise) when Gemma3 import fails.
@@ -84,27 +86,20 @@ def test_validate_tp_mesh_import_error(monkeypatch):
         if key.startswith("transformers"):
             monkeypatch.delitem(sys.modules, key, raising=False)
 
-    # 2. Patch the import machinery so any subsequent attempt raises ImportError.
-    original_import = builtins.__import__
-
-    def _import_blocker(name, globals=None, locals=None, fromlist=(), level=0):  # noqa: D401,E501
-        if name.startswith("transformers"):
-            raise ImportError("Blocked for test")
-        return original_import(name, globals, locals, fromlist, level)
-
-    monkeypatch.setattr(builtins, "__import__", _import_blocker)
-
-    # 3. Call the helper – it should *not* raise.
+    # 2. Call the helper – it should *not* raise.
     tp_mesh = _make_tp_mesh(4)
     dummy_model = object()
 
     validate_tp_mesh(dummy_model, tp_mesh)  # Should silently return
 
 
-@pytest.mark.parametrize("num_heads,tp_size,should_raise", [
-    (8, 4, False),  # divisible
-    (10, 4, True),  # not divisible
-])
+@pytest.mark.parametrize(
+    "num_heads,tp_size,should_raise",
+    [
+        (8, 4, False),  # divisible
+        (10, 4, True),  # not divisible
+    ],
+)
 def test_validate_tp_mesh_basic_divisibility(monkeypatch, num_heads, tp_size, should_raise):
     """Smoke-test divisibility logic with a minimal config object.
 

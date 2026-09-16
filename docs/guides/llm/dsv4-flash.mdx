@@ -1,5 +1,5 @@
 ---
-title: "DeepSeek V4 Flash"
+title: "DeepSeek-V4 Flash"
 description: ""
 position: 6
 ---
@@ -7,7 +7,7 @@ position: 6
 
 [deepseek-ai/DeepSeek-V4-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash) is the latest fine-grained Mixture-of-Experts language model from DeepSeek. It uses a 43-layer all-MoE backbone (no dense MLP layers) with 256 routed experts plus one shared expert per block and top-6 routing. The architecture introduces a hybrid per-layer attention zoo — Sliding-Window Attention (SWA), Compressed Sparse Attention (CSA, Compressor + Indexer), and Hierarchical Compressed Attention (HCA, Compressor only) — selectable per layer through `compress_ratios`. The first `num_hash_layers` blocks use a hash-clustering gate (`DeepseekV4HashGate`) for token-to-expert routing, and every block maintains `hc_mult=4` Hyper-Connection streams mixed via a learned col-norm-first Sinkhorn router.
 
-This guide walks you through fine-tuning DeepSeek V4 Flash on HellaSwag using NVIDIA NeMo Automodel. You will learn how to configure the recipe, launch training, and inspect the results.
+This guide walks you through fine-tuning DeepSeek-V4 Flash on HellaSwag using NVIDIA NeMo Automodel. You will learn how to configure the recipe, launch training, and inspect the results.
 
 To set up your environment to run NeMo Automodel, follow the [installation guide](https://github.com/NVIDIA-NeMo/Automodel#-install-nemo-automodel).
 
@@ -18,14 +18,14 @@ To set up your environment to run NeMo Automodel, follow the [installation guide
 We use [HellaSwag](https://huggingface.co/datasets/Rowan/hellaswag), a commonsense natural-language-inference dataset consisting of context + four candidate continuations. The version used here is the standard `rowan/hellaswag` HuggingFace split, formatted for next-token-prediction fine-tuning.
 
 - **Train / validation splits** taken directly from the HuggingFace dataset.
-- **Tokenizer**: shared with the base model (`AutoTokenizer.from_pretrained` on the DeepSeek V4 Flash checkpoint).
+- **Tokenizer**: shared with the base model (`AutoTokenizer.from_pretrained` on the DeepSeek-V4 Flash checkpoint).
 - **Padding**: `pad_seq_len_divisible=64` via the default collater.
 
 For the full HellaSwag dataset wrapper used in NeMo Automodel, see [`nemo_automodel.components.datasets.llm.hellaswag.HellaSwag`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/datasets/llm/hellaswag.py).
 
 ## Architecture Notes
 
-DeepSeek V4 Flash differs from V3 / V3.2 in several load-bearing ways. The state-dict adapter and pipeline-parallel forward in NeMo Automodel handle each of these transparently:
+DeepSeek-V4 Flash differs from V3 / V3.2 in several load-bearing ways. The state-dict adapter and pipeline-parallel forward in NeMo Automodel handle each of these transparently:
 
 - **Attention**: GQA with a single KV head broadcast to all 64 attention heads, Q-LoRA (`q_lora_rank=1024`), and grouped O-LoRA (`o_lora_rank=1024`, `o_groups=8`) — not MLA. Per-head non-learnable rsqrt on Q after `wq_b` matches the inference reference.
 - **Hybrid attention via `compress_ratios`**:
@@ -93,5 +93,5 @@ The bringup was validated against the official DeepSeek inference reference (`ds
 The training loss curve below is from a 43-layer full-finetune run on HellaSwag with the full attention zoo (SWA + CSA + HCA) live.
 
 <p align="center">
-  <img src="https://github.com/user-attachments/assets/b5ed8837-40cb-41c6-8b90-2789e5e872cc" alt="DeepSeek V4 Flash Training Loss Curve" width="600" />
+  <img src="https://github.com/user-attachments/assets/b5ed8837-40cb-41c6-8b90-2789e5e872cc" alt="DeepSeek-V4 Flash Training Loss Curve" width="600" />
 </p>

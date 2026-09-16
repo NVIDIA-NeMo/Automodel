@@ -147,6 +147,25 @@ class TestDrafterClassStructure:
         assert cfg.tie_word_embeddings is True
         assert model.lm_head.weight.data_ptr() == model.model.embed_tokens.weight.data_ptr()
 
+    def test_tie_weights_restores_lm_head_alias(self):
+        from transformers.models.gemma4_assistant.configuration_gemma4_assistant import (
+            Gemma4AssistantConfig,
+        )
+
+        from nemo_automodel.components.models.gemma4_drafter.model import (
+            Gemma4DrafterForCausalLM,
+        )
+
+        text_cfg = _make_tiny_drafter_text_config()
+        cfg = Gemma4AssistantConfig(text_config=text_cfg, backbone_hidden_size=text_cfg.hidden_size)
+        model = Gemma4DrafterForCausalLM(cfg)
+        model.lm_head.weight = torch.nn.Parameter(model.lm_head.weight.detach().clone())
+        assert model.lm_head.weight is not model.model.embed_tokens.weight
+
+        model.tie_weights()
+
+        assert model.lm_head.weight is model.model.embed_tokens.weight
+
     def test_use_ordered_embeddings_creates_masked_embedder(self):
         from transformers.models.gemma4_assistant.configuration_gemma4_assistant import (
             Gemma4AssistantConfig,

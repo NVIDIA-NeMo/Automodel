@@ -32,7 +32,7 @@ from safetensors import safe_open
 from torch.distributed.tensor import DTensor
 
 from nemo_automodel.components.distributed.config import FSDP2Config
-from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
+from nemo_automodel.components.distributed.context_parallel.utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.mesh import ParallelismSizes
 from nemo_automodel.components.distributed.mesh_utils import _create_device_meshes
 from nemo_automodel.components.models.common import BackendConfig

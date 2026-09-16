@@ -57,7 +57,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import json
 import logging
 import sys
 from dataclasses import dataclass
@@ -68,6 +67,7 @@ from nemo_automodel.components.speculative.bench_common import (
     _load_prompts,
     _normalize_server_url,
     _output_throughput,
+    _report_summary,
     _run_workload,
     _speedup,
     _validate_workload_args,
@@ -197,8 +197,15 @@ def _summarize(
     return summary
 
 
-async def _run(args: argparse.Namespace) -> int:
-    """Async driver: load prompts, run the workload(s), report metrics. Returns an exit code."""
+async def _run_summary(args: argparse.Namespace) -> dict[str, Any] | None:
+    """Validate args, run the workload(s), and return the metrics dict.
+
+    Returns ``None`` when no usable prompts were loaded (the caller's cue to
+    report a failure without raising -- a bad ``--num-prompts``/etc. value is a
+    real programming error and still raises via ``_validate_workload_args``).
+    Split out of ``_run`` so ``bench_sweep`` can drive one dataset at a time
+    without the printing / ``--output-json`` side effects below.
+    """
     _validate_workload_args(args)
     gen_cfg = GenerationConfig(
         model=args.model,
@@ -209,7 +216,7 @@ async def _run(args: argparse.Namespace) -> int:
     prompts = _load_prompts(args)
     if not prompts:
         logger.error("No usable prompts loaded from %s; nothing to benchmark.", args.input_data)
-        return 1
+        return None
     logger.info("Benchmarking %d prompts against %s", len(prompts), args.server)
 
     metrics_before = await _fetch_spec_metrics(args.server, timeout_s=args.timeout_s)
@@ -252,14 +259,13 @@ async def _run(args: argparse.Namespace) -> int:
             "enabled on %s? Throughput is still reported.",
             args.server,
         )
+    return summary
 
-    rendered = json.dumps(summary, indent=2)
-    print(rendered)
-    if args.output_json:
-        with open(args.output_json, "w") as f:
-            f.write(rendered + "\n")
-        logger.info("Wrote metrics to %s", args.output_json)
-    return 0
+
+async def _run(args: argparse.Namespace) -> int:
+    """Async driver: compute the benchmark summary and report it. Returns an exit code."""
+    summary = await _run_summary(args)
+    return _report_summary(summary, args.output_json)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -295,6 +301,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--temperature", type=float, default=0.0, help="Default 0.0 = greedy.")
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--messages-column", default="messages", help="Column holding the OpenAI messages list.")
+    parser.add_argument(
+        "--prompt-column",
+        default=None,
+        help="Column holding a raw prompt string (or list of turns, first used) instead of --messages-column, "
+        "for datasets that are not already chat-messages-shaped.",
+    )
     parser.add_argument("--split", default="train", help="HF dataset split (supports slice syntax).")
     parser.add_argument("--dataset-name", default=None, help="HF dataset configuration name, if any.")
     parser.add_argument("--shuffle-seed", type=int, default=None, help="Optional shuffle seed before slicing.")

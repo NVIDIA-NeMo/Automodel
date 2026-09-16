@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import importlib
+import multiprocessing
 import os
 import sys
 import types
@@ -19,6 +20,7 @@ from pathlib import Path
 from shutil import rmtree
 
 import pytest
+import torch
 
 os.environ.setdefault("HF_CACHE", "/home/TestData/lite/hf_cache")
 os.environ.setdefault("HF_HOME", "/home/TestData/HF_HOME")
@@ -45,6 +47,23 @@ if "transformers.initialization" not in sys.modules:
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    """Give unmarked unit tests a 5s fallback timeout.
+
+    pytest-timeout resolves a test's timeout as marker, then ``--timeout``, then
+    ``PYTEST_TIMEOUT``, then the ``timeout`` ini option. The fallback is installed
+    as a marker, so it would outrank all three global settings; it is therefore
+    skipped entirely when any of them was set explicitly. Genuine per-test or
+    per-module ``timeout`` markers are always preserved.
+    """
+    if config.getoption("timeout") is not None or "PYTEST_TIMEOUT" in os.environ or config.getini("timeout"):
+        return
+    unit_tests_root = Path(__file__).parent
+    for item in items:
+        if unit_tests_root in item.path.parents and item.get_closest_marker("timeout") is None:
+            item.add_marker(pytest.mark.timeout(5))
 
 
 def pytest_addoption(parser):
@@ -119,6 +138,101 @@ def reset_env_vars():
     os.environ.update(original_env)
 
 
+@pytest.fixture(autouse=True)
+def enforce_torch_memory_limit(request):
+    """Enforce opt-in per-test PyTorch allocator budgets."""
+    marker = request.node.get_closest_marker("torch_memory_limit")
+    if marker is None:
+        yield
+        return
+
+    cpu_limit_mb = marker.kwargs.get("cpu_mb")
+    cuda_limit_mb = marker.kwargs.get("cuda_mb")
+    if cpu_limit_mb is None and cuda_limit_mb is None:
+        pytest.fail("torch_memory_limit requires cpu_mb and/or cuda_mb")
+
+    cuda_device = None
+    cuda_allocated_before = 0
+    if cuda_limit_mb is not None and torch.cuda.is_available():
+        cuda_device = torch.cuda.current_device()
+        torch.cuda.reset_peak_memory_stats(cuda_device)
+        cuda_allocated_before = torch.cuda.memory_allocated(cuda_device)
+
+    if cpu_limit_mb is None:
+        yield
+        profiler = None
+    else:
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU],
+            profile_memory=True,
+            acc_events=True,
+        ) as profiler:
+            yield
+
+    bytes_per_mb = 1024**2
+    if profiler is not None:
+        cpu_allocated_bytes = sum(max(0, event.self_cpu_memory_usage) for event in profiler.key_averages())
+        assert cpu_allocated_bytes <= cpu_limit_mb * bytes_per_mb, (
+            f"test allocated {cpu_allocated_bytes / bytes_per_mb:.1f} MiB through the PyTorch CPU allocator; "
+            f"limit is {cpu_limit_mb} MiB"
+        )
+
+    if cuda_device is not None:
+        cuda_peak_delta_bytes = torch.cuda.max_memory_allocated(cuda_device) - cuda_allocated_before
+        assert cuda_peak_delta_bytes <= cuda_limit_mb * bytes_per_mb, (
+            f"test allocated {cuda_peak_delta_bytes / bytes_per_mb:.1f} MiB through the PyTorch CUDA allocator; "
+            f"limit is {cuda_limit_mb} MiB"
+        )
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _fail_on_leaked_process_group():
+    """Fail the session when a test leaves a torch.distributed process group running.
+
+    A leaked group is invisible in the test that created it and silently corrupts
+    later ones: helpers such as ``get_world_size_safe`` stop reading ``WORLD_SIZE``
+    from the environment and report the live group's size instead, and tests that
+    skip when a group already exists stop running at all. Whether it bites depends
+    on collection order, so it can pass in CI and fail locally.
+
+    Tests that need a real group must tear it down, for example by initializing it
+    inside a fixture that destroys it in a ``finally`` block.
+    """
+    yield
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.destroy_process_group()
+        pytest.fail(
+            "a test left a torch.distributed process group initialized; "
+            "re-run with -p no:randomly and bisect by file to find the fixture that "
+            "calls init_process_group without a matching destroy_process_group",
+            pytrace=False,
+        )
+
+
+@pytest.fixture(autouse=True)
+def _kill_leaked_child_processes():
+    """Kill worker processes a test left behind, so a hung worker cannot stall the session.
+
+    pytest-timeout's signal method only interrupts the pytest process. ``mp.spawn(join=True)``
+    starts non-daemonic workers, and when the timeout fires inside its ``join`` those workers
+    keep running. Python then waits for them at interpreter exit, so a single hung worker holds
+    the CI job until the workflow timeout, the failure mode the per-test budget exists to bound.
+    """
+    yield
+    leaked = multiprocessing.active_children()
+    if not leaked:
+        return
+    for process in leaked:
+        process.kill()
+    for process in leaked:
+        process.join(timeout=5)
+    pytest.fail(
+        f"test left {len(leaked)} child process(es) running (pids {[process.pid for process in leaked]}); "
+        "they were killed. Join or terminate spawned workers before the test returns",
+        pytrace=False,
+    )
+
+
 def pytest_configure(config):
     """Initial configuration of conftest.
     The function checks if test_data.tar.gz is present in tests/.data.
@@ -132,4 +246,8 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers",
         "with_downloads: runs the test using data present in tests/.data",
+    )
+    config.addinivalue_line(
+        "markers",
+        "torch_memory_limit(cpu_mb=None, cuda_mb=None): limits per-test PyTorch allocator usage",
     )

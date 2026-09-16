@@ -77,5 +77,18 @@ def test_trainer_module_forward_returns_finite_metrics():
             target_last_hidden_states=torch.randn(b, s, HIDDEN, generator=gen),
         )
     assert isinstance(out, DSparkStepMetrics)
-    for term in (out.loss, out.ce_loss, out.l1_loss, out.confidence_loss):
+    for term in (
+        out.loss,
+        out.ce_loss,
+        out.l1_loss,
+        out.confidence_loss,
+        out.accept_rate_per_pos_num,
+        out.accept_rate_per_pos_den,
+        out.tau_num,
+        out.tau_den,
+        out.confidence_abs_error_num,
+        out.confidence_bias_num,
+        out.confidence_cumprod_bias_num,
+        out.confidence_diag_den,
+    ):
         assert torch.isfinite(term).all()

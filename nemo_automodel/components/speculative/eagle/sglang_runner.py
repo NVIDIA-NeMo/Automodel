@@ -46,7 +46,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Optional, Sequence
+from typing import Sequence
 
 import torch
 
@@ -59,7 +59,7 @@ _SGLANG_DTYPE_STRINGS = {
 }
 
 
-def sglang_dtype_str(dtype: Optional[torch.dtype]) -> str:
+def sglang_dtype_str(dtype: torch.dtype | None) -> str:
     """Map a torch dtype to the string form SGLang's ``ServerArgs.dtype`` expects.
 
     SGLang compares ``ServerArgs.dtype`` against string literals (``"auto"``,
@@ -95,8 +95,8 @@ def _wrap_logits_processors_for_eagle3(model) -> None:  # pragma: no cover - req
             hidden_states,
             lm_head,
             logits_metadata,
-            aux_hidden_states: Optional[list] = None,
-            hidden_states_before_norm: Optional[torch.Tensor] = None,
+            aux_hidden_states: list | None = None,
+            hidden_states_before_norm: torch.Tensor | None = None,
         ):
             lp = self.logits_processor
             # Force the extend forward down the decode branch so the patched
@@ -187,7 +187,7 @@ class SGLangTargetRunner:
         cls,
         model_path: str,
         *,
-        dtype: Optional[torch.dtype] = None,
+        dtype: torch.dtype | None = None,
         tp_size: int = 1,
         trust_remote_code: bool = False,
         **sglang_kwargs,

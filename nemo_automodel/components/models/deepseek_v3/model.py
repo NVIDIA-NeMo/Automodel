@@ -12,15 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
-from typing import Any, Optional, Union
+from dataclasses import dataclass, replace
+from typing import Any, Union
 
 import torch
 import torch.nn as nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 
-from nemo_automodel.components.checkpoint.utils import reject_unsupported_tied_word_embeddings
 from nemo_automodel.components.models.common import (
     BackendConfig,
     get_rope_config,
@@ -28,6 +27,10 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
 from nemo_automodel.components.models.common.utils import compute_lm_head_logits, yield_fp32_model
 from nemo_automodel.components.models.deepseek_v3.layers import MLA
 from nemo_automodel.components.models.deepseek_v3.rope_utils import freqs_cis_from_position_ids, precompute_freqs_cis
@@ -48,7 +51,7 @@ class Block(nn.Module):
         backend: BackendConfig,
     ):
         super().__init__()
-        self.self_attn = MLA(config, backend)
+        self.self_attn = MLA(config, backend, latent_norm_eps=1e-6)
         self.is_moe_layer = layer_idx >= config.first_k_dense_replace
 
         # Thread dtype from config.torch_dtype so the block's own params stay
@@ -156,6 +159,11 @@ class DeepseekV3Model(nn.Module):
             route_scale=config.routed_scaling_factor,
             aux_loss_coeff=0,
             norm_topk_prob=config.norm_topk_prob,
+            # HF gathers topk_weights from the fp32 scores and returns them with
+            # no cast back, so expert compute sees fp32. Without this, Gate.forward
+            # applies weights.type_as(x) and hands over bf16. Set in moe_defaults,
+            # above the moe_overrides update, so a caller override still wins.
+            router_weights_fp32=True,
             dtype=model_dtype,
         )
         if moe_overrides:
@@ -258,6 +266,7 @@ class DeepseekV3Model(nn.Module):
 
 
 class DeepseekV3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
+    tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
     _keep_in_fp32_modules_strict = ["e_score_correction_bias"]
 
     @dataclass(frozen=True)
@@ -300,13 +309,16 @@ class DeepseekV3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     ):
         super().__init__()
         self.config = config
-        reject_unsupported_tied_word_embeddings(config, type(self).__name__)
-        self.backend = backend or BackendConfig()
-        # The HF DeepSeek-V3 reference computes router scoring in fp32; routing is highly
-        # precision-sensitive (small bf16 errors flip expert selection) and the gate is tiny,
-        # so default to fp32 gate compute unless the user explicitly overrides it.
-        if self.backend.gate_precision is None:
-            self.backend.gate_precision = torch.float32
+        reject_unsupported_tie_word_embeddings(type(self), config)
+        # HF's DeepseekV3TopkRouter runs the router projection in fp32, so default
+        # gate_precision to fp32. Scoring is already fp32 via Gate's score_dtype
+        # default - this covers the projection only.
+        # replace() rather than in-place: the caller's BackendConfig may be shared
+        # with other models, which must not inherit a model-owned default.
+        resolved_backend = backend or BackendConfig()
+        if resolved_backend.gate_precision is None:
+            resolved_backend = replace(resolved_backend, gate_precision=torch.float32)
+        self.backend = resolved_backend
         moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = DeepseekV3Model(
             config,
@@ -343,7 +355,7 @@ class DeepseekV3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
-        output_hidden_states: Optional[bool] = None,
+        output_hidden_states: bool | None = None,
         **attn_kwargs: Any,
     ) -> CausalLMOutputWithPast:
         """Forward pass returning :class:`~transformers.modeling_outputs.CausalLMOutputWithPast`.
