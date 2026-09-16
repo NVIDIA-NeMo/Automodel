@@ -382,6 +382,45 @@ def test_170m_lmm_recipe_matches_paper_scale():
     assert sum(parameter.numel() for parameter in instantiated.parameters()) == 173_695_680
 
 
+@pytest.mark.parametrize(
+    ("scale", "hidden_size", "max_steps", "peak_lr", "expected_parameters"),
+    [
+        ("340m", 1024, 28_610, 1.5e-3, 360_303_104),
+        ("760m", 1536, 57_220, 1.25e-3, 760_655_360),
+    ],
+)
+def test_larger_lmm_recipes_match_paper_parameter_classes(
+    scale,
+    hidden_size,
+    max_steps,
+    peak_lr,
+    expected_parameters,
+):
+    root = Path(__file__).parents[4]
+    recipe = yaml.safe_load(
+        (root / f"examples/llm_pretrain/titans_{scale}_lmm.yaml").read_text()
+    )
+    model = recipe["model"]["config"]
+
+    assert recipe["step_scheduler"]["global_batch_size"] * recipe["dataset"]["seq_len"] == 524_288
+    assert recipe["step_scheduler"]["max_steps"] == max_steps
+    assert recipe["optimizer"]["lr"] == peak_lr
+    assert model["hidden_size"] == hidden_size
+    assert model["num_hidden_layers"] == 16
+    assert model["num_attention_heads"] == 16
+    assert model["deep_memory_backend"] == "titans_pytorch"
+    assert model["num_persistent_memory_tokens"] == 128
+
+    config_values = {
+        key: value
+        for key, value in model.items()
+        if key not in {"_target_", "architectures"}
+    }
+    with torch.device("meta"):
+        instantiated = TitansForCausalLM(TitansConfig(**config_values))
+    assert sum(parameter.numel() for parameter in instantiated.parameters()) == expected_parameters
+
+
 def test_multinode_ablation_runner_preserves_paper_batch_and_uses_c10d():
     root = Path(__file__).parents[4]
     runner = (root / "examples/llm_pretrain/slurm/cwdfw_titans_170m_ablation.sbatch").read_text()
@@ -398,6 +437,29 @@ def test_multinode_ablation_runner_preserves_paper_batch_and_uses_c10d():
     assert "checkouts/$LOCAL_SHA" in submitter
     for variant in ("no_persistent", "no_convolution", "no_momentum", "no_weight_decay", "depth3", "depth4"):
         assert f"{variant})" in runner
+
+
+def test_blackwell_submitter_resolves_portable_topology():
+    root = Path(__file__).parents[4]
+    runner = (
+        root / "examples/llm_pretrain/slurm/titans_blackwell_lmm_pilot.sbatch"
+    ).read_text()
+    submitter = (root / "tools/submit_titans_blackwell.sh").read_text()
+
+    assert "--total-gpus \"$TOTAL_GPUS\"" in submitter
+    assert "--gpu-family blackwell" in submitter
+    assert "job recommend-target" in submitter
+    assert "--nodes \"$NODES\"" in submitter
+    assert "--gpus \"$GPUS_PER_NODE\"" in submitter
+    assert "aws-pdx-slurm-1" in submitter
+    assert "nsc-svg-slurm-1" in submitter
+    assert "aws-cmh-slurm-1" in submitter
+    assert "oci-hsg-cs-001" in submitter
+    assert "--nproc-per-node='$TITANS_GPUS_PER_NODE'" in runner
+    assert "--nnodes=\\$SLURM_NNODES" in runner
+    assert "--rdzv-backend=c10d" in runner
+    for scale in ("170m", "340m", "760m"):
+        assert scale in runner
 
 
 # --------------------------------------------------------------------------- #

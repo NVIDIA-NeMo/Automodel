@@ -28,12 +28,20 @@ the authoritative target for the added 1.3B/100B-token and RULER results.
 - Optimizer: AdamW, weight decay 0.1, cosine learning-rate schedule.
 - Effective global batch: approximately 0.5M tokens.
 
-The proceedings architecture table gives these scale points:
+The proceedings architecture table gives these reported scale points:
 
 - 170M: 12 blocks, hidden size 768, 16 heads, peak LR 3e-3, 15B tokens.
 - 340M: 24 blocks, hidden size 1024, 16 heads, peak LR 1.5e-3, 15B tokens.
 - 760M: 24 blocks, hidden size 1536, 16 heads, peak LR 1.25e-3, 30B tokens.
 - 1.3B: 18 blocks, hidden size 2048, 8 heads, peak LR 7e-4, 100B tokens.
+
+There is an internal inconsistency in those reported dimensions. With the
+LMM block implemented here, the 24-block 1024- and 1536-dimensional shapes
+contain 507,620,608 and 1,091,731,968 parameters. Sixteen blocks contain
+360,303,104 and 760,655,360 parameters respectively, matching Figure 7's
+"360M" label and the reported 760M parameter class. The larger LMM recipes
+therefore use 16 blocks and record this as an operational choice; runs using
+them must not claim fidelity to the appendix's 24-block row.
 
 ## Reproduction order
 
@@ -52,6 +60,8 @@ No official implementation was released. The paper does not fully specify:
 - the 400M model dimensions reported in the language-model table;
 - whether the architecture-table peak learning rates supersede the prose
   statement that training uses a learning rate of 4e-4;
+- whether the 24-block entries for the 340M/760M rows are erroneous, since
+  parameter-count-matched LMMs use 16 blocks in this implementation;
 - all tensor shapes and parameterizations of the channel-wise forget gate;
 - exact chunk-boundary retrieval alignment and streaming-state semantics;
 - all implementation details needed to reconstruct MAC, MAG, and MAL.
@@ -192,3 +202,29 @@ Override `AUTOMODEL_CHECKOUT`, `TITANS_WORK_ROOT`, or `TITANS_IMAGE` with
 exported environment variables when the checkout, storage root, or approved
 container differs. Success requires a finite train and validation loss plus
 the logged peak memory and tokens/s from all eight workers.
+
+### Blackwell scale and ablation pilots
+
+Blackwell pilots use one portable total-GPU request instead of assuming eight
+GPUs per node:
+
+```bash
+tools/submit_titans_blackwell.sh 170m baseline --pilot --total-gpus 8
+tools/submit_titans_blackwell.sh 170m no_convolution --pilot --total-gpus 8
+tools/submit_titans_blackwell.sh 340m baseline --pilot --total-gpus 8
+tools/submit_titans_blackwell.sh 760m baseline --pilot --total-gpus 16
+```
+
+The submitter asks `slurm-cli` to rank configured Blackwell clusters and their
+authorized accounts. Eight total GPUs resolve to one node on
+`nsc-svg-slurm-1` (B200) or `aws-pdx-slurm-1` (B300), and two nodes on the
+four-GPU NVL72 partitions at `aws-cmh-slurm-1` and `oci-hsg-cs-001`. The
+resolved topology is then fixed for the submitted job. Each pilot uses an
+immutable AutoModel commit, prepares a reusable 64M-token shard if needed,
+runs ten optimizer steps, writes a checkpoint, and logs to
+`titans-paper-blackwell-pilots`.
+
+Only pilots are enabled initially. Full 15B/30B chains remain blocked until
+the target topology passes the 4096-token forward/backward, validation, and
+checkpoint gates. This avoids treating container availability, ARM64 support,
+or cluster-local storage as assumptions.
