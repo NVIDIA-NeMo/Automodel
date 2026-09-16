@@ -117,6 +117,45 @@ class TestIndicesToMultihot:
         assert routing_map[0, 0] and routing_map[0, 7]
 
 
+def test_hybridep_manager_forwards_permute_fusion_to_dispatch_and_combine():
+    with patch(
+        "nemo_automodel.components.moe.megatron.token_dispatcher.hybrid_ep_dispatch",
+        new=Mock(),
+    ):
+        manager = _HybridEPManager(
+            group=None,
+            num_local_experts=2,
+            num_experts=8,
+            router_topk=2,
+            permute_fusion=True,
+        )
+    manager.routing_map = torch.zeros(2, 8, dtype=torch.bool)
+    manager.token_probs = torch.zeros(2, 8, dtype=torch.float32)
+    hidden_states = torch.randn(2, 4)
+    dispatched_hidden = torch.randn(3, 4)
+    dispatched_probs = torch.randn(3)
+    tokens_per_expert = torch.tensor([1, 2])
+    handle = (object(),)
+
+    with (
+        patch(
+            "nemo_automodel.components.moe.megatron.token_dispatcher.hybrid_ep_dispatch",
+            return_value=(dispatched_hidden, dispatched_probs, None, tokens_per_expert, handle),
+        ) as dispatch,
+        patch(
+            "nemo_automodel.components.moe.megatron.token_dispatcher.hybrid_ep_combine",
+            return_value=hidden_states,
+        ) as combine,
+    ):
+        actual_dispatched = manager.dispatch(hidden_states)
+        actual_combined = manager.combine(dispatched_hidden)
+
+    torch.testing.assert_close(actual_dispatched, dispatched_hidden)
+    torch.testing.assert_close(actual_combined, hidden_states)
+    assert dispatch.call_args.kwargs["permute_fusion"] is True
+    assert combine.call_args.kwargs["permute_fusion"] is True
+
+
 @pytest.mark.parametrize("enabled", [False, True])
 def test_token_unpermutation_applies_async_setting_to_deepep_combine(enabled):
     dispatcher = object.__new__(MoEFlexTokenDispatcher)
