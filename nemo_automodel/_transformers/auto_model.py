@@ -29,7 +29,7 @@ import inspect
 import logging
 import os
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, List, Optional, Union
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 from torch.nn.attention import SDPBackend
@@ -47,6 +47,7 @@ from transformers import (  # noqa: E402
     AutoModelForSequenceClassification,
     AutoModelForTextToWaveform,
     AutoModelForTokenClassification,
+    PretrainedConfig,
     PreTrainedModel,
 )
 from transformers.initialization import no_init_weights  # noqa: E402
@@ -67,7 +68,9 @@ from nemo_automodel.shared.utils import dtype_from_str  # noqa: E402
 
 if TYPE_CHECKING:
     from torch.distributed.device_mesh import DeviceMesh
+    from transformers import BitsAndBytesConfig
 
+    from nemo_automodel.components._peft.lora import PeftConfig
     from nemo_automodel.components.quantization.fp8 import FP8Config
     from nemo_automodel.components.utils.compile_utils import CompileConfig
 
@@ -643,22 +646,22 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
     @classmethod
     def from_pretrained(
         cls,
-        pretrained_model_name_or_path,
-        *model_args,
+        pretrained_model_name_or_path: str | os.PathLike,
+        *model_args: object,
         use_liger_kernel: bool = True,
         use_sdpa_patching: bool = True,
-        sdpa_method: List[Union[SDPBackend, str]] | None = None,
-        torch_dtype="auto",
+        sdpa_method: list[SDPBackend | str] | None = None,
+        torch_dtype: str | torch.dtype = "auto",
         attn_implementation: str = DEFAULT_ATTN_IMPLEMENTATION,
-        quantization_config=None,
+        quantization_config: "BitsAndBytesConfig | None" = None,
         force_hf: bool = False,
         distributed_setup: DistributedSetup | None = None,
-        device_mesh: Optional["DeviceMesh"] = None,
+        device_mesh: "DeviceMesh | None" = None,
         qat_config: QATConfig | None = None,
-        peft_config: dict | None = None,
-        fp8_config: Optional["FP8Config"] = None,
-        compile_config: Optional["CompileConfig"] = None,
-        **kwargs,
+        peft_config: "PeftConfig | None" = None,
+        fp8_config: "FP8Config | None" = None,
+        compile_config: "CompileConfig | None" = None,
+        **kwargs: object,
     ) -> PreTrainedModel:
         """
         Instantiate and (optionally) patch a causal-language model.
@@ -703,9 +706,11 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 internally. Use ``distributed_setup`` when passing NeMo-specific
                 policies such as strategy, pipeline, MoE, or activation checkpointing.
                 Default: None.
-            qat_config (QATConfig | None, optional): Quantization-Aware Training
-                configuration. Default: None.
-            peft_config (dict | None, optional): PEFT/LoRA configuration dictionary.
+            qat_config (QATConfig | None, optional): TorchAO QAT or
+                merged-weight LoRA QAT configuration. LoRA QAT requires PEFT and
+                currently supports only single-process execution without TP/CP/PP/EP,
+                Megatron FSDP, DDP, FP8 training, or BitsAndBytes. Default: None.
+            peft_config (PeftConfig | None, optional): PEFT/LoRA configuration.
                 If provided, LoRA adapters will be applied to the model. Default: None.
             fp8_config (FP8Config | None, optional): FP8 quantization configuration.
                 If provided, FP8 quantization will be applied. Default: None.
@@ -791,22 +796,22 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
     @classmethod
     def from_config(
         cls,
-        config,
-        *model_args,
+        config: PretrainedConfig | str,
+        *model_args: object,
         use_liger_kernel: bool = True,
         use_sdpa_patching: bool = True,
-        sdpa_method: List[Union[SDPBackend, str]] | None = None,
-        torch_dtype: Union[str, torch.dtype] = "auto",
+        sdpa_method: list[SDPBackend | str] | None = None,
+        torch_dtype: str | torch.dtype = "auto",
         attn_implementation: str = DEFAULT_ATTN_IMPLEMENTATION,
-        quantization_config=None,
+        quantization_config: "BitsAndBytesConfig | None" = None,
         force_hf: bool = False,
         distributed_setup: DistributedSetup | None = None,
-        device_mesh: Optional["DeviceMesh"] = None,
+        device_mesh: "DeviceMesh | None" = None,
         qat_config: QATConfig | None = None,
-        peft_config: dict | None = None,
-        fp8_config: Optional["FP8Config"] = None,
-        compile_config: Optional["CompileConfig"] = None,
-        **kwargs,
+        peft_config: "PeftConfig | None" = None,
+        fp8_config: "FP8Config | None" = None,
+        compile_config: "CompileConfig | None" = None,
+        **kwargs: object,
     ) -> PreTrainedModel:
         """
         Instantiate a model from a ``transformers.PretrainedConfig`` (no pretrained
@@ -837,17 +842,17 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         moe_parallel_config = setup.moe_parallel_config
         activation_checkpointing = setup.activation_checkpointing
 
-        # Only instantiate infrastructure when distributed_config is provided
+        # QAT must also be constructed for topology-only/single-process setups.
         model_wrapper = autopipeline = parallelize_fn = qat_quantizer = None
         loss_fn = None
-        if distributed_config is not None:
+        if distributed_config is not None or qat_config is not None:
             model_wrapper, autopipeline, parallelize_fn, qat_quantizer = instantiate_infrastructure(
                 distributed_config=distributed_config,
                 pipeline_config=pipeline_config,
                 qat_config=qat_config,
                 moe_parallel_config=moe_parallel_config,
                 activation_checkpointing=activation_checkpointing,
-                device=torch.device("cuda", torch.cuda.current_device()),
+                device=torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else None,
                 mesh=mesh,
             )
             if pipeline_config is not None:

@@ -279,6 +279,8 @@ def _fusible(module) -> bool:
         return False
     if not getattr(module, "use_memory_efficient_lora", False):
         return False
+    if getattr(module, "weight_fake_quantizer", None) is not None:
+        return False
     if getattr(module, "use_dora", False):
         return False
     if getattr(module, "dropout_p", 0.0) and module.training:

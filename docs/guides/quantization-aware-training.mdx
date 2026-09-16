@@ -1,115 +1,89 @@
 ---
 title: "Quantization-Aware Training (QAT) in NeMo Automodel"
-description: ""
+description: "Configure legacy full-parameter INT4 or targeted LoRA FP8/MXFP4 QAT, with training and reference-export limits."
 position: 18
 ---
-NeMo Automodel supports Quantization-Aware Training (QAT) for Supervised Fine-Tuning (SFT) using [TorchAO](https://github.com/pytorch/ao). QAT simulates quantization effects during training so model weights can adapt to the selected lower-precision scheme. Whether QAT improves task quality over post-training quantization (PTQ), and whether the converted model improves deployment efficiency, depends on the model, task, hardware, and inference backend; measure both approaches on the target workload.
 
-## What is Quantization-Aware Training?
+QAT simulates quantization during training so trainable weights can adapt to
+quantization error. NeMo Automodel provides two distinct modes through
+`nemo_automodel.components.quantization.qat.QATConfig`:
 
-Quantization-Aware Training introduces fake-quantization operations in the forward pass while keeping model weights trainable. This gives the model an opportunity to adapt to quantization error before the weights are converted to an actual quantized representation.
+| Mode | Trainable weights | Quantization |
+| --- | --- | --- |
+| Legacy TorchAO | Full-parameter BF16 SFT, without PEFT | INT4 weights; optional dynamic INT8 activations |
+| Targeted merged-weight QAT | LoRA adapters on frozen floating-point bases | FP8 or MXFP4 weights selected independently of PEFT |
 
-### Benefits of QAT
+Neither mode guarantees better task quality than post-training quantization
+(PTQ), lower training memory, or faster inference. Measure the intended workload
+and deployment backend rather than inferring improvements from the bit width.
 
-- **Adaptation during training**: Model weights are optimized while fake quantization is active
-- **A PTQ alternative**: QAT can be evaluated when PTQ does not meet the workload's quality target
-- **Deployment experimentation**: Converted models can be benchmarked with quantized kernels on the intended hardware and backend
-- **Explicit trade-off measurement**: Validation quality, latency, throughput, and memory can be compared against BF16 and PTQ baselines
+## Legacy full-parameter TorchAO QAT
 
-### QAT vs. Post-Training Quantization
+Use the installed repository environment, including TorchAO, and BF16 model
+parameters. Add this section to a complete SFT recipe **without `peft`**:
 
-| Aspect | QAT | Post-Training Quantization |
-|--------|-----|---------------------------|
-| **Accuracy** | Model weights can adapt to fake quantization; measure the result | No adaptation step; measure the result |
-| **Training time** | Longer - requires retraining | None - applied after training |
-| **Use case** | Consider when PTQ misses a measured quality target | Establish a quantized baseline before adding QAT training |
-| **Trainable state** | Fine-tunes model weights through fake quantizers | Quantizes fixed model weights after training |
+```yaml
+qat:
+  enabled: true
+  fake_quant_after_n_steps: 0
+  qat_config:
+    _target_: nemo_automodel.components.quantization.qat.QATConfig
+    quantizer_type: int8_dynact_int4weight
+    groupsize: 256
+```
 
-## Requirements
+`int8_dynact_int4weight` fake-quantizes eligible weights to INT4 and activations
+to dynamic INT8. Choose `int4_weight_only` instead to keep activations in BF16.
+TorchAO prepares eligible `nn.Linear` layers, not necessarily every projection.
+Input dimensions must satisfy the group-size constraints; weight-only INT4 also
+has bias and kernel tile constraints. Inspect the prepared model.
 
-To use QAT in NeMo Automodel, you need:
-
-- **Software**: Use the repository's locked environment, which includes TorchAO
-- **Hardware**: An NVIDIA GPU and software stack supported by the selected TorchAO training and deployment kernels
-- **Training mode**: Full-parameter BF16 SFT; the current recipe rejects QAT with PEFT and rejects models containing non-BF16 parameters
-- **Model dimensions**: The model's target `nn.Linear` layers must satisfy the selected TorchAO quantizer's group and kernel shape constraints
-
-## Install TorchAO
-
-TorchAO is a project dependency. Install the repository's locked environment:
+The existing [Llama 3.2 INT4 recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_2/llama3_2_1b_squad_qat.yaml)
+retains its original settings, including a requested one-step delay. Override
+that delay for new runs: nested TorchAO modules do not reliably honor positive
+`fake_quant_after_n_steps` values in the current recipe.
 
 ```bash
-uv sync --locked
+uv run --no-sync automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad_qat.yaml --nproc-per-node 8 --qat.fake_quant_after_n_steps 0
 ```
 
-## How QAT Works in NeMo Automodel
+This example needs model/data access and eight GPUs. `--no-sync` assumes
+dependencies are already installed. Legacy TorchAO conversion is separate from
+the targeted reference-export API below; validate its converted model using the
+matching [TorchAO quantizer and inference kernels](https://github.com/pytorch/ao/tree/main/torchao/quantization/qat).
 
-NeMo Automodel integrates TorchAO's QAT quantizers into the training pipeline. During training:
+## Targeted LoRA FP8 / MXFP4 QAT
 
-1. **Model preparation**: The quantizer replaces eligible linear layers with TorchAO QAT linear modules
-2. **Forward pass**: Eligible weights, and activations for 8da4w, pass through fake quantization
-3. **Backward pass**: Gradients flow through the fake quantization operations
-4. **Weight updates**: The optimizer updates the model weights; the current prepared modules do not add a separate set of trainable quantization parameters
-
-### Supported Quantization Schemes
-
-NeMo Automodel supports two TorchAO QAT quantizers:
-
-#### Int8 Dynamic Activation + Int4 Weight (8da4w-qat)
-- **Quantizer**: `Int8DynActInt4WeightQATQuantizer`
-- **Activations**: INT8 with dynamic quantization
-- **Weights**: INT4 quantization
-- **Layer constraint**: With the current default `padding_allowed=False`, eligible linear layers must have `in_features` divisible by `groupsize`; incompatible layers remain unmodified
-
-#### Int4 Weight-Only (4w-qat)
-- **Quantizer**: `Int4WeightOnlyQATQuantizer`
-- **Activations**: BF16 in the current integration
-- **Weights**: INT4 quantization
-- **Layer constraint**: TorchAO targets bias-free linear layers; preparation requires compatible input dimensions, and conversion requires `out_features` divisible by 8
-
-The current `QATConfig` sets both model-weight precision and weight-scale precision to BF16. For the documented group sizes, a target layer's `in_features` must be divisible by `groupsize`; the 4w path also requires divisibility by `inner_k_tiles * 16` (128 with the default `inner_k_tiles=8`). Layers left unmodified by a quantizer remain BF16, so inspect the prepared model rather than assuming every linear layer was quantized.
-
-## Configuration
-
-To enable QAT in your training configuration, you need to specify the quantizer in your YAML configuration file.
-
-### Basic Configuration
+PEFT chooses where adapters are installed. QAT chooses which of those adapters
+receive fake quantization, using case-sensitive **full module-name shell globs**.
+The selectors are independent: QAT can cover only a subset of PEFT targets.
+For example, adapt q/v projections but quantize only q projections:
 
 ```yaml
-# Enable QAT with Int8 Dynamic Activation + Int4 Weight quantization
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  target_modules: ['*.q_proj', '*.v_proj']
+  dim: 4
+  alpha: 8
+  dropout: 0.0
+  use_dora: false
+  use_triton: false
+  use_memory_efficient_lora: false
+
 qat:
   enabled: true
+  fake_quant_after_n_steps: 0
   qat_config:
     _target_: nemo_automodel.components.quantization.qat.QATConfig
-    quantizer_type: int8_dynact_int4weight
-    groupsize: 256
+    target_modules: ['*.q_proj']
+    weight:
+      format: fp8
+      block_size: [32, 32]
 ```
 
-### Int4 Weight-Only Configuration
-
-```yaml
-# Enable QAT with Int4 Weight-Only quantization
-qat:
-  enabled: true
-  qat_config:
-    _target_: nemo_automodel.components.quantization.qat.QATConfig
-    quantizer_type: int4_weight_only
-    groupsize: 256
-```
-
-### Configuration Parameters
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `enabled` | bool | Enable or disable QAT |
-| `fake_quant_after_n_steps` | int | Requested fake-quant activation step read by the recipe; use `0` in the current revision |
-| `qat_config._target_` | str | Fully qualified class name of the NeMo AutoModel QAT configuration |
-| `qat_config.quantizer_type` | str | QAT scheme: `int8_dynact_int4weight` or `int4_weight_only` |
-| `qat_config.groupsize` | int | Group size for weight quantization (typically 128 or 256) |
-
-### Fake Quantization Start Step
-
-The recipe accepts `fake_quant_after_n_steps` as the requested activation threshold. In the current revision, however, the enable and disable helpers are called on top-level model parts without traversing their nested TorchAO QAT linear modules. Positive values therefore do not reliably delay fake quantization in those nested layers. Use `0` and do not rely on delayed activation until that traversal is implemented.
+For grouped experts or multiple numerical settings, replace `target_modules`
+and `weight` under `qat_config` with `rules`. This GLM example requires PEFT on
+the same expert modules:
 
 ```yaml
 qat:
@@ -117,267 +91,208 @@ qat:
   fake_quant_after_n_steps: 0
   qat_config:
     _target_: nemo_automodel.components.quantization.qat.QATConfig
-    quantizer_type: int8_dynact_int4weight
-    groupsize: 256
+    rules:
+      - target_modules: ['model.language_model.layers.*.mlp.experts']
+        weight:
+          format: fp8
+          block_size: [128, 128]
+          scale_format: float32
 ```
 
-## Training Workflow
+Nested rule/weight mappings are typed by `ConfigNode.instantiate()`; they do not
+need nested `_target_` entries. Do not mix `rules` with the simple form, or mix
+either targeted form with `quantizer_type` / TorchAO kwargs. Unmatched selectors,
+overlapping rules, non-LoRA targets and tied LoRA base projections are rejected.
+Legacy INT4 with PEFT and targeted full-parameter FP8/MXFP4 are unsupported.
 
-### 1. Prepare Your Configuration
+### Numerical contract
 
-Create a YAML configuration file with QAT enabled:
+The forward pass quantizes and dequantizes the effective weight
+`W + (alpha / rank) * B @ A`; gradients update the adapters while the base stays
+frozen. Untargeted adapters train normally and export as merged floating weights.
+Training storage and activations are not packed FP8/FP4. Use matching base/adapter
+storage dtypes, zero dropout, no DoRA, and no autocast for the targeted examples.
 
-```yaml
-recipe: TrainFinetuneRecipeForNextTokenPrediction
+| Weight format | Supported block sizes | Scale format |
+| --- | --- | --- |
+| FP8 E4M3FN | `[32, 32]` or `[128, 128]` (default) | `e8m0` (default) or explicit `float32` |
+| MXFP4 E2M1 | `[1, 32]` (default) | `e8m0` only |
 
-step_scheduler:
-  global_batch_size: 64
-  local_batch_size: 8
-  max_steps: 10000
-  ckpt_every_steps: 1000
+Blocks apply to `[out, in]` dense or canonical `[experts, out, in]` grouped
+weights, including gate/up and down projections; dimensions must be divisible
+by the block sizes. E8M0 uses power-of-two scales. FP32 scales use
+`max(block_amax, 1e-12) / 448` without power-of-two rounding.
 
-model:
-  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
+**GLM-5.3-Flash uses FP8 block128 with explicit `scale_format: float32`.**
+This matches its decoded scale layout, not a proven bit-exact reproduction of
+the original checkpoint encoder. **DeepSeek-V4 uses MXFP4 group32 with E8M0**,
+which is also the default when `scale_format` is omitted. Older reference
+manifests without this field decode as E8M0.
 
-distributed:
-  strategy: fsdp2
-  dp_size: none
-  tp_size: 1
-  cp_size: 1
+## Examples and supported training
 
-qat:
-  enabled: true
-  fake_quant_after_n_steps: 0
-  qat_config:
-    _target_: nemo_automodel.components.quantization.qat.QATConfig
-    quantizer_type: int8_dynact_int4weight
-    groupsize: 256
+| Example | Scope |
+| --- | --- |
+| [Qwen3-0.6B](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen3_0p6b_lora_qat.yaml) | Two-step SQuAD, q/v LoRA FP8; configured for one GPU |
+| [DeepSeek-V4-Flash](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v4/deepseek_v4_flash_hellaswag_experts_qat.yaml) | Experimental full pretrained backbone, expert MXFP4, EP32 |
+| [GLM-5.3-Flash](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.3_flash_hellaswag_experts_qat.yaml) | Experimental full pretrained `glm5_next`, expert FP8/FP32 scales, EP32; text-only adaptation |
 
-loss_fn:
-  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+V4/GLM are **experimental reference configurations**. Earlier successful
+full-model QAT smoke tests used synthetic overrides; they do **not** establish
+that the published HellaSwag YAMLs ran unchanged. They also do not establish
+convergence, task-quality gains or paired QAT-versus-ordinary-training results.
+Native serving has not been tested. Scalar/unit tests and tiny/cropped-model GPU
+checks are not substitutes for full-model validation of these configurations.
 
-dataset:
-  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
-  dataset_name: rajpurkar/squad
-  split: train
+### Run Qwen on one GPU
 
-dataloader:
-  _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.default_collater
-  shuffle: false
-
-optimizer:
-  _target_: torch.optim.Adam
-  betas: [0.9, 0.999]
-  eps: 1e-8
-  lr: 2.0e-5
-  weight_decay: 0
-
-checkpoint:
-  checkpoint_dir: checkpoints/
-  model_save_format: safetensors
-  save_consolidated: final
-```
-
-### 2. Run Training
-
-Launch training with your QAT-enabled configuration:
+From the repository root in an already installed CUDA environment:
 
 ```bash
-uv run automodel your_qat_config.yaml --nproc-per-node 8
+CUDA_VISIBLE_DEVICES=0 uv run --no-sync automodel examples/llm_finetune/qwen/qwen3_0p6b_lora_qat.yaml --nproc-per-node 1
 ```
 
-### 3. Monitor Training
+Qwen needs access to `Qwen/Qwen3-0.6B` and `rajpurkar/squad`. It uses 64 samples,
+answer-only supervision, left truncation at 512 tokens, BF16 and HF SDPA.
+Keep this recipe at one process; its FSDP2 path skips sharding. `--no-sync` does
+not install missing dependencies. For local weights, update both
+`model.pretrained_model_name_or_path` and
+`dataset.tokenizer.pretrained_model_name_or_path`.
 
-During training, the model will:
-- Apply fake quantization to eligible weights and, for 8da4w, activations
-- Learn to minimize loss while accounting for quantization effects
-- Produce checkpoints that can be converted to actual quantized models
+### Full pretrained expert recipes
 
-### 4. Deploy Quantized Model
+V4 and GLM use `TrainFinetuneRecipeForNextTokenPrediction`, model-owned
+`Config.from_pretrained`, `load_base_model: true` and
+`checkpoint.dequantize_base_checkpoint: true`. Preserve the source architecture
+and vocabulary; do not replace pretrained loading with full random CPU construction.
+MTP is disabled; V4 retains 43 backbone layers, and GLM retains 45 text layers
+and its frozen vision branch.
 
-After training, convert the QAT checkpoint to a fully quantized model for deployment:
+| Model | PEFT / QAT expert target | Notes |
+| --- | --- | --- |
+| V4 | `model.layers.*.mlp.experts` | 256 experts; 8 local experts at EP32 |
+| GLM | `model.language_model.layers.*.mlp.experts` | 288 experts; 9 local experts at EP32; `distributed.moe.wrap_outer_model: true` keeps the frozen vision branch FSDP-owned |
+
+Both recipes use rank-4/alpha-8 LoRA, BF16 base/adapters, zero dropout, QAT from
+step zero and activation checkpointing. Keep DoRA, Triton/memory-efficient LoRA,
+compilation, TE FP8 and autocast off.
+
+They request 64 HellaSwag training examples, local batch 1/global batch 32 and
+two optimizer steps. Padding to a multiple of 64 **does not truncate to 64
+tokens**; HellaSwag has no `seq_length` / `max_length` argument. These are not
+native chat-format or quality benchmarks. Validation and checkpoint output are
+disabled.
+
+### Distributed launch requirements
+
+Targeted training supports one rank or **FSDP2 pure DP sharding** with
+`dp_shard_size = world_size`, `dp_replicate_size = 1`, TP=CP=PP=1 and matching
+device/MoE meshes. Optional EP must equal world size, divide the expert count,
+and use no additional expert-DP sharding/replication. Use `dispatcher: torch`
+and `experts: torch` reference loops, including untargeted experts. HSDP, DDP,
+Megatron FSDP, autopipeline, HybridEP, DeepEP, `torch_mm`, grouped-MM and MXFP8
+expert execution are outside this targeted training gate.
+
+Apply PEFT, then QAT, **before sharding and optimizer construction**. The V4/GLM
+examples use four nodes with eight GPUs each: FSDP2 DP-shard32 plus EP32 is
+32 ranks, not 1,024. `--nproc-per-node 8` alone does not launch four nodes.
+GLM has 288 experts and cannot use EP64. The configured topology does not imply
+arbitrary model sizes or sequence lengths fit in memory.
+
+Follow the [Slurm launcher guide](/job-launchers/slurm-cluster) for site-specific
+allocation and rendezvous. Set the batch script's `CONFIG` to the V4 or GLM YAML
+linked above, allocate **4 nodes × 8 GPUs**, and launch one `torchrun` agent per
+node with eight workers and a shared four-node rendezvous. Do not launch these
+YAMLs unchanged on one eight-GPU node.
+
+All ranks need model/config/tokenizer and HellaSwag access. For local expert
+checkpoints, update these together:
+`model.config.pretrained_model_name_or_path`, `model.config.name_or_path` and
+`dataset.tokenizer.pretrained_model_name_or_path`, using paths visible on every node.
+
+### Download-free configuration check
+
+```bash
+uv run --no-sync pytest tests/unit_tests/_transformers/test_lora_qat_yaml.py -v --timeout=60
+```
+
+This checks typed mappings and recipe settings without downloading weights/data
+or constructing the full expert models. It does not validate GPU training,
+distributed collectives, memory fit or model quality.
+
+## Reference export is local-only
+
+The runtime controller is `nemo_automodel._transformers.qat.QAT(config)`:
+use `prepare(model)`, `export(model, directory)`, and
+`QAT.load_quantized_checkpoint(model, directory)`. `QATConfig.build()` resolves
+the configuration; it does not prepare or export a model.
+
+Export requires a **complete, materialized local model in eval mode**. It does
+not gather FSDP/EP shards and rejects DTensors or rank-local expert shards, even
+after supported distributed training. The examples disable training checkpoint
+output; running the CLI does not automatically produce a packed reference export.
+
+Export merges all adapters and packs selected weights into safetensors plus a
+manifest. Reload decodes them to floating tensors in an identical non-LoRA
+architecture. Retain the architecture and tokenizer: this is not a standalone
+Hugging Face `save_pretrained` directory, a training-resume checkpoint, or native
+vLLM / TensorRT-LLM packed serving.
+
+### Train, export and reload Qwen locally
+
+To retain the trained Qwen model, run this session from the repository root in
+the installed CUDA environment, with exactly one visible GPU and no `torchrun`.
+Export before releasing the model; the CLI training command above exits without
+retaining it for this session.
 
 ```python
-from pathlib import Path
+from copy import deepcopy
 
-import torch
+import torch.distributed as dist
 
-from torchao.quantization import Int8DynamicActivationInt4WeightConfig, quantize_
-from transformers import AutoModelForCausalLM
+from nemo_automodel import NeMoAutoModelForCausalLM
+from nemo_automodel._transformers.qat import QAT
+from nemo_automodel.components.config.loader import load_yaml_config
+from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
 
-# Resolve the final checkpoint selected by the recipe. On filesystems without
-# symlink support, AutoModel writes the relative target to LATEST.txt instead.
-checkpoint_root = Path("checkpoints")
-latest_link = checkpoint_root / "LATEST"
-if latest_link.is_symlink():
-    checkpoint_dir = latest_link.resolve(strict=True)
-else:
-    latest_pointer = checkpoint_root / "LATEST.txt"
-    checkpoint_dir = (checkpoint_root / latest_pointer.read_text().strip()).resolve(strict=True)
-
-checkpoint_path = checkpoint_dir / "model" / "consolidated"
-if not checkpoint_path.is_dir():
-    raise FileNotFoundError(f"Consolidated checkpoint not found: {checkpoint_path}")
-
-model = AutoModelForCausalLM.from_pretrained(checkpoint_path, dtype=torch.bfloat16)
-model.eval()
-
-# Apply actual quantization (not fake quantization)
-quantize_(model, Int8DynamicActivationInt4WeightConfig(group_size=256))
+cfg = load_yaml_config("examples/llm_finetune/qwen/qwen3_0p6b_lora_qat.yaml")
+controller = QAT(cfg.qat.qat_config.instantiate())
+trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
+try:
+  trainer.setup()  # Applies PEFT and QAT before sharding and the optimizer.
+  trainer.run_train_validation_loop()
+  model = trainer.model_parts[0]  # Complete, unsharded model on this one rank.
+  model.eval()
+  controller.export(model, "checkpoints/qwen3_lora_qat_reference")
+  fresh = NeMoAutoModelForCausalLM.from_config(
+    deepcopy(model.config), dtype="bfloat16", force_hf=True, attn_implementation="sdpa"
+  )
+  QAT.load_quantized_checkpoint(fresh, "checkpoints/qwen3_lora_qat_reference")
+  fresh.eval()
+finally:
+  if dist.is_initialized():
+    dist.destroy_process_group()
 ```
 
-## Performance Considerations
+Use no autocast and enough GPU memory for both models. The controller uses the
+same typed config as training. Do not apply this local export session to the
+distributed expert recipes.
 
-### Training Performance
+## What to compare
 
-- **Training time**: Fake-quantization operations add work to each forward pass; benchmark step time against the BF16 baseline
-- **Memory usage**: QAT modules change the training graph and state; measure peak allocated and reserved memory for the selected model and topology
-- **Convergence**: Tune training duration and learning rate from validation results rather than assuming BF16 hyperparameters transfer unchanged
-
-### Inference Performance
-
-After converting to actual quantization, benchmark the exact inference stack you plan to deploy. The encoded weights use lower precision, but scales, metadata, unmodified layers, kernel availability, and runtime packing all affect the end-to-end result.
-
-- **Speed**: Report latency and throughput on the target hardware and backend; quantized storage alone does not guarantee faster kernels
-- **Memory**: Measure serialized size and runtime peak memory because they include more than packed weight bits
-- **Accuracy**: Evaluate the same task metrics for BF16, PTQ, and QAT checkpoints
-
-### When to Use QAT
-
-Consider QAT when:
-
-- **PTQ misses a target**: A measured PTQ quality result is below the workload requirement
-- **Training is available**: You can run and validate an additional full-parameter SFT job
-- **The deployment stack supports the scheme**: The target hardware and backend have compatible quantized kernels
-
-### When Not to Use QAT
-
-Prefer a simpler baseline when:
-
-- **Establishing feasibility**: PTQ can test the deployment scheme without another training run
-- **The backend lacks compatible kernels**: Conversion would not exercise the intended quantized implementation
-- **Training resources are limited**: QAT requires another full-parameter training run
-- **PTQ already meets the measured targets**: Additional QAT training may not be justified
-
-## Best Practices
-
-### 1. Start with Post-Training Quantization
-
-Before investing in QAT, try post-training quantization to establish a baseline:
-
-```python
-import torch
-
-from torchao.quantization import Int8DynamicActivationInt4WeightConfig, quantize_
-from transformers import AutoModelForCausalLM
-
-model = AutoModelForCausalLM.from_pretrained(
-    "meta-llama/Llama-3.2-1B",
-    dtype=torch.bfloat16,
-)
-model.eval()
-
-quantize_(model, Int8DynamicActivationInt4WeightConfig(group_size=256))
-```
-
-If accuracy is acceptable, you may not need QAT.
-
-### 2. Choose the Right Quantization Scheme
-
-- **8da4w-qat**: Fake-quantizes eligible activations to INT8 and weights to INT4
-- **4w-qat**: Fake-quantizes eligible weights to INT4 while activations remain BF16
-
-Train and benchmark both only when their layer-shape constraints and deployment kernels match your model; neither scheme is categorically more accurate or faster for every workload.
-
-### 3. Tune Group Size
-
-The `groupsize` parameter affects the granularity of quantization:
-
-- **Smaller groups (128)**: Finer weight quantization granularity with more scale metadata
-- **Larger groups (256)**: Coarser granularity with fewer scales
-
-Both values must divide the target linear layer's `in_features`. Compare validation metrics and deployment measurements before choosing one.
-
-### 4. Monitor Validation Metrics
-
-Track validation metrics closely during QAT training:
-
-- Compare against full-precision baseline
-- Watch for convergence issues
-- Compare learning-rate choices using the same validation protocol
-
-### 5. Start Fake Quantization Immediately
-
-Use immediate fake quantization in the current revision:
-
-```yaml
-qat:
-  fake_quant_after_n_steps: 0
-```
-
-Positive values are accepted by the recipe, but the current direct helper calls do not traverse nested TorchAO QAT linear modules, so they must not be relied upon to delay activation.
-
-## Accuracy vs. Efficiency Trade-offs
-
-### Measure the Trade-off
-
-Do not assume a fixed accuracy loss, compression ratio, or inference speedup. Record the following for BF16, PTQ, and each QAT scheme you evaluate:
-
-| Measurement | What to keep constant |
-|-------------|-----------------------|
-| Task quality | Dataset, preprocessing, decoding, and metric implementation |
-| Serialized size | Checkpoint contents and serialization format |
-| Runtime memory | Batch size, sequence length, cache settings, and backend |
-| Latency and throughput | Hardware, quantized kernels, warm-up, and concurrency |
-
-### Optimization Strategies
-
-If accuracy is below expectations:
-
-1. **Tune training duration**: Use validation curves to decide whether more steps help
-2. **Tune learning rate**: Compare a small set of learning rates against the BF16 training baseline
-3. **Compare schemes**: Evaluate 8da4w and 4w when both satisfy the model and backend constraints
-4. **Compare group sizes**: Smaller groups provide finer-grained quantization but add scale metadata
-
-## Limitations and Known Issues
-
-### Current Limitations
-
-- **SFT only**: QAT is currently supported for Supervised Fine-Tuning tasks only
-- **BF16 only**: The infrastructure rejects QAT when any model parameter is not BF16
-- **No PEFT**: The fine-tuning recipe rejects configurations that combine QAT and PEFT
-- **Model compatibility**: TorchAO only prepares eligible `nn.Linear` layers, and the 4w path has stricter bias and shape constraints
-- **Training overhead**: QAT adds computational overhead during training
-
-### Troubleshooting
-
-#### Issue: Training diverges or doesn't converge
-
-**Solution**: Try these approaches:
-- Compare lower learning rates against the BF16 baseline
-- Compare supported group sizes whose values divide the target layer dimensions
-- Verify your baseline model trains successfully without QAT
-
-#### Issue: Accuracy is significantly worse than expected
-
-**Solution**:
-- Ensure you're comparing against the same baseline (same training steps, data, etc.)
-- Compare 8da4w quantization with 4w if both are supported by the deployment backend
-- Compare supported group sizes whose values divide the target layer dimensions
-- Use the validation curve to decide whether additional training steps help
-
-#### Issue: Out of memory during training
-
-**Solution**:
-- Measure peak memory against the BF16 run to determine the added cost for this model
-- Reduce batch size if needed
-- Use gradient accumulation to maintain effective batch size
-
-## References
-
-- [TorchAO Documentation](https://github.com/pytorch/ao)
-- [TorchAO QAT Guide](https://github.com/pytorch/ao/tree/main/torchao/quantization/qat)
-- [Quantization Fundamentals](https://pytorch.org/docs/stable/quantization.html)
-- [INT8 Quantization for Deep Learning](https://arxiv.org/abs/1806.08342)
+- **Training effect:** compare ordinary LoRA and QAT from the same pretrained
+  base and adapter initialization, with matching data order, steps, optimizer,
+  dtype, topology and evaluation inputs. Successful QAT training alone does not
+  establish a paired comparison or a quality gain.
+- **Same-model reference quantize/decode consistency:** compare each trained
+  model's eval output with its own merged, quantized/dequantized reference.
+  Include a merge-only control: BF16 merge rounding and operation order can
+  change outputs independently of quantization. Low reload error measures
+  consistency, not language quality or native low-bit kernel parity.
+- **Ordinary expert-LoRA baseline:** a routing-weight placement/reduction bug
+  in the ordinary path has been fixed. Older naive comparisons using that
+  affected path are invalid evidence of QAT benefit; rerun both arms on the
+  corrected implementation rather than attributing the discrepancy to QAT.
+- **Deployment quality and efficiency:** evaluate held-out task metrics and
+  measure latency, throughput and memory in the actual serving backend.
+  Reference decode checks cannot substitute for those measurements.
