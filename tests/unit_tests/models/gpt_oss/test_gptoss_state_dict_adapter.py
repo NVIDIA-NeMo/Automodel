@@ -16,6 +16,7 @@ import gc
 import weakref
 from unittest.mock import Mock, patch
 
+import pytest
 import torch
 from transformers import GptOssConfig
 
@@ -525,7 +526,11 @@ class TestBoundedMXFP4CheckpointLoad:
             torch.testing.assert_close(model_state[f"model.layers.0.mlp.experts.{projection}"], layer0_expected)
             torch.testing.assert_close(model_state[f"model.layers.1.mlp.experts.{projection}"], layer1_expected)
 
-    def test_supports_fp32_model_weights(self):
+    @pytest.mark.parametrize("cuda_available", [False, True])
+    def test_supports_fp32_model_weights(self, monkeypatch, cuda_available):
+        # CPU loading must also work on GPU hosts without a distributed process group.
+        assert not torch.distributed.is_initialized()
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: cuda_available)
         adapter = self._make_adapter(num_hidden_layers=1)
         model_state = self._make_model_state(dtype=torch.float32, num_hidden_layers=1)
 
@@ -1016,6 +1021,7 @@ class TestDTensorPaths:
             patch("torch.distributed.tensor.Shard", new=lambda dim: ("Shard", dim), create=True),
             patch("torch.distributed.tensor.Replicate", new=lambda: "Pr", create=True),
             patch("torch.cuda.is_available", return_value=True),
+            patch("torch.distributed.is_initialized", return_value=True),
             patch("torch.distributed.get_world_size", return_value=2),
         ):
             out = adapter._convert_moe_packed_tensors(blocks, scales, dtype=torch.float32, rows_per_chunk=4)
