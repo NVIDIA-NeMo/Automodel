@@ -94,7 +94,6 @@ optimizer:
   fused: true
 checkpoint:
   enabled: false
-  checkpoint_dir: /lustre/fsw/portfolios/coreai/users/huiyingl/super35_perf_hsg_20260915/benchmark_runs/super35_vl_text_8k_ep16_fused_adam
 wandb:
   enable: false
   entity: Nemo-automodel
@@ -109,3 +108,11 @@ benchmark:
   nsys_ranks: []
   num_nodes: 4
   json_output_path: training_logs/super35_vl_text_8k_ep16_fused_adam.json
+
+ci:
+  recipe_owner: HuiyingLi
+  time: "00:15:00"
+  nodes: 4
+  nproc_per_node: 4
+  env_vars:
+    PYTORCH_ALLOC_CONF: expandable_segments:True
