@@ -487,8 +487,8 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
     _keep_in_fp32_modules_strict = ["_fp32_params"]
     _owns_cp_attention = True
     # Packed (THD) training and packed CP are owned by the model's
-    # FlexAttention QSA path; other attention backends have no packed routing.
-    _packed_cp_attn_backends = ("flex",)
+    # route-indexed QSA path for the listed CUDA backends.
+    _packed_cp_attn_backends = ("flex", "cute")
 
     @dataclass(frozen=True)
     class ModelCapabilities:

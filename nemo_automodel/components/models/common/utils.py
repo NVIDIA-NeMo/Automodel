@@ -291,12 +291,13 @@ class BackendConfig:
     """Backend configuration for model components.
 
     Attributes:
-        attn: Attention backend ("te", "sdpa", "flex", "eager", "tilelang", or "cudnn").
+        attn: Attention backend ("te", "sdpa", "flex", "eager", "tilelang", "cudnn", or "cute").
             For DeepSeek V4, "tilelang" enables the TileLang sparse attention,
             indexer, and Sinkhorn kernels together. For GLM DSA, "tilelang" and
             "cudnn" select their respective packed sparse-attention kernels.
             For Qwen3.8-Flash-Next, "flex" selects FlexAttention sparse GQA on
-            CUDA BF16; CPU execution retains the PyTorch numerical oracle.
+            CUDA BF16; "cute" selects the optional SM90 CuTe sparse GQA backend.
+            CPU execution retains the PyTorch numerical oracle.
         sparse_attn: Sparse-attention backend. "generic" preserves each model's
             existing sparse mask plus ``attn`` path; "msa" selects the optional
             SM100 MSA kernels a model provides for its sparse layers only.
@@ -357,7 +358,7 @@ class BackendConfig:
         cuda_graph: Scoped partial CUDA-graph configuration.
     """
 
-    attn: Literal["te", "sdpa", "flex", "eager", "tilelang", "cudnn"] = (
+    attn: Literal["te", "sdpa", "flex", "eager", "tilelang", "cudnn", "cute"] = (
         "te" if HAVE_TE and torch.cuda.is_available() else "sdpa"
     )
     sparse_attn: Literal["generic", "msa"] = "generic"

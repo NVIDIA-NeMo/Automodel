@@ -424,14 +424,15 @@ def test_flex_qsa_empty_route_rows_have_zero_output_and_gradients() -> None:
         assert torch.count_nonzero(tensor.grad) == 0
 
 
-def test_qsa_flex_backend_bypasses_generic_parent_initializer() -> None:
+@pytest.mark.parametrize("attn_backend", ["flex", "cute"])
+def test_qsa_sparse_backend_bypasses_generic_parent_initializer(attn_backend: str) -> None:
     backend = _backend()
-    backend.attn = "flex"
+    backend.attn = attn_backend
 
     attention = Qwen3_8_FlashNextQSAAttention(_config(), layer_idx=0, backend=backend)
 
     assert attention.backend is backend
-    assert attention.backend.attn == "flex"
+    assert attention.backend.attn == attn_backend
     assert attention.attn_module is None
     assert attention.attn_func is None
 
