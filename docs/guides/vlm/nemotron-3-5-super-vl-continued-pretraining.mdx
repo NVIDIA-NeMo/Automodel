@@ -299,7 +299,7 @@ Use
 The `TrainFinetuneRecipeForNextTokenPrediction` recipe is also the existing LLM pretraining
 entry point. Its name does not imply an SFT objective: `MegatronPretraining` supplies raw,
 shifted next-token targets. `from_pretrained` loads the existing weights rather than
-randomly initializing a model. Architecture registration resolves the causal-LM entrypoint
+randomly initializing a model. Architecture registration resolves the causal-LM entry point
 to the full `NemotronOmniForConditionalGeneration` implementation.
 
 The important data fields are:
