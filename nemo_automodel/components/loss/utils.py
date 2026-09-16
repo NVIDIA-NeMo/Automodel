@@ -47,6 +47,33 @@ def _normalize_loss_labels(labels: torch.Tensor, ignore_index: int) -> torch.Ten
     return labels.masked_fill(labels == _DATASET_IGNORE_INDEX, ignore_index)
 
 
+def _normalize_kd_labels(
+    labels: torch.Tensor,
+    *,
+    loss_ignore_index: int,
+    kd_ignore_index: int,
+) -> torch.Tensor:
+    """Align KD supervision with the main loss mask.
+
+    Args:
+        labels: Integer target tensor of any shape.
+        loss_ignore_index: Label sentinel consumed by the main loss.
+        kd_ignore_index: Label sentinel consumed by the KD loss.
+
+    Returns:
+        Target tensor with the same shape, dtype, and device as ``labels``.
+        Positions ignored by the dataset or main loss contain
+        ``kd_ignore_index``. Valid labels equal to ``kd_ignore_index`` are
+        remapped to ``loss_ignore_index`` so they remain supervised.
+    """
+    labels = _normalize_loss_labels(labels, loss_ignore_index)
+    valid_mask = labels != loss_ignore_index
+    kd_labels = labels.masked_fill(~valid_mask, kd_ignore_index)
+    if kd_ignore_index != loss_ignore_index:
+        kd_labels = kd_labels.masked_fill(valid_mask & (kd_labels == kd_ignore_index), loss_ignore_index)
+    return kd_labels
+
+
 def _count_label_tokens(labels: torch.Tensor, ignore_index: int) -> int:
     """Count supervised entries in an integer target tensor of any shape.
 

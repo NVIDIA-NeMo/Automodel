@@ -62,7 +62,12 @@ from nemo_automodel.components.distributed.tp_replicas import synchronize_tp_rep
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
-from nemo_automodel.components.loss.utils import _count_label_tokens, _get_loss_ignore_index, calculate_loss
+from nemo_automodel.components.loss.utils import (
+    _count_label_tokens,
+    _get_loss_ignore_index,
+    _normalize_kd_labels,
+    calculate_loss,
+)
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 from nemo_automodel.components.training.rng import ScopedRNG
 from nemo_automodel.components.training.signal_handler import DistributedSignalHandler
@@ -447,10 +452,15 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                     labels=target,
                     num_label_tokens=None,
                 )
+            kd_labels = _normalize_kd_labels(
+                target,
+                loss_ignore_index=_get_loss_ignore_index(recipe_ref.loss_fn),
+                kd_ignore_index=_get_loss_ignore_index(recipe_ref.kd_loss_fn),
+            )
             kd_loss = recipe_ref.kd_loss_fn(
                 logits,
                 teacher_logits,
-                target,
+                kd_labels,
                 num_batch_labels=1,
             )
             recipe_ref._ce_loss_buffer.append(ce_loss.detach().clone())
@@ -662,10 +672,15 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             # Reminder: kd_loss is normalized by num_label_tokens, which is typically
             # larger than the number of labels in this batch alone because it covers all
             # batches in one optimizer step (grad_acc_steps = gbs / mbs).
+            kd_labels = _normalize_kd_labels(
+                labels,
+                loss_ignore_index=_get_loss_ignore_index(self.loss_fn),
+                kd_ignore_index=_get_loss_ignore_index(self.kd_loss_fn),
+            )
             kd_loss = self.kd_loss_fn(
                 student_logits,
                 teacher_logits,
-                labels,
+                kd_labels,
                 num_batch_labels=num_label_tokens,
             )
             local_loss = (1.0 - self.kd_ratio) * ce_loss + self.kd_ratio * kd_loss
