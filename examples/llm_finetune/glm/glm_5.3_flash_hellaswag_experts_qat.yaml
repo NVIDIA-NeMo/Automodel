@@ -1,0 +1,143 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# EXPERIMENTAL full pretrained GLM-5.3-Flash (glm5_next), not glm_moe_dsa or a tiny model.
+# 4 nodes x 8 GPUs: WORLD_SIZE=32, FSDP2 DP-shard=32, EP=32, 9 experts/rank.
+# Two optimizer steps are requested; full-model/multi-node validation is pending.
+# Requires a multi-node launcher; --nproc-per-node 8 alone starts only one node.
+# See ../README_qat.md. No CPU full-model initialization or packed shard export.
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+seed: 42
+
+step_scheduler:
+  global_batch_size: 32
+  local_batch_size: 1
+  max_steps: 2
+  num_epochs: 2
+  ckpt_every_steps: 1000000
+  val_every_steps: null
+  validate_on_checkpoint: false
+  save_checkpoint_every_epoch: false
+  gc_every_steps: null
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 10
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  config:
+    _target_: nemo_automodel.components.models.glm5_next.config.Glm5NextConfig.from_pretrained
+    pretrained_model_name_or_path: zai-org/GLM-5.3-Flash
+    name_or_path: zai-org/GLM-5.3-Flash
+    # Merge only these overrides into the source text config. Keep all 45 layers,
+    # original hybrid schedules, widths, vocabulary, and the complete vision config.
+    text_config:
+      num_nextn_predict_layers: 0
+      use_cache: false
+  load_base_model: true
+  dtype: bfloat16
+  trust_remote_code: false
+  use_liger_kernel: false
+  attn_implementation: sdpa
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    dispatcher: torch
+    experts: torch
+    attn: sdpa
+    linear: torch
+    rms_norm: torch_fp32
+    rope_fusion: false
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+
+# Expert-only PEFT freezes every other parameter, including the visual branch.
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  target_modules: ['model.language_model.layers.*.mlp.experts']
+  dim: 4
+  alpha: 8
+  dropout: 0.0
+  use_dora: false
+  use_triton: false
+  use_memory_efficient_lora: false
+
+qat:
+  enabled: true
+  fake_quant_after_n_steps: 0
+  qat_config:
+    _target_: nemo_automodel.components.quantization.qat.QATConfig
+    rules:
+      - target_modules: ['model.language_model.layers.*.mlp.experts']
+        weight:
+          format: fp8
+          block_size: [128, 128]
+          scale_format: float32
+
+distributed:
+  strategy: fsdp2
+  dp_replicate_size: 1
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 32
+  sequence_parallel: false
+  activation_checkpointing: true
+  moe:
+    reshard_after_forward: false
+    # FSDP must also own the frozen visual branch outside language_model.
+    wrap_outer_model: true
+
+compile:
+  enabled: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  path_or_dataset: rowan/hellaswag
+  split: train
+  num_samples_limit: 64
+  pad_to_max_length: false
+  # HellaSwag has no max_length/seq_length argument; 64 below is padding, not truncation.
+  tokenizer:
+    _target_: transformers.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: zai-org/GLM-5.3-Flash
+    trust_remote_code: false
+
+packed_sequence:
+  packed_sequence_size: 0
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 0
+  shuffle: true
+  drop_last: true
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+    pad_seq_len_divisible: 64
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-5
+  weight_decay: 0.0
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+
+# Load/dequantize the pretrained base, but do not attempt distributed packed export.
+checkpoint:
+  enabled: false
+  dequantize_base_checkpoint: true
+  save_consolidated: false

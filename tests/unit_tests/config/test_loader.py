@@ -18,7 +18,7 @@ import sys
 import textwrap
 from copy import deepcopy
 from pathlib import Path
-from typing import Any
+from typing import Any, get_type_hints
 
 import pytest
 
@@ -47,6 +47,203 @@ def tmp_module(tmp_path: Path, monkeypatch):
         return importlib.import_module(name)
 
     return _factory
+
+
+@pytest.fixture()
+def typed_module(tmp_module):
+    return tmp_module(
+        "typed_nested_config",
+        """
+        from __future__ import annotations
+        from dataclasses import dataclass, field
+        from typing import Optional
+
+        @dataclass(frozen=True)
+        class Leaf:
+            value: str = "default"
+
+        @dataclass
+        class Parent:
+            child: Optional[Leaf] = field(default=None, metadata={"instantiate": True})
+            children: tuple[Leaf, ...] = field(default=(), metadata={"instantiate": True})
+            items: list[Leaf] | None = field(default=None, metadata={"instantiate": True})
+            mapping: dict[str, str] | None = None
+            dimensions: tuple[int, ...] = ()
+            plain_child: Optional[Leaf] = None
+
+        class Untyped:
+            def __init__(self, child):
+                self.child = child
+        """,
+    )
+
+
+def test_dataclass_plain_nested_yaml_is_typed_only_at_instantiate(typed_module):
+    raw = {
+        "_target_": typed_module.Parent,
+        "child": {"value": "first"},
+        "children": [{"value": "second"}],
+        "items": [{"value": "third"}],
+        "mapping": {"ordinary": "mapping"},
+        "dimensions": [32, 32],
+        "plain_child": {"value": "unchanged"},
+    }
+    node = ConfigNode(raw)
+    obj = node.instantiate()
+    assert obj.child == typed_module.Leaf("first")
+    assert obj.children == (typed_module.Leaf("second"),)
+    assert obj.items == [typed_module.Leaf("third")]
+    assert obj.mapping == raw["mapping"]
+    assert isinstance(obj.dimensions, list) and obj.dimensions == [32, 32]
+    assert isinstance(obj.plain_child, dict) and obj.plain_child == raw["plain_child"]
+    assert node.raw_config == node.to_dict() == raw
+    assert node.instantiate() == obj
+    assert ConfigNode({"_target_": typed_module.Parent, "child": None}).instantiate().child is None
+
+
+def test_dataclass_runtime_override_retains_identity_and_literal_environment_text(typed_module):
+    node = ConfigNode({"_target_": typed_module.Parent, "child": {"unknown": True}})
+    child = typed_module.Leaf("${UNDEFINED_RUNTIME_VALUE}")
+    assert node.instantiate(child=child).child is child
+    mapping = {"value": "${UNDEFINED_RUNTIME_VALUE}"}
+    assert node.instantiate(child=mapping).child is mapping
+
+
+def test_dataclass_nested_unknown_fields_are_not_silently_dropped(typed_module):
+    node = ConfigNode({"_target_": typed_module.Parent, "children": [{"unknown": True}]})
+    with pytest.raises(TypeError, match="unknown"):
+        node.instantiate()
+
+
+def test_non_dataclass_targets_keep_plain_mapping_semantics(typed_module):
+    child = {"value": "unchanged"}
+    obj = ConfigNode({"_target_": typed_module.Untyped, "child": child}).instantiate()
+    assert obj.child == child
+    assert isinstance(obj.child, dict)
+
+
+@pytest.mark.parametrize("metadata", [{}, {"instantiate": False}, {"instantiate": 1}])
+@pytest.mark.parametrize("optional_type", ["int | None", "Missing | None", "RuntimeOnly[int] | None"])
+def test_existing_dataclasses_keep_lists_and_dicts_without_evaluating_hints(tmp_module, monkeypatch, metadata, optional_type):
+    monkeypatch.delitem(sys.modules, "existing_dataclass_config", raising=False)
+    module = tmp_module(
+        "existing_dataclass_config",
+        f"""
+        from __future__ import annotations
+        from dataclasses import dataclass, field
+
+        RuntimeOnly = int
+
+        @dataclass
+        class Child:
+            size: int = 4
+
+        @dataclass
+        class ExistingSettings:
+            dimensions: tuple[int, ...] = field(metadata={metadata!r})
+
+        @dataclass
+        class ExistingParent:
+            child: Child = field(metadata={metadata!r})
+            optional: {optional_type} = None
+        """,
+    )
+    monkeypatch.setattr("nemo_automodel.components.config.loader.get_type_hints", lambda _: pytest.fail("unexpected hints"))
+    settings = ConfigNode({"_target_": module.ExistingSettings, "dimensions": [32, 32]}).instantiate()
+    parent = ConfigNode({"_target_": module.ExistingParent, "child": {"size": 4}}).instantiate()
+    assert type(settings.dimensions) is list and settings.dimensions == [32, 32]
+    assert type(parent.child) is dict and parent.child == {"size": 4}
+    assert parent.optional is None
+
+
+@pytest.mark.parametrize("override", [False, True])
+def test_omitted_or_overridden_opt_in_field_does_not_evaluate_hints(typed_module, monkeypatch, override):
+    monkeypatch.setattr("nemo_automodel.components.config.loader.get_type_hints", lambda _: pytest.fail("unexpected hints"))
+    child = {"value": "${UNDEFINED_RUNTIME_VALUE}"}
+    node = ConfigNode({"_target_": typed_module.Parent, **({"child": {"unknown": True}} if override else {})})
+    obj = node.instantiate(**({"child": child} if override else {}))
+    assert obj.child is (child if override else None)
+
+
+@pytest.fixture(params=["Missing | None", "RuntimeOnly[int] | None"], ids=["name_error", "type_error"])
+def unresolved_hints_module(tmp_module, request):
+    name = f"unresolved_config_{request.node.callspec.id.replace('-', '_')}"
+    module = tmp_module(
+        name,
+        f"""
+        from __future__ import annotations
+        from dataclasses import dataclass, field
+        from typing import TYPE_CHECKING
+
+        if TYPE_CHECKING:
+            from collections import Counter as Missing
+
+        RuntimeOnly = int
+
+        @dataclass
+        class Known:
+            value: int = 0
+
+        @dataclass
+        class Config:
+            scalar: int = 0
+            optional: {request.param} = None
+            child: Known | None = field(default=None, metadata={{"instantiate": True}})
+
+        @dataclass
+        class Parent:
+            config: Config | None = field(default=None, metadata={{"instantiate": True}})
+        """,
+    )
+    assert "Missing" not in vars(module)
+    with pytest.raises(NameError if request.param.startswith("Missing") else TypeError):
+        get_type_hints(module.Config)
+    try:
+        yield module
+    finally:
+        sys.modules.pop(name, None)
+
+
+def test_dataclass_unresolved_omitted_annotation_keeps_scalar_instantiation(unresolved_hints_module):
+    module = unresolved_hints_module
+    obj = ConfigNode({"_target_": f"{module.__name__}.Config", "scalar": "7"}).instantiate()
+    assert isinstance(obj, module.Config)
+    assert obj.scalar == 7
+    assert obj.optional is None
+    assert obj.child is None
+
+
+@pytest.mark.parametrize("placement", ["top", "nested_plain", "nested_target"])
+@pytest.mark.parametrize("explicit_child", [False, True])
+def test_dataclass_unresolved_hints_preserve_mapping_and_target_semantics(
+    unresolved_hints_module, placement, explicit_child
+):
+    module = unresolved_hints_module
+    child = {"value": 9}
+    if explicit_child:
+        child["_target_"] = f"{module.__name__}.Known"
+    raw = {"scalar": 7, "child": child}
+    if placement != "nested_plain":
+        raw["_target_"] = f"{module.__name__}.Config"
+    if placement != "top":
+        raw = {"_target_": f"{module.__name__}.Parent", "config": raw}
+    node = ConfigNode(raw)
+    obj = node.instantiate()
+    if placement != "top":
+        obj = obj.config
+    assert isinstance(obj, module.Config)
+    assert obj.scalar == 7
+    assert obj.optional is None
+    # A plain nested mapping never gets typed when the class hints fail.
+    # Explicit nested targets retain the pre-existing instantiation behavior.
+    if explicit_child and placement != "nested_plain":
+        assert obj.child == module.Known(9)
+    else:
+        assert isinstance(obj.child, dict)
+        # Targets inside plain mappings are resolved but not instantiated.
+        expected = {"value": 9, "_target_": module.Known} if explicit_child else child
+        assert obj.child == expected
+    assert node.raw_config == raw
 
 
 @pytest.mark.parametrize(

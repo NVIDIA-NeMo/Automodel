@@ -26,6 +26,7 @@ from nemo_automodel.components.moe.experts import (
     GroupedExpertsDeepEP,
     _AllGatherConcatVarlenFn,
     _apply_bias,
+    _apply_router_weight_fp32,
     _permute_tokens_for_grouped_mm,
 )
 from nemo_automodel.shared.utils import dtype_from_str
@@ -44,6 +45,53 @@ def _to_local(proj):
 def _to_grouped_mm_operand(proj, dtype: torch.dtype):
     """Convert a projection tensor to the dtype/layout expected by grouped MM."""
     return _to_local(proj).to(dtype).contiguous()
+
+
+def _validate_qat_operand_dtypes(x: torch.Tensor, operands: tuple[torch.Tensor, ...]) -> None:
+    """Reject compute casts that would change the exported effective weight.
+
+    Args:
+        x: Local activation tensor [tokens, hidden]. CPU and CUDA autocast must
+            both be disabled, including when all stored dtypes match.
+        operands: Original base and adapter tensors [local_experts, in, out],
+            or DTensors sharded on expert axis 0 of a one-dimensional EP mesh.
+            Every local dtype must equal x's dtype before any conversion.
+    """
+    if torch.is_autocast_enabled("cpu") or torch.is_autocast_enabled("cuda"):
+        raise ValueError("Expert LoRA weight fake quantization does not support CPU or CUDA autocast")
+    if any(_to_local(operand).dtype != x.dtype for operand in operands):
+        raise ValueError(
+            "Expert LoRA weight fake quantization requires activation dtype to match original local base and LoRA A/B "
+            "dtypes so forward and exported effective weights use the same merge dtype"
+        )
+
+
+def _fake_quantize_effective_weight(
+    base: torch.Tensor,
+    lora_A: torch.Tensor,
+    lora_B: torch.Tensor,
+    scale: float,
+    quantizer: nn.Module,
+) -> torch.Tensor:
+    """Quantize a local merged expert operand without mutating its parameters.
+
+    Args:
+        base: Local tensor of shape [local_experts, in, out], already converted
+            by _to_grouped_mm_operand to the activation dtype and device.
+        lora_A: Local tensor of shape [local_experts, in, rank], matching base's dtype/device.
+        lora_B: Local tensor of shape [local_experts, rank, out], matching base's dtype/device.
+        scale: LoRA alpha/rank multiplier, applied exactly once.
+        quantizer: Fake quantizer accepting canonical [local_experts, out, in]
+            weights and returning the same shape, dtype and device with autograd.
+
+    Returns:
+        Contiguous tensor of shape [local_experts, in, out] in the operand
+        dtype/device, retaining gradients to both adapters. Inputs are not mutated.
+    """
+    if any(isinstance(t, DTensor) for t in (base, lora_A, lora_B)):
+        raise TypeError("Expert weight fake quantization requires local grouped-MM operands")
+    effective_weight = base + scale * (lora_A @ lora_B)
+    return quantizer(effective_weight.transpose(-2, -1)).transpose(-2, -1).contiguous()
 
 
 def _pad_lora_rank_for_grouped_mm(lora_A: torch.Tensor, lora_B: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -71,8 +119,11 @@ class GroupedExpertsLoRA(GroupedExperts):
         lora_down_B (nn.Parameter): LoRA B matrix for down projection.
     """
 
+    weight_fake_quantizer: nn.Module | None
+
     def __init__(self, orig_module: GroupedExperts, lora_dim=8, alpha=32, lora_A_init_method="xavier", lora_dtype=None):
         super().__init__(orig_module.config)
+        self.to(device=orig_module.gate_and_up_projs.device, dtype=orig_module.gate_and_up_projs.dtype)
 
         self.gate_and_up_projs.data.copy_(orig_module.gate_and_up_projs.data)
         self.down_projs.data.copy_(orig_module.down_projs.data)
@@ -83,6 +134,7 @@ class GroupedExpertsLoRA(GroupedExperts):
 
         # Copy backend setting from original (super().__init__ defaults to False without backend)
         self.use_torch_mm = orig_module.use_torch_mm
+        self.use_mxfp8 = orig_module.use_mxfp8
 
         GroupedExpertsLoRA._init_adapter(
             self,
@@ -96,6 +148,7 @@ class GroupedExpertsLoRA(GroupedExperts):
     def _init_adapter(obj, lora_dim=8, alpha=32, lora_A_init_method="xavier", lora_dtype=None):
         obj.lora_dim = lora_dim
         obj.scale = alpha / lora_dim
+        obj.weight_fake_quantizer = None
 
         # Freeze base weights
         obj.gate_and_up_projs.requires_grad = False
@@ -156,9 +209,38 @@ class GroupedExpertsLoRA(GroupedExperts):
     def forward(self, x: torch.Tensor, token_mask: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor):
         """Forward pass for GroupedExpertsLoRA with LoRA injection.
 
-        Mirrors GroupedExperts.forward but injects LoRA computations into
-        the expert processing at the projection level.
+        QAT merges adapters into local operands and explicitly dispatches the
+        parent compute kernels, preserving its routing-weight placement and
+        top-k reduction order without changing EP collectives. Non-QAT uses
+        additive-LoRA kernels with the same configured routing placement.
+
+        Args:
+            x: Local tensor of shape [tokens, hidden], in the compute dtype.
+                QAT requires this dtype to match original local base/A/B
+                storage dtypes, with CPU and CUDA autocast disabled.
+            token_mask: Local boolean tensor of shape [tokens].
+            weights: Local routing probabilities of shape [tokens, top_k].
+            indices: Local integer expert IDs of shape [tokens, top_k].
+
+        Returns:
+            Local tensor of shape [tokens, hidden], in x's dtype/device.
+            Expert parameters may be DTensors sharded on expert axis 0 of a
+            one-dimensional EP mesh; QAT only sees their local expert shards.
         """
+        if self.weight_fake_quantizer is not None:
+            if self.use_mxfp8:
+                raise NotImplementedError("LoRA weight fake quantization does not support the MXFP8 expert backend")
+            _validate_qat_operand_dtypes(
+                x,
+                (
+                    self.gate_and_up_projs,
+                    self.down_projs,
+                    self.lora_gate_and_up_A,
+                    self.lora_gate_and_up_B,
+                    self.lora_down_A,
+                    self.lora_down_B,
+                ),
+            )
         assert not isinstance(x, DTensor)
         input_dtype = x.dtype
 
@@ -182,6 +264,14 @@ class GroupedExpertsLoRA(GroupedExperts):
         lora_gate_and_up_B = _to_grouped_mm_operand(self.lora_gate_and_up_B, compute_dtype)
         lora_down_A = _to_grouped_mm_operand(self.lora_down_A, compute_dtype)
         lora_down_B = _to_grouped_mm_operand(self.lora_down_B, compute_dtype)
+
+        if self.weight_fake_quantizer is not None:
+            gate_and_up_projs = _fake_quantize_effective_weight(
+                gate_and_up_projs, lora_gate_and_up_A, lora_gate_and_up_B, self.scale, self.weight_fake_quantizer
+            )
+            down_projs = _fake_quantize_effective_weight(
+                down_projs, lora_down_A, lora_down_B, self.scale, self.weight_fake_quantizer
+            )
 
         local_num_tokens = x.size(0)
         if ep_size > 1:
@@ -215,7 +305,60 @@ class GroupedExpertsLoRA(GroupedExperts):
         experts_start_idx = ep_rank * n_local_experts
         experts_end_idx = experts_start_idx + n_local_experts
 
-        if self.use_torch_mm:
+        if self.weight_fake_quantizer is not None:
+            gate_up_proj_bias = _to_local(self.gate_up_proj_bias).to(compute_dtype) if self.expert_bias else None
+            down_proj_bias = _to_local(self.down_proj_bias).to(compute_dtype) if self.expert_bias else None
+            has_local_tokens = (
+                token_mask.unsqueeze(-1) & (indices >= experts_start_idx) & (indices < experts_end_idx)
+            ).any()
+            if not has_local_tokens:
+                # Parent empty paths index x[0]. Keep every QAT gradient and
+                # gathered input attached, even for zero tokens or no local routes.
+                output_shape = (
+                    (x.shape[0], weights.shape[1], x.shape[1])
+                    if self.config.apply_router_weight_after_down
+                    else x.shape
+                )
+                y = (
+                    torch.zeros(output_shape, dtype=torch.float32, device=x.device)
+                    + (
+                        x.sum(dtype=torch.float32)
+                        + weights.sum(dtype=torch.float32)
+                        + gate_and_up_projs.sum(dtype=torch.float32)
+                        + down_projs.sum(dtype=torch.float32)
+                    )
+                    * 0.0
+                )
+            elif self.use_torch_mm:
+                y = GroupedExperts._forward_grouped_mm(
+                    self,
+                    x,
+                    token_mask,
+                    weights,
+                    indices,
+                    gate_and_up_projs,
+                    down_projs,
+                    gate_up_proj_bias,
+                    down_proj_bias,
+                    n_local_experts,
+                    experts_start_idx,
+                )
+            else:
+                y = GroupedExperts._forward_loop(
+                    self,
+                    x,
+                    weights,
+                    indices,
+                    token_mask,
+                    gate_and_up_projs,
+                    down_projs,
+                    gate_up_proj_bias,
+                    down_proj_bias,
+                    n_local_experts,
+                    experts_start_idx,
+                    experts_end_idx,
+                )
+        elif self.use_torch_mm:
             lora_gate_and_up_A, lora_gate_and_up_B = _pad_lora_rank_for_grouped_mm(
                 lora_gate_and_up_A, lora_gate_and_up_B
             )
@@ -259,6 +402,8 @@ class GroupedExpertsLoRA(GroupedExperts):
             start = sum(gathered_lens[:ep_rank])
             y = y.narrow(0, start, local_num_tokens).contiguous()
 
+        if self.config.apply_router_weight_after_down:
+            y = y.sum(dim=1)
         return y.to(input_dtype)
 
     def _forward_loop(
@@ -277,8 +422,34 @@ class GroupedExpertsLoRA(GroupedExperts):
         experts_start_idx,
         experts_end_idx,
     ):
-        """Per-expert loop forward path with LoRA injection."""
-        y = torch.zeros(x.shape, dtype=torch.float32, device=x.device)
+        """Additive-LoRA loop; QAT dispatches the parent kernel instead.
+
+        Args:
+            x: Tensor of shape [tokens, hidden], EP-gathered when needed.
+            weights: Tensor of shape [tokens, top_k], routing probabilities.
+            indices: Integer tensor of shape [tokens, top_k], global expert IDs.
+            token_mask: Boolean tensor of shape [tokens].
+            gate_and_up_projs: Local tensor [local_experts, hidden, up], where
+                up is intermediate or fused gate+up (2 * intermediate).
+            down_projs: Local tensor [local_experts, intermediate, hidden].
+            lora_gate_and_up_A: Local tensor [local_experts, hidden, rank].
+            lora_gate_and_up_B: Local tensor [local_experts, rank, up].
+            lora_down_A: Local tensor [local_experts, intermediate, rank].
+            lora_down_B: Local tensor [local_experts, rank, hidden].
+            n_local_experts: Number of local experts.
+            experts_start_idx: First global expert ID on this rank.
+            experts_end_idx: Exclusive last global expert ID on this rank.
+
+        Returns:
+            FP32 tensor [tokens, top_k, hidden] for post-down routing, otherwise
+            [tokens, hidden], on x's device. Operands have x's dtype/device.
+            Slots are reduced by forward after EP combine. No input is mutated.
+        """
+        apply_after_down = self.config.apply_router_weight_after_down
+        output_shape = (x.shape[0], weights.shape[1], x.shape[1]) if apply_after_down else x.shape
+        y = torch.zeros(output_shape, dtype=torch.float32, device=x.device)
+        gate_up_proj_bias = _to_local(self.gate_up_proj_bias).to(x.dtype) if self.expert_bias else None
+        down_proj_bias = _to_local(self.down_proj_bias).to(x.dtype) if self.expert_bias else None
 
         active_local_experts = 0
         for i in range(experts_start_idx, experts_end_idx):
@@ -300,30 +471,46 @@ class GroupedExpertsLoRA(GroupedExperts):
             )
 
             if self.expert_bias:
-                gate_and_up_out = gate_and_up_out + self.gate_up_proj_bias[local_idx]
+                gate_and_up_out = gate_and_up_out + gate_up_proj_bias[local_idx]
 
-            # Weighted activation (routing weight applied BETWEEN up and down projections)
+            # Preserve the parent's configured routing placement without merging LoRA.
             w = weights[idx, top, None]
-            activated = self.expert_activation_grouped(gate_and_up_out, w)
+            activation_weight = torch.ones_like(w) if apply_after_down else w
+            activated = self.expert_activation_grouped(gate_and_up_out, activation_weight)
 
             # Down projection + LoRA
             expert_out = activated @ down_projs[local_idx]
             expert_out = expert_out + (activated @ lora_down_A[local_idx] @ lora_down_B[local_idx]) * self.scale
 
             if self.expert_bias:
-                expert_out = expert_out + self.down_proj_bias[local_idx] * w
+                expert_out = expert_out + (
+                    down_proj_bias[local_idx] if apply_after_down else down_proj_bias[local_idx] * w
+                )
 
-            y.scatter_add_(dim=0, index=idx_b, src=expert_out.float())
+            if apply_after_down:
+                expert_out = expert_out.float() * w.float()
+                slot_ids = idx * weights.shape[1] + top
+                slot_ids_b = slot_ids[:, None].expand(-1, x.size(1))
+                y.view(-1, x.size(1)).scatter_add_(dim=0, index=slot_ids_b, src=expert_out.float())
+            else:
+                y.scatter_add_(dim=0, index=idx_b, src=expert_out.float())
 
-        # Dummy computation for gradient flow when no tokens routed locally
+        # Keep empty/fully masked ranks attached without indexing nonexistent tokens.
         if active_local_experts == 0:
-            dummy_x = torch.zeros_like(x[0]).unsqueeze(0)
-            gate_and_up_out = dummy_x @ gate_and_up_projs[0]
-            gate_and_up_out = gate_and_up_out + (dummy_x @ lora_gate_and_up_A[0] @ lora_gate_and_up_B[0]) * self.scale
-            activated = self.expert_activation_grouped(gate_and_up_out, weights[0, 0, None].unsqueeze(0))
-            expert_out = activated @ down_projs[0]
-            expert_out = expert_out + (activated @ lora_down_A[0] @ lora_down_B[0]) * self.scale
-            y[0] += expert_out[0]
+            y = (
+                y
+                + (
+                    x.sum(dtype=torch.float32)
+                    + weights.sum(dtype=torch.float32)
+                    + gate_and_up_projs.sum(dtype=torch.float32)
+                    + down_projs.sum(dtype=torch.float32)
+                    + lora_gate_and_up_A.sum(dtype=torch.float32)
+                    + lora_gate_and_up_B.sum(dtype=torch.float32)
+                    + lora_down_A.sum(dtype=torch.float32)
+                    + lora_down_B.sum(dtype=torch.float32)
+                )
+                * 0.0
+            )
 
         return y
 
@@ -342,24 +529,50 @@ class GroupedExpertsLoRA(GroupedExperts):
         n_local_experts,
         experts_start_idx,
     ):
-        """Grouped GEMM forward path with LoRA injection using torch._grouped_mm."""
-        sorted_token_ids, sorted_weights, tokens_per_expert, offs = _permute_tokens_for_grouped_mm(
+        """Additive-LoRA grouped GEMM; QAT uses the parent kernel instead.
+
+        Args:
+            x: Tensor [tokens, hidden], EP-gathered when needed.
+            token_mask: Boolean tensor [tokens].
+            weights: Routing probability tensor [tokens, top_k].
+            indices: Integer tensor [tokens, top_k], global expert IDs.
+            gate_and_up_projs: Contiguous local tensor [local_experts, hidden,
+                up], where up is intermediate or fused gate+up (2 * intermediate).
+            down_projs: Contiguous local tensor [local_experts, intermediate, hidden].
+            lora_gate_and_up_A: Contiguous local tensor [local_experts, hidden, rank].
+            lora_gate_and_up_B: Contiguous local tensor [local_experts, rank, up].
+            lora_down_A: Contiguous local tensor [local_experts, intermediate, rank].
+            lora_down_B: Contiguous local tensor [local_experts, rank, hidden].
+                Adapter ranks are padded for 16-byte stride alignment outside QAT.
+            n_local_experts: Number of local experts.
+            experts_start_idx: First global expert ID on this rank.
+
+        Returns:
+            FP32 tensor [tokens, top_k, hidden] for post-down routing, otherwise
+            [tokens, hidden], on x's device. All operands share x's dtype/device.
+            Slots are reduced by forward after EP combine. No input is mutated.
+        """
+        sorted_token_ids, sorted_slot_ids, sorted_weights, tokens_per_expert, offs = _permute_tokens_for_grouped_mm(
             indices,
             weights,
             token_mask,
             n_local_experts,
             experts_start_idx,
+            return_slot_ids=True,
         )
 
-        y = torch.zeros(x.shape, dtype=torch.float32, device=x.device)
+        apply_after_down = self.config.apply_router_weight_after_down
+        output_shape = (x.shape[0], weights.shape[1], x.shape[1]) if apply_after_down else x.shape
+        y = torch.zeros(output_shape, dtype=torch.float32, device=x.device)
 
         if sorted_token_ids.numel() > 0:
             permuted_x = x[sorted_token_ids]
             permuted_probs = sorted_weights.unsqueeze(-1)
+            activation_probs = torch.ones_like(permuted_probs) if apply_after_down else permuted_probs
 
             if self.expert_bias:
-                gate_up_proj_bias = _to_local(self.gate_up_proj_bias)
-                down_proj_bias = _to_local(self.down_proj_bias)
+                gate_up_proj_bias = _to_local(self.gate_up_proj_bias).to(x.dtype)
+                down_proj_bias = _to_local(self.down_proj_bias).to(x.dtype)
 
             # Gate+Up projection + LoRA
             output1 = torch._grouped_mm(permuted_x, gate_and_up_projs, offs=offs)
@@ -370,7 +583,7 @@ class GroupedExpertsLoRA(GroupedExperts):
             if self.expert_bias:
                 output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
 
-            output1 = self.expert_activation_grouped(output1, permuted_probs)
+            output1 = self.expert_activation_grouped(output1, activation_probs)
 
             # Down projection + LoRA
             output2 = torch._grouped_mm(output1, down_projs, offs=offs)
@@ -379,21 +592,33 @@ class GroupedExpertsLoRA(GroupedExperts):
             output2 = output2 + lora_out2 * self.scale
 
             if self.expert_bias:
-                output2 = _apply_bias(output2, down_proj_bias, tokens_per_expert, permuted_probs)
+                output2 = _apply_bias(
+                    output2, down_proj_bias, tokens_per_expert, None if apply_after_down else permuted_probs
+                )
 
-            scatter_ids = sorted_token_ids.unsqueeze(1).expand_as(output2)
-            y.scatter_add_(0, scatter_ids, output2.float())
+            if apply_after_down:
+                output2 = _apply_router_weight_fp32(output2, permuted_probs, torch.float32)
+                scatter_ids = sorted_slot_ids.unsqueeze(1).expand_as(output2)
+                y.view(-1, x.size(1)).scatter_add_(0, scatter_ids, output2.float())
+            else:
+                scatter_ids = sorted_token_ids.unsqueeze(1).expand_as(output2)
+                y.scatter_add_(0, scatter_ids, output2.float())
         else:
-            # Dummy computation for gradient flow
-            output1 = torch.matmul(x[0] * 0, gate_and_up_projs[0])
-            output1 = (
-                output1
-                + torch.matmul(torch.matmul(x[0] * 0, lora_gate_and_up_A[0]), lora_gate_and_up_B[0]) * self.scale
+            # Preserve the output layout and all gradients even for zero tokens.
+            y = (
+                y
+                + (
+                    x.sum(dtype=torch.float32)
+                    + weights.sum(dtype=torch.float32)
+                    + gate_and_up_projs.sum(dtype=torch.float32)
+                    + down_projs.sum(dtype=torch.float32)
+                    + lora_gate_and_up_A.sum(dtype=torch.float32)
+                    + lora_gate_and_up_B.sum(dtype=torch.float32)
+                    + lora_down_A.sum(dtype=torch.float32)
+                    + lora_down_B.sum(dtype=torch.float32)
+                )
+                * 0.0
             )
-            output1_ = self.expert_activation_grouped(output1, weights[0, 0, None].unsqueeze(0))
-            output2 = torch.matmul(output1_, down_projs[0])
-            output2 = output2 + torch.matmul(torch.matmul(output1_ * 0, lora_down_A[0]), lora_down_B[0]) * self.scale
-            y[0] += output2[0]
 
         return y
 
@@ -413,6 +638,8 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         lora_down_B (nn.Parameter): LoRA B matrix for down projection.
     """
 
+    weight_fake_quantizer: nn.Module | None
+
     def __init__(
         self, orig_module: GroupedExpertsDeepEP, lora_dim=8, alpha=32, lora_A_init_method="xavier", lora_dtype=None
     ):
@@ -423,6 +650,7 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
             dispatcher_share_token_dispatcher=orig_module.dispatcher_share_token_dispatcher,
             dispatcher_async_dispatch=orig_module.dispatcher_async_dispatch,
         )
+        self.to(device=orig_module.gate_and_up_projs.device, dtype=orig_module.gate_and_up_projs.dtype)
 
         self.gate_and_up_projs.data.copy_(orig_module.gate_and_up_projs.data)
         self.down_projs.data.copy_(orig_module.down_projs.data)
@@ -451,6 +679,7 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
     def _init_adapter(obj, lora_dim=8, alpha=32, lora_A_init_method="xavier", lora_dtype=None):
         obj.lora_dim = lora_dim
         obj.scale = alpha / lora_dim
+        obj.weight_fake_quantizer = None
 
         obj.gate_and_up_projs.requires_grad = False
         obj.down_projs.requires_grad = False
@@ -515,8 +744,41 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         """Forward pass for GroupedExpertsDeepEPLoRA with LoRA injection.
 
         Mirrors GroupedExpertsDeepEP.forward but injects LoRA computations
-        into the expert processing at the projection level.
+        into the expert processing at the projection level. QAT merges local
+        operands without changing dispatch or combine. Both paths follow the
+        parent's configured pre-down or FP32 post-down routing-weight scaling;
+        non-QAT keeps the adapter projections additive.
+
+        Args:
+            x: Local tensor [tokens, hidden], in the compute dtype. QAT requires
+                original local base/A/B storage dtypes to match, with CPU and
+                CUDA autocast disabled. Dispatch must preserve this dtype.
+            token_mask: Local boolean tensor [tokens].
+            weights: Local routing probability tensor [tokens, top_k].
+            indices: Local integer tensor [tokens, top_k], global expert IDs.
+
+        Returns:
+            Local tensor [tokens, hidden] on x's device after dispatcher combine.
+            Base and adapter parameters may be DTensors sharded on expert axis 0;
+            QAT operates only on local [local_experts, in, out] shards, converting
+            them to canonical [local_experts, out, in] for the quantizer.
         """
+        if self.weight_fake_quantizer is not None:
+            if self.use_mxfp8:
+                raise NotImplementedError("LoRA weight fake quantization does not support the MXFP8 expert backend")
+            _validate_qat_operand_dtypes(
+                x,
+                (
+                    self.gate_and_up_projs,
+                    self.down_projs,
+                    self.lora_gate_and_up_A,
+                    self.lora_gate_and_up_B,
+                    self.lora_down_A,
+                    self.lora_down_B,
+                ),
+            )
+            if not self.use_torch_mm and ops is None:
+                raise RuntimeError("DeepEP LoRA weight fake quantization requires grouped_gemm or use_torch_mm=True")
         assert not isinstance(x, DTensor)
         assert self.n_routed_experts % self.ep_size == 0
 
@@ -529,6 +791,10 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
             token_indices=indices,
         )
         permuted_probs = permuted_probs.unsqueeze(-1)
+        apply_after_down = self.config.apply_router_weight_after_down
+        activation_probs = torch.ones_like(permuted_probs) if apply_after_down else permuted_probs
+        if self.weight_fake_quantizer is not None and permuted_local_hidden_states.dtype != x.dtype:
+            raise ValueError("DeepEP LoRA weight fake quantization requires dispatch to preserve activation dtype")
 
         compute_dtype = x.dtype
         gate_and_up_projs = _to_grouped_mm_operand(self.gate_and_up_projs, compute_dtype)
@@ -538,12 +804,21 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         lora_down_A = _to_grouped_mm_operand(self.lora_down_A, compute_dtype)
         lora_down_B = _to_grouped_mm_operand(self.lora_down_B, compute_dtype)
 
+        if self.weight_fake_quantizer is not None:
+            gate_and_up_projs = _fake_quantize_effective_weight(
+                gate_and_up_projs, lora_gate_and_up_A, lora_gate_and_up_B, self.scale, self.weight_fake_quantizer
+            )
+            down_projs = _fake_quantize_effective_weight(
+                down_projs, lora_down_A, lora_down_B, self.scale, self.weight_fake_quantizer
+            )
+
         if torch.count_nonzero(tokens_per_expert) > 0:
             if self.use_torch_mm:
-                lora_gate_and_up_A, lora_gate_and_up_B = _pad_lora_rank_for_grouped_mm(
-                    lora_gate_and_up_A, lora_gate_and_up_B
-                )
-                lora_down_A, lora_down_B = _pad_lora_rank_for_grouped_mm(lora_down_A, lora_down_B)
+                if self.weight_fake_quantizer is None:
+                    lora_gate_and_up_A, lora_gate_and_up_B = _pad_lora_rank_for_grouped_mm(
+                        lora_gate_and_up_A, lora_gate_and_up_B
+                    )
+                    lora_down_A, lora_down_B = _pad_lora_rank_for_grouped_mm(lora_down_A, lora_down_B)
                 tokens_per_expert_gpu = tokens_per_expert.to(
                     device=permuted_local_hidden_states.device, non_blocking=True
                 )
@@ -551,25 +826,29 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
 
                 # Gate+Up projection + LoRA
                 output1 = torch._grouped_mm(permuted_local_hidden_states, gate_and_up_projs, offs=offs)
-                lora_out1_A = torch._grouped_mm(permuted_local_hidden_states, lora_gate_and_up_A, offs=offs)
-                lora_out1 = torch._grouped_mm(lora_out1_A, lora_gate_and_up_B, offs=offs)
-                output1 = output1 + lora_out1 * self.scale
+                if self.weight_fake_quantizer is None:
+                    lora_out1_A = torch._grouped_mm(permuted_local_hidden_states, lora_gate_and_up_A, offs=offs)
+                    lora_out1 = torch._grouped_mm(lora_out1_A, lora_gate_and_up_B, offs=offs)
+                    output1 = output1 + lora_out1 * self.scale
 
                 if self.expert_bias:
                     gate_up_proj_bias = _to_local(self.gate_up_proj_bias)
                     output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
 
-                output1 = self.expert_activation(output1, permuted_probs)
+                output1 = self.expert_activation(output1, activation_probs)
 
                 # Down projection + LoRA
                 output2 = torch._grouped_mm(output1, down_projs, offs=offs)
-                lora_out2_A = torch._grouped_mm(output1, lora_down_A, offs=offs)
-                lora_out2 = torch._grouped_mm(lora_out2_A, lora_down_B, offs=offs)
-                output2 = output2 + lora_out2 * self.scale
+                if self.weight_fake_quantizer is None:
+                    lora_out2_A = torch._grouped_mm(output1, lora_down_A, offs=offs)
+                    lora_out2 = torch._grouped_mm(lora_out2_A, lora_down_B, offs=offs)
+                    output2 = output2 + lora_out2 * self.scale
 
                 if self.expert_bias:
                     down_bias = _to_local(self.down_proj_bias)
-                    output2 = _apply_bias(output2, down_bias, tokens_per_expert, permuted_probs)
+                    output2 = _apply_bias(
+                        output2, down_bias, tokens_per_expert, None if apply_after_down else permuted_probs
+                    )
             else:
                 # Gate+Up projection + LoRA
                 output1 = ops.gmm(
@@ -578,40 +857,60 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
                     tokens_per_expert,
                     trans_b=False,
                 )
-                lora_out1_A = ops.gmm(
-                    permuted_local_hidden_states,
-                    lora_gate_and_up_A,
-                    tokens_per_expert,
-                    trans_b=False,
-                )
-                lora_out1 = ops.gmm(lora_out1_A, lora_gate_and_up_B, tokens_per_expert, trans_b=False)
-                output1 = output1 + lora_out1 * self.scale
+                if self.weight_fake_quantizer is None:
+                    lora_out1_A = ops.gmm(
+                        permuted_local_hidden_states,
+                        lora_gate_and_up_A,
+                        tokens_per_expert,
+                        trans_b=False,
+                    )
+                    lora_out1 = ops.gmm(lora_out1_A, lora_gate_and_up_B, tokens_per_expert, trans_b=False)
+                    output1 = output1 + lora_out1 * self.scale
 
                 if self.expert_bias:
-                    gate_up_proj_bias = _to_local(self.gate_up_proj_bias)
+                    gate_up_proj_bias = _to_local(self.gate_up_proj_bias).to(compute_dtype)
                     output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
 
-                output1 = self.expert_activation(output1, permuted_probs)
+                output1 = self.expert_activation(output1, activation_probs)
 
                 # Down projection + LoRA
                 output2 = ops.gmm(output1, down_projs, tokens_per_expert, trans_b=False)
-                lora_out2_A = ops.gmm(output1, lora_down_A, tokens_per_expert, trans_b=False)
-                lora_out2 = ops.gmm(lora_out2_A, lora_down_B, tokens_per_expert, trans_b=False)
-                output2 = output2 + lora_out2 * self.scale
+                if self.weight_fake_quantizer is None:
+                    lora_out2_A = ops.gmm(output1, lora_down_A, tokens_per_expert, trans_b=False)
+                    lora_out2 = ops.gmm(lora_out2_A, lora_down_B, tokens_per_expert, trans_b=False)
+                    output2 = output2 + lora_out2 * self.scale
 
                 if self.expert_bias:
-                    down_bias = _to_local(self.down_proj_bias)
-                    output2 = _apply_bias(output2, down_bias, tokens_per_expert, permuted_probs)
+                    down_bias = _to_local(self.down_proj_bias).to(compute_dtype)
+                    output2 = _apply_bias(
+                        output2, down_bias, tokens_per_expert, None if apply_after_down else permuted_probs
+                    )
+        elif self.weight_fake_quantizer is not None:
+            # Preserve the empty dispatcher graph and all adapter gradients without x[0].
+            output2 = permuted_local_hidden_states + (
+                (
+                    gate_and_up_projs.sum(dtype=torch.float32)
+                    + down_projs.sum(dtype=torch.float32)
+                    + permuted_probs.sum(dtype=torch.float32)
+                )
+                * 0.0
+            ).to(compute_dtype)
         else:
-            # Dummy computation for gradient flow
-            output1 = torch.matmul(x[0] * 0, gate_and_up_projs[0])
-            output1 = (
-                output1
-                + torch.matmul(torch.matmul(x[0] * 0, lora_gate_and_up_A[0]), lora_gate_and_up_B[0]) * self.scale
-            )
-            output1_ = self.expert_activation(output1, permuted_probs)
-            output2 = torch.matmul(output1_, down_projs[0])
-            output2 = output2 + torch.matmul(torch.matmul(output1_ * 0, lora_down_A[0]), lora_down_B[0]) * self.scale
+            # Preserve the dispatched [0, hidden] layout and additive adapter graph.
+            output2 = permuted_local_hidden_states + (
+                (
+                    gate_and_up_projs.sum(dtype=torch.float32)
+                    + down_projs.sum(dtype=torch.float32)
+                    + lora_gate_and_up_A.sum(dtype=torch.float32)
+                    + lora_gate_and_up_B.sum(dtype=torch.float32)
+                    + lora_down_A.sum(dtype=torch.float32)
+                    + lora_down_B.sum(dtype=torch.float32)
+                    + permuted_probs.sum(dtype=torch.float32)
+                )
+                * 0.0
+            ).to(compute_dtype)
 
+        if apply_after_down:
+            output2 = _apply_router_weight_fp32(output2, permuted_probs, compute_dtype)
         y = self.token_dispatcher.token_unpermutation(output2)
         return y
