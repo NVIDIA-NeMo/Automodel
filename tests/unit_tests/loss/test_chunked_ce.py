@@ -294,3 +294,42 @@ def test_chunked_cross_entropy_cuda_bf16_matches_fp32_reference():
     reference.backward()
     torch.cuda.synchronize(device)
     torch.testing.assert_close(logits.grad.float(), reference_logits.grad, rtol=2e-2, atol=2e-3)
+
+
+def test_chunked_cross_entropy_does_not_mutate_labels():
+    """``ChunkedCrossEntropy`` must not write ``ignore_index`` into the caller's labels."""
+    torch.manual_seed(0)
+    logits = torch.randn(8, 5)
+    labels = torch.randint(high=5, size=(8,))
+    mask = torch.tensor([1, 0, 1, 0, 1, 0, 1, 0])
+
+    before = labels.clone()
+    ChunkedCrossEntropy()(logits, labels, mask=mask)
+
+    assert torch.equal(labels, before), f"labels were mutated in place: {before.tolist()} -> {labels.tolist()}"
+
+
+def test_chunked_cross_entropy_reused_labels_with_two_masks():
+    """A second, disjoint mask over the same labels must still score its own positions."""
+    torch.manual_seed(0)
+    n_tokens, n_classes = 8, 5
+    logits = torch.randn(n_tokens, n_classes)
+    labels = torch.randint(high=n_classes, size=(n_tokens,))
+    mask_a = torch.tensor([1, 1, 1, 1, 0, 0, 0, 0])
+    mask_b = torch.tensor([0, 0, 0, 0, 1, 1, 1, 1])
+
+    def reference(mask):
+        targets = labels.clone()
+        targets[mask == 0] = -100
+        return F.cross_entropy(logits, targets, reduction="sum")
+
+    loss_fn = ChunkedCrossEntropy(reduction="sum")
+    shared = labels.clone()
+    loss_a = loss_fn(logits, shared, mask=mask_a)
+    loss_b = loss_fn(logits, shared, mask=mask_b)
+
+    assert torch.allclose(loss_a, reference(mask_a), atol=1e-5)
+    assert torch.allclose(loss_b, reference(mask_b), atol=1e-5), (
+        f"second mask scored {loss_b.item():.6f}, expected {reference(mask_b).item():.6f}"
+    )
+    assert loss_b.item() != 0.0
