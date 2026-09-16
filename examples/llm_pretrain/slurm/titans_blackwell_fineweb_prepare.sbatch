@@ -57,7 +57,7 @@ if [[ ! -s "$READY_MARKER" ]]; then
         --tokens-per-shard 1B \
         --output-prefix fineweb_edu \
         --data-cache-dir '$TITANS_WORK_ROOT/cache/fineweb-edu' \
-        --num-workers 112 \
+        --num-workers 32 \
         --chunk-size 128 \
         --prefetch 2
     "

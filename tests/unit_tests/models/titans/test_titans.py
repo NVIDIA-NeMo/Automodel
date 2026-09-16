@@ -466,9 +466,13 @@ def test_blackwell_submitter_resolves_portable_topology():
     assert "--nnodes=\\$SLURM_NNODES" in runner
     assert "--rdzv-backend=c10d" in runner
     assert "--step_scheduler.max_steps_per_run='$MAX_STEPS_PER_RUN'" in full_runner
+    assert "TARGET_SEGMENT_SECONDS=${TITANS_TARGET_SEGMENT_SECONDS:-13200}" in full_runner
+    assert "NEXT_SEGMENT_STEPS" in full_runner
     assert "--wandb.project=titans-paper-reproduction" in full_runner
     assert "--validation-dir '$STAGING_ROOT/validation'" in data_runner
+    assert "--num-workers 32" in data_runner
     assert "titans_blackwell_lmm_full.sbatch" in data_runner
+    assert "HF_TOKEN_QUOTED" in submitter
     assert "--full" in submitter
     for scale in ("170m", "340m", "760m"):
         assert scale in runner

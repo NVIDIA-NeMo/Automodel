@@ -123,6 +123,13 @@ if [[ $WANDB_STATUS == *missing* ]]; then
     >/dev/null
 fi
 
+if [[ -n ${HF_TOKEN:-} ]]; then
+  printf -v HF_TOKEN_QUOTED %q "$HF_TOKEN"
+  slurm-cli --cluster "$CLUSTER" shell \
+    "umask 077; mkdir -p '$REMOTE_ROOT/cache/huggingface'; printf '%s' $HF_TOKEN_QUOTED > '$REMOTE_ROOT/cache/huggingface/token'; chmod 600 '$REMOTE_ROOT/cache/huggingface/token'" \
+    >/dev/null
+fi
+
 SYNC_COMMAND=$(cat <<EOF
 set -euo pipefail
 mkdir -p '$REMOTE_ROOT/checkouts' '$REMOTE_ROOT/logs'

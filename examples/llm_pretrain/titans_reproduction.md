@@ -237,3 +237,9 @@ All new pilots and full runs log to the consolidated
 `nvidia/titans-paper-reproduction` W&B project. Groups separate canonical
 LMM scales (`lmm-170m`, `lmm-340m`, `lmm-760m`) from `ablations-170m`; cluster
 and GPU topology remain properties of each run rather than separate projects.
+
+Each completed full-run segment measures its optimizer-step throughput and
+adjusts the next segment by at most 25%, targeting 13,200 seconds (3h40m) of
+the four-hour allocation. This preserves a 20-minute checkpoint/runtime
+margin while adapting `max_steps_per_run` to B200, B300, or GB200 throughput.
+The global `max_steps` and cosine schedule never change.
