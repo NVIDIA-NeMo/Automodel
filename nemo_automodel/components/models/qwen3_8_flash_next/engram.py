@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 import torch
 import torch.distributed as dist
@@ -343,13 +343,32 @@ class Qwen3_8_FlashNextOwnerShardedEmbedding(nn.Module):
         self.mark_sharding_contract()
         self.reset_parameters()
 
+    def _apply(
+        self, fn: Callable[[torch.Tensor], torch.Tensor], recurse: bool = True
+    ) -> Qwen3_8_FlashNextOwnerShardedEmbedding:
+        """Restore ownership metadata after a module device or dtype conversion.
+
+        Args:
+            fn: Tensor conversion applied by ``Module.to`` or ``Module.to_empty``.
+            recurse: Whether to convert child modules as well.
+
+        Returns:
+            This module after the normal PyTorch conversion, with the current
+            row-sharded weight marked for owner-gradient averaging. Shapes,
+            placements and values follow ``fn`` without an additional copy.
+        """
+        result = super()._apply(fn, recurse=recurse)
+        self.mark_sharding_contract()
+        return result
+
     def mark_sharding_contract(self) -> None:
         """Stamp the model-owned contract on the current weight.
 
-        Meta materialization and dtype casting can replace the Parameter
-        object, and custom tensor attributes do not survive that replacement,
-        so the top-level model calls this again afterwards.  The single-rank
-        reference table (plain Parameter, no process group) needs no contract.
+        DTensor conversion can discard custom attributes even when PyTorch
+        preserves the Parameter identity. Ordinary module conversions restore
+        the marker through ``_apply``. Custom parameter-only materialization
+        bypasses that method, so model initialization stamps it afterwards.
+        The single-rank reference table needs no contract.
         """
         if isinstance(self.weight, DTensor):
             self.weight._nemo_model_owned_grad_divisor = float(self.owner_world_size)

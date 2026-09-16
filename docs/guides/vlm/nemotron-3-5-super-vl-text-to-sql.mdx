@@ -1,0 +1,452 @@
+---
+title: "Nemotron 3.5 Super VL: Text-to-SQL with LoRA"
+description: "LoRA fine-tune Nemotron 3.5 Super VL on Spider so it answers natural-language questions with SQL for databases it has never seen, then evaluate on the Spider validation split."
+position: 16
+---
+**A step-by-step guide for LoRA fine-tuning Nemotron 3.5 Super VL (121B hybrid Mamba and Attention
+Mixture-of-Experts (MoE) VLM) on [Spider](https://huggingface.co/datasets/xlangai/spider), a cross-domain
+text-to-SQL dataset, using [NeMo AutoModel](https://github.com/NVIDIA-NeMo/Automodel). The whole run fits
+on a single node of 8 H100; inference and evaluation use the Spider validation split, whose databases never
+appear in training.**
+
+---
+
+## What is Nemotron 3.5 Super VL?
+
+Nemotron 3.5 Super VL (`nvidia/NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained`, architecture
+`NemotronH_Omni_Reasoning_V3`) is the 121B member of the Nemotron 3.5 family: a NemotronV3 hybrid backbone
+(88 layers: 40 Mamba2, 8 attention, 40 MoE with 512 routed experts and top-22 routing) with a RADIO v2.5-H
+vision encoder. This guide uses it as a text-only model: the vision tower is loaded but never receives an
+image. See the [model coverage page](/model-coverage/omni/nvidia/nemotron-3-5-super-vl) for the
+architecture details and the other recipes.
+
+## Text-to-SQL on Spider
+
+Spider contains 10,181 natural-language questions over 200 databases spanning 138 domains. The Hugging Face
+release ships the questions and gold SQL for 7,000 training questions (140 databases) and 1,034 validation
+questions (20 databases). The two sets of databases are disjoint, so the validation split measures how
+well the model writes SQL for schemas it has never seen.
+
+| Column | Example |
+|--------|---------|
+| `db_id` | `department_management` |
+| `question` | How many heads of the departments are older than 56 ? |
+| `query` | `SELECT count(*) FROM head WHERE age > 56` |
+
+The **base model** answers such a question with a paragraph of reasoning that might not end in a
+query. After fine-tuning, it outputs **exactly one SQL query** against the schema it is given.
+
+## Guide Overview
+
+| Step | Description |
+|------|-------------|
+| **Step 0** | Environment setup |
+| **Step 1** | Explore Spider and render the database schemas |
+| **Step 2** | LoRA training configuration |
+| **Step 3** | Launch fine-tuning on one node |
+| **Step 4** | Run inference and evaluation on unseen databases |
+| **Step 5** | Results |
+
+## Hardware Requirements
+
+- **1 node x 8 H100 80 GB** (512 experts sharded with `ep_size=8`; `cp_size=1` so the 8-question global
+  batch is one question per data-parallel rank)
+- **Memory**: ~36 GiB per GPU. The frozen base weights need no fp32 master copy or optimizer state; only the
+  177M LoRA parameters carry fp32 master weights and Adam moments.
+- **Training time**: ~15 min for 400 steps (3,200 of the 7,000 training questions), including four
+  validation passes over the 1,034 validation questions and adapter-only checkpoints (~355 MB each)
+
+---
+
+## Step 0 — Set Up the Environment
+
+```bash
+# Inside the NeMo AutoModel container (26.04+):
+cd /opt/Automodel
+uv pip install --python /opt/venv/bin/python ".[vlm-media]"
+
+# Or from a source checkout:
+git clone https://github.com/NVIDIA-NeMo/Automodel.git
+cd Automodel
+uv sync --locked --all-groups --all-extras
+```
+
+<Note>
+Nemotron 3.5 Super VL requires `mamba_ssm` and `causal_conv1d` (the `cuda` extra, pre-built in the
+NeMo AutoModel container), Transformer Engine (`attn: te`, `linear: te`), and DeepEP for expert dispatch.
+The checkpoint is ~232 GB in bf16 (63 safetensors shards); download it into `$HF_HOME` before launching
+so that all 8 ranks read from the shared cache.
+
+</Note>
+
+---
+
+## Step 1 — Explore Spider and Render the Database Schemas
+
+The Spider rows carry only `db_id`, `question`, and `query`; the database schemas come from
+[`richardr1126/spider-schema`](https://huggingface.co/datasets/richardr1126/spider-schema), one row per
+database with its tables, columns, column types, primary keys, and foreign keys.
+
+```python
+from datasets import load_dataset
+
+spider = load_dataset("xlangai/spider")
+schemas = load_dataset("richardr1126/spider-schema", split="train")
+
+print(f"train      : {len(spider['train'])} questions over {len(set(spider['train']['db_id']))} databases")
+print(f"validation : {len(spider['validation'])} questions over {len(set(spider['validation']['db_id']))} databases")
+print(f"schemas    : {len(schemas)} databases")
+
+row = spider["train"][0]
+print(row["db_id"], "|", row["question"], "|", row["query"])
+print(schemas.filter(lambda r: r["db_id"] == row["db_id"])[0]["Schema (values (type))"])
+```
+
+Expected output:
+```
+train      : 7000 questions over 140 databases
+validation : 1034 questions over 20 databases
+schemas    : 166 databases
+department_management | How many heads of the departments are older than 56 ? | SELECT count(*) FROM head WHERE age  >  56
+department : Department_ID (number) , Name (text) , Creation (text) , Ranking (number) , Budget_in_Billions (number) , Num_Employees (number) | head : head_ID (number) , name (text) , born_state (text) , age (number) | management : department_ID (number) , head_ID (number) , temporary_acting (text)
+```
+
+### Schema as CREATE TABLE Statements
+
+`make_spider_dataset` (in `nemo_automodel.components.datasets.vlm.datasets`) renders every database as
+`CREATE TABLE` statements with primary and foreign keys (`spider_schema_to_ddl`), puts the schema and the
+question into the user turn, and uses the gold query (whitespace collapsed) as the assistant turn:
+
+```python
+from nemo_automodel.components.datasets.vlm.datasets import make_spider_dataset
+
+train = make_spider_dataset(split="train")
+user_turn, assistant_turn = train[0]["conversation"]
+print(user_turn["content"][0]["text"])
+print("->", assistant_turn["content"][0]["text"])
+```
+
+```
+Given the SQL schema:
+CREATE TABLE department (Department_ID NUMBER, Name TEXT, Creation TEXT, Ranking NUMBER, Budget_in_Billions NUMBER, Num_Employees NUMBER, PRIMARY KEY (Department_ID))
+CREATE TABLE head (head_ID NUMBER, name TEXT, born_state TEXT, age NUMBER, PRIMARY KEY (head_ID))
+CREATE TABLE management (department_ID NUMBER, head_ID NUMBER, temporary_acting TEXT, PRIMARY KEY (department_ID), FOREIGN KEY (head_ID) REFERENCES head(head_ID), FOREIGN KEY (department_ID) REFERENCES department(Department_ID))
+
+Write the SQL query that answers this question: How many heads of the departments are older than 56 ?
+-> SELECT count(*) FROM head WHERE age > 56
+```
+
+A training sample is 371 tokens on average (95th percentile 904, maximum 1,839); the SQL answer is 30 tokens
+on average. `max_length: 2048` in the recipe therefore never truncates.
+
+---
+
+## Step 2 — LoRA Training Configuration
+
+**Config file**: `examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_spider_peft.yaml`
+
+```yaml
+recipe: FinetuneRecipeForVLM
+
+step_scheduler:
+  global_batch_size: 8
+  local_batch_size: 1
+  ckpt_every_steps: 100
+  val_every_steps: 100
+  max_steps: 400
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
+  pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained
+  trust_remote_code: true
+  num_nextn_predict_layers: 0
+  torch_dtype: torch.bfloat16
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: te
+    linear: te
+    rms_norm: torch_fp32
+    rope_fusion: false
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  match_all_linear: false
+  exclude_modules:
+    - "*vision_tower*"
+    - "*vision_model*"
+    - "*vision_projector*"
+    - "*audio*"
+    - "*sound*"
+    - "*lm_head*"
+    - "*mlp1*"
+  dim: 64
+  alpha: 128
+  use_triton: true
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: vlm_checkpoints/nemotron_3_5_super_vl_spider_peft
+  model_save_format: safetensors
+  save_consolidated: false    # LoRA checkpoints hold the adapter weights only
+
+distributed:
+  strategy: fsdp2
+  cp_size: 1            # dp 8 on 8 GPUs -> one question per rank per step
+  ep_size: 8            # 512 MoE experts across 8 GPUs
+  activation_checkpointing: true
+  reshard_after_forward: true
+  moe:
+    reshard_after_forward: true
+
+freeze_config:
+  freeze_vision_tower: true
+  freeze_audio_tower: true
+  freeze_language_model: false
+
+dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_spider_dataset
+  path_or_dataset: xlangai/spider
+  schema_dataset: richardr1126/spider-schema
+  split: train
+
+dataloader:
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.nemotron_omni_collate_fn
+    max_length: 2048
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_spider_dataset
+  path_or_dataset: xlangai/spider
+  schema_dataset: richardr1126/spider-schema
+  split: validation
+
+optimizer:
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+  lr: 2e-4
+  weight_decay: 0.01
+  betas: [0.9, 0.95]
+  master_weights: true              # fp32 master copy of the bf16 LoRA weights
+  store_param_remainders: true
+  exp_avg_dtype: torch.bfloat16
+  exp_avg_sq_dtype: torch.bfloat16
+```
+
+Rank-64 LoRA adapters are trained on 272 LLM linear projections (177M parameters, 0.15% of the model).
+The targets include Mamba `in_proj`/`out_proj`; attention `q_proj`/`k_proj`/`v_proj`/`o_proj`; MoE latent
+projections; and shared-expert MLPs. The vision tower, projector, and `lm_head` are excluded.
+
+### Collate Function
+
+The collate function applies the chat template to each conversation (which adds the `<think></think>`
+prefix for the assistant turn), tokenizes it, and masks everything but the assistant turn in the labels,
+so the loss is computed on the SQL tokens only.
+
+---
+
+## Step 3 — Launch Fine-Tuning
+
+On one node with 8 GPUs:
+
+```bash
+srun --nodes=1 --ntasks-per-node=8 --gpus-per-node=8 \
+    python examples/vlm_finetune/finetune.py \
+    -c examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_spider_peft.yaml
+```
+
+You can also launch it on any 8-GPU machine with the `automodel` launcher: `automodel examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_spider_peft.yaml --nproc-per-node 8`.
+W&B logging is opt-in: add `--wandb.enable=true --wandb.entity=<entity> --wandb.project=<project>`.
+
+### Training Log
+
+```
+Trainable parameters: 177,012,736
+Trainable parameters percentage: 0.15%
+
+step    0 | loss 0.5729 | grad_norm  6.86 | lr 2.00e-04 | mem 35.70 GiB
+step   10 | loss 0.4061 | grad_norm  2.26 | lr 2.00e-04 | mem 35.86 GiB
+step   50 | loss 0.1959 | grad_norm  0.96 | lr 2.00e-04 | mem 35.86 GiB
+step  100 | loss 0.1039 | grad_norm  0.56 | lr 2.00e-04 | mem 35.86 GiB
+step  200 | loss 0.1429 | grad_norm  0.92 | lr 2.00e-04 | mem 35.86 GiB
+step  300 | loss 0.0813 | grad_norm  0.47 | lr 2.00e-04 | mem 35.86 GiB
+step  399 | loss 0.2095 | grad_norm  1.03 | lr 2.00e-04 | mem 35.86 GiB
+
+Validation:
+  step  99 | val_loss 0.2298  <-- LOWEST_VAL
+  step 199 | val_loss 0.2349
+  step 299 | val_loss 0.2490
+  step 399 | val_loss 0.2480
+```
+
+The 400-step run takes about 15 min on 8 H100, including the four validation passes. Training loss keeps falling while
+validation loss on the unseen databases is lowest after the first 100 steps and then drifts up slightly.
+Step 5 shows that the later checkpoints nevertheless decode more queries correctly, so evaluate both.
+
+### Checkpoints Saved
+
+```
+vlm_checkpoints/nemotron_3_5_super_vl_spider_peft/
+  epoch_0_step_99/
+    model/
+      adapter_model.safetensors   # LoRA A/B matrices, ~355 MB
+      adapter_config.json
+    optim/
+    rng/
+    dataloader/
+  epoch_0_step_199/
+  epoch_0_step_299/
+  epoch_0_step_399/
+  LATEST -> epoch_0_step_399
+  LOWEST_VAL -> epoch_0_step_99
+  training.jsonl
+  validation.jsonl
+```
+
+A checkpoint is written every `ckpt_every_steps` (100) steps and at the final step; each holds only the
+adapter weights, so the whole run needs about 1.5 GB of disk.
+
+---
+
+## Step 4 — Run Inference and Evaluation
+
+Load the base checkpoint across all visible GPUs (`device_map="auto"`; the bf16 weights need ~232 GB, so use
+one node with 8x H100), fold the LoRA adapter into the base weights (`W += (B @ A) * alpha / r`), and greedy-decode
+validation questions with the training prompt. Each prediction is scored against the gold query after
+normalization (lower-cased, whitespace collapsed, trailing `;` removed):
+
+- **exact match** — normalized prediction identical to the normalized gold query
+- **similarity** — normalized sequence similarity (difflib ratio; 1.0 = identical)
+
+Spider's validation split is ordered by database, so the snippet takes every 51st question to cover
+many databases in a small sample.
+
+```python
+import difflib, json, re
+from pathlib import Path
+
+import torch
+from safetensors import safe_open
+from transformers import AutoModel, AutoProcessor
+
+from datasets import load_dataset
+from nemo_automodel.components.datasets.vlm.datasets import TEXT_TO_SQL_PROMPT, spider_schema_to_ddl
+
+BASE = "nvidia/NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained"
+ADAPTER = "vlm_checkpoints/nemotron_3_5_super_vl_spider_peft/LATEST/model"  # pragma: allowlist secret
+NUM_SAMPLES, STRIDE = 20, 51
+
+processor = AutoProcessor.from_pretrained(BASE, trust_remote_code=True)
+model = AutoModel.from_pretrained(BASE, trust_remote_code=True, torch_dtype=torch.bfloat16, device_map="auto")
+model.vision_model.radio_model.summary_idxs = None  # non-persistent RADIO buffer; can be a meta tensor after load
+model.eval()
+
+# Fold the LoRA adapter into the base weights.
+cfg = json.loads((Path(ADAPTER) / "adapter_config.json").read_text())
+scale = cfg["lora_alpha"] / cfg["r"]
+pairs = {}
+with safe_open(str(Path(ADAPTER) / "adapter_model.safetensors"), framework="pt") as f:
+    for key in f.keys():
+        m = re.match(r"^(?:base_model\.model\.)?(.+)\.lora_(A|B)\.weight$", key)
+        if m:
+            pairs.setdefault(m.group(1), {})[m.group(2)] = f.get_tensor(key)
+modules = dict(model.named_modules())
+with torch.no_grad():
+    for fqn, ab in pairs.items():
+        weight = modules[fqn].weight
+        delta = (ab["B"].to(weight.device, torch.float32) @ ab["A"].to(weight.device, torch.float32)) * scale
+        weight.add_(delta.to(weight.dtype))
+print(f"merged {len(pairs)} LoRA modules")
+
+validation = load_dataset("xlangai/spider", split="validation")
+schemas = {row["db_id"]: spider_schema_to_ddl(row) for row in load_dataset("richardr1126/spider-schema", split="train")}
+PROCESSOR_METADATA_KEYS = ("num_patches", "num_tokens", "imgs_sizes")  # not generate() kwargs
+
+
+def normalize_sql(sql):
+    return re.sub(r"\s+", " ", sql.strip().rstrip(";").strip()).lower()
+
+
+@torch.no_grad()
+def predict(db_id, question, max_new_tokens=256):
+    prompt = TEXT_TO_SQL_PROMPT.format(context=schemas[db_id], question=question.strip())
+    text = processor.tokenizer.apply_chat_template(
+        [{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True, enable_thinking=False
+    )
+    inputs = processor(text=text, return_tensors="pt")
+    for key in PROCESSOR_METADATA_KEYS:
+        inputs.pop(key, None)
+    device = next(model.parameters()).device
+    inputs = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in inputs.items()}
+    output_ids = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
+    return processor.tokenizer.decode(output_ids[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True).strip()
+
+
+exact, similarity = 0, 0.0
+for i in range(0, len(validation), STRIDE)[:NUM_SAMPLES]:
+    row = validation[i]
+    target, pred = normalize_sql(row["query"]), normalize_sql(predict(row["db_id"], row["question"]))
+    ratio = difflib.SequenceMatcher(None, pred, target).ratio()
+    exact += pred == target
+    similarity += ratio
+    print(f"[{i}] {row['db_id']} exact={pred == target} similarity={ratio:.3f}\n  target: {target}\n  pred:   {pred}")
+
+print(f"exact match {exact}/{NUM_SAMPLES} | mean similarity {similarity / NUM_SAMPLES:.3f}")
+```
+
+Skipping the merge block scores the un-tuned base model the same way.
+
+**Resources:** One node with 8x H100 (bf16 weights spread over the GPUs).
+**Runtime:** About 2–4 min to load the base checkpoint, then about 3.4 s per question for the fine-tuned
+model (greedy, up to 256 new tokens). The un-tuned base model takes about 16 s per question because it writes
+a paragraph of reasoning before (or instead of) the query.
+
+---
+
+## Step 5 — Results
+
+### Evaluation on 20 Spider Validation Questions (13 Unseen Databases)
+
+| Model | Exact Match | Mean Similarity | Median Similarity | Similarity above 0.9 |
+|---|---|---|---|---|
+| Base (`NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained`) | 0/20 | 0.140 | 0.141 | 0/20 |
+| LoRA, step 99 (`LOWEST_VAL`, val loss 0.230) | 7/20 | 0.847 | 0.956 | 12/20 |
+| LoRA, step 399 (`LATEST`, val loss 0.248) | **10/20** | **0.905** | **0.984** | **14/20** |
+
+The base model never returns a bare query: it reasons about the schema in prose ("We need to count the number
+of singers. The table singer has Singer_ID as primary key. So we can count distinct Singer_ID or just count
+rows...") and, when it does write SQL, wraps it in a code fence. After LoRA fine-tuning, every prediction is a
+single SQL statement against the given schema.
+
+Exact string match understates the fine-tuned model: of the 10 step-399 mismatches, 7 are semantically
+equivalent queries (the two joined tables listed in the other order with aliases swapped, single instead of
+double quotes, `ORDER BY ... LIMIT 1` instead of a `min()` subquery, an explicit `ASC`, grouping by the id
+column instead of the name column). The remaining 3 are genuine errors (a wrong column such as `Maker` for
+`Make`, one extra selected column, and a mis-specified nested query). Spider's official metric is execution
+accuracy against the SQLite databases, which are not part of the Hugging Face release; the normalized exact
+match and similarity above are a conservative proxy.
+
+### Sample Predictions (Fine-Tuned, Step 399, `LATEST`)
+
+| Database | Question | Prediction Compared to Gold Query | Similarity |
+|----------|----------|---------------------------|------------|
+| `concert_singer` | How many singers do we have? | Exact match | 1.00 |
+| `pets_1` | Find number of pets owned by students who are older than 20. | Same join, tables listed in the other order (aliases swapped) | 0.90 |
+| `car_1` | What is the maker of the car produced in the earliest year and what year was it? | `Maker` column instead of `Make`; `ORDER BY Year LIMIT 1` instead of a `min()` subquery | 0.82 |
+| `car_1` | In which years were cars produced weighing no less than 3000 and no more than 4000? | Exact match | 1.00 |
+| `flight_2` | Count the number of flights departing from 'APG'. | Single quotes instead of double quotes around the literal | 0.96 |
+| `cre_Doc_Template_Mgt` | Count the number of different templates used for documents. | Exact match | 1.00 |
+| `course_teach` | What are the names of the teachers who teach at least two courses? | `GROUP BY` the teacher id instead of the teacher name | 0.95 |
+| `student_transcripts_tracking` | How many courses are there? | Exact match | 1.00 |
+
+### Summary
+
+| | LoRA PEFT |
+|---|---|
+| Trainable params | 177M (0.15%), rank 64 / alpha 128 |
+| Learning rate | 2e-4 (TE FusedAdam, fp32 master weights) |
+| GPU memory | ~36 GiB / GPU (8 GPUs) |
+| Training time | ~15 min for 400 steps on 1x8 H100 |
+| Validation loss | 0.230 (step 99) to 0.248 (step 399) |
+| Checkpoint size | ~355 MB per adapter |
+| Exact matches (20 val questions, unseen databases) | 0/20 base to 7/20 at step 99 to 10/20 at step 399 |
