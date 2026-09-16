@@ -544,7 +544,8 @@ def _float32_rms_norm_meta(x: torch.Tensor, weight: torch.Tensor, eps: float) ->
     Returns:
         Tensor of shape [..., hidden] with x's dtype and device.
     """
-    return torch.empty_like(x)
+    # Native RMSNorm can choose a different output layout on CPU and CUDA.
+    return torch.nn.functional.rms_norm(x.float(), (x.shape[-1],), weight.float(), eps).to(x.dtype)
 
 
 @register_sharding(torch.ops.nemo_automodel.float32_rms_norm.default)

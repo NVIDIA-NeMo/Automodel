@@ -57,15 +57,27 @@ def test_float32_rms_norm_forward_and_gradients(shape, dtype, trainable):
             assert result.grad is None
 
 
-@pytest.mark.parametrize("noncontiguous", [False, True])
+@pytest.mark.parametrize("layout", ["contiguous", "transposed", "strided_hidden"])
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA layout validation requires a GPU"),
+        ),
+    ],
+)
 # opcheck includes AOTAutograd compilation, which exceeds the default 5 seconds.
 @pytest.mark.timeout(60)
-def test_float32_rms_norm_custom_op_contract(noncontiguous):
-    x = torch.randn(3, 2, 7)
-    if noncontiguous:
+def test_float32_rms_norm_custom_op_contract(layout, device):
+    x = torch.randn(3, 2, 14 if layout == "strided_hidden" else 7, device=device)
+    if layout == "transposed":
         x = x.transpose(0, 1)
+    elif layout == "strided_hidden":
+        x = x[..., ::2]
     x.requires_grad_()
-    weight = torch.randn(7, requires_grad=True)
+    weight = torch.randn(7, device=device, requires_grad=True)
     torch.library.opcheck(torch.ops.nemo_automodel.float32_rms_norm.default, (x, weight, 1e-5))
 
 
