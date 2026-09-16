@@ -454,6 +454,9 @@ def test_blackwell_submitter_resolves_portable_topology():
 
     assert "--total-gpus \"$TOTAL_GPUS\"" in submitter
     assert "--gpu-family blackwell" in submitter
+    assert "--require-shared-root" in submitter
+    assert "SHARED_ROOT=${TARGET[5]}" in submitter
+    assert "MOUNT_ROOT=${TITANS_MOUNT_ROOT:-/lustre}" in submitter
     assert "job recommend-target" in submitter
     assert "--nodes \"$SUBMIT_NODES\"" in submitter
     assert "TITANS_TRAIN_NODES=%q" in submitter

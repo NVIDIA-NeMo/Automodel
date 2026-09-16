@@ -83,6 +83,7 @@ RECOMMENDATION=$(slurm-cli --json job recommend-target \
   --name "titans-${SCALE}-${VARIANT}-${MODE}" \
   --total-gpus "$TOTAL_GPUS" \
   --gpu-family blackwell \
+  --require-shared-root \
   --cpus-per-task 128 \
   --memory 0 \
   --time 4:00:00)
@@ -96,6 +97,7 @@ print(data["account"])
 print(data["requested_nodes"])
 print(data["requested_gpus_per_node"])
 print(data.get("detected_gpu_type") or "unknown")
+print(data["work_root"])
 ' <<<"$RECOMMENDATION"
 )
 CLUSTER=${TARGET[0]}
@@ -103,12 +105,15 @@ ACCOUNT=${TARGET[1]}
 NODES=${TARGET[2]}
 GPUS_PER_NODE=${TARGET[3]}
 GPU_TYPE=${TARGET[4]}
+SHARED_ROOT=${TARGET[5]}
 
-PROFILE=$(slurm-cli --json config show "$CLUSTER")
-USER_ROOT=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["user_root"])' <<<"$PROFILE")
-REMOTE_ROOT=${TITANS_REMOTE_ROOT:-$USER_ROOT/titans-automodel}
+if [[ $SHARED_ROOT != /lustre/* ]]; then
+  echo "refusing non-Lustre work root for $CLUSTER / $ACCOUNT: $SHARED_ROOT" >&2
+  exit 1
+fi
+REMOTE_ROOT=${TITANS_REMOTE_ROOT:-$SHARED_ROOT/titans-automodel}
 REMOTE_CHECKOUT=$REMOTE_ROOT/checkouts/$LOCAL_SHA
-MOUNT_ROOT=${TITANS_MOUNT_ROOT:-$USER_ROOT}
+MOUNT_ROOT=${TITANS_MOUNT_ROOT:-/lustre}
 
 WANDB_STATUS=$(slurm-cli --cluster "$CLUSTER" shell \
   'if grep -qs "api.wandb.ai" "$HOME/.netrc" 2>/dev/null; then echo ready; else echo missing; fi')
