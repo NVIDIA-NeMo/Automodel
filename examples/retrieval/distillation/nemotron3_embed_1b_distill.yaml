@@ -41,7 +41,7 @@ tokenizer:
   pretrained_model_name_or_path: <your_path>
   add_eos_token: false
   padding_side: left
-  force_hf: true
+  tokenizer_backend: transformers_auto
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader

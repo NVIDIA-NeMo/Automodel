@@ -246,6 +246,16 @@ def _resolve_custom_model_cls_for_config(config):
 
             return HyMT2ForCausalLM
 
+    # This architecture name is shared with the Mistral4 implementation in the
+    # registry, so try the Ministral3-backed VLM implementation first.
+    if arch_name == "Mistral3ForConditionalGeneration":
+        from nemo_automodel.components.models.mistral3_vlm.model import (
+            Mistral3FP8VLMForConditionalGeneration,
+        )
+
+        if Mistral3FP8VLMForConditionalGeneration.supports_config(config):
+            return Mistral3FP8VLMForConditionalGeneration
+
     if not ModelRegistry.has_custom_model(arch_name):
         return None
 
@@ -995,7 +1005,7 @@ def _init_model_bnb_streaming(
     with no_init_weights(), init_empty_weights():
         model = cls._from_config_parent_class(
             hf_config,
-            torch_dtype=torch_dtype,
+            dtype=torch_dtype,
             attn_implementation=attn_implementation,
         )
 
@@ -1239,7 +1249,7 @@ def __init_model(
                 model = cls._from_pretrained_parent_class(
                     pretrained_model_name_or_path,
                     *model_args,
-                    torch_dtype=torch_dtype,
+                    dtype=torch_dtype,
                     attn_implementation=attn_implementation,
                     **kwargs,
                 )
@@ -1256,7 +1266,7 @@ def __init_model(
             model = cls._from_config_parent_class(
                 hf_config,
                 *model_args,
-                torch_dtype=torch_dtype,
+                dtype=torch_dtype,
                 attn_implementation=attn_implementation,
                 **kwargs,
             )
@@ -1347,7 +1357,7 @@ def __init_model(
             model = cls._from_pretrained_parent_class(
                 pretrained_model_name_or_path,
                 *model_args,
-                torch_dtype=torch_dtype,
+                dtype=torch_dtype,
                 attn_implementation=attn_implementation,
                 **kwargs,
             )
@@ -1364,7 +1374,7 @@ def __init_model(
         model = cls._from_config_parent_class(
             hf_config,
             *model_args,
-            torch_dtype=torch_dtype,
+            dtype=torch_dtype,
             attn_implementation=attn_implementation,
             **kwargs,
         )

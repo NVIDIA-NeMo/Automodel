@@ -20,6 +20,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+import nemo_automodel.components.training.utils as training_utils
 from nemo_automodel.components.training.utils import (
     ScopedModuleOffloading,
     _all_reduce_scalar,
@@ -29,6 +30,10 @@ from nemo_automodel.components.training.utils import (
     move_to_device,
     scale_grads_and_clip_grad_norm,
 )
+
+# Over the default 5s budget on purpose: this module spawns worker processes; every child re-imports torch from scratch.
+# Shrink the work or the process count before raising this further.
+pytestmark = pytest.mark.timeout(60)
 
 
 def test_docstring_example():
@@ -634,9 +639,8 @@ class TestScaleGradsAndClipGradNorm:
 
         # Base EP divisor = 4/2 = 2; replicated TP tokens add another 2.
         assert torch.allclose(expert_param.grad, torch.ones_like(expert_param) * 2.0)
-        # Router/dense replicas stay identical across TP ranks via the
-        # fail-closed identical-pretrained-weights invariant (no separate
-        # sync) and must never receive the expert-only divisor.
+        # Router/dense replicas must never receive the expert-only divisor;
+        # their TP synchronization is owned separately at the optimizer boundary.
         assert torch.allclose(model.gate.weight.grad, torch.ones_like(model.gate.weight) * 8.0)
 
     @pytest.mark.parametrize(
