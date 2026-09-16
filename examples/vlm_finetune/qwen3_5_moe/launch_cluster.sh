@@ -27,6 +27,8 @@ for v in NCCL_DEBUG NCCL_ALGO NCCL_PROTO NCCL_CROSS_NIC NCCL_NVLS_ENABLE \
 done
 
 # node_rank -> private IP. Rank 0 is this box (the NFS server and rendezvous master).
+# Spot hosts are re-provisioned: re-check these addresses (and the SSH user below) after
+# every re-provisioning, and keep them in sync with teardown.sh and MASTER_ADDR.
 NODE_IPS=(10.30.0.2 10.30.0.4 10.30.0.3 10.30.0.7)
 
 STAMP=$(date +%Y%m%d_%H%M%S)

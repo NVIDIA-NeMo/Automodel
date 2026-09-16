@@ -10,6 +10,8 @@
 set -uo pipefail
 
 RUN_NAME=${RUN_NAME:-affine}
+# Same order as NODE_IPS in launch_cluster.sh; re-check after every Spot re-provisioning.
+# Every host listed here gets torchrun/nemo pkill -9, so trim it when other hosts are busy.
 NODE_IPS=(10.30.0.2 10.30.0.4 10.30.0.3 10.30.0.7)
 
 for rank in "${!NODE_IPS[@]}"; do

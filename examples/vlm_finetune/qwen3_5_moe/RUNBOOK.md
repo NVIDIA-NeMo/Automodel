@@ -97,7 +97,7 @@ worst-case batch shape, so memory behaviour carries over unchanged between them.
 
 **Signal density (v4):** supervised final-turn lengths p50 163, p90 844, p99 1,685,
 max 1,801, mean 324 → 28.3M supervised tokens against 1.03B processed per epoch (2.8%),
-an artifact of last-turn-only supervision on turn-exploded data. See §12.4.
+an artifact of last-turn-only supervision on turn-exploded data. See §13.4.
 
 ---
 
@@ -135,6 +135,14 @@ unused here.
   `transformer-engine{,-cu13,-torch}==2.18.0`, `nvidia-cudnn-cu13>=9.23`. Build
   `transformer-engine-torch` with `NVTE_WITH_NCCL_EP=0` (its NCCL-EP code includes a
   header torch 2.10 lacks) and run `uv pip install` from **outside** the repo.
+- Build environment for the source packages (DeepEP, TE-torch, causal-conv1d,
+  nv-grouped-gemm) on SM 10.x: `TORCH_CUDA_ARCH_LIST="10.0;10.3"`,
+  `NVTE_CUDA_ARCHS="100;103"`, and `CPATH=$CUDA_HOME/include/cccl` — CUDA 13 moved CCCL
+  and DeepEP's host sources need it. `uv sync` has to run in two passes, because the MoE
+  extra contains source builds that need torch already installed: `--extra fla` first,
+  then `--extra moe`, then `--inexact ... --group dev`.
+- DeepEP itself works on B300 (`tests/test_intranode.py --num-processes 2` passes), so the
+  `dispatcher: hybridep` workaround from the `*_gb200.yaml` benchmarks is not needed.
 - Do **not** apt-install `libnvidia-ml-dev`: it pulls `libnvidia-compute-*` and wedges
   dpkg in a container. CUDA 13's `cuda-nvml-dev-13-0` already provides `nvml.h`.
 - The CUDA toolkit's `lib64` must not be on `LD_LIBRARY_PATH` at runtime — its cuBLASLt
@@ -266,9 +274,13 @@ run.**
   node's log and tears down immediately.
 - `save_consolidated: final` logs `v4_compatible=False`; a transformers-v4 load needs
   `--checkpoint.v4_compatible=True`.
-- Syncing the tree from Windows: `git archive` emits CRLF unless run with
-  `-c core.autocrlf=false`, and a CR in a launcher or YAML breaks the run confusingly
-  (`sed -i 's/\r$//'`).
+- **Suspect the hardware before the config** when a run dies with
+  `Invalid access of peer GPU memory over nvlink or a hardware error`. One B300 box failed
+  mid-session with all NVLinks down and pending uncorrectable retirements on GPU 0. Triage:
+  `nvidia-smi -q -d ECC,ROW_REMAPPER | grep -iE 'pending|uncorrectable'` (expect none),
+  `nvidia-smi nvlink -s` (links active on every GPU), then DeepEP's
+  `tests/test_intranode.py`. A node with pending repairs risks silent corruption over a
+  multi-day run — get it reset or replaced.
 
 ---
 
@@ -314,6 +326,30 @@ cuDNN/cuBLAS workspaces, CUDA context), none of it reclaimable — **judge headr
   the schedule, sets the effective step size.
 - Checkpointing and validation work at lbs 4: sharded save ~80 GB in ~64 s, consolidated
   export 26 shards / ~67 GiB; validation adds no memory beyond the training peak.
+
+Reproducing either arm on one node:
+
+```bash
+# worst-case fit test: 8 steps x 32 samples covers the 256 longest rows exactly once
+automodel examples/vlm_finetune/qwen3_5_moe/qwen3_6_35b_1node_ep8.yaml \
+  --nproc-per-node 8 --distributed.ep_size 8 \
+  --step_scheduler.local_batch_size 4 --step_scheduler.global_batch_size 32 \
+  --step_scheduler.max_steps 8 --lr_scheduler.lr_warmup_steps 1 \
+  --checkpoint.enabled false \
+  --dataset.path_or_dataset data/<corpus>_filtered/longest256.parquet
+
+# 50-step production-shape run, checkpointing and validation live
+automodel examples/vlm_finetune/qwen3_5_moe/qwen3_6_35b_1node_ep8.yaml \
+  --nproc-per-node 8 --distributed.ep_size 8 --step_scheduler.max_steps 50 \
+  --step_scheduler.val_every_steps 25 --step_scheduler.ckpt_every_steps 25 \
+  --lr_scheduler.lr_warmup_steps 50 --lr_scheduler.lr_decay_steps 5456
+```
+
+**Knobs already ruled out, so they need no re-investigation:** fused RoPE (force-disabled
+globally, upstream #3027), `compile_attn` (needs `attn: sdpa` + `linear: torch`), CUDA
+graphs (sequence lengths vary per micro-batch), the `rms_norm` backend (this model
+hard-codes `Qwen3NextRMSNorm`). Still unmeasured: `defer_fsdp_grad_sync`, `experts`
+`gmm`/`torch_mm`, `hybridep`, async dispatch, `dispatcher_num_sms`.
 
 ### 9.2 Two nodes, 16 × H200 (v4, length-grouped, AdamW8bit, full AC)
 
@@ -402,22 +438,56 @@ are below bf16 resolution.)
 
 ## 11. Running multi-node
 
-Cluster: `h200-32c-260914` in GCP `us-west1-c`, `a3-ultragpu-8g` nodes (8 × H200,
-224 vCPUs, 32 local NVMe, 2 gVNICs + 8 RoCE NICs `gpu{0..7}rdma0`). node-2 (10.30.0.2) is
-torchrun rank 0 and the NFS server; node-3 is 10.30.0.4.
+Cluster shape this was built for: 4 × GCP `a3-ultragpu-8g` Spot (8 × H200, 224 vCPUs,
+32 local NVMe, 2 gVNICs + 8 RoCE NICs `gpu{0..7}rdma0` / `rocep*s0`, MTU 8896), same zone,
+one shared SSH account.
+
+**The hosts are Spot and are re-provisioned; nothing below is a permanent address.** After
+every re-provisioning, update `NODE_IPS` in `launch_cluster.sh`, the same list in
+`teardown.sh`, the SSH user in both, and the `MASTER_ADDR` default in `launch_node.sh`.
+The structure is what is stable:
+
+- **torchrun rank order is the order of `NODE_IPS`, which is not the hosts' own numbering.**
+  Read that array, don't assume host *N* is rank *N*.
+- Rank 0 is the rendezvous master (`MASTER_ADDR`, port 29500) and the NFS server, and is
+  where `launch_cluster.sh` and the watchdog run.
+- `NNODES=2` means the first two entries of `NODE_IPS`.
+- Hosts not in the run may belong to someone else — `teardown.sh` SSHes **every** entry in
+  `NODE_IPS` and `pkill -9`s `torchrun` there, so a teardown during a 2-node job kills
+  whatever the other hosts are running. Trim the array before using it that way.
+
+> **Never `apt install` on a node of a live run.** On 2026-09-15 `sudo apt install gh` on
+> rank 0 let needrestart restart `systemd-networkd`, `rdma-ndd` and the guest agent; ~60 s
+> later every rank died with `ncclRemoteError` at step 2,344 of the v5_130k run and the
+> 120-minute NCCL timeout held all 32 GPUs. Install tools on the laptop, or wait for a
+> checkpoint boundary; if unavoidable, `sudo NEEDRESTART_MODE=l apt install ...`.
 
 Per-node storage: the 32 local SSDs are one RAID0 at `/mnt/fast` — **not in `/etc/fstab`**,
 so after a reboot re-assemble (`mdadm --assemble --scan`) and re-mount; spot preemption
-wipes it along with the image, data, Triton cache and checkpoints. `/mnt/fast/hf` is
-`HF_HOME` (local per node); node-2 exports `/mnt/fast/shared` over NFS (`nconnect=16`)
-holding the checkout, `.env`, `data/`, `logs/`, `checkpoints/` — so the recipe's relative
-paths resolve identically on every node, which DCP needs (each rank writes its own shards,
-rank 0 consolidates by reading all of them). Hugging Face rate-limits node-2's public IP
-(HTTP 429) even with a token: do all Hub traffic from node-3; the launcher sets
-`HF_HUB_OFFLINE=1`. Docker's data root is on `/mnt/fast` too (46 GB image).
+wipes the array outright, along with the image, data, Triton cache and checkpoints, and it
+has to be rebuilt:
 
 ```bash
-# 2 nodes: rank 0 (node-2) first, from /mnt/fast/shared/Automodel
+apt-get install -y docker.io nvidia-container-toolkit mdadm nfs-common ibverbs-utils
+nvidia-ctk runtime configure --runtime=docker && systemctl restart docker
+DEVS=$(lsblk -dn -b -o NAME,SIZE | awk '$2 == 402653184000 {print "/dev/"$1}')
+mdadm --create /dev/md0 --level=0 --raid-devices=32 $DEVS --run
+mkfs.ext4 -F -m 0 -E lazy_itable_init=1,lazy_journal_init=1 /dev/md0
+mkdir -p /mnt/fast && mount -o noatime /dev/md0 /mnt/fast
+# then: docker data-root -> /mnt/fast/docker, rebuild the deepep564 image, restore /mnt/fast/hf
+```
+
+`/mnt/fast/hf` is
+`HF_HOME` (local per node); rank 0 exports `/mnt/fast/shared` over NFS (`nconnect=16`)
+holding the checkout, `.env`, `data/`, `logs/`, `checkpoints/` — so the recipe's relative
+paths resolve identically on every node, which DCP needs (each rank writes its own shards,
+rank 0 consolidates by reading all of them). Docker's data root is on `/mnt/fast` too
+(46 GB image). Hugging Face has rate-limited one host's public IP (HTTP 429) even with a
+token, while the others were fine: if that happens, download on a host that works and copy
+over NFS. The launcher sets `HF_HUB_OFFLINE=1`.
+
+```bash
+# 2 nodes: rank 0 first, from the checkout on the NFS share
 bash examples/vlm_finetune/qwen3_5_moe/launch_node.sh 0 [--key.sub value ...]
 bash examples/vlm_finetune/qwen3_5_moe/launch_node.sh 1 [--key.sub value ...]
 
@@ -443,7 +513,28 @@ NCCL plugin (`/usr/local/gib/scripts/set_nccl_env.sh`),
 
 **Always sample `nvidia-smi` alongside the run**
 (`nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits -l 2 > memlog.csv`);
-`launch_cluster.sh` does it for you on every node.
+`launch_cluster.sh` does it for you on every node, into `logs/<RUN_NAME>-<stamp>/`.
+
+Watchdog and teardown, for any run left unattended:
+
+```bash
+# in a second shell on rank 0, after the run dir exists
+RUN_NAME=<name> FINAL_STEP=<last step> bash examples/vlm_finetune/qwen3_5_moe/oom_watchdog.sh
+
+# tearing down by hand: kill the watchdog first, or it fires on the way down
+pkill -f "[o]om_watchdog"
+RUN_NAME=<name> bash examples/vlm_finetune/qwen3_5_moe/teardown.sh
+```
+
+`RUN_NAME` must match the launch (it names the containers `<RUN_NAME>_node<rank>` and the
+run dir); `FINAL_STEP` is the last optimizer step, which is how the watchdog tells a
+finished run from a dead one. Note that `pkill -f <pattern>` run over `ssh` matches its own
+remote shell — hence the `[o]` bracket in every pattern in these scripts.
+
+Syncing the checkout to the nodes is normally `git pull` on the NFS share. From the Windows
+checkout use `git -c core.autocrlf=false archive HEAD | ssh ... tar -x`; a plain archive,
+`tar` or `scp` carries CRLF, which breaks the launchers and YAMLs confusingly. Keep the
+scripts mode 664 on the node (they are committed 100644) or git reports mode changes.
 
 > The cluster account is shared. Other sessions have installed packages under
 > `/mnt/fast/shared` and once deleted `/mnt/fast/hf/hub` (67 GB of base weights) with no
@@ -467,8 +558,12 @@ world size; on 2 GPUs (EP2) multiply it by 4.
 
 ## 13. Open questions
 
-1. **Resume from a multi-node checkpoint** (`checkpoint.restore_from`) has never been
-   exercised. Needed before trusting spot recovery.
+1. **Resume from a multi-node checkpoint** (`checkpoint.restore_from`, or the `LATEST`
+   symlink) has never been exercised end to end. Note that resuming an `AdamW8bit` run
+   needs commit `3e0ed2695` ("restore DTensor specs of torchao quantized optimizer state
+   on load") — without it the first step after a resume dies in `lerp`. On Spot hosts this
+   is the difference between a preemption costing an hour and costing the run, so it is
+   worth a deliberate kill-and-resume test rather than discovering it during a preemption.
 2. **The LR** is a judgement everywhere, not an A/B: clipping fires every step at 1e-5 in
    every configuration measured, the 2-node v4 config dropped to 5e-6, and the v6 runs
    from base use 5e-5 with a WSD schedule.
