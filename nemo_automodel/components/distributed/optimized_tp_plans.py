@@ -18,6 +18,8 @@ This module contains optimized tensor parallel plans for different model archite
 including LLaMA, Qwen, Gemma3, and Ministral3 models.
 """
 
+from __future__ import annotations
+
 from typing import TYPE_CHECKING, Callable, Dict, Union, cast
 
 import torch
@@ -30,23 +32,28 @@ from torch.distributed.tensor.parallel import (
 )
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
-# Import model classes for type checking and parallel plan mapping
-from transformers.models.gemma3.modeling_gemma3 import (
-    Gemma3ForCausalLM,
-    Gemma3ForConditionalGeneration,
-)
-from transformers.models.llama.modeling_llama import LlamaForCausalLM
-from transformers.models.mistral3.modeling_mistral3 import Mistral3ForConditionalGeneration
-from transformers.models.phi.modeling_phi import PhiForCausalLM
-from transformers.models.phi3.modeling_phi3 import Phi3ForCausalLM
-from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
-from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM, Qwen3ForSequenceClassification
+from nemo_automodel.components.distributed.parallel_styles import ReplicatedWithGradAllReduce
 
-from nemo_automodel.components.models.baichuan.model import BaichuanForCausalLM
-from nemo_automodel.components.models.llama.model import LlamaForCausalLM as CustomLlamaForCausalLM
-from nemo_automodel.components.models.mistral3_vlm.model import Mistral3FP8VLMForConditionalGeneration
-
+# These are needed only for annotations and for PARALLELIZE_FUNCTIONS keys. Importing
+# any one of them at module scope drags in the whole transformers model zoo --
+# transformers.models.gemma3 alone pulls sklearn -> pandas/scipy plus torchvision and
+# opentelemetry, which measured longer than `import torch` itself. The registry below
+# therefore spells the qualnames out as literals, the same trick already used for
+# qwen3_5 and falcon_h1.
 if TYPE_CHECKING:
+    from transformers.models.gemma3.modeling_gemma3 import (
+        Gemma3ForCausalLM,
+        Gemma3ForConditionalGeneration,
+    )
+    from transformers.models.llama.modeling_llama import LlamaForCausalLM
+    from transformers.models.phi.modeling_phi import PhiForCausalLM
+    from transformers.models.phi3.modeling_phi3 import Phi3ForCausalLM
+    from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
+    from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM, Qwen3ForSequenceClassification
+
+    # Same reason as above: these model modules import transformers' generation
+    # stack, which reaches sklearn. Only the qualnames are needed at runtime.
+    from nemo_automodel.components.models.baichuan.model import BaichuanForCausalLM
     from nemo_automodel.components.models.mistral3.model import Ministral3ForCausalLM
 
 
@@ -174,6 +181,8 @@ def _parallelize_gemma3(
     sequence_parallel: bool = False,
 ) -> dict[str, ParallelStyle]:
     """Parallelizes a Gemma3ForCausalLM model across data and tensor parallel dimensions."""
+    from transformers.models.gemma3.modeling_gemma3 import Gemma3ForConditionalGeneration
+
     if isinstance(model, Gemma3ForConditionalGeneration):
         model_prefix = "model.language_model"
     else:
@@ -183,6 +192,8 @@ def _parallelize_gemma3(
         f"{model_prefix}.embed_tokens": VocabParallelEmbedding(input_layouts=Replicate()),
         f"{model_prefix}.layers.*.self_attn.q_proj": ColwiseParallel(),
         f"{model_prefix}.layers.*.self_attn.k_proj": ColwiseParallel(),
+        f"{model_prefix}.layers.*.self_attn.q_norm": ReplicatedWithGradAllReduce(),
+        f"{model_prefix}.layers.*.self_attn.k_norm": ReplicatedWithGradAllReduce(),
         f"{model_prefix}.layers.*.self_attn.v_proj": ColwiseParallel(),
         f"{model_prefix}.layers.*.self_attn.o_proj": RowwiseParallel(),
         f"{model_prefix}.layers.*.mlp.up_proj": ColwiseParallel(),
@@ -509,13 +520,14 @@ def _parallelize_qwen(
             "model.layers.*.input_layernorm": SequenceParallelAllGatherActivation(),
             "model.layers.*.self_attn.q_proj": ColwiseParallel(),
             "model.layers.*.self_attn.k_proj": ColwiseParallel(),
+            "model.layers.*.self_attn.q_norm": ReplicatedWithGradAllReduce(),
+            "model.layers.*.self_attn.k_norm": ReplicatedWithGradAllReduce(),
             "model.layers.*.self_attn.v_proj": ColwiseParallel(),
             "model.layers.*.self_attn.qkv_proj": ColwiseParallel(),
             # Rowwise projections reduce-scatter back to sequence-sharded activations.
             "model.layers.*.self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1), use_local_output=False),
-            # NOTE: Qwen3 has `q_norm`/`k_norm` inside attention. These operate on the
-            # head-sharded outputs of q_proj/k_proj. Do NOT wrap them with SequenceParallel,
-            # which would incorrectly tag head-sharded activations as sequence-sharded.
+            # Qwen3 q_norm/k_norm operate independently on head-sharded Q/K.
+            # Their parameters stay replicated, while partial-head gradients sum.
             "model.layers.*.post_attention_layernorm": SequenceParallelAllGatherActivation(),
             "model.layers.*.mlp.up_proj": ColwiseParallel(),
             "model.layers.*.mlp.gate_proj": ColwiseParallel(),
@@ -531,6 +543,8 @@ def _parallelize_qwen(
             ),
             "model.layers.*.self_attn.q_proj": ColwiseParallel(),
             "model.layers.*.self_attn.k_proj": ColwiseParallel(),
+            "model.layers.*.self_attn.q_norm": ReplicatedWithGradAllReduce(),
+            "model.layers.*.self_attn.k_norm": ReplicatedWithGradAllReduce(),
             "model.layers.*.self_attn.v_proj": ColwiseParallel(),
             "model.layers.*.self_attn.qkv_proj": ColwiseParallel(),
             "model.layers.*.self_attn.o_proj": RowwiseParallel(),
@@ -576,6 +590,14 @@ def _parallelize_phi(
         "model.layers.*.mlp.fc2": RowwiseParallel(),
         "lm_head": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
     }
+
+    if model.config.qk_layernorm:
+        base_model_tp_plan.update(
+            {
+                "model.layers.*.self_attn.q_layernorm": ReplicatedWithGradAllReduce(),
+                "model.layers.*.self_attn.k_layernorm": ReplicatedWithGradAllReduce(),
+            }
+        )
 
     if sequence_parallel:
         base_model_sp_plan: dict[str, ParallelStyle] = {
@@ -720,10 +742,10 @@ def _parallelize_falcon_h1(
 
 # Keyed by qualified class name — see _get_class_qualname for why.
 PARALLELIZE_FUNCTIONS: Dict[str, Callable[..., Dict[str, ParallelStyle]]] = {
-    _get_class_qualname(BaichuanForCausalLM): _parallelize_baichuan,
-    _get_class_qualname(Qwen2ForCausalLM): _parallelize_qwen,
-    _get_class_qualname(Qwen3ForCausalLM): _parallelize_qwen,
-    _get_class_qualname(Qwen3ForSequenceClassification): _parallelize_qwen_classification,
+    "nemo_automodel.components.models.baichuan.model.BaichuanForCausalLM": _parallelize_baichuan,
+    "transformers.models.qwen2.modeling_qwen2.Qwen2ForCausalLM": _parallelize_qwen,
+    "transformers.models.qwen3.modeling_qwen3.Qwen3ForCausalLM": _parallelize_qwen,
+    "transformers.models.qwen3.modeling_qwen3.Qwen3ForSequenceClassification": _parallelize_qwen_classification,
     # Hard-coded qualname to avoid eagerly importing transformers.models.qwen3_5.
     "transformers.models.qwen3_5.modeling_qwen3_5.Qwen3_5ForConditionalGeneration": _parallelize_qwen3_5_vlm,
     # NeMo-native Qwen3.5 dense (custom-model port): same plan — shard self_attn +
@@ -739,19 +761,19 @@ PARALLELIZE_FUNCTIONS: Dict[str, Callable[..., Dict[str, ParallelStyle]]] = {
     # whose module path carries a snapshot hash.
     "transformers.models.falcon_h1.modeling_falcon_h1.FalconH1ForCausalLM": _parallelize_falcon_h1,
     "FalconH1ForCausalLM": _parallelize_falcon_h1,
-    _get_class_qualname(LlamaForCausalLM): _parallelize_llama,
+    "transformers.models.llama.modeling_llama.LlamaForCausalLM": _parallelize_llama,
     "nemo_automodel.components.models.mistral3.model.Ministral3ForCausalLM": _parallelize_ministral3,
     # Mistral3 VLM (Pixtral + Ministral3) — native HF class plus the Automodel
     # FP8-VLM subclass that owns FP8 dequant.
-    _get_class_qualname(Mistral3ForConditionalGeneration): _parallelize_mistral3_vlm,
-    _get_class_qualname(Mistral3FP8VLMForConditionalGeneration): _parallelize_mistral3_vlm,
+    "transformers.models.mistral3.modeling_mistral3.Mistral3ForConditionalGeneration": _parallelize_mistral3_vlm,
+    "nemo_automodel.components.models.mistral3_vlm.model.Mistral3FP8VLMForConditionalGeneration": _parallelize_mistral3_vlm,
     # gemma-3-1b-it uses Gemma3ForCausalLM since it is a text-only model
-    _get_class_qualname(Gemma3ForCausalLM): _parallelize_gemma3,
+    "transformers.models.gemma3.modeling_gemma3.Gemma3ForCausalLM": _parallelize_gemma3,
     # The larger gemma models use Gemma3ForConditionalGeneration, which are for text-image input
-    _get_class_qualname(Gemma3ForConditionalGeneration): _parallelize_gemma3,
-    _get_class_qualname(PhiForCausalLM): _parallelize_phi,
-    _get_class_qualname(Phi3ForCausalLM): _parallelize_phi3,
-    _get_class_qualname(CustomLlamaForCausalLM): _parallelize_llama,
+    "transformers.models.gemma3.modeling_gemma3.Gemma3ForConditionalGeneration": _parallelize_gemma3,
+    "transformers.models.phi.modeling_phi.PhiForCausalLM": _parallelize_phi,
+    "transformers.models.phi3.modeling_phi3.Phi3ForCausalLM": _parallelize_phi3,
+    "nemo_automodel.components.models.llama.model.LlamaForCausalLM": _parallelize_llama,
     # Register native Qwen classes without importing their checkpoint adapters into the distributed component.
     "nemo_automodel.components.models.qwen2.model.Qwen2ForCausalLM": _parallelize_qwen,
     "nemo_automodel.components.models.qwen3.model.Qwen3ForCausalLM": _parallelize_qwen,
