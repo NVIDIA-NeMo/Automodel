@@ -32,6 +32,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -425,7 +426,14 @@ class _StageWithoutCPPrepare:
     pass
 
 
-def _patch_pp_setup_minimals(monkeypatch, *, cp_size, stage0, dataloader_calls):
+def _patch_pp_setup_minimals(
+    monkeypatch,
+    *,
+    cp_size,
+    stage0,
+    dataloader_calls,
+    validation_loader_config=None,
+):
     monkeypatch.setattr(vlm_finetune, "AutoPipeline", _FakePPModel)
     monkeypatch.setattr(
         vlm_finetune,
@@ -497,7 +505,7 @@ def _patch_pp_setup_minimals(monkeypatch, *, cp_size, stage0, dataloader_calls):
     )
     monkeypatch.setattr(
         "nemo_automodel.recipes._typed_config.RecipeConfig.vlm_validation_dataloader",
-        property(lambda self: None),
+        property(lambda self: validation_loader_config),
     )
     monkeypatch.setattr(vlm_finetune, "ScopedRNG", lambda **kwargs: nullcontext())
     monkeypatch.setattr(
@@ -574,6 +582,123 @@ def test_setup_always_stages_pp_media_under_pp(
 
     assert dataloader_calls[0]["pp_n_microbatches"] == expected_pp_n_microbatches
     assert dataloader_calls[0]["cp_size"] == cp_size
+
+
+def test_setup_stages_pp_validation_media_and_preserves_packing_wiring(monkeypatch):
+    """The validation loader gets the same PP/packing wiring as the training loader.
+
+    Under PP the recipe now runs validation, so the validation batches must be
+    pre-chunked per microbatch and built against a resolved packing backend --
+    otherwise validation hits the raw-media row-chunking the training path fixed.
+    """
+    dataloader_calls = []
+    packing_resolutions = []
+    configure_packing_calls = []
+
+    def _resolve_validation_packing(**kwargs):
+        packing_resolutions.append(kwargs)
+        return "sdpa"
+
+    validation_loader_config = SimpleNamespace(
+        drop_last=True,
+        packing=SimpleNamespace(packing_format="neat"),
+        resolve_packing_attn_implementation=_resolve_validation_packing,
+        build=lambda **kwargs: (
+            dataloader_calls.append(kwargs) or SimpleNamespace(dataloader="val_dl", processor="processor")
+        ),
+    )
+    _patch_pp_setup_minimals(
+        monkeypatch,
+        cp_size=1,
+        stage0=_StageWithoutCPPrepare(),
+        dataloader_calls=dataloader_calls,
+        validation_loader_config=validation_loader_config,
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.components.models.common.packing.configure_packing",
+        lambda **kwargs: configure_packing_calls.append(kwargs),
+    )
+    trainer = FinetuneRecipeForVLM(_minimal_pp_setup_cfg())
+
+    trainer.setup()
+
+    assert len(dataloader_calls) == 2
+    validation_call = dataloader_calls[1]
+    assert validation_call["pp_n_microbatches"] == 2
+    assert validation_call["packing_attn_implementation"] == "sdpa"
+    assert validation_call["cp_size"] == 1
+    assert packing_resolutions == [{"model_attn_implementation": "sdpa", "cp_size": 1}]
+    assert configure_packing_calls == [{"attn_implementation": "sdpa"}]
+    assert trainer.val_dataloader == "val_dl"
+
+
+def test_setup_rejects_incomplete_pp_validation_batches(monkeypatch):
+    """AutoPipeline runs a fixed outer batch, so a short trailing val batch cannot run."""
+    dataloader_calls = []
+    validation_loader_config = SimpleNamespace(
+        drop_last=False,
+        packing=None,
+        resolve_packing_attn_implementation=lambda **kwargs: None,
+        build=lambda **kwargs: pytest.fail("validation loader must not build before drop_last validation"),
+    )
+    _patch_pp_setup_minimals(
+        monkeypatch,
+        cp_size=1,
+        stage0=_StageWithoutCPPrepare(),
+        dataloader_calls=dataloader_calls,
+        validation_loader_config=validation_loader_config,
+    )
+    trainer = FinetuneRecipeForVLM(_minimal_pp_setup_cfg())
+
+    with pytest.raises(ValueError, match=r"validation_dataloader\.drop_last=true"):
+        trainer.setup()
+
+    assert len(dataloader_calls) == 1
+
+
+def test_train_loop_runs_validation_when_pipeline_is_enabled():
+    """The train loop must no longer skip validation under PP."""
+
+    class _SingleStepScheduler:
+        epochs = (0,)
+        step = 1
+        epoch = 0
+        is_val_step = True
+        is_ckpt_step = False
+        sigterm_flag = False
+
+        def set_epoch(self, epoch):
+            self.epoch = epoch
+
+        def __iter__(self):
+            yield [object()]
+
+    recipe = object.__new__(FinetuneRecipeForVLM)
+    model_part = SimpleNamespace(train=MagicMock())
+    recipe.model_parts = [model_part]
+    recipe.step_scheduler = _SingleStepScheduler()
+    recipe.val_dataloader = object()
+    recipe.pp_enabled = True
+    recipe.max_grad_norm = None
+    recipe._make_progress_bar = MagicMock(return_value=None)
+    recipe._run_train_optim_step = MagicMock(return_value=SimpleNamespace(metrics={"loss": 1.0}))
+    recipe.log_train_metrics = MagicMock()
+    recipe._update_progress_bar = MagicMock()
+    validation_metrics = SimpleNamespace(metrics={"val_loss": 0.25})
+    recipe._run_validation_epoch = MagicMock(return_value=validation_metrics)
+    recipe.log_val_metrics = MagicMock()
+    recipe.save_checkpoint = MagicMock()
+    recipe._maybe_collect_garbage = MagicMock()
+    recipe.metric_logger_train = SimpleNamespace(close=MagicMock())
+    recipe.metric_logger_valid = SimpleNamespace(close=MagicMock())
+    recipe._finalize_and_close_checkpointer = MagicMock()
+
+    recipe.run_train_validation_loop()
+
+    recipe._run_validation_epoch.assert_called_once_with(recipe.val_dataloader)
+    recipe.log_val_metrics.assert_called_once_with(validation_metrics)
+    # Once before the loop, once after validation put the parts back in train mode.
+    assert model_part.train.call_count == 2
 
 
 # -----------------------------------------------------------------------------

@@ -243,6 +243,25 @@ class _KwargsChunkSchedule:
         self.args_during_step = None
         self.kwargs_chunk_spec_during_step = None
         self.kwargs_split = None
+        self.entry_points: list[str] = []
+
+    def eval(self, *args, target=None, losses=None, **kwargs):
+        """Forward-only entry point, which upstream implements by delegating to ``step``.
+
+        Args:
+            *args: Positional schedule inputs. Tensor values have arbitrary
+                model-defined layouts.
+            target: Optional tensor of shape [batch, sequence] containing loss
+                targets.
+            losses: Optional mutable list populated with scalar loss tensors.
+            **kwargs: Keyword schedule inputs. Tensor values have arbitrary
+                model-defined layouts.
+
+        Returns:
+            A sentinel string identifying the schedule result.
+        """
+        self.entry_points.append("eval")
+        return self.step(*args, target=target, losses=losses, **kwargs)
 
     def step(self, *args, target=None, losses=None, **kwargs):
         """Split schedule inputs using the chunk spec active during the call.
@@ -260,6 +279,7 @@ class _KwargsChunkSchedule:
             A sentinel string identifying the schedule result.
         """
         del target, losses
+        self.entry_points.append("step")
         self.args_during_step = args
         self.kwargs_chunk_spec_during_step = self._kwargs_chunk_spec
         if self.fail_on_step:
@@ -360,6 +380,27 @@ class TestAutoPipelineKwargsChunkSpec:
 
         with pytest.raises(ValueError, match="unknown kwarg"):
             ap.step(torch.zeros(2, 8), attention_mask=torch.ones(2, 8))
+
+    def test_eval_runs_forward_only_with_the_same_chunk_policy(self):
+        """Validation must chunk model-owned axes exactly as training does."""
+        position_ids = torch.arange(8, dtype=torch.long).view(1, 1, -1).expand(3, 2, -1).clone()
+        ap = self._pipeline_with_parts(_KwargsChunkHookPart({"position_ids": 1}))
+
+        result = ap.eval(torch.zeros(2, 8, dtype=torch.long), position_ids=position_ids)
+
+        assert result == "schedule-result"
+        assert ap.info.schedule.entry_points[0] == "eval"
+        assert ap.info.schedule.kwargs_split[0]["position_ids"].shape == (3, 1, 8)
+        assert ap.info.schedule._kwargs_chunk_spec is None
+
+    def test_eval_without_model_hook_uses_pytorch_default_chunking(self):
+        ap = self._pipeline_with_parts(nn.Module())
+
+        ap.eval(torch.zeros(2, 8), attention_mask=torch.ones(2, 8))
+
+        assert ap.info.schedule.entry_points[0] == "eval"
+        assert ap.info.schedule.kwargs_chunk_spec_during_step is None
+        assert ap.info.schedule.kwargs_split[0]["attention_mask"].shape == (1, 8)
 
 
 # -----------------------------
