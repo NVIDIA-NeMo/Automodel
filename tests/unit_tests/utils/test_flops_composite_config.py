@@ -22,7 +22,7 @@ from nemo_automodel.components.utils.flops_utils import (
 )
 
 
-def test_unknown_composite_uses_text_backbone_flops() -> None:
+def test_unknown_composite_requires_explicit_text_config() -> None:
     text = LlamaConfig(
         hidden_size=64,
         intermediate_size=128,
@@ -32,12 +32,14 @@ def test_unknown_composite_uses_text_backbone_flops() -> None:
         vocab_size=256,
     )
     composite = PretrainedConfig(text_config=text)
-    formula = get_flops_formula_for_hf_config(composite)
+    assert get_flops_formula_for_hf_config(composite) is None
+    formula = get_flops_formula_for_hf_config(composite.get_text_config())
+    assert formula is not None
     expected = llama2_flops(text, gbs=2, seq_len=16)
-    assert formula(composite, gbs=2, seq_len=16) == expected
-    assert formula(composite, gbs=4, seq_len=16) == 2 * expected
+    assert formula(text, gbs=2, seq_len=16) == expected
+    assert formula(text, gbs=4, seq_len=16) == 2 * expected
     text.num_hidden_layers = 3
-    assert formula(composite, gbs=2, seq_len=16) == llama2_flops(text, gbs=2, seq_len=16)
+    assert formula(text, gbs=2, seq_len=16) == llama2_flops(text, gbs=2, seq_len=16)
 
 
 def test_known_composite_keeps_its_registered_formula() -> None:

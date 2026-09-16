@@ -13,10 +13,7 @@
 # limitations under the License.
 
 import warnings
-from typing import TYPE_CHECKING, Any, Callable
-
-if TYPE_CHECKING:
-    from transformers import PretrainedConfig
+from typing import Any, Callable
 
 
 def calculate_mfu(
@@ -1705,22 +1702,6 @@ def step3_5_flash_flops(config, gbs=1, seq_len=None):
     return gbs * (total_attn + total_mlp + total_vocab + mtp_total)
 
 
-def _text_config_flops(config: "PretrainedConfig", gbs: int = 1, seq_len: int | None = None) -> float:
-    """Count only the text backbone for an otherwise unregistered composite config.
-
-    Args:
-        config: Hugging Face composite configuration exposing get_text_config().
-        gbs: Global batch size.
-        seq_len: Sequence length, or the text configuration's default.
-
-    Returns:
-        Text-backbone training FLOPs for the batch; visual computation is excluded.
-    """
-    text_config = config.get_text_config()
-    formula = get_flops_formula_for_hf_config(text_config)
-    return formula(text_config, gbs=gbs, seq_len=seq_len)
-
-
 def get_flops_formula_for_hf_config(config: Any) -> Callable | None:
     """
     Get the appropriate FLOPs formula function for a given HuggingFace config.
@@ -1729,7 +1710,9 @@ def get_flops_formula_for_hf_config(config: Any) -> Callable | None:
         config: HuggingFace model config object
 
     Returns:
-        The appropriate FLOPs formula function, or None if model type is not supported
+        The appropriate FLOPs formula function, or None for an unregistered
+        composite config. Pass its text config explicitly when only text-backbone
+        FLOPs are intended.
     """
     # Get config class name
     config_class_name = config.__class__.__name__
@@ -1799,8 +1782,8 @@ def get_flops_formula_for_hf_config(config: Any) -> Callable | None:
     # If no exact match, try to match by model_type as fallback
     if formula is None:
         get_text_config = getattr(config, "get_text_config", None)
-        if get_text_config is not None and get_text_config() is not config:
-            return _text_config_flops
+        if callable(get_text_config) and get_text_config() is not config:
+            return None
         formula = transformer_flops
 
     return formula
