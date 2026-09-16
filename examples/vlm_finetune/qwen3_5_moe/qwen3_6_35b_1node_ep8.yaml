@@ -22,11 +22,11 @@
 #
 # Prerequisites:
 #   export HF_TOKEN=...                       # the repo does not read .env
-#   uv run --no-project ... scripts/prefilter_v4_88k.py --max-seq-len 40960 \
+#   uv run --no-project ... examples/vlm_finetune/qwen3_5_moe/affine/prefilter.py --max-seq-len 40960 \
 #       --out data/v4_88k_filtered            # drops the ~0.3% over-length rows
 #
 # To run this recipe:
-#   automodel examples/vlm_finetune/qwen3_5_moe/qwen3_6_35b_v4_88k_ep8.yaml --nproc-per-node 8
+#   automodel examples/vlm_finetune/qwen3_5_moe/qwen3_6_35b_1node_ep8.yaml --nproc-per-node 8
 
 recipe: FinetuneRecipeForVLM
 
@@ -164,7 +164,7 @@ loss_fn:
   _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
 
 dataset:
-  _target_: examples/vlm_finetune/qwen3_5_moe/v4_88k.py:make_v4_88k_dataset
+  _target_: examples/vlm_finetune/qwen3_5_moe/affine/dataset.py:make_affine_dataset
   path_or_dataset: data/v4_88k_filtered/train.parquet
 
 dataloader:
@@ -196,11 +196,11 @@ dataloader:
     #
     # Deliberately no `max_length` here: default_collate_fn switches to
     # padding="max_length" whenever it is set, which would pad every sample to that
-    # length. The length cap is enforced offline by scripts/prefilter_v4_88k.py.
-    _target_: examples/vlm_finetune/qwen3_5_moe/v4_88k.py:last_turn_collate_fn
+    # length. The length cap is enforced offline by examples/vlm_finetune/qwen3_5_moe/affine/prefilter.py.
+    _target_: examples/vlm_finetune/qwen3_5_moe/affine/dataset.py:last_turn_collate_fn
 
 validation_dataset:
-  _target_: examples/vlm_finetune/qwen3_5_moe/v4_88k.py:make_v4_88k_dataset
+  _target_: examples/vlm_finetune/qwen3_5_moe/affine/dataset.py:make_affine_dataset
   path_or_dataset: data/v4_88k_filtered/val.parquet
 
 validation_dataloader:
@@ -210,7 +210,7 @@ validation_dataloader:
   drop_last: true
   shuffle: false
   collate_fn:
-    _target_: examples/vlm_finetune/qwen3_5_moe/v4_88k.py:last_turn_collate_fn
+    _target_: examples/vlm_finetune/qwen3_5_moe/affine/dataset.py:last_turn_collate_fn
 
 optimizer:
   # torchao 8-bit AdamW: block-wise (256-element) quantized exp_avg / exp_avg_sq,

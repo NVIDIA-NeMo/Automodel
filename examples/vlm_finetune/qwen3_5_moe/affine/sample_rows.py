@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Draw a uniform random row subset of the pre-filtered v5_130k train split.
+"""Draw a uniform random row subset of a pre-filtered train split.
 
 Rows are sampled without replacement and written in their original order, with every
 column (including ``n_tokens`` for the length-grouped sampler) kept. Run from the repo root:
 
-    python examples/vlm_finetune/qwen3_5_moe/sample_v5_10k.py [-n 10000] [--seed 1234]
+    python examples/vlm_finetune/qwen3_5_moe/affine/sample_rows.py [-n 10000] [--seed 1234]
 """
 
 import argparse

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Pure-DDP variant of qwen3_6_35b_v4_88k_ep8.yaml for one node of 2 x B300 (268 GiB).
+# Pure-DDP variant of qwen3_6_35b_1node_ep8.yaml for one node of 2 x B300 (268 GiB).
 # Same data, masking, loss, optimizer, and schedule; only the parallelism differs.
 #
 # What DDP changes, and why each setting below is what it is:
@@ -32,7 +32,7 @@
 #
 # To run:
 #   . /workspace/automodel_env.sh
-#   automodel examples/vlm_finetune/qwen3_5_moe/qwen3_6_35b_v4_88k_ddp2.yaml --nproc-per-node 2
+#   automodel examples/vlm_finetune/qwen3_5_moe/qwen3_6_35b_ddp2.yaml --nproc-per-node 2
 
 recipe: FinetuneRecipeForVLM
 
@@ -112,7 +112,7 @@ loss_fn:
   _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
 
 dataset:
-  _target_: examples/vlm_finetune/qwen3_5_moe/v4_88k.py:make_v4_88k_dataset
+  _target_: examples/vlm_finetune/qwen3_5_moe/affine/dataset.py:make_affine_dataset
   path_or_dataset: data/v4_88k_filtered/train.parquet
 
 dataloader:
@@ -124,10 +124,10 @@ dataloader:
   shuffle: true
   collate_fn:
     # Supervises only the final assistant turn; no max_length (see the ep8 recipe).
-    _target_: examples/vlm_finetune/qwen3_5_moe/v4_88k.py:last_turn_collate_fn
+    _target_: examples/vlm_finetune/qwen3_5_moe/affine/dataset.py:last_turn_collate_fn
 
 validation_dataset:
-  _target_: examples/vlm_finetune/qwen3_5_moe/v4_88k.py:make_v4_88k_dataset
+  _target_: examples/vlm_finetune/qwen3_5_moe/affine/dataset.py:make_affine_dataset
   path_or_dataset: data/v4_88k_filtered/val.parquet
 
 validation_dataloader:
@@ -137,7 +137,7 @@ validation_dataloader:
   drop_last: true
   shuffle: false
   collate_fn:
-    _target_: examples/vlm_finetune/qwen3_5_moe/v4_88k.py:last_turn_collate_fn
+    _target_: examples/vlm_finetune/qwen3_5_moe/affine/dataset.py:last_turn_collate_fn
 
 optimizer:
   # torchao 8-bit AdamW (same as the ep8 recipe); plain tensors under DDP.

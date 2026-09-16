@@ -8,8 +8,8 @@
 set -uo pipefail
 
 REPO=$(cd "$(dirname "$0")/../../.." && pwd)
-RUN_DIR=${RUN_DIR:-$(ls -td "$REPO"/logs/v5_130k-* | head -1)}
-RUN_NAME=${RUN_NAME:-v5_130k}
+RUN_NAME=${RUN_NAME:-affine}
+RUN_DIR=${RUN_DIR:-$(ls -td "$REPO"/logs/"$RUN_NAME"-* | head -1)}
 # Last optimizer step the run logs; the watchdog exits cleanly once it appears.
 FINAL_STEP=${FINAL_STEP:-5020}
 PATTERN='OutOfMemoryError|CUDA out of memory|DeepEP error|Xid|CUDA error|NCCL.*(unhandled|aborting)'
@@ -20,15 +20,15 @@ while true; do
   if [ -n "$hit" ]; then
     echo "WATCHDOG_TRIGGERED in $hit"
     grep -hEm2 "$PATTERN" "$RUN_DIR"/rank*.log 2>/dev/null | head -4
-    RUN_NAME=$RUN_NAME bash "$REPO/examples/vlm_finetune/qwen3_5_moe/teardown_v5_130k.sh"
+    RUN_NAME=$RUN_NAME bash "$REPO/examples/vlm_finetune/qwen3_5_moe/teardown.sh"
     echo "WATCHDOG_TEARDOWN_DONE"
     exit 10
   fi
   # Stop watching once the run is over.
-  if ! pgrep -f "launch_2node_v4_88k.sh 0" > /dev/null 2>&1; then
+  if ! pgrep -f "launch_node.sh 0" > /dev/null 2>&1; then
     grep -qE "step $FINAL_STEP \|" "$RUN_DIR"/rank0.log 2>/dev/null && { echo "WATCHDOG_RUN_COMPLETE"; exit 0; }
     sleep 30
-    pgrep -f "launch_2node_v4_88k.sh 0" > /dev/null 2>&1 || { echo "WATCHDOG_RANK0_GONE"; exit 11; }
+    pgrep -f "launch_node.sh 0" > /dev/null 2>&1 || { echo "WATCHDOG_RANK0_GONE"; exit 11; }
   fi
   sleep 10
 done

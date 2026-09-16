@@ -13,7 +13,7 @@
 # limitations under the License.
 """Two-node comms smoke test for the EP16 run: NCCL all-reduce, then DeepEP internode.
 
-Launched through launch_2node_v4_88k.sh with ENTRY pointing at this file. Passes when the
+Launched through launch_node.sh with ENTRY pointing at this file. Passes when the
 all-reduce bus bandwidth looks like RDMA (hundreds of Gbps, not single digits) and a
 DeepEP dispatch -> combine round trip over 16 ranks reproduces its input.
 """

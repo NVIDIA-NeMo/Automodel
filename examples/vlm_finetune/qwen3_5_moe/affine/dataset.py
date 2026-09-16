@@ -35,21 +35,21 @@ from nemo_automodel.components.datasets.vlm.collate_fns import default_collate_f
 IGNORE_INDEX = -100
 
 _LENGTH_COLUMN = "n_tokens"
-"""Exact rendered token count per row, written by ``scripts/prefilter_v4_88k.py``."""
+"""Exact rendered token count per row, written by ``examples/vlm_finetune/qwen3_5_moe/affine/prefilter.py``."""
 
 _ROLES = frozenset({"system", "user", "assistant"})
 
 # Attribute used to memoize (assistant marker ids, generation-prompt suffix ids) on the
 # tokenizer itself, so the cache cannot outlive the object it describes.
-_MARKER_ATTR = "_v4_88k_turn_markers"
+_MARKER_ATTR = "_affine_turn_markers"
 
 
-def make_v4_88k_dataset(
+def make_affine_dataset(
     path_or_dataset: str = "vuhaian/v4_88k",
     split: str = "train",
     **kwargs: Any,
 ):
-    """Load the v4_88k corpus as text-only conversations for the VLM input pipeline.
+    """Load the agentic SFT corpus as text-only conversations for the VLM input pipeline.
 
     Emits the same ``{"conversation": [...]}`` contract as
     :func:`nemo_automodel.components.datasets.vlm.datasets.make_tulu3_dataset`, so the
@@ -63,7 +63,7 @@ def make_v4_88k_dataset(
 
     Args:
         path_or_dataset: HF Hub id, or a path to a local ``.parquet`` file produced by
-            ``scripts/prefilter_v4_88k.py``.
+            ``examples/vlm_finetune/qwen3_5_moe/affine/prefilter.py``.
         split: HF split expression. Ignored for local Parquet files.
         **kwargs: Ignored. Accepted so recipe-level dataset keys forwarded to the
             dataset target do not raise.
@@ -72,7 +72,7 @@ def make_v4_88k_dataset(
         datasets.Dataset: Rows with a ``conversation`` column, each a list of
         ``{"role": ..., "content": [{"type": "text", "text": ...}]}`` turns, plus the
         ``n_tokens`` column when the source carries it (written by
-        ``scripts/prefilter_v4_88k.py``). ``n_tokens`` is the exact rendered length
+        ``examples/vlm_finetune/qwen3_5_moe/affine/prefilter.py``). ``n_tokens`` is the exact rendered length
         from the real tokenizer and chat template, so ``dataloader.length_grouped_sampler``
         can group by it instead of estimating.
     """
@@ -215,7 +215,7 @@ def last_turn_collate_fn(
 
     Do not pass ``max_length`` here: ``default_collate_fn`` switches to
     ``padding="max_length"`` when it is set, which would pad every sample to that
-    length. Enforce the length cap offline with ``scripts/prefilter_v4_88k.py`` instead
+    length. Enforce the length cap offline with ``examples/vlm_finetune/qwen3_5_moe/affine/prefilter.py`` instead
     and let this collator pad to the longest sample in the batch.
 
     Args:

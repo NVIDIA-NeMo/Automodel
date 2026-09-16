@@ -1,14 +1,14 @@
-"""Dump one training-ready v4_88k sample to a human-readable text file.
+"""Dump one training-ready sample to a human-readable text file.
 
 Takes a random row from the pre-filtered corpus, pushes it through exactly the
-dataset adapter and collator the recipe uses (`make_v4_88k_dataset` +
+dataset adapter and collator the recipe uses (`make_affine_dataset` +
 `last_turn_collate_fn`), and writes what the model actually sees: the decoded
 input_ids, the supervised span marked inline, the decoded labels, and a
 token-level view of the mask boundary.
 
 CPU only. Batch of one, so there is no padding to confuse the reading.
 
-    python examples/vlm_finetune/qwen3_5_moe/dump_sample_v4_88k.py \
+    python examples/vlm_finetune/qwen3_5_moe/affine/dump_sample.py \
         --dataset data/v4_88k_filtered/train.parquet --out sample.txt
 """
 
@@ -21,11 +21,11 @@ import torch
 from transformers import AutoProcessor
 
 IGNORE_INDEX = -100
-_MODULE_PATH = pathlib.Path(__file__).resolve().parent / "v4_88k.py"
+_MODULE_PATH = pathlib.Path(__file__).resolve().parent / "dataset.py"
 
 
 def _load_adapter():
-    spec = importlib.util.spec_from_file_location("v4_88k_adapter", _MODULE_PATH)
+    spec = importlib.util.spec_from_file_location("affine_dataset_adapter", _MODULE_PATH)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -50,7 +50,7 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--dataset", default="data/v4_88k_filtered/train.parquet")
     p.add_argument("--model", default="Qwen/Qwen3.6-35B-A3B")
-    p.add_argument("--out", default="sample_v4_88k.txt")
+    p.add_argument("--out", default="sample.txt")
     p.add_argument("--seed", type=int, default=None, help="Default: OS entropy.")
     p.add_argument("--index", type=int, default=None, help="Force a row index.")
     p.add_argument("--context", type=int, default=24, help="Tokens of context at the mask boundary.")
@@ -68,7 +68,7 @@ def main() -> None:
     processor = AutoProcessor.from_pretrained(args.model, padding_side="right")
     tokenizer = getattr(processor, "tokenizer", processor)
 
-    dataset = adapter.make_v4_88k_dataset(path_or_dataset=args.dataset)
+    dataset = adapter.make_affine_dataset(path_or_dataset=args.dataset)
 
     seed = args.seed if args.seed is not None else random.SystemRandom().randrange(2**31)
     index = args.index if args.index is not None else random.Random(seed).randrange(len(dataset))
@@ -127,13 +127,13 @@ def main() -> None:
     w = out.append
 
     w("=" * 100)
-    w("v4_88k training-ready sample — decoded for manual review")
+    w("training-ready sample — decoded for manual review")
     w("=" * 100)
     w(f"dataset            : {args.dataset}")
     w(f"rows in dataset    : {len(dataset)}")
     w(f"row index          : {index}   (seed {seed})")
     w(f"model / tokenizer  : {args.model}")
-    w(f"collator           : v4_88k.py:last_turn_collate_fn (batch of 1, no padding)")
+    w(f"collator           : affine/dataset.py:last_turn_collate_fn (batch of 1, no padding)")
     w(f"text rendering     : {'repr() literals' if args.as_repr else 'plain decoded text'}")
     if args.reasoning_revision:
         w("final turn         : *** SYNTHESIZED reasoning_content revision (content=y_raw, "

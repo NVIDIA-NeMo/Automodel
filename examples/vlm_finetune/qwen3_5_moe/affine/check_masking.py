@@ -29,7 +29,7 @@ Usage::
 
     export HF_TOKEN=...
     uv run --no-project --with "transformers>=5" --with datasets --with torch \\
-        python examples/vlm_finetune/qwen3_5_moe/check_masking_v4_88k.py --n 8
+        python examples/vlm_finetune/qwen3_5_moe/affine/check_masking.py --n 8
 """
 
 import argparse
@@ -43,12 +43,12 @@ from transformers import AutoProcessor
 from nemo_automodel.components.datasets.vlm.collate_fns import default_collate_fn
 
 IGNORE_INDEX = -100
-_MODULE_PATH = pathlib.Path(__file__).resolve().parent / "v4_88k.py"
+_MODULE_PATH = pathlib.Path(__file__).resolve().parent / "dataset.py"
 
 
 def _load_adapter():
     """Import the recipe-local dataset adapter module by path."""
-    spec = importlib.util.spec_from_file_location("v4_88k_adapter", _MODULE_PATH)
+    spec = importlib.util.spec_from_file_location("affine_dataset_adapter", _MODULE_PATH)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

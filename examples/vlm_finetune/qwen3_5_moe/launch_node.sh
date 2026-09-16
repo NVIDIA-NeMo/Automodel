@@ -1,14 +1,14 @@
 #!/bin/bash
-# Launch one node of the N x 8 x H200 run (default: 2 nodes, qwen3_6_35b_v4_88k_2node_ep8.yaml).
-# See MULTINODE_2xH200_v4_88k.md for the node setup this assumes.
+# Launch one node of the N x 8 x H200 run (default: NNODES=2, CONFIG=qwen3_6_35b_4node_ep8_base.yaml).
+# See RUNBOOK.md for the node setup this assumes.
 #
 # Run from the repo checkout on the shared filesystem, once per node, node rank 0 first:
-#   rank 0:  bash examples/vlm_finetune/qwen3_5_moe/launch_2node_v4_88k.sh 0 [--key.sub value ...]
-#   rank 1:  bash examples/vlm_finetune/qwen3_5_moe/launch_2node_v4_88k.sh 1 [--key.sub value ...]
+#   rank 0:  bash examples/vlm_finetune/qwen3_5_moe/launch_node.sh 0 [--key.sub value ...]
+#   rank 1:  bash examples/vlm_finetune/qwen3_5_moe/launch_node.sh 1 [--key.sub value ...]
 #
 # For more than two nodes set NNODES and MASTER_ADDR, and give each node its own rank:
-#   NNODES=4 MASTER_ADDR=10.30.0.2 CONFIG=.../qwen3_6_35b_v5_130k_4node_ep8.yaml \
-#     bash examples/vlm_finetune/qwen3_5_moe/launch_2node_v4_88k.sh <0..3>
+#   NNODES=4 MASTER_ADDR=10.30.0.2 CONFIG=.../qwen3_6_35b_4node_ep8_base.yaml \
+#     bash examples/vlm_finetune/qwen3_5_moe/launch_node.sh <0..3>
 #
 # NCCL tuning vars (NCCL_ALGO, NCCL_PROTO, NCCL_CROSS_NIC, NCCL_NVLS_ENABLE,
 # NCCL_MIN_NCHANNELS, NCCL_MAX_NCHANNELS, NCCL_COLLNET_ENABLE) are forwarded when set.
@@ -19,18 +19,18 @@
 # TRITON_CACHE_HOST, RUN_NAME (container/log suffix), TORCHRUN_ARGS (extra torchrun flags),
 # NCCL_DEBUG, NVSHMEM_DEBUG, TRITON_PRINT_AUTOTUNING=1 (log every autotune benchmark).
 # ENTRY swaps the torchrun target for a plain script, e.g. the comms smoke test:
-#   ENTRY=examples/vlm_finetune/qwen3_5_moe/comm_check_2node.py bash ...launch_2node_v4_88k.sh 0
+#   ENTRY=examples/vlm_finetune/qwen3_5_moe/affine/comm_check.py bash ...launch_node.sh 0
 set -euo pipefail
 
-NODE_RANK=${1:?usage: launch_2node_v4_88k.sh <node_rank> [overrides...]}
+NODE_RANK=${1:?usage: launch_node.sh <node_rank> [overrides...]}
 shift
 NNODES=${NNODES:-2}
 [ "$NODE_RANK" -lt "$NNODES" ] || { echo "node_rank $NODE_RANK is out of range for NNODES=$NNODES" >&2; exit 1; }
 MASTER_ADDR=${MASTER_ADDR:-10.30.0.2}
 MASTER_PORT=${MASTER_PORT:-29500}
 IMAGE=${IMAGE:-nemo-automodel:26.08.00-deepep564}
-CONFIG=${CONFIG:-examples/vlm_finetune/qwen3_5_moe/qwen3_6_35b_v4_88k_2node_ep8.yaml}
-RUN_NAME=${RUN_NAME:-v4_88k}
+CONFIG=${CONFIG:-examples/vlm_finetune/qwen3_5_moe/qwen3_6_35b_4node_ep8_base.yaml}
+RUN_NAME=${RUN_NAME:-affine}
 REPO=$(cd "$(dirname "$0")/../../.." && pwd)
 
 # HF_TOKEN (and optionally WANDB_API_KEY) come from the repo-root .env, which is not committed.

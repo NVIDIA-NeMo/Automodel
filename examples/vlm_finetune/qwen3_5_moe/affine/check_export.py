@@ -22,7 +22,7 @@ Checks, on GPU(s):
 
 Usage (inside the training container, with the base snapshot in ``$HF_HOME``)::
 
-    python examples/vlm_finetune/qwen3_5_moe/check_export_v4_88k.py exports/<name>
+    python examples/vlm_finetune/qwen3_5_moe/affine/check_export.py exports/<name>
 """
 
 import argparse

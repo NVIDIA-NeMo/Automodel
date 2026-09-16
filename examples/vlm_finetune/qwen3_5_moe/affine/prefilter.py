@@ -22,7 +22,7 @@ Run before training::
 
     export HF_TOKEN=...
     uv run --no-project --with "transformers>=5" --with datasets \\
-        python scripts/prefilter_v4_88k.py --max-seq-len 40960 --out data/v4_88k_filtered
+        python examples/vlm_finetune/qwen3_5_moe/affine/prefilter.py --max-seq-len 40960 --out data/v4_88k_filtered
 """
 
 import argparse

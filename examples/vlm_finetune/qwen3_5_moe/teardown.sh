@@ -3,13 +3,13 @@
 #
 # A failed rank does not end the run: the survivors sit in a collective holding all their
 # memory until the 120-minute NCCL timeout, so on any OOM or traceback kill everything at
-# once rather than waiting (MULTINODE_2xH200_v4_88k.md section 3). Ranks re-parent to PID 1
+# once rather than waiting (RUNBOOK.md section 8.6). Ranks re-parent to PID 1
 # and hold ~100 GB through SIGTERM, so this uses `docker rm -f` and then SIGKILL, and does
 # not return until every GPU is under 2000 MiB and port 29500 is free -- otherwise the next
 # launch dies on EADDRINUSE while the memory sampler records the previous run's peak.
 set -uo pipefail
 
-RUN_NAME=${RUN_NAME:-v5_130k}
+RUN_NAME=${RUN_NAME:-affine}
 NODE_IPS=(10.30.0.2 10.30.0.4 10.30.0.3 10.30.0.7)
 
 for rank in "${!NODE_IPS[@]}"; do

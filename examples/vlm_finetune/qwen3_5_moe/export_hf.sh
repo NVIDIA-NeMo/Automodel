@@ -1,5 +1,5 @@
 #!/bin/bash
-# Export a sharded v4_88k checkpoint as an HF directory whose every file matches the base
+# Export a sharded checkpoint as an HF directory whose every file matches the base
 # model's layout: same 1,045 tensor names, shapes AND dtypes, and the base's own
 # config.json / generation_config.json / tokenizer / preprocessor files.
 #
@@ -16,18 +16,18 @@
 #     are not written at all.
 #
 # Usage (from the repo root, inside the training container; CPU only, ~1 min):
-#   NPROC_PER_NODE=16 bash examples/vlm_finetune/qwen3_5_moe/export_hf_v4_88k.sh \
+#   NPROC_PER_NODE=16 bash examples/vlm_finetune/qwen3_5_moe/export_hf.sh \
 #       checkpoints/<run>/epoch_0_step_199/model  exports/<name>
 # BASE_SNAPSHOT defaults to the Qwen/Qwen3.6-35B-A3B snapshot in $HF_HOME.
 set -euo pipefail
 
-CKPT_MODEL_DIR=${1:?usage: export_hf_v4_88k.sh <checkpoint>/model <output_dir>}
-OUT_DIR=${2:?usage: export_hf_v4_88k.sh <checkpoint>/model <output_dir>}
+CKPT_MODEL_DIR=${1:?usage: export_hf.sh <checkpoint>/model <output_dir>}
+OUT_DIR=${2:?usage: export_hf.sh <checkpoint>/model <output_dir>}
 NPROC_PER_NODE=${NPROC_PER_NODE:-16}
 NUM_THREADS=${NUM_THREADS:-5}
 HF_HOME=${HF_HOME:-$HOME/.cache/huggingface}
 BASE_SNAPSHOT=${BASE_SNAPSHOT:-$(ls -d "$HF_HOME"/hub/models--Qwen--Qwen3.6-35B-A3B/snapshots/*/ | head -1)}
-HELPER="$(dirname "$0")/export_hf_v4_88k_helper.py"
+HELPER="$(dirname "$0")/affine/export_hf_helper.py"
 
 [ -d "$CKPT_MODEL_DIR/.hf_metadata" ] || { echo "no .hf_metadata in $CKPT_MODEL_DIR"; exit 1; }
 [ -f "$BASE_SNAPSHOT/config.json" ] || { echo "base snapshot not found: $BASE_SNAPSHOT"; exit 1; }

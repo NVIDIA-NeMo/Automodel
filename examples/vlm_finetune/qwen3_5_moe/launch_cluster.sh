@@ -1,21 +1,21 @@
 #!/bin/bash
-# Fan out the 4 x 8 x H200 v5_130k run from rank 0's node.
+# Fan out the N x 8 x H200 run from rank 0's node.
 #
-# Starts launch_2node_v4_88k.sh (NNODES=4) on every node over SSH, rank 0 locally and
+# Starts launch_node.sh (NNODES=4) on every node over SSH, rank 0 locally and
 # last so the rendezvous master is up before the others connect, and samples nvidia-smi
 # on every node for the duration -- the recipe's `mem` field is
 # torch.cuda.max_memory_allocated and sits 20-30 GiB below the real footprint, so the smi
-# trace is the one to judge headroom by (MULTINODE_2xH200_v4_88k.md section 3).
+# trace is the one to judge headroom by (RUNBOOK.md section 11).
 #
-#   bash examples/vlm_finetune/qwen3_5_moe/launch_4node_v5_130k.sh [--key.sub value ...]
+#   bash examples/vlm_finetune/qwen3_5_moe/launch_cluster.sh [--key.sub value ...]
 #
-# Knobs: CONFIG, RUN_NAME, MASTER_ADDR, NNODES, plus anything launch_2node_v4_88k.sh takes.
+# Knobs: CONFIG, RUN_NAME, MASTER_ADDR, NNODES, plus anything launch_node.sh takes.
 set -euo pipefail
 
 REPO=$(cd "$(dirname "$0")/../../.." && pwd)
-LAUNCHER=examples/vlm_finetune/qwen3_5_moe/launch_2node_v4_88k.sh
-CONFIG=${CONFIG:-examples/vlm_finetune/qwen3_5_moe/qwen3_6_35b_v5_130k_4node_ep8.yaml}
-RUN_NAME=${RUN_NAME:-v5_130k}
+LAUNCHER=examples/vlm_finetune/qwen3_5_moe/launch_node.sh
+CONFIG=${CONFIG:-examples/vlm_finetune/qwen3_5_moe/qwen3_6_35b_4node_ep8_base.yaml}
+RUN_NAME=${RUN_NAME:-affine}
 MASTER_ADDR=${MASTER_ADDR:-10.30.0.2}
 NNODES=${NNODES:-4}
 

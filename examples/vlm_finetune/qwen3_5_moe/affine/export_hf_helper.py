@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Helper for ``export_hf_v4_88k.sh``: dtype remap, base-metadata overlay, and verification.
+"""Helper for ``export_hf.sh``: dtype remap, base-metadata overlay, and verification.
 
 Two subcommands:
 

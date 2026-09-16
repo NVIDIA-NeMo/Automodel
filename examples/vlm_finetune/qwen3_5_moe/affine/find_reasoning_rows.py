@@ -1,4 +1,4 @@
-"""Scan the v4_88k corpus for rows that carry real reasoning.
+"""Scan the corpus for rows that carry real reasoning.
 
 Two shapes can put reasoning into the supervised span:
 
