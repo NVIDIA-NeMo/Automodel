@@ -108,6 +108,19 @@ REMOTE_ROOT=${TITANS_REMOTE_ROOT:-$USER_ROOT/titans-automodel}
 REMOTE_CHECKOUT=$REMOTE_ROOT/checkouts/$LOCAL_SHA
 MOUNT_ROOT=${TITANS_MOUNT_ROOT:-$USER_ROOT}
 
+WANDB_STATUS=$(slurm-cli --cluster "$CLUSTER" shell \
+  'if grep -qs "api.wandb.ai" "$HOME/.netrc" 2>/dev/null; then echo ready; else echo missing; fi')
+if [[ $WANDB_STATUS == *missing* ]]; then
+  if [[ -z ${WANDB_API_KEY:-} ]]; then
+    echo "selected cluster $CLUSTER needs W&B authentication; export WANDB_API_KEY" >&2
+    exit 1
+  fi
+  printf -v WANDB_KEY_QUOTED %q "$WANDB_API_KEY"
+  slurm-cli --cluster "$CLUSTER" shell \
+    "umask 077; touch \"\$HOME/.netrc\"; printf '\\nmachine api.wandb.ai\\n  login user\\n  password %s\\n' $WANDB_KEY_QUOTED >> \"\$HOME/.netrc\"; chmod 600 \"\$HOME/.netrc\"" \
+    >/dev/null
+fi
+
 SYNC_COMMAND=$(cat <<EOF
 set -euo pipefail
 mkdir -p '$REMOTE_ROOT/checkouts' '$REMOTE_ROOT/logs'
