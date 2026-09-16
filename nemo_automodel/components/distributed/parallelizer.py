@@ -46,21 +46,6 @@ from torch.distributed.tensor.parallel import (
     parallelize_module,
 )
 from torch.distributed.tensor.placement_types import Replicate, Shard
-from transformers.models.gemma3.modeling_gemma3 import (
-    Gemma3ForConditionalGeneration,
-)
-
-try:
-    from transformers.models.gemma4.modeling_gemma4 import (
-        Gemma4ForConditionalGeneration,
-    )
-except (ImportError, ModuleNotFoundError):
-
-    class Gemma4ForConditionalGeneration:  # type: ignore[no-redef]
-        """Placeholder when the installed transformers build has no Gemma4."""
-
-        pass
-
 
 from nemo_automodel.components.distributed.activation_checkpointing import (
     SELECTIVE_AC_WRAPPER_FLAG,
@@ -97,28 +82,24 @@ def _is_transformers_v5_or_higher() -> bool:
     return major_version >= 5
 
 
-from transformers.models.gpt2.modeling_gpt2 import GPT2LMHeadModel
-from transformers.models.llama4.modeling_llama4 import Llama4ForConditionalGeneration
-from transformers.models.llava.modeling_llava import LlavaForConditionalGeneration
-from transformers.models.llava_next.modeling_llava_next import (
-    LlavaNextForConditionalGeneration,
-)
-from transformers.models.llava_next_video.modeling_llava_next_video import (
-    LlavaNextVideoForConditionalGeneration,
-)
-from transformers.models.llava_onevision.modeling_llava_onevision import (
-    LlavaOnevisionForConditionalGeneration,
-)
-from transformers.models.mistral3.modeling_mistral3 import (
-    Mistral3ForConditionalGeneration,
-)
-from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
-    Qwen2_5_VLForConditionalGeneration,
-)
-from transformers.models.qwen2_vl.modeling_qwen2_vl import (
-    Qwen2VLForConditionalGeneration,
-)
-from transformers.models.smolvlm.modeling_smolvlm import SmolVLMForConditionalGeneration
+@lru_cache(maxsize=1)
+def _gemma4_for_conditional_generation() -> type:
+    """Return Gemma4ForConditionalGeneration, or a placeholder on older transformers.
+
+    Cached so the placeholder branch yields one stable class object, which the
+    callers rely on for identity comparisons and as a dict key.
+    """
+    try:
+        from transformers.models.gemma4.modeling_gemma4 import Gemma4ForConditionalGeneration
+
+        return Gemma4ForConditionalGeneration
+    except (ImportError, ModuleNotFoundError):
+
+        class Gemma4ForConditionalGeneration:  # type: ignore[no-redef]
+            """Placeholder when the installed transformers build has no Gemma4."""
+
+        return Gemma4ForConditionalGeneration
+
 
 from nemo_automodel._transformers.v4_patches.rotary import _is_nemotron_flash_config
 from nemo_automodel.components.distributed.optimized_tp_plans import (
@@ -129,7 +110,7 @@ from nemo_automodel.components.distributed.optimized_tp_plans import (
     get_decilm_nemotron_tp_plan,
     get_llama_nemotron_super_tp_plan,
 )
-from nemo_automodel.components.distributed.parallel_styles import translate_to_lora
+from nemo_automodel.components.distributed.parallel_styles import ReplicatedWithGradAllReduce, translate_to_lora
 from nemo_automodel.shared.import_utils import UnavailableMeta, safe_import_from
 
 _MEGATRON_FSDP_050_REQUIRED_MSG = (
@@ -269,6 +250,82 @@ class ParallelizationStrategy(ABC):
     ) -> nn.Module:
         """Apply parallelization strategy to the model."""
         pass
+
+
+def _fully_shard_untied_input_output_embeddings(
+    model: nn.Module,
+    *,
+    mesh: DeviceMesh,
+    mp_policy: MixedPrecisionPolicy,
+    offload_policy: OffloadPolicy | None,
+    input_reshard_after_forward: bool,
+    fully_shard_fn: Callable[..., nn.Module],
+) -> None:
+    """Give large trainable untied embedding tables independent FSDP buffers.
+
+    The generic dense path otherwise leaves both tables in the root FSDP unit.
+    With fp32 gradient reduction, that unit allocates one contiguous
+    reduce-scatter input containing both gradients. Keeping the two trainable
+    leaf modules in separate FSDP units bounds that allocation by the larger
+    table instead of their sum. Tied weights stay in one unit to preserve
+    aliasing, and frozen tables stay in the root because they have no gradient
+    communication buffer to split.
+
+    Args:
+        model: Model whose input and output embedding modules may be sharded.
+        mesh: Device mesh that owns the FSDP shards.
+        mp_policy: Mixed-precision policy used by the surrounding FSDP units.
+        offload_policy: Optional offload policy used by the surrounding FSDP
+            units.
+        input_reshard_after_forward: Whether the input embedding unit reshards
+            its parameters after forward.
+        fully_shard_fn: FSDP sharding callable, injectable for unit tests.
+    """
+    weights_are_tied = ensure_tied_lm_head(model)
+
+    def _resolve(getter_name: str) -> nn.Module | None:
+        getter = getattr(model, getter_name, None)
+        if not callable(getter):
+            return None
+        try:
+            module = getter()
+        except (AttributeError, NotImplementedError):
+            return None
+        return module if isinstance(module, nn.Module) else None
+
+    input_embeddings = _resolve("get_input_embeddings")
+    output_embeddings = _resolve("get_output_embeddings")
+    input_weight = getattr(input_embeddings, "weight", None)
+    output_weight = getattr(output_embeddings, "weight", None)
+    weights_are_physically_tied = input_embeddings is not None and (
+        input_embeddings is output_embeddings or (input_weight is not None and input_weight is output_weight)
+    )
+    if weights_are_tied or weights_are_physically_tied:
+        logger.info("Keeping tied input/output embeddings in the root FSDP unit")
+        return
+
+    seen: set[int] = set()
+    for role, module, module_reshard_after_forward in (
+        ("input embedding", input_embeddings, input_reshard_after_forward),
+        # The output projection is the last compute unit. Keep it gathered until
+        # backward, matching the old root-owned behavior and allowing
+        # FusedLinearCrossEntropy to consume its mixed-precision compute weight
+        # outside the module's forward.
+        ("output embedding", output_embeddings, False),
+    ):
+        if module is None or id(module) in seen:
+            continue
+        seen.add(id(module))
+        if not any(param.requires_grad for param in module.parameters()):
+            continue
+        fully_shard_fn(
+            module,
+            mesh=mesh,
+            mp_policy=mp_policy,
+            reshard_after_forward=module_reshard_after_forward,
+            offload_policy=offload_policy,
+        )
+        logger.info("Sharded %s as an independent FSDP unit", role)
 
 
 class DefaultParallelizationStrategy(ParallelizationStrategy):
@@ -453,6 +510,18 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
             fully_shard_fn=fully_shard_fn,
             frozen_multimodal_sharding=frozen_multimodal_sharding,
             ignored_multimodal_params=ignored_multimodal_params,
+        )
+
+        input_embedding_reshard_after_forward = (
+            reshard_after_forward if reshard_after_forward is not None else not pp_enabled
+        )
+        _fully_shard_untied_input_output_embeddings(
+            model,
+            mesh=dp_mesh,
+            mp_policy=mp_policy,
+            offload_policy=offload_policy,
+            input_reshard_after_forward=input_embedding_reshard_after_forward,
+            fully_shard_fn=fully_shard_fn,
         )
 
         # Apply FSDP to the root model
@@ -1373,6 +1442,26 @@ def get_hf_tp_shard_plan(model):
     Raises:
         AssertionError: If no TP plan is found
     """
+    # Imported inside the function, not at module scope: pulling in a single
+    # ``transformers.models.*.modeling_*`` module drags the whole model-zoo
+    # dependency graph along with it (sklearn -> pandas/scipy, torchvision,
+    # opentelemetry). That cost more than ``import torch`` itself and was paid
+    # by every process that so much as touched this module -- including each
+    # ``mp.spawn`` child in the unit-test suite, which re-imports from scratch.
+    from transformers.models.gemma3.modeling_gemma3 import Gemma3ForConditionalGeneration
+    from transformers.models.llama4.modeling_llama4 import Llama4ForConditionalGeneration
+    from transformers.models.llava.modeling_llava import LlavaForConditionalGeneration
+    from transformers.models.llava_next.modeling_llava_next import LlavaNextForConditionalGeneration
+    from transformers.models.llava_next_video.modeling_llava_next_video import (
+        LlavaNextVideoForConditionalGeneration,
+    )
+    from transformers.models.llava_onevision.modeling_llava_onevision import (
+        LlavaOnevisionForConditionalGeneration,
+    )
+    from transformers.models.mistral3.modeling_mistral3 import Mistral3ForConditionalGeneration
+    from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
+    from transformers.models.qwen2_vl.modeling_qwen2_vl import Qwen2VLForConditionalGeneration
+
     model_cls = type(model)
 
     # Handle VL models structure
@@ -1468,13 +1557,7 @@ def get_hf_tp_shard_plan(model):
         if (k == "lm_head" or k == "language_model.lm_head") and v == "colwise_rep":
             translated_plan[k] = ColwiseParallel(output_layouts=Shard(-1), use_local_output=False)
         else:
-            style = translate_to_torch_parallel_style(v)
-            # Translator returns None for styles that should be skipped (e.g.
-            # "replicated_with_grad_allreduce" under FSDP where leaving the
-            # param un-wrapped is equivalent).
-            if style is None:
-                continue
-            translated_plan[k] = style
+            translated_plan[k] = translate_to_torch_parallel_style(v)
 
     logger.info(f"Hugging Face tp plan: {translated_plan}")
     return translated_plan
@@ -1540,12 +1623,7 @@ def translate_to_torch_parallel_style(style: str):
     elif style == "sequence_parallel":
         return SequenceParallel()
     elif style == "replicated_with_grad_allreduce":
-        # transformers v5 style for norm weights (q_norm, k_norm, etc.) that are
-        # replicated across TP ranks but need gradient all-reduce. Under FSDP+TP,
-        # leaving the param un-wrapped (no TP style) is equivalent: FSDP handles
-        # grad sync on its DP/DP_shard mesh, and since the param is replicated on
-        # the TP mesh, no TP-level collective is needed in forward.
-        return None
+        return ReplicatedWithGradAllReduce()
     else:
         raise ValueError(f"Unknown parallel style: {style}")
 
@@ -1653,8 +1731,27 @@ def validate_tp_mesh(model, tp_mesh):
     """
     Validate that attention heads and key value heads are divisible by TP size
     """
+    # Imported here rather than at module scope; see get_hf_tp_shard_plan.
+
     if tp_mesh.size() == 1:
         return  # if tp_mesh.size() == 1, we don't need to validate
+
+    from transformers.models.gemma3.modeling_gemma3 import Gemma3ForConditionalGeneration
+
+    Gemma4ForConditionalGeneration = _gemma4_for_conditional_generation()
+    from transformers.models.llama4.modeling_llama4 import Llama4ForConditionalGeneration
+    from transformers.models.llava.modeling_llava import LlavaForConditionalGeneration
+    from transformers.models.llava_next.modeling_llava_next import LlavaNextForConditionalGeneration
+    from transformers.models.llava_next_video.modeling_llava_next_video import (
+        LlavaNextVideoForConditionalGeneration,
+    )
+    from transformers.models.llava_onevision.modeling_llava_onevision import (
+        LlavaOnevisionForConditionalGeneration,
+    )
+    from transformers.models.mistral3.modeling_mistral3 import Mistral3ForConditionalGeneration
+    from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
+    from transformers.models.qwen2_vl.modeling_qwen2_vl import Qwen2VLForConditionalGeneration
+    from transformers.models.smolvlm.modeling_smolvlm import SmolVLMForConditionalGeneration
 
     model_cls = type(model)
 
@@ -1799,6 +1896,25 @@ def _extend_layers(layers: List[nn.Module], modules: Sequence[nn.Module]) -> Non
 
 
 def _get_model_layer_group_specs() -> Dict[Any, Dict[str, List[str]]]:
+    # Imported here rather than at module scope; see get_hf_tp_shard_plan.
+    from transformers.models.gemma3.modeling_gemma3 import Gemma3ForConditionalGeneration
+    from transformers.models.gpt2.modeling_gpt2 import GPT2LMHeadModel
+
+    Gemma4ForConditionalGeneration = _gemma4_for_conditional_generation()
+    from transformers.models.llama4.modeling_llama4 import Llama4ForConditionalGeneration
+    from transformers.models.llava.modeling_llava import LlavaForConditionalGeneration
+    from transformers.models.llava_next.modeling_llava_next import LlavaNextForConditionalGeneration
+    from transformers.models.llava_next_video.modeling_llava_next_video import (
+        LlavaNextVideoForConditionalGeneration,
+    )
+    from transformers.models.llava_onevision.modeling_llava_onevision import (
+        LlavaOnevisionForConditionalGeneration,
+    )
+    from transformers.models.mistral3.modeling_mistral3 import Mistral3ForConditionalGeneration
+    from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
+    from transformers.models.qwen2_vl.modeling_qwen2_vl import Qwen2VLForConditionalGeneration
+    from transformers.models.smolvlm.modeling_smolvlm import SmolVLMForConditionalGeneration
+
     # Each group lists every known location of its layer container across
     # transformers releases; ``_extract_model_layer_groups`` takes the first
     # candidate that resolves, so the specs need no version gating. The VLM

@@ -12,14 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from unittest.mock import patch
-
 import pytest
 import torch
+from transformers.models.mistral4.configuration_mistral4 import Mistral4Config as HFMistral4Config
+from transformers.models.mistral4.modeling_mistral4 import Mistral4Attention as HFMistral4Attention
+from transformers.models.mistral4.modeling_mistral4 import Mistral4RotaryEmbedding
 
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.deepseek_v3.rope_utils import (
+    freqs_cis_from_position_ids,
+    precompute_freqs_cis,
+)
 from nemo_automodel.components.models.mistral4.configuration import Mistral4Config
-from nemo_automodel.components.models.mistral4.model import Mistral4MLA, _get_llama_4_attn_scale
+from nemo_automodel.components.models.mistral4.model import Mistral4ForCausalLM, Mistral4MLA, _get_llama_4_attn_scale
 
 
 def _tiny_long_context_config() -> Mistral4Config:
@@ -36,7 +41,7 @@ def _tiny_long_context_config() -> Mistral4Config:
         kv_lora_rank=2,
         q_lora_rank=None,
         qk_rope_head_dim=2,
-        v_head_dim=2,
+        v_head_dim=4,
         qk_nope_head_dim=2,
         n_group=1,
         topk_group=1,
@@ -56,21 +61,115 @@ def _torch_backend() -> BackendConfig:
     )
 
 
-def test_mistral4_uses_standard_qk_attention_scale() -> None:
+@pytest.mark.parametrize(
+    "rope_overrides",
+    [
+        {"rope_type": "yarn"},
+        {"rope_type": "yarn", "mscale": 0.5, "mscale_all_dim": 1.0},
+        {"rope_type": "yarn", "mscale_all_dim": 0.0},
+        {"rope_type": "yarn", "factor": 1.0},
+        {"rope_type": "default"},
+        {"type": "yarn"},
+    ],
+)
+def test_mistral4_attention_scale_matches_hf(rope_overrides: dict[str, str | float]) -> None:
     config = _tiny_long_context_config()
+    config.rope_parameters.update(rope_overrides)
     attention = Mistral4MLA(config, _torch_backend())
-    expected_scale = config.qk_head_dim**-0.5
+    reference = HFMistral4Attention(HFMistral4Config(**config.to_dict()), layer_idx=0)
+    assert attention.softmax_scale == pytest.approx(reference.scaling)
 
-    assert attention.softmax_scale == pytest.approx(expected_scale)
 
-    query = torch.zeros(1, 1, 1, config.qk_head_dim)
-    key = torch.zeros_like(query)
-    value = torch.zeros(1, 1, 1, config.v_head_dim)
-    with patch("nemo_automodel.components.attention.utils.F.scaled_dot_product_attention") as sdpa:
-        sdpa.return_value = torch.zeros_like(value)
-        attention.attn_func(query, key, value)
+@pytest.mark.parametrize("position_offset", [0, 8192])
+@pytest.mark.parametrize("q_lora_rank", [None, 2])
+def test_mistral4_attention_forward_backward_matches_hf(position_offset: int, q_lora_rank: int | None) -> None:
+    """Compare real attention outputs and gradients with the pinned HF implementation."""
+    torch.manual_seed(42)
+    config = _tiny_long_context_config()
+    config.q_lora_rank = q_lora_rank
+    hf_config = HFMistral4Config(**config.to_dict())
+    hf_config._attn_implementation = "sdpa"
+    reference = HFMistral4Attention(hf_config, layer_idx=0).float()
+    attention = Mistral4MLA(config, _torch_backend()).float()
+    attention.load_state_dict(reference.state_dict(), strict=True)
 
-    assert sdpa.call_args.kwargs["scale"] == pytest.approx(expected_scale)
+    hidden_states = torch.randn(2, 8, config.hidden_size, requires_grad=True)
+    reference_hidden_states = hidden_states.detach().clone().requires_grad_(True)
+    position_ids = torch.arange(position_offset, position_offset + 8).unsqueeze(0).expand(2, -1)
+    frequencies = precompute_freqs_cis(
+        config.qk_rope_head_dim,
+        config.max_position_embeddings,
+        config.rope_parameters["rope_theta"],
+        config.rope_parameters,
+    )
+    freqs_cis = freqs_cis_from_position_ids(position_ids, frequencies)
+    position_embeddings = Mistral4RotaryEmbedding(hf_config)(reference_hidden_states, position_ids)
+
+    actual = attention(hidden_states, freqs_cis, position_ids=position_ids)
+    expected, _ = reference(
+        reference_hidden_states,
+        position_embeddings=position_embeddings,
+        attention_mask=None,
+        position_ids=position_ids,
+    )
+    # FP32 uses equivalent rotary layouts and SDPA with different operation order.
+    torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-5)
+    gradient = torch.randn_like(expected)
+    actual.backward(gradient)
+    expected.backward(gradient)
+    torch.testing.assert_close(hidden_states.grad, reference_hidden_states.grad, atol=2e-6, rtol=2e-5)
+    reference_parameters = dict(reference.named_parameters())
+    for name, parameter in attention.named_parameters():
+        torch.testing.assert_close(parameter.grad, reference_parameters[name].grad, atol=2e-6, rtol=2e-5)
+
+
+@pytest.mark.parametrize("multimodal", [False, True])
+def test_mistral4_bf16_initialization_preserves_hf_rotary_frequencies(multimodal: bool) -> None:
+    """Exercise the checkpoint initializer with the published model's rotary width."""
+    config = _tiny_long_context_config()
+    config.qk_rope_head_dim = 64
+    config.qk_nope_head_dim = 64
+    config.qk_head_dim = 128
+    config.v_head_dim = 128
+    config.head_dim = 128
+    hf_config = HFMistral4Config(**config.to_dict())
+    if multimodal:
+        from transformers.models.mistral3.configuration_mistral3 import Mistral3Config
+
+        from nemo_automodel.components.models.mistral4.model import Mistral3ForConditionalGeneration
+
+        wrapper_config = Mistral3Config(
+            text_config=config.to_dict(),
+            vision_config={
+                "model_type": "pixtral",
+                "hidden_size": 8,
+                "intermediate_size": 16,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 1,
+                "num_channels": 3,
+                "image_size": 4,
+                "patch_size": 2,
+            },
+            image_token_index=10,
+            spatial_merge_size=2,
+        )
+        model = Mistral3ForConditionalGeneration(wrapper_config, backend=_torch_backend())
+        text_model = model.model.language_model.model
+    else:
+        model = Mistral4ForCausalLM(config, backend=_torch_backend())
+        text_model = model.model
+
+    model.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.bfloat16)
+    reference_rotary = Mistral4RotaryEmbedding(hf_config)
+    assert text_model.freqs_cis.dtype == torch.float32
+    torch.testing.assert_close(text_model.freqs_cis, reference_rotary.inv_freq, atol=1e-8, rtol=1e-6)
+    assert model.lm_head.weight.dtype == torch.bfloat16
+
+    position_ids = torch.tensor([[0, 2047, 8192]])
+    frequencies = freqs_cis_from_position_ids(position_ids, text_model.freqs_cis)
+    cos, sin = reference_rotary(torch.empty(1, 3, config.hidden_size), position_ids)
+    torch.testing.assert_close(frequencies.real, cos[..., :32], atol=1e-6, rtol=1e-5)
+    torch.testing.assert_close(frequencies.imag, sin[..., :32], atol=1e-6, rtol=1e-5)
 
 
 def test_mistral4_long_context_scale_applies_to_full_query() -> None:
