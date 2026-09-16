@@ -1,10 +1,10 @@
 #!/bin/bash
-# Rank compatible Blackwell clusters and submit a portable Titans pilot.
+# Rank compatible Blackwell clusters and submit a portable Titans run.
 
 set -euo pipefail
 
 if (( $# < 2 )); then
-  echo "usage: $0 SCALE VARIANT --pilot [--total-gpus 8|16]" >&2
+  echo "usage: $0 SCALE VARIANT (--pilot|--full) [--total-gpus 8|16]" >&2
   echo "       SCALE: 170m | 340m | 760m" >&2
   echo "       VARIANT: baseline or a 170M component ablation" >&2
   exit 2
@@ -15,10 +15,12 @@ VARIANT=$2
 shift 2
 TOTAL_GPUS=8
 MODE=
+MODE_COUNT=0
 
 while (( $# )); do
   case "$1" in
-    --pilot) MODE=pilot ;;
+    --pilot) MODE=pilot; MODE_COUNT=$((MODE_COUNT + 1)) ;;
+    --full) MODE=full; MODE_COUNT=$((MODE_COUNT + 1)) ;;
     --total-gpus)
       shift
       TOTAL_GPUS=${1:?--total-gpus requires a value}
@@ -33,8 +35,8 @@ case "$VARIANT" in
   baseline|no_persistent|no_convolution|no_momentum|no_weight_decay|depth3|depth4|linear_memory) ;;
   *) echo "unknown variant: $VARIANT" >&2; exit 2 ;;
 esac
-if [[ $MODE != pilot ]]; then
-  echo "only --pilot is enabled until the Blackwell acceptance gates pass" >&2
+if (( MODE_COUNT != 1 )); then
+  echo "choose exactly one of --pilot or --full" >&2
   exit 2
 fi
 if [[ $SCALE != 170m && $VARIANT != baseline ]]; then
@@ -78,7 +80,7 @@ done
 
 RECOMMENDATION=$(slurm-cli --json job recommend-target \
   "${TARGET_ARGS[@]}" \
-  --name "titans-${SCALE}-${VARIANT}-pilot" \
+  --name "titans-${SCALE}-${VARIANT}-${MODE}" \
   --total-gpus "$TOTAL_GPUS" \
   --gpu-family blackwell \
   --cpus-per-task 128 \
@@ -135,9 +137,19 @@ EOF
 )
 slurm-cli --cluster "$CLUSTER" shell "$SYNC_COMMAND" --timeout 300 >/dev/null
 
-JOB_NAME=titans-${SCALE}-${VARIANT}-blackwell-pilot
+if [[ $MODE == pilot ]]; then
+  JOB_NAME=titans-${SCALE}-${VARIANT}-blackwell-pilot
+  SBATCH_SCRIPT=examples/llm_pretrain/slurm/titans_blackwell_lmm_pilot.sbatch
+  SUBMIT_NODES=$NODES
+  SUBMIT_TASKS=$NODES
+else
+  JOB_NAME=titans-${SCALE}-fineweb-prepare
+  SBATCH_SCRIPT=examples/llm_pretrain/slurm/titans_blackwell_fineweb_prepare.sbatch
+  # Data preparation uses one node; it submits training with the resolved topology.
+  SUBMIT_NODES=1
+  SUBMIT_TASKS=1
+fi
 LOG_PATH=$REMOTE_ROOT/logs/${JOB_NAME}_%j.out
-SBATCH_SCRIPT=examples/llm_pretrain/slurm/titans_blackwell_lmm_pilot.sbatch
 JOB_BODY=$(mktemp)
 trap 'rm -f "$JOB_BODY"' EXIT
 {
@@ -146,6 +158,7 @@ trap 'rm -f "$JOB_BODY"' EXIT
   printf 'export TITANS_MOUNT_ROOT=%q\n' "$MOUNT_ROOT"
   printf 'export TITANS_SCALE=%q\n' "$SCALE"
   printf 'export TITANS_EXPERIMENT=%q\n' "$VARIANT"
+  printf 'export TITANS_TRAIN_NODES=%q\n' "$NODES"
   printf 'export TITANS_GPUS_PER_NODE=%q\n' "$GPUS_PER_NODE"
   awk 'NR == 1 {next} !/^#SBATCH/' "$SBATCH_SCRIPT"
 } >"$JOB_BODY"
@@ -155,8 +168,8 @@ SUBMIT_RESULT=$(slurm-cli --cluster "$CLUSTER" --json job submit \
   --name "$JOB_NAME" \
   --partition batch \
   --account "$ACCOUNT" \
-  --nodes "$NODES" \
-  --ntasks "$NODES" \
+  --nodes "$SUBMIT_NODES" \
+  --ntasks "$SUBMIT_TASKS" \
   --cpus-per-task 128 \
   --gpus "$GPUS_PER_NODE" \
   --memory 0 \
@@ -165,9 +178,15 @@ SUBMIT_RESULT=$(slurm-cli --cluster "$CLUSTER" --json job submit \
   --output "$LOG_PATH")
 JOB_ID=$(printf '%s' "$SUBMIT_RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin)['job_id'])")
 
-echo "Submitted $SCALE/$VARIANT pilot to $CLUSTER / $ACCOUNT"
+echo "Submitted $SCALE/$VARIANT $MODE to $CLUSTER / $ACCOUNT"
 echo "Topology: $NODES node(s) x $GPUS_PER_NODE $GPU_TYPE GPU(s) = $TOTAL_GPUS total"
 echo "Job:      $JOB_ID"
-echo "W&B:      https://wandb.ai/nvidia/titans-paper-blackwell-pilots"
+if [[ $MODE == pilot ]]; then
+  echo "W&B:      https://wandb.ai/nvidia/titans-paper-reproduction"
+else
+  case "$SCALE" in 170m|340m) TOKEN_BUDGET=15B ;; 760m) TOKEN_BUDGET=30B ;; esac
+  RUN_ID=titans-${SCALE}-${VARIANT}-${TOKEN_BUDGET}-blackwell-v1
+  echo "W&B:      https://wandb.ai/nvidia/titans-paper-reproduction/runs/$RUN_ID"
+fi
 echo "Status:   slurm-cli --cluster $CLUSTER job get $JOB_ID"
 echo "Log:      slurm-cli --cluster $CLUSTER file read ${LOG_PATH//%j/$JOB_ID} --tail 100"

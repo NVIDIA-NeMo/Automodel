@@ -224,7 +224,16 @@ immutable AutoModel commit, prepares a reusable 64M-token shard if needed,
 runs ten optimizer steps, writes a checkpoint, and logs to
 `titans-paper-blackwell-pilots`.
 
-Only pilots are enabled initially. Full 15B/30B chains remain blocked until
-the target topology passes the 4096-token forward/backward, validation, and
-checkpoint gates. This avoids treating container availability, ARM64 support,
-or cluster-local storage as assumptions.
+Full runs use the same router with `--full`. The selected cluster first
+prepares a document-aligned 15B-token dataset for the 170M/340M scales or a
+30B-token dataset for 760M, including a real 4M-token FineWeb-Edu validation
+split. It then starts a resumable training chain on the resolved topology:
+
+```bash
+tools/submit_titans_blackwell.sh 170m baseline --full --total-gpus 8
+```
+
+All new pilots and full runs log to the consolidated
+`nvidia/titans-paper-reproduction` W&B project. Groups separate canonical
+LMM scales (`lmm-170m`, `lmm-340m`, `lmm-760m`) from `ablations-170m`; cluster
+and GPU topology remain properties of each run rather than separate projects.

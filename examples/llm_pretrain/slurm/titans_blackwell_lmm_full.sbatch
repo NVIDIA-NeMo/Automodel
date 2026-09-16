@@ -1,7 +1,5 @@
 #!/bin/bash
-# Portable ten-step pilot for Titans LMM scales and 170M component ablations.
-# Resource directives are supplied by tools/submit_titans_blackwell.sh after
-# slurm-cli resolves the cluster's 8-GPU or NVL72 topology.
+# Resumable full Titans LMM/component run on a resolved Blackwell topology.
 
 set -euo pipefail
 
@@ -12,9 +10,17 @@ TITANS_SCALE=${TITANS_SCALE:?set TITANS_SCALE}
 TITANS_EXPERIMENT=${TITANS_EXPERIMENT:-baseline}
 TITANS_GPUS_PER_NODE=${TITANS_GPUS_PER_NODE:?set TITANS_GPUS_PER_NODE}
 TITANS_IMAGE=${TITANS_IMAGE:-nvcr.io#nvidia/nemo-automodel:26.04}
+MAX_STEPS_PER_RUN=${TITANS_MAX_STEPS_PER_RUN:-1700}
 
 case "$TITANS_SCALE" in
-  170m|340m|760m) ;;
+  170m|340m)
+    TOTAL_STEPS=28610
+    TOKEN_BUDGET=15B
+    ;;
+  760m)
+    TOTAL_STEPS=57220
+    TOKEN_BUDGET=30B
+    ;;
   *) echo "unsupported Titans scale: $TITANS_SCALE" >&2; exit 2 ;;
 esac
 if [[ $TITANS_SCALE != 170m && $TITANS_EXPERIMENT != baseline ]]; then
@@ -40,25 +46,37 @@ case "$TITANS_EXPERIMENT" in
 esac
 
 RECIPE=examples/llm_pretrain/titans_${TITANS_SCALE}_lmm.yaml
-DATA_ROOT=$TITANS_WORK_ROOT/data/fineweb-edu-llama2-pilot
-TRAIN_DATA=$DATA_ROOT/train/fineweb_edu_max_tokens_64M/dataset.bin
-TRAIN_INDEX=${TRAIN_DATA%.bin}.bos.idx
-VALIDATION_ROOT=$DATA_ROOT/validation-health-$SLURM_NNODES-$TITANS_GPUS_PER_NODE
-RUN_NAME=titans-${TITANS_SCALE}-${TITANS_EXPERIMENT}-blackwell-pilot
-CHECKPOINT_ROOT=$TITANS_WORK_ROOT/outputs/$RUN_NAME-$SLURM_JOB_ID
+DATA_ROOT=$TITANS_WORK_ROOT/data/fineweb-edu-llama2-$TOKEN_BUDGET
+RUN_NAME=titans-${TITANS_SCALE}-${TITANS_EXPERIMENT}-${TOKEN_BUDGET}-blackwell
+CHECKPOINT_ROOT=$TITANS_WORK_ROOT/outputs/$RUN_NAME
+RUN_SHA_FILE=$CHECKPOINT_ROOT/git_sha
+WANDB_RUN_ID=${WANDB_RUN_ID:-${RUN_NAME}-v1}
 WANDB_GROUP=$([[ $TITANS_EXPERIMENT == baseline ]] && echo "lmm-$TITANS_SCALE" || echo "ablations-170m")
 
-mkdir -p "$TITANS_WORK_ROOT"/{cache,logs,outputs} "$DATA_ROOT/train" \
+mkdir -p "$TITANS_WORK_ROOT"/{cache,logs,outputs} "$CHECKPOINT_ROOT" \
   "$TITANS_WORK_ROOT/cache"/{triton,torchinductor,wandb,wandb-data} \
   "$TITANS_WORK_ROOT/.config/wandb" "$AUTOMODEL_CHECKOUT/slurm_jobs"
+test -s "$DATA_ROOT/READY"
+
+CURRENT_SHA=$(git -C "$AUTOMODEL_CHECKOUT" rev-parse HEAD)
+if [[ -s "$RUN_SHA_FILE" ]]; then
+  RECORDED_SHA=$(cat "$RUN_SHA_FILE")
+  if [[ $RECORDED_SHA != "$CURRENT_SHA" && -e "$CHECKPOINT_ROOT/LATEST" ]]; then
+    echo "refusing to resume checkpoints from $RECORDED_SHA with source $CURRENT_SHA" >&2
+    exit 1
+  fi
+fi
+printf '%s\n' "$CURRENT_SHA" >"$RUN_SHA_FILE"
 
 if ! grep -qs "api.wandb.ai" "$HOME/.netrc" && [[ -z ${WANDB_API_KEY:-} ]]; then
-  echo "W&B authentication is required for Blackwell pilots" >&2
+  echo "W&B authentication is required for full Titans runs" >&2
   exit 1
 fi
 
 export TITANS_DATA_ROOT=$DATA_ROOT
 export TITANS_CHECKPOINT_ROOT=$CHECKPOINT_ROOT
+export WANDB_RUN_ID
+export WANDB_MODE=online
 export HF_HOME=$TITANS_WORK_ROOT/cache/huggingface
 export XDG_CACHE_HOME=$TITANS_WORK_ROOT/cache
 export TRITON_CACHE_DIR=$TITANS_WORK_ROOT/cache/triton
@@ -67,42 +85,8 @@ export WANDB_CACHE_DIR=$TITANS_WORK_ROOT/cache/wandb
 export WANDB_DATA_DIR=$TITANS_WORK_ROOT/cache/wandb-data
 export WANDB_CONFIG_DIR=$TITANS_WORK_ROOT/.config/wandb
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-
-# Prepare the small pilot corpus exactly once, even for a multi-node target.
-srun \
-  --nodes=1 \
-  --ntasks=1 \
-  --container-image="$TITANS_IMAGE" \
-  --container-mounts="$TITANS_MOUNT_ROOT:$TITANS_MOUNT_ROOT" \
-  --container-workdir="$AUTOMODEL_CHECKOUT" \
-  --export=ALL \
-  bash -lc "
-    set -euo pipefail
-    export PYTHONPATH='$AUTOMODEL_CHECKOUT'
-    if [[ ! -s '$TRAIN_DATA' || ! -s '$TRAIN_INDEX' ]]; then
-      python tools/nanogpt_data_processor.py \
-        --dataset HuggingFaceFW/fineweb-edu \
-        --set-name sample-10BT \
-        --tokenizer NousResearch/Llama-2-7b-hf \
-        --output-dir '$DATA_ROOT/train/fineweb_edu' \
-        --data-cache-dir '$TITANS_WORK_ROOT/cache/fineweb-edu' \
-        --max-tokens 64M \
-        --num-workers 32 \
-        --chunk-size 128 \
-        --prefetch 2
-    fi
-    test -s '$TRAIN_DATA'
-    test -s '$TRAIN_INDEX'
-    python tools/make_titans_smoke_data.py \
-      --output-dir '$VALIDATION_ROOT' \
-      --seq-len 4096 \
-      --train-documents 16 \
-      --validation-documents 16 \
-      --vocab-size 32000
-  "
-
 MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | awk 'NR==1 {print; exit}')
-MASTER_PORT=${MASTER_PORT:-13747}
+MASTER_PORT=${MASTER_PORT:-13749}
 export MASTER_ADDR MASTER_PORT
 
 srun \
@@ -124,13 +108,8 @@ srun \
       --rdzv-id='$SLURM_JOB_ID' \
       -m nemo_automodel.cli.app \
       '$RECIPE' \
-      --dataset.file_pattern='$TRAIN_DATA' \
-      --validation_dataset.file_pattern='$VALIDATION_ROOT/validation/*.bin' \
-      --step_scheduler.max_steps=10 \
-      --step_scheduler.ckpt_every_steps=10 \
-      --step_scheduler.val_every_steps=10 \
-      --step_scheduler.log_remote_every_steps=1 \
-      --lr_scheduler.lr_warmup_steps=1 \
+      --step_scheduler.max_steps='$TOTAL_STEPS' \
+      --step_scheduler.max_steps_per_run='$MAX_STEPS_PER_RUN' \
       --checkpoint.checkpoint_dir='$CHECKPOINT_ROOT' \
       --wandb.enable=true \
       --wandb.entity=nvidia \
@@ -138,8 +117,32 @@ srun \
       --wandb.name='$RUN_NAME' \
       --wandb.group='$WANDB_GROUP' \
       --wandb.mode=online \
-      --wandb.id='${RUN_NAME}-${SLURM_JOB_ID}' \
-      --wandb.resume=never \
+      --wandb.id='$WANDB_RUN_ID' \
+      --wandb.resume=allow \
       --wandb.dir='$CHECKPOINT_ROOT/wandb' \
       $MODEL_OVERRIDES
   "
+
+LATEST_TARGET=$(readlink "$CHECKPOINT_ROOT/LATEST")
+LATEST_STEP=${LATEST_TARGET##*_step_}
+if (( LATEST_STEP + 1 < TOTAL_STEPS )); then
+  NEXT_JOB_ID=$(env -u SLURM_CPUS_PER_TASK -u SLURM_TRES_PER_TASK \
+    sbatch --parsable \
+      --partition="$SLURM_JOB_PARTITION" \
+      --account="$SLURM_JOB_ACCOUNT" \
+      --nodes="$SLURM_NNODES" \
+      --ntasks="$SLURM_NNODES" \
+      --ntasks-per-node=1 \
+      --cpus-per-task="$SLURM_CPUS_PER_TASK" \
+      --gpus-per-node="$TITANS_GPUS_PER_NODE" \
+      --mem=0 \
+      --time="$SLURM_TIMELIMIT" \
+      --dependency=singleton \
+      --job-name="$SLURM_JOB_NAME" \
+      --chdir="$AUTOMODEL_CHECKOUT" \
+      --output="$TITANS_WORK_ROOT/logs/${SLURM_JOB_NAME}_%j.out" \
+      "$AUTOMODEL_CHECKOUT/examples/llm_pretrain/slurm/titans_blackwell_lmm_full.sbatch")
+  echo "Completed through step $LATEST_STEP; submitted continuation $NEXT_JOB_ID"
+else
+  echo "Titans $TITANS_SCALE/$TITANS_EXPERIMENT completed at step $LATEST_STEP"
+fi

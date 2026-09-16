@@ -444,12 +444,19 @@ def test_blackwell_submitter_resolves_portable_topology():
     runner = (
         root / "examples/llm_pretrain/slurm/titans_blackwell_lmm_pilot.sbatch"
     ).read_text()
+    full_runner = (
+        root / "examples/llm_pretrain/slurm/titans_blackwell_lmm_full.sbatch"
+    ).read_text()
+    data_runner = (
+        root / "examples/llm_pretrain/slurm/titans_blackwell_fineweb_prepare.sbatch"
+    ).read_text()
     submitter = (root / "tools/submit_titans_blackwell.sh").read_text()
 
     assert "--total-gpus \"$TOTAL_GPUS\"" in submitter
     assert "--gpu-family blackwell" in submitter
     assert "job recommend-target" in submitter
-    assert "--nodes \"$NODES\"" in submitter
+    assert "--nodes \"$SUBMIT_NODES\"" in submitter
+    assert "TITANS_TRAIN_NODES=%q" in submitter
     assert "--gpus \"$GPUS_PER_NODE\"" in submitter
     assert "aws-pdx-slurm-1" in submitter
     assert "nsc-svg-slurm-1" in submitter
@@ -458,6 +465,11 @@ def test_blackwell_submitter_resolves_portable_topology():
     assert "--nproc-per-node='$TITANS_GPUS_PER_NODE'" in runner
     assert "--nnodes=\\$SLURM_NNODES" in runner
     assert "--rdzv-backend=c10d" in runner
+    assert "--step_scheduler.max_steps_per_run='$MAX_STEPS_PER_RUN'" in full_runner
+    assert "--wandb.project=titans-paper-reproduction" in full_runner
+    assert "--validation-dir '$STAGING_ROOT/validation'" in data_runner
+    assert "titans_blackwell_lmm_full.sbatch" in data_runner
+    assert "--full" in submitter
     for scale in ("170m", "340m", "760m"):
         assert scale in runner
 
