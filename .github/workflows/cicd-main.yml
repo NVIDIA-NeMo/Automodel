@@ -415,8 +415,7 @@ jobs:
           - test-name: L0_Unit_Tests_CPU
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             cpu-only: true
-            # The base suite takes ~14 minutes; multi-process model coverage adds ~3 more.
-            # Leave enough time to finish without restarting the entire CPU suite.
+            # The 15-minute budget expires near the end of the ~14k-test suite.
             timeout: 20
           - test-name: L0_Unit_Tests_GPU_1_of_2
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
@@ -454,6 +453,9 @@ jobs:
         uses: ./.github/actions/test-template
         with:
           timeout: ${{ matrix.timeout || 10 }}
+          # Keep one confirmation for runner failures without allowing a stuck
+          # unit-test shard to consume three consecutive 20-30m attempts.
+          max-attempts: "2"
           is-unit-test: "true"
           cpu-only: ${{ matrix.cpu-only || false }}
           shard-id: ${{ matrix.shard-id }}
@@ -585,8 +587,9 @@ jobs:
           # Merged with hf_transformer_llm + data, mirroring cicd-e2e-tests
           # (2.4 + 3.8 + 4.3 = 10.5 min median, under the 13.2 min L2_Context_Parallel
           # floor). Leaves this matrix at 9 entries, one slot of headroom.
+          # Include models/minimax_m3_vl here; its runtime is not part of the 10.5 min median.
           - test-name: L2_HF_Transformer
-            test-folder: hf_transformer,hf_transformer_llm,data
+            test-folder: hf_transformer,hf_transformer_llm,data,models/minimax_m3_vl
             timeout: 40
           - test-name: L2_HF_Transformer_Finetune
             test-folder: hf_transformer_finetune

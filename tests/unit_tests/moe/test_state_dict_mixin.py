@@ -24,6 +24,10 @@ skip_if_no_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA 
 
 from nemo_automodel.components.moe.state_dict_mixin import MoESplitExpertsStateDictMixin, get_world_size_safe
 
+# Over the default 5s budget on purpose: this module spawns worker processes; every child re-imports torch from scratch.
+# Shrink the work or the process count before raising this further.
+pytestmark = pytest.mark.timeout(60)
+
 
 def test_get_world_size_safe_uses_initialized_process_group():
     with (

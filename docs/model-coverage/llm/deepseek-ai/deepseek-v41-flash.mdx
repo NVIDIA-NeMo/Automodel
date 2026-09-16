@@ -90,6 +90,11 @@ eight. Both runs must use the same prepared Arrow data, tokenizer, initial
 checkpoint, optimizer, and seed. The provided chat template follows the
 released chat-mode message format and masks loss to assistant content.
 
+The three Tulu3 CP recipes explicitly set `clip_grad_norm.backend: triton`.
+This uses the shared fused FP64 gradient-norm reduction from main and avoids
+gradient-sized norm temporaries for contiguous CUDA owner shards. Set
+`clip_grad_norm.backend: te` to select the shared Transformer Engine reducer.
+
 ## Loading and Inputs
 
 Set `DS41_CHECKPOINT` to the shared local Hugging Face snapshot of revision

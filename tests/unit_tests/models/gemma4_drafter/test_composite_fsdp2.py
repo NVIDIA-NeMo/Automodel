@@ -45,6 +45,10 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+# Over the default 5s budget on purpose: this module spawns worker processes; every child re-imports torch from scratch.
+# Shrink the work or the process count before raising this further.
+pytestmark = pytest.mark.timeout(60)
+
 
 def _gemma4_assistant_available() -> bool:
     try:

@@ -39,6 +39,10 @@ from nemo_automodel.components.models.deepseek_v41.state_dict_adapter import (
 )
 from nemo_automodel.components.moe.config import MoEConfig
 
+# Over the default 5s budget on purpose: distributed checkpoint round trips spawn Gloo workers.
+# Shrink process startup and checkpoint fixtures before lowering this further.
+pytestmark = pytest.mark.timeout(60)
+
 
 def _checkpoint_model(tensors: dict[str, torch.Tensor]) -> torch.nn.Module:
     model = torch.nn.Module()
