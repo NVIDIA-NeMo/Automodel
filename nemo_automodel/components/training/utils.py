@@ -22,6 +22,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Partial, Replicate
 
 from nemo_automodel.components.models.common.utils import set_is_first_microbatch, set_is_optim_step
+from nemo_automodel.shared.import_utils import safe_import, safe_import_te
 
 # Regex pattern to match expert parameters in GroupedExpertsTE.
 # Matches FQNs like:
@@ -107,6 +108,69 @@ def count_tail_padding(labels, ignore_label=-100):
     return prod_mask.view(-1).sum().item()
 
 
+def _local_l2_norm(gradients: list[torch.Tensor], target_device: torch.device) -> torch.Tensor:
+    """Reduce local gradients, lazily loading TE for eligible gradient storage.
+
+    Args:
+        gradients: Plain local tensors of arbitrary shape, without DTensor placements.
+            Contiguous CUDA FP16/BF16/FP32 tensors use TE, grouped by device and dtype.
+            Other layouts/devices/dtypes use PyTorch's FP64 vector norm. Inputs are
+            read-only and may alias parameter gradients.
+        target_device: Device for the returned scalar; only scalars move between devices.
+
+    Returns:
+        Independent scalar FP64 L2 norm on target_device. TE squares and accumulates
+        in FP32; PyTorch retries tiny/non-finite TE results in FP64 to preserve finite
+        norms outside FP32's squared-norm range. This check synchronizes the CUDA scalar.
+        Unsupported inputs and exceptional results may allocate widened gradient storage.
+    """
+    norms: list[torch.Tensor] = []
+    te_groups: dict[tuple[torch.device, torch.dtype], list[torch.Tensor]] = {}
+    for gradient in gradients:
+        if gradient.numel() == 0:
+            continue
+        if (
+            type(gradient) is torch.Tensor
+            and gradient.is_cuda
+            and gradient.is_contiguous()
+            and gradient.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        ):
+            te_groups.setdefault((gradient.device, gradient.dtype), []).append(gradient)
+        elif gradient.dtype in (torch.float64, torch.complex128):
+            # FP64 input can exceed even an FP64 sum-of-squares range. Preserve
+            # the scaled reduction used by the generic path for these tensors.
+            maximum = gradient.abs().max()
+            scale = torch.where(torch.isfinite(maximum) & maximum.ne(0), maximum, torch.ones_like(maximum))
+            norms.append((maximum * torch.linalg.vector_norm(gradient / scale)).to(target_device))
+        else:
+            dtype = torch.complex128 if gradient.is_complex() else torch.float64
+            norms.append(torch.linalg.vector_norm(gradient, dtype=dtype).to(target_device))
+
+    for (device, _), group in te_groups.items():
+        # Load TE only for eligible CUDA gradients. Its shared loader handles
+        # known binary incompatibilities, preserving the optional fallback.
+        have_te, te_optimizers = (
+            safe_import("transformer_engine.pytorch.optimizers") if safe_import_te()[0] else (False, None)
+        )
+        if not have_te:
+            norms.extend(torch.linalg.vector_norm(g, dtype=torch.float64).to(target_device) for g in group)
+            continue
+        overflow = torch.zeros(1, dtype=torch.int32, device=device)
+        norm, _ = te_optimizers.multi_tensor_applier(te_optimizers.multi_tensor_l2norm, overflow, [group], False)
+        norm = norm.reshape(()).to(dtype=torch.float64)
+        # Bound the contribution that FP32 squared subnormals could lose. Retry
+        # when it could exceed FP32 epsilon, or when the squared sum overflows.
+        finfo = torch.finfo(torch.float32)
+        minimum_squared_norm = sum(g.numel() for g in group) * finfo.tiny / finfo.eps
+        if not bool(torch.isfinite(norm) & norm.square().gt(minimum_squared_norm)):
+            norm = torch.linalg.vector_norm(
+                torch.stack([torch.linalg.vector_norm(g, dtype=torch.float64) for g in group])
+            )
+        norms.append(norm.to(target_device))
+
+    return _combine_norms(norms, 2.0, target_device)
+
+
 @torch.no_grad()
 def _clip_grad_norm_impl(
     parameters: torch.Tensor | Iterable[torch.Tensor],
@@ -115,8 +179,14 @@ def _clip_grad_norm_impl(
     error_if_nonfinite: bool = False,
     foreach: bool | None = None,
     pp_mesh: DeviceMesh | None = None,
+    *,
+    use_te: bool = False,
 ) -> torch.Tensor:
     """Compute and clip the norm of local and DTensor gradients.
+
+    Opt-in L2 uses Transformer Engine for contiguous CUDA FP16/BF16/FP32 local gradients,
+    with a PyTorch FP64 fallback. Partial placements retain materialization before
+    norm computation; other norm orders retain the scaled reduction path.
 
     Args:
         parameters: One parameter tensor or an iterable of parameter tensors
@@ -127,6 +197,7 @@ def _clip_grad_norm_impl(
         error_if_nonfinite: Whether to raise for a non-finite global norm.
         foreach: Optional foreach implementation preference for clipping.
         pp_mesh: Optional pipeline mesh over which the scalar norm is reduced.
+        use_te: Opt into TE local L2 reduction. False preserves the native scaled reduction.
 
     Returns:
         Scalar tensor containing the pre-clipping global gradient norm.
@@ -187,6 +258,31 @@ def _clip_grad_norm_impl(
         # Partial placements can't be reduced via sum-of-local-norms; materialize
         # those per-grad (each full_tensor() is a same-shape collective, safe).
         has_partial = is_dtensor and any(isinstance(pl, Partial) for pl in first.placements)
+
+        if use_te and norm_type == 2.0 and not has_partial:
+            local_gradients = [
+                (p.grad.to_local() if isinstance(p.grad, DTensor) else p.grad).detach() for p in group_params
+            ]
+            local_norm = _local_l2_norm(local_gradients, target_device)
+            if is_dtensor:
+                # Keep a scaled, scalar-only MAX/SUM schedule on every rank,
+                # including empty shards and ranks that use the PyTorch fallback.
+                maximum = local_norm.clone()
+                for dim_idx, placement in enumerate(first.placements):
+                    if not isinstance(placement, Replicate):
+                        maximum = _all_reduce_scalar(
+                            maximum, torch.distributed.ReduceOp.MAX, first.device_mesh, dim_idx
+                        )
+                scale = torch.where(torch.isfinite(maximum) & maximum.ne(0), maximum, torch.ones_like(maximum))
+                sum_squares = local_norm.div(scale).square()
+                for dim_idx, placement in enumerate(first.placements):
+                    if not isinstance(placement, Replicate):
+                        sum_squares = _all_reduce_scalar(
+                            sum_squares, torch.distributed.ReduceOp.SUM, first.device_mesh, dim_idx
+                        )
+                local_norm = maximum * sum_squares.sqrt()
+            group_norms.append(local_norm)
+            continue
 
         local_max = torch.zeros((), dtype=torch.float64, device=target_device)
         for p in group_params:
@@ -274,6 +370,7 @@ def clip_grad_norm(
     pp_axis_name: str | None = None,
     foreach: bool = True,
     use_torch_clip_grad_norm: bool = False,
+    use_te: bool = False,
 ) -> torch.Tensor | float:
     """Apply sharding-aware gradient clipping.
 
@@ -297,10 +394,11 @@ def clip_grad_norm(
         pp_axis_name: Pipeline parallel axis name.
         foreach: Whether to use foreach implementation for clipping.
         use_torch_clip_grad_norm: Use PyTorch's optimized regular-tensor clipping path when possible.
+        use_te: Opt into TE local L2 reduction; takes precedence over the PyTorch fast path.
 
     Returns:
-        Scalar tensor containing the total gradient norm without synchronizing it to the host,
-        or 0.0 when clipping is disabled.
+        Scalar tensor containing the total gradient norm, or 0.0 when clipping is disabled.
+        The TE L2 path checks its scalar result on the host for FP64 fallback.
     """
     if max_grad_norm is None:
         return 0.0
@@ -314,7 +412,7 @@ def clip_grad_norm(
         assert pp_axis_name is not None, "pp_axis_name must be provided when pp_enabled is True"
         pp_mesh = device_mesh[pp_axis_name] if device_mesh is not None else None
 
-    can_use_torch_clip = use_torch_clip_grad_norm and pp_mesh is None
+    can_use_torch_clip = use_torch_clip_grad_norm and not use_te and pp_mesh is None
     if can_use_torch_clip:
         for p in parameters:
             if (
@@ -342,6 +440,7 @@ def clip_grad_norm(
             error_if_nonfinite=False,
             foreach=foreach,
             pp_mesh=pp_mesh,
+            use_te=use_te,
         )
 
     return grad_norm
@@ -433,6 +532,7 @@ def scale_grads_and_clip_grad_norm(
     dp_group_size: int | None = None,
     expert_tp_replication_factor: int = 1,
     use_torch_clip_grad_norm: bool = False,
+    use_te: bool = False,
 ) -> torch.Tensor | float:
     """Scale gradients for PP/EP and model-owned shards, then clip.
 
@@ -446,9 +546,27 @@ def scale_grads_and_clip_grad_norm(
       declared by its model-owned sharding contract.
     - Finally, perform grad clipping with PP/EP-aware reductions.
 
+    Args:
+        max_grad_norm: Maximum global gradient norm, or None to skip clipping.
+        model_parts: Model modules whose parameters have gradients of arbitrary shape.
+            Gradients retain their original local or DTensor layout and are scaled in place.
+        norm_type: Norm order.
+        pp_enabled: Whether pipeline-parallel normalization is required.
+        device_mesh: Training mesh used for gradient norm reductions.
+        moe_mesh: Expert-parallel mesh used to normalize expert gradients.
+        ep_axis_name: Expert axis in the parameter mesh.
+        pp_axis_name: Pipeline axis in the training mesh.
+        foreach: Whether to use foreach for in-place clipping.
+        num_label_tokens: Global supervised-token count for PP normalization.
+        dp_group_size: Data-parallel group size, including CP when configured.
+        expert_tp_replication_factor: Number of identical TP copies of expert tokens.
+        use_torch_clip_grad_norm: Prefer PyTorch's regular-tensor clipping fast path.
+        use_te: Opt into TE local L2 reduction, taking precedence over the PyTorch fast path.
+            False preserves the native scaled reduction.
+
     Returns:
-        Scalar tensor containing the total gradient norm without synchronizing it to the host,
-        or 0.0 when clipping is disabled.
+        Scalar tensor containing the total gradient norm, or 0.0 when clipping is disabled.
+        The TE L2 path checks its scalar result on the host for FP64 fallback.
     """
 
     # Precompute scale factors
@@ -516,6 +634,7 @@ def scale_grads_and_clip_grad_norm(
         pp_axis_name=pp_axis_name,
         foreach=foreach,
         use_torch_clip_grad_norm=use_torch_clip_grad_norm,
+        use_te=use_te,
     )
 
 

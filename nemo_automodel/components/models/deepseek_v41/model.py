@@ -194,7 +194,7 @@ class DeepseekV41Model(nn.Module):
 
     def __init__(
         self,
-        config: DeepseekV41TextConfig,
+        config: DeepseekV41Config,
         backend: BackendConfig,
         moe_config: MoEConfig,
         *,
@@ -202,6 +202,10 @@ class DeepseekV41Model(nn.Module):
         engram_process_group: dist.ProcessGroup | None = None,
     ) -> None:
         super().__init__()
+        self.vision_config = config.vision_config
+        self.image_token_id = config.image_token_id
+        top_config = config
+        config = config.text_config
         self.config = config
         self.moe_config = moe_config
         dtype = dtype_from_str(config.dtype, torch.bfloat16)
@@ -223,6 +227,67 @@ class DeepseekV41Model(nn.Module):
         )
         self.norm = norm(config.hidden_size, eps=config.rms_norm_eps, dtype=dtype)
 
+        self.vision = None
+        self.aligner = None
+        if self.vision_config.num_hidden_layers > 0:
+            self.vision = DeepseekV41VisionTransformer(top_config)
+            self.aligner = DeepseekV41VisionAligner(top_config)
+            for name in ("image_start", "image_end", "image_newline"):
+                parameter = nn.Parameter(torch.empty(config.hidden_size, dtype=dtype))
+                nn.init.normal_(parameter, std=config.initializer_range)
+                self.register_parameter(name, parameter)
+
+    def _image_embeddings(
+        self,
+        input_ids: torch.Tensor,
+        pixel_values: torch.Tensor,
+        image_grid_hws: torch.Tensor,
+        vision_token_types: torch.Tensor,
+    ) -> torch.Tensor:
+        """Insert image features and learned delimiters into fresh token embeddings.
+
+        Args:
+            input_ids: Integer tensor of shape [batch, sequence].
+            pixel_values: Tensor of shape [all_patches, 3, patch_size, patch_size].
+            image_grid_hws: Integer tensor of shape [images, 2], containing patch grids.
+            vision_token_types: Integer tensor of shape [batch, sequence], with
+                -1 for text and 0/1/2/3 for image start/content/newline/end.
+
+        Returns:
+            Tensor of shape [batch, sequence, hidden], retaining text and image
+            gradients. The supplied input tensors are not modified.
+        """
+        if self.vision is None:
+            raise ValueError("pixel_values requires an enabled DeepSeek V4.1 vision encoder")
+        if vision_token_types.shape != input_ids.shape:
+            raise ValueError("vision_token_types must match input_ids [batch, sequence]")
+        if torch.any(input_ids[vision_token_types >= 0] != self.image_token_id):
+            raise ValueError("Every image-span token must use the checkpoint's image_token_id")
+        images = image_inputs_from_batch(
+            pixel_values,
+            image_grid_hws,
+            vision_token_types,
+            downsample_ratio=self.vision_config.downsample_ratio,
+        )
+        embedded = self.embed_tokens(input_ids)
+        for item in images:
+            patches = item.patches.to(device=embedded.device, dtype=self.vision.patch_embed.proj.weight.dtype)
+            features = self.vision(patches, item.n_vit_h, item.n_vit_w)
+            features = self.aligner(features, item.n_vit_h, item.n_vit_w).to(embedded.dtype)
+            types = item.types.to(embedded.device)
+            if (types == IMAGE).sum() != features.shape[0]:
+                raise ValueError("Image token count does not match the downsampled vision grid")
+            span = embedded.new_empty(types.shape[0], embedded.shape[-1])
+            span[types == IMAGE] = features
+            span[types == IMAGE_START] = self.image_start.to(embedded.dtype)
+            span[types == IMAGE_END] = self.image_end.to(embedded.dtype)
+            span[types == IMAGE_NEW_LINE] = self.image_newline.to(embedded.dtype)
+            flat_indices = item.batch_index * input_ids.shape[1] + torch.arange(
+                item.start, item.start + types.shape[0], device=embedded.device
+            )
+            embedded = embedded.flatten(0, 1).index_copy(0, flat_indices, span).view_as(embedded)
+        return embedded
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -230,6 +295,9 @@ class DeepseekV41Model(nn.Module):
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         image_mask: torch.Tensor | None = None,
+        pixel_values: torch.Tensor | None = None,
+        image_grid_hws: torch.Tensor | None = None,
+        vision_token_types: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
         output_hidden_states: bool = False,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...] | None]:
@@ -240,6 +308,9 @@ class DeepseekV41Model(nn.Module):
             position_ids: Optional integer tensor of shape [batch, sequence].
             attention_mask: Optional binary right-padding tensor [batch, sequence].
             image_mask: Optional boolean image-span tensor [batch, sequence].
+            pixel_values: Optional image patches [all_patches, 3, patch_size, patch_size].
+            image_grid_hws: Optional patch grids [images, 2].
+            vision_token_types: Optional image/text markers [batch, sequence].
             inputs_embeds: Optional projected multimodal embeddings [batch, sequence, hidden].
             output_hidden_states: Whether to retain streams before each block.
 
@@ -247,6 +318,15 @@ class DeepseekV41Model(nn.Module):
             Final normalized hidden states [batch, sequence, hidden] and optional
             per-block streams [batch, sequence, streams, hidden].
         """
+        # Fuse within this FSDP owner's forward so learned image delimiters
+        # are unsharded before they are read.
+        if pixel_values is not None:
+            if image_grid_hws is None or vision_token_types is None:
+                raise ValueError("pixel_values requires image_grid_hws and vision_token_types")
+            inputs_embeds = self._image_embeddings(input_ids, pixel_values, image_grid_hws, vision_token_types)
+            image_mask = vision_token_types >= 0
+        elif image_grid_hws is not None or (vision_token_types is not None and torch.any(vision_token_types >= 0)):
+            raise ValueError("Image spans require pixel_values; image placeholders cannot be trained as ordinary text")
         if position_ids is None:
             position_ids = torch.arange(input_ids.shape[1], device=input_ids.device).expand_as(input_ids)
         embedded = self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
@@ -358,17 +438,8 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
             dtype=dtype,
         )
         self.model = DeepseekV41Model(
-            text, self.backend, moe_config, tokenizer=tokenizer, engram_process_group=engram_process_group
+            config, self.backend, moe_config, tokenizer=tokenizer, engram_process_group=engram_process_group
         )
-        self.model.vision = None
-        self.model.aligner = None
-        if config.vision_config.num_hidden_layers > 0:
-            self.model.vision = DeepseekV41VisionTransformer(config)
-            self.model.aligner = DeepseekV41VisionAligner(config)
-            for name in ("image_start", "image_end", "image_newline"):
-                parameter = nn.Parameter(torch.empty(text.hidden_size, dtype=dtype))
-                nn.init.normal_(parameter, std=text.initializer_range)
-                self.model.register_parameter(name, parameter)
         self.lm_head = initialize_linear_module(
             self.backend.linear, text.hidden_size, text.vocab_size, bias=False, dtype=torch.float32
         )
@@ -383,57 +454,6 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
     def get_output_embeddings(self) -> nn.Module:
         """Return the independent vocabulary projection."""
         return self.lm_head
-
-    def _image_embeddings(
-        self,
-        input_ids: torch.Tensor,
-        pixel_values: torch.Tensor,
-        image_grid_hws: torch.Tensor,
-        vision_token_types: torch.Tensor,
-    ) -> torch.Tensor:
-        """Insert image features and learned delimiters into fresh token embeddings.
-
-        Args:
-            input_ids: Integer tensor of shape [batch, sequence].
-            pixel_values: Tensor of shape [all_patches, 3, patch_size, patch_size].
-            image_grid_hws: Integer tensor of shape [images, 2], containing patch grids.
-            vision_token_types: Integer tensor of shape [batch, sequence], with
-                -1 for text and 0/1/2/3 for image start/content/newline/end.
-
-        Returns:
-            Tensor of shape [batch, sequence, hidden], retaining text and image
-            gradients. The supplied input tensors are not modified.
-        """
-        if self.model.vision is None:
-            raise ValueError("pixel_values requires an enabled DeepSeek V4.1 vision encoder")
-        if vision_token_types.shape != input_ids.shape:
-            raise ValueError("vision_token_types must match input_ids [batch, sequence]")
-        if torch.any(input_ids[vision_token_types >= 0] != self.config.image_token_id):
-            raise ValueError("Every image-span token must use the checkpoint's image_token_id")
-        images = image_inputs_from_batch(
-            pixel_values,
-            image_grid_hws,
-            vision_token_types,
-            downsample_ratio=self.config.vision_config.downsample_ratio,
-        )
-        embedded = self.model.embed_tokens(input_ids)
-        for item in images:
-            patches = item.patches.to(device=embedded.device, dtype=self.model.vision.patch_embed.proj.weight.dtype)
-            features = self.model.vision(patches, item.n_vit_h, item.n_vit_w)
-            features = self.model.aligner(features, item.n_vit_h, item.n_vit_w).to(embedded.dtype)
-            types = item.types.to(embedded.device)
-            if (types == IMAGE).sum() != features.shape[0]:
-                raise ValueError("Image token count does not match the downsampled vision grid")
-            span = embedded.new_empty(types.shape[0], embedded.shape[-1])
-            span[types == IMAGE] = features
-            span[types == IMAGE_START] = self.model.image_start.to(embedded.dtype)
-            span[types == IMAGE_END] = self.model.image_end.to(embedded.dtype)
-            span[types == IMAGE_NEW_LINE] = self.model.image_newline.to(embedded.dtype)
-            flat_indices = item.batch_index * input_ids.shape[1] + torch.arange(
-                item.start, item.start + types.shape[0], device=embedded.device
-            )
-            embedded = embedded.flatten(0, 1).index_copy(0, flat_indices, span).view_as(embedded)
-        return embedded
 
     def _nemo_prepare_model_owned_dtensors(self, fsdp_mesh: DeviceMesh) -> set[nn.Parameter]:
         """Register owner table DTensors before FSDP records ignored parameters.
@@ -486,21 +506,13 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
             CausalLMOutputWithPast containing logits [batch, kept_sequence, vocab],
             optional scalar loss, and requested hidden tensors. No inference KV cache.
         """
-        inputs_embeds = None
-        image_mask = None
-        if pixel_values is not None:
-            if image_grid_hws is None or vision_token_types is None:
-                raise ValueError("pixel_values requires image_grid_hws and vision_token_types")
-            inputs_embeds = self._image_embeddings(input_ids, pixel_values, image_grid_hws, vision_token_types)
-            image_mask = vision_token_types >= 0
-        elif image_grid_hws is not None or (vision_token_types is not None and torch.any(vision_token_types >= 0)):
-            raise ValueError("Image spans require pixel_values; image placeholders cannot be trained as ordinary text")
         hidden, captured = self.model(
             input_ids,
             position_ids=position_ids,
             attention_mask=attention_mask,
-            inputs_embeds=inputs_embeds,
-            image_mask=image_mask,
+            pixel_values=pixel_values,
+            image_grid_hws=image_grid_hws,
+            vision_token_types=vision_token_types,
             output_hidden_states=output_hidden_states,
         )
         projected = compute_lm_head_logits(

@@ -921,7 +921,22 @@ def apply_fsdp(
             # ``moe/fsdp_mixin.py::_iter_fsdp_modules`` reuses the same shared
             # multimodal taxonomy so every unit created here also participates
             # in the gradient-accumulation sync state machine.
-            fully_shard_default(module)
+            # Resolve the root precision contract to names relative to this
+            # tower/projector before splitting its storage/compute dtype groups.
+            fp32_names = tuple(
+                name
+                for name, _ in module.named_parameters()
+                if any(pin in f"{module_name}.{name}" for pin in fp32_compute_module_names)
+            )
+            parallelizer_utils.fully_shard_by_dtype(
+                module,
+                mesh=fsdp_mesh,
+                mp_policy=mp_policy,
+                offload_policy=offload_policy,
+                fp32_compute_module_names=fp32_names,
+                reshard_after_forward=reshard_after_forward,
+                fully_shard_fn=fully_shard_impl,
+            )
         elif frozen_multimodal_sharding == "per_layer":
             shard_multimodal_module(module, fully_shard_default)
         else:

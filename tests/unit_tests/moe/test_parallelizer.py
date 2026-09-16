@@ -1219,6 +1219,9 @@ def test_apply_fsdp_handles_multimodal_components(monkeypatch, audio_trainable, 
         def parameters(self):
             return iter(self._params)
 
+        def named_parameters(self):
+            return ((str(index), param) for index, param in enumerate(self._params))
+
         def named_children(self):
             return []
 
@@ -1408,6 +1411,9 @@ def test_apply_fsdp_without_outer_root_allows_supported_multimodal_policies(
 
         def parameters(self):
             return iter(self._params)
+
+        def named_parameters(self):
+            return ((str(index), param) for index, param in enumerate(self._params))
 
         def named_children(self):
             return []
