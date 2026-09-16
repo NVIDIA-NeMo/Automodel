@@ -297,7 +297,7 @@ Use
 [`nemotron_3_5_super_vl_fineweb_cpt.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/nemotron_3_5_super_vl/nemotron_3_5_super_vl_fineweb_cpt.yaml).
 
 The `TrainFinetuneRecipeForNextTokenPrediction` recipe is also the existing LLM pretraining
-entrypoint. Its name does not imply an SFT objective: `MegatronPretraining` supplies raw,
+entry point. Its name does not imply an SFT objective: `MegatronPretraining` supplies raw,
 shifted next-token targets. `from_pretrained` loads the existing weights rather than
 randomly initializing a model. Architecture registration resolves the causal-LM entrypoint
 to the full `NemotronOmniForConditionalGeneration` implementation.
