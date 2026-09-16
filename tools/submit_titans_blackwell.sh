@@ -107,13 +107,13 @@ GPUS_PER_NODE=${TARGET[3]}
 GPU_TYPE=${TARGET[4]}
 SHARED_ROOT=${TARGET[5]}
 
-if [[ $SHARED_ROOT != /lustre/* ]]; then
-  echo "refusing non-Lustre work root for $CLUSTER / $ACCOUNT: $SHARED_ROOT" >&2
+if [[ $SHARED_ROOT != /scratch/fsw/portfolios/* ]]; then
+  echo "refusing non-FSW work root for $CLUSTER / $ACCOUNT: $SHARED_ROOT" >&2
   exit 1
 fi
 REMOTE_ROOT=${TITANS_REMOTE_ROOT:-$SHARED_ROOT/titans-automodel}
 REMOTE_CHECKOUT=$REMOTE_ROOT/checkouts/$LOCAL_SHA
-MOUNT_ROOT=${TITANS_MOUNT_ROOT:-/lustre}
+MOUNT_ROOT=${TITANS_MOUNT_ROOT:-/scratch}
 
 WANDB_STATUS=$(slurm-cli --cluster "$CLUSTER" shell \
   'if grep -qs "api.wandb.ai" "$HOME/.netrc" 2>/dev/null; then echo ready; else echo missing; fi')

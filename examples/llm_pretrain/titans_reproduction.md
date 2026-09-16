@@ -220,10 +220,12 @@ authorized accounts. Eight total GPUs resolve to one node on
 `nsc-svg-slurm-1` (B200) or `aws-pdx-slurm-1` (B300), and two nodes on the
 four-GPU NVL72 partitions at `aws-cmh-slurm-1` and `oci-hsg-cs-001`. The
 resolved topology is then fixed for the submitted job. Account prefixes are
-mapped to verified shared roots such as
-`/lustre/fsw/portfolios/nemotron/users/ffrujeri`; targets without a configured
-writable shared root are rejected. Data, immutable checkouts, checkpoints,
-caches, and job logs must remain under that Lustre hierarchy, never `$HOME`.
+mapped to verified compute-visible FSW roots such as
+`/scratch/fsw/portfolios/nemotron/projects/nemotron_sw_eval/users/ffrujeri`;
+targets without a configured writable shared root are rejected. `/lustre` may
+be a login-node alias for this physical path and is therefore not used by the
+portable workflow. Data, immutable checkouts, checkpoints, caches, and job
+logs remain under the shared FSW hierarchy, never `$HOME`.
 Each pilot uses an
 immutable AutoModel commit, prepares a reusable 64M-token shard if needed,
 runs ten optimizer steps, writes a checkpoint, and logs to
