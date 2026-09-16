@@ -453,6 +453,9 @@ jobs:
         uses: ./.github/actions/test-template
         with:
           timeout: ${{ matrix.timeout || 10 }}
+          # Keep one confirmation for runner failures without allowing a stuck
+          # unit-test shard to consume three consecutive 20-30m attempts.
+          max-attempts: "2"
           is-unit-test: "true"
           cpu-only: ${{ matrix.cpu-only || false }}
           shard-id: ${{ matrix.shard-id }}
