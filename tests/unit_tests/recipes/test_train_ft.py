@@ -2219,6 +2219,82 @@ class TestRunTrainOptimStepSetsMoEScale:
         object.__setattr__(recipe, "timestamp", 0.0)
         return recipe
 
+    @pytest.mark.parametrize("pp_enabled", [False, True])
+    @pytest.mark.parametrize("accumulation_steps", [1, 3])
+    @pytest.mark.parametrize("max_grad_norm", [None, 0.5])
+    def test_tp_sync_precedes_scaling_clipping_and_step(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        pp_enabled: bool,
+        accumulation_steps: int,
+        max_grad_norm: float | None,
+    ) -> None:
+        """Full and partial accumulation windows synchronize once before normalization."""
+        from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
+
+        recipe = self._make_recipe(monkeypatch, pp_enabled=pp_enabled, dp_group_size=1)
+        model = nn.Linear(1, 1, bias=False)
+        with torch.no_grad():
+            model.weight.fill_(1.0)
+        recipe.model_parts = [model]
+        recipe.optimizer = [torch.optim.SGD(model.parameters(), lr=0.1)]
+        sync_inputs = []
+
+        def forward_backward_step(
+            idx: int,
+            batch: dict[str, torch.Tensor],
+            *,
+            loss_buffer: list[torch.Tensor],
+            num_label_tokens: int,
+            num_batches: int,
+            is_train: bool = True,
+        ) -> None:
+            """Accumulate one scalar loss in the tiny reference model.
+
+            Args:
+                idx: Microbatch index.
+                batch: Mapping containing labels of shape [batch, sequence].
+                loss_buffer: List of scalar loss tensors; appended in place.
+                num_label_tokens: Total supervised tokens in the update.
+                num_batches: Number of accumulated microbatches.
+                is_train: Whether this is a training step.
+            """
+            loss = model(torch.ones(1, 1)).sum()
+            loss.backward()
+            loss_buffer.append(loss.detach())
+
+        def synchronize(
+            model_parts: list[nn.Module], device_mesh: torch.distributed.device_mesh.DeviceMesh | None
+        ) -> None:
+            assert model_parts == [model]
+            assert device_mesh is recipe.device_mesh
+            sync_inputs.append(model.weight.grad.clone())
+            # Model a second TP rank's equal partial contribution. Real
+            # collectives are covered by parallelism/test_tp_replicas.py.
+            model.weight.grad.mul_(2.0)
+
+        monkeypatch.setattr(recipe, "_forward_backward_step", forward_backward_step)
+        monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.synchronize_tp_replica_gradients", synchronize)
+        monkeypatch.setattr(
+            "nemo_automodel.recipes.llm.train_ft.scale_grads_and_clip_grad_norm",
+            scale_grads_and_clip_grad_norm,
+        )
+        batches = [{"labels": torch.tensor([[1, 2, 3, -100]])} for _ in range(accumulation_steps)]
+
+        metrics = recipe._run_train_optim_step(batches, max_grad_norm=max_grad_norm)
+
+        assert len(sync_inputs) == 1
+        torch.testing.assert_close(sync_inputs[0], torch.full_like(model.weight, float(accumulation_steps)))
+        expected_gradient = float(2 * accumulation_steps)
+        if pp_enabled:
+            expected_gradient /= 3 * accumulation_steps
+        expected_norm = expected_gradient if max_grad_norm is not None else 0.0
+        assert float(metrics.metrics["grad_norm"]) == pytest.approx(expected_norm)
+        if max_grad_norm is not None:
+            expected_gradient *= min(1.0, max_grad_norm / (expected_gradient + 1e-6))
+        torch.testing.assert_close(model.weight, torch.full_like(model.weight, 1.0 - 0.1 * expected_gradient))
+        assert model.weight.grad is None
+
     def test_pp_scale_includes_pipeline_microbatches_and_token_normalization(self, monkeypatch):
         from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 

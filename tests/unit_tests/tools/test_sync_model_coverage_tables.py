@@ -45,6 +45,10 @@ from tests.ci_tests.utils.sync_model_coverage_tables import (
     _validate_generated_tables_are_not_committed,
 )
 
+# Over the default 5s budget on purpose: this module drives git through subprocesses over throwaway repositories.
+# Shrink the work or the process count before raising this further.
+pytestmark = pytest.mark.timeout(60)
+
 
 def _commit_recipes(repo_root: Path, timestamp: str = "2026-07-30T12:00:00Z") -> None:
     subprocess.run(["git", "init", "-q", "-b", "main", str(repo_root)], check=True)
