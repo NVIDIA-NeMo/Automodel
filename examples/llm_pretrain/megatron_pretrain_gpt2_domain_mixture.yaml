@@ -74,7 +74,7 @@ dataset:
     _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
     pretrained_model_name_or_path: openai-community/gpt2
   seq_length: 1024
-  split: "1, 0, 0"
+  split: "0.99, 0.01, 0"
   splits_to_build: train
 
 dataloader:
@@ -90,7 +90,7 @@ validation_dataset_web:
     _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
     pretrained_model_name_or_path: openai-community/gpt2
   seq_length: 1024
-  split: "0, 1, 0"
+  split: "0.99, 0.01, 0"
   splits_to_build: validation
   num_val_samples: 128
 
@@ -102,7 +102,7 @@ validation_dataset_code:
     _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
     pretrained_model_name_or_path: openai-community/gpt2
   seq_length: 1024
-  split: "0, 1, 0"
+  split: "0.99, 0.01, 0"
   splits_to_build: validation
   num_val_samples: 128
 
