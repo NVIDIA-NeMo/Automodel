@@ -11,11 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import inspect
+
 import pytest
 import torch
 import torch.nn.functional as F
 
-from nemo_automodel.components.loss.te_parallel_ce import TEParallelCrossEntropy, HAVE_TE_PARALLEL_CE, MISSING_TE_PARALLEL_CE_MSG
+from nemo_automodel.components.loss.te_parallel_ce import (
+    HAVE_TE_PARALLEL_CE,
+    MISSING_TE_PARALLEL_CE_MSG,
+    TEParallelCrossEntropy,
+)
+
 
 @pytest.mark.skipif(not HAVE_TE_PARALLEL_CE, reason=MISSING_TE_PARALLEL_CE_MSG)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -41,7 +48,9 @@ def test_te_parallel_cross_entropy(reduction, ignore_index):
     # Measure memory for PyTorch implementation
     torch.cuda.reset_peak_memory_stats()
     with torch.amp.autocast(device_type="cuda", dtype=dtype):
-        pytorch_loss = F.cross_entropy(logits.view(-1, vocab_size), targets.view(-1), reduction=reduction, ignore_index=ignore_index)
+        pytorch_loss = F.cross_entropy(
+            logits.view(-1, vocab_size), targets.view(-1), reduction=reduction, ignore_index=ignore_index
+        )
         if reduction == "none":
             pytorch_loss = pytorch_loss.view(batch_size, seq_length)
 
@@ -49,6 +58,7 @@ def test_te_parallel_cross_entropy(reduction, ignore_index):
 
     torch.cuda.empty_cache()
     import gc
+
     gc.collect()
 
     # Measure memory for TE implementation
@@ -79,6 +89,7 @@ def test_te_parallel_cross_entropy(reduction, ignore_index):
         assert torch.allclose(te_loss, pytorch_loss, rtol=1e-2, atol=1e-2), (
             f"Loss mismatch with reduction={reduction}: PyTorch={pytorch_loss}, TE={te_loss}"
         )
+
 
 @pytest.mark.skipif(not HAVE_TE_PARALLEL_CE, reason=MISSING_TE_PARALLEL_CE_MSG)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -148,3 +159,19 @@ def test_te_parallel_cross_entropy_invalid_reduction_raises():
     with torch.amp.autocast(device_type="cuda", dtype=dtype):
         with pytest.raises(ValueError, match=r"Invalid reduction:"):
             TEParallelCrossEntropy(reduction="not-a-valid-reduction")(logits, targets)
+
+
+def test_te_parallel_cross_entropy_rejects_per_token_weights():
+    """TE parallel CE must not accept loss_weights.
+
+    TE's Triton backward loads ``grad_output`` as a single scalar, so a
+    per-token upstream gradient silently collapses to the first token's value:
+    the loss would be right while every token trained with one sample's
+    multiplier. Omitting the parameter is what makes the recipe's
+    ``_supports_loss_weights`` gate reject this loss at setup.
+    """
+    from nemo_automodel.recipes.llm.train_ft import _supports_loss_weights
+
+    parameters = inspect.signature(TEParallelCrossEntropy.__call__).parameters
+    assert "loss_weights" not in parameters
+    assert _supports_loss_weights(TEParallelCrossEntropy(reduction="sum")) is False
