@@ -22,6 +22,8 @@ from typing import Any, Literal, Protocol
 import torch
 from torch import nn
 from torch.distributed.fsdp import FSDPModule
+from torch.distributed.tensor import Replicate, Shard
+from torch.distributed.tensor.experimental import register_sharding
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel.shared.import_utils import safe_import, safe_import_from
@@ -514,33 +516,79 @@ class BackendConfig:
             )
 
 
-# Register rms_norm as a custom op so that torch.inductor treats it as opaque
-# and calls the deterministic fused CUDA kernel instead of decomposing it into
-# a Triton reduction that is non-deterministic across calls.
-_rms_norm_lib = torch.library.Library("nemo_automodel", "DEF")
-_rms_norm_lib.define("float32_rms_norm(Tensor x, Tensor weight, float eps) -> Tensor")
-
-
+# Keep the forward opaque so grad/no_grad compilation uses the same computation.
+@torch.library.custom_op("nemo_automodel::float32_rms_norm", mutates_args=())
 def _float32_rms_norm_impl(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    """Compute RMSNorm in fp32 with an opaque, device-independent forward.
+
+    Args:
+        x: Tensor of shape [..., hidden], with arbitrary leading dimensions.
+        weight: Tensor of shape [hidden] on the same device as x.
+        eps: Epsilon added to the mean square.
+
+    Returns:
+        Tensor of shape [..., hidden] in x's dtype, without aliasing either input.
+    """
     return torch.nn.functional.rms_norm(x.float(), (x.shape[-1],), weight.float(), eps).to(x.dtype)
 
 
-torch.library.impl(_rms_norm_lib, "float32_rms_norm", "CUDA")(_float32_rms_norm_impl)
-torch.library.impl(_rms_norm_lib, "float32_rms_norm", "CPU")(_float32_rms_norm_impl)
-
-
-@torch.library.impl(_rms_norm_lib, "float32_rms_norm", "Meta")
+@_float32_rms_norm_impl.register_fake
 def _float32_rms_norm_meta(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    """Describe the output metadata for inputs x [..., hidden] and weight [hidden].
+
+    Args:
+        x: Tensor of shape [..., hidden], with arbitrary leading dimensions.
+        weight: Tensor of shape [hidden] on the same device as x.
+        eps: Epsilon added to the mean square.
+
+    Returns:
+        Tensor of shape [..., hidden] with x's dtype and device.
+    """
     return torch.empty_like(x)
 
 
+@register_sharding(torch.ops.nemo_automodel.float32_rms_norm.default)
+def _float32_rms_norm_sharding(x, weight, eps):
+    """Keep the normalized axis complete while allowing leading-axis sharding.
+
+    Args:
+        x: Tensor metadata of global shape [..., hidden].
+        weight: Tensor metadata of global shape [hidden].
+        eps: Epsilon added to the mean square.
+
+    Returns:
+        Supported output/input placements on each mesh axis. Leading dimensions
+        may be sharded; weight and the hidden dimension must be replicated.
+    """
+    strategies = [([Replicate()], [Replicate(), Replicate(), None])]
+    strategies.extend(([Shard(dim)], [Shard(dim), Replicate(), None]) for dim in range(x.ndim - 1))
+    return strategies
+
+
 def _float32_rms_norm_setup_context(ctx, inputs, output):
+    """Save the inputs required for the RMSNorm gradient.
+
+    Args:
+        ctx: Autograd context that owns the saved tensors.
+        inputs: Tuple containing x [..., hidden], weight [hidden], and eps.
+        output: Tensor of shape [..., hidden] in x's dtype.
+    """
     x, weight, eps = inputs
     ctx.save_for_backward(x, weight)
     ctx.eps = eps
 
 
 def _float32_rms_norm_backward(ctx, grad_output):
+    """Differentiate the fp32 RMSNorm computation.
+
+    Args:
+        ctx: Autograd context containing x [..., hidden] and weight [hidden].
+        grad_output: Output gradient of shape [..., hidden].
+
+    Returns:
+        Gradients for x [..., hidden] and weight [hidden] in their input dtypes,
+        or None for frozen inputs, followed by None for the scalar eps.
+    """
     x, weight = ctx.saved_tensors
     x_f32 = x.float()
     w_f32 = weight.float()
@@ -549,7 +597,7 @@ def _float32_rms_norm_backward(ctx, grad_output):
     r = torch.rsqrt(x_f32.pow(2).mean(-1, keepdim=True) + ctx.eps)
     xnorm = x_f32 * r
 
-    grad_w = (g_f32 * xnorm).sum(list(range(g_f32.ndim - 1)))
+    grad_w = (g_f32 * xnorm).sum_to_size(weight.shape)
 
     gw = g_f32 * w_f32
     grad_x = r * (gw - xnorm * (gw * xnorm).mean(-1, keepdim=True))
@@ -561,8 +609,7 @@ def _float32_rms_norm_backward(ctx, grad_output):
     )
 
 
-torch.library.register_autograd(
-    "nemo_automodel::float32_rms_norm",
+_float32_rms_norm_impl.register_autograd(
     _float32_rms_norm_backward,
     setup_context=_float32_rms_norm_setup_context,
 )
@@ -572,8 +619,15 @@ torch.library.register_autograd(
 def _float32_rms_norm_fwd(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     """Compiled fp32 RMSNorm forward — standalone function to minimize dynamo guards.
 
-    Delegates to a custom op so inductor does not decompose rms_norm into a
-    non-deterministic Triton reduction kernel.
+    The opaque forward keeps the same computation in grad and no_grad contexts.
+
+    Args:
+        x: Tensor of shape [..., hidden], with arbitrary leading dimensions.
+        weight: Tensor of shape [hidden] on the same device as x.
+        eps: Epsilon added to the mean square.
+
+    Returns:
+        Tensor of shape [..., hidden] in x's dtype.
     """
     return torch.ops.nemo_automodel.float32_rms_norm(x, weight, eps)
 
