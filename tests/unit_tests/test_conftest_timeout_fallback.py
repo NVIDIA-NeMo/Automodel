@@ -18,7 +18,9 @@ model the base and pull-request revisions so the checks exercise the same
 changed-test discovery used in CI.
 """
 
+import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -69,6 +71,7 @@ def _run_sleeper(
     module_marker: str = "",
     function_marker: str = "",
     changed: bool = True,
+    run_in_subprocess: bool = False,
 ) -> tuple[pytest.RunResult, Path]:
     """Run one sleeping test under a copy of the unit-test conftest."""
     pytester.makeconftest(_CONFTEST_SOURCE)
@@ -97,7 +100,14 @@ def _run_sleeper(
         _git(pytester, "add", str(test_path.name))
         _git(pytester, "commit", "-q", "-m", "change test")
 
-    result = pytester.runpytest("-p", "no:cacheprovider", *_POLICY_ARGS, *args)
+    if run_in_subprocess:
+        # pytester relocates HOME, which can hide user-site packages such as torch
+        # from the fresh interpreter used by local development environments.
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            monkeypatch.setenv("PYTHONPATH", os.pathsep.join(path for path in sys.path if path))
+            result = pytester.runpytest_subprocess("-p", "no:cacheprovider", *_POLICY_ARGS, *args)
+    else:
+        result = pytester.runpytest("-p", "no:cacheprovider", *_POLICY_ARGS, *args)
     return result, pytester.path / "completed"
 
 
@@ -163,26 +173,41 @@ def test_cli_timeout_zero_disables_policy(pytester: pytest.Pytester):
     assert completed.exists()
 
 
+@pytest.mark.runtime_budget(
+    30,
+    hard_timeout=60,
+    reason="starts a fresh pytest subprocess to isolate the intentional timeout",
+)
 def test_cli_timeout_overrides_policy(pytester: pytest.Pytester):
-    result, completed = _run_sleeper(pytester, 0.12, "--timeout=0.05")
+    result, completed = _run_sleeper(pytester, 0.12, "--timeout=0.05", run_in_subprocess=True)
 
     result.assert_outcomes(failed=1)
     result.stdout.fnmatch_lines(["*Timeout (>0.05s) from pytest-timeout*"])
     assert not completed.exists()
 
 
+@pytest.mark.runtime_budget(
+    30,
+    hard_timeout=60,
+    reason="starts a fresh pytest subprocess to isolate the intentional timeout",
+)
 def test_env_timeout_overrides_policy(pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("PYTEST_TIMEOUT", "0.05")
-    result, completed = _run_sleeper(pytester, 0.12)
+    result, completed = _run_sleeper(pytester, 0.12, run_in_subprocess=True)
 
     result.assert_outcomes(failed=1)
     result.stdout.fnmatch_lines(["*Timeout (>0.05s) from pytest-timeout*"])
     assert not completed.exists()
 
 
+@pytest.mark.runtime_budget(
+    30,
+    hard_timeout=60,
+    reason="starts a fresh pytest subprocess to isolate the intentional timeout",
+)
 def test_ini_timeout_overrides_policy(pytester: pytest.Pytester):
     pytester.makeini("[pytest]\ntimeout = 0.05\n")
-    result, completed = _run_sleeper(pytester, 0.12)
+    result, completed = _run_sleeper(pytester, 0.12, run_in_subprocess=True)
 
     result.assert_outcomes(failed=1)
     result.stdout.fnmatch_lines(["*Timeout (>0.05s) from pytest-timeout*"])

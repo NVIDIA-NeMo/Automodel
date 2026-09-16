@@ -306,6 +306,27 @@ def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo):
         setattr(item, "_automodel_timed_out", True)
 
 
+def _descendant_processes() -> list[psutil.Process]:
+    try:
+        return psutil.Process().children(recursive=True)
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return []
+
+
+def _is_inductor_compile_worker(process: psutil.Process) -> bool:
+    try:
+        command = " ".join(process.cmdline()).replace("\\", "/")
+    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+        return False
+    return "torch/_inductor/compile_worker" in command or "torch._inductor.compile_worker" in command
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_setup(item: pytest.Item) -> None:
+    """Remember long-lived children so a timeout does not kill another test's pool."""
+    setattr(item, "_automodel_child_pids_before", {process.pid for process in _descendant_processes()})
+
+
 def pytest_addoption(parser):
     """Additional command-line arguments passed to pytest.
     For now:
@@ -477,10 +498,12 @@ def _kill_leaked_child_processes(request: pytest.FixtureRequest):
     multiprocessing_children = multiprocessing.active_children()
     leaked_pids = {process.pid for process in multiprocessing_children if process.pid is not None}
     if getattr(request.node, "_automodel_timed_out", False):
-        try:
-            leaked_pids.update(process.pid for process in psutil.Process().children(recursive=True))
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            pass
+        child_pids_before = getattr(request.node, "_automodel_child_pids_before", set())
+        leaked_pids.update(
+            process.pid
+            for process in _descendant_processes()
+            if process.pid not in child_pids_before or _is_inductor_compile_worker(process)
+        )
     if not leaked_pids:
         return
 
