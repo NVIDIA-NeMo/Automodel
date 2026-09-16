@@ -44,7 +44,24 @@ Validation loss is computed on held-out FineWeb text using the same tokenizer an
 A lower loss on this sample does not establish improved downstream task accuracy or retained
 image understanding.
 
-## Hardware and Run Configuration
+## Guide Overview
+
+| Step | Description |
+|---|---|
+| **Step 0** | Set up the environment |
+| **Step 1** | Download a reproducible FineWeb sample |
+| **Step 2** | Tokenize the sample into Megatron `.bin/.idx` files |
+| **Step 3** | Review the continued-pretraining YAML |
+| **Step 4** | Launch training with Slurm and online W&B |
+| **Step 5** | Inspect the checkpoint and resume training |
+| **Step 6** | View the training loss in W&B |
+
+## Hardware Requirements
+
+- **8 nodes × 8 H100 80 GB GPUs** (64 GPUs) required for this recipe
+- **Storage**: Approximately 232 GiB for the base BF16 checkpoint, and approximately 6 TiB of additional shared storage for checkpoint retention
+
+## Run Configuration
 
 | Setting | Value |
 |---|---|
