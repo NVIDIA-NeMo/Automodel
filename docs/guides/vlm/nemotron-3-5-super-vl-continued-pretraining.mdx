@@ -467,8 +467,8 @@ command after checking that `LATEST` resolves to a complete checkpoint:
 --checkpoint.restore_from=/path/to/checkpoints/LATEST
 ```
 
-Keep the tokenizer, dataset prefix and revision, train/validation split, seed, and batch
-semantics fixed when resuming training. The optimizer scheduler restores its
+Keep the tokenizer, dataset prefix, dataset revision, training and validation split, seed, and batch
+semantics fixed when resuming training. The learning-rate scheduler restores its
 checkpointed decay schedule by default: increasing `step_scheduler.max_steps` alone does
 not extend the saved learning-rate decay. For this recipe, keep the original 10,000-step
 schedule when continuing training.
