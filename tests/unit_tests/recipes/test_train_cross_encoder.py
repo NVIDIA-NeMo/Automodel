@@ -12,11 +12,41 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for accuracy() and batch_mrr() from train_cross_encoder."""
+"""Unit tests for the cross-encoder training recipe."""
 
+from types import SimpleNamespace
+
+import pytest
 import torch
 
-from nemo_automodel.recipes.retrieval.train_cross_encoder import accuracy, batch_mrr
+from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.recipes.retrieval.train_cross_encoder import (
+    TrainCrossEncoderRecipe,
+    accuracy,
+    batch_mrr,
+)
+
+# ---------------------------------------------------------------------------
+# temperature configuration
+# ---------------------------------------------------------------------------
+
+
+def test_recipe_rejects_two_active_non_unit_temperatures() -> None:
+    """Recipe and model temperature must not both scale logits."""
+    recipe = TrainCrossEncoderRecipe(ConfigNode({"temperature": 0.3}))
+    model = SimpleNamespace(effective_score_temperature=0.02)
+
+    with pytest.raises(ValueError, match="Set either top-level temperature or model.temperature to 1.0"):
+        recipe._validate_model(model)
+
+
+def test_recipe_allows_model_temperature_when_recipe_temperature_is_unit() -> None:
+    """A model-owned temperature is valid when recipe scaling is disabled."""
+    recipe = TrainCrossEncoderRecipe(ConfigNode({"temperature": 1.0}))
+    model = SimpleNamespace(effective_score_temperature=0.02)
+
+    recipe._validate_model(model)
+
 
 # ---------------------------------------------------------------------------
 # accuracy

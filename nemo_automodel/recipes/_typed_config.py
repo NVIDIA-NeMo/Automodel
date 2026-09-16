@@ -63,6 +63,7 @@ if TYPE_CHECKING:
     from nemo_automodel.components.optim.optimizer import OptimizerConfig
     from nemo_automodel.components.training.embedding_row_repair import EmbeddingRowRepairConfig
     from nemo_automodel.components.training.prewarm import PrewarmConfig
+    from nemo_automodel.components.utils.model_utils import FreezeConfig
 
 # Keys present in the YAML ``step_scheduler:`` block that are runtime args passed
 # to ``StepSchedulerConfig.build(...)`` separately (not config fields).
@@ -141,6 +142,14 @@ class RecipeConfig:
 
     def __init__(self, raw: "ConfigNode"):
         self._raw = raw
+
+    @cached_property
+    def freeze_config(self) -> FreezeConfig | None:
+        """Return the validated parameter-freezing policy from the YAML boundary."""
+        from nemo_automodel.components.utils.model_utils import parse_freeze_config
+
+        node = self._raw.get("freeze_config", None)
+        return parse_freeze_config(_as_dict(node)) if node is not None else None
 
     @cached_property
     def wandb(self) -> WandbConfig | None:

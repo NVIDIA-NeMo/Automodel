@@ -22,6 +22,7 @@ import torch
 
 from nemo_automodel._transformers.auto_model import (
     _MAX_BUILD_RETRIES,
+    NeMoAutoModelBiEncoder,
     NeMoAutoModelForCausalLM,
     _alias_remote_auto_map_for_target,
     _BaseNeMoAutoModelClass,
@@ -51,6 +52,7 @@ from nemo_automodel.components.distributed.config import (
 )
 from nemo_automodel.components.distributed.mesh import MeshAxisName, MeshContext
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.utils.model_utils import apply_parameter_freezing
 
 
 class _FakeMesh:
@@ -60,6 +62,61 @@ class _FakeMesh:
 
     def __getitem__(self, axis):
         return types.SimpleNamespace(size=lambda: self._sizes[axis])
+
+
+class _VisualRetriever(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.model = torch.nn.Module()
+        self.model.vision_tower = torch.nn.Linear(2, 2)
+        self.model.multi_modal_projector = torch.nn.Linear(2, 2)
+        self.model.language_model = torch.nn.Linear(2, 2)
+
+
+def test_retrieval_freeze_config_survives_kernel_retry_and_only_trains_projector():
+    freeze_config = {
+        "freeze_vision_tower": True,
+        "freeze_language_model": True,
+    }
+    model = _VisualRetriever()
+
+    def _apply_infrastructure(*, model, freeze_config, **kwargs):
+        apply_parameter_freezing(model, freeze_config)
+        return model
+
+    with (
+        patch(
+            "nemo_automodel._transformers.retrieval.BiEncoderModel.build",
+            side_effect=[_VisualRetriever(), model],
+        ) as mock_build,
+        patch(
+            "nemo_automodel._transformers.auto_model.instantiate_infrastructure",
+            return_value=(None, None, None, None),
+        ),
+        patch(
+            "nemo_automodel._transformers.auto_model._patch_liger_kernel",
+            side_effect=RuntimeError("unsupported test kernel"),
+        ),
+        patch(
+            "nemo_automodel._transformers.auto_model.apply_model_infrastructure",
+            side_effect=_apply_infrastructure,
+        ) as mock_infrastructure,
+        patch("torch.cuda.current_device", return_value=0),
+    ):
+        result = NeMoAutoModelBiEncoder.from_pretrained(
+            "test-model",
+            freeze_config=freeze_config,
+            use_sdpa_patching=False,
+        )
+
+    assert result is model
+    assert mock_build.call_count == 2
+    assert all("freeze_config" not in call.kwargs for call in mock_build.call_args_list)
+    assert mock_infrastructure.call_args.kwargs["freeze_config"] == freeze_config
+    assert {name for name, param in result.named_parameters() if param.requires_grad} == {
+        "model.multi_modal_projector.bias",
+        "model.multi_modal_projector.weight",
+    }
 
 
 class TestResolveMeshContext:
@@ -633,6 +690,30 @@ def test_patch_liger_kernel_success(monkeypatch):
 
     # SDPA not called inside _patch_liger_kernel (it's called separately)
     attn_mock.assert_not_called()
+
+
+def test_patch_liger_kernel_uses_model_owned_hook(monkeypatch):
+    """Composite models can own their model-specific Liger policy."""
+    import nemo_automodel._transformers.kernel_patches as tgt
+
+    apply_mock, _ = prepare_env(monkeypatch, tgt, has_liger=True, apply_ok=True)
+
+    class ModelOwnedLigerPatch(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.liger_patch = MagicMock()
+
+        def _nemo_apply_liger_kernel(self, liger_kernel_transformers):
+            self.liger_patch(liger_kernel_transformers)
+
+    backbone = ModelOwnedLigerPatch()
+    model = torch.nn.Module()
+    model.model = backbone
+    patched = tgt._patch_liger_kernel(model)
+
+    assert patched is model
+    apply_mock.assert_not_called()
+    backbone.liger_patch.assert_called_once_with(tgt.liger_kernel_trf)
 
 
 def test_liger_not_available(monkeypatch):

@@ -321,10 +321,21 @@ class ProcessorMethodCollator:
             tokenizer: Runtime multimodal processor.
             collator_fn_name: Processor method used to collate each batch.
         """
+        self.processor = tokenizer
         self.collate_fn = cast(
             Callable[[list[dict[str, object]]], dict[str, object]],
             getattr(tokenizer, collator_fn_name),
         )
+
+    @property
+    def query_prefix(self) -> str:
+        """Return the query prefix owned by the underlying processor."""
+        return cast(str, getattr(self.processor, "query_prefix"))
+
+    @property
+    def passage_prefix(self) -> str:
+        """Return the passage prefix owned by the underlying processor."""
+        return cast(str, getattr(self.processor, "passage_prefix"))
 
     def __call__(self, batch: list[dict[str, object]]) -> dict[str, object]:
         """Collate retrieval examples with the resolved processor method.
