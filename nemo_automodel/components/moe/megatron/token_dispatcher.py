@@ -581,6 +581,9 @@ class TokenDispatcherConfig:
     moe_hybridep_permute_fusion: bool = False
     """Fuse HybridEP permutation with dispatch and unpermutation with combine."""
 
+    moe_hybridep_compact_routing: bool = False
+    """Send compact top-k indices instead of a dense Boolean HybridEP routing map."""
+
     moe_hybridep_num_sms_preprocessing: int | None = None
     """Optional number of SMs used by HybridEP routing-metadata preprocessing."""
 
@@ -754,21 +757,25 @@ class MoEFlexTokenDispatcher:
         token_probs: torch.Tensor,
         token_indices: torch.Tensor,
     ):
-        """Prepare ``hidden_states[..., H]`` and compact routing metadata for dispatch.
+        """Prepare ``hidden_states[..., H]`` and routing metadata for dispatch.
 
         DeepEP consumes ``token_indices[T, K]`` and ``token_probs[T, K]`` directly. HybridEP
-        keeps compact indices for metadata communication and expands probabilities to ``[T, E]``
+        uses its established dense routing map by default. Compact routing can be enabled to
+        keep top-k indices for metadata communication while expanding probabilities to ``[T, E]``
         so the existing dense router-gradient layout is preserved.
         """
         self.hidden_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
 
         if isinstance(self._comm_manager, _HybridEPManager):
-            assert self.hybridep_metadata_processor is not None
-            multihot_probs = self.hybridep_metadata_processor(token_indices, token_probs)
-            self._comm_manager.token_indices = token_indices
-            self._comm_manager.routing_map = None
-            self._comm_manager.token_probs = multihot_probs
+            if self.config.moe_hybridep_compact_routing:
+                assert self.hybridep_metadata_processor is not None
+                multihot_probs = self.hybridep_metadata_processor(token_indices, token_probs)
+                self._comm_manager.token_indices = token_indices
+                self._comm_manager.routing_map = None
+                self._comm_manager.token_probs = multihot_probs
+            else:
+                self._comm_manager.setup_metadata_from_indices(token_indices, token_probs)
         else:
             self._comm_manager.token_probs = token_probs
             self._comm_manager.token_indices = token_indices

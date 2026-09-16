@@ -962,6 +962,9 @@ class GroupedExpertsDeepEP(nn.Module):
         self.dispatcher_hybridep_permute_fusion = (
             backend.dispatcher_hybridep_permute_fusion if backend is not None else False
         )
+        self.dispatcher_hybridep_compact_routing = (
+            backend.dispatcher_hybridep_compact_routing if backend is not None else False
+        )
         self.dispatcher_hybridep_num_sms_preprocessing = (
             backend.dispatcher_hybridep_num_sms_preprocessing if backend is not None else None
         )
@@ -1005,6 +1008,7 @@ class GroupedExpertsDeepEP(nn.Module):
             moe_share_token_dispatcher=self.dispatcher_share_token_dispatcher,
             moe_deepep_async_dispatch=self.dispatcher_async_dispatch,
             moe_hybridep_permute_fusion=self.dispatcher_hybridep_permute_fusion,
+            moe_hybridep_compact_routing=self.dispatcher_hybridep_compact_routing,
             moe_hybridep_num_sms_preprocessing=self.dispatcher_hybridep_num_sms_preprocessing,
             moe_hybridep_num_blocks_permute=self.dispatcher_hybridep_num_blocks_permute,
             moe_hybridep_num_blocks_unpermute=self.dispatcher_hybridep_num_blocks_unpermute,
@@ -1272,6 +1276,9 @@ class GroupedExpertsTE(nn.Module):
         self.dispatcher_async_dispatch = dispatcher_async_dispatch
         self.dispatcher_hybridep_permute_fusion = (
             backend.dispatcher_hybridep_permute_fusion if backend is not None else False
+        )
+        self.dispatcher_hybridep_compact_routing = (
+            backend.dispatcher_hybridep_compact_routing if backend is not None else False
         )
         self.dispatcher_hybridep_num_sms_preprocessing = (
             backend.dispatcher_hybridep_num_sms_preprocessing if backend is not None else None
@@ -1593,6 +1600,7 @@ class GroupedExpertsTE(nn.Module):
             moe_share_token_dispatcher=self.dispatcher_share_token_dispatcher,
             moe_deepep_async_dispatch=self.dispatcher_async_dispatch,
             moe_hybridep_permute_fusion=self.dispatcher_hybridep_permute_fusion,
+            moe_hybridep_compact_routing=self.dispatcher_hybridep_compact_routing,
             moe_hybridep_num_sms_preprocessing=self.dispatcher_hybridep_num_sms_preprocessing,
             moe_hybridep_num_blocks_permute=self.dispatcher_hybridep_num_blocks_permute,
             moe_hybridep_num_blocks_unpermute=self.dispatcher_hybridep_num_blocks_unpermute,

@@ -159,6 +159,7 @@ class TestIndicesToMultihot:
     def test_dispatch_preprocess_retains_compact_indices(self, hybrid_ep_manager):
         dispatcher = object.__new__(MoEFlexTokenDispatcher)
         dispatcher._comm_manager = hybrid_ep_manager
+        dispatcher.config = SimpleNamespace(moe_hybridep_compact_routing=True)
         dispatcher.hybridep_metadata_processor = _HybridEPMetadataProcessor(num_experts=8, permute_fusion=False)
         hidden = torch.randn(2, 4)
         token_indices = torch.tensor([[0, 3], [1, 5]])
@@ -169,6 +170,22 @@ class TestIndicesToMultihot:
         assert actual_hidden.data_ptr() == hidden.data_ptr()
         assert hybrid_ep_manager.token_indices is token_indices
         assert hybrid_ep_manager.routing_map is None
+        assert actual_probs.shape == (2, 8)
+
+    def test_dispatch_preprocess_uses_dense_routing_by_default(self, hybrid_ep_manager):
+        dispatcher = object.__new__(MoEFlexTokenDispatcher)
+        dispatcher._comm_manager = hybrid_ep_manager
+        dispatcher.config = SimpleNamespace(moe_hybridep_compact_routing=False)
+        dispatcher.hybridep_metadata_processor = _HybridEPMetadataProcessor(num_experts=8, permute_fusion=False)
+        hidden = torch.randn(2, 4)
+        token_indices = torch.tensor([[0, 3], [1, 5]])
+        token_probs = torch.tensor([[0.6, 0.4], [0.7, 0.3]])
+
+        actual_hidden, actual_probs = dispatcher.dispatch_preprocess2(hidden, 2, token_probs, token_indices)
+
+        assert actual_hidden.data_ptr() == hidden.data_ptr()
+        assert hybrid_ep_manager.token_indices is None
+        assert hybrid_ep_manager.routing_map.shape == (2, 8)
         assert actual_probs.shape == (2, 8)
 
     def test_topk_1(self, hybrid_ep_manager):

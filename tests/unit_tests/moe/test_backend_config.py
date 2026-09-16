@@ -208,6 +208,13 @@ class TestBackendConfigHybridEP:
         assert config.dispatcher_hybridep_num_blocks_permute == 112
         assert config.dispatcher_hybridep_num_blocks_unpermute == 112
 
+    def test_hybridep_compact_routing_is_opt_in(self):
+        default = BackendConfig(dispatcher="hybridep")
+        compact = BackendConfig(dispatcher="hybridep", dispatcher_hybridep_compact_routing=True)
+
+        assert default.dispatcher_hybridep_compact_routing is False
+        assert compact.dispatcher_hybridep_compact_routing is True
+
     def test_dispatcher_share_token_dispatcher_default(self):
         """Test that dispatcher_share_token_dispatcher defaults to enabled."""
         config = BackendConfig(dispatcher="deepep")

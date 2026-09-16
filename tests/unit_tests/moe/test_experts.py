@@ -1058,6 +1058,7 @@ class TestGroupedExpertsDeepEP:
         """Test init_token_dispatcher passes hybridep config to TokenDispatcherConfig."""
         backend = BackendConfig(
             dispatcher_hybridep_permute_fusion=True,
+            dispatcher_hybridep_compact_routing=True,
             dispatcher_hybridep_num_sms_preprocessing=132,
             dispatcher_hybridep_num_blocks_permute=112,
             dispatcher_hybridep_num_blocks_unpermute=112,
@@ -1092,6 +1093,7 @@ class TestGroupedExpertsDeepEP:
             assert config_arg.moe_share_token_dispatcher is False
             assert config_arg.moe_deepep_async_dispatch is True
             assert config_arg.moe_hybridep_permute_fusion is True
+            assert config_arg.moe_hybridep_compact_routing is True
             assert config_arg.moe_hybridep_num_sms_preprocessing == 132
             assert config_arg.moe_hybridep_num_blocks_permute == 112
             assert config_arg.moe_hybridep_num_blocks_unpermute == 112

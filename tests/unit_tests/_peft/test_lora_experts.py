@@ -177,6 +177,7 @@ def test_grouped_experts_deepep_lora_preserves_dispatcher_settings(moe_config):
     """Test that LoRA wrapping preserves the source expert dispatcher backend."""
     backend = BackendConfig(
         dispatcher_hybridep_permute_fusion=True,
+        dispatcher_hybridep_compact_routing=True,
         dispatcher_hybridep_num_sms_preprocessing=132,
         dispatcher_hybridep_num_blocks_permute=112,
         dispatcher_hybridep_num_blocks_unpermute=112,
@@ -199,6 +200,7 @@ def test_grouped_experts_deepep_lora_preserves_dispatcher_settings(moe_config):
     assert lora_experts.dispatcher_share_token_dispatcher is False
     assert lora_experts.dispatcher_async_dispatch is True
     assert lora_experts.dispatcher_hybridep_permute_fusion is True
+    assert lora_experts.dispatcher_hybridep_compact_routing is True
     assert lora_experts.dispatcher_hybridep_num_sms_preprocessing == 132
     assert lora_experts.dispatcher_hybridep_num_blocks_permute == 112
     assert lora_experts.dispatcher_hybridep_num_blocks_unpermute == 112
