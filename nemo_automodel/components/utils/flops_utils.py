@@ -1436,6 +1436,143 @@ def mla_moe_flops(config, gbs=1, seq_len=None):
     )
 
 
+def _kda_attention_per_layer_flops(
+    gbs: int,
+    seq_len: int,
+    hs: int,
+    head_dim: int,
+    num_heads: int,
+    conv_kernel_size: int,
+    use_full_rank_gate: bool,
+    chunk_size: int = 64,
+) -> float:
+    """Per-layer FLOPs for Kimi Delta Attention (KDA, gated delta-rule linear attention).
+
+    Projections follow the KDA layer definition (Kimi Linear, arXiv:2510.26692):
+    q/k/v with short causal convolutions, the low-rank forget gate
+    (``f_a``/``f_b``), the beta projection, the output gate (full-rank ``g_proj``
+    or low-rank ``g_a``/``g_b``) and ``o_proj``. The chunkwise kernel is costed
+    with the paper's own count, ``FLOPs_KDA(T; C, d_h) = 6 T d_h^2 + 3 T C d_h + T C^2``
+    per head (forward, chunk size ``C``), halved to MAC-equivalents so the shared
+    ``6 x`` (forward + backward) factor of this module applies.
+    """
+    proj = num_heads * head_dim
+    gate_params = hs * proj if use_full_rank_gate else hs * head_dim + head_dim * proj
+    linear_params = (
+        3 * hs * proj  # q, k, v projections
+        + hs * head_dim
+        + head_dim * proj  # forget gate f_a / f_b
+        + hs * num_heads  # beta projection
+        + gate_params  # output gate
+        + proj * hs  # o_proj
+    )
+    conv_per_token = 3 * proj * conv_kernel_size
+    kernel_per_token = num_heads * (6 * head_dim**2 + 3 * chunk_size * head_dim + chunk_size**2) / 2
+    return 6 * gbs * seq_len * (linear_params + conv_per_token + kernel_per_token)
+
+
+def kimi_k3_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> float:
+    """Model FLOPs for Kimi K3 (hybrid KDA / gated-MLA attention + latent MoE with a SiTU shared expert).
+
+    Accepts ``KimiK3TextConfig`` or the multimodal ``KimiK3Config`` wrapper (its
+    ``text_config`` is used; the vision tower is not counted, as for other VL entries).
+
+    The layer pattern is read from the config rather than assumed: 1-based
+    ``linear_attn_config["kda_layers"]`` marks KDA layers and every other layer
+    is MLA (with an extra output-gate projection when ``mla_use_output_gate``);
+    ``first_k_dense_replace`` / ``moe_layer_freq`` mark dense vs MoE MLPs, using
+    the same rule as ``KimiDecoderLayer``. Routed experts run in a latent space
+    of ``routed_expert_hidden_size`` behind shared down/up projections, and the
+    shared expert is one SiTU MLP of ``moe_intermediate_size * num_shared_experts``.
+    The router GEMM (``hidden_size x num_experts``, about 0.6% of the total), norms
+    and the scalar attention-residual projections are omitted, matching the other
+    MoE formulas in this module.
+
+    The router top-k field on this config is ``num_experts_per_token`` (not the
+    ``num_experts_per_tok`` that the generic ``transformer_flops`` fallback probes),
+    which is why K3 was previously costed as a dense 93-layer transformer at well
+    under half of its real FLOPs. For the released checkpoint's configuration
+    (96 attention heads, dense ``intermediate_size`` 33792) the formula counts
+    104.0B active matmul parameters per token and 2.78T total, matching the
+    model card ("104B activated / 2.8T") and the tech report's Table 1 (104.2B /
+    2.78T) to within 0.2%, which is inside the accounting difference for the
+    non-GEMM parameters (router, norms, gate biases). The report's
+    single MTP layer is not shipped in the checkpoint (``num_nextn_predict_layers``
+    is 0) and is not modelled by Automodel, so it is not counted.
+    """
+    if hasattr(config, "text_config") and not hasattr(config, "num_hidden_layers"):
+        config = config.text_config
+
+    if seq_len is None:
+        seq_len = getattr(config, "max_position_embeddings", 2048)
+
+    layers = config.num_hidden_layers
+    hs = config.hidden_size
+    vocab_size = config.vocab_size
+
+    # --- attention layer pattern (1-based kda_layers list) ---
+    linear_attn_config = getattr(config, "linear_attn_config", None) or {}
+    kda_layer_ids = set(linear_attn_config.get("kda_layers", []))
+    num_kda_layers = sum(1 for layer in range(1, layers + 1) if layer in kda_layer_ids)
+    num_mla_layers = layers - num_kda_layers
+
+    attention_heads = config.num_attention_heads
+    mla_per_layer = _mla_attention_per_layer_flops(
+        gbs,
+        seq_len,
+        hs,
+        attention_heads,
+        getattr(config, "q_lora_rank", None),
+        config.kv_lora_rank,
+        config.qk_rope_head_dim,
+        config.qk_nope_head_dim,
+        config.v_head_dim,
+    )
+    if getattr(config, "mla_use_output_gate", False):
+        mla_per_layer += 6 * gbs * seq_len * hs * attention_heads * config.v_head_dim
+
+    kda_per_layer = 0
+    if num_kda_layers:
+        kda_per_layer = _kda_attention_per_layer_flops(
+            gbs,
+            seq_len,
+            hs,
+            linear_attn_config["head_dim"],
+            linear_attn_config["num_heads"],
+            linear_attn_config.get("short_conv_kernel_size", 4),
+            linear_attn_config.get("use_full_rank_gate", False),
+        )
+    attention_flops = num_mla_layers * mla_per_layer + num_kda_layers * kda_per_layer
+
+    # --- MLP layer pattern (same rule as KimiDecoderLayer) ---
+    num_experts = getattr(config, "num_experts", None)
+    is_moe = num_experts is not None and num_experts > 1
+    first_k_dense = getattr(config, "first_k_dense_replace", 0) or 0
+    moe_layer_freq = getattr(config, "moe_layer_freq", 1) or 1
+    num_moe_layers = sum(1 for i in range(layers) if is_moe and i >= first_k_dense and i % moe_layer_freq == 0)
+    num_dense_layers = layers - num_moe_layers
+
+    dense_ffn_params = 3 * hs * config.intermediate_size  # SiTU MLP: gate, up, down
+    moe_ffn_params = 0
+    if is_moe:
+        moe_topk = getattr(config, "num_experts_per_token", None)
+        if moe_topk is None:
+            moe_topk = getattr(config, "num_experts_per_tok", 1)
+        moe_ffn_hs = config.moe_intermediate_size
+        latent = getattr(config, "routed_expert_hidden_size", None)
+        expert_in = latent or hs
+        routed_params = moe_topk * 3 * expert_in * moe_ffn_hs
+        latent_proj_params = 2 * hs * latent if latent else 0
+        shared_params = 3 * hs * moe_ffn_hs * (getattr(config, "num_shared_experts", 0) or 0)
+        moe_ffn_params = routed_params + latent_proj_params + shared_params
+    ffn_flops = 6 * gbs * seq_len * (num_dense_layers * dense_ffn_params + num_moe_layers * moe_ffn_params)
+
+    # --- vocab ---
+    vocab_flops = 6 * gbs * seq_len * hs * vocab_size
+
+    return attention_flops + ffn_flops + vocab_flops
+
+
 def step3_5_flash_flops(config, gbs=1, seq_len=None):
     """Model FLOPs for Step3.5-Flash (GQA + sliding-window / full attention + MoE).
 
@@ -1620,6 +1757,8 @@ def get_flops_formula_for_hf_config(config: Any) -> Callable | None:
         "Mistral3Config": mla_moe_flops,  # Mistral Small 4 (VL wrapper, extracts text_config)
         "KimiK2Config": mla_moe_flops,  # Kimi K2 / K2.5
         "KimiK25Config": mla_moe_flops,
+        "KimiK3TextConfig": kimi_k3_flops,  # Kimi K3 (hybrid KDA/MLA + latent MoE)
+        "KimiK3Config": kimi_k3_flops,  # Kimi K3 multimodal wrapper (text_config)
         # Step3.5-Flash
         "Step3p5Config": step3_5_flash_flops,
         "LongcatFlashConfig": mla_moe_flops,  # MLA + MoE

@@ -646,6 +646,35 @@ def test_apply_ep_parallelizes_moe_experts(monkeypatch):
     assert isinstance(kwargs["parallelize_plan"], P.ExpertParallel)
 
 
+def test_apply_ep_excludes_te_owned_experts_from_tp_replica_sync(monkeypatch):
+    """TE's plain local expert tensors remain owned by the folded EP mesh."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+
+    class DummyGroupedExpertsTE:
+        def __init__(self):
+            self.init_token_dispatcher = MagicMock()
+
+    experts = DummyGroupedExpertsTE()
+    moe = DummyMoE()
+    moe.experts = experts
+    block = DummyBlock(mlp=moe)
+    model = DummyModel([block])
+    ep_mesh = type("Mesh", (), {"size": lambda self: 2})()
+    moe_mesh = object()
+
+    monkeypatch.setattr(P, "GroupedExpertsTE", DummyGroupedExpertsTE)
+    exclude_mock = MagicMock()
+    tp_replicas_stub = types.ModuleType("nemo_automodel.components.distributed.tp_replicas")
+    tp_replicas_stub.exclude_from_tp_replica_sync = exclude_mock
+    monkeypatch.setitem(sys.modules, "nemo_automodel.components.distributed.tp_replicas", tp_replicas_stub)
+
+    P.apply_ep(model, ep_mesh, moe_mesh=moe_mesh)
+
+    experts.init_token_dispatcher.assert_called_once_with(ep_mesh=ep_mesh, moe_mesh=moe_mesh)
+    exclude_mock.assert_called_once_with(experts)
+
+
 def test_apply_ep_parallelizes_diffusion_style_block_moe(monkeypatch):
     """Diffusion Gemma exposes the MoE branch as block.moe, not block.mlp."""
     P = _import_parallelizer_with_stubs(monkeypatch)
@@ -926,6 +955,34 @@ def test_apply_fsdp_installs_accumulated_grad_guard(monkeypatch):
     )
 
     guard_mock.assert_called_once_with()
+
+
+def test_apply_fsdp_rejects_mok_mxfp8_with_ep_shard(monkeypatch):
+    P = _import_parallelizer_with_stubs(monkeypatch)
+
+    class MoKExperts(DummyExperts):
+        def __init__(self):
+            super().__init__()
+            self.runtime = types.SimpleNamespace(mok_config=types.SimpleNamespace(precision="mxfp8"))
+
+    class MoEModule:
+        def __init__(self):
+            self.experts = MoKExperts()
+            self.gate = None
+
+    monkeypatch.setattr(P, "MoE", MoEModule)
+    monkeypatch.setattr(P, "GroupedExpertsMoK", MoKExperts)
+    monkeypatch.setattr(P, "fully_shard", MagicMock())
+    monkeypatch.setattr(P, "MixedPrecisionPolicy", MagicMock(return_value="MP_POLICY"))
+
+    with pytest.raises(ValueError, match="MoK MXFP8 currently requires ep_shard size 1"):
+        P.apply_fsdp(
+            model=DummyModel([DummyBlock(mlp=MoEModule())]),
+            fsdp_mesh=object(),
+            ep_enabled=True,
+            ep_shard_enabled=True,
+            ep_shard_mesh=object(),
+        )
 
 
 def test_apply_fsdp_routes_strict_fp32_contract_and_expert_exclusions_to_shared_sharder(monkeypatch):

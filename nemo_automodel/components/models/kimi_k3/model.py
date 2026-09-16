@@ -58,7 +58,9 @@ from nemo_automodel.components.models.kimi_k3.cp import (
 )
 from nemo_automodel.components.models.kimi_k3.situ import (
     _apply_attn_res,
+    _compile_norm_core,
     _compile_situ_cores,
+    _rms_norm,
     _weighted_situ,
 )
 from nemo_automodel.components.models.kimi_k3.state_dict_adapter import KimiK3StateDictAdapter
@@ -231,6 +233,12 @@ def _pad_input(hidden_states: torch.Tensor, indices: torch.Tensor, batch_size: i
     return output.reshape(batch_size, seq_len, *hidden_states.shape[1:])
 
 
+# One cached upper-triangular mask per (dtype, device), grown on demand and
+# sliced per call, so repeated microbatches skip rebuilding the [S, S] mask on
+# the hot path while the cache stays bounded to a single largest-size entry.
+_CAUSAL_MASK_CACHE: dict[tuple[torch.dtype, torch.device], torch.Tensor] = {}
+
+
 def _make_causal_mask(
     inputs_embeds: torch.Tensor,
     packed_context: "KimiPackedContext | None",
@@ -257,10 +265,14 @@ def _make_causal_mask(
             q_global_start=0,
             dtype=dtype,
         )
-    min_value = torch.finfo(dtype).min
-    mask = torch.full((seq_len, seq_len), min_value, device=inputs_embeds.device, dtype=dtype)
-    mask = torch.triu(mask, diagonal=1)
-    return mask[None, None, :, :].expand(batch_size, 1, -1, -1)
+    cache_key = (dtype, inputs_embeds.device)
+    mask = _CAUSAL_MASK_CACHE.get(cache_key)
+    if mask is None or mask.shape[0] < seq_len:
+        min_value = torch.finfo(dtype).min
+        mask = torch.full((seq_len, seq_len), min_value, device=inputs_embeds.device, dtype=dtype)
+        mask = torch.triu(mask, diagonal=1)
+        _CAUSAL_MASK_CACHE[cache_key] = mask
+    return mask[None, None, :seq_len, :seq_len].expand(batch_size, 1, -1, -1)
 
 
 def _packed_context_from_inputs(
@@ -306,11 +318,7 @@ class KimiRMSNorm(nn.Module):
         Returns:
             Tensor of shape [batch, sequence, hidden].
         """
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
+        return _rms_norm(hidden_states, self.weight, self.variance_epsilon)
 
     def reset_parameters(self) -> None:
         nn.init.ones_(self.weight)
@@ -1053,6 +1061,19 @@ class KimiK3Gate(Gate):
         return weights * self.route_scale, indices, None
 
 
+_SHARED_EXPERT_STREAMS: dict[int, torch.cuda.Stream] = {}
+
+
+def _shared_expert_stream(device: torch.device) -> torch.cuda.Stream:
+    """Return the per-device side stream used for shared-expert overlap (created lazily, one per process)."""
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    stream = _SHARED_EXPERT_STREAMS.get(index)
+    if stream is None:
+        stream = torch.cuda.Stream(device=index)
+        _SHARED_EXPERT_STREAMS[index] = stream
+    return stream
+
+
 class KimiK3MoE(MoE):
     """K3 routed experts with latent projections and a SiTU shared expert."""
 
@@ -1071,6 +1092,8 @@ class KimiK3MoE(MoE):
             self.gate = KimiK3Gate(moe_config, gate_precision=torch.float32)
         if backend.compile_situ:
             _compile_situ_cores()
+        if backend.compile_norm:
+            _compile_norm_core()
         expert_activation = partial(
             _weighted_situ,
             beta=config.activation_situ_beta or 1.0,
@@ -1136,6 +1159,24 @@ class KimiK3MoE(MoE):
         gate_cp_mesh = cp_mesh if cp_mesh is not None else self.cp_mesh
         weights, indices, _ = self.gate(identity, token_mask, gate_cp_mesh)
         routed_input = self.routed_expert_down_proj(identity)
+        # Shared-expert overlap (BackendConfig.shared_expert_overlap): the shared experts only
+        # depend on ``identity``, so launch them on a side stream before the routed path and
+        # join after it. Under expert parallelism the routed path spends most of its time in
+        # dispatch / combine communication on the current stream, which leaves SMs free for the
+        # shared-expert GEMMs (same idea as Megatron-Core's ``moe_shared_expert_overlap``).
+        # Autograd replays each backward op on the stream its forward op used; measured on an
+        # 8-node EP32 K3 mini the win comes from the forward and recompute passes (launching the
+        # shared experts after the routed path to reorder the backward was slower: the routed path
+        # host-syncs on tokens_per_expert, which serializes the shared experts behind it).
+        shared_output = None
+        shared_stream = None
+        if self.shared_experts is not None and self.backend.shared_expert_overlap and identity.is_cuda:
+            shared_stream = _shared_expert_stream(identity.device)
+            shared_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(shared_stream):
+                shared_output = self.shared_experts(identity)
+            # ``identity`` was allocated on the current stream; keep its block alive for the side stream.
+            identity.record_stream(shared_stream)
         if not self.training and not self._has_distributed_experts():
             routed = self._forward_reference_order(routed_input, indices, weights)
         else:
@@ -1143,7 +1184,12 @@ class KimiK3MoE(MoE):
         if self.routed_expert_norm is not None:
             routed = self.routed_expert_norm(routed)
         output = self.routed_expert_up_proj(routed)
-        if self.shared_experts is not None:
+        if shared_output is not None:
+            current = torch.cuda.current_stream()
+            current.wait_stream(shared_stream)
+            shared_output.record_stream(current)
+            output = output + shared_output
+        elif self.shared_experts is not None:
             output = output + self.shared_experts(identity)
         return output.view(shape)
 
@@ -1512,7 +1558,11 @@ class KimiK3TextModel(nn.Module):
         Returns:
             Binary padding mask tensor of shape [batch, sequence], or None when no KDA mask is needed.
         """
-        if cache_position[0] > 0 or (attention_mask is not None and torch.all(attention_mask == 1)):
+        if attention_mask is None:
+            # Both branches below return None for this input; returning early skips
+            # a per-microbatch device-to-host sync on cache_position[0].
+            return None
+        if cache_position[0] > 0 or torch.all(attention_mask == 1):
             return None
         return attention_mask
 

@@ -20,6 +20,10 @@ from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.moe.config import MoEConfig
 
+# Over the default 5s budget on purpose: CUDA Mamba kernels compile on their first invocation.
+# Reduce cold compiler startup before lowering this further.
+pytestmark = pytest.mark.timeout(60)
+
 skip_if_no_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for GPU operations")
 
 
@@ -820,6 +824,9 @@ class TestNemotronHForCausalLM:
         model = NemotronHForCausalLM(hf_config, backend=backend)
         model = model.to(torch.bfloat16)
         model.eval()
+        experts_implementation = model.get_experts_implementation()
+        assert experts_implementation == {"": hf_config._experts_implementation}
+        model.set_experts_implementation(experts_implementation)
 
         batch_size, prompt_len = 1, 4
         max_new_tokens = 3

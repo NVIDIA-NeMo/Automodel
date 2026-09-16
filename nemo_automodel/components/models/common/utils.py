@@ -22,6 +22,8 @@ from typing import Any, Literal, Protocol
 import torch
 from torch import nn
 from torch.distributed.fsdp import FSDPModule
+from torch.distributed.tensor import Replicate, Shard
+from torch.distributed.tensor.experimental import register_sharding
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel.shared.import_utils import safe_import, safe_import_from
@@ -207,6 +209,9 @@ class MoKBackendConfig:
     """Configuration for the optional Mixture-of-Kittens MoE backend.
 
     Attributes:
+        precision: Routed-expert compute precision. ``"bf16"`` passes the
+            materialized BF16 weights directly to MoK; ``"mxfp8"`` quantizes
+            them with MoK's E4M3 data and E8M0 block-scale format.
         fwd_num_comm_sms: Communication SMs reserved during the forward megakernel.
         bwd_num_comm_sms: Communication SMs reserved during the backward megakernel.
         minibatch_size: Routed-token overlap granularity, divisible by 256.
@@ -216,6 +221,7 @@ class MoKBackendConfig:
         all_gather_top_experts_chunk_bytes: Routing all-gather chunk size in bytes.
     """
 
+    precision: Literal["bf16", "mxfp8"] = "bf16"
     fwd_num_comm_sms: int = 40
     bwd_num_comm_sms: int = 28
     minibatch_size: int = 4096
@@ -225,6 +231,8 @@ class MoKBackendConfig:
 
     def __post_init__(self) -> None:
         """Validate settings that do not depend on a CUDA device or EP group."""
+        if self.precision not in ("bf16", "mxfp8"):
+            raise ValueError(f"mok.precision must be 'bf16' or 'mxfp8'; got {self.precision!r}")
         for name, value in (
             ("fwd_num_comm_sms", self.fwd_num_comm_sms),
             ("bwd_num_comm_sms", self.bwd_num_comm_sms),
@@ -296,6 +304,9 @@ class BackendConfig:
             "cudnn" select their respective packed sparse-attention kernels.
             For Qwen3.8-Flash-Next, "flex" selects FlexAttention sparse GQA on
             CUDA BF16; CPU execution retains the PyTorch numerical oracle.
+        sparse_attn: Sparse-attention backend. "generic" preserves each model's
+            existing sparse mask plus ``attn`` path; "msa" selects the optional
+            SM100 MSA kernels a model provides for its sparse layers only.
         linear: Linear layer backend ("torch", "te", or "quack").
         rms_norm: RMSNorm backend ("torch", "torch_fp32", "te", or "quack").
         rope: Rotary embedding backend ("torch" or "quack"). QuACK is currently
@@ -335,10 +346,26 @@ class BackendConfig:
             activation (currently used by Kimi K3), fusing the elementwise fp32
             chain in both the forward and the backward recompute. Compiled
             numerics are allclose to eager but not bitwise-identical.
+        compile_norm: torch.compile the fp32 RMSNorm chain of models that opt in
+            (currently Kimi K3), fusing cast/pow/mean/rsqrt/mul into one kernel.
+            Same lazy once-per-process pattern as ``compile_situ``; numerics are
+            allclose to eager but not bitwise-identical.
+        shared_expert_overlap: run the shared experts of opted-in MoE models (currently Kimi K3)
+            on a side CUDA stream so their GEMMs overlap the expert-parallel dispatch / combine
+            communication of the routed path; numerics unchanged. Default False.
+        benchmark_static_routing: Benchmark-only. Requires ``fake_balanced_gate=True``
+            with ``fake_gate_noise=0.0``, where routing metadata (tokens per expert,
+            permuted token counts) is identical for every microbatch. Skips the
+            per-microbatch device-to-host reads of that metadata (`.tolist()` /
+            `count_nonzero` / dispatcher size checks) by caching the first
+            microbatch's values, removing recurring host-sync stalls on the hot
+            path. Never enable with a learned gate: cached metadata would go
+            stale and silently corrupt expert dispatch.
         cuda_graph: Scoped partial CUDA-graph configuration.
     """
 
     attn: AttentionBackend = "te" if HAVE_TE and torch.cuda.is_available() else "sdpa"
+    sparse_attn: Literal["generic", "msa"] = "generic"
     linear: Literal["torch", "te", "quack"] = "te" if HAVE_TE and torch.cuda.is_available() else "torch"
     rms_norm: Literal["torch", "torch_fp32", "te", "quack"] = "torch_fp32"
     rope: Literal["torch", "quack"] = "torch"
@@ -377,9 +404,35 @@ class BackendConfig:
     # of models using the SiTU expert activation (currently Kimi K3). Fuses the hot fp32
     # elementwise chains; numerics are allclose to eager, not bitwise-identical. Default False.
     compile_situ: bool = False
+    # When True, torch.compile the fp32 RMSNorm chain of opted-in models (currently Kimi K3),
+    # same lazy once-per-process pattern as compile_situ. Numerics are allclose to eager,
+    # not bitwise-identical. Default False.
+    compile_norm: bool = False
+    # When True, models that opt in (currently Kimi K3) run their shared experts on a side CUDA
+    # stream, launched before the routed-expert path and joined after it, so the shared-expert
+    # GEMMs overlap the expert-parallel dispatch / combine communication (Megatron-Core's
+    # moe_shared_expert_overlap). Same math, only the execution order changes. Default False.
+    shared_expert_overlap: bool = False
+    # Benchmark-only: cache per-microbatch routing metadata (tokens per expert, permuted
+    # token counts) after the first microbatch to remove recurring device-to-host syncs.
+    # Valid ONLY with fake_balanced_gate=True and fake_gate_noise=0.0 (enforced in
+    # __post_init__), where that metadata is constant by construction. Default False.
+    benchmark_static_routing: bool = False
     cuda_graph: CudaGraphConfig = field(default_factory=CudaGraphConfig)
 
     def __post_init__(self) -> None:
+        # benchmark_static_routing caches routing metadata across microbatches, which is
+        # only sound when routing is constant by construction (forced balance, no noise).
+        if self.benchmark_static_routing and not (self.fake_balanced_gate and self.fake_gate_noise == 0.0):
+            raise ValueError(
+                "benchmark_static_routing=True requires fake_balanced_gate=True and "
+                "fake_gate_noise=0.0; with a learned or noisy gate the cached routing "
+                "metadata would go stale and corrupt expert dispatch."
+            )
+
+        if self.sparse_attn not in ("generic", "msa"):
+            raise ValueError(f"Unsupported sparse_attn={self.sparse_attn!r}; expected 'generic' or 'msa'.")
+
         # QuACK consumes position-gathered cosine/sine tables. TE's fused RoPE path
         # instead assumes contiguous [0, seq_len) positions, so combining the two
         # silently produces incorrect phases for packed, offset, or per-example
@@ -468,13 +521,121 @@ class BackendConfig:
             )
 
 
+# Keep the forward opaque so grad/no_grad compilation uses the same computation.
+@torch.library.custom_op("nemo_automodel::float32_rms_norm", mutates_args=())
+def _float32_rms_norm_impl(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    """Compute RMSNorm in fp32 with an opaque, device-independent forward.
+
+    Args:
+        x: Tensor of shape [..., hidden], with arbitrary leading dimensions.
+        weight: Tensor of shape [hidden] on the same device as x.
+        eps: Epsilon added to the mean square.
+
+    Returns:
+        Tensor of shape [..., hidden] in x's dtype, without aliasing either input.
+    """
+    return torch.nn.functional.rms_norm(x.float(), (x.shape[-1],), weight.float(), eps).to(x.dtype)
+
+
+@_float32_rms_norm_impl.register_fake
+def _float32_rms_norm_meta(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    """Describe the output metadata for inputs x [..., hidden] and weight [hidden].
+
+    Args:
+        x: Tensor of shape [..., hidden], with arbitrary leading dimensions.
+        weight: Tensor of shape [hidden] on the same device as x.
+        eps: Epsilon added to the mean square.
+
+    Returns:
+        Tensor of shape [..., hidden] with x's dtype and device.
+    """
+    # Native RMSNorm can choose a different output layout on CPU and CUDA.
+    return torch.nn.functional.rms_norm(x.float(), (x.shape[-1],), weight.float(), eps).to(x.dtype)
+
+
+@register_sharding(torch.ops.nemo_automodel.float32_rms_norm.default)
+def _float32_rms_norm_sharding(x, weight, eps):
+    """Keep the normalized axis complete while allowing leading-axis sharding.
+
+    Args:
+        x: Tensor metadata of global shape [..., hidden].
+        weight: Tensor metadata of global shape [hidden].
+        eps: Epsilon added to the mean square.
+
+    Returns:
+        Supported output/input placements on each mesh axis. Leading dimensions
+        may be sharded; weight and the hidden dimension must be replicated.
+    """
+    strategies = [([Replicate()], [Replicate(), Replicate(), None])]
+    strategies.extend(([Shard(dim)], [Shard(dim), Replicate(), None]) for dim in range(x.ndim - 1))
+    return strategies
+
+
+def _float32_rms_norm_setup_context(ctx, inputs, output):
+    """Save the inputs required for the RMSNorm gradient.
+
+    Args:
+        ctx: Autograd context that owns the saved tensors.
+        inputs: Tuple containing x [..., hidden], weight [hidden], and eps.
+        output: Tensor of shape [..., hidden] in x's dtype.
+    """
+    x, weight, eps = inputs
+    ctx.save_for_backward(x, weight)
+    ctx.eps = eps
+
+
+def _float32_rms_norm_backward(ctx, grad_output):
+    """Differentiate the fp32 RMSNorm computation.
+
+    Args:
+        ctx: Autograd context containing x [..., hidden] and weight [hidden].
+        grad_output: Output gradient of shape [..., hidden].
+
+    Returns:
+        Gradients for x [..., hidden] and weight [hidden] in their input dtypes,
+        or None for frozen inputs, followed by None for the scalar eps.
+    """
+    x, weight = ctx.saved_tensors
+    x_f32 = x.float()
+    w_f32 = weight.float()
+    g_f32 = grad_output.float()
+
+    r = torch.rsqrt(x_f32.pow(2).mean(-1, keepdim=True) + ctx.eps)
+    xnorm = x_f32 * r
+
+    grad_w = (g_f32 * xnorm).sum_to_size(weight.shape)
+
+    gw = g_f32 * w_f32
+    grad_x = r * (gw - xnorm * (gw * xnorm).mean(-1, keepdim=True))
+
+    return (
+        grad_x.to(x.dtype) if x.requires_grad else None,
+        grad_w.to(weight.dtype) if weight.requires_grad else None,
+        None,  # eps is not differentiable
+    )
+
+
+_float32_rms_norm_impl.register_autograd(
+    _float32_rms_norm_backward,
+    setup_context=_float32_rms_norm_setup_context,
+)
+
+
 @torch.compile(dynamic=True)
 def _float32_rms_norm_fwd(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    """Compiled fp32 RMSNorm forward — standalone function to minimize dynamo guards."""
-    input_dtype = x.dtype
-    x = x.float()
-    x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
-    return (weight * x).to(input_dtype)
+    """Compiled fp32 RMSNorm forward — standalone function to minimize dynamo guards.
+
+    The opaque forward keeps the same computation in grad and no_grad contexts.
+
+    Args:
+        x: Tensor of shape [..., hidden], with arbitrary leading dimensions.
+        weight: Tensor of shape [hidden] on the same device as x.
+        eps: Epsilon added to the mean square.
+
+    Returns:
+        Tensor of shape [..., hidden] in x's dtype.
+    """
+    return torch.ops.nemo_automodel.float32_rms_norm(x, weight, eps)
 
 
 class Float32RMSNorm(nn.Module):
