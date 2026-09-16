@@ -394,6 +394,25 @@ class TestCustomModelGenerationConfig:
 
         assert model.generation_config.eos_token_id == [2, 11]
 
+    @patch("nemo_automodel._transformers.model_init.get_hf_config")
+    @patch("nemo_automodel._transformers.model_init._download_model_weights")
+    @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")
+    def test_explicit_none_eos_override_survives_the_config_json_fallback(
+        self, mock_resolve_cls, _mock_download, mock_get_hf_config, tmp_path
+    ):
+        """``eos_token_id=None`` means do not stop; the file's stop token must not replace it."""
+        import json
+
+        (tmp_path / "config.json").write_text(json.dumps({"model_type": "llama", "eos_token_id": 0}))
+        config = PretrainedConfig(architectures=["SomeModel"], eos_token_id=1)
+
+        _, model = self._init_from(
+            mock_resolve_cls, mock_get_hf_config, str(tmp_path), config=config, eos_token_id=None
+        )
+
+        assert model.config.eos_token_id is None
+        assert model.generation_config.eos_token_id is None
+
     @pytest.mark.parametrize("disk_eos", [2, None], ids=["conflicting", "omitted"])
     @patch("nemo_automodel._transformers.model_init.get_hf_config")
     @patch("nemo_automodel._transformers.model_init._download_model_weights")

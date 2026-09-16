@@ -1298,7 +1298,7 @@ def __init_model(
             # Treat config-related kwargs as config overrides (HF behavior) and
             # avoid forwarding them into model __init__.
             init_param_names = _get_init_param_names(model_cls)
-            _consume_config_overrides(hf_config, kwargs, init_param_names=init_param_names)
+            config_overrides = _consume_config_overrides(hf_config, kwargs, init_param_names=init_param_names)
             kwargs = _filter_kwargs_for_init(model_cls, kwargs)
             # Coerce plain-dict backend (e.g. from CLI --model.backend.attn sdpa) to BackendConfig
             if "backend" in kwargs and isinstance(kwargs["backend"], dict):
@@ -1317,7 +1317,9 @@ def __init_model(
                 # generation_config.json carries stop tokens and sampling defaults that
                 # the config lacks, and the consolidated export writes
                 # model.generation_config back out.
-                restore_pretrained_generation_config(model, pretrained_model_name_or_path, **loading_kwargs)
+                restore_pretrained_generation_config(
+                    model, pretrained_model_name_or_path, config_overrides=config_overrides, **loading_kwargs
+                )
             return True, model
 
     # 3. fallback to HF model class wrapped with mixin
@@ -1580,7 +1582,7 @@ def _try_get_remote_code_model_cls(hf_config, pretrained_model_name_or_path, tar
         return None
 
 
-def _consume_config_overrides(config, kwargs: dict, *, init_param_names: set[str] | None = None) -> None:
+def _consume_config_overrides(config, kwargs: dict, *, init_param_names: set[str] | None = None) -> set[str]:
     """
     Mimic HF from_pretrained behavior: treat config-related kwargs as config overrides,
     not model __init__ kwargs.
@@ -1588,7 +1590,13 @@ def _consume_config_overrides(config, kwargs: dict, *, init_param_names: set[str
     For custom model implementations we instantiate via `model_cls(config, **kwargs)`,
     so passing config flags like `output_hidden_states` would crash. This helper moves
     such keys onto the config and removes them from `kwargs`.
+
+    Returns:
+        The config field names the caller explicitly set. A value that equals the
+        field's default is indistinguishable from an unset one afterwards, so
+        consumers that must honor deliberate values need this set.
     """
+    applied: set[str] = set()
     if init_param_names is None:
         init_param_names = set()
     # Prefer `to_dict()` to capture the canonical set of config fields.
@@ -1607,6 +1615,7 @@ def _consume_config_overrides(config, kwargs: dict, *, init_param_names: set[str
             # Deep-merge dict overrides into existing sub-config objects (e.g.
             # text_config={"router_aux_loss_coef": 0}) instead of replacing the
             # entire sub-config, which would lose all other fields.
+            applied.add(k)
             if isinstance(val, dict):
                 existing = getattr(config, k, None)
                 if existing is not None and hasattr(existing, "to_dict"):
@@ -1614,6 +1623,7 @@ def _consume_config_overrides(config, kwargs: dict, *, init_param_names: set[str
                         setattr(existing, sub_k, sub_v)
                     continue
             setattr(config, k, val)
+    return applied
 
 
 def _filter_kwargs_for_init(model_cls, kwargs: dict) -> dict:

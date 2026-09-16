@@ -459,6 +459,21 @@ class TestGenerationConfigHelpers:
         assert can_generate.generation_config.eos_token_id == [2, 11]
         assert not hasattr(cannot_generate, "generation_config")
 
+    def test_load_pretrained_fallback_keeps_an_override_that_equals_a_default(self, tmp_path):
+        """``eos_token_id=None`` is a deliberate "do not stop"; it equals the default, so
+        the diff-based merge cannot see it and the caller has to name it."""
+        import json
+
+        from transformers import PretrainedConfig
+
+        (tmp_path / "config.json").write_text(json.dumps({"model_type": "llama", "eos_token_id": 0}))
+
+        generation_config = load_pretrained_generation_config(
+            tmp_path, config=PretrainedConfig(eos_token_id=None), config_overrides={"eos_token_id"}
+        )
+
+        assert generation_config.eos_token_id is None
+
     def test_load_pretrained_reads_the_subfolder_of_a_local_directory(self, tmp_path):
         """transformers resolves an absolute local path to the parent's generation_config.json
         even with ``subfolder`` set; the helper joins the directory itself so the child wins."""

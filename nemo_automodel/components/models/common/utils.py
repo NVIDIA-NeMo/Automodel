@@ -16,6 +16,7 @@ import importlib.util
 import logging
 import math
 import os
+from collections.abc import Collection
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
@@ -113,6 +114,7 @@ def generation_config_from_model_config(config: PretrainedConfig) -> GenerationC
 def load_pretrained_generation_config(
     pretrained_model_name_or_path: str | os.PathLike[str],
     config: PretrainedConfig | None = None,
+    config_overrides: Collection[str] | None = None,
     **loading_kwargs: Any,
 ) -> GenerationConfig | None:
     """The generation config a checkpoint carries, or ``None`` when it carries none.
@@ -129,6 +131,8 @@ def load_pretrained_generation_config(
         config: The model's in-memory config. Its explicit values (an ``eos_token_id``
             passed to ``from_pretrained`` lands here) win over the ``config.json``
             fallback, which cannot know about them.
+        config_overrides: Names the caller explicitly set on *config*. Needed because a
+            value cannot be recognized as deliberate once it equals a default.
         **loading_kwargs: The ``HUB_LOADING_KWARGS`` the caller was loading with, so the
             generation config is read from the same place as the weights.
     """
@@ -160,17 +164,33 @@ def load_pretrained_generation_config(
         # The raw file only contributes the legacy sampling fields; the token ids and
         # anything else set on the in-memory config, overrides included, stay on top.
         generation_config.update(**generation_config_from_model_config(config).to_diff_dict())
+        # ``to_diff_dict`` drops values that equal a GenerationConfig default, so an
+        # explicit ``eos_token_id=None`` would be indistinguishable from "unset" above
+        # and the file's stop token would win. Re-apply what the caller actually set.
+        if config_overrides:
+            generation_fields = set(GenerationConfig().to_dict())
+            generation_config.update(
+                **{
+                    name: getattr(config, name)
+                    for name in config_overrides
+                    if name in generation_fields and hasattr(config, name)
+                }
+            )
     return generation_config
 
 
 def restore_pretrained_generation_config(
-    model: nn.Module, pretrained_model_name_or_path: str | os.PathLike[str], **loading_kwargs: Any
+    model: nn.Module,
+    pretrained_model_name_or_path: str | os.PathLike[str],
+    config_overrides: Collection[str] | None = None,
+    **loading_kwargs: Any,
 ) -> None:
     """Replace a model's ``generation_config`` with the one its checkpoint carries, if any.
 
     Applies only to models that expose a real ``GenerationConfig`` (the ones that can
     generate); a model without one, or a checkpoint without generation settings, is
-    left as it is. ``loading_kwargs`` are the ``HUB_LOADING_KWARGS`` the model was
+    left as it is. ``config_overrides`` names what the caller explicitly set on the
+    model's config, and ``loading_kwargs`` are the ``HUB_LOADING_KWARGS`` the model was
     loaded with.
     """
     if not isinstance(getattr(model, "generation_config", None), GenerationConfig):
@@ -179,6 +199,7 @@ def restore_pretrained_generation_config(
     generation_config = load_pretrained_generation_config(
         pretrained_model_name_or_path,
         config=config if isinstance(config, PretrainedConfig) else None,
+        config_overrides=config_overrides,
         **loading_kwargs,
     )
     if generation_config is not None:
