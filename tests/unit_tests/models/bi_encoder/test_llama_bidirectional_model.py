@@ -366,8 +366,7 @@ def test_encoder_build_and_save(tmp_path, monkeypatch):
             return cls(hidden=16)
 
     # Patch the registry to return our fake model
-    ModelRegistry.model_arch_name_to_cls["LlamaBidirectionalModel"] = FakeBidirectionalModel
-    monkeypatch.setattr(ModelRegistry, "model_arch_name_to_cls", ModelRegistry.model_arch_name_to_cls)
+    monkeypatch.setattr(ModelRegistry, "model_arch_name_to_cls", {"LlamaBidirectionalModel": FakeBidirectionalModel})
 
     # Directory path with config.json to hit config-reading branch
     model_dir = tmp_path / "model"
@@ -452,8 +451,7 @@ def test_encoder_build_llama_bidirec_model_type_generic_path(tmp_path, monkeypat
             return cls(hidden=16)
 
     # Patch the registry to return our fake model
-    ModelRegistry.model_arch_name_to_cls["LlamaBidirectionalModel"] = FakeBidirectionalModel
-    monkeypatch.setattr(ModelRegistry, "model_arch_name_to_cls", ModelRegistry.model_arch_name_to_cls)
+    monkeypatch.setattr(ModelRegistry, "model_arch_name_to_cls", {"LlamaBidirectionalModel": FakeBidirectionalModel})
 
     # Create a model directory whose path has no 'llama' substring
     model_dir = tmp_path / "scratch" / "job" / "model"
@@ -487,8 +485,7 @@ def test_encoder_build_hub_and_errors(tmp_path, monkeypatch):
             return cls(hidden=16)
 
     # Patch the registry to return our fake model
-    ModelRegistry.model_arch_name_to_cls["LlamaBidirectionalModel"] = FakeBidirectionalModel
-    monkeypatch.setattr(ModelRegistry, "model_arch_name_to_cls", ModelRegistry.model_arch_name_to_cls)
+    monkeypatch.setattr(ModelRegistry, "model_arch_name_to_cls", {"LlamaBidirectionalModel": FakeBidirectionalModel})
 
     # Model type not in SUPPORTED_BACKBONES should fall back to AutoModel
     import nemo_automodel._transformers.retrieval as encoder_module

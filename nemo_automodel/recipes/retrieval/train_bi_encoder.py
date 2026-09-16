@@ -95,8 +95,10 @@ def _configure_sentence_transformer_export(model, collate_fn) -> None:
                     "does not expose static query_prefix and passage_prefix metadata."
                 )
             return
-        query_prompt = f"{collate_fn.query_prefix} " if collate_fn.query_prefix else ""
-        document_prompt = f"{collate_fn.passage_prefix} " if collate_fn.passage_prefix else ""
+        export_config = getattr(model, "sentence_transformer_export_config", None)
+        prompt_separator = "" if getattr(export_config, "input_mode", "text") == "structured_multimodal" else " "
+        query_prompt = f"{collate_fn.query_prefix}{prompt_separator}" if collate_fn.query_prefix else ""
+        document_prompt = f"{collate_fn.passage_prefix}{prompt_separator}" if collate_fn.passage_prefix else ""
 
     configure_prompts(query_prompt=query_prompt, document_prompt=document_prompt)
 
@@ -115,6 +117,9 @@ def _get_model_instantiate_kwargs(cfg, distributed_setup, peft_config):
         "distributed_setup": distributed_setup,
         "peft_config": peft_config,
     }
+    freeze_config = cfg.get("freeze_config", None)
+    if freeze_config is not None:
+        kwargs["freeze_config"] = cfg.freeze_config
     if cfg.get("compile", None) is not None:
         kwargs["compile_config"] = build_compile_config(cfg.compile)
     return kwargs
@@ -320,6 +325,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
                 **kwargs,
             )
 
+        self._validate_model(_unwrap_model_for_attrs(model))
         self.model_parts = [model]
         self.pp = None
 
@@ -411,6 +417,13 @@ class TrainBiEncoderRecipe(BaseRecipe):
         restore_from = self.cfg.get("checkpoint.restore_from", None)
         self.load_checkpoint(restore_from)
         self._log_step_scheduler_details(self.step_scheduler)
+
+    def _validate_model(self, model: torch.nn.Module) -> None:
+        """Validate recipe-specific model settings before constructing the optimizer.
+
+        Args:
+            model: Constructed retrieval model, including infrastructure wrappers.
+        """
 
     def run_train_validation_loop(self):
         """Run the training loop over all epochs and batches."""

@@ -3286,6 +3286,79 @@ class TestExtractModelLayers:
         assert len(groups["language"]) == 3
         assert result == groups["language"]
 
+    def test_retrieval_wrapper_unwraps_private_mistral3_vdr_layers(self):
+        """The private Mistral3 VDR wrapper exposes language and vision layers."""
+
+        class Mistral3BidirectionalModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.language_model = nn.Module()
+                self.language_model.layers = nn.ModuleList([_FakeLayer() for _ in range(4)])
+                self.vision_tower = nn.Module()
+                self.vision_tower.transformer = nn.Module()
+                self.vision_tower.transformer.layers = nn.ModuleList([_FakeLayer() for _ in range(2)])
+
+            def get_model_layer_groups(self) -> dict[str, list[nn.Module]]:
+                return {
+                    "language": list(self.language_model.layers),
+                    "vision": list(self.vision_tower.transformer.layers),
+                }
+
+        class BiEncoderModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = Mistral3BidirectionalModel()
+
+        model = BiEncoderModel()
+
+        groups = _extract_model_layer_groups(model)
+        result = _extract_model_layers(model)
+
+        assert set(groups) == {"language", "vision"}
+        assert len(groups["language"]) == 4
+        assert len(groups["vision"]) == 2
+        assert result == groups["language"] + groups["vision"]
+
+    def test_retrieval_wrapper_resolves_registered_mistral3_reranker_layers(self):
+        """The Mistral3 reranker registration exposes language and vision layers."""
+
+        class Mistral3BidirectionalModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.language_model = nn.Module()
+                self.language_model.layers = nn.ModuleList([_FakeLayer() for _ in range(4)])
+                self.vision_tower = nn.Module()
+                self.vision_tower.transformer = nn.Module()
+                self.vision_tower.transformer.layers = nn.ModuleList([_FakeLayer() for _ in range(2)])
+
+            def get_model_layer_groups(self) -> dict[str, list[nn.Module]]:
+                return {
+                    "language": list(self.language_model.layers),
+                    "vision": list(self.vision_tower.transformer.layers),
+                }
+
+        class Mistral3VLBidirectionalForSequenceClassification(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = Mistral3BidirectionalModel()
+
+            def get_model_layer_groups(self) -> dict[str, list[nn.Module]]:
+                return self.model.get_model_layer_groups()
+
+        class CrossEncoderModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = Mistral3VLBidirectionalForSequenceClassification()
+
+        wrapper = CrossEncoderModel()
+        groups = _extract_model_layer_groups(wrapper)
+        body_groups = _extract_model_layer_groups(wrapper.model.model)
+
+        assert set(groups) == {"language", "vision"}
+        assert len(groups["language"]) == 4
+        assert len(groups["vision"]) == 2
+        assert groups == body_groups
+
     def test_activation_checkpointing_scope_filtering(self):
         language = [_FakeLayer(), _FakeLayer()]
         vision = [_FakeLayer()]

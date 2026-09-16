@@ -20,14 +20,65 @@ import pytest
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
-from transformers import AutoTokenizer, PreTrainedTokenizerFast
+from transformers import AutoTokenizer, PretrainedConfig, PreTrainedTokenizerFast, ProcessorMixin
 
 from nemo_automodel import NeMoAutoTokenizer
 from nemo_automodel._transformers import sentence_transformer_export
 from nemo_automodel._transformers.sentence_transformer_export import (
+    SentenceTransformerExportConfig,
     _resolve_sentence_transformer_max_seq_length,
     _save_generated_sentence_transformer_assets,
+    _supports_standard_sentence_transformer_export,
 )
+
+
+def test_composite_export_support_is_selected_by_export_config():
+    text_config = PretrainedConfig()
+    text_config.hidden_size = 8
+    config = PretrainedConfig()
+    config.is_composition = True
+    config.text_config = text_config
+    model = SimpleNamespace(config=config, main_input_name="input_ids")
+
+    assert not _supports_standard_sentence_transformer_export(
+        model,
+        "avg",
+        SentenceTransformerExportConfig(),
+    )
+    assert _supports_standard_sentence_transformer_export(
+        model,
+        "avg",
+        SentenceTransformerExportConfig(input_mode="structured_multimodal"),
+    )
+
+
+def test_multimodal_export_profile_preserves_processor_assets(tmp_path):
+    (tmp_path / "processor_config.json").write_text("{}")
+    (tmp_path / "preprocessor_config.json").write_text("{}")
+    model = SimpleNamespace(
+        pooling="avg",
+        l2_normalize=True,
+        config=SimpleNamespace(hidden_size=8, max_position_embeddings=512),
+    )
+    processor = MagicMock(spec=ProcessorMixin)
+    processor.tokenizer = SimpleNamespace(model_max_length=512, pad_token=None)
+    processor.image_processor = object()
+    processor.chat_template = "{{ messages }}"
+    processor.model_max_length = 512
+
+    _save_generated_sentence_transformer_assets(
+        model,
+        SentenceTransformerExportConfig(input_mode="structured_multimodal"),
+        original_model_path=None,
+        hf_metadata_dir=str(tmp_path),
+        tokenizer=processor,
+    )
+
+    transformer_config = json.loads((tmp_path / "sentence_bert_config.json").read_text())
+    assert set(transformer_config["modality_config"]) == {"text", "image", "message"}
+    assert transformer_config["module_output_name"] == "token_embeddings"
+    assert (tmp_path / "processor_config.json").is_file()
+    assert (tmp_path / "preprocessor_config.json").is_file()
 
 
 def test_generated_sentence_transformer_assets_regenerate_semantics_and_preserve_source_limit(tmp_path):
