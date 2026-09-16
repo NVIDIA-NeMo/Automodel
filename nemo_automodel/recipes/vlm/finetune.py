@@ -610,11 +610,15 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
         packing_contract = DEFAULT_PACKED_SEQUENCE_CONTRACT
         if dataloader_config.packing is not None and dataloader_config.packing.packing_format != "thd":
+            attn_implementation = get_model_attn_implementation(self.model_parts[0])
             packing_contract = configure_packing(
-                get_model_attn_implementation(self.model_parts[0]),
+                attn_implementation,
                 model=self.model_parts[0],
                 unpad_data=get_unpad_data,
             )
+            if packing_contract.uses_native_fa4:
+                for model_part in self.model_parts[1:]:
+                    configure_packing(attn_implementation, model=model_part)
         process_group = getattr(self.mesh_context, "process_group", None)
         dataset_build_context = FirstRankPerNode(group=process_group)
         with ScopedRNG(seed=self.cfg.get("seed", 42), ranked=True):

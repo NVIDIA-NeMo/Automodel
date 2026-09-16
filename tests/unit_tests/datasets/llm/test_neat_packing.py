@@ -470,3 +470,12 @@ class TestNeatPackedCollaterContracts:
 
         with pytest.raises(ValueError, match="Unsupported packed_mask_type"):
             neat_packed_collater(self._batch(), packing=packing)
+
+    def test_deprecated_attention_keyword_is_translated(self):
+        with pytest.warns(FutureWarning, match="attn_implementation is deprecated"):
+            out = neat_packed_collater(
+                self._batch(),
+                attn_implementation="flash_attention_2",
+            )
+
+        assert out["attention_mask"].tolist() == [[1, 1, 2, 2]]

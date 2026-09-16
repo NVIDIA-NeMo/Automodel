@@ -713,6 +713,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 model=self.model_parts[0],
                 unpad_data=get_unpad_data,
             )
+            if packing_contract.uses_native_fa4:
+                for model_part in self.model_parts[1:]:
+                    configure_packing(attn_implementation, model=model_part)
         collate_wrapper = _build_pp_collate_wrapper(self.cfg.model, self.pp_enabled)
 
         def materialize_loader(config):

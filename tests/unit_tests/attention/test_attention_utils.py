@@ -26,6 +26,7 @@ from nemo_automodel.components.attention.utils import (
     postprocess_output_for_attn,
     preprocess_args_and_kwargs_for_attn,
 )
+from nemo_automodel.components.models.common.packing import flatten_packed_sequence_metadata
 
 
 def _reference_varlen_sdpa(
@@ -44,9 +45,9 @@ def _reference_varlen_sdpa(
     """Evaluate independent per-document SDPA for a fake FA4 varlen kernel.
 
     Args:
-        q: Query tensor of shape [tokens, heads, head_dim].
-        k: Key tensor of shape [tokens, heads, head_dim].
-        v: Value tensor of shape [tokens, heads, head_dim].
+        q: Query tensor of shape [tokens, heads, qk_head_dim].
+        k: Key tensor of shape [tokens, heads, qk_head_dim].
+        v: Value tensor of shape [tokens, heads, v_head_dim].
         cu_seqlens_q: Query boundaries of shape [documents + 1].
         cu_seqlens_k: Key/value boundaries of shape [documents + 1].
         max_seqlen_q: Maximum query document length.
@@ -56,7 +57,7 @@ def _reference_varlen_sdpa(
         **kwargs: Unused FA4 options accepted for signature compatibility.
 
     Returns:
-        Tensor of shape [tokens, heads, head_dim] containing independently
+        Tensor of shape [tokens, heads, v_head_dim] containing independently
         evaluated document outputs.
     """
     del max_seqlen_q, max_seqlen_k, kwargs
@@ -637,8 +638,23 @@ class TestFA4Backend:
         with pytest.raises(ValueError, match="dataset-provided"):
             preprocess_args_and_kwargs_for_attn(q, k, v, document_ids, "fa4")
 
+    def test_fa4_requires_model_entry_to_flatten_batch_major_metadata(self):
+        q = k = v = torch.randn(2, 4, 2, 8)
+
+        with pytest.raises(ValueError, match="flattened once at model entry"):
+            preprocess_args_and_kwargs_for_attn(
+                q,
+                k,
+                v,
+                None,
+                "fa4",
+                packed_token_indices=torch.tensor([[0, 1, -1, -1], [0, 1, 2, -1]]),
+                cu_seqlens=torch.tensor([[0, 2], [0, 3]], dtype=torch.int32),
+                max_seqlen=3,
+            )
+
     def test_fa4_packed_bshd_forward_backward_matches_document_sdpa(self):
-        """The production packed adapter preserves output and gradient boundaries."""
+        """Packed FA4 preserves MLA value width, outputs, and gradients."""
         from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
 
         flash_attn_cute = ModuleType("flash_attn.cute")
@@ -672,7 +688,7 @@ class TestFA4Backend:
         attention_mask = collated["attention_mask"]
         q = torch.randn(2, 6, 2, 8, requires_grad=True)
         k = torch.randn(2, 6, 2, 8, requires_grad=True)
-        v = torch.randn(2, 6, 2, 8, requires_grad=True)
+        v = torch.randn(2, 6, 2, 6, requires_grad=True)
         q_ref = q.detach().clone().requires_grad_()
         k_ref = k.detach().clone().requires_grad_()
         v_ref = v.detach().clone().requires_grad_()
@@ -682,22 +698,28 @@ class TestFA4Backend:
                 attn_impl="fa4",
                 num_attention_heads=2,
                 num_qk_channels=8,
-                num_v_channels=8,
+                num_v_channels=6,
                 softmax_scale=0.5,
             )
+        packed_token_indices, cu_seqlens = flatten_packed_sequence_metadata(
+            collated["packed_token_indices"],
+            collated["cu_seqlens"],
+            batch_size=2,
+            sequence_length=6,
+        )
         packed_q, packed_k, packed_v, fa4_kwargs = preprocess_args_and_kwargs_for_attn(
             q,
             k,
             v,
             attention_mask,
             "fa4",
-            cu_seqlens=collated["cu_seqlens"],
+            cu_seqlens=cu_seqlens,
             max_seqlen=collated["max_seqlen"],
-            packed_token_indices=collated["packed_token_indices"],
+            packed_token_indices=packed_token_indices,
         )
         output = fa4(packed_q, packed_k, packed_v, **fa4_kwargs)
 
-        reference = torch.zeros_like(q_ref)
+        reference = v_ref.new_zeros((*q_ref.shape[:-1], v_ref.shape[-1]))
         for batch_idx in range(attention_mask.shape[0]):
             for document_id in range(1, int(attention_mask[batch_idx].max().item()) + 1):
                 positions = torch.nonzero(attention_mask[batch_idx] == document_id, as_tuple=False).flatten()
@@ -713,6 +735,7 @@ class TestFA4Backend:
                 )
                 reference[batch_idx, positions] = document_output.squeeze(0).transpose(0, 1)
 
+        assert output.shape == (2, 6, 2, 6)
         torch.testing.assert_close(output, reference)
         output_weight = torch.randn_like(output)
         (output * output_weight).sum().backward()

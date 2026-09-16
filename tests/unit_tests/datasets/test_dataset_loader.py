@@ -297,6 +297,40 @@ def test_neat_packing_uses_default_contract(monkeypatch):
     assert collate_fn.keywords["packing"] is DEFAULT_PACKED_SEQUENCE_CONTRACT
 
 
+def test_packing_config_build_preserves_deprecated_attention_keyword(monkeypatch):
+    monkeypatch.setattr(
+        "nemo_automodel.components.datasets.llm.neat_packing.neat_pack_dataset",
+        lambda dataset, **_: dataset,
+    )
+    config = NeatPackingConfig(packed_sequence_size=8)
+
+    with pytest.warns(FutureWarning, match="attn_implementation is deprecated"):
+        _, collate_fn = config.build([], attn_implementation="flash_attention_2")
+
+    assert collate_fn.keywords["packing"].packed_mask_type == "document_ids"
+
+
+def test_dataloader_build_preserves_deprecated_attention_keyword(monkeypatch):
+    monkeypatch.setattr(
+        "nemo_automodel.components.datasets.llm.neat_packing.neat_pack_dataset",
+        lambda dataset, **_: dataset,
+    )
+    config = DataloaderConfig(
+        dataset_config=StaticDatasetConfig([{"input_ids": [1]}]),
+        packing=NeatPackingConfig(packed_sequence_size=8),
+        shuffle=False,
+    )
+
+    with pytest.warns(FutureWarning, match="attn_implementation is deprecated"):
+        loader = config.build(
+            dp_rank=0,
+            dp_world_size=1,
+            attn_implementation="flash_attention_2",
+        )
+
+    assert loader.collate_fn.keywords["packing"].packed_mask_type == "document_ids"
+
+
 def test_megatron_loader_preserves_schedule_and_sampler_config():
     config = RecipeConfig(
         ConfigNode(

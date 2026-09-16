@@ -85,6 +85,8 @@ _NATIVE_ATTENTION_BACKENDS: dict[str, AttentionBackend] = {"flash_attention_4": 
 def _resolve_custom_attention_backend(
     attn_implementation: str | None,
     backend: BackendConfig,
+    *,
+    uses_native_fa4: bool,
 ) -> BackendConfig:
     """Resolve an HF attention name onto a custom model's typed backend."""
     if not isinstance(attn_implementation, str):
@@ -97,6 +99,8 @@ def _resolve_custom_attention_backend(
                 attn_implementation,
                 backend.attn,
             )
+        return backend
+    if not uses_native_fa4:
         return backend
     if backend.attn == native_backend:
         return backend
@@ -1334,7 +1338,11 @@ def __init_model(
                 else:
                     kwargs["backend"] = BackendConfig(**kwargs["backend"])
             if isinstance(kwargs.get("backend"), BackendConfig):
-                kwargs["backend"] = _resolve_custom_attention_backend(attn_implementation, kwargs["backend"])
+                kwargs["backend"] = _resolve_custom_attention_backend(
+                    attn_implementation,
+                    kwargs["backend"],
+                    uses_native_fa4=getattr(model_cls, "_uses_native_fa4", False) is True,
+                )
             resolved_backend = kwargs.get("backend")
             kwargs = _filter_kwargs_for_init(model_cls, kwargs)
             with local_torch_dtype(torch_dtype, model_cls.__name__):

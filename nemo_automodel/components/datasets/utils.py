@@ -21,6 +21,7 @@ from nemo_automodel.components.datasets.packing import (
     DEFAULT_PACKED_SEQUENCE_CONTRACT,
     PackedSequenceContract,
     build_packed_sequence_metadata,
+    resolve_packing_contract,
 )
 
 
@@ -509,6 +510,7 @@ def _indexed_mask_to_4d_block_causal(attention_mask: torch.Tensor) -> torch.Tens
 
 def neat_packed_collater(
     batch: list[dict],
+    attn_implementation: str | None = None,
     *,
     packing: PackedSequenceContract = DEFAULT_PACKED_SEQUENCE_CONTRACT,
 ) -> dict:
@@ -523,6 +525,8 @@ def neat_packed_collater(
 
     Args:
         batch: List of sample dicts produced by ``neat_pack_dataset``.
+        attn_implementation: Deprecated attention-backend name retained for
+            Python-call compatibility during the packing-contract migration.
         packing: Structural model contract selecting the packed mask representation.
             Defaults to block-causal masking without packed-sequence metadata.
 
@@ -531,6 +535,7 @@ def neat_packed_collater(
         batch-major ``packed_token_indices`` and ``cu_seqlens`` tensors plus
         scalar ``max_seqlen``.
     """
+    packing = resolve_packing_contract(packing, attn_implementation)
     if not batch:
         return {}
 

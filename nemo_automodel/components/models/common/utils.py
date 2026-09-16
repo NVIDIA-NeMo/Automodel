@@ -288,8 +288,9 @@ class BackendConfig:
     Attributes:
         attn: Attention backend ("torch", "te", "sdpa", "flex", "eager", "tilelang", "cudnn", "fa4", or "magi").
             "fa4" selects FlashAttention-4 (CuTe) and is the only backend that reaches the
-            Blackwell FA4 kernels; it requires an INSTALL_FA4=true image and accepts only
-            causal or varlen (cu_seqlens) masks -- an explicit attention_mask raises.
+            Blackwell FA4 kernels; it requires an INSTALL_FA4=true image. A rank-2 binary
+            padding mask is converted to varlen metadata, while dense/block masks and indexed
+            document masks without explicit packed metadata are rejected.
             For DeepSeek V4, "tilelang" enables the TileLang sparse attention,
             indexer, and Sinkhorn kernels together. For GLM DSA, "tilelang" and
             "cudnn" select their respective packed sparse-attention kernels.

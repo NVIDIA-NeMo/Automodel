@@ -22,52 +22,6 @@ from nemo_automodel.components.attention.flex_attention import FlexAttention
 from nemo_automodel.shared.import_utils import safe_import
 
 
-def _flatten_packed_sequence_metadata(
-    packed_token_indices: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    *,
-    batch_size: int,
-    sequence_length: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Adapt batch-major dataset metadata to FA4's flat varlen layout."""
-    if packed_token_indices.ndim == 1 and cu_seqlens.ndim == 1:
-        if (
-            cu_seqlens.numel() < 2
-            or int(cu_seqlens[0].item()) != 0
-            or int(cu_seqlens[-1].item()) != packed_token_indices.numel()
-        ):
-            raise ValueError("Flat packed FA4 metadata must start at zero and cover every token index")
-        return packed_token_indices, cu_seqlens
-    if packed_token_indices.shape != (batch_size, sequence_length) or cu_seqlens.ndim != 2:
-        raise ValueError(
-            "Packed FA4 metadata does not match the current [batch, sequence] layout: "
-            f"indices={tuple(packed_token_indices.shape)}, cu_seqlens={tuple(cu_seqlens.shape)}, "
-            f"batch={batch_size}, sequence={sequence_length}."
-        )
-
-    valid = packed_token_indices >= 0
-    row_offsets = torch.arange(batch_size, device=packed_token_indices.device)[:, None] * sequence_length
-    flat_indices = (packed_token_indices + row_offsets)[valid].to(torch.long)
-    lengths: list[torch.Tensor] = []
-    for row_idx, row in enumerate(cu_seqlens):
-        boundaries = row[row >= 0]
-        if boundaries.numel() and (
-            int(boundaries[0].item()) != 0
-            or int(boundaries[-1].item()) != int(valid[row_idx].sum().item())
-            or bool((boundaries[1:] < boundaries[:-1]).any().item())
-        ):
-            raise ValueError("Each packed FA4 metadata row must start at zero and cover its valid tokens")
-        if boundaries.numel() > 1:
-            lengths.append(boundaries[1:] - boundaries[:-1])
-    if not lengths:
-        raise ValueError("Packed FA4 metadata must describe at least one document")
-    document_lengths = torch.cat(lengths)
-    flat_cu_seqlens = F.pad(torch.cumsum(document_lengths, dim=0, dtype=cu_seqlens.dtype), (1, 0))
-    if int(flat_cu_seqlens[-1].item()) != flat_indices.numel():
-        raise ValueError("Packed FA4 token indices and cumulative lengths describe different token counts")
-    return flat_indices, flat_cu_seqlens
-
-
 def initialize_attn_module_and_func(
     attn_impl: str,
     num_attention_heads: int,
@@ -138,7 +92,7 @@ def initialize_attn_module_and_func(
         # (thd) layout directly, like TE -- no transpose on the way in or out. FA4 has no
         # dense-mask entry point by design: `causal` plus varlen `cu_seqlens` are its only
         # mask forms, which is what makes it fast. preprocess_args_and_kwargs_for_attn
-        # rejects an explicit mask rather than silently materializing one.
+        # converts a rank-2 binary padding mask to varlen metadata and rejects dense masks.
         try:
             have_fa4, flash_attn_cute = safe_import("flash_attn.cute")
         except Exception as exc:
@@ -180,19 +134,23 @@ def initialize_attn_module_and_func(
             """Run dense or varlen FA4 and restore a padded BSHD result when requested.
 
             Args:
-                q: Query tensor of shape [batch, sequence, heads, head_dim] for
-                    dense attention or [tokens, heads, head_dim] for varlen attention.
-                k: Key tensor of shape [batch, sequence, kv_heads, head_dim] for
-                    dense attention or [tokens, kv_heads, head_dim] for varlen attention.
-                v: Value tensor with the same layout as ``k``.
+                q: Query tensor of shape [batch, sequence, heads, qk_head_dim]
+                    for dense attention or [tokens, heads, qk_head_dim] for
+                    varlen attention.
+                k: Key tensor of shape [batch, sequence, kv_heads, qk_head_dim]
+                    for dense attention or [tokens, kv_heads, qk_head_dim] for
+                    varlen attention.
+                v: Value tensor with the same leading layout as ``k`` and a
+                    trailing dimension of v_head_dim.
                 **call_kwargs: FA4 options and optional packed-sequence metadata.
                     ``packed_token_indices`` has shape [tokens] and
-                    ``_fa4_padded_output_shape`` is [batch, sequence, heads, head_dim].
+                    ``_fa4_padded_output_shape`` is
+                    [batch, sequence, heads, v_head_dim].
 
             Returns:
-                Attention output matching the input query layout, or a restored
-                tensor of shape [batch, sequence, heads, head_dim] when packed
-                inputs were unpadded before the kernel call.
+                Attention output with trailing dimension v_head_dim, or a
+                restored tensor of shape [batch, sequence, heads, v_head_dim]
+                when packed inputs were unpadded before the kernel call.
             """
             unexpected_call_kwargs = call_kwargs.keys() - supported_fa4_kwargs
             if unexpected_call_kwargs:
@@ -282,7 +240,8 @@ def preprocess_args_and_kwargs_for_attn(
             [tokens, heads, head_dim] for THD input.
         k: Key tensor of shape [batch, sequence, kv_heads, head_dim] or
             [tokens, kv_heads, head_dim] for THD input.
-        v: Value tensor with the same layout as ``k``.
+        v: Value tensor with the same leading layout as ``k`` and an optional
+            distinct value head dimension.
         attention_mask: Optional tensor of shape [batch, sequence] for padding
             or indexed packing, or [batch, 1, sequence, sequence] for an
             explicit dense mask.
@@ -293,7 +252,8 @@ def preprocess_args_and_kwargs_for_attn(
     Returns:
         Query, key, and value tensors in the backend layout plus its keyword
         arguments. Packed BSHD FA4 tensors are unpadded to [tokens, heads,
-        head_dim]; the FA4 callable restores its output to BSHD.
+        head_dim]; the FA4 callable restores its output to BSHD using the value
+        head dimension.
     """
     attn_kwargs: dict[str, Any]
     # Create attention kwargs based on backend
@@ -391,14 +351,10 @@ def preprocess_args_and_kwargs_for_attn(
             cu_seqlens = F.pad(torch.cumsum(seqlens, dim=0, dtype=torch.int32), (1, 0))
             max_seqlen = int(seqlens.max().item())
 
-        if cu_seqlens is not None and unpad_indices is not None and unpad_indices.ndim == 2:
-            if q.ndim != 4:
-                raise ValueError("Batch-major packed FA4 metadata requires BSHD query/key/value tensors")
-            unpad_indices, cu_seqlens = _flatten_packed_sequence_metadata(
-                unpad_indices,
-                cu_seqlens,
-                batch_size=q.shape[0],
-                sequence_length=q.shape[1],
+        if cu_seqlens is not None and unpad_indices is not None and (cu_seqlens.ndim != 1 or unpad_indices.ndim != 1):
+            raise ValueError(
+                "Packed FA4 metadata must be flattened once at model entry after microbatch splitting; "
+                f"got indices={tuple(unpad_indices.shape)} and cu_seqlens={tuple(cu_seqlens.shape)}."
             )
 
         if cu_seqlens is not None:
@@ -410,24 +366,14 @@ def preprocess_args_and_kwargs_for_attn(
             attn_kwargs["max_seqlen_kv"] = max_seqlen
 
             if q.ndim == 4:
-                padded_output_shape = tuple(q.shape)
+                padded_output_shape = (*q.shape[:-1], v.shape[-1])
                 flat_q = q.reshape(-1, *q.shape[2:])
                 flat_k = k.reshape(-1, *k.shape[2:])
                 flat_v = v.reshape(-1, *v.shape[2:])
                 if unpad_indices is None:
-                    if int(cu_seqlens[-1].item()) != flat_q.shape[0]:
-                        raise ValueError(
-                            "Packed BSHD FA4 inputs require packed_token_indices when cu_seqlens "
-                            "does not cover every padded token."
-                        )
                     q, k, v = flat_q, flat_k, flat_v
                 else:
                     unpad_indices = unpad_indices.to(device=q.device, dtype=torch.long)
-                    if int(cu_seqlens[-1].item()) != unpad_indices.numel():
-                        raise ValueError(
-                            "FA4 cu_seqlens and packed_token_indices disagree: "
-                            f"{int(cu_seqlens[-1].item())} tokens vs {unpad_indices.numel()} indices."
-                        )
                     q = flat_q.index_select(0, unpad_indices)
                     k = flat_k.index_select(0, unpad_indices)
                     v = flat_v.index_select(0, unpad_indices)

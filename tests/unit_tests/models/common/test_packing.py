@@ -100,6 +100,28 @@ class TestGetAttnImplementation:
         model.config = SimpleNamespace(_attn_implementation="sdpa")
         assert get_model_attn_implementation(model) == "te"
 
+    def test_hf_fa4_dispatch_takes_precedence_without_native_consumer(self):
+        model = torch.nn.Module()
+        model.backend = BackendConfig(attn="fa4")
+        model.config = SimpleNamespace(_attn_implementation="flash_attention_4")
+
+        assert get_model_attn_implementation(model) == "flash_attention_4"
+
+    def test_non_native_fa4_backend_falls_back_to_live_hf_dispatch(self):
+        model = torch.nn.Module()
+        model.backend = BackendConfig(attn="fa4")
+        model.config = SimpleNamespace(_attn_implementation="sdpa")
+
+        assert get_model_attn_implementation(model) == "sdpa"
+
+    def test_native_fa4_consumer_uses_typed_backend(self):
+        model = torch.nn.Module()
+        model._uses_native_fa4 = True
+        model.backend = BackendConfig(attn="fa4")
+        model.config = SimpleNamespace(_attn_implementation="flash_attention_4")
+
+        assert get_model_attn_implementation(model) == "fa4"
+
     def test_reads_through_ddp_wrapper(self):
         """DDP holds the model as ``.module`` and does not proxy attribute access."""
         inner = torch.nn.Module()
@@ -142,6 +164,21 @@ class TestConfigurePacking:
         assert capabilities.packed_mask_type == "document_ids"
         assert capabilities.requires_packed_sequence_metadata is True
 
+    def test_fa4_requires_explicit_native_consumer_capability(self):
+        hf_dispatched_model = torch.nn.Module()
+        native_model = torch.nn.Module()
+        native_model._uses_native_fa4 = True
+
+        hf_capabilities = get_packing_capabilities("fa4", model=hf_dispatched_model)
+        native_capabilities = get_packing_capabilities("fa4", model=native_model)
+
+        assert hf_capabilities.patch_transformers is True
+        assert hf_capabilities.requires_packed_sequence_metadata is False
+        assert hf_capabilities.uses_native_fa4 is False
+        assert native_capabilities.patch_transformers is False
+        assert native_capabilities.requires_packed_sequence_metadata is True
+        assert native_capabilities.uses_native_fa4 is True
+
     def test_batch_major_metadata_flattens_after_microbatch_splitting(self):
         indices, cu_seqlens = flatten_packed_sequence_metadata(
             torch.tensor([[0, 1, 2, -1]]),
@@ -152,6 +189,54 @@ class TestConfigurePacking:
 
         assert indices.tolist() == [0, 1, 2]
         assert cu_seqlens.tolist() == [0, 1, 3]
+
+    def test_native_fa4_flattens_metadata_once_per_model_forward(self):
+        class NativeFA4Model(torch.nn.Module):
+            _uses_native_fa4 = True
+
+            def forward(self, input_ids: torch.Tensor, **kwargs):
+                """Capture normalized packed metadata.
+
+                Args:
+                    input_ids: Token IDs of shape [batch, sequence].
+                    **kwargs: Model inputs containing packed token indices of
+                        shape [tokens] and cumulative lengths of shape
+                        [documents + 1].
+
+                Returns:
+                    The received keyword-input mapping with tensor layouts
+                    unchanged.
+                """
+                del input_ids
+                return kwargs
+
+        model = NativeFA4Model()
+        configure_packing("fa4", model=model)
+        configure_packing("fa4", model=model)
+        assert len(model._forward_pre_hooks) == 1
+
+        output = model(
+            torch.ones(2, 4, dtype=torch.long),
+            packed_token_indices=torch.tensor([[0, 1, 2, -1], [0, 1, -1, -1]]),
+            cu_seqlens=torch.tensor([[0, 1, 3], [0, 2, -1]], dtype=torch.int32),
+            max_seqlen=2,
+        )
+
+        assert output["packed_token_indices"].tolist() == [0, 1, 2, 4, 5]
+        assert output["cu_seqlens"].tolist() == [0, 1, 3, 5]
+
+    def test_native_fa4_rejects_incomplete_metadata_at_model_entry(self):
+        class NativeFA4Model(torch.nn.Module):
+            _uses_native_fa4 = True
+
+            def forward(self, **kwargs):
+                return kwargs
+
+        model = NativeFA4Model()
+        configure_packing("fa4", model=model)
+
+        with pytest.raises(ValueError, match="must be tensors supplied together"):
+            model(cu_seqlens=torch.tensor([0, 2], dtype=torch.int32))
 
     @pytest.mark.parametrize("attn_implementation", ["sdpa", "eager"])
     def test_noop_for_unsupported_backends(self, attn_implementation, monkeypatch):

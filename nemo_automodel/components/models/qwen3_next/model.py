@@ -266,6 +266,7 @@ class Qwen3NextModel(nn.Module):
 
 
 class Qwen3NextForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
+    _uses_native_fa4 = True
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
 
     _keep_in_fp32_modules_strict = ["_fp32_params"]

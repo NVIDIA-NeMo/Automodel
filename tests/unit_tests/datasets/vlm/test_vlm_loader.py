@@ -296,6 +296,29 @@ def test_vlm_dataloader_neat_packing_uses_default_contract(monkeypatch):
     assert result.dataloader.collate_fn.keywords["packing"] is DEFAULT_PACKED_SEQUENCE_CONTRACT
 
 
+def test_vlm_dataloader_preserves_deprecated_python_packing_backend(monkeypatch):
+    processor = DummyProcessor()
+    monkeypatch.setattr(PreTokenizedDatasetWrapperConfig, "build", lambda self, dataset, processor: dataset)
+    monkeypatch.setattr(NeatPackConfig, "build", lambda self, dataset, **kwargs: dataset)
+    config = VlmDataloaderConfig(
+        dataset_config=StaticDatasetConfig([]),
+        processor_config=VlmProcessorConfig(factory=lambda: processor),
+        pretokenization=PreTokenizedDatasetWrapperConfig(),
+        packing=NeatPackConfig(attn_implementation="flash_attention_2"),
+        shuffle=False,
+    )
+
+    with pytest.warns(FutureWarning, match="attn_implementation is deprecated"):
+        result = config.build(
+            pretrained_model_name_or_path="unused",
+            dp_rank=0,
+            dp_world_size=1,
+            batch_size=2,
+        )
+
+    assert result.dataloader.collate_fn.keywords["packing"].packed_mask_type == "document_ids"
+
+
 def test_vlm_dataloader_skips_dense_neat_packing_mask_under_cp(monkeypatch):
     processor = DummyProcessor()
     monkeypatch.setattr(PreTokenizedDatasetWrapperConfig, "build", lambda self, dataset, processor: dataset)

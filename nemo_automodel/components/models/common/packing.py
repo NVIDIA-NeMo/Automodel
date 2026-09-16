@@ -33,9 +33,10 @@ This is the same approach used by LlamaFactory.
 
 import logging
 from dataclasses import dataclass
-from typing import Literal, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol, runtime_checkable
 
 import torch
+import torch.nn.functional as F
 
 from nemo_automodel.components.models.common.utils import AttentionBackend
 
@@ -53,6 +54,7 @@ class PackingCapabilities:
     packed_mask_type: PackedMaskType
     requires_packed_sequence_metadata: bool = False
     patch_transformers: bool = False
+    uses_native_fa4: bool = False
 
 
 @runtime_checkable
@@ -67,6 +69,13 @@ class PackedMaskConsumer(Protocol):
     """Model that owns masking and consumes compact document IDs."""
 
     packed_mask_type: PackedMaskType
+
+
+@runtime_checkable
+class NativeFA4Consumer(Protocol):
+    """Model whose attention layers invoke Automodel's native FA4 callable."""
+
+    _uses_native_fa4: bool
 
 
 @runtime_checkable
@@ -96,8 +105,8 @@ def get_packing_capabilities(
 
     Args:
         attn_implementation: Attention implementation resolved from the built model.
-        model: Optional built model, inspected only through
-            :class:`PackingMetadataConsumer`.
+        model: Optional built model, inspected through explicit packed-metadata,
+            mask, and native-FA4 consumer capabilities.
 
     Returns:
         Structural capabilities consumed by dataset packing. Backend names do not
@@ -107,7 +116,13 @@ def get_packing_capabilities(
     requires_metadata = isinstance(model, PackingMetadataConsumer) and model.requires_packed_sequence_metadata
     model_mask_type = model.packed_mask_type if isinstance(model, PackedMaskConsumer) else None
     if attn_implementation == "fa4":
-        return PackingCapabilities(packed_mask_type="document_ids", requires_packed_sequence_metadata=True)
+        uses_native_fa4 = isinstance(model, NativeFA4Consumer) and model._uses_native_fa4
+        return PackingCapabilities(
+            packed_mask_type="document_ids",
+            requires_packed_sequence_metadata=uses_native_fa4 or requires_metadata,
+            patch_transformers=not uses_native_fa4,
+            uses_native_fa4=uses_native_fa4,
+        )
     if attn_implementation in _FLASH_ATTN_IMPLEMENTATIONS:
         return PackingCapabilities(
             packed_mask_type="document_ids",
@@ -146,51 +161,139 @@ def flatten_packed_sequence_metadata(
     batch_size: int,
     sequence_length: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Adapt batch-major dataset metadata to one consumer-local flat stream.
+    """Normalize batch-major packed metadata to a single flat token stream.
 
-    The dataset representation keeps a leading batch axis so pipeline schedules
-    can split it safely. Recurrent model kernels consume a single flattened
-    token stream, so the model converts only its current microbatch here.
+    Args:
+        packed_token_indices: Tensor of shape [batch, sequence] containing
+            row-local token indices with ``-1`` padding, or a pre-flattened
+            tensor of shape [tokens] containing indices into [batch, sequence].
+        cu_seqlens: Tensor of shape [batch, max_documents + 1] containing
+            row-local cumulative lengths with ``-1`` padding, or a pre-flattened
+            tensor of shape [documents + 1].
+        batch_size: Batch dimension of the padded token layout.
+        sequence_length: Sequence dimension of the padded token layout.
+
+    Returns:
+        Flat token indices of shape [tokens] into the padded [batch, sequence]
+        layout and cumulative document lengths of shape [documents + 1].
+
+    Raises:
+        ValueError: If the layouts, boundaries, or represented token counts are
+            inconsistent.
     """
     if packed_token_indices.ndim == 1 and cu_seqlens.ndim == 1:
-        if (
-            cu_seqlens.numel() < 2
-            or int(cu_seqlens[0].item()) != 0
-            or int(cu_seqlens[-1].item()) != packed_token_indices.numel()
-        ):
+        invalid = cu_seqlens.numel() < 2
+        if not invalid:
+            invalid = bool(
+                (
+                    (cu_seqlens[0] != 0)
+                    | (cu_seqlens[-1] != packed_token_indices.numel())
+                    | (cu_seqlens[1:] < cu_seqlens[:-1]).any()
+                ).item()
+            )
+        if invalid:
             raise ValueError("Flat packed sequence metadata must start at zero and cover every token index")
-        return packed_token_indices, cu_seqlens
+        return packed_token_indices.to(torch.long), cu_seqlens
+
     if packed_token_indices.shape != (batch_size, sequence_length) or cu_seqlens.ndim != 2:
         raise ValueError(
             "Packed sequence metadata does not match the current [batch, sequence] layout: "
             f"indices={tuple(packed_token_indices.shape)}, cu_seqlens={tuple(cu_seqlens.shape)}, "
             f"batch={batch_size}, sequence={sequence_length}."
         )
+    if cu_seqlens.shape[0] != batch_size or cu_seqlens.shape[1] == 0:
+        raise ValueError(
+            "Packed sequence cumulative lengths must have the same batch dimension as token indices "
+            "and at least one boundary per row: "
+            f"indices={tuple(packed_token_indices.shape)}, cu_seqlens={tuple(cu_seqlens.shape)}."
+        )
 
-    valid = packed_token_indices >= 0
-    row_offsets = torch.arange(batch_size, device=packed_token_indices.device)[:, None] * sequence_length
-    flat_indices = (packed_token_indices + row_offsets)[valid].to(torch.long)
-    lengths: list[torch.Tensor] = []
-    for row_idx, row in enumerate(cu_seqlens):
-        boundaries = row[row >= 0]
-        if boundaries.numel() and (
-            int(boundaries[0].item()) != 0
-            or int(boundaries[-1].item()) != int(valid[row_idx].sum().item())
-            or bool((boundaries[1:] < boundaries[:-1]).any().item())
-        ):
-            raise ValueError("Each packed sequence metadata row must start at zero and cover its valid tokens")
-        if boundaries.numel() > 1:
-            lengths.append(boundaries[1:] - boundaries[:-1])
-    if not lengths:
-        raise ValueError("Packed sequence metadata must describe at least one document")
-    document_lengths = torch.cat(lengths)
-    flat_cu_seqlens = torch.nn.functional.pad(
-        torch.cumsum(document_lengths, dim=0, dtype=cu_seqlens.dtype),
-        (1, 0),
+    valid_tokens = packed_token_indices >= 0
+    valid_boundaries = cu_seqlens >= 0
+    boundary_after_padding = valid_boundaries & ((~valid_boundaries).cumsum(dim=1) > 0)
+    boundary_counts = valid_boundaries.sum(dim=1)
+    last_boundary_indices = (boundary_counts - 1).clamp_min(0).unsqueeze(1)
+    last_boundaries = cu_seqlens.gather(1, last_boundary_indices).squeeze(1)
+    valid_boundary_pairs = valid_boundaries[:, 1:] & valid_boundaries[:, :-1]
+    boundary_deltas = cu_seqlens[:, 1:] - cu_seqlens[:, :-1]
+    invalid_rows = (
+        ((boundary_counts == 0) | (cu_seqlens[:, 0] != 0))
+        | (last_boundaries != valid_tokens.sum(dim=1))
+        | boundary_after_padding.any(dim=1)
+        | ((boundary_deltas < 0) & valid_boundary_pairs).any(dim=1)
     )
-    if int(flat_cu_seqlens[-1].item()) != flat_indices.numel():
-        raise ValueError("Packed token indices and cumulative lengths describe different token counts")
+
+    document_lengths = boundary_deltas[valid_boundary_pairs]
+    represented_token_count = document_lengths.sum() if document_lengths.numel() else cu_seqlens.new_zeros(())
+    invalid = invalid_rows.any() | (represented_token_count != valid_tokens.sum()) | (document_lengths.numel() == 0)
+    if bool(invalid.item()):
+        raise ValueError(
+            "Each packed sequence metadata row must start at zero, be monotonic, and cover its valid tokens"
+        )
+
+    row_offsets = torch.arange(batch_size, device=packed_token_indices.device)[:, None] * sequence_length
+    flat_indices = (packed_token_indices + row_offsets)[valid_tokens].to(torch.long)
+    flat_cu_seqlens = F.pad(torch.cumsum(document_lengths, dim=0, dtype=cu_seqlens.dtype), (1, 0))
     return flat_indices, flat_cu_seqlens
+
+
+def _flatten_packed_metadata_at_model_entry(
+    _module: torch.nn.Module,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> tuple[tuple[Any, ...], dict[str, Any]] | None:
+    """Flatten packed metadata once after pipeline microbatch splitting.
+
+    Args:
+        _module: Native FA4 model receiving the forward call.
+        args: Positional model inputs. Tensor entries retain their model-specific
+            layouts and are returned unchanged.
+        kwargs: Model inputs containing ``packed_token_indices`` of shape
+            [batch, sequence] or [tokens] and ``cu_seqlens`` of shape
+            [batch, max_documents + 1] or [documents + 1].
+
+    Returns:
+        Updated positional and keyword inputs whose packed token indices have
+        shape [tokens] and cumulative lengths have shape [documents + 1], or
+        ``None`` when neither packed-metadata tensor was supplied.
+
+    Raises:
+        ValueError: If only one metadata tensor is supplied or either layout is
+            inconsistent with the current microbatch.
+    """
+    packed_token_indices = kwargs.get("packed_token_indices")
+    cu_seqlens = kwargs.get("cu_seqlens")
+    if packed_token_indices is None and cu_seqlens is None:
+        return None
+    if not isinstance(packed_token_indices, torch.Tensor) or not isinstance(cu_seqlens, torch.Tensor):
+        raise ValueError("Native FA4 packed_token_indices and cu_seqlens must be tensors supplied together")
+
+    if packed_token_indices.ndim == 2:
+        batch_size, sequence_length = packed_token_indices.shape
+    else:
+        batch_size, sequence_length = 1, packed_token_indices.numel()
+    flat_indices, flat_cu_seqlens = flatten_packed_sequence_metadata(
+        packed_token_indices,
+        cu_seqlens,
+        batch_size=batch_size,
+        sequence_length=sequence_length,
+    )
+    updated_kwargs = dict(kwargs)
+    updated_kwargs["packed_token_indices"] = flat_indices
+    updated_kwargs["cu_seqlens"] = flat_cu_seqlens
+    return args, updated_kwargs
+
+
+def _install_native_fa4_metadata_hook(model: torch.nn.Module) -> None:
+    """Install the once-per-forward native FA4 metadata normalizer."""
+    model = getattr(model, "module", model)
+    if getattr(model, "_native_fa4_metadata_hook_handle", None) is not None:
+        return
+    handle = model.register_forward_pre_hook(
+        _flatten_packed_metadata_at_model_entry,
+        with_kwargs=True,
+    )
+    setattr(model, "_native_fa4_metadata_hook_handle", handle)
 
 
 def _passthrough_create_causal_mask(
@@ -268,9 +371,15 @@ def get_model_attn_implementation(model: torch.nn.Module) -> str:
         raise TypeError(f"Expected a built torch.nn.Module, got {type(model).__name__}")
     model = getattr(model, "module", model)
     backend = getattr(model, "backend", None)
+    hf_implementation = _model_attn_implementation(model)
+    uses_native_fa4 = isinstance(model, NativeFA4Consumer) and model._uses_native_fa4
+    if hf_implementation == "flash_attention_4" and not uses_native_fa4:
+        return hf_implementation
     if isinstance(backend, AttentionBackendSelection):
+        if backend.attn == "fa4" and not uses_native_fa4:
+            return hf_implementation or "sdpa"
         return backend.attn
-    return _model_attn_implementation(model) or "sdpa"
+    return hf_implementation or "sdpa"
 
 
 def _patch_preprocess_mask_arguments_for_packing() -> None:
@@ -412,6 +521,11 @@ def configure_packing(
         ValueError: If a Transformers adapter is required without ``unpad_data``.
     """
     capabilities = get_packing_capabilities(attn_implementation, model=model)
+    if capabilities.uses_native_fa4:
+        if model is None:
+            raise ValueError("Native FA4 packing requires the built model")
+        _install_native_fa4_metadata_hook(model)
+        return capabilities
     if not capabilities.patch_transformers:
         return capabilities
     if unpad_data is None:

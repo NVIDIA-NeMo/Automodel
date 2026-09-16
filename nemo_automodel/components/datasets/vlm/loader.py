@@ -33,6 +33,7 @@ from nemo_automodel.components.datasets.loader import DatasetConfig, TokenizerDa
 from nemo_automodel.components.datasets.packing import (
     DEFAULT_PACKED_SEQUENCE_CONTRACT,
     PackedSequenceContract,
+    resolve_packing_contract,
 )
 from nemo_automodel.components.datasets.vlm.collate_fns import (
     COLLATE_FNS,
@@ -214,6 +215,7 @@ class VlmDataloaderConfig:
         batch_size: int,
         dataset_build_context: AbstractContextManager[object] | None = None,
         get_rope_index: Callable[..., object] | None = None,
+        packing_attn_implementation: str | None = None,
         packing_contract: PackedSequenceContract = DEFAULT_PACKED_SEQUENCE_CONTRACT,
         pp_n_microbatches: int | None = None,
         cp_size: int = 1,
@@ -227,6 +229,8 @@ class VlmDataloaderConfig:
             batch_size: Runtime local training batch size.
             dataset_build_context: Optional rank-ordering context used only for processor and source-dataset build.
             get_rope_index: Optional model callback used to create packed multimodal position IDs.
+            packing_attn_implementation: Deprecated attention-backend name
+                retained for Python-call compatibility.
             packing_contract: Structural model contract used for packed-mask construction.
                 Defaults to block-causal masking without packed-sequence metadata.
             pp_n_microbatches: Optional pipeline microbatch count used to pre-chunk media tensors.
@@ -253,6 +257,8 @@ class VlmDataloaderConfig:
         if self.packing is not None:
             if self.pretokenization is None:
                 raise ValueError("VLM neat packing requires pretokenization")
+            legacy_attn_implementation = packing_attn_implementation or self.packing.attn_implementation
+            packing_contract = resolve_packing_contract(packing_contract, legacy_attn_implementation)
             tokenizer = getattr(processor, "tokenizer", None)
             padding_idx = getattr(tokenizer, "pad_token_id", 0) or 0
             dataset = self.packing.build(

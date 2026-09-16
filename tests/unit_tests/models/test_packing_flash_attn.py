@@ -139,7 +139,10 @@ def test_collater_native_fa4_emits_varlen_metadata():
 
     result = neat_packed_vlm_collater(
         batch,
-        packing=get_packing_capabilities("fa4"),
+        packing=get_packing_capabilities(
+            "fa4",
+            model=type("NativeFA4Consumer", (), {"_uses_native_fa4": True})(),
+        ),
     )
 
     assert result["attention_mask"].tolist() == [[1, 1, 2, 2, 2], [1, 1, 1, 0, 0]]

@@ -23,6 +23,7 @@ from nemo_automodel.components.datasets.packing import (
     DEFAULT_PACKED_SEQUENCE_CONTRACT,
     PackedSequenceContract,
     build_packed_sequence_metadata,
+    resolve_packing_contract,
 )
 
 try:
@@ -1511,8 +1512,10 @@ def neat_packed_vlm_collater(
     batch: list[dict],
     padding_idx: int = 0,
     max_length: int | None = None,
-    packing: PackedSequenceContract = DEFAULT_PACKED_SEQUENCE_CONTRACT,
+    attn_implementation: str | None = None,
     materialize_4d_mask: bool = True,
+    *,
+    packing: PackedSequenceContract = DEFAULT_PACKED_SEQUENCE_CONTRACT,
 ) -> dict:
     """Collater for neat-packed VLM sequences.
 
@@ -1533,6 +1536,8 @@ def neat_packed_vlm_collater(
             If ``None`` (default), pad to the longest pack in the batch.
             A fixed length avoids recompilation with ``torch.compile``
             and ensures uniform tensor shapes across steps.
+        attn_implementation: Deprecated attention-backend name retained in its
+            original positional slot for Python-call compatibility.
         packing: Structural model contract selecting the packed mask representation.
             Defaults to block-causal masking without packed-sequence metadata.
         materialize_4d_mask: Whether SDPA/eager packing should expand the
@@ -1546,6 +1551,7 @@ def neat_packed_vlm_collater(
         batch-major ``packed_token_indices`` and ``cu_seqlens`` tensors plus
         scalar ``max_seqlen``.
     """
+    packing = resolve_packing_contract(packing, attn_implementation)
     if not batch:
         return {}
 

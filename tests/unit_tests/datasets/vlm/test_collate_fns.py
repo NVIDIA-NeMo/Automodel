@@ -3128,6 +3128,15 @@ class TestNeatPackedVlmCollaterPackingContract:
 
         assert result["attention_mask"].ndim == 2
 
+    def test_deprecated_positional_attention_argument_is_translated(self):
+        from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
+
+        batch = [self._make_packed_sample(8, 0)]
+        with pytest.warns(FutureWarning, match="attn_implementation is deprecated"):
+            result = neat_packed_vlm_collater(batch, 0, None, "flash_attention_2")
+
+        assert result["attention_mask"].ndim == 2
+
     def test_block_causal_contract_returns_4d_mask(self):
         from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
 

@@ -60,10 +60,11 @@ def prepare_gated_delta_packed_metadata(
             sequence] or a backend-specific attention mask.
         packed_seq_ids: Optional indexed document IDs of shape [batch,
             sequence] supplied beside a backend-specific attention mask.
-        packed_token_indices: Optional batch-major valid-token indices supplied
-            by dataset packing.
-        cu_seqlens: Optional batch-major cumulative document lengths supplied
-            by dataset packing.
+        packed_token_indices: Optional valid-token indices of shape [batch,
+            sequence] before model-entry normalization or [tokens] afterward.
+        cu_seqlens: Optional cumulative document lengths of shape [batch,
+            max_documents + 1] before model-entry normalization or
+            [documents + 1] afterward.
 
     Returns:
         Device and CPU packed-sequence metadata whose tensor layouts are
@@ -79,12 +80,13 @@ def prepare_gated_delta_packed_metadata(
 
     if packed_token_indices is None or cu_seqlens is None:
         raise ValueError("Packed Qwen3.5 inputs require dataset-provided packed_token_indices and cu_seqlens.")
-    packed_token_indices, cu_seqlens = flatten_packed_sequence_metadata(
-        packed_token_indices,
-        cu_seqlens,
-        batch_size=document_ids.shape[0],
-        sequence_length=document_ids.shape[1],
-    )
+    if packed_token_indices.ndim != 1 or cu_seqlens.ndim != 1:
+        packed_token_indices, cu_seqlens = flatten_packed_sequence_metadata(
+            packed_token_indices,
+            cu_seqlens,
+            batch_size=document_ids.shape[0],
+            sequence_length=document_ids.shape[1],
+        )
     cu_seqlens = cu_seqlens.to(torch.long)
     return GatedDeltaPackedMetadata(
         document_ids=document_ids,

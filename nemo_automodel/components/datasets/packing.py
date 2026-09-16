@@ -14,6 +14,7 @@
 
 """Dataset-owned packed-sequence construction contracts and helpers."""
 
+import warnings
 from dataclasses import dataclass
 from typing import Final, Literal, Protocol, TypedDict
 
@@ -46,6 +47,40 @@ class _DefaultPackedSequenceContract:
 
 
 DEFAULT_PACKED_SEQUENCE_CONTRACT: Final[PackedSequenceContract] = _DefaultPackedSequenceContract()
+_LEGACY_FLASH_ATTENTION_IMPLEMENTATIONS = frozenset({"flash_attention_2", "flash_attention_3", "flash_attention_4"})
+
+
+def resolve_packing_contract(
+    packing: PackedSequenceContract,
+    attn_implementation: str | None,
+) -> PackedSequenceContract:
+    """Translate the deprecated attention keyword to a packing contract.
+
+    Args:
+        packing: Explicit structural packing contract. It takes precedence when
+            both migration surfaces are supplied.
+        attn_implementation: Deprecated attention-backend name, or ``None``.
+
+    Returns:
+        The explicit contract, or a compatibility contract matching the legacy
+        mask-layout behavior.
+    """
+    if attn_implementation is None:
+        return packing
+
+    if packing is DEFAULT_PACKED_SEQUENCE_CONTRACT:
+        packed_mask_type: PackedMaskType = (
+            "document_ids" if attn_implementation in _LEGACY_FLASH_ATTENTION_IMPLEMENTATIONS else "block_causal"
+        )
+        packing = _DefaultPackedSequenceContract(packed_mask_type=packed_mask_type)
+        message = (
+            "attn_implementation is deprecated for packed-sequence construction; "
+            "pass the model-derived packing contract instead"
+        )
+    else:
+        message = "attn_implementation is deprecated and ignored because an explicit packing contract was supplied"
+    warnings.warn(message, FutureWarning, stacklevel=3)
+    return packing
 
 
 class PackedSequenceMetadata(TypedDict):

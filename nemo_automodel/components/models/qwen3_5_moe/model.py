@@ -826,6 +826,7 @@ class Qwen3_5MoeTextModelBackend(nn.Module):
 class Qwen3_5MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     """Text-only Qwen3.5-MoE causal language model."""
 
+    _uses_native_fa4 = True
     requires_packed_sequence_metadata = True
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
     _pp_keep_self_forward: bool = True
@@ -1144,6 +1145,7 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
     # through this packed attention contract.
     _packed_cp_attn_backends = ("sdpa",)
 
+    _uses_native_fa4 = True
     requires_packed_sequence_metadata = True
     # forward() pulls per-microbatch pixel_values from _vlm_pixel_values_chunks;
     # patch_hf_model_for_pp must not replace it under PP.

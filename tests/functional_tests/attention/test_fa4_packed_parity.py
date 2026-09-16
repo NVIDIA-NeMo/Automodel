@@ -23,6 +23,7 @@ from nemo_automodel.components.attention.utils import (
     preprocess_args_and_kwargs_for_attn,
 )
 from nemo_automodel.components.datasets.packing import build_packed_sequence_metadata
+from nemo_automodel.components.models.common.packing import flatten_packed_sequence_metadata
 
 
 def _packed_sdpa_reference(
@@ -36,17 +37,17 @@ def _packed_sdpa_reference(
     """Evaluate packed causal attention independently with PyTorch SDPA.
 
     Args:
-        q: Query tensor of shape [batch, sequence, heads, head_dim].
-        k: Key tensor of shape [batch, sequence, heads, head_dim].
-        v: Value tensor of shape [batch, sequence, heads, head_dim].
+        q: Query tensor of shape [batch, sequence, heads, qk_head_dim].
+        k: Key tensor of shape [batch, sequence, heads, qk_head_dim].
+        v: Value tensor of shape [batch, sequence, heads, v_head_dim].
         attention_mask: Indexed document mask of shape [batch, sequence].
         scale: Attention score scale.
 
     Returns:
-        Tensor of shape [batch, sequence, heads, head_dim], with zeros at
+        Tensor of shape [batch, sequence, heads, v_head_dim], with zeros at
         padding positions.
     """
-    output = torch.zeros_like(q)
+    output = v.new_zeros((*q.shape[:-1], v.shape[-1]))
     for batch_idx in range(attention_mask.shape[0]):
         for document_id in range(1, int(attention_mask[batch_idx].max().item()) + 1):
             positions = torch.nonzero(attention_mask[batch_idx] == document_id, as_tuple=False).flatten()
@@ -73,8 +74,9 @@ def test_native_fa4_packed_forward_backward_matches_sdpa() -> None:
 
     device = torch.device("cuda")
     dtype = torch.bfloat16
-    head_dim = 64
-    scale = head_dim**-0.5
+    qk_head_dim = 192
+    v_head_dim = 128
+    scale = qk_head_dim**-0.5
     attention_mask = torch.tensor(
         [[1] * 32 + [2] * 48 + [0] * 16, [1] * 24 + [2] * 24 + [3] * 48],
         device=device,
@@ -82,9 +84,9 @@ def test_native_fa4_packed_forward_backward_matches_sdpa() -> None:
     packing_metadata = build_packed_sequence_metadata(attention_mask)
 
     torch.manual_seed(1234)
-    q = torch.randn(2, 96, 4, head_dim, device=device, dtype=dtype, requires_grad=True)
-    k = torch.randn(2, 96, 4, head_dim, device=device, dtype=dtype, requires_grad=True)
-    v = torch.randn(2, 96, 4, head_dim, device=device, dtype=dtype, requires_grad=True)
+    q = torch.randn(2, 96, 4, qk_head_dim, device=device, dtype=dtype, requires_grad=True)
+    k = torch.randn(2, 96, 4, qk_head_dim, device=device, dtype=dtype, requires_grad=True)
+    v = torch.randn(2, 96, 4, v_head_dim, device=device, dtype=dtype, requires_grad=True)
     q_ref = q.detach().clone().requires_grad_()
     k_ref = k.detach().clone().requires_grad_()
     v_ref = v.detach().clone().requires_grad_()
@@ -92,9 +94,15 @@ def test_native_fa4_packed_forward_backward_matches_sdpa() -> None:
     _, fa4 = initialize_attn_module_and_func(
         attn_impl="fa4",
         num_attention_heads=4,
-        num_qk_channels=head_dim,
-        num_v_channels=head_dim,
+        num_qk_channels=qk_head_dim,
+        num_v_channels=v_head_dim,
         softmax_scale=scale,
+    )
+    packed_token_indices, cu_seqlens = flatten_packed_sequence_metadata(
+        packing_metadata["packed_token_indices"],
+        packing_metadata["cu_seqlens"],
+        batch_size=2,
+        sequence_length=96,
     )
     packed_q, packed_k, packed_v, fa4_kwargs = preprocess_args_and_kwargs_for_attn(
         q,
@@ -102,7 +110,9 @@ def test_native_fa4_packed_forward_backward_matches_sdpa() -> None:
         v,
         attention_mask,
         "fa4",
-        **packing_metadata,
+        packed_token_indices=packed_token_indices,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=packing_metadata["max_seqlen"],
     )
     output = fa4(packed_q, packed_k, packed_v, **fa4_kwargs)
     reference = _packed_sdpa_reference(q_ref, k_ref, v_ref, attention_mask, scale=scale)
