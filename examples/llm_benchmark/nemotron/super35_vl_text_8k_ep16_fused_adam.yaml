@@ -15,7 +15,7 @@
 # Super 3.5 VL text-only mock benchmark: 4 nodes x 4 GB200, one NVLink domain.
 # Native entry: nemo_automodel/recipes/llm/benchmark.py
 # Required environment: PYTORCH_ALLOC_CONF=expandable_segments:True
-# Online W&B authentication must be available in the launch environment.
+# To enable online W&B, set wandb.enable: true and provide authentication.
 recipe: BenchmarkingRecipeForNextTokenPrediction
 seed: 1234
 step_scheduler:
@@ -96,7 +96,7 @@ checkpoint:
   enabled: false
   checkpoint_dir: /lustre/fsw/portfolios/coreai/users/huiyingl/super35_perf_hsg_20260915/benchmark_runs/super35_vl_text_8k_ep16_fused_adam
 wandb:
-  enable: true
+  enable: false
   entity: Nemo-automodel
   project: huiyingl_workspace
   mode: online
@@ -108,4 +108,4 @@ benchmark:
   nsys_end: -1
   nsys_ranks: []
   num_nodes: 4
-  json_output_path: /lustre/fsw/portfolios/coreai/users/huiyingl/super35_perf_hsg_20260915/benchmark_runs/super35_vl_text_8k_ep16_fused_adam/benchmark_summary.json
+  json_output_path: training_logs/super35_vl_text_8k_ep16_fused_adam.json
