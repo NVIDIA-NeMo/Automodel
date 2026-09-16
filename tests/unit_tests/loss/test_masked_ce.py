@@ -164,3 +164,35 @@ def test_calculate_loss_maps_dataset_padding_to_configured_ignore_index():
         reduction="sum",
     )
     torch.testing.assert_close(loss, expected)
+
+
+def test_masked_cross_entropy_per_token_weights_match_loss_and_gradient_reference():
+    """Per-token objective multipliers must scale both loss and logits gradients."""
+    torch.manual_seed(17)
+    logits = torch.randn(2, 3, 7, requires_grad=True)
+    reference_logits = logits.detach().clone().requires_grad_()
+    labels = torch.tensor([[1, 2, -100], [3, 4, 5]])
+    loss_weights = torch.tensor([[0.5, 0.5, 0.5], [1.5, 1.5, 1.5]])
+
+    loss = MaskedCrossEntropy(fp32_upcast=False)(
+        logits,
+        labels,
+        num_label_tokens=5,
+        loss_weights=loss_weights,
+    )
+    per_token = F.cross_entropy(
+        reference_logits.reshape(-1, reference_logits.shape[-1]),
+        labels.reshape(-1),
+        ignore_index=-100,
+        reduction="none",
+    ).reshape_as(labels)
+    reference = (per_token * loss_weights).sum() / 5
+
+    torch.testing.assert_close(loss, reference)
+    loss.backward()
+    reference.backward()
+    torch.testing.assert_close(logits.grad, reference_logits.grad)
+    with torch.no_grad():
+        logits -= 0.1 * logits.grad
+        reference_logits -= 0.1 * reference_logits.grad
+    torch.testing.assert_close(logits, reference_logits)

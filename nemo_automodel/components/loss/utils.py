@@ -127,6 +127,9 @@ def calculate_loss(loss_fn: nn.Module, **kwargs: Any) -> torch.Tensor:
     """
     loss_fn_kwargs = {"num_label_tokens": kwargs.pop("num_label_tokens", None)}
     labels = _normalize_loss_labels(kwargs.pop("labels"), _get_loss_ignore_index(loss_fn))
+    loss_weights = kwargs.pop("loss_weights", None)
+    if loss_weights is not None:
+        loss_fn_kwargs["loss_weights"] = loss_weights
     if isinstance(loss_fn, FusedLinearCrossEntropy):
         model = kwargs.pop("model")
         # Reuse a caller-materialized LM head when provided so a single
