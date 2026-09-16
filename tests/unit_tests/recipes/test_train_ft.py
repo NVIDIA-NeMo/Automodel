@@ -2253,6 +2253,7 @@ class TestRunTrainOptimStepSetsMoEScale:
         cp_group_size=1,
         pp_microbatches=1,
         world_size=1,
+        clip_grad_norm=None,
     ):
         from nemo_automodel.components.config.loader import ConfigNode
 
@@ -2269,6 +2270,7 @@ class TestRunTrainOptimStepSetsMoEScale:
                 "checkpoint": {"best_metric_key": "default"},
                 "distributed": {"cp_size": 1},
                 "autopipeline": {"pp_microbatch_size": 1},
+                "clip_grad_norm": clip_grad_norm or {},
             }
         )
         monkeypatch.setattr(
@@ -2340,6 +2342,19 @@ class TestRunTrainOptimStepSetsMoEScale:
         object.__setattr__(recipe, "lr_scheduler", None)
         object.__setattr__(recipe, "timestamp", 0.0)
         return recipe
+
+    @pytest.mark.parametrize("backend", [None, "triton", "te"])
+    def test_grad_norm_backend_config(self, monkeypatch, backend):
+        options = {} if backend is None else {"backend": backend}
+        recipe = self._make_recipe(monkeypatch, pp_enabled=False, clip_grad_norm=options)
+        clip = MagicMock(return_value=torch.tensor(1.0))
+        monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.scale_grads_and_clip_grad_norm", clip)
+        batches = [{"input_ids": torch.tensor([[1, 2, 3]]), "labels": torch.tensor([[1, 2, 3]])}]
+
+        sample = recipe._run_train_optim_step(batches, max_grad_norm=1.0)
+
+        assert clip.call_args.kwargs["grad_norm_backend"] == (backend or "triton")
+        assert sample.metrics["grad_norm"] == 1.0
 
     @pytest.mark.parametrize("pp_enabled", [False, True])
     @pytest.mark.parametrize("accumulation_steps", [1, 3])
