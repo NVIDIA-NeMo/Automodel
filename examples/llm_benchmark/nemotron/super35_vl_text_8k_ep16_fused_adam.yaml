@@ -101,6 +101,7 @@ wandb:
   mode: online
   name: super35-vl-text-8k-ep16-fused-adam
 benchmark:
+  flops_scope: text  # Text-only mock input; vision FLOPs are excluded.
   warmup_steps: 5
   peak_tflops: 2500
   nsys_start: -1
