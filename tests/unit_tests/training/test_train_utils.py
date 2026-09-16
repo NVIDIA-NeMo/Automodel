@@ -20,6 +20,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from nemo_automodel.components.training import utils as training_utils
 from nemo_automodel.components.training.utils import (
     ScopedModuleOffloading,
     _all_reduce_scalar,
@@ -181,6 +182,35 @@ def test_clip_grad_norm_uses_torch_fast_path_when_requested(monkeypatch):
     assert clip_grad_norm_mock.call_args.kwargs["error_if_nonfinite"] is False
     assert clip_grad_norm_mock.call_args.kwargs["foreach"] is True
     clip_grads_with_norm_mock.assert_not_called()
+
+
+@pytest.mark.parametrize("backend", [None, "triton", "te"])
+def test_clip_grad_norm_selects_requested_backend(monkeypatch, backend):
+    model = torch.nn.Linear(2, 1, bias=False)
+    gradient = torch.tensor([[3.0, 4.0]])
+    model.weight.grad = gradient.clone()
+
+    triton_norm = Mock(return_value=torch.tensor(25.0, dtype=torch.float64))
+    te_norm = Mock(return_value=torch.tensor(5.0, dtype=torch.float64))
+    monkeypatch.setattr(training_utils, "_use_fused_grad_norm", lambda *_: True)
+    monkeypatch.setattr(training_utils, "multi_tensor_sumsq", triton_norm)
+    monkeypatch.setattr(training_utils, "_local_te_l2_norm", te_norm)
+
+    options = {} if backend is None else {"grad_norm_backend": backend}
+    observed = clip_grad_norm(max_grad_norm=1.0, model_parts=[model], **options)
+
+    torch.testing.assert_close(observed, torch.tensor(5.0, dtype=torch.float64))
+    torch.testing.assert_close(model.weight.grad, gradient / (5.0 + 1e-6))
+    assert triton_norm.call_count == (backend != "te")
+    assert te_norm.call_count == (backend == "te")
+
+
+def test_clip_grad_norm_rejects_invalid_backend():
+    model = torch.nn.Linear(1, 1, bias=False)
+    model.weight.grad = torch.ones_like(model.weight)
+
+    with pytest.raises(ValueError, match="grad_norm_backend must be 'triton' or 'te'"):
+        clip_grad_norm(max_grad_norm=1.0, model_parts=[model], grad_norm_backend="invalid")
 
 
 def test_clip_grad_norm_disables_torch_fast_path_for_owner_shard(monkeypatch):

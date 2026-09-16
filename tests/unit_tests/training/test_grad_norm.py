@@ -22,6 +22,8 @@ from nemo_automodel.components.training.triton.grad_norm import (
     multi_tensor_sumsq,
     sumsq_reference,
 )
+from nemo_automodel.components.training.utils import _local_te_l2_norm
+from nemo_automodel.shared.import_utils import safe_import_te
 
 
 def test_build_chunk_ends_handles_empty_and_boundary_sized_tensors():
@@ -45,3 +47,21 @@ def test_multi_tensor_sumsq_matches_fp64_reference_and_is_repeatable():
 
     torch.testing.assert_close(actual[0], expected, rtol=1e-12, atol=1e-12)
     assert all(torch.equal(actual[0], repeated) for repeated in actual[1:])
+
+
+@pytest.mark.skipif(not HAVE_TRITON or not torch.cuda.is_available(), reason="requires Triton and CUDA")
+def test_te_and_triton_l2_backends_match_fp64_reference():
+    if not safe_import_te()[0]:
+        pytest.skip("requires Transformer Engine")
+
+    gradients = [
+        torch.linspace(-3, 3, _CHUNK + 17, device="cuda").to(torch.bfloat16),
+        torch.linspace(-0.25, 0.25, 2 * _CHUNK + 1, device="cuda"),
+    ]
+    expected = sumsq_reference(gradients).sqrt()
+
+    triton_norm = multi_tensor_sumsq(gradients).sqrt().cpu()
+    te_norm = _local_te_l2_norm(gradients, torch.device("cuda")).cpu()
+
+    torch.testing.assert_close(triton_norm, expected, rtol=1e-12, atol=1e-12)
+    torch.testing.assert_close(te_norm, expected, rtol=2e-6, atol=0)
