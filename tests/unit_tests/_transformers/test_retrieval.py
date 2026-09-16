@@ -1471,6 +1471,54 @@ def test_extract_submodel_llama_score_from_local_vlm_converts_to_supported_cross
     assert outputs.logits.shape == (2, 1)
 
 
+@pytest.mark.parametrize(
+    ("saved_policy", "explicit_policy", "expected_policy"),
+    [(None, None, False), (True, None, True), (False, None, False), (True, False, False), (False, True, True)],
+    ids=["native-scorer", "saved-causal", "saved-bidirectional", "override-bidirectional", "override-causal"],
+)
+def test_extracted_scorer_matches_direct_loading(tmp_path, saved_policy, explicit_policy, expected_policy):
+    """Extraction preserves scorer defaults, saved policies, and explicit overrides."""
+    config = _tiny_mistral3_vlm_config("llama")
+    if saved_policy is not None:
+        config.text_config.is_causal = saved_policy
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(0)
+        source = AutoModel.from_config(config, attn_implementation="eager")
+    composite_dir = tmp_path / "composite"
+    text_dir = tmp_path / "text"
+    source.save_pretrained(composite_dir)
+    source.language_model.save_pretrained(text_dir)
+
+    direct = retrieval.CrossEncoderModel.build(
+        str(text_dir), num_labels=1, pooling="cls", attn_implementation="eager", is_causal=explicit_policy
+    ).eval()
+    extracted = retrieval.CrossEncoderModel.build(
+        str(composite_dir),
+        extract_submodel="language_model",
+        num_labels=1,
+        pooling="cls",
+        attn_implementation="eager",
+        is_causal=explicit_policy,
+    ).eval()
+    # The checkpoint contains no scoring head; compare with identical deterministic head weights.
+    with torch.no_grad():
+        direct.model.score.weight.copy_(torch.linspace(-0.5, 0.5, config.text_config.hidden_size).unsqueeze(0))
+    extracted.model.score.load_state_dict(direct.model.score.state_dict())
+
+    inputs = {"input_ids": torch.tensor([[1, 2, 3, 4], [1, 2, 3, 5]]), "attention_mask": torch.ones(2, 4)}
+    with torch.no_grad():
+        direct_scores = direct(inputs).logits
+        extracted_scores = extracted(inputs).logits
+
+    assert direct.is_causal is extracted.is_causal is expected_policy
+    torch.testing.assert_close(extracted_scores, direct_scores, rtol=0, atol=0)
+    # CLS pooling exposes future-token influence, unlike last-token pooling.
+    if expected_policy:
+        torch.testing.assert_close(extracted_scores[0], extracted_scores[1], rtol=0, atol=0)
+    else:
+        assert not torch.allclose(extracted_scores[0], extracted_scores[1], rtol=1e-5, atol=1e-7)
+
+
 def test_extract_submodel_ministral_score_from_local_vlm_converts_to_hf_cross_encoder(tmp_path):
     """Reranking still works when no registered score backbone exists for the text model."""
     model_dir, language_state_dict = _save_tiny_vlm(tmp_path, "ministral3")
