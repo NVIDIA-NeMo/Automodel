@@ -120,9 +120,10 @@ ci:
   recipe_owner: akoumpa
   time: "00:20:00"
   checkpoint_robustness:
-    # PEFT source and reload comparisons consistently sit above the standard
-    # same-implementation envelope while remaining well inside the shared relaxed profile.
-    parity_tolerance_profile: relaxed
+    # Fixed attention makes AutoModel reload exact; source parity also passes standard.
+    # HF adapter reload still needs relaxed (mean KL 0.01998, p95 KL 0.06953).
+    parity_tolerance_profile_overrides:
+      hf_reload: relaxed
     tokenizer_name: openai/gpt-oss-20b
     dataset.num_samples_limit: 500
     validation_dataset.num_samples_limit: 500

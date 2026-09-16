@@ -22,12 +22,18 @@ from typing import Any, Dict
 
 import torch
 import torch.distributed as dist
-import wandb
+
+from nemo_automodel.shared.import_utils import safe_import
+
+_HAS_WANDB, wandb = safe_import(
+    "wandb", msg="wandb is not installed. To enable W&B experiment tracking, run: uv add nemo-automodel[wandb]"
+)
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
 
 from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
 from nemo_automodel.components.distributed.fsdp2 import fsdp2_sharding_enabled
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
+from nemo_automodel.components.distributed.tp_replicas import broadcast_tp_replicas, synchronize_tp_replica_gradients
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.flow_matching.pipeline import FlowMatchingPipeline, create_adapter
 from nemo_automodel.components.loggers.log_utils import setup_logging
@@ -693,6 +699,10 @@ class TrainDiffusionRecipe(BaseRecipe):
         )
 
         self.model = self.pipe.transformer
+        # LoRA and random-pretraining parameters are initialized before TP is
+        # applied. Align their replicated local storage before the optimizer
+        # captures the sharded model parameters.
+        broadcast_tp_replicas([self.model], self.device_mesh)
 
         # FSDP2's MixedPrecisionPolicy is what casts parameters to compute_dtype, and
         # parallelization is skipped entirely on a single-rank mesh. Autocast covers
@@ -1062,7 +1072,13 @@ class TrainDiffusionRecipe(BaseRecipe):
                     if microbatch_idx == 0:
                         prepare_after_first_microbatch()
 
-                grad_norm = clip_grad_norm(self.clip_grad_max_norm, [self.model], foreach=self.grad_clip_foreach)
+                synchronize_tp_replica_gradients([self.model], getattr(self, "device_mesh", None))
+                grad_norm = clip_grad_norm(
+                    self.clip_grad_max_norm,
+                    [self.model],
+                    device_mesh=getattr(self, "device_mesh", None),
+                    foreach=self.grad_clip_foreach,
+                )
                 grad_norm = float(grad_norm) if torch.is_tensor(grad_norm) else grad_norm
 
                 # ── LoRA gradient diagnostic (step 1 only) ───────────────────
@@ -1118,7 +1134,7 @@ class TrainDiffusionRecipe(BaseRecipe):
                         **throughput_metrics,
                         **memory_metrics,
                     }
-                    if wandb.run is not None:
+                    if _HAS_WANDB and wandb.run is not None:
                         wandb.log(log_dict, step=global_step)
                     logging.info(
                         "[TRAIN] step=%s epoch=%s loss=%.6f avg_loss=%.6f lr=%.3e grad_norm=%.3f "
@@ -1151,7 +1167,7 @@ class TrainDiffusionRecipe(BaseRecipe):
                 if self.val_dataloader is not None and self.step_scheduler.is_val_step:
                     val_loss = self._run_validation_epoch(global_step)
                     if self.dist_env.is_main:
-                        if wandb.run is not None:
+                        if _HAS_WANDB and wandb.run is not None:
                             wandb.log({"val_loss": val_loss}, step=global_step)
                         logging.info(
                             "[VAL] step=%s epoch=%s val_loss=%.6f",
@@ -1169,12 +1185,12 @@ class TrainDiffusionRecipe(BaseRecipe):
             avg_loss = epoch_loss / num_steps
             logging.info(f"[INFO] Epoch {epoch + 1} complete. avg_loss={avg_loss:.6f}")
 
-            if self.dist_env.is_main and wandb.run is not None:
+            if self.dist_env.is_main and _HAS_WANDB and wandb.run is not None:
                 wandb.log({"epoch/avg_loss": avg_loss, "epoch/num": epoch + 1}, step=global_step)
 
         if self.dist_env.is_main:
             logging.info(f"[INFO] Saved final checkpoint at step {global_step}")
-            if wandb.run is not None:
+            if _HAS_WANDB and wandb.run is not None:
                 wandb.finish()
 
         self._finalize_and_close_checkpointer()
