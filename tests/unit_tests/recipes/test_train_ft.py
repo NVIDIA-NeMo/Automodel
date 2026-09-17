@@ -572,6 +572,7 @@ def test_build_dataloader_iterable_shard_and_shuffle_removed_from_cfg(monkeypatc
     captured = getattr(mod.dl_factory_capture, "captured")
     # Ensure shuffle-related keys are not forwarded to DataLoader instantiation
     assert "shuffle" not in captured and "shuffle_buffer_size" not in captured
+    assert captured["batch_size"] == 2
     ds = captured["dataset"]
     # Avoid fragile identity issues from re-imports; validate by name and interface
     assert ds.__class__.__name__ == "DummyIterableDataset"

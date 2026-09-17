@@ -520,7 +520,7 @@ def build_dataloader(
                     logging.info(f"Shuffling IterableDataset with buffer_size={shuffle_buffer_size}, seed={seed}")
                 except Exception as e:
                     logging.warning(f"IterableDataset shuffle skipped due to error: {e}")
-            dl_kwargs = {}
+            dl_kwargs = {"batch_size": local_batch_size}
 
         # Handle collate_fn with optional mask precomputation for pipeline parallelism
         dl_kwargs = dl_kwargs | {"dataset": ds}
