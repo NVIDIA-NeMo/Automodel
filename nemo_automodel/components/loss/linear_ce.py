@@ -217,6 +217,7 @@ class FusedLinearCrossEntropy(nn.Module):
         lm_weight: torch.Tensor,
         num_label_tokens: int | None = None,
         grad_reduce_group: dist.ProcessGroup | None = None,
+        loss_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Compute fused linear cross entropy matching PyTorch behavior.
 
@@ -230,6 +231,8 @@ class FusedLinearCrossEntropy(nn.Module):
                 to normalize a sum-reduced loss.
             grad_reduce_group: Group that contributes independent loss shards
                 when ``lm_weight`` is a sharded DTensor.
+            loss_weights: Optional per-token multipliers matching
+                ``labels.shape``. Only supported with ``reduction="sum"``.
 
         Returns:
             Scalar loss tensor on the same device as ``hidden_states``. The
@@ -238,14 +241,23 @@ class FusedLinearCrossEntropy(nn.Module):
         if not HAVE_CUT_CROSS_ENTROPY:
             raise ImportError(MISSING_CUT_CROSS_ENTROPY_MSG)
 
+        if loss_weights is not None:
+            if self.reduction != "sum":
+                raise ValueError("loss_weights is only supported when reduction is 'sum'")
+            if loss_weights.shape != labels.shape:
+                raise ValueError(
+                    f"loss_weights.shape must match labels.shape, got {tuple(loss_weights.shape)} "
+                    f"and {tuple(labels.shape)}"
+                )
+            loss_weights = loss_weights.to(device=hidden_states.device, dtype=torch.float32)
+
         lm_weight = self.materialize_lm_weight(
             lm_weight,
             grad_reduce_group=grad_reduce_group,
         )
 
         # First compute loss with sum reduction to handle normalization ourselves
-        if self.logit_softcapping == 0:
-            self.logit_softcapping = None
+        softcap = None if self.logit_softcapping == 0 else self.logit_softcapping
 
         # Compute loss with shift=False to match PyTorch behavior
         # Set filter_eps=None to avoid any token filtering
@@ -254,12 +266,17 @@ class FusedLinearCrossEntropy(nn.Module):
             lm_weight,
             targets=labels,
             ignore_index=self.ignore_index,
-            softcap=self.logit_softcapping,
-            reduction=self.reduction,  # Use sum reduction to handle normalization ourselves
+            softcap=softcap,
+            reduction="none" if loss_weights is not None else self.reduction,
             shift=False,  # Match PyTorch behavior
             filter_eps=None,  # No token filtering
         )
+        if loss_weights is not None:
+            loss = (loss * loss_weights).sum()
         if num_label_tokens is not None:
-            assert self.reduction == "sum", "num_label_tokens is only supported when reduction is 'sum'"
+            if self.reduction != "sum":
+                raise ValueError("num_label_tokens is only supported when reduction is 'sum'")
+            if num_label_tokens == 0:
+                return loss * 0.0
             loss = loss / num_label_tokens
         return loss

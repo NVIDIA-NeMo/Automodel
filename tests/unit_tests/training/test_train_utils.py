@@ -21,6 +21,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+import nemo_automodel.components.training.utils as training_utils
 from nemo_automodel.components.training.utils import (
     ScopedModuleOffloading,
     _all_reduce_scalar,
@@ -182,6 +183,35 @@ def test_clip_grad_norm_uses_torch_fast_path_when_requested(monkeypatch):
     assert clip_grad_norm_mock.call_args.kwargs["error_if_nonfinite"] is False
     assert clip_grad_norm_mock.call_args.kwargs["foreach"] is True
     clip_grads_with_norm_mock.assert_not_called()
+
+
+@pytest.mark.parametrize("backend", [None, "triton", "te"])
+def test_clip_grad_norm_selects_requested_backend(monkeypatch, backend):
+    model = torch.nn.Linear(2, 1, bias=False)
+    gradient = torch.tensor([[3.0, 4.0]])
+    model.weight.grad = gradient.clone()
+
+    triton_norm = Mock(return_value=torch.tensor(25.0, dtype=torch.float64))
+    te_norm = Mock(return_value=torch.tensor(5.0, dtype=torch.float64))
+    monkeypatch.setattr(training_utils, "_use_fused_grad_norm", lambda *_: True)
+    monkeypatch.setattr(training_utils, "multi_tensor_sumsq", triton_norm)
+    monkeypatch.setattr(training_utils, "_local_te_l2_norm", te_norm)
+
+    options = {} if backend is None else {"grad_norm_backend": backend}
+    observed = clip_grad_norm(max_grad_norm=1.0, model_parts=[model], **options)
+
+    torch.testing.assert_close(observed, torch.tensor(5.0, dtype=torch.float64))
+    torch.testing.assert_close(model.weight.grad, gradient / (5.0 + 1e-6))
+    assert triton_norm.call_count == (backend != "te")
+    assert te_norm.call_count == (backend == "te")
+
+
+def test_clip_grad_norm_rejects_invalid_backend():
+    model = torch.nn.Linear(1, 1, bias=False)
+    model.weight.grad = torch.ones_like(model.weight)
+
+    with pytest.raises(ValueError, match="grad_norm_backend must be 'triton' or 'te'"):
+        clip_grad_norm(max_grad_norm=1.0, model_parts=[model], grad_norm_backend="invalid")
 
 
 def test_clip_grad_norm_disables_torch_fast_path_for_owner_shard(monkeypatch):
@@ -731,8 +761,27 @@ class TestScaleGradsAndClipGradNorm:
         assert torch.allclose(expert_param.grad, torch.ones_like(expert_param) * 2.0)
 
 
-@pytest.mark.parametrize("use_te", [False, True])
-def test_optional_te_is_not_loaded_for_import_or_cpu_clipping(monkeypatch, use_te):
+@pytest.mark.parametrize("norm_type", [1.0, 2.0, 3.0, float("inf")])
+@pytest.mark.parametrize("transposed", [False, True])
+def test_clip_large_gradient_matches_dense_float64_reference(norm_type, transposed):
+    """Check large contiguous/strided gradients and clipping against a dense FP64 reference."""
+    torch.manual_seed(4128)
+    gradient = torch.randn(1025, 2049)
+    if transposed:
+        gradient = gradient.t()
+    parameter = torch.nn.Parameter(torch.empty_like(gradient))
+    parameter.grad = gradient.clone(memory_format=torch.preserve_format)
+    reference_norm = torch.linalg.vector_norm(gradient.double(), ord=norm_type)
+    reference = gradient * (0.3 / (reference_norm + 1e-6)).clamp(max=1.0)
+    from nemo_automodel.components.training.utils import _clip_grad_norm_impl
+
+    actual_norm = _clip_grad_norm_impl([parameter], 0.3, norm_type=norm_type)
+    torch.testing.assert_close(actual_norm, reference_norm, atol=0, rtol=2e-7)
+    torch.testing.assert_close(parameter.grad, reference, atol=0, rtol=3e-7)
+
+
+@pytest.mark.parametrize("backend", ["triton", "te"])
+def test_optional_te_is_not_loaded_for_import_or_cpu_clipping(monkeypatch: pytest.MonkeyPatch, backend: str) -> None:
     """A broken optional TE binary must not prevent import or CPU gradient clipping."""
     from nemo_automodel.components.training import utils
     from nemo_automodel.shared import import_utils
@@ -753,7 +802,7 @@ def test_optional_te_is_not_loaded_for_import_or_cpu_clipping(monkeypatch, use_t
 
     parameter = nn.Parameter(torch.tensor([1.0, 2.0]))
     parameter.grad = torch.tensor([3.0, 4.0])
-    norm = isolated_utils._clip_grad_norm_impl([parameter], 1.0, use_te=use_te)
+    norm = isolated_utils._clip_grad_norm_impl([parameter], 1.0, grad_norm_backend=backend)
     torch.testing.assert_close(norm, torch.tensor(5.0, dtype=torch.float64))
     expected_gradient = torch.tensor([3.0, 4.0]) / (5.0 + 1e-6)
     torch.testing.assert_close(parameter.grad, expected_gradient)

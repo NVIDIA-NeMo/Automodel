@@ -136,14 +136,15 @@ lr_scheduler:
   min_lr: 5.0e-7
 
 clip_grad_norm:
-  use_te: true  # Avoid FP64 gradient-sized temporaries for the Engram owner shards.
+  backend: te  # Avoid gradient-sized temporaries for the Engram owner shards.
   max_norm: 1.0
 
 wandb:
+  enable: false  # Set true to log training to W&B.
   entity: Nemo-automodel
   project: automodel-ds41-medpix
   name: ds41-medpix-4k-ep64
-  mode: disabled  # Set to online to enable W&B.
+  mode: online
   dir: ../logs/wandb
 
 ci:

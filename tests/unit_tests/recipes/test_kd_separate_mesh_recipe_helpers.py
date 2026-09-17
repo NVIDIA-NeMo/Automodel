@@ -24,6 +24,7 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.loss.kd_loss import KDLoss
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.recipes.llm import kd as llm_kd
 from nemo_automodel.recipes.vlm import kd as vlm_kd
 
@@ -64,6 +65,36 @@ class _TensorHiddenStateStudent(nn.Module):
         if logits_to_keep is not None:
             logits = logits[:, -logits_to_keep:]
         return CausalLMOutputWithPast(logits=logits, hidden_states=self.hidden_states)
+
+
+class _KDLogitsModel(nn.Module):
+    def __init__(self, logits: torch.Tensor, *, trainable: bool):
+        """Register logits used by the KD recipe regression.
+
+        Args:
+            logits: Tensor of shape [batch, sequence, vocab].
+            trainable: Whether to register ``logits`` as a parameter.
+        """
+        super().__init__()
+        if trainable:
+            self.logits = nn.Parameter(logits)
+        else:
+            self.register_buffer("logits", logits)
+
+    def forward(self, input_ids: torch.Tensor) -> CausalLMOutputWithPast:
+        """Return fixed logits for a matching token layout.
+
+        Args:
+            input_ids: Tensor of shape [batch, sequence].
+
+        Returns:
+            Model output with logits of shape [batch, sequence, vocab].
+        """
+        if self.logits.shape[:-1] != input_ids.shape:
+            raise ValueError(
+                f"logits shape {tuple(self.logits.shape[:-1])} does not match input shape {tuple(input_ids.shape)}"
+            )
+        return CausalLMOutputWithPast(logits=self.logits)
 
 
 _RECIPE_CASES = (
@@ -150,6 +181,117 @@ def test_kd_fused_loss_preserves_tensor_valued_hidden_states(monkeypatch, recipe
     assert received_hidden_states is student.hidden_states
     assert received_hidden_states.shape[:-1] == batch["labels"].shape
     assert calculate_loss.call_args.kwargs["grad_reduce_group"] is grad_reduce_group
+
+
+@pytest.mark.parametrize("recipe_module,recipe_cls,_", _RECIPE_CASES)
+@pytest.mark.parametrize(
+    ("labels", "num_label_tokens"),
+    [
+        (torch.tensor([[0, 1], [0, 2]]), 2),
+        (torch.zeros(2, 2, dtype=torch.long), 0),
+    ],
+    ids=("mixed", "fully-masked"),
+)
+def test_kd_uses_main_loss_mask_and_denominator(
+    monkeypatch: pytest.MonkeyPatch,
+    recipe_module,
+    recipe_cls,
+    _,
+    labels: torch.Tensor,
+    num_label_tokens: int,
+):
+    """LLM and VLM KD use the main loss mask with the real KD loss.
+
+    Args:
+        monkeypatch: Pytest fixture used to replace distributed helpers.
+        recipe_module: LLM or VLM KD recipe module under test.
+        recipe_cls: LLM or VLM KD recipe class under test.
+        _: Unused parent recipe class from the shared parameter set.
+        labels: Tensor of shape [batch, sequence].
+        num_label_tokens: Number of positions supervised by the main loss.
+    """
+
+    def no_op_sharder(model, mesh, batch, **kwargs):
+        """Return a sharder that preserves tensors in the input mapping.
+
+        Args:
+            model: Student model under test.
+            mesh: Unused device mesh.
+            batch: Mapping containing tensors of shape [batch, sequence].
+            **kwargs: Unused context-parallel options.
+
+        Returns:
+            Object whose shard operation returns the unchanged batch.
+        """
+        del model, mesh, kwargs
+        return SimpleNamespace(shard=lambda actual_batch: (nullcontext, actual_batch))
+
+    monkeypatch.setattr(recipe_module, "ContextParallelSharder", no_op_sharder)
+    monkeypatch.setattr(recipe_module, "get_sync_ctx", lambda *args, **kwargs: nullcontext())
+
+    student_values = torch.tensor(
+        [
+            [[0.2, -0.1, 0.4], [0.5, 0.0, -0.3]],
+            [[-0.2, 0.3, 0.1], [0.7, -0.4, 0.2]],
+        ]
+    )
+    teacher_values = torch.tensor(
+        [
+            [[0.8, -0.2, 0.1], [0.1, 0.4, -0.5]],
+            [[0.6, -0.3, 0.2], [-0.1, 0.9, 0.0]],
+        ]
+    )
+    student = _KDLogitsModel(student_values.clone(), trainable=True)
+    teacher = _KDLogitsModel(teacher_values, trainable=False)
+    recipe = object.__new__(recipe_cls)
+    recipe.dist_env = SimpleNamespace(device="cpu")
+    recipe.device_mesh = None
+    recipe.pp_enabled = False
+    recipe.distributed_config = SimpleNamespace(defer_fsdp_grad_sync=True)
+    recipe.model_parts = [student]
+    recipe.teacher_model = teacher
+    recipe.loss_fn = MaskedCrossEntropy(ignore_index=0)
+    recipe.kd_loss_fn = KDLoss()
+    recipe.kd_ratio = 1.0
+    recipe._offload_teacher_model = False
+    recipe.separate_meshes = False
+    recipe._get_dp_group_size = lambda include_cp=True: 1
+
+    aligned_labels = labels.masked_fill(labels == 0, -100)
+    reference_logits = student_values.clone().requires_grad_(True)
+    expected_loss = KDLoss()(
+        reference_logits,
+        teacher_values,
+        aligned_labels,
+        num_batch_labels=num_label_tokens,
+    )
+    expected_loss.backward()
+
+    batch = {"input_ids": torch.ones_like(labels), "labels": labels}
+    if recipe_module is vlm_kd:
+        recipe._ce_loss_buffer = []
+        recipe._kd_loss_buffer = []
+        loss_buffer = []
+        recipe._forward_backward_step(
+            0,
+            batch,
+            loss_buffer=loss_buffer,
+            num_label_tokens=num_label_tokens,
+            num_batches=1,
+            is_train=True,
+        )
+        actual_loss = recipe._kd_loss_buffer[-1]
+    else:
+        _, actual_loss, _ = recipe._forward_backward_step(
+            0,
+            batch,
+            num_label_tokens=num_label_tokens,
+            num_batches=1,
+            is_train=True,
+        )
+
+    torch.testing.assert_close(actual_loss, expected_loss.detach())
+    torch.testing.assert_close(student.logits.grad, reference_logits.grad)
 
 
 @pytest.mark.parametrize("recipe_module,recipe_cls,parent_cls", _RECIPE_CASES)

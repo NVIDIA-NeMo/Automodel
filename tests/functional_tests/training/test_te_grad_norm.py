@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Real CUDA/DTensor coverage for the optional Transformer Engine L2 path."""
+"""CUDA norm/clipping checks for TE and distributed TE/Triton backends."""
 
 import copy
 from datetime import timedelta
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -46,10 +47,12 @@ def _reference_norm(gradients):
 
 
 @pytest.mark.parametrize("layout", ["contiguous", "transpose", "strided", "offset"])
-@pytest.mark.parametrize("use_te", [True, False])
-def test_norm_clipped_gradients_and_optimizer_step(layout, use_te, monkeypatch):
+@pytest.mark.parametrize("te_available", [True, False])
+def test_norm_clipped_gradients_and_optimizer_step(
+    layout: str, te_available: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Compare norm, clipping, and an SGD update to an independent FP64 reference."""
-    if not use_te:
+    if not te_available:
         monkeypatch.setattr(utils, "safe_import_te", lambda: (False, None))
     torch.manual_seed(23)
     parameters, references, gradients = [], [], []
@@ -75,7 +78,12 @@ def test_norm_clipped_gradients_and_optimizer_step(layout, use_te, monkeypatch):
     coefficient = (0.7 / (expected + 1e-6)).clamp(max=1.0)
     for parameter, gradient in zip(references, gradients):
         parameter.grad = gradient * coefficient
-    observed = utils._clip_grad_norm_impl(parameters, 0.7, foreach=True, use_te=True)
+    # Strided/transposed gradients use the reference path without loading TE.
+    if not te_available and layout in ("contiguous", "offset"):
+        with pytest.raises(RuntimeError, match="backend requested but unavailable"):
+            utils._clip_grad_norm_impl(parameters, 0.7, foreach=True, grad_norm_backend="te")
+        return
+    observed = utils._clip_grad_norm_impl(parameters, 0.7, foreach=True, grad_norm_backend="te")
     torch.testing.assert_close(observed, expected, rtol=2e-6, atol=0)
     for parameter, reference in zip(parameters, references):
         torch.testing.assert_close(
@@ -102,7 +110,7 @@ def test_finite_extreme_gradients(value):
     gradient = torch.full_like(parameter, value)
     parameter.grad = gradient.clone()
     expected = torch.linalg.vector_norm(gradient, dtype=torch.float64)
-    observed = utils._clip_grad_norm_impl(parameter, 1.0, error_if_nonfinite=True, use_te=True)
+    observed = utils._clip_grad_norm_impl(parameter, 1.0, error_if_nonfinite=True, grad_norm_backend="te")
     torch.testing.assert_close(observed, expected, rtol=2e-6, atol=0)
     torch.testing.assert_close(parameter.grad, gradient * (1.0 / (expected + 1e-6)).clamp(max=1.0))
 
@@ -114,7 +122,7 @@ def test_nonfinite_gradients_raise_before_mutation(value):
     parameter.grad[4] = value
     original = parameter.grad.clone()
     with pytest.raises(RuntimeError, match="non-finite"):
-        utils._clip_grad_norm_impl(parameter, 1.0, error_if_nonfinite=True, use_te=True)
+        utils._clip_grad_norm_impl(parameter, 1.0, error_if_nonfinite=True, grad_norm_backend="te")
     torch.testing.assert_close(parameter.grad, original, equal_nan=True)
 
 
@@ -123,7 +131,7 @@ def test_finite_float64_extremes(value):
     parameter = torch.nn.Parameter(torch.zeros(16, device="cuda", dtype=torch.float64))
     parameter.grad = torch.full_like(parameter, value)
     expected = torch.tensor(4.0 * abs(value), device="cuda", dtype=torch.float64)
-    observed = utils._clip_grad_norm_impl(parameter, 1.0, error_if_nonfinite=True, use_te=True)
+    observed = utils._clip_grad_norm_impl(parameter, 1.0, error_if_nonfinite=True, grad_norm_backend="te")
     torch.testing.assert_close(observed, expected, rtol=1e-14, atol=0)
     torch.testing.assert_close(
         parameter.grad, torch.full_like(parameter, value) * (1.0 / (expected + 1e-6)).clamp(max=1.0)
@@ -137,12 +145,12 @@ def test_small_gradient_mixture():
     gradient[0] = 1e-17
     parameter.grad = gradient.clone()
     expected = torch.linalg.vector_norm(gradient, dtype=torch.float64)
-    observed = utils._clip_grad_norm_impl(parameter, 1.0, error_if_nonfinite=True, use_te=True)
+    observed = utils._clip_grad_norm_impl(parameter, 1.0, error_if_nonfinite=True, grad_norm_backend="te")
     torch.testing.assert_close(observed, expected, rtol=2e-6, atol=0)
     torch.testing.assert_close(parameter.grad, gradient)
 
 
-def _distributed_worker(rank, init_file):
+def _distributed_worker(rank: int, init_file: str, grad_norm_backend: str) -> None:
     torch.cuda.set_device(rank)
     dist.init_process_group(
         "nccl",
@@ -169,7 +177,7 @@ def _distributed_worker(rank, init_file):
                 parameter = torch.nn.Parameter(distribute_tensor(torch.zeros_like(full), mesh, [placement]))
                 parameter.grad = distribute_tensor(full.clone(), mesh, [placement])
             expected = torch.linalg.vector_norm(full, dtype=torch.float64)
-            observed = utils._clip_grad_norm_impl([parameter], 0.7, foreach=True, use_te=True)
+            observed = utils._clip_grad_norm_impl([parameter], 0.7, foreach=True, grad_norm_backend=grad_norm_backend)
             torch.testing.assert_close(observed, expected, rtol=2e-6, atol=0)
             torch.testing.assert_close(
                 parameter.grad.full_tensor(), full * (0.7 / (expected + 1e-6)), rtol=2e-6, atol=1e-7
@@ -204,7 +212,7 @@ def _distributed_worker(rank, init_file):
         expected = _reference_norm(local_gradients).square()
         dist.all_reduce(expected)
         expected = expected.sqrt()
-        observed = utils._clip_grad_norm_impl(parameters, 0.7, foreach=True, use_te=True)
+        observed = utils._clip_grad_norm_impl(parameters, 0.7, foreach=True, grad_norm_backend=grad_norm_backend)
         torch.testing.assert_close(observed, expected, rtol=2e-6, atol=0)
         for parameter, gradient in zip(parameters, local_gradients):
             torch.testing.assert_close(
@@ -214,7 +222,7 @@ def _distributed_worker(rank, init_file):
         # Pipeline stages own distinct parameters, so their squared norms must add.
         parameter = torch.nn.Parameter(torch.zeros(5, device="cuda"))
         parameter.grad = torch.full_like(parameter, rank + 1.0)
-        observed = utils._clip_grad_norm_impl([parameter], 0.7, pp_mesh=mesh, use_te=True)
+        observed = utils._clip_grad_norm_impl([parameter], 0.7, pp_mesh=mesh, grad_norm_backend=grad_norm_backend)
         torch.testing.assert_close(observed, torch.tensor(5.0, device="cuda", dtype=torch.float64))
 
         # Real FSDP2 backward and optimizer update, with different examples per rank.
@@ -228,7 +236,9 @@ def _distributed_worker(rank, init_file):
         reference(inputs).square().mean().backward()
         model(inputs.chunk(2)[rank]).square().mean().backward()
         expected = _reference_norm([p.grad for p in reference.parameters()])
-        observed = utils._clip_grad_norm_impl(model.parameters(), 0.1, foreach=True, use_te=True)
+        observed = utils._clip_grad_norm_impl(
+            model.parameters(), 0.1, foreach=True, grad_norm_backend=grad_norm_backend
+        )
         torch.testing.assert_close(observed, expected, rtol=2e-6, atol=1e-8)
         coefficient = (0.1 / (expected + 1e-6)).clamp(max=1.0)
         for parameter in reference.parameters():
@@ -244,23 +254,26 @@ def _distributed_worker(rank, init_file):
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires two CUDA devices")
-def test_distributed_norm_and_fsdp_update(tmp_path):
-    mp.spawn(_distributed_worker, args=(str(tmp_path / "init"),), nprocs=2, join=True)
+@pytest.mark.parametrize("grad_norm_backend", ["te", "triton"])
+def test_distributed_norm_and_fsdp_update(tmp_path: Path, grad_norm_backend: str) -> None:
+    mp.spawn(_distributed_worker, args=(str(tmp_path / "init"), grad_norm_backend), nprocs=2, join=True)
 
 
-@pytest.mark.parametrize("enabled", [None, False, True])
+@pytest.mark.parametrize("backend", [None, "triton", "te"])
 @pytest.mark.parametrize("torch_fast_path", [False, True])
-def test_te_requires_explicit_opt_in(enabled, torch_fast_path, monkeypatch):
-    """Default and explicit-off preserve native clipping even when TE is installed."""
+def test_grad_norm_backend_selection(
+    backend: str | None, torch_fast_path: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """TE is selected explicitly; default clipping uses main's Triton backend."""
     model = torch.nn.Linear(2, 1, bias=False, device="cuda")
     initial = model.weight.detach().clone()
     gradient = torch.tensor([[3.0, 4.0]], device="cuda")
     model.weight.grad = gradient.clone()
-    local_te_norm = MagicMock(wraps=utils._local_l2_norm)
-    monkeypatch.setattr(utils, "_local_l2_norm", local_te_norm)
-    options = {} if enabled is None else {"use_te": enabled}
+    local_te_norm = MagicMock(wraps=utils._local_te_l2_norm)
+    monkeypatch.setattr(utils, "_local_te_l2_norm", local_te_norm)
+    options = {} if backend is None else {"grad_norm_backend": backend}
     norm = utils.scale_grads_and_clip_grad_norm(1.0, [model], use_torch_clip_grad_norm=torch_fast_path, **options)
-    assert bool(local_te_norm.call_count) is (enabled is True)
+    assert bool(local_te_norm.call_count) is (backend == "te")
     torch.testing.assert_close(norm.double(), torch.tensor(5.0, dtype=torch.float64, device="cuda"))
     expected_gradient = gradient * (1.0 / (5.0 + 1e-6))
     torch.testing.assert_close(model.weight.grad, expected_gradient, rtol=2e-6, atol=1e-7)
