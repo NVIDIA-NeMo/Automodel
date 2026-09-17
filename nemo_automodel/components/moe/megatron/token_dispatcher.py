@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import logging
+import math
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -377,6 +378,17 @@ _HYBRIDEP_TOKEN_ALIGNMENT = 4
 _STATIC_ROUTING_PAD_PIN = os.environ.get("NEMO_STATIC_ROUTING_PAD_PIN", "1") != "0"
 
 
+def _assert_no_hybridep_overflow(handle, capacity: int) -> None:
+    """Device-side guard: HybridEP truncates silently when the capacity is exceeded and sets
+    ``overflow_flag`` (handle item 10); fail loudly instead of training on dropped tokens."""
+    flag = handle[10] if isinstance(handle, (tuple, list)) and len(handle) > 10 else None
+    if torch.is_tensor(flag):
+        torch._assert_async(
+            (flag == 0).reshape(()),
+            f"HybridEP dispatch overflowed its capacity of {capacity} permuted rows; raise BackendConfig.dispatcher_capacity_factor",
+        )
+
+
 class _HybridEPManager(_DispatchManager):
     """
     A manager class to handle fused all-to-all communication processes for MoE models using
@@ -406,6 +418,8 @@ class _HybridEPManager(_DispatchManager):
         moe_hybridep_num_blocks_permute: int | None = None,
         moe_hybridep_num_blocks_unpermute: int | None = None,
         benchmark_static_routing: bool = False,
+        moe_hybridep_capacity_factor: float | None = None,
+    
     ) -> None:
         self.group = group
         self.num_local_experts = num_local_experts
@@ -418,6 +432,10 @@ class _HybridEPManager(_DispatchManager):
         self.moe_hybridep_num_sms_preprocessing = moe_hybridep_num_sms_preprocessing
         self.moe_hybridep_num_blocks_permute = moe_hybridep_num_blocks_permute
         self.moe_hybridep_num_blocks_unpermute = moe_hybridep_num_blocks_unpermute
+        # Capacity mode (dynamic routing): after one blocking calibration dispatch, later dispatches
+        # pass this many rows as num_permuted_tokens and run non-blocking (see dispatch()).
+        self.hybridep_capacity_factor = moe_hybridep_capacity_factor
+        self._hybridep_capacity: int | None = None
         # Benchmark-only (TokenDispatcherConfig.moe_benchmark_static_routing):
         # persist num_permuted_tokens across dispatches, see dispatch()/reset.
         self.benchmark_static_routing = benchmark_static_routing
@@ -544,6 +562,12 @@ class _HybridEPManager(_DispatchManager):
                     self.token_indices = nn.functional.pad(self.token_indices, (0, 0, 0, pad_tokens), value=-1)
                 self.token_probs = nn.functional.pad(self.token_probs, (0, 0, 0, pad_tokens))
 
+        capacity_mode = self.hybridep_capacity_factor is not None and not self.benchmark_static_routing
+        if capacity_mode and self._hybridep_capacity is not None:
+            # Non-blocking HybridEP dispatch: the buffers are sized to the calibrated capacity, the
+            # real counts stay on the device, and no compute-stream drain happens on this call.
+            self.num_permuted_tokens = self._hybridep_capacity
+
         dispatched_hidden, self.dispatched_probs, _, tokens_per_expert, self.handle = hybrid_ep_dispatch(
             x=hidden_states,
             topk_idx=self.token_indices,
@@ -563,11 +587,45 @@ class _HybridEPManager(_DispatchManager):
         )
 
         self.tokens_per_expert = tokens_per_expert
+        if capacity_mode:
+            if self._hybridep_capacity is None:
+                self._calibrate_hybridep_capacity(tokens_per_expert, dispatched_hidden.device)
+            else:
+                _assert_no_hybridep_overflow(self.handle, self._hybridep_capacity)
+                self.num_permuted_tokens = self._hybridep_capacity
+            return dispatched_hidden
         self.num_permuted_tokens = self.tokens_per_expert.sum()
         if self.benchmark_static_routing and getattr(self, "_static_num_permuted_tokens", None) is None:
             self._static_num_permuted_tokens = self.num_permuted_tokens
 
         return dispatched_hidden
+
+    def _calibrate_hybridep_capacity(self, tokens_per_expert: torch.Tensor, device: torch.device) -> None:
+        """Turn the one blocking calibration dispatch into the capacity every later dispatch uses.
+
+        The blocking dispatch already brought ``tokens_per_expert`` to the host, so reading its sum is
+        free; the capacity is that count times ``hybridep_capacity_factor``, aligned to the HybridEP
+        token alignment (and ``pad_multiple``), taken as the EP-group maximum once so every rank
+        allocates the same buffers.
+        """
+        actual = int(tokens_per_expert.sum())
+        align = max(int(self.pad_multiple or 0), _HYBRIDEP_TOKEN_ALIGNMENT)
+        cap = -(-int(math.ceil(actual * self.hybridep_capacity_factor)) // align) * align
+        if torch.distributed.is_initialized() and torch.distributed.get_world_size(self.group) > 1:
+            cap_t = torch.tensor(cap, device=device)
+            torch.distributed.all_reduce(cap_t, op=torch.distributed.ReduceOp.MAX, group=self.group)
+            cap = int(cap_t)
+        self._hybridep_capacity = cap
+        # This dispatch itself was blocking: its combine (and the combine's backward dispatch) can
+        # use the exact host-side count.
+        self.num_permuted_tokens = actual
+        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+            logging.getLogger(__name__).info(
+                "HybridEP capacity mode: calibrated %d permuted rows x %.2f -> capacity %d; later dispatches run non-blocking",
+                actual,
+                self.hybridep_capacity_factor,
+                cap,
+            )
 
     def combine(
         self,
@@ -826,6 +884,10 @@ class TokenDispatcherConfig:
     None means no changes for dtype."""
 
     moe_flex_dispatcher_backend: Literal["deepep", "hybridep", "uccl_ep"] = "deepep"
+
+    # HybridEP capacity mode, see BackendConfig.dispatcher_capacity_factor
+
+    moe_hybridep_capacity_factor: float | None = None
     """Backend for the flex token dispatcher. Options: 'deepep', 'hybridep', or 'uccl_ep'."""
 
     moe_deepep_num_sms: int = 20
@@ -968,6 +1030,7 @@ class MoEFlexTokenDispatcher:
                         moe_hybridep_num_blocks_permute=self.config.moe_hybridep_num_blocks_permute,
                         moe_hybridep_num_blocks_unpermute=self.config.moe_hybridep_num_blocks_unpermute,
                         benchmark_static_routing=self.config.moe_benchmark_static_routing,
+                        moe_hybridep_capacity_factor=self.config.moe_hybridep_capacity_factor,
                     )
                 self._comm_manager = MoEFlexTokenDispatcher.shared_hybridep_manager
                 if (
@@ -1000,6 +1063,7 @@ class MoEFlexTokenDispatcher:
                     moe_hybridep_num_blocks_permute=self.config.moe_hybridep_num_blocks_permute,
                     moe_hybridep_num_blocks_unpermute=self.config.moe_hybridep_num_blocks_unpermute,
                     benchmark_static_routing=self.config.moe_benchmark_static_routing,
+                    moe_hybridep_capacity_factor=self.config.moe_hybridep_capacity_factor,
                 )
             self.hybridep_metadata_processor = _HybridEPMetadataProcessor(
                 num_experts=self.tp_size * self.config.num_moe_experts,
