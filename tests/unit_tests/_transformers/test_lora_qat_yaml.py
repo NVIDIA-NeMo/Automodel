@@ -32,6 +32,26 @@ V4_EXAMPLE = EXAMPLES / "deepseek_v4/deepseek_v4_flash_hellaswag_experts_qat.yam
 GLM_EXAMPLE = EXAMPLES / "glm/glm_5.3_flash_hellaswag_experts_qat.yaml"
 
 
+@pytest.mark.parametrize("path", [EXAMPLE, V4_EXAMPLE, GLM_EXAMPLE])
+def test_example_ci_preserves_supported_smoke_topology(path: Path) -> None:
+    """Keep auto-discovered CI jobs within each recipe's rank and step contract."""
+    raw = load_yaml_config(path).raw_config
+    ci = raw["ci"]
+    assert isinstance(ci["recipe_owner"], str) and ci["recipe_owner"].strip()
+    hours, minutes, seconds = (int(part) for part in ci["time"].split(":"))
+    assert hours >= 0 and 0 <= minutes < 60 and 0 <= seconds < 60
+    assert hours * 3600 + minutes * 60 + seconds > 0
+    assert type(ci["nodes"]) is int and ci["nodes"] > 0
+    assert type(ci["nproc_per_node"]) is int and ci["nproc_per_node"] > 0
+    assert ci["node_multiplier"] is False
+    world_size = ci["nodes"] * ci["nproc_per_node"]
+    assert world_size == raw["distributed"].get("ep_size", 1)
+    assert ci["max_steps"] == raw["step_scheduler"]["max_steps"] == 2
+    assert ci["local_batch_size"] == raw["step_scheduler"]["local_batch_size"] == 1
+    assert world_size * ci["local_batch_size"] == raw["step_scheduler"]["global_batch_size"]
+    assert ci["env_vars"]["REQUIRE_FINITE_METRICS"] == "true"
+
+
 def test_example_instantiates_nested_qat_config() -> None:
     """Exercise real YAML lists without constructing a model, tokenizer, or dataset."""
     cfg = load_yaml_config(EXAMPLE)

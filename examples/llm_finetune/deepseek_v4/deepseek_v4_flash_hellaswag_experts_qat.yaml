@@ -137,3 +137,15 @@ checkpoint:
   enabled: false
   dequantize_base_checkpoint: true
   save_consolidated: false
+
+ci:
+  recipe_owner: hasuoshenyun
+  time: "00:30:00"
+  # EP32 requires exactly 4 x 8 ranks; do not scale nodes with the cluster default.
+  nodes: 4
+  nproc_per_node: 8
+  node_multiplier: false
+  max_steps: 2
+  local_batch_size: 1
+  env_vars:
+    REQUIRE_FINITE_METRICS: "true"

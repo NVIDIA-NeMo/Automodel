@@ -102,3 +102,15 @@ optimizer:
 # Ordinary recipe checkpoints are not packed LoRA-QAT reference exports.
 checkpoint:
   enabled: false
+
+ci:
+  recipe_owner: hasuoshenyun
+  time: "00:15:00"
+  nodes: 1
+  # This reference smoke requires exactly one rank, regardless of cluster defaults.
+  nproc_per_node: 1
+  node_multiplier: false
+  max_steps: 2
+  local_batch_size: 1
+  env_vars:
+    REQUIRE_FINITE_METRICS: "true"
