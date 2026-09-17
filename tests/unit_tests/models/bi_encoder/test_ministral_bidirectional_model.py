@@ -33,6 +33,7 @@ from transformers.tokenization_utils_tokenizers import TokenizersBackend
 
 pytest.importorskip("transformers.models.ministral3", reason="Ministral3 not available in this transformers version")
 
+from transformers.models.ministral3.modeling_ministral3 import Ministral3Model as HFMinistral3Model
 from transformers.models.mistral3.modeling_mistral3 import Mistral3Model
 
 from nemo_automodel._transformers.registry import ModelRegistry
@@ -806,12 +807,14 @@ def test_legacy_ministral_checkpoint_loads_in_fresh_process(tmp_path):
     assert completed.returncode == 0, completed.stderr
 
 
-def test_ministral3_bidirectional_model_init_and_mask():
+@pytest.mark.parametrize("is_causal", [False, True])
+def test_ministral3_bidirectional_model_init_and_mask(is_causal):
     cfg = tiny_bidirectional_config()
+    cfg.is_causal = is_causal
     model = Ministral3BidirectionalModel(cfg)
     model.eval()
 
-    assert all(getattr(layer.self_attn, "is_causal", True) is False for layer in model.layers)
+    assert all(getattr(layer.self_attn, "is_causal", None) is is_causal for layer in model.layers)
 
     input_ids = torch.randint(0, cfg.vocab_size, (1, 3))
     mask = torch.tensor([[1, 1, 0]])
@@ -841,6 +844,37 @@ def test_ministral3_bidirectional_attention_symmetric():
     assert not torch.allclose(out_base[0, 0], out_modified[0, 0], atol=1e-6), (
         "Bidirectional Ministral3: changing last token should affect first token hidden state"
     )
+
+
+@pytest.mark.parametrize("is_causal", [False, True])
+def test_ministral3_dual_mode_matches_hf_parent(is_causal):
+    torch.manual_seed(42)
+    config = tiny_bidirectional_config()
+    config.is_causal = is_causal
+    actual_model = Ministral3BidirectionalModel(config).eval()
+    reference_model = HFMinistral3Model(config).eval()
+    reference_model.load_state_dict(actual_model.state_dict())
+    input_ids = torch.randint(0, config.vocab_size, (1, 4))
+    attention_mask = torch.ones_like(input_ids)
+
+    with torch.no_grad():
+        actual = actual_model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+        reference = reference_model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+
+    torch.testing.assert_close(actual, reference, rtol=1e-5, atol=1e-5)
+
+
+def test_ministral3_causal_attention_blocks_future_token_influence():
+    cfg = tiny_bidirectional_config()
+    cfg.is_causal = True
+    model = Ministral3BidirectionalModel(cfg).eval()
+    input_ids = torch.randint(0, cfg.vocab_size, (1, 4))
+    modified = input_ids.clone()
+    modified[0, -1] = (modified[0, -1] + 1) % cfg.vocab_size
+    with torch.no_grad():
+        original = model(input_ids=input_ids).last_hidden_state
+        changed = model(input_ids=modified).last_hidden_state
+    torch.testing.assert_close(original[0, 0], changed[0, 0])
 
 
 def test_ministral3_bidirectional_forward_paths():
@@ -915,7 +949,8 @@ def test_encoder_build_legacy_ministral_registry_path(tmp_path, monkeypatch):
     assert any("save1" in p for p in model.model.saved)
 
 
-def test_ministral_dispatch_uses_custom_class_only_for_legacy_checkpoints():
+def test_ministral_dispatch_preserves_standard_and_legacy_mappings():
+    """Verify standard and legacy Ministral dispatch mappings remain stable."""
     from nemo_automodel._transformers.retrieval import SUPPORTED_BACKBONES
 
     assert "ministral3" not in SUPPORTED_BACKBONES
@@ -992,8 +1027,24 @@ def _tiny_mistral3_bidirectional_vlm_config() -> Mistral3BidirectionalConfig:
     return config
 
 
-def test_mistral3_vlm_saves_as_stock_bidirectional_model_without_remote_code(tmp_path):
+def test_mistral3_vlm_causal_export_scopes_attention_policy_to_text_tower():
+    """Portable VLM export must not apply text causality to the vision tower."""
     config = _tiny_mistral3_bidirectional_vlm_config()
+    assert hasattr(config.text_config, "is_causal")
+    config.text_config.is_causal = True
+
+    export_config = Mistral3BidirectionalModel(config).get_hf_export_config()
+    serialized_config = export_config.to_dict()
+
+    assert "is_causal" not in serialized_config
+    assert serialized_config["text_config"]["is_causal"] is True
+    assert serialized_config["vision_config"].get("is_causal", False) is False
+
+
+@pytest.mark.parametrize("is_causal", [False, True])
+def test_mistral3_vlm_saves_as_stock_bidirectional_model_without_remote_code(tmp_path, is_causal):
+    config = _tiny_mistral3_bidirectional_vlm_config()
+    config.text_config.is_causal = is_causal
     config.task_instructions = {"query": "stale query: "}
     training_config = config.to_dict()
     assert training_config["model_type"] == "mistral3_bidirec"
@@ -1050,9 +1101,9 @@ def test_mistral3_vlm_saves_as_stock_bidirectional_model_without_remote_code(tmp
     assert type(reloaded) is Mistral3Model
     assert saved_config["model_type"] == "mistral3"
     assert saved_config["architectures"] == ["Mistral3Model"]
-    assert saved_config["is_causal"] is False
+    assert "is_causal" not in saved_config
     assert saved_config["pooling"] == "avg"
-    assert saved_config["text_config"]["is_causal"] is False
+    assert saved_config["text_config"]["is_causal"] is is_causal
     assert "auto_map" not in saved_config["text_config"]
     assert "auto_map" not in saved_config["vision_config"]
     assert "auto_map" not in saved_config
@@ -1079,7 +1130,10 @@ def test_mistral3_vlm_saves_as_stock_bidirectional_model_without_remote_code(tmp
     changed_ids[0, -1] = 5
     with torch.no_grad():
         changed = reloaded(input_ids=changed_ids, attention_mask=attention_mask).last_hidden_state
-    assert not torch.allclose(actual[0, 0], changed[0, 0], atol=1e-6)
+    if is_causal:
+        torch.testing.assert_close(actual[0, 0], changed[0, 0])
+    else:
+        assert not torch.allclose(actual[0, 0], changed[0, 0], atol=1e-6)
 
 
 def test_mistral3_vlm_portable_export_requires_processor(tmp_path):
@@ -1444,6 +1498,28 @@ def test_mistral3_vlm_runs_dummy_vision_inside_model_forward(monkeypatch):
     assert events == ["parent"]
     assert torch.equal(outputs["input_ids"], input_ids)
     assert outputs["inputs_embeds"] is None
+
+    model.eval()
+
+    events.clear()
+    outputs = model(
+        input_ids=torch.tensor([[1, 2]]),
+        attention_mask=torch.ones(1, 2, dtype=torch.long),
+        force_dummy_vision=True,
+    )
+
+    assert events == ["vision", "projector", "parent"]
+    assert outputs["inputs_embeds"].shape == (1, 2, 4)
+
+    # An eval-mode caller that does not opt in must still skip the vision tower, so bi-encoder
+    # training, cross-encoder SFT, and offline eval keep their current behavior.
+    input_ids = torch.tensor([[5, 6]])
+    for eval_kwargs in ({}, {"run_dummy_vision": True}):
+        events.clear()
+        outputs = model(input_ids=input_ids, **eval_kwargs)
+
+        assert events == ["parent"]
+        assert torch.equal(outputs["input_ids"], input_ids)
 
 
 def test_mistral3_vlm_crossencoder_scores_vision_inputs_and_backpropagates():

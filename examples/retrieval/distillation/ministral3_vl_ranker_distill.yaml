@@ -1,0 +1,164 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Joint image + text cross-encoder distillation: Ministral3 1B student, frozen 8B teacher.
+# Same data and optimization as ministral3_image_text_ranker_more_data.yaml; the training
+# loss blends the supervised grouped cross-entropy with KL against the teacher's score
+# distribution. Validation stays student-only cross-entropy, so val_loss remains comparable
+# with the SFT baseline. Submit with
+# ./scripts/distillation/start_crossencoder_distillation_experiment.sh.
+
+recipe: DistillCrossEncoderRecipe
+
+seed: 42
+
+# Blend weights for the training loss. ce_loss_weight: 1.0 with kd_loss_weight: 0.0
+# reproduces plain cross-encoder SFT and skips the teacher entirely.
+ce_loss_weight: 0.5
+kd_loss_weight: 0.5
+
+# Absolute softmax temperature on raw teacher/student scores. Set from
+# teacher_score_scale_probe.py against the actual teacher checkpoint; 0.1 is the 1B probe's
+# starting point (normalized entropy ~0.5). Sweep 0.05 / 0.10 / 0.20.
+kd_temperature: 0.1
+
+step_scheduler:
+  global_batch_size: 256
+  local_batch_size: 4
+  ckpt_every_steps: 200
+  val_every_steps: 500
+  num_epochs: 1
+  log_remote_every_steps: 10
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelCrossEncoder.from_pretrained
+  pretrained_model_name_or_path: /lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/users/gmoreira/model_checkpoints/ministral3_1b_vl/ministral3_8bfull_base_lr1e4_distillproj_lr1e3_from_teacher_3b_20260814_125136/epoch_0_step_2047/model/consolidated
+  trust_remote_code: true
+  num_labels: 1
+  temperature: 0.02
+  pooling: avg
+  use_liger_kernel: true
+  use_sdpa_patching: true
+  torch_dtype: bfloat16
+  attn_implementation: flash_attention_2
+
+# Frozen teacher. Same _target_ as the student so
+# --teacher_model.pretrained_model_name_or_path works as a launcher override. Never
+# checkpointed: BaseRecipe skips the `teacher_model` attribute by name.
+# `temperature` is set explicitly here, as on the student: the YAML value overrides whatever
+# the checkpoint records, so a teacher that never serialized the field cannot silently load
+# as 1.0. The recipe multiplies each model's own temperature back into its logits to recover
+# raw scores; a student/teacher mismatch is logged, not an error. The shared distillation
+# temperature is the separate top-level kd_temperature.
+teacher_model:
+  _target_: nemo_automodel.NeMoAutoModelCrossEncoder.from_pretrained
+  pretrained_model_name_or_path: /lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/users/ronaya/model_checkpoints/ministral3_8b_reranker_Gabriel143548_text_768k_frozenvision_lr1e6_08-27-191344/epoch_0_step_5599/model/consolidated
+  trust_remote_code: true
+  num_labels: 1
+  temperature: 0.02
+  pooling: avg
+  use_liger_kernel: true
+  use_sdpa_patching: true
+  torch_dtype: bfloat16
+  attn_implementation: flash_attention_2
+
+# Kept on the student checkpoint, which records the same vocabulary, post-processor and image
+# settings as the teacher, so one tokenization serves both. A stock Ministral export records a
+# different post-processor and BOS setting and is not a drop-in substitute.
+tokenizer:
+  _target_: nemo_automodel.components.models.ministral_bidirectional.processor.Mistral3BiEncoderProcessor.from_pretrained
+  pretrained_model_name_or_path: /lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/users/gmoreira/model_checkpoints/ministral3_1b_vl/ministral3_8bfull_base_lr1e4_distillproj_lr1e3_from_teacher_3b_20260814_125136/epoch_0_step_2047/model/consolidated
+  rerank_max_length: 4096
+  use_prompt_template: true
+  export_as_stock_processor: false
+  pad_to_multiple_of: 8
+  image_longest_edge: 1284
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.retrieval_dataset.RetrievalDatasetConfig
+  model_type: cross_encoder
+  data_dir_list:
+    # --- vision / image-mined corpora (8 sources) ---
+    - path: /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/01_datasets/03_training_datasets/docvqa_smolvlm_iteration2_mined_data_39302.json
+      num_samples: 39302
+    - path: /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/01_datasets/03_training_datasets/tatdqa_smolvlm_iteration1_mined_data_13188.json
+      num_samples: 13188
+    - path: /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/01_datasets/03_training_datasets/arxiv_qa_smolvlm_iteration1_mined_data_9949.json
+      num_samples: 9949
+    - path: /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/01_datasets/03_training_datasets/colpali_train_mined_filtered_docvqa_IVQA_68855_synthetic_prompt_1_remined.json
+      num_samples: 30000
+    - path: /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/01_datasets/03_training_datasets/docmatix_100k_smolvlm_iteration1_mined_data_100k.json
+      num_samples: 100000
+    - path: /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/01_datasets/03_training_datasets/wiki-ss-nq_smolvlm-iteration1_only-iamge-for-mining_mined_data_only-iamge-for-mining_44002.json
+      num_samples: 44002
+    - path: /lustre/fsw/portfolios/llmservice/users/ronaya/synthetic_query_generation/mined/infovqa_top05_nanovl_ronay3_8k_fixed_mined.json
+      num_samples: 8000
+    - path: /lustre/fsw/portfolios/llmservice/users/ronaya/synthetic_query_generation/mined/vdr_en_top05_nanovl_ronay3_42k_fixed_mined.json
+      num_samples: 40000
+    - path: /lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/users/jiaruic/code/zhvidore-sdg/data/nonlatin_wds_training/nonlatin_wds_image_mined_qwen3vl8b_margin095_colpali_rg100.json
+      num_samples: 29000
+    - path: /lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/users/jiaruic/code/zhvidore-sdg/data/table_chart_wds_training/table_chart_wds_image_mined_qwen3vl8b_margin095_colpali_rg100.json
+      num_samples: 29000
+
+  data_type: train
+  n_passages: 4
+  seed: 42
+  do_shuffle: true
+  max_train_samples: 826000
+
+dataloader:
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.llm.ProcessorMethodCollator
+    collator_fn_name: process_queries_documents_crossencoder
+  shuffle: true
+  num_workers: 4
+
+optimizer:
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+  lr: 5.0e-6
+  weight_decay: 0.01
+  adam_w_mode: true
+  bias_correction: true
+  master_weights: true
+
+lr_scheduler:
+  lr_warmup_steps: 200
+  lr_decay_style: cosine
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: /lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/users/ronaya/model_checkpoints/ministral3_1b_reranker_image_distill
+  model_save_format: safetensors
+  save_consolidated: final
+  max_recent_checkpoints: 2
+
+
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 1
+  cp_size: 1
+  activation_checkpointing: true
+  activation_checkpointing_scope: all
+  reshard_after_forward: false
+
+wandb:
+  project: inform-simlm-reranking
+  entity: nvidia-merlin
+  name: ministral3_1b_reranker_image_distill_blended_test
+  enable: true

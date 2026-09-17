@@ -17,12 +17,14 @@ import torch
 import torch.nn as nn
 from PIL import Image
 from transformers.image_utils import PILImageResampling
-from transformers.modeling_outputs import CausalLMOutputWithPast
+from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
+from transformers.models.llama.modeling_llama import LlamaModel
 from transformers.models.siglip.configuration_siglip import SiglipVisionConfig
 from transformers.processing_utils import ProcessorMixin
 
 from nemo_automodel.components.models.llama_nemotron_vl.model import (
     LlamaBidirectionalConfig,
+    LlamaBidirectionalModel,
     LlamaNemotronVLConfig,
     LlamaNemotronVLModel,
 )
@@ -517,6 +519,60 @@ def test_fast_image_processor_preprocess_honors_image_kwargs(monkeypatch):
     }
 
 
+@pytest.mark.parametrize("is_causal", [False, True])
+def test_llama_nemotron_text_backbone_supports_both_attention_policies(is_causal):
+    """Verify the text backbone honors causal and bidirectional policies."""
+    config = LlamaBidirectionalConfig(
+        vocab_size=32,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        is_causal=is_causal,
+    )
+    model = LlamaBidirectionalModel(config).eval()
+    input_ids = torch.randint(0, config.vocab_size, (1, 4))
+    modified = input_ids.clone()
+    modified[0, -1] = (modified[0, -1] + 1) % config.vocab_size
+
+    with torch.no_grad():
+        original = model(input_ids=input_ids).last_hidden_state
+        changed = model(input_ids=modified).last_hidden_state
+
+    assert all(layer.self_attn.is_causal is is_causal for layer in model.layers)
+    if is_causal:
+        torch.testing.assert_close(original[0, 0], changed[0, 0])
+    else:
+        assert not torch.allclose(original[0, 0], changed[0, 0])
+
+
+def test_llama_nemotron_causal_forward_preserves_cache_position(monkeypatch):
+    """Verify causal forwarding preserves an explicit cache position."""
+    captured = {}
+
+    def fake_forward(_model, **kwargs):
+        captured.update(kwargs)
+        return BaseModelOutputWithPast(last_hidden_state=torch.zeros(1, 2, 16))
+
+    monkeypatch.setattr(LlamaModel, "forward", fake_forward)
+    config = LlamaBidirectionalConfig(
+        vocab_size=32,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        is_causal=True,
+    )
+    model = LlamaBidirectionalModel(config)
+    cache_position = torch.tensor([4, 5])
+
+    model(input_ids=torch.ones(1, 2, dtype=torch.long), cache_position=cache_position)
+
+    assert captured.get("cache_position") is cache_position
+
+
 def test_llama_nemotron_vl_config_builds_composed_subconfigs():
     config = LlamaNemotronVLConfig(
         vision_config=_tiny_vision_config(),
@@ -533,6 +589,12 @@ def test_llama_nemotron_vl_config_builds_composed_subconfigs():
     assert config.q_max_length == 13
     assert config.p_max_length == 21
     assert config.pooling == "avg"
+    assert config.get_text_config(decoder=True) is config.llm_config
+
+
+def test_llama_nemotron_vl_model_exposes_text_decoder(tiny_model):
+    """The composite model must expose the retrieval text tower explicitly."""
+    assert tiny_model.get_decoder() is tiny_model.language_model
 
 
 def test_llama_nemotron_vl_config_rejects_unsupported_vision_model():

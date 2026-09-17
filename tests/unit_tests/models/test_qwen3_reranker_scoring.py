@@ -34,6 +34,7 @@ from transformers import AutoConfig, AutoModelForCausalLM
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
 
+from nemo_automodel._transformers.retrieval import CrossEncoderModel
 from nemo_automodel.components.models.qwen3_reranker.model import (
     Qwen3RerankerConfig,
     Qwen3RerankerForCausalReranking,
@@ -55,11 +56,34 @@ def _tiny_model() -> Qwen3RerankerForCausalReranking:
         num_key_value_heads=1,
         max_position_embeddings=32,
         head_dim=8,
+        is_decoder=False,
     )
     torch.manual_seed(0)
     model = Qwen3RerankerForCausalReranking(config)
     model.eval()
     return model
+
+
+def test_cross_encoder_default_preserves_native_causal_attention():
+    """An unspecified wrapper policy must not change a causal reranker's semantics."""
+    model = _tiny_model()
+    assert all(layer.self_attn.is_causal is True for layer in model.model.layers)
+
+    encoder = CrossEncoderModel(model)
+
+    assert encoder.is_causal is True
+    assert encoder.model.config.is_causal is True
+    assert all(layer.self_attn.is_causal is True for layer in model.model.layers)
+
+    input_ids = torch.tensor([[1, 2, 3, 4]])
+    changed_ids = input_ids.clone()
+    changed_ids[0, -1] = 5
+    attention_mask = torch.ones_like(input_ids)
+    with torch.no_grad():
+        original = model.model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+        changed = model.model(input_ids=changed_ids, attention_mask=attention_mask).last_hidden_state
+
+    torch.testing.assert_close(original[0, 0], changed[0, 0])
 
 
 def _reference_p_yes(model, input_ids, attention_mask, last_idx) -> torch.Tensor:
