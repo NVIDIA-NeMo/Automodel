@@ -213,11 +213,28 @@ class TestFp32SafeRotaryEmbedding:
 
 
 class TestDenseTextBackbone:
-    def test_packed_metadata_prefers_authoritative_ids_and_matches_reference(self):
-        attention_mask = torch.tensor(
-            [[1, 1, 1, 2, 2, 0], [1, 1, 2, 2, 3, 3]],
-            dtype=torch.long,
-        )
+    @pytest.mark.parametrize(
+        "attention_mask",
+        [
+            pytest.param(
+                torch.tensor(
+                    [[1, 1, 1, 2, 2, 0], [1, 1, 2, 2, 3, 3]],
+                    dtype=torch.long,
+                ),
+                id="conflicting-indexed-boundaries",
+            ),
+            pytest.param(torch.ones((2, 6), dtype=torch.long), id="binary-mask"),
+        ],
+    )
+    def test_packed_metadata_prefers_authoritative_ids_and_matches_reference(
+        self, attention_mask: torch.Tensor
+    ) -> None:
+        """Verify packed IDs override indexed and binary attention masks.
+
+        Args:
+            attention_mask: Tensor of shape [batch, sequence] containing either
+                indexed document IDs with conflicting boundaries or a binary mask.
+        """
         packed_seq_ids = torch.tensor(
             [[1, 1, 2, 2, 2, 0], [1, 2, 2, 3, 3, 3]],
             dtype=torch.long,
