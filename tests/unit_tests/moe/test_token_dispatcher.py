@@ -193,3 +193,68 @@ class TestHybridEPTokenCountEqualization:
         assert dispatched["x"].shape[0] == 4
         assert combined.shape[0] == 4
         assert torch.equal(combined, hidden)
+
+
+class TestHybridEPStaticRoutingPadPin:
+    """Under benchmark_static_routing the padded EP-group token count is computed once (one MAX all-reduce +
+    host sync) and reused by every later dispatch; NEMO_STATIC_ROUTING_PAD_PIN=0 keeps the per-dispatch path."""
+
+    def _manager(self, static_routing):
+        with patch(
+            "nemo_automodel.components.moe.megatron.token_dispatcher.hybrid_ep_dispatch",
+            new=lambda *a, **kw: None,
+        ):
+            return _HybridEPManager(
+                group=None, num_local_experts=2, num_experts=8, router_topk=2, benchmark_static_routing=static_routing
+            )
+
+    def _dispatch_n(self, manager, monkeypatch, num_tokens_seq, group_max, pin):
+        import nemo_automodel.components.moe.megatron.token_dispatcher as td
+
+        monkeypatch.setattr(td, "_STATIC_ROUTING_PAD_PIN", pin)
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+        monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 2)
+        monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 0)
+        calls = []
+
+        def fake_all_reduce(tensor, op=None, group=None):
+            calls.append(int(tensor))
+            tensor.fill_(group_max)
+
+        monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+        sizes = []
+
+        def fake_dispatch(x, routing_map, probs, **kwargs):
+            sizes.append(x.shape[0])
+            return x, probs, None, routing_map.sum(dim=0), "handle"
+
+        monkeypatch.setattr(td, "hybrid_ep_dispatch", fake_dispatch)
+        for n in num_tokens_seq:
+            manager.routing_map = torch.ones(n, 8, dtype=torch.bool)
+            manager.token_probs = torch.full((n, 8), 0.125)
+            manager.dispatch(torch.randn(n, 4))
+        return calls, sizes
+
+    def test_static_routing_all_reduces_once_and_reuses_the_padded_size(self, monkeypatch):
+        m = self._manager(static_routing=True)
+        calls, sizes = self._dispatch_n(m, monkeypatch, [6, 6, 6], group_max=6, pin=True)
+        assert calls == [6], "only the first dispatch pays the EP-group max all-reduce"
+        assert sizes == [8, 8, 8] and m._static_target_tokens == 8
+
+    def test_pin_env_off_keeps_the_per_dispatch_all_reduce(self, monkeypatch):
+        m = self._manager(static_routing=True)
+        calls, sizes = self._dispatch_n(m, monkeypatch, [6, 6, 6], group_max=6, pin=False)
+        assert calls == [6, 6, 6] and sizes == [8, 8, 8] and m._static_target_tokens is None
+
+    def test_dynamic_routing_never_pins(self, monkeypatch):
+        m = self._manager(static_routing=False)
+        calls, _ = self._dispatch_n(m, monkeypatch, [6, 6], group_max=6, pin=True)
+        assert calls == [6, 6] and m._static_target_tokens is None
+
+    def test_pinned_size_smaller_than_a_later_batch_falls_back_to_the_all_reduce(self, monkeypatch):
+        m = self._manager(static_routing=True)
+        calls, sizes = self._dispatch_n(m, monkeypatch, [4, 12], group_max=12, pin=True)
+        # first call: group max 12 -> pin 12; second call fits -> no all-reduce. Then a larger batch re-derives.
+        assert calls == [4] and sizes == [12, 12]
+        calls2, sizes2 = self._dispatch_n(m, monkeypatch, [16], group_max=16, pin=True)
+        assert calls2 == [16] and sizes2 == [16] and m._static_target_tokens == 16

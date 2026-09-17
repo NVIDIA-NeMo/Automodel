@@ -30,6 +30,7 @@ from nemo_automodel.components.loss.kd_loss import (
     _kl_forward_chunked,
     _kl_forward_tp,
 )
+from nemo_automodel.components.loss.utils import _normalize_kd_labels
 
 # Over the default 5s budget on purpose: this module spawns worker processes; every child re-imports torch from scratch.
 # Shrink the work or the process count before raising this further.
@@ -162,6 +163,14 @@ def test_kd_loss_ignore_index():
     ref = _reference_kd_loss(student_logits, teacher_logits, labels, ignore_index=-100)
 
     assert torch.allclose(loss, ref, atol=1e-6), f"Expected {ref}, got {loss}"
+
+
+def test_normalize_kd_labels_preserves_valid_labels_equal_to_kd_sentinel():
+    labels = torch.tensor([0, 1, -100])
+
+    normalized = _normalize_kd_labels(labels, loss_ignore_index=-100, kd_ignore_index=0)
+
+    torch.testing.assert_close(normalized, torch.tensor([-100, 1, 0]))
 
 
 def test_kd_loss_num_labels():
