@@ -957,6 +957,12 @@ class GroupedExpertsDeepEP(nn.Module):
         self.dispatcher_num_sms = dispatcher_num_sms
         self.dispatcher_share_token_dispatcher = dispatcher_share_token_dispatcher
         self.dispatcher_async_dispatch = dispatcher_async_dispatch
+        # HybridEP capacity mode (BackendConfig.dispatcher_capacity_factor): the dispatcher returns
+        # device-side tokens_per_expert and buffers of a fixed capacity, so the per-microbatch
+        # count_nonzero host read below is skipped as well (rows are never empty).
+        self.dispatcher_capacity_factor = (
+            getattr(backend, "dispatcher_capacity_factor", None) if backend is not None else None
+        )
 
         # Allocate projection tensor - size depends on whether activation is gated
         # Gated (SwiGLU, Quick-GEGLU): [n_experts, dim, 2*inter_dim]
@@ -990,6 +996,7 @@ class GroupedExpertsDeepEP(nn.Module):
             moe_hybridep_num_sms=self.dispatcher_num_sms,
             moe_share_token_dispatcher=self.dispatcher_share_token_dispatcher,
             moe_deepep_async_dispatch=self.dispatcher_async_dispatch,
+            moe_hybridep_capacity_factor=self.dispatcher_capacity_factor,
             moe_benchmark_static_routing=self.static_routing,
         )
 
@@ -1070,7 +1077,11 @@ class GroupedExpertsDeepEP(nn.Module):
         # With static routing (forced balance, no noise) every expert receives tokens by
         # construction, so the count_nonzero device-to-host read (one per microbatch, and
         # again per activation-checkpoint recompute) can be skipped.
-        if self.static_routing or torch.count_nonzero(tokens_per_expert) > 0:
+        if (
+            self.static_routing
+            or self.dispatcher_capacity_factor is not None
+            or torch.count_nonzero(tokens_per_expert) > 0
+        ):
             tokens_per_expert_gpu = tokens_per_expert.to(device=permuted_local_hidden_states.device, non_blocking=True)
 
             if self.expert_bias:

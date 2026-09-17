@@ -487,3 +487,10 @@ class TestBackendConfigPartialCudaGraphs:
                 dispatcher="deepep",
                 cuda_graph=CudaGraphConfig(modules=["moe_router", "moe_preprocess"]),
             )
+
+
+def test_dispatcher_capacity_factor_defaults_off():
+    from nemo_automodel.components.models.common.utils import BackendConfig
+
+    assert BackendConfig().dispatcher_capacity_factor is None
+    assert BackendConfig(dispatcher_capacity_factor=1.5).dispatcher_capacity_factor == 1.5

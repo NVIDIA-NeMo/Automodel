@@ -794,6 +794,8 @@ class HybridEPCombine(torch.autograd.Function):
             handle=handle,
             pad_multiple=ctx.pad_multiple,
             num_permuted_tokens=ctx.num_permuted_tokens,
+            # Capacity mode hands a host int: the backward dispatch then needs no stream drain either.
+            non_blocking=isinstance(ctx.num_permuted_tokens, int),
         )
         return dispatched_hidden, None, None, None
 
