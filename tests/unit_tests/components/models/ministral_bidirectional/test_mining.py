@@ -24,9 +24,9 @@ import torch
 from PIL import Image
 
 from nemo_automodel.components.config.loader import ConfigNode
-from nemo_automodel.components.models.ministral_bidirectional.mining import (
-    Mistral3MultimodalMiningEncoder,
-    Mistral3MultimodalMiningEncoderConfig,
+from nemo_automodel._transformers.mining import (
+    CheckpointMiningEncoder,
+    CheckpointMiningEncoderConfig,
 )
 from nemo_automodel.components.models.ministral_bidirectional.processor import load_image
 from nemo_automodel.recipes.retrieval.mine_hard_negatives import MineHardNegativesRecipe
@@ -84,29 +84,54 @@ def _png_bytes() -> bytes:
 def test_typed_config_owns_processor_construction(monkeypatch):
     processor = _PixelProcessor()
     from_pretrained = MagicMock(return_value=processor)
-    monkeypatch.setattr(
-        "nemo_automodel.components.models.ministral_bidirectional.mining.Mistral3BiEncoderProcessor.from_pretrained",
-        from_pretrained,
-    )
     config = ConfigNode(
         {
-            "_target_": Mistral3MultimodalMiningEncoderConfig,
-            "processor_name_or_path": "/processor",
+            "_target_": CheckpointMiningEncoderConfig,
             "p_max_length": 2048,
             "use_text_in_document": False,
         }
     ).instantiate()
 
-    encoder = config.build(model=_PixelModel(), device=torch.device("cpu"))
+    model = _PixelModel()
+    model.model = SimpleNamespace(retrieval_processor_target="fixture.Processor")
+    model.config = SimpleNamespace(name_or_path="", _commit_hash=None)
+    monkeypatch.setattr(
+        "nemo_automodel._transformers.mining.import_module",
+        lambda _: SimpleNamespace(Processor=SimpleNamespace(from_pretrained=from_pretrained)),
+    )
+    model.source_model_path = "/resolved-snapshot"
+    encoder = config.build(model=model, device=torch.device("cpu"))
 
     assert encoder.processor is processor
     assert encoder.use_text_in_document is False
     assert from_pretrained.call_args.kwargs["p_max_length"] == 2048
+    from_pretrained.assert_called_once_with("/resolved-snapshot", p_max_length=2048)
+
+
+def test_empty_prefix_is_an_explicit_override(monkeypatch):
+    load = MagicMock(return_value=_PixelProcessor())
+    model = _PixelModel()
+    model.model = SimpleNamespace(retrieval_processor_target="fixture.Processor")
+    model.config = SimpleNamespace(name_or_path="org/model", _commit_hash="pinned-sha")
+    monkeypatch.setattr(
+        "nemo_automodel._transformers.mining.import_module",
+        lambda _: SimpleNamespace(Processor=SimpleNamespace(from_pretrained=load)),
+    )
+    model.source_model_path = "/snapshot"
+    CheckpointMiningEncoderConfig(query_prefix="").build(model=model, device=torch.device("cpu"))
+    load.assert_called_once_with("org/model", query_prefix="", revision="pinned-sha")
+
+
+def test_checkpoint_without_registered_processor_is_rejected():
+    model = _PixelModel()
+    model.model = SimpleNamespace()
+    with pytest.raises(ValueError, match="does not declare a supported retrieval processor"):
+        CheckpointMiningEncoderConfig().build(model=model, device=torch.device("cpu"))
 
 
 def test_pixels_change_same_text_embeddings_and_ranking_excludes_positive():
     processor = _PixelProcessor()
-    encoder = Mistral3MultimodalMiningEncoder(
+    encoder = CheckpointMiningEncoder(
         model=_PixelModel(),
         processor=processor,
         device=torch.device("cpu"),
@@ -138,7 +163,7 @@ def test_pixels_change_same_text_embeddings_and_ranking_excludes_positive():
 
 def test_image_only_and_mixed_documents_preserve_configured_content_policy():
     processor = _PixelProcessor()
-    encoder = Mistral3MultimodalMiningEncoder(
+    encoder = CheckpointMiningEncoder(
         model=_PixelModel(),
         processor=processor,
         device=torch.device("cpu"),
@@ -177,7 +202,7 @@ def test_unsupported_image_diagnostic_does_not_expose_payload():
 def test_binary_images_are_wrapped_for_the_strict_processor(binary_type):
     payload = binary_type(_png_bytes())
     processor = _ImageProcessor()
-    encoder = Mistral3MultimodalMiningEncoder(
+    encoder = CheckpointMiningEncoder(
         model=_PixelModel(),
         processor=processor,
         device=torch.device("cpu"),
@@ -191,7 +216,7 @@ def test_binary_images_are_wrapped_for_the_strict_processor(binary_type):
 
 
 def test_policy_rejects_document_without_usable_text_or_image():
-    encoder = Mistral3MultimodalMiningEncoder(
+    encoder = CheckpointMiningEncoder(
         model=_PixelModel(),
         processor=_PixelProcessor(),
         device=torch.device("cpu"),

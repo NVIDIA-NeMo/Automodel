@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import os
 from enum import IntEnum
 from io import BytesIO
@@ -29,6 +30,7 @@ from PIL import Image
 from tokenizers.normalizers import Replace, Sequence
 from transformers import BatchEncoding, PixtralProcessor
 from transformers.tokenization_utils_tokenizers import TokenizersBackend
+from transformers.utils import cached_file
 
 _CONTROL_TOKEN_ESCAPE = "\u200c"
 _CONTROL_TOKEN_ESCAPE_POLICY = "mistral_retrieval_zwnj_prefix_v1"
@@ -169,6 +171,45 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
     """
 
     _export_as_stock_processor = True
+
+    @classmethod
+    def from_pretrained(
+        cls, pretrained_model_name_or_path: str | os.PathLike, **kwargs: Any
+    ) -> "Mistral3BiEncoderProcessor":
+        """Restore saved retrieval prompts unless explicitly overridden.
+
+        Args:
+            pretrained_model_name_or_path: Local checkpoint or Hugging Face model identifier.
+            **kwargs: Standard processor loading arguments and explicit runtime overrides.
+
+        Returns:
+            Processor with Sentence Transformers query/document prompts and saved image settings.
+
+        Raises:
+            ValueError: If saved retrieval prompt metadata is malformed.
+        """
+        metadata_path = cached_file(
+            pretrained_model_name_or_path,
+            "config_sentence_transformers.json",
+            **{
+                key: kwargs[key]
+                for key in ("cache_dir", "revision", "token", "local_files_only", "subfolder")
+                if key in kwargs
+            },
+            _raise_exceptions_for_missing_entries=False,
+        )
+        if metadata_path is not None:
+            with open(metadata_path) as stream:
+                metadata = json.load(stream)
+            if not isinstance(metadata, dict) or not isinstance(metadata.get("prompts", {}), dict):
+                raise ValueError("config_sentence_transformers.json must contain a prompts mapping")
+            for argument, prompt_name in (("query_prefix", "query"), ("passage_prefix", "document")):
+                prompt = metadata.get("prompts", {}).get(prompt_name)
+                if prompt is not None and not isinstance(prompt, str):
+                    raise ValueError(f"Sentence Transformers {prompt_name} prompt must be a string")
+                if argument not in kwargs and prompt is not None:
+                    kwargs[argument] = prompt
+        return super().from_pretrained(pretrained_model_name_or_path, **kwargs)
 
     def check_argument_for_proper_class(
         self,

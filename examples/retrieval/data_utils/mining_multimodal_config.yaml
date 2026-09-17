@@ -12,11 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Override the checkpoint, processor, input and output paths when launching:
+# Override the checkpoint, input and output paths when launching:
 # uv run torchrun --nproc_per_node=1 examples/retrieval/data_utils/mine_hard_negatives.py \
 #   --config examples/retrieval/data_utils/mining_multimodal_config.yaml \
 #   --mining.model_name_or_path /path/to/checkpoint \
-#   --mining.multimodal_encoder.processor_name_or_path /path/to/checkpoint \
 #   --mining.train_qa_file_path /path/to/input.json \
 #   --mining.train_file_output_path /path/to/output.json
 
@@ -30,13 +29,11 @@ mining:
   train_file_output_path: null
 
   multimodal_encoder:
-    _target_: nemo_automodel.components.models.ministral_bidirectional.mining.Mistral3MultimodalMiningEncoderConfig
-    processor_name_or_path: null
+    # Checkpoint selects its processor and supplies prompts, image preprocessing,
+    # pooling and normalization. Only runtime token budgets are overridden here.
+    _target_: nemo_automodel._transformers.mining.CheckpointMiningEncoderConfig
     q_max_length: 512
     p_max_length: 4096
-    query_prefix: "query:"
-    passage_prefix: "passage:"
-    image_longest_edge: 1284
     use_text_in_document: true
     use_images: true
 

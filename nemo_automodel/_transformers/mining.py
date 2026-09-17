@@ -12,34 +12,70 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Model-owned multimodal encoding for hard-negative mining."""
+"""Checkpoint-owned retrieval preprocessing for mining and evaluation."""
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
-from typing import Any
+from importlib import import_module
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 import numpy as np
 import torch
 
-from nemo_automodel.components.models.ministral_bidirectional.processor import Mistral3BiEncoderProcessor
+if TYPE_CHECKING:
+    from nemo_automodel._transformers.retrieval import BiEncoderModel
+
+logger = logging.getLogger(__name__)
+
+
+class _RetrievalProcessor(Protocol):
+    def process_queries(self, queries: list[str], *, return_tensors: Literal["pt"]) -> dict[str, Any]:
+        """Process query strings.
+
+        Args:
+            queries: Query strings in input order.
+            return_tensors: Tensor backend.
+
+        Returns:
+            Token IDs and attention mask tensors of shape [batch, sequence].
+        """
+        ...
+
+    def process_documents(self, documents: list[dict[str, Any]], *, return_tensors: Literal["pt"]) -> dict[str, Any]:
+        """Process text/image documents.
+
+        Args:
+            documents: Mappings containing text and optional decoded or local images.
+            return_tensors: Tensor backend.
+
+        Returns:
+            Token IDs/masks of shape [batch, sequence], optional pixel tensors of
+            shape [images, channels, height, width], and image sizes of shape [images, 2].
+        """
+        ...
 
 
 @dataclass(frozen=True)
-class Mistral3MultimodalMiningEncoderConfig:
-    """Declarative construction settings for Mistral3 multimodal mining inputs."""
+class CheckpointMiningEncoderConfig:
+    """Optional runtime overrides for the checkpoint's model-owned retrieval processor.
 
-    processor_name_or_path: str
-    q_max_length: int = 512
-    p_max_length: int = 4096
-    query_prefix: str = ""
-    passage_prefix: str = ""
+    Omitted overrides preserve saved processor settings and Sentence Transformers
+    prompts. An explicitly empty prefix disables that prompt. The processor is
+    loaded from the same resolved snapshot as the model, not a second model path.
+    """
+
+    q_max_length: int | None = None
+    p_max_length: int | None = None
+    query_prefix: str | None = None
+    passage_prefix: str | None = None
     image_longest_edge: int | None = None
     use_text_in_document: bool = True
     use_images: bool = True
 
-    def build(self, *, model: torch.nn.Module, device: torch.device) -> "Mistral3MultimodalMiningEncoder":
-        """Build the model-owned multimodal mining encoder.
+    def build(self, *, model: "BiEncoderModel", device: torch.device) -> "CheckpointMiningEncoder":
+        """Build an encoder using the processor declared by the loaded backbone.
 
         Args:
             model: Bi-encoder module whose ``encode`` method returns a tensor of shape [batch, hidden].
@@ -48,15 +84,26 @@ class Mistral3MultimodalMiningEncoderConfig:
         Returns:
             A configured multimodal mining encoder.
         """
-        processor = Mistral3BiEncoderProcessor.from_pretrained(
-            self.processor_name_or_path,
-            q_max_length=self.q_max_length,
-            p_max_length=self.p_max_length,
-            query_prefix=self.query_prefix,
-            passage_prefix=self.passage_prefix,
-            image_longest_edge=self.image_longest_edge,
+        processor_target = getattr(model.model, "retrieval_processor_target", None)
+        if processor_target is None:
+            raise ValueError("This checkpoint's backbone does not declare a supported retrieval processor.")
+        module_name, class_name = processor_target.rsplit(".", 1)
+        processor_class = getattr(import_module(module_name), class_name)
+        overrides = {
+            "q_max_length": self.q_max_length,
+            "p_max_length": self.p_max_length,
+            "query_prefix": self.query_prefix,
+            "passage_prefix": self.passage_prefix,
+            "image_longest_edge": self.image_longest_edge,
+        }
+        loading_options = {key: value for key, value in overrides.items() if value is not None}
+        if model.config._commit_hash is not None:
+            loading_options["revision"] = model.config._commit_hash
+        processor = processor_class.from_pretrained(
+            model.config.name_or_path or model.source_model_path, **loading_options
         )
-        return Mistral3MultimodalMiningEncoder(
+        logger.info("Resolved checkpoint retrieval processor: %s", processor)
+        return CheckpointMiningEncoder(
             model=model,
             processor=processor,
             device=device,
@@ -65,14 +112,14 @@ class Mistral3MultimodalMiningEncoderConfig:
         )
 
 
-class Mistral3MultimodalMiningEncoder:
-    """Encode mining queries and multimodal documents with the Mistral3 processor."""
+class CheckpointMiningEncoder:
+    """Encode mining queries and documents through the checkpoint's retrieval processor."""
 
     def __init__(
         self,
         *,
         model: torch.nn.Module,
-        processor: Mistral3BiEncoderProcessor,
+        processor: _RetrievalProcessor,
         device: torch.device,
         use_text_in_document: bool = True,
         use_images: bool = True,
