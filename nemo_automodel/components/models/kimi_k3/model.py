@@ -945,8 +945,9 @@ class KimiDeltaAttention(nn.Module):
             g=g,
             beta=beta,
             initial_state=None,
-            # Under CP the final state is owned by FLA's rank-to-rank handoff.
-            output_final_state=cp_context is None,
+            # The final recurrent state is never consumed in training (and under CP it is owned by
+            # FLA's rank-to-rank handoff), so do not have the kernel materialise it.
+            output_final_state=False,
             cu_seqlens=cu_seqlens,
             **kernel_options,
             **kernel_kwargs,
