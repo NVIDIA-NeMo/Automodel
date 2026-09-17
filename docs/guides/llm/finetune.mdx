@@ -1,6 +1,6 @@
 ---
 title: "Supervised Fine-Tuning (SFT) and Parameter-Efficient Fine-Tuning (PEFT) with NeMo AutoModel"
-description: ""
+description: "Fine-tune language models with NeMo AutoModel using SFT or PEFT (LoRA), from install and YAML config through training, evaluation, publish, and vLLM deploy."
 position: 2
 ---
 ## Introduction
@@ -137,7 +137,7 @@ recipe: nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPredi
 
 The short name form is a convenience. The CLI scans all recipe modules under `nemo_automodel.recipes` and matches the bare class name. If you invoke the recipe script directly with `torchrun` instead of the `automodel` CLI, the `recipe` key is not required because the script itself *is* the recipe.
 
-Not every section uses `_target_`. `step_scheduler` and `checkpoint` are converted into `StepSchedulerConfig` and `CheckpointingConfig`, whose `.build(...)` methods receive runtime-only values from the recipe. The `distributed` mapping is parsed into typed strategy, parallelism, pipeline, and MoE configs before `DistributedSetup.build(...)` creates the meshes.
+Not every section uses `_target_`. `step_scheduler` and `checkpoint` are converted into `StepSchedulerConfig` and `CheckpointingConfig`, whose `.build(...)` methods receive runtime-only values from the recipe. The `distributed` mapping is parsed into typed strategy, parallelism, pipeline, and Mixture-of-Experts (MoE) configs before `DistributedSetup.build(...)` creates the meshes.
 </Accordion>
 
 ### Model
@@ -151,7 +151,7 @@ model:
 | Key | Role |
 |-----|------|
 | `_target_` | Points to [`NeMoAutoModelForCausalLM.from_pretrained`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/_transformers/auto_model.py), which is a factory method that downloads (or loads from cache) a pretrained Hugging Face model and wraps it with NeMo distributed-training support. |
-| `pretrained_model_name_or_path` | A keyword argument to `from_pretrained`. Any argument that [`from_pretrained`](https://huggingface.co/docs/transformers/main_classes/model#transformers.PreTrainedModel.from_pretrained) accepts can be added here (e.g., `cache_dir`, `torch_dtype`). |
+| `pretrained_model_name_or_path` | A keyword argument to `from_pretrained`. NeMo AutoModel supports common Hugging Face [`from_pretrained`](https://huggingface.co/docs/transformers/main_classes/model#transformers.PreTrainedModel.from_pretrained) arguments, for example, `cache_dir` and `dtype`. Check the NeMo loader documentation for supported arguments; the deprecated `torch_dtype` spelling remains supported. |
 
 This guide uses **Meta Llama 3.2 1B** as a running example. Replace `pretrained_model_name_or_path` with any supported [Hugging Face model ID](/model-coverage/large-language-models/overview).
 
@@ -225,7 +225,7 @@ Including a `peft:` section enables LoRA fine-tuning. Remove it entirely to run 
 
 If GPU memory is a constraint, [QLoRA](https://arxiv.org/abs/2305.14314) combines LoRA with 4-bit NormalFloat (NF4) quantization to reduce memory usage by up to 75% compared to full-parameter SFT in 16-bit precision, while maintaining comparable quality to standard LoRA.
 
-QLoRA requires `bitsandbytes`, which is provided by AutoModel's `cuda_source`
+QLoRA requires `bitsandbytes`, which is provided by NeMo AutoModel's `cuda_source`
 install profile. Add it to the active environment created above before running a
 QLoRA recipe:
 
@@ -274,7 +274,7 @@ gradient accumulation steps = global_batch_size / (local_batch_size × DP size)
 With the values above, a single DP rank accumulates 8 micro-batches; 8 DP ranks require no accumulation. `global_batch_size` must be divisible by `local_batch_size × DP size`.
 
 <Note>
-Most example recipes use bf16 training by default for memory and throughput. If you are running long fine-tuning, especially full-parameter SFT, and you require a higher-precision optimizer state, configure it explicitly instead of assuming it from the mixed-precision compute policy. See the [Mixed-Precision Training Guide](/development/mixed-precision-training) for the recommended Transformer Engine (TE) and torch AdamW patterns.
+Most example recipes use bf16 training by default for memory and throughput. If you are running long fine-tuning, especially full-parameter SFT, and you require a higher-precision optimizer state, set `model.dtype: float32` explicitly when using `torch.optim.Adam` or `AdamW`. The deprecated `model.torch_dtype` key remains supported. The mixed-precision compute policy does not set optimizer-state precision. See the [Mixed-Precision Training Guide](/development/mixed-precision-training) for the recommended Transformer Engine (TE) and torch AdamW patterns.
 
 </Note>
 
@@ -354,7 +354,7 @@ checkpoint:
 
 ## Fine-Tune the Model
 
-You can run the recipe using the AutoModel CLI or directly with `torchrun` (advanced).
+You can run the recipe using the `automodel` CLI or directly with `torchrun` (advanced).
 
 ```bash
 automodel --nproc-per-node=8 finetune_config.yaml
@@ -483,7 +483,7 @@ PEFT adapters must be loaded on top of the base model. Because the base NeMo Aut
 uv pip install "peft>=0.19.1"
 ```
 
-LoRA adapters for models with fused MoE expert weights (for example Qwen3-MoE, MiniMax-M2, Nemotron 3) are exported in the ParamWrapper layout peft has used since 0.19.1, when peft changed it (huggingface/peft#3165); that is why the step above installs `peft>=0.19.1`. If such an adapter has to be loaded by a consumer pinned to an older peft, set `checkpoint.legacy_paramwrapper_layout: true` in the training config to export the pre-0.19.1 layout instead. An adapter exported that way does not load with peft 0.19.1 or newer.
+LoRA adapters for models with fused MoE expert weights (for example, Qwen3-MoE, MiniMax-M2, Nemotron 3) are exported in the ParamWrapper layout that `peft` has used since 0.19.1, when `peft` changed it (huggingface/peft#3165); that is why the step above installs `peft>=0.19.1`. If such an adapter has to be loaded by a consumer pinned to an older `peft` version, set `checkpoint.legacy_paramwrapper_layout: true` in the training config to export the pre-0.19.1 layout instead. An adapter exported that way does not load with `peft` 0.19.1 or newer.
 
 ```python
 import torch

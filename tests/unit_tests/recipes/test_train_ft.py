@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 import inspect
 import logging
 import sys
 import types
 from contextlib import AbstractContextManager, nullcontext
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -24,7 +26,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.components.config.loader import ConfigNode, load_yaml_config
 
 # Skip decorator for tests that require CUDA
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -37,7 +39,8 @@ from nemo_automodel.components.datasets.loader import (
 )
 from nemo_automodel.components.distributed.utils import dp_eval_sample_shard
 from nemo_automodel.components.eval.tool_call_evaluator import ToolCallAccuracyEvaluator
-from nemo_automodel.components.loss.mtp import PipelineCausalLMLoss
+from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+from nemo_automodel.components.loss.mtp import PipelineCausalLMLoss, calculate_mtp_loss
 from nemo_automodel.components.models.deepseek_v4.cp import dsv4_cp_local_seq_multiple
 from nemo_automodel.components.optim.optimizer import build_optimizer_config
 from nemo_automodel.recipes._typed_config import RecipeConfig, _as_dict, _callable_and_kwargs
@@ -45,6 +48,8 @@ from nemo_automodel.recipes.llm.train_ft import (
     TrainFinetuneRecipeForNextTokenPrediction,
     _build_pp_collate_wrapper,
     _should_pack_validation,
+    _supports_loss_weights,
+    _validate_domain_sampling_weights,
     build_model,
     compute_trust_remote_code_from_model,
 )
@@ -171,8 +176,6 @@ def dl_factory_capture(**kwargs):  # returns a sentinel while exposing passed kw
 
 
 def test_pipeline_causal_lm_loss_adds_mtp_tuple_output():
-    from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
-
     class DummyModel(nn.Module):
         def __init__(self):
             super().__init__()
@@ -203,7 +206,6 @@ def test_pipeline_causal_lm_loss_adds_mtp_tuple_output():
 
 
 def test_mtp_loss_config_defaults_and_override():
-    from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
     from nemo_automodel.components.loss.mtp import MTPLossConfig
 
     class DummyModel(nn.Module):
@@ -215,19 +217,19 @@ def test_mtp_loss_config_defaults_and_override():
         def get_output_embeddings(self):
             return self.lm_head
 
-    # Defaults: scaling_factor None (model-driven), ignore_index -100.
+    # Defaults: scaling_factor is model-driven and ignore_index is loss-driven.
     assert MTPLossConfig().scaling_factor is None
-    assert MTPLossConfig().ignore_index == -100
+    assert MTPLossConfig().ignore_index is None
 
     torch.manual_seed(123)
     model = DummyModel()
     model.train()
-    loss_fn = MaskedCrossEntropy(fp32_upcast=False, reduction="sum")
+    loss_fn = MaskedCrossEntropy(fp32_upcast=False, ignore_index=0, reduction="sum")
 
     logits = torch.randn(1, 4, 5)
     mtp_h = torch.randn(1, 4, 3)
-    labels = torch.tensor([[1, 2, 3, 4]])
-    shifted_labels = torch.tensor([[2, 3, 4, -100]])
+    labels = torch.tensor([[1, 2, 3, -100]])
+    shifted_labels = torch.tensor([[2, 3, 0, 0]])
     base = loss_fn(logits=logits, labels=labels)
     aux = loss_fn(logits=model.lm_head(mtp_h), labels=shifted_labels)
 
@@ -236,8 +238,35 @@ def test_mtp_loss_config_defaults_and_override():
     torch.testing.assert_close(got_override, base + 0.5 * aux)
 
     # The default (None) falls back to the model-provided 0.2.
-    got_default = MTPLossConfig().build(loss_fn, model)((logits, mtp_h), labels)
+    default_wrapper = MTPLossConfig().build(loss_fn, model)
+    assert default_wrapper.ignore_index == 0
+    got_default = default_wrapper((logits, mtp_h), labels)
     torch.testing.assert_close(got_default, base + 0.2 * aux)
+
+    with pytest.raises(ValueError, match="must match the configured loss"):
+        MTPLossConfig(ignore_index=-100).build(loss_fn, model)
+
+
+def test_mtp_loss_applies_domain_weights_to_shifted_targets():
+    from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+
+    loss_fn = MaskedCrossEntropy(fp32_upcast=False)
+    logits = torch.randn(2, 4, 6)
+    labels = torch.tensor([[0, 1, 2, 3], [1, 2, 3, 4]])
+    loss_weights = torch.tensor([[0.5] * 4, [1.5] * 4])
+
+    got = calculate_mtp_loss(
+        loss_fn,
+        mtp_per_depth_logits=[logits],
+        labels=labels,
+        model=nn.Module(),
+        scaling_factor=1.0,
+        loss_weights=loss_weights,
+    )
+    shifted_labels = torch.tensor([[1, 2, 3, -100], [2, 3, 4, -100]])
+    expected = loss_fn(logits, shifted_labels, loss_weights=loss_weights)
+
+    torch.testing.assert_close(got, expected)
 
 
 def test_validation_dataloaders_pp_enabled(caplog):
@@ -280,6 +309,45 @@ def test_validation_dataloaders_collects_and_names_properly():
     assert set(result.keys()) == {"default", "val", "test"}
     assert all(isinstance(v, DataloaderConfig) for v in result.values())
     assert all(v.batch_size == 8 for v in result.values())
+
+
+def test_recipe_config_resolves_typed_domain_mixture():
+    cfg = RecipeConfig(
+        ConfigNode(
+            {
+                "domain_mixture": {
+                    "domains": [
+                        {"name": "web", "sampling_weight": 0.75, "objective_weight": 0.5},
+                        {"name": "code", "sampling_weight": 0.25, "objective_weight": 0.5},
+                    ]
+                }
+            }
+        )
+    )
+
+    mixture = cfg.domain_mixture.build()
+
+    assert mixture.names == ("web", "code")
+    assert mixture.loss_multipliers == pytest.approx((2.0 / 3.0, 2.0))
+
+
+def test_domain_mixture_sampling_weights_match_megatron_blend():
+    from nemo_automodel.components.datasets.llm.megatron_dataset import MegatronPretrainingConfig
+    from nemo_automodel.components.training.domain_mixture import DomainMixtureConfig, DomainWeightConfig
+
+    mixture = DomainMixtureConfig(
+        domains=(
+            DomainWeightConfig(name="web", sampling_weight=0.75, objective_weight=0.5),
+            DomainWeightConfig(name="code", sampling_weight=0.25, objective_weight=0.5),
+        )
+    ).build()
+    dataloader = DataloaderConfig(dataset_config=MegatronPretrainingConfig(paths=["3", "/data/web", "1", "/data/code"]))
+
+    _validate_domain_sampling_weights(mixture, dataloader)
+
+    mismatched = DataloaderConfig(dataset_config=MegatronPretrainingConfig(paths=["1", "/data/web", "1", "/data/code"]))
+    with pytest.raises(ValueError, match="sampling weights must match"):
+        _validate_domain_sampling_weights(mixture, mismatched)
 
 
 def test_validation_dataloaders_no_validation_keys():
@@ -1260,18 +1328,18 @@ def test_maybe_downgrade_loss_fn(has_logits_to_keep, has_marker, pp_enabled, exp
     logits_to_keep and (under PP) advertises hidden-states emission via
     _pp_return_hidden_states_supported; otherwise it downgrades to MaskedCrossEntropy."""
     from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
-    from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
     from nemo_automodel.recipes.llm.train_ft import _maybe_downgrade_loss_fn
 
     probe = (_StageWithLogitsToKeep if has_logits_to_keep else _StageNoLogitsToKeep)()
     if has_marker:
         probe._pp_return_hidden_states_supported = True  # set by patch_hf_model_for_pp on the generic forward
 
-    result = _maybe_downgrade_loss_fn(FusedLinearCrossEntropy(), probe, pp_enabled=pp_enabled)
+    result = _maybe_downgrade_loss_fn(FusedLinearCrossEntropy(ignore_index=0), probe, pp_enabled=pp_enabled)
 
     assert isinstance(result, FusedLinearCrossEntropy) is expect_fused
     if not expect_fused:
         assert isinstance(result, MaskedCrossEntropy)
+        assert result.ignore_index == 0
 
 
 def test_run_train_validation_loop_calls_gc_hook_once_per_step():
@@ -1312,6 +1380,63 @@ def test_run_train_validation_loop_calls_gc_hook_once_per_step():
     trainer.run_train_validation_loop()
 
     trainer._maybe_collect_garbage.assert_called_once()
+
+
+def test_run_train_validation_loop_reports_weighted_domain_validation():
+    from nemo_automodel.components.training.domain_mixture import DomainMixtureConfig, DomainWeightConfig
+
+    class _OneValidationStep:
+        step = 1
+        epoch = 0
+        epochs = [0]
+        is_val_step = True
+        is_ckpt_step = True
+        sigterm_flag = False
+
+        def set_epoch(self, epoch):
+            self.epoch = epoch
+
+        def __iter__(self):
+            yield ["dummy-batch"]
+
+    trainer = TrainFinetuneRecipeForNextTokenPrediction.__new__(TrainFinetuneRecipeForNextTokenPrediction)
+    trainer.model_parts = [MagicMock()]
+    trainer.step_scheduler = _OneValidationStep()
+    trainer.max_grad_norm = 1.0
+    trainer.partial_cuda_graph_manager = None
+    trainer._partial_cuda_graph_capture_pending = False
+    trainer._enable_qat_if_delayed = MagicMock()
+    trainer._run_train_optim_step = MagicMock(return_value=SimpleNamespace(metrics={"loss": 1.0}))
+    trainer.optimizer = [SimpleNamespace(param_groups=[{"lr": 1.0e-4}])]
+    trainer._collect_moe_load_balance = MagicMock()
+    trainer._maybe_collect_garbage = MagicMock()
+    trainer.log_train_metrics = MagicMock()
+    trainer.log_val_metrics = MagicMock()
+    trainer.save_checkpoint = MagicMock()
+    trainer.val_dataloaders = {"web": object(), "code": object()}
+    trainer._run_validation_epoch = MagicMock(
+        side_effect=[
+            SimpleNamespace(metrics={"val_loss": 2.0, "num_label_tokens": 10}),
+            SimpleNamespace(metrics={"val_loss": 4.0, "num_label_tokens": 20}),
+        ]
+    )
+    trainer.domain_mixture = DomainMixtureConfig(
+        domains=(
+            DomainWeightConfig(name="web", sampling_weight=0.5, objective_weight=0.25),
+            DomainWeightConfig(name="code", sampling_weight=0.5, objective_weight=0.75),
+        )
+    ).build()
+    trainer.metric_logger_train = SimpleNamespace(close=MagicMock())
+    trainer.metric_logger_valid = {name: SimpleNamespace(close=MagicMock()) for name in ("web", "code", "weighted")}
+    trainer.checkpointer = SimpleNamespace(finalize=MagicMock())
+    trainer.best_metric_key = "weighted"
+
+    trainer.run_train_validation_loop()
+
+    weighted_call = next(call for call in trainer.log_val_metrics.call_args_list if call.args[0] == "weighted")
+    assert weighted_call.args[1].metrics["val_loss"] == pytest.approx(3.5)
+    saved_val_losses = trainer.save_checkpoint.call_args.args[3]
+    assert saved_val_losses == {"web": 2.0, "code": 4.0, "weighted": pytest.approx(3.5)}
 
 
 def test_compute_trust_remote_code_prefers_cfg_flag():
@@ -1579,6 +1704,7 @@ def test_run_validation_epoch_pp_sends_loss_from_last_stage_to_main(monkeypatch)
 
     # Set up recipe attributes for validation - use object.__setattr__ to bypass state tracking
     object.__setattr__(recipe, "model_parts", [DummyModel()])
+    object.__setattr__(recipe, "loss_fn", MaskedCrossEntropy(ignore_index=0))
     object.__setattr__(recipe, "step_scheduler", SimpleNamespace(step=1, epoch=0))
     object.__setattr__(recipe, "optimizer", [SimpleNamespace(param_groups=[{"lr": 0.01}])])
 
@@ -1616,12 +1742,18 @@ def test_run_validation_epoch_pp_sends_loss_from_last_stage_to_main(monkeypatch)
     )
 
     # Create a simple dataloader that yields one batch
-    val_dataloader = [{"input_ids": torch.tensor([[1, 2, 3]]), "labels": torch.tensor([[1, 2, 3]])}]
+    val_dataloader = [
+        {
+            "input_ids": torch.tensor([[1, 2], [3, 4]]),
+            "labels": torch.tensor([[0, 1], [0, 2]]),
+        }
+    ]
 
     result = recipe._run_validation_epoch(val_dataloader)
 
     # Verify result is a MetricsSample with val_loss
     assert "val_loss" in result.metrics
+    assert result.metrics["num_label_tokens"] == 2
     # val_loss should be a float, not a tensor
     assert isinstance(result.metrics["val_loss"], float)
 
@@ -2131,6 +2263,7 @@ class TestRunTrainOptimStepSetsMoEScale:
         cp_group_size=1,
         pp_microbatches=1,
         world_size=1,
+        clip_grad_norm=None,
     ):
         from nemo_automodel.components.config.loader import ConfigNode
 
@@ -2147,6 +2280,7 @@ class TestRunTrainOptimStepSetsMoEScale:
                 "checkpoint": {"best_metric_key": "default"},
                 "distributed": {"cp_size": 1},
                 "autopipeline": {"pp_microbatch_size": 1},
+                "clip_grad_norm": clip_grad_norm or {},
             }
         )
         monkeypatch.setattr(
@@ -2219,6 +2353,95 @@ class TestRunTrainOptimStepSetsMoEScale:
         object.__setattr__(recipe, "timestamp", 0.0)
         return recipe
 
+    @pytest.mark.parametrize("backend", [None, "triton", "te"])
+    def test_grad_norm_backend_config(self, monkeypatch, backend):
+        options = {} if backend is None else {"backend": backend}
+        recipe = self._make_recipe(monkeypatch, pp_enabled=False, clip_grad_norm=options)
+        clip = MagicMock(return_value=torch.tensor(1.0))
+        monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.scale_grads_and_clip_grad_norm", clip)
+        batches = [{"input_ids": torch.tensor([[1, 2, 3]]), "labels": torch.tensor([[1, 2, 3]])}]
+
+        sample = recipe._run_train_optim_step(batches, max_grad_norm=1.0)
+
+        assert clip.call_args.kwargs["grad_norm_backend"] == (backend or "triton")
+        assert sample.metrics["grad_norm"] == 1.0
+
+    @pytest.mark.parametrize("pp_enabled", [False, True])
+    @pytest.mark.parametrize("accumulation_steps", [1, 3])
+    @pytest.mark.parametrize("max_grad_norm", [None, 0.5])
+    def test_tp_sync_precedes_scaling_clipping_and_step(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        pp_enabled: bool,
+        accumulation_steps: int,
+        max_grad_norm: float | None,
+    ) -> None:
+        """Full and partial accumulation windows synchronize once before normalization."""
+        from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
+
+        recipe = self._make_recipe(monkeypatch, pp_enabled=pp_enabled, dp_group_size=1)
+        model = nn.Linear(1, 1, bias=False)
+        with torch.no_grad():
+            model.weight.fill_(1.0)
+        recipe.model_parts = [model]
+        recipe.optimizer = [torch.optim.SGD(model.parameters(), lr=0.1)]
+        sync_inputs = []
+
+        def forward_backward_step(
+            idx: int,
+            batch: dict[str, torch.Tensor],
+            *,
+            loss_buffer: list[torch.Tensor],
+            num_label_tokens: int,
+            num_batches: int,
+            is_train: bool = True,
+        ) -> None:
+            """Accumulate one scalar loss in the tiny reference model.
+
+            Args:
+                idx: Microbatch index.
+                batch: Mapping containing labels of shape [batch, sequence].
+                loss_buffer: List of scalar loss tensors; appended in place.
+                num_label_tokens: Total supervised tokens in the update.
+                num_batches: Number of accumulated microbatches.
+                is_train: Whether this is a training step.
+            """
+            loss = model(torch.ones(1, 1)).sum()
+            loss.backward()
+            loss_buffer.append(loss.detach())
+
+        def synchronize(
+            model_parts: list[nn.Module], device_mesh: torch.distributed.device_mesh.DeviceMesh | None
+        ) -> None:
+            assert model_parts == [model]
+            assert device_mesh is recipe.device_mesh
+            sync_inputs.append(model.weight.grad.clone())
+            # Model a second TP rank's equal partial contribution. Real
+            # collectives are covered by parallelism/test_tp_replicas.py.
+            model.weight.grad.mul_(2.0)
+
+        monkeypatch.setattr(recipe, "_forward_backward_step", forward_backward_step)
+        monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.synchronize_tp_replica_gradients", synchronize)
+        monkeypatch.setattr(
+            "nemo_automodel.recipes.llm.train_ft.scale_grads_and_clip_grad_norm",
+            scale_grads_and_clip_grad_norm,
+        )
+        batches = [{"labels": torch.tensor([[1, 2, 3, -100]])} for _ in range(accumulation_steps)]
+
+        metrics = recipe._run_train_optim_step(batches, max_grad_norm=max_grad_norm)
+
+        assert len(sync_inputs) == 1
+        torch.testing.assert_close(sync_inputs[0], torch.full_like(model.weight, float(accumulation_steps)))
+        expected_gradient = float(2 * accumulation_steps)
+        if pp_enabled:
+            expected_gradient /= 3 * accumulation_steps
+        expected_norm = expected_gradient if max_grad_norm is not None else 0.0
+        assert float(metrics.metrics["grad_norm"]) == pytest.approx(expected_norm)
+        if max_grad_norm is not None:
+            expected_gradient *= min(1.0, max_grad_norm / (expected_gradient + 1e-6))
+        torch.testing.assert_close(model.weight, torch.full_like(model.weight, 1.0 - 0.1 * expected_gradient))
+        assert model.weight.grad is None
+
     def test_pp_scale_includes_pipeline_microbatches_and_token_normalization(self, monkeypatch):
         from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 
@@ -2256,6 +2479,23 @@ class TestRunTrainOptimStepSetsMoEScale:
 
         assert MoEAuxLossAutoScaler.main_loss_backward_scale is not None
         assert MoEAuxLossAutoScaler.main_loss_backward_scale.item() == pytest.approx(0.25)
+
+    def test_label_token_count_uses_loss_ignore_index(self, monkeypatch):
+        recipe = self._make_recipe(monkeypatch, pp_enabled=False, dp_group_size=1)
+        recipe.loss_fn = MaskedCrossEntropy(ignore_index=0)
+        seen_counts = []
+
+        def forward_backward_step(idx, batch, *, loss_buffer, num_label_tokens, num_batches, is_train=True):
+            seen_counts.append(num_label_tokens)
+            loss_buffer.append(torch.tensor(0.5))
+
+        monkeypatch.setattr(recipe, "_forward_backward_step", forward_backward_step)
+        batches = [{"labels": torch.tensor([[0, 1], [0, 2]])}]
+
+        metrics = recipe._run_train_optim_step(batches)
+
+        assert seen_counts == [2]
+        assert metrics.metrics["num_label_tokens"] == 2
 
     def test_non_pp_scale_restores_cp_sum(self, monkeypatch):
         from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
@@ -2851,3 +3091,210 @@ def test_forward_backward_step_shards_global_mtp_inputs_and_targets(monkeypatch)
     assert captured["cu_seqlens"] is None
     assert model.scale.grad is not None
     assert len(loss_buffer) == 1
+
+
+# ---------------------------------------------------------------------------
+# domain_mixture guards
+#
+# Each guard below is the only thing standing between a misconfiguration and a
+# silently-wrong training objective, so they are asserted explicitly rather than
+# left to the happy-path tests.
+# ---------------------------------------------------------------------------
+
+
+class _LossWithWeights(torch.nn.Module):
+    reduction = "sum"
+
+    def forward(self, logits, labels, num_label_tokens=None, loss_weights=None):
+        return logits.sum()
+
+
+class _LossWithWeightsWithoutReduction(torch.nn.Module):
+    def forward(self, logits, labels, num_label_tokens=None, loss_weights=None):
+        return logits.sum()
+
+
+class _LossSwallowingKwargs(torch.nn.Module):
+    reduction = "sum"
+
+    def forward(self, logits, labels, **kwargs):
+        return logits.sum()
+
+
+def _plain_loss_without_weights(logits, labels, num_label_tokens=None):
+    return logits.sum()
+
+
+def _plain_loss_with_weights(logits, labels, num_label_tokens=None, loss_weights=None):
+    return logits.sum()
+
+
+@pytest.mark.parametrize(
+    "loss_fn, expected",
+    [
+        (_LossWithWeights(), True),
+        (_plain_loss_with_weights, True),
+        # A **kwargs catch-all silently swallows loss_weights (unweighted training
+        # while the domain metrics claim otherwise) -- it must not pass the gate.
+        (_LossSwallowingKwargs(), False),
+        # inspect.signature(fn.__call__) on a plain function reports (*args, **kwargs);
+        # the gate must introspect the function itself.
+        (_plain_loss_without_weights, False),
+        (functools.partial(_plain_loss_without_weights), False),
+    ],
+)
+def test_supports_loss_weights_requires_the_named_parameter(loss_fn, expected):
+    assert _supports_loss_weights(loss_fn) is expected
+
+
+def test_supports_loss_weights_rejects_te_parallel_ce():
+    """TE's backward reads grad_output as a scalar, so weighting it is unsound."""
+    from nemo_automodel.components.loss.te_parallel_ce import TEParallelCrossEntropy
+
+    assert _supports_loss_weights(TEParallelCrossEntropy(reduction="sum")) is False
+
+
+def test_domain_weight_config_rejects_reserved_aggregate_name():
+    """A domain named 'weighted' would collide with the aggregate metric key."""
+    from nemo_automodel.components.training.domain_mixture import (
+        WEIGHTED_AGGREGATE_NAME,
+        DomainWeightConfig,
+    )
+
+    with pytest.raises(ValueError, match="reserved"):
+        DomainWeightConfig(name=WEIGHTED_AGGREGATE_NAME, sampling_weight=0.5, objective_weight=0.5)
+
+
+def test_domain_mixture_order_validation_does_not_infer_names_from_paths():
+    """Domain names are positional labels, not substrings to infer from paths."""
+    from nemo_automodel.components.datasets.llm.megatron_dataset import MegatronPretrainingConfig
+    from nemo_automodel.components.training.domain_mixture import DomainMixtureConfig, DomainWeightConfig
+
+    mixture = DomainMixtureConfig(
+        domains=(
+            DomainWeightConfig(name="code", sampling_weight=0.5, objective_weight=0.5),
+            DomainWeightConfig(name="web", sampling_weight=0.5, objective_weight=0.5),
+        )
+    ).build()
+    dataloader = DataloaderConfig(
+        dataset_config=MegatronPretrainingConfig(
+            paths=["1", "/data/python/train", "1", "/data/web/encoded_text_document"]
+        )
+    )
+
+    _validate_domain_sampling_weights(mixture, dataloader)
+
+
+_DOMAIN_MIXTURE_EXAMPLE = Path(__file__).parents[3] / "examples/llm_pretrain/megatron_pretrain_gpt2_domain_mixture.yaml"
+
+
+def _patch_domain_mixture_example_setup(monkeypatch, cfg, loss_fn, *, cp_size=1, pp_enabled=False):
+    """Keep the example's typed configs while stubbing heavyweight setup work."""
+    typed_cfg = RecipeConfig(cfg)
+    dataloader = typed_cfg.dataloader
+    validation_dataloaders = typed_cfg.validation_dataloaders
+
+    _patch_setup_minimals(monkeypatch, lambda *args, **kwargs: None)
+    monkeypatch.setattr(RecipeConfig, "loss_fn", property(lambda self: SimpleNamespace(build=lambda: loss_fn)))
+    monkeypatch.setattr(RecipeConfig, "dataloader", property(lambda self: dataloader))
+    monkeypatch.setattr(RecipeConfig, "validation_dataloaders", property(lambda self: validation_dataloaders))
+    monkeypatch.setattr(DataloaderConfig, "build", lambda self, **kwargs: "dl")
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.llm.train_ft.create_distributed_setup_from_config",
+        lambda cfg, world_size: SimpleNamespace(
+            mesh_context=SimpleNamespace(
+                pp_enabled=pp_enabled,
+                device_mesh=None,
+                moe_mesh=None,
+                cp_size=cp_size,
+                pp_size=2 if pp_enabled else 1,
+            ),
+            strategy_config=None,
+            pipeline_config=None,
+            moe_parallel_config=None,
+            activation_checkpointing=False,
+        ),
+    )
+    return typed_cfg
+
+
+def test_domain_mixture_example_setup_smoke(monkeypatch):
+    cfg = load_yaml_config(_DOMAIN_MIXTURE_EXAMPLE)
+    typed_cfg = _patch_domain_mixture_example_setup(monkeypatch, cfg, _LossWithWeights())
+
+    trainer = TrainFinetuneRecipeForNextTokenPrediction(typed_cfg)
+    trainer.setup()
+
+    assert trainer.domain_mixture.names == ("web", "code")
+    assert set(trainer.val_dataloaders) == {"web", "code"}
+
+
+@pytest.mark.parametrize(
+    "loss_fn, reduction",
+    [
+        (_LossWithWeightsWithoutReduction(), None),
+        (_LossWithWeights(), "mean"),
+    ],
+)
+def test_domain_mixture_example_rejects_unsupported_loss_reduction(monkeypatch, loss_fn, reduction):
+    if reduction is not None:
+        loss_fn.reduction = reduction
+    cfg = load_yaml_config(_DOMAIN_MIXTURE_EXAMPLE)
+    typed_cfg = _patch_domain_mixture_example_setup(monkeypatch, cfg, loss_fn)
+
+    with pytest.raises(ValueError, match="explicit reduction='sum'"):
+        TrainFinetuneRecipeForNextTokenPrediction(typed_cfg).setup()
+
+
+def test_domain_mixture_example_rejects_sequence_packing(monkeypatch):
+    cfg = load_yaml_config(_DOMAIN_MIXTURE_EXAMPLE)
+    cfg.packed_sequence = ConfigNode({"packed_sequence_size": 1024, "packing_strategy": "thd"})
+    typed_cfg = _patch_domain_mixture_example_setup(monkeypatch, cfg, _LossWithWeights())
+
+    with pytest.raises(ValueError, match="does not support sequence packing"):
+        TrainFinetuneRecipeForNextTokenPrediction(typed_cfg).setup()
+
+
+@pytest.mark.parametrize(
+    "cp_size, pp_enabled, message",
+    [
+        (2, False, "does not currently support context parallelism"),
+        (1, True, "does not currently support pipeline parallelism"),
+    ],
+)
+def test_domain_mixture_example_rejects_parallelism(monkeypatch, cp_size, pp_enabled, message):
+    cfg = load_yaml_config(_DOMAIN_MIXTURE_EXAMPLE)
+    typed_cfg = _patch_domain_mixture_example_setup(
+        monkeypatch,
+        cfg,
+        _LossWithWeights(),
+        cp_size=cp_size,
+        pp_enabled=pp_enabled,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        TrainFinetuneRecipeForNextTokenPrediction(typed_cfg).setup()
+
+
+def test_default_collater_batches_per_sample_dataset_id():
+    """BlendedDataset emits dataset_id as a bare numpy scalar next to sequences."""
+    import numpy as np
+
+    from nemo_automodel.components.datasets.utils import default_collater
+
+    batch = [
+        {
+            "input_ids": torch.ones(4, dtype=torch.long),
+            "labels": torch.ones(4, dtype=torch.long),
+            "dataset_id": np.int16(0),
+        },
+        {
+            "input_ids": torch.ones(4, dtype=torch.long),
+            "labels": torch.ones(4, dtype=torch.long),
+            "dataset_id": np.int16(1),
+        },
+    ]
+    out = default_collater(batch)
+    # [B], not [1, B] and not padded as a ragged sequence.
+    assert out["dataset_id"].tolist() == [0, 1]
+    assert out["input_ids"].shape == (2, 4)

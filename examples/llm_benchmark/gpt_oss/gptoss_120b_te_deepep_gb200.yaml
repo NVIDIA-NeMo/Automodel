@@ -17,13 +17,11 @@
 # GB200-specific deltas vs the generic gptoss_120b_te_deepep.yaml:
 #   - peak_tflops: 2500  (GB200 BF16 dense peak; the generic recipe uses the
 #     H100 989 value, which inflates the reported MFU on Blackwell)
-#   - local_batch_size: 4, GBS=512 (GA=4), activation_checkpointing=false —
-#     the best-MFU bf16 operating point from the gpt-oss sweep: 3.506 s/iter,
-#     22.70% MFU@2500, 154.6 GB. AC-off avoids recompute (higher MFU); lbs=4
-#     is the largest that fits <192GB with AC off (lbs=6 would OOM). NOTE: the
-#     TE-MXFP8 config uses a DIFFERENT operating point (lbs=8/GBS1280/AC-on) —
-#     for mxfp8 the bigger batch wins MFU despite recompute. Each precision is at
-#     its own best config, so the comparison is best-vs-best, not iso-batch.
+#   - local_batch_size: 4, GBS=512 (GA=4), activation_checkpointing=true.
+#     Checkpointing preserves headroom for backward and lazy Adam-state materialization;
+#     FusedLinearCrossEntropy separately removes the full-vocabulary logits allocation.
+#     NOTE: the TE-MXFP8 config uses a different operating point
+#     (lbs=8/GBS1280/AC-on), so the comparison is best-vs-best, not iso-batch.
 #
 # 8 nodes x 4 GB200 = 32 GPUs, ep_size=16, GBS=512, seq_len=4096.
 
@@ -56,7 +54,7 @@ distributed:
   ep_size: 16
 
   sequence_parallel: false
-  activation_checkpointing: false
+  activation_checkpointing: true
 
   pipeline:
     pp_schedule: interleaved1f1b
@@ -76,6 +74,9 @@ dist_env:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  # FusedLinearCrossEntropy consumes the final hidden states without materializing
+  # the full [batch, sequence, vocab] logits tensor (GitHub issue #3907).
+  output_hidden_states: true
   config:
     _target_: transformers.AutoConfig.from_pretrained
     pretrained_model_name_or_path: openai/gpt-oss-120b
@@ -96,8 +97,7 @@ checkpoint:
   enabled: false
 
 loss_fn:
-  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
-  fp32_upcast: false
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDataset
