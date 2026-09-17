@@ -34,7 +34,7 @@ from nemo_automodel.components.models.qwen3_8_flash_next.cp import (
     Qwen3_8_FlashNextCPContext,
     qwen3_8_flash_next_cp_all_gather,
 )
-from nemo_automodel.components.models.qwen3_8_flash_next.cute_qsa import cute_sparse_gqa_attention
+from nemo_automodel.components.models.qwen3_8_flash_next.fa4_qsa import fa4_sparse_gqa_attention
 from nemo_automodel.components.models.qwen3_8_flash_next.flex_qsa import flex_sparse_gqa_attention
 from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextRMSNorm
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
@@ -411,7 +411,7 @@ def qsa_gqa_attention(
         value: Tensor with key's layout. Q/K/V share one dtype and device.
         selected_token_ids: Signed IDs [batch, local_queries, routes] in global
             K/V coordinates; invalid CUDA IDs are padding and duplicates collapse.
-        backend: CUDA backend, "flex" or "cute". CuTe requires SM90 BF16 D256.
+        backend: CUDA backend, "flex" or "cute". FA4 requires SM90 BF16 D256.
         softmax_scale: Optional positive QK score multiplier.
 
     Returns:
@@ -427,7 +427,7 @@ def qsa_gqa_attention(
             softmax_scale=softmax_scale,
         )
     if backend == "cute":
-        return cute_sparse_gqa_attention(query, key, value, selected_token_ids, softmax_scale=softmax_scale)
+        return fa4_sparse_gqa_attention(query, key, value, selected_token_ids, softmax_scale=softmax_scale)
     if backend != "flex":
         raise RuntimeError(
             f"Qwen3.8-Flash-Next CUDA QSA requires backend.attn='flex' or 'cute', got {backend!r}; "

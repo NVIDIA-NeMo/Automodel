@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SM90 CuTe QSA parity against an independent dense FP64 attention oracle."""
+"""SM90 FA4 QSA parity against an independent dense FP64 attention oracle."""
 
 import functools
 
@@ -21,12 +21,12 @@ import torch
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
-from nemo_automodel.components.models.qwen3_8_flash_next.cute_qsa import cute_sparse_gqa_attention
+from nemo_automodel.components.models.qwen3_8_flash_next.fa4_qsa import fa4_sparse_gqa_attention
 from nemo_automodel.components.models.qwen3_8_flash_next.qsa import qsa_gqa_attention
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0),
-    reason="CuTe QSA implements SM90 CUDA kernels",
+    reason="FA4 QSA implements SM90 CUDA kernels",
 )
 
 
@@ -111,7 +111,7 @@ def test_output_and_all_gradients(seed: int, batch: int, sq: int, sk: int, width
     assert torch.count_nonzero(grads[1][unused]) == 0
     assert torch.count_nonzero(grads[2][unused]) == 0
 
-    call = functools.partial(cute_sparse_gqa_attention, softmax_scale=scale)
+    call = functools.partial(fa4_sparse_gqa_attention, softmax_scale=scale)
     checkpointed = checkpoint(call, q, k, v, routes, use_reentrant=False)
     ac_grads = torch.autograd.grad(checkpointed, (q, k, v), dy)
     for actual, expected in zip((checkpointed, *ac_grads), (ref, *ref_grads)):
@@ -128,7 +128,7 @@ def test_full_tiles_and_empty_tiles(empty_tile: bool) -> None:
     if empty_tile:
         routes[:, 128:] = -1
     dy = torch.randn_like(q)
-    out = cute_sparse_gqa_attention(q, k, v, routes)
+    out = fa4_sparse_gqa_attention(q, k, v, routes)
     grads = torch.autograd.grad(out, (q, k, v), dy)
     inputs64 = [x.detach().double().requires_grad_() for x in (q, k, v)]
     ref, _ = _reference(*inputs64, routes, scale=256**-0.5)
@@ -150,8 +150,8 @@ def test_local_query_slices_and_current_stream() -> None:
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
-        first = cute_sparse_gqa_attention(q[:, :129], k, v, routes[:, :129])
-        second = cute_sparse_gqa_attention(q[:, 129:], k, v, routes[:, 129:])
+        first = fa4_sparse_gqa_attention(q[:, :129], k, v, routes[:, :129])
+        second = fa4_sparse_gqa_attention(q[:, 129:], k, v, routes[:, 129:])
         split = torch.cat((first, second), dim=1)
         split_grads = torch.autograd.grad(split, (q, k, v), dy)
     torch.cuda.current_stream().wait_stream(stream)
@@ -171,7 +171,7 @@ def test_deterministic_mode_rejected() -> None:
     try:
         torch.use_deterministic_algorithms(True)
         with pytest.raises(RuntimeError, match="atomic reductions"):
-            cute_sparse_gqa_attention(q, kv, kv, routes)
+            fa4_sparse_gqa_attention(q, kv, kv, routes)
     finally:
         torch.use_deterministic_algorithms(enabled, warn_only=warn_only)
 
@@ -187,7 +187,7 @@ def test_4k_routes_with_sampled_fp64_backward() -> None:
     rows = torch.tensor([0, 31, 63, 127, 128, 1023, 2047, 2050, 2051, 3071, 4095], device="cuda")
     dy = torch.zeros_like(q)
     dy[:, rows] = torch.randn_like(dy[:, rows])
-    out = cute_sparse_gqa_attention(q, k, v, routes)
+    out = fa4_sparse_gqa_attention(q, k, v, routes)
     grads = torch.autograd.grad(out, (q, k, v), dy)
     inputs64 = [
         q[:, rows].detach().double().requires_grad_(),
@@ -240,7 +240,7 @@ def test_model_qsa_layer_parameter_gradients(monkeypatch: pytest.MonkeyPatch) ->
     freqs = torch.cat((torch.ones(1, 33, 32), torch.zeros(1, 33, 32)), dim=-1).cuda()
     actual = layer(x, freqs_cis=freqs)
     with monkeypatch.context() as patch:
-        patch.setattr(qsa, "cute_sparse_gqa_attention", qsa.gathered_qsa_gqa_attention)
+        patch.setattr(qsa, "fa4_sparse_gqa_attention", qsa.gathered_qsa_gqa_attention)
         expected = reference(xr, freqs_cis=freqs)
     dy = torch.randn_like(actual)
     actual.backward(dy)

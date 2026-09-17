@@ -1,6 +1,6 @@
-# CuTe QSA on SM90
+# FA4 QSA on SM90
 
-Select CuTe through the model-owned runtime backend configuration:
+Select FA4 through the existing `cute` setting in the model-owned runtime backend configuration:
 
 ```yaml
 model:
@@ -22,27 +22,31 @@ are unchanged.
 
 ## Implementation
 
-- `cute_qsa.py`: validates the SM90/BF16/D256 contract and lazily loads the
-  optional kernels through `safe_import`. CPU model dispatch keeps the
-  existing numerical oracle without importing CuTe.
-- `_cute_qsa.py`: builds one bit per physical K/V token in each query's
-  route set, supplies a CuTe mask callback, and owns first-order autograd.
-- `_cute_qsa_metadata.py`: classifies 128-query by 64-key tiles as absent,
-  partial or full, then builds forward and reverse block lists on the GPU.
-- FlashAttention's CuTe SM90 implementation supplies attention forward/backward
-  arithmetic. Its sources are an external BSD-3-Clause dependency, not vendored
-  into this branch.
+One model-local file, `fa4_qsa.py`, validates the SM90/BF16/D256 contract,
+lazily loads optional dependencies through `safe_import`, and calls FA4's
+public `flash_attn_func`. FA4 owns attention forward, backward and autograd.
 
-Duplicate route IDs select a token once. Negative and out-of-range IDs are
-ignored before converting int64 IDs to int32. Fully masked query rows and their
-query gradients are zero; unselected K/V rows receive zero gradients.
-Causality, packed documents and physical padding gaps are encoded by the
-indexer's route IDs. Local query slices can reference gathered global K/V.
-No device scalar is read on the host during route preprocessing.
+PyTorch constructs a uint8 membership table and forward/reverse block lists
+for 128-query by 80-key forward tiles and 128-query by 64-key backward
+tiles, matching the pinned FA4 public API defaults. Only these discrete operations are lazily
+compiled with `torch.compile(dynamic=False)`; model layers are
+not compiled. The small CuTe `mask_mod` callback reads membership inside FA4.
+There are no model-owned CuTe preprocessing kernels or custom autograd classes.
 
-The bitmap uses `4 * batch * queries * ceil(keys / 32)` bytes.
-The two model-owned compile caches each retain at most 32 compiled callables,
-without retaining input or output tensors.
+Duplicate IDs select a token once. Invalid IDs write a separate padding column
+and never overwrite a valid token's membership. Empty query rows have zero
+output and query gradients. Routes encode causality, documents, physical
+padding gaps and local-query/global-KV CP coordinates. No additional triangular
+mask or host read of a device scalar is introduced.
+
+The byte table occupies `batch * queries * round_up(keys + 1, 32)` bytes.
+Compile caches retain code, not input/output tensors. PyTorch may execute
+preprocessing eagerly after exhausting its shape-specialization budget; this
+preserves correctness for varying sequence/stride layouts without changing
+process-global compiler settings. Route membership and block
+lists are rebuilt from each call's IDs, including checkpoint recomputation.
+The historical `attn: cute` selector is retained for existing recipes; shared
+BackendConfig and its defaults remain unchanged.
 
 ## Dependencies
 
@@ -71,13 +75,13 @@ compatibility. This QSA forward/backward suite was explicitly tested against
 
 CUDA execution requires SM90, BF16, head dimension 256, positive dimensions,
 matching K/V shapes and an integral positive Q-head/KV-head ratio. Inputs must
-share one device; arbitrary strides are accepted. The route bitmap is limited
-to 48 KiB of shared memory per query and fewer than 2^31 total bitmap words.
+share one device; arbitrary strides are accepted. The padded byte mask must
+contain fewer than 2^31 elements for the FA4 auxiliary-indexing contract.
 
 The backend supports first-order autograd and non-reentrant activation
 checkpointing. Backward uses atomic reductions and is not bitwise deterministic;
 deterministic-algorithm mode is rejected explicitly. Higher-order gradients and
-outer torch.compile/CUDA-graph integration are not advertised by this change.
+outer layer/model torch.compile or CUDA-graph integration are not advertised by this change.
 
 The packed/CP attention contract is tested with disjoint document ranges,
 physical gaps, differing Q/K lengths and local-query gradient composition.
@@ -90,7 +94,7 @@ From the repository root, in a compatible environment:
 
 ```bash
 CUDA_VISIBLE_DEVICES="" python -m pytest tests/unit_tests/models/qwen3_8_flash_next -q
-python -m pytest tests/functional_tests/models/test_qwen3_8_flash_next_cute_qsa.py -q
+python -m pytest tests/functional_tests/models/test_qwen3_8_flash_next_fa4_qsa.py -q
 ```
 
 The H100 suite checks output and all Q/K/V gradients against independent dense
@@ -102,4 +106,4 @@ and actual QSA-layer parameter gradients versus the PyTorch oracle.
 
 The earlier 12.05% EP64 MFU result came from a different experiment checkout
 with additional performance settings and a warm autotune cache. It is not a
-measurement of this isolated branch, which contains only CuTe QSA integration.
+measurement of this isolated branch, which contains only FA4 QSA integration.

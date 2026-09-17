@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CPU coverage of optional CuTe dispatch and tensor validation."""
+"""CPU coverage of optional FA4 dispatch and tensor validation."""
 
 import pytest
 import torch
 
-from nemo_automodel.components.models.qwen3_8_flash_next import cute_qsa
+from nemo_automodel.components.models.qwen3_8_flash_next import fa4_qsa
 from nemo_automodel.components.models.qwen3_8_flash_next.qsa import (
     gathered_qsa_gqa_attention,
     qsa_gqa_attention,
@@ -28,7 +28,7 @@ def test_cpu_cute_dispatch_keeps_oracle(monkeypatch: pytest.MonkeyPatch) -> None
     torch.manual_seed(4)
     inputs = [torch.randn(1, 7, heads, 4, requires_grad=True) for heads in (4, 2, 2)]
     routes = torch.arange(7).view(1, 1, 7).expand(1, 7, 7)
-    monkeypatch.setattr(cute_qsa, "safe_import", lambda *args: pytest.fail("CPU must not load CuTe"))
+    monkeypatch.setattr(fa4_qsa, "safe_import", lambda *args: pytest.fail("CPU must not load FA4"))
     actual = qsa_gqa_attention(*inputs, routes, backend="cute")
     expected = gathered_qsa_gqa_attention(*inputs, routes)
     dy = torch.randn_like(actual)
@@ -39,11 +39,11 @@ def test_cpu_cute_dispatch_keeps_oracle(monkeypatch: pytest.MonkeyPatch) -> None
 
 
 def test_missing_optional_dependency_has_actionable_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    cute_qsa._load_kernels.cache_clear()
-    monkeypatch.setattr(cute_qsa, "safe_import", lambda name: (False, None))
+    fa4_qsa._load_fa4.cache_clear()
+    monkeypatch.setattr(fa4_qsa, "safe_import", lambda name: (False, None))
     with pytest.raises(ImportError, match="FlashAttention.*SM90"):
-        cute_qsa._load_kernels()
-    cute_qsa._load_kernels.cache_clear()
+        fa4_qsa._load_fa4()
+    fa4_qsa._load_fa4.cache_clear()
 
 
 @pytest.mark.parametrize(
@@ -84,4 +84,34 @@ def test_cute_contract_rejects_invalid_inputs(case: str) -> None:
         q = q.float()
         error, match = TypeError, "BF16"
     with pytest.raises(error, match=match):
-        cute_qsa.cute_sparse_gqa_attention(q, k, v, routes)
+        fa4_qsa.fa4_sparse_gqa_attention(q, k, v, routes)
+
+
+def test_byte_membership_preserves_route_set() -> None:
+    routes = torch.tensor(
+        [[[0, 0, -1, 1 << 40, 31, 32, 64], [-1] * 7], [[1, 2, 3, 65, -3, 2, 0], [64] * 7]], dtype=torch.int64
+    )
+    raw = fa4_qsa._preprocess(routes, 65)
+    expected = torch.zeros(2, 2, 65, dtype=torch.uint8)
+    expected[0, 0, [0, 31, 32, 64]] = 1
+    expected[1, 0, [0, 1, 2, 3]] = 1
+    expected[1, 1, 64] = 1
+    torch.testing.assert_close(raw[0], expected, rtol=0, atol=0)
+    assert raw[0].stride(1) % 16 == 0
+    assert all(t.is_contiguous() for t in raw[1:])
+
+
+def test_block_lists_distinguish_full_partial_and_empty() -> None:
+    routes = torch.arange(81).expand(1, 129, 81).clone()
+    routes[:, 128] = -1
+    raw = fa4_qsa._preprocess(routes, 81)
+    mask, pc, pi, fc, fi, rpc, rpi, rfc, rfi = raw
+    assert mask[:, 128].count_nonzero() == 0
+    assert pc.tolist() == [[[1, 0]]]
+    assert fc.tolist() == [[[1, 0]]]
+    assert pi[0, 0, 0, 0] == 1
+    assert fi[0, 0, 0, 0] == 0
+    assert rpc.tolist() == [[[0, 1]]]
+    assert rfc.tolist() == [[[1, 0]]]
+    assert rpi[0, 0, 1, 0] == 0
+    assert rfi[0, 0, 0, 0] == 0
