@@ -93,6 +93,7 @@ P-EAGLE (parallel-drafting EAGLE-3) adds one further optional toggle:
 from __future__ import annotations
 
 import logging
+from typing import Literal
 
 import torch
 import torch.nn as nn
@@ -263,10 +264,13 @@ class Eagle3LlamaAttention(_PeagleAttentionMixin, nn.Module):
         self.rotary_emb = LlamaRotaryEmbedding(config)
         # Set by attach_eagle3_cp_attention when the draft runs under context
         # parallelism: the sequence is sharded across this cp group and the mixed
-        # causal/TTT-diagonal attention runs as a differentiable ring. None otherwise.
+        # causal/TTT-diagonal attention runs distributed. None otherwise.
         self._cp_group = None
+        # CP compute mode: "ring" (default, hand-written causal ring) or "ulysses"
+        # (all-to-all sequence<->head redistribution; composes with sequence packing).
+        self._cp_mode = None
         # When True the cp ring uses the load-balanced zig-zag layout (inputs must
-        # be sharded in zig-zag order); False uses the contiguous ring.
+        # be sharded in zig-zag order); False uses the contiguous ring. Ring only.
         self._cp_zigzag = False
 
     def _project_qkv(self, combined_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -329,7 +333,12 @@ class Eagle3LlamaAttention(_PeagleAttentionMixin, nn.Module):
             cache_v.append(v)
 
         if self._cp_group is not None:
-            attn_output = self._cp_ring_attention_forward(q, cache_k, cache_v, batch_size, seq_len)
+            if self._cp_mode == "ulysses":
+                attn_output = self._cp_ulysses_attention_forward(
+                    q, cache_k, cache_v, batch_size, seq_len, cu_seqlens, max_seqlen
+                )
+            else:
+                attn_output = self._cp_ring_attention_forward(q, cache_k, cache_v, batch_size, seq_len)
         elif self.attn_implementation == "flash_attention_2":
             attn_output = self._flash_attention_forward(
                 q, cache_k, cache_v, step_idx, batch_size, seq_len, cu_seqlens, max_seqlen
@@ -521,31 +530,85 @@ class Eagle3LlamaAttention(_PeagleAttentionMixin, nn.Module):
         lse_fa = lse_flat.transpose(0, 1).reshape(batch_size, seq_len, num_heads).permute(0, 2, 1)
         return attn_output_bhtd, lse_fa
 
+    def _cp_ulysses_attention_forward(
+        self,
+        q: torch.Tensor,
+        cache_k: list[torch.Tensor],
+        cache_v: list[torch.Tensor],
+        batch_size: int,
+        seq_len: int,
+        cu_seqlens: torch.Tensor | None = None,
+        max_seqlen: int | None = None,
+    ) -> torch.Tensor:
+        """Context-parallel EAGLE-3 attention via Ulysses (all-to-all) instead of the ring.
 
-def attach_eagle3_cp_attention(model: nn.Module, cp_group, zigzag: bool = False) -> None:
+        The sequence is sharded across ``self._cp_group``. Block-0 (``Q @ K_0^T``,
+        causal over the full sequence) is all-to-all'd so each rank holds the *full*
+        sequence for a subset of the heads, runs one dense or packed ``varlen``
+        FlashAttention, and is all-to-all'd back; the per-position TTT diagonals
+        (blocks ``i >= 1``) stay shard-local and merge into block-0 via the
+        online-softmax identity. Unlike the ring, ``cu_seqlens`` carries straight
+        through, so it composes with sequence packing (``cu_seqlens`` must then be
+        the GLOBAL, un-sharded document boundaries). See
+        :func:`~nemo_automodel.components.speculative.eagle.ulysses_attention.cached_ulysses_attention`.
+
+        Args:
+            q: This step's query, ``[batch, heads, seq_local, head_dim]`` (the
+                sequence is CP-sharded, so ``seq_local = seq_global / cp``).
+            cache_k: Per-TTT-step keys; ``cache_k[0]`` is the step-0 sequence key and
+                ``cache_k[i>=1]`` the diagonal steps, each already in FlashAttention
+                ``[batch, seq_local, heads, head_dim]`` layout and compute dtype.
+            cache_v: Per-TTT-step values, same layout as ``cache_k``.
+            batch_size: Batch size ``batch``.
+            seq_len: Local sequence length ``seq_local``.
+            cu_seqlens: GLOBAL (un-sharded) packed-document boundaries
+                ``[num_docs + 1]`` (int32), or ``None`` for a single causal stream.
+            max_seqlen: Longest document length for the packed path.
+
+        Returns:
+            Attention output ``[batch, seq_local, heads * head_dim]`` in the draft's
+            compute dtype, ready for ``o_proj``.
+        """
+        from nemo_automodel.components.speculative.eagle.ulysses_attention import cached_ulysses_attention
+
+        dt = self.o_proj.weight.dtype
+        q_fa = q.transpose(1, 2).contiguous().to(dt)  # [B, H, T_local, D] -> [B, T_local, H, D]
+        out = cached_ulysses_attention(q_fa, cache_k, cache_v, self._cp_group, self.scaling, cu_seqlens, max_seqlen)
+        return out.reshape(batch_size, seq_len, -1)
+
+
+def attach_eagle3_cp_attention(
+    model: nn.Module, cp_group, *, mode: Literal["ring", "ulysses"] = "ring", zigzag: bool = False
+) -> None:
     """Route every EAGLE-3 draft attention through the context-parallel ring path.
 
     Sets ``_cp_group`` on each :class:`Eagle3LlamaAttention` so its forward runs the
     differentiable causal-ring + TTT-diagonal attention over the cp-sharded sequence.
-    A no-op ``cp_group`` of size 1 leaves the plain per-rank path in place. With
-    ``zigzag=True`` the load-balanced zig-zag ring is used (the inputs must then be
-    sharded in zig-zag order); otherwise the contiguous ring.
+    A no-op ``cp_group`` of size 1 leaves the plain per-rank path in place.
+    ``mode`` selects the CP compute path: ``"ring"`` (default, hand-written causal
+    ring) or ``"ulysses"`` (all-to-all sequence<->head redistribution, which
+    composes with sequence packing). With ``zigzag=True`` the load-balanced zig-zag
+    ring is used (the inputs must then be sharded in zig-zag order); otherwise the
+    contiguous ring. ``zigzag`` applies to the ring mode only.
 
     Raises if the draft has no :class:`Eagle3LlamaAttention` to route (e.g. the
     DeepSeek MLA draft): the trainer would still shard/shift the sequence and
     renormalize the loss while each rank's attention silently saw only its own
     shard, so context parallelism must be refused rather than run wrong.
     """
+    if mode not in ("ring", "ulysses"):
+        raise ValueError(f"Unknown CP attention mode {mode!r}; expected 'ring' or 'ulysses'.")
     matched = 0
     for module in model.modules():
         if isinstance(module, Eagle3LlamaAttention):
             module._cp_group = cp_group
+            module._cp_mode = mode
             module._cp_zigzag = zigzag
             matched += 1
     if matched == 0:
         raise NotImplementedError(
             "Context parallelism (cp_size>1) for the EAGLE-3 draft is only implemented for the "
-            f"Eagle3LlamaAttention ring path; {type(model).__name__} exposes no such attention "
+            f"Eagle3LlamaAttention path; {type(model).__name__} exposes no such attention "
             "module (e.g. the DeepSeek MLA draft). Set cp_size=1 for this draft architecture."
         )
 
@@ -904,7 +967,16 @@ class LlamaEagle3DraftModel(_PeagleDraftMixin, PreTrainedModel):
             # Packed: structure comes from seq_lens (cu_seqlens for FA2 / block-causal
             # mask for eager), so the right-padding check below does not apply.
             seq_length = input_ids.shape[1]
-            if is_fa2:
+            # Under Ulysses CP the draft's block-0 all-to-alls into the FULL sequence,
+            # so cu_seqlens must span the global packed length (B * T_global), and the
+            # attention runs FlashAttention regardless of ``attn_implementation``.
+            attn0 = self.model.layers[0].self_attn
+            # _cp_mode == "ulysses" is only ever set together with _cp_group (by
+            # attach_eagle3_cp_attention), so it already implies a live cp group.
+            ulysses_cp = getattr(attn0, "_cp_mode", None) == "ulysses"
+            if ulysses_cp:
+                seq_length = seq_length * attn0._cp_group.size()
+            if is_fa2 or ulysses_cp:
                 # FA2 attends document-wise through cu_seqlens and never reads the 4D
                 # additive mask, so skip materializing the [B, 1, T, T] block-causal mask.
                 causal_mask = None

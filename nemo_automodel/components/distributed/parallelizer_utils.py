@@ -25,6 +25,7 @@ from torch.distributed.fsdp import (
     fully_shard,
 )
 
+from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 from nemo_automodel.shared.torch_patches import (
     patch_fsdp_uniform_reduce_dtype as _patch_fsdp_uniform_reduce_dtype,
 )
@@ -261,6 +262,30 @@ def _mp_policy_with_param_dtype(
     return mp_policy_copy
 
 
+def get_internal_fsdp_mp_policy(
+    mp_policy: MixedPrecisionPolicy | None,
+) -> MixedPrecisionPolicy | None:
+    """Clone an FSDP policy without imposing an external output dtype.
+
+    Internal FSDP units are implementation details inside a parent module's
+    forward. Their outputs may feed an unwrapped sibling before another FSDP
+    input cast, so they preserve the wrapped module's natural output dtype.
+
+    Args:
+        mp_policy: Mixed-precision policy inherited from the enclosing FSDP
+            boundary, or ``None`` when mixed precision is disabled.
+
+    Returns:
+        A cloned policy with ``output_dtype=None``, or ``None`` when no policy
+        was provided. Parameter, reduction, and input-cast settings are unchanged.
+    """
+    if mp_policy is None:
+        return None
+    mp_policy_copy = copy(mp_policy)
+    object.__setattr__(mp_policy_copy, "output_dtype", None)
+    return mp_policy_copy
+
+
 def _make_compute_dtype_fn(
     module: nn.Module,
     mp_policy: MixedPrecisionPolicy | None,
@@ -297,6 +322,7 @@ def _make_compute_dtype_fn(
     pinned_ids: Set[int] = set()
     if fp32_compute_module_names:
         for name, tensor in (*module.named_parameters(), *module.named_buffers()):
+            name = canonical_parameter_fqn(name)
             if id(tensor) not in ignored_param_ids and any(token in name for token in fp32_compute_module_names):
                 pinned_ids.add(id(tensor))
 
@@ -345,6 +371,10 @@ def fully_shard_by_dtype(
       * 2 compute dtypes -> shard the minority-dtype subtrees on their own, then shard
         the parent with the majority dtype (keeps the bulk as one FSDP unit).
       * 3+ compute dtypes -> shard every maximal compute-dtype-uniform subtree on its own.
+
+    Dtype-specific child units are internal to the enclosing module's forward, so they
+    preserve their module's natural output dtype. Any enclosing FSDP boundary created
+    by this function retains the caller's ``output_dtype`` as its external contract.
 
     Args:
         fp32_compute_module_names: Parameter/buffer name substrings that must compute in
@@ -443,7 +473,7 @@ def fully_shard_by_dtype(
         for path, key, _ in selected_subtrees:
             subtree_kwargs = {
                 "mesh": mesh,
-                "mp_policy": _mp_policy_with_param_dtype(mp_policy, key[1]),
+                "mp_policy": get_internal_fsdp_mp_policy(_mp_policy_with_param_dtype(mp_policy, key[1])),
                 "offload_policy": offload_policy,
                 "reshard_after_forward": reshard_after_forward,
             }

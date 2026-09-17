@@ -117,7 +117,6 @@ optimizer:
   exp_avg_sq_dtype: torch.float32
 
 freeze_config:
-  freeze_embeddings: true
   freeze_vision_tower: true
   freeze_audio_tower: true
   freeze_language_model: false

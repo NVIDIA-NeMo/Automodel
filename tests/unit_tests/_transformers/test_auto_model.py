@@ -1124,7 +1124,7 @@ class TestModelMappingKeyErrorFallback:
             )
 
         assert is_custom is False
-        assert cls._from_pretrained_parent_class.call_args.kwargs["torch_dtype"] == "auto"
+        assert cls._from_pretrained_parent_class.call_args.kwargs["dtype"] == "auto"
         assert fake_model.linear.weight.dtype == torch.bfloat16
         assert fake_model.norm.weight.dtype == torch.float32
         mock_wrap.assert_called_once_with(FakeModel)
@@ -1295,7 +1295,7 @@ class TestModelMappingKeyErrorFallback:
             )
 
         assert is_custom is False
-        assert cls._from_pretrained_parent_class.call_args.kwargs["torch_dtype"] == torch.bfloat16
+        assert cls._from_pretrained_parent_class.call_args.kwargs["dtype"] == torch.bfloat16
         assert fake_model.lm_head.weight is fake_model.embed_tokens.weight
         assert fake_model.lm_head.weight.dtype == torch.bfloat16
         assert fake_model.embed_tokens.weight.dtype == torch.bfloat16
@@ -1726,6 +1726,43 @@ class TestBuildModelRetryDepth:
             result = _BaseNeMoAutoModelClass._build_model(mock_config, **build_kwargs)
             assert result is sentinel_model
             assert mock_init.call_count == 2
+
+    def test_custom_model_under_ddp_still_needs_its_checkpoint(self):
+        """A MODEL_ARCH_MAPPING model under DDP reaches infrastructure unloaded and off meta.
+
+        ``DDPManager`` is excluded from meta-device init, and custom model constructors
+        only build the architecture, so ``apply_model_infrastructure`` has to be told the
+        weights are still missing. If either flag is wrong the model enters training
+        randomly initialized and nothing is raised.
+        """
+        build_kwargs, mock_config = self._make_build_kwargs()
+        build_kwargs["is_hf_model"] = False
+        dummy_manager_cls = type("DummyManager", (), {})
+        build_kwargs["model_wrapper"] = dummy_manager_cls()
+        sentinel_model = MagicMock()
+        captured = {}
+
+        def capture(**kwargs):
+            captured.update(kwargs)
+            return sentinel_model
+
+        with (
+            patch("nemo_automodel._transformers.auto_model.DDPManager", dummy_manager_cls),
+            patch("nemo_automodel._transformers.auto_model._init_model", return_value=(True, sentinel_model)),
+            patch("nemo_automodel._transformers.auto_model.get_world_size_safe", return_value=1),
+            patch(
+                "nemo_automodel._transformers.capabilities.attach_capabilities_and_validate",
+                return_value=sentinel_model,
+            ),
+            patch("nemo_automodel._transformers.auto_model.apply_model_infrastructure", side_effect=capture),
+            patch("nemo_automodel._transformers.auto_model.get_hf_config", return_value=mock_config),
+            patch("nemo_automodel._transformers.auto_model._maybe_dequantize_fp8_for_peft", return_value=False),
+            patch("torch.cuda.current_device", return_value=0),
+        ):
+            _BaseNeMoAutoModelClass._build_model(mock_config, **build_kwargs)
+
+        assert captured["is_meta_device"] is False
+        assert captured["weights_already_loaded"] is False
 
 
 class TestNeMoAutoModelForMultimodalLM:

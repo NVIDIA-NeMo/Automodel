@@ -27,7 +27,6 @@ from nemo_automodel.components.models.llama.rope_utils import (
     apply_rotary_pos_emb,
     apply_rotary_pos_emb_quack,
 )
-from nemo_automodel.components.models.llama.state_dict_adapter import LlamaStateDictAdapter
 
 set_seed(42)
 
@@ -147,7 +146,7 @@ class TestLlamaModel:
 
     @pytest.mark.parametrize("rope_type", ["default", "llama3"])
     @pytest.mark.parametrize("rms_norm", ["torch_fp32", "te"])
-    def test_model_matches_hf_with_adapter_bidirectional(self, rope_type, rms_norm, tmp_path):
+    def test_model_matches_hf_bidirectional(self, rope_type, rms_norm, tmp_path):
         """Test bidirectional conversion between HF and custom models produces identical outputs.
 
         Parametrized over:
@@ -168,7 +167,6 @@ class TestLlamaModel:
 
         checkpoint = _create_checkpoint(ROPE_CONFIGS[rope_type], tmp_path)
         config = LlamaConfig.from_pretrained(checkpoint)
-        adapter = LlamaStateDictAdapter(config)
 
         # Load HF model
         llama_model_hf = (
@@ -201,13 +199,10 @@ class TestLlamaModel:
 
         # Test forward direction: HF → Custom
         hf_state_dict = llama_model_hf.state_dict()
-        custom_state_dict_from_hf = adapter.from_hf(hf_state_dict)
-        # Use nn.Module.load_state_dict directly to bypass mixin (testing adapter, not mixin)
         # Note: strict=False because HF checkpoints don't have TE's _extra_state keys
-        torch.nn.Module.load_state_dict(llama_model_custom, custom_state_dict_from_hf, strict=False)
+        torch.nn.Module.load_state_dict(llama_model_custom, hf_state_dict, strict=False)
 
-        # Use nn.Module.state_dict directly to get native format (testing adapter, not mixin)
-        s = adapter.to_hf(torch.nn.Module.state_dict(llama_model_custom))
+        s = llama_model_custom.state_dict()
 
         for n1, p1 in hf_state_dict.items():
             p2 = s[n1]
@@ -236,9 +231,7 @@ class TestLlamaModel:
         )
 
         # Test reverse direction: Custom → HF
-        # Use nn.Module.state_dict directly to get native format (testing adapter, not mixin)
-        custom_state_dict = torch.nn.Module.state_dict(llama_model_custom)
-        hf_state_dict_from_custom = adapter.to_hf(custom_state_dict)
+        hf_state_dict_from_custom = llama_model_custom.state_dict()
 
         # Create new HF model and load converted state dict
         llama_model_hf_converted = (
@@ -261,15 +254,14 @@ class TestLlamaModel:
             **tol,
         )
 
-    def test_state_dict_adapter_to_hf(self):
+    def test_model_has_hf_style_projection_keys(self):
         """Test custom model has HF-style separate projection keys."""
-        # Build custom model (which uses adapter internally to load from HF checkpoint)
+        # Build the custom model from an HF checkpoint.
         llama_model_custom = NeMoAutoModelForCausalLM.from_pretrained(
             pretrained_model_name_or_path=self.tiny_llama_checkpoint,
             attn_implementation="eager",
             torch_dtype=torch.bfloat16,
         )
-        # Use nn.Module.state_dict directly to get native format (testing adapter, not mixin)
         custom_state_dict = torch.nn.Module.state_dict(llama_model_custom)
 
         # Separate keys must be present (HF-style passthrough)

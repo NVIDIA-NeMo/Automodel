@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import List, Literal, Tuple
@@ -352,6 +354,13 @@ class _HybridEPMetadataProcessor(nn.Module):
         return routing_map, multihot_probs
 
 
+# DeepEP's hybrid-ep metadata allgather asserts bytes_per_rank % 16 == 0 on a
+# 4-byte-per-token array, so per-rank token counts must be multiples of 4.
+_HYBRIDEP_TOKEN_ALIGNMENT = 4
+# Benchmark A/B switch for the static-routing pad-size pin (default on); see _HybridEPManager.dispatch.
+_STATIC_ROUTING_PAD_PIN = os.environ.get("NEMO_STATIC_ROUTING_PAD_PIN", "1") != "0"
+
+
 class _HybridEPManager(_DispatchManager):
     """
     A manager class to handle fused all-to-all communication processes for MoE models using
@@ -375,6 +384,7 @@ class _HybridEPManager(_DispatchManager):
         router_topk: int,
         permute_fusion: bool = False,
         moe_hybridep_num_sms: int = 24,
+        benchmark_static_routing: bool = False,
     ):
         self.group = group
         self.num_local_experts = num_local_experts
@@ -382,7 +392,14 @@ class _HybridEPManager(_DispatchManager):
         self.router_topk = router_topk
         self.permute_fusion = permute_fusion
         self.moe_hybridep_num_sms = moe_hybridep_num_sms
+        # Benchmark-only (TokenDispatcherConfig.moe_benchmark_static_routing):
+        # persist num_permuted_tokens across dispatches, see dispatch()/reset.
+        self.benchmark_static_routing = benchmark_static_routing
         self.num_permuted_tokens = None
+        # Benchmark-only companion pin: the EP-group padded token count (see dispatch()). Under static
+        # routing every dispatch pads to the same size, so the per-dispatch MAX all-reduce + host sync
+        # that computes it runs once. NEMO_STATIC_ROUTING_PAD_PIN=0 keeps the per-dispatch path (A/B).
+        self._static_target_tokens: int | None = None
 
         # Metadata
         self.token_probs: torch.Tensor | None = None
@@ -390,6 +407,9 @@ class _HybridEPManager(_DispatchManager):
         # Handle used for combine operation
         self.handle = None
         self.pad_multiple = None
+        # Set by dispatch() when this rank padded its tokens up to the EP-group
+        # maximum; combine() slices the padding back off.
+        self.num_unpadded_tokens: int | None = None
 
         if hybrid_ep_dispatch is None:
             raise ImportError(
@@ -440,9 +460,48 @@ class _HybridEPManager(_DispatchManager):
     ) -> torch.Tensor:
         # Reset num_permuted_tokens to None to avoid reusing cached state from a prior dispatch.
         # This can happen in non-reentrant activation checkpointing mode.
-        self.num_permuted_tokens = None
+        # Benchmark-only exception: with static routing every dispatch permutes the same
+        # count, so reusing the first dispatch's value keeps hybrid_ep_dispatch on its
+        # non-blocking path and removes a per-microbatch host wait on a device-side flag.
+        if self.benchmark_static_routing and getattr(self, "_static_num_permuted_tokens", None) is not None:
+            self.num_permuted_tokens = self._static_num_permuted_tokens
+        else:
+            self.num_permuted_tokens = None
         if self.token_probs.dtype != torch.float32:
             self.token_probs = self.token_probs.float()
+
+        # HybridEP's fused all-to-all exchanges fixed-extent buffers, so every rank
+        # in the EP group must dispatch the same number of tokens, and the kernel's
+        # metadata allgather additionally requires that count to be 16-byte aligned
+        # (4 tokens). Unequal or unaligned counts (variable-length or packed dynamic
+        # batches) abort or deadlock the collective. Pad this rank's tokens up to
+        # the aligned group-wide maximum: padded rows route to no expert (all-False
+        # routing map), and combine() slices them back off.
+        self.num_unpadded_tokens = None
+        if torch.distributed.is_initialized() and torch.distributed.get_world_size(self.group) > 1:
+            num_tokens = hidden_states.shape[0]
+            pin = self.benchmark_static_routing and _STATIC_ROUTING_PAD_PIN
+            if pin and self._static_target_tokens is not None and self._static_target_tokens >= num_tokens:
+                target_tokens = self._static_target_tokens
+            else:
+                group_max = torch.tensor(num_tokens, device=hidden_states.device)
+                torch.distributed.all_reduce(group_max, op=torch.distributed.ReduceOp.MAX, group=self.group)
+                target_tokens = -(-int(group_max) // _HYBRIDEP_TOKEN_ALIGNMENT) * _HYBRIDEP_TOKEN_ALIGNMENT
+                if pin:
+                    self._static_target_tokens = target_tokens
+                    if torch.distributed.get_rank() == 0:
+                        logging.getLogger(__name__).info(
+                            "benchmark_static_routing: HybridEP pad size pinned at %d tokens "
+                            "(per-dispatch EP-group max all-reduce + host sync skipped from now on)",
+                            target_tokens,
+                        )
+            pad_tokens = target_tokens - num_tokens
+            if pad_tokens > 0:
+                self.num_unpadded_tokens = num_tokens
+                hidden_states = nn.functional.pad(hidden_states, (0, 0, 0, pad_tokens))
+                self.routing_map = nn.functional.pad(self.routing_map, (0, 0, 0, pad_tokens))
+                self.token_probs = nn.functional.pad(self.token_probs, (0, 0, 0, pad_tokens))
+
         dispatched_hidden, self.dispatched_probs, _, tokens_per_expert, self.handle = hybrid_ep_dispatch(
             x=hidden_states,
             routing_map=self.routing_map,
@@ -457,6 +516,8 @@ class _HybridEPManager(_DispatchManager):
 
         self.tokens_per_expert = tokens_per_expert
         self.num_permuted_tokens = self.tokens_per_expert.sum()
+        if self.benchmark_static_routing and getattr(self, "_static_num_permuted_tokens", None) is None:
+            self._static_num_permuted_tokens = self.num_permuted_tokens
 
         return dispatched_hidden
 
@@ -474,6 +535,9 @@ class _HybridEPManager(_DispatchManager):
         )
         self.handle = None
         self.num_permuted_tokens = None
+        if self.num_unpadded_tokens is not None:
+            hidden_states = hidden_states[: self.num_unpadded_tokens]
+            self.num_unpadded_tokens = None
         return hidden_states
 
     def get_dispatched_metadata(self) -> torch.Tensor:
@@ -532,6 +596,12 @@ class TokenDispatcherConfig:
 
     moe_deepep_async_dispatch: bool = False
     """Use asynchronous DeepEP/UCCL-EP dispatch/combine and communication-stream allocations."""
+
+    moe_benchmark_static_routing: bool = False
+    """Benchmark-only (mirrors BackendConfig.benchmark_static_routing, validated there):
+    routing is forced-balanced with no noise, so every dispatch permutes the same token
+    count. Persist num_permuted_tokens across dispatches to keep HybridEP on its
+    non-blocking size path instead of waiting on a device-side count per microbatch."""
 
 
 class MoEFlexTokenDispatcher:
@@ -634,6 +704,7 @@ class MoEFlexTokenDispatcher:
                         router_topk=self.tp_size * self.config.moe_router_topk,
                         permute_fusion=self.config.moe_permute_fusion,
                         moe_hybridep_num_sms=self.config.moe_hybridep_num_sms,
+                        benchmark_static_routing=self.config.moe_benchmark_static_routing,
                     )
                 self._comm_manager = MoEFlexTokenDispatcher.shared_hybridep_manager
             else:
@@ -644,6 +715,7 @@ class MoEFlexTokenDispatcher:
                     router_topk=self.tp_size * self.config.moe_router_topk,
                     permute_fusion=self.config.moe_permute_fusion,
                     moe_hybridep_num_sms=self.config.moe_hybridep_num_sms,
+                    benchmark_static_routing=self.config.moe_benchmark_static_routing,
                 )
             self.hybridep_metadata_processor = _HybridEPMetadataProcessor(
                 num_experts=self.tp_size * self.config.num_moe_experts,

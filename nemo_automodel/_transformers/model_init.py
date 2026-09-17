@@ -68,9 +68,11 @@ from nemo_automodel.components.models.common.gated_delta_net_fp32 import (
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.utils import (
+    HUB_LOADING_KWARGS,
     BackendConfig,
     initialize_linear_module,
     initialize_rms_norm_module,
+    restore_pretrained_generation_config,
 )
 from nemo_automodel.components.utils.model_utils import resolve_trust_remote_code, skip_random_init
 from nemo_automodel.shared.utils import dtype_from_str
@@ -245,6 +247,16 @@ def _resolve_custom_model_cls_for_config(config):
             from nemo_automodel.components.models.hy_mt2.model import HyMT2ForCausalLM
 
             return HyMT2ForCausalLM
+
+    # This architecture name is shared with the Mistral4 implementation in the
+    # registry, so try the Ministral3-backed VLM implementation first.
+    if arch_name == "Mistral3ForConditionalGeneration":
+        from nemo_automodel.components.models.mistral3_vlm.model import (
+            Mistral3FP8VLMForConditionalGeneration,
+        )
+
+        if Mistral3FP8VLMForConditionalGeneration.supports_config(config):
+            return Mistral3FP8VLMForConditionalGeneration
 
     if not ModelRegistry.has_custom_model(arch_name):
         return None
@@ -768,14 +780,15 @@ def _has_safetensors(model_dir: str) -> bool:
     return False
 
 
-def _stream_load_bnb_weights(model, model_dir, device, torch_dtype):
+def _stream_load_bnb_weights(model, model_dir, device, torch_dtype, *, disable_mmap: bool = False):
     """Load safetensor shards one-at-a-time, quantizing BnB Params4bit on the fly.
 
     Peak memory ≈ (accumulated quantized weights) + (one bf16 weight tensor)
     instead of (full bf16 model) with standard HF loading.
+    When disable_mmap=True, one tensor at a time is cloned to anonymous CPU
+    memory before CUDA transfer to avoid UMA page-migration stalls.
     """
     import bitsandbytes as bnb
-    from safetensors import safe_open
 
     index_path = os.path.join(model_dir, "model.safetensors.index.json")
     if os.path.exists(index_path):
@@ -800,6 +813,50 @@ def _stream_load_bnb_weights(model, model_dir, device, torch_dtype):
     loaded_keys: set[str] = set()
     device = torch.device(device) if not isinstance(device, torch.device) else device
 
+    def consume_tensor(key: str, tensor: torch.Tensor) -> None:
+        """Install one checkpoint tensor into the target model.
+
+        Args:
+            key: Fully-qualified state-dict key. The key determines the tensor's rank and axis semantics.
+            tensor: Tensor from the active safetensors shard. This function takes ownership and may cast,
+                quantize, move, or install it as a parameter/buffer.
+
+        Returns:
+            None.
+        """
+        if key not in param_map:
+            logger.debug("Skipping key not in model: %s", key)
+            del tensor
+            return
+
+        mod, attr, old_param = param_map[key]
+
+        if isinstance(old_param, bnb.nn.Params4bit):
+            if torch_dtype is not None:
+                tensor = tensor.to(dtype=torch_dtype)
+            new_param = bnb.nn.Params4bit(
+                data=tensor,
+                requires_grad=False,
+                compress_statistics=old_param.compress_statistics,
+                quant_type=old_param.quant_type,
+                quant_storage=old_param.quant_storage,
+                module=mod if isinstance(mod, bnb.nn.Linear4bit) else None,
+                bnb_quantized=False,
+            )
+            del tensor
+            new_param._quantize(device)
+            mod._parameters[attr] = new_param
+        else:
+            target_dtype = torch_dtype if torch_dtype is not None else tensor.dtype
+            materialized = tensor.to(device=device, dtype=target_dtype)
+            del tensor
+            if isinstance(old_param, torch.nn.Parameter):
+                mod._parameters[attr] = torch.nn.Parameter(materialized, requires_grad=old_param.requires_grad)
+            else:
+                mod._buffers[attr] = materialized
+
+        loaded_keys.add(key)
+
     for shard_idx, shard_file in enumerate(shard_files):
         shard_path = os.path.join(model_dir, shard_file)
         logger.info(
@@ -809,42 +866,19 @@ def _stream_load_bnb_weights(model, model_dir, device, torch_dtype):
             shard_file,
         )
 
+        from safetensors import safe_open
+
         with safe_open(shard_path, framework="pt") as f:
             for key in f.keys():
                 tensor = f.get_tensor(key)
-
-                if key not in param_map:
-                    logger.debug("Skipping key not in model: %s", key)
+                if disable_mmap and key in param_map:
+                    # Avoid full-shard materialization while detaching the next
+                    # CUDA/quantization copy from mmap-backed checkpoint pages.
+                    tensor = tensor.clone()
+                try:
+                    consume_tensor(key, tensor)
+                finally:
                     del tensor
-                    continue
-
-                mod, attr, old_param = param_map[key]
-
-                if isinstance(old_param, bnb.nn.Params4bit):
-                    if torch_dtype is not None:
-                        tensor = tensor.to(dtype=torch_dtype)
-                    new_param = bnb.nn.Params4bit(
-                        data=tensor,
-                        requires_grad=False,
-                        compress_statistics=old_param.compress_statistics,
-                        quant_type=old_param.quant_type,
-                        quant_storage=old_param.quant_storage,
-                        module=mod if isinstance(mod, bnb.nn.Linear4bit) else None,
-                        bnb_quantized=False,
-                    )
-                    del tensor
-                    new_param._quantize(device)
-                    mod._parameters[attr] = new_param
-                else:
-                    target_dtype = torch_dtype if torch_dtype is not None else tensor.dtype
-                    materialized = tensor.to(device=device, dtype=target_dtype)
-                    del tensor
-                    if isinstance(old_param, torch.nn.Parameter):
-                        mod._parameters[attr] = torch.nn.Parameter(materialized, requires_grad=old_param.requires_grad)
-                    else:
-                        mod._buffers[attr] = materialized
-
-                loaded_keys.add(key)
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -879,6 +913,22 @@ def _stream_load_bnb_weights(model, model_dir, device, torch_dtype):
         len(loaded_keys),
         len(param_map) - len(loaded_keys),
     )
+
+
+def _get_bnb_modules_to_not_convert(model, quantization_config):
+    """Mirror HF BnB's default skip-list semantics before streaming replacement."""
+    from transformers.quantizers.base import get_keys_to_not_convert
+
+    skip_modules = getattr(quantization_config, "llm_int8_skip_modules", None)
+    keep_in_fp32_modules = getattr(model, "_keep_in_fp32_modules", None)
+
+    modules_to_not_convert = get_keys_to_not_convert(model) if skip_modules is None else []
+    if skip_modules is not None:
+        modules_to_not_convert.extend(skip_modules)
+    if keep_in_fp32_modules is not None:
+        modules_to_not_convert.extend(keep_in_fp32_modules)
+
+    return list(set(modules_to_not_convert))
 
 
 def _streaming_bnb_supported(cls, hf_config) -> bool:
@@ -944,6 +994,7 @@ def _init_model_bnb_streaming(
     device = torch.cuda.current_device()
 
     # 1. Download weights if needed
+    disable_mmap = bool(kwargs.pop("disable_mmap", False))
     _download_model_weights(hf_config, pretrained_model_name_or_path)
 
     # 2. Resolve to local directory & verify safetensors
@@ -956,14 +1007,12 @@ def _init_model_bnb_streaming(
     with no_init_weights(), init_empty_weights():
         model = cls._from_config_parent_class(
             hf_config,
-            torch_dtype=torch_dtype,
+            dtype=torch_dtype,
             attn_implementation=attn_implementation,
         )
 
     # 4. Replace nn.Linear → bnb.nn.Linear4bit (still on meta, no memory)
-    modules_to_not_convert = getattr(quantization_config, "llm_int8_skip_modules", None)
-    if modules_to_not_convert is None:
-        modules_to_not_convert = getattr(model, "_keep_in_fp32_modules", None)
+    modules_to_not_convert = _get_bnb_modules_to_not_convert(model, quantization_config)
     model = replace_with_bnb_linear(
         model,
         modules_to_not_convert=modules_to_not_convert,
@@ -971,7 +1020,7 @@ def _init_model_bnb_streaming(
     )
 
     # 5. Stream-load weights, quantizing each tensor on the fly
-    _stream_load_bnb_weights(model, model_dir, device, torch_dtype)
+    _stream_load_bnb_weights(model, model_dir, device, torch_dtype, disable_mmap=disable_mmap)
 
     # 6. Store quantization_config on the model (HF convention)
     model.config.quantization_config = quantization_config
@@ -1137,8 +1186,11 @@ def __init_model(
     # kwargs so it is not also forwarded into the model constructor / HF from_pretrained
     # (custom path passes ``hf_config`` positionally as ``config`` -> would collide;
     # stock-HF path does not accept a dict ``config``).
+    # Its keys are explicit overrides all the same, and nothing downstream can tell
+    # a deliberate value from an unset one once it equals a default, so keep them.
+    dict_config_overrides: set[str] = set()
     if isinstance(kwargs.get("config"), dict):
-        kwargs.pop("config", None)
+        dict_config_overrides = set(kwargs.pop("config"))
     architectures = get_architectures(hf_config)
 
     # Propagate the user-requested dtype to the top-level config and every nested
@@ -1202,7 +1254,7 @@ def __init_model(
                 model = cls._from_pretrained_parent_class(
                     pretrained_model_name_or_path,
                     *model_args,
-                    torch_dtype=torch_dtype,
+                    dtype=torch_dtype,
                     attn_implementation=attn_implementation,
                     **kwargs,
                 )
@@ -1219,7 +1271,7 @@ def __init_model(
             model = cls._from_config_parent_class(
                 hf_config,
                 *model_args,
-                torch_dtype=torch_dtype,
+                dtype=torch_dtype,
                 attn_implementation=attn_implementation,
                 **kwargs,
             )
@@ -1252,10 +1304,16 @@ def __init_model(
                 _download_model_weights(hf_config, pretrained_model_name_or_path, process_group=process_group)
             logger.info(f"Using custom model implementation for {architectures[0]}")
             kwargs.pop("trust_remote_code", None)
+            # Keep the hub loading options before the constructor-argument filter drops
+            # them: the generation-config restore below has to read from the same
+            # subfolder/revision the weights came from.
+            loading_kwargs = {key: kwargs[key] for key in HUB_LOADING_KWARGS if key in kwargs}
             # Treat config-related kwargs as config overrides (HF behavior) and
             # avoid forwarding them into model __init__.
             init_param_names = _get_init_param_names(model_cls)
-            _consume_config_overrides(hf_config, kwargs, init_param_names=init_param_names)
+            config_overrides = dict_config_overrides | _consume_config_overrides(
+                hf_config, kwargs, init_param_names=init_param_names
+            )
             kwargs = _filter_kwargs_for_init(model_cls, kwargs)
             # Coerce plain-dict backend (e.g. from CLI --model.backend.attn sdpa) to BackendConfig
             if "backend" in kwargs and isinstance(kwargs["backend"], dict):
@@ -1267,7 +1325,17 @@ def __init_model(
 
                     kwargs["backend"] = BackendConfig(**kwargs["backend"])
             with local_torch_dtype(torch_dtype, model_cls.__name__):
-                return True, model_cls(hf_config, *model_args, **kwargs)
+                model = model_cls(hf_config, *model_args, **kwargs)
+            if is_pretrained_init:
+                # Custom constructors only see the config. Restore the checkpoint's
+                # generation settings the way PreTrainedModel.from_pretrained does:
+                # generation_config.json carries stop tokens and sampling defaults that
+                # the config lacks, and the consolidated export writes
+                # model.generation_config back out.
+                restore_pretrained_generation_config(
+                    model, pretrained_model_name_or_path, config_overrides=config_overrides, **loading_kwargs
+                )
+            return True, model
 
     # 3. fallback to HF model class wrapped with mixin
     model = None
@@ -1310,7 +1378,7 @@ def __init_model(
             model = cls._from_pretrained_parent_class(
                 pretrained_model_name_or_path,
                 *model_args,
-                torch_dtype=torch_dtype,
+                dtype=torch_dtype,
                 attn_implementation=attn_implementation,
                 **kwargs,
             )
@@ -1327,7 +1395,7 @@ def __init_model(
         model = cls._from_config_parent_class(
             hf_config,
             *model_args,
-            torch_dtype=torch_dtype,
+            dtype=torch_dtype,
             attn_implementation=attn_implementation,
             **kwargs,
         )
@@ -1529,7 +1597,7 @@ def _try_get_remote_code_model_cls(hf_config, pretrained_model_name_or_path, tar
         return None
 
 
-def _consume_config_overrides(config, kwargs: dict, *, init_param_names: set[str] | None = None) -> None:
+def _consume_config_overrides(config, kwargs: dict, *, init_param_names: set[str] | None = None) -> set[str]:
     """
     Mimic HF from_pretrained behavior: treat config-related kwargs as config overrides,
     not model __init__ kwargs.
@@ -1537,7 +1605,13 @@ def _consume_config_overrides(config, kwargs: dict, *, init_param_names: set[str
     For custom model implementations we instantiate via `model_cls(config, **kwargs)`,
     so passing config flags like `output_hidden_states` would crash. This helper moves
     such keys onto the config and removes them from `kwargs`.
+
+    Returns:
+        The config field names the caller explicitly set. A value that equals the
+        field's default is indistinguishable from an unset one afterwards, so
+        consumers that must honor deliberate values need this set.
     """
+    applied: set[str] = set()
     if init_param_names is None:
         init_param_names = set()
     # Prefer `to_dict()` to capture the canonical set of config fields.
@@ -1556,6 +1630,7 @@ def _consume_config_overrides(config, kwargs: dict, *, init_param_names: set[str
             # Deep-merge dict overrides into existing sub-config objects (e.g.
             # text_config={"router_aux_loss_coef": 0}) instead of replacing the
             # entire sub-config, which would lose all other fields.
+            applied.add(k)
             if isinstance(val, dict):
                 existing = getattr(config, k, None)
                 if existing is not None and hasattr(existing, "to_dict"):
@@ -1563,6 +1638,7 @@ def _consume_config_overrides(config, kwargs: dict, *, init_param_names: set[str
                         setattr(existing, sub_k, sub_v)
                     continue
             setattr(config, k, val)
+    return applied
 
 
 def _filter_kwargs_for_init(model_cls, kwargs: dict) -> dict:

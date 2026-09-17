@@ -38,14 +38,23 @@ import logging
 import time
 from contextlib import nullcontext
 
-import mlflow
+from nemo_automodel.shared.import_utils import safe_import
+
+_HAS_MLFLOW, mlflow = safe_import(
+    "mlflow",
+    msg="mlflow is not installed. To enable MLflow experiment tracking, run: uv add nemo-automodel[mlflow]. For the full MLflow stack: uv add nemo-automodel[mlflow-full]",
+)
 import torch
-import wandb
+
+_HAS_WANDB, wandb = safe_import(
+    "wandb", msg="wandb is not installed. To enable W&B experiment tracking, run: uv add nemo-automodel[wandb]"
+)
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.dllm.collate import DLLMCollator
 from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
+from nemo_automodel.components.distributed.tp_replicas import synchronize_tp_replica_gradients
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.components.loggers.mlflow_utils import to_float_metrics
@@ -430,6 +439,9 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
                 num_diffusion_tokens=num_diffusion_tokens,
                 num_ar_tokens=num_ar_tokens if has_causal else None,
                 causal_logits=causal_logits,
+                # Mixed forward kernels (scdd) score the corrupted token itself,
+                # which noise_mask alone cannot recover; absorbing losses ignore it.
+                noisy_input_ids=noisy_input_ids,
             )
             microbatch_loss = loss_result.total_loss
             dllm_loss = loss_result.dllm_loss.detach().clone()
@@ -538,6 +550,7 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
                 logging.warning("FLOPs measurement failed, skipping: %s", e)
                 self._step_flops_per_gpu = None
 
+        synchronize_tp_replica_gradients(self.model_parts, self.device_mesh)
         grad_norm = scale_grads_and_clip_grad_norm(
             max_grad_norm,
             self.model_parts,
@@ -753,9 +766,9 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
                 k: sum(d[k] for d in _win) / len(_win) for k in _win[0] if k not in ("step", "epoch", "timestamp")
             }
             self._remote_log_window = []
-            if wandb.run is not None:
+            if _HAS_WANDB and wandb.run is not None:
                 wandb.log(remote_metrics, step=self.step_scheduler.step)
-            if mlflow.active_run() is not None:
+            if _HAS_MLFLOW and mlflow.active_run() is not None:
                 mlflow.log_metrics(to_float_metrics(remote_metrics), step=log_data.step)
             if self.comet_logger is not None:
                 self.comet_logger.log_metrics(remote_metrics, step=log_data.step)

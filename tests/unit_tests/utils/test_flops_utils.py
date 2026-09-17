@@ -318,6 +318,17 @@ def test_automfu_h100_reference_uses_dense_bf16_peak():
     assert h100_tflops == 989.0
 
 
+@pytest.mark.parametrize(
+    "device_name, expected_tflops",
+    [
+        ("NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition", 438.9),
+        ("NVIDIA RTX PRO 6000 Blackwell Workstation Edition", 503.8),
+    ],
+)
+def test_get_device_flops_distinguishes_rtx_pro_6000_variants(device_name, expected_tflops):
+    assert get_device_flops(unit="T", device_name=device_name) == expected_tflops
+
+
 def test_get_device_flops_detects_current_cuda_device(monkeypatch):
     monkeypatch.setattr(mfu_module.torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(mfu_module.torch.cuda, "current_device", lambda: 3)

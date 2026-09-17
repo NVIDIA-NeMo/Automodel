@@ -113,24 +113,40 @@ computed:
 # resolved YAML's ci.<phase> block but does not apply them to the top-level.
 fixture_keys:
   checkpoint_robustness:
-    - check_hf_reload
-    - check_source_load_parity
+    # Specialized structural and loading controls.
     - check_fused_qkv_keys
     - check_phantom_keys
-    - check_resume
-    - cross_tp_kl_threshold
     - cross_tp_size
-    - cosine_threshold
     - experts_implementation
     - hf_adapter_ignored_key_prefix
     - hf_device_map_auto
     - hf_device_map_cpu_max_memory_gib
     - hf_device_map_max_memory_gib
-    - hf_cosine_threshold
-    - hf_kl_threshold
-    - kl_threshold
+    - hf_reload_timeout_seconds
     - hf_source_post_load_dequantize
-    - no_check_resume
+    # Optional routed-MoE evidence to determine whether parity outliers are
+    # caused by numerically fragile router choices. Currently implemented only
+    # for GLM 4.7 Flash.
+    - capture_router_diagnostics
+    # Optional HF self-comparison across sequence lengths, used to distinguish
+    # shape-sensitive numerics from a cross-framework loading or parity bug. A
+    # shorter cross-framework gate measures its gate length automatically.
+    - shape_diagnostic
+    # Full-logit parity defaults to 2048 tokens from the repository's fixed
+    # long-form document. Named profiles gate mean KL, p95 KL, and cosine.
+    # Max KL, JSD, and absolute-difference metrics are report-only.
+    - parity_sequence_length
+    # Optional prefix of the same long forward used to gate cross-framework
+    # source/HF-reload parity. Full-sequence metrics remain report-only.
+    - cross_framework_gate_sequence_length
+    - parity_tolerance_profile
+    # Optional source_load, automodel_reload, hf_reload, or cross_tp profile
+    # selections. Unspecified comparisons inherit parity_tolerance_profile.
+    - parity_tolerance_profile_overrides
+    # Prefer a profile. This optional mapping overrides only specified gates
+    # for a measured one-model exception in source_load, automodel_reload,
+    # hf_reload, or cross_tp; every other gate remains profile-owned.
+    - parity_threshold_overrides
     - process_isolation
     # Independent normal-finetune versus checkpoint-Phase-1 metric. This is
     # reported separately and never gates checkpoint resume correctness.
@@ -142,11 +158,16 @@ fixture_keys:
     - resume_tolerance_profile
     - resume_first_loss_threshold
     - resume_loss_threshold
+    # Core phases are enabled by default. Use only these semantic skip controls
+    # for a documented model or backend blocker.
+    - skip_resume
+    - skip_source_load_parity
+    - skip_source_load_logit_parity
     - skip_hf_reload
-    - skip_automodel_logit_parity
-    - skip_hf_logit_parity
-    - source_load_cosine_threshold
-    - source_load_kl_threshold
-    - source_load_mean_kl_threshold
+    - skip_automodel_reload_logit_parity
+    - skip_hf_reload_logit_parity
     - tokenizer_name
     - trust_remote_code
+    # Removed positive check aliases and legacy max-KL fields are intentionally
+    # unsupported. Use the default-on phases, semantic skip fields, and named
+    # tolerance profiles above.

@@ -141,9 +141,9 @@ def load_model_and_tokenizer(checkpoint_path: str, sampler_name: str = "llada", 
 
     Args:
         checkpoint_path: Path to the HF-format checkpoint directory.
-        sampler_name: ``"llada"``, ``"llada2"``, ``"nemotron"``, ``"idlm"``, or
-            ``"gemma"``. Adjusts tokenizer setup and model construction kwargs
-            for the chosen family.
+        sampler_name: ``"llada"``, ``"scdd"``, ``"llada2"``, ``"nemotron"``,
+            ``"idlm"``, or ``"gemma"``. Adjusts tokenizer setup and model
+            construction kwargs for the chosen family.
         mask_id_override: Explicit mask token id. Takes precedence over the
             tokenizer/config lookup. Required for I-DLM, whose base Qwen3
             tokenizer has no mask token (training reuses a reserved id).
@@ -199,7 +199,9 @@ def load_model_and_tokenizer(checkpoint_path: str, sampler_name: str = "llada", 
 
         return model.eval(), tokenizer, None, tokenizer.eos_token_id
 
-    if sampler_name == "llada":
+    if sampler_name in ("llada", "scdd"):
+        # SCDD fine-tunes LLaDA-family checkpoints, whose tokenizer ships the
+        # mask token only in the model config.
         if tokenizer.mask_token is None:
             tokenizer.add_special_tokens({"mask_token": "<|mdm_mask|>"})
 

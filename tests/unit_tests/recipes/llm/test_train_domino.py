@@ -68,7 +68,10 @@ def _domino_draft(shift_label=True, pure_prefix=1):
 
 
 def _recipe():
-    return TrainDominoRecipe.__new__(TrainDominoRecipe)
+    recipe = TrainDominoRecipe.__new__(TrainDominoRecipe)
+    # Resolved by setup(), which these focused seam tests bypass.
+    recipe.block_size = BLOCK_SIZE
+    return recipe
 
 
 def test_build_dflash_config_adds_domino_fields():
@@ -76,6 +79,7 @@ def test_build_dflash_config_adds_domino_fields():
     recipe.mask_token_id = MASK_ID
     cfg = {"emb_dim": 128, "gru_hidden_dim": 512, "pure_draft_prefix_len": 2, "shift_label": False}
     out = recipe._build_dflash_config(cfg, TARGET_LAYER_IDS)
+    assert out["block_size"] == BLOCK_SIZE
     assert out["mask_token_id"] == MASK_ID
     assert out["target_layer_ids"] == TARGET_LAYER_IDS
     assert out["projector_type"] == "domino"

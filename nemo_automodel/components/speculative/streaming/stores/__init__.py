@@ -14,12 +14,14 @@
 
 """Pluggable feature-store backends for the streaming data plane.
 
-PR 1 ships one backend -- :class:`LocalFeatureStore` -- as a build-and-test
-target. ``SharedDirFeatureStore`` (PR 3) and ``NcclFeatureStore`` (PR 4) plug in
-behind the same :class:`~nemo_automodel.components.speculative.streaming.store.FeatureStore`
-contract later.
+:class:`LocalFeatureStore` is the in-process reference backend.
+:class:`SharedDirFeatureStore` adds cross-process rendezvous on a shared
+POSIX mount. A future :class:`NcclFeatureStore` can plug in behind the same
+:class:`~nemo_automodel.components.speculative.streaming.store.FeatureStore`
+contract.
 """
 
 from nemo_automodel.components.speculative.streaming.stores.local import LocalFeatureStore
+from nemo_automodel.components.speculative.streaming.stores.shared_dir import SharedDirFeatureStore
 
-__all__ = ["LocalFeatureStore"]
+__all__ = ["LocalFeatureStore", "SharedDirFeatureStore"]
