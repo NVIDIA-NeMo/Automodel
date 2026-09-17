@@ -963,6 +963,9 @@ class GroupedExpertsDeepEP(nn.Module):
         self.dispatcher_capacity_factor = (
             getattr(backend, "dispatcher_capacity_factor", None) if backend is not None else None
         )
+        self.dispatcher_equal_token_counts = (
+            bool(getattr(backend, "dispatcher_equal_token_counts", False)) if backend is not None else False
+        )
 
         # Allocate projection tensor - size depends on whether activation is gated
         # Gated (SwiGLU, Quick-GEGLU): [n_experts, dim, 2*inter_dim]
@@ -997,6 +1000,7 @@ class GroupedExpertsDeepEP(nn.Module):
             moe_share_token_dispatcher=self.dispatcher_share_token_dispatcher,
             moe_deepep_async_dispatch=self.dispatcher_async_dispatch,
             moe_hybridep_capacity_factor=self.dispatcher_capacity_factor,
+            moe_hybridep_equal_token_counts=self.dispatcher_equal_token_counts,
             moe_benchmark_static_routing=self.static_routing,
         )
 
