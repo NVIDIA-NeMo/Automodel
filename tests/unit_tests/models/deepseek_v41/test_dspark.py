@@ -24,8 +24,7 @@ from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41Text
 from nemo_automodel.components.models.deepseek_v41.dspark import DeepseekV41DSparkBackbone, DeepseekV41DSparkModel
 from nemo_automodel.components.models.deepseek_v41.quantization import quantize_cache
 
-# Over the default 5s budget on purpose: this module runs full draft forwards and a backward pass.
-# Shrink the model fixtures and compilation cost before lowering this further.
+# Keep a hard watchdog for draft-model tests; slower cases declare exact runtime budgets below.
 pytestmark = pytest.mark.timeout(60)
 
 
@@ -232,6 +231,11 @@ def test_quantized_checkpoint_load_and_training_resume(tmp_path: Path) -> None:
         checkpointer.close()
 
 
+@pytest.mark.runtime_budget(
+    15,
+    hard_timeout=60,
+    reason="Runs a complete three-stage draft forward/backward, including CPU MoE activation compilation.",
+)
 def test_cache_free_backbone_forward_and_backward() -> None:
     torch.manual_seed(17)
     model = _model()
@@ -256,6 +260,11 @@ def test_cache_free_backbone_forward_and_backward() -> None:
     assert model.mtp[0].ffn.experts.gate_and_up_projs.grad is not None
 
 
+@pytest.mark.runtime_budget(
+    15,
+    hard_timeout=60,
+    reason="Checks confidence-gradient isolation through all three draft stages and compiled MoE activations.",
+)
 @pytest.mark.parametrize("stop_gradient", [False, True])
 def test_confidence_head_stop_gradient_isolates_the_backbone(stop_gradient: bool) -> None:
     """With stop_gradient the confidence loss trains only the head; without it, it reaches the backbone."""

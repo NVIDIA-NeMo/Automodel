@@ -37,8 +37,7 @@ from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41Text
 from nemo_automodel.components.models.deepseek_v41.dspark import DeepseekV41DSparkModel
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
 
-# Over the default 5s budget on purpose: this module spawns two worker processes that import torch.
-# Shrink the model fixture or process count before lowering this further.
+# Keep a hard watchdog for spawned workers; each distributed test declares its runtime budget below.
 pytestmark = pytest.mark.timeout(60)
 
 _WORLD_SIZE = 2
@@ -162,6 +161,11 @@ def _worker(rank: int, port: int, activation_checkpointing: bool, checkpoint_dir
         dist.destroy_process_group()
 
 
+@pytest.mark.runtime_budget(
+    45,
+    hard_timeout=60,
+    reason="Spawns two FSDP workers, compiles draft forward/backward, and saves and restores a sharded checkpoint.",
+)
 @pytest.mark.parametrize("activation_checkpointing", [False, True])
 def test_bf16_dspark_fsdp_forward_backward_checkpoint_roundtrip(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, activation_checkpointing: bool
@@ -239,6 +243,11 @@ def _parity_worker(rank: int, port: int) -> None:
         dist.destroy_process_group()
 
 
+@pytest.mark.runtime_budget(
+    45,
+    hard_timeout=60,
+    reason="Spawns two FSDP workers and compares compiled draft gradients, clipping, and updates with an FP32 reference.",
+)
 def test_fp32_dspark_fsdp_gradient_and_step_parity(monkeypatch: pytest.MonkeyPatch) -> None:
     # Restore the caller's environment after spawning, without changing other tests.
     monkeypatch.setenv("TORCH_COMPILE_DISABLE", "0")
