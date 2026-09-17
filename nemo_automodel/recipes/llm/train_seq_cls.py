@@ -30,6 +30,7 @@ _HAS_WANDB, wandb = safe_import(
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
+from nemo_automodel.components.distributed.tp_replicas import synchronize_tp_replica_gradients
 from nemo_automodel.components.distributed.utils import FirstRankPerNode
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
@@ -233,6 +234,19 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         )
         num_tokens_in_batch = self._dp_allreduce(num_tokens_in_batch).item()
 
+        # Global number of labels over the whole accumulated batch and every DP
+        # rank. Normalizing the backward loss by this -- rather than by a local
+        # per-microbatch mean -- is what makes the gradient invariant to both the
+        # micro-batch split and dp_size. It is the convention train_ft.py uses
+        # with num_label_tokens, and it is what makes the `* dp_size` below
+        # correct: that factor cancels the DP gradient average, which only
+        # reconstructs the global mean when the denominator is already global.
+        num_label_samples = torch.tensor(
+            sum(batch["labels"].numel() for batch in batches),
+            dtype=torch.long,
+        )
+        num_label_samples = max(int(self._dp_allreduce(num_label_samples).item()), 1)
+
         for batch in batches:
             batch = {
                 k: (v.to(self.dist_env.device, non_blocking=True) if v is not None else None) for k, v in batch.items()
@@ -243,15 +257,25 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
                 out = model(**batch)
                 logits = getattr(out, "logits", out)
                 loss = self.loss_fn(logits, labels.view(-1))
-            losses.append(loss.detach().clone())
+            # Keep the summed loss, not the per-microbatch mean: means cannot be
+            # added back together, and the reported metric is normalized by the
+            # same global label count the gradient uses.
+            losses.append((loss * labels.numel()).detach().clone())
 
             # Collect predictions for accuracy calculation
             preds = torch.argmax(logits, dim=-1)
             all_preds.append(preds.detach())
             all_labels.append(labels.view(-1).detach())
-            (loss * self._get_dp_group_size(include_cp=True)).backward()
+            # `loss` is the mean over this micro-batch, so `loss * n_local` is its
+            # summed loss; dividing by the global count gives this micro-batch's
+            # share of the global mean. Every sequence-classification sample
+            # carries exactly one label, so `numel()` is the supervised count and
+            # matches how num_label_samples above was accumulated.
+            local_loss = loss * labels.numel() / num_label_samples
+            (local_loss * self._get_dp_group_size(include_cp=True)).backward()
 
-        # Calculate gradient norm (distributed-aware)
+        # Synchronize unsharded TP replicas, then calculate the distributed-aware gradient norm.
+        synchronize_tp_replica_gradients(self.model_parts, self.device_mesh)
         grad_norm = clip_grad_norm(
             max_grad_norm=self.max_grad_norm,
             model_parts=self.model_parts,
@@ -315,9 +339,13 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
                     reference_mfu=mfu_calculator.reference_mfu,
                 )
 
+        # Global summed loss over every micro-batch and DP rank, divided by the
+        # same global label count as the gradient. Dividing by len(batches)
+        # instead would report a mean of means: inflated by dp_size, and wrong
+        # whenever micro-batches are unevenly sized.
         total_loss = torch.sum(torch.stack(losses))
         total_loss = self._dp_allreduce(total_loss, include_cp=True).detach()
-        loss = total_loss / len(batches)
+        loss = total_loss / num_label_samples
 
         return MetricsSample(
             step=self.step_scheduler.step,

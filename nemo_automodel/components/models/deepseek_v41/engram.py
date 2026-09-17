@@ -162,12 +162,14 @@ class DeepseekV41NgramHash(nn.Module):
         input_ids: torch.Tensor,
         *,
         token_mask: torch.Tensor | None = None,
+        sequence_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Hash unpacked sequences without crossing image or padding boundaries.
+        """Hash sequences without crossing document, image, or padding boundaries.
 
         Args:
             input_ids: Integer tensor of shape [batch, sequence] containing raw
-                tokenizer IDs for complete, unpacked sequences.
+                tokenizer IDs for complete sequences.
+            sequence_ids: Optional integer document IDs [batch, sequence]; zero marks padding.
             token_mask: Optional boolean tensor of shape [batch, sequence].
                 False marks image or padding tokens and blocks all lookback
                 through those positions. The caller also masks their residual gate.
@@ -188,12 +190,17 @@ class DeepseekV41NgramHash(nn.Module):
                 raise ValueError("Engram token_mask must be bool with the same [batch, sequence] shape as input_ids")
             compressed = torch.where(token_mask, compressed, -1)
         positions = torch.arange(sequence, device=input_ids.device).expand(batch, sequence)
+        if sequence_ids is not None and sequence_ids.shape != input_ids.shape:
+            raise ValueError("Engram sequence_ids must have shape [batch, sequence]")
         blocked = torch.zeros_like(positions, dtype=torch.bool)
         tokens = []
         for shift in range(self.max_ngram_size):
             source_positions = positions - shift
             source = compressed.gather(1, source_positions.clamp_min(0))
             blocked = blocked | (source_positions < 0) | (source == -1)
+            if sequence_ids is not None:
+                source_ids = sequence_ids.gather(1, source_positions.clamp_min(0))
+                blocked = blocked | (source_ids != sequence_ids) | (sequence_ids == 0)
             tokens.append(torch.where(blocked, self.pad_id, source))
         products = torch.stack(tokens, dim=-1).unsqueeze(2) * self.multipliers
         rolling, hashes = products[..., 0], []

@@ -22,7 +22,34 @@ def infonce_loss(
     use_in_batch_negatives: bool = True,
     normalize: bool = True,
 ) -> torch.Tensor:
-    """InfoNCE contrastive loss with optional hard negatives."""
+    """InfoNCE contrastive loss with optional hard negatives.
+
+    Args:
+        queries: Tensor of shape [batch, hidden] -- pooled query embeddings.
+        documents: Tensor of shape [batch, hidden] -- pooled embeddings of the
+            positive document for each query, row-aligned with ``queries``.
+        hard_negatives: Optional Tensor of shape [batch, negatives, hidden] --
+            mined negative *documents* for each query. Rows are per-query, so
+            these are candidates for the ``"q2d"`` direction only.
+        hard_negatives_mask: Optional Tensor of shape [batch, negatives] --
+            1 for a real negative, 0 for padding in a ragged batch. Padded
+            columns are scored as ``-inf`` and contribute nothing.
+        temperature: Logit scale divisor; a 0-dim Tensor when it is learned.
+        direction: ``"q2d"``, ``"d2q"``, or ``"symmetric"``.
+        use_in_batch_negatives: Score every query against every document in the
+            batch instead of only its own positive.
+        normalize: L2-normalize the embeddings before scoring.
+
+    Returns:
+        Scalar Tensor: the mean cross-entropy over the batch.
+
+    Raises:
+        ValueError: If the embedding shapes disagree with the layouts above, if
+            ``direction`` is unknown, or if the requested directions have no
+            candidates to score against -- ``use_in_batch_negatives=False``
+            needs ``hard_negatives`` *and* ``direction="q2d"``, because the
+            document-to-query direction can only draw candidates from the batch.
+    """
     if queries.dim() != 2 or documents.dim() != 2:
         raise ValueError(
             f"infonce_loss: queries and documents must be 2-D [B, D]; got queries={tuple(queries.shape)}, "
@@ -51,8 +78,17 @@ def infonce_loss(
                 f"infonce_loss: hard_negatives_mask must be [B, K]; got {tuple(hard_negatives_mask.shape)}"
             )
 
-    if not use_in_batch_negatives and not has_hard_negs:
-        raise ValueError("infonce_loss: no negatives provided")
+    if not use_in_batch_negatives:
+        if not has_hard_negs:
+            raise ValueError("infonce_loss: no negatives provided")
+        if direction != "q2d":
+            raise ValueError(
+                f"infonce_loss: direction={direction!r} scores each document against the other "
+                "queries in the batch, and hard negatives are document-side candidates that "
+                "cannot stand in for them. With use_in_batch_negatives=False that direction has "
+                "no candidates at all and its cross-entropy is identically zero. Set "
+                "use_in_batch_negatives=True or direction='q2d'."
+            )
 
     if normalize:
         q = F.normalize(queries, dim=-1)
@@ -62,6 +98,16 @@ def infonce_loss(
         q, d, n = queries, documents, hard_negatives
 
     def _one_direction(query: torch.Tensor, doc: torch.Tensor, neg: torch.Tensor | None) -> torch.Tensor:
+        """Score one direction with the configured temperature.
+
+        Args:
+            query: Tensor of shape [batch, hidden].
+            doc: Tensor of shape [batch, hidden], row-aligned positives.
+            neg: Optional Tensor of shape [batch, negatives, hidden].
+
+        Returns:
+            Scalar Tensor: mean cross-entropy over the batch.
+        """
         if use_in_batch_negatives:
             logits = query @ doc.T
             target = torch.arange(batch, device=device)
@@ -70,6 +116,7 @@ def infonce_loss(
             logits = pos
             target = torch.zeros(batch, device=device, dtype=torch.long)
 
+        # Scale before inserting -inf padding to keep learnable temperature gradients finite.
         logits = logits / temperature
         if neg is not None:
             sim_qn = torch.einsum("bd,bkd->bk", query, neg) / temperature
@@ -101,7 +148,46 @@ def infonce_distill_loss(
     normalize: bool = True,
     divergence: str = "kl",
 ) -> torch.Tensor:
-    """Soft listwise distillation on InfoNCE candidate sets."""
+    """Soft listwise distillation on InfoNCE candidate sets.
+
+    Builds the same candidate sets as :func:`infonce_loss` for the student and
+    the (detached) teacher, then matches the student's distribution over those
+    candidates to the teacher's.
+
+    Args:
+        student_queries: Tensor of shape [batch, student_hidden].
+        student_documents: Tensor of shape [batch, student_hidden], row-aligned
+            with ``student_queries``.
+        teacher_queries: Tensor of shape [batch, teacher_hidden]. Detached.
+        teacher_documents: Tensor of shape [batch, teacher_hidden], row-aligned
+            with ``teacher_queries``. Detached.
+        student_hard_negatives: Optional Tensor of shape
+            [batch, negatives, student_hidden] -- mined negative *documents*,
+            per query, so they are candidates for ``"q2d"`` only.
+        teacher_hard_negatives: Optional Tensor of shape
+            [batch, negatives, teacher_hidden], aligned with
+            ``student_hard_negatives``. Required when it is given. Detached.
+        hard_negatives_mask: Optional Tensor of shape [batch, negatives] -- 1
+            for a real negative, 0 for padding. Padded columns are scored as
+            ``-inf`` and masked out of the divergence.
+        temperature: Logit scale divisor; a 0-dim Tensor when it is learned.
+        direction: ``"q2d"``, ``"d2q"``, or ``"symmetric"``.
+        use_in_batch_negatives: Score every query against every document in the
+            batch instead of only its own positive.
+        normalize: L2-normalize the embeddings before scoring.
+        divergence: ``"kl"``, ``"ce"``, or ``"mse"``.
+
+    Returns:
+        Scalar Tensor: the mean divergence over the batch.
+
+    Raises:
+        ValueError: If the embedding shapes disagree with the layouts above, if
+            ``direction`` or ``divergence`` is unknown, or if the requested
+            directions have no candidates to score against --
+            ``use_in_batch_negatives=False`` needs hard negatives *and*
+            ``direction="q2d"``, because the document-to-query direction can
+            only draw candidates from the batch.
+    """
     if student_queries.dim() != 2 or student_documents.dim() != 2:
         raise ValueError(
             f"infonce_distill_loss: student embeddings must be 2-D [B, D_s]; got queries={tuple(student_queries.shape)}, "
@@ -141,8 +227,18 @@ def infonce_distill_loss(
         if hard_negatives_mask is not None and hard_negatives_mask.shape != (batch, student_hard_negatives.shape[1]):
             raise ValueError("infonce_distill_loss: hard_negatives_mask must be [B, K]")
 
-    if not use_in_batch_negatives and not has_hard_negs:
-        raise ValueError("infonce_distill_loss: no negatives available")
+    if not use_in_batch_negatives:
+        if not has_hard_negs:
+            raise ValueError("infonce_distill_loss: no negatives available")
+        if direction != "q2d":
+            raise ValueError(
+                f"infonce_distill_loss: direction={direction!r} scores each document against the "
+                "other queries in the batch, and hard negatives are document-side candidates that "
+                "cannot stand in for them. With use_in_batch_negatives=False that direction leaves "
+                "a single candidate, so student and teacher distributions are both degenerate and "
+                "the divergence is identically zero. Set use_in_batch_negatives=True or "
+                "direction='q2d'."
+            )
 
     s_q = student_queries.float()
     s_d = student_documents.float()
@@ -163,14 +259,28 @@ def infonce_distill_loss(
     def _build_logits(
         query: torch.Tensor, doc: torch.Tensor, neg: torch.Tensor | None
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build scaled logits and the mask of real candidates.
+
+        Args:
+            query: Tensor of shape [batch, hidden], for student or teacher.
+            doc: Tensor of shape [batch, hidden], row-aligned positives.
+            neg: Optional Tensor of shape [batch, negatives, hidden].
+
+        Returns:
+            Tuple of logits and boolean validity mask, each of shape [batch,
+            candidates], with batch-wide or single-positive columns followed
+            by any hard-negative columns.
+        """
         if use_in_batch_negatives:
             logits = query @ doc.T
         else:
             logits = (query * doc).sum(dim=-1, keepdim=True)
+        # The student temperature can be learned; never divide masked -inf by it.
+        logits = logits / temperature
         # In-batch / positive columns are always real candidates.
         valid = torch.ones_like(logits, dtype=torch.bool)
         if neg is not None:
-            sim_qn = torch.einsum("bd,bkd->bk", query, neg)
+            sim_qn = torch.einsum("bd,bkd->bk", query, neg) / temperature
             neg_valid = torch.ones_like(sim_qn, dtype=torch.bool)
             if hard_negatives_mask is not None:
                 pad = hard_negatives_mask.to(sim_qn.dtype) == 0
@@ -188,11 +298,22 @@ def infonce_distill_loss(
         t_doc: torch.Tensor,
         t_neg: torch.Tensor | None,
     ) -> torch.Tensor:
+        """Match student and detached teacher distributions for one direction.
+
+        Args:
+            s_query: Tensor of shape [batch, student_hidden].
+            s_doc: Tensor of shape [batch, student_hidden].
+            s_neg: Optional Tensor of shape [batch, negatives, student_hidden].
+            t_query: Tensor of shape [batch, teacher_hidden].
+            t_doc: Tensor of shape [batch, teacher_hidden].
+            t_neg: Optional Tensor of shape [batch, negatives, teacher_hidden].
+
+        Returns:
+            Scalar Tensor: mean divergence over the batch.
+        """
         s_logits, valid = _build_logits(s_query, s_doc, s_neg)
-        s_logits = s_logits / temperature
         with torch.no_grad():
             t_logits, _ = _build_logits(t_query, t_doc, t_neg)
-            t_logits = t_logits / temperature
 
         if divergence == "mse":
             p_s = F.softmax(s_logits, dim=-1)

@@ -91,6 +91,43 @@ def test_infonce_loss_no_in_batch_with_hard_negatives():
     assert torch.isfinite(loss)
 
 
+@pytest.mark.parametrize("direction", ["d2q", "symmetric"])
+def test_infonce_loss_no_in_batch_rejects_document_side_direction(direction):
+    """``d2q`` can only draw candidates from the batch, so dropping them is not a valid config."""
+    torch.manual_seed(0)
+    q = torch.randn(4, 8)
+    d = torch.randn(4, 8)
+    n = torch.randn(4, 3, 8)
+
+    with pytest.raises(ValueError, match="no candidates at all"):
+        infonce_loss(q, d, hard_negatives=n, direction=direction, use_in_batch_negatives=False)
+
+
+@pytest.mark.parametrize(
+    "direction, use_in_batch_negatives",
+    [("q2d", True), ("q2d", False), ("d2q", True), ("symmetric", True)],
+)
+def test_infonce_loss_accepted_configs_score_real_candidates(direction, use_in_batch_negatives):
+    """Every accepted config must score >1 candidate: a 1-class CE is 0 with no gradient."""
+    torch.manual_seed(0)
+    q = torch.randn(4, 8, requires_grad=True)
+    d = torch.randn(4, 8, requires_grad=True)
+    n = torch.randn(4, 3, 8, requires_grad=True)
+
+    loss = infonce_loss(
+        q,
+        d,
+        hard_negatives=n,
+        direction=direction,
+        use_in_batch_negatives=use_in_batch_negatives,
+    )
+    loss.backward()
+
+    assert loss.item() > 0.0
+    assert q.grad.abs().sum().item() > 0.0
+    assert d.grad.abs().sum().item() > 0.0
+
+
 def test_infonce_loss_without_normalize():
     torch.manual_seed(0)
     q = torch.randn(4, 8)
@@ -398,6 +435,49 @@ def test_distill_loss_no_negatives_error():
         infonce_distill_loss(s_q, s_d, t_q, t_d, use_in_batch_negatives=False)
 
 
+@pytest.mark.parametrize("direction", ["d2q", "symmetric"])
+def test_distill_loss_no_in_batch_rejects_document_side_direction(direction):
+    """The document-to-query candidate set is the batch; without it the divergence is 0."""
+    s_q, s_d, t_q, t_d, s_n, t_n = _distill_inputs()
+
+    with pytest.raises(ValueError, match="a single candidate"):
+        infonce_distill_loss(
+            s_q,
+            s_d,
+            t_q,
+            t_d,
+            student_hard_negatives=s_n,
+            teacher_hard_negatives=t_n,
+            direction=direction,
+            use_in_batch_negatives=False,
+        )
+
+
+@pytest.mark.parametrize(
+    "direction, use_in_batch_negatives",
+    [("q2d", True), ("q2d", False), ("d2q", True), ("symmetric", True)],
+)
+def test_distill_loss_accepted_configs_score_real_candidates(direction, use_in_batch_negatives):
+    """A degenerate 1-candidate set makes both distributions one-hot and the divergence 0."""
+    s_q, s_d, t_q, t_d, s_n, t_n = _distill_inputs(requires_grad=True)
+
+    loss = infonce_distill_loss(
+        s_q,
+        s_d,
+        t_q,
+        t_d,
+        student_hard_negatives=s_n,
+        teacher_hard_negatives=t_n,
+        direction=direction,
+        use_in_batch_negatives=use_in_batch_negatives,
+    )
+    loss.backward()
+
+    assert loss.item() > 0.0
+    assert s_q.grad.abs().sum().item() > 0.0
+    assert s_d.grad.abs().sum().item() > 0.0
+
+
 # ---------------------------------------------------------------------------
 # InfoNCELoss module
 # ---------------------------------------------------------------------------
@@ -410,6 +490,18 @@ def test_infonce_module_forward():
     loss = loss_fn(q, d)
 
     assert torch.isfinite(loss)
+
+
+def test_infonce_module_surfaces_document_side_direction_conflict():
+    """The recipe builds this module straight from YAML, so the config path must fail loudly."""
+    torch.manual_seed(0)
+    loss_fn = InfoNCELoss(direction="symmetric", use_in_batch_negatives=False)
+    q = torch.randn(4, 8)
+    d = torch.randn(4, 8)
+    n = torch.randn(4, 3, 8)
+
+    with pytest.raises(ValueError, match="no candidates at all"):
+        loss_fn(q, d, hard_negatives=n)
 
 
 def test_infonce_module_rejects_nonpositive_temperature():
@@ -431,8 +523,7 @@ def test_infonce_module_learnable_temperature():
     assert torch.allclose(loss_fn.current_temperature(), torch.tensor(0.05), atol=ATOL)
 
 
-@pytest.mark.parametrize("direction", ["q2d", "symmetric"])
-@pytest.mark.parametrize("in_batch", [False, True])
+@pytest.mark.parametrize("direction, in_batch", [("q2d", False), ("q2d", True), ("symmetric", True)])
 @pytest.mark.parametrize("mask_kind", ["all_valid", "ragged", "all_padding"])
 def test_infonce_learnable_temperature_with_masked_negatives(direction, in_batch, mask_kind):
     torch.manual_seed(42)
@@ -472,6 +563,7 @@ def test_infonce_learnable_temperature_with_masked_negatives(direction, in_batch
     actual.backward()
 
     torch.testing.assert_close(actual, expected)
+    assert torch.isfinite(loss_fn.log_inv_tau.grad)
     torch.testing.assert_close(loss_fn.log_inv_tau.grad, log_inv_tau.grad)
     for actual_input, reference_input in zip(inputs, reference_inputs):
         torch.testing.assert_close(actual_input.grad, reference_input.grad)
@@ -480,6 +572,82 @@ def test_infonce_learnable_temperature_with_masked_negatives(direction, in_batch
 # ---------------------------------------------------------------------------
 # InfoNCEDistillLoss module
 # ---------------------------------------------------------------------------
+@pytest.mark.parametrize("divergence", ["kl", "ce", "mse"])
+@pytest.mark.parametrize("direction, in_batch", [("q2d", False), ("q2d", True), ("symmetric", True)])
+@pytest.mark.parametrize("mask_kind", ["all_valid", "ragged", "all_padding"])
+def test_distill_learnable_temperature_with_masked_negatives(divergence, direction, in_batch, mask_kind):
+    s_q, s_d, t_q, t_d, s_n, t_n = _distill_inputs(seed=42, batch=3, k=2, requires_grad=True)
+    temperature = torch.tensor(0.2, requires_grad=True)
+    mask = torch.tensor([[1, 0], [0, 0], [1, 1]], dtype=torch.bool)
+    if mask_kind == "all_valid":
+        mask.fill_(True)
+    elif mask_kind == "all_padding":
+        mask.fill_(False)
+
+    reference_inputs = [x.detach().clone().requires_grad_() for x in (s_q, s_d, s_n)]
+    reference_temperature = temperature.detach().clone().requires_grad_()
+    sq, sd, sn = [torch.nn.functional.normalize(x, dim=-1) for x in reference_inputs]
+    tq, td, tn = [torch.nn.functional.normalize(x, dim=-1) for x in (t_q, t_d, t_n)]
+
+    def reference_side(s_query, s_docs, t_query, t_docs, include_negatives):
+        """Compare distributions after physically removing padded candidates.
+
+        Args:
+            s_query: Tensor of shape [batch, student_hidden].
+            s_docs: Tensor of shape [batch, student_hidden].
+            t_query: Tensor of shape [batch, teacher_hidden].
+            t_docs: Tensor of shape [batch, teacher_hidden].
+            include_negatives: Whether to include per-query document negatives.
+
+        Returns:
+            Scalar Tensor: mean divergence over the batch.
+        """
+        losses = []
+        for i in range(len(s_query)):
+            s_candidates = s_docs if in_batch else s_docs[i : i + 1]
+            t_candidates = t_docs if in_batch else t_docs[i : i + 1]
+            if include_negatives:
+                s_candidates = torch.cat([s_candidates, sn[i, mask[i]]])
+                t_candidates = torch.cat([t_candidates, tn[i, mask[i]]])
+            log_s = torch.log_softmax((s_candidates @ s_query[i]) / reference_temperature, dim=0)
+            with torch.no_grad():
+                log_t = torch.log_softmax((t_candidates @ t_query[i]) / reference_temperature, dim=0)
+            if divergence == "kl":
+                value = torch.nn.functional.kl_div(log_s, log_t, log_target=True, reduction="sum")
+            elif divergence == "ce":
+                value = -(log_t.exp() * log_s).sum()
+            else:
+                value = torch.nn.functional.mse_loss(log_s.exp(), log_t.exp(), reduction="sum")
+            losses.append(value)
+        return torch.stack(losses).mean()
+
+    expected = reference_side(sq, sd, tq, td, True)
+    if direction == "symmetric":
+        expected = (expected + reference_side(sd, sq, td, tq, False)) / 2
+    expected.backward()
+    actual = infonce_distill_loss(
+        s_q,
+        s_d,
+        t_q,
+        t_d,
+        s_n,
+        t_n,
+        hard_negatives_mask=mask,
+        temperature=temperature,
+        direction=direction,
+        use_in_batch_negatives=in_batch,
+        divergence=divergence,
+    )
+    actual.backward()
+
+    assert torch.isfinite(actual)
+    assert torch.isfinite(temperature.grad)
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(temperature.grad, reference_temperature.grad)
+    for actual_input, reference_input in zip((s_q, s_d, s_n), reference_inputs):
+        torch.testing.assert_close(actual_input.grad, reference_input.grad)
+
+
 def test_infonce_distill_module_forward():
     s_q, s_d, t_q, t_d, s_n, t_n = _distill_inputs()
     loss_fn = InfoNCEDistillLoss(divergence="kl")
