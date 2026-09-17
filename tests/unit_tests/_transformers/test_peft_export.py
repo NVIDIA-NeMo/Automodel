@@ -19,7 +19,7 @@ import pytest
 import torch
 from safetensors.torch import load_file, save_file
 from torch import nn
-from transformers import PretrainedConfig
+from transformers import AutoModelForCausalLM, LlamaConfig, LlamaForCausalLM, PretrainedConfig
 
 from nemo_automodel import export_merged_peft_checkpoint
 from nemo_automodel._transformers.peft_export import _merge_and_get_hf_state_dict
@@ -233,3 +233,57 @@ def test_merge_rejects_mixed_supported_and_unsupported_lora_before_mutating_weig
 
     for key, tensor in model.state_dict().items():
         torch.testing.assert_close(tensor, original_state[key], rtol=0, atol=0)
+
+
+def test_export_dequantized_weights_reload_without_stale_fp8_metadata(tmp_path):
+    """A dequantized LoRA export reloads as ordinary BF16 with every weight intact."""
+    torch.manual_seed(1234)
+    config = LlamaConfig(
+        vocab_size=32,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+    )
+    model = LlamaForCausalLM(config).to(torch.bfloat16)
+    projection = LinearLoRA(
+        model.model.layers[0].self_attn.q_proj,
+        dim=2,
+        alpha=4,
+        use_memory_efficient_lora=False,
+    ).to(torch.bfloat16)
+    model.model.layers[0].self_attn.q_proj = projection
+    with torch.no_grad():
+        projection.lora_A.weight.normal_()
+        projection.lora_B.weight.normal_()
+    # Custom models retain this source-checkpoint metadata after dequantization.
+    config.quantization_config = {"quant_method": "fp8", "weight_block_size": [128, 128]}
+    model.generation_config.max_new_tokens = 7
+    expected = {key: value.detach().clone() for key, value in model.state_dict().items() if "lora_" not in key}
+    expected["model.layers.0.self_attn.q_proj.weight"] = projection.materialize_effective_weight().detach().clone()
+    adapter_dir = tmp_path / "adapter"
+    adapter_dir.mkdir()
+    save_file(ModelState(model, is_peft=True).state_dict(), adapter_dir / "adapter_model.safetensors")
+    (adapter_dir / "automodel_peft_config.json").write_text("{}", encoding="utf-8")
+    with torch.no_grad():
+        projection.lora_A.weight.zero_()
+        projection.lora_B.weight.zero_()
+
+    output_dir = export_merged_peft_checkpoint(
+        model, adapter_path=adapter_dir, output_dir=tmp_path / "merged", max_shard_size=300
+    )
+
+    exported_config = json.loads((output_dir / "config.json").read_text(encoding="utf-8"))
+    assert "quantization_config" not in exported_config
+    reloaded, loading_info = AutoModelForCausalLM.from_pretrained(
+        output_dir, dtype=torch.bfloat16, local_files_only=True, output_loading_info=True
+    )
+    assert not loading_info["missing_keys"]
+    assert not loading_info["unexpected_keys"]
+    assert reloaded.generation_config.max_new_tokens == 7
+    assert isinstance(reloaded.model.layers[0].self_attn.q_proj, nn.Linear)
+    assert reloaded.state_dict().keys() == expected.keys()
+    for key, tensor in reloaded.state_dict().items():
+        assert tensor.dtype == torch.bfloat16
+        torch.testing.assert_close(tensor, expected[key], rtol=0, atol=0)

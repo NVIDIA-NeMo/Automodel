@@ -15,6 +15,7 @@
 """Serve-ready Hugging Face export for native AutoModel PEFT checkpoints."""
 
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import torch
 from huggingface_hub import save_torch_state_dict
@@ -23,7 +24,9 @@ from torch.distributed.tensor import DTensor
 
 from nemo_automodel.components._peft.lora import LinearLoRA
 from nemo_automodel.components._peft.lora_experts import GroupedExpertsLoRA
+from nemo_automodel.components.checkpoint.addons import ConsolidatedHFAddon
 from nemo_automodel.components.checkpoint.config import CheckpointingConfig
+from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState
 
 
 def _is_lora_state_key(key: str) -> bool:
@@ -157,10 +160,17 @@ def export_merged_peft_checkpoint(
     destination = Path(output_dir)
     destination.mkdir(parents=True, exist_ok=True)
 
-    config.save_pretrained(destination)
-    generation_config = getattr(model, "generation_config", None)
-    if generation_config is not None and callable(getattr(generation_config, "save_pretrained", None)):
-        generation_config.save_pretrained(destination)
+    # Use the checkpoint metadata path so dequantized weights do not retain
+    # stale quantization settings. Only public HF assets reach the output.
+    metadata = ConsolidatedHFAddon()
+    with TemporaryDirectory() as metadata_dir:
+        metadata.pre_save(
+            model_state=ModelState(model),
+            hf_metadata_dir=metadata_dir,
+            fqn_to_file_index_mapping={},
+            original_model_path=None,
+        )
+        metadata.post_save(consolidated_path=str(destination), hf_metadata_path=metadata_dir)
 
     save_torch_state_dict(
         state_dict,
