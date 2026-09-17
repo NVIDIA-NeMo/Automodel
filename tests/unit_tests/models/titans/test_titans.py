@@ -471,6 +471,13 @@ def test_blackwell_submitter_resolves_portable_topology():
     assert "--step_scheduler.max_steps_per_run='$MAX_STEPS_PER_RUN'" in full_runner
     assert "TARGET_SEGMENT_SECONDS=${TITANS_TARGET_SEGMENT_SECONDS:-13200}" in full_runner
     assert "NEXT_SEGMENT_STEPS" in full_runner
+    assert "DEFAULT_LOCAL_BATCH_SIZE=16" in full_runner
+    assert "--step_scheduler.local_batch_size='$LOCAL_BATCH_SIZE'" in full_runner
+    assert "--distributed.activation_checkpointing='$ACTIVATION_CHECKPOINTING'" in full_runner
+    assert "TITANS_ACTIVATION_CHECKPOINTING:-false" in full_runner
+    assert "--step_scheduler.local_batch_size='$LOCAL_BATCH_SIZE'" in runner
+    assert "--step_scheduler.max_steps='$PILOT_STEPS'" in runner
+    assert "TITANS_PILOT_STEPS=%q" in submitter
     assert "--wandb.project=titans-paper-reproduction" in full_runner
     assert "--validation-dir '$STAGING_ROOT/validation'" in data_runner
     assert "--num-workers 32" in data_runner

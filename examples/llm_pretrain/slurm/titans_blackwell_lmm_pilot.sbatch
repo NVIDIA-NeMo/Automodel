@@ -12,11 +12,32 @@ TITANS_SCALE=${TITANS_SCALE:?set TITANS_SCALE}
 TITANS_EXPERIMENT=${TITANS_EXPERIMENT:-baseline}
 TITANS_GPUS_PER_NODE=${TITANS_GPUS_PER_NODE:?set TITANS_GPUS_PER_NODE}
 TITANS_IMAGE=${TITANS_IMAGE:-nvcr.io#nvidia/nemo-automodel:26.04}
+PILOT_STEPS=${TITANS_PILOT_STEPS:-10}
+WORLD_SIZE=$((SLURM_NNODES * TITANS_GPUS_PER_NODE))
+if (( 128 % WORLD_SIZE != 0 )); then
+  echo "global batch 128 must be divisible by world size $WORLD_SIZE" >&2
+  exit 2
+fi
+MAX_LOCAL_BATCH_SIZE=$((128 / WORLD_SIZE))
 
 case "$TITANS_SCALE" in
   170m|340m|760m) ;;
   *) echo "unsupported Titans scale: $TITANS_SCALE" >&2; exit 2 ;;
 esac
+case "$TITANS_SCALE" in
+  170m) DEFAULT_LOCAL_BATCH_SIZE=16 ;;
+  340m) DEFAULT_LOCAL_BATCH_SIZE=8 ;;
+  760m) DEFAULT_LOCAL_BATCH_SIZE=4 ;;
+esac
+(( DEFAULT_LOCAL_BATCH_SIZE > MAX_LOCAL_BATCH_SIZE )) && \
+  DEFAULT_LOCAL_BATCH_SIZE=$MAX_LOCAL_BATCH_SIZE
+LOCAL_BATCH_SIZE=${TITANS_LOCAL_BATCH_SIZE:-$DEFAULT_LOCAL_BATCH_SIZE}
+ACTIVATION_CHECKPOINTING=${TITANS_ACTIVATION_CHECKPOINTING:-false}
+if (( LOCAL_BATCH_SIZE < 1 || 128 % (WORLD_SIZE * LOCAL_BATCH_SIZE) != 0 )); then
+  echo "local batch $LOCAL_BATCH_SIZE does not divide global batch 128 across $WORLD_SIZE ranks" >&2
+  exit 2
+fi
+echo "Blackwell tuning: world_size=$WORLD_SIZE local_batch_size=$LOCAL_BATCH_SIZE activation_checkpointing=$ACTIVATION_CHECKPOINTING"
 if [[ $TITANS_SCALE != 170m && $TITANS_EXPERIMENT != baseline ]]; then
   echo "component ablations are currently defined only for the 170M scale" >&2
   exit 2
@@ -126,11 +147,13 @@ srun \
       '$RECIPE' \
       --dataset.file_pattern='$TRAIN_DATA' \
       --validation_dataset.file_pattern='$VALIDATION_ROOT/validation/*.bin' \
-      --step_scheduler.max_steps=10 \
-      --step_scheduler.ckpt_every_steps=10 \
-      --step_scheduler.val_every_steps=10 \
+      --step_scheduler.max_steps='$PILOT_STEPS' \
+      --step_scheduler.local_batch_size='$LOCAL_BATCH_SIZE' \
+      --step_scheduler.ckpt_every_steps='$PILOT_STEPS' \
+      --step_scheduler.val_every_steps='$PILOT_STEPS' \
       --step_scheduler.log_remote_every_steps=1 \
       --lr_scheduler.lr_warmup_steps=1 \
+      --distributed.activation_checkpointing='$ACTIVATION_CHECKPOINTING' \
       --checkpoint.checkpoint_dir='$CHECKPOINT_ROOT' \
       --wandb.enable=true \
       --wandb.entity=nvidia \

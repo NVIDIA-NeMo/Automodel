@@ -215,6 +215,10 @@ tools/submit_titans_blackwell.sh 340m baseline --pilot --total-gpus 8
 tools/submit_titans_blackwell.sh 760m baseline --pilot --total-gpus 16
 ```
 
+For a throughput comparison rather than a ten-step gate, set
+`TITANS_PILOT_STEPS=100`; the effective local batch and checkpointing mode are
+logged at startup.
+
 The submitter asks `slurm-cli` to rank configured Blackwell clusters and their
 authorized accounts. Eight total GPUs resolve to one node on
 `nsc-svg-slurm-1` (B200) or `aws-pdx-slurm-1` (B300), and two nodes on the
@@ -229,7 +233,7 @@ logs remain under the shared FSW hierarchy, never `$HOME`.
 Each pilot uses an
 immutable AutoModel commit, prepares a reusable 64M-token shard if needed,
 runs ten optimizer steps, writes a checkpoint, and logs to
-`titans-paper-blackwell-pilots`.
+`titans-paper-reproduction`.
 
 Full runs use the same router with `--full`. The selected cluster first
 prepares a document-aligned 15B-token dataset for the 170M/340M scales or a
@@ -244,6 +248,13 @@ All new pilots and full runs log to the consolidated
 `nvidia/titans-paper-reproduction` W&B project. Groups separate canonical
 LMM scales (`lmm-170m`, `lmm-340m`, `lmm-760m`) from `ablations-170m`; cluster
 and GPU topology remain properties of each run rather than separate projects.
+
+Blackwell runs trade their large memory capacity for fewer gradient
+accumulation rounds. Activation checkpointing is disabled, and the default
+local batch is 16 for 170M, 8 for 340M, and 4 for 760M, capped by
+`global_batch_size / world_size`. The global batch remains 128, so token
+budgets and LR schedules are unchanged. Set `TITANS_LOCAL_BATCH_SIZE` or
+`TITANS_ACTIVATION_CHECKPOINTING` to override these hardware defaults.
 
 Each completed full-run segment measures its optimizer-step throughput and
 adjusts the next segment by at most 25%, targeting 13,200 seconds (3h40m) of

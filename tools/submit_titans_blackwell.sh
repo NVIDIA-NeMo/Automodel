@@ -172,6 +172,9 @@ trap 'rm -f "$JOB_BODY"' EXIT
   printf 'export TITANS_EXPERIMENT=%q\n' "$VARIANT"
   printf 'export TITANS_TRAIN_NODES=%q\n' "$NODES"
   printf 'export TITANS_GPUS_PER_NODE=%q\n' "$GPUS_PER_NODE"
+  printf 'export TITANS_PILOT_STEPS=%q\n' "${TITANS_PILOT_STEPS:-10}"
+  printf 'export TITANS_LOCAL_BATCH_SIZE=%q\n' "${TITANS_LOCAL_BATCH_SIZE:-}"
+  printf 'export TITANS_ACTIVATION_CHECKPOINTING=%q\n' "${TITANS_ACTIVATION_CHECKPOINTING:-false}"
   awk 'NR == 1 {next} !/^#SBATCH/' "$SBATCH_SCRIPT"
 } >"$JOB_BODY"
 
