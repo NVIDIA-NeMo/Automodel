@@ -57,7 +57,7 @@ from nemo_automodel._transformers.retrieval import (
 from nemo_automodel.components.checkpoint.addons import ConsolidatedHFAddon, _maybe_save_custom_model_code
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
 from nemo_automodel.components.datasets.llm.retrieval_dataset import load_corpus
-from nemo_automodel.components.models.ministral_bidirectional.mining import Mistral3MultimodalMiningEncoder
+from nemo_automodel._transformers.mining import CheckpointMiningEncoder, CheckpointMiningEncoderConfig
 from nemo_automodel.components.models.ministral_bidirectional.model import (
     Ministral3BidirectionalConfig,
     Ministral3BidirectionalModel,
@@ -93,7 +93,7 @@ def test_native_mining_real_processor_and_model_use_wikissnq_binary_pixels(tmp_p
     config = _tiny_mistral3_bidirectional_vlm_config()
     config.image_token_id = processor.image_token_id
     model = BiEncoderModel(Mistral3BidirectionalModel(config), pooling="avg", l2_normalize=True).eval()
-    encoder = Mistral3MultimodalMiningEncoder(model=model, processor=processor, device=torch.device("cpu"))
+    encoder = CheckpointMiningEncoder(model=model, processor=processor, device=torch.device("cpu"))
     red_image = Image.new("RGB", (16, 16), (255, 0, 0))
     image_buffer = BytesIO()
     red_image.save(image_buffer, format="PNG")
@@ -475,6 +475,48 @@ def test_ministral3_biencoder_processor_saves_as_stock_pixtral_without_remote_co
     source_with_zwnj = "literal [\u200cIMG]"
     marked_source = training_reload._mark_user_text_ownership(source_with_zwnj)
     assert training_reload.tokenizer.backend_tokenizer.normalizer.normalize_str(marked_source) == source_with_zwnj
+
+
+@pytest.mark.parametrize("overrides", [{}, {"query_prefix": "", "passage_prefix": ""}, {"query_prefix": "Text:"}])
+def test_checkpoint_mining_restores_prompts_and_image_settings(tmp_path, overrides):
+    """Actual saved metadata, not mining defaults, determines processor token IDs."""
+    original = Mistral3BiEncoderProcessor(
+        image_processor=PixtralImageProcessor(size={"longest_edge": 56}),
+        tokenizer=FakePixtralTokenizer(),
+        patch_size=14,
+    )
+    original.save_pretrained(tmp_path)
+    (tmp_path / "config_sentence_transformers.json").write_text(
+        json.dumps({"prompts": {"query": "Document:", "document": "Image:"}})
+    )
+    model = BiEncoderModel(Mistral3BidirectionalModel(_tiny_mistral3_bidirectional_vlm_config()))
+    model.source_model_path = str(tmp_path)
+    loaded = CheckpointMiningEncoderConfig(**overrides).build(model=model, device=torch.device("cpu")).processor
+    expected_query = overrides.get("query_prefix", "Document:")
+    expected_passage = overrides.get("passage_prefix", "Image:")
+    assert loaded.query_prefix == expected_query
+    assert loaded.passage_prefix == expected_passage
+    assert loaded.image_longest_edge == 56
+    expected = Mistral3BiEncoderProcessor.from_pretrained(
+        tmp_path, query_prefix=expected_query, passage_prefix=expected_passage
+    )
+    assert torch.equal(
+        loaded.process_queries(["literal"])["input_ids"], expected.process_queries(["literal"])["input_ids"]
+    )
+    documents = [{"text": "literal", "image": Image.new("RGB", (28, 56), "red")}]
+    actual_document = loaded.process_documents(documents)
+    expected_document = expected.process_documents(documents)
+    assert torch.equal(actual_document["input_ids"], expected_document["input_ids"])
+    assert torch.equal(actual_document["pixel_values"], expected_document["pixel_values"])
+
+
+@pytest.mark.parametrize(
+    "metadata", [[], {"prompts": []}, {"prompts": {"query": 123}}, {"prompts": {"document": False}}]
+)
+def test_processor_rejects_malformed_saved_prompts(tmp_path, metadata):
+    (tmp_path / "config_sentence_transformers.json").write_text(json.dumps(metadata))
+    with pytest.raises(ValueError, match="prompt"):
+        Mistral3BiEncoderProcessor.from_pretrained(tmp_path)
 
 
 @pytest.mark.parametrize("image_size", [(16, 16), (8, 16), (16, 8)])

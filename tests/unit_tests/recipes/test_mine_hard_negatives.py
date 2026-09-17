@@ -24,7 +24,7 @@ import pytest
 import torch
 
 from nemo_automodel.components.config.loader import ConfigNode, load_yaml_config
-from nemo_automodel.components.models.ministral_bidirectional.mining import Mistral3MultimodalMiningEncoderConfig
+from nemo_automodel._transformers.mining import CheckpointMiningEncoderConfig
 from nemo_automodel.recipes.retrieval.mine_hard_negatives import MINING_DEFAULTS, MineHardNegativesRecipe
 
 # ---------------------------------------------------------------------------
@@ -269,15 +269,15 @@ def test_distributed_multimodal_chunk_fetches_only_rank_owned_documents(tmp_path
 
 
 def test_mining_metadata_records_json_serializable_multimodal_config_and_disabled_cache_reuse(monkeypatch):
-    monkeypatch.setenv("MINING_TEST_PROCESSOR", "/resolved-processor")
-    target = "nemo_automodel.components.models.ministral_bidirectional.mining.Mistral3MultimodalMiningEncoderConfig"
+    monkeypatch.setenv("MINING_TEST_PREFIX", "look up:")
+    target = "nemo_automodel._transformers.mining.CheckpointMiningEncoderConfig"
     cfg = ConfigNode(
         {
             "mining": {
                 **_BASE_MINING,
                 "multimodal_encoder": {
                     "_target_": target,
-                    "processor_name_or_path": "${oc.env:MINING_TEST_PROCESSOR}",
+                    "query_prefix": "${oc.env:MINING_TEST_PREFIX}",
                     "p_max_length": 4096,
                     "image_longest_edge": 1284,
                     "use_text_in_document": True,
@@ -295,8 +295,7 @@ def test_mining_metadata_records_json_serializable_multimodal_config_and_disable
         patch("nemo_automodel.recipes.retrieval.mine_hard_negatives.build_distributed") as build_dist,
         patch("nemo_automodel.recipes.retrieval.mine_hard_negatives.NeMoAutoModelBiEncoder") as auto_model,
         patch(
-            "nemo_automodel.components.models.ministral_bidirectional.mining."
-            "Mistral3MultimodalMiningEncoderConfig.build",
+            "nemo_automodel._transformers.mining.CheckpointMiningEncoderConfig.build",
             return_value=encoder,
         ),
         patch.object(recipe, "_load_data"),
@@ -310,7 +309,7 @@ def test_mining_metadata_records_json_serializable_multimodal_config_and_disable
     metadata = recipe._get_mining_args_dict()
 
     assert metadata["multimodal_encoder"]["_target_"] == target
-    assert metadata["multimodal_encoder"]["processor_name_or_path"] == "/resolved-processor"
+    assert metadata["multimodal_encoder"]["query_prefix"] == "look up:"
     assert metadata["cache_reuse"] is False
     json.dumps(metadata)
 
@@ -321,7 +320,7 @@ def test_multimodal_mining_example_resolves_typed_encoder_without_downloads():
 
     encoder_config = cfg.mining.multimodal_encoder.instantiate()
 
-    assert isinstance(encoder_config, Mistral3MultimodalMiningEncoderConfig)
+    assert isinstance(encoder_config, CheckpointMiningEncoderConfig)
     assert encoder_config.p_max_length == 4096
     assert cfg.mining.load_embeddings_from_cache is False
 

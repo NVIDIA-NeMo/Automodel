@@ -125,6 +125,10 @@ class Mistral3BidirectionalModel(Mistral3Model):
     """
 
     config_class = Mistral3BidirectionalConfig
+    # Resolve only when mining/evaluating: portable model exports must not import AutoModel.
+    retrieval_processor_target: str = (
+        "nemo_automodel.components.models.ministral_bidirectional.processor.Mistral3BiEncoderProcessor"
+    )
 
     _export_as_stock_model = True
     _sentence_transformer_input_mode = "structured_multimodal"
