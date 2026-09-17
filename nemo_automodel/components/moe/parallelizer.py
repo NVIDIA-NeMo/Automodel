@@ -794,11 +794,7 @@ def apply_fsdp(
     experts_mp_policy = parallelizer_utils.get_internal_fsdp_mp_policy(mp_policy)
     fp32_compute_module_names = tuple(getattr(model, "_keep_in_fp32_modules_strict", None) or ())
 
-    fully_shard_impl = fully_shard
-    if _is_deepseek_v4_model(model):
-        from nemo_automodel.components.models.deepseek_v4.fsdp import fully_shard_deepseek_v4
-
-        fully_shard_impl = fully_shard_deepseek_v4
+    fully_shard_impl = getattr(model, "_nemo_fully_shard", fully_shard)
 
     fully_shard_default = functools.partial(
         fully_shard_impl,

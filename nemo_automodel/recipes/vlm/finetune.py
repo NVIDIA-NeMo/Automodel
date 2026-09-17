@@ -1120,6 +1120,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             num_label_tokens=num_label_tokens,
             dp_group_size=self._get_dp_group_size(include_cp=True),
             expert_tp_replication_factor=get_expert_tp_replication_factor(self.model_parts, self.device_mesh),
+            grad_norm_backend=self.cfg.get("clip_grad_norm.backend", "triton"),
         )
 
         # Note(MegatronFSDP): Need to call these functions for MegatronFSDP if not using latest api

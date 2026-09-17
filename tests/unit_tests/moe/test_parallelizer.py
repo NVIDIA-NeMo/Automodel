@@ -2060,22 +2060,19 @@ def test_apply_fsdp_without_lm_head_precision_uses_default_policy(monkeypatch):
     assert mp_policy_mock.call_count == 1
 
 
-def test_apply_fsdp_uses_dsv4_wrapper_only_for_deepseek_v4(monkeypatch):
-    """DeepSeek-V4 gets its model-specific dtype wrapper without changing generic MoE FSDP."""
+@pytest.mark.parametrize("model_owned_sharding", [False, True])
+def test_apply_fsdp_uses_model_wrapper_or_default(monkeypatch: pytest.MonkeyPatch, model_owned_sharding: bool) -> None:
+    """Language and multimodal units share one model-selected FSDP callback."""
     P = _import_parallelizer_with_stubs(monkeypatch)
     monkeypatch.setattr(P, "MoE", DummyMoE)
-
-    fully_shard_mock = MagicMock()
-    monkeypatch.setattr(P, "fully_shard", fully_shard_mock)
-
-    dsv4_fsdp_stub = types.ModuleType("nemo_automodel.components.models.deepseek_v4.fsdp")
-    dsv4_fully_shard_mock = MagicMock()
-    dsv4_fsdp_stub.fully_shard_deepseek_v4 = dsv4_fully_shard_mock
-    monkeypatch.setitem(sys.modules, "nemo_automodel.components.models.deepseek_v4.fsdp", dsv4_fsdp_stub)
-
+    default_shard = MagicMock()
+    model_shard = MagicMock()
+    monkeypatch.setattr(P, "fully_shard", default_shard)
     block = DummyBlock(mlp=DummyMoE())
     model = DummyModel([block])
-    model.config = types.SimpleNamespace(model_type="deepseek_v4")
+    model.visual = DummyExperts()
+    if model_owned_sharding:
+        model._nemo_fully_shard = model_shard
 
     P.apply_fsdp(
         model=model,
@@ -2085,8 +2082,11 @@ def test_apply_fsdp_uses_dsv4_wrapper_only_for_deepseek_v4(monkeypatch):
         lm_head_precision=None,
     )
 
-    assert _find_call_by_first_arg(dsv4_fully_shard_mock, block) is not None
-    assert _find_call_by_first_arg(fully_shard_mock, block) is None
+    selected = model_shard if model_owned_sharding else default_shard
+    other = default_shard if model_owned_sharding else model_shard
+    for module in (block, model.visual, model):
+        assert _find_call_by_first_arg(selected, module) is not None
+        assert _find_call_by_first_arg(other, module) is None
 
 
 def test_parallelize_model_passes_lm_head_precision_to_apply_fsdp(monkeypatch):
