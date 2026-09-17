@@ -394,6 +394,35 @@ class TestCustomModelGenerationConfig:
 
         assert model.generation_config.eos_token_id == [2, 11]
 
+    @patch("nemo_automodel._transformers.model_init._download_model_weights")
+    @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")
+    def test_dict_config_override_survives_the_config_json_fallback(self, mock_resolve_cls, _mock_download, tmp_path):
+        """``config={"eos_token_id": None}`` is the YAML/CLI override form.
+
+        get_hf_config folds it into the config and the dict is dropped from kwargs
+        before the keyword overrides are collected, so its keys are captured at
+        that point instead. Runs the real config load rather than a mocked one.
+        """
+        import json
+
+        (tmp_path / "config.json").write_text(
+            json.dumps({"model_type": "llama", "architectures": ["SomeModel"], "eos_token_id": 0})
+        )
+        mock_resolve_cls.return_value = self._FakeModel
+
+        _, model = _init_model(
+            cls=MagicMock(),
+            pretrained_model_name_or_path_or_config=str(tmp_path),
+            attn_implementation="sdpa",
+            torch_dtype=torch.float32,
+            quantization_config=None,
+            force_hf=False,
+            config={"eos_token_id": None},
+        )
+
+        assert model.config.eos_token_id is None
+        assert model.generation_config.eos_token_id is None
+
     @patch("nemo_automodel._transformers.model_init.get_hf_config")
     @patch("nemo_automodel._transformers.model_init._download_model_weights")
     @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")

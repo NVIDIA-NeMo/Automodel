@@ -1186,8 +1186,11 @@ def __init_model(
     # kwargs so it is not also forwarded into the model constructor / HF from_pretrained
     # (custom path passes ``hf_config`` positionally as ``config`` -> would collide;
     # stock-HF path does not accept a dict ``config``).
+    # Its keys are explicit overrides all the same, and nothing downstream can tell
+    # a deliberate value from an unset one once it equals a default, so keep them.
+    dict_config_overrides: set[str] = set()
     if isinstance(kwargs.get("config"), dict):
-        kwargs.pop("config", None)
+        dict_config_overrides = set(kwargs.pop("config"))
     architectures = get_architectures(hf_config)
 
     # Propagate the user-requested dtype to the top-level config and every nested
@@ -1308,7 +1311,9 @@ def __init_model(
             # Treat config-related kwargs as config overrides (HF behavior) and
             # avoid forwarding them into model __init__.
             init_param_names = _get_init_param_names(model_cls)
-            config_overrides = _consume_config_overrides(hf_config, kwargs, init_param_names=init_param_names)
+            config_overrides = dict_config_overrides | _consume_config_overrides(
+                hf_config, kwargs, init_param_names=init_param_names
+            )
             kwargs = _filter_kwargs_for_init(model_cls, kwargs)
             # Coerce plain-dict backend (e.g. from CLI --model.backend.attn sdpa) to BackendConfig
             if "backend" in kwargs and isinstance(kwargs["backend"], dict):
