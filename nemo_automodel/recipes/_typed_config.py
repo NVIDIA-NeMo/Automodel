@@ -613,8 +613,8 @@ class RecipeConfig:
     @cached_property
     def mtp(self) -> "MTPLossConfig":
         # MTP loss params are model-driven (scaling_factor comes from the model
-        # output / get_mtp_loss_scaling_factor; ignore_index is fixed) and are not
-        # exposed via YAML.  This typed accessor just lets recipes build MTP through
+        # output / get_mtp_loss_scaling_factor; ignore_index comes from the loss)
+        # and are not exposed via YAML. This typed accessor lets recipes build MTP through
         # the typed-config boundary like the other sections.
         from nemo_automodel.components.loss.mtp import MTPLossConfig
 
