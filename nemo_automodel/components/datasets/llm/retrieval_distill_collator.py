@@ -213,6 +213,8 @@ class BiEncoderDistillCollator:
         neg_lists_raw = [docs[1:] for docs in doc_lists]
         neg_lists = [[self._apply_passage_prefix(n, pi) for n in negs] for negs, pi in zip(neg_lists_raw, passage_inst)]
 
+        # Some backends, including MistralCommonBackend, neither support the
+        # return_token_type_ids kwarg nor advertise token type IDs.
         token_type_kwargs = {}
         if "token_type_ids" in getattr(self.tokenizer, "model_input_names", []):
             token_type_kwargs["return_token_type_ids"] = False
