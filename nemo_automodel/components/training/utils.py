@@ -294,24 +294,24 @@ def _clip_grad_norm_impl(
         first_grad = group_params[0].grad
         is_dtensor = isinstance(first_grad, DTensor)
 
-        if grad_norm_backend == "te" and not has_partial:
+        if grad_norm_backend == "te":
             local_gradients = [
                 (p.grad.to_local() if isinstance(p.grad, DTensor) else p.grad).detach() for p in group_params
             ]
             local_norm = _local_te_l2_norm(local_gradients, target_device)
             if is_dtensor:
                 maximum = local_norm.clone()
-                for dim_idx, placement in enumerate(first.placements):
+                for dim_idx, placement in enumerate(first_grad.placements):
                     if not isinstance(placement, Replicate):
                         maximum = _all_reduce_scalar(
-                            maximum, torch.distributed.ReduceOp.MAX, first.device_mesh, dim_idx
+                            maximum, torch.distributed.ReduceOp.MAX, first_grad.device_mesh, dim_idx
                         )
                 scale = torch.where(torch.isfinite(maximum) & maximum.ne(0), maximum, torch.ones_like(maximum))
                 sum_squares = local_norm.div(scale).square()
-                for dim_idx, placement in enumerate(first.placements):
+                for dim_idx, placement in enumerate(first_grad.placements):
                     if not isinstance(placement, Replicate):
                         sum_squares = _all_reduce_scalar(
-                            sum_squares, torch.distributed.ReduceOp.SUM, first.device_mesh, dim_idx
+                            sum_squares, torch.distributed.ReduceOp.SUM, first_grad.device_mesh, dim_idx
                         )
                 local_norm = maximum * sum_squares.sqrt()
             group_norms.append(local_norm)
@@ -325,7 +325,7 @@ def _clip_grad_norm_impl(
             for p in group_params:
                 g = p.grad
                 if isinstance(g, DTensor):
-                    g = g.full_tensor() if has_partial else g.to_local()
+                    g = g.to_local()
                 if g.numel():
                     locals_.append(g.detach())
 
@@ -339,9 +339,9 @@ def _clip_grad_norm_impl(
                 group_val = multi_tensor_sumsq(locals_)
                 reduce_op = torch.distributed.ReduceOp.SUM
 
-            if is_dtensor and not has_partial:
-                mesh = first.device_mesh
-                for dim_idx, pl in enumerate(first.placements):
+            if is_dtensor:
+                mesh = first_grad.device_mesh
+                for dim_idx, pl in enumerate(first_grad.placements):
                     if isinstance(pl, Replicate):
                         continue
                     group_val = _all_reduce_scalar(group_val, reduce_op, mesh, dim_idx)
