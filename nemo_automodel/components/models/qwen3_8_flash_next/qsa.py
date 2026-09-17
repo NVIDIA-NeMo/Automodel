@@ -23,19 +23,24 @@ every forward, while gradients flow through the main attention Q/K/V path.
 
 from __future__ import annotations
 
+import functools
 import math
+from types import ModuleType
+from typing import Literal
 
 import torch
 from torch import nn
 
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.gpt_oss.rope_utils import apply_rotary_emb
+from nemo_automodel.components.models.qwen3_8_flash_next.backend import Qwen3_8_FlashNextBackendConfig
 from nemo_automodel.components.models.qwen3_8_flash_next.cp import (
     Qwen3_8_FlashNextCPContext,
     qwen3_8_flash_next_cp_all_gather,
 )
 from nemo_automodel.components.models.qwen3_8_flash_next.flex_qsa import flex_sparse_gqa_attention
 from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextRMSNorm
+from nemo_automodel.shared.import_utils import safe_import
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 # The gathered implementation is a numerical oracle and CPU fallback, not the
@@ -117,6 +122,49 @@ def apply_qsa_rope(states: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tenso
     return apply_rotary_emb(states, cos, sin)
 
 
+@functools.cache
+def _get_deepselect() -> ModuleType:
+    """Load the optional CUDA selector only when explicitly requested."""
+    available, module = safe_import("deep_select")
+    if not available:
+        raise ImportError("backend.qsa_topk='deepselect' requires DeepSelect built for this GPU architecture")
+    return module
+
+
+def _deepselect_qsa_blocks(scores: torch.Tensor, visible_blocks: torch.Tensor) -> torch.Tensor:
+    """Select 512 causal blocks without changing score precision.
+
+    Args:
+        scores: FP32 CUDA tensor [queries, blocks]. Noncontiguous rows are
+            copied to aligned storage when required by DeepSelect.
+        visible_blocks: Integer tensor [queries] on scores.device, containing
+            the exclusive causal bound for each row, between 513 and blocks.
+
+    Returns:
+        Int64 CUDA tensor [queries, 512] of block IDs. Ordering and equal-score
+        tie breaking are unspecified. Neither input is mutated.
+    """
+    if not scores.is_cuda or scores.dtype != torch.float32 or scores.ndim != 2:
+        raise ValueError("DeepSelect QSA scores must be FP32 CUDA [queries, blocks]")
+    module = _get_deepselect()
+    alignment = module.get_stride_requirement()[0] // scores.element_size()
+    if scores.stride(0) % alignment or scores.stride(1) != 1:
+        rows, columns = scores.shape
+        padded_columns = -(-columns // alignment) * alignment
+        aligned = scores.new_empty((rows, padded_columns))
+        aligned[:, :columns].copy_(scores)
+        scores = aligned[:, :columns]
+    with torch.cuda.device(scores.device):
+        return module.topk(
+            scores,
+            512,
+            end=visible_blocks.to(dtype=torch.int32).contiguous(),
+            indices_type=torch.int64,
+            idx_oob_fill_value=-1,
+            return_value=False,
+        )[1]
+
+
 @torch.no_grad()
 def select_qsa_token_ids(
     index_queries: torch.Tensor,
@@ -128,6 +176,7 @@ def select_qsa_token_ids(
     query_chunk_size: int = 128,
     query_position_offset: int = 0,
     global_sequence_length: int | None = None,
+    topk_backend: Literal["torch", "deepselect"] = "torch",
 ) -> torch.Tensor:
     """Score compressed blocks and expand gold QSA top-k IDs.
 
@@ -153,6 +202,9 @@ def select_qsa_token_ids(
             contiguous CP layout.
         global_sequence_length: Padded global physical sequence length. It
             defaults to the local query length for the non-CP path.
+        topk_backend: Compressed-block selector. DeepSelect requires CUDA and
+            512 blocks. Sparse ordering and equal-score tie breaking may differ
+            from PyTorch. Dense-prefix order and causal tails are preserved.
 
     Returns:
         Global logical token IDs ``[B, S_query, token_budget +
@@ -173,6 +225,14 @@ def select_qsa_token_ids(
             "QSA requires a positive token_budget divisible by compress_ratio > 1; "
             f"got token_budget={token_budget}, compress_ratio={compress_ratio}"
         )
+    if topk_backend not in ("torch", "deepselect"):
+        raise ValueError(f"Unsupported QSA top-k backend: {topk_backend!r}")
+    if topk_backend == "deepselect":
+        if not index_queries.is_cuda:
+            raise ValueError("DeepSelect QSA selection requires CUDA tensors")
+        if token_budget // compress_ratio != 512:
+            raise ValueError("DeepSelect QSA currently supports exactly 512 selected blocks")
+        _get_deepselect()
     if query_chunk_size <= 0:
         raise ValueError(f"query_chunk_size must be positive, got {query_chunk_size}")
     if num_heads <= 0 or head_dim <= 0:
@@ -239,10 +299,13 @@ def select_qsa_token_ids(
                     sparse_queries = index_queries[batch_idx, query_start:query_end][sparse_rows].float()
                     scores = torch.einsum("qhd,pd->qhp", sparse_queries, keys)
                     scores = torch.relu(scores).sum(dim=1) / score_scale
-                    block_ids = torch.arange(available_blocks, device=index_queries.device)
                     sparse_visible = visible_blocks[sparse_rows]
-                    scores = scores.masked_fill(block_ids.unsqueeze(0) >= sparse_visible.unsqueeze(1), -torch.inf)
-                    top_blocks[sparse_rows] = torch.topk(scores, k=block_budget, dim=-1).indices
+                    if topk_backend == "deepselect":
+                        top_blocks[sparse_rows] = _deepselect_qsa_blocks(scores, sparse_visible)
+                    else:
+                        block_ids = torch.arange(available_blocks, device=index_queries.device)
+                        scores = scores.masked_fill(block_ids.unsqueeze(0) >= sparse_visible.unsqueeze(1), -torch.inf)
+                        top_blocks[sparse_rows] = torch.topk(scores, k=block_budget, dim=-1).indices
                     valid_blocks[sparse_rows] = True
                 expanded = top_blocks.unsqueeze(-1) * compress_ratio + block_offsets
                 expanded = torch.where(valid_blocks.unsqueeze(-1), expanded, -torch.ones_like(expanded))
@@ -452,6 +515,7 @@ class Qwen3_8_FlashNextQSAIndexer(nn.Module):
         self.token_budget = int(getattr(config, "indexer_budget"))
         self.compress_ratio = int(getattr(config, "indexer_compress_ratio"))
         self.query_chunk_size = int(getattr(config, "qsa_indexer_query_chunk_size", 128))
+        self.topk_backend = backend.qsa_topk if isinstance(backend, Qwen3_8_FlashNextBackendConfig) else "torch"
         if self.num_query_heads <= 0 or self.head_dim <= 0:
             raise ValueError("QSA index head count and dimension must be positive")
         if self.num_key_heads != 1:
@@ -460,6 +524,10 @@ class Qwen3_8_FlashNextQSAIndexer(nn.Module):
             raise ValueError("QSA indexer_budget must be positive and divisible by indexer_compress_ratio > 1")
         if self.query_chunk_size <= 0:
             raise ValueError("qsa_indexer_query_chunk_size must be positive")
+        if self.topk_backend == "deepselect":
+            if self.token_budget // self.compress_ratio != 512:
+                raise ValueError("DeepSelect QSA currently supports exactly 512 selected blocks")
+            _get_deepselect()
 
         dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
         self.index_qk_proj = initialize_linear_module(
@@ -575,6 +643,7 @@ class Qwen3_8_FlashNextQSAIndexer(nn.Module):
             token_budget=self.token_budget,
             compress_ratio=self.compress_ratio,
             query_chunk_size=self.query_chunk_size,
+            topk_backend=self.topk_backend,
             query_position_offset=query_position_offset,
             global_sequence_length=global_sequence_length,
         )
@@ -669,6 +738,7 @@ class Qwen3_8_FlashNextQSAIndexer(nn.Module):
             token_budget=self.token_budget,
             compress_ratio=self.compress_ratio,
             query_chunk_size=self.query_chunk_size,
+            topk_backend=self.topk_backend,
         )
         global_routes = torch.where(
             document_routes >= 0,
@@ -759,6 +829,7 @@ class Qwen3_8_FlashNextQSAIndexer(nn.Module):
                 token_budget=self.token_budget,
                 compress_ratio=self.compress_ratio,
                 query_chunk_size=self.query_chunk_size,
+                topk_backend=self.topk_backend,
                 query_position_offset=overlap_start - document_start,
                 global_sequence_length=document_length,
             )

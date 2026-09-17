@@ -112,7 +112,8 @@ def test_multimodal_configuration_fails_closed() -> None:
         )
 
 
-def test_tiny_qwen3_8_flash_next_forward_backward_and_state_layout() -> None:
+@pytest.mark.parametrize("backend_mapping", [False, True])
+def test_tiny_qwen3_8_flash_next_forward_backward_and_state_layout(backend_mapping: bool) -> None:
     config = _tiny_config()
     backend = BackendConfig(
         linear="torch",
@@ -122,11 +123,22 @@ def test_tiny_qwen3_8_flash_next_forward_backward_and_state_layout() -> None:
         dispatcher="torch",
         enable_hf_state_dict_adapter=False,
     )
+    if backend_mapping:
+        backend = dict(
+            linear="torch",
+            attn="sdpa",
+            rms_norm="torch",
+            experts="torch",
+            dispatcher="torch",
+            enable_hf_state_dict_adapter=False,
+            qsa_topk="torch",
+        )
     model = Qwen3_8_FlashNextForConditionalGeneration.from_config(
         config,
         moe_config=_tiny_moe_config(config.text_config),
         backend=backend,
     )
+    assert model.model.language_model.layers["0"].self_attn.indexer.topk_backend == "torch"
     model.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
     model.train()
 
