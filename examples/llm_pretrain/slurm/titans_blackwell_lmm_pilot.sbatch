@@ -33,11 +33,19 @@ esac
   DEFAULT_LOCAL_BATCH_SIZE=$MAX_LOCAL_BATCH_SIZE
 LOCAL_BATCH_SIZE=${TITANS_LOCAL_BATCH_SIZE:-$DEFAULT_LOCAL_BATCH_SIZE}
 ACTIVATION_CHECKPOINTING=${TITANS_ACTIVATION_CHECKPOINTING:-false}
+DISTRIBUTED_STRATEGY=${TITANS_DISTRIBUTED_STRATEGY:-fsdp2}
+case "$DISTRIBUTED_STRATEGY" in
+  fsdp2) DISTRIBUTED_OVERRIDES="--distributed.strategy=fsdp2" ;;
+  ddp)
+    DISTRIBUTED_OVERRIDES="--distributed.strategy=ddp --distributed.autocast_dtype=bfloat16 --distributed.static_graph=true --distributed.gradient_as_bucket_view=true"
+    ;;
+  *) echo "unsupported distributed strategy: $DISTRIBUTED_STRATEGY" >&2; exit 2 ;;
+esac
 if (( LOCAL_BATCH_SIZE < 1 || 128 % (WORLD_SIZE * LOCAL_BATCH_SIZE) != 0 )); then
   echo "local batch $LOCAL_BATCH_SIZE does not divide global batch 128 across $WORLD_SIZE ranks" >&2
   exit 2
 fi
-echo "Blackwell tuning: world_size=$WORLD_SIZE local_batch_size=$LOCAL_BATCH_SIZE activation_checkpointing=$ACTIVATION_CHECKPOINTING"
+echo "Blackwell tuning: strategy=$DISTRIBUTED_STRATEGY world_size=$WORLD_SIZE local_batch_size=$LOCAL_BATCH_SIZE activation_checkpointing=$ACTIVATION_CHECKPOINTING"
 if [[ $TITANS_SCALE != 170m && $TITANS_EXPERIMENT != baseline ]]; then
   echo "component ablations are currently defined only for the 170M scale" >&2
   exit 2
@@ -66,6 +74,7 @@ TRAIN_DATA=$DATA_ROOT/train/fineweb_edu_max_tokens_64M/dataset.bin
 TRAIN_INDEX=${TRAIN_DATA%.bin}.bos.idx
 VALIDATION_ROOT=$DATA_ROOT/validation-health-$SLURM_NNODES-$TITANS_GPUS_PER_NODE
 RUN_NAME=titans-${TITANS_SCALE}-${TITANS_EXPERIMENT}-blackwell-pilot
+[[ $DISTRIBUTED_STRATEGY != fsdp2 ]] && RUN_NAME=$RUN_NAME-$DISTRIBUTED_STRATEGY
 CHECKPOINT_ROOT=$TITANS_WORK_ROOT/outputs/$RUN_NAME-$SLURM_JOB_ID
 WANDB_GROUP=$([[ $TITANS_EXPERIMENT == baseline ]] && echo "lmm-$TITANS_SCALE" || echo "ablations-170m")
 
@@ -154,6 +163,7 @@ srun \
       --step_scheduler.log_remote_every_steps=1 \
       --lr_scheduler.lr_warmup_steps=1 \
       --distributed.activation_checkpointing='$ACTIVATION_CHECKPOINTING' \
+      $DISTRIBUTED_OVERRIDES \
       --checkpoint.checkpoint_dir='$CHECKPOINT_ROOT' \
       --wandb.enable=true \
       --wandb.entity=nvidia \

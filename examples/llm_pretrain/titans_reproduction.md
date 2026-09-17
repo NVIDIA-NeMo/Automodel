@@ -219,6 +219,17 @@ For a throughput comparison rather than a ten-step gate, set
 `TITANS_PILOT_STEPS=100`; the effective local batch and checkpointing mode are
 logged at startup.
 
+The 170M model can also benchmark replicated data parallelism:
+
+```bash
+TITANS_DISTRIBUTED_STRATEGY=ddp TITANS_PILOT_STEPS=100 \
+  tools/submit_titans_blackwell.sh 170m baseline --pilot --total-gpus 8
+```
+
+DDP uses BF16 autocast, a static graph, gradient bucket views, and no activation
+checkpointing. FSDP2 remains the full-run default until this pilot demonstrates
+that DDP fits and improves steady-state throughput.
+
 The submitter asks `slurm-cli` to rank configured Blackwell clusters and their
 authorized accounts. Eight total GPUs resolve to one node on
 `nsc-svg-slurm-1` (B200) or `aws-pdx-slurm-1` (B300), and two nodes on the

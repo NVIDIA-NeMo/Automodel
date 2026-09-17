@@ -40,13 +40,22 @@ esac
   DEFAULT_LOCAL_BATCH_SIZE=$MAX_LOCAL_BATCH_SIZE
 LOCAL_BATCH_SIZE=${TITANS_LOCAL_BATCH_SIZE:-$DEFAULT_LOCAL_BATCH_SIZE}
 ACTIVATION_CHECKPOINTING=${TITANS_ACTIVATION_CHECKPOINTING:-false}
+DISTRIBUTED_STRATEGY=${TITANS_DISTRIBUTED_STRATEGY:-fsdp2}
+case "$DISTRIBUTED_STRATEGY" in
+  fsdp2) DISTRIBUTED_OVERRIDES="--distributed.strategy=fsdp2" ;;
+  ddp)
+    DISTRIBUTED_OVERRIDES="--distributed.strategy=ddp --distributed.autocast_dtype=bfloat16 --distributed.static_graph=true --distributed.gradient_as_bucket_view=true"
+    ;;
+  *) echo "unsupported distributed strategy: $DISTRIBUTED_STRATEGY" >&2; exit 2 ;;
+esac
 if (( LOCAL_BATCH_SIZE < 1 || 128 % (WORLD_SIZE * LOCAL_BATCH_SIZE) != 0 )); then
   echo "local batch $LOCAL_BATCH_SIZE does not divide global batch 128 across $WORLD_SIZE ranks" >&2
   exit 2
 fi
 export TITANS_LOCAL_BATCH_SIZE=$LOCAL_BATCH_SIZE
 export TITANS_ACTIVATION_CHECKPOINTING=$ACTIVATION_CHECKPOINTING
-echo "Blackwell tuning: world_size=$WORLD_SIZE local_batch_size=$LOCAL_BATCH_SIZE activation_checkpointing=$ACTIVATION_CHECKPOINTING"
+export TITANS_DISTRIBUTED_STRATEGY=$DISTRIBUTED_STRATEGY
+echo "Blackwell tuning: strategy=$DISTRIBUTED_STRATEGY world_size=$WORLD_SIZE local_batch_size=$LOCAL_BATCH_SIZE activation_checkpointing=$ACTIVATION_CHECKPOINTING"
 if [[ $TITANS_SCALE != 170m && $TITANS_EXPERIMENT != baseline ]]; then
   echo "component ablations are currently defined only for the 170M scale" >&2
   exit 2
@@ -72,6 +81,7 @@ esac
 RECIPE=examples/llm_pretrain/titans_${TITANS_SCALE}_lmm.yaml
 DATA_ROOT=$TITANS_WORK_ROOT/data/fineweb-edu-llama2-$TOKEN_BUDGET
 RUN_NAME=titans-${TITANS_SCALE}-${TITANS_EXPERIMENT}-${TOKEN_BUDGET}-blackwell
+[[ $DISTRIBUTED_STRATEGY != fsdp2 ]] && RUN_NAME=$RUN_NAME-$DISTRIBUTED_STRATEGY
 if [[ -n ${TITANS_RUN_SUFFIX:-} ]]; then
   [[ $TITANS_RUN_SUFFIX =~ ^[A-Za-z0-9._-]+$ ]] || {
     echo "TITANS_RUN_SUFFIX contains unsupported characters" >&2
@@ -150,6 +160,7 @@ srun \
       --step_scheduler.max_steps_per_run='$MAX_STEPS_PER_RUN' \
       --step_scheduler.local_batch_size='$LOCAL_BATCH_SIZE' \
       --distributed.activation_checkpointing='$ACTIVATION_CHECKPOINTING' \
+      $DISTRIBUTED_OVERRIDES \
       --checkpoint.checkpoint_dir='$CHECKPOINT_ROOT' \
       --wandb.enable=true \
       --wandb.entity=nvidia \

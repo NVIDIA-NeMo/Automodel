@@ -175,6 +175,7 @@ trap 'rm -f "$JOB_BODY"' EXIT
   printf 'export TITANS_PILOT_STEPS=%q\n' "${TITANS_PILOT_STEPS:-10}"
   printf 'export TITANS_LOCAL_BATCH_SIZE=%q\n' "${TITANS_LOCAL_BATCH_SIZE:-}"
   printf 'export TITANS_ACTIVATION_CHECKPOINTING=%q\n' "${TITANS_ACTIVATION_CHECKPOINTING:-false}"
+  printf 'export TITANS_DISTRIBUTED_STRATEGY=%q\n' "${TITANS_DISTRIBUTED_STRATEGY:-fsdp2}"
   printf 'export TITANS_RUN_SUFFIX=%q\n' "${TITANS_RUN_SUFFIX:-}"
   printf 'export TITANS_TIME_LIMIT=%q\n' "${TITANS_TIME_LIMIT:-4:00:00}"
   awk 'NR == 1 {next} !/^#SBATCH/' "$SBATCH_SCRIPT"
@@ -203,6 +204,8 @@ if [[ $MODE == pilot ]]; then
 else
   case "$SCALE" in 170m|340m) TOKEN_BUDGET=15B ;; 760m) TOKEN_BUDGET=30B ;; esac
   RUN_ID=titans-${SCALE}-${VARIANT}-${TOKEN_BUDGET}-blackwell
+  [[ ${TITANS_DISTRIBUTED_STRATEGY:-fsdp2} != fsdp2 ]] && \
+    RUN_ID=$RUN_ID-${TITANS_DISTRIBUTED_STRATEGY}
   [[ -n ${TITANS_RUN_SUFFIX:-} ]] && RUN_ID=$RUN_ID-$TITANS_RUN_SUFFIX
   RUN_ID=$RUN_ID-v1
   echo "W&B:      https://wandb.ai/nvidia/titans-paper-reproduction/runs/$RUN_ID"

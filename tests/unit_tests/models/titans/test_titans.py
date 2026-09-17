@@ -37,6 +37,7 @@ import torch.nn.functional as F
 import yaml
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
 
+from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config
 from nemo_automodel.components.distributed.parallelizer import _apply_titans_activation_checkpointing
 from nemo_automodel.components.models.titans.config import TitansConfig
 from nemo_automodel.components.models.titans.layers import (
@@ -44,6 +45,7 @@ from nemo_automodel.components.models.titans.layers import (
     titans_delta_rule_recurrence,
 )
 from nemo_automodel.components.models.titans.model import TitansForCausalLM
+from nemo_automodel.recipes._dist_utils import parse_distributed_section
 from nemo_automodel.shared.import_utils import safe_import
 
 CUDA = torch.cuda.is_available()
@@ -421,6 +423,23 @@ def test_larger_lmm_recipes_match_paper_parameter_classes(
     assert sum(parameter.numel() for parameter in instantiated.parameters()) == expected_parameters
 
 
+def test_lmm_recipe_distributed_section_supports_fsdp2_and_ddp():
+    root = Path(__file__).parents[4]
+    distributed = yaml.safe_load(
+        (root / "examples/llm_pretrain/titans_170m_lmm.yaml").read_text()
+    )["distributed"]
+
+    assert isinstance(parse_distributed_section(distributed)["strategy_config"], FSDP2Config)
+
+    ddp = distributed | {
+        "strategy": "ddp",
+        "autocast_dtype": "bfloat16",
+        "static_graph": True,
+        "gradient_as_bucket_view": True,
+    }
+    assert isinstance(parse_distributed_section(ddp)["strategy_config"], DDPConfig)
+
+
 def test_multinode_ablation_runner_preserves_paper_batch_and_uses_c10d():
     root = Path(__file__).parents[4]
     runner = (root / "examples/llm_pretrain/slurm/cwdfw_titans_170m_ablation.sbatch").read_text()
@@ -479,6 +498,9 @@ def test_blackwell_submitter_resolves_portable_topology():
     assert "--step_scheduler.max_steps='$PILOT_STEPS'" in runner
     assert "TITANS_PILOT_STEPS=%q" in submitter
     assert "TITANS_RUN_SUFFIX=%q" in submitter
+    assert "TITANS_DISTRIBUTED_STRATEGY=%q" in submitter
+    assert "--distributed.strategy=ddp" in runner
+    assert "--distributed.autocast_dtype=bfloat16" in runner
     assert '--time="$TITANS_TIME_LIMIT"' in full_runner
     assert "SLURM_TIMELIMIT" not in full_runner
     assert "--wandb.project=titans-paper-reproduction" in full_runner

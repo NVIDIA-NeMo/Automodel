@@ -110,14 +110,7 @@ distributed:
   tp_size: 1
   cp_size: 1
   pp_size: 1
-  sequence_parallel: false
   activation_checkpointing: true
-  mp_policy:
-    _target_: torch.distributed.fsdp.MixedPrecisionPolicy
-    param_dtype: bfloat16
-    reduce_dtype: float32
-    output_dtype: bfloat16
-    cast_forward_inputs: true
 
 checkpoint:
   enabled: true
