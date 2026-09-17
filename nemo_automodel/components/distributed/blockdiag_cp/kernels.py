@@ -17,17 +17,33 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
+from typing import Any
 
 import torch
 
-from nemo_automodel.shared.import_utils import safe_import_from, safe_import_te
+from nemo_automodel.shared.import_utils import safe_import_te
 
 logger = logging.getLogger(__name__)
 
-# Availability probes only -- the kernel symbols themselves are imported at the
-# call sites so a per-call stub (tests) or lazy TE extension load keeps working.
-HAS_FLASH_VARLEN, _ = safe_import_from("flash_attn", "flash_attn_varlen_func")
-HAS_TE, _ = safe_import_te()
+
+def _get_flash_functions() -> tuple[Callable[..., Any] | None, Callable[..., Any] | None]:
+    """Load FlashAttention functions through Transformers' supported loader."""
+    from transformers.modeling_flash_attention_utils import lazy_import_flash_attention
+
+    flash_functions, _ = lazy_import_flash_attention("flash_attention_2")
+    return flash_functions[0], flash_functions[1]
+
+
+def _has_flash_varlen() -> bool:
+    """Return True when flash varlen is available via pip or Hub."""
+    try:
+        _, flash_attn_varlen_func = _get_flash_functions()
+    except Exception:
+        logger.debug("FlashAttention varlen loader is unavailable", exc_info=True)
+        return False
+    return flash_attn_varlen_func is not None
+
 
 _CP_FLASH_DETERMINISTIC = False
 _CP_FLASH_WARNED = False
@@ -36,6 +52,7 @@ _CP_VARLEN_SHAPE_LOGGED = False
 _CP_FLASH_LONG_SEGMENT_WARNED = False
 _CP_TE_DROPOUT_WARNED = False
 _TE_DPA_CACHE = {}
+HAS_TE, _ = safe_import_te()
 
 
 def _varlen_backend_unavailable_reason(
@@ -65,7 +82,7 @@ def _varlen_backend_unavailable_reason(
     if device.type != "cuda":
         return f"varlen CP attention requires CUDA, got device={device}"
     if backend == "flash":
-        if not HAS_FLASH_VARLEN:
+        if not _has_flash_varlen():
             return "flash_attn varlen kernel is unavailable"
         return None
     if backend == "te":
@@ -282,7 +299,9 @@ def _flash_varlen_with_long_prefix_guard(
     Returns:
         Packed attention output ``[n_real, Hq, D]``.
     """
-    from flash_attn import flash_attn_func, flash_attn_varlen_func
+    flash_attn_func, flash_attn_varlen_func = _get_flash_functions()
+    if flash_attn_func is None or flash_attn_varlen_func is None:
+        raise RuntimeError("flash_attn func/varlen unavailable")
 
     first_q = int(meta.get("first_q", 0))
     first_k = int(meta.get("first_k", 0))
@@ -568,7 +587,7 @@ def _cp_blockdiag_varlen(
             )
             _CP_TE_DROPOUT_WARNED = True
         return None
-    if backend == "flash" and not HAS_FLASH_VARLEN:
+    if backend == "flash" and not _has_flash_varlen():
         if not _CP_FLASH_WARNED:
             logger.warning("flash_attn is unavailable; reporting the unavailable varlen path to the caller")
             _CP_FLASH_WARNED = True

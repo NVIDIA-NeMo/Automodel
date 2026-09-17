@@ -47,6 +47,7 @@ from transformers import (  # noqa: E402
     AutoModelForSequenceClassification,
     AutoModelForTextToWaveform,
     AutoModelForTokenClassification,
+    KernelConfig,
     PreTrainedModel,
 )
 from transformers.initialization import no_init_weights  # noqa: E402
@@ -387,6 +388,9 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         sdpa_method,
         torch_dtype,
         attn_implementation,
+        use_kernels=False,
+        allow_all_kernels=False,
+        kernel_config=None,
         quantization_config,
         force_hf,
         model_wrapper,
@@ -418,6 +422,19 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         freeze_config = kwargs.pop("freeze_config", None)
         cache_dir = kwargs.pop("cache_dir", hf_constants.HF_HUB_CACHE)
 
+        if kernel_config is not None:
+            use_kernels = True
+        if use_kernels:
+            if use_liger_kernel:
+                logger.info(
+                    "use_kernels=True: skipping pip Liger patching (Transformers Hub kernelize owns layer replacements). "
+                    "Install with: uv sync --extra hub_kernels"
+                )
+            use_liger_kernel = False
+        kernels_applied_during_load = (
+            use_kernels and is_hf_model and isinstance(pretrained_model_name_or_path_or_config, str)
+        )
+
         def _retry(**override):
             """Re-enter ``_build_model`` with overridden parameters."""
             if _retry_depth >= _MAX_BUILD_RETRIES:
@@ -437,6 +454,9 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 sdpa_method=sdpa_method,
                 torch_dtype=torch_dtype,
                 attn_implementation=override.get("attn_implementation", attn_implementation),
+                use_kernels=override.get("use_kernels", use_kernels),
+                allow_all_kernels=override.get("allow_all_kernels", allow_all_kernels),
+                kernel_config=override.get("kernel_config", kernel_config),
                 quantization_config=quantization_config,
                 force_hf=force_hf,
                 model_wrapper=model_wrapper,
@@ -507,6 +527,16 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             if is_hf_model:
                 kwargs["config"] = _hf_config
 
+        model_init_kwargs = dict(kwargs)
+        # Transformers consumes these during construction. Keep them out of
+        # AutoConfig resolution and the retry kwargs owned by AutoModel.
+        if allow_all_kernels and is_hf_model:
+            model_init_kwargs["allow_all_kernels"] = True
+        if kernels_applied_during_load:
+            model_init_kwargs["use_kernels"] = True
+            if kernel_config is not None:
+                model_init_kwargs["kernel_config"] = kernel_config
+
         # Use meta device initialization when:
         # - Not using MegatronFSDPManager or DDPManager (they handle their own initialization)
         # - AND either multi-GPU (world_size > 1) or single-GPU custom model (not HF)
@@ -535,7 +565,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                     force_hf,
                     *model_args,
                     _process_group=process_group,
-                    **kwargs,
+                    **model_init_kwargs,
                 )
         except (NotImplementedError, RuntimeError) as e:
             _meta_err_msgs = (
@@ -565,7 +595,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                         force_hf,
                         *model_args,
                         _process_group=process_group,
-                        **kwargs,
+                        **model_init_kwargs,
                     )
             else:
                 raise
@@ -580,8 +610,22 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         model = apply_model_runtime_patches(model, mesh)
 
         # Kernel patching
+        if use_kernels and not kernels_applied_during_load:
+            if is_meta_device:
+                raise ValueError(
+                    "use_kernels cannot replace layers while the model is on the meta device. "
+                    "Use from_pretrained with force_hf=True so Transformers applies kernels after loading weights."
+                )
+            if allow_all_kernels:
+                from transformers.integrations.hub_kernels import allow_all_hub_kernels
+
+                with allow_all_hub_kernels():
+                    model.set_use_kernels(True, kernel_config)
+            else:
+                model.set_use_kernels(True, kernel_config)
+
         try:
-            if use_liger_kernel and not is_custom_model:
+            if use_liger_kernel and not is_custom_model and not use_kernels:
                 model = _patch_liger_kernel(model)
         except RuntimeError:
             logger.warning("Retrying without Liger kernels.")
@@ -646,6 +690,9 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         pretrained_model_name_or_path,
         *model_args,
         use_liger_kernel: bool = True,
+        use_kernels: bool = False,
+        allow_all_kernels: bool = False,
+        kernel_config: KernelConfig | None = None,
         use_sdpa_patching: bool = True,
         sdpa_method: List[Union[SDPBackend, str]] | None = None,
         torch_dtype="auto",
@@ -677,6 +724,17 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 `AutoModelForCausalLM.from_pretrained`.
             use_liger_kernel (bool, default=True): If `True`, try to patch
                 the model with Liger kernels for faster inference/training.
+                Ignored when ``use_kernels=True``.
+            use_kernels (bool, default=False): If `True`, apply Transformers Hub
+                ``kernelize`` to non-attention layers (RMSNorm, MLP, Linear, etc.).
+                Independent of ``attn_implementation``. Requires the ``hub_kernels``
+                extra. Set ``use_liger_kernel=False`` when enabled.
+            allow_all_kernels (bool, default=False): If `True`, allow Hub kernel
+                repos outside ``kernels-community`` (Transformers
+                ``allow_all_kernels``). Required for non-trusted attention repos
+                and optional for custom ``kernel_config`` mappings.
+            kernel_config: Optional Transformers ``KernelConfig`` for
+                ``use_kernels=True``. Enables ``use_kernels`` when set.
             use_sdpa_patching (bool, default=True): If `True`, patch the
                 model with SDPA-based attention optimizations.
             sdpa_method (list[SDPBackend | str] | None, optional): Explicit list of
@@ -688,9 +746,11 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 Deprecated alias for ``dtype``. Defaults to ``auto``.
             attn_implementation (str, optional):
                 Specifies which attention implementation to use (e.g.,
-                ``"flash_attention_2"``, ``"eager"``). Only applied when the
-                base model supports this kwarg. Defaults to ``"flash_attention_2"``,
-                if flash attention is not available, defaults to ``"sdpa"``.
+                ``"flash_attention_2"``, ``"eager"``). Hub repo ids such as
+                ``"kernels-community/flash-attn2"`` are also supported. Only
+                applied when the base model supports this kwarg. Defaults to
+                ``"flash_attention_2"`` when flash attention is available, else
+                ``"sdpa"``.
             quantization_config (optional): BitsAndBytesConfig configuration object that
                 specifies all quantization settings. If provided, quantization
                 will be applied to the model.
@@ -747,6 +807,11 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         )
         loss_fn = pipeline_config.loss_fn if pipeline_config is not None else None
 
+        if kernel_config is not None and not use_kernels:
+            use_kernels = True
+        if use_kernels:
+            use_liger_kernel = False
+
         try:
             hf_config = get_hf_config(pretrained_model_name_or_path, attn_implementation, **kwargs)
         except Exception as e:
@@ -773,6 +838,9 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             sdpa_method=sdpa_method,
             torch_dtype=torch_dtype,
             attn_implementation=attn_implementation,
+            use_kernels=use_kernels,
+            allow_all_kernels=allow_all_kernels,
+            kernel_config=kernel_config,
             quantization_config=quantization_config,
             force_hf=force_hf,
             model_wrapper=model_wrapper,
@@ -794,6 +862,9 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         config,
         *model_args,
         use_liger_kernel: bool = True,
+        use_kernels: bool = False,
+        allow_all_kernels: bool = False,
+        kernel_config: KernelConfig | None = None,
         use_sdpa_patching: bool = True,
         sdpa_method: List[Union[SDPBackend, str]] | None = None,
         torch_dtype: Union[str, torch.dtype] = "auto",
@@ -873,6 +944,11 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
 
         sdpa_method = resolve_sdpa_method(sdpa_method, mesh.device_mesh, activation_checkpointing)
 
+        if kernel_config is not None and not use_kernels:
+            use_kernels = True
+        if use_kernels:
+            use_liger_kernel = False
+
         return cls._build_model(
             config,
             *model_args,
@@ -882,6 +958,9 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             sdpa_method=sdpa_method,
             torch_dtype=torch_dtype,
             attn_implementation=attn_implementation,
+            use_kernels=use_kernels,
+            allow_all_kernels=allow_all_kernels,
+            kernel_config=kernel_config,
             quantization_config=quantization_config,
             force_hf=force_hf,
             model_wrapper=model_wrapper,
@@ -1098,8 +1177,7 @@ class _NeMoAutoModelForRetrievalBase:
             pretrained_model_name_or_path: Path to pretrained model or model identifier.
             attn_implementation: Attention implementation to use (e.g.,
                 ``"flash_attention_2"``, ``"sdpa"``, ``"eager"``).
-                Defaults to ``DEFAULT_ATTN_IMPLEMENTATION``
-                (``"flash_attention_2"`` when flash-attn is installed, otherwise ``"sdpa"``).
+                Defaults to ``DEFAULT_ATTN_IMPLEMENTATION``.
             use_liger_kernel: Whether to apply Liger kernel optimizations.
             use_sdpa_patching: Whether to apply SDPA patching.
             sdpa_method: SDPA backend methods to use.

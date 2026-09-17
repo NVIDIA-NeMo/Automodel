@@ -126,7 +126,22 @@ def preprocess_args_and_kwargs_for_attn(
     attn_impl: str,
     **kwargs: Any,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, Any]]:
-    """Preprocess attention inputs based on backend requirements."""
+    """Preprocess attention inputs based on backend requirements.
+
+    Args:
+        q: Query tensor of shape [batch, sequence, heads, head_dim].
+        k: Key tensor of shape [batch, sequence, kv_heads, head_dim].
+        v: Value tensor of shape [batch, sequence, kv_heads, head_dim].
+        attention_mask: Optional mask tensor of shape [batch, sequence] or broadcastable
+            dense shape [batch, heads, query_sequence, key_sequence].
+        attn_impl: Attention backend name.
+        **kwargs: Backend-specific attention metadata.
+
+    Returns:
+        A tuple containing the transformed query, key, and value tensors plus backend
+        keyword arguments. SDPA and FlexAttention tensors use shapes
+        [batch, heads, sequence, head_dim]; other backends retain their native layout.
+    """
     # Create attention kwargs based on backend
     if attn_impl == "te":
         attn_kwargs = {
@@ -206,7 +221,7 @@ def preprocess_args_and_kwargs_for_attn(
                 attn_kwargs[_k] = kwargs[_k]
     else:  # sdpa
         attn_kwargs = {}
-        # Transpose for SDPA
+        # Transpose for SDPA (BHSD layout expected by attn_func)
         q = q.transpose(1, 2).contiguous()
         k = k.transpose(1, 2).contiguous()
         v = v.transpose(1, 2).contiguous()
@@ -258,7 +273,17 @@ def preprocess_args_and_kwargs_for_attn(
 
 
 def postprocess_output_for_attn(x: torch.Tensor, attn_impl: str) -> torch.Tensor:
-    """Postprocess attention output based on attn_impl requirements."""
+    """Postprocess an attention output for its backend.
+
+    Args:
+        x: Attention output tensor of shape [batch, heads, sequence, head_dim] for
+            SDPA and FlexAttention, or [batch, sequence, heads, head_dim]
+            for other backends.
+        attn_impl: Attention backend name.
+
+    Returns:
+        Attention output tensor of shape [batch, sequence, heads, head_dim].
+    """
     if attn_impl in ("sdpa", "flex"):
         x = x.transpose(1, 2).contiguous()
     return x
