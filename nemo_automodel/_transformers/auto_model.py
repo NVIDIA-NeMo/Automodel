@@ -132,7 +132,7 @@ def _reject_separate_distributed_kwargs(kwargs: dict) -> None:
 
 def _resolve_distributed_setup(
     *,
-    distributed_setup: Optional[DistributedSetup],
+    distributed_setup: DistributedSetup | None,
     device_mesh: Optional["DeviceMesh"] = None,
 ) -> DistributedSetup:
     """Return a setup, upcasting raw mesh inputs into topology-only setup."""
@@ -647,15 +647,15 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         *model_args,
         use_liger_kernel: bool = True,
         use_sdpa_patching: bool = True,
-        sdpa_method: Optional[List[Union[SDPBackend, str]]] = None,
+        sdpa_method: List[Union[SDPBackend, str]] | None = None,
         torch_dtype="auto",
         attn_implementation: str = DEFAULT_ATTN_IMPLEMENTATION,
         quantization_config=None,
         force_hf: bool = False,
-        distributed_setup: Optional[DistributedSetup] = None,
+        distributed_setup: DistributedSetup | None = None,
         device_mesh: Optional["DeviceMesh"] = None,
-        qat_config: Optional[QATConfig] = None,
-        peft_config: Optional[dict] = None,
+        qat_config: QATConfig | None = None,
+        peft_config: dict | None = None,
         fp8_config: Optional["FP8Config"] = None,
         compile_config: Optional["CompileConfig"] = None,
         **kwargs,
@@ -685,7 +685,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 ``["flash_attention", "efficient_attention"]``). When ``None``,
                 auto-selects based on CP and activation checkpointing.
             torch_dtype (str | torch.dtype):
-                Data type passed to the underlying `from_pretrained` call. Defaults to `auto`.
+                Deprecated alias for ``dtype``. Defaults to ``auto``.
             attn_implementation (str, optional):
                 Specifies which attention implementation to use (e.g.,
                 ``"flash_attention_2"``, ``"eager"``). Only applied when the
@@ -712,6 +712,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             compile_config (CompileConfig | None, optional): Configuration for torch.compile.
                 If provided, the model will be compiled. Default: None.
             **kwargs: Additional keyword arguments. Notable ones include:
+                - dtype (str | torch.dtype): Model storage dtype. Takes precedence
+                  over ``torch_dtype`` when not ``None``; accepts ``auto``.
                 - has_packed_sequence (bool): Whether using packed sequences. Default: False.
                 - cache_dir (str): Cache directory for model weights.
 
@@ -720,6 +722,10 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             model instance with all infrastructure applied.
         """
         _reject_separate_distributed_kwargs(kwargs)
+        # Resolve HF's dtype alias before config overrides or model construction
+        # can consume it independently of AutoModel's storage-dtype handling.
+        if (dtype := kwargs.pop("dtype", None)) is not None:
+            torch_dtype = dtype
         setup = _resolve_distributed_setup(
             distributed_setup=distributed_setup,
             device_mesh=device_mesh,
@@ -789,15 +795,15 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         *model_args,
         use_liger_kernel: bool = True,
         use_sdpa_patching: bool = True,
-        sdpa_method: Optional[List[Union[SDPBackend, str]]] = None,
+        sdpa_method: List[Union[SDPBackend, str]] | None = None,
         torch_dtype: Union[str, torch.dtype] = "auto",
         attn_implementation: str = DEFAULT_ATTN_IMPLEMENTATION,
         quantization_config=None,
         force_hf: bool = False,
-        distributed_setup: Optional[DistributedSetup] = None,
+        distributed_setup: DistributedSetup | None = None,
         device_mesh: Optional["DeviceMesh"] = None,
-        qat_config: Optional[QATConfig] = None,
-        peft_config: Optional[dict] = None,
+        qat_config: QATConfig | None = None,
+        peft_config: dict | None = None,
         fp8_config: Optional["FP8Config"] = None,
         compile_config: Optional["CompileConfig"] = None,
         **kwargs,
@@ -814,9 +820,13 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 If config is passed as a string (e.g., model-id / local checkpoint),
                 it will create a config internally using AutoConfig.
             torch_dtype (str | torch.dtype):
-                Data type for model parameters. Defaults to `auto`, which selects ``torch.bfloat16``.
+                Deprecated alias for ``dtype``. Defaults to ``auto``, which selects ``torch.bfloat16``.
+            **kwargs: Additional arguments documented in ``from_pretrained``.
+                ``dtype`` takes precedence over ``torch_dtype`` when not ``None``.
         """
         _reject_separate_distributed_kwargs(kwargs)
+        if (dtype := kwargs.pop("dtype", None)) is not None:
+            torch_dtype = dtype
         setup = _resolve_distributed_setup(
             distributed_setup=distributed_setup,
             device_mesh=device_mesh,
@@ -1061,7 +1071,7 @@ class _NeMoAutoModelForRetrievalBase:
     from ``nemo_automodel._transformers.retrieval``.
     """
 
-    _ENCODER_CLS_NAME: Optional[str] = None  # "BiEncoderModel" or "CrossEncoderModel"
+    _ENCODER_CLS_NAME: str | None = None  # "BiEncoderModel" or "CrossEncoderModel"
 
     @classmethod
     def from_pretrained(
@@ -1070,12 +1080,12 @@ class _NeMoAutoModelForRetrievalBase:
         attn_implementation: str = DEFAULT_ATTN_IMPLEMENTATION,
         use_liger_kernel: bool = True,
         use_sdpa_patching: bool = True,
-        sdpa_method: Optional[List[SDPBackend]] = None,
+        sdpa_method: List[SDPBackend] | None = None,
         torch_dtype="auto",
-        distributed_setup: Optional[DistributedSetup] = None,
+        distributed_setup: DistributedSetup | None = None,
         device_mesh: Optional["DeviceMesh"] = None,
         compile_config: Optional["CompileConfig"] = None,
-        peft_config: Optional[dict] = None,
+        peft_config: dict | None = None,
         **kwargs,
     ) -> PreTrainedModel:
         """Load an encoder model with infrastructure (FSDP, PEFT, kernel patching, etc.).
@@ -1093,13 +1103,15 @@ class _NeMoAutoModelForRetrievalBase:
             use_liger_kernel: Whether to apply Liger kernel optimizations.
             use_sdpa_patching: Whether to apply SDPA patching.
             sdpa_method: SDPA backend methods to use.
-            torch_dtype: Data type passed to the underlying model initialization.
+            torch_dtype: Deprecated alias for ``dtype``. Defaults to ``auto``.
             distributed_setup: Resolved distributed topology and policy object.
             device_mesh: Pre-created Hugging Face-style device mesh. NeMo wraps it
                 in a topology-only ``DistributedSetup`` internally.
             compile_config: Configuration for torch.compile.
             peft_config: PEFT/LoRA configuration dictionary.
             **kwargs: Additional arguments passed to the encoder's ``build()`` method.
+                ``dtype`` selects model storage dtype and takes precedence over
+                ``torch_dtype`` when not ``None``; accepts ``auto``.
 
         Returns:
             Encoder model instance with loaded weights and all infrastructure applied.
@@ -1108,6 +1120,9 @@ class _NeMoAutoModelForRetrievalBase:
             If kernel patching fails, the method retries with adjusted parameters.
         """
         _reject_separate_distributed_kwargs(kwargs)
+        if (dtype := kwargs.pop("dtype", None)) is not None:
+            torch_dtype = dtype
+        torch_dtype = dtype_from_str(torch_dtype) if torch_dtype != "auto" else torch_dtype
         from nemo_automodel._transformers import retrieval as _enc_mod
 
         encoder_cls = getattr(_enc_mod, cls._ENCODER_CLS_NAME)
@@ -1163,7 +1178,7 @@ class _NeMoAutoModelForRetrievalBase:
         model = encoder_cls.build(
             model_name_or_path=pretrained_model_name_or_path,
             attn_implementation=attn_implementation,
-            torch_dtype=torch_dtype,
+            dtype=torch_dtype,
             **build_kwargs,
         )
 

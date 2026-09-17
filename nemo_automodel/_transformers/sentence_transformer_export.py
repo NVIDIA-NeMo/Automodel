@@ -26,6 +26,11 @@ from transformers import PretrainedConfig
 from transformers.utils import logging
 
 _SENTENCE_TRANSFORMER_POOLING_KEYS = {
+    "avg": "mean",
+    "cls": "cls",
+    "last": "lasttoken",
+}
+_SENTENCE_TRANSFORMER_LEGACY_POOLING_KEYS = {
     "avg": "pooling_mode_mean_tokens",
     "cls": "pooling_mode_cls_token",
     "last": "pooling_mode_lasttoken",
@@ -47,6 +52,31 @@ _SOURCE_LEGAL_ASSET_PATTERNS = (
 )
 _SOURCE_LEGAL_ASSET_PREFIXES = ("license", "notice")
 _TEXT_EXPORT_STALE_PROCESSOR_ASSETS = ("processor_config.json", "preprocessor_config.json")
+_SENTENCE_TRANSFORMER_MODULE_TYPES = {
+    "transformer": {
+        "sentence_transformers.models.Transformer",
+        "sentence_transformers.base.modules.transformer.Transformer",
+    },
+    "pooling": {
+        "sentence_transformers.models.Pooling",
+        "sentence_transformers.sentence_transformer.modules.pooling.Pooling",
+    },
+    "normalize": {
+        "sentence_transformers.models.Normalize",
+        "sentence_transformers.sentence_transformer.modules.normalize.Normalize",
+        "sentence_transformers.base.modules.normalize.Normalize",
+    },
+}
+_SUPPORTED_SENTENCE_TRANSFORMER_MODULE_STACKS = {
+    ("transformer", "pooling"),
+    ("transformer", "pooling", "normalize"),
+}
+_SENTENCE_TRANSFORMER_EXPORT_MODULE_TYPES = {
+    # v6 remaps these v5.4-era paths, keeping exported checkpoints loadable across v5.4+.
+    "transformer": "sentence_transformers.base.modules.transformer.Transformer",
+    "pooling": "sentence_transformers.sentence_transformer.modules.pooling.Pooling",
+    "normalize": "sentence_transformers.sentence_transformer.modules.normalize.Normalize",
+}
 
 
 logger = logging.get_logger(__name__)
@@ -130,17 +160,52 @@ def _load_sentence_transformer_wrapper_options(
     if not isinstance(modules, list):
         raise ValueError("Sentence Transformers modules.json must contain a list of modules.")
 
-    transformer_type = "sentence_transformers.models.Transformer"
-    pooling_type = "sentence_transformers.models.Pooling"
-    normalize_type = "sentence_transformers.models.Normalize"
-    module_types = [module.get("type") if isinstance(module, dict) else None for module in modules]
-    if module_types not in ([transformer_type, pooling_type], [transformer_type, pooling_type, normalize_type]):
+    module_roles = []
+    for module in modules:
+        module_type = module.get("type") if isinstance(module, dict) else None
+        module_role = next(
+            (
+                role
+                for role, allowed_types in _SENTENCE_TRANSFORMER_MODULE_TYPES.items()
+                if module_type in allowed_types
+            ),
+            None,
+        )
+        module_roles.append(module_role)
+    module_roles = tuple(module_roles)
+    if module_roles not in _SUPPORTED_SENTENCE_TRANSFORMER_MODULE_STACKS:
         raise ValueError(
             "Sentence Transformers metadata must use the exact supported module stack: "
             "Transformer, Pooling, and optional Normalize."
         )
-    if modules[0].get("path") != "":
+
+    modules_by_role = dict(zip(module_roles, modules, strict=True))
+    transformer_module = modules_by_role["transformer"]
+    pooling_module = modules_by_role["pooling"]
+    normalize_module = modules_by_role.get("normalize")
+    if transformer_module.get("path") != "":
         raise ValueError("Sentence Transformers Transformer metadata must reference the checkpoint root.")
+
+    if normalize_module is not None:
+        normalize_path = normalize_module.get("path")
+        if not isinstance(normalize_path, str) or not normalize_path:
+            raise ValueError("Sentence Transformers Normalize metadata must reference a module path.")
+        normalize_config = _load_sentence_transformer_json(
+            model_name_or_path,
+            os.path.join(normalize_path, "config.json"),
+            hf_kwargs,
+        )
+        if normalize_config is not None:
+            if not isinstance(normalize_config, dict):
+                raise ValueError("Sentence Transformers Normalize config.json is invalid.")
+            normalize_input_name = normalize_config.get("module_input_name", "sentence_embedding")
+            normalize_output_name = normalize_config.get("module_output_name")
+            if normalize_output_name is None:
+                normalize_output_name = normalize_input_name
+            if normalize_input_name != "sentence_embedding" or normalize_output_name != "sentence_embedding":
+                raise ValueError(
+                    "Sentence Transformers Normalize metadata must normalize the final sentence embedding in place."
+                )
 
     sentence_bert_config = _load_sentence_transformer_json(
         model_name_or_path,
@@ -153,7 +218,7 @@ def _load_sentence_transformer_wrapper_options(
             "the NeMo inference path does not lowercase text."
         )
 
-    pooling_path = modules[1].get("path")
+    pooling_path = pooling_module.get("path")
     if not isinstance(pooling_path, str) or not pooling_path:
         raise ValueError("Sentence Transformers Pooling metadata must reference a module path.")
     pooling_config = _load_sentence_transformer_json(
@@ -169,18 +234,30 @@ def _load_sentence_transformer_wrapper_options(
             "the NeMo pooling path includes prompt tokens."
         )
 
-    active_pooling_keys = {
-        key for key, value in pooling_config.items() if key.startswith("pooling_mode_") and bool(value)
-    }
-    matching_pooling = [
-        pooling
-        for pooling, metadata_key in _SENTENCE_TRANSFORMER_POOLING_KEYS.items()
-        if metadata_key in active_pooling_keys
-    ]
-    if len(active_pooling_keys) != 1 or len(matching_pooling) != 1:
-        raise ValueError(
-            "Sentence Transformers pooling metadata cannot be represented by a single NeMo avg, cls, or last mode."
-        )
+    pooling_mode = pooling_config.get("pooling_mode")
+    if pooling_mode is not None:
+        if not isinstance(pooling_mode, str) or pooling_mode not in _SENTENCE_TRANSFORMER_POOLING_KEYS.values():
+            raise ValueError(
+                "Sentence Transformers pooling metadata cannot be represented by a single NeMo avg, cls, or last mode."
+            )
+        matching_pooling = [
+            pooling
+            for pooling, sentence_transformer_mode in _SENTENCE_TRANSFORMER_POOLING_KEYS.items()
+            if sentence_transformer_mode == pooling_mode
+        ]
+    else:
+        active_pooling_keys = {
+            key for key, value in pooling_config.items() if key.startswith("pooling_mode_") and bool(value)
+        }
+        matching_pooling = [
+            pooling
+            for pooling, metadata_key in _SENTENCE_TRANSFORMER_LEGACY_POOLING_KEYS.items()
+            if metadata_key in active_pooling_keys
+        ]
+        if len(active_pooling_keys) != 1 or len(matching_pooling) != 1:
+            raise ValueError(
+                "Sentence Transformers pooling metadata cannot be represented by a single NeMo avg, cls, or last mode."
+            )
 
     sentence_transformer_config = _load_sentence_transformer_json(
         model_name_or_path,
@@ -204,7 +281,7 @@ def _load_sentence_transformer_wrapper_options(
 
     return SentenceTransformerWrapperOptions(
         pooling=matching_pooling[0],
-        l2_normalize=len(modules) == 3,
+        l2_normalize=normalize_module is not None,
         query_prompt=query_prompt,
         document_prompt=document_prompt,
     )
@@ -468,13 +545,13 @@ def _save_generated_sentence_transformer_assets(
             "idx": 0,
             "name": "0",
             "path": "",
-            "type": "sentence_transformers.models.Transformer",
+            "type": _SENTENCE_TRANSFORMER_EXPORT_MODULE_TYPES["transformer"],
         },
         {
             "idx": 1,
             "name": "1",
             "path": "1_Pooling",
-            "type": "sentence_transformers.models.Pooling",
+            "type": _SENTENCE_TRANSFORMER_EXPORT_MODULE_TYPES["pooling"],
         },
     ]
     if normalize:
@@ -483,21 +560,15 @@ def _save_generated_sentence_transformer_assets(
                 "idx": 2,
                 "name": "2",
                 "path": "2_Normalize",
-                "type": "sentence_transformers.models.Normalize",
+                "type": _SENTENCE_TRANSFORMER_EXPORT_MODULE_TYPES["normalize"],
             }
         )
 
     pooling_config = {
-        "word_embedding_dimension": embedding_dimension,
-        "pooling_mode_cls_token": False,
-        "pooling_mode_max_tokens": False,
-        "pooling_mode_mean_tokens": False,
-        "pooling_mode_mean_sqrt_len_tokens": False,
-        "pooling_mode_weightedmean_tokens": False,
-        "pooling_mode_lasttoken": False,
+        "embedding_dimension": embedding_dimension,
+        "pooling_mode": _SENTENCE_TRANSFORMER_POOLING_KEYS[pooling],
         "include_prompt": True,
     }
-    pooling_config[_SENTENCE_TRANSFORMER_POOLING_KEYS[pooling]] = True
 
     max_seq_length = _resolve_sentence_transformer_max_seq_length(model_part, tokenizer, original_model_path)
 

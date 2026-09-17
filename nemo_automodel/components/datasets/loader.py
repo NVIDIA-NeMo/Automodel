@@ -196,6 +196,9 @@ class ThdPackingConfig(PackingConfig):
     Requires a model whose forward accepts ``seq_lens`` — packing is skipped (with a warning) otherwise.
     """
 
+    pad_to_multiple_of: int = 1
+    """Align each document's physical span, counting padding within the pack budget."""
+
     def build(
         self,
         dataset: object,
@@ -223,6 +226,7 @@ class ThdPackingConfig(PackingConfig):
             dataset,
             split=split,
             packed_sequence_size=self.packed_sequence_size,
+            pad_to_multiple_of=self.pad_to_multiple_of,
             max_packs=self.max_packs,
             padding_idx=pad_token_id,
             cp_size=cp_size,
@@ -438,6 +442,9 @@ _DATASET_CONFIGS: dict[str, str] = {
     f"{_DATASETS}.vlm.datasets.make_rdr_dataset": f"{_DATASETS}.vlm.datasets.RdrDatasetConfig",
     f"{_DATASETS}.vlm.datasets.make_cord_v2_dataset": f"{_DATASETS}.vlm.datasets.CordV2DatasetConfig",
     f"{_DATASETS}.vlm.datasets.make_medpix_dataset": f"{_DATASETS}.vlm.datasets.MedPixDatasetConfig",
+    f"{_DATASETS}.vlm.datasets.make_shopify_product_catalogue_dataset": (
+        f"{_DATASETS}.vlm.datasets.ShopifyProductCatalogueDatasetConfig"
+    ),
     f"{_DATASETS}.vlm.datasets.make_llava_onevision_dataset": (f"{_DATASETS}.vlm.datasets.LlavaOnevisionDatasetConfig"),
     f"{_DATASETS}.vlm.datasets.make_tulu3_magicoder_text_mix_dataset": (
         f"{_DATASETS}.vlm.datasets.Tulu3MagicoderTextMixDatasetConfig"

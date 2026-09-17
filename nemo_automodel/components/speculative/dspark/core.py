@@ -23,12 +23,10 @@ calls the draft with the target supervision and computes the three-term loss.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
 
 import torch
 import torch.nn as nn
 
-from nemo_automodel.components.speculative.dspark.draft_qwen3 import Qwen3DSparkModel
 from nemo_automodel.components.speculative.dspark.loss import compute_dspark_loss
 
 
@@ -65,9 +63,9 @@ class DSparkTrainerModule(nn.Module):
 
     def __init__(
         self,
-        draft_model: Qwen3DSparkModel,
+        draft_model: nn.Module,
         *,
-        loss_decay_gamma: Optional[float] = None,
+        loss_decay_gamma: float | None = None,
         ce_loss_alpha: float = 0.1,
         l1_loss_alpha: float = 0.9,
         confidence_head_alpha: float = 1.0,
@@ -84,10 +82,10 @@ class DSparkTrainerModule(nn.Module):
         input_ids: torch.Tensor,
         target_hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
-        target_last_hidden_states: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
-        seq_lens: Optional[torch.Tensor] = None,
-        doc_remaining: Optional[torch.Tensor] = None,
+        target_last_hidden_states: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        seq_lens: torch.Tensor | None = None,
+        doc_remaining: torch.Tensor | None = None,
     ) -> DSparkStepMetrics:
         """Run the draft on the target supervision and compute the DSpark loss.
 

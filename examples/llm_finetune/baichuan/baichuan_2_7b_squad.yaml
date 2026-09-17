@@ -114,11 +114,8 @@ ci:
   known_issue_id: AM-149
   checkpoint_robustness:
     trust_remote_code: true
-    kl_threshold: 1e-2
-    hf_kl_threshold: 5e-2
     distributed.tp_size: 2
     cross_tp_size: 2
-    cross_tp_kl_threshold: 1e-2
     training_reproducibility_loss_threshold: 5e-2
     tokenizer_name: baichuan-inc/Baichuan2-7B-Chat
     dataset.limit_dataset_samples: 500

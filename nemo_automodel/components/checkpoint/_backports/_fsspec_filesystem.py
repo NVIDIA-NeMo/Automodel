@@ -20,7 +20,7 @@ import os
 from collections.abc import Generator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Union
 
 from fsspec.core import url_to_fs
 from torch.distributed.checkpoint._extension import StreamTransformExtension
@@ -44,7 +44,7 @@ __all__ = [
 
 class FileSystem(FileSystemBase):
     def __init__(self) -> None:
-        self.fs: Optional[AbstractFileSystem] = None
+        self.fs: AbstractFileSystem | None = None
 
     @contextmanager
     def create_stream(self, path: Union[str, os.PathLike], mode: str) -> Generator[io.IOBase, None, None]:
@@ -125,7 +125,7 @@ class FsspecWriter(FileSystemWriter):
         thread_count: int = 1,
         per_thread_copy_ahead: int = 10_000_000,
         overwrite: bool = True,
-        _extensions: Optional[Sequence[StreamTransformExtension]] = None,
+        _extensions: Sequence[StreamTransformExtension] | None = None,
         serialization_format: SerializationFormat = SerializationFormat.TORCH_SAVE,
         **kwargs,
     ) -> None:

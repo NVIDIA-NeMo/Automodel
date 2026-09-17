@@ -20,7 +20,7 @@ import math
 import os
 import time
 import types
-from typing import Callable, Optional, Protocol
+from typing import Callable, Protocol
 
 import torch
 import torch.nn as nn
@@ -102,7 +102,7 @@ def generate_hf_model_fqn_per_model_part(
     include_lm_head: bool = True,
     include_rotary_emb: bool = True,
     include_multimodal_encoders: bool = True,
-    extra_module_fqns: Optional[list[str]] = None,
+    extra_module_fqns: list[str] | None = None,
     fqn_prefix: str = "model.",
     lm_head_fqn: str = "lm_head",
 ) -> list[list[str]]:
@@ -181,7 +181,7 @@ def generate_hf_model_fqn_per_model_part(
 
 def calculate_virtual_stages(
     num_layers: int,
-    layers_per_stage: Optional[int],
+    layers_per_stage: int | None,
     pp_size: int,
     is_single_stage_schedule: bool,
     round_to_pp_multiple: str | None = None,
@@ -442,6 +442,50 @@ def _use_static_pipeline_stage_metadata(schedule: _PipelineSchedule, stages: lis
     logger.info("Using static pipeline metadata with preinitialized neighbor P2P communicators")
 
 
+def _preserve_grads_across_stage_reinit(stages: list[PipelineStage]) -> None:
+    """Keep accumulated gradients alive when stage infrastructure is rebuilt.
+
+    ``_initialize_pp_stages`` ends by calling ``_post_metadata_inference_cleanup``
+    on every stage, which sets ``param.grad = None`` on FSDP modules. Upstream that
+    is safe: it assumes initialization happens once, before any real backward, and
+    only clears the throwaway gradients left behind by dynamic metadata inference.
+
+    ``reset_pp_stage_shapes`` breaks that assumption. It re-initializes the stages
+    whenever the sequence length changes, which for VLM batches is most steps -- and
+    with gradient accumulation that lands *between* micro-batches, so the cleanup
+    discards everything accumulated so far and only the final micro-batch's
+    gradients reach the optimizer.
+
+    With static metadata no inference forward/backward runs, so there are no stale
+    gradients to clear and the whole wipe is collateral damage. Restore the
+    gradients in that case, and leave dynamic mode alone, where the cleanup is doing
+    real work.
+
+    Args:
+        stages: The local pipeline stages to protect.
+    """
+    try:
+        from torch.distributed.pipelining._utils import InferenceMode
+    except ImportError:
+        return
+
+    for stage in stages:
+        cleanup = getattr(stage, "_post_metadata_inference_cleanup", None)
+        if cleanup is None:
+            continue
+
+        def _cleanup_preserving_grads(self, *, _cleanup=cleanup) -> None:
+            if getattr(self, "_inference_mode", None) is not InferenceMode.STATIC:
+                _cleanup()
+                return
+            saved = [(param, param.grad) for param in self.submod.parameters() if param.grad is not None]
+            _cleanup()
+            for param, grad in saved:
+                param.grad = grad
+
+        stage._post_metadata_inference_cleanup = types.MethodType(_cleanup_preserving_grads, stage)
+
+
 def reset_pp_stage_shapes(
     schedule: _PipelineSchedule,
     stages: list[PipelineStage],
@@ -556,8 +600,8 @@ def split_model_into_stages(
     pp_axis_name: str,
     pp_schedule: str,
     device: torch.device,
-    module_names_per_stage: Optional[list[list[str]]] = None,
-    layers_per_stage: Optional[int] = None,
+    module_names_per_stage: list[list[str]] | None = None,
+    layers_per_stage: int | None = None,
     patch_inner_model: bool = True,
     patch_causal_lm_model: bool = True,
     round_to_pp_multiple: str | None = None,
@@ -932,6 +976,7 @@ def pipeline_model(
     )
     if seq_len is not None:
         _use_static_pipeline_stage_metadata(pp_schedule, stages)
+    _preserve_grads_across_stage_reinit(stages)
 
     # Patch FSDP backward for MoE models, or when per-microbatch grad reduce-scatter
     # is requested (mapped from surface-level defer_fsdp_grad_sync=False for memory

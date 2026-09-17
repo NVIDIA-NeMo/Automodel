@@ -255,7 +255,8 @@ class VlmDataloaderConfig:
             packing_attn_implementation: Resolved attention backend for packed-mask construction.
             pp_n_microbatches: Optional pipeline microbatch count used to pre-chunk media tensors.
             cp_size: Runtime context-parallel world size. Neat-packed CP uses
-                compact document IDs instead of a dense quadratic attention mask.
+                compact document IDs instead of a dense quadratic attention mask;
+                THD packing also accounts for per-document CP alignment.
 
         Returns:
             Named result containing the stateful dataloader and runtime processor.
@@ -284,6 +285,7 @@ class VlmDataloaderConfig:
                 ds_raw=raw_dataset,
                 get_rope_index=get_rope_index,
                 processor=processor,
+                cp_size=cp_size,
             )
             if self.packing.packing_format == "thd":
                 logger.info("Configured VLM THD packing (Transformer Engine, qkv_format=thd)")

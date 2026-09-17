@@ -43,7 +43,7 @@ Usage:
 import logging
 import os
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -96,7 +96,7 @@ class PipelineSpec:
     transformer_cls: str = ""
 
     # Optional: full pipeline class name (for loading VAE, text encoders, etc.)
-    pipeline_cls: Optional[str] = None
+    pipeline_cls: str | None = None
 
     # Subfolder for transformer weights in HF repo
     subfolder: str = "transformer"
@@ -108,7 +108,7 @@ class PipelineSpec:
     low_cpu_mem_usage: bool = True
 
     @classmethod
-    def from_dict(cls, d: Optional[Dict[str, Any]]) -> "PipelineSpec":
+    def from_dict(cls, d: Dict[str, Any] | None) -> "PipelineSpec":
         """Create PipelineSpec from YAML dict."""
         if d is None:
             return cls()
@@ -145,7 +145,7 @@ def _init_parallelizer():
     parallelizer.PARALLELIZATION_STRATEGIES["HunyuanVideo15Transformer3DModel"] = HunyuanParallelizationStrategy()
 
 
-def _choose_device(device: Optional[torch.device]) -> torch.device:
+def _choose_device(device: torch.device | None) -> torch.device:
     """Choose device, defaulting to CUDA with LOCAL_RANK if available."""
     if device is not None:
         return device
@@ -178,7 +178,7 @@ def _iter_pipeline_modules(pipe) -> Iterable[Tuple[str, nn.Module]]:
 
 def _move_module_to_device(module: nn.Module, device: torch.device, torch_dtype: Any) -> None:
     """Move module to device with specified dtype."""
-    dtype: Optional[torch.dtype]
+    dtype: torch.dtype | None
     if torch_dtype == "auto":
         dtype = None
     else:
@@ -233,7 +233,7 @@ def _select_active_transformer(pipe, active_transformer: str) -> None:
         torch.cuda.empty_cache()
 
 
-def _ensure_params_trainable(module: nn.Module, module_name: Optional[str] = None) -> int:
+def _ensure_params_trainable(module: nn.Module, module_name: str | None = None) -> int:
     """
     Ensure that all parameters in the given module are trainable.
 
@@ -550,7 +550,7 @@ def _enable_context_parallel(
 
 def _apply_parallelization(
     pipe,
-    parallel_scheme: Optional[Dict[str, Dict[str, Any]]],
+    parallel_scheme: Dict[str, Dict[str, Any]] | None,
 ) -> Dict[str, ParallelManager]:
     """Apply FSDP2/DDP parallelization to pipeline components.
 
@@ -647,20 +647,20 @@ class NeMoAutoDiffusionPipeline:
         cls,
         pretrained_model_name_or_path: str,
         *model_args,
-        parallel_scheme: Optional[Dict[str, Dict[str, Any]]] = None,
-        device: Optional[torch.device] = None,
+        parallel_scheme: Dict[str, Dict[str, Any]] | None = None,
+        device: torch.device | None = None,
         torch_dtype: Any = torch.bfloat16,
         move_to_device: bool = True,
         load_for_training: bool = False,
-        components_to_load: Optional[Iterable[str]] = None,
+        components_to_load: Iterable[str] | None = None,
         peft_cfg=None,
         model_type=None,
-        active_transformer: Optional[str] = None,
+        active_transformer: str | None = None,
         transformer_engine_linear: bool = False,
         transformer_engine_fp8_safe_only: bool = False,
         fuse_qkv_projections: bool = False,
         compact_fused_qkv_projections: bool = False,
-        attention_backend: Optional[str] = None,
+        attention_backend: str | None = None,
         **kwargs,
     ) -> Tuple[DiffusionPipeline, Dict[str, ParallelManager]]:
         """
@@ -854,15 +854,15 @@ class NeMoAutoDiffusionPipeline:
         model_id: str,
         pipeline_spec: Dict[str, Any],
         torch_dtype: torch.dtype = torch.bfloat16,
-        device: Optional[torch.device] = None,
-        parallel_scheme: Optional[Dict[str, Dict[str, Any]]] = None,
+        device: torch.device | None = None,
+        parallel_scheme: Dict[str, Dict[str, Any]] | None = None,
         move_to_device: bool = True,
-        components_to_load: Optional[Iterable[str]] = None,
+        components_to_load: Iterable[str] | None = None,
         transformer_engine_linear: bool = False,
         transformer_engine_fp8_safe_only: bool = False,
         fuse_qkv_projections: bool = False,
         compact_fused_qkv_projections: bool = False,
-        attention_backend: Optional[str] = None,
+        attention_backend: str | None = None,
         **kwargs,
     ) -> Tuple["NeMoAutoDiffusionPipeline", Dict[str, ParallelManager]]:
         """

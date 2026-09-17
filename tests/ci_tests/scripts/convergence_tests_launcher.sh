@@ -103,6 +103,20 @@ if [[ "$TRAIN_EXIT_CODE" -ne 0 ]]; then
   exit $TRAIN_EXIT_CODE
 fi
 
+# --- Eval runs once, on the first node ---
+# This script body executes on every node (torchrun rendezvous), so without this guard
+# steps 2-3 clone lm-eval, build the venv and run the whole vLLM eval once per node. The
+# duplicate work is not just wasted GPU hours -- it multiplies the exposure to a flaky
+# clone. In pipeline 61927701 the gemma4 4-node job hit
+#   fatal: could not read Username for 'https://github.com'
+# on 2 of its 4 nodes; setup_lm_eval.sh aborted there, those tasks exited non-zero, and
+# srun tore down the eval that the two healthy nodes were still running.
+CONVERGENCE_NODE_ID=${SLURM_NODEID:-${SLURM_PROCID:-0}}
+if [[ "${CONVERGENCE_NODE_ID}" != "0" ]]; then
+  echo "[convergence] node ${CONVERGENCE_NODE_ID}: training done; eval runs on node 0 only"
+  exit 0
+fi
+
 # --- 2. Eval-env setup (model-agnostic, idempotent) ---
 echo "[convergence] Setting up lm-evaluation-harness..."
 export HOME=/root

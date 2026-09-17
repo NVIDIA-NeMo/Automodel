@@ -14,9 +14,46 @@
 
 from pathlib import Path
 
+import pytest
 from ruamel.yaml import YAML
 
 from tests.ci_tests.utils.generate_ci_tests import generate_job, generate_pipeline
+
+# Over the default 5s budget on purpose: this module parses every example config under examples/.
+# Shrink the work or the process count before raising this further.
+pytestmark = pytest.mark.timeout(60)
+
+
+def test_example_checkpoint_robustness_configs_do_not_use_removed_fields():
+    removed_keys = {
+        "automodel_reload_cosine_threshold",
+        "automodel_reload_mean_kl_threshold",
+        "automodel_reload_p95_kl_threshold",
+        "check_hf_reload",
+        "check_resume",
+        "check_source_load_parity",
+        "cosine_threshold",
+        "hf_cosine_threshold",
+        "kl_threshold",
+        "hf_kl_threshold",
+        "source_load_kl_threshold",
+        "source_load_mean_kl_threshold",
+        "source_load_cosine_threshold",
+        "cross_tp_kl_threshold",
+        "no_check_resume",
+        "skip_automodel_logit_parity",
+        "skip_hf_logit_parity",
+    }
+    violations = []
+
+    for config in Path("examples").rglob("*.yaml"):
+        recipe = YAML(typ="safe").load(config) or {}
+        robustness = (recipe.get("ci") or {}).get("checkpoint_robustness") or {}
+        found = sorted(removed_keys & robustness.keys())
+        if found:
+            violations.append(f"{config}: {', '.join(found)}")
+
+    assert not violations, "Removed checkpoint-robustness fields remain:\n" + "\n".join(violations)
 
 
 def test_generate_deepseek_v4_pretrain_nightly_job():
@@ -36,6 +73,50 @@ def test_generate_deepseek_v4_pretrain_release_job():
     job = pipeline["deepseek_v4_flash_pretrain"]
     assert job["extends"] == ".llm_pretrain_test"
     assert job["variables"]["TEST_LEVEL"] == "release"
+
+
+def test_generate_gpt_oss_120b_release_job_uses_ep64():
+    config = Path("examples/llm_finetune/gpt_oss/gpt_oss_120b.yaml")
+
+    jobs = dict(generate_job(config, {}, "release", "llm_finetune", "."))
+    recipe = YAML(typ="safe").load(config)
+
+    variables = jobs[""]["variables"]
+    world_size = variables["TEST_NODE_COUNT"] * 8
+    assert variables["TEST_NODE_COUNT"] == 8
+    assert variables["LOCAL_BATCH_SIZE"] == 8
+    assert recipe["distributed"]["ep_size"] == world_size
+    assert recipe["distributed"]["activation_checkpointing"] is False
+
+
+def test_generate_gpt_oss_120b_benchmark_job_uses_ep64_without_activation_checkpointing():
+    config = Path("examples/llm_benchmark/gpt_oss/gptoss_120b_te_deepep.yaml")
+
+    jobs = dict(generate_job(config, {}, "performance", "llm_benchmark", "."))
+    recipe = YAML(typ="safe").load(config)
+
+    variables = jobs[""]["variables"]
+    world_size = variables["TEST_NODE_COUNT"] * 8
+    assert variables["TEST_NODE_COUNT"] == 8
+    assert variables["EP_SIZE"] == world_size
+    assert recipe["distributed"]["ep_size"] == world_size
+    assert recipe["distributed"]["activation_checkpointing"] is False
+
+
+@pytest.mark.parametrize(
+    ("config_path", "activation_checkpointing"),
+    [
+        ("examples/llm_benchmark/gpt_oss/gptoss_20b_te_deepep.yaml", None),
+        ("examples/llm_benchmark/gpt_oss/gptoss_120b_te_deepep_gb200.yaml", True),
+    ],
+)
+def test_gpt_oss_oom_benchmark_configs_use_fused_loss(config_path, activation_checkpointing):
+    recipe = YAML(typ="safe").load(Path(config_path))
+
+    assert recipe["model"]["output_hidden_states"] is True
+    assert recipe["loss_fn"]["_target_"] == ("nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy")
+    if activation_checkpointing is not None:
+        assert recipe["distributed"]["activation_checkpointing"] is activation_checkpointing
 
 
 def test_generate_vllm_deploy_time_override(tmp_path):
@@ -63,8 +144,7 @@ def test_generate_checkpoint_robustness_process_isolation_derives_phases(tmp_pat
 ci:
   checkpoint_robustness:
     process_isolation: true
-    check_source_load_parity: true
-    no_check_resume: true
+    skip_resume: true
     trust_remote_code: true
     hf_device_map_auto: true
     hf_device_map_max_memory_gib: 55
@@ -86,15 +166,16 @@ def test_generate_checkpoint_robustness_process_isolation_preserves_full_default
     (tmp_path / config).write_text(
         """
 ci:
-  checkpoint_robustness:
-    process_isolation: true
+  checkpoint_robustness: {}
 """,
         encoding="utf-8",
     )
 
     jobs = dict(generate_job(config, {}, "release", "llm_finetune", str(tmp_path)))
 
-    assert jobs[""]["variables"]["CHECKPOINT_ROBUSTNESS_PHASES"] == ("train_and_save automodel_reload hf_reload resume")
+    assert jobs[""]["variables"]["CHECKPOINT_ROBUSTNESS_PHASES"] == (
+        "source_load_reference source_load_parity train_and_save automodel_reload hf_reload resume"
+    )
 
 
 def test_generate_checkpoint_robustness_process_isolation_honors_skips(tmp_path):
@@ -104,8 +185,9 @@ def test_generate_checkpoint_robustness_process_isolation_honors_skips(tmp_path)
 ci:
   checkpoint_robustness:
     process_isolation: true
+    skip_source_load_parity: true
     skip_hf_reload: true
-    no_check_resume: true
+    skip_resume: true
 """,
         encoding="utf-8",
     )
@@ -113,6 +195,42 @@ ci:
     jobs = dict(generate_job(config, {}, "release", "llm_finetune", str(tmp_path)))
 
     assert jobs[""]["variables"]["CHECKPOINT_ROBUSTNESS_PHASES"] == "train_and_save automodel_reload"
+
+
+def test_generate_checkpoint_robustness_process_isolation_is_default_and_cross_tp_is_last(tmp_path):
+    config = Path("dense_model.yaml")
+    (tmp_path / config).write_text(
+        """
+ci:
+  checkpoint_robustness:
+    cross_tp_size: 2
+""",
+        encoding="utf-8",
+    )
+
+    jobs = dict(generate_job(config, {}, "release", "llm_finetune", str(tmp_path)))
+
+    assert jobs[""]["variables"]["CHECKPOINT_ROBUSTNESS_PROCESS_ISOLATION"] == "true"
+    assert jobs[""]["variables"]["CHECKPOINT_ROBUSTNESS_PHASES"] == (
+        "source_load_reference source_load_parity train_and_save automodel_reload hf_reload resume cross_tp_reload"
+    )
+
+
+def test_generate_checkpoint_robustness_allows_single_process_fallback(tmp_path):
+    config = Path("fallback_model.yaml")
+    (tmp_path / config).write_text(
+        """
+ci:
+  checkpoint_robustness:
+    process_isolation: false
+""",
+        encoding="utf-8",
+    )
+
+    jobs = dict(generate_job(config, {}, "release", "llm_finetune", str(tmp_path)))
+
+    assert "CHECKPOINT_ROBUSTNESS_PROCESS_ISOLATION" not in jobs[""]["variables"]
+    assert "CHECKPOINT_ROBUSTNESS_PHASES" not in jobs[""]["variables"]
 
 
 def test_generate_checkpoint_robustness_process_isolation_allows_phase_override(tmp_path):
@@ -133,7 +251,7 @@ ci:
     assert jobs[""]["variables"]["CHECKPOINT_ROBUSTNESS_PHASES"] == "train_and_save automodel_reload"
 
 
-def test_generate_qwen3_moe_lora_uses_isolated_reload_phases():
+def test_generate_qwen3_moe_lora_uses_all_isolated_checkpoint_phases():
     config = Path("examples/llm_finetune/qwen/qwen3_moe_30b_lora.yaml")
 
     jobs = dict(generate_job(config, {}, "release", "llm_finetune", "."))
@@ -143,15 +261,51 @@ def test_generate_qwen3_moe_lora_uses_isolated_reload_phases():
     variables = jobs[""]["variables"]
     assert "CHECKPOINT_ROBUSTNESS_PHASES" not in ci_config.get("env_vars", {})
     assert variables["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True"
+    assert variables["TIME"] == "00:30:00"
     assert variables["CHECKPOINT_ROBUSTNESS_PROCESS_ISOLATION"] == "true"
     assert variables["CHECKPOINT_ROBUSTNESS_PHASES"] == (
-        "source_load_reference source_load_parity train_and_save automodel_reload hf_reload"
+        "source_load_reference source_load_parity train_and_save automodel_reload hf_reload resume"
     )
-    assert robustness["check_source_load_parity"] is True
-    assert robustness["skip_hf_logit_parity"] is True
-    assert robustness["source_load_kl_threshold"] == 3e-2
-    assert robustness["source_load_mean_kl_threshold"] == 6e-3
-    assert robustness["source_load_cosine_threshold"] == 0.997
+    assert "check_source_load_parity" not in robustness
+    assert "skip_source_load_parity" not in robustness
+    assert "skip_automodel_reload_logit_parity" not in robustness
+    assert "skip_hf_reload_logit_parity" not in robustness
+    assert "skip_resume" not in robustness
+    for key in (
+        "source_load_kl_threshold",
+        "source_load_mean_kl_threshold",
+        "source_load_cosine_threshold",
+    ):
+        assert key not in robustness
+
+
+def test_generate_nemotron_resume_cohort_preserves_known_issue_gating():
+    expected_times = {
+        "customizer_nemotron_nano_peft": "00:30:00",
+        "customizer_nemotron_nano_peft_packing": "00:30:00",
+        "nemotron_nano_4b_squad_peft": "00:30:00",
+        "nemotron_nano_8b_v1_squad": "00:25:00",
+        "nemotron_nano_8b_v1_squad_peft": "00:25:00",
+        "nemotron_nano_9b_squad": "00:30:00",
+        "nemotron_nano_9b_squad_peft": "00:30:00",
+        "nemotron_nano_v3_hellaswag_peft": "00:30:00",
+    }
+
+    for recipe_name, expected_time in expected_times.items():
+        config = Path(f"examples/llm_finetune/nemotron/{recipe_name}.yaml")
+        jobs = dict(generate_job(config, {}, "release", "llm_finetune", "."))
+
+        job = jobs[""]
+        assert job.get("allow_failure") is None
+        assert job["variables"]["TIME"] == expected_time
+        assert job["variables"]["CHECKPOINT_ROBUSTNESS_PROCESS_ISOLATION"] == "true"
+        expected_phases = "source_load_reference source_load_parity train_and_save automodel_reload hf_reload resume"
+        if recipe_name == "nemotron_nano_8b_v1_squad":
+            expected_phases += " cross_tp_reload"
+        assert job["variables"]["CHECKPOINT_ROBUSTNESS_PHASES"] == expected_phases
+
+    known_issue_config = Path("examples/llm_finetune/nemotron/nemotron_nano_4b_squad.yaml")
+    assert generate_job(known_issue_config, {}, "release", "llm_finetune", ".") == []
 
 
 def test_generate_qwen3_moe_te_deepep_uses_isolated_source_and_reload_phases():
@@ -163,14 +317,16 @@ def test_generate_qwen3_moe_te_deepep_uses_isolated_source_and_reload_phases():
 
     variables = jobs[""]["variables"]
     assert "CHECKPOINT_ROBUSTNESS_PHASES" not in ci_config.get("env_vars", {})
-    assert variables["TIME"] == "00:20:00"
+    assert variables["TIME"] == "00:30:00"
     assert variables["CHECKPOINT_ROBUSTNESS_PROCESS_ISOLATION"] == "true"
     assert variables["CHECKPOINT_ROBUSTNESS_PHASES"] == (
-        "source_load_reference source_load_parity train_and_save automodel_reload hf_reload"
+        "source_load_reference source_load_parity train_and_save automodel_reload hf_reload resume"
     )
-    assert robustness["check_source_load_parity"] is True
-    assert robustness["source_load_kl_threshold"] == 3e-2
-    assert robustness["source_load_mean_kl_threshold"] == 6e-3
-    assert robustness["source_load_cosine_threshold"] == 0.997
+    assert "check_source_load_parity" not in robustness
+    assert "skip_source_load_parity" not in robustness
+    assert "source_load_kl_threshold" not in robustness
+    assert "source_load_mean_kl_threshold" not in robustness
+    assert "source_load_cosine_threshold" not in robustness
+    assert "skip_resume" not in robustness
     assert robustness["trust_remote_code"] is True
     assert robustness["hf_device_map_auto"] is True

@@ -16,14 +16,14 @@ import logging
 import os
 import subprocess
 import sys
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 logger = logging.getLogger(__name__)
 
 
 def get_blend_from_list(
-    blend: Optional[List[str]],
-) -> Optional[Tuple[List[str], Optional[List[float]]]]:
+    blend: List[str] | None,
+) -> Tuple[List[str], List[float] | None] | None:
     """Get the megatron.core.datasets.blended_megatron_dataset_config.BlendedMegatronDatasetConfig blend from the blend list
 
     Args:

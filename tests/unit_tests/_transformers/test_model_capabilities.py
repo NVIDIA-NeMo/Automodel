@@ -130,6 +130,12 @@ def test_gemma4_dynamic_class_blocks_static_access():
         cls.ModelCapabilities  # noqa: B018  -- attribute access is the test
 
 
+def test_gemma4_declares_model_owned_context_parallel_attention():
+    """The Gemma4 p2p ring must not be rejected for lacking a TE backend."""
+    cls = ModelRegistry.get_model_cls_from_model_arch("Gemma4ForConditionalGeneration")
+    assert cls._owns_cp_attention is True
+
+
 def test_llama_declares_context_parallel_support():
     """The shipped Llama CP KD example requires the static capability flag."""
     cls = ModelRegistry.get_model_cls_from_model_arch("LlamaForCausalLM")
@@ -230,6 +236,8 @@ def test_query_returns_canonical_type_for_static_class():
     assert caps.supports_cp is False
     assert caps.supports_ep is False
     assert caps.supports_thd is True
+    assert caps.supports_mtp_cp is False
+    assert caps.supports_mtp_cp_pp is False
     assert caps.supports_cp_vision_frame_sharding is False
 
 

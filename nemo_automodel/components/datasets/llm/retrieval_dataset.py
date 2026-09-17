@@ -20,7 +20,7 @@ from abc import ABC, abstractmethod
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, List, Tuple, Union
 
 from datasets import Dataset, concatenate_datasets, load_dataset
 from huggingface_hub import HfApi, hf_hub_download
@@ -221,7 +221,7 @@ def load_corpus_metadata(path: str):
     return metadata
 
 
-def load_corpus(path, metadata: Optional[dict] = None):
+def load_corpus(path, metadata: dict | None = None):
     """Instantiate a corpus dataset from a path and optional metadata."""
     if metadata is None:
         metadata = load_corpus_metadata(path)
@@ -258,7 +258,7 @@ def add_corpus(qa_corpus_paths: Union[dict, list], corpus_dict: dict):
 DataEntry = Union[str, dict[str, Any]]
 
 
-def _parse_data_entry(entry: DataEntry) -> Tuple[Optional[int], str]:
+def _parse_data_entry(entry: DataEntry) -> Tuple[int | None, str]:
     """
     Parse a data entry.
 
@@ -291,7 +291,7 @@ def _parse_data_entry(entry: DataEntry) -> Tuple[Optional[int], str]:
     raise ValueError(f"Invalid data entry format: {entry}. Expected a string path or a dictionary with 'path'")
 
 
-def _normalize_data_entries(data_dir_list: Union[List[DataEntry], DataEntry]) -> List[Tuple[Optional[int], str]]:
+def _normalize_data_entries(data_dir_list: Union[List[DataEntry], DataEntry]) -> List[Tuple[int | None, str]]:
     """Normalize a single source or list of sources into parsed entries."""
     if isinstance(data_dir_list, (str, dict)):
         entries = [data_dir_list]
@@ -306,7 +306,7 @@ def _normalize_data_entries(data_dir_list: Union[List[DataEntry], DataEntry]) ->
     return [entry if isinstance(entry, tuple) else _parse_data_entry(entry) for entry in entries]
 
 
-def _sample_data_items(data_items: List[dict], num_samples: Optional[int], source: str, seed: int) -> List[dict]:
+def _sample_data_items(data_items: List[dict], num_samples: int | None, source: str, seed: int) -> List[dict]:
     if num_samples is None:
         return data_items
     if num_samples >= len(data_items):
@@ -547,7 +547,7 @@ def _load_hf_subset(repo_id: str, subset: str):
     return normalized_data, corpus_info
 
 
-def _load_hf_sources(hf_entries: List[Tuple[Optional[int], str]], seed: int = 42):
+def _load_hf_sources(hf_entries: List[Tuple[int | None, str]], seed: int = 42):
     """Load one or more ``hf://`` URIs and return ``(Dataset, corpus_dict)``."""
     hf_data: List[dict] = []
     corpus_dict: dict = {}
@@ -878,8 +878,8 @@ def make_retrieval_dataset(
         corpus_dict.update(hf_corpus)
 
     if local_entries:
-        corpus_local_entries: list[tuple[Optional[int], str]] = []
-        inline_local_entries: list[tuple[Optional[int], str]] = []
+        corpus_local_entries: list[tuple[int | None, str]] = []
+        inline_local_entries: list[tuple[int | None, str]] = []
         for num_samples, local_path in local_entries:
             suffix = Path(local_path).suffix.lower()
             if suffix in {".jsonl", ".tsv", ".csv"}:

@@ -66,6 +66,7 @@ from nemo_automodel.components.datasets.llm.dspark_cache import (
 from nemo_automodel.components.datasets.llm.eagle3 import build_eagle3_dataloader
 from nemo_automodel.components.datasets.llm.offline_cache import write_cache_shards_distributed
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
+from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41DSparkTargetConfig
 from nemo_automodel.components.speculative.dspark.common import validate_target_layer_ids
 from nemo_automodel.components.speculative.dspark.registry import build_target_layer_ids
 from nemo_automodel.components.speculative.dspark.target import HFDSparkTargetModel
@@ -73,10 +74,16 @@ from nemo_automodel.components.speculative.dspark.target_utils import (
     DEEPSEEK_V4_MODEL_TYPE as _DEEPSEEK_V4_MODEL_TYPE,
 )
 from nemo_automodel.components.speculative.dspark.target_utils import (
+    DEEPSEEK_V41_MODEL_TYPE as _DEEPSEEK_V41_MODEL_TYPE,
+)
+from nemo_automodel.components.speculative.dspark.target_utils import (
     GEMMA4_MODEL_TYPES as _GEMMA4_MODEL_TYPES,
 )
 from nemo_automodel.components.speculative.dspark.target_utils import (
     GLM_5_2_MODEL_TYPE as _GLM_5_2_MODEL_TYPE,
+)
+from nemo_automodel.components.speculative.dspark.target_utils import (
+    KIMI_K3_MODEL_TYPES as _KIMI_K3_MODEL_TYPES,
 )
 from nemo_automodel.components.speculative.dspark.target_utils import (
     MINIMAX_M3_MODEL_TYPES as _MINIMAX_M3_MODEL_TYPES,
@@ -87,9 +94,11 @@ from nemo_automodel.components.speculative.dspark.target_utils import (
 from nemo_automodel.components.speculative.dspark.target_utils import (
     read_target_model_type as _read_target_model_type,
 )
+from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
 from nemo_automodel.recipes.llm._dspark_target_build import (
     build_deepseek_v4_target,
     build_glm_5_2_target,
+    build_kimi_k3_target,
     gather_full_weight_module,
     validate_dspark_parallelism_axes,
 )
@@ -152,8 +161,9 @@ def _build_target(
 ):
     """Build the frozen target for capture, dispatching on model type.
 
-    DeepSeek V4 / GLM-5.2 load through the sharded EP/FSDP path; other single-process
-    text targets (Qwen3, Gemma4) load replicated for data-parallel throughput.
+    DeepSeek V4/V4.1, GLM-5.2, and Kimi K3 load through the sharded EP/FSDP path; other
+    single-process text targets (Qwen3, Gemma4) load replicated for data-parallel
+    throughput.
     Returns ``(target_config, target_model)``.
     """
     if model_type in _MINIMAX_M3_MODEL_TYPES:
@@ -172,8 +182,39 @@ def _build_target(
             trust_remote_code=trust_remote_code,
         )
         return target_config, target_model
+    if model_type == _DEEPSEEK_V41_MODEL_TYPE:
+        target_options = DeepseekV41DSparkTargetConfig(
+            target_path=target_path,
+            trust_remote_code=trust_remote_code,
+            target_num_hidden_layers=recipe_cfg.get("target_num_hidden_layers", None),
+        )
+        target_options.attn_backend = str(recipe_cfg.get("target_attn_backend", target_options.attn_backend))
+        target_options.dispatcher = str(recipe_cfg.get("target_dispatcher", target_options.dispatcher))
+        target_options.experts = str(recipe_cfg.get("target_experts", target_options.experts))
+        target_options.enable_fsdp_optimizations = bool(
+            recipe_cfg.get("target_enable_fsdp_optimizations", target_options.enable_fsdp_optimizations)
+        )
+        distributed_setup = create_distributed_setup_from_config(cfg, world_size=world_size)
+        target_model = target_options.build(
+            device=device,
+            compute_dtype=compute_dtype,
+            distributed_setup=distributed_setup,
+        )
+        target_config = target_model.config
+        return target_config, target_model
     if model_type == _GLM_5_2_MODEL_TYPE:
         target_config, target_model, _ = build_glm_5_2_target(
+            cfg=cfg,
+            world_size=world_size,
+            device=device,
+            compute_dtype=compute_dtype,
+            target_path=target_path,
+            recipe_cfg=recipe_cfg,
+            trust_remote_code=trust_remote_code,
+        )
+        return target_config, target_model
+    if model_type in _KIMI_K3_MODEL_TYPES:
+        target_config, target_model, _ = build_kimi_k3_target(
             cfg=cfg,
             world_size=world_size,
             device=device,
@@ -250,7 +291,11 @@ def run(cfg) -> int:
     tokenizer = NeMoAutoTokenizer.from_pretrained(target_path, trust_remote_code=trust_remote_code)
     _apply_target_chat_template(tokenizer, recipe_cfg.get("chat_template", None))
 
-    target_text_config = target_config.text_config if model_type in _GEMMA4_MODEL_TYPES else target_config
+    target_text_config = (
+        target_config.text_config
+        if model_type in _GEMMA4_MODEL_TYPES or model_type == _DEEPSEEK_V41_MODEL_TYPE
+        else target_config
+    )
     num_target_layers = int(target_text_config.num_hidden_layers)
     draft_num_hidden_layers = int(recipe_cfg.get("draft_num_hidden_layers", 5))
     target_layer_ids = list(
@@ -264,6 +309,7 @@ def run(cfg) -> int:
     train_split = recipe_cfg.get("train_split", None)
     shuffle_seed = int(recipe_cfg.get("shuffle_seed", 42))
     mask_reasoning_content = bool(recipe_cfg.get("mask_reasoning_content", False))
+    mask_generation_prompt = bool(recipe_cfg.get("mask_generation_prompt", False))
     dataloader = build_eagle3_dataloader(
         data_path=recipe_cfg.train_data_path,
         tokenizer=tokenizer,
@@ -275,6 +321,7 @@ def run(cfg) -> int:
         distributed=False,
         shuffle_seed=shuffle_seed,
         mask_reasoning_content=mask_reasoning_content,
+        mask_generation_prompt=mask_generation_prompt,
     )
     num_samples = len(dataloader.dataset)
 
@@ -292,6 +339,7 @@ def run(cfg) -> int:
         shuffle_seed=shuffle_seed,
         mask_reasoning_content=mask_reasoning_content,
         chat_template_sha256=tokenizer_chat_template_sha256(tokenizer),
+        mask_generation_prompt=mask_generation_prompt,
     )
 
     # Gather the (possibly DTensor-sharded) target embed_tokens / lm_head to full

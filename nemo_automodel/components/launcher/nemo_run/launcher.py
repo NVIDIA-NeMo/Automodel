@@ -17,7 +17,7 @@ import os
 import sys
 import time as _time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import yaml
 
@@ -104,7 +104,7 @@ class NemoRunLauncher(Launcher):
         config_path: Path,
         recipe_target: str,
         launcher_config: Dict[str, Any],
-        extra_args: Optional[List[str]] = None,
+        extra_args: List[str] | None = None,
     ) -> int:
         try:
             import nemo_run as run

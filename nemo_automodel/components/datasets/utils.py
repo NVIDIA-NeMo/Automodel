@@ -13,8 +13,8 @@
 # limitations under the License.
 
 import math
-from typing import Optional
 
+import numpy as np
 import torch
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 
@@ -50,6 +50,25 @@ def extract_key_from_dicts(batch, key):
         the dictionaries in the input batch.
     """
     return list(map(lambda x: x[key], batch))
+
+
+def is_scalar_field(value) -> bool:
+    """Return whether a batch field holds one scalar per example.
+
+    Blended pretraining datasets attach per-sample provenance (``dataset_id``)
+    as a bare numpy/Python scalar alongside sequence-valued fields. Such a field
+    must be stacked to ``[B]``, not padded as a ragged sequence -- ``len()`` of a
+    numpy scalar raises ``TypeError``.
+    """
+    if isinstance(value, torch.Tensor):
+        return value.ndim == 0
+    if isinstance(value, (str, bytes)):
+        return False
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, (int, float)):
+        return True
+    return getattr(value, "ndim", None) == 0
 
 
 def pad_within_micro(batch, pad_token_id, pad_seq_len_divisible=None):
@@ -94,7 +113,7 @@ def find_last_non_pad_token(lst: list[int], value: int) -> int | None:
     return None
 
 
-def get_pad_token_from_key(val: str, pad_token_ids: Optional[dict[str, int]] = None) -> int | None:
+def get_pad_token_from_key(val: str, pad_token_ids: dict[str, int] | None = None) -> int | None:
     """Return the default pad token id for a batch field name."""
     PAD_TOKEN_IDS = {
         "labels": -100,
@@ -248,12 +267,19 @@ def default_collater(
     # key: str (e.g., "input_ids", "attention_mask", "labels", "loss_mask")
     # value: list[list[int]] (e.g., [[1, 2, 3], [4, 5, 6]])
     ans = {}
+    scalar_keys = set()
     for key in batch[0].keys():
         values = extract_key_from_dicts(batch, key)
-        if all(isinstance(v, torch.Tensor) for v in values):
+        if all(isinstance(v, torch.Tensor) and v.ndim > 0 for v in values):
             # Pre-batched fields: each value is a [batch_size, seq_len] tensor; concatenate along the
             # batch dim rather than treating it as a ragged list[int] to be padded.
             ans[key] = torch.cat([batchify(v) for v in values], dim=0)
+        elif all(is_scalar_field(v) for v in values):
+            # One scalar per example (e.g. dataset_id from a blended dataset):
+            # stack to [B]. Padding this as a ragged sequence raises, and
+            # batchify would turn [B] into [1, B].
+            ans[key] = torch.as_tensor(np.asarray(values))
+            scalar_keys.add(key)
         else:
             ans[key] = pad_within_micro(
                 values,
@@ -262,7 +288,10 @@ def default_collater(
             )
 
     # convert to tensors (already-tensor fields are passed through batchify unchanged)
-    result = {k: batchify(v if isinstance(v, torch.Tensor) else torch.LongTensor(v)) for k, v in ans.items()}
+    result = {
+        k: v if k in scalar_keys else batchify(v if isinstance(v, torch.Tensor) else torch.LongTensor(v))
+        for k, v in ans.items()
+    }
 
     # Add padding_mask. Prefer the real attention_mask: matching the pad token *value*
     # (input_ids == pad_token_id) misclassifies real tokens as padding whenever pad_token_id
@@ -397,6 +426,56 @@ def packed_sequence_thd_collater(batch):
         "seq_lens": seq_lens,
         "seq_lens_padded": seq_lens_padded,
         "qkv_format": "thd",
+    }
+
+
+def pack_features_for_thd(features: list[dict], *, ignore_index: int = -100) -> dict:
+    """Concatenate loose single-sequence features into one pre-packed THD record.
+
+    Each input feature holds one unpadded variable-length sequence
+    (``input_ids`` and optionally ``labels``). The output is a single record in
+    the pre-packed schema :func:`packed_sequence_thd_collater` accepts: flat
+    ``input_ids``/``labels``, ``position_ids`` restarting at every sequence
+    boundary, and per-sequence ``seq_lens``/``seq_lens_padded`` (no separator
+    tokens, so the two are equal).
+
+    Deciding *which* sequences share a pack is the caller's job (the sampler,
+    or an RL framework's microbatcher); this helper only executes the
+    concatenation.
+
+    Args:
+        features: per-example dicts with ``input_ids`` and optional ``labels``
+            (``list[int]`` or 1-D tensors). An example without ``labels``
+            contributes ``ignore_index`` at every position (no loss).
+        ignore_index: label fill value for examples without labels.
+
+    Returns:
+        One pre-packed feature record (plain lists), suitable as a batch item
+        for :func:`packed_sequence_thd_collater`.
+    """
+    if not features:
+        raise ValueError("pack_features_for_thd requires at least one feature")
+    input_ids: list[int] = []
+    labels: list[int] = []
+    position_ids: list[int] = []
+    seq_lens: list[int] = []
+    for feature in features:
+        ids = list(feature["input_ids"])
+        if not ids:
+            raise ValueError("cannot pack an empty sequence")
+        example_labels = list(feature["labels"]) if "labels" in feature else [ignore_index] * len(ids)
+        if len(example_labels) != len(ids):
+            raise ValueError(f"labels length {len(example_labels)} does not match input_ids length {len(ids)}")
+        input_ids.extend(ids)
+        labels.extend(example_labels)
+        position_ids.extend(range(len(ids)))
+        seq_lens.append(len(ids))
+    return {
+        "input_ids": input_ids,
+        "labels": labels,
+        "position_ids": position_ids,
+        "seq_lens": seq_lens,
+        "seq_lens_padded": list(seq_lens),
     }
 
 

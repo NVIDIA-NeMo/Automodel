@@ -49,6 +49,11 @@ distributed:
   sequence_parallel: false
   activation_checkpointing: true
 
+  moe:
+    reshard_after_forward: false
+    # fake_balanced_gate routes deterministically, so router recomputation under AC is safe and faster.
+    ignore_router_for_ac: false
+
   pipeline:
     pp_schedule: interleaved1f1b
     pp_microbatch_size: 2

@@ -52,6 +52,11 @@ class MockNemotronModel(nn.Module):
         )
         self.backbone = nn.Module()
         self.backbone.layers = nn.ModuleList([self._create_layer() for _ in range(2)])
+        self.supports = SimpleNamespace(
+            mtp_enabled=False,
+            supports_mtp_cp=False,
+            supports_mtp_cp_pp=False,
+        )
         self.__class__.__name__ = "NemotronHForCausalLM"
 
     def _create_layer(self):

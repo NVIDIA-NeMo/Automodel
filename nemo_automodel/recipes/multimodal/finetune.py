@@ -39,14 +39,20 @@ import random
 import shutil
 import time
 import warnings
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import numpy as np
 import torch
 import torch.distributed as dist
-import wandb
+
+from nemo_automodel.shared.import_utils import safe_import, safe_import_from
+
+_HAS_WANDB, wandb = safe_import(
+    "wandb", msg="wandb is not installed. To enable W&B experiment tracking, run: uv add nemo-automodel[wandb]"
+)
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config  # noqa: E402
+from nemo_automodel.components.distributed.tp_replicas import synchronize_tp_replica_gradients  # noqa: E402
 from nemo_automodel.components.loggers.log_utils import setup_logging  # noqa: E402
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger  # noqa: E402
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages  # noqa: E402
@@ -58,6 +64,7 @@ from nemo_automodel.components.models.bagel.hf_backbone_loader import (  # noqa:
 )
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG  # noqa: E402
 from nemo_automodel.components.training.step_scheduler import StepScheduler  # noqa: E402
+from nemo_automodel.components.training.utils import clip_grad_norm  # noqa: E402
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config  # noqa: E402
 from nemo_automodel.recipes._typed_config import RecipeConfig  # noqa: E402
 from nemo_automodel.recipes.base_recipe import BaseRecipe  # noqa: E402
@@ -739,8 +746,8 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
         # the per-token-averaged loss gradient on each side.
         ws = self.dist_env.world_size
         microbatch_loss = torch.zeros((), device=self.dist_env.device, dtype=torch.float32)
-        ce_logged: Optional[torch.Tensor] = None
-        mse_logged: Optional[torch.Tensor] = None
+        ce_logged: torch.Tensor | None = None
+        mse_logged: torch.Tensor | None = None
         if ce is not None and num_ce_tokens_global > 0:
             ce_term = ce.sum() * ws / max(num_ce_tokens_global, 1)
             microbatch_loss = microbatch_loss + ce_term
@@ -769,7 +776,7 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
 
         return data
 
-    def _run_train_optim_step(self, batches, max_grad_norm: Optional[float] = None):
+    def _run_train_optim_step(self, batches, max_grad_norm: float | None = None):
         """Execute a training step; supports grad accumulation trivially.
 
         BAGEL packs variable token counts per microbatch. For gradient
@@ -777,7 +784,7 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
         over the whole optimizer step, not by each microbatch independently.
         """
         device = self.dist_env.device
-        loss_buffer: List[Dict[str, Optional[torch.Tensor]]] = []
+        loss_buffer: List[Dict[str, torch.Tensor | None]] = []
         total_tokens = 0
         total_ce_tokens = 0
         total_mse_tokens = 0
@@ -809,20 +816,16 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
                 num_batches=num_batches,
             )
 
-        # Grad clip + step.
-        # FSDP2 sharded parameters expose ``clip_grad_norm_`` via the manager,
-        # but the simplest cross-wrapper approach is torch.nn.utils.clip_grad_norm_
-        # on trainable params. FSDP2 DTensor params play nice with it in newer
-        # torch versions; for older ones we fall back to the raw compute.
-        if max_grad_norm is not None and max_grad_norm > 0:
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                [p for p in self.model.parameters() if p.requires_grad],
-                max_norm=max_grad_norm,
-                norm_type=2.0,
-                foreach=True,
-            )
-        else:
-            grad_norm = torch.tensor(0.0, device=device)
+        # Synchronize unsharded TP replicas once at the optimizer boundary,
+        # then compute a sharding-aware norm and clip when configured.
+        clip_threshold = max_grad_norm if max_grad_norm is not None and max_grad_norm > 0 else None
+        synchronize_tp_replica_gradients([self.model], self.device_mesh)
+        grad_norm = clip_grad_norm(
+            clip_threshold,
+            [self.model],
+            device_mesh=self.device_mesh,
+            foreach=True,
+        )
 
         # LR warmup (stateless; called before each optimizer.step).
         self._apply_warmup(self.step_scheduler.step)
@@ -934,7 +937,7 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
         epoch: int,
         step: int,
         train_loss: float,
-        val_loss: Optional[Dict[str, float]] = None,
+        val_loss: Dict[str, float] | None = None,
         best_metric_key: str = "default",
     ) -> None:
         """Save BAGEL state and include the frozen VAE as a checkpoint sidecar."""
@@ -981,8 +984,11 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
     # ------------------------------------------------------------------
     def _build_wandb(self):
         assert self.cfg.get("wandb", None) is not None
-        from wandb import Settings
-
+        _, _Settings = safe_import_from(
+            "wandb",
+            "Settings",
+            msg="wandb is not installed. To enable W&B experiment tracking, run: uv add nemo-automodel[wandb]",
+        )
         kwargs = self.cfg.wandb.to_dict()
         if kwargs.get("name", "") == "":
             # default name: model basename.
@@ -991,7 +997,7 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
         run = wandb.init(
             **kwargs,
             config=self.cfg.to_dict(),
-            settings=Settings(silent=True),
+            settings=_Settings(silent=True),
         )
         return run
 
@@ -1001,7 +1007,7 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
         if not self.step_scheduler.is_remote_logging_step:
             self.metric_logger_train.log(log_data)
             return
-        if wandb.run is not None:
+        if _HAS_WANDB and wandb.run is not None:
             wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
         self.metric_logger_train.log(log_data)
         logging.info(
@@ -1029,7 +1035,7 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
 # ---------------------------------------------------------------------------
 
 
-def main(config_path: Optional[str] = None) -> None:
+def main(config_path: str | None = None) -> None:
     """Run the BAGEL multimodal training recipe from a YAML config path."""
     if config_path is None:
         config_path = "examples/multimodal_finetune/bagel/bagel_sft.yaml"

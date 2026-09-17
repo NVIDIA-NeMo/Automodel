@@ -20,8 +20,6 @@ Ministral3, Qwen3, ...) do not import these directly; the trainer wires them
 in around ``BiEncoderModel.encode``.
 """
 
-from typing import Optional
-
 import torch
 import torch.distributed as dist
 import torch.distributed.nn.functional as dist_nn_func
@@ -39,7 +37,7 @@ def _all_gather_tensor(t: torch.Tensor, preserve_grad: bool = False) -> torch.Te
     return torch.cat(gathered, dim=0)
 
 
-def dist_gather_tensor(t: Optional[torch.Tensor], preserve_grad: bool = False) -> Optional[torch.Tensor]:
+def dist_gather_tensor(t: torch.Tensor | None, preserve_grad: bool = False) -> torch.Tensor | None:
     """All-gather ``t`` along dim 0 across the default process group.
 
     When ``preserve_grad`` is true, tensors that require gradients use an
@@ -59,10 +57,10 @@ def dist_gather_tensor(t: Optional[torch.Tensor], preserve_grad: bool = False) -
 
 
 def dist_gather_tensor_with_dim1_padding(
-    t: Optional[torch.Tensor],
+    t: torch.Tensor | None,
     padding_value: int | float | bool = 0,
     preserve_grad: bool = False,
-) -> Optional[torch.Tensor]:
+) -> torch.Tensor | None:
     """All-gather ``t`` after padding dim 1 to the maximum length across ranks."""
     if t is None:
         return None

@@ -1,0 +1,157 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Continue pretraining the language model in the 121B Super 3.5 VL checkpoint.
+# FineWeb must be tokenized with this checkpoint's tokenizer into Megatron .bin/.idx.
+# The tutorial generates a launch YAML with explicit dataset paths and W&B settings.
+# 8 nodes x 8 H100: cp4 / ep64 / dp16; global batch 32 = 2 microbatches per DP rank.
+# The tutorial reports 200 measured steps from this 10,000-step schedule/data horizon.
+# Periodic sharded checkpoints are retained; consolidate a selected checkpoint if needed.
+# W&B is enabled in the tutorial's launch command with --wandb.enable=true.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
+step_scheduler:
+  global_batch_size: 32
+  local_batch_size: 1
+  max_steps: 10000
+  num_epochs: null
+  log_remote_every_steps: 1
+  ckpt_every_steps: 100
+  val_every_steps: 25
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1234
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained
+  trust_remote_code: true
+  torch_dtype: torch.bfloat16
+  num_nextn_predict_layers: 0
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: te
+    linear: te
+    experts: torch_mm
+    dispatcher: deepep
+    rms_norm: torch_fp32
+    rope_fusion: false
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 4
+  pp_size: 1
+  ep_size: 64
+  sequence_parallel: false
+  activation_checkpointing: true
+  reshard_after_forward: true
+  moe:
+    reshard_after_forward: true
+  multimodal:
+    frozen_sharding: replicate
+
+freeze_config:
+  freeze_vision_tower: true
+  freeze_audio_tower: true
+  freeze_language_model: false
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints/nemotron_3_5_super_vl_fineweb_cpt
+  model_save_format: safetensors
+  save_consolidated: false
+  max_recent_checkpoints: 2
+  cpu_offload: true
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+  fp32_upcast: true
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.megatron_dataset.MegatronPretraining
+  paths: /path/to/shared/super35_fineweb/megatron/fineweb_0_text_document
+  index_mapping_dir: /path/to/shared/super35_fineweb/megatron/index_mapping
+  tokenizer:
+    _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained
+    trust_remote_code: true
+  seq_length: 4096
+  seed: 1234
+  split: "99,1,0"
+  splits_to_build: train
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: torch.utils.data.default_collate
+  dataloader_type: single
+  num_workers: 0
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.megatron_dataset.MegatronPretraining
+  paths: /path/to/shared/super35_fineweb/megatron/fineweb_0_text_document
+  index_mapping_dir: /path/to/shared/super35_fineweb/megatron/index_mapping
+  tokenizer:
+    _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained
+    trust_remote_code: true
+  seq_length: 4096
+  seed: 1234
+  split: "99,1,0"
+  splits_to_build: validation
+  num_val_samples: 128
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: torch.utils.data.default_collate
+  dataloader_type: single
+  num_workers: 0
+
+optimizer:
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+  lr: 1.0e-5
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  weight_decay: 0.1
+  master_weights: true
+  store_param_remainders: true
+  exp_avg_dtype: torch.bfloat16
+  exp_avg_sq_dtype: torch.bfloat16
+
+lr_scheduler:
+  lr_decay_style: cosine
+  lr_warmup_steps: 10
+  min_lr: 1.0e-6
+
+wandb:
+  enable: false
+  entity: your-wandb-entity
+  project: your-wandb-project
+  name: nemotron_3_5_super_vl_fineweb_cpt
+  mode: online
+
+ci:
+  recipe_owner: HuiyingLi
+  nodes: 8
+  time: "00:30:00"
+  max_steps: 20

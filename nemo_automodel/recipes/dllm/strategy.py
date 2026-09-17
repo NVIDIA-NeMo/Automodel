@@ -32,7 +32,7 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from contextlib import nullcontext
-from typing import Dict, Optional, Tuple
+from typing import Dict, Tuple
 
 import torch
 import torch.nn as nn
@@ -44,6 +44,7 @@ from nemo_automodel.components.attention.idlm_mask import (
 from nemo_automodel.components.datasets.dllm.corruption import (
     corrupt_all_masked,
     corrupt_blockwise,
+    corrupt_mix,
     corrupt_uniform,
     corrupt_uniform_random,
 )
@@ -54,6 +55,8 @@ from nemo_automodel.components.loss.dllm_loss import (
     HybridDiffusionLLMLoss,
     IDLMLoss,
     MDLMCrossEntropyLoss,
+    SCDDLoss,
+    scdd_schedule,
 )
 
 logger = logging.getLogger(__name__)
@@ -129,7 +132,7 @@ class DLLMStrategy(ABC):
         *,
         loss_buffer: list,
         num_diffusion_tokens: int,
-        num_ar_tokens: Optional[int] = None,
+        num_ar_tokens: int | None = None,
         num_batches: int,
         is_train: bool = True,
     ) -> None:
@@ -156,9 +159,9 @@ class DLLMStrategy(ABC):
         mask_token_id: int,
         *,
         eps: float,
-        block_size: Optional[int],
-        half_life_ratio: Optional[float],
-        generator: Optional[torch.Generator] = None,
+        block_size: int | None,
+        half_life_ratio: float | None,
+        generator: torch.Generator | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return ``(noisy_input_ids, noise_mask, p_mask)``.
 
@@ -197,6 +200,147 @@ class MDLMStrategy(DLLMStrategy):
     def prepare_batch(self, batch, noisy_input_ids, noise_mask, clean_input_ids):
         batch["input_ids"] = noisy_input_ids
         batch.pop("attention_mask", None)  # MDLM models are bidirectional
+        return batch
+
+
+class SCDDStrategy(DLLMStrategy):
+    """Strategy for SCDD (Self-Correcting Discrete Diffusion).
+
+    Paper: https://openreview.net/forum?id=zQKlzKB6I9
+
+    SCDD generalises MDLM by adding a uniform-transition channel to the
+    absorbing forward process, so the denoiser is trained on contexts that
+    contain wrong-but-plausible tokens and learns to overwrite them. That
+    self-correction is what lets it decode many tokens per step without the
+    quality collapse a pure absorbing model shows under parallel decoding.
+
+    - Loss: :class:`SCDDLoss` — the discrete-time NELBO with a denoising term at
+      ``[MASK]`` positions and a correction term everywhere else.
+    - Corruption: :func:`corrupt_mix` driven by :func:`scdd_schedule` at a
+      diffusion time drawn on the ``1/T`` grid.
+    - Normalization: ``"supervised"`` — the ELBO is supported on every
+      supervised position, not only the corrupted ones.
+    - Batch: like MDLM, the model receives the corrupted tokens as ``input_ids``
+      and attends bidirectionally.
+
+    Time conditioning: the SCDD reference backbone takes the noise level as an
+    input. Pretrained masked-dLLM checkpoints in Automodel (LLaDA and friends)
+    are time-free — they read the corruption level off the number of visible
+    ``[MASK]`` tokens — so no time embedding is threaded into the forward pass
+    here, matching :class:`MDLMStrategy`. The schedule still enters the
+    objective through the ELBO weights.
+
+    Requires ``dllm.vocab_size`` and ``dllm.mask_token_id``: the uniform channel
+    samples replacements over the vocabulary minus ``[MASK]``, and the loss
+    re-parameterises the model output over that same domain. Context parallelism
+    is unsupported — the ELBO scores the corrupted tokens against the clean
+    targets, which the recipe keeps unsharded.
+    """
+
+    def __init__(self) -> None:
+        # vocab_size and the schedule hyperparameters are not part of the
+        # apply_corruption ABC signature, so they are captured from the dllm
+        # config in create_loss_fn, which the recipe always calls during setup
+        # before any corruption runs.
+        self._vocab_size: int | None = None
+        self._num_timesteps: int = 1000
+        self._max_ratio: float = 0.1
+        self._gamma_shape: float = 1.0
+        self._t_peak: float = 0.5
+
+    def create_loss_fn(self, dllm_cfg: dict) -> nn.Module:
+        vocab_size = dllm_cfg.get("vocab_size", None)
+        if vocab_size is None:
+            raise ValueError(
+                "SCDDStrategy requires dllm.vocab_size to be set in the config "
+                "(the uniform-transition channel draws replacements over the "
+                "vocabulary excluding [MASK] and the clean token)."
+            )
+        self._vocab_size = int(vocab_size)
+        self._num_timesteps = int(dllm_cfg.get("num_timesteps", 1000))
+        self._max_ratio = float(dllm_cfg.get("uniform_ratio", 0.1))
+        self._gamma_shape = float(dllm_cfg.get("schedule_shape", 1.0))
+        self._t_peak = float(dllm_cfg.get("schedule_peak", 0.5))
+        # Positions per checkpointed chunk of the loss's vocabulary reduction;
+        # ``null`` in YAML disables chunking. This is the memory knob for long
+        # sequences on a large vocabulary.
+        chunk_size = dllm_cfg.get("chunk_size", 1024)
+        # mask_token_id may still be unresolved here (the recipe falls back to
+        # the tokenizer); setup_extra below installs the resolved value.
+        return SCDDLoss(
+            mask_token_id=int(dllm_cfg.get("mask_token_id", 0)),
+            num_timesteps=self._num_timesteps,
+            max_ratio=self._max_ratio,
+            gamma_shape=self._gamma_shape,
+            t_peak=self._t_peak,
+            chunk_size=None if chunk_size is None else int(chunk_size),
+        )
+
+    def setup_extra(self, recipe) -> None:
+        if getattr(recipe.distributed_config, "cp_size", 1) > 1:
+            raise ValueError("SCDD does not support context parallelism (cp_size must be 1).")
+        if recipe.mask_token_id is None:
+            raise ValueError("SCDD requires dllm.mask_token_id, or a tokenizer that resolves a mask token.")
+        model_config = getattr(recipe.model_parts[0], "config", None)
+        vocab_size = getattr(model_config, "vocab_size", None)
+        if vocab_size is not None:
+            # A wrong id silently corrupts with a real token and trains garbage.
+            if not 0 <= int(recipe.mask_token_id) < int(vocab_size):
+                raise ValueError(
+                    f"dllm.mask_token_id={recipe.mask_token_id} is outside the model vocab (size {vocab_size})."
+                )
+            # The uniform channel and the ELBO's non-[MASK] domain must both be
+            # the model's own output domain, or the objective is inconsistent.
+            if int(vocab_size) != self._vocab_size:
+                raise ValueError(f"dllm.vocab_size={self._vocab_size} does not match the model vocab ({vocab_size}).")
+        # The recipe may only resolve the mask id from the tokenizer, after
+        # create_loss_fn has already built the loss module.
+        recipe.dllm_loss_fn.mask_token_id = int(recipe.mask_token_id)
+
+    def apply_corruption(
+        self, input_ids, loss_mask, mask_token_id, *, eps, block_size, half_life_ratio, generator=None
+    ):
+        del block_size, half_life_ratio  # SCDD corrupts the whole sequence at one time
+        if self._vocab_size is None:
+            raise ValueError("SCDDStrategy.create_loss_fn must run before corruption (it captures dllm.vocab_size).")
+
+        batch = input_ids.shape[0]
+        # t ~ U(eps, 1) snapped onto the discrete grid {1/T, ..., 1}: SCDD is
+        # derived in discrete time, and the ELBO weights compare t against the
+        # previous grid point s = t - 1/T.
+        u = torch.rand((batch,), device=input_ids.device, generator=generator)
+        u = (1.0 - eps) * u + eps
+        t = ((u * self._num_timesteps).to(torch.int64).float() + 1.0) / self._num_timesteps
+        # Drop the top point t = 1, where the schedule is fully absorbed and rho
+        # is degenerate. Clamping to the previous grid point rather than to
+        # 1 - 1e-4 keeps both t and s = t - 1/T on the grid.
+        t = t.clamp(max=1.0 - 1.0 / self._num_timesteps)
+
+        sched = scdd_schedule(t, max_ratio=self._max_ratio, gamma_shape=self._gamma_shape, t_peak=self._t_peak)
+        # A uniform draw that lands back on the clean token leaves the position
+        # unchanged, so only the (K-1)/K share of the uniform mass is routed
+        # through the "replace with a different token" channel.
+        num_states = self._vocab_size - 1
+        uniform_prob = sched.uniform_mass * (num_states - 1) / num_states
+
+        noisy_input_ids, noise_mask = corrupt_mix(
+            input_ids,
+            loss_mask,
+            mask_token_id,
+            self._vocab_size,
+            mask_prob=sched.absorbed_mass,
+            uniform_prob=uniform_prob,
+            generator=generator,
+        )
+        # p_mask carries the diffusion time itself (see SCDDLoss): the mixed
+        # kernel's ELBO weights need the full schedule at t, not a single
+        # per-position corruption probability.
+        p_mask = t[:, None].expand_as(input_ids).float()
+        return noisy_input_ids, noise_mask, p_mask
+
+    def prepare_batch(self, batch, noisy_input_ids, noise_mask, clean_input_ids):
+        batch["input_ids"] = noisy_input_ids
+        batch.pop("attention_mask", None)  # SCDD models are bidirectional
         return batch
 
 
@@ -319,7 +463,7 @@ class IDLMStrategy(DLLMStrategy):
         *,
         loss_buffer: list,
         num_diffusion_tokens: int,
-        num_ar_tokens: Optional[int] = None,
+        num_ar_tokens: int | None = None,
         num_batches: int,
         is_train: bool = True,
     ) -> None:
@@ -591,7 +735,7 @@ class DFlashStrategy(DLLMStrategy):
         recipe,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-        loss_mask: Optional[torch.Tensor] = None,
+        loss_mask: torch.Tensor | None = None,
     ) -> tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
         B = input_ids.size(0)
         device = input_ids.device
@@ -623,7 +767,7 @@ class DFlashStrategy(DLLMStrategy):
         input_ids: torch.Tensor,
         attn: torch.Tensor,
         num_blocks: int,
-        loss_mask: Optional[torch.Tensor] = None,
+        loss_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Sample ``num_blocks`` anchors **per sample** and gather block tensors.
 
@@ -748,7 +892,7 @@ class DFlashStrategy(DLLMStrategy):
         *,
         loss_buffer: list,
         num_diffusion_tokens: int,
-        num_ar_tokens: Optional[int] = None,
+        num_ar_tokens: int | None = None,
         num_batches: int,
         is_train: bool = True,
     ) -> None:
@@ -1008,6 +1152,7 @@ class BlockDiffusionStrategy(DLLMStrategy):
 
 DLLM_STRATEGIES: Dict[str, type] = {
     "mdlm": MDLMStrategy,
+    "scdd": SCDDStrategy,
     "hybrid": HybridStrategy,
     "idlm": IDLMStrategy,
     "dflash": DFlashStrategy,

@@ -16,6 +16,7 @@ import json
 from copy import deepcopy
 from types import SimpleNamespace
 
+import pytest
 import torch
 from torch.utils.data import TensorDataset
 from torchdata.stateful_dataloader import StatefulDataLoader
@@ -28,7 +29,11 @@ from tests.functional_tests.checkpoint_robustness.resume_trajectory import (
     _compare_training_reproducibility,
     _configure_resumed_run,
     _configure_uninterrupted_run,
+    _disable_checkpoint_saves_after_restore,
+    _optimizer_step_summary,
+    _report_resume_comparison,
     _report_training_reproducibility,
+    _resolve_resume_loss_tolerance,
     _restored_state_mismatch,
     _resume_plan_from_config,
     _ResumePlan,
@@ -41,7 +46,12 @@ from tests.functional_tests.checkpoint_robustness.resume_trajectory import (
 
 def _config(max_steps: int = 5) -> SimpleNamespace:
     return SimpleNamespace(
-        step_scheduler=SimpleNamespace(max_steps=max_steps, ckpt_every_steps=max_steps),
+        step_scheduler=SimpleNamespace(
+            max_steps=max_steps,
+            num_epochs=1,
+            ckpt_every_steps=max_steps,
+            save_checkpoint_every_epoch=True,
+        ),
         lr_scheduler=SimpleNamespace(lr_decay_steps=None),
         checkpoint=SimpleNamespace(
             checkpoint_dir="/tmp/checkpoint-robustness",
@@ -57,7 +67,15 @@ def _trajectory(*, first_loss: float, second_loss: float, first_batch: str = "ba
         "continuation_steps": 2,
         "boundary_state": {},
         "steps": {
-            "5": {"batch_digest": first_batch, "loss": first_loss, "lr": 1e-4},
+            "5": {
+                "batch_digest": first_batch,
+                "loss": first_loss,
+                "lr": 1e-4,
+                "diagnostics": {
+                    "pre_update_model_digests": {"model_part_0.parameter.weight": "model"},
+                    "pre_update_optimizer_digests": {"optimizer_0.model_part_0.parameter.weight.step": "optimizer"},
+                },
+            },
             "6": {"batch_digest": "batch-6", "loss": second_loss, "lr": 5e-5},
         },
     }
@@ -89,7 +107,9 @@ def test_shared_resume_plan_extends_phase_one_from_the_checkpoint_boundary(tmp_p
     assert plan.boundary_step == 5
     assert plan.comparison_steps == (5, 6, 7)
     assert cfg.step_scheduler.max_steps == 8
+    assert cfg.step_scheduler.num_epochs == 8
     assert cfg.step_scheduler.ckpt_every_steps == 5
+    assert cfg.step_scheduler.save_checkpoint_every_epoch is False
     assert cfg.lr_scheduler.lr_decay_steps == 5
     assert cfg.checkpoint.save_consolidated == "final"
 
@@ -98,6 +118,16 @@ def test_shared_resume_plan_extends_phase_one_from_the_checkpoint_boundary(tmp_p
     assert cfg.checkpoint.restore_from == str(checkpoint_path)
     assert cfg.checkpoint.checkpoint_dir == str(plan.resume_checkpoint_dir)
     assert cfg.checkpoint.save_consolidated is False
+    assert cfg.step_scheduler.num_epochs == 8
+    assert cfg.step_scheduler.save_checkpoint_every_epoch is False
+
+
+def test_resume_continuation_disables_checkpoint_writes_after_restore():
+    trainer = SimpleNamespace(checkpointer=SimpleNamespace(config=SimpleNamespace(enabled=True)))
+
+    _disable_checkpoint_saves_after_restore(trainer)
+
+    assert trainer.checkpointer.config.enabled is False
 
 
 def test_resume_state_check_detects_omitted_rng_state():
@@ -105,6 +135,7 @@ def test_resume_state_check_detects_omitted_rng_state():
         "step_scheduler": {"step": 5, "epoch": 0},
         "optimizer_steps": [{"5.0": 2}],
         "optimizer_groups": [[{"lr": 1e-4, "weight_decay": 0.01}]],
+        "optimizer_group_digest": "optimizer-groups",
         "lr_scheduler_digest": "lr",
         "rng_digest": "rng",
     }
@@ -113,6 +144,74 @@ def test_resume_state_check_detects_omitted_rng_state():
     mismatch = _restored_state_mismatch(reference, restored)
 
     assert mismatch == "restored snapshot omitted required RNG state (rng_digest)"
+
+
+def test_optimizer_step_summary_treats_missing_adam_state_as_effective_zero():
+    class PartiallyUsedModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.used = torch.nn.Linear(2, 1, bias=False)
+            self.unused = torch.nn.Linear(2, 1, bias=False)
+
+    model = PartiallyUsedModel()
+    optimizer = torch.optim.AdamW(model.parameters())
+    model.used(torch.ones(1, 2)).sum().backward()
+    optimizer.step()
+
+    before_materialization = _optimizer_step_summary(optimizer)
+    optimizer.state[model.unused.weight] = {
+        "step": torch.tensor(0.0),
+        "exp_avg": torch.zeros_like(model.unused.weight),
+        "exp_avg_sq": torch.zeros_like(model.unused.weight),
+    }
+
+    assert before_materialization == [{"0.0": 1, "1.0": 1}]
+    assert _optimizer_step_summary(optimizer) == before_materialization
+
+
+@pytest.mark.parametrize(
+    ("profile", "expected"),
+    [
+        ("strict", (1e-6, 0.0, 1e-6, 0.0)),
+        ("standard", (1e-5, 2e-3, 5e-3, 2e-3)),
+        ("relaxed", (1e-4, 7.5e-3, 1e-2, 7.5e-3)),
+    ],
+)
+def test_resume_loss_tolerance_profiles(profile, expected):
+    tolerance = _resolve_resume_loss_tolerance(profile)
+
+    assert tolerance.profile == profile
+    assert (
+        tolerance.first_step_atol,
+        tolerance.first_step_rtol,
+        tolerance.later_step_atol,
+        tolerance.later_step_rtol,
+    ) == expected
+
+
+def test_resume_loss_tolerance_numeric_overrides_take_precedence():
+    tolerance = _resolve_resume_loss_tolerance(
+        "relaxed",
+        first_step_override="2e-4",
+        later_step_override=3e-2,
+    )
+
+    assert tolerance.profile == "relaxed"
+    assert tolerance.first_step_atol == 2e-4
+    assert tolerance.first_step_rtol == 0.0
+    assert tolerance.later_step_atol == 3e-2
+    assert tolerance.later_step_rtol == 0.0
+
+
+def test_resume_loss_tolerance_rejects_unknown_profile():
+    with pytest.raises(ValueError, match="unknown resume tolerance profile 'model_specific'"):
+        _resolve_resume_loss_tolerance("model_specific")
+
+
+@pytest.mark.parametrize("override", [-1e-4, float("nan"), float("inf")])
+def test_resume_loss_tolerance_rejects_invalid_numeric_override(override):
+    with pytest.raises(ValueError, match="must be finite and non-negative"):
+        _resolve_resume_loss_tolerance("standard", first_step_override=override)
 
 
 def test_stateful_sampler_restore_uses_next_batch_instead_of_raw_state_digest():
@@ -145,11 +244,13 @@ def test_stateful_sampler_restore_uses_next_batch_instead_of_raw_state_digest():
 
 
 def test_shared_trajectory_harness_runs_checkpoint_and_resume_locally(tmp_path):
-    plan = _ResumePlan(checkpoint_dir=tmp_path, boundary_step=2, continuation_steps=2)
+    # Three optimizer steps fit in each epoch, so the step-five checkpoint and
+    # its continuation exercise dataloader restoration across epoch boundaries.
+    plan = _ResumePlan(checkpoint_dir=tmp_path, boundary_step=5, continuation_steps=3)
     checkpoints: dict[int, dict[str, object]] = {}
 
     def make_trainer() -> SimpleNamespace:
-        dataset = TensorDataset(torch.arange(16, dtype=torch.float32))
+        dataset = TensorDataset(torch.arange(6, dtype=torch.float32))
         sampler = StatefulDistributedSampler(
             dataset,
             seed=42,
@@ -159,11 +260,15 @@ def test_shared_trajectory_harness_runs_checkpoint_and_resume_locally(tmp_path):
             shuffle=True,
         )
         dataloader = StatefulDataLoader(dataset, batch_size=2, sampler=sampler, num_workers=0)
-        parameter = torch.nn.Parameter(torch.tensor(1.0))
+        model = torch.nn.Linear(1, 1, bias=False)
+        parameter = model.weight
+        with torch.no_grad():
+            parameter.fill_(1.0)
         optimizer = torch.optim.Adam([parameter], lr=1e-3)
         lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
         trainer = SimpleNamespace(
             dataloader=dataloader,
+            model_parts=[model],
             parameter=parameter,
             optimizer=optimizer,
             lr_scheduler=lr_scheduler,
@@ -252,15 +357,56 @@ def test_shared_trajectory_harness_runs_checkpoint_and_resume_locally(tmp_path):
     resumed_recorder = _TrajectoryRecorder(plan, capture_boundary_state=False)
     resumed_recorder.attach(resumed)
     run(resumed)
+    resumed_trajectory = resumed_recorder.to_dict()
+    exact_tolerance = _resolve_resume_loss_tolerance(
+        "strict",
+        first_step_override=0.0,
+        later_step_override=0.0,
+    )
     assert (
         _trajectory_mismatch(
             reference,
-            resumed_recorder.to_dict(),
-            first_loss_threshold=0.0,
-            later_loss_threshold=0.0,
+            resumed_trajectory,
+            tolerance=exact_tolerance,
         )
         is None
     )
+    comparison = _report_resume_comparison(
+        plan,
+        reference,
+        resumed_trajectory,
+        exact_tolerance,
+    )
+    assert comparison["status"] == "passed"
+    assert comparison["steps"][0]["absolute_difference"] == 0.0
+    assert all(diagnostic["matches"] for diagnostic in comparison["first_step_diagnostics"].values())
+    assert (plan.artifact_dir / "resumed_trajectory_rank_0.json").exists()
+    assert (plan.artifact_dir / "resume_comparison.json").exists()
+
+    changed_trajectory = deepcopy(resumed_trajectory)
+    first_step = str(plan.comparison_steps[0])
+    model_digests = changed_trajectory["steps"][first_step]["diagnostics"]["pre_update_model_digests"]
+    changed_model_key = next(key for key in model_digests if ".parameter." in key)
+    model_digests[changed_model_key] = "changed"
+    mismatch = _trajectory_mismatch(
+        reference,
+        changed_trajectory,
+        tolerance=exact_tolerance,
+    )
+    assert "pre-update model parameters" in mismatch
+    assert changed_model_key in mismatch
+
+    changed_trajectory = deepcopy(resumed_trajectory)
+    optimizer_digests = changed_trajectory["steps"][first_step]["diagnostics"]["pre_update_optimizer_digests"]
+    changed_optimizer_key = next(iter(optimizer_digests))
+    optimizer_digests[changed_optimizer_key] = "changed"
+    mismatch = _trajectory_mismatch(
+        reference,
+        changed_trajectory,
+        tolerance=exact_tolerance,
+    )
+    assert "pre-update optimizer tensor state" in mismatch
+    assert changed_optimizer_key in mismatch
 
 
 def test_shared_trajectory_detects_shifted_dataloader_position():
@@ -270,8 +416,7 @@ def test_shared_trajectory_detects_shifted_dataloader_position():
     mismatch = _trajectory_mismatch(
         reference,
         resumed,
-        first_loss_threshold=1e-6,
-        later_loss_threshold=5e-3,
+        tolerance=_resolve_resume_loss_tolerance("standard"),
     )
 
     assert mismatch == "resumed batch identity differs at step 5; stateful dataloader position was not restored"
@@ -280,13 +425,17 @@ def test_shared_trajectory_detects_shifted_dataloader_position():
 def test_shared_trajectory_uses_stricter_first_loss_threshold():
     reference = _trajectory(first_loss=1.0, second_loss=0.9)
     resumed = _trajectory(first_loss=1.0 + 5e-7, second_loss=0.904)
+    tolerance = _resolve_resume_loss_tolerance(
+        "standard",
+        first_step_override=1e-6,
+        later_step_override=5e-3,
+    )
 
     assert (
         _trajectory_mismatch(
             reference,
             resumed,
-            first_loss_threshold=1e-6,
-            later_loss_threshold=5e-3,
+            tolerance=tolerance,
         )
         is None
     )
@@ -295,10 +444,41 @@ def test_shared_trajectory_uses_stricter_first_loss_threshold():
     mismatch = _trajectory_mismatch(
         reference,
         resumed,
-        first_loss_threshold=1e-6,
-        later_loss_threshold=5e-3,
+        tolerance=tolerance,
     )
-    assert "first-step_threshold=1.000000e-06" in mismatch
+    assert "allowed_diff=1.000000e-06" in mismatch
+    assert "rtol=0.000000e+00" in mismatch
+
+
+def test_scale_aware_profiles_classify_observed_49b_loss_drift():
+    full_model_reference = _trajectory(first_loss=0.165309, second_loss=0.9)
+    full_model_resumed = _trajectory(first_loss=0.165890, second_loss=0.9)
+
+    standard_mismatch = _trajectory_mismatch(
+        full_model_reference,
+        full_model_resumed,
+        tolerance=_resolve_resume_loss_tolerance("standard"),
+    )
+    assert "shared-trajectory loss mismatch at step 5" in standard_mismatch
+    assert (
+        _trajectory_mismatch(
+            full_model_reference,
+            full_model_resumed,
+            tolerance=_resolve_resume_loss_tolerance("relaxed"),
+        )
+        is None
+    )
+
+    peft_reference = _trajectory(first_loss=1.0, second_loss=3.608548)
+    peft_resumed = _trajectory(first_loss=1.0, second_loss=3.603262)
+    assert (
+        _trajectory_mismatch(
+            peft_reference,
+            peft_resumed,
+            tolerance=_resolve_resume_loss_tolerance("standard"),
+        )
+        is None
+    )
 
 
 def test_training_reproducibility_requires_matching_configuration_fingerprint():

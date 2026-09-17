@@ -31,7 +31,23 @@ if [ -d "$INSTALL_DIR/.git" ]; then
   echo "lm-evaluation-harness already cloned at $INSTALL_DIR, skipping."
 else
   echo "Cloning lm-evaluation-harness to $INSTALL_DIR ..."
-  git clone --depth 1 https://github.com/EleutherAI/lm-evaluation-harness "$INSTALL_DIR"
+  # CI nodes intermittently get an auth challenge instead of the repo ("could not read
+  # Username for 'https://github.com'"); retry, removing the partial checkout so the
+  # `.git` probe above cannot short-circuit it.
+  cloned=0
+  for attempt in 1 2 3; do
+    if git clone --depth 1 https://github.com/EleutherAI/lm-evaluation-harness "$INSTALL_DIR"; then
+      cloned=1
+      break
+    fi
+    echo "clone attempt ${attempt}/3 failed; retrying"
+    rm -rf "$INSTALL_DIR"
+    sleep $((attempt * 10))
+  done
+  if [ "$cloned" -ne 1 ]; then
+    echo "ERROR: could not clone lm-evaluation-harness after 3 attempts" >&2
+    exit 1
+  fi
 fi
 
 # ── Virtual-env & dependencies ───────────────────────────────────────────────
@@ -49,9 +65,11 @@ else
   # (vllm_flash_attn.cute). On older cutlass-dsl (the 4.5.x that vllm 0.25.x resolves
   # transitively) that kernel fails to compile -> GPUModuleOp / cudaErrorIllegalAddress.
   # vllm 0.26.0 + cutlass-dsl 4.6.0 compiles it cleanly (verified: gemma4 IFEval
-  # prompt_level_strict_acc=0.5360). Floor both so the nemo-ci convergence run stays on a known-good
-  # combination while still picking up newer fixes.
-  uv pip install -e ".[vllm]" "vllm>=0.26.0" "nvidia-cutlass-dsl>=4.6.0"
+  # prompt_level_strict_acc=0.5360).
+  # transformers 5.15.0 makes gemma4's per-layer head_dim raise
+  # AmbiguousGlobalPerLayerAttributeError on the plain getattr in vLLM's get_head_size(),
+  # so pin transformers too. 5.14.1 + vllm 0.26.0 is the combination we verified.
+  uv pip install -e ".[vllm]" "vllm==0.26.0" "transformers==5.14.1" "nvidia-cutlass-dsl>=4.6.0"
 
   echo "Setup complete. Activate with:  source $VENV_DIR/bin/activate"
 fi

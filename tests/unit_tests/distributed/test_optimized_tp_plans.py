@@ -42,8 +42,11 @@ from nemo_automodel.components.distributed.optimized_tp_plans import (
     _get_class_qualname,
     _parallelize_gemma3,
     _parallelize_llama,
+    _parallelize_phi,
     _parallelize_qwen,
 )
+from nemo_automodel.components.distributed.parallel_styles import ReplicatedWithGradAllReduce
+from nemo_automodel.components.models.qwen2.model import Qwen2ForCausalLM as CustomQwen2ForCausalLM
 from nemo_automodel.components.models.qwen3.model import Qwen3ForCausalLM as CustomQwen3ForCausalLM
 
 
@@ -219,6 +222,8 @@ class TestParallelizeFunctions:
         # Check parallel styles
         assert isinstance(result["model.layers.*.self_attn.q_proj"], ColwiseParallel)
         assert isinstance(result["model.layers.*.self_attn.o_proj"], RowwiseParallel)
+        assert isinstance(result["model.layers.*.self_attn.q_norm"], ReplicatedWithGradAllReduce)
+        assert isinstance(result["model.layers.*.self_attn.k_norm"], ReplicatedWithGradAllReduce)
 
     def test_parallelize_gemma3_conditional_basic(self):
         """Test _parallelize_gemma3 with Gemma3ForConditionalGeneration."""
@@ -377,10 +382,30 @@ class TestParallelizeFunctions:
 
         result = _parallelize_qwen(model, sequence_parallel=True)
 
-        # Qwen3 has q_norm/k_norm inside attention, but those should remain unwrapped.
-        # Wrapping them with SequenceParallel can incorrectly tag head-sharded activations as sequence-sharded.
-        assert "model.layers.*.self_attn.q_norm" not in result
-        assert "model.layers.*.self_attn.k_norm" not in result
+        # These norms stay local on head-sharded activations, but their replicated
+        # parameters receive partial-head gradients that must be summed.
+        assert isinstance(result["model.layers.*.self_attn.q_norm"], ReplicatedWithGradAllReduce)
+        assert isinstance(result["model.layers.*.self_attn.k_norm"], ReplicatedWithGradAllReduce)
+        q_norm = torch.nn.LayerNorm(4)
+        result["model.layers.*.self_attn.q_norm"]._apply(q_norm, MockDeviceMesh())
+        assert q_norm._nemo_tp_replica_grad_reduction == "sum"
+
+    @pytest.mark.parametrize("qk_layernorm", [False, True])
+    def test_parallelize_phi_marks_optional_qk_layernorms(self, qk_layernorm):
+        """Head-local Phi Q/K norms sum their partial TP gradients when enabled."""
+        model = SimpleNamespace(config=SimpleNamespace(qk_layernorm=qk_layernorm))
+
+        result = _parallelize_phi(model, sequence_parallel=False)
+
+        norm_keys = {
+            "model.layers.*.self_attn.q_layernorm",
+            "model.layers.*.self_attn.k_layernorm",
+        }
+        if qk_layernorm:
+            assert norm_keys <= result.keys()
+            assert all(isinstance(result[key], ReplicatedWithGradAllReduce) for key in norm_keys)
+        else:
+            assert norm_keys.isdisjoint(result)
 
 
 class TestParallelizeFunctionsMapping:
@@ -390,6 +415,7 @@ class TestParallelizeFunctionsMapping:
         """Test that PARALLELIZE_FUNCTIONS contains all expected model types."""
         expected_types = [
             Qwen2ForCausalLM,
+            CustomQwen2ForCausalLM,
             Qwen3ForCausalLM,
             CustomQwen3ForCausalLM,
             Qwen3ForSequenceClassification,
@@ -410,6 +436,7 @@ class TestParallelizeFunctionsMapping:
         """Test that all mapping functions return dictionaries."""
         all_model_types = [
             Qwen2ForCausalLM,
+            CustomQwen2ForCausalLM,
             Qwen3ForCausalLM,
             CustomQwen3ForCausalLM,
             Qwen3ForSequenceClassification,
@@ -432,10 +459,12 @@ class TestParallelizeFunctionsMapping:
     def test_qwen2_and_qwen3_use_same_function(self):
         """Test that Qwen2 and Qwen3 models use the same parallelization function."""
         qwen2_func = PARALLELIZE_FUNCTIONS[_get_class_qualname(Qwen2ForCausalLM)]
+        custom_qwen2_func = PARALLELIZE_FUNCTIONS[_get_class_qualname(CustomQwen2ForCausalLM)]
         qwen3_func = PARALLELIZE_FUNCTIONS[_get_class_qualname(Qwen3ForCausalLM)]
         custom_qwen3_func = PARALLELIZE_FUNCTIONS[_get_class_qualname(CustomQwen3ForCausalLM)]
 
         assert qwen2_func is qwen3_func
+        assert qwen2_func is custom_qwen2_func
         assert qwen3_func is custom_qwen3_func
         assert qwen2_func is _parallelize_qwen
 
@@ -466,6 +495,7 @@ class TestParallelPlanStructure:
             PrepareModuleInput,
             PrepareModuleOutput,
             RotaryEmbedParallel,
+            ReplicatedWithGradAllReduce,
         )
 
         for model, func in mock_models:
@@ -658,6 +688,52 @@ class TestParallelizeFalconH1:
         ):
             assert key in PARALLELIZE_FUNCTIONS, f"{key} not registered"
             assert PARALLELIZE_FUNCTIONS[key] is _parallelize_falcon_h1
+
+
+class TestParallelizeMuseGlimmer:
+    """MuseGlimmer uses one complete language TP plan for its supported TP1/TP2 sizes."""
+
+    def test_tp2_shards_complete_language_backbone(self):
+        from nemo_automodel.components.distributed.optimized_tp_plans import _parallelize_muse_glimmer
+
+        plan = _parallelize_muse_glimmer(model=None)
+        for key in (
+            "model.layers.*.self_attn.q_proj",
+            "model.layers.*.self_attn.k_proj",
+            "model.layers.*.self_attn.v_proj",
+            "model.layers.*.self_attn.output_gate_proj",
+            "model.layers.*.mlp.gate_proj",
+            "model.layers.*.mlp.up_proj",
+            "lm_head",
+        ):
+            assert isinstance(plan[key], ColwiseParallel)
+        for key in (
+            "model.layers.*.self_attn.o_proj",
+            "model.layers.*.mlp.down_proj",
+        ):
+            assert isinstance(plan[key], RowwiseParallel)
+        assert not any("vision" in key for key in plan)
+
+    def test_sequence_parallel_is_explicitly_ignored(self):
+        from nemo_automodel.components.distributed.optimized_tp_plans import _parallelize_muse_glimmer
+
+        with pytest.warns(UserWarning, match="not yet supported for MuseGlimmer"):
+            plan_sp = _parallelize_muse_glimmer(model=None, sequence_parallel=True)
+        plan = _parallelize_muse_glimmer(model=None, sequence_parallel=False)
+        assert plan.keys() == plan_sp.keys()
+        assert {key: type(style) for key, style in plan.items()} == {key: type(style) for key, style in plan_sp.items()}
+
+    def test_native_class_qualname_is_registered(self):
+        from nemo_automodel._transformers.capabilities import _has_optimized_tp_plan
+        from nemo_automodel.components.distributed.optimized_tp_plans import (
+            PARALLELIZE_FUNCTIONS,
+            _parallelize_muse_glimmer,
+        )
+        from nemo_automodel.components.models.muse_glimmer.model import MuseGlimmerForConditionalGeneration
+
+        key = "nemo_automodel.components.models.muse_glimmer.model.MuseGlimmerForConditionalGeneration"
+        assert PARALLELIZE_FUNCTIONS[key] is _parallelize_muse_glimmer
+        assert _has_optimized_tp_plan(MuseGlimmerForConditionalGeneration)
 
 
 if __name__ == "__main__":

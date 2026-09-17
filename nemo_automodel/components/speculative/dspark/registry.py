@@ -21,12 +21,14 @@ string so adding a target family is a one-line append, with no recipe change.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Protocol, runtime_checkable
 
 from torch import nn
 
 from nemo_automodel.components.speculative.dspark.draft_deepseek_v4 import DeepseekV4DSparkModel
 from nemo_automodel.components.speculative.dspark.draft_gemma4 import Gemma4DSparkModel
 from nemo_automodel.components.speculative.dspark.draft_glm_5_2 import Glm5_2DSparkModel
+from nemo_automodel.components.speculative.dspark.draft_kimi_k3 import KimiK3DSparkModel
 from nemo_automodel.components.speculative.dspark.draft_minimax_m3 import MiniMaxM3DSparkModel
 from nemo_automodel.components.speculative.dspark.draft_qwen3 import Qwen3DSparkModel
 
@@ -38,6 +40,14 @@ class DraftSpec:
     # Constructed as ``draft_cls(draft_config)``; some drafts are HF PreTrainedModel
     # subclasses (Qwen3, Gemma4) while others are plain modules (V4, GLM, MiniMax M3).
     draft_cls: type[nn.Module]
+
+
+@runtime_checkable
+class ModelOwnedDSparkProvider(Protocol):
+    """Target config that owns construction of its architecture-specific draft."""
+
+    def build_dspark_draft(self, options: object) -> nn.Module:
+        """Build a draft from the generic recipe's declarative options."""
 
 
 # Qwen3-style dense (and MoE) targets: the draft only consumes the target's
@@ -58,6 +68,8 @@ DSPARK_DRAFT_REGISTRY["DeepseekV4ForCausalLM"] = DraftSpec(draft_cls=DeepseekV4D
 # Q-LoRA + compressed KV latent + interleaved complex RoPE), with the DSA indexer and MoE
 # dropped. Registered separately because its MLA backbone differs from V4's.
 DSPARK_DRAFT_REGISTRY["GlmMoeDsaForCausalLM"] = DraftSpec(draft_cls=Glm5_2DSparkModel)
+DSPARK_DRAFT_REGISTRY["KimiK3ForCausalLM"] = DraftSpec(draft_cls=KimiK3DSparkModel)
+DSPARK_DRAFT_REGISTRY["KimiK3ForConditionalGeneration"] = DraftSpec(draft_cls=KimiK3DSparkModel)
 # Gemma4 targets: the MoE VLM (model_type "gemma4") and the encoder-free unified model
 # (model_type "gemma4_unified") share one dense Gemma4 draft built from the target's
 # text sub-config.
@@ -101,4 +113,10 @@ def build_target_layer_ids(num_target_layers: int, num_feature_layers: int) -> l
     return ids
 
 
-__all__ = ["DraftSpec", "DSPARK_DRAFT_REGISTRY", "resolve_dspark_draft_spec", "build_target_layer_ids"]
+__all__ = [
+    "DraftSpec",
+    "DSPARK_DRAFT_REGISTRY",
+    "ModelOwnedDSparkProvider",
+    "resolve_dspark_draft_spec",
+    "build_target_layer_ids",
+]

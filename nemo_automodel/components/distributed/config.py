@@ -38,7 +38,7 @@ Usage:
 from __future__ import annotations
 
 from dataclasses import dataclass, field, fields
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Tuple, Union
 
 import torch
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
@@ -176,9 +176,9 @@ class MoEParallelizerConfig:
     # torch.utils.checkpoint raise a CheckpointError on the backward recompute.
     ignore_router_for_ac: bool = True
     reshard_after_forward: bool = False
-    lm_head_precision: Optional[Union[str, torch.dtype]] = None
+    lm_head_precision: Union[str, torch.dtype] | None = None
     wrap_outer_model: bool = True
-    mp_policy: Optional[MixedPrecisionPolicy] = None
+    mp_policy: MixedPrecisionPolicy | None = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {f.name: getattr(self, f.name) for f in fields(self)}
@@ -301,9 +301,9 @@ class FSDP2Config:
     """
 
     sequence_parallel: bool = False
-    tp_plan: Optional[dict] = None
+    tp_plan: dict | None = None
     patch_is_packed_sequence: bool = False
-    mp_policy: Optional[MixedPrecisionPolicy] = field(
+    mp_policy: MixedPrecisionPolicy | None = field(
         default_factory=lambda: MixedPrecisionPolicy(
             param_dtype=torch.bfloat16,
             reduce_dtype=torch.float32,
@@ -311,12 +311,12 @@ class FSDP2Config:
             cast_forward_inputs=True,
         )
     )
-    offload_policy: Optional[CPUOffloadPolicy] = None
-    autocast_dtype: Optional[torch.dtype] = None
+    offload_policy: CPUOffloadPolicy | None = None
+    autocast_dtype: torch.dtype | None = None
     activation_checkpointing: ActivationCheckpointingMode = False
     activation_checkpointing_scope: ActivationCheckpointingScope = "all"
     defer_fsdp_grad_sync: bool = True
-    reshard_after_forward: Optional[bool] = None
+    reshard_after_forward: bool | None = None
     enable_async_tensor_parallel: bool = False
     enable_compile: bool = False
     enable_fsdp2_prefetch: bool = False
@@ -443,9 +443,9 @@ class DDPConfig:
     broadcast_buffers: bool = False
     find_unused_parameters: bool = False
     static_graph: bool = False
-    bucket_cap_mb: Optional[float] = None
+    bucket_cap_mb: float | None = None
     gradient_as_bucket_view: bool = False
-    autocast_dtype: Optional[torch.dtype] = None
+    autocast_dtype: torch.dtype | None = None
 
     def __post_init__(self):
         self.activation_checkpointing_scope = normalize_activation_checkpointing_scope(

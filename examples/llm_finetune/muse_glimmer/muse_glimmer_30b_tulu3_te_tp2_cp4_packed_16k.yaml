@@ -75,17 +75,8 @@ distributed:
   reshard_after_forward: true
   defer_fsdp_grad_sync: false
 
-# Checkpointed linear CE avoids materializing an [4096, 202048] local logits
-# tensor and needs no optional package. Native MuseGlimmer folds
-# output_multiplier into hidden states; the soft cap below therefore matches
-# the native HF logits exactly.
 loss_fn:
-  _target_: nemo_automodel.components.loss.linear_ce.CheckpointedLinearCrossEntropy
-  logit_softcapping: 20.0
-  reduction: sum
-  # Keep the transient fp32 vocabulary projection small enough that TE's
-  # CP4 p2p communicators still have CUDA allocation headroom in backward.
-  chunk_size: 64
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
