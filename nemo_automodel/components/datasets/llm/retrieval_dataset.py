@@ -651,6 +651,7 @@ def _transform_func(
     use_dataset_instruction: bool = False,
     epoch: int = 0,
     use_text_in_document: bool = False,
+    prob_text_with_image: float = 1.0,
     use_ocr_text: str | None = None,
     prob_sample_ocr_text_with_image: float = 1.0,
 ):
@@ -664,6 +665,7 @@ def _transform_func(
         use_dataset_instruction: Whether to use instruction from dataset's metadata
         epoch: Current epoch for cycling through positive documents
         use_text_in_document: Whether image documents should also include their text
+        prob_text_with_image: Probability of including the main text field with an image
         use_ocr_text: OCR field to include (``simple_ocr`` or ``complex_ocr``)
         prob_sample_ocr_text_with_image: Probability of including OCR text with an image
     """
@@ -749,7 +751,7 @@ def _transform_func(
             if cur_doc["text"] != "" and not cur_doc["image"]:
                 text = cur_doc["text"]
             elif use_text_in_document and cur_doc["image"]:
-                text = " " + cur_doc["text"] if cur_doc["text"] else ""
+                text = " " + cur_doc["text"] if cur_doc["text"] and random.random() < prob_text_with_image else ""
                 if use_ocr_text and random.random() < prob_sample_ocr_text_with_image:
                     if use_ocr_text == "simple_ocr" and cur_doc.get("nr_ocr"):
                         text += " " + cur_doc["nr_ocr"]
@@ -804,6 +806,7 @@ def _cross_encoder_transform_func(
     use_dataset_instruction: bool = False,
     epoch: int = 0,
     use_text_in_document: bool = False,
+    prob_text_with_image: float = 1.0,
     use_ocr_text: str | None = None,
     prob_sample_ocr_text_with_image: float = 1.0,
 ):
@@ -819,6 +822,7 @@ def _cross_encoder_transform_func(
         use_dataset_instruction,
         epoch=epoch,
         use_text_in_document=use_text_in_document,
+        prob_text_with_image=prob_text_with_image,
         use_ocr_text=use_ocr_text,
         prob_sample_ocr_text_with_image=prob_sample_ocr_text_with_image,
     )
@@ -840,6 +844,7 @@ class RetrievalTransform:
         model_type: str = "bi_encoder",
         cycle_positive_docs: bool = False,
         use_text_in_document: bool = False,
+        prob_text_with_image: float = 1.0,
         use_ocr_text: str | None = None,
         prob_sample_ocr_text_with_image: float = 1.0,
     ):
@@ -851,6 +856,7 @@ class RetrievalTransform:
         self.model_type = model_type
         self.cycle_positive_docs = cycle_positive_docs
         self.use_text_in_document = use_text_in_document
+        self.prob_text_with_image = prob_text_with_image
         self.use_ocr_text = use_ocr_text
         self.prob_sample_ocr_text_with_image = prob_sample_ocr_text_with_image
         self.epoch = 0
@@ -865,6 +871,7 @@ class RetrievalTransform:
                 use_dataset_instruction=self.use_dataset_instruction,
                 epoch=epoch,
                 use_text_in_document=self.use_text_in_document,
+                prob_text_with_image=self.prob_text_with_image,
                 use_ocr_text=self.use_ocr_text,
                 prob_sample_ocr_text_with_image=self.prob_sample_ocr_text_with_image,
             )
@@ -875,6 +882,7 @@ class RetrievalTransform:
             use_dataset_instruction=self.use_dataset_instruction,
             epoch=epoch,
             use_text_in_document=self.use_text_in_document,
+            prob_text_with_image=self.prob_text_with_image,
             use_ocr_text=self.use_ocr_text,
             prob_sample_ocr_text_with_image=self.prob_sample_ocr_text_with_image,
         )
@@ -897,6 +905,7 @@ def make_retrieval_dataset(
     use_dataset_instruction: bool = False,
     cycle_positive_docs: bool = False,
     use_text_in_document: bool = False,
+    prob_text_with_image: float = 1.0,
     use_ocr_text: str | None = None,
     prob_sample_ocr_text_with_image: float = 1.0,
 ):
@@ -928,6 +937,7 @@ def make_retrieval_dataset(
             Defaults to ``False`` (always use the first positive document). Set to ``True`` only
             when a query has multiple positive documents and you want to rotate through them by epoch.
         use_text_in_document: Whether image documents should also include their text.
+        prob_text_with_image: Probability of including the main text field with an image.
         use_ocr_text: OCR field to include (``simple_ocr`` or ``complex_ocr``).
         prob_sample_ocr_text_with_image: Probability of including OCR text with an image.
 
@@ -1022,6 +1032,7 @@ def make_retrieval_dataset(
             model_type,
             cycle_positive_docs,
             use_text_in_document,
+            prob_text_with_image,
             use_ocr_text,
             prob_sample_ocr_text_with_image,
         )
@@ -1043,6 +1054,7 @@ def make_retrieval_dataset(
             model_type,
             cycle_positive_docs,
             use_text_in_document,
+            prob_text_with_image,
             use_ocr_text,
             prob_sample_ocr_text_with_image,
         )
@@ -1084,6 +1096,8 @@ class RetrievalDatasetConfig:
     """Whether to rotate through multiple positive documents by epoch during training."""
     use_text_in_document: bool = False
     """Whether image documents should also include their text."""
+    prob_text_with_image: float = 1.0
+    """Probability of including the main text field with an image."""
     use_ocr_text: str | None = None
     """OCR field to include (``simple_ocr`` or ``complex_ocr``)."""
     prob_sample_ocr_text_with_image: float = 1.0
@@ -1104,6 +1118,7 @@ class RetrievalDatasetConfig:
             use_dataset_instruction=self.use_dataset_instruction,
             cycle_positive_docs=self.cycle_positive_docs,
             use_text_in_document=self.use_text_in_document,
+            prob_text_with_image=self.prob_text_with_image,
             use_ocr_text=self.use_ocr_text,
             prob_sample_ocr_text_with_image=self.prob_sample_ocr_text_with_image,
         )
