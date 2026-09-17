@@ -13,7 +13,6 @@
 # limitations under the License.
 
 # Benchmarking config for Qwen3 Next Te Deepep
-
 # To run this recipe:
 #   automodel examples/llm_benchmark/qwen/qwen3_next_te_deepep.yaml --nproc-per-node 8
 # Adjust --nproc-per-node to the number of GPUs available on your machine.
@@ -81,6 +80,8 @@ model:
     rope_fusion: true
     experts: gmm
     dispatcher: hybridep
+    # The dense route is faster for this H100 shape; compact routing remains opt-in.
+    dispatcher_hybridep_compact_routing: false
     fake_balanced_gate: true
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true

@@ -96,6 +96,46 @@ distributed:
     layers_per_stage: 2
 ```
 
+## Configure HybridEP Routing
+
+Several large-scale MoE recipes use the [HybridEP dispatcher](https://github.com/deepseek-ai/DeepEP/tree/hybrid-ep) to combine expert-parallel token permutation and communication. Select it in the model backend:
+
+```yaml
+model:
+  backend:
+    experts: gmm
+    dispatcher: hybridep
+```
+
+HybridEP supports two routing-metadata paths:
+
+- **Dense routing (default)** builds a Boolean routing map with shape `[tokens, experts]` and a matching dense probability tensor.
+- **Compact routing (opt-in)** passes top-k expert indices with shape `[tokens, top_k]` instead of the dense Boolean routing map. NeMo AutoModel still expands the routing probabilities to `[tokens, experts]` to preserve the existing router-gradient layout.
+
+Enable compact routing only after benchmarking the exact model, batch shape, GPU, and expert-parallel topology:
+
+```yaml
+model:
+  backend:
+    experts: gmm
+    dispatcher: hybridep
+    dispatcher_hybridep_compact_routing: true
+```
+
+Compact routing reduces routing-map size, but its additional metadata preprocessing can increase latency for some workloads. Dense routing therefore remains the default.
+
+The following advanced settings apply only when `dispatcher: hybridep`:
+
+| Setting | Default | Description |
+|---|---:|---|
+| `dispatcher_hybridep_compact_routing` | `false` | Pass top-k expert indices instead of a dense Boolean routing map. |
+| `dispatcher_hybridep_permute_fusion` | `false` | Fuse token permutation into dispatch and unpermutation into combine. |
+| `dispatcher_hybridep_num_sms_preprocessing` | `null` | Override the number of SMs used for routing-metadata preprocessing. |
+| `dispatcher_hybridep_num_blocks_permute` | `null` | Override the number of dispatch permutation blocks. |
+| `dispatcher_hybridep_num_blocks_unpermute` | `null` | Override the number of combine unpermutation blocks. |
+
+Leave the numeric tuning settings unset to use HybridEP defaults unless a matched benchmark demonstrates an improvement. Values tuned for one GPU architecture or topology may regress another.
+
 ## Launch Training
 
 NeMo Automodel supports direct Slurm submission, local interactive runs through the Automodel CLI, and external `torchrun`. For full details on Slurm batch jobs, multi-node configuration, environment variables, and other launch options, see the [Run on a Cluster](/job-launchers/slurm-cluster) guide.
