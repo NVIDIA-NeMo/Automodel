@@ -444,13 +444,17 @@ class NemotronOmniStateDictAdapter(StateDictAdapter):
         """
         exclude_key_regex = kwargs.get("exclude_key_regex", None)
 
-        # Vision model (pass through, or rename for native RadioModel checkpoints)
+        # Vision model: pass through unchanged.
+        #
+        # For native RadioModel checkpoints the legacy layout fuses q/k/v into one
+        # ``attn.qkv`` tensor, which a per-tensor conversion cannot rebuild (it only sees
+        # one of query/key/value at a time). ``to_hf`` (whole state dict) still emits the
+        # legacy layout; here we keep the native names so a streaming consumer (e.g. the
+        # NeMo-RL -> vLLM refit) can load q/k/v as individual shards. Renaming to the
+        # legacy tree without fusing would produce keys no loader recognizes and the
+        # vision tower would silently keep its previous (or dummy) weights.
         if fqn.startswith("vision_model."):
-            if self.vision_uses_native_radio:
-                sub_key = fqn[len("vision_model.") :]
-                new_fqn = f"vision_model.{_rename_radio_key(sub_key, _RADIO_NATIVE_TO_LEGACY_RENAMES)}"
-            else:
-                new_fqn = fqn
+            new_fqn = fqn
 
         # Vision projector
         elif fqn.startswith("vision_projector."):
