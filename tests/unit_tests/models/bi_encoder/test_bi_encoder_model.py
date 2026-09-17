@@ -20,6 +20,7 @@ import torch
 import nemo_automodel._transformers.auto_model as am
 import nemo_automodel.recipes.retrieval.train_bi_encoder as tbe
 from nemo_automodel._transformers.retrieval import BiEncoderModel, CrossEncoderModel, _dummy_vision_sum
+from nemo_automodel.components.utils.model_utils import apply_parameter_freezing
 from nemo_automodel.recipes.retrieval.train_bi_encoder import (
     TrainBiEncoderRecipe,
     distributed_maxsim_scores_and_labels,
@@ -89,6 +90,22 @@ class _ToyBackboneWithoutDummyFlag(torch.nn.Module):
         }
         hidden_state = input_ids.float().unsqueeze(-1).expand(*input_ids.shape, 2)
         return _ToyBackboneOutput(hidden_state)
+
+
+class _ToyCrossEncoderBackbone(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.config = SimpleNamespace(name_or_path="")
+        self.encoder = torch.nn.Linear(4, 4)
+        self.score = torch.nn.Sequential(
+            torch.nn.Linear(4, 2),
+            torch.nn.ReLU(),
+            torch.nn.Linear(2, 1),
+        )
+
+    @property
+    def base_model(self):
+        return self.encoder
 
 
 class _ToyVisionBackboneWithoutDummyFlag(torch.nn.Module):
@@ -336,6 +353,23 @@ def test_cross_encoder_from_pretrained(monkeypatch):
     assert "l2_normalize" not in last_kwargs
     assert last_kwargs["is_causal"] is True
     assert last_kwargs["model_name_or_path"] == "mock-model"
+
+
+@pytest.mark.parametrize("freeze_score_head", [False, True])
+def test_cross_encoder_score_head_freezing(freeze_score_head):
+    backbone = _ToyCrossEncoderBackbone()
+    model = CrossEncoderModel(backbone)
+
+    apply_parameter_freezing(
+        model,
+        {
+            "freeze_vision_tower": False,
+            "freeze_score_head": freeze_score_head,
+        },
+    )
+
+    assert all(param.requires_grad for param in backbone.encoder.parameters())
+    assert all(param.requires_grad is not freeze_score_head for param in backbone.score.parameters())
 
 
 def test_cross_encoder_retries_without_liger(monkeypatch):

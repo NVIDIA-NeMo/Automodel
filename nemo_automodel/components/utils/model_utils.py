@@ -373,12 +373,14 @@ def apply_parameter_freezing(model, freeze_config):
         - freeze_multimodal_projector: bool (default False)
         - freeze_audio_tower: bool (default False)
         - freeze_language_model: bool (default False)
+        - freeze_score_head: bool (default False)
         - freeze_video_embedder: bool (default False)
     """
     freeze_vision_tower = freeze_config.get("freeze_vision_tower", True)
     freeze_multimodal_projector = freeze_config.get("freeze_multimodal_projector", False)
     freeze_audio_tower = freeze_config.get("freeze_audio_tower", False)
     freeze_language_model = freeze_config.get("freeze_language_model", False)
+    freeze_score_head = freeze_config.get("freeze_score_head", False)
     freeze_video_embedder = freeze_config.get("freeze_video_embedder", False)
 
     # Freeze vision tower
@@ -400,6 +402,14 @@ def apply_parameter_freezing(model, freeze_config):
     # Freeze language model backbone
     if freeze_language_model:
         _freeze_module_by_attribute_and_patterns(model, "language_model", ["language", "text", "llm"])
+
+    # Cross-encoder classification/scoring head
+    if freeze_score_head:
+        freeze_score_head_fn = getattr(model, "freeze_score_head", None)
+        if callable(freeze_score_head_fn):
+            freeze_score_head_fn()
+        else:
+            logger.warning("Model does not expose a score head to freeze")
 
     # NemotronOmni RADIO: patch_generator.video_embedder is only exercised on
     # video inputs; on image-only training it sits in the optimizer without

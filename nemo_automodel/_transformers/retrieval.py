@@ -1110,6 +1110,26 @@ class CrossEncoderModel(nn.Module):
         inputs.setdefault("return_dict", True)
         return self.model(**inputs)
 
+    def freeze_score_head(self) -> None:
+        """Freeze the scoring head while leaving the base model trainable.
+
+        The scoring head consists of the parameters owned by the Hugging Face
+        task model but not by its ``base_model``. This covers both linear score
+        projections and multi-layer classification heads without depending on
+        model-specific attribute names.
+        """
+        base_model_parameter_ids = {id(param) for param in self.model.base_model.parameters()}
+        frozen_parameters = 0
+        for param in self.model.parameters():
+            if id(param) not in base_model_parameter_ids:
+                param.requires_grad_(False)
+                frozen_parameters += 1
+
+        if frozen_parameters:
+            logger.info("Froze %d cross-encoder score-head parameters", frozen_parameters)
+        else:
+            logger.warning("Cross-encoder has no score-head parameters separate from its base model")
+
 
 def _get_layers(model: nn.Module) -> nn.ModuleList:
     """Locate the transformer block list on a HuggingFace backbone."""
