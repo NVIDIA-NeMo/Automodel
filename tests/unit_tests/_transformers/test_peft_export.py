@@ -138,7 +138,7 @@ def test_export_restores_moe_rank_scaled_peft_v5_and_writes_canonical_hf_shards(
     native_lora = _write_legacy_automodel_adapter(model, adapter_dir)
 
     legacy_checkpoint = load_file(adapter_dir / "adapter_model.safetensors")
-    folded_rank_key = "base_model.model.backbone.layers.0.mixer.experts.base_layer.lora_A.weight"
+    folded_rank_key = "base_model.model.model.layers.0.mixer.experts.base_layer.lora_A.weight"
     assert legacy_checkpoint[folded_rank_key].shape[0] == _NUM_EXPERTS * _EXPERT_RANK
     assert legacy_checkpoint[folded_rank_key].shape[0] != _NUM_EXPERTS * _REQUESTED_RANK
 
