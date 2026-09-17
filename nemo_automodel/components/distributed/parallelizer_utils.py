@@ -234,6 +234,18 @@ def _mp_policy_with_param_dtype(
     return mp_policy_copy
 
 
+def _mp_policy_with_output_dtype(
+    mp_policy: Optional[MixedPrecisionPolicy],
+    output_dtype: torch.dtype,
+) -> Optional[MixedPrecisionPolicy]:
+    """Copy an FSDP mixed-precision policy with a different output dtype."""
+    if mp_policy is None:
+        return None
+    mp_policy_copy = copy(mp_policy)
+    object.__setattr__(mp_policy_copy, "output_dtype", output_dtype)
+    return mp_policy_copy
+
+
 def _make_compute_dtype_fn(
     module: nn.Module,
     mp_policy: Optional[MixedPrecisionPolicy],

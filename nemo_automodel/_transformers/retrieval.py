@@ -906,6 +906,9 @@ class CrossEncoderModel(nn.Module):
     def __init__(self, model: PreTrainedModel):
         super().__init__()
         _init_encoder_common(self, model)
+        fsdp_output_dtype = getattr(model, "_nemo_fsdp_output_dtype", None)
+        if fsdp_output_dtype is not None:
+            self._nemo_fsdp_output_dtype = fsdp_output_dtype
 
     @property
     def effective_score_temperature(self) -> float:
