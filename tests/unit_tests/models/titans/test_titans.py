@@ -478,6 +478,9 @@ def test_blackwell_submitter_resolves_portable_topology():
     assert "--step_scheduler.local_batch_size='$LOCAL_BATCH_SIZE'" in runner
     assert "--step_scheduler.max_steps='$PILOT_STEPS'" in runner
     assert "TITANS_PILOT_STEPS=%q" in submitter
+    assert "TITANS_RUN_SUFFIX=%q" in submitter
+    assert '--time="$TITANS_TIME_LIMIT"' in full_runner
+    assert "SLURM_TIMELIMIT" not in full_runner
     assert "--wandb.project=titans-paper-reproduction" in full_runner
     assert "--validation-dir '$STAGING_ROOT/validation'" in data_runner
     assert "--num-workers 32" in data_runner

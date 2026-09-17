@@ -175,6 +175,8 @@ trap 'rm -f "$JOB_BODY"' EXIT
   printf 'export TITANS_PILOT_STEPS=%q\n' "${TITANS_PILOT_STEPS:-10}"
   printf 'export TITANS_LOCAL_BATCH_SIZE=%q\n' "${TITANS_LOCAL_BATCH_SIZE:-}"
   printf 'export TITANS_ACTIVATION_CHECKPOINTING=%q\n' "${TITANS_ACTIVATION_CHECKPOINTING:-false}"
+  printf 'export TITANS_RUN_SUFFIX=%q\n' "${TITANS_RUN_SUFFIX:-}"
+  printf 'export TITANS_TIME_LIMIT=%q\n' "${TITANS_TIME_LIMIT:-4:00:00}"
   awk 'NR == 1 {next} !/^#SBATCH/' "$SBATCH_SCRIPT"
 } >"$JOB_BODY"
 

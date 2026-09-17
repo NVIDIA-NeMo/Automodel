@@ -10,6 +10,7 @@ TITANS_SCALE=${TITANS_SCALE:?set TITANS_SCALE}
 TITANS_EXPERIMENT=${TITANS_EXPERIMENT:-baseline}
 TITANS_GPUS_PER_NODE=${TITANS_GPUS_PER_NODE:?set TITANS_GPUS_PER_NODE}
 TITANS_IMAGE=${TITANS_IMAGE:-nvcr.io#nvidia/nemo-automodel:26.04}
+TITANS_TIME_LIMIT=${TITANS_TIME_LIMIT:-4:00:00}
 MAX_STEPS_PER_RUN=${TITANS_MAX_STEPS_PER_RUN:-1700}
 TARGET_SEGMENT_SECONDS=${TITANS_TARGET_SEGMENT_SECONDS:-13200}
 WORLD_SIZE=$((SLURM_NNODES * TITANS_GPUS_PER_NODE))
@@ -71,6 +72,13 @@ esac
 RECIPE=examples/llm_pretrain/titans_${TITANS_SCALE}_lmm.yaml
 DATA_ROOT=$TITANS_WORK_ROOT/data/fineweb-edu-llama2-$TOKEN_BUDGET
 RUN_NAME=titans-${TITANS_SCALE}-${TITANS_EXPERIMENT}-${TOKEN_BUDGET}-blackwell
+if [[ -n ${TITANS_RUN_SUFFIX:-} ]]; then
+  [[ $TITANS_RUN_SUFFIX =~ ^[A-Za-z0-9._-]+$ ]] || {
+    echo "TITANS_RUN_SUFFIX contains unsupported characters" >&2
+    exit 2
+  }
+  RUN_NAME=$RUN_NAME-$TITANS_RUN_SUFFIX
+fi
 CHECKPOINT_ROOT=$TITANS_WORK_ROOT/outputs/$RUN_NAME
 RUN_SHA_FILE=$CHECKPOINT_ROOT/git_sha
 WANDB_RUN_ID=${WANDB_RUN_ID:-${RUN_NAME}-v1}
@@ -184,7 +192,7 @@ if (( LATEST_STEP + 1 < TOTAL_STEPS )); then
       --cpus-per-task="$SLURM_CPUS_PER_TASK" \
       --gpus-per-node="$TITANS_GPUS_PER_NODE" \
       --mem=0 \
-      --time="$SLURM_TIMELIMIT" \
+      --time="$TITANS_TIME_LIMIT" \
       --dependency=singleton \
       --job-name="$SLURM_JOB_NAME" \
       --chdir="$AUTOMODEL_CHECKOUT" \
