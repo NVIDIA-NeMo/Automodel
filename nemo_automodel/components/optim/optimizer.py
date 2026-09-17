@@ -38,10 +38,12 @@ Megatron-FSDP sharding).  Subclasses only implement the small
 
 from __future__ import annotations
 
+import functools
 import importlib
 import inspect
 import logging
 import re
+import sys
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar
@@ -559,7 +561,7 @@ class OptimizerFromFactoryConfig(OptimizerConfig):
     per-group LR/WD, matching the typed-config behavior.
     """
 
-    optim_cls: Callable[..., torch.optim.Optimizer] | None = None
+    factory: Callable[..., torch.optim.Optimizer] | None = None
     kwargs: dict[str, Any] = field(default_factory=dict)
 
     def build(
@@ -569,11 +571,11 @@ class OptimizerFromFactoryConfig(OptimizerConfig):
         device_mesh: DeviceMesh | None = None,
         is_peft: bool = False,
     ) -> list[torch.optim.Optimizer]:
-        assert callable(self.optim_cls), "OptimizerFromFactoryConfig.factory must be a callable"
+        assert callable(self.factory), "OptimizerFromFactoryConfig.factory must be a callable"
         foreach = _foreach_for_mesh(device_mesh)
 
         kwargs = dict(self.kwargs)
-        # For the optim_cls path, per-group overrides normally arrive inside ``kwargs``
+        # For the factory path, per-group overrides normally arrive inside ``kwargs``
         # (like every other hyperparameter, since the typed ``lr``/``weight_decay``
         # fields are unused here); pop them so they drive grouping rather than being
         # forwarded to the optimizer constructor. Fall back to the inherited field
@@ -585,9 +587,9 @@ class OptimizerFromFactoryConfig(OptimizerConfig):
             if isinstance(val, str):
                 kwargs[attr] = dtype_from_str(val)
         # Only inject ``foreach`` for factories that actually accept it. The TP>1 path sets
-        # ``foreach=False`` via ``_foreach_for_mesh``; passing it to a optim_cls that does not take
+        # ``foreach=False`` via ``_foreach_for_mesh``; passing it to a factory that does not take
         # ``foreach`` (e.g. TE ``FusedAdam``) would raise.  Honour an explicit user-provided value.
-        if foreach is not None and "foreach" not in kwargs and _accepts_foreach(self.optim_cls):
+        if foreach is not None and "foreach" not in kwargs and _accepts_foreach(self.factory):
             kwargs["foreach"] = foreach
 
         optimizers: list[torch.optim.Optimizer] = []
@@ -596,7 +598,12 @@ class OptimizerFromFactoryConfig(OptimizerConfig):
             # trainable parameters, and returns either a flat param list or the
             # per-group dicts.
             params = _trainable_params_or_groups(part, overrides)
-            optimizers.append(self.optim_cls(params=params, **kwargs))
+            # TE FusedAdam's multi_tensor_apply faults on zero-numel local shards; see
+            # _drop_empty_local_shards.  Same guard as FusedAdamConfig, for the YAML
+            # ``_target_: transformer_engine...FusedAdam`` escape hatch.
+            if _is_te_fused_adam(self.factory):
+                params = _drop_empty_local_shards(params)
+            optimizers.append(self.factory(params=params, **kwargs))
         warn_if_torch_adam_with_bf16_params(optimizer=optimizers, is_peft=is_peft, context="optim", logger=logger)
         return optimizers
 
@@ -606,7 +613,7 @@ class OptimizerFromFactoryConfig(OptimizerConfig):
         *,
         device_mesh: DeviceMesh | None = None,
     ) -> torch.optim.Optimizer:
-        assert callable(self.optim_cls), "OptimizerFromFactoryConfig.factory must be a callable"
+        assert callable(self.factory), "OptimizerFromFactoryConfig.factory must be a callable"
         foreach = _foreach_for_mesh(device_mesh)
 
         kwargs = dict(self.kwargs)
@@ -614,10 +621,12 @@ class OptimizerFromFactoryConfig(OptimizerConfig):
             val = kwargs.get(attr, None)
             if isinstance(val, str):
                 kwargs[attr] = dtype_from_str(val)
-        if foreach is not None and "foreach" not in kwargs and _accepts_foreach(self.optim_cls):
+        if foreach is not None and "foreach" not in kwargs and _accepts_foreach(self.factory):
             kwargs["foreach"] = foreach
 
-        return self.optim_cls(params=param_groups, **kwargs)
+        if _is_te_fused_adam(self.factory):
+            param_groups = _drop_empty_local_shards(param_groups)
+        return self.factory(params=param_groups, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -827,6 +836,28 @@ def _drop_empty_local_shards(params: list[Any]) -> list[Any]:
             dropped,
         )
     return filtered
+
+
+def _is_te_fused_adam(factory: Callable[..., Any]) -> bool:
+    """Return ``True`` if ``factory`` is TransformerEngine's ``FusedAdam`` (or a subclass).
+
+    ``functools.partial`` wrappers are unwrapped (iteratively, for nested
+    partials) before the identity check, so ``partial(FusedAdam, ...)``
+    factories are recognized.  Other wrapper callables (closures, custom
+    factory functions) are opaque and are NOT recognized; such factories must
+    guard against zero-numel local shards themselves.
+
+    Identity-based and import-free: TE is an optional dependency, so this never
+    imports it.  If TE has not been imported yet, ``factory`` cannot be TE's
+    ``FusedAdam`` class and the check is trivially ``False``.
+    """
+    while isinstance(factory, functools.partial):
+        factory = factory.func
+    te_optimizers = sys.modules.get("transformer_engine.pytorch.optimizers")
+    if te_optimizers is None:
+        return False
+    te_fused_adam = getattr(te_optimizers, "FusedAdam", None)
+    return isinstance(te_fused_adam, type) and isinstance(factory, type) and issubclass(factory, te_fused_adam)
 
 
 def _accepts_foreach(optim_cls: type["torch.optim.Optimizer"]) -> bool:
