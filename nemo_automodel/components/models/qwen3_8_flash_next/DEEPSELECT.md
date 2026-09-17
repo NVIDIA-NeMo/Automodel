@@ -39,8 +39,8 @@ indexer; the existing FlexAttention forward/backward still computes attention.
 
 The H100 integration was tested with DeepSelect revision
 `0f03b68748b304863fdf0181a11458d04ae533a9`, compiled for `sm_90a`.
-That revision's default build targets newer architectures, so its build target
-must be adjusted for H100. The CUDA selection kernels were unchanged.
+The build adds SM90a through `NVCC_APPEND_FLAGS` to the upstream SM100a/SM103a
+targets. Upstream source files, including `setup.py` and CUDA kernels, are unchanged.
 
 GPU coverage is in
 `tests/functional_tests/models/test_qwen3_8_flash_next_deepselect.py`.
@@ -50,31 +50,31 @@ parity, and activation-checkpoint recomputation consistency.
 
 ## Installation
 
-The AutoModel Dockerfile builds and installs the pinned extension by default
-(`INSTALL_DEEPSELECT=true`), targeting SM90a, SM100a and SM103a. It installs into
-the base interpreter's site-packages, inherited by the image's uv environment.
-The backend remains opt-in; ordinary Torch selection does not import DeepSelect.
+The AutoModel Dockerfile clones the pinned upstream source, builds a wheel, and
+installs it by default (`INSTALL_DEEPSELECT=true`). The wheel targets SM90a,
+SM100a and SM103a. It installs into system site-packages, inherited by the image's
+uv environment. The backend remains opt-in.
 
-For an existing environment, run from the AutoModel checkout on a compute node:
+For an existing environment, build on a compute node with its PyTorch and CUDA
+toolkit already installed. Git, pciutils (for `lspci`), a C++ compiler, Ninja,
+setuptools and NVCC >= 12.9 are required by this upstream build:
 
 ```bash
-DEEPSELECT_PYTHON="$(command -v python)" DEEP_SELECT_CUDA_ARCHS=90a \
-  bash docker/common/install_deepselect.sh
+git clone https://github.com/deepseek-ai/DeepSelect.git
+cd DeepSelect
+git checkout 0f03b68748b304863fdf0181a11458d04ae533a9
+git submodule update --init --recursive
+DEEP_SELECT_BUILD_TARGET_PLATFORM=CUDA \
+NVCC_APPEND_FLAGS="-gencode=arch=compute_90a,code=sm_90a" MAX_JOBS=8 NVCC_THREADS=2 \
+  uv build --wheel --no-build-isolation --python "$(command -v python)" --out-dir dist .
+uv pip install --python "$(command -v python)" --no-deps dist/*.whl
+cd ..
 ```
 
-The script uses uv, builds against that interpreter's installed PyTorch and
-CUDA toolkit, and pins the source revision above. Git, a C++ compiler, Ninja,
-setuptools and NVCC >= 12.9 are required by this upstream build.
-Set `DEEP_SELECT_CUDA_ARCHS` to a semicolon-separated subset of
-`90a;100a;103a` when building for different targets.
+Building the wheel first avoids separate metadata and wheel phases disagreeing
+on upstream's timestamped version. The NVCC flag adds H100 support without
+modifying upstream source. No patch or experiment-directory `PYTHONPATH` is needed.
 
-The checked-in build patch adds H100 to the supported build targets and makes
-the package version deterministic across uv's metadata/wheel phases. It also
-permits a CUDA build without a visible GPU. Selection kernels are unchanged.
-No experiment-directory `PYTHONPATH` is needed.
-
-This source-built extension is installed outside uv's project resolution,
-following the image's prebuilt-extension pattern; a standalone `uv sync` does
-not install it. Use the image or installer above, and install it in every
-training rank's environment. Docker builds can opt out with
-`--build-arg INSTALL_DEEPSELECT=false`.
+A standalone `uv sync` does not install this optional source-built extension.
+Use the image or commands above in every training rank's environment.
+Docker builds can opt out with `--build-arg INSTALL_DEEPSELECT=false`.
