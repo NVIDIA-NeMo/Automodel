@@ -46,7 +46,7 @@ import re
 import sys
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import torch
 from torch.distributed.tensor import DTensor
@@ -177,8 +177,8 @@ def _trainable_params_or_groups(part: torch.nn.Module, overrides: list[ParamGrou
 
 
 def _split_dtensor_and_plain_params(
-    params_or_groups: list[torch.Tensor] | list[dict[str, Any]],
-) -> list[torch.Tensor] | list[dict[str, Any]]:
+    params_or_groups: list[torch.nn.Parameter] | list[dict[str, Any]],
+) -> list[torch.nn.Parameter] | list[dict[str, Any]]:
     """Keep plain tensors out of foreach groups containing DTensors.
 
     PyTorch foreach operators reject a mixed list of ordinary tensors and
@@ -216,7 +216,7 @@ def _split_dtensor_and_plain_params(
         return [{"params": sharded, **options}, {"params": plain, **options}]
 
     is_groups = bool(params_or_groups) and isinstance(params_or_groups[0], dict)
-    groups = params_or_groups if is_groups else [{"params": params_or_groups}]
+    groups = cast(list[dict[str, Any]], params_or_groups) if is_groups else [{"params": params_or_groups}]
     split_groups = [split for group in groups for split in split_group(group)]
     if is_groups or len(split_groups) > 1:
         return split_groups
