@@ -152,9 +152,25 @@ def test_te_master_ownership_uses_resident_fp32_parameter_directly_after_resume(
             self._scales = {}
 
         def _initialize_state(self, parameter, state_name, zero_buffer):
-            """Create one FP32 optimizer-state tensor matching ``parameter`` shape."""
+            """Create one state tensor with the parameter's arbitrary shape.
+
+            Args:
+                parameter: Tensor of arbitrary shape whose optimizer state is initialized.
+                state_name: State key to create.
+                zero_buffer: Whether to initialize the state to zero.
+            """
             assert zero_buffer
             self.state[parameter][state_name] = torch.zeros_like(parameter, dtype=torch.float32)
+
+        def load_state_dict(self, state_dict):
+            """Mimic TE's second state rebuild after PyTorch load hooks run."""
+            super().load_state_dict(state_dict)
+            saved_ids = [saved_id for group in state_dict["param_groups"] for saved_id in group["params"]]
+            current_params = [parameter for group in self.param_groups for parameter in group["params"]]
+            id_map = dict(zip(saved_ids, current_params))
+            for saved_id, saved_state in state_dict["state"].items():
+                parameter = id_map[saved_id]
+                self.state[parameter] = {name: value.detach().clone() for name, value in saved_state.items()}
 
     optimizer = FakeFusedAdam()
     _avoid_redundant_te_master_weights_for_fp32_params(optimizer)
@@ -162,13 +178,22 @@ def test_te_master_ownership_uses_resident_fp32_parameter_directly_after_resume(
     assert set(optimizer.state[fp32_param]) == {"exp_avg", "exp_avg_sq"}
     assert optimizer.state[bf16_param] == {}
 
+    optimizer.state[bf16_param]["exp_avg"] = torch.zeros_like(bf16_param, dtype=torch.float32)
+    optimizer.state[bf16_param]["exp_avg_sq"] = torch.zeros_like(bf16_param, dtype=torch.float32)
     optimizer.state[fp32_param]["master_param"] = fp32_param.detach().clone()
     optimizer.state[bf16_param]["master_param"] = bf16_param.detach().float().clone()
     checkpoint = optimizer.state_dict()
     optimizer.load_state_dict(checkpoint)
 
     assert set(optimizer.state[fp32_param]) == {"exp_avg", "exp_avg_sq"}
-    assert "master_param" in optimizer.state[bf16_param]
+    assert set(optimizer.state[bf16_param]) == {"exp_avg", "exp_avg_sq", "master_param"}
+
+    pre_step_checkpoint = optimizer.state_dict()
+    pre_step_checkpoint["state"] = {}
+    optimizer.load_state_dict(pre_step_checkpoint)
+
+    assert set(optimizer.state[fp32_param]) == {"exp_avg", "exp_avg_sq"}
+    assert optimizer.state[bf16_param] == {}
 
 
 # ---------------------------------------------------------------------------
@@ -221,7 +246,7 @@ class TestBuildOptimizer:
 class TestOptimizerFromFactoryConfig:
     def test_build_constructs_from_factory(self):
         cfg = OptimizerFromFactoryConfig(
-            optim_cls=torch.optim.SGD,
+            factory=torch.optim.SGD,
             kwargs={"lr": 0.01, "momentum": 0.9},
         )
         optimizers = cfg.build(_model())
@@ -237,18 +262,18 @@ class TestOptimizerFromFactoryConfig:
             return torch.optim.SGD(params, lr=kwargs.get("lr", 0.01))
 
         OptimizerFromFactoryConfig(
-            optim_cls=fake_factory,
+            factory=fake_factory,
             kwargs={"lr": 1e-3, "master_weight_dtype": "torch.bfloat16"},
         ).build(_model())
         assert captured["master_weight_dtype"] is torch.bfloat16
 
     def test_build_requires_callable_factory(self):
         with pytest.raises(AssertionError, match="must be a callable"):
-            OptimizerFromFactoryConfig(optim_cls=None).build(_model())
+            OptimizerFromFactoryConfig(factory=None).build(_model())
 
     def test_build_from_param_groups_uses_factory(self):
         cfg = OptimizerFromFactoryConfig(
-            optim_cls=torch.optim.SGD,
+            factory=torch.optim.SGD,
             kwargs={"lr": 0.01, "momentum": 0.9},
         )
         params = list(_model().parameters())
@@ -302,7 +327,7 @@ class TestBuildOptimizerTuple:
         build_optimizer(
             _model(),
             OptimizerFromFactoryConfig(
-                optim_cls=fake_factory,
+                factory=fake_factory,
                 kwargs={"lr": 1e-3, "master_weight_dtype": "torch.bfloat16", "exp_avg_dtype": "float16"},
             ),
         )
@@ -618,7 +643,7 @@ class TestParamGroupOverrides:
     def test_factory_reads_overrides_from_inherited_field(self):
         # Overrides set on the factory config's own field (not nested in kwargs) are honored.
         cfg = OptimizerFromFactoryConfig(
-            optim_cls=torch.optim.AdamW,
+            factory=torch.optim.AdamW,
             kwargs={"lr": 1e-3},
             param_group_overrides=[ParamGroupOverride("router", lr_mult=0.1)],
         )

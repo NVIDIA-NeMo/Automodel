@@ -25,6 +25,7 @@ whole param group (rank-asymmetric ``param_groups`` desynchronize positional
 LR/WD scheduling) or the whole param list: those cases must raise.
 """
 
+import functools
 import logging
 import sys
 import types
@@ -42,7 +43,7 @@ from nemo_automodel.components.optim.optimizer import (
 )
 
 
-class _RecordingFusedAdam:
+class _RecordingFusedAdam(torch.optim.Optimizer):
     """Stand-in for TE FusedAdam that records its constructor arguments.
 
     Args:
@@ -53,11 +54,32 @@ class _RecordingFusedAdam:
 
     last_params = None
     last_kwargs = None
+    last_instance = None
 
     def __init__(self, params, **kwargs):
-        type(self).last_params = list(params)
+        recorded_params = list(params)
+        if recorded_params and isinstance(recorded_params[0], dict):
+            recorded_params = [{**group, "params": list(group["params"])} for group in recorded_params]
+            last_params = [{**group, "params": list(group["params"])} for group in recorded_params]
+        else:
+            last_params = list(recorded_params)
+        super().__init__(recorded_params, {"lr": kwargs.get("lr", 1e-3)})
+        type(self).last_params = last_params
         type(self).last_kwargs = kwargs
-        self.param_groups = []
+        type(self).last_instance = self
+        self.master_weights = kwargs.get("master_weights", False)
+        self._scales = {}
+
+    def _initialize_state(self, parameter, state_name, zero_buffer):
+        """Create one state tensor with the parameter's arbitrary shape.
+
+        Args:
+            parameter: Tensor of arbitrary shape whose optimizer state is initialized.
+            state_name: State key to create.
+            zero_buffer: Whether to initialize the state to zero.
+        """
+        assert zero_buffer
+        self.state[parameter][state_name] = torch.zeros_like(parameter, dtype=torch.float32)
 
 
 def _te_stub_modules() -> dict[str, types.ModuleType]:
@@ -86,6 +108,7 @@ def stub_te_fused_adam(monkeypatch):
         monkeypatch.setitem(sys.modules, name, module)
     _RecordingFusedAdam.last_params = None
     _RecordingFusedAdam.last_kwargs = None
+    _RecordingFusedAdam.last_instance = None
     return _RecordingFusedAdam
 
 
@@ -118,6 +141,13 @@ class TestFusedAdamConfigDropsEmptyLocalShards:
         FusedAdamConfig(master_weight_dtype="torch.float16")._build_optimizer([kept])
 
         assert stub_te_fused_adam.last_kwargs["master_weight_dtype"] is torch.float16
+
+    def test_none_master_weight_dtype_defers_to_te(self, stub_te_fused_adam):
+        kept = nn.Parameter(torch.ones(3))
+
+        FusedAdamConfig(master_weight_dtype=None)._build_optimizer([kept])
+
+        assert "master_weight_dtype" not in stub_te_fused_adam.last_kwargs
 
     def test_flat_params_all_empty_raises(self, stub_te_fused_adam):
         with pytest.raises(ValueError, match="zero-numel local shard"):
@@ -181,11 +211,66 @@ class _TinyModel(nn.Module):
         self.empty = nn.Parameter(torch.empty(0))
 
 
+class _OnlyEmptyTrainableModel(nn.Module):
+    """Frozen linear; the sole trainable parameter has a zero-numel local shard."""
+
+    def __init__(self):
+        super().__init__()
+        self.linear = nn.Linear(3, 3)
+        self.linear.requires_grad_(False)
+        self.empty = nn.Parameter(torch.empty(0))
+
+
 class TestOptimizerFromFactoryConfig:
-    def test_all_params_forwarded_including_empty(self):
-        # The factory escape hatch does not filter zero-numel params; callers using
-        # TE FusedAdam should use FusedAdamConfig, which handles this automatically.
-        cfg = OptimizerFromFactoryConfig(optim_cls=torch.optim.SGD, kwargs={"lr": 0.01})
+    def test_te_fused_adam_factory_drops_empty(self, stub_te_fused_adam):
+        cfg = OptimizerFromFactoryConfig(factory=stub_te_fused_adam, kwargs={"lr": 1e-3})
+
+        cfg.build(_TinyModel())
+
+        assert all(p.numel() > 0 for p in stub_te_fused_adam.last_params)
+        assert len(stub_te_fused_adam.last_params) == 2
+
+    def test_partial_wrapped_te_fused_adam_factory_drops_empty(self, stub_te_fused_adam):
+        factory = functools.partial(stub_te_fused_adam, bias_correction=True)
+        cfg = OptimizerFromFactoryConfig(factory=factory, kwargs={"lr": 1e-3})
+
+        cfg.build(_TinyModel())
+
+        assert all(p.numel() > 0 for p in stub_te_fused_adam.last_params)
+        assert stub_te_fused_adam.last_kwargs["bias_correction"] is True
+
+    def test_te_fused_adam_factory_all_params_empty_raises(self, stub_te_fused_adam):
+        cfg = OptimizerFromFactoryConfig(factory=stub_te_fused_adam, kwargs={"lr": 1e-3})
+
+        with pytest.raises(ValueError, match="zero-numel local shard"):
+            cfg.build(_OnlyEmptyTrainableModel())
+
+        assert stub_te_fused_adam.last_params is None
+
+    def test_te_fused_adam_factory_drops_empty_param_groups(self, stub_te_fused_adam):
+        cfg = OptimizerFromFactoryConfig(factory=stub_te_fused_adam, kwargs={"lr": 1e-3})
+        kept = nn.Parameter(torch.ones(3))
+
+        cfg.build_from_param_groups(
+            [
+                {"params": [nn.Parameter(torch.empty(0)), kept], "weight_decay": 0.1},
+            ]
+        )
+
+        assert stub_te_fused_adam.last_params == [{"params": [kept], "weight_decay": 0.1}]
+
+    def test_te_fused_adam_factory_applies_fp32_master_ownership(self, stub_te_fused_adam):
+        cfg = OptimizerFromFactoryConfig(
+            factory=stub_te_fused_adam,
+            kwargs={"lr": 1e-3, "master_weights": True},
+        )
+
+        optimizer = cfg.build(_TinyModel())[0]
+
+        assert all(set(optimizer.state[param]) == {"exp_avg", "exp_avg_sq"} for param in stub_te_fused_adam.last_params)
+
+    def test_non_te_factory_is_not_filtered(self):
+        cfg = OptimizerFromFactoryConfig(factory=torch.optim.SGD, kwargs={"lr": 0.01})
 
         opt = cfg.build(_TinyModel())[0]
 
@@ -218,3 +303,33 @@ def test_fused_adam_cuda_step_ignores_locally_empty_parameter():
 
     assert torch.isfinite(kept).all()
     assert not torch.equal(kept, before)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_fused_adam_cuda_omits_fp32_master_before_and_after_resume():
+    """Real TE keeps moments, but no redundant master, for a resident FP32 weight."""
+    pytest.importorskip("transformer_engine")
+
+    device = torch.device("cuda", 0)
+    fp32_param = nn.Parameter(torch.tensor([1.0, -2.0], device=device, dtype=torch.float32))
+    bf16_param = nn.Parameter(torch.tensor([3.0, -4.0], device=device, dtype=torch.bfloat16))
+    optimizer = FusedAdamConfig(lr=1e-2)._build_optimizer([fp32_param, bf16_param])
+
+    assert set(optimizer.state[fp32_param]) == {"exp_avg", "exp_avg_sq"}
+    assert optimizer.state[bf16_param] == {}
+
+    fp32_param.grad = torch.tensor([0.25, -0.5], device=device, dtype=torch.float32)
+    bf16_param.grad = torch.tensor([0.5, -0.25], device=device, dtype=torch.bfloat16)
+    optimizer.step()
+    torch.cuda.synchronize(device)
+
+    assert "master_param" not in optimizer.state[fp32_param]
+    assert "master_param" in optimizer.state[bf16_param]
+
+    checkpoint = optimizer.state_dict()
+    fp32_id = checkpoint["param_groups"][0]["params"][0]
+    checkpoint["state"][fp32_id]["master_param"] = fp32_param.detach().clone()
+    optimizer.load_state_dict(checkpoint)
+
+    assert "master_param" not in optimizer.state[fp32_param]
+    assert "master_param" in optimizer.state[bf16_param]
