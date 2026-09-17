@@ -419,7 +419,7 @@ class _HybridEPManager(_DispatchManager):
         moe_hybridep_num_blocks_unpermute: int | None = None,
         benchmark_static_routing: bool = False,
         moe_hybridep_capacity_factor: float | None = None,
-    
+        moe_hybridep_equal_token_counts: bool = False,
     ) -> None:
         self.group = group
         self.num_local_experts = num_local_experts
@@ -436,6 +436,8 @@ class _HybridEPManager(_DispatchManager):
         # pass this many rows as num_permuted_tokens and run non-blocking (see dispatch()).
         self.hybridep_capacity_factor = moe_hybridep_capacity_factor
         self._hybridep_capacity: int | None = None
+        # Equal row counts across the EP group: the pad size is the aligned local count, no collective.
+        self.equal_token_counts = moe_hybridep_equal_token_counts
         # Benchmark-only (TokenDispatcherConfig.moe_benchmark_static_routing):
         # persist num_permuted_tokens across dispatches, see dispatch()/reset.
         self.benchmark_static_routing = benchmark_static_routing
@@ -538,7 +540,11 @@ class _HybridEPManager(_DispatchManager):
         if torch.distributed.is_initialized() and torch.distributed.get_world_size(self.group) > 1:
             num_tokens = hidden_states.shape[0]
             pin = self.benchmark_static_routing and _STATIC_ROUTING_PAD_PIN
-            if pin and self._static_target_tokens is not None and self._static_target_tokens >= num_tokens:
+            if self.equal_token_counts:
+                # Every rank holds the same row count by construction (fixed-shape batches): the
+                # group-wide maximum is the local count, so only align it. No collective, no host sync.
+                target_tokens = -(-num_tokens // _HYBRIDEP_TOKEN_ALIGNMENT) * _HYBRIDEP_TOKEN_ALIGNMENT
+            elif pin and self._static_target_tokens is not None and self._static_target_tokens >= num_tokens:
                 target_tokens = self._static_target_tokens
             else:
                 group_max = torch.tensor(num_tokens, device=hidden_states.device)
@@ -888,6 +894,8 @@ class TokenDispatcherConfig:
     # HybridEP capacity mode, see BackendConfig.dispatcher_capacity_factor
 
     moe_hybridep_capacity_factor: float | None = None
+    # HybridEP: skip the per-dispatch pad-size all-reduce, see BackendConfig.dispatcher_equal_token_counts
+    moe_hybridep_equal_token_counts: bool = False
     """Backend for the flex token dispatcher. Options: 'deepep', 'hybridep', or 'uccl_ep'."""
 
     moe_deepep_num_sms: int = 20
@@ -1031,6 +1039,7 @@ class MoEFlexTokenDispatcher:
                         moe_hybridep_num_blocks_unpermute=self.config.moe_hybridep_num_blocks_unpermute,
                         benchmark_static_routing=self.config.moe_benchmark_static_routing,
                         moe_hybridep_capacity_factor=self.config.moe_hybridep_capacity_factor,
+                        moe_hybridep_equal_token_counts=self.config.moe_hybridep_equal_token_counts,
                     )
                 self._comm_manager = MoEFlexTokenDispatcher.shared_hybridep_manager
                 if (
@@ -1064,6 +1073,7 @@ class MoEFlexTokenDispatcher:
                     moe_hybridep_num_blocks_unpermute=self.config.moe_hybridep_num_blocks_unpermute,
                     benchmark_static_routing=self.config.moe_benchmark_static_routing,
                     moe_hybridep_capacity_factor=self.config.moe_hybridep_capacity_factor,
+                    moe_hybridep_equal_token_counts=self.config.moe_hybridep_equal_token_counts,
                 )
             self.hybridep_metadata_processor = _HybridEPMetadataProcessor(
                 num_experts=self.tp_size * self.config.num_moe_experts,
