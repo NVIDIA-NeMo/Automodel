@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from contextlib import nullcontext
+import copy
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -166,6 +167,155 @@ class TestTEFp8Config:
         cfg = TEFp8Config()
         with patch("nemo_automodel.components.models.common.utils.HAVE_TE", False):
             assert cfg.build_recipe() is None
+
+    def test_filter_fqns_default_empty(self):
+        """filter_fqns defaults to an empty list (backward compatible)."""
+        cfg = TEFp8Config()
+        assert cfg.filter_fqns == []
+
+    def test_apply_filter_fqns_without_te(self):
+        """Without TE installed, apply_filter_fqns is a no-op returning []."""
+        cfg = TEFp8Config(filter_fqns=["lm_head"])
+        model = torch.nn.Linear(4, 4)
+        with patch("nemo_automodel.components.models.common.utils.HAVE_TE", False):
+            assert cfg.apply_filter_fqns(model) == []
+
+    def test_apply_filter_fqns_empty_list_noop(self):
+        """With no filter_fqns, apply_filter_fqns returns [] without importing TE."""
+        cfg = TEFp8Config()
+        model = torch.nn.Linear(4, 4)
+        assert cfg.apply_filter_fqns(model) == []
+        assert not hasattr(model, "_te_fp8_filtered")
+
+    @pytest.mark.parametrize(
+        "missing_module", ["transformer_engine.pytorch.module.base", "transformer_engine.pytorch.quantization"]
+    )
+    def test_apply_filter_fqns_missing_te_api_fails_before_mutation(self, missing_module):
+        model = nn.Sequential(nn.Linear(4, 4))
+        original_forward = model[0].forward
+        cfg = TEFp8Config(filter_fqns=["0"])
+
+        # Simulate a partial TE installation without importing its CUDA extension.
+        def import_te(module, symbol):
+            if module == missing_module:
+                return False, object()
+            return True, nn.Linear if symbol == "TransformerEngineBaseModule" else nullcontext
+
+        with (
+            patch("nemo_automodel.components.models.common.utils.HAVE_TE", True),
+            patch("nemo_automodel.components.models.common.utils.safe_import_from", side_effect=import_te),
+            pytest.raises(ImportError, match="filter_fqns.*Transformer Engine"),
+        ):
+            cfg.apply_filter_fqns(model)
+        assert model[0].forward == original_forward
+
+    @pytest.mark.parametrize("checkpointed", [False, True])
+    def test_apply_filter_fqns_uses_logical_checkpoint_names(self, checkpointed):
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
+
+        attention = nn.ModuleDict({"q_proj": nn.Linear(4, 4), "k_proj": nn.Linear(4, 4)})
+        model = nn.ModuleDict({"self_attn": checkpoint_wrapper(attention) if checkpointed else attention})
+        calls = []
+
+        @contextmanager
+        def autocast(*, enabled):
+            calls.append(enabled)
+            yield
+
+        cfg = TEFp8Config(filter_fqns=["self_attn.q_proj"])
+        with (
+            patch("nemo_automodel.components.models.common.utils.HAVE_TE", True),
+            patch(
+                "nemo_automodel.components.models.common.utils.safe_import_from",
+                side_effect=[(True, nn.Linear), (True, autocast)],
+            ),
+        ):
+            assert cfg.apply_filter_fqns(model) == ["self_attn.q_proj"]
+        x = torch.randn(2, 4)
+        attention["q_proj"](x)
+        attention["k_proj"](x)
+        assert calls == [False]
+
+    def test_apply_filter_fqns_matches_shared_alias_once(self):
+        shared = nn.Linear(4, 4)
+        model = nn.ModuleDict({"first": shared, "alias": shared, "other": nn.Linear(4, 4)})
+        calls = []
+
+        @contextmanager
+        def autocast(*, enabled):
+            calls.append(enabled)
+            yield
+
+        cfg = TEFp8Config(filter_fqns=["alias"])
+        with (
+            patch("nemo_automodel.components.models.common.utils.HAVE_TE", True),
+            patch(
+                "nemo_automodel.components.models.common.utils.safe_import_from",
+                side_effect=lambda module, symbol: (
+                    True,
+                    nn.Linear if symbol == "TransformerEngineBaseModule" else autocast,
+                ),
+            ),
+        ):
+            assert cfg.apply_filter_fqns(model) == ["alias"]
+            forward = shared.forward
+            cfg.filter_fqns = ["first", "alias", "other"]
+            assert cfg.apply_filter_fqns(model) == ["first", "alias", "other"]
+            assert shared.forward is forward
+            cfg.filter_fqns = []
+            assert cfg.apply_filter_fqns(model) == []
+        x = torch.randn(2, 4)
+        model["first"](x)
+        model["alias"](x)
+        model["other"](x)
+        assert calls == [False, False, False]
+
+    def test_apply_filter_fqns_deepcopy_owns_weights_and_gradients(self):
+        source = nn.ModuleDict({"proj": nn.Linear(4, 4)})
+        calls = []
+
+        @contextmanager
+        def autocast(*, enabled):
+            calls.append(enabled)
+            yield
+
+        cfg = TEFp8Config(filter_fqns=["proj"])
+        with (
+            patch("nemo_automodel.components.models.common.utils.HAVE_TE", True),
+            patch(
+                "nemo_automodel.components.models.common.utils.safe_import_from",
+                side_effect=[(True, nn.Linear), (True, autocast)],
+            ),
+        ):
+            cfg.apply_filter_fqns(source)
+        cloned = copy.deepcopy(source)
+        with torch.no_grad():
+            source["proj"].weight.zero_()
+            source["proj"].bias.zero_()
+            cloned["proj"].weight.fill_(1)
+            cloned["proj"].bias.fill_(2)
+        x = torch.ones(2, 4, requires_grad=True)
+        actual = cloned["proj"](x)
+        actual.sum().backward()
+        torch.testing.assert_close(actual, torch.full_like(actual, 6), atol=0, rtol=0)
+        torch.testing.assert_close(x.grad, torch.full_like(x, 4), atol=0, rtol=0)
+        for parameter in cloned.parameters():
+            torch.testing.assert_close(parameter.grad, torch.full_like(parameter, 2), atol=0, rtol=0)
+        assert all(parameter.grad is None for parameter in source.parameters())
+        assert calls == [False]
+
+    def test_apply_filter_fqns_no_matches_warns(self, caplog):
+        model = nn.Sequential(nn.Linear(4, 4))
+        cfg = TEFp8Config(filter_fqns=["absent"])
+        with (
+            patch("nemo_automodel.components.models.common.utils.HAVE_TE", True),
+            patch(
+                "nemo_automodel.components.models.common.utils.safe_import_from",
+                side_effect=[(True, nn.Linear), (True, nullcontext)],
+            ),
+        ):
+            assert cfg.apply_filter_fqns(model) == []
+        assert "matched no TE modules" in caplog.text
 
 
 class TestBackendConfigTeFp8:
