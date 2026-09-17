@@ -885,7 +885,7 @@ The following table describes the config fields for the fine-tuning recipe.
 | `distributed` | Yes | `dp_size: null` means auto-detect from world size. Adjust `tp_size` for tensor parallelism across GPUs. |
 | `prewarm` | Optional | Enable targeted initialization warmups for first-step out-of-memory errors, or `pipeline_stage_compile` to reduce pipeline-parallel startup time. See [Prewarm One-Time CUDA Initialization](/get-started/configuration#prewarm-one-time-cuda-initialization), including [HybridEP JIT cache configuration](/get-started/configuration#reuse-hybridep-jit-kernels-across-jobs) for reuse across jobs. Source: [`prewarm.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/training/prewarm.py). |
 | `checkpoint` | Recommended | Set `checkpoint_dir` to a persistent path, especially in Docker. `save_consolidated` defaults to `final`: intermediate SFT checkpoints are sharded and the final checkpoint also exports consolidated HF weights. |
-| `optimizer` | Yes | Any supported `torch.optim` class can be selected using `_target_`; `RecipeConfig` normalizes it to an `OptimizerConfig` that owns construction. For long fine-tuning, especially full-parameter SFT, see the [mixed-precision training guide](/development/mixed-precision-training) before combining torch AdamW with bf16 resident parameters. |
+| `optimizer` | Yes | Any supported `torch.optim` class can be selected using `_target_`; `RecipeConfig` normalizes it to an `OptimizerConfig` that owns construction. For long fine-tuning, especially full-parameter SFT, see the [Mixed-Precision Training Guide](/development/mixed-precision-training) before combining torch AdamW with bf16 resident parameters. |
 | `wandb` | Optional | Uncomment and configure to enable Weights & Biases logging. |
 
 For the fine-tuning recipe itself, see [`train_ft.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/train_ft.py).
@@ -933,7 +933,7 @@ dp_size = world_size ÷ (tp_size × cp_size × pp_size)
 
 EP does not appear in this formula. Experts are distributed across the DP×CP rank groups, with the constraint that `(dp_size × cp_size)` must be divisible by `ep_size`.
 
-#### Data Parallelism as the Default
+### Data Parallelism as the Default
 
 Data parallelism is the default. With `strategy: fsdp2`, FSDP2 shards both model parameters and optimizer states across the DP group, so memory usage shrinks as you add GPUs:
 
@@ -945,7 +945,7 @@ distributed:
   cp_size: 1
 ```
 
-#### Tensor Parallelism
+### Tensor Parallelism
 
 TP splits weight matrices across GPUs within a single node. Set `tp_size` to the number of GPUs you want to shard over. The value is typically 2, 4, or 8 and should divide evenly into the number of attention heads:
 
@@ -960,7 +960,7 @@ distributed:
 
 `sequence_parallel: true` extends TP to also shard activation memory along the sequence dimension, further reducing per-GPU memory at the cost of additional communication.
 
-#### Pipeline Parallelism
+### Pipeline Parallelism
 
 PP assigns groups of layers to different GPUs and streams micro-batches through the stages. It requires an additional nested `pipeline:` section:
 
@@ -991,7 +991,7 @@ PP is available only when the model declares pipeline-parallel support and defin
 
 </Note>
 
-#### Context Parallelism
+### Context Parallelism
 
 CP splits the sequence across GPUs, which is useful for very long contexts that exceed single-GPU memory. Set `cp_size` to the target split factor:
 
@@ -1008,7 +1008,7 @@ When `cp_size > 1`, fused RoPE is automatically disabled. Some models also requi
 
 </Info>
 
-#### Expert Parallelism for MoE Models
+### Expert Parallelism for MoE Models
 
 EP distributes MoE experts across GPUs. Set `ep_size` to the number of GPUs that share the full set of experts:
 
@@ -1024,7 +1024,7 @@ distributed:
 
 EP only applies to Mixture-of-Experts models (such as Qwen3-MoE, Mixtral, and DeepSeek-V3). For dense models, leave `ep_size` at `1` or omit it.
 
-#### Combine Multiple Dimensions
+### Combine Multiple Dimensions
 
 You can combine TP, PP, CP, and EP in a single config. For example, a large MoE model on a multi-node cluster might use:
 

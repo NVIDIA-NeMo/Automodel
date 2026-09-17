@@ -77,9 +77,9 @@ freeze_config:
   - path: multi_modal_projector
 ```
 
-Each selector is a mapping with exactly one key — `path` matches one module by its exact fully qualified name, while `glob` matches module names with `fnmatch`-style wildcards (`*` crosses `.` separators, so `*_proj` matches projection modules at any depth). List entries are additive: repeat `path` or `glob` entries to select several modules, and a single entry combining both keys is rejected. Matching is recursive: a selected module's entire subtree is frozen or unfrozen. Bare strings are rejected; unknown options and selectors that match no parameters raise an error before training starts.
+Each selector is a mapping with exactly one key. `path` matches one module by its exact fully qualified name, while `glob` matches module names with `fnmatch`-style wildcards (`*` crosses `.` separators, so `*_proj` matches projection modules at any depth). List entries are additive: repeat `path` or `glob` entries to select several modules, and a single entry combining both keys is rejected. Matching is recursive: a selected module's entire subtree is frozen or unfrozen. Bare strings are rejected; unknown options and selectors that match no parameters raise an error before training starts.
 
-Trainability is resolved in a fixed order. Full fine-tuning preserves the model's existing `requires_grad` state, including intentionally frozen model-owned parameters; PEFT establishes a LoRA-trainable, base-frozen baseline. `freeze_modules` selectors then freeze their modules, and `unfreeze_modules` selectors unfreeze theirs, winning on overlap — this makes combinations such as LoRA plus a fully trainable multimodal projector a two-line configuration. Freezing only controls `requires_grad`; it never changes a parameter's storage dtype. The policy is validated on the complete model, re-resolved after tensor/expert parallel and activation-checkpointing surgery immediately before DDP/FSDP construction, and resolved once more after checkpoint loading before optimizer construction.
+Trainability is resolved in a fixed order. Full fine-tuning preserves the model's existing `requires_grad` state, including intentionally frozen model-owned parameters. PEFT establishes a LoRA-trainable, base-frozen baseline. `freeze_modules` selectors then freeze their modules, and `unfreeze_modules` selectors unfreeze theirs, winning on overlap. This makes combinations such as LoRA plus a fully trainable multimodal projector a two-line configuration. Freezing only controls `requires_grad`; it never changes a parameter's storage dtype. The policy is validated on the complete model, re-resolved after tensor/expert parallel and activation-checkpointing surgery immediately before DDP/FSDP construction, and resolved once more after checkpoint loading before optimizer construction.
 
 The modality-specific booleans `freeze_vision_tower`, `freeze_audio_tower`, `freeze_language_model`, and `freeze_video_embedder` remain supported and keep their established attribute and substring matching, applied before `unfreeze_modules`:
 
@@ -222,7 +222,7 @@ This option is intended for diagnosed checkpoint defects where rare token IDs pr
 
 For diagnosis, safety behavior, verification steps, and performance impact, see [Repair Damaged Input-Embedding Rows](/model-coverage/troubleshooting#repair-damaged-input-embedding-rows).
 
-### Frozen Multimodal FSDP Policy
+## Frozen Multimodal FSDP Policy
 
 FSDP2 uses the correctness-first `root` policy for fully frozen vision/audio towers and multimodal projectors.
 
