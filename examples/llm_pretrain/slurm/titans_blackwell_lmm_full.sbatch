@@ -42,7 +42,16 @@ LOCAL_BATCH_SIZE=${TITANS_LOCAL_BATCH_SIZE:-$DEFAULT_LOCAL_BATCH_SIZE}
 ACTIVATION_CHECKPOINTING=${TITANS_ACTIVATION_CHECKPOINTING:-false}
 DISTRIBUTED_STRATEGY=${TITANS_DISTRIBUTED_STRATEGY:-fsdp2}
 case "$DISTRIBUTED_STRATEGY" in
-  fsdp2) DISTRIBUTED_OVERRIDES="--distributed.strategy=fsdp2" ;;
+  fsdp2)
+    DISTRIBUTED_OVERRIDES="--distributed.strategy=fsdp2"
+    if [[ -n ${TITANS_FSDP_RESHARD_AFTER_FORWARD:-} ]]; then
+      [[ $TITANS_FSDP_RESHARD_AFTER_FORWARD == true || $TITANS_FSDP_RESHARD_AFTER_FORWARD == false ]] || {
+        echo "TITANS_FSDP_RESHARD_AFTER_FORWARD must be true or false" >&2
+        exit 2
+      }
+      DISTRIBUTED_OVERRIDES+=" --distributed.reshard_after_forward=$TITANS_FSDP_RESHARD_AFTER_FORWARD"
+    fi
+    ;;
   ddp)
     DISTRIBUTED_OVERRIDES="--distributed.strategy=ddp --distributed.autocast_dtype=bfloat16 --distributed.gradient_as_bucket_view=true"
     ;;
@@ -82,6 +91,7 @@ RECIPE=examples/llm_pretrain/titans_${TITANS_SCALE}_lmm.yaml
 DATA_ROOT=$TITANS_WORK_ROOT/data/fineweb-edu-llama2-$TOKEN_BUDGET
 RUN_NAME=titans-${TITANS_SCALE}-${TITANS_EXPERIMENT}-${TOKEN_BUDGET}-blackwell
 [[ $DISTRIBUTED_STRATEGY != fsdp2 ]] && RUN_NAME=$RUN_NAME-$DISTRIBUTED_STRATEGY
+[[ ${TITANS_FSDP_RESHARD_AFTER_FORWARD:-} == false ]] && RUN_NAME=$RUN_NAME-no-reshard
 if [[ -n ${TITANS_RUN_SUFFIX:-} ]]; then
   [[ $TITANS_RUN_SUFFIX =~ ^[A-Za-z0-9._-]+$ ]] || {
     echo "TITANS_RUN_SUFFIX contains unsupported characters" >&2

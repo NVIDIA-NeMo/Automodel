@@ -176,6 +176,7 @@ trap 'rm -f "$JOB_BODY"' EXIT
   printf 'export TITANS_LOCAL_BATCH_SIZE=%q\n' "${TITANS_LOCAL_BATCH_SIZE:-}"
   printf 'export TITANS_ACTIVATION_CHECKPOINTING=%q\n' "${TITANS_ACTIVATION_CHECKPOINTING:-false}"
   printf 'export TITANS_DISTRIBUTED_STRATEGY=%q\n' "${TITANS_DISTRIBUTED_STRATEGY:-fsdp2}"
+  printf 'export TITANS_FSDP_RESHARD_AFTER_FORWARD=%q\n' "${TITANS_FSDP_RESHARD_AFTER_FORWARD:-}"
   printf 'export TITANS_RUN_SUFFIX=%q\n' "${TITANS_RUN_SUFFIX:-}"
   printf 'export TITANS_TIME_LIMIT=%q\n' "${TITANS_TIME_LIMIT:-4:00:00}"
   awk 'NR == 1 {next} !/^#SBATCH/' "$SBATCH_SCRIPT"
@@ -206,6 +207,7 @@ else
   RUN_ID=titans-${SCALE}-${VARIANT}-${TOKEN_BUDGET}-blackwell
   [[ ${TITANS_DISTRIBUTED_STRATEGY:-fsdp2} != fsdp2 ]] && \
     RUN_ID=$RUN_ID-${TITANS_DISTRIBUTED_STRATEGY}
+  [[ ${TITANS_FSDP_RESHARD_AFTER_FORWARD:-} == false ]] && RUN_ID=$RUN_ID-no-reshard
   [[ -n ${TITANS_RUN_SUFFIX:-} ]] && RUN_ID=$RUN_ID-$TITANS_RUN_SUFFIX
   RUN_ID=$RUN_ID-v1
   echo "W&B:      https://wandb.ai/nvidia/titans-paper-reproduction/runs/$RUN_ID"

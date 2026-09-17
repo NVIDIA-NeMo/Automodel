@@ -232,6 +232,16 @@ backward is incompatible with the PyTorch DDP reducer's static-graph hooks.
 FSDP2 remains the full-run default until this pilot demonstrates that DDP fits
 and improves steady-state throughput.
 
+To retain gathered FSDP parameters across the two accumulation microbatches:
+
+```bash
+TITANS_FSDP_RESHARD_AFTER_FORWARD=false TITANS_PILOT_STEPS=100 \
+  tools/submit_titans_blackwell.sh 170m baseline --pilot --total-gpus 8
+```
+
+This benchmark keeps the model, data, global batch, and checkpointing settings
+identical to the default FSDP2 pilot.
+
 The submitter asks `slurm-cli` to rank configured Blackwell clusters and their
 authorized accounts. Eight total GPUs resolve to one node on
 `nsc-svg-slurm-1` (B200) or `aws-pdx-slurm-1` (B300), and two nodes on the

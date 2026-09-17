@@ -498,9 +498,11 @@ def test_blackwell_submitter_resolves_portable_topology():
     assert "TITANS_PILOT_STEPS=%q" in submitter
     assert "TITANS_RUN_SUFFIX=%q" in submitter
     assert "TITANS_DISTRIBUTED_STRATEGY=%q" in submitter
+    assert "TITANS_FSDP_RESHARD_AFTER_FORWARD=%q" in submitter
     assert "--distributed.strategy=ddp" in runner
     assert "--distributed.autocast_dtype=bfloat16" in runner
     assert "--distributed.static_graph=true" not in runner
+    assert "--distributed.reshard_after_forward=$TITANS_FSDP_RESHARD_AFTER_FORWARD" in runner
     assert '--time="$TITANS_TIME_LIMIT"' in full_runner
     assert "SLURM_TIMELIMIT" not in full_runner
     assert "--wandb.project=titans-paper-reproduction" in full_runner

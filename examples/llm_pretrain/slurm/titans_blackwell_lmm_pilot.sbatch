@@ -35,7 +35,16 @@ LOCAL_BATCH_SIZE=${TITANS_LOCAL_BATCH_SIZE:-$DEFAULT_LOCAL_BATCH_SIZE}
 ACTIVATION_CHECKPOINTING=${TITANS_ACTIVATION_CHECKPOINTING:-false}
 DISTRIBUTED_STRATEGY=${TITANS_DISTRIBUTED_STRATEGY:-fsdp2}
 case "$DISTRIBUTED_STRATEGY" in
-  fsdp2) DISTRIBUTED_OVERRIDES="--distributed.strategy=fsdp2" ;;
+  fsdp2)
+    DISTRIBUTED_OVERRIDES="--distributed.strategy=fsdp2"
+    if [[ -n ${TITANS_FSDP_RESHARD_AFTER_FORWARD:-} ]]; then
+      [[ $TITANS_FSDP_RESHARD_AFTER_FORWARD == true || $TITANS_FSDP_RESHARD_AFTER_FORWARD == false ]] || {
+        echo "TITANS_FSDP_RESHARD_AFTER_FORWARD must be true or false" >&2
+        exit 2
+      }
+      DISTRIBUTED_OVERRIDES+=" --distributed.reshard_after_forward=$TITANS_FSDP_RESHARD_AFTER_FORWARD"
+    fi
+    ;;
   ddp)
     DISTRIBUTED_OVERRIDES="--distributed.strategy=ddp --distributed.autocast_dtype=bfloat16 --distributed.gradient_as_bucket_view=true"
     ;;
@@ -75,6 +84,7 @@ TRAIN_INDEX=${TRAIN_DATA%.bin}.bos.idx
 VALIDATION_ROOT=$DATA_ROOT/validation-health-$SLURM_NNODES-$TITANS_GPUS_PER_NODE
 RUN_NAME=titans-${TITANS_SCALE}-${TITANS_EXPERIMENT}-blackwell-pilot
 [[ $DISTRIBUTED_STRATEGY != fsdp2 ]] && RUN_NAME=$RUN_NAME-$DISTRIBUTED_STRATEGY
+[[ ${TITANS_FSDP_RESHARD_AFTER_FORWARD:-} == false ]] && RUN_NAME=$RUN_NAME-no-reshard
 CHECKPOINT_ROOT=$TITANS_WORK_ROOT/outputs/$RUN_NAME-$SLURM_JOB_ID
 WANDB_GROUP=$([[ $TITANS_EXPERIMENT == baseline ]] && echo "lmm-$TITANS_SCALE" || echo "ablations-170m")
 
