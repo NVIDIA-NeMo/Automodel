@@ -202,7 +202,9 @@ if [[ $MODE == pilot ]]; then
   echo "W&B:      https://wandb.ai/nvidia/titans-paper-reproduction"
 else
   case "$SCALE" in 170m|340m) TOKEN_BUDGET=15B ;; 760m) TOKEN_BUDGET=30B ;; esac
-  RUN_ID=titans-${SCALE}-${VARIANT}-${TOKEN_BUDGET}-blackwell-v1
+  RUN_ID=titans-${SCALE}-${VARIANT}-${TOKEN_BUDGET}-blackwell
+  [[ -n ${TITANS_RUN_SUFFIX:-} ]] && RUN_ID=$RUN_ID-$TITANS_RUN_SUFFIX
+  RUN_ID=$RUN_ID-v1
   echo "W&B:      https://wandb.ai/nvidia/titans-paper-reproduction/runs/$RUN_ID"
 fi
 echo "Status:   slurm-cli --cluster $CLUSTER job get $JOB_ID"
