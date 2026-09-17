@@ -162,17 +162,28 @@ class SoftCrossEntropyFunction(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, logits, target_probs, valid_mask, valid_count):
+        """Flatten soft-CE inputs for kernels with contiguous column and mask access.
+
+        Args:
+            ctx: Autograd context.
+            logits: Tensor of shape [batch, sequence, vocab], possibly strided or
+                expanded. Contiguous inputs may be reused for the backward gradient.
+            target_probs: Tensor of shape [batch, sequence, vocab], possibly strided.
+            valid_mask: Tensor of shape [batch, sequence] containing 0/1 supervision.
+            valid_count: Scalar tensor containing the clamped number of valid positions.
+
+        Returns:
+            Scalar fp32 tensor containing the mean supervised soft cross entropy.
+        """
         B, S, V = logits.shape
         n_rows = B * S
 
-        logits_2d = logits.view(n_rows, V)
-        if logits_2d.stride(-1) != 1:
-            logits_2d = logits_2d.contiguous()
-        target_probs_2d = target_probs.view(n_rows, V)
+        logits_2d = logits.reshape(n_rows, V).contiguous()
+        target_probs_2d = target_probs.reshape(n_rows, V)
         if target_probs_2d.stride(-1) != 1:
             target_probs_2d = target_probs_2d.contiguous()
 
-        mask_1d = valid_mask.view(n_rows)
+        mask_1d = valid_mask.reshape(n_rows).contiguous()
         loss_1d = torch.empty(n_rows, dtype=torch.float32, device=logits.device)
         lse_1d = torch.empty(n_rows, dtype=torch.float32, device=logits.device)
         sump_1d = torch.empty(n_rows, dtype=torch.float32, device=logits.device)
