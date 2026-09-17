@@ -258,3 +258,63 @@ class TestHybridEPStaticRoutingPadPin:
         assert calls == [4] and sizes == [12, 12]
         calls2, sizes2 = self._dispatch_n(m, monkeypatch, [16], group_max=16, pin=True)
         assert calls2 == [16] and sizes2 == [16] and m._static_target_tokens == 16
+
+
+class TestHybridEPCapacityMode:
+    """BackendConfig.dispatcher_capacity_factor: one blocking calibration dispatch, then every dispatch passes
+    the calibrated capacity as num_permuted_tokens (non-blocking) and guards HybridEP's overflow flag."""
+
+    def _run(self, monkeypatch, factor, num_tokens_seq, tpe_rows, overflow=0, static=False):
+        import nemo_automodel.components.moe.megatron.token_dispatcher as td
+
+        with patch(
+            "nemo_automodel.components.moe.megatron.token_dispatcher.hybrid_ep_dispatch", new=lambda *a, **kw: None
+        ):
+            m = _HybridEPManager(
+                group=None,
+                num_local_experts=2,
+                num_experts=8,
+                router_topk=2,
+                benchmark_static_routing=static,
+                moe_hybridep_capacity_factor=factor,
+            )
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+        passed, asserts = [], []
+
+        def fake_dispatch(x, routing_map, probs, num_permuted_tokens=None, **kwargs):
+            passed.append(num_permuted_tokens)
+            # blocking mode returns host-side counts; non-blocking returns device-side (cpu stands in) counts
+            tpe = torch.tensor(tpe_rows, dtype=torch.int64)
+            handle = tuple([None] * 10 + [torch.tensor(overflow)])
+            rows = int(tpe.sum()) if num_permuted_tokens is None else int(num_permuted_tokens)
+            return x.new_zeros(rows, x.shape[1]), probs, None, tpe, handle
+
+        monkeypatch.setattr(td, "hybrid_ep_dispatch", fake_dispatch)
+        monkeypatch.setattr(torch, "_assert_async", lambda cond, msg="": asserts.append((bool(cond), msg)))
+        for n in num_tokens_seq:
+            m.routing_map = torch.ones(n, 8, dtype=torch.bool)
+            m.token_probs = torch.full((n, 8), 0.125)
+            m.dispatch(torch.randn(n, 4))
+        return m, passed, asserts
+
+    def test_first_dispatch_calibrates_then_passes_the_capacity(self, monkeypatch):
+        m, passed, asserts = self._run(monkeypatch, 1.5, [8, 8, 8], tpe_rows=[5, 5])  # 10 rows x 1.5 = 15 -> aligned 16
+        assert passed == [None, 16, 16]
+        assert m._hybridep_capacity == 16 and m.num_permuted_tokens == 16
+        assert asserts and all(ok for ok, _ in asserts), "overflow guard checked on every capacity dispatch"
+
+    def test_calibration_dispatch_keeps_the_exact_count_for_its_combine(self, monkeypatch):
+        m, passed, _ = self._run(monkeypatch, 2.0, [8], tpe_rows=[5, 5])
+        assert passed == [None] and m.num_permuted_tokens == 10 and m._hybridep_capacity == 20
+
+    def test_overflow_flag_trips_the_guard(self, monkeypatch):
+        _, _, asserts = self._run(monkeypatch, 1.5, [8, 8], tpe_rows=[5, 5], overflow=1)
+        assert asserts and asserts[-1][0] is False and "capacity" in asserts[-1][1]
+
+    def test_static_routing_ignores_the_factor(self, monkeypatch):
+        m, passed, asserts = self._run(monkeypatch, 1.5, [8, 8], tpe_rows=[5, 5], static=True)
+        assert passed[0] is None and m._hybridep_capacity is None and asserts == []
+
+    def test_no_factor_keeps_the_blocking_path(self, monkeypatch):
+        m, passed, asserts = self._run(monkeypatch, None, [8, 8], tpe_rows=[5, 5])
+        assert passed == [None, None] and asserts == []

@@ -442,6 +442,11 @@ class BackendConfig:
             manager instance across MoE layers.
         dispatcher_async_dispatch: Whether DeepEP/UCCL-EP dispatch and combine should return
             asynchronously and allocate their outputs on the communication stream.
+        dispatcher_capacity_factor: HybridEP only, dynamic routing. Run HybridEP dispatch in its
+            non-blocking mode with output buffers sized to the first microbatch's permuted row
+            count times this factor (EP-group max, 4-token aligned) instead of letting every
+            dispatch drain the compute stream to read the exact count. Overflow trips a
+            device-side assert. None (default) keeps the blocking reference path.
         enable_deepep: Removed and ignored. Logs a warning if set; configure "dispatcher"
             and "experts" explicitly instead.
         fake_balanced_gate: If True, replace the learned Gate with FakeBalancedGate
@@ -501,6 +506,12 @@ class BackendConfig:
     dispatcher_num_sms: int = 20
     dispatcher_share_token_dispatcher: bool = True
     dispatcher_async_dispatch: bool = False
+    # HybridEP only, dynamic routing: after one blocking calibration dispatch per MoE layer, size every
+    # later dispatch's output buffers to ceil(calibrated rows x factor) (EP-group max, aligned) and run
+    # HybridEP in its non-blocking mode. Removes the per-dispatch compute-stream drain that HybridEP's
+    # blocking mode needs to learn the permuted row count (and the per-layer barrier it implies); an
+    # overflow of the capacity trips a device-side assert instead of silently truncating. None = blocking.
+    dispatcher_capacity_factor: float | None = None
     mok: MoKBackendConfig = field(default_factory=MoKBackendConfig)
     enable_deepep: bool | None = None  # Removed: ignored with a warning; set dispatcher/experts explicitly
     fake_balanced_gate: bool = False
