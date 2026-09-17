@@ -122,7 +122,7 @@ preserves released parameter names, required FP32 weights, and logical Engram
 rows while removing the original quantization metadata. Quantized re-export
 is not supported.
 
-Recipe initialization uses the NeMo wrapper's internal Checkpointer and DCP
+Recipe initialization uses the NeMo AutoModel wrapper's internal Checkpointer and DCP
 path to load the base checkpoint into the distributed model.
 
 Text inputs use unpacked `input_ids [batch, sequence]`, right padding, and
@@ -201,7 +201,10 @@ restoration, or full-model convergence.
 THD packing, TP, PP, incremental generation caches, bounded decoder replay,
 and million-token training are unsupported. Image inputs also require
 unpacked batches. Indexers remain frozen because hard top-k selection has no
-language-model gradient; indexer distillation and DSpark draft training are
-outside this implementation. Fine-tuning does not reproduce the report's
+language-model gradient; indexer distillation is outside this implementation.
+Native DSpark draft training is available through the
+[DSpark training guide](/recipes-e2e-examples/dspark-speculative-decoding), with
+the target frozen and DSpark gradients isolated from the target backbone.
+Fine-tuning does not reproduce the report's
 Engram pretraining optimizer. Bitwise training continuation is not established
 for the TileLang backward kernels.
