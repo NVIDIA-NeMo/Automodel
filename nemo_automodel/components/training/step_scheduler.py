@@ -217,11 +217,18 @@ class StepScheduler(Stateful):
 
     def set_epoch(self, epoch: int):
         """
-        Set the epoch for the sampler.
+        Set the epoch for the sampler and the collate function.
+
+        The collate function is notified as well as the sampler because a collator may
+        derive per-epoch augmentation from the epoch. Only this scheduler's dataloader is
+        touched, so a separately built validation loader keeps a fixed epoch and therefore
+        a fixed augmentation mix.
         """
         self.epoch = epoch
         if hasattr(getattr(self.dataloader, "sampler", None), "set_epoch"):
             self.dataloader.sampler.set_epoch(epoch)
+        if hasattr(getattr(self.dataloader, "collate_fn", None), "set_epoch"):
+            self.dataloader.collate_fn.set_epoch(epoch)
 
     @property
     def is_remote_logging_step(self):
