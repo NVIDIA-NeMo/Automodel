@@ -214,7 +214,10 @@ class TestFp32SafeRotaryEmbedding:
 
 class TestDenseTextBackbone:
     def test_packed_metadata_prefers_authoritative_ids_and_matches_reference(self):
-        attention_mask = torch.ones((2, 6), dtype=torch.long)
+        attention_mask = torch.tensor(
+            [[1, 1, 1, 2, 2, 0], [1, 1, 2, 2, 3, 3]],
+            dtype=torch.long,
+        )
         packed_seq_ids = torch.tensor(
             [[1, 1, 2, 2, 2, 0], [1, 2, 2, 3, 3, 3]],
             dtype=torch.long,
