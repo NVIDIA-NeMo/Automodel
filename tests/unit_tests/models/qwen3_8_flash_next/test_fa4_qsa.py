@@ -91,7 +91,8 @@ def test_byte_membership_preserves_route_set() -> None:
     routes = torch.tensor(
         [[[0, 0, -1, 1 << 40, 31, 32, 64], [-1] * 7], [[1, 2, 3, 65, -3, 2, 0], [64] * 7]], dtype=torch.int64
     )
-    raw = fa4_qsa._preprocess(routes, 65)
+    # Keep CPU unit tests focused on semantics, without compiler cold-start overhead.
+    raw = fa4_qsa._preprocess.__wrapped__(routes, 65)
     expected = torch.zeros(2, 2, 65, dtype=torch.uint8)
     expected[0, 0, [0, 31, 32, 64]] = 1
     expected[1, 0, [0, 1, 2, 3]] = 1
@@ -104,7 +105,8 @@ def test_byte_membership_preserves_route_set() -> None:
 def test_block_lists_distinguish_full_partial_and_empty() -> None:
     routes = torch.arange(81).expand(1, 129, 81).clone()
     routes[:, 128] = -1
-    raw = fa4_qsa._preprocess(routes, 81)
+    # Keep CPU unit tests focused on semantics, without compiler cold-start overhead.
+    raw = fa4_qsa._preprocess.__wrapped__(routes, 81)
     mask, pc, pi, fc, fi, rpc, rpi, rfc, rfi = raw
     assert mask[:, 128].count_nonzero() == 0
     assert pc.tolist() == [[[1, 0]]]

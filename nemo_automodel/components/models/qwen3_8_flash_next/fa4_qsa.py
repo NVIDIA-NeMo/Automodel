@@ -119,6 +119,7 @@ def _block_kinds(membership: torch.Tensor, block_keys: int) -> torch.Tensor:
     return present.to(torch.int32) + full.to(torch.int32)
 
 
+@torch.compile(dynamic=False)
 def _preprocess(routes: torch.Tensor, kv_length: int) -> tuple[torch.Tensor, ...]:
     """Build a byte membership table and FA4 forward/reverse block lists.
 
@@ -148,14 +149,6 @@ def _preprocess(routes: torch.Tensor, kv_length: int) -> tuple[torch.Tensor, ...
     forward = _compact_blocks(_block_kinds(membership, 80))
     backward = _compact_blocks(_block_kinds(membership, 64).transpose(1, 2))
     return membership, *forward, *backward
-
-
-@functools.cache
-def _compiled_preprocess() -> Callable:
-    """Lazily compile discrete preprocessing; retain code, not route tensors."""
-    # Keep PyTorch's eager fallback when many shape/stride specializations
-    # exhaust its compile cache. Rare shapes must not abort a training run.
-    return torch.compile(_preprocess, dynamic=False)
 
 
 def fa4_sparse_gqa_attention(
@@ -222,7 +215,7 @@ def fa4_sparse_gqa_attention(
         raise RuntimeError("FA4 QSA backward uses atomic reductions and does not support deterministic algorithms")
     with torch.cuda.device(query.device):
         attention, block_lists, mask_mod = _load_fa4()
-        raw = _compiled_preprocess()(selected_token_ids, key.shape[1])
+        raw = _preprocess(selected_token_ids, key.shape[1])
         forward_blocks = block_lists(*raw[1:5], block_size=(128, 80))
         backward_blocks = block_lists(*raw[5:9], block_size=(128, 64))
         # No tensor Python attributes: FA4 can also consume checkpoint-restored
