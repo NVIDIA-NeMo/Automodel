@@ -40,7 +40,12 @@ from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import (
     _AllGatherConcatFn,
 )
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+# Over the default 5s budget on purpose: CUDA gated-delta kernels take about 72s to compile on a cold worker.
+# Reduce cold compiler startup before lowering this further.
+pytestmark = [
+    pytest.mark.timeout(120),
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available"),
+]
 
 
 @pytest.fixture

@@ -51,6 +51,8 @@ recipe_args:
   num_workers: 2
   shuffle_seed: 42
   trust_remote_code: false
+  # mask_reasoning_content: true   # exclude <think>...</think> traces from loss (non-thinking data)
+  # mask_generation_prompt: true   # exclude the template-supplied turn prefix (role header, empty think block) from loss
 
   # --- offline cache output (PHASE 2 reads this as cached_target_path) ---
   cache_output_dir: ./outputs/dspark_glm_5.2_cache

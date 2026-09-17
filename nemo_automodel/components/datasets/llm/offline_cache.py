@@ -91,8 +91,15 @@ def read_manifest(
     cache_name: str,
     format_version: int,
     producer_name: str | None = None,
+    defaults: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Load and validate an offline-cache manifest."""
+    """Load and validate an offline-cache manifest.
+
+    ``defaults`` holds fields added after the format was first released, with
+    the value a producer that predates them effectively used; a manifest that
+    lacks such a field is read as if it recorded that default, so older caches
+    keep comparing and training under the configuration they were built with.
+    """
     path = manifest_path(cache_dir)
     if not os.path.exists(path):
         raise FileNotFoundError(f"{cache_name} cache manifest not found at {path}. Was the cache fully written?")
@@ -105,7 +112,36 @@ def read_manifest(
             f"{cache_name} cache at {cache_dir} has format_version={version}, expected {format_version}. "
             f"Regenerate the cache with the current {producer}."
         )
-    return manifest
+    return {**(defaults or {}), **manifest}
+
+
+def ensure_supervision_options_match(
+    manifest: dict[str, Any], expected: dict[str, bool], *, cache_name: str, cache_dir: str, producer_name: str
+) -> None:
+    """Reject a cache whose stored supervision was shaped by different options than the run's.
+
+    The cached trainers stream the precomputed ``loss_mask``/``position_mask`` as
+    stored, so dataset options such as ``mask_generation_prompt`` only take effect
+    through the producer. ``expected`` maps each such option to the recipe's value.
+    A manifest that does not record an option (a cache older than the option, or
+    than its manifest field) cannot be verified and is rejected too, unless
+    ``read_manifest`` filled the field in from its defaults.
+    """
+    missing = [k for k in expected if k not in manifest]
+    if missing:
+        raise ValueError(
+            f"{cache_name} cache at {cache_dir} does not record {', '.join(missing)}, so the options its loss "
+            f"masks were built with cannot be verified. Rebuild the cache with the current {producer_name}."
+        )
+    mismatched = {k: bool(manifest[k]) for k, v in expected.items() if bool(manifest[k]) != bool(v)}
+    if mismatched:
+        recorded = ", ".join(f"{k}={v}" for k, v in mismatched.items())
+        configured = ", ".join(f"{k}={bool(expected[k])}" for k in mismatched)
+        raise ValueError(
+            f"{cache_name} cache at {cache_dir} was built with {recorded}, but the recipe sets {configured}. "
+            f"The cached loss masks are used as stored, so rebuild the cache with {producer_name} under the "
+            "recipe's settings or match them in the recipe."
+        )
 
 
 def validate_contiguous_shards(cache_dir: str, cache_name: str, num_samples: int, shard_size: int) -> list[int]:

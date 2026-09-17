@@ -303,6 +303,20 @@ class _ToyRecipe(BaseRecipe):
         self.cfg = ConfigNode(cfg_dict)
 
 
+def test_recipe_autocast_preserves_fp32_parameter_storage():
+    """Configured compute autocast must not mutate resident/master parameters."""
+    recipe = BaseRecipe.__new__(BaseRecipe)
+    recipe.__dict__["distributed_config"] = SimpleNamespace(autocast_dtype=torch.bfloat16)
+    recipe.__dict__["dist_env"] = SimpleNamespace(device=torch.device("cpu"))
+    linear = nn.Linear(2, 2, dtype=torch.float32)
+
+    with recipe._autocast_context():
+        output = linear(torch.ones(1, 2, dtype=torch.float32))
+
+    assert output.dtype == torch.bfloat16
+    assert linear.weight.dtype == torch.float32
+
+
 def test_dp_allreduce_uses_world_group_without_device_mesh(tmp_path, monkeypatch):
     """
     DDP does not create a device mesh, so DP reductions should use the default

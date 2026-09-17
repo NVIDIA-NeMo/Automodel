@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import inspect
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -98,7 +99,7 @@ class TestDeepseekV3BlockMlpDispatch:
 
 
 class TestDeepseekV3GatePrecision:
-    """DeepSeek-V3 should default router scoring to fp32 to match the HF reference."""
+    """DeepSeek-V3 installs the fp32 gate default on a copy, never on the caller's backend."""
 
     @staticmethod
     def _tiny_config():
@@ -116,27 +117,14 @@ class TestDeepseekV3GatePrecision:
             qk_nope_head_dim=16,
         )
 
-    def test_gate_precision_defaults_to_fp32(self):
+    def test_gate_precision_default_lands_on_a_copy(self):
         from nemo_automodel.components.models.common.utils import BackendConfig
 
         backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch", experts="torch", dispatcher="torch")
+        model = DeepseekV3ForCausalLM(self._tiny_config(), backend=backend)
+
+        assert model.backend == replace(backend, gate_precision=torch.float32)
         assert backend.gate_precision is None
-        model = DeepseekV3ForCausalLM(self._tiny_config(), backend=backend)
-        assert model.backend.gate_precision == torch.float32
-
-    def test_gate_precision_respects_explicit_override(self):
-        from nemo_automodel.components.models.common.utils import BackendConfig
-
-        backend = BackendConfig(
-            attn="sdpa",
-            linear="torch",
-            rms_norm="torch",
-            experts="torch",
-            dispatcher="torch",
-            gate_precision="bfloat16",
-        )
-        model = DeepseekV3ForCausalLM(self._tiny_config(), backend=backend)
-        assert model.backend.gate_precision == torch.bfloat16
 
 
 # NOTE: HFCheckpointingMixin tests are now in tests/unit_tests/models/common/test_hf_checkpointing_mixin.py

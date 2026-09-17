@@ -53,12 +53,20 @@ from nemo_automodel.components.models.kimi_k3.cp import (
     document_causal_flex_attention,
     shard_batch_for_kimi_cp,
 )
+from nemo_automodel.components.models.kimi_k3.situ import (
+    _apply_attn_res,
+    _compile_norm_core,
+    _compile_situ_cores,
+    _rms_norm,
+    _weighted_situ,
+)
 from nemo_automodel.components.models.kimi_k3.state_dict_adapter import KimiK3StateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.experts import GroupedExperts, GroupedExpertsDeepEP
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
-from nemo_automodel.components.moe.layers import Gate, MoE
+from nemo_automodel.components.moe.layers import FakeBalancedGate, Gate, MoE
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
+from nemo_automodel.shared.embedding_padding import zero_embedding_row_
 from nemo_automodel.shared.import_utils import UnavailableError, safe_import_from
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
@@ -223,6 +231,12 @@ def _pad_input(hidden_states: torch.Tensor, indices: torch.Tensor, batch_size: i
     return output.reshape(batch_size, seq_len, *hidden_states.shape[1:])
 
 
+# One cached upper-triangular mask per (dtype, device), grown on demand and
+# sliced per call, so repeated microbatches skip rebuilding the [S, S] mask on
+# the hot path while the cache stays bounded to a single largest-size entry.
+_CAUSAL_MASK_CACHE: dict[tuple[torch.dtype, torch.device], torch.Tensor] = {}
+
+
 def _make_causal_mask(
     inputs_embeds: torch.Tensor,
     packed_context: "KimiPackedContext | None",
@@ -249,10 +263,14 @@ def _make_causal_mask(
             q_global_start=0,
             dtype=dtype,
         )
-    min_value = torch.finfo(dtype).min
-    mask = torch.full((seq_len, seq_len), min_value, device=inputs_embeds.device, dtype=dtype)
-    mask = torch.triu(mask, diagonal=1)
-    return mask[None, None, :, :].expand(batch_size, 1, -1, -1)
+    cache_key = (dtype, inputs_embeds.device)
+    mask = _CAUSAL_MASK_CACHE.get(cache_key)
+    if mask is None or mask.shape[0] < seq_len:
+        min_value = torch.finfo(dtype).min
+        mask = torch.full((seq_len, seq_len), min_value, device=inputs_embeds.device, dtype=dtype)
+        mask = torch.triu(mask, diagonal=1)
+        _CAUSAL_MASK_CACHE[cache_key] = mask
+    return mask[None, None, :seq_len, :seq_len].expand(batch_size, 1, -1, -1)
 
 
 def _packed_context_from_inputs(
@@ -298,11 +316,7 @@ class KimiRMSNorm(nn.Module):
         Returns:
             Tensor of shape [batch, sequence, hidden].
         """
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
+        return _rms_norm(hidden_states, self.weight, self.variance_epsilon)
 
     def reset_parameters(self) -> None:
         nn.init.ones_(self.weight)
@@ -973,24 +987,6 @@ class KimiDeltaAttention(nn.Module):
                 self.o_norm.reset_parameters()
 
 
-def _weighted_situ(
-    gate_up: torch.Tensor,
-    routing_weights: torch.Tensor,
-    *,
-    beta: float,
-    linear_beta: float | None,
-) -> torch.Tensor:
-    """Apply SiTU and routing weights to ``[tokens, 2 * intermediate]`` projections."""
-    input_dtype = gate_up.dtype
-    gate, up = gate_up.chunk(2, dim=-1)
-    gate = gate.float()
-    up = up.float()
-    activated = beta * torch.tanh(gate / beta) * torch.sigmoid(gate)
-    if linear_beta is not None:
-        up = linear_beta * torch.tanh(up / linear_beta)
-    return (activated * up * routing_weights.float()).to(input_dtype)
-
-
 class KimiK3Gate(Gate):
     """K3's fp32 sigmoid router with correction-bias-only expert selection."""
 
@@ -1043,6 +1039,19 @@ class KimiK3Gate(Gate):
         return weights * self.route_scale, indices, None
 
 
+_SHARED_EXPERT_STREAMS: dict[int, torch.cuda.Stream] = {}
+
+
+def _shared_expert_stream(device: torch.device) -> torch.cuda.Stream:
+    """Return the per-device side stream used for shared-expert overlap (created lazily, one per process)."""
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    stream = _SHARED_EXPERT_STREAMS.get(index)
+    if stream is None:
+        stream = torch.cuda.Stream(device=index)
+        _SHARED_EXPERT_STREAMS[index] = stream
+    return stream
+
+
 class KimiK3MoE(MoE):
     """K3 routed experts with latent projections and a SiTU shared expert."""
 
@@ -1052,7 +1061,17 @@ class KimiK3MoE(MoE):
         self.dim = moe_config.dim
         self.n_routed_experts = moe_config.n_routed_experts
         self.n_activated_experts = moe_config.n_activated_experts
-        self.gate = KimiK3Gate(moe_config, gate_precision=torch.float32)
+        if backend.fake_balanced_gate:
+            # Mirror the base MoE: with random-init weights the learned gate's
+            # near-equal scores make topk pick experts [0..topk) for every token,
+            # collapsing all traffic onto each EP group's first rank.
+            self.gate = FakeBalancedGate(moe_config, noise=backend.fake_gate_noise)
+        else:
+            self.gate = KimiK3Gate(moe_config, gate_precision=torch.float32)
+        if backend.compile_situ:
+            _compile_situ_cores()
+        if backend.compile_norm:
+            _compile_norm_core()
         expert_activation = partial(
             _weighted_situ,
             beta=config.activation_situ_beta or 1.0,
@@ -1118,6 +1137,24 @@ class KimiK3MoE(MoE):
         gate_cp_mesh = cp_mesh if cp_mesh is not None else self.cp_mesh
         weights, indices, _ = self.gate(identity, token_mask, gate_cp_mesh)
         routed_input = self.routed_expert_down_proj(identity)
+        # Shared-expert overlap (BackendConfig.shared_expert_overlap): the shared experts only
+        # depend on ``identity``, so launch them on a side stream before the routed path and
+        # join after it. Under expert parallelism the routed path spends most of its time in
+        # dispatch / combine communication on the current stream, which leaves SMs free for the
+        # shared-expert GEMMs (same idea as Megatron-Core's ``moe_shared_expert_overlap``).
+        # Autograd replays each backward op on the stream its forward op used; measured on an
+        # 8-node EP32 K3 mini the win comes from the forward and recompute passes (launching the
+        # shared experts after the routed path to reorder the backward was slower: the routed path
+        # host-syncs on tokens_per_expert, which serializes the shared experts behind it).
+        shared_output = None
+        shared_stream = None
+        if self.shared_experts is not None and self.backend.shared_expert_overlap and identity.is_cuda:
+            shared_stream = _shared_expert_stream(identity.device)
+            shared_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(shared_stream):
+                shared_output = self.shared_experts(identity)
+            # ``identity`` was allocated on the current stream; keep its block alive for the side stream.
+            identity.record_stream(shared_stream)
         if not self.training and not self._has_distributed_experts():
             routed = self._forward_reference_order(routed_input, indices, weights)
         else:
@@ -1125,7 +1162,12 @@ class KimiK3MoE(MoE):
         if self.routed_expert_norm is not None:
             routed = self.routed_expert_norm(routed)
         output = self.routed_expert_up_proj(routed)
-        if self.shared_experts is not None:
+        if shared_output is not None:
+            current = torch.cuda.current_stream()
+            current.wait_stream(shared_stream)
+            shared_output.record_stream(current)
+            output = output + shared_output
+        elif self.shared_experts is not None:
             output = output + self.shared_experts(identity)
         return output.view(shape)
 
@@ -1179,22 +1221,6 @@ class KimiK3MoE(MoE):
                 self.routed_expert_norm.reset_parameters()
         if self.shared_experts is not None:
             self.shared_experts.init_weights(buffer_device, init_std)
-
-
-def _apply_attn_res(
-    prefix_sum: torch.Tensor,
-    block_residual: torch.Tensor,
-    projection: nn.Linear,
-    norm: KimiRMSNorm,
-) -> torch.Tensor:
-    """Mix ``[tokens, hidden]`` with prior ``[tokens, blocks, hidden]`` residuals."""
-    values = torch.cat((block_residual, prefix_sum.unsqueeze(1)), dim=1)
-    values_fp32 = values.float()
-    variance = values_fp32.pow(2).mean(-1, keepdim=True)
-    keys = values_fp32 * torch.rsqrt(variance + norm.variance_epsilon)
-    score_weight = norm.weight.float() * projection.weight.squeeze(0).float()
-    probabilities = (keys * score_weight).sum(-1).softmax(-1).unsqueeze(1)
-    return torch.matmul(probabilities, values_fp32).squeeze(1).to(values.dtype)
 
 
 class KimiDecoderLayer(nn.Module):
@@ -1510,7 +1536,11 @@ class KimiK3TextModel(nn.Module):
         Returns:
             Binary padding mask tensor of shape [batch, sequence], or None when no KDA mask is needed.
         """
-        if cache_position[0] > 0 or (attention_mask is not None and torch.all(attention_mask == 1)):
+        if attention_mask is None:
+            # Both branches below return None for this input; returning early skips
+            # a per-microbatch device-to-host sync on cache_position[0].
+            return None
+        if cache_position[0] > 0 or torch.all(attention_mask == 1):
             return None
         return attention_mask
 
@@ -1663,7 +1693,7 @@ class KimiK3TextModel(nn.Module):
             if self.embed_tokens is not None:
                 nn.init.normal_(self.embed_tokens.weight, mean=0.0, std=init_std)
                 if self.padding_idx is not None:
-                    self.embed_tokens.weight[self.padding_idx].zero_()
+                    zero_embedding_row_(self.embed_tokens.weight, self.padding_idx)
             if self.norm is not None:
                 self.norm.reset_parameters()
             if self.use_attn_residuals:

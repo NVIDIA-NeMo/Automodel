@@ -35,13 +35,14 @@ import os
 import sys
 import time
 import traceback
-from collections.abc import Callable
-from contextlib import AbstractContextManager, contextmanager, nullcontext
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import timedelta
-from functools import wraps
+from functools import cache, wraps
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
+from unittest.mock import patch
 
 if TYPE_CHECKING:
     from nemo_automodel.recipes.base_recipe import BaseRecipe
@@ -50,13 +51,16 @@ import datasets
 import torch
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor
+from torch.overrides import TorchFunctionMode
 
+from nemo_automodel.components.attention.flex_attention import FlexAttention
 from nemo_automodel.components.checkpoint.checkpointing import (
     _MODELS_REQUIRING_BUFFER_REINIT,
     _reinit_non_persistent_buffers,
 )
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.shared.import_utils import safe_import
 from nemo_automodel.shared.utils import dtype_from_str
 from tests.functional_tests.checkpoint_robustness.parity_metrics import (
     _apply_parity_threshold_overrides,
@@ -86,11 +90,18 @@ from tests.functional_tests.checkpoint_robustness.resume_trajectory import (
     _TrainingReproducibilityRecorder,
     _TrajectoryRecorder,
 )
+from tests.functional_tests.checkpoint_robustness.shape_diagnostics import (
+    _build_shape_diagnostic_report,
+    _normalize_shape_diagnostic_config,
+    _persist_shape_diagnostic_report,
+    _ShapeDiagnosticConfig,
+)
 
 datasets.disable_caching()
 
 _PARITY_DOCUMENT_PATH = Path(__file__).with_name("parity_document.mdx")
 _PARITY_DOCUMENT_SHA256 = "8f734b2ee925ab82afb56dfa3a512108b70d3c54a2489f7978a036420da34cdb"  # pragma: allowlist secret
+_ROUTER_DIAGNOSTIC_MODEL_TYPE = "glm4_moe_lite"
 _REMOVED_CHECKPOINT_ROBUSTNESS_FIELDS = {
     "automodel_reload_cosine_threshold",
     "automodel_reload_mean_kl_threshold",
@@ -124,6 +135,18 @@ class _LogitParityPolicy:
     mean_kl_threshold_override: float | None = None
     p95_kl_threshold_override: float | None = None
     cosine_threshold_override: float | None = None
+    gate_sequence_length: int | None = None
+
+
+def _parse_boolean_fixture_value(value: object, *, key: str) -> bool:
+    """Normalize a YAML boolean fixture value without string-truthiness surprises."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "false"}:
+            return normalized == "true"
+    raise ValueError(f"ci.checkpoint_robustness.{key} must be true or false, got {value!r}")
 
 
 def _extract_custom_args(argv: list[str]) -> tuple[dict[str, object], list[str]]:
@@ -141,6 +164,7 @@ def _extract_custom_args(argv: list[str]) -> tuple[dict[str, object], list[str]]
         "--max_cpu_gb",
         "--training_reproducibility_loss_threshold",
         "--parity_sequence_length",
+        "--cross_framework_gate_sequence_length",
         "--parity_threshold_overrides",
         "--parity_tolerance_profile",
         "--parity_tolerance_profile_overrides",
@@ -154,6 +178,7 @@ def _extract_custom_args(argv: list[str]) -> tuple[dict[str, object], list[str]]
         "--check_phantom_keys",
         "--hf_device_map_auto",
         "--hf_source_post_load_dequantize",
+        "--capture_router_diagnostics",
         "--skip_resume",
         "--skip_source_load_parity",
         "--skip_source_load_logit_parity",
@@ -161,6 +186,7 @@ def _extract_custom_args(argv: list[str]) -> tuple[dict[str, object], list[str]]
         "--skip_automodel_reload_logit_parity",
         "--skip_hf_reload_logit_parity",
     }
+    boolean_config_keys = {key.lstrip("-") for key in boolean_keys}
     custom: dict[str, object] = {}
     remaining = []
     i = 0
@@ -202,15 +228,15 @@ def _extract_custom_args(argv: list[str]) -> tuple[dict[str, object], list[str]]
         for k, v in ci_robustness.items():
             if k in default_on_control_keys:
                 continue
+            if k in {"shape_diagnostic", "hf_reference_compute_fp32"}:
+                continue
             if k not in custom:
                 if "." in k:
                     # Dotted keys are config overrides (e.g. distributed.tp_size),
                     # route them to the config parser instead of the custom dict.
                     remaining.extend([f"--{k}", str(v)])
-                elif isinstance(v, bool) and (v or k == "trust_remote_code"):
-                    # ``false`` is meaningful for trust_remote_code: it must be
-                    # able to override a recipe model that normally uses remote code.
-                    custom[k] = v
+                elif k in boolean_config_keys:
+                    custom[k] = _parse_boolean_fixture_value(v, key=k)
                 elif not isinstance(v, bool):
                     custom[k] = str(v)
 
@@ -237,7 +263,9 @@ def _extract_custom_args(argv: list[str]) -> tuple[dict[str, object], list[str]]
     if "skip_source_load_parity" in cli_custom_keys:
         source_load_parity_enabled = False
     elif "skip_source_load_parity" in ci_robustness:
-        source_load_parity_enabled = not bool(ci_robustness["skip_source_load_parity"])
+        source_load_parity_enabled = not _parse_boolean_fixture_value(
+            ci_robustness["skip_source_load_parity"], key="skip_source_load_parity"
+        )
     else:
         source_load_parity_enabled = True
     custom["source_load_parity_enabled"] = source_load_parity_enabled
@@ -247,7 +275,7 @@ def _extract_custom_args(argv: list[str]) -> tuple[dict[str, object], list[str]]
     if "skip_resume" in cli_custom_keys:
         resume_enabled = False
     elif "skip_resume" in ci_robustness:
-        resume_enabled = not bool(ci_robustness["skip_resume"])
+        resume_enabled = not _parse_boolean_fixture_value(ci_robustness["skip_resume"], key="skip_resume")
     else:
         resume_enabled = True
     custom["resume_enabled"] = resume_enabled
@@ -257,6 +285,32 @@ def _extract_custom_args(argv: list[str]) -> tuple[dict[str, object], list[str]]
     parity_sequence_length = int(custom.get("parity_sequence_length", "2048"))
     if parity_sequence_length <= 0:
         raise ValueError(f"parity_sequence_length must be positive, got {parity_sequence_length}")
+    if "cross_framework_gate_sequence_length" in custom:
+        cross_framework_gate_sequence_length = int(custom["cross_framework_gate_sequence_length"])
+        if cross_framework_gate_sequence_length <= 0:
+            raise ValueError(
+                f"cross_framework_gate_sequence_length must be positive, got {cross_framework_gate_sequence_length}"
+            )
+        if cross_framework_gate_sequence_length > parity_sequence_length:
+            raise ValueError(
+                "cross_framework_gate_sequence_length must not exceed parity_sequence_length "
+                f"({cross_framework_gate_sequence_length} > {parity_sequence_length})"
+            )
+    else:
+        cross_framework_gate_sequence_length = None
+    raw_shape_diagnostic = ci_robustness.get("shape_diagnostic")
+    shape_diagnostic = _normalize_shape_diagnostic_config(
+        raw_shape_diagnostic,
+        parity_sequence_length=parity_sequence_length,
+    )
+    shape_diagnostic_lengths = shape_diagnostic.lengths(
+        parity_sequence_length=parity_sequence_length,
+        gate_sequence_length=cross_framework_gate_sequence_length,
+    )
+    if shape_diagnostic.sweep_lengths and not source_load_parity_enabled:
+        raise ValueError("shape_diagnostic.sweep_lengths requires source-load parity to be enabled")
+    if shape_diagnostic_lengths:
+        custom["shape_diagnostic"] = shape_diagnostic
     if "hf_reload_timeout_seconds" in custom and int(custom["hf_reload_timeout_seconds"]) <= 0:
         raise ValueError("hf_reload_timeout_seconds must be positive")
     _resolve_parity_thresholds(str(custom.get("parity_tolerance_profile", "standard")), "same_implementation")
@@ -343,6 +397,42 @@ def _load_hf_fp8_dequantized_config(
     return config
 
 
+def _repair_legacy_partial_rotary_config(config) -> bool:
+    """Restore a legacy partial-rotary spec dropped by newer Transformers configs.
+
+    Checkpoints such as MiniMax-M2.* express partial RoPE only through the
+    legacy ``rotary_dim`` config field. Transformers 5.x in-tree configs keep
+    ``rotary_dim`` as a plain attribute while their models read only
+    ``rope_parameters["partial_rotary_factor"]``, so the vanilla reference
+    silently rotates the full head dimension with the wrong frequency ladder
+    and becomes a deterministic but invalid reference (AMINT-286). Derive the
+    missing factor as ``rotary_dim / head_dim``.
+
+    Args:
+        config: Loaded HF config for the vanilla reference model.
+
+    Returns:
+        True when the config's rope parameters were repaired; False when the
+        config has no legacy spec or already carries a partial factor.
+    """
+    rotary_dim = getattr(config, "rotary_dim", None)
+    head_dim = getattr(config, "head_dim", None)
+    if not rotary_dim or not head_dim or rotary_dim == head_dim:
+        return False
+    rope_parameters = getattr(config, "rope_parameters", None)
+    if isinstance(rope_parameters, dict):
+        if rope_parameters.get("partial_rotary_factor"):
+            return False
+        rope_parameters["partial_rotary_factor"] = rotary_dim / head_dim
+        return True
+    if rope_parameters is not None and hasattr(rope_parameters, "partial_rotary_factor"):
+        if rope_parameters.partial_rotary_factor:
+            return False
+        rope_parameters.partial_rotary_factor = rotary_dim / head_dim
+        return True
+    return False
+
+
 def _is_nemo_owned_config(config) -> bool:
     """Return True when a config object is an AutoModel component config."""
     return type(config).__module__.startswith("nemo_automodel")
@@ -368,6 +458,14 @@ def _replace_nemo_owned_reference_config(
     (AMINT-288). Resolve the checkpoint's own config class from its
     ``auto_map`` instead, preserving a load-time FP8 ``dequantize`` request.
 
+    The same registrations also shadow in-tree config classes: for built-in
+    references (``trust_remote_code=False``), AutoConfig pairs the
+    AutoModel-owned config with the in-tree model, which then crashes on
+    attribute contracts the local class does not carry (the in-tree
+    minimax_m3_vl vision tower reads ``vision_config.temporal_patch_size``).
+    Resolve the in-tree class from Transformers' own name table, which
+    registration cannot shadow.
+
     Args:
         config: Config resolved for the vanilla reference load.
         pretrained_model_name_or_path: Checkpoint the reference loads from.
@@ -378,14 +476,8 @@ def _replace_nemo_owned_reference_config(
     Returns:
         Tuple of the faithful config and whether a replacement happened.
     """
-    if not trust_remote_code or not _is_nemo_owned_config(config):
+    if not _is_nemo_owned_config(config):
         return config, False
-    auto_map = getattr(config, "auto_map", None) or {}
-    class_reference = auto_map.get("AutoConfig")
-    if not class_reference:
-        return config, False
-
-    from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
     load_kwargs: dict[str, str | bool] = {
         "local_files_only": os.environ.get("HF_HUB_OFFLINE", "0") == "1",
@@ -394,7 +486,23 @@ def _replace_nemo_owned_reference_config(
         load_kwargs["revision"] = revision
     if token is not None:
         load_kwargs["token"] = token
-    config_cls = get_class_from_dynamic_module(class_reference, pretrained_model_name_or_path, **load_kwargs)
+
+    config_cls = None
+    auto_map = getattr(config, "auto_map", None) or {}
+    class_reference = auto_map.get("AutoConfig")
+    if trust_remote_code and class_reference:
+        from transformers.dynamic_module_utils import get_class_from_dynamic_module
+
+        config_cls = get_class_from_dynamic_module(class_reference, pretrained_model_name_or_path, **load_kwargs)
+    else:
+        import transformers
+        from transformers.models.auto.configuration_auto import CONFIG_MAPPING_NAMES
+
+        class_name = CONFIG_MAPPING_NAMES.get(getattr(config, "model_type", None) or "")
+        if class_name is not None:
+            config_cls = getattr(transformers, class_name, None)
+    if config_cls is None:
+        return config, False
     replacement = config_cls.from_pretrained(pretrained_model_name_or_path, **load_kwargs)
 
     original_quantization = getattr(config, "quantization_config", None)
@@ -645,6 +753,8 @@ def _compare_logits(
     reference_logits: torch.Tensor,
     candidate_logits: torch.Tensor,
     policy: _LogitParityPolicy,
+    *,
+    diagnostics: dict[str, object] | None = None,
 ) -> str | None:
     """Compute, persist, and optionally enforce one full-logit comparison.
 
@@ -653,11 +763,31 @@ def _compare_logits(
         reference_logits: Reference tensor of shape [..., vocab], with arbitrary leading token dimensions.
         candidate_logits: Candidate tensor of shape [..., vocab], matching ``reference_logits`` exactly.
         policy: Comparison identity, numerical profile, targeted overrides, and enforcement state.
+        diagnostics: Optional diagnostic evidence to embed in the emitted schema-v3 record.
 
     Returns:
         A failure message when an enforced gate fails, otherwise ``None``.
     """
     metrics = _compute_parity_metrics(reference_logits, candidate_logits)
+    full_sequence_length = reference_logits.shape[-2]
+    gate_sequence_length = full_sequence_length if policy.gate_sequence_length is None else policy.gate_sequence_length
+    if gate_sequence_length <= 0:
+        raise ValueError(f"{policy.comparison} gate_sequence_length must be positive, got {gate_sequence_length}")
+    if policy.gate_sequence_length is not None and policy.comparison_kind != "cross_framework":
+        raise ValueError("gate_sequence_length is supported only for cross-framework comparisons")
+    if gate_sequence_length > full_sequence_length:
+        raise ValueError(
+            f"{policy.comparison} gate_sequence_length={gate_sequence_length} exceeds the captured "
+            f"sequence length {full_sequence_length}"
+        )
+    uses_gate_prefix = gate_sequence_length < full_sequence_length
+    if uses_gate_prefix:
+        gate_metrics = _compute_parity_metrics(
+            reference_logits[..., :gate_sequence_length, :],
+            candidate_logits[..., :gate_sequence_length, :],
+        )
+    else:
+        gate_metrics = metrics
     profile_thresholds = _resolve_parity_thresholds(policy.profile, policy.comparison_kind)
     threshold_overrides = {
         "mean_kl": policy.mean_kl_threshold_override,
@@ -671,11 +801,13 @@ def _compare_logits(
         p95_kl=policy.p95_kl_threshold_override,
         cosine_similarity=policy.cosine_threshold_override,
     )
-    profile_failures = _parity_failures(metrics, profile_thresholds)
-    active_failures = _parity_failures(metrics, active_profile_thresholds)
+    profile_failures = _parity_failures(gate_metrics, profile_thresholds)
+    active_failures = _parity_failures(gate_metrics, active_profile_thresholds)
+    full_sequence_profile_failures = _parity_failures(metrics, profile_thresholds)
+    full_sequence_active_failures = _parity_failures(metrics, active_profile_thresholds)
     threshold_mode = "profile_with_numeric_overrides" if uses_threshold_overrides else "profile"
     payload = {
-        "schema_version": 2,
+        "schema_version": 3,
         "parity_document_sha256": _PARITY_DOCUMENT_SHA256,
         "phase": policy.phase,
         "comparison": policy.comparison,
@@ -689,9 +821,16 @@ def _compare_logits(
         "passed": not policy.enforce or not active_failures,
         "within_active_thresholds": not active_failures,
         "would_pass_profile": not profile_failures,
+        "full_sequence_within_active_thresholds": not full_sequence_active_failures,
+        "full_sequence_would_pass_profile": not full_sequence_profile_failures,
         "failures": list(active_failures) if policy.enforce else [],
         "threshold_failures": list(active_failures),
         "profile_failures": list(profile_failures),
+        "full_sequence_threshold_failures": list(full_sequence_active_failures),
+        "full_sequence_profile_failures": list(full_sequence_profile_failures),
+        "full_sequence_length": full_sequence_length,
+        "gate_sequence_length": gate_sequence_length,
+        "uses_gate_prefix": uses_gate_prefix,
         "reference_logits": {
             "dtype": str(reference_logits.dtype),
             "shape": list(reference_logits.shape),
@@ -701,14 +840,25 @@ def _compare_logits(
             "shape": list(candidate_logits.shape),
         },
         "metrics": metrics.to_dict(),
+        "gate_metrics": gate_metrics.to_dict(),
     }
+    diagnostic_keys = set(diagnostics or ())
+    diagnostic_collisions = diagnostic_keys & payload.keys()
+    if diagnostic_collisions:
+        raise ValueError(f"Diagnostic keys collide with parity record fields: {sorted(diagnostic_collisions)}")
+    if diagnostics:
+        payload.update(diagnostics)
     report_dir = artifact_dir / "parity_metrics"
     report_dir.mkdir(parents=True, exist_ok=True)
     report_path = report_dir / f"{policy.phase}_{policy.comparison}.json"
     temporary_report_path = report_path.with_suffix(".tmp")
     temporary_report_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
     temporary_report_path.replace(report_path)
-    print(f"CHECKPOINT_PARITY_METRICS {json.dumps(payload, sort_keys=True)}")
+    logged_payload = {key: value for key, value in payload.items() if key not in diagnostic_keys}
+    if diagnostics:
+        logged_payload["embedded_diagnostics"] = sorted(diagnostics)
+    logged_payload["report_path"] = str(report_path)
+    print(f"CHECKPOINT_PARITY_METRICS {json.dumps(logged_payload, sort_keys=True)}")
 
     if not policy.enforce:
         print(
@@ -718,7 +868,8 @@ def _compare_logits(
         return None
     if not active_failures:
         return None
-    return f"{policy.comparison} parity failed: " + "; ".join(active_failures)
+    gate_scope = f"first {gate_sequence_length} tokens" if uses_gate_prefix else "full sequence"
+    return f"{policy.comparison} parity failed on {gate_scope}: " + "; ".join(active_failures)
 
 
 def _comparison_threshold_overrides(custom_args: dict[str, object], comparison: str) -> dict[str, float]:
@@ -748,6 +899,11 @@ def _source_load_parity_policy(custom_args: dict[str, object], *, enforce: bool 
         mean_kl_threshold_override=overrides.get("mean_kl"),
         p95_kl_threshold_override=overrides.get("p95_kl"),
         cosine_threshold_override=overrides.get("cosine_similarity"),
+        gate_sequence_length=(
+            int(custom_args["cross_framework_gate_sequence_length"])
+            if "cross_framework_gate_sequence_length" in custom_args
+            else None
+        ),
     )
 
 
@@ -789,6 +945,11 @@ def _hf_reload_parity_policy(custom_args: dict[str, object]) -> _LogitParityPoli
         mean_kl_threshold_override=overrides.get("mean_kl"),
         p95_kl_threshold_override=overrides.get("p95_kl"),
         cosine_threshold_override=overrides.get("cosine_similarity"),
+        gate_sequence_length=(
+            int(custom_args["cross_framework_gate_sequence_length"])
+            if "cross_framework_gate_sequence_length" in custom_args
+            else None
+        ),
     )
 
 
@@ -1121,6 +1282,8 @@ def _hf_source_load_kwargs(
     hf_model_cls: type,
     device: torch.device,
     hf_device_map_auto: bool,
+    hf_device_map_max_memory_gib: str | float | None = None,
+    hf_device_map_cpu_max_memory_gib: str | float | None = None,
 ) -> dict:
     """Build the HF-safe subset of recipe model kwargs for the source-load reference."""
     hf_allowed_keys = {
@@ -1157,6 +1320,13 @@ def _hf_source_load_kwargs(
         hf_kwargs["trust_remote_code"] = False
     if hf_device_map_auto:
         hf_kwargs["device_map"] = "auto"
+        # References too large for uncapped automatic placement (the 427B
+        # MiniMax-M3 fills every GPU and OOMs on the fused-expert concat
+        # transient) need the same GPU caps + CPU spill as the HF reload path.
+        max_memory = _hf_device_map_max_memory(hf_device_map_max_memory_gib, hf_device_map_cpu_max_memory_gib)
+        if max_memory is not None:
+            hf_kwargs["max_memory"] = max_memory
+            print(f"[Phase 0] Automatic device-map memory limits: {max_memory}")
     if (
         "device_map" not in hf_kwargs
         and not hf_kwargs["trust_remote_code"]
@@ -1251,6 +1421,15 @@ def _release_model_memory() -> None:
         torch.cuda.empty_cache()
 
 
+# Leaf names distinctive enough to register as layout-independent fp32
+# aliases. Transformers matches _keep_in_fp32_modules_strict entries as
+# unanchored substrings, so only leaves that cannot collide with unrelated
+# modules qualify — a generic leaf such as ``proj`` or ``scale`` (from
+# Gemma4's ``router.proj``/``router.scale``) would pin ``q_proj``,
+# ``down_proj``, and friends fp32 across the whole bf16 reference.
+_HF_FP32_LEAF_ALIASES = ("e_score_correction_bias",)
+
+
 def _hf_fp32_module_names(hf_config: object) -> tuple[str, ...]:
     """Infer vanilla-HF fp32 names from AutoModel's model-owned checkpoint contract."""
     from nemo_automodel._transformers.model_init import _resolve_custom_model_cls_for_config
@@ -1264,6 +1443,16 @@ def _hf_fp32_module_names(hf_config: object) -> tuple[str, ...]:
     for name in getattr(model_cls, "_keep_in_fp32_modules_strict", None) or ():
         if name not in module_names:
             module_names.append(name)
+        # AutoModel strict names use AutoModel module paths, but vanilla HF
+        # layouts can hang the same tensor off a different parent (in-tree
+        # MiniMax-M2 keeps e_score_correction_bias on ``mlp``, not
+        # ``mlp.gate``), so the AutoModel-path entry silently fails to match
+        # and the reference's router bias was cast to bf16 — scrambling 30-73%
+        # of knife-edge top-k selections per layer (AMINT-286). Also register
+        # the distinctive leaf so any layout keeps the tensor in fp32.
+        leaf = name.rsplit(".", 1)[-1]
+        if leaf in _HF_FP32_LEAF_ALIASES and leaf not in module_names:
+            module_names.append(leaf)
     return tuple(module_names)
 
 
@@ -1284,6 +1473,190 @@ def _keep_hf_modules_in_fp32(hf_config: object):
         yield
     finally:
         setattr(PreTrainedModel, attr, previous)
+
+
+class _FP32ReferenceOperation(TorchFunctionMode):
+    """Change only the dtype argument of one explicitly selected HF operation."""
+
+    def __init__(self, operation: Callable) -> None:
+        self.operation = operation
+        self.calls = 0
+
+    def __torch_function__(
+        self, func: Callable, types: tuple[type, ...], args: tuple = (), kwargs: dict | None = None
+    ) -> Any:
+        """Dispatch native operations, promoting the selected one.
+
+        Args:
+            func: Original torch operation.
+            types: Tensor types supplied by torch's dispatch protocol.
+            args: Framework operands of arbitrary layouts. The selected operation
+                receives router logits [tokens, experts] or expert inputs [tokens, hidden].
+            kwargs: Original operation keywords, including an optional dtype.
+
+        Returns:
+            The native result with its original layout. The selected operation
+            returns FP32; other operations retain their native dtype behavior.
+        """
+        kwargs = dict(kwargs or {})
+        if func is self.operation:
+            kwargs["dtype"] = torch.float32
+            self.calls += 1
+        return func(*args, **kwargs)
+
+
+def _with_fp32_scores(forward: Callable) -> Callable:
+    @wraps(forward)
+    def wrapped(hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run the original HF router with FP32 score arithmetic.
+
+        Args:
+            hidden_states: Tensor of shape [..., hidden], with arbitrary leading
+                dimensions and the native router projection's input dtype.
+
+        Returns:
+            Native projection logits of shape [tokens, experts], FP32 normalized
+            routing weights of shape [tokens, top_k], and integer expert indices
+            of shape [tokens, top_k]. Tokens flatten the input's leading axes.
+        """
+        with _FP32ReferenceOperation(torch.Tensor.softmax) as mode:
+            result = forward(hidden_states)
+        if mode.calls != 1:
+            raise RuntimeError(f"HF Mistral4 router softmax contract changed: expected one call, got {mode.calls}")
+        return result
+
+    return wrapped
+
+
+def _with_fp32_expert_sum(forward: Callable) -> Callable:
+    @wraps(forward)
+    def wrapped(hidden_states: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+        """Sum routed experts [tokens, hidden] in FP32, restoring the activation dtype."""
+        # The native eager expert forward creates its accumulator with zeros_like.
+        # Keep its BF16 projections/activation and native indexing, but avoid BF16
+        # rounding after every expert addition. vLLM's CUDA moe_sum uses float acc.
+        with _FP32ReferenceOperation(torch.zeros_like) as mode:
+            result = forward(hidden_states, *args, **kwargs)
+        if mode.calls != 1:
+            raise RuntimeError(f"HF Mistral4 expert accumulator contract changed: expected one call, got {mode.calls}")
+        return result.to(hidden_states.dtype)
+
+    return wrapped
+
+
+def _with_fp32_norm(forward: Callable) -> Callable:
+    @wraps(forward)
+    def wrapped(hidden_states: torch.Tensor) -> torch.Tensor:
+        """Normalize [..., hidden] in FP32, returning the original activation dtype."""
+        # HF otherwise rounds before multiplying by the norm weight. CUDA vLLM
+        # RMSNorm and AutoModel's TE/FP32 RMSNorm cast only after that multiply.
+        return forward(hidden_states.float()).to(hidden_states.dtype)
+
+    return wrapped
+
+
+def _with_fp32_rotary_embedding(forward: Callable) -> Callable:
+    @wraps(forward)
+    def wrapped(x: torch.Tensor, *args, **kwargs) -> tuple[torch.Tensor, torch.Tensor]:
+        """Generate FP32 cos/sin [batch, sequence, rotary_dim] from native HF frequencies."""
+        # Upcasting already-rounded BF16 tables cannot recover their precision.
+        return forward(x.float(), *args, **kwargs)
+
+    return wrapped
+
+
+def _with_fp32_rotary_application(forward: Callable) -> Callable:
+    @wraps(forward)
+    def wrapped(
+        q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, *args, **kwargs
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Rotate Q/K [..., rotary_dim] in FP32 and restore each input's dtype and layout."""
+        q_out, k_out = forward(q.float(), k.float(), cos.float(), sin.float(), *args, **kwargs)
+        return q_out.to(q.dtype), k_out.to(k.dtype)
+
+    return wrapped
+
+
+def _with_fp32_rotary_attention(forward: Callable, hf_module: Any) -> Callable:
+    rotary_functions = {
+        name: _with_fp32_rotary_application(getattr(hf_module, name))
+        for name in ("apply_rotary_pos_emb", "apply_rotary_pos_emb_interleave")
+    }
+
+    @wraps(forward)
+    def wrapped(*args, **kwargs) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Preserve native HF attention inputs/outputs, changing only rotary arithmetic."""
+        # HF calls free functions for rotation. Patch only while this reference
+        # instance is executing; restore before any other model can be evaluated
+        # by this sequential harness, including when the forward raises.
+        with ExitStack() as stack:
+            for name, rotary_forward in rotary_functions.items():
+                stack.enter_context(patch.object(hf_module, name, rotary_forward))
+            return forward(*args, **kwargs)
+
+    return wrapped
+
+
+@contextmanager
+def _hf_reference_context(cfg: ConfigNode, model: torch.nn.Module) -> Iterator[None]:
+    """Temporarily promote sensitive operations in the test's HF reference.
+
+    The opt-in supports Mistral4 RMSNorm, RoPE, router scoring, and expert sums.
+    Experts temporarily use the eager backend whose accumulator is promoted.
+    Projections, activations, and stored weights retain their native dtypes.
+    The original HF algorithms run through instance wrappers that preserve
+    device-map dispatch and are restored on success or failure. This is a
+    sequential test context.
+
+    Args:
+        cfg: Recipe configuration containing checkpoint-robustness controls.
+        model: Loaded HF reference model, including any PEFT wrapper.
+
+    Yields:
+        Control to source or reload reference forwards with the selected precision.
+    """
+    enabled = cfg.get("ci.checkpoint_robustness.hf_reference_compute_fp32", False)
+    if not _parse_boolean_fixture_value(enabled, key="hf_reference_compute_fp32"):
+        yield
+        return
+
+    available, hf_module = safe_import("transformers.models.mistral4.modeling_mistral4")
+    if not available:
+        raise ImportError("FP32 Mistral4 reference computation requires Transformers with Mistral4 support")
+    routers = [module for module in model.modules() if isinstance(module, hf_module.Mistral4TopkRouter)]
+    if not routers:
+        raise ValueError("FP32 Mistral4 reference scoring found no HF Mistral4 routers")
+    print("[HF reference] Mistral4 FP32 RMSNorm, RoPE, router scoring, and eager expert sums; modified HF reference")
+    with ExitStack() as stack:
+        for module in model.modules():
+            original = module.forward
+            if isinstance(module, hf_module.Mistral4TopkRouter):
+                wrapped = _with_fp32_scores(original)
+            elif isinstance(module, hf_module.Mistral4RMSNorm):
+                wrapped = _with_fp32_norm(original)
+            elif isinstance(module, hf_module.Mistral4RotaryEmbedding):
+                wrapped = _with_fp32_rotary_embedding(original)
+            elif isinstance(module, hf_module.Mistral4Attention):
+                wrapped = _with_fp32_rotary_attention(original, hf_module)
+            elif isinstance(module, hf_module.Mistral4Experts):
+                # Source FP8 dequantization selects eager, but BF16 reload can
+                # default to grouped_mm. Select the same native algorithm for
+                # both phases: only eager creates the zeros_like accumulator
+                # that this wrapper promotes. Restore the dispatch on exit.
+                if module.config._experts_implementation != "eager":
+                    stack.callback(
+                        setattr, module.config, "_experts_implementation", module.config._experts_implementation
+                    )
+                    module.config._experts_implementation = "eager"
+                wrapped = _with_fp32_expert_sum(original)
+            else:
+                continue
+            if "forward" in module.__dict__:
+                stack.callback(setattr, module, "forward", original)
+            else:
+                stack.callback(delattr, module, "forward")
+            module.forward = wrapped
+        yield
 
 
 def _preinit_global_rank() -> int:
@@ -1527,8 +1900,13 @@ def _prepare_source_load_reference(
     trust_remote_code: bool | None,
     experts_implementation: str | None,
     hf_device_map_auto: bool,
+    hf_device_map_max_memory_gib: str | float | None = None,
+    hf_device_map_cpu_max_memory_gib: str | float | None = None,
     hf_source_post_load_dequantize: bool,
     parity_tolerance_profile: str = "standard",
+    capture_router_diagnostics: bool = False,
+    shape_diagnostic: _ShapeDiagnosticConfig | None = None,
+    cross_framework_gate_sequence_length: int | None = None,
 ) -> tuple[torch.Tensor, bool | None, bool | None] | None:
     """Compute vanilla HF source-load reference logits before trainer construction."""
     if _preinit_world_size() > 1:
@@ -1554,8 +1932,13 @@ def _prepare_source_load_reference(
             trust_remote_code=trust_remote_code,
             experts_implementation=experts_implementation,
             hf_device_map_auto=hf_device_map_auto,
+            hf_device_map_max_memory_gib=hf_device_map_max_memory_gib,
+            hf_device_map_cpu_max_memory_gib=hf_device_map_cpu_max_memory_gib,
             hf_source_post_load_dequantize=hf_source_post_load_dequantize,
             parity_tolerance_profile=parity_tolerance_profile,
+            capture_router_diagnostics=capture_router_diagnostics,
+            shape_diagnostic=shape_diagnostic,
+            cross_framework_gate_sequence_length=cross_framework_gate_sequence_length,
         )
     except Exception:
         if fail_path is not None:
@@ -1575,8 +1958,13 @@ def _prepare_source_load_reference_rank0(
     trust_remote_code: bool | None,
     experts_implementation: str | None,
     hf_device_map_auto: bool,
+    hf_device_map_max_memory_gib: str | float | None = None,
+    hf_device_map_cpu_max_memory_gib: str | float | None = None,
     hf_source_post_load_dequantize: bool,
     parity_tolerance_profile: str = "standard",
+    capture_router_diagnostics: bool = False,
+    shape_diagnostic: _ShapeDiagnosticConfig | None = None,
+    cross_framework_gate_sequence_length: int | None = None,
 ) -> tuple[torch.Tensor, bool | None, bool | None]:
     """Rank-0 implementation of vanilla HF source-load reference capture."""
     from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
@@ -1584,6 +1972,17 @@ def _prepare_source_load_reference_rank0(
     apply_cache_compatibility_patches()
     _patch_remote_masking_api_compatibility()
     _patch_remote_fla_api_compatibility()
+    artifact_dir = _robustness_artifact_dir(cfg)
+    for router_path in _router_diagnostic_paths(artifact_dir):
+        router_path.unlink(missing_ok=True)
+    _shape_diagnostic_report_path(artifact_dir, "phase_0").unlink(missing_ok=True)
+    if capture_router_diagnostics:
+        if shape_diagnostic is not None:
+            for sequence_length in shape_diagnostic.lengths(
+                parity_sequence_length=len(input_ids),
+                gate_sequence_length=cross_framework_gate_sequence_length,
+            ):
+                _shape_router_capture_path(artifact_dir, sequence_length).unlink(missing_ok=True)
 
     model_kwargs = _model_kwargs_from_config(cfg.model)
     original_pretrained_path = _model_pretrained_path(cfg.model, model_kwargs)
@@ -1607,6 +2006,8 @@ def _prepare_source_load_reference_rank0(
         hf_model_cls=hf_model_cls,
         device=device,
         hf_device_map_auto=hf_device_map_auto,
+        hf_device_map_max_memory_gib=hf_device_map_max_memory_gib,
+        hf_device_map_cpu_max_memory_gib=hf_device_map_cpu_max_memory_gib,
     )
     requested_attn_implementation = model_kwargs.get("attn_implementation")
     if hf_kwargs.get("attn_implementation") != requested_attn_implementation:
@@ -1655,6 +2056,10 @@ def _prepare_source_load_reference_rank0(
         # Pass the faithful config explicitly so from_pretrained's internal
         # AutoConfig resolution cannot re-select the AutoModel-owned class.
         hf_kwargs["config"] = hf_config
+    if _repair_legacy_partial_rotary_config(hf_config):
+        # The repaired spec only reaches the model when the config object is
+        # passed explicitly; from_pretrained otherwise re-reads config.json.
+        hf_kwargs["config"] = hf_config
 
     model_load_context = _hf_model_load_context(
         trust_remote_code=trust_remote_code,
@@ -1679,19 +2084,38 @@ def _prepare_source_load_reference_rank0(
         if should_fix_rotary_embeddings([hf_model]):
             fix_rotary_embeddings([hf_model])
 
-    hf_logits = _get_logits(hf_model, input_ids, device)
-    repeated_hf_logits = _get_logits(hf_model, input_ids, device)
-    _compare_logits(
-        _robustness_artifact_dir(cfg),
-        hf_logits,
-        repeated_hf_logits,
-        _repeatability_policy(
-            phase="phase_0",
-            comparison="hf_source_self_repeat",
-            profile=parity_tolerance_profile,
-        ),
-    )
-    del repeated_hf_logits
+    with _hf_reference_context(cfg, hf_model):
+        with _router_diagnostic_capture_context(
+            hf_model,
+            _robustness_artifact_dir(cfg),
+            framework="hf",
+            enabled=capture_router_diagnostics,
+        ):
+            hf_logits = _get_logits(hf_model, input_ids, device)
+        repeated_hf_logits = _get_logits(hf_model, input_ids, device)
+        _compare_logits(
+            _robustness_artifact_dir(cfg),
+            hf_logits,
+            repeated_hf_logits,
+            _repeatability_policy(
+                phase="phase_0",
+                comparison="hf_source_self_repeat",
+                profile=parity_tolerance_profile,
+            ),
+        )
+        del repeated_hf_logits
+        if shape_diagnostic is not None:
+            _run_hf_shape_diagnostic(
+                hf_model,
+                input_ids,
+                device,
+                hf_logits,
+                artifact_dir=artifact_dir,
+                config=shape_diagnostic,
+                gate_sequence_length=cross_framework_gate_sequence_length,
+                capture_router_diagnostics=capture_router_diagnostics,
+                phase="phase_0",
+            )
     hf_aliased = _lm_head_embedding_aliased(hf_model)
     explicit_tie_word_embeddings = _explicit_tie_word_embeddings(hf_model.config)
     del hf_model
@@ -1730,9 +2154,51 @@ def _compare_source_load_parity(
                 f"Source-load parity shape mismatch: HF logits {hf_logits.shape} vs trainer logits "
                 f"{candidate_logits.shape}"
             )
-            parity_failure = _compare_logits(artifact_dir, hf_logits, candidate_logits, policy)
+            diagnostics: dict[str, object] = {}
+            diagnostic_failure = None
+            try:
+                shape_report_path = _shape_diagnostic_report_path(artifact_dir, "phase_0")
+                if shape_report_path.exists():
+                    diagnostics["shape_diagnostic"] = json.loads(shape_report_path.read_text())
+                hf_router_capture, automodel_router_capture, router_report = _router_diagnostic_paths(artifact_dir)
+                if hf_router_capture.exists() or automodel_router_capture.exists():
+                    if not hf_router_capture.exists() or not automodel_router_capture.exists():
+                        raise AssertionError(
+                            "Incomplete Phase 0 router diagnostics: expected both HF and AutoModel captures, got "
+                            f"hf={hf_router_capture.exists()} automodel={automodel_router_capture.exists()}"
+                        )
+                    from tests.functional_tests.checkpoint_robustness.router_diagnostics import (
+                        compare_glm_router_captures,
+                    )
+
+                    router_diagnostics = compare_glm_router_captures(
+                        hf_path=hf_router_capture,
+                        automodel_path=automodel_router_capture,
+                        report_path=router_report,
+                        reference_logits=hf_logits,
+                        candidate_logits=candidate_logits,
+                    )
+                    diagnostics["router_diagnostics"] = router_diagnostics
+            except Exception as exc:
+                diagnostic_failure = traceback.format_exc()
+                diagnostics["diagnostic_failure"] = {
+                    "error_type": type(exc).__name__,
+                    "message": str(exc),
+                }
+            parity_failure = _compare_logits(
+                artifact_dir,
+                hf_logits,
+                candidate_logits,
+                policy,
+                diagnostics=diagnostics,
+            )
+            comparison_failures = []
             if parity_failure is not None:
-                raise AssertionError(parity_failure)
+                comparison_failures.append(parity_failure)
+            if diagnostic_failure is not None:
+                comparison_failures.append(f"Phase 0 diagnostics failed:\n{diagnostic_failure}")
+            if comparison_failures:
+                raise AssertionError("\n".join(comparison_failures))
             print(
                 f"[Phase 0] Source-load aliases: hf_aliased={hf_aliased}; "
                 f"trainer_aliased={candidate_aliased}; tie_word_embeddings={explicit_tie_word_embeddings}"
@@ -1835,20 +2301,101 @@ def _get_logits_pp(trainer, input_ids, device) -> torch.Tensor:
     return buf.cpu()
 
 
-def _get_logits(model, input_ids, device, trainer=None) -> torch.Tensor:
-    """Forward pass returning float32 logits on CPU."""
-    if trainer is not None and getattr(trainer, "pp_enabled", False):
-        return _get_logits_pp(trainer, input_ids, device)
+@cache
+def _parity_flex_attention() -> Callable[..., torch.Tensor | tuple[torch.Tensor, torch.Tensor]]:
+    """Compile one static, fixed-tile FlexAttention callable per test process.
 
-    model.eval()
-    ids = torch.tensor([input_ids], device=device)
-    attention_mask = torch.ones_like(ids)
-    with torch.no_grad():
-        out = model(input_ids=ids, attention_mask=attention_mask, use_cache=False)
-        logits = out.logits if hasattr(out, "logits") else out
-        if isinstance(logits, DTensor):
-            logits = logits.full_tensor()
-        return logits.float().cpu()
+    The compiler retains specializations for the parity input geometries for the
+    lifetime of this process. Training continues to use the original callable.
+    """
+    from torch.nn.attention.flex_attention import BlockMask, flex_attention
+
+    # A distinct code object keeps training's recompilations out of the parity
+    # cache budget. Full-graph mode rejects fallback to unfused attention.
+    @torch.compile(dynamic=False, fullgraph=True)
+    def attention(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        block_mask: BlockMask,
+        scale: float | None = None,
+        enable_gqa: bool = False,
+        return_lse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Run fixed-tile attention through a dedicated compiler entry point.
+
+        Args:
+            q: Tensor of shape [batch, query_heads, query_sequence, head_dim].
+            k: Tensor of shape [batch, kv_heads, key_sequence, head_dim].
+            v: Tensor of shape [batch, kv_heads, key_sequence, value_dim].
+            block_mask: BlockMask describing allowed positions of shape
+                [batch, query_heads, query_sequence, key_sequence].
+            scale: Optional query/key scale; defaults to inverse sqrt(head_dim).
+            enable_gqa: Allow query_heads to be a multiple of kv_heads.
+            return_lse: Also return the attention log-sum-exp for attention sinks.
+
+        Returns:
+            Output of shape [batch, query_heads, query_sequence, value_dim], or
+            that output and log-sum-exp of shape [batch, query_heads, query_sequence].
+        """
+        return flex_attention(
+            q,
+            k,
+            v,
+            block_mask=block_mask,
+            scale=scale,
+            enable_gqa=enable_gqa,
+            return_lse=return_lse,
+            kernel_options={"BLOCK_M": 64, "BLOCK_N": 64},
+        )
+
+    return attention
+
+
+@contextmanager
+def _fixed_flex_attention_for_parity(model_parts: Sequence[torch.nn.Module]) -> Iterator[None]:
+    """Keep shared FlexAttention numerics consistent across parity forwards.
+
+    Training can generalize the compiled shapes and select different tiles from
+    a fresh reload. Fix both policies for reference and candidate forwards; even
+    small attention differences can change MoE routes. The override is local to
+    these serial test forwards and is restored on both success and failure.
+
+    Args:
+        model_parts: Local model parts, including every local pipeline stage.
+            Models using other attention implementations are left untouched.
+
+    Yields:
+        None while the shared FlexAttention callable is temporarily replaced.
+    """
+    if not any(isinstance(module, FlexAttention) for part in model_parts for module in part.modules()):
+        yield
+        return
+    original = FlexAttention.flex_attn
+    FlexAttention.flex_attn = _parity_flex_attention()
+    try:
+        yield
+    finally:
+        FlexAttention.flex_attn = original
+
+
+def _get_logits(model, input_ids, device, trainer=None) -> torch.Tensor:
+    """Run a parity forward and return float32 CPU logits of shape [1, sequence, vocab]."""
+    model_parts = trainer.model_parts if trainer is not None else [model]
+    with _fixed_flex_attention_for_parity(model_parts):
+        if trainer is not None and getattr(trainer, "pp_enabled", False):
+            return _get_logits_pp(trainer, input_ids, device)
+
+        model.eval()
+        ids = torch.tensor([input_ids], device=device)
+        attention_mask = torch.ones_like(ids)
+        with torch.no_grad():
+            out = model(input_ids=ids, attention_mask=attention_mask, use_cache=False)
+            logits = out.logits if hasattr(out, "logits") else out
+            if isinstance(logits, DTensor):
+                logits = logits.full_tensor()
+            return logits.float().cpu()
 
 
 def _reinit_rotary_per_module(model, default_device):
@@ -2067,6 +2614,75 @@ def _materialize_hf_quantization_config(cfg):
     return raw_quantization_config
 
 
+def _run_hf_reload_standing_shape_diagnostic(
+    hf_model: torch.nn.Module,
+    input_ids: list[int],
+    device: torch.device,
+    hf_logits: torch.Tensor,
+    *,
+    artifact_dir: Path,
+    custom_args: dict[str, object],
+) -> None:
+    """Automatically contextualize a shortened Phase 3 cross-framework gate.
+
+    Args:
+        hf_model: Loaded vanilla-HF model used for standalone forwards.
+        input_ids: Token IDs for the full parity prompt.
+        device: Device holding ``hf_model`` and its inputs.
+        hf_logits: Full-forward logits of shape [batch, sequence, vocab].
+        artifact_dir: Directory that owns checkpoint-robustness artifacts.
+        custom_args: Validated checkpoint-robustness fixture settings.
+    """
+    if "cross_framework_gate_sequence_length" not in custom_args:
+        return
+    gate_sequence_length = int(custom_args["cross_framework_gate_sequence_length"])
+    if gate_sequence_length >= len(input_ids):
+        return
+    _run_hf_shape_diagnostic(
+        hf_model,
+        input_ids,
+        device,
+        hf_logits,
+        artifact_dir=artifact_dir,
+        config=_ShapeDiagnosticConfig(),
+        gate_sequence_length=gate_sequence_length,
+        capture_router_diagnostics=False,
+        phase="phase_3",
+    )
+
+
+def _collect_hf_reload_shape_diagnostics(
+    hf_model: torch.nn.Module,
+    input_ids: list[int],
+    device: torch.device,
+    hf_logits: torch.Tensor,
+    *,
+    artifact_dir: Path,
+    custom_args: dict[str, object],
+) -> tuple[dict[str, object], str | None]:
+    """Collect optional Phase 3 shape evidence without suppressing parity output."""
+    diagnostics: dict[str, object] = {}
+    try:
+        _run_hf_reload_standing_shape_diagnostic(
+            hf_model,
+            input_ids,
+            device,
+            hf_logits,
+            artifact_dir=artifact_dir,
+            custom_args=custom_args,
+        )
+        shape_report_path = _shape_diagnostic_report_path(artifact_dir, "phase_3")
+        if shape_report_path.exists():
+            diagnostics["shape_diagnostic"] = json.loads(shape_report_path.read_text())
+    except Exception as exc:
+        diagnostics["diagnostic_failure"] = {
+            "error_type": type(exc).__name__,
+            "message": str(exc),
+        }
+        return diagnostics, traceback.format_exc()
+    return diagnostics, None
+
+
 def _run_vanilla_hf_reload(
     cfg,
     input_ids: list[int],
@@ -2096,6 +2712,8 @@ def _run_vanilla_hf_reload(
         _patch_remote_masking_api_compatibility()
         _patch_remote_fla_api_compatibility()
         _, ckpt_step_dir, consolidated_dir = _checkpoint_paths(cfg)
+        artifact_dir = _robustness_artifact_dir(cfg)
+        _shape_diagnostic_report_path(artifact_dir, "phase_3").unlink(missing_ok=True)
         is_peft = hasattr(cfg, "peft")
         model_kwargs = _model_kwargs_from_config(cfg.model)
         original_pretrained_path = _model_pretrained_path(cfg.model, model_kwargs)
@@ -2185,6 +2803,12 @@ def _run_vanilla_hf_reload(
             # Pass the faithful config explicitly so from_pretrained's internal
             # AutoConfig resolution cannot re-select the AutoModel-owned class.
             hf_kwargs["config"] = hf_config
+        if _repair_legacy_partial_rotary_config(hf_config):
+            # The repaired spec only reaches the model when the config object
+            # is passed explicitly; from_pretrained otherwise re-reads
+            # config.json (the consolidated export copies the source config,
+            # so it carries the same legacy rotary_dim field).
+            hf_kwargs["config"] = hf_config
         # Load the reference model straight onto the target GPU. Materialising a
         # 14B checkpoint on CPU and then ``.to(device)`` costs ~50-225s, and that
         # rank-0-only stall trips the NCCL watchdog while the other ranks idle at
@@ -2197,6 +2821,7 @@ def _run_vanilla_hf_reload(
             has_device_map="device_map" in hf_kwargs,
         )
 
+        diagnostic_failure = None
         if is_peft:
             from peft import PeftModel
 
@@ -2240,19 +2865,28 @@ def _run_vanilla_hf_reload(
                     "[HF reload] Saved adapter tensors absent from vanilla HF were allowed by the configured prefix "
                     f"{hf_adapter_ignored_key_prefix!r} ({ignored_adapter_tensors} tensors)"
                 )
-            hf_logits = _get_logits(peft_model, input_ids, device)
-            repeated_hf_logits = _get_logits(peft_model, input_ids, device)
-            _compare_logits(
-                _robustness_artifact_dir(cfg),
-                hf_logits,
-                repeated_hf_logits,
-                _repeatability_policy(
-                    phase="phase_3",
-                    comparison="hf_export_self_repeat",
-                    profile=_comparison_profile(custom_args, "hf_reload"),
-                ),
-            )
-            del repeated_hf_logits
+            with _hf_reference_context(cfg, peft_model):
+                hf_logits = _get_logits(peft_model, input_ids, device)
+                repeated_hf_logits = _get_logits(peft_model, input_ids, device)
+                _compare_logits(
+                    _robustness_artifact_dir(cfg),
+                    hf_logits,
+                    repeated_hf_logits,
+                    _repeatability_policy(
+                        phase="phase_3",
+                        comparison="hf_export_self_repeat",
+                        profile=_comparison_profile(custom_args, "hf_reload"),
+                    ),
+                )
+                del repeated_hf_logits
+                diagnostics, diagnostic_failure = _collect_hf_reload_shape_diagnostics(
+                    peft_model,
+                    input_ids,
+                    device,
+                    hf_logits,
+                    artifact_dir=artifact_dir,
+                    custom_args=custom_args,
+                )
 
             if check_fused_qkv_keys:
                 from safetensors import safe_open
@@ -2285,30 +2919,45 @@ def _run_vanilla_hf_reload(
 
                 if should_fix_rotary_embeddings([hf_model]):
                     fix_rotary_embeddings([hf_model])
-            hf_logits = _get_logits(hf_model, input_ids, device)
-            repeated_hf_logits = _get_logits(hf_model, input_ids, device)
-            _compare_logits(
-                _robustness_artifact_dir(cfg),
-                hf_logits,
-                repeated_hf_logits,
-                _repeatability_policy(
-                    phase="phase_3",
-                    comparison="hf_export_self_repeat",
-                    profile=_comparison_profile(custom_args, "hf_reload"),
-                ),
-            )
-            del repeated_hf_logits
+            with _hf_reference_context(cfg, hf_model):
+                hf_logits = _get_logits(hf_model, input_ids, device)
+                repeated_hf_logits = _get_logits(hf_model, input_ids, device)
+                _compare_logits(
+                    _robustness_artifact_dir(cfg),
+                    hf_logits,
+                    repeated_hf_logits,
+                    _repeatability_policy(
+                        phase="phase_3",
+                        comparison="hf_export_self_repeat",
+                        profile=_comparison_profile(custom_args, "hf_reload"),
+                    ),
+                )
+                del repeated_hf_logits
+                diagnostics, diagnostic_failure = _collect_hf_reload_shape_diagnostics(
+                    hf_model,
+                    input_ids,
+                    device,
+                    hf_logits,
+                    artifact_dir=artifact_dir,
+                    custom_args=custom_args,
+                )
             del hf_model
 
         hf_reload_error = _compare_logits(
-            _robustness_artifact_dir(cfg),
+            artifact_dir,
             reference_logits,
             hf_logits,
             _hf_reload_parity_policy(custom_args),
+            diagnostics=diagnostics,
         )
         del hf_logits
         _release_model_memory()
-        return hf_reload_error
+        failures = []
+        if hf_reload_error is not None:
+            failures.append(hf_reload_error)
+        if diagnostic_failure is not None:
+            failures.append(f"Phase 3 diagnostics failed:\n{diagnostic_failure}")
+        return "\n".join(failures) if failures else None
     except Exception as exc:
         _release_model_memory()
         return f"Vanilla HF reload failed: {type(exc).__name__}: {exc}\n{traceback.format_exc()}"
@@ -2317,6 +2966,149 @@ def _run_vanilla_hf_reload(
 def _robustness_artifact_dir(cfg) -> Path:
     """Return the shared directory used to pass small artifacts between isolated phases."""
     return Path(cfg.checkpoint.checkpoint_dir) / ".checkpoint_robustness"
+
+
+def _router_diagnostic_paths(artifact_dir: Path) -> tuple[Path, Path, Path]:
+    """Return the Phase 0 HF capture, AutoModel capture, and summary paths."""
+    router_dir = artifact_dir / "router_diagnostics"
+    return router_dir / "phase_0_hf.pt", router_dir / "phase_0_automodel.pt", router_dir / "phase_0_summary.json"
+
+
+def _shape_diagnostic_report_path(artifact_dir: Path, phase: str) -> Path:
+    """Return the full non-gating HF shape report path for one phase."""
+    return artifact_dir / "shape_diagnostics" / f"{phase}_hf_shape.json"
+
+
+def _shape_router_capture_path(artifact_dir: Path, sequence_length: int) -> Path:
+    """Return the vanilla-HF router capture path for one standalone shape probe."""
+    return artifact_dir / "shape_diagnostics" / "router_captures" / f"hf_{sequence_length}.pt"
+
+
+def _router_diagnostic_capture_context(
+    model: torch.nn.Module,
+    artifact_dir: Path,
+    *,
+    framework: Literal["hf", "automodel"],
+    enabled: bool,
+    output_path: Path | None = None,
+) -> AbstractContextManager[None]:
+    """Return an opt-in GLM router capture context for one Phase 0 forward."""
+    if not enabled:
+        return nullcontext()
+    from tests.functional_tests.checkpoint_robustness.router_diagnostics import (
+        capture_glm_automodel_routers,
+        capture_glm_hf_routers,
+    )
+
+    hf_path, automodel_path, _report_path = _router_diagnostic_paths(artifact_dir)
+    if framework == "hf":
+        return capture_glm_hf_routers(model, hf_path if output_path is None else output_path)
+    if output_path is not None:
+        raise ValueError("A custom router capture output_path is supported only for vanilla-HF shape diagnostics")
+    return capture_glm_automodel_routers(model, automodel_path)
+
+
+def _validate_router_diagnostic_config(cfg, custom_args: dict[str, object]) -> None:
+    """Reject router capture for unsupported model families and pipeline execution."""
+    if not custom_args.get("capture_router_diagnostics", False):
+        return
+    distributed_config = getattr(cfg, "distributed", None)
+    pp_size = int(getattr(distributed_config, "pp_size", 1))
+    if pp_size > 1:
+        raise ValueError(
+            "capture_router_diagnostics does not support pipeline parallelism because global rank 0 owns only "
+            f"one local pipeline stage; set distributed.pp_size=1 or disable capture (got pp_size={pp_size})"
+        )
+    model_kwargs = _model_kwargs_from_config(cfg.model)
+    pretrained_path = _model_pretrained_path(cfg.model, model_kwargs)
+    configured_trust_remote_code = custom_args.get("trust_remote_code")
+    trust_remote_code = (
+        bool(model_kwargs.get("trust_remote_code", False))
+        if configured_trust_remote_code is None
+        else bool(configured_trust_remote_code)
+    )
+    model_config = _load_hf_config(
+        pretrained_path,
+        trust_remote_code=trust_remote_code,
+        revision=model_kwargs.get("revision"),
+        token=model_kwargs.get("token"),
+    )
+    model_type = getattr(model_config, "model_type", None)
+    if model_type != _ROUTER_DIAGNOSTIC_MODEL_TYPE:
+        raise ValueError(
+            "capture_router_diagnostics currently supports only model_type="
+            f"{_ROUTER_DIAGNOSTIC_MODEL_TYPE!r}, got {model_type!r}"
+        )
+
+
+def _run_hf_shape_diagnostic(
+    hf_model: torch.nn.Module,
+    input_ids: list[int],
+    device: torch.device,
+    base_logits: torch.Tensor,
+    *,
+    artifact_dir: Path,
+    config: _ShapeDiagnosticConfig,
+    gate_sequence_length: int | None,
+    capture_router_diagnostics: bool,
+    phase: Literal["phase_0", "phase_3"],
+) -> None:
+    """Run informational HF-full-prefix versus HF-standalone forwards.
+
+    Args:
+        hf_model: Loaded vanilla-HF model used for standalone forwards.
+        input_ids: Token IDs for the full parity prompt.
+        device: Device holding ``hf_model`` and its inputs.
+        base_logits: Full-forward logits of shape [batch, sequence, vocab].
+        artifact_dir: Directory that owns checkpoint-robustness artifacts.
+        config: Validated standalone-forward lengths.
+        gate_sequence_length: Optional standing cross-framework gate length.
+        capture_router_diagnostics: Whether to capture router selections for each standalone forward.
+        phase: Checkpoint phase that owns the diagnostic report.
+    """
+    diagnostic_lengths = config.lengths(
+        parity_sequence_length=len(input_ids),
+        gate_sequence_length=gate_sequence_length,
+    )
+    if not diagnostic_lengths:
+        raise ValueError("Shape diagnostic has no standalone-forward lengths")
+
+    standalone_logits: dict[int, torch.Tensor] = {}
+    router_summaries: dict[int, dict[str, object]] = {}
+    hf_router_capture = _router_diagnostic_paths(artifact_dir)[0]
+    for sequence_length in diagnostic_lengths:
+        router_capture_path = _shape_router_capture_path(artifact_dir, sequence_length)
+        with _router_diagnostic_capture_context(
+            hf_model,
+            artifact_dir,
+            framework="hf",
+            enabled=capture_router_diagnostics,
+            output_path=router_capture_path,
+        ):
+            candidate_logits = _get_logits(hf_model, input_ids[:sequence_length], device)
+        standalone_logits[sequence_length] = candidate_logits
+        if capture_router_diagnostics:
+            from tests.functional_tests.checkpoint_robustness.router_diagnostics import (
+                summarize_glm_router_shape_captures,
+            )
+
+            router_summaries[sequence_length] = summarize_glm_router_shape_captures(
+                base_path=hf_router_capture,
+                standalone_path=router_capture_path,
+                reference_logits=base_logits[..., :sequence_length, :],
+                candidate_logits=candidate_logits,
+            )
+
+    report = _build_shape_diagnostic_report(
+        base_logits,
+        standalone_logits,
+        parity_document_sha256=_PARITY_DOCUMENT_SHA256,
+        phase=phase,
+        gate_sequence_length=gate_sequence_length,
+        sweep_lengths=config.sweep_lengths,
+        router_diagnostics=router_summaries or None,
+    )
+    _persist_shape_diagnostic_report(report, _shape_diagnostic_report_path(artifact_dir, phase))
 
 
 def _source_load_artifact_paths(cfg) -> tuple[Path, Path]:
@@ -2399,6 +3191,7 @@ def _run_process_isolated_checkpoint_phase(
 
     _disable_distributed_atexit_teardown()
     cfg = parse_args_and_load_config()
+    _validate_router_diagnostic_config(cfg, custom_args)
     tokenizer_name = custom_args.get("tokenizer_name", None)
     parity_sequence_length = int(custom_args.get("parity_sequence_length", "2048"))
 
@@ -2432,8 +3225,17 @@ def _run_process_isolated_checkpoint_phase(
             trust_remote_code=custom_args.get("trust_remote_code"),
             experts_implementation=custom_args.get("experts_implementation", None),
             hf_device_map_auto=bool(custom_args.get("hf_device_map_auto", False)),
+            hf_device_map_max_memory_gib=custom_args.get("hf_device_map_max_memory_gib"),
+            hf_device_map_cpu_max_memory_gib=custom_args.get("hf_device_map_cpu_max_memory_gib"),
             hf_source_post_load_dequantize=bool(custom_args.get("hf_source_post_load_dequantize", False)),
             parity_tolerance_profile=_comparison_profile(custom_args, "source_load"),
+            capture_router_diagnostics=bool(custom_args.get("capture_router_diagnostics", False)),
+            shape_diagnostic=custom_args.get("shape_diagnostic"),
+            cross_framework_gate_sequence_length=(
+                int(custom_args["cross_framework_gate_sequence_length"])
+                if "cross_framework_gate_sequence_length" in custom_args
+                else None
+            ),
         )
         if _preinit_global_rank() == 0:
             assert source_load_reference is not None, "rank 0 source-load reference was not captured"
@@ -2494,12 +3296,18 @@ def _run_process_isolated_checkpoint_phase(
             _barrier()
 
         device = next(source_trainer.model_parts[0].parameters()).device
-        trainer_source_logits = _get_logits(
+        with _router_diagnostic_capture_context(
             source_trainer.model_parts[0],
-            input_ids,
-            device,
-            trainer=source_trainer,
-        )
+            _robustness_artifact_dir(cfg),
+            framework="automodel",
+            enabled=bool(custom_args.get("capture_router_diagnostics", False)),
+        ):
+            trainer_source_logits = _get_logits(
+                source_trainer.model_parts[0],
+                input_ids,
+                device,
+                trainer=source_trainer,
+            )
         source_load_reference = None
         if _rank0():
             metadata = json.loads(metadata_path.read_text())
@@ -2973,6 +3781,7 @@ def run_checkpoint_robustness(
     deferred_failures: list[str] = []
 
     cfg = parse_args_and_load_config()
+    _validate_router_diagnostic_config(cfg, custom_args)
     resume_plan = _resume_plan_from_config(cfg) if resume_enabled else None
     if resume_plan is not None:
         _configure_uninterrupted_run(cfg, resume_plan)
@@ -2993,8 +3802,17 @@ def run_checkpoint_robustness(
             trust_remote_code=trust_remote_code,
             experts_implementation=experts_implementation,
             hf_device_map_auto=hf_device_map_auto,
+            hf_device_map_max_memory_gib=custom_args.get("hf_device_map_max_memory_gib"),
+            hf_device_map_cpu_max_memory_gib=custom_args.get("hf_device_map_cpu_max_memory_gib"),
             hf_source_post_load_dequantize=hf_source_post_load_dequantize,
             parity_tolerance_profile=_comparison_profile(custom_args, "source_load"),
+            capture_router_diagnostics=bool(custom_args.get("capture_router_diagnostics", False)),
+            shape_diagnostic=custom_args.get("shape_diagnostic"),
+            cross_framework_gate_sequence_length=(
+                int(custom_args["cross_framework_gate_sequence_length"])
+                if "cross_framework_gate_sequence_length" in custom_args
+                else None
+            ),
         )
         _barrier()
         _report_phase("Phase 0: vanilla-HF source-load reference complete")
@@ -3015,7 +3833,13 @@ def run_checkpoint_robustness(
     if source_load_parity_enabled:
         _report_phase("Phase 0: starting constructed-trainer parity forward")
         device = next(trainer.model_parts[0].parameters()).device
-        trainer_source_logits = _get_logits(trainer.model_parts[0], input_ids, device, trainer=trainer)
+        with _router_diagnostic_capture_context(
+            trainer.model_parts[0],
+            _robustness_artifact_dir(cfg),
+            framework="automodel",
+            enabled=bool(custom_args.get("capture_router_diagnostics", False)),
+        ):
+            trainer_source_logits = _get_logits(trainer.model_parts[0], input_ids, device, trainer=trainer)
         source_load_failure = _compare_source_load_parity(
             source_load_reference,
             trainer_source_logits,

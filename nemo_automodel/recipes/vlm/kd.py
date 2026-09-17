@@ -46,16 +46,22 @@ from contextlib import nullcontext
 from typing import Any
 
 import torch
-import wandb
+
+from nemo_automodel.shared.import_utils import safe_import
+
+_HAS_WANDB, wandb = safe_import(
+    "wandb", msg="wandb is not installed. To enable W&B experiment tracking, run: uv add nemo-automodel[wandb]"
+)
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.distributed.config import DistributedSetup
 from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
+from nemo_automodel.components.distributed.tp_replicas import synchronize_tp_replica_gradients
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
-from nemo_automodel.components.optim.precision_warnings import resolve_storage_dtype
+from nemo_automodel.components.loss.utils import _count_label_tokens, _get_loss_ignore_index, _normalize_kd_labels
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 from nemo_automodel.components.training.rng import ScopedRNG
 from nemo_automodel.components.training.signal_handler import DistributedSignalHandler
@@ -181,14 +187,6 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
     def setup(self):
         """Build student & teacher, dataloaders, optimizers, etc."""
         _verify_tokenizer_compatibility(self.cfg.get("model", None), self.cfg.get("teacher_model", None))
-
-        resolve_storage_dtype(
-            self.cfg.get("model"),
-            self.cfg.get("optimizer"),
-            is_peft=self.cfg.get("peft", None) is not None,
-            context="vlm-kd",
-            logger=logger,
-        )
 
         super().setup()
 
@@ -398,10 +396,15 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
                 )
             del hidden_states
 
+            kd_labels = _normalize_kd_labels(
+                labels,
+                loss_ignore_index=_get_loss_ignore_index(self.loss_fn),
+                kd_ignore_index=_get_loss_ignore_index(self.kd_loss_fn),
+            )
             kd_loss = self.kd_loss_fn(
                 student_logits,
                 teacher_logits,
-                labels,
+                kd_labels,
                 num_batch_labels=num_label_tokens,
             )
             del teacher_logits
@@ -415,8 +418,9 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
 
     def _run_train_optim_step(self, batches, max_grad_norm: float | None = None):
         """Execute a single training step with KD loss tracking."""
+        ignore_index = _get_loss_ignore_index(self.loss_fn)
         num_label_tokens = torch.tensor(
-            sum((batch["labels"] != -100).sum().item() for batch in batches), dtype=torch.long
+            sum(_count_label_tokens(batch["labels"], ignore_index) for batch in batches), dtype=torch.long
         )
         num_label_tokens = self._dp_allreduce(num_label_tokens).item()
 
@@ -444,6 +448,7 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
             if i == 0:
                 prepare_after_first_microbatch()
 
+        synchronize_tp_replica_gradients(self.model_parts, self.device_mesh)
         grad_norm = scale_grads_and_clip_grad_norm(
             max_grad_norm=max_grad_norm,
             model_parts=self.model_parts,
@@ -537,9 +542,10 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
             total_kd_loss = 0.0
             total_num_label_tokens = 0
             loss_buffer: list[torch.Tensor] = []
+            ignore_index = _get_loss_ignore_index(self.loss_fn)
 
             for batch in val_dataloader:
-                num_label_tokens = (batch["labels"] != -100).sum().item()
+                num_label_tokens = _count_label_tokens(batch["labels"], ignore_index)
                 self._forward_backward_step(
                     0,
                     batch,
@@ -589,7 +595,7 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
         if not self.dist_env.is_main or log_data is None:
             return
 
-        if wandb.run is not None:
+        if _HAS_WANDB and wandb.run is not None:
             wandb.log(log_data.to_dict(), step=log_data.step)
 
         self.metric_logger_valid.log(log_data)
@@ -623,7 +629,7 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
             return
 
         if self.step_scheduler.is_remote_logging_step:
-            if wandb.run is not None:
+            if _HAS_WANDB and wandb.run is not None:
                 wandb.log(log_data.to_dict(), step=log_data.step)
 
         self.metric_logger_train.log(log_data)

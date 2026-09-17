@@ -106,7 +106,9 @@ class MetricLogger:
         if not isinstance(buffer_size, int) or buffer_size < 1:
             raise ValueError("buffer_size must be a positive integer")
         self.filepath = os.path.abspath(filepath)
-        self.flush = flush
+        # NOT `self.flush`: an instance attribute of that name shadows the flush() method
+        # below, so callers get a bool back and calling it raises TypeError.
+        self._fsync_on_write = flush
         self.buffer_size = buffer_size
         self.buffer: List[MetricsSample] = []
         self._lock = threading.Lock()
@@ -133,14 +135,37 @@ class MetricLogger:
         if len(lines) == 0:
             return
         self._fp.write("\n".join(lines) + "\n")
-        if self.flush:
+        if self._fsync_on_write:
+            self._fp.flush()
+            os.fsync(self._fp.fileno())
+
+    def _drain(self) -> None:
+        """Write buffered records out. Caller must hold ``self._lock``."""
+        self._save(self._move_to_cpu(self.buffer))
+        self.buffer = []
+
+    def flush(self) -> None:
+        """Write buffered records out to the file and fsync, without closing it.
+
+        Lets a caller align durability with an external event -- a checkpoint boundary, say --
+        instead of relying on the record count happening to reach ``buffer_size`` there.
+
+        The fsync is unconditional, NOT gated on the ``flush=`` constructor flag. That flag
+        controls whether every buffer-size-triggered write pays for an fsync; this method is
+        an explicit, caller-chosen durability point, so it has to be durable under the
+        default ``flush=False`` too. Draining into the file object alone would leave the
+        records in the process's stdio buffer -- still lost to a crash, and invisible to
+        anything reading the file -- which would make the guarantee empty exactly where it
+        is being relied on.
+        """
+        with self._lock:
+            self._drain()
             self._fp.flush()
             os.fsync(self._fp.fileno())
 
     def close(self) -> None:
         with self._lock:
-            self._save(self._move_to_cpu(self.buffer))
-            self.buffer = []
+            self._drain()
             try:
                 self._fp.flush()
             except Exception:
@@ -172,6 +197,11 @@ class MetricLoggerDist(MetricLogger):
         if self.rank != 0:
             return
         super().log(record)
+
+    def flush(self) -> None:
+        if self.rank != 0:
+            return
+        super().flush()
 
     def close(self) -> None:
         if self.rank != 0:
