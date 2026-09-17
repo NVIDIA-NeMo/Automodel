@@ -434,7 +434,6 @@ def test_lmm_recipe_distributed_section_supports_fsdp2_and_ddp():
     ddp = distributed | {
         "strategy": "ddp",
         "autocast_dtype": "bfloat16",
-        "static_graph": True,
         "gradient_as_bucket_view": True,
     }
     assert isinstance(parse_distributed_section(ddp)["strategy_config"], DDPConfig)
@@ -501,6 +500,7 @@ def test_blackwell_submitter_resolves_portable_topology():
     assert "TITANS_DISTRIBUTED_STRATEGY=%q" in submitter
     assert "--distributed.strategy=ddp" in runner
     assert "--distributed.autocast_dtype=bfloat16" in runner
+    assert "--distributed.static_graph=true" not in runner
     assert '--time="$TITANS_TIME_LIMIT"' in full_runner
     assert "SLURM_TIMELIMIT" not in full_runner
     assert "--wandb.project=titans-paper-reproduction" in full_runner

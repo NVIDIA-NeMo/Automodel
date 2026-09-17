@@ -44,7 +44,7 @@ DISTRIBUTED_STRATEGY=${TITANS_DISTRIBUTED_STRATEGY:-fsdp2}
 case "$DISTRIBUTED_STRATEGY" in
   fsdp2) DISTRIBUTED_OVERRIDES="--distributed.strategy=fsdp2" ;;
   ddp)
-    DISTRIBUTED_OVERRIDES="--distributed.strategy=ddp --distributed.autocast_dtype=bfloat16 --distributed.static_graph=true --distributed.gradient_as_bucket_view=true"
+    DISTRIBUTED_OVERRIDES="--distributed.strategy=ddp --distributed.autocast_dtype=bfloat16 --distributed.gradient_as_bucket_view=true"
     ;;
   *) echo "unsupported distributed strategy: $DISTRIBUTED_STRATEGY" >&2; exit 2 ;;
 esac

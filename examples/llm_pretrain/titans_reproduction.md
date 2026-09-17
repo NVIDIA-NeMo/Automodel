@@ -226,9 +226,11 @@ TITANS_DISTRIBUTED_STRATEGY=ddp TITANS_PILOT_STEPS=100 \
   tools/submit_titans_blackwell.sh 170m baseline --pilot --total-gpus 8
 ```
 
-DDP uses BF16 autocast, a static graph, gradient bucket views, and no activation
-checkpointing. FSDP2 remains the full-run default until this pilot demonstrates
-that DDP fits and improves steady-state throughput.
+DDP uses BF16 autocast, gradient bucket views, and no activation checkpointing.
+Static-graph mode remains disabled because Titans' custom neural-memory
+backward is incompatible with the PyTorch DDP reducer's static-graph hooks.
+FSDP2 remains the full-run default until this pilot demonstrates that DDP fits
+and improves steady-state throughput.
 
 The submitter asks `slurm-cli` to rank configured Blackwell clusters and their
 authorized accounts. Eight total GPUs resolve to one node on
