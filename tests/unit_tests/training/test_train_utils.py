@@ -473,6 +473,11 @@ def _run_partial_gradient_clip_worker(rank: int, world_size: int, init_file: str
         torch.distributed.destroy_process_group()
 
 
+@pytest.mark.runtime_budget(
+    15,
+    hard_timeout=60,
+    reason="Spawns a 2-rank gloo process group; the cost is the child interpreters re-importing nemo_automodel, not the assertions.",
+)
 def test_clip_grad_norm_synchronizes_partial_gradients(tmp_path):
     """Replicated parameters must not retain rank-local Partial gradients."""
     torch.multiprocessing.spawn(
@@ -522,6 +527,11 @@ def _run_sharded_parameter_partial_gradient_worker(rank: int, world_size: int, i
         torch.distributed.destroy_process_group()
 
 
+@pytest.mark.runtime_budget(
+    15,
+    hard_timeout=60,
+    reason="Spawns a 2-rank gloo process group; the cost is the child interpreters re-importing nemo_automodel, not the assertions.",
+)
 def test_clip_grad_norm_reduce_scatters_partial_gradient_to_parameter_shard(tmp_path):
     """Sharded parameters must receive sharded, globally reduced gradients."""
     torch.multiprocessing.spawn(
