@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import os
 from enum import IntEnum
 from io import BytesIO
@@ -139,8 +140,10 @@ def load_image(image: Any) -> Image.Image:
     """
     if isinstance(image, Image.Image):
         return image
-    if isinstance(image, str) and os.path.exists(image):
-        return Image.open(image)
+    if isinstance(image, str):
+        if os.path.exists(image):
+            return Image.open(image)
+        raise FileNotFoundError(f"Retrieval image does not exist: {image}")
     if isinstance(image, dict):
         if "disk_path" in image:
             return Image.open(image["disk_path"])
@@ -150,7 +153,7 @@ def load_image(image: Any) -> Image.Image:
             raise ValueError("Remote image URLs are not supported; use disk_path, base64, or bytes.")
         if "bytes" in image:
             return Image.open(BytesIO(image["bytes"]))
-    raise ValueError(f"Invalid image: {image}")
+    raise ValueError(f"Invalid image type: {type(image).__name__}")
 
 
 class Mistral3BiEncoderProcessor(PixtralProcessor):
@@ -396,7 +399,9 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
 
         Args:
             features: Query examples with aligned ``doc_text`` and ``doc_image``
-                candidate lists.
+                candidate lists. Optional ``doc_id`` lists must contain one
+                nonempty string per candidate in every example when supplied.
+                Distributed callers must use the same ID policy on every rank.
             return_tensors: Output format, ``"pt"`` or ``"np"``.
             **kwargs: Extra keyword arguments forwarded to the query and document processors.
 
@@ -411,7 +416,31 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
             has shape [batch]. Values use the requested PyTorch or NumPy backend.
             Unpadded ragged NumPy token fields are object arrays of shape [batch]
             or [documents], containing per-example token arrays; PyTorch requires rectangular batches.
+            When supplied, ``passage_doc_ids``
+            is an int64 array of shape [documents] in that same order, outside
+            the q_/d_ model-input namespaces, for duplicate-positive masking.
+
+        Raises:
+            ValueError: Supplied document IDs are missing, empty, or misaligned.
         """
+        passage_doc_ids = None
+        if any("doc_id" in feature for feature in features):
+            passage_doc_ids = []
+            for feature in features:
+                ids = feature.get("doc_id")
+                if (
+                    not isinstance(ids, (list, tuple))
+                    or len(ids) != len(feature["doc_text"])
+                    or len(ids) != len(feature["doc_image"])
+                    or not all(isinstance(doc_id, str) and doc_id for doc_id in ids)
+                ):
+                    raise ValueError("doc_id must contain one nonempty string per candidate in every example")
+                # Keep this stdlib encoding inline so exported processors need
+                # no AutoModel installation. Tests lock parity with the shared
+                # text-collator encoding in shared/retrieval_ids.py.
+                for doc_id in ids:
+                    digest = hashlib.md5(doc_id.encode("utf-8")).digest()[:8]
+                    passage_doc_ids.append(int.from_bytes(digest, "little", signed=False) & ((1 << 63) - 1))
         queries = []
         pos_neg_text_batch = []
         pos_neg_image_batch = []
@@ -439,8 +468,12 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
         merged_batch_dict = self.merge_batch_dict(query_batch_dict, doc_batch_dict)
         if return_tensors == "pt":
             merged_batch_dict["passage_modality"] = torch.tensor(doc_modalities, dtype=torch.long)
+            if passage_doc_ids is not None:
+                merged_batch_dict["passage_doc_ids"] = torch.tensor(passage_doc_ids, dtype=torch.long)
         elif return_tensors == "np":
             merged_batch_dict["passage_modality"] = np.asarray(doc_modalities, dtype=np.int64)
+            if passage_doc_ids is not None:
+                merged_batch_dict["passage_doc_ids"] = np.asarray(passage_doc_ids, dtype=np.int64)
         return self.add_dummy_labels(queries, merged_batch_dict, return_tensors=return_tensors)
 
     def prompt_template_question_passage(self, question: str, text: str) -> str:

@@ -17,6 +17,7 @@
 import json
 import subprocess
 import sys
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -25,6 +26,7 @@ import numpy as np
 import pytest
 import torch
 import torch.nn as nn
+from datasets import Dataset
 from PIL import Image
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel, WordPiece
@@ -54,6 +56,8 @@ from nemo_automodel._transformers.retrieval import (
 )
 from nemo_automodel.components.checkpoint.addons import ConsolidatedHFAddon, _maybe_save_custom_model_code
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
+from nemo_automodel.components.datasets.llm.retrieval_dataset import load_corpus
+from nemo_automodel.components.models.ministral_bidirectional.mining import Mistral3MultimodalMiningEncoder
 from nemo_automodel.components.models.ministral_bidirectional.model import (
     Ministral3BidirectionalConfig,
     Ministral3BidirectionalModel,
@@ -71,6 +75,59 @@ from nemo_automodel.recipes.retrieval.train_bi_encoder import _configure_sentenc
 # Over the default 5s budget on purpose: this module launches a fresh interpreter, which re-imports torch from scratch.
 # Shrink the work or the process count before raising this further.
 pytestmark = pytest.mark.timeout(60)
+
+
+def test_native_mining_real_processor_and_model_use_wikissnq_binary_pixels(tmp_path, monkeypatch):
+    """Actual pixel preprocessing and VL forward preserve batching and image dependence."""
+    torch.manual_seed(42)
+    monkeypatch.setattr("datasets.config.HF_DATASETS_CACHE", str(tmp_path / "datasets-cache"))
+    monkeypatch.setattr(Mistral3BiEncoderProcessor, "check_argument_for_proper_class", lambda *args, **kwargs: None)
+    processor = Mistral3BiEncoderProcessor(
+        image_processor=PixtralImageProcessor(size={"longest_edge": 16}),
+        tokenizer=FakePixtralTokenizer(),
+        patch_size=4,
+        padding=True,
+        q_max_length=128,
+        p_max_length=128,
+    )
+    config = _tiny_mistral3_bidirectional_vlm_config()
+    config.image_token_id = processor.image_token_id
+    model = BiEncoderModel(Mistral3BidirectionalModel(config), pooling="avg", l2_normalize=True).eval()
+    encoder = Mistral3MultimodalMiningEncoder(model=model, processor=processor, device=torch.device("cpu"))
+    red_image = Image.new("RGB", (16, 16), (255, 0, 0))
+    image_buffer = BytesIO()
+    red_image.save(image_buffer, format="PNG")
+    image_bytes = image_buffer.getvalue()
+    corpus_dir = tmp_path / "corpus"
+    corpus_dir.mkdir()
+    Dataset.from_dict({"docid": ["doc-1"], "text": ["literal"], "image": [image_bytes]}).to_parquet(
+        corpus_dir / "part-00000.parquet"
+    )
+    (corpus_dir / "merlin_metadata.json").write_text(
+        json.dumps({"class": "WikiSSNQDataset", "corpus_id": "wikissnq-test"})
+    )
+    corpus_id, corpus = load_corpus(str(corpus_dir))
+    binary_document = corpus.get_document_by_id("doc-1")
+    decoded_image = load_image({"bytes": binary_document["image"]}).convert("RGB")
+    documents = [
+        binary_document,
+        {"text": "literal", "image": Image.new("RGB", (16, 16), (0, 0, 255))},
+    ]
+    together = encoder.encode_documents(documents, batch_size=2)
+    separate = encoder.encode_documents(documents, batch_size=1)
+    expected_red = encoder.encode_documents([{"text": "literal", "image": red_image}], batch_size=1)
+    assert corpus_id == "wikissnq-test"
+    assert type(binary_document["image"]) is bytes
+    assert decoded_image.size == (16, 16)
+    assert decoded_image.getpixel((0, 0)) == (255, 0, 0)
+    assert np.isfinite(together).all()
+    np.testing.assert_allclose(together, separate, rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(together[0], expected_red[0], rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(np.linalg.norm(together, axis=1), 1, atol=1e-6)
+    assert not np.allclose(together[0], together[1], rtol=1e-5, atol=1e-6)
+    query = encoder.encode_queries(["literal"], batch_size=1)
+    scores = query @ together.T
+    assert not np.isclose(scores[0, 0], scores[0, 1], rtol=1e-5, atol=1e-6)
 
 
 def tiny_bidirectional_config() -> Ministral3BidirectionalConfig:

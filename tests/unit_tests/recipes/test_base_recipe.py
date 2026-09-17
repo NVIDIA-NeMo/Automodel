@@ -20,6 +20,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn as nn
+import yaml
 
 from nemo_automodel.components.checkpoint.checkpointing import save_losses
 from nemo_automodel.components.checkpoint.lifecycle import (
@@ -38,7 +39,11 @@ from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.components.training.rng import StatefulRNG
-from nemo_automodel.recipes.base_recipe import BaseRecipe, is_distributed_stateful
+from nemo_automodel.recipes.base_recipe import (
+    BaseRecipe,
+    _is_checkpoint_model_config_compatible,
+    is_distributed_stateful,
+)
 
 try:
     import expecttest
@@ -301,6 +306,86 @@ class _ToyRecipe(BaseRecipe):
         if cfg_dict is None:
             cfg_dict = {"test": "config"}
         self.cfg = ConfigNode(cfg_dict)
+
+
+def test_save_checkpoint_serializes_effective_config_overrides(tmp_path):
+    """Checkpoint YAML records live recipe overrides rather than loaded defaults."""
+    recipe = _ToyRecipe(
+        tmp_path,
+        cfg_dict={
+            "step_scheduler": {
+                "num_epochs": 1,
+                "global_batch_size": 1,
+                "local_batch_size": 1,
+            },
+            "dataset": {"n_passages": 4, "use_text_in_document": False},
+            "tokenizer": {"p_max_length": 4096, "image_longest_edge": 1284},
+            "optimizer": {"lr": 2e-6},
+            "model": {"pretrained_model_name_or_path": "toy/default"},
+        },
+    )
+    recipe.cfg.step_scheduler.num_epochs = 3
+    recipe.cfg.step_scheduler.global_batch_size = 8
+    recipe.cfg.step_scheduler.local_batch_size = 4
+    recipe.cfg.dataset.n_passages = 2
+    recipe.cfg.dataset.use_text_in_document = True
+    recipe.cfg.tokenizer.p_max_length = 8192
+    recipe.cfg.tokenizer.image_longest_edge = 1120
+    recipe.cfg.optimizer.lr = 1e-5
+    recipe.cfg.model.pretrained_model_name_or_path = "toy/effective"
+
+    recipe.save_checkpoint(epoch=2, step=53, train_loss=0.0)
+
+    with (tmp_path / "epoch_2_step_53" / "config.yaml").open() as config_file:
+        saved = yaml.safe_load(config_file)
+    assert saved["step_scheduler"] == {
+        "num_epochs": 3,
+        "global_batch_size": 8,
+        "local_batch_size": 4,
+    }
+    assert saved["dataset"] == {"n_passages": 2, "use_text_in_document": True}
+    assert saved["tokenizer"] == {"p_max_length": 8192, "image_longest_edge": 1120}
+    assert saved["optimizer"] == {"lr": 1e-5}
+    assert saved["model"] == {"pretrained_model_name_or_path": "toy/effective"}
+    assert _is_checkpoint_model_config_compatible(recipe.cfg, tmp_path / "epoch_2_step_53") == (
+        True,
+        "model signature matches",
+    )
+
+
+def test_save_checkpoint_serializes_yaml_safe_runtime_values(tmp_path, monkeypatch):
+    """Live targets and dtypes are serialized while environment placeholders stay unresolved."""
+    monkeypatch.setenv("CHECKPOINT_TEST_SECRET", "resolved-secret")
+    recipe = _ToyRecipe(
+        tmp_path,
+        cfg_dict={
+            "model": {
+                "_target_": "builtins.len",
+                "torch_dtype": "bfloat16",
+            },
+            "callback_fn": "builtins.len",
+            "secret_token": "${oc.env:CHECKPOINT_TEST_SECRET}",
+        },
+    )
+    recipe.cfg.model._target_ = sorted
+    recipe.cfg.model.torch_dtype = torch.float32
+    recipe.cfg.callback_fn = sum
+
+    recipe.save_checkpoint(epoch=0, step=1, train_loss=0.0)
+
+    config_path = tmp_path / "epoch_0_step_1" / "config.yaml"
+    saved_text = config_path.read_text()
+    saved = yaml.safe_load(saved_text)
+    assert saved["model"] == {"_target_": "builtins.sorted", "torch_dtype": "float32"}
+    assert saved["callback_fn"] == "builtins.sum"
+    assert saved["secret_token"] == "${oc.env:CHECKPOINT_TEST_SECRET}"
+    assert "resolved-secret" not in saved_text
+
+    roundtrip = ConfigNode(saved)
+    assert roundtrip.model._target_ is sorted
+    assert roundtrip.model.torch_dtype == "float32"
+    assert roundtrip.callback_fn is sum
+    assert roundtrip.secret_token == "resolved-secret"
 
 
 def test_recipe_autocast_preserves_fp32_parameter_storage():
