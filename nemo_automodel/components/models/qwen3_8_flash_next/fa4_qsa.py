@@ -46,8 +46,7 @@ def _load_fa4() -> tuple[Callable, type, Callable]:
     if not all(available for available, _ in dependencies):
         raise ImportError(
             "FA4 QSA requires FlashAttention's flash_attn.cute SM90 kernels, "
-            "nvidia-cutlass-dsl==4.6.2 and compatible TVM FFI. "
-            "See nemo_automodel/components/models/qwen3_8_flash_next/FA4_QSA.md."
+            "nvidia-cutlass-dsl==4.6.2 and compatible TVM FFI."
         )
     interface, sparsity, cutlass, cute, utils = [module for _, module in dependencies]
 
