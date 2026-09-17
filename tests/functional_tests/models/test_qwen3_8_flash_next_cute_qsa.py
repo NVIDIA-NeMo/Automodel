@@ -203,8 +203,8 @@ def test_4k_routes_with_sampled_fp64_backward() -> None:
 def test_model_qsa_layer_parameter_gradients(monkeypatch: pytest.MonkeyPatch) -> None:
     import copy
 
-    from nemo_automodel.components.models.common import BackendConfig
     from nemo_automodel.components.models.qwen3_8_flash_next import qsa
+    from nemo_automodel.components.models.qwen3_8_flash_next.backend import Qwen3_8_FlashNextBackendConfig
     from nemo_automodel.components.models.qwen3_8_flash_next.config import Qwen3_8_FlashNextTextConfig
     from nemo_automodel.components.models.qwen3_8_flash_next.layers import Qwen3_8_FlashNextQSAAttention
 
@@ -229,7 +229,9 @@ def test_model_qsa_layer_parameter_gradients(monkeypatch: pytest.MonkeyPatch) ->
         partial_rotary_factor=0.25,
         rope_parameters={"rope_theta": 10000.0, "rope_type": "default", "partial_rotary_factor": 0.25},
     )
-    backend = BackendConfig(attn="cute", linear="torch", rms_norm="torch", experts="torch", dispatcher="torch")
+    backend = Qwen3_8_FlashNextBackendConfig(
+        attn="cute", linear="torch", rms_norm="torch", experts="torch", dispatcher="torch"
+    )
     layer = Qwen3_8_FlashNextQSAAttention(config, layer_idx=0, backend=backend).cuda()
     layer.init_weights(buffer_device=torch.device("cuda"))
     reference = copy.deepcopy(layer)

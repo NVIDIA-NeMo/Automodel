@@ -20,6 +20,7 @@ import torch
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.qwen3_8_flash_next import layers as qwen3_8_flash_next_layers
 from nemo_automodel.components.models.qwen3_8_flash_next import qsa as qwen3_8_flash_next_qsa
+from nemo_automodel.components.models.qwen3_8_flash_next.backend import Qwen3_8_FlashNextBackendConfig
 from nemo_automodel.components.models.qwen3_8_flash_next.config import Qwen3_8_FlashNextTextConfig
 from nemo_automodel.components.models.qwen3_8_flash_next.flex_qsa import (
     _membership_flat_offset,
@@ -426,8 +427,14 @@ def test_flex_qsa_empty_route_rows_have_zero_output_and_gradients() -> None:
 
 @pytest.mark.parametrize("attn_backend", ["flex", "cute"])
 def test_qsa_sparse_backend_bypasses_generic_parent_initializer(attn_backend: str) -> None:
-    backend = _backend()
-    backend.attn = attn_backend
+    backend = Qwen3_8_FlashNextBackendConfig(
+        attn=attn_backend,
+        linear="torch",
+        rms_norm="torch",
+        experts="torch",
+        dispatcher="torch",
+        enable_hf_state_dict_adapter=False,
+    )
 
     attention = Qwen3_8_FlashNextQSAAttention(_config(), layer_idx=0, backend=backend)
 

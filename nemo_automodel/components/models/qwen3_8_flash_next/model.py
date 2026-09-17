@@ -14,11 +14,11 @@
 
 """Trainable Qwen3.8-Flash-Next conditional-generation model.
 
-This implementation uses the checkpoint's compressed-block QSA router and a
-FlexAttention sparse-GQA path for CUDA BF16 long-sequence SFT, with a PyTorch
-oracle for CPU and numerical parity. Pipeline and tensor parallelism remain
-unsupported. Context parallelism uses a model-owned contiguous sequence shard
-for QSA, GDN, and PLE, and composes with sequence packing.
+This implementation uses the checkpoint's compressed-block QSA router and
+FlexAttention or optional SM90 CuTe sparse GQA for CUDA BF16 long-sequence SFT,
+with a PyTorch oracle for CPU and numerical parity. Pipeline and tensor
+parallelism remain unsupported. Context parallelism uses a model-owned contiguous
+sequence shard for QSA, GDN, and PLE, and composes with sequence packing.
 """
 
 from __future__ import annotations
@@ -50,6 +50,7 @@ from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MoEConfig
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
+from .backend import Qwen3_8_FlashNextBackendConfig
 from .config import Qwen3_8_FlashNextConfig, Qwen3_8_FlashNextTextConfig
 from .cp import (
     Qwen3_8_FlashNextCPContext,
@@ -71,9 +72,12 @@ class Qwen3_8_FlashNextCausalLMOutput(CausalLMOutputWithPast):
     """Causal-LM output with optional per-layer HC states for parity capture."""
 
 
-def _qwen3_8_flash_next_backend(backend: BackendConfig | None = None) -> BackendConfig:
-    """Return a backend whose rotary path supports text and multimodal layouts."""
-    resolved = copy.copy(backend) if backend is not None else BackendConfig()
+def _qwen3_8_flash_next_backend(backend: BackendConfig | dict[str, Any] | None = None) -> BackendConfig:
+    """Resolve recipe mappings and preserve the model's unfused rotary path."""
+    if isinstance(backend, dict):
+        resolved = Qwen3_8_FlashNextBackendConfig(**backend)
+    else:
+        resolved = copy.copy(backend) if backend is not None else Qwen3_8_FlashNextBackendConfig()
     resolved.rope_fusion = False
     return resolved
 
@@ -489,6 +493,7 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
     # Packed (THD) training and packed CP are owned by the model's
     # route-indexed QSA path for the listed CUDA backends.
     _packed_cp_attn_backends = ("flex", "cute")
+    backend_config_resolver = staticmethod(_qwen3_8_flash_next_backend)
 
     @dataclass(frozen=True)
     class ModelCapabilities:
@@ -505,7 +510,7 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
         cls,
         config: Qwen3_8_FlashNextConfig,
         moe_config: MoEConfig | None = None,
-        backend: BackendConfig | None = None,
+        backend: BackendConfig | dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> Qwen3_8_FlashNextForConditionalGeneration:
         """Construct from a parsed Qwen3.8-Flash-Next configuration."""
@@ -527,7 +532,7 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
         self,
         config: Qwen3_8_FlashNextConfig,
         moe_config: MoEConfig | None = None,
-        backend: BackendConfig | None = None,
+        backend: BackendConfig | dict[str, Any] | None = None,
         *,
         engram_process_group: dist.ProcessGroup | None = None,
         engram_table_config: Qwen3_8_FlashNextEngramTableConfig | None = None,

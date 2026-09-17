@@ -1,16 +1,21 @@
 # CuTe QSA on SM90
 
-Select the backend through the existing model configuration:
+Select CuTe through the model-owned runtime backend configuration:
 
 ```yaml
 model:
   backend:
+    _target_: nemo_automodel.components.models.qwen3_8_flash_next.backend.Qwen3_8_FlashNextBackendConfig
     attn: cute
 ```
 
-For example, use the existing
-`examples/llm_finetune/qwen/qwen3_8_flash_next_180b_hellaswag_ep64.yaml`
-with `--model.backend.attn cute` in its normal scheduler launch.
+For example, change the backend target and attention selection in
+`examples/llm_finetune/qwen/qwen3_8_flash_next_180b_hellaswag_ep64.yaml`,
+retaining its other backend settings, then use its normal scheduler launch.
+Plain backend mappings passed to the AutoModel factory are resolved by the
+model's existing `backend_config_resolver` hook. Existing shared
+`BackendConfig` instances remain accepted. The shared configuration is
+unchanged: only this model's configuration declares the `"cute"` option.
 The selection affects Qwen3.8-Flash-Next QSA layers. Gated DeltaNet layers
 continue to use FLA. The default backend, indexer and checkpoint tensor layout
 are unchanged.
