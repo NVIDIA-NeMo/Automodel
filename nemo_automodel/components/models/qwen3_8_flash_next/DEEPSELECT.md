@@ -48,33 +48,33 @@ It includes selected-set equivalence, dense-prefix/tail behavior, padded query
 rows, non-aligned key-row storage, packed documents, attention output/gradient
 parity, and activation-checkpoint recomputation consistency.
 
-## Installing the validated H100 extension
+## Installation
 
-Use the training environment's Python, PyTorch and CUDA toolkit (NVCC >= 12.9
-for this pinned build script). Build on an allocated compute node:
+The AutoModel Dockerfile builds and installs the pinned extension by default
+(`INSTALL_DEEPSELECT=true`), targeting SM90a, SM100a and SM103a. It installs into
+the base interpreter's site-packages, inherited by the image's uv environment.
+The backend remains opt-in; ordinary Torch selection does not import DeepSelect.
 
-```bash
-git clone https://github.com/deepseek-ai/DeepSelect.git
-cd DeepSelect
-git checkout 0f03b68748b304863fdf0181a11458d04ae533a9
-git submodule update --init --recursive
-```
-
-At this revision, set the following values in `setup.py` for H100:
-
-```python
-cc_flag = ["-gencode", "arch=compute_90a,code=sm_90a"]
-datetime_rev = "20260916.000000"
-```
-
-The fixed timestamp replaces the generated build time so uv's metadata and
-wheel phases report the same version. These are build-only changes; the
-selection kernel source is unchanged.
+For an existing environment, run from the AutoModel checkout on a compute node:
 
 ```bash
-DEEP_SELECT_BUILD_TARGET_PLATFORM=CUDA MAX_JOBS=8 NVCC_THREADS=2 \
-  uv pip install --python "$(command -v python)" --no-build-isolation --no-deps .
+DEEPSELECT_PYTHON="$(command -v python)" DEEP_SELECT_CUDA_ARCHS=90a \
+  bash docker/common/install_deepselect.sh
 ```
 
-Install the resulting extension in the environment used by every rank.
-The extension is optional and is not added to AutoModel's base dependencies.
+The script uses uv, builds against that interpreter's installed PyTorch and
+CUDA toolkit, and pins the source revision above. Git, a C++ compiler, Ninja,
+setuptools and NVCC >= 12.9 are required by this upstream build.
+Set `DEEP_SELECT_CUDA_ARCHS` to a semicolon-separated subset of
+`90a;100a;103a` when building for different targets.
+
+The checked-in build patch adds H100 to the supported build targets and makes
+the package version deterministic across uv's metadata/wheel phases. It also
+permits a CUDA build without a visible GPU. Selection kernels are unchanged.
+No experiment-directory `PYTHONPATH` is needed.
+
+This source-built extension is installed outside uv's project resolution,
+following the image's prebuilt-extension pattern; a standalone `uv sync` does
+not install it. Use the image or installer above, and install it in every
+training rank's environment. Docker builds can opt out with
+`--build-arg INSTALL_DEEPSELECT=false`.
