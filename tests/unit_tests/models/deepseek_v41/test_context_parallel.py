@@ -150,8 +150,11 @@ def _cpu_worker(rank, rendezvous):
         dist.destroy_process_group()
 
 
-# Spawned workers import the model stack before running the CP collectives.
-@pytest.mark.timeout(60)
+@pytest.mark.runtime_budget(
+    30,
+    hard_timeout=60,
+    reason="two spawned workers import the model stack and check real CP gradients and optimizer updates",
+)
 def test_cp2_attention_gradients_clipping_update_and_padding(tmp_path: Path):
     mp.spawn(_cpu_worker, args=(str(tmp_path / "gloo"),), nprocs=2, join=True)
 

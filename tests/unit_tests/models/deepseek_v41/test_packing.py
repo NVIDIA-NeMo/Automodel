@@ -235,8 +235,11 @@ def _cp_worker(rank, rendezvous):
         dist.destroy_process_group()
 
 
-# Spawned workers import the model stack before running the CP collectives.
-@pytest.mark.timeout(60)
+@pytest.mark.runtime_budget(
+    45,
+    hard_timeout=60,
+    reason="two spawned workers import the model stack and compile packed CP forward/backward with checkpointing",
+)
 def test_packed_cp2_forward_backward_with_activation_checkpointing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
