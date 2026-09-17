@@ -58,10 +58,16 @@ from nemo_automodel.components.config._arg_parser import parse_args_and_load_con
 from nemo_automodel.components.distributed.config import DistributedSetup
 from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
+from nemo_automodel.components.distributed.tp_replicas import synchronize_tp_replica_gradients
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
-from nemo_automodel.components.loss.utils import calculate_loss
+from nemo_automodel.components.loss.utils import (
+    _count_label_tokens,
+    _get_loss_ignore_index,
+    _normalize_kd_labels,
+    calculate_loss,
+)
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 from nemo_automodel.components.training.rng import ScopedRNG
 from nemo_automodel.components.training.signal_handler import DistributedSignalHandler
@@ -446,10 +452,15 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                     labels=target,
                     num_label_tokens=None,
                 )
+            kd_labels = _normalize_kd_labels(
+                target,
+                loss_ignore_index=_get_loss_ignore_index(recipe_ref.loss_fn),
+                kd_ignore_index=_get_loss_ignore_index(recipe_ref.kd_loss_fn),
+            )
             kd_loss = recipe_ref.kd_loss_fn(
                 logits,
                 teacher_logits,
-                target,
+                kd_labels,
                 num_batch_labels=1,
             )
             recipe_ref._ce_loss_buffer.append(ce_loss.detach().clone())
@@ -661,10 +672,15 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             # Reminder: kd_loss is normalized by num_label_tokens, which is typically
             # larger than the number of labels in this batch alone because it covers all
             # batches in one optimizer step (grad_acc_steps = gbs / mbs).
+            kd_labels = _normalize_kd_labels(
+                labels,
+                loss_ignore_index=_get_loss_ignore_index(self.loss_fn),
+                kd_ignore_index=_get_loss_ignore_index(self.kd_loss_fn),
+            )
             kd_loss = self.kd_loss_fn(
                 student_logits,
                 teacher_logits,
-                labels,
+                kd_labels,
                 num_batch_labels=num_label_tokens,
             )
             local_loss = (1.0 - self.kd_ratio) * ce_loss + self.kd_ratio * kd_loss
@@ -787,8 +803,9 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         if self.pp_enabled:
             return self._run_train_optim_step_pp(batches, max_grad_norm)
 
+        ignore_index = _get_loss_ignore_index(self.loss_fn)
         num_label_tokens = torch.tensor(
-            sum((batch["labels"] != -100).sum().item() for batch in batches), dtype=torch.long
+            sum(_count_label_tokens(batch["labels"], ignore_index) for batch in batches), dtype=torch.long
         )
         num_label_tokens = self._dp_allreduce(num_label_tokens).item()
         loss_buffer = []
@@ -809,6 +826,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             self._ce_loss_buffer.append(ce_loss)
             self._kd_loss_buffer.append(kd_loss)
 
+        synchronize_tp_replica_gradients(self.model_parts, self.device_mesh)
         grad_norm = scale_grads_and_clip_grad_norm(
             max_grad_norm,
             self.model_parts,
@@ -880,7 +898,10 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
 
     def _run_train_optim_step_pp(self, batches, max_grad_norm: float | None = None):
         """Execute a single training step when pipeline parallelism is enabled."""
-        num_label_tokens = torch.tensor(sum((b["labels"] != -100).sum().item() for b in batches), dtype=torch.long)
+        ignore_index = _get_loss_ignore_index(self.loss_fn)
+        num_label_tokens = torch.tensor(
+            sum(_count_label_tokens(batch["labels"], ignore_index) for batch in batches), dtype=torch.long
+        )
         num_label_tokens = self._dp_allreduce(num_label_tokens).item()
         loss_buffer = []
 
@@ -907,6 +928,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             if i == 0:
                 prepare_after_first_microbatch()
 
+        synchronize_tp_replica_gradients(self.model_parts, self.device_mesh)
         grad_norm = scale_grads_and_clip_grad_norm(
             max_grad_norm,
             self.model_parts,
@@ -1082,9 +1104,10 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             total_ce_loss = 0.0
             total_kd_loss = 0.0
             total_num_label_tokens = 0
+            ignore_index = _get_loss_ignore_index(self.loss_fn)
 
             for batch in val_dataloader:
-                num_label_tokens = (batch["labels"] != -100).sum().item()
+                num_label_tokens = _count_label_tokens(batch["labels"], ignore_index)
                 local_loss, _kd_loss, _ce_loss = self._forward_backward_step(
                     0,
                     batch,

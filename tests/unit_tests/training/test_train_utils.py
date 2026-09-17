@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib.util
 import math
 from datetime import timedelta
 from unittest.mock import Mock
@@ -20,6 +21,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+import nemo_automodel.components.training.utils as training_utils
 from nemo_automodel.components.training.utils import (
     ScopedModuleOffloading,
     _all_reduce_scalar,
@@ -181,6 +183,35 @@ def test_clip_grad_norm_uses_torch_fast_path_when_requested(monkeypatch):
     assert clip_grad_norm_mock.call_args.kwargs["error_if_nonfinite"] is False
     assert clip_grad_norm_mock.call_args.kwargs["foreach"] is True
     clip_grads_with_norm_mock.assert_not_called()
+
+
+@pytest.mark.parametrize("backend", [None, "triton", "te"])
+def test_clip_grad_norm_selects_requested_backend(monkeypatch, backend):
+    model = torch.nn.Linear(2, 1, bias=False)
+    gradient = torch.tensor([[3.0, 4.0]])
+    model.weight.grad = gradient.clone()
+
+    triton_norm = Mock(return_value=torch.tensor(25.0, dtype=torch.float64))
+    te_norm = Mock(return_value=torch.tensor(5.0, dtype=torch.float64))
+    monkeypatch.setattr(training_utils, "_use_fused_grad_norm", lambda *_: True)
+    monkeypatch.setattr(training_utils, "multi_tensor_sumsq", triton_norm)
+    monkeypatch.setattr(training_utils, "_local_te_l2_norm", te_norm)
+
+    options = {} if backend is None else {"grad_norm_backend": backend}
+    observed = clip_grad_norm(max_grad_norm=1.0, model_parts=[model], **options)
+
+    torch.testing.assert_close(observed, torch.tensor(5.0, dtype=torch.float64))
+    torch.testing.assert_close(model.weight.grad, gradient / (5.0 + 1e-6))
+    assert triton_norm.call_count == (backend != "te")
+    assert te_norm.call_count == (backend == "te")
+
+
+def test_clip_grad_norm_rejects_invalid_backend():
+    model = torch.nn.Linear(1, 1, bias=False)
+    model.weight.grad = torch.ones_like(model.weight)
+
+    with pytest.raises(ValueError, match="grad_norm_backend must be 'triton' or 'te'"):
+        clip_grad_norm(max_grad_norm=1.0, model_parts=[model], grad_norm_backend="invalid")
 
 
 def test_clip_grad_norm_disables_torch_fast_path_for_owner_shard(monkeypatch):
@@ -638,9 +669,8 @@ class TestScaleGradsAndClipGradNorm:
 
         # Base EP divisor = 4/2 = 2; replicated TP tokens add another 2.
         assert torch.allclose(expert_param.grad, torch.ones_like(expert_param) * 2.0)
-        # Router/dense replicas stay identical across TP ranks via the
-        # fail-closed identical-pretrained-weights invariant (no separate
-        # sync) and must never receive the expert-only divisor.
+        # Router/dense replicas must never receive the expert-only divisor;
+        # their TP synchronization is owned separately at the optimizer boundary.
         assert torch.allclose(model.gate.weight.grad, torch.ones_like(model.gate.weight) * 8.0)
 
     @pytest.mark.parametrize(
@@ -729,3 +759,53 @@ class TestScaleGradsAndClipGradNorm:
         # Non-expert params: only PP scaling -> 4
         assert torch.allclose(model.gate.weight.grad, torch.ones_like(model.gate.weight) * 4.0)
         assert torch.allclose(expert_param.grad, torch.ones_like(expert_param) * 2.0)
+
+
+@pytest.mark.parametrize("norm_type", [1.0, 2.0, 3.0, float("inf")])
+@pytest.mark.parametrize("transposed", [False, True])
+def test_clip_large_gradient_matches_dense_float64_reference(norm_type, transposed):
+    """Check large contiguous/strided gradients and clipping against a dense FP64 reference."""
+    torch.manual_seed(4128)
+    gradient = torch.randn(1025, 2049)
+    if transposed:
+        gradient = gradient.t()
+    parameter = torch.nn.Parameter(torch.empty_like(gradient))
+    parameter.grad = gradient.clone(memory_format=torch.preserve_format)
+    reference_norm = torch.linalg.vector_norm(gradient.double(), ord=norm_type)
+    reference = gradient * (0.3 / (reference_norm + 1e-6)).clamp(max=1.0)
+    from nemo_automodel.components.training.utils import _clip_grad_norm_impl
+
+    actual_norm = _clip_grad_norm_impl([parameter], 0.3, norm_type=norm_type)
+    torch.testing.assert_close(actual_norm, reference_norm, atol=0, rtol=2e-7)
+    torch.testing.assert_close(parameter.grad, reference, atol=0, rtol=3e-7)
+
+
+@pytest.mark.parametrize("backend", ["triton", "te"])
+def test_optional_te_is_not_loaded_for_import_or_cpu_clipping(monkeypatch: pytest.MonkeyPatch, backend: str) -> None:
+    """A broken optional TE binary must not prevent import or CPU gradient clipping."""
+    from nemo_automodel.components.training import utils
+    from nemo_automodel.shared import import_utils
+
+    original_import = import_utils.safe_import
+    te_imports = []
+
+    def import_with_broken_te(module, **kwargs):
+        if module.startswith("transformer_engine"):
+            te_imports.append(module)
+            raise OSError("undefined symbol: cublasLtGroupedMatrixLayoutInit_internal")
+        return original_import(module, **kwargs)
+
+    monkeypatch.setattr(import_utils, "safe_import", import_with_broken_te)
+    spec = importlib.util.spec_from_file_location("_training_utils_import_test", utils.__file__)
+    isolated_utils = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(isolated_utils)
+
+    parameter = nn.Parameter(torch.tensor([1.0, 2.0]))
+    parameter.grad = torch.tensor([3.0, 4.0])
+    norm = isolated_utils._clip_grad_norm_impl([parameter], 1.0, grad_norm_backend=backend)
+    torch.testing.assert_close(norm, torch.tensor(5.0, dtype=torch.float64))
+    expected_gradient = torch.tensor([3.0, 4.0]) / (5.0 + 1e-6)
+    torch.testing.assert_close(parameter.grad, expected_gradient)
+    torch.optim.SGD([parameter], lr=0.1).step()
+    torch.testing.assert_close(parameter, torch.tensor([1.0, 2.0]) - 0.1 * expected_gradient)
+    assert not te_imports
