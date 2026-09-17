@@ -251,7 +251,7 @@ and GPU topology remain properties of each run rather than separate projects.
 
 Blackwell runs trade their large memory capacity for fewer gradient
 accumulation rounds. Activation checkpointing is disabled, and the default
-local batch is 16 for 170M, 8 for 340M, and 4 for 760M, capped by
+local batch is 8 for 170M, 4 for 340M, and 2 for 760M, capped by
 `global_batch_size / world_size`. The global batch remains 128, so token
 budgets and LR schedules are unchanged. Set `TITANS_LOCAL_BATCH_SIZE` or
 `TITANS_ACTIVATION_CHECKPOINTING` to override these hardware defaults.
