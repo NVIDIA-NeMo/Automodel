@@ -402,19 +402,6 @@ class BlendedMegatronDatasetBuilder:
                             prefixes[0], split_spoof, sizes_spoof
                         )[i]
                         continue
-                    elif self.config.multiple_validation_sets and i == Split.valid.value:
-                        # handle multiple validation sets
-                        validation_datasets = []
-                        if self.config.full_validation:
-                            # verify that size is None, which causes a single epoch dataset
-                            # to be built
-                            assert sizes_spoof[i] is None
-                        for prefix in prefixes:
-                            ds = self._build_megatron_dataset_splits(prefix, split_spoof, sizes_spoof)[i]
-                            validation_datasets.append(ds)
-                        blended_datasets[i] = validation_datasets
-                        continue
-
                     # Build mid-level datasets
                     if weights is None:
                         sizes_per_dataset_buffer = [[None for split in Split] for prefix in prefixes]

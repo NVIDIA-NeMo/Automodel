@@ -26,6 +26,7 @@ from nemo_automodel.components.distributed.fsdp2_extensions.compat import (
 from nemo_automodel.components.distributed.fsdp2_extensions.compat import (
     patch_fsdp_unused_param_reduction as _patch_fsdp_unused_param_reduction,
 )
+from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 
 UniformSubtreeItem = Union[Tuple[nn.Module, torch.dtype], Tuple[str, nn.Module, torch.dtype]]
 
@@ -327,6 +328,7 @@ def make_parameter_compute_dtype_resolver(
     pinned_ids: Set[int] = set()
     if fp32_compute_module_names:
         for name, tensor in (*module.named_parameters(), *module.named_buffers()):
+            name = canonical_parameter_fqn(name)
             if id(tensor) not in ignored_param_ids and any(token in name for token in fp32_compute_module_names):
                 pinned_ids.add(id(tensor))
 

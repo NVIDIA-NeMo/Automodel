@@ -35,6 +35,7 @@ model:
 ```
 """
 
+from dataclasses import replace
 from typing import Any, Union
 
 import torch
@@ -182,6 +183,13 @@ class BailingMoeV2Model(nn.Module):
             shared_expert_inter_dim=config.moe_intermediate_size,
             shared_expert_activation="swiglu",
             softmax_before_topk=False,
+            # BailingMoeV2Gate (checkpoint-owned modeling_bailing_moe_v2.py,
+            # trust_remote_code) gathers topk_weight from the fp32 scores and
+            # returns it with no cast back, so expert compute sees fp32. Without
+            # this, Gate.forward applies weights.type_as(x) and hands over bf16.
+            # Set in moe_defaults, above the moe_overrides update, so a caller
+            # override still wins.
+            router_weights_fp32=True,
             dtype=model_dtype,
         )
         if moe_overrides:
@@ -284,7 +292,9 @@ class BailingMoeV2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
 
     # ``e_score_correction_bias`` must stay in fp32 even when the rest of the
     # model is bf16; tiny quantization errors in the bias change routing.
-    _keep_in_fp32_modules_strict = ["e_score_correction_bias"]
+    # The checkpoint-owned HF implementation names the same buffer expert_bias.
+    # Include that name for the checkpoint-parity harness's HF load contract.
+    _keep_in_fp32_modules_strict = ["e_score_correction_bias", "expert_bias"]
 
     # PP compatibility: our forward computes ``freqs_cis`` inline and threads it
     # through the decoder blocks (gpt_oss-style rotary convention).  The generic
@@ -349,7 +359,16 @@ class BailingMoeV2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
         super().__init__()
         self.config = config
         reject_unsupported_tie_word_embeddings(type(self), config)
-        self.backend = backend or BackendConfig()
+        # The reference BailingMoeV2Gate casts hidden states and gate weight to
+        # fp32 before the router linear, so default gate_precision to fp32.
+        # Scoring is already fp32 via Gate's score_dtype default - this covers
+        # the projection only.
+        # replace() rather than in-place: the caller's BackendConfig may be shared
+        # with other models, which must not inherit a model-owned default.
+        resolved_backend = backend or BackendConfig()
+        if resolved_backend.gate_precision is None:
+            resolved_backend = replace(resolved_backend, gate_precision=torch.float32)
+        self.backend = resolved_backend
         moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = BailingMoeV2Model(
             config,

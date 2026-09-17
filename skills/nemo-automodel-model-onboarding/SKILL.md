@@ -42,8 +42,8 @@ Use these compact answer patterns for common questions:
 - Dense causal LM: classify as dense only when `architectures` contains a
   `ForCausalLM` class and expert fields such as `num_local_experts`,
   `n_routed_experts`, or `num_experts_per_tok` are absent. Create
-  `components/models/<name>/model.py`, `state_dict_adapter.py`, `__init__.py`,
-  and optional `config.py`, register `MODEL_ARCH_MAPPING` in
+  `components/models/<name>/model.py` and `__init__.py`; add `state_dict_adapter.py`
+  only for checkpoint weight conversion and `config.py` only if needed. Register `MODEL_ARCH_MAPPING` in
   `_transformers/registry.py`, add example YAML, and add tiny-config unit tests
   plus layer-equivalence tests for rewritten layers.
 - MoE state dict: identify expert fields in `config.json`, reference
@@ -55,7 +55,7 @@ Use these compact answer patterns for common questions:
   a `ForConditionalGeneration` architecture are present. Reference
   `vlm-patterns.md` and existing VLM implementations such as `mistral4`,
   `kimivl`, or `kimi_k25_vl`; check text backbone, vision tower, projector,
-  processor assumptions, text and vision `state_dict_adapter.py` mappings,
+  processor assumptions, text and vision checkpoint compatibility (adapter mappings when needed),
   registry registration, and tiny image-text tests before full checkpoints.
   Do not treat VLM onboarding as a pure causal-LM path or skip processor/image
   tests.
@@ -109,7 +109,7 @@ Look in `components/models/` for architectures with similar attention or MLP pat
 
 ```
 components/models/
-  llama/           # Standard GQA + SwiGLU (CombinedQKV + CombinedGateUpMLP)
+  llama/           # Standard GQA + SwiGLU with separate HF-compatible projections
   qwen2/           # Same as Llama but with attention bias + QKV bias
   baichuan/        # ALiBi attention variant
   deepseek_v3/     # MLA attention + MoE (DeepSeek-style grouped experts)
@@ -157,7 +157,7 @@ tiny_config = LlamaConfig(
 components/models/<name>/
   __init__.py
   model.py
-  state_dict_adapter.py
+  state_dict_adapter.py # Only if HF weight names or tensor layouts need conversion
   config.py            # Only if HF config is insufficient
   layers.py            # Only for MoE / MLA / other non-standard layers
   rope_utils.py        # Only for custom RoPE
@@ -171,7 +171,7 @@ Implement files in dependency order:
 2. **rope_utils.py** (if needed) -- RoPE implementation
 3. **layers.py** (if needed) -- Attention, MLP, decoder block classes
 4. **model.py** -- The main `ForCausalLM` (or `ForConditionalGeneration`) class
-5. **state_dict_adapter.py** -- HF weight conversion. Treat checkpoint I/O
+5. **state_dict_adapter.py** (if needed) -- HF weight conversion. Treat checkpoint I/O
    performance as part of the implementation, and evaluate the low-memory DCP
    capability as described in Section 2.6.
 6. **__init__.py** -- Re-export the main model class
@@ -182,6 +182,11 @@ See the pattern files for detailed implementation guidance:
 - MoE: [moe-patterns.md](./moe-patterns.md)
 - VLM: [vlm-patterns.md](./vlm-patterns.md)
 - Capabilities and fp32 precision: [capabilities-and-precision.md](./capabilities-and-precision.md)
+
+Most custom models need `state_dict_adapter.py` for HF weight conversion.
+Omit the file and attribute only when HF names and tensor layouts already match
+across supported backend/config variants, as in Llama, Qwen2, and Qwen3.
+Weight tying remains the model's responsibility (Section 2.3).
 
 ### 2.3 Causal LM weight tying
 
@@ -229,7 +234,8 @@ model_class_name)`.
 
 ### 2.4 MoE state-dict adapter checklist
 
-For MoE models, do not stop at generic loading. The adapter must explicitly map:
+For MoE models, verify all weights below. When their HF and native layouts differ,
+the adapter must explicitly map:
 
 - Router weights, including gate bias or correction-bias tensors when the Hugging Face model has them.
 - Expert weights, preserving expert index order across local and routed experts.
@@ -257,9 +263,9 @@ compare existing implementations such as `mistral4`, `kimivl`, or
 The implementation should explicitly cover:
 
 - Text backbone, vision tower, projector, and processor or image preprocessing assumptions.
-- Weight mapping for both text and vision modules in `state_dict_adapter.py`.
+- Checkpoint compatibility for both text and vision modules, with adapter mappings where needed.
 - Registration of the `ForConditionalGeneration` class in `_transformers/registry.py`.
-- Tiny tests that exercise image-text inputs and verify the adapter round-trip.
+- Tiny tests that exercise image-text inputs and verify checkpoint load/export, plus adapter round-trip when present.
 
 ### 2.6 Checkpoint I/O performance
 
@@ -341,10 +347,15 @@ recipe authoring or existing recipe modifications.
 
 Create an example config under `examples/llm_finetune/<name>/` (or `examples/vlm_finetune/<name>/`):
 
+For new full-parameter Adam/AdamW examples, set `model.dtype: float32`.
+See [training precision](../nemo-automodel-recipe-development/SKILL.md#full-parameter-training-precision)
+for compute precision and other training modes.
+
 ```yaml
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: <org>/<model-name>
+  dtype: float32
 
 trainer:
   max_steps: 100
@@ -374,8 +385,10 @@ Create `tests/unit_tests/models/<name>/` and cover the checks below before
 loading full checkpoints:
 
 - Forward-shape smoke test with a tiny config.
-- State-dict adapter round-trip: `from_hf -> to_hf` preserves mapped names,
-  shapes, dtypes, and values.
+- State-dict adapter round-trip, when present: `from_hf -> to_hf` preserves
+  mapped names, shapes, dtypes, and values.
+- HF load/export and native save/reload preserve weights and ties, with or
+  without an adapter; see `tests/unit_tests/checkpoint/test_native_hf_state_dict.py`.
 - Layer equivalence tests for every rewritten attention, MLP, normalization,
   RoPE, or MoE layer. Use the model dtype from config, identical seeded weights,
   identical inputs, and dtype-appropriate `torch.allclose` tolerances.
@@ -424,10 +437,9 @@ that only surface in a full parity comparison.
 | File | Purpose |
 |------|---------|
 | `_transformers/registry.py` | `MODEL_ARCH_MAPPING` and `_CUSTOM_CONFIG_REGISTRATIONS` |
-| `components/models/common/__init__.py` | Exports `CombinedQKVAttentionMixin`, `CombinedGateUpMLP`, `BackendConfig`, `HFCheckpointingMixin`, etc. |
-| `components/models/common/combined_projection/combined_qkv.py` | `CombinedQKVAttentionMixin` with `setup_qkv_projection()` and `compute_qkv()` |
-| `components/models/common/combined_projection/combined_mlp.py` | `CombinedGateUpMLP` with interleaved gate/up layout |
-| `components/models/common/combined_projection/state_dict_adapter.py` | `CombinedProjectionStateDictAdapter` base class |
+| `components/models/common/__init__.py` | Exports `BackendConfig`, `HFCheckpointingMixin`, and backend construction utilities |
+| `components/models/llama/model.py` | Separate attention and MLP projections with HF-compatible weights |
+| `components/checkpoint/state_dict_adapter.py` | Optional `StateDictAdapter` conversion contract |
 | `components/models/common/hf_checkpointing_mixin.py` | `HFCheckpointingMixin` for save/load |
 | `components/models/common/utils.py` | `BackendConfig`, `initialize_rms_norm_module`, `initialize_linear_module`, `get_rope_config` |
 | `components/moe/config.py` | `MoEConfig` dataclass |
@@ -447,8 +459,8 @@ that only surface in a full parity comparison.
 - [ ] Implemented layers.py (if custom layers needed)
 - [ ] Implemented rope_utils.py (if custom RoPE needed)
 - [ ] Implemented model.py with `HFCheckpointingMixin`
-- [ ] Implemented state_dict_adapter.py and evaluated checkpoint latency plus peak host/device memory per Section 2.6
-- [ ] Evaluated `supports_low_memory_dcp_load`; any opt-in proves direct destinations reach model storage, bounds
+- [ ] Implemented state_dict_adapter.py if needed; evaluated checkpoint latency and peak memory per Section 2.6
+- [ ] For adapters, evaluated `supports_low_memory_dcp_load`; any opt-in proves direct destinations reach model storage, bounds
   allocating conversions, and reports `False` for unsafe variants
 - [ ] Implemented __init__.py with re-export
 - [ ] Registered in `MODEL_ARCH_MAPPING` in `_transformers/registry.py`
