@@ -1050,6 +1050,11 @@ class CrossEncoderModel(nn.Module):
         is_causal = _resolve_text_backbone_is_causal(model, model.config, is_causal)
         _set_text_backbone_is_causal(model, is_causal)
         _init_encoder_common(self, model)
+
+        fsdp_output_dtype = getattr(model, "_nemo_fsdp_output_dtype", None)
+        if fsdp_output_dtype is not None:
+            self._nemo_fsdp_output_dtype = fsdp_output_dtype
+
         self.is_causal = is_causal
 
     @property

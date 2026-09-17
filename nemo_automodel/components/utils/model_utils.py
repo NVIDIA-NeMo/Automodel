@@ -370,11 +370,13 @@ def apply_parameter_freezing(model, freeze_config):
 
     freeze_config can contain:
         - freeze_vision_tower: bool (default True)
+        - freeze_multimodal_projector: bool (default False)
         - freeze_audio_tower: bool (default False)
         - freeze_language_model: bool (default False)
         - freeze_video_embedder: bool (default False)
     """
     freeze_vision_tower = freeze_config.get("freeze_vision_tower", True)
+    freeze_multimodal_projector = freeze_config.get("freeze_multimodal_projector", False)
     freeze_audio_tower = freeze_config.get("freeze_audio_tower", False)
     freeze_language_model = freeze_config.get("freeze_language_model", False)
     freeze_video_embedder = freeze_config.get("freeze_video_embedder", False)
@@ -382,6 +384,14 @@ def apply_parameter_freezing(model, freeze_config):
     # Freeze vision tower
     if freeze_vision_tower:
         _freeze_module_by_attribute_and_patterns(model, "vision_tower", ["vision", "visual", "image_encoder"])
+
+    # Freeze multimodal projector
+    if freeze_multimodal_projector:
+        _freeze_module_by_attribute_and_patterns(
+            model,
+            "multi_modal_projector",
+            ["multi_modal_projector", "multimodal_projector", "mm_projector"],
+        )
 
     # Freeze audio tower
     if freeze_audio_tower:

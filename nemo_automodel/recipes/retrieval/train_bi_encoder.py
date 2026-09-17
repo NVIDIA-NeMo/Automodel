@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import pathlib
 import time
 from collections import deque
@@ -54,6 +55,22 @@ from nemo_automodel.shared.te_patches import apply_te_patches
 _, wandb = safe_import("wandb")
 
 logger = logging.getLogger(__name__)
+
+
+def _is_finite_value(value: float | torch.Tensor | None) -> bool:
+    """Return whether a scalar value is present and finite.
+
+    Args:
+        value: Scalar tensor of shape [] or a Python scalar. ``None`` is non-finite.
+
+    Returns:
+        Whether every tensor element, or the scalar value, is finite.
+    """
+    if value is None:
+        return False
+    if isinstance(value, torch.Tensor):
+        return bool(torch.isfinite(value.detach()).all().item())
+    return math.isfinite(float(value))
 
 
 def _uses_multi_vector_scoring(model) -> bool:
@@ -528,6 +545,51 @@ class TrainBiEncoderRecipe(BaseRecipe):
 
         self._finalize_and_close_checkpointer()
 
+    def _has_nonfinite_across_dp(self, local_has_nonfinite: bool) -> bool:
+        """Return whether any data-parallel rank reports a non-finite value."""
+        flag = torch.tensor(int(local_has_nonfinite), device=self.dist_env.device, dtype=torch.int32)
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(
+                flag,
+                op=torch.distributed.ReduceOp.MAX,
+                group=self._get_dp_group(include_cp=True),
+            )
+        return bool(flag.item())
+
+    def _log_nonfinite_loss(self, idx: int, loss: float | torch.Tensor | None) -> None:
+        """Log a non-finite training loss produced on the local rank.
+
+        Args:
+            idx: Microbatch index within the optimizer step.
+            loss: Scalar loss tensor of shape [], a Python scalar, or ``None``.
+        """
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        logger.warning(
+            "Non-finite retrieval training loss detected at step %s epoch %s rank %s microbatch %s: loss=%s",
+            self.step_scheduler.step,
+            self.step_scheduler.epoch,
+            rank,
+            idx,
+            loss,
+        )
+
+    def _log_skipped_train_update(self, reason: str) -> None:
+        """Log a skipped optimizer update from the main rank."""
+        if not self.dist_env.is_main:
+            return
+        logger.warning(
+            "Skipping retrieval optimizer update at step %s epoch %s because %s. "
+            "Optimizer step and LR scheduler step were skipped; gradients were zeroed.",
+            self.step_scheduler.step,
+            self.step_scheduler.epoch,
+            reason,
+        )
+
+    def _zero_optimizer_grads(self) -> None:
+        """Clear optimizer gradients without applying an optimizer update."""
+        for opt in self.optimizer:
+            opt.zero_grad()
+
     def _forward_backward_step(
         self,
         idx,
@@ -538,7 +600,23 @@ class TrainBiEncoderRecipe(BaseRecipe):
         is_train: bool = True,
         modality_loss_buffers: dict[str, list[torch.Tensor]] | None = None,
     ):
-        """Forward and backward pass for a single micro-batch."""
+        """Run the forward and optional backward pass for one microbatch.
+
+        Args:
+            idx: Microbatch index within the optimizer step.
+            batch: Mapping containing query token tensors of shape [batch, sequence],
+                passage token tensors of shape [batch * passages, sequence], and
+                optional image tensors of shape [batch, images, channels, height, width]
+                or [batch * passages, images, channels, height, width].
+            loss_buffer: List receiving detached scalar loss tensors of shape [].
+            num_batches: Number of microbatches in the optimizer step.
+            is_train: Whether to run backward and non-finite synchronization.
+            modality_loss_buffers: Optional mapping receiving tensors of shape [2]
+                containing loss sum and sample count for each modality.
+
+        Returns:
+            Whether this microbatch caused the optimizer update to be skipped.
+        """
         batch = {
             k: v.to(self.dist_env.device, non_blocking=True) if isinstance(v, torch.Tensor) else v
             for k, v in batch.items()
@@ -631,6 +709,16 @@ class TrainBiEncoderRecipe(BaseRecipe):
             per_query_loss = F.cross_entropy(scores, labels, reduction="none")
             loss = per_query_loss.mean()
 
+            has_nonfinite_loss = not _is_finite_value(loss)
+            if is_train:
+                if has_nonfinite_loss:
+                    self._log_nonfinite_loss(idx, loss)
+                has_nonfinite_loss = self._has_nonfinite_across_dp(has_nonfinite_loss)
+                if has_nonfinite_loss:
+                    if loss is not None:
+                        loss_buffer.append(loss.clone().detach())
+                    return True
+
             loss_buffer.append(loss.clone().detach())
             _append_modality_loss_stats(batch, per_query_loss, n_passages, modality_loss_buffers)
 
@@ -639,6 +727,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
                 # FSDP/DDP will handle averaging across DP ranks automatically
                 scaled_loss = loss / num_batches
                 scaled_loss.backward()
+        return False
 
     def _run_train_optim_step(self, batches, max_grad_norm=None):
         """Run one optimization step with gradient accumulation."""
@@ -646,46 +735,76 @@ class TrainBiEncoderRecipe(BaseRecipe):
         modality_loss_buffers = (
             {name: [] for name in PASSAGE_MODALITY_NAMES.values()} if self.log_modality_loss else None
         )
+        has_nonfinite_loss = False
         for idx, batch in enumerate(batches):
-            self._forward_backward_step(
-                idx,
-                batch,
-                loss_buffer=loss_buffer,
-                num_batches=len(batches),
-                is_train=True,
-                modality_loss_buffers=modality_loss_buffers,
+            has_nonfinite_loss = (
+                self._forward_backward_step(
+                    idx,
+                    batch,
+                    loss_buffer=loss_buffer,
+                    num_batches=len(batches),
+                    is_train=True,
+                    modality_loss_buffers=modality_loss_buffers,
+                )
+                or has_nonfinite_loss
             )
 
-        grad_norm = scale_grads_and_clip_grad_norm(
-            max_grad_norm,
-            self.model_parts,
-            norm_type=2.0,
-            pp_enabled=self.pp_enabled,
-            device_mesh=self.device_mesh,
-            moe_mesh=self.moe_mesh,
-            ep_axis_name="ep" if self.moe_mesh is not None and "ep" in self.moe_mesh.mesh_dim_names else None,
-            pp_axis_name="pp" if self.pp_enabled else None,
-            foreach=True,
-            num_label_tokens=None,  # Not applicable for encoder
-            dp_group_size=self._get_dp_group_size(include_cp=True),
-            use_torch_clip_grad_norm=isinstance(self.distributed_config, DDPConfig),
-        )
+        grad_norm = 0.0
+        skipped_update = has_nonfinite_loss
+        has_nonfinite_grad_norm = False
+        skip_reason = "a non-finite loss was detected on at least one data-parallel rank"
+        if not skipped_update:
+            grad_norm = scale_grads_and_clip_grad_norm(
+                max_grad_norm,
+                self.model_parts,
+                norm_type=2.0,
+                pp_enabled=self.pp_enabled,
+                device_mesh=self.device_mesh,
+                moe_mesh=self.moe_mesh,
+                ep_axis_name="ep" if self.moe_mesh is not None and "ep" in self.moe_mesh.mesh_dim_names else None,
+                pp_axis_name="pp" if self.pp_enabled else None,
+                foreach=True,
+                num_label_tokens=None,  # Not applicable for encoder
+                dp_group_size=self._get_dp_group_size(include_cp=True),
+                use_torch_clip_grad_norm=isinstance(self.distributed_config, DDPConfig),
+            )
+            local_nonfinite_grad_norm = not _is_finite_value(grad_norm)
+            if local_nonfinite_grad_norm:
+                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                logger.warning(
+                    "Non-finite retrieval grad norm detected at step %s epoch %s rank %s: grad_norm=%s",
+                    self.step_scheduler.step,
+                    self.step_scheduler.epoch,
+                    rank,
+                    grad_norm,
+                )
+            has_nonfinite_grad_norm = self._has_nonfinite_across_dp(local_nonfinite_grad_norm)
+            skipped_update = has_nonfinite_grad_norm
+            skip_reason = "a non-finite grad norm was detected on at least one data-parallel rank"
 
-        self.checkpointer.maybe_wait_for_staging()
         lr = self.optimizer[0].param_groups[0]["lr"]
-        for opt in self.optimizer:
-            opt.step()
-            opt.zero_grad()
+        if skipped_update:
+            self._log_skipped_train_update(skip_reason)
+            self._zero_optimizer_grads()
+        else:
+            self.checkpointer.maybe_wait_for_staging()
+            for opt in self.optimizer:
+                opt.step()
+                opt.zero_grad()
 
-        if self.lr_scheduler is not None:
-            for scheduler in self.lr_scheduler:
-                scheduler.step(1)
+            if self.lr_scheduler is not None:
+                for scheduler in self.lr_scheduler:
+                    scheduler.step(1)
 
-        # Average loss across gradient accumulation steps and DP ranks
-        reporting_loss = torch.mean(torch.stack(loss_buffer))
+        # Average finite losses across gradient accumulation steps and DP ranks.
+        losses = torch.stack(loss_buffer) if loss_buffer else torch.empty(0, device=self.dist_env.device)
+        finite_losses = torch.isfinite(losses)
+        loss_sum = losses[finite_losses].sum() if finite_losses.any() else torch.zeros((), device=losses.device)
+        loss_count = finite_losses.sum().to(device=loss_sum.device, dtype=loss_sum.dtype)
         if torch.distributed.is_initialized():
-            reporting_loss = self._dp_allreduce(reporting_loss, include_cp=True)
-            reporting_loss = reporting_loss / self._get_dp_group_size(include_cp=True)
+            loss_sum = self._dp_allreduce(loss_sum, include_cp=True)
+            loss_count = self._dp_allreduce(loss_count, include_cp=True)
+        reporting_loss = loss_sum / loss_count if loss_count.item() > 0 else torch.zeros((), device=loss_sum.device)
         reporting_loss = reporting_loss.cpu().item()
         self.loss_average_window.append(reporting_loss)
         average_loss = sum(self.loss_average_window) / len(self.loss_average_window)
@@ -696,10 +815,13 @@ class TrainBiEncoderRecipe(BaseRecipe):
         metrics = {
             "loss": reporting_loss,
             "loss_avg_window": average_loss,
-            "grad_norm": grad_norm,
+            "grad_norm": 0.0 if has_nonfinite_grad_norm else grad_norm,
             "lr": lr,
             "mem": mem_allocated,
             "time_per_step": elapsed,
+            "skipped_update": float(skipped_update),
+            "nonfinite_loss_microbatches": float(sum(not _is_finite_value(loss) for loss in loss_buffer)),
+            "nonfinite_grad_norm": float(has_nonfinite_grad_norm),
         }
         if modality_loss_buffers is not None:
             for modality, stats_buffer in modality_loss_buffers.items():
@@ -831,7 +953,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
         logging.info(
             (
                 "step {} | epoch {} | loss {:.4f} | loss_avg_window {:.4f} | "
-                "grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | time {:.2f}s{}"
+                "grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | time {:.2f}s | skipped_update {:.0f}{}"
             ).format(
                 log_data.step,
                 log_data.epoch,
@@ -841,6 +963,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
                 log_data.metrics["lr"],
                 log_data.metrics["mem"],
                 log_data.metrics["time_per_step"],
+                log_data.metrics.get("skipped_update", 0.0),
                 modality_loss_log,
             )
         )

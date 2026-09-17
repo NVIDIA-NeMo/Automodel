@@ -16,6 +16,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers import AutoConfig, AutoModel, AutoModelForSequenceClassification
 from transformers import initialization as init
 from transformers.cache_utils import Cache
@@ -345,6 +346,7 @@ class Mistral3VLBidirectionalForSequenceClassification(Mistral3PreTrainedModel):
 
     config_class = Mistral3BidirectionalConfig
     base_model_prefix = "model"
+    _nemo_fsdp_output_dtype = torch.float32
 
     @dataclass(frozen=True)
     class ModelCapabilities:
@@ -486,7 +488,15 @@ class Mistral3VLBidirectionalForSequenceClassification(Mistral3PreTrainedModel):
             attention_mask=attention_mask,
             pool_type=self.config.pooling,
         )
-        logits = self.score(pooled_hidden_states) / self.config.temperature
+        with torch.autocast(
+            device_type=pooled_hidden_states.device.type,
+            enabled=False,
+        ):
+            raw_logits = F.linear(
+                pooled_hidden_states.float(),
+                self.score.weight.float(),
+            )
+        logits = raw_logits / self.config.temperature
 
         if not return_dict:
             return (logits,) + outputs[1:]

@@ -250,18 +250,34 @@ def test_retrieval_model_instantiate_kwargs_include_freeze_config():
 
 
 class _FakeCheckpointer:
+    def __init__(self):
+        self.wait_calls = 0
+
     def maybe_wait_for_staging(self):
-        pass
+        self.wait_calls += 1
 
 
 class _FakeOptimizer:
     param_groups = [{"lr": 1e-5}]
 
+    def __init__(self):
+        self.step_calls = 0
+        self.zero_grad_calls = 0
+
     def step(self):
-        pass
+        self.step_calls += 1
 
     def zero_grad(self):
-        pass
+        self.zero_grad_calls += 1
+
+
+class _FakeLRScheduler:
+    def __init__(self):
+        self.step_calls = 0
+
+    def step(self, increment):
+        assert increment == 1
+        self.step_calls += 1
 
 
 class _FakeStepScheduler:
@@ -278,8 +294,9 @@ def _make_recipe_for_optim_step(distributed_config):
     recipe.moe_mesh = None
     recipe.checkpointer = _FakeCheckpointer()
     recipe.optimizer = [_FakeOptimizer()]
-    recipe.lr_scheduler = None
+    recipe.lr_scheduler = [_FakeLRScheduler()]
     recipe.step_scheduler = _FakeStepScheduler()
+    recipe.dist_env = SimpleNamespace(device=torch.device("cpu"), is_main=True)
     recipe.loss_average_window = deque(maxlen=50)
     recipe.log_modality_loss = False
     recipe.timestamp = 0.0
@@ -287,6 +304,7 @@ def _make_recipe_for_optim_step(distributed_config):
 
     def _fake_forward_backward_step(*args, **kwargs):
         kwargs["loss_buffer"].append(torch.tensor(1.0))
+        return False
 
     recipe._forward_backward_step = _fake_forward_backward_step
     return recipe
@@ -320,3 +338,59 @@ def test_retrieval_optim_step_keeps_sharded_clip_path_for_fsdp2(monkeypatch):
     recipe._run_train_optim_step([{}], max_grad_norm=1.0)
 
     assert captured["use_torch_clip_grad_norm"] is False
+
+
+def test_retrieval_optim_step_updates_on_finite_values(monkeypatch):
+    recipe = _make_recipe_for_optim_step(FSDP2Config())
+    monkeypatch.setattr(train_bi_encoder, "scale_grads_and_clip_grad_norm", lambda *args, **kwargs: 0.5)
+
+    metrics = recipe._run_train_optim_step([{}], max_grad_norm=1.0).metrics
+
+    assert recipe.optimizer[0].step_calls == 1
+    assert recipe.optimizer[0].zero_grad_calls == 1
+    assert recipe.lr_scheduler[0].step_calls == 1
+    assert recipe.checkpointer.wait_calls == 1
+    assert metrics["loss"] == 1.0
+    assert metrics["grad_norm"] == 0.5
+    assert metrics["skipped_update"] == 0.0
+
+
+def test_retrieval_optim_step_skips_nonfinite_loss(monkeypatch):
+    recipe = _make_recipe_for_optim_step(FSDP2Config())
+
+    def _nonfinite_forward(*args, **kwargs):
+        kwargs["loss_buffer"].append(torch.tensor(float("nan")))
+        return True
+
+    def _unexpected_clip(*args, **kwargs):
+        raise AssertionError("gradient clipping must not run after a non-finite loss")
+
+    recipe._forward_backward_step = _nonfinite_forward
+    monkeypatch.setattr(train_bi_encoder, "scale_grads_and_clip_grad_norm", _unexpected_clip)
+
+    metrics = recipe._run_train_optim_step([{}], max_grad_norm=1.0).metrics
+
+    assert recipe.optimizer[0].step_calls == 0
+    assert recipe.optimizer[0].zero_grad_calls == 1
+    assert recipe.lr_scheduler[0].step_calls == 0
+    assert recipe.checkpointer.wait_calls == 0
+    assert metrics["loss"] == 0.0
+    assert metrics["skipped_update"] == 1.0
+    assert metrics["nonfinite_loss_microbatches"] == 1.0
+    assert metrics["nonfinite_grad_norm"] == 0.0
+
+
+def test_retrieval_optim_step_skips_nonfinite_grad_norm(monkeypatch):
+    recipe = _make_recipe_for_optim_step(FSDP2Config())
+    monkeypatch.setattr(train_bi_encoder, "scale_grads_and_clip_grad_norm", lambda *args, **kwargs: float("inf"))
+
+    metrics = recipe._run_train_optim_step([{}], max_grad_norm=1.0).metrics
+
+    assert recipe.optimizer[0].step_calls == 0
+    assert recipe.optimizer[0].zero_grad_calls == 1
+    assert recipe.lr_scheduler[0].step_calls == 0
+    assert recipe.checkpointer.wait_calls == 0
+    assert metrics["loss"] == 1.0
+    assert metrics["grad_norm"] == 0.0
+    assert metrics["skipped_update"] == 1.0
+    assert metrics["nonfinite_grad_norm"] == 1.0

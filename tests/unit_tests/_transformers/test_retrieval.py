@@ -209,6 +209,8 @@ def test_mistral_vlm_reranker_load_restores_all_backbone_weights(tmp_path):
     )
 
     assert isinstance(reranker, Mistral3VLBidirectionalForSequenceClassification)
+    cross_encoder = retrieval.CrossEncoderModel(reranker)
+    assert cross_encoder._nemo_fsdp_output_dtype == torch.float32
     source_state = source.state_dict()
     reranker_state = reranker.state_dict()
     for source_key, source_weight in source_state.items():
