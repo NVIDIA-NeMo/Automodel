@@ -47,6 +47,15 @@ if TYPE_CHECKING:
     from .masked_ce import MaskedCrossEntropy
     from .mtp import MTPLossConfig, calculate_mtp_loss
     from .soft_ce import masked_soft_cross_entropy
+    from .utils import (
+        _count_label_tokens as count_label_tokens,
+    )
+    from .utils import (
+        _get_loss_ignore_index as get_loss_ignore_index,
+    )
+    from .utils import (
+        _normalize_kd_labels as normalize_kd_labels,
+    )
     from .utils import calculate_loss, get_lm_head_weight
 
 __all__ = [
@@ -81,10 +90,13 @@ _LAZY_ATTRS = {
     "ScoreDistillLoss": (".embedding_distill", "ScoreDistillLoss"),
     "calculate_loss": (".utils", "calculate_loss"),
     "calculate_mtp_loss": (".mtp", "calculate_mtp_loss"),
+    "count_label_tokens": (".utils", "_count_label_tokens"),
     "encoder_ar_loss": (".dllm_loss", "encoder_ar_loss"),
     "get_lm_head_weight": (".utils", "get_lm_head_weight"),
+    "get_loss_ignore_index": (".utils", "_get_loss_ignore_index"),
     "listmle_loss": (".listmle", "listmle_loss"),
     "masked_soft_cross_entropy": (".soft_ce", "masked_soft_cross_entropy"),
+    "normalize_kd_labels": (".utils", "_normalize_kd_labels"),
     "scdd_schedule": (".dllm_loss", "scdd_schedule"),
 }
 

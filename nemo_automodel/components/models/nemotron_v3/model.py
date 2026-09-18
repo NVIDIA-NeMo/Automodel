@@ -19,7 +19,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoConfig
-from transformers.generation import GenerationConfig, GenerationMixin
+from transformers.generation import GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel._transformers.model_capabilities import ModelCapabilities
@@ -37,7 +37,12 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
-from nemo_automodel.components.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
+from nemo_automodel.components.models.common.utils import (
+    cast_model_to_dtype,
+    compute_lm_head_logits,
+    generation_config_from_model_config,
+    restore_pretrained_generation_config,
+)
 from nemo_automodel.components.models.nemotron_v3.layers import NemotronV3Block
 from nemo_automodel.components.models.nemotron_v3.mtp import (
     _resolve_block_types_per_sublayer,
@@ -381,7 +386,11 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             NemotronHForCausalLM instance
         """
         config = AutoConfig.from_pretrained(pretrained_model_name_or_path, trust_remote_code=True)
-        return cls.from_config(config, *model_args, **kwargs)
+        model = cls.from_config(config, *model_args, **kwargs)
+        # The checkpoint's own generation settings win over the config-derived
+        # defaults, as in PreTrainedModel.from_pretrained.
+        restore_pretrained_generation_config(model, pretrained_model_name_or_path)
+        return model
 
     def __init__(
         self,
@@ -472,8 +481,11 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
                 dtype=dtype,
             )
 
-        # Required by GenerationMixin.generate().
-        self.generation_config = GenerationConfig()
+        # Required by GenerationMixin.generate(). Seeded from the model config like
+        # PreTrainedModel does, so eos/bos/pad are set: the consolidated export writes
+        # this object to generation_config.json, and a blank one there leaves the
+        # exported model with no stop token.
+        self.generation_config = generation_config_from_model_config(config)
 
     @property
     def device(self) -> torch.device:

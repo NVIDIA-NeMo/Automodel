@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 from nemo_automodel.components.training.step_scheduler import StepSchedulerConfig
 
 if TYPE_CHECKING:
+    from .domain_mixture import WEIGHTED_AGGREGATE_NAME, DomainMixtureConfig, DomainWeightConfig
     from .ema import EMAManager, ShardedModelEMAManager
     from .embedding_row_repair import EmbeddingRowRepairConfig
     from .garbage_collection import GarbageCollection
@@ -45,6 +46,8 @@ __all__ = ["StepSchedulerConfig"]
 
 _LAZY_ATTRS = {
     "DistributedSignalHandler": (".signal_handler", "DistributedSignalHandler"),
+    "DomainMixtureConfig": (".domain_mixture", "DomainMixtureConfig"),
+    "DomainWeightConfig": (".domain_mixture", "DomainWeightConfig"),
     "EMAManager": (".ema", "EMAManager"),
     "EmbeddingRowRepairConfig": (".embedding_row_repair", "EmbeddingRowRepairConfig"),
     "GarbageCollection": (".garbage_collection", "GarbageCollection"),
@@ -56,6 +59,7 @@ _LAZY_ATTRS = {
     "StatefulRNG": (".rng", "StatefulRNG"),
     "StepScheduler": (".step_scheduler", "StepScheduler"),
     "Timers": (".timers", "Timers"),
+    "WEIGHTED_AGGREGATE_NAME": (".domain_mixture", "WEIGHTED_AGGREGATE_NAME"),
     "clip_grad_norm": (".utils", "clip_grad_norm"),
     "count_tail_padding": (".utils", "count_tail_padding"),
     "get_expert_tp_replication_factor": (".utils", "get_expert_tp_replication_factor"),

@@ -87,7 +87,9 @@ if TYPE_CHECKING:
         write_shard as eagle3_write_shard,
     )
     from .llm.formatting_utils import has_chat_template, resolve_chat_template
+    from .llm.megatron.megatron_utils import get_blend_from_list
     from .llm.megatron.sampler import MegatronSamplerConfig
+    from .llm.megatron_dataset import MegatronPretrainingConfig
     from .llm.offline_cache import (
         dataloader_from_sample,
         ensure_supervision_options_match,
@@ -124,6 +126,7 @@ _LAZY_ATTRS = {
     "DatasetBuildSchedule": (".loader", "DatasetBuildSchedule"),
     "EAGLE3_DTYPE_MAP": (".llm.eagle3_cache", "DTYPE_MAP"),
     "MegatronSamplerConfig": (".llm.megatron.sampler", "MegatronSamplerConfig"),
+    "MegatronPretrainingConfig": (".llm.megatron_dataset", "MegatronPretrainingConfig"),
     "MetaFilesDataloaderConfig": (".diffusion.meta_files_dataset", "MetaFilesDataloaderConfig"),
     "MockWanDataloaderConfig": (".diffusion.mock_dataloader", "MockWanDataloaderConfig"),
     "NeatPackConfig": (".vlm.neat_packing_vlm", "NeatPackConfig"),
@@ -163,6 +166,7 @@ _LAZY_ATTRS = {
     "eagle3_write_manifest": (".llm.eagle3_cache", "write_manifest"),
     "eagle3_write_shard": (".llm.eagle3_cache", "write_shard"),
     "ensure_supervision_options_match": (".llm.offline_cache", "ensure_supervision_options_match"),
+    "get_blend_from_list": (".llm.megatron.megatron_utils", "get_blend_from_list"),
     "has_chat_template": (".llm.formatting_utils", "has_chat_template"),
     "is_compressed": (".llm.eagle3_cache", "is_compressed"),
     "load_datasets": (".llm.retrieval_dataset", "load_datasets"),

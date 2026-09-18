@@ -14,10 +14,15 @@
 
 import sys
 import types
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from unittest.mock import MagicMock, patch
 
 import pytest
+
+# torch.utils.checkpoint.create_selective_checkpoint_contexts returns
+# ``(forward_ctx, recompute_ctx)``, and apply_ac's context wrappers unpack it,
+# so the stubs below must return a pair rather than a bare sentinel.
+SELECTIVE_CTX = ("CTX_FORWARD", "CTX_RECOMPUTE")
 
 
 class DummyParam:
@@ -258,7 +263,7 @@ def _install_torch_and_layers_stubs(monkeypatch):
         PREFER_RECOMPUTE = 2
 
     def create_selective_checkpoint_contexts(policy_factory):
-        return "CTX"
+        return SELECTIVE_CTX
 
     utils_checkpoint_stub.CheckpointPolicy = CheckpointPolicy
     utils_checkpoint_stub._allowed_determinism_checks_to_fns = {"default": object(), "none": object()}
@@ -482,6 +487,31 @@ def _import_parallelizer_with_stubs(monkeypatch):
         sys.modules,
         "nemo_automodel.components.distributed.activation_checkpointing",
         activation_checkpointing_stub,
+    )
+
+    # apply_ac wraps each block's context in the DeepEP dispatch-replay recorder,
+    # which imports fused_a2a lazily. Stub it so this module does not depend on
+    # some earlier test having imported it under the real torch.
+    fused_a2a_stub = types.ModuleType("nemo_automodel.components.moe.megatron.fused_a2a")
+
+    class _StubDispatchReplayRecorder:
+        def __init__(self):
+            self.replay_misses = 0
+            self.rewind_count = 0
+
+        def rewind(self):
+            self.rewind_count += 1
+
+    @contextmanager
+    def _stub_dispatch_replay_scope(recorder, mode):
+        yield
+
+    fused_a2a_stub.DispatchReplayRecorder = _StubDispatchReplayRecorder
+    fused_a2a_stub.dispatch_replay_scope = _stub_dispatch_replay_scope
+    monkeypatch.setitem(
+        sys.modules,
+        "nemo_automodel.components.moe.megatron.fused_a2a",
+        fused_a2a_stub,
     )
 
     distributed_config_stub = types.ModuleType("nemo_automodel.components.distributed.config")
@@ -806,7 +836,7 @@ def test_apply_ac_wraps_blocks_with_and_without_context(monkeypatch):
         return wrapper_returns.pop(0)
 
     wrapper_mock = MagicMock(side_effect=fake_wrapper)
-    ctx_mock = MagicMock(return_value="CTX")
+    ctx_mock = MagicMock(return_value=SELECTIVE_CTX)
     monkeypatch.setattr(P, "ptd_checkpoint_wrapper", wrapper_mock)
     monkeypatch.setattr(P, "create_selective_checkpoint_contexts", ctx_mock)
 
@@ -859,7 +889,7 @@ def test_apply_ac_skips_model_owned_eager_block(monkeypatch, selective):
 def test_apply_ac_warns_when_router_is_recomputed(monkeypatch):
     P = _import_parallelizer_with_stubs(monkeypatch)
     monkeypatch.setattr(P, "ptd_checkpoint_wrapper", MagicMock(side_effect=lambda block, **kw: block))
-    monkeypatch.setattr(P, "create_selective_checkpoint_contexts", MagicMock(return_value="CTX"))
+    monkeypatch.setattr(P, "create_selective_checkpoint_contexts", MagicMock(return_value=SELECTIVE_CTX))
     logger_mock = MagicMock()
     monkeypatch.setattr(P, "logger", logger_mock)
 
@@ -872,6 +902,38 @@ def test_apply_ac_warns_when_router_is_recomputed(monkeypatch):
     logger_mock.reset_mock()
     P.apply_ac(DummyModel([DummyBlock()]), ignore_router=True, hidden_size=7168, num_experts=256)
     logger_mock.warning.assert_not_called()
+
+
+@pytest.mark.parametrize("selective", [False, True])
+def test_apply_ac_replays_hybridep_layout_for_full_and_selective_ac(monkeypatch, selective):
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    expert = P.GroupedExpertsDeepEP()
+    expert.dispatcher_backend = "hybridep"
+
+    class HybridEPModel(DummyModel):
+        def modules(self):
+            return iter((self, expert))
+
+    if selective:
+        activation_checkpointing_stub = sys.modules["nemo_automodel.components.distributed.activation_checkpointing"]
+        activation_checkpointing_stub.make_selective_checkpoint_context_fn = lambda: (
+            lambda: (nullcontext(), nullcontext())
+        )
+        activation_checkpointing_stub.SELECTIVE_AC_WRAPPER_FLAG = "_nemo_selective_ac"
+
+    replay_wrapper = MagicMock(side_effect=lambda context_fn: context_fn)
+    monkeypatch.setattr(P, "_replay_hybridep_dispatch_on_recompute", replay_wrapper)
+    monkeypatch.setattr(P, "ptd_checkpoint_wrapper", MagicMock(side_effect=lambda block, **kwargs: block))
+
+    P.apply_ac(
+        HybridEPModel([DummyBlock()]),
+        ignore_router=True,
+        hidden_size=7168,
+        num_experts=384,
+        selective=selective,
+    )
+
+    replay_wrapper.assert_called_once()
 
 
 def test_apply_ac_uses_generic_wrapper_even_when_block_local_checkpointing_is_available(monkeypatch):
@@ -908,12 +970,16 @@ def test_apply_ac_custom_policy_saves_router_projection_and_topk(monkeypatch):
     def fake_create_selective_checkpoint_contexts(policy_cb):
         nonlocal captured_policy
         captured_policy = policy_cb
-        return "CTX"
+        return SELECTIVE_CTX
 
     def fake_wrapper(block, preserve_rng_state, determinism_check=None, context_fn=None):
         assert preserve_rng_state is True
         assert callable(context_fn)
-        assert context_fn() == "CTX"
+        # The selective contexts are wrapped for DeepEP dispatch replay, so what
+        # comes back is the wrapper's pair rather than SELECTIVE_CTX itself.
+        forward_ctx, recompute_ctx = context_fn()
+        assert hasattr(forward_ctx, "__enter__")
+        assert hasattr(recompute_ctx, "__enter__")
         return block
 
     monkeypatch.setattr(P, "create_selective_checkpoint_contexts", fake_create_selective_checkpoint_contexts)
@@ -2091,22 +2157,19 @@ def test_apply_fsdp_without_lm_head_precision_uses_default_policy(monkeypatch):
     assert mp_policy_mock.call_count == 1
 
 
-def test_apply_fsdp_uses_dsv4_wrapper_only_for_deepseek_v4(monkeypatch):
-    """DeepSeek-V4 gets its model-specific dtype wrapper without changing generic MoE FSDP."""
+@pytest.mark.parametrize("model_owned_sharding", [False, True])
+def test_apply_fsdp_uses_model_wrapper_or_default(monkeypatch: pytest.MonkeyPatch, model_owned_sharding: bool) -> None:
+    """Language and multimodal units share one model-selected FSDP callback."""
     P = _import_parallelizer_with_stubs(monkeypatch)
     monkeypatch.setattr(P, "MoE", DummyMoE)
-
-    fully_shard_mock = MagicMock()
-    monkeypatch.setattr(P, "fully_shard", fully_shard_mock)
-
-    dsv4_fsdp_stub = types.ModuleType("nemo_automodel.components.models.deepseek_v4.fsdp")
-    dsv4_fully_shard_mock = MagicMock()
-    dsv4_fsdp_stub.fully_shard_deepseek_v4 = dsv4_fully_shard_mock
-    monkeypatch.setitem(sys.modules, "nemo_automodel.components.models.deepseek_v4.fsdp", dsv4_fsdp_stub)
-
+    default_shard = MagicMock()
+    model_shard = MagicMock()
+    monkeypatch.setattr(P, "fully_shard", default_shard)
     block = DummyBlock(mlp=DummyMoE())
     model = DummyModel([block])
-    model.config = types.SimpleNamespace(model_type="deepseek_v4")
+    model.visual = DummyExperts()
+    if model_owned_sharding:
+        model._nemo_fully_shard = model_shard
 
     P.apply_fsdp(
         model=model,
@@ -2116,8 +2179,11 @@ def test_apply_fsdp_uses_dsv4_wrapper_only_for_deepseek_v4(monkeypatch):
         lm_head_precision=None,
     )
 
-    assert _find_call_by_first_arg(dsv4_fully_shard_mock, block) is not None
-    assert _find_call_by_first_arg(fully_shard_mock, block) is None
+    selected = model_shard if model_owned_sharding else default_shard
+    other = default_shard if model_owned_sharding else model_shard
+    for module in (block, model.visual, model):
+        assert _find_call_by_first_arg(selected, module) is not None
+        assert _find_call_by_first_arg(other, module) is None
 
 
 def test_parallelize_model_passes_lm_head_precision_to_apply_fsdp(monkeypatch):
@@ -2439,7 +2505,7 @@ def test_apply_ac_derives_hidden_size_and_num_experts_from_config(monkeypatch):
                     break
             if captured_hidden_size is not None:
                 break
-        return "CTX"
+        return SELECTIVE_CTX
 
     def fake_wrapper(block, preserve_rng_state, determinism_check=None, context_fn=None):
         if context_fn is not None:
@@ -2515,7 +2581,7 @@ def test_apply_ac_derives_num_experts_from_num_local_experts(monkeypatch):
             result = policy_cb(None, torch_stub.ops.aten.mm.default, object(), rhs)
             if result == P.CheckpointPolicy.MUST_SAVE:
                 captured_num_experts = ne
-        return "CTX"
+        return SELECTIVE_CTX
 
     def fake_wrapper(block, preserve_rng_state, determinism_check=None, context_fn=None):
         if context_fn is not None:
@@ -2557,7 +2623,7 @@ def test_apply_ac_accepts_explicit_hidden_size_and_num_experts(monkeypatch):
         if result == P.CheckpointPolicy.MUST_SAVE:
             captured_hidden_size = 512
             captured_num_experts = 32
-        return "CTX"
+        return SELECTIVE_CTX
 
     def fake_wrapper(block, preserve_rng_state, determinism_check=None, context_fn=None):
         if context_fn is not None:
@@ -2596,7 +2662,7 @@ def test_apply_ac_explicit_params_override_config(monkeypatch):
         if result == P.CheckpointPolicy.MUST_SAVE:
             captured_hidden_size = 1024
             captured_num_experts = 64
-        return "CTX"
+        return SELECTIVE_CTX
 
     def fake_wrapper(block, preserve_rng_state, determinism_check=None, context_fn=None):
         if context_fn is not None:
@@ -2644,7 +2710,7 @@ def test_apply_ac_derives_from_llm_config(monkeypatch):
                     break
             if captured_hidden_size is not None:
                 break
-        return "CTX"
+        return SELECTIVE_CTX
 
     def fake_wrapper(block, preserve_rng_state, determinism_check=None, context_fn=None):
         if context_fn is not None:
@@ -2692,7 +2758,7 @@ def test_apply_ac_text_config_takes_priority_over_llm_config(monkeypatch):
                     break
             if captured_hidden_size is not None:
                 break
-        return "CTX"
+        return SELECTIVE_CTX
 
     monkeypatch.setattr(P, "create_selective_checkpoint_contexts", fake_create_selective_checkpoint_contexts)
     monkeypatch.setattr(
@@ -2751,7 +2817,7 @@ def test_apply_ac_routes_through_get_text_module(monkeypatch):
         return m.language_model if hasattr(m, "language_model") else m
 
     monkeypatch.setattr(P, "get_text_module", vlm_get_text_module)
-    monkeypatch.setattr(P, "create_selective_checkpoint_contexts", MagicMock(return_value="CTX"))
+    monkeypatch.setattr(P, "create_selective_checkpoint_contexts", MagicMock(return_value=SELECTIVE_CTX))
     monkeypatch.setattr(P, "ptd_checkpoint_wrapper", MagicMock(side_effect=lambda b, **kw: b))
 
     lm_blocks = [DummyBlock(), DummyBlock()]
@@ -3060,7 +3126,7 @@ def test_apply_ac_derives_num_experts_from_moe_num_experts(monkeypatch):
             if result == P.CheckpointPolicy.MUST_SAVE:
                 captured_num_experts = ne
                 break
-        return "CTX"
+        return SELECTIVE_CTX
 
     def fake_wrapper(block, preserve_rng_state, determinism_check=None, context_fn=None):
         if context_fn is not None:
@@ -3103,7 +3169,7 @@ def test_apply_ac_prefers_num_experts_over_moe_num_experts(monkeypatch):
             if result == P.CheckpointPolicy.MUST_SAVE:
                 captured_num_experts = ne
                 break
-        return "CTX"
+        return SELECTIVE_CTX
 
     def fake_wrapper(block, preserve_rng_state, determinism_check=None, context_fn=None):
         if context_fn is not None:
@@ -3147,7 +3213,7 @@ def test_apply_ac_derives_num_experts_from_moe_config(monkeypatch):
             if result == P.CheckpointPolicy.MUST_SAVE:
                 captured_num_experts = ne
                 break
-        return "CTX"
+        return SELECTIVE_CTX
 
     def fake_wrapper(block, preserve_rng_state, determinism_check=None, context_fn=None):
         if context_fn is not None:
@@ -3195,7 +3261,7 @@ def test_apply_ac_prefers_moe_config_over_config_attrs(monkeypatch):
             if result == P.CheckpointPolicy.MUST_SAVE:
                 captured_num_experts = ne
                 break
-        return "CTX"
+        return SELECTIVE_CTX
 
     def fake_wrapper(block, preserve_rng_state, determinism_check=None, context_fn=None):
         if context_fn is not None:
@@ -3396,7 +3462,7 @@ def test_apply_ac_derives_hidden_size_and_num_experts_from_text_config(monkeypat
                     break
             if captured_hidden_size is not None:
                 break
-        return "CTX"
+        return SELECTIVE_CTX
 
     def fake_wrapper(block, preserve_rng_state, determinism_check=None, context_fn=None):
         if context_fn is not None:

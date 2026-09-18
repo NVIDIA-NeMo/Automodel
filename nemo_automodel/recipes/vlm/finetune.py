@@ -85,7 +85,13 @@ from nemo_automodel.components.loss import (
     calculate_loss,
     calculate_mtp_loss,
 )
+from nemo_automodel.components.loss import (
+    count_label_tokens as _count_label_tokens,
+)
 from nemo_automodel.components.loss import get_lm_head_weight as _get_lm_head_weight
+from nemo_automodel.components.loss import (
+    get_loss_ignore_index as _get_loss_ignore_index,
+)
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
 from nemo_automodel.components.training import (
     ScopedRNG,
@@ -577,7 +583,10 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
         if not _supports_logits_to_keep(model) and not isinstance(self.loss_fn, MaskedCrossEntropy):
             logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
-            self.loss_fn = MaskedCrossEntropy()
+            self.loss_fn = MaskedCrossEntropy(
+                ignore_index=_get_loss_ignore_index(self.loss_fn),
+                reduction=getattr(self.loss_fn, "reduction", "sum"),
+            )
 
         if isinstance(model, AutoPipeline):
             self.model_parts = model.parts
@@ -907,6 +916,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             invoke_pre_embed=True,
         )
         model = self.model_parts[0]
+        ignore_index = _get_loss_ignore_index(getattr(self, "loss_fn", None))
         mtp_cp_enabled = _cp_active and not self.pp_enabled and model.supports.mtp_enabled
         mtp_cp_inputs = None
         if mtp_cp_enabled:
@@ -917,7 +927,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 )
             mtp_cp_inputs = model.prepare_mtp_inputs_for_cp(
                 batch,
-                ignore_index=self.cfg.mtp.ignore_index,
+                ignore_index=ignore_index,
             )
         train_ctx, batch = cp_sharder.shard(batch)
         mtp_per_depth_targets = None
@@ -933,7 +943,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 cp_sharder.shard_token_tensor(mask, seq_dim=1, fill=False) for mask in mtp_cp_inputs.valid_masks
             )
             mtp_per_depth_targets = tuple(
-                cp_sharder.shard_token_tensor(targets, seq_dim=1, fill=self.cfg.mtp.ignore_index)
+                cp_sharder.shard_token_tensor(targets, seq_dim=1, fill=ignore_index)
                 for targets in mtp_cp_inputs.targets
             )
         labels = batch.pop("labels")
@@ -1028,7 +1038,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                         model=model,
                         scaling_factor=scaling_factor,
                         num_label_tokens=num_label_tokens,
-                        ignore_index=mtp_cfg.ignore_index,
+                        ignore_index=ignore_index,
                         lm_weight=shared_lm_weight,
                         grad_reduce_group=grad_reduce_group,
                         cu_seqlens=None if mtp_per_depth_targets is not None else batch.get("cu_seqlens"),
@@ -1081,8 +1091,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
             batches: List of batches of training data.
             max_grad_norm: Gradient clipping norm. Optional, if None will not clip gradients.
         """
+        ignore_index = _get_loss_ignore_index(getattr(self, "loss_fn", None))
         num_label_tokens = torch.tensor(
-            sum((batch["labels"] != -100).sum().item() for batch in batches), dtype=torch.long
+            sum(_count_label_tokens(batch["labels"], ignore_index) for batch in batches), dtype=torch.long
         )
         num_label_tokens = self._dp_allreduce(num_label_tokens).item()
 
@@ -1125,6 +1136,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             num_label_tokens=num_label_tokens,
             dp_group_size=self._get_dp_group_size(include_cp=True),
             expert_tp_replication_factor=get_expert_tp_replication_factor(self.model_parts, self.device_mesh),
+            grad_norm_backend=self.cfg.get("clip_grad_norm.backend", "triton"),
         )
 
         # Note(MegatronFSDP): Need to call these functions for MegatronFSDP if not using latest api
@@ -1221,7 +1233,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     k: (v.to(self.dist_env.device, non_blocking=True) if isinstance(v, torch.Tensor) else v)
                     for k, v in batch.items()
                 }
-                num_label_tokens = (batch["labels"] != -100).sum().item()
+                num_label_tokens = _count_label_tokens(
+                    batch["labels"], _get_loss_ignore_index(getattr(self, "loss_fn", None))
+                )
 
                 cp_sharder = ContextParallelSharder(
                     self.model_parts[0],

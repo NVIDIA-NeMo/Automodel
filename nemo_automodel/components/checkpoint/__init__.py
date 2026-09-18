@@ -19,7 +19,7 @@ from ._torch_backports import apply_patches as _nemo__apply_patches
 from .config import CheckpointingConfig, _is_geq_torch_2_9, _is_leq_torch_2_7_1
 
 if TYPE_CHECKING:
-    from .addons import save_generated_hf_assets
+    from .addons import ConsolidatedHFAddon, save_generated_hf_assets
     from .checkpointing import (
         Checkpointer,
         load_full_state_dict_into_model,
@@ -30,7 +30,8 @@ if TYPE_CHECKING:
         save_config,
         save_losses,
     )
-    from .state_dict_adapter import StateDictAdapter
+    from .state_dict_adapter import CheckpointLoadPart, StateDictAdapter
+    from .stateful_wrappers import ModelState
     from .utils import (
         find_latest_checkpoint,
         get_checkpoint_tensor_dtypes,
@@ -47,6 +48,9 @@ if _is_geq_torch_2_9():
 
 _LAZY_ATTRS = {
     "Checkpointer": (".checkpointing", "Checkpointer"),
+    "CheckpointLoadPart": (".state_dict_adapter", "CheckpointLoadPart"),
+    "ConsolidatedHFAddon": (".addons", "ConsolidatedHFAddon"),
+    "ModelState": (".stateful_wrappers", "ModelState"),
     "StateDictAdapter": (".state_dict_adapter", "StateDictAdapter"),
     "find_latest_checkpoint": (".utils", "find_latest_checkpoint"),
     "get_checkpoint_tensor_dtypes": (".utils", "get_checkpoint_tensor_dtypes"),
