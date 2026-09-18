@@ -123,11 +123,11 @@ ci:
     # Fixed attention makes AutoModel reload exact; source parity also passes standard.
     parity_tolerance_profile_overrides:
       hf_reload: relaxed
-    # Native HF PEFT reached mean KL 0.02606 while AutoModel reload remained exact.
-    # H100 replay: all 603 parameter tensors matched; aligning norm, attention,
-    # expert arithmetic/EP reduction, and RoPE made all 2048-token logits exact
-    # (native HF mean KL 0.02154). Allow numerical drift amplified by MoE routing;
-    # retain native HF inference and the relaxed p95/cosine limits.
+    # On a saved adapter, replaying AutoModel's expert selections in native HF
+    # reduced mean KL from 0.02154 to 0.00209, retaining HF's own routing scores
+    # and operators. All 603 parameter tensors matched: differing expert choices
+    # amplify numerical drift. The failing HF nightly reached 0.02606, so allow
+    # mean KL 0.03; keep native routing and the relaxed p95/cosine gates in CI.
     parity_threshold_overrides:
       hf_reload:
         mean_kl: 0.03
