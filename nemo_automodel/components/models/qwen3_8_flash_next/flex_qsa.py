@@ -71,6 +71,39 @@ def _routes_to_membership(
     return membership, has_routes
 
 
+def _membership_flat_offset(
+    batch_idx: torch.Tensor,
+    query_idx: torch.Tensor,
+    kv_idx: torch.Tensor,
+    query_length: int,
+    kv_length: int,
+) -> torch.Tensor:
+    """Flat offset into a ``[B, S_q, kv_length]`` membership table, evaluated in int64.
+
+    FlexAttention inlines ``mask_mod`` into its Triton template and emits that
+    inlined index arithmetic in int32. The membership table crosses
+    ``INT32_MAX`` once ``B * S_q * kv_length > 2**31`` -- a square 46341-token
+    sequence is already past it -- and from that point ``query_idx * kv_length``
+    wraps negative inside the kernel. The wrapped address still lands in mapped
+    memory for a while, so the tail queries silently read a wrong mask before
+    the failure escalates to ``CUDA error: an illegal memory access`` at larger
+    sequence lengths. Widening the operands here keeps the generated address
+    arithmetic in int64.
+
+    Args:
+        batch_idx: Scalar batch coordinate supplied by FlexAttention.
+        query_idx: Scalar query coordinate, already clamped in range.
+        kv_idx: Scalar key/value coordinate, already clamped in range.
+        query_length: Number of query rows in the membership table.
+        kv_length: Number of physical K/V rows in the membership table.
+
+    Returns:
+        int64 offset of ``[batch_idx, query_idx, kv_idx]`` in the flattened table.
+    """
+    flat_query = batch_idx.to(torch.int64) * query_length + query_idx.to(torch.int64)
+    return flat_query * kv_length + kv_idx.to(torch.int64)
+
+
 def flex_sparse_gqa_attention(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -110,6 +143,10 @@ def flex_sparse_gqa_attention(
     scale = head_dim**-0.5 if softmax_scale is None else float(softmax_scale)
 
     membership, has_routes = _routes_to_membership(selected_token_ids, kv_length)
+    # Looked up through a flat int64 offset rather than membership[b, q, kv]:
+    # the inlined mask_mod indexes this table in int32, which overflows for
+    # long sequences. See _membership_flat_offset.
+    membership_flat = membership.reshape(-1)
 
     def mask_mod(b, h, q_idx, kv_idx):
         # FlexAttention pads Q/KV to block multiples and probes the padded
@@ -118,7 +155,8 @@ def flex_sparse_gqa_attention(
         in_range = (q_idx < query_length) & (kv_idx < kv_length)
         safe_q = torch.clamp(q_idx, max=query_length - 1)
         safe_kv = torch.clamp(kv_idx, max=kv_length - 1)
-        return in_range & membership[b, safe_q, safe_kv]
+        offset = _membership_flat_offset(b, safe_q, safe_kv, query_length, kv_length)
+        return in_range & membership_flat[offset]
 
     block_mask = create_block_mask(
         mask_mod,

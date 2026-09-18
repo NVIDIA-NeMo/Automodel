@@ -26,7 +26,8 @@ import pytest
 import torch
 
 from nemo_automodel.components.distributed.pipelining.functional import generate_hf_model_fqn_per_model_part
-from nemo_automodel.components.distributed.pipelining.hf_utils import MULTIMODAL_SUFFIXES
+from nemo_automodel.components.distributed.pipelining.hf_utils import MULTIMODAL_SUFFIXES, model_keeps_self_forward
+from nemo_automodel.components.models.minimax_m3_vl.model import MiniMaxM3SparseForCausalLM
 
 NUM_LAYERS = 3
 
@@ -89,6 +90,12 @@ def test_customize_rewrites_to_real_module_paths(vlm_model):
             continue
         # The only tolerated misses are extra multimodal suffixes M3 doesn't have.
         assert n in MULTIMODAL_SUFFIXES, f"rewritten FQN {n!r} is not a real module path"
+
+
+def test_text_model_keeps_its_msa_forward_under_pp():
+    """The PP builder must preserve the model-owned packed-layout orchestration."""
+    model = MiniMaxM3SparseForCausalLM.__new__(MiniMaxM3SparseForCausalLM)
+    assert model_keeps_self_forward(model) is True
 
 
 def test_is_pp_stage_full_model(vlm_model):

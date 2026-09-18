@@ -258,7 +258,14 @@ def safe_import(module, *, msg=None, alt=None):
         UnavailableMeta, and a boolean indicating whether the intended import was successful.
     """
     try:
-        return True, importlib.import_module(module)
+        mod = importlib.import_module(module)
+        if (
+            getattr(mod, "__file__", None) is None
+            and getattr(mod, "__path__", None) is not None
+            and getattr(getattr(mod, "__spec__", None), "origin", None) is None
+        ):
+            raise ImportError(f"{module} is only present as a namespace package without an origin file")
+        return True, mod
     except ImportError:
         exception_text = traceback.format_exc()
         logger.debug(f"Import of {module} failed with: {exception_text}")

@@ -31,13 +31,15 @@ include:
 2. **Changelog**: bullet list of user-visible changes.
 3. **Pre-checks**: confirm linting, tests, and sign-off.
 
-PR title format: Conventional Commits — `type(scope)?: description`
-(e.g. `feat(model): add Qwen3 VLM support`). The `Validate PR title` check
-enforces this. Bracket-prefixed titles such as `[model] feat: ...` fail
-validation.
+PR titles follow [Conventional Commits](https://www.conventionalcommits.org/):
+`type(scope)?: description` (e.g. `feat(model): add Qwen3 VLM support`).
+Valid types: `feat` `fix` `docs` `style` `refactor` `perf` `test` `build` `ci`
+`chore` `revert` `cp`. Titles must be 80 characters or fewer.
 
-See `CONTRIBUTING.md` for the full PR workflow, area/type labels, and DCO
-requirements.
+The `Validate PR title` check enforces this. Never use bracket-prefixed styles
+such as `[model] feat: …` — they fail validation.
+
+See `CONTRIBUTING.md` for DCO requirements.
 
 ### Branch Naming
 

@@ -70,6 +70,14 @@ _DIFFUSERS_INDEX_FN = "diffusion_pytorch_model.safetensors.index.json"
 logger = logging.getLogger(__name__)
 
 
+def _is_integrated_cuda_device(device: torch.device) -> bool:
+    """Whether CUDA reports *device* as sharing physical memory with the host."""
+    if device.type != "cuda":
+        return False
+    properties = torch.cuda.get_device_properties(device)
+    return bool(getattr(properties, "is_integrated", False))
+
+
 def _maybe_rename_index_for_diffusers(consolidated_dir: str) -> None:
     """Rename the consolidated index file to the diffusers-expected name.
 
@@ -276,6 +284,14 @@ class _HuggingFaceStorageReader(FsspecReader):
             super().__init__(path=path)
 
         self.key_mapping = key_mapping
+        self._metadata_cache: Metadata | None = None
+
+    def reset(self, checkpoint_id: str | os.PathLike | None = None) -> None:
+        """Reset reader state and discard metadata only when the checkpoint changes."""
+        previous_path = str(self.path)
+        super().reset(checkpoint_id)
+        if checkpoint_id is not None and str(self.path) != previous_path:
+            self._metadata_cache = None
 
     def read_data(self, plan: LoadPlan, planner: LoadPlanner) -> Future[None]:
         per_file: dict[str, list[ReadItem]] = {}
@@ -321,17 +337,29 @@ class _HuggingFaceStorageReader(FsspecReader):
                             tensor = torch.frombuffer(
                                 view, dtype=item_md.dtype, count=numel, offset=item_md.offset
                             ).reshape(item_md.shape)
+                            # This view still faults pages from the file mmap.
+                            file_backed = True
                         else:
                             tensor = torch.frombuffer(
                                 bytearray(view[item_md.offset : item_md.offset + item_md.length]),
                                 dtype=item_md.dtype,
                             ).reshape(item_md.shape)
+                            # The alignment fallback already owns resident bytes.
+                            file_backed = False
                         tensor = narrow_tensor_by_index(tensor, req.storage_offsets, req.lengths)
                         target_tensor = planner.resolve_tensor(req).detach()
 
                         assert target_tensor.size() == tensor.size(), (
                             f"req {req.storage_index} mismatch sizes {target_tensor.size()} vs {tensor.size()}"
                         )
+
+                        # On integrated GPUs, copying a file-backed mmap directly to CUDA can
+                        # migrate it page-by-page and take minutes per tensor. Stage only this
+                        # requested slice in anonymous host memory; unlike the full-state loader,
+                        # peak host memory is bounded by one tensor. Discrete GPUs keep the
+                        # zero-copy mmap source used to avoid host OOM on very large checkpoints.
+                        if file_backed and _is_integrated_cuda_device(target_tensor.device):
+                            tensor = tensor.clone()
 
                         # copy_ from a pageable host buffer is synchronous, so the mmap can be
                         # released right after this loop without racing an in-flight H2D copy.
@@ -372,6 +400,11 @@ class _HuggingFaceStorageReader(FsspecReader):
         return fut
 
     def read_metadata(self) -> Metadata:
+        if self._metadata_cache is not None:
+            if getattr(self._metadata_cache, "storage_meta", None) is not None:
+                self._metadata_cache.storage_meta.load_id = self.load_id
+            return self._metadata_cache
+
         state_dict_metadata: dict[str, TensorStorageMetadata] = {}
         storage_data: dict[MetadataIndex, _HFStorageInfo] = {}
 
@@ -443,6 +476,7 @@ class _HuggingFaceStorageReader(FsspecReader):
             metadata.storage_meta = StorageMeta()
         metadata.storage_meta.load_id = self.load_id  # type: ignore[union-attr]
 
+        self._metadata_cache = metadata
         return metadata
 
 

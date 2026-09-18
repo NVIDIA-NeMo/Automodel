@@ -58,3 +58,50 @@ ci:
     )
 
     assert args["enable_expert_parallel"] is False
+
+
+def test_resolve_args_uses_checkpoint_robustness_tokenizer(tmp_path):
+    config_path = tmp_path / "recipe.yaml"
+    config_path.write_text(
+        """
+model:
+  pretrained_model_name_or_path: test/model
+ci:
+  checkpoint_robustness:
+    tokenizer_name: test/tokenizer
+"""
+    )
+
+    args = _resolve_args(
+        {
+            "config_path": str(config_path),
+            "deploy_mode": "peft",
+            "adapter_path": "/tmp/adapter",
+        }
+    )
+
+    assert args["tokenizer"] == "test/tokenizer"
+
+
+def test_resolve_args_prefers_cli_tokenizer_over_recipe(tmp_path):
+    config_path = tmp_path / "recipe.yaml"
+    config_path.write_text(
+        """
+model:
+  pretrained_model_name_or_path: test/model
+ci:
+  checkpoint_robustness:
+    tokenizer_name: test/recipe-tokenizer
+"""
+    )
+
+    args = _resolve_args(
+        {
+            "config_path": str(config_path),
+            "deploy_mode": "peft",
+            "adapter_path": "/tmp/adapter",
+            "tokenizer": "test/cli-tokenizer",
+        }
+    )
+
+    assert args["tokenizer"] == "test/cli-tokenizer"

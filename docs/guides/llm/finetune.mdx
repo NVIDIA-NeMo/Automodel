@@ -1,6 +1,6 @@
 ---
 title: "Supervised Fine-Tuning (SFT) and Parameter-Efficient Fine-Tuning (PEFT) with NeMo AutoModel"
-description: ""
+description: "Fine-tune language models with NeMo AutoModel using SFT or PEFT (LoRA), from install and YAML config through training, evaluation, publish, and vLLM deploy."
 position: 2
 ---
 ## Introduction
@@ -125,7 +125,7 @@ Raw `ConfigNode` sections call `.instantiate()` inside the relevant recipe build
 
 Nested `_target_` blocks (such as a configured `collate_fn` inside `dataloader`) are recursively instantiated the same way. In contrast, `RecipeConfig` converts recognized sections to typed configs that own construction through `.build(...)`: optimizer receives the model and device mesh, step scheduler receives the dataloader, data-parallel (DP) size, and local batch size, and checkpoint receives runtime ranks and meshes.
 
-**The `recipe` key.** Every config file includes a top-level `recipe` key that tells the CLI *which recipe class* to run. You can write it as a **short name** or as a **fully-qualified Python path**, and both resolve to the same class:
+**The `recipe` key.** Every config file includes a top-level `recipe` key that tells the CLI *which recipe class* to run. You can write it as a **short name** or as a **fully qualified Python path**, and both resolve to the same class:
 
 ```yaml
 # Short name (the CLI looks up the class automatically)
@@ -137,7 +137,7 @@ recipe: nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPredi
 
 The short name form is a convenience. The CLI scans all recipe modules under `nemo_automodel.recipes` and matches the bare class name. If you invoke the recipe script directly with `torchrun` instead of the `automodel` CLI, the `recipe` key is not required because the script itself *is* the recipe.
 
-Not every section uses `_target_`. `step_scheduler` and `checkpoint` are converted into `StepSchedulerConfig` and `CheckpointingConfig`, whose `.build(...)` methods receive runtime-only values from the recipe. The `distributed` mapping is parsed into typed strategy, parallelism, pipeline, and MoE configs before `DistributedSetup.build(...)` creates the meshes.
+Not every section uses `_target_`. `step_scheduler` and `checkpoint` are converted into `StepSchedulerConfig` and `CheckpointingConfig`, whose `.build(...)` methods receive runtime-only values from the recipe. The `distributed` mapping is parsed into typed strategy, parallelism, pipeline, and Mixture-of-Experts (MoE) configs before `DistributedSetup.build(...)` creates the meshes.
 </Accordion>
 
 ### Model
@@ -151,7 +151,7 @@ model:
 | Key | Role |
 |-----|------|
 | `_target_` | Points to [`NeMoAutoModelForCausalLM.from_pretrained`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/_transformers/auto_model.py), which is a factory method that downloads (or loads from cache) a pretrained Hugging Face model and wraps it with NeMo distributed-training support. |
-| `pretrained_model_name_or_path` | A keyword argument to `from_pretrained`. Any argument that [`from_pretrained`](https://huggingface.co/docs/transformers/main_classes/model#transformers.PreTrainedModel.from_pretrained) accepts can be added here (e.g., `cache_dir`, `torch_dtype`). |
+| `pretrained_model_name_or_path` | A keyword argument to `from_pretrained`. NeMo AutoModel supports common Hugging Face [`from_pretrained`](https://huggingface.co/docs/transformers/main_classes/model#transformers.PreTrainedModel.from_pretrained) arguments, for example, `cache_dir` and `dtype`. Check the NeMo loader documentation for supported arguments; the deprecated `torch_dtype` spelling remains supported. |
 
 This guide uses **Meta Llama 3.2 1B** as a running example. Replace `pretrained_model_name_or_path` with any supported [Hugging Face model ID](/model-coverage/large-language-models/overview).
 
@@ -215,7 +215,7 @@ peft:
 | Key | Role |
 |-----|------|
 | `_target_` | Points to [`PeftConfig`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/_peft/lora.py), which is a dataclass that describes which layers to adapt and how. Unlike the model and dataset sections, this instantiation produces a *config object*, not the adapter itself. The recipe passes the resulting `PeftConfig` into `build_model`, which applies LoRA adapters to the model. |
-| `target_modules` | A glob pattern matched against fully-qualified layer names (for example, `"*_proj"` matches Llama projection layers such as `q_proj`, `k_proj`, and `down_proj`). |
+| `target_modules` | A glob pattern matched against fully qualified layer names (for example, `"*_proj"` matches Llama projection layers such as `q_proj`, `k_proj`, and `down_proj`). |
 | `dim` | The low-rank dimension *r*, which controls adapter capacity. Larger values learn more but use more memory. |
 | `alpha` | Scaling factor applied to the adapter output (`alpha / dim`). Higher values give adapters more influence during training. |
 
@@ -225,7 +225,7 @@ Including a `peft:` section enables LoRA fine-tuning. Remove it entirely to run 
 
 If GPU memory is a constraint, [QLoRA](https://arxiv.org/abs/2305.14314) combines LoRA with 4-bit NormalFloat (NF4) quantization to reduce memory usage by up to 75% compared to full-parameter SFT in 16-bit precision, while maintaining comparable quality to standard LoRA.
 
-QLoRA requires `bitsandbytes`, which is provided by AutoModel's `cuda_source`
+QLoRA requires `bitsandbytes`, which is provided by NeMo AutoModel's `cuda_source`
 install profile. Add it to the active environment created above before running a
 QLoRA recipe:
 
@@ -274,7 +274,7 @@ gradient accumulation steps = global_batch_size / (local_batch_size × DP size)
 With the values above, a single DP rank accumulates 8 micro-batches; 8 DP ranks require no accumulation. `global_batch_size` must be divisible by `local_batch_size × DP size`.
 
 <Note>
-Most example recipes use bf16 training by default for memory and throughput. If you are running long fine-tuning, especially full-parameter SFT, and you require a higher-precision optimizer state, configure it explicitly instead of assuming it from the mixed-precision compute policy. See the [Mixed-Precision Training Guide](/development/mixed-precision-training) for the recommended Transformer Engine (TE) and torch AdamW patterns.
+Most example recipes use bf16 training by default for memory and throughput. If you are running long fine-tuning, especially full-parameter SFT, and you require a higher-precision optimizer state, set `model.dtype: float32` explicitly when using `torch.optim.Adam` or `AdamW`. The deprecated `model.torch_dtype` key remains supported. The mixed-precision compute policy does not set optimizer-state precision. See the [Mixed-Precision Training Guide](/development/mixed-precision-training) for the recommended Transformer Engine (TE) and torch AdamW patterns.
 
 </Note>
 
@@ -354,7 +354,7 @@ checkpoint:
 
 ## Fine-Tune the Model
 
-You can run the recipe using the AutoModel CLI or directly with `torchrun` (advanced).
+You can run the recipe using the `automodel` CLI or directly with `torchrun` (advanced).
 
 ```bash
 automodel --nproc-per-node=8 finetune_config.yaml
@@ -395,7 +395,7 @@ Each log line reports the current loss, gradient norm, peak GPU memory, and toke
 
 Checkpoints are saved as Hugging Face-compatible safetensors. For SFT, `save_consolidated: final` is the default. Intermediate checkpoints contain sharded model weights and a generated `model/consolidate.sh` helper. The final checkpoint also contains `model/consolidated/` for Transformers, vLLM, lm-eval-harness, and other Hugging Face ecosystem tools. Set `save_consolidated: false` to keep every checkpoint sharded, and then run the helper script for whichever checkpoint you want to export. Use `save_consolidated: every` (or the legacy value `true`) only when you intentionally want inline Hugging Face export at every checkpoint save.
 
-**PEFT checkpoints** contain only the adapter weights (megabytes instead of gigabytes) and are saved directly under `model/`. They do not use `model/consolidate.sh`. At inference time, you must load the original base model and apply the adapter on top. This distinction affects every downstream step, including inference, publishing, and deployment.
+**PEFT checkpoints** contain only the adapter weights (megabytes instead of gigabytes) and are saved directly under `model/`. They do not use `model/consolidate.sh`. At inference time, you can load the original base model and apply the adapter on top. To produce a standalone checkpoint instead, run `python tools/merge_lora.py --base-model <base-model> --adapter-path <checkpoint>/model --output-dir <output>`. For AutoModel PEFT-v5 checkpoints with grouped-expert adapters, add `--automodel-native-export` to restore the adapter through the model family's state-dict adapter and write canonical sharded Hugging Face weights. This distinction affects every downstream step, including inference, publishing, and deployment.
 
 <Accordion title="Checkpoint Directory Structure">
 **SFT checkpoint:**
@@ -480,8 +480,10 @@ print(tokenizer.decode(output[0], skip_special_tokens=True))
 PEFT adapters must be loaded on top of the base model. Because the base NeMo AutoModel installation does not include the Hugging Face PEFT library, install a tested version in your active environment before running the inference code:
 
 ```bash
-uv pip install "peft>=0.18.1"
+uv pip install "peft>=0.19.1"
 ```
+
+LoRA adapters for models with fused MoE expert weights (for example, Qwen3-MoE, MiniMax-M2, Nemotron 3) are exported in the ParamWrapper layout that `peft` has used since 0.19.1, when `peft` changed it (huggingface/peft#3165); that is why the step above installs `peft>=0.19.1`. If such an adapter has to be loaded by a consumer pinned to an older `peft` version, set `checkpoint.legacy_paramwrapper_layout: true` in the training config to export the pre-0.19.1 layout instead. An adapter exported that way does not load with `peft` 0.19.1 or newer.
 
 ```python
 import torch
@@ -674,7 +676,7 @@ print(outputs[0].outputs[0].text)
 
 ## Full Configuration Reference
 
-This section documents all available config fields for the fine-tuning recipe. For the quick-start config, see [Configure Your Training Recipe](#configure-your-training-recipe).
+This section documents all available config fields for the fine-tuning recipe. For the Quickstart config, see [Configure Your Training Recipe](#configure-your-training-recipe).
 
 ### Switch Between SFT and PEFT
 
@@ -693,7 +695,7 @@ All other config sections remain the same for both modes.
 ```yaml
 # Recipe
 # Selects which recipe class runs the training loop.
-# Use a short name (auto-discovered) or a fully-qualified Python path:
+# Use a short name (auto-discovered) or a fully qualified Python path:
 #   recipe: nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
@@ -767,7 +769,7 @@ model:
 # to the matching layers.
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
-  target_modules: "*_proj" # glob pattern matched against fully-qualified layer names;
+  target_modules: "*_proj" # glob pattern matched against fully qualified layer names;
                            # matches Llama projection layers such as q_proj and down_proj
   dim: 8                   # low-rank dimension r, which controls adapter capacity.
                            # Larger values are more expressive but use more memory.
@@ -796,7 +798,7 @@ checkpoint:
 # change _target_ to another factory function (see the dataset guide).
 dataset:
   _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
-  dataset_name: rajpurkar/squad  # HuggingFace Hub dataset ID
+  dataset_name: rajpurkar/squad  # Hugging Face Hub dataset ID
   split: train                   # which split to use (train, validation, test)
 
 # Validation Dataset
@@ -870,7 +872,7 @@ The following table describes the config fields for the fine-tuning recipe.
 
 | Section | Required? | What to Change |
 |---------|-----------|----------------|
-| `recipe` | CLI only | Required by `automodel`; select `TrainFinetuneRecipeForNextTokenPrediction` by short name or fully-qualified path. |
+| `recipe` | CLI only | Required by `automodel`; select `TrainFinetuneRecipeForNextTokenPrediction` by short name or fully qualified path. |
 | `model` | Yes | Set `pretrained_model_name_or_path` to your Hugging Face model ID. Source: [`auto_model.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/_transformers/auto_model.py). |
 | `peft` | PEFT only | Remove entirely for SFT. Adjust `dim` and `alpha` to tune adapter capacity. `use_triton: True` enables an optimized LoRA kernel (requires the `triton` package). For reduced memory usage, see [QLoRA](#qlora-quantized-low-rank-adaptation). Source: [`lora.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/_peft/lora.py). |
 | `dataset` | Yes | Change `_target_`, `dataset_name`, and `split` for your data. Source: [`squad.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/datasets/llm/squad.py). |
@@ -930,7 +932,7 @@ dp_size = world_size ÷ (tp_size × cp_size × pp_size)
 
 EP does not appear in this formula. Experts are distributed across the DP×CP rank groups, with the constraint that `(dp_size × cp_size)` must be divisible by `ep_size`.
 
-#### Data Parallelism as the Default
+### Data Parallelism as the Default
 
 Data parallelism is the default. With `strategy: fsdp2`, FSDP2 shards both model parameters and optimizer states across the DP group, so memory usage shrinks as you add GPUs:
 
@@ -942,7 +944,7 @@ distributed:
   cp_size: 1
 ```
 
-#### Tensor Parallelism
+### Tensor Parallelism
 
 TP splits weight matrices across GPUs within a single node. Set `tp_size` to the number of GPUs you want to shard over. The value is typically 2, 4, or 8 and should divide evenly into the number of attention heads:
 
@@ -957,7 +959,7 @@ distributed:
 
 `sequence_parallel: true` extends TP to also shard activation memory along the sequence dimension, further reducing per-GPU memory at the cost of additional communication.
 
-#### Pipeline Parallelism
+### Pipeline Parallelism
 
 PP assigns groups of layers to different GPUs and streams micro-batches through the stages. It requires an additional nested `pipeline:` section:
 
@@ -988,7 +990,7 @@ PP is available only when the model declares pipeline-parallel support and defin
 
 </Note>
 
-#### Context Parallelism
+### Context Parallelism
 
 CP splits the sequence across GPUs, which is useful for very long contexts that exceed single-GPU memory. Set `cp_size` to the target split factor:
 
@@ -1005,7 +1007,7 @@ When `cp_size > 1`, fused RoPE is automatically disabled. Some models also requi
 
 </Info>
 
-#### Expert Parallelism for MoE Models
+### Expert Parallelism for MoE Models
 
 EP distributes MoE experts across GPUs. Set `ep_size` to the number of GPUs that share the full set of experts:
 
@@ -1021,7 +1023,7 @@ distributed:
 
 EP only applies to Mixture-of-Experts models (such as Qwen3-MoE, Mixtral, and DeepSeek-V3). For dense models, leave `ep_size` at `1` or omit it.
 
-#### Combine Multiple Dimensions
+### Combine Multiple Dimensions
 
 You can combine TP, PP, CP, and EP in a single config. For example, a large MoE model on a multi-node cluster might use:
 

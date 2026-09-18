@@ -41,6 +41,7 @@ from nemo_automodel.components.attention.utils import (
 )
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.gpt_oss.rope_utils import apply_rotary_emb_qk
+from nemo_automodel.components.models.minimax_m3_vl.msa import MSAMicrobatch, require_msa_support, sparse_attention
 from nemo_automodel.components.moe.layers import MoE, MoEConfig
 
 
@@ -347,18 +348,38 @@ class MiniMaxM3Indexer(nn.Module):
         self.index_q_norm = MiniMaxM3RMSNorm(self.index_head_dim, eps=config.rms_norm_eps, gemma=gemma)
         self.index_k_norm = MiniMaxM3RMSNorm(self.index_head_dim, eps=config.rms_norm_eps, gemma=gemma)
 
-    def forward(
-        self, x: torch.Tensor, *, freqs_cis: torch.Tensor, num_q_heads: int, **attn_kwargs: Any
-    ) -> torch.Tensor:
-        bsz, seqlen, _ = x.shape
-        idx_q = self.index_q_norm(self.index_q_proj(x).view(bsz, seqlen, self.num_index_heads, self.index_head_dim))
-        idx_k = self.index_k_norm(self.index_k_proj(x).view(bsz, seqlen, 1, self.index_head_dim))
-        idx_q, idx_k = apply_rotary_emb_qk(
+    def project_qk(
+        self,
+        x: torch.Tensor,
+        *,
+        freqs_cis: torch.Tensor,
+        cp_size: int,
+        cp_rank: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Project x[..., hidden] and freqs_cis[..., rotary] to rotated index_q[..., num_index_heads, index_head_dim]
+        and index_k[..., 1, index_head_dim]; ``...`` is [batch, sequence] or [tokens]."""
+        token_shape = x.shape[:-1]
+        idx_q = self.index_q_norm(self.index_q_proj(x).view(*token_shape, self.num_index_heads, self.index_head_dim))
+        idx_k = self.index_k_norm(self.index_k_proj(x).view(*token_shape, 1, self.index_head_dim))
+        qkv_format = "thd" if x.dim() == 2 else "bshd"
+        return apply_rotary_emb_qk(
             idx_q,
             idx_k,
             freqs_cis,
-            format="bshd",
+            format=qkv_format,
             rope_fusion=self.backend.rope_fusion,
+            cp_size=cp_size,
+            cp_rank=cp_rank,
+        )
+
+    def forward(
+        self, x: torch.Tensor, *, freqs_cis: torch.Tensor, num_q_heads: int, **attn_kwargs: Any
+    ) -> torch.Tensor:
+        """Map x[batch, sequence, hidden] and freqs_cis[batch, sequence, rotary] to a bool keep-mask
+        [batch, num_q_heads, sequence, sequence]."""
+        idx_q, idx_k = self.project_qk(
+            x,
+            freqs_cis=freqs_cis,
             cp_size=attn_kwargs.get("cp_size", 1),
             cp_rank=attn_kwargs.get("cp_rank", 0),
         )
@@ -439,15 +460,32 @@ class MiniMaxM3Attention(nn.Module):
             MiniMaxM3Indexer(config, config.sparse_attention_config, backend) if is_sparse_attention_layer else None
         )
 
-        softmax_scale = self.head_dim**-0.5
-        self.attn_module, self.attn_func = initialize_attn_module_and_func(
-            attn_impl=backend.attn,
+        self.attn_module, self.attn_func = self._initialize_attention()
+
+    def _initialize_attention(self) -> tuple[nn.Module | None, Any]:
+        """Return the ``(attn_module, attn_func)`` of ``backend.attn``; a layer with its own kernels overrides this."""
+        return initialize_attn_module_and_func(
+            attn_impl=self.backend.attn,
             num_attention_heads=self.num_heads,
             num_qk_channels=self.head_dim,
             num_v_channels=self.head_dim,
-            softmax_scale=softmax_scale,
+            softmax_scale=self.head_dim**-0.5,
             num_gqa_groups=self.num_kv_heads,
         )
+
+    def _project_qkv(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Project x[..., hidden] to q[..., num_heads, head_dim] and k/v[..., num_kv_heads, head_dim].
+
+        Per-head QK norm (over head_dim) is applied before RoPE, matching the sglang reference
+        (``_qk_norm`` then ``rotary_emb``).
+        """
+        leading = tuple(x.shape[:-1])
+        q = self.q_proj(x).view(*leading, self.num_heads, self.head_dim)
+        k = self.k_proj(x).view(*leading, self.num_kv_heads, self.head_dim)
+        v = self.v_proj(x).view(*leading, self.num_kv_heads, self.head_dim)
+        if self.q_norm is None:
+            return q, k, v
+        return self.q_norm(q), self.k_norm(k), v
 
     def forward(
         self,
@@ -455,31 +493,29 @@ class MiniMaxM3Attention(nn.Module):
         *,
         freqs_cis: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
+        msa: MSAMicrobatch | None = None,
         **attn_kwargs: Any,
     ) -> torch.Tensor:
+        """Map x[batch, sequence, hidden] and freqs_cis[batch, sequence, rotary] to output[batch, sequence, hidden].
+
+        Args:
+            x: Hidden states; with ``msa`` they are packed to [tokens, hidden] here and unpacked before
+                returning, so padding rows come back as zero.
+            freqs_cis: Rotary table, packed alongside ``x``.
+            attention_mask: [batch, sequence] or [batch, heads, sequence, sequence]; None with ``msa``,
+                whose documents travel as ``cu_seqlens`` in ``attn_kwargs`` instead.
+            msa: The model-owned packed microbatch, given to every attention layer once MSA is on.
+            **attn_kwargs: Backend arguments.
+        """
         # padding_mask / position_ids are only consumed by the CP-aware sparse
         # subclass; drop them here so they never reach the indexer or the attention
         # backend kwargs (eager path uses freqs_cis, not raw position_ids).
         attn_kwargs.pop("padding_mask", None)
         attn_kwargs.pop("position_ids", None)
-        if len(x.shape) == 2:
-            qkv_format = "thd"
-            num_tokens = x.shape[0]
-            q = self.q_proj(x).view(num_tokens, self.num_heads, self.head_dim)
-            k = self.k_proj(x).view(num_tokens, self.num_kv_heads, self.head_dim)
-            v = self.v_proj(x).view(num_tokens, self.num_kv_heads, self.head_dim)
-        else:
-            qkv_format = "bshd"
-            bsz, seqlen, _ = x.size()
-            q = self.q_proj(x).view(bsz, seqlen, self.num_heads, self.head_dim)
-            k = self.k_proj(x).view(bsz, seqlen, self.num_kv_heads, self.head_dim)
-            v = self.v_proj(x).view(bsz, seqlen, self.num_kv_heads, self.head_dim)
-
-        # Per-head QK norm (over head_dim) is applied before RoPE, matching the
-        # sglang reference (``_qk_norm`` then ``rotary_emb``).
-        if self.q_norm is not None:
-            q = self.q_norm(q)
-            k = self.k_norm(k)
+        if msa is not None:
+            x, freqs_cis = msa.pack(x), msa.pack(freqs_cis)
+        qkv_format = "thd" if x.dim() == 2 else "bshd"
+        q, k, v = self._project_qkv(x)
 
         if self.indexer is not None:
             if qkv_format != "bshd":
@@ -510,7 +546,8 @@ class MiniMaxM3Attention(nn.Module):
         out = postprocess_output_for_attn(out, self.backend.attn)
 
         flatten_dim = 2 if qkv_format == "bshd" else 1
-        return self.o_proj(out.flatten(flatten_dim))
+        out = self.o_proj(out.flatten(flatten_dim))
+        return msa.unpack(out) if msa is not None else out
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02):
         for linear in (self.q_proj, self.k_proj, self.v_proj, self.o_proj):
@@ -520,6 +557,55 @@ class MiniMaxM3Attention(nn.Module):
             self.k_norm.reset_parameters()
         if self.indexer is not None:
             self.indexer.init_weights(buffer_device, init_std)
+
+
+class MiniMaxM3MSAAttention(MiniMaxM3Attention):
+    """A sparse attention layer running MSA's SM100 kernels on compact packed documents.
+
+    Same interface as :class:`MiniMaxM3Attention`. Rejections are layered by when the answer can change:
+    backend and topology at construction, context parallelism at ``setup_cp_attention``, and runtime
+    arguments once per microbatch in ``MSAMicrobatch.build``.
+    """
+
+    def __init__(self, config: Any, backend: BackendConfig) -> None:
+        super().__init__(config, backend, is_sparse_attention_layer=True)
+        require_msa_support(self, backend)
+
+    def _initialize_attention(self) -> tuple[None, None]:
+        """Own no generic backend: building one would import TransformerEngine before any MSA rejection
+        can fire, and a leftover ``DotProductAttention`` would send ``apply_cp`` down TE's context-parallel
+        branch (moe/parallelizer.py) instead of the ``setup_cp_attention`` rejection below."""
+        return None, None
+
+    def setup_cp_attention(self, cp_mesh: Any) -> None:
+        """Reject context parallelism; ``apply_cp`` dispatches on this method's presence and would otherwise
+        only log a warning, leaving CP silently unapplied."""
+        raise NotImplementedError(
+            "MiniMax M3 backend.sparse_attn='msa' requires cp_size=1; disable context parallelism "
+            "or set backend.sparse_attn='generic'."
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        freqs_cis: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        msa: MSAMicrobatch,
+        **attn_kwargs: Any,
+    ) -> torch.Tensor:
+        """Map x[batch, sequence, hidden] and freqs_cis[batch, sequence, rotary] to output[batch, sequence, hidden].
+
+        Both are packed to [tokens, ...] by ``msa`` and the output unpacked with zero padding rows.
+        ``attention_mask`` and ``attn_kwargs`` are ignored: document isolation travels in ``msa``.
+        """
+        x, freqs_cis = msa.pack(x), msa.pack(freqs_cis)
+        q, k, v = self._project_qkv(x)
+        with torch.no_grad():
+            index_q, index_k = self.indexer.project_qk(x, freqs_cis=freqs_cis, cp_size=1, cp_rank=0)
+            q2k = msa.select_blocks(index_q, index_k)
+        q, k = apply_rotary_emb_qk(q, k, freqs_cis, format="thd", rope_fusion=False)
+        return msa.unpack(self.o_proj(sparse_attention(q, k, v, q2k, msa).flatten(1)))
 
 
 class Block(nn.Module):
@@ -552,7 +638,11 @@ class Block(nn.Module):
                 f"MiniMax M3 sparse layer {layer_idx} has disable_index_value=0 (index value/output "
                 "projections), which is not supported (only the selection-only indexer is implemented)."
             )
-        if is_sparse_attention_layer:
+        if is_sparse_attention_layer and backend.sparse_attn == "msa":
+            # MSA owns packing, block selection and the SM100 kernels; it never reaches the generic
+            # attention backend and rejects CP in setup_cp_attention.
+            self.self_attn = MiniMaxM3MSAAttention(config, backend)
+        elif is_sparse_attention_layer:
             # Sparse layers use the CP-aware attention so context parallelism can
             # rebuild a correct global-sequence block-sparse mask (FlexAttention).
             # It delegates to the plain sparse forward when CP is off (_cp_mesh

@@ -1124,7 +1124,7 @@ class TestModelMappingKeyErrorFallback:
             )
 
         assert is_custom is False
-        assert cls._from_pretrained_parent_class.call_args.kwargs["torch_dtype"] == "auto"
+        assert cls._from_pretrained_parent_class.call_args.kwargs["dtype"] == "auto"
         assert fake_model.linear.weight.dtype == torch.bfloat16
         assert fake_model.norm.weight.dtype == torch.float32
         mock_wrap.assert_called_once_with(FakeModel)
@@ -1295,7 +1295,7 @@ class TestModelMappingKeyErrorFallback:
             )
 
         assert is_custom is False
-        assert cls._from_pretrained_parent_class.call_args.kwargs["torch_dtype"] == torch.bfloat16
+        assert cls._from_pretrained_parent_class.call_args.kwargs["dtype"] == torch.bfloat16
         assert fake_model.lm_head.weight is fake_model.embed_tokens.weight
         assert fake_model.lm_head.weight.dtype == torch.bfloat16
         assert fake_model.embed_tokens.weight.dtype == torch.bfloat16

@@ -42,8 +42,7 @@ _VARLEN_WIN_NONE = -(2**31)
 _SDPA_FN: Callable | None = None
 _EAGER_FN: Callable | None = None
 _FLEX_FN: Callable | None = None
-_FFPA_FN: Callable | None = None
-_CUTEDSL_BACKEND: Any = None
+_FFPA_HIGH_LEVEL: tuple[Callable, Any] | None = None
 _FFPA_LOW_LEVEL_READY: bool | None = None
 
 
@@ -137,12 +136,31 @@ def _ffpa_varlen_fwd(
     scale: float,
     causal: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """FFPA CuTeDSL varlen forward on packed THD inputs. Returns ``(out[T,Hq,D], lse[Hq,T])``.
+    """Run FFPA CuTeDSL varlen forward on packed THD inputs.
 
-    Wraps ``_varlen_fwd_cute`` with the fixed no-window/no-softcap/no-pack-gqa sentinels.
+    Windowing, softcap, and packed GQA are disabled at this seam.
+
+    Args:
+        q_pack: Float16 or bfloat16 CUDA tensor of shape [total_query_tokens, query_heads, head_dim] in packed
+            THD layout. QKV share dtype and device and are made contiguous before dispatch.
+        k_pack: Key tensor of shape [total_key_value_tokens, key_value_heads, head_dim] in packed THD layout.
+        v_pack: Value tensor of shape [total_key_value_tokens, key_value_heads, value_head_dim] in packed THD
+            layout.
+        cu_q: Int32 CUDA tensor of shape [batch + 1] on the same device as ``q_pack``, containing cumulative
+            query-token offsets from 0 through ``total_query_tokens``.
+        cu_k: Int32 CUDA tensor of shape [batch + 1] on the same device as ``q_pack``, containing cumulative
+            key/value-token offsets from 0 through ``total_key_value_tokens``.
+        max_q: Maximum query sequence length represented by ``cu_q``.
+        max_k: Maximum key/value sequence length represented by ``cu_k``.
+        scale: Pre-softmax scaling factor applied to query-key scores.
+        causal: Whether to apply the tail-aligned causal mask within each packed sequence.
+
+    Returns:
+        A tuple containing an output tensor of shape [total_query_tokens, query_heads, value_head_dim] with the
+        dtype and device of ``q_pack``, and a float32 LSE tensor of shape [query_heads, total_query_tokens] on the
+        same device. Neither output aliases an input.
     """
-    # ``torch.ops.<ns>.<op>`` is a dynamically-dispatched OpOverloadPacket whose
-    # ParamSpec the type checker cannot bind; cast to the concrete signature.
+    # Cast the dynamic torch op packet to the callable signature expected by the type checker.
     varlen_fwd_cute = cast(
         "Callable[..., tuple[torch.Tensor, torch.Tensor]]",
         torch.ops.ffpa_attn._varlen_fwd_cute,
@@ -179,13 +197,35 @@ def _ffpa_varlen_bwd(
     scale: float,
     causal: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """FFPA CuTeDSL varlen backward using the *caller-supplied* out/lse. Returns ``(dq, dk, dv)``.
+    """Run FFPA CuTeDSL varlen backward with the caller's globally merged output and LSE.
 
-    Exposed as an explicit op call (not the package's varlen autograd) because the
-    ring backward feeds the globally merged out/lse, not a chunk-local one.
+    Args:
+        grad_out_pack: Output-gradient tensor of shape [total_query_tokens, query_heads, value_head_dim] in
+            packed THD layout.
+        q_pack: Float16 or bfloat16 CUDA tensor of shape [total_query_tokens, query_heads, head_dim] in packed
+            THD layout. QKV, ``grad_out_pack``, and ``out_pack`` share dtype and device and are made contiguous
+            before dispatch.
+        k_pack: Key tensor of shape [total_key_value_tokens, key_value_heads, head_dim] in packed THD layout.
+        v_pack: Value tensor of shape [total_key_value_tokens, key_value_heads, value_head_dim] in packed THD
+            layout.
+        out_pack: Caller's globally merged output tensor of shape
+            [total_query_tokens, query_heads, value_head_dim] in packed THD layout.
+        lse_pack: Caller's globally merged float32 LSE tensor of shape [query_heads, total_query_tokens] on the
+            same device as ``q_pack``.
+        cu_q: Int32 CUDA tensor of shape [batch + 1] on the same device as ``q_pack``, containing cumulative
+            query-token offsets.
+        cu_k: Int32 CUDA tensor of shape [batch + 1] on the same device as ``q_pack``, containing cumulative
+            key/value-token offsets.
+        max_q: Maximum query sequence length represented by ``cu_q``.
+        max_k: Maximum key/value sequence length represented by ``cu_k``.
+        scale: Pre-softmax scaling factor applied to query-key scores.
+        causal: Whether to apply the tail-aligned causal mask within each packed sequence.
+
+    Returns:
+        A ``(dq, dk, dv)`` tuple in packed THD layout. Each gradient has the shape, dtype, and device of its
+        corresponding QKV input and does not alias an input.
     """
-    # ``torch.ops.<ns>.<op>`` is a dynamically-dispatched OpOverloadPacket whose
-    # ParamSpec the type checker cannot bind; cast to the concrete signature.
+    # Cast the dynamic torch op packet to the callable signature expected by the type checker.
     varlen_bwd_cute = cast(
         "Callable[..., tuple[torch.Tensor, torch.Tensor, torch.Tensor]]",
         torch.ops.ffpa_attn._varlen_bwd_cute,
@@ -218,11 +258,22 @@ def _ffpa_dense_fwd(
     scale: float,
     causal: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """FFPA CuTeDSL *dense* forward on ``[B, H, N, D]`` SDPA-layout tensors.
+    """Run FFPA CuTeDSL dense forward on SDPA-layout tensors.
 
-    Returns ``(out[B, Hq, Nq, D], lse[B, Hq, Nq] fp32)``; handles GQA and causal/non-causal
-    internally. Exposed (not via the autograd ``ffpa_attn_func``) so the ring gets the
-    per-chunk ``lse`` for its online-softmax merge.
+    The returned per-chunk LSE supports the ring online-softmax merge.
+
+    Args:
+        q: Float16 or bfloat16 CUDA tensor of shape [batch, query_heads, query_sequence, head_dim] in SDPA
+            layout. QKV share dtype, device, and head dimension.
+        k: Key tensor of shape [batch, key_value_heads, key_value_sequence, head_dim] in SDPA layout.
+        v: Value tensor of shape [batch, key_value_heads, key_value_sequence, value_head_dim] in SDPA layout.
+        scale: Pre-softmax scaling factor applied to query-key scores.
+        causal: Whether to apply the causal mask.
+
+    Returns:
+        A tuple containing an output tensor of shape [batch, query_heads, query_sequence, value_head_dim] with
+        the dtype and device of ``q``, and a float32 LSE tensor of shape [batch, query_heads, query_sequence] on
+        the same device. Neither output aliases an input.
     """
     from ffpa_attn.cute import _ffpa_attn_forward_cute
 
@@ -240,29 +291,42 @@ def _ffpa_dense_bwd(
     scale: float,
     causal: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """FFPA CuTeDSL *dense* backward using the *caller-supplied* out/lse.
+    """Run FFPA CuTeDSL dense backward with the caller's globally merged output and LSE.
 
-    Returns ``(dq, dk, dv)`` all in ``[B, H, N, D]`` SDPA layout (dK/dV reduced to
-    ``Hkv`` for GQA). Exposed as an explicit call (not the package's autograd) so
-    the ring backward can feed the globally merged out/lse, not a chunk-local one.
+    Args:
+        grad_out: Output-gradient tensor of shape [batch, query_heads, query_sequence, value_head_dim] in SDPA
+            layout.
+        q: Float16 or bfloat16 CUDA tensor of shape [batch, query_heads, query_sequence, head_dim] in SDPA
+            layout. QKV, ``grad_out``, and ``out`` share dtype and device.
+        k: Key tensor of shape [batch, key_value_heads, key_value_sequence, head_dim] in SDPA layout.
+        v: Value tensor of shape [batch, key_value_heads, key_value_sequence, value_head_dim] in SDPA layout.
+        out: Caller's globally merged output tensor of shape
+            [batch, query_heads, query_sequence, value_head_dim] in SDPA layout.
+        lse: Caller's globally merged float32 LSE tensor of shape [batch, query_heads, query_sequence] on the
+            same device as ``q``.
+        scale: Pre-softmax scaling factor applied to query-key scores.
+        causal: Whether to apply the causal mask.
+
+    Returns:
+        A ``(dq, dk, dv)`` tuple in SDPA layout. Each gradient has the shape, dtype, and device of its
+        corresponding QKV input and does not alias an input; GQA ``dk`` and ``dv`` use ``key_value_heads``.
     """
     from ffpa_attn.cute import _ffpa_attn_backward_cute
 
     return _ffpa_attn_backward_cute(grad_out, q, k, v, out, lse, float(scale), bool(causal))
 
 
-def _get_ffpa_high_level() -> tuple[Callable | None, Any]:
-    global _FFPA_FN, _CUTEDSL_BACKEND
-    if _FFPA_FN is None:
+def _get_ffpa_high_level() -> tuple[Callable, Any] | None:
+    global _FFPA_HIGH_LEVEL
+    if _FFPA_HIGH_LEVEL is None:
         try:
             from ffpa_attn import ffpa_attn_func
             from ffpa_attn.functional import CuTeDSLBackend
 
-            _FFPA_FN = ffpa_attn_func
-            _CUTEDSL_BACKEND = CuTeDSLBackend()
+            _FFPA_HIGH_LEVEL = ffpa_attn_func, CuTeDSLBackend()
         except Exception:
-            return None, None
-    return _FFPA_FN, _CUTEDSL_BACKEND
+            return None
+    return _FFPA_HIGH_LEVEL
 
 
 def ffpa_mask(
@@ -276,24 +340,48 @@ def ffpa_mask(
     dtype: torch.dtype = torch.float32,
     **kwargs: Any,
 ) -> "torch.Tensor | BlockMask | None":
-    """Mask factory for ``ALL_MASK_ATTENTION_FUNCTIONS["ffpa"]``."""
+    """Build the attention mask used by the registered FFPA backend.
+
+    Args:
+        batch_size: Number of sequences in the batch.
+        q_length: Query sequence length.
+        kv_length: Key/value sequence length.
+        q_offset: Global offset of the first query token.
+        kv_offset: Global offset of the first key/value token.
+        mask_function: Optional index-based mask predicate.
+        attention_mask: Optional padding mask tensor of shape ``[batch, kv_sequence]``
+            or a prebuilt mask tensor of shape ``[batch, 1, query_sequence, kv_sequence]``.
+        dtype: Floating-point dtype used when a backend needs an additive mask.
+        **kwargs: Mask-factory metadata forwarded by Transformers.
+
+    Returns:
+        A boolean tensor of shape ``[batch, kv_sequence]`` in padding layout or
+        ``[batch, 1, query_sequence, kv_sequence]`` in SDPA layout, a ``BlockMask`` for FlexAttention, or
+        ``None`` when causal attention needs no explicit mask. A padding-layout result may alias
+        ``attention_mask``.
+    """
     # Vision / audio sub-encoders share this registry but need 4D float masks.
     cfg = kwargs.get("config")
-    if cfg is not None:
-        model_type = getattr(cfg, "model_type", "") or ""
-        if "vision" in model_type or "audio" in model_type:
-            return None
+    model_type = getattr(cfg, "model_type", "") or ""
+    if "vision" in model_type or "audio" in model_type:
+        return None
 
     if mask_function is not None:
         from transformers.masking_utils import causal_mask_function, flex_attention_mask
 
         if mask_function is not causal_mask_function:
-            # Sliding-window / vision-bidirectional (non-causal) layers route to FlexAttention:
-            # build the block-sparse BlockMask HF builds under attn_implementation="flex_attention"
-            # so the sliding sparsity is exploited (cheaper than the dense SDPA fallback). The
-            # returned BlockMask is the marker ffpa_attention_forward uses to pick the flex path.
             device = kwargs.pop("device", None) or (attention_mask.device if attention_mask is not None else "cpu")
-            return flex_attention_mask(
+            sliding_backend = str(getattr(cfg, "ffpa_sliding_attn_backend", "flex")).lower()
+            if sliding_backend == "sdpa":
+                from transformers.masking_utils import sdpa_mask
+
+                mask_builder = sdpa_mask
+            elif sliding_backend == "flex":
+                # BlockMask preserves sliding sparsity and selects the Flex path in ffpa_attention_forward.
+                mask_builder = flex_attention_mask
+            else:
+                raise ValueError(f"ffpa_sliding_attn_backend must be 'flex' or 'sdpa', got {sliding_backend!r}.")
+            return mask_builder(
                 batch_size=batch_size,
                 q_length=q_length,
                 kv_length=kv_length,
@@ -311,9 +399,7 @@ def ffpa_mask(
         attention_mask = attention_mask.to(dtype=torch.bool)
     if attention_mask.shape[-1] != kv_length:
         attention_mask = attention_mask[:, -kv_length:]
-    if bool(attention_mask.all()):
-        return None
-    return attention_mask
+    return None if bool(attention_mask.all()) else attention_mask
 
 
 def ffpa_attention_forward(
@@ -327,21 +413,36 @@ def ffpa_attention_forward(
     softcap: float | None = None,
     **kwargs: Any,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """HF attention-interface forward backed by ``torch.ops.ffpa_attn._fwd_cute``."""
-    # Sliding-window / vision-bidirectional layers carry a flex BlockMask (built by ffpa_mask);
-    # FlexAttention is their backend -- there is no SDPA/eager fallback for them.
+    """Route the Hugging Face attention interface through FFPA or an eligible fallback.
+
+    Args:
+        module: Attention module providing the training state and ``head_dim`` used for FFPA eligibility.
+        query: Query tensor of shape [batch, query_heads, query_sequence, head_dim] in SDPA layout.
+        key: Key tensor of shape [batch, key_value_heads, key_value_sequence, head_dim] in SDPA layout.
+        value: Value tensor of shape [batch, key_value_heads, key_value_sequence, value_head_dim] in SDPA layout.
+            QKV share dtype and device. FFPA requires float16 or bfloat16 CUDA tensors with head dimension 512.
+        attention_mask: Optional boolean padding tensor of shape [batch, key_value_sequence] or additive tensor
+            of shape [batch, 1, query_sequence, key_value_sequence]. A Flex ``BlockMask`` produced by
+            ``ffpa_mask`` may also be supplied for the FlexAttention route.
+        dropout: Dropout probability. Nonzero training dropout makes the FFPA route ineligible.
+        scaling: Optional pre-softmax scaling factor applied to query-key scores.
+        softcap: Optional score cap; when present, the eager fallback owns execution.
+        **kwargs: Additional Hugging Face attention arguments forwarded to the selected backend.
+
+    Returns:
+        A tuple containing an output tensor of shape [batch, query_sequence, query_heads, value_head_dim] with
+        the dtype and device of ``query``, and either eager-fallback attention weights of shape
+        [batch, query_heads, query_sequence, key_value_sequence] or ``None``.
+    """
+    # Flex BlockMask inputs route to Flex; tensor masks continue through FFPA eligibility and fallback checks.
     if _is_block_mask(attention_mask):
         flex = _get_flex()
         if flex is None:
             raise RuntimeError("ffpa_attention_forward: flex_attention is unavailable for sliding-window layers")
         return flex(module, query, key, value, attention_mask, scaling=scaling, softcap=softcap, **kwargs)
 
-    # Full-attention (head_dim=512) path: run FFPA when eligible, else fall back to SDPA/eager below.
-    # softcap must go to eager: SDPA silently drops the kwarg.
-    use_sdpa = softcap is None
-
     def _fallback():
-        if use_sdpa:
+        if softcap is None:
             sdpa = _get_sdpa()
             if sdpa is not None:
                 return sdpa(module, query, key, value, attention_mask, dropout=dropout, scaling=scaling, **kwargs)
@@ -363,7 +464,7 @@ def ffpa_attention_forward(
     if module.training and float(dropout) > 0.0:
         _warn_once("dropout", f"CuTeDSL backend rejects dropout={float(dropout):.4f}")
         return _fallback()
-    # Refuse silent default to 1/sqrt(head_dim): Gemma4 full-attn uses 1/sqrt(256), not 1/sqrt(512).
+    # Refuse FFPA's implicit 1/sqrt(head_dim) default: Gemma4 supplies its own scaling (1.0 in Transformers 5.12.1).
     if scaling is None:
         _warn_once("scaling", "module.scaling is None — refusing ffpa default scale")
         return _fallback()
@@ -371,47 +472,44 @@ def ffpa_attention_forward(
         _warn_once("ffpa_unavailable", "ffpa_attn or torch.ops.ffpa_attn._fwd_cute not importable")
         return _fallback()
 
-    if attention_mask is not None:
-        if isinstance(attention_mask, torch.Tensor) and attention_mask.dim() == 4:
+    if attention_mask is None:
+        ffpa_high_level = _get_ffpa_high_level()
+        if ffpa_high_level is None:
+            _warn_once("ffpa_attn_func_unavailable", "ffpa_attn.ffpa_attn_func not importable")
             return _fallback()
-        if not (
-            isinstance(attention_mask, torch.Tensor)
-            and attention_mask.dim() == 2
-            and attention_mask.dtype == torch.bool
-        ):
-            _warn_once(
-                "unsupported_mask",
-                f"ffpa expects 2D bool pad mask or 4D additive float; got "
-                f"shape={tuple(attention_mask.shape) if isinstance(attention_mask, torch.Tensor) else type(attention_mask).__name__} "
-                f"dtype={getattr(attention_mask, 'dtype', None)}",
-            )
-            return _fallback()
-        from transformers.modeling_flash_attention_utils import _pad_input, _unpad_input, _upad_input
-
-        B, _, S, _ = query.shape
-        q_pack, k_pack, v_pack, indices_q, (cu_q, cu_k), (max_q, max_k) = _upad_input(
-            query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2), attention_mask, S, _unpad_input
+        ffpa_fn, backend = ffpa_high_level
+        # ffpa returns [B, H_q, N_q, D]; HF caller expects [B, S, H_q, D].
+        out_bhnd = ffpa_fn(
+            query,
+            key,
+            value,
+            attn_mask=None,
+            dropout_p=0.0,
+            is_causal=True,
+            scale=float(scaling),
+            enable_gqa=True,
+            backend=backend,
         )
-        out_pack, _ = _ffpa_varlen_fwd(q_pack, k_pack, v_pack, cu_q, cu_k, max_q, max_k, scale=scaling, causal=True)
-        return _pad_input(out_pack, indices_q, B, S), None
+        return out_bhnd.transpose(1, 2).contiguous(), None
 
-    ffpa_fn, backend = _get_ffpa_high_level()
-    if ffpa_fn is None:
-        _warn_once("ffpa_attn_func_unavailable", "ffpa_attn.ffpa_attn_func not importable")
+    if isinstance(attention_mask, torch.Tensor) and attention_mask.dim() == 4:
         return _fallback()
-    # ffpa returns [B, H_q, N_q, D]; HF caller expects [B, S, H_q, D].
-    out_bhnd = ffpa_fn(
-        query,
-        key,
-        value,
-        attn_mask=None,
-        dropout_p=0.0,
-        is_causal=True,
-        scale=float(scaling),
-        enable_gqa=True,
-        backend=backend,
+    if not isinstance(attention_mask, torch.Tensor) or attention_mask.dim() != 2 or attention_mask.dtype != torch.bool:
+        _warn_once(
+            "unsupported_mask",
+            f"ffpa expects 2D bool pad mask or 4D additive float; got "
+            f"shape={tuple(attention_mask.shape) if isinstance(attention_mask, torch.Tensor) else type(attention_mask).__name__} "
+            f"dtype={getattr(attention_mask, 'dtype', None)}",
+        )
+        return _fallback()
+    from transformers.modeling_flash_attention_utils import _pad_input, _unpad_input, _upad_input
+
+    B, _, S, _ = query.shape
+    q_pack, k_pack, v_pack, indices_q, (cu_q, cu_k), (max_q, max_k) = _upad_input(
+        query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2), attention_mask, S, _unpad_input
     )
-    return out_bhnd.transpose(1, 2).contiguous(), None
+    out_pack, _ = _ffpa_varlen_fwd(q_pack, k_pack, v_pack, cu_q, cu_k, max_q, max_k, scale=scaling, causal=True)
+    return _pad_input(out_pack, indices_q, B, S), None
 
 
 def register_ffpa_attention() -> bool:
@@ -458,6 +556,4 @@ __all__ = [
     "ffpa_mask",
     "register_ffpa_attention",
     "setup_ffpa_backend",
-    "_ffpa_dense_fwd",
-    "_ffpa_dense_bwd",
 ]

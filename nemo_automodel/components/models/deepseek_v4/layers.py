@@ -1272,6 +1272,7 @@ class DeepseekV4Attention(nn.Module):
         cp_group = kwargs.get("_dsv4_cp_group") or getattr(self, "_cp_group", None)
         cp_active = dsv4_cp_enabled(cp_group)
         packed_seq_ids = kwargs.get("packed_seq_ids")
+        vision_token_types = kwargs.get("vision_token_types")
         if packed_seq_ids is not None and packed_seq_ids.dim() == 1:
             packed_seq_ids = packed_seq_ids.unsqueeze(0)
         batch, seq_len = hidden_states.shape[:2]
@@ -1424,6 +1425,8 @@ class DeepseekV4Attention(nn.Module):
                 n_pooled=n_pooled,
                 vanilla_key_len=vanilla_key_len,
                 q_positions=sparse_query_positions,
+                vision_token_types=vision_token_types,
+                max_image_tokens=int(getattr(self.config, "vision_max_n_token", 0) or 0),
             )
             attn_output = dsv4_sparse_attention(
                 q.transpose(1, 2).contiguous(),
