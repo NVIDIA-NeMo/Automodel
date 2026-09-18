@@ -564,8 +564,12 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
     ) -> None:
         """Wrap the model's submodules into FSDP2 units.
 
-        Subclasses override this hook to change how parameters are grouped into FSDP
-        units without having to reimplement the surrounding TP/AC/mixed-precision flow.
+        Strategies deriving from this class (in-tree or registered through
+        :func:`register_parallel_strategy`) override this hook to change how parameters
+        are grouped into FSDP units without reimplementing the surrounding
+        TP/AC/mixed-precision flow. ``fully_shard_fn`` selects the primitive that wraps
+        each unit and is also used for the root and embedding units, so overrides
+        should honor it.
         """
         apply_fsdp2_sharding_recursively(
             module,
@@ -741,24 +745,25 @@ class Qwen3_5ParallelizationStrategy(DefaultParallelizationStrategy):
 
     def _apply_fsdp_sharding(
         self,
-        module,
-        mesh,
-        mp_policy,
-        offload_policy=None,
-        enable_fsdp2_prefetch=True,
-        fsdp2_backward_prefetch_depth=2,
-        fsdp2_forward_prefetch_depth=1,
-        reshard_after_forward=None,
+        module: nn.Module,
+        mesh: DeviceMesh,
+        mp_policy: MixedPrecisionPolicy | None,
+        offload_policy: OffloadPolicy | None = None,
+        enable_fsdp2_prefetch: bool = True,
+        fsdp2_backward_prefetch_depth: int = 2,
+        fsdp2_forward_prefetch_depth: int = 1,
+        reshard_after_forward: bool | None = None,
         fully_shard_fn=None,
-        frozen_multimodal_sharding="root",
-        ignored_multimodal_params=None,
-    ):
+        frozen_multimodal_sharding: FrozenMultimodalSharding = "root",
+        ignored_multimodal_params: set[nn.Parameter] | None = None,
+    ) -> None:
         """Shard each decoder layer with :func:`fully_shard_by_dtype`.
 
         Overrides the default recursive walk so fp32 and bfloat16 parameters end up
-        in separate, dtype-uniform FSDP groups.
+        in separate, dtype-uniform FSDP groups. ``fully_shard_fn`` is forwarded to
+        every unit; the prefetch knobs are not supported by the dtype walk.
         """
-        del enable_fsdp2_prefetch, fsdp2_backward_prefetch_depth, fsdp2_forward_prefetch_depth, fully_shard_fn
+        del enable_fsdp2_prefetch, fsdp2_backward_prefetch_depth, fsdp2_forward_prefetch_depth
         frozen_multimodal_sharding = normalize_frozen_multimodal_sharding(frozen_multimodal_sharding)
         pp_enabled = "pp" in mesh.mesh_dim_names and mesh["pp"].size() > 1
 
@@ -780,6 +785,7 @@ class Qwen3_5ParallelizationStrategy(DefaultParallelizationStrategy):
                     mp_policy,
                     offload_policy,
                     reshard_after_forward=reshard_after_forward,
+                    fully_shard_fn=fully_shard_fn,
                     frozen_multimodal_sharding=frozen_multimodal_sharding,
                     ignored_multimodal_params=ignored_multimodal_params,
                 )
@@ -798,6 +804,7 @@ class Qwen3_5ParallelizationStrategy(DefaultParallelizationStrategy):
                     offload_policy,
                     fp32_compute_module_names=self._fp32_compute_module_names,
                     reshard_after_forward=layer_reshard_after_forward,
+                    fully_shard_fn=fully_shard_fn,
                 )
         else:
             for name, sub in module.named_children():
@@ -817,6 +824,7 @@ class Qwen3_5ParallelizationStrategy(DefaultParallelizationStrategy):
                     mp_policy,
                     offload_policy,
                     reshard_after_forward=reshard_after_forward,
+                    fully_shard_fn=fully_shard_fn,
                     frozen_multimodal_sharding=frozen_multimodal_sharding,
                     ignored_multimodal_params=ignored_multimodal_params,
                 )
