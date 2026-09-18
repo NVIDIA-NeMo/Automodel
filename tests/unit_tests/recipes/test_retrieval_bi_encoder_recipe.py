@@ -71,10 +71,12 @@ def test_retrieval_attrs_accept_unwrapped_model():
     assert _uses_multi_vector_scoring(inner) is True
 
 
-def test_configure_sentence_transformer_export_binds_exact_static_collator_prompts():
+def test_configure_sentence_transformer_export_binds_structured_multimodal_prompts_without_separator():
     captured = {}
 
     class _Model(torch.nn.Module):
+        sentence_transformer_export_config = SimpleNamespace(input_mode="structured_multimodal")
+
         def __init__(self):
             super().__init__()
 
@@ -89,6 +91,29 @@ def test_configure_sentence_transformer_export_binds_exact_static_collator_promp
 
     wrapped = _DDPLikeWrapper(_Model())
     _configure_sentence_transformer_export(wrapped, collator)
+
+    assert captured == {"query_prompt": "query:", "document_prompt": "passage:"}
+
+
+def test_configure_sentence_transformer_export_retains_separator_for_text_prompts():
+    captured = {}
+
+    class _Model(torch.nn.Module):
+        sentence_transformer_export_config = SimpleNamespace(input_mode="text")
+
+        def __init__(self):
+            super().__init__()
+
+        def configure_sentence_transformer_prompts(self, **kwargs):
+            captured.update(kwargs)
+
+    collator = SimpleNamespace(
+        query_prefix="query:",
+        passage_prefix="passage:",
+        use_dataset_instruction=False,
+    )
+
+    _configure_sentence_transformer_export(_Model(), collator)
 
     assert captured == {"query_prompt": "query: ", "document_prompt": "passage: "}
 

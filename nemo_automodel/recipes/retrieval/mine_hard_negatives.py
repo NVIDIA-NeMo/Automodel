@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -39,6 +40,7 @@ QUERY_EMBEDDINGS_FNAME = "query_embeddings.npz"
 DOCUMENT_EMBEDDINGS_FNAME = "passage_embeddings.npz"
 CORPUS_CHUNKS_DIR = "corpus_chunks"
 QUERY_SHARDS_DIR = "query_shards"
+MULTIMODAL_SCRATCH_DIR = "multimodal_scratch"
 
 # Mining algorithm constants
 TOPK_BUFFER_MULTIPLIER = 2  # Select 2x candidates to ensure enough negatives after filtering positives
@@ -71,6 +73,11 @@ MINING_DEFAULTS = {
     "tokenizer_name_or_path": None,  # Optional: defaults to model_name_or_path
     # Attention implementation for model loading
     "attn_implementation": None,  # None = use model default; "sdpa", "flash_attention_2", "eager"
+    "trust_remote_code": False,
+    "tokenizer_force_default": False,
+    # Optional typed, model-owned multimodal encoder config. Text-only behavior is
+    # unchanged when omitted.
+    "multimodal_encoder": None,
 }
 
 
@@ -99,6 +106,31 @@ def _load_npz_array(path: Path) -> np.ndarray:
     """
     cached = np.load(path)
     return cached[cached.files[0]]
+
+
+def _save_npz_array(path: Path, embeddings: np.ndarray) -> None:
+    """Atomically save an embeddings array to an NPZ archive."""
+    temporary_path = path.with_name(f"{path.name}.tmp.npz")
+    np.savez(temporary_path, embeddings)
+    os.replace(temporary_path, path)
+
+
+def _concatenate_embedding_shards(parts: list[np.ndarray]) -> np.ndarray:
+    """Concatenate embedding shards while normalizing zero-row metadata shards."""
+    nonempty_dims = {part.shape[1] for part in parts if part.ndim == 2 and part.shape[0] > 0}
+    if len(nonempty_dims) > 1:
+        raise ValueError(f"Embedding shard dimensions do not match: {sorted(nonempty_dims)}")
+    embedding_dim = next(iter(nonempty_dims), 0)
+    normalized_parts = []
+    for part in parts:
+        if part.ndim != 2:
+            raise ValueError(f"Embedding shards must be 2D, got shape {part.shape}.")
+        if part.shape[0] == 0:
+            part = np.empty((0, embedding_dim), dtype=part.dtype)
+        elif part.shape[1] != embedding_dim:
+            raise ValueError(f"Embedding shard dimension mismatch: got {part.shape[1]}, expected {embedding_dim}.")
+        normalized_parts.append(part)
+    return np.concatenate(normalized_parts, axis=0)
 
 
 def _compute_rank_partition(total_size: int, world_size: int, rank: int) -> Tuple[int, int]:
@@ -178,10 +210,14 @@ class MineHardNegativesRecipe:
         self.add_bos_token = None
         self.add_eos_token = None
         self.attn_implementation = None
+        self.trust_remote_code = None
+        self.tokenizer_force_default = None
 
         # Model and tokenizer (populated in setup)
         self.model = None
         self.tokenizer = None
+        self.multimodal_encoder = None
+        self.multimodal_encoder_config = None
 
         # Data (populated in setup)
         self.questions_dataset = None
@@ -241,6 +277,8 @@ class MineHardNegativesRecipe:
             "use_liger_kernel": False,  # Not needed for inference
             "use_sdpa_patching": True,
         }
+        if self.trust_remote_code:
+            model_kwargs["trust_remote_code"] = True
         if self.attn_implementation is not None:
             model_kwargs["attn_implementation"] = self.attn_implementation
         self.model = NeMoAutoModelBiEncoder.from_pretrained(
@@ -250,8 +288,15 @@ class MineHardNegativesRecipe:
         self.model = self.model.to(self.dist_env.device)
         self.model.eval()
 
-        # Load and configure tokenizer
-        self._configure_tokenizer()
+        # A configured multimodal encoder owns processor construction. The legacy
+        # text path continues to construct the tokenizer exactly as before.
+        multimodal_encoder_cfg = self._get_mining_param("multimodal_encoder")
+        if multimodal_encoder_cfg is None:
+            self._configure_tokenizer()
+        else:
+            self.multimodal_encoder_config = multimodal_encoder_cfg.to_yaml_dict(resolve_env=True)
+            encoder_config = multimodal_encoder_cfg.instantiate()
+            self.multimodal_encoder = encoder_config.build(model=self.model, device=self.dist_env.device)
 
         # Load dataset and corpus
         self._load_data()
@@ -306,6 +351,8 @@ class MineHardNegativesRecipe:
 
         # Attention implementation for model loading
         self.attn_implementation = self._get_mining_param("attn_implementation")
+        self.trust_remote_code = self._get_mining_param("trust_remote_code")
+        self.tokenizer_force_default = self._get_mining_param("tokenizer_force_default")
 
         # Prefix and length parameters for embedding generation
         self.query_prefix = self._get_mining_param("query_prefix")
@@ -346,6 +393,10 @@ class MineHardNegativesRecipe:
             tokenizer_kwargs["add_eos_token"] = self.add_eos_token
 
         # Load tokenizer
+        if self.tokenizer_force_default:
+            tokenizer_kwargs["force_default"] = True
+        if self.trust_remote_code:
+            tokenizer_kwargs["trust_remote_code"] = True
         self.tokenizer = NeMoAutoTokenizer.from_pretrained(self.tokenizer_name_or_path, **tokenizer_kwargs)
 
         # Log tokenizer configuration for transparency
@@ -542,6 +593,11 @@ class MineHardNegativesRecipe:
         Returns:
             numpy array of query embeddings [num_queries, embedding_dim].
         """
+        if self.multimodal_encoder is not None:
+            return self.multimodal_encoder.encode_queries(
+                self.questions,
+                batch_size=self.query_embedding_batch_size,
+            )
         return self._encode_texts(
             texts=self.questions,
             batch_size=self.query_embedding_batch_size,
@@ -567,6 +623,8 @@ class MineHardNegativesRecipe:
             )
 
         cache_dir = Path(self.cache_embeddings_dir)
+        if self.multimodal_encoder is not None:
+            cache_dir = cache_dir / MULTIMODAL_SCRATCH_DIR
         shard_dir = cache_dir / QUERY_SHARDS_DIR
         shard_dir.mkdir(parents=True, exist_ok=True)
 
@@ -579,17 +637,26 @@ class MineHardNegativesRecipe:
         shard_path = shard_dir / f"queries_rank{r:04d}.npz"
 
         # Compute or load this rank's shard
-        if shard_path.exists():
+        if local_start == local_end:
+            local_embeds = np.empty((0, 0), dtype=np.float32)
+            _save_npz_array(shard_path, local_embeds)
+        elif shard_path.exists() and self.multimodal_encoder is None:
             local_embeds = _load_npz_array(shard_path)
         else:
             local_texts = self.questions[local_start:local_end]
-            local_embeds = self._encode_texts(
-                texts=local_texts,
-                batch_size=self.query_embedding_batch_size,
-                max_length=self.query_max_length,
-                prefix=self.query_prefix,
-            )
-            np.savez(shard_path, local_embeds)
+            if self.multimodal_encoder is not None:
+                local_embeds = self.multimodal_encoder.encode_queries(
+                    local_texts,
+                    batch_size=self.query_embedding_batch_size,
+                )
+            else:
+                local_embeds = self._encode_texts(
+                    texts=local_texts,
+                    batch_size=self.query_embedding_batch_size,
+                    max_length=self.query_max_length,
+                    prefix=self.query_prefix,
+                )
+            _save_npz_array(shard_path, local_embeds)
 
         # Synchronize so rank0 can safely assemble
         self._synchronize_ranks()
@@ -610,7 +677,7 @@ class MineHardNegativesRecipe:
             _validate_shard_shape(rr_path, expected, rr_emb.shape[0])
             parts.append(rr_emb)
 
-        return np.concatenate(parts, axis=0)
+        return _concatenate_embedding_shards(parts)
 
     def _load_cached_chunk(self, cache_path: Path) -> np.ndarray | None:
         """Load a fully-assembled chunk cache if it exists.
@@ -625,6 +692,8 @@ class MineHardNegativesRecipe:
         """
         if cache_path is None or not cache_path.exists():
             return None
+        if self.multimodal_encoder is not None:
+            return None
 
         # In distributed runs, only rank0 needs the assembled chunk
         if self.dist_env.world_size > 1 and not self.dist_env.is_main:
@@ -634,7 +703,7 @@ class MineHardNegativesRecipe:
 
     def _encode_chunk_distributed(
         self,
-        texts: List[str],
+        doc_indices: list[int],
         cache_path: Path,
     ) -> np.ndarray:
         """Encode a chunk of documents in distributed mode.
@@ -643,13 +712,13 @@ class MineHardNegativesRecipe:
         and assembles on rank0.
 
         Args:
-            texts: Document texts to encode.
+            doc_indices: Corpus indices to encode.
             cache_path: Path for caching the assembled chunk.
 
         Returns:
             Assembled document embeddings for this chunk (rank0 only).
         """
-        num_docs_in_chunk = len(texts)
+        num_docs_in_chunk = len(doc_indices)
         ws = self.dist_env.world_size
         r = self.dist_env.rank
 
@@ -660,17 +729,12 @@ class MineHardNegativesRecipe:
         rank_cache_path = cache_path.parent / f"{cache_path.stem}_rank{r:04d}{cache_path.suffix}"
 
         # Compute or load this rank's slice
-        if rank_cache_path.exists():
+        if rank_cache_path.exists() and self.multimodal_encoder is None:
             local_embeds = _load_npz_array(rank_cache_path)
         else:
-            local_texts = texts[local_start:local_end]
-            local_embeds = self._encode_texts(
-                texts=local_texts,
-                batch_size=self.document_embedding_batch_size,
-                max_length=self.passage_max_length,
-                prefix=self.passage_prefix,
-            )
-            np.savez(rank_cache_path, local_embeds)
+            local_doc_indices = doc_indices[local_start:local_end]
+            local_embeds = self._encode_document_indices(local_doc_indices)
+            _save_npz_array(rank_cache_path, local_embeds)
 
         # Synchronize to ensure all rank shard files exist before assembly on rank0
         self._synchronize_ranks()
@@ -689,9 +753,9 @@ class MineHardNegativesRecipe:
                 _validate_shard_shape(rr_path, expected, rr_emb.shape[0])
                 parts.append(rr_emb)
 
-            embeddings = np.concatenate(parts, axis=0)
+            embeddings = _concatenate_embedding_shards(parts)
             # Save assembled chunk for faster reuse next time
-            np.savez(cache_path, embeddings)
+            _save_npz_array(cache_path, embeddings)
             return embeddings
 
         # Non-main ranks do not need the assembled chunk
@@ -699,27 +763,50 @@ class MineHardNegativesRecipe:
 
     def _encode_chunk_local(
         self,
-        texts: List[str],
+        doc_indices: list[int],
         cache_path: Path | None,
     ) -> np.ndarray:
         """Encode a chunk of documents locally (single-process).
 
         Args:
-            texts: Document texts to encode.
+            doc_indices: Corpus indices to encode.
             cache_path: Optional path for caching.
 
         Returns:
             Document embeddings for this chunk.
         """
-        embeddings = self._encode_texts(
-            texts=texts,
-            batch_size=self.document_embedding_batch_size,
-            max_length=self.passage_max_length,
-            prefix=self.passage_prefix,
-        )
+        embeddings = self._encode_document_indices(doc_indices)
         if cache_path is not None:
-            np.savez(cache_path, embeddings)
+            _save_npz_array(cache_path, embeddings)
         return embeddings
+
+    def _encode_document_indices(self, doc_indices: list[int]) -> np.ndarray:
+        """Fetch and encode corpus documents in bounded batches and stable order."""
+        if not doc_indices:
+            return np.empty((0, 0), dtype=np.float32)
+        embeddings = []
+        for start in range(0, len(doc_indices), self.document_embedding_batch_size):
+            batch_indices = doc_indices[start : start + self.document_embedding_batch_size]
+            doc_ids = [self.idx_to_doc[idx] for idx in batch_indices]
+            documents = [
+                {**self.documents_dataset.get_document_by_id(doc_id), "_mining_document_id": doc_id}
+                for doc_id in doc_ids
+            ]
+            if self.multimodal_encoder is not None:
+                batch_embeddings = self.multimodal_encoder.encode_documents(
+                    documents,
+                    batch_size=self.document_embedding_batch_size,
+                )
+            else:
+                texts = [self._get_document_text(document) for document in documents]
+                batch_embeddings = self._encode_texts(
+                    texts=texts,
+                    batch_size=self.document_embedding_batch_size,
+                    max_length=self.passage_max_length,
+                    prefix=self.passage_prefix,
+                )
+            embeddings.append(batch_embeddings)
+        return np.concatenate(embeddings, axis=0)
 
     def _encode_documents_chunk(
         self,
@@ -740,11 +827,6 @@ class MineHardNegativesRecipe:
         if cached_result is not None:
             return cached_result
 
-        # Fetch document texts
-        doc_ids = [self.idx_to_doc[idx] for idx in doc_indices]
-        docs = [self.documents_dataset.get_document_by_id(doc_id) for doc_id in doc_ids]
-        texts = [self._get_document_text(doc) for doc in docs]
-
         # Encode: distributed or local
         if self.dist_env.world_size > 1:
             if cache_path is None:
@@ -752,9 +834,9 @@ class MineHardNegativesRecipe:
                     "Distributed mining requires --mining.cache_embeddings_dir so ranks can shard document encoding "
                     "and rank0 can assemble embeddings from cached corpus chunks."
                 )
-            return self._encode_chunk_distributed(texts, cache_path)
+            return self._encode_chunk_distributed(doc_indices, cache_path)
         else:
-            return self._encode_chunk_local(texts, cache_path)
+            return self._encode_chunk_local(doc_indices, cache_path)
 
     def _encode_all_documents(self) -> np.ndarray:
         """Encode all documents in corpus, chunk by chunk.
@@ -765,7 +847,10 @@ class MineHardNegativesRecipe:
         # Setup cache directory if caching enabled
         chunk_cache_dir = None
         if self.cache_embeddings_dir:
-            chunk_cache_dir = Path(self.cache_embeddings_dir) / CORPUS_CHUNKS_DIR
+            cache_dir = Path(self.cache_embeddings_dir)
+            if self.multimodal_encoder is not None:
+                cache_dir = cache_dir / MULTIMODAL_SCRATCH_DIR
+            chunk_cache_dir = cache_dir / CORPUS_CHUNKS_DIR
             chunk_cache_dir.mkdir(parents=True, exist_ok=True)
         elif self.dist_env.world_size > 1:
             raise ValueError(
@@ -851,8 +936,8 @@ class MineHardNegativesRecipe:
         cache_dir = Path(self.cache_embeddings_dir)
         cache_dir.mkdir(parents=True, exist_ok=True)
 
-        np.savez(cache_dir / QUERY_EMBEDDINGS_FNAME, query_embeddings)
-        np.savez(cache_dir / DOCUMENT_EMBEDDINGS_FNAME, document_embeddings)
+        _save_npz_array(cache_dir / QUERY_EMBEDDINGS_FNAME, query_embeddings)
+        _save_npz_array(cache_dir / DOCUMENT_EMBEDDINGS_FNAME, document_embeddings)
 
         logger.info(f"Saved embeddings to cache: {cache_dir}")
 
@@ -864,6 +949,12 @@ class MineHardNegativesRecipe:
         Returns:
             Tuple of (query_embeddings, document_embeddings).
         """
+        if self.multimodal_encoder is not None and self.load_embeddings_from_cache:
+            raise ValueError(
+                "Reusable embedding caches are not supported for multimodal mining because processor, model, query, "
+                "corpus, and source-image identity cannot yet be validated. Set mining.load_embeddings_from_cache=false."
+            )
+
         # Try loading from cache first.
         #
         # In distributed runs, only rank0 needs the consolidated embeddings for mining.
@@ -916,7 +1007,7 @@ class MineHardNegativesRecipe:
             logger.info(f"Document embeddings shape: {document_embeddings.shape}")
 
         # Save to cache (rank0 only; writes the consolidated query_embeddings.npz and passage_embeddings.npz)
-        if self.cache_embeddings_dir and self.dist_env.is_main:
+        if self.cache_embeddings_dir and self.dist_env.is_main and self.multimodal_encoder is None:
             self._save_embeddings_to_cache(query_embeddings, document_embeddings)
 
         # Only rank0 proceeds to mining/output; other ranks return dummy arrays.
@@ -947,6 +1038,8 @@ class MineHardNegativesRecipe:
 
         # Move model to CPU first (safer cleanup)
         self.model = self.model.cpu()
+        if self.multimodal_encoder is not None:
+            self.multimodal_encoder.release_model()
 
         # Delete model reference
         del self.model
@@ -997,7 +1090,8 @@ class MineHardNegativesRecipe:
                 - pos_scores: Similarity scores for each positive document
         """
         # Convert document embeddings to tensor once (encoder embeddings are 2D)
-        doc_embeddings_tensor = torch.tensor(document_embeddings, device="cuda")
+        mining_device = self.dist_env.device
+        doc_embeddings_tensor = torch.tensor(document_embeddings, device=mining_device)
 
         neg_indices_all = []
         neg_scores_all = []
@@ -1015,7 +1109,7 @@ class MineHardNegativesRecipe:
             batch_pos_indices = pos_doc_indices[start_idx:end_idx]
 
             # Compute similarity scores: [batch_size, num_docs]
-            batch_query_tensor = torch.tensor(batch_query_embs, device="cuda")
+            batch_query_tensor = torch.tensor(batch_query_embs, device=mining_device)
             batch_scores = batch_query_tensor @ doc_embeddings_tensor.T
 
             # Extract positive scores and mask positives
@@ -1045,7 +1139,7 @@ class MineHardNegativesRecipe:
 
             # Vectorized margin filtering
             if hard_neg_margin is not None:
-                min_pos_tensor = torch.tensor(min_pos_scores, device="cuda")
+                min_pos_tensor = torch.tensor(min_pos_scores, device=mining_device)
 
                 if hard_neg_margin_type.lower() == "abs":
                     threshold = torch.unsqueeze(min_pos_tensor - hard_neg_margin, dim=1)
@@ -1107,6 +1201,10 @@ class MineHardNegativesRecipe:
             "passage_max_length": self.passage_max_length,
             "add_bos_token": self.add_bos_token,  # None means "use Automodel tokenizer defaults"
             "add_eos_token": self.add_eos_token,  # None means "use Automodel tokenizer defaults"
+            "trust_remote_code": self.trust_remote_code,
+            "tokenizer_force_default": self.tokenizer_force_default,
+            "multimodal_encoder": self.multimodal_encoder_config,
+            "cache_reuse": self.load_embeddings_from_cache if self.multimodal_encoder is None else False,
             # Model info (loaded directly from path, not from config)
             "model_name_or_path": str(self.model_name_or_path),
             "tokenizer_name_or_path": str(self.tokenizer_name_or_path),
