@@ -40,6 +40,7 @@ from nemo_automodel._transformers.model_init import (
     _try_get_remote_code_model_cls,
     get_hf_config,
 )
+from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.models.common.utils import BackendConfig, generation_config_from_model_config
 
 
@@ -559,7 +560,14 @@ class TestBackendDictCoercion:
         config.name_or_path = "fake/model"
         return config
 
-    def _run_init_model(self, mock_resolve_cls, backend_config_resolver=None, **extra_kwargs):
+    def _run_init_model(
+        self,
+        mock_resolve_cls,
+        backend_config_resolver=None,
+        attn_implementation="flash_attention_2",
+        uses_native_fa4=False,
+        **extra_kwargs,
+    ):
         """Helper to call _init_model with a fake model class and capture kwargs."""
         captured_kwargs = {}
 
@@ -568,6 +576,8 @@ class TestBackendDictCoercion:
             return MagicMock()
 
         fake_model_cls.__module__ = "nemo_automodel.components.models.fake"
+        if uses_native_fa4:
+            fake_model_cls._uses_native_fa4 = True
         if backend_config_resolver is not None:
             fake_model_cls.backend_config_resolver = backend_config_resolver
         mock_resolve_cls.return_value = fake_model_cls
@@ -575,7 +585,7 @@ class TestBackendDictCoercion:
         _init_model(
             cls=MagicMock(),
             pretrained_model_name_or_path_or_config=self._make_config(),
-            attn_implementation="flash_attention_2",
+            attn_implementation=attn_implementation,
             torch_dtype="auto",
             quantization_config=None,
             force_hf=False,
@@ -598,6 +608,89 @@ class TestBackendDictCoercion:
 
     @patch("nemo_automodel._transformers.model_init._download_model_weights")
     @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")
+    def test_flash_attention_4_selects_native_fa4_backend(self, mock_resolve_cls, _mock_download):
+        captured = self._run_init_model(
+            mock_resolve_cls,
+            attn_implementation="flash_attention_4",
+            uses_native_fa4=True,
+            backend={"attn": "sdpa"},
+        )
+
+        assert isinstance(captured["backend"], BackendConfig)
+        assert captured["backend"].attn == "fa4"
+
+    @patch("nemo_automodel._transformers.model_init._download_model_weights")
+    @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")
+    def test_flash_attention_4_does_not_mutate_typed_backend(self, mock_resolve_cls, _mock_download):
+        original = BackendConfig(attn="sdpa", linear="torch")
+        with patch("nemo_automodel._transformers.model_init._apply_backend_module_overrides") as apply_overrides:
+            captured = self._run_init_model(
+                mock_resolve_cls,
+                attn_implementation="flash_attention_4",
+                uses_native_fa4=True,
+                backend=original,
+            )
+
+        assert captured["backend"] is not original
+        assert captured["backend"].attn == "fa4"
+        assert original.attn == "sdpa"
+        assert apply_overrides.call_args.args[1] is captured["backend"]
+
+    @patch("nemo_automodel._transformers.model_init._download_model_weights")
+    @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")
+    def test_config_node_stays_at_instantiation_boundary(self, mock_resolve_cls, _mock_download):
+        cfg_model = ConfigNode(
+            {
+                "_target_": lambda **kwargs: self._run_init_model(
+                    mock_resolve_cls,
+                    uses_native_fa4=True,
+                    **kwargs,
+                ),
+                "attn_implementation": "flash_attention_4",
+                "backend": {"_target_": BackendConfig, "attn": "sdpa"},
+            }
+        )
+
+        captured = cfg_model.instantiate()
+
+        assert cfg_model.backend.attn == "sdpa"
+        assert captured["backend"].attn == "fa4"
+
+    @patch("nemo_automodel._transformers.model_init._download_model_weights")
+    @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")
+    def test_flash_attention_4_preserves_backend_without_native_consumer(self, mock_resolve_cls, _mock_download):
+        original = BackendConfig(attn="sdpa")
+
+        captured = self._run_init_model(
+            mock_resolve_cls,
+            attn_implementation="flash_attention_4",
+            backend=original,
+        )
+
+        assert captured["backend"] is original
+        assert captured["backend"].attn == "sdpa"
+
+    @pytest.mark.parametrize("attn_implementation", ["sdpa", "flash_attention_2", "flash_attention_3"])
+    @patch("nemo_automodel._transformers.model_init._download_model_weights")
+    @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")
+    def test_attention_without_native_alias_preserves_backend(
+        self,
+        mock_resolve_cls,
+        _mock_download,
+        attn_implementation,
+    ):
+        original = BackendConfig(attn="te")
+        captured = self._run_init_model(
+            mock_resolve_cls,
+            attn_implementation=attn_implementation,
+            backend=original,
+        )
+
+        assert captured["backend"] is original
+        assert captured["backend"].attn == "te"
+
+    @patch("nemo_automodel._transformers.model_init._download_model_weights")
+    @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")
     def test_model_specific_backend_resolver_takes_precedence(self, mock_resolve_cls, _mock_download):
         """Custom models may merge partial mappings onto model-specific stable defaults."""
         resolved_backend = object()
@@ -609,6 +702,7 @@ class TestBackendDictCoercion:
         captured = self._run_init_model(
             mock_resolve_cls,
             backend_config_resolver=_resolve_backend,
+            attn_implementation="flash_attention_4",
             backend={"rms_norm": "te"},
         )
 
@@ -627,7 +721,7 @@ class TestBackendDictCoercion:
     @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")
     def test_no_backend_kwarg_unchanged(self, mock_resolve_cls, _mock_download):
         """When no backend is provided, kwargs should not gain one."""
-        captured = self._run_init_model(mock_resolve_cls)
+        captured = self._run_init_model(mock_resolve_cls, attn_implementation="flash_attention_4")
 
         assert "backend" not in captured
 

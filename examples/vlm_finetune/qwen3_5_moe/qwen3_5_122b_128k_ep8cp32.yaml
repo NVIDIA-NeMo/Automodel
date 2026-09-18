@@ -146,7 +146,6 @@ packed_sequence:
   drop_long_samples: true
   balance_media_tokens: true
   max_packs: 128
-  attn_implementation: sdpa
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader

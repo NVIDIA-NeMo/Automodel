@@ -660,7 +660,7 @@ class NeatPackConfig:
     collate_max_length: int | None = None
     """Optional maximum padded length used by the packed collator."""
     attn_implementation: str | None = None
-    """Optional packed-mask backend override used only with context parallelism."""
+    """Deprecated packed-mask backend override retained for Python compatibility."""
     packing_format: Literal["neat", "thd"] = "neat"
     """Packed collator format. ``thd`` emits Transformer Engine sequence metadata."""
 

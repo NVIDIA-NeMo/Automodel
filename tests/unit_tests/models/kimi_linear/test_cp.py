@@ -139,6 +139,30 @@ def test_shard_batch_derives_documents_from_indexed_mask():
     assert sharded["kimi_packed_context"].row_cu_seqlens(0)[0].tolist() == [0, 3, 7, 8]
 
 
+def test_shard_batch_consumes_dataset_packing_metadata():
+    batch = _batch(seq_len=8)
+    batch.update(
+        {
+            "attention_mask": torch.ones(1, 1, 8, 8, dtype=torch.bool),
+            "_packed_seq_ids": torch.tensor([[1, 1, 1, 2, 2, 2, 2, 0]], dtype=torch.int32),
+            "packed_token_indices": torch.arange(7),
+            "cu_seqlens": torch.tensor([0, 3, 7], dtype=torch.int32),
+            "max_seqlen": 4,
+        }
+    )
+
+    _, sharded, _ = shard_batch_for_kimi_cp(_FakeCPMesh(2, 0), None, batch)
+
+    assert sharded["kimi_packed_context"].doc_ids.tolist() == [[1, 1, 1, 2, 2, 2, 2, 0]]
+    assert not {
+        "attention_mask",
+        "_packed_seq_ids",
+        "packed_token_indices",
+        "cu_seqlens",
+        "max_seqlen",
+    } & set(sharded)
+
+
 def test_shard_batch_drops_thd_metadata_that_no_longer_matches():
     batch = _batch(seq_len=8)
     batch["seq_lens"] = torch.tensor([[5, 3]], dtype=torch.int32)
