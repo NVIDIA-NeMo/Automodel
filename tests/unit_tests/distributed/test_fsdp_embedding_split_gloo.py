@@ -27,10 +27,10 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
-from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy, fully_shard
+from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy
 from torch.distributed.tensor import DTensor
 
-from nemo_automodel.components.distributed.parallelizer import _fully_shard_untied_input_output_embeddings
+from nemo_automodel.components.distributed.parallelizer import DefaultParallelizationStrategy
 
 # Over the default 5s budget on purpose: this module spawns worker processes; every child re-imports torch from scratch.
 # Shrink the work or the process count before raising this further.
@@ -38,20 +38,32 @@ pytestmark = pytest.mark.timeout(60)
 
 
 class _ToyLM(nn.Module):
-    def __init__(self, *, tied: bool) -> None:
+    def __init__(self, *, tied: bool, input_in_container: bool, output_in_container: bool) -> None:
         super().__init__()
         self.config = SimpleNamespace(tie_word_embeddings=tied)
-        self.embed_tokens = nn.Embedding(32, 8)
-        self.body = nn.Linear(8, 8)
-        self.lm_head = nn.Linear(8, 32, bias=False)
+        input_embedding = nn.Embedding(32, 8)
+        output_embedding = nn.Linear(8, 32, bias=False)
         if tied:
-            self.lm_head.weight = self.embed_tokens.weight
+            output_embedding.weight = input_embedding.weight
+
+        # Recursive sharding visits ModuleDict children before the embedding pass.
+        # Exercise each table both inside and outside that earlier traversal.
+        self.transformer = nn.ModuleDict()
+        if input_in_container:
+            self.transformer["wte"] = input_embedding
+        else:
+            self.embed_tokens = input_embedding
+        self.transformer["blocks"] = nn.ModuleList([nn.Linear(8, 8)])
+        if output_in_container:
+            self.transformer["ff_out"] = output_embedding
+        else:
+            self.lm_head = output_embedding
 
     def get_input_embeddings(self) -> nn.Module:
-        return self.embed_tokens
+        return self.transformer["wte"] if "wte" in self.transformer else self.embed_tokens
 
     def get_output_embeddings(self) -> nn.Module:
-        return self.lm_head
+        return self.transformer["ff_out"] if "ff_out" in self.transformer else self.lm_head
 
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
         """Compute token logits.
@@ -62,7 +74,10 @@ class _ToyLM(nn.Module):
         Returns:
             Logits of shape [batch, sequence, vocab].
         """
-        return self.lm_head(torch.tanh(self.body(self.embed_tokens(token_ids))))
+        hidden = self.get_input_embeddings()(token_ids)
+        for block in self.transformer["blocks"]:
+            hidden = torch.tanh(block(hidden))
+        return self.get_output_embeddings()(hidden)
 
 
 def _full_tensor(tensor: torch.Tensor) -> torch.Tensor:
@@ -84,29 +99,23 @@ def _free_port() -> int:
         return sock.getsockname()[1]
 
 
-def _run_case(mesh: DeviceMesh, *, tied: bool) -> None:
+def _run_case(
+    mesh: DeviceMesh, *, tied: bool, input_in_container: bool = False, output_in_container: bool = False
+) -> None:
     torch.manual_seed(2026)
-    model = _ToyLM(tied=tied)
+    model = _ToyLM(tied=tied, input_in_container=input_in_container, output_in_container=output_in_container)
     reference = copy.deepcopy(model)
     mp_policy = MixedPrecisionPolicy(reduce_dtype=torch.float32)
 
-    _fully_shard_untied_input_output_embeddings(
-        model,
-        mesh=mesh,
-        mp_policy=mp_policy,
-        offload_policy=None,
-        input_reshard_after_forward=True,
-        fully_shard_fn=fully_shard,
-    )
-    fully_shard(model, mesh=mesh, mp_policy=mp_policy, reshard_after_forward=False)
+    DefaultParallelizationStrategy().parallelize(model, device_mesh=mesh, mp_policy=mp_policy)
 
     assert isinstance(model, FSDPModule)
     if tied:
-        assert not isinstance(model.embed_tokens, FSDPModule)
-        assert not isinstance(model.lm_head, FSDPModule)
+        assert not isinstance(model.get_input_embeddings(), FSDPModule)
+        assert not isinstance(model.get_output_embeddings(), FSDPModule)
     else:
-        assert isinstance(model.embed_tokens, FSDPModule)
-        assert isinstance(model.lm_head, FSDPModule)
+        assert isinstance(model.get_input_embeddings(), FSDPModule)
+        assert isinstance(model.get_output_embeddings(), FSDPModule)
 
     token_ids = torch.tensor([[1, 2, 3], [4, 5, 6]])
     model_optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
@@ -144,8 +153,15 @@ def _worker(rank: int, world_size: int, port: int) -> None:
     os.environ["MASTER_PORT"] = str(port)
     dist.init_process_group("gloo", rank=rank, world_size=world_size)
     try:
-        mesh = init_device_mesh("cpu", (world_size,), mesh_dim_names=("dp",))
-        _run_case(mesh, tied=False)
+        mesh = init_device_mesh("cpu", (1, world_size, 1), mesh_dim_names=("dp_replicate", "dp_shard_cp", "tp"))
+        for input_in_container in (False, True):
+            for output_in_container in (False, True):
+                _run_case(
+                    mesh,
+                    tied=False,
+                    input_in_container=input_in_container,
+                    output_in_container=output_in_container,
+                )
         _run_case(mesh, tied=True)
         dist.barrier()
     finally:

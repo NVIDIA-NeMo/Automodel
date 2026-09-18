@@ -316,6 +316,10 @@ def _fully_shard_untied_input_output_embeddings(
         if module is None or id(module) in seen:
             continue
         seen.add(id(module))
+        # Recursive sharding may already own embeddings inside a ModuleDict.
+        # Preserve that FSDP unit and its policy instead of applying it twice.
+        if isinstance(module, FSDPModule):
+            continue
         if not any(param.requires_grad for param in module.parameters()):
             continue
         fully_shard_fn(
