@@ -70,5 +70,5 @@ repos:
         name: "Disallow globals()"
         language: system
         entry: python tools/lint_no_globals.py
-        files: '^(nemo_automodel|tools|scripts|examples)/.*\.py$|^app\.py$'
+        files: '^(nemo_automodel|tools|scripts|examples|tutorials)/.*\.py$|^app\.py$'
         types: [file]

@@ -166,12 +166,15 @@ ruff check --fix .
 ruff format .
 ```
 
-Ruff does not cover every rule we enforce. `tools/lint_no_globals.py` rejects `globals()`,
-which is usually reached for to swap a module-level function so that another function picks
-up the replacement — a process-wide mutation that changes behaviour for every concurrent or
-nested caller. Pass the collaborator in, or expose a method subclasses can override, instead.
-The one exception is the PEP 562 lazy-import cache (`globals()[name] = attr` inside a
-module-level `def __getattr__`). Run it over the tree with:
+Ruff does not cover every rule we enforce. `tools/lint_no_globals.py` rejects `globals()`
+and its equivalents (module-scope `vars()`, `sys.modules[__name__].__dict__`,
+`setattr(sys.modules[__name__], ...)`). These are usually used to swap a module-level
+function so that another function picks up the replacement — a process-wide mutation that
+changes behavior for every concurrent or nested caller. Pass the collaborator in, or expose
+a method subclasses can override, instead. The one exception is the PEP 562 lazy-import
+cache: `globals()[name] = attr` written directly inside a module-level `def __getattr__(name)`.
+The check covers the same paths as Bandit (`app.py`, `nemo_automodel/`, `examples/`,
+`scripts/`, `tools/`, `tutorials/`); `tests/` is excluded, as it is for Ruff. Run it with:
 
 ```bash
 python tools/lint_no_globals.py
