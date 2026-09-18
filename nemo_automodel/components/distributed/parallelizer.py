@@ -269,9 +269,9 @@ def _get_input_output_embeddings(model: nn.Module) -> tuple[nn.Module | None, nn
 
 
 def _fully_shard_untied_input_output_embeddings(
+    *,
     input_embeddings: nn.Module | None,
     output_embeddings: nn.Module | None,
-    *,
     mesh: DeviceMesh,
     mp_policy: MixedPrecisionPolicy,
     offload_policy: OffloadPolicy | None,
@@ -287,7 +287,10 @@ def _fully_shard_untied_input_output_embeddings(
     table instead of their sum. The caller excludes tied tables, and this pass
     skips frozen tables because they have no gradient communication buffer
     to split. Tables already wrapped as FSDP units retain their existing
-    reshard policy.
+    reshard policy. With an explicit ``reshard_after_forward=True``, a
+    container-hosted head reshards while a newly split top-level head stays
+    gathered. FusedLinearCrossEntropy handles the sharded weight with correct
+    gradients, at the cost of an extra all-gather.
 
     Args:
         input_embeddings: Untied input embedding module, if available.
@@ -532,8 +535,8 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
         )
         if not (weights_are_tied or weights_are_physically_tied):
             _fully_shard_untied_input_output_embeddings(
-                input_embeddings,
-                output_embeddings,
+                input_embeddings=input_embeddings,
+                output_embeddings=output_embeddings,
                 mesh=dp_mesh,
                 mp_policy=mp_policy,
                 offload_policy=offload_policy,
