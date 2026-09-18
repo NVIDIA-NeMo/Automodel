@@ -107,17 +107,50 @@ def test_kd_loss_basic(temperature, upcast, unsqueeze):
     assert torch.allclose(loss, ref, atol=1e-6), f"Expected {ref}, got {loss}"
 
 
-def test_kd_loss_basic_no_labels():
-    """Returns a graph-connected zero when the entire batch is padding."""
-    student_logits = torch.tensor([[2.0, 0.5, -1.0], [0.1, 0.2, 0.3]], requires_grad=True)
-    teacher_logits = torch.tensor([[1.5, 0.0, -0.5], [0.2, -0.1, 0.0]])
-    labels = torch.tensor([-100, -100])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("chunk_size", [0, 2])
+def test_kd_loss_basic_no_labels(dtype, chunk_size):
+    """An ignored microbatch contributes zero loss and zero student gradients."""
+    student_logits = torch.full((2, 3, 8), 2000.0, dtype=dtype, requires_grad=True)
+    teacher_logits = torch.zeros_like(student_logits)
+    labels = torch.full((2, 3), -100)
 
-    loss = KDLoss()(student_logits, teacher_logits, labels)
-
+    loss = KDLoss(chunk_size=chunk_size)(student_logits, teacher_logits, labels)
     assert loss == 0.0
     loss.backward()
     torch.testing.assert_close(student_logits.grad, torch.zeros_like(student_logits))
+
+
+@pytest.mark.parametrize("chunk_size", [0, 2])
+def test_kd_loss_accumulation_with_ignored_microbatch(chunk_size):
+    """Ignoring one microbatch must preserve the supervised batch's update."""
+    torch.manual_seed(61)
+    student = torch.nn.Linear(4, 8)
+    reference = torch.nn.Linear(4, 8)
+    reference.load_state_dict(student.state_dict())
+    inputs = torch.randn(2, 3, 4)
+    teacher_logits = torch.randn(2, 3, 8)
+    labels = torch.tensor([[-100, -100, -100], [0, -100, 1]])
+    count = (labels != -100).sum().item()
+    loss_fn = KDLoss(chunk_size=chunk_size)
+    for i in range(2):
+        loss_fn(student(inputs[i]), teacher_logits[i], labels[i], num_batch_labels=count).backward()
+
+    ref_logits = reference(inputs[1])
+    valid = labels[1] != -100
+    ref_loss = F.kl_div(
+        F.log_softmax(ref_logits[valid], dim=-1),
+        F.log_softmax(teacher_logits[1][valid], dim=-1),
+        reduction="batchmean",
+        log_target=True,
+    )
+    ref_loss.backward()
+    for actual, expected in zip(student.parameters(), reference.parameters()):
+        torch.testing.assert_close(actual.grad, expected.grad)
+    torch.optim.SGD(student.parameters(), lr=0.1).step()
+    torch.optim.SGD(reference.parameters(), lr=0.1).step()
+    for actual, expected in zip(student.parameters(), reference.parameters()):
+        torch.testing.assert_close(actual, expected)
 
 
 def test_kd_loss_ignore_index():
@@ -727,6 +760,19 @@ def _run_two_process_tp_kd_gradient(rank: int, init_file: str) -> None:
             atol=1e-6,
             rtol=1e-5,
         )
+
+        from torch.distributed.device_mesh import init_device_mesh
+        from torch.distributed.tensor import DTensor, Shard
+
+        mesh = init_device_mesh("cpu", (2,))
+        sharded_student = DTensor.from_local(local_student.detach(), mesh, [Shard(-1)]).requires_grad_()
+        sharded_teacher = DTensor.from_local(local_teacher, mesh, [Shard(-1)])
+        ignored_labels = torch.full_like(labels, -100)
+        ignored_loss = KDLoss()(sharded_student, sharded_teacher, ignored_labels)
+        assert ignored_loss.item() == 0.0
+        ignored_loss.backward()
+        assert sharded_student.grad.placements == sharded_student.placements
+        torch.testing.assert_close(sharded_student.grad.to_local(), torch.zeros_like(local_student))
     finally:
         torch.distributed.destroy_process_group()
 
