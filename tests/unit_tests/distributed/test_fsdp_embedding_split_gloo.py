@@ -41,9 +41,12 @@ pytestmark = pytest.mark.timeout(60)
 
 
 class _ToyLM(nn.Module):
-    def __init__(self, *, tied: bool, input_in_container: bool, output_in_container: bool) -> None:
+    def __init__(
+        self, *, tied: bool, input_in_container: bool, output_in_container: bool, shared_module: bool = False
+    ) -> None:
         super().__init__()
         self.config = SimpleNamespace(tie_word_embeddings=tied)
+        self.shared_module = shared_module
         input_embedding = nn.Embedding(32, 8)
         output_embedding = nn.Linear(8, 32, bias=False)
         if tied:
@@ -57,15 +60,18 @@ class _ToyLM(nn.Module):
         else:
             self.embed_tokens = input_embedding
         self.transformer["blocks"] = nn.ModuleList([nn.Linear(8, 8)])
-        if output_in_container:
-            self.transformer["ff_out"] = output_embedding
-        else:
-            self.lm_head = output_embedding
+        if not shared_module:
+            if output_in_container:
+                self.transformer["ff_out"] = output_embedding
+            else:
+                self.lm_head = output_embedding
 
     def get_input_embeddings(self) -> nn.Module:
         return self.transformer["wte"] if "wte" in self.transformer else self.embed_tokens
 
     def get_output_embeddings(self) -> nn.Module:
+        if self.shared_module:
+            return self.get_input_embeddings()
         head = self.transformer["ff_out"] if "ff_out" in self.transformer else self.lm_head
         return head[0] if isinstance(head, nn.Sequential) else head
 
@@ -81,6 +87,8 @@ class _ToyLM(nn.Module):
         hidden = self.get_input_embeddings()(token_ids)
         for block in self.transformer["blocks"]:
             hidden = torch.tanh(block(hidden))
+        if self.shared_module:
+            return nn.functional.linear(hidden, self.get_output_embeddings().weight)
         head = self.transformer["ff_out"] if "ff_out" in self.transformer else self.lm_head
         return head(hidden)
 
@@ -112,13 +120,28 @@ def _run_case(
     input_in_container: bool = False,
     output_in_container: bool = False,
     nested_output: bool = False,
+    shared_module: bool = False,
 ) -> None:
     torch.manual_seed(2026)
-    model = _ToyLM(tied=tied, input_in_container=input_in_container, output_in_container=output_in_container)
+    model = _ToyLM(
+        tied=tied,
+        input_in_container=input_in_container,
+        output_in_container=output_in_container,
+        shared_module=shared_module,
+    )
     if nested_output:
         model.transformer["ff_out"] = nn.Sequential(model.transformer["ff_out"])
     reference = copy.deepcopy(model)
     mp_policy = MixedPrecisionPolicy(reduce_dtype=torch.float32)
+
+    if tied and not shared_module and (input_in_container or output_in_container):
+        original_parameters = list(model.parameters())
+        with pytest.raises(ValueError, match="Distinct tied input/output embedding modules inside a ModuleList or ModuleDict"):
+            strategy.parallelize(model, device_mesh=mesh, mp_policy=mp_policy)
+        assert model.get_input_embeddings().weight is model.get_output_embeddings().weight
+        assert [id(param) for param in model.parameters()] == [id(param) for param in original_parameters]
+        assert not any(isinstance(module, FSDPModule) for module in model.modules())
+        return
 
     strategy.parallelize(model, device_mesh=mesh, mp_policy=mp_policy)
 
@@ -126,8 +149,12 @@ def _run_case(
     if tied:
         assert model.get_input_embeddings().weight is model.get_output_embeddings().weight
         assert len(list(model.parameters())) == len(list(reference.parameters()))
-        assert not isinstance(model.get_input_embeddings(), FSDPModule)
-        assert not isinstance(model.get_output_embeddings(), FSDPModule)
+        if shared_module:
+            assert model.get_input_embeddings() is model.get_output_embeddings()
+            assert isinstance(model.get_input_embeddings(), FSDPModule) == input_in_container
+        else:
+            assert not isinstance(model.get_input_embeddings(), FSDPModule)
+            assert not isinstance(model.get_output_embeddings(), FSDPModule)
     else:
         assert isinstance(model.get_input_embeddings(), FSDPModule)
         assert isinstance(model.get_output_embeddings(), FSDPModule)
@@ -190,6 +217,15 @@ def _worker(rank: int, world_size: int, port: int) -> None:
                 output_in_container=True,
                 nested_output=True,
             )
+            # LLaDA's tied layout exposes the same module from both getters.
+            for input_in_container in (False, True):
+                _run_case(
+                    mesh,
+                    strategy=strategy,
+                    tied=True,
+                    input_in_container=input_in_container,
+                    shared_module=True,
+                )
         dist.barrier()
     finally:
         dist.destroy_process_group()
