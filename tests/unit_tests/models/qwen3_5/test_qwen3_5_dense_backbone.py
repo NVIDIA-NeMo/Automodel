@@ -34,8 +34,9 @@ pytest.importorskip("transformers.models.qwen3_5_moe")
 
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 
-from nemo_automodel.components.datasets.packing import build_packed_sequence_metadata
+from nemo_automodel.components.datasets.packing import build_packed_sequence_metadata, get_unpad_data
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.qwen3_5 import packing as qwen3_5_packing
 from nemo_automodel.components.models.qwen3_5.model import (
     Fp32SafeQwen3_5TextRotaryEmbedding,
     Qwen3_5DenseTextBackbone,
@@ -213,6 +214,64 @@ class TestFp32SafeRotaryEmbedding:
 
 
 class TestDenseTextBackbone:
+    @pytest.mark.parametrize(
+        "attention_mask",
+        [
+            pytest.param(
+                torch.tensor(
+                    [[1, 1, 1, 2, 2, 0], [1, 1, 2, 2, 3, 3]],
+                    dtype=torch.long,
+                ),
+                id="conflicting-indexed-boundaries",
+            ),
+            pytest.param(torch.ones((2, 6), dtype=torch.long), id="binary-mask"),
+        ],
+    )
+    def test_packed_metadata_prefers_authoritative_ids_and_matches_reference(
+        self, attention_mask: torch.Tensor
+    ) -> None:
+        """Verify packed IDs override indexed and binary attention masks.
+
+        Args:
+            attention_mask: Tensor of shape [batch, sequence] containing either
+                indexed document IDs with conflicting boundaries or a binary mask.
+        """
+        packed_seq_ids = torch.tensor(
+            [[1, 1, 2, 2, 2, 0], [1, 2, 2, 3, 3, 3]],
+            dtype=torch.long,
+        )
+        packed_metadata = build_packed_sequence_metadata(packed_seq_ids)
+
+        metadata = qwen3_5_packing.prepare_gated_delta_packed_metadata(
+            attention_mask,
+            packed_seq_ids,
+            packed_metadata["packed_token_indices"],
+            packed_metadata["cu_seqlens"],
+        )
+        reference_indices, reference_cu_seqlens, _ = get_unpad_data(packed_seq_ids)
+
+        assert metadata is not None
+        assert metadata.document_ids is packed_seq_ids
+        torch.testing.assert_close(metadata.indices, reference_indices)
+        torch.testing.assert_close(metadata.cu_seqlens, reference_cu_seqlens.long())
+        torch.testing.assert_close(metadata.cu_seqlens_cpu, reference_cu_seqlens.long())
+
+    def test_packed_metadata_falls_back_from_binary_ids_to_indexed_attention_mask(self):
+        attention_mask = torch.tensor([[1, 1, 2, 2]], dtype=torch.long)
+        packed_seq_ids = torch.ones_like(attention_mask)
+        packed_metadata = build_packed_sequence_metadata(attention_mask)
+
+        metadata = qwen3_5_packing.prepare_gated_delta_packed_metadata(
+            attention_mask,
+            packed_seq_ids,
+            packed_metadata["packed_token_indices"],
+            packed_metadata["cu_seqlens"],
+        )
+
+        assert metadata is not None
+        assert metadata.document_ids is attention_mask
+        assert metadata.cu_seqlens_cpu.tolist() == [0, 2, 4]
+
     def test_builds_expected_layer_types(self):
         cfg = _tiny_config(layer_types=("full_attention", "linear_attention"))
         backbone = Qwen3_5DenseTextBackbone(cfg, _backend())

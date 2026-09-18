@@ -71,11 +71,19 @@ def prepare_gated_delta_packed_metadata(
         documented by :class:`GatedDeltaPackedMetadata`, or ``None`` for an
         unpacked mask.
     """
-    if is_indexed_packed_mask(attention_mask):
-        document_ids = attention_mask
-    elif is_indexed_packed_mask(packed_seq_ids):
-        document_ids = packed_seq_ids
-    else:
+    # ``_packed_seq_ids`` is the collater's authoritative indexed mask. Prefer
+    # it when present so a backend-specific attention mask does not need a
+    # device scalar decision. Otherwise a structurally eligible 2D attention
+    # mask is the only candidate.
+    document_ids = None
+    for candidate in (packed_seq_ids, attention_mask):
+        if candidate is None or candidate.dtype == torch.bool or candidate.dim() != 2:
+            continue
+        candidate_cpu = candidate.detach().to(device="cpu")
+        if is_indexed_packed_mask(candidate_cpu):
+            document_ids = candidate
+            break
+    if document_ids is None:
         return None
 
     if packed_token_indices is None or cu_seqlens is None:
