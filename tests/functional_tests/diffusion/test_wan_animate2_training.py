@@ -22,7 +22,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
-from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
+from torch.distributed.checkpoint.state_dict import StateDictOptions, get_state_dict, set_state_dict
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor import DTensor
@@ -184,6 +184,21 @@ def _worker(rank: int, work_dir: str, lora: bool) -> None:
                 torch.testing.assert_close(actual_gradient, expected_gradient, rtol=3e-2, atol=tolerance, msg=name)
 
         for index in range(2):
+            if index > 0:
+                # Compare each distributed update from the same weights and
+                # momentum. Small BF16 gradient differences can otherwise
+                # accumulate into different trajectories through AdamW.
+                options = StateDictOptions(full_state_dict=True)
+                model_state, optimizer_state = get_state_dict(model, optimizer, options=options)
+                set_state_dict(
+                    reference,
+                    ref_optimizer,
+                    model_state_dict=model_state,
+                    # Scalar optimizer state can alias the source even when
+                    # gathered parameter-shaped tensors have separate storage.
+                    optim_state_dict=deepcopy(optimizer_state),
+                    options=options,
+                )
             actual = backward(model, optimizer)
             expected = backward(reference, ref_optimizer, average_gradients=True)
             forward_error = None
@@ -218,6 +233,11 @@ def _worker(rank: int, work_dir: str, lora: bool) -> None:
             compare_gradients()
             optimizer.step()
             ref_optimizer.step()
+            # Check the update before resetting the reference on the next
+            # iteration, including the first update without momentum history.
+            for name, value in model.state_dict().items():
+                full = value.full_tensor() if isinstance(value, DTensor) else value
+                torch.testing.assert_close(full, reference.state_dict()[name], rtol=2e-2, atol=3e-3, msg=name)
             if index == 0:
                 model_state, optimizer_state = get_state_dict(model, optimizer)
                 dcp.save({"model": model_state, "optimizer": optimizer_state}, checkpoint_id=f"{work_dir}/checkpoint")
