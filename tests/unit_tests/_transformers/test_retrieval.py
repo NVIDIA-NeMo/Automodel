@@ -1504,6 +1504,7 @@ def test_extracted_scorer_matches_direct_loading(tmp_path, saved_policy, explici
     with torch.no_grad():
         direct.model.score.weight.copy_(torch.linspace(-0.5, 0.5, config.text_config.hidden_size).unsqueeze(0))
     extracted.model.score.load_state_dict(direct.model.score.state_dict())
+    _assert_state_dict_equal(direct.model.state_dict(), extracted.model.state_dict())
 
     inputs = {"input_ids": torch.tensor([[1, 2, 3, 4], [1, 2, 3, 5]]), "attention_mask": torch.ones(2, 4)}
     with torch.no_grad():
@@ -1511,7 +1512,8 @@ def test_extracted_scorer_matches_direct_loading(tmp_path, saved_policy, explici
         extracted_scores = extracted(inputs).logits
 
     assert direct.is_causal is extracted.is_causal is expected_policy
-    torch.testing.assert_close(extracted_scores, direct_scores, rtol=0, atol=0)
+    # Computed scores allow FP32 roundoff across loads; checkpoint weights remain exact.
+    torch.testing.assert_close(extracted_scores, direct_scores, rtol=1e-5, atol=1e-6)
     # CLS pooling exposes future-token influence, unlike last-token pooling.
     if expected_policy:
         torch.testing.assert_close(extracted_scores[0], extracted_scores[1], rtol=0, atol=0)

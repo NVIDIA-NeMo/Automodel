@@ -119,8 +119,10 @@ def test_cross_encoder_round_trip_preserves_native_encoder_decoder_scores(tmp_pa
         assert loaded.is_causal is None
         assert "is_causal" not in vars(loaded.model.config)
         assert _attention_flags(loaded.model) == native_flags
+        torch.testing.assert_close(loaded.model.state_dict(), native_scorer.state_dict(), rtol=0, atol=0)
         actual = loaded(input_ids=input_ids, attention_mask=attention_mask).logits
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        # Computed scores allow FP32 roundoff across loads; checkpoint weights remain exact.
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
 
 
 @pytest.mark.parametrize("policy_source", ["explicit", "saved"])
