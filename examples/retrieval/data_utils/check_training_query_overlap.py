@@ -30,9 +30,7 @@ DatasetSpec = tuple[int | None, Path]
 SummaryRow = dict[str, int | str]
 
 FSW_YBABAKHIN = Path("/lustre/fsw/portfolios/llmservice/users/ybabakhin")
-FS12_ROSMULSKI = Path(
-    "/lustre/fs12/portfolios/llmservice/projects/llmservice_nlp_retro/users/rosmulski"
-)
+FS12_ROSMULSKI = Path("/lustre/fs12/portfolios/llmservice/projects/llmservice_nlp_retro/users/rosmulski")
 ROSMULSKI_SCRATCH = Path("/home/rosmulski/scratch")
 RONAYA_TRAINING = Path("/lustre/fsw/portfolios/llmservice/users/ronaya/mteb_8b/training_datasets")
 

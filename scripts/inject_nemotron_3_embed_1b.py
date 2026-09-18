@@ -118,9 +118,7 @@ def _load_source_tokenizer_config() -> dict[str, object]:
     )
     tokenizer_config_size = tokenizer_config_path.stat().st_size
     if tokenizer_config_size > 1_048_576:
-        raise ValueError(
-            f"Refusing to load unexpectedly large tokenizer config ({tokenizer_config_size} bytes)"
-        )
+        raise ValueError(f"Refusing to load unexpectedly large tokenizer config ({tokenizer_config_size} bytes)")
     with tokenizer_config_path.open(encoding="utf-8") as tokenizer_config_file:
         tokenizer_config = json.load(tokenizer_config_file)
     if not isinstance(tokenizer_config, dict):
@@ -131,9 +129,7 @@ def _load_source_tokenizer_config() -> dict[str, object]:
         "tokenizer_class": "TokenizersBackend",
         "processor_class": "PixtralProcessor",
     }
-    actual_source_values = {
-        name: tokenizer_config.get(name) for name in expected_source_values
-    }
+    actual_source_values = {name: tokenizer_config.get(name) for name in expected_source_values}
     if actual_source_values != expected_source_values:
         raise ValueError(
             f"Unexpected source tokenizer config: expected {expected_source_values}, got {actual_source_values}"
@@ -176,9 +172,7 @@ def _load_source_processor_config() -> dict[str, object]:
     )
     processor_config_size = processor_config_path.stat().st_size
     if processor_config_size > 1_048_576:
-        raise ValueError(
-            f"Refusing to load unexpectedly large processor config ({processor_config_size} bytes)"
-        )
+        raise ValueError(f"Refusing to load unexpectedly large processor config ({processor_config_size} bytes)")
     with processor_config_path.open(encoding="utf-8") as processor_config_file:
         processor_config = json.load(processor_config_file)
     if not isinstance(processor_config, dict):
@@ -192,9 +186,7 @@ def _load_source_processor_config() -> dict[str, object]:
         "patch_size": 14,
         "spatial_merge_size": 2,
     }
-    actual_source_values = {
-        name: processor_config.get(name) for name in expected_source_values
-    }
+    actual_source_values = {name: processor_config.get(name) for name in expected_source_values}
     if actual_source_values != expected_source_values:
         raise ValueError(
             f"Unexpected source processor config: expected {expected_source_values}, got {actual_source_values}"
@@ -295,15 +287,11 @@ def _validate_tokenizer(tokenizer: PreTrainedTokenizerBase) -> None:
         "<SPECIAL_34>": 34,
         "<SPECIAL_35>": 35,
     }
-    actual_token_ids = {
-        token: tokenizer.convert_tokens_to_ids(token) for token in expected_token_ids
-    }
+    actual_token_ids = {token: tokenizer.convert_tokens_to_ids(token) for token in expected_token_ids}
     if actual_token_ids != expected_token_ids:
         raise ValueError(f"Unexpected special-token mapping: expected {expected_token_ids}, got {actual_token_ids}")
     if tokenizer.model_max_length != MAX_SEQUENCE_LENGTH:
-        raise ValueError(
-            f"Expected tokenizer model_max_length={MAX_SEQUENCE_LENGTH}, got {tokenizer.model_max_length}"
-        )
+        raise ValueError(f"Expected tokenizer model_max_length={MAX_SEQUENCE_LENGTH}, got {tokenizer.model_max_length}")
     if tokenizer.padding_side != "right":
         raise ValueError(f"Expected right padding, got {tokenizer.padding_side!r}")
 
@@ -365,9 +353,7 @@ def _resize_multimodal_projector(model: _ProjectorHost) -> None:
     )
     with torch.no_grad():
         new_linear_1.weight.copy_(old_linear_1.weight[:TARGET_TEXT_HIDDEN_SIZE, :])
-        new_linear_2.weight.copy_(
-            old_linear_2.weight[:TARGET_TEXT_HIDDEN_SIZE, :TARGET_TEXT_HIDDEN_SIZE]
-        )
+        new_linear_2.weight.copy_(old_linear_2.weight[:TARGET_TEXT_HIDDEN_SIZE, :TARGET_TEXT_HIDDEN_SIZE])
 
     projector.linear_1 = new_linear_1
     projector.linear_2 = new_linear_2
@@ -378,9 +364,7 @@ def _validate_composed_model(model: Mistral3Model) -> None:
     from transformers import Ministral3Model
 
     if not isinstance(model.language_model, Ministral3Model):
-        raise TypeError(
-            f"Expected a Ministral3Model text backbone, got {type(model.language_model).__name__}"
-        )
+        raise TypeError(f"Expected a Ministral3Model text backbone, got {type(model.language_model).__name__}")
     text_config = model.config.text_config
     if model.language_model.config is not text_config:
         raise ValueError("Outer text_config and language_model.config must reference the same config object")
@@ -395,17 +379,12 @@ def _validate_composed_model(model: Mistral3Model) -> None:
         "pooling": "avg",
         "tie_word_embeddings": True,
     }
-    actual_text_values = {
-        name: getattr(text_config, name) for name in expected_text_values
-    }
+    actual_text_values = {name: getattr(text_config, name) for name in expected_text_values}
     if actual_text_values != expected_text_values:
-        raise ValueError(
-            f"Unexpected text config: expected {expected_text_values}, got {actual_text_values}"
-        )
+        raise ValueError(f"Unexpected text config: expected {expected_text_values}, got {actual_text_values}")
     if text_config.max_position_embeddings != MAX_SEQUENCE_LENGTH:
         raise ValueError(
-            f"Expected text max_position_embeddings={MAX_SEQUENCE_LENGTH}, got "
-            f"{text_config.max_position_embeddings}"
+            f"Expected text max_position_embeddings={MAX_SEQUENCE_LENGTH}, got {text_config.max_position_embeddings}"
         )
     if model.config.vision_config.hidden_size != VISION_HIDDEN_SIZE:
         raise ValueError(
@@ -448,8 +427,7 @@ def _validate_composed_model(model: Mistral3Model) -> None:
     ]
     if non_bf16_parameters:
         raise TypeError(
-            "All floating-point model parameters must be BF16; mismatches: "
-            + ", ".join(non_bf16_parameters[:20])
+            "All floating-point model parameters must be BF16; mismatches: " + ", ".join(non_bf16_parameters[:20])
         )
 
 
@@ -491,9 +469,7 @@ def _normalize_config_value(value: object) -> object:
     """Remove only non-serialized checkpoint-location metadata from a config value."""
     if isinstance(value, dict):
         return {
-            key: _normalize_config_value(nested_value)
-            for key, nested_value in value.items()
-            if key != "_name_or_path"
+            key: _normalize_config_value(nested_value) for key, nested_value in value.items() if key != "_name_or_path"
         }
     if isinstance(value, list):
         return [_normalize_config_value(item) for item in value]
@@ -667,9 +643,7 @@ def _normalize_safetensors_header(path: Path) -> tuple[int, set[str]]:
             separators=(",", ":"),
         ).encode("utf-8")
         if len(serialized_header) > header_length:
-            raise ValueError(
-                f"Normalized header grew from {header_length} to {len(serialized_header)} bytes in {path}"
-            )
+            raise ValueError(f"Normalized header grew from {header_length} to {len(serialized_header)} bytes in {path}")
         padded_header = serialized_header + b" " * (header_length - len(serialized_header))
         _write_exact_backup(Path(f"{path}{HEADER_BACKUP_SUFFIX}"), original_header_blob)
         with path.open("r+b") as checkpoint_file:
@@ -718,9 +692,7 @@ def _normalize_saved_mistral3_state_dict(output_path: Path) -> int:
     single_checkpoint = output_path / "model.safetensors"
     index_path = output_path / "model.safetensors.index.json"
     if single_checkpoint.is_file() == index_path.is_file():
-        raise ValueError(
-            f"Expected exactly one of {single_checkpoint.name} or {index_path.name} in {output_path}"
-        )
+        raise ValueError(f"Expected exactly one of {single_checkpoint.name} or {index_path.name} in {output_path}")
 
     if single_checkpoint.is_file():
         renamed_count, _ = _normalize_safetensors_header(single_checkpoint)
@@ -841,8 +813,8 @@ def main() -> int:
         AutoModel,
         AutoProcessor,
         AutoTokenizer,
-        Mistral3Model,
         Ministral3Model,
+        Mistral3Model,
         PixtralProcessor,
     )
 
@@ -979,9 +951,7 @@ def main() -> int:
         if actual_fingerprints != expected_fingerprints:
             mismatches = sorted(set(expected_fingerprints) | set(actual_fingerprints))
             mismatches = [
-                name
-                for name in mismatches
-                if actual_fingerprints.get(name) != expected_fingerprints.get(name)
+                name for name in mismatches if actual_fingerprints.get(name) != expected_fingerprints.get(name)
             ]
             raise ValueError(f"Save/reload changed state-tensor bytes for: {mismatches}")
 
@@ -1003,9 +973,7 @@ def main() -> int:
             )
         _validate_tokenizer(reloaded_processor.tokenizer)
         if reloaded_processor.image_token_ids != [10, 12, 13]:
-            raise ValueError(
-                f"Expected image token IDs [10, 12, 13], got {reloaded_processor.image_token_ids}"
-            )
+            raise ValueError(f"Expected image token IDs [10, 12, 13], got {reloaded_processor.image_token_ids}")
 
         logger.info("Running a tiny image-first multimodal validation forward")
         _validate_multimodal_forward(reloaded_model, reloaded_processor, torch.device("cuda", device_index))

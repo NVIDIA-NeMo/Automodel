@@ -6,6 +6,8 @@ from enum import IntEnum
 
 
 class PassageModality(IntEnum):
+    """Identify whether a retrieval passage contains text, an image, or both."""
+
     TEXT_ONLY = 0
     IMAGE_ONLY = 1
     IMAGE_TEXT = 2

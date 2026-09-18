@@ -1,6 +1,6 @@
 ---
 name: cicd
-description: CI/CD reference for NeMo AutoModel — pipeline structure, commit and PR workflow, CI failure investigation, and common failure patterns.
+description: CI/CD reference for NeMo AutoModel — upstream GitHub and internal GitLab workflows, pipeline structure, and CI failure investigation.
 when_to_use: Investigating a CI failure, understanding the pipeline structure, writing a commit or PR, triggering CI, 'CI is red', 'how do I trigger CI', 'PR workflow', 'where are the logs', 'CI did not run', '/ok to test'.
 ---
 
@@ -31,22 +31,43 @@ include:
 2. **Changelog**: bullet list of user-visible changes.
 3. **Pre-checks**: confirm linting, tests, and sign-off.
 
-PR title format: `[{areas}] {type}: {description}`
-(e.g., `[model] feat: Add Qwen3 VLM support`)
+Use the Conventional Commit title format in `AGENTS.md`, without bracket prefixes
+(e.g., `ci: expand internal CPU checks`). This applies to GitLab MRs too.
 
 See `CONTRIBUTING.md` for the full PR workflow, area/type labels, and DCO
 requirements.
 
 ### Branch Naming
 
-Use descriptive branch names prefixed with your username or a category:
-
-```
-username/feat_add_qwen2_recipe
-fix/gradient_clip_nan
-```
+Follow the branch naming convention in `AGENTS.md`.
 
 ## How CI Is Triggered
+
+### Internal GitLab fork
+
+These instructions apply to MRs targeting `internal` in
+`gitlab-master.nvidia.com/aire/research/retriever/forks/automodel`, including work
+on feature branches. Identify the destination from the remote and MR target;
+the local remote name is not significant.
+
+- `.gitlab-ci.yml` is the source of truth. MR pipelines start automatically for
+  target `internal`; standalone branch pushes do not run this pipeline. GitHub's
+  `copy-pr-bot` and `/ok to test` mechanism do not apply.
+- Jobs use the CPU runner tag `nemollm-common-aws`. The CPU test job starts in
+  parallel with lint via `needs: []`; it does not consume lint artifacts.
+- Preserve repository-wide linting, changed-file secret detection, and recipe
+  validation. Follow the testing skill when expanding CPU test discovery.
+- When GitHub checks or their shared configuration change, review whether the
+  corresponding GitLab check needs updating. Reuse shared configuration and
+  validators where possible; do not copy GPU or download requirements into the
+  offline MR suite.
+- Use GitLab MR pipeline/job logs to verify changes. Distinguish runner startup
+  failures from script failures before changing tests or dependencies. Retry
+  infrastructure failures only; do not mask test failures with automatic retries.
+- Report the tested commit, pipeline result, test/skip counts, and runtime when
+  changing suite selection. A local pass does not establish runner compatibility.
+
+### Upstream GitHub
 
 CI is triggered on `push` — **not** on `pull_request`. A bot called
 `copy-pr-bot` controls when CI runs.
@@ -69,7 +90,7 @@ CI is triggered on `push` — **not** on `pull_request`. A bot called
 - Pushing a new commit does **not** automatically re-trigger CI unless the
   commit is signed or `/ok to test <new-sha>` is posted.
 
-## Pipeline Structure
+## Upstream GitHub Pipeline Structure
 
 ```
 lint-check
@@ -82,7 +103,7 @@ lint-check
 CI test scripts live in `tests/ci_tests/`. These are executed in the CI
 pipeline and should not be run locally unless reproducing a CI failure.
 
-## CI Failure Investigation
+## Upstream GitHub CI Failure Investigation
 
 ### Locating the PR from a CI Branch
 
@@ -112,7 +133,7 @@ gh pr checks "$PR_NUMBER" --repo NVIDIA-NeMo/Automodel
    ```
 5. **Cross-reference the changeset** against the failing step.
 
-## Common Failure Patterns
+## Upstream GitHub Common Failure Patterns
 
 | Symptom | Likely Cause | Action |
 |---|---|---|
