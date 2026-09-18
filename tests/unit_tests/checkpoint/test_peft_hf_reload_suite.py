@@ -304,13 +304,22 @@ _FAMILIES = (
         {"target_modules": ["*.q_proj", "*.v_proj"]},
         build_reference=_build_qwen3_omni_moe_reference,
         reference_path="thinker",
-        xfail=(
-            "exported tensors carry the thinker. segment but target_modules does not, so PEFT's "
-            "suffix match also adapts talker.model.* on the full model and initializes those "
-            "adapters randomly instead of loading them"
-        ),
     ),
 )
+
+
+def _params():
+    """Declarative xfail, so a family whose defect gets fixed reports XPASS and fails.
+
+    An imperative ``pytest.xfail()`` aborts before the body runs, which would let a
+    fixed export silently keep its marker and go uncovered.
+    """
+    return [
+        pytest.param(family, id=family.id, marks=pytest.mark.xfail(reason=family.xfail, strict=True))
+        if family.xfail
+        else pytest.param(family, id=family.id)
+        for family in _FAMILIES
+    ]
 
 
 # --------------------------------------------------------------------------- fixtures
@@ -386,11 +395,9 @@ def _save_through_checkpointer(model: nn.Module, peft_config: PeftConfig, tmp_pa
 # --------------------------------------------------------------------------- tests
 
 
-@pytest.mark.parametrize("family", _FAMILIES, ids=lambda family: family.id)
+@pytest.mark.parametrize("family", _params())
 def test_exported_adapter_loads_into_hf_peft(family: _Family, tmp_path: Path, peft_process_group):
     """Save through the real path, reload with real PEFT, and require identical behavior."""
-    if family.xfail:
-        pytest.xfail(family.xfail)
     from peft import PeftModel, get_peft_model_state_dict
     from safetensors.torch import load_file
 
@@ -421,15 +428,13 @@ def test_exported_adapter_loads_into_hf_peft(family: _Family, tmp_path: Path, pe
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
 
 
-@pytest.mark.parametrize("family", _FAMILIES, ids=lambda family: family.id)
+@pytest.mark.parametrize("family", _params())
 def test_bulk_and_per_tensor_exports_agree(family: _Family, tmp_path: Path, peft_process_group):
     """``to_hf`` and ``convert_single_tensor_to_hf`` feed different consumers; they must match.
 
     Streaming consumers convert one tensor at a time, which cannot see the sibling
     tensors a fused conversion needs, so the two paths drift apart silently.
     """
-    if family.xfail:
-        pytest.xfail(family.xfail)
     model, _, _ = _adapted_model(family, tmp_path / "source")
     adapter = getattr(model, "state_dict_adapter", None)
     if adapter is None:
