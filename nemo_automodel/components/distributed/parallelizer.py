@@ -252,8 +252,25 @@ class ParallelizationStrategy(ABC):
         pass
 
 
+def _get_input_output_embeddings(model: nn.Module) -> tuple[nn.Module | None, nn.Module | None]:
+    """Resolve the optional Hugging Face embedding getters before sharding."""
+
+    def _resolve(getter_name: str) -> nn.Module | None:
+        getter = getattr(model, getter_name, None)
+        if not callable(getter):
+            return None
+        try:
+            module = getter()
+        except (AttributeError, NotImplementedError):
+            return None
+        return module if isinstance(module, nn.Module) else None
+
+    return _resolve("get_input_embeddings"), _resolve("get_output_embeddings")
+
+
 def _fully_shard_untied_input_output_embeddings(
-    model: nn.Module,
+    input_embeddings: nn.Module | None,
+    output_embeddings: nn.Module | None,
     *,
     mesh: DeviceMesh,
     mp_policy: MixedPrecisionPolicy,
@@ -267,12 +284,14 @@ def _fully_shard_untied_input_output_embeddings(
     With fp32 gradient reduction, that unit allocates one contiguous
     reduce-scatter input containing both gradients. Keeping the two trainable
     leaf modules in separate FSDP units bounds that allocation by the larger
-    table instead of their sum. Tied weights stay in one unit to preserve
-    aliasing, and frozen tables stay in the root because they have no gradient
-    communication buffer to split.
+    table instead of their sum. The caller excludes tied tables, and this pass
+    skips frozen tables because they have no gradient communication buffer
+    to split. Tables already wrapped as FSDP units retain their existing
+    reshard policy.
 
     Args:
-        model: Model whose input and output embedding modules may be sharded.
+        input_embeddings: Untied input embedding module, if available.
+        output_embeddings: Untied output projection module, if available.
         mesh: Device mesh that owns the FSDP shards.
         mp_policy: Mixed-precision policy used by the surrounding FSDP units.
         offload_policy: Optional offload policy used by the surrounding FSDP
@@ -281,29 +300,6 @@ def _fully_shard_untied_input_output_embeddings(
             its parameters after forward.
         fully_shard_fn: FSDP sharding callable, injectable for unit tests.
     """
-    weights_are_tied = ensure_tied_lm_head(model)
-
-    def _resolve(getter_name: str) -> nn.Module | None:
-        getter = getattr(model, getter_name, None)
-        if not callable(getter):
-            return None
-        try:
-            module = getter()
-        except (AttributeError, NotImplementedError):
-            return None
-        return module if isinstance(module, nn.Module) else None
-
-    input_embeddings = _resolve("get_input_embeddings")
-    output_embeddings = _resolve("get_output_embeddings")
-    input_weight = getattr(input_embeddings, "weight", None)
-    output_weight = getattr(output_embeddings, "weight", None)
-    weights_are_physically_tied = input_embeddings is not None and (
-        input_embeddings is output_embeddings or (input_weight is not None and input_weight is output_weight)
-    )
-    if weights_are_tied or weights_are_physically_tied:
-        logger.info("Keeping tied input/output embeddings in the root FSDP unit")
-        return
-
     seen: set[int] = set()
     for role, module, module_reshard_after_forward in (
         ("input embedding", input_embeddings, input_reshard_after_forward),
@@ -316,8 +312,8 @@ def _fully_shard_untied_input_output_embeddings(
         if module is None or id(module) in seen:
             continue
         seen.add(id(module))
-        # Recursive sharding may already own embeddings inside a ModuleDict.
-        # Preserve that FSDP unit and its policy instead of applying it twice.
+        # Skip tables that are themselves FSDP units (e.g. ModuleDict children).
+        # This does not detect ownership by an ancestor FSDP unit.
         if isinstance(module, FSDPModule):
             continue
         if not any(param.requires_grad for param in module.parameters()):
@@ -501,6 +497,20 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
 
         ignored_multimodal_params: set[nn.Parameter] = set()
 
+        # FSDP replaces Parameters in-place. Resolve aliases before any recursive
+        # wrapping can separate a shared input/output weight into distinct owners.
+        weights_are_tied = ensure_tied_lm_head(model)
+        input_embeddings, output_embeddings = _get_input_output_embeddings(model)
+        input_weight = getattr(input_embeddings, "weight", None)
+        output_weight = getattr(output_embeddings, "weight", None)
+        weights_are_physically_tied = input_embeddings is not None and (
+            input_embeddings is output_embeddings or (input_weight is not None and input_weight is output_weight)
+        )
+        root_owned_modules: set[nn.Module] = set()
+        if weights_are_tied or weights_are_physically_tied:
+            root_owned_modules = {module for module in (input_embeddings, output_embeddings) if module is not None}
+            logger.info("Keeping tied input/output embeddings in the root FSDP unit")
+
         # Find transformer layers and apply parallelisms
         apply_fsdp2_sharding_recursively(
             model,
@@ -514,19 +524,22 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
             fully_shard_fn=fully_shard_fn,
             frozen_multimodal_sharding=frozen_multimodal_sharding,
             ignored_multimodal_params=ignored_multimodal_params,
+            root_owned_modules=root_owned_modules,
         )
 
         input_embedding_reshard_after_forward = (
             reshard_after_forward if reshard_after_forward is not None else not pp_enabled
         )
-        _fully_shard_untied_input_output_embeddings(
-            model,
-            mesh=dp_mesh,
-            mp_policy=mp_policy,
-            offload_policy=offload_policy,
-            input_reshard_after_forward=input_embedding_reshard_after_forward,
-            fully_shard_fn=fully_shard_fn,
-        )
+        if not (weights_are_tied or weights_are_physically_tied):
+            _fully_shard_untied_input_output_embeddings(
+                input_embeddings,
+                output_embeddings,
+                mesh=dp_mesh,
+                mp_policy=mp_policy,
+                offload_policy=offload_policy,
+                input_reshard_after_forward=input_embedding_reshard_after_forward,
+                fully_shard_fn=fully_shard_fn,
+            )
 
         # Apply FSDP to the root model
         # Do not reshard after forward for root model because its parameters
@@ -733,23 +746,26 @@ class Qwen3_5ParallelizationStrategy(DefaultParallelizationStrategy):
             fully_shard_fn=None,
             frozen_multimodal_sharding="root",
             ignored_multimodal_params=None,
+            *,
+            root_owned_modules: set[nn.Module] | None = None,
         ):
+            if root_owned_modules and module in root_owned_modules:
+                return
             del enable_fsdp2_prefetch, fsdp2_backward_prefetch_depth, fsdp2_forward_prefetch_depth, fully_shard_fn
             frozen_multimodal_sharding = normalize_frozen_multimodal_sharding(frozen_multimodal_sharding)
             pp_enabled = "pp" in mesh.mesh_dim_names and mesh["pp"].size() > 1
 
             if isinstance(module, (nn.ModuleList, nn.ModuleDict)):
                 all_items = list(module.items()) if isinstance(module, nn.ModuleDict) else list(enumerate(module))
-                flat_layer_items = [
-                    (layer_id, child)
-                    for layer_id, child in all_items
-                    if not isinstance(child, (nn.ModuleList, nn.ModuleDict))
-                ]
-                nested_items = [
-                    (layer_id, child)
-                    for layer_id, child in all_items
-                    if isinstance(child, (nn.ModuleList, nn.ModuleDict))
-                ]
+                flat_layer_items = []
+                nested_items = []
+                for key, child in all_items:
+                    if isinstance(child, (nn.ModuleList, nn.ModuleDict)) or (
+                        root_owned_modules and not root_owned_modules.isdisjoint(child.modules())
+                    ):
+                        nested_items.append((key, child))
+                    else:
+                        flat_layer_items.append((key, child))
 
                 for _, child in nested_items:
                     _fsdp_by_dtype(
@@ -760,6 +776,7 @@ class Qwen3_5ParallelizationStrategy(DefaultParallelizationStrategy):
                         reshard_after_forward=reshard_after_forward,
                         frozen_multimodal_sharding=frozen_multimodal_sharding,
                         ignored_multimodal_params=ignored_multimodal_params,
+                        root_owned_modules=root_owned_modules,
                     )
 
                 for enum_id, (_, child) in enumerate(flat_layer_items):
@@ -797,6 +814,7 @@ class Qwen3_5ParallelizationStrategy(DefaultParallelizationStrategy):
                         reshard_after_forward=reshard_after_forward,
                         frozen_multimodal_sharding=frozen_multimodal_sharding,
                         ignored_multimodal_params=ignored_multimodal_params,
+                        root_owned_modules=root_owned_modules,
                     )
 
         globals()["apply_fsdp2_sharding_recursively"] = _fsdp_by_dtype
@@ -1289,9 +1307,11 @@ def apply_fsdp2_sharding_recursively(
     fsdp2_backward_prefetch_depth: int = 2,
     fsdp2_forward_prefetch_depth: int = 1,
     reshard_after_forward: bool | None = None,
-    fully_shard_fn=None,
+    fully_shard_fn: Callable[..., nn.Module] | None = None,
     frozen_multimodal_sharding: FrozenMultimodalSharding = "root",
     ignored_multimodal_params: set[nn.Parameter] | None = None,
+    *,
+    root_owned_modules: set[nn.Module] | None = None,
 ) -> None:
     """
     Recursively apply FSDP2 sharding to modules, with optimizations for ModuleList.
@@ -1320,10 +1340,15 @@ def apply_fsdp2_sharding_recursively(
             owned by the root FSDP unit, sharded per layer, or replicated.
         ignored_multimodal_params: Accumulator for replicated frozen multimodal
             parameters that must be ignored by ancestor FSDP roots.
+        root_owned_modules: Modules whose parameters must remain with the root
+            FSDP unit, such as a tied input/output pair. Their ancestors are
+            traversed instead of wrapped to preserve that ownership.
     Note:
         This function modifies the module in-place by replacing modules with their
         FSDP2-subclassed versions.
     """
+    if root_owned_modules and module in root_owned_modules:
+        return
     frozen_multimodal_sharding = normalize_frozen_multimodal_sharding(frozen_multimodal_sharding)
     if fully_shard_fn is None:
         fully_shard_fn = fully_shard
@@ -1340,12 +1365,15 @@ def apply_fsdp2_sharding_recursively(
             all_items = [(i, module[i]) for i in range(len(module))]
             _is_container = lambda c: isinstance(c, nn.ModuleList)
 
-        flat_layer_items = [(k, c) for k, c in all_items if not _is_container(c)]
-        nested_items = [(k, c) for k, c in all_items if _is_container(c)]
-        nested_lists = nested_items  # kept for len() checks below
-
-        # Recurse into any nested ModuleLists first (unchanged behavior).
-        for layer_id, child_module in nested_lists:
+        flat_layer_items = []
+        nested_items = []
+        for key, child in all_items:
+            if _is_container(child) or (root_owned_modules and not root_owned_modules.isdisjoint(child.modules())):
+                nested_items.append((key, child))
+            else:
+                flat_layer_items.append((key, child))
+        # Recurse through containers and ancestors of root-owned modules first.
+        for layer_id, child_module in nested_items:
             apply_fsdp2_sharding_recursively(
                 child_module,
                 mesh,
@@ -1358,6 +1386,7 @@ def apply_fsdp2_sharding_recursively(
                 fully_shard_fn=fully_shard_fn,
                 frozen_multimodal_sharding=frozen_multimodal_sharding,
                 ignored_multimodal_params=ignored_multimodal_params,
+                root_owned_modules=root_owned_modules,
             )
 
         for enum_id, (layer_key, child_module) in enumerate(flat_layer_items):
@@ -1424,6 +1453,7 @@ def apply_fsdp2_sharding_recursively(
                 fully_shard_fn=fully_shard_fn,
                 frozen_multimodal_sharding=frozen_multimodal_sharding,
                 ignored_multimodal_params=ignored_multimodal_params,
+                root_owned_modules=root_owned_modules,
             )
 
 

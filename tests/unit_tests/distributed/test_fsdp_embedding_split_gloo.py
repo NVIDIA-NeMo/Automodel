@@ -30,7 +30,10 @@ from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy
 from torch.distributed.tensor import DTensor
 
-from nemo_automodel.components.distributed.parallelizer import DefaultParallelizationStrategy
+from nemo_automodel.components.distributed.parallelizer import (
+    DefaultParallelizationStrategy,
+    Qwen3_5ParallelizationStrategy,
+)
 
 # Over the default 5s budget on purpose: this module spawns worker processes; every child re-imports torch from scratch.
 # Shrink the work or the process count before raising this further.
@@ -63,7 +66,8 @@ class _ToyLM(nn.Module):
         return self.transformer["wte"] if "wte" in self.transformer else self.embed_tokens
 
     def get_output_embeddings(self) -> nn.Module:
-        return self.transformer["ff_out"] if "ff_out" in self.transformer else self.lm_head
+        head = self.transformer["ff_out"] if "ff_out" in self.transformer else self.lm_head
+        return head[0] if isinstance(head, nn.Sequential) else head
 
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
         """Compute token logits.
@@ -77,7 +81,8 @@ class _ToyLM(nn.Module):
         hidden = self.get_input_embeddings()(token_ids)
         for block in self.transformer["blocks"]:
             hidden = torch.tanh(block(hidden))
-        return self.get_output_embeddings()(hidden)
+        head = self.transformer["ff_out"] if "ff_out" in self.transformer else self.lm_head
+        return head(hidden)
 
 
 def _full_tensor(tensor: torch.Tensor) -> torch.Tensor:
@@ -100,17 +105,27 @@ def _free_port() -> int:
 
 
 def _run_case(
-    mesh: DeviceMesh, *, tied: bool, input_in_container: bool = False, output_in_container: bool = False
+    mesh: DeviceMesh,
+    *,
+    strategy: DefaultParallelizationStrategy,
+    tied: bool,
+    input_in_container: bool = False,
+    output_in_container: bool = False,
+    nested_output: bool = False,
 ) -> None:
     torch.manual_seed(2026)
     model = _ToyLM(tied=tied, input_in_container=input_in_container, output_in_container=output_in_container)
+    if nested_output:
+        model.transformer["ff_out"] = nn.Sequential(model.transformer["ff_out"])
     reference = copy.deepcopy(model)
     mp_policy = MixedPrecisionPolicy(reduce_dtype=torch.float32)
 
-    DefaultParallelizationStrategy().parallelize(model, device_mesh=mesh, mp_policy=mp_policy)
+    strategy.parallelize(model, device_mesh=mesh, mp_policy=mp_policy)
 
     assert isinstance(model, FSDPModule)
     if tied:
+        assert model.get_input_embeddings().weight is model.get_output_embeddings().weight
+        assert len(list(model.parameters())) == len(list(reference.parameters()))
         assert not isinstance(model.get_input_embeddings(), FSDPModule)
         assert not isinstance(model.get_output_embeddings(), FSDPModule)
     else:
@@ -142,6 +157,8 @@ def _run_case(
 
     model_optimizer.step()
     reference_optimizer.step()
+    if tied:
+        assert model.get_input_embeddings().weight is model.get_output_embeddings().weight
     actual_state = model.state_dict()
     expected_state = reference.state_dict()
     for name, expected_parameter in expected_state.items():
@@ -153,16 +170,26 @@ def _worker(rank: int, world_size: int, port: int) -> None:
     os.environ["MASTER_PORT"] = str(port)
     dist.init_process_group("gloo", rank=rank, world_size=world_size)
     try:
-        mesh = init_device_mesh("cpu", (1, world_size, 1), mesh_dim_names=("dp_replicate", "dp_shard_cp", "tp"))
-        for input_in_container in (False, True):
-            for output_in_container in (False, True):
-                _run_case(
-                    mesh,
-                    tied=False,
-                    input_in_container=input_in_container,
-                    output_in_container=output_in_container,
-                )
-        _run_case(mesh, tied=True)
+        mesh = init_device_mesh("cpu", (1, world_size, 1, 1), mesh_dim_names=("dp_replicate", "dp_shard", "cp", "tp"))
+        for strategy in (DefaultParallelizationStrategy(), Qwen3_5ParallelizationStrategy()):
+            for tied in (False, True):
+                for input_in_container in (False, True):
+                    for output_in_container in (False, True):
+                        _run_case(
+                            mesh,
+                            strategy=strategy,
+                            tied=tied,
+                            input_in_container=input_in_container,
+                            output_in_container=output_in_container,
+                        )
+            _run_case(
+                mesh,
+                strategy=strategy,
+                tied=True,
+                input_in_container=True,
+                output_in_container=True,
+                nested_output=True,
+            )
         dist.barrier()
     finally:
         dist.destroy_process_group()
