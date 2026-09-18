@@ -19,6 +19,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 import torch.nn as nn
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
 from torch.distributed.fsdp import MixedPrecisionPolicy
 
 from nemo_automodel.components.distributed.parallelizer_utils import (
@@ -1013,3 +1014,21 @@ def test_fully_shard_by_dtype_three_dtypes(monkeypatch):
         model.b: torch.float16,
         model.c: torch.bfloat16,
     }
+
+
+def test_compute_dtype_pins_logical_names_through_activation_checkpointing():
+    """Checkpoint wrappers preserve strict FP32 parameter and buffer matching."""
+    attention = nn.Module()
+    attention.sinks_param = nn.Linear(4, 4, bias=False)
+    attention.sinks_param.register_buffer("scale", torch.ones(4))
+    attention.proj = nn.Linear(4, 4, bias=False)
+    model = nn.Module()
+    model.attn = checkpoint_wrapper(attention)
+
+    compute_dtype_of = _make_compute_dtype_fn(
+        model, _make_mp_policy(), ("attn.sinks_param",)
+    )
+
+    assert compute_dtype_of(attention.sinks_param.weight) == torch.float32
+    assert compute_dtype_of(attention.sinks_param.scale) == torch.float32
+    assert compute_dtype_of(attention.proj.weight) == torch.bfloat16

@@ -310,3 +310,36 @@ def test_supports_low_memory_dcp_load_false_for_native_radio(native_adapter):
     """Native RadioModel's fused-qkv split requires a materializing conversion."""
     native_adapter._llm_adapter.supports_low_memory_dcp_load = True
     assert native_adapter.supports_low_memory_dcp_load is False
+
+
+def test_convert_single_tensor_keeps_native_radio_keys(native_adapter):
+    """Per-tensor conversion must not rename native RADIO keys to the legacy tree.
+
+    The legacy layout needs query/key/value fused into ``attn.qkv``, which a single-tensor
+    conversion cannot do; renaming without fusing yields keys no loader recognizes.
+    Streaming consumers (NeMo-RL refit into vLLM) load the native per-shard names instead.
+    """
+    for fqn in (
+        "vision_model.encoder.layer.0.attention.attention.query.weight",
+        "vision_model.encoder.layer.0.attention.output.dense.weight",
+        "vision_model.embeddings.patch_projection.weight",
+        "vision_model.encoder.layer.0.norm1.weight",
+    ):
+        t = torch.zeros(2)
+        assert native_adapter.convert_single_tensor_to_hf(fqn, t) == [(fqn, t)]
+
+
+def test_to_hf_still_emits_legacy_radio_keys_for_native_radio(native_adapter):
+    """Whole-state-dict export keeps the legacy (fused qkv) layout for checkpoint compatibility."""
+    custom_sd = {
+        "vision_model.encoder.layer.0.attention.attention.query.weight": torch.zeros(3, 4),
+        "vision_model.encoder.layer.0.attention.attention.key.weight": torch.ones(3, 4),
+        "vision_model.encoder.layer.0.attention.attention.value.weight": torch.full((3, 4), 2.0),
+        "vision_model.encoder.layer.0.attention.output.dense.weight": torch.zeros(4, 4),
+    }
+    out = native_adapter.to_hf(dict(custom_sd))
+    assert set(out) == {
+        "vision_model.radio_model.model.blocks.0.attn.qkv.weight",
+        "vision_model.radio_model.model.blocks.0.attn.proj.weight",
+    }
+    assert out["vision_model.radio_model.model.blocks.0.attn.qkv.weight"].shape == (9, 4)
