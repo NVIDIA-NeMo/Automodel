@@ -180,6 +180,93 @@ def _build_minimax_m2():
     return MiniMaxM2ForCausalLM(config), MiniMaxM2StateDictAdapter(config, moe_config, _BACKEND)
 
 
+def _build_qwen3_omni_moe():
+    """Multimodal: the adapter names tensors for the whole Omni model.
+
+    The thinker builds on its own, but its modules are then named without the
+    ``thinker.`` segment the adapter emits, so the reload target has to be the full
+    model. ``spatial_merge_size`` and ``shared_expert_intermediate_size`` have no
+    defaults on the talker configs and are read during construction.
+    """
+    from transformers.models.qwen3_omni_moe import Qwen3OmniMoeConfig
+    from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
+        Qwen3OmniMoeThinkerForConditionalGeneration,
+    )
+
+    from nemo_automodel.components.models.qwen3_omni_moe.state_dict_adapter import Qwen3OmniMoeStateDictAdapter
+
+    thinker_config = dict(
+        text_config=dict(
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,
+            moe_intermediate_size=16,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            num_experts=2,
+            num_experts_per_tok=1,
+            max_position_embeddings=64,
+        ),
+        vision_config=dict(
+            depth=1,
+            hidden_size=32,
+            num_heads=4,
+            out_hidden_size=32,
+            intermediate_size=64,
+            patch_size=14,
+            spatial_merge_size=2,
+            temporal_patch_size=2,
+        ),
+        audio_config=dict(
+            d_model=32,
+            encoder_layers=1,
+            encoder_attention_heads=4,
+            encoder_ffn_dim=64,
+            num_mel_bins=128,
+            output_dim=32,
+            max_source_positions=64,
+        ),
+    )
+    config = Qwen3OmniMoeConfig(
+        thinker_config=thinker_config,
+        talker_config=dict(
+            spatial_merge_size=2,
+            text_config=dict(
+                vocab_size=64,
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=1,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                max_position_embeddings=64,
+                shared_expert_intermediate_size=32,
+            ),
+            code_predictor_config=dict(
+                vocab_size=64,
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=1,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+            ),
+        ),
+        code2wav_config=dict(hidden_size=32, num_hidden_layers=1, num_attention_heads=4, intermediate_size=64),
+    )
+    config._attn_implementation = "sdpa"
+    moe_config = _moe_config(dim=32, moe_inter_dim=16, n_routed_experts=2, gated=True)
+    thinker = Qwen3OmniMoeThinkerForConditionalGeneration(config.thinker_config)
+    return thinker, Qwen3OmniMoeStateDictAdapter(config, moe_config, _BACKEND)
+
+
+def _build_qwen3_omni_moe_reference():
+    """The reload target for the Omni adapter: the full model the exported names describe."""
+    from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import Qwen3OmniMoeForConditionalGeneration
+
+    _, adapter = _build_qwen3_omni_moe()
+    return Qwen3OmniMoeForConditionalGeneration(adapter.config)
+
+
 @dataclass(frozen=True)
 class _Family:
     """One covered model family.
@@ -189,12 +276,18 @@ class _Family:
         build: Returns ``(tiny Transformers model, adapter or None)``. The adapter is the
             AutoModel component that owns this family's HF naming.
         peft_kwargs: Overrides for the ``PeftConfig`` the export is driven with.
+        build_reference: The model the export is meant to load into, when that is not the
+            same class as the source. AutoModel trains Omni's thinker on its own and the
+            adapter adds the ``thinker.`` segment, so the artifact targets the full model.
+        reference_path: Attribute on the reference that corresponds to the source model.
         xfail: Issue reference when this family has a known, filed export defect.
     """
 
     id: str
     build: Callable[[], tuple[nn.Module, object | None]]
     peft_kwargs: dict = field(default_factory=dict)
+    build_reference: Callable[[], nn.Module] | None = None
+    reference_path: str | None = None
     xfail: str | None = None
 
 
@@ -203,6 +296,20 @@ _FAMILIES = (
     _Family("nemotron_v3", _build_nemotron_v3, {"exclude_modules": ["*.out_proj"]}),
     _Family("qwen3_moe", _build_qwen3_moe, {"target_modules": ["*.q_proj", "*.v_proj"]}),
     _Family("minimax_m2", _build_minimax_m2, {"target_modules": ["*.q_proj", "*.v_proj"]}),
+    # Scoped to the thinker: the talker and code2wav towers add adapters the thinker's
+    # naming rules do not describe, which is a separate contract from the one under test.
+    _Family(
+        "qwen3_omni_moe",
+        _build_qwen3_omni_moe,
+        {"target_modules": ["*.q_proj", "*.v_proj"]},
+        build_reference=_build_qwen3_omni_moe_reference,
+        reference_path="thinker",
+        xfail=(
+            "exported tensors carry the thinker. segment but target_modules does not, so PEFT's "
+            "suffix match also adapts talker.model.* on the full model and initializes those "
+            "adapters randomly instead of loading them"
+        ),
+    ),
 )
 
 
@@ -226,13 +333,22 @@ def _adapted_model(family: _Family, source: Path):
     forward comparison, so every LoRA weight is randomized before the export.
     """
     torch.manual_seed(1234)
-    reference, adapter = family.build()
-    reference = reference.eval()
-    reference.save_pretrained(source)
+    source_model, adapter = family.build()
+    source_model = source_model.eval()
+    source_model.save_pretrained(source)
+
+    if family.build_reference is None:
+        reference = family.build()[0].eval()
+        reference.load_state_dict(source_model.state_dict())
+    else:
+        # The artifact targets a larger model that embeds this one; give the matching
+        # submodule the same base weights so only the adapter can explain a difference.
+        reference = family.build_reference().eval()
+        getattr(reference, family.reference_path).load_state_dict(source_model.state_dict())
 
     model, _ = family.build()
     model = model.eval()
-    model.load_state_dict(reference.state_dict())
+    model.load_state_dict(source_model.state_dict())
     if adapter is not None:
         model.state_dict_adapter = adapter
 
@@ -294,9 +410,14 @@ def test_exported_adapter_loads_into_hf_peft(family: _Family, tmp_path: Path, pe
     for name, value in exported.items():
         torch.testing.assert_close(loaded_state[name], value, rtol=0, atol=0)
 
+    # Compare the adapted submodule, not the wrapper: a larger reference model has its
+    # own forward signature, and the contract under test is this model's behavior.
+    adapted = loaded.base_model.model
+    if family.reference_path is not None:
+        adapted = getattr(adapted, family.reference_path)
     with torch.no_grad():
         expected = model(_INPUT_IDS, use_cache=False).logits
-        actual = loaded(_INPUT_IDS, use_cache=False).logits
+        actual = adapted(_INPUT_IDS, use_cache=False).logits
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
 
 
