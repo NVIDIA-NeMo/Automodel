@@ -1,6 +1,6 @@
 ---
 title: "Fine-Tune Wan-Animate-2"
-description: ""
+description: "Fine-tune Wan-Animate-2 in NeMo AutoModel with a triplet dataset, latent preprocessing, and full or LoRA recipes."
 ---
 
 ## Introduction
@@ -17,7 +17,7 @@ This guide covers Supervised Fine-Tuning (SFT) of the Wan-Animate-2 14B model us
 AutoModel with both full fine-tuning and Low-Rank Adaptation (LoRA).
 
 Use `diffusers>=0.40.0`, which provides the released transformer and modular pipeline.
-Install the `diffusion` and `diffusion-media` extras with the repository’s locked dependency
+Install the `diffusion` and `diffusion-media` extras with the repository's locked dependency
 workflow. The recipe loads the public `Wan-AI/Wan2.2-Animate-2-14B-Diffusers` checkpoint;
 no Diffusers fork or weight conversion is needed.
 
@@ -28,13 +28,14 @@ no Diffusers fork or weight conversion is needed.
 | 1. Install | Install NeMo AutoModel using pip or a container |
 | 2. Prepare data | Write a JSONL manifest of reference, driving, and target triplets |
 | 3. Preprocess | Encode the triplets into a cached latent dataset |
-| 4. Train | Launch training with `torchrun` on eight GPUs |
+| 4. Train | Launch training with `torchrun` on 8 GPUs |
 
 ## Model Overview
 
-Wan-Animate-2 is a 40-layer, 16.4B-parameter flow-matching DiT that shares Wan's VAE and UMT5-XXL
-text encoder. It conditions on a reference character image (as a VAE latent plus CLIP features), the
-driving video, and a text caption.
+Wan-Animate-2 is published under the `14B` checkpoint name. The transformer defined by its [released configuration](https://huggingface.co/Wan-AI/Wan2.2-Animate-2-14B-Diffusers/blob/7d48412d7b903ff3a89f4f5a960d99e1899605a1/transformer/config.json)
+has approximately 16.4 billion parameters across 40 layers. This flow-matching DiT shares
+Wan's VAE and UMT5-XXL text encoder. It conditions on a reference character image (as a VAE latent
+plus CLIP features), the driving video, and a text caption.
 
 The `WanAnimate2Adapter` handles the following key training mechanics:
 
@@ -54,15 +55,15 @@ The `WanAnimate2Adapter` handles the following key training mechanics:
   Full SFT trains all transformer parameters; DiffSynth's example named `full` trains
   only self-attention Q/K/V. Its example hyperparameters therefore differ from this recipe.
 
-The recipe runs with FSDP2 on a single eight-GPU node and mixed precision, with one sample per
+The recipe runs with FSDP2 on a single 8-GPU node and mixed precision, with one sample per
 rank. Tensor and context parallelism are not available for this model, and a training run must use a
 single resolution bucket.
 
 Resolution and clip length are set during preprocessing, through `--resolution_preset` and
-`--num_frames`. The two-pass forward attends over both the generated and the driving stream, so it
+`--num_frames`. The two-pass forward attends over both the generated and driving streams, so it
 uses considerably more memory per frame than a single-pass video model at the same resolution. On
-eight 80 GB GPUs, choose the preset and frame count together rather than assuming a configuration
-that fits another Wan recipe will fit here.
+8 GPUs with 80 GB of memory each, choose the preset and frame count together rather than assuming
+a configuration that fits another Wan recipe will fit here.
 
 ## Prepare Your Data
 

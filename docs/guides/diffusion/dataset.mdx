@@ -1,6 +1,6 @@
 ---
 title: "Diffusion Dataset Preparation"
-description: ""
+description: "Prepare images and videos as cached latent files for NeMo AutoModel diffusion training, including processors, bucketing, and dataloader YAML."
 position: 7
 ---
 ## Introduction
@@ -11,7 +11,7 @@ Diffusion model training in NeMo AutoModel requires pre-encoded `.meta` files ra
 
 ### Images
 
-Place your images in a directory. Supported formats: `jpg`, `jpeg`, `png`, `webp`, `bmp`.
+Place your images in a directory. Supported formats include `jpg`, `jpeg`, `png`, `webp`, and `bmp`.
 
 Captions can be provided in several formats:
 - **Sidecar JSON** (default for images): A `.json` file alongside each image with a caption field.
@@ -19,7 +19,7 @@ Captions can be provided in several formats:
 
 ### Videos
 
-Place your videos in a directory. Supported formats: `mp4`, `avi`, `mov`, `mkv`, `webm`.
+Place your videos in a directory. Supported formats include `mp4`, `avi`, `mov`, `mkv`, and `webm`.
 
 Captions can be provided in several formats:
 - **Sidecar JSON** (`--caption_format sidecar`): A `.json` file alongside each video.
@@ -38,6 +38,7 @@ uv venv
 source .venv/bin/activate
 uv pip install "nemo-automodel[diffusion,diffusion-media]"
 ```
+
 </Note>
 
 NeMo AutoModel includes a unified preprocessing tool at [`tools/diffusion/preprocessing_multiprocess.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tools/diffusion/preprocessing_multiprocess.py) that encodes raw images and videos into cache files compatible with the multiresolution dataloader. It uses model-specific processors from `tools/diffusion/processors/` to handle VAE encoding, text embedding, and cache data formatting for each supported model.
@@ -111,7 +112,7 @@ python -m tools.diffusion.preprocessing_multiprocess video \
 
 | Argument | Description |
 |----------|-------------|
-| `--processor` | Processor name (`flux`, `wan`, `hunyuan`) |
+| `--processor` | Processor name (`flux`, `wan`, `wan_animate2`, `hunyuan`) |
 | `--model_name` | Hugging Face model name (uses processor default if omitted) |
 | `--output_dir` | Output directory for cached data |
 | `--shard_size` | Number of samples per metadata shard (default: 10,000) |
