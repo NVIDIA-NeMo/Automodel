@@ -94,6 +94,10 @@ jobs:
         run: |
           source ./venv/bin/activate
           uv run --active bandit -r app.py nemo_automodel examples scripts tools tutorials -t B614
+      - name: Reject globals()
+        run: |
+          source ./venv/bin/activate
+          uv run --active python tools/lint_no_globals.py
 
   import_linting:
     runs-on: ${{ vars.LINT_AND_INSTALL_TEST_RUNNER || 'ubuntu-latest' }}
