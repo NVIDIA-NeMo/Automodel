@@ -21,13 +21,12 @@ import os
 import threading
 from contextlib import contextmanager
 
-try:
-    from deep_ep import Buffer
-    from deep_ep.utils import EventHandle, EventOverlap
+from nemo_automodel.shared.import_utils import safe_import
 
-    HAVE_DEEP_EP = True
-except ImportError:
-    HAVE_DEEP_EP = False
+_DEEP_EP_INSTALLED, deep_ep = safe_import("deep_ep")
+HAVE_DEEP_EP = _DEEP_EP_INSTALLED and hasattr(deep_ep, "ElasticBuffer")
+if HAVE_DEEP_EP:
+    ElasticBuffer = deep_ep.ElasticBuffer
 
 
 # ── DeepEP dispatch replay across activation-checkpoint recompute ────────────
@@ -128,7 +127,8 @@ except ImportError:
 import torch
 
 _buffer = None
-_nvshmem_available = None
+_buffer_spec = None
+_deepep_num_sms = 0
 _uccl_buffer = None
 
 
@@ -192,18 +192,6 @@ def hybridep_dispatch_replay_scope(recorder: HybridEPDispatchReplayRecorder | No
         _hybridep_dispatch_replay_state.mode = previous_mode
 
 
-def _is_nvshmem_available() -> bool:
-    """Check if DeepEP was compiled with NVSHMEM support.
-
-    Uses is_sm90_compiled() as proxy — DeepEP's build enforces that
-    NVSHMEM is disabled when SM90 features are disabled.
-    """
-    global _nvshmem_available
-    if _nvshmem_available is None:
-        _nvshmem_available = Buffer.is_sm90_compiled()
-    return _nvshmem_available
-
-
 def get_hidden_bytes(x: torch.Tensor) -> int:
     """Calculate the number of hidden bytes for a tensor.
 
@@ -216,67 +204,62 @@ def get_hidden_bytes(x: torch.Tensor) -> int:
     return x.size(1) * max(x.element_size(), 2)
 
 
-def get_buffer(group: torch.distributed.ProcessGroup, hidden_bytes: int):
-    """Get or create a buffer for all-to-all communication.
+def get_buffer(
+    group: torch.distributed.ProcessGroup,
+    num_max_tokens_per_rank: int,
+    hidden: int,
+    num_topk: int,
+):
+    """Get or grow the process-global DeepEP V2 elastic buffer.
 
     Args:
         group (torch.distributed.ProcessGroup): Process group for communication
-        hidden_bytes (int): Number of hidden bytes needed
+        num_max_tokens_per_rank (int): Maximum input tokens on each EP rank.
+        hidden (int): Hidden dimension of each token.
+        num_topk (int): Number of selected experts per token.
 
     Returns:
-        Buffer: Communication buffer
+        ElasticBuffer: Communication buffer.
     """
-    global _buffer
-    num_nvl_bytes, num_rdma_bytes = 0, 0
-    nvshmem = _is_nvshmem_available()
-    for config in (
-        Buffer.get_dispatch_config(group.size()),
-        Buffer.get_combine_config(group.size()),
-    ):
-        num_nvl_bytes = max(config.get_nvl_buffer_size_hint(hidden_bytes, group.size()), num_nvl_bytes)
-        if nvshmem:
-            num_rdma_bytes = max(config.get_rdma_buffer_size_hint(hidden_bytes, group.size()), num_rdma_bytes)
+    global _buffer, _buffer_spec
+    configured_capacity = int(os.environ.get("DEEPEP_MAX_TOKENS_PER_RANK", "0"))
+    num_max_tokens_per_rank = max(num_max_tokens_per_rank, configured_capacity)
+    allow_hybrid_mode = os.environ.get("DEEPEP_ALLOW_HYBRID_MODE", "0") == "1"
+    requested_spec = (group, hidden, num_topk, allow_hybrid_mode)
 
-    if not nvshmem and group.size() > 8:
-        raise RuntimeError(
-            f"DeepEP was compiled without NVSHMEM support (SM90 features disabled), "
-            f"but expert parallelism group size {group.size()} > 8 requires internode "
-            f"RDMA communication. Recompile DeepEP with NVSHMEM or reduce ep_size to "
-            f"fit within a single node (max 8 GPUs)."
+    if _buffer is None or _buffer_spec != requested_spec or _buffer.num_max_tokens_per_rank < num_max_tokens_per_rank:
+        free_buffer()
+        # ProcessGroupNCCL creates its communicator lazily unless distributed
+        # initialization received ``device_id``. ElasticBuffer consumes the raw
+        # communicator pointer immediately, so initialize it once before handing
+        # that pointer to DeepEP.
+        torch.distributed.barrier(group=group, device_ids=[torch.cuda.current_device()])
+        _buffer = ElasticBuffer(
+            group=group,
+            num_max_tokens_per_rank=num_max_tokens_per_rank,
+            hidden=hidden,
+            num_topk=num_topk,
+            allow_hybrid_mode=allow_hybrid_mode,
+            explicitly_destroy=True,
         )
-
-    # Allocate buffer if not existed or not enough buffer
-    # NOTES: the adaptive routing configuration of the network **must be off**
-    if (
-        _buffer is None
-        or _buffer.group != group
-        or _buffer.num_nvl_bytes < num_nvl_bytes
-        or _buffer.num_rdma_bytes < num_rdma_bytes
-    ):
-        # explicitly_destroy=True lets callers free the NVSHMEM/cpp runtime via
-        # ``_buffer.destroy()`` (see free_buffer()). Without an explicit teardown the DeepEP
-        # state lingers on the GPUs for the lifetime of the process / Slurm allocation and
-        # corrupts later forwards (e.g. a checkpoint-robustness HF reload after training).
-        _buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes, explicitly_destroy=True)
+        _buffer_spec = requested_spec
     return _buffer
 
 
 def free_buffer() -> None:
-    """Destroy the global DeepEP ``Buffer`` and release its NVSHMEM/cpp runtime.
+    """Destroy the global DeepEP ``ElasticBuffer`` communication runtime.
 
-    DeepEP keeps a process-global communication buffer backed by NVSHMEM symmetric memory.
-    It is normally never torn down (``destroy_process_group`` hangs on DeepEP's NCCL
-    sub-groups, so cleanup is skipped), but that leftover GPU state survives process exit for
-    the whole Slurm allocation and corrupts subsequent forwards. Destroying the buffer first
-    frees the runtime and lets a clean ``destroy_process_group`` follow without hanging.
+    ElasticBuffer owns GPU communication memory and internal NCCL communicators. Destroy it
+    before replacing a too-small buffer or tearing down the caller's process group.
     """
-    global _buffer
+    global _buffer, _buffer_spec
     if _buffer is not None:
         try:
             _buffer.destroy()
         except Exception:  # pragma: no cover - best effort
             pass
         _buffer = None
+        _buffer_spec = None
 
 
 class FusedDispatch(torch.autograd.Function):
@@ -292,12 +275,12 @@ class FusedDispatch(torch.autograd.Function):
         group,
         async_finish=False,
         allocate_on_comm_stream=False,
+        sync_free=False,
     ):
-        """Forward pass of fused dispatch."""
-        previous_event = None
-        if async_finish:
-            previous_event = EventOverlap(EventHandle())
-        buffer = get_buffer(group, get_hidden_bytes(x))
+        """Forward pass of fused dispatch through DeepEP V2's ElasticBuffer."""
+        buffer = get_buffer(group, x.shape[0], x.shape[1], token_indices.shape[1])
+        allocate_on_comm_stream = allocate_on_comm_stream or async_finish
+        previous_event = buffer.capture() if async_finish else None
 
         # Activation-checkpoint replay: reuse the layout this dispatch computed
         # on the original forward instead of recomputing it. Cached-mode dispatch
@@ -307,12 +290,17 @@ class FusedDispatch(torch.autograd.Function):
             replayed = recorder.take()
             if replayed is not None:
                 cached_handle, recv_token_indices, recv_token_probs, tokens_per_expert = replayed
-                recv_x, _, _, _, _, after_event_overlap = buffer.dispatch(
+                recv_x, _, recv_token_probs, _, after_event_overlap = buffer.dispatch(
                     x,
+                    topk_weights=token_probs,
                     handle=cached_handle,
                     previous_event=previous_event,
-                    async_finish=async_finish,
+                    async_with_compute_stream=async_finish,
                     allocate_on_comm_stream=allocate_on_comm_stream,
+                    do_cpu_sync=False if sync_free else None,
+                    do_expand=sync_free,
+                    do_zero_padding=sync_free,
+                    num_sms=_deepep_num_sms,
                 )
                 if async_finish:
                     after_event_overlap.current_stream_wait()
@@ -320,44 +308,31 @@ class FusedDispatch(torch.autograd.Function):
                 ctx.handle = cached_handle
                 ctx.async_finish = async_finish
                 ctx.allocate_on_comm_stream = allocate_on_comm_stream
+                ctx.num_max_tokens_per_rank = x.shape[0]
+                ctx.hidden = x.shape[1]
+                ctx.num_topk = token_indices.shape[1]
                 return (recv_x, recv_token_indices, recv_token_probs, tokens_per_expert, cached_handle)
 
-        # Calculate layout before actual dispatch
-        (
-            num_tokens_per_rank,
-            num_tokens_per_rdma_rank,
-            num_tokens_per_expert,
-            is_token_in_rank,
-            event,
-        ) = buffer.get_dispatch_layout(
-            token_indices,
-            num_experts,
-            previous_event=previous_event,
-            async_finish=async_finish,
-            allocate_on_comm_stream=allocate_on_comm_stream,
-        )
-
-        # Do MoE dispatch
-        # NOTES: the CPU will wait for GPU's signal to arrive,
-        # so this is not compatible with CUDA graph
         (
             recv_x,
             recv_token_indices,
             recv_token_probs,
-            num_recv_tokens_per_expert_list,
             handle,
             after_event_overlap,
         ) = buffer.dispatch(
             x,
             topk_idx=token_indices,
             topk_weights=token_probs,  # DeepEP only supports float32 probs
-            num_tokens_per_rank=num_tokens_per_rank,
-            num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
-            is_token_in_rank=is_token_in_rank,
-            num_tokens_per_expert=num_tokens_per_expert,
-            previous_event=event,  # wait in deepep::intra/inter_dispatch
-            async_finish=async_finish,
+            num_experts=num_experts,
+            num_max_tokens_per_rank=x.shape[0],
+            expert_alignment=1,
+            num_sms=_deepep_num_sms,
+            previous_event=previous_event,
+            async_with_compute_stream=async_finish,
             allocate_on_comm_stream=allocate_on_comm_stream,
+            do_cpu_sync=not sync_free,
+            do_expand=sync_free,
+            do_zero_padding=sync_free,
         )
 
         # Make sure current stream is synchronized
@@ -369,7 +344,13 @@ class FusedDispatch(torch.autograd.Function):
         ctx.handle = handle
         ctx.async_finish = async_finish
         ctx.allocate_on_comm_stream = allocate_on_comm_stream
-        tokens_per_expert = torch.tensor(num_recv_tokens_per_expert_list)
+        ctx.num_max_tokens_per_rank = x.shape[0]
+        ctx.hidden = x.shape[1]
+        ctx.num_topk = token_indices.shape[1]
+        if sync_free:
+            tokens_per_expert = handle.num_unaligned_recv_tokens_per_expert
+        else:
+            tokens_per_expert = torch.tensor(handle.num_recv_tokens_per_expert_list)
 
         if recorder is not None and _replay_mode() == "record":
             # Keep the handle and routing metadata (small) so the recompute can
@@ -388,23 +369,21 @@ class FusedDispatch(torch.autograd.Function):
         grad_handle,
     ):
         """Backward pass of fused dispatch."""
-        buffer = get_buffer(ctx.group, get_hidden_bytes(grad_output))
+        buffer = get_buffer(ctx.group, ctx.num_max_tokens_per_rank, ctx.hidden, ctx.num_topk)
         handle = ctx.handle
-        previous_event = None
-        if ctx.async_finish:
-            previous_event = EventOverlap(EventHandle())
+        previous_event = buffer.capture() if ctx.async_finish else None
         grad_x, grad_token_probs, after_event = buffer.combine(
             grad_output.contiguous(),
             handle,
             topk_weights=grad_token_probs.float(),
             previous_event=previous_event,
-            async_finish=ctx.async_finish,
+            async_with_compute_stream=ctx.async_finish,
             allocate_on_comm_stream=ctx.allocate_on_comm_stream,
         )
         # Make sure current stream is synchronized
         if ctx.async_finish:
             after_event.current_stream_wait()
-        return grad_x, None, grad_token_probs, None, None, None, None
+        return grad_x, None, grad_token_probs, None, None, None, None, None
 
 
 class FusedCombine(torch.autograd.Function):
@@ -413,14 +392,13 @@ class FusedCombine(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, group, handle, async_finish=False, allocate_on_comm_stream=False):
         """Forward pass of fused combine."""
-        previous_event = None
-        if async_finish:
-            previous_event = EventOverlap(EventHandle())
-        buffer = get_buffer(group, get_hidden_bytes(x))
+        buffer = get_buffer(group, handle.num_max_tokens_per_rank, x.shape[1], handle.topk_idx.shape[1])
+        allocate_on_comm_stream = allocate_on_comm_stream or async_finish
+        previous_event = buffer.capture() if async_finish else None
         combined_x, _, after_event = buffer.combine(
             x,
             handle=handle,
-            async_finish=async_finish,
+            async_with_compute_stream=async_finish,
             previous_event=previous_event,
             allocate_on_comm_stream=allocate_on_comm_stream,
         )
@@ -432,21 +410,26 @@ class FusedCombine(torch.autograd.Function):
         ctx.group = group
         ctx.async_finish = async_finish
         ctx.allocate_on_comm_stream = allocate_on_comm_stream
+        ctx.num_max_tokens_per_rank = handle.num_max_tokens_per_rank
+        ctx.hidden = x.shape[1]
+        ctx.num_topk = handle.topk_idx.shape[1]
         return combined_x, None
 
     @staticmethod
     def backward(ctx, grad_output, previous_event=None):
         """Backward pass of fused combine."""
-        previous_event = None
-        if ctx.async_finish:
-            previous_event = EventOverlap(EventHandle())
-        buffer = get_buffer(ctx.group, get_hidden_bytes(grad_output))
-        grad_x, _, _, _, _, after_event = buffer.dispatch(
+        buffer = get_buffer(ctx.group, ctx.num_max_tokens_per_rank, ctx.hidden, ctx.num_topk)
+        previous_event = buffer.capture() if ctx.async_finish else None
+        grad_x, _, _, _, after_event = buffer.dispatch(
             grad_output.contiguous(),
             handle=ctx.handle,
             previous_event=previous_event,
-            async_finish=ctx.async_finish,
+            async_with_compute_stream=ctx.async_finish,
             allocate_on_comm_stream=ctx.allocate_on_comm_stream,
+            num_sms=_deepep_num_sms,
+            do_cpu_sync=False,
+            do_expand=ctx.handle.do_expand,
+            do_zero_padding=ctx.handle.do_expand,
         )
         # Make sure current stream is synchronized
         if ctx.async_finish:
@@ -464,6 +447,7 @@ if HAVE_DEEP_EP:
         group,
         async_finish=False,
         allocate_on_comm_stream=False,
+        sync_free=False,
     ):
         """Perform fused dispatch operation if deep_ep is available.
 
@@ -486,6 +470,7 @@ if HAVE_DEEP_EP:
             group,
             async_finish,
             allocate_on_comm_stream,
+            sync_free,
         )
 
     def fused_combine(x, group, handle, async_finish=False, allocate_on_comm_stream=False):
@@ -504,7 +489,8 @@ if HAVE_DEEP_EP:
 
     def set_deepep_num_sms(num_sms):
         """Sets the number of SMs to use for DeepEP."""
-        Buffer.set_num_sms(num_sms)
+        global _deepep_num_sms
+        _deepep_num_sms = num_sms
 
 else:
     fused_dispatch = None
@@ -513,12 +499,9 @@ else:
 
 
 # HybridEP support
-try:
-    from deep_ep import HybridEPBuffer
-
-    HAVE_HYBRIDEP = True
-except ImportError:
-    HAVE_HYBRIDEP = False
+HAVE_HYBRIDEP = _DEEP_EP_INSTALLED and hasattr(deep_ep, "HybridEPBuffer")
+if HAVE_HYBRIDEP:
+    HybridEPBuffer = deep_ep.HybridEPBuffer
 
 _hybrid_ep_buffer = None
 

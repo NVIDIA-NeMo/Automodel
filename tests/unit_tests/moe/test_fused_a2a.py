@@ -15,6 +15,7 @@
 """Unit tests for fused DeepEP and HybridEP dispatch helpers."""
 
 from contextlib import nullcontext
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -28,6 +29,7 @@ import nemo_automodel.components.moe.megatron.fused_a2a as fused_a2a
 def _restore_buffer():
     """Save/restore module-global dispatch state so tests don't leak state."""
     saved = fused_a2a._buffer
+    saved_spec = fused_a2a._buffer_spec
     saved_hybridep = fused_a2a._hybrid_ep_buffer
     saved_recorder = fused_a2a._hybridep_dispatch_replay_state.recorder
     saved_mode = fused_a2a._hybridep_dispatch_replay_state.mode
@@ -35,6 +37,7 @@ def _restore_buffer():
         yield
     finally:
         fused_a2a._buffer = saved
+        fused_a2a._buffer_spec = saved_spec
         fused_a2a._hybrid_ep_buffer = saved_hybridep
         fused_a2a._hybridep_dispatch_replay_state.recorder = saved_recorder
         fused_a2a._hybridep_dispatch_replay_state.mode = saved_mode
@@ -48,6 +51,7 @@ def test_free_buffer_destroys_and_clears():
 
     sentinel.destroy.assert_called_once_with()
     assert fused_a2a._buffer is None
+    assert fused_a2a._buffer_spec is None
 
 
 def test_free_buffer_is_noop_when_unset():
@@ -69,6 +73,92 @@ def test_free_buffer_swallows_destroy_errors():
 
     boom.destroy.assert_called_once_with()
     assert fused_a2a._buffer is None
+
+
+class _CompletedEvent:
+    def current_stream_wait(self):
+        pass
+
+
+class _FakeElasticBuffer:
+    def __init__(self):
+        self.dispatch_kwargs = None
+        self.combine_kwargs = None
+
+    def dispatch(self, x, **kwargs):
+        self.dispatch_kwargs = kwargs
+        handle = SimpleNamespace(
+            num_unaligned_recv_tokens_per_expert=torch.tensor([2, 1], device=x.device),
+            num_recv_tokens_per_expert_list=[2, 1],
+        )
+        recv_weights = kwargs["topk_weights"].reshape(-1)[: x.shape[0]]
+        return x, None, recv_weights, handle, _CompletedEvent()
+
+    def combine(self, x, handle, **kwargs):
+        self.combine_kwargs = kwargs
+        combined_weights = kwargs.get("topk_weights")
+        if combined_weights is not None:
+            combined_weights = combined_weights.reshape(x.shape[0], -1)
+        return x, combined_weights, _CompletedEvent()
+
+
+def test_sync_free_dispatch_uses_elastic_expanded_layout(monkeypatch):
+    buffer = _FakeElasticBuffer()
+    monkeypatch.setattr(fused_a2a, "get_buffer", lambda *args, **kwargs: buffer)
+    x = torch.randn(3, 4, requires_grad=True)
+    indices = torch.tensor([[0], [1], [0]])
+    probs = torch.full((3, 1), 0.5, requires_grad=True)
+
+    recv_x, recv_indices, recv_probs, tokens_per_expert, _ = fused_a2a.FusedDispatch.apply(
+        x,
+        indices,
+        probs,
+        2,
+        object(),
+        False,
+        False,
+        True,
+    )
+
+    assert recv_indices is None
+    assert torch.equal(tokens_per_expert, torch.tensor([2, 1]))
+    assert buffer.dispatch_kwargs["do_cpu_sync"] is False
+    assert buffer.dispatch_kwargs["do_expand"] is True
+    assert buffer.dispatch_kwargs["do_zero_padding"] is True
+    assert buffer.dispatch_kwargs["async_with_compute_stream"] is False
+
+    (recv_x.sum() + recv_probs.sum()).backward()
+    assert torch.equal(x.grad, torch.ones_like(x))
+    assert torch.equal(probs.grad, torch.ones_like(probs))
+    assert buffer.combine_kwargs["async_with_compute_stream"] is False
+
+
+def test_combine_backward_preserves_expanded_dispatch_shape(monkeypatch):
+    class FakeBuffer:
+        def combine(self, x, handle, **kwargs):
+            return x[:3], None, _CompletedEvent()
+
+        def dispatch(self, x, **kwargs):
+            self.dispatch_kwargs = kwargs
+            expanded = torch.ones(6, x.shape[1], dtype=x.dtype)
+            return expanded, None, None, kwargs["handle"], _CompletedEvent()
+
+    buffer = FakeBuffer()
+    monkeypatch.setattr(fused_a2a, "get_buffer", lambda *args, **kwargs: buffer)
+    handle = SimpleNamespace(
+        num_max_tokens_per_rank=3,
+        topk_idx=torch.tensor([[0], [1], [0]]),
+        do_expand=True,
+    )
+    x = torch.randn(6, 4, requires_grad=True)
+
+    combined, _ = fused_a2a.FusedCombine.apply(x, object(), handle, False, False)
+    combined.sum().backward()
+
+    assert x.grad.shape == x.shape
+    assert buffer.dispatch_kwargs["do_cpu_sync"] is False
+    assert buffer.dispatch_kwargs["do_expand"] is True
+    assert buffer.dispatch_kwargs["do_zero_padding"] is True
 
 
 class _DriftingHybridEPBuffer:
