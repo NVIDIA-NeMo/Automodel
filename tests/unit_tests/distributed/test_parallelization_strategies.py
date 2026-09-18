@@ -985,6 +985,51 @@ class TestQwen3_5ParallelizationStrategy:
         else:
             assert "ignored_params" not in root_kwargs
 
+    @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
+    @patch("nemo_automodel.components.distributed.parallelizer_utils.fully_shard_by_dtype")
+    def test_dtype_sharding_does_not_mutate_module_globals(
+        self,
+        fully_shard_by_dtype,
+        fully_shard,
+        strategy,
+        mock_device_mesh,
+    ):
+        """Qwen3.5 overrides sharding through a subclass hook, not the module global.
+
+        The override used to be installed by rebinding
+        ``parallelizer.apply_fsdp2_sharding_recursively`` for the duration of the call,
+        which any concurrent or nested parallelize of another model would have picked
+        up. Assert the global is untouched *while* Qwen3.5 shards, not just after.
+        """
+
+        class MockQwen35Inner(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = nn.ModuleList([nn.Linear(10, 10)])
+
+        class MockQwen35Model(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.config = SimpleNamespace(num_attention_heads=8, num_key_value_heads=8, hidden_size=64)
+                self.model = MockQwen35Inner()
+
+        mesh, _, _, _ = mock_device_mesh
+        default_walk = parallelizer_mod.apply_fsdp2_sharding_recursively
+        observed = []
+
+        def record(module, *args, **kwargs):
+            observed.append(parallelizer_mod.apply_fsdp2_sharding_recursively)
+            return module
+
+        fully_shard.side_effect = lambda model, **kwargs: model
+        fully_shard_by_dtype.side_effect = record
+
+        strategy.parallelize(model=MockQwen35Model(), device_mesh=mesh)
+
+        assert observed, "expected the dtype-aware sharder to run"
+        assert all(fn is default_walk for fn in observed)
+        assert parallelizer_mod.apply_fsdp2_sharding_recursively is default_walk
+
 
 class TestStrategyRegistry:
     """Test the strategy registry functionality."""

@@ -498,7 +498,7 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
         ignored_multimodal_params: set[nn.Parameter] = set()
 
         # Find transformer layers and apply parallelisms
-        apply_fsdp2_sharding_recursively(
+        self._apply_fsdp_sharding(
             model,
             dp_mesh,
             mp_policy,
@@ -547,6 +547,39 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
             )
 
         return model
+
+    def _apply_fsdp_sharding(
+        self,
+        module: nn.Module,
+        mesh: DeviceMesh,
+        mp_policy: MixedPrecisionPolicy | None,
+        offload_policy: OffloadPolicy | None = None,
+        enable_fsdp2_prefetch: bool = True,
+        fsdp2_backward_prefetch_depth: int = 2,
+        fsdp2_forward_prefetch_depth: int = 1,
+        reshard_after_forward: bool | None = None,
+        fully_shard_fn=None,
+        frozen_multimodal_sharding: FrozenMultimodalSharding = "root",
+        ignored_multimodal_params: set[nn.Parameter] | None = None,
+    ) -> None:
+        """Wrap the model's submodules into FSDP2 units.
+
+        Subclasses override this hook to change how parameters are grouped into FSDP
+        units without having to reimplement the surrounding TP/AC/mixed-precision flow.
+        """
+        apply_fsdp2_sharding_recursively(
+            module,
+            mesh,
+            mp_policy,
+            offload_policy,
+            enable_fsdp2_prefetch,
+            fsdp2_backward_prefetch_depth,
+            fsdp2_forward_prefetch_depth,
+            reshard_after_forward,
+            fully_shard_fn=fully_shard_fn,
+            frozen_multimodal_sharding=frozen_multimodal_sharding,
+            ignored_multimodal_params=ignored_multimodal_params,
+        )
 
 
 def _nemotronh_decoder_blocks(model: nn.Module) -> tuple[nn.Module, list[nn.Module]]:
@@ -701,110 +734,105 @@ class Qwen3_5ParallelizationStrategy(DefaultParallelizationStrategy):
     per layer, and sets the CP mesh on CPAwareGatedDeltaNet modules.
     """
 
+    # The Qwen3.5 model builds CPAwareGatedDeltaNet with a fp32 ``SSMGate``
+    # (``_fp32_params``) at construction — no runtime patch needed. Keep those
+    # params in their own dtype-uniform fp32 FSDP group (true master weights).
+    _fp32_compute_module_names: tuple[str, ...] = ("_fp32_params",)
+
+    def _apply_fsdp_sharding(
+        self,
+        module,
+        mesh,
+        mp_policy,
+        offload_policy=None,
+        enable_fsdp2_prefetch=True,
+        fsdp2_backward_prefetch_depth=2,
+        fsdp2_forward_prefetch_depth=1,
+        reshard_after_forward=None,
+        fully_shard_fn=None,
+        frozen_multimodal_sharding="root",
+        ignored_multimodal_params=None,
+    ):
+        """Shard each decoder layer with :func:`fully_shard_by_dtype`.
+
+        Overrides the default recursive walk so fp32 and bfloat16 parameters end up
+        in separate, dtype-uniform FSDP groups.
+        """
+        del enable_fsdp2_prefetch, fsdp2_backward_prefetch_depth, fsdp2_forward_prefetch_depth, fully_shard_fn
+        frozen_multimodal_sharding = normalize_frozen_multimodal_sharding(frozen_multimodal_sharding)
+        pp_enabled = "pp" in mesh.mesh_dim_names and mesh["pp"].size() > 1
+
+        if isinstance(module, (nn.ModuleList, nn.ModuleDict)):
+            all_items = list(module.items()) if isinstance(module, nn.ModuleDict) else list(enumerate(module))
+            flat_layer_items = [
+                (layer_id, child)
+                for layer_id, child in all_items
+                if not isinstance(child, (nn.ModuleList, nn.ModuleDict))
+            ]
+            nested_items = [
+                (layer_id, child) for layer_id, child in all_items if isinstance(child, (nn.ModuleList, nn.ModuleDict))
+            ]
+
+            for _, child in nested_items:
+                self._apply_fsdp_sharding(
+                    child,
+                    mesh,
+                    mp_policy,
+                    offload_policy,
+                    reshard_after_forward=reshard_after_forward,
+                    frozen_multimodal_sharding=frozen_multimodal_sharding,
+                    ignored_multimodal_params=ignored_multimodal_params,
+                )
+
+            for enum_id, (_, child) in enumerate(flat_layer_items):
+                if reshard_after_forward is not None:
+                    layer_reshard_after_forward = reshard_after_forward
+                elif pp_enabled:
+                    layer_reshard_after_forward = False
+                else:
+                    layer_reshard_after_forward = enum_id < len(flat_layer_items) - 1
+                parallelizer_utils.fully_shard_by_dtype(
+                    child,
+                    mesh,
+                    mp_policy,
+                    offload_policy,
+                    fp32_compute_module_names=self._fp32_compute_module_names,
+                    reshard_after_forward=layer_reshard_after_forward,
+                )
+        else:
+            for name, sub in module.named_children():
+                if is_multimodal_module_name(name) and module_is_fully_frozen(sub):
+                    if frozen_multimodal_sharding in ("root", "replicate"):
+                        logger.info(
+                            "Keeping frozen multimodal module %s at FSDP policy %s",
+                            name,
+                            frozen_multimodal_sharding,
+                        )
+                        if frozen_multimodal_sharding == "replicate" and ignored_multimodal_params is not None:
+                            ignored_multimodal_params.update(module_parameters(sub))
+                        continue
+                self._apply_fsdp_sharding(
+                    sub,
+                    mesh,
+                    mp_policy,
+                    offload_policy,
+                    reshard_after_forward=reshard_after_forward,
+                    frozen_multimodal_sharding=frozen_multimodal_sharding,
+                    ignored_multimodal_params=ignored_multimodal_params,
+                )
+
     def parallelize(self, model, device_mesh, dp_shard_cp_mesh_name="dp_shard_cp", **kwargs):
         cp_mesh_name = dp_shard_cp_mesh_name.replace("dp_shard_", "")
         cp_enabled = cp_mesh_name in device_mesh.mesh_dim_names and device_mesh[cp_mesh_name].size() > 1
 
-        # The Qwen3.5 model builds CPAwareGatedDeltaNet with a fp32 ``SSMGate``
-        # (``_fp32_params``) at construction — no runtime patch needed. Keep those
-        # params in their own dtype-uniform fp32 FSDP group (true master weights).
-        fp32_compute_module_names = ("_fp32_params",)
-
-        # Delegate TP, AC, mixed precision to the default strategy, but
-        # override the FSDP sharding to use fully_shard_by_dtype.
-        # Temporarily swap the global — safe because model init is single-threaded
-        # (one model is parallelized at a time). Not safe under concurrent calls.
-        original_fn = globals().get("apply_fsdp2_sharding_recursively")
-        assert original_fn is not None, "apply_fsdp2_sharding_recursively not found in module globals"
-
-        def _fsdp_by_dtype(
-            module,
-            mesh,
-            mp_policy,
-            offload_policy=None,
-            enable_fsdp2_prefetch=True,
-            fsdp2_backward_prefetch_depth=2,
-            fsdp2_forward_prefetch_depth=1,
-            reshard_after_forward=None,
-            fully_shard_fn=None,
-            frozen_multimodal_sharding="root",
-            ignored_multimodal_params=None,
-        ):
-            del enable_fsdp2_prefetch, fsdp2_backward_prefetch_depth, fsdp2_forward_prefetch_depth, fully_shard_fn
-            frozen_multimodal_sharding = normalize_frozen_multimodal_sharding(frozen_multimodal_sharding)
-            pp_enabled = "pp" in mesh.mesh_dim_names and mesh["pp"].size() > 1
-
-            if isinstance(module, (nn.ModuleList, nn.ModuleDict)):
-                all_items = list(module.items()) if isinstance(module, nn.ModuleDict) else list(enumerate(module))
-                flat_layer_items = [
-                    (layer_id, child)
-                    for layer_id, child in all_items
-                    if not isinstance(child, (nn.ModuleList, nn.ModuleDict))
-                ]
-                nested_items = [
-                    (layer_id, child)
-                    for layer_id, child in all_items
-                    if isinstance(child, (nn.ModuleList, nn.ModuleDict))
-                ]
-
-                for _, child in nested_items:
-                    _fsdp_by_dtype(
-                        child,
-                        mesh,
-                        mp_policy,
-                        offload_policy,
-                        reshard_after_forward=reshard_after_forward,
-                        frozen_multimodal_sharding=frozen_multimodal_sharding,
-                        ignored_multimodal_params=ignored_multimodal_params,
-                    )
-
-                for enum_id, (_, child) in enumerate(flat_layer_items):
-                    if reshard_after_forward is not None:
-                        layer_reshard_after_forward = reshard_after_forward
-                    elif pp_enabled:
-                        layer_reshard_after_forward = False
-                    else:
-                        layer_reshard_after_forward = enum_id < len(flat_layer_items) - 1
-                    parallelizer_utils.fully_shard_by_dtype(
-                        child,
-                        mesh,
-                        mp_policy,
-                        offload_policy,
-                        fp32_compute_module_names=fp32_compute_module_names,
-                        reshard_after_forward=layer_reshard_after_forward,
-                    )
-            else:
-                for name, sub in module.named_children():
-                    if is_multimodal_module_name(name) and module_is_fully_frozen(sub):
-                        if frozen_multimodal_sharding in ("root", "replicate"):
-                            logger.info(
-                                "Keeping frozen multimodal module %s at FSDP policy %s",
-                                name,
-                                frozen_multimodal_sharding,
-                            )
-                            if frozen_multimodal_sharding == "replicate" and ignored_multimodal_params is not None:
-                                ignored_multimodal_params.update(module_parameters(sub))
-                            continue
-                    _fsdp_by_dtype(
-                        sub,
-                        mesh,
-                        mp_policy,
-                        offload_policy,
-                        reshard_after_forward=reshard_after_forward,
-                        frozen_multimodal_sharding=frozen_multimodal_sharding,
-                        ignored_multimodal_params=ignored_multimodal_params,
-                    )
-
-        globals()["apply_fsdp2_sharding_recursively"] = _fsdp_by_dtype
-        try:
-            result = super().parallelize(
-                model,
-                device_mesh,
-                dp_shard_cp_mesh_name=dp_shard_cp_mesh_name,
-                **kwargs,
-            )
-        finally:
-            globals()["apply_fsdp2_sharding_recursively"] = original_fn
+        # TP, AC and mixed precision come from the default strategy; the FSDP wrapping
+        # step is customized through the ``_apply_fsdp_sharding`` hook above.
+        result = super().parallelize(
+            model,
+            device_mesh,
+            dp_shard_cp_mesh_name=dp_shard_cp_mesh_name,
+            **kwargs,
+        )
 
         # Set CP mesh on CPAwareGatedDeltaNet modules
         if cp_enabled:
