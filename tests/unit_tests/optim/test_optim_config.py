@@ -28,7 +28,9 @@ from nemo_automodel.components.optim.optimizer import (
     OptimizerConfig,
     OptimizerFromFactoryConfig,
     ParamGroupOverride,
+    _avoid_redundant_te_master_weights_for_fp32_params,
     _drop_empty_local_shards,
+    _split_dtensor_and_plain_params,
     build_optimizer,
     build_optimizer_config,
 )
@@ -106,6 +108,20 @@ class TestAdamWConfig:
 
 
 class TestOptimizerConfigBase:
+    def test_isolates_plain_params_from_dtensor_foreach_group(self, monkeypatch):
+        import nemo_automodel.components.optim.optimizer as optimizer_module
+
+        class FakeDTensor:
+            pass
+
+        sharded = FakeDTensor()
+        plain = object()
+        monkeypatch.setattr(optimizer_module, "DTensor", FakeDTensor)
+
+        groups = _split_dtensor_and_plain_params([sharded, plain])
+
+        assert groups == [{"params": [sharded]}, {"params": [plain]}]
+
     def test_base_build_not_implemented(self):
         with pytest.raises(NotImplementedError):
             OptimizerConfig()._build_optimizer(_params())
@@ -123,6 +139,61 @@ class TestOptimizerConfigBase:
         assert isinstance(opt, torch.optim.AdamW)
         assert opt.param_groups[0]["weight_decay"] == 0.1
         assert opt.param_groups[1]["weight_decay"] == 0.0
+
+
+def test_te_master_ownership_uses_resident_fp32_parameter_directly_after_resume():
+    fp32_param = nn.Parameter(torch.ones(4, dtype=torch.float32))
+    bf16_param = nn.Parameter(torch.ones(4, dtype=torch.bfloat16))
+
+    class FakeFusedAdam(torch.optim.Optimizer):
+        def __init__(self):
+            super().__init__([fp32_param, bf16_param], {"lr": 1e-3})
+            self.master_weights = True
+            self._scales = {}
+
+        def _initialize_state(self, parameter, state_name, zero_buffer):
+            """Create one state tensor with the parameter's arbitrary shape.
+
+            Args:
+                parameter: Tensor of arbitrary shape whose optimizer state is initialized.
+                state_name: State key to create.
+                zero_buffer: Whether to initialize the state to zero.
+            """
+            assert zero_buffer
+            self.state[parameter][state_name] = torch.zeros_like(parameter, dtype=torch.float32)
+
+        def load_state_dict(self, state_dict):
+            """Mimic TE's second state rebuild after PyTorch load hooks run."""
+            super().load_state_dict(state_dict)
+            saved_ids = [saved_id for group in state_dict["param_groups"] for saved_id in group["params"]]
+            current_params = [parameter for group in self.param_groups for parameter in group["params"]]
+            id_map = dict(zip(saved_ids, current_params))
+            for saved_id, saved_state in state_dict["state"].items():
+                parameter = id_map[saved_id]
+                self.state[parameter] = {name: value.detach().clone() for name, value in saved_state.items()}
+
+    optimizer = FakeFusedAdam()
+    _avoid_redundant_te_master_weights_for_fp32_params(optimizer)
+
+    assert set(optimizer.state[fp32_param]) == {"exp_avg", "exp_avg_sq"}
+    assert optimizer.state[bf16_param] == {}
+
+    optimizer.state[bf16_param]["exp_avg"] = torch.zeros_like(bf16_param, dtype=torch.float32)
+    optimizer.state[bf16_param]["exp_avg_sq"] = torch.zeros_like(bf16_param, dtype=torch.float32)
+    optimizer.state[fp32_param]["master_param"] = fp32_param.detach().clone()
+    optimizer.state[bf16_param]["master_param"] = bf16_param.detach().float().clone()
+    checkpoint = optimizer.state_dict()
+    optimizer.load_state_dict(checkpoint)
+
+    assert set(optimizer.state[fp32_param]) == {"exp_avg", "exp_avg_sq"}
+    assert set(optimizer.state[bf16_param]) == {"exp_avg", "exp_avg_sq", "master_param"}
+
+    pre_step_checkpoint = optimizer.state_dict()
+    pre_step_checkpoint["state"] = {}
+    optimizer.load_state_dict(pre_step_checkpoint)
+
+    assert set(optimizer.state[fp32_param]) == {"exp_avg", "exp_avg_sq"}
+    assert optimizer.state[bf16_param] == {}
 
 
 # ---------------------------------------------------------------------------
