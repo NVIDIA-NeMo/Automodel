@@ -385,7 +385,9 @@ class _TensorModel(torch.nn.Module):
 
 
 @pytest.mark.cuda(False)
-def test_run_train_step_supports_tensor_outputs(monkeypatch):
+@pytest.mark.parametrize("grad_norm_backend", [None, "triton", "te"])
+def test_run_train_step_supports_tensor_outputs(monkeypatch: pytest.MonkeyPatch, grad_norm_backend: str | None) -> None:
+    """Check tensor outputs and norm backend selection through a native optimizer step."""
     recipe = FinetuneRecipeForVLM.__new__(FinetuneRecipeForVLM)
     recipe.dist_env = SimpleNamespace(device="cpu")
     recipe.device_mesh = None
@@ -400,7 +402,9 @@ def test_run_train_step_supports_tensor_outputs(monkeypatch):
     # so non-drafter test paths skip the log line.
     recipe.step_scheduler = SimpleNamespace(step=0, epoch=0, is_remote_logging_step=False)
     recipe.checkpointer = SimpleNamespace(maybe_wait_for_staging=lambda: None)
-    recipe.cfg = _Cfg(fp8=None)
+    recipe.cfg = ConfigNode(
+        {"fp8": None, **({"clip_grad_norm": {"backend": grad_norm_backend}} if grad_norm_backend is not None else {})}
+    )
     recipe.lr_scheduler = None
     recipe.timestamp = 0.0
     recipe.distributed_config = None
@@ -454,6 +458,7 @@ def test_run_train_step_supports_tensor_outputs(monkeypatch):
     assert isinstance(metrics, MetricsSample)
     assert logits_seen["value"].requires_grad
     grad_clip_mock.assert_called_once()
+    assert grad_clip_mock.call_args.kwargs["grad_norm_backend"] == (grad_norm_backend or "triton")
     assert calculate_mock.call_args.kwargs["num_label_tokens"] == 1
     assert metrics.metrics["grad_norm"] == 2.5
     assert MoEAuxLossAutoScaler.main_loss_backward_scale.item() == pytest.approx(1.0)

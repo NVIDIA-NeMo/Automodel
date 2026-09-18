@@ -153,6 +153,18 @@ class GroupedExpertsLoRA(GroupedExperts):
         nn.init.zeros_(self.lora_gate_and_up_B)
         nn.init.zeros_(self.lora_down_B)
 
+    def materialize_effective_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the grouped expert weights with the LoRA updates folded in.
+
+        Returns:
+            A pair containing the input-projection tensor of shape
+            [experts, expert_dim, fused_intermediate] and the down-projection
+            tensor of shape [experts, intermediate, expert_dim].
+        """
+        gate_and_up_delta = torch.bmm(self.lora_gate_and_up_A, self.lora_gate_and_up_B) * self.scale
+        down_delta = torch.bmm(self.lora_down_A, self.lora_down_B) * self.scale
+        return self.gate_and_up_projs + gate_and_up_delta, self.down_projs + down_delta
+
     def forward(self, x: torch.Tensor, token_mask: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor):
         """Forward pass for GroupedExpertsLoRA with LoRA injection.
 
