@@ -14,6 +14,7 @@
 
 """Two-GPU FSDP2, compiled attention, and optimizer-resume regression tests."""
 
+import traceback
 from copy import deepcopy
 from pathlib import Path
 
@@ -69,6 +70,10 @@ def _worker(rank: int, work_dir: str, lora: bool) -> None:
                 skip_freeze=True,
             )
         reference = deepcopy(model)
+        # FSDP casts every gathered parameter, including modulation and norm
+        # weights, to BF16. Autocast alone leaves those reference weights FP32.
+        # Keep an independent compute copy and FP32 optimizer masters for SFT.
+        reference_compute = reference if lora else deepcopy(reference).to(dtype=torch.bfloat16)
         mesh = init_device_mesh("cuda", (1, 2, 1), mesh_dim_names=("dp_replicate", "dp_shard_cp", "tp"))
         manager = FSDP2Manager(
             FSDP2Config(
@@ -129,10 +134,21 @@ def _worker(rank: int, work_dir: str, lora: bool) -> None:
                 Detached velocities [1, 16, 3, 4, 4], including the reference slot.
             """
             opt.zero_grad(set_to_none=True)
-            prediction = adapter.forward(module, inputs)
+            compute_module = reference_compute if average_gradients else module
+            if compute_module is not module:
+                # Copy into existing BF16 parameters so compiled callables keep
+                # stable identities across optimizer steps.
+                compute_module.load_state_dict(module.state_dict())
+                compute_module.zero_grad(set_to_none=True)
+            prediction = adapter.forward(compute_module, inputs)
             loss = (prediction - target).square().mean()
             assert torch.isfinite(loss)
             loss.backward()
+            if compute_module is not module:
+                compute_parameters = dict(compute_module.named_parameters())
+                for name, parameter in module.named_parameters():
+                    gradient = compute_parameters[name].grad
+                    parameter.grad = None if gradient is None else gradient.detach().float()
             for parameter in module.parameters():
                 if not parameter.requires_grad or parameter.grad is None:
                     continue
@@ -170,7 +186,18 @@ def _worker(rank: int, work_dir: str, lora: bool) -> None:
         for index in range(2):
             actual = backward(model, optimizer)
             expected = backward(reference, ref_optimizer, average_gradients=True)
-            torch.testing.assert_close(actual, expected, rtol=2e-2, atol=3e-3)
+            forward_error = None
+            try:
+                torch.testing.assert_close(actual, expected, rtol=2e-2, atol=3e-3)
+            except AssertionError as error:
+                forward_error = f"Rank {rank}, update {index}: {error}"
+            # Every rank must stop before gradient all-gathers if any rank's
+            # local prediction fails; otherwise cleanup can hide the assertion.
+            forward_errors = [None] * dist.get_world_size()
+            dist.all_gather_object(forward_errors, forward_error)
+            failures = [error for error in forward_errors if error is not None]
+            if failures:
+                raise AssertionError("\n".join(failures))
             compare_gradients()
             reference_norm = torch.linalg.vector_norm(
                 torch.stack(
@@ -209,6 +236,11 @@ def _worker(rank: int, work_dir: str, lora: bool) -> None:
             torch.testing.assert_close(local, saved, rtol=0, atol=0, msg=name)
             full = value.full_tensor() if isinstance(value, DTensor) else value
             torch.testing.assert_close(full, reference.state_dict()[name], rtol=2e-2, atol=3e-3, msg=name)
+    except Exception:
+        # Report the original error even if a peer is still inside NCCL and
+        # process-group cleanup waits for its timeout.
+        traceback.print_exc()
+        raise
     finally:
         dist.destroy_process_group()
 
