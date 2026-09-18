@@ -35,6 +35,7 @@ try:
     from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
         Qwen3_5MoeConfig,
         Qwen3_5MoeTextConfig,
+        Qwen3_5MoeVisionConfig,
     )
     from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
         Qwen3_5MoeForConditionalGeneration as HFQwen3_5MoeForConditionalGeneration,
@@ -59,6 +60,7 @@ except ModuleNotFoundError:
     Qwen3_5MoeModelOutputWithPast = _make_missing("Qwen3_5MoeModelOutputWithPast")
     Qwen3_5MoeTextRotaryEmbedding = _make_missing("Qwen3_5MoeTextRotaryEmbedding")
     Qwen3_5MoeVisionRotaryEmbedding = _make_missing("Qwen3_5MoeVisionRotaryEmbedding")
+    Qwen3_5MoeVisionConfig = _make_missing("Qwen3_5MoeVisionConfig")
     HFQwen3_5MoeModel = _make_missing("Qwen3_5MoeModel")
 
 from nemo_automodel.components.distributed.context_parallel.sharder import (
@@ -500,7 +502,24 @@ class Fp32SafeQwen3_5MoeTextRotaryEmbedding(Qwen3_5MoeTextRotaryEmbedding):
 
 
 class Fp32SafeQwen3_5MoeVisionRotaryEmbedding(Qwen3_5MoeVisionRotaryEmbedding):
-    """Ensure the vision rotary inv_freq buffer remains float32."""
+    """Ensure the vision rotary inv_freq buffer remains float32.
+
+    transformers >= 5.17 changed the vision rotary embedding constructor from
+    ``(dim, ...)`` to ``(config, ...)``. Accept both: a legacy int ``dim`` is
+    converted into a minimal axial vision config with ``head_dim = dim``.
+    """
+
+    def __init__(self, config: Any = None, *args: Any, dim: int | None = None, **kwargs: Any):
+        if isinstance(config, int):
+            dim = config
+            config = None
+        if config is None:
+            if dim is None:
+                raise TypeError("Fp32SafeQwen3_5MoeVisionRotaryEmbedding requires a config or an int dim")
+            config = Qwen3_5MoeVisionConfig(hidden_size=dim * 4, num_heads=4)
+            config.head_dim = dim
+            config.rope_parameters = {"rope_type": "axial", "rope_theta": 10000.0}
+        super().__init__(config, *args, **kwargs)
 
     def _apply(self, fn: Any, recurse: bool = True):
         inv_freq_fp32 = self.inv_freq.detach().clone().to(torch.float32)
