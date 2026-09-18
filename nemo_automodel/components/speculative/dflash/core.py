@@ -327,6 +327,19 @@ class DFlashTrainerModule(nn.Module):
         pos_ids = base + offsets
         return pos_ids.view(bsz, -1)
 
+    def _embed_noise_ids(self, noise_ids: torch.Tensor) -> torch.Tensor:
+        """Embed noise-block token ids and apply the target's input-embedding scale.
+
+        Mirrors ``Qwen3DFlashDraftModel.embed_noise_block``, which spec_generate
+        uses on the decode side: a target whose ``dflash_config`` sets
+        ``input_embedding_scale`` must see the same scaled embeddings during
+        training, or the draft learns one distribution and is served another --
+        the same train/serve mismatch ``compute_logits`` closes on the output side.
+        """
+        embedded = _to_full_tensor(self.embed_tokens(noise_ids))
+        scale = self.draft_model.input_embedding_scale
+        return embedded if scale == 1.0 else embedded * scale
+
     def _create_noise_embed(self, input_ids, anchor_positions, block_keep_mask):
         """Embed each block as ``[anchor_token, MASK, MASK, ...]`` (invalid blocks all MASK)."""
         bsz, seq_len = input_ids.shape
@@ -348,7 +361,7 @@ class DFlashTrainerModule(nn.Module):
         )
         # A tensor-parallel target's embed_tokens is vocab-parallel and returns a
         # DTensor; gather it so the (plain) draft can consume the noise embedding.
-        return _to_full_tensor(self.embed_tokens(noise_ids))
+        return self._embed_noise_ids(noise_ids)
 
     def _create_vp_noise_embed(self, input_ids, anchor_positions, block_keep_mask, prefix_lengths):
         """Embed the draft blocks with a visible prefix of real tokens, then ``MASK``.
@@ -381,7 +394,7 @@ class DFlashTrainerModule(nn.Module):
         noise_ids = torch.where(fill_mask, real_tokens, mask_tokens).view(bsz, n * self.block_size)
         # A tensor-parallel target's embed_tokens is vocab-parallel and returns a
         # DTensor; gather it so the (plain) draft can consume the noise embedding.
-        return _to_full_tensor(self.embed_tokens(noise_ids))
+        return self._embed_noise_ids(noise_ids)
 
     def _build_block_targets(
         self,
@@ -548,7 +561,9 @@ class DFlashTrainerModule(nn.Module):
         )
         # A tensor-parallel target's lm_head is column-parallel and returns
         # vocab-sharded (DTensor) logits; gather to a full tensor for the loss.
-        logits = _to_full_tensor(self.lm_head(output_hidden))
+        # ``compute_logits`` applies the target's output transform (multiplier /
+        # softcapping) so training supervises the distribution serving produces.
+        logits = _to_full_tensor(self.draft_model.compute_logits(output_hidden, self.lm_head))
 
         n = anchor_positions.size(1)
         bs = self.block_size
