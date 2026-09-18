@@ -23,7 +23,7 @@ import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.nn.functional import all_gather
 
-from nemo_automodel.components.distributed.context_parallel.sharder import ShardLayout, shard_batch_contiguous
+from nemo_automodel.components.distributed import ShardLayout, shard_batch_contiguous
 from nemo_automodel.components.models.deepseek_v41.packing import packed_layout
 
 

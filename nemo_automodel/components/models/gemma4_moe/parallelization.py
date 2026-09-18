@@ -29,7 +29,7 @@ from torch.distributed.tensor import DTensor, distribute_tensor
 from torch.distributed.tensor.parallel import ColwiseParallel, ParallelStyle
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
-from nemo_automodel.components.distributed.parallel_styles import ReplicatedWithGradAllReduce
+from nemo_automodel.components.distributed import ReplicatedWithGradAllReduce
 
 
 class _ReduceFromTensorParallelRegion(torch.autograd.Function):
@@ -260,7 +260,7 @@ def _get_attention_head_counts(text_config) -> set[tuple[int, int]]:
 
 def register_gemma4_parallel_strategy() -> None:
     """Register Gemma4's model-owned FSDP2 strategy once."""
-    from nemo_automodel.components.distributed.parallelizer import (
+    from nemo_automodel.components.distributed import (
         PARALLELIZATION_STRATEGIES,
         DefaultParallelizationStrategy,
         register_parallel_strategy,

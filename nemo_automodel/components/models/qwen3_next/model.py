@@ -20,7 +20,7 @@ import torch.nn as nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.qwen3_next.configuration_qwen3_next import Qwen3NextConfig
 
-from nemo_automodel.components.distributed.activation_checkpointing import unwrap_checkpoint_wrapper
+from nemo_automodel.components.distributed import unwrap_checkpoint_wrapper
 from nemo_automodel.components.models.common import (
     BackendConfig,
     get_rope_config,
@@ -43,7 +43,7 @@ from nemo_automodel.components.models.qwen3_next.state_dict_adapter import Qwen3
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MLP, MoE
-from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
+from nemo_automodel.components.utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 

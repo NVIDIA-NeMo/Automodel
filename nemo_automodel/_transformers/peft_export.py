@@ -24,9 +24,7 @@ from torch.distributed.tensor import DTensor
 
 from nemo_automodel.components._peft.lora import LinearLoRA
 from nemo_automodel.components._peft.lora_experts import GroupedExpertsLoRA
-from nemo_automodel.components.checkpoint.addons import ConsolidatedHFAddon
-from nemo_automodel.components.checkpoint.config import CheckpointingConfig
-from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState
+from nemo_automodel.components.checkpoint import CheckpointingConfig, ConsolidatedHFAddon, ModelState
 
 
 def _is_lora_state_key(key: str) -> bool:

@@ -109,8 +109,10 @@ modify it. Use the current year (2026).
 - **Optional dependencies** must be guarded with `safe_import()` from
   `nemo_automodel.shared.import_utils`. Never let an optional import crash
   module loading.
-- **Components must not import each other** — enforced by `import-linter`
-  (see `pyproject.toml`).
+- **Component imports use exported symbols only** — every consumer outside a
+  component, including recipes and other components, imports from the component
+  package; the imported symbol must be declared in its `__all__`. This is
+  enforced by `import-linter` (see `pyproject.toml`).
 
 ## Code Review Checklist
 
@@ -121,7 +123,7 @@ modify it. Use the current year (2026).
 5. **No bare `print()`** — use `logging.getLogger(__name__)`
 6. **No commented-out code** without explanation
 7. **Optional imports** guarded with `safe_import()`
-8. **No cross-component imports** between `components/` subdirectories
+8. **Public component imports only** from recipes, framework code, and other components
 
 ## Automated Review
 

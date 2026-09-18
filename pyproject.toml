@@ -531,10 +531,13 @@ known-third-party = ["datasets", "transformers", "wandb"]
 [tool.importlinter]
 root_package = "nemo_automodel"
 exclude_type_checking_imports = true
+contract_types = [
+    "component_interface: tools.import_linter_contracts.ComponentInterfaceContract",
+]
 
 [[tool.importlinter.contracts]]
-name = "Components must not import each other"
-type = "independence"
+name = "Component imports use exported symbols"
+type = "component_interface"
 modules = [
     "nemo_automodel.components.checkpoint",
     "nemo_automodel.components.config",
@@ -548,11 +551,6 @@ modules = [
     "nemo_automodel.components.training",
     "nemo_automodel.components.utils",
 ]
-ignore_imports = [
-    # Dion needs the FSDP DP mesh resolver so its optimizer mesh matches parameter sharding.
-    "nemo_automodel.components.optim.dion -> nemo_automodel.components.distributed.mesh_utils",
-]
-
 # ty: type checking (https://github.com/astral-sh/ty)
 # Default: permissive. Strict checks are opt-in per-file via overrides below.
 # Phase 1 modules: launcher, attention, config, optim, loggers

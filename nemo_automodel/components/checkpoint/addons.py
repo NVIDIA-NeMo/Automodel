@@ -60,7 +60,7 @@ def _unwrap_ddp_model(model: nn.Module) -> nn.Module:
     return model
 
 
-def _save_generated_hf_assets(
+def save_generated_hf_assets(
     model_part: nn.Module,
     metadata_reference_path: str | None,
     hf_metadata_dir: str,
@@ -112,6 +112,9 @@ def _save_generated_hf_assets(
 
     if tokenizer is not None:
         tokenizer.save_pretrained(hf_metadata_dir)
+
+
+_save_generated_hf_assets = save_generated_hf_assets
 
 
 class CheckpointAddon(Protocol):

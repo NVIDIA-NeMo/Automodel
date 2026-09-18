@@ -53,8 +53,7 @@ import torch
 from datasets import load_dataset
 from transformers import AutoModelForImageTextToText, AutoProcessor
 
-from nemo_automodel.components.datasets.vlm.datasets import convert_sharegpt_to_conversation
-from nemo_automodel.components.datasets.vlm.utils import set_image_pixel_bounds
+from nemo_automodel.components.datasets import convert_sharegpt_to_conversation, set_image_pixel_bounds
 from nemo_automodel.shared.import_utils import safe_import
 
 logger = logging.getLogger(__name__)

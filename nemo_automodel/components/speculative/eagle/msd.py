@@ -30,7 +30,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import PretrainedConfig
 
-from nemo_automodel.components.loss.soft_ce import masked_soft_cross_entropy
+from nemo_automodel.components.loss import masked_soft_cross_entropy
 from nemo_automodel.components.speculative.eagle.draft_llama_v12 import (
     LlamaEagleDraftModel,
     _build_causal_mask,

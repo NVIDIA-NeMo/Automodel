@@ -620,7 +620,7 @@ class _SentenceTransformerMetadataExporter:
         original_model_path: str | None,
     ) -> None:
         """Write deployable Hugging Face metadata plus standard Sentence Transformers assets."""
-        from nemo_automodel.components.checkpoint.addons import _save_generated_hf_assets
+        from nemo_automodel.components.checkpoint import save_generated_hf_assets as _save_generated_hf_assets
 
         deploy_config = self.model_part.get_hf_export_config()
         source_model_path = self._source_model_path(original_model_path)

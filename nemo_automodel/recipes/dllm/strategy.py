@@ -41,16 +41,15 @@ from nemo_automodel.components.attention.idlm_mask import (
     create_idlm_block_mask,
     create_idlm_sdpa_mask,
 )
-from nemo_automodel.components.datasets.dllm.corruption import (
+from nemo_automodel.components.datasets import (
     corrupt_all_masked,
     corrupt_blockwise,
     corrupt_mix,
     corrupt_uniform,
     corrupt_uniform_random,
 )
-from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
-from nemo_automodel.components.distributed.utils import get_sync_ctx
-from nemo_automodel.components.loss.dllm_loss import (
+from nemo_automodel.components.distributed import ContextParallelSharder, get_sync_ctx
+from nemo_automodel.components.loss import (
     BlockDiffusionCrossEntropyLoss,
     HybridDiffusionLLMLoss,
     IDLMLoss,
@@ -599,7 +598,7 @@ class DFlashStrategy(DLLMStrategy):
         """Load and freeze the target LM; resolve block_size, layer_ids, decay loss."""
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
-        from nemo_automodel.components.loss.dllm_loss import DFlashDecayLoss
+        from nemo_automodel.components.loss import DFlashDecayLoss
 
         dflash_cfg = recipe.cfg.get("dflash", None) or {}
 

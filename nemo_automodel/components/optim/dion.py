@@ -20,7 +20,7 @@ from typing import Any, Protocol
 
 import torch.nn as nn
 
-from nemo_automodel.components.distributed.mesh_utils import get_fsdp_dp_mesh
+from nemo_automodel.components.distributed import get_fsdp_dp_mesh
 
 
 class _DionFamilyConfig(Protocol):
