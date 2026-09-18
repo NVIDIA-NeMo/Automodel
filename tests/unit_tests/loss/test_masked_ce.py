@@ -16,6 +16,7 @@ import torch
 import torch.nn.functional as F
 
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+from nemo_automodel.components.loss.utils import calculate_loss
 
 
 def test_masked_cross_entropy_no_mask():
@@ -127,6 +128,42 @@ def test_masked_cross_entropy_num_label_tokens_normalization():
     assert torch.allclose(loss_masked, expected_loss, atol=1e-6), (
         f"Expected normalized loss {expected_loss.item()}, but got {loss_masked.item()}."
     )
+
+
+@pytest.mark.parametrize("ignore_index", [-100, -1, 0])
+def test_masked_cross_entropy_honors_configured_ignore_index(ignore_index):
+    torch.manual_seed(0)
+    logits = torch.randn(2, 4, 6)
+    labels = torch.randint(1, 6, (2, 4))
+    mask = torch.tensor([[1, 1, 0, 0], [1, 0, 1, 0]])
+
+    loss = MaskedCrossEntropy(ignore_index=ignore_index, reduction="sum")(logits, labels.clone(), mask=mask)
+
+    expected_labels = labels.masked_fill(mask == 0, ignore_index)
+    expected = F.cross_entropy(
+        logits.reshape(-1, logits.shape[-1]).float(),
+        expected_labels.reshape(-1),
+        ignore_index=ignore_index,
+        reduction="sum",
+    )
+    torch.testing.assert_close(loss, expected)
+
+
+def test_calculate_loss_maps_dataset_padding_to_configured_ignore_index():
+    torch.manual_seed(0)
+    logits = torch.randn(1, 3, 5)
+    labels = torch.tensor([[1, -100, 2]])
+    loss_fn = MaskedCrossEntropy(ignore_index=0, reduction="sum")
+
+    loss = calculate_loss(loss_fn, logits=logits, labels=labels)
+
+    expected = F.cross_entropy(
+        logits.reshape(-1, 5).float(),
+        torch.tensor([1, 0, 2]),
+        ignore_index=0,
+        reduction="sum",
+    )
+    torch.testing.assert_close(loss, expected)
 
 
 def test_masked_cross_entropy_per_token_weights_match_loss_and_gradient_reference():

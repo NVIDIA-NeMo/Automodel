@@ -17,6 +17,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed.tensor import DTensor
 
+from nemo_automodel.components.loss.utils import _normalize_loss_labels
+
 
 class MaskedCrossEntropy(nn.Module):
     """Cross-entropy loss that handles ignored or masked target positions."""
@@ -67,6 +69,7 @@ class MaskedCrossEntropy(nn.Module):
         # this may happen with CPUOffloadPolicy
         if labels.device != logits.device:
             labels = labels.to(logits.device)  # pragma: no cover
+        labels = _normalize_loss_labels(labels, self.ignore_index)
         labels_shape = labels.shape
         if loss_weights is not None:
             if self.reduction != "sum":
@@ -77,7 +80,6 @@ class MaskedCrossEntropy(nn.Module):
                     f"and {tuple(labels_shape)}"
                 )
             loss_weights = loss_weights.reshape(-1).to(device=logits.device, dtype=torch.float32)
-
         # reshape to (N, C) and (N,) respectively
         logits = logits.view(-1, logits.size(-1))
         labels = labels.view(-1)
@@ -97,7 +99,7 @@ class MaskedCrossEntropy(nn.Module):
             labels = labels.full_tensor()
 
         reduction = "none" if loss_weights is not None else self.reduction
-        loss = F.cross_entropy(logits, labels, reduction=reduction)
+        loss = F.cross_entropy(logits, labels, ignore_index=self.ignore_index, reduction=reduction)
         if loss_weights is not None:
             loss = (loss * loss_weights).sum()
         if num_label_tokens is not None:
