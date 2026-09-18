@@ -102,7 +102,7 @@ def test_apply_router_weight_fp32_routes_large_inputs_through_function():
 
     out = _apply_router_weight_fp32(x, probs, torch.bfloat16)
 
-    assert type(out.grad_fn).__name__.startswith("_RouterWeightMulFunction")
+    assert type(out.grad_fn).__name__.startswith(("_RouterWeightMulFunction", "_TritonRouterWeightMulFunction"))
     assert torch.equal(out, _eager_reference(x.detach(), probs, torch.bfloat16))
 
     out.backward(torch.randn_like(out))
@@ -117,7 +117,7 @@ def test_apply_router_weight_fp32_small_inputs_keep_eager_path():
 
     out = _apply_router_weight_fp32(x, probs, torch.float32)
 
-    assert not type(out.grad_fn).__name__.startswith("_RouterWeightMulFunction")
+    assert not type(out.grad_fn).__name__.startswith(("_RouterWeightMulFunction", "_TritonRouterWeightMulFunction"))
     assert torch.equal(out, _eager_reference(x.detach(), probs, torch.float32))
 
 
@@ -183,3 +183,62 @@ def test_grad_only_for_probs():
 
     assert p_c.grad is not None
     torch.testing.assert_close(p_c.grad, p_e.grad, rtol=1e-6, atol=5e-6)
+
+
+@pytest.mark.skipif(
+    not (getattr(experts_mod, "_TRITON_ROUTER_WEIGHT_AVAILABLE", False) and torch.cuda.is_available()),
+    reason="Triton + CUDA required",
+)
+@pytest.mark.parametrize("tokens,hidden", [(1024, 2048), (16384, 2048), (16384, 4096), (16384, 3584)])
+@pytest.mark.parametrize("compute_dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_triton_router_weight_forward_backward_parity(tokens: int, hidden: int, compute_dtype: torch.dtype) -> None:
+    """Test parity of Triton kernel against eager reference on GPU.
+
+    Args:
+        tokens: Number of routed tokens.
+        hidden: Hidden dimension.
+        compute_dtype: Output computation dtype.
+    """
+    device = "cuda"
+    x = torch.randn(tokens, hidden, dtype=compute_dtype, device=device, requires_grad=True)
+    probs = torch.rand(tokens, 1, dtype=torch.float32, device=device, requires_grad=True)
+
+    # Reference
+    ref_out = _eager_reference(x, probs, compute_dtype)
+    loss_ref = (ref_out.float() * 0.5).sum()
+    loss_ref.backward()
+    grad_x_ref = x.grad.clone()
+    grad_p_ref = probs.grad.clone()
+
+    # Triton Path
+    x_tri = x.detach().clone().requires_grad_(True)
+    probs_tri = probs.detach().clone().requires_grad_(True)
+
+    tri_out = _apply_router_weight_fp32(x_tri, probs_tri, compute_dtype)
+    loss_tri = (tri_out.float() * 0.5).sum()
+    loss_tri.backward()
+
+    # Check forward
+    torch.testing.assert_close(tri_out, ref_out, rtol=1e-3, atol=1e-3)
+    # Check backward
+    torch.testing.assert_close(x_tri.grad, grad_x_ref, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(probs_tri.grad, grad_p_ref, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.skipif(
+    not (getattr(experts_mod, "_TRITON_ROUTER_WEIGHT_AVAILABLE", False) and torch.cuda.is_available()),
+    reason="Triton + CUDA required",
+)
+def test_triton_save_x_false() -> None:
+    """Verify save_x=False optimization when probs does not require grad."""
+    tokens, hidden = 16384, 2048
+    device = "cuda"
+    x = torch.randn(tokens, hidden, dtype=torch.bfloat16, device=device, requires_grad=True)
+    probs = torch.rand(tokens, 1, dtype=torch.float32, device=device, requires_grad=False)
+
+    tri_out = _apply_router_weight_fp32(x, probs, torch.bfloat16)
+    loss = tri_out.float().sum()
+    loss.backward()
+
+    assert x.grad is not None
+    assert probs.grad is None
