@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -90,6 +91,34 @@ class WanAnimate2Adapter(ModelAdapter):
             Gaussian noise with the same shape, dtype, and device as ``latents``.
         """
         return torch.randn_like(latents)
+
+    def add_noise(
+        self,
+        latents: torch.Tensor,
+        noise: torch.Tensor,
+        sigma: torch.Tensor,
+        *,
+        noise_schedule: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],
+    ) -> torch.Tensor:
+        """Preserve DiffSynth's scalar interpolation and intermediate rounding.
+
+        Args:
+            latents: Complete clean stream [batch, 16, target_frames + 1, height,
+                width], in the recipe's compute dtype.
+            noise: Noise with the same shape, dtype, and device as ``latents``.
+            sigma: Float32 noise levels [batch].
+            noise_schedule: Pipeline interpolation callable used for inputs
+                outside BF16 and FP16.
+
+        Returns:
+            Noisy tensor with the same shape and dtype as ``latents`` for BF16
+            and FP16; otherwise the configured schedule's output.
+        """
+        if latents.dtype in (torch.bfloat16, torch.float16):
+            return torch.stack(
+                [(1.0 - s) * clean + s * sample for clean, sample, s in zip(latents, noise, sigma.cpu())]
+            )
+        return super().add_noise(latents, noise, sigma, noise_schedule=noise_schedule)
 
     @staticmethod
     def _build_i2v_mask(

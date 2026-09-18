@@ -34,7 +34,7 @@ import pytest
 import torch
 
 from nemo_automodel.components.flow_matching.adapters.base import FlowMatchingContext
-from nemo_automodel.components.flow_matching.pipeline import create_adapter
+from nemo_automodel.components.flow_matching.pipeline import LinearInterpolationSchedule, create_adapter
 from nemo_automodel.components.models.wan_animate2.adapter import WanAnimate2Adapter
 
 TARGET_FRAMES = 3
@@ -338,6 +338,18 @@ def test_training_noise_preserves_reference_precision(dtype: torch.dtype) -> Non
     expected = torch.randn_like(latents)
     torch.manual_seed(53)
     actual = WanAnimate2Adapter().sample_noise(latents)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+def test_interpolation_matches_per_sample_scalar_precision(dtype: torch.dtype) -> None:
+    """Wan retains native-precision interpolation through its adapter hook."""
+    torch.manual_seed(19)
+    clean = torch.randn(2, 16, 3, 4, 4).to(dtype)
+    noise = torch.randn_like(clean)
+    sigma = torch.tensor([0.9080963134765625, 0.5005995631217957])
+    expected = torch.stack([(1 - s) * x + s * n for x, n, s in zip(clean, noise, sigma)])
+    actual = WanAnimate2Adapter().add_noise(clean, noise, sigma, noise_schedule=LinearInterpolationSchedule().forward)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 

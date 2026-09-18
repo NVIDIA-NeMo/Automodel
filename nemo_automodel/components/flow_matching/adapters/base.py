@@ -20,6 +20,7 @@ dataclass used to pass data between the pipeline and adapters.
 """
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Dict
 
@@ -127,6 +128,30 @@ class ModelAdapter(ABC):
             Adapters may preserve latent precision to match their training reference.
         """
         return torch.randn_like(latents, dtype=torch.float32)
+
+    def add_noise(
+        self,
+        latents: torch.Tensor,
+        noise: torch.Tensor,
+        sigma: torch.Tensor,
+        *,
+        noise_schedule: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],
+    ) -> torch.Tensor:
+        """Apply the pipeline's configured noise schedule.
+
+        Args:
+            latents: Clean tensor [batch, channels, ...], with arbitrary trailing
+                latent dimensions.
+            noise: Noise with the same shape and dtype as ``latents``.
+            sigma: Noise levels [batch].
+            noise_schedule: Interpolation callable accepting latents, noise, and
+                sigma in that order.
+
+        Returns:
+            Noisy tensor with the same shape as ``latents``, as returned by the
+            configured schedule.
+        """
+        return noise_schedule(latents, noise, sigma)
 
     @abstractmethod
     def prepare_inputs(self, context: FlowMatchingContext) -> Dict[str, Any]:

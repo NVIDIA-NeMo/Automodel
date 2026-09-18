@@ -15,6 +15,7 @@
 """Load a real tiny modular checkpoint entirely offline."""
 
 import json
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -24,7 +25,8 @@ from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionP
 
 
 @pytest.mark.parametrize("legacy_index", [False, True])
-def test_modular_pipeline_loads_selected_local_weights(tiny_model, tmp_path, legacy_index):
+@pytest.mark.parametrize("component_iterator", [False, True])
+def test_modular_pipeline_loads_selected_local_weights(tiny_model, tmp_path, legacy_index, component_iterator):
     """A stale pipeline name and remote component revision cannot select other weights."""
     tiny_model.save_pretrained(tmp_path / "transformer")
     index = {
@@ -48,8 +50,9 @@ def test_modular_pipeline_loads_selected_local_weights(tiny_model, tmp_path, leg
         str(tmp_path),
         torch_dtype=torch.float32,
         device=torch.device("cpu"),
-        components_to_load=["transformer"],
+        components_to_load=iter(["transformer"]) if component_iterator else ["transformer"],
         load_for_training=True,
+        model_type="wan_animate2",
         local_files_only=True,
     )
     assert not managers
@@ -62,11 +65,44 @@ def test_modular_pipeline_loads_selected_local_weights(tiny_model, tmp_path, leg
 
 def test_supported_standard_pipeline_keeps_existing_loader(tmp_path):
     """A modular index does not change loading of supported standard pipelines."""
-    from nemo_automodel._diffusers.auto_diffusion_pipeline import _load_pretrained_pipeline
+    from nemo_automodel.components.models.wan_animate2.loading import load_pipeline
 
     (tmp_path / "modular_model_index.json").write_text("{}")
     (tmp_path / "model_index.json").write_text(json.dumps({"_class_name": "WanPipeline"}))
     with patch("nemo_automodel._diffusers.auto_diffusion_pipeline.DiffusionPipeline.from_pretrained") as loader:
-        pipe = _load_pretrained_pipeline(str(tmp_path), (), torch_dtype=torch.float32, components_to_load=None)
+        pipe = load_pipeline(str(tmp_path), (), torch_dtype=torch.float32, components_to_load=None)
     assert pipe is loader.return_value
     loader.assert_called_once_with(str(tmp_path), torch_dtype=torch.float32)
+
+
+@pytest.mark.parametrize("model_type", [None, "flux", "wan", "ltx2", "unregistered"])
+def test_other_models_keep_standard_loader_arguments_and_iterable(tmp_path, model_type):
+    """Other models do not inspect modular indices or consume component iterables early."""
+    (tmp_path / "modular_model_index.json").write_text("invalid json")
+    (tmp_path / "model_index.json").write_text("invalid json")
+    components = iter(["transformer"])
+    expected_pipe = SimpleNamespace(components={})
+    with patch(
+        "nemo_automodel._diffusers.auto_diffusion_pipeline.DiffusionPipeline.from_pretrained",
+        return_value=expected_pipe,
+    ) as loader:
+        pipe, managers = NeMoAutoDiffusionPipeline.from_pretrained(
+            str(tmp_path),
+            "positional-argument",
+            model_type=model_type,
+            torch_dtype=torch.float32,
+            components_to_load=components,
+            move_to_device=False,
+            revision="requested-revision",
+            local_files_only=True,
+        )
+    assert pipe is expected_pipe
+    assert not managers
+    assert list(components) == ["transformer"]
+    loader.assert_called_once_with(
+        str(tmp_path),
+        "positional-argument",
+        torch_dtype=torch.float32,
+        revision="requested-revision",
+        local_files_only=True,
+    )

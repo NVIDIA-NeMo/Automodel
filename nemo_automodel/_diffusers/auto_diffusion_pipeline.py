@@ -40,11 +40,10 @@ Usage:
     )
 """
 
-import json
+import importlib
 import logging
 import os
 from dataclasses import dataclass
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Iterable, Tuple, Union
 
 import torch
@@ -79,6 +78,10 @@ logger = logging.getLogger(__name__)
 
 # Type alias for parallel managers
 ParallelManager = Union[FSDP2Manager, DDPManager]
+
+_PRETRAINED_PIPELINE_LOADERS: dict[str, tuple[str, str]] = {
+    "wan_animate2": ("nemo_automodel.components.models.wan_animate2.loading", "load_pipeline"),
+}
 
 
 @dataclass
@@ -179,59 +182,6 @@ def _iter_pipeline_modules(pipe) -> Iterable[Tuple[str, nn.Module]]:
             continue
         if isinstance(value, nn.Module):
             yield name, value
-
-
-def _load_pretrained_pipeline(
-    model_dir: str,
-    model_args: tuple,
-    *,
-    torch_dtype: Any,
-    components_to_load: Iterable[str] | None,
-    **kwargs: Any,
-) -> "DiffusionPipeline | ModularPipeline":
-    """Load a standard pipeline or a repository's released modular pipeline.
-
-    Prefer the standard loader when its advertised class exists. Modular-only
-    releases may retain an older, unavailable class in ``model_index.json``.
-    Components present in the resolved snapshot are loaded from that snapshot,
-    preserving offline use and the selected checkpoint revision.
-
-    Args:
-        model_dir: Resolved local checkpoint directory.
-        model_args: Positional arguments for the standard pipeline loader.
-        torch_dtype: Requested component weight dtype.
-        components_to_load: Component names, or all pretrained components.
-        **kwargs: Additional Diffusers loading arguments.
-
-    Returns:
-        The loaded standard or modular Diffusers pipeline.
-    """
-    import diffusers
-
-    modular_index = Path(model_dir) / "modular_model_index.json"
-    standard_index = Path(model_dir) / "model_index.json"
-    use_modular = modular_index.is_file()
-    if use_modular and standard_index.is_file():
-        config = json.loads(standard_index.read_text())
-        use_modular = not hasattr(diffusers, config.get("_class_name", ""))
-    if not use_modular:
-        return DiffusionPipeline.from_pretrained(model_dir, *model_args, torch_dtype=torch_dtype, **kwargs)
-    if model_args:
-        raise TypeError("Modular pipelines accept keyword loading arguments only")
-
-    pipe = diffusers.ModularPipeline.from_pretrained(model_dir, **kwargs)
-    names = list(components_to_load) if components_to_load is not None else pipe.pretrained_component_names
-    loaded = {}
-    for name in names:
-        spec = pipe.get_component_spec(name)
-        load_kwargs = dict(kwargs, dtype=torch_dtype)
-        if (Path(model_dir) / (spec.subfolder or name)).is_dir():
-            load_kwargs.update(pretrained_model_name_or_path=model_dir, subfolder=spec.subfolder or name, revision=None)
-        # ComponentSpec.load propagates errors; load_components only logs them,
-        # which could leave a requested training component silently unloaded.
-        loaded[name] = spec.load(**load_kwargs)
-    pipe.update_components(**loaded)
-    return pipe
 
 
 def _move_module_to_device(module: nn.Module, device: torch.device, torch_dtype: Any) -> None:
@@ -771,15 +721,21 @@ class NeMoAutoDiffusionPipeline:
         # (and potentially re-downloaded) over the network on every run.
         model_dir = resolve_diffusion_model_dir(pretrained_model_name_or_path)
 
-        if components_to_load is not None:
-            components_to_load = tuple(components_to_load)
-        pipe = _load_pretrained_pipeline(
-            model_dir,
-            model_args,
-            torch_dtype=torch_dtype,
-            components_to_load=components_to_load,
-            **kwargs,
-        )
+        loader_spec = _PRETRAINED_PIPELINE_LOADERS.get(model_type)
+        if loader_spec is not None:
+            module_name, loader_name = loader_spec
+            loader = getattr(importlib.import_module(module_name), loader_name)
+            if components_to_load is not None:
+                components_to_load = tuple(components_to_load)
+            pipe = loader(
+                model_dir,
+                model_args,
+                torch_dtype=torch_dtype,
+                components_to_load=components_to_load,
+                **kwargs,
+            )
+        else:
+            pipe = DiffusionPipeline.from_pretrained(model_dir, *model_args, torch_dtype=torch_dtype, **kwargs)
 
         logger.info("[INFO] Loaded pipeline type: %s", type(pipe).__name__)
 

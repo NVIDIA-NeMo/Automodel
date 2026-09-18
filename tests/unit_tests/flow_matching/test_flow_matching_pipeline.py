@@ -103,14 +103,13 @@ def pipeline(simple_adapter):
 class TestLinearInterpolationSchedule:
     """Test the linear interpolation noise schedule."""
 
-    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-    def test_interpolation_matches_per_sample_scalar_precision(self, dtype):
-        """Native-precision interpolation matches DiffSynth's scalar-sigma path."""
-        torch.manual_seed(19)
-        clean = torch.randn(2, 16, 3, 4, 4).to(dtype)
-        noise = torch.randn_like(clean)
-        sigma = torch.tensor([0.9080963134765625, 0.5005995631217957])
-        expected = torch.stack([(1 - s) * x + s * n for x, n, s in zip(clean, noise, sigma)])
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+    def test_interpolation_preserves_float32_coefficient_promotion(self, dtype):
+        """The shared schedule retains its original float32 interpolation."""
+        clean = torch.tensor([1.0078125, 1.0], dtype=dtype).view(2, 1, 1, 1)
+        noise = torch.tensor([1.015625, 2.0], dtype=dtype).view_as(clean)
+        sigma = torch.tensor([0.25, 0.75])
+        expected = torch.tensor([1.009765625, 1.75]).view_as(clean)
         actual = LinearInterpolationSchedule().forward(clean, noise, sigma)
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 

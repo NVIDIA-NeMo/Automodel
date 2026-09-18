@@ -64,17 +64,13 @@ class LinearInterpolationSchedule:
         Linear interpolation: x_t = (1 - σ) * x_0 + σ * x_1
 
         Args:
-            x0: Clean latents [batch, channels, ...].
-            x1: Noise with the same shape and dtype as ``x0``.
-            sigma: Float32 noise levels [batch] in [0, 1].
+            x0: Starting point (clean latents)
+            x1: Ending point (noise)
+            sigma: Sigma values in [0, 1]
 
         Returns:
-            Interpolated tensor with the same shape and dtype as ``x0``. Native
-            low-precision inputs use scalar CPU coefficients, preserving the
-            reference scheduler's scalar promotion and intermediate rounding.
+            Interpolated tensor at sigma
         """
-        if x0.dtype in (torch.bfloat16, torch.float16):
-            return torch.stack([(1.0 - s) * clean + s * noise for clean, noise, s in zip(x0, x1, sigma.cpu())])
         sigma = sigma.view(-1, *([1] * (x0.ndim - 1)))
         return (1.0 - sigma) * x0 + sigma * x1
 
@@ -487,7 +483,9 @@ class FlowMatchingPipeline:
         clean_latents = latents.to(noise.dtype)
 
         # x_t = (1 - σ) * x_0 + σ * ε
-        noisy_latents = self.noise_schedule.forward(clean_latents, noise, sigma)
+        noisy_latents = self.model_adapter.add_noise(
+            clean_latents, noise, sigma, noise_schedule=self.noise_schedule.forward
+        )
 
         # ====================================================================
         # Logging
@@ -651,7 +649,7 @@ class FlowMatchingPipeline:
         logger.info(f"[RANGES] Model pred: [{model_pred.min():.4f}, {model_pred.max():.4f}]")
         logger.info(f"[RANGES] Target (v): [{target.min():.4f}, {target.max():.4f}]")
         logger.info("")
-        logger.info(f"[WEIGHTS] Scheme: {self.loss_weighting_scheme if self.use_loss_weighting else 'none'}")
+        logger.info(f"[WEIGHTS] Formula: 1 + {self.flow_shift} * σ")
         logger.info(f"[WEIGHTS] Range: [{loss_weight.min():.4f}, {loss_weight.max():.4f}]")
         logger.info(f"[WEIGHTS] Mean: {loss_weight.mean():.4f}")
         logger.info("")
