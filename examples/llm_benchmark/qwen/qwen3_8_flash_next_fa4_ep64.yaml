@@ -155,7 +155,6 @@ checkpoint:
 loss_fn:
   _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
   ignore_index: -100
-  reduction: sum
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDataset

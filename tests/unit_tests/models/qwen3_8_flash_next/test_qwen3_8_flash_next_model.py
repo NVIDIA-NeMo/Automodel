@@ -114,7 +114,7 @@ def test_multimodal_configuration_fails_closed() -> None:
         )
 
 
-@pytest.mark.parametrize("backend_source", ["shared", "cute_yaml", "cute_dict"])
+@pytest.mark.parametrize("backend_source", ["shared", "cute_yaml", "cute_typed"])
 def test_tiny_qwen3_8_flash_next_forward_backward_and_state_layout(backend_source: str) -> None:
     config = _tiny_config()
     settings = dict(
@@ -135,7 +135,7 @@ def test_tiny_qwen3_8_flash_next_forward_backward_and_state_layout(backend_sourc
             }
         ).instantiate()
     else:
-        backend = Qwen3_8_FlashNextForConditionalGeneration.backend_config_resolver(settings)
+        backend = Qwen3_8_FlashNextBackendConfig(**settings)
     if backend_source != "shared":
         assert isinstance(backend, Qwen3_8_FlashNextBackendConfig)
         assert backend.attn == "cute"
