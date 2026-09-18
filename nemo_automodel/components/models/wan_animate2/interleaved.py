@@ -121,7 +121,19 @@ def install_forward_origin(model: nn.Module) -> None:
     available, upstream = safe_import("diffusers.models.transformers.transformer_wan_animate_2")
     if not available or not isinstance(inner, upstream.WanAnimate2Transformer3DModel):
         raise TypeError("Wan-Animate-2 training requires WanAnimate2Transformer3DModel from diffusers>=0.40.0")
+    lora_classes: dict[tuple[type, ...], type] = {}
     for block in inner.blocks:
+        # LoRA injection creates a distinct empty subclass for each projection.
+        # Reuse equivalent classes only on this model so type guards do not
+        # exhaust Dynamo's recompile budget and change checkpoint replay to eager.
+        for name in ("to_q", "to_k", "to_v"):
+            projection = getattr(block.self_attn, name)
+            projection_class = type(projection)
+            if (
+                projection_class.__name__ == "PatchedLinearLoRA"
+                and projection_class.__module__ == "nemo_automodel.components._peft.lora"
+            ):
+                projection.__class__ = lora_classes.setdefault(projection_class.__bases__, projection_class)
         block._wan_animate2_forward = block.forward
         block._wan_animate2_cache_type = upstream.WanAnimate2KVLayerCache
         block.forward = MethodType(_block_forward_origin, block)
