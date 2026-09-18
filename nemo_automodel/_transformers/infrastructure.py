@@ -65,6 +65,7 @@ from nemo_automodel.components.distributed.pipelining.config import PipelineConf
 from nemo_automodel.components.distributed.tp_replicas import broadcast_tp_replicas
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.models.common.utils import cast_frozen_modules_to_compute_dtype
+from nemo_automodel.components.moe.quantized_experts import apply_mxfp4_to_moe_experts
 from nemo_automodel.components.quantization.fp8 import apply_fp8_to_model
 from nemo_automodel.components.quantization.qat import QATConfig
 from nemo_automodel.components.utils.compile_utils import compile_model
@@ -159,6 +160,8 @@ def _apply_peft_and_lower_precision(
             peft_config.use_triton = False
         # Skip freeze here - will do global freeze after checkpoint loading
         apply_lora_to_linear_modules(model, peft_config, quantization_config=quantization_config, skip_freeze=True)
+        if peft_config.expert_weight_format == "mxfp4":
+            model = apply_mxfp4_to_moe_experts(model)
 
     # FP8
     if fp8_config is not None:

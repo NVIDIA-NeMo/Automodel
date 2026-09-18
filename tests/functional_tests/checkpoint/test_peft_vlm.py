@@ -634,6 +634,7 @@ def test_hf_peft_checkpoint():
         "dropout": 0.0,
         "dropout_position": "post",
         "exclude_modules": ["*vision_tower*", "*vision*", "*visual*", "*image_encoder*", "*lm_head*"],
+        "expert_weight_format": "unquantized",
         "lora_A_init": "xavier",
         "lora_dtype": None,
         "match_all_linear": False,

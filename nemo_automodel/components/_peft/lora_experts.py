@@ -24,7 +24,6 @@ from torch.distributed.tensor import DTensor
 from nemo_automodel.components.moe.experts import (
     GroupedExperts,
     GroupedExpertsDeepEP,
-    _AllGatherConcatVarlenFn,
     _apply_bias,
     _permute_tokens_for_grouped_mm,
 )
@@ -197,31 +196,10 @@ class GroupedExpertsLoRA(GroupedExperts):
 
         local_num_tokens = x.size(0)
         if ep_size > 1:
-            # Variable-length EP gather, mirroring GroupedExperts.forward.
-            # DTensor.from_local(..., Shard(0)).full_tensor() assumes identical local shapes on
-            # every EP rank; with ragged (unpacked / unpadded) batches each rank infers a different
-            # global shape and the all_gather never completes. Exchange lengths, pad, gather, narrow.
             ep_group = ep_mesh.get_group()
-            local_len_t = torch.tensor([local_num_tokens], device=x.device, dtype=torch.int64)
-            gathered_len_t = [torch.zeros_like(local_len_t) for _ in range(ep_size)]
-            dist.all_gather(gathered_len_t, local_len_t, group=ep_group)
-            gathered_lens = [int(t.item()) for t in gathered_len_t]
-            max_len = max(gathered_lens)
-
-            def _gather_var(t: torch.Tensor, *, differentiable: bool) -> torch.Tensor:
-                if differentiable:
-                    return _AllGatherConcatVarlenFn.apply(t, ep_group, gathered_lens, max_len)
-                if max_len > t.size(0):
-                    pad = torch.zeros((max_len - t.size(0),) + tuple(t.shape[1:]), dtype=t.dtype, device=t.device)
-                    t = torch.cat([t, pad], dim=0)
-                gathered = [torch.empty_like(t) for _ in range(ep_size)]
-                dist.all_gather(gathered, t, group=ep_group)
-                return torch.cat([g[:n] for g, n in zip(gathered, gathered_lens)], dim=0)
-
-            x = _gather_var(x, differentiable=True)
-            weights = _gather_var(weights.float(), differentiable=True)
-            indices = _gather_var(indices, differentiable=False)
-            token_mask = _gather_var(token_mask, differentiable=False)
+            x, weights, indices, token_mask, gathered_lens = self._gather_ep_inputs(
+                x, token_mask, weights, indices, ep_group=ep_group, ep_size=ep_size
+            )
 
         n_local_experts = self.n_routed_experts // ep_size
         experts_start_idx = ep_rank * n_local_experts
@@ -532,15 +510,9 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         assert not isinstance(x, DTensor)
         assert self.n_routed_experts % self.ep_size == 0
 
-        indices = indices.masked_fill(~token_mask.unsqueeze(-1), -1)
-
-        (permuted_local_hidden_states, tokens_per_expert, permuted_probs) = self.token_dispatcher.token_permutation2(
-            hidden_states=x,
-            num_local_tokens=x.size(0),
-            token_probs=weights,
-            token_indices=indices,
+        permuted_local_hidden_states, tokens_per_expert, permuted_probs = self._dispatch_tokens(
+            x, token_mask, weights, indices
         )
-        permuted_probs = permuted_probs.unsqueeze(-1)
 
         compute_dtype = x.dtype
         gate_and_up_projs = _to_grouped_mm_operand(self.gate_and_up_projs, compute_dtype)
