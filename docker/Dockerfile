@@ -143,6 +143,26 @@ RUN apt-get update && apt-get install -y --allow-change-held-packages \
     rm -rf /var/lib/apt/lists/* /opt/deepep.patch && \
     cd / && rm -rf DeepEP
 
+# Install DeepSelect from unmodified upstream source; add H100 via NVCC flags.
+# Build the wheel once so upstream's timestamped version stays consistent.
+ARG INSTALL_DEEPSELECT=true
+ARG DEEPSELECT_COMMIT=0f03b68748b304863fdf0181a11458d04ae533a9
+RUN if [ "$INSTALL_DEEPSELECT" = "true" ]; then \
+        apt-get update && apt-get install -y --no-install-recommends pciutils && \
+        git clone https://github.com/deepseek-ai/DeepSelect.git /tmp/DeepSelect && \
+        cd /tmp/DeepSelect && git checkout "$DEEPSELECT_COMMIT" && \
+        git submodule update --init --recursive && \
+        DEEP_SELECT_BUILD_TARGET_PLATFORM=CUDA \
+        NVCC_APPEND_FLAGS="-gencode=arch=compute_90a,code=sm_90a" MAX_JOBS=8 NVCC_THREADS=2 \
+            uv build --wheel --no-build-isolation \
+                --python "$(python -c 'import sys; print(sys._base_executable)')" \
+                --out-dir /tmp/deepselect-wheels . && \
+        UV_BREAK_SYSTEM_PACKAGES=true uv pip install \
+            --python "$(python -c 'import sys; print(sys._base_executable)')" \
+            --no-deps /tmp/deepselect-wheels/*.whl && \
+        cd / && rm -rf /tmp/DeepSelect /tmp/deepselect-wheels /var/lib/apt/lists/*; \
+    fi
+
 # Install Bitsandbytes
 ARG INSTALL_BITSANDBYTES=True
 ARG BITSANDBYTES_COMMIT=0.49.2
