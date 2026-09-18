@@ -200,6 +200,62 @@ def _scenario_torch_fast_path(rank: int) -> None:
     torch.testing.assert_close(torch.tensor(total_norm), torch.tensor(correct))
 
 
+def _scenario_te_backend(rank: int) -> None:
+    """The TE reducer must not bypass the EP reduction.
+
+    ``grad_norm_backend="te"`` takes its own branch that reduces and returns
+    early. Without TE installed the local reduction falls back to torch, which
+    is what makes this branch reachable on CPU.
+    """
+    moe_mesh = init_device_mesh("cpu", (1, _WORLD), mesh_dim_names=("ep_shard", "ep"))
+
+    expert = nn.Parameter(torch.zeros(2, 8))
+    expert.grad = torch.full((2, 8), 10.0 if rank == 0 else 0.1)
+    model = _expert_model(expert)
+
+    total_norm = _clip(model, moe_mesh, grad_norm_backend="te")
+
+    correct = (16 * 100.0 + (_WORLD - 1) * 16 * 0.01) ** 0.5
+    torch.testing.assert_close(torch.tensor(total_norm), torch.tensor(correct))
+
+
+def _scenario_fused_backend(rank: int) -> None:
+    """The fused multi-tensor reducer must not bypass the EP reduction.
+
+    The kernel is CUDA-only, so the eligibility check and the two kernel entry
+    points are swapped for the module's own CPU reference reductions; the branch
+    under test, and the reduction that follows it, are the real ones.
+    """
+    from nemo_automodel.components.training import utils as training_utils
+    from nemo_automodel.components.training.triton import grad_norm
+
+    moe_mesh = init_device_mesh("cpu", (1, _WORLD), mesh_dim_names=("ep_shard", "ep"))
+
+    expert = nn.Parameter(torch.zeros(2, 8))
+    expert.grad = torch.full((2, 8), 10.0 if rank == 0 else 0.1)
+    model = _expert_model(expert)
+
+    originals = (
+        training_utils._use_fused_grad_norm,
+        training_utils.multi_tensor_sumsq,
+        training_utils.multi_tensor_absmax,
+    )
+    training_utils._use_fused_grad_norm = lambda params, norm_type: True
+    training_utils.multi_tensor_sumsq = grad_norm.sumsq_reference
+    training_utils.multi_tensor_absmax = grad_norm.absmax_reference
+    try:
+        total_norm = _clip(model, moe_mesh)
+    finally:
+        (
+            training_utils._use_fused_grad_norm,
+            training_utils.multi_tensor_sumsq,
+            training_utils.multi_tensor_absmax,
+        ) = originals
+
+    correct = (16 * 100.0 + (_WORLD - 1) * 16 * 0.01) ** 0.5
+    torch.testing.assert_close(torch.tensor(total_norm), torch.tensor(correct))
+
+
 def _scenario_inf_norm(rank: int) -> None:
     """The inf-norm path must take the EP-wide max, not the rank-local one."""
     from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
@@ -247,6 +303,8 @@ _SCENARIOS = (
     _scenario_ep_shard_experts,
     _scenario_rank_without_expert_grads,
     _scenario_torch_fast_path,
+    _scenario_te_backend,
+    _scenario_fused_backend,
     _scenario_inf_norm,
     _scenario_ep_size_one,
 )

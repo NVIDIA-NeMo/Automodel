@@ -415,8 +415,8 @@ jobs:
           - test-name: L0_Unit_Tests_CPU
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             cpu-only: true
-            # The 15-minute budget expires near the end of the ~14k-test suite.
-            timeout: 20
+            # The full CPU suite plus DSpark distributed tests exceeds 20 minutes.
+            timeout: 30
           - test-name: L0_Unit_Tests_GPU_1_of_2
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             cpu-only: false
@@ -453,6 +453,9 @@ jobs:
         uses: ./.github/actions/test-template
         with:
           timeout: ${{ matrix.timeout || 10 }}
+          # Keep one confirmation for runner failures without allowing a stuck
+          # unit-test shard to consume three consecutive 20-30m attempts.
+          max-attempts: "2"
           is-unit-test: "true"
           cpu-only: ${{ matrix.cpu-only || false }}
           shard-id: ${{ matrix.shard-id }}

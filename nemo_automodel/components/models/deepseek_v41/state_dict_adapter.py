@@ -47,10 +47,9 @@ Key mapping (HF -> internal):
   vision.* / aligner.*                   -> model.vision.* / model.aligner.*
   image_{start,end,newline}              -> model.image_{start,end,newline}
 
-The ``mtp.*`` DSpark draft is excluded. Eager loading also excludes layers
-beyond the configured backbone and experts assigned to other ranks before
-dequantization. Other checkpoint keys are not filtered by optional-tower
-configuration.
+The backbone adapter excludes the ``mtp.*`` DSpark draft. The draft adapter
+loads that namespace separately so DSpark training can start from the released
+weights without attaching the draft objective to the frozen backbone.
 """
 
 from __future__ import annotations
@@ -65,12 +64,13 @@ from torch.distributed.tensor import DTensor, Partial, Shard
 
 from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
 from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41Config
+from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41Config, DeepseekV41TextConfig
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.state_dict_mixin import MoESplitExpertsStateDictMixin
 from nemo_automodel.components.moe.state_dict_utils import is_dtensor, should_load_expert_for_rank
 
 _ENGRAM_EMBED_PATTERN = re.compile(r"^layers\.(\d+)\.engram\.embed\.weight$")
+_DSPARK_EXPERT_PATTERN = re.compile(r"^mtp\.(\d+)\.ffn\.experts\.(gate_and_up_projs|down_projs)$")
 
 
 def _native_key(key: str) -> str:
@@ -486,7 +486,7 @@ class DeepseekV41StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
             expert/Engram scales [rows, columns / 32] are owner-local DTensors.
             Buffers are uninitialized and must only be passed to DCP loading.
         """
-        expert = re.fullmatch(r"layers\.\d+\.ffn\.experts\.\d+\.w[123]\.weight", key) is not None
+        expert = re.fullmatch(r"(?:layers|mtp)\.\d+\.ffn\.experts\.\d+\.w[123]\.weight", key) is not None
         rowwise = expert or ".engram.embed." in key
         local = value.to_local() if isinstance(value, DTensor) else value
         if local.ndim != 2:
@@ -640,6 +640,207 @@ class DeepseekV41StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
         """
         return {
             _released_key(key): "float32"
+            for key, value in state_dict.items()
+            if isinstance(value, torch.Tensor) and value.dtype == torch.float32
+        }
+
+
+def _dspark_native_key(key: str) -> str:
+    """Map one released DSpark checkpoint name to the native draft namespace."""
+    key = re.sub(r"^mtp\.(\d+)\.", r"layers.\1.", key)
+    key = _native_key(key)
+    if key.startswith("model.layers."):
+        return "mtp." + key.removeprefix("model.layers.")
+    return key.removeprefix("model.")
+
+
+def _dspark_released_key(key: str) -> str:
+    """Map one native DSpark parameter name to the released checkpoint namespace."""
+    if key.startswith("mtp."):
+        key = "model.layers." + key.removeprefix("mtp.")
+    elif key.startswith("embed_tokens."):
+        key = "model." + key
+    key = _released_key(key)
+    if key.startswith("layers."):
+        return "mtp." + key.removeprefix("layers.")
+    return key
+
+
+class DeepseekV41DSparkStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
+    """Convert the released ``mtp.*`` DSpark weights for training and export."""
+
+    _supports_low_memory_dcp_load = False
+
+    def __init__(
+        self,
+        config: DeepseekV41TextConfig,
+        moe_config: MoEConfig,
+        backend: BackendConfig,
+        dtype: torch.dtype = torch.bfloat16,
+    ) -> None:
+        self.config = config
+        self.moe_config = moe_config
+        self.backend = backend
+        self.dtype = dtype
+        self._uses_model_prefix = False
+
+    @property
+    def _expert_path_segment(self) -> str:
+        return "ffn.experts"
+
+    @property
+    def view_loaded_native_keys(self) -> set[str]:
+        """Return native DSpark keys populated through checkpoint views."""
+        return {re.sub(r"^layers\.(\d+)\.", r"mtp.\1.", key) for key in super().view_loaded_native_keys}
+
+    def get_hf_state_dict_keys(self, state_dict: dict[str, Any]) -> list[str]:
+        """Return released names for the draft's native state-dict keys."""
+        keys: list[str] = []
+        for fqn in state_dict:
+            expert = _DSPARK_EXPERT_PATTERN.fullmatch(fqn)
+            if expert:
+                projections = (1, 3) if expert[2] == "gate_and_up_projs" else (2,)
+                keys.extend(
+                    f"mtp.{expert[1]}.ffn.experts.{index}.w{projection}.weight"
+                    for index in range(self.moe_config.n_routed_experts)
+                    for projection in projections
+                )
+            elif "_extra_state" not in fqn:
+                keys.append(_dspark_released_key(fqn))
+        return keys
+
+    def from_hf(
+        self,
+        hf_state_dict: dict[str, Any],
+        device_mesh: DeviceMesh | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Convert released draft tensors to native grouped storage.
+
+        Args:
+            hf_state_dict: Consumed mapping containing ``embed.weight``,
+                ``head.weight``, and ``mtp.*`` tensors. Split expert projections
+                have shape [output, input]; packed FP4 projections store two input
+                values per INT8 element. Other tensors keep their registered shapes.
+            device_mesh: Optional expert mesh selecting rank-local expert IDs.
+            **kwargs: Additional checkpoint protocol arguments.
+
+        Returns:
+            Native mapping with grouped experts shaped [experts, hidden,
+            2 * expert_hidden] and [experts, expert_hidden, hidden].
+        """
+        for key in list(hf_state_dict):
+            expert = re.match(r"mtp\.\d+\.ffn\.experts\.(\d+)\.", key)
+            not_draft = key not in ("embed.weight", "head.weight") and not key.startswith("mtp.")
+            nonlocal_expert = expert is not None and not should_load_expert_for_rank(
+                int(expert[1]), device_mesh, self.moe_config.n_routed_experts
+            )
+            if not_draft or nonlocal_expert:
+                hf_state_dict.pop(key)
+        self._dequantize(hf_state_dict)
+
+        converted: dict[str, Any] = {}
+        expert_state: dict[str, Any] = {}
+        for key in list(hf_state_dict):
+            value = hf_state_dict.pop(key)
+            if key.endswith(".scale"):
+                raise ValueError(f"Checkpoint scale {key} has no matching weight")
+            native_key = _dspark_native_key(key)
+            if ".ffn.experts." in native_key:
+                pseudo_key = re.sub(r"^mtp\.(\d+)\.", r"layers.\1.", native_key)
+                expert_state[pseudo_key] = value
+            else:
+                if native_key in converted:
+                    raise ValueError(f"Multiple checkpoint tensors map to {native_key}")
+                converted[native_key] = value
+
+        merged = self._from_hf_w_merged_experts(expert_state, device_mesh)
+        converted.update({re.sub(r"^layers\.(\d+)\.", r"mtp.\1.", key): value for key, value in merged.items()})
+        return converted
+
+    def _dequantize(self, state_dict: dict[str, Any]) -> None:
+        """Replace paired released draft weights and scales with BF16 tensors."""
+        for key in list(state_dict):
+            if not key.endswith(".weight"):
+                continue
+            weight = state_dict[key]
+            scale_key = key.removesuffix(".weight") + ".scale"
+            if scale_key not in state_dict:
+                if weight.dtype in (torch.float8_e4m3fn, torch.int8):
+                    raise ValueError(f"Quantized weight {key} is missing its scale tensor {scale_key}")
+                continue
+            state_dict[key] = dequantize_checkpoint_weight(
+                weight,
+                state_dict.pop(scale_key),
+                dtype=self.dtype,
+            )
+
+    def to_hf(
+        self,
+        state_dict: dict[str, Any],
+        exclude_key_regex: str | None = None,
+        quantization: bool = False,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Export native draft tensors under released checkpoint names."""
+        output: dict[str, Any] = {}
+        for key, value in state_dict.items():
+            output.update(
+                self.convert_single_tensor_to_hf(
+                    key,
+                    value,
+                    exclude_key_regex=exclude_key_regex,
+                    quantization=quantization,
+                    **kwargs,
+                )
+            )
+        return output
+
+    def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs: Any) -> list[tuple[str, Any]]:
+        """Convert one native draft tensor to released checkpoint storage."""
+        quantization = kwargs.get("quantization", False)
+        if quantization and not kwargs.get("for_checkpoint_load", False):
+            raise ValueError(
+                "Quantization targets are for checkpoint loading only; export trained weights without quantization"
+            )
+
+        expert = _DSPARK_EXPERT_PATTERN.fullmatch(fqn)
+        if expert:
+            pseudo_fqn = re.sub(r"^mtp\.(\d+)\.", r"layers.\1.", fqn)
+            result = self._convert_single_merged_expert_to_hf_split_experts(
+                pseudo_fqn,
+                tensor,
+                for_checkpoint_load=kwargs.get("for_checkpoint_load", False),
+                quantization=quantization,
+            )
+            if result is None:
+                raise RuntimeError(f"Could not convert DSpark expert tensor {fqn}")
+            released = [
+                (_dspark_released_key(re.sub(r"^layers\.(\d+)\.", r"mtp.\1.", key)), value) for key, value in result
+            ]
+        else:
+            released = [(_dspark_released_key(fqn), tensor)]
+
+        exclude = kwargs.get("exclude_key_regex")
+        converted: list[tuple[str, Any]] = []
+        for key, value in released:
+            if exclude and re.match(exclude, key):
+                continue
+            quantized = re.fullmatch(
+                r"mtp\.\d+\.(?:attn\.(?:wq_a|wq_b|wkv|wo_a|wo_b)"
+                r"|main_proj|ffn\.(?:shared_experts|experts\.\d+)\.w[123])\.weight",
+                key,
+            )
+            if quantization and quantized:
+                converted.extend(DeepseekV41StateDictAdapter._quantized_load_targets(key, value))
+            else:
+                converted.append((key, value))
+        return converted
+
+    def forced_hf_dtype_mapping(self, state_dict: dict[str, Any]) -> dict[str, str]:
+        """Return released draft keys whose trained values must remain FP32."""
+        return {
+            _dspark_released_key(key): "float32"
             for key, value in state_dict.items()
             if isinstance(value, torch.Tensor) and value.dtype == torch.float32
         }
