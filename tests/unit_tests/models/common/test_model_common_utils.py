@@ -24,11 +24,14 @@ from nemo_automodel.components.models.common.utils import (
     BackendConfig,
     TEFp8Config,
     compute_lm_head_logits,
+    generation_config_from_model_config,
     get_is_first_microbatch,
     get_is_optim_step,
     get_rope_config,
     initialize_linear_module,
     initialize_rms_norm_module,
+    load_pretrained_generation_config,
+    restore_pretrained_generation_config,
     set_is_first_microbatch,
     set_is_optim_step,
 )
@@ -406,3 +409,119 @@ class TestComputeLmHeadLogits:
         out = compute_lm_head_logits(lm_head, hidden, logits_to_keep=0, is_thd=True, output_hidden_states=True)
         assert out.hidden_states.shape == (1, 7, self.HIDDEN)
         torch.testing.assert_close(out.hidden_states, hidden.unsqueeze(0))
+
+
+class TestGenerationConfigHelpers:
+    def test_from_model_config_takes_stop_tokens_from_a_pretrained_config(self):
+        from transformers import PretrainedConfig
+
+        config = PretrainedConfig(bos_token_id=3, eos_token_id=[2, 11], pad_token_id=0)
+
+        generation_config = generation_config_from_model_config(config)
+
+        assert generation_config.bos_token_id == 3
+        assert generation_config.eos_token_id == [2, 11]
+        assert generation_config.pad_token_id == 0
+
+    def test_from_model_config_falls_back_to_defaults_for_plain_objects(self):
+        generation_config = generation_config_from_model_config(SimpleNamespace(eos_token_id=2))
+
+        assert generation_config.eos_token_id is None
+
+    def test_load_pretrained_returns_none_without_any_config_file(self, tmp_path):
+        assert load_pretrained_generation_config(tmp_path) is None
+
+    def test_load_pretrained_falls_back_to_the_generation_fields_of_config_json(self, tmp_path):
+        """Legacy checkpoints keep do_sample/temperature in config.json only; HF reads them from there."""
+        import json
+
+        (tmp_path / "config.json").write_text(
+            json.dumps({"model_type": "llama", "eos_token_id": 2, "do_sample": True, "temperature": 0.5})
+        )
+
+        generation_config = load_pretrained_generation_config(tmp_path)
+
+        assert generation_config.eos_token_id == 2
+        assert generation_config.do_sample is True
+        assert generation_config.temperature == 0.5
+
+    def test_restore_replaces_a_real_generation_config_only(self, tmp_path):
+        from transformers import GenerationConfig
+
+        GenerationConfig(eos_token_id=[2, 11]).save_pretrained(tmp_path)
+        can_generate = nn.Module()
+        can_generate.generation_config = GenerationConfig()
+        cannot_generate = nn.Module()
+
+        restore_pretrained_generation_config(can_generate, tmp_path)
+        restore_pretrained_generation_config(cannot_generate, tmp_path)
+
+        assert can_generate.generation_config.eos_token_id == [2, 11]
+        assert not hasattr(cannot_generate, "generation_config")
+
+    def test_load_pretrained_fallback_keeps_an_override_that_equals_a_default(self, tmp_path):
+        """``eos_token_id=None`` is a deliberate "do not stop"; it equals the default, so
+        the diff-based merge cannot see it and the caller has to name it."""
+        import json
+
+        from transformers import PretrainedConfig
+
+        (tmp_path / "config.json").write_text(json.dumps({"model_type": "llama", "eos_token_id": 0}))
+
+        generation_config = load_pretrained_generation_config(
+            tmp_path, config=PretrainedConfig(eos_token_id=None), config_overrides={"eos_token_id"}
+        )
+
+        assert generation_config.eos_token_id is None
+
+    def test_load_pretrained_reads_the_subfolder_of_a_local_directory(self, tmp_path):
+        """transformers resolves an absolute local path to the parent's generation_config.json
+        even with ``subfolder`` set; the helper joins the directory itself so the child wins."""
+        from transformers import GenerationConfig
+
+        GenerationConfig(eos_token_id=7).save_pretrained(tmp_path)
+        GenerationConfig(eos_token_id=[2, 11]).save_pretrained(tmp_path / "child")
+
+        assert load_pretrained_generation_config(tmp_path, subfolder="child").eos_token_id == [2, 11]
+
+    def test_load_pretrained_forwards_the_hub_loading_options(self, tmp_path):
+        from transformers import GenerationConfig
+
+        GenerationConfig(eos_token_id=3).save_pretrained(tmp_path)
+
+        with patch.object(GenerationConfig, "from_pretrained", wraps=GenerationConfig.from_pretrained) as spy:
+            load_pretrained_generation_config(tmp_path, revision="abc123", token="secret", local_files_only=True)
+
+        _, forwarded = spy.call_args
+        assert forwarded["revision"] == "abc123"
+        assert forwarded["token"] == "secret"
+        assert forwarded["local_files_only"] is True
+
+    @pytest.mark.parametrize("disk_eos", [2, None], ids=["conflicting", "omitted"])
+    def test_load_pretrained_fallback_keeps_explicit_config_overrides(self, tmp_path, disk_eos):
+        """An eos override passed at load time already sits on the in-memory config; the
+        config.json fallback must neither replace it with the file's value nor with None."""
+        import json
+
+        from transformers import PretrainedConfig
+
+        raw = {"model_type": "llama", "do_sample": True}
+        if disk_eos is not None:
+            raw["eos_token_id"] = disk_eos
+        (tmp_path / "config.json").write_text(json.dumps(raw))
+
+        generation_config = load_pretrained_generation_config(tmp_path, config=PretrainedConfig(eos_token_id=9))
+
+        assert generation_config.eos_token_id == 9
+        assert generation_config.do_sample is True
+
+    def test_load_pretrained_reads_the_checkpoint_generation_file(self, tmp_path):
+        from transformers import GenerationConfig
+
+        GenerationConfig(eos_token_id=[2, 11], do_sample=True, temperature=0.7).save_pretrained(tmp_path)
+
+        generation_config = load_pretrained_generation_config(tmp_path)
+
+        assert generation_config.eos_token_id == [2, 11]
+        assert generation_config.do_sample is True
+        assert generation_config.temperature == 0.7

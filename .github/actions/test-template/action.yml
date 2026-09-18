@@ -19,6 +19,10 @@ inputs:
     description: "Max runtime of test in minutes"
     required: false
     default: "10"
+  max-attempts:
+    description: "Maximum attempts when the test command reaches the job timeout"
+    required: false
+    default: "3"
   test-folder:
     description: "Comma-separated names of folders containing test suites"
     required: false
@@ -151,7 +155,7 @@ runs:
       continue-on-error: ${{ inputs.is-optional == 'true' }}
       with:
         timeout_seconds: ${{ steps.create.outputs.timeout_in_seconds }}
-        max_attempts: 3
+        max_attempts: ${{ inputs.max-attempts }}
         shell: bash
         retry_on: timeout
         command: /bin/bash job.sh
