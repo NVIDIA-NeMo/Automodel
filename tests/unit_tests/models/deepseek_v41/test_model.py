@@ -30,11 +30,11 @@ from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy, fully_shard
 from torch.distributed.tensor import DTensor, Shard, distribute_tensor
 
 from nemo_automodel._transformers.capabilities import _is_deepseek_v4
+from nemo_automodel.components.distributed.fsdp2_extensions.utils import fully_shard_by_dtype
 from nemo_automodel.components.distributed.parallelizer import (
     DefaultParallelizationStrategy,
     get_parallelization_strategy,
 )
-from nemo_automodel.components.distributed.parallelizer_utils import fully_shard_by_dtype
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.deepseek_v4 import fsdp as dsv4_fsdp

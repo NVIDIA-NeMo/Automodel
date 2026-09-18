@@ -172,9 +172,34 @@ def _trainable_params_or_groups(part: torch.nn.Module, overrides: list[ParamGrou
     named_params = [(name, p) for name, p in part.named_parameters() if p.requires_grad]
     if not named_params:
         raise ValueError("optimizer received no trainable parameters")
-    if overrides:
-        return _build_param_groups(named_params, overrides)
-    return [p for _, p in named_params]
+    params_or_groups = _build_param_groups(named_params, overrides) if overrides else [p for _, p in named_params]
+    return _split_dtensor_and_plain_params(params_or_groups)
+
+
+def _split_dtensor_and_plain_params(params_or_groups: list) -> list:
+    """Keep plain tensors out of foreach groups containing DTensors.
+
+    PyTorch foreach operators reject a mixed list of ordinary tensors and
+    DTensors. Bounded FSDP2 replication intentionally creates exactly that
+    model layout, so split only affected optimizer groups while preserving all
+    hyperparameter overrides. The bulk group remains foreach-enabled.
+    """
+
+    def split_group(group: dict[str, Any]) -> list[dict[str, Any]]:
+        params = list(group["params"])
+        plain = [param for param in params if not isinstance(param, DTensor)]
+        sharded = [param for param in params if isinstance(param, DTensor)]
+        if not plain or not sharded:
+            return [group]
+        options = {key: value for key, value in group.items() if key != "params"}
+        return [{"params": sharded, **options}, {"params": plain, **options}]
+
+    is_groups = bool(params_or_groups) and isinstance(params_or_groups[0], dict)
+    groups = params_or_groups if is_groups else [{"params": params_or_groups}]
+    split_groups = [split for group in groups for split in split_group(group)]
+    if is_groups or len(split_groups) > 1:
+        return split_groups
+    return split_groups[0]["params"]
 
 
 @dataclass
@@ -293,6 +318,52 @@ class AdamWConfig(OptimizerConfig):
         )
 
 
+def _avoid_redundant_te_master_weights_for_fp32_params(optimizer: torch.optim.Optimizer) -> None:
+    """Keep TE optimizer moments but no duplicate master for resident FP32 weights.
+
+    Transformer Engine's FusedAdam has one optimizer-wide ``master_weights``
+    switch. Mixed BF16/FP32 models need it for BF16 parameters, but its FP32
+    update path operates directly on the resident parameter and never consumes
+    ``master_param``. Pre-initializing only the two moments for resident FP32
+    parameters makes TE skip its generic three-state initializer. A post-load
+    hook applies the same ownership rule to old checkpoints that contain the
+    redundant state.
+
+    Args:
+        optimizer: Transformer Engine FusedAdam instance whose parameter groups
+            contain tensors of arbitrary shape. DTensor parameters may be sharded
+            on any mesh placement supported by TE; residency is inspected on the
+            rank-local tensor.
+    """
+    if not bool(getattr(optimizer, "master_weights", False)):
+        return
+
+    initialize_state = getattr(optimizer, "_initialize_state", None)
+    if not callable(initialize_state):
+        raise RuntimeError(
+            "Transformer Engine FusedAdam master-weight ownership requires its _initialize_state integration API"
+        )
+
+    def enforce_fp32_ownership(loaded_optimizer: torch.optim.Optimizer) -> None:
+        for group in loaded_optimizer.param_groups:
+            for parameter in group["params"]:
+                local_parameter = parameter.to_local() if isinstance(parameter, DTensor) else parameter
+                if local_parameter.dtype is not torch.float32:
+                    continue
+                state = loaded_optimizer.state[parameter]
+                if "exp_avg" not in state:
+                    initialize_state(parameter, "exp_avg", zero_buffer=True)
+                if "exp_avg_sq" not in state:
+                    initialize_state(parameter, "exp_avg_sq", zero_buffer=True)
+                state.pop("master_param", None)
+                scales = getattr(loaded_optimizer, "_scales", {}).get(parameter)
+                if scales is not None:
+                    scales.pop("master_param", None)
+
+    enforce_fp32_ownership(optimizer)
+    optimizer.register_load_state_dict_post_hook(enforce_fp32_ownership)
+
+
 @dataclass
 class FusedAdamConfig(OptimizerConfig):
     """``transformer_engine.pytorch.optimizers.FusedAdam``."""
@@ -304,16 +375,16 @@ class FusedAdamConfig(OptimizerConfig):
     adam_w_mode: bool = True
     bias_correction: bool = True
     master_weights: bool = True
-    master_weight_dtype: str | None = None
+    master_weight_dtype: str = "fp32"
 
     def _build_optimizer(self, params, *, foreach: bool | None = None) -> torch.optim.Optimizer:
         from transformer_engine.pytorch.optimizers import FusedAdam
 
         kwargs = self._constructor_kwargs()
-        master_weight_dtype = kwargs.pop("master_weight_dtype", None)
-        if master_weight_dtype is not None:
-            master_weight_dtype = dtype_from_str(master_weight_dtype)
-        return FusedAdam(_drop_empty_local_shards(params), **kwargs, master_weight_dtype=master_weight_dtype)
+        kwargs["master_weight_dtype"] = dtype_from_str(kwargs["master_weight_dtype"])
+        optimizer = FusedAdam(_drop_empty_local_shards(params), **kwargs)
+        _avoid_redundant_te_master_weights_for_fp32_params(optimizer)
+        return optimizer
 
 
 @dataclass
@@ -518,7 +589,7 @@ class OptimizerFromFactoryConfig(OptimizerConfig):
         # Only inject ``foreach`` for factories that actually accept it. The TP>1 path sets
         # ``foreach=False`` via ``_foreach_for_mesh``; passing it to a factory that does not take
         # ``foreach`` (e.g. TE ``FusedAdam``) would raise.  Honour an explicit user-provided value.
-        if foreach is not None and "foreach" not in kwargs and _factory_accepts_foreach(self.factory):
+        if foreach is not None and "foreach" not in kwargs and _accepts_foreach(self.factory):
             kwargs["foreach"] = foreach
 
         optimizers: list[torch.optim.Optimizer] = []
@@ -550,7 +621,7 @@ class OptimizerFromFactoryConfig(OptimizerConfig):
             val = kwargs.get(attr, None)
             if isinstance(val, str):
                 kwargs[attr] = dtype_from_str(val)
-        if foreach is not None and "foreach" not in kwargs and _factory_accepts_foreach(self.factory):
+        if foreach is not None and "foreach" not in kwargs and _accepts_foreach(self.factory):
             kwargs["foreach"] = foreach
 
         if _is_te_fused_adam(self.factory):
@@ -789,20 +860,17 @@ def _is_te_fused_adam(factory: Callable[..., Any]) -> bool:
     return isinstance(te_fused_adam, type) and isinstance(factory, type) and issubclass(factory, te_fused_adam)
 
 
-def _factory_accepts_foreach(factory: Callable[..., Any]) -> bool:
+def _accepts_foreach(optim_cls: type["torch.optim.Optimizer"]) -> bool:
     """Return ``True`` if ``factory`` accepts a ``foreach`` kwarg.
 
     ``torch.optim`` optimizers take ``foreach``; external factories such as TE
     ``FusedAdam`` do not, so passing it would raise ``TypeError``.
     """
     try:
-        sig = inspect.signature(factory)
+        sig = inspect.signature(optim_cls)
     except (TypeError, ValueError):
         return False
-    params = sig.parameters
-    if "foreach" in params:
-        return True
-    return any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+    return "foreach" in sig.parameters
 
 
 # ---------------------------------------------------------------------------

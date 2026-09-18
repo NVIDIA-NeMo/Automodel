@@ -65,9 +65,9 @@ from nemo_automodel.components.distributed.activation_checkpointing import (
     is_selective_activation_checkpointing,
 )
 from nemo_automodel.components.distributed.config import FSDP2Config
+from nemo_automodel.components.distributed.fsdp2_extensions.utils import fully_shard_by_dtype
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
-from nemo_automodel.components.distributed.parallelizer_utils import fully_shard_by_dtype
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
