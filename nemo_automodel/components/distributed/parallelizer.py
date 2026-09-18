@@ -252,6 +252,22 @@ class ParallelizationStrategy(ABC):
         pass
 
 
+def _get_input_output_embeddings(model: nn.Module) -> tuple[nn.Module | None, nn.Module | None]:
+    """Resolve the optional Hugging Face embedding getters."""
+
+    def _resolve(getter_name: str) -> nn.Module | None:
+        getter = getattr(model, getter_name, None)
+        if not callable(getter):
+            return None
+        try:
+            module = getter()
+        except (AttributeError, NotImplementedError):
+            return None
+        return module if isinstance(module, nn.Module) else None
+
+    return _resolve("get_input_embeddings"), _resolve("get_output_embeddings")
+
+
 def _fully_shard_untied_input_output_embeddings(
     model: nn.Module,
     *,
@@ -267,9 +283,13 @@ def _fully_shard_untied_input_output_embeddings(
     With fp32 gradient reduction, that unit allocates one contiguous
     reduce-scatter input containing both gradients. Keeping the two trainable
     leaf modules in separate FSDP units bounds that allocation by the larger
-    table instead of their sum. Tied weights stay in one unit to preserve
-    aliasing, and frozen tables stay in the root because they have no gradient
-    communication buffer to split.
+    table instead of their sum. This pass skips tied tables to preserve aliasing,
+    and frozen tables because they have no gradient communication buffer
+    to split. Tables already wrapped as FSDP units retain their existing
+    reshard policy. With an explicit ``reshard_after_forward=True``, a
+    container-hosted head reshards while a newly split top-level head stays
+    gathered. FusedLinearCrossEntropy handles the sharded weight with correct
+    gradients, at the cost of an extra all-gather.
 
     Args:
         model: Model whose input and output embedding modules may be sharded.
@@ -282,26 +302,14 @@ def _fully_shard_untied_input_output_embeddings(
         fully_shard_fn: FSDP sharding callable, injectable for unit tests.
     """
     weights_are_tied = ensure_tied_lm_head(model)
-
-    def _resolve(getter_name: str) -> nn.Module | None:
-        getter = getattr(model, getter_name, None)
-        if not callable(getter):
-            return None
-        try:
-            module = getter()
-        except (AttributeError, NotImplementedError):
-            return None
-        return module if isinstance(module, nn.Module) else None
-
-    input_embeddings = _resolve("get_input_embeddings")
-    output_embeddings = _resolve("get_output_embeddings")
+    input_embeddings, output_embeddings = _get_input_output_embeddings(model)
     input_weight = getattr(input_embeddings, "weight", None)
     output_weight = getattr(output_embeddings, "weight", None)
     weights_are_physically_tied = input_embeddings is not None and (
         input_embeddings is output_embeddings or (input_weight is not None and input_weight is output_weight)
     )
     if weights_are_tied or weights_are_physically_tied:
-        logger.info("Keeping tied input/output embeddings in the root FSDP unit")
+        logger.info("Skipping independent sharding of tied input/output embeddings")
         return
 
     seen: set[int] = set()
@@ -316,6 +324,10 @@ def _fully_shard_untied_input_output_embeddings(
         if module is None or id(module) in seen:
             continue
         seen.add(id(module))
+        # Skip tables that are themselves FSDP units (e.g. ModuleDict children).
+        # This does not detect ownership by an ancestor FSDP unit.
+        if isinstance(module, FSDPModule):
+            continue
         if not any(param.requires_grad for param in module.parameters()):
             continue
         fully_shard_fn(
@@ -496,6 +508,23 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
         _patch_fsdp_accumulated_grad_guard()
 
         ignored_multimodal_params: set[nn.Parameter] = set()
+
+        # Wrapping distinct modules separately replaces their shared Parameter
+        # and breaks the tie. Reject this layout before recursive sharding.
+        ensure_tied_lm_head(model)
+        input_embeddings, output_embeddings = _get_input_output_embeddings(model)
+        input_weight = getattr(input_embeddings, "weight", None)
+        output_weight = getattr(output_embeddings, "weight", None)
+        if input_embeddings is not output_embeddings and input_weight is not None and input_weight is output_weight:
+            for module in model.modules():
+                if isinstance(module, (nn.ModuleList, nn.ModuleDict)) and any(
+                    child is input_embeddings or child is output_embeddings for child in module.modules()
+                ):
+                    raise ValueError(
+                        "Distinct tied input/output embedding modules inside a ModuleList or ModuleDict are not "
+                        "supported by recursive FSDP sharding. Keep both tied modules outside these containers, "
+                        "or use a single shared embedding module."
+                    )
 
         # Find transformer layers and apply parallelisms
         apply_fsdp2_sharding_recursively(
