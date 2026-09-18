@@ -16,6 +16,11 @@ driving frame *t*.
 This guide covers Supervised Fine-Tuning (SFT) of the Wan-Animate-2 14B model using NeMo
 AutoModel with both full fine-tuning and Low-Rank Adaptation (LoRA).
 
+Use `diffusers>=0.40.0`, which provides the released transformer and modular pipeline.
+Install the `diffusion` and `diffusion-media` extras with the repository’s locked dependency
+workflow. The recipe loads the public `Wan-AI/Wan2.2-Animate-2-14B-Diffusers` checkpoint;
+no Diffusers fork or weight conversion is needed.
+
 ### Workflow Overview
 
 | Step | What You Do |
@@ -33,13 +38,21 @@ driving video, and a text caption.
 
 The `WanAnimate2Adapter` handles the following key training mechanics:
 
-- **Two-pass forward**: Each step runs the driving video through the transformer to build a
-  key/value cache, then denoises against it. Both passes carry gradient, so the driving branch is
-  trained rather than frozen.
+- **Two-pass forward**: Each block processes the driving stream and then the generation stream
+  using a fresh key/value cache. Both streams carry gradients. Keeping them inside one block
+  call supports FSDP2 sharding and whole-block activation checkpointing.
 - **Reference slot**: The generation stream carries one extra leading latent frame for the reference
-  character. Its prediction is dropped before the loss, as frame 0 is dropped at inference.
-- **LoRA targets**: The three self-attention input projections, named `q`, `k`, and `v` on this
-  architecture, matching the reference training recipe.
+  character. Training noises and supervises this slot together with the target video,
+  following DiffSynth's training objective. Inference drops its decoded prediction.
+- **LoRA targets**: The three self-attention input projections, named `self_attn.to_q`,
+  `self_attn.to_k`, and `self_attn.to_v`, matching the reference training recipe.
+- **Training objective**: Both recipes sample uniformly from 1,000 discrete timesteps
+  with flow shift 5 and apply bell-shaped weights normalized over that shifted grid,
+  following [DiffSynth's flow-matching loss](https://github.com/modelscope/DiffSynth-Studio/blob/c458cb42ab1ee838bff85c6546e14bb01c3571e9/diffsynth/diffusion/loss.py).
+  Timesteps are rounded to the compute dtype before the scheduler lookup; noise,
+  interpolation, and velocity targets use that dtype too, including BF16 rounding.
+  Full SFT trains all transformer parameters; DiffSynth's example named `full` trains
+  only self-attention Q/K/V. Its example hyperparameters therefore differ from this recipe.
 
 The recipe runs with FSDP2 on a single eight-GPU node and mixed precision, with one sample per
 rank. Tensor and context parallelism are not available for this model, and a training run must use a
@@ -61,7 +74,8 @@ files and a caption:
 ```
 
 Relative paths resolve against the manifest's parent directory. All reference images in a manifest
-must share an aspect ratio, since the training bucket is derived from them.
+must produce the same resolution bucket. The released image processor rounds source
+dimensions down to multiples of 16 before deriving the bucket from their aspect ratio.
 
 <Warning>
 Do not point `driving_video` and `target_video` at the same file. Because the driving video is
@@ -69,6 +83,7 @@ consumed directly with no pose extraction, a model given the target clip as its 
 can reach zero loss by copying it and ignoring the reference image. The loss curve descends
 normally, so this failure is silent. A valid sample needs the driving video to differ from the
 target in appearance while preserving motion.
+
 </Warning>
 
 Encode the manifest once. Training reads only cached latents:
@@ -86,15 +101,18 @@ python -m tools.diffusion.preprocessing_multiprocess wan-animate \
 `--num_frames` must satisfy `4n + 1`. Both videos are resampled to `--fps`, so training motion speed
 matches inference.
 
-The preset and frame count above are what a single eight-GPU 80 GB node fits. Raising either raises
-memory sharply, because each step attends over the driving stream as well as the generated one.
-The `512p` preset at 33 frames does not fit on that node. Preprocess and train a short run at a new
-setting before committing to it.
+Start with short clips at `256p` and measure memory before increasing resolution or clip length.
+Training stores activations for both the driving and generation streams.
 
 <Note>
-Wan-Animate-2 requires `flash-attn`. Unlike the other diffusion models, its transformer calls
-flash attention directly rather than going through the Diffusers attention dispatch, so there is
-no fallback. The NeMo AutoModel container ships it. A bare install needs the `fa` extra.
+The released transformer uses Diffusers attention dispatch and PyTorch flex attention. A separate
+`flash-attn` install is not required by this recipe. Generation attention is compiled without CUDA
+graph capture so activation checkpoint replay can rebuild its differentiable cache.
+
+Regenerate caches made with the earlier Diffusers fork. The released pipeline uses bicubic PIL
+resizing for reference images, bilinear PIL resizing for video frames, and explicit dtype casting
+for CLIP inputs. Earlier caches do not reproduce these conditioning features.
+
 </Note>
 
 ## Launch Training

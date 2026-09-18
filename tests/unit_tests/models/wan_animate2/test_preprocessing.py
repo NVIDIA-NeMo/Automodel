@@ -32,8 +32,10 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+import torch
 
 from nemo_automodel.components.models.wan_animate2 import preprocessing
 
@@ -164,18 +166,18 @@ class TestResolveSharedBucket:
 
         bucket = preprocessing._resolve_shared_bucket(samples, max_pixels=512 * 512)
 
-        assert bucket == preprocessing._bucket_dimensions(1080, 1920, target_area=512 * 512)
+        assert bucket == (368, 672)
 
     def test_accepts_differing_sizes_that_share_an_aspect_ratio(self, tmp_path: Path) -> None:
         rows = [
-            _triplet_row(tmp_path, 0, reference_size=(1920, 1080)),
-            _triplet_row(tmp_path, 1, reference_size=(1280, 720)),
+            _triplet_row(tmp_path, 0, reference_size=(1536, 1024)),
+            _triplet_row(tmp_path, 1, reference_size=(768, 512)),
         ]
         samples = preprocessing._read_manifest(_write_manifest(tmp_path, rows))
 
         bucket = preprocessing._resolve_shared_bucket(samples, max_pixels=512 * 512)
 
-        assert bucket == preprocessing._bucket_dimensions(1080, 1920, target_area=512 * 512)
+        assert bucket == (416, 624)
 
     def test_rejects_a_manifest_spanning_multiple_buckets_and_names_an_offender(self, tmp_path: Path) -> None:
         rows = [
@@ -304,7 +306,7 @@ class TestResampleFrameIndices:
         assert min(indices) >= 0
 
 
-@requires_opencv
+@requires_pillow
 class TestPaddingResize:
     """Letterboxing must hit the exact bucket while preserving the source aspect ratio."""
 
@@ -315,9 +317,7 @@ class TestPaddingResize:
     def test_output_matches_the_requested_bucket(self, source_height: int, source_width: int) -> None:
         image = preprocessing.np.zeros((source_height, source_width, 3), dtype=preprocessing.np.uint8)
 
-        resized = preprocessing._padding_resize(
-            image, height=256, width=512, interpolation=preprocessing.cv2.INTER_LINEAR
-        )
+        resized = preprocessing._padding_resize(image, height=256, width=512, resample="bilinear")
 
         assert resized.shape == (256, 512, 3)
         assert resized.dtype == preprocessing.np.uint8
@@ -327,10 +327,185 @@ class TestPaddingResize:
         # the left and right, with content in the middle.
         image = preprocessing.np.full((400, 100, 3), 255, dtype=preprocessing.np.uint8)
 
-        resized = preprocessing._padding_resize(
-            image, height=256, width=512, interpolation=preprocessing.cv2.INTER_LINEAR
-        )
+        resized = preprocessing._padding_resize(image, height=256, width=512, resample="bilinear")
 
         assert resized[:, 0, :].max() == 0
         assert resized[:, -1, :].max() == 0
         assert resized[128, 256, :].max() > 0
+
+
+@pytest.mark.parametrize("shape", [(1080, 1920), (257, 131), (101, 87)])
+def test_reference_preprocessing_matches_released_pipeline(shape):
+    """Bucket alignment, bicubic pixels, and black padding match Diffusers."""
+    pytest.importorskip("diffusers", minversion="0.40.0")
+    from diffusers.modular_pipelines import PipelineState
+    from diffusers.modular_pipelines.wan_animate_2.encoders import WanAnimate2ProcessImagesInputStep
+    from diffusers.modular_pipelines.wan_animate_2.video_processor import WanAnimate2VideoProcessor
+
+    rng = preprocessing.np.random.default_rng(17)
+    pixels = rng.integers(0, 256, (*shape, 3), dtype=preprocessing.np.uint8)
+    processor = WanAnimate2VideoProcessor(resample="bicubic")
+    components = SimpleNamespace(
+        image_processor=processor, _execution_device=torch.device("cpu"), vae_scale_factor_spatial=8
+    )
+    state = PipelineState(values={"image": preprocessing.Image.fromarray(pixels), "height": 256, "width": 256})
+    _, state = WanAnimate2ProcessImagesInputStep()(components, state)
+    actual = preprocessing._frames_to_tensor(
+        preprocessing._resize_by_area(pixels, target_area=256**2)[None], device=torch.device("cpu")
+    )[:, :, 0]
+    expected = state.get("image_pixels")
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert actual.shape[-2:] == preprocessing._bucket_dimensions(*shape, target_area=256**2)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_clip_features_match_released_encoder(dtype):
+    """Match real CLIP outputs, including explicit bf16 input casting."""
+    pytest.importorskip("diffusers", minversion="0.40.0")
+    from diffusers.modular_pipelines.wan_animate_2.encoders import clip_visual_encode
+    from transformers import CLIPVisionConfig, CLIPVisionModel
+
+    torch.manual_seed(23)
+    config = CLIPVisionConfig(
+        hidden_size=32, intermediate_size=64, num_hidden_layers=2, num_attention_heads=2, image_size=224, patch_size=14
+    )
+    encoder = CLIPVisionModel(config).eval().to(dtype=dtype)
+    pixels = torch.randn(3, 33, 49)
+
+    # The cache's public shape contract is ViT-H. Use a tiny real CLIP to test
+    # its numerical path, retaining 1280 channels via a fixed output projection.
+    class ProjectedCLIP(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.encoder = encoder
+            self.project = torch.nn.Linear(32, 1280, bias=False).to(dtype=dtype)
+
+        def forward(self, pixel_values, output_hidden_states):
+            """Map [batch, 3, 224, 224] pixels to [batch, 257, 1280] features."""
+            output = self.encoder(pixel_values=pixel_values, output_hidden_states=output_hidden_states)
+            return SimpleNamespace(hidden_states=(self.project(output.hidden_states[-2]), None))
+
+    image_encoder = ProjectedCLIP().eval()
+    with torch.no_grad():
+        actual = preprocessing._clip_visual_encode(image_encoder, pixels, device=torch.device("cpu"))
+        expected = clip_visual_encode(image_encoder, pixels, device=torch.device("cpu"), dtype=dtype)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@requires_opencv
+@requires_pillow
+def test_manifest_encoding_writes_reusable_training_cache(tmp_path, monkeypatch):
+    """Decode actual media and persist conditioning with frozen encoder stand-ins."""
+    import torch.nn.functional as functional
+
+    class TinyVAE(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.anchor = torch.nn.Parameter(torch.zeros(()))
+
+        def encode(self, pixels):
+            """Map [1, 3, frames, height, width] pixels to [1, 16, latent_frames, h/8, w/8]."""
+            pooled = functional.avg_pool3d(pixels[:, :, ::4], (1, 8, 8)).mean(1, keepdim=True).repeat(1, 16, 1, 1, 1)
+            return SimpleNamespace(latent_dist=SimpleNamespace(mode=lambda: pooled))
+
+        def decode(self, latents, return_dict):
+            """Map [1, 16, frames, h, w] latents to a finite RGB clip."""
+            output = functional.interpolate(
+                latents[:, :3], size=((latents.shape[2] - 1) * 4 + 1, latents.shape[3] * 8, latents.shape[4] * 8)
+            )
+            return (output,)
+
+    class TinyCLIP(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.anchor = torch.nn.Parameter(torch.zeros(()))
+
+        def forward(self, pixel_values, output_hidden_states):
+            """Map [1, 3, 224, 224] pixels to deterministic [1, 257, 1280] features."""
+            return SimpleNamespace(hidden_states=(pixel_values.mean().expand(1, 257, 1280), None))
+
+    class TinyText(torch.nn.Module):
+        def forward(self, input_ids, attention_mask):
+            """Embed [1, tokens] token IDs into [1, tokens, 16]."""
+            return SimpleNamespace(last_hidden_state=input_ids.unsqueeze(-1).float().expand(-1, -1, 16))
+
+    def tokenizer(prompt, **kwargs):
+        return {"input_ids": torch.tensor([[3, 5, 0, 0]]), "attention_mask": torch.tensor([[1, 1, 0, 0]])}
+
+    image = preprocessing.Image.new("RGB", (32, 32), color=(10, 90, 150))
+    image.save(tmp_path / "ref.png")
+    for name, level in (("drive.avi", 40), ("target.avi", 180)):
+        writer = preprocessing.cv2.VideoWriter(
+            str(tmp_path / name), preprocessing.cv2.VideoWriter_fourcc(*"MJPG"), 24.0, (32, 32)
+        )
+        assert writer.isOpened()
+        try:
+            for frame in range(5):
+                writer.write(preprocessing.np.full((32, 32, 3), level + frame, dtype=preprocessing.np.uint8))
+        finally:
+            writer.release()
+    manifest = _write_manifest(
+        tmp_path,
+        [
+            {
+                "reference_image": "ref.png",
+                "driving_video": "drive.avi",
+                "target_video": "target.avi",
+                "caption": "moving",
+            }
+        ],
+    )
+    models = preprocessing._EncoderModels(
+        vae=TinyVAE(),
+        text_encoder=TinyText(),
+        image_encoder=TinyCLIP(),
+        tokenizer=tokenizer,
+        latents_mean=torch.full((1, 16, 1, 1, 1), 0.2),
+        latents_reciprocal_std=torch.full((1, 16, 1, 1, 1), 2.0),
+    )
+    encoder = preprocessing.WanAnimate2CacheEncoder(
+        model_name="local-fixture", device="cpu", torch_dtype="float32", max_sequence_length=4
+    )
+    monkeypatch.setattr(encoder, "_load_models", lambda device: models)
+    output_dir = tmp_path / "cache"
+    metadata_path = encoder.encode_manifest(
+        manifest_path=manifest, output_dir=output_dir, max_pixels=1024, num_frames=5, fps=24, verify=True
+    )
+    metadata = json.loads(metadata_path.read_text())
+    assert metadata["total_items"] == 1
+    records = json.loads((output_dir / metadata["shards"][0]).read_text())
+    payload = torch.load(records[0]["cache_file"], weights_only=True)
+    assert payload["video_latents"].shape == (1, 16, 2, 4, 4)
+    assert payload["reference_latents"].shape == (1, 16, 1, 4, 4)
+    assert payload["clip_fea"].shape == (1, 257, 1280)
+    assert not torch.equal(payload["driving_latents"], payload["video_latents"])
+    torch.testing.assert_close(payload["cond_zero_latents"], torch.full((1, 16, 2, 4, 4), -0.4))
+    assert torch.count_nonzero(payload["text_embeddings"][:, 2:]) == 0
+    assert all(
+        value.device.type == "cpu" and not value.requires_grad
+        for value in payload.values()
+        if isinstance(value, torch.Tensor)
+    )
+    with pytest.raises(ValueError, match="already holds a cache"):
+        encoder.encode_manifest(manifest_path=manifest, output_dir=output_dir, max_pixels=1024, num_frames=5)
+
+
+@pytest.mark.parametrize(
+    "kwargs, message",
+    [
+        ({"num_frames": 4}, r"4n \+ 1"),
+        ({"fps": 0}, "fps must be positive"),
+        ({"max_pixels": 64}, "max_pixels must be at least"),
+        ({"num_gpus": 0}, "num_gpus must be positive"),
+        ({"num_gpus": 2}, "explicit device"),
+    ],
+)
+@requires_opencv
+@requires_pillow
+def test_invalid_encoding_requests_fail_before_loading_models(tmp_path, kwargs, message):
+    encoder = preprocessing.WanAnimate2CacheEncoder(model_name="unused", device="cpu")
+    (tmp_path / "unused.jsonl").write_text("")
+    arguments = dict(manifest_path=tmp_path / "unused.jsonl", output_dir=tmp_path / "cache", max_pixels=1024)
+    arguments.update(kwargs)
+    with pytest.raises(ValueError, match=message):
+        encoder.encode_manifest(**arguments)

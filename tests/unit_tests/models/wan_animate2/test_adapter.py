@@ -14,11 +14,8 @@
 
 """CPU unit tests for the Wan-Animate-2 flow-matching adapter.
 
-Every test here is CPU-only and stubs the transformer: the upstream
-``WanAnimate2Transformer3DModel`` attention kernels hard-assert
-``q.device.type == "cuda"``, so no real forward pass can run on CPU.
-``WanAnimate2Adapter.forward`` also resolves the attention backend through
-nothing here depends on the fork being installed.
+Input-contract tests run on CPU. Real released-transformer forward and backward
+parity are covered in test_interleaved.py.
 
 The geometry expectations come from how the upstream transformer *consumes* the
 adapter's outputs: its ``(1, 2, 2)`` patch embedding turns every latent frame
@@ -32,17 +29,13 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable
-from dataclasses import dataclass
-from typing import Any
 
 import pytest
 import torch
-import torch.nn as nn
 
 from nemo_automodel.components.flow_matching.adapters.base import FlowMatchingContext
 from nemo_automodel.components.flow_matching.pipeline import create_adapter
 from nemo_automodel.components.models.wan_animate2.adapter import WanAnimate2Adapter
-from nemo_automodel.components.models.wan_animate2.interleaved import _block_forward_origin
 
 TARGET_FRAMES = 3
 LATENT_HEIGHT = 4
@@ -108,11 +101,11 @@ def _make_context(
             tensors stay float32, matching a cache read back for bf16 training.
 
     Returns:
-        Context whose float32 ``noisy_latents`` and ``latents`` have the shape of
-        ``video_latents`` and whose ``timesteps`` and ``sigma`` have shape
+        Context whose float32 ``noisy_latents`` and ``latents`` prepend one
+        reference frame to ``video_latents``; ``timesteps`` and ``sigma`` have shape
         [batch].
     """
-    latents = batch["video_latents"]
+    latents = WanAnimate2Adapter().prepare_latents(batch["video_latents"], batch)
     batch_size = latents.shape[0]
     sigma = torch.full((batch_size,), sigma_value)
     noise = torch.randn_like(latents)
@@ -128,97 +121,6 @@ def _make_context(
         dtype=dtype,
         batch=batch,
     )
-
-
-@dataclass
-class _RecordedCall:
-    """One recorded call into :class:`_RecordingTransformer`, as observed on entry."""
-
-    method: str
-    grad_enabled: bool
-    # First positional argument: per-sample tensors of shape
-    # [channels, frames, latent_height, latent_width].
-    stream: list[torch.Tensor]
-    # Every other upstream keyword, including the ``_ref`` / non-``_ref`` pairs.
-    kwargs: dict[str, Any]
-    key_cache: dict[int, torch.Tensor]
-    value_cache: dict[int, torch.Tensor]
-    cached_entries_on_entry: int
-
-
-class _RecordingBlock(nn.Module):
-    """A block exposing the two per-block passes the interleaved traversal calls."""
-
-    def forward_ref(self, x_ref: torch.Tensor, index: int, k_cache: dict, v_cache: dict, **kwargs: Any):
-        """Write this block's keys and values, then return the reference stream."""
-        k_cache[index] = x_ref
-        v_cache[index] = x_ref
-        return x_ref
-
-    def forward_gen(self, x: torch.Tensor, index: int, k_cache: dict, v_cache: dict, **kwargs: Any):
-        """Read this block's keys and values, then return the generation stream."""
-        _ = k_cache[index], v_cache[index]
-        return x
-
-
-class _RecordingTransformer(nn.Module):
-    """Stub for the ``method``-dispatched upstream transformer.
-
-    The reference phase writes one key/value tensor per block into the caches and
-    returns nothing; the generation phase scales its input stream by a trainable
-    parameter and returns the per-sample list the adapter expects.
-    """
-
-    def __init__(self, *, num_blocks: int = 2, scale: float = 2.0) -> None:
-        super().__init__()
-        self.scale = nn.Parameter(torch.tensor(scale))
-        self.num_blocks = num_blocks
-        self.calls: list[_RecordedCall] = []
-        # `install_forward_origin` refuses to run against a transformer that does
-        # not expose the interleaved traversal's dependencies, so the stub has to
-        # carry them even though this test never exercises the real traversal.
-        self.blocks = nn.ModuleList(_RecordingBlock() for _ in range(num_blocks))
-        self.patch_embedding = nn.Conv3d(36, 8, kernel_size=1)
-        self.time_embedding = nn.Identity()
-        self.time_projection = nn.Identity()
-        self.text_embedding = nn.Identity()
-        self.head = nn.Identity()
-        self.block_masks: dict[Any, Any] = {}
-
-    def unpatchify(self, x: torch.Tensor, grid_sizes: torch.Tensor) -> torch.Tensor:
-        """Present the upstream method name; unused by these tests."""
-        return x
-
-    def create_mask(self, origin_len: int, origin_area: list[int], device: torch.device) -> None:
-        """Present the upstream method name; unused by these tests."""
-        return None
-
-    def forward_origin(self, inputs: dict[str, Any]) -> list[torch.Tensor]:
-        """Record the call and emulate one interleaved traversal.
-
-        Args:
-            inputs: The mapping produced by ``prepare_inputs``.
-
-        Returns:
-            Per-sample tensors of shape [16, frames, latent_height,
-            latent_width], one per sample.
-        """
-        self.calls.append(
-            _RecordedCall(
-                method="forward_origin",
-                grad_enabled=torch.is_grad_enabled(),
-                stream=inputs["x"],
-                kwargs=inputs,
-                key_cache={},
-                value_cache={},
-                cached_entries_on_entry=0,
-            )
-        )
-        return [sample * self.scale for sample in inputs["x"]]
-
-    def forward(self, *args: Any, method: str, **kwargs: Any) -> list[torch.Tensor]:
-        """Dispatch on ``method`` exactly as the upstream transformer does."""
-        return getattr(self, method)(*args, **kwargs)
 
 
 def test_prepare_inputs_stream_shapes_and_channel_layout() -> None:
@@ -241,8 +143,8 @@ def test_prepare_inputs_stream_shapes_and_channel_layout() -> None:
     assert driving_stream.shape == (LATENT_CHANNELS, TARGET_FRAMES, LATENT_HEIGHT, LATENT_WIDTH)
     assert driving_conditioning.shape == (CONDITIONING_CHANNELS, TARGET_FRAMES, LATENT_HEIGHT, LATENT_WIDTH)
 
-    # Only the leading (reference-slot) frame is new; the rest is the noisy target.
-    torch.testing.assert_close(generation_stream[:, 1:], context.noisy_latents[0])
+    # Both the reference slot and video were noised by the shared pipeline.
+    torch.testing.assert_close(generation_stream, context.noisy_latents[0])
     torch.testing.assert_close(
         conditioning[MASK_CHANNELS:],
         torch.cat([batch["reference_latents"][0], batch["cond_zero_latents"][0]], dim=1),
@@ -410,10 +312,41 @@ def test_prepare_inputs_rejects_cached_geometry_that_disagrees_with_the_target(
     """Cached conditioning is concatenated with the target, so its geometry must align."""
     torch.manual_seed(11)
     batch = _make_batch()
+    context = _make_context(batch)
     batch[key] = torch.randn(shape)
 
     with pytest.raises(ValueError, match=message):
-        WanAnimate2Adapter().prepare_inputs(_make_context(batch))
+        WanAnimate2Adapter().prepare_inputs(context)
+
+
+def test_prepare_latents_includes_reference_in_supervised_target() -> None:
+    """The reference slot must receive the same noise-minus-clean target as video."""
+    batch = _make_batch()
+    target = batch["video_latents"]
+    result = WanAnimate2Adapter().prepare_latents(target, batch)
+    torch.testing.assert_close(result[:, :, :1], batch["reference_latents"])
+    torch.testing.assert_close(result[:, :, 1:], target)
+    assert result.shape[2] == TARGET_FRAMES + 1
+    assert batch["video_latents"] is target
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_training_noise_preserves_reference_precision(dtype: torch.dtype) -> None:
+    """DiffSynth samples noise and subtracts clean latents in the training dtype."""
+    latents = torch.zeros(1, 16, 3, 4, 4, dtype=dtype)
+    torch.manual_seed(53)
+    expected = torch.randn_like(latents)
+    torch.manual_seed(53)
+    actual = WanAnimate2Adapter().sample_noise(latents)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("shape", [(1, 16, 2, 4, 6), (1, 8, 1, 4, 6), (1, 16, 1, 6, 6)])
+def test_prepare_latents_rejects_incompatible_reference(shape: tuple[int, ...]) -> None:
+    batch = _make_batch()
+    batch["reference_latents"] = torch.randn(shape)
+    with pytest.raises(ValueError, match="reference_latents must have shape"):
+        WanAnimate2Adapter().prepare_latents(batch["video_latents"], batch)
 
 
 @pytest.mark.parametrize(
@@ -443,71 +376,6 @@ def test_prepare_inputs_rejects_a_latent_grid_the_patch_size_cannot_tile() -> No
 
     with pytest.raises(ValueError, match=r"divisible by the \(2, 2\) patch size"):
         WanAnimate2Adapter().prepare_inputs(_make_context(batch))
-
-
-def test_forward_dispatches_one_interleaved_traversal_per_step() -> None:
-    """One call per step, through the model's own ``method`` dispatcher, with gradient.
-
-    The two passes used to be issued separately, which under FSDP2 meant two
-    forwards per module and a cache that did not survive the call boundary. The
-    adapter now issues a single interleaved traversal instead.
-    """
-    torch.manual_seed(16)
-    adapter = WanAnimate2Adapter()
-    model = _RecordingTransformer()
-    inputs = adapter.prepare_inputs(_make_context(_make_batch()))
-
-    adapter.forward(model, inputs)
-    adapter.forward(model, inputs)
-
-    assert [call.method for call in model.calls] == ["forward_origin", "forward_origin"]
-
-    first, _ = model.calls
-    assert first.stream is inputs["x"]
-    # Both streams and both conditionings reach the traversal in one mapping.
-    assert first.kwargs["x_ref"] is inputs["x_ref"]
-    assert first.kwargs["condition_y"] is inputs["condition_y"]
-    assert first.kwargs["context_ref"] is inputs["context_ref"]
-    assert first.kwargs["context"] is inputs["context"]
-    # The reference stream is trained, so the traversal runs with gradient.
-    assert first.grad_enabled is True
-
-
-def test_block_traversal_gives_each_block_an_isolated_cache() -> None:
-    """A block's keys and values live and die inside its own call.
-
-    This is what keeps the traversal correct under wrappers that rebuild
-    container arguments: nothing is handed across a call boundary.
-    """
-    block = _RecordingBlock()
-    stream = torch.zeros(2, 3)
-    reference = torch.ones(2, 3)
-
-    _, _ = _block_forward_origin(block, stream, reference, {}, {})
-
-    # forward_gen reading index 0 would raise if the cache were not the one
-    # forward_ref just wrote, so reaching here is the assertion.
-    assert True
-
-
-def test_forward_drops_the_reference_slot_and_keeps_the_target_frames() -> None:
-    """The prediction covers the target frames only and stays differentiable."""
-    torch.manual_seed(18)
-    adapter = WanAnimate2Adapter()
-    model = _RecordingTransformer(scale=2.0)
-    context = _make_context(_make_batch())
-    inputs = adapter.prepare_inputs(context)
-
-    prediction = adapter.forward(model, inputs)
-
-    assert prediction.shape == (1, LATENT_CHANNELS, TARGET_FRAMES, LATENT_HEIGHT, LATENT_WIDTH)
-    # The stub scales its input, so the surviving frames must be the noisy target
-    # frames: had the trailing frame been dropped instead, this would fail.
-    torch.testing.assert_close(prediction, context.noisy_latents * 2.0)
-
-    prediction.sum().backward()
-    assert model.scale.grad is not None
-    assert torch.isfinite(model.scale.grad).all()
 
 
 def test_create_adapter_resolves_the_wan_animate2_adapter() -> None:

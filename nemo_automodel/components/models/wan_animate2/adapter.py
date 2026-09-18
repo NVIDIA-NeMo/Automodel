@@ -22,7 +22,7 @@ import torch
 import torch.nn as nn
 
 from nemo_automodel.components.flow_matching.adapters.base import FlowMatchingContext, ModelAdapter
-from nemo_automodel.components.models.wan_animate2.interleaved import install_forward_origin
+from nemo_automodel.components.models.wan_animate2.interleaved import WanAnimate2Inputs, install_forward_origin
 
 # The upstream transformer uses a (1, 2, 2) patch embedding, so post-patch grids
 # halve both spatial axes. The VAE applies 8x spatial and 4x temporal compression.
@@ -43,23 +43,53 @@ class WanAnimate2Adapter(ModelAdapter):
     character image. Unlike every other diffusion model in this repository, its
     transformer runs two passes per step against the same weights:
 
-    1. ``forward_ref`` embeds the driving-video latents and writes per-block
+    1. The reference pass embeds the driving-video latents and writes per-block
        key/value tensors into a cache.
-    2. ``forward_gen`` denoises the generation stream, where each generated
+    2. The generation pass denoises the generation stream, where each generated
        latent frame attends to the time-aligned cached driving frame.
 
-    Both calls are issued inside :meth:`forward` so the shared
-    :class:`~nemo_automodel.components.flow_matching.adapters.base.ModelAdapter`
-    single-call contract is preserved for every other model. ``forward_ref``
-    carries gradient, matching the reference training implementation, which
-    backpropagates through the reference stream. Inference builds the cache under
-    ``torch.no_grad`` because it is reused across denoising steps; training does
-    not.
+    Training interleaves both passes inside each block so FSDP and activation
+    checkpointing see a single invocation. Gradients propagate through both
+    streams and their shared weights. Each block creates a fresh differentiable
+    cache on every step and checkpoint replay.
 
     The generation stream carries one extra leading latent frame that holds the
-    reference-character slot. Its prediction is discarded before the loss,
-    mirroring inference where the decoded frame 0 is dropped.
+    reference-character slot. Training noises and supervises that frame along
+    with the target video, as DiffSynth's training path does. Inference drops
+    its decoded prediction when assembling the output video.
     """
+
+    def prepare_latents(self, latents: torch.Tensor, batch: dict[str, Any]) -> torch.Tensor:
+        """Prepend the clean reference frame to the supervised video stream.
+
+        Args:
+            latents: Target-video latents [batch, 16, target_frames, height, width].
+            batch: Cached fields, including ``reference_latents`` with shape
+                [batch, 16, 1, height, width].
+
+        Returns:
+            A new tensor [batch, 16, target_frames + 1, height, width], with the
+            reference frame first. The pipeline noises and supervises all frames.
+        """
+        if latents.ndim != 5:
+            raise ValueError("Wan-Animate-2 target latents must have shape [batch, 16, frames, height, width]")
+        reference = self._require_tensor(batch, "reference_latents", ndim=5, batch_size=latents.shape[0])
+        expected = (latents.shape[0], _LATENT_CHANNELS, 1, *latents.shape[-2:])
+        if tuple(reference.shape) != expected:
+            raise ValueError(f"reference_latents must have shape {expected}, got {tuple(reference.shape)}")
+        return torch.cat([reference.to(device=latents.device, dtype=latents.dtype), latents], dim=2)
+
+    def sample_noise(self, latents: torch.Tensor) -> torch.Tensor:
+        """Match the reference training path's native-precision noise and target.
+
+        Args:
+            latents: Complete clean stream [batch, 16, target_frames + 1, height,
+                width], in the recipe's compute dtype.
+
+        Returns:
+            Gaussian noise with the same shape, dtype, and device as ``latents``.
+        """
+        return torch.randn_like(latents)
 
     @staticmethod
     def _build_i2v_mask(
@@ -128,12 +158,12 @@ class WanAnimate2Adapter(ModelAdapter):
             raise ValueError(f"'{key}' must have batch size {batch_size}, got {value.shape[0]}")
         return value
 
-    def prepare_inputs(self, context: FlowMatchingContext) -> dict[str, Any]:
+    def prepare_inputs(self, context: FlowMatchingContext) -> WanAnimate2Inputs:
         """Build the two-phase Wan-Animate-2 conditioning from a cached batch.
 
         Args:
             context: Flow context whose ``noisy_latents`` and ``latents``
-                tensors have shape [batch, 16, target_latent_frames,
+                tensors have shape [batch, 16, target_latent_frames + 1,
                 latent_height, latent_width]. Its ``batch`` must additionally
                 contain ``reference_latents`` of shape [batch, 16, 1,
                 latent_height, latent_width], ``driving_latents`` of shape
@@ -162,7 +192,8 @@ class WanAnimate2Adapter(ModelAdapter):
                 f"[batch, channels, frames, height, width]; got {tuple(noisy_latents.shape)}"
             )
 
-        batch_size, channels, target_latent_frames, latent_height, latent_width = noisy_latents.shape
+        batch_size, channels, generation_latent_frames, latent_height, latent_width = noisy_latents.shape
+        target_latent_frames = generation_latent_frames - 1
         if channels != _LATENT_CHANNELS:
             raise ValueError(f"Wan-Animate-2 requires {_LATENT_CHANNELS} latent channels, got {channels}")
         if latent_height % _PATCH_H != 0 or latent_width % _PATCH_W != 0:
@@ -171,11 +202,9 @@ class WanAnimate2Adapter(ModelAdapter):
                 f"got {(latent_height, latent_width)}"
             )
         if batch_size != 1:
-            # forward_ref passes a length-1 k_lens to the upstream varlen attention,
-            # which silently truncates the packed key/value sequence when batch > 1.
             raise ValueError(
-                "Wan-Animate-2 requires local_batch_size=1; the upstream reference pass does not "
-                f"support batched key/value packing. Got batch size {batch_size}. Scale with "
+                "The Wan-Animate-2 cached recipe requires local_batch_size=1. "
+                f"Got batch size {batch_size}. Scale with "
                 "gradient accumulation and data parallelism instead."
             )
 
@@ -201,7 +230,7 @@ class WanAnimate2Adapter(ModelAdapter):
         if driving_latents.shape[2] != target_latent_frames:
             # The upstream block mask sizes the query span from the DRIVING frame
             # count (origin_len -> origin_latent_f + 1 reference slot), while
-            # forward_gen embeds a stream of target_latent_frames + 1. A mismatch
+            # generation embeds a stream of target_latent_frames + 1. A mismatch
             # produces a seq_len that silently disagrees with the flex-attention
             # block mask instead of raising.
             raise ValueError(
@@ -209,7 +238,13 @@ class WanAnimate2Adapter(ModelAdapter):
                 f"driving={driving_latents.shape[2]}, target={target_latent_frames}. Re-run preprocessing "
                 "so both videos are encoded with the same num_frames."
             )
-        for name, tensor in (("reference_latents", reference_latents), ("driving_latents", driving_latents)):
+        for name, tensor in (
+            ("reference_latents", reference_latents),
+            ("driving_latents", driving_latents),
+            ("cond_zero_latents", cond_zero_latents),
+        ):
+            if tensor.shape[1] != _LATENT_CHANNELS:
+                raise ValueError(f"{name} must have {_LATENT_CHANNELS} latent channels, got {tensor.shape[1]}")
             if tensor.shape[-2:] != (latent_height, latent_width):
                 raise ValueError(
                     f"{name} spatial dims {tuple(tensor.shape[-2:])} must match the target "
@@ -221,15 +256,9 @@ class WanAnimate2Adapter(ModelAdapter):
         cond_zero_latents = cond_zero_latents.to(device=device, dtype=dtype, non_blocking=True)
         driving_latent_frames = driving_latents.shape[2]
 
-        # The generation stream prepends one latent frame for the reference slot.
-        # Its x_t is built from the reference latent at the batch's sigma so the
-        # input stays in-distribution; its prediction is discarded before the loss.
-        sigma = context.sigma.to(device=device, dtype=torch.float32).view(batch_size, 1, 1, 1, 1)
-        reference_noise = torch.randn(reference_latents.shape, device=device, dtype=torch.float32)
-        reference_slot = (1.0 - sigma) * reference_latents.float() + sigma * reference_noise
-        generation_stream = torch.cat([reference_slot.to(dtype), noisy_latents.to(dtype)], dim=2)
-
-        generation_latent_frames = target_latent_frames + 1
+        # prepare_latents includes the reference slot before the shared pipeline
+        # samples noise, so its prediction receives the same velocity objective.
+        generation_stream = noisy_latents.to(dtype)
         mask_reference = self._build_i2v_mask(
             latent_frames=1,
             latent_height=latent_height,
@@ -296,11 +325,11 @@ class WanAnimate2Adapter(ModelAdapter):
                 latent_height * _VAE_SPATIAL_COMPRESSION,
                 latent_width * _VAE_SPATIAL_COMPRESSION,
             ],
-            "_target_latent_frames": target_latent_frames,
+            "_target_latent_frames": generation_latent_frames,
             "_compute_dtype": dtype,
         }
 
-    def forward(self, model: nn.Module, inputs: dict[str, Any]) -> torch.Tensor:
+    def forward(self, model: nn.Module, inputs: WanAnimate2Inputs) -> torch.Tensor:
         """Run the reference and generation passes, returning target predictions.
 
         The reference pass populates a per-step key/value cache and the
@@ -308,51 +337,31 @@ class WanAnimate2Adapter(ModelAdapter):
         allocated on every call so no state leaks across steps.
 
         Args:
-            model: Upstream Diffusers ``WanAnimate2Transformer3DModel``, whose
-                ``forward`` dispatches on a required ``method`` keyword.
+            model: Upstream Diffusers ``WanAnimate2Transformer3DModel``,
+                optionally sharded or wrapped in DDP.
             inputs: Mapping returned by :meth:`prepare_inputs`. Tensor-bearing
                 fields have the layouts documented by that method.
 
         Returns:
-            Velocity prediction tensor of shape [batch, 16,
-            target_latent_frames, latent_height, latent_width]. The leading
-            reference-slot frame is sliced off so the prediction aligns
-            element-wise with the pipeline's flow-matching target.
+            Velocity predictions [batch, 16, target_latent_frames + 1,
+            latent_height, latent_width], including the reference slot. All
+            frames align with the pipeline's complete flow-matching target.
         """
-        # One traversal of the blocks, each running the reference pass and then
-        # the generation pass against a block-local cache. The Diffusers
-        # integration exposes the two passes as separate entry points, each
-        # walking all forty blocks; under FSDP2 that means two forwards per
-        # module, whose resharding frees weights the second pass still needs, and
-        # a caller-owned cache that the pre-forward path copies per block. The
-        # interleaved traversal is what the reference training implementation
-        # does and it avoids both. See interleaved.forward_origin.
-        #
-        # Autocast wraps the whole thing: the upstream blocks promote activations
-        # to float32 around the modulation arithmetic
-        # (`self.norm1(x).float() * (1 + e[1]) + e[0]`) and feed the result
-        # straight into half-precision Linear layers, so without it the first
-        # matmul raises "mat1 and mat2 must have the same dtype".
-        if not install_forward_origin(model):
-            raise RuntimeError(
-                "This Wan-Animate-2 transformer does not expose the block methods the interleaved "
-                "training forward needs (blocks with forward_ref/forward_gen). Check the installed "
-                "diffusers version."
-            )
-        with torch.amp.autocast(device_type=inputs["x"][0].device.type, dtype=inputs["_compute_dtype"]):
-            # Dispatched through the model's own `method` keyword so the call
-            # goes through __call__ and FSDP2 gathers the parameters first.
-            prediction = model(inputs, method="forward_origin")
+        install_forward_origin(model)
+        with torch.amp.autocast(
+            device_type=inputs["x"][0].device.type,
+            dtype=inputs["_compute_dtype"],
+            enabled=inputs["_compute_dtype"] in (torch.bfloat16, torch.float16),
+        ):
+            prediction = model(inputs)
 
         if not isinstance(prediction, (list, tuple)):
             raise TypeError(
-                "WanAnimate2Transformer3DModel.forward_gen must return a list of per-sample tensors, "
-                f"got {type(prediction)!r}"
+                f"Wan-Animate-2 training forward must return a list of per-sample tensors, got {type(prediction)!r}"
             )
         stacked = torch.stack(list(prediction), dim=0)
 
         target_latent_frames = inputs["_target_latent_frames"]
-        sliced = stacked[:, :, 1:]
-        if sliced.shape[2] != target_latent_frames:
-            raise ValueError(f"Sliced prediction has {sliced.shape[2]} latent frames, expected {target_latent_frames}")
-        return sliced
+        if stacked.shape[2] != target_latent_frames:
+            raise ValueError(f"Prediction has {stacked.shape[2]} latent frames, expected {target_latent_frames}")
+        return stacked

@@ -12,201 +12,219 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for the interleaved Wan-Animate-2 traversal.
+"""Numerical tests against the released Diffusers two-pass implementation."""
 
-The traversal itself needs the upstream transformer, but everything that decides
-*whether* and *how* it is installed is plain Python and is what actually broke in
-practice: a cache handed across a call boundary, a method installed on a wrapper
-rather than on the block underneath it, and an unguarded optional import.
-"""
+from copy import deepcopy
 
-from __future__ import annotations
-
-from typing import Any
-
+import pytest
 import torch
-import torch.nn as nn
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointImpl, checkpoint_wrapper
 
-from nemo_automodel.components.models.wan_animate2.interleaved import (
-    _block_forward_origin,
-    _precompile_attention_without_cudagraphs,
-    _unwrap_module,
-    install_forward_origin,
-    supports_interleaved_forward,
-)
+from nemo_automodel.components._peft.lora import PeftConfig, apply_lora_to_linear_modules
+from nemo_automodel.components.flow_matching.pipeline import FlowMatchingPipeline
+from nemo_automodel.components.models.wan_animate2.adapter import WanAnimate2Adapter
+from nemo_automodel.components.models.wan_animate2.interleaved import install_forward_origin
 
 
-class _Block(nn.Module):
-    """A block exposing the two per-block passes the traversal calls."""
+def _upstream_forward(model, inputs):
+    """Run unmodified Diffusers with gradient through the reference stream.
 
-    def __init__(self) -> None:
-        super().__init__()
-        self.seen: list[int] = []
+    Args:
+        model: The reference upstream transformer.
+        inputs: Adapter tensors with layouts documented by prepare_inputs.
 
-    def forward_ref(self, x_ref: torch.Tensor, index: int, k_cache: dict, v_cache: dict, **kwargs: Any):
-        """Record the index and write this block's keys and values."""
-        self.seen.append(index)
-        k_cache[index] = x_ref * 2
-        v_cache[index] = x_ref * 3
-        return x_ref
-
-    def forward_gen(self, x: torch.Tensor, index: int, k_cache: dict, v_cache: dict, **kwargs: Any):
-        """Read back this block's keys and values, failing loudly if absent."""
-        return x + k_cache[index] + v_cache[index]
-
-
-class _Wrapper(nn.Module):
-    """Stand-in for an activation-checkpoint wrapper around a block."""
-
-    def __init__(self, inner: nn.Module) -> None:
-        super().__init__()
-        self._checkpoint_wrapped_module = inner
-
-
-class _Transformer(nn.Module):
-    """A transformer exposing everything the traversal depends on."""
-
-    def __init__(self, *, num_blocks: int = 3, wrap: bool = False) -> None:
-        super().__init__()
-        blocks = [_Block() for _ in range(num_blocks)]
-        self.blocks = nn.ModuleList(_Wrapper(b) if wrap else b for b in blocks)
-        self.patch_embedding = nn.Conv3d(4, 4, kernel_size=1)
-        self.time_embedding = nn.Identity()
-        self.time_projection = nn.Identity()
-        self.text_embedding = nn.Identity()
-        self.head = nn.Identity()
-        self.block_masks: dict[Any, Any] = {}
-
-    def unpatchify(self, x: torch.Tensor, grid_sizes: torch.Tensor) -> torch.Tensor:
-        """Present the upstream method name."""
-        return x
-
-    def create_mask(self, origin_len: int, origin_area: list[int], device: torch.device) -> None:
-        """Present the upstream method name."""
-        return None
-
-
-def test_block_traversal_round_trips_its_own_cache() -> None:
-    """The generation pass reads exactly what the reference pass just wrote."""
-    block = _Block()
-    x = torch.zeros(2, 2)
-    x_ref = torch.ones(2, 2)
-
-    out, out_ref = _block_forward_origin(block, x, x_ref, {}, {})
-
-    # forward_gen reads index 0, so a cache that did not survive the call would
-    # raise KeyError rather than return.
-    torch.testing.assert_close(out, x + x_ref * 2 + x_ref * 3)
-    torch.testing.assert_close(out_ref, x_ref)
-    assert block.seen == [0]
-
-
-def test_block_traversal_uses_a_fresh_cache_each_call() -> None:
-    """Nothing carries over between calls, so no state can leak across steps."""
-    block = _Block()
-    x, x_ref = torch.zeros(2, 2), torch.ones(2, 2)
-
-    _block_forward_origin(block, x, x_ref, {}, {})
-    _block_forward_origin(block, x, x_ref, {}, {})
-
-    # Both calls addressed index 0 of their own cache, never index 1.
-    assert block.seen == [0, 0]
-
-
-def test_unwrap_module_reaches_through_checkpoint_wrappers() -> None:
-    """Wrapped blocks resolve to the block underneath."""
-    inner = _Block()
-    assert _unwrap_module(inner) is inner
-    assert _unwrap_module(_Wrapper(inner)) is inner
-    assert _unwrap_module(_Wrapper(_Wrapper(inner))) is inner
-
-
-def test_unwrap_module_stops_on_a_wrapper_cycle() -> None:
-    """A self-referential wrapper terminates instead of looping forever."""
-
-    class _Cyclic(nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self._checkpoint_wrapped_module = self
-
-    cyclic = _Cyclic()
-    assert _unwrap_module(cyclic) is cyclic
-
-
-def test_supports_interleaved_forward_accepts_a_complete_transformer() -> None:
-    """A transformer carrying every dependency is accepted."""
-    assert supports_interleaved_forward(_Transformer()) is True
-
-
-def test_supports_interleaved_forward_rejects_a_missing_attribute() -> None:
-    """Dropping any dependency is refused rather than failing mid-traversal."""
-    model = _Transformer()
-    del model.patch_embedding
-    assert supports_interleaved_forward(model) is False
-
-
-def test_supports_interleaved_forward_rejects_blocks_without_the_two_passes() -> None:
-    """Blocks lacking the per-block passes are refused."""
-    model = _Transformer()
-    model.blocks = nn.ModuleList([nn.Identity()])
-    assert supports_interleaved_forward(model) is False
-
-
-def test_supports_interleaved_forward_rejects_an_empty_block_list() -> None:
-    """A transformer with no blocks is refused."""
-    model = _Transformer()
-    model.blocks = nn.ModuleList()
-    assert supports_interleaved_forward(model) is False
-
-
-def test_install_forward_origin_adds_the_method_to_model_and_block() -> None:
-    """Both levels gain the traversal, so both are entered through __call__."""
-
-    class _FreshTransformer(_Transformer):
-        pass
-
-    class _FreshBlock(_Block):
-        pass
-
-    model = _FreshTransformer()
-    model.blocks = nn.ModuleList([_FreshBlock() for _ in range(2)])
-
-    assert install_forward_origin(model) is True
-    assert hasattr(type(model), "forward_origin")
-    assert hasattr(type(model.blocks[0]), "forward_origin")
-
-
-def test_install_forward_origin_targets_the_block_not_its_wrapper() -> None:
-    """The method lands on the block underneath an activation-checkpoint wrapper.
-
-    Installing on the wrapper's class would leave the real block without it, and
-    the traversal would fail with AttributeError on the first block.
+    Returns:
+        Predictions [batch, 16, target_frames + 1, height, width], including the reference slot.
     """
+    from diffusers.models.transformers.transformer_wan_animate_2 import WanAnimate2KVCache
 
-    class _FreshBlock(_Block):
-        pass
+    cache = WanAnimate2KVCache(len(model.blocks))
+    model(
+        hidden_states=inputs["x_ref"],
+        timestep=inputs["timestep"],
+        encoder_hidden_states=inputs["context_ref"],
+        condition_latents=inputs["condition_y"],
+        encoder_hidden_states_image=inputs["clip_fea_ref"],
+        offset_grid_sizes=inputs["grid_sizes_ref"],
+        seq_len=inputs["seq_len_ref"],
+        kv_cache=cache,
+        kv_cache_mode="extract",
+    )
+    result = model(
+        hidden_states=inputs["x"],
+        timestep=inputs["timestep"],
+        encoder_hidden_states=inputs["context"],
+        condition_latents=inputs["y"],
+        encoder_hidden_states_image=inputs["clip_fea"],
+        reference_grid_sizes=inputs["grid_sizes_ref"],
+        seq_len=inputs["seq_len"],
+        kv_cache=cache,
+        kv_cache_mode="cached",
+        origin_len=inputs["origin_len"],
+        origin_area=inputs["origin_area"],
+    ).sample
+    return torch.stack(result)
 
-    class _FreshTransformer(_Transformer):
-        pass
 
-    model = _FreshTransformer()
-    model.blocks = nn.ModuleList([_Wrapper(_FreshBlock()) for _ in range(2)])
+@pytest.mark.parametrize("checkpointed", [False, True])
+@pytest.mark.parametrize("lora", [False, True])
+@pytest.mark.runtime_budget(30, reason="Real upstream flex-attention forward/backward includes cold CPU compilation")
+def test_forward_gradients_and_update_match_upstream(tiny_model, training_inputs, checkpointed, lora):
+    """Both trained streams, checkpoint replay, and LoRA match real Diffusers."""
+    if lora:
+        apply_lora_to_linear_modules(
+            tiny_model,
+            PeftConfig(
+                dim=4,
+                alpha=4,
+                dropout=0.0,
+                lora_dtype=torch.float32,
+                use_memory_efficient_lora=False,
+                target_modules=["*.self_attn.to_q", "*.self_attn.to_k", "*.self_attn.to_v"],
+            ),
+        )
+    reference = deepcopy(tiny_model)
+    expected_inputs = deepcopy(training_inputs)
+    training_inputs["x_ref"][0].requires_grad_()
+    expected_inputs["x_ref"][0].requires_grad_()
+    install_forward_origin(tiny_model)
+    if checkpointed:
+        for i, block in enumerate(tiny_model.blocks):
+            tiny_model.blocks[i] = checkpoint_wrapper(block, checkpoint_impl=CheckpointImpl.NO_REENTRANT)
+    actual = WanAnimate2Adapter().forward(tiny_model, training_inputs)
+    expected = _upstream_forward(reference, expected_inputs)
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+    gradient = torch.randn_like(actual)
+    actual.backward(gradient)
+    expected.backward(gradient)
+    driving_grad = training_inputs["x_ref"][0].grad
+    assert driving_grad is not None and driving_grad.abs().max() > 0
+    torch.testing.assert_close(driving_grad, expected_inputs["x_ref"][0].grad, rtol=2e-5, atol=2e-6)
+    actual_params = dict(tiny_model.named_parameters())
+    expected_params = dict(reference.named_parameters())
+    # Checkpoint wrappers preserve state-dict keys; named_parameters exposes
+    # their wrapper path, so compare through the wrapper's state-dict traversal.
+    actual_params = {k.replace("._checkpoint_wrapped_module", ""): v for k, v in actual_params.items()}
+    assert actual_params.keys() == expected_params.keys()
+    for name, parameter in actual_params.items():
+        expected_grad = expected_params[name].grad
+        assert (parameter.grad is None) == (expected_grad is None), name
+        if expected_grad is not None:
+            torch.testing.assert_close(parameter.grad, expected_grad, rtol=3e-5, atol=3e-6, msg=name)
+    for model in (tiny_model, reference):
+        torch.optim.AdamW(model.parameters(), lr=1e-4, foreach=False).step()
+    for name, value in tiny_model.state_dict().items():
+        torch.testing.assert_close(value, reference.state_dict()[name], rtol=1e-5, atol=2e-6, msg=name)
 
-    assert install_forward_origin(model) is True
-    assert hasattr(_FreshBlock, "forward_origin")
+
+def test_installation_is_instance_local_and_preserves_checkpoint(tiny_model, training_inputs, tmp_path):
+    """Training setup leaves other models, names, and Diffusers reload intact."""
+    reference = deepcopy(tiny_model)
+    keys = set(tiny_model.state_dict())
+    original_forward = type(tiny_model).forward
+    block_forward = type(tiny_model.blocks[0]).forward
+    install_forward_origin(tiny_model)
+    install_forward_origin(tiny_model)
+    assert type(tiny_model).forward is original_forward
+    assert type(tiny_model.blocks[0]).forward is block_forward
+    assert reference.forward.__func__ is original_forward
+    assert set(tiny_model.state_dict()) == keys
+    tiny_model.save_pretrained(tmp_path)
+    restored = type(reference).from_pretrained(tmp_path)
+    for name, tensor in tiny_model.state_dict().items():
+        torch.testing.assert_close(tensor, restored.state_dict()[name], rtol=0, atol=0)
+    expected = _upstream_forward(restored, training_inputs)
+    actual = WanAnimate2Adapter().forward(tiny_model, training_inputs)
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
 
 
-def test_install_forward_origin_refuses_an_unsupported_transformer() -> None:
-    """An incomplete transformer is reported rather than patched."""
-    model = _Transformer()
-    del model.head
-    assert install_forward_origin(model) is False
+def test_repeated_steps_do_not_reuse_reference_cache(tiny_model, training_inputs):
+    """A new driving video changes the prediction and matches a fresh reference."""
+    reference = deepcopy(tiny_model)
+    adapter = WanAnimate2Adapter()
+    first = adapter.forward(tiny_model, training_inputs)
+    second_inputs = deepcopy(training_inputs)
+    second_inputs["x_ref"][0] = torch.randn_like(second_inputs["x_ref"][0])
+    second = adapter.forward(tiny_model, second_inputs)
+    expected = _upstream_forward(reference, second_inputs)
+    assert not torch.allclose(first, second)
+    torch.testing.assert_close(second, expected, rtol=1e-5, atol=1e-6)
 
 
-def test_precompiling_attention_is_a_no_op_without_the_integration() -> None:
-    """A diffusers build lacking Wan-Animate-2 does not raise here.
+def test_unsupported_model_reports_required_diffusers_class():
+    with pytest.raises(TypeError, match="diffusers>=0.40.0"):
+        install_forward_origin(torch.nn.Linear(2, 2))
 
-    The model load reports missing support with a useful message; this helper
-    must not pre-empt it with an ImportError of its own.
-    """
-    _precompile_attention_without_cudagraphs()
+
+@pytest.mark.runtime_budget(30, reason="Real upstream flex-attention model exercises complete recipe loss")
+def test_recipe_loss_supervises_reference_slot(tiny_model, training_batch, monkeypatch):
+    """A nonzero reference frame contributes loss even when all video targets are zero."""
+    training_batch["video_latents"].zero_()
+    training_batch["reference_latents"].fill_(3.0)
+    with torch.no_grad():
+        tiny_model.head.head.weight.zero_()
+        tiny_model.head.head.bias.zero_()
+    pipeline = FlowMatchingPipeline(
+        model_adapter=WanAnimate2Adapter(),
+        timestep_sampling="uniform_discrete",
+        loss_weighting_scheme="bsmntw_shifted",
+        flow_shift=5.0,
+        i2v_prob=0.0,
+        cfg_dropout_prob=0.0,
+        device=torch.device("cpu"),
+    )
+    monkeypatch.setattr(torch, "randint", lambda *args, **kwargs: torch.tensor([500]))
+    monkeypatch.setattr(torch, "randn_like", torch.zeros_like)
+    per_element, loss, _, _ = pipeline.step(
+        tiny_model, training_batch, torch.device("cpu"), torch.float32, collect_metrics=False, check_loss=False
+    )
+    assert per_element.shape == (1, 16, 3, 4, 4)
+    # One reference frame with velocity -3 and two zero target frames. The
+    # frozen weight is from DiffSynth c458cb42's scheduler at grid index 500.
+    torch.testing.assert_close(loss, torch.tensor(3.0 * 1.0248619318), rtol=1e-6, atol=1e-6)
+    assert per_element[:, :, 1:].count_nonzero() == 0
+    loss.backward()
+    assert tiny_model.head.head.bias.grad.abs().max() > 0
+
+
+@pytest.mark.parametrize("lora", [False, True])
+@pytest.mark.runtime_budget(30, reason="Real attention backward and optimizer checkpoint round trip")
+def test_optimizer_resume_reproduces_next_update(tiny_model, training_inputs, tmp_path, lora):
+    """Saving after step one reproduces step two exactly for SFT and LoRA."""
+    if lora:
+        apply_lora_to_linear_modules(
+            tiny_model,
+            PeftConfig(
+                dim=4,
+                alpha=4,
+                dropout=0.0,
+                lora_dtype=torch.float32,
+                use_memory_efficient_lora=False,
+                target_modules=["*.self_attn.to_q", "*.self_attn.to_k", "*.self_attn.to_v"],
+            ),
+        )
+    restored = deepcopy(tiny_model)
+    adapter = WanAnimate2Adapter()
+    optimizer = torch.optim.AdamW(tiny_model.parameters(), lr=1e-3, foreach=False)
+    target = torch.randn(1, 16, 3, 4, 4)
+
+    def step(model, opt):
+        """Update from prediction/target tensors [1, 16, 3, 4, 4]."""
+        opt.zero_grad(set_to_none=True)
+        loss = (adapter.forward(model, training_inputs) - target).square().mean()
+        loss.backward()
+        opt.step()
+        return loss.detach()
+
+    step(tiny_model, optimizer)
+    checkpoint = tmp_path / "resume.pt"
+    torch.save({"model": tiny_model.state_dict(), "optimizer": optimizer.state_dict()}, checkpoint)
+    expected_loss = step(tiny_model, optimizer)
+    saved = torch.load(checkpoint, weights_only=True)
+    restored.load_state_dict(saved["model"])
+    restored_optimizer = torch.optim.AdamW(restored.parameters(), lr=1e-3, foreach=False)
+    restored_optimizer.load_state_dict(saved["optimizer"])
+    actual_loss = step(restored, restored_optimizer)
+    torch.testing.assert_close(actual_loss, expected_loss, rtol=0, atol=0)
+    for name, value in tiny_model.state_dict().items():
+        torch.testing.assert_close(value, restored.state_dict()[name], rtol=0, atol=0, msg=name)

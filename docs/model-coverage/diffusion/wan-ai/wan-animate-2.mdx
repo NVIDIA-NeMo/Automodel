@@ -20,7 +20,9 @@ slug: model-coverage/diffusion/wan-ai/wan-animate-2-14b
 
 Wan-Animate-2 14B has 40 layers, a shared Wan VAE and UMT5-XXL text encoder, and CLIP ViT-H image conditioning.
 
-Training is limited to full-parameter and LoRA fine-tuning of the base checkpoint on a single node, from a cached triplet dataset. Tensor parallelism, context parallelism, multi-resolution bucketing, and a per-rank batch larger than one are not supported by this architecture. The 10-step distilled checkpoint is not supported for training. The flow-matching objective regresses the full-trajectory velocity and would erode the step distillation.
+Training is limited to full-parameter and LoRA fine-tuning of the base checkpoint on a single node, from a cached triplet dataset. Tensor parallelism, context parallelism, multi-resolution bucketing, and a per-rank batch larger than one are outside the supported recipe. The 10-step distilled checkpoint is not supported for training. The flow-matching objective regresses the full-trajectory velocity and would erode the step distillation.
+
+The recipe requires `diffusers>=0.40.0` and the current public checkpoint in the released Diffusers format.
 
 ## Example Recipes
 

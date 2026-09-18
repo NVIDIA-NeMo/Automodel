@@ -14,19 +14,13 @@ model:
   pretrained_model_name_or_path: "Wan-AI/Wan2.2-Animate-2-14B-Diffusers"
   mode: finetune
   model_type: "wan_animate2"
-  # float32 storage with bfloat16 compute, matching the Wan2.1 and LTX-2.3
-  # recipes. torch.optim.AdamW keeps no fp32 master copy, so the parameters
-  # themselves serve as it; bfloat16 storage would leave updates at lr 5e-6
-  # below the bf16 relative epsilon (~3.9e-3) and round them away. Storing in
-  # bfloat16 does save ~11.6 GB per rank -- that is the cost of the master
-  # copy, not waste. It also happens to satisfy the transformer's
-  # `assert e.dtype == torch.float32` in every block.
+  # Keep small AdamW updates in float32 master weights; compute in bfloat16.
   torch_dtype: float32
   compute_dtype: bfloat16
 
 step_scheduler:
   global_batch_size: 8
-  local_batch_size: 1  # must stay 1; the reference pass cannot pack more than one sample
+  local_batch_size: 1  # validated recipe shape
   ckpt_every_steps: 1000
   num_epochs: 100
   log_remote_every_steps: 2
@@ -48,10 +42,7 @@ optimizer:
   lr: 5e-6
   weight_decay: 0.01
   betas: [0.9, 0.999]
-  # Multi-tensor AdamW is 2.1x SLOWER here, not faster: it raises mean step time
-  # from 1.280s to 2.687s, step-time variance from 6.9% to 37.5%, and introduces
-  # a 28% upward drift over 130 steps that a fixed cost cannot explain. Measured
-  # A/B on one node at 256p/17f.
+  # Keep the optimizer path used by the validated recipe.
   foreach: false
 
 performance:
@@ -66,7 +57,7 @@ lr_scheduler:
 flow_matching:
   adapter_type: "wan_animate2"
   adapter_kwargs: {}
-  timestep_sampling: "uniform"
+  timestep_sampling: "uniform_discrete"
   use_sigma_noise: true
   flow_shift: 5.0
   sigma_min: 0.0
@@ -75,6 +66,7 @@ flow_matching:
   i2v_prob: 0.0
   cfg_dropout_prob: 0.0
   use_loss_weighting: true
+  loss_weighting_scheme: "bsmntw_shifted"
   log_interval: 100
   summary_log_interval: 10
 

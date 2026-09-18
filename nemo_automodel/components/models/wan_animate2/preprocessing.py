@@ -17,7 +17,7 @@
 Turns a triplet manifest (reference character image, driving video, target
 video, caption) into the ``.meta`` cache files consumed by
 :class:`~nemo_automodel.components.datasets.diffusion.text_to_video_dataset.TextToVideoDataset`.
-Every encoding rule mirrors the upstream ``WanAnimate2Pipeline``, with one
+Encoding follows the released Diffusers Wan-Animate-2 modular pipeline, with one
 inversion relative to the generic video processors: the resolution bucket is
 derived from the *reference image*, and the driving and target frames are
 letterboxed into it.
@@ -92,7 +92,6 @@ _DTYPES = {
     "float16": torch.float16,
     "float32": torch.float32,
 }
-_HALF_DTYPES = (torch.bfloat16, torch.float16)
 
 
 class _CacheRecord(TypedDict):
@@ -343,6 +342,9 @@ class WanAnimate2CacheEncoder:
                 ),
                 "max_pixels": max_pixels,
                 "num_frames": num_frames,
+                "fps": fps,
+                "reference_resample": "bicubic",
+                "video_resample": "bilinear",
                 "latent_frames": latent_frames,
                 "bucket_resolution": [bucket_width, bucket_height],
                 "max_sequence_length": self.max_sequence_length,
@@ -818,7 +820,7 @@ def _to_cache(tensor: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
 
 
 def _bucket_dimensions(height: int, width: int, *, target_area: int) -> tuple[int, int]:
-    """Compute the upstream ``resize_by_area`` output dimensions.
+    """Compute the released pipeline's reference-image bucket dimensions.
 
     Args:
         height: Source pixel height.
@@ -828,7 +830,13 @@ def _bucket_dimensions(height: int, width: int, *, target_area: int) -> tuple[in
     Returns:
         ``(bucket_height, bucket_width)``, both positive multiples of 16.
     """
-    aspect_ratio = width / height
+    # The upstream image processor first aligns the source dimensions, then
+    # computes the area-limited bucket from that aligned aspect ratio.
+    aligned_height = height // _SPATIAL_DIVISOR * _SPATIAL_DIVISOR
+    aligned_width = width // _SPATIAL_DIVISOR * _SPATIAL_DIVISOR
+    if min(aligned_height, aligned_width) == 0:
+        raise ValueError("Reference images must be at least 16 pixels on each axis")
+    aspect_ratio = aligned_width / aligned_height
     new_height = math.sqrt(target_area / aspect_ratio)
     new_width = target_area / new_height
     bucket_width = int((new_width // _SPATIAL_DIVISOR) * _SPATIAL_DIVISOR)
@@ -844,10 +852,8 @@ def _bucket_dimensions(height: int, width: int, *, target_area: int) -> tuple[in
 def _resolve_shared_bucket(samples: list[_TripletSample], *, max_pixels: int) -> tuple[int, int]:
     """Derive the single training bucket from every reference image.
 
-    Wan-Animate-2 caches its reference RoPE offset (``refer_offset_w``) on the
-    first forward pass and never resets it, so a run must train on exactly one
-    resolution bucket. This reads image headers only and fails fast when the
-    manifest would produce more than one.
+    This recipe supports one resolution per cache. Read image headers only and
+    fail before encoding if the manifest would produce multiple buckets.
 
     Args:
         samples: Validated manifest rows.
@@ -869,8 +875,8 @@ def _resolve_shared_bucket(samples: list[_TripletSample], *, max_pixels: int) ->
             for (height, width), paths in sorted(buckets.items())
         )
         raise ValueError(
-            "Wan-Animate-2 training requires a single resolution bucket because the transformer caches its "
-            f"reference RoPE offset on the first forward pass. The manifest produced {len(buckets)} buckets: "
+            "The Wan-Animate-2 cached recipe requires a single resolution bucket. "
+            f"The manifest produced {len(buckets)} buckets: "
             f"{summary}. Split the manifest by reference-image aspect ratio and preprocess each split separately."
         )
     return next(iter(buckets))
@@ -889,43 +895,42 @@ def _load_rgb_image(path: Path) -> np.ndarray:
         return np.asarray(image.convert("RGB"), dtype=np.uint8)
 
 
-def _padding_resize(image: np.ndarray, *, height: int, width: int, interpolation: int) -> np.ndarray:
+def _padding_resize(image: np.ndarray, *, height: int, width: int, resample: str) -> np.ndarray:
     """Letterbox one frame into exact dimensions with black padding.
 
-    Mirrors the upstream ``padding_resize``: the frame is scaled to fit while
-    preserving its aspect ratio and centered inside a zero-filled canvas.
+    Matches ``WanAnimate2VideoProcessor`` with ``resize_mode="fill"``,
+    including PIL interpolation and floor-centered placement.
 
     Args:
         image: ``numpy.ndarray`` of shape [height, width, channels], dtype
             ``uint8``, channels-last RGB.
         height: Output pixel height.
         width: Output pixel width.
-        interpolation: OpenCV interpolation flag.
+        resample: PIL filter name: ``"bicubic"`` for reference images or
+            ``"bilinear"`` for video frames.
 
     Returns:
         ``numpy.ndarray`` of shape [height, width, channels], dtype ``uint8``.
     """
     original_height, original_width = image.shape[:2]
-    channels = image.shape[2]
-    padded = np.zeros((height, width, channels), dtype=np.uint8)
     if original_height / original_width > height / width:
-        new_width = int(height / original_height * original_width)
-        resized = cv2.resize(image, (new_width, height), interpolation=interpolation)
-        offset = (width - new_width) // 2
-        padded[:, offset : offset + new_width, :] = resized
+        new_width = original_width * height // original_height
+        new_height = height
     else:
-        new_height = int(width / original_width * original_height)
-        resized = cv2.resize(image, (width, new_height), interpolation=interpolation)
-        offset = (height - new_height) // 2
-        padded[offset : offset + new_height, :, :] = resized
-    return padded
+        new_width = width
+        new_height = original_height * width // original_width
+    resized = Image.fromarray(image).resize(
+        (new_width, new_height), resample=getattr(Image.Resampling, resample.upper())
+    )
+    padded = Image.new("RGB", (width, height), color=0)
+    padded.paste(resized, ((width - new_width) // 2, (height - new_height) // 2))
+    return np.asarray(padded)
 
 
 def _resize_by_area(image: np.ndarray, *, target_area: int) -> np.ndarray:
     """Resize a reference image to the 16-aligned bucket, then letterbox it.
 
-    Mirrors the upstream ``resize_by_area(image, target_area, divisor=16)``,
-    including its area-dependent interpolation choice.
+    Uses the released pipeline's bicubic reference-image interpolation.
 
     Args:
         image: ``numpy.ndarray`` of shape [height, width, 3], dtype ``uint8``.
@@ -937,8 +942,7 @@ def _resize_by_area(image: np.ndarray, *, target_area: int) -> np.ndarray:
     """
     height, width = image.shape[:2]
     bucket_height, bucket_width = _bucket_dimensions(height, width, target_area=target_area)
-    interpolation = cv2.INTER_AREA if bucket_width * bucket_height < width * height else cv2.INTER_LINEAR
-    return _padding_resize(image, height=bucket_height, width=bucket_width, interpolation=interpolation)
+    return _padding_resize(image, height=bucket_height, width=bucket_width, resample="bicubic")
 
 
 def _resample_frame_indices(source_frame_count: int, source_fps: float, *, num_frames: int, fps: int) -> list[int]:
@@ -1011,7 +1015,7 @@ def _read_resampled_frames(video_path: Path, *, num_frames: int, fps: int, heigh
             if decoded is None:
                 raise ValueError(f"Video {video_path} yielded no decodable frames")
             rgb = cv2.cvtColor(decoded, cv2.COLOR_BGR2RGB)
-            frames.append(_padding_resize(rgb, height=height, width=width, interpolation=cv2.INTER_LINEAR))
+            frames.append(_padding_resize(rgb, height=height, width=width, resample="bilinear"))
     finally:
         capture.release()
 
@@ -1090,12 +1094,7 @@ def _clip_visual_encode(image_encoder: nn.Module, pixels: torch.Tensor, *, devic
     std = torch.tensor(_CLIP_STD, device=device, dtype=videos.dtype).view(1, 3, 1, 1)
     videos = (videos - mean) / std
 
-    # Upstream feeds float32 pixels through an autocast region rather than a
-    # hard cast, which keeps every layer norm in float32. Casting the input to a
-    # half dtype instead would run those norms in bfloat16 and drift the cached
-    # features away from what the model sees at inference.
-    with torch.autocast(device_type=device.type, dtype=encoder_dtype, enabled=encoder_dtype in _HALF_DTYPES):
-        outputs = image_encoder(pixel_values=videos, output_hidden_states=True)
+    outputs = image_encoder(pixel_values=videos.to(encoder_dtype), output_hidden_states=True)
     features = outputs.hidden_states[-2]
     if tuple(features.shape) != (1, _CLIP_TOKENS, _CLIP_HIDDEN):
         raise ValueError(
