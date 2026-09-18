@@ -166,6 +166,17 @@ ruff check --fix .
 ruff format .
 ```
 
+Ruff does not cover every rule we enforce. `tools/lint_no_globals.py` rejects `globals()`,
+which is usually reached for to swap a module-level function so that another function picks
+up the replacement — a process-wide mutation that changes behaviour for every concurrent or
+nested caller. Pass the collaborator in, or expose a method subclasses can override, instead.
+The one exception is the PEP 562 lazy-import cache (`globals()[name] = attr` inside a
+module-level `def __getattr__`). Run it over the tree with:
+
+```bash
+python tools/lint_no_globals.py
+```
+
 ## Pre-commit
 
 We recommand to use [prek](https://github.com/j178/prek) to ensure code quality. It is a faster and more modern alternative to [pre-commit](https://github.com/pre-commit/pre-commit).
