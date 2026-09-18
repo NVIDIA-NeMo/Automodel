@@ -40,10 +40,11 @@ Usage:
     )
 """
 
+import importlib
 import logging
 import os
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, Iterable, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -60,6 +61,9 @@ from nemo_automodel.components.distributed.parallelizer import (
 from nemo_automodel.shared.import_utils import safe_import_te
 from nemo_automodel.shared.utils import dtype_from_str
 
+if TYPE_CHECKING:
+    from diffusers import ModularPipeline
+
 # diffusers is an optional dependency
 try:
     from diffusers import DiffusionPipeline
@@ -74,6 +78,10 @@ logger = logging.getLogger(__name__)
 
 # Type alias for parallel managers
 ParallelManager = Union[FSDP2Manager, DDPManager]
+
+_PRETRAINED_PIPELINE_LOADERS: dict[str, tuple[str, str]] = {
+    "wan_animate2": ("nemo_automodel.components.models.wan_animate2.loading", "load_pipeline"),
+}
 
 
 @dataclass
@@ -662,7 +670,7 @@ class NeMoAutoDiffusionPipeline:
         compact_fused_qkv_projections: bool = False,
         attention_backend: str | None = None,
         **kwargs,
-    ) -> Tuple[DiffusionPipeline, Dict[str, ParallelManager]]:
+    ) -> Tuple["DiffusionPipeline | ModularPipeline", Dict[str, ParallelManager]]:
         """
         Load pipeline from pretrained weights using DiffusionPipeline auto-detection.
 
@@ -713,13 +721,21 @@ class NeMoAutoDiffusionPipeline:
         # (and potentially re-downloaded) over the network on every run.
         model_dir = resolve_diffusion_model_dir(pretrained_model_name_or_path)
 
-        # Use DiffusionPipeline.from_pretrained for auto-detection
-        pipe: DiffusionPipeline = DiffusionPipeline.from_pretrained(
-            model_dir,
-            *model_args,
-            torch_dtype=torch_dtype,
-            **kwargs,
-        )
+        loader_spec = _PRETRAINED_PIPELINE_LOADERS.get(model_type)
+        if loader_spec is not None:
+            module_name, loader_name = loader_spec
+            loader = getattr(importlib.import_module(module_name), loader_name)
+            if components_to_load is not None:
+                components_to_load = tuple(components_to_load)
+            pipe = loader(
+                model_dir,
+                model_args,
+                torch_dtype=torch_dtype,
+                components_to_load=components_to_load,
+                **kwargs,
+            )
+        else:
+            pipe = DiffusionPipeline.from_pretrained(model_dir, *model_args, torch_dtype=torch_dtype, **kwargs)
 
         logger.info("[INFO] Loaded pipeline type: %s", type(pipe).__name__)
 

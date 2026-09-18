@@ -148,6 +148,7 @@ class FlowMatchingPipeline:
             num_train_timesteps: Total number of timesteps for the flow
             timestep_sampling: Sampling strategy:
                 - "uniform": Pure uniform sampling
+                - "uniform_discrete": Uniform indices into a shifted sigma grid
                 - "logit_normal": SD3-style logit-normal (recommended)
                 - "mode": Mode-based sampling
                 - "lognorm": Log-normal based sampling
@@ -170,6 +171,8 @@ class FlowMatchingPipeline:
                 - "linear": w = 1 + flow_shift * sigma
                 - "bsmntw": Bell-Shaped Midpoint Noise Timestep Weighting (Gaussian
                   centered at t=num_train_timesteps/2)
+                - "bsmntw_shifted": The same bell curve normalized over the
+                  shifted discrete training grid, with nearest-timestep lookup
             log_interval: Steps between detailed logs
             summary_log_interval: Steps between summary logs
             device: Device to use for computations
@@ -193,14 +196,22 @@ class FlowMatchingPipeline:
         self.use_loss_weighting = use_loss_weighting
         self.loss_weighting_scheme = loss_weighting_scheme
 
-        _VALID_SCHEMES = ("linear", "bsmntw")
+        _VALID_SCHEMES = ("linear", "bsmntw", "bsmntw_shifted")
         if loss_weighting_scheme not in _VALID_SCHEMES:
             raise ValueError(
                 f"Unknown loss_weighting_scheme: {loss_weighting_scheme!r}. Must be one of {_VALID_SCHEMES}"
             )
 
+        if timestep_sampling == "uniform_discrete" or loss_weighting_scheme == "bsmntw_shifted":
+            if num_train_timesteps < 2 or flow_shift <= 0 or not 0 <= sigma_min < sigma_max <= 1:
+                raise ValueError(
+                    "A discrete flow grid requires at least two steps, a positive shift, and 0 <= min < max <= 1"
+                )
+            sigmas = torch.linspace(1.0, 0.0, num_train_timesteps + 1)[:-1]
+            self._discrete_sigmas = (flow_shift * sigmas / (1 + (flow_shift - 1) * sigmas)).clamp(sigma_min, sigma_max)
+
         # Precompute BSMNTW weight table if needed
-        if use_loss_weighting and loss_weighting_scheme == "bsmntw":
+        if use_loss_weighting and loss_weighting_scheme in ("bsmntw", "bsmntw_shifted"):
             self._bsmntw_weights = self._build_bsmntw_weights()
 
         self.log_interval = log_interval
@@ -217,9 +228,15 @@ class FlowMatchingPipeline:
         following a Gaussian bell curve centered at the midpoint (t=steps/2).
         """
         steps = self.num_train_timesteps
-        t = torch.arange(steps, dtype=torch.float32)
+        t = (
+            self._discrete_sigmas * steps
+            if self.loss_weighting_scheme == "bsmntw_shifted"
+            else torch.arange(steps, dtype=torch.float32)
+        )
         w = torch.exp(-2.0 * ((t - steps / 2) / steps) ** 2)
         w = w - w.min()
+        if self.loss_weighting_scheme == "bsmntw_shifted" and w.sum() == 0:
+            raise ValueError("The clamped discrete grid has no variation in bell-shaped weights")
         w = w * (steps / w.sum())
         return w
 
@@ -227,7 +244,9 @@ class FlowMatchingPipeline:
         self,
         batch_size: int,
         device: torch.device | None = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, str]:
+        *,
+        dtype: torch.dtype = torch.float32,
+    ) -> tuple[torch.Tensor, torch.Tensor, str]:
         """
         Sample timesteps and compute sigma values with flow shift.
 
@@ -236,11 +255,14 @@ class FlowMatchingPipeline:
 
         Args:
             batch_size: Number of timesteps to sample
-            device: Device for tensor operations
+            device: Device for tensor operations.
+            dtype: Model timestep dtype. Discrete sampling resolves sigma from
+                the timestep after rounding to this dtype; continuous modes
+                retain their existing float32 behavior.
 
         Returns:
-            sigma: Sigma values in [sigma_min, sigma_max]
-            timesteps: Timesteps in [0, num_train_timesteps]
+            sigma: Float32 noise levels [batch_size] in [sigma_min, sigma_max].
+            timesteps: Model timesteps [batch_size] in [0, num_train_timesteps].
             sampling_method: Name of the sampling method used
         """
         if device is None:
@@ -253,6 +275,16 @@ class FlowMatchingPipeline:
             sigma = torch.clamp(sigma, self.sigma_min, self.sigma_max)
             timesteps = sigma * self.num_train_timesteps
             return sigma, timesteps, "uniform_no_shift"
+
+        if self.timestep_sampling == "uniform_discrete":
+            indices = torch.randint(self.num_train_timesteps, (batch_size,), device=device)
+            sigma_grid = self._discrete_sigmas.to(device)
+            timestep_grid = sigma_grid * self.num_train_timesteps
+            timesteps = timestep_grid[indices].to(dtype)
+            # The reference scheduler selects sigma/weight from the rounded
+            # model timestep, which can identify a different grid point in BF16.
+            nearest = (timestep_grid[None, :] - timesteps.float()[:, None]).abs().argmin(-1)
+            return sigma_grid[nearest], timesteps, "uniform_discrete"
 
         if self.timestep_sampling == "beta":
             alpha = torch.full((batch_size,), self.beta_alpha, dtype=torch.float32, device=device)
@@ -335,28 +367,32 @@ class FlowMatchingPipeline:
         """
         Compute flow matching loss with optional weighting.
 
-        Loss weight: w = 1 + flow_shift * σ
+        Applies the configured linear or bell-shaped per-sample weighting.
 
         Args:
-            model_pred: Model prediction
-            target: Target (velocity = noise - clean)
-            sigma: Sigma values for each sample
-            batch: Optional batch dictionary containing loss_mask
+            model_pred: Velocity predictions [batch, channels, frames, height,
+                width] for video or [batch, channels, height, width] for images.
+            target: Noise minus clean latents, with the same shape as model_pred.
+            sigma: Noise levels [batch].
+            batch: Optional batch dictionary containing a loss_mask broadcastable
+                to the prediction shape.
 
         Returns:
-            weighted_loss: Per-element weighted loss
-            average_weighted_loss: Scalar average weighted loss
-            unweighted_loss: Per-element raw MSE loss
-            average_unweighted_loss: Scalar average unweighted loss
-            loss_weight: Applied weights
-            loss_mask: Loss mask from batch (or None if not present)
+            Per-element weighted loss and raw MSE, each with prediction shape,
+            their scalar means, broadcast weights [batch, 1, ...], and the
+            optional loss mask from the batch.
         """
         loss = self.model_adapter.compute_loss(model_pred, target)
         loss_mask = batch.get("loss_mask") if batch is not None else None
 
         if self.use_loss_weighting:
-            if self.loss_weighting_scheme == "bsmntw":
-                timestep_indices = (sigma * self.num_train_timesteps).long().clamp(0, self.num_train_timesteps - 1)
+            if self.loss_weighting_scheme in ("bsmntw", "bsmntw_shifted"):
+                if self.loss_weighting_scheme == "bsmntw_shifted":
+                    timestep_indices = (
+                        (sigma[:, None] - self._discrete_sigmas.to(sigma.device)[None, :]).abs().argmin(-1)
+                    )
+                else:
+                    timestep_indices = (sigma * self.num_train_timesteps).long().clamp(0, self.num_train_timesteps - 1)
                 loss_weight = self._bsmntw_weights.to(model_pred.device)[timestep_indices]
                 loss_weight = loss_weight.view(-1, *([1] * (loss.ndim - 1)))
             elif self.loss_weighting_scheme == "linear":
@@ -426,6 +462,8 @@ class FlowMatchingPipeline:
         else:
             raise KeyError("Batch must contain either 'video_latents' or 'image_latents'")
 
+        latents = self.model_adapter.prepare_latents(latents, batch)
+
         # latents can be 4D [B, C, H, W] for images or 5D [B, C, F, H, W] for videos
         batch_size = latents.shape[0]
 
@@ -436,15 +474,18 @@ class FlowMatchingPipeline:
         # ====================================================================
         # Flow Matching: Sample Timesteps
         # ====================================================================
-        sigma, timesteps, sampling_method = self.sample_timesteps(batch_size, device)
+        sigma, timesteps, sampling_method = self.sample_timesteps(batch_size, device, dtype=dtype)
 
         # ====================================================================
         # Flow Matching: Add Noise
         # ====================================================================
-        noise = torch.randn_like(latents, dtype=torch.float32)
+        noise = self.model_adapter.sample_noise(latents)
+        clean_latents = latents.to(noise.dtype)
 
         # x_t = (1 - σ) * x_0 + σ * ε
-        noisy_latents = self.noise_schedule.forward(latents.float(), noise, sigma)
+        noisy_latents = self.model_adapter.add_noise(
+            clean_latents, noise, sigma, noise_schedule=self.noise_schedule.forward
+        )
 
         # ====================================================================
         # Logging
@@ -487,7 +528,7 @@ class FlowMatchingPipeline:
         # Target: Flow Matching Velocity
         # ====================================================================
         # v = ε - x_0
-        target = noise - latents.float()
+        target = noise - clean_latents
 
         # ====================================================================
         # Loss Computation
@@ -631,15 +672,16 @@ def create_adapter(adapter_type: str, **kwargs) -> ModelAdapter:
 
     Args:
         adapter_type: Type of adapter ("hunyuan", "simple", "flux", "flux2", "qwen_image",
-            "qwen_image_edit", "ltx2")
+            "qwen_image_edit", "ltx2", "wan_animate2")
         **kwargs: Additional arguments passed to the adapter constructor
 
     Returns:
         ModelAdapter instance
     """
-    # Imported lazily: the adapter is owned by the model package, and importing
-    # it here at module scope would load the Qwen model code for every recipe.
+    # Imported lazily: these adapters are owned by their model packages, and
+    # importing them here at module scope would load that model code for every recipe.
     from nemo_automodel.components.models.qwen_image_edit.adapter import QwenImageEditAdapter
+    from nemo_automodel.components.models.wan_animate2.adapter import WanAnimate2Adapter
 
     adapters = {
         "hunyuan": HunyuanAdapter,
@@ -649,6 +691,7 @@ def create_adapter(adapter_type: str, **kwargs) -> ModelAdapter:
         "qwen_image": QwenImageAdapter,
         "qwen_image_edit": QwenImageEditAdapter,
         "ltx2": LTX2Adapter,
+        "wan_animate2": WanAnimate2Adapter,
     }
 
     if adapter_type not in adapters:
