@@ -442,6 +442,15 @@ class BackendConfig:
             manager instance across MoE layers.
         dispatcher_async_dispatch: Whether DeepEP/UCCL-EP dispatch and combine should return
             asynchronously and allocate their outputs on the communication stream.
+        dispatcher_capacity_factor: HybridEP only, dynamic routing. Run HybridEP dispatch in its
+            non-blocking mode with output buffers sized to the first microbatch's permuted row
+            count times this factor (EP-group max, 4-token aligned) instead of letting every
+            dispatch drain the compute stream to read the exact count. Overflow trips a
+            device-side assert. None (default) keeps the blocking reference path.
+        dispatcher_equal_token_counts: HybridEP only. Declare that every EP rank dispatches the
+            same row count, so the per-dispatch EP-group max all-reduce (and its host sync)
+            that derives the pad size is skipped and the count is only aligned. Default False;
+            keep it False for variable-length or in-batch-packed inputs.
         enable_deepep: Removed and ignored. Logs a warning if set; configure "dispatcher"
             and "experts" explicitly instead.
         fake_balanced_gate: If True, replace the learned Gate with FakeBalancedGate
@@ -501,6 +510,17 @@ class BackendConfig:
     dispatcher_num_sms: int = 20
     dispatcher_share_token_dispatcher: bool = True
     dispatcher_async_dispatch: bool = False
+    # HybridEP only, dynamic routing: after one blocking calibration dispatch per MoE layer, size every
+    # later dispatch's output buffers to ceil(calibrated rows x factor) (EP-group max, aligned) and run
+    # HybridEP in its non-blocking mode. Removes the per-dispatch compute-stream drain that HybridEP's
+    # blocking mode needs to learn the permuted row count (and the per-layer barrier it implies); an
+    # overflow of the capacity trips a device-side assert instead of silently truncating. None = blocking.
+    dispatcher_capacity_factor: float | None = None
+    # HybridEP only: every EP rank dispatches the same number of rows (fixed-shape batches, which is
+    # every batch that is not variable-length / in-batch packed), so the per-dispatch EP-group MAX
+    # all-reduce + int() host sync that derives the pad size is skipped and the local count is only
+    # aligned. Leave False for variable-length inputs: unequal counts abort the HybridEP collective.
+    dispatcher_equal_token_counts: bool = False
     mok: MoKBackendConfig = field(default_factory=MoKBackendConfig)
     enable_deepep: bool | None = None  # Removed: ignored with a warning; set dispatcher/experts explicitly
     fake_balanced_gate: bool = False
