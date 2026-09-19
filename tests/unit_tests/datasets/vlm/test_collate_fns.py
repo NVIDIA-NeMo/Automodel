@@ -25,6 +25,47 @@ CONVERSATION = [
 ]
 
 
+class TestFindPatternIndices:
+    @pytest.mark.parametrize(
+        ("template", "pattern", "search_start", "allow_first_mismatch", "expected"),
+        [
+            ([1, 2, 3, 2, 3], [2, 3], 0, False, (1, 3)),
+            ([1, 2, 3, 2, 3], [2, 3], 2, False, (3, 5)),
+            ([1, 9, 3, 4], [2, 3, 4], 0, True, (1, 4)),
+            ([1, 9, 3, 4], [2, 3, 4], 0, False, (-1, -1)),
+            ([1, 2], [1, 2, 3], 0, False, (-1, -1)),
+            ([1, 2], [], 0, False, (0, 0)),
+            ([1, 2], [9], 1, True, (1, 2)),
+        ],
+    )
+    def test_matches_expected_semantics(self, template, pattern, search_start, allow_first_mismatch, expected):
+        from nemo_automodel.components.datasets.vlm.collate_fns import _find_pattern_indices
+
+        actual = _find_pattern_indices(
+            torch.tensor(template),
+            torch.tensor(pattern),
+            search_start_index=search_start,
+            allow_first_token_mismatch=allow_first_mismatch,
+        )
+
+        assert actual == expected
+
+    def test_long_scan_does_not_scalarize_each_candidate(self):
+        from nemo_automodel.components.datasets.vlm.collate_fns import _find_pattern_indices
+
+        template = torch.zeros(16_384, dtype=torch.long)
+        pattern = torch.arange(1, 9, dtype=torch.long)
+        template[-len(pattern) :] = pattern
+
+        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as prof:
+            actual = _find_pattern_indices(template, pattern)
+
+        assert actual == (16_376, 16_384)
+        operator_names = {event.key for event in prof.key_averages()}
+        assert "aten::item" not in operator_names
+        assert "aten::equal" not in operator_names
+
+
 class DummyTokenizer:
     def __init__(self, pad_token_id=0):
         self.pad_token_id = pad_token_id
@@ -2397,6 +2438,19 @@ class TestBuildLabelsFromTemplate:
         # Turn 1: content [20] + im_end
         # Turn 2: content [40, 41] + im_end
         assert len(labeled_positions) == 5  # 1+1 + 2+1
+
+    def test_long_marker_scan_does_not_scalarize_each_token(self, collate_mod):
+        prefix = torch.zeros(16_000, dtype=torch.long)
+        assistant_turn = _make_qwen_input_ids(("assistant", [20, 21]))[0]
+        input_ids = torch.cat([prefix, assistant_turn]).unsqueeze(0)
+
+        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as prof:
+            labels = collate_mod.build_labels_from_template(input_ids, [[]], Qwen3VLProcessor())
+
+        operator_names = {event.key for event in prof.key_averages()}
+        assert "aten::item" not in operator_names
+        assert "aten::is_nonzero" not in operator_names
+        assert labels[0, -4:-1].tolist() == [20, 21, _IM_END]
 
     def test_user_text_never_labeled(self, collate_mod):
         """Even if user text matches assistant text, user tokens stay -100."""
