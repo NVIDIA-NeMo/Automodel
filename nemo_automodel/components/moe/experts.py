@@ -959,6 +959,7 @@ class GroupedExpertsDeepEP(nn.Module):
         self.dispatcher_num_sms = dispatcher_num_sms
         self.dispatcher_share_token_dispatcher = dispatcher_share_token_dispatcher
         self.dispatcher_async_dispatch = dispatcher_async_dispatch
+        self.deepep_sync_free = self.use_torch_mm and dispatcher_backend in ("deepep", "hybridep")
 
         # Allocate projection tensor - size depends on whether activation is gated
         # Gated (SwiGLU, Quick-GEGLU): [n_experts, dim, 2*inter_dim]
@@ -992,6 +993,7 @@ class GroupedExpertsDeepEP(nn.Module):
             moe_hybridep_num_sms=self.dispatcher_num_sms,
             moe_share_token_dispatcher=self.dispatcher_share_token_dispatcher,
             moe_deepep_async_dispatch=self.dispatcher_async_dispatch,
+            moe_deepep_sync_free=self.deepep_sync_free,
             moe_benchmark_static_routing=self.static_routing,
         )
 
@@ -1008,15 +1010,6 @@ class GroupedExpertsDeepEP(nn.Module):
             config=config,
             ep_group=ep_group,
         )
-        if self.dispatcher_backend == "deepep":
-            self._init_deepep_buffer(ep_group)
-
-    def _init_deepep_buffer(self, ep_group: dist.ProcessGroup) -> None:
-        """Initialize DeepEP communication buffers before activation checkpointing."""
-        from nemo_automodel.components.moe.megatron.fused_a2a import get_buffer
-
-        dtype_size = max(torch.empty((), dtype=self.config.dtype).element_size(), 2)
-        get_buffer(ep_group, self.config.expert_dim * dtype_size)
 
     def forward(
         self,
@@ -1072,7 +1065,7 @@ class GroupedExpertsDeepEP(nn.Module):
         # With static routing (forced balance, no noise) every expert receives tokens by
         # construction, so the count_nonzero device-to-host read (one per microbatch, and
         # again per activation-checkpoint recompute) can be skipped.
-        if self.static_routing or torch.count_nonzero(tokens_per_expert) > 0:
+        if self.deepep_sync_free or self.static_routing or torch.count_nonzero(tokens_per_expert) > 0:
             if self.use_torch_mm:
                 tokens_per_expert_gpu = tokens_per_expert.to(
                     device=permuted_local_hidden_states.device, non_blocking=True
@@ -1087,6 +1080,8 @@ class GroupedExpertsDeepEP(nn.Module):
                     offs = tokens_per_expert_gpu.cumsum(dim=0).to(torch.int32)
                     grouped_mm = select_grouped_mm(self.use_mxfp8)
                     output1 = grouped_mm(permuted_local_hidden_states, gate_and_up_projs, offs)
+                    if self.deepep_sync_free:
+                        output1 = _zero_grouped_mm_tail(output1, offs)
                     gate_up_proj_bias = self.gate_up_proj_bias.to_local()
                     # MXFP8: the grouped_mm wrapper clamps its quant input (see
                     # select_grouped_mm) so a bias-shifted value can't overflow the e8m0
@@ -1095,6 +1090,8 @@ class GroupedExpertsDeepEP(nn.Module):
                     output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
                     output1 = self.expert_activation(output1, activation_probs)
                     output2 = grouped_mm(output1, down_projs, offs)
+                    if self.deepep_sync_free:
+                        output2 = _zero_grouped_mm_tail(output2, offs)
                     down_bias = self.down_proj_bias.to_local()
                     output2 = _apply_bias(
                         output2,
@@ -1111,6 +1108,7 @@ class GroupedExpertsDeepEP(nn.Module):
                         activation_probs,
                         self.expert_activation,
                         use_mxfp8=self.use_mxfp8,
+                        zero_tail=self.deepep_sync_free,
                     )
             else:
                 # ops.gmm sizes its launches from a CPU copy of tokens_per_expert; under
@@ -1171,6 +1169,7 @@ def _torch_mm_experts_fwd(
     permuted_probs,
     activation_fn,
     use_mxfp8=False,
+    zero_tail=False,
 ):
     # torchao's MXFP8 quantizer (mx_tensor.to_mx) strictly asserts is_contiguous() on each
     # operand it quantizes, unlike torch._grouped_mm. select_grouped_mm returns a wrapper
@@ -1179,9 +1178,19 @@ def _torch_mm_experts_fwd(
     offs = tokens_per_expert.cumsum(dim=0).to(torch.int32)
     grouped_mm = select_grouped_mm(use_mxfp8)
     output1 = grouped_mm(hidden_states, gate_and_up_projs, offs)
+    if zero_tail:
+        output1 = _zero_grouped_mm_tail(output1, offs)
     output1 = activation_fn(output1, permuted_probs)
     output2 = grouped_mm(output1, down_projs, offs)
+    if zero_tail:
+        output2 = _zero_grouped_mm_tail(output2, offs)
     return output2
+
+
+def _zero_grouped_mm_tail(output: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
+    """Zero fixed-capacity rows that DeepEP V2 did not route to an expert."""
+    valid_rows = torch.arange(output.shape[0], device=output.device) < offsets[-1]
+    return output.masked_fill(~valid_rows.unsqueeze(-1), 0)
 
 
 class GroupedExpertsTE(nn.Module):
