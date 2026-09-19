@@ -852,6 +852,96 @@ class TitansMLP(nn.Module):
             nn.init.trunc_normal_(lin.weight, mean=0.0, std=init_std)
 
 
+class SegmentedCausalAttention(nn.Module):
+    """Block-local causal attention with always-visible persistent KV prefixes.
+
+    This follows the public ``titans-pytorch`` MAC topology: ordinary tokens and
+    learned long-term-memory tokens are grouped into independent segments, while
+    every query can attend to per-layer persistent-memory key/value parameters.
+    """
+
+    def __init__(self, config, dtype: torch.dtype = torch.bfloat16):
+        super().__init__()
+        self.num_heads = config.num_attention_heads
+        self.head_dim = config.head_dim
+        self.inner_dim = self.num_heads * self.head_dim
+        self.segment_length = config.attention_segment_size + config.num_longterm_memory_tokens
+        self.num_persistent_tokens = config.num_persistent_memory_tokens
+        if self.head_dim % 2:
+            raise ValueError("MAC attention head_dim must be even for rotary embeddings.")
+
+        self.q_proj = nn.Linear(config.hidden_size, self.inner_dim, bias=False, dtype=dtype)
+        self.k_proj = nn.Linear(config.hidden_size, self.inner_dim, bias=False, dtype=dtype)
+        self.v_proj = nn.Linear(config.hidden_size, self.inner_dim, bias=False, dtype=dtype)
+        self.o_proj = nn.Linear(self.inner_dim, config.hidden_size, bias=False, dtype=dtype)
+        self.persistent_kv = nn.Parameter(
+            torch.empty(2, self.num_heads, self.num_persistent_tokens, self.head_dim, dtype=dtype)
+        )
+        inv_freq = 1.0 / (
+            10000
+            ** (torch.arange(0, self.head_dim, 2, dtype=torch.float32) / self.head_dim)
+        )
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def _apply_rope(self, x: torch.Tensor) -> torch.Tensor:
+        positions = torch.arange(x.shape[-2], device=x.device, dtype=torch.float32)
+        angles = torch.outer(positions, self.inv_freq.to(device=x.device))
+        cos = angles.cos()[None, None]
+        sin = angles.sin()[None, None]
+        even, odd = x.float()[..., 0::2], x.float()[..., 1::2]
+        rotated = torch.stack((even * cos - odd * sin, even * sin + odd * cos), dim=-1)
+        return rotated.flatten(-2).to(dtype=x.dtype)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch, sequence, _ = x.shape
+        if sequence % self.segment_length:
+            raise ValueError(
+                f"MAC augmented sequence length {sequence} must be divisible by "
+                f"segment length {self.segment_length}."
+            )
+        groups = sequence // self.segment_length
+
+        def project(layer: nn.Linear, value: torch.Tensor) -> torch.Tensor:
+            value = layer(value).view(batch, groups, self.segment_length, self.num_heads, self.head_dim)
+            return value.permute(0, 1, 3, 2, 4).reshape(
+                batch * groups, self.num_heads, self.segment_length, self.head_dim
+            )
+
+        q = self._apply_rope(project(self.q_proj, x))
+        k = self._apply_rope(project(self.k_proj, x))
+        v = project(self.v_proj, x)
+        if self.num_persistent_tokens:
+            persistent_k, persistent_v = self.persistent_kv
+            persistent_k = persistent_k.unsqueeze(0).expand(batch * groups, -1, -1, -1)
+            persistent_v = persistent_v.unsqueeze(0).expand(batch * groups, -1, -1, -1)
+            k = torch.cat((persistent_k, k), dim=-2)
+            v = torch.cat((persistent_v, v), dim=-2)
+
+        causal = torch.ones(
+            self.segment_length,
+            self.segment_length,
+            dtype=torch.bool,
+            device=x.device,
+        ).tril()
+        if self.num_persistent_tokens:
+            prefix = torch.ones(
+                self.segment_length,
+                self.num_persistent_tokens,
+                dtype=torch.bool,
+                device=x.device,
+            )
+            causal = torch.cat((prefix, causal), dim=-1)
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=causal[None, None])
+        out = out.reshape(batch, groups, self.num_heads, self.segment_length, self.head_dim)
+        out = out.permute(0, 1, 3, 2, 4).reshape(batch, sequence, self.inner_dim)
+        return self.o_proj(out)
+
+    def init_weights(self, init_std: float = 0.02):
+        for linear in (self.q_proj, self.k_proj, self.v_proj, self.o_proj):
+            nn.init.trunc_normal_(linear.weight, mean=0.0, std=init_std)
+        nn.init.trunc_normal_(self.persistent_kv, mean=0.0, std=init_std)
+
+
 class TitansBlock(nn.Module):
     """Pre-norm decoder block: NeuralMemory token mixer + SwiGLU MLP."""
 
@@ -886,3 +976,23 @@ class TitansBlock(nn.Module):
         self.post_attention_layernorm.reset_parameters()
         self.memory.init_weights(init_std)
         self.mlp.init_weights(init_std)
+
+
+class TitansMACBlock(TitansBlock):
+    """Public-reference MAC block: neural-memory residual, attention, then MLP."""
+
+    def __init__(self, config, dtype: torch.dtype = torch.bfloat16):
+        super().__init__(config, dtype=dtype)
+        self.attention_layernorm = TitansRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.attention = SegmentedCausalAttention(config, dtype=dtype)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.memory(self.input_layernorm(x))
+        x = x + self.attention(self.attention_layernorm(x))
+        x = x + self.mlp(self.post_attention_layernorm(x))
+        return x
+
+    def init_weights(self, init_std: float = 0.02):
+        super().init_weights(init_std)
+        self.attention_layernorm.reset_parameters()
+        self.attention.init_weights(init_std)

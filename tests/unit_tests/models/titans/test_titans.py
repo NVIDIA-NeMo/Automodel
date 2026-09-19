@@ -107,6 +107,57 @@ def test_persistent_memory_token_count_must_be_nonnegative():
         _tiny_config(num_persistent_memory_tokens=-1)
 
 
+def test_mac_preserves_token_length_and_trains_both_memory_kinds():
+    config = _tiny_config(
+        architecture_variant="mac",
+        attention_segment_size=4,
+        num_longterm_memory_tokens=2,
+        num_persistent_memory_tokens=3,
+        mem_depth=2,
+        chunk_size=2,
+        memory_batch_size=6,
+    )
+    model = TitansForCausalLM(config)
+    input_ids = torch.randint(0, config.vocab_size, (2, 7))
+
+    logits = model(input_ids).logits
+    logits.sum().backward()
+
+    assert logits.shape == (2, 7, config.vocab_size)
+    assert model.model.longterm_memory.shape == (2, config.hidden_size)
+    assert model.model.longterm_memory.grad is not None
+    assert model.model.layers[0].attention.persistent_kv.shape == (2, 4, 3, 32)
+    assert model.model.layers[0].attention.persistent_kv.grad is not None
+
+
+def test_mac_is_causal_across_and_within_segments():
+    torch.manual_seed(7)
+    config = _tiny_config(
+        architecture_variant="mac",
+        attention_segment_size=4,
+        num_longterm_memory_tokens=2,
+        num_persistent_memory_tokens=3,
+        mem_depth=2,
+        chunk_size=2,
+        memory_batch_size=6,
+    )
+    model = TitansForCausalLM(config).eval()
+    original = torch.randint(0, config.vocab_size, (1, 8))
+    changed = original.clone()
+    changed[:, 5:] = (changed[:, 5:] + 1) % config.vocab_size
+
+    with torch.no_grad():
+        original_logits = model(original).logits
+        changed_logits = model(changed).logits
+
+    torch.testing.assert_close(original_logits[:, :5], changed_logits[:, :5], rtol=0, atol=0)
+
+
+def test_mac_requires_longterm_memory_tokens():
+    with pytest.raises(ValueError, match="MAC requires num_longterm_memory_tokens"):
+        _tiny_config(architecture_variant="mac", num_longterm_memory_tokens=0)
+
+
 # --------------------------------------------------------------------------- #
 # (c) Reduction check: Titans (eta=0) == Gated DeltaNet (fla)
 # --------------------------------------------------------------------------- #
@@ -423,6 +474,32 @@ def test_larger_lmm_recipes_match_paper_parameter_classes(
     assert sum(parameter.numel() for parameter in instantiated.parameters()) == expected_parameters
 
 
+def test_170m_mac_recipe_pins_public_reference_topology():
+    root = Path(__file__).parents[4]
+    recipe = yaml.safe_load(
+        (root / "examples/llm_pretrain/titans_170m_mac.yaml").read_text()
+    )
+    model = recipe["model"]["config"]
+
+    assert model["architecture_variant"] == "mac"
+    assert model["attention_segment_size"] == 512
+    assert model["num_longterm_memory_tokens"] == 256
+    assert model["num_persistent_memory_tokens"] == 128
+    assert model["chunk_size"] == 16
+    assert model["memory_batch_size"] == 6144
+    assert recipe["dataset"]["seq_len"] == 4096
+    assert recipe["step_scheduler"]["max_steps"] == 28_610
+
+    config_values = {
+        key: value
+        for key, value in model.items()
+        if key not in {"_target_", "architectures"}
+    }
+    with torch.device("meta"):
+        instantiated = TitansForCausalLM(TitansConfig(**config_values))
+    assert sum(parameter.numel() for parameter in instantiated.parameters()) > 173_695_680
+
+
 def test_lmm_recipe_distributed_section_supports_fsdp2_and_ddp():
     root = Path(__file__).parents[4]
     distributed = yaml.safe_load(
@@ -511,6 +588,10 @@ def test_blackwell_submitter_resolves_portable_topology():
     assert "titans_blackwell_lmm_full.sbatch" in data_runner
     assert "HF_TOKEN_QUOTED" in submitter
     assert "--full" in submitter
+    assert "baseline|mac|" in submitter
+    assert "titans_${TITANS_SCALE}_mac.yaml" in runner
+    assert "WANDB_GROUP=mac-$TITANS_SCALE" in runner
+    assert "[[ $TITANS_EXPERIMENT == mac ]] && DEFAULT_LOCAL_BATCH_SIZE=4" in runner
     for scale in ("170m", "340m", "760m"):
         assert scale in runner
 

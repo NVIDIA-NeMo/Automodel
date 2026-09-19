@@ -36,6 +36,7 @@ case "$TITANS_SCALE" in
   340m) DEFAULT_LOCAL_BATCH_SIZE=4 ;;
   760m) DEFAULT_LOCAL_BATCH_SIZE=2 ;;
 esac
+[[ $TITANS_EXPERIMENT == mac ]] && DEFAULT_LOCAL_BATCH_SIZE=4
 (( DEFAULT_LOCAL_BATCH_SIZE > MAX_LOCAL_BATCH_SIZE )) && \
   DEFAULT_LOCAL_BATCH_SIZE=$MAX_LOCAL_BATCH_SIZE
 LOCAL_BATCH_SIZE=${TITANS_LOCAL_BATCH_SIZE:-$DEFAULT_LOCAL_BATCH_SIZE}
@@ -72,6 +73,7 @@ fi
 
 case "$TITANS_EXPERIMENT" in
   baseline) MODEL_OVERRIDES="" ;;
+  mac) MODEL_OVERRIDES="" ;;
   no_persistent)
     MODEL_OVERRIDES="--model.config.num_persistent_memory_tokens=0 --model.config.memory_batch_size=4096"
     ;;
@@ -87,7 +89,11 @@ case "$TITANS_EXPERIMENT" in
   *) echo "unknown Titans experiment: $TITANS_EXPERIMENT" >&2; exit 2 ;;
 esac
 
-RECIPE=examples/llm_pretrain/titans_${TITANS_SCALE}_lmm.yaml
+if [[ $TITANS_EXPERIMENT == mac ]]; then
+  RECIPE=examples/llm_pretrain/titans_${TITANS_SCALE}_mac.yaml
+else
+  RECIPE=examples/llm_pretrain/titans_${TITANS_SCALE}_lmm.yaml
+fi
 DATA_ROOT=$TITANS_WORK_ROOT/data/fineweb-edu-llama2-$TOKEN_BUDGET
 RUN_NAME=titans-${TITANS_SCALE}-${TITANS_EXPERIMENT}-${TOKEN_BUDGET}-blackwell
 [[ $DISTRIBUTED_STRATEGY != fsdp2 ]] && RUN_NAME=$RUN_NAME-$DISTRIBUTED_STRATEGY
@@ -102,7 +108,11 @@ fi
 CHECKPOINT_ROOT=$TITANS_WORK_ROOT/outputs/$RUN_NAME
 RUN_SHA_FILE=$CHECKPOINT_ROOT/git_sha
 WANDB_RUN_ID=${WANDB_RUN_ID:-${RUN_NAME}-v1}
-WANDB_GROUP=$([[ $TITANS_EXPERIMENT == baseline ]] && echo "lmm-$TITANS_SCALE" || echo "ablations-170m")
+case "$TITANS_EXPERIMENT" in
+  baseline) WANDB_GROUP=lmm-$TITANS_SCALE ;;
+  mac) WANDB_GROUP=mac-$TITANS_SCALE ;;
+  *) WANDB_GROUP=ablations-170m ;;
+esac
 
 mkdir -p "$TITANS_WORK_ROOT"/{cache,logs,outputs} "$CHECKPOINT_ROOT" \
   "$TITANS_WORK_ROOT/cache"/{triton,torchinductor,wandb,wandb-data} \

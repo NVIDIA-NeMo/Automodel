@@ -33,7 +33,7 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.titans.config import TitansConfig
-from nemo_automodel.components.models.titans.layers import TitansBlock, TitansRMSNorm
+from nemo_automodel.components.models.titans.layers import TitansBlock, TitansMACBlock, TitansRMSNorm
 from nemo_automodel.components.models.titans.state_dict_adapter import TitansStateDictAdapter
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
@@ -44,7 +44,7 @@ class TitansPreTrainedModel(PreTrainedModel):
     config_class = TitansConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
-    _no_split_modules = ["TitansBlock"]
+    _no_split_modules = ["TitansBlock", "TitansMACBlock"]
     # A_log / dt_bias are exponentiated in the decay gate; keep them fp32 under
     # any mixed-precision sharding (see layers.NeuralMemory and state_dict_adapter).
     _keep_in_fp32_modules = ["A_log", "dt_bias"]
@@ -69,20 +69,54 @@ class TitansModel(TitansPreTrainedModel):
         super().__init__(config)
         dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, dtype=dtype)
-        if config.num_persistent_memory_tokens:
+        if config.architecture_variant == "lmm" and config.num_persistent_memory_tokens:
             self.persistent_memory = nn.Parameter(
                 torch.empty(config.num_persistent_memory_tokens, config.hidden_size, dtype=dtype)
             )
             nn.init.trunc_normal_(self.persistent_memory, mean=0.0, std=config.initializer_range)
-        self.layers = nn.ModuleList([TitansBlock(config, dtype=dtype) for _ in range(config.num_hidden_layers)])
+        if config.architecture_variant == "mac":
+            self.longterm_memory = nn.Parameter(
+                torch.empty(config.num_longterm_memory_tokens, config.hidden_size, dtype=dtype)
+            )
+            nn.init.trunc_normal_(self.longterm_memory, mean=0.0, std=config.initializer_range)
+            block_cls = TitansMACBlock
+        else:
+            block_cls = TitansBlock
+        self.layers = nn.ModuleList([block_cls(config, dtype=dtype) for _ in range(config.num_hidden_layers)])
         self.norm = TitansRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.gradient_checkpointing = False
         self.post_init()
 
+    def _insert_longterm_memory(self, h: torch.Tensor) -> tuple[torch.Tensor, int]:
+        """Append learned long-term-memory tokens to each padded MAC segment."""
+        batch, sequence, dim = h.shape
+        segment = self.config.attention_segment_size
+        padding = (-sequence) % segment
+        if padding:
+            h = nn.functional.pad(h, (0, 0, 0, padding))
+        groups = h.shape[1] // segment
+        h = h.view(batch, groups, segment, dim)
+        memory = self.longterm_memory.view(1, 1, -1, dim).expand(batch, groups, -1, -1)
+        return torch.cat((h, memory), dim=2).reshape(batch, -1, dim), padding
+
+    def _remove_longterm_memory(self, h: torch.Tensor, padding: int) -> torch.Tensor:
+        batch, _, dim = h.shape
+        augmented_segment = self.config.attention_segment_size + self.config.num_longterm_memory_tokens
+        groups = h.shape[1] // augmented_segment
+        h = h.view(batch, groups, augmented_segment, dim)
+        h = h[:, :, : self.config.attention_segment_size].reshape(batch, -1, dim)
+        return h[:, : h.shape[1] - padding] if padding else h
+
     def forward(self, input_ids: torch.Tensor, inputs_embeds: torch.Tensor | None = None) -> torch.Tensor:
         h = inputs_embeds if inputs_embeds is not None else self.embed_tokens(input_ids)
-        persistent_length = self.config.num_persistent_memory_tokens
-        if persistent_length:
+        persistent_length = (
+            self.config.num_persistent_memory_tokens
+            if self.config.architecture_variant == "lmm"
+            else 0
+        )
+        if self.config.architecture_variant == "mac":
+            h, mac_padding = self._insert_longterm_memory(h)
+        elif persistent_length:
             persistent = self.persistent_memory.unsqueeze(0).expand(h.shape[0], -1, -1)
             h = torch.cat((persistent, h), dim=1)
         for layer in self.layers:
@@ -91,6 +125,8 @@ class TitansModel(TitansPreTrainedModel):
             else:
                 h = layer(h)
         h = self.norm(h)
+        if self.config.architecture_variant == "mac":
+            return self._remove_longterm_memory(h, mac_padding)
         return h[:, persistent_length:]
 
 
@@ -173,8 +209,10 @@ class TitansForCausalLM(HFCheckpointingMixin, TitansPreTrainedModel):
         std = self.config.initializer_range
         with buffer_device:
             nn.init.trunc_normal_(self.model.embed_tokens.weight, mean=0.0, std=std)
-            if self.config.num_persistent_memory_tokens:
+            if hasattr(self.model, "persistent_memory"):
                 nn.init.trunc_normal_(self.model.persistent_memory, mean=0.0, std=std)
+            if hasattr(self.model, "longterm_memory"):
+                nn.init.trunc_normal_(self.model.longterm_memory, mean=0.0, std=std)
             self.model.norm.reset_parameters()
             for layer in self.model.layers:
                 layer.init_weights(std)

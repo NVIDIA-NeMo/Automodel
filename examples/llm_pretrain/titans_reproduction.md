@@ -64,11 +64,37 @@ No official implementation was released. The paper does not fully specify:
   parameter-count-matched LMMs use 16 blocks in this implementation;
 - all tensor shapes and parameterizations of the channel-wise forget gate;
 - exact chunk-boundary retrieval alignment and streaming-state semantics;
-- all implementation details needed to reconstruct MAC, MAG, and MAL.
+- exact unpublished MAC/MAG/MAL tensor flow and parameter accounting.
 
 Do not silently guess these details. Record each operational choice in the
 resolved run configuration and validate it against an independent reference
 or ablation before labeling a run as a paper reproduction.
+
+### MAC operational definition
+
+The initial MAC implementation is pinned to the public `titans-pytorch`
+topology and the proceedings hyperparameters, rather than filling in the
+paper's omissions silently:
+
+- append 256 learned long-term-memory tokens after every 512-token segment;
+- run neural memory over the resulting 6,144-token augmented sequence;
+- apply block-local causal attention after neural-memory retrieval;
+- expose 128 learned per-layer persistent key/value tokens to every attention
+  segment;
+- remove long-term-memory token positions before computing language-model
+  logits.
+
+This preserves the public implementation's ordering of neural memory,
+segmented attention, and feed-forward layers. It differs from a literal but
+underspecified implementation of equations 7--10, so the first MAC runs are
+implementation-parity pilots. They become reproduction runs only after their
+learning behavior is independently validated. Submit the 170M pilot with:
+
+```bash
+TITANS_PILOT_STEPS=100 \
+  TITANS_LOCAL_BATCH_SIZE=4 \
+  tools/submit_titans_blackwell.sh 170m mac --pilot --total-gpus 8
+```
 
 ## Acceptance gates
 

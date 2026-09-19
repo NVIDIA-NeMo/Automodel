@@ -67,8 +67,15 @@ class TitansConfig(PretrainedConfig):
         memory_batch_size: Number of tokens sharing one deep-memory gradient
             anchor for the ``"titans_pytorch"`` backend. Must be divisible by
             ``chunk_size``. ``None`` uses the full input sequence.
+        architecture_variant: ``"lmm"`` for neural memory as the token mixer or
+            ``"mac"`` for the public Memory-as-Context topology.
+        attention_segment_size: Number of ordinary tokens in each MAC local
+            attention segment.
+        num_longterm_memory_tokens: Learned MAC tokens appended to each segment
+            before memory and local attention.
         num_persistent_memory_tokens: Number of learned, input-independent
-            vectors prepended to every sequence before the decoder stack.
+            vectors prepended to LMM inputs or exposed as per-layer attention
+            prefix key/value pairs in MAC.
         tie_word_embeddings: Whether ``lm_head`` shares weights with ``embed_tokens``.
         initializer_range: Stddev for truncated-normal weight init.
         torch_dtype: Default compute dtype (``A_log`` / ``dt_bias`` always stay fp32).
@@ -97,6 +104,9 @@ class TitansConfig(PretrainedConfig):
         chunk_size: int = 16,
         deep_memory_backend: str = "reference",
         memory_batch_size: int | None = None,
+        architecture_variant: str = "lmm",
+        attention_segment_size: int = 512,
+        num_longterm_memory_tokens: int = 256,
         num_persistent_memory_tokens: int = 0,
         tie_word_embeddings: bool = True,
         initializer_range: float = 0.02,
@@ -125,6 +135,9 @@ class TitansConfig(PretrainedConfig):
         self.chunk_size = chunk_size
         self.deep_memory_backend = deep_memory_backend
         self.memory_batch_size = memory_batch_size
+        self.architecture_variant = architecture_variant
+        self.attention_segment_size = attention_segment_size
+        self.num_longterm_memory_tokens = num_longterm_memory_tokens
         self.num_persistent_memory_tokens = num_persistent_memory_tokens
         self.initializer_range = initializer_range
         self.torch_dtype = torch_dtype
@@ -144,6 +157,17 @@ class TitansConfig(PretrainedConfig):
                 "TitansConfig: deep_memory_backend must be 'reference' or 'titans_pytorch'; "
                 f"got {deep_memory_backend!r}."
             )
+        if architecture_variant not in {"lmm", "mac"}:
+            raise ValueError(
+                "TitansConfig: architecture_variant must be 'lmm' or 'mac'; "
+                f"got {architecture_variant!r}."
+            )
+        if attention_segment_size <= 0:
+            raise ValueError("TitansConfig: attention_segment_size must be positive.")
+        if num_longterm_memory_tokens < 0:
+            raise ValueError("TitansConfig: num_longterm_memory_tokens must be non-negative.")
+        if architecture_variant == "mac" and num_longterm_memory_tokens == 0:
+            raise ValueError("TitansConfig: MAC requires num_longterm_memory_tokens > 0.")
         if memory_batch_size is not None:
             if memory_batch_size <= 0:
                 raise ValueError("TitansConfig: memory_batch_size must be positive when provided.")
