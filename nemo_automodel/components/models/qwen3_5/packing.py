@@ -61,18 +61,36 @@ def prepare_gated_delta_packed_metadata(
         documented by :class:`GatedDeltaPackedMetadata`, or ``None`` for an
         unpacked mask.
     """
-    if is_indexed_packed_mask(attention_mask):
-        document_ids = attention_mask
-    elif is_indexed_packed_mask(packed_seq_ids):
-        document_ids = packed_seq_ids
-    else:
+    # ``_packed_seq_ids`` is the collater's authoritative indexed mask. Prefer
+    # it when present so a backend-specific attention mask does not need a
+    # device scalar decision. Otherwise a structurally eligible 2D attention
+    # mask is the only candidate.
+    document_ids = None
+    document_ids_cpu = None
+    for candidate in (packed_seq_ids, attention_mask):
+        if candidate is None or candidate.dtype == torch.bool or candidate.dim() != 2:
+            continue
+        candidate_cpu = candidate.detach().to(device="cpu")
+        if is_indexed_packed_mask(candidate_cpu):
+            document_ids = candidate
+            document_ids_cpu = candidate_cpu
+            break
+    if document_ids is None or document_ids_cpu is None:
         return None
 
-    indices, cu_seqlens, _ = get_unpad_data(document_ids)
-    cu_seqlens = cu_seqlens.to(torch.long)
+    # FLA needs a CPU cu_seqlens mirror for host-side chunk planning. Derive all
+    # dynamic-size metadata from the single host copy above, and coalesce indices
+    # + cu_seqlens into one H2D transfer. The normal packed path therefore replaces
+    # three CUDA scalar reads, two dynamic ``nonzero`` synchronizations, and a
+    # final D2H mirror with one boundary in each direction per model forward.
+    indices_cpu, cu_seqlens_cpu, _ = get_unpad_data(document_ids_cpu)
+    indices_cpu = indices_cpu.to(torch.long)
+    cu_seqlens_cpu = cu_seqlens_cpu.to(torch.long)
+    num_indices = indices_cpu.numel()
+    device_metadata = torch.cat((indices_cpu, cu_seqlens_cpu)).to(device=document_ids.device)
     return GatedDeltaPackedMetadata(
         document_ids=document_ids,
-        indices=indices,
-        cu_seqlens=cu_seqlens,
-        cu_seqlens_cpu=cu_seqlens.detach().cpu(),
+        indices=device_metadata[:num_indices],
+        cu_seqlens=device_metadata[num_indices:],
+        cu_seqlens_cpu=cu_seqlens_cpu,
     )
