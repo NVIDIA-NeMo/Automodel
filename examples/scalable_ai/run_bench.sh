@@ -1,5 +1,5 @@
 #!/bin/bash
-# Moonlight-V4-16B-A3B benchmarks on 8 GPUs (branch scalable-ai-2026_sept). Usage: run_bench.sh [torch|tilelang|deepep|hf|hf2layer ...]
+# Moonlight-V4-16B-A3B benchmarks on 8 GPUs (branch scalable-ai-2026_sept). Usage: run_bench.sh [torch|tilelang|deepep|hf|hf2layer|journey ...]
 # Expects $WORK (default /workspace) to contain Automodel/ (this repo), models/Moonlight-V4-16B-A3B/ (config + tokenizer) and logs/.
 set -o pipefail
 WORK=${WORK:-/workspace}
@@ -51,6 +51,35 @@ run_lbs() {  # name config [extra overrides...]
   return 1
 }
 
+# "Journey" on a reduced model every stage can run: first L layers (default 4 = SWA, SWA, CSA, HCA). Finds the
+# longest sequence at which stock transformers survives, then runs the same model through all stages at the same
+# micro-batch, and the Automodel stages again at a larger micro-batch. Automodel stages use the fake balanced gate unless JOURNEY_GATE=false.
+journey() {  # layers
+  local L=${1:-4} S="" o G=${JOURNEY_GATE:-true} sfx=""
+  [ "$G" = false ] && sfx="_lg"   # learned (random-init) gate instead of the fake balanced gate
+  sfx="${sfx}${JOURNEY_TAG:-}"      # optional extra suffix for repeat runs (keeps earlier logs)
+  if [ -n "$JOURNEY_SKIP_HF" ]; then   # Automodel stages only, at the first listed sequence length
+    S=${JOURNEY_SEQS:-2048}; S=${S%% *}
+  else
+    for S_try in ${JOURNEY_SEQS:-2048 1024 512}; do
+      run "journey_hf_L${L}_s${S_try}_b1" $C/moonlight_v4_16b_hf.yaml --model.config.num_hidden_layers $L --dataset.seq_len $S_try --step_scheduler.local_batch_size 1 && S=$S_try && break
+    done
+    [ -z "$S" ] && { echo "stock transformers did not fit at any sequence length for L=$L"; return 1; }
+    echo "### stock transformers runs at L=$L, seq $S; running the Automodel stages on the same model"
+  fi
+  for B in ${JOURNEY_LBS:-1 ${JOURNEY_BIG_LBS:-4}}; do   # micro-batch sizes; JOURNEY_LBS overrides the list
+    o="--model.config.num_hidden_layers $L --dataset.seq_len $S --step_scheduler.local_batch_size $B --model.backend.fake_balanced_gate $G"
+    [ "$B" != 1 ] && [ -z "$JOURNEY_SKIP_HF" ] && run "journey_hf_L${L}_s${S}_b${B}" $C/moonlight_v4_16b_hf.yaml --model.config.num_hidden_layers $L --dataset.seq_len $S --step_scheduler.local_batch_size $B
+    for st in ${JOURNEY_STAGES:-eager deepep tilelang}; do   # Automodel stages to run
+      case $st in
+        eager)    run "journey_am_eager_L${L}_s${S}_b${B}${sfx}"    $C/moonlight_v4_16b_torch.yaml $o ;;
+        deepep)   run "journey_am_deepep_L${L}_s${S}_b${B}${sfx}"   $C/moonlight_v4_16b_torch.yaml $o --model.backend.dispatcher deepep ;;
+        tilelang) run "journey_am_tilelang_L${L}_s${S}_b${B}${sfx}" $C/moonlight_v4_16b_tilelang_deepep.yaml $o ;;
+      esac
+    done
+  done
+}
+
 C=examples/scalable_ai/configs
 for which in "${@:-torch tilelang hf}"; do
   case $which in
@@ -58,6 +87,7 @@ for which in "${@:-torch tilelang hf}"; do
     tilelang) run_lbs automodel_tilelang_deepep $C/moonlight_v4_16b_tilelang_deepep.yaml ;;
     deepep)   run_lbs automodel_eager_deepep   $C/moonlight_v4_16b_torch.yaml --model.backend.dispatcher deepep ;;
     torch_ac) run automodel_torch_lbs4_ac      $C/moonlight_v4_16b_torch.yaml --distributed.activation_checkpointing true ;;
+    journey)  journey ${JOURNEY_LAYERS:-4} ;;
     hf)       run hf_ootb_seq2048           $C/moonlight_v4_16b_hf.yaml
               run hf_ootb_seq1024           $C/moonlight_v4_16b_hf.yaml --dataset.seq_len 1024
               run hf_ootb_seq512            $C/moonlight_v4_16b_hf.yaml --dataset.seq_len 512 ;;

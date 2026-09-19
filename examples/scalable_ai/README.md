@@ -25,6 +25,7 @@ compression, no indexer); both ship a training recipe in their `training/` folde
 | `configs/pretrain_moonlight_v4_16b.yaml` | from-scratch pre-training on Megatron-format data (8 GPUs, EP 8) |
 | `profile_layer.py` | per-layer fwd+bwd profiling (attention SWA/CSA/HCA, MoE, block, RMSNorm, mHC mixer), Automodel vs transformers |
 | `nsys_profiles/` | the nsys commands behind the lecture's profiles and a script to regenerate them |
+| `run_bench.sh` | 8-GPU benchmark runner behind the reference tables below; `run_bench.sh journey` is the stage-by-stage comparison on the 4-layer model |
 
 ## Quick start
 
@@ -96,6 +97,47 @@ Reading the table: the stock implementation cannot train the full model on 80 GB
 `S x k` keys per query); the eager Automodel path fits at micro-batch 1; the TileLang kernels cut the attention
 memory enough for micro-batch 2 and run 1.9x faster than the eager path. Reproduce with
 `examples/scalable_ai/run_bench.sh` (see its header for the expected workspace layout).
+
+### Stage by stage on a model every stage can run
+
+Stock transformers never fits the full model, so the stage-by-stage comparison uses the first four layers of the
+schedule (`--model.config.num_hidden_layers 4`: sliding-window, sliding-window, CSA, HCA, one of each attention
+kind; 3.01B parameters), everything else unchanged: sequence 2048, global batch 256 sequences (524k tokens per
+step), 8x H100, same recipe, data and optimizer. `run_bench.sh journey` produces the table; the Automodel rows use
+the fake balanced gate like the full-model table above, stock transformers routes with its (random-init) learned gate.
+
+| stage | micro-batch / GPU | step time | tokens/s (8 GPUs) | peak memory | MFU |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1. stock transformers (`moonlight_v4_16b_hf.yaml`) | 1 | 4.36 s | 120k | 22.0 GB | 6.2% |
+| 1. stock transformers | 4 | 2.58 s | 203k | 43.6 GB | 10.5% |
+| 1. stock transformers | 8 | OOM in the first forward | - | > 79 GB | - |
+| 2. NeMo Automodel, eager attention, torch dispatcher (`moonlight_v4_16b_torch.yaml`) | 1 | 3.35 s | 157k | 15.7 GB | 8.1% |
+| 2. NeMo Automodel, eager attention, torch dispatcher | 4 | 2.56 s | 205k | 37.2 GB | 10.6% |
+| 2. NeMo Automodel, eager attention, torch dispatcher | 8 | no result: did not finish iteration 0 in 11 min (both attempts) | - | - | - |
+| 3. NeMo Automodel, eager attention + DeepEP dispatcher | 1 | 3.05 s | 172k | 15.7 GB | 8.9% |
+| 3. NeMo Automodel, eager attention + DeepEP dispatcher | 4 | 2.26 s | 232k | 37.2 GB | 12.0% |
+| 3. NeMo Automodel, eager attention + DeepEP dispatcher | 8 | OOM in the first iteration | - | > 79 GB | - |
+| 4. NeMo Automodel, TileLang attention kernels + DeepEP (`moonlight_v4_16b_tilelang_deepep.yaml`) | 1 | 2.49 s | 210k | 14.2 GB | 10.9% |
+| 4. NeMo Automodel, TileLang attention kernels + DeepEP | 4 | 1.76 s | 297k | 30.2 GB | 15.3% |
+| 4. NeMo Automodel, TileLang attention kernels + DeepEP | 8 | 1.71 s | 308k | 52.4 GB | 15.9% |
+
+Reading the table: memory is the first thing that moves. Stock transformers needs 22 GB at micro-batch 1 and
+44 GB at 4, and does not fit 8; the Automodel stages need 14-16 GB and 30-38 GB for the same work. Speed follows:
+at micro-batch 4 the portable Automodel path (stage 2) is as fast as stock, DeepEP takes 12% off the step time
+(the torch dispatcher exchanges tokens with all-gathers over the EP group), and the TileLang kernels take another
+22% off while saving 7 GB, so stage 4 is 1.47x faster than stock at micro-batch 4 and 1.75x at micro-batch 1.
+Only the TileLang path fits micro-batch 8 (52 GB), where it reaches 308k tokens/s and 15.9% MFU, 1.5x the best
+stock throughput (203k tokens/s at micro-batch 4). On the full 27-layer model the same steps are the difference
+between "does not run" and 50k tokens/s.
+
+The gate matters for a fair reading: rerunning the Automodel stages with the learned gate (`JOURNEY_GATE=false`)
+gives 3.55-3.58 s (eager, micro-batch 1), 2.61 s (eager, 4), 2.40 s (DeepEP, 4), 2.55 s (TileLang, 1) and
+1.88-1.90 s (TileLang, 4), i.e. random-init learned routing costs 2-8% over the fake balanced gate, so the
+stock-to-Automodel gap in the table is overstated by about that much. Those learned-gate runs were also less stable
+at EP 8 in the 26.08 container: of 15 runs, 4 died right after their first iteration on the DeepEP dispatcher
+(`DeepEP timeout check failed`, then `CUDA error: unspecified launch failure`), one hit a cuBLAS execution failure
+in backward and one hung in iteration 0; with the balanced gate all 4-layer runs at micro-batch 1 and 4 completed.
+Rerun the stage when that happens; the cause was not investigated here.
 
 Operational notes for containers: put `TILELANG_CACHE_DIR`, `TRITON_CACHE_DIR` and `TORCHINDUCTOR_CACHE_DIR` on a
 writable filesystem (`run_bench.sh` does); when tilelang cannot create its cache directory its import fails and
