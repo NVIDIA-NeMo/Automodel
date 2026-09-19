@@ -540,6 +540,103 @@ def deepseekv3_flops(config, gbs=1, seq_len=None):
     return (per_input_attention_flops + per_input_linear_flops + per_input_vocab_flops) * gbs
 
 
+def _deepseekv4_layer_kinds(config, layers):
+    """Per-layer compression ratio of a DeepSeek-V4 config (0 = sliding-window only, 4 = CSA, 128 = HCA).
+
+    Accepts NeMo Automodel's config (``compress_ratios``) and transformers' config (``layer_types`` +
+    ``compress_rates``).
+    """
+    ratios = getattr(config, "compress_ratios", None)
+    if ratios:
+        return [int(r) for r in list(ratios)[:layers]]
+    layer_types = getattr(config, "layer_types", None)
+    if layer_types:
+        rates = getattr(config, "compress_rates", None) or {}
+        mapping = {
+            "sliding_attention": 0,
+            "compressed_sparse_attention": int(rates.get("compressed_sparse_attention", 4)),
+            "heavily_compressed_attention": int(rates.get("heavily_compressed_attention", 128)),
+        }
+        return [mapping[t] for t in list(layer_types)[:layers]]
+    return [0] * layers
+
+
+def deepseekv4_flops(config, gbs=1, seq_len=None):
+    """Model FLOPs for DeepSeek-V4 (shared-KV MQA with grouped low-rank output projection, hybrid
+    sliding-window / Compressed Sparse / Heavily Compressed Attention, all-MoE FFN, mHC residual mixers).
+
+    Conventions follow ``deepseekv3_flops``: 6 FLOPs per parameter per token for linear layers (fwd + bwd),
+    6 FLOPs per multiply-accumulate for the attention BMMs, the output head counted like a linear layer.
+    Attention costs are causal: a sliding-window layer attends to at most ``sliding_window`` tokens, a CSA
+    layer additionally to ``min(ceil(t / m), index_topk)`` ratio-``m`` compressed entries (its lightning
+    indexer scores all preceding compressed entries), an HCA layer to all preceding ratio-``m'`` entries.
+    The compressor projections, indexer projections, mHC mixers and the hash-routed layers (same expert
+    cost, no learned router) are included; RoPE, norms, softmax and the Sinkhorn iterations are not.
+    Accepts NeMo Automodel's ``DeepseekV4Config`` and transformers' ``DeepseekV4Config``.
+    """
+    if seq_len is None:
+        seq_len = config.max_position_embeddings if hasattr(config, "max_position_embeddings") else 4096
+    hs = config.hidden_size
+    layers = config.num_hidden_layers
+    heads = config.num_attention_heads
+    head_dim = config.head_dim
+    q_lora_rank = config.q_lora_rank
+    o_lora_rank = config.o_lora_rank
+    o_groups = config.o_groups
+    vocab_size = config.vocab_size
+    window = int(getattr(config, "sliding_window", 128) or 128)
+    hc_mult = int(getattr(config, "hc_mult", 1) or 1)
+    moe_inter = config.moe_intermediate_size
+    topk_experts = config.num_experts_per_tok
+    n_shared = int(getattr(config, "n_shared_experts", 1) or 0)
+    index_n_heads = int(getattr(config, "index_n_heads", 0) or 0)
+    index_head_dim = int(getattr(config, "index_head_dim", 0) or 0)
+    index_topk = int(getattr(config, "index_topk", 0) or 0)
+    mtp_layers = int(getattr(config, "num_nextn_predict_layers", 0) or 0)
+    kinds = _deepseekv4_layer_kinds(config, layers) + [0] * mtp_layers  # the MTP block is a sliding-window layer
+
+    # --- attention BMMs (multiply-accumulates per input sequence; keys and values are the same entries) ---
+    window_pairs = window * (window + 1) / 2 + max(seq_len - window, 0) * window  # causal band
+    per_layer_bmm = []
+    for ratio in kinds:
+        pairs = window_pairs
+        indexer_macs = 0
+        if ratio:
+            n_compressed = seq_len // ratio
+            if ratio == 4 and index_topk > 0:
+                # every query sees min(#preceding compressed entries, index_topk); the indexer scores all of them
+                compressed_pairs = sum(min((t + 1) // ratio, index_topk) for t in range(seq_len))
+                indexer_macs = index_n_heads * index_head_dim * (n_compressed * (n_compressed + 1) / 2) * ratio
+            else:
+                compressed_pairs = n_compressed * (n_compressed + 1) / 2 * ratio  # causal, ratio queries per entry
+            pairs += compressed_pairs
+        per_layer_bmm.append(2 * heads * head_dim * pairs + indexer_macs)  # QK^T and PV
+    per_input_attention_flops = 6 * sum(per_layer_bmm)
+
+    # --- linear layers (parameters touched per token) ---
+    attn_core = hs * q_lora_rank + q_lora_rank * heads * head_dim + hs * head_dim + heads * head_dim * o_lora_rank
+    attn_core += o_groups * o_lora_rank * hs
+    mhc = 2 * (2 + hc_mult) * hc_mult * hc_mult * hs if hc_mult > 1 else 0
+    ffn = (topk_experts + n_shared) * 3 * hs * moe_inter
+    per_input_params = 0
+    for ratio in kinds:
+        params = attn_core + mhc + ffn
+        if ratio:
+            coff = 2 if ratio == 4 else 1  # overlapped compression doubles the compressor width
+            params += 2 * hs * coff * head_dim  # compressor wkv + wgate
+            if ratio == 4 and index_n_heads > 0:
+                params += (
+                    q_lora_rank * index_n_heads * index_head_dim + hs * index_n_heads + 2 * hs * 2 * index_head_dim
+                )
+        per_input_params += params
+    per_input_params += mtp_layers * 2 * hs * hs  # MTP e_proj / h_proj
+    per_input_linear_flops = 6 * per_input_params * seq_len
+
+    # --- output head (and one head per MTP depth) ---
+    per_input_vocab_flops = 6 * vocab_size * hs * seq_len * (1 + mtp_layers)
+    return (per_input_attention_flops + per_input_linear_flops + per_input_vocab_flops) * gbs
+
+
 def _nemotronh_mlp_layer_flops(config, gbs, seq_len):
     """Model FLOPs for MLP layer. Assume gated linear unit."""
     return 6 * gbs * seq_len * config.hidden_size * config.intermediate_size * 3
@@ -1744,6 +1841,8 @@ def get_flops_formula_for_hf_config(config: Any) -> Callable | None:
         "ElectraConfig": bert_flops,
         # DeepSeek V3 / V3.2
         "DeepseekV3Config": deepseekv3_flops,
+        # DeepSeek V4 (shared-KV MQA, hybrid CSA/HCA attention, mHC); NeMo Automodel and transformers configs
+        "DeepseekV4Config": deepseekv4_flops,
         # GPT-OSS
         "GptOssConfig": gpt_oss_flops,
         # GLM family
