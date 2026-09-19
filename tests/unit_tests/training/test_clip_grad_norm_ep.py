@@ -36,6 +36,7 @@ affordable for the CPU unit-test budget.
 """
 
 import time
+from contextlib import contextmanager
 
 import pytest
 import torch
@@ -200,6 +201,65 @@ def _scenario_torch_fast_path(rank: int) -> None:
     torch.testing.assert_close(torch.tensor(total_norm), torch.tensor(correct))
 
 
+@contextmanager
+def _fused_backend_forced():
+    """Take the fused branch on CPU, with the module's own reference reductions.
+
+    The kernel is CUDA-only, so forcing the branch means swapping the two kernel
+    entry points as well. The branch under test, and the reduction that follows
+    it, are the real ones.
+    """
+    from nemo_automodel.components.training import utils as training_utils
+    from nemo_automodel.components.training.triton import grad_norm
+
+    originals = (
+        training_utils.HAVE_FUSED_GRAD_NORM,
+        training_utils.multi_tensor_sumsq,
+        training_utils.multi_tensor_absmax,
+    )
+    training_utils.HAVE_FUSED_GRAD_NORM = True
+    training_utils.multi_tensor_sumsq = grad_norm.sumsq_reference
+    training_utils.multi_tensor_absmax = grad_norm.absmax_reference
+    try:
+        yield
+    finally:
+        (
+            training_utils.HAVE_FUSED_GRAD_NORM,
+            training_utils.multi_tensor_sumsq,
+            training_utils.multi_tensor_absmax,
+        ) = originals
+
+
+def _scenario_rank_without_expert_grads_fused(rank: int) -> None:
+    """A rank with no expert grads must resolve the fused branch like its peers.
+
+    The fused branch issues one collective and the fallback issues two, so a
+    selector that answered from this rank's gradients would give the empty rank
+    a different answer than a peer holding CPU gradients, and the two would
+    mismatch and hang rather than fail.
+    """
+    dp_mesh = init_device_mesh("cpu", (_WORLD,), mesh_dim_names=("dp_shard_cp",))
+    moe_mesh = init_device_mesh("cpu", (1, _WORLD), mesh_dim_names=("ep_shard", "ep"))
+
+    expert = nn.Parameter(torch.zeros(2, 8))
+    if rank == 0:
+        expert.grad = torch.full((2, 8), 10.0)
+    model = _expert_model(expert)
+    dense = _add_dense(model, dp_mesh)
+
+    from nemo_automodel.components.training import utils as training_utils
+
+    with _fused_backend_forced():
+        assert training_utils._use_fused_grad_norm(expert, 2.0) is False, (
+            "CPU parameters must not select the CUDA-only kernel"
+        )
+        total_norm = _clip(model, moe_mesh)
+
+    correct = (8 * _WORLD * 1.0 + 16 * 100.0) ** 0.5
+    torch.testing.assert_close(torch.tensor(total_norm), torch.tensor(correct))
+    torch.testing.assert_close(dense.grad.to_local(), torch.full((2, 4), MAX_NORM / (correct + 1e-6)))
+
+
 def _scenario_te_backend(rank: int) -> None:
     """The TE reducer must not bypass the EP reduction.
 
@@ -220,37 +280,15 @@ def _scenario_te_backend(rank: int) -> None:
 
 
 def _scenario_fused_backend(rank: int) -> None:
-    """The fused multi-tensor reducer must not bypass the EP reduction.
-
-    The kernel is CUDA-only, so the eligibility check and the two kernel entry
-    points are swapped for the module's own CPU reference reductions; the branch
-    under test, and the reduction that follows it, are the real ones.
-    """
-    from nemo_automodel.components.training import utils as training_utils
-    from nemo_automodel.components.training.triton import grad_norm
-
+    """The fused multi-tensor reducer must not bypass the EP reduction."""
     moe_mesh = init_device_mesh("cpu", (1, _WORLD), mesh_dim_names=("ep_shard", "ep"))
 
     expert = nn.Parameter(torch.zeros(2, 8))
     expert.grad = torch.full((2, 8), 10.0 if rank == 0 else 0.1)
     model = _expert_model(expert)
 
-    originals = (
-        training_utils._use_fused_grad_norm,
-        training_utils.multi_tensor_sumsq,
-        training_utils.multi_tensor_absmax,
-    )
-    training_utils._use_fused_grad_norm = lambda params, norm_type: True
-    training_utils.multi_tensor_sumsq = grad_norm.sumsq_reference
-    training_utils.multi_tensor_absmax = grad_norm.absmax_reference
-    try:
+    with _fused_backend_forced():
         total_norm = _clip(model, moe_mesh)
-    finally:
-        (
-            training_utils._use_fused_grad_norm,
-            training_utils.multi_tensor_sumsq,
-            training_utils.multi_tensor_absmax,
-        ) = originals
 
     correct = (16 * 100.0 + (_WORLD - 1) * 16 * 0.01) ** 0.5
     torch.testing.assert_close(torch.tensor(total_norm), torch.tensor(correct))
@@ -302,6 +340,7 @@ _SCENARIOS = (
     _scenario_plain_experts,
     _scenario_ep_shard_experts,
     _scenario_rank_without_expert_grads,
+    _scenario_rank_without_expert_grads_fused,
     _scenario_torch_fast_path,
     _scenario_te_backend,
     _scenario_fused_backend,

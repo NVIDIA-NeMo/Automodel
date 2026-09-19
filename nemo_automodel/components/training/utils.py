@@ -137,18 +137,30 @@ def count_tail_padding(labels, ignore_label=-100):
     return prod_mask.view(-1).sum().item()
 
 
-def _use_fused_grad_norm(params, norm_type: float) -> bool:
+def _use_fused_grad_norm(representative: torch.Tensor, norm_type: float) -> bool:
     """Whether the fused multi-tensor reduction applies to this group.
 
-    Only the 2-norm and inf-norm are implemented by the kernel, and the whole
-    group has to be CUDA -- a mixed CPU/CUDA group would silently take two
-    different reduction paths.
+    Only the 2-norm and inf-norm are implemented by the kernel, and the kernel
+    itself is CUDA-only (``_reduce`` routes anything else through its reference
+    reduction, so a non-CUDA group would pay the wrapper for nothing).
+
+    The choice is made from the group's representative parameter rather than
+    from this rank's gradients. The fused branch issues one collective where the
+    fallback issues two, so a group that resolved differently on two ranks would
+    mismatch their collectives and hang. Every rank holds the representative for
+    every group, including the ranks that contributed no gradients this step, so
+    deriving the choice from it keeps the decision identical everywhere.
+
+    Args:
+        representative: The group's representative parameter, equal in device and
+            layout across ranks by construction.
+        norm_type: Norm exponent, including ``inf``.
     """
     if not HAVE_FUSED_GRAD_NORM:
         return False
     if not (math.isinf(norm_type) or norm_type == 2.0):
         return False
-    return all(p.grad is not None and p.grad.is_cuda for p in params)
+    return representative.is_cuda
 
 
 def _local_te_l2_norm(gradients: list[torch.Tensor], target_device: torch.device) -> torch.Tensor:
@@ -351,7 +363,7 @@ def _clip_grad_norm_impl(
         # Fused path: one kernel launch per dtype instead of ~7 per parameter.
         # Restricted to the 2- and inf-norms, the only orders the kernel
         # implements; anything else falls through to the loops below.
-        if grad_norm_backend == "triton" and _use_fused_grad_norm(group_params, norm_type):
+        if grad_norm_backend == "triton" and _use_fused_grad_norm(representative, norm_type):
             locals_ = []
             for p in group_params:
                 g = p.grad
