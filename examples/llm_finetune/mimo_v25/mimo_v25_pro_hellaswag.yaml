@@ -133,3 +133,9 @@ wandb:
   project: automodel-mimo-v25-pro
   name: mimo_v25_pro_hellaswag_16n
   mode: online
+
+ci:
+  recipe_owner: Simar-malhotra09
+  # pp_size(4) * ep_size(32) = 128 GPUs => 16 nodes (8 H100/node).
+  nodes: 16
+  time: "00:15:00"
