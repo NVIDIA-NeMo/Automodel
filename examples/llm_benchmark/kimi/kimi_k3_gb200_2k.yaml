@@ -20,16 +20,17 @@
 # summary = mean over the 9 iterations after 3 warm-up iterations; same Slurm
 # job as this file without gc_every_steps, which measured 578.7 tok/s/GPU at
 # 56.6 s/iteration with a 1.7% iteration-time spread):
-# 627.3 tok/s/GPU at 52.2 s/iteration (0.1% spread), Average MFU 17.5% on the
-# recipe's config-derived FLOPs basis (17.4% on tok/s/GPU * 6 * 104e9 /
-# 2.25e15, this file's peak_tflops; 15.7% on the 2.5e15 GB200 bf16 dense
-# peak). Peak memory 150.2 GiB per GPU (34 GiB headroom on 184 GiB HBM). Run
+# 627.3 tok/s/GPU at 52.2 s/iteration (0.1% spread), Average MFU 15.8% on the
+# recipe's config-derived FLOPs basis against the 2.5 PF GB200 BF16 dense peak
+# (the run printed 17.5% with the earlier 2.25 PF setting; 15.8% is that figure
+# rescaled to the corrected peak; 15.7% on tok/s/GPU * 6 * 104e9 / 2.5e15).
+# Peak memory 150.2 GiB per GPU (34 GiB headroom on 184 GiB HBM). Run
 # the file through nemo_automodel/recipes/llm/benchmark.py --config <this file>
 # for the recipe's own per-iteration MFU and Average MFU summary.
 #
-# Why 2k rows beat the 1k config (kimi_k3_gb200.yaml: 392.4 tok/s/GPU, 10.9%
-# on the 2026-09-04 tree, when this file measured 538.8) by 37% / 4.2pp: at
-# this scale the workload is launch-bound, so doubling
+# Why 2k rows beat the 1k config (kimi_k3_gb200.yaml: 392.4 tok/s/GPU, 9.8%
+# on the 2026-09-04 tree, when this file measured 538.8 = 13.5%) by 37% / 3.7pp
+# on the 2.5 PF basis: at this scale the workload is launch-bound, so doubling
 # tokens per row halves the per-token kernel-launch tax, and K3's KDA linear
 # attention does not penalize longer rows. The PP bubble at this point is 9.9%
 # (64 microbatches).
@@ -51,7 +52,7 @@ recipe: BenchmarkingRecipeForNextTokenPrediction
 
 benchmark:
   warmup_steps: 3
-  peak_tflops: 2250   # GB200 bf16 dense peak
+  peak_tflops: 2500   # GB200 BF16 dense peak (NVL72: 180 PF dense / 72 GPUs), same as the other GB200 configs
   nsys_start: -1
   nsys_end: -1
   nsys_ranks: []

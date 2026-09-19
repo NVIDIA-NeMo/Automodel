@@ -103,6 +103,22 @@ def test_generate_gpt_oss_120b_benchmark_job_uses_ep64_without_activation_checkp
     assert recipe["distributed"]["activation_checkpointing"] is False
 
 
+@pytest.mark.parametrize(
+    ("config_path", "activation_checkpointing"),
+    [
+        ("examples/llm_benchmark/gpt_oss/gptoss_20b_te_deepep.yaml", None),
+        ("examples/llm_benchmark/gpt_oss/gptoss_120b_te_deepep_gb200.yaml", True),
+    ],
+)
+def test_gpt_oss_oom_benchmark_configs_use_fused_loss(config_path, activation_checkpointing):
+    recipe = YAML(typ="safe").load(Path(config_path))
+
+    assert recipe["model"]["output_hidden_states"] is True
+    assert recipe["loss_fn"]["_target_"] == ("nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy")
+    if activation_checkpointing is not None:
+        assert recipe["distributed"]["activation_checkpointing"] is activation_checkpointing
+
+
 def test_generate_vllm_deploy_time_override(tmp_path):
     config = Path("model_peft.yaml")
     (tmp_path / config).write_text(

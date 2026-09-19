@@ -26,10 +26,11 @@ from unittest.mock import MagicMock, call, patch
 import numpy as np
 import pytest
 import torch
+import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 import yaml
 from safetensors.torch import load_file, save_file
-from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.tensor import Replicate, Shard, distribute_tensor
 from torch.nn.parallel import DistributedDataParallel
 
@@ -80,6 +81,7 @@ from nemo_automodel.components.checkpoint.utils import (
     materialize_missing_tied_lm_head,
 )
 from nemo_automodel.components.models.gemma4_moe.state_dict_adapter import Gemma4MoEStateDictAdapter
+from nemo_automodel.components.models.gpt_oss.state_dict_adapter import GPTOSSStateDictAdapter
 from nemo_automodel.components.models.mistral3.state_dict_adapter import Mistral3FP8StateDictAdapter
 from nemo_automodel.components.training.rng import RNGState, StatefulRNG, init_all_rng
 
@@ -2193,6 +2195,79 @@ class TestLoadModelCustomModelGuard:
         assert dcp_load.call_count == 2  # shared tensors and one bounded decoder-layer group
         for key, expected in expected_state.items():
             torch.testing.assert_close(model.state_dict()[key], expected)
+
+    def test_gpt_oss_mxfp4_checkpoint_loads_without_full_cpu_state(self, tmp_path):
+        """The one-GPU GPT-OSS path must decode packed experts into persistent model tensors."""
+
+        class LinearWithExtraState(torch.nn.Linear):
+            def get_extra_state(self) -> torch.Tensor:
+                """Return backend bookkeeping that is not present in the HF checkpoint."""
+                return torch.empty(0, dtype=torch.uint8)
+
+        CustomModel = type("CustomModel", (torch.nn.Module,), {})
+        CustomModel.__module__ = "nemo_automodel.components.models.gpt_oss.model"
+        model = CustomModel()
+        model.model = torch.nn.Module()
+        model.model.embed_tokens = torch.nn.Embedding(4, 4, dtype=torch.bfloat16)
+        model.model.layers = torch.nn.ModuleList()
+        layer = torch.nn.Module()
+        layer.self_attn = torch.nn.Module()
+        layer.self_attn.q_proj = LinearWithExtraState(4, 4, bias=False, dtype=torch.bfloat16)
+        layer.mlp = torch.nn.Module()
+        layer.mlp.gate = torch.nn.Linear(4, 2, bias=False, dtype=torch.bfloat16)
+        layer.mlp.experts = torch.nn.Module()
+        layer.mlp.experts.gate_and_up_projs = torch.nn.Parameter(torch.zeros(1, 32, 64, dtype=torch.bfloat16))
+        layer.mlp.experts.down_projs = torch.nn.Parameter(torch.zeros(1, 32, 64, dtype=torch.bfloat16))
+        model.model.layers.append(layer)
+        model.config = SimpleNamespace(
+            tie_word_embeddings=False,
+            num_hidden_layers=1,
+            quantization_config={"quant_method": "mxfp4"},
+        )
+        model.state_dict_adapter = GPTOSSStateDictAdapter(
+            config=model.config,
+            moe_config=SimpleNamespace(),
+            backend=SimpleNamespace(attn="flex"),
+        )
+
+        checkpoint_state = {}
+        for model_key, target in model.state_dict().items():
+            if model_key.endswith("_extra_state"):
+                continue
+            hf_key = model.state_dict_adapter._model_to_hf_key(model_key)
+            if model_key.endswith(("gate_and_up_projs", "down_projs")):
+                n_experts, input_features, output_features = target.shape
+                checkpoint_state[f"{hf_key}_blocks"] = torch.full(
+                    (n_experts, output_features, input_features // 32, 16), 0x12, dtype=torch.uint8
+                )
+                checkpoint_state[f"{hf_key}_scales"] = torch.full(
+                    (n_experts, output_features, input_features // 32), 127, dtype=torch.uint8
+                )
+            else:
+                checkpoint_state[hf_key] = torch.full_like(target, 3)
+
+        model_path = tmp_path / "model"
+        model_path.mkdir()
+        save_file(checkpoint_state, model_path / "model.safetensors")
+        checkpointer = self._make_checkpointer()
+
+        with (
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._load_hf_checkpoint_preserving_dtype"
+            ) as full_cpu_load,
+            patch("nemo_automodel.components.checkpoint.checkpointing.dcp.load", wraps=dcp.load) as dcp_load,
+        ):
+            checkpointer.load_model(model, model_path=str(model_path), is_init_step=True)
+
+        full_cpu_load.assert_not_called()
+        assert dcp_load.call_count == 2  # direct tensors and one MXFP4 decoder-layer group
+        expected_expert = torch.tensor([1.0, 0.5] * 16, dtype=torch.bfloat16).view(1, 32, 1).expand(1, 32, 64)
+        loaded_state = model.state_dict()
+        torch.testing.assert_close(loaded_state["model.layers.0.mlp.experts.gate_and_up_projs"], expected_expert)
+        torch.testing.assert_close(loaded_state["model.layers.0.mlp.experts.down_projs"], expected_expert)
+        torch.testing.assert_close(
+            loaded_state["model.layers.0.mlp.gate.weight"], torch.full((2, 4), 3, dtype=torch.bfloat16)
+        )
 
 
 class TestLoadModelCheckpointKeySubset:
@@ -4776,3 +4851,73 @@ class TestSyncAsyncSave:
 
         mock_dcp.async_save.assert_called_once()
         mock_dcp.save.assert_not_called()
+
+
+class TestInitializeModelWeightsPaddingIdxDTensor:
+    """Embeddings with padding_idx that are already DTensors must still be initialized.
+
+    #1675 put ``has_padding_idx`` into the skip list to avoid HF's DTensor-unsafe
+    ``weight[padding_idx] = 0``; that skipped the whole random init, so from_config
+    models built with ``nn.Embedding(..., padding_idx)`` (Kimi-K3, Kimi Linear, ...)
+    kept the uninitialized memory ``to_empty()`` handed out. The fix clears
+    padding_idx around ``initialize_weights()`` and zeroes the row on the local shard.
+    """
+
+    @pytest.fixture
+    def single_rank_pg(self):
+        if dist.is_initialized():
+            pytest.skip("a process group is already initialized")
+        dist.init_process_group("gloo", rank=0, world_size=1, store=dist.HashStore())
+        yield
+        dist.destroy_process_group()
+
+    @staticmethod
+    def _model(dtensor: bool = True):
+        class _Model(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embed = torch.nn.Embedding(8, 4, padding_idx=2)
+                self.config = SimpleNamespace(architectures=["FakeForCausalLM"])
+                self.padding_idx_seen_by_init = "unset"
+
+            def initialize_weights(self):
+                # HF's _init_weights would run ``weight[padding_idx] = 0`` here when padding_idx is set.
+                self.padding_idx_seen_by_init = self.embed.padding_idx
+                with torch.no_grad():
+                    self.embed.weight.fill_(1.0)
+
+        model = _Model()
+        if dtensor:
+            mesh = init_device_mesh("cpu", (1,))
+            model.embed.weight = torch.nn.Parameter(distribute_tensor(model.embed.weight.detach(), mesh, [Shard(0)]))
+        return model
+
+    def test_dtensor_embedding_is_initialized_and_padding_row_zeroed(self, single_rank_pg):
+        model = self._model()
+
+        Checkpointer.initialize_model_weights(model, torch.device("cpu"))
+
+        assert model.padding_idx_seen_by_init is None  # HF's indexing op was skipped
+        assert model.embed.padding_idx == 2  # and the attribute restored
+        full = model.embed.weight.full_tensor()
+        assert torch.all(full[2] == 0)
+        assert torch.all(full[[0, 1, 3, 4, 5, 6, 7]] == 1)
+
+    def test_padding_idx_restored_when_initialize_weights_raises(self, single_rank_pg):
+        model = self._model()
+
+        def boom(*_args, **_kwargs):
+            raise RuntimeError("init failed")
+
+        model.initialize_weights = boom
+        with pytest.raises(RuntimeError, match="init failed"):
+            Checkpointer.initialize_model_weights(model, torch.device("cpu"))
+        assert model.embed.padding_idx == 2
+
+    def test_plain_embedding_keeps_padding_idx_during_init(self):
+        model = self._model(dtensor=False)
+
+        Checkpointer.initialize_model_weights(model, torch.device("cpu"))
+
+        assert model.padding_idx_seen_by_init == 2  # regular tensors: HF's own zeroing path is fine
+        assert torch.all(model.embed.weight == 1)
