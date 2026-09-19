@@ -158,6 +158,34 @@ def test_mac_requires_longterm_memory_tokens():
         _tiny_config(architecture_variant="mac", num_longterm_memory_tokens=0)
 
 
+@pytest.mark.parametrize("variant", ["mag", "mal"])
+def test_mag_and_mal_preserve_shape_gradient_and_causality(variant):
+    torch.manual_seed(11)
+    config = _tiny_config(
+        architecture_variant=variant,
+        num_persistent_memory_tokens=4,
+        mem_depth=2,
+        chunk_size=2,
+        memory_batch_size=12,
+    )
+    model = TitansForCausalLM(config).eval()
+    original = torch.randint(0, config.vocab_size, (1, 8))
+    changed = original.clone()
+    changed[:, 6:] = (changed[:, 6:] + 1) % config.vocab_size
+
+    original_logits = model(original).logits
+    changed_logits = model(changed).logits
+    original_logits.sum().backward()
+
+    assert original_logits.shape == (1, 8, config.vocab_size)
+    torch.testing.assert_close(original_logits[:, :6], changed_logits[:, :6], rtol=0, atol=0)
+    assert model.model.persistent_memory.grad is not None
+    assert model.model.layers[0].attention.q_proj.weight.grad is not None
+    if variant == "mag":
+        assert model.model.layers[0].memory_output_norm.weight.grad is not None
+        assert model.model.layers[0].attention_output_norm.weight.grad is not None
+
+
 # --------------------------------------------------------------------------- #
 # (c) Reduction check: Titans (eta=0) == Gated DeltaNet (fla)
 # --------------------------------------------------------------------------- #
@@ -500,6 +528,24 @@ def test_170m_mac_recipe_pins_public_reference_topology():
     assert sum(parameter.numel() for parameter in instantiated.parameters()) > 173_695_680
 
 
+@pytest.mark.parametrize("variant", ["mag", "mal"])
+def test_170m_mag_mal_recipes_pin_paper_window_and_token_batch(variant):
+    root = Path(__file__).parents[4]
+    recipe = yaml.safe_load(
+        (root / f"examples/llm_pretrain/titans_170m_{variant}.yaml").read_text()
+    )
+    model = recipe["model"]["config"]
+
+    assert model["architecture_variant"] == variant
+    assert model["num_persistent_memory_tokens"] == 128
+    assert model["chunk_size"] == 16
+    assert model["memory_batch_size"] == 2176
+    assert recipe["dataset"]["seq_len"] == 2048
+    assert recipe["step_scheduler"]["global_batch_size"] == 256
+    assert recipe["step_scheduler"]["global_batch_size"] * recipe["dataset"]["seq_len"] == 524_288
+    assert recipe["step_scheduler"]["max_steps"] == 28_610
+
+
 def test_lmm_recipe_distributed_section_supports_fsdp2_and_ddp():
     root = Path(__file__).parents[4]
     distributed = yaml.safe_load(
@@ -588,10 +634,13 @@ def test_blackwell_submitter_resolves_portable_topology():
     assert "titans_blackwell_lmm_full.sbatch" in data_runner
     assert "HF_TOKEN_QUOTED" in submitter
     assert "--full" in submitter
-    assert "baseline|mac|" in submitter
-    assert "titans_${TITANS_SCALE}_mac.yaml" in runner
+    assert "baseline|mac|mag|mal|" in submitter
+    assert "titans_${TITANS_SCALE}_${TITANS_EXPERIMENT}.yaml" in runner
     assert "WANDB_GROUP=mac-$TITANS_SCALE" in runner
     assert "[[ $TITANS_EXPERIMENT == mac ]] && DEFAULT_LOCAL_BATCH_SIZE=4" in runner
+    assert "mag|mal) GLOBAL_BATCH_SIZE=256" in runner
+    assert "WANDB_GROUP=mag-$TITANS_SCALE" in runner
+    assert "WANDB_GROUP=mal-$TITANS_SCALE" in runner
     for scale in ("170m", "340m", "760m"):
         assert scale in runner
 

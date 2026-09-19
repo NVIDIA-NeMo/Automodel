@@ -14,11 +14,15 @@ TITANS_GPUS_PER_NODE=${TITANS_GPUS_PER_NODE:?set TITANS_GPUS_PER_NODE}
 TITANS_IMAGE=${TITANS_IMAGE:-nvcr.io#nvidia/nemo-automodel:26.04}
 PILOT_STEPS=${TITANS_PILOT_STEPS:-10}
 WORLD_SIZE=$((SLURM_NNODES * TITANS_GPUS_PER_NODE))
-if (( 128 % WORLD_SIZE != 0 )); then
-  echo "global batch 128 must be divisible by world size $WORLD_SIZE" >&2
+case "$TITANS_EXPERIMENT" in
+  mag|mal) GLOBAL_BATCH_SIZE=256; SEQUENCE_LENGTH=2048 ;;
+  *) GLOBAL_BATCH_SIZE=128; SEQUENCE_LENGTH=4096 ;;
+esac
+if (( GLOBAL_BATCH_SIZE % WORLD_SIZE != 0 )); then
+  echo "global batch $GLOBAL_BATCH_SIZE must be divisible by world size $WORLD_SIZE" >&2
   exit 2
 fi
-MAX_LOCAL_BATCH_SIZE=$((128 / WORLD_SIZE))
+MAX_LOCAL_BATCH_SIZE=$((GLOBAL_BATCH_SIZE / WORLD_SIZE))
 
 case "$TITANS_SCALE" in
   170m|340m|760m) ;;
@@ -30,6 +34,7 @@ case "$TITANS_SCALE" in
   760m) DEFAULT_LOCAL_BATCH_SIZE=2 ;;
 esac
 [[ $TITANS_EXPERIMENT == mac ]] && DEFAULT_LOCAL_BATCH_SIZE=4
+[[ $TITANS_EXPERIMENT == mag || $TITANS_EXPERIMENT == mal ]] && DEFAULT_LOCAL_BATCH_SIZE=4
 (( DEFAULT_LOCAL_BATCH_SIZE > MAX_LOCAL_BATCH_SIZE )) && \
   DEFAULT_LOCAL_BATCH_SIZE=$MAX_LOCAL_BATCH_SIZE
 LOCAL_BATCH_SIZE=${TITANS_LOCAL_BATCH_SIZE:-$DEFAULT_LOCAL_BATCH_SIZE}
@@ -51,8 +56,8 @@ case "$DISTRIBUTED_STRATEGY" in
     ;;
   *) echo "unsupported distributed strategy: $DISTRIBUTED_STRATEGY" >&2; exit 2 ;;
 esac
-if (( LOCAL_BATCH_SIZE < 1 || 128 % (WORLD_SIZE * LOCAL_BATCH_SIZE) != 0 )); then
-  echo "local batch $LOCAL_BATCH_SIZE does not divide global batch 128 across $WORLD_SIZE ranks" >&2
+if (( LOCAL_BATCH_SIZE < 1 || GLOBAL_BATCH_SIZE % (WORLD_SIZE * LOCAL_BATCH_SIZE) != 0 )); then
+  echo "local batch $LOCAL_BATCH_SIZE does not divide global batch $GLOBAL_BATCH_SIZE across $WORLD_SIZE ranks" >&2
   exit 2
 fi
 echo "Blackwell tuning: strategy=$DISTRIBUTED_STRATEGY world_size=$WORLD_SIZE local_batch_size=$LOCAL_BATCH_SIZE activation_checkpointing=$ACTIVATION_CHECKPOINTING"
@@ -64,6 +69,7 @@ fi
 case "$TITANS_EXPERIMENT" in
   baseline) MODEL_OVERRIDES="" ;;
   mac) MODEL_OVERRIDES="" ;;
+  mag|mal) MODEL_OVERRIDES="" ;;
   no_persistent)
     MODEL_OVERRIDES="--model.config.num_persistent_memory_tokens=0 --model.config.memory_batch_size=4096"
     ;;
@@ -79,8 +85,8 @@ case "$TITANS_EXPERIMENT" in
   *) echo "unknown Titans experiment: $TITANS_EXPERIMENT" >&2; exit 2 ;;
 esac
 
-if [[ $TITANS_EXPERIMENT == mac ]]; then
-  RECIPE=examples/llm_pretrain/titans_${TITANS_SCALE}_mac.yaml
+if [[ $TITANS_EXPERIMENT == mac || $TITANS_EXPERIMENT == mag || $TITANS_EXPERIMENT == mal ]]; then
+  RECIPE=examples/llm_pretrain/titans_${TITANS_SCALE}_${TITANS_EXPERIMENT}.yaml
 else
   RECIPE=examples/llm_pretrain/titans_${TITANS_SCALE}_lmm.yaml
 fi
@@ -95,6 +101,8 @@ CHECKPOINT_ROOT=$TITANS_WORK_ROOT/outputs/$RUN_NAME-$SLURM_JOB_ID
 case "$TITANS_EXPERIMENT" in
   baseline) WANDB_GROUP=lmm-$TITANS_SCALE ;;
   mac) WANDB_GROUP=mac-$TITANS_SCALE ;;
+  mag) WANDB_GROUP=mag-$TITANS_SCALE ;;
+  mal) WANDB_GROUP=mal-$TITANS_SCALE ;;
   *) WANDB_GROUP=ablations-170m ;;
 esac
 
@@ -145,7 +153,7 @@ srun \
     test -s '$TRAIN_INDEX'
     python tools/make_titans_smoke_data.py \
       --output-dir '$VALIDATION_ROOT' \
-      --seq-len 4096 \
+      --seq-len '$SEQUENCE_LENGTH' \
       --train-documents 16 \
       --validation-documents 16 \
       --vocab-size 32000

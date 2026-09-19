@@ -67,8 +67,10 @@ class TitansConfig(PretrainedConfig):
         memory_batch_size: Number of tokens sharing one deep-memory gradient
             anchor for the ``"titans_pytorch"`` backend. Must be divisible by
             ``chunk_size``. ``None`` uses the full input sequence.
-        architecture_variant: ``"lmm"`` for neural memory as the token mixer or
-            ``"mac"`` for the public Memory-as-Context topology.
+        architecture_variant: ``"lmm"`` for neural memory as the token mixer,
+            ``"mac"`` for the public Memory-as-Context topology, ``"mag"`` for
+            parallel gated memory/attention, or ``"mal"`` for sequential
+            memory-then-attention layers.
         attention_segment_size: Number of ordinary tokens in each MAC local
             attention segment.
         num_longterm_memory_tokens: Learned MAC tokens appended to each segment
@@ -157,9 +159,10 @@ class TitansConfig(PretrainedConfig):
                 "TitansConfig: deep_memory_backend must be 'reference' or 'titans_pytorch'; "
                 f"got {deep_memory_backend!r}."
             )
-        if architecture_variant not in {"lmm", "mac"}:
+        if architecture_variant not in {"lmm", "mac", "mag", "mal"}:
             raise ValueError(
-                "TitansConfig: architecture_variant must be 'lmm' or 'mac'; "
+                "TitansConfig: architecture_variant must be one of "
+                "'lmm', 'mac', 'mag', or 'mal'; "
                 f"got {architecture_variant!r}."
             )
         if attention_segment_size <= 0:

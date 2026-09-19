@@ -33,7 +33,13 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.titans.config import TitansConfig
-from nemo_automodel.components.models.titans.layers import TitansBlock, TitansMACBlock, TitansRMSNorm
+from nemo_automodel.components.models.titans.layers import (
+    TitansBlock,
+    TitansMACBlock,
+    TitansMAGBlock,
+    TitansMALBlock,
+    TitansRMSNorm,
+)
 from nemo_automodel.components.models.titans.state_dict_adapter import TitansStateDictAdapter
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
@@ -44,7 +50,7 @@ class TitansPreTrainedModel(PreTrainedModel):
     config_class = TitansConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
-    _no_split_modules = ["TitansBlock", "TitansMACBlock"]
+    _no_split_modules = ["TitansBlock", "TitansMACBlock", "TitansMAGBlock", "TitansMALBlock"]
     # A_log / dt_bias are exponentiated in the decay gate; keep them fp32 under
     # any mixed-precision sharding (see layers.NeuralMemory and state_dict_adapter).
     _keep_in_fp32_modules = ["A_log", "dt_bias"]
@@ -69,7 +75,7 @@ class TitansModel(TitansPreTrainedModel):
         super().__init__(config)
         dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, dtype=dtype)
-        if config.architecture_variant == "lmm" and config.num_persistent_memory_tokens:
+        if config.architecture_variant != "mac" and config.num_persistent_memory_tokens:
             self.persistent_memory = nn.Parameter(
                 torch.empty(config.num_persistent_memory_tokens, config.hidden_size, dtype=dtype)
             )
@@ -81,7 +87,11 @@ class TitansModel(TitansPreTrainedModel):
             nn.init.trunc_normal_(self.longterm_memory, mean=0.0, std=config.initializer_range)
             block_cls = TitansMACBlock
         else:
-            block_cls = TitansBlock
+            block_cls = {
+                "lmm": TitansBlock,
+                "mag": TitansMAGBlock,
+                "mal": TitansMALBlock,
+            }[config.architecture_variant]
         self.layers = nn.ModuleList([block_cls(config, dtype=dtype) for _ in range(config.num_hidden_layers)])
         self.norm = TitansRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.gradient_checkpointing = False
@@ -111,7 +121,7 @@ class TitansModel(TitansPreTrainedModel):
         h = inputs_embeds if inputs_embeds is not None else self.embed_tokens(input_ids)
         persistent_length = (
             self.config.num_persistent_memory_tokens
-            if self.config.architecture_variant == "lmm"
+            if self.config.architecture_variant != "mac"
             else 0
         )
         if self.config.architecture_variant == "mac":

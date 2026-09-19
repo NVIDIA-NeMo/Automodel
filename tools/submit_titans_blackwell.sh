@@ -6,7 +6,7 @@ set -euo pipefail
 if (( $# < 2 )); then
   echo "usage: $0 SCALE VARIANT (--pilot|--full) [--total-gpus 8|16]" >&2
   echo "       SCALE: 170m | 340m | 760m" >&2
-  echo "       VARIANT: baseline | mac | a 170M component ablation" >&2
+  echo "       VARIANT: baseline | mac | mag | mal | a 170M component ablation" >&2
   exit 2
 fi
 
@@ -32,7 +32,7 @@ done
 
 case "$SCALE" in 170m|340m|760m) ;; *) echo "unsupported scale: $SCALE" >&2; exit 2 ;; esac
 case "$VARIANT" in
-  baseline|mac|no_persistent|no_convolution|no_momentum|no_weight_decay|depth3|depth4|linear_memory) ;;
+  baseline|mac|mag|mal|no_persistent|no_convolution|no_momentum|no_weight_decay|depth3|depth4|linear_memory) ;;
   *) echo "unknown variant: $VARIANT" >&2; exit 2 ;;
 esac
 if (( MODE_COUNT != 1 )); then

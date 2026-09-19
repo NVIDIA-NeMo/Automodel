@@ -96,6 +96,21 @@ TITANS_PILOT_STEPS=100 \
   tools/submit_titans_blackwell.sh 170m mac --pilot --total-gpus 8
 ```
 
+MAG and MAL follow the proceedings more directly:
+
+- both use the paper's 2,048-token attention/training window, 128 persistent
+  tokens, and a 256-sequence global batch so every optimizer step still
+  contains 524,288 ordinary tokens;
+- MAG evaluates attention and neural memory in parallel, RMS-normalizes both
+  outputs with learned vector scales, applies SiLU, and multiplies the branches
+  before the residual connection;
+- MAL applies neural memory and causal attention sequentially before the
+  feed-forward sublayer.
+
+The paper leaves MAG's exact nonlinear gate unspecified, so the normalized
+SiLU product is an explicit operational choice. MAG/MAL runs remain
+implementation-validation experiments until downstream behavior is checked.
+
 ## Acceptance gates
 
 A full-scale run may start only after:
