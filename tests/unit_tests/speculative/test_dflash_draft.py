@@ -18,14 +18,17 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
+from nemo_automodel.components.speculative.dflash import draft_qwen3
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import (
     Qwen3DFlashDraftModel,
     _sliding_window_mask,
     build_target_layer_ids,
     extract_context_feature,
+    forward_target_with_context_feature,
 )
 
 
@@ -47,6 +50,59 @@ def test_extract_context_feature_uses_offset_one():
     # first 3 features come from hidden_states[2], next 3 from hidden_states[4]
     assert torch.allclose(out[..., :3], torch.full((1, 2, 3), 2.0))
     assert torch.allclose(out[..., 3:], torch.full((1, 2, 3), 4.0))
+
+
+def test_extract_context_feature_rejects_post_norm_final_entry():
+    hs = [torch.full((1, 2, 3), float(i)) for i in range(6)]
+
+    with pytest.raises(ValueError, match="cannot be recovered pre-norm"):
+        extract_context_feature(hs, [4])
+
+
+class _AddConstant(torch.nn.Module):
+    """Test layer that makes block and final-norm outputs distinguishable."""
+
+    def __init__(self, value: float) -> None:
+        super().__init__()
+        self.value = value
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        """Add the configured scalar without changing tensor layout.
+
+        Args:
+            inputs: Tensor with arbitrary shape.
+
+        Returns:
+            Tensor with the same shape as ``inputs``.
+        """
+        return inputs + self.value
+
+
+def test_forward_target_with_context_feature_captures_final_block_before_model_norm():
+    cfg = _draft_cfg()
+    target = _ConstantTarget(cfg, forced_token_id=1)
+    target.model.layers = torch.nn.ModuleList([_AddConstant(float(i + 1)) for i in range(target.num_layers)])
+    target.model.norm = _AddConstant(10.0)
+    input_ids = torch.tensor([[1, 2, 3]])
+
+    output, feature = forward_target_with_context_feature(target, input_ids, [target.num_layers - 1])
+
+    expected = target.model.embed_tokens(input_ids)
+    for i in range(target.num_layers):
+        expected = expected + float(i + 1)
+    assert torch.equal(feature, expected)
+    assert torch.equal(output.final_hidden_state, target.model.norm(expected))
+
+
+def test_forward_target_with_context_feature_rejects_invalid_id_without_leaking_hook():
+    cfg = _draft_cfg()
+    target = _ConstantTarget(cfg, forced_token_id=1)
+    first_layer = target.model.layers[0]
+
+    with pytest.raises(ValueError, match="out of bounds"):
+        forward_target_with_context_feature(target, torch.tensor([[1]]), [0, target.num_layers])
+
+    assert not first_layer._forward_hooks
 
 
 def _draft_cfg(bs=4):
@@ -130,6 +186,52 @@ def test_draft_forward_output_shape():
     assert torch.isfinite(out).all()
 
 
+def test_flex_attention_forces_regular_kernel_for_short_dynamic_queries(monkeypatch):
+    cfg = _draft_cfg()
+    cfg._attn_implementation = "flex_attention"
+    captured_options = []
+
+    def fake_flex_attention(_module, query, _key, _value, _mask, **kwargs):
+        """Record kernel options while preserving the attention output contract.
+
+        Args:
+            _module: Attention module (unused by this test double).
+            query: Tensor of shape ``[batch, heads, query, head_dim]``.
+            _key: Tensor of shape ``[batch, heads, key_value, head_dim]``.
+            _value: Tensor of shape ``[batch, heads, key_value, head_dim]``.
+            _mask: Flex-attention block mask, or ``None``.
+            **kwargs: Attention options, including ``kernel_options``.
+
+        Returns:
+            Attention output tensor of shape ``[batch, query, heads, head_dim]``
+            and ``None`` for attention weights.
+        """
+        captured_options.append(kwargs["kernel_options"])
+        return query.transpose(1, 2), None
+
+    monkeypatch.setattr(
+        draft_qwen3,
+        "ALL_ATTENTION_FUNCTIONS",
+        {"flex_attention": fake_flex_attention},
+    )
+    draft = Qwen3DFlashDraftModel(cfg)
+    batch, context, query = 2, 10, 12
+    noise = torch.randn(batch, query, cfg.hidden_size)
+    target_hidden = torch.randn(batch, context, len(cfg.dflash_config["target_layer_ids"]) * cfg.hidden_size)
+    position_ids = torch.arange(context + query).unsqueeze(0).expand(batch, -1)
+
+    output = draft(
+        position_ids=position_ids,
+        attention_mask=None,
+        noise_embedding=noise,
+        target_hidden=target_hidden,
+    )
+
+    assert output.shape == noise.shape
+    assert len(captured_options) == cfg.num_hidden_layers
+    assert all(options["FORCE_USE_FLEX_ATTENTION"] for options in captured_options)
+
+
 class _ConstantTarget(torch.nn.Module):
     """Minimal stand-in for the verifier: always samples ``forced_token_id``.
 
@@ -141,6 +243,8 @@ class _ConstantTarget(torch.nn.Module):
         super().__init__()
         self.model = torch.nn.Module()
         self.model.embed_tokens = torch.nn.Embedding(cfg.vocab_size, cfg.hidden_size)
+        self.model.layers = torch.nn.ModuleList([torch.nn.Identity() for _ in range(cfg.num_target_layers)])
+        self.model.norm = torch.nn.Identity()
         self.lm_head = torch.nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
         self.num_layers = cfg.num_target_layers
         self.vocab_size = cfg.vocab_size
@@ -157,10 +261,13 @@ class _ConstantTarget(torch.nn.Module):
         output_hidden_states=False,
     ):
         hidden = self.model.embed_tokens(input_ids)
+        for layer in self.model.layers:
+            hidden = layer(hidden)
+        final_hidden = self.model.norm(hidden)
         keep = input_ids.shape[1] if logits_to_keep is None else logits_to_keep
         logits = torch.zeros(input_ids.shape[0], keep, self.vocab_size)
         logits[..., self.forced_token_id] = 1.0
-        return SimpleNamespace(logits=logits, hidden_states=[hidden] * (self.num_layers + 1))
+        return SimpleNamespace(logits=logits, final_hidden_state=final_hidden)
 
 
 def test_spec_generate_keeps_generated_tokens_equal_to_the_mask_id():

@@ -108,9 +108,10 @@ def test_build_trainer_module_is_domino():
         get_output_embeddings=lambda: torch.nn.Linear(HIDDEN, VOCAB, bias=False),
         get_input_embeddings=lambda: torch.nn.Embedding(VOCAB, HIDDEN),
     )
-    module = recipe._build_trainer_module("sdpa", {"num_anchors": 7, "loss_decay_gamma": 5.0})
+    module = recipe._build_trainer_module("sdpa", {"num_anchors": 7, "max_total_anchors": 11, "loss_decay_gamma": 5.0})
     assert isinstance(module, DominoTrainerModule)
     assert module.num_anchors == 7
+    assert module.max_total_anchors == 11
     assert module.loss_decay_gamma == 5.0
     assert module.shift_label is True
 
