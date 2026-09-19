@@ -126,6 +126,7 @@ class _DeepepManager(_DispatchManager):
         num_local_experts: int | None = None,
         router_dtype: str | None = None,
         moe_router_expert_pad_multiple: int | None = None,
+        sync_free: bool = False,
         _dispatch_fn=None,
         _combine_fn=None,
     ):
@@ -137,6 +138,7 @@ class _DeepepManager(_DispatchManager):
         self.num_local_experts = num_local_experts
         self.router_dtype = router_dtype
         self.moe_router_expert_pad_multiple = moe_router_expert_pad_multiple
+        self.sync_free = sync_free
 
         # Metadata
         self.token_indices: torch.Tensor | None = None
@@ -182,6 +184,12 @@ class _DeepepManager(_DispatchManager):
                 # TODO: remove this
                 pass
             self.token_probs = self.token_probs.float()  # downcast or upcast
+        dispatch_kwargs = {
+            "async_finish": async_finish,
+            "allocate_on_comm_stream": allocate_on_comm_stream,
+        }
+        if self.sync_free:
+            dispatch_kwargs["sync_free"] = True
         (
             hidden_states,
             dispatched_indices,
@@ -194,8 +202,7 @@ class _DeepepManager(_DispatchManager):
             self.token_probs,
             self.num_experts,
             self.group,
-            async_finish=async_finish,
-            allocate_on_comm_stream=allocate_on_comm_stream,
+            **dispatch_kwargs,
         )
         self.handle = handle
         self.tokens_per_expert = num_tokens_per_expert
@@ -271,6 +278,11 @@ class _DeepepManager(_DispatchManager):
         - Convert routing map and probabilities to multihot format
         - Permute tokens using fused kernel
         """
+        if self.sync_free:
+            if self.router_dtype == "fp64":
+                self.dispatched_probs = self.dispatched_probs.to(torch.float64)
+            return hidden_states, self.dispatched_probs
+
         if self.permute_fusion:
             self.dispatched_routing_map, self.dispatched_probs = fused_indices_to_multihot(
                 self.dispatched_indices,
@@ -312,6 +324,9 @@ class _DeepepManager(_DispatchManager):
         """
         Restore the hidden states to their original ordering before expert processing
         """
+        if self.sync_free:
+            return hidden_states
+
         hidden_states = unpermute(
             hidden_states,
             self.reversed_mapping_for_combine,
@@ -597,6 +612,9 @@ class TokenDispatcherConfig:
     moe_deepep_async_dispatch: bool = False
     """Use asynchronous DeepEP/UCCL-EP dispatch/combine and communication-stream allocations."""
 
+    moe_deepep_sync_free: bool = False
+    """Use DeepEP V2 expanded dispatch without per-dispatch CPU synchronization."""
+
     moe_benchmark_static_routing: bool = False
     """Benchmark-only (mirrors BackendConfig.benchmark_static_routing, validated there):
     routing is forced-balanced with no noise, so every dispatch permutes the same token
@@ -681,6 +699,7 @@ class MoEFlexTokenDispatcher:
                         num_local_experts=self.num_local_experts,
                         router_dtype=self.config.moe_router_dtype,
                         moe_router_expert_pad_multiple=self.config.moe_router_expert_pad_multiple,
+                        sync_free=self.config.moe_deepep_sync_free,
                     )
                 self._comm_manager = MoEFlexTokenDispatcher.shared_deepep_manager
             else:
@@ -693,8 +712,32 @@ class MoEFlexTokenDispatcher:
                     num_local_experts=self.num_local_experts,
                     router_dtype=self.config.moe_router_dtype,
                     moe_router_expert_pad_multiple=self.config.moe_router_expert_pad_multiple,
+                    sync_free=self.config.moe_deepep_sync_free,
                 )
         elif backend == "hybridep":
+            # DeepEP V2 folds hierarchical communication into ElasticBuffer and no longer
+            # exports the separate HybridEPBuffer API. Keep the existing backend label as
+            # a compatibility alias when running against V2; legacy DeepEP installations
+            # continue through _HybridEPManager below.
+            if hybrid_ep_dispatch is None and fused_dispatch is not None:
+                manager_kwargs = dict(
+                    group=ep_group,
+                    router_topk=self.tp_size * self.config.moe_router_topk,
+                    permute_fusion=self.config.moe_permute_fusion,
+                    capacity_factor=self.config.moe_expert_capacity_factor,
+                    num_experts=self.tp_size * self.config.num_moe_experts,
+                    num_local_experts=self.num_local_experts,
+                    router_dtype=self.config.moe_router_dtype,
+                    moe_router_expert_pad_multiple=self.config.moe_router_expert_pad_multiple,
+                    sync_free=self.config.moe_deepep_sync_free,
+                )
+                if self.config.moe_share_token_dispatcher:
+                    if MoEFlexTokenDispatcher.shared_hybridep_manager is None:
+                        MoEFlexTokenDispatcher.shared_hybridep_manager = _DeepepManager(**manager_kwargs)
+                    self._comm_manager = MoEFlexTokenDispatcher.shared_hybridep_manager
+                else:
+                    self._comm_manager = _DeepepManager(**manager_kwargs)
+                return
             if self.config.moe_share_token_dispatcher:
                 if MoEFlexTokenDispatcher.shared_hybridep_manager is None:
                     MoEFlexTokenDispatcher.shared_hybridep_manager = _HybridEPManager(

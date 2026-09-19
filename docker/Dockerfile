@@ -113,11 +113,9 @@ RUN if [ "$INSTALL_TE" = "True" ]; then \
     cd ../ && rm -rf TransformerEngine; \
     fi
 
-# Install HybridEP / DeepEP: apt rdma-core v60 (build==runtime libibverbs), nvshmem wheel 3.6.5.
-# DEEPEP_COMMIT = 17cfb817 + DeepEP #638, padding max_num_of_tokens_per_rank to the combine-kernel chunk size.
-COPY docker/common/deepep.patch /opt/deepep.patch
-ARG DEEPEP_COMMIT=42144303752422ade37f24bca9e2dde12df70e09
-ENV HYBRID_EP_MULTINODE=1
+# Install DeepEP V2. ElasticBuffer uses NCCL GIN for hierarchical multi-node EP;
+# the source build still includes the legacy NVSHMEM backend.
+ARG DEEPEP_COMMIT=a56d6156febcd9976e55adc85b5155bfac9f28f8
 ENV RDMA_CORE_HOME=/opt/rdma-core/build
 ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64/:$LD_LIBRARY_PATH
 RUN apt-get update && apt-get install -y --allow-change-held-packages \
@@ -133,14 +131,11 @@ RUN apt-get update && apt-get install -y --allow-change-held-packages \
     cd DeepEP && \
     git fetch origin $DEEPEP_COMMIT && \
     git checkout FETCH_HEAD && \
-    patch -p1 < /opt/deepep.patch && \
-    pip install --no-cache-dir nvidia-nvshmem-cu13==3.6.5 && \
-    NVSHMEM_LIB_PATH=$(pip show nvidia-nvshmem-cu13 | grep "Location:" | cut -d' ' -f2)/nvidia/nvshmem/lib && \
-    ln -sf ${NVSHMEM_LIB_PATH}/libnvshmem_host.so.3 ${NVSHMEM_LIB_PATH}/libnvshmem_host.so && \
+    pip install --no-cache-dir nvidia-nvshmem-cu13==3.6.5 nvidia-nccl-cu13==2.30.7 && \
     apt-get update && apt-get install -y --no-install-recommends libnvidia-ml-dev && \
-    TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" pip install --no-cache-dir --no-build-isolation -v . && \
+    TORCH_CUDA_ARCH_LIST="9.0" pip install --no-cache-dir --no-build-isolation -v . && \
     apt-get purge -y libnvidia-ml-dev && apt-get autoremove -y && \
-    rm -rf /var/lib/apt/lists/* /opt/deepep.patch && \
+    rm -rf /var/lib/apt/lists/* && \
     cd / && rm -rf DeepEP
 
 # Install Bitsandbytes
