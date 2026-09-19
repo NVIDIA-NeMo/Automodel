@@ -1,0 +1,129 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# From-scratch pre-training of Moonlight-V4-16B-A3B (16.5B total / 3.0B active) on Megatron-format data.
+#
+#   automodel examples/scalable_ai/configs/pretrain_moonlight_v4_16b.yaml --nproc-per-node 8
+#
+# No checkpoint is loaded; the native DeepSeek-V4 implementation initialises everything from the config, including
+# the hash-routed first layer's token table (deterministic balanced assignment) and the mHC mixers. Preprocess data
+# with tools/preprocess_megatron_dataset.py using the tokenizer bundled in the model repo (Moonshot's, 163,840 rows).
+# Moonlight itself trained with Muon (Automodel: optimizer MuonConfig, needs the `dion` package); AdamW below uses
+# Moonlight's peak learning rate.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
+step_scheduler:
+  global_batch_size: 512
+  local_batch_size: 2
+  ckpt_every_steps: 500
+  val_every_steps: 100
+  num_epochs: 1
+  max_steps: 9500
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 10
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1111
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  config:
+    _target_: nemo_automodel.components.models.deepseek_v4.config.DeepseekV4Config.from_pretrained
+    pretrained_model_name_or_path: akoumpa/Moonlight-V4-16B-A3B
+    use_cache: false
+  trust_remote_code: false
+  load_base_model: false
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: tilelang       # Hopper-class GPUs; use 'eager' elsewhere (dense masked attention, same math at <= 4K tokens)
+    linear: torch
+    rms_norm: torch_fp32
+    rope_fusion: false
+    experts: torch_mm
+    dispatcher: deepep   # or hybridep / torch
+    gate_precision: float32
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: false
+    enable_fsdp_optimizations: true
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints/moonlight_v4_16b
+  model_save_format: torch_save
+  save_consolidated: false
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  dp_size: 8
+  ep_size: 8
+  moe:
+    reshard_after_forward: false
+    wrap_outer_model: false
+
+loss_fn:
+  # lm_head is kept in fp32 (as in the released V4 checkpoints); the fused linear cross-entropy requires one dtype.
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.megatron_dataset.MegatronPretraining
+  paths: /path/to/fineweb_edu/processed_data_*_text_document*  # REPLACE THIS
+  index_mapping_dir: /path/to/fineweb_edu/mapping_dir  # REPLACE THIS
+  tokenizer:
+    _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: akoumpa/Moonlight-V4-16B-A3B
+  seq_length: 4096   # DeepSeek-V4 pre-training starts at 4K (then 16K, 64K, 1M); the config carries V4's YaRN setup
+  split: "0.99, 0.01, 0.00"
+  splits_to_build: "train"
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: torch.utils.data.default_collate
+  dataloader_type: "single"
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.megatron_dataset.MegatronPretraining
+  paths: /path/to/fineweb_edu/processed_data_*_text_document*  # REPLACE THIS
+  index_mapping_dir: /path/to/fineweb_edu/mapping_dir  # REPLACE THIS
+  tokenizer:
+    _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: akoumpa/Moonlight-V4-16B-A3B
+  seq_length: 4096
+  split: "0.99, 0.01, 0.00"
+  splits_to_build: "validation"
+  num_val_samples: 1024
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: torch.utils.data.default_collate
+  dataloader_type: "single"
+
+optimizer:
+  _target_: torch.optim.AdamW
+  betas: [0.9, 0.95]
+  eps: 1e-8
+  lr: 4.2e-4
+  weight_decay: 0.1
+
+lr_scheduler:
+  lr_decay_style: cosine
+  lr_warmup_steps: 2000
+  min_lr: 4.2e-5

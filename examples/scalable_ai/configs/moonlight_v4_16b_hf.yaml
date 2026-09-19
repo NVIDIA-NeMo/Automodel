@@ -1,0 +1,99 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Baseline: stock transformers (>= 5.8) DeepseekV4ForCausalLM built from the Moonlight-V4-16B-A3B config, driven by
+# the same benchmark recipe as the NeMo Automodel configs.
+#
+#   torchrun --nproc-per-node 8 nemo_automodel/recipes/llm/benchmark.py --config examples/scalable_ai/configs/moonlight_v4_16b_hf.yaml
+#
+# Read before comparing numbers: the transformers DeepSeek-V4 implementation is inference-oriented. In training mode
+# (no KV cache) its Compressed Sparse Attention layers gather the per-query top-k entries into an `S x k` key axis
+# (memory grows with S^2 * k) and its compressed entries carry no causal mask. It is therefore only a fair baseline for
+# sliding-window layers: the lecture profiles use `--model.config.num_hidden_layers 2` (the schedule starts `[0, 0]`),
+# which the NeMo Automodel configs mirror. Attention is eager only (no FlashAttention for 512-dim heads, no SDPA with
+# sinks), and `num_hash_layers: 0` avoids the zero-initialised token table of a from-config hash layer.
+
+recipe: BenchmarkingRecipeForNextTokenPrediction
+
+seed: 1234
+
+benchmark:
+  warmup_steps: 10
+  peak_tflops: 989  # H100 dense BF16 peak
+  nsys_start: -1
+  nsys_end: -1
+  nsys_ranks: []
+  num_nodes: 1
+
+step_scheduler:
+  gc_every_steps: 10
+  global_batch_size: 256
+  local_batch_size: 1
+  ckpt_every_steps: 1000
+  val_every_steps: 1000
+  num_epochs: 1
+  max_steps: 30
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 1
+  sequence_parallel: false
+  activation_checkpointing: false
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 10
+
+model:
+  # Stock transformers implementation via Automodel's loader (`force_hf`), so dtype and meta-device init are handled
+  # like every other recipe. The config class is named explicitly: with nemo_automodel imported, AutoConfig resolves
+  # `deepseek_v4` to Automodel's own config class, which the transformers model cannot consume.
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  config:
+    _target_: transformers.DeepseekV4Config.from_pretrained
+    pretrained_model_name_or_path: akoumpa/Moonlight-V4-16B-A3B
+    num_hash_layers: 0
+    use_cache: false
+  force_hf: true
+  torch_dtype: bfloat16
+  trust_remote_code: false
+
+checkpoint:
+  enabled: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+  fp32_upcast: false
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDataset
+  seq_len: 2048
+  num_samples: 100000
+
+dataloader:
+  batch_size: null  # Dataset already yields batches
+  _target_: torch.utils.data.DataLoader
+  num_workers: 0
+
+optimizer:
+  _target_: torch.optim.Adam
+  betas:
+  - 0.9
+  - 0.999
+  eps: 1e-8
+  lr: 0.0001
+  weight_decay: 0
