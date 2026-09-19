@@ -44,6 +44,8 @@ recipe_args:
   num_anchors: 64                     # blocks per sequence per step; the 248k-token
   #                                   # vocab makes the block logits the memory driver
   loss_decay_gamma: 4.0               # paper default for block_size 8
+  # loss_type: dflash                 # "dflash" (fixed decay) or a D-PACE variant ("dpace", ...)
+  # dpace_alpha: 0.5                  # smoothing alpha for the D-PACE confidence products
   mask_token_id: 248070               # reserved token, matching the published drafter
   target_layer_ids: [5, 19, 33, 47, 61]
   attention_backend: flex_attention

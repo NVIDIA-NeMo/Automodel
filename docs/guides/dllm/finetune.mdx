@@ -257,6 +257,8 @@ dflash:
   num_blocks_per_sample: 512                    # Paper default (Appendix A.1)
   attention_backend: flex_attention             # required for N > ~64; sdpa OOMs
   overlap_anchors: true                         # paper samples anchors independently
+  loss_type: dflash                             # dflash | dpace | dpace-cumulative-confidence-only | dpace-continuation-value-only
+  dpace_alpha: 0.5                              # smoothing alpha for the D-PACE variants
 ```
 
 The following table describes the key configuration fields for DFlash fine-tuning:
@@ -269,6 +271,23 @@ The following table describes the key configuration fields for DFlash fine-tunin
 | `dflash.num_blocks_per_sample` | Number of anchor blocks processed per sequence per step (paper default: 512, Appendix A.1) |
 | `dflash.attention_backend` | `flex_attention` (sparse, scales to 512 anchors) or `sdpa` (dense, runs out of memory above approximately 64). The default is `sdpa` for backward compatibility. Set it to `flex_attention` for production runs. |
 | `dflash.overlap_anchors` | `true` (paper, independent sampling) or `false` (non-overlapping stars-and-bars, caps at `seq_len // block_size`) |
+| `dflash.loss_type` | `dflash` (decay-weighted CE, default) or a D-PACE variant: `dpace`, `dpace-cumulative-confidence-only`, `dpace-continuation-value-only` (detached confidence-aware weights) |
+| `dflash.dpace_alpha` | Smoothing α in `[0, 1]` for the D-PACE confidence products; ignored when `loss_type: dflash` |
+
+<Note>
+The `dpace*` variants implement D-PACE (Dynamic Position-Aware Cross-Entropy),
+which reweights each position by detached cumulative draft confidence; see
+[arXiv:2605.18810](https://arxiv.org/abs/2605.18810). Their weighted sum is
+divided by the globally reduced batch size times `num_blocks_per_sample`. This
+is equivalent to the local mean used by the dedicated DFlash recipe
+(`train_dflash.py`), including across data-parallel ranks and gradient
+accumulation, so `dpace_alpha` and `optimizer.lr` are portable between paths.
+
+Switching `loss_type` from `dflash` to a `dpace*` variant here does change the
+scale: `dflash` uses `normalize="tokens"` (a supervised-token count) in this
+strategy, not `normalize="mean"`, so it is on a different scale than either
+D-PACE convention. Retune `optimizer.lr` when switching `loss_type`.
+</Note>
 
 #### DFlash Training Metrics
 
@@ -336,6 +355,7 @@ dataset:
 The mask is built for `sdpa` or `eager` (dense additive) or `flex_attention` (sparse `BlockMask`, preferred at scale). FlashAttention-2 is unsupported because it ignores arbitrary masks, and context parallelism is also unsupported. The paper trains a `block_length` 1→2→3 curriculum (one epoch each). Run the stages as successive fine-tunes, and enable `auto_balance_clean_loss` at the b3 stage.
 
 ## Fine-Tune the Model
+Run the following commands to launch fine-tuning for each supported model family.
 
 ### Fine-Tune LLaDA2
 
