@@ -741,13 +741,14 @@ distributed:
 
 # Setup Prewarms (optional)
 # Moves selected one-time CUDA and NCCL initialization work out of the first
-# training step. Leave disabled unless the corresponding lazy initialization
-# causes a first-step out-of-memory error.
+# training step. Enable the first four options only for the corresponding
+# first-step initialization failure. pipeline_stage_compile targets slow PP startup.
 prewarm:
   cublas_backward: false   # initialize cuBLAS backward workspaces during setup
   fla_gdn_autotune: false  # autotune FLA gated-delta-net Triton kernels during setup
   mamba_ssd_autotune: false # autotune Mamba SSD Triton kernels during setup
   comm_groups: false       # initialize grad-norm communication groups during setup
+  pipeline_stage_compile: false # concurrently warm PP stages with synthetic forward/backward passes
 
 {/* docs-review-end: mamba-ssd-prewarm */}
 
@@ -882,9 +883,9 @@ The following table describes the config fields for the fine-tuning recipe.
 | `seed` | Optional | Controls the checkpointable, rank-aware RNG that the recipe constructs. Source: [`rng.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/training/rng.py). |
 | `step_scheduler` | Optional (recommended) | Set `global_batch_size` and `local_batch_size`; accumulation is derived as `global / (local × DP size)`. `ckpt_every_steps` and `val_every_steps` are counted in optimizer steps. |
 | `distributed` | Yes | `dp_size: null` means auto-detect from world size. Adjust `tp_size` for tensor parallelism across GPUs. |
-| `prewarm` | Optional | Enable only the targeted setup warmup associated with a first-step out-of-memory error. See [Prewarm One-Time CUDA Initialization](/get-started/configuration#prewarm-one-time-cuda-initialization). Source: [`prewarm.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/training/prewarm.py). |
+| `prewarm` | Optional | Enable targeted initialization warmups for first-step out-of-memory errors, or `pipeline_stage_compile` to reduce pipeline-parallel startup time. See [Prewarm One-Time CUDA Initialization](/get-started/configuration#prewarm-one-time-cuda-initialization), including [HybridEP JIT cache configuration](/get-started/configuration#reuse-hybridep-jit-kernels-across-jobs) for reuse across jobs. Source: [`prewarm.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/training/prewarm.py). |
 | `checkpoint` | Recommended | Set `checkpoint_dir` to a persistent path, especially in Docker. `save_consolidated` defaults to `final`: intermediate SFT checkpoints are sharded and the final checkpoint also exports consolidated HF weights. |
-| `optimizer` | Yes | Any supported `torch.optim` class can be selected using `_target_`; `RecipeConfig` normalizes it to an `OptimizerConfig` that owns construction. For long fine-tuning, especially full-parameter SFT, see the [mixed-precision training guide](/development/mixed-precision-training) before combining torch AdamW with bf16 resident parameters. |
+| `optimizer` | Yes | Any supported `torch.optim` class can be selected using `_target_`; `RecipeConfig` normalizes it to an `OptimizerConfig` that owns construction. For long fine-tuning, especially full-parameter SFT, see the [Mixed-Precision Training Guide](/development/mixed-precision-training) before combining torch AdamW with bf16 resident parameters. |
 | `wandb` | Optional | Uncomment and configure to enable Weights & Biases logging. |
 
 For the fine-tuning recipe itself, see [`train_ft.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/train_ft.py).
