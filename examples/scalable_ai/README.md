@@ -76,6 +76,31 @@ automodel examples/scalable_ai/configs/pretrain_moonlight_v4_16b.yaml --nproc-pe
 - Kernel prerequisites for the Hopper configs: `tilelang`, `tile_kernels` (DeepSeek TileKernels, Sinkhorn),
   `deep_ep`; optional `transformer_engine` for the TE RMSNorm / GroupedLinear profiles.
 
+## Reference numbers (8x H100 80 GB, NeMo Automodel 26.08 container, 2026-09-19)
+
+Moonlight-V4-16B-A3B from random init on mock data, sequence length 2048, global batch 256 sequences
+(524k tokens per optimizer step), 12 steps with 4 warm-up, Adam. MFU uses the `deepseekv4_flops` formula against
+989 TFLOPS (H100 dense BF16). Per-GPU memory is rank 0's `max_memory_allocated`.
+
+| run (`run_bench.sh`) | micro-batch / GPU | step time | tokens/s (8 GPUs) | peak memory | MFU |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| stock transformers (`moonlight_v4_16b_hf.yaml`), 27 layers, seq 2048 / 1024 / 512 | 1 | OOM in the first forward at every length | - | > 79 GB | - |
+| NeMo Automodel, eager attention, `torch_mm` experts, torch dispatcher (`moonlight_v4_16b_torch.yaml`) | 2 | OOM | - | > 79 GB | - |
+| same | 1 | 19.75 s | 26.5k | 58.8 GB | 5.6% |
+| NeMo Automodel, eager attention + DeepEP dispatcher | 1 | 18.05 s | 29.0k | 58.8 GB | 6.1% |
+| NeMo Automodel, TileLang sparse attention + indexer + Sinkhorn, DeepEP (`moonlight_v4_16b_tilelang_deepep.yaml`) | 2 | 10.42 s | 50.3k | 69.8 GB | 10.6% |
+| like-for-like 2 sliding-window layers: stock transformers | 1 | 2.37 s | 221k | 14.7 GB | 8.4% |
+| like-for-like 2 sliding-window layers: NeMo Automodel eager | 4 | 1.51 s | 347k | 26.1 GB | 13.1% |
+
+Reading the table: the stock implementation cannot train the full model on 80 GB GPUs (its CSA layers gather
+`S x k` keys per query); the eager Automodel path fits at micro-batch 1; the TileLang kernels cut the attention
+memory enough for micro-batch 2 and run 1.9x faster than the eager path. Reproduce with
+`examples/scalable_ai/run_bench.sh` (see its header for the expected workspace layout).
+
+Operational notes for containers: put `TILELANG_CACHE_DIR`, `TRITON_CACHE_DIR` and `TORCHINDUCTOR_CACHE_DIR` on a
+writable filesystem (`run_bench.sh` does); when tilelang cannot create its cache directory its import fails and
+Automodel silently falls back to the transformers model class, which then rejects the `backend` argument.
+
 ## Changes from the January 2026 edition
 
 - Model: DeepSeek-V3 / Moonlight-16B-A3B -> DeepSeek-V4 / Moonlight-V4-16B-A3B; layer profiles cover SWA/CSA/HCA
