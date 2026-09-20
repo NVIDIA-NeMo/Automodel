@@ -178,9 +178,55 @@ What the current evidence says is limiting, in priority order.
    the token gather/scatter into the grouped-GEMM epilogue would keep it off HBM entirely; CUTLASS exposes this
    through the collective epilogue builder's fusion operation, and its group GEMM (variable-size, one kernel) is
    the documented pattern for the expert GEMM itself.
-3. **`sparse_mqa_bwd_kernel` is the single largest attention kernel** once TileLang is on. Whether it is
+3. **FSDP2's AllGather is essentially never overlapped: 93-97% of it is exposed.** Measured with
+   [`nsys-overlap`](https://gitlab-master.nvidia.com/zhiyul/nsys-overlap)'s 3-bucket decomposition, which assigns
+   every nanosecond of merged collective wall time to hidden-by-deep-compute, hidden-by-light-compute, or truly
+   exposed (compute stream idle). Steady-state windows only (`iteration_3..5`, both gradient-accumulation steps),
+   both ranks:
+
+   | stage | AG exposed, rank 0 | AG exposed, rank 1 | RS exposed, rank 0 | RS exposed, rank 1 |
+   | --- | ---: | ---: | ---: | ---: |
+   | stage3 grouped GEMM | 96.2% | 97.0% | 56.0% | 59.7% |
+   | stage4 DeepEP | 92.9% | 96.4% | 64.8% | 54.6% |
+   | stage5 TileLang | 96.8% | 95.9% | 52.8% | 53.4% |
+
+   ReduceScatter is roughly half hidden; AllGather is not hidden at all. The model gives the prefetcher almost
+   nothing to hide it behind -- in `stage3` the compute stream holds 503 ms of kernel wall time, but GEMM-shaped
+   work is a small fraction of it, the rest being the elementwise traffic item 1 describes. The same pathology is
+   documented for Qwen3-MoE-30B in the `nsys-overlap` README, where registering expert GEMM streams as valid
+   overlap partners for the AG prefetcher was the identified fix. Worth testing here, though note this model runs
+   its experts on the main compute stream rather than on dedicated ones, so the mechanism differs.
+
+4. **`sparse_mqa_bwd_kernel` is the single largest attention kernel** once TileLang is on. Whether it is
    bandwidth-, occupancy- or latency-limited is a kernel-internal question Nsight Systems cannot answer -- capture
    it with Nsight Compute (Speed of Light plus memory workload analysis) before changing it.
+
+### What the exposed-communication numbers do and do not support
+
+The exposed percentages above were checked four ways before being written down, because a single overlap number is
+easy to get wrong:
+
+- **Not a warmup artifact.** Restricting to `iteration_3..5` changes nothing; `nsys-overlap` run over the whole
+  capture gives 92.5 / 94.3 / 93.7 / 97.6% for AG against 95.2 / 96.2 / 92.9 / 96.8% windowed.
+- **Not an artifact of one rank.** Both ranks agree, on different compute streams (7 and 21).
+- **Not an artifact of one implementation.** An independent interval-intersection written directly against
+  `CUPTI_ACTIVITY_KIND_KERNEL` reproduces `nsys-overlap` within ~2 points on every stage.
+- **Not a stream-classification error.** The tool's own README warns its heuristic can misclassify MoE expert
+  streams. Here each profile has one dominant compute stream (410-503 ms) with the rest being NCCL, DeepEP
+  dispatch, and optimizer streams, so there is no hidden expert-GEMM stream to miss.
+
+Two things the numbers do **not** support:
+
+- **"Zero AllGather is hidden behind GEMM."** `nsys-overlap` reports bucket A at 0.0%, but it classifies GEMM by
+  the kernel-name pattern `%nvjet_sm%`, which does not match this model's `sm90_xmma_gemm_*`, CUTLASS,
+  `torch._grouped_mm` or TileLang kernels. The A-versus-B split is therefore unreliable here. Only bucket C --
+  comm time with the compute stream fully idle -- is robust, since it depends on kernel presence rather than
+  kernel naming.
+- **Absolute exposed milliseconds.** Exposed AG ranges over 12.9-42.9 ms between stages, including a 3x swing
+  between two stages that share a dispatcher, so only the *fraction* is stable enough to quote.
+
+Scope: 2 ranks, one node, `ep_size 2`, sequence 1024. Whether AllGather stays this exposed at EP 8 across nodes is
+untested here.
 
 Gaps in this profiling setup, which bound how far the above can be trusted:
 
