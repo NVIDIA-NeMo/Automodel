@@ -19,7 +19,10 @@ that looks fine is measuring the wrong implementation. Source those exports befo
 
 Only end-to-end profiles are produced here. Per-module timings can be read straight out of these reports --
 `--nvtx true` annotates every submodule's forward and backward, so
-`nsys stats --report nvtx_gpu_proj_sum <profile>.nsys-rep` breaks a step down by module. To profile a module in
+`nsys stats --report nvtx_gpu_proj_sum <profile>.nsys-rep` breaks a step down by module. `./extract_stats.sh`
+runs that report and five others over the whole ladder and writes one CSV per report per profile into `stats/`,
+which is how the tables below were produced; it skips a profile only when every report's CSV is already present,
+so adding a report re-exports rather than serving a stale set. To profile a module in
 isolation instead (single process, no distributed traffic, one backend at a time), run
 `examples/scalable_ai/profile_layer.py` directly; see the parent `examples/scalable_ai/README.md`.
 
