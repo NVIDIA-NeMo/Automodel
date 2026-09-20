@@ -41,7 +41,15 @@ echo "=== Regenerating profiles in $OUT (repo root: $REPO_ROOT) ==="
 # submodule's forward and backward in an NVTX range, so the timeline is labelled by module instead of by raw
 # kernel.  The hooks are installed once at setup, so they are live for every step, not just the
 # captured window; the cost is one hook pair per module.
-E2E_COMMON=(--benchmark.nsys_start 3 --benchmark.nsys_end 5 --step_scheduler.max_steps 6 --benchmark.warmup_steps 1
+#
+# The capture window is iterations 3-5.  It takes three settings that only work together: the recipe calls
+# cudaProfilerStart/Stop at nsys_start/nsys_end, but only for ranks listed in `nsys_ranks` -- which the
+# configs default to `[]`, so the calls never fire -- and nsys only honours them under `-c cudaProfilerApi`
+# below.  With any one missing, nsys captures the whole run instead, iteration 0 included.  That matters
+# because DeepEP and TileLang JIT-compile on the first iteration: stage4's iteration 0 carries 2777 ms of
+# kernel time against 46.7 ms in a steady step, which swamps any per-module total taken over the capture.
+E2E_COMMON=(--benchmark.nsys_start 3 --benchmark.nsys_end 5 --benchmark.nsys_ranks '[0,1]'
+            --step_scheduler.max_steps 6 --benchmark.warmup_steps 1
             --step_scheduler.global_batch_size 4 --step_scheduler.local_batch_size 1 --dataset.seq_len 1024
             --nvtx true)
 
@@ -58,7 +66,7 @@ e2e() {  # name config extra-args...
   echo "=== e2e: $name ==="
   # nsys finalizes a report even when the target crashes, so a failed run must not leave one behind:
   # it would look like a cache hit forever and hide the stage that needs attention.
-  if nsys profile --force-overwrite true --trace=cuda,nvtx --cuda-memory-usage=true --output="$report" \
+  if nsys profile --force-overwrite true -c cudaProfilerApi --trace=cuda,nvtx --cuda-memory-usage=true --output="$report" \
       torchrun --nproc-per-node 2 nemo_automodel/recipes/llm/benchmark.py --config "$config" "${E2E_COMMON[@]}" "$@"; then
     printf '%s' "$cmd" > "$stamp"
   else
