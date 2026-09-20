@@ -74,6 +74,7 @@ from nemo_automodel.components.models.deepseek_v4.cp import (
     dsv4_cp_rank,
     dsv4_cp_size,
 )
+from nemo_automodel.components.models.deepseek_v4.hc_kernels import fused_hc_projection
 from nemo_automodel.components.models.deepseek_v4.optimized_kernels import (
     build_dsv4_sparse_topk_indices,
     dsv4_indexer_scores,
@@ -1056,6 +1057,142 @@ class DeepseekV4Compressor(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# mHC (hyper-connection) fusible cores.
+#
+# The mixer runs once per attention site and once per FFN site, i.e. 2 x
+# num_hidden_layers times per micro-batch.  Each call casts the whole
+# [B, S, hc_mult * hidden] residual stack to fp32, RMS-normalises it, applies a
+# very skinny projection ((2 + hc) * hc columns, 24 for hc_mult=4), and then
+# runs a handful of sigmoid / scale elementwise ops; the collapse and expand
+# steps touch the [B, S, hc_mult, hidden] stack several more times.  Profiling a
+# 12-layer step showed ~15k elementwise launches and 38-47% of all GPU time in
+# elementwise kernels, with the fp32 cast of the stack materialised in HBM every
+# time.
+#
+# Keeping the math in module-level functions lets ``BackendConfig.compile_hc``
+# replace them with ``torch.compile``d versions once per process: inductor fuses
+# the cast into the norm (the fp32 copy is never materialised) and collapses the
+# sigmoid / scale / collapse / expand chains into a few kernels.  Compiled
+# numerics are allclose to eager, not bitwise-identical.  The Sinkhorn
+# normalisation stays outside: it has its own TileKernels path.
+# ---------------------------------------------------------------------------
+
+
+def _hc_gates(
+    mix: torch.Tensor, base: torch.Tensor, scale: torch.Tensor, hc: int, hc_eps: float
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Split the mixer projection into the ``pre`` / ``post`` gates and the ``comb`` logits."""
+    pre_scale, post_scale, comb_scale = scale.unbind(0)
+    pre = torch.sigmoid(mix[..., :hc] * pre_scale + base[:hc]) + hc_eps
+    post = 2.0 * torch.sigmoid(mix[..., hc : 2 * hc] * post_scale + base[hc : 2 * hc])
+    comb_logit = mix[..., 2 * hc :].view(*mix.shape[:-1], hc, hc) * comb_scale + base[2 * hc :].view(hc, hc)
+    return pre, post, comb_logit
+
+
+def _hc_weights_kernel(
+    hidden_streams: torch.Tensor,
+    fn: torch.Tensor,
+    base: torch.Tensor,
+    scale: torch.Tensor,
+    hc: int,
+    norm_eps: float,
+    hc_eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Same as :func:`_hc_weights_core` with the norm + projection done by the fused Triton kernel."""
+    mix = fused_hc_projection(hidden_streams.flatten(start_dim=2), fn, norm_eps)
+    return _hc_gates(mix, base, scale, hc, hc_eps)
+
+
+def _hc_weights_core(
+    hidden_streams: torch.Tensor,
+    fn: torch.Tensor,
+    base: torch.Tensor,
+    scale: torch.Tensor,
+    hc: int,
+    norm_eps: float,
+    hc_eps: float,
+    proj_dtype: torch.dtype | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Mixer projection and gates: returns ``pre``, ``post`` and the pre-Sinkhorn ``comb`` logits.
+
+    ``proj_dtype`` (``BackendConfig.hc_proj_bf16``) runs only the projection in that dtype. The
+    projection is [tokens, hc_mult * hidden] x [hc_mult * hidden, (2 + hc) * hc]: a very skinny
+    output (24 columns for hc_mult=4) against a very wide reduction, so it is bound by reading the
+    activations, and in fp32 cuBLAS picks a 32x32 wmma tile that profiled at ~210 GB/s (60 ms per
+    step, 11.6% of GPU time, for 0.3% of the model FLOPs). Reading bf16 halves the traffic and
+    selects a proper tensor-core kernel; the reduction still accumulates in fp32, and the norm,
+    gates and Sinkhorn stay fp32.
+    """
+    flat = hidden_streams.flatten(start_dim=2).float()  # [B, S, H*D]
+    normed = _rms_norm_last_dim(flat, norm_eps)
+    if proj_dtype is not None:
+        mix = F.linear(normed.to(proj_dtype), fn.to(proj_dtype)).float()  # [B, S, (2+H)*H]
+    else:
+        mix = F.linear(normed, fn)  # [B, S, (2+H)*H]
+    return _hc_gates(mix, base, scale, hc, hc_eps)
+
+
+def hc_collapse(pre: torch.Tensor, hidden_streams: torch.Tensor) -> torch.Tensor:
+    """Collapse the HC stream stack to one residual: ``sum_h pre[h] * streams[h]``."""
+    return (pre.unsqueeze(-1) * hidden_streams).sum(dim=2).to(hidden_streams.dtype)
+
+
+def hc_expand(
+    post: torch.Tensor, sublayer_out: torch.Tensor, comb: torch.Tensor, hidden_streams: torch.Tensor
+) -> torch.Tensor:
+    """Expand a sub-layer output back onto the HC stream stack and mix the streams."""
+    dtype = hidden_streams.dtype
+    return post.to(dtype).unsqueeze(-1) * sublayer_out.unsqueeze(-2) + torch.matmul(
+        comb.transpose(-1, -2).to(dtype), hidden_streams
+    )
+
+
+def hc_expand_unrolled(
+    post: torch.Tensor, sublayer_out: torch.Tensor, comb: torch.Tensor, hidden_streams: torch.Tensor
+) -> torch.Tensor:
+    """:func:`hc_expand` with the stream mix written as an explicit sum instead of a matmul.
+
+    ``torch.matmul(comb.T, streams)`` is a batched GEMM whose M, N and K are all ``hc_mult`` (4),
+    batched over every token. cuBLAS serves it with a 32x32 wmma tile: a 12-layer step spent 60 ms
+    there, 12% of GPU time, moving 6.4 GB at ~108 GB/s. Written as ``hc_mult`` fused multiply-adds
+    the same result is one elementwise pass that reads the stream stack once, which is what
+    ``torch.compile`` lowers it to. Only used when ``BackendConfig.compile_hc`` is set, since
+    uncompiled this form would materialise each term separately.
+    """
+    dtype = hidden_streams.dtype
+    # fp32 accumulation, matching what the batched GEMM does internally; compiled, these stay in
+    # registers so the pass still reads the stream stack once.
+    combt = comb.transpose(-1, -2).float()
+    streams = hidden_streams.float()
+    mixed = combt[..., 0].unsqueeze(-1) * streams[..., 0, :].unsqueeze(-2)
+    for j in range(1, hidden_streams.shape[-2]):
+        mixed = mixed + combt[..., j].unsqueeze(-1) * streams[..., j, :].unsqueeze(-2)
+    mixed = mixed + post.float().unsqueeze(-1) * sublayer_out.float().unsqueeze(-2)
+    return mixed.to(dtype)
+
+
+_HC_CORES_COMPILED = False
+
+
+def compile_dsv4_hc_cores() -> None:
+    """Wrap the mHC cores with ``torch.compile`` (``BackendConfig.compile_hc``).
+
+    Runs once per process: the compiled functions replace the module-level eager
+    cores, so every layer shares the same compiled kernels and repeated model
+    construction does not recompile. Compilation itself is lazy (at first call).
+    """
+    global _hc_weights_core, _hc_gates, hc_collapse, hc_expand, _HC_CORES_COMPILED
+    if _HC_CORES_COMPILED:
+        return
+    _hc_weights_core = torch.compile(_hc_weights_core, dynamic=True)
+    _hc_gates = torch.compile(_hc_gates, dynamic=True)
+    hc_collapse = torch.compile(hc_collapse, dynamic=True)
+    # The unrolled stream mix only pays off once compiled; see hc_expand_unrolled.
+    hc_expand = torch.compile(hc_expand_unrolled, dynamic=True)
+    _HC_CORES_COMPILED = True
+
+
 class DeepseekV4HyperConnection(nn.Module):
     """Per-site HyperConnection mixer (attention or FFN).  Ported from
     ``transformers/src/transformers/models/deepseek_v4/modular_deepseek_v4.py``
@@ -1083,8 +1220,12 @@ class DeepseekV4HyperConnection(nn.Module):
         hc_eps: float,
         rms_norm_eps: float,
         sinkhorn_backend: str = "torch",
+        proj_dtype: torch.dtype | None = None,
+        use_proj_kernel: bool = False,
     ):
         super().__init__()
+        self.proj_dtype = proj_dtype
+        self.use_proj_kernel = use_proj_kernel
         self.hc_mult = hc_mult
         self.hc_sinkhorn_iters = hc_sinkhorn_iters
         self.hc_eps = hc_eps
@@ -1107,33 +1248,42 @@ class DeepseekV4HyperConnection(nn.Module):
         nn.init.ones_(self.scale)
 
     def compute_weights(self, hidden_streams: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        flat = hidden_streams.flatten(start_dim=2).float()  # [B, S, H*D]
-        # HC mixer params are kept in fp32 for Sinkhorn stability — cast defensively.
-        mix = torch.nn.functional.linear(_rms_norm_last_dim(flat, self.norm_eps), self.fn.float())  # [B, S, (2+H)*H]
-        pre_scale, post_scale, comb_scale = self.scale.float().unbind(0)
         hc = self.hc_mult
+        # HC mixer params are kept in fp32 for Sinkhorn stability — cast defensively.
+        # The projection + gates live in ``_hc_weights_core`` so that
+        # ``BackendConfig.compile_hc`` can fuse them (see the module-level note).
+        if self.use_proj_kernel:
+            pre, post, comb_logit = _hc_weights_kernel(
+                hidden_streams, self.fn.float(), self.base.float(), self.scale.float(), hc, self.norm_eps, self.hc_eps
+            )
+        else:
+            pre, post, comb_logit = _hc_weights_core(
+                hidden_streams,
+                self.fn.float(),
+                self.base.float(),
+                self.scale.float(),
+                hc,
+                self.norm_eps,
+                self.hc_eps,
+                self.proj_dtype,
+            )
 
         # ``pre`` and ``post`` have DIFFERENT formulas in the released DSV4-Flash
-        # (see ``dsv4flash/inference/kernel.py:hc_split_sinkhorn_kernel`` 391-394):
+        # (applied in ``_hc_weights_core``; see
+        # ``dsv4flash/inference/kernel.py:hc_split_sinkhorn_kernel`` 391-394):
         #   pre  = sigmoid(...) + eps     range (eps, 1+eps]
         #   post = 2 * sigmoid(...)       range (0, 2)  — NO +eps, AND a 2x prefactor
         # HF transformers PR 45616 / 45643 treats post identically to pre (sigmoid
         # + eps), which makes ``post`` half the magnitude the released weights
         # were trained against — verified empirically on the parity test
         # (auto post std = 0.5x ref post std before this fix).
-        pre = torch.sigmoid(mix[..., :hc] * pre_scale + self.base[:hc].float()) + self.hc_eps
-        post = 2.0 * torch.sigmoid(mix[..., hc : 2 * hc] * post_scale + self.base[hc : 2 * hc].float())
-
         # ``comb`` uses softmax(dim=-1) on raw logits + eps, then sinkhorn.  HF
         # uses sigmoid + eps + sinkhorn — also a divergence from the reference
         # kernel.  Reference (kernel.py:395-413):
-        #   1. comb_logit = mix * scale + base
+        #   1. comb_logit = mix * scale + base   (in ``_hc_weights_core``)
         #   2. row_softmax(dim=-1) + eps   (numerically stable, NOT sigmoid)
         #   3. col-norm / sum(dim=-2)
         #   4. for sinkhorn_iters - 1: row-norm / sum(dim=-1) ; col-norm / sum(dim=-2)
-        comb_logit = (
-            mix[..., 2 * hc :].view(*mix.shape[:-1], hc, hc) * comb_scale + self.base[2 * hc :].view(hc, hc).float()
-        )
         comb = dsv4_sinkhorn_normalize(
             comb_logit,
             backend=self.sinkhorn_backend,

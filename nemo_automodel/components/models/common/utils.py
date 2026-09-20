@@ -462,6 +462,12 @@ class BackendConfig:
             activation (currently used by Kimi K3), fusing the elementwise fp32
             chain in both the forward and the backward recompute. Compiled
             numerics are allclose to eager but not bitwise-identical.
+        hc_proj_bf16: run the DeepSeek-V4 mHC mixer projection in bf16 (read-bound skinny GEMM).
+        hc_proj_kernel: use the fused Triton RMSNorm + projection kernel for the mHC mixer.
+        lm_head_bf16: run the DeepSeek-V4 output projection in bf16 instead of fp32.
+        compile_hc: torch.compile the DeepSeek-V4 mHC mixer and stream collapse/expand
+            cores. Same lazy once-per-process pattern as ``compile_situ``; numerics are
+            allclose to eager but not bitwise-identical.
         compile_norm: torch.compile the fp32 RMSNorm chain of models that opt in
             (currently Kimi K3), fusing cast/pow/mean/rsqrt/mul into one kernel.
             Same lazy once-per-process pattern as ``compile_situ``; numerics are
@@ -526,6 +532,27 @@ class BackendConfig:
     # same lazy once-per-process pattern as compile_situ. Numerics are allclose to eager,
     # not bitwise-identical. Default False.
     compile_norm: bool = False
+    # When True, torch.compile the mHC (hyper-connection) cores of DeepSeek-V4: the mixer
+    # projection + sigmoid gates, and the stream collapse / expand chains. Those run twice per
+    # layer over the [B, S, hc_mult, hidden] stream stack and, uncompiled, dominate the
+    # elementwise kernel count (a 12-layer step profiles ~15k elementwise launches, 38-47% of
+    # GPU time). Compiling fuses the fp32 cast into the norm and collapses the gate chains.
+    # Numerics are allclose to eager, not bitwise-identical. Default False.
+    compile_hc: bool = False
+    # DeepSeek-V4 only. Run the mHC mixer projection in bf16 (norm, gates and Sinkhorn stay fp32).
+    # The projection reads the whole [tokens, hc_mult * hidden] stream stack for 24 output columns,
+    # so it is read-bound; fp32 profiled at ~210 GB/s. Default False.
+    hc_proj_bf16: bool = False
+    # DeepSeek-V4 only. Use the fused Triton RMSNorm + skinny-projection kernel for the mHC mixer
+    # (nemo_automodel/components/models/deepseek_v4/hc_kernels.py). cuBLAS cannot parallelise a
+    # 24-column output: it profiled at 108 GB/s, ~3% of an H100's bandwidth. The kernel splits the
+    # reduction over K instead. Falls back to the eager path without Triton or on CPU. Default False.
+    hc_proj_kernel: bool = False
+    # DeepSeek-V4 only. Drop ``lm_head`` from the model's strict-fp32 module list so the output
+    # projection runs in bf16 like the rest of the model. The released V4 checkpoints keep it in
+    # fp32; at a 163,840-row vocabulary the fp32 matmul profiled at 50 ms per step (9.6% of GPU
+    # time). Changes training numerics of the output head. Default False.
+    lm_head_bf16: bool = False
     # When True, models that opt in (currently Kimi K3) run their shared experts on a side CUDA
     # stream, launched before the routed-expert path and joined after it, so the shared-expert
     # GEMMs overlap the expert-parallel dispatch / combine communication (Megatron-Core's

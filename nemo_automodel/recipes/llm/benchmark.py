@@ -122,6 +122,12 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         self._bench_nsys_end = bench_cfg.nsys_end
         self._bench_nsys_ranks = bench_cfg.nsys_ranks
         self._bench_json_output_path = getattr(bench_cfg, "json_output_path", None)
+        # torch.profiler window (kernel-level traces); -1 disables. Mirrors the nsys_* fields.
+        self._bench_torch_profile_start = getattr(bench_cfg, "torch_profile_start", -1)
+        self._bench_torch_profile_end = getattr(bench_cfg, "torch_profile_end", -1)
+        self._bench_torch_profile_ranks = getattr(bench_cfg, "torch_profile_ranks", [0])
+        self._bench_torch_profile_dir = getattr(bench_cfg, "torch_profile_dir", "torch_traces")
+        self._torch_profiler = None
         self._wandb_enabled = cfg.get("wandb", None) is not None
 
         # Infer max_steps from step_scheduler
@@ -301,6 +307,10 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         nsys_end = self._bench_nsys_end
         nsys_ranks = self._bench_nsys_ranks
 
+        torch_profile_start = self._bench_torch_profile_start
+        torch_profile_end = self._bench_torch_profile_end
+        torch_profile_ranks = self._bench_torch_profile_ranks
+
         peak_tflops = self._bench_peak_tflops
 
         # Set models to training mode
@@ -331,6 +341,17 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                 # Per-microbatch NVTX ranges below already delimit the work.
                 # Entering emit_nvtx() without closing it leaks RecordFunction
                 # callbacks into later DTensor/FSDP operations.
+
+            # Start the torch profiler window if configured
+            if i == torch_profile_start and rank in torch_profile_ranks:
+                logger.info(f"Rank {rank} | Starting torch profiler")
+                self._torch_profiler = torch.profiler.profile(
+                    activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+                    record_shapes=True,
+                    with_stack=False,
+                    profile_memory=False,
+                )
+                self._torch_profiler.__enter__()
 
             if rank == 0:
                 logger.info(f"Rank {rank} | Iteration {i}")
@@ -430,6 +451,12 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                 logger.info(f"Rank {rank} | Stopping nsys profiling")
                 torch.cuda.cudart().cudaProfilerStop()
 
+            # Close the torch profiler window, write the trace and log the hot operators
+            if self._torch_profiler is not None and i == torch_profile_end:
+                logger.info(f"Rank {rank} | Stopping torch profiler")
+                self._torch_profiler.__exit__(None, None, None)
+                self._write_torch_profile(rank)
+
             self._maybe_collect_garbage()
 
         if self.partial_cuda_graph_manager is not None:
@@ -437,6 +464,17 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
 
         # Final summary
         self._log_benchmark_summary(steps, warmup_steps, peak_tflops, rank)
+
+    def _write_torch_profile(self, rank):
+        """Export the chrome trace of the profiled window and log the top CUDA operators."""
+        out_dir = pathlib.Path(self._bench_torch_profile_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        trace_path = str(out_dir / f"trace_rank{rank}.json.gz")
+        self._torch_profiler.export_chrome_trace(trace_path)
+        logger.info(f"Rank {rank} | torch profiler trace written to {trace_path}")
+        table = self._torch_profiler.key_averages().table(sort_by="self_device_time_total", row_limit=25)
+        logger.info(f"Rank {rank} | top operators by self CUDA time:\n{table}")
+        self._torch_profiler = None
 
     def _log_iteration_metrics(self, iter_timer, ga_steps, peak_tflops, rank, iteration):
         max_iter_time = self.timers._get_global_min_max_time([iter_timer], reset=False, barrier=False, normalizer=1.0)[

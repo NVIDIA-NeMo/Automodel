@@ -66,6 +66,11 @@ from nemo_automodel.components.models.common.utils import (
     cast_model_to_dtype,
     compute_lm_head_logits,
 )
+
+# Imported as a module (not `from ... import hc_collapse`) on purpose: enabling
+# ``BackendConfig.compile_hc`` rebinds these names in the layers module, and an
+# attribute lookup through the module picks up the compiled versions.
+from nemo_automodel.components.models.deepseek_v4 import layers as dsv4_layers
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
 from nemo_automodel.components.models.deepseek_v4.cp import (
     build_dsv4_cp_causal_padding_mask,
@@ -251,6 +256,10 @@ class DeepseekV4Block(nn.Module):
         # ``scale`` (fp32 per-head gain) parameters.  ``_keep_in_fp32_modules_strict``
         # on ``DeepseekV4ForCausalLM`` keeps all nine HC param tensors in fp32
         # at runtime via submodule-name matching.
+        # Opt-in fusion of the mHC cores (see BackendConfig.compile_hc). Idempotent and
+        # process-wide, so every block shares one set of compiled kernels.
+        if backend is not None and getattr(backend, "compile_hc", False):
+            dsv4_layers.compile_dsv4_hc_cores()
         hc_kwargs = dict(
             hc_mult=config.hc_mult,
             hidden_size=config.hidden_size,
@@ -258,6 +267,8 @@ class DeepseekV4Block(nn.Module):
             hc_eps=float(config.hc_eps),
             rms_norm_eps=float(config.rms_norm_eps),
             sinkhorn_backend=_dsv4_sinkhorn_backend(backend),
+            proj_dtype=torch.bfloat16 if (backend is not None and getattr(backend, "hc_proj_bf16", False)) else None,
+            use_proj_kernel=bool(backend is not None and getattr(backend, "hc_proj_kernel", False)),
         )
         self.attn_hc = DeepseekV4HyperConnection(**hc_kwargs)
         self.ffn_hc = DeepseekV4HyperConnection(**hc_kwargs)
@@ -304,7 +315,7 @@ class DeepseekV4Block(nn.Module):
 
         def attention_site(hidden_streams: torch.Tensor) -> torch.Tensor:
             pre, post, comb = self.attn_hc(hidden_streams)
-            collapsed = (pre.unsqueeze(-1) * hidden_streams).sum(dim=2).to(hidden_streams.dtype)
+            collapsed = dsv4_layers.hc_collapse(pre, hidden_streams)
             attn_out, _ = self.self_attn(
                 hidden_states=self.input_layernorm(collapsed),
                 position_embeddings=position_embeddings,
@@ -315,16 +326,12 @@ class DeepseekV4Block(nn.Module):
                 vision_token_types=vision_token_types,
                 **attn_kwargs,
             )
-            dtype = hidden_streams.dtype
             # Expand: native DSV4 uses comb[j, h] * residual[j], i.e. comb.T @ residual.
-            return post.to(dtype).unsqueeze(-1) * attn_out.unsqueeze(-2) + torch.matmul(
-                comb.transpose(-1, -2).to(dtype), hidden_streams
-            )
+            return dsv4_layers.hc_expand(post, attn_out, comb, hidden_streams)
 
         def ffn_prepare(hidden_streams: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             pre, post, comb = self.ffn_hc(hidden_streams)
-            collapsed = (pre.unsqueeze(-1) * hidden_streams).sum(dim=2).to(hidden_streams.dtype)
-            return collapsed, post, comb
+            return dsv4_layers.hc_collapse(pre, hidden_streams), post, comb
 
         x = attention_site(x)
         collapsed, post, comb = ffn_prepare(x)
@@ -337,8 +344,7 @@ class DeepseekV4Block(nn.Module):
         elif self.is_hash_routing_layer and isinstance(gate, DeepseekV4HashGate):
             gate.set_input_ids(input_ids)
         mlp_out = self.mlp(self.post_attention_layernorm(collapsed), padding_mask)
-        dtype = x.dtype
-        return post.to(dtype).unsqueeze(-1) * mlp_out.unsqueeze(-2) + torch.matmul(comb.transpose(-1, -2).to(dtype), x)
+        return dsv4_layers.hc_expand(post, mlp_out, comb, x)
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
         self.input_layernorm.reset_parameters()
@@ -1160,13 +1166,21 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             moe_config=moe_config,
             moe_overrides=moe_overrides,
         )
+        # The released V4 checkpoints keep the output projection in fp32. At a 163,840-row
+        # vocabulary that matmul profiled at ~50 ms per step (9.6% of GPU time), so
+        # ``BackendConfig.lm_head_bf16`` opts into bf16 for throughput work; the module is then
+        # also dropped from the strict-fp32 list below so FSDP shards it like any other bf16 unit.
+        lm_head_dtype = torch.bfloat16 if getattr(self.backend, "lm_head_bf16", False) else torch.float32
         self.lm_head = initialize_linear_module(
             self.backend.linear,
             config.hidden_size,
             config.vocab_size,
             bias=False,
-            dtype=torch.float32,
+            dtype=lm_head_dtype,
         )
+        if lm_head_dtype is not torch.float32:
+            # Instance attribute shadows the class list the parallelizer reads.
+            self._keep_in_fp32_modules_strict = [m for m in type(self)._keep_in_fp32_modules_strict if m != "lm_head"]
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = DeepSeekV4StateDictAdapter(
                 self.config,

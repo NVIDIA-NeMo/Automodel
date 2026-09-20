@@ -1,5 +1,5 @@
 #!/bin/bash
-# Moonlight-V4-16B-A3B benchmarks on 8 GPUs (branch scalable-ai-2026_sept). Usage: run_bench.sh [torch|tilelang|deepep|hf|hf2layer|journey ...]
+# Moonlight-V4-16B-A3B benchmarks on 8 GPUs (branch scalable-ai-2026_sept). Usage: run_bench.sh [torch|tilelang|deepep|hf|hf2layer|journey|moe_ab|one ...]
 # Expects $WORK (default /workspace) to contain Automodel/ (this repo), models/Moonlight-V4-16B-A3B/ (config + tokenizer) and logs/.
 set -o pipefail
 WORK=${WORK:-/workspace}
@@ -88,6 +88,17 @@ for which in "${@:-torch tilelang hf}"; do
     deepep)   run_lbs automodel_eager_deepep   $C/moonlight_v4_16b_torch.yaml --model.backend.dispatcher deepep ;;
     torch_ac) run automodel_torch_lbs4_ac      $C/moonlight_v4_16b_torch.yaml --distributed.activation_checkpointing true ;;
     journey)  journey ${JOURNEY_LAYERS:-4} ;;
+    # Single run, fully driven by the environment: ONE_NAME, ONE_CFG (file name under configs/), ONE_ARGS (overrides).
+    one)      run "${ONE_NAME:-one}" $C/${ONE_CFG:-moonlight_v4_16b_tilelang_deepep.yaml} ${ONE_ARGS:-} ;;
+    # MoE communication + expert-GEMM A/B on the same model: per-expert loop with the all-gather (torch)
+    # dispatcher, versus grouped_gemm experts with DeepEP. Attention backend is identical in both runs.
+    moe_ab)   o="--step_scheduler.local_batch_size ${MOE_AB_LBS:-1} --step_scheduler.global_batch_size ${MOE_AB_GBS:-256} --dataset.seq_len ${MOE_AB_SEQ:-2048}"
+              [ -n "${MOE_AB_LAYERS:-}" ] && o="$o --model.config.num_hidden_layers $MOE_AB_LAYERS"
+              [ -n "${MOE_AB_ATTN:-}" ]   && o="$o --model.backend.attn $MOE_AB_ATTN"
+              # MOE_AB_PROF="<start> <end>" adds a torch.profiler window on rank 0 (traces under $WORK/traces/<name>)
+              prof() { [ -z "${MOE_AB_PROF:-}" ] && return; local n=$1; set -- $MOE_AB_PROF; echo "--benchmark.torch_profile_start $1 --benchmark.torch_profile_end $2 --benchmark.torch_profile_dir $WORK/traces/$n"; }
+              run "moe_off_loop_torchdisp${MOE_AB_TAG:-}" $C/moonlight_v4_16b_torch.yaml $o --model.backend.dispatcher torch  --model.backend.experts torch $(prof "moe_off${MOE_AB_TAG:-}")
+              run "moe_on_gmm_deepep${MOE_AB_TAG:-}"     $C/moonlight_v4_16b_torch.yaml $o --model.backend.dispatcher deepep --model.backend.experts gmm  $(prof "moe_on${MOE_AB_TAG:-}") ;;
     hf)       run hf_ootb_seq2048           $C/moonlight_v4_16b_hf.yaml
               run hf_ootb_seq1024           $C/moonlight_v4_16b_hf.yaml --dataset.seq_len 1024
               run hf_ootb_seq512            $C/moonlight_v4_16b_hf.yaml --dataset.seq_len 512 ;;
