@@ -14,11 +14,12 @@
 
 """Unit tests for the shared speculative-recipe training utilities.
 
-These pin the grad-accumulation bookkeeping, the warmup+cosine LR schedule, and
-the draft activation-checkpointing wiring that EAGLE-1/2, EAGLE-3, DFlash, and
-DSpark now share, so a change is caught for all of them at once (the drift
-these utilities exist to prevent). Recipe-level integration of the same logic
-lives in each recipe's own tests.
+These pin the grad-accumulation bookkeeping and the warmup+cosine LR schedule
+that EAGLE-1/2, EAGLE-3, DFlash, and DSpark share, plus the draft
+activation-checkpointing wiring that DFlash and DSpark share (EAGLE-1/2 and
+EAGLE-3 do not call it yet), so a change is caught for all current callers at
+once (the drift these utilities exist to prevent). Recipe-level integration of
+the same logic lives in each recipe's own tests.
 """
 
 import math
