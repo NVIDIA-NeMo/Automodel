@@ -66,7 +66,11 @@ for name in "${profiles[@]}"; do
   echo "=== $name -- ${want[*]} ==="
   report_args=()
   for r in "${want[@]}"; do report_args+=(--report "$r"); done
-  log="$(nsys stats --format csv --output "$OUT" \
+  # Run from inside $OUT with `--output .`.  nsys treats --output as a filename *prefix*, not a
+  # directory, so `--output "$OUT"` writes "<OUT>_<report>.csv" beside the profiles -- one name shared by
+  # every stage, so the first wins and the rest are SKIPPED.  A directory of "." makes it name each file
+  # after the report it read, which is what gives <profile>_<report>.csv.
+  log="$(cd "$OUT" && nsys stats --format csv --output . \
            ${FORCE_EXPORT:+--force-export=true} \
            "${report_args[@]}" "$report" 2>&1)"
   status=$?
