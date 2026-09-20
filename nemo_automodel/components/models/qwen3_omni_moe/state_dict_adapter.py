@@ -85,22 +85,28 @@ class Qwen3OmniMoeStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapt
         return self._from_hf_w_merged_experts(hf_state_dict, device_mesh)
 
     def map_peft_target_module_to_hf(self, name: str, *, v4_compatible: bool = False) -> str:
-        """Give target_modules the same ``thinker.`` namespace the exported tensors get.
+        """Give target_modules the same namespace the exported tensors get.
 
-        PEFT suffix-matches adapter_config.json's target_modules against the receiving
-        model, so an entry without the namespace also matches the talker's identically
-        named modules. Those get adapters the checkpoint has no weights for, leaving them
-        randomly initialized. Both export formats keep the namespace: the omni checkpoint
-        has no layout in which the thinker's modules are addressed without it.
+        ``from_hf`` records whether the base checkpoint nests the text tower under
+        ``thinker.``; ``to_hf`` and ``convert_single_tensor_to_hf`` both honor that
+        flag, so target_modules has to honor it too. Otherwise the two halves of one
+        checkpoint name different modules and PEFT cannot match them up.
+
+        On the full omni layout the namespace is required: PEFT suffix-matches
+        target_modules against the receiving model, so an entry without it also hits
+        the talker's identically named modules, which then get adapters the checkpoint
+        has no weights for and stay randomly initialized. On a standalone-thinker base
+        the namespace does not exist on the receiving model at all, and adding it makes
+        PEFT reject the adapter with "Target modules ... not found".
 
         Args:
             name: A target-module name in native layout.
             v4_compatible: Legacy export selection; omni uses one module layout for both.
 
         Returns:
-            Target-module name in the HF omni layout.
+            Target-module name in the layout the exported tensors use.
         """
-        return self._add_thinker_prefix(name)
+        return self._add_thinker_prefix(name) if self._uses_thinker_prefix else name
 
     @staticmethod
     def _add_thinker_prefix(key: str) -> str:

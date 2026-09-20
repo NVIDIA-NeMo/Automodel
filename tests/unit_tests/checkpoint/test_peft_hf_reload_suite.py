@@ -267,6 +267,30 @@ def _build_qwen3_omni_moe_reference():
     return Qwen3OmniMoeForConditionalGeneration(adapter.config)
 
 
+def _build_qwen3_omni_moe_standalone_thinker():
+    """The same adapter against a thinker-only base, which carries no ``thinker.`` segment.
+
+    ``from_hf`` records the base checkpoint's layout, and both tensor exporters drop the
+    namespace when it is absent, so target_modules has to drop it too. Getting that wrong
+    is invisible to a self-consistency check and only shows up on a real PEFT reload.
+    """
+    thinker, adapter = _build_qwen3_omni_moe()
+
+    # Production reaches the adapter through the checkpoint load, which is where the
+    # layout is recorded. Checkpoints store experts split per index; the model fuses
+    # them on load, so the detector only ever sees the split form.
+    thinkerless = {}
+    for expert in range(2):
+        prefix = f"model.layers.0.mlp.experts.{expert}"
+        thinkerless[f"{prefix}.gate_proj.weight"] = torch.zeros(16, 32)
+        thinkerless[f"{prefix}.up_proj.weight"] = torch.zeros(16, 32)
+        thinkerless[f"{prefix}.down_proj.weight"] = torch.zeros(32, 16)
+    adapter.from_hf(thinkerless)
+    assert adapter._uses_thinker_prefix is False, "the thinker-only layout was not detected"
+
+    return thinker, adapter
+
+
 @dataclass(frozen=True)
 class _Family:
     """One covered model family.
@@ -304,6 +328,13 @@ _FAMILIES = (
         {"target_modules": ["*.q_proj", "*.v_proj"]},
         build_reference=_build_qwen3_omni_moe_reference,
         reference_path="thinker",
+    ),
+    # Same adapter, thinker-only base: the namespace the full layout requires is exactly
+    # the one this layout must not have, so one hook has to serve both.
+    _Family(
+        "qwen3_omni_moe_standalone_thinker",
+        _build_qwen3_omni_moe_standalone_thinker,
+        {"target_modules": ["*.q_proj", "*.v_proj"]},
     ),
 )
 
