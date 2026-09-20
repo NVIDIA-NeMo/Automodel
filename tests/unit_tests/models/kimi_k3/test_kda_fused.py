@@ -268,3 +268,16 @@ def test_backward_module_imports_without_triton(monkeypatch):
     with pytest.raises(ImportError):
         mod.run(*([None] * 12))
     monkeypatch.delitem(sys.modules, name, raising=False)  # do not leave the stubbed module cached for other tests
+
+
+def test_embedded_forward_sources_are_self_contained():
+    from nemo_automodel.components.models.kimi_k3.kda_fused import chunk_kda_fwd_cuda as src
+
+    # load_inline writes main.cpp / cuda.cu from these strings: nothing may reference a file on disk
+    for text in src.CPP_SOURCES + src.CUDA_SOURCES:
+        assert '#include "' not in text
+        assert "#pragma once" not in text
+    assert "cudaError_t kda_launch(" in src.HEADER
+    assert "PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)" in src.BINDING and 'm.def("run"' in src.BINDING
+    assert "__global__" in src.KERNEL and "cudaError_t kda_launch(" in src.KERNEL
+    assert src.CPP_SOURCES == (src.HEADER, src.BINDING) and src.CUDA_SOURCES == (src.HEADER, src.KERNEL)

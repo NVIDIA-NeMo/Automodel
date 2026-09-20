@@ -25,7 +25,6 @@ include = ["nemo_automodel", "nemo_automodel.*"]
 [tool.setuptools.package-data]
 nemo_automodel = [
     "components/datasets/llm/megatron/Makefile",
-    "components/models/kimi_k3/kda_fused/csrc/*",
 ]
 
 [tool.setuptools.dynamic]

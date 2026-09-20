@@ -14,8 +14,8 @@
 
 """Opt-in fused kernels for the Kimi-K3 KDA chunked delta rule (``KimiK3TextConfig.kda_chunk_impl = "fused"``).
 
-Forward: a fused CUDA kernel (``csrc/chunk_kda_fwd.cu``, JIT-built once per build directory through
-``torch.utils.cpp_extension.load`` and imported straight from the built ``.so`` afterwards; build dir
+Forward: a fused CUDA kernel (source text in ``chunk_kda_fwd_cuda.py``, JIT-built once per build directory through
+``torch.utils.cpp_extension.load_inline`` and imported straight from the built ``.so`` afterwards; build dir
 ``$NEMO_KDA_FUSED_BUILD_DIR`` or ``~/.cache/nemo_automodel/kda_fused``, keyed by sources, torch version and device arch).
 Backward: a Triton kernel (``chunk_kda_bwd_triton.py``) that recomputes every intermediate from the raw forward inputs,
 so the autograd function saves only q, k, v, g, beta and cu_seqlens — no chunk states or WY factors.
@@ -37,10 +37,8 @@ from typing import Any
 
 import torch
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_CSRC = os.path.join(_HERE, "csrc")
-_FWD_SOURCES = [os.path.join(_CSRC, "chunk_kda_fwd_binding.cpp"), os.path.join(_CSRC, "chunk_kda_fwd.cu")]
-_FWD_HEADERS = [os.path.join(_CSRC, "chunk_kda_fwd.h")]
+from nemo_automodel.components.models.kimi_k3.kda_fused.chunk_kda_fwd_cuda import CPP_SOURCES, CUDA_SOURCES
+
 _HEAD_DIM = 128
 _EXT_NAME = "nemo_fused_chunk_kda_fwd"
 # A single-arch build of the forward took ~15 s on GB200 (first-call 17.6 s including the Triton compiles); a lock
@@ -58,9 +56,8 @@ def _build_dir() -> str:
         os.path.expanduser("~"), ".cache", "nemo_automodel", "kda_fused"
     )
     h = hashlib.sha1()
-    for p in _FWD_SOURCES + _FWD_HEADERS:
-        with open(p, "rb") as f:
-            h.update(f.read())
+    for src in CPP_SOURCES + CUDA_SOURCES:
+        h.update(src.encode())
     h.update(torch.__version__.encode())
     cap = torch.cuda.get_device_capability() if torch.cuda.is_available() else (0, 0)
     h.update(f"sm_{cap[0]}{cap[1]}".encode())
@@ -81,11 +78,11 @@ def _lock_age(build_dir: str) -> float | None:
 def _import_prebuilt(build_dir: str) -> Any | None:
     """Import the extension straight from its built ``.so`` when it exists and no build is in progress.
 
-    ``torch.utils.cpp_extension.load`` takes a file lock in the build directory on EVERY call, even when nothing needs
-    rebuilding, and a process killed while holding it (a cancelled job) leaves a lock that hangs every later caller
-    for good. Importing the finished artifact directly needs no lock; only a genuine build goes through ``load``. A
-    fresh ``lock`` means another process may still be linking the ``.so``: return None and let the caller wait in
-    ``load`` instead of importing a half-written file.
+    ``torch.utils.cpp_extension.load_inline`` takes a file lock in the build directory on EVERY call, even when
+    nothing needs rebuilding, and a process killed while holding it (a cancelled job) leaves a lock that hangs every
+    later caller for good. Importing the finished artifact directly needs no lock; only a genuine build goes through
+    ``load_inline``. A fresh ``lock`` means another process may still be linking the ``.so``: return None and let the
+    caller wait in ``load_inline`` instead of importing a half-written file.
     """
     so = os.path.join(build_dir, f"{_EXT_NAME}.so")
     if not os.path.isfile(so):
@@ -129,15 +126,17 @@ def _forward_ext() -> Any:
                 build_dir = _build_dir()
                 _fwd_ext = _import_prebuilt(build_dir)
                 if _fwd_ext is None:
-                    from torch.utils.cpp_extension import load
+                    from torch.utils.cpp_extension import load_inline
 
                     _clear_stale_lock(build_dir)
                     cap = torch.cuda.get_device_capability()
                     cc = f"{cap[0]}{cap[1]}"
-                    _fwd_ext = load(
+                    _fwd_ext = load_inline(
                         name=_EXT_NAME,
-                        sources=_FWD_SOURCES,
-                        extra_include_paths=[_CSRC],
+                        # torch writes these to main.cpp / cuda.cu in the build directory; the binding carries its own
+                        # PYBIND11_MODULE, so no `functions` list (torch would generate a second module definition)
+                        cpp_sources=list(CPP_SOURCES),
+                        cuda_sources=list(CUDA_SOURCES),
                         # one arch (the current device) — torch drops its own TORCH_CUDA_ARCH_LIST when a flag names one
                         extra_cuda_cflags=["-O3", "-lineinfo", "-gencode", f"arch=compute_{cc},code=sm_{cc}"],
                         build_directory=build_dir,
