@@ -12,29 +12,33 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# From-scratch pre-training of Moonlight-V4-16B-A3B (16.5B total / 3.0B active) on Megatron-format data.
+# From-scratch pre-training of Moonlight-V4-16B-A3B (16.5B total / 3.0B active) on FineWeb-edu, one 8x H100 node.
 #
-#   automodel examples/scalable_ai/configs/pretrain_moonlight_v4_16b.yaml --nproc-per-node 8
+#   bash examples/scalable_ai/pretrain.sh          # inside the NeMo Automodel container, see the script header
+#   automodel examples/scalable_ai/configs/pretrain_moonlight_v4_16b.yaml --nproc-per-node 8   # without the wrapper
 #
 # No checkpoint is loaded; the native DeepSeek-V4 implementation initialises everything from the config, including
-# the hash-routed first layer's token table (deterministic balanced assignment) and the mHC mixers. Preprocess data
-# with tools/preprocess_megatron_dataset.py using the tokenizer bundled in the model repo (Moonshot's, 163,840 rows).
-# Moonlight itself trained with Muon (Automodel: optimizer MuonConfig, needs the `dion` package); AdamW below uses
-# Moonlight's peak learning rate.
+# the hash-routed first layer's token table and the mHC mixers. Data: NanogptDataset shards written by
+# examples/scalable_ai/prepare_fineweb.py with the tokenizer bundled in the model repo (Moonshot's, 163,840 ids,
+# BOS 163584). Moonlight itself trained with Muon (Automodel: optimizer MuonConfig, needs the `dion` package);
+# AdamW below uses Moonlight's peak learning rate. 700 steps x 256 x 2048 = 367M tokens, ~3 h on 8x H100 with the
+# TileLang + DeepEP backends at micro-batch 1 (micro-batch 2 peaks at 69 GB in the first step and OOMs when the bf16 Adam
+# states are allocated). Checkpoints resume automatically (latest is picked up when the job restarts); the loss goes
+# to Weights & Biases (WANDB_API_KEY or ~/.netrc, otherwise offline).
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
-  global_batch_size: 512
-  local_batch_size: 2
-  ckpt_every_steps: 500
+  global_batch_size: 256         # 256 x 2048 = 524k tokens per optimizer step
+  local_batch_size: 1            # keep equal to dataloader.batch_size below; 2 fits the forward but OOMs once the Adam states exist
+  ckpt_every_steps: 200
   val_every_steps: 100
   num_epochs: 1
-  max_steps: 9500
+  max_steps: 700
 
 dist_env:
   backend: nccl
-  timeout_minutes: 10
+  timeout_minutes: 15
 
 rng:
   _target_: nemo_automodel.components.training.rng.StatefulRNG
@@ -45,7 +49,7 @@ model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
   config:
     _target_: nemo_automodel.components.models.deepseek_v4.config.DeepseekV4Config.from_pretrained
-    pretrained_model_name_or_path: akoumpa/Moonlight-V4-16B-A3B
+    pretrained_model_name_or_path: akoumpa/Moonlight-V4-16B-A3B   # pretrain.sh points this at the local copy
     use_cache: false
   trust_remote_code: false
   load_base_model: false
@@ -56,7 +60,7 @@ model:
     rms_norm: torch_fp32
     rope_fusion: false
     experts: torch_mm
-    dispatcher: deepep   # or hybridep / torch
+    dispatcher: deepep   # or hybridep / torch (pretrain.sh falls back to torch after repeated DeepEP failures)
     gate_precision: float32
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: false
@@ -64,9 +68,10 @@ model:
 
 checkpoint:
   enabled: true
-  checkpoint_dir: checkpoints/moonlight_v4_16b
+  checkpoint_dir: /workspace/checkpoints/moonlight_v4_16b   # ~165 GB per checkpoint (bf16 weights + fp32 Adam states)
   model_save_format: torch_save
   save_consolidated: false
+  max_recent_checkpoints: 2
 
 distributed:
   strategy: fsdp2
@@ -76,6 +81,8 @@ distributed:
   dp_size: 8
   ep_size: 8
   moe:
+    # DeepSeek-V4's fp32 tensors (attention sinks, compressor position biases, mHC mixers) are separate FSDP2 units;
+    # keep them unsharded between forward and backward.
     reshard_after_forward: false
     wrap_outer_model: false
 
@@ -83,38 +90,41 @@ loss_fn:
   # lm_head is kept in fp32 (as in the released V4 checkpoints); the fused linear cross-entropy requires one dtype.
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
+clip_grad_norm:
+  max_norm: 1.0
+
 dataset:
-  _target_: nemo_automodel.components.datasets.llm.megatron_dataset.MegatronPretraining
-  paths: /path/to/fineweb_edu/processed_data_*_text_document*  # REPLACE THIS
-  index_mapping_dir: /path/to/fineweb_edu/mapping_dir  # REPLACE THIS
-  tokenizer:
-    _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
-    pretrained_model_name_or_path: akoumpa/Moonlight-V4-16B-A3B
-  seq_length: 4096   # DeepSeek-V4 pre-training starts at 4K (then 16K, 64K, 1M); the config carries V4's YaRN setup
-  split: "0.99, 0.01, 0.00"
-  splits_to_build: "train"
+  _target_: nemo_automodel.components.datasets.llm.nanogpt_dataset.NanogptDataset
+  file_pattern: /workspace/data/fineweb_edu_moonshot/fineweb_train_*.bin   # 16 shards: files are dealt round-robin to the 8 ranks
+  seq_len: 2048
+  shuffle_files: true
+  align_to_bos: false
+  bos_token: 163584
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: torch.utils.data.default_collate
-  dataloader_type: "single"
+  # The recipe passes no batch size to the DataLoader for IterableDatasets (local_batch_size only sets the
+  # accumulation count), so without this line every micro-batch is a single sequence.
+  batch_size: 1
+  shuffle: false
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
 
 validation_dataset:
-  _target_: nemo_automodel.components.datasets.llm.megatron_dataset.MegatronPretraining
-  paths: /path/to/fineweb_edu/processed_data_*_text_document*  # REPLACE THIS
-  index_mapping_dir: /path/to/fineweb_edu/mapping_dir  # REPLACE THIS
-  tokenizer:
-    _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
-    pretrained_model_name_or_path: akoumpa/Moonlight-V4-16B-A3B
-  seq_length: 4096
-  split: "0.99, 0.01, 0.00"
-  splits_to_build: "validation"
-  num_val_samples: 1024
+  # NanogptDataset is an infinite stream; FiniteNanogptDataset (examples/scalable_ai/finite_nanogpt.py, on
+  # PYTHONPATH via pretrain.sh) stops after max_samples sequences per rank. One 8M-token shard, split by position.
+  _target_: finite_nanogpt.FiniteNanogptDataset
+  file_pattern: /workspace/data/fineweb_edu_moonshot/fineweb_val_0000.bin
+  max_samples: 32                 # 32 x 2048 tokens per rank per validation
+  seq_len: 2048
+  shuffle_files: false
+  align_to_bos: false
+  bos_token: 163584
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: torch.utils.data.default_collate
-  dataloader_type: "single"
+  batch_size: 1
+  shuffle: false
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
 
 optimizer:
   _target_: torch.optim.AdamW
@@ -125,5 +135,10 @@ optimizer:
 
 lr_scheduler:
   lr_decay_style: cosine
-  lr_warmup_steps: 2000
+  lr_warmup_steps: 100
   min_lr: 4.2e-5
+
+wandb:
+  project: moonlight-v4
+  name: moonlight-v4-16b-a3b-pretrain-8xh100
+  # mode is left to WANDB_MODE (pretrain.sh passes --wandb.mode offline when no credentials are available)
