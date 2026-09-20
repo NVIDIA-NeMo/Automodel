@@ -1007,7 +1007,13 @@ class FinetuneRecipeForVLM(BaseRecipe):
                         ignore_index=mtp_cfg.ignore_index,
                         lm_weight=shared_lm_weight,
                         grad_reduce_group=grad_reduce_group,
+                        # Mask cross-boundary MTP label rolls in a packed batch. THD
+                        # packing supplies cu_seqlens; `neat` packing instead carries the
+                        # indexed document map, which is what seq_idx wants directly.
+                        # Without one of the two, every depth-k target at a document's
+                        # last k tokens is rolled in from the NEXT document, silently.
                         cu_seqlens=None if mtp_per_depth_targets is not None else batch.get("cu_seqlens"),
+                        seq_idx=None if mtp_per_depth_targets is not None else batch.get("_packed_seq_ids"),
                     )
 
                 # Joint base + drafter co-training (Gemma4WithDrafter and
