@@ -19,7 +19,7 @@ The journey, measured end to end. Sequence 2048 and FSDP2 across 8 GPUs througho
 | 7 | bf16 projections | 12 | 4 | 1 | 8 | TileLang | + bf16 vocabulary and mixer | 0.514 s | 127.5k | 13.60% |
 | 8 | hand-written mixer kernel | 12 | 4 | 1 | 8 | TileLang | + fused Triton norm-projection | 0.515 s | 127.3k | 13.58% |
 | 9 | fused stream mix | 12 | 4 | 1 | 8 | TileLang | + 4-way mix as multiply-adds | 0.483 s | 135.7k | **14.48%** |
-| 10 | everything, back on the full model | 27 | 3 | 1 | 8 | TileLang | all of the above | 0.900 s | **54.6k** | **11.51%** |
+| 10 | everything applied | 27 | 3 | 1 | 8 | TileLang | all of the above | 0.900 s | **54.6k** | **11.51%** |
 
 `mb` is the micro-batch per GPU, `accum` the gradient accumulation steps, `EP` the expert-parallel
 size. Rows 1-2 and 10 are the real 27-layer model; rows 3-9 use 12 layers so that every step is
