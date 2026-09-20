@@ -17,7 +17,23 @@ All rows: 12 layers, sequence 2048, micro-batch 4, one gradient accumulation ste
 
 **3.0x the MFU, and 19 GB less memory**, on a model stock `transformers` could not train at all.
 
-**Where the remaining time goes**, from the final trace:
+## And on the real model
+
+The 12-layer model keeps the comparison honest against a baseline that could not run. The tuned
+configuration on the **full 27 layers**, 16.5B parameters:
+
+| full model, sequence 2048 | step time | tokens/s | MFU | peak memory |
+| --- | ---: | ---: | ---: | ---: |
+| baseline: eager, loop experts, micro-batch 1 | 23.02 s | 22.8k | 4.80% | 60.5 GB |
+| tuned, micro-batch 2 | 0.742 s | 44.2k | 9.30% | 46.3 GB |
+| tuned, micro-batch 3 | 0.900 s | 54.6k | **11.51%** | 62.1 GB |
+
+**2.4x the MFU and 2.4x the tokens per second on the model people actually train.** The full model
+gains less than the 12-layer one because its attention schedule is 25 compressed and heavily
+compressed layers against 10, and those carry the compressor and indexer work that the levers here
+do not touch.
+
+**Where the remaining time goes**, from the final 12-layer trace:
 
 | category | share |
 | --- | ---: |

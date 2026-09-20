@@ -20,6 +20,8 @@ The journey, measured end to end:
 | 8 | fixing what the profile actually said | **14.5%** |
 
 **3.0x, and 19 GB less memory**, on a model the stock implementation could not train at all.
+On the full 27-layer model the same configuration is worth **2.4x**: 4.80% to 11.51% MFU,
+22.8k to 54.6k tokens per second.
 
 Every number here is a measurement on the same hardware with the same recipe, not a projection.
 Two of the eight stages did not work as expected, and both are kept in the deck: stage 7 bought
