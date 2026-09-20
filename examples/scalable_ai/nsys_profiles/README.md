@@ -93,12 +93,19 @@ calls per iteration per rank. `Proj Med` is the **span** of a range on the GPU t
 of kernel busy time. Sibling and nested ranges therefore overlap: the column does not add up to the step time, and
 these numbers are only meaningful as a same-module ratio across stages, which is how they are used below.
 
+**Not every module range covers its backward pass.** `autonvtx` opens a backward range for each module, but when a
+module's backward runs inside a custom autograd Function the kernels land outside that range. Measured on
+`stage2`, one `iteration_5_ga_step_0`: the two forward-thread `self_attn` ranges hold 16.2 / 16.6 ms of wall time
+and 10.3 / 12.3 ms of kernel time over ~700 kernels each, while the two backward-thread ranges of the same name
+hold 0.02 ms and under 10 kernels. `self_attn` and `indexer` rows below are therefore **forward-only**; `mlp: MoE`,
+`experts`, `attn_hc` and `compressor` cover both passes.
+
 | module (Proj Med x calls, ms/iteration/rank) | stage2 loop | stage3 grouped | stage4 DeepEP | stage5 TileLang |
 | --- | ---: | ---: | ---: | ---: |
 | `experts` | 309.8 | 25.2 | 20.0 | 17.2 |
 | `mlp: MoE` | 311.9 | 32.8 | 28.6 | 21.8 |
-| `self_attn` | 17.3 | 17.2 | 17.7 | 22.1 |
-| `indexer` | 6.8 | 7.7 | 8.0 | 7.7 |
+| `self_attn` (fwd only) | 17.3 | 17.2 | 17.7 | 22.1 |
+| `indexer` (fwd only) | 6.8 | 7.7 | 8.0 | 7.7 |
 | `compressor` | 16.9 | 17.3 | 17.0 | 17.4 |
 | `attn_hc` (mHC) | 13.9 | 18.9 | 20.7 | 4.3 |
 
@@ -111,16 +118,22 @@ launches. Those two are the ladder's control variables -- any delta larger than 
 | --- | --- | ---: |
 | stage2 -> stage3 (grouped GEMM) | `experts` | **12.29x** |
 | stage3 -> stage4 (DeepEP) | `experts` | 1.26x |
-| stage4 -> stage5 (TileLang) | `self_attn` | **0.80x** |
-| stage4 -> stage5 (TileLang) | `indexer` | 1.04x |
+| stage4 -> stage5 (TileLang) | `self_attn`, forward only | **0.80x** |
+| stage4 -> stage5 (TileLang) | `indexer`, forward only | 1.04x |
 | stage4 -> stage5 (TileLang) | `attn_hc` Sinkhorn | **4.81x** |
 
 **`attn: tilelang` is one config key but three kernel families.** The kernels that appear only in `stage5` are
 `sparse_mqa_bwd_kernel` (sparse attention), `tl_indexer_fwd_kernel` (indexer) and the `tile_kernels` Sinkhorn
-kernels (hyper-connections). At the ladder's sequence length the rung's gain comes from the Sinkhorn kernels, not
-from attention: sparse attention is a 0.80x *regression* here, and only becomes the 1.79x win in the parent
-README's per-component table once the sequence is long enough (4096) for the backward saving to outweigh its fixed
-forward cost. Quote the sequence length with either number.
+kernels (hyper-connections). Of the measurable gain at this shape, the Sinkhorn kernels supply most of it: 4.81x
+against 1.04x for the indexer.
+
+The attention rung cannot be scored from this table at all, and the 0.80x above must not be read as "sparse
+attention is slower". TileLang's attention win is in the backward pass -- `sparse_mqa_bwd_kernel` is the largest
+kernel `stage5` introduces (29.45 ms over 72 launches) -- and that kernel runs outside the `self_attn` range, so
+none of it appears in the 17.7 -> 22.1 ms figure. What the 0.80x does say is that the **forward** pass costs more
+with TileLang, which the isolated per-component table in the parent README confirms independently at sequence 4096
+(forward 8.285 -> 9.077 ms, 0.91x) while its backward more than repays it (23.593 -> 8.693 ms, 2.71x, for 1.79x
+overall). Score the attention rung from `profile_layer.py`, not from here.
 
 ## Bottlenecks and where to look next
 
