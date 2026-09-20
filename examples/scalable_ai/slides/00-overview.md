@@ -5,38 +5,33 @@
 A DeepSeek-V4-architecture model at Moonlight scale: 16.5B total parameters, 3.0B active,
 27 layers, 64 experts with top-6 routing plus one shared expert.
 
-The journey, measured end to end. Two tables because the shape changes: the first three stages run
-the **full 27-layer model**, which is where the baseline fails, and the rest run a **12-layer model**
-so that every later step is compared against something that actually runs.
+The journey, measured end to end. Sequence 2048 and FSDP2 across 8 GPUs throughout.
 
-## Stages 0-2: full model, 27 layers, sequence 2048, micro-batch 1, 32 accumulation steps
+| # | change | layers | mb | accum | EP | attention kernel | MoE and fusions | step | tok/s | MFU |
+| ---: | --- | ---: | ---: | ---: | ---: | --- | --- | ---: | ---: | ---: |
+| 0 | stock `transformers` | 27 | 1 | 32 | **1** | eager, dense then mask | HF module list | does not run | - | - |
+| 1 | Automodel native model | 27 | 1 | 32 | 8 | eager | loop experts, all-gather | 23.02 s | 22.8k | 4.80% |
+| 2 | grouped GEMM + DeepEP | 27 | 1 | 32 | 8 | eager | `gmm` + DeepEP | 20.09 s | 26.1k | 5.50% |
+| 3 | batch shape | 12 | 3 | 1 | 8 | eager | `gmm` + DeepEP | 0.658 s | 74.7k | 7.98% |
+| 4 | sparse attention | 12 | 4 | 1 | 8 | **TileLang** sparse + indexer | `gmm` + DeepEP | 0.599 s | 109.4k | 11.69% |
+| 5 | fuse hyper-connections | 12 | 4 | 1 | 8 | TileLang | + `compile_hc` | 0.561 s | 116.8k | 12.47% |
+| 6 | bf16 gradient reduction | 12 | 4 | 1 | 8 | TileLang | + bf16 ReduceScatter | 0.554 s | 118.3k | 12.64% |
+| 7 | bf16 projections | 12 | 4 | 1 | 8 | TileLang | + bf16 vocabulary and mixer | 0.514 s | 127.5k | 13.60% |
+| 8 | hand-written mixer kernel | 12 | 4 | 1 | 8 | TileLang | + fused Triton norm-projection | 0.515 s | 127.3k | 13.58% |
+| 9 | fused stream mix | 12 | 4 | 1 | 8 | TileLang | + 4-way mix as multiply-adds | 0.483 s | 135.7k | **14.48%** |
+| 10 | everything, back on the full model | 27 | 3 | 1 | 8 | TileLang | all of the above | 0.900 s | **54.6k** | **11.51%** |
 
-| # | change | parallelism | attention kernel | MoE kernels | step | MFU |
-| ---: | --- | --- | --- | --- | ---: | ---: |
-| 0 | stock `transformers` | FSDP2 dp8, **ep1** | eager, dense then mask | HF module list, no EP | does not run | - |
-| 1 | Automodel native model | FSDP2 dp8, **ep8** | eager | per-expert loop, all-gather dispatch | 23.02 s | 4.80% |
-| 2 | DeepEP + grouped GEMM | FSDP2 dp8, ep8 | eager | `grouped_gemm`, DeepEP dispatch | 20.09 s | 5.50% |
+`mb` is the micro-batch per GPU, `accum` the gradient accumulation steps, `EP` the expert-parallel
+size. Rows 1-2 and 10 are the real 27-layer model; rows 3-9 use 12 layers so that every step is
+measured against a baseline that runs.
 
-## Stages 3-9: 12 layers, sequence 2048, one accumulation step, FSDP2 dp8 + ep8
+**Read MFU across the whole table, not tokens per second.** Throughput jumps at row 3 mostly because
+the model got shorter, and drops at row 10 because it got long again. MFU is normalised for that.
+The comparison that matters end to end is row 1 against row 10, same model, same hardware:
+**22.8k to 54.6k tokens per second, 4.80% to 11.51% MFU.**
 
-| # | change | micro-batch | attention kernel | MoE and fusions | step | MFU |
-| ---: | --- | ---: | --- | --- | ---: | ---: |
-| 3 | batch shape | 3 | eager | `gmm` + DeepEP | 0.658 s | 7.98% |
-| 4 | sparse attention | 4 | **TileLang** sparse + indexer + Sinkhorn | `gmm` + DeepEP | 0.599 s | 11.69% |
-| 5 | fuse hyper-connections | 4 | TileLang | + `compile_hc` | 0.561 s | 12.47% |
-| 6 | bf16 gradient reduction | 4 | TileLang | + bf16 ReduceScatter | 0.554 s | 12.64% |
-| 7 | bf16 projections | 4 | TileLang | + bf16 vocabulary and mixer projections | 0.514 s | 13.60% |
-| 8 | hand-written mixer kernel | 4 | TileLang | + fused Triton norm-projection | 0.515 s | 13.58% |
-| 9 | fused stream mix | 4 | TileLang | + 4-way mix as fused multiply-adds | 0.483 s | **14.48%** |
-
-Row 7 was measured without the gradient-reduction change and row 8 with it, which is why they agree
-to within run-to-run noise; row 9 has everything. Sequence length is 2048 throughout. It is not a
-lever once attention is sparse: at stage 4, sequence 4096 with micro-batch 2 measured 11.67%, the
-same as sequence 2048 with micro-batch 4 for the same token count.
-
-**3.0x, and 19 GB less memory**, on a model the stock implementation could not train at all.
-On the full 27-layer model the same configuration is worth **2.4x**: 4.80% to 11.51% MFU,
-22.8k to 54.6k tokens per second.
+**2.4x on the full model and 3.0x on the 12-layer one**, with peak memory down from 60.5 GB to
+41.3 GB, on a model the stock implementation could not train at any sequence length.
 
 ## Why stage 0 cannot run, and stage 1 can
 
