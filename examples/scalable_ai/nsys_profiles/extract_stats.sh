@@ -6,34 +6,37 @@
 #   ./extract_stats.sh all                      # every .nsys-rep in the folder
 #   ./extract_stats.sh stage3_groupedgemm ...   # named profiles
 #
-# FORCE=1 re-exports profiles whose CSVs already exist.  nsys builds a .sqlite beside each report on the
-# first run, which is the slow part; later runs reuse it unless FORCE=1 passes --force-export.
-set +e   # keep going if one report fails
+# Only the reports whose CSV is missing are requested, so adding an entry to REPORTS costs one report per
+# profile rather than a full re-export.  FORCE=1 re-requests every report; FORCE_EXPORT=1 additionally
+# rebuilds the .sqlite nsys keeps beside each .nsys-rep, which is the slow part and is only needed when a
+# profile was regenerated in place.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT="$SCRIPT_DIR/stats"
+GEN="$SCRIPT_DIR/regenerate_profiles.sh"
 mkdir -p "$OUT"
+shopt -s nullglob   # an unmatched *.nsys-rep glob must expand to nothing, not to itself
 
 # nvtx_pushpop_sum and nvtx_gpu_proj_sum are the reason regenerate_profiles.sh passes `--nvtx true`:
 # they resolve to module names (DeepseekV4Attention, DeepseekV4Indexer, MoE, GroupedExperts) instead of
 # raw kernel names.  cuda_api_sum carries the kernel *launch* counts, which is where the per-expert loop
-# and the grouped GEMM differ most visibly.
-#
-# nvtx_kern_sum is the one that makes per-module numbers safe to quote.  nvtx_gpu_proj_sum's `Proj *`
-# columns are the *span* of a range on the GPU timeline, gaps included, so a module whose kernels are
-# unchanged but whose launches spread out looks slower.  nvtx_kern_sum sums kernel execution time inside
-# each range instead, which is the number to use when a stage delta is small enough that a span could
-# explain it.  See README.md "What the ladder measures" for where this bit.
+# and the grouped GEMM differ most visibly.  nvtx_kern_sum sums kernel time inside each range, unlike
+# nvtx_gpu_proj_sum's timeline span -- see README.md "What the ladder measures" for when that matters.
 REPORTS=(nvtx_pushpop_sum nvtx_gpu_proj_sum nvtx_kern_sum cuda_gpu_kern_sum cuda_gpu_sum cuda_api_sum)
-STAGES=(stage1_hf_ootb stage2_am_expertloop stage3_groupedgemm stage4_deepep stage5_tilelang)
 
-# nsys wants `--report X --report Y`, so each flag and value must be its own argv entry.
-REPORT_ARGS=()
-for r in "${REPORTS[@]}"; do REPORT_ARGS+=(--report "$r"); done
+# The ladder's membership lives in regenerate_profiles.sh, which is what actually produces the reports.
+# Read it back rather than restating it here, so a renamed or added stage cannot go missing from the stats.
+STAGES=()
+# Stages 4-5 sit indented inside the RUN_HOPPER block, so the match cannot be anchored at column 0.
+while IFS= read -r s; do STAGES+=("$s"); done < <(grep -oE '^[[:space:]]*e2e +stage[A-Za-z0-9_]*' "$GEN" | awk '{print $NF}')
+if [ ${#STAGES[@]} -eq 0 ]; then
+  echo "No 'e2e stage...' lines found in $GEN -- has the ladder been renamed?"
+  exit 1
+fi
 
 case "${1:-}" in
   "")    profiles=("${STAGES[@]}") ;;
-  all)   profiles=(); for f in "$SCRIPT_DIR"/*.nsys-rep; do [ -e "$f" ] && profiles+=("$(basename "$f" .nsys-rep)"); done ;;
+  all)   profiles=(); for f in "$SCRIPT_DIR"/*.nsys-rep; do f="${f##*/}"; profiles+=("${f%.nsys-rep}"); done ;;
   *)     profiles=("$@") ;;
 esac
 
@@ -48,21 +51,26 @@ for name in "${profiles[@]}"; do
     echo "=== $name -- no report, skipping (run regenerate_profiles.sh) ==="
     continue
   fi
-  # One CSV per report is written as <name>_<report>.csv.  Require *every* report's CSV before calling a
-  # profile cached, not just the first: otherwise adding a report to REPORTS silently serves the old set
-  # forever, since the marker file would already exist.
-  missing=0
-  for r in "${REPORTS[@]}"; do [ -s "$OUT/${name}_${r}.csv" ] || missing=1; done
-  if [[ "$missing" == "0" && "${FORCE:-0}" != "1" ]]; then
-    echo "=== $name -- cached, skipping (FORCE=1 to re-export) ==="
+  # One CSV per report is written as <name>_<report>.csv.  Ask only for the ones that are not there yet:
+  # a presence check per report is what lets REPORTS grow without either serving a stale set or redoing
+  # the reports that are already current.
+  want=()
+  for r in "${REPORTS[@]}"; do
+    if [[ "${FORCE:-0}" == "1" || ! -s "$OUT/${name}_${r}.csv" ]]; then want+=("$r"); fi
+  done
+  if [ ${#want[@]} -eq 0 ]; then
+    echo "=== $name -- cached, skipping (FORCE=1 to re-request) ==="
     continue
   fi
-  echo "=== $name ==="
+  echo "=== $name -- ${want[*]} ==="
+  report_args=()
+  for r in "${want[@]}"; do report_args+=(--report "$r"); done
   nsys stats --format csv --output "$OUT" \
-    ${FORCE:+--force-export=true} \
-    "${REPORT_ARGS[@]}" "$report" 2>&1 | grep -vE "^Processing|^Exporting|^\s*$"
+    ${FORCE_EXPORT:+--force-export=true} \
+    "${report_args[@]}" "$report" 2>&1 | grep -vE "^Processing|^Exporting|^\s*$"
 done
 
 echo
 echo "=== CSVs in $OUT ==="
-ls -1 "$OUT"/*.csv 2>/dev/null | sed "s|$OUT/||" || echo "(none written)"
+csvs=("$OUT"/*.csv)
+if [ ${#csvs[@]} -eq 0 ]; then echo "(none written)"; else printf '%s\n' "${csvs[@]##*/}"; fi
