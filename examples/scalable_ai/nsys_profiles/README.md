@@ -178,21 +178,63 @@ What the current evidence says is limiting, in priority order.
    the token gather/scatter into the grouped-GEMM epilogue would keep it off HBM entirely; CUTLASS exposes this
    through the collective epilogue builder's fusion operation, and its group GEMM (variable-size, one kernel) is
    the documented pattern for the expert GEMM itself.
-3. **The GPU is idle for more than half of every step.** Measured over steady-state windows
-   (`iteration_3..5`, both gradient-accumulation steps, rank 0), counting every kernel on every stream plus
-   memcpy and memset:
+3. **The GPU is idle for roughly half of every step, waiting on the host.** Measured over steady-state windows
+   (`iteration_3..5`, both gradient-accumulation steps, rank 0), counting every kernel on every stream -- NCCL
+   included -- plus memcpy and memset, so the remainder is time with nothing running on the GPU at all:
 
-   | stage | iteration | GPU busy | idle | exposed comm | exposed comm as share of iteration |
+   | stage | iteration | GPU busy | of which comm only | **idle** | kernel launches / iter |
    | --- | ---: | ---: | ---: | ---: | ---: |
-   | stage2 per-expert loop | 363.8 ms | 61.3% | 38.7% | 16.58 ms | 4.6% |
-   | stage3 grouped GEMM | 189.5 ms | 39.1% | 60.9% | 11.17 ms | 5.9% |
-   | stage4 DeepEP | 190.5 ms | 46.4% | 53.6% | 23.72 ms | 12.5% |
-   | stage5 TileLang | 140.9 ms | 44.3% | 55.7% | 8.18 ms | 5.8% |
+   | stage2 per-expert loop | 363.8 ms | 66.4% | 5.1% | **33.6%** | 11,406 |
+   | stage3 grouped GEMM | 189.5 ms | 45.8% | 6.6% | **54.2%** | 8,058 |
+   | stage4 DeepEP | 190.5 ms | 58.9% | 12.5% | **41.1%** | 7,656 |
+   | stage5 TileLang | 140.9 ms | 50.2% | 5.8% | **49.8%** | 2,984 |
 
-   Every rung that removes GPU work makes idleness worse, because it does not shorten the gaps. This is the
-   dominant cost at this operating point and it is a property of the shape -- 3 layers, sequence 1024,
-   micro-batch 1 on two GPUs -- not of any backend. It is also why the rungs are hard to score: see the noise
-   floor above.
+   Note the direction: **every rung that removed GPU work made the idle fraction worse** (33.6% -> 49.8%). The
+   host issue rate is the constant, so shrinking kernels exposes more of it. That is also why wall-clock gains
+   exceed GPU-time gains throughout this ladder, and why `stage5` is the fastest rung while its kernel time
+   barely moves -- it issues 3.8x fewer launches than `stage2`.
+
+   Attributing the idle time by what the host thread was doing, for one `stage5` step (68.0 ms wall, 35.1 ms
+   idle across 1,824 gaps):
+
+   | host state during GPU idle | | |
+   | --- | ---: | ---: |
+   | no CUDA API call at all | 30.69 ms | 87.5% |
+   | `cudaLaunchKernel` | 2.46 ms | 7.0% |
+   | `cudaMemcpyAsync` | 0.40 ms | 1.1% |
+   | `cudaDeviceSynchronize` + `cudaStreamWaitEvent` | 0.27 ms | 0.8% |
+
+   So it is **not** synchronization, **not** the launch API, and **not** communication. It is host-side work
+   between launches, at roughly one gap per two kernel launches (1,824 gaps against 3,472 launches) averaging
+   ~19 us.
+
+   **It is not the NVTX instrumentation either**, which is the obvious suspect given `--nvtx true` installs a
+   forward and backward hook on every submodule. The counts rule it out: the step records 354 NVTX ranges but has
+   1,824 idle gaps, and `self_attn` has 12 range instances containing 250 gaps -- 21 gaps inside a single module
+   invocation. Hooks fire twice per invocation and cannot produce that.
+
+   **What the host is actually doing is not identified.** These profiles are captured with `--trace=cuda,nvtx`,
+   which has no CPU or Python sampling, so "no CUDA API on the host" is the limit of what the data supports --
+   PyTorch dispatch, autograd graph construction and backend launch wrappers are all consistent with it. Adding
+   `--python-sampling=true` (and `osrt` to `--trace`) to `regenerate_profiles.sh` would turn that 30.69 ms into
+   named frames. Until then, the per-module ranking below is *where* the host is slow, not *what* it is doing:
+
+   | module | idle inside it | gaps |
+   | --- | ---: | ---: |
+   | `self_attn: DeepseekV4Attention` | 24.6% | 250 |
+   | `model:` outside blocks | 8.6% | 38 |
+   | `indexer: DeepseekV4Indexer` | 8.6% | 77 |
+   | `experts: GroupedExpertsDeepEP` | 7.6% | 191 |
+   | `compressor: DeepseekV4Compressor` | 7.1% | 50 |
+   | the three blocks | 15.4% | 94 |
+   | between modules | 6.0% | 360 |
+
+   The levers this points at are the ones that reduce the *number* of host operations rather than the cost of
+   kernels: a larger micro-batch (the journey table in the parent README shows MFU 6.2% -> 10.5% from
+   micro-batch 1 to 4 on stock transformers, 10.9% -> 15.3% on TileLang), and fusion. CUDA graphs remove host
+   dispatch from the critical path entirely and `benchmark.py` has a `partial_cuda_graph_manager`, but graph
+   capture needs static shapes -- which hold here only because `fake_balanced_gate: true` fixes the tokens per
+   expert, and would not hold under a learned gate without padding to capacity.
 
 4. **AllGather is 93-97% exposed, but the prize is only ~5% of the step.** Measured with
    [`nsys-overlap`](https://gitlab-master.nvidia.com/zhiyul/nsys-overlap)'s 3-bucket decomposition, which assigns
@@ -205,11 +247,11 @@ What the current evidence says is limiting, in priority order.
    | stage4 DeepEP | 92.9% | 96.4% | 64.8% | 54.6% |
    | stage5 TileLang | 96.8% | 95.9% | 52.8% | 53.4% |
 
-   **Quote the fraction and the magnitude together.** Exposed communication is 4.6-12.5% of iteration time
-   (table in item 3), so removing all of it -- every AllGather and ReduceScatter nanosecond perfectly hidden --
+   **Quote the fraction and the magnitude together.** Exposed communication is 5.1-12.5% of iteration time
+   (the "of which comm only" column in item 3), so removing all of it -- every AllGather and ReduceScatter nanosecond perfectly hidden --
    would buy at most that. The 93-97% figure is a statement about overlap quality, not about available headroom.
 
-   This is a consequence of item 3 rather than an independent problem. At ~40% occupancy, essentially any
+   This is a consequence of item 3 rather than an independent problem. At 46-66% GPU occupancy, essentially any
    collective lands in idle time, and the exposure fraction saturates near 100% regardless of how much
    communication there is. Both gradient-accumulation steps show it: `ga_step_0` issues 7.36 ms of AllGather and
    exposes 6.74 ms; `ga_step_1` issues 0.57 ms and exposes 0.57 ms. `ga_step_1` is not better overlapped, it
