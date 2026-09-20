@@ -12,13 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Small real upstream models and cached triplet inputs; no model downloads."""
+"""Small real upstream models; no model downloads."""
 
 import pytest
 import torch
-
-from nemo_automodel.components.flow_matching.adapters.base import FlowMatchingContext
-from nemo_automodel.components.models.wan_animate2.adapter import WanAnimate2Adapter
 
 
 @pytest.fixture
@@ -38,38 +35,3 @@ def tiny_model():
         use_img_emb=True,
         cross_attn_norm=True,
     )
-
-
-@pytest.fixture
-def training_batch():
-    torch.manual_seed(11)
-    latents = torch.randn(1, 16, 2, 4, 4)
-    return {
-        "video_latents": latents,
-        "reference_latents": torch.randn(1, 16, 1, 4, 4),
-        "driving_latents": torch.randn_like(latents),
-        "cond_zero_latents": torch.randn_like(latents),
-        "clip_fea": torch.randn(1, 3, 1280),
-        "clip_fea_ref": torch.randn(1, 3, 1280),
-        "text_embeddings": torch.randn(1, 5, 16),
-        "prompt_ref_embeddings": torch.randn(1, 4, 16),
-    }
-
-
-@pytest.fixture
-def training_inputs(training_batch):
-    """Return two-stream inputs with a supervised reference slot."""
-    batch = training_batch
-    latents = WanAnimate2Adapter().prepare_latents(batch["video_latents"], batch)
-    context = FlowMatchingContext(
-        batch=batch,
-        latents=latents,
-        noisy_latents=torch.randn_like(latents),
-        task_type="i2v",
-        data_type="video",
-        timesteps=torch.tensor([500.0]),
-        sigma=torch.tensor([0.5]),
-        device=torch.device("cpu"),
-        dtype=torch.float32,
-    )
-    return WanAnimate2Adapter().prepare_inputs(context)

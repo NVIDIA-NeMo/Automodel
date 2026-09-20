@@ -621,7 +621,8 @@ class TestLossComputation:
         torch.testing.assert_close(timesteps, torch.tensor([980, 908, 832, 500, 4.96875], dtype=torch.bfloat16))
         prediction = torch.zeros(5, 1, 1, 1, 1)
         _, _, _, _, weights, _ = pipeline.compute_loss(prediction, torch.ones_like(prediction), sigma)
-        torch.testing.assert_close(weights.flatten(), expected_weight, rtol=1e-7, atol=1e-8)
+        # FP32 exp/reductions vary by a few ULPs across CPU kernels; match the FP32-grid test tolerance.
+        torch.testing.assert_close(weights.flatten(), expected_weight, rtol=1e-6, atol=1e-7)
 
     @pytest.mark.parametrize("kwargs", [{"num_train_timesteps": 1}, {"flow_shift": 0}, {"sigma_min": 1.0}])
     def test_discrete_schedule_rejects_invalid_grid(self, simple_adapter, kwargs):

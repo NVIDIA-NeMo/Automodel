@@ -71,7 +71,11 @@ def test_patch_applies_on_buggy_diffusers(apply_patch, ops):
 
     any_buggy = False
     for name, (fixed_op, marker) in ops.items():
-        if marker in inspect.getsource(originals[name]):
+        # Fixed 0.40 backward ops accept model-layout ring-loop Q/K/V overrides.
+        legacy_backward = "query" not in inspect.signature(originals[name]).parameters
+        if marker in inspect.getsource(originals[name]) and (
+            marker != patches._BUGGY_KV_TRANSPOSE_MARKER or legacy_backward
+        ):
             any_buggy = True
             assert getattr(attention_dispatch, name) is fixed_op
         else:
@@ -91,8 +95,27 @@ def test_patch_is_idempotent(apply_patch, ops):
 def test_patch_skips_fixed_upstream(monkeypatch, apply_patch, ops):
     from diffusers.models import attention_dispatch
 
-    def already_fixed_op(ctx, *args, **kwargs):
-        return None
+    def already_fixed_op(
+        ctx: torch.autograd.function.FunctionCtx,
+        query: torch.Tensor,
+        key: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Represent the fixed upstream model-to-kernel layout conversion.
+
+        Args:
+            ctx: Unused autograd context for the source-inspection fixture.
+            query: Tensor of shape [batch, query_tokens, heads, head_dim].
+            key: Tensor of shape [batch, key_tokens, heads, head_dim].
+
+        Returns:
+            Query and key tensors of shape [batch, heads, query_tokens,
+            head_dim] and [batch, heads, key_tokens, head_dim], respectively.
+        """
+        # Fixed upstream retains the key transpose; it must not trigger the
+        # old-layout workaround because query is transposed here as well.
+        query = query.transpose(1, 2).contiguous()
+        key = key.transpose(1, 2).contiguous()
+        return query, key
 
     for name in ops:
         monkeypatch.setattr(attention_dispatch, name, already_fixed_op)
@@ -210,10 +233,10 @@ def _sdpa_reference(
 
 @requires_cuda
 def test_fixed_native_flash_backward_matches_sdpa_grads():
-    """The patched flash backward must reproduce SDPA autograd gradients.
+    """The selected native-flash forward/backward pair must match SDPA gradients.
 
-    The unpatched diffusers op re-transposes the already-transposed key/value
-    saved by the forward, so it either raises or produces garbage gradients.
+    Older Diffusers uses the legacy fix; fixed upstream versions keep their
+    matched model-layout forward/backward contract.
     """
     from diffusers.models import attention_dispatch
 
@@ -221,11 +244,33 @@ def test_fixed_native_flash_backward_matches_sdpa_grads():
     grad_out = torch.randn_like(query)
 
     ctx = _FakeFunctionCtx()
+    patches.apply_native_flash_backward_patch()
     out = attention_dispatch._native_flash_attention_forward_op(ctx, query, key, value)
-    grad_query, grad_key, grad_value = patches._fixed_native_flash_attention_backward_op(ctx, grad_out)
+    grad_query, grad_key, grad_value = attention_dispatch._native_flash_attention_backward_op(ctx, grad_out)
 
     ref_out, ref_gq, ref_gk, ref_gv = _sdpa_reference(query, key, value, grad_out)
     torch.testing.assert_close(out, ref_out, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(grad_query, ref_gq, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(grad_key, ref_gk, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(grad_value, ref_gv, atol=3e-2, rtol=3e-2)
+
+
+@requires_cuda
+def test_legacy_native_flash_backward_matches_sdpa_grads() -> None:
+    """Retain numerical coverage of the legacy fix's explicit kernel-layout context."""
+    query, key, value = _model_layout_qkv(seed=3)
+    grad_out = torch.randn_like(query)
+    query_t, key_t, value_t = (tensor.transpose(1, 2).contiguous() for tensor in (query, key, value))
+    out, lse, cum_seq_q, cum_seq_k, max_q, max_k, seed, offset, _ = torch.ops.aten._scaled_dot_product_flash_attention(
+        query_t, key_t, value_t
+    )
+    ctx = _FakeFunctionCtx()
+    ctx.save_for_backward(query_t, key_t, value_t, out, lse, cum_seq_q, cum_seq_k, seed, offset)
+    ctx.max_q, ctx.max_k = max_q, max_k
+    ctx.dropout_p, ctx.is_causal, ctx.scale = 0.0, False, None
+    grad_query, grad_key, grad_value = patches._fixed_native_flash_attention_backward_op(ctx, grad_out)
+    ref_out, ref_gq, ref_gk, ref_gv = _sdpa_reference(query, key, value, grad_out)
+    torch.testing.assert_close(out.transpose(1, 2), ref_out, atol=3e-2, rtol=3e-2)
     torch.testing.assert_close(grad_query, ref_gq, atol=3e-2, rtol=3e-2)
     torch.testing.assert_close(grad_key, ref_gk, atol=3e-2, rtol=3e-2)
     torch.testing.assert_close(grad_value, ref_gv, atol=3e-2, rtol=3e-2)
