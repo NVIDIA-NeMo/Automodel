@@ -19,7 +19,7 @@ that looks fine is measuring the wrong implementation. Source those exports befo
 
 Only end-to-end profiles are produced here. Per-module timings can be read straight out of these reports --
 `--nvtx true` annotates every submodule's forward and backward, so
-`nsys stats --report nvtx_gpu_proj_sum <profile>.nsys-rep` breaks a step down by module. `./extract_stats.sh`
+`nsys stats --report nvtx_kern_sum <profile>.nsys-rep` breaks a step down by module. `./extract_stats.sh`
 runs that report and five others over the whole ladder and writes one CSV per report per profile into `stats/`,
 which is how the tables below were produced; it skips a profile only when every report's CSV is already present,
 so adding a report re-exports rather than serving a stale set. To profile a module in
@@ -91,52 +91,78 @@ pretraining recipe sets `fake_balanced_gate: false` and leaves the hash layer on
 
 ### What the ladder measures
 
-Per-module numbers from `nsys stats --report nvtx_gpu_proj_sum <stage>.nsys-rep`, as `Proj Med` times the module's
-calls per iteration per rank. `Proj Med` is the **span** of a range on the GPU timeline, gaps included -- not a sum
-of kernel busy time. Sibling and nested ranges therefore overlap: the column does not add up to the step time, and
-these numbers are only meaningful as a same-module ratio across stages, which is how they are used below.
+Per-module numbers from `nsys stats --report nvtx_kern_sum <stage>.nsys-rep`, which sums **kernel execution time**
+inside each NVTX range. Use this report, not `nvtx_gpu_proj_sum`: the latter's `Proj *` columns are the *span* of a
+range on the GPU timeline, gaps included, so a module whose kernels are unchanged but whose launches spread out
+reads as slower. Scored with spans, this ladder overstated every win it found and hid two regressions entirely.
 
 **Not every module range covers its backward pass.** `autonvtx` opens a backward range for each module, but when a
 module's backward runs inside a custom autograd Function the kernels land outside that range. Measured on
 `stage2`, one `iteration_5_ga_step_0`: the two forward-thread `self_attn` ranges hold 16.2 / 16.6 ms of wall time
 and 10.3 / 12.3 ms of kernel time over ~700 kernels each, while the two backward-thread ranges of the same name
-hold 0.02 ms and under 10 kernels. `self_attn` and `indexer` rows below are therefore **forward-only**; `mlp: MoE`,
+hold 0.02 ms and under 10 kernels. `self_attn` and `indexer` are therefore **forward-only**; `mlp: MoE`,
 `experts`, `attn_hc` and `compressor` cover both passes.
 
-| module (Proj Med x calls, ms/iteration/rank) | stage2 loop | stage3 grouped | stage4 DeepEP | stage5 TileLang |
+| module (kernel time, ms, whole capture, both ranks) | stage2 loop | stage3 grouped | stage4 DeepEP | stage5 TileLang |
 | --- | ---: | ---: | ---: | ---: |
-| `experts` | 309.8 | 25.2 | 20.0 | 17.2 |
-| `mlp: MoE` | 311.9 | 32.8 | 28.6 | 21.8 |
-| `self_attn` (fwd only) | 17.3 | 17.2 | 17.7 | 22.1 |
-| `indexer` (fwd only) | 6.8 | 7.7 | 8.0 | 7.7 |
-| `compressor` | 16.9 | 17.3 | 17.0 | 17.4 |
-| `attn_hc` (mHC) | 13.9 | 18.9 | 20.7 | 4.3 |
+| `experts` | 1964.9 | 203.4 | 5535.6 | 5512.2 |
+| `mlp: MoE` | 1979.9 | 218.6 | 5551.3 | 5527.9 |
+| `self_attn` (fwd only) | 131.7 | 196.9 | 142.1 | 158.4 |
+| `indexer` (fwd only) | 18.7 | 16.9 | 18.1 | 24.3 |
+| `compressor` | 34.9 | 31.8 | 36.7 | 53.3 |
+| `attn_hc` (mHC) | 69.2 | 69.3 | 69.4 | 22.3 |
 
-Each rung moves its own module and leaves the others flat, which is what makes the ladder readable: `compressor`
-stays within 16.9-17.4 ms across all four stages, and the dense GEMM no rung touches
-(`sm90_xmma_gemm_f32f32_tf32f32_f32_nt_n_tilesize256x128x32`) costs 68.00 / 67.99 / 67.89 / 67.88 ms over 24
-launches. Those two are the ladder's control variables -- any delta larger than ~0.2% is signal. So:
+#### The noise floor, and which deltas the ladder can resolve
+
+No rung before stage 5 touches attention, so stages 2-4 are three replicates of the same attention work and their
+spread *is* this ladder's noise floor -- per module, because it differs per module by two orders of magnitude:
+
+| module | stage2-4 spread | resolves to | stage5 | verdict |
+| --- | --- | ---: | ---: | --- |
+| `attn_hc` | 69.2 / 69.3 / 69.4 | 0.1% | 22.3 | **3.11x**, far outside the spread |
+| `indexer` | 18.7 / 16.9 / 18.1 | ~5% | 24.3 | **0.74x**, a real regression |
+| `compressor` | 34.9 / 31.8 / 36.7 | ~7% | 53.3 | **0.69x**, a real regression |
+| `self_attn` | 131.7 / 196.9 / 142.1 | ~20% | 158.4 | **not resolvable** -- inside the spread |
+
+Quote a delta only when it clears its module's spread. `self_attn` does not: 158.4 sits between the 131.7 and
+196.9 this ladder produces for stages that changed nothing about attention.
 
 | rung | component it targets | speed-up |
 | --- | --- | ---: |
-| stage2 -> stage3 (grouped GEMM) | `experts` | **12.29x** |
-| stage3 -> stage4 (DeepEP) | `experts` | 1.26x |
-| stage4 -> stage5 (TileLang) | `self_attn`, forward only | **0.80x** |
-| stage4 -> stage5 (TileLang) | `indexer`, forward only | 1.04x |
-| stage4 -> stage5 (TileLang) | `attn_hc` Sinkhorn | **4.81x** |
+| stage2 -> stage3 (grouped GEMM) | `experts` | **9.66x** |
+| stage2 -> stage3 (grouped GEMM) | `mlp: MoE` | 9.06x |
+| stage4 -> stage5 (TileLang) | `attn_hc` Sinkhorn | **3.11x** |
+| stage4 -> stage5 (TileLang) | `indexer`, forward only | **0.74x** |
+| stage4 -> stage5 (TileLang) | `compressor` | **0.69x** |
+| stage4 -> stage5 (TileLang) | `self_attn`, forward only | not resolvable |
+
+**The DeepEP rung cannot be scored from this table.** `nvtx_kern_sum` has no time filter, and DeepEP JIT-compiles
+during the first captured iteration, so stages 4-5 are almost entirely warmup:
+
+```
+kernel time, iteration_0_ga_step_0 -> iteration_5_ga_step_0
+  stage2    140.3 ->  56.6 ms
+  stage3    239.7 ->  39.5 ms
+  stage4   2777.0 ->  46.7 ms     <- 59x the steady step
+  stage5   2849.5 ->  31.1 ms
+```
+
+The attention-side rows survive that because their kernel counts are identical across stages 2-4 (8388, 1956,
+32004 and 4780 respectively), so warmup contributes the same fraction everywhere and cancels in the ratio. The MoE
+rows do not. Scoring DeepEP needs a capture that excludes iteration 0 -- `--benchmark.nsys_start 4` in
+`regenerate_profiles.sh` -- which means re-running those two profiles.
 
 **`attn: tilelang` is one config key but three kernel families.** The kernels that appear only in `stage5` are
 `sparse_mqa_bwd_kernel` (sparse attention), `tl_indexer_fwd_kernel` (indexer) and the `tile_kernels` Sinkhorn
-kernels (hyper-connections). Of the measurable gain at this shape, the Sinkhorn kernels supply most of it: 4.81x
-against 1.04x for the indexer.
+kernels (hyper-connections). At this shape that bundle is **one large win and two regressions**: Sinkhorn 3.11x,
+indexer 0.74x, compressor 0.69x. `attn_hc`'s kernel count drops 32004 -> 3780 for the win; `indexer` and
+`compressor` keep identical kernel counts and simply cost more.
 
-The attention rung cannot be scored from this table at all, and the 0.80x above must not be read as "sparse
-attention is slower". TileLang's attention win is in the backward pass -- `sparse_mqa_bwd_kernel` is the largest
-kernel `stage5` introduces (29.45 ms over 72 launches) -- and that kernel runs outside the `self_attn` range, so
-none of it appears in the 17.7 -> 22.1 ms figure. What the 0.80x does say is that the **forward** pass costs more
-with TileLang, which the isolated per-component table in the parent README confirms independently at sequence 4096
-(forward 8.285 -> 9.077 ms, 0.91x) while its backward more than repays it (23.593 -> 8.693 ms, 2.71x, for 1.79x
-overall). Score the attention rung from `profile_layer.py`, not from here.
+The sparse-attention kernel the rung is named for cannot be scored here at all -- `self_attn` is below the noise
+floor, and `sparse_mqa_bwd_kernel` runs outside the `self_attn` range anyway, so TileLang's backward win is not in
+these numbers even in principle. The only trustworthy attention figure is the isolated one in the parent README:
+at sequence 4096, forward 8.285 -> 9.077 ms (0.91x) and backward 23.593 -> 8.693 ms (2.71x), for **1.79x** overall.
+Score the attention rung from `profile_layer.py`, not from here.
 
 ## Bottlenecks and where to look next
 
@@ -168,7 +194,8 @@ Gaps in this profiling setup, which bound how far the above can be trusted:
   would reorder the rungs.
 - **DeepEP is measured where it cannot win.** `ep_size 2` on a single node, plus the `fake_balanced_gate`
   convention noted above, removes exactly the load imbalance and cross-node traffic DeepEP exists to fix -- hence
-  1.26x on its own module and ~1.00x end to end here, against 1.14x at EP 8 in the parent README's journey table.
+  ~1.00x end to end here, against 1.14x at EP 8 in the parent README's journey table. Its per-module effect is not
+  measurable from these captures either, for the warmup reason given above.
 - **Two rungs are not single-knob deltas.** Stage 1 runs 2 layers for the reason given above, so `stage1 ->
   stage2` is not a valid delta; `moonlight_v4_torch_small` is the like-for-like control and is not yet in the
   ladder's own stats. And `attn: tilelang` bundles three kernel families; splitting it into three sub-rungs would
