@@ -119,7 +119,7 @@ ci:
   checkpoint_robustness:
     hf_device_map_auto: true
     experts_implementation: grouped_mm
-    trust_remote_code: true
+    trust_remote_code: false  # Match the default PEFT export's built-in Transformers v5 layout.
     tokenizer_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
     distributed.ep_size: 8
     dataset.num_samples_limit: 500

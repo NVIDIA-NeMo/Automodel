@@ -125,6 +125,6 @@ ci:
     # tp_size stays at the base value (1): the dense Nemotron-H custom path is FSDP2-only.
     # Use the same cached family tokenizer for the long parity document.
     tokenizer_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
-    trust_remote_code: true
+    trust_remote_code: false  # Match the default PEFT export's built-in Transformers v5 layout.
     dataset.limit_dataset_samples: 500
     validation_dataset.limit_dataset_samples: 500
