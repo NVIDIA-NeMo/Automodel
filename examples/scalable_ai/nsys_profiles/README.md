@@ -178,11 +178,26 @@ What the current evidence says is limiting, in priority order.
    the token gather/scatter into the grouped-GEMM epilogue would keep it off HBM entirely; CUTLASS exposes this
    through the collective epilogue builder's fusion operation, and its group GEMM (variable-size, one kernel) is
    the documented pattern for the expert GEMM itself.
-3. **FSDP2's AllGather is essentially never overlapped: 93-97% of it is exposed.** Measured with
+3. **The GPU is idle for more than half of every step.** Measured over steady-state windows
+   (`iteration_3..5`, both gradient-accumulation steps, rank 0), counting every kernel on every stream plus
+   memcpy and memset:
+
+   | stage | iteration | GPU busy | idle | exposed comm | exposed comm as share of iteration |
+   | --- | ---: | ---: | ---: | ---: | ---: |
+   | stage2 per-expert loop | 363.8 ms | 61.3% | 38.7% | 16.58 ms | 4.6% |
+   | stage3 grouped GEMM | 189.5 ms | 39.1% | 60.9% | 11.17 ms | 5.9% |
+   | stage4 DeepEP | 190.5 ms | 46.4% | 53.6% | 23.72 ms | 12.5% |
+   | stage5 TileLang | 140.9 ms | 44.3% | 55.7% | 8.18 ms | 5.8% |
+
+   Every rung that removes GPU work makes idleness worse, because it does not shorten the gaps. This is the
+   dominant cost at this operating point and it is a property of the shape -- 3 layers, sequence 1024,
+   micro-batch 1 on two GPUs -- not of any backend. It is also why the rungs are hard to score: see the noise
+   floor above.
+
+4. **AllGather is 93-97% exposed, but the prize is only ~5% of the step.** Measured with
    [`nsys-overlap`](https://gitlab-master.nvidia.com/zhiyul/nsys-overlap)'s 3-bucket decomposition, which assigns
    every nanosecond of merged collective wall time to hidden-by-deep-compute, hidden-by-light-compute, or truly
-   exposed (compute stream idle). Steady-state windows only (`iteration_3..5`, both gradient-accumulation steps),
-   both ranks:
+   exposed (compute stream idle). Steady-state windows, both ranks:
 
    | stage | AG exposed, rank 0 | AG exposed, rank 1 | RS exposed, rank 0 | RS exposed, rank 1 |
    | --- | ---: | ---: | ---: | ---: |
@@ -190,30 +205,45 @@ What the current evidence says is limiting, in priority order.
    | stage4 DeepEP | 92.9% | 96.4% | 64.8% | 54.6% |
    | stage5 TileLang | 96.8% | 95.9% | 52.8% | 53.4% |
 
-   ReduceScatter is roughly half hidden; AllGather is not hidden at all. The model gives the prefetcher almost
-   nothing to hide it behind -- in `stage3` the compute stream holds 503 ms of kernel wall time, but GEMM-shaped
-   work is a small fraction of it, the rest being the elementwise traffic item 1 describes. The same pathology is
-   documented for Qwen3-MoE-30B in the `nsys-overlap` README, where registering expert GEMM streams as valid
-   overlap partners for the AG prefetcher was the identified fix. Worth testing here, though note this model runs
-   its experts on the main compute stream rather than on dedicated ones, so the mechanism differs.
+   **Quote the fraction and the magnitude together.** Exposed communication is 4.6-12.5% of iteration time
+   (table in item 3), so removing all of it -- every AllGather and ReduceScatter nanosecond perfectly hidden --
+   would buy at most that. The 93-97% figure is a statement about overlap quality, not about available headroom.
 
-4. **`sparse_mqa_bwd_kernel` is the single largest attention kernel** once TileLang is on. Whether it is
+   This is a consequence of item 3 rather than an independent problem. At ~40% occupancy, essentially any
+   collective lands in idle time, and the exposure fraction saturates near 100% regardless of how much
+   communication there is. Both gradient-accumulation steps show it: `ga_step_0` issues 7.36 ms of AllGather and
+   exposes 6.74 ms; `ga_step_1` issues 0.57 ms and exposes 0.57 ms. `ga_step_1` is not better overlapped, it
+   simply gathers almost nothing, because `reshard_after_forward: false` keeps the parameters resident between
+   micro-batches.
+
+   **Prefetch tuning is not the fix here.** The single largest exposed interval is 2.28 ms at 54% of `ga_step_0`,
+   reproducible to three significant figures across iterations (2.35 / 2.34 / 2.28 ms), sitting between the close
+   of forward and the open of backward with no module range active and `split_with_sizes_copy_out_contiguous`
+   -- FSDP2's all-gather copy-out -- as the next compute. Issuing it earlier would move it into a window that is
+   84% idle: compute occupancy is 6.5% in the 2 ms before it and 16-21% in the 20 ms before, against 99% in the
+   2 ms after. The dense compute follows the gather because it depends on it. What would remove that interval is
+   widening `reshard_after_forward: false` beyond the MoE unit group so the parameters are never resharded, at a
+   cost in memory -- the constraint that makes this model fit in the first place.
+
+5. **`sparse_mqa_bwd_kernel` is the single largest attention kernel** once TileLang is on. Whether it is
    bandwidth-, occupancy- or latency-limited is a kernel-internal question Nsight Systems cannot answer -- capture
    it with Nsight Compute (Speed of Light plus memory workload analysis) before changing it.
 
 ### What the exposed-communication numbers do and do not support
 
-The exposed percentages above were checked four ways before being written down, because a single overlap number is
-easy to get wrong:
+The exposed percentages were checked five ways before being written down, because a single overlap number is easy
+to over-read:
 
-- **Not a warmup artifact.** Restricting to `iteration_3..5` changes nothing; `nsys-overlap` run over the whole
+- **Not a warmup artifact.** Restricting to `iteration_3..5` changes nothing; `nsys-overlap` over the whole
   capture gives 92.5 / 94.3 / 93.7 / 97.6% for AG against 95.2 / 96.2 / 92.9 / 96.8% windowed.
 - **Not an artifact of one rank.** Both ranks agree, on different compute streams (7 and 21).
-- **Not an artifact of one implementation.** An independent interval-intersection written directly against
+- **Not an artifact of one implementation.** An independent interval intersection written directly against
   `CUPTI_ACTIVITY_KIND_KERNEL` reproduces `nsys-overlap` within ~2 points on every stage.
 - **Not a stream-classification error.** The tool's own README warns its heuristic can misclassify MoE expert
   streams. Here each profile has one dominant compute stream (410-503 ms) with the rest being NCCL, DeepEP
-  dispatch, and optimizer streams, so there is no hidden expert-GEMM stream to miss.
+  dispatch and optimizer streams, so there is no hidden expert-GEMM stream to miss. Counting *all* streams plus
+  memory operations moves occupancy by under 2 points (36.2% to 36.7% in `stage3`).
+- **Not a big lever.** See the magnitude check in item 4.
 
 Two things the numbers do **not** support:
 
@@ -222,10 +252,11 @@ Two things the numbers do **not** support:
   `torch._grouped_mm` or TileLang kernels. The A-versus-B split is therefore unreliable here. Only bucket C --
   comm time with the compute stream fully idle -- is robust, since it depends on kernel presence rather than
   kernel naming.
-- **Absolute exposed milliseconds.** Exposed AG ranges over 12.9-42.9 ms between stages, including a 3x swing
-  between two stages that share a dispatcher, so only the *fraction* is stable enough to quote.
+- **Absolute exposed milliseconds per stage.** Exposed comm ranges over 8.18-23.72 ms between stages, including a
+  3x swing between two stages that share a dispatcher, so only the fraction is stable enough to compare rungs.
 
 Scope: 2 ranks, one node, `ep_size 2`, sequence 1024. Whether AllGather stays this exposed at EP 8 across nodes is
+untested here, and the journey table's 1.14x for DeepEP at EP 8 suggests it does not.
 untested here.
 
 Gaps in this profiling setup, which bound how far the above can be trusted:
