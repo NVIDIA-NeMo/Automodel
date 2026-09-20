@@ -86,6 +86,78 @@ removes expert load-imbalance noise and applies to the Automodel stages only -- 
 pretraining recipe sets `fake_balanced_gate: false` and leaves the hash layer on.
 
 
+### What the ladder measures
+
+Per-module numbers from `nsys stats --report nvtx_gpu_proj_sum <stage>.nsys-rep`, as `Proj Med` times the module's
+calls per iteration per rank. `Proj Med` is the **span** of a range on the GPU timeline, gaps included -- not a sum
+of kernel busy time. Sibling and nested ranges therefore overlap: the column does not add up to the step time, and
+these numbers are only meaningful as a same-module ratio across stages, which is how they are used below.
+
+| module (Proj Med x calls, ms/iteration/rank) | stage2 loop | stage3 grouped | stage4 DeepEP | stage5 TileLang |
+| --- | ---: | ---: | ---: | ---: |
+| `experts` | 309.8 | 25.2 | 20.0 | 17.2 |
+| `mlp: MoE` | 311.9 | 32.8 | 28.6 | 21.8 |
+| `self_attn` | 17.3 | 17.2 | 17.7 | 22.1 |
+| `indexer` | 6.8 | 7.7 | 8.0 | 7.7 |
+| `compressor` | 16.9 | 17.3 | 17.0 | 17.4 |
+| `attn_hc` (mHC) | 13.9 | 18.9 | 20.7 | 4.3 |
+
+Each rung moves its own module and leaves the others flat, which is what makes the ladder readable: `compressor`
+stays within 16.9-17.4 ms across all four stages, and the dense GEMM no rung touches
+(`sm90_xmma_gemm_f32f32_tf32f32_f32_nt_n_tilesize256x128x32`) costs 68.00 / 67.99 / 67.89 / 67.88 ms over 24
+launches. Those two are the ladder's control variables -- any delta larger than ~0.2% is signal. So:
+
+| rung | component it targets | speed-up |
+| --- | --- | ---: |
+| stage2 -> stage3 (grouped GEMM) | `experts` | **12.29x** |
+| stage3 -> stage4 (DeepEP) | `experts` | 1.26x |
+| stage4 -> stage5 (TileLang) | `self_attn` | **0.80x** |
+| stage4 -> stage5 (TileLang) | `indexer` | 1.04x |
+| stage4 -> stage5 (TileLang) | `attn_hc` Sinkhorn | **4.81x** |
+
+**`attn: tilelang` is one config key but three kernel families.** The kernels that appear only in `stage5` are
+`sparse_mqa_bwd_kernel` (sparse attention), `tl_indexer_fwd_kernel` (indexer) and the `tile_kernels` Sinkhorn
+kernels (hyper-connections). At the ladder's sequence length the rung's gain comes from the Sinkhorn kernels, not
+from attention: sparse attention is a 0.80x *regression* here, and only becomes the 1.79x win in the parent
+README's per-component table once the sequence is long enough (4096) for the backward saving to outweigh its fixed
+forward cost. Quote the sequence length with either number.
+
+## Bottlenecks and where to look next
+
+What the current evidence says is limiting, in priority order.
+
+1. **The per-expert loop is HBM-bandwidth bound, not compute bound.** In one steady-state `stage2` gradient-
+   accumulation step (`iteration_5_ga_step_0`, 185 ms of wall time on one rank), `CUDAFunctor_add` and
+   `FillFunctor` account for 137 ms of GPU time. Their launch geometry (`grid 90112 x block 128 x 8 elements`) is
+   exactly `64 experts x 1024 tokens x 1408 intermediate`: the loop zero-fills and scatter-adds a full `[E, T, I]`
+   buffer per expert. At ~1.11 GB moved per 361 us launch those kernels already run near HBM3 peak, so there is no
+   kernel to tune -- only the traffic to remove, which is what `experts: torch_mm` does.
+2. **`_permute_kernel` / `_unpermute_kernel` are the largest remaining MoE overhead** in the DeepEP stages. Fusing
+   the token gather/scatter into the grouped-GEMM epilogue would keep it off HBM entirely; CUTLASS exposes this
+   through the collective epilogue builder's fusion operation, and its group GEMM (variable-size, one kernel) is
+   the documented pattern for the expert GEMM itself.
+3. **`sparse_mqa_bwd_kernel` is the single largest attention kernel** once TileLang is on. Whether it is
+   bandwidth-, occupancy- or latency-limited is a kernel-internal question Nsight Systems cannot answer -- capture
+   it with Nsight Compute (Speed of Light plus memory workload analysis) before changing it.
+
+Gaps in this profiling setup, which bound how far the above can be trusted:
+
+- **Memory is not captured.** `regenerate_profiles.sh` passes `--cuda-memory-usage=true`, but
+  `CUDA_GPU_MEMORY_USAGE_EVENTS` is empty in the stage reports. Peak memory is the headline of the parent README's
+  reference tables (22.0 -> 14.2 GB, and only the TileLang path fits micro-batch 8) and none of it can be read
+  here; those numbers come from `max_memory_allocated` in the bench runs instead.
+- **The ladder is profiled at a launch-bound operating point.** At the `E2E_COMMON` shape above, wall-clock gains
+  (1.92x for grouped GEMM) exceed GPU-time gains (1.50x), so the ladder flatters operation-count reductions and
+  understates bandwidth ones. Re-running it at the journey shape (4 layers, sequence 2048, micro-batch 4, 8 GPUs)
+  would reorder the rungs.
+- **DeepEP is measured where it cannot win.** `ep_size 2` on a single node, plus the `fake_balanced_gate`
+  convention noted above, removes exactly the load imbalance and cross-node traffic DeepEP exists to fix -- hence
+  1.26x on its own module and ~1.00x end to end here, against 1.14x at EP 8 in the parent README's journey table.
+- **Two rungs are not single-knob deltas.** Stage 1 runs 2 layers for the reason given above, so `stage1 ->
+  stage2` is not a valid delta; `moonlight_v4_torch_small` is the like-for-like control and is not yet in the
+  ladder's own stats. And `attn: tilelang` bundles three kernel families; splitting it into three sub-rungs would
+  make that delta attributable.
+
 ## Viewing profiles
 
 ```bash

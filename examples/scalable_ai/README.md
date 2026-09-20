@@ -143,6 +143,41 @@ Operational notes for containers: put `TILELANG_CACHE_DIR`, `TRITON_CACHE_DIR` a
 writable filesystem (`run_bench.sh` does); when tilelang cannot create its cache directory its import fails and
 Automodel silently falls back to the transformers model class, which then rejects the `backend` argument.
 
+## Per-component numbers
+
+The tables above are end-to-end. These isolate one layer at a time, so each row attributes a speed-up to the
+backend knob that causes it. Numbers are `profile_layer.py` defaults (one layer, batch 1, **sequence 4096**,
+bfloat16, single process, no EP), read from the `nsys_profiles/` reports as the median of the last 8 of the 10
+profiled iterations; forward and backward are separate NVTX ranges, so they are reported separately. Reproduce a
+row by wrapping the command in the `nsys profile -c cudaProfilerApi -t cuda,nvtx` invocation `profile_layer.py`'s
+module docstring gives, or drop `--no-nsys` from the Quick start commands above to get the timings on stdout.
+
+| `profile_layer.py` arguments | fwd (ms) | bwd (ms) | fwd+bwd (ms) | speed-up |
+| --- | ---: | ---: | ---: | --- |
+| `--layer moe --backend-experts torch` | 39.470 | 101.576 | 141.046 | baseline (per-expert loop) |
+| `--layer moe --backend-experts torch_mm` | 2.559 | 4.835 | 7.394 | **19.08x** over the loop |
+| `--layer moe --backend-experts te` | 2.550 | 4.836 | 7.386 | 1.00x over `torch_mm` |
+| `--layer moe --use-hf` | 1.411 | 5.665 | 7.076 | 1.04x over `torch_mm` (transformers is faster) |
+| `--layer attn --compress-ratio 4` | 8.285 | 23.593 | 31.878 | baseline (eager) |
+| `--layer attn --compress-ratio 4 --backend-attn tilelang` | 9.077 | 8.693 | 17.770 | **1.79x** over eager |
+| `--layer hc --use-hf` | 2.112 | 6.031 | 8.144 | baseline |
+| `--layer hc` | 2.014 | 5.291 | 7.305 | 1.11x over transformers |
+
+Reading the table:
+
+- **Both headline optimizations are backward-pass optimizations.** Grouped GEMM removes 101.6 -> 4.8 ms of
+  backward; TileLang removes 23.6 -> 8.7 ms of backward while *losing* 0.8 ms in forward. Neither is an
+  inference-style forward kernel win.
+- **`experts: te` is indistinguishable from `torch_mm` here** (7.386 vs 7.394 ms). This profile uses neither FP8
+  nor a fused epilogue, which is where TE normally pays; it does mean the TE dependency buys nothing at this shape.
+- **The expert GEMM is not where Automodel beats transformers** -- the HF MoE layer is 4% faster in isolation.
+  `profile_layer.py` runs one process, so the dispatcher and EP sharding that make Automodel's MoE win at scale
+  are not in this measurement.
+
+The same components measured *inside* the stage ladder -- per-module timings, the ladder's control
+variables, and the bottlenecks those profiles point at -- are in
+[`nsys_profiles/README.md`](nsys_profiles/README.md), which owns the stage-ladder definitions.
+
 ## Changes from the January 2026 edition
 
 - Model: DeepSeek-V3 / Moonlight-16B-A3B -> DeepSeek-V4 / Moonlight-V4-16B-A3B; layer profiles cover SWA/CSA/HCA
