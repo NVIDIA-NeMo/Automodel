@@ -53,12 +53,23 @@ E2E_COMMON=(--benchmark.nsys_start 3 --benchmark.nsys_end 5 --benchmark.nsys_ran
             --step_scheduler.global_batch_size 4 --step_scheduler.local_batch_size 1 --dataset.seq_len 1024
             --nvtx true)
 
+# --trace=osrt records the OS-runtime calls the compute thread makes, which is how a "the host is blocked"
+# hypothesis gets tested rather than assumed: on these captures it showed the main thread blocked for only
+# 8% of the GPU stall, the rest being userspace execution.  --python-sampling periodically captures the
+# Python stack, which is the only way to attribute that userspace time to frames.  Note it needs CPU
+# IP/backtrace sampling to be available on the host: where `kernel.perf_event_paranoid` forbids it (or the
+# container lacks SYS_ADMIN) the injection still loads but collects nothing, and the report records
+# "Unable to configure the collection of CPU IP/backtrace samples" in its diagnostics.  Check with
+# `nsys status --environment`.
+NSYS_ARGS=(--force-overwrite true -c cudaProfilerApi --trace=cuda,nvtx,osrt --cuda-memory-usage=true
+           --python-sampling=true --python-sampling-frequency=2000)
+
 e2e() {  # name config extra-args...
   local name=$1 config=$2; shift 2
   local report="$OUT/$name.nsys-rep" stamp="$OUT/.$name.cmd"
   # Cache on the command, not just the filename: an edited stage flag or a new E2E_COMMON entry has to
   # invalidate the report, or a rerun silently serves one captured with different settings.
-  local cmd="$config ${E2E_COMMON[*]} $*"
+  local cmd="${NSYS_ARGS[*]} $config ${E2E_COMMON[*]} $*"
   if [[ -s "$report" && "${FORCE:-0}" != "1" && "$(cat "$stamp" 2>/dev/null)" == "$cmd" ]]; then
     echo "=== e2e: $name -- cached, skipping (FORCE=1 to regenerate) ==="
     return 0
@@ -66,7 +77,7 @@ e2e() {  # name config extra-args...
   echo "=== e2e: $name ==="
   # nsys finalizes a report even when the target crashes, so a failed run must not leave one behind:
   # it would look like a cache hit forever and hide the stage that needs attention.
-  if nsys profile --force-overwrite true -c cudaProfilerApi --trace=cuda,nvtx --cuda-memory-usage=true --output="$report" \
+  if nsys profile "${NSYS_ARGS[@]}" --output="$report" \
       torchrun --nproc-per-node 2 nemo_automodel/recipes/llm/benchmark.py --config "$config" "${E2E_COMMON[@]}" "$@"; then
     printf '%s' "$cmd" > "$stamp"
   else

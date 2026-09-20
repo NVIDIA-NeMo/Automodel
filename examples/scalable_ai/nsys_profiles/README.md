@@ -178,65 +178,84 @@ What the current evidence says is limiting, in priority order.
    the token gather/scatter into the grouped-GEMM epilogue would keep it off HBM entirely; CUTLASS exposes this
    through the collective epilogue builder's fusion operation, and its group GEMM (variable-size, one kernel) is
    the documented pattern for the expert GEMM itself.
-3. **The GPU is idle for roughly half of every step, waiting on the host.** Measured over steady-state windows
-   (`iteration_3..5`, both gradient-accumulation steps, rank 0), counting every kernel on every stream -- NCCL
-   included -- plus memcpy and memset, so the remainder is time with nothing running on the GPU at all:
+3. **The GPU stalls for 20-55% of every step, and the stall grows as the ladder improves.** Measured on the
+   steady-state windows (`iteration_3..5`, both gradient-accumulation steps) of captures that exclude the JIT
+   warmup iteration, counting every kernel on every stream -- NCCL included -- plus memcpy and memset, so the
+   remainder is time with nothing running on the GPU at all:
 
-   | stage | iteration | GPU busy | of which comm only | **idle** | kernel launches / iter |
+   | stage | windows total | GPU busy | **stalled** | host CUDA calls | host / GPU |
    | --- | ---: | ---: | ---: | ---: | ---: |
-   | stage2 per-expert loop | 363.8 ms | 66.4% | 5.1% | **33.6%** | 11,406 |
-   | stage3 grouped GEMM | 189.5 ms | 45.8% | 6.6% | **54.2%** | 8,058 |
-   | stage4 DeepEP | 190.5 ms | 58.9% | 12.5% | **41.1%** | 7,656 |
-   | stage5 TileLang | 140.9 ms | 50.2% | 5.8% | **49.8%** | 2,984 |
+   | stage1 stock transformers (2 layers) | 409.8 ms | 79.7% | **20.3%** | 40,256 | 0.69 |
+   | stage2 per-expert loop | 1130.2 ms | 69.0% | **31.0%** | 107,490 | 0.97 |
+   | stage3 grouped GEMM | 618.7 ms | 53.0% | **47.0%** | 63,300 | 1.30 |
+   | stage4 DeepEP | 584.7 ms | 46.5% | **53.5%** | 58,294 | 1.56 |
+   | stage5 TileLang | 457.9 ms | 45.1% | **54.9%** | 29,553 | 1.57 |
 
-   Note the direction: **every rung that removed GPU work made the idle fraction worse** (33.6% -> 49.8%). The
-   host issue rate is the constant, so shrinking kernels exposes more of it. That is also why wall-clock gains
-   exceed GPU-time gains throughout this ladder, and why `stage5` is the fastest rung while its kernel time
-   barely moves -- it issues 3.8x fewer launches than `stage2`.
+   Stock transformers keeps the GPU 79.7% busy; the fully optimized stage keeps it 45.1% busy. `host / GPU`
+   crosses 1.0 between stage 2 and stage 3 -- from there on the host, not the GPU, is the critical path. stage 5
+   is still much the fastest rung in wall time, but it wins by issuing **3.6x fewer CUDA calls** than stage 2
+   (29,553 against 107,490), not by running faster kernels. That is the ladder's real mechanism, and it is why
+   every rung that removed GPU work made the stall fraction worse.
 
-   Attributing the idle time by what the host thread was doing, for one `stage5` step (68.0 ms wall, 35.1 ms
-   idle across 1,824 gaps):
+   Breaking one `stage5` step down (73.0 ms wall, 42.1 ms stalled across 1,770 gaps averaging 23.8 us):
 
-   | host state during GPU idle | | |
+   | where the stalled time goes | | |
    | --- | ---: | ---: |
-   | no CUDA API call at all | 30.69 ms | 87.5% |
-   | `cudaLaunchKernel` | 2.46 ms | 7.0% |
-   | `cudaMemcpyAsync` | 0.40 ms | 1.1% |
-   | `cudaDeviceSynchronize` + `cudaStreamWaitEvent` | 0.27 ms | 0.8% |
+   | host executing userspace code, not in CUDA | 34.29 ms | **81.4%** |
+   | host inside CUDA APIs (`cudaLaunchKernel` 2.63 ms, rest smaller) | 4.44 ms | 10.5% |
+   | host blocked in OS calls (`pthread_cond_wait`) | 3.41 ms | 8.1% |
 
-   So it is **not** synchronization, **not** the launch API, and **not** communication. It is host-side work
-   between launches, at roughly one gap per two kernel launches (1,824 gaps against 3,472 launches) averaging
-   ~19 us.
+   **The host is not blocked, it is running.** `--trace=osrt` was added to test that rather than assume it: the
+   main thread's only long OS wait is a single 24.2 ms `pthread_cond_wait` starting at 65% of the step, during
+   which the autograd thread issues all 2,234 of its CUDA calls -- that is the backward pass, and the GPU is 86%
+   busy through it. All other OS waits on the compute thread are 5-9 us. There is no futex contention, no I/O
+   stall, and no page-fault stall on the compute path.
 
-   **It is not the NVTX instrumentation either**, which is the obvious suspect given `--nvtx true` installs a
-   forward and backward hook on every submodule. The counts rule it out: the step records 354 NVTX ranges but has
-   1,824 idle gaps, and `self_attn` has 12 range instances containing 250 gaps -- 21 gaps inside a single module
-   invocation. Hooks fire twice per invocation and cannot produce that.
+   The rate mismatch is the whole story: the GPU consumes a kernel in ~18.3 us on average, and the host produces
+   one every ~8.5 us of stall. With 1,684 kernels and 4,938 host CUDA calls in a 73 ms step, the pipeline runs
+   half empty by construction.
 
-   **What the host is actually doing is not identified.** These profiles are captured with `--trace=cuda,nvtx`,
-   which has no CPU or Python sampling, so "no CUDA API on the host" is the limit of what the data supports --
-   PyTorch dispatch, autograd graph construction and backend launch wrappers are all consistent with it. Adding
-   `--python-sampling=true` (and `osrt` to `--trace`) to `regenerate_profiles.sh` would turn that 30.69 ms into
-   named frames. Until then, the per-module ranking below is *where* the host is slow, not *what* it is doing:
+   Attributing the userspace portion to the innermost NVTX module open at each gap (leaf-level, so nothing is
+   double counted -- a gap inside `wq_b: Linear` is charged to `Linear`, not to its enclosing `self_attn`):
 
-   | module | idle inside it | gaps |
-   | --- | ---: | ---: |
-   | `self_attn: DeepseekV4Attention` | 24.6% | 250 |
-   | `model:` outside blocks | 8.6% | 38 |
-   | `indexer: DeepseekV4Indexer` | 8.6% | 77 |
-   | `experts: GroupedExpertsDeepEP` | 7.6% | 191 |
-   | `compressor: DeepseekV4Compressor` | 7.1% | 50 |
-   | the three blocks | 15.4% | 94 |
-   | between modules | 6.0% | 360 |
+   | module | share of the userspace stall | gaps | us/gap |
+   | --- | ---: | ---: | ---: |
+   | `self_attn: DeepseekV4Attention` | 22.8% | 226 | 37.1 |
+   | `experts: GroupedExpertsDeepEP` | 12.4% | 216 | 21.1 |
+   | block/model boundaries, no module open | 16.3% | 450 | 8-58 |
+   | `indexer: DeepseekV4Indexer` | 8.6% | 66 | 47.8 |
+   | `compressor: DeepseekV4Compressor` | 6.9% | 46 | 55.2 |
+   | all `Float32RMSNorm` | 5.2% | | 13-16 |
+   | **all `Linear` / `GroupedLinear` combined** | **1.2%** | | |
 
-   The levers this points at are the ones that reduce the *number* of host operations rather than the cost of
-   kernels: a larger micro-batch (the journey table in the parent README shows MFU 6.2% -> 10.5% from
-   micro-batch 1 to 4 on stock transformers, 10.9% -> 15.3% on TileLang), and fusion. CUDA graphs remove host
-   dispatch from the critical path entirely and `benchmark.py` has a `partial_cuda_graph_manager`, but graph
-   capture needs static shapes -- which hold here only because `fake_balanced_gate: true` fixes the tokens per
-   expert, and would not hold under a learned gate without padding to capacity.
+   The modules that do the matmuls cost essentially nothing. The cost is in the sparse-attention machinery --
+   `self_attn`, `indexer` and `compressor` together are 38% of the userspace stall and 19% of the whole step --
+   and it is per-operation glue, not a single hot spot: the per-gap cost only varies from 9 to 55 us across
+   modules that do very different work.
 
-4. **AllGather is 93-97% exposed, but the prize is only ~5% of the step.** Measured with
+   **The levers are op count, not kernel speed.** A larger micro-batch puts more GPU work under the same host
+   cost (the parent README's journey table shows MFU 6.2% -> 10.5% from micro-batch 1 to 4 on stock
+   transformers, 10.9% -> 15.3% on TileLang). Fusion removes the ops: `BackendConfig.compile_attn` exists and
+   its docstring targets exactly this -- "attention's many small ops (projections, RoPE, reshapes, SDPA)" -- but
+   it requires `attn="sdpa"`, so it cannot be combined with `attn: tilelang` and would have to be tested on the
+   eager stages. CUDA graphs remove host dispatch entirely at replay, and `benchmark.py` carries a
+   `partial_cuda_graph_manager`, but capture needs static shapes, which hold here only because
+   `fake_balanced_gate: true` fixes the tokens per expert and would not hold under a learned gate without
+   padding to capacity.
+
+   **What is still unattributed.** The 81.4% is userspace execution, and nothing in a CUDA or OS-runtime trace
+   can see inside it -- PyTorch dispatch, autograd bookkeeping and the Python interpreter are indistinguishable
+   from the outside. `regenerate_profiles.sh` passes `--python-sampling=true`, and the injection loads, but on
+   the cluster used here the samples were never collected: the reports record *"Unable to configure the
+   collection of CPU IP/backtrace samples, context switch data, or event sampling data"*, which is the CPU
+   IP/backtrace sampler being unavailable (typically `kernel.perf_event_paranoid`, or a container without
+   `SYS_ADMIN`). Check with `nsys status --environment`; where the host cannot be changed, `torch.profiler`
+   with `with_stack=True` or `py-spy` against rank 0 get the same attribution without `perf_events`.
+
+4. **AllGather is 93-97% exposed, but the prize is only ~5% of the step.** These numbers predate the capture-
+   window fix and were taken over profiles that still contained the JIT warmup iteration; the exposure
+   *fractions* were stable across stages and ranks, but re-running the analysis on the current captures would
+   tighten the milliseconds. Measured with
    [`nsys-overlap`](https://gitlab-master.nvidia.com/zhiyul/nsys-overlap)'s 3-bucket decomposition, which assigns
    every nanosecond of merged collective wall time to hidden-by-deep-compute, hidden-by-light-compute, or truly
    exposed (compute stream idle). Steady-state windows, both ranks:
@@ -247,11 +266,11 @@ What the current evidence says is limiting, in priority order.
    | stage4 DeepEP | 92.9% | 96.4% | 64.8% | 54.6% |
    | stage5 TileLang | 96.8% | 95.9% | 52.8% | 53.4% |
 
-   **Quote the fraction and the magnitude together.** Exposed communication is 5.1-12.5% of iteration time
-   (the "of which comm only" column in item 3), so removing all of it -- every AllGather and ReduceScatter nanosecond perfectly hidden --
+   **Quote the fraction and the magnitude together.** Exposed communication is 5.1-12.5% of iteration time,
+   against the 20-55% the GPU spends stalled in item 3, so removing all of it -- every AllGather and ReduceScatter nanosecond perfectly hidden --
    would buy at most that. The 93-97% figure is a statement about overlap quality, not about available headroom.
 
-   This is a consequence of item 3 rather than an independent problem. At 46-66% GPU occupancy, essentially any
+   This is a consequence of item 3 rather than an independent problem. At 45-80% GPU occupancy, essentially any
    collective lands in idle time, and the exposure fraction saturates near 100% regardless of how much
    communication there is. Both gradient-accumulation steps show it: `ga_step_0` issues 7.36 ms of AllGather and
    exposes 6.74 ms; `ga_step_1` issues 0.57 ms and exposes 0.57 ms. `ga_step_1` is not better overlapped, it
