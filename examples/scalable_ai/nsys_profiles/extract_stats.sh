@@ -45,6 +45,7 @@ if [ ${#profiles[@]} -eq 0 ]; then
   exit 1
 fi
 
+failed=0
 for name in "${profiles[@]}"; do
   report="$SCRIPT_DIR/$name.nsys-rep"
   if [ ! -s "$report" ]; then
@@ -65,12 +66,33 @@ for name in "${profiles[@]}"; do
   echo "=== $name -- ${want[*]} ==="
   report_args=()
   for r in "${want[@]}"; do report_args+=(--report "$r"); done
-  nsys stats --format csv --output "$OUT" \
-    ${FORCE_EXPORT:+--force-export=true} \
-    "${report_args[@]}" "$report" 2>&1 | grep -vE "^Processing|^Exporting|^\s*$"
+  log="$(nsys stats --format csv --output "$OUT" \
+           ${FORCE_EXPORT:+--force-export=true} \
+           "${report_args[@]}" "$report" 2>&1)"
+  status=$?
+
+  # nsys exits 0 and prints its usual NOTICE even when a requested report writes nothing, so verify the
+  # artifacts rather than the exit status.  On failure print the unfiltered log: the filter below is a
+  # convenience for the normal path and must never be the reason a diagnostic is lost.
+  absent=()
+  for r in "${want[@]}"; do [ -s "$OUT/${name}_${r}.csv" ] || absent+=("$r"); done
+  if [ ${#absent[@]} -ne 0 ]; then
+    failed=1
+    echo "    FAILED: nsys exited $status but wrote no CSV for: ${absent[*]}"
+    echo "    expected: $OUT/${name}_<report>.csv"
+    printf '%s\n' "$log" | sed 's/^/    | /'
+  else
+    printf '%s\n' "$log" | grep -vE "^Processing|^Exporting|^\s*$"
+  fi
 done
 
 echo
 echo "=== CSVs in $OUT ==="
 csvs=("$OUT"/*.csv)
 if [ ${#csvs[@]} -eq 0 ]; then echo "(none written)"; else printf '%s\n' "${csvs[@]##*/}"; fi
+
+if [ "$failed" -ne 0 ]; then
+  echo
+  echo "One or more reports produced no CSV -- see the FAILED lines above."
+  exit 1
+fi
