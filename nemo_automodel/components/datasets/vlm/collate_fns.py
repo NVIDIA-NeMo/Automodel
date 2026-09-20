@@ -1530,8 +1530,10 @@ def neat_packed_vlm_collater(
             If ``None`` (default), pad to the longest pack in the batch.
             A fixed length avoids recompilation with ``torch.compile``
             and ensures uniform tensor shapes across steps.
-        attn_implementation: Attention backend (``"flash_attention_2"``,
-            ``"sdpa"``, or ``"eager"``).
+        attn_implementation: Attention backend (``"flash_attention_2"``, ``"te"``,
+            ``"sdpa"``, or ``"eager"``). ``"flash_attention_2"`` and ``"te"`` derive
+            per-document ``cu_seqlens`` from the compact document map, so neither
+            needs the dense mask.
         materialize_4d_mask: Whether SDPA/eager packing should expand the
             indexed ``[B, S]`` document map into a dense
             ``[B, 1, S, S]`` block-causal mask. Context-parallel VLM paths
@@ -1545,7 +1547,11 @@ def neat_packed_vlm_collater(
         return {}
 
     LABEL_PAD = -100
-    use_flash = attn_implementation == "flash_attention_2"
+    # Backends that consume per-document cu_seqlens rather than an explicit mask.
+    # TransformerEngine's packed route is qkv_format="thd" + cu_seqlens, so handing
+    # it the dense block-causal mask is both wasteful (quadratic in the pack size)
+    # and wrong -- its mask contract is a 2-D padding mask, not a 4-D block map.
+    use_cu_seqlens_backend = attn_implementation in ("flash_attention_2", "te")
 
     # Determine pad target: fixed max_length or batch-dynamic
     max_len = (
@@ -1575,10 +1581,10 @@ def neat_packed_vlm_collater(
 
     mm_token_type_ids = torch.stack([_pad_1d(_get_mm_token_type_ids(x), 0, max_len) for x in batch])
 
-    if use_flash or not materialize_4d_mask:
-        # Keep the compact indexed [B, S] document map. FlashAttention derives
-        # cu_seqlens from it; block-diagonal CP rebuilds its local mask from the
-        # identical _packed_seq_ids emitted below.
+    if use_cu_seqlens_backend or not materialize_4d_mask:
+        # Keep the compact indexed [B, S] document map. FlashAttention and
+        # TransformerEngine derive cu_seqlens from it; block-diagonal CP rebuilds
+        # its local mask from the identical _packed_seq_ids emitted below.
         attention_mask_out = attention_mask
     else:
         from nemo_automodel.components.datasets.utils import _indexed_mask_to_4d_block_causal
@@ -1614,7 +1620,7 @@ def neat_packed_vlm_collater(
     # values 1,2,3,... per original sample and 0 for padding.  For SDPA the
     # ``attention_mask_out`` is already converted to 4D, so keep a copy.
     has_multiple_docs = attention_mask.numel() > 0 and bool(attention_mask.max().item() > 1)
-    if has_multiple_docs or not materialize_4d_mask:
+    if has_multiple_docs or not materialize_4d_mask or use_cu_seqlens_backend:
         result["_packed_seq_ids"] = attention_mask
 
     # Concatenate media tensors across batch (variable count, no padding needed)

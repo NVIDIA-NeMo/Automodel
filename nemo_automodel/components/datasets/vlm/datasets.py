@@ -1396,6 +1396,8 @@ class PreTokenizedDatasetWrapperConfig:
     """If ``True``, inject a fake image into text-only samples for sharded training."""
     post_tokenize_hook: Callable[[dict[str, object]], dict[str, object]] | None = None
     """Optional declarative callback applied to each tokenizer result."""
+    label_post_hook: Callable[[dict[str, object], "ProcessorMixin"], dict[str, object]] | None = None
+    """Optional declarative callback applied to each sample after labels are built."""
 
     def build(
         self,
@@ -1416,6 +1418,7 @@ class PreTokenizedDatasetWrapperConfig:
             max_retries=self.max_retries,
             truncate=self.truncate,
             post_tokenize_hook=self.post_tokenize_hook,
+            label_post_hook=self.label_post_hook,
             inject_fake_images=self.inject_fake_images,
         )
 
@@ -1452,6 +1455,7 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
         truncate=False,
         post_tokenize_hook=None,
         inject_fake_images=True,
+        label_post_hook=None,
     ):
         self.dataset = dataset
         self.processor = processor
@@ -1459,6 +1463,7 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
         self.truncate = truncate
         self.max_retries = max_retries
         self.post_tokenize_hook = post_tokenize_hook
+        self.label_post_hook = label_post_hook
         self.inject_fake_images = inject_fake_images
         # Compatibility attributes expected by build_dataloader
         self.preload_media = False
@@ -1605,6 +1610,25 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
                 # Mask fake vision tokens so they don't affect attention.
                 if injected_fake:
                     mask_fake_vision_tokens_single(output, self.processor)
+
+                # Restrict or re-weight the supervised span. This runs after labels
+                # exist (unlike post_tokenize_hook, which sees only the tokenizer
+                # result), so a caller can express label-level policies -- e.g.
+                # supervising only the final assistant turn -- that the template-driven
+                # label builder does not model. Pretokenization is mandatory under
+                # packing, where the packed collators consume these per-sample labels
+                # and the dataloader's own ``collate_fn`` is bypassed, so this is the
+                # only hook able to alter the training signal of a packed run.
+                if self.label_post_hook is not None:
+                    hooked = self.label_post_hook(output, self.processor)
+                    if hooked is None:
+                        raise ValueError("label_post_hook must return the sample mapping, got None")
+                    if hooked["labels"].shape != output["labels"].shape:
+                        raise ValueError(
+                            "label_post_hook must preserve the label sequence length: "
+                            f"got {tuple(hooked['labels'].shape)}, expected {tuple(output['labels'].shape)}"
+                        )
+                    output = hooked
 
                 return output
 

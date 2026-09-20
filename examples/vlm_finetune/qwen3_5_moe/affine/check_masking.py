@@ -23,7 +23,11 @@ For each sampled conversation it verifies:
 * the wrapper leaves exactly one contiguous supervised run,
 * that run decodes to the final assistant message and ends at ``<|im_end|>``,
 * the run excludes the generation-prompt prefix (``<think>`` ...) that the chat
-  template inserts ahead of assistant content.
+  template inserts ahead of assistant content,
+* the **packed** path agrees: ``last_turn_label_hook``, applied to the unshifted labels
+  ``PreTokenizedDatasetWrapper`` produces, selects the same final turn. Packing replaces
+  the dataloader collate_fn, so this hook -- not ``last_turn_collate_fn`` -- is what
+  masks a packed run, and it must be checked whenever the corpus format changes.
 
 Usage::
 
@@ -40,7 +44,7 @@ import torch
 from datasets import load_dataset
 from transformers import AutoProcessor
 
-from nemo_automodel.components.datasets.vlm.collate_fns import default_collate_fn
+from nemo_automodel.components.datasets.vlm.collate_fns import build_labels_from_template, default_collate_fn
 
 IGNORE_INDEX = -100
 _MODULE_PATH = pathlib.Path(__file__).resolve().parent / "dataset.py"
@@ -68,6 +72,57 @@ def _runs(labels_row: torch.Tensor) -> list[tuple[int, int]]:
     if start is not None:
         spans.append((start, len(supervised)))
     return spans
+
+
+def _check_packed_path(adapter, processor, tokenizer, conversation, suffixes, expected: str) -> str:
+    """Check ``last_turn_label_hook`` on one conversation's unshifted labels.
+
+    Mirrors ``PreTokenizedDatasetWrapper.__getitem__``: the processor tokenizes the
+    rendered conversation, ``build_labels_from_template`` supervises every assistant
+    turn, and the hook narrows that to the final turn. Labels here are **unshifted**
+    (packing applies the autoregressive shift afterwards), so a supervised span starting
+    at position ``start`` is preceded by the generation prompt ending at ``start`` --
+    with no off-by-one, unlike the collator path.
+
+    Args:
+        adapter: The recipe-local dataset adapter module.
+        processor: Multimodal processor used to tokenize and build labels.
+        tokenizer: Tokenizer wrapped by ``processor``.
+        conversation: One conversation in the VLM ``{"role", "content"}`` form.
+        suffixes: Generation-prompt suffix id sequences, longest first.
+        expected: The final assistant message text the span must reproduce.
+
+    Returns:
+        ``"ok"``, or a string describing the first failed expectation.
+    """
+    text = processor.apply_chat_template([conversation], tokenize=False)
+    if isinstance(text, list):
+        text = text[0]
+    encoded = processor(text=[text], return_tensors="pt")
+    labels = build_labels_from_template(encoded["input_ids"], [conversation], processor)[0]
+
+    sample = {"input_ids": encoded["input_ids"][0], "labels": labels.clone()}
+    hooked = adapter.last_turn_label_hook(sample, processor)
+
+    runs = _runs(hooked["labels"])
+    if len(runs) != 1:
+        return f"FAIL packed hook left {len(runs)} runs, expected 1"
+    start, end = runs[0]
+
+    supervised = hooked["labels"][start:end]
+    # Unshifted: the label at a position IS the token at that position.
+    if not torch.equal(supervised, sample["input_ids"][start:end]):
+        return "FAIL packed labels are misaligned with input_ids (unexpected shift)"
+
+    decoded = tokenizer.decode(supervised)
+    if not decoded.replace("<|im_end|>", "").strip().endswith(expected[-120:]):
+        return "FAIL packed supervised span does not match the final assistant message"
+
+    if suffixes:
+        preceding = sample["input_ids"][:start].tolist()
+        if not any(len(s) <= start and preceding[-len(s) :] == s for s in suffixes):
+            return "FAIL packed generation-prompt prefix was not excluded from the loss"
+    return "ok"
 
 
 def main() -> None:
@@ -130,17 +185,30 @@ def main() -> None:
                 if not any(len(s) <= token_start and preceding[-len(s) :] == s for s in suffixes):
                     status = "FAIL generation-prompt prefix was not excluded from the loss"
 
-        if status != "ok":
+        packed_status = _check_packed_path(
+            adapter,
+            processor,
+            tokenizer,
+            conversation,
+            suffixes,
+            (messages[-1]["content"] or "").strip(),
+        )
+
+        if status != "ok" or packed_status != "ok":
             failures += 1
         print(
             f"turns={len(messages):4d} assistant={n_assistant:4d} tokens={n_tokens:7d} "
             f"baseline_runs={len(baseline_runs):4d} wrapped_runs={len(wrapped_runs):2d} "
-            f"supervised={int(wrapped['labels'][0].ne(IGNORE_INDEX).sum()):6d}  {status}"
+            f"supervised={int(wrapped['labels'][0].ne(IGNORE_INDEX).sum()):6d}  "
+            f"collate={status} packed={packed_status}"
         )
 
     if failures:
         raise SystemExit(f"{failures}/{args.n} conversations failed the masking check")
-    print(f"\nOK - {args.n}/{args.n} conversations supervise exactly the final assistant turn")
+    print(
+        f"\nOK - {args.n}/{args.n} conversations supervise exactly the final assistant turn "
+        "on both the collator and the packed label-hook path"
+    )
 
 
 if __name__ == "__main__":

@@ -16,10 +16,11 @@ import torch.nn as nn
 
 pytest.importorskip("transformers.models.qwen3_5_moe")
 
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.qwen3_5_moe.model import Qwen3_5MoeBlock
 
 
-def _build_block(layer_type: str) -> tuple[Qwen3_5MoeBlock, dict]:
+def _build_block(layer_type: str, attn_backend: str = "sdpa") -> tuple[Qwen3_5MoeBlock, dict]:
     """Build a barebones Qwen3_5MoeBlock with recorder submodules."""
     block = Qwen3_5MoeBlock.__new__(Qwen3_5MoeBlock)
     nn.Module.__init__(block)
@@ -35,12 +36,18 @@ def _build_block(layer_type: str) -> tuple[Qwen3_5MoeBlock, dict]:
             return kwargs["hidden_states"]
 
     class _RecorderSelfAttn(nn.Module):
+        def __init__(self, attn: str = "sdpa"):
+            super().__init__()
+            # A real Qwen3NextAttention carries the backend it was built with; the
+            # block reads it to decide whether a packed batch needs TE's THD route.
+            self.backend = BackendConfig(attn=attn)
+
         def forward(self, **kwargs):
             recorded["self_attn_kwargs"] = kwargs
             return kwargs["hidden_states"]
 
     block.linear_attn = _RecorderLinearAttn()
-    block.self_attn = _RecorderSelfAttn()
+    block.self_attn = _RecorderSelfAttn(attn=attn_backend)
 
     def _mlp(*, x, padding_mask):
         recorded["mlp_padding_mask"] = padding_mask

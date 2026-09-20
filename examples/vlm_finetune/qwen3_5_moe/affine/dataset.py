@@ -20,8 +20,18 @@ supervising every turn would weight early turns by their duplication factor.
 
 The shipped VLM label builder
 (:func:`nemo_automodel.components.datasets.vlm.collate_fns.build_labels_from_template`)
-supervises every assistant turn, so :func:`last_turn_collate_fn` wraps it and keeps
-only the final supervised run.
+supervises every assistant turn, so this module narrows it to the final supervised run.
+
+There are two entry points because the pipeline has two label paths:
+
+* :func:`last_turn_collate_fn` -- the unpacked path, wrapping ``default_collate_fn``.
+  Labels are already shifted against ``input_ids`` when it sees them.
+* :func:`last_turn_label_hook` -- the packed path
+  (``packed_sequence.label_post_hook_fn``). Packing forces pretokenization and replaces
+  the dataloader's ``collate_fn``, so the collator wrapper never runs. Labels here are
+  unshifted; packing shifts each sample afterwards.
+
+Both must agree, and ``affine/check_masking.py`` (rung 2) checks them together.
 """
 
 from typing import Any, Sequence
@@ -36,6 +46,9 @@ IGNORE_INDEX = -100
 
 _LENGTH_COLUMN = "n_tokens"
 """Exact rendered token count per row, written by ``examples/vlm_finetune/qwen3_5_moe/affine/prefilter.py``."""
+
+_PACKING_LENGTH_COLUMN = "_text_tokens"
+"""Column the neat-packing knapsack reads (``_estimate_sample_length``); absent it guesses ``chars // 3``."""
 
 _ROLES = frozenset({"system", "user", "assistant"})
 
@@ -98,11 +111,19 @@ def make_affine_dataset(
             if reasoning:
                 turn["reasoning_content"] = reasoning
             conversation.append(turn)
-        return {"conversation": conversation}
+        row: dict[str, Any] = {"conversation": conversation}
+        if has_length:
+            # The neat-packing knapsack bins on `_text_tokens` and otherwise estimates
+            # `chars // 3`, which on this corpus is far enough off to leave packs badly
+            # under- or over-filled. n_tokens is the exact rendered length, so expose it
+            # under the name the packer looks for as well.
+            row[_PACKING_LENGTH_COLUMN] = int(example[_LENGTH_COLUMN])
+        return row
 
     # Keep the pre-filter's exact rendered token count when present: it is what
     # dataloader.length_grouped_sampler.length_key reads. Everything else is dropped,
     # since the collator only consumes "conversation".
+    has_length = _LENGTH_COLUMN in dataset.column_names
     dropped = [name for name in dataset.column_names if name != _LENGTH_COLUMN]
     return dataset.map(_to_conversation, remove_columns=dropped)
 
@@ -256,3 +277,52 @@ def last_turn_collate_fn(
 
     batch["labels"] = labels.masked_fill(~keep, IGNORE_INDEX)
     return batch
+
+
+def last_turn_label_hook(
+    sample: dict[str, Any],
+    processor: ProcessorMixin,
+) -> dict[str, Any]:
+    """Restrict one pre-tokenized sample's labels to its final assistant turn.
+
+    This is the packing-path counterpart of :func:`last_turn_collate_fn`. Enabling
+    ``packed_sequence`` forces pretokenization and replaces the dataloader's
+    ``collate_fn``, so the collator wrapper never runs; this hook is invoked by
+    ``PreTokenizedDatasetWrapper`` right after ``build_labels_from_template``, which
+    supervises every assistant turn.
+
+    Unlike the collator path, labels here are **unshifted** -- ``labels[p]``
+    supervises ``input_ids[p]``, because packing applies the autoregressive shift
+    afterwards, per-sample, in ``_shift_sample``. The generation-prompt suffix to
+    drop therefore occupies the same positions in both tensors, with no off-by-one.
+
+    Args:
+        sample: One pre-tokenized sample holding ``input_ids`` of shape [sequence]
+            and ``labels`` of shape [sequence], with ``IGNORE_INDEX`` marking
+            unsupervised positions.
+        processor: Multimodal processor whose tokenizer carries the chat template.
+
+    Returns:
+        The same mapping with ``labels`` of shape [sequence] restricted to the final
+        assistant turn, minus the generation-prompt prefix. Mutated in place and
+        returned, matching the hook contract.
+    """
+    labels = sample["labels"]
+    keep = _keep_last_supervised_run(labels.unsqueeze(0))
+
+    tokenizer = getattr(processor, "tokenizer", processor)
+    _, suffixes = _resolve_markers(tokenizer)
+    if suffixes:
+        selected = keep[0].nonzero(as_tuple=True)[0]
+        if selected.numel() > 0:
+            start = int(selected[0])
+            input_ids = sample["input_ids"]
+            # Longest first: on a corpus without reasoning_content the span opens with
+            # the full empty think block, which only the thinking-disabled suffix covers.
+            for suffix in suffixes:
+                if input_ids[start : start + len(suffix)].tolist() == suffix:
+                    keep[0, start : start + len(suffix)] = False
+                    break
+
+    sample["labels"] = labels.masked_fill(~keep[0], IGNORE_INDEX)
+    return sample

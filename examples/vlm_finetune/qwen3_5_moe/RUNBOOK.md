@@ -42,7 +42,10 @@ Each was verified against the source and each fails **silently** if reverted.
 | Pass `max_length` to the collator | `default_collate_fn` flips to `padding="max_length"` once it is set (`vlm/collate_fns.py:1294`); a 163-token row would pad to 40,960. The cap is enforced offline instead. |
 | Set `text_config.mtp_expert_hf_layout` | Qwen3.6-35B-A3B stores MTP experts **fused**; unset, the adapter infers it. (The sibling 122B config sets `split`.) |
 | Set `num_nextn_predict_layers: 0` | `self.mtp = None`, so the 19 `mtp.*` tensors never reach the export while the copied `config.json` still declares `mtp_num_hidden_layers: 1` → missing keys on load. Breaks requirement 3. |
-| Enable packing while keeping `attn: te` | The model declares `_packed_cp_attn_backends = ("sdpa",)` and `supports_thd: False`; TE has no route to the 4-D block-causal mask, so attention bleeds across documents with no error. |
+| Hand TE a packed **mask** of any kind | TE's `padding_causal` contract is a 2-D `[batch, sequence]` padding mask. A 4-D block-causal mask silently became 6-D; an indexed document map collapses to a plain padding mask and bleeds across documents with **no error**. The packed recipe routes TE through `qkv_format="thd"` + `cu_seqlens` instead, and `components/attention/utils.py` now raises on a non-2-D mask. |
+| Enable packing without `packed_sequence.label_post_hook_fn` | Packing forces pretokenization and selects the packed collater, so `dataloader.collate_fn` is **silently ignored** (`vlm/loader.py:341` precedes `:376`) and `last_turn_collate_fn` never runs. Labels then come from the stock builder, which supervises every assistant turn: ~36x more supervised tokens on this turn-exploded corpus, a different objective, and a plausible-looking loss. |
+| Enable packing without `dataset.inject_fake_images: false` | Pretokenization defaults it to true, so every text-only row gets a synthetic image and is pushed through the frozen vision tower. |
+| Set `packing_format: thd` on this model | Unwired for the MoE variant: `cp_linear_attn.py:186` unpacks 3 dims from a `[tokens, hidden]` tensor and dies. Use `neat`. |
 | Run without `flash-linear-attention` | GatedDeltaNet falls back to a pure-PyTorch reference path behind a bare `except ImportError`, **no warning** (`qwen3_5_moe/cp_linear_attn.py:126-142`) — silently degrades 30 of 40 layers. |
 | Use `experts: gmm`/`te` without a DeepEP-family dispatcher | `BackendConfig.__post_init__` silently rewrites the pair to `(torch_mm, torch)`. |
 | Narrow `_resolve_markers` to the thinking-enabled suffix only | See §3. |
@@ -184,7 +187,7 @@ Run in order; 1–4 need no GPU and catch most failures.
 | # | Command | Pass |
 |---|---|---|
 | 1 kernels | `python -c "import fla, causal_conv1d, deep_ep, transformer_engine"` | no ImportError — a failure here means a silent slow path, not a crash |
-| 2 masking | `python examples/vlm_finetune/qwen3_5_moe/affine/check_masking.py --n 8` | exactly **1** supervised run per row, decoding to the final assistant message, generation-prompt `<think>` prefix excluded (§3). On v4, supervised counts p50 ≈ 163, p90 ≈ 844, max ≈ 1,801 — thousands per row means the wrapper is inert |
+| 2 masking | `python examples/vlm_finetune/qwen3_5_moe/affine/check_masking.py --n 8` | exactly **1** supervised run per row, decoding to the final assistant message, generation-prompt `<think>` prefix excluded (§3). Checks **both** paths: `collate=ok packed=ok` per row — the packed column exercises `last_turn_label_hook`, which is what masks a packed run. On v4, supervised counts p50 ≈ 163, p90 ≈ 844, max ≈ 1,801 — thousands per row means the wrapper is inert |
 | 3 pre-filter | `python examples/vlm_finetune/qwen3_5_moe/affine/prefilter.py --max-seq-len 40960 --out data/<corpus>_filtered` | the keep rate in §4. A different one means the tokenizer or template changed |
 | 4 config parse | `load_yaml_config(<config>)` | no `TypeError: Unexpected ... field(s)`. The VLM `dataloader` allowlist is `{shuffle, num_workers, pin_memory, persistent_workers, prefetch_factor, drop_last}` + `collate_fn`/`_target_` — deliberately **no `batch_size`** (it comes from `step_scheduler.local_batch_size`) |
 | 5 tiny proxy | `torchrun --nproc-per-node=2 -m nemo_automodel.recipes.llm.train_ft -c tests/functional_tests/parallelism/qwen3_5_moe_proxy.yaml` | 6 steps, finite decreasing loss |
@@ -261,6 +264,11 @@ bind-mounted, `TRITON_CACHE_DIR=/triton_cache`) while the inductor cache stays p
 the race is in inductor's, not Triton's. The first epoch after any change in batch shape
 still pays ~25 stalls (~12 min); after that they are gone. **Judge speed only from a warm
 run.**
+
+The packed recipe should not have this problem at all: every pack is exactly
+`collate_max_length` long, so the batch-length term in the autotune key is constant.
+If a packed run still shows the bimodal step times, the fixed-shape assumption is
+broken somewhere — check that `collate_max_length` is set, not just `pack_size`.
 
 ### 8.6 Smaller items
 - `global_batch_size` must be a multiple of `local_batch_size × world_size`
@@ -374,8 +382,9 @@ hard-codes `Qwen3NextRMSNorm`). Still unmeasured: `defer_fsdp_grad_sync`, `exper
 - **To go faster, add nodes:** with EP8 the expert all-to-all never leaves a node, so
   4 nodes at gbs 128 is near-linear (~18 samples/s, ~1.4 h/epoch on v4). The v5/v6 configs
   do exactly this: 32 GPUs, `ep_size: 8`, MoE mesh `(ep_shard=4, ep=8)`, lbs 4 / gbs 128.
-- What will not help: lbs 8 (OOM), selective AC, sequence packing (incompatible with the
-  TE masking this recipe depends on), larger gbs via gradient accumulation.
+- What will not help: lbs 8 (OOM), selective AC, larger gbs via gradient accumulation.
+  (Sequence packing was listed here as incompatible with TE. That is no longer true —
+  see §13.5 and `qwen3_6_35b_4node_ep8_packed.yaml`.)
 
 ### 9.3 End-to-end 266-step run (2 nodes, EP8, lbs 4, checkpointing + validation live)
 
@@ -567,23 +576,86 @@ world size; on 2 GPUs (EP2) multiply it by 4.
 2. **The LR** is a judgement everywhere, not an A/B: clipping fires every step at 1e-5 in
    every configuration measured, the 2-node v4 config dropped to 5e-6, and the v6 runs
    from base use 5e-5 with a WSD schedule.
-3. **Length-grouped vs random, ~300 steps at lbs 2.** Grouping is 1.70× faster but showed
-   a consistently worse validation loss (0.5718 vs 0.5605) over 50 steps of a single seed,
-   entirely inside LR warmup — weak evidence either way. It ships enabled on multi-node
-   and disabled in the single-node recipe. `affine/check_sampler.py` shows what the sampler
-   actually yields epoch over epoch (only the per-epoch chunk shuffle is random; batch
-   membership stays length-homogeneous).
+3. **Length-grouped vs random — resolved by dropping the sampler.** Grouping is 1.70×
+   faster but showed a consistently worse validation loss (0.5718 vs 0.5605) over 50 steps
+   of a single seed, entirely inside LR warmup — weak evidence either way. The bias is
+   worse than first recorded: `LengthGroupedSampler` sorts the dataset **once** in
+   `__init__` (`length_grouped_sampler.py:116`) and `set_epoch` never re-sorts, so the
+   per-epoch chunk shuffle only reorders batches — **batch membership is frozen for the
+   entire run, across every epoch and every restart.** The packed recipe drops the sampler
+   entirely: packs are all `collate_max_length` long, so there is no padding left for
+   grouping to remove. It stays enabled in the unpacked multi-node recipe, where removing
+   it would cost the 1.70× for nothing.
+
+   Two things to know when removing it: the fallback `DistributedSampler` is constructed
+   without `seed` (`vlm/loader.py:409`), so data order stops honouring `seed: 1234`; and
+   the saved `dataloader/dataloader_dp_rank_*.pt` carries `{yielded, epoch}` that a
+   `DistributedSampler` cannot consume, with no compatibility gate on restore (the check
+   at `base_recipe.py:511` inspects only the model config). **Start a packed run in a
+   fresh `checkpoint_dir`.** `affine/check_sampler.py` documents the frozen-membership
+   behaviour and is dead once the sampler is gone.
 4. **Signal density.** 2.8% of processed tokens are supervised (§4). Collapsing to the
    unique full trajectories and supervising every turn would give equivalent coverage for
    ~a ninth of the compute. The user has been told and chose the current design; do not
    change it unilaterally.
-5. **Sequence packing.** Rejected, not impossible: `packing_format: thd` emits `seq_lens`
-   but no `attention_mask`, and the model's THD branch nulls the mask, so the 30 GDN
-   layers treat a whole pack as one sequence and bleed across samples silently; `neat` +
-   TE passes the document-id mask to TE as a *padding* mask, which also bleeds; `neat` +
-   SDPA is correct but slower than today. Packing also bypasses the last-turn masking
-   (labels are built inside `PreTokenizedDatasetWrapper`, whose only hook runs before
-   labels exist). Making it work needs a model change plus a `label_post_hook`.
+5. **Sequence packing — implemented, not yet run on GPU.**
+   `qwen3_6_35b_4node_ep8_packed.yaml` is `neat` packing with `attn: te` and no
+   length-grouped sampler. The earlier rejection rested on three claims, two of them wrong:
+
+   - *"The 30 GDN layers treat a whole pack as one sequence and bleed silently."*
+     **Stale.** Upstream `c4a4c8322` threads `cu_seqlens` + `seq_idx` and unpads to
+     `[1, total_valid, H]` (`cp_linear_attn.py:206-345`), reporting a standalone-vs-packed
+     layer diff of `4.011e-01 → 0.000e+00`. GDN packing was correct before this recipe
+     existed.
+   - *"`neat` + TE passes the document-id mask to TE as a padding mask."* Right
+     conclusion, wrong mechanism. At cp1 `neat` materialized a **4-D** mask, which
+     `attention/utils.py` reshaped into a 6-D tensor — an error, not a bleed. The genuine
+     silent bleed is the 2-D indexed map, reachable only at cp>1.
+   - *"`packing_format: thd` emits `seq_lens` but no `attention_mask`."* True, but it
+     hard-crashes in GDN (`cp_linear_attn.py:186`) rather than bleeding, so `thd` is
+     simply unwired for the MoE model.
+
+   What made it work: the packed collater keeps the compact `[B, S]` document map for
+   `te`, as it already did for FlashAttention, instead of expanding the dense
+   `[B, 1, S, S]` mask — **1.6 GiB per row at `pack_size` 40,960** — and
+   `_Qwen3_5MoeAttention` unpads q/k/v and calls TE in its native `qkv_format="thd"` with
+   `cu_seqlens`, reusing the metadata GDN already builds once per forward. TE's fused
+   kernel is kept; an `arbitrary` 4-D mask would fall back to the unfused path §6 measures
+   at +259 GiB.
+
+   The last-turn masking problem was real and is solved by a new generic `label_post_hook`
+   on `PreTokenizedDatasetWrapper` (`packed_sequence.label_post_hook_fn`), which runs
+   *after* labels are built, unlike `post_tokenize_hook`. `affine/dataset.py` supplies
+   `last_turn_label_hook`; rung 2 now checks it beside the collator path, and both corpus
+   cases of §3 were verified against the real tokenizer.
+
+   Expect a second win: pack shapes are fixed at `collate_max_length`, so FLA's autotune
+   key stops changing every step and the §8.5 stalls should largely disappear.
+
+   **MTP needed a separate fix, in the loss.** `calculate_mtp_loss` masks depth-k targets
+   whose rolled source crosses a document boundary, but only when it is given `cu_seqlens`
+   **or** `seq_idx`. Both recipes passed `batch.get("cu_seqlens")` only — written for THD
+   packing, where that key exists. `neat` emits no `cu_seqlens`, so the guard silently
+   no-opped and **every depth-k target at a document's last k tokens was rolled in from the
+   next document.** Fixed by also passing `seq_idx=batch.get("_packed_seq_ids")` (the
+   indexed map `neat` already produces) in both `recipes/vlm/finetune.py` and
+   `recipes/llm/train_ft.py`. Covered by
+   `tests/unit_tests/loss/test_mtp_packed_seq_idx.py`, whose first test pins the old
+   leak. `mtp_loss_scaling_factor: 0.1` itself was never broken — it resolves correctly
+   from the model output when no `mtp.scaling_factor` is set.
+
+   With that in place the MTP per-depth **position ids**, which are still rolled without
+   regard to boundaries, no longer matter: the only positions with a wrong position id are
+   the last k tokens of each document, and those now have a masked target, a zero-filled
+   source embedding, and — because the MTP sublayers receive the same document map and run
+   the same per-document TE route — no causal influence on any unmasked position. This is
+   reasoning, not a measurement; if MTP loss ever looks wrong on a packed run, check it.
+
+   **Unverified, needs the container:** whether TE raises or silently accepts the
+   malformed 6-D mask (if it accepts, the two shipped upstream `neat` recipes are bleeding
+   today); the `chunk_gated_delta_rule` signature in the installed FLA 0.4.2; and the run
+   end to end. `PACKING_BRINGUP.md` is the ordered procedure for settling all three on a
+   2-GPU box.
 6. **FP8.** `te_fp8` works on Hopper elsewhere in this repo and is the next large speedup.
    No fp8 reference exists for this model family — an experiment after a green bf16
    baseline, not a default.
@@ -597,12 +669,15 @@ world size; on 2 GPUs (EP2) multiply it by 4.
 | `qwen3_6_35b_1node_ep8.yaml` | single-node 8×H200 recipe (EP8, lbs 2, random batching) |
 | `qwen3_6_35b_ddp2.yaml` | pure-DDP 2-GPU variant (`ep_size: 1`, `dispatcher: torch`) — probe only; each rank materializes the whole model on CPU first (~13 min, single-threaded) and the fit was never confirmed |
 | `qwen3_6_35b_4node_ep8_base.yaml` | 4-node run from the base model on v6_137k (5 epochs, WSD, peak LR 5e-5) |
-| `affine/dataset.py` | dataset adapter (`make_affine_dataset`) + `last_turn_collate_fn` — the masking, §3 |
+| `qwen3_6_35b_4node_ep8_packed.yaml` | the same run with `neat` packing + TE and no length-grouped sampler (§13.5). Step counts are derived from an estimated pack count and **must** be recomputed from the packer's log before a full run |
+| `affine/dataset.py` | dataset adapter (`make_affine_dataset`) + `last_turn_collate_fn` (unpacked) and `last_turn_label_hook` (packed) — the masking, §3 |
 | `affine/check_masking.py` | rung 2 |
 | `affine/check_export.py` | rung 9 |
 | `affine/export_hf_helper.py` | offline consolidation used by `export_hf.sh` |
 | `affine/dump_sample.py` | dump one training-ready sample with the supervised span marked |
-| `affine/check_sampler.py` | what `LengthGroupedSampler` actually yields, epoch over epoch |
+| `PACKING_BRINGUP.md` | how to qualify the packing change on 2 GPUs before a 4-node run: the TE fused-attention gate, the parity test, the smoke checks, and the step-schedule recomputation |
+| `affine/check_packed_parity.py` | packed-vs-standalone parity per document — the gate for §13.5 |
+| `affine/check_sampler.py` | what `LengthGroupedSampler` actually yields, epoch over epoch — shows the frozen batch membership of §13.3; dead for the packed recipe |
 | `affine/find_reasoning_rows.py` | scan a corpus for rows carrying real reasoning (decides which case §3 is in) |
 | `affine/sample_rows.py` | row sampler for the subset ablations |
 | `affine/comm_check.py` | multi-rank NCCL all-reduce + DeepEP dispatch/combine smoke test |

@@ -133,6 +133,18 @@ def preprocess_args_and_kwargs_for_attn(
             "window_size": kwargs.get("window_size", (-1, 0)),
         }
         if attention_mask is not None:
+            # TE's "padding_causal" mask contract is a [batch, 1, 1, sequence] bool
+            # derived from a [batch, sequence] validity mask. A 4-D block-causal mask
+            # would be silently reshaped to 6-D here, and an indexed [batch, sequence]
+            # document map would collapse to a pure padding mask -- letting tokens
+            # attend across packed document boundaries with no error. Packed callers
+            # must take the cu_seqlens route below instead.
+            if attention_mask.ndim != 2:
+                raise ValueError(
+                    "attn_impl='te' expects a 2-D [batch, sequence] padding mask, got shape "
+                    f"{tuple(attention_mask.shape)}. For packed sequences pass cu_seqlens "
+                    "(qkv_format='thd') instead of an explicit mask."
+                )
             padding_mask = attention_mask.logical_not()
             attn_kwargs.update(
                 {

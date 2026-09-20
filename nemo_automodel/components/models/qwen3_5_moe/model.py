@@ -81,7 +81,9 @@ from nemo_automodel.components.models.common.mtp import (
     MTPModule,
     prepare_mtp_context_parallel_inputs,
     roll_tensor,
+    shift_packed_tensor,
 )
+from nemo_automodel.components.models.common.packing import is_indexed_packed_mask
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -117,6 +119,44 @@ class _Qwen3_5MoeAttention(Qwen3NextAttention):
         super().__init__(*args, **kwargs)
         self._base_attn_func = self.attn_func
         self.attn_func = self._dispatch_attention
+        self._packed_te_metadata: GatedDeltaPackedMetadata | None = None
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        freqs_cis: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        packed_te_metadata: GatedDeltaPackedMetadata | None = None,
+        **attn_kwargs: Any,
+    ) -> torch.Tensor:
+        """Run full attention, routing a packed batch through TE's THD layout.
+
+        ``packed_te_metadata`` is carried on the instance rather than through
+        ``attn_kwargs`` because the shared backend preprocessing rebuilds the
+        TransformerEngine kwargs from scratch, and because the rotary helper reads
+        ``cu_seqlens`` from ``attn_kwargs`` only to drive TE's *fused* rope -- which
+        this model disables. Keeping it off that path leaves rope position-id driven,
+        which is already per-document correct for a packed batch.
+
+        Args:
+            x: Hidden states of shape [batch, sequence, hidden].
+            freqs_cis: Rotary frequencies of shape [axes, batch, sequence, head_dim].
+            attention_mask: Optional padding mask of shape [batch, sequence]. Must be
+                ``None`` when ``packed_te_metadata`` is given, since per-document
+                causality comes from ``cu_seqlens`` instead.
+            packed_te_metadata: Optional packed-sequence metadata; tensor layouts are
+                documented by :class:`GatedDeltaPackedMetadata`.
+            **attn_kwargs: Backend-specific attention arguments.
+
+        Returns:
+            Hidden states of shape [batch, sequence, hidden].
+        """
+        self._packed_te_metadata = packed_te_metadata
+        try:
+            return super().forward(x, freqs_cis=freqs_cis, attention_mask=attention_mask, **attn_kwargs)
+        finally:
+            self._packed_te_metadata = None
 
     def _dispatch_attention(
         self,
@@ -125,18 +165,24 @@ class _Qwen3_5MoeAttention(Qwen3NextAttention):
         value: torch.Tensor,
         **attn_kwargs: Any,
     ) -> torch.Tensor:
-        """Route preprocessed QKV through packed CP or the configured backend.
+        """Route preprocessed QKV through packed CP, packed TE, or the configured backend.
+
+        The QKV axis order is whatever the backend preprocessing produced: SDPA is
+        ``[batch, heads, local_sequence, head_dim]`` while TransformerEngine keeps
+        ``[batch, local_sequence, heads, head_dim]``. Each branch below documents the
+        layout it requires, and the output matches the input layout.
 
         Args:
-            query: Query states of shape ``[batch, heads, local_sequence, head_dim]``.
-            key: Key states of shape ``[batch, kv_heads, local_sequence, head_dim]``.
+            query: Query states of shape ``[batch, heads, local_sequence, head_dim]``
+                (SDPA) or ``[batch, local_sequence, heads, head_dim]`` (TE).
+            key: Key states in the same layout as ``query`` with ``kv_heads`` in place
+                of ``heads``.
             value: Value states with the same layout as ``key``.
             **attn_kwargs: Keyword arguments produced by the parent attention's
                 backend preprocessing.
 
         Returns:
-            Attention output of shape
-            ``[batch, heads, local_sequence, head_dim]``.
+            Attention output in the same layout as ``query``.
         """
         from nemo_automodel.components.distributed.blockdiag_cp import (
             cp_blockdiag_sdpa,
@@ -147,7 +193,73 @@ class _Qwen3_5MoeAttention(Qwen3NextAttention):
             if self.backend.attn != "sdpa":
                 raise ValueError("Qwen3.5-MoE packed context parallelism requires model.backend.attn='sdpa'")
             return cp_blockdiag_sdpa(query, key, value, **attn_kwargs)
+        if self._packed_te_metadata is not None:
+            return self._packed_te_attention(query, key, value, self._packed_te_metadata, **attn_kwargs)
         return self._base_attn_func(query, key, value, **attn_kwargs)
+
+    def _packed_te_attention(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        metadata: GatedDeltaPackedMetadata,
+        **attn_kwargs: Any,
+    ) -> torch.Tensor:
+        """Run TransformerEngine attention over a packed batch in THD layout.
+
+        Padding is removed so the token stream is dense, and ``cu_seqlens`` makes TE
+        apply causality within each document independently. TE's fused kernel is
+        retained, unlike an ``arbitrary`` 4-D mask, which falls back to the unfused
+        path.
+
+        Args:
+            query: Query states of shape [batch, sequence, heads, head_dim].
+            key: Key states of shape [batch, sequence, kv_heads, head_dim].
+            value: Value states with the same layout as ``key``.
+            metadata: Packed-sequence metadata; tensor layouts are documented by
+                :class:`GatedDeltaPackedMetadata`. ``cu_seqlens`` indexes the
+                *unpadded* stream produced here.
+            **attn_kwargs: Backend arguments from the shared TE preprocessing. Must
+                not contain ``attention_mask``; per-document causality comes from
+                ``cu_seqlens``.
+
+        Returns:
+            Attention output of shape [batch, sequence, heads, head_dim], with padding
+            positions zero-filled.
+        """
+        if "attention_mask" in attn_kwargs:
+            raise ValueError("Packed TE attention derives causality from cu_seqlens; an explicit mask is ambiguous")
+
+        batch, seq_len = query.shape[0], query.shape[1]
+        indices = metadata.indices
+        # cu_seqlens_cpu is already materialized on the host, so the max document
+        # length TE needs costs no device synchronization.
+        seqlens = metadata.cu_seqlens_cpu[1:] - metadata.cu_seqlens_cpu[:-1]
+        max_seqlen = int(seqlens.max())
+
+        def _unpad(tensor: torch.Tensor) -> torch.Tensor:
+            heads, head_dim = tensor.shape[2], tensor.shape[3]
+            return tensor.reshape(batch * seq_len, heads, head_dim)[indices]
+
+        attn_output = self._base_attn_func(
+            _unpad(query),
+            _unpad(key),
+            _unpad(value),
+            qkv_format="thd",
+            attn_mask_type="padding_causal",
+            cu_seqlens_q=metadata.cu_seqlens,
+            cu_seqlens_kv=metadata.cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_kv=max_seqlen,
+            **attn_kwargs,
+        )
+
+        # Scatter [tokens, heads, head_dim] back into [batch, sequence, heads, head_dim];
+        # padding positions stay zero and are masked out downstream.
+        flat = attn_output.reshape(attn_output.shape[0], -1)
+        padded = torch.zeros(batch * seq_len, flat.shape[-1], dtype=flat.dtype, device=flat.device)
+        padded.index_copy_(0, indices, flat)
+        return padded.reshape(batch, seq_len, attn_output.shape[1], attn_output.shape[2])
 
 
 class Qwen3_5MoeBlock(Block):
@@ -194,10 +306,29 @@ class Qwen3_5MoeBlock(Block):
         if self.layer_type != "linear_attention":
             attn_kwargs = dict(attn_kwargs)
             attn_kwargs.pop("seq_index", None)
+            self_attn_mask = attention_mask
+            if self.self_attn.backend.attn == "te":
+                # TransformerEngine has no mask route to per-document causality: a
+                # 4-D block-causal mask is rejected and an indexed [batch, sequence]
+                # document map would collapse into a plain padding mask, letting
+                # tokens attend across packed documents with no error. Hand the
+                # metadata to the attention module instead, which runs TE in its
+                # native qkv_format="thd" over the unpadded token stream.
+                te_packed_metadata = packed_gdn_metadata
+                if te_packed_metadata is None:
+                    te_packed_metadata = prepare_gated_delta_packed_metadata(
+                        attention_mask,
+                        attn_kwargs.get("_packed_seq_ids"),
+                    )
+                if te_packed_metadata is not None:
+                    if padding_mask is None:
+                        padding_mask = te_packed_metadata.document_ids.bool().logical_not()
+                    attn_kwargs["packed_te_metadata"] = te_packed_metadata
+                    self_attn_mask = None
             return super().forward(
                 x,
                 freqs_cis=freqs_cis,
-                attention_mask=attention_mask,
+                attention_mask=self_attn_mask,
                 padding_mask=padding_mask,
                 position_ids=position_ids,
                 **attn_kwargs,
@@ -344,7 +475,52 @@ def _freqs_cis_from_rotary(
     return torch.cat((cos[..., :head_dim], sin[..., :head_dim]), dim=-1)
 
 
-def _rolled_embed_inputs(inputs_embeds: torch.Tensor, num_depths: int) -> tuple[torch.Tensor, ...]:
+def _packed_document_ids(
+    attention_mask: torch.Tensor | None,
+    packed_seq_ids: torch.Tensor | None,
+) -> torch.Tensor | None:
+    """Return the indexed packing map for a batch, or ``None`` when unpacked.
+
+    Args:
+        attention_mask: Optional mask of shape [batch, sequence] or
+            [batch, 1, sequence, sequence]. Only an indexed document map qualifies.
+        packed_seq_ids: Optional indexed document IDs of shape [batch, sequence],
+            supplied beside a backend-specific mask.
+
+    Returns:
+        Indexed document map of shape [batch, sequence] with zero for padding, or
+        ``None`` when the batch holds at most one document per row.
+    """
+    if is_indexed_packed_mask(attention_mask):
+        return attention_mask
+    if is_indexed_packed_mask(packed_seq_ids):
+        return packed_seq_ids
+    return None
+
+
+def _rolled_embed_inputs(
+    inputs_embeds: torch.Tensor,
+    num_depths: int,
+    document_ids: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, ...]:
+    """Build per-depth future-token embeddings for the MTP heads.
+
+    Args:
+        inputs_embeds: Embeddings of shape [batch, sequence, hidden].
+        num_depths: Number of MTP future-token depths.
+        document_ids: Optional indexed packing map of shape [batch, sequence]. When
+            given, a depth's source embedding is zero-filled wherever the shifted
+            position belongs to a different packed document, so no MTP head is
+            trained to predict across a document boundary.
+
+    Returns:
+        ``num_depths`` embeddings of shape [batch, sequence, hidden], depth ``d``
+        holding the embedding ``d`` positions ahead.
+    """
+    if document_ids is not None:
+        return tuple(
+            shift_packed_tensor(inputs_embeds, depth=depth, seq_idx=document_ids) for depth in range(1, num_depths + 1)
+        )
     embed_inputs = []
     cur = inputs_embeds
     for _ in range(num_depths):
@@ -1038,6 +1214,7 @@ class Qwen3_5MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         mtp_per_depth_h: list[torch.Tensor] | None = None
         if self.mtp is not None and self.training:
             source_embeds = inputs_embeds if inputs_embeds is not None else self.model.embed_tokens(input_ids)
+            mtp_document_ids = _packed_document_ids(attention_mask, kwargs.get("_packed_seq_ids"))
             mtp_position_ids = _split_qwen3_5_moe_position_ids(
                 position_ids,
                 batch_size=source_embeds.shape[0],
@@ -1060,10 +1237,10 @@ class Qwen3_5MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 )
             elif int(kwargs.get("cp_size", 1) or 1) > 1:
                 raise ValueError("Context-parallel Qwen3.5-MoE MTP requires precomputed per-depth inputs and positions")
-            elif input_ids is None:
+            elif input_ids is None or mtp_document_ids is not None:
                 mtp_per_depth_h = self.mtp(
                     hidden_states,
-                    embed_inputs=_rolled_embed_inputs(source_embeds, self.mtp.num_depths),
+                    embed_inputs=_rolled_embed_inputs(source_embeds, self.mtp.num_depths, mtp_document_ids),
                     position_ids=mtp_position_ids,
                     attention_mask=attention_mask,
                     padding_mask=padding_mask,
@@ -1790,6 +1967,7 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         if self.mtp is not None and self.training:
             language_model = self.model.language_model
             source_embeds = inputs_embeds if inputs_embeds is not None else language_model.embed_tokens(input_ids)
+            mtp_document_ids = _packed_document_ids(attention_mask, kwargs.get("_packed_seq_ids"))
             mtp_position_ids = _split_qwen3_5_moe_position_ids(
                 position_ids,
                 batch_size=source_embeds.shape[0],
@@ -1821,10 +1999,10 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
                 )
             elif cp_size > 1:
                 raise ValueError("Context-parallel Qwen3.5-MoE MTP requires globally prepared per-depth inputs")
-            elif input_ids is None:
+            elif input_ids is None or mtp_document_ids is not None:
                 mtp_per_depth_h = self.mtp(
                     hidden_states,
-                    embed_inputs=_rolled_embed_inputs(source_embeds, self.mtp.num_depths),
+                    embed_inputs=_rolled_embed_inputs(source_embeds, self.mtp.num_depths, mtp_document_ids),
                     position_ids=mtp_position_ids,
                     attention_mask=attention_mask,
                     padding_mask=padding_mask,

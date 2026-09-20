@@ -1,0 +1,248 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Four-node run: 4 x 8 x H200, FSDP2 over 32 GPUs + EP8 + DeepEP, **neat sequence packing
+# with TransformerEngine attention**, 5 epochs on vuhaian/v6_137k, trained from the base
+# model Qwen/Qwen3.6-35B-A3B with a WSD schedule.
+#
+# This is qwen3_6_35b_4node_ep8_base.yaml with three coupled changes:
+#
+#   1. `packed_sequence` on, `packing_format: neat`. Padding is eliminated, so the
+#      length-grouped sampler has nothing left to buy.
+#   2. `dataloader.length_grouped_sampler` REMOVED. It sorted the corpus once in
+#      __init__ and never re-sorted, so batch membership was frozen for the whole run
+#      (only batch order was shuffled) -- see RUNBOOK.md section 13.3. Packing replaces
+#      the throughput it bought.
+#   3. `packed_sequence.label_post_hook_fn` supplies the final-assistant-turn masking.
+#      This is MANDATORY: enabling packing forces pretokenization and replaces the
+#      dataloader's collate_fn, so `last_turn_collate_fn` never runs and labels would
+#      otherwise come from the stock builder, which supervises EVERY assistant turn.
+#      On this turn-exploded corpus that is ~36x more supervised tokens, a different
+#      objective, and no error. Rung 2 must be re-run against a packed batch.
+#
+# Read RUNBOOK.md sections 5 and 11 for the node setup and the patched image, and
+# section 13.5 for why packing was previously believed impossible here (the
+# GatedDeltaNet half of that verdict was fixed upstream in c4a4c8322).
+#
+# Why TE still works under packing: TE has no mask representation for per-document
+# causality, so the model hands it `qkv_format="thd"` + `cu_seqlens` over the unpadded
+# token stream instead of a mask. The 4-D block-causal mask is never materialized (it
+# would be 1.6 GiB per row at this pack size). The 30 GatedDeltaNet layers already
+# reset state on `cu_seqlens`.
+#
+# Bonus effect worth expecting: pack shapes are fixed at `collate_max_length`, so FLA's
+# Triton autotune key stops changing every step. The ~25% of wall time RUNBOOK.md
+# section 8.5 attributes to autotune stalls should largely disappear.
+
+recipe: FinetuneRecipeForVLM
+
+seed: 1234
+
+step_scheduler:
+  # dp_size = 32. grad_accum = global_batch_size / (local_batch_size * dp_size)
+  #   = 64 / (2 * 32) = 1. gbs must be a multiple of lbs * 32 (step_scheduler.py).
+  global_batch_size: 64
+  # lbs 2 at pack_size 40,960 is 81,920 real tokens per rank per micro-batch -- half of
+  # the 163,840 padded tokens the lbs-4 length-grouped worst case carried, which measured
+  # 139.5 GiB on 8 GPUs and 123.7 GiB on 16. At 32-way sharding the fixed per-GPU cost
+  # (params + grads + 8-bit moments) is ~6.5 GiB, so expect ~85-95 GiB nvidia-smi.
+  # Unlike the unpacked recipe EVERY step is now worst-case-shaped, so there is no
+  # occasional-peak luck left: judge the fit from step 1, not from a trend.
+  # lbs 4 (163,840 tokens) is expected to land near the 141 GiB ceiling -- do not use it
+  # without a rung-6 memory check.
+  local_batch_size: 2
+  num_epochs: 5
+  #
+  # STEP COUNTS BELOW ARE ESTIMATES AND MUST BE CONFIRMED BEFORE A FULL RUN.
+  #
+  # v6_137k is 135,491 train rows / 0.564B rendered tokens per epoch. At pack_size 40,960
+  # and an assumed ~97% fill that is ~14,190 packs, i.e. ~443 packs per rank, ~222
+  # micro-batches per rank, so epoch_len ~222 optimizer steps and 5 epochs ~1,110 steps.
+  # The true pack count is deterministic once the knapsack runs and is logged by the
+  # packer at startup. Read it from a 5-step smoke run and recompute:
+  #   epoch_len   = floor(packs / 32 / local_batch_size)
+  #   total_steps = epoch_len * num_epochs
+  #   wsd_decay_steps = epoch_len          # anneal across exactly the last epoch
+  #   ckpt_every_steps = floor(epoch_len / 4)
+  # Every figure below is derived from epoch_len = 222.
+  ckpt_every_steps: 55
+  val_every_steps: 55
+  log_remote_every_steps: 1
+  save_checkpoint_every_epoch: false
+  validate_on_checkpoint: true
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 120
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen3.6-35B-A3B
+  torch_dtype: torch.bfloat16
+  text_config:
+    # Keep MTP: disabling it drops the 19 mtp.* tensors from the export.
+    num_nextn_predict_layers: 1
+    output_hidden_states: true
+    use_cache: false
+  mtp_loss_scaling_factor: 0.1
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    # Retained under packing: the model routes packed batches to TE's fused THD path.
+    attn: te
+    linear: te
+    rms_norm: torch_fp32
+    rope_fusion: false
+    experts: te
+    dispatcher: deepep
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+
+processor:
+  _target_: transformers.AutoProcessor.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen3.6-35B-A3B
+  padding_side: right
+
+checkpoint:
+  enabled: true
+  # A NEW directory on purpose. The sibling recipe's dataloader state was written by the
+  # length-grouped sampler; the restore path only checks the model config, so resuming
+  # that state into this (sampler-free, packed) pipeline would silently mismatch the data
+  # order. RUNBOOK.md section 13.1 also notes resume has never been exercised here.
+  checkpoint_dir: checkpoints/qwen3_6_35b_v6_137k_4node_ep8_packed/
+  model_save_format: safetensors
+  save_consolidated: final
+  max_recent_checkpoints: 2
+  # restore_from: checkpoints/qwen3_6_35b_v6_137k_4node_ep8_packed/LATEST
+
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  dp_replicate_size: 1
+  tp_size: 1
+  # cp_size MUST stay 1. At cp > 1 the packed VLM path keeps the compact document map and
+  # the model's block-diagonal CP route requires backend.attn='sdpa'
+  # (_packed_cp_attn_backends), which would give up TE fused attention.
+  cp_size: 1
+  pp_size: 1
+  ep_size: 8
+  sequence_parallel: false
+  activation_checkpointing: true
+  defer_fsdp_grad_sync: false
+  multimodal:
+    frozen_sharding: per_layer
+  moe:
+    # MUST be true on this topology; see the sibling recipe for the DCP KeyError it avoids.
+    reshard_after_forward: true
+    wrap_outer_model: true
+    ignore_router_for_ac: true
+
+freeze_config:
+  freeze_vision_tower: true
+  freeze_audio_tower: true
+  freeze_language_model: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
+
+dataset:
+  _target_: examples/vlm_finetune/qwen3_5_moe/affine/dataset.py:make_affine_dataset
+  path_or_dataset: data/v6_137k_filtered/train.parquet
+  # MANDATORY under packing. Packing forces pretokenization, and the pretokenizing
+  # wrapper defaults this to true: every text-only row would get a synthetic image and
+  # be pushed through the frozen vision tower.
+  inject_fake_images: false
+
+packed_sequence:
+  # Pack to the pre-filter cap so no row has to be dropped for length: the longest v6 row
+  # is 40,947 tokens. A smaller pack_size would silently discard the long tail that the
+  # 40,960 pre-filter was chosen to keep (98.88% of rows).
+  pack_size: 40960
+  packing_format: neat
+  pretokenize: true
+  # Fixed pack shapes: uniform tensors every step, which is what stops the FLA autotune
+  # thrash of RUNBOOK.md section 8.5.
+  collate_max_length: 40960
+  # Self-documenting only; at cp_size 1 the packed mask format follows model.backend.attn.
+  attn_implementation: te
+  # Final-assistant-turn supervision on the packed path. See the header, item 3.
+  # A `*_fn` key is resolved straight from this string by the config loader, so it takes
+  # the bare target rather than a nested `_target_` block.
+  label_post_hook_fn: examples/vlm_finetune/qwen3_5_moe/affine/dataset.py:last_turn_label_hook
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 4
+  pin_memory: true
+  persistent_workers: true
+  drop_last: true
+  # Plain shuffled distributed sampling. No length_grouped_sampler: packs are all
+  # collate_max_length long, so there is no padding left for length grouping to remove,
+  # and its frozen batch membership was the bias this recipe drops.
+  shuffle: true
+  # NOTE: no collate_fn here. Under packing the packed collater is selected and a
+  # dataloader collate_fn would be silently ignored, so declaring one would be
+  # misleading. Label masking is packed_sequence.label_post_hook_fn instead.
+
+validation_dataset:
+  _target_: examples/vlm_finetune/qwen3_5_moe/affine/dataset.py:make_affine_dataset
+  path_or_dataset: data/v6_137k_filtered/val.parquet
+
+validation_dataloader:
+  # Validation is deliberately NOT packed: RecipeConfig.vlm_validation_dataloader does not
+  # receive the packed_sequence node, so this path keeps the ordinary collator and
+  # last_turn_collate_fn. Validation loss therefore stays directly comparable with the
+  # unpacked runs.
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 2
+  pin_memory: true
+  drop_last: true
+  shuffle: false
+  collate_fn:
+    _target_: examples/vlm_finetune/qwen3_5_moe/affine/dataset.py:last_turn_collate_fn
+
+optimizer:
+  _target_: torchao.optim.AdamW8bit
+  lr: 5.0e-5
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  weight_decay: 0.01
+
+lr_scheduler:
+  # Warmup is ~4.5% of one epoch, matching the 50/1,054 ratio of the unpacked recipe.
+  lr_warmup_steps: 10
+  # Warmup -> stable for epochs 1-4 -> cosine anneal across epoch 5. lr_decay_steps
+  # defaults to total_steps (~1,110), so the anneal begins at total_steps -
+  # wsd_decay_steps. Recompute both with the measured epoch_len.
+  lr_decay_style: WSD
+  wsd_decay_steps: 222
+  lr_wsd_decay_style: cosine
+  max_lr: 5.0e-5
+  min_lr: 5.0e-7
+
+clip_grad_norm:
+  max_norm: 1.0
+
+prewarm:
+  cublas_backward: true
+  fla_gdn_autotune: true
+  comm_groups: true
+
+moe_metrics:
+  enabled: true
+
+wandb:
+  project: qwen3_6_35b_v5_130k
+  name: v6_137k_4node_ep8_packed_neat_te_lbs2
+  dir: logs/wandb
