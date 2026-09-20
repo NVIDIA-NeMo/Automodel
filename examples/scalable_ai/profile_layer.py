@@ -249,8 +249,23 @@ def create_inputs(
     dtype: torch.dtype,
     use_hf: bool,
     hf_rotary=None,
+    hf_layer: torch.nn.Module | None = None,
 ) -> dict:
-    """Random hidden states plus the rotary / mask tensors the chosen layer needs."""
+    """Random hidden states plus the rotary / mask tensors the chosen layer needs.
+
+    Args:
+        hf_rotary: The transformers rotary embedding module, when ``use_hf``.
+        hf_layer: The transformers layer, when ``use_hf``; used to discover which rope layer type
+            it indexes ``position_embeddings`` by, so the matching rotary is built for it.
+
+    Returns:
+        Mapping of keyword name to input. ``x`` is of shape [batch, sequence, hidden], or
+        [batch, sequence, hc_mult, hidden] for the ``block`` and ``hc`` layers which carry
+        manifold-constrained hyper-connection residual streams. ``position_ids`` is
+        [batch, sequence]; ``attention_mask`` is [batch, 1, sequence, sequence];
+        ``position_embeddings`` is a ``(cos, sin)`` pair of [batch, sequence, head_dim] tensors,
+        keyed by rope layer type on the transformers path.
+    """
     D, hc = cfg.hidden_size, cfg.hc_mult
     inputs = {}
     if layer_type in ("block", "hc"):
@@ -264,7 +279,13 @@ def create_inputs(
         if use_hf:
             from transformers.masking_utils import create_sliding_window_causal_mask
 
-            inputs["position_embeddings"] = hf_rotary(ref, position_ids, layer_type="main")
+            # transformers indexes position_embeddings by the layer's own rope type
+            # (modeling_deepseek_v4.py: ``cos, sin = position_embeddings[self.rope_layer_type]``),
+            # where sliding-window layers use "main" and compressed ones "compress" -- different
+            # theta and scaling.  Build the rotary for whichever the layer declares, so CSA/HCA are
+            # not silently profiled with the sliding-window frequencies.
+            rope_layer_type = getattr(getattr(hf_layer, "self_attn", hf_layer), "rope_layer_type", "main")
+            inputs["position_embeddings"] = {rope_layer_type: hf_rotary(ref, position_ids, layer_type=rope_layer_type)}
             inputs["attention_mask"] = create_sliding_window_causal_mask(
                 config=cfg, inputs_embeds=ref, attention_mask=None, past_key_values=None, position_ids=position_ids
             )
@@ -443,7 +464,9 @@ def main():
     n_fp32 = sum(p.numel() for p in layer.parameters() if p.dtype == torch.float32)
     logger.info(f"Parameters: {n_params:,} ({n_fp32:,} kept in fp32)")
 
-    inputs = create_inputs(args.layer, cfg, args.batch_size, args.seq_len, device, dtype, args.use_hf, hf_rotary)
+    inputs = create_inputs(
+        args.layer, cfg, args.batch_size, args.seq_len, device, dtype, args.use_hf, hf_rotary, hf_layer=layer
+    )
     nsys_start = args.nsys_start if args.nsys_start is not None else args.warmup_iters
     nsys_end = args.nsys_end if args.nsys_end is not None else args.warmup_iters + args.profile_iters - 1
     total_iters = args.warmup_iters + args.profile_iters
