@@ -1,19 +1,22 @@
 # Scoreboard, and what is left
 
-All rows: 12 layers, sequence 2048, micro-batch 4, one gradient accumulation step, 8x H100.
+Each row adds one change to the row above. Stages 0-2 are the full 27-layer model at micro-batch 1
+with 32 accumulation steps, which is where the baseline fails; stages 3-9 are a 12-layer model at one
+accumulation step so that every later change is measured against something that runs. Sequence 2048,
+FSDP2 across 8 GPUs, expert parallelism 8 everywhere except the stock baseline.
 
-| # | change | step time | MFU | peak memory |
-| ---: | --- | ---: | ---: | ---: |
-| 0 | stock `transformers`, full model | does not run | - | > 79 GB |
-| 1 | Automodel, eager, loop experts, micro-batch 1 | 23.02 s | 4.80% | 60.5 GB |
-| 2 | grouped GEMM + DeepEP | 20.09 s | 5.50% | 58.8 GB |
-| 3 | batch shape, one accumulation step | - | 7.98% | 59.3 GB |
-| 4 | TileLang sparse attention | 0.599 s | 11.69% | 54.2 GB |
-| 5 | `compile_hc` fusion | 0.561 s | 12.47% | 48.2 GB |
-| 6 | bf16 gradient reduction | 0.554 s | 12.64% | 48.1 GB |
-| 7 | bf16 vocabulary projection | 0.514 s | 13.60% | 44.3 GB |
-| 8 | fused mHC projection kernel | 0.515 s | 13.58% | 41.3 GB |
-| 9 | fused stream mix | 0.483 s | **14.48%** | 41.3 GB |
+| # | change | layers | micro-batch | attention | MoE and fusions | step time | MFU | peak memory |
+| ---: | --- | ---: | ---: | --- | --- | ---: | ---: | ---: |
+| 0 | stock `transformers`, ep1 | 27 | 1 | eager, dense then mask | HF module list | does not run | - | > 79 GB |
+| 1 | Automodel native model | 27 | 1 | eager | loop experts, all-gather | 23.02 s | 4.80% | 60.5 GB |
+| 2 | grouped GEMM + DeepEP | 27 | 1 | eager | `gmm` + DeepEP | 20.09 s | 5.50% | 58.8 GB |
+| 3 | batch shape, one accumulation step | 12 | 3 | eager | `gmm` + DeepEP | 0.658 s | 7.98% | 59.3 GB |
+| 4 | TileLang sparse attention | 12 | 4 | TileLang | `gmm` + DeepEP | 0.599 s | 11.69% | 54.2 GB |
+| 5 | `compile_hc` fusion | 12 | 4 | TileLang | + compiled mHC cores | 0.561 s | 12.47% | 48.2 GB |
+| 6 | bf16 gradient reduction | 12 | 4 | TileLang | + bf16 ReduceScatter | 0.554 s | 12.64% | 48.1 GB |
+| 7 | bf16 vocabulary projection | 12 | 4 | TileLang | + bf16 projections | 0.514 s | 13.60% | 44.3 GB |
+| 8 | fused mHC projection kernel | 12 | 4 | TileLang | + Triton norm-projection | 0.515 s | 13.58% | 41.3 GB |
+| 9 | fused stream mix | 12 | 4 | TileLang | + 4-way mix as multiply-adds | 0.483 s | **14.48%** | 41.3 GB |
 
 **3.0x the MFU, and 19 GB less memory**, on a model stock `transformers` could not train at all.
 
