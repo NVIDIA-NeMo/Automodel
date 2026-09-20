@@ -678,8 +678,11 @@ class Checkpointer:
         if self.config.model_save_format == SerializationFormat.SAFETENSORS:
             # Module metadata (e.g. Transformer Engine state) is not part of HF weights.
             state_dict = {key: value for key, value in state_dict.items() if not key.endswith("_extra_state")}
-        # MoE adapters return non-contiguous views; safetensors.save rejects those.
-        _materialize_to_hf_views_for_save(state_dict)
+        # DCP's default writer can save strided views one tensor at a time.
+        # Materializing them all here duplicates the model's local expert storage.
+        # PEFT also writes safetensors, regardless of model_save_format.
+        if self.config.model_save_format == SerializationFormat.SAFETENSORS or self.config.is_peft:
+            _materialize_to_hf_views_for_save(state_dict)
         # Build the consolidated model.safetensors.index.json if needed
         fqn_to_file_index_mapping = self._maybe_build_consolidated_index(model_state, state_dict)
         fqn_to_dtype_mapping = self._maybe_build_original_dtype_mapping(model_state, state_dict)
@@ -2678,9 +2681,9 @@ def _materialize_to_hf_views_for_save(state_dict: dict[str, torch.Tensor]) -> No
     MoE adapters return non-contiguous strided views into the model's grouped
     expert storage for the optimized load path; ``safetensors.torch.save``
     (which the DCP HF storage writer calls) rejects non-contiguous tensors,
-    so we materialize one tensor at a time here with ``empty_cache`` between
-    iterations. Per-tensor transient is bounded to a single expert weight
-    instead of allocating the full grouped set up front.
+    so safetensors exports materialize those views here. The resulting copies
+    stay live in the dictionary alongside the model's original storage until
+    saving completes; ordinary DCP saves must avoid this eager duplication.
     """
     if not state_dict:
         return

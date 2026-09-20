@@ -182,7 +182,12 @@ class TestSplitExpertsWeightsDtensorAware:
         mock_submesh.size.return_value = 1  # Make it seem like dp dimension is not used
         mock_get_submesh.return_value = mock_submesh
 
-        split_weights, expert_ids = split_experts_weights_dtensor_aware(mock_weight, 8)
+        # Even a singleton axis must survive if it is present on the source.
+        with patch("nemo_automodel.components.moe.state_dict_utils.DTensor.from_local",
+                   side_effect=lambda value, mesh, placements: value) as create:
+            split_weights, expert_ids = split_experts_weights_dtensor_aware(mock_weight, 8)
+        assert create.call_count == 2
+        assert all(call.args[1] is mock_submesh for call in create.call_args_list)
 
         assert len(split_weights) == 2
         assert expert_ids == [2, 3]

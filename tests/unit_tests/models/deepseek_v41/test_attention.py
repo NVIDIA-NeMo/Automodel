@@ -530,7 +530,8 @@ def test_compressor_cast_boundary_and_all_gradients_match_literal_projection(rat
         chunks = reference_x[:, :4].float().reshape(2, 2, 2, config.hidden_size)
         kv = F.linear(chunks, reference["wkv.weight"])
         logits = F.linear(chunks, reference["wgate.weight"])
-        latent = (kv * logits.softmax(2)).sum(2).bfloat16()
+        # Validated V4.1 path normalizes the FP32 pooled projection before BF16 rounding.
+        latent = (kv * logits.softmax(2)).sum(2)
     expected = F.rms_norm(
         latent.float(), (config.head_dim,), reference["norm.weight"].float(), config.rms_norm_eps
     ).bfloat16()

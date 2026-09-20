@@ -62,6 +62,7 @@ from typing import Any
 import torch
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Partial, Shard
+from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
 
 from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
 from nemo_automodel.components.models.common import BackendConfig
@@ -139,6 +140,25 @@ def _local_offsets(tensor: DTensor) -> tuple[int, ...]:
             shape[axis] = size
             offsets[axis] += offset
     return tuple(offsets)
+
+
+def _checkpoint_dtensor(local: torch.Tensor, template: DTensor, shape: tuple[int, int]) -> DTensor:
+    """Wrap detached checkpoint storage [local_rows, local_columns] on its device.
+
+    Return the global [rows, columns] shape with the template mesh/placements.
+    CPU-offloaded tensors still have a CUDA mesh. from_local would move them
+    back to CUDA, unlike FSDP's CPU shards. The explicit storage constructor is
+    limited to detached checkpoint tensors; it must not bypass training autograd.
+    """
+    stride = (shape[1], 1)
+    if local.is_meta or local.device.type == template.device_mesh.device_type:
+        return DTensor.from_local(local, template.device_mesh, template.placements,
+                                  shape=torch.Size(shape), stride=stride)
+    if local.device.type != "cpu" or local.requires_grad:
+        raise ValueError("Offloaded checkpoint DTensor storage must be detached and on CPU")
+    spec = DTensorSpec(template.device_mesh, template.placements,
+                       tensor_meta=TensorMeta(torch.Size(shape), stride, local.dtype))
+    return DTensor(local, spec, requires_grad=False)
 
 
 def dequantize_checkpoint_weight(
@@ -230,13 +250,7 @@ def dequantize_checkpoint_weight(
             scales = local_scale[scale_begin:scale_end].float()
             output[begin:end].copy_(decoded * scales[row_ids[:, None], column_ids])
     if isinstance(weight, DTensor):
-        return DTensor.from_local(
-            output,
-            weight.device_mesh,
-            weight.placements,
-            shape=torch.Size(global_shape),
-            stride=(global_shape[1], 1),
-        )
+        return _checkpoint_dtensor(output, weight, global_shape)
     return output
 
 
@@ -344,6 +358,10 @@ class DeepseekV41StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
             expert = re.match(r"layers\.\d+\.ffn\.experts\.(\d+)\.", key)
             if (
                 key.startswith("mtp.")
+                or (
+                    self.config.text_config.engram_host_checkpoint is not None
+                    and re.fullmatch(r"layers\.\d+\.engram\.embed\.(weight|scale)", key)
+                )
                 or (layer and int(layer[1]) >= self.config.text_config.num_hidden_layers)
                 or (
                     expert
@@ -502,13 +520,7 @@ class DeepseekV41StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
         )
         shape = (value.shape[0], value.shape[1] // divisor)
         if isinstance(value, DTensor):
-            weight = DTensor.from_local(
-                local_weight,
-                value.device_mesh,
-                value.placements,
-                shape=torch.Size(shape),
-                stride=(shape[1], 1),
-            )
+            weight = _checkpoint_dtensor(local_weight, value, shape)
         else:
             weight = local_weight
         if rowwise:
@@ -517,13 +529,7 @@ class DeepseekV41StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
             )
             if isinstance(value, DTensor):
                 shape = (value.shape[0], value.shape[1] // 32)
-                scale = DTensor.from_local(
-                    local_scale,
-                    value.device_mesh,
-                    value.placements,
-                    shape=torch.Size(shape),
-                    stride=(shape[1], 1),
-                )
+                scale = _checkpoint_dtensor(local_scale, value, shape)
             else:
                 scale = local_scale
         else:

@@ -67,6 +67,7 @@ from nemo_automodel.components.models.deepseek_v41.attention import (
 )
 from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41Config, DeepseekV41TextConfig
 from nemo_automodel.components.models.deepseek_v41.engram import DeepseekV41Engram, DeepseekV41NgramHash
+from nemo_automodel.components.models.deepseek_v41.host_engram import FrozenHostEngramTable
 from nemo_automodel.components.models.deepseek_v41.layers import (
     DeepseekV41HyperConnection,
     DeepseekV41RMSNorm,
@@ -353,6 +354,7 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
             route_scale=text.routed_scaling_factor,
             norm_topk_prob=text.norm_topk_prob,
             router_weights_fp32=True,
+            apply_router_weight_after_down=True,
             force_e_score_correction_bias=True,
             swiglu_limit=text.swiglu_limit,
             dtype=dtype,
@@ -449,7 +451,7 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
         """
         parameters: set[nn.Parameter] = set()
         for layer in self.model.layers.values():
-            if layer.engram is None:
+            if layer.engram is None or isinstance(layer.engram.embed, FrozenHostEngramTable):
                 continue
             parameters.add(layer.engram.embed.parallelize_weight(fsdp_mesh))
         return parameters
@@ -553,7 +555,7 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
         if not _has_dtensor_params(self):
             cast_model_to_dtype(self, dtype)
         for layer in self.model.layers.values():
-            if layer.engram is not None:
+            if layer.engram is not None and not isinstance(layer.engram.embed, FrozenHostEngramTable):
                 layer.engram.embed.mark_sharding_contract()
 
 

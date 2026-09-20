@@ -113,9 +113,12 @@ class MLP(nn.Module):
             # Mirror DSV4 reference Expert.forward: fp32 SwiGLU with one-sided
             # gate clamp and symmetric up clamp; cast back before down_proj.
             dtype = x.dtype
-            gate = self.gate_proj(x).float().clamp(max=self.swiglu_limit)
-            up = self.up_proj(x).float().clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
-            return self.down_proj((F.silu(gate) * up).to(dtype))
+            assert self.gate_proj.bias is None and self.up_proj.bias is None
+            weight = torch.cat((self.gate_proj.weight, self.up_proj.weight), dim=0)
+            gate, up = F.linear(x, weight).chunk(2, dim=-1)
+            gate = gate.float().clamp(max=self.swiglu_limit)
+            up = up.float().clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
+            return self.down_proj((F.silu(gate).to(dtype).float() * up).to(dtype))
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:

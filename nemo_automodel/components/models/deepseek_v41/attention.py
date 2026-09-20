@@ -200,8 +200,8 @@ class _Compressor(nn.Module):
         scores = self.wgate(hidden_states[:, :length].float())
         values = values.unflatten(1, (-1, self.ratio))
         scores = scores.unflatten(1, (-1, self.ratio))
-        pooled = (values * scores.softmax(dim=2)).sum(dim=2).to(hidden_states.dtype)
-        return self.norm(pooled)
+        pooled = (values * scores.softmax(dim=2)).sum(dim=2)
+        return self.norm(pooled).to(hidden_states.dtype)
 
 
 def _select_candidate_blocks(
@@ -357,6 +357,7 @@ class DeepseekV41Attention(nn.Module):
         self.backend = backend
         self.layer_idx = layer_idx
         self.compress_ratio = config.compress_ratios[layer_idx]
+        self.compressed_kv_format = config.compressed_kv_format
         self.num_heads = config.num_attention_heads
         self.head_dim = config.head_dim
         self.num_groups = config.o_groups
@@ -493,7 +494,13 @@ class DeepseekV41Attention(nn.Module):
                     .all(dim=-1)
                 )
                 next_state = DeepseekV41AttentionState(
-                    compressed_kv=quantize_cache(_apply_rope(latent, compressed_angles), format="nvfp4", block_size=16),
+                    compressed_kv=quantize_cache(
+                        _apply_rope(
+                            latent.float() if self.compressed_kv_format == "mxfp8" else latent, compressed_angles
+                        ),
+                        format="fp8" if self.compressed_kv_format == "mxfp8" else "nvfp4",
+                        block_size=32 if self.compressed_kv_format == "mxfp8" else 16,
+                    ).to(latent.dtype),
                     compressed_valid=compressed_valid,
                     compression_ratio=self.compress_ratio,
                 )
@@ -533,9 +540,12 @@ class DeepseekV41Attention(nn.Module):
             indices = torch.where(visible, slots, -1)
             if self.compress_ratio:
                 selected = next_state.topk_indices
-                indices = torch.cat((indices, torch.where(selected >= 0, selected + sequence, -1)), dim=-1)
+                indices = torch.cat((torch.where(selected >= 0, selected + sequence, -1), indices), dim=-1)
             indices = indices.masked_fill(~valid_tokens.unsqueeze(-1), -1)
-            indices = F.pad(indices, (0, -indices.shape[-1] % 64), value=-1)
+            slot_order = torch.arange(indices.shape[-1], device=indices.device).expand_as(indices)
+            keys = torch.where(indices >= 0, slot_order, slot_order + indices.shape[-1])
+            indices = indices.gather(-1, keys.argsort(dim=-1))
+            indices = F.pad(indices, (0, -indices.shape[-1] % 128), value=-1)
             attended = dsv4_sparse_attention(
                 query,
                 kv,

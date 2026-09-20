@@ -3643,3 +3643,25 @@ def test_apply_cp_mixed_full_and_linear_attention(monkeypatch):
     te_attn.set_context_parallel_group.assert_called_once()
     # linear_attention block: cp_mesh attached
     assert linear_attn._cp_mesh is cp_mesh
+
+
+@pytest.mark.parametrize("cpu_offload", [False, True])
+def test_singleton_expert_mesh_owns_cpu_offload(monkeypatch, cpu_offload):
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+    shard = MagicMock()
+    monkeypatch.setattr(P, "fully_shard", shard)
+    block = DummyBlock(mlp=DummyMoE())
+    model = DummyModel([block])
+    mesh = type("Mesh", (), {"ndim": 1, "size": lambda self: 4})()
+    expert_mesh = type("Mesh", (), {"ndim": 1, "size": lambda self: 1})()
+    policy = P.CPUOffloadPolicy() if cpu_offload else None
+    P.apply_fsdp(model, mesh, ep_enabled=True, ep_shard_enabled=False,
+                 ep_shard_mesh=expert_mesh, offload_policy=policy)
+    call = _find_call_by_first_arg(shard, block.mlp.experts)
+    if cpu_offload:
+        assert call is not None
+        assert call[1]["mesh"] is expert_mesh
+        assert call[1]["offload_policy"] is policy
+    else:
+        assert call is None

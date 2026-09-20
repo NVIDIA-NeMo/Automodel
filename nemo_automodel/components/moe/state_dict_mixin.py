@@ -908,7 +908,12 @@ class MoESplitExpertsStateDictMixin:
                                 expert_parts.append((up_weight.transpose(0, 1),))
 
                         merged = self._direct_fill_grouped_expert_tensor(expert_parts)
-                        state_dict[native_key] = create_dtensor_from_local(merged, device_mesh, rank)
+                        state_dict[native_key] = create_dtensor_from_local(
+                            merged, device_mesh, rank,
+                            preserve_expert_sharding=(
+                                is_dtensor(value) and "ep_shard" in value.device_mesh.mesh_dim_names
+                            ),
+                        )
                         merged_on_cuda = merged.is_cuda
 
                         # Release the per-expert sources before processing the next projection or layer so they
@@ -940,7 +945,12 @@ class MoESplitExpertsStateDictMixin:
                             expert_parts.append((down_t,))
 
                         merged = self._direct_fill_grouped_expert_tensor(expert_parts)
-                        state_dict[native_key] = create_dtensor_from_local(merged, device_mesh, rank)
+                        state_dict[native_key] = create_dtensor_from_local(
+                            merged, device_mesh, rank,
+                            preserve_expert_sharding=(
+                                is_dtensor(value) and "ep_shard" in value.device_mesh.mesh_dim_names
+                            ),
+                        )
                         merged_on_cuda = merged.is_cuda
 
                         # See gate/up branch above for the cleanup rationale.

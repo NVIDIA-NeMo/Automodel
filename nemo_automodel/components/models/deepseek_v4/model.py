@@ -101,6 +101,7 @@ from nemo_automodel.components.models.deepseek_v4.vision import (
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import Gate, MoE
+from nemo_automodel.components.moe.router_replay import replay_selection
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
@@ -553,6 +554,7 @@ class DeepseekV4VisionGate(Gate):
             selection_bias = torch.where(vision_mask.unsqueeze(-1), visual_bias, correction_bias)
             indices = (original_scores + selection_bias).topk(self.topk, dim=-1)[1]
 
+        indices = replay_selection(self.router_replay, indices)
         weights = original_scores.gather(1, indices.long())
         if self.norm_topk_prob and self.topk > 1:
             weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)

@@ -162,7 +162,7 @@ def split_experts_weights_dtensor_aware(weight: torch.Tensor, n_experts: int) ->
             )
 
         # Build a device mesh without the dimension that partitioned experts.
-        if remaining_mesh_dims and any(map(lambda x: get_submesh(device_mesh, (x,)).size() > 1, remaining_mesh_dims)):
+        if remaining_mesh_dims:
             new_device_mesh = get_submesh(device_mesh, tuple(remaining_mesh_dims))
         else:
             new_device_mesh = None
@@ -188,7 +188,10 @@ def split_experts_weights_dtensor_aware(weight: torch.Tensor, n_experts: int) ->
                     new_placements.append(placement)
 
             # Create DTensor with new device mesh and placements
-            expert_weight = DTensor.from_local(expert_weight, new_device_mesh, new_placements)
+            # A CUDA mesh can hold offloaded CPU checkpoint storage. from_local
+            # homes its input to the mesh device, so restore the source device.
+            source_device = expert_weight.device
+            expert_weight = DTensor.from_local(expert_weight, new_device_mesh, new_placements).to(source_device)
 
         split_weights.append(expert_weight)
         expert_ids.append(global_expert_id)
@@ -232,7 +235,8 @@ def validate_dtensor_expert_sharding(tensor: torch.Tensor, expected_experts: int
 
 
 def create_dtensor_from_local(
-    local_tensor: torch.Tensor, device_mesh: Optional["DeviceMesh"], rank: int | None = None
+    local_tensor: torch.Tensor, device_mesh: Optional["DeviceMesh"], rank: int | None = None,
+    *, preserve_expert_sharding: bool = False,
 ) -> torch.Tensor:
     """
     Create a DTensor from a local tensor for expert parallelism.
@@ -241,6 +245,7 @@ def create_dtensor_from_local(
         local_tensor: Local portion of the tensor on this rank
         device_mesh: Device mesh for DTensor creation
         rank: Current rank (for device placement)
+        preserve_expert_sharding: Retain singleton FSDP axes present in source expert tensors.
 
     Returns:
         DTensor if device_mesh is provided and DTensor is available, otherwise local_tensor
@@ -253,7 +258,7 @@ def create_dtensor_from_local(
 
     # Create placements based on device mesh dimensions
     placements = []
-    ep_sharded = any(
+    ep_sharded = preserve_expert_sharding or any(
         map(
             lambda x: x in device_mesh.mesh_dim_names and get_submesh(device_mesh, (x,)).size() > 1,
             ["ep_shard", "ep_replicate"],

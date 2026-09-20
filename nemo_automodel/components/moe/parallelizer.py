@@ -26,7 +26,7 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper as ptd_checkpoint_wrapper,
 )
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.fsdp import fully_shard
+from torch.distributed.fsdp import CPUOffloadPolicy, fully_shard
 from torch.distributed.fsdp._fully_shard import MixedPrecisionPolicy, OffloadPolicy
 from torch.distributed.tensor import Replicate, Shard, distribute_module, distribute_tensor
 from torch.distributed.tensor.parallel import ParallelStyle, parallelize_module
@@ -797,7 +797,12 @@ def apply_fsdp(
                 placements=[Replicate()] * fsdp_mesh.ndim,
             )
         experts_reshard_after_forward = False if id(block) in mtp_block_ids else reshard_after_forward
-        if isinstance(moe_module, MoE) and ep_shard_enabled:
+        # A singleton expert FSDP mesh still needs hooks for CPU onload/offload.
+        # EP owns the expert partition, but does not move its storage for forward.
+        expert_cpu_offload = ep_enabled and isinstance(offload_policy, CPUOffloadPolicy)
+        if expert_cpu_offload and ep_shard_mesh is None:
+            raise ValueError("CPU offload of EP experts requires an expert FSDP mesh")
+        if isinstance(moe_module, MoE) and (ep_shard_enabled or expert_cpu_offload):
             if (
                 isinstance(moe_module.experts, GroupedExpertsMoK)
                 and moe_module.experts.runtime.mok_config.precision == "mxfp8"

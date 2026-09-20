@@ -32,7 +32,12 @@ from torch.distributed.tensor import DTensor
 from transformers import PreTrainedTokenizerFast
 
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
-from nemo_automodel.components.models.qwen3_8_flash_next.engram import Qwen3_8_FlashNextEngramTableConfig
+from nemo_automodel.components.models.qwen3_8_flash_next.engram import (
+    Qwen3_8_FlashNextEngramTableConfig,
+    Qwen3_8_FlashNextOwnerShardedEmbedding,
+)
+from .host_engram import FrozenHostEngramTable, HostEngramTableConfig
+
 from nemo_automodel.shared.import_utils import safe_import
 from nemo_automodel.shared.utils import dtype_from_str
 
@@ -234,11 +239,20 @@ class DeepseekV41Engram(nn.Module):
         owner_size = 1 if process_group is None else dist.get_world_size(process_group)
         padded_rows = ((self.num_embeddings + owner_size - 1) // owner_size) * owner_size
         dtype = dtype_from_str(config.dtype, torch.bfloat16)
-        self.embed = Qwen3_8_FlashNextEngramTableConfig(
-            num_embeddings=padded_rows,
-            embedding_dim=config.engram_head_dim,
-            initializer_range=config.initializer_range,
-        ).build(process_group=process_group, dtype=dtype)
+        self.embed: FrozenHostEngramTable | Qwen3_8_FlashNextOwnerShardedEmbedding
+        if config.engram_host_checkpoint is not None:
+            self.embed = HostEngramTableConfig(
+                checkpoint=config.engram_host_checkpoint,
+                layer_idx=layer_idx,
+                num_embeddings=self.num_embeddings,
+                embedding_dim=config.engram_head_dim,
+            ).build(dtype=dtype)
+        else:
+            self.embed = Qwen3_8_FlashNextEngramTableConfig(
+                num_embeddings=padded_rows,
+                embedding_dim=config.engram_head_dim,
+                initializer_range=config.initializer_range,
+            ).build(process_group=process_group, dtype=dtype)
         self.wkv = initialize_linear_module(
             backend.linear,
             self.hash_heads * config.engram_head_dim,
@@ -253,16 +267,18 @@ class DeepseekV41Engram(nn.Module):
     @torch.no_grad()
     def init_weights(self) -> None:
         """Initialize the table, projection, and learned branch normalization weights."""
-        self.embed.reset_parameters()
-        # Physical owner padding is absent from the released checkpoint. Keep
-        # it zero so fresh initialization and strict checkpoint resume agree.
-        local_weight = self.embed.weight.to_local() if isinstance(self.embed.weight, DTensor) else self.embed.weight
-        valid_rows = max(0, min(local_weight.shape[0], self.num_embeddings - self.embed.global_row_start))
-        local_weight[valid_rows:].zero_()
+        if not isinstance(self.embed, FrozenHostEngramTable):
+            self.embed.reset_parameters()
+            # Physical owner padding is absent from the released checkpoint. Keep
+            # it zero so fresh initialization and strict checkpoint resume agree.
+            local_weight = self.embed.weight.to_local() if isinstance(self.embed.weight, DTensor) else self.embed.weight
+            valid_rows = max(0, min(local_weight.shape[0], self.num_embeddings - self.embed.global_row_start))
+            local_weight[valid_rows:].zero_()
         nn.init.normal_(self.wkv.weight, mean=0.0, std=self.initializer_range)
         nn.init.ones_(self.q_weight)
         nn.init.ones_(self.k_weight)
-        self.embed.mark_sharding_contract()
+        if not isinstance(self.embed, FrozenHostEngramTable):
+            self.embed.mark_sharding_contract()
 
     def forward(
         self,
@@ -293,7 +309,7 @@ class DeepseekV41Engram(nn.Module):
         if valid and hash_ids.numel():
             valid = bool(((hash_ids >= 0) & (hash_ids < self.num_embeddings)).all())
         validity = torch.tensor(int(valid), device=hash_ids.device, dtype=torch.int32)
-        if self.embed.process_group is not None:
+        if not isinstance(self.embed, FrozenHostEngramTable) and self.embed.process_group is not None:
             dist.all_reduce(validity, op=dist.ReduceOp.MIN, group=self.embed.process_group)
         if not bool(validity):
             raise ValueError(

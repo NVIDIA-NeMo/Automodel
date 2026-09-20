@@ -601,7 +601,10 @@ class GroupedExperts(nn.Module):
             y = y.narrow(0, start, local_num_tokens).contiguous()
 
         if self.config.apply_router_weight_after_down:
-            y = y.sum(dim=1)
+            total = torch.zeros_like(y[:, 0], dtype=torch.float32)
+            for slot in range(y.shape[1]):
+                total = total + y[:, slot].float()
+            y = total
         return y.to(input_dtype)
 
     def _forward_loop(
@@ -834,7 +837,6 @@ def relu2_deepep(x, permuted_probs):
     return (inter * permuted_probs).to(x.dtype)
 
 
-@torch.compile(fullgraph=True, options={"max_autotune": True})
 def swiglu_clamped_deepep(x, permuted_probs, limit: float):
     """Clamped SwiGLU (DeepSeek V4 style) for DeepEP.
 
@@ -855,8 +857,8 @@ def swiglu_clamped_deepep(x, permuted_probs, limit: float):
     gate, up = torch.chunk(x, 2, dim=-1)
     gate = gate.float().clamp(max=limit)
     up = up.float().clamp(min=-limit, max=limit)
-    inter = F.silu(gate) * up
-    return (inter * permuted_probs).to(x.dtype)
+    inter = (F.silu(gate).to(x.dtype).float() * up).to(x.dtype)
+    return (inter.float() * permuted_probs).to(x.dtype)
 
 
 def get_expert_activation_for_deepep(config: MoEConfig):

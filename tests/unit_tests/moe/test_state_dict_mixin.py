@@ -681,7 +681,7 @@ class TestFromHfWMergedExperts:
     @patch("nemo_automodel.components.moe.state_dict_mixin.should_load_expert_for_rank")
     def test_basic_conversion(self, mock_should_load, mock_create_dtensor):
         mock_should_load.return_value = True
-        mock_create_dtensor.side_effect = lambda x, *args: x  # Return local tensor as-is
+        mock_create_dtensor.side_effect = lambda x, *args, **kwargs: x  # Return local tensor as-is
 
         mixin = MockMoEStateDictMixin(n_experts=2, dtype=torch.float32)
 
@@ -719,7 +719,7 @@ class TestFromHfWMergedExperts:
                 mock_should_load.side_effect = lambda expert_id, *args: expert_id == 1  # Only load expert 1
                 with patch(
                     "nemo_automodel.components.moe.state_dict_mixin.create_dtensor_from_local",
-                    side_effect=lambda x, *args: x,
+                    side_effect=lambda x, *args, **kwargs: x,
                 ):
                     result = mixin._from_hf_w_merged_experts(hf_state_dict)
 
@@ -743,7 +743,7 @@ class TestFromHfWMergedExperts:
             with patch("nemo_automodel.components.moe.state_dict_mixin.should_load_expert_for_rank", return_value=True):
                 with patch(
                     "nemo_automodel.components.moe.state_dict_mixin.create_dtensor_from_local",
-                    side_effect=lambda x, *args: x,
+                    side_effect=lambda x, *args, **kwargs: x,
                 ):
                     result = mixin._from_hf_w_merged_experts(hf_state_dict)
 
@@ -767,7 +767,7 @@ class TestFromHfWMergedExperts:
             with patch("nemo_automodel.components.moe.state_dict_mixin.should_load_expert_for_rank", return_value=True):
                 with patch(
                     "nemo_automodel.components.moe.state_dict_mixin.create_dtensor_from_local",
-                    side_effect=lambda x, *args: x,
+                    side_effect=lambda x, *args, **kwargs: x,
                 ):
                     result = mixin._from_hf_w_merged_experts(hf_state_dict)
 
@@ -789,7 +789,7 @@ class TestFromHfWMergedExperts:
             with patch("nemo_automodel.components.moe.state_dict_mixin.should_load_expert_for_rank", return_value=True):
                 with patch(
                     "nemo_automodel.components.moe.state_dict_mixin.create_dtensor_from_local",
-                    side_effect=lambda x, *args: x,
+                    side_effect=lambda x, *args, **kwargs: x,
                 ):
                     result = mixin._from_hf_w_merged_experts(hf_state_dict)
 
@@ -822,7 +822,7 @@ class TestFromHfWMergedExperts:
             with patch("nemo_automodel.components.moe.state_dict_mixin.should_load_expert_for_rank", return_value=True):
                 with patch(
                     "nemo_automodel.components.moe.state_dict_mixin.create_dtensor_from_local",
-                    side_effect=lambda x, *args: x,
+                    side_effect=lambda x, *args, **kwargs: x,
                 ):
                     result = mixin._from_hf_w_merged_experts(hf_state_dict, mock_device_mesh)
 
@@ -834,7 +834,7 @@ class TestFromHfWMergedExperts:
     @patch("nemo_automodel.components.moe.state_dict_mixin.should_load_expert_for_rank")
     def test_gate_and_up_combination(self, mock_should_load, mock_create_dtensor):
         mock_should_load.return_value = True
-        mock_create_dtensor.side_effect = lambda x, *args: x
+        mock_create_dtensor.side_effect = lambda x, *args, **kwargs: x
 
         mixin = MockMoEStateDictMixin(n_experts=1, inter_dim=512, dtype=torch.float32)
 
@@ -855,7 +855,7 @@ class TestFromHfWMergedExperts:
     @patch("nemo_automodel.components.moe.state_dict_mixin.should_load_expert_for_rank")
     def test_down_proj_transpose(self, mock_should_load, mock_create_dtensor):
         mock_should_load.return_value = True
-        mock_create_dtensor.side_effect = lambda x, *args: x
+        mock_create_dtensor.side_effect = lambda x, *args, **kwargs: x
 
         mixin = MockMoEStateDictMixin(n_experts=1, inter_dim=512, dtype=torch.float32)
 
@@ -881,7 +881,9 @@ class TestFromHfWMergedExperts:
         # Mock DTensor inputs
         mock_gate_dtensor = Mock()
         mock_gate_dtensor.to_local.return_value = torch.randn(512, 1024)
+        mock_gate_dtensor.device_mesh.mesh_dim_names = ("ep_shard",)
         mock_up_dtensor = Mock()
+        mock_up_dtensor.device_mesh.mesh_dim_names = ("ep_shard",)
         mock_up_dtensor.to_local.return_value = torch.randn(512, 1024)
 
         hf_state_dict = {
@@ -893,7 +895,7 @@ class TestFromHfWMergedExperts:
             with patch("nemo_automodel.components.moe.state_dict_mixin.should_load_expert_for_rank", return_value=True):
                 with patch(
                     "nemo_automodel.components.moe.state_dict_mixin.create_dtensor_from_local",
-                    side_effect=lambda x, *args: x,
+                    side_effect=lambda x, *args, **kwargs: x,
                 ):
                     mixin._from_hf_w_merged_experts(hf_state_dict)
 

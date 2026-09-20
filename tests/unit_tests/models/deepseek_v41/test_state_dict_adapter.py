@@ -557,3 +557,20 @@ def test_generic_checkpoint_keys_and_optional_tower_weights_are_preserved() -> N
     assert adapter.forced_hf_dtype_mapping(native) == {
         key: "float32" for key, value in source.items() if value.dtype == torch.float32
     }
+
+
+def test_frozen_host_table_is_excluded_before_dequantization() -> None:
+    adapter = _adapter(engram_rows=17)
+    adapter.config.text_config.engram_host_checkpoint = "/immutable/checkpoint"
+    projection = torch.randn(8, 32)
+    # Deliberately not tensors: the external table must be discarded without
+    # touching its dtype/storage or allocating a dequantized destination.
+    source = {
+        "layers.1.engram.embed.weight": object(),
+        "layers.1.engram.embed.scale": object(),
+        "layers.1.engram.wkv.weight": projection,
+    }
+    converted = adapter.from_hf(source)
+    assert set(converted) == {"model.layers.1.engram.wkv.weight"}
+    assert converted["model.layers.1.engram.wkv.weight"] is projection
+    assert adapter.get_hf_state_dict_keys(converted) == ["layers.1.engram.wkv.weight"]

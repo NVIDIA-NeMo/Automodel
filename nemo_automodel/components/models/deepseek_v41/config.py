@@ -70,6 +70,7 @@ class DeepseekV41TextConfig(PretrainedConfig):
         sliding_window: int = 128,
         compress_ratios: list[int] | None = None,
         compress_rope_theta: float = 160000.0,
+        compressed_kv_format: str = "nvfp4",
         kv_source_layer_ids: list[int] | None = None,
         index_source_layer_ids: list[int] | None = None,
         index_n_heads: int = 32,
@@ -87,6 +88,7 @@ class DeepseekV41TextConfig(PretrainedConfig):
         engram_vocab_size: int = 16000000,
         engram_n_heads: int = 8,
         engram_head_dim: int = 256,
+        engram_host_checkpoint: str | None = None,
         engram_pad_token_id: int = 2,
         engram_compressed_vocab_size: int = 99092,
         num_nextn_predict_layers: int = 3,
@@ -146,6 +148,9 @@ class DeepseekV41TextConfig(PretrainedConfig):
             [0, 0] + [2] * 18 + [1] * 20 + [0] * 3 if compress_ratios is None else list(compress_ratios)
         )
         self.compress_rope_theta = compress_rope_theta
+        if compressed_kv_format not in ("nvfp4", "mxfp8"):
+            raise ValueError("compressed_kv_format must be 'nvfp4' or 'mxfp8'")
+        self.compressed_kv_format = compressed_kv_format
         self.kv_source_layer_ids = [2, 8, 14, 20] if kv_source_layer_ids is None else list(kv_source_layer_ids)
         self.index_source_layer_ids = (
             [2, 8, 14, 20, 24, 28, 32, 36] if index_source_layer_ids is None else list(index_source_layer_ids)
@@ -168,6 +173,9 @@ class DeepseekV41TextConfig(PretrainedConfig):
         self.engram_max_ngram_size = engram_max_ngram_size
         self.engram_vocab_size = engram_vocab_size
         self.engram_n_heads = engram_n_heads
+        # None retains trainable owner-sharded tables. A local checkpoint path
+        # selects immutable native FP8 CPU tables, excluded from saved weights.
+        self.engram_host_checkpoint = engram_host_checkpoint
         self.engram_head_dim = engram_head_dim
         self.engram_pad_token_id = engram_pad_token_id
         self.engram_compressed_vocab_size = engram_compressed_vocab_size
