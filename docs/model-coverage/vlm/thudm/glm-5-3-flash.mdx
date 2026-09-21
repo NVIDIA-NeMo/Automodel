@@ -19,7 +19,7 @@ Manifold-Constrained Hyper-Connections (mHC).
 | **Parameters** | 320B total, 18B active |
 | **Decoder** | 45 layers: 34 KDA and 11 KPool-DSA layers |
 | **Experts** | 288 routed experts, top-8 routing, plus one shared expert |
-| **Context length** | 1,048,576 in the checkpoint configuration; validated here at 2,048 and 4,096 tokens |
+| **Context Length** | 1,048,576 in the checkpoint configuration; validated here at 2,048 and 4,096 tokens |
 | **Training Precision** | BF16 after FP8 checkpoint dequantization |
 | **HF Org** | [zai-org](https://huggingface.co/zai-org) |
 
@@ -110,7 +110,6 @@ uv run automodel --nproc-per-node=8 examples/vlm_finetune/glm5_next/glm5_3_flash
 ```
 
 <Note>
-
 Use the [Slurm Launcher Guide](/job-launchers/slurm-cluster) to configure the
 multi-node launch. If FlashMLA or cuDNN Frontend is unavailable, change
 `model.backend.attn` to `sdpa`; KDA still requires the FLA dependency.
