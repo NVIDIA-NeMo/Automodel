@@ -66,10 +66,10 @@ else
   # transitively) that kernel fails to compile -> GPUModuleOp / cudaErrorIllegalAddress.
   # vllm 0.26.0 + cutlass-dsl 4.6.0 compiles it cleanly (verified: gemma4 IFEval
   # prompt_level_strict_acc=0.5360).
-  # transformers 5.15.0 makes gemma4's per-layer head_dim raise
-  # AmbiguousGlobalPerLayerAttributeError on the plain getattr in vLLM's get_head_size(),
-  # so pin transformers too. 5.14.1 + vllm 0.26.0 is the combination we verified.
-  uv pip install -e ".[vllm]" "vllm==0.26.0" "transformers==5.14.1" "nvidia-cutlass-dsl>=4.6.0"
+  # transformers 5.14.1 rejects the explicit per_layer_config written by the 5.15.1
+  # training stack before vLLM can apply its Gemma4-aware head-size handling. 5.13.0
+  # loads that consolidated config and preserves both head_dim and global_head_dim.
+  uv pip install -e ".[vllm]" "vllm==0.26.0" "transformers==5.13.0" "nvidia-cutlass-dsl>=4.6.0"
 
   echo "Setup complete. Activate with:  source $VENV_DIR/bin/activate"
 fi
