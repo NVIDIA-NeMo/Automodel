@@ -238,7 +238,7 @@ _ATTN_RES_TRITON_ENABLED = False
 
 
 def _enable_attn_res_triton() -> None:
-    """Route the attention-residual mix through the fused Triton kernels (``BackendConfig.attn_res_triton``).
+    """Route the attention-residual mix through the fused Triton kernels (``KimiK3TextConfig.attn_res_triton``).
 
     Runs once per process. ``_apply_attn_res`` then launches ``attn_res_triton.attn_res_fwd_triton`` /
     ``attn_res_bwd_triton`` (no ``torch.cat``, no fp32 copy of the stacked entries) for CUDA inputs with
@@ -306,7 +306,7 @@ class _AttnResTritonFunction(torch.autograd.Function):
 
 
 def _enable_situ_triton() -> None:
-    """Route the SiTU activation through the hand-written Triton kernels (``BackendConfig.situ_triton``).
+    """Route the SiTU activation through the hand-written Triton kernels (``KimiK3TextConfig.situ_triton``).
 
     Runs once per process. ``_WeightedSiTUFunction`` (row-aligned ``[rows, 1]`` weights on a
     CUDA device) and ``SituAndMul`` then launch ``situ_triton.situ_fwd_triton`` /

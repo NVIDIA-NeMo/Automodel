@@ -23,7 +23,7 @@ from nemo_automodel.components.models.kimi_k3.config import KimiK3TextConfig
 from nemo_automodel.components.models.kimi_k3.model import KimiDecoderLayer, KimiK3MoE, _build_moe_config
 
 
-def _tiny_config() -> KimiK3TextConfig:
+def _tiny_config(**overrides) -> KimiK3TextConfig:
     return KimiK3TextConfig(
         vocab_size=64,
         hidden_size=32,
@@ -54,6 +54,7 @@ def _tiny_config() -> KimiK3TextConfig:
             "gate_lower_bound": -5.0,
         },
         attn_res_block_size=1,
+        **overrides,
     )
 
 
@@ -149,8 +150,8 @@ def test_compile_situ_wraps_cores_once(restore_situ_cores):
     assert kimi_k3_situ._dense_situ_dispatch is not kimi_k3_situ._dense_situ_core
 
 
-def _build_decoder_layer(backend: BackendConfig) -> KimiDecoderLayer:
-    config = _tiny_config()
+def _build_decoder_layer(backend: BackendConfig, **config_knobs) -> KimiDecoderLayer:
+    config = _tiny_config(**config_knobs)  # the K3-only kernel knobs live on the model config
     moe_config = _build_moe_config(config, torch.float32, None)
     # layer 1 is a full-attention MoE layer of the tiny config (first_k_dense_replace=0), with attention
     # residuals on (attn_res_block_size=1), so both kernel flags have a call site to reach.
@@ -160,20 +161,20 @@ def _build_decoder_layer(backend: BackendConfig) -> KimiDecoderLayer:
 def test_situ_triton_flag_wires_decoder_layer(monkeypatch):
     calls = []
     monkeypatch.setattr(kimi_k3_model, "_enable_situ_triton", lambda: calls.append("situ"))
-    assert BackendConfig().situ_triton is False
+    assert _tiny_config().situ_triton is False and not hasattr(BackendConfig(), "situ_triton")
     _build_decoder_layer(_torch_backend())
     assert calls == []
-    _build_decoder_layer(_torch_backend(situ_triton=True))
+    _build_decoder_layer(_torch_backend(), situ_triton=True)
     assert calls == ["situ"]
 
 
 def test_attn_res_triton_flag_wires_decoder_layer(monkeypatch):
     calls = []
     monkeypatch.setattr(kimi_k3_model, "_enable_attn_res_triton", lambda: calls.append("attn_res"))
-    assert BackendConfig().attn_res_triton is False
+    assert _tiny_config().attn_res_triton is False and not hasattr(BackendConfig(), "attn_res_triton")
     layer = _build_decoder_layer(_torch_backend())
     assert layer.use_attn_residuals and calls == []
-    _build_decoder_layer(_torch_backend(attn_res_triton=True))
+    _build_decoder_layer(_torch_backend(), attn_res_triton=True)
     assert calls == ["attn_res"]
 
 

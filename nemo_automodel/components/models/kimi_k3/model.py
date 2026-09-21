@@ -1102,7 +1102,7 @@ class KimiK3MoE(MoE):
             self.gate = KimiK3Gate(moe_config, gate_precision=torch.float32)
         if backend.compile_situ:
             _compile_situ_cores()
-        if backend.situ_triton:
+        if getattr(config, "situ_triton", False):
             _enable_situ_triton()
         if backend.compile_norm:
             _compile_norm_core()
@@ -1289,7 +1289,7 @@ class KimiDecoderLayer(nn.Module):
         self.post_attention_layernorm = KimiRMSNorm(config.hidden_size, eps=config.rms_norm_eps, dtype=dtype)
         self.use_attn_residuals = config.attn_res_block_size is not None
         if self.use_attn_residuals:
-            if backend.attn_res_triton:
+            if getattr(config, "attn_res_triton", False):
                 _enable_attn_res_triton()
             self.attn_res_block_size = config.attn_res_block_size
             self.self_attention_res_norm = KimiRMSNorm(

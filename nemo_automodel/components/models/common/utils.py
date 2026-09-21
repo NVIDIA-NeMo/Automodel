@@ -476,14 +476,6 @@ class BackendConfig:
             so each pass is one fused kernel instead of the eager per-chunk cast/multiply/
             cast/slice-assign loop. Same lazy once-per-process pattern as ``compile_situ``;
             numerics are allclose to eager but not bitwise-identical.
-        situ_triton: run the Kimi K3 SiTU activation (weighted expert path and dense
-            SituAndMul) through the hand-written Triton kernels in
-            ``models/kimi_k3/situ_triton.py``; supersedes the ``compile_situ`` inductor
-            kernels for those two paths and is a no-op without Triton. Default False.
-        attn_res_triton: run the Kimi K3 attention-residual mix through the fused Triton kernels
-            in ``models/kimi_k3/attn_res_triton.py`` (no ``torch.cat`` / fp32 copy of the stacked
-            entries, analytic backward); supersedes the ``compile_situ`` chain for that call and
-            is a no-op without Triton. Default False.
         benchmark_static_routing: Benchmark-only. Requires ``fake_balanced_gate=True``
             with ``fake_gate_noise=0.0``, where routing metadata (tokens per expert,
             permuted token counts) is identical for every microbatch. Skips the
@@ -550,19 +542,6 @@ class BackendConfig:
     # all MoE expert modules), same lazy once-per-process pattern as compile_situ. Numerics
     # are allclose to eager, not bitwise-identical. Default False.
     compile_router_weight: bool = False
-    # When True, run the Kimi K3 SiTU expert/dense activation through the hand-written Triton
-    # kernels in models/kimi_k3/situ_triton.py (2-D tiles, in-kernel routing-weight gradient
-    # reduction) instead of the eager chunk loop or the compile_situ inductor kernels; the
-    # attn-res chain still follows compile_situ. No-op without Triton. Same fp32 math as eager;
-    # only the routing-weight gradient's fp32 accumulation order differs. Default False.
-    situ_triton: bool = False
-    # When True, run the Kimi K3 attention-residual mix (score, softmax and weighted sum over the
-    # block residuals + prefix sum) through the fused Triton kernels in
-    # models/kimi_k3/attn_res_triton.py: one token per program, no torch.cat / fp32 copy of the
-    # stacked entries, analytic backward with a deterministic score-weight-gradient reduction.
-    # Supersedes the compile_situ inductor chain for that call. No-op without Triton. Same fp32
-    # math as eager up to fp32 accumulation order. Default False.
-    attn_res_triton: bool = False
     # Benchmark-only: cache per-microbatch routing metadata (tokens per expert, permuted
     # token counts) after the first microbatch to remove recurring device-to-host syncs.
     # Valid ONLY with fake_balanced_gate=True and fake_gate_noise=0.0 (enforced in
