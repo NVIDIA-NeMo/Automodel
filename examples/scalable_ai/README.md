@@ -171,7 +171,8 @@ and runs out of memory in step 1, when the Adam states are allocated, so micro-b
 recipe on 80 GB GPUs. Automodel warns that AdamW on bf16 parameters keeps bf16 optimizer states; that is fine for
 this demonstration but not how one would run a real pre-training. Weights & Biases logging follows the credentials:
 with `WANDB_API_KEY` or a netrc the run is live, otherwise the run is written offline under `$WORK/logs/wandb` and
-uploaded later with `wandb sync <offline-run-dir>` (this run was offline); per-step metrics are also in
+uploaded later with `wandb sync <offline-run-dir>` using the same wandb major version that wrote it (this run was written
+offline and uploaded afterwards); per-step metrics are also in
 `checkpoints/moonlight_v4_16b/training.jsonl` and `validation.jsonl`.
 
 ## Changes from the January 2026 edition
