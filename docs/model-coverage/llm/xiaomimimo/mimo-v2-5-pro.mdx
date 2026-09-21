@@ -1,9 +1,9 @@
 ---
 title: "MiMo-V2.5-Pro"
-description: ""
+description: "Fine-tune the MiMo-V2.5-Pro hybrid attention MoE language model with NeMo AutoModel."
 slug: model-coverage/large-language-models/xiaomimimo/mimo-v2-5-pro
 ---
-[MiMo-V2.5-Pro](https://huggingface.co/XiaomiMiMo/MiMo-V2.5-Pro) is Xiaomi's hybrid attention Mixture-of-Experts language model. It alternates full and sliding-window attention layers, uses a `sigmoid_with_bias` router with group-limited expert routing, and ships as an FP8 HF checkpoint.
+[MiMo-V2.5-Pro](https://huggingface.co/XiaomiMiMo/MiMo-V2.5-Pro) is Xiaomi's hybrid attention Mixture-of-Experts (MoE) language model. It alternates full and sliding-window attention layers, uses a `sigmoid_with_bias` router with group-limited expert routing, and ships as an FP8 HF checkpoint.
 
 <Info>
 
@@ -18,14 +18,14 @@ slug: model-coverage/large-language-models/xiaomimimo/mimo-v2-5-pro
 
 ## Available Models
 
-- **MiMo-V2.5-Pro**: hybrid full/sliding-window attention with FP8 weights.
+- **MiMo-V2.5-Pro**: Hybrid full and sliding-window attention with FP8 weights.
 
 ## Architecture
 
 - `MiMoV2ForCausalLM`
 - Sliding-window attention using the `MiMoV2Attention(is_swa=True)` path.
 - MoE blocks use `nemo_automodel.components.moe.layers.MoE` with `score_func="sigmoid_with_bias"` and `gate_precision=fp32`.
-- FP8 round-trip in `MiMoV2StateDictAdapter` covers the bulk of attention/expert weights; layer norms, the gate, `lm_head`, and `embed_tokens` stay in bf16 per `NON_QUANTIZED_KEY_PATTERNS`.
+- FP8 round-trip in `MiMoV2StateDictAdapter` covers the bulk of attention and expert weights; layer norms, the gate, `lm_head`, and `embed_tokens` stay in bf16 per `NON_QUANTIZED_KEY_PATTERNS`.
 
 ## Example HF Models
 
@@ -70,7 +70,7 @@ docker run --gpus all -it --rm \
   nvcr.io/nvidia/nemo-automodel:26.02.00
 ```
 
-**2. Navigate to the AutoModel directory**:
+**2. Navigate to `/opt/Automodel`**:
 
 ```bash
 cd /opt/Automodel
