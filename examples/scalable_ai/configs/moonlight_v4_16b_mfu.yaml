@@ -98,8 +98,11 @@ model:
     experts: gmm         # grouped_gemm.ops.gmm; 'torch' is the per-expert loop (~1.16x slower end to end)
     dispatcher: deepep   # or hybridep
     compile_hc: true     # torch.compile the mHC mixer / collapse / expand cores
-    hc_proj_bf16: false  # superseded by hc_proj_kernel below; set true instead to stay on cuBLAS
-    hc_proj_kernel: true  # fused Triton RMSNorm + skinny projection for the mHC mixer
+    hc_proj_bf16: true   # mHC mixer projection in bf16 (norm, gates and Sinkhorn stay fp32)
+    # hc_proj_kernel: the fused Triton norm+projection kernel. Measured at this shape: 0.482 s and
+    # 41.3 GB against 0.477 s and 44.3 GB for the bf16 cuBLAS path above. Slightly slower, 3 GB
+    # leaner -- so it is off by default here and worth enabling only when memory is the constraint.
+    hc_proj_kernel: false
     lm_head_bf16: true   # output projection in bf16 instead of the released model's fp32
     gate_precision: float32
     fake_balanced_gate: true

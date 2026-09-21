@@ -1,29 +1,37 @@
-# Slides: from stock Transformers to a tuned DeepSeek-V4 training step
+# From "it does not run" to a tuned training step
 
-One markdown file per slide. Render with any markdown-to-slides tool, or read in order.
+A guest-lecture deck on making a large mixture-of-experts model train efficiently. One markdown file
+per slide; render with any markdown-to-slides tool, or read in order.
 
-| slide | subject |
-| --- | --- |
-| `00-overview.md` | the journey in one table |
-| `01-what-v4-adds.md` | what DeepSeek-V4 adds over V3, and why it is hard to make fast |
-| `02-what-mfu-counts.md` | measurement setup, what MFU credits, the FLOPs budget |
-| `03-stage0-stock.md` | stock `transformers` out of the box: does not run |
-| `04-reduced-journey.md` | four implementations on the same 4-layer model |
-| `05-profile-first.md` | the kernel trace that drove every decision after it |
-| `06-lever-attention.md` | sparse attention instead of dense-and-mask (1.35x) |
-| `07-lever-moe.md` | DeepEP dispatch and grouped expert GEMMs (1.15x) |
-| `08-lever-batch.md` | batch shape as a kernel-efficiency knob, and where it saturates |
-| `09-lever-fusion.md` | compiling the hyper-connection cores (1.07x, 6 GB) |
-| `10-lever-precision.md` | bf16 gradient reduction and vocabulary projection |
-| `11-lever-kernel.md` | writing a Triton kernel: 2.1x in isolation, 0 in the step |
-| `12-misattribution.md` | the hot kernel was not the one I thought |
-| `13-fused-ce.md` | an optimisation that did not pay |
-| `14-scoreboard.md` | final numbers and the honest gap to 20% |
-| `15-reproduce.md` | configs, runner, flags, gotchas |
+**Subject.** Moonlight-V4-16B-A3B, a DeepSeek-V4-architecture model, on one node of 8 H100s.
 
-Suggested narrative arc: stages 0 to 4 are about **removing waste** and are where most of the gain
-is. Stages 5 to 9 are about **fusion and precision**, with smaller returns and two instructive
-failures. The closing slide is deliberately not a victory lap.
+| | slide | subject |
+| --- | --- | --- |
+| | `00-overview.md` | the result and the shape of the talk |
+| **Setup** | `01-the-model.md` | the model, and the three things about it that matter |
+| | `02-what-we-measure.md` | MFU, and where the useful work actually is |
+| | `03-it-does-not-run.md` | why the published implementation runs out of memory |
+| | `04-how-we-find-it.md` | reading a kernel trace |
+| **The ladder** | `05-the-ladder.md` | **the spine**: one shape, one change per row |
+| | `06-lever-sparsity.md` | sparsity has to be real |
+| | `07-lever-communication.md` | move tokens, not weights |
+| | `08-lever-fusion.md` | a thousand small kernels |
+| | `09-lever-precision.md` | precision, and a lever that did nothing |
+| **Beyond** | `10-batch-shape.md` | the lever that is not a kernel |
+| | `11-does-it-transfer.md` | the same changes on the full 27-layer model |
+| | `12-lessons.md` | five transferable ideas |
+| **Appendix** | `13-appendix-profile-lied.md` | the profile pointed at the wrong line |
+| | `14-appendix-kernel.md` | a kernel that was 2x and bought nothing |
+| | `15-appendix-fused-ce.md` | a memory optimisation that cost time |
+| | `16-reproduce.md` | configs, commands, flags, gotchas |
 
-All measurements: 8x H100 80GB, NeMo Automodel 26.08 container, FSDP2 with expert parallelism 8,
-random init on mock data, 12 steps with 4 warm-up.
+**Teaching notes.**
+
+- The spine is slide 5. Slides 6 to 9 each expand one of its rows and can be cut for time; the table
+  still tells the story without them.
+- Row 5 of the ladder is deliberately a change that measured zero. Slide 9 explains why, and it is
+  the single most transferable point in the deck: a profile describes one configuration, not a
+  program.
+- The appendices are self-contained. If the audience is enjoying the failures, A is the best one.
+- Every measurement: 8x H100 80GB, NeMo Automodel 26.08 container, FSDP2 with expert parallelism 8,
+  random weights and synthetic data, 12 steps of which 4 are warm-up.
