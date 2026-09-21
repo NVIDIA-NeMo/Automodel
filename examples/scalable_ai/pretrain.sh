@@ -54,7 +54,7 @@ for attempt in 1 2 3 4 5 6; do
   torchrun --nproc-per-node 8 nemo_automodel/recipes/llm/train_ft.py --config $CFG \
       --model.config.pretrained_model_name_or_path "$M" --checkpoint.checkpoint_dir $CKPT \
       --dataset.file_pattern "$DATA/fineweb_train_*.bin" --validation_dataset.file_pattern "$DATA/fineweb_val_0000.bin" \
-      ${WANDB_ARGS:-} "$@" $extra 2>&1 | tee $WORK/logs/pretrain_attempt${attempt}.log
+      ${WANDB_ARGS:-} "$@" $extra 2>&1 | tee $WORK/logs/pretrain_${WANDB_RUN_ID}_attempt${attempt}.log
   rc=${PIPESTATUS[0]}
   [ $rc -eq 0 ] && { echo "=== training finished ($(date))"; exit 0; }
   echo "=== attempt $attempt failed with rc=$rc ($(date)); will resume from the latest checkpoint"; sleep 30
