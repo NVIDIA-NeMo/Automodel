@@ -158,9 +158,15 @@ class CheckpointMiningEncoder:
         device_inputs = {
             key: value.to(self.device) if isinstance(value, torch.Tensor) else value for key, value in inputs.items()
         }
+        parameter = next(self.model.parameters(), None)
+        dtype = parameter.dtype if parameter is not None else torch.float32
         with (
             torch.no_grad(),
-            torch.amp.autocast(self.device.type, dtype=torch.float16, enabled=self.device.type == "cuda"),
+            torch.amp.autocast(
+                self.device.type,
+                dtype=dtype,
+                enabled=self.device.type == "cuda" and dtype in (torch.float16, torch.bfloat16),
+            ),
         ):
             embeddings = self.model.encode(device_inputs)
         if embeddings is None:

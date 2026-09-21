@@ -228,3 +228,55 @@ def test_policy_rejects_document_without_usable_text_or_image():
             [{"_mining_document_id": "doc-7", "text": "", "image": 0.5}],
             batch_size=1,
         )
+
+
+class _LargeValueModel(torch.nn.Module):
+    def __init__(self, dtype: torch.dtype) -> None:
+        super().__init__()
+        self.projection = torch.nn.Linear(2, 2, bias=False, dtype=dtype)
+        with torch.no_grad():
+            self.projection.weight.copy_(torch.eye(2) * 70000)
+
+    def encode(self, inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Project inputs without changing the checkpoint's weight dtype.
+
+        Args:
+            inputs: Token features in ``input_ids`` of shape [batch, hidden].
+
+        Returns:
+            Projected features of shape [batch, hidden].
+        """
+        return self.projection(inputs["input_ids"].to(self.projection.weight.dtype))
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_mining_preserves_checkpoint_dynamic_range(monkeypatch, dtype):
+    # Exercise CUDA precision policy with real CPU matrix math and autocast.
+    # Only device transport is substituted; this does not qualify GPU execution.
+    tensor_to = torch.Tensor.to
+    autocast = torch.amp.autocast
+
+    def cpu_transport(tensor: torch.Tensor, device, *args, **kwargs) -> torch.Tensor:
+        """Move inputs to the CPU proxy.
+
+        Args:
+            tensor: Tensor of arbitrary shape whose layout is preserved.
+            device: Requested device or dtype.
+            *args: Additional Tensor.to options.
+            **kwargs: Additional Tensor.to options.
+
+        Returns:
+            Tensor with the same shape and requested dtype on CPU.
+        """
+        if device == torch.device("cuda"):
+            device = torch.device("cpu")
+        return tensor_to(tensor, device, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", cpu_transport)
+    monkeypatch.setattr(torch.amp, "autocast", lambda device, **kwargs: autocast("cpu", **kwargs))
+    model = _LargeValueModel(dtype)
+    encoder = CheckpointMiningEncoder(model=model, processor=_PixelProcessor(), device=torch.device("cuda"))
+    result = encoder.encode_queries(["query"], batch_size=1)
+    expected = model.projection.weight.detach().float().numpy()[:, 0][None, :]
+    np.testing.assert_array_equal(result, expected)
+    assert np.isfinite(result).all()
