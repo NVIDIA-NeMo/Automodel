@@ -340,6 +340,8 @@ def _get_dataclass_hints(cls: type) -> dict[str, Any]:
     TYPE_CHECKING-only names may raise NameError. Forward references may also
     raise TypeError when runtime aliases do not support annotation operations
     such as subscripting. Neither should prevent otherwise valid construction.
+    Resolution is all-or-nothing for each class: either error disables all
+    annotation-based field conversion for that class, even for resolvable fields.
     """
     try:
         return get_type_hints(cls)
@@ -352,6 +354,8 @@ def _convert_dataclass_value(value: Any, annotation: Any) -> Any:
 
     Optional dataclasses and homogeneous sequences are supported. Other values,
     including explicitly instantiated objects, retain their existing semantics.
+    The caller opts in at the subtree root. Within plain nested dataclass
+    mappings, annotations drive recursion without consulting field metadata again.
     """
     origin = get_origin(annotation)
     args = get_args(annotation)
@@ -495,8 +499,16 @@ class ConfigNode:
         it to a callable function or class which is then instantiated.
 
         Dataclass fields with metadata={"instantiate": True} opt into recursive
-        annotation-based conversion of nested config values. Unmarked fields keep
-        their existing list/dict semantics; explicit runtime overrides are unchanged.
+        annotation-based conversion of their entire supported typed subtree.
+        Plain nested dataclass fields need no additional metadata; homogeneous
+        list/tuple fields follow their annotations too. Unmarked fields on this
+        target retain the existing list/dict behavior. Explicitly instantiated
+        objects and runtime overrides are not reprocessed by typed conversion.
+
+        Type hints are resolved per class, not per field. If any annotation raises
+        NameError or TypeError, no annotation-based field conversion is performed
+        for that class; plain mappings can remain dictionaries even for marked
+        fields. Existing explicit nested _target_ construction is unchanged.
 
         Args:
             *args: Positional arguments for the target instantiation.

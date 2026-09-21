@@ -74,8 +74,44 @@ def typed_module(tmp_module):
         class Untyped:
             def __init__(self, child):
                 self.child = child
+
+        @dataclass
+        class Branch:
+            leaf: Leaf
+            leaves: tuple[Leaf, ...]
+            dimensions: tuple[int, ...]
+
+        @dataclass
+        class Root:
+            branch: Branch = field(metadata={"instantiate": True})
+            plain_branch: Branch
         """,
     )
+
+
+def test_dataclass_opt_in_converts_entire_plain_typed_subtree(typed_module: Any) -> None:
+    """Construct three levels without marking descendants or changing a sibling."""
+    branch = {"leaf": {"value": "first"}, "leaves": [{"value": "second"}], "dimensions": [32, 32]}
+    raw = {"_target_": typed_module.Root, "branch": deepcopy(branch), "plain_branch": deepcopy(branch)}
+    original = deepcopy(raw)
+    node = ConfigNode(raw)
+
+    obj = node.instantiate()
+    assert isinstance(obj, typed_module.Root)
+    assert isinstance(obj.branch, typed_module.Branch)
+    assert isinstance(obj.branch.leaf, typed_module.Leaf)
+    assert obj.branch.leaf.value == "first"
+    assert isinstance(obj.branch.leaves, tuple)
+    assert obj.branch.leaves == (typed_module.Leaf("second"),)
+    assert obj.branch.dimensions == (32, 32)
+    assert isinstance(obj.plain_branch, dict)
+    assert isinstance(obj.plain_branch["leaf"], dict)
+    assert isinstance(obj.plain_branch["leaves"], list)
+    assert isinstance(obj.plain_branch["dimensions"], list)
+    assert obj.plain_branch == branch
+    assert node.instantiate() == obj
+    assert node.instantiate(branch=branch).branch is branch
+    assert raw == node.raw_config == node.to_dict() == original
 
 
 def test_dataclass_plain_nested_yaml_is_typed_only_at_instantiate(typed_module):
