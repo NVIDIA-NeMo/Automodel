@@ -5,7 +5,9 @@
 # Step 2 runs the recipe, restarting from the latest checkpoint after a failure; after three failures it swaps the
 # DeepEP dispatcher for the torch one at micro-batch 1. Weights & Biases picks up WANDB_API_KEY or ~/.netrc; without
 # either the run is logged offline (sync later with `wandb sync`).
-# Extra arguments are passed to the recipe, e.g. `pretrain.sh --step_scheduler.max_steps 200`.
+# Extra arguments are passed to the recipe, e.g. `pretrain.sh --step_scheduler.max_steps 200`. Environment knobs: CFG (yaml),
+# DATA (shard dir), CKPT (checkpoint dir), PREP_FILES / TRAIN_TOKENS / SHARD_TOKENS / PREP_WORKERS (data preparation),
+# WANDB_RUN_ID / WANDB_WAIT_MIN (credential wait in minutes).
 set -o pipefail
 WORK=${WORK:-/workspace}
 cd $WORK/Automodel || exit 1
@@ -16,12 +18,13 @@ export WANDB_DIR=$WORK/logs/wandb WANDB_CACHE_DIR=$WORK/cache/wandb WANDB_CONFIG
 mkdir -p $WORK/logs $WORK/hf_home $TILELANG_CACHE_DIR $TRITON_CACHE_DIR $TORCHINDUCTOR_CACHE_DIR $WANDB_DIR $WANDB_CACHE_DIR $WANDB_CONFIG_DIR
 M=$WORK/models/Moonlight-V4-16B-A3B
 DATA=${DATA:-$WORK/data/fineweb_edu_moonshot}
-CFG=examples/scalable_ai/configs/pretrain_moonlight_v4_16b.yaml
+CFG=${CFG:-examples/scalable_ai/configs/pretrain_moonlight_v4_16b.yaml}
+CKPT=${CKPT:-$WORK/checkpoints/moonlight_v4_16b}
 
 if [ ! -f "$DATA/README.txt" ]; then
   echo "=== preparing data in $DATA ($(date))"
   python examples/scalable_ai/prepare_fineweb.py --tokenizer "$M" --out "$DATA" --num-files ${PREP_FILES:-2} \
-      --train-tokens ${TRAIN_TOKENS:-560M} --val-tokens 8M --shard-tokens 35M --workers ${PREP_WORKERS:-48} \
+      --train-tokens ${TRAIN_TOKENS:-560M} --val-tokens 8M --shard-tokens ${SHARD_TOKENS:-35M} --workers ${PREP_WORKERS:-48} \
       2>&1 | tee $WORK/logs/prepare_fineweb.log || { echo "data preparation failed"; exit 1; }
 fi
 echo "train shards: $(ls $DATA/fineweb_train_*.bin | wc -l), $(du -sh $DATA | cut -f1) total"
@@ -49,7 +52,7 @@ for attempt in 1 2 3 4 5 6; do
   [ $attempt -ge 4 ] && extra="--model.backend.dispatcher torch --step_scheduler.local_batch_size 1 --dataloader.batch_size 1 --validation_dataloader.batch_size 1"
   echo "=== training attempt $attempt ($(date)) $extra"
   torchrun --nproc-per-node 8 nemo_automodel/recipes/llm/train_ft.py --config $CFG \
-      --model.config.pretrained_model_name_or_path "$M" --checkpoint.checkpoint_dir $WORK/checkpoints/moonlight_v4_16b \
+      --model.config.pretrained_model_name_or_path "$M" --checkpoint.checkpoint_dir $CKPT \
       --dataset.file_pattern "$DATA/fineweb_train_*.bin" --validation_dataset.file_pattern "$DATA/fineweb_val_0000.bin" \
       ${WANDB_ARGS:-} "$@" $extra 2>&1 | tee $WORK/logs/pretrain_attempt${attempt}.log
   rc=${PIPESTATUS[0]}
