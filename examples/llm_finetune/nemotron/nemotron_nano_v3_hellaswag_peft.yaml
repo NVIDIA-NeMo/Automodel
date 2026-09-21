@@ -117,7 +117,9 @@ ci:
   recipe_owner: adil-a
   time: "00:30:00"
   checkpoint_robustness:
-    hf_device_map_auto: true
+    # Transformers 5.15.1's Mamba path produces NaNs across GPUs without a CUDA device guard.
+    # The BF16 HF reference fits on one GPU; keep the independent HF checks on that device.
+    hf_device_map_auto: false
     experts_implementation: grouped_mm
     trust_remote_code: false  # Match the default PEFT export's built-in Transformers v5 layout.
     tokenizer_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
