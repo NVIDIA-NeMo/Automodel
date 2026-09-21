@@ -32,6 +32,8 @@ per slide; render with any markdown-to-slides tool, or read in order.
 - Row 5 of the ladder is deliberately a change that measured zero. Slide 9 explains why, and it is
   the single most transferable point in the deck: a profile describes one configuration, not a
   program.
+- Slide 10 is the one to keep if you only have time for two slides: the shape lever is worth more
+  than every code change in the deck, and it is the one the audience can act on tomorrow.
 - The appendices are self-contained. If the audience is enjoying the failures, A is the best one.
 - Every measurement: 8x H100 80GB, NeMo Automodel 26.08 container, FSDP2 with expert parallelism 8,
   random weights and synthetic data, 12 steps of which 4 are warm-up.

@@ -1,8 +1,8 @@
 # What to take away
 
-**The numbers.** 4.80% to 11.51% MFU on the full model, 22.8k to 54.6k tokens per second, peak
-memory from 60.5 GB to 37.1 GB. Starting from an implementation that could not train the model at
-any sequence length.
+**The numbers.** On the full model, 4.80% to 11.81% MFU and 22.8k to 56.0k tokens per second.
+At the baseline's own shape the code changes alone give 1.67x and free 23 GB; handing the GPU more
+work gives the rest. Starting from an implementation that could not train the model at all.
 
 **The five ideas, in the order they paid off:**
 
@@ -13,8 +13,10 @@ any sequence length.
    activations or weights. Pick the smaller one.
 3. **Cost follows memory traffic and kernel count, not FLOPs.** A module worth 0.3% of the model's
    arithmetic cost 12% of the runtime.
-4. **Check the shape before writing a kernel.** Batch size and accumulation changed more than any
-   single kernel here, and cost nothing to try.
+4. **Check the shape before writing a kernel.** Batch size and accumulation were worth more than
+   every kernel change combined, and cost nothing to try. Memory optimisations are throughput
+   optimisations one step removed: they raise the batch size you can afford, which raises
+   utilisation again.
 5. **A profile describes one configuration, not the program.** Every time you change the shape, the
    ranking changes. Re-measure.
 
@@ -23,6 +25,8 @@ isolation and worthless in context, one memory optimisation that cost time, and 
 that pointed at the wrong line of code entirely. They are in the appendix because they took as long
 as the successes and taught more.
 
-**The honest ceiling.** We are at 14.7% in the best configuration. Getting to 20% needs another 1.4x
-and the remaining time is now spread thin rather than concentrated in a hot spot, which means graph
-capture or whole-block compilation rather than another point fix. There is no obvious next win.
+**The honest ceiling.** The best configuration measured reaches 16.4%, and the full model 11.8%.
+Reaching 20% needs roughly another 1.2x, and the remaining time is now spread thin rather than
+concentrated in a hot spot: no single kernel is more than 12% of the step. That calls for graph
+capture or whole-block compilation rather than another point fix. There is no obvious next win,
+which is usually the sign to stop.
