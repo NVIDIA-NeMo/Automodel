@@ -25,17 +25,18 @@
 # BOS 163584). Moonlight itself trained with Muon (Automodel: optimizer MuonConfig, needs the `dion` package);
 # AdamW below uses Moonlight's peak learning rate. 10,000 steps x 256 x 2048 = 5.2B tokens (5.6B prepared, 56 shards).
 # Backends: TileLang attention, grouped_gemm experts, DeepEP, compiled mHC cores, bf16 mixer/output projections and
-# bf16 gradient reduction (moonlight_v4_16b_mfu.yaml; 137.7k tokens/s and 44 GB at micro-batch 4 in the benchmark),
-# so micro-batch 4 with 8 accumulation steps instead of the 1 x 32 of pretrain_moonlight_v4_16b.yaml. Checkpoints
-# resume automatically (latest is picked up when the job restarts); the loss goes to Weights & Biases (WANDB_API_KEY
-# or ~/.netrc, otherwise offline).
+# bf16 gradient reduction (moonlight_v4_16b_mfu.yaml). Measured on the full model with real data (8x H100, global
+# batch 256 x 2048): micro-batch 1 = 30k tokens/s at 43 GB, micro-batch 2 = 48k tokens/s at 63 GB (torch dispatcher:
+# 41k), micro-batch 4 runs out of memory in the first backward. So micro-batch 2 with 16 accumulation steps, ~11 s per
+# step, ~31 h for the 10k steps; checkpoints every 100 steps resume automatically (latest is picked up when the job
+# restarts); the loss goes to Weights & Biases (WANDB_API_KEY or ~/.netrc, otherwise offline).
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
   global_batch_size: 256         # 256 x 2048 = 524k tokens per optimizer step
-  local_batch_size: 4            # keep equal to dataloader.batch_size below (44 GB in the benchmark, ~50 GB with real routing)
-  ckpt_every_steps: 250
+  local_batch_size: 2            # keep equal to dataloader.batch_size below; 63 GB peak, micro-batch 4 OOMs
+  ckpt_every_steps: 100         # ~95 GB and ~20 s each, two kept; bounds the loss on a restart to ~18 min
   val_every_steps: 250
   num_epochs: 1
   max_steps: 10000
@@ -123,7 +124,7 @@ dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   # The recipe passes no batch size to the DataLoader for IterableDatasets (local_batch_size only sets the
   # accumulation count), so without this line every micro-batch is a single sequence.
-  batch_size: 4
+  batch_size: 2
   shuffle: false
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
 
@@ -140,7 +141,7 @@ validation_dataset:
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  batch_size: 4
+  batch_size: 2
   shuffle: false
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
 

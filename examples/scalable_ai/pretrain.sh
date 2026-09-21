@@ -3,7 +3,7 @@
 # Expects $WORK (default /workspace) with Automodel/ (this repo) and models/Moonlight-V4-16B-A3B/ (config + tokenizer).
 # Step 1 tokenises FineWeb-edu into $WORK/data/fineweb_edu_moonshot if that directory is missing (needs network).
 # Step 2 runs the recipe, restarting from the latest checkpoint after a failure; after three failures it swaps the
-# DeepEP dispatcher for the torch one at micro-batch 1. Weights & Biases picks up WANDB_API_KEY or ~/.netrc; without
+# DeepEP dispatcher for the torch one. Weights & Biases picks up WANDB_API_KEY or ~/.netrc; without
 # either the run is logged offline (sync later with `wandb sync`).
 # Extra arguments are passed to the recipe, e.g. `pretrain.sh --step_scheduler.max_steps 200`. Environment knobs: CFG (yaml),
 # DATA (shard dir), CKPT (checkpoint dir), PREP_FILES / TRAIN_TOKENS / SHARD_TOKENS / PREP_WORKERS (data preparation),
@@ -49,7 +49,7 @@ fi
 
 for attempt in 1 2 3 4 5 6; do
   extra=""
-  [ $attempt -ge 4 ] && extra="--model.backend.dispatcher torch --step_scheduler.local_batch_size 1 --dataloader.batch_size 1 --validation_dataloader.batch_size 1"
+  [ $attempt -ge 4 ] && extra="--model.backend.dispatcher torch"   # after three failures: no DeepEP (same micro-batch, ~15% slower)
   echo "=== training attempt $attempt ($(date)) $extra"
   torchrun --nproc-per-node 8 nemo_automodel/recipes/llm/train_ft.py --config $CFG \
       --model.config.pretrained_model_name_or_path "$M" --checkpoint.checkpoint_dir $CKPT \
