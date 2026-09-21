@@ -93,7 +93,7 @@ def test_pyproject_deepep_rev_matches_dockerfile_commit():
 
 
 def test_deepep_dependency_metadata_version_matches_pinned_rev():
-    """The declared `1.2.1+<short-sha>` local version must name the commit that is actually pinned.
+    """The declared `<version>+<short-sha>` local version must name the commit that is actually pinned.
 
     `uv` trusts this string instead of building DeepEP during resolution; if it names a different
     commit than `deep_ep.rev`, the lock file records a version that the built wheel never produces.
@@ -111,6 +111,15 @@ def test_deepep_dependency_metadata_version_matches_pinned_rev():
         "DeepEP declared version does not match the pinned commit.\n"
         f"  [tool.uv.sources]            deep_ep.rev = {rev}\n"
         f"  [[tool.uv.dependency-metadata]]  version = {declared}\n"
-        f"`deep_ep` builds as `1.2.1+$(git rev-parse --short HEAD)`, so the local segment must be "
+        f"`deep_ep` builds with `+$(git rev-parse --short HEAD)`, so the local segment must be "
         f"an abbreviation of the pinned rev (expected `+{rev[:_MIN_ABBREV_LEN]}`, got `+{short_sha}`)."
     )
+
+
+def test_deepep_dependency_is_v2_or_newer():
+    """AutoModel's DeepEP integration requires the ElasticBuffer API introduced in V2."""
+    declared = _pyproject_deepep_declared_version().lstrip("v")
+    public_version = declared.split("+", 1)[0]
+    major = int(public_version.split(".", 1)[0])
+
+    assert major >= 2, f"DeepEP V2 or newer is required, got {declared!r}"

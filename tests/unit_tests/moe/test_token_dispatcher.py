@@ -20,6 +20,7 @@ import torch
 
 from nemo_automodel.components.moe.megatron.token_dispatcher import (
     MoEFlexTokenDispatcher,
+    TokenDispatcherConfig,
     _DeepepManager,
     _HybridEPManager,
     _HybridEPMetadataProcessor,
@@ -132,6 +133,59 @@ def test_token_unpermutation_applies_async_setting_to_deepep_combine(enabled):
 
     torch.testing.assert_close(actual, hidden_states)
     manager.combine.assert_called_once_with(hidden_states, enabled, enabled)
+
+
+def test_deepep_sync_free_dispatch_consumes_expanded_expert_layout():
+    calls = []
+
+    def fake_dispatch(hidden, indices, probs, num_experts, group, **kwargs):
+        calls.append(kwargs)
+        return hidden, None, probs.reshape(-1), torch.tensor([1, 1]), "handle"
+
+    manager = _DeepepManager(
+        group=object(),
+        router_topk=1,
+        num_experts=2,
+        num_local_experts=2,
+        sync_free=True,
+        _dispatch_fn=fake_dispatch,
+        _combine_fn=lambda *args, **kwargs: None,
+    )
+    manager.token_indices = torch.tensor([[0], [1]])
+    manager.token_probs = torch.tensor([[0.75], [0.25]])
+    hidden = torch.randn(2, 4)
+
+    dispatched = manager.dispatch(hidden)
+    permuted, permuted_probs = manager.get_permuted_hidden_states_by_experts(dispatched)
+    restored = manager.get_restored_hidden_states_by_experts(permuted)
+
+    assert calls == [{"async_finish": False, "allocate_on_comm_stream": False, "sync_free": True}]
+    assert permuted is hidden
+    assert restored is hidden
+    torch.testing.assert_close(permuted_probs, torch.tensor([0.75, 0.25]))
+
+
+def test_hybridep_label_uses_elastic_manager_when_legacy_api_is_absent(monkeypatch):
+    import nemo_automodel.components.moe.megatron.token_dispatcher as td
+
+    monkeypatch.setattr(td, "hybrid_ep_dispatch", None)
+    monkeypatch.setattr(td, "fused_dispatch", Mock())
+    dispatcher = MoEFlexTokenDispatcher(
+        num_local_experts=2,
+        local_expert_indices=[0, 1],
+        config=TokenDispatcherConfig(
+            moe_flex_dispatcher_backend="hybridep",
+            num_moe_experts=4,
+            moe_router_topk=2,
+            moe_share_token_dispatcher=False,
+            moe_deepep_sync_free=True,
+        ),
+        ep_group=SimpleNamespace(size=lambda: 2),
+    )
+
+    assert isinstance(dispatcher._comm_manager, _DeepepManager)
+    assert dispatcher._comm_manager.sync_free is True
+    assert dispatcher.hybridep_metadata_processor is None
 
 
 class TestHybridEPTokenCountEqualization:
