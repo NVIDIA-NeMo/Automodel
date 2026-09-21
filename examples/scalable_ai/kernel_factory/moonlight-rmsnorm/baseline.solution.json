@@ -1,0 +1,19 @@
+{
+  "name": "rmsnorm_bf16_h2048_automodel_torch_fp32",
+  "definition": "rmsnorm_bf16_h2048_eps1e6",
+  "author": "nemo-automodel",
+  "description": "The shipped NeMo Automodel baseline: Float32RMSNorm, i.e. the nemo_automodel::float32_rms_norm custom op behind torch.compile(dynamic=True). This is what rms_norm: torch_fp32 runs today, so it is the number a winning kernel has to beat. The fp32 math and the store into y are compiled together so the destination-passing ABI does not add a second pass that the real Automodel path does not pay.",
+  "spec": {
+    "languages": ["pytorch"],
+    "target_hardware": ["H100"],
+    "entry_point": "kernel.py::run",
+    "dependencies": ["torch"],
+    "destination_passing_style": true
+  },
+  "sources": [
+    {
+      "path": "kernel.py",
+      "content": "import torch\n\n\ndef _rms_norm_into(x, weight, eps, y):\n    y.copy_(torch.nn.functional.rms_norm(x.float(), (x.shape[-1],), weight.float(), eps))\n\n\n_compiled = None\n\n\ndef run(x, weight, eps, y):\n    global _compiled\n    if _compiled is None:\n        # dynamic=True matches Automodel, which compiles once for a varying token count.\n        _compiled = torch.compile(_rms_norm_into, dynamic=True)\n    _compiled(x, weight, eps, y)\n"
+    }
+  ]
+}

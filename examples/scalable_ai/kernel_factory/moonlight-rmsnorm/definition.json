@@ -1,0 +1,41 @@
+{
+  "name": "rmsnorm_bf16_h2048_eps1e6",
+  "op_type": "rmsnorm",
+  "description": "RMSNorm as NeMo Automodel executes it for the block and final norms of Moonlight-V4-16B-A3B (DeepSeek-V4 architecture, hidden_size=2048, rms_norm_eps=1e-6). Inputs and outputs are bf16; the mean square, the reciprocal square root and the weight scaling are all computed in fp32, and the single rounding back to bf16 happens on the store. This is the contract of nemo_automodel::float32_rms_norm, which is what the candidate kernel replaces. Forward only: the training path keeps the reference fp32 gradient until a separate backward definition is searched.",
+  "axes": {
+    "tokens": {
+      "type": "var",
+      "description": "Flattened batch x sequence rows. Automodel flattens [batch, sequence, hidden] to [tokens, hidden] before the call."
+    },
+    "hidden": {
+      "type": "const",
+      "value": 2048,
+      "description": "hidden_size of akoumpa/Moonlight-V4-16B-A3B. Not 4096: that is the Llama-3.1 size used by the public walkthrough."
+    }
+  },
+  "inputs": {
+    "x": {
+      "shape": ["tokens", "hidden"],
+      "dtype": "bfloat16",
+      "description": "Hidden states, row-major contiguous, one normalized row per token."
+    },
+    "weight": {
+      "shape": ["hidden"],
+      "dtype": "bfloat16",
+      "description": "Learned per-channel gain. Kept in the model dtype (bf16) for FSDP2, upcast to fp32 inside the op."
+    },
+    "eps": {
+      "shape": null,
+      "dtype": "float32",
+      "description": "Added to the mean square before the reciprocal square root. Pinned to 1e-6 by every workload."
+    }
+  },
+  "outputs": {
+    "y": {
+      "shape": ["tokens", "hidden"],
+      "dtype": "bfloat16",
+      "description": "Normalized and scaled hidden states, row-major contiguous, not aliasing x."
+    }
+  },
+  "reference": "import torch\n\n\ndef run(x, weight, eps):\n    # Exactly nemo_automodel::float32_rms_norm: fp32 arithmetic, one rounding to bf16 at the end.\n    return torch.nn.functional.rms_norm(x.float(), (x.shape[-1],), weight.float(), eps).to(x.dtype)\n"
+}

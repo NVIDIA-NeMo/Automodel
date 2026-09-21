@@ -24,6 +24,8 @@ compression, no indexer); both ship a training recipe in their `training/` folde
 | `configs/moonlight_v4_16b_tilelang_deepep.yaml` | NeMo Automodel with TileLang sparse-attention / indexer / Sinkhorn kernels and DeepEP (Hopper-class GPUs) |
 | `configs/pretrain_moonlight_v4_16b.yaml` | from-scratch pre-training on Megatron-format data (8 GPUs, EP 8) |
 | `profile_layer.py` | per-layer fwd+bwd profiling (attention SWA/CSA/HCA, MoE, block, RMSNorm, mHC mixer), Automodel vs transformers |
+| `configs/moonlight_v4_16b_kf_rmsnorm.yaml` | e2e A/B twin of `moonlight_v4_16b_torch.yaml`; the only difference is `rms_norm: kf_triton_h2048` |
+| `kernel_factory/` | Kernel Factory proof of concept: the RMSNorm backend migration, the four-way backend comparison, and the campaign for the block/final norms (bf16, hidden 2048, eps 1e-6) |
 | `nsys_profiles/` | the nsys commands behind the lecture's profiles and a script to regenerate them |
 | `run_bench.sh` | 8-GPU benchmark runner behind the reference tables below; `run_bench.sh journey` is the stage-by-stage comparison on the 4-layer model |
 

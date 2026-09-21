@@ -485,7 +485,7 @@ class BackendConfig:
     )
     sparse_attn: Literal["generic", "msa"] = "generic"
     linear: Literal["torch", "te", "quack"] = "te" if HAVE_TE and torch.cuda.is_available() else "torch"
-    rms_norm: Literal["torch", "torch_fp32", "te", "quack"] = "torch_fp32"
+    rms_norm: Literal["torch", "torch_fp32", "te", "quack", "kf_triton_h2048"] = "torch_fp32"
     rope: Literal["torch", "quack"] = "torch"
     rope_fusion: bool = HAVE_TE and torch.cuda.is_available()
     experts: Literal["torch", "te", "gmm", "torch_mm", "torch_mm_mxfp8"] = (
@@ -789,11 +789,15 @@ def initialize_rms_norm_module(
     Call reset_parameters() to materialize weights if created on meta device.
 
     Args:
-        rms_norm_impl: Backend implementation ("te", "torch", "torch_fp32", or "quack")
+        rms_norm_impl: Backend implementation ("te", "torch", "torch_fp32", "quack",
+            or "kf_triton_h2048")
             - "te": Transformer Engine fused RMSNorm kernel
             - "torch": PyTorch native nn.RMSNorm (computes in input dtype)
             - "torch_fp32": torch.compiled fp32 RMSNorm for training stability
             - "quack": QuACK CuTe DSL RMSNorm kernel
+            - "kf_triton_h2048": Kernel Factory forward kernel with the fp32 reference
+              backward; only valid at dim=2048, eps=1e-6, bf16 (Moonlight-V4 block and
+              final norms). See examples/scalable_ai/kernel_factory/moonlight-rmsnorm.
         dim: Normalized dimension
         eps: Epsilon for numerical stability
         device: Device to create module on (None uses PyTorch default, typically CPU)
@@ -811,6 +815,10 @@ def initialize_rms_norm_module(
         return nn.RMSNorm(dim, eps=eps, device=device, dtype=dtype)
     elif rms_norm_impl == "torch_fp32":
         return Float32RMSNorm(dim, eps=eps, device=device, dtype=dtype)
+    elif rms_norm_impl == "kf_triton_h2048":
+        from nemo_automodel.components.models.common.kf_triton_rms_norm import KFTritonRMSNorm
+
+        return KFTritonRMSNorm(dim, eps=eps, device=device, dtype=dtype)
     elif rms_norm_impl == "quack":
         available, quack_rms_norm = safe_import_from(
             "quack.rmsnorm",

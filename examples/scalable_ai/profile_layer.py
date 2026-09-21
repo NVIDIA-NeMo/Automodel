@@ -414,7 +414,14 @@ def main():
         choices=["eager", "tilelang"],
         help="Automodel attention path: eager (dense masked attention with sinks) or TileLang sparse kernels",
     )
-    parser.add_argument("--backend-rms-norm", type=str, default="torch_fp32", choices=["torch", "torch_fp32", "te"])
+    parser.add_argument(
+        "--backend-rms-norm",
+        type=str,
+        default="torch_fp32",
+        choices=["torch", "torch_fp32", "te", "kf_triton_h2048"],
+        help="RMSNorm backend; 'kf_triton_h2048' is the Kernel Factory candidate and only "
+        "accepts the Moonlight-V4 contract (hidden 2048, eps 1e-6, bf16)",
+    )
     parser.add_argument("--backend-experts", type=str, default="torch_mm", choices=["torch", "torch_mm", "gmm", "te"])
     parser.add_argument("--backend-linear", type=str, default="torch", choices=["torch", "te"])
     parser.add_argument(
