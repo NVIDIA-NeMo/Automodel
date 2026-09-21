@@ -15,7 +15,7 @@ per slide; render with any markdown-to-slides tool, or read in order.
 | **The ladder** | `05-the-ladder.md` | **the spine**: one shape, one change per row |
 | | `06-lever-sparsity.md` | sparsity has to be real |
 | | `07-lever-communication.md` | move tokens, not weights |
-| | `08-lever-fusion.md` | a thousand small kernels |
+| | `08-lever-fusion.md` | `compile_hc`: pseudocode, kernel counts, and measured gain |
 | | `09-lever-precision.md` | precision, and a lever that did nothing |
 | **Beyond** | `10-batch-shape.md` | the lever that is not a kernel |
 | | `11-does-it-transfer.md` | the same changes on the full 27-layer model |
