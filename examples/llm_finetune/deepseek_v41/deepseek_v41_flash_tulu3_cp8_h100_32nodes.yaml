@@ -1,0 +1,180 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# H100-80GB port of deepseek_v41_flash_tulu3_cp.yaml: 32 nodes x 8 H100, WORLD=256,
+# EP64 (ep_shard=4), CP8, GBS 64 / LBS 1 -> dp=32, two accumulated microbatches.
+#
+# Two settings differ from the GB200 recipe, both forced by the 80 GB budget:
+# - distributed.defer_fsdp_grad_sync: false. With the default (true), all FSDP units keep
+#   their unsharded parameters and gradients resident across the accumulated microbatches
+#   (~+33 GB here for the dense stack plus this EP rank's experts, independent of dp);
+#   that fits GB200 but overflows H100 at 16 and at 32 nodes.
+# - distributed.moe.reshard_after_forward: false. With per-microbatch gradient sync the
+#   expert FSDP unit is resharded after every microbatch and re-unsharded inside the
+#   activation-checkpoint recompute; on torch 2.13 the non-zero-dim copy-out path emits
+#   aten.split.Tensor / aten.cat.out, which selective AC did not record in the forward
+#   (issue #3958, fixed by PR #3961). Keeping the experts unsharded between forward and
+#   backward avoids it (~+8.5 GB) and is not needed once #3961 is merged.
+# 16 nodes (dp=16, four microbatches) fit the first step but run out of memory in the
+# second, when the optimizer state has been created; use 32 nodes.
+#
+# CP1 reference run on 16 x 8 H100: dp becomes 128, so override
+#   --distributed.cp_size 1 --step_scheduler.global_batch_size 128
+# (the GB200 recipe keeps GBS 64 at CP1 because dp is 64 there).
+# Launch requirements: NCCL_PXN_DISABLE=1 (or NCCL_NET_PLUGIN=none NCCL_NET=IB) and node-local JIT caches, see the model-coverage page.
+# Data: DS41_DATA_ROOT prepared by prepare_tulu3_data.py in this directory (4096-token,
+# right-padded ChatDataset rows with assistant-only shifted labels).
+# Measured (100 updates): CP8 train loss 0.7147 -> 0.6202, validation 0.5541 / 0.5444;
+# CP1 reference 0.8003 -> 0.5060, validation 0.5477 / 0.5384; 65.7 GiB peak.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+seed: 1234
+
+step_scheduler:
+  global_batch_size: 64
+  local_batch_size: 1
+  ckpt_every_steps: 50
+  save_checkpoint_every_epoch: false
+  val_every_steps: 50
+  gc_every_steps: 10
+  num_epochs: 1
+  max_steps: 100
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 120
+
+prewarm:
+  cublas_backward: true
+  comm_groups: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  config:
+    _target_: nemo_automodel.components.models.deepseek_v41.config.DeepseekV41Config.from_pretrained
+    pretrained_model_name_or_path: ${DS41_CHECKPOINT}
+    name_or_path: ${DS41_CHECKPOINT}
+    revision: df42c109f1defefcbfcedbe7d905718a12266e40  # pragma: allowlist secret (public model commit SHA)
+    vision_config:
+      _target_: nemo_automodel.components.models.deepseek_v41.config.DeepseekV41VisionConfig
+      num_hidden_layers: 0
+  trust_remote_code: false
+  load_base_model: true
+  torch_dtype: bfloat16
+  use_liger_kernel: false
+  use_sdpa_patching: false
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: tilelang
+    linear: torch
+    rms_norm: te
+    experts: torch_mm
+    dispatcher: hybridep
+    gate_precision: float32
+    rope_fusion: false
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  pp_size: 1
+  cp_size: 8
+  ep_size: 64
+  defer_fsdp_grad_sync: false
+  sequence_parallel: false
+  activation_checkpointing: true
+  moe:
+    reshard_after_forward: false
+    wrap_outer_model: true
+    lm_head_precision: float32
+    # Single-pass mHC carries FP32 coefficients alongside BF16 residuals.
+    # Preserve each module's explicit casts across FSDP boundaries.
+    mp_policy:
+      _target_: torch.distributed.fsdp.MixedPrecisionPolicy
+      param_dtype: bfloat16
+      reduce_dtype: float32
+      output_dtype: null
+      cast_forward_inputs: false
+
+checkpoint:
+  enabled: false
+  checkpoint_dir: ../checkpoints/deepseek_v41_flash_tulu3_cp8_h100_32nodes
+  model_save_format: safetensors
+  save_consolidated: false
+  dequantize_base_checkpoint: true
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: datasets.load_from_disk
+  dataset_path: ${DS41_DATA_ROOT}/train
+
+packed_sequence:
+  packed_sequence_size: 0
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+    pad_seq_len_divisible: 64
+  shuffle: true
+  num_workers: 4
+
+validation_dataset:
+  _target_: datasets.load_from_disk
+  dataset_path: ${DS41_DATA_ROOT}/validation
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+    pad_seq_len_divisible: 64
+  shuffle: false
+  drop_last: true
+  num_workers: 4
+
+optimizer:
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  lr: 1.0e-5
+  weight_decay: 0.1
+  adam_w_mode: true
+  bias_correction: true
+  master_weights: true
+  master_weight_dtype: torch.float32
+  store_param_remainders: true
+  exp_avg_dtype: torch.bfloat16
+  exp_avg_sq_dtype: torch.bfloat16
+
+lr_scheduler:
+  lr_warmup_steps: 10
+  lr_decay_steps: 100
+  lr_decay_style: cosine
+  min_lr: 1.0e-6
+
+clip_grad_norm:
+  max_norm: 1.0
+  backend: triton
+
+wandb:
+  enable: false
+  project: deepseek-v41
+  name: ds41-tulu3-4k-cp8-h100-32x8
+  mode: online
+  dir: ../logs/wandb
+
