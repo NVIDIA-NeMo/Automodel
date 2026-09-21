@@ -12,7 +12,7 @@ gradient accumulation, 8x H100.** Only the thing named in each row changes.
 | 5 | bf16 gradient reduction | 0.356 s | 92.0k | 9.83% | 28.3 GB |
 | 6 | bf16 vocabulary projection | 0.330 s | 99.2k | **10.59%** | 27.4 GB |
 
-**1.74x faster and 16 GB lighter**, on a model the stock implementation could not train at all.
+**1.74x faster and 16 GB lighter** than the training-ready baseline at the same shape.
 
 Two things to notice before we go through them one at a time.
 

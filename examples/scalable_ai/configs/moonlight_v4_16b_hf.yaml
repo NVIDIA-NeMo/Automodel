@@ -23,6 +23,10 @@
 # sliding-window layers: the lecture profiles use `--model.config.num_hidden_layers 2` (the schedule starts `[0, 0]`),
 # which the NeMo Automodel configs mirror. Attention is eager only (no FlashAttention for 512-dim heads, no SDPA with
 # sinks), and `num_hash_layers: 0` avoids the zero-initialised token table of a from-config hash layer.
+#
+# The default global batch of 256 needs 32 accumulation steps and OOMs while FSDP retains an unsharded accumulated
+# gradient. For the measured full-model FSDP-only control (micro-batch 1, accumulation 1), override
+# `--step_scheduler.global_batch_size 8`.
 
 recipe: BenchmarkingRecipeForNextTokenPrediction
 

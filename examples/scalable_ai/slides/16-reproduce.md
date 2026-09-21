@@ -13,9 +13,17 @@
 `models/Moonlight-V4-16B-A3B/` and `logs/`.
 
 ```bash
-run_bench.sh journey    # stock vs optimised on a 4-layer model, the only shape stock survives
+run_bench.sh journey    # stock vs optimised on a compact common shape
 run_bench.sh moe_ab     # the expert-communication comparison, slide 7
 run_bench.sh one        # a single run, driven by ONE_CFG and ONE_ARGS
+```
+
+**The full-model stock control on slide 3:**
+
+```bash
+ONE_NAME=hf27_ga1 ONE_CFG=moonlight_v4_16b_hf.yaml \
+  ONE_ARGS="--step_scheduler.local_batch_size 1 --step_scheduler.global_batch_size 8" \
+  run_bench.sh one
 ```
 
 **The ladder on slide 5**, one shape, one change per row:

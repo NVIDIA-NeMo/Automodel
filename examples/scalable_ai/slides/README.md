@@ -1,4 +1,4 @@
-# From "it does not run" to a tuned training step
+# From a narrow corner to a tuned training step
 
 A guest-lecture deck on making a large mixture-of-experts model train efficiently. One markdown file
 per slide; render with any markdown-to-slides tool, or read in order.
@@ -10,7 +10,7 @@ per slide; render with any markdown-to-slides tool, or read in order.
 | | `00-overview.md` | the result and the shape of the talk |
 | **Setup** | `01-the-model.md` | the model, and the three things about it that matter |
 | | `02-what-we-measure.md` | MFU, and where the useful work actually is |
-| | `03-it-does-not-run.md` | why the published implementation runs out of memory |
+| | `03-the-narrow-corner.md` | where the stock implementation fits, and why the original run did not |
 | | `04-how-we-find-it.md` | reading a kernel trace |
 | **The ladder** | `05-the-ladder.md` | **the spine**: one shape, one change per row |
 | | `06-lever-sparsity.md` | sparsity has to be real |

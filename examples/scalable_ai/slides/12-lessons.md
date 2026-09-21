@@ -1,8 +1,10 @@
 # What to take away
 
-**The numbers.** On the full model, 4.80% to 11.81% MFU and 22.8k to 56.0k tokens per second.
-At the baseline's own shape the code changes alone give 1.67x and free 23 GB; handing the GPU more
-work gives the rest. Starting from an implementation that could not train the model at all.
+**The numbers.** The only full-model stock `transformers` point that completed our FSDP-only sweep
+used micro-batch 1 and accumulation 1: 3.67% MFU and 17.4k tokens per second. On the training-ready
+path, the full model moves from 4.80% to 11.81% MFU and 22.8k to 56.0k tokens per second. At the
+baseline's own shape the code changes alone give 1.67x and free 23 GB; handing the GPU more work
+gives the rest.
 
 **The five ideas, in the order they paid off:**
 

@@ -62,8 +62,10 @@ automodel examples/scalable_ai/configs/pretrain_moonlight_v4_16b.yaml --nproc-pe
 - **mHC.** Every block keeps 4 residual streams and mixes them through a Sinkhorn-projected doubly-stochastic matrix;
   the `hc` layer profile isolates this cost.
 - **transformers baseline.** The stock implementation is inference-oriented (eager attention only; in training mode
-  CSA gathers `S x k` keys per layer and compressed entries carry no causal mask), so end-to-end comparisons use the
-  two sliding-window layers and the HF attention profiles are limited to ratio 0 (and 128 for timing only).
+  CSA gathers `S x k` keys per layer and compressed entries carry no causal mask). The only full-model point that
+  completed the measured FSDP-only sweep used micro-batch 1 with one accumulation step, so the higher-batch
+  stage-by-stage comparison uses a smaller common shape. HF attention profiles are limited to ratio 0 (and 128 for
+  timing only).
 
 ## Notes for reproducing the lecture numbers
 
@@ -77,7 +79,7 @@ automodel examples/scalable_ai/configs/pretrain_moonlight_v4_16b.yaml --nproc-pe
 - Kernel prerequisites for the Hopper configs: `tilelang`, `tile_kernels` (DeepSeek TileKernels, Sinkhorn),
   `deep_ep`; optional `transformer_engine` for the TE RMSNorm / GroupedLinear profiles.
 
-## Reference numbers (8x H100 80 GB, NeMo Automodel 26.08 container, 2026-09-19)
+## Reference numbers (8x H100 80 GB, NeMo Automodel 26.08 container, 2026-09-19 to 2026-09-20)
 
 Moonlight-V4-16B-A3B from random init on mock data, sequence length 2048, global batch 256 sequences
 (524k tokens per optimizer step), 12 steps with 4 warm-up, Adam. MFU uses the `deepseekv4_flops` formula against
@@ -85,7 +87,7 @@ Moonlight-V4-16B-A3B from random init on mock data, sequence length 2048, global
 
 | run (`run_bench.sh`) | micro-batch / GPU | step time | tokens/s (8 GPUs) | peak memory | MFU |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| stock transformers (`moonlight_v4_16b_hf.yaml`), 27 layers, seq 2048 / 1024 / 512 | 1 | OOM in the first forward at every length | - | > 79 GB | - |
+| stock transformers (`moonlight_v4_16b_hf.yaml`), 27 layers, seq 2048 / 1024 / 512 | 1 | OOM in the first optimizer step at every length | - | > 79 GB | - |
 | NeMo Automodel, eager attention, `torch_mm` experts, torch dispatcher (`moonlight_v4_16b_torch.yaml`) | 2 | OOM | - | > 79 GB | - |
 | same | 1 | 19.75 s | 26.5k | 58.8 GB | 5.6% |
 | NeMo Automodel, eager attention + DeepEP dispatcher | 1 | 18.05 s | 29.0k | 58.8 GB | 6.1% |
@@ -93,18 +95,25 @@ Moonlight-V4-16B-A3B from random init on mock data, sequence length 2048, global
 | like-for-like 2 sliding-window layers: stock transformers | 1 | 2.37 s | 221k | 14.7 GB | 8.4% |
 | like-for-like 2 sliding-window layers: NeMo Automodel eager | 4 | 1.51 s | 347k | 26.1 GB | 13.1% |
 
-Reading the table: the stock implementation cannot train the full model on 80 GB GPUs (its CSA layers gather
-`S x k` keys per query); the eager Automodel path fits at micro-batch 1; the TileLang kernels cut the attention
-memory enough for micro-batch 2 and run 1.9x faster than the eager path. Reproduce with
-`examples/scalable_ai/run_bench.sh` (see its header for the expected workspace layout).
+The stock row is specific to this table's global batch of 256, which requires 32 accumulation steps.
+A 2026-09-20 control with global batch 8 and one accumulation step completed the full 27-layer model at
+0.940 s, 17.4k tokens/s, 3.67% MFU and 45.6 GB. Repeating global batch 256 reproduced the OOM in the first
+backward while FSDP allocated an unsharded accumulated-gradient buffer; the shorter-sequence runs reached a later
+micro-batch before that retained buffer collided with an FSDP parameter all-gather. The original description of
+these runs as "OOM in the first forward" and the broader claim that stock could not train the model were wrong.
+
+At global batch 256, the eager Automodel path fits at micro-batch 1; the TileLang kernels cut the attention memory
+enough for micro-batch 2 and run 1.9x faster than the eager path. Reproduce with `examples/scalable_ai/run_bench.sh`
+(see its header for the expected workspace layout).
 
 ### Stage by stage on a model every stage can run
 
-Stock transformers never fits the full model, so the stage-by-stage comparison uses the first four layers of the
-schedule (`--model.config.num_hidden_layers 4`: sliding-window, sliding-window, CSA, HCA, one of each attention
-kind; 3.01B parameters), everything else unchanged: sequence 2048, global batch 256 sequences (524k tokens per
-step), 8x H100, same recipe, data and optimizer. `run_bench.sh journey` produces the table; the Automodel rows use
-the fake balanced gate like the full-model table above, stock transformers routes with its (random-init) learned gate.
+The only full-stock-model point that completed the sweep used global batch 8 with micro-batch 1. To compare every
+stage at the original global batch of 256 and at larger micro-batches, the stage-by-stage comparison uses the first
+four layers of the schedule (`--model.config.num_hidden_layers 4`: sliding-window, sliding-window, CSA, HCA, one of
+each attention kind; 3.01B parameters), everything else unchanged: sequence 2048, 8x H100, same recipe, data and
+optimizer. `run_bench.sh journey` produces the table; the Automodel rows use the fake balanced gate like the
+full-model table above, stock transformers routes with its (random-init) learned gate.
 
 | stage | micro-batch / GPU | step time | tokens/s (8 GPUs) | peak memory | MFU |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -127,8 +136,9 @@ at micro-batch 4 the portable Automodel path (stage 2) is as fast as stock, Deep
 (the torch dispatcher exchanges tokens with all-gathers over the EP group), and the TileLang kernels take another
 22% off while saving 7 GB, so stage 4 is 1.47x faster than stock at micro-batch 4 and 1.75x at micro-batch 1.
 Only the TileLang path fits micro-batch 8 (52 GB), where it reaches 308k tokens/s and 15.9% MFU, 1.5x the best
-stock throughput (203k tokens/s at micro-batch 4). On the full 27-layer model the same steps are the difference
-between "does not run" and 50k tokens/s.
+stock throughput (203k tokens/s at micro-batch 4). On the full 27-layer model, the stock FSDP-only path sustains
+17.4k tokens/s at 3.67% MFU in its micro-batch-1, accumulation-1 corner; the sparse-kernel path reaches about 50k
+tokens/s at the original reference configuration.
 
 The gate matters for a fair reading: rerunning the Automodel stages with the learned gate (`JOURNEY_GATE=false`)
 gives 3.55-3.58 s (eager, micro-batch 1), 2.61 s (eager, 4), 2.40 s (DeepEP, 4), 2.55 s (TileLang, 1) and
