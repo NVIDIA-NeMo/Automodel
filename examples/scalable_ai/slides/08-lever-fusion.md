@@ -2,9 +2,22 @@
 
 > Same computation, allclose numerics; fewer launches and fewer round trips through HBM.
 
+$$
+\underbrace{\mathbf X_{\ell+1}}_{\text{four residual streams}}
+=
+\underbrace{\mathbf H_{\ell}^{\mathrm{res}}\mathbf X_{\ell}}_{\mathtt{comb}^{\top}\mathbf X_{\ell}}
++
+\underbrace{(\mathbf H_{\ell}^{\mathrm{post}})^{\top}
+\mathcal F(\mathbf H_{\ell}^{\mathrm{pre}}\mathbf X_{\ell};\mathbf W_{\ell})}_{
+\mathtt{post}\odot\mathcal F(\mathtt{collapse(pre, X)})},
+\qquad
+\mathbf C_{\ell}=\operatorname{Sinkhorn}(\mathbf L_{\ell}),
+\qquad \mathbf H_{\ell}^{\mathrm{res}}=\mathbf C_{\ell}^{\top}.
+$$
+
 | eager mHC | `backend.compile_hc: true` |
 | --- | --- |
-| `x32 = streams.float()`<br>`mix = linear(rmsnorm(x32), W)`<br>`pre, post, logits = gates(mix)`<br>`comb = sinkhorn(sigmoid(logits))`<br>`collapsed = (pre * streams).sum(hc)`<br>`expanded = post * y + matmul(comb.T, streams)` | `pre, post, logits = compile(weights)(streams)`<br>`comb = sinkhorn(...)  # unchanged`<br>`collapsed = compile(sum(pre * streams))`<br>`expanded = compile(post * y + sum_i(comb_i * stream_i))`<br><br>Inductor fuses the cast, norm, gates, and reductions; unrolling the four-stream mix turns the tiny batched GEMM into one fused pass. |
+| `x32 = streams.float()`<br>`mix = linear(rmsnorm(x32), W)`<br>`pre, post, logits = gates(mix)`<br>`comb = sinkhorn(logits)`<br>`collapsed = (pre * streams).sum(hc)`<br>`expanded = post * y + matmul(comb.T, streams)` | `pre, post, logits = compile(weights)(streams)`<br>`comb = sinkhorn(...)  # unchanged`<br>`collapsed = compile(sum(pre * streams))`<br>`expanded = compile(post * y + sum_i(comb_i * stream_i))`<br><br>Inductor fuses the cast, norm, gates, and reductions; unrolling the four-stream mix turns the tiny batched GEMM into one fused pass. |
 | **23 forward + 51 backward = 74 kernels/site** | **9 forward + 25 backward = 34 kernels/site**<br>**61% fewer forward, 51% fewer backward, 54% fewer total** |
 
 The full-model A/B changes only `compile_hc`:
@@ -16,6 +29,7 @@ The full-model A/B changes only `compile_hc`:
 | MFU | 7.609% | 8.052% | **+0.443 points** |
 | rank-0 peak memory | 47.98 GiB | 44.65 GiB | **−3.33 GiB** |
 
-*Kernel counts are an isolated H100 profile of one mHC site at local batch 1; the unchanged
+*Equation: [Xie et al., Eq. (3)](https://arxiv.org/abs/2512.24880). Kernel counts are an isolated
+H100 profile of one mHC site at local batch 1; the unchanged
 TileLang Sinkhorn is included on both sides. There are two sites per transformer layer. Slurm job
 `19039285`. The 12-layer teaching proxy shows the same result: 0.388 s to 0.355 s (8.5% lower).*
