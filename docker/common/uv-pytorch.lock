@@ -4405,7 +4405,7 @@ magi = [{ name = "magi-attention", git = "https://github.com/SandAI-org/MagiAtte
 test = [
     { name = "coverage" },
     { name = "onnxruntime-gpu", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'", index = "https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-13/pypi/simple/" },
-    { name = "peft", specifier = ">=0.19.1" },
+    { name = "peft", specifier = ">=0.20.0" },
     { name = "pytest" },
     { name = "pytest-shard" },
     { name = "pytest-timeout" },
