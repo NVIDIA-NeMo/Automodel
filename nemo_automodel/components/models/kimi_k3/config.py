@@ -86,6 +86,9 @@ class KimiK3TextConfig(PretrainedConfig):
         kda_unpad_inputs: bool = True,
         kda_use_fused_gate: bool = True,
         kda_use_qk_l2norm_in_kernel: bool = True,
+        kda_disable_recompute: bool = False,
+        kda_conv_backend: str = "triton",
+        kda_transpose_state_layout: bool = True,
         attn_res_block_size: int | None = 12,
         activation_situ_beta: float | None = 4.0,
         activation_situ_linear_beta: float | None = 25.0,
@@ -157,6 +160,9 @@ class KimiK3TextConfig(PretrainedConfig):
         self.kda_unpad_inputs = kda_unpad_inputs
         self.kda_use_fused_gate = kda_use_fused_gate
         self.kda_use_qk_l2norm_in_kernel = kda_use_qk_l2norm_in_kernel
+        self.kda_disable_recompute = kda_disable_recompute
+        self.kda_conv_backend = kda_conv_backend
+        self.kda_transpose_state_layout = kda_transpose_state_layout
         self.attn_res_block_size = attn_res_block_size
         self.activation_situ_beta = activation_situ_beta
         self.activation_situ_linear_beta = activation_situ_linear_beta
@@ -177,6 +183,8 @@ class KimiK3TextConfig(PretrainedConfig):
             raise ValueError("moe_router_activation_func must be 'sigmoid' or 'softmax'.")
         if self.kda_mode not in {"chunk", "fused_recurrent"}:
             raise ValueError("kda_mode must be 'chunk' or 'fused_recurrent'.")
+        if self.kda_conv_backend not in {"triton", "cuda"}:
+            raise ValueError("kda_conv_backend must be 'triton' or 'cuda'.")
         if self.linear_attn_config is None:
             return
         if "kda_layers" not in self.linear_attn_config or "full_attn_layers" not in self.linear_attn_config:

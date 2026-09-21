@@ -79,6 +79,22 @@ _FUSED_RMSNORM_GATED_OK, FusedRMSNormGated = safe_import_from(
 )
 _CHUNK_KDA_OK, chunk_kda = safe_import_from("fla.ops.kda", "chunk_kda", msg=_FLA_MSG)
 _RECURRENT_KDA_OK, fused_recurrent_kda = safe_import_from("fla.ops.kda", "fused_recurrent_kda", msg=_FLA_MSG)
+_CHUNK_KDA_HAS_DISABLE_RECOMPUTE = _CHUNK_KDA_OK and "disable_recompute" in inspect.signature(chunk_kda).parameters
+
+
+def _short_conv_backend_kwargs(backend: str) -> dict[str, str]:
+    """Return the ``ShortConvolution`` keyword for a non-default conv backend.
+
+    Older FLA releases have no ``backend`` parameter; the default Triton backend is then the only
+    choice and no keyword is passed, so the module still constructs.
+    """
+    if backend == "triton" or not _SHORT_CONV_OK:
+        return {}
+    if "backend" not in inspect.signature(ShortConvolution.__init__).parameters:
+        return {}
+    return {"backend": backend}
+
+
 _KDA_GATE_OK, fused_kda_gate = safe_import_from("fla.ops.kda.gate", "fused_kda_gate", msg=_FLA_MSG)
 try:
     _FUSED_KDA_GATE_HAS_G_BIAS = _KDA_GATE_OK and "g_bias" in inspect.signature(fused_kda_gate).parameters
@@ -749,12 +765,16 @@ class KimiDeltaAttention(nn.Module):
         self.q_proj = nn.Linear(self.hidden_size, projection_k_size, bias=False, dtype=dtype)
         self.k_proj = nn.Linear(self.hidden_size, projection_k_size, bias=False, dtype=dtype)
         self.v_proj = nn.Linear(self.hidden_size, projection_size, bias=False, dtype=dtype)
+        # FLA's ShortConvolution defaults to its Triton kernels; ``kda_conv_backend: cuda`` selects the
+        # causal-conv1d CUDA kernels when that package is installed (FLA falls back to Triton otherwise).
+        conv_kwargs = _short_conv_backend_kwargs(getattr(config, "kda_conv_backend", "triton"))
         self.q_conv1d = _KimiFp32Module(
             ShortConvolution(
                 hidden_size=projection_k_size,
                 kernel_size=self.conv_size,
                 activation="silu",
                 dtype=torch.float32,
+                **conv_kwargs,
             )
         )
         self.k_conv1d = _KimiFp32Module(
@@ -763,6 +783,7 @@ class KimiDeltaAttention(nn.Module):
                 kernel_size=self.conv_size,
                 activation="silu",
                 dtype=torch.float32,
+                **conv_kwargs,
             )
         )
         self.v_conv1d = _KimiFp32Module(
@@ -771,6 +792,7 @@ class KimiDeltaAttention(nn.Module):
                 kernel_size=self.conv_size,
                 activation="silu",
                 dtype=torch.float32,
+                **conv_kwargs,
             )
         )
 
@@ -934,10 +956,18 @@ class KimiDeltaAttention(nn.Module):
         kernel = chunk_kda if mode == "chunk" else fused_recurrent_kda
         kernel_options = {
             "use_qk_l2norm_in_kernel": use_qk_l2norm_in_kernel,
-            "transpose_state_layout": True,
+            # FLA's transposed [K, V] state layout is the reference default; the plain layout runs the
+            # chunk kernels slightly faster on GB200 and yields the same output up to fp32 summation order.
+            "transpose_state_layout": bool(getattr(self.config, "kda_transpose_state_layout", True)),
         }
         if mode == "chunk":
             kernel_options["safe_gate"] = self.gate_lower_bound is not None
+            if getattr(self.config, "kda_disable_recompute", False) and _CHUNK_KDA_HAS_DISABLE_RECOMPUTE:
+                # Under activation checkpointing the layer forward is already re-run right before its
+                # backward, so FLA's own in-backward recompute of w/u/qg/kg and the chunk states is
+                # redundant work: keep them from that forward instead (transient memory, freed at the
+                # end of the layer backward).
+                kernel_options["disable_recompute"] = True
         o, _ = kernel(
             q=q,
             k=k,
@@ -945,8 +975,9 @@ class KimiDeltaAttention(nn.Module):
             g=g,
             beta=beta,
             initial_state=None,
-            # Under CP the final state is owned by FLA's rank-to-rank handoff.
-            output_final_state=cp_context is None,
+            # The final recurrent state is never consumed in training (and under CP it is owned by
+            # FLA's rank-to-rank handoff), so do not have the kernel materialise it.
+            output_final_state=False,
             cu_seqlens=cu_seqlens,
             **kernel_options,
             **kernel_kwargs,

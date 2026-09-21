@@ -1573,6 +1573,147 @@ def kimi_k3_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> floa
     return attention_flops + ffn_flops + vocab_flops
 
 
+def _sum_min_floor_div(seq_len: int, ratio: int, cap: int | None) -> int:
+    """``sum_{j=1..seq_len} min(cap, floor(j / ratio))`` in closed form (``cap=None`` disables the cap).
+
+    ``floor(j / ratio)`` is the number of complete compressed groups visible to the query at
+    zero-based position ``j - 1``; the cap is the sparse top-k. Closed form so million-token
+    sequences cost nothing to evaluate.
+    """
+
+    def floor_sum(n: int) -> int:
+        q, rem = divmod(n, ratio)
+        return ratio * q * (q - 1) // 2 + q * (rem + 1)
+
+    if cap is None or seq_len <= cap * ratio:
+        return floor_sum(seq_len)
+    threshold = cap * ratio  # from here on every query sees at least ``cap`` groups
+    return floor_sum(threshold) + (seq_len - threshold) * cap
+
+
+def _sum_min_window(seq_len: int, window: int) -> int:
+    """``sum_{i=0..seq_len-1} min(i + 1, window)``: causal sliding-window keys per query, summed."""
+    if seq_len <= window:
+        return seq_len * (seq_len + 1) // 2
+    return window * (window + 1) // 2 + (seq_len - window) * window
+
+
+def deepseek_v41_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> float:
+    """Model FLOPs for DeepSeek-V4.1 (CSA2 sparse attention, single-pass mHC, Engram, MoE).
+
+    Accepts ``DeepseekV41TextConfig`` or the multimodal ``DeepseekV41Config`` wrapper (its
+    ``text_config`` is used; the vision tower is not counted, as for other VL entries). The
+    module shapes follow ``nemo_automodel/components/models/deepseek_v41``:
+
+    * attention linears per layer: ``wq_a`` (hidden x q_lora_rank), ``wq_b`` (q_lora_rank x
+      heads*head_dim), ``wkv`` (hidden x head_dim, one shared latent), grouped ``wo_a``
+      (heads*head_dim -> o_groups*o_lora_rank) and ``wo_b`` (o_groups*o_lora_rank x hidden);
+    * compressors on ``kv_source_layer_ids``: ``wkv`` and, for ratio > 1, ``wgate`` (hidden x
+      head_dim each, applied to every token before pooling);
+    * sparse attention BMMs: every query attends to ``min(i+1, sliding_window)`` local keys plus
+      ``min(index_topk, floor((i+1)/ratio))`` selected compressed keys (SWA-only layers have
+      ``compress_ratios[i] == 0``); QK^T and PV each cost ``heads * head_dim`` MACs per key;
+    * the indexer is frozen (``_Indexer.requires_grad_(False)``; hard top-k has no gradient), so
+      its projections and its causal scoring over the compressed positions are counted forward
+      only (2 x MACs) — the implementation scores the full ``[S, S/ratio]`` block before
+      masking, which is executed work but not model work;
+    * MoE per layer: router GEMM (hidden x n_routed_experts) plus ``num_experts_per_tok +
+      n_shared_experts`` experts of ``3 * hidden * moe_intermediate_size``;
+    * single-pass mHC: two coefficient projections per layer (``hc_mult*(hc_mult+2)`` x
+      ``hc_mult*hidden``); the stream collapse/expand are elementwise and not counted;
+    * Engram on ``engram_layer_ids``: the fused key/value projection
+      (``(engram_max_ngram_size-1)*engram_n_heads*engram_head_dim`` x ``hidden*(hc_mult+1)``);
+      the table gather, hashing, norms, RoPE and quantize/dequantize boundaries are not GEMMs;
+    * the FP32 language-model head (hidden x vocab).
+
+    Trainable GEMMs and attention BMMs cost 6 x MACs (forward + backward); activation
+    recomputation is excluded (that is HFU). For the released Flash configuration the formula
+    counts 16.09B active GEMM parameters per token (model card: 16B activated during decode)
+    and 105.6 GFLOPs/token at 4096 tokens, 1.095x the dense-FFN identity ``6 x active``.
+
+    Args:
+        config: ``DeepseekV41TextConfig``, or a ``DeepseekV41Config`` wrapper whose ``text_config`` is used.
+        gbs: Number of sequences per step.
+        seq_len: Tokens per sequence; defaults to ``config.max_position_embeddings``.
+
+    Returns:
+        Model FLOPs for one training step of ``gbs`` sequences of ``seq_len`` tokens.
+    """
+    if hasattr(config, "text_config") and not hasattr(config, "num_hidden_layers"):
+        config = config.text_config
+
+    if seq_len is None:
+        seq_len = getattr(config, "max_position_embeddings", 4096)
+    seq_len = int(seq_len)
+
+    layers = config.num_hidden_layers
+    hs = config.hidden_size
+    vocab_size = config.vocab_size
+    heads = config.num_attention_heads
+    head_dim = config.head_dim
+    q_lora_rank = config.q_lora_rank
+    o_lora_rank = config.o_lora_rank
+    o_groups = config.o_groups
+    window = config.sliding_window
+    compress_ratios = list(config.compress_ratios)
+    kv_source_layer_ids = set(config.kv_source_layer_ids)
+    index_source_layer_ids = set(config.index_source_layer_ids)
+    index_n_heads = config.index_n_heads
+    index_head_dim = config.index_head_dim
+    index_topk = config.index_topk
+    hc_mult = config.hc_mult
+    moe_inter = config.moe_intermediate_size
+    n_routed = config.n_routed_experts
+    topk = config.num_experts_per_tok
+    n_shared = config.n_shared_experts
+    engram_layers = [lid for lid in config.engram_layer_ids if lid < layers]
+    engram_hash_heads = (config.engram_max_ngram_size - 1) * config.engram_n_heads
+    engram_head_dim = config.engram_head_dim
+
+    # --- trainable GEMM MACs per token (6x) ---
+    attn_linear = (
+        hs * q_lora_rank
+        + q_lora_rank * heads * head_dim
+        + hs * head_dim
+        + heads * head_dim * o_lora_rank  # grouped wo_a: (heads*head_dim/o_groups) x o_lora_rank per group
+        + o_groups * o_lora_rank * hs
+    )
+    compressor = sum(
+        hs * head_dim * (2 if compress_ratios[lid] > 1 else 1) for lid in kv_source_layer_ids if lid < layers
+    )
+    experts = (topk + n_shared) * 3 * hs * moe_inter
+    router = hs * n_routed
+    mhc = 2 * (hc_mult * (hc_mult + 2)) * hc_mult * hs
+    engram = len(engram_layers) * engram_hash_heads * engram_head_dim * hs * (hc_mult + 1)
+    lm_head = hs * vocab_size
+    trainable_macs_per_token = layers * (attn_linear + experts + router + mhc) + compressor + engram + lm_head
+    trainable_flops = 6 * gbs * seq_len * trainable_macs_per_token
+
+    # --- sparse attention BMMs (6x), summed over query positions ---
+    bmm_macs = 0
+    for lid in range(layers):
+        ratio = compress_ratios[lid]
+        keys = _sum_min_window(seq_len, window)
+        if ratio:
+            keys += _sum_min_floor_div(seq_len, ratio, index_topk)
+        bmm_macs += 2 * heads * head_dim * keys  # QK^T and PV
+    attention_flops = 6 * gbs * bmm_macs
+
+    # --- frozen indexer: forward only (2x) ---
+    indexer_macs = 0
+    for lid in index_source_layer_ids:
+        if lid >= layers:
+            continue
+        ratio = compress_ratios[lid]
+        indexer_macs += seq_len * (q_lora_rank * index_n_heads * index_head_dim + hs * index_n_heads)
+        if lid in kv_source_layer_ids:
+            indexer_macs += (seq_len // ratio) * head_dim * index_head_dim  # wk on compressed tokens
+        indexer_macs += index_n_heads * index_head_dim * _sum_min_floor_div(seq_len, ratio, None)
+    indexer_flops = 2 * gbs * indexer_macs
+
+    return float(trainable_flops + attention_flops + indexer_flops)
+
+
 def step3_5_flash_flops(config, gbs=1, seq_len=None):
     """Model FLOPs for Step3.5-Flash (GQA + sliding-window / full attention + MoE).
 
@@ -1744,6 +1885,9 @@ def get_flops_formula_for_hf_config(config: Any) -> Callable | None:
         "ElectraConfig": bert_flops,
         # DeepSeek V3 / V3.2
         "DeepseekV3Config": deepseekv3_flops,
+        # DeepSeek V4.1 (CSA2 sparse attention + single-pass mHC + Engram + MoE; wrapper uses text_config)
+        "DeepseekV41Config": deepseek_v41_flops,
+        "DeepseekV41TextConfig": deepseek_v41_flops,
         # GPT-OSS
         "GptOssConfig": gpt_oss_flops,
         # GLM family
