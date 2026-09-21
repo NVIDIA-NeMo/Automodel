@@ -63,18 +63,6 @@ def test_modular_pipeline_loads_selected_local_weights(tiny_model, tmp_path, leg
         torch.testing.assert_close(value, pipe.transformer.state_dict()[name], rtol=0, atol=0)
 
 
-def test_supported_standard_pipeline_keeps_existing_loader(tmp_path):
-    """A modular index does not change loading of supported standard pipelines."""
-    from nemo_automodel.components.models.wan_animate2.loading import load_pipeline
-
-    (tmp_path / "modular_model_index.json").write_text("{}")
-    (tmp_path / "model_index.json").write_text(json.dumps({"_class_name": "WanPipeline"}))
-    with patch("nemo_automodel._diffusers.auto_diffusion_pipeline.DiffusionPipeline.from_pretrained") as loader:
-        pipe = load_pipeline(str(tmp_path), (), torch_dtype=torch.float32, components_to_load=None)
-    assert pipe is loader.return_value
-    loader.assert_called_once_with(str(tmp_path), torch_dtype=torch.float32)
-
-
 @pytest.mark.parametrize("model_type", [None, "flux", "wan", "ltx2", "unregistered"])
 def test_other_models_keep_standard_loader_arguments_and_iterable(tmp_path, model_type):
     """Other models do not inspect modular indices or consume component iterables early."""

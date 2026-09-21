@@ -253,7 +253,7 @@ def test_prepare_inputs_rejects_driving_latents_with_a_foreign_frame_count() -> 
     """A driving clip of another length silently mis-sizes the upstream block mask.
 
     ``create_mask`` derives the flex-attention query span from the *driving*
-    frame count while ``forward_gen`` embeds ``target_latent_frames + 1`` frames.
+    frame count while the generation pass embeds ``target_latent_frames + 1`` frames.
     A mismatch must be rejected here rather than produce a ``seq_len`` that
     disagrees with the block mask.
     """
