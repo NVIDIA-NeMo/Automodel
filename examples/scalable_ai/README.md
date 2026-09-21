@@ -26,6 +26,7 @@ compression, no indexer); both ship a training recipe in their `training/` folde
 | `profile_layer.py` | per-layer fwd+bwd profiling (attention SWA/CSA/HCA, MoE, block, RMSNorm, mHC mixer), Automodel vs transformers |
 | `nsys_profiles/` | the nsys commands behind the lecture's profiles and a script to regenerate them |
 | `run_bench.sh` | 8-GPU benchmark runner behind the reference tables below; `run_bench.sh journey` is the stage-by-stage comparison on the 4-layer model |
+| `pretrain.sh`, `prepare_fineweb.py`, `finite_nanogpt.py` | the 8-GPU pre-training run: FineWeb-edu tokenisation into NanogptDataset shards, bounded validation dataset, container launcher with auto-resume and Weights & Biases logging |
 
 ## Quick start
 
@@ -43,8 +44,8 @@ python examples/scalable_ai/profile_layer.py --layer attn --compress-ratio 4 --n
 python examples/scalable_ai/profile_layer.py --layer attn --compress-ratio 4 --backend-attn tilelang --no-nsys   # Hopper
 python examples/scalable_ai/profile_layer.py --layer attn --compress-ratio 0 --use-hf --no-nsys
 
-# Pre-training (replace the data paths in the yaml first)
-automodel examples/scalable_ai/configs/pretrain_moonlight_v4_16b.yaml --nproc-per-node 8
+# Pre-training on 8 GPUs (inside the container: tokenises FineWeb-edu on first use, resumes from the latest checkpoint)
+bash examples/scalable_ai/pretrain.sh                    # or: automodel examples/scalable_ai/configs/pretrain_moonlight_v4_16b.yaml --nproc-per-node 8
 ```
 
 ## What the profiles show
@@ -142,6 +143,36 @@ Rerun the stage when that happens; the cause was not investigated here.
 Operational notes for containers: put `TILELANG_CACHE_DIR`, `TRITON_CACHE_DIR` and `TORCHINDUCTOR_CACHE_DIR` on a
 writable filesystem (`run_bench.sh` does); when tilelang cannot create its cache directory its import fails and
 Automodel silently falls back to the transformers model class, which then rejects the `backend` argument.
+
+## Pre-training run (700 steps on 8x H100, 2026-09-20)
+
+`pretrain.sh` trains Moonlight-V4-16B-A3B from scratch with `configs/pretrain_moonlight_v4_16b.yaml`: FineWeb-edu
+(sample-10BT, two parquet files, 568.6M tokens with the Moonshot tokenizer, tokenised on the node in 148 s by
+`prepare_fineweb.py`), sequence 2048, global batch 256 sequences (524k tokens per step), micro-batch 1, TileLang
+attention kernels + DeepEP, FSDP2 with data parallel 8 and expert parallel 8, AdamW at 4.2e-4 with 100 warm-up steps
+and cosine decay to 4.2e-5 over 700 steps (367M tokens). One Slurm job on the `batch` partition (4 h limit) in the
+26.08 container; the recipe wrote a 95 GB checkpoint every 200 steps (about 20 s each, two kept) and validated on a
+held-out 8M-token shard every 100 steps.
+
+| step | train loss | validation loss | learning rate |
+| ---: | ---: | ---: | ---: |
+| 0 | 12.50 | - | 4.6e-5 |
+| 100 | 5.83 | 5.85 | 4.2e-4 |
+| 200 | 4.78 | 4.85 | 3.9e-4 |
+| 300 | 4.43 | 4.40 | 3.3e-4 |
+| 400 | 4.07 | 4.08 | 2.3e-4 |
+| 500 | 3.89 | 3.90 | 1.4e-4 |
+| 600 | 3.78 | 3.82 | 6.7e-5 |
+| 700 | 3.78 | 3.79 | 4.2e-5 |
+
+Throughput was 19 s per step, 27.3k tokens/s averaged over steps 100-699 (about 5.8% MFU by the `deepseekv4_flops`
+formula), with 50 GB peak memory per GPU; the whole job took 3 h 51 min. Micro-batch 2 reaches 69 GB in step 0
+and runs out of memory in step 1, when the Adam states are allocated, so micro-batch 1 is the ceiling for this
+recipe on 80 GB GPUs. Automodel warns that AdamW on bf16 parameters keeps bf16 optimizer states; that is fine for
+this demonstration but not how one would run a real pre-training. Weights & Biases logging follows the credentials:
+with `WANDB_API_KEY` or a netrc the run is live, otherwise the run is written offline under `$WORK/logs/wandb` and
+uploaded later with `wandb sync <offline-run-dir>` (this run was offline); per-step metrics are also in
+`checkpoints/moonlight_v4_16b/training.jsonl` and `validation.jsonl`.
 
 ## Changes from the January 2026 edition
 
