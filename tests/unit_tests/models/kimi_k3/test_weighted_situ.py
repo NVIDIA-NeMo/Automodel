@@ -15,10 +15,6 @@
 import pytest
 import torch
 
-# The GPU tests torch.compile their cores on first use; the unit-test conftest's 5 s fallback
-# timeout is for CPU-only tests.
-pytestmark = pytest.mark.timeout(600)
-
 import nemo_automodel.components.models.kimi_k3.situ as kimi_k3_model
 from nemo_automodel.components.models.kimi_k3.situ import (
     _SITU_CHUNK_THRESHOLD,
@@ -389,6 +385,11 @@ def test_dense_situ_core_matches_module_math(dtype, linear_beta):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="compiled execution needs a GPU and inductor")
+@pytest.mark.runtime_budget(
+    60,
+    hard_timeout=300,
+    reason="torch.compile of the SiTU cores on first use.",
+)
 def test_compiled_execution_matches_eager_on_gpu(restore_situ_state):
     kimi_k3_model._SITU_CORES_COMPILED = False
     _compile_situ_cores()

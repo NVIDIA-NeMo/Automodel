@@ -31,10 +31,6 @@ from nemo_automodel.components.models.kimi_k3.situ import (
     _enable_attn_res_triton,
 )
 
-# The GPU tests compile and autotune the Triton kernels on first use; the unit-test conftest's 5 s
-# fallback timeout is for CPU-only tests.
-pytestmark = pytest.mark.timeout(600)
-
 needs_gpu_triton = pytest.mark.skipif(
     not (torch.cuda.is_available() and HAVE_TRITON), reason="Triton attn-res kernels need a GPU and Triton"
 )
@@ -101,6 +97,11 @@ def test_enable_sets_flag_once(monkeypatch):
     "tokens,blocks,hidden",
     [(64, 3, 128), (37, 8, 200), (5, 0, 32), (130, 1, 7168), (16, 16, 96)],
 )
+@pytest.mark.runtime_budget(
+    60,
+    hard_timeout=300,
+    reason="Compiles and autotunes the Triton attention-residual kernels on a cold cache (up to 9.5 s measured on GB200).",
+)
 def test_fp32_forward_and_grads_match_reference(tokens, blocks, hidden):
     """fp32 in/out: the kernels reproduce the eager chain to fp32 accumulation-order noise."""
     ps, br, nw, pw = _inputs(tokens, blocks, hidden, torch.float32, "cuda")
@@ -125,6 +126,11 @@ def test_fp32_forward_and_grads_match_reference(tokens, blocks, hidden):
 
 @needs_gpu_triton
 @pytest.mark.parametrize("tokens,blocks,hidden", [(64, 3, 128), (37, 8, 7168), (9, 1, 64)])
+@pytest.mark.runtime_budget(
+    60,
+    hard_timeout=300,
+    reason="Compiles and autotunes the Triton attention-residual kernels on a cold cache (up to 9.5 s measured on GB200).",
+)
 def test_bf16_forward_within_one_ulp_and_grads_close(tokens, blocks, hidden):
     """bf16 in/out (the training dtype): forward within one bf16 ulp of the eager chain, grads close."""
     ps, br, nw, pw = _inputs(tokens, blocks, hidden, torch.bfloat16, "cuda")
@@ -149,6 +155,11 @@ def test_bf16_forward_within_one_ulp_and_grads_close(tokens, blocks, hidden):
 
 
 @needs_gpu_triton
+@pytest.mark.runtime_budget(
+    60,
+    hard_timeout=300,
+    reason="Compiles and autotunes the Triton attention-residual kernels on a cold cache (up to 9.5 s measured on GB200).",
+)
 def test_raw_kernels_accept_strided_entries_and_reject_bad_shapes():
     ps, br, nw, pw = _inputs(12, 4, 64, torch.float32, "cuda")
     ps_d, br_d, nw_d, pw_d = (t.detach() for t in (ps, br, nw, pw))
@@ -174,6 +185,11 @@ def test_raw_kernels_accept_strided_entries_and_reject_bad_shapes():
 
 
 @needs_gpu_triton
+@pytest.mark.runtime_budget(
+    60,
+    hard_timeout=300,
+    reason="Compiles and autotunes the Triton attention-residual kernels on a cold cache (up to 9.5 s measured on GB200).",
+)
 def test_apply_attn_res_routes_to_triton_when_enabled(triton_enabled, monkeypatch):
     """_apply_attn_res takes the Triton path for CUDA inputs and matches the eager chain."""
     hidden = 96

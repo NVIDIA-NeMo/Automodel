@@ -28,10 +28,6 @@ from nemo_automodel.components.models.kimi_k3.situ_triton import HAVE_TRITON, si
 BETA = 4.0
 LINEAR_BETA = 25.0
 
-# The GPU tests compile and autotune the Triton kernels on first use; the unit-test conftest's 5 s
-# fallback timeout is for CPU-only tests.
-pytestmark = pytest.mark.timeout(600)
-
 needs_gpu_triton = pytest.mark.skipif(
     not (torch.cuda.is_available() and HAVE_TRITON), reason="Triton SiTU kernels need a GPU and Triton"
 )
@@ -95,6 +91,11 @@ def test_enable_sets_flag_once(monkeypatch):
 @pytest.mark.parametrize("linear_beta", [None, LINEAR_BETA])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("rows,half", [(1, 8), (37, 100), (4099, 3072)])
+@pytest.mark.runtime_budget(
+    60,
+    hard_timeout=300,
+    reason="Compiles and autotunes the Triton SiTU kernels on a cold cache (up to 5.6 s measured on GB200).",
+)
 def test_weighted_forward_matches_eager(dtype, linear_beta, rows, half):
     torch.manual_seed(rows + half)
     gate_up = torch.randn(rows, 2 * half, dtype=dtype, device="cuda") * 3
@@ -108,6 +109,11 @@ def test_weighted_forward_matches_eager(dtype, linear_beta, rows, half):
 @needs_gpu_triton
 @pytest.mark.parametrize("linear_beta", [None, LINEAR_BETA])
 @pytest.mark.parametrize("rows,half", [(1, 8), (37, 100), (4099, 3072)])
+@pytest.mark.runtime_budget(
+    60,
+    hard_timeout=300,
+    reason="Compiles and autotunes the Triton SiTU kernels on a cold cache (up to 5.6 s measured on GB200).",
+)
 def test_weighted_backward_matches_autograd(linear_beta, rows, half):
     torch.manual_seed(100 + rows)
     gate_up = torch.randn(rows, 2 * half, dtype=torch.float32, device="cuda") * 3
@@ -125,6 +131,11 @@ def test_weighted_backward_matches_autograd(linear_beta, rows, half):
 
 
 @needs_gpu_triton
+@pytest.mark.runtime_budget(
+    60,
+    hard_timeout=300,
+    reason="Compiles and autotunes the Triton SiTU kernels on a cold cache (up to 5.6 s measured on GB200).",
+)
 def test_bf16_backward_matches_eager_chunked_function():
     torch.manual_seed(7)
     gate_up = torch.randn(2048, 128, dtype=torch.bfloat16, device="cuda") * 3
@@ -140,6 +151,11 @@ def test_bf16_backward_matches_eager_chunked_function():
 
 @needs_gpu_triton
 @pytest.mark.parametrize("linear_beta", [None, LINEAR_BETA])
+@pytest.mark.runtime_budget(
+    60,
+    hard_timeout=300,
+    reason="Compiles and autotunes the Triton SiTU kernels on a cold cache (up to 5.6 s measured on GB200).",
+)
 def test_dense_kernels_match_core(linear_beta):
     torch.manual_seed(9)
     x = torch.randn(3, 517, 2 * 96, dtype=torch.bfloat16, device="cuda") * 3
@@ -155,6 +171,11 @@ def test_dense_kernels_match_core(linear_beta):
 
 
 @needs_gpu_triton
+@pytest.mark.runtime_budget(
+    60,
+    hard_timeout=300,
+    reason="Compiles and autotunes the Triton SiTU kernels on a cold cache (up to 5.6 s measured on GB200).",
+)
 def test_zero_rows_and_noncontiguous_grad():
     empty = torch.empty(0, 64, dtype=torch.bfloat16, device="cuda")
     rw0 = torch.empty(0, 1, dtype=torch.float32, device="cuda")
@@ -177,6 +198,11 @@ def test_zero_rows_and_noncontiguous_grad():
 
 
 @needs_gpu_triton
+@pytest.mark.runtime_budget(
+    60,
+    hard_timeout=300,
+    reason="Compiles and autotunes the Triton SiTU kernels on a cold cache (up to 5.6 s measured on GB200).",
+)
 def test_function_and_dense_entry_route_through_triton(triton_enabled, monkeypatch):
     calls = {"fwd": 0, "bwd": 0}
     real_fwd, real_bwd = situ_mod.situ_fwd_triton, situ_mod.situ_bwd_triton

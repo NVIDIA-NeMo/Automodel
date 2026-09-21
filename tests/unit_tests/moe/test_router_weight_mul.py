@@ -15,10 +15,6 @@
 import pytest
 import torch
 
-# The GPU tests torch.compile their cores on first use; the unit-test conftest's 5 s fallback
-# timeout is for CPU-only tests.
-pytestmark = pytest.mark.timeout(600)
-
 import nemo_automodel.components.moe.experts as _experts_unused  # noqa: F401
 import nemo_automodel.components.moe.optimized_ops as experts_mod
 from nemo_automodel.components.moe.optimized_ops import (
@@ -342,6 +338,11 @@ def test_backend_flag_defaults_false_and_wires_expert_modules(restore_rw_cores, 
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="compiled execution needs a GPU and inductor")
+@pytest.mark.runtime_budget(
+    60,
+    hard_timeout=300,
+    reason="torch.compile of the router-weight cores on first use.",
+)
 def test_compiled_execution_matches_eager_on_gpu(restore_rw_cores):
     experts_mod._RW_CORES_COMPILED = False
     _compile_router_weight_cores()
