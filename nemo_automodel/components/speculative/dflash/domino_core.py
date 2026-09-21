@@ -131,6 +131,8 @@ class DominoTrainerModule(DFlashTrainerModule):
         num_anchors: int = 512,
         loss_decay_gamma: float | None = None,
         shift_label: bool = False,
+        *,
+        max_total_anchors: int | None = None,
     ):
         super().__init__(
             draft_model=draft_model,
@@ -141,6 +143,7 @@ class DominoTrainerModule(DFlashTrainerModule):
             attention_backend=attention_backend,
             num_anchors=num_anchors,
             loss_decay_gamma=loss_decay_gamma,
+            max_total_anchors=max_total_anchors,
         )
         if getattr(draft_model, "projector_type", None) != "domino":
             raise ValueError(

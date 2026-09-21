@@ -113,9 +113,13 @@ def test_build_dflash_config_stamps_causal():
 
 def test_build_trainer_module_is_jetspec():
     recipe = _jetspec_recipe()
-    module = recipe._build_trainer_module("sdpa", {"num_anchors": 7, "kd_temperature": 2.0, "kd_chunk_size": 64})
+    module = recipe._build_trainer_module(
+        "sdpa",
+        {"num_anchors": 7, "max_total_anchors": 11, "kd_temperature": 2.0, "kd_chunk_size": 64},
+    )
     assert isinstance(module, JetSpecTrainerModule)
     assert module.num_anchors == 7
+    assert module.max_total_anchors == 11
     assert module.kd_temperature == 2.0
     assert module.kd_chunk_size == 64
 

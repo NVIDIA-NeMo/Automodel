@@ -71,12 +71,37 @@ def resolve_text_config(config: Any) -> Any:
     return getattr(config, "text_config", None) or config
 
 
+def resolve_transformer_layers(model: nn.Module) -> list[nn.Module]:
+    """Return decoder blocks as an ordered, integer-indexable list.
+
+    Args:
+        model: Target language model containing a supported decoder stack.
+
+    Returns:
+        Decoder blocks in forward order.
+
+    Raises:
+        ValueError: If the decoder stack cannot be located.
+    """
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        container = model.model.layers
+    elif hasattr(model, "layers"):
+        container = model.layers
+    elif hasattr(model, "transformer") and hasattr(model.transformer, "h"):
+        container = model.transformer.h
+    else:
+        raise ValueError("Unsupported model structure for DFlash hidden-state capture")
+    if isinstance(container, nn.ModuleDict):
+        return [container[str(i)] for i in range(len(container))]
+    return list(container)
+
+
 class HFDFlashTargetModel:
     """Capture a set of decoder-layer hidden states from a frozen HF causal LM.
 
-    A forward hook on decoder layer ``i`` captures that layer's output, which in
-    HuggingFace's ``output_hidden_states`` convention is ``hidden_states[i + 1]``
-    -- matching SpecForge's ``extract_context_feature`` (offset 1).
+    A forward hook on decoder block ``i`` captures that block's raw residual
+    output. This is the pre-final-norm feature: a separate model-level final
+    normalization, when present, is intentionally excluded.
     """
 
     def __init__(
@@ -126,17 +151,7 @@ class HFDFlashTargetModel:
 
     def _get_transformer_layers(self) -> list[nn.Module]:
         """Return decoder layers as an ordered, integer-indexable list."""
-        if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
-            container = self.model.model.layers
-        elif hasattr(self.model, "layers"):
-            container = self.model.layers
-        elif hasattr(self.model, "transformer") and hasattr(self.model.transformer, "h"):
-            container = self.model.transformer.h
-        else:
-            raise ValueError("Unsupported model structure for DFlash hidden-state capture")
-        if isinstance(container, nn.ModuleDict):
-            return [container[str(i)] for i in range(len(container))]
-        return list(container)
+        return resolve_transformer_layers(self.model)
 
     def get_input_embeddings(self) -> nn.Embedding:
         """Return the target model input embeddings."""

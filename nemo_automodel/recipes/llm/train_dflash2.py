@@ -73,6 +73,7 @@ class TrainDFlash2Recipe(TrainDFlashRecipe):
                 "loss_type is only supported by the DFlash recipe; the DFlash 2 trainer teacher-forces the "
                 "selector's predecessor from the fixed-anchor block layout and would silently ignore it."
             )
+        self.selector_loss_weight = float(recipe_cfg.get("selector_loss_weight", 1.0))
         return DFlash2TrainerModule(
             draft_model=self.draft_model,
             target_lm_head=self.target_model.get_output_embeddings(),
@@ -81,11 +82,14 @@ class TrainDFlash2Recipe(TrainDFlashRecipe):
             block_size=self.block_size,
             attention_backend=attention_backend,
             num_anchors=int(recipe_cfg.get("num_anchors", 512)),
+            max_total_anchors=(
+                int(recipe_cfg["max_total_anchors"]) if recipe_cfg.get("max_total_anchors", None) is not None else None
+            ),
             # Paper default (Appendix A.1) for the shipped block_size=16 configs;
             # matches DFlashDecayLoss's own default. Set null explicitly in YAML
             # to disable the position decay (uniform weighting).
             loss_decay_gamma=recipe_cfg.get("loss_decay_gamma", 7.0),
-            selector_loss_weight=float(recipe_cfg.get("selector_loss_weight", 1.0)),
+            selector_loss_weight=self.selector_loss_weight,
             sliding_window=self.draft_sliding_window,
         )
 
@@ -99,6 +103,21 @@ class TrainDFlash2Recipe(TrainDFlashRecipe):
         metrics = super()._run_trainer_step(target_batch)
         self._last_dflash2_metrics = metrics
         return metrics
+
+    def _loss_terms(self, metrics) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
+        """Normalize backbone and selector losses over their own valid sets."""
+        weighted_selector_loss = self.selector_loss_weight * metrics.selector_loss
+        return (
+            (metrics.base_loss, metrics.loss_weight),
+            (weighted_selector_loss, metrics.selector_loss_denominator),
+        )
+
+    def _run_eval(self):
+        """Report the composite validation loss with per-term denominators."""
+        result = super()._run_eval()
+        if result is not None:
+            result["val_loss"] = result["val_base_loss"] + self.selector_loss_weight * result["val_selector_loss"]
+        return result
 
     def _log_extra_train_metrics(self, epoch_idx: int) -> None:
         """Log the DFlash 2 diagnostics for the most recent step (rank-0 local)."""
@@ -143,11 +162,15 @@ class TrainDFlash2Recipe(TrainDFlashRecipe):
         The shared validation loop SUM-reduces each pair before division.
         """
         loss_weight = metrics.loss_weight.detach()
+        selector_loss_denominator = metrics.selector_loss_denominator.detach()
         valid_tokens = metrics.valid_tokens.detach()
         valid_blocks = metrics.valid_blocks.detach()
         return {
             "val_base_loss": (metrics.base_loss.detach() * loss_weight, loss_weight),
-            "val_selector_loss": (metrics.selector_loss.detach() * loss_weight, loss_weight),
+            "val_selector_loss": (
+                metrics.selector_loss.detach() * selector_loss_denominator,
+                selector_loss_denominator,
+            ),
             "val_base_accuracy": (metrics.base_correct_tokens.detach(), valid_tokens),
             "val_base_accept_len": (metrics.base_accept_len_sum.detach(), valid_blocks),
             "val_candidate_recall": (metrics.candidate_recall.detach() * valid_tokens, valid_tokens),

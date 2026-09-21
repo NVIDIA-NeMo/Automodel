@@ -818,7 +818,24 @@ class DFlashDecayLoss(nn.Module):
         draft_correct_per_pos: torch.Tensor | None = None,
         draft_count_per_pos: torch.Tensor | None = None,
     ) -> DLLMLossOutput:
-        """Apply decay weights + block mask, sum, and normalise."""
+        """Apply decay weights and the block mask, then normalize the loss.
+
+        Args:
+            token_nll: Tensor of shape ``[batch, tokens]`` containing per-token
+                negative log-likelihood values.
+            block_mask: Tensor of shape ``[batch, tokens]`` containing valid-token
+                indicators.
+            num_tokens: Optional global token-count denominator.
+            block_size: Optional size of each draft block, including its anchor.
+            draft_correct_per_pos: Optional tensor of shape ``[block_size - 1]``
+                containing correct-prediction counts by draft depth.
+            draft_count_per_pos: Optional tensor of shape ``[block_size - 1]``
+                containing valid-token counts by draft depth.
+
+        Returns:
+            DLLMLossOutput containing scalar loss tensors and optional per-depth
+            count tensors.
+        """
         _, T = token_nll.shape
         w = self._decay_weights(T, block_size, token_nll.device, token_nll.dtype)
         weights = w.unsqueeze(0) * block_mask.to(token_nll.dtype)  # [B, T]
@@ -911,11 +928,86 @@ class DFlashDecayLoss(nn.Module):
         Wrapped in :func:`torch.utils.checkpoint` by the caller, so the
         ``[chunk, vocab]`` logits are recomputed in backward rather than held.
         The argmax is non-differentiable, so it adds no backward cost.
+
+        Args:
+            hidden_chunk: Tensor of shape ``[positions, hidden]``.
+            lm_head_weight: Tensor of shape ``[vocab, hidden]``.
+            lm_head_bias: Optional tensor of shape ``[vocab]``.
+            target_chunk: Long tensor of shape ``[positions]``.
+
+        Returns:
+            Tuple containing per-token NLL and boolean argmax correctness tensors,
+            each of shape ``[positions]``.
         """
         logits = F.linear(hidden_chunk, lm_head_weight, lm_head_bias)  # [chunk, V]
         nll = F.cross_entropy(logits.float(), target_chunk, reduction="none")  # [chunk]
         correct = logits.argmax(dim=-1) == target_chunk  # [chunk]
         return nll, correct
+
+    def forward_fused_with_correct(
+        self,
+        hidden: torch.Tensor,
+        lm_head_weight: torch.Tensor,
+        target_ids: torch.Tensor,
+        block_mask: torch.Tensor,
+        num_tokens: int | None = None,
+        block_size: int | None = None,
+        lm_head_bias: torch.Tensor | None = None,
+    ) -> tuple[DLLMLossOutput, torch.Tensor]:
+        """Compute chunked linear-CE and retain per-token correctness.
+
+        This is the detailed variant used by DFlash trainers that need acceptance
+        metrics. :meth:`forward_fused` preserves the historical four-field
+        :class:`DLLMLossOutput` contract by discarding the detailed correctness
+        tensor.
+
+        Args:
+            hidden: Tensor of shape ``[batch, tokens, hidden]`` containing draft
+                hidden states.
+            lm_head_weight: Plain local tensor of shape ``[vocab, hidden]``. Any
+                distributed weight must be materialized by the caller before this
+                method so the position-chunk loop contains no collectives.
+            target_ids: Long tensor of shape ``[batch, tokens]``.
+            block_mask: Tensor of shape ``[batch, tokens]`` containing valid-token
+                indicators.
+            num_tokens: Optional global token-count denominator.
+            block_size: Optional size of each draft block, including its anchor.
+            lm_head_bias: Optional plain local tensor of shape ``[vocab]``.
+
+        Returns:
+            Tuple containing a DLLMLossOutput and a boolean correctness tensor of
+            shape ``[batch, tokens]``.
+        """
+        B, T, D = hidden.shape
+        flat_hidden = hidden.reshape(-1, D)  # [B*T, D]
+        flat_target = target_ids.reshape(-1)  # [B*T]
+
+        nll_parts = []
+        correct_parts = []
+        for start in range(0, flat_hidden.size(0), self.chunk_size):
+            end = start + self.chunk_size
+            nll_chunk, correct_chunk = torch.utils.checkpoint.checkpoint(
+                self._chunk_nll,
+                flat_hidden[start:end],
+                lm_head_weight,
+                lm_head_bias,
+                flat_target[start:end],
+                use_reentrant=False,
+            )
+            nll_parts.append(nll_chunk)
+            correct_parts.append(correct_chunk)
+        token_nll = torch.cat(nll_parts).reshape(B, T)
+        correct = torch.cat(correct_parts).reshape(B, T)
+        c_per_pos, n_per_pos = self._draft_acc_per_pos(correct, block_mask, block_size)
+        output = self._reduce(
+            token_nll,
+            block_mask,
+            num_tokens,
+            block_size,
+            draft_correct_per_pos=c_per_pos,
+            draft_count_per_pos=n_per_pos,
+        )
+        return output, correct
 
     def forward_fused(
         self,
@@ -948,35 +1040,16 @@ class DFlashDecayLoss(nn.Module):
         Returns:
             :class:`DLLMLossOutput`.
         """
-        B, T, D = hidden.shape
-        flat_hidden = hidden.reshape(-1, D)  # [B*T, D]
-        flat_target = target_ids.reshape(-1)  # [B*T]
-
-        nll_parts = []
-        correct_parts = []
-        for start in range(0, flat_hidden.size(0), self.chunk_size):
-            end = start + self.chunk_size
-            nll_chunk, correct_chunk = torch.utils.checkpoint.checkpoint(
-                self._chunk_nll,
-                flat_hidden[start:end],
-                lm_head_weight,
-                lm_head_bias,
-                flat_target[start:end],
-                use_reentrant=False,
-            )
-            nll_parts.append(nll_chunk)
-            correct_parts.append(correct_chunk)
-        token_nll = torch.cat(nll_parts).reshape(B, T)
-        correct = torch.cat(correct_parts).reshape(B, T)
-        c_per_pos, n_per_pos = self._draft_acc_per_pos(correct, block_mask, block_size)
-        return self._reduce(
-            token_nll,
+        output, _ = self.forward_fused_with_correct(
+            hidden,
+            lm_head_weight,
+            target_ids,
             block_mask,
-            num_tokens,
-            block_size,
-            draft_correct_per_pos=c_per_pos,
-            draft_count_per_pos=n_per_pos,
+            num_tokens=num_tokens,
+            block_size=block_size,
+            lm_head_bias=lm_head_bias,
         )
+        return output
 
 
 class IDLMLoss(nn.Module):
