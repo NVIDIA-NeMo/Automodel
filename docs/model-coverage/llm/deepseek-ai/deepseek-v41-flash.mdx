@@ -57,6 +57,18 @@ The model and recipe use `attn: tilelang`, `linear: torch`,
 Set `model.backend.rms_norm: te` to use Transformer Engine RMSNorm for the
 text backbone, attention projections, compressor, and indexer. This preserves
 parameter names and dtypes; the default retains eager FP32 normalization.
+Set `model.config.text_config.hc_impl: compile` to run the single-pass mHC
+coefficient projection, stream collapse and stream expand through
+`torch.compile` (one fused kernel each instead of four to five FP32 passes;
+the eager `expand` materializes a `[batch, sequence, streams, streams, hidden]`
+FP32 temporary), and `model.backend.compile_norm: true` to compile the FP32
+RMSNorm chain the same way. Both are opt-in: compiled numerics are allclose to
+eager, not bitwise-identical (the 12-layer mini benchmark reproduced the eager
+loss to four decimals). The cores are specialized per shape: a new sequence
+length (or grad mode) compiles them again, so keep them off for runs with many
+distinct packed lengths.
+The Sinkhorn normalization keeps its TileKernels or torch backend. Like every
+config field, `hc_impl` is saved into `config.json` by `save_pretrained`.
 TileLang and TileKernels are the optional dependencies also used by DeepSeek V4.
 HybridEP provides both token dispatch and expert-output combine. Router
 correction biases remain fixed during fine-tuning through
