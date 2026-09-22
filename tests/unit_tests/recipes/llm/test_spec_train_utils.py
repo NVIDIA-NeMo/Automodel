@@ -182,6 +182,22 @@ def test_draft_activation_checkpointing_false_is_noop():
     assert draft.layers[0].self_attn is original_attention
 
 
+@pytest.mark.parametrize("spelling", ["off", "none", "disabled", "no", "OFF"])
+def test_draft_activation_checkpointing_disabled_spellings_are_noop(spelling):
+    """Must recognize the same disabled spellings ``_normalize_activation_checkpointing``
+    does for the target, or ``distributed: {activation_checkpointing: off}`` leaves the
+    target uncheckpointed while fully checkpointing the draft."""
+    draft = _Draft()
+    original_attention = draft.layers[0].self_attn
+    apply_draft_activation_checkpointing(draft, spelling)
+    assert draft.layers[0].self_attn is original_attention
+
+
+def test_draft_activation_checkpointing_rejects_an_unrecognized_string():
+    with pytest.raises(ValueError, match="activation_checkpointing"):
+        apply_draft_activation_checkpointing(_Draft(), "sometimes")
+
+
 def test_draft_activation_checkpointing_warns_when_draft_has_no_layers():
     draft = torch.nn.Module()
     # Must not raise -- a draft with an unexpected shape should be a loud warning,

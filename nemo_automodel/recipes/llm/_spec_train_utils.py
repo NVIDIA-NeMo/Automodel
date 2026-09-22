@@ -36,6 +36,7 @@ from nemo_automodel.components.distributed.activation_checkpointing import (
 )
 from nemo_automodel.components.quantization.fp8 import apply_fp8_to_model, build_fp8_config
 from nemo_automodel.components.utils.compile_utils import build_compile_config, compile_module_inplace
+from nemo_automodel.recipes._dist_utils import _normalize_activation_checkpointing
 
 logger = logging.getLogger(__name__)
 
@@ -75,13 +76,17 @@ def apply_draft_compile(draft_model: nn.Module, cfg_compile: Any) -> None:
 def apply_draft_activation_checkpointing(draft_model: nn.Module, mode: bool | str) -> None:
     """Optionally wrap the draft's transformer layers with activation checkpointing, in place.
 
-    ``mode`` is the recipe's top-level ``distributed.activation_checkpointing``
-    YAML value (bool or ``"selective"``); no-op when falsy. These recipes wrap
-    the draft with plain ``DistributedDataParallel`` / ``fully_shard`` instead of
-    the FSDP2Manager/DDPManager path that applies AC automatically, so it must be
-    requested explicitly here, before the draft is wrapped.
+    ``mode`` is the recipe's raw top-level ``distributed.activation_checkpointing``
+    YAML value, normalized with the same ``_normalize_activation_checkpointing``
+    used for the target (so ``"off"``/``"none"``/``"disabled"``/``"no"`` disable the
+    draft too, not just a literal ``false``); no-op once normalized to ``False``.
+    These recipes wrap the draft with plain ``DistributedDataParallel`` /
+    ``fully_shard`` instead of the FSDP2Manager/DDPManager path that applies AC
+    automatically, so it must be requested explicitly here, before the draft is
+    wrapped.
     """
-    if not mode or (isinstance(mode, str) and mode.lower() == "false"):
+    mode = _normalize_activation_checkpointing(mode)
+    if not mode:
         return
     layers = list(getattr(draft_model, "layers", ()))
     if not layers:
