@@ -205,6 +205,23 @@ def _preserve_gate_load_during_recompute(
     return checkpoint_context_fn
 
 
+def _with_model_checkpoint_context(
+    block: nn.Module,
+    context_fn: Callable[[], tuple[AbstractContextManager, AbstractContextManager]] | None,
+) -> Callable[[], tuple[AbstractContextManager, AbstractContextManager]] | None:
+    """Let a block extend its own activation-checkpoint contexts.
+
+    Models that own state which must stay consistent between the checkpoint forward and
+    its recompute (for example a frozen router whose selection is replayed instead of
+    recomputed) expose ``nemo_checkpoint_context_fn(context_fn)`` on the block. The
+    parallelizer stays model-agnostic: it only composes that hook when present.
+    """
+    hook = getattr(block, "nemo_checkpoint_context_fn", None)
+    if not callable(hook):
+        return context_fn
+    return hook(context_fn)
+
+
 def _get_model_moe_config(model: nn.Module):
     """Return the model-level MoE config exposed by custom MoE architectures."""
     candidates = []
@@ -635,10 +652,11 @@ def apply_ac(
                 if bool(getattr(block, "_nemo_disable_activation_checkpointing", False)):
                     logger.info("Skipping activation checkpointing for model-owned eager block %s", layer_id)
                     continue
+                block_context_fn = _preserve_gate_load_during_recompute(block, attention_context_fn)
                 block = ptd_checkpoint_wrapper(
                     block,
                     preserve_rng_state=True,
-                    context_fn=_preserve_gate_load_during_recompute(block, attention_context_fn),
+                    context_fn=_with_model_checkpoint_context(block, block_context_fn),
                 )
                 # Tag so _apply_per_layer_compile compiles the wrapper OUTER (keeping the
                 # selective policy visible to the partitioner) instead of unwrapping and
@@ -743,13 +761,14 @@ def apply_ac(
                 block,
                 preserve_rng_state=True,
                 determinism_check=_register_moe_checkpoint_determinism_check(),
-                context_fn=block_context_fn,
+                context_fn=_with_model_checkpoint_context(block, block_context_fn),
             )
         else:
+            block_context_fn = _preserve_gate_load_during_recompute(block, _with_attention_backend_snapshot())
             block = ptd_checkpoint_wrapper(
                 block,
                 preserve_rng_state=True,
-                context_fn=_preserve_gate_load_during_recompute(block, _with_attention_backend_snapshot()),
+                context_fn=_with_model_checkpoint_context(block, block_context_fn),
             )
 
         parent_layers.register_module(layer_id, block)
