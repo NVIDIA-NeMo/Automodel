@@ -547,6 +547,7 @@ class TestCustomModelGenerationConfig:
 
         assert is_custom is True
         assert model.generation_config.eos_token_id is None
+        _mock_download.assert_not_called()
 
 
 class TestBackendDictCoercion:
@@ -660,12 +661,30 @@ class TestBackendDictCoercion:
         assert model.backend is backend
         apply_overrides.assert_called_once_with(model, backend)
 
+    @patch("nemo_automodel._transformers.model_init.get_hf_config")
     @patch("nemo_automodel._transformers.model_init._download_model_weights")
     @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")
-    def test_process_group_is_forwarded_only_to_weight_download(self, mock_resolve_cls, mock_download):
+    def test_process_group_is_forwarded_only_to_weight_download(
+        self, mock_resolve_cls, mock_download, mock_get_hf_config
+    ):
         process_group = object()
+        captured = {}
 
-        captured = self._run_init_model(mock_resolve_cls, _process_group=process_group)
+        def fake_model_cls(config, **kwargs):
+            captured.update(kwargs)
+            return MagicMock()
+
+        mock_resolve_cls.return_value = fake_model_cls
+        mock_get_hf_config.return_value = self._make_config()
+        _init_model(
+            cls=MagicMock(),
+            pretrained_model_name_or_path_or_config="fake/model",
+            attn_implementation="flash_attention_2",
+            torch_dtype="auto",
+            quantization_config=None,
+            force_hf=False,
+            _process_group=process_group,
+        )
 
         assert "_process_group" not in captured
         assert mock_download.call_args.args[1] == "fake/model"

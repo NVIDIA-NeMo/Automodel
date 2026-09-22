@@ -1300,7 +1300,7 @@ def __init_model(
             )
         else:
             # Download model weights on local rank 0; skip for from_config or local paths
-            if pretrained_model_name_or_path:
+            if is_pretrained_init and pretrained_model_name_or_path:
                 _download_model_weights(hf_config, pretrained_model_name_or_path, process_group=process_group)
             logger.info(f"Using custom model implementation for {architectures[0]}")
             kwargs.pop("trust_remote_code", None)
