@@ -258,7 +258,7 @@ test = [
     "pytest",
     "pytest-shard",
     "pytest-timeout",
-    "peft>=0.19.1",
+    "peft>=0.20.0",
     "ruamel.yaml",
     "onnxruntime-gpu; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
     "sentence-transformers>=5.6.0",
