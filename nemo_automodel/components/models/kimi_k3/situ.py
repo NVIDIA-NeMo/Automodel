@@ -234,7 +234,8 @@ def dense_situ(x: torch.Tensor, beta: float, linear_beta: float | None) -> torch
 
 _SITU_CORES_COMPILED = False
 _SITU_TRITON_ENABLED = False
-# KimiK3TextConfig.situ_fast_math: SFU tanh / exp2 / rcp inside the Triton SiTU kernels (<= 1 bf16 ulp from libdevice).
+# KimiK3TextConfig.situ_backend = "triton_fast_math": SFU tanh / exp2 / rcp inside the Triton SiTU kernels
+# (<= 1 bf16 ulp from libdevice).
 _SITU_FAST_MATH = False
 _ATTN_RES_TRITON_ENABLED = False
 
@@ -308,7 +309,7 @@ class _AttnResTritonFunction(torch.autograd.Function):
 
 
 def _enable_situ_triton(fast_math: bool = False) -> None:
-    """Route the SiTU activation through the hand-written Triton kernels (``KimiK3TextConfig.situ_triton``).
+    """Route SiTU through the hand-written Triton kernels (``situ_backend`` = ``triton`` / ``triton_fast_math``).
 
     Runs once per process. ``_WeightedSiTUFunction`` (row-aligned ``[rows, 1]`` weights on a
     CUDA device) and ``SituAndMul`` then launch ``situ_triton.situ_fwd_triton`` /
@@ -316,7 +317,7 @@ def _enable_situ_triton(fast_math: bool = False) -> None:
     kernels; every other shape keeps its existing path. Without Triton the flag is a no-op
     (the eager or compiled path stays in place). fp32 math and operation order match the
     eager cores; only the routing-weight gradient's fp32 accumulation order differs. ``fast_math``
-    (``KimiK3TextConfig.situ_fast_math``) selects the SFU variants of the kernels; once any layer of the
+    (``situ_backend = "triton_fast_math"``) selects the SFU variants of the kernels; once any layer of the
     process asks for them every SiTU call uses them.
     """
     global _SITU_TRITON_ENABLED, _SITU_FAST_MATH

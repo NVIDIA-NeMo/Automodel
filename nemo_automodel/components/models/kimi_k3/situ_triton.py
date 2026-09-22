@@ -242,7 +242,7 @@ def situ_fwd_triton(
         beta: SiTU beta applied to the gate branch.
         linear_beta: Optional bounded-linear beta applied to the up branch.
         fast_math: SFU ``tanh.approx`` / ``exp2`` / ``rcp.approx`` instead of libdevice tanh and an IEEE divide
-            (``KimiK3TextConfig.situ_fast_math``); at most one bf16 ulp from the exact chain.
+            (``KimiK3TextConfig.situ_backend = "triton_fast_math"``); at most one bf16 ulp from the exact chain.
 
     Returns:
         Tensor of shape [rows, intermediate] in ``gate_up2``'s dtype.

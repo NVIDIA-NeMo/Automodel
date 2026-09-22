@@ -254,11 +254,11 @@ def test_function_and_dense_entry_route_through_triton(triton_enabled, monkeypat
     assert calls["fwd"] >= 3 and calls["bwd"] >= 2
 
 
-def test_fast_math_requires_situ_triton_at_config_time():
-    with pytest.raises(ValueError, match="situ_fast_math"):
-        KimiK3TextConfig(situ_fast_math=True)
-    cfg = KimiK3TextConfig(situ_triton=True, situ_fast_math=True)
-    assert cfg.situ_fast_math is True and KimiK3TextConfig().situ_fast_math is False
+def test_situ_backend_choices_are_validated_at_config_time():
+    assert KimiK3TextConfig().situ_backend == "torch"
+    assert KimiK3TextConfig(situ_backend="triton_fast_math").situ_backend == "triton_fast_math"
+    with pytest.raises(ValueError, match="situ_backend"):
+        KimiK3TextConfig(situ_backend="fast")
 
 
 def test_enable_records_fast_math(monkeypatch):
