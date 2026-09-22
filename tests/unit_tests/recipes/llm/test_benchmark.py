@@ -208,6 +208,7 @@ class TestBenchmarkingRecipeInitialization:
         assert config["model"]["config"]["pretrained_model_name_or_path"] == (
             "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"
         )
+        assert config["ci"]["cluster_tag"] == "gb200"
         assert config["ci"]["env_vars"]["CUDA_VISIBLE_DEVICES"] == "0,1,2,3"
         assert config["step_scheduler"]["local_batch_size"] == 2
 
