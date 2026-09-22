@@ -1,0 +1,123 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Replace the /data paths with two Megatron Core dataset prefixes, then run:
+# uv run automodel examples/llm_pretrain/megatron_pretrain_gpt2_domain_mixture.yaml --nproc-per-node 1
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
+step_scheduler:
+  global_batch_size: 8
+  local_batch_size: 2
+  ckpt_every_steps: 100
+  val_every_steps: 25
+  num_epochs: 1
+  max_steps: 100
+
+dist_env:
+  backend: nccl
+
+seed: 1111
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  config:
+    _target_: transformers.AutoConfig.from_pretrained
+    pretrained_model_name_or_path: openai-community/gpt2
+
+checkpoint:
+  enabled: false
+  checkpoint_dir: checkpoints/domain_mixture
+  best_metric_key: weighted
+
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 1
+  cp_size: 1
+  sequence_parallel: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+  reduction: sum
+
+domain_mixture:
+  domains:
+    # Domain order is positional and must match the weighted paths below.
+    - name: web
+      sampling_weight: 0.7
+      objective_weight: 0.5
+    - name: code
+      sampling_weight: 0.3
+      objective_weight: 0.5
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.megatron_dataset.MegatronPretraining
+  paths:
+    - "70"
+    - /data/web/processed_text_document
+    - "30"
+    - /data/code/processed_text_document
+  index_mapping_dir: /data/domain_mixture/mapping_dir
+  tokenizer:
+    _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: openai-community/gpt2
+  seq_length: 1024
+  split: "0.99, 0.01, 0"
+  splits_to_build: train
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  dataloader_type: single
+
+validation_dataset_web:
+  _target_: nemo_automodel.components.datasets.llm.megatron_dataset.MegatronPretraining
+  paths: /data/web/processed_text_document
+  index_mapping_dir: /data/web/validation_mapping_dir
+  tokenizer:
+    _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: openai-community/gpt2
+  seq_length: 1024
+  split: "0.99, 0.01, 0"
+  splits_to_build: validation
+  num_val_samples: 128
+
+validation_dataset_code:
+  _target_: nemo_automodel.components.datasets.llm.megatron_dataset.MegatronPretraining
+  paths: /data/code/processed_text_document
+  index_mapping_dir: /data/code/validation_mapping_dir
+  tokenizer:
+    _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: openai-community/gpt2
+  seq_length: 1024
+  split: "0.99, 0.01, 0"
+  splits_to_build: validation
+  num_val_samples: 128
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  dataloader_type: single
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 0.0006
+  betas: [0.9, 0.95]
+  weight_decay: 0.1
+
+lr_scheduler:
+  lr_decay_style: cosine
+  lr_warmup_steps: 10
+  min_lr: 0.0

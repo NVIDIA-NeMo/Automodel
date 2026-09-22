@@ -66,6 +66,7 @@ from nemo_automodel.components.moe.experts import GroupedExperts, GroupedExperts
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import FakeBalancedGate, Gate, MoE
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
+from nemo_automodel.shared.embedding_padding import zero_embedding_row_
 from nemo_automodel.shared.import_utils import UnavailableError, safe_import_from
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
@@ -78,6 +79,22 @@ _FUSED_RMSNORM_GATED_OK, FusedRMSNormGated = safe_import_from(
 )
 _CHUNK_KDA_OK, chunk_kda = safe_import_from("fla.ops.kda", "chunk_kda", msg=_FLA_MSG)
 _RECURRENT_KDA_OK, fused_recurrent_kda = safe_import_from("fla.ops.kda", "fused_recurrent_kda", msg=_FLA_MSG)
+_CHUNK_KDA_HAS_DISABLE_RECOMPUTE = _CHUNK_KDA_OK and "disable_recompute" in inspect.signature(chunk_kda).parameters
+
+
+def _short_conv_backend_kwargs(backend: str) -> dict[str, str]:
+    """Return the ``ShortConvolution`` keyword for a non-default conv backend.
+
+    Older FLA releases have no ``backend`` parameter; the default Triton backend is then the only
+    choice and no keyword is passed, so the module still constructs.
+    """
+    if backend == "triton" or not _SHORT_CONV_OK:
+        return {}
+    if "backend" not in inspect.signature(ShortConvolution.__init__).parameters:
+        return {}
+    return {"backend": backend}
+
+
 _KDA_GATE_OK, fused_kda_gate = safe_import_from("fla.ops.kda.gate", "fused_kda_gate", msg=_FLA_MSG)
 try:
     _FUSED_KDA_GATE_HAS_G_BIAS = _KDA_GATE_OK and "g_bias" in inspect.signature(fused_kda_gate).parameters
@@ -748,12 +765,16 @@ class KimiDeltaAttention(nn.Module):
         self.q_proj = nn.Linear(self.hidden_size, projection_k_size, bias=False, dtype=dtype)
         self.k_proj = nn.Linear(self.hidden_size, projection_k_size, bias=False, dtype=dtype)
         self.v_proj = nn.Linear(self.hidden_size, projection_size, bias=False, dtype=dtype)
+        # FLA's ShortConvolution defaults to its Triton kernels; ``kda_conv_backend: cuda`` selects the
+        # causal-conv1d CUDA kernels when that package is installed (FLA falls back to Triton otherwise).
+        conv_kwargs = _short_conv_backend_kwargs(getattr(config, "kda_conv_backend", "triton"))
         self.q_conv1d = _KimiFp32Module(
             ShortConvolution(
                 hidden_size=projection_k_size,
                 kernel_size=self.conv_size,
                 activation="silu",
                 dtype=torch.float32,
+                **conv_kwargs,
             )
         )
         self.k_conv1d = _KimiFp32Module(
@@ -762,6 +783,7 @@ class KimiDeltaAttention(nn.Module):
                 kernel_size=self.conv_size,
                 activation="silu",
                 dtype=torch.float32,
+                **conv_kwargs,
             )
         )
         self.v_conv1d = _KimiFp32Module(
@@ -770,6 +792,7 @@ class KimiDeltaAttention(nn.Module):
                 kernel_size=self.conv_size,
                 activation="silu",
                 dtype=torch.float32,
+                **conv_kwargs,
             )
         )
 
@@ -933,10 +956,18 @@ class KimiDeltaAttention(nn.Module):
         kernel = chunk_kda if mode == "chunk" else fused_recurrent_kda
         kernel_options = {
             "use_qk_l2norm_in_kernel": use_qk_l2norm_in_kernel,
-            "transpose_state_layout": True,
+            # FLA's transposed [K, V] state layout is the reference default; the plain layout runs the
+            # chunk kernels slightly faster on GB200 and yields the same output up to fp32 summation order.
+            "transpose_state_layout": bool(getattr(self.config, "kda_transpose_state_layout", True)),
         }
         if mode == "chunk":
             kernel_options["safe_gate"] = self.gate_lower_bound is not None
+            if getattr(self.config, "kda_disable_recompute", False) and _CHUNK_KDA_HAS_DISABLE_RECOMPUTE:
+                # Under activation checkpointing the layer forward is already re-run right before its
+                # backward, so FLA's own in-backward recompute of w/u/qg/kg and the chunk states is
+                # redundant work: keep them from that forward instead (transient memory, freed at the
+                # end of the layer backward).
+                kernel_options["disable_recompute"] = True
         o, _ = kernel(
             q=q,
             k=k,
@@ -944,8 +975,9 @@ class KimiDeltaAttention(nn.Module):
             g=g,
             beta=beta,
             initial_state=None,
-            # Under CP the final state is owned by FLA's rank-to-rank handoff.
-            output_final_state=cp_context is None,
+            # The final recurrent state is never consumed in training (and under CP it is owned by
+            # FLA's rank-to-rank handoff), so do not have the kernel materialise it.
+            output_final_state=False,
             cu_seqlens=cu_seqlens,
             **kernel_options,
             **kernel_kwargs,
@@ -1038,6 +1070,19 @@ class KimiK3Gate(Gate):
         return weights * self.route_scale, indices, None
 
 
+_SHARED_EXPERT_STREAMS: dict[int, torch.cuda.Stream] = {}
+
+
+def _shared_expert_stream(device: torch.device) -> torch.cuda.Stream:
+    """Return the per-device side stream used for shared-expert overlap (created lazily, one per process)."""
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    stream = _SHARED_EXPERT_STREAMS.get(index)
+    if stream is None:
+        stream = torch.cuda.Stream(device=index)
+        _SHARED_EXPERT_STREAMS[index] = stream
+    return stream
+
+
 class KimiK3MoE(MoE):
     """K3 routed experts with latent projections and a SiTU shared expert."""
 
@@ -1123,6 +1168,24 @@ class KimiK3MoE(MoE):
         gate_cp_mesh = cp_mesh if cp_mesh is not None else self.cp_mesh
         weights, indices, _ = self.gate(identity, token_mask, gate_cp_mesh)
         routed_input = self.routed_expert_down_proj(identity)
+        # Shared-expert overlap (BackendConfig.shared_expert_overlap): the shared experts only
+        # depend on ``identity``, so launch them on a side stream before the routed path and
+        # join after it. Under expert parallelism the routed path spends most of its time in
+        # dispatch / combine communication on the current stream, which leaves SMs free for the
+        # shared-expert GEMMs (same idea as Megatron-Core's ``moe_shared_expert_overlap``).
+        # Autograd replays each backward op on the stream its forward op used; measured on an
+        # 8-node EP32 K3 mini the win comes from the forward and recompute passes (launching the
+        # shared experts after the routed path to reorder the backward was slower: the routed path
+        # host-syncs on tokens_per_expert, which serializes the shared experts behind it).
+        shared_output = None
+        shared_stream = None
+        if self.shared_experts is not None and self.backend.shared_expert_overlap and identity.is_cuda:
+            shared_stream = _shared_expert_stream(identity.device)
+            shared_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(shared_stream):
+                shared_output = self.shared_experts(identity)
+            # ``identity`` was allocated on the current stream; keep its block alive for the side stream.
+            identity.record_stream(shared_stream)
         if not self.training and not self._has_distributed_experts():
             routed = self._forward_reference_order(routed_input, indices, weights)
         else:
@@ -1130,7 +1193,12 @@ class KimiK3MoE(MoE):
         if self.routed_expert_norm is not None:
             routed = self.routed_expert_norm(routed)
         output = self.routed_expert_up_proj(routed)
-        if self.shared_experts is not None:
+        if shared_output is not None:
+            current = torch.cuda.current_stream()
+            current.wait_stream(shared_stream)
+            shared_output.record_stream(current)
+            output = output + shared_output
+        elif self.shared_experts is not None:
             output = output + self.shared_experts(identity)
         return output.view(shape)
 
@@ -1656,7 +1724,7 @@ class KimiK3TextModel(nn.Module):
             if self.embed_tokens is not None:
                 nn.init.normal_(self.embed_tokens.weight, mean=0.0, std=init_std)
                 if self.padding_idx is not None:
-                    self.embed_tokens.weight[self.padding_idx].zero_()
+                    zero_embedding_row_(self.embed_tokens.weight, self.padding_idx)
             if self.norm is not None:
                 self.norm.reset_parameters()
             if self.use_attn_residuals:

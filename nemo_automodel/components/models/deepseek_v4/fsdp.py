@@ -184,7 +184,11 @@ def _iter_dsv4_fp32_modules(module: nn.Module):
     for name, submodule in module.named_modules():
         if not name or id(submodule) in seen:
             continue
-        if not any(_matches_suffix(name, suffix) for suffix in _DSV4_FP32_MODULE_SUFFIXES):
+        # A standalone vision tower names its final norm simply "norm".
+        # Match the shared vision norm type as well as paths relative to a model.
+        if submodule.__class__.__name__ not in _DSV4_SELF_CASTING_FP32_MODULE_CLASS_NAMES and not any(
+            _matches_suffix(name, suffix) for suffix in _DSV4_FP32_MODULE_SUFFIXES
+        ):
             continue
         if _floating_param_dtypes(submodule) != {torch.float32}:
             continue

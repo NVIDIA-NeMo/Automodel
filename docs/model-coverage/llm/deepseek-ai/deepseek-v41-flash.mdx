@@ -1,6 +1,6 @@
 ---
 title: "DeepSeek-V4.1 Flash"
-description: "DeepSeek V4.1 backbone fine-tuning with expert parallelism and sharded Engram memory."
+description: "DeepSeek-V4.1 Flash backbone fine-tuning with expert parallelism and sharded Engram memory."
 slug: model-coverage/large-language-models/deepseek-ai/deepseek-v41-flash
 ---
 
@@ -14,7 +14,7 @@ at layers 1 and 14 provide tokenizer-dependent N-gram memory. The approximately
 
 | Setting | Value |
 |---|---|
-| **Architecture** | `DeepseekV41ForCausalLM` |
+| Architecture | `DeepseekV41ForCausalLM` |
 | Model ID | `deepseek-ai/DeepSeek-V4.1-Flash` |
 | Reference revision | `df42c109f1defefcbfcedbe7d905718a12266e40` |
 | Configuration | `DeepseekV41Config` with typed `text_config` and `vision_config` |
@@ -67,6 +67,34 @@ See the [Slurm launcher guide](/job-launchers/slurm-cluster) and
 and communication prewarming must match the backend, topology, and local
 input shapes.
 
+## Context Parallelism
+
+Unpacked, right-padded text supports context parallelism with contiguous sequence
+shards. Set `distributed.cp_size` and retain the same global batch size when
+comparing CP sizes. The model's sharder pads the global sequence so each rank
+owns complete compression groups and preserves global position IDs. Shift
+labels before sharding and use the recipe's external loss; direct `labels=`
+loss is unavailable when CP is active.
+
+Queries and hidden activations remain local. Window KV, newly compressed KV,
+and index keys are gathered across the CP group; reused compressed KV retains
+its gradient history across layers. Engram gathers integer token history for
+N-gram hashing, then looks up only the local tokens through the existing row
+owners. CP does not gather full Engram tables. TP, PP, packed documents, and
+image inputs remain outside this CP path.
+
+The [Tulu3 CP recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_tulu3_cp.yaml)
+uses 4,096-token sequences, TE RMSNorm, EP64, and 64 Engram owners. At global
+batch 64 and local batch 1, CP1 uses one microbatch per update and CP8 uses
+eight. Both runs must use the same prepared Arrow data, tokenizer, initial
+checkpoint, optimizer, and seed. The provided chat template follows the
+released chat-mode message format and masks loss to assistant content.
+
+The Tulu3 CP recipes explicitly set `clip_grad_norm.backend: triton`.
+This uses the shared fused FP64 gradient-norm reduction from main and avoids
+gradient-sized norm temporaries for contiguous CUDA owner shards. Set
+`clip_grad_norm.backend: te` to select the shared Transformer Engine reducer.
+
 ## Loading and Inputs
 
 Set `DS41_CHECKPOINT` to the shared local Hugging Face snapshot of revision
@@ -94,7 +122,7 @@ preserves released parameter names, required FP32 weights, and logical Engram
 rows while removing the original quantization metadata. Quantized re-export
 is not supported.
 
-Recipe initialization uses the NeMo wrapper's internal Checkpointer and DCP
+Recipe initialization uses the NeMo AutoModel wrapper's internal Checkpointer and DCP
 path to load the base checkpoint into the distributed model.
 
 Text inputs use unpacked `input_ids [batch, sequence]`, right padding, and
@@ -117,7 +145,7 @@ should be rendered with the official encoder before processing.
 At PR commit `d5c8b5e45176bd6de54c139b311937516be4e0d2`, a real-weight comparison
 covered all 40 layers, 4,096 positions, and all 129,280 vocabulary entries
 against the pinned checkpoint's unchanged official `inference/` implementation.
-Official TP1 was compared with native EP4 and four Engram owners using
+Official TP1 was compared with native EP4 and 4 Engram owners using
 `torch_mm`, native HybridEP dispatch and combine, and TileLang. Dense and expert
 reference weights were decoded for BF16 compute, with the original cache/index quantization retained;
 this was not a default FP8/FP4 GEMM comparison.
@@ -143,7 +171,7 @@ This is a measured baseline, not a strict parity pass.
 
 An earlier PR commit, `ae380ea74b8417a000c1639ebd64991aafeb42b8`, completed
 three resident forward/backward iterations using the now-removed custom FP32
-combine. It used four GB200 GPUs, the released first four layers and full
+combine. It used 4 GB200 GPUs, the released first four layers and full
 layer-1 Engram table, EP4, activation checkpointing, and resharding. All local
 trainable gradients were present and finite, including nonzero Engram and
 expert gradients. This check performed no clipping or optimizer updates and
@@ -170,10 +198,13 @@ restoration, or full-model convergence.
 
 ## Current Scope
 
-THD packing, TP, PP, CP, incremental generation caches, bounded decoder replay,
+THD packing, TP, PP, incremental generation caches, bounded decoder replay,
 and million-token training are unsupported. Image inputs also require
 unpacked batches. Indexers remain frozen because hard top-k selection has no
-language-model gradient; indexer distillation and DSpark draft training are
-outside this implementation. Fine-tuning does not reproduce the report's
+language-model gradient; indexer distillation is outside this implementation.
+Native DSpark draft training is available through the
+[DSpark training guide](/recipes-e2e-examples/dspark-speculative-decoding), with
+the target frozen and DSpark gradients isolated from the target backbone.
+Fine-tuning does not reproduce the report's
 Engram pretraining optimizer. Bitwise training continuation is not established
 for the TileLang backward kernels.

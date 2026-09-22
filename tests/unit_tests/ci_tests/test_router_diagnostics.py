@@ -13,12 +13,15 @@
 # limitations under the License.
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 import torch
 from torch import nn
+from transformers.models.glm4_moe_lite.configuration_glm4_moe_lite import Glm4MoeLiteConfig
+from transformers.models.glm4_moe_lite.modeling_glm4_moe_lite import Glm4MoeLiteMoE
 
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import Gate
@@ -31,23 +34,28 @@ from tests.functional_tests.checkpoint_robustness.router_diagnostics import (
 )
 
 
-class Glm4MoeLiteMoE(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.config = SimpleNamespace(n_group=1)
-        self.gate = SimpleNamespace(e_score_correction_bias=torch.zeros(3))
-
-    def route_tokens_to_experts(self, router_logits):
-        return router_logits.topk(1, dim=-1).indices, torch.ones_like(router_logits[..., :1])
-
-
 class _HfRouterModel(nn.Module):
     def __init__(self, *, include_invalid_name: bool = False):
         super().__init__()
-        self.config = SimpleNamespace(model_type="glm4_moe_lite")
-        self.layers = nn.ModuleDict({"0": Glm4MoeLiteMoE()})
+        self.config = Glm4MoeLiteConfig(
+            hidden_size=4,
+            intermediate_size=8,
+            moe_intermediate_size=8,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            num_experts_per_tok=2,
+            n_group=2,
+            topk_group=1,
+        )
+        self.layers = nn.ModuleDict({str(index): Glm4MoeLiteMoE(self.config) for index in range(2)})
+        with torch.no_grad():
+            for index, layer in enumerate(self.layers.values()):
+                for parameter in layer.parameters():
+                    parameter.fill_(0.1)
+                layer.gate.weight.copy_(torch.eye(4).roll(index, dims=0))
+                layer.gate.e_score_correction_bias.copy_(torch.arange(4) * (index + 1) * 0.1)
         if include_invalid_name:
-            self.orphan_router = Glm4MoeLiteMoE()
+            self.orphan_router = Glm4MoeLiteMoE(self.config)
 
 
 class _GateBlock(nn.Module):
@@ -82,7 +90,9 @@ def _gate() -> Gate:
         force_e_score_correction_bias=True,
         dtype=torch.float32,
     )
-    return Gate(config, gate_precision=torch.float32)
+    gate = Gate(config, gate_precision=torch.float32)
+    nn.init.zeros_(gate.weight)
+    return gate
 
 
 def _capture(router_logits, indices):
@@ -102,7 +112,38 @@ def _capture(router_logits, indices):
     }
 
 
-def test_hf_capture_validates_all_modules_before_patching(tmp_path):
+def test_hf_capture_matches_real_router_outputs_without_changing_forward(tmp_path: Path) -> None:
+    model = _HfRouterModel()
+    hidden_states = torch.arange(24, dtype=torch.float32).reshape(2, 3, 4) / 10
+    capture_path = tmp_path / "capture.pt"
+
+    with torch.no_grad():
+        expected_routes = [layer.gate(hidden_states) for layer in model.layers.values()]
+        expected_outputs = [layer(hidden_states) for layer in model.layers.values()]
+        with capture_glm_hf_routers(model, capture_path):
+            actual_outputs = [layer(hidden_states) for layer in model.layers.values()]
+
+        for layer, expected_output, actual_output in zip(model.layers.values(), expected_outputs, actual_outputs):
+            torch.testing.assert_close(actual_output, expected_output, rtol=0, atol=0)
+            torch.testing.assert_close(layer(hidden_states), expected_output, rtol=0, atol=0)
+            assert not layer.gate._forward_hooks
+
+    capture = torch.load(capture_path, map_location="cpu", weights_only=True)
+    assert capture["framework"] == "hf"
+    assert capture["model_family"] == "glm4_moe_lite"
+    assert set(capture["layers"]) == {0, 1}
+    for index, (router_logits, _weights, indices) in enumerate(expected_routes):
+        layer_capture = capture["layers"][index]
+        torch.testing.assert_close(layer_capture["router_logits"], router_logits, rtol=0, atol=0)
+        torch.testing.assert_close(layer_capture["indices"], indices, rtol=0, atol=0)
+        torch.testing.assert_close(
+            layer_capture["correction_bias"], model.layers[str(index)].gate.e_score_correction_bias, rtol=0, atol=0
+        )
+        assert layer_capture["score_func"] == "sigmoid"
+        assert layer_capture["n_groups"] == 2
+
+
+def test_hf_capture_validates_all_modules_before_registering_hooks(tmp_path: Path) -> None:
     model = _HfRouterModel(include_invalid_name=True)
     router = model.layers["0"]
 
@@ -110,7 +151,7 @@ def test_hf_capture_validates_all_modules_before_patching(tmp_path):
         with capture_glm_hf_routers(model, tmp_path / "capture.pt"):
             pass
 
-    assert "route_tokens_to_experts" not in router.__dict__
+    assert not router.gate._forward_hooks
 
 
 def test_hf_capture_rejects_missing_router_on_nonzero_rank_path(tmp_path):
@@ -127,15 +168,31 @@ def test_hf_capture_rejects_missing_router_on_nonzero_rank_path(tmp_path):
 
 
 @pytest.mark.parametrize("nonfinite", [float("inf"), float("nan")])
-def test_hf_capture_rejects_nonfinite_router_values_and_restores_patch(tmp_path, nonfinite):
+def test_hf_capture_rejects_nonfinite_router_values_and_removes_hooks(tmp_path: Path, nonfinite: float) -> None:
     model = _HfRouterModel()
     router = model.layers["0"]
+    with torch.no_grad():
+        router.gate.weight[0, 0] = nonfinite
 
     with pytest.raises(ValueError, match="non-finite router_logits"):
         with capture_glm_hf_routers(model, tmp_path / "capture.pt"):
-            router.route_tokens_to_experts(torch.tensor([[nonfinite, 0.0, 1.0]]))
+            router.gate(torch.ones(1, 4))
 
-    assert "route_tokens_to_experts" not in router.__dict__
+    assert all(not layer.gate._forward_hooks for layer in model.layers.values())
+    assert not (tmp_path / "capture.pt").exists()
+
+
+def test_hf_capture_removes_hooks_when_forward_fails(tmp_path: Path) -> None:
+    model = _HfRouterModel()
+    capture_path = tmp_path / "capture.pt"
+
+    with pytest.raises(RuntimeError, match="forward failed"):
+        with capture_glm_hf_routers(model, capture_path):
+            model.layers["0"](torch.ones(1, 4))
+            raise RuntimeError("forward failed")
+
+    assert all(not layer.gate._forward_hooks for layer in model.layers.values())
+    assert not capture_path.exists()
 
 
 def test_automodel_capture_wraps_cuda_graph_routing_core(tmp_path):

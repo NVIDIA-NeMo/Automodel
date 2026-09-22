@@ -27,6 +27,7 @@ To check without modifying files:
 ruff format --check .   # exits non-zero if any file would change
 ruff check .            # exits non-zero on lint violations
 bandit -r app.py nemo_automodel examples scripts tools tutorials -t B614
+python tools/lint_no_globals.py   # exits non-zero on globals() / module-namespace mutation
 ```
 
 To lint a single file or directory:
@@ -50,10 +51,11 @@ ruff check --fix nemo_automodel/components/models/llama/
 | Docstring convention | D101/D103 | Google style (currently ignored — selected then suppressed) |
 | No pickle | S301/S403 | Security: forbids `pickle.load` |
 | Restricted PyTorch load | B614 | Requires explicit `weights_only=True` for `torch.load` |
+| No module-namespace mutation | `tools/lint_no_globals.py` | Bans `globals()`, module-scope `vars()`, `sys.modules[__name__].__dict__` and `setattr(sys.modules[__name__], ...)`; only the PEP 562 cache `globals()[name] = ...` inside a module-level `__getattr__(name)` is exempt |
 | Ambiguous variable names | E741 | Error (e.g., `l`, `O`, `I`) |
 
-Tests (`tests/`) are excluded from Ruff and Bandit checks. Docstring rules
-(`D`) are also relaxed in test files.
+Tests (`tests/`) are excluded from Ruff, Bandit and the module-namespace
+check. Docstring rules (`D`) are also relaxed in test files.
 
 ## Type Hints
 

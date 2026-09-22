@@ -360,6 +360,12 @@ def apply_ep(model: nn.Module, ep_mesh: DeviceMesh, moe_mesh: DeviceMesh | None 
         # skip distribute_module entirely and just initialize token dispatcher.
         if isinstance(moe_module.experts, GroupedExpertsTE):
             moe_module.experts.init_token_dispatcher(ep_mesh=ep_mesh, moe_mesh=moe_mesh)
+            # TE creates rank-local parameters for the experts owned by this EP
+            # rank. A combined MoE mesh may fold physical TP peers into EP, so
+            # these plain tensors are different expert shards, not TP replicas.
+            from nemo_automodel.components.distributed.tp_replicas import exclude_from_tp_replica_sync
+
+            exclude_from_tp_replica_sync(moe_module.experts)
         else:
             parallelize_module(
                 module=moe_module.experts,
@@ -459,6 +465,94 @@ def _apply_multimodal_tower_ac(model: nn.Module, scopes: tuple[str, ...]) -> Non
     apply_submodule_checkpointing(tower_layers, has_kv_sharing=False, context_fn=sdpa_backend_snapshot_context_fn)
 
 
+def _replay_deepep_dispatch_on_recompute(
+    context_fn: Callable[[], tuple[AbstractContextManager, AbstractContextManager]],
+) -> Callable[[], tuple[AbstractContextManager, AbstractContextManager]]:
+    """Let a checkpointed block's recompute reuse the DeepEP layout it already computed.
+
+    Activation checkpointing replays the block during backward, and the replayed
+    MoE dispatch recomputes its routing layout from scratch even though the
+    routing is identical to the forward's. DeepEP skips that exchange when handed
+    the previous dispatch's handle -- the same shortcut its backward already
+    takes, which is why the backward dispatch is ~1000x cheaper than a
+    layout-computing forward one.
+
+    The recorder is built inside ``checkpoint_context_fn``, so each checkpointed
+    call gets its own: a block called once per forward pass keeps its passes'
+    dispatches separate, and the recompute consumes them in the order the
+    matching forward produced them.
+    """
+    from nemo_automodel.components.moe.megatron.fused_a2a import (
+        DispatchReplayRecorder,
+        dispatch_replay_scope,
+    )
+
+    def checkpoint_context_fn() -> tuple[AbstractContextManager, AbstractContextManager]:
+        forward_context, recompute_context = context_fn()
+        recorder = DispatchReplayRecorder()
+
+        @contextmanager
+        def scoped(mode: str, inner: AbstractContextManager):
+            if mode == "replay":
+                recorder.rewind()
+            with dispatch_replay_scope(recorder, mode), inner:
+                yield
+
+        return scoped("record", forward_context), scoped("replay", recompute_context)
+
+    return checkpoint_context_fn
+
+
+def _replay_hybridep_dispatch_on_recompute(
+    context_fn: Callable[[], tuple[AbstractContextManager, AbstractContextManager]],
+) -> Callable[[], tuple[AbstractContextManager, AbstractContextManager]]:
+    """Reuse checkpoint-forward HybridEP layouts during backward recomputation.
+
+    HybridEP can produce a different receive-token extent when it rebuilds a
+    layout during activation-checkpoint recompute, even when the saved router
+    top-k is identical. Reusing the forward handle keeps the layout stable while
+    still redispatching the recomputed activations, so activation memory remains
+    checkpointed.
+    """
+    from nemo_automodel.components.moe.megatron.fused_a2a import (
+        HybridEPDispatchReplayRecorder,
+        hybridep_dispatch_replay_scope,
+    )
+
+    def checkpoint_context_fn() -> tuple[AbstractContextManager, AbstractContextManager]:
+        forward_context, recompute_context = context_fn()
+        recorder = HybridEPDispatchReplayRecorder()
+
+        @contextmanager
+        def scoped(mode: str, inner: AbstractContextManager):
+            if mode == "replay":
+                recorder.rewind()
+            with hybridep_dispatch_replay_scope(recorder, mode):
+                with inner:
+                    yield
+                if mode == "record":
+                    # Cache the dispatch extents only after the selective-op
+                    # context exits. Recompute can then reuse them without an
+                    # extra aten.sum that would diverge from the forward trace.
+                    recorder.finalize()
+
+        return scoped("record", forward_context), scoped("replay", recompute_context)
+
+    return checkpoint_context_fn
+
+
+def _uses_hybridep_dispatch(model: nn.Module) -> bool:
+    """Return whether any expert module uses the HybridEP dispatcher."""
+    modules = getattr(model, "modules", None)
+    if not callable(modules):
+        return False
+    return any(
+        isinstance(module, (GroupedExpertsDeepEP, GroupedExpertsTE))
+        and getattr(module, "dispatcher_backend", None) == "hybridep"
+        for module in modules()
+    )
+
+
 def apply_ac(
     model: nn.Module,
     ignore_router: bool = True,
@@ -479,8 +573,8 @@ def apply_ac(
             first, then falls back to model.config attributes.
         selective: If True, applies TorchTitan-style per-op selective activation checkpointing
             (shared with the dense FSDP2 path) to each block. Takes precedence over
-            ``ignore_router``; the shared policy already saves expert-parallel communication
-            collectives and ``topk``, so it composes with expert parallelism.
+            ``ignore_router``; the shared policy saves ``topk``, and HybridEP reuses the
+            checkpoint-forward dispatch layout while redispatching recomputed activations.
         activation_checkpointing_scope: Which layer groups to checkpoint -- the same field
             and semantics as the generic FSDP2/DDP path. ``"all"`` (the default) checkpoints
             the text/MoE decoder blocks plus the trainable vision tower; ``"language"`` the
@@ -501,6 +595,7 @@ def apply_ac(
 
     scopes = normalize_activation_checkpointing_scope(activation_checkpointing_scope)
     checkpoint_decoder = "all" in scopes or "language" in scopes
+    uses_hybridep_dispatch = checkpoint_decoder and _uses_hybridep_dispatch(model)
     repeated_mtp_moe_block_ids = _repeated_mtp_moe_block_ids(model) if checkpoint_decoder else set()
     if repeated_mtp_moe_block_ids:
         logger.info(
@@ -532,6 +627,8 @@ def apply_ac(
                 transformer_engine_attention_backend_snapshot_context_fn,
                 selective_context_fn,
             )
+            if uses_hybridep_dispatch:
+                attention_context_fn = _replay_hybridep_dispatch_on_recompute(attention_context_fn)
             for parent_layers, layer_id, block in iter_transformer_and_mtp_blocks(model):
                 if id(block) in repeated_mtp_moe_block_ids:
                     continue
@@ -631,14 +728,22 @@ def apply_ac(
             logger.info("Skipping activation checkpointing for model-owned eager block %s", layer_id)
             continue
         if ignore_router:
+            # Only this branch pins routing across recompute (the policy saves the
+            # router projection and top-k), which makes replaying a recorded
+            # dispatch layout sound. Do not extend replay to the else-branch:
+            # there the router may choose a different layout during recompute.
+            block_context_fn = _preserve_gate_load_during_recompute(
+                block,
+                _with_attention_backend_snapshot(selective_checkpointing_context_fn),
+            )
+            block_context_fn = _replay_deepep_dispatch_on_recompute(block_context_fn)
+            if uses_hybridep_dispatch:
+                block_context_fn = _replay_hybridep_dispatch_on_recompute(block_context_fn)
             block = ptd_checkpoint_wrapper(
                 block,
                 preserve_rng_state=True,
                 determinism_check=_register_moe_checkpoint_determinism_check(),
-                context_fn=_preserve_gate_load_during_recompute(
-                    block,
-                    _with_attention_backend_snapshot(selective_checkpointing_context_fn),
-                ),
+                context_fn=block_context_fn,
             )
         else:
             block = ptd_checkpoint_wrapper(
@@ -689,11 +794,7 @@ def apply_fsdp(
     experts_mp_policy = parallelizer_utils.get_internal_fsdp_mp_policy(mp_policy)
     fp32_compute_module_names = tuple(getattr(model, "_keep_in_fp32_modules_strict", None) or ())
 
-    fully_shard_impl = fully_shard
-    if _is_deepseek_v4_model(model):
-        from nemo_automodel.components.models.deepseek_v4.fsdp import fully_shard_deepseek_v4
-
-        fully_shard_impl = fully_shard_deepseek_v4
+    fully_shard_impl = getattr(model, "_nemo_fully_shard", fully_shard)
 
     fully_shard_default = functools.partial(
         fully_shard_impl,
@@ -1084,12 +1185,10 @@ def parallelize_model(
         # get_expert_tp_replication_factor reads this marker to remove that
         # factor in scale_grads_and_clip_grad_norm.
         model._nemo_moe_tp_requires_replica_sync = True
-        # The replicated paths have no gradient synchronization of their own;
-        # they stay identical across TP ranks only when every rank starts from
-        # the same complete pretrained checkpoint. This marker makes
-        # apply_model_infrastructure and checkpoint loading fail closed on
-        # random/from-config initialization or partial checkpoints. It applies
-        # equally to registered and explicit custom-MoE plans.
+        # The custom-MoE TP support contract requires a complete pretrained base
+        # model and excludes PEFT because adapter and initialization ownership are
+        # undefined across combined TP/EP. This marker enforces that contract for
+        # both registered and explicit plans during setup and checkpoint loading.
         model._nemo_moe_tp_requires_pretrained_weights = True
         # PEFT is applied before distributed sharding. Translate each style so
         # LoRA-wrapped shared-expert/lm-head modules keep the same TP semantics.
