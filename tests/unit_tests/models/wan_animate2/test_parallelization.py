@@ -18,13 +18,14 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+from torch import nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
 
 from nemo_automodel.components.distributed.parallelizer import get_parallelization_strategy
 from nemo_automodel.components.models.wan_animate2.parallelization import WanAnimate2ParallelizationStrategy
 
 
-@pytest.mark.parametrize("checkpointing", [False, True, "selective"])
+@pytest.mark.parametrize("checkpointing", [False, True])
 def test_strategy_installs_forward_before_shared_sharding(tiny_model, checkpointing):
     strategy = get_parallelization_strategy(tiny_model)
     assert isinstance(strategy, WanAnimate2ParallelizationStrategy)
@@ -38,6 +39,16 @@ def test_strategy_installs_forward_before_shared_sharding(tiny_model, checkpoint
     assert tiny_model._wan_animate2_training
     assert all(isinstance(block, CheckpointWrapper) == bool(checkpointing) for block in tiny_model.blocks)
     assert shard.call_args.kwargs["activation_checkpointing"] is False
+
+
+def test_selective_checkpointing_fails_before_model_surgery(tiny_model: nn.Module) -> None:
+    """Reject selective checkpointing before installing or compiling the training forward."""
+    original_forwards = [block.forward for block in tiny_model.blocks]
+    mesh = SimpleNamespace(mesh_dim_names=())
+    with pytest.raises(ValueError, match="does not support selective activation checkpointing"):
+        WanAnimate2ParallelizationStrategy().parallelize(tiny_model, mesh, activation_checkpointing="selective")
+    assert not getattr(tiny_model, "_wan_animate2_training", False)
+    assert [block.forward for block in tiny_model.blocks] == original_forwards
 
 
 @pytest.mark.parametrize("axis", ["tp", "cp", "pp"])

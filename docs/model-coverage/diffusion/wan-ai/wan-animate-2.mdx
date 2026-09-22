@@ -38,6 +38,8 @@ The recipe requires `diffusers>=0.40.0` and the current public checkpoint in the
 See the [Wan-Animate-2 Fine-Tuning Guide](/recipes-e2e-examples/wan-animate-2) for the triplet dataset format, preprocessing, and launch commands.
 
 <Warning>
-A training sample must not use the same clip as both the driving video and the target. Because the driving video is consumed directly with no pose extraction, the model can then reach zero loss by copying it and ignoring the reference image, while the loss curve looks healthy.
+For motion-transfer training, avoid using the target clip as its own driving input: the model can
+learn a copying shortcut and ignore the reference image, making a low training loss misleading.
+Preprocessing warns when both paths identify the same file and continues processing.
 
 </Warning>

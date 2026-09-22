@@ -20,10 +20,7 @@ from torch import nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointImpl, checkpoint_wrapper
 from torch.distributed.device_mesh import DeviceMesh
 
-from nemo_automodel.components.distributed.activation_checkpointing import (
-    apply_selective_checkpointing_to_layers,
-    is_selective_activation_checkpointing,
-)
+from nemo_automodel.components.distributed.activation_checkpointing import is_selective_activation_checkpointing
 from nemo_automodel.components.distributed.parallelizer import DefaultParallelizationStrategy
 from nemo_automodel.components.models.wan_animate2.interleaved import install_forward_origin
 
@@ -46,11 +43,14 @@ class WanAnimate2ParallelizationStrategy(DefaultParallelizationStrategy):
         for name in (kwargs.get("tp_mesh_name", "tp"), "cp", "pp"):
             if name in device_mesh.mesh_dim_names and device_mesh[name].size() > 1:
                 raise ValueError(f"Wan-Animate-2 does not support {name} parallelism; set {name}_size=1")
-        install_forward_origin(model)
         checkpointing = kwargs.pop("activation_checkpointing", False)
         if is_selective_activation_checkpointing(checkpointing):
-            apply_selective_checkpointing_to_layers(model, list(model.blocks), has_kv_sharing=False)
-        elif checkpointing:
+            raise ValueError(
+                "Wan-Animate-2 does not support selective activation checkpointing; "
+                "set activation_checkpointing=true for full checkpointing or false to disable it."
+            )
+        install_forward_origin(model)
+        if checkpointing:
             for index, block in enumerate(model.blocks):
                 model.blocks[index] = checkpoint_wrapper(block, checkpoint_impl=CheckpointImpl.NO_REENTRANT)
         # The cache is local to the whole block; submodule checkpointing could

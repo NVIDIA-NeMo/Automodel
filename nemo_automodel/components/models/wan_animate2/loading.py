@@ -34,8 +34,11 @@ def load_pipeline(
     model_dir: str,
     model_args: tuple[object, ...],
     *,
-    torch_dtype: torch.dtype | str | dict[str, torch.dtype],
+    torch_dtype: torch.dtype | str,
     components_to_load: Iterable[str] | None,
+    use_lora: bool = False,
+    fuse_qkv_projections: bool = False,
+    compact_fused_qkv_projections: bool = False,
     **kwargs: object,
 ) -> ModularPipeline:
     """Load Wan-Animate-2 through its released modular pipeline.
@@ -46,13 +49,27 @@ def load_pipeline(
     Args:
         model_dir: Resolved local checkpoint directory.
         model_args: Positional loading arguments; must be empty for modular pipelines.
-        torch_dtype: Requested component weight dtype, or a mapping by component.
+        torch_dtype: One weight dtype for all loaded components. Per-component mappings are not supported.
         components_to_load: Component names, or all pretrained components.
+        use_lora: Whether LoRA adapters will be injected after loading.
+        fuse_qkv_projections: Whether QKV fusion was requested after loading.
+        compact_fused_qkv_projections: Whether original projections would be removed after fusion.
         **kwargs: Loading arguments forwarded to the upstream Diffusers APIs.
 
     Returns:
         The loaded modular Wan-Animate-2 pipeline.
     """
+    if isinstance(torch_dtype, dict):
+        raise TypeError("Wan-Animate-2 requires a single torch_dtype; per-component dtype mappings are not supported.")
+    if use_lora and fuse_qkv_projections:
+        raise ValueError(
+            "Wan-Animate-2 LoRA does not support QKV fusion; "
+            "set model.fuse_qkv_projections=false and model.compact_fused_qkv_projections=false."
+        )
+    if compact_fused_qkv_projections:
+        raise ValueError(
+            "Wan-Animate-2 does not support compact QKV fusion; set model.compact_fused_qkv_projections=false."
+        )
     if model_args:
         raise TypeError("Modular pipelines accept keyword loading arguments only")
 

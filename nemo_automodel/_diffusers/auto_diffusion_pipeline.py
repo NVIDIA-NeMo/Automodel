@@ -732,6 +732,9 @@ class NeMoAutoDiffusionPipeline:
                 model_args,
                 torch_dtype=torch_dtype,
                 components_to_load=components_to_load,
+                use_lora=peft_cfg is not None,
+                fuse_qkv_projections=fuse_qkv_projections,
+                compact_fused_qkv_projections=compact_fused_qkv_projections,
                 **kwargs,
             )
         else:

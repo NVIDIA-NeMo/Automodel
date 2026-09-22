@@ -264,6 +264,41 @@ class TestReadManifest:
         with pytest.raises(FileNotFoundError, match="driving_video"):
             preprocessing._read_manifest(_write_manifest(tmp_path, [row]))
 
+    @pytest.mark.parametrize("alias", ["literal", "absolute", "symlink", "hardlink"])
+    def test_same_driving_and_target_file_warns_and_keeps_sample(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture, alias: str
+    ) -> None:
+        row = _triplet_row(tmp_path, 0, reference_size=(640, 480))
+        target = tmp_path / row["target_video"]
+        if alias == "literal":
+            row["driving_video"] = row["target_video"]
+        elif alias == "absolute":
+            row["driving_video"] = str(target.resolve())
+        else:
+            link = tmp_path / "alias.mp4"
+            if alias == "symlink":
+                link.symlink_to(target)
+            else:
+                link.hardlink_to(target)
+            row["driving_video"] = link.name
+
+        samples = preprocessing._read_manifest(_write_manifest(tmp_path, [row]))
+
+        assert len(samples) == 1
+        assert samples[0].driving_path.samefile(samples[0].target_path)
+        assert "line 1: driving_video and target_video refer to the same file" in caplog.text
+        assert "Preprocessing will continue" in caplog.text
+
+    def test_repeated_rows_with_distinct_media_do_not_warn(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        row = _triplet_row(tmp_path, 0, reference_size=(640, 480))
+
+        samples = preprocessing._read_manifest(_write_manifest(tmp_path, [row, row]))
+
+        assert len(samples) == 2
+        assert "driving_video and target_video refer to the same file" not in caplog.text
+
 
 class TestResampleFrameIndices:
     """Frame selection must realize a physical frame rate, matching inference."""

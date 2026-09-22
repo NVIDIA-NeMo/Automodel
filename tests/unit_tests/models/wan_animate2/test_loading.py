@@ -15,6 +15,7 @@
 """Load a real tiny modular checkpoint entirely offline."""
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -22,6 +23,59 @@ import pytest
 import torch
 
 from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
+from nemo_automodel.components._peft.lora import PeftConfig
+
+
+@pytest.mark.parametrize("compact", [False, True])
+def test_lora_qkv_fusion_is_rejected_before_loading(tmp_path: Path, compact: bool) -> None:
+    """Unsupported LoRA fusion fails before loading or mutating the transformer."""
+    with patch(
+        "nemo_automodel.components.models.wan_animate2.loading.diffusers.ModularPipeline.from_pretrained"
+    ) as loader:
+        with pytest.raises(ValueError, match="Wan-Animate-2 LoRA does not support QKV fusion"):
+            NeMoAutoDiffusionPipeline.from_pretrained(
+                str(tmp_path),
+                model_type="wan_animate2",
+                peft_cfg=PeftConfig(target_modules=["*.self_attn.to_q", "*.self_attn.to_k", "*.self_attn.to_v"]),
+                fuse_qkv_projections=True,
+                compact_fused_qkv_projections=compact,
+                local_files_only=True,
+            )
+    loader.assert_not_called()
+
+
+def test_compact_qkv_fusion_is_rejected_for_sft_before_loading(tmp_path: Path) -> None:
+    """Full SFT rejects compact fusion before any projection can be deleted."""
+    with patch(
+        "nemo_automodel.components.models.wan_animate2.loading.diffusers.ModularPipeline.from_pretrained"
+    ) as loader:
+        with pytest.raises(ValueError, match="does not support compact QKV fusion"):
+            NeMoAutoDiffusionPipeline.from_pretrained(
+                str(tmp_path),
+                model_type="wan_animate2",
+                load_for_training=True,
+                fuse_qkv_projections=True,
+                compact_fused_qkv_projections=True,
+                local_files_only=True,
+            )
+    loader.assert_not_called()
+
+
+@pytest.mark.parametrize("move_to_device", [False, True])
+def test_dtype_mapping_is_rejected_before_loading(tmp_path: Path, move_to_device: bool) -> None:
+    """A dtype mapping cannot silently load FP32 or reach device movement."""
+    with patch(
+        "nemo_automodel.components.models.wan_animate2.loading.diffusers.ModularPipeline.from_pretrained"
+    ) as loader:
+        with pytest.raises(TypeError, match="requires a single torch_dtype"):
+            NeMoAutoDiffusionPipeline.from_pretrained(
+                str(tmp_path),
+                model_type="wan_animate2",
+                torch_dtype={"transformer": torch.bfloat16, "default": torch.float32},
+                move_to_device=move_to_device,
+                local_files_only=True,
+            )
+    loader.assert_not_called()
 
 
 @pytest.mark.parametrize("legacy_index", [False, True])

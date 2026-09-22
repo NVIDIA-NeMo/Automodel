@@ -25,9 +25,7 @@ peft:
   dropout: 0.0
   # Use the standard autograd path for checkpointed two-stream training.
   use_memory_efficient_lora: false
-  # The three self-attention input projections, matching the reference training
-  # recipe. The output projection is deliberately excluded: upstream trains only
-  # the query, key, and value projections for LoRA.
+  # Train the self-attention query, key, and value projections.
   target_modules:
     - "*.self_attn.to_q"
     - "*.self_attn.to_k"

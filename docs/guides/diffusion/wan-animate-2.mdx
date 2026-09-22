@@ -18,14 +18,13 @@ AutoModel with both full fine-tuning and Low-Rank Adaptation (LoRA).
 
 Use `diffusers>=0.40.0`, which provides the released transformer and modular pipeline.
 Install the `diffusion` and `diffusion-media` extras with the repository's locked dependency
-workflow. The recipe loads the public `Wan-AI/Wan2.2-Animate-2-14B-Diffusers` checkpoint;
-no Diffusers fork or weight conversion is needed.
+workflow. The recipe loads the public `Wan-AI/Wan2.2-Animate-2-14B-Diffusers` checkpoint directly.
 
 ### Workflow Overview
 
 | Step | What You Do |
 | :--- | :--- |
-| 1. Install | Install NeMo AutoModel using pip or a container |
+| 1. Install | Install NeMo AutoModel using `uv` or a container |
 | 2. Prepare data | Write a JSONL manifest of reference, driving, and target triplets |
 | 3. Preprocess | Encode the triplets into a cached latent dataset |
 | 4. Train | Launch training with `torchrun` on 8 GPUs |
@@ -43,17 +42,15 @@ The `WanAnimate2Adapter` handles the following key training mechanics:
   using a fresh key/value cache. Both streams carry gradients. Keeping them inside one block
   call supports FSDP2 sharding and whole-block activation checkpointing.
 - **Reference slot**: The generation stream carries one extra leading latent frame for the reference
-  character. Training noises and supervises this slot together with the target video,
-  following DiffSynth's training objective. Inference drops its decoded prediction.
+  character. Training noises and supervises this slot together with the target video.
+  Inference drops its decoded prediction.
 - **LoRA targets**: The three self-attention input projections, named `self_attn.to_q`,
-  `self_attn.to_k`, and `self_attn.to_v`, matching the reference training recipe.
+  `self_attn.to_k`, and `self_attn.to_v`.
 - **Training objective**: Both recipes sample uniformly from 1,000 discrete timesteps
-  with flow shift 5 and apply bell-shaped weights normalized over that shifted grid,
-  following [DiffSynth's flow-matching loss](https://github.com/modelscope/DiffSynth-Studio/blob/c458cb42ab1ee838bff85c6546e14bb01c3571e9/diffsynth/diffusion/loss.py).
+  with flow shift 5 and apply bell-shaped weights normalized over that shifted grid.
   Timesteps are rounded to the compute dtype before the scheduler lookup; noise,
   interpolation, and velocity targets use that dtype too, including BF16 rounding.
-  Full SFT trains all transformer parameters; DiffSynth's example named `full` trains
-  only self-attention Q/K/V. Its example hyperparameters therefore differ from this recipe.
+  Full SFT trains all transformer parameters.
 
 The recipe runs with FSDP2 on a single 8-GPU node and mixed precision, with one sample per
 rank. Tensor and context parallelism are not available for this model, and a training run must use a
@@ -79,11 +76,13 @@ must produce the same resolution bucket. The released image processor rounds sou
 dimensions down to multiples of 16 before deriving the bucket from their aspect ratio.
 
 <Warning>
-Do not point `driving_video` and `target_video` at the same file. Because the driving video is
-consumed directly with no pose extraction, a model given the target clip as its own driving input
-can reach zero loss by copying it and ignoring the reference image. The loss curve descends
-normally, so this failure is silent. A valid sample needs the driving video to differ from the
-target in appearance while preserving motion.
+For motion-transfer training, use driving and target clips that differ in appearance while
+preserving motion. Providing the target clip as its own driving input can encourage the model to
+copy it and ignore the reference image, making a low training loss misleading.
+
+Preprocessing logs a warning with the manifest line number when `driving_video` and `target_video`
+identify the same file, including through path aliases. It continues processing so intentional
+reconstruction or debugging samples remain usable.
 
 </Warning>
 
@@ -109,10 +108,6 @@ Training stores activations for both the driving and generation streams.
 The released transformer uses Diffusers attention dispatch and PyTorch flex attention. A separate
 `flash-attn` install is not required by this recipe. Generation attention is compiled without CUDA
 graph capture so activation checkpoint replay can rebuild its differentiable cache.
-
-Regenerate caches made with the earlier Diffusers fork. The released pipeline uses bicubic PIL
-resizing for reference images, bilinear PIL resizing for video frames, and explicit dtype casting
-for CLIP inputs. Earlier caches do not reproduce these conditioning features.
 
 </Note>
 

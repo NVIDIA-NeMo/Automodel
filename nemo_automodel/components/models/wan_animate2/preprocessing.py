@@ -786,6 +786,16 @@ def _read_manifest(manifest_path: Path) -> list[_TripletSample]:
                     raise FileNotFoundError(f"Manifest line {line_number} {field_name} does not exist: {resolved}")
                 paths[field_name] = resolved
 
+            if paths["driving_video"].samefile(paths["target_video"]):
+                logger.warning(
+                    "Manifest %s line %d: driving_video and target_video refer to the same file (%s). "
+                    "This can encourage copying the target instead of learning character transfer. "
+                    "Preprocessing will continue.",
+                    manifest_path,
+                    line_number,
+                    paths["target_video"],
+                )
+
             samples.append(
                 _TripletSample(
                     identifier=str(identifier),
