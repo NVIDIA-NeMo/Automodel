@@ -22,10 +22,12 @@ if [[ ${TITANS_EVAL_IN_CONTAINER:-0} != 1 ]]; then
       TITANS_WORK_ROOT="$TITANS_WORK_ROOT" \
       NPROC_PER_NODE="$NPROC_PER_NODE" \
       NUM_THREADS="$NUM_THREADS" \
+      PYTHONPATH="$AUTOMODEL_CHECKOUT${PYTHONPATH:+:$PYTHONPATH}" \
       bash "$AUTOMODEL_CHECKOUT/examples/llm_pretrain/slurm/titans_blackwell_eval_prepare.sbatch"
 fi
 
 cd "$AUTOMODEL_CHECKOUT"
+export PYTHONPATH="$AUTOMODEL_CHECKOUT${PYTHONPATH:+:$PYTHONPATH}"
 
 RUNS=(
   titans-170m-baseline-15B-blackwell-optimized
