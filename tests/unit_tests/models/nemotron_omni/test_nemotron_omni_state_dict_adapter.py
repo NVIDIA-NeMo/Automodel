@@ -356,3 +356,157 @@ def test_super35_final_vision_norm_roundtrip(adapter):
     assert set(converted) == set(hf) == set(restored)
     for key in hf:
         assert torch.equal(restored[key], hf[key])
+
+
+# ---------------------------------------------------------------------------
+# PEFT adapter save and reload tests
+# ---------------------------------------------------------------------------
+
+
+def test_to_hf_peft_keys(adapter):
+    """PEFT keys starting with base_model.model. are converted properly."""
+    custom_sd = {
+        "base_model.model.language_model.model.layers.0.self_attn.q_proj.lora_A.weight": torch.zeros(4, 32),
+        "base_model.model.sound_encoder.layers.0.weight": torch.zeros(4),
+        "base_model.model.vision_projector.norm.weight": torch.zeros(8),
+        "base_model.model.sound_projection.norm.weight": torch.zeros(8),
+        "base_model.model.vision_model.radio_model.model.blocks.0.norm1.weight": torch.zeros(2),
+    }
+    out = adapter.to_hf(dict(custom_sd))
+
+    assert "base_model.model.sound_encoder.encoder.layers.0.weight" in out
+    assert "base_model.model.mlp1.0.weight" in out
+    assert "base_model.model.sound_projection.norm.weight" in out
+    assert "base_model.model.vision_model.radio_model.model.blocks.0.norm1.weight" in out
+
+    # Delegate received stripped key with base_model.model. preserved
+    args, kwargs = adapter._llm_adapter.to_hf.call_args
+    delegated = args[0]
+    assert "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight" in delegated
+    assert kwargs.get("v4_compatible") is True
+
+
+def test_from_hf_peft_keys(adapter):
+    """from_hf strips and re-nests PEFT keys without unknown key prefix warnings."""
+    hf_sd = {
+        "base_model.model.language_model.backbone.layers.0.self_attn.q_proj.lora_A.weight": torch.zeros(4, 32),
+        "base_model.model.sound_encoder.encoder.layers.0.weight": torch.zeros(4),
+        "base_model.model.mlp1.0.weight": torch.zeros(8),
+        "base_model.model.sound_projection.norm.weight": torch.zeros(8),
+        "base_model.model.vision_model.radio_model.model.blocks.0.norm1.weight": torch.zeros(2),
+    }
+    out = adapter.from_hf(dict(hf_sd))
+
+    assert "base_model.model.sound_encoder.layers.0.weight" in out
+    assert "base_model.model.vision_projector.norm.weight" in out
+    assert "base_model.model.sound_projection.norm.weight" in out
+    assert "base_model.model.vision_model.radio_model.model.blocks.0.norm1.weight" in out
+
+    args, _ = adapter._llm_adapter.from_hf.call_args
+    delegated = args[0]
+    assert "base_model.model.backbone.layers.0.self_attn.q_proj.lora_A.weight" in delegated
+
+
+def test_convert_single_tensor_to_hf_peft(adapter):
+    """convert_single_tensor_to_hf handles keys starting with base_model.model."""
+    t = torch.zeros(4, 32)
+    t_proj = torch.zeros(8)
+
+    res_sound = adapter.convert_single_tensor_to_hf("base_model.model.sound_encoder.layers.0.weight", t)
+    assert res_sound[0][0] == "base_model.model.sound_encoder.encoder.layers.0.weight"
+    assert torch.equal(res_sound[0][1], t)
+
+    res_proj = adapter.convert_single_tensor_to_hf("base_model.model.vision_projector.norm.weight", t_proj)
+    assert res_proj[0][0] == "base_model.model.mlp1.0.weight"
+    assert torch.equal(res_proj[0][1], t_proj)
+
+    res_proj_pass = adapter.convert_single_tensor_to_hf("base_model.model.sound_projection.norm.weight", t_proj)
+    assert res_proj_pass[0][0] == "base_model.model.sound_projection.norm.weight"
+    assert torch.equal(res_proj_pass[0][1], t_proj)
+
+    res_llm = adapter.convert_single_tensor_to_hf(
+        "base_model.model.language_model.model.layers.0.self_attn.q_proj.lora_A.weight", t
+    )
+    assert res_llm[0][0] == "base_model.model.language_model.model.layers.0.self_attn.q_proj.lora_A.weight"
+    assert torch.equal(res_llm[0][1], t)
+    args, kwargs = adapter._llm_adapter.convert_single_tensor_to_hf.call_args
+    assert args[0] == "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight"
+    assert kwargs.get("v4_compatible") is True
+
+
+def test_map_peft_target_module_to_hf(adapter):
+    """map_peft_target_module_to_hf maps target modules across subcomponents."""
+    adapter._llm_adapter.map_peft_target_module_to_hf.side_effect = lambda name, **kwargs: name.replace(
+        "model.", "backbone."
+    )
+
+    assert (
+        adapter.map_peft_target_module_to_hf("language_model.model.layers.0.self_attn.q_proj")
+        == "language_model.backbone.layers.0.self_attn.q_proj"
+    )
+    assert adapter.map_peft_target_module_to_hf("sound_encoder.layers.0.conv") == "sound_encoder.encoder.layers.0.conv"
+    assert adapter.map_peft_target_module_to_hf("vision_projector.norm.weight") == "mlp1.0.weight"
+    assert adapter.map_peft_target_module_to_hf("other.module") == "other.module"
+
+
+def test_peft_end_to_end_with_real_v3_adapter():
+    """End-to-end to_hf and from_hf round trip with real NemotronV3StateDictAdapter."""
+    from types import SimpleNamespace
+
+    from nemo_automodel.components.models.common import BackendConfig
+    from nemo_automodel.components.moe.config import MoEConfig
+
+    moe = MoEConfig(
+        dim=32,
+        inter_dim=64,
+        moe_inter_dim=16,
+        n_routed_experts=2,
+        n_shared_experts=0,
+        n_activated_experts=1,
+        n_expert_groups=1,
+        n_limited_groups=1,
+        train_gate=True,
+        gate_bias_update_factor=0.0,
+        score_func="softmax",
+        route_scale=1.0,
+        aux_loss_coeff=0.0,
+        norm_topk_prob=False,
+        expert_bias=False,
+        router_bias=False,
+        expert_activation="relu2",
+        softmax_before_topk=True,
+    )
+    backend = BackendConfig(linear="torch", rms_norm="torch", attn="sdpa")
+
+    real_adapter = NemotronOmniStateDictAdapter(
+        config=SimpleNamespace(),
+        llm_config=SimpleNamespace(),
+        moe_config=moe,
+        backend=backend,
+    )
+
+    base_expert = "base_model.model.language_model.model.layers.0.mixer.experts"
+    peft_sd = {
+        "base_model.model.language_model.model.layers.0.self_attn.q_proj.lora_A.weight": torch.randn(4, 32),
+        f"{base_expert}.lora_gate_and_up_A": torch.randn(2, 32, 4),
+        f"{base_expert}.lora_gate_and_up_B": torch.randn(2, 4, 16),
+        "base_model.model.sound_encoder.layers.0.weight": torch.randn(4, 32),
+        "base_model.model.vision_projector.norm.weight": torch.randn(8),
+    }
+
+    hf_sd = real_adapter.to_hf(dict(peft_sd))
+
+    # Verify HF keys match expected HF remote-code layout
+    assert "base_model.model.language_model.backbone.layers.0.self_attn.q_proj.lora_A.weight" in hf_sd
+    assert "base_model.model.language_model.backbone.layers.0.mixer.experts.0.up_proj.lora_A.weight" in hf_sd
+    assert "base_model.model.language_model.backbone.layers.0.mixer.experts.0.up_proj.lora_B.weight" in hf_sd
+    assert "base_model.model.language_model.backbone.layers.0.mixer.experts.1.up_proj.lora_A.weight" in hf_sd
+    assert "base_model.model.language_model.backbone.layers.0.mixer.experts.1.up_proj.lora_B.weight" in hf_sd
+    assert "base_model.model.sound_encoder.encoder.layers.0.weight" in hf_sd
+    assert "base_model.model.mlp1.0.weight" in hf_sd
+
+    # Round trip back through from_hf
+    recovered_sd = real_adapter.from_hf(dict(hf_sd))
+    assert set(recovered_sd.keys()) == set(peft_sd.keys())
+    for k in peft_sd:
+        torch.testing.assert_close(recovered_sd[k], peft_sd[k])

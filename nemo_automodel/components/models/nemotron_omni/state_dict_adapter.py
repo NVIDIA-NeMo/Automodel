@@ -89,6 +89,8 @@ _VISION_PROJ_HF_TO_CUSTOM = {
 }
 _VISION_PROJ_CUSTOM_TO_HF = {v: k for k, v in _VISION_PROJ_HF_TO_CUSTOM.items()}
 
+_PEFT_PREFIX = "base_model.model."
+
 # Sound encoder: HF has "sound_encoder.encoder.*", custom has "sound_encoder.*"
 # This prefix stripping is needed because our model stores ParakeetEncoder directly
 # as self.sound_encoder, while HF wraps it in a SoundEncoder class with .encoder attr.
@@ -277,20 +279,27 @@ class NemotronOmniStateDictAdapter(StateDictAdapter):
         for key in list(hf_state_dict.keys()):
             value = hf_state_dict.pop(key)
 
+            if key.startswith(_PEFT_PREFIX):
+                prefix = _PEFT_PREFIX
+                bare_key = key[len(_PEFT_PREFIX) :]
+            else:
+                prefix = ""
+                bare_key = key
+
             # 1. Vision model keys (pass through as-is, or remap legacy RADIO naming)
-            if key.startswith("vision_model."):
-                sub_key = key[len("vision_model.") :]
+            if bare_key.startswith("vision_model."):
+                sub_key = bare_key[len("vision_model.") :]
                 if self.vision_uses_native_radio:
                     for new_sub_key, new_value in _radio_legacy_to_native(sub_key, value):
-                        result[f"vision_model.{new_sub_key}"] = new_value
+                        result[f"{prefix}vision_model.{new_sub_key}"] = new_value
                 else:
-                    result[key] = value
+                    result[f"{prefix}vision_model.{sub_key}"] = value
                 debug_counts["vision_model"] += 1
 
             # 2. Vision projector keys (mlp1.* -> vision_projector.*)
-            elif key.startswith("mlp1.") or key in _VISION_PROJ_HF_TO_CUSTOM:
-                if key in _VISION_PROJ_HF_TO_CUSTOM:
-                    new_key = _VISION_PROJ_HF_TO_CUSTOM[key]
+            elif bare_key.startswith("mlp1.") or bare_key in _VISION_PROJ_HF_TO_CUSTOM:
+                if bare_key in _VISION_PROJ_HF_TO_CUSTOM:
+                    new_key = f"{prefix}{_VISION_PROJ_HF_TO_CUSTOM[bare_key]}"
                     result[new_key] = value
                     debug_counts["vision_projector"] += 1
                     logger.debug(f"  Vision proj: {key} -> {new_key}")
@@ -302,22 +311,23 @@ class NemotronOmniStateDictAdapter(StateDictAdapter):
             # 3. Sound encoder keys
             # HF: sound_encoder.encoder.* -> Custom: sound_encoder.*
             # Because our model stores ParakeetEncoder directly as self.sound_encoder
-            elif key.startswith("sound_encoder.encoder."):
-                new_key = "sound_encoder." + key[len("sound_encoder.encoder.") :]
+            elif bare_key.startswith("sound_encoder.encoder."):
+                new_key = f"{prefix}sound_encoder." + bare_key[len("sound_encoder.encoder.") :]
                 result[new_key] = value
                 debug_counts["sound_encoder"] += 1
 
             # 4. Sound projection keys (pass through as-is)
-            elif key.startswith("sound_projection."):
-                result[key] = value
+            elif bare_key.startswith("sound_projection."):
+                result[f"{prefix}{bare_key}"] = value
                 debug_counts["sound_projection"] += 1
 
             # 5. LLM keys (language_model.*)
             # Strip "language_model." prefix, pass to NemotronV3StateDictAdapter,
-            # then re-add "language_model." prefix
-            elif key.startswith("language_model."):
-                stripped_key = key[len("language_model.") :]
-                llm_state_dict[stripped_key] = value
+            # then re-add "language_model." prefix. Keep PEFT prefix on delegated key.
+            elif bare_key.startswith("language_model."):
+                stripped_key = bare_key[len("language_model.") :]
+                llm_key = f"{prefix}{stripped_key}" if prefix else stripped_key
+                llm_state_dict[llm_key] = value
                 debug_counts["llm"] += 1
 
             else:
@@ -334,7 +344,10 @@ class NemotronOmniStateDictAdapter(StateDictAdapter):
 
         # Re-add "language_model." prefix
         for key, value in converted_llm.items():
-            result[f"language_model.{key}"] = value
+            if key.startswith(_PEFT_PREFIX):
+                result[f"{_PEFT_PREFIX}language_model.{key[len(_PEFT_PREFIX) :]}"] = value
+            else:
+                result[f"language_model.{key}"] = value
 
         # Debug summary
         logger.info(
@@ -381,6 +394,7 @@ class NemotronOmniStateDictAdapter(StateDictAdapter):
         hf_result = {}
         llm_state_dict = {}
         vision_state_dict = {}
+        vision_prefixes = {}
 
         for fqn in list(state_dict.keys()):
             tensor = state_dict.pop(fqn)
@@ -388,40 +402,55 @@ class NemotronOmniStateDictAdapter(StateDictAdapter):
             if exclude_key_regex and re.match(exclude_key_regex, fqn):
                 continue
 
+            if fqn.startswith(_PEFT_PREFIX):
+                prefix = _PEFT_PREFIX
+                bare_fqn = fqn[len(_PEFT_PREFIX) :]
+            else:
+                prefix = ""
+                bare_fqn = fqn
+
             # Vision model (pass through, or remap back to legacy RADIO naming)
-            if fqn.startswith("vision_model."):
-                vision_state_dict[fqn[len("vision_model.") :]] = tensor
+            if bare_fqn.startswith("vision_model."):
+                sub_key = bare_fqn[len("vision_model.") :]
+                vision_state_dict[sub_key] = tensor
+                vision_prefixes[sub_key] = prefix
 
             # Vision projector (custom -> HF)
-            elif fqn.startswith("vision_projector."):
-                if fqn in _VISION_PROJ_CUSTOM_TO_HF:
-                    hf_result[_VISION_PROJ_CUSTOM_TO_HF[fqn]] = tensor
+            elif bare_fqn.startswith("vision_projector."):
+                if bare_fqn in _VISION_PROJ_CUSTOM_TO_HF:
+                    hf_result[f"{prefix}{_VISION_PROJ_CUSTOM_TO_HF[bare_fqn]}"] = tensor
                 else:
                     hf_result[fqn] = tensor
 
             # Sound encoder (custom -> HF: add "encoder." prefix)
-            elif fqn.startswith("sound_encoder."):
-                new_key = "sound_encoder.encoder." + fqn[len("sound_encoder.") :]
+            elif bare_fqn.startswith("sound_encoder."):
+                new_key = f"{prefix}sound_encoder.encoder." + bare_fqn[len("sound_encoder.") :]
                 hf_result[new_key] = tensor
 
             # Sound projection (pass through)
-            elif fqn.startswith("sound_projection."):
-                hf_result[fqn] = tensor
+            elif bare_fqn.startswith("sound_projection."):
+                hf_result[f"{prefix}{bare_fqn}"] = tensor
 
             # LLM keys (strip language_model. prefix for NemotronV3)
-            elif fqn.startswith("language_model."):
-                stripped = fqn[len("language_model.") :]
-                llm_state_dict[stripped] = tensor
+            elif bare_fqn.startswith("language_model."):
+                stripped = bare_fqn[len("language_model.") :]
+                llm_key = f"{prefix}{stripped}" if prefix else stripped
+                llm_state_dict[llm_key] = tensor
 
             else:
                 hf_result[fqn] = tensor
 
         # Convert LLM keys to HF format
-        converted_llm = self._llm_adapter.to_hf(llm_state_dict, exclude_key_regex=exclude_key_regex, **kwargs)
+        kwargs_llm = dict(kwargs)
+        kwargs_llm.setdefault("v4_compatible", True)
+        converted_llm = self._llm_adapter.to_hf(llm_state_dict, exclude_key_regex=exclude_key_regex, **kwargs_llm)
 
         # Re-add "language_model." prefix
         for key, value in converted_llm.items():
-            hf_result[f"language_model.{key}"] = value
+            if key.startswith(_PEFT_PREFIX):
+                hf_result[f"{_PEFT_PREFIX}language_model.{key[len(_PEFT_PREFIX) :]}"] = value
+            else:
+                hf_result[f"language_model.{key}"] = value
 
         # Convert vision keys back to the checkpoint's own naming (remap for native RadioModel,
         # pass through otherwise) and re-add "vision_model." prefix
@@ -429,7 +458,8 @@ class NemotronOmniStateDictAdapter(StateDictAdapter):
             _radio_native_to_legacy(vision_state_dict) if self.vision_uses_native_radio else vision_state_dict
         )
         for key, value in converted_vision.items():
-            hf_result[f"vision_model.{key}"] = value
+            prefix = vision_prefixes.get(key, "")
+            hf_result[f"{prefix}vision_model.{key}"] = value
 
         return hf_result
 
@@ -446,6 +476,13 @@ class NemotronOmniStateDictAdapter(StateDictAdapter):
         """
         exclude_key_regex = kwargs.get("exclude_key_regex", None)
 
+        if fqn.startswith(_PEFT_PREFIX):
+            prefix = _PEFT_PREFIX
+            bare_fqn = fqn[len(_PEFT_PREFIX) :]
+        else:
+            prefix = ""
+            bare_fqn = fqn
+
         # Vision model: pass through unchanged.
         #
         # For native RadioModel checkpoints the legacy layout fuses q/k/v into one
@@ -455,27 +492,37 @@ class NemotronOmniStateDictAdapter(StateDictAdapter):
         # NeMo-RL -> vLLM refit) can load q/k/v as individual shards. Renaming to the
         # legacy tree without fusing would produce keys no loader recognizes and the
         # vision tower would silently keep its previous (or dummy) weights.
-        if fqn.startswith("vision_model."):
+        if bare_fqn.startswith("vision_model."):
             new_fqn = fqn
 
         # Vision projector
-        elif fqn.startswith("vision_projector."):
-            new_fqn = _VISION_PROJ_CUSTOM_TO_HF.get(fqn, fqn)
+        elif bare_fqn.startswith("vision_projector."):
+            new_bare_fqn = _VISION_PROJ_CUSTOM_TO_HF.get(bare_fqn, bare_fqn)
+            new_fqn = f"{prefix}{new_bare_fqn}"
 
         # Sound encoder
-        elif fqn.startswith("sound_encoder."):
-            new_fqn = "sound_encoder.encoder." + fqn[len("sound_encoder.") :]
+        elif bare_fqn.startswith("sound_encoder."):
+            new_fqn = f"{prefix}sound_encoder.encoder." + bare_fqn[len("sound_encoder.") :]
 
         # Sound projection (pass through)
-        elif fqn.startswith("sound_projection."):
+        elif bare_fqn.startswith("sound_projection."):
             new_fqn = fqn
 
         # LLM keys
-        elif fqn.startswith("language_model."):
-            stripped = fqn[len("language_model.") :]
-            llm_results = self._llm_adapter.convert_single_tensor_to_hf(stripped, tensor, **kwargs)
+        elif bare_fqn.startswith("language_model."):
+            stripped = bare_fqn[len("language_model.") :]
+            llm_fqn = f"{prefix}{stripped}" if prefix else stripped
+            kwargs_llm = dict(kwargs)
+            kwargs_llm.setdefault("v4_compatible", True)
+            llm_results = self._llm_adapter.convert_single_tensor_to_hf(llm_fqn, tensor, **kwargs_llm)
             # Re-add language_model. prefix
-            results = [(f"language_model.{k}", v) for k, v in llm_results]
+            results = []
+            for k, v in llm_results:
+                if k.startswith(_PEFT_PREFIX):
+                    new_k = f"{_PEFT_PREFIX}language_model.{k[len(_PEFT_PREFIX) :]}"
+                else:
+                    new_k = f"language_model.{k}"
+                results.append((new_k, v))
             if exclude_key_regex:
                 results = [(k, v) for k, v in results if not re.match(exclude_key_regex, k)]
             return results
@@ -487,3 +534,15 @@ class NemotronOmniStateDictAdapter(StateDictAdapter):
         if exclude_key_regex:
             result = [(k, v) for k, v in result if not re.match(exclude_key_regex, k)]
         return result
+
+    def map_peft_target_module_to_hf(self, name: str, *, v4_compatible: bool = True) -> str:
+        """Map native PEFT target modules to the public HF namespace."""
+        if name.startswith("language_model."):
+            stripped = name[len("language_model.") :]
+            mapped = self._llm_adapter.map_peft_target_module_to_hf(stripped, v4_compatible=v4_compatible)
+            return f"language_model.{mapped}"
+        if name.startswith("sound_encoder."):
+            return "sound_encoder.encoder." + name[len("sound_encoder.") :]
+        if name.startswith("vision_projector."):
+            return _VISION_PROJ_CUSTOM_TO_HF.get(name, name)
+        return name
