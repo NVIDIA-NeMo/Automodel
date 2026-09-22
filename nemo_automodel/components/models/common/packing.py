@@ -163,22 +163,38 @@ def _model_attn_implementation(model) -> str | None:
     vocabulary is wider than the mask layouts packing knows about: when flash
     attention is requested but only the ``kernels`` package provides it,
     Transformers records a kernels-hub id instead of the mainline name. Those ids
-    are mapped back so a model genuinely running varlen flash attention is packed
-    as such. Any key that still names no known layout yields ``None``, leaving the
-    caller on the configured value.
+    are mapped back through Transformers' ``FLASH_ATTN_KERNEL_FALLBACK`` first,
+    then through the same ``is_kernel`` / ``is_flash_attention_requested`` check
+    Automodel's Hub passthrough uses to accept a repo id -- a user-supplied Hub id
+    (e.g. ``kernels-community/flash-attn3``) need not be the one Transformers'
+    fallback table hardcodes, and an unrecognized flash id here silently skips the
+    varlen packing patches while the model still runs flash attention across
+    document boundaries. Any key that still names no known layout yields ``None``,
+    leaving the caller on the configured value.
     """
     # DDP does not proxy attribute access to the model it wraps, so read through it.
     model = getattr(model, "module", model)
     attn_implementation = getattr(getattr(model, "config", None), "_attn_implementation", None)
     if attn_implementation in _FLASH_ATTN_IMPLEMENTATIONS or attn_implementation in ("sdpa", "eager"):
         return attn_implementation
+    if attn_implementation is None:
+        return None
     try:
         from transformers.modeling_flash_attention_utils import FLASH_ATTN_KERNEL_FALLBACK
     except ImportError:
-        return None
+        FLASH_ATTN_KERNEL_FALLBACK = {}
     for mainline, kernel_id in FLASH_ATTN_KERNEL_FALLBACK.items():
         if kernel_id == attn_implementation:
             return mainline
+    try:
+        from transformers.integrations.hub_kernels import is_kernel
+        from transformers.utils.generic import is_flash_attention_requested
+    except ImportError:
+        return None
+    if is_kernel(attn_implementation) and is_flash_attention_requested(
+        requested_attention_implementation=attn_implementation
+    ):
+        return "flash_attention_2"
     return None
 
 

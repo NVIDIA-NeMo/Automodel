@@ -15,6 +15,7 @@ import pytest
 import torch
 
 from nemo_automodel.components.models.common.packing import (
+    _FLASH_ATTN_IMPLEMENTATIONS,
     _passthrough_create_causal_mask,
     _patch_preprocess_mask_arguments_for_packing,
     configure_packing,
@@ -119,16 +120,26 @@ class TestPassthroughCreateCausalMask:
 # ---------------------------------------------------------------------------
 
 
+def _cfg_without_backend(fallback_attn_implementation: str) -> MagicMock:
+    """A model config with no custom ``backend.attn``, so ``get_attn_implementation``
+    falls through to ``cfg.get("attn_implementation", ...)``."""
+    cfg = MagicMock()
+    del cfg.backend
+    cfg.get.return_value = fallback_attn_implementation
+    return cfg
+
+
+def _model_with_attn(attn_implementation: str | None) -> SimpleNamespace:
+    return SimpleNamespace(config=SimpleNamespace(_attn_implementation=attn_implementation))
+
+
 class TestGetAttnImplementation:
     def test_from_backend_config(self):
         cfg = SimpleNamespace(backend=SimpleNamespace(attn="te"))
         assert get_attn_implementation(cfg) == "te"
 
     def test_from_attn_implementation(self):
-        cfg = MagicMock()
-        del cfg.backend
-        cfg.get.return_value = "flash_attention_2"
-        assert get_attn_implementation(cfg) == "flash_attention_2"
+        assert get_attn_implementation(_cfg_without_backend("flash_attention_2")) == "flash_attention_2"
 
     def test_default_sdpa(self):
         assert get_attn_implementation(None) == "sdpa"
@@ -140,49 +151,52 @@ class TestGetAttnImplementation:
 
     def test_built_model_wins_over_stale_config(self):
         """A packed run force-switches the model to flash; the config keeps saying sdpa."""
-        cfg = MagicMock()
-        del cfg.backend
-        cfg.get.return_value = "sdpa"
-        model = SimpleNamespace(config=SimpleNamespace(_attn_implementation="flash_attention_2"))
+        cfg = _cfg_without_backend("sdpa")
+        model = _model_with_attn("flash_attention_2")
         assert get_attn_implementation(cfg, model=model) == "flash_attention_2"
 
     def test_backend_config_wins_over_built_model(self):
         """Custom models keep naming their backend; ``te`` inits through sdpa."""
         cfg = SimpleNamespace(backend=SimpleNamespace(attn="te"))
-        model = SimpleNamespace(config=SimpleNamespace(_attn_implementation="sdpa"))
+        model = _model_with_attn("sdpa")
         assert get_attn_implementation(cfg, model=model) == "te"
 
     def test_reads_through_ddp_wrapper(self):
         """DDP holds the model as ``.module`` and does not proxy attribute access."""
-        cfg = MagicMock()
-        del cfg.backend
-        cfg.get.return_value = "sdpa"
-        inner = SimpleNamespace(config=SimpleNamespace(_attn_implementation="flash_attention_2"))
+        cfg = _cfg_without_backend("sdpa")
+        inner = _model_with_attn("flash_attention_2")
         assert get_attn_implementation(cfg, model=SimpleNamespace(module=inner)) == "flash_attention_2"
 
     def test_kernels_hub_id_maps_back_to_mainline_flash(self):
         """Transformers records a kernels-hub id when only ``kernels`` provides FA2."""
-        cfg = MagicMock()
-        del cfg.backend
-        cfg.get.return_value = "flash_attention_2"
-        model = SimpleNamespace(config=SimpleNamespace(_attn_implementation="kernels-community/flash-attn2"))
+        cfg = _cfg_without_backend("flash_attention_2")
+        model = _model_with_attn("kernels-community/flash-attn2")
         assert get_attn_implementation(cfg, model=model) == "flash_attention_2"
+
+    def test_kernels_hub_id_outside_the_fallback_table_is_still_flash(self):
+        """``kernels-community/flash-attn3`` is a real, valid flash-attn Hub id, but it is
+        not the one id Transformers' ``FLASH_ATTN_KERNEL_FALLBACK`` hardcodes for
+        ``flash_attention_3`` (that table maps to ``kernels-community/aiter-flash-attn``
+        instead). It must still resolve to a flash implementation here, or
+        ``configure_packing`` silently skips its varlen patches while the model
+        actually runs flash attention, letting packed documents attend across
+        each other's boundaries."""
+        cfg = _cfg_without_backend("eager")
+        model = _model_with_attn("kernels-community/flash-attn3")
+        assert get_attn_implementation(cfg, model=model) in _FLASH_ATTN_IMPLEMENTATIONS
 
     @pytest.mark.parametrize(
         "model",
         [
             SimpleNamespace(),
             SimpleNamespace(config=SimpleNamespace()),
-            SimpleNamespace(config=SimpleNamespace(_attn_implementation=None)),
+            _model_with_attn(None),
             # A dispatch key naming no layout packing knows about must not select one.
-            SimpleNamespace(config=SimpleNamespace(_attn_implementation="some_future_backend")),
+            _model_with_attn("some_future_backend"),
         ],
     )
     def test_falls_back_to_config_when_model_names_no_known_backend(self, model):
-        cfg = MagicMock()
-        del cfg.backend
-        cfg.get.return_value = "eager"
-        assert get_attn_implementation(cfg, model=model) == "eager"
+        assert get_attn_implementation(_cfg_without_backend("eager"), model=model) == "eager"
 
 
 # ---------------------------------------------------------------------------
