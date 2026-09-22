@@ -6,8 +6,6 @@ slug: model-coverage/large-language-models/moonshotai/moonlight
 
 [Moonlight-16B-A3B](https://huggingface.co/moonshotai/Moonlight-16B-A3B) is a Mixture-of-Experts (MoE) language model from Moonshot AI with 16B total parameters and 3B active parameters. Moonshot AI reports training it on 5.7T tokens with the Muon optimizer.
 
-NeMo AutoModel includes standard and packed-sequence fine-tuning recipes, an 8-GPU pretraining template, and Tulu-3 convergence configurations for the base checkpoint.
-
 <Badge>MoE</Badge> <Badge>16B total / 3B active</Badge> <Badge>8K context</Badge>
 
 ## Fine-Tune Moonlight
@@ -31,10 +29,10 @@ uv run automodel examples/llm_finetune/moonlight/moonlight_16b_te_packed_sequenc
 
 | Workflow | Recipe | Parallelism | Key Configuration |
 |---|---|---|---|
-| Standard fine-tuning | [`moonlight_16b_te.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/moonlight/moonlight_16b_te.yaml) | FSDP2, TP=1, CP=1, PP=1, EP=8 | Unpacked HellaSwag data; Transformer Engine attention, linear layers, and experts; DeepEP dispatch; Adam |
-| Packed fine-tuning | [`moonlight_16b_te_packed_sequence.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/moonlight/moonlight_16b_te_packed_sequence.yaml) | FSDP2, TP=1, CP=1, PP=1, EP=8 | 1,024-token THD packs; Transformer Engine attention and linear layers; `torch_mm` experts; DeepEP dispatch; Adam |
-| Pretraining | [Pretraining template](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/megatron_pretrain_moonlight_16b_te_slurm.yaml) | FSDP2, DP=8, EP=8 on 8 GPUs | 2,048-token Megatron-format data; AdamW; Slurm template |
-| Tulu-3 fine-tuning | [`examples/convergence/tulu3/models/moonlight-16b`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/convergence/tulu3/models/moonlight-16b) | FSDP2, EP=8, optional CP=2 on 8 GPUs | 2,048-token data; FlashAdamW or TE FusedAdam; IFEval and loss results |
+| Standard fine-tuning | [`moonlight_16b_te.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/moonlight/moonlight_16b_te.yaml) | FSDP2, EP=8 | TE experts; DeepEP; Adam |
+| Packed fine-tuning | [`moonlight_16b_te_packed_sequence.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/moonlight/moonlight_16b_te_packed_sequence.yaml) | FSDP2, EP=8 | 1,024-token THD packs; `torch_mm` experts; DeepEP |
+| Pretraining | [Pretraining template](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/megatron_pretrain_moonlight_16b_te_slurm.yaml) | FSDP2, DP=8, EP=8 | 2,048-token data; AdamW; Slurm |
+| Tulu-3 fine-tuning | [Tulu-3 configs](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/convergence/tulu3/models/moonlight-16b) | FSDP2, EP=8, optional CP=2 | 2,048-token data; FlashAdamW or TE FusedAdam |
 
 ## Standard Recipe Configuration
 
