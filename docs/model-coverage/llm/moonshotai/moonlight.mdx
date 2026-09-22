@@ -1,64 +1,69 @@
 ---
-title: "Moonlight"
-description: "Fine-tune Moonlight-16B-A3B with NeMo AutoModel using FSDP2, EP=8, Transformer Engine (TE), DeepEP, and optional packed sequences."
+title: "Moonlight-16B-A3B"
+description: "Fine-tune Moonlight-16B-A3B with NeMo AutoModel on 8 GPUs using FSDP2, 8-way expert parallelism, Transformer Engine, and DeepEP."
 slug: model-coverage/large-language-models/moonshotai/Moonlight-16B-A3B
 ---
 
 [Moonlight-16B-A3B](https://huggingface.co/moonshotai/Moonlight-16B-A3B) is a Mixture-of-Experts (MoE) language model from Moonshot AI with 16B total parameters and 3B active parameters. Moonshot AI reports training it on 5.7T tokens with the Muon optimizer.
 
-## Fine-Tune Moonlight
+The documented workflows cover HellaSwag fine-tuning, packed sequences, pretraining from configuration, and Tulu-3 fine-tuning.
 
-Run the standard fine-tuning recipe with `--nproc-per-node 8`:
+## Before You Run
 
-```bash
-git clone https://github.com/NVIDIA-NeMo/Automodel.git
-cd Automodel
-uv sync --locked --all-groups --all-extras
-uv run automodel examples/llm_finetune/moonlight/moonlight_16b_te.yaml --nproc-per-node 8
-```
+Complete the [NeMo AutoModel installation guide](/get-started/installation). Use an environment with Transformer Engine (TE) and DeepEP. The quick start uses Moonlight-16B-A3B, HellaSwag, 2 training epochs, Fully Sharded Data Parallel 2 (FSDP2), and 8-way expert parallelism.
 
-To use packed sequences, run:
-
-```bash
-uv run automodel examples/llm_finetune/moonlight/moonlight_16b_te_packed_sequence.yaml --nproc-per-node 8
-```
+Checkpointing is disabled in the checked-in fine-tuning recipe. The command below enables it and writes the final consolidated checkpoint in Hugging Face-compatible Safetensors format.
 
 ## Choose a Workflow
 
-| Workflow | Recipe | Parallelism | Key Configuration |
-|---|---|---|---|
-| Standard fine-tuning | [`moonlight_16b_te.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/moonlight/moonlight_16b_te.yaml) | FSDP2, EP=8 | TE experts; DeepEP; Adam |
-| Packed fine-tuning | [`moonlight_16b_te_packed_sequence.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/moonlight/moonlight_16b_te_packed_sequence.yaml) | FSDP2, EP=8 | 1,024-token THD packs; `torch_mm` experts; DeepEP |
-| Pretraining | [Pretraining template](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/megatron_pretrain_moonlight_16b_te_slurm.yaml) | FSDP2, DP=8, EP=8 | 2,048-token data; AdamW; Slurm |
-| Tulu-3 fine-tuning | [Tulu-3 configs](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/convergence/tulu3/models/moonlight-16b) | FSDP2, EP=8, optional CP=2 | 2,048-token data; FlashAdamW or TE FusedAdam |
+| Goal | Start Here |
+|---|---|
+| Fine-tune the base checkpoint | Use [`moonlight_16b_te.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/moonlight/moonlight_16b_te.yaml). It fine-tunes on HellaSwag for two epochs with FSDP2 and eight-way expert parallelism. |
+| Fine-tune with packed sequences | Use [`moonlight_16b_te_packed_sequence.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/moonlight/moonlight_16b_te_packed_sequence.yaml). It packs sequences to 1,024 tokens and uses `torch_mm` experts. |
+| Pretrain from configuration | Customize the [pretraining template](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/megatron_pretrain_moonlight_16b_te_slurm.yaml). Replace the data paths, configure Slurm, and submit it on one 8-GPU node. |
+| Reproduce the Tulu-3 workflow | Follow the [Tulu-3 run instructions](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/convergence/tulu3/models/moonlight-16b). Prefilter the data to 2,048 tokens and launch the fine-tuning script with `torchrun`. |
 
-## Alternate Recipe Configuration
+## Fine-Tune Moonlight
+
+From the repository root, run:
+
+```bash
+uv run automodel examples/llm_finetune/moonlight/moonlight_16b_te.yaml \
+  --nproc-per-node 8 \
+  --checkpoint.enabled true \
+  --checkpoint.checkpoint_dir checkpoints/moonlight
+```
+
+## Workflow Details
 
 ### Packed Sequences
 
-The packed recipe uses THD collation with `packed_sequence_size: 1024` and `torch_mm` experts.
+The packed recipe uses 1,024-token packs, a packed-sequence collator, and `torch_mm` experts.
 
 <Warning>
 
-Keep `rope_fusion: false` for the packed recipe. Its configuration disables fused Transformer Engine RoPE because that path can produce NaN or Inf values for the MLA `k_pe` tensor in THD mode.
+Keep `rope_fusion: false` for the packed recipe. Its configuration disables fused Transformer Engine RoPE because that path can produce NaN or Inf values for the MLA `k_pe` tensor in packed-sequence mode.
 
 </Warning>
 
+Run the packed recipe and save a final consolidated Safetensors checkpoint:
+
+```bash
+uv run automodel examples/llm_finetune/moonlight/moonlight_16b_te_packed_sequence.yaml \
+  --nproc-per-node 8 \
+  --checkpoint.enabled true \
+  --checkpoint.checkpoint_dir checkpoints/moonlight-packed \
+  --checkpoint.model_save_format safetensors \
+  --checkpoint.save_consolidated final
+```
+
 ### Pretraining
 
-The pretraining template initializes Moonlight from its Hugging Face configuration and uses FSDP2 with DP=8 and EP=8 on one 8-GPU node. Replace the dataset and index-mapping paths before submitting it through Slurm.
+The pretraining template builds Moonlight from the Hugging Face configuration with no pretrained weights. Replace the dataset and index-mapping paths, configure the Slurm submission file, and then submit the job on one 8-GPU node.
 
-### Tulu-3 Training Example
+### Tulu-3 Convergence
 
-The Moonlight Tulu-3 report covers EP=8 runs on 8 GPUs through step 999, including a CP=2 run. All three configurations report training loss decreasing from 0.875 at step 0 to 0.570 at step 999.
-
-| Configuration | CP | Validation Loss | IFEval Prompt Strict | IFEval Instruction Strict |
-|---|---:|---:|---:|---:|
-| TE FusedAdam | 1 | 0.655 | 0.381 | 0.534 |
-| FlashAdamW | 1 | 0.657 | 0.412 | 0.559 |
-| FlashAdamW | 2 | 0.656 | 0.573 | 0.668 |
-
-The Tulu-3 workflow uses Moonlight's TikToken tokenizer with `trust_remote_code: true`. Its evaluation command stops generation at `<|im_end|>`, and its training data is prefiltered to a 2,048-token sequence length to limit memory spikes from the 163,840-token vocabulary.
+The Tulu-3 workflow launches `examples/llm_finetune/finetune.py` directly with `torchrun`. Follow its [run instructions](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/convergence/tulu3/models/moonlight-16b) to prefilter the dataset to 2,048 tokens and launch the selected configuration. The workflow requires `trust_remote_code: true` for Moonlight's tokenizer, and evaluation stops generation at `<|im_end|>`.
 
 ## Model Reference
 
@@ -82,8 +87,8 @@ The Tulu-3 workflow uses Moonlight's TikToken tokenizer with `trust_remote_code:
 
 | Checkpoint | Type |
 |---|---|
-| [`moonshotai/Moonlight-16B-A3B`](https://huggingface.co/moonshotai/Moonlight-16B-A3B) | Pretrained base model |
-| [`moonshotai/Moonlight-16B-A3B-Instruct`](https://huggingface.co/moonshotai/Moonlight-16B-A3B-Instruct) | Instruction-tuned model |
+| [`moonshotai/Moonlight-16B-A3B`](https://huggingface.co/moonshotai/Moonlight-16B-A3B) | Pretrained base model used by the recipes above |
+| [`moonshotai/Moonlight-16B-A3B-Instruct`](https://huggingface.co/moonshotai/Moonlight-16B-A3B-Instruct) | Upstream instruction-tuned checkpoint |
 
 ## Related Resources
 
