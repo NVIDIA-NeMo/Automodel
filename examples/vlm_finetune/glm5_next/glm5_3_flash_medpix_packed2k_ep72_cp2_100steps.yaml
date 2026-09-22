@@ -151,4 +151,4 @@ ci:
   recipe_owner: HuiyingLi
   nodes: 9
   time: "01:00:00"
-  max_steps: 5
+  max_steps: 10
