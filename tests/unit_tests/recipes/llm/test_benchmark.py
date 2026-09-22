@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pathlib
 import types
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+import yaml
 
 from nemo_automodel.recipes.llm.benchmark import BenchmarkingRecipeForNextTokenPrediction, _infer_vocab_size, main
 
@@ -191,6 +193,21 @@ class TestBenchmarkingRecipeInitialization:
                 BenchmarkingRecipeForNextTokenPrediction(mock_config)
 
                 assert mock_config.dataset.vocab_size == 50257
+
+    def test_super35_recipe_uses_shared_checkpoint(self):
+        """The Super 3.5 benchmark must use a checkpoint reachable from every CI node."""
+        config_path = (
+            pathlib.Path(__file__).resolve().parents[4]
+            / "examples"
+            / "llm_benchmark"
+            / "nemotron"
+            / "super35_vl_text_8k_ep16_fused_adam.yaml"
+        )
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+        assert config["model"]["config"]["pretrained_model_name_or_path"] == (
+            "nvidia/NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained"
+        )
 
     def test_infer_vocab_size_string_target(self, mock_config):
         """Test _infer_vocab_size with a string _target_ (custom config class)."""
