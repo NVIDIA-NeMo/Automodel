@@ -664,6 +664,19 @@ class TestDFlashDecayLossWeightedMean:
         assert torch.isclose(denom_few, denom_many)
         assert denom_few.item() == float(2 * 4)
 
+    def test_mean_denominator_is_fp32_even_under_bf16_weights(self):
+        """``weights`` carries ``token_nll``'s dtype and the unfused path does not
+        upcast it, so building this integer-valued denominator from a bf16 tensor
+        would round it (1022 -> 1024.0 in bf16), disagreeing with the fp32 fused
+        path for identical inputs and skewing the whole D-PACE loss and gradient."""
+        loss_fn = DFlashDecayLoss(loss_type="dpace", dpace_alpha=0.35, normalize="mean")
+        weights = torch.ones(2, 1, K_D, dtype=torch.bfloat16)
+
+        denom = loss_fn._mean_denominator(weights, bsz=2, n_blocks=1, total_blocks=511)
+
+        assert denom.dtype == torch.float32
+        assert denom.item() == 1022.0
+
     def test_total_blocks_does_not_change_the_dflash_denominator(self, dflash_inputs):
         """``total_blocks`` is a D-PACE-only knob: fixed decay's denominator is
         already the (data-dependent, but not partition-sensitive in the reported

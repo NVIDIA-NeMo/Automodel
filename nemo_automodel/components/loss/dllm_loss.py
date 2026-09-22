@@ -986,7 +986,11 @@ class DFlashDecayLoss(nn.Module):
         """
         if self.loss_type in _DPACE_LOSS_TYPES:
             blocks = n_blocks if total_blocks is None else total_blocks
-            return weights.new_tensor(max(float(bsz * blocks), 1.0))
+            # Built in fp32 explicitly: ``weights`` carries token_nll's dtype, and the
+            # unfused path does not upcast it, so a bf16 ``new_tensor`` would round this
+            # integer-valued denominator (e.g. 1022 -> 1024.0), disagreeing with the
+            # fused (fp32) path's scale for identical inputs.
+            return torch.tensor(max(float(bsz * blocks), 1.0), dtype=torch.float32, device=weights.device)
         return weights.sum() + 1e-6
 
     def weighted_mean(
