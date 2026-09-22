@@ -1588,6 +1588,32 @@ class TestBuildModelRetryDepth:
         assert mock_init.call_args.kwargs["kernel_config"] is kernel_config
         sentinel_model.set_use_kernels.assert_not_called()
 
+    def test_from_config_does_not_forward_allow_all_kernels(self):
+        """Only ``from_pretrained`` (a string path) pops ``allow_all_kernels`` before
+        constructing the model; ``_from_config`` forwards unrecognized kwargs straight
+        into ``cls(config, **kwargs)``, so a stock HF model would raise ``TypeError``
+        if this reached model construction on the ``from_config`` path."""
+        build_kwargs, mock_config = self._make_build_kwargs()
+        sentinel_model = MagicMock()
+        build_kwargs.update(allow_all_kernels=True)
+
+        with (
+            patch("nemo_automodel._transformers.auto_model._apply_preload_overrides", return_value=("eager", False)),
+            patch(
+                "nemo_automodel._transformers.auto_model._init_model", return_value=(False, sentinel_model)
+            ) as mock_init,
+            patch("nemo_automodel._transformers.auto_model.get_world_size_safe", return_value=1),
+            patch("nemo_automodel._transformers.auto_model.apply_model_runtime_patches", return_value=sentinel_model),
+            patch("nemo_automodel._transformers.auto_model._verify_sdpa_support"),
+            patch("nemo_automodel._transformers.capabilities.attach_capabilities_and_validate"),
+            patch("nemo_automodel._transformers.auto_model.apply_model_infrastructure", return_value=sentinel_model),
+            patch("torch.cuda.current_device", return_value=0),
+        ):
+            result = _BaseNeMoAutoModelClass._build_model(mock_config, **build_kwargs)
+
+        assert result is sentinel_model
+        assert "allow_all_kernels" not in mock_init.call_args.kwargs
+
     def test_meta_model_rejects_layer_kernel_replacement(self):
         """Layer replacement must not mutate a meta model before sharding."""
         build_kwargs, mock_config = self._make_build_kwargs()

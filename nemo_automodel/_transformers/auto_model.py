@@ -530,7 +530,12 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         model_init_kwargs = dict(kwargs)
         # Transformers consumes these during construction. Keep them out of
         # AutoConfig resolution and the retry kwargs owned by AutoModel.
-        if allow_all_kernels and is_hf_model:
+        # ``allow_all_kernels`` is only popped by HF's own ``from_pretrained``
+        # (a string path) before constructing the model; ``_from_config`` reads it
+        # with ``kwargs.get(...)`` and forwards it straight into ``cls(config,
+        # **kwargs)``, so a stock HF model's ``from_config`` would raise
+        # ``TypeError: unexpected keyword argument 'allow_all_kernels'``.
+        if allow_all_kernels and is_hf_model and isinstance(pretrained_model_name_or_path_or_config, str):
             model_init_kwargs["allow_all_kernels"] = True
         if kernels_applied_during_load:
             model_init_kwargs["use_kernels"] = True
