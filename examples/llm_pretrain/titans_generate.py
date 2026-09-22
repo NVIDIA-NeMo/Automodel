@@ -25,7 +25,8 @@ class TitansGenerator:
             torch_dtype=dtype,
             trust_remote_code=True,
             key_mapping={
-                r"^(.*\.memory)\.(A_log|dt_bias)$": r"\1._fp32_params.\2",
+                r"^(.*\.memory)\.A_log$": r"\1._fp32_params.A_log",
+                r"^(.*\.memory)\.dt_bias$": r"\1._fp32_params.dt_bias",
             },
             output_loading_info=True,
         )
