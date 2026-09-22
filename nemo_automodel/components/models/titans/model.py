@@ -34,6 +34,7 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.titans.config import TitansConfig
 from nemo_automodel.components.models.titans.layers import (
+    NeuralMemoryState,
     TitansBlock,
     TitansMACBlock,
     TitansMAGBlock,
@@ -42,6 +43,29 @@ from nemo_automodel.components.models.titans.layers import (
 )
 from nemo_automodel.components.models.titans.state_dict_adapter import TitansStateDictAdapter
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
+
+
+@dataclass(frozen=True)
+class TitansInferenceState:
+    """Recurrent deep-memory state for aligned LMM or MAC inference."""
+
+    memory_states: tuple[NeuralMemoryState, ...]
+    tokens_seen: int
+
+    def detach(self) -> "TitansInferenceState":
+        """Detach all fast-weight tensors before carrying state across calls."""
+
+        def detach_memory(state: NeuralMemoryState) -> NeuralMemoryState:
+            return NeuralMemoryState(
+                weights=tuple(tensor.detach() for tensor in state.weights),
+                momentum=tuple(tensor.detach() for tensor in state.momentum),
+                qkv_history=tuple(tensor.detach() for tensor in state.qkv_history),
+            )
+
+        return TitansInferenceState(
+            memory_states=tuple(detach_memory(state) for state in self.memory_states),
+            tokens_seen=self.tokens_seen,
+        )
 
 
 class TitansPreTrainedModel(PreTrainedModel):
@@ -117,8 +141,40 @@ class TitansModel(TitansPreTrainedModel):
         h = h[:, :, : self.config.attention_segment_size].reshape(batch, -1, dim)
         return h[:, : h.shape[1] - padding] if padding else h
 
-    def forward(self, input_ids: torch.Tensor, inputs_embeds: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        inputs_embeds: torch.Tensor | None = None,
+        inference_state: TitansInferenceState | None = None,
+        return_inference_state: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, TitansInferenceState]:
+        streaming = inference_state is not None or return_inference_state
+        if streaming:
+            if self.config.architecture_variant not in {"lmm", "mac"}:
+                raise NotImplementedError(
+                    "Stateful inference currently supports LMM and segment-aligned MAC; "
+                    "MAG/MAL also require attention-cache state."
+                )
+            if self.config.mem_depth < 2:
+                raise NotImplementedError("Stateful inference requires deep memory (mem_depth >= 2).")
+            if inference_state is not None and len(inference_state.memory_states) != len(self.layers):
+                raise ValueError(
+                    "Inference state layer count does not match the model: "
+                    f"{len(inference_state.memory_states)} != {len(self.layers)}."
+                )
+
         h = inputs_embeds if inputs_embeds is not None else self.embed_tokens(input_ids)
+        input_length = h.shape[1]
+        if (
+            streaming
+            and self.config.architecture_variant == "mac"
+            and input_length % self.config.attention_segment_size
+        ):
+            raise ValueError(
+                "Stateful MAC calls must contain complete ordinary-token segments: "
+                f"received {input_length} tokens, expected a multiple of "
+                f"{self.config.attention_segment_size}."
+            )
         persistent_length = (
             self.config.num_persistent_memory_tokens
             if self.config.architecture_variant != "mac"
@@ -126,18 +182,46 @@ class TitansModel(TitansPreTrainedModel):
         )
         if self.config.architecture_variant == "mac":
             h, mac_padding = self._insert_longterm_memory(h)
-        elif persistent_length:
+        elif persistent_length and inference_state is None:
             persistent = self.persistent_memory.unsqueeze(0).expand(h.shape[0], -1, -1)
             h = torch.cat((persistent, h), dim=1)
-        for layer in self.layers:
+        if streaming:
+            alignment = self.config.chunk_size
+            if self.config.deep_memory_backend == "titans_pytorch" and self.config.memory_batch_size is not None:
+                alignment = self.config.memory_batch_size
+            if h.shape[1] % alignment:
+                raise ValueError(
+                    "Stateful inference calls must preserve memory re-anchoring boundaries: "
+                    f"received {h.shape[1]} embedded tokens, expected a multiple of {alignment}."
+                )
+        next_memory_states = []
+        for layer_index, layer in enumerate(self.layers):
             if self.gradient_checkpointing and self.training:
+                if streaming:
+                    raise ValueError("Stateful inference is incompatible with training-time gradient checkpointing.")
                 h = self._gradient_checkpointing_func(layer.__call__, h)
+            elif streaming:
+                past_memory = (
+                    inference_state.memory_states[layer_index]
+                    if inference_state is not None
+                    else None
+                )
+                h, next_memory = layer(h, past_state=past_memory, return_state=True)
+                next_memory_states.append(next_memory)
             else:
                 h = layer(h)
         h = self.norm(h)
         if self.config.architecture_variant == "mac":
-            return self._remove_longterm_memory(h, mac_padding)
-        return h[:, persistent_length:]
+            h = self._remove_longterm_memory(h, mac_padding)
+        elif persistent_length and inference_state is None:
+            h = h[:, persistent_length:]
+        if return_inference_state:
+            state = TitansInferenceState(
+                memory_states=tuple(next_memory_states),
+                tokens_seen=(inference_state.tokens_seen if inference_state is not None else 0) + input_length,
+            )
+            return h, state
+        return h
 
 
 class TitansForCausalLM(HFCheckpointingMixin, TitansPreTrainedModel):
@@ -185,9 +269,21 @@ class TitansForCausalLM(HFCheckpointingMixin, TitansPreTrainedModel):
         inputs_embeds: torch.Tensor | None = None,
         labels: torch.Tensor | None = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
+        inference_state: TitansInferenceState | None = None,
+        return_inference_state: bool = False,
         **kwargs,
     ) -> CausalLMOutputWithPast:
-        hidden = self.model(input_ids=input_ids, inputs_embeds=inputs_embeds)
+        model_result = self.model(
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            inference_state=inference_state,
+            return_inference_state=return_inference_state,
+        )
+        if return_inference_state:
+            hidden, next_inference_state = model_result
+        else:
+            hidden = model_result
+            next_inference_state = None
         slice_idx = (
             slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) and logits_to_keep > 0 else slice(None)
         )
@@ -201,7 +297,82 @@ class TitansForCausalLM(HFCheckpointingMixin, TitansPreTrainedModel):
                 shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), ignore_index=-100
             )
 
-        return CausalLMOutputWithPast(loss=loss, logits=logits)
+        return CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=next_inference_state,
+        )
+
+    @torch.no_grad()
+    def prefill(
+        self,
+        input_ids: torch.Tensor,
+        inference_state: TitansInferenceState | None = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+    ) -> CausalLMOutputWithPast:
+        """Run one aligned LMM/MAC prefill and return detached recurrent state."""
+        output = self.forward(
+            input_ids=input_ids,
+            logits_to_keep=logits_to_keep,
+            inference_state=inference_state,
+            return_inference_state=True,
+        )
+        output.past_key_values = output.past_key_values.detach()
+        return output
+
+    @torch.no_grad()
+    def generate_full_prefix(
+        self,
+        input_ids: torch.Tensor,
+        max_new_tokens: int,
+        *,
+        eos_token_id: int | None = None,
+        do_sample: bool = False,
+        temperature: float = 1.0,
+        top_k: int | None = None,
+    ) -> torch.Tensor:
+        """Generate by recomputing the complete prefix at every decoding step.
+
+        This is the correctness-first path for every Titans architecture. It
+        preserves the configured chunk/segment semantics without pretending
+        that hybrid attention or a partially filled memory chunk has a valid
+        cache. Stateful decoding can replace it only after prefix-equivalence
+        tests pass for the relevant architecture.
+        """
+        if input_ids.ndim != 2:
+            raise ValueError(f"input_ids must have shape [batch, sequence]; got {tuple(input_ids.shape)}.")
+        if max_new_tokens < 0:
+            raise ValueError("max_new_tokens must be non-negative.")
+        if temperature <= 0:
+            raise ValueError("temperature must be positive.")
+        if top_k is not None and top_k <= 0:
+            raise ValueError("top_k must be positive when provided.")
+
+        generated = input_ids
+        finished = torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
+        stop_id = self.config.eos_token_id if eos_token_id is None else eos_token_id
+
+        for _ in range(max_new_tokens):
+            next_logits = self(generated, logits_to_keep=1).logits[:, -1]
+            if do_sample:
+                next_logits = next_logits / temperature
+                if top_k is not None:
+                    k = min(top_k, next_logits.shape[-1])
+                    threshold = torch.topk(next_logits, k, dim=-1).values[:, -1, None]
+                    next_logits = next_logits.masked_fill(next_logits < threshold, float("-inf"))
+                next_token = torch.multinomial(torch.softmax(next_logits, dim=-1), num_samples=1)
+            else:
+                next_token = next_logits.argmax(dim=-1, keepdim=True)
+
+            if stop_id is not None:
+                stop_tokens = torch.full_like(next_token, stop_id)
+                next_token = torch.where(finished[:, None], stop_tokens, next_token)
+                finished = finished | next_token.squeeze(-1).eq(stop_id)
+            generated = torch.cat((generated, next_token), dim=-1)
+            if stop_id is not None and finished.all():
+                break
+
+        return generated
 
     # --- NeMo AutoModel construction / init -----------------------------------
     @classmethod

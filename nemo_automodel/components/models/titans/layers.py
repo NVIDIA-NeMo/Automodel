@@ -1014,9 +1014,25 @@ class TitansBlock(nn.Module):
         self.post_attention_layernorm = TitansRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.mlp = TitansMLP(config.hidden_size, config.intermediate_size, dtype=dtype)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.memory(self.input_layernorm(x))
+    def forward(
+        self,
+        x: torch.Tensor,
+        past_state: NeuralMemoryState | None = None,
+        return_state: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, NeuralMemoryState]:
+        memory_result = self.memory(
+            self.input_layernorm(x),
+            past_state=past_state,
+            return_state=return_state,
+        )
+        if return_state:
+            memory_out, next_state = memory_result
+        else:
+            memory_out = memory_result
+        x = x + memory_out
         x = x + self.mlp(self.post_attention_layernorm(x))
+        if return_state:
+            return x, next_state
         return x
 
     def init_weights(self, init_std: float = 0.02):
@@ -1034,10 +1050,26 @@ class TitansMACBlock(TitansBlock):
         self.attention_layernorm = TitansRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.attention = SegmentedCausalAttention(config, dtype=dtype)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.memory(self.input_layernorm(x))
+    def forward(
+        self,
+        x: torch.Tensor,
+        past_state: NeuralMemoryState | None = None,
+        return_state: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, NeuralMemoryState]:
+        memory_result = self.memory(
+            self.input_layernorm(x),
+            past_state=past_state,
+            return_state=return_state,
+        )
+        if return_state:
+            memory_out, next_state = memory_result
+        else:
+            memory_out = memory_result
+        x = x + memory_out
         x = x + self.attention(self.attention_layernorm(x))
         x = x + self.mlp(self.post_attention_layernorm(x))
+        if return_state:
+            return x, next_state
         return x
 
     def init_weights(self, init_std: float = 0.02):

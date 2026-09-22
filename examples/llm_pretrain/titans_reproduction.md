@@ -111,6 +111,58 @@ The paper leaves MAG's exact nonlinear gate unspecified, so the normalized
 SiLU product is an explicit operational choice. MAG/MAL runs remain
 implementation-validation experiments until downstream behavior is checked.
 
+## Inference-state contract
+
+The paper and public implementations use a model-owned runtime rather than a
+separate serving engine. AutoModel follows that design. For deep LMM and MAC
+models, `TitansForCausalLM.prefill()` accepts an aligned token block and returns
+logits plus a `TitansInferenceState` in `past_key_values`. The state contains
+every layer's test-time-updated memory weights, momentum, causal-convolution
+history, and the number of ordinary tokens consumed:
+
+```python
+first = model.prefill(prompt_ids[:, :split])
+second = model.prefill(
+    prompt_ids[:, split:],
+    inference_state=first.past_key_values,
+)
+```
+
+The returned state is detached automatically and can be discarded to reset
+memory between evaluation examples. Calls must preserve the training
+re-anchoring boundaries: use `memory_batch_size` boundaries for the
+`titans_pytorch` backend and `chunk_size` boundaries for the reference backend.
+MAC calls must also contain complete `attention_segment_size` ordinary-token
+segments so long-term-memory tokens are inserted at the same positions as a
+concatenated forward. LMM persistent tokens are consumed only on the first
+call.
+
+The first stateful contract supports LMM and segment-aligned MAC prefill.
+Stateful MAG/MAL and token-by-token MAC generation additionally require
+per-layer attention KV state, MAC segment position, and partial memory-chunk
+state. Until those caches pass concatenated-forward equivalence, generation
+must use `generate_full_prefix()`, which recomputes the complete sequence for
+each generated token and preserves the current chunk/segment semantics. It is
+a slow correctness baseline, not the final throughput path. RULER and
+`lm-evaluation-harness` are benchmark adapters above this runtime, not
+inference engines.
+
+After running the generated `<checkpoint>/model/consolidate.sh`, exercise that
+baseline directly against the resulting Hugging Face directory:
+
+```bash
+uv run python examples/llm_pretrain/titans_generate.py \
+  --checkpoint /path/to/checkpoint/model/consolidated \
+  --prompt "The secret key is sapphire. The secret key is"
+```
+
+For benchmark integration, pass `--input-jsonl requests.jsonl
+--output-jsonl generations.jsonl`. Each input row requires `prompt` and may
+specify `id` and `max_new_tokens`; each output row records the generated
+continuation and token counts. This keeps checkpoint loading and Titans
+execution inside AutoModel while allowing RULER task generation/scoring to
+remain an external harness.
+
 ## Acceptance gates
 
 A full-scale run may start only after:

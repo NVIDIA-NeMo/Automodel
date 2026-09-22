@@ -435,6 +435,135 @@ def test_deep_memory_state_carry_matches_concatenated_forward():
     torch.testing.assert_close(torch.cat((first, second), dim=1), expected, rtol=1e-10, atol=1e-10)
 
 
+def test_lmm_prefill_state_matches_concatenated_model_forward():
+    """Model-level prefill carries every layer's fast weights and convolution history."""
+    torch.manual_seed(8)
+    config = _tiny_config(
+        mem_depth=2,
+        chunk_size=4,
+        qkv_conv_kernel_size=4,
+        num_persistent_memory_tokens=4,
+        deep_memory_backend="reference",
+    )
+    model = TitansForCausalLM(config).eval()
+    input_ids = torch.randint(0, config.vocab_size, (2, 8))
+
+    with torch.no_grad():
+        expected = model(input_ids).logits
+        first = model.prefill(input_ids[:, :4])
+        second = model.prefill(input_ids[:, 4:], inference_state=first.past_key_values)
+
+    actual = torch.cat((first.logits, second.logits), dim=1)
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+    assert first.past_key_values.tokens_seen == 4
+    assert second.past_key_values.tokens_seen == 8
+    assert len(second.past_key_values.memory_states) == config.num_hidden_layers
+    for state in second.past_key_values.memory_states:
+        assert all(not tensor.requires_grad for tensor in state.weights)
+        assert all(not tensor.requires_grad for tensor in state.momentum)
+        assert all(not tensor.requires_grad for tensor in state.qkv_history)
+
+
+@pytest.mark.parametrize("variant", ["mag", "mal"])
+def test_prefill_rejects_global_attention_architectures_until_kv_state_is_available(variant):
+    config = _tiny_config(
+        architecture_variant=variant,
+        mem_depth=2,
+        chunk_size=4,
+        num_persistent_memory_tokens=4,
+    )
+    model = TitansForCausalLM(config).eval()
+    input_ids = torch.randint(0, config.vocab_size, (1, 4))
+
+    with pytest.raises(NotImplementedError, match="MAG/MAL"):
+        model.prefill(input_ids)
+
+
+def test_mac_prefill_state_matches_segment_aligned_model_forward():
+    torch.manual_seed(10)
+    config = _tiny_config(
+        architecture_variant="mac",
+        attention_segment_size=4,
+        num_longterm_memory_tokens=2,
+        num_persistent_memory_tokens=3,
+        mem_depth=2,
+        chunk_size=2,
+        qkv_conv_kernel_size=4,
+        deep_memory_backend="reference",
+    )
+    model = TitansForCausalLM(config).eval()
+    input_ids = torch.randint(0, config.vocab_size, (1, 8))
+
+    with torch.no_grad():
+        expected = model(input_ids).logits
+        first = model.prefill(input_ids[:, :4])
+        second = model.prefill(input_ids[:, 4:], inference_state=first.past_key_values)
+
+    torch.testing.assert_close(
+        torch.cat((first.logits, second.logits), dim=1),
+        expected,
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    assert second.past_key_values.tokens_seen == 8
+
+
+def test_mac_prefill_rejects_partial_attention_segments():
+    config = _tiny_config(
+        architecture_variant="mac",
+        attention_segment_size=4,
+        num_longterm_memory_tokens=2,
+        mem_depth=2,
+        chunk_size=2,
+    )
+    model = TitansForCausalLM(config).eval()
+
+    with pytest.raises(ValueError, match="complete ordinary-token segments"):
+        model.prefill(torch.randint(0, config.vocab_size, (1, 2)))
+
+
+def test_public_backend_prefill_requires_memory_batch_boundaries():
+    config = _tiny_config(
+        mem_depth=2,
+        chunk_size=2,
+        deep_memory_backend="titans_pytorch",
+        memory_batch_size=8,
+        qkv_conv_kernel_size=0,
+    )
+    model = TitansForCausalLM(config).eval()
+    input_ids = torch.randint(0, config.vocab_size, (1, 4))
+
+    with pytest.raises(ValueError, match="multiple of 8"):
+        model.prefill(input_ids)
+
+
+@pytest.mark.parametrize("variant", ["lmm", "mac", "mag", "mal"])
+def test_full_prefix_generation_supports_every_architecture(variant):
+    torch.manual_seed(9)
+    overrides = dict(
+        architecture_variant=variant,
+        mem_depth=2,
+        chunk_size=2,
+        qkv_conv_kernel_size=0,
+        num_persistent_memory_tokens=2,
+    )
+    if variant == "mac":
+        overrides.update(attention_segment_size=4, num_longterm_memory_tokens=2)
+    config = _tiny_config(**overrides)
+    model = TitansForCausalLM(config).eval()
+    prompt = torch.randint(0, config.vocab_size, (2, 4))
+
+    expected_first = model(prompt, logits_to_keep=1).logits[:, -1].argmax(dim=-1)
+    generated = model.generate_full_prefix(
+        prompt,
+        max_new_tokens=2,
+        eos_token_id=-1,
+    )
+
+    assert generated.shape == (2, 6)
+    torch.testing.assert_close(generated[:, 4], expected_first)
+
+
 def test_170m_lmm_recipe_matches_paper_scale():
     """The first full reproduction recipe pins the paper's 170M setup."""
     recipe_path = Path(__file__).parents[4] / "examples/llm_pretrain/titans_170m_lmm.yaml"

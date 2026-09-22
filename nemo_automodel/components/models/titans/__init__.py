@@ -21,11 +21,16 @@ that ``AutoModelForCausalLM.from_config(TitansConfig(...))`` works out of the bo
 
 from nemo_automodel.components.models.titans.config import TitansConfig
 from nemo_automodel.components.models.titans.layers import NeuralMemory, NeuralMemoryState, titans_delta_rule_recurrence
-from nemo_automodel.components.models.titans.model import TitansForCausalLM, TitansModel
+from nemo_automodel.components.models.titans.model import (
+    TitansForCausalLM,
+    TitansInferenceState,
+    TitansModel,
+)
 
 __all__ = [
     "TitansConfig",
     "TitansForCausalLM",
+    "TitansInferenceState",
     "TitansModel",
     "NeuralMemory",
     "NeuralMemoryState",
