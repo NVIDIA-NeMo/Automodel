@@ -41,9 +41,22 @@ export PYTHONPATH="$AUTOMODEL_CHECKOUT${PYTHONPATH:+:$PYTHONPATH}"
 export HF_HOME=${HF_HOME:-"$TITANS_WORK_ROOT/cache/huggingface"}
 export NLTK_DATA=${NLTK_DATA:-"$TITANS_WORK_ROOT/cache/nltk"}
 mkdir -p "$NLTK_DATA"
-python -c "import nltk, tenacity, wonderwords" 2>/dev/null || \
-  python -m pip install --quiet nltk tenacity wonderwords
+python -c "import bs4, html2text, nltk, tenacity, wonderwords" 2>/dev/null || \
+  python -m pip install --quiet beautifulsoup4 html2text nltk tenacity wonderwords
 python -m nltk.downloader -q -d "$NLTK_DATA" punkt punkt_tab
+
+RULER_ASSET_DIR="$RULER_REPO/scripts/data/synthetic/json"
+RULER_ESSAYS="$RULER_ASSET_DIR/PaulGrahamEssays.json"
+if [[ ! -s "$RULER_ESSAYS" ]]; then
+  (
+    flock 9
+    if [[ ! -s "$RULER_ESSAYS" ]]; then
+      cd "$RULER_ASSET_DIR"
+      python download_paulgraham_essay.py
+      test -s "$RULER_ESSAYS"
+    fi
+  ) 9>"$RULER_ASSET_DIR/.PaulGrahamEssays.lock"
+fi
 
 declare -A RUNS=(
   [lmm]=titans-170m-baseline-15B-blackwell-optimized
