@@ -33,6 +33,16 @@ NeMo AutoModel includes standard and packed-sequence fine-tuning recipes, an 8-G
 
 ## NeMo AutoModel recipes
 
+The runnable example uses [`moonlight_16b_te.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/moonlight/moonlight_16b_te.yaml).
+
+| Setting | Configuration |
+|---|---|
+| Hardware | 8 GPUs in the example command; adjust `--nproc-per-node` to the GPUs available |
+| Strategy | FSDP2; TP=1, PP=1, CP=1, EP=8 |
+| Nodes | Single node in the local AutoModel CLI workflow |
+| Features | Transformer Engine attention, linear layers, and experts; DeepEP dispatch; FSDP optimizations |
+| Advanced | HellaSwag; `packed_sequence_size=0`; Adam with `lr=1.0e-4` and `foreach=false` |
+
 | Workflow | Recipe | Parallelism | Key configuration |
 |---|---|---|---|
 | Standard fine-tuning | [`moonlight_16b_te.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/moonlight/moonlight_16b_te.yaml) | FSDP2, TP=1, CP=1, PP=1, EP=8 | Unpacked HellaSwag data; Transformer Engine attention, linear layers, and experts; DeepEP dispatch; Adam |
