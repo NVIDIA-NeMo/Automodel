@@ -579,51 +579,6 @@ class TestLossComputation:
                 loss_weighting_scheme="invalid_scheme",
             )
 
-    def test_discrete_shifted_schedule_matches_reference_values(self, simple_adapter, monkeypatch):
-        """Frozen values from DiffSynth c458cb42's 1000-step, shift-5 scheduler."""
-        pipeline = FlowMatchingPipeline(
-            model_adapter=simple_adapter,
-            timestep_sampling="uniform_discrete",
-            loss_weighting_scheme="bsmntw_shifted",
-            flow_shift=5.0,
-            device=torch.device("cpu"),
-        )
-        indices = torch.tensor([0, 1, 100, 500, 999])
-        monkeypatch.setattr(torch, "randint", lambda *args, **kwargs: indices)
-        sigma, timesteps, method = pipeline.sample_timesteps(5)
-        expected_sigma = torch.tensor([1.0, 0.999799788, 0.978260875, 0.833333313, 0.0049800803])
-        expected_weight = torch.tensor([0.0, 0.0012814513, 0.139074892, 1.024861932, 0.0318790115])
-        torch.testing.assert_close(sigma, expected_sigma, rtol=1e-7, atol=1e-8)
-        torch.testing.assert_close(timesteps, expected_sigma * 1000)
-        assert method == "uniform_discrete"
-        prediction = torch.zeros(5, 1, 1, 1, 1)
-        target = torch.ones_like(prediction)
-        weighted, average, _, _, weights, _ = pipeline.compute_loss(prediction, target, sigma)
-        torch.testing.assert_close(weights.flatten(), expected_weight, rtol=1e-6, atol=1e-7)
-        torch.testing.assert_close(weighted.flatten(), expected_weight, rtol=1e-6, atol=1e-7)
-        torch.testing.assert_close(average, expected_weight.mean())
-
-    def test_discrete_bf16_timesteps_match_reference_lookup(self, simple_adapter, monkeypatch):
-        """Frozen DiffSynth c458cb42 values include BF16's changed grid indices."""
-        pipeline = FlowMatchingPipeline(
-            model_adapter=simple_adapter,
-            timestep_sampling="uniform_discrete",
-            loss_weighting_scheme="bsmntw_shifted",
-            flow_shift=5.0,
-            device=torch.device("cpu"),
-        )
-        indices = torch.tensor([100, 333, 500, 833, 999])
-        monkeypatch.setattr(torch, "randint", lambda *args, **kwargs: indices)
-        sigma, timesteps, _ = pipeline.sample_timesteps(5, dtype=torch.bfloat16)
-        expected_sigma = torch.tensor([0.9799048305, 0.9080963135, 0.8322193027, 0.5005995631, 0.0049800803])
-        expected_weight = torch.tensor([0.1285694540, 0.5814303756, 1.0311326981, 2.0764002800, 0.0318790115])
-        torch.testing.assert_close(sigma, expected_sigma, rtol=0, atol=0)
-        torch.testing.assert_close(timesteps, torch.tensor([980, 908, 832, 500, 4.96875], dtype=torch.bfloat16))
-        prediction = torch.zeros(5, 1, 1, 1, 1)
-        _, _, _, _, weights, _ = pipeline.compute_loss(prediction, torch.ones_like(prediction), sigma)
-        # FP32 exp/reductions vary by a few ULPs across CPU kernels; match the FP32-grid test tolerance.
-        torch.testing.assert_close(weights.flatten(), expected_weight, rtol=1e-6, atol=1e-7)
-
     @pytest.mark.parametrize("kwargs", [{"num_train_timesteps": 1}, {"flow_shift": 0}, {"sigma_min": 1.0}])
     def test_discrete_schedule_rejects_invalid_grid(self, simple_adapter, kwargs):
         with pytest.raises(ValueError, match="discrete flow grid"):

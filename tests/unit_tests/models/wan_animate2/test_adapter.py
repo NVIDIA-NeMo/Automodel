@@ -14,8 +14,7 @@
 
 """CPU unit tests for the Wan-Animate-2 flow-matching adapter.
 
-Input-contract tests run on CPU. Real released-transformer forward and backward
-parity are covered in test_interleaved.py.
+These tests cover cached-input contracts, supervised latents, and training precision.
 
 The geometry expectations come from how the upstream transformer *consumes* the
 adapter's outputs: its ``(1, 2, 2)`` patch embedding turns every latent frame
@@ -331,8 +330,8 @@ def test_prepare_latents_includes_reference_in_supervised_target() -> None:
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_training_noise_preserves_reference_precision(dtype: torch.dtype) -> None:
-    """DiffSynth samples noise and subtracts clean latents in the training dtype."""
+def test_training_noise_preserves_latent_precision(dtype: torch.dtype) -> None:
+    """Noise is sampled directly in the latent tensor's dtype."""
     latents = torch.zeros(1, 16, 3, 4, 4, dtype=dtype)
     torch.manual_seed(53)
     expected = torch.randn_like(latents)

@@ -56,8 +56,8 @@ class WanAnimate2Adapter(ModelAdapter):
 
     The generation stream carries one extra leading latent frame that holds the
     reference-character slot. Training noises and supervises that frame along
-    with the target video, as DiffSynth's training path does. Inference drops
-    its decoded prediction when assembling the output video.
+    with the target video. Inference drops its decoded prediction when
+    assembling the output video.
     """
 
     def prepare_latents(self, latents: torch.Tensor, batch: dict[str, Any]) -> torch.Tensor:
@@ -81,7 +81,7 @@ class WanAnimate2Adapter(ModelAdapter):
         return torch.cat([reference.to(device=latents.device, dtype=latents.dtype), latents], dim=2)
 
     def sample_noise(self, latents: torch.Tensor) -> torch.Tensor:
-        """Match the reference training path's native-precision noise and target.
+        """Sample Gaussian noise in the latent tensor's dtype.
 
         Args:
             latents: Complete clean stream [batch, 16, target_frames + 1, height,
@@ -100,7 +100,7 @@ class WanAnimate2Adapter(ModelAdapter):
         *,
         noise_schedule: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],
     ) -> torch.Tensor:
-        """Preserve DiffSynth's scalar interpolation and intermediate rounding.
+        """Interpolate each sample with scalar noise levels and native-precision rounding.
 
         Args:
             latents: Complete clean stream [batch, 16, target_frames + 1, height,
