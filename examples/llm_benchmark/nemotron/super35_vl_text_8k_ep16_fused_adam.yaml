@@ -37,7 +37,7 @@ model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
   config:
     _target_: transformers.AutoConfig.from_pretrained
-    pretrained_model_name_or_path: /lustre/fsw/portfolios/coreai/users/huiyingl/super35_perf_hsg_20260915/model_full
+    pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained
     trust_remote_code: true
   dtype: bfloat16
   num_nextn_predict_layers: 0
