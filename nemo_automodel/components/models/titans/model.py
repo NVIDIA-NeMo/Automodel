@@ -79,6 +79,9 @@ class TitansPreTrainedModel(PreTrainedModel):
     # any mixed-precision sharding (see layers.NeuralMemory and state_dict_adapter).
     _keep_in_fp32_modules = ["A_log", "dt_bias"]
     _keep_in_fp32_modules_strict = ["A_log", "dt_bias"]
+    _checkpoint_conversion_mapping = {
+        r"^(.*\.memory)\.(A_log|dt_bias)$": r"\1._fp32_params.\2",
+    }
 
     def _init_weights(self, module: nn.Module) -> None:
         std = self.config.initializer_range
