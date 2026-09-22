@@ -1201,9 +1201,7 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
             **promoted,
         }
 
-    def prepare_mtp_inputs_for_cp(
-        self, batch: dict[str, Any], *, ignore_index: int = -100
-    ) -> MTPContextParallelInputs:
+    def prepare_mtp_inputs_for_cp(self, batch: dict[str, Any], *, ignore_index: int = -100) -> MTPContextParallelInputs:
         """Prepare dense Qwen VLM future-token streams before CP sharding.
 
         Call this after :meth:`prepare_model_inputs_for_cp` has materialized
