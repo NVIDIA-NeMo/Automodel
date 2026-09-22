@@ -21,6 +21,7 @@ import pprint
 import re
 import sys
 import types
+from collections.abc import Callable
 from copy import deepcopy
 from pathlib import Path
 
@@ -333,6 +334,38 @@ def _resolve_target(dotted_path: str) -> Any:
     raise ImportError(f"Cannot resolve target (blocked or not found): {dotted_path}")
 
 
+_HF_LOCAL_FILES_FIRST_ENV = "NEMO_AUTOMODEL_HF_LOCAL_FILES_FIRST"
+
+
+def _call_hf_from_pretrained_local_first(
+    func: Callable[..., Any], args: tuple[Any, ...], config_kwargs: dict[str, Any]
+) -> Any:
+    """Prefer a warm Hugging Face cache without concurrent online cache updates.
+
+    A local-only lookup avoids rewriting shared cache refs and snapshot links
+    while other ranks read them. Missing files fall back to the original call;
+    callables that reject the added keyword retain their original behavior.
+    Other errors propagate without retrying the callable.
+
+    Cached revisions take precedence over checking the Hub for updates. An
+    explicit ``local_files_only`` argument always wins; setting
+    ``NEMO_AUTOMODEL_HF_LOCAL_FILES_FIRST=0`` disables the cache-first attempt.
+    Cold-cache downloads are not synchronized by this helper.
+    """
+    if os.environ.get(_HF_LOCAL_FILES_FIRST_ENV, "1") == "0" or "local_files_only" in config_kwargs:
+        return func(*args, **config_kwargs)
+    try:
+        return func(*args, local_files_only=True, **config_kwargs)
+    except OSError:
+        # Hugging Face reports files missing from the local cache as OSError.
+        # Retry the original call so it can download them or report its error.
+        return func(*args, **config_kwargs)
+    except TypeError as exc:
+        if "unexpected keyword argument 'local_files_only'" not in str(exc):
+            raise
+        return func(*args, **config_kwargs)
+
+
 class ConfigNode:
     """
     A configuration node that wraps a dictionary (or parts of it) from a YAML file.
@@ -496,6 +529,8 @@ class ConfigNode:
         import traceback
 
         try:
+            if getattr(func, "__name__", "") == "from_pretrained":
+                return _call_hf_from_pretrained_local_first(func, args, config_kwargs)
             return func(*args, **config_kwargs)
         except Exception as e:
             sig = inspect.signature(func)
