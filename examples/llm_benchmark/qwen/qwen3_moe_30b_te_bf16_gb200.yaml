@@ -14,11 +14,11 @@
 
 # Benchmarking config for Qwen3 MoE 30B (A3B) bf16, experts=te (TE GroupedLinear, NO fp8), GB200 (WAVE 11 bake-off).
 #
-# Single-variable delta vs qwen3_moe_30b_te_deepep_gb200.yaml: experts gmm -> te.
+# Single-variable delta vs qwen3_moe_30b_te_deepep_gb200.yaml: experts torch_mm -> te.
 # No te_fp8 block => TE GroupedLinear runs in BF16 (not fp8). Same lbs16/GBS512/ep8/2N op point.
 # ep_size=8 == world (2N x 4) => experts:te params are NOT FSDP-wrapped (plain tensors) while the
 # rest are DTensor; optimizer.foreach=false avoids aten._foreach_lerp_ batching a plain-Tensor +
-# DTensor together (same fix as the TE-mxfp8 ep==world configs). gmm baseline = 26.12% MFU@2500 / 9.237s.
+# DTensor together (same fix as the TE-mxfp8 ep==world configs). Native torch_mm comparison = 25.45% MFU@2500.
 #
 # GB200 deltas vs the generic qwen3_moe_30b_te_deepep.yaml:
 #   - peak_tflops: 2500  (GB200 BF16 dense peak; generic recipe uses H100 989)
@@ -86,7 +86,7 @@ model:
     linear: te
     rms_norm: te
     rope_fusion: true
-    experts: te  # WAVE 11: TE GroupedLinear bf16 (no fp8); vs gmm
+    experts: te  # WAVE 11: TE GroupedLinear bf16 (no fp8); vs torch_mm
     dispatcher: hybridep  # GB200: deepep fails EP-buffer init ('invalid resource handle')
     fake_balanced_gate: true
     enable_hf_state_dict_adapter: true

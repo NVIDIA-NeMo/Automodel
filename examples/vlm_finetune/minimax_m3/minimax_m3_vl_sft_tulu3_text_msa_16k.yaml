@@ -28,7 +28,7 @@ model:
     sparse_attn: msa
     linear: te
     rope_fusion: false
-    experts: gmm
+    experts: torch_mm
     dispatcher: hybridep
     enable_fsdp_optimizations: true
 

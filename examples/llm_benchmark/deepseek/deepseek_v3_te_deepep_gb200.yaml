@@ -75,7 +75,7 @@ model:
     linear: te
     rms_norm: te
     rope_fusion: true
-    experts: gmm
+    experts: torch_mm
     dispatcher: hybridep  # GB200: deepep fails EP-buffer init ('invalid resource handle')
     fake_balanced_gate: true
     enable_hf_state_dict_adapter: false
