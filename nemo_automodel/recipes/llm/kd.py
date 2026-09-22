@@ -54,33 +54,41 @@ _HAS_WANDB, wandb = safe_import(
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
-from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.components.distributed.config import DistributedSetup
-from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
-from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
-from nemo_automodel.components.distributed.tp_replicas import synchronize_tp_replica_gradients
-from nemo_automodel.components.distributed.utils import get_sync_ctx
-from nemo_automodel.components.loggers.metric_logger import MetricsSample
-from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
-from nemo_automodel.components.loss.utils import (
-    _count_label_tokens,
-    _get_loss_ignore_index,
-    _normalize_kd_labels,
+from nemo_automodel.components.config import parse_args_and_load_config
+from nemo_automodel.components.distributed import (
+    ContextParallelSharder,
+    DistributedSetup,
+    PipelineConfig,
+    get_sync_ctx,
+    synchronize_tp_replica_gradients,
+)
+from nemo_automodel.components.loggers import MetricsSample
+from nemo_automodel.components.loss import (
+    FusedLinearCrossEntropy,
     calculate_loss,
 )
-from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
-from nemo_automodel.components.training.rng import ScopedRNG
-from nemo_automodel.components.training.signal_handler import DistributedSignalHandler
-from nemo_automodel.components.training.utils import (
+from nemo_automodel.components.loss import (
+    count_label_tokens as _count_label_tokens,
+)
+from nemo_automodel.components.loss import (
+    get_loss_ignore_index as _get_loss_ignore_index,
+)
+from nemo_automodel.components.loss import (
+    normalize_kd_labels as _normalize_kd_labels,
+)
+from nemo_automodel.components.training import (
+    DistributedSignalHandler,
     ScopedModuleOffloading,
+    ScopedRNG,
     count_tail_padding,
     get_expert_tp_replication_factor,
+    get_final_hidden_states,
     prepare_after_first_microbatch,
     prepare_for_final_backward,
     prepare_for_grad_accumulation,
     scale_grads_and_clip_grad_norm,
 )
-from nemo_automodel.components.utils.model_utils import filter_forward_kwargs
+from nemo_automodel.components.utils import filter_forward_kwargs
 from nemo_automodel.recipes.kd_utils import (
     RUN_TEACHER,
     STOP_TEACHER,

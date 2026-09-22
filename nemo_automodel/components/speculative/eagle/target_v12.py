@@ -22,7 +22,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
-from nemo_automodel.components.datasets.llm.packed_sequence import build_block_causal_additive_mask
+from nemo_automodel.components.datasets import build_block_causal_additive_mask
 
 
 def _shift_left_with_zero(tensor: torch.Tensor) -> torch.Tensor:

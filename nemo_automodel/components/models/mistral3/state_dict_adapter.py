@@ -45,7 +45,7 @@ from typing import TYPE_CHECKING, Any, Callable
 
 import torch
 
-from nemo_automodel.components.checkpoint.state_dict_adapter import CheckpointLoadPart, StateDictAdapter
+from nemo_automodel.components.checkpoint import CheckpointLoadPart, StateDictAdapter
 
 if TYPE_CHECKING:
     from torch.distributed.device_mesh import DeviceMesh

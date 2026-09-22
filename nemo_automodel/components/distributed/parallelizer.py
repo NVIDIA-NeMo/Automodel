@@ -2366,7 +2366,7 @@ def _uses_custom_moe_modules(model: nn.Module) -> bool:
     return any(isinstance(module, MoE) for module in iter_modules())
 
 
-def _get_parallel_plan(
+def get_parallel_plan(
     model: nn.Module,
     sequence_parallel: bool = False,
     tp_shard_plan: Union[Dict[str, ParallelStyle], str] | None = None,
@@ -2576,6 +2576,9 @@ def _get_parallel_plan(
         model_parallel_plan = _validate_moe_tp_plan(model_parallel_plan, model=model)
 
     return model_parallel_plan
+
+
+_get_parallel_plan = get_parallel_plan
 
 
 # Taken and modified from torchtitan

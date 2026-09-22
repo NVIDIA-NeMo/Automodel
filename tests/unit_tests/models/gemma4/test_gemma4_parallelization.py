@@ -18,7 +18,7 @@ from types import SimpleNamespace
 
 import torch.nn as nn
 
-from nemo_automodel.components.distributed.parallel_styles import ReplicatedWithGradAllReduce
+from nemo_automodel.components.distributed import ReplicatedWithGradAllReduce
 from nemo_automodel.components.models.gemma4_moe.parallelization import _gemma4_tp_plan
 
 

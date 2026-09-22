@@ -69,7 +69,7 @@ def _parse_split_slice(split: str | None):
     return base, slice(start, end)
 
 
-def _load_openai_messages(
+def load_openai_messages(
     path_or_dataset_id: Union[str, Sequence[str]],
     split: str | None = None,
     name: str | None = None,
@@ -186,6 +186,9 @@ def _load_openai_messages(
         _read_file(f)
 
     return rows
+
+
+_load_openai_messages = load_openai_messages
 
 
 def _normalize_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

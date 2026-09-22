@@ -23,7 +23,7 @@ import torch
 logger = logging.getLogger(__name__)
 
 
-def _resolve_chat_template(chat_template: str | None) -> str | None:
+def resolve_chat_template(chat_template: str | None) -> str | None:
     """Resolve a chat template string that may be a file path.
 
     If *chat_template* points to an existing file, its contents are returned.
@@ -52,6 +52,9 @@ def _resolve_chat_template(chat_template: str | None) -> str | None:
             pass
         return content
     return chat_template
+
+
+_resolve_chat_template = resolve_chat_template
 
 
 if TYPE_CHECKING:
@@ -663,7 +666,7 @@ def _add_pad_token(tokenizer):
     return pad_token_id
 
 
-def _has_chat_template(tokenizer: "PreTrainedTokenizer") -> bool:
+def has_chat_template(tokenizer: "PreTrainedTokenizer") -> bool:
     """
     Check if the tokenizer supports a chat template.
 
@@ -676,6 +679,9 @@ def _has_chat_template(tokenizer: "PreTrainedTokenizer") -> bool:
     return getattr(tokenizer, "chat_template", None) is not None and callable(
         getattr(tokenizer, "apply_chat_template", None)
     )
+
+
+_has_chat_template = has_chat_template
 
 
 def _package_tokenized_example(

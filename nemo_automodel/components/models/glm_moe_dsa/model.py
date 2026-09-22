@@ -41,7 +41,7 @@ from nemo_automodel.components.models.glm_moe_dsa.optimized_kernels import prepa
 from nemo_automodel.components.models.glm_moe_dsa.state_dict_adapter import GlmMoeDsaStateDictAdapter
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MLP, MoE, MoEConfig
-from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
+from nemo_automodel.components.utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
@@ -429,7 +429,7 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         """
         from functools import partial  # noqa: PLC0415
 
-        from nemo_automodel.components.distributed.context_parallel.sharder import (  # noqa: PLC0415
+        from nemo_automodel.components.distributed import (  # noqa: PLC0415
             ContextParallelSharder,
             contiguous_local_indices,
         )

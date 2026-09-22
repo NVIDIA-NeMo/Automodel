@@ -29,7 +29,7 @@ from typing import Any
 import torch.nn as nn
 
 from nemo_automodel.components.quantization.fp8 import apply_fp8_to_model, build_fp8_config
-from nemo_automodel.components.utils.compile_utils import build_compile_config, compile_module_inplace
+from nemo_automodel.components.utils import build_compile_config, compile_module_inplace
 
 
 def apply_draft_fp8(draft_model: nn.Module, cfg_fp8: Any) -> None:

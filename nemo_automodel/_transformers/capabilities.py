@@ -44,9 +44,11 @@ logger = logging.getLogger(__name__)
 
 def _has_optimized_tp_plan(model_cls: type) -> bool:
     """Check if *model_cls* has an entry in ``PARALLELIZE_FUNCTIONS``."""
-    from nemo_automodel.components.distributed.optimized_tp_plans import (
+    from nemo_automodel.components.distributed import (
         PARALLELIZE_FUNCTIONS,
-        _get_class_qualname,
+    )
+    from nemo_automodel.components.distributed import (
+        get_class_qualname as _get_class_qualname,
     )
 
     return _get_class_qualname(model_cls) in PARALLELIZE_FUNCTIONS

@@ -405,7 +405,7 @@ def _run_args(**over):
 def test_load_prompts_caps_and_drops_unusable(monkeypatch):
     rows = [{"messages": "a"}, {"messages": "b"}, {"messages": "c"}]
     monkeypatch.setattr(
-        "nemo_automodel.components.datasets.llm.chat_dataset._load_openai_messages",
+        "nemo_automodel.components.datasets.load_openai_messages",
         lambda *a, **k: rows,
     )
     # "b" yields no usable prompt and must be skipped; the cap stops at 2.

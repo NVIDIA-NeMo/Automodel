@@ -51,7 +51,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from transformers import PreTrainedModel, PreTrainedTokenizerFast
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from nemo_automodel.components.distributed.context_parallel.sharder import (
+from nemo_automodel.components.distributed import (
     ContextParallelSharder,
     contiguous_local_indices,
 )
