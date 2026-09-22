@@ -5,6 +5,8 @@ slug: model-coverage/large-language-models/xiaomimimo/mimo-v2-flash
 ---
 [MiMo-V2-Flash](https://huggingface.co/XiaomiMiMo/MiMo-V2-Flash) is Xiaomi's hybrid attention Mixture-of-Experts language model. It alternates full and sliding-window attention layers, uses a `sigmoid_with_bias` router with group-limited expert routing, and ships as an FP8 HF checkpoint.
 
+[MiMo-V2.6-Flash-RL](https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Flash-RL) uses the registered `MiMoV2ForCausalLM` architecture. It adds an image tower, fused FP8 QKV checkpoint tensors, and MXFP4 expert tensors while retaining the hybrid MiMo text backbone.
+
 <Info>
 
 | | |
@@ -19,6 +21,7 @@ slug: model-coverage/large-language-models/xiaomimimo/mimo-v2-flash
 ## Available Models
 
 - **MiMo-V2-Flash**: hybrid full/sliding-window attention with FP8 weights.
+- **MiMo-V2.6-Flash-RL**: multimodal `MiMoV2ForCausalLM` checkpoint with FP8 attention and MXFP4 experts.
 
 ## Architecture
 
@@ -32,6 +35,7 @@ slug: model-coverage/large-language-models/xiaomimimo/mimo-v2-flash
 | Model | HF ID |
 |---|---|
 | MiMo-V2-Flash | [`XiaomiMiMo/MiMo-V2-Flash`](https://huggingface.co/XiaomiMiMo/MiMo-V2-Flash) |
+| MiMo-V2.6-Flash-RL | [`XiaomiMiMo/MiMo-V2.6-Flash-RL`](https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Flash-RL) |
 
 ## Example Recipes
 
@@ -87,3 +91,4 @@ See the [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).
 ## Hugging Face Model Cards
 
 - [XiaomiMiMo/MiMo-V2-Flash](https://huggingface.co/XiaomiMiMo/MiMo-V2-Flash)
+- [XiaomiMiMo/MiMo-V2.6-Flash-RL](https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Flash-RL)

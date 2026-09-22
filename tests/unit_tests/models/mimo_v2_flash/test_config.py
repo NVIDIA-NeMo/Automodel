@@ -12,7 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from nemo_automodel.components.models.mimo_v2_flash.config import MiMoV2FlashConfig
+import json
+
+import pytest
+
+from nemo_automodel._transformers.model_init import get_hf_config
+from nemo_automodel._transformers.registry import MODEL_ARCH_MAPPING, resolve_custom_config_cls
+from nemo_automodel.components.models.mimo_v2_flash.config import MiMoV2Config, MiMoV2FlashConfig
 
 
 class TestMiMoV2FlashConfig:
@@ -95,3 +101,36 @@ class TestMiMoV2FlashConfig:
 
     def test_keys_to_ignore_at_inference(self):
         assert MiMoV2FlashConfig.keys_to_ignore_at_inference == ["past_key_values"]
+
+
+class TestMiMoV2Config:
+    def test_defaults_to_fused_layout(self):
+        cfg = MiMoV2Config()
+        assert cfg.attention_projection_layout == "fused_qkv"
+        assert cfg.apply_router_weight_after_down
+        assert not MiMoV2FlashConfig().apply_router_weight_after_down
+
+    def test_model_type_and_fused_layout(self):
+        cfg = MiMoV2Config(attention_projection_layout="fused_qkv")
+        assert cfg.model_type == "mimo_v2"
+        assert cfg.attention_projection_layout == "fused_qkv"
+
+    def test_rejects_unknown_projection_layout(self):
+        with pytest.raises(ValueError, match="attention_projection_layout"):
+            MiMoV2Config(attention_projection_layout="unknown")
+
+    def test_checkpoint_style_config_resolves_local_class(self, tmp_path):
+        (tmp_path / "config.json").write_text(
+            json.dumps({"model_type": "mimo_v2", "architectures": ["MiMoV2ForCausalLM"]})
+        )
+
+        cfg = get_hf_config(tmp_path, attn_implementation="sdpa")
+
+        assert isinstance(cfg, MiMoV2Config)
+        assert cfg.attention_projection_layout == "fused_qkv"
+        assert cfg.apply_router_weight_after_down
+        assert resolve_custom_config_cls("mimo_v2") is MiMoV2Config
+        assert MODEL_ARCH_MAPPING["MiMoV2ForCausalLM"] == (
+            "nemo_automodel.components.models.mimo_v2_flash.model",
+            "MiMoV2ForCausalLM",
+        )

@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from transformers import PretrainedConfig
 
 
@@ -56,6 +58,7 @@ class MiMoV2FlashConfig(PretrainedConfig):
         rope_scaling: dict | None = None,
         attention_bias: bool = False,
         attention_dropout: float = 0.0,
+        attention_projection_layout: str = "split",
         attention_value_scale: float | None = 0.707,
         add_full_attention_sink_bias: bool = False,
         add_swa_attention_sink_bias: bool = True,
@@ -74,8 +77,12 @@ class MiMoV2FlashConfig(PretrainedConfig):
         topk_group: int = 1,
         norm_topk_prob: bool = True,
         routed_scaling_factor: float | None = 1.0,
+        apply_router_weight_after_down: bool = False,
         moe_layer_freq: list[int] | None = None,
         torch_dtype: str = "bfloat16",
+        vision_config: dict | None = None,
+        audio_config: dict | None = None,
+        processor_config: dict | None = None,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -102,6 +109,12 @@ class MiMoV2FlashConfig(PretrainedConfig):
         self.rope_scaling = rope_scaling
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
+        if attention_projection_layout not in {"split", "fused_qkv"}:
+            raise ValueError(
+                "attention_projection_layout must be either 'split' or 'fused_qkv', "
+                f"got {attention_projection_layout!r}"
+            )
+        self.attention_projection_layout = attention_projection_layout
         self.attention_value_scale = attention_value_scale
         self.add_full_attention_sink_bias = add_full_attention_sink_bias
         self.add_swa_attention_sink_bias = add_swa_attention_sink_bias
@@ -132,8 +145,12 @@ class MiMoV2FlashConfig(PretrainedConfig):
         self.topk_group = topk_group
         self.norm_topk_prob = norm_topk_prob
         self.routed_scaling_factor = 1.0 if routed_scaling_factor is None else routed_scaling_factor
+        self.apply_router_weight_after_down = apply_router_weight_after_down
         self.moe_layer_freq = moe_layer_freq if moe_layer_freq is not None else [0] + [1] * (num_hidden_layers - 1)
         self.torch_dtype = torch_dtype
+        self.vision_config = vision_config
+        self.audio_config = audio_config
+        self.processor_config = processor_config
 
         self.rope_parameters = {
             "rope_theta": rope_theta,
@@ -146,3 +163,25 @@ class MiMoV2FlashConfig(PretrainedConfig):
             use_cache=use_cache,
             **kwargs,
         )
+
+
+class MiMoV2Config(MiMoV2FlashConfig):
+    """Configuration for MiMo-V2.5 and MiMo-V2.6 checkpoints.
+
+    These checkpoints retain the MiMo-V2-Flash text backbone while using the
+    ``mimo_v2`` model type, fused QKV checkpoint layout, and optional
+    multimodal encoder configuration.
+    """
+
+    model_type = "mimo_v2"
+
+    def __init__(self, **kwargs: Any) -> None:
+        """Initialize V2.5/V2.6 fields through the shared MiMo config.
+
+        Transformers dataclass-wraps ``PretrainedConfig`` subclasses that do
+        not declare their own initializer.  Keeping this explicit pass-through
+        preserves the parent field handling and validation.
+        """
+        kwargs.setdefault("attention_projection_layout", "fused_qkv")
+        kwargs.setdefault("apply_router_weight_after_down", True)
+        super().__init__(**kwargs)
