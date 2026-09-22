@@ -194,8 +194,8 @@ class TestBenchmarkingRecipeInitialization:
 
                 assert mock_config.dataset.vocab_size == 50257
 
-    def test_super35_recipe_uses_shared_checkpoint_and_four_visible_gpus(self):
-        """The Super 3.5 benchmark must use shared inputs and expose four GPUs per node."""
+    def test_super35_recipe_uses_supported_shared_ci_inputs(self):
+        """The Super 3.5 benchmark must keep its shared CI inputs within backend limits."""
         config_path = (
             pathlib.Path(__file__).resolve().parents[4]
             / "examples"
@@ -209,6 +209,7 @@ class TestBenchmarkingRecipeInitialization:
             "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"
         )
         assert config["ci"]["env_vars"]["CUDA_VISIBLE_DEVICES"] == "0,1,2,3"
+        assert config["step_scheduler"]["local_batch_size"] == 2
 
     def test_infer_vocab_size_string_target(self, mock_config):
         """Test _infer_vocab_size with a string _target_ (custom config class)."""

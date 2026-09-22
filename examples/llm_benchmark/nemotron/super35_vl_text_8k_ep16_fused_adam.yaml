@@ -20,7 +20,7 @@ recipe: BenchmarkingRecipeForNextTokenPrediction
 seed: 1234
 step_scheduler:
   global_batch_size: 128
-  local_batch_size: 8
+  local_batch_size: 2
   max_steps: 15
   num_epochs: 30
   ckpt_every_steps: 1000
