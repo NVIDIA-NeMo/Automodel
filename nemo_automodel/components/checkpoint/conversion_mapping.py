@@ -30,6 +30,8 @@ The primary entry points are:
 - `requires_tensor_merging(model_type)`: Check if model needs tensor operations
 """
 
+import re
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -186,9 +188,11 @@ _VLM_KEY_MAPPINGS: dict[str, dict[str, str]] = {
 def get_combined_key_mapping(
     model_type: str,
     model_key_mapping: dict[str, str] | None = None,
-) -> dict[str, str] | None:
+    *,
+    model: "nn.Module | None" = None,
+) -> dict[str, str] | Callable[[str], str] | None:
     """
-    Get combined key mapping for simple regex-based key renaming.
+    Get root key renames and optional scoped submodel renames.
 
     This is a simpler alternative to get_model_conversion_mapping that only
     handles key renaming (not tensor operations). Useful when you just need
@@ -201,10 +205,14 @@ def get_combined_key_mapping(
         model_type: The model type string from config.model_type
         model_key_mapping: Optional key mapping from the model's
                           `_checkpoint_conversion_mapping` attribute
+        model: Optional model instance whose nested submodels may supply additional
+            scoped renames. Omit for models whose state-dict adapter or tensor
+            converters own checkpoint conversion.
 
     Returns:
-        Combined key mapping dictionary (regex pattern -> replacement),
-        or None if no mappings are defined.
+        Regex mapping, a callable that also applies nested-model renames in order,
+        or None if no mappings are defined. The callable preserves submodel scopes
+        that cannot be represented by a single first-match regex mapping.
     """
     # VLM models with known restructured hierarchies get explicit mappings
     # that override the generic transformers conversion (e.g. transformers 5.5.0
@@ -239,6 +247,27 @@ def get_combined_key_mapping(
                         for source, target in zip(sources, targets):
                             if source not in result:
                                 result[source] = target
+
+        if model is not None:
+            scoped_renamings = [
+                conversion
+                for conversion in get_model_conversion_mapping(model, add_legacy=False)
+                if isinstance(conversion, WeightRenaming) and conversion.scope_prefix is not None
+            ]
+            if scoped_renamings:
+
+                def rename_key(key: str) -> str:
+                    # Preserve first-match semantics for explicit/root rules, then
+                    # let HF apply nested rules relative to their owning submodels.
+                    for pattern, replacement in result.items():
+                        key, count = re.subn(pattern, replacement, key)
+                        if count:
+                            break
+                    for conversion in scoped_renamings:
+                        key, _ = conversion.rename_source_key(key)
+                    return key
+
+                return rename_key
 
     return result if result else None
 
