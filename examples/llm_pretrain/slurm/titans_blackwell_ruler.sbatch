@@ -41,7 +41,7 @@ export PYTHONPATH="$AUTOMODEL_CHECKOUT${PYTHONPATH:+:$PYTHONPATH}"
 export HF_HOME=${HF_HOME:-"$TITANS_WORK_ROOT/cache/huggingface"}
 export NLTK_DATA=${NLTK_DATA:-"$TITANS_WORK_ROOT/cache/nltk"}
 mkdir -p "$NLTK_DATA"
-python -c "import nltk" 2>/dev/null || python -m pip install --quiet nltk
+python -c "import nltk, wonderwords" 2>/dev/null || python -m pip install --quiet nltk wonderwords
 python -m nltk.downloader -q -d "$NLTK_DATA" punkt punkt_tab
 
 declare -A RUNS=(
