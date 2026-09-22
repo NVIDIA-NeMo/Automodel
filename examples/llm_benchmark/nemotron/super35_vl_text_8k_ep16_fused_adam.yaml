@@ -116,4 +116,5 @@ ci:
   nodes: 4
   nproc_per_node: 4
   env_vars:
+    CUDA_VISIBLE_DEVICES: "0,1,2,3"
     PYTORCH_ALLOC_CONF: expandable_segments:True
