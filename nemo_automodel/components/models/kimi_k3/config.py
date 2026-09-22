@@ -89,6 +89,8 @@ class KimiK3TextConfig(PretrainedConfig):
         kda_disable_recompute: bool = False,
         kda_conv_backend: str = "triton",
         kda_transpose_state_layout: bool = True,
+        situ_triton: bool = False,
+        attn_res_triton: bool = False,
         attn_res_block_size: int | None = 12,
         activation_situ_beta: float | None = 4.0,
         activation_situ_linear_beta: float | None = 25.0,
@@ -163,6 +165,10 @@ class KimiK3TextConfig(PretrainedConfig):
         self.kda_disable_recompute = kda_disable_recompute
         self.kda_conv_backend = kda_conv_backend
         self.kda_transpose_state_layout = kda_transpose_state_layout
+        # Kimi-K3-only kernel switches: Triton kernels for the SiTU activation (kimi_k3/situ_triton.py) and for the
+        # attention-residual mix (kimi_k3/attn_res_triton.py); both are no-ops without Triton.
+        self.situ_triton = situ_triton
+        self.attn_res_triton = attn_res_triton
         self.attn_res_block_size = attn_res_block_size
         self.activation_situ_beta = activation_situ_beta
         self.activation_situ_linear_beta = activation_situ_linear_beta
