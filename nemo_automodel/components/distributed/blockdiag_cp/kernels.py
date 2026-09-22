@@ -27,12 +27,27 @@ from nemo_automodel.shared.import_utils import safe_import_te
 logger = logging.getLogger(__name__)
 
 
-def _get_flash_functions() -> tuple[Callable[..., Any] | None, Callable[..., Any] | None]:
-    """Load FlashAttention functions through Transformers' supported loader."""
-    from transformers.modeling_flash_attention_utils import lazy_import_flash_attention
+_FLASH_FUNCTIONS: tuple[Callable[..., Any] | None, Callable[..., Any] | None] | None = None
 
-    flash_functions, _ = lazy_import_flash_attention("flash_attention_2")
-    return flash_functions[0], flash_functions[1]
+
+def _get_flash_functions() -> tuple[Callable[..., Any] | None, Callable[..., Any] | None]:
+    """Load FlashAttention functions through Transformers' supported loader.
+
+    Cached after the first successful call. ``lazy_import_flash_attention`` is not a
+    pure probe: it overwrites Transformers' module-global "currently loaded"
+    implementation whenever the requested one differs from what is already loaded.
+    A model attending with a different implementation (flash_attention_3, a Hub
+    kernel id, ...) reloads that global back on every real attention call, so
+    probing "flash_attention_2" fresh here on every CP layer/step would thrash the
+    global against the model's own forward pass instead of just reading it once.
+    """
+    global _FLASH_FUNCTIONS
+    if _FLASH_FUNCTIONS is None:
+        from transformers.modeling_flash_attention_utils import lazy_import_flash_attention
+
+        flash_functions, _ = lazy_import_flash_attention("flash_attention_2")
+        _FLASH_FUNCTIONS = (flash_functions[0], flash_functions[1])
+    return _FLASH_FUNCTIONS
 
 
 def _has_flash_varlen() -> bool:

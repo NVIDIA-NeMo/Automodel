@@ -564,6 +564,30 @@ def test_select_kv_exchange_path_downgrades_name_reasons():
     assert path == "allgather" and "dropout" in reason
 
 
+def test_get_flash_functions_caches_the_loader_call(monkeypatch):
+    """``lazy_import_flash_attention`` overwrites Transformers' loaded-implementation
+    global as a side effect, so calling it fresh probes "flash_attention_2" against
+    whatever a model's own attention forward just loaded (flash_attention_3, a Hub
+    kernel id, ...) and reloads it back on every CP layer/step. The probe must run
+    at most once, not on every ``_has_flash_varlen()`` / ``_get_flash_functions()``
+    call."""
+    monkeypatch.setattr(bd_kernels, "_FLASH_FUNCTIONS", None)
+    calls = []
+
+    def fake_loader(implementation):
+        calls.append(implementation)
+        return (object(), object(), None, None, None), None
+
+    monkeypatch.setattr("transformers.modeling_flash_attention_utils.lazy_import_flash_attention", fake_loader)
+
+    first = bd_kernels._get_flash_functions()
+    second = bd_kernels._get_flash_functions()
+    assert bd_kernels._has_flash_varlen() is True
+
+    assert calls == ["flash_attention_2"]
+    assert first is second
+
+
 def test_flash_long_prefix_guard_peels_only_boundary_segment(monkeypatch):
     calls = []
 
