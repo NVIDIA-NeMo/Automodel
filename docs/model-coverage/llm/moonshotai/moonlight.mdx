@@ -4,6 +4,15 @@ description: "Fine-tune Moonlight-16B-A3B with NeMo AutoModel using FSDP2, EP=8,
 slug: model-coverage/large-language-models/moonshotai/moonlight
 ---
 
+<style>
+{`
+.light .fern-prose code:not(.code-block),
+.light .fern-code-block pre.code-block-root {
+  background-color: var(--nv-color-bg-alt, #f7f7f7) !important;
+}
+`}
+</style>
+
 [Moonlight-16B-A3B](https://huggingface.co/moonshotai/Moonlight-16B-A3B) is a Mixture-of-Experts language model from Moonshot AI with 16B total parameters and 3B active parameters. Moonshot AI reports training it on 5.7T tokens with the Muon optimizer.
 
 NeMo AutoModel includes standard and packed-sequence fine-tuning recipes, an 8-GPU pretraining template, and Tulu-3 convergence configurations for the base checkpoint.
