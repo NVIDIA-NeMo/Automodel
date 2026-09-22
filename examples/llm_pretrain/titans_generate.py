@@ -24,6 +24,9 @@ class TitansGenerator:
             checkpoint,
             torch_dtype=dtype,
             trust_remote_code=True,
+            key_mapping={
+                r"^(.*\.memory)\.(A_log|dt_bias)$": r"\1._fp32_params.\2",
+            },
             output_loading_info=True,
         )
         load_errors = {
