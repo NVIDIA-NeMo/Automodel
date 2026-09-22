@@ -1103,7 +1103,7 @@ class KimiK3MoE(MoE):
         if backend.compile_situ:
             _compile_situ_cores()
         if getattr(config, "situ_triton", False):
-            _enable_situ_triton()
+            _enable_situ_triton(fast_math=getattr(config, "situ_fast_math", False))
         if backend.compile_norm:
             _compile_norm_core()
         expert_activation = partial(

@@ -90,6 +90,7 @@ class KimiK3TextConfig(PretrainedConfig):
         kda_conv_backend: str = "triton",
         kda_transpose_state_layout: bool = True,
         situ_triton: bool = False,
+        situ_fast_math: bool = False,
         attn_res_triton: bool = False,
         attn_res_block_size: int | None = 12,
         activation_situ_beta: float | None = 4.0,
@@ -168,6 +169,8 @@ class KimiK3TextConfig(PretrainedConfig):
         # Kimi-K3-only kernel switches: Triton kernels for the SiTU activation (kimi_k3/situ_triton.py) and for the
         # attention-residual mix (kimi_k3/attn_res_triton.py); both are no-ops without Triton.
         self.situ_triton = situ_triton
+        # SFU tanh.approx / exp2 / rcp.approx inside the Triton SiTU kernels (<= 1 bf16 ulp from libdevice); needs situ_triton.
+        self.situ_fast_math = situ_fast_math
         self.attn_res_triton = attn_res_triton
         self.attn_res_block_size = attn_res_block_size
         self.activation_situ_beta = activation_situ_beta
@@ -191,6 +194,10 @@ class KimiK3TextConfig(PretrainedConfig):
             raise ValueError("kda_mode must be 'chunk' or 'fused_recurrent'.")
         if self.kda_conv_backend not in {"triton", "cuda"}:
             raise ValueError("kda_conv_backend must be 'triton' or 'cuda'.")
+        if self.situ_fast_math and not self.situ_triton:
+            raise ValueError(
+                "situ_fast_math selects the SFU variants of the Triton SiTU kernels and requires situ_triton=True."
+            )
         if self.linear_attn_config is None:
             return
         if "kda_layers" not in self.linear_attn_config or "full_attn_layers" not in self.linear_attn_config:

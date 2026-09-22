@@ -160,12 +160,16 @@ def _build_decoder_layer(backend: BackendConfig, **config_knobs) -> KimiDecoderL
 
 def test_situ_triton_flag_wires_decoder_layer(monkeypatch):
     calls = []
-    monkeypatch.setattr(kimi_k3_model, "_enable_situ_triton", lambda: calls.append("situ"))
+    monkeypatch.setattr(kimi_k3_model, "_enable_situ_triton", lambda **kw: calls.append(("situ", kw.get("fast_math"))))
     assert _tiny_config().situ_triton is False and not hasattr(BackendConfig(), "situ_triton")
     _build_decoder_layer(_torch_backend())
     assert calls == []
     _build_decoder_layer(_torch_backend(), situ_triton=True)
-    assert calls == ["situ"]
+    assert calls == [("situ", False)]
+    _build_decoder_layer(
+        _torch_backend(), situ_triton=True, situ_fast_math=True
+    )  # the SFU variant rides on situ_triton
+    assert calls == [("situ", False), ("situ", True)]
 
 
 def test_attn_res_triton_flag_wires_decoder_layer(monkeypatch):
