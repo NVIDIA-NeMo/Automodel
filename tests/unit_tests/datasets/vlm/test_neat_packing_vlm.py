@@ -297,20 +297,85 @@ class TestNeatPackDatasetVlm:
             assert sum(item["seq_lens_padded"]) == len(item["input_ids"])
             assert all(length % 8 == 0 for length in item["seq_lens_padded"])
 
-    def test_thd_config_derives_alignment_from_cp_size(self):
+    def test_thd_config_default_preserves_cp1_and_derives_cp_alignment(self):
         samples = [_make_vlm_sample(4)]
+        raw = [{"_text_tokens": 4, "conversation": []}]
         config = NeatPackConfig(pack_size=16, collate_max_length=16, packing_format="thd")
 
-        packed = config.build(
+        packed_cp1 = config.build(
             dataset=_FakeDataset(samples),
             padding_idx=0,
-            ds_raw=[{"_text_tokens": 4, "conversation": []}],
+            ds_raw=raw,
+            cp_size=1,
+        )
+        packed_cp4 = config.build(
+            dataset=_FakeDataset(samples),
+            padding_idx=0,
+            ds_raw=raw,
             cp_size=4,
         )
 
-        assert packed.sequence_alignment == 8
-        assert packed[0]["seq_lens"] == [3]
-        assert packed[0]["seq_lens_padded"] == [8]
+        assert packed_cp1.sequence_alignment == 1
+        assert packed_cp1[0]["seq_lens_padded"] == [3]
+        assert packed_cp4.sequence_alignment == 8
+        assert packed_cp4[0]["seq_lens"] == [3]
+        assert packed_cp4[0]["seq_lens_padded"] == [8]
+
+    def test_thd_config_explicit_alignment_keeps_cp1_cp2_packing_identical(self):
+        samples = [_make_vlm_sample(4) for _ in range(3)]
+        raw = [{"_text_tokens": 4, "conversation": []} for _ in samples]
+        config = NeatPackConfig(
+            pack_size=16,
+            collate_max_length=16,
+            packing_format="thd",
+            sequence_alignment=4,
+            balance_media_tokens=False,
+        )
+
+        packed_cp1 = config.build(
+            dataset=_FakeDataset(samples),
+            padding_idx=0,
+            ds_raw=raw,
+            cp_size=1,
+        )
+        packed_cp2 = config.build(
+            dataset=_FakeDataset(samples),
+            padding_idx=0,
+            ds_raw=raw,
+            cp_size=2,
+        )
+
+        assert packed_cp1.sequence_alignment == packed_cp2.sequence_alignment == 4
+        assert packed_cp1.bins == packed_cp2.bins
+        assert len(packed_cp1) == len(packed_cp2) == 1
+        cp1_item = packed_cp1[0]
+        cp2_item = packed_cp2[0]
+        assert cp1_item["seq_lens"] == cp2_item["seq_lens"] == [3, 3, 3]
+        assert cp1_item["seq_lens_padded"] == cp2_item["seq_lens_padded"] == [4, 4, 4]
+        torch.testing.assert_close(cp1_item["input_ids"], cp2_item["input_ids"])
+        torch.testing.assert_close(cp1_item["labels"], cp2_item["labels"])
+
+    def test_thd_config_rejects_invalid_explicit_alignment(self):
+        with pytest.raises(ValueError, match="sequence_alignment must be at least 1"):
+            NeatPackConfig(packing_format="thd", sequence_alignment=0)
+
+        explicit_cp1 = NeatPackConfig(
+            pack_size=16,
+            packing_format="thd",
+            sequence_alignment=1,
+        ).build(
+            dataset=_FakeDataset([]),
+            padding_idx=0,
+            cp_size=1,
+        )
+        assert explicit_cp1.sequence_alignment == 1
+
+        with pytest.raises(ValueError, match=r"sequence_alignment must be a multiple of 2 \* cp_size"):
+            NeatPackConfig(pack_size=16, packing_format="thd", sequence_alignment=2).build(
+                dataset=_FakeDataset([]),
+                padding_idx=0,
+                cp_size=2,
+            )
 
     def test_thd_config_rejects_mrope_cp_and_unaligned_collate_length(self):
         with pytest.raises(NotImplementedError, match="multi-axis mRoPE"):
@@ -321,7 +386,7 @@ class TestNeatPackDatasetVlm:
                 cp_size=2,
             )
 
-        with pytest.raises(ValueError, match=r"collate_max_length must be divisible by 2 \* cp_size"):
+        with pytest.raises(ValueError, match="collate_max_length must be divisible by sequence_alignment"):
             NeatPackConfig(pack_size=10, collate_max_length=10, packing_format="thd").build(
                 dataset=_FakeDataset([]),
                 padding_idx=0,

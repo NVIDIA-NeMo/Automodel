@@ -210,6 +210,31 @@ class MiMoV2FlashStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
         self.backend = backend
         self.dtype = dtype
         self._uses_model_prefix = True
+        self.hf_to_internal_map: dict[str, str] = {}
+        if self.backend.attn == "te":
+            self.hf_to_internal_map["self_attn.attention_sink_bias"] = "self_attn.attn_module.softmax_offset"
+        self.internal_to_hf_map = {internal: hf for hf, internal in self.hf_to_internal_map.items()}
+
+    @staticmethod
+    def _apply_key_mapping(state_dict: dict[str, Any], mapping: dict[str, str]) -> dict[str, Any]:
+        """Rename matching state-dict leaves in place without touching prefixes."""
+        for key in list(state_dict):
+            for pattern, replacement in mapping.items():
+                if key.endswith(pattern):
+                    new_key = key[: -len(pattern)] + replacement
+                    value = state_dict.pop(key)
+                    if replacement.endswith("attn_module.softmax_offset") and isinstance(value, torch.Tensor):
+                        value = value.to(torch.float32)
+                    state_dict[new_key] = value
+                    break
+        return state_dict
+
+    def _model_to_hf_key(self, model_key: str) -> str:
+        """Map one native MiMo tensor name back to its Hugging Face leaf name."""
+        for pattern, replacement in self.internal_to_hf_map.items():
+            if model_key.endswith(pattern):
+                return model_key[: -len(pattern)] + replacement
+        return model_key
 
     @property
     def _uses_fused_qkv_checkpoint(self) -> bool:
@@ -230,6 +255,7 @@ class MiMoV2FlashStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
         hf_state_dict = self._convert_fused_qkv(hf_state_dict)
         hf_state_dict = self._dequantize_mxfp4_experts(hf_state_dict)
         hf_state_dict = self._dequantize(hf_state_dict)
+        hf_state_dict = self._apply_key_mapping(hf_state_dict, self.hf_to_internal_map)
         return self._from_hf_w_merged_experts(hf_state_dict, device_mesh)
 
     def _convert_fused_qkv(self, state_dict: dict[str, Any]) -> dict[str, Any]:
@@ -477,6 +503,7 @@ class MiMoV2FlashStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
             split_kwargs = {**kwargs, "quantization": False}
         expert_result = self._convert_single_merged_expert_to_hf_split_experts(fqn, tensor, **split_kwargs)
         result = expert_result if expert_result is not None else [(fqn, tensor)]
+        result = [(self._model_to_hf_key(key), value) for key, value in result]
 
         if exclude_key_regex:
             result = [(key, value) for key, value in result if not re.match(exclude_key_regex, key)]

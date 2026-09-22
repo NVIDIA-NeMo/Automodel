@@ -14,115 +14,160 @@
 
 from __future__ import annotations
 
+import sys
+from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
-import torch.nn as nn
 
-from nemo_automodel.components.distributed.parallelizer import (
-    PARALLELIZATION_STRATEGIES,
-    DefaultParallelizationStrategy,
-)
+from nemo_automodel.components.distributed.context_parallel.sharder import ContextParallelSharder
 from nemo_automodel.components.models.mimo_v2_flash.cp import (
-    MiMoCPContext,
-    build_cp_attention_mask,
-    shard_batch_for_mimo_cp,
+    _MIMO_GLOBAL_IMAGE_MASK,
+    _MIMO_GLOBAL_VIDEO_MASK,
+    _MIMO_THD_LOCAL_INDICES,
+    make_mimo_te_cp_sharder,
+    shard_batch_for_mimo_te,
 )
 
 
 class _FakeCPMesh:
-    def __init__(self, size: int, rank: int):
+    def __init__(self, size: int = 2):
         self._size = size
-        self._rank = rank
+        self._group = object()
 
     def size(self) -> int:
         return self._size
 
-    def get_local_rank(self) -> int:
-        return self._rank
+    def get_group(self):
+        return self._group
 
 
-class _FakeWorldMesh:
-    mesh_dim_names = ("cp",)
-
-    def __init__(self, cp_mesh):
-        self.cp_mesh = cp_mesh
-
-    def __getitem__(self, name):
-        assert name == "cp"
-        return self.cp_mesh
-
-
-class _CPAwareModule(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.cp_mesh = None
-
-    def setup_cp_attention(self, cp_mesh):
-        self.cp_mesh = cp_mesh
-
-
-def test_full_attention_mask_uses_global_query_offsets():
-    context = MiMoCPContext(doc_ids=torch.ones(1, 8, dtype=torch.int32), seq_start=4, cp_size=2)
-    mask = build_cp_attention_mask(context, dtype=torch.float32, sliding_window=None)
-
-    assert mask.shape == (1, 1, 4, 8)
-    minimum = torch.finfo(torch.float32).min
-    for local_query, global_query in enumerate(range(4, 8)):
-        assert torch.all(mask[0, 0, local_query, : global_query + 1] == 0)
-        assert torch.all(mask[0, 0, local_query, global_query + 1 :] == minimum)
-
-
-def test_sliding_attention_mask_limits_global_history():
-    context = MiMoCPContext(doc_ids=torch.ones(1, 8, dtype=torch.int32), seq_start=4, cp_size=2)
-    mask = build_cp_attention_mask(context, dtype=torch.float32, sliding_window=3)
-
-    minimum = torch.finfo(torch.float32).min
-    assert torch.all(mask[0, 0, 0, 2:5] == 0)
-    assert torch.all(mask[0, 0, 0, :2] == minimum)
-    assert torch.all(mask[0, 0, 0, 5:] == minimum)
-
-
-def test_attention_mask_blocks_other_documents_and_padding():
-    doc_ids = torch.tensor([[1, 1, 1, 1, 2, 2, 0, 0]], dtype=torch.int32)
-    context = MiMoCPContext(doc_ids=doc_ids, seq_start=4, cp_size=2)
-    mask = build_cp_attention_mask(context, dtype=torch.float32, sliding_window=None)
-
-    minimum = torch.finfo(torch.float32).min
-    assert torch.all(mask[0, 0, 0, :4] == minimum)
-    assert mask[0, 0, 0, 4] == 0
-    assert torch.all(mask[0, 0, 1, 4:6] == 0)
-    assert mask[0, 0, 2, 0] == 0
-    assert torch.all(mask[0, 0, 2, 1:] == minimum)
-
-
-def test_contiguous_sharder_keeps_global_doc_ids_and_slices_sequence():
-    batch = {
-        "input_ids": torch.arange(8).unsqueeze(0),
-        "labels": torch.arange(8).unsqueeze(0),
-        "attention_mask": torch.ones(1, 8, dtype=torch.int64),
+def _thd_batch(*, batch_size: int = 1, sequence: int = 8) -> dict:
+    input_ids = torch.arange(batch_size * sequence, dtype=torch.long).reshape(batch_size, sequence)
+    return {
+        "input_ids": input_ids,
+        "labels": input_ids.clone(),
+        "position_ids": torch.arange(sequence).expand(batch_size, -1).clone(),
+        "seq_lens": torch.full((batch_size, 1), sequence, dtype=torch.long),
+        "seq_lens_padded": torch.full((batch_size, 1), sequence, dtype=torch.long),
+        "qkv_format": "thd",
     }
-    _, local, layout = shard_batch_for_mimo_cp(_FakeCPMesh(2, 1), None, batch)
 
-    torch.testing.assert_close(local["input_ids"], torch.tensor([[4, 5, 6, 7]]))
-    torch.testing.assert_close(local["labels"], torch.tensor([[4, 5, 6, 7]]))
-    torch.testing.assert_close(local["position_ids"], torch.tensor([[4, 5, 6, 7]]))
-    assert local["mimo_cp_doc_ids"].shape == (1, 8)
-    assert local["mimo_cp_seq_start"] == 4
-    assert local["mimo_cp_size"] == 2
-    assert layout.original_seq_len == 8
+
+def test_mimo_te_sharder_delegates_to_framework_and_preserves_vlm_metadata():
+    """The adapter must retain PP media and global-to-local VLM token maps."""
+    batch = _thd_batch(batch_size=2, sequence=4)
+    batch["input_ids"][0, 1] = 91
+    batch["input_ids"][1, 2] = 92
+    media = {"pixel_values": [torch.ones(1)]}
+    batch["_vlm_pp_media_chunks"] = media
+    delegated = {
+        "input_ids": batch["input_ids"].clone(),
+        "labels": batch["labels"].clone(),
+        "position_ids": batch["position_ids"].clone(),
+        "cu_seqlens": torch.tensor([[0, 4], [0, 4]], dtype=torch.int32),
+        "max_seqlen": torch.tensor([4, 4], dtype=torch.int32),
+        "padding_mask": torch.zeros_like(batch["input_ids"], dtype=torch.bool),
+        "qkv_format": "thd",
+    }
+
+    with patch(
+        "nemo_automodel.components.models.mimo_v2_flash.cp.make_cp_batch_for_te",
+        return_value=delegated,
+    ) as make_te:
+        _, result, layout = shard_batch_for_mimo_te(
+            None,
+            None,
+            batch,
+            num_chunks=2,
+            image_token_id=91,
+            video_token_id=92,
+        )
+
+    make_te.assert_called_once()
+    assert layout is None
+    torch.testing.assert_close(result[_MIMO_THD_LOCAL_INDICES], torch.arange(4).expand(2, -1))
+    torch.testing.assert_close(
+        result[_MIMO_GLOBAL_IMAGE_MASK],
+        torch.tensor([[False, True, False, False], [False, False, False, False]]),
+    )
+    torch.testing.assert_close(
+        result[_MIMO_GLOBAL_VIDEO_MASK],
+        torch.tensor([[False, False, False, False], [False, False, True, False]]),
+    )
+    assert result["_vlm_pp_media_chunks"] is media
+
+
+def test_mimo_te_sharder_uses_te_dual_chunk_indices_and_reports_layout():
+    """CP token ownership must come from TE's THD partition primitive."""
+    batch = _thd_batch(sequence=8)
+    expected = torch.tensor([0, 1, 6, 7], dtype=torch.long)
+    fake_tex = SimpleNamespace(thd_get_partitioned_indices=lambda cu, total, size, rank: expected)
+    delegated = {
+        "input_ids": batch["input_ids"].reshape(-1).index_select(0, expected),
+        "labels": batch["labels"].reshape(-1).index_select(0, expected),
+        "position_ids": batch["position_ids"].reshape(-1).index_select(0, expected),
+        "cu_seqlens": torch.tensor([0, 8], dtype=torch.int32),
+        "max_seqlen": torch.tensor(8, dtype=torch.int32),
+        "padding_mask": torch.zeros(4, dtype=torch.bool),
+        "qkv_format": "thd",
+    }
+
+    with (
+        patch.dict(sys.modules, {"transformer_engine_torch": fake_tex}),
+        patch("torch.distributed.get_rank", return_value=0),
+        patch(
+            "nemo_automodel.components.models.mimo_v2_flash.cp.make_cp_batch_for_te",
+            return_value=delegated,
+        ),
+    ):
+        _, result, layout = shard_batch_for_mimo_te(
+            _FakeCPMesh(),
+            None,
+            batch,
+            image_token_id=None,
+            video_token_id=None,
+        )
+
+    torch.testing.assert_close(result[_MIMO_THD_LOCAL_INDICES], expected)
+    assert layout is not None
+    torch.testing.assert_close(layout.local_token_global_indices, expected)
+    assert layout.input_row_shape == (1, 8)
     assert layout.padded_seq_len == 8
 
 
-def test_ep1_default_strategy_attaches_cp_mesh_to_model_owned_attention():
-    strategy = PARALLELIZATION_STRATEGIES["MiMoV2ForCausalLM"]
-    model = nn.Module()
-    model.attention = _CPAwareModule()
-    cp_mesh = _FakeCPMesh(2, 0)
+def test_mimo_te_sharder_rejects_neat_packed_cp_without_fallback():
+    """A block-diagonal NEAT mask must never silently become ordinary causal CP."""
+    batch = _thd_batch()
+    batch["qkv_format"] = "bshd"
 
-    with patch.object(DefaultParallelizationStrategy, "parallelize", return_value=model):
-        result = strategy.parallelize(model, _FakeWorldMesh(cp_mesh))
+    with (
+        patch("nemo_automodel.components.models.mimo_v2_flash.cp.make_cp_batch_for_te") as make_te,
+        pytest.raises(ValueError, match="requires qkv_format='thd'"),
+    ):
+        shard_batch_for_mimo_te(_FakeCPMesh(), None, batch)
 
-    assert result is model
-    assert model.cp_mesh is cp_mesh
-    assert model.attention.cp_mesh is cp_mesh
+    make_te.assert_not_called()
+
+
+def test_mimo_te_sharder_rejects_documents_not_divisible_by_dual_chunks():
+    """TE CP requires every physical document span divisible by 2 * CP."""
+    batch = _thd_batch(sequence=8)
+    batch["seq_lens"] = torch.tensor([[6, 2]])
+    batch["seq_lens_padded"] = torch.tensor([[6, 2]])
+
+    with pytest.raises(ValueError, match=r"divisible by 2 \* cp_size"):
+        shard_batch_for_mimo_te(_FakeCPMesh(), None, batch)
+
+
+def test_mimo_te_sharder_rejects_external_loss_mask():
+    batch = _thd_batch()
+    with pytest.raises(ValueError, match="external loss_mask"):
+        shard_batch_for_mimo_te(None, None, batch, loss_mask=torch.ones(1, 8))
+
+
+def test_make_mimo_te_cp_sharder_returns_framework_contract():
+    sharder = make_mimo_te_cp_sharder(num_chunks=1, image_token_id=91, video_token_id=92)
+    assert isinstance(sharder, ContextParallelSharder)
+    assert sharder.local_token_global_indices is None

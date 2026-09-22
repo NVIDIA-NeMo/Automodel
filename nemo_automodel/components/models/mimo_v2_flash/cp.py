@@ -12,229 +12,266 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Contiguous context parallelism for MiMo full and sliding attention."""
+"""MiMo adapters for the framework Transformer Engine THD sharder."""
 
 from __future__ import annotations
 
 import contextlib
-from dataclasses import dataclass
+from functools import partial
 from typing import Any
 
 import torch
-import torch.distributed as dist
 
-from nemo_automodel.components.distributed.context_parallel.sharder import ShardLayout
+from nemo_automodel.components.distributed.context_parallel.sharder import (
+    ContextParallelSharder,
+    ShardLayout,
+)
+from nemo_automodel.components.distributed.context_parallel.utils import make_cp_batch_for_te
 
-_PAD_DOC_ID = 0
-
-
-@dataclass
-class MiMoCPContext:
-    """Global sequence layout shared by every MiMo attention layer.
-
-    Attributes:
-        doc_ids: Document ids of shape [batch, global_sequence]. Zero marks padding.
-        seq_start: Global offset of this rank's contiguous query interval.
-        cp_size: Number of context-parallel ranks.
-        original_seq_len: Sequence length before divisibility padding.
-    """
-
-    doc_ids: torch.Tensor
-    seq_start: int = 0
-    cp_size: int = 1
-    original_seq_len: int | None = None
-
-    @property
-    def cp_enabled(self) -> bool:
-        """Return whether the sequence is distributed across ranks."""
-        return self.cp_size > 1
-
-    @property
-    def local_seq_len(self) -> int:
-        """Return the padded sequence length owned by this rank."""
-        return self.doc_ids.shape[1] // self.cp_size
-
-    @property
-    def local_doc_ids(self) -> torch.Tensor:
-        """Return local document ids of shape [batch, local_sequence]."""
-        return self.doc_ids[:, self.seq_start : self.seq_start + self.local_seq_len]
+_MIMO_GLOBAL_IMAGE_MASK = "_mimo_global_image_mask"
+_MIMO_GLOBAL_VIDEO_MASK = "_mimo_global_video_mask"
+_MIMO_THD_LOCAL_INDICES = "_mimo_thd_local_indices"
+_VLM_PP_MEDIA_KEY = "_vlm_pp_media_chunks"
+_SEQ_LENS_PADDING_VALUE = -1000
 
 
-class _AllGatherSequence(torch.autograd.Function):
-    """Autograd-aware all-gather of equal contiguous sequence shards."""
-
-    @staticmethod
-    def forward(ctx, local_tensor: torch.Tensor, group: Any, dim: int) -> torch.Tensor:
-        """Gather ``local_tensor`` along ``dim`` from every CP rank."""
-        dim = dim if dim >= 0 else local_tensor.ndim + dim
-        local_tensor = local_tensor.contiguous()
-        gathered = [torch.empty_like(local_tensor) for _ in range(dist.get_world_size(group))]
-        dist.all_gather(gathered, local_tensor, group=group)
-        ctx.group = group
-        ctx.dim = dim
-        ctx.rank = dist.get_rank(group)
-        ctx.local_size = local_tensor.shape[dim]
-        return torch.cat(gathered, dim=dim)
-
-    @staticmethod
-    def backward(ctx, grad_output: torch.Tensor):
-        """Sum consumers' gradients and return this rank's contiguous interval."""
-        grad_output = grad_output.contiguous()
-        dist.all_reduce(grad_output, op=dist.ReduceOp.SUM, group=ctx.group)
-        start = ctx.rank * ctx.local_size
-        return grad_output.narrow(ctx.dim, start, ctx.local_size).contiguous(), None, None
-
-
-def all_gather_sequence(tensor: torch.Tensor, cp_group: Any, *, dim: int) -> torch.Tensor:
-    """Gather a sequence-sharded tensor while preserving its gradient path.
+def _flatten_chunks(tensor: torch.Tensor, num_chunks: int) -> torch.Tensor:
+    """Flatten batch rows into one token stream per pipeline chunk.
 
     Args:
-        tensor: Local tensor whose sequence axis is ``dim``.
-        cp_group: Context-parallel process group.
-        dim: Sequence dimension.
+        tensor: Token-aligned tensor of shape [batch, sequence].
+        num_chunks: Number of equal groups along the batch axis.
 
     Returns:
-        Tensor with the full global sequence on ``dim``.
+        Tensor of shape [num_chunks, batch * sequence / num_chunks], or a
+        one-dimensional [batch * sequence] tensor when ``num_chunks == 1``.
     """
-    return _AllGatherSequence.apply(tensor, cp_group, dim)
+    if tensor.ndim != 2:
+        raise ValueError(f"MiMo THD token metadata must have shape [batch, sequence], got {tuple(tensor.shape)}")
+    if num_chunks <= 0 or tensor.shape[0] % num_chunks:
+        raise ValueError(f"MiMo THD num_chunks={num_chunks} must evenly divide batch size {tensor.shape[0]}")
+    if num_chunks == 1:
+        return tensor.reshape(-1).contiguous()
+    rows_per_chunk = tensor.shape[0] // num_chunks
+    return tensor.reshape(num_chunks, rows_per_chunk * tensor.shape[1]).contiguous()
 
 
-def build_cp_attention_mask(
-    context: MiMoCPContext,
+def _media_mask(input_ids: torch.Tensor, token_id: int | None, num_chunks: int) -> torch.Tensor | None:
+    """Build a global placeholder mask before Transformer Engine shards tokens.
+
+    Args:
+        input_ids: Unsharded token IDs of shape [batch, sequence].
+        token_id: Image or video placeholder ID, or ``None`` when absent.
+        num_chunks: Number of pipeline token streams.
+
+    Returns:
+        Boolean mask in global THD stream order, with shape [tokens] for one
+        chunk or [chunks, tokens_per_chunk] for pipeline execution. Returns
+        ``None`` when the modality has no configured placeholder ID.
+    """
+    if token_id is None:
+        return None
+    return _flatten_chunks(input_ids.eq(int(token_id)), num_chunks)
+
+
+def _chunk_partition_indices(
+    batch: dict[str, Any],
     *,
-    dtype: torch.dtype,
-    sliding_window: int | None,
+    cp_mesh,
+    num_chunks: int,
+    seq_lens_padding_value: int,
 ) -> torch.Tensor:
-    """Build local-query/global-key document-causal attention masking.
+    """Reproduce TE's data-dependent THD token partition for every chunk.
 
     Args:
-        context: Global document layout and local query offset.
-        dtype: Floating dtype used by attention logits.
-        sliding_window: Optional number of visible causal keys.
+        batch: Unsharded packed batch. ``input_ids`` has shape [batch,
+            sequence] and ``seq_lens_padded`` has shape [batch, documents].
+        cp_mesh: Optional one-dimensional context-parallel mesh.
+        num_chunks: Number of equal pipeline chunks along the batch axis.
+        seq_lens_padding_value: Sentinel used in ragged length rows.
 
     Returns:
-        Additive mask of shape [batch, 1, local_sequence, global_sequence].
+        Global token indices with shape [local_tokens] for one chunk or
+        [chunks, local_tokens_per_chunk] for pipeline execution. Indices are
+        relative to the corresponding chunk's global flattened token stream.
     """
-    global_doc_ids = context.doc_ids
-    local_doc_ids = context.local_doc_ids
-    device = global_doc_ids.device
-    query_positions = torch.arange(local_doc_ids.shape[1], device=device) + context.seq_start
-    key_positions = torch.arange(global_doc_ids.shape[1], device=device)
-    allowed = key_positions[None, :] <= query_positions[:, None]
-    if sliding_window is not None:
-        allowed = allowed & ((query_positions[:, None] - key_positions[None, :]) < sliding_window)
-    allowed = (
-        allowed.unsqueeze(0)
-        & (local_doc_ids[:, :, None] == global_doc_ids[:, None, :])
-        & (global_doc_ids[:, None, :] > _PAD_DOC_ID)
-    )
-    padding_queries = local_doc_ids[:, :, None] <= _PAD_DOC_ID
-    allowed = torch.where(padding_queries, key_positions[None, None, :] == 0, allowed)
-    mask = torch.zeros(allowed.shape, dtype=dtype, device=device)
-    return mask.masked_fill_(~allowed, torch.finfo(dtype).min).unsqueeze(1)
+    input_ids = batch.get("input_ids")
+    padded_lengths = batch.get("seq_lens_padded")
+    if not isinstance(input_ids, torch.Tensor) or input_ids.ndim != 2:
+        raise ValueError("MiMo TE THD sharding requires input_ids [batch, sequence]")
+    if not isinstance(padded_lengths, torch.Tensor) or padded_lengths.ndim != 2:
+        raise ValueError("MiMo TE THD sharding requires seq_lens_padded [batch, documents]")
+    if input_ids.shape[0] % num_chunks:
+        raise ValueError(f"MiMo THD num_chunks={num_chunks} must evenly divide batch size {input_ids.shape[0]}")
+
+    cp_size = 1 if cp_mesh is None else cp_mesh.size()
+    if cp_mesh is None:
+        cp_rank = 0
+    elif torch.distributed.is_available() and torch.distributed.is_initialized():
+        cp_rank = torch.distributed.get_rank(group=cp_mesh.get_group())
+    else:
+        cp_rank = getattr(cp_mesh, "get_local_rank", lambda: 0)()
+    rows_per_chunk = input_ids.shape[0] // num_chunks
+    tokens_per_chunk = rows_per_chunk * input_ids.shape[1]
+    chunk_indices = []
+    for chunk_idx in range(num_chunks):
+        if cp_size == 1:
+            indices = torch.arange(tokens_per_chunk, device=input_ids.device, dtype=torch.long)
+        else:
+            rows = padded_lengths[chunk_idx * rows_per_chunk : (chunk_idx + 1) * rows_per_chunk]
+            lengths = rows.reshape(-1)
+            lengths = lengths[lengths != seq_lens_padding_value].to(torch.int32)
+            if lengths.numel() == 0 or bool((lengths <= 0).any().item()):
+                raise ValueError("MiMo TE THD padded document lengths must be positive")
+            if int(lengths.sum().item()) != tokens_per_chunk:
+                raise ValueError(
+                    "MiMo TE THD seq_lens_padded must cover each pipeline chunk: "
+                    f"got {int(lengths.sum().item())} slots for {tokens_per_chunk} tokens"
+                )
+            divisor = 2 * cp_size
+            if bool((lengths.remainder(divisor) != 0).any().item()):
+                raise ValueError(
+                    "MiMo TE context parallelism requires every padded document length "
+                    f"to be divisible by 2 * cp_size ({divisor}); got {lengths.tolist()}"
+                )
+            cu_seqlens_padded = torch.cat(
+                (
+                    torch.zeros(1, dtype=torch.int32, device=lengths.device),
+                    lengths.cumsum(0, dtype=torch.int32),
+                )
+            )
+            import transformer_engine_torch as tex
+
+            indices = tex.thd_get_partitioned_indices(
+                cu_seqlens_padded,
+                tokens_per_chunk,
+                cp_size,
+                cp_rank,
+            ).to(torch.long)
+        chunk_indices.append(indices)
+    return chunk_indices[0] if num_chunks == 1 else torch.stack(chunk_indices)
 
 
-def _pad_sequence(tensor: torch.Tensor, pad_len: int, value: float | int | bool) -> torch.Tensor:
-    """Pad a [batch, sequence, ...] tensor along its sequence dimension."""
-    if pad_len <= 0:
-        return tensor
-    padding = torch.full(
-        (tensor.shape[0], pad_len, *tensor.shape[2:]),
-        value,
-        dtype=tensor.dtype,
-        device=tensor.device,
-    )
-    return torch.cat((tensor, padding), dim=1)
-
-
-def _global_doc_ids(batch: dict[str, Any], seq_len: int) -> torch.Tensor:
-    """Resolve one global document-id tensor before sequence sharding."""
-    attention_mask = batch.get("attention_mask")
-    if isinstance(attention_mask, torch.Tensor) and attention_mask.ndim == 2:
-        return attention_mask.to(torch.int32)
-    doc_ids = torch.ones(
-        (batch["input_ids"].shape[0], seq_len),
-        dtype=torch.int32,
-        device=batch["input_ids"].device,
-    )
-    padding_mask = batch.get("padding_mask")
-    if isinstance(padding_mask, torch.Tensor):
-        doc_ids.masked_fill_(padding_mask.bool(), _PAD_DOC_ID)
-    return doc_ids
-
-
-def shard_batch_for_mimo_cp(
+def shard_batch_for_mimo_te(
     cp_mesh,
     tp_mesh,
     batch: dict[str, Any],
     *,
-    loss_mask=None,
+    loss_mask: torch.Tensor | None = None,
     padding_token_id: int = 0,
-    shard_primary: bool = True,
+    num_chunks: int = 1,
+    image_token_id: int | None = None,
+    video_token_id: int | None = None,
 ):
-    """Shard every sequence-aligned MiMo tensor into contiguous CP intervals.
+    """Delegate MiMo packed CP to the framework TE THD sharder.
+
+    The wrapper records global VLM placeholder masks and TE's local-token index
+    map before the framework mutates the packed batch. Those tensors let MiMo
+    select exactly the image/video features owned by each DualChunkSwap shard.
+    It also preserves the PP media side channel, which is intentionally not a
+    token-aligned tensor and therefore must not be split by the THD helper.
 
     Args:
-        cp_mesh: One-dimensional context-parallel mesh, or ``None``.
+        cp_mesh: Optional one-dimensional context-parallel mesh.
         tp_mesh: Unused tensor-parallel mesh required by the sharder protocol.
-        batch: Full batch with token tensors shaped [batch, sequence].
-        loss_mask: Optional loss mask shaped [batch, sequence].
-        padding_token_id: Token used for CP divisibility padding.
-        shard_primary: Whether to shard ``input_ids``. VLM batches keep the
-            primary stream whole until vision features have been inserted.
+        batch: Packed batch whose token tensors have shape [batch, sequence].
+        loss_mask: Optional loss mask passed by the sharder protocol. Labels
+            already carry the loss ignore value, so this is unsupported here.
+        padding_token_id: Token ID used for physical THD padding.
+        num_chunks: Number of pipeline microbatch streams.
+        image_token_id: Optional image placeholder token ID.
+        video_token_id: Optional video placeholder token ID.
 
     Returns:
-        Null transport context, local batch, and global padding layout.
+        A null transport context, the TE-prepared batch, and its
+        :class:`ShardLayout`. Token tensors are true THD: [local_tokens] for one
+        stream or [chunks, local_tokens_per_chunk] for PP.
     """
     del tp_mesh
-    input_ids = batch["input_ids"]
-    if input_ids.ndim != 2:
-        raise ValueError(f"MiMo CP expects input_ids [batch, sequence], got {tuple(input_ids.shape)}")
-    original_seq_len = input_ids.shape[1]
-    cp_size = 1 if cp_mesh is None else cp_mesh.size()
-    doc_ids = _global_doc_ids(batch, original_seq_len)
-    batch.pop("attention_mask", None)
-    for key in ("seq_lens", "seq_lens_padded", "cu_seqlens", "cu_seqlens_padded", "max_seqlen", "qkv_format"):
-        batch.pop(key, None)
-
-    if "position_ids" not in batch:
-        batch["position_ids"] = (
-            torch.arange(original_seq_len, device=input_ids.device).unsqueeze(0).expand_as(input_ids)
+    if loss_mask is not None:
+        raise ValueError("MiMo TE THD sharding does not support an external loss_mask; encode it in labels")
+    if batch.get("qkv_format") != "thd":
+        raise ValueError(
+            "MiMo packed context parallelism requires qkv_format='thd'; "
+            "packed NEAT masks cannot be represented by TE context parallelism"
         )
-    batch.setdefault("padding_mask", doc_ids <= _PAD_DOC_ID)
+    input_ids = batch.get("input_ids")
+    if not isinstance(input_ids, torch.Tensor) or input_ids.ndim != 2:
+        raise ValueError("MiMo TE THD sharding requires input_ids [batch, sequence]")
+    position_ids = batch.get("position_ids")
+    if num_chunks > 1 and isinstance(position_ids, torch.Tensor) and position_ids.ndim != 2:
+        raise ValueError("MiMo THD pipeline parallelism currently requires one-dimensional position_ids")
 
-    pad_len = (-original_seq_len) % cp_size
-    padded_seq_len = original_seq_len + pad_len
-    if pad_len:
-        pad_values = {"labels": -100, "position_ids": 0, "padding_mask": True}
-        if shard_primary:
-            pad_values["input_ids"] = padding_token_id
-        for key, pad_value in pad_values.items():
-            value = batch.get(key)
-            if isinstance(value, torch.Tensor) and value.ndim >= 2 and value.shape[1] == original_seq_len:
-                batch[key] = _pad_sequence(value, pad_len, pad_value)
-        doc_ids = _pad_sequence(doc_ids, pad_len, _PAD_DOC_ID)
-        if isinstance(loss_mask, torch.Tensor):
-            loss_mask = _pad_sequence(loss_mask, pad_len, 0)
-
-    seq_start = 0 if cp_mesh is None else cp_mesh.get_local_rank() * (padded_seq_len // cp_size)
-    local_seq_len = padded_seq_len // cp_size
-    seq_end = seq_start + local_seq_len
-    shard_keys = ["labels", "position_ids", "padding_mask"]
-    if shard_primary:
-        shard_keys.append("input_ids")
-    for key in shard_keys:
-        value = batch.get(key)
-        if isinstance(value, torch.Tensor) and value.ndim >= 2 and value.shape[1] == padded_seq_len:
-            batch[key] = value[:, seq_start:seq_end].contiguous()
-    if isinstance(loss_mask, torch.Tensor):
-        batch["loss_mask"] = loss_mask[:, seq_start:seq_end].contiguous()
-
-    batch["mimo_cp_doc_ids"] = doc_ids
-    batch["mimo_cp_seq_start"] = seq_start
-    batch["mimo_cp_size"] = cp_size
-    return (
-        contextlib.nullcontext,
+    original_row_shape = tuple(input_ids.shape)
+    global_image_mask = _media_mask(input_ids, image_token_id, num_chunks)
+    global_video_mask = _media_mask(input_ids, video_token_id, num_chunks)
+    local_indices = _chunk_partition_indices(
         batch,
-        ShardLayout(original_seq_len=original_seq_len, padded_seq_len=padded_seq_len),
+        cp_mesh=cp_mesh,
+        num_chunks=num_chunks,
+        seq_lens_padding_value=_SEQ_LENS_PADDING_VALUE,
     )
+    pp_media = batch.get(_VLM_PP_MEDIA_KEY)
+
+    prepared = make_cp_batch_for_te(
+        cp_mesh,
+        batch,
+        qkv_format="thd",
+        padding_token_id=padding_token_id,
+        num_chunks=num_chunks,
+        seq_lens_padding_value=_SEQ_LENS_PADDING_VALUE,
+        return_local_indices=False,
+    )
+    prepared[_MIMO_THD_LOCAL_INDICES] = local_indices
+    if global_image_mask is not None:
+        prepared[_MIMO_GLOBAL_IMAGE_MASK] = global_image_mask
+    if global_video_mask is not None:
+        prepared[_MIMO_GLOBAL_VIDEO_MASK] = global_video_mask
+    if pp_media is not None:
+        prepared[_VLM_PP_MEDIA_KEY] = pp_media
+
+    layout = None
+    if num_chunks == 1:
+        layout = ShardLayout(
+            local_token_global_indices=local_indices,
+            padded_seq_len=original_row_shape[0] * original_row_shape[1],
+            input_row_shape=original_row_shape,
+        )
+    return contextlib.nullcontext, prepared, layout
+
+
+def make_mimo_te_cp_sharder(
+    *,
+    num_chunks: int,
+    image_token_id: int | None,
+    video_token_id: int | None,
+) -> ContextParallelSharder:
+    """Create MiMo's thin adapter around the framework TE THD sharder.
+
+    Args:
+        num_chunks: Number of pipeline microbatch streams.
+        image_token_id: Optional image placeholder token ID.
+        video_token_id: Optional video placeholder token ID.
+
+    Returns:
+        An unresolved :class:`ContextParallelSharder` configured by the caller's
+        device mesh before its first :meth:`~ContextParallelSharder.shard` call.
+    """
+    return ContextParallelSharder(
+        shard_batch=partial(
+            shard_batch_for_mimo_te,
+            num_chunks=num_chunks,
+            image_token_id=image_token_id,
+            video_token_id=video_token_id,
+        ),
+        local_token_global_indices=None,
+    )
+
+
+__all__ = [
+    "_MIMO_GLOBAL_IMAGE_MASK",
+    "_MIMO_GLOBAL_VIDEO_MASK",
+    "_MIMO_THD_LOCAL_INDICES",
+    "make_mimo_te_cp_sharder",
+    "shard_batch_for_mimo_te",
+]

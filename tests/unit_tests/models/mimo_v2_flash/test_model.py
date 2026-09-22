@@ -27,6 +27,7 @@ from nemo_automodel.components.models.mimo_v2_flash.model import (
     MiMoV2FlashForCausalLM,
     MiMoV2FlashModel,
     ModelClass,
+    _validate_te_thd_sink_cudnn,
 )
 from nemo_automodel.components.models.mimo_v2_flash.state_dict_adapter import (
     MiMoV2FlashStateDictAdapter,
@@ -140,6 +141,19 @@ class TestMiMoV2FlashAttention:
         # head_dim=8, partial_rotary_factor=0.5 → rope_dim=4
         attn = MiMoV2FlashAttention(tiny_config, backend_config, is_swa=False, layer_idx=0)
         assert attn.rope_dim == 4
+
+    @patch("torch.backends.cudnn.version", return_value=92300)
+    def test_te_thd_sink_rejects_affected_cudnn(self, _version):
+        with pytest.raises(RuntimeError, match=r"requires cuDNN >= 9\.26.*detected cuDNN 92300"):
+            _validate_te_thd_sink_cudnn(192)
+
+    @patch("torch.backends.cudnn.version", return_value=92600)
+    def test_te_thd_sink_accepts_fixed_cudnn(self, _version):
+        _validate_te_thd_sink_cudnn(192)
+
+    @patch("torch.backends.cudnn.version", return_value=92300)
+    def test_te_thd_sink_accepts_specialized_value_head_kernel(self, _version):
+        _validate_te_thd_sink_cudnn(256)
 
 
 # ---------------------------------------------------------------------------
@@ -311,6 +325,158 @@ class TestMiMoV2FlashForCausalLM:
         for stage_modules in out:
             assert "model.swa_rotary_emb" in stage_modules
 
+    def test_thd_fused_ce_hidden_states_match_flat_labels(
+        self,
+        tiny_config,
+        backend_config,
+        monkeypatch,
+    ):
+        model = MiMoV2FlashForCausalLM(tiny_config, backend=backend_config).eval()
+        hidden = torch.randn(1, 4, tiny_config.hidden_size)
+        monkeypatch.setattr(model.model, "forward", lambda *args, **kwargs: hidden)
+
+        with torch.no_grad():
+            output = model(
+                torch.randint(0, tiny_config.vocab_size, (4,)),
+                qkv_format="thd",
+                output_hidden_states=True,
+            )
+
+        assert output.logits.shape == (1, 4, tiny_config.vocab_size)
+        assert output.hidden_states.shape == (4, tiny_config.hidden_size)
+
+    def test_pipeline_fused_ce_returns_hidden_states_to_loss(
+        self,
+        tiny_config,
+        backend_config,
+        monkeypatch,
+    ):
+        import nemo_automodel.components.loss.mtp as mtp_module
+        from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+        from nemo_automodel.components.loss.mtp import PipelineCausalLMLoss
+
+        model = MiMoV2FlashForCausalLM(tiny_config, backend=backend_config).eval()
+        model._pp_return_hidden_states = True
+        input_ids = torch.randint(0, tiny_config.vocab_size, (2, 4))
+        hidden = torch.randn(2, 4, tiny_config.hidden_size)
+        monkeypatch.setattr(model.model, "forward", lambda *args, **kwargs: hidden)
+        monkeypatch.setattr(model.lm_head, "forward", lambda *args, **kwargs: pytest.fail("lm_head was called"))
+
+        with torch.no_grad():
+            stage_output = model(input_ids)
+
+        assert stage_output is hidden
+        assert stage_output.shape == (2, 4, tiny_config.hidden_size)
+        _, outputs_meta = model.get_pipeline_stage_metas(
+            is_first=False,
+            microbatch_size=2,
+            seq_len=4,
+            dtype=torch.float32,
+        )
+        assert outputs_meta[0].shape == stage_output.shape
+
+        captured = {}
+
+        def fake_calculate_loss(loss_fn, **kwargs):
+            assert isinstance(loss_fn, FusedLinearCrossEntropy)
+            captured.update(kwargs)
+            return torch.zeros((), requires_grad=True)
+
+        monkeypatch.setattr(mtp_module, "calculate_loss", fake_calculate_loss)
+        labels = torch.randint(0, tiny_config.vocab_size, (2, 4))
+        loss = PipelineCausalLMLoss(FusedLinearCrossEntropy(), model)(stage_output, labels)
+
+        assert loss.shape == ()
+        assert captured["hidden_states"] is stage_output
+        assert captured["logits"] is None
+        assert captured["lm_weight"].shape == (tiny_config.vocab_size, tiny_config.hidden_size)
+
+    def test_pipeline_media_cursor_advances_over_text_only_slot(self, tiny_config, backend_config):
+        model = MiMoV2FlashForCausalLM(tiny_config, backend=backend_config)
+        tiny_config.image_token_id = tiny_config.vocab_size - 2
+        tiny_config.video_token_id = tiny_config.vocab_size - 1
+        image_chunk = torch.randn(3, 8)
+        video_chunk = torch.randn(4, 8)
+        image_grid = torch.tensor([[1, 1, 3]])
+        video_grid = torch.tensor([[1, 2, 2]])
+        model._vlm_pixel_values_chunks = [torch.empty(0, 8), image_chunk]
+        model._vlm_image_grid_hws_chunks = [torch.empty(0, 3, dtype=torch.long), image_grid]
+        model._vlm_pixel_values_videos_chunks = [torch.empty(0, 8), video_chunk]
+        model._vlm_video_grid_thw_chunks = [torch.empty(0, 3, dtype=torch.long), video_grid]
+        model._vlm_chunk_idx = 0
+
+        empty_media = model._pull_pipeline_media(
+            torch.tensor([[1, 2, 3]]),
+            None,
+            None,
+            None,
+            None,
+        )
+        pulled_media = model._pull_pipeline_media(
+            torch.tensor([[tiny_config.image_token_id, tiny_config.video_token_id]]),
+            None,
+            None,
+            None,
+            None,
+        )
+
+        assert empty_media == (None, None, None, None)
+        assert model._vlm_chunk_idx == 2
+        torch.testing.assert_close(pulled_media[0], image_chunk)
+        torch.testing.assert_close(pulled_media[1], image_grid)
+        torch.testing.assert_close(pulled_media[2], video_chunk)
+        torch.testing.assert_close(pulled_media[3], video_grid)
+
+    def test_pipeline_media_cursor_tolerates_cleanup_none(self, tiny_config, backend_config):
+        model = MiMoV2FlashForCausalLM(tiny_config, backend=backend_config)
+        model._vlm_chunk_idx = None
+        model._vlm_pixel_values_chunks = None
+        model._vlm_pixel_values_videos_chunks = None
+
+        media = model._pull_pipeline_media(torch.tensor([[1, 2, 3]]), None, None, None, None)
+
+        assert media == (None, None, None, None)
+
+    def test_pipeline_stage_metas_use_already_local_te_sequence_length(self, tiny_config, backend_config):
+        model = MiMoV2FlashForCausalLM(tiny_config, backend=backend_config)
+        model.config.vision_config = object()
+        model.cp_mesh = _FakeCPMesh(2)
+        model.lm_head = None
+
+        first_inputs, first_outputs = model.get_pipeline_stage_metas(
+            is_first=True,
+            microbatch_size=2,
+            seq_len=7,
+            dtype=torch.float32,
+        )
+        later_inputs, later_outputs = model.get_pipeline_stage_metas(
+            is_first=False,
+            microbatch_size=2,
+            seq_len=7,
+            dtype=torch.float32,
+        )
+
+        assert first_inputs[0].shape == (2, 7)
+        assert first_inputs[0].dtype == torch.long
+        assert first_outputs[0].shape == (2, 7, tiny_config.hidden_size)
+        assert later_inputs[0].shape == (2, 7, tiny_config.hidden_size)
+        assert later_outputs[0].shape == (2, 7, tiny_config.hidden_size)
+
+    def test_pipeline_stage_metas_llm_cp_keeps_already_local_length(self, tiny_config, backend_config):
+        model = MiMoV2FlashForCausalLM(tiny_config, backend=backend_config)
+        model.cp_mesh = _FakeCPMesh(2)
+        model.lm_head = None
+
+        inputs_meta, outputs_meta = model.get_pipeline_stage_metas(
+            is_first=False,
+            microbatch_size=2,
+            seq_len=4,
+            dtype=torch.float32,
+        )
+
+        assert inputs_meta[0].shape == (2, 4, tiny_config.hidden_size)
+        assert outputs_meta[0].shape == (2, 4, tiny_config.hidden_size)
+
 
 # ---------------------------------------------------------------------------
 # Forward-pass smoke tests (CPU)
@@ -361,6 +527,14 @@ class TestModelClassExport:
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
+class _FakeCPMesh:
+    def __init__(self, size: int):
+        self._size = size
+
+    def size(self) -> int:
+        return self._size
+
+
 def _moe_config(cfg: MiMoV2FlashConfig):
     from nemo_automodel.components.moe.config import MoEConfig
 

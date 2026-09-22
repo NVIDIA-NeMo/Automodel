@@ -157,6 +157,15 @@ class TestMiMoV2FlashStateDictAdapterInit:
         assert adapter.backend is backend_config
         assert adapter.dtype is torch.bfloat16
         assert adapter._uses_model_prefix is True
+        assert adapter.hf_to_internal_map == {}
+        assert adapter.internal_to_hf_map == {}
+
+    def test_te_backend_registers_bidirectional_sink_mapping(self, hf_config, moe_config, backend_config):
+        backend_config.attn = "te"
+        adapter = MiMoV2FlashStateDictAdapter(hf_config, moe_config, backend_config)
+
+        assert adapter.hf_to_internal_map == {"self_attn.attention_sink_bias": "self_attn.attn_module.softmax_offset"}
+        assert adapter.internal_to_hf_map == {"self_attn.attn_module.softmax_offset": "self_attn.attention_sink_bias"}
 
 
 class TestFromHf:
@@ -196,6 +205,29 @@ class TestFromHf:
         with patch.object(adapter, "_from_hf_w_merged_experts", return_value=hf_state) as mock_merge:
             adapter.from_hf(hf_state, device_mesh=mesh)
         assert mock_merge.call_args[0][1] is mesh
+
+    def test_te_sink_maps_to_fp32_softmax_offset(self, hf_config, moe_config, backend_config):
+        backend_config.attn = "te"
+        adapter = MiMoV2FlashStateDictAdapter(hf_config, moe_config, backend_config)
+        sink = torch.randn(4, dtype=torch.bfloat16)
+        hf_state = {"model.layers.0.self_attn.attention_sink_bias": sink}
+
+        with patch.object(adapter, "_from_hf_w_merged_experts", side_effect=lambda sd, _: sd):
+            out = adapter.from_hf(hf_state)
+
+        internal_key = "model.layers.0.self_attn.attn_module.softmax_offset"
+        assert internal_key in out
+        assert "model.layers.0.self_attn.attention_sink_bias" not in out
+        assert out[internal_key].dtype is torch.float32
+        torch.testing.assert_close(out[internal_key], sink.float())
+
+    def test_non_te_sink_key_is_unchanged(self, adapter):
+        key = "model.layers.0.self_attn.attention_sink_bias"
+        sink = torch.randn(4)
+        with patch.object(adapter, "_from_hf_w_merged_experts", side_effect=lambda sd, _: sd):
+            out = adapter.from_hf({key: sink})
+
+        assert out[key] is sink
 
 
 class TestMiMoV26CheckpointLayouts:
@@ -403,6 +435,25 @@ class TestMiMoV26CheckpointLayouts:
 
 
 class TestConvertSingleTensorToHf:
+    def test_te_softmax_offset_maps_back_to_attention_sink_bias(
+        self,
+        hf_config,
+        moe_config,
+        backend_config,
+    ):
+        backend_config.attn = "te"
+        adapter = MiMoV2FlashStateDictAdapter(hf_config, moe_config, backend_config)
+        sink = torch.randn(4, dtype=torch.float32)
+
+        with patch.object(adapter, "_convert_single_merged_expert_to_hf_split_experts", return_value=None):
+            out = adapter.to_hf(
+                {"model.layers.0.self_attn.attn_module.softmax_offset": sink},
+                quantization=False,
+            )
+
+        assert set(out) == {"model.layers.0.self_attn.attention_sink_bias"}
+        assert out["model.layers.0.self_attn.attention_sink_bias"] is sink
+
     def test_non_expert_passthrough(self, adapter):
         tensor = torch.randn(4, 4)
         with patch.object(adapter, "_convert_single_merged_expert_to_hf_split_experts", return_value=None):

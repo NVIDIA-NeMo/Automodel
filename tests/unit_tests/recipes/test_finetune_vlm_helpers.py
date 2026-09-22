@@ -43,6 +43,7 @@ from nemo_automodel.recipes._typed_config import (
 from nemo_automodel.recipes.vlm.finetune import (
     FinetuneRecipeForVLM,
     _get_model_name,
+    _maybe_downgrade_loss_fn,
     build_model,
 )
 
@@ -510,6 +511,7 @@ def test_forward_backward_step_routes_thd_batch_through_te(monkeypatch):
     assert "use_te" not in captured
     assert "magi" not in captured
     assert captured["padding_token_id"] == 7
+    assert captured["num_chunks"] == 1
 
 
 @pytest.mark.cuda(False)
@@ -1553,6 +1555,8 @@ class _MockAutoPipeline:
     def __init__(self, has_first_stage=True, has_last_stage=True, n_microbatches=2, add_losses=True):
         self._info = _MockPPInfo(has_first_stage, has_last_stage, n_microbatches, add_losses)
         self.info = self._info
+        self.pp_batch_size = n_microbatches
+        self.pp_microbatch_size = 1
         self.step_batches = []
 
     def update_seq_len(self, seq_len: int) -> None:
@@ -1607,6 +1611,51 @@ def _prepare_pp_vlm_batch(batch, n_microbatches=2):
     )
 
 
+def test_vlm_pp_keeps_fused_ce_for_hidden_state_capable_stage():
+    from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+
+    class _SupportedStage(nn.Module):
+        _pp_return_hidden_states_supported = True
+
+        def forward(self, input_ids=None, logits_to_keep=0):
+            return input_ids
+
+    loss_fn = FusedLinearCrossEntropy(ignore_index=-7)
+
+    result = _maybe_downgrade_loss_fn(loss_fn, _SupportedStage(), pp_enabled=True)
+
+    assert result is loss_fn
+
+
+def test_configure_pipeline_fused_ce_requests_hidden_states():
+    from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+
+    first_stage_model = nn.Linear(2, 2)
+    last_stage_model = nn.Linear(2, 2)
+    recipe = _create_pp_recipe(first_stage_model)
+    recipe.__dict__["model_parts"] = [first_stage_model, last_stage_model]
+    recipe.__dict__["loss_fn"] = FusedLinearCrossEntropy()
+    pipeline_loss = object()
+    build_loss = MagicMock(return_value=pipeline_loss)
+    recipe.__dict__["cfg"] = SimpleNamespace(mtp=SimpleNamespace(build=build_loss))
+    reduce_group = object()
+    recipe.__dict__["_get_dp_group"] = lambda include_cp=True: reduce_group
+    pp = _MockAutoPipeline(has_first_stage=True, has_last_stage=True)
+    pp.info.stages = [SimpleNamespace(is_last=False), SimpleNamespace(is_last=True)]
+    recipe.__dict__["pp"] = pp
+
+    recipe._configure_pipeline_loss_fn()
+
+    assert not hasattr(first_stage_model, "_pp_return_hidden_states")
+    assert last_stage_model._pp_return_hidden_states is True
+    assert pp.info.schedule._loss_fn is pipeline_loss
+    build_loss.assert_called_once_with(
+        recipe.loss_fn,
+        last_stage_model,
+        grad_reduce_group=reduce_group,
+    )
+
+
 class TestForwardBackwardStepPP:
     """Tests for _forward_backward_step with pipeline parallelism enabled."""
 
@@ -1642,6 +1691,54 @@ class TestForwardBackwardStepPP:
 
         # Loss buffer should be empty (no forward pass)
         assert len(loss_buffer) == 0
+
+    def test_pp_thd_uses_pipeline_chunks_and_local_sequence_length(self, pp_recipe, monkeypatch):
+        """TE THD sharding runs per PP microbatch and reports its local token length."""
+        pp_recipe.pp = _MockAutoPipeline(has_first_stage=True, has_last_stage=True, n_microbatches=2)
+        pp_recipe.mesh_context = SimpleNamespace(cp_size=2)
+        pp_recipe.pp.update_seq_len = MagicMock()
+        pipeline_loss = SimpleNamespace(cu_seqlens=None)
+        pp_recipe.pp.info.schedule._loss_fn = pipeline_loss
+        captured = {}
+
+        local_input_ids = torch.tensor([[1, 2, 7, 8], [9, 10, 15, 16]])
+        local_labels = torch.tensor([[2, 3, -100, -100], [10, 11, -100, -100]])
+        local_cu_seqlens = torch.tensor([[0, 4], [0, 4]], dtype=torch.int32)
+
+        def make_thd_sharder(model, device_mesh, batch, **kwargs):
+            del model, device_mesh, batch
+            captured.update(kwargs)
+
+            def shard(actual):
+                actual["input_ids"] = local_input_ids
+                actual["labels"] = local_labels
+                actual["cu_seqlens"] = local_cu_seqlens
+                return nullcontext, actual
+
+            return SimpleNamespace(shard=shard)
+
+        monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.ContextParallelSharder", make_thd_sharder)
+
+        pp_recipe._forward_backward_step(
+            idx=0,
+            batch={
+                "input_ids": torch.arange(16).reshape(2, 8),
+                "labels": torch.arange(16).reshape(2, 8),
+                "qkv_format": "thd",
+            },
+            loss_buffer=[],
+            num_label_tokens=8,
+            num_batches=1,
+            is_train=True,
+        )
+
+        assert captured["num_chunks"] == 2
+        pp_recipe.pp.update_seq_len.assert_called_once_with(4)
+        step_call = pp_recipe.pp.info.schedule.step.call_args
+        assert torch.equal(step_call.args[0], local_input_ids)
+        assert torch.equal(step_call.kwargs["target"], local_labels)
+        assert torch.equal(step_call.kwargs["cu_seqlens"], local_cu_seqlens)
+        assert torch.equal(pipeline_loss.cu_seqlens, local_cu_seqlens)
 
     def test_pp_vlm_chunking_equal_images_and_batch(self, pp_recipe, monkeypatch):
         """Test VLM pixel_values chunking when n_images == batch_size."""

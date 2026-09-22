@@ -78,6 +78,7 @@ def test_recipe_config_separates_vlm_dataset_wrapper_and_packing_fields():
                     "packing_ratio": 0.9,
                     "collate_max_length": 128,
                     "packing_format": "thd",
+                    "sequence_alignment": 4,
                 },
                 "dataloader": {
                     "_target_": "torchdata.stateful_dataloader.StatefulDataLoader",
@@ -96,6 +97,7 @@ def test_recipe_config_separates_vlm_dataset_wrapper_and_packing_fields():
     assert config.packing.packing_ratio == 0.9
     assert config.packing.collate_max_length == 128
     assert config.packing.packing_format == "thd"
+    assert config.packing.sequence_alignment == 4
 
 
 def test_recipe_config_rejects_unknown_vlm_packing_format():

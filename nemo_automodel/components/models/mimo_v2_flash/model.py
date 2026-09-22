@@ -15,7 +15,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import partial
 from typing import Any, Union
 
 import torch
@@ -24,6 +23,11 @@ import torch.nn.functional as F
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+from nemo_automodel.components.attention.utils import (
+    initialize_attn_module_and_func,
+    postprocess_output_for_attn,
+    preprocess_args_and_kwargs_for_attn,
+)
 from nemo_automodel.components.models.common import (
     BackendConfig,
     initialize_linear_module,
@@ -40,12 +44,15 @@ from nemo_automodel.components.models.common.utils import (
 )
 from nemo_automodel.components.models.mimo_v2_flash.config import MiMoV2Config, MiMoV2FlashConfig
 from nemo_automodel.components.models.mimo_v2_flash.cp import (
-    MiMoCPContext,
-    all_gather_sequence,
-    build_cp_attention_mask,
-    shard_batch_for_mimo_cp,
+    _MIMO_GLOBAL_IMAGE_MASK,
+    _MIMO_GLOBAL_VIDEO_MASK,
+    _MIMO_THD_LOCAL_INDICES,
+    make_mimo_te_cp_sharder,
 )
-from nemo_automodel.components.models.mimo_v2_flash.parallelization import register_mimo_v2_parallel_strategies
+from nemo_automodel.components.models.mimo_v2_flash.parallelization import (
+    register_mimo_v2_parallel_strategies,
+    setup_mimo_te_context_parallel,
+)
 from nemo_automodel.components.models.mimo_v2_flash.state_dict_adapter import MiMoV2FlashStateDictAdapter
 from nemo_automodel.components.models.mimo_v2_flash.vision import MiMoVisionTransformer
 from nemo_automodel.components.moe.config import MoEConfig
@@ -97,6 +104,28 @@ def _derive_padding_mask(attention_mask: torch.Tensor) -> torch.Tensor:
     return attention_mask.bool().logical_not()
 
 
+def _intersect_with_sliding_window(
+    attention_mask: torch.Tensor,
+    *,
+    sliding_window: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Apply causal sliding-window bounds to an existing 4D document mask."""
+    mask = _convert_bool_4d_mask_to_additive(attention_mask, dtype)
+    if not mask.dtype.is_floating_point:
+        mask = _convert_bool_4d_mask_to_additive(mask.bool(), dtype)
+    query_len, key_len = mask.shape[-2:]
+    query_positions = torch.arange(key_len - query_len, key_len, device=mask.device)
+    key_positions = torch.arange(key_len, device=mask.device)
+    outside_window = (key_positions[None, :] > query_positions[:, None]) | (
+        (query_positions[:, None] - key_positions[None, :]) >= sliding_window
+    )
+    return mask.masked_fill(
+        outside_window.unsqueeze(0).unsqueeze(0),
+        torch.finfo(dtype).min,
+    )
+
+
 def _replace_modal_embeddings(
     input_ids: torch.Tensor,
     inputs_embeds: torch.Tensor,
@@ -118,6 +147,22 @@ def _replace_modal_embeddings(
     inputs_embeds = inputs_embeds.clone()
     inputs_embeds[mask] = modal_embeds.to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)
     return inputs_embeds
+
+
+def _validate_te_thd_sink_cudnn(head_dim: int) -> None:
+    """Reject the known pre-9.26 cuDNN ragged dSink kernel bug."""
+    if head_dim in (64, 128, 256):
+        return
+    cudnn_version = torch.backends.cudnn.version()
+    if cudnn_version is None or cudnn_version < 92600:
+        detected = "unavailable" if cudnn_version is None else str(cudnn_version)
+        raise RuntimeError(
+            "MiMo TE THD training with learnable attention sinks requires cuDNN >= 9.26 "
+            "when the a2a-compatible padded value head uses a generic kernel "
+            f"(head_dim={head_dim}); detected cuDNN {detected}. Older cuDNN versions "
+            "can illegally access memory in fused-attention backward "
+            "(NVIDIA/TransformerEngine#3249)."
+        )
 
 
 def _normalize_image_grid(grid: torch.Tensor | None) -> torch.Tensor | None:
@@ -267,7 +312,7 @@ class MiMoV2RMSNorm(nn.Module):
 
 
 class MiMoV2FlashAttention(nn.Module):
-    """MiMo-V2-Flash attention with full and sliding-window variants."""
+    """MiMo-V2 attention with a Transformer Engine THD context-parallel path."""
 
     def __init__(self, config: MiMoV2FlashConfig, backend: BackendConfig, is_swa: bool, layer_idx: int):
         super().__init__()
@@ -277,22 +322,23 @@ class MiMoV2FlashAttention(nn.Module):
         self.is_swa = is_swa
 
         if is_swa:
-            self.head_dim = config.swa_head_dim
-            self.v_head_dim = config.swa_v_head_dim
-            self.num_attention_heads = config.swa_num_attention_heads
-            self.num_key_value_heads = config.swa_num_key_value_heads
+            self.head_dim = int(config.swa_head_dim)
+            self.v_head_dim = int(config.swa_v_head_dim)
+            self.num_attention_heads = int(config.swa_num_attention_heads)
+            self.num_key_value_heads = int(config.swa_num_key_value_heads)
         else:
-            self.head_dim = config.head_dim
-            self.v_head_dim = config.v_head_dim
-            self.num_attention_heads = config.num_attention_heads
-            self.num_key_value_heads = config.num_key_value_heads
+            self.head_dim = int(config.head_dim)
+            self.v_head_dim = int(config.v_head_dim)
+            self.num_attention_heads = int(config.num_attention_heads)
+            self.num_key_value_heads = int(config.num_key_value_heads)
 
         self.rope_dim = int(self.head_dim * config.partial_rotary_factor)
-        self.rope_dim = self.rope_dim - (self.rope_dim % 2)
+        self.rope_dim -= self.rope_dim % 2
         self.num_key_value_groups = self.num_attention_heads // self.num_key_value_heads
         self.attention_dropout = float(config.attention_dropout or 0.0)
         self.scaling = self.head_dim**-0.5
         self.v_scale = getattr(config, "attention_value_scale", None)
+        self.sliding_window = int(config.sliding_window) if is_swa else None
 
         dtype = get_dtype(config.torch_dtype, torch.bfloat16)
         self.q_proj = initialize_linear_module(
@@ -327,15 +373,171 @@ class MiMoV2FlashAttention(nn.Module):
         has_sink = (config.add_full_attention_sink_bias and not is_swa) or (
             config.add_swa_attention_sink_bias and is_swa
         )
-        if has_sink:
-            self.register_buffer("attention_sink_bias", torch.empty(self.num_attention_heads, dtype=torch.float32))
-        else:
+        self.attn_module = None
+        self.attn_func = None
+        if backend.attn == "te":
+            if self.v_head_dim > self.head_dim:
+                raise ValueError(
+                    "MiMo Transformer Engine attention requires v_head_dim <= qk head_dim so V can be "
+                    f"zero-padded for a2a CP, got {self.v_head_dim} > {self.head_dim} at layer {layer_idx}."
+                )
+            self.attn_module, self.attn_func = initialize_attn_module_and_func(
+                attn_impl="te",
+                num_attention_heads=self.num_attention_heads,
+                num_qk_channels=self.head_dim,
+                # TE a2a CP cannot combine sliding/sink attention with unequal QK/V
+                # dimensions. Padding V is mathematically exact because the padded
+                # output channels are cropped before o_proj.
+                num_v_channels=self.head_dim,
+                softmax_scale=self.scaling,
+                attn_mask_type="causal",
+                qkv_format="bshd",
+                num_gqa_groups=self.num_key_value_heads,
+                attention_dropout=self.attention_dropout,
+                softmax_type="learnable" if has_sink else "vanilla",
+            )
+            assert self.attn_module is not None
+            if has_sink:
+                # MiMo checkpoints freeze the sink. TE constructs it as a
+                # Parameter, but FSDP resharding that Parameter invalidates the
+                # pointer saved by TE's custom backward. Keep the identical
+                # named tensor as a persistent FP32 buffer instead.
+                softmax_offset = self.attn_module._parameters.pop("softmax_offset")
+                self.attn_module.register_buffer(
+                    "softmax_offset",
+                    softmax_offset.detach().to(torch.float32),
+                    persistent=True,
+                )
             self.attention_sink_bias = None
+        else:
+            if has_sink:
+                self.register_buffer("attention_sink_bias", torch.empty(self.num_attention_heads, dtype=torch.float32))
+            else:
+                self.attention_sink_bias = None
         self._cp_mesh = None
 
+    def _validate_a2a_cp_size(self, cp_size: int) -> None:
+        """Validate the head partition required by TE's a2a CP transport."""
+        if cp_size <= 1:
+            return
+        if self.num_attention_heads % cp_size or self.num_key_value_heads % cp_size:
+            raise ValueError(
+                "MiMo TE context parallelism uses cp_comm_type='a2a', which requires both query and "
+                "key/value head counts to be divisible by cp_size: "
+                f"layer={self.layer_idx}, query_heads={self.num_attention_heads}, "
+                f"kv_heads={self.num_key_value_heads}, cp_size={cp_size}."
+            )
+
     def setup_cp_attention(self, cp_mesh) -> None:
-        """Attach the contiguous context-parallel mesh used to gather K/V."""
+        """Attach TE a2a context parallelism and reject non-TE backends."""
+        if self.backend.attn != "te" or self.attn_module is None:
+            raise ValueError(
+                "MiMo context parallelism requires backend.attn='te' with THD packed sequences; "
+                f"got backend.attn={self.backend.attn!r}."
+            )
+        cp_size = int(cp_mesh.size())
+        self._validate_a2a_cp_size(cp_size)
         self._cp_mesh = cp_mesh
+        if cp_size <= 1:
+            return
+        cp_group = cp_mesh.get_group()
+        cp_ranks = torch.distributed.get_process_group_ranks(cp_group)
+        self.attn_module.set_context_parallel_group(
+            cp_group,
+            cp_ranks,
+            torch.cuda.Stream(),
+            cp_comm_type="a2a",
+        )
+
+    @staticmethod
+    def _apply_te_rope(
+        query_states: torch.Tensor,
+        key_states: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        *,
+        qkv_format: str,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply partial RoPE to BSHD or flattened THD query/key tensors."""
+        if qkv_format == "thd":
+            if cos.ndim == 3:
+                if cos.shape[0] != 1:
+                    raise ValueError(f"THD RoPE expects one token stream, got cos shape {tuple(cos.shape)}")
+                cos = cos.squeeze(0)
+                sin = sin.squeeze(0)
+            cos = cos.unsqueeze(1)
+            sin = sin.unsqueeze(1)
+        else:
+            cos = cos.unsqueeze(2)
+            sin = sin.unsqueeze(2)
+        return (query_states * cos) + (_rotate_half(query_states) * sin), (key_states * cos) + (
+            _rotate_half(key_states) * sin
+        )
+
+    def _forward_te(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: torch.Tensor | None,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        """Run TE attention, zero-padding V for the exact MiMo a2a kernel path."""
+        explicit_thd = kwargs.get("qkv_format") == "thd" or kwargs.get("cu_seqlens") is not None
+        qkv_format = "thd" if explicit_thd else "bshd"
+        restore_batch_dim = False
+        if qkv_format == "thd" and hidden_states.ndim == 3:
+            if hidden_states.shape[0] != 1:
+                raise ValueError(
+                    "MiMo TE THD attention expects a singleton token-stream dimension, "
+                    f"got hidden_states shape {tuple(hidden_states.shape)}."
+                )
+            hidden_states = hidden_states.squeeze(0)
+            restore_batch_dim = True
+        if qkv_format == "thd" and hidden_states.ndim != 2:
+            raise ValueError(f"MiMo TE THD attention expects [T,H], got {tuple(hidden_states.shape)}")
+        if qkv_format == "bshd" and hidden_states.ndim != 3:
+            raise ValueError(f"MiMo TE BSHD attention expects [B,S,H], got {tuple(hidden_states.shape)}")
+
+        prefix = hidden_states.shape[:-1]
+        query_states = self.q_proj(hidden_states).view(*prefix, self.num_attention_heads, self.head_dim)
+        key_states = self.k_proj(hidden_states).view(*prefix, self.num_key_value_heads, self.head_dim)
+        value_states = self.v_proj(hidden_states).view(*prefix, self.num_key_value_heads, self.v_head_dim)
+        if self.v_scale is not None:
+            value_states = value_states * self.v_scale
+
+        cos, sin = position_embeddings
+        query_rope, query_nope = query_states.split((self.rope_dim, self.head_dim - self.rope_dim), dim=-1)
+        key_rope, key_nope = key_states.split((self.rope_dim, self.head_dim - self.rope_dim), dim=-1)
+        query_rope, key_rope = self._apply_te_rope(query_rope, key_rope, cos, sin, qkv_format=qkv_format)
+        query_states = torch.cat((query_rope, query_nope), dim=-1)
+        key_states = torch.cat((key_rope, key_nope), dim=-1)
+        value_states = F.pad(value_states, (0, self.head_dim - self.v_head_dim))
+
+        if (
+            qkv_format == "thd"
+            and self.training
+            and self.attn_module is not None
+            and getattr(self.attn_module, "softmax_offset", None) is not None
+        ):
+            _validate_te_thd_sink_cudnn(self.head_dim)
+
+        te_kwargs = dict(kwargs)
+        te_kwargs["qkv_format"] = qkv_format
+        te_kwargs["window_size"] = (self.sliding_window - 1, 0) if self.sliding_window is not None else (-1, 0)
+        query_states, key_states, value_states, attn_kwargs = preprocess_args_and_kwargs_for_attn(
+            query_states,
+            key_states,
+            value_states,
+            None if qkv_format == "thd" else attention_mask,
+            "te",
+            **te_kwargs,
+        )
+        assert self.attn_func is not None
+        output = self.attn_func(query_states, key_states, value_states, **attn_kwargs)
+        output = postprocess_output_for_attn(output, "te")
+        output = output.view(*prefix, self.num_attention_heads, self.head_dim)[..., : self.v_head_dim]
+        output = self.o_proj(output.flatten(-2))
+        return output.unsqueeze(0) if restore_batch_dim else output
 
     def forward(
         self,
@@ -343,8 +545,15 @@ class MiMoV2FlashAttention(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None = None,
         **kwargs: Any,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        cp_context = kwargs.pop("mimo_cp_context", None)
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if self.backend.attn == "te":
+            return self._forward_te(hidden_states, position_embeddings, attention_mask, **kwargs), None
+
+        if kwargs.get("qkv_format") == "thd" or kwargs.get("cu_seqlens") is not None:
+            raise ValueError(
+                "MiMo THD packed attention requires backend.attn='te'; dense-mask SDPA/eager attention "
+                "cannot safely recover THD document boundaries."
+            )
         del kwargs
         batch, seq_len = hidden_states.shape[:2]
         q_shape = (batch, seq_len, self.num_attention_heads, self.head_dim)
@@ -354,28 +563,15 @@ class MiMoV2FlashAttention(nn.Module):
         query_states = self.q_proj(hidden_states).view(q_shape).transpose(1, 2)
         key_states = self.k_proj(hidden_states).view(k_shape).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(v_shape).transpose(1, 2)
-
         if self.v_scale is not None:
             value_states = value_states * self.v_scale
 
         cos, sin = position_embeddings
-        query_rope, query_nope = query_states.split([self.rope_dim, self.head_dim - self.rope_dim], dim=-1)
-        key_rope, key_nope = key_states.split([self.rope_dim, self.head_dim - self.rope_dim], dim=-1)
+        query_rope, query_nope = query_states.split((self.rope_dim, self.head_dim - self.rope_dim), dim=-1)
+        key_rope, key_nope = key_states.split((self.rope_dim, self.head_dim - self.rope_dim), dim=-1)
         query_rope, key_rope = _apply_rotary_pos_emb(query_rope, key_rope, cos, sin)
-        query_states = torch.cat([query_rope, query_nope], dim=-1)
-        key_states = torch.cat([key_rope, key_nope], dim=-1)
-
-        if cp_context is not None and cp_context.cp_enabled:
-            if self._cp_mesh is None:
-                raise RuntimeError("MiMo attention received a CP batch before apply_cp attached its mesh")
-            cp_group = self._cp_mesh.get_group()
-            key_states = all_gather_sequence(key_states, cp_group, dim=2)
-            value_states = all_gather_sequence(value_states, cp_group, dim=2)
-            attention_mask = build_cp_attention_mask(
-                cp_context,
-                dtype=query_states.dtype,
-                sliding_window=int(self.config.sliding_window) if self.is_swa else None,
-            )
+        query_states = torch.cat((query_rope, query_nope), dim=-1)
+        key_states = torch.cat((key_rope, key_nope), dim=-1)
 
         attn_output, attn_weights = _eager_attention_forward(
             self,
@@ -395,7 +591,11 @@ class MiMoV2FlashAttention(nn.Module):
             nn.init.normal_(linear.weight, mean=0.0, std=init_std)
             if getattr(linear, "bias", None) is not None:
                 nn.init.zeros_(linear.bias)
-        if self.attention_sink_bias is not None:
+        if self.backend.attn == "te" and self.attn_module is not None:
+            if self.attn_module.softmax_offset is not None:
+                nn.init.zeros_(self.attn_module.softmax_offset)
+                self.attn_module.softmax_offset.requires_grad_(False)
+        elif self.attention_sink_bias is not None:
             nn.init.zeros_(self.attention_sink_bias)
 
 
@@ -566,6 +766,56 @@ class MiMoV2FlashModel(nn.Module):
                 ),
             }
 
+        if isinstance(attention_mask, torch.Tensor) and attention_mask.ndim == 4:
+            full = _ensure_additive_mask(
+                attention_mask,
+                batch_size=batch_size,
+                seq_len=seq_len,
+                dtype=inputs_embeds.dtype,
+                device=inputs_embeds.device,
+                attention_mask=None,
+                sliding_window=None,
+            )
+            sliding_window = getattr(self.config, "sliding_window", None) if self.has_sliding_layers else None
+            sliding = (
+                _intersect_with_sliding_window(
+                    full,
+                    sliding_window=int(sliding_window),
+                    dtype=inputs_embeds.dtype,
+                )
+                if sliding_window is not None
+                else full
+            )
+            return {"full_attention": full, "sliding_attention": sliding}
+
+        # Released MiMo configs leave _attn_implementation unset. The custom
+        # eager attention owns mask application, so build ordinary masks here
+        # instead of asking transformers to select an attention backend.
+        if getattr(self.config, "_attn_implementation", None) is None:
+            tensor_mask = attention_mask if isinstance(attention_mask, torch.Tensor) else None
+            full = _fallback_additive_mask(
+                batch_size,
+                seq_len,
+                inputs_embeds.dtype,
+                inputs_embeds.device,
+                tensor_mask,
+                None,
+            )
+            sliding_window = getattr(self.config, "sliding_window", None) if self.has_sliding_layers else None
+            sliding = (
+                _fallback_additive_mask(
+                    batch_size,
+                    seq_len,
+                    inputs_embeds.dtype,
+                    inputs_embeds.device,
+                    tensor_mask,
+                    int(sliding_window),
+                )
+                if sliding_window is not None
+                else full
+            )
+            return {"full_attention": full, "sliding_attention": sliding}
+
         mask_kwargs = {
             "config": self.config,
             "inputs_embeds": inputs_embeds,
@@ -605,12 +855,45 @@ class MiMoV2FlashModel(nn.Module):
         attention_mask: torch.Tensor | dict[str, torch.Tensor] | None = None,
         padding_mask: torch.Tensor | None = None,
         cache_position: torch.Tensor | None = None,
-        mimo_cp_doc_ids: torch.Tensor | None = None,
-        mimo_cp_seq_start: int = 0,
-        mimo_cp_size: int = 1,
+        _packed_seq_ids: torch.Tensor | None = None,
+        seq_lens: torch.Tensor | None = None,
+        seq_lens_padded: torch.Tensor | None = None,
+        cu_seqlens: torch.Tensor | None = None,
+        cu_seqlens_padded: torch.Tensor | None = None,
+        max_seqlen: int | torch.Tensor | None = None,
+        qkv_format: str | None = None,
+        cp_size: int = 1,
+        cp_rank: int = 0,
         **kwargs: Any,
     ) -> torch.Tensor:
-        del kwargs
+        """Run the text backbone in BSHD or genuine TE THD layout.
+
+        THD batches must already have passed through the framework TE sharder.
+        Their cumulative lengths delimit packed documents and are forwarded to
+        every attention layer, including non-first pipeline stages.
+        """
+        del seq_lens, seq_lens_padded, kwargs
+        is_thd = qkv_format == "thd"
+        indexed_attention = (
+            isinstance(attention_mask, torch.Tensor)
+            and attention_mask.ndim == 2
+            and attention_mask.numel() > 0
+            and bool((attention_mask > 1).any().item())
+        )
+        if self.backend.attn == "te" and not is_thd and (_packed_seq_ids is not None or indexed_attention):
+            raise ValueError(
+                "MiMo TE packed attention requires THD packing with seq_lens/seq_lens_padded; "
+                "NEAT document IDs cannot be represented safely by TE context parallelism."
+            )
+        if is_thd and self.backend.attn != "te":
+            raise ValueError(
+                "MiMo THD packed attention requires backend.attn='te'; select THD packing and TE together."
+            )
+
+        if is_thd and input_ids is not None and input_ids.ndim == 1:
+            input_ids = input_ids.unsqueeze(0)
+        if is_thd and inputs_embeds is not None and inputs_embeds.ndim == 2:
+            inputs_embeds = inputs_embeds.unsqueeze(0)
         if inputs_embeds is None:
             if self.embed_tokens is not None:
                 if input_ids is None:
@@ -620,24 +903,58 @@ class MiMoV2FlashModel(nn.Module):
                 inputs_embeds = input_ids
         if inputs_embeds is None:
             raise ValueError("input_ids or inputs_embeds must be provided")
+        if is_thd and inputs_embeds.ndim != 3:
+            raise ValueError(
+                f"MiMo THD model input must be [1,T,H] after pipeline chunking, got {tuple(inputs_embeds.shape)}."
+            )
+        if is_thd and inputs_embeds.shape[0] != 1:
+            raise ValueError(
+                "MiMo THD attention represents one flattened token stream per model call; "
+                f"got batch dimension {inputs_embeds.shape[0]}."
+            )
+
+        if is_thd:
+            if position_ids is not None and position_ids.ndim == 1:
+                position_ids = position_ids.unsqueeze(0)
+            if padding_mask is not None and padding_mask.ndim == 1:
+                padding_mask = padding_mask.unsqueeze(0)
+            if cu_seqlens is None:
+                raise ValueError(
+                    "MiMo TE THD attention requires cu_seqlens from make_cp_batch_for_te; "
+                    "call the model through its ContextParallelSharder."
+                )
+            if cu_seqlens.ndim == 2:
+                if cu_seqlens.shape[0] != 1:
+                    raise ValueError(f"Expected one THD cu_seqlens row, got {tuple(cu_seqlens.shape)}")
+                cu_seqlens = cu_seqlens.squeeze(0)
+            cu_seqlens = cu_seqlens[cu_seqlens >= 0].to(torch.int32).contiguous()
+            if cu_seqlens_padded is not None:
+                if cu_seqlens_padded.ndim == 2:
+                    if cu_seqlens_padded.shape[0] != 1:
+                        raise ValueError(
+                            f"Expected one THD cu_seqlens_padded row, got {tuple(cu_seqlens_padded.shape)}"
+                        )
+                    cu_seqlens_padded = cu_seqlens_padded.squeeze(0)
+                cu_seqlens_padded = cu_seqlens_padded[cu_seqlens_padded >= 0].to(torch.int32).contiguous()
+                # MiMo packs each document as real tokens followed only by tail
+                # padding. Use its physical boundary directly: causal real-token
+                # outputs are unchanged, while this avoids TE/cuDNN's unstable
+                # separate padded-cu backward path and matches CP>1 sharding.
+                cu_seqlens = cu_seqlens_padded
+                cu_seqlens_padded = None
+            if isinstance(max_seqlen, torch.Tensor) and max_seqlen.numel() != 1:
+                raise ValueError(f"Expected scalar max_seqlen, got {tuple(max_seqlen.shape)}")
+            max_seqlen = int((cu_seqlens[1:] - cu_seqlens[:-1]).max().item())
+            attention_mask = None
 
         if cache_position is None:
             cache_position = torch.arange(0, inputs_embeds.shape[1], device=inputs_embeds.device)
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
-
         if padding_mask is None and isinstance(attention_mask, torch.Tensor):
             padding_mask = _derive_padding_mask(attention_mask)
 
-        cp_context = None
-        if mimo_cp_doc_ids is not None:
-            cp_context = MiMoCPContext(
-                doc_ids=mimo_cp_doc_ids,
-                seq_start=int(mimo_cp_seq_start),
-                cp_size=int(mimo_cp_size),
-                original_seq_len=mimo_cp_doc_ids.shape[1],
-            )
-        if cp_context is not None and cp_context.cp_enabled:
+        if is_thd:
             causal_mask_mapping = {"full_attention": None, "sliding_attention": None}
         else:
             causal_mask_mapping = self._build_causal_mask_mapping(
@@ -650,6 +967,15 @@ class MiMoV2FlashModel(nn.Module):
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
         swa_position_embeddings = self.swa_rotary_emb(hidden_states, position_ids)
+        attention_kwargs = {
+            "qkv_format": qkv_format,
+            "cu_seqlens": cu_seqlens,
+            "cu_seqlens_padded": cu_seqlens_padded,
+            "max_seqlen": max_seqlen,
+            "cp_size": cp_size,
+            "cp_rank": cp_rank,
+        }
+        attention_kwargs = {key: value for key, value in attention_kwargs.items() if value is not None}
 
         for decoder_layer in self.layers.values():
             layer_position_embeddings = (
@@ -660,7 +986,7 @@ class MiMoV2FlashModel(nn.Module):
                 attention_mask=causal_mask_mapping[decoder_layer.attention_type],
                 position_embeddings=layer_position_embeddings,
                 padding_mask=padding_mask,
-                mimo_cp_context=cp_context,
+                **attention_kwargs,
             )
 
         return self.norm(hidden_states) if self.norm is not None else hidden_states
@@ -685,10 +1011,17 @@ class MiMoV2FlashForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     # "rotary_emb" (matches self.rotary_emb + self.swa_rotary_emb) pins their inv_freq
     # buffers in fp32: cast_model_to_dtype's bf16 cast would otherwise round inv_freq and
     # degrade RoPE precision vs HF (see llama/rope_utils.py).
-    _keep_in_fp32_modules_strict = ["mlp.gate.e_score_correction_bias", "attention_sink_bias", "rotary_emb"]
+    _keep_in_fp32_modules_strict = [
+        "mlp.gate.e_score_correction_bias",
+        "attention_sink_bias",
+        "attn_module.softmax_offset",
+        "rotary_emb",
+    ]
     _pp_keep_self_forward = True
+    _pp_return_hidden_states_supported = True
     _skip_init_weights_on_load = True
     _owns_cp_attention = True
+    _owns_packed_attention = True
     cp_mesh = None
 
     @dataclass(frozen=True)
@@ -779,11 +1112,13 @@ class MiMoV2FlashForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         pixel_values: torch.Tensor | None = None,
         image_grid_thw: torch.Tensor | None = None,
         image_embeds: torch.Tensor | None = None,
+        image_feature_indices: torch.Tensor | None = None,
         pixel_values_videos: torch.Tensor | None = None,
         video_grid_thw: torch.Tensor | None = None,
         video_embeds: torch.Tensor | None = None,
+        video_feature_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Encode image/video patches and splice them into their token slots."""
+        """Encode global media and splice only this TE THD shard's feature rows."""
         has_image = image_embeds is not None or pixel_values is not None
         has_video = video_embeds is not None or pixel_values_videos is not None
         if not has_image and not has_video:
@@ -795,6 +1130,8 @@ class MiMoV2FlashForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             if image_embeds is None:
                 image_grid_thw = _normalize_image_grid(image_grid_thw)
                 image_embeds = self.visual(pixel_values, image_grid_thw)
+            if image_feature_indices is not None:
+                image_embeds = image_embeds.index_select(0, image_feature_indices.to(image_embeds.device))
             inputs_embeds = _replace_modal_embeddings(
                 input_ids,
                 inputs_embeds,
@@ -805,6 +1142,8 @@ class MiMoV2FlashForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             if video_embeds is None:
                 video_grid_thw = _normalize_image_grid(video_grid_thw)
                 video_embeds = self.visual(pixel_values_videos, video_grid_thw)
+            if video_feature_indices is not None:
+                video_embeds = video_embeds.index_select(0, video_feature_indices.to(video_embeds.device))
             inputs_embeds = _replace_modal_embeddings(
                 input_ids,
                 inputs_embeds,
@@ -813,6 +1152,27 @@ class MiMoV2FlashForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             )
         return inputs_embeds
 
+    @staticmethod
+    def _local_modal_feature_indices(
+        global_mask: torch.Tensor | None,
+        local_indices: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        """Map local TE THD placeholders to rows in globally ordered media features."""
+        if global_mask is None:
+            return None
+        if local_indices is None:
+            raise ValueError("MiMo VLM THD media mapping requires TE local-token global indices")
+        global_mask = global_mask.reshape(-1).bool()
+        local_indices = local_indices.reshape(-1).to(device=global_mask.device, dtype=torch.long)
+        if local_indices.numel() and int(local_indices.max().item()) >= global_mask.numel():
+            raise ValueError(
+                "MiMo VLM THD local token index exceeds the global placeholder mask: "
+                f"max_index={int(local_indices.max().item())}, mask_tokens={global_mask.numel()}."
+            )
+        feature_index_by_token = global_mask.long().cumsum(0) - 1
+        local_mask = global_mask.index_select(0, local_indices)
+        return feature_index_by_token.index_select(0, local_indices)[local_mask].to(torch.long)
+
     def _pull_pipeline_media(
         self,
         input_ids: torch.Tensor | None,
@@ -820,68 +1180,59 @@ class MiMoV2FlashForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         image_grid_thw: torch.Tensor | None,
         pixel_values_videos: torch.Tensor | None,
         video_grid_thw: torch.Tensor | None,
+        *,
+        global_image_mask: torch.Tensor | None = None,
+        global_video_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
-        """Retrieve the current PP microbatch's media from the stage-zero side channel."""
+        """Retrieve PP media using global masks so every CP rank runs the same vision work."""
         if input_ids is None or torch.is_floating_point(input_ids):
             return pixel_values, image_grid_thw, pixel_values_videos, video_grid_thw
 
-        chunk_idx = int(getattr(self, "_vlm_chunk_idx", 0))
-        consumed = False
+        chunk_idx = int(getattr(self, "_vlm_chunk_idx", 0) or 0)
         image_chunks = getattr(self, "_vlm_pixel_values_chunks", None)
+        video_chunks = getattr(self, "_vlm_pixel_values_videos_chunks", None)
+        has_staged_media = image_chunks is not None or video_chunks is not None
+        if not has_staged_media:
+            return pixel_values, image_grid_thw, pixel_values_videos, video_grid_thw
+
+        if image_chunks is not None and chunk_idx >= len(image_chunks):
+            raise RuntimeError(f"MiMo PP image-media cursor {chunk_idx} exceeds {len(image_chunks)} staged chunks")
+        if video_chunks is not None and chunk_idx >= len(video_chunks):
+            raise RuntimeError(f"MiMo PP video-media cursor {chunk_idx} exceeds {len(video_chunks)} staged chunks")
+
         image_token_id = getattr(self.config, "image_token_id", None)
+        image_placeholder_mask = global_image_mask
+        if image_placeholder_mask is None and image_token_id is not None:
+            image_placeholder_mask = input_ids.eq(image_token_id)
         if (
             pixel_values is None
             and image_chunks is not None
-            and image_token_id is not None
-            and bool(input_ids.eq(image_token_id).any())
-            and chunk_idx < len(image_chunks)
+            and image_placeholder_mask is not None
+            and bool(image_placeholder_mask.any())
         ):
             pixel_values = image_chunks[chunk_idx]
             grid_chunks = getattr(self, "_vlm_image_grid_hws_chunks", None)
             if grid_chunks is not None and chunk_idx < len(grid_chunks):
                 image_grid_thw = _normalize_image_grid(grid_chunks[chunk_idx])
-            consumed = True
 
-        video_chunks = getattr(self, "_vlm_pixel_values_videos_chunks", None)
         video_token_id = getattr(self.config, "video_token_id", None)
+        video_placeholder_mask = global_video_mask
+        if video_placeholder_mask is None and video_token_id is not None:
+            video_placeholder_mask = input_ids.eq(video_token_id)
         if (
             pixel_values_videos is None
             and video_chunks is not None
-            and video_token_id is not None
-            and bool(input_ids.eq(video_token_id).any())
-            and chunk_idx < len(video_chunks)
+            and video_placeholder_mask is not None
+            and bool(video_placeholder_mask.any())
         ):
             pixel_values_videos = video_chunks[chunk_idx]
             grid_chunks = getattr(self, "_vlm_video_grid_thw_chunks", None)
             if grid_chunks is not None and chunk_idx < len(grid_chunks):
                 video_grid_thw = grid_chunks[chunk_idx]
-            consumed = True
-        if consumed:
-            self._vlm_chunk_idx = chunk_idx + 1
+        # Every integer-token microbatch consumes exactly one staged slot,
+        # including text-only slots whose media chunks are empty.
+        self._vlm_chunk_idx = chunk_idx + 1
         return pixel_values, image_grid_thw, pixel_values_videos, video_grid_thw
-
-    @staticmethod
-    def _shard_vlm_embeddings_for_cp(
-        inputs_embeds: torch.Tensor,
-        *,
-        doc_ids: torch.Tensor | None,
-        seq_start: int,
-        cp_size: int,
-    ) -> torch.Tensor:
-        """Pad and slice full multimodal embeddings after vision insertion."""
-        if cp_size <= 1 or doc_ids is None:
-            return inputs_embeds
-        padded_seq_len = doc_ids.shape[1]
-        local_seq_len = padded_seq_len // cp_size
-        if inputs_embeds.shape[1] == local_seq_len:
-            return inputs_embeds
-        if inputs_embeds.shape[1] > padded_seq_len:
-            raise ValueError(
-                f"VLM input sequence {inputs_embeds.shape[1]} exceeds the CP padded length {padded_seq_len}"
-            )
-        if inputs_embeds.shape[1] < padded_seq_len:
-            inputs_embeds = F.pad(inputs_embeds, (0, 0, 0, padded_seq_len - inputs_embeds.shape[1]))
-        return inputs_embeds[:, seq_start : seq_start + local_seq_len].contiguous()
 
     def forward(
         self,
@@ -901,30 +1252,20 @@ class MiMoV2FlashForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         logits_to_keep: Union[int, torch.Tensor] = 0,
         output_hidden_states: bool | None = None,
         **kwargs: Any,
-    ) -> CausalLMOutputWithPast:
-        """Forward pass producing text logits.
-
-        Args:
-            input_ids: Input token IDs ``[B, S]`` (or THD-packed ``[T]``/``[1, T]``).
-            inputs_embeds: Pre-computed input embeddings (optional).
-            position_ids: Optional position indices.
-            attention_mask: 2D padding mask, 4D additive mask, or per-type dict.
-            padding_mask: Optional MoE padding mask.
-            logits_to_keep: If 0, compute logits for all positions (training default);
-                otherwise compute only the last ``logits_to_keep`` positions.
-            output_hidden_states: When set, the returned output carries the final
-                hidden states (input to ``lm_head``) in ``hidden_states``.
-            **kwargs: Additional arguments forwarded to the base model.
-
-        Returns:
-            :class:`~transformers.modeling_outputs.CausalLMOutputWithPast` with
-            ``logits`` and, when requested, ``hidden_states``.
-        """
+    ) -> CausalLMOutputWithPast | torch.Tensor:
+        """Run text or VLM forward with TE-local packed media placement."""
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None
             else getattr(self.config, "output_hidden_states", False)
         )
+        is_thd = kwargs.get("qkv_format") == "thd"
+        local_thd_indices = kwargs.pop(_MIMO_THD_LOCAL_INDICES, None)
+        global_image_mask = kwargs.pop(_MIMO_GLOBAL_IMAGE_MASK, None)
+        global_video_mask = kwargs.pop(_MIMO_GLOBAL_VIDEO_MASK, None)
+        cp_size = int(kwargs.get("cp_size", 1))
+        if cp_size > 1 and self.config.vision_config is not None and is_thd and local_thd_indices is None:
+            raise ValueError("MiMo VLM TE context parallelism requires the local THD index map from its model sharder.")
 
         if pixel_values_videos is not None and video_pixel_values is not None:
             raise ValueError("Pass only one of pixel_values_videos and video_pixel_values")
@@ -936,18 +1277,17 @@ class MiMoV2FlashForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             image_grid_thw,
             pixel_values_videos,
             video_grid_thw,
+            global_image_mask=global_image_mask,
+            global_video_mask=global_video_mask,
         )
 
+        integer_tokens = input_ids is not None and not torch.is_floating_point(input_ids)
         has_media = any(value is not None for value in (pixel_values, image_embeds, pixel_values_videos, video_embeds))
-        needs_vlm_cp_shard = self.config.vision_config is not None and int(kwargs.get("mimo_cp_size", 1)) > 1
-        if (
-            inputs_embeds is None
-            and input_ids is not None
-            and not torch.is_floating_point(input_ids)
-            and (has_media or needs_vlm_cp_shard)
-        ):
+        if inputs_embeds is None and integer_tokens and has_media:
             if self.model.embed_tokens is None:
                 raise ValueError("The first pipeline stage must own embed_tokens")
+            image_feature_indices = self._local_modal_feature_indices(global_image_mask, local_thd_indices)
+            video_feature_indices = self._local_modal_feature_indices(global_video_mask, local_thd_indices)
             inputs_embeds = self.model.embed_tokens(input_ids)
             inputs_embeds = self._get_multimodal_embeds(
                 input_ids,
@@ -955,19 +1295,13 @@ class MiMoV2FlashForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 pixel_values=pixel_values,
                 image_grid_thw=image_grid_thw,
                 image_embeds=image_embeds,
+                image_feature_indices=image_feature_indices,
                 pixel_values_videos=pixel_values_videos,
                 video_grid_thw=video_grid_thw,
                 video_embeds=video_embeds,
+                video_feature_indices=video_feature_indices,
             )
             input_ids = None
-
-        if inputs_embeds is not None and self.config.vision_config is not None:
-            inputs_embeds = self._shard_vlm_embeddings_for_cp(
-                inputs_embeds,
-                doc_ids=kwargs.get("mimo_cp_doc_ids"),
-                seq_start=int(kwargs.get("mimo_cp_seq_start", 0)),
-                cp_size=int(kwargs.get("mimo_cp_size", 1)),
-            )
 
         hidden = self.model(
             input_ids=input_ids,
@@ -977,13 +1311,54 @@ class MiMoV2FlashForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             padding_mask=padding_mask,
             **kwargs,
         )
+        if getattr(self, "_pp_return_hidden_states", False) is True:
+            return hidden
         if self.lm_head is None:
             return CausalLMOutputWithPast(
                 logits=hidden,
                 hidden_states=hidden if output_hidden_states else None,
             )
 
-        return compute_lm_head_logits(self.lm_head, hidden, logits_to_keep, output_hidden_states=output_hidden_states)
+        output = compute_lm_head_logits(
+            self.lm_head,
+            hidden,
+            logits_to_keep,
+            is_thd=is_thd,
+            output_hidden_states=output_hidden_states,
+        )
+        if (
+            is_thd
+            and output.hidden_states is not None
+            and output.hidden_states.ndim == 3
+            and output.hidden_states.shape[0] == 1
+        ):
+            # The TE THD sharder flattens labels to [T]. FusedLinearCrossEntropy
+            # therefore consumes [T,H], while logits retain the public [1,T,V]
+            # shape. PP returns above and keeps [microbatch,T,H] for its schedule.
+            output.hidden_states = output.hidden_states.squeeze(0)
+        return output
+
+    def get_pipeline_stage_metas(
+        self,
+        *,
+        is_first: bool,
+        microbatch_size: int,
+        seq_len: int,
+        dtype: torch.dtype,
+    ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+        """Describe PP tensors using the already TE-sharded local token length."""
+        hidden_size = int(self.config.hidden_size)
+        vocab_size = int(self.config.vocab_size)
+        if is_first:
+            inputs_meta = (torch.empty(microbatch_size, seq_len, device="meta", dtype=torch.long),)
+        else:
+            inputs_meta = (torch.empty(microbatch_size, seq_len, hidden_size, device="meta", dtype=dtype),)
+
+        has_lm_head = self.lm_head is not None
+        emits_hidden_states = getattr(self, "_pp_return_hidden_states", False) is True
+        output_width = vocab_size if has_lm_head and not emits_hidden_states else hidden_size
+        outputs_meta = (torch.empty(microbatch_size, seq_len, output_width, device="meta", dtype=dtype),)
+        return inputs_meta, outputs_meta
 
     def customize_pipeline_stage_modules(
         self,
@@ -1010,27 +1385,23 @@ class MiMoV2FlashForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         return stage_modules
 
     def prepare_model_inputs_for_cp(self, batch: dict[str, Any], *, num_chunks: int = 1) -> dict[str, Any]:
-        """Install MiMo's contiguous sharder and attach the CP mesh to attention."""
-        from nemo_automodel.components.distributed.context_parallel.sharder import (
-            ContextParallelSharder,
-            contiguous_local_indices,
-        )
-
+        """Install MiMo's model-local adapter around framework TE THD sharding."""
+        if self.backend.attn != "te":
+            raise ValueError(f"MiMo context parallelism requires model.backend.attn='te'; got {self.backend.attn!r}.")
+        if batch.get("qkv_format") != "thd":
+            raise ValueError(
+                "MiMo context parallelism requires packed THD input. NEAT/dense packed masks cannot be "
+                "mapped to Transformer Engine document boundaries; set packing_strategy='thd'."
+            )
         cp_mesh = getattr(self, "cp_mesh", None)
-        if cp_mesh is None:
-            raise RuntimeError("MiMo context-parallel input preparation requires a CP mesh")
-        for module in self.modules():
-            if isinstance(module, MiMoV2FlashAttention):
-                module.setup_cp_attention(cp_mesh)
-        del batch, num_chunks
+        if cp_mesh is None or cp_mesh.size() <= 1:
+            raise RuntimeError("MiMo context-parallel input preparation requires an active CP mesh")
+        setup_mimo_te_context_parallel(self, cp_mesh)
         return {
-            "cp_sharder": ContextParallelSharder(
-                shard_batch=partial(
-                    shard_batch_for_mimo_cp,
-                    padding_token_id=int(getattr(self.config, "pad_token_id", 0) or 0),
-                    shard_primary=self.config.vision_config is None,
-                ),
-                local_token_global_indices=contiguous_local_indices,
+            "cp_sharder": make_mimo_te_cp_sharder(
+                num_chunks=num_chunks,
+                image_token_id=getattr(self.config, "image_token_id", None),
+                video_token_id=getattr(self.config, "video_token_id", None),
             )
         }
 

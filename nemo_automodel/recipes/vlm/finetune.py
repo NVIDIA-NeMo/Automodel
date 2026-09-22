@@ -172,6 +172,30 @@ def _validate_cp_packing_support(
     )
 
 
+def _maybe_downgrade_loss_fn(loss_fn: nn.Module, probe_module: nn.Module, pp_enabled: bool) -> nn.Module:
+    """Downgrade losses whose required model output contract is unavailable."""
+    if not _supports_logits_to_keep(probe_module) and not isinstance(loss_fn, MaskedCrossEntropy):
+        logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
+        return MaskedCrossEntropy(
+            ignore_index=_get_loss_ignore_index(loss_fn),
+            reduction=getattr(loss_fn, "reduction", "sum"),
+        )
+    if (
+        pp_enabled
+        and isinstance(loss_fn, FusedLinearCrossEntropy)
+        and not getattr(probe_module, "_pp_return_hidden_states_supported", False)
+    ):
+        logger.warning(
+            "FusedLinearCrossEntropy is not supported under pipeline parallelism for this "
+            "model. Using MaskedCrossEntropy instead."
+        )
+        return MaskedCrossEntropy(
+            ignore_index=_get_loss_ignore_index(loss_fn),
+            reduction=getattr(loss_fn, "reduction", "sum"),
+        )
+    return loss_fn
+
+
 def _get_model_name(cfg_model):
     if cfg_model.get("pretrained_model_name_or_path", None) is not None:
         return cfg_model.pretrained_model_name_or_path
@@ -565,12 +589,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             model, optimizer, self.distributed_config, allow=allow_megatron_fsdp_sharding
         )
 
-        if not _supports_logits_to_keep(model) and not isinstance(self.loss_fn, MaskedCrossEntropy):
-            logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
-            self.loss_fn = MaskedCrossEntropy(
-                ignore_index=_get_loss_ignore_index(self.loss_fn),
-                reduction=getattr(self.loss_fn, "reduction", "sum"),
-            )
+        self.loss_fn = _maybe_downgrade_loss_fn(self.loss_fn, capability_model, isinstance(model, AutoPipeline))
 
         if isinstance(model, AutoPipeline):
             self.model_parts = model.parts
@@ -897,6 +916,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self.device_mesh,
             batch,
             padding_token_id=_padding_id,
+            num_chunks=self.pp.pp_batch_size // self.pp.pp_microbatch_size if self.pp_enabled else 1,
             invoke_pre_embed=True,
         )
         model = self.model_parts[0]
@@ -949,6 +969,17 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 model_input = batch.pop(model_input_key)
                 self.pp.update_seq_len(model_input.shape[1])
                 self._maybe_set_pp_first_stage_embed_input_meta(model_input)
+
+                # Match the LLM THD+PP path: make packed boundaries available to
+                # pipeline losses that need to keep token shifts within documents.
+                # The TE sharder emits one metadata row per pipeline chunk; a
+                # single-row batch is normalized to the loss' flat convention.
+                cu_seqlens = batch.get("cu_seqlens")
+                if isinstance(cu_seqlens, torch.Tensor) and cu_seqlens.dim() == 2:
+                    cu_seqlens = cu_seqlens.squeeze(0)
+                pp_loss_fn = getattr(self.pp.info.schedule, "_loss_fn", None) if self.pp.info.has_last_stage else None
+                if pp_loss_fn is not None and hasattr(pp_loss_fn, "cu_seqlens"):
+                    pp_loss_fn.cu_seqlens = cu_seqlens
 
                 with stage_vlm_media_for_pp(self.pp, self.model_parts, batch):
                     self.pp.step(model_input, target=targets, losses=losses, **batch)
@@ -1061,6 +1092,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 break
         if last_stage_model is None:
             raise RuntimeError("Pipeline reports a last stage, but no last-stage model part was found")
+
+        if isinstance(self.loss_fn, FusedLinearCrossEntropy):
+            last_stage_model._pp_return_hidden_states = True
 
         self.pp.info.schedule._loss_fn = self.cfg.mtp.build(
             self.loss_fn,

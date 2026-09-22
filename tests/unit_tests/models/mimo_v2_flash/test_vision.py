@@ -14,11 +14,20 @@
 
 from __future__ import annotations
 
+import sys
+from types import SimpleNamespace
+from unittest.mock import patch
+
 import torch
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.mimo_v2_flash.config import MiMoV2Config
-from nemo_automodel.components.models.mimo_v2_flash.cp import shard_batch_for_mimo_cp
+from nemo_automodel.components.models.mimo_v2_flash.cp import (
+    _MIMO_GLOBAL_IMAGE_MASK,
+    _MIMO_GLOBAL_VIDEO_MASK,
+    _MIMO_THD_LOCAL_INDICES,
+    shard_batch_for_mimo_te,
+)
 from nemo_automodel.components.models.mimo_v2_flash.model import MiMoV2ForCausalLM
 from nemo_automodel.components.models.mimo_v2_flash.vision import (
     MiMoVisionRotaryEmbedding,
@@ -218,41 +227,147 @@ def test_pipeline_media_side_channel_accepts_hw_grid_alias():
     assert model._vlm_chunk_idx == 1
 
 
-def test_vlm_cp_splices_before_contiguous_embedding_shard():
+def test_vlm_te_cp_maps_global_media_to_local_dual_chunk_tokens():
     class FakeMesh:
         def size(self):
             return 2
 
+        def get_group(self):
+            return object()
+
         def get_local_rank(self):
             return 1
 
-    input_ids = torch.tensor([[62, 1, 2, 3, 4]])
+    input_ids = torch.tensor([[62, 63, 7, 62, 8, 63, 63, 62]])
     batch = {
         "input_ids": input_ids.clone(),
         "labels": input_ids.clone(),
-        "attention_mask": torch.ones_like(input_ids),
+        "position_ids": torch.arange(input_ids.shape[1]).unsqueeze(0),
+        "seq_lens": torch.tensor([[8]]),
+        "seq_lens_padded": torch.tensor([[8]]),
+        "qkv_format": "thd",
     }
-    _, local_batch, layout = shard_batch_for_mimo_cp(
-        FakeMesh(),
-        None,
-        batch,
-        shard_primary=False,
+    local_indices = torch.tensor([2, 3, 4, 5])
+    fake_tex = SimpleNamespace(
+        thd_get_partitioned_indices=lambda _cu, _tokens, _size, _rank: local_indices,
     )
 
-    assert local_batch["input_ids"].shape == (1, 5)
-    assert local_batch["labels"].shape == (1, 3)
-    assert layout.original_seq_len == 5
-    assert layout.padded_seq_len == 6
+    with (
+        patch.dict(sys.modules, {"transformer_engine_torch": fake_tex}),
+        patch("torch.distributed.get_rank", return_value=1),
+    ):
+        _, local_batch, layout = shard_batch_for_mimo_te(
+            FakeMesh(),
+            None,
+            batch,
+            image_token_id=62,
+            video_token_id=63,
+        )
 
-    full_embeds = torch.arange(10, dtype=torch.float32).reshape(1, 5, 2)
-    local_embeds = MiMoV2ForCausalLM._shard_vlm_embeddings_for_cp(
-        full_embeds,
-        doc_ids=local_batch["mimo_cp_doc_ids"],
-        seq_start=local_batch["mimo_cp_seq_start"],
-        cp_size=local_batch["mimo_cp_size"],
+    torch.testing.assert_close(local_batch["input_ids"], torch.tensor([7, 62, 8, 63]))
+    torch.testing.assert_close(local_batch[_MIMO_THD_LOCAL_INDICES], local_indices)
+    torch.testing.assert_close(local_batch[_MIMO_GLOBAL_IMAGE_MASK], input_ids.reshape(-1).eq(62))
+    torch.testing.assert_close(local_batch[_MIMO_GLOBAL_VIDEO_MASK], input_ids.reshape(-1).eq(63))
+    torch.testing.assert_close(layout.local_token_global_indices, local_indices)
+
+    model = MiMoV2ForCausalLM(_model_config(), backend=_backend())
+    inputs_embeds = model.get_input_embeddings()(local_batch["input_ids"])
+    image_embeds = torch.arange(3 * 16, dtype=torch.float32).reshape(3, 16)
+    video_embeds = -torch.arange(3 * 16, dtype=torch.float32).reshape(3, 16)
+    image_feature_indices = model._local_modal_feature_indices(
+        local_batch[_MIMO_GLOBAL_IMAGE_MASK],
+        local_batch[_MIMO_THD_LOCAL_INDICES],
     )
-    expected = torch.tensor([[[6.0, 7.0], [8.0, 9.0], [0.0, 0.0]]])
-    torch.testing.assert_close(local_embeds, expected)
+    video_feature_indices = model._local_modal_feature_indices(
+        local_batch[_MIMO_GLOBAL_VIDEO_MASK],
+        local_batch[_MIMO_THD_LOCAL_INDICES],
+    )
+
+    output = model._get_multimodal_embeds(
+        local_batch["input_ids"],
+        inputs_embeds,
+        image_embeds=image_embeds,
+        image_feature_indices=image_feature_indices,
+        video_embeds=video_embeds,
+        video_feature_indices=video_feature_indices,
+    )
+
+    torch.testing.assert_close(image_feature_indices, torch.tensor([1]))
+    torch.testing.assert_close(video_feature_indices, torch.tensor([1]))
+    torch.testing.assert_close(output[1], image_embeds[1].to(output.dtype))
+    torch.testing.assert_close(output[3], video_embeds[1].to(output.dtype))
+    torch.testing.assert_close(output[[0, 2]], inputs_embeds[[0, 2]])
+
+
+def test_pp_cp_global_masks_keep_vision_execution_and_local_mapping_in_lockstep(monkeypatch):
+    global_input_ids = torch.tensor([[62, 1, 63, 3, 4, 5, 6, 7]])
+    global_image_mask = global_input_ids.eq(62)
+    global_video_mask = global_input_ids.eq(63)
+    image_pixels = torch.randn(4, 12)
+    video_pixels = torch.randn(4, 12)
+    image_grid = torch.tensor([[1, 2, 2]])
+    video_grid = torch.tensor([[1, 2, 2]])
+    image_feature = torch.arange(16, dtype=torch.float32).unsqueeze(0)
+    video_feature = -torch.arange(1, 17, dtype=torch.float32).unsqueeze(0)
+
+    # These are TE's two CP=2 DualChunkSwap partitions. Only rank 0 owns the
+    # image placeholder and only rank 1 owns the video placeholder.
+    rank_local_indices = (
+        torch.tensor([[0, 1, 6, 7]]),
+        torch.tensor([[2, 3, 4, 5]]),
+    )
+    for local_indices in rank_local_indices:
+        model = MiMoV2ForCausalLM(_model_config(), backend=_backend())
+        model._pp_return_hidden_states = True
+        model._vlm_pixel_values_chunks = [image_pixels]
+        model._vlm_image_grid_hws_chunks = [image_grid]
+        model._vlm_pixel_values_videos_chunks = [video_pixels]
+        model._vlm_video_grid_thw_chunks = [video_grid]
+        model._vlm_chunk_idx = 0
+
+        visual_inputs = []
+
+        def fake_visual(pixel_values, _grid_thw):
+            visual_inputs.append(pixel_values)
+            if pixel_values is image_pixels:
+                return image_feature
+            assert pixel_values is video_pixels
+            return video_feature
+
+        def text_passthrough(*, input_ids, inputs_embeds, **_kwargs):
+            assert input_ids is None
+            assert inputs_embeds is not None
+            return inputs_embeds
+
+        monkeypatch.setattr(model.visual, "forward", fake_visual)
+        monkeypatch.setattr(model.model, "forward", text_passthrough)
+
+        local_input_ids = global_input_ids.reshape(-1).index_select(0, local_indices.reshape(-1)).reshape(1, -1)
+        original_embeds = model.get_input_embeddings()(local_input_ids).detach().clone()
+        output = model(
+            input_ids=local_input_ids,
+            qkv_format="thd",
+            cp_size=2,
+            **{
+                _MIMO_GLOBAL_IMAGE_MASK: global_image_mask,
+                _MIMO_GLOBAL_VIDEO_MASK: global_video_mask,
+                _MIMO_THD_LOCAL_INDICES: local_indices,
+            },
+        )
+
+        assert len(visual_inputs) == 2
+        assert visual_inputs[0] is image_pixels
+        assert visual_inputs[1] is video_pixels
+        assert model._vlm_chunk_idx == 1
+
+        expected = original_embeds.clone()
+        local_image_mask = local_input_ids.eq(62)
+        local_video_mask = local_input_ids.eq(63)
+        if bool(local_image_mask.any()):
+            expected[local_image_mask] = image_feature.to(expected)
+        if bool(local_video_mask.any()):
+            expected[local_video_mask] = video_feature.to(expected)
+        torch.testing.assert_close(output, expected)
 
 
 def test_state_adapter_keeps_visual_weights_in_checkpoint_dtype():
