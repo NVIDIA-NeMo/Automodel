@@ -17,62 +17,7 @@ slug: model-coverage/large-language-models/moonshotai/moonlight
 
 NeMo AutoModel includes standard and packed-sequence fine-tuning recipes, an 8-GPU pretraining template, and Tulu-3 convergence configurations for the base checkpoint.
 
-## Model architecture
-
-| Property | Value |
-|---|---|
-| Hugging Face architecture | `DeepseekV3ForCausalLM` |
-| Parameters | 16B total / 3B active |
-| Decoder layers | 27 |
-| Hidden size | 2,048 |
-| Attention | 16 attention heads and 16 key-value heads |
-| Feed-forward sizes | 11,264 dense / 1,408 per expert |
-| Experts | 64 routed / 2 shared / 6 selected per token |
-| Context length | 8,192 tokens |
-| Vocabulary size | 163,840 |
-| Weight dtype | `bfloat16` |
-| Upstream training | 5.7T tokens with Muon |
-
-## Available models
-
-| Checkpoint | Type |
-|---|---|
-| [`moonshotai/Moonlight-16B-A3B`](https://huggingface.co/moonshotai/Moonlight-16B-A3B) | Pretrained base model |
-| [`moonshotai/Moonlight-16B-A3B-Instruct`](https://huggingface.co/moonshotai/Moonlight-16B-A3B-Instruct) | Instruction-tuned model |
-
-## NeMo AutoModel recipes
-
-The runnable example uses [`moonlight_16b_te.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/moonlight/moonlight_16b_te.yaml).
-
-| Setting | Configuration |
-|---|---|
-| Hardware | 8 GPUs in the example command; adjust `--nproc-per-node` to the GPUs available |
-| Strategy | FSDP2; TP=1, PP=1, CP=1, EP=8 |
-| Nodes | Single node in the local AutoModel CLI workflow |
-| Features | Transformer Engine attention, linear layers, and experts; DeepEP dispatch; FSDP optimizations |
-| Advanced | HellaSwag; `packed_sequence_size=0`; Adam with `lr=1.0e-4` and `foreach=false` |
-
-### Recipe comparison
-
-| Workflow | Recipe | Parallelism | Key configuration |
-|---|---|---|---|
-| Standard fine-tuning | [`moonlight_16b_te.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/moonlight/moonlight_16b_te.yaml) | FSDP2, TP=1, CP=1, PP=1, EP=8 | Unpacked HellaSwag data; Transformer Engine attention, linear layers, and experts; DeepEP dispatch; Adam |
-| Packed fine-tuning | [`moonlight_16b_te_packed_sequence.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/moonlight/moonlight_16b_te_packed_sequence.yaml) | FSDP2, TP=1, CP=1, PP=1, EP=8 | 1,024-token THD packs; Transformer Engine attention and linear layers; `torch_mm` experts; DeepEP dispatch; Adam |
-| Pretraining | [Pretraining template](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/megatron_pretrain_moonlight_16b_te_slurm.yaml) | FSDP2, DP=8, EP=8 on 8 GPUs | 2,048-token Megatron-format data; AdamW; Slurm template |
-| Tulu-3 fine-tuning | [`examples/convergence/tulu3/models/moonlight-16b`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/convergence/tulu3/models/moonlight-16b) | FSDP2, EP=8, optional CP=2 on 8 GPUs | 2,048-token data; FlashAdamW or TE FusedAdam; IFEval and loss results |
-
-### Parallelism and backend settings
-
-| Capability | Moonlight configuration |
-|---|---|
-| Expert parallelism | Supported; the included recipes use EP=8 |
-| Context parallelism | Supported; the Tulu-3 configurations include CP=1 and CP=2 |
-| Pipeline parallelism | Supported; the included recipes use PP=1 |
-| Tensor parallelism | Disabled for this model; the included recipes use TP=1 |
-
-The standard fine-tuning recipe uses Transformer Engine experts. The packed and Tulu-3 recipes use `torch_mm` experts. Both fine-tuning recipes use Transformer Engine for attention and linear layers and use DeepEP for expert dispatch.
-
-## Run Moonlight
+## Quick start: fine-tune Moonlight
 
 Run the standard fine-tuning recipe with `--nproc-per-node 8`:
 
@@ -88,6 +33,38 @@ To use packed sequences, run:
 ```bash
 uv run automodel examples/llm_finetune/moonlight/moonlight_16b_te_packed_sequence.yaml --nproc-per-node 8
 ```
+
+## Choose a workflow
+
+| Workflow | Recipe | Parallelism | Key configuration |
+|---|---|---|---|
+| Standard fine-tuning | [`moonlight_16b_te.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/moonlight/moonlight_16b_te.yaml) | FSDP2, TP=1, CP=1, PP=1, EP=8 | Unpacked HellaSwag data; Transformer Engine attention, linear layers, and experts; DeepEP dispatch; Adam |
+| Packed fine-tuning | [`moonlight_16b_te_packed_sequence.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/moonlight/moonlight_16b_te_packed_sequence.yaml) | FSDP2, TP=1, CP=1, PP=1, EP=8 | 1,024-token THD packs; Transformer Engine attention and linear layers; `torch_mm` experts; DeepEP dispatch; Adam |
+| Pretraining | [Pretraining template](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/megatron_pretrain_moonlight_16b_te_slurm.yaml) | FSDP2, DP=8, EP=8 on 8 GPUs | 2,048-token Megatron-format data; AdamW; Slurm template |
+| Tulu-3 fine-tuning | [`examples/convergence/tulu3/models/moonlight-16b`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/convergence/tulu3/models/moonlight-16b) | FSDP2, EP=8, optional CP=2 on 8 GPUs | 2,048-token data; FlashAdamW or TE FusedAdam; IFEval and loss results |
+
+## What this command runs
+
+The runnable example uses [`moonlight_16b_te.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/moonlight/moonlight_16b_te.yaml).
+
+| Setting | Configuration |
+|---|---|
+| Hardware | 8 GPUs in the example command; adjust `--nproc-per-node` to the GPUs available |
+| Strategy | FSDP2; TP=1, PP=1, CP=1, EP=8 |
+| Nodes | Single node in the local AutoModel CLI workflow |
+| Features | Transformer Engine attention, linear layers, and experts; DeepEP dispatch; FSDP optimizations |
+| Advanced | HellaSwag; `packed_sequence_size=0`; Adam with `lr=1.0e-4` and `foreach=false` |
+
+### Parallelism and backend settings
+
+| Capability | Moonlight configuration |
+|---|---|
+| Expert parallelism | Supported; the included recipes use EP=8 |
+| Context parallelism | Supported; the Tulu-3 configurations include CP=1 and CP=2 |
+| Pipeline parallelism | Supported; the included recipes use PP=1 |
+| Tensor parallelism | Disabled for this model; the included recipes use TP=1 |
+
+The standard fine-tuning recipe uses Transformer Engine experts. The packed and Tulu-3 recipes use `torch_mm` experts. Both fine-tuning recipes use Transformer Engine for attention and linear layers and use DeepEP for expert dispatch.
 
 ## Configuration notes
 
@@ -116,6 +93,31 @@ The Moonlight Tulu-3 report covers EP=8 runs on 8 GPUs through step 999, includi
 | FlashAdamW | 2 | 0.656 | 0.573 | 0.668 |
 
 The Tulu-3 workflow uses Moonlight's TikToken tokenizer with `trust_remote_code: true`. Its evaluation command stops generation at `<|im_end|>`, and its training data is prefiltered to a 2,048-token sequence length to limit memory spikes from the 163,840-token vocabulary.
+
+## Model reference
+
+### Model architecture
+
+| Property | Value |
+|---|---|
+| Hugging Face architecture | `DeepseekV3ForCausalLM` |
+| Parameters | 16B total / 3B active |
+| Decoder layers | 27 |
+| Hidden size | 2,048 |
+| Attention | 16 attention heads and 16 key-value heads |
+| Feed-forward sizes | 11,264 dense / 1,408 per expert |
+| Experts | 64 routed / 2 shared / 6 selected per token |
+| Context length | 8,192 tokens |
+| Vocabulary size | 163,840 |
+| Weight dtype | `bfloat16` |
+| Upstream training | 5.7T tokens with Muon |
+
+### Available models
+
+| Checkpoint | Type |
+|---|---|
+| [`moonshotai/Moonlight-16B-A3B`](https://huggingface.co/moonshotai/Moonlight-16B-A3B) | Pretrained base model |
+| [`moonshotai/Moonlight-16B-A3B-Instruct`](https://huggingface.co/moonshotai/Moonlight-16B-A3B-Instruct) | Instruction-tuned model |
 
 ## Related resources
 
