@@ -7,6 +7,23 @@ AUTOMODEL_CHECKOUT=${AUTOMODEL_CHECKOUT:-$PWD}
 TITANS_WORK_ROOT=${TITANS_WORK_ROOT:-$(cd "$AUTOMODEL_CHECKOUT/../.." && pwd)}
 NPROC_PER_NODE=${NPROC_PER_NODE:-8}
 NUM_THREADS=${NUM_THREADS:-8}
+TITANS_IMAGE=${TITANS_IMAGE:-nvcr.io#nvidia/nemo-automodel:26.04}
+
+if [[ ${TITANS_EVAL_IN_CONTAINER:-0} != 1 ]]; then
+  exec srun \
+    --nodes=1 \
+    --ntasks=1 \
+    --container-image="$TITANS_IMAGE" \
+    --container-mounts=/scratch:/scratch \
+    --container-workdir="$AUTOMODEL_CHECKOUT" \
+    env \
+      TITANS_EVAL_IN_CONTAINER=1 \
+      AUTOMODEL_CHECKOUT="$AUTOMODEL_CHECKOUT" \
+      TITANS_WORK_ROOT="$TITANS_WORK_ROOT" \
+      NPROC_PER_NODE="$NPROC_PER_NODE" \
+      NUM_THREADS="$NUM_THREADS" \
+      bash "$AUTOMODEL_CHECKOUT/examples/llm_pretrain/slurm/titans_blackwell_eval_prepare.sbatch"
+fi
 
 cd "$AUTOMODEL_CHECKOUT"
 
