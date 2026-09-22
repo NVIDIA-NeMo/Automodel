@@ -16,7 +16,14 @@ from pathlib import Path
 
 import pytest
 
-from tools.apply_fern_code_styles import GENERATED_STYLE, apply_fern_code_styles
+from tools.apply_fern_code_styles import (
+    DARK_CODE_BLOCK_SELECTOR,
+    DARK_INLINE_CODE_SELECTOR,
+    GENERATED_STYLE,
+    LIGHT_CODE_BLOCK_SELECTOR,
+    LIGHT_INLINE_CODE_SELECTOR,
+    apply_fern_code_styles,
+)
 
 
 def test_apply_styles_is_idempotent_and_clean_is_lossless(tmp_path: Path) -> None:
@@ -27,6 +34,10 @@ def test_apply_styles_is_idempotent_and_clean_is_lossless(tmp_path: Path) -> Non
 
     assert apply_fern_code_styles(tmp_path) == [page]
     assert page.read_text(encoding="utf-8") == original + GENERATED_STYLE
+    assert LIGHT_CODE_BLOCK_SELECTOR in GENERATED_STYLE
+    assert LIGHT_INLINE_CODE_SELECTOR in GENERATED_STYLE
+    assert DARK_CODE_BLOCK_SELECTOR in GENERATED_STYLE
+    assert DARK_INLINE_CODE_SELECTOR in GENERATED_STYLE
     assert apply_fern_code_styles(tmp_path) == []
 
     assert apply_fern_code_styles(tmp_path, clean=True) == [page]
@@ -44,6 +55,11 @@ title: Guide
   .light .fern-code-block,
   .light .fern-prose code:not(.code-block) {
     background-color: #f7f7f7 !important;
+  }
+
+  .dark .fern-code-block,
+  .dark .fern-prose code:not(.code-block) {
+    background-color: #1f1f1f !important;
   }
 `}</style>
 """

@@ -19,14 +19,27 @@ from pathlib import Path
 
 START_MARKER = "{/* BEGIN GENERATED FERN CODE STYLES */}"
 END_MARKER = "{/* END GENERATED FERN CODE STYLES */}"
-CODE_BLOCK_SELECTOR = ".light .fern-code-block"
-INLINE_CODE_SELECTOR = ".light .fern-prose code:not(.code-block)"
+LIGHT_CODE_BLOCK_SELECTOR = ".light .fern-code-block"
+LIGHT_INLINE_CODE_SELECTOR = ".light .fern-prose code:not(.code-block)"
+DARK_CODE_BLOCK_SELECTOR = ".dark .fern-code-block"
+DARK_INLINE_CODE_SELECTOR = ".dark .fern-prose code:not(.code-block)"
+STYLE_SELECTORS = (
+    LIGHT_CODE_BLOCK_SELECTOR,
+    LIGHT_INLINE_CODE_SELECTOR,
+    DARK_CODE_BLOCK_SELECTOR,
+    DARK_INLINE_CODE_SELECTOR,
+)
 GENERATED_STYLE = f"""
 {START_MARKER}
 <style>{{`
-  {CODE_BLOCK_SELECTOR},
-  {INLINE_CODE_SELECTOR} {{
+  {LIGHT_CODE_BLOCK_SELECTOR},
+  {LIGHT_INLINE_CODE_SELECTOR} {{
     background-color: var(--nv-color-bg-alt, #f7f7f7) !important;
+  }}
+
+  {DARK_CODE_BLOCK_SELECTOR},
+  {DARK_INLINE_CODE_SELECTOR} {{
+    background-color: #1f1f1f !important;
   }}
 `}}</style>
 {END_MARKER}
@@ -46,7 +59,7 @@ def _remove_generated_style(document: str, path: Path) -> str:
 
 
 def _has_equivalent_page_style(document: str) -> bool:
-    return CODE_BLOCK_SELECTOR in document and INLINE_CODE_SELECTOR in document
+    return all(selector in document for selector in STYLE_SELECTORS)
 
 
 def apply_fern_code_styles(repo_root: Path, clean: bool = False) -> list[Path]:
