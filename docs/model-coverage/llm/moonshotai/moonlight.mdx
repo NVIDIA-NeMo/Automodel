@@ -43,6 +43,8 @@ The runnable example uses [`moonlight_16b_te.yaml`](https://github.com/NVIDIA-Ne
 | Features | Transformer Engine attention, linear layers, and experts; DeepEP dispatch; FSDP optimizations |
 | Advanced | HellaSwag; `packed_sequence_size=0`; Adam with `lr=1.0e-4` and `foreach=false` |
 
+### Recipe comparison
+
 | Workflow | Recipe | Parallelism | Key configuration |
 |---|---|---|---|
 | Standard fine-tuning | [`moonlight_16b_te.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/moonlight/moonlight_16b_te.yaml) | FSDP2, TP=1, CP=1, PP=1, EP=8 | Unpacked HellaSwag data; Transformer Engine attention, linear layers, and experts; DeepEP dispatch; Adam |
