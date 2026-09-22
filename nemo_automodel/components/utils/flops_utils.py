@@ -1714,6 +1714,134 @@ def deepseek_v41_flops(config: Any, gbs: int = 1, seq_len: int | None = None) ->
     return float(trainable_flops + attention_flops + indexer_flops)
 
 
+def _sum_mod(seq_len: int, ratio: int) -> int:
+    """``sum_{j=1..seq_len} (j mod ratio)`` in closed form.
+
+    ``j mod ratio`` is the length of the incomplete compressed tail visible to the query at
+    zero-based position ``j - 1``.
+    """
+    full_cycles, remainder = divmod(seq_len, ratio)
+    return full_cycles * (ratio * (ratio - 1) // 2) + remainder * (remainder + 1) // 2
+
+
+def qwen3_8_flash_next_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> float:
+    """Model FLOPs for Qwen3.8-Flash-Next (GDN + compressed-block QSA, HyperConnections, Engram PLE, MoE).
+
+    Accepts ``Qwen3_8_FlashNextTextConfig`` or the multimodal ``Qwen3_8_FlashNextConfig`` wrapper
+    (its ``text_config`` is used; the vision tower is not loaded by the training path). The module
+    shapes follow ``nemo_automodel/components/models/qwen3_8_flash_next``:
+
+    * GatedDeltaNet layers (``layers_block_type == "linear_attention"``): the shared
+      ``_gdn_attention_per_layer_flops`` term (QKV/Z/B/A projections, causal conv, chunked
+      delta-rule recurrence, output projection);
+    * QSA full-attention layers: gated ``q_proj`` (hidden x 2*heads*head_dim), ``k_proj``/``v_proj``
+      (hidden x kv_heads*head_dim) and ``o_proj``; the sparse GQA BMMs where the query at zero-based
+      position ``t`` attends to ``ratio * min(indexer_budget / ratio, floor((t+1)/ratio))`` routed tokens
+      plus the ``(t+1) mod ratio`` tokens of its incomplete causal tail, QK^T and PV each costing
+      ``heads * head_dim`` MACs per key;
+    * the QSA indexer is frozen (``requires_grad_(False)``; hard top-k has no gradient), so its
+      ``index_qk_proj`` and its causal scoring of ``indexer_n_heads`` queries against the
+      ``floor((t+1)/ratio)`` compressed keys are counted forward only (2 x MACs);
+    * MoE per layer: router GEMM (hidden x num_experts), ``num_experts_per_tok`` routed plus one shared
+      expert of ``3 * hidden * moe_intermediate_size`` / ``shared_expert_intermediate_size``, and the
+      shared-expert gate (hidden x 1);
+    * HyperConnections: two mixers per layer (attention and MoE), each with ``input_mix_weight_down``
+      (hc_count*hidden x hc_lowrank), ``input_mix_weight_up`` (hc_lowrank x hc_count*hidden) and
+      ``block_inject_weight`` (hc_count*hidden x hc_count); the final read mixer has no inject weight;
+    * Engram PLE on ``ple_layer_ids``: ``key_proj`` (ple_embed_dim x hc_count*hidden), ``value_proj``
+      (ple_embed_dim x hidden) and the depthwise causal convolution (hc_count*hidden x kernel); the
+      table gather, hashing and norms are not GEMMs;
+    * the untied language-model head (hidden x vocab). The checkpoint's MTP head is not loaded.
+
+    Trainable GEMMs and attention BMMs cost 6 x MACs (forward + backward); activation recomputation
+    is excluded (that is HFU). On the released configuration the formula counts 6.14B active GEMM
+    parameters per token excluding the LM head (model card: 6B activated), implies a 125.8B backbone
+    excluding the 51.2B Engram table (model card: 125B), and gives 42.0 GFLOPs/token at 4096 tokens,
+    1.034x the dense identity ``6 x active``.
+
+    Args:
+        config: ``Qwen3_8_FlashNextTextConfig``, or a ``Qwen3_8_FlashNextConfig`` wrapper whose
+            ``text_config`` is used.
+        gbs: Number of sequences per step.
+        seq_len: Tokens per sequence; defaults to ``config.max_position_embeddings``.
+
+    Returns:
+        Model FLOPs for one training step of ``gbs`` sequences of ``seq_len`` tokens.
+    """
+    if hasattr(config, "text_config") and not hasattr(config, "num_hidden_layers"):
+        config = config.text_config
+
+    if seq_len is None:
+        seq_len = getattr(config, "max_position_embeddings", 4096)
+    seq_len = int(seq_len)
+
+    layers = config.num_hidden_layers
+    hs = config.hidden_size
+    vocab_size = config.vocab_size
+    heads = config.num_attention_heads
+    kv_heads = config.num_key_value_heads
+    head_dim = config.head_dim
+    hc_count = config.hc_count
+    hc_lowrank = config.hc_lowrank
+    flat_hs = hc_count * hs
+    moe_inter = config.moe_intermediate_size
+    shared_inter = config.shared_expert_intermediate_size
+    n_routed = config.num_experts
+    topk = config.num_experts_per_tok
+    ratio = config.indexer_compress_ratio
+    budget_blocks = config.indexer_budget // ratio
+    index_heads = config.indexer_n_heads
+    index_kv_heads = config.indexer_kv_heads
+    index_head_dim = config.indexer_head_dim
+    ple_embed_dim = config.ple_embed_dim
+    ple_kernel = config.ple_conv_kernel_size
+    num_ple_layers = len(config.ple_layer_ids)
+
+    block_types = config.layers_block_type
+    num_full_attn_layers = sum(1 for block_type in block_types if block_type == "attention")
+    num_gdn_layers = layers - num_full_attn_layers
+
+    # --- trainable GEMM MACs per token (6x) ---
+    attn_linear = hs * heads * head_dim * 2 + 2 * hs * kv_heads * head_dim + heads * head_dim * hs
+    experts = topk * 3 * hs * moe_inter + 3 * hs * shared_inter
+    router = hs * n_routed + hs  # routed gate + shared-expert gate
+    hyper_connection = 2 * (2 * flat_hs * hc_lowrank + flat_hs * hc_count)  # attention + MoE mixers
+    final_mixer = 2 * flat_hs * hc_lowrank
+    ple = num_ple_layers * (ple_embed_dim * flat_hs + ple_embed_dim * hs + flat_hs * ple_kernel)
+    lm_head = hs * vocab_size
+    trainable_macs_per_token = (
+        num_full_attn_layers * attn_linear
+        + layers * (experts + router + hyper_connection)
+        + final_mixer
+        + ple
+        + lm_head
+    )
+    trainable_flops = 6 * gbs * seq_len * trainable_macs_per_token
+
+    # --- GDN layers (already 6x, includes projections and recurrence) ---
+    gdn_flops = num_gdn_layers * _gdn_attention_per_layer_flops(
+        gbs,
+        seq_len,
+        hs,
+        config.linear_key_head_dim,
+        config.linear_value_head_dim,
+        config.linear_num_key_heads,
+        config.linear_num_value_heads,
+        config.linear_conv_kernel_dim,
+    )
+
+    # --- sparse QSA BMMs (6x), summed over query positions ---
+    routed_keys = ratio * _sum_min_floor_div(seq_len, ratio, budget_blocks) + _sum_mod(seq_len, ratio)
+    attention_flops = 6 * gbs * num_full_attn_layers * 2 * heads * head_dim * routed_keys  # QK^T and PV
+
+    # --- frozen indexer: forward only (2x) ---
+    indexer_macs = seq_len * hs * (index_heads + index_kv_heads) * index_head_dim
+    indexer_macs += index_heads * index_head_dim * _sum_min_floor_div(seq_len, ratio, None)
+    indexer_flops = 2 * gbs * num_full_attn_layers * indexer_macs
+
+    return float(trainable_flops + gdn_flops + attention_flops + indexer_flops)
+
+
 def step3_5_flash_flops(config, gbs=1, seq_len=None):
     """Model FLOPs for Step3.5-Flash (GQA + sliding-window / full attention + MoE).
 
@@ -1851,7 +1979,9 @@ def get_flops_formula_for_hf_config(config: Any) -> Callable | None:
         config: HuggingFace model config object
 
     Returns:
-        The appropriate FLOPs formula function, or None if model type is not supported
+        The appropriate FLOPs formula function, or None for an unregistered
+        composite config. Pass its text config explicitly when only text-backbone
+        FLOPs are intended.
     """
     # Get config class name
     config_class_name = config.__class__.__name__
@@ -1874,6 +2004,12 @@ def get_flops_formula_for_hf_config(config: Any) -> Callable | None:
         "Qwen3_5Config": qwen3_5_flops,
         "Qwen3_5MoeConfig": qwen3_5_flops,
         "Qwen3NextConfig": qwen3_5_flops,  # Qwen3.5 Small 4B/9B (GDN + MoE)
+        # Qwen3.8-Flash-Next (GDN + compressed-block QSA + HyperConnections + Engram PLE + MoE);
+        # the multimodal wrapper and the pre-rename ``qwen4_exp`` aliases use text_config.
+        "Qwen3_8_FlashNextConfig": qwen3_8_flash_next_flops,
+        "Qwen3_8_FlashNextTextConfig": qwen3_8_flash_next_flops,
+        "Qwen3_8_FlashNextLegacyConfig": qwen3_8_flash_next_flops,
+        "Qwen3_8_FlashNextLegacyTextConfig": qwen3_8_flash_next_flops,
         "Qwen3VLMoeConfig": qwen3_flops,  # Qwen3 VL 235B text backbone
         "Qwen3VLMoeTextConfig": qwen3_flops,
         "Qwen3VLConfig": qwen3_flops,
@@ -1923,6 +2059,9 @@ def get_flops_formula_for_hf_config(config: Any) -> Callable | None:
 
     # If no exact match, try to match by model_type as fallback
     if formula is None:
+        get_text_config = getattr(config, "get_text_config", None)
+        if callable(get_text_config) and get_text_config() is not config:
+            return None
         formula = transformer_flops
 
     return formula
