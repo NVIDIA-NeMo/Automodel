@@ -97,4 +97,6 @@ ci:
   checkpoint_robustness:
     tokenizer_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
     experts_implementation: grouped_mm
+    # Pair the remote-code HF receiver with the legacy adapter export.
     trust_remote_code: true
+    checkpoint.v4_compatible: true
