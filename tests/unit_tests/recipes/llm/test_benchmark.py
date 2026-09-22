@@ -206,7 +206,7 @@ class TestBenchmarkingRecipeInitialization:
         config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
 
         assert config["model"]["config"]["pretrained_model_name_or_path"] == (
-            "nvidia/NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained"
+            "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"
         )
 
     def test_infer_vocab_size_string_target(self, mock_config):
