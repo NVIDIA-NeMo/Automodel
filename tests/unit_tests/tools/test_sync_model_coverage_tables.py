@@ -149,6 +149,11 @@ def _collect_fern_routes(
     for item in items:
         if "section" in item:
             slug = str(item.get("slug", _fern_slug(str(item["section"]))))
+            section_path = item.get("path")
+            if config_dir is not None and isinstance(section_path, str):
+                frontmatter_slug = _frontmatter_slug((config_dir / section_path).resolve())
+                if frontmatter_slug:
+                    routes.add("/" + frontmatter_slug)
             routes.update(_collect_fern_routes(item.get("contents", []), (*parents, slug), config_dir))
         elif "page" in item:
             page_path = item.get("path")
@@ -300,46 +305,132 @@ def test_committed_generated_tables_are_rejected(tmp_path):
         _validate_generated_tables_are_not_committed(tmp_path)
 
 
-def test_model_coverage_pages_use_org_slugs_without_nesting_sidebar():
+def test_model_coverage_pages_use_provider_sections_and_checkpoint_slugs():
     repo_root = Path(__file__).parents[3]
     config_path = repo_root / "docs" / "fern" / "versions" / "nightly.yml"
     navigation = yaml.safe_load(config_path.read_text(encoding="utf-8"))["navigation"]
+    model_coverage = next(item for item in navigation if item.get("section") == "Model Coverage")
+    category_directories = {
+        "large-language-models": "llm",
+        "vision-language-models": "vlm",
+        "multimodal": "multimodal",
+        "omni": "omni",
+        "dllm": "dllm",
+        "diffusion": "diffusion",
+        "embedding-models": "embedding",
+        "reranking-models": "reranker",
+    }
     offenders: list[str] = []
+    navigated_model_pages: list[Path] = []
 
-    def visit(items: list[dict[str, object]], parent_slugs: tuple[str, ...] = ()) -> None:
-        for item in items:
-            if "section" in item:
-                section_slug = str(item.get("slug", _fern_slug(str(item["section"]))))
-                visit(item.get("contents", []), (*parent_slugs, section_slug))
+    for category in (item for item in model_coverage["contents"] if "section" in item):
+        category_slug = str(category.get("slug"))
+        category_directory = category_directories[category_slug]
+        provider_sections = category.get("contents", [])[1:]
+        for provider in provider_sections:
+            if "section" not in provider:
+                offenders.append(f"{category_slug}: expected provider section, found {provider}")
                 continue
+            provider_slug = str(provider.get("slug"))
+            expected_index = f"../../model-coverage/{category_directory}/{provider_slug}/index.mdx"
+            if provider.get("path") != expected_index:
+                offenders.append(f"{provider_slug}: expected provider index {expected_index!r}")
+            index_path = (config_path.parent / expected_index).resolve()
+            expected_provider_route = f"model-coverage/{category_slug}/{provider_slug}"
+            if not index_path.is_file() or _frontmatter_slug(index_path) != expected_provider_route:
+                offenders.append(f"{provider_slug}: invalid provider index route")
 
-            path = item.get("path")
-            if not isinstance(path, str):
-                continue
-            parts = Path(path).parts
-            if "model-coverage" not in parts:
-                continue
-            relative_parts = parts[parts.index("model-coverage") + 1 :]
-            if len(relative_parts) != 3:
-                continue
+            for page in provider.get("contents", []):
+                path = page.get("path")
+                if not isinstance(path, str):
+                    offenders.append(f"{provider_slug}: model entry has no path")
+                    continue
+                model_path = (config_path.parent / path).resolve()
+                navigated_model_pages.append(model_path)
+                relative_parts = model_path.relative_to(repo_root / "docs" / "model-coverage").parts
+                if relative_parts[:2] != (category_directory, provider_slug):
+                    offenders.append(f"{path}: nested under the wrong provider section")
+                frontmatter_slug = _frontmatter_slug(model_path)
+                if frontmatter_slug is None or not frontmatter_slug.startswith(expected_provider_route + "/"):
+                    offenders.append(f"{path}: invalid model route {frontmatter_slug!r}")
+                    continue
+                model_id = frontmatter_slug.rsplit("/", 1)[1]
+                if page.get("page") != model_id:
+                    offenders.append(f"{path}: sidebar label must be the model ID {model_id!r}")
+                document = model_path.read_text(encoding="utf-8")
+                hf_models = re.findall(
+                    r"https://huggingface\.co/[A-Za-z0-9_.-]+/([A-Za-z0-9_.-]+)",
+                    document,
+                )
+                if model_id not in hf_models:
+                    offenders.append(f"{path}: URL model ID {model_id!r} is not linked by the card")
 
-            category, expected_org = relative_parts[:2]
-            frontmatter_slug = _frontmatter_slug((config_path.parent / path).resolve())
-            actual_parent = parent_slugs[-1] if parent_slugs else "<none>"
-            if frontmatter_slug is None or f"/{expected_org}/" not in f"/{frontmatter_slug}/":
-                offenders.append(f"{path}: frontmatter slug does not include organization {expected_org!r}")
-            if actual_parent == expected_org:
-                offenders.append(f"{path}: organization {expected_org!r} must not be a sidebar section")
-            if category == "llm" and (
-                frontmatter_slug is None or not frontmatter_slug.startswith("model-coverage/large-language-models/")
-            ):
-                offenders.append(f"{path}: unexpected LLM slug {frontmatter_slug!r}")
+    expected_model_pages = {
+        path.resolve()
+        for category_directory in category_directories.values()
+        for path in (repo_root / "docs" / "model-coverage" / category_directory).glob("*/*.mdx")
+        if path.name != "index.mdx"
+    }
+    if set(navigated_model_pages) != expected_model_pages:
+        offenders.append("nightly navigation does not contain every model card exactly once")
+    if len(navigated_model_pages) != len(set(navigated_model_pages)):
+        offenders.append("nightly navigation contains duplicate model cards")
 
-    visit(navigation)
-
-    assert not offenders, "Model coverage organization URL/sidebar violations:\n" + "\n".join(
+    assert not offenders, "Model coverage provider hierarchy violations:\n" + "\n".join(
         f"  - {offender}" for offender in offenders
     )
+
+
+def test_retired_model_routes_redirect_to_provider_indexes():
+    repo_root = Path(__file__).parents[3]
+    docs_config = yaml.safe_load((repo_root / "docs" / "fern" / "docs.yml").read_text(encoding="utf-8"))
+    redirects = docs_config["redirects"]
+    sources = [redirect["source"] for redirect in redirects]
+    assert len(sources) == len(set(sources)), "Fern redirects contain duplicate sources"
+    assert all(redirect["source"] != redirect["destination"] for redirect in redirects)
+
+    config_path = repo_root / "docs" / "fern" / "versions" / "nightly.yml"
+    navigation = yaml.safe_load(config_path.read_text(encoding="utf-8"))["navigation"]
+    routes = _collect_fern_routes(navigation, config_dir=config_path.parent)
+    provider_routes = {
+        route
+        for route in routes
+        if re.fullmatch(
+            r"/model-coverage/(?:large-language-models|vision-language-models|multimodal|omni|dllm|diffusion|embedding-models|reranking-models)/[^/]+",
+            route,
+        )
+    }
+
+    relevant_redirects = [
+        redirect
+        for redirect in redirects
+        if redirect["source"].startswith("/nemo/automodel/nightly/model-coverage/")
+        or redirect["source"].startswith("/nemo/automodel/model-coverage/")
+    ]
+    for redirect in relevant_redirects:
+        destination = redirect["destination"].removeprefix("/nemo/automodel/nightly")
+        destination = destination.removeprefix("/nemo/automodel")
+        assert destination in provider_routes, redirect
+
+    canonical_model_sources = {
+        f"/nemo/automodel{route}" for route in routes - provider_routes if route.startswith("/model-coverage/")
+    }
+    canonical_model_sources |= {
+        source.replace("/nemo/automodel/", "/nemo/automodel/nightly/", 1) for source in canonical_model_sources
+    }
+    assert not canonical_model_sources.intersection(sources), "A canonical model URL must not also be a redirect source"
+
+    expected_moonlight_redirects = {
+        "/nemo/automodel/model-coverage/large-language-models/moonshotai/moonlight": (
+            "/nemo/automodel/model-coverage/large-language-models/moonshotai"
+        ),
+        "/nemo/automodel/nightly/model-coverage/large-language-models/moonshotai/moonlight": (
+            "/nemo/automodel/nightly/model-coverage/large-language-models/moonshotai"
+        ),
+    }
+    redirects_by_source = {redirect["source"]: redirect["destination"] for redirect in redirects}
+    for source, destination in expected_moonlight_redirects.items():
+        assert redirects_by_source.get(source) == destination
 
 
 def test_internal_model_coverage_links_resolve_to_nightly_routes():

@@ -1,7 +1,7 @@
 ---
 title: "DeepSeek-V4 Flash"
 description: ""
-slug: model-coverage/large-language-models/deepseek-ai/deepseek-v4-flash
+slug: model-coverage/large-language-models/deepseek-ai/DeepSeek-V4-Flash
 ---
 [DeepSeek-V4 Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash) is DeepSeek's latest fine-grained Mixture-of-Experts language model. It uses a 43-layer all-MoE backbone with 256 routed experts plus one shared expert per block, top-6 routing, and a hybrid per-layer attention zoo (SWA / CSA / HCA) selectable through `compress_ratios`. The first `num_hash_layers` blocks use a hash-clustering gate, and every block maintains `hc_mult=4` Hyper-Connection streams mixed via a learned col-norm-first Sinkhorn router.
 

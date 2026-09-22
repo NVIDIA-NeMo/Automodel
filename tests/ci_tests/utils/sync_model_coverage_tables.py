@@ -31,7 +31,7 @@ SUPPORT_LOG_END_MARKER = "{/* END GENERATED MODEL SUPPORT LOG */}"
 REGISTRY_START_MARKER = "{/* BEGIN GENERATED MODEL ARCHITECTURES */}"
 REGISTRY_END_MARKER = "{/* END GENERATED MODEL ARCHITECTURES */}"
 HF_MODEL_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
-DOCS_PAGE_PATTERN = re.compile(r"^/[a-z0-9][a-z0-9/-]*$")
+DOCS_PAGE_PATTERN = re.compile(r"^/[A-Za-z0-9][A-Za-z0-9._/-]*$")
 MARKDOWN_UNSAFE_PATTERN = re.compile(r"[\[\]|<>`\r\n]")
 REPOSITORY_URL = "https://github.com/NVIDIA-NeMo/Automodel/blob/main"
 DATED_SUPPORT_TABLE_HEADER = "| Date | Type | Model | Recipe |"
@@ -328,6 +328,8 @@ def _load_model_doc_catalog(
     model_coverage_root = docs_root / "model-coverage"
     for directory, model_type in directory_types.items():
         for path in sorted((model_coverage_root / directory).glob("*/*.mdx")):
+            if path.name == "index.mdx":
+                continue
             document = path.read_text(encoding="utf-8")
             slug_match = re.search(r'^slug: "?([^"\r\n]+)"?$', document, flags=re.MULTILINE)
             if slug_match is None:
@@ -398,9 +400,15 @@ def _load_model_releases(repo_root: Path, model_docs: dict[str, list[_ModelDoc]]
                 documented_type = next(iter(documented_types))
                 if documented_type in {"Omni", "Multimodal"}:
                     model_type = documented_type
+            typed_docs = [model_doc for model_doc in matching_docs if model_doc.model_type == model_type]
+            hf_model_name = hf_model_id.rsplit("/", 1)[1]
             docs_page = next(
-                (model_doc.docs_page for model_doc in matching_docs if model_doc.model_type == model_type),
-                f"https://huggingface.co/{hf_model_id}",
+                (
+                    model_doc.docs_page
+                    for model_doc in typed_docs
+                    if model_doc.docs_page.rsplit("/", 1)[-1] == hf_model_name
+                ),
+                typed_docs[0].docs_page if typed_docs else f"https://huggingface.co/{hf_model_id}",
             )
             recipe_string = str(recipe)
             release_date = introduction_dates.get((recipe_string, hf_model_id))

@@ -57,317 +57,556 @@ navigation:
           - page: "Overview"
             path: ../../model-coverage/llm/index.mdx
             slug: overview
-          - page: "Llama"
-            path: ../../model-coverage/llm/meta/llama.mdx
-          - page: "Gemma"
-            path: ../../model-coverage/llm/google/gemma.mdx
-            hidden: true
-          - page: "Gemma 1"
-            path: ../../model-coverage/llm/google/gemma-1.mdx
-          - page: "Gemma 2"
-            path: ../../model-coverage/llm/google/gemma-2.mdx
-          - page: "FunctionGemma"
-            path: ../../model-coverage/llm/google/functiongemma.mdx
-          - page: "Qwen2"
-            path: ../../model-coverage/llm/qwen/qwen2.mdx
-          - page: "Qwen2 MoE"
-            path: ../../model-coverage/llm/qwen/qwen2-moe.mdx
-          - page: "Qwen3"
-            path: ../../model-coverage/llm/qwen/qwen3.mdx
-          - page: "Qwen3 MoE"
-            path: ../../model-coverage/llm/qwen/qwen3-moe.mdx
-          - page: "Qwen3.8-2.4T-A95B"
-            path: ../../model-coverage/llm/qwen/qwen3-8-2-4t-a95b.mdx
-          - page: "Qwen3.8-Flash-Next"
-            path: ../../model-coverage/llm/qwen/qwen3-8-flash-next.mdx
-          - page: "Qwen3-Next"
-            path: ../../model-coverage/llm/qwen/qwen3-next.mdx
-          - page: "ERNIE 4.5"
-            path: ../../model-coverage/llm/baidu/ernie4-5.mdx
-            slug: ernie-4-5
-          - page: "DeepSeek"
-            path: ../../model-coverage/llm/deepseek-ai/deepseek.mdx
-          - page: "DeepSeek-V3"
-            path: ../../model-coverage/llm/deepseek-ai/deepseek-v3.mdx
-          - page: "DeepSeek-V4 Flash"
-            path: ../../model-coverage/llm/deepseek-ai/dsv4-flash.mdx
-          - page: "DeepSeek-V4 Pro"
-            path: ../../model-coverage/llm/deepseek-ai/dsv4-pro.mdx
-          - page: "DeepSeek-V4.1 Flash"
-            path: ../../model-coverage/llm/deepseek-ai/deepseek-v41-flash.mdx
-          - page: "Mistral"
-            path: ../../model-coverage/llm/mistralai/mistral.mdx
-          - page: "Mixtral"
-            path: ../../model-coverage/llm/mistralai/mixtral.mdx
-          - page: "Ministral3 / Devstral"
-            path: ../../model-coverage/llm/mistralai/ministral3.mdx
-            slug: ministral3-devstral
-          - page: "Phi"
-            path: ../../model-coverage/llm/microsoft/phi.mdx
-          - page: "Phi-3 / Phi-4"
-            path: ../../model-coverage/llm/microsoft/phi3.mdx
-            slug: phi-3-phi-4
-          - page: "Phi-3-Small"
-            path: ../../model-coverage/llm/microsoft/phi3-small.mdx
-          - page: "Nemotron / Minitron"
-            path: ../../model-coverage/llm/nvidia/nemotron.mdx
-            slug: nemotron-minitron
-          - page: "Nemotron-H"
-            path: ../../model-coverage/llm/nvidia/nemotron-h.mdx
-          - page: "Nemotron-Flash"
-            path: ../../model-coverage/llm/nvidia/nemotron-flash.mdx
-          - page: "Nemotron-Super (Llama-3.3-Nemotron-Super-49B)"
-            path: ../../model-coverage/llm/nvidia/nemotron-super.mdx
-            slug: nemotron-super-llama-3-3-nemotron-super-49b
-          - page: "ChatGLM"
-            path: ../../model-coverage/llm/thudm/chatglm.mdx
-          - page: "GLM-4"
-            path: ../../model-coverage/llm/thudm/glm4.mdx
-          - page: "GLM-4 MoE (GLM-4.5 / GLM-4.7)"
-            path: ../../model-coverage/llm/thudm/glm4-moe.mdx
-            slug: glm-4-moe-glm-4-5-glm-4-7
-          - page: "GLM-5 / GLM-5.3 (MoE + DSA)"
-            path: ../../model-coverage/llm/thudm/glm5-moe-dsa.mdx
-            slug: glm-5-moe-dsa
-          - page: "Granite"
-            path: ../../model-coverage/llm/ibm/granite.mdx
-          - page: "Granite MoE"
-            path: ../../model-coverage/llm/ibm/granite-moe.mdx
-          - page: "Bamba"
-            path: ../../model-coverage/llm/ibm/bamba.mdx
-          - page: "OLMo"
-            path: ../../model-coverage/llm/allenai/olmo.mdx
-          - page: "OLMo2"
-            path: ../../model-coverage/llm/allenai/olmo2.mdx
-          - page: "OLMoE"
-            path: ../../model-coverage/llm/allenai/olmoe.mdx
-          - page: "GPT-OSS"
-            path: ../../model-coverage/llm/openai/gpt-oss.mdx
-          - page: "GPT-2"
-            path: ../../model-coverage/llm/openai/gpt2.mdx
-          - page: "GPT-J"
-            path: ../../model-coverage/llm/eleutherai/gpt-j.mdx
-          - page: "GPT-NeoX / Pythia"
-            path: ../../model-coverage/llm/eleutherai/gpt-neox.mdx
-            slug: gpt-neox-pythia
-          - page: "StarCoder"
-            path: ../../model-coverage/llm/bigcode/starcoder.mdx
-          - page: "StarCoder2"
-            path: ../../model-coverage/llm/bigcode/starcoder2.mdx
-          - page: "Aquila / Aquila2"
-            path: ../../model-coverage/llm/baai/aquila.mdx
-            slug: aquila-aquila2
-          - page: "Baichuan / Baichuan2"
-            path: ../../model-coverage/llm/baichuan-inc/baichuan.mdx
-            slug: baichuan-baichuan2
-          - page: "Command-R"
-            path: ../../model-coverage/llm/cohere/command-r.mdx
-          - page: "Falcon"
-            path: ../../model-coverage/llm/tiiuae/falcon.mdx
-          - page: "EXAONE"
-            path: ../../model-coverage/llm/lgai-exaone/exaone.mdx
-          - page: "InternLM"
-            path: ../../model-coverage/llm/internlm/internlm.mdx
-          - page: "Jais"
-            path: ../../model-coverage/llm/inceptionai/jais.mdx
-          - page: "MiniMax-M2"
-            path: ../../model-coverage/llm/minimax/minimax-m2.mdx
-          - page: "MiniCPM"
-            path: ../../model-coverage/llm/openbmb/minicpm.mdx
+          - section: "Meta"
+            slug: meta
+            path: ../../model-coverage/llm/meta/index.mdx
+            contents:
+              - page: "Llama-3.2-1B"
+                path: ../../model-coverage/llm/meta/llama.mdx
+          - section: "Google"
+            slug: google
+            path: ../../model-coverage/llm/google/index.mdx
+            contents:
+              - page: "gemma-7b"
+                path: ../../model-coverage/llm/google/gemma-1.mdx
+              - page: "gemma-2-9b-it"
+                path: ../../model-coverage/llm/google/gemma-2.mdx
+              - page: "functiongemma-270m-it"
+                path: ../../model-coverage/llm/google/functiongemma.mdx
+          - section: "Qwen"
+            slug: qwen
+            path: ../../model-coverage/llm/qwen/index.mdx
+            contents:
+              - page: "Qwen2.5-7B-Instruct"
+                path: ../../model-coverage/llm/qwen/qwen2.mdx
+              - page: "Qwen1.5-MoE-A2.7B"
+                path: ../../model-coverage/llm/qwen/qwen2-moe.mdx
+              - page: "Qwen3-0.6B"
+                path: ../../model-coverage/llm/qwen/qwen3.mdx
+              - page: "Qwen3-30B-A3B"
+                path: ../../model-coverage/llm/qwen/qwen3-moe.mdx
+              - page: "Qwen3.8-2.4T-A95B"
+                path: ../../model-coverage/llm/qwen/qwen3-8-2-4t-a95b.mdx
+              - page: "Qwen3.8-Flash-Next"
+                path: ../../model-coverage/llm/qwen/qwen3-8-flash-next.mdx
+              - page: "Qwen3-Next-80B-A3B-Instruct"
+                path: ../../model-coverage/llm/qwen/qwen3-next.mdx
+          - section: "Baidu"
+            slug: baidu
+            path: ../../model-coverage/llm/baidu/index.mdx
+            contents:
+              - page: "ERNIE-4.5-0.3B-PT"
+                path: ../../model-coverage/llm/baidu/ernie4-5.mdx
+          - section: "DeepSeek AI"
+            slug: deepseek-ai
+            path: ../../model-coverage/llm/deepseek-ai/index.mdx
+            contents:
+              - page: "deepseek-llm-7b-chat"
+                path: ../../model-coverage/llm/deepseek-ai/deepseek.mdx
+              - page: "DeepSeek-V3"
+                path: ../../model-coverage/llm/deepseek-ai/deepseek-v3.mdx
+              - page: "DeepSeek-V4-Flash"
+                path: ../../model-coverage/llm/deepseek-ai/dsv4-flash.mdx
+              - page: "DeepSeek-V4-Pro"
+                path: ../../model-coverage/llm/deepseek-ai/dsv4-pro.mdx
+              - page: "DeepSeek-V4.1-Flash"
+                path: ../../model-coverage/llm/deepseek-ai/deepseek-v41-flash.mdx
+          - section: "Mistral AI"
+            slug: mistralai
+            path: ../../model-coverage/llm/mistralai/index.mdx
+            contents:
+              - page: "Mistral-7B-v0.1"
+                path: ../../model-coverage/llm/mistralai/mistral.mdx
+              - page: "Mixtral-8x7B-v0.1"
+                path: ../../model-coverage/llm/mistralai/mixtral.mdx
+              - page: "Ministral-3-3B-Instruct-2512"
+                path: ../../model-coverage/llm/mistralai/ministral3.mdx
+          - section: "Microsoft"
+            slug: microsoft
+            path: ../../model-coverage/llm/microsoft/index.mdx
+            contents:
+              - page: "phi-2"
+                path: ../../model-coverage/llm/microsoft/phi.mdx
+              - page: "Phi-4"
+                path: ../../model-coverage/llm/microsoft/phi3.mdx
+              - page: "Phi-3-small-8k-instruct"
+                path: ../../model-coverage/llm/microsoft/phi3-small.mdx
+          - section: "NVIDIA"
+            slug: nvidia
+            path: ../../model-coverage/llm/nvidia/index.mdx
+            contents:
+              - page: "Minitron-8B-Base"
+                path: ../../model-coverage/llm/nvidia/nemotron.mdx
+              - page: "NVIDIA-Nemotron-3-Nano-4B-BF16"
+                path: ../../model-coverage/llm/nvidia/nemotron-h.mdx
+              - page: "Nemotron-Flash-1B"
+                path: ../../model-coverage/llm/nvidia/nemotron-flash.mdx
+              - page: "Llama-3_3-Nemotron-Super-49B-v1"
+                path: ../../model-coverage/llm/nvidia/nemotron-super.mdx
+          - section: "Z.ai"
+            slug: thudm
+            path: ../../model-coverage/llm/thudm/index.mdx
+            contents:
+              - page: "chatglm3-6b"
+                path: ../../model-coverage/llm/thudm/chatglm.mdx
+              - page: "glm-4-9b-chat-hf"
+                path: ../../model-coverage/llm/thudm/glm4.mdx
+              - page: "GLM-4.5-Air"
+                path: ../../model-coverage/llm/thudm/glm4-moe.mdx
+              - page: "GLM-5"
+                path: ../../model-coverage/llm/thudm/glm5-moe-dsa.mdx
+          - section: "IBM"
+            slug: ibm
+            path: ../../model-coverage/llm/ibm/index.mdx
+            contents:
+              - page: "granite-3.0-2b-base"
+                path: ../../model-coverage/llm/ibm/granite.mdx
+              - page: "granite-3.0-1b-a400m-base"
+                path: ../../model-coverage/llm/ibm/granite-moe.mdx
+              - page: "Bamba-9B"
+                path: ../../model-coverage/llm/ibm/bamba.mdx
+          - section: "Allen AI"
+            slug: allenai
+            path: ../../model-coverage/llm/allenai/index.mdx
+            contents:
+              - page: "OLMo-1B-hf"
+                path: ../../model-coverage/llm/allenai/olmo.mdx
+              - page: "OLMo2-7B-1124"
+                path: ../../model-coverage/llm/allenai/olmo2.mdx
+              - page: "OLMoE-1B-7B-0924"
+                path: ../../model-coverage/llm/allenai/olmoe.mdx
+          - section: "OpenAI"
+            slug: openai
+            path: ../../model-coverage/llm/openai/index.mdx
+            contents:
+              - page: "gpt-oss-20b"
+                path: ../../model-coverage/llm/openai/gpt-oss.mdx
+              - page: "gpt2"
+                path: ../../model-coverage/llm/openai/gpt2.mdx
+          - section: "EleutherAI"
+            slug: eleutherai
+            path: ../../model-coverage/llm/eleutherai/index.mdx
+            contents:
+              - page: "gpt-j-6b"
+                path: ../../model-coverage/llm/eleutherai/gpt-j.mdx
+              - page: "gpt-neox-20b"
+                path: ../../model-coverage/llm/eleutherai/gpt-neox.mdx
+          - section: "BigCode"
+            slug: bigcode
+            path: ../../model-coverage/llm/bigcode/index.mdx
+            contents:
+              - page: "starcoder"
+                path: ../../model-coverage/llm/bigcode/starcoder.mdx
+              - page: "starcoder2-3b"
+                path: ../../model-coverage/llm/bigcode/starcoder2.mdx
+          - section: "BAAI"
+            slug: baai
+            path: ../../model-coverage/llm/baai/index.mdx
+            contents:
+              - page: "Aquila-7B"
+                path: ../../model-coverage/llm/baai/aquila.mdx
+          - section: "Baichuan Inc."
+            slug: baichuan-inc
+            path: ../../model-coverage/llm/baichuan-inc/index.mdx
+            contents:
+              - page: "Baichuan2-13B-Chat"
+                path: ../../model-coverage/llm/baichuan-inc/baichuan.mdx
+          - section: "Cohere"
+            slug: cohere
+            path: ../../model-coverage/llm/cohere/index.mdx
+            contents:
+              - page: "c4ai-command-r-v01"
+                path: ../../model-coverage/llm/cohere/command-r.mdx
+          - section: "TII"
+            slug: tiiuae
+            path: ../../model-coverage/llm/tiiuae/index.mdx
+            contents:
+              - page: "falcon-7b"
+                path: ../../model-coverage/llm/tiiuae/falcon.mdx
+          - section: "LG AI EXAONE"
+            slug: lgai-exaone
+            path: ../../model-coverage/llm/lgai-exaone/index.mdx
+            contents:
+              - page: "EXAONE-3.0-7.8B-Instruct"
+                path: ../../model-coverage/llm/lgai-exaone/exaone.mdx
+          - section: "InternLM"
+            slug: internlm
+            path: ../../model-coverage/llm/internlm/index.mdx
+            contents:
+              - page: "internlm3-8b-instruct"
+                path: ../../model-coverage/llm/internlm/internlm.mdx
+          - section: "Inception AI"
+            slug: inceptionai
+            path: ../../model-coverage/llm/inceptionai/index.mdx
+            contents:
+              - page: "jais-13b"
+                path: ../../model-coverage/llm/inceptionai/jais.mdx
+          - section: "MiniMax AI"
+            slug: minimax
+            path: ../../model-coverage/llm/minimax/index.mdx
+            contents:
+              - page: "MiniMax-M2.1"
+                path: ../../model-coverage/llm/minimax/minimax-m2.mdx
+          - section: "OpenBMB"
+            slug: openbmb
+            path: ../../model-coverage/llm/openbmb/index.mdx
+            contents:
+              - page: "MiniCPM5-1B"
+                path: ../../model-coverage/llm/openbmb/minicpm.mdx
           - section: "Moonshot AI"
             slug: moonshotai
+            path: ../../model-coverage/llm/moonshotai/index.mdx
             contents:
-              - page: "Moonlight"
+              - page: "Moonlight-16B-A3B"
                 path: ../../model-coverage/llm/moonshotai/moonlight.mdx
-              - page: "Kimi Linear"
+              - page: "Kimi-Linear-48B-A3B-Instruct"
                 path: ../../model-coverage/llm/moonshotai/kimi-linear.mdx
-              - page: "Kimi K3"
+              - page: "Kimi-K3"
                 path: ../../model-coverage/llm/moonshotai/kimi-k3.mdx
-                slug: kimi-k3
-          - page: "Seed (ByteDance)"
-            path: ../../model-coverage/llm/bytedance-seed/seed.mdx
-          - page: "Solar Pro"
-            path: ../../model-coverage/llm/upstage/solar.mdx
-          - page: "Orion"
-            path: ../../model-coverage/llm/orionstar/orion.mdx
-          - page: "StableLM"
-            path: ../../model-coverage/llm/stabilityai/stablelm.mdx
-          - page: "T5"
-            path: ../../model-coverage/llm/google-t5/t5.mdx
-          - page: "Step-3.5"
-            path: ../../model-coverage/llm/stepfun-ai/step-3-5.mdx
-            slug: step-3-5
-          - page: "GritLM"
-            path: ../../model-coverage/llm/parasail-ai/gritlm.mdx
-          - page: "Hy3-preview"
-            path: ../../model-coverage/llm/tencent/hy3.mdx
-          - page: "Hy-MT2"
-            path: ../../model-coverage/llm/tencent/hy-mt2.mdx
-          - page: "MiMo-V2-Flash"
-            path: ../../model-coverage/llm/xiaomimimo/mimo-v2-flash.mdx
-          - page: "Ling 2.0"
-            path: ../../model-coverage/llm/inclusionai/ling-2.mdx
-            slug: ling-2-0
-          - page: "Laguna"
-            path: ../../model-coverage/llm/poolside/laguna.mdx
-            slug: laguna
+          - section: "ByteDance Seed"
+            slug: bytedance-seed
+            path: ../../model-coverage/llm/bytedance-seed/index.mdx
+            contents:
+              - page: "Seed-Coder-8B-Instruct"
+                path: ../../model-coverage/llm/bytedance-seed/seed.mdx
+          - section: "Upstage"
+            slug: upstage
+            path: ../../model-coverage/llm/upstage/index.mdx
+            contents:
+              - page: "solar-pro-preview-instruct"
+                path: ../../model-coverage/llm/upstage/solar.mdx
+          - section: "OrionStar AI"
+            slug: orionstar
+            path: ../../model-coverage/llm/orionstar/index.mdx
+            contents:
+              - page: "Orion-14B-Base"
+                path: ../../model-coverage/llm/orionstar/orion.mdx
+          - section: "Stability AI"
+            slug: stabilityai
+            path: ../../model-coverage/llm/stabilityai/index.mdx
+            contents:
+              - page: "stablelm-3b-4e1t"
+                path: ../../model-coverage/llm/stabilityai/stablelm.mdx
+          - section: "Google T5"
+            slug: google-t5
+            path: ../../model-coverage/llm/google-t5/index.mdx
+            contents:
+              - page: "t5-small"
+                path: ../../model-coverage/llm/google-t5/t5.mdx
+          - section: "StepFun AI"
+            slug: stepfun-ai
+            path: ../../model-coverage/llm/stepfun-ai/index.mdx
+            contents:
+              - page: "Step-3.5-Flash"
+                path: ../../model-coverage/llm/stepfun-ai/step-3-5.mdx
+          - section: "ParaSail AI"
+            slug: parasail-ai
+            path: ../../model-coverage/llm/parasail-ai/index.mdx
+            contents:
+              - page: "GritLM-7B-vllm"
+                path: ../../model-coverage/llm/parasail-ai/gritlm.mdx
+          - section: "Tencent"
+            slug: tencent
+            path: ../../model-coverage/llm/tencent/index.mdx
+            contents:
+              - page: "Hy3-preview"
+                path: ../../model-coverage/llm/tencent/hy3.mdx
+              - page: "Hy-MT2-30B-A3B"
+                path: ../../model-coverage/llm/tencent/hy-mt2.mdx
+          - section: "XiaomiMiMo"
+            slug: xiaomimimo
+            path: ../../model-coverage/llm/xiaomimimo/index.mdx
+            contents:
+              - page: "MiMo-V2-Flash"
+                path: ../../model-coverage/llm/xiaomimimo/mimo-v2-flash.mdx
+          - section: "Inclusion AI"
+            slug: inclusionai
+            path: ../../model-coverage/llm/inclusionai/index.mdx
+            contents:
+              - page: "Ling-mini-2.0"
+                path: ../../model-coverage/llm/inclusionai/ling-2.mdx
+          - section: "Poolside"
+            slug: poolside
+            path: ../../model-coverage/llm/poolside/index.mdx
+            contents:
+              - page: "Laguna-S-2.1"
+                path: ../../model-coverage/llm/poolside/laguna.mdx
       - section: "Vision Language Models"
         slug: vision-language-models
         contents:
           - page: "Overview"
             path: ../../model-coverage/vlm/index.mdx
             slug: overview
-          - page: "MuseGlimmer"
-            path: ../../model-coverage/vlm/muse/muse_glimmer.mdx
-          - page: "Kimi-VL"
-            path: ../../model-coverage/vlm/moonshotai/kimi-vl.mdx
-          - page: "Kimi-K3"
-            path: ../../model-coverage/vlm/moonshotai/kimi-k3.mdx
-          - page: "North Micro Vision"
-            path: ../../model-coverage/vlm/coherelabs/north-micro-vision.mdx
-            slug: north-micro-vision
-          - page: "Inkling"
-            path: ../../model-coverage/vlm/thinkingmachines/inkling.mdx
-          - page: "Gemma 3 / Gemma 3n"
-            path: ../../model-coverage/vlm/google/gemma3-vl.mdx
-            slug: gemma-3-vl-gemma-3n
-          - page: "Gemma 4"
-            path: ../../model-coverage/vlm/google/gemma4.mdx
-          - page: "Qwen2.5-VL"
-            path: ../../model-coverage/vlm/qwen/qwen2-5-vl.mdx
-            slug: qwen2-5-vl
-          - page: "Qwen3-VL / Qwen3-VL-MoE"
-            path: ../../model-coverage/vlm/qwen/qwen3-vl.mdx
-            slug: qwen3-vl-qwen3-vl-moe
-          - page: "Qwen3.5"
-            path: ../../model-coverage/vlm/qwen/qwen3-5-vl.mdx
-            slug: qwen3-5-vl
-          - page: "Qwen3.6"
-            path: ../../model-coverage/vlm/qwen/qwen3-6-vl.mdx
-            slug: qwen3-6-vl
-          - page: "Qwen3.8"
-            path: ../../model-coverage/vlm/qwen/qwen3-8-vl.mdx
-            slug: qwen3-8-vl
-          - page: "Nemotron-Parse"
-            path: ../../model-coverage/vlm/nvidia/nemotron-parse.mdx
-          - page: "Ministral3 VL"
-            path: ../../model-coverage/vlm/mistralai/ministral3-vl.mdx
-          - page: "Mistral Medium 3.5"
-            path: ../../model-coverage/vlm/mistralai/mistral-medium-3-5.mdx
-            slug: mistral-medium-3-5
-          - page: "Mistral-Small-4"
-            path: ../../model-coverage/vlm/mistralai/mistral-small-4.mdx
-          - page: "InternVL"
-            path: ../../model-coverage/vlm/internlm/internvl.mdx
-          - page: "Llama 4"
-            path: ../../model-coverage/vlm/meta/llama4.mdx
-          - page: "LLaVA-OneVision"
-            path: ../../model-coverage/vlm/lmms-lab/llava-onevision.mdx
-          - page: "SmolVLM"
-            path: ../../model-coverage/vlm/huggingface/smolvlm.mdx
-          - page: "LLaVA"
-            path: ../../model-coverage/vlm/llava-hf/llava.mdx
-          - page: "Step-3.7-Flash"
-            path: ../../model-coverage/vlm/stepfun-ai/step-3-7.mdx
-            slug: step-3-7-flash
-          - page: "MiniMax-M3"
-            path: ../../model-coverage/vlm/minimax/minimax-m3.mdx
-            slug: minimax-m3
-          - page: "GLM-5.3-Flash"
-            path: ../../model-coverage/vlm/thudm/glm-5-3-flash.mdx
-            slug: glm-5-3-flash
+          - section: "Muse"
+            slug: muse
+            path: ../../model-coverage/vlm/muse/index.mdx
+            contents:
+              - page: "Muse-Glimmer-30B"
+                path: ../../model-coverage/vlm/muse/muse_glimmer.mdx
+          - section: "Moonshot AI"
+            slug: moonshotai
+            path: ../../model-coverage/vlm/moonshotai/index.mdx
+            contents:
+              - page: "Kimi-VL-A3B-Instruct"
+                path: ../../model-coverage/vlm/moonshotai/kimi-vl.mdx
+              - page: "Kimi-K3"
+                path: ../../model-coverage/vlm/moonshotai/kimi-k3.mdx
+          - section: "Cohere Labs"
+            slug: coherelabs
+            path: ../../model-coverage/vlm/coherelabs/index.mdx
+            contents:
+              - page: "North-Micro-Vision-Instruct"
+                path: ../../model-coverage/vlm/coherelabs/north-micro-vision.mdx
+          - section: "Thinking Machines"
+            slug: thinkingmachines
+            path: ../../model-coverage/vlm/thinkingmachines/index.mdx
+            contents:
+              - page: "Inkling"
+                path: ../../model-coverage/vlm/thinkingmachines/inkling.mdx
+          - section: "Google"
+            slug: google
+            path: ../../model-coverage/vlm/google/index.mdx
+            contents:
+              - page: "gemma-3-270m"
+                path: ../../model-coverage/vlm/google/gemma3-vl.mdx
+              - page: "gemma-4-12B"
+                path: ../../model-coverage/vlm/google/gemma4.mdx
+          - section: "Qwen"
+            slug: qwen
+            path: ../../model-coverage/vlm/qwen/index.mdx
+            contents:
+              - page: "Qwen2.5-VL-3B-Instruct"
+                path: ../../model-coverage/vlm/qwen/qwen2-5-vl.mdx
+              - page: "Qwen3-VL-4B-Instruct"
+                path: ../../model-coverage/vlm/qwen/qwen3-vl.mdx
+              - page: "Qwen3.5-4B"
+                path: ../../model-coverage/vlm/qwen/qwen3-5-vl.mdx
+              - page: "Qwen3.6-27B"
+                path: ../../model-coverage/vlm/qwen/qwen3-6-vl.mdx
+              - page: "Qwen3.8-27B"
+                path: ../../model-coverage/vlm/qwen/qwen3-8-vl.mdx
+          - section: "NVIDIA"
+            slug: nvidia
+            path: ../../model-coverage/vlm/nvidia/index.mdx
+            contents:
+              - page: "NVIDIA-Nemotron-Parse-v1.1"
+                path: ../../model-coverage/vlm/nvidia/nemotron-parse.mdx
+          - section: "Mistral AI"
+            slug: mistralai
+            path: ../../model-coverage/vlm/mistralai/index.mdx
+            contents:
+              - page: "Ministral-3-3B-Instruct-2512"
+                path: ../../model-coverage/vlm/mistralai/ministral3-vl.mdx
+              - page: "Devstral-2-123B-Instruct-2512"
+                path: ../../model-coverage/vlm/mistralai/mistral-medium-3-5.mdx
+              - page: "Mistral-Small-4-119B-2603"
+                path: ../../model-coverage/vlm/mistralai/mistral-small-4.mdx
+          - section: "InternLM"
+            slug: internlm
+            path: ../../model-coverage/vlm/internlm/index.mdx
+            contents:
+              - page: "InternVL3_5-4B"
+                path: ../../model-coverage/vlm/internlm/internvl.mdx
+          - section: "Meta"
+            slug: meta
+            path: ../../model-coverage/vlm/meta/index.mdx
+            contents:
+              - page: "Llama-4-Scout-17B-16E-Instruct"
+                path: ../../model-coverage/vlm/meta/llama4.mdx
+          - section: "LMMS Lab"
+            slug: lmms-lab
+            path: ../../model-coverage/vlm/lmms-lab/index.mdx
+            contents:
+              - page: "LLaVA-OneVision-1.5-4B-Instruct"
+                path: ../../model-coverage/vlm/lmms-lab/llava-onevision.mdx
+          - section: "Hugging Face"
+            slug: huggingface
+            path: ../../model-coverage/vlm/huggingface/index.mdx
+            contents:
+              - page: "SmolVLM-Instruct"
+                path: ../../model-coverage/vlm/huggingface/smolvlm.mdx
+          - section: "LLaVA HF"
+            slug: llava-hf
+            path: ../../model-coverage/vlm/llava-hf/index.mdx
+            contents:
+              - page: "llava-1.5-7b-hf"
+                path: ../../model-coverage/vlm/llava-hf/llava.mdx
+          - section: "StepFun AI"
+            slug: stepfun-ai
+            path: ../../model-coverage/vlm/stepfun-ai/index.mdx
+            contents:
+              - page: "Step-3.7-Flash"
+                path: ../../model-coverage/vlm/stepfun-ai/step-3-7.mdx
+          - section: "MiniMax AI"
+            slug: minimax
+            path: ../../model-coverage/vlm/minimax/index.mdx
+            contents:
+              - page: "MiniMax-M3"
+                path: ../../model-coverage/vlm/minimax/minimax-m3.mdx
+          - section: "Z.ai"
+            slug: thudm
+            path: ../../model-coverage/vlm/thudm/index.mdx
+            contents:
+              - page: "GLM-5.3-Flash"
+                path: ../../model-coverage/vlm/thudm/glm-5-3-flash.mdx
       - section: "Multimodal"
         slug: multimodal
         contents:
           - page: "Overview"
             path: ../../model-coverage/multimodal/index.mdx
             slug: overview
-          - page: "BAGEL"
-            path: ../../model-coverage/multimodal/bytedance-seed/bagel.mdx
+          - section: "ByteDance Seed"
+            slug: bytedance-seed
+            path: ../../model-coverage/multimodal/bytedance-seed/index.mdx
+            contents:
+              - page: "BAGEL-7B-MoT"
+                path: ../../model-coverage/multimodal/bytedance-seed/bagel.mdx
       - section: "Omni"
         slug: omni
         contents:
           - page: "Overview"
             path: ../../model-coverage/omni/index.mdx
             slug: overview
-          - page: "Qwen3-Omni"
-            path: ../../model-coverage/omni/qwen/qwen3-omni.mdx
-          - page: "Qwen2.5-Omni"
-            path: ../../model-coverage/omni/qwen/qwen2-5-omni.mdx
-            slug: qwen2-5-omni
-          - page: "Phi-4-multimodal"
-            path: ../../model-coverage/omni/microsoft/phi4-multimodal.mdx
-          - page: "Nemotron-Omni"
-            path: ../../model-coverage/omni/nvidia/nemotron-omni.mdx
-          - page: "Nemotron 3.5 Super VL"
-            path: ../../model-coverage/omni/nvidia/nemotron-3-5-super-vl.mdx
+          - section: "Qwen"
+            slug: qwen
+            path: ../../model-coverage/omni/qwen/index.mdx
+            contents:
+              - page: "Qwen3-Omni-30B-A3B-Instruct"
+                path: ../../model-coverage/omni/qwen/qwen3-omni.mdx
+              - page: "Qwen2.5-Omni-3B"
+                path: ../../model-coverage/omni/qwen/qwen2-5-omni.mdx
+          - section: "Microsoft"
+            slug: microsoft
+            path: ../../model-coverage/omni/microsoft/index.mdx
+            contents:
+              - page: "Phi-4-multimodal-instruct"
+                path: ../../model-coverage/omni/microsoft/phi4-multimodal.mdx
+          - section: "NVIDIA"
+            slug: nvidia
+            path: ../../model-coverage/omni/nvidia/index.mdx
+            contents:
+              - page: "Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16"
+                path: ../../model-coverage/omni/nvidia/nemotron-omni.mdx
+              - page: "NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained"
+                path: ../../model-coverage/omni/nvidia/nemotron-3-5-super-vl.mdx
       - section: "Diffusion Language Models"
         slug: dllm
         contents:
           - page: "Overview"
             path: ../../model-coverage/dllm/index.mdx
             slug: overview
-          - page: "DiffusionGemma"
-            path: ../../model-coverage/dllm/google/diffusiongemma.mdx
-          - page: "LLaDA"
-            path: ../../model-coverage/dllm/gsai-ml/llada.mdx
-          - page: "LLaDA 2.1"
-            path: ../../model-coverage/dllm/inclusionai/llada2.mdx
-          - page: "Nemotron-Labs-Diffusion"
-            path: ../../model-coverage/dllm/nvidia/nemotron-labs-diffusion.mdx
-          - page: "DFlash"
-            path: ../../model-coverage/dllm/z-lab/dflash.mdx
-          - page: "Qwen3 I-DLM"
-            path: ../../model-coverage/dllm/qwen/qwen3-idlm.mdx
+          - section: "Google"
+            slug: google
+            path: ../../model-coverage/dllm/google/index.mdx
+            contents:
+              - page: "diffusiongemma-26B-A4B-it"
+                path: ../../model-coverage/dllm/google/diffusiongemma.mdx
+          - section: "GSAI ML"
+            slug: gsai-ml
+            path: ../../model-coverage/dllm/gsai-ml/index.mdx
+            contents:
+              - page: "LLaDA-8B-Base"
+                path: ../../model-coverage/dllm/gsai-ml/llada.mdx
+          - section: "Inclusion AI"
+            slug: inclusionai
+            path: ../../model-coverage/dllm/inclusionai/index.mdx
+            contents:
+              - page: "LLaDA2.1-mini"
+                path: ../../model-coverage/dllm/inclusionai/llada2.mdx
+          - section: "NVIDIA"
+            slug: nvidia
+            path: ../../model-coverage/dllm/nvidia/index.mdx
+            contents:
+              - page: "Nemotron-Labs-Diffusion-8B-Base"
+                path: ../../model-coverage/dllm/nvidia/nemotron-labs-diffusion.mdx
+          - section: "Z Lab"
+            slug: z-lab
+            path: ../../model-coverage/dllm/z-lab/index.mdx
+            contents:
+              - page: "Qwen3-4B-DFlash-b16"
+                path: ../../model-coverage/dllm/z-lab/dflash.mdx
+          - section: "Qwen"
+            slug: qwen
+            path: ../../model-coverage/dllm/qwen/index.mdx
+            contents:
+              - page: "Qwen3-8B"
+                path: ../../model-coverage/dllm/qwen/qwen3-idlm.mdx
       - section: "Diffusion"
         slug: diffusion
         contents:
           - page: "Overview"
             path: ../../model-coverage/diffusion/index.mdx
             slug: overview
-          - page: "Wan 2.1 T2V"
-            path: ../../model-coverage/diffusion/wan-ai/wan2-1-t2v.mdx
-            slug: wan-2-1-t2v
-          - page: "Wan 2.2 T2V-A14B"
-            path: ../../model-coverage/diffusion/wan-ai/wan2-2-t2v.mdx
-            slug: wan-2-2-t2v-a14b
-          - page: "FLUX.1-dev"
-            path: ../../model-coverage/diffusion/black-forest-labs/flux.mdx
-            slug: flux-1-dev
-          - page: "FLUX.2-dev"
-            path: ../../model-coverage/diffusion/black-forest-labs/flux2.mdx
-            slug: flux-2-dev
-          - page: "HunyuanVideo 1.5"
-            path: ../../model-coverage/diffusion/hunyuanvideo-community/hunyuanvideo.mdx
-            slug: hunyuanvideo-1-5
-          - page: "LTX-2.3"
-            path: ../../model-coverage/diffusion/lightricks/ltx-2-3.mdx
-            slug: ltx-2-3
-          - page: "Qwen-Image"
-            path: ../../model-coverage/diffusion/qwen/qwen-image.mdx
-          - page: "LTX-2.3"
-            path: ../../model-coverage/diffusion/diffusers/ltx-2-3.mdx
+          - section: "Wan AI"
+            slug: wan-ai
+            path: ../../model-coverage/diffusion/wan-ai/index.mdx
+            contents:
+              - page: "Wan2.1-T2V-1.3B-Diffusers"
+                path: ../../model-coverage/diffusion/wan-ai/wan2-1-t2v.mdx
+              - page: "Wan2.2-T2V-A14B-Diffusers"
+                path: ../../model-coverage/diffusion/wan-ai/wan2-2-t2v.mdx
+          - section: "Black Forest Labs"
+            slug: black-forest-labs
+            path: ../../model-coverage/diffusion/black-forest-labs/index.mdx
+            contents:
+              - page: "FLUX.1-dev"
+                path: ../../model-coverage/diffusion/black-forest-labs/flux.mdx
+              - page: "FLUX.2-dev"
+                path: ../../model-coverage/diffusion/black-forest-labs/flux2.mdx
+          - section: "HunyuanVideo Community"
+            slug: hunyuanvideo-community
+            path: ../../model-coverage/diffusion/hunyuanvideo-community/index.mdx
+            contents:
+              - page: "HunyuanVideo-1.5-Diffusers-720p_t2v"
+                path: ../../model-coverage/diffusion/hunyuanvideo-community/hunyuanvideo.mdx
+          - section: "Lightricks"
+            slug: lightricks
+            path: ../../model-coverage/diffusion/lightricks/index.mdx
+            contents:
+              - page: "LTX-2.3"
+                path: ../../model-coverage/diffusion/lightricks/ltx-2-3.mdx
+          - section: "Qwen"
+            slug: qwen
+            path: ../../model-coverage/diffusion/qwen/index.mdx
+            contents:
+              - page: "Qwen-Image"
+                path: ../../model-coverage/diffusion/qwen/qwen-image.mdx
+          - section: "Diffusers"
+            slug: diffusers
+            path: ../../model-coverage/diffusion/diffusers/index.mdx
+            contents:
+              - page: "LTX-2.3-Diffusers"
+                path: ../../model-coverage/diffusion/diffusers/ltx-2-3.mdx
       - section: "Embedding Models"
         slug: embedding-models
         contents:
           - page: "Overview"
             path: ../../model-coverage/embedding/index.mdx
             slug: overview
-          - page: "Llama (Bidirectional)"
-            path: ../../model-coverage/embedding/nvidia/llama-bidirectional.mdx
-            slug: llama-bidirectional
-          - page: "Ministral3"
-            path: ../../model-coverage/embedding/mistralai/ministral3-bidirectional.mdx
-            slug: ministral3-bidirectional
+          - section: "NVIDIA"
+            slug: nvidia
+            path: ../../model-coverage/embedding/nvidia/index.mdx
+            contents:
+              - page: "llama-embed-nemotron-8b"
+                path: ../../model-coverage/embedding/nvidia/llama-bidirectional.mdx
+          - section: "Mistral AI"
+            slug: mistralai
+            path: ../../model-coverage/embedding/mistralai/index.mdx
+            contents:
+              - page: "Ministral-3-3B-Base-2512"
+                path: ../../model-coverage/embedding/mistralai/ministral3-bidirectional.mdx
       - section: "Reranking Models"
         slug: reranking-models
         contents:
           - page: "Overview"
             path: ../../model-coverage/reranker/index.mdx
             slug: overview
-          - page: "Llama (Bidirectional)"
-            path: ../../model-coverage/reranker/nvidia/llama-bidirectional.mdx
-            slug: llama-bidirectional
+          - section: "NVIDIA"
+            slug: nvidia
+            path: ../../model-coverage/reranker/nvidia/index.mdx
+            contents:
+              - page: "llama-nemotron-rerank-1b-v2"
+                path: ../../model-coverage/reranker/nvidia/llama-bidirectional.mdx
       - page: "Troubleshooting"
         path: ../../model-coverage/troubleshooting.mdx
         slug: troubleshooting

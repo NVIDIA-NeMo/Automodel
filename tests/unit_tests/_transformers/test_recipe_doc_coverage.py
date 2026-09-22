@@ -286,7 +286,7 @@ def test_recipe_model_ids_live_under_publishing_org_dir(recipe_model_ids: set[st
     # ``index.mdx``, etc.) legitimately cross-reference HF IDs from many orgs.
     md_texts: list[tuple[pathlib.Path, str]] = []
     for md in docs_dir.rglob("*.mdx"):
-        if len(md.relative_to(docs_dir).parts) != 3:
+        if len(md.relative_to(docs_dir).parts) != 3 or md.name == "index.mdx":
             continue
         md_texts.append((md, md.read_text(encoding="utf-8")))
 
