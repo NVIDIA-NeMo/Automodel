@@ -195,6 +195,11 @@ class MoEParallelizerConfig:
     # different number of tokens per expert than the forward pass, which makes
     # torch.utils.checkpoint raise a CheckpointError on the backward recompute.
     ignore_router_for_ac: bool = True
+    # When True (and activation checkpointing is on), only the MoE sub-block of each decoder
+    # layer is checkpointed; attention / linear-attention / residual-mixing activations are
+    # saved instead of recomputed. Trades activation memory for the recompute of everything
+    # outside the experts. Requires ignore_router_for_ac=True and the non-selective mode.
+    checkpoint_moe_only: bool = False
     reshard_after_forward: bool = False
     lm_head_precision: Union[str, torch.dtype] | None = None
     wrap_outer_model: bool = True

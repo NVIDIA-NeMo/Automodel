@@ -579,6 +579,15 @@ def _uses_hybridep_dispatch(model: nn.Module) -> bool:
     )
 
 
+def _moe_child(block: nn.Module) -> tuple[str, MoE] | None:
+    """Return the attribute name and module of the block's MoE sub-block, if any."""
+    for name in ("moe", "mlp"):
+        module = getattr(block, name, None)
+        if isinstance(module, MoE):
+            return name, module
+    return None
+
+
 def apply_ac(
     model: nn.Module,
     ignore_router: bool = True,
@@ -586,6 +595,7 @@ def apply_ac(
     num_experts: int | None = None,
     selective: bool = False,
     activation_checkpointing_scope: str | list[str] | tuple[str, ...] = "all",
+    moe_only: bool = False,
 ):
     """Apply activation checkpointing to the model.
 
@@ -601,6 +611,9 @@ def apply_ac(
             (shared with the dense FSDP2 path) to each block. Takes precedence over
             ``ignore_router``; the shared policy saves ``topk``, and HybridEP reuses the
             checkpoint-forward dispatch layout while redispatching recomputed activations.
+        moe_only: If True, checkpoint only each decoder block's MoE sub-block (``moe``/``mlp``)
+            and save every other activation of the block. Requires ``ignore_router=True`` and
+            ``selective=False``; blocks without an MoE sub-block are left uncheckpointed.
         activation_checkpointing_scope: Which layer groups to checkpoint -- the same field
             and semantics as the generic FSDP2/DDP path. ``"all"`` (the default) checkpoints
             the text/MoE decoder blocks plus the trainable vision tower; ``"language"`` the
@@ -621,6 +634,12 @@ def apply_ac(
 
     scopes = normalize_activation_checkpointing_scope(activation_checkpointing_scope)
     checkpoint_decoder = "all" in scopes or "language" in scopes
+    if moe_only and (selective or not ignore_router):
+        raise ValueError(
+            "checkpoint_moe_only requires the default block checkpointing mode "
+            "(activation_checkpointing=true, ignore_router_for_ac=true); got "
+            f"selective={selective}, ignore_router={ignore_router}"
+        )
     uses_hybridep_dispatch = checkpoint_decoder and _uses_hybridep_dispatch(model)
     repeated_mtp_moe_block_ids = _repeated_mtp_moe_block_ids(model) if checkpoint_decoder else set()
     if repeated_mtp_moe_block_ids:
@@ -766,6 +785,26 @@ def apply_ac(
             block_context_fn = _replay_deepep_dispatch_on_recompute(block_context_fn)
             if uses_hybridep_dispatch:
                 block_context_fn = _replay_hybridep_dispatch_on_recompute(block_context_fn)
+            if moe_only:
+                # Checkpoint the MoE sub-block alone: attention / linear-attention /
+                # residual mixing keep their activations, only the experts (and the
+                # dispatch around them) are recomputed. The block itself is not
+                # wrapped, so model-owned block hooks (e.g. route replay) are not needed.
+                moe_child = _moe_child(block)
+                if moe_child is None:
+                    logger.info(
+                        "Skipping MoE-only activation checkpointing for block %s without an MoE sub-block", layer_id
+                    )
+                    continue
+                child_name, moe_module = moe_child
+                wrapped_moe = ptd_checkpoint_wrapper(
+                    moe_module,
+                    preserve_rng_state=True,
+                    determinism_check=_register_moe_checkpoint_determinism_check(),
+                    context_fn=block_context_fn,
+                )
+                block.register_module(child_name, wrapped_moe)
+                continue
             block = ptd_checkpoint_wrapper(
                 block,
                 preserve_rng_state=True,
@@ -1174,6 +1213,7 @@ def parallelize_model(
     ep_shard_axis_names: tuple[str, ...] | None = None,
     activation_checkpointing: bool | str = False,
     ignore_router_for_ac: bool = True,
+    checkpoint_moe_only: bool = False,
     activation_checkpointing_scope: str | list[str] | tuple[str, ...] = "all",
     reshard_after_forward: bool = False,
     lm_head_precision: str | torch.dtype | None = None,
@@ -1256,6 +1296,7 @@ def parallelize_model(
             ignore_router=ignore_router_for_ac,
             selective=_is_selective_ac(activation_checkpointing),
             activation_checkpointing_scope=activation_checkpointing_scope,
+            moe_only=checkpoint_moe_only,
         )
 
     if reapply_trainability is not None:
