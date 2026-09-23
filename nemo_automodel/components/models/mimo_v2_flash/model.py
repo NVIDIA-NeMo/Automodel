@@ -956,6 +956,26 @@ class MiMoV2FlashModel(nn.Module):
 
         if is_thd:
             causal_mask_mapping = {"full_attention": None, "sliding_attention": None}
+        elif self.backend.attn == "te":
+            if isinstance(attention_mask, dict) or (
+                isinstance(attention_mask, torch.Tensor) and attention_mask.ndim != 2
+            ):
+                raise ValueError(
+                    "MiMo TE BSHD attention expects a 2D padding mask [batch, sequence], "
+                    f"got {type(attention_mask).__name__}"
+                    + (
+                        f" with shape {tuple(attention_mask.shape)}"
+                        if isinstance(attention_mask, torch.Tensor)
+                        else ""
+                    )
+                )
+            # TE constructs the causal mask internally and applies each layer's
+            # window_size. Passing the original padding mask avoids expanding an
+            # additive [B,1,S,S] mask through TE's 2D padding-mask interface.
+            causal_mask_mapping = {
+                "full_attention": attention_mask,
+                "sliding_attention": attention_mask,
+            }
         else:
             causal_mask_mapping = self._build_causal_mask_mapping(
                 inputs_embeds,
