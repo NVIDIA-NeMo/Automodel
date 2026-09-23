@@ -446,7 +446,8 @@ class BackendConfig:
             non-blocking mode with output buffers sized to the first microbatch's permuted row
             count times this factor (EP-group max, 4-token aligned) instead of letting every
             dispatch drain the compute stream to read the exact count. Overflow trips a
-            device-side assert. None (default) keeps the blocking reference path.
+            device-side assert. None (default) keeps the blocking reference path. Not supported
+            for experts with ``expert_bias`` (``GroupedExpertsDeepEP`` rejects the combination).
         dispatcher_equal_token_counts: HybridEP only. Declare that every EP rank dispatches the
             same row count, so the per-dispatch EP-group max all-reduce (and its host sync)
             that derives the pad size is skipped and the count is only aligned. Default False;
@@ -522,6 +523,7 @@ class BackendConfig:
     # HybridEP in its non-blocking mode. Removes the per-dispatch compute-stream drain that HybridEP's
     # blocking mode needs to learn the permuted row count (and the per-layer barrier it implies); an
     # overflow of the capacity trips a device-side assert instead of silently truncating. None = blocking.
+    # Rejected by GroupedExpertsDeepEP for expert_bias experts (the bias add sizes itself from the buffer rows).
     dispatcher_capacity_factor: float | None = None
     # HybridEP only: every EP rank dispatches the same number of rows (fixed-shape batches, which is
     # every batch that is not variable-length / in-batch packed), so the per-dispatch EP-group MAX

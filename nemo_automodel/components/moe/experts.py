@@ -966,6 +966,14 @@ class GroupedExpertsDeepEP(nn.Module):
         self.dispatcher_equal_token_counts = (
             bool(getattr(backend, "dispatcher_equal_token_counts", False)) if backend is not None else False
         )
+        if self.dispatcher_capacity_factor is not None and self.expert_bias:
+            # Capacity mode pads the dispatched buffer past the routed row count while tokens_per_expert
+            # still sums to the routed rows; _apply_bias sizes its repeat_interleave from the buffer rows,
+            # so the bias add would trip a device-side size assert. Keep such models on the blocking path.
+            raise ValueError(
+                "dispatcher_capacity_factor is not supported for experts with expert_bias=True; "
+                "leave it at None (blocking HybridEP dispatch) for this model."
+            )
 
         # Allocate projection tensor - size depends on whether activation is gated
         # Gated (SwiGLU, Quick-GEGLU): [n_experts, dim, 2*inter_dim]
