@@ -18,6 +18,7 @@ import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 
 from nemo_automodel.components.models.common import BackendConfig
@@ -383,12 +384,15 @@ def test_pp_cp_global_masks_keep_vision_execution_and_local_mapping_in_lockstep(
         torch.testing.assert_close(output, expected)
 
 
-def test_state_adapter_keeps_visual_weights_in_checkpoint_dtype():
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_state_adapter_keeps_visual_weights_in_checkpoint_dtype(dtype):
     config = _model_config()
+    config.dtype = dtype
     backend = _backend()
     backend.enable_hf_state_dict_adapter = True
     model = MiMoV2ForCausalLM(config, backend=backend)
     weight = model.visual.blocks[0].attn.qkv.weight
+    assert weight.dtype == dtype
 
     converted = model.state_dict_adapter.convert_single_tensor_to_hf(
         "visual.blocks.0.attn.qkv.weight",
@@ -398,4 +402,4 @@ def test_state_adapter_keeps_visual_weights_in_checkpoint_dtype():
     )
 
     assert converted == [("visual.blocks.0.attn.qkv.weight", weight)]
-    assert converted[0][1].dtype == torch.bfloat16
+    assert converted[0][1].dtype == dtype

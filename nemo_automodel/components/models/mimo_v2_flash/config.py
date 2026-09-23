@@ -147,7 +147,6 @@ class MiMoV2FlashConfig(PretrainedConfig):
         self.routed_scaling_factor = 1.0 if routed_scaling_factor is None else routed_scaling_factor
         self.apply_router_weight_after_down = apply_router_weight_after_down
         self.moe_layer_freq = moe_layer_freq if moe_layer_freq is not None else [0] + [1] * (num_hidden_layers - 1)
-        self.torch_dtype = torch_dtype
         self.vision_config = vision_config
         self.audio_config = audio_config
         self.processor_config = processor_config
@@ -161,6 +160,7 @@ class MiMoV2FlashConfig(PretrainedConfig):
         super().__init__(
             tie_word_embeddings=tie_word_embeddings,
             use_cache=use_cache,
+            torch_dtype=torch_dtype,
             **kwargs,
         )
 
