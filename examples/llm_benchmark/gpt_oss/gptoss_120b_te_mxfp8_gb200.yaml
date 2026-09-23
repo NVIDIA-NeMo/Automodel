@@ -35,7 +35,7 @@
 #   local_batch_size=8, GBS=1280 (GA=5), activation_checkpointing=true, seq_len=4096.
 #   -> 6.918 s/iter, 14.38% MFU@5000, 132.5 GB peak (loss descends 12.75->12.40).
 # peak_tflops=5000 (GB200 MXFP8/FP8 dense peak) so MFU is reported against the FP8
-# roofline, not the bf16 2500 peak the gmm/bf16 configs use.
+# roofline, not the bf16 2500 peak the torch_mm/bf16 configs use.
 
 recipe: BenchmarkingRecipeForNextTokenPrediction
 

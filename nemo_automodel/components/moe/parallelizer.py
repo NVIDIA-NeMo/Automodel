@@ -908,7 +908,7 @@ def apply_fsdp(
             # shards than experts (dim=0).
             # Preserve the enclosing policy's parameter, reduction, and input-cast
             # settings so FP32 master weights still compute in param_dtype (required
-            # by BF16 GMM / TE kernels). Experts are an internal FSDP boundary, so
+            # by BF16 grouped-MM / TE kernels). Experts are an internal FSDP boundary, so
             # their policy does not override the activation dtype returned to the
             # rest of the block.
             fully_shard(

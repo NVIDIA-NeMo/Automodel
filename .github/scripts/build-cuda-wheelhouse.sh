@@ -16,6 +16,10 @@
 
 set -euxo pipefail
 
+# The optional TE NCCL-EP binding includes private PyTorch symmetric-memory
+# headers that are not shipped in the public PyTorch wheel used here.
+export NVTE_WITH_NCCL_EP=0
+
 : "${TORCH_CU_INDEX:?TORCH_CU_INDEX must be set}"
 : "${WHEELHOUSE_DIR:?WHEELHOUSE_DIR must be set}"
 : "${PYTHON_VERSION:?PYTHON_VERSION must be set}"

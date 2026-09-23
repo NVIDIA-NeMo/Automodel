@@ -129,6 +129,9 @@ jobs:
           PAT: ${{ secrets.PAT }}
           UV_PROJECT_ENVIRONMENT: ./venv
           TORCH_CUDA_ARCH_LIST: "9.0 10.0 12.0"
+          # TE's optional NCCL-EP binding requires private PyTorch headers that
+          # are not included in the public wheel used by this source build.
+          NVTE_WITH_NCCL_EP: "0"
         shell: bash
         run: |
           echo -e "machine github.com\n  login token\n  password ${{ secrets.PAT }}" > ~/.netrc
@@ -239,7 +242,6 @@ jobs:
           test -n "$(ls -1 "${WHEELHOUSE_DIR}"/causal_conv1d*.whl 2>/dev/null)"
           test -n "$(ls -1 "${WHEELHOUSE_DIR}"/flash_attn*.whl 2>/dev/null)"
           test -n "$(ls -1 "${WHEELHOUSE_DIR}"/mamba_ssm*.whl 2>/dev/null)"
-          test -n "$(ls -1 "${WHEELHOUSE_DIR}"/nv_grouped_gemm*.whl 2>/dev/null)"
           test -n "$(ls -1 "${WHEELHOUSE_DIR}"/transformer_engine_torch*.whl 2>/dev/null)"
 
       - name: Upload CUDA wheelhouse artifact

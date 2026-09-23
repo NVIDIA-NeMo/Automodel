@@ -24,14 +24,6 @@ from torch.autograd import Function
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 
-from nemo_automodel.components.moe.optimized_ops import _apply_router_weight_fp32, _compile_router_weight_cores
-from nemo_automodel.components.moe.state_dict_utils import create_dtensor_from_local
-
-try:
-    from grouped_gemm import ops
-except ImportError:
-    print("grouped_gemm is not available. Please run:pip install git+https://github.com/fanshiqing/grouped_gemm@v1.1.4")
-
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.megatron.moe_utils import (
     weighted_bias_geglu_impl,
@@ -39,6 +31,8 @@ from nemo_automodel.components.moe.megatron.moe_utils import (
 )
 from nemo_automodel.components.moe.megatron.token_dispatcher import MoEFlexTokenDispatcher, TokenDispatcherConfig
 from nemo_automodel.components.moe.mxfp8 import select_grouped_mm
+from nemo_automodel.components.moe.optimized_ops import _apply_router_weight_fp32, _compile_router_weight_cores
+from nemo_automodel.components.moe.state_dict_utils import create_dtensor_from_local
 from nemo_automodel.shared.import_utils import safe_import
 
 _HAVE_TRITON, triton = safe_import("triton")
@@ -402,7 +396,8 @@ class GroupedExperts(nn.Module):
 
     Supports two compute backends:
     - Per-expert loop with gather/scatter (default)
-    - torch._grouped_mm with argsort-based permutation (backend.experts="torch_mm")
+    - torch._grouped_mm with argsort-based permutation (backend.experts="torch_mm";
+      "gmm" remains a deprecated compatibility alias)
 
     Attributes:
         n_routed_experts (int): Total number of experts in the model.
@@ -416,7 +411,7 @@ class GroupedExperts(nn.Module):
 
         Args:
             config: MoE configuration containing expert parameters.
-            backend: Backend configuration. When backend.experts == "torch_mm",
+            backend: Backend configuration. When backend.experts is "torch_mm",
                 uses torch._grouped_mm instead of per-expert loop.
         """
         super().__init__()
@@ -424,9 +419,10 @@ class GroupedExperts(nn.Module):
         self.n_routed_experts = config.n_routed_experts
         self.expert_bias = config.expert_bias
         self.is_gated = is_gated_activation(config.expert_activation)
-        # "torch_mm_mxfp8" dispatches identically to "torch_mm" but routes the grouped
+        # "gmm" is a deprecated compatibility alias for "torch_mm".
+        # "torch_mm_mxfp8" dispatches identically but routes the grouped
         # GEMMs through torchao's MXFP8 kernel (see _torch_mm_experts_fwd).
-        self.use_torch_mm = backend is not None and backend.experts in ("torch_mm", "torch_mm_mxfp8")
+        self.use_torch_mm = backend is not None and backend.experts in ("gmm", "torch_mm", "torch_mm_mxfp8")
         self.use_mxfp8 = backend is not None and backend.experts == "torch_mm_mxfp8"
         if backend is not None and getattr(backend, "compile_router_weight", False):
             _compile_router_weight_cores()
@@ -498,7 +494,7 @@ class GroupedExperts(nn.Module):
 
         # Cast expert weights to the activation dtype so that fp32-stored
         # parameters (e.g. under fp32 master weights) still work with kernels
-        # (grouped_gemm / torch._grouped_mm) that require matching dtypes with
+        # torch._grouped_mm requires matching dtypes with
         # the (typically bf16) activations. When the weights are already in the
         # activation dtype these casts are no-ops.
         compute_dtype = x.dtype
@@ -910,9 +906,8 @@ class GroupedExpertsDeepEP(nn.Module):
     """
     Sparse MoE implementation using grouped GEMM with DeepEP token dispatch.
 
-    Supports two GEMM backends via BackendConfig.experts:
-    - grouped_gemm.ops.gmm (experts="gmm", default)
-    - torch._grouped_mm (experts="torch_mm", no external dependency)
+    Uses torch._grouped_mm for the canonical ``experts="torch_mm"`` backend.
+    ``experts="gmm"`` remains a deprecated compatibility alias.
 
     Once the experts for a particular token have been identified, this module
     is invoked to compute and average the output of the activated experts.
@@ -937,8 +932,8 @@ class GroupedExpertsDeepEP(nn.Module):
 
         Args:
             config: MoE configuration containing expert parameters.
-            backend: Backend configuration. When backend.experts == "torch_mm",
-                uses torch._grouped_mm; otherwise uses grouped_gemm.ops.gmm.
+            backend: Backend configuration. ``torch_mm`` and its deprecated ``gmm``
+                compatibility alias both use torch._grouped_mm.
             dispatcher_backend: Backend for the flex token dispatcher ("deepep" or "hybridep").
             dispatcher_num_sms: Number of SMs to use for the dispatcher backend.
             dispatcher_share_token_dispatcher: Whether to share a flex dispatcher communication manager across layers.
@@ -947,16 +942,15 @@ class GroupedExpertsDeepEP(nn.Module):
         super().__init__()
 
         self.config = config
-        # "torch_mm_mxfp8" dispatches identically to "torch_mm" but routes the grouped
+        # This module is always a native grouped-MM implementation. "torch_mm_mxfp8"
+        # routes the grouped
         # GEMMs through torchao's MXFP8 kernel (see _torch_mm_experts_fwd).
-        self.use_torch_mm = backend is not None and backend.experts in ("torch_mm", "torch_mm_mxfp8")
         self.use_mxfp8 = backend is not None and backend.experts == "torch_mm_mxfp8"
         if backend is not None and getattr(backend, "compile_router_weight", False):
             _compile_router_weight_cores()
         # Benchmark-only (BackendConfig.benchmark_static_routing, validated there): routing
         # metadata is identical per microbatch, so host copies of it can be cached.
         self.static_routing = backend is not None and backend.benchmark_static_routing
-        self._static_tokens_per_expert_cpu: torch.Tensor | None = None
         self.expert_bias = config.expert_bias
         self.is_gated = is_gated_activation(config.expert_activation)
         self.dispatcher_backend = dispatcher_backend
@@ -1066,7 +1060,7 @@ class GroupedExpertsDeepEP(nn.Module):
 
         # Cast expert weights to the activation dtype so that fp32-stored
         # parameters (e.g. under fp32 master weights) still work with kernels
-        # (grouped_gemm / torch._grouped_mm) that require matching dtypes with
+        # torch._grouped_mm requires matching dtypes with
         # the (typically bf16) activations. When the weights are already in the
         # activation dtype these casts are no-ops.
         compute_dtype = permuted_local_hidden_states.dtype
@@ -1077,77 +1071,42 @@ class GroupedExpertsDeepEP(nn.Module):
         # construction, so the count_nonzero device-to-host read (one per microbatch, and
         # again per activation-checkpoint recompute) can be skipped.
         if self.static_routing or torch.count_nonzero(tokens_per_expert) > 0:
-            if self.use_torch_mm:
-                tokens_per_expert_gpu = tokens_per_expert.to(
-                    device=permuted_local_hidden_states.device, non_blocking=True
-                )
+            tokens_per_expert_gpu = tokens_per_expert.to(device=permuted_local_hidden_states.device, non_blocking=True)
 
-                if self.expert_bias:
-                    # torch._grouped_mm does not support bias yet (raises
-                    # "RuntimeError: Bias not supported yet" as of PyTorch 2.10).
-                    # Apply bias manually after each grouped GEMM via _apply_bias.
-                    # select_grouped_mm routes through torchao MXFP8 (with the contiguous-
-                    # operand relayout) when use_mxfp8, else plain torch._grouped_mm.
-                    offs = tokens_per_expert_gpu.cumsum(dim=0).to(torch.int32)
-                    grouped_mm = select_grouped_mm(self.use_mxfp8)
-                    output1 = grouped_mm(permuted_local_hidden_states, gate_and_up_projs, offs)
-                    gate_up_proj_bias = self.gate_up_proj_bias.to_local()
-                    # MXFP8: the grouped_mm wrapper clamps its quant input (see
-                    # select_grouped_mm) so a bias-shifted value can't overflow the e8m0
-                    # block scale -> nan (seen on gpt-oss). The bias-add stays a bf16
-                    # separate add (torchao v0.17.0 has no bias arg). bf16 path unchanged.
-                    output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
-                    output1 = self.expert_activation(output1, activation_probs)
-                    output2 = grouped_mm(output1, down_projs, offs)
-                    down_bias = self.down_proj_bias.to_local()
-                    output2 = _apply_bias(
-                        output2,
-                        down_bias,
-                        tokens_per_expert,
-                        None if self.config.apply_router_weight_after_down else permuted_probs,
-                    )
-                else:
-                    output2 = _torch_mm_experts_fwd(
-                        permuted_local_hidden_states,
-                        gate_and_up_projs,
-                        down_projs,
-                        tokens_per_expert_gpu,
-                        activation_probs,
-                        self.expert_activation,
-                        use_mxfp8=self.use_mxfp8,
-                    )
+            if self.expert_bias:
+                # torch._grouped_mm does not support bias yet (raises
+                # "RuntimeError: Bias not supported yet" as of PyTorch 2.10).
+                # Apply bias manually after each grouped GEMM via _apply_bias.
+                # select_grouped_mm routes through torchao MXFP8 (with the contiguous-
+                # operand relayout) when use_mxfp8, else plain torch._grouped_mm.
+                offs = tokens_per_expert_gpu.cumsum(dim=0).to(torch.int32)
+                grouped_mm = select_grouped_mm(self.use_mxfp8)
+                output1 = grouped_mm(permuted_local_hidden_states, gate_and_up_projs, offs)
+                gate_up_proj_bias = self.gate_up_proj_bias.to_local()
+                # MXFP8: the grouped_mm wrapper clamps its quant input (see
+                # select_grouped_mm) so a bias-shifted value can't overflow the e8m0
+                # block scale -> nan (seen on gpt-oss). The bias-add stays a bf16
+                # separate add (torchao v0.17.0 has no bias arg). bf16 path unchanged.
+                output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
+                output1 = self.expert_activation(output1, activation_probs)
+                output2 = grouped_mm(output1, down_projs, offs)
+                down_bias = self.down_proj_bias.to_local()
+                output2 = _apply_bias(
+                    output2,
+                    down_bias,
+                    tokens_per_expert,
+                    None if self.config.apply_router_weight_after_down else permuted_probs,
+                )
             else:
-                # ops.gmm sizes its launches from a CPU copy of tokens_per_expert; under
-                # static routing the first microbatch's copy is reused to avoid the
-                # per-microbatch device-to-host transfer.
-                if self.static_routing and self._static_tokens_per_expert_cpu is not None:
-                    tokens_per_expert = self._static_tokens_per_expert_cpu
-                else:
-                    tokens_per_expert = tokens_per_expert.to("cpu")
-                    if self.static_routing:
-                        self._static_tokens_per_expert_cpu = tokens_per_expert
-                output1 = ops.gmm(
+                output2 = _torch_mm_experts_fwd(
                     permuted_local_hidden_states,
                     gate_and_up_projs,
-                    tokens_per_expert,
-                    trans_b=False,
+                    down_projs,
+                    tokens_per_expert_gpu,
+                    activation_probs,
+                    self.expert_activation,
+                    use_mxfp8=self.use_mxfp8,
                 )
-
-                if self.expert_bias:
-                    gate_up_proj_bias = self.gate_up_proj_bias.to_local().to(compute_dtype)
-                    output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
-
-                output1 = self.expert_activation(output1, activation_probs)
-                output2 = ops.gmm(output1, down_projs, tokens_per_expert, trans_b=False)
-
-                if self.expert_bias:
-                    down_bias = self.down_proj_bias.to_local().to(compute_dtype)
-                    output2 = _apply_bias(
-                        output2,
-                        down_bias,
-                        tokens_per_expert,
-                        None if self.config.apply_router_weight_after_down else permuted_probs,
-                    )
         else:
             output1 = torch.matmul(x[0] * 0, gate_and_up_projs[0])
             output1_ = self.expert_activation(output1, activation_probs)

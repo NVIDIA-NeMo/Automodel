@@ -34,16 +34,15 @@ def _lock_contents(
         "flash-attn": "2.8.3",
         "mamba-ssm": "2.3.0",
         "numpy": "1.26.4",
-        "nv-grouped-gemm": "1.1.4.post8",
         "packaging": packaging_version,
         "psutil": "7.1.1",
         "pybind11": "3.0.1",
         "setuptools": "80.10.2",
         "torch": torch_version,
         "torchvision": torchvision_version,
-        "transformer-engine": "2.15.0",
-        "transformer-engine-cu13": "2.15.0",
-        "transformer-engine-torch": "2.15.0",
+        "transformer-engine": "2.19.0",
+        "transformer-engine-cu13": "2.19.0",
+        "transformer-engine-torch": "2.19.0",
         "unrelated-package": unrelated_version,
     }
     packages = []
@@ -101,6 +100,12 @@ def test_lock_manifest_pins_build_and_runtime_requirements(tmp_path):
     assert set(locked_inputs["build_tools"]) <= set(locked_inputs["constraints"])
     assert "torch==2.10.0+cu130" in locked_inputs["constraints"]
     assert "torchvision==0.25.0+cu130" in locked_inputs["constraints"]
+    assert "transformer-engine-torch==2.19.0" in locked_inputs["wheels"]
+
+
+def test_te_wheel_build_disables_optional_nccl_ep():
+    assert "export NVTE_WITH_NCCL_EP=0" in _BUILD_SCRIPT.read_text()
+    assert 'NVTE_WITH_NCCL_EP: "0"' in Path(".github/workflows/install-test.yml").read_text()
 
 
 def test_unrelated_lock_change_preserves_cache_fingerprint(tmp_path):
