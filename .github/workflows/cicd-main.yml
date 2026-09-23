@@ -425,13 +425,14 @@ jobs:
           - test-name: L0_Unit_Tests_GPU_1_of_2
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             cpu-only: false
-            timeout: 30
+            # GPU shards take ~30 minutes before teardown and coverage finish.
+            timeout: 40
             shard-id: 0
             num-shards: 2
           - test-name: L0_Unit_Tests_GPU_2_of_2
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             cpu-only: false
-            timeout: 30
+            timeout: 40
             shard-id: 1
             num-shards: 2
     needs: [pre-flight, cicd-wait-in-queue, cicd-container-build]
