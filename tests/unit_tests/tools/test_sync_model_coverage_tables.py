@@ -322,6 +322,7 @@ def test_model_coverage_pages_use_provider_sections_and_checkpoint_slugs():
     }
     offenders: list[str] = []
     navigated_model_pages: list[Path] = []
+    provider_icons: dict[str, str] = {}
 
     for category in (item for item in model_coverage["contents"] if "section" in item):
         category_slug = str(category.get("slug"))
@@ -340,6 +341,17 @@ def test_model_coverage_pages_use_provider_sections_and_checkpoint_slugs():
             if not index_path.is_file() or _frontmatter_slug(index_path) != expected_provider_route:
                 offenders.append(f"{provider_slug}: invalid provider index route")
 
+            icon = provider.get("icon")
+            if not isinstance(icon, str):
+                offenders.append(f"{provider_slug}: provider section has no icon")
+            else:
+                icon_path = (config_path.parent / icon).resolve()
+                if not icon_path.is_file():
+                    offenders.append(f"{provider_slug}: missing provider icon {icon!r}")
+                previous_icon = provider_icons.setdefault(provider_slug, icon)
+                if previous_icon != icon:
+                    offenders.append(f"{provider_slug}: provider icon must be consistent across categories")
+
             for page in provider.get("contents", []):
                 path = page.get("path")
                 if not isinstance(path, str):
@@ -355,8 +367,11 @@ def test_model_coverage_pages_use_provider_sections_and_checkpoint_slugs():
                     offenders.append(f"{path}: invalid model route {frontmatter_slug!r}")
                     continue
                 model_id = frontmatter_slug.rsplit("/", 1)[1]
-                if page.get("page") != model_id:
-                    offenders.append(f"{path}: sidebar label must be the model ID {model_id!r}")
+                sidebar_label = page.get("page")
+                if not isinstance(sidebar_label, str) or not sidebar_label:
+                    offenders.append(f"{path}: model entry has no sidebar label")
+                elif sidebar_label[0].islower():
+                    offenders.append(f"{path}: sidebar label must use human-readable capitalization")
                 document = model_path.read_text(encoding="utf-8")
                 hf_models = re.findall(
                     r"https://huggingface\.co/[A-Za-z0-9_.-]+/([A-Za-z0-9_.-]+)",

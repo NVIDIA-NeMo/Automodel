@@ -58,22 +58,25 @@ navigation:
             path: ../../model-coverage/llm/index.mdx
             slug: overview
           - section: "Meta"
+            icon: ../assets/providers/meta.webp
             slug: meta
             path: ../../model-coverage/llm/meta/index.mdx
             contents:
-              - page: "Llama-3.2-1B"
+              - page: "Llama"
                 path: ../../model-coverage/llm/meta/llama.mdx
           - section: "Google"
+            icon: ../assets/providers/google.webp
             slug: google
             path: ../../model-coverage/llm/google/index.mdx
             contents:
-              - page: "gemma-7b"
+              - page: "Gemma 7B"
                 path: ../../model-coverage/llm/google/gemma-1.mdx
-              - page: "gemma-2-9b-it"
+              - page: "Gemma 2 9B IT"
                 path: ../../model-coverage/llm/google/gemma-2.mdx
-              - page: "functiongemma-270m-it"
+              - page: "FunctionGemma 270M IT"
                 path: ../../model-coverage/llm/google/functiongemma.mdx
           - section: "Qwen"
+            icon: ../assets/providers/qwen.webp
             slug: qwen
             path: ../../model-coverage/llm/qwen/index.mdx
             contents:
@@ -92,16 +95,18 @@ navigation:
               - page: "Qwen3-Next-80B-A3B-Instruct"
                 path: ../../model-coverage/llm/qwen/qwen3-next.mdx
           - section: "Baidu"
+            icon: ../assets/providers/baidu.webp
             slug: baidu
             path: ../../model-coverage/llm/baidu/index.mdx
             contents:
               - page: "ERNIE-4.5-0.3B-PT"
                 path: ../../model-coverage/llm/baidu/ernie4-5.mdx
           - section: "DeepSeek AI"
+            icon: ../assets/providers/deepseek-ai.webp
             slug: deepseek-ai
             path: ../../model-coverage/llm/deepseek-ai/index.mdx
             contents:
-              - page: "deepseek-llm-7b-chat"
+              - page: "DeepSeek LLM 7B Chat"
                 path: ../../model-coverage/llm/deepseek-ai/deepseek.mdx
               - page: "DeepSeek-V3"
                 path: ../../model-coverage/llm/deepseek-ai/deepseek-v3.mdx
@@ -112,6 +117,7 @@ navigation:
               - page: "DeepSeek-V4.1-Flash"
                 path: ../../model-coverage/llm/deepseek-ai/deepseek-v41-flash.mdx
           - section: "Mistral AI"
+            icon: ../assets/providers/mistralai.webp
             slug: mistralai
             path: ../../model-coverage/llm/mistralai/index.mdx
             contents:
@@ -122,16 +128,18 @@ navigation:
               - page: "Ministral-3-3B-Instruct-2512"
                 path: ../../model-coverage/llm/mistralai/ministral3.mdx
           - section: "Microsoft"
+            icon: ../assets/providers/microsoft.webp
             slug: microsoft
             path: ../../model-coverage/llm/microsoft/index.mdx
             contents:
-              - page: "phi-2"
+              - page: "Phi-2"
                 path: ../../model-coverage/llm/microsoft/phi.mdx
               - page: "Phi-4"
                 path: ../../model-coverage/llm/microsoft/phi3.mdx
               - page: "Phi-3-small-8k-instruct"
                 path: ../../model-coverage/llm/microsoft/phi3-small.mdx
           - section: "NVIDIA"
+            icon: ../assets/providers/nvidia.webp
             slug: nvidia
             path: ../../model-coverage/llm/nvidia/index.mdx
             contents:
@@ -144,28 +152,31 @@ navigation:
               - page: "Llama-3_3-Nemotron-Super-49B-v1"
                 path: ../../model-coverage/llm/nvidia/nemotron-super.mdx
           - section: "Z.ai"
+            icon: ../assets/providers/thudm.webp
             slug: thudm
             path: ../../model-coverage/llm/thudm/index.mdx
             contents:
-              - page: "chatglm3-6b"
+              - page: "ChatGLM3 6B"
                 path: ../../model-coverage/llm/thudm/chatglm.mdx
-              - page: "glm-4-9b-chat-hf"
+              - page: "GLM-4 9B Chat"
                 path: ../../model-coverage/llm/thudm/glm4.mdx
               - page: "GLM-4.5-Air"
                 path: ../../model-coverage/llm/thudm/glm4-moe.mdx
               - page: "GLM-5"
                 path: ../../model-coverage/llm/thudm/glm5-moe-dsa.mdx
           - section: "IBM"
+            icon: ../assets/providers/ibm.webp
             slug: ibm
             path: ../../model-coverage/llm/ibm/index.mdx
             contents:
-              - page: "granite-3.0-2b-base"
+              - page: "Granite 3.0 2B Base"
                 path: ../../model-coverage/llm/ibm/granite.mdx
-              - page: "granite-3.0-1b-a400m-base"
+              - page: "Granite 3.0 1B A400M Base"
                 path: ../../model-coverage/llm/ibm/granite-moe.mdx
               - page: "Bamba-9B"
                 path: ../../model-coverage/llm/ibm/bamba.mdx
           - section: "Allen AI"
+            icon: ../assets/providers/allenai.webp
             slug: allenai
             path: ../../model-coverage/llm/allenai/index.mdx
             contents:
@@ -176,84 +187,97 @@ navigation:
               - page: "OLMoE-1B-7B-0924"
                 path: ../../model-coverage/llm/allenai/olmoe.mdx
           - section: "OpenAI"
+            icon: ../assets/providers/openai.webp
             slug: openai
             path: ../../model-coverage/llm/openai/index.mdx
             contents:
-              - page: "gpt-oss-20b"
+              - page: "GPT-OSS 20B"
                 path: ../../model-coverage/llm/openai/gpt-oss.mdx
-              - page: "gpt2"
+              - page: "GPT-2"
                 path: ../../model-coverage/llm/openai/gpt2.mdx
           - section: "EleutherAI"
+            icon: ../assets/providers/eleutherai.webp
             slug: eleutherai
             path: ../../model-coverage/llm/eleutherai/index.mdx
             contents:
-              - page: "gpt-j-6b"
+              - page: "GPT-J 6B"
                 path: ../../model-coverage/llm/eleutherai/gpt-j.mdx
-              - page: "gpt-neox-20b"
+              - page: "GPT-NeoX 20B"
                 path: ../../model-coverage/llm/eleutherai/gpt-neox.mdx
           - section: "BigCode"
+            icon: ../assets/providers/bigcode.webp
             slug: bigcode
             path: ../../model-coverage/llm/bigcode/index.mdx
             contents:
-              - page: "starcoder"
+              - page: "StarCoder"
                 path: ../../model-coverage/llm/bigcode/starcoder.mdx
-              - page: "starcoder2-3b"
+              - page: "StarCoder2 3B"
                 path: ../../model-coverage/llm/bigcode/starcoder2.mdx
           - section: "BAAI"
+            icon: ../assets/providers/baai.webp
             slug: baai
             path: ../../model-coverage/llm/baai/index.mdx
             contents:
               - page: "Aquila-7B"
                 path: ../../model-coverage/llm/baai/aquila.mdx
           - section: "Baichuan Inc."
+            icon: ../assets/providers/baichuan-inc.webp
             slug: baichuan-inc
             path: ../../model-coverage/llm/baichuan-inc/index.mdx
             contents:
               - page: "Baichuan2-13B-Chat"
                 path: ../../model-coverage/llm/baichuan-inc/baichuan.mdx
           - section: "Cohere"
+            icon: ../assets/providers/cohere.webp
             slug: cohere
             path: ../../model-coverage/llm/cohere/index.mdx
             contents:
-              - page: "c4ai-command-r-v01"
+              - page: "Command R"
                 path: ../../model-coverage/llm/cohere/command-r.mdx
           - section: "TII"
+            icon: ../assets/providers/tiiuae.webp
             slug: tiiuae
             path: ../../model-coverage/llm/tiiuae/index.mdx
             contents:
-              - page: "falcon-7b"
+              - page: "Falcon 7B"
                 path: ../../model-coverage/llm/tiiuae/falcon.mdx
           - section: "LG AI EXAONE"
+            icon: ../assets/providers/lgai-exaone.webp
             slug: lgai-exaone
             path: ../../model-coverage/llm/lgai-exaone/index.mdx
             contents:
               - page: "EXAONE-3.0-7.8B-Instruct"
                 path: ../../model-coverage/llm/lgai-exaone/exaone.mdx
           - section: "InternLM"
+            icon: ../assets/providers/internlm.webp
             slug: internlm
             path: ../../model-coverage/llm/internlm/index.mdx
             contents:
-              - page: "internlm3-8b-instruct"
+              - page: "InternLM3 8B Instruct"
                 path: ../../model-coverage/llm/internlm/internlm.mdx
           - section: "Inception AI"
+            icon: ../assets/providers/inceptionai.webp
             slug: inceptionai
             path: ../../model-coverage/llm/inceptionai/index.mdx
             contents:
-              - page: "jais-13b"
+              - page: "Jais 13B"
                 path: ../../model-coverage/llm/inceptionai/jais.mdx
           - section: "MiniMax AI"
+            icon: ../assets/providers/minimax.webp
             slug: minimax
             path: ../../model-coverage/llm/minimax/index.mdx
             contents:
               - page: "MiniMax-M2.1"
                 path: ../../model-coverage/llm/minimax/minimax-m2.mdx
           - section: "OpenBMB"
+            icon: ../assets/providers/openbmb.webp
             slug: openbmb
             path: ../../model-coverage/llm/openbmb/index.mdx
             contents:
               - page: "MiniCPM5-1B"
                 path: ../../model-coverage/llm/openbmb/minicpm.mdx
           - section: "Moonshot AI"
+            icon: ../assets/providers/moonshotai.webp
             slug: moonshotai
             path: ../../model-coverage/llm/moonshotai/index.mdx
             contents:
@@ -264,48 +288,56 @@ navigation:
               - page: "Kimi-K3"
                 path: ../../model-coverage/llm/moonshotai/kimi-k3.mdx
           - section: "ByteDance Seed"
+            icon: ../assets/providers/bytedance-seed.webp
             slug: bytedance-seed
             path: ../../model-coverage/llm/bytedance-seed/index.mdx
             contents:
               - page: "Seed-Coder-8B-Instruct"
                 path: ../../model-coverage/llm/bytedance-seed/seed.mdx
           - section: "Upstage"
+            icon: ../assets/providers/upstage.webp
             slug: upstage
             path: ../../model-coverage/llm/upstage/index.mdx
             contents:
-              - page: "solar-pro-preview-instruct"
+              - page: "Solar Pro Preview Instruct"
                 path: ../../model-coverage/llm/upstage/solar.mdx
           - section: "OrionStar AI"
+            icon: ../assets/providers/orionstar.webp
             slug: orionstar
             path: ../../model-coverage/llm/orionstar/index.mdx
             contents:
               - page: "Orion-14B-Base"
                 path: ../../model-coverage/llm/orionstar/orion.mdx
           - section: "Stability AI"
+            icon: ../assets/providers/stabilityai.webp
             slug: stabilityai
             path: ../../model-coverage/llm/stabilityai/index.mdx
             contents:
-              - page: "stablelm-3b-4e1t"
+              - page: "StableLM 3B 4E1T"
                 path: ../../model-coverage/llm/stabilityai/stablelm.mdx
           - section: "Google T5"
+            icon: ../assets/providers/google-t5.webp
             slug: google-t5
             path: ../../model-coverage/llm/google-t5/index.mdx
             contents:
-              - page: "t5-small"
+              - page: "T5 Small"
                 path: ../../model-coverage/llm/google-t5/t5.mdx
           - section: "StepFun AI"
+            icon: ../assets/providers/stepfun-ai.webp
             slug: stepfun-ai
             path: ../../model-coverage/llm/stepfun-ai/index.mdx
             contents:
               - page: "Step-3.5-Flash"
                 path: ../../model-coverage/llm/stepfun-ai/step-3-5.mdx
           - section: "ParaSail AI"
+            icon: ../assets/providers/parasail-ai.webp
             slug: parasail-ai
             path: ../../model-coverage/llm/parasail-ai/index.mdx
             contents:
               - page: "GritLM-7B-vllm"
                 path: ../../model-coverage/llm/parasail-ai/gritlm.mdx
           - section: "Tencent"
+            icon: ../assets/providers/tencent.webp
             slug: tencent
             path: ../../model-coverage/llm/tencent/index.mdx
             contents:
@@ -314,18 +346,21 @@ navigation:
               - page: "Hy-MT2-30B-A3B"
                 path: ../../model-coverage/llm/tencent/hy-mt2.mdx
           - section: "XiaomiMiMo"
+            icon: ../assets/providers/xiaomimimo.webp
             slug: xiaomimimo
             path: ../../model-coverage/llm/xiaomimimo/index.mdx
             contents:
               - page: "MiMo-V2-Flash"
                 path: ../../model-coverage/llm/xiaomimimo/mimo-v2-flash.mdx
           - section: "Inclusion AI"
+            icon: ../assets/providers/inclusionai.webp
             slug: inclusionai
             path: ../../model-coverage/llm/inclusionai/index.mdx
             contents:
               - page: "Ling-mini-2.0"
                 path: ../../model-coverage/llm/inclusionai/ling-2.mdx
           - section: "Poolside"
+            icon: ../assets/providers/poolside.webp
             slug: poolside
             path: ../../model-coverage/llm/poolside/index.mdx
             contents:
@@ -338,12 +373,14 @@ navigation:
             path: ../../model-coverage/vlm/index.mdx
             slug: overview
           - section: "Muse"
+            icon: ../assets/providers/muse.webp
             slug: muse
             path: ../../model-coverage/vlm/muse/index.mdx
             contents:
               - page: "Muse-Glimmer-30B"
                 path: ../../model-coverage/vlm/muse/muse_glimmer.mdx
           - section: "Moonshot AI"
+            icon: ../assets/providers/moonshotai.webp
             slug: moonshotai
             path: ../../model-coverage/vlm/moonshotai/index.mdx
             contents:
@@ -352,26 +389,30 @@ navigation:
               - page: "Kimi-K3"
                 path: ../../model-coverage/vlm/moonshotai/kimi-k3.mdx
           - section: "Cohere Labs"
+            icon: ../assets/providers/coherelabs.webp
             slug: coherelabs
             path: ../../model-coverage/vlm/coherelabs/index.mdx
             contents:
               - page: "North-Micro-Vision-Instruct"
                 path: ../../model-coverage/vlm/coherelabs/north-micro-vision.mdx
           - section: "Thinking Machines"
+            icon: ../assets/providers/thinkingmachines.webp
             slug: thinkingmachines
             path: ../../model-coverage/vlm/thinkingmachines/index.mdx
             contents:
               - page: "Inkling"
                 path: ../../model-coverage/vlm/thinkingmachines/inkling.mdx
           - section: "Google"
+            icon: ../assets/providers/google.webp
             slug: google
             path: ../../model-coverage/vlm/google/index.mdx
             contents:
-              - page: "gemma-3-270m"
+              - page: "Gemma 3 270M"
                 path: ../../model-coverage/vlm/google/gemma3-vl.mdx
-              - page: "gemma-4-12B"
+              - page: "Gemma 4 12B"
                 path: ../../model-coverage/vlm/google/gemma4.mdx
           - section: "Qwen"
+            icon: ../assets/providers/qwen.webp
             slug: qwen
             path: ../../model-coverage/vlm/qwen/index.mdx
             contents:
@@ -386,12 +427,14 @@ navigation:
               - page: "Qwen3.8-27B"
                 path: ../../model-coverage/vlm/qwen/qwen3-8-vl.mdx
           - section: "NVIDIA"
+            icon: ../assets/providers/nvidia.webp
             slug: nvidia
             path: ../../model-coverage/vlm/nvidia/index.mdx
             contents:
               - page: "NVIDIA-Nemotron-Parse-v1.1"
                 path: ../../model-coverage/vlm/nvidia/nemotron-parse.mdx
           - section: "Mistral AI"
+            icon: ../assets/providers/mistralai.webp
             slug: mistralai
             path: ../../model-coverage/vlm/mistralai/index.mdx
             contents:
@@ -402,48 +445,56 @@ navigation:
               - page: "Mistral-Small-4-119B-2603"
                 path: ../../model-coverage/vlm/mistralai/mistral-small-4.mdx
           - section: "InternLM"
+            icon: ../assets/providers/internlm.webp
             slug: internlm
             path: ../../model-coverage/vlm/internlm/index.mdx
             contents:
               - page: "InternVL3_5-4B"
                 path: ../../model-coverage/vlm/internlm/internvl.mdx
           - section: "Meta"
+            icon: ../assets/providers/meta.webp
             slug: meta
             path: ../../model-coverage/vlm/meta/index.mdx
             contents:
               - page: "Llama-4-Scout-17B-16E-Instruct"
                 path: ../../model-coverage/vlm/meta/llama4.mdx
           - section: "LMMS Lab"
+            icon: ../assets/providers/lmms-lab.webp
             slug: lmms-lab
             path: ../../model-coverage/vlm/lmms-lab/index.mdx
             contents:
               - page: "LLaVA-OneVision-1.5-4B-Instruct"
                 path: ../../model-coverage/vlm/lmms-lab/llava-onevision.mdx
           - section: "Hugging Face"
+            icon: ../assets/providers/huggingface.webp
             slug: huggingface
             path: ../../model-coverage/vlm/huggingface/index.mdx
             contents:
               - page: "SmolVLM-Instruct"
                 path: ../../model-coverage/vlm/huggingface/smolvlm.mdx
           - section: "LLaVA HF"
+            icon: ../assets/providers/llava-hf.webp
             slug: llava-hf
             path: ../../model-coverage/vlm/llava-hf/index.mdx
             contents:
-              - page: "llava-1.5-7b-hf"
+              - page: "LLaVA 1.5 7B HF"
                 path: ../../model-coverage/vlm/llava-hf/llava.mdx
           - section: "StepFun AI"
+            icon: ../assets/providers/stepfun-ai.webp
             slug: stepfun-ai
             path: ../../model-coverage/vlm/stepfun-ai/index.mdx
             contents:
               - page: "Step-3.7-Flash"
                 path: ../../model-coverage/vlm/stepfun-ai/step-3-7.mdx
           - section: "MiniMax AI"
+            icon: ../assets/providers/minimax.webp
             slug: minimax
             path: ../../model-coverage/vlm/minimax/index.mdx
             contents:
               - page: "MiniMax-M3"
                 path: ../../model-coverage/vlm/minimax/minimax-m3.mdx
           - section: "Z.ai"
+            icon: ../assets/providers/thudm.webp
             slug: thudm
             path: ../../model-coverage/vlm/thudm/index.mdx
             contents:
@@ -456,6 +507,7 @@ navigation:
             path: ../../model-coverage/multimodal/index.mdx
             slug: overview
           - section: "ByteDance Seed"
+            icon: ../assets/providers/bytedance-seed.webp
             slug: bytedance-seed
             path: ../../model-coverage/multimodal/bytedance-seed/index.mdx
             contents:
@@ -468,6 +520,7 @@ navigation:
             path: ../../model-coverage/omni/index.mdx
             slug: overview
           - section: "Qwen"
+            icon: ../assets/providers/qwen.webp
             slug: qwen
             path: ../../model-coverage/omni/qwen/index.mdx
             contents:
@@ -476,12 +529,14 @@ navigation:
               - page: "Qwen2.5-Omni-3B"
                 path: ../../model-coverage/omni/qwen/qwen2-5-omni.mdx
           - section: "Microsoft"
+            icon: ../assets/providers/microsoft.webp
             slug: microsoft
             path: ../../model-coverage/omni/microsoft/index.mdx
             contents:
               - page: "Phi-4-multimodal-instruct"
                 path: ../../model-coverage/omni/microsoft/phi4-multimodal.mdx
           - section: "NVIDIA"
+            icon: ../assets/providers/nvidia.webp
             slug: nvidia
             path: ../../model-coverage/omni/nvidia/index.mdx
             contents:
@@ -496,36 +551,42 @@ navigation:
             path: ../../model-coverage/dllm/index.mdx
             slug: overview
           - section: "Google"
+            icon: ../assets/providers/google.webp
             slug: google
             path: ../../model-coverage/dllm/google/index.mdx
             contents:
-              - page: "diffusiongemma-26B-A4B-it"
+              - page: "DiffusionGemma 26B A4B IT"
                 path: ../../model-coverage/dllm/google/diffusiongemma.mdx
           - section: "GSAI ML"
+            icon: ../assets/providers/gsai-ml.webp
             slug: gsai-ml
             path: ../../model-coverage/dllm/gsai-ml/index.mdx
             contents:
               - page: "LLaDA-8B-Base"
                 path: ../../model-coverage/dllm/gsai-ml/llada.mdx
           - section: "Inclusion AI"
+            icon: ../assets/providers/inclusionai.webp
             slug: inclusionai
             path: ../../model-coverage/dllm/inclusionai/index.mdx
             contents:
               - page: "LLaDA2.1-mini"
                 path: ../../model-coverage/dllm/inclusionai/llada2.mdx
           - section: "NVIDIA"
+            icon: ../assets/providers/nvidia.webp
             slug: nvidia
             path: ../../model-coverage/dllm/nvidia/index.mdx
             contents:
               - page: "Nemotron-Labs-Diffusion-8B-Base"
                 path: ../../model-coverage/dllm/nvidia/nemotron-labs-diffusion.mdx
           - section: "Z Lab"
+            icon: ../assets/providers/z-lab.webp
             slug: z-lab
             path: ../../model-coverage/dllm/z-lab/index.mdx
             contents:
               - page: "Qwen3-4B-DFlash-b16"
                 path: ../../model-coverage/dllm/z-lab/dflash.mdx
           - section: "Qwen"
+            icon: ../assets/providers/qwen.webp
             slug: qwen
             path: ../../model-coverage/dllm/qwen/index.mdx
             contents:
@@ -538,6 +599,7 @@ navigation:
             path: ../../model-coverage/diffusion/index.mdx
             slug: overview
           - section: "Wan AI"
+            icon: ../assets/providers/wan-ai.webp
             slug: wan-ai
             path: ../../model-coverage/diffusion/wan-ai/index.mdx
             contents:
@@ -546,6 +608,7 @@ navigation:
               - page: "Wan2.2-T2V-A14B-Diffusers"
                 path: ../../model-coverage/diffusion/wan-ai/wan2-2-t2v.mdx
           - section: "Black Forest Labs"
+            icon: ../assets/providers/black-forest-labs.webp
             slug: black-forest-labs
             path: ../../model-coverage/diffusion/black-forest-labs/index.mdx
             contents:
@@ -554,24 +617,28 @@ navigation:
               - page: "FLUX.2-dev"
                 path: ../../model-coverage/diffusion/black-forest-labs/flux2.mdx
           - section: "HunyuanVideo Community"
+            icon: ../assets/providers/hunyuanvideo-community.webp
             slug: hunyuanvideo-community
             path: ../../model-coverage/diffusion/hunyuanvideo-community/index.mdx
             contents:
               - page: "HunyuanVideo-1.5-Diffusers-720p_t2v"
                 path: ../../model-coverage/diffusion/hunyuanvideo-community/hunyuanvideo.mdx
           - section: "Lightricks"
+            icon: ../assets/providers/lightricks.webp
             slug: lightricks
             path: ../../model-coverage/diffusion/lightricks/index.mdx
             contents:
               - page: "LTX-2.3"
                 path: ../../model-coverage/diffusion/lightricks/ltx-2-3.mdx
           - section: "Qwen"
+            icon: ../assets/providers/qwen.webp
             slug: qwen
             path: ../../model-coverage/diffusion/qwen/index.mdx
             contents:
               - page: "Qwen-Image"
                 path: ../../model-coverage/diffusion/qwen/qwen-image.mdx
           - section: "Diffusers"
+            icon: ../assets/providers/diffusers.webp
             slug: diffusers
             path: ../../model-coverage/diffusion/diffusers/index.mdx
             contents:
@@ -584,12 +651,14 @@ navigation:
             path: ../../model-coverage/embedding/index.mdx
             slug: overview
           - section: "NVIDIA"
+            icon: ../assets/providers/nvidia.webp
             slug: nvidia
             path: ../../model-coverage/embedding/nvidia/index.mdx
             contents:
-              - page: "llama-embed-nemotron-8b"
+              - page: "Llama Embed Nemotron 8B"
                 path: ../../model-coverage/embedding/nvidia/llama-bidirectional.mdx
           - section: "Mistral AI"
+            icon: ../assets/providers/mistralai.webp
             slug: mistralai
             path: ../../model-coverage/embedding/mistralai/index.mdx
             contents:
@@ -602,10 +671,11 @@ navigation:
             path: ../../model-coverage/reranker/index.mdx
             slug: overview
           - section: "NVIDIA"
+            icon: ../assets/providers/nvidia.webp
             slug: nvidia
             path: ../../model-coverage/reranker/nvidia/index.mdx
             contents:
-              - page: "llama-nemotron-rerank-1b-v2"
+              - page: "Llama Nemotron Rerank 1B v2"
                 path: ../../model-coverage/reranker/nvidia/llama-bidirectional.mdx
       - page: "Troubleshooting"
         path: ../../model-coverage/troubleshooting.mdx
