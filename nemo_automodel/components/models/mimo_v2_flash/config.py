@@ -14,7 +14,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from typing import ClassVar
+
 from transformers import PretrainedConfig
+
+from nemo_automodel.components.models.mimo_v2_flash.flops import mimo_v2_flops
 
 
 class MiMoV2FlashConfig(PretrainedConfig):
@@ -24,6 +29,8 @@ class MiMoV2FlashConfig(PretrainedConfig):
     Automodel registers this local config with the hub's JSON ``model_type`` so
     configs can resolve without executing remote code.
     """
+
+    flops_formula: ClassVar[Callable[..., float]] = staticmethod(mimo_v2_flops)
 
     model_type = "mimo_v2_flash"
     keys_to_ignore_at_inference = ["past_key_values"]

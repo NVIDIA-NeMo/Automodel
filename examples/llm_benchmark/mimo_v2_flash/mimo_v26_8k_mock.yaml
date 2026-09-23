@@ -1,0 +1,133 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Full 48-layer MiMo-V2.6 text benchmark: 8 nodes x 8 H100 SXM GPUs.
+# Mock data, random initialization, non-packed 8192-token sequences.
+# EP64, TP=CP=PP=1, DP64; LBS=2, GBS=128, GA=1.
+# 30 total iterations: 10 warmup + 20 measured.
+# Requires MiMo V2.6 model support from PR #3992. See README.md for MFU scope,
+# kernel/runtime requirements, results and the 8K validation limitation.
+# Launch through the dedicated benchmark recipe:
+# automodel examples/llm_benchmark/mimo_v2_flash/mimo_v26_8k_mock.yaml --nnodes 8 --nproc-per-node 8
+
+recipe: BenchmarkingRecipeForNextTokenPrediction
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1234
+  ranked: true
+
+benchmark:
+  warmup_steps: 10
+  flops_scope: text  # Full 48-layer text backbone; no vision/audio encoder
+  peak_tflops: 989  # H100 SXM BF16 dense peak; no FP8 or sparsity
+  nsys_start: -1
+  nsys_end: -1
+  nsys_ranks: []
+  num_nodes: 8
+  json_output_path: training_logs/mimo26-8k-benchmark.json
+
+step_scheduler:
+  gc_every_steps: 10
+  global_batch_size: 128
+  local_batch_size: 2
+  ckpt_every_steps: 1000
+  val_every_steps: 1000
+  num_epochs: 1
+  max_steps: 30
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 120
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  config:
+    _target_: nemo_automodel.components.models.mimo_v2_flash.config.MiMoV2Config.from_pretrained
+    pretrained_model_name_or_path: XiaomiMiMo/MiMo-V2.6-Flash-RL
+    name_or_path: XiaomiMiMo/MiMo-V2.6-Flash-RL
+    use_cache: false
+    output_hidden_states: true
+    num_nextn_predict_layers: 0
+  trust_remote_code: false
+  torch_dtype: bfloat16
+  use_liger_kernel: false
+  load_base_model: false
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: te
+    linear: te
+    rms_norm: te
+    experts: torch_mm
+    dispatcher: hybridep
+    dispatcher_num_sms: 20
+    rope_fusion: false
+    gate_precision: float32
+    fake_balanced_gate: true  # Benchmark only; bypasses the learned router
+    fake_gate_noise: 0.0
+    benchmark_static_routing: true
+    enable_hf_state_dict_adapter: false
+    enable_fsdp_optimizations: true
+
+checkpoint:
+  enabled: false
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 64
+  sequence_parallel: false
+  activation_checkpointing: true
+  enable_fsdp2_prefetch: true
+  fsdp2_backward_prefetch_depth: 2
+  fsdp2_forward_prefetch_depth: 1
+  reshard_after_forward: true
+  defer_fsdp_grad_sync: false
+  moe:
+    reshard_after_forward: true
+    wrap_outer_model: true
+    ignore_router_for_ac: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDataset
+  seq_len: 8192
+  num_samples: 100000
+  exclude_token_ids: [151643]
+
+dataloader:
+  _target_: torch.utils.data.DataLoader
+  batch_size: null  # MockIterableDataset already yields batches
+  num_workers: 0
+
+optimizer:
+  _target_: transformer_engine.pytorch.optimizers.FusedAdam
+  lr: 5.0e-6
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  weight_decay: 0.1
+  adam_w_mode: true
+
+prewarm:
+  comm_groups: true
+  cublas_backward: true
+
+# Optional W&B logging; opt in with your own project/entity.
+# wandb:
+#   enable: true
+#   project: automodel-mimo-v26
+#   name: mimo26-mock-ep64-8k-lbs2
