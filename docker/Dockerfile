@@ -210,7 +210,7 @@ RUN git clone --filter=blob:none --no-checkout \
         https://github.com/deepseek-ai/FlashMLA.git /tmp/FlashMLA && \
     git -C /tmp/FlashMLA checkout "${FLASH_MLA_REF}" && \
     git -C /tmp/FlashMLA submodule update --init --recursive && \
-    MAX_JOBS=8 NVCC_THREADS=2 \
+    CPLUS_INCLUDE_PATH=/usr/local/cuda/include/cccl MAX_JOBS=8 NVCC_THREADS=2 \
         pip wheel --no-cache-dir --no-build-isolation --no-deps -w /wheels /tmp/FlashMLA && \
     rm -rf /tmp/FlashMLA
 
