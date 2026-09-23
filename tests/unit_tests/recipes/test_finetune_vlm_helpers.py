@@ -43,6 +43,7 @@ from nemo_automodel.recipes._typed_config import (
 from nemo_automodel.recipes.vlm.finetune import (
     FinetuneRecipeForVLM,
     _get_model_name,
+    _maybe_downgrade_loss_fn,
     build_model,
 )
 
@@ -1604,6 +1605,107 @@ def _prepare_pp_vlm_batch(batch, n_microbatches=2):
         batch,
         batch_size=batch["input_ids"].shape[0],
         n_microbatches=n_microbatches,
+    )
+
+
+class _StageWithLogitsToKeep(nn.Module):
+    def forward(self, input_ids=None, logits_to_keep=0, **kwargs):
+        return input_ids
+
+
+class _StageWithoutLogitsToKeep(nn.Module):
+    def forward(self, input_ids=None, **kwargs):
+        return input_ids
+
+
+@pytest.mark.parametrize(
+    "has_logits_to_keep, has_hidden_state_marker, pp_enabled, expect_fused",
+    [
+        (True, True, True, True),
+        (False, True, True, False),
+        (True, False, True, False),
+        (True, False, False, True),
+    ],
+)
+def test_vlm_maybe_downgrade_loss_fn(
+    has_logits_to_keep,
+    has_hidden_state_marker,
+    pp_enabled,
+    expect_fused,
+):
+    from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+    from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+
+    stage_cls = _StageWithLogitsToKeep if has_logits_to_keep else _StageWithoutLogitsToKeep
+    probe = stage_cls()
+    if has_hidden_state_marker:
+        probe._pp_return_hidden_states_supported = True
+
+    result = _maybe_downgrade_loss_fn(
+        FusedLinearCrossEntropy(ignore_index=-7),
+        probe,
+        pp_enabled=pp_enabled,
+    )
+
+    assert isinstance(result, FusedLinearCrossEntropy) is expect_fused
+    if not expect_fused:
+        assert isinstance(result, MaskedCrossEntropy)
+        assert result.ignore_index == -7
+
+
+def test_configure_pipeline_fused_ce_requests_hidden_states():
+    from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+
+    first_stage_model = nn.Linear(2, 2)
+    last_stage_model = nn.Linear(2, 2)
+    recipe = _create_pp_recipe(first_stage_model)
+    recipe.__dict__["model_parts"] = [first_stage_model, last_stage_model]
+    recipe.__dict__["loss_fn"] = FusedLinearCrossEntropy()
+    pipeline_loss = object()
+    build_loss = MagicMock(return_value=pipeline_loss)
+    recipe.__dict__["cfg"] = SimpleNamespace(mtp=SimpleNamespace(build=build_loss))
+    reduce_group = object()
+    recipe.__dict__["_get_dp_group"] = lambda include_cp=True: reduce_group
+    pp = _MockAutoPipeline(has_first_stage=True, has_last_stage=True)
+    pp.info.stages = [SimpleNamespace(is_last=False), SimpleNamespace(is_last=True)]
+    recipe.__dict__["pp"] = pp
+
+    recipe._configure_pipeline_loss_fn()
+
+    assert not hasattr(first_stage_model, "_pp_return_hidden_states")
+    assert last_stage_model._pp_return_hidden_states is True
+    assert pp.info.schedule._loss_fn is pipeline_loss
+    build_loss.assert_called_once_with(
+        recipe.loss_fn,
+        last_stage_model,
+        grad_reduce_group=reduce_group,
+    )
+
+
+def test_configure_pipeline_masked_ce_keeps_logits_output():
+    from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+
+    last_stage_model = nn.Linear(2, 2)
+    recipe = _create_pp_recipe(last_stage_model)
+    recipe.__dict__["model_parts"] = [last_stage_model]
+    recipe.__dict__["loss_fn"] = MaskedCrossEntropy()
+    pipeline_loss = object()
+    build_loss = MagicMock(return_value=pipeline_loss)
+    recipe.__dict__["cfg"] = SimpleNamespace(mtp=SimpleNamespace(build=build_loss))
+    reduce_group = object()
+    recipe.__dict__["_get_dp_group"] = lambda include_cp=True: reduce_group
+    pp = _MockAutoPipeline(has_first_stage=True, has_last_stage=True)
+    pp.info.stages = [SimpleNamespace(is_last=True)]
+    recipe.__dict__["pp"] = pp
+
+    recipe._configure_pipeline_loss_fn()
+
+    assert not hasattr(last_stage_model, "_pp_return_hidden_states")
+    assert pp.info.schedule._loss_fn is pipeline_loss
+    build_loss.assert_called_once_with(
+        recipe.loss_fn,
+        last_stage_model,
+        grad_reduce_group=reduce_group,
     )
 
 
