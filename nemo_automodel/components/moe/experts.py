@@ -372,18 +372,18 @@ class _DeterministicBiasRepeatInterleave(Function):
         return grad_bias, None, None
 
 
-def _reduce_weighted_bias_grad_fallback(
+def _reduce_bias_grad_chunked_fallback(
     grad_output: torch.Tensor,
     token_counts: torch.Tensor,
-    probs: torch.Tensor,
+    probs: torch.Tensor | None,
     output_dtype: torch.dtype,
 ) -> torch.Tensor:
-    """Reduce probability-weighted bias gradients without full-size intermediates.
+    """Reduce bias gradients without full-size intermediates.
 
     Args:
         grad_output: Tensor of shape [tokens, hidden], grouped contiguously by expert.
         token_counts: Tensor of shape [experts] containing each contiguous segment length.
-        probs: Routing probabilities of shape [tokens, 1].
+        probs: Optional routing probabilities of shape [tokens, 1].
         output_dtype: Result dtype.
 
     Returns:
@@ -398,12 +398,10 @@ def _reduce_weighted_bias_grad_fallback(
         token_end = token_start + count
         for chunk_start in range(token_start, token_end, _BIAS_CHUNK_ROWS):
             chunk_end = min(chunk_start + _BIAS_CHUNK_ROWS, token_end)
-            partials.append(
-                (
-                    grad_output[chunk_start:chunk_end].to(accumulation_dtype)
-                    * probs[chunk_start:chunk_end].to(accumulation_dtype)
-                ).sum(dim=0)
-            )
+            chunk = grad_output[chunk_start:chunk_end].to(accumulation_dtype)
+            if probs is not None:
+                chunk = chunk * probs[chunk_start:chunk_end].to(accumulation_dtype)
+            partials.append(chunk.sum(dim=0))
         if partials:
             expert_grads.append(torch.stack(partials).sum(dim=0))
         else:
@@ -412,19 +410,19 @@ def _reduce_weighted_bias_grad_fallback(
     return torch.stack(expert_grads).to(output_dtype)
 
 
-class _WeightedBiasAdd(Function):
-    """Add probability-weighted expert bias without materializing it per token."""
+class _ChunkedBiasAdd(Function):
+    """Add expert bias without materializing a full-size expanded bias."""
 
     @staticmethod
-    def forward(ctx, value, bias, token_counts, probs):
-        """Add expert bias in bounded row chunks.
+    def forward(ctx, value, bias, token_counts, probs=None):
+        """Add optionally weighted expert bias in bounded row chunks.
 
         Args:
             ctx: Autograd context used to retain the compact inputs.
             value: Grouped expert output of shape [tokens, hidden].
             bias: Per-expert bias of shape [experts, hidden].
             token_counts: Tensor of shape [experts] containing nonnegative token counts.
-            probs: FP32 routing probabilities of shape [tokens, 1].
+            probs: Optional FP32 routing probabilities of shape [tokens, 1].
 
         Returns:
             Tensor of shape [tokens, hidden] and the same dtype as ``value``.
@@ -434,15 +432,19 @@ class _WeightedBiasAdd(Function):
             token_counts,
             output_size=value.shape[0],
         )
-        ctx.save_for_backward(bias, token_counts, probs, expert_ids)
+        ctx.has_probs = probs is not None
+        tensors_to_save = (bias, token_counts, expert_ids) if probs is None else (bias, token_counts, probs, expert_ids)
+        ctx.save_for_backward(*tensors_to_save)
         output = torch.empty_like(value)
-        compute_dtype = torch.promote_types(value.dtype, torch.promote_types(bias.dtype, probs.dtype))
+        compute_dtype = torch.promote_types(value.dtype, bias.dtype)
+        if probs is not None:
+            compute_dtype = torch.promote_types(compute_dtype, probs.dtype)
         for start in range(0, value.shape[0], _BIAS_CHUNK_ROWS):
             end = min(start + _BIAS_CHUNK_ROWS, value.shape[0])
             bias_rows = bias.index_select(0, expert_ids[start:end]).to(compute_dtype)
-            output[start:end] = (
-                value[start:end].to(compute_dtype) + bias_rows * probs[start:end].to(compute_dtype)
-            ).to(value.dtype)
+            if probs is not None:
+                bias_rows = bias_rows * probs[start:end].to(compute_dtype)
+            output[start:end] = (value[start:end].to(compute_dtype) + bias_rows).to(value.dtype)
         return output
 
     @staticmethod
@@ -456,7 +458,11 @@ class _WeightedBiasAdd(Function):
         Returns:
             Gradients for ``value``, ``bias``, and ``probs``; token counts are non-differentiable.
         """
-        bias, token_counts, probs, expert_ids = ctx.saved_tensors
+        if ctx.has_probs:
+            bias, token_counts, probs, expert_ids = ctx.saved_tensors
+        else:
+            bias, token_counts, expert_ids = ctx.saved_tensors
+            probs = None
         grad_value = grad_output if ctx.needs_input_grad[0] else None
         grad_bias = None
         grad_probs = None
@@ -465,17 +471,19 @@ class _WeightedBiasAdd(Function):
                 _BIAS_GRAD_TRITON_AVAILABLE
                 and grad_output.is_cuda
                 and grad_output.dtype in (torch.float16, torch.bfloat16, torch.float32)
-                and probs.dtype == torch.float32
+                and (probs is None or probs.dtype == torch.float32)
                 and grad_output.shape[0] < 2**31
                 and grad_output.shape[1] * grad_output.element_size() % 16 == 0
                 and not torch.is_grad_enabled()
             )
-            grad_bias = (
-                _reduce_bias_grad_triton(grad_output, token_counts, probs, bias.dtype)
-                if use_triton
-                else _reduce_weighted_bias_grad_fallback(grad_output, token_counts, probs, bias.dtype)
-            )
-        if ctx.needs_input_grad[3]:
+            if use_triton:
+                grad_bias = _reduce_bias_grad_triton(grad_output, token_counts, probs, bias.dtype)
+            elif torch.compiler.is_compiling():
+                reduction_input = grad_output if probs is None else grad_output * probs
+                grad_bias = _reduce_bias_grad_fallback(reduction_input, token_counts).to(bias.dtype)
+            else:
+                grad_bias = _reduce_bias_grad_chunked_fallback(grad_output, token_counts, probs, bias.dtype)
+        if probs is not None and ctx.needs_input_grad[3]:
             grad_probs = torch.empty_like(probs)
             compute_dtype = torch.promote_types(probs.dtype, torch.promote_types(grad_output.dtype, bias.dtype))
             for start in range(0, grad_output.shape[0], _BIAS_CHUNK_ROWS):
@@ -514,13 +522,11 @@ def _apply_bias(value, bias, tokens_per_expert, permuted_probs=None):
     shape = value.shape
     flat_value = value.reshape(-1, shape[-1])
     token_counts = torch.as_tensor(tokens_per_expert, device=bias.device, dtype=torch.long)
-    if (
-        permuted_probs is not None
-        and permuted_probs.dim() == 2
-        and permuted_probs.shape == (flat_value.shape[0], 1)
-        and flat_value.shape[0] > _BIAS_CHUNK_THRESHOLD
-    ):
-        return _WeightedBiasAdd.apply(flat_value, bias, token_counts, permuted_probs).view(shape)
+    chunkable_probs = permuted_probs is None or (
+        permuted_probs.dim() == 2 and permuted_probs.shape == (flat_value.shape[0], 1)
+    )
+    if chunkable_probs and flat_value.shape[0] > _BIAS_CHUNK_THRESHOLD:
+        return _ChunkedBiasAdd.apply(flat_value, bias, token_counts, permuted_probs).view(shape)
     if torch.is_grad_enabled() and bias.requires_grad:
         bias_to_expand = bias
         if permuted_probs is not None:

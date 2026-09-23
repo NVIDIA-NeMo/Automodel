@@ -23,7 +23,7 @@ def test_apply_bias_has_deterministic_bf16_bias_gradient():
     """Imbalanced BF16 routing produces the same trainable bias gradient on every CUDA backward."""
     device = torch.device(f"cuda:{torch.cuda.current_device()}")
     n_experts = 64
-    n_tokens = 4096
+    n_tokens = 16384
     hidden = 512
 
     torch.manual_seed(1234)

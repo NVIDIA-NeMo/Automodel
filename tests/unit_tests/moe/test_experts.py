@@ -961,6 +961,35 @@ class TestGroupedExpertsDeepEP:
         torch.testing.assert_close(bias.grad, expected_bias.grad)
         torch.testing.assert_close(permuted_probs.grad, expected_probs.grad)
 
+    def test_grouped_experts_deepep_apply_bias_large_unweighted_path(self, moe_config):
+        """Large unweighted bias additions avoid expansion and preserve gradients."""
+        _ = GroupedExpertsDeepEP(moe_config)
+        tokens_per_expert = torch.tensor([0, 4097, 8192, 0])
+        n_tokens = int(tokens_per_expert.sum())
+
+        torch.manual_seed(321)
+        value = torch.randn(n_tokens, 4, dtype=torch.float64, requires_grad=True)
+        bias = torch.randn(4, 4, dtype=torch.float64, requires_grad=True)
+        upstream_grad = torch.randn_like(value)
+
+        expected_value = value.detach().clone().requires_grad_()
+        expected_bias = bias.detach().clone().requires_grad_()
+        expected_bias_rows = torch.repeat_interleave(
+            expected_bias,
+            tokens_per_expert,
+            dim=0,
+            output_size=n_tokens,
+        )
+        expected = expected_value + expected_bias_rows
+        expected.backward(upstream_grad)
+
+        result = _apply_bias(value, bias, tokens_per_expert)
+        result.backward(upstream_grad)
+
+        torch.testing.assert_close(result, expected)
+        torch.testing.assert_close(value.grad, expected_value.grad)
+        torch.testing.assert_close(bias.grad, expected_bias.grad)
+
     @pytest.mark.parametrize(
         ("bias_requires_grad", "use_probs", "expected_bias_grad_dtype", "expected_probs_grad_dtype"),
         [
@@ -1055,12 +1084,13 @@ class TestGroupedExpertsDeepEP:
 
     @pytest.mark.parametrize("use_probs", [False, True], ids=["unweighted", "fp32-weighted"])
     def test_grouped_experts_deepep_apply_bias_backward_is_fullgraph_compatible(self, moe_config, use_probs):
-        """The deterministic bias backward remains traceable by AOTAutograd."""
+        """The large chunked bias backward remains traceable by AOTAutograd."""
         _ = GroupedExpertsDeepEP(moe_config)
-        value = torch.randn(4, 8, requires_grad=True)
-        bias = torch.randn(3, 8, requires_grad=True)
-        tokens_per_expert = torch.tensor([0, 1, 3])
-        permuted_probs = torch.rand(4, 1, dtype=torch.float32, requires_grad=True) if use_probs else None
+        tokens_per_expert = torch.tensor([0, 4096, 8192, 1])
+        n_tokens = int(tokens_per_expert.sum())
+        value = torch.randn(n_tokens, 8, requires_grad=True)
+        bias = torch.randn(4, 8, requires_grad=True)
+        permuted_probs = torch.rand(n_tokens, 1, dtype=torch.float32, requires_grad=True) if use_probs else None
         compiled_apply_bias = torch.compile(_apply_bias, backend="aot_eager", fullgraph=True)
 
         compiled_apply_bias(value, bias, tokens_per_expert, permuted_probs).square().sum().backward()
