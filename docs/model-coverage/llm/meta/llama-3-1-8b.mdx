@@ -1,0 +1,59 @@
+---
+title: "Llama-3.1-8B"
+description: "Use NeMo AutoModel to fine-tune Llama-3.1-8B for LLM workflows with checked-in text generation recipes and documented distributed settings."
+slug: model-coverage/large-language-models/meta/Llama-3.1-8B
+---
+
+[Llama-3.1-8B](https://huggingface.co/meta-llama/Llama-3.1-8B) has a checked-in NeMo AutoModel recipe for text generation.
+The Hugging Face configuration declares the `LlamaForCausalLM` architecture.
+
+## Fine-Tune Llama-3.1-8B
+
+Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+
+```bash
+automodel examples/llm_finetune/llama3_1/llama3_1_8b_squad_qlora.yaml --nproc-per-node 8
+```
+
+## Standard Recipe Configuration
+
+Start with the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_1/llama3_1_8b_squad_qlora.yaml).
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | - |
+| Strategy | FSDP2; tp_size=1, cp_size=1 |
+| Nodes | - |
+| Features | LoRA |
+| Advanced | bfloat16 |
+
+## Alternate Recipe Configuration
+
+- [`llama3_1_8b_peft_benchmark.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/llama3_1/llama3_1_8b_peft_benchmark.yaml)
+- [`llama3_1_8b_quack_rope.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/llama3_1/llama3_1_8b_quack_rope.yaml)
+- [`llama3_1_8b_quack_rope_baseline.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/llama3_1/llama3_1_8b_quack_rope_baseline.yaml)
+- [`customizer_llama_3_1_8b_full_sft_tp.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_1/customizer_llama_3_1_8b_full_sft_tp.yaml)
+- [`llama3_1_8b_columnmapped_lora.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_1/llama3_1_8b_columnmapped_lora.yaml)
+- [`llama3_1_8b_hellaswag_fp8.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_1/llama3_1_8b_hellaswag_fp8.yaml)
+- [`llama3_1_8b_hellaswag_pp.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_1/llama3_1_8b_hellaswag_pp.yaml)
+- [`llama3_1_8b_hellaswag_pp_dynamic_seq_len.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_1/llama3_1_8b_hellaswag_pp_dynamic_seq_len.yaml)
+- [`llama3_1_8b_instruct_squad_qlora_2node.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_1/llama3_1_8b_instruct_squad_qlora_2node.yaml)
+- [`llama3_1_8b_squad_peft_rtx_spark.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_1/llama3_1_8b_squad_peft_rtx_spark.yaml)
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| Architecture | `LlamaForCausalLM` |
+
+### Available Models
+
+- [`meta-llama/Llama-3.1-8B`](https://huggingface.co/meta-llama/Llama-3.1-8B)
+- [`meta-llama/Llama-3.1-8B-Instruct`](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct)
+
+## Related Resources
+
+- [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)

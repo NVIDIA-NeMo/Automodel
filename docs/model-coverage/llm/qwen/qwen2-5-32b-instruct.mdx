@@ -1,0 +1,50 @@
+---
+title: "Qwen2.5-32B-Instruct"
+description: "Use NeMo AutoModel to fine-tune Qwen2.5-32B-Instruct for LLM workflows with checked-in text generation recipes and documented distributed settings."
+slug: model-coverage/large-language-models/qwen/Qwen2.5-32B-Instruct
+---
+
+[Qwen2.5-32B-Instruct](https://huggingface.co/Qwen/Qwen2.5-32B-Instruct) has a checked-in NeMo AutoModel recipe for text generation.
+The Hugging Face configuration declares the `Qwen2ForCausalLM` architecture.
+
+## Fine-Tune Qwen2.5-32B-Instruct
+
+Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+
+```bash
+automodel examples/llm_finetune/qwen/qwen2_5_32b_peft_benchmark.yaml --nproc-per-node 8
+```
+
+## Standard Recipe Configuration
+
+Start with the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen2_5_32b_peft_benchmark.yaml).
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | - |
+| Strategy | FSDP2; tp_size=1, pp_size=4, cp_size=1 |
+| Nodes | - |
+| Features | Activation checkpointing (activation_checkpointing=true), LoRA |
+| Advanced | bf16 |
+
+## Alternate Recipe Configuration
+
+- [`custom_qwen2_5_32b_peft_benchmark.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/qwen/custom_qwen2_5_32b_peft_benchmark.yaml)
+- [`custom_qwen2_5_32b_peft_benchmark_2nodes.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/qwen/custom_qwen2_5_32b_peft_benchmark_2nodes.yaml)
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| Architecture | `Qwen2ForCausalLM` |
+
+### Available Models
+
+- [`Qwen/Qwen2.5-32B-Instruct`](https://huggingface.co/Qwen/Qwen2.5-32B-Instruct)
+
+## Related Resources
+
+- [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)

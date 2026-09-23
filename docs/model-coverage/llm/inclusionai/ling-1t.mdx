@@ -1,0 +1,51 @@
+---
+title: "Ling-1T"
+description: "Use NeMo AutoModel to fine-tune Ling-1T for LLM workflows with checked-in text generation recipes and documented distributed settings."
+slug: model-coverage/large-language-models/inclusionai/Ling-1T
+---
+
+[Ling-1T](https://huggingface.co/inclusionAI/Ling-1T) has a checked-in NeMo AutoModel recipe for text generation.
+The Hugging Face configuration declares the `BailingMoeV2ForCausalLM` architecture.
+
+## Fine-Tune Ling-1T
+
+Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+
+```bash
+automodel examples/llm_finetune/ling/ling_1t_sft.yaml --nproc-per-node 8
+```
+
+Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node run.
+
+## Standard Recipe Configuration
+
+Start with the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/ling/ling_1t_sft.yaml).
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | - |
+| Strategy | FSDP2; tp_size=1, pp_size=4, cp_size=1, ep_size=64 |
+| Nodes | 32 |
+| Features | Checkpointing (enabled=true), Activation checkpointing (activation_checkpointing=true), Transformer Engine, HybridEP (dispatcher=hybridep) |
+| Advanced | bfloat16, attention=sdpa, linear=te, experts=torch_mm, dispatcher=hybridep |
+
+## Alternate Recipe Configuration
+
+- [`ling_1t_lora_pp.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/ling/ling_1t_lora_pp.yaml)
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| Architecture | `BailingMoeV2ForCausalLM` |
+
+### Available Models
+
+- [`inclusionAI/Ling-1T`](https://huggingface.co/inclusionAI/Ling-1T)
+
+## Related Resources
+
+- [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)

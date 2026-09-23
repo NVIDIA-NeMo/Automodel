@@ -1,0 +1,53 @@
+---
+title: "GPT-OSS 120B"
+description: "Use NeMo AutoModel to fine-tune GPT-OSS 120B for LLM workflows with checked-in text generation recipes and documented distributed settings."
+slug: model-coverage/large-language-models/openai/gpt-oss-120b
+---
+
+[GPT-OSS 120B](https://huggingface.co/openai/gpt-oss-120b) has a checked-in NeMo AutoModel recipe for text generation.
+The Hugging Face configuration declares the `GptOssForCausalLM` architecture.
+
+## Fine-Tune GPT-OSS 120B
+
+Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+
+```bash
+automodel examples/llm_finetune/gpt_oss/gpt_oss_120b.yaml --nproc-per-node 8
+```
+
+Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node run.
+
+## Standard Recipe Configuration
+
+Start with the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gpt_oss/gpt_oss_120b.yaml).
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | - |
+| Strategy | FSDP2; tp_size=1, pp_size=1, cp_size=1, ep_size=64 |
+| Nodes | 8 |
+| Features | Checkpointing (enabled=true), HybridEP (dispatcher=hybridep) |
+| Advanced | experts=torch_mm, dispatcher=hybridep |
+
+## Alternate Recipe Configuration
+
+- [`gptoss_120b_te_deepep.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/gpt_oss/gptoss_120b_te_deepep.yaml)
+- [`gptoss_120b_te_deepep_gb200.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/gpt_oss/gptoss_120b_te_deepep_gb200.yaml)
+- [`gptoss_120b_te_mxfp8_gb200.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/gpt_oss/gptoss_120b_te_mxfp8_gb200.yaml)
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| Architecture | `GptOssForCausalLM` |
+
+### Available Models
+
+- [`openai/gpt-oss-120b`](https://huggingface.co/openai/gpt-oss-120b)
+
+## Related Resources
+
+- [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)

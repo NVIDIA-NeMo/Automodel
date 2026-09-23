@@ -1,0 +1,50 @@
+---
+title: "Mistral-Nemo-Base-2407"
+description: "Use NeMo AutoModel to fine-tune Mistral-Nemo-Base-2407 for LLM workflows with checked-in text generation recipes and documented distributed settings."
+slug: model-coverage/large-language-models/mistralai/Mistral-Nemo-Base-2407
+---
+
+[Mistral-Nemo-Base-2407](https://huggingface.co/mistralai/Mistral-Nemo-Base-2407) has a checked-in NeMo AutoModel recipe for text generation.
+The Hugging Face configuration declares the `MistralForCausalLM` architecture.
+
+## Fine-Tune Mistral-Nemo-Base-2407
+
+Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+
+```bash
+automodel examples/llm_finetune/mistral/mistral_nemo_2407_squad.yaml --nproc-per-node 8
+```
+
+## Standard Recipe Configuration
+
+Start with the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mistral/mistral_nemo_2407_squad.yaml).
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | - |
+| Strategy | FSDP2; tp_size=1, cp_size=1 |
+| Nodes | - |
+| Features | - |
+| Advanced | bf16 |
+
+## Alternate Recipe Configuration
+
+- [`mistral_nemo_2407_hellaswag_fp8.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mistral/mistral_nemo_2407_hellaswag_fp8.yaml)
+- [`mistral_nemo_2407_squad_peft.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mistral/mistral_nemo_2407_squad_peft.yaml)
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| Architecture | `MistralForCausalLM` |
+
+### Available Models
+
+- [`mistralai/Mistral-Nemo-Base-2407`](https://huggingface.co/mistralai/Mistral-Nemo-Base-2407)
+
+## Related Resources
+
+- [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)

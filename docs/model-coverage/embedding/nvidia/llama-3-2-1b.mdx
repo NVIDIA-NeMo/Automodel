@@ -1,0 +1,49 @@
+---
+title: "Llama-3.2-1B"
+description: "Use NeMo AutoModel to fine-tune Llama-3.2-1B for Embedding workflows with checked-in feature extraction recipes and documented distributed settings."
+slug: model-coverage/embedding-models/nvidia/Llama-3.2-1B
+---
+
+[Llama-3.2-1B](https://huggingface.co/meta-llama/Llama-3.2-1B) has a checked-in NeMo AutoModel recipe for feature extraction.
+The Hugging Face configuration declares the `LlamaForCausalLM` architecture.
+
+## Fine-Tune Llama-3.2-1B
+
+Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+
+```bash
+uv run automodel examples/retrieval/bi_encoder/llama3_2_1b.yaml --nproc-per-node 8
+```
+
+## Standard Recipe Configuration
+
+Start with the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/bi_encoder/llama3_2_1b.yaml).
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | - |
+| Strategy | FSDP2; tp_size=1, cp_size=1 |
+| Nodes | 1 |
+| Features | Checkpointing (enabled=true) |
+| Advanced | bfloat16 |
+
+## Alternate Recipe Configuration
+
+- [Standard recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/bi_encoder/llama3_2_1b.yaml)
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+| --- | --- |
+| Task | Feature extraction |
+| Architecture | `LlamaForCausalLM` |
+
+### Available Models
+
+- [`meta-llama/Llama-3.2-1B`](https://huggingface.co/meta-llama/Llama-3.2-1B)
+
+## Related Resources
+
+- [Installation instructions](/get-started/installation)

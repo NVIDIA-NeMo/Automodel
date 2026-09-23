@@ -1,0 +1,50 @@
+---
+title: "Qwen3-32B"
+description: "Use NeMo AutoModel to fine-tune Qwen3-32B for LLM workflows with checked-in text generation recipes and documented distributed settings."
+slug: model-coverage/large-language-models/qwen/Qwen3-32B
+---
+
+[Qwen3-32B](https://huggingface.co/Qwen/Qwen3-32B) has a checked-in NeMo AutoModel recipe for text generation.
+The Hugging Face configuration declares the `Qwen3ForCausalLM` architecture.
+
+## Fine-Tune Qwen3-32B
+
+Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+
+```bash
+automodel examples/llm_finetune/qwen/qwen3_32b_tulu3.yaml --nproc-per-node 8
+```
+
+## Standard Recipe Configuration
+
+Start with the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen3_32b_tulu3.yaml).
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | - |
+| Strategy | FSDP2; tp_size=1, pp_size=1, cp_size=1 |
+| Nodes | 1 |
+| Features | Activation checkpointing (activation_checkpointing=true) |
+| Advanced | sequence length 2048 |
+
+## Alternate Recipe Configuration
+
+- [`qwen3_32b_tulu3_cp2.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen3_32b_tulu3_cp2.yaml)
+- [`qwen3_32b_coderforge_cp16_128k_lowerLR.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/long_context_validation/qwen3_32b/qwen3_32b_coderforge_cp16_128k_lowerLR.yaml)
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| Architecture | `Qwen3ForCausalLM` |
+
+### Available Models
+
+- [`Qwen/Qwen3-32B`](https://huggingface.co/Qwen/Qwen3-32B)
+
+## Related Resources
+
+- [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)

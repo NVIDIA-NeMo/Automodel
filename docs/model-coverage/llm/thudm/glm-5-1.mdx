@@ -1,0 +1,51 @@
+---
+title: "GLM-5.1"
+description: "Use NeMo AutoModel to fine-tune GLM-5.1 for LLM workflows with checked-in text generation recipes and documented distributed settings."
+slug: model-coverage/large-language-models/thudm/GLM-5.1
+---
+
+[GLM-5.1](https://huggingface.co/zai-org/GLM-5.1) has a checked-in NeMo AutoModel recipe for text generation.
+The Hugging Face configuration declares the `GlmMoeDsaForCausalLM` architecture.
+
+## Fine-Tune GLM-5.1
+
+Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+
+```bash
+uv run automodel <recipe-path>
+```
+
+Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node run.
+
+## Standard Recipe Configuration
+
+Start with the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.1_lora.yaml).
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | - |
+| Strategy | FSDP2; tp_size=1, pp_size=4, cp_size=1, ep_size=32 |
+| Nodes | 16 |
+| Features | LoRA, HybridEP (dispatcher=hybridep) |
+| Advanced | attention=sdpa, linear=torch, experts=gmm, dispatcher=hybridep |
+
+## Alternate Recipe Configuration
+
+- [`glm_5.1_hellaswag_pp.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.1_hellaswag_pp.yaml)
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| Architecture | `GlmMoeDsaForCausalLM` |
+
+### Available Models
+
+- [`zai-org/GLM-5.1`](https://huggingface.co/zai-org/GLM-5.1)
+
+## Related Resources
+
+- [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)

@@ -1,0 +1,51 @@
+---
+title: "Mistral-Medium-3.5-128B"
+description: "Use NeMo AutoModel to fine-tune Mistral-Medium-3.5-128B for VLM workflows with checked-in image-text-to-text recipes and documented distributed settings."
+slug: model-coverage/vision-language-models/mistralai/Mistral-Medium-3.5-128B
+---
+
+[Mistral-Medium-3.5-128B](https://huggingface.co/mistralai/Mistral-Medium-3.5-128B) has a checked-in NeMo AutoModel recipe for image-text-to-text.
+The Hugging Face configuration declares the `Mistral3ForConditionalGeneration` architecture.
+
+## Fine-Tune Mistral-Medium-3.5-128B
+
+Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+
+```bash
+uv run automodel <recipe-path>
+```
+
+Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node run.
+
+## Standard Recipe Configuration
+
+Start with the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mistral3p5/mistral3p5_128b_medpix.yaml).
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | - |
+| Strategy | FSDP2; tp_size=8, pp_size=8, cp_size=1, ep_size=1 |
+| Nodes | 8 |
+| Features | Activation checkpointing (activation_checkpointing=true) |
+| Advanced | torch.bfloat16 |
+
+## Alternate Recipe Configuration
+
+- [`mistral3p5_128b_medpix_lora.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mistral3p5/mistral3p5_128b_medpix_lora.yaml)
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+| --- | --- |
+| Task | Image-text-to-text |
+| Architecture | `Mistral3ForConditionalGeneration` |
+
+### Available Models
+
+- [`mistralai/Mistral-Medium-3.5-128B`](https://huggingface.co/mistralai/Mistral-Medium-3.5-128B)
+
+## Related Resources
+
+- [Vision-language model fine-tuning guide](/recipes-e2e-examples/vlm-finetune)

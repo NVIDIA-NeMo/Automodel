@@ -1,0 +1,51 @@
+---
+title: "Qwen3.5-27B"
+description: "Use NeMo AutoModel to fine-tune Qwen3.5-27B for VLM workflows with checked-in image-text-to-text recipes and documented distributed settings."
+slug: model-coverage/vision-language-models/qwen/Qwen3.5-27B
+---
+
+[Qwen3.5-27B](https://huggingface.co/Qwen/Qwen3.5-27B) has a checked-in NeMo AutoModel recipe for image-text-to-text.
+The Hugging Face configuration declares the `Qwen3_5ForConditionalGeneration` architecture.
+
+## Fine-Tune Qwen3.5-27B
+
+Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+
+```bash
+uv run automodel <recipe-path>
+```
+
+Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node run.
+
+## Standard Recipe Configuration
+
+Start with the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5/qwen3_5_27b_tp4pp4.yaml).
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | - |
+| Strategy | tp_size=4; pp_size=4, cp_size=1, ep_size=1 |
+| Nodes | 2 |
+| Features | Activation checkpointing (activation_checkpointing=true) |
+| Advanced | attention=sdpa, linear=torch |
+
+## Alternate Recipe Configuration
+
+- [Standard recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5/qwen3_5_27b_tp4pp4.yaml)
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+| --- | --- |
+| Task | Image-text-to-text |
+| Architecture | `Qwen3_5ForConditionalGeneration` |
+
+### Available Models
+
+- [`Qwen/Qwen3.5-27B`](https://huggingface.co/Qwen/Qwen3.5-27B)
+
+## Related Resources
+
+- [Vision-language model fine-tuning guide](/recipes-e2e-examples/vlm-finetune)

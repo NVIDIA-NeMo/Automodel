@@ -1,0 +1,51 @@
+---
+title: "Kimi-K2-Base"
+description: "Use NeMo AutoModel to fine-tune Kimi-K2-Base for LLM workflows with checked-in text generation recipes and documented distributed settings."
+slug: model-coverage/large-language-models/moonshotai/Kimi-K2-Base
+---
+
+[Kimi-K2-Base](https://huggingface.co/moonshotai/Kimi-K2-Base) has a checked-in NeMo AutoModel recipe for text generation.
+The Hugging Face configuration declares the `DeepseekV3ForCausalLM` architecture.
+
+## Fine-Tune Kimi-K2-Base
+
+Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+
+```bash
+automodel examples/llm_benchmark/kimi/kimi_k2_te_deepep.yaml --nproc-per-node 8
+```
+
+Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node run.
+
+## Standard Recipe Configuration
+
+Start with the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/kimi/kimi_k2_te_deepep.yaml).
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | - |
+| Strategy | FSDP2; tp_size=1, pp_size=8, cp_size=1, ep_size=32 |
+| Nodes | 32 |
+| Features | Activation checkpointing (activation_checkpointing=true), Transformer Engine, DeepEP (dispatcher=deepep) |
+| Advanced | attention=te, linear=te, experts=gmm, dispatcher=deepep |
+
+## Alternate Recipe Configuration
+
+- [Standard recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/kimi/kimi_k2_te_deepep.yaml)
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| Architecture | `DeepseekV3ForCausalLM` |
+
+### Available Models
+
+- [`moonshotai/Kimi-K2-Base`](https://huggingface.co/moonshotai/Kimi-K2-Base)
+
+## Related Resources
+
+- [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)

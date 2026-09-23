@@ -1,0 +1,49 @@
+---
+title: "Llama-3.1-70B"
+description: "Use NeMo AutoModel to fine-tune Llama-3.1-70B for LLM workflows with checked-in text generation recipes and documented distributed settings."
+slug: model-coverage/large-language-models/meta/Llama-3.1-70B
+---
+
+[Llama-3.1-70B](https://huggingface.co/meta-llama/Llama-3.1-70B) has a checked-in NeMo AutoModel recipe for text generation.
+The Hugging Face configuration declares the `LlamaForCausalLM` architecture.
+
+## Fine-Tune Llama-3.1-70B
+
+Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+
+```bash
+uv run automodel <recipe-path>
+```
+
+## Standard Recipe Configuration
+
+Start with the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/llama3_70b_pretrain.yaml).
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | - |
+| Strategy | FSDP2; tp_size=4, pp_size=4, cp_size=1 |
+| Nodes | - |
+| Features | Activation checkpointing (activation_checkpointing=true), Packed sequences (packed_sequence_size=4096) |
+| Advanced | bfloat16 |
+
+## Alternate Recipe Configuration
+
+- [`custom_llama3_1_70b_pretrain_benchmark_8nodes.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/llama3_3/custom_llama3_1_70b_pretrain_benchmark_8nodes.yaml)
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| Architecture | `LlamaForCausalLM` |
+
+### Available Models
+
+- [`meta-llama/Llama-3.1-70B`](https://huggingface.co/meta-llama/Llama-3.1-70B)
+
+## Related Resources
+
+- [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)

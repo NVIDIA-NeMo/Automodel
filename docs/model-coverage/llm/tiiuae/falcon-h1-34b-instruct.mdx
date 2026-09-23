@@ -1,0 +1,49 @@
+---
+title: "Falcon-H1-34B-Instruct"
+description: "Use NeMo AutoModel to fine-tune Falcon-H1-34B-Instruct for LLM workflows with checked-in text generation recipes and documented distributed settings."
+slug: model-coverage/large-language-models/tiiuae/Falcon-H1-34B-Instruct
+---
+
+[Falcon-H1-34B-Instruct](https://huggingface.co/tiiuae/Falcon-H1-34B-Instruct) has a checked-in NeMo AutoModel recipe for text generation.
+The Hugging Face configuration declares the `FalconH1ForCausalLM` architecture.
+
+## Fine-Tune Falcon-H1-34B-Instruct
+
+Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+
+```bash
+automodel examples/llm_finetune/falcon/falcon_h1_34b_instruct_squad_peft.yaml --nproc-per-node 8
+```
+
+## Standard Recipe Configuration
+
+Start with the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/falcon/falcon_h1_34b_instruct_squad_peft.yaml).
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | - |
+| Strategy | FSDP2; tp_size=4, cp_size=1 |
+| Nodes | 1 |
+| Features | LoRA |
+| Advanced | bf16 |
+
+## Alternate Recipe Configuration
+
+- [Standard recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/falcon/falcon_h1_34b_instruct_squad_peft.yaml)
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| Architecture | `FalconH1ForCausalLM` |
+
+### Available Models
+
+- [`tiiuae/Falcon-H1-34B-Instruct`](https://huggingface.co/tiiuae/Falcon-H1-34B-Instruct)
+
+## Related Resources
+
+- [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)

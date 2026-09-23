@@ -1,0 +1,51 @@
+---
+title: "Gemma-4-31B"
+description: "Use NeMo AutoModel to fine-tune Gemma-4-31B for LLM workflows with checked-in text generation recipes and documented distributed settings."
+slug: model-coverage/large-language-models/google/gemma-4-31B
+---
+
+[Gemma-4-31B](https://huggingface.co/google/gemma-4-31B) has a checked-in NeMo AutoModel recipe for text generation.
+The Hugging Face configuration declares the `Gemma4ForConditionalGeneration` architecture.
+
+## Fine-Tune Gemma-4-31B
+
+Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+
+```bash
+uv run automodel <recipe-path>
+```
+
+Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node run.
+
+## Standard Recipe Configuration
+
+Start with the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/convergence/tulu3/models/gemma4-31b/gemma4_31b_tulu3_packed2k_cp1_gbs32_4node.yaml).
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | - |
+| Strategy | FSDP2; tp_size=1, cp_size=1 |
+| Nodes | 4 |
+| Features | Checkpointing (enabled=true), Activation checkpointing (activation_checkpointing=true) |
+| Advanced | torch.bfloat16 |
+
+## Alternate Recipe Configuration
+
+- [`gemma4_31b_base_coderforge_cp8_64k_1e5_800steps.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/long_context_validation/gemma4_31B/gemma4_31b_base_coderforge_cp8_64k_1e5_800steps.yaml)
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| Architecture | `Gemma4ForConditionalGeneration` |
+
+### Available Models
+
+- [`google/gemma-4-31B`](https://huggingface.co/google/gemma-4-31B)
+
+## Related Resources
+
+- [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)

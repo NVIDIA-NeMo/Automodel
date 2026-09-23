@@ -1,0 +1,51 @@
+---
+title: "Kimi-K2.5"
+description: "Use NeMo AutoModel to fine-tune Kimi-K2.5 for VLM workflows with checked-in image-text-to-text recipes and documented distributed settings."
+slug: model-coverage/vision-language-models/moonshotai/Kimi-K2.5
+---
+
+[Kimi-K2.5](https://huggingface.co/moonshotai/Kimi-K2.5) has a checked-in NeMo AutoModel recipe for image-text-to-text.
+The Hugging Face configuration declares the `KimiK25ForConditionalGeneration` architecture.
+
+## Fine-Tune Kimi-K2.5
+
+Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+
+```bash
+automodel examples/vlm_finetune/kimi/kimi25vl_medpix.yaml --nproc-per-node 8
+```
+
+Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node run.
+
+## Standard Recipe Configuration
+
+Start with the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/kimi/kimi25vl_medpix.yaml).
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | - |
+| Strategy | FSDP2; tp_size=1, pp_size=8, cp_size=1, ep_size=32 |
+| Nodes | 32 |
+| Features | Transformer Engine, DeepEP (dispatcher=deepep) |
+| Advanced | bfloat16, attention=te, linear=torch, experts=gmm, dispatcher=deepep |
+
+## Alternate Recipe Configuration
+
+- [`kimi25vl_lora.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_benchmark/kimi/kimi25vl_lora.yaml)
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+| --- | --- |
+| Task | Image-text-to-text |
+| Architecture | `KimiK25ForConditionalGeneration` |
+
+### Available Models
+
+- [`moonshotai/Kimi-K2.5`](https://huggingface.co/moonshotai/Kimi-K2.5)
+
+## Related Resources
+
+- [Vision-language model fine-tuning guide](/recipes-e2e-examples/vlm-finetune)

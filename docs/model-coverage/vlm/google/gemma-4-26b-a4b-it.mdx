@@ -1,0 +1,52 @@
+---
+title: "Gemma-4-26B-A4B-it"
+description: "Use NeMo AutoModel to fine-tune Gemma-4-26B-A4B-it for VLM workflows with checked-in image-text-to-text recipes and documented distributed settings."
+slug: model-coverage/vision-language-models/google/gemma-4-26B-A4B-it
+---
+
+[Gemma-4-26B-A4B-it](https://huggingface.co/google/gemma-4-26B-A4B-it) has a checked-in NeMo AutoModel recipe for image-text-to-text.
+The Hugging Face configuration declares the `Gemma4ForConditionalGeneration` architecture.
+
+## Fine-Tune Gemma-4-26B-A4B-it
+
+Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+
+```bash
+uv run automodel <recipe-path>
+```
+
+## Standard Recipe Configuration
+
+Start with the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_26b_a4b_moe.yaml).
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | - |
+| Strategy | FSDP2; tp_size=1, cp_size=1, ep_size=8 |
+| Nodes | 1 |
+| Features | Checkpointing (enabled=true), Transformer Engine, DeepEP (dispatcher=deepep) |
+| Advanced | torch.bfloat16, attention=te, linear=te, dispatcher=deepep |
+
+## Alternate Recipe Configuration
+
+- [`gemma4_26b_a4b_moe_medpix_ep8cp2_4k.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_26b_a4b_moe_medpix_ep8cp2_4k.yaml)
+- [`gemma4_26b_a4b_moe_mock.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_26b_a4b_moe_mock.yaml)
+- [`gemma4_26b_a4b_moe_packing.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_26b_a4b_moe_packing.yaml)
+- [`gemma4_26b_a4b_moe_peft.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_26b_a4b_moe_peft.yaml)
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+| --- | --- |
+| Task | Image-text-to-text |
+| Architecture | `Gemma4ForConditionalGeneration` |
+
+### Available Models
+
+- [`google/gemma-4-26B-A4B-it`](https://huggingface.co/google/gemma-4-26B-A4B-it)
+
+## Related Resources
+
+- [Vision-language model fine-tuning guide](/recipes-e2e-examples/vlm-finetune)

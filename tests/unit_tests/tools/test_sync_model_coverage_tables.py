@@ -412,6 +412,121 @@ def test_model_coverage_pages_use_provider_sections_and_checkpoint_slugs():
     )
 
 
+def _model_size_key(hf_model_id: str) -> tuple[str, str]:
+    organization, model_name = hf_model_id.split("/", 1)
+    size_pattern = re.compile(r"(?i)(?:^|[-_])(?:A?\d+(?:\.\d+)?[BMT])(?=$|[-_])")
+    size_matches = list(size_pattern.finditer(model_name))
+    if size_matches:
+        model_stem = model_name[: size_matches[-1].end()]
+    else:
+        variant_suffixes = re.compile(
+            r"(?i)(?:[-_](?:instruct|chat|base|thinking|reasoning|pt|it|bf16|fp8|flash|preview|deep|hf))+$"
+        )
+        model_stem = variant_suffixes.sub("", model_name)
+    normalized_stem = model_stem.casefold().replace("_", "-")
+    if organization.casefold() == "meta-llama":
+        normalized_stem = re.sub(r"^meta-", "", normalized_stem)
+    return organization.casefold(), normalized_stem
+
+
+def test_recipe_backed_model_sizes_have_exact_index_routes_and_one_card():
+    repo_root = Path(__file__).parents[3]
+    model_docs, _ = _load_model_docs(repo_root / "docs")
+    releases = _load_model_releases(repo_root, model_docs)
+    unavailable_hf_models = {
+        # The checked-in recipe currently names an unpublished Hugging Face repository.
+        "nvidia/NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained",
+    }
+    category_by_type = {
+        "LLM": "large-language-models",
+        "Encoder-Decoder": "large-language-models",
+        "VLM": "vision-language-models",
+        "Multimodal": "multimodal",
+        "Omni": "omni",
+        "dLLM": "dllm",
+        "Diffusion": "diffusion",
+        "Embedding": "embedding-models",
+        "Reranking": "reranking-models",
+    }
+
+    index_routes: dict[str, set[str]] = {}
+    providers_by_owner: dict[tuple[str, str], set[str]] = {}
+    duplicates: list[tuple[str, str]] = []
+    for index_path in (repo_root / "docs" / "model-coverage").glob("*/*/index.mdx"):
+        provider_route = _frontmatter_slug(index_path)
+        assert provider_route is not None
+        provider_href = f"/{provider_route}"
+        category = provider_route.split("/")[1]
+        document = index_path.read_text(encoding="utf-8")
+        labels = set()
+        for label, href in re.findall(r"^- \[`([^`]+)`\]\((/model-coverage/[^)]+)\)$", document, re.MULTILINE):
+            normalized_label = label.casefold()
+            if normalized_label in labels:
+                duplicates.append((provider_href, label))
+            labels.add(normalized_label)
+            index_routes.setdefault(provider_href, set()).add(href)
+        for card_path in index_path.parent.glob("*.mdx"):
+            if card_path.name == "index.mdx":
+                continue
+            card = card_path.read_text(encoding="utf-8")
+            for owner in re.findall(r"https://huggingface\.co/([A-Za-z0-9_.-]+)/[A-Za-z0-9_.-]+", card):
+                providers_by_owner.setdefault((category, owner.casefold()), set()).add(provider_href)
+    assert not duplicates, f"Duplicate model names within one provider index: {duplicates}"
+
+    docs_config = yaml.safe_load((repo_root / "docs" / "fern" / "docs.yml").read_text(encoding="utf-8"))
+    redirects = {redirect["source"]: redirect["destination"] for redirect in docs_config["redirects"]}
+    config_path = repo_root / "docs" / "fern" / "versions" / "nightly.yml"
+    navigation = yaml.safe_load(config_path.read_text(encoding="utf-8"))["navigation"]
+    navigated_routes = _collect_fern_routes(navigation, config_dir=config_path.parent)
+
+    destinations_by_group: dict[tuple[str, tuple[str, str]], set[str]] = {}
+    destination_groups: dict[tuple[str, str], set[tuple[str, str]]] = {}
+    missing = []
+    for release in releases:
+        if release.hf_model_id in unavailable_hf_models:
+            continue
+        category = category_by_type[release.model_type]
+        owner, model_name = release.hf_model_id.split("/", 1)
+        model_name = model_name.replace("_", "-")
+        provider_hrefs = {
+            provider_href
+            for provider_href in providers_by_owner.get((category, owner.casefold()), set())
+            if f"{provider_href}/{model_name}" in navigated_routes
+            or f"/nemo/automodel{provider_href}/{model_name}" in redirects
+        }
+        if len(provider_hrefs) != 1:
+            missing.append((release.model_type, release.hf_model_id, f"provider mapping {sorted(provider_hrefs)}"))
+            continue
+        provider_href = next(iter(provider_hrefs))
+        exact_href = f"{provider_href}/{model_name}"
+        source = f"/nemo/automodel{exact_href}"
+        destination = redirects.get(source, source).removeprefix("/nemo/automodel")
+        if destination not in navigated_routes:
+            missing.append((release.model_type, release.hf_model_id, f"navigated card {destination}"))
+            continue
+        if destination not in index_routes.get(provider_href, set()):
+            missing.append((release.model_type, release.hf_model_id, f"provider index card {destination}"))
+            continue
+        group = (release.model_type, _model_size_key(release.hf_model_id))
+        destinations_by_group.setdefault(group, set()).add(destination)
+        destination_groups.setdefault((release.model_type, destination), set()).add(group[1])
+
+    split_groups = {
+        group: destinations for group, destinations in destinations_by_group.items() if len(destinations) != 1
+    }
+    merged_groups = {key: groups for key, groups in destination_groups.items() if len(groups) != 1}
+    assert not missing, f"Recipe-backed checkpoints without exact model-card routes: {missing}"
+    assert not split_groups, f"Same-size checkpoint variants resolve to different cards: {split_groups}"
+    assert not merged_groups, f"Different model sizes resolve to the same card: {merged_groups}"
+
+    meta_aliases = (
+        "/model-coverage/large-language-models/meta/Meta-Llama-3.1-8B",
+        "/model-coverage/large-language-models/meta/Meta-Llama-3.1-8B-Instruct",
+    )
+    meta_destinations = {redirects[f"/nemo/automodel{route}"].removeprefix("/nemo/automodel") for route in meta_aliases}
+    assert meta_destinations == {"/model-coverage/large-language-models/meta/Llama-3.1-8B"}
+
+
 def test_retired_model_routes_redirect_to_provider_indexes():
     repo_root = Path(__file__).parents[3]
     docs_config = yaml.safe_load((repo_root / "docs" / "fern" / "docs.yml").read_text(encoding="utf-8"))
@@ -441,7 +556,7 @@ def test_retired_model_routes_redirect_to_provider_indexes():
     for redirect in relevant_redirects:
         destination = redirect["destination"].removeprefix("/nemo/automodel/nightly")
         destination = destination.removeprefix("/nemo/automodel")
-        assert destination in provider_routes, redirect
+        assert destination in routes, redirect
 
     canonical_model_sources = {
         f"/nemo/automodel{route}" for route in routes - provider_routes if route.startswith("/model-coverage/")
@@ -466,6 +581,8 @@ def test_retired_model_routes_redirect_to_provider_indexes():
 
 def test_internal_model_coverage_links_resolve_to_nightly_routes():
     repo_root = Path(__file__).parents[3]
+    docs_config = yaml.safe_load((repo_root / "docs" / "fern" / "docs.yml").read_text(encoding="utf-8"))
+    redirects = {redirect["source"]: redirect["destination"] for redirect in docs_config["redirects"]}
     config_path = repo_root / "docs" / "fern" / "versions" / "nightly.yml"
     navigation = yaml.safe_load(config_path.read_text(encoding="utf-8"))["navigation"]
     routes = _collect_fern_routes(navigation, config_dir=config_path.parent)
@@ -480,7 +597,9 @@ def test_internal_model_coverage_links_resolve_to_nightly_routes():
             # it is a virtual endpoint rather than an entry in nightly.yml.
             if link == "/model-coverage/llms.txt":
                 continue
-            if link.rstrip("/") not in routes:
+            route = link.rstrip("/")
+            redirected = redirects.get(f"/nemo/automodel{route}", "").removeprefix("/nemo/automodel")
+            if route not in routes and redirected not in routes:
                 broken_links.append((page.relative_to(repo_root), link))
 
     assert not broken_links, "Model coverage links missing from nightly routes:\n" + "\n".join(

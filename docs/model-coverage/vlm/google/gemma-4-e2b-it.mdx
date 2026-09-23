@@ -1,0 +1,49 @@
+---
+title: "Gemma-4-E2B-it"
+description: "Use NeMo AutoModel to fine-tune Gemma-4-E2B-it for VLM workflows with checked-in image-text-to-text recipes and documented distributed settings."
+slug: model-coverage/vision-language-models/google/gemma-4-E2B-it
+---
+
+[Gemma-4-E2B-it](https://huggingface.co/google/gemma-4-E2B-it) has a checked-in NeMo AutoModel recipe for image-text-to-text.
+The Hugging Face configuration declares the `Gemma4ForConditionalGeneration` architecture.
+
+## Fine-Tune Gemma-4-E2B-it
+
+Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+
+```bash
+uv run automodel <recipe-path>
+```
+
+## Standard Recipe Configuration
+
+Start with the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_2b.yaml).
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | - |
+| Strategy | FSDP2; tp_size=1, cp_size=1 |
+| Nodes | 1 |
+| Features | Checkpointing (enabled=true) |
+| Advanced | torch.bfloat16 |
+
+## Alternate Recipe Configuration
+
+- [`gemma4_2b_peft.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_2b_peft.yaml)
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+| --- | --- |
+| Task | Image-text-to-text |
+| Architecture | `Gemma4ForConditionalGeneration` |
+
+### Available Models
+
+- [`google/gemma-4-E2B-it`](https://huggingface.co/google/gemma-4-E2B-it)
+
+## Related Resources
+
+- [Vision-language model fine-tuning guide](/recipes-e2e-examples/vlm-finetune)

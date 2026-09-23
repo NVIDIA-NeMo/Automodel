@@ -1,0 +1,55 @@
+---
+title: "GLM-5.2"
+description: "Use NeMo AutoModel to fine-tune GLM-5.2 for LLM workflows with checked-in text generation recipes and documented distributed settings."
+slug: model-coverage/large-language-models/thudm/GLM-5.2
+---
+
+[GLM-5.2](https://huggingface.co/zai-org/GLM-5.2) has a checked-in NeMo AutoModel recipe for text generation.
+The Hugging Face configuration declares the `GlmMoeDsaForCausalLM` architecture.
+
+## Fine-Tune GLM-5.2
+
+Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+
+```bash
+automodel examples/llm_finetune/glm/glm_5.2_lora.yaml --nproc-per-node 8
+```
+
+Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node run.
+
+## Standard Recipe Configuration
+
+Start with the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.2_lora.yaml).
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | - |
+| Strategy | FSDP2; tp_size=1, pp_size=1, cp_size=1, ep_size=128 |
+| Nodes | 16 |
+| Features | Activation checkpointing (activation_checkpointing=true), Packed sequences (packed_sequence_size=4096), LoRA, HybridEP (dispatcher=hybridep) |
+| Advanced | attention=tilelang, linear=torch, experts=torch_mm, dispatcher=hybridep, sequence length 4096 |
+
+## Alternate Recipe Configuration
+
+- [`glm_5.2_hellaswag_pp.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.2_hellaswag_pp.yaml)
+- [`glm_5.2_tulu3_32k_tilelang_cp8.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.2_tulu3_32k_tilelang_cp8.yaml)
+- [`glm_5.2_tulu3_4k_cudnn_100k.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.2_tulu3_4k_cudnn_100k.yaml)
+- [`glm_5.2_tulu3_4k_tilelang_100k.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.2_tulu3_4k_tilelang_100k.yaml)
+- [`glm_5.2_mok_mxfp8_fineweb_8k.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/glm/glm_5.2_mok_mxfp8_fineweb_8k.yaml)
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| Architecture | `GlmMoeDsaForCausalLM` |
+
+### Available Models
+
+- [`zai-org/GLM-5.2`](https://huggingface.co/zai-org/GLM-5.2)
+
+## Related Resources
+
+- [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)

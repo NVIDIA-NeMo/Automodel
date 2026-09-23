@@ -1,0 +1,49 @@
+---
+title: "Gemma-4-12B"
+description: "Use NeMo AutoModel to fine-tune Gemma-4-12B for LLM workflows with checked-in text generation recipes and documented distributed settings."
+slug: model-coverage/large-language-models/google/gemma-4-12B
+---
+
+[Gemma-4-12B](https://huggingface.co/google/gemma-4-12B) has a checked-in NeMo AutoModel recipe for text generation.
+The Hugging Face configuration declares the `Gemma4UnifiedForConditionalGeneration` architecture.
+
+## Fine-Tune Gemma-4-12B
+
+Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+
+```bash
+automodel examples/llm_finetune/gemma/gemma_4_12b_hellaswag.yaml --nproc-per-node 8
+```
+
+## Standard Recipe Configuration
+
+Start with the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gemma/gemma_4_12b_hellaswag.yaml).
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | - |
+| Strategy | FSDP2; tp_size=1, pp_size=1, cp_size=1 |
+| Nodes | - |
+| Features | Checkpointing (enabled=true) |
+| Advanced | bf16 |
+
+## Alternate Recipe Configuration
+
+- [Standard recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gemma/gemma_4_12b_hellaswag.yaml)
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| Architecture | `Gemma4UnifiedForConditionalGeneration` |
+
+### Available Models
+
+- [`google/gemma-4-12B`](https://huggingface.co/google/gemma-4-12B)
+
+## Related Resources
+
+- [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)

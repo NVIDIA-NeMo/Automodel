@@ -1,0 +1,49 @@
+---
+title: "Devstral-2-123B-Instruct-2512"
+description: "Use NeMo AutoModel to fine-tune Devstral-2-123B-Instruct-2512 for LLM workflows with checked-in text generation recipes and documented distributed settings."
+slug: model-coverage/large-language-models/mistralai/Devstral-2-123B-Instruct-2512
+---
+
+[Devstral-2-123B-Instruct-2512](https://huggingface.co/mistralai/Devstral-2-123B-Instruct-2512) has a checked-in NeMo AutoModel recipe for text generation.
+The Hugging Face configuration declares the `Ministral3ForCausalLM` architecture.
+
+## Fine-Tune Devstral-2-123B-Instruct-2512
+
+Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+
+```bash
+automodel examples/llm_finetune/devstral/devstral2_123b_2512_squad_peft.yaml --nproc-per-node 8
+```
+
+## Standard Recipe Configuration
+
+Start with the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/devstral/devstral2_123b_2512_squad_peft.yaml).
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | - |
+| Strategy | FSDP2; tp_size=8, pp_size=1, cp_size=1, ep_size=1 |
+| Nodes | 1 |
+| Features | Checkpointing (enabled=true), Activation checkpointing (activation_checkpointing=true), LoRA |
+| Advanced | bfloat16 |
+
+## Alternate Recipe Configuration
+
+- [Standard recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/devstral/devstral2_123b_2512_squad_peft.yaml)
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| Architecture | `Ministral3ForCausalLM` |
+
+### Available Models
+
+- [`mistralai/Devstral-2-123B-Instruct-2512`](https://huggingface.co/mistralai/Devstral-2-123B-Instruct-2512)
+
+## Related Resources
+
+- [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)
