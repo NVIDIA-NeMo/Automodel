@@ -73,7 +73,7 @@ model:
     rms_norm: te
     rope_fusion: false
     experts: gmm
-    dispatcher: deepep
+    dispatcher: hybridep  # DeepEP times out in multi-node EP32 CI.
     fake_balanced_gate: true
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
@@ -105,7 +105,7 @@ optimizer:
   weight_decay: 0
 
 ci:
-  time: "00:30:00"
+  time: "00:45:00"
   nodes: 16
   env_vars:
     HF_HUB_OFFLINE: "0"
