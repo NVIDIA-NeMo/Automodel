@@ -31,6 +31,7 @@ from nemo_automodel.components.attention.utils import (
 from nemo_automodel.components.models.common import (
     BackendConfig,
     initialize_linear_module,
+    initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import (
@@ -305,6 +306,19 @@ class MiMoV2RMSNorm(nn.Module):
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
         return self.weight * hidden_states.to(input_dtype)
+
+
+def _initialize_mimo_rms_norm(
+    backend: BackendConfig,
+    hidden_size: int,
+    *,
+    eps: float,
+    dtype: torch.dtype,
+) -> nn.Module:
+    """Construct a MiMo RMSNorm from the configured backend."""
+    if backend.rms_norm == "torch_fp32":
+        return MiMoV2RMSNorm(hidden_size, eps=eps, dtype=dtype)
+    return initialize_rms_norm_module(backend.rms_norm, hidden_size, eps=eps, dtype=dtype)
 
 
 class MiMoV2FlashAttention(nn.Module):
@@ -617,8 +631,12 @@ class MiMoV2FlashBlock(nn.Module):
                 bias=False,
             )
 
-        self.input_layernorm = MiMoV2RMSNorm(config.hidden_size, eps=config.layernorm_epsilon, dtype=dtype)
-        self.post_attention_layernorm = MiMoV2RMSNorm(config.hidden_size, eps=config.layernorm_epsilon, dtype=dtype)
+        self.input_layernorm = _initialize_mimo_rms_norm(
+            backend, config.hidden_size, eps=config.layernorm_epsilon, dtype=dtype
+        )
+        self.post_attention_layernorm = _initialize_mimo_rms_norm(
+            backend, config.hidden_size, eps=config.layernorm_epsilon, dtype=dtype
+        )
         self.layer_idx = layer_idx
 
     def forward(
@@ -712,7 +730,9 @@ class MiMoV2FlashModel(nn.Module):
                 for layer_id in range(config.num_hidden_layers)
             }
         )
-        self.norm = MiMoV2RMSNorm(config.hidden_size, eps=config.layernorm_epsilon, dtype=dtype)
+        self.norm = _initialize_mimo_rms_norm(
+            backend, config.hidden_size, eps=config.layernorm_epsilon, dtype=dtype
+        )
         self.rotary_emb = MiMoV2FlashRotaryEmbedding(
             rope_theta=float(config.rope_theta),
             head_dim=int(config.head_dim),

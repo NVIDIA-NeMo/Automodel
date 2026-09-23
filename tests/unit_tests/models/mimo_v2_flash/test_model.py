@@ -26,6 +26,7 @@ from nemo_automodel.components.models.mimo_v2_flash.model import (
     MiMoV2FlashBlock,
     MiMoV2FlashForCausalLM,
     MiMoV2FlashModel,
+    MiMoV2RMSNorm,
     ModelClass,
     _validate_te_thd_sink_cudnn,
 )
@@ -243,6 +244,55 @@ class TestMiMoV2FlashModel:
     def test_layer_count_matches_config(self, tiny_config, backend_config):
         model = MiMoV2FlashModel(tiny_config, backend_config)
         assert len(model.layers) == tiny_config.num_hidden_layers
+
+    def test_torch_fp32_uses_mimo_reference_rms_norm(self, tiny_config, backend_config):
+        backend_config.rms_norm = "torch_fp32"
+
+        with patch(
+            "nemo_automodel.components.models.mimo_v2_flash.model.initialize_rms_norm_module"
+        ) as rms_norm_factory:
+            model = MiMoV2FlashModel(tiny_config, backend_config)
+
+        rms_norm_factory.assert_not_called()
+        assert isinstance(model.norm, MiMoV2RMSNorm)
+        for layer in model.layers.values():
+            assert isinstance(layer.input_layernorm, MiMoV2RMSNorm)
+            assert isinstance(layer.post_attention_layernorm, MiMoV2RMSNorm)
+
+    def test_non_reference_rms_norm_backend_uses_common_factory(self, tiny_config, backend_config):
+        backend_config.rms_norm = "te"
+        constructed_norms = []
+
+        def build_rms_norm(
+            rms_norm_impl: str,
+            dim: int,
+            *,
+            eps: float,
+            dtype: torch.dtype,
+        ) -> torch.nn.Module:
+            assert rms_norm_impl == "te"
+            assert dim == tiny_config.hidden_size
+            assert eps == tiny_config.layernorm_epsilon
+            assert dtype == torch.float32
+            norm = torch.nn.RMSNorm(dim, eps=eps, dtype=dtype)
+            constructed_norms.append(norm)
+            return norm
+
+        with patch(
+            "nemo_automodel.components.models.mimo_v2_flash.model.initialize_rms_norm_module",
+            side_effect=build_rms_norm,
+        ) as rms_norm_factory:
+            model = MiMoV2FlashModel(tiny_config, backend_config)
+
+        expected_norms = [
+            norm
+            for layer in model.layers.values()
+            for norm in (layer.input_layernorm, layer.post_attention_layernorm)
+        ]
+        expected_norms.append(model.norm)
+        assert rms_norm_factory.call_count == 2 * tiny_config.num_hidden_layers + 1
+        assert len(constructed_norms) == len(expected_norms)
+        assert all(actual is expected for actual, expected in zip(constructed_norms, expected_norms))
 
     def test_has_swa_rotary_emb_only_when_sliding_present(self, tiny_config, backend_config):
         """swa_rotary_emb is always constructed (used by sliding layers)."""
