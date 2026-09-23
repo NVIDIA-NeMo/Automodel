@@ -88,9 +88,10 @@ distributed:
     frozen_sharding: replicate
 
 freeze_config:
-  freeze_vision_tower: true
-  freeze_audio_tower: true
-  freeze_language_model: false
+  freeze_modules:
+    - path: vision_model
+  unfreeze_modules:
+    - path: vision_projector
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
