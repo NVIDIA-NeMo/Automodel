@@ -16,6 +16,7 @@ import json
 
 import pytest
 
+from nemo_automodel._transformers.hf_cache import call_with_cached_files_first
 from nemo_automodel.components.config.loader import ConfigNode
 
 
@@ -63,22 +64,23 @@ def test_cache_miss_falls_back_to_download(tmp_path):
             cached_config.write_text(json.dumps({"model_type": model_id}))
         return json.loads(cached_config.read_text())
 
-    cfg = ConfigNode({"_target_": from_pretrained})
-    assert cfg.instantiate("test-model") == {"model_type": "test-model"}
+    assert call_with_cached_files_first(from_pretrained, "test-model") == {"model_type": "test-model"}
     assert cached_config.is_file()
 
 
 @pytest.mark.parametrize("local_only", [True, False])
-@pytest.mark.parametrize("runtime_override", [True, False])
-def test_explicit_cache_policy_is_preserved(local_only, runtime_override):
+def test_explicit_cache_policy_is_preserved(local_only):
     def from_pretrained(*, local_files_only):
         return local_files_only
 
-    cfg = ConfigNode(
-        {"_target_": from_pretrained, "local_files_only": not local_only if runtime_override else local_only}
-    )
-    kwargs = {"local_files_only": local_only} if runtime_override else {}
-    assert cfg.instantiate(**kwargs) is local_only
+    assert call_with_cached_files_first(from_pretrained, local_files_only=local_only) is local_only
+
+
+def test_force_download_keeps_online_resolution():
+    def from_pretrained(*, local_files_only=False, force_download=False):
+        return local_files_only, force_download
+
+    assert call_with_cached_files_first(from_pretrained, force_download=True) == (False, True)
 
 
 def test_environment_opt_out_preserves_default(monkeypatch):
@@ -87,14 +89,14 @@ def test_environment_opt_out_preserves_default(monkeypatch):
     def from_pretrained(*, local_files_only=False):
         return local_files_only
 
-    assert ConfigNode({"_target_": from_pretrained}).instantiate() is False
+    assert call_with_cached_files_first(from_pretrained) is False
 
 
 def test_callable_without_local_files_only_remains_supported():
     def from_pretrained(model_id):
         return model_id
 
-    assert ConfigNode({"_target_": from_pretrained}).instantiate("test-model") == "test-model"
+    assert call_with_cached_files_first(from_pretrained, "test-model") == "test-model"
 
 
 @pytest.mark.parametrize("error_type", [ValueError, TypeError, RuntimeError])
@@ -107,7 +109,7 @@ def test_unrelated_failure_is_not_retried(error_type):
         raise error
 
     with pytest.raises(error_type) as caught:
-        ConfigNode({"_target_": from_pretrained}).instantiate()
+        call_with_cached_files_first(from_pretrained)
     assert caught.value is error
     assert len(attempts) == 1
 
@@ -121,7 +123,7 @@ def test_download_failure_is_propagated():
         raise error
 
     with pytest.raises(OSError) as caught:
-        ConfigNode({"_target_": from_pretrained}).instantiate()
+        call_with_cached_files_first(from_pretrained)
     assert caught.value is error
 
 
@@ -130,3 +132,10 @@ def test_other_targets_keep_their_default_behavior():
         return local_files_only
 
     assert ConfigNode({"_target_": factory}).instantiate() is False
+
+
+def test_non_auto_config_from_pretrained_is_unchanged():
+    def from_pretrained(*, local_files_only=False):
+        return local_files_only
+
+    assert ConfigNode({"_target_": from_pretrained}).instantiate() is False

@@ -768,6 +768,24 @@ class TestGetHfConfigCustomRegistry:
         mock_resolve.assert_called_once_with("am_future")
         mock_auto_config.assert_not_called()
 
+    def test_direct_model_config_load_reads_cache_first(self):
+        config = MagicMock()
+        with (
+            patch(
+                "nemo_automodel._transformers.model_init.PretrainedConfig.get_config_dict",
+                return_value=({"model_type": "not_registered"}, {}),
+            ) as get_config_dict,
+            patch("nemo_automodel._transformers.model_init.resolve_custom_config_cls", return_value=None),
+            patch(
+                "nemo_automodel._transformers.model_init.AutoConfig.from_pretrained",
+                return_value=config,
+            ) as from_pretrained,
+        ):
+            assert get_hf_config("org/model", "eager") is config
+
+        assert get_config_dict.call_args.kwargs["local_files_only"] is True
+        assert from_pretrained.call_args.kwargs["local_files_only"] is True
+
     def test_unknown_custom_config_falls_back_to_auto_config(self):
         fallback_config = MagicMock()
         with (
