@@ -18,6 +18,9 @@ title: NVIDIA NeMo AutoModel
 # js / css) intentionally do NOT appear below.
 global-theme: nvidia
 
+theme:
+  sidebar: default
+
 # NVIDIA green (#76B900) does not meet WCAG AA contrast for normal text on
 # white. Keep the brand hue while using accessible light and dark variants.
 colors:

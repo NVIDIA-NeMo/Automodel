@@ -307,6 +307,8 @@ def test_committed_generated_tables_are_rejected(tmp_path):
 
 def test_model_coverage_pages_use_provider_sections_and_checkpoint_slugs():
     repo_root = Path(__file__).parents[3]
+    docs_config = yaml.safe_load((repo_root / "docs" / "fern" / "docs.yml").read_text(encoding="utf-8"))
+    assert docs_config.get("theme", {}).get("sidebar") == "default", "Provider icons require the default sidebar"
     config_path = repo_root / "docs" / "fern" / "versions" / "nightly.yml"
     navigation = yaml.safe_load(config_path.read_text(encoding="utf-8"))["navigation"]
     model_coverage = next(item for item in navigation if item.get("section") == "Model Coverage")
