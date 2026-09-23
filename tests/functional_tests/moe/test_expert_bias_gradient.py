@@ -93,7 +93,7 @@ def test_apply_bias_triton_gradient_matches_fp64_under_cancellation():
     assert _BIAS_GRAD_TRITON_AVAILABLE
     device = torch.device(f"cuda:{torch.cuda.current_device()}")
     n_experts = 4
-    n_tokens = 4096
+    n_tokens = 16384
     hidden = 64
 
     value = torch.zeros(n_tokens, hidden, dtype=torch.bfloat16, device=device)
@@ -143,12 +143,13 @@ def test_apply_bias_triton_backward_is_inductor_fullgraph_compatible():
     """The weighted Triton backward remains inside an Inductor full graph."""
     assert _BIAS_GRAD_TRITON_AVAILABLE
     device = torch.device(f"cuda:{torch.cuda.current_device()}")
-    tokens_per_expert = torch.tensor([0, 2, 6, 1], dtype=torch.long, device=device)
+    tokens_per_expert = torch.tensor([0, 4096, 8192, 1], dtype=torch.long, device=device)
+    n_tokens = int(tokens_per_expert.sum())
 
     torch.manual_seed(7)
-    value = torch.randn(9, 8, dtype=torch.bfloat16, device=device, requires_grad=True)
+    value = torch.randn(n_tokens, 8, dtype=torch.bfloat16, device=device, requires_grad=True)
     bias = torch.randn(4, 8, dtype=torch.bfloat16, device=device, requires_grad=True)
-    permuted_probs = torch.rand(9, 1, dtype=torch.float32, device=device, requires_grad=True)
+    permuted_probs = torch.rand(n_tokens, 1, dtype=torch.float32, device=device, requires_grad=True)
     upstream_grad = torch.randn_like(value)
     compiled_apply_bias = torch.compile(_apply_bias, fullgraph=True)
 

@@ -929,6 +929,38 @@ class TestGroupedExpertsDeepEP:
         torch.testing.assert_close(bias.grad, expected_bias_grad)
         torch.testing.assert_close(permuted_probs.grad, expected_probs_grad)
 
+    def test_grouped_experts_deepep_apply_bias_large_weighted_path(self, moe_config):
+        """Large weighted bias additions preserve values and all gradients."""
+        _ = GroupedExpertsDeepEP(moe_config)
+        tokens_per_expert = torch.tensor([0, 4097, 8192, 0])
+        n_tokens = int(tokens_per_expert.sum())
+
+        torch.manual_seed(123)
+        value = torch.randn(n_tokens, 4, dtype=torch.float64, requires_grad=True)
+        bias = torch.randn(4, 4, dtype=torch.float64, requires_grad=True)
+        permuted_probs = torch.rand(n_tokens, 1, dtype=torch.float64, requires_grad=True)
+        upstream_grad = torch.randn_like(value)
+
+        expected_value = value.detach().clone().requires_grad_()
+        expected_bias = bias.detach().clone().requires_grad_()
+        expected_probs = permuted_probs.detach().clone().requires_grad_()
+        expected_bias_rows = torch.repeat_interleave(
+            expected_bias,
+            tokens_per_expert,
+            dim=0,
+            output_size=n_tokens,
+        )
+        expected = expected_value + expected_bias_rows * expected_probs
+        expected.backward(upstream_grad)
+
+        result = _apply_bias(value, bias, tokens_per_expert, permuted_probs)
+        result.backward(upstream_grad)
+
+        torch.testing.assert_close(result, expected)
+        torch.testing.assert_close(value.grad, expected_value.grad)
+        torch.testing.assert_close(bias.grad, expected_bias.grad)
+        torch.testing.assert_close(permuted_probs.grad, expected_probs.grad)
+
     @pytest.mark.parametrize(
         ("bias_requires_grad", "use_probs", "expected_bias_grad_dtype", "expected_probs_grad_dtype"),
         [

@@ -38,6 +38,10 @@ from nemo_automodel.shared.import_utils import safe_import
 _HAVE_TRITON, triton = safe_import("triton")
 _HAVE_TRITON_LANGUAGE, tl = safe_import("triton.language")
 _BIAS_GRAD_TRITON_AVAILABLE = _HAVE_TRITON and _HAVE_TRITON_LANGUAGE and hasattr(tl, "make_tensor_descriptor")
+# Bound each GPT-OSS-sized FP32 temporary to about 45 MiB while leaving small
+# dispatches on the faster single-operation path.
+_BIAS_CHUNK_ROWS = 4096
+_BIAS_CHUNK_THRESHOLD = 12288
 
 
 def _allocate_triton_workspace(size: int, alignment: int, stream: int | None) -> torch.Tensor:
@@ -61,9 +65,11 @@ if _BIAS_GRAD_TRITON_AVAILABLE:
     def _deterministic_bias_grad_kernel(
         grad_output_ptr,
         token_offsets_ptr,
+        probs_ptr,
         grad_bias_ptr,
         n_tokens,
         hidden: tl.constexpr,
+        USE_PROBS: tl.constexpr,
         BLOCK_TOKENS: tl.constexpr,
         BLOCK_HIDDEN: tl.constexpr,
     ):
@@ -91,6 +97,9 @@ if _BIAS_GRAD_TRITON_AVAILABLE:
             token_offsets = token_block_start + tl.arange(0, BLOCK_TOKENS)
             values = grad_output.load([token_block_start, hidden_block_start]).to(tl.float32)
             values = tl.where(token_offsets[:, None] < token_end, values, 0.0)
+            if USE_PROBS:
+                probs = tl.load(probs_ptr + token_offsets, mask=token_offsets < token_end, other=0.0).to(tl.float32)
+                values *= probs[:, None]
             block_sum = tl.sum(values, axis=0)
 
             # Kahan compensation protects the serial accumulation of the balanced
@@ -272,18 +281,28 @@ def _reduce_bias_grad_fallback(grad_output: torch.Tensor, token_counts: torch.Te
     return grad_bias.view(hidden, token_counts.numel()).transpose(0, 1).contiguous().to(grad_output.dtype)
 
 
-def _reduce_bias_grad_triton(grad_output: torch.Tensor, token_counts: torch.Tensor) -> torch.Tensor:
+def _reduce_bias_grad_triton(
+    grad_output: torch.Tensor,
+    token_counts: torch.Tensor,
+    probs: torch.Tensor | None = None,
+    output_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
     """Reduce grouped CUDA token gradients with deterministic compensated FP32 sums.
 
     Args:
         grad_output: Contiguous CUDA tensor of shape [tokens, hidden], grouped by expert. Supported dtypes are
             FP16, BF16, and FP32.
         token_counts: Contiguous CUDA tensor of shape [experts] containing each segment length.
+        probs: Optional FP32 routing probabilities of shape [tokens, 1].
+        output_dtype: Result dtype. Defaults to ``grad_output.dtype``.
 
     Returns:
-        CUDA tensor of shape [experts, hidden] and the same dtype as ``grad_output``.
+        CUDA tensor of shape [experts, hidden] and ``output_dtype`` when provided,
+        otherwise the same dtype as ``grad_output``.
     """
     grad_output = grad_output.contiguous()
+    if probs is not None:
+        probs = probs.contiguous()
     hidden = grad_output.shape[1]
     token_offsets = torch.cat((token_counts.new_zeros(1), token_counts.cumsum(dim=0)))
     grad_bias = torch.empty((token_counts.numel(), hidden), dtype=torch.float32, device=grad_output.device)
@@ -294,14 +313,16 @@ def _reduce_bias_grad_triton(grad_output: torch.Tensor, token_counts: torch.Tens
     _deterministic_bias_grad_kernel[grid](
         grad_output,
         token_offsets,
+        probs if probs is not None else grad_output,
         grad_bias,
         grad_output.shape[0],
         hidden,
+        USE_PROBS=probs is not None,
         BLOCK_TOKENS=128,
         BLOCK_HIDDEN=block_hidden,
         num_warps=4,
     )
-    return grad_bias.to(grad_output.dtype)
+    return grad_bias.to(output_dtype or grad_output.dtype)
 
 
 class _DeterministicBiasRepeatInterleave(Function):
@@ -351,6 +372,121 @@ class _DeterministicBiasRepeatInterleave(Function):
         return grad_bias, None, None
 
 
+def _reduce_weighted_bias_grad_fallback(
+    grad_output: torch.Tensor,
+    token_counts: torch.Tensor,
+    probs: torch.Tensor,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Reduce probability-weighted bias gradients without full-size intermediates.
+
+    Args:
+        grad_output: Tensor of shape [tokens, hidden], grouped contiguously by expert.
+        token_counts: Tensor of shape [experts] containing each contiguous segment length.
+        probs: Routing probabilities of shape [tokens, 1].
+        output_dtype: Result dtype.
+
+    Returns:
+        Tensor of shape [experts, hidden] with one weighted gradient sum per expert.
+    """
+    accumulation_dtype = torch.float64 if not grad_output.is_cuda else torch.float32
+    counts = token_counts.tolist()
+    expert_grads = []
+    token_start = 0
+    for count in counts:
+        partials = []
+        token_end = token_start + count
+        for chunk_start in range(token_start, token_end, _BIAS_CHUNK_ROWS):
+            chunk_end = min(chunk_start + _BIAS_CHUNK_ROWS, token_end)
+            partials.append(
+                (
+                    grad_output[chunk_start:chunk_end].to(accumulation_dtype)
+                    * probs[chunk_start:chunk_end].to(accumulation_dtype)
+                ).sum(dim=0)
+            )
+        if partials:
+            expert_grads.append(torch.stack(partials).sum(dim=0))
+        else:
+            expert_grads.append(torch.zeros(grad_output.shape[1], dtype=accumulation_dtype, device=grad_output.device))
+        token_start = token_end
+    return torch.stack(expert_grads).to(output_dtype)
+
+
+class _WeightedBiasAdd(Function):
+    """Add probability-weighted expert bias without materializing it per token."""
+
+    @staticmethod
+    def forward(ctx, value, bias, token_counts, probs):
+        """Add expert bias in bounded row chunks.
+
+        Args:
+            ctx: Autograd context used to retain the compact inputs.
+            value: Grouped expert output of shape [tokens, hidden].
+            bias: Per-expert bias of shape [experts, hidden].
+            token_counts: Tensor of shape [experts] containing nonnegative token counts.
+            probs: FP32 routing probabilities of shape [tokens, 1].
+
+        Returns:
+            Tensor of shape [tokens, hidden] and the same dtype as ``value``.
+        """
+        expert_ids = torch.repeat_interleave(
+            torch.arange(token_counts.numel(), device=token_counts.device),
+            token_counts,
+            output_size=value.shape[0],
+        )
+        ctx.save_for_backward(bias, token_counts, probs, expert_ids)
+        output = torch.empty_like(value)
+        compute_dtype = torch.promote_types(value.dtype, torch.promote_types(bias.dtype, probs.dtype))
+        for start in range(0, value.shape[0], _BIAS_CHUNK_ROWS):
+            end = min(start + _BIAS_CHUNK_ROWS, value.shape[0])
+            bias_rows = bias.index_select(0, expert_ids[start:end]).to(compute_dtype)
+            output[start:end] = (
+                value[start:end].to(compute_dtype) + bias_rows * probs[start:end].to(compute_dtype)
+            ).to(value.dtype)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Compute value, bias, and probability gradients in bounded memory.
+
+        Args:
+            ctx: Autograd context containing bias, counts, probabilities, and expert IDs.
+            grad_output: Upstream gradient of shape [tokens, hidden].
+
+        Returns:
+            Gradients for ``value``, ``bias``, and ``probs``; token counts are non-differentiable.
+        """
+        bias, token_counts, probs, expert_ids = ctx.saved_tensors
+        grad_value = grad_output if ctx.needs_input_grad[0] else None
+        grad_bias = None
+        grad_probs = None
+        if ctx.needs_input_grad[1]:
+            use_triton = (
+                _BIAS_GRAD_TRITON_AVAILABLE
+                and grad_output.is_cuda
+                and grad_output.dtype in (torch.float16, torch.bfloat16, torch.float32)
+                and probs.dtype == torch.float32
+                and grad_output.shape[0] < 2**31
+                and grad_output.shape[1] * grad_output.element_size() % 16 == 0
+                and not torch.is_grad_enabled()
+            )
+            grad_bias = (
+                _reduce_bias_grad_triton(grad_output, token_counts, probs, bias.dtype)
+                if use_triton
+                else _reduce_weighted_bias_grad_fallback(grad_output, token_counts, probs, bias.dtype)
+            )
+        if ctx.needs_input_grad[3]:
+            grad_probs = torch.empty_like(probs)
+            compute_dtype = torch.promote_types(probs.dtype, torch.promote_types(grad_output.dtype, bias.dtype))
+            for start in range(0, grad_output.shape[0], _BIAS_CHUNK_ROWS):
+                end = min(start + _BIAS_CHUNK_ROWS, grad_output.shape[0])
+                bias_rows = bias.index_select(0, expert_ids[start:end]).to(compute_dtype)
+                grad_probs[start:end] = (
+                    (grad_output[start:end].to(compute_dtype) * bias_rows).sum(dim=-1, keepdim=True).to(probs.dtype)
+                )
+        return grad_value, grad_bias, None, grad_probs
+
+
 def _apply_bias(value, bias, tokens_per_expert, permuted_probs=None):
     """Apply per-expert bias to grouped GEMM output.
 
@@ -378,6 +514,13 @@ def _apply_bias(value, bias, tokens_per_expert, permuted_probs=None):
     shape = value.shape
     flat_value = value.reshape(-1, shape[-1])
     token_counts = torch.as_tensor(tokens_per_expert, device=bias.device, dtype=torch.long)
+    if (
+        permuted_probs is not None
+        and permuted_probs.dim() == 2
+        and permuted_probs.shape == (flat_value.shape[0], 1)
+        and flat_value.shape[0] > _BIAS_CHUNK_THRESHOLD
+    ):
+        return _WeightedBiasAdd.apply(flat_value, bias, token_counts, permuted_probs).view(shape)
     if torch.is_grad_enabled() and bias.requires_grad:
         bias_to_expand = bias
         if permuted_probs is not None:
