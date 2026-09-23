@@ -37,6 +37,7 @@ from nemo_automodel.components.models.glm5_next.layers import (
 )
 from nemo_automodel.components.models.glm5_next.vision import Glm5NextVisionModel, Glm5NextVisionOutput
 from nemo_automodel.components.moe.config import MoEConfig
+from nemo_automodel.components.moe.fp8_qdq import FP8QDQConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
@@ -68,6 +69,8 @@ def build_glm5_next_moe_config(
         expert_bias=False,
         expert_activation="swiglu",
         apply_router_weight_after_down=True,
+        routed_fp8_qdq=FP8QDQConfig(weights=config.routed_fp8_weight_qdq, activations=config.routed_fp8_activation_qdq),
+        shared_fp8_qdq=FP8QDQConfig(weights=config.shared_fp8_weight_qdq, activations=config.shared_fp8_activation_qdq),
         swiglu_limit=config.swiglu_limit,
         softmax_before_topk=False,
         router_weights_fp32=True,

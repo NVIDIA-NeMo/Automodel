@@ -14,11 +14,12 @@
 
 """MoE model configuration."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 import torch
 
+from nemo_automodel.components.moe.fp8_qdq import FP8QDQConfig
 from nemo_automodel.shared.utils import dtype_from_str
 
 
@@ -70,6 +71,8 @@ class MoEConfig:
     # expert selection so RL training reuses the rollout's routing decisions. See
     # nemo_automodel.components.moe.router_replay.
     enable_routing_replay: bool = False
+    routed_fp8_qdq: FP8QDQConfig = field(default_factory=FP8QDQConfig)
+    shared_fp8_qdq: FP8QDQConfig = field(default_factory=FP8QDQConfig)
 
     @property
     def expert_dim(self) -> int:
@@ -77,6 +80,11 @@ class MoEConfig:
         return self.moe_latent_size if self.moe_latent_size is not None else self.dim
 
     def __post_init__(self):
+        if self.routed_fp8_qdq.enabled:
+            if self.expert_bias or self.expert_activation != "swiglu" or not self.apply_router_weight_after_down:
+                raise ValueError("Routed FP8 QDQ requires bias-free SwiGLU and apply_router_weight_after_down=True")
+            if self.expert_dim % 128 or self.moe_inter_dim % 128:
+                raise ValueError("Routed FP8 QDQ requires expert dimensions divisible by 128")
         if isinstance(self.dtype, str):
             self.dtype = dtype_from_str(self.dtype, default=torch.bfloat16)
         if isinstance(self.gate_dtype, str):

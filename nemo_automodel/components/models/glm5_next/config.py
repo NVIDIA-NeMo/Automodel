@@ -66,6 +66,13 @@ class Glm5NextTextConfig(PretrainedConfig):
         index_n_heads: int = 32,
         index_kpool: int = 16,
         index_kpool_always_select_tail: bool = True,
+        indexer_fp8_fake_quant: bool = False,
+        dense_fp8_weight_qdq: bool = False,
+        dense_fp8_activation_qdq: bool = False,
+        routed_fp8_weight_qdq: bool = False,
+        routed_fp8_activation_qdq: bool = False,
+        shared_fp8_weight_qdq: bool = False,
+        shared_fp8_activation_qdq: bool = False,
         hidden_act: str = "silu",
         swiglu_limit: float = 10.0,
         linear_head_dim: int = 128,
@@ -160,6 +167,15 @@ class Glm5NextTextConfig(PretrainedConfig):
         self.index_n_heads = index_n_heads
         self.index_kpool = index_kpool
         self.index_kpool_always_select_tail = index_kpool_always_select_tail
+        if indexer_fp8_fake_quant and (index_head_dim != 128 or qk_rope_head_dim != 0):
+            raise ValueError("indexer_fp8_fake_quant requires index_head_dim=128 and qk_rope_head_dim=0")
+        self.indexer_fp8_fake_quant = indexer_fp8_fake_quant
+        self.dense_fp8_weight_qdq = dense_fp8_weight_qdq
+        self.dense_fp8_activation_qdq = dense_fp8_activation_qdq
+        self.routed_fp8_weight_qdq = routed_fp8_weight_qdq
+        self.routed_fp8_activation_qdq = routed_fp8_activation_qdq
+        self.shared_fp8_weight_qdq = shared_fp8_weight_qdq
+        self.shared_fp8_activation_qdq = shared_fp8_activation_qdq
 
         if linear_attn_config is not None:
             linear_head_dim = linear_attn_config.get("head_dim", linear_head_dim)

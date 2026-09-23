@@ -32,6 +32,7 @@ from nemo_automodel.components.moe.experts import (
 from nemo_automodel.components.moe.experts import (
     _init_weights as _init_expert_weights,
 )
+from nemo_automodel.components.moe.fp8_qdq import FP8QDQConfig
 from nemo_automodel.components.moe.megatron.moe_utils import (
     MoEAuxLossAutoScaler,
 )
@@ -60,6 +61,8 @@ class MLP(nn.Module):
         activation: str = "swiglu",
         bias: bool = False,
         swiglu_limit: float = 0.0,
+        *,
+        fp8_qdq: FP8QDQConfig | None = None,
     ):
         """
         Initializes the MLP layer.
@@ -74,10 +77,25 @@ class MLP(nn.Module):
             swiglu_limit (float): When > 0 and activation is gated, run SwiGLU
                 in fp32 with one-sided gate clamp ``max=limit`` and symmetric
                 up clamp ``±limit``. Matches DSV4 reference ``Expert.forward``.
+            fp8_qdq: Opt-in block FP8 simulation using torch linears and identity
+                STE; leaves parameter storage and state-dict names unchanged.
         """
         super().__init__()
         if activation not in ("swiglu", "relu2"):
             raise ValueError(f"Unsupported activation: {activation}. Choose 'swiglu' or 'relu2'.")
+
+        if fp8_qdq is not None and fp8_qdq.enabled:
+            if activation != "swiglu" or bias:
+                raise ValueError("FP8 FFN QDQ requires bias-free SwiGLU")
+            # Opt-in fake quantization uses ordinary torch BF16 linears, even
+            # when the unquantized model selects TE. State-dict names are kept.
+            self.up_proj = fp8_qdq.build(in_features=dim, out_features=inter_dim, bias=False, dtype=dtype)
+            self.gate_proj = fp8_qdq.build(in_features=dim, out_features=inter_dim, bias=False, dtype=dtype)
+            self.down_proj = fp8_qdq.build(in_features=inter_dim, out_features=dim, bias=False, dtype=dtype)
+            self.activation = activation
+            self.is_gated = True
+            self.swiglu_limit = float(swiglu_limit)
+            return
 
         self.activation = activation
         self.is_gated = is_gated_activation(activation)
@@ -766,6 +784,12 @@ class MoE(nn.Module):
         """
         super().__init__()
         self.backend = backend
+        if config.routed_fp8_qdq.enabled and (
+            backend.experts not in ("torch", "torch_mm", "gmm") or backend.dispatcher == "mok"
+        ):
+            raise ValueError(
+                "Routed FP8 QDQ supports torch/torch_mm/gmm experts with standard or DeepEP/HybridEP dispatch"
+            )
         self.dim = config.dim
         self.n_routed_experts = config.n_routed_experts
         self.n_activated_experts = config.n_activated_experts
@@ -821,6 +845,7 @@ class MoE(nn.Module):
                 activation=config.shared_expert_activation,
                 bias=config.expert_bias,
                 swiglu_limit=config.swiglu_limit,
+                fp8_qdq=config.shared_fp8_qdq,
             )
             if config.shared_expert_gate:
                 self.shared_expert_gate = initialize_linear_module(

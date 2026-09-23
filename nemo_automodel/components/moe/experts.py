@@ -32,6 +32,7 @@ except ImportError:
     print("grouped_gemm is not available. Please run:pip install git+https://github.com/fanshiqing/grouped_gemm@v1.1.4")
 
 from nemo_automodel.components.moe.config import MoEConfig
+from nemo_automodel.components.moe.fp8_qdq import FP8QDQConfig
 from nemo_automodel.components.moe.megatron.moe_utils import (
     weighted_bias_geglu_impl,
     weighted_bias_swiglu_impl,
@@ -589,7 +590,26 @@ class GroupedExperts(nn.Module):
         experts_start_idx,
         experts_end_idx,
     ):
-        """Per-expert loop forward path using gather/scatter."""
+        """Per-expert loop forward path using gather/scatter.
+
+        Args:
+            x: Gathered token tensor [tokens, hidden].
+            weights: Routing probabilities [tokens, topk].
+            indices: Global expert IDs [tokens, topk].
+            token_mask: Valid-token mask [tokens].
+            gate_and_up_projs: Local weights [local_experts, hidden, 2 * intermediate],
+                with gate then up columns; unsharded along the matrix axes.
+            down_projs: Local weights [local_experts, intermediate, hidden].
+            gate_up_proj_bias: Optional bias [local_experts, 2 * intermediate].
+            down_proj_bias: Optional bias [local_experts, hidden].
+            n_local_experts: Number of experts on this EP rank.
+            experts_start_idx: First global expert index on this EP rank.
+            experts_end_idx: Exclusive last global expert index on this EP rank.
+
+        Returns:
+            FP32 tensor [tokens, topk, hidden] when weighting after down,
+            otherwise [tokens, hidden], before cross-rank reduction.
+        """
         output_shape = (
             (x.shape[0], weights.shape[1], x.shape[1]) if self.config.apply_router_weight_after_down else x.shape
         )
@@ -615,6 +635,10 @@ class GroupedExperts(nn.Module):
             expert_gate_up_proj_bias = gate_up_proj_bias[local_idx] if gate_up_proj_bias is not None else None
 
             # Up projection (separate from activation, matching DeepEP pattern)
+            qdq = self.config.routed_fp8_qdq
+            x_idx = qdq.activation(x_idx)
+            gate_and_up_proj = qdq.weight(gate_and_up_proj.T).T
+            down_proj = qdq.weight(down_proj.T).T
             gate_and_up_out = x_idx @ gate_and_up_proj
             if expert_gate_up_proj_bias is not None:
                 gate_and_up_out = gate_and_up_out + expert_gate_up_proj_bias
@@ -626,7 +650,7 @@ class GroupedExperts(nn.Module):
             activated = self.expert_activation_grouped(gate_and_up_out, activation_weight)
 
             # Down projection
-            expert_out = activated @ down_proj
+            expert_out = qdq.activation(activated) @ down_proj
             if expert_down_proj_bias is not None:
                 expert_out = expert_out + (
                     expert_down_proj_bias if self.config.apply_router_weight_after_down else expert_down_proj_bias * w
@@ -666,7 +690,25 @@ class GroupedExperts(nn.Module):
         n_local_experts,
         experts_start_idx,
     ):
-        """Grouped GEMM forward path using torch._grouped_mm."""
+        """Grouped GEMM forward path using torch._grouped_mm.
+
+        Args:
+            x: Gathered token tensor [tokens, hidden].
+            weights: Routing probabilities [tokens, topk].
+            indices: Global expert IDs [tokens, topk].
+            token_mask: Valid-token mask [tokens].
+            gate_and_up_projs: Local weights [local_experts, hidden, 2 * intermediate],
+                with gate then up columns; unsharded along the matrix axes.
+            down_projs: Local weights [local_experts, intermediate, hidden].
+            gate_up_proj_bias: Optional bias [local_experts, 2 * intermediate].
+            down_proj_bias: Optional bias [local_experts, hidden].
+            n_local_experts: Number of experts on this EP rank.
+            experts_start_idx: First global expert index on this EP rank.
+
+        Returns:
+            FP32 tensor [tokens, topk, hidden] when weighting after down,
+            otherwise [tokens, hidden], before cross-rank reduction.
+        """
         (
             sorted_token_ids,
             sorted_slot_ids,
@@ -724,6 +766,7 @@ class GroupedExperts(nn.Module):
                     activation_probs,
                     self.expert_activation_grouped,
                     use_mxfp8=self.use_mxfp8,
+                    fp8_qdq=self.config.routed_fp8_qdq,
                 )
 
             if self.config.apply_router_weight_after_down:
@@ -1072,9 +1115,14 @@ class GroupedExpertsDeepEP(nn.Module):
                         activation_probs,
                         self.expert_activation,
                         use_mxfp8=self.use_mxfp8,
+                        fp8_qdq=self.config.routed_fp8_qdq,
                     )
             else:
                 tokens_per_expert = tokens_per_expert.to("cpu")
+                qdq = self.config.routed_fp8_qdq
+                permuted_local_hidden_states = qdq.activation(permuted_local_hidden_states)
+                gate_and_up_projs = qdq.weight(gate_and_up_projs.transpose(-1, -2)).transpose(-1, -2)
+                down_projs = qdq.weight(down_projs.transpose(-1, -2)).transpose(-1, -2)
                 output1 = ops.gmm(
                     permuted_local_hidden_states,
                     gate_and_up_projs,
@@ -1087,7 +1135,7 @@ class GroupedExpertsDeepEP(nn.Module):
                     output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
 
                 output1 = self.expert_activation(output1, activation_probs)
-                output2 = ops.gmm(output1, down_projs, tokens_per_expert, trans_b=False)
+                output2 = ops.gmm(qdq.activation(output1), down_projs, tokens_per_expert, trans_b=False)
 
                 if self.expert_bias:
                     down_bias = self.down_proj_bias.to_local().to(compute_dtype)
@@ -1122,7 +1170,28 @@ def _torch_mm_experts_fwd(
     permuted_probs,
     activation_fn,
     use_mxfp8=False,
+    fp8_qdq: FP8QDQConfig = FP8QDQConfig(),
 ):
+    """Compute two local expert GEMMs with optional fake quantization.
+
+    Args:
+        hidden_states: Tensor [tokens, hidden], sorted by local expert.
+        gate_and_up_projs: Tensor [local_experts, hidden, 2 * intermediate],
+            with contiguous gate then up columns; already unsharded by FSDP.
+        down_projs: Tensor [local_experts, intermediate, hidden].
+        tokens_per_expert: Tensor [local_experts] of per-expert token counts.
+        permuted_probs: Tensor [tokens, 1] of activation multipliers.
+        activation_fn: Weighted activation callable.
+        use_mxfp8: Whether to use real MXFP8 grouped GEMMs.
+        fp8_qdq: Block-FP8 fake-quantization settings; incompatible with MXFP8.
+    Returns:
+        Tensor [tokens, hidden] in the original activation dtype.
+    """
+    if fp8_qdq.enabled and use_mxfp8:
+        raise ValueError("Block FP8 QDQ cannot be combined with MXFP8 GEMMs")
+    hidden_states = fp8_qdq.activation(hidden_states)
+    gate_and_up_projs = fp8_qdq.weight(gate_and_up_projs.transpose(-1, -2)).transpose(-1, -2)
+    down_projs = fp8_qdq.weight(down_projs.transpose(-1, -2)).transpose(-1, -2)
     # torchao's MXFP8 quantizer (mx_tensor.to_mx) strictly asserts is_contiguous() on each
     # operand it quantizes, unlike torch._grouped_mm. select_grouped_mm returns a wrapper
     # that makes A contiguous and relays out B (so its transpose is contiguous, the layout
@@ -1131,7 +1200,7 @@ def _torch_mm_experts_fwd(
     grouped_mm = select_grouped_mm(use_mxfp8)
     output1 = grouped_mm(hidden_states, gate_and_up_projs, offs)
     output1 = activation_fn(output1, permuted_probs)
-    output2 = grouped_mm(output1, down_projs, offs)
+    output2 = grouped_mm(fp8_qdq.activation(output1), down_projs, offs)
     return output2
 
 

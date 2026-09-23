@@ -12,6 +12,7 @@ kernel; small pure-Torch fallbacks keep CPU construction and unit tests useful.
 from __future__ import annotations
 
 import math
+from contextlib import nullcontext
 from typing import Any
 
 import torch
@@ -32,6 +33,7 @@ from nemo_automodel.components.models.glm5_next.cp import (
     build_fla_cp_context,
 )
 from nemo_automodel.components.moe.config import MoEConfig
+from nemo_automodel.components.moe.fp8_qdq import FP8QDQConfig
 from nemo_automodel.components.moe.layers import MLP, MoE
 from nemo_automodel.shared.import_utils import safe_import_from
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
@@ -432,6 +434,33 @@ class Glm5NextLinearAttention(nn.Module):
                 self.o_norm.reset_parameters()
 
 
+@torch.no_grad()
+def _indexer_fp8_qdq(x: torch.Tensor) -> torch.Tensor:
+    """Rotate and QDQ Indexer vectors in vLLM's Hadamard/UE8M0 basis.
+
+    Args:
+        x: Tensor of shape [..., 128], with arbitrary leading dimensions.
+            Values are materialized as BF16 before FP32 Hadamard butterflies.
+
+    Returns:
+        FP32 tensor of shape [..., 128] in the rotated basis, after E4M3FN
+        quantize/dequantize with one power-of-two scale per vector. Does not
+        mutate the input. No gradient is needed for discrete Indexer selection.
+    """
+    if x.shape[-1] != 128:
+        raise ValueError("Indexer FP8 QDQ requires 128-wide vectors")
+    rotated = x.to(torch.bfloat16).float()
+    for stride in (1, 2, 4, 8, 16, 32, 64):
+        pairs = rotated.reshape(*x.shape[:-1], 128 // (2 * stride), 2, stride)
+        left, right = pairs.unbind(dim=-2)
+        rotated = torch.stack((left + right, left - right), dim=-2).reshape_as(x)
+    rotated = (rotated * (128**-0.5)).to(torch.bfloat16).float()
+    absmax = rotated.abs().amax(dim=-1, keepdim=True).clamp_min(1e-4)
+    scale = torch.exp2(torch.ceil(torch.log2(absmax * (1.0 / 448.0))))
+    quantized = (rotated / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    return quantized.float() * scale
+
+
 class Glm5NextKPoolIndexer(nn.Module):
     """KPool-compressed DSA indexer for training without a KV cache."""
 
@@ -443,6 +472,7 @@ class Glm5NextKPoolIndexer(nn.Module):
         self.index_topk = config.index_topk
         self.index_kpool = config.index_kpool
         self.always_select_tail = config.index_kpool_always_select_tail
+        self.indexer_fp8_fake_quant = config.indexer_fp8_fake_quant
         self.wq_b = nn.Linear(config.q_lora_rank, self.n_heads * self.head_dim, bias=False, dtype=dtype)
         self.wk = nn.Linear(config.hidden_size, self.head_dim, bias=False, dtype=dtype)
         self.k_norm = nn.LayerNorm(self.head_dim, eps=1e-6, dtype=dtype)
@@ -461,7 +491,9 @@ class Glm5NextKPoolIndexer(nn.Module):
 
         Returns:
             Pool keys with shape ``[complete_pools, index_head_dim]`` and raw
-            token indices with shape ``[complete_pools, index_kpool]``.
+            token indices with shape ``[complete_pools, index_kpool]``. With
+            ``indexer_fp8_fake_quant``, pool keys are FP32 dequantized values
+            in the Hadamard basis, consumed by ``select`` in the same mode.
         """
         keys = self.k_norm(self.wk(full_hidden)).squeeze(0)
         gates = F.linear(full_hidden.squeeze(0), self.index_kpool_compress_gate)
@@ -472,10 +504,24 @@ class Glm5NextKPoolIndexer(nn.Module):
             grouped_keys = keys[:width].view(complete_pools, self.index_kpool, self.head_dim)
             grouped_gates = gates[:width].view(complete_pools, self.index_kpool, self.head_dim)
             logits = grouped_gates.float() + self.index_kpool_compress_ape.float().unsqueeze(0)
-            pool_keys = (logits.softmax(dim=1).to(keys.dtype) * grouped_keys).sum(dim=1)
+            if self.indexer_fp8_fake_quant:
+                # vLLM accumulates compression in FP32, materializes BF16, then
+                # rotates and quantizes completed pools. The raw tail is not quantized.
+                probabilities = (logits - logits.amax(dim=1, keepdim=True)).exp()
+                numerator = torch.zeros_like(grouped_keys[:, 0], dtype=torch.float32)
+                denominator = torch.zeros_like(numerator)
+                # Match the slot-ordered, two-pass reduction in vLLM's kernel.
+                for slot in range(self.index_kpool):
+                    numerator = torch.addcmul(numerator, grouped_keys[:, slot].float(), probabilities[:, slot])
+                    denominator = denominator + probabilities[:, slot]
+                pool_keys = _indexer_fp8_qdq(numerator / denominator)
+            else:
+                pool_keys = (logits.softmax(dim=1).to(keys.dtype) * grouped_keys).sum(dim=1)
             pool_indices = torch.arange(width, device=keys.device).view(complete_pools, self.index_kpool)
         else:
-            pool_keys = keys.new_empty((0, self.head_dim))
+            pool_keys = keys.new_empty(
+                (0, self.head_dim), dtype=torch.float32 if self.indexer_fp8_fake_quant else keys.dtype
+            )
             pool_indices = torch.empty((0, self.index_kpool), dtype=torch.long, device=keys.device)
         return pool_keys, pool_indices
 
@@ -497,7 +543,8 @@ class Glm5NextKPoolIndexer(nn.Module):
                 ``[1, queries, q_lora_rank]``.
             query_positions: Document-local positions with shape ``[queries]``.
             pool_keys: Prepared KPool keys with shape
-                ``[complete_pools, index_head_dim]``.
+                ``[complete_pools, index_head_dim]``, in the Hadamard basis
+                when ``indexer_fp8_fake_quant`` is enabled.
             pool_indices: Prepared raw token indices with shape
                 ``[complete_pools, index_kpool]``.
             key_length: Number of tokens in the unpadded document.
@@ -510,10 +557,23 @@ class Glm5NextKPoolIndexer(nn.Module):
         complete_pools = pool_keys.shape[0]
 
         queries = self.wq_b(query_resid).view(1, -1, self.n_heads, self.head_dim)
-        scores = torch.einsum("bqhd,pd->bqhp", queries.float(), pool_keys.float())
-        scores = F.relu(scores * self.softmax_scale)
-        weights = self.weights_proj(query_hidden).float() * (self.n_heads**-0.5)
-        scores = torch.einsum("bqh,bqhp->bqp", weights, scores)
+        if self.indexer_fp8_fake_quant:
+            queries = _indexer_fp8_qdq(queries)
+        # Keep the QDQ score path in FP32 even under training autocast.
+        with (
+            torch.autocast(device_type=query_hidden.device.type, enabled=False)
+            if self.indexer_fp8_fake_quant
+            else nullcontext()
+        ):
+            scores = torch.einsum("bqhd,pd->bqhp", queries.float(), pool_keys.float())
+            scores = F.relu(scores * self.softmax_scale)
+            if self.indexer_fp8_fake_quant:
+                # vLLM computes head weights in FP32 without BF16 output rounding.
+                weights = F.linear(query_hidden.float(), self.weights_proj.weight.float())
+                weights = weights * (self.n_heads**-0.5)
+            else:
+                weights = self.weights_proj(query_hidden).float() * (self.n_heads**-0.5)
+            scores = torch.einsum("bqh,bqhp->bqp", weights, scores)
         if complete_pools:
             pool_end = pool_indices[:, -1]
             visible = pool_end.view(1, 1, -1) <= query_positions.view(1, -1, 1)
@@ -737,7 +797,8 @@ class Glm5NextSparseAttention(nn.Module):
             latent: Normalized shared latent K/V with shape
                 ``[1, key_tokens, 512]``.
             pool_keys: KPool-compressed index keys with shape
-                ``[complete_pools, index_head_dim]``.
+                ``[complete_pools, index_head_dim]``, in the Hadamard basis
+                when ``indexer_fp8_fake_quant`` is enabled.
             pool_indices: Document-local token indices with shape
                 ``[complete_pools, index_kpool]``.
             query_start: Inclusive document-local index of the first local query.
@@ -830,6 +891,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 backend.linear,
                 dtype=dtype,
                 swiglu_limit=config.swiglu_limit,
+                fp8_qdq=FP8QDQConfig(weights=config.dense_fp8_weight_qdq, activations=config.dense_fp8_activation_qdq),
             )
         )
         self.input_layernorm = Glm5NextRMSNorm(config.hidden_size, config.rms_norm_eps, dtype)
