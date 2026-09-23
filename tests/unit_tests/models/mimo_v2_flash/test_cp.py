@@ -102,6 +102,8 @@ def test_mimo_te_sharder_delegates_to_framework_and_preserves_vlm_metadata():
 def test_mimo_te_sharder_uses_te_dual_chunk_indices_and_reports_layout():
     """CP token ownership must come from TE's THD partition primitive."""
     batch = _thd_batch(sequence=8)
+    mesh = _FakeCPMesh()
+    model = torch.nn.Module()
     expected = torch.tensor([0, 1, 6, 7], dtype=torch.long)
     fake_tex = SimpleNamespace(thd_get_partitioned_indices=lambda cu, total, size, rank: expected)
     delegated = {
@@ -121,15 +123,20 @@ def test_mimo_te_sharder_uses_te_dual_chunk_indices_and_reports_layout():
             "nemo_automodel.components.models.mimo_v2_flash.cp.make_cp_batch_for_te",
             return_value=delegated,
         ),
+        patch(
+            "nemo_automodel.components.models.mimo_v2_flash.cp.ensure_mimo_te_context_parallel"
+        ) as ensure_cp,
     ):
         _, result, layout = shard_batch_for_mimo_te(
-            _FakeCPMesh(),
+            mesh,
             None,
             batch,
+            model=model,
             image_token_id=None,
             video_token_id=None,
         )
 
+    ensure_cp.assert_called_once_with(model, mesh)
     torch.testing.assert_close(result[_MIMO_THD_LOCAL_INDICES], expected)
     assert layout is not None
     torch.testing.assert_close(layout.local_token_global_indices, expected)
@@ -168,6 +175,8 @@ def test_mimo_te_sharder_rejects_external_loss_mask():
 
 
 def test_make_mimo_te_cp_sharder_returns_framework_contract():
-    sharder = make_mimo_te_cp_sharder(num_chunks=1, image_token_id=91, video_token_id=92)
+    model = torch.nn.Module()
+    sharder = make_mimo_te_cp_sharder(model=model, num_chunks=1, image_token_id=91, video_token_id=92)
     assert isinstance(sharder, ContextParallelSharder)
     assert sharder.local_token_global_indices is None
+    assert sharder.shard_batch.keywords["model"] is model

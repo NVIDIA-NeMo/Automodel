@@ -27,6 +27,7 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
     ShardLayout,
 )
 from nemo_automodel.components.distributed.context_parallel.utils import make_cp_batch_for_te
+from nemo_automodel.components.models.mimo_v2_flash.parallelization import ensure_mimo_te_context_parallel
 
 _MIMO_GLOBAL_IMAGE_MASK = "_mimo_global_image_mask"
 _MIMO_GLOBAL_VIDEO_MASK = "_mimo_global_video_mask"
@@ -157,6 +158,7 @@ def shard_batch_for_mimo_te(
     tp_mesh,
     batch: dict[str, Any],
     *,
+    model: torch.nn.Module | None = None,
     loss_mask: torch.Tensor | None = None,
     padding_token_id: int = 0,
     num_chunks: int = 1,
@@ -175,6 +177,8 @@ def shard_batch_for_mimo_te(
         cp_mesh: Optional one-dimensional context-parallel mesh.
         tp_mesh: Unused tensor-parallel mesh required by the sharder protocol.
         batch: Packed batch whose token tensors have shape [batch, sequence].
+        model: MiMo model or pipeline-local part whose TE attention is configured
+            from the runtime CP mesh before the first forward.
         loss_mask: Optional loss mask passed by the sharder protocol. Labels
             already carry the loss ignore value, so this is unsupported here.
         padding_token_id: Token ID used for physical THD padding.
@@ -201,6 +205,8 @@ def shard_batch_for_mimo_te(
     position_ids = batch.get("position_ids")
     if num_chunks > 1 and isinstance(position_ids, torch.Tensor) and position_ids.ndim != 2:
         raise ValueError("MiMo THD pipeline parallelism currently requires one-dimensional position_ids")
+    if model is not None:
+        ensure_mimo_te_context_parallel(model, cp_mesh)
 
     original_row_shape = tuple(input_ids.shape)
     global_image_mask = _media_mask(input_ids, image_token_id, num_chunks)
@@ -242,6 +248,7 @@ def shard_batch_for_mimo_te(
 
 def make_mimo_te_cp_sharder(
     *,
+    model: torch.nn.Module,
     num_chunks: int,
     image_token_id: int | None,
     video_token_id: int | None,
@@ -249,6 +256,7 @@ def make_mimo_te_cp_sharder(
     """Create MiMo's thin adapter around the framework TE THD sharder.
 
     Args:
+        model: MiMo model or pipeline-local part to configure from the runtime CP mesh.
         num_chunks: Number of pipeline microbatch streams.
         image_token_id: Optional image placeholder token ID.
         video_token_id: Optional video placeholder token ID.
@@ -260,6 +268,7 @@ def make_mimo_te_cp_sharder(
     return ContextParallelSharder(
         shard_batch=partial(
             shard_batch_for_mimo_te,
+            model=model,
             num_chunks=num_chunks,
             image_token_id=image_token_id,
             video_token_id=video_token_id,

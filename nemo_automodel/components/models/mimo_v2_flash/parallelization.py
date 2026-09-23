@@ -12,13 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""MiMo-specific distributed-parallelization registration."""
+"""MiMo-specific Transformer Engine context-parallel setup."""
 
 from __future__ import annotations
 
 import torch
-
-from nemo_automodel.shared.import_utils import safe_import_from
 
 
 def _unwrap_checkpoint_module(module: torch.nn.Module) -> torch.nn.Module:
@@ -28,91 +26,40 @@ def _unwrap_checkpoint_module(module: torch.nn.Module) -> torch.nn.Module:
     return module
 
 
-def setup_mimo_te_context_parallel(model: torch.nn.Module, cp_mesh) -> int:
-    """Configure every MiMo text attention layer for TE all-to-all CP.
+def setup_mimo_te_context_parallel(model: torch.nn.Module, cp_mesh) -> None:
+    """Configure every MiMo attention layer through its model-owned CP hook.
 
-    MiMo uses grouped-query attention, so TE's all-to-all transport must be able
-    to split both query heads and KV groups evenly across the CP ranks.  Refuse
-    any non-TE attention module instead of silently falling back to the older
-    model-owned K/V gather path.
+    The attention module owns TE backend validation, head-partition validation,
+    and the a2a transport choice. This traversal only finds pipeline-local
+    attention layers and shares one CUDA communication stream across them.
 
     Args:
         model: A complete MiMo model or one pipeline-local model part.
         cp_mesh: One-dimensional context-parallel device mesh.
-
-    Returns:
-        Number of local decoder attention modules configured.
     """
     cp_size = cp_mesh.size() if cp_mesh is not None else 1
-    model.cp_mesh = cp_mesh if cp_size > 1 else None
     if cp_size <= 1:
-        return 0
-
-    has_te, dot_product_attention_cls = safe_import_from(
-        "transformer_engine.pytorch.attention",
-        "DotProductAttention",
-    )
-    if not has_te:
-        raise ImportError("MiMo context parallelism requires Transformer Engine DotProductAttention.")
+        model._mimo_te_cp_configured_group = None
+        return
 
     cp_group = cp_mesh.get_group()
-    cp_global_ranks = torch.distributed.get_process_group_ranks(cp_group)
     cp_stream = torch.cuda.Stream()
-    configured = 0
     for name, wrapped_attention in model.named_modules():
         if not name.endswith("self_attn"):
             continue
         self_attn = _unwrap_checkpoint_module(wrapped_attention)
-        attn_module = getattr(self_attn, "attn_module", None)
-        if not isinstance(attn_module, dot_product_attention_cls):
-            backend_name = type(attn_module).__name__ if attn_module is not None else type(self_attn).__name__
-            raise ValueError(
-                "MiMo context parallelism only supports Transformer Engine DotProductAttention; "
-                f"{name} uses {backend_name}. Set model.backend.attn='te'."
-            )
+        setup_cp_attention = getattr(self_attn, "setup_cp_attention", None)
+        if not callable(setup_cp_attention):
+            raise ValueError(f"MiMo context parallelism requires {name} to expose setup_cp_attention(cp_mesh).")
+        setup_cp_attention(cp_mesh, cp_stream=cp_stream)
 
-        query_heads = int(getattr(self_attn, "num_attention_heads", attn_module.num_attention_heads))
-        kv_heads = int(getattr(self_attn, "num_key_value_heads", attn_module.num_gqa_groups))
-        if query_heads % cp_size != 0 or kv_heads % cp_size != 0:
-            raise ValueError(
-                "MiMo TE all-to-all context parallelism requires query and KV head counts "
-                f"divisible by cp_size; {name} has query_heads={query_heads}, "
-                f"kv_heads={kv_heads}, cp_size={cp_size}."
-            )
-
-        attn_module.set_context_parallel_group(
-            cp_group,
-            cp_global_ranks,
-            cp_stream,
-            cp_comm_type="a2a",
-        )
-        configured += 1
-
-    return configured
+    model._mimo_te_cp_configured_group = cp_group
 
 
-def register_mimo_v2_parallel_strategies() -> None:
-    """Register the MiMo FSDP2 strategy once for both checkpoint class names."""
-    from nemo_automodel.components.distributed.parallelizer import (
-        PARALLELIZATION_STRATEGIES,
-        DefaultParallelizationStrategy,
-        register_parallel_strategy,
-    )
-
-    for name in ("MiMoV2FlashForCausalLM", "MiMoV2ForCausalLM"):
-        if name in PARALLELIZATION_STRATEGIES:
-            continue
-
-        @register_parallel_strategy(name=name)
-        class MiMoV2ParallelizationStrategy(DefaultParallelizationStrategy):
-            """Apply dense sharding and enforce MiMo's TE all-to-all CP contract."""
-
-            def parallelize(self, model, device_mesh, **kwargs):
-                result = super().parallelize(model, device_mesh, **kwargs)
-                cp_mesh = device_mesh["cp"] if "cp" in device_mesh.mesh_dim_names else None
-                cp_mesh = cp_mesh if cp_mesh is not None and cp_mesh.size() > 1 else None
-                if cp_mesh is not None:
-                    setup_mimo_te_context_parallel(model, cp_mesh)
-                else:
-                    model.cp_mesh = None
-                return result
+def ensure_mimo_te_context_parallel(model: torch.nn.Module, cp_mesh) -> None:
+    """Install MiMo's TE a2a transport once for the active CP process group."""
+    if cp_mesh is None or cp_mesh.size() <= 1:
+        return
+    if getattr(model, "_mimo_te_cp_configured_group", None) is cp_mesh.get_group():
+        return
+    setup_mimo_te_context_parallel(model, cp_mesh)

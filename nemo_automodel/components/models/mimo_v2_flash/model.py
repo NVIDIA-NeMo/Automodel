@@ -49,10 +49,6 @@ from nemo_automodel.components.models.mimo_v2_flash.cp import (
     _MIMO_THD_LOCAL_INDICES,
     make_mimo_te_cp_sharder,
 )
-from nemo_automodel.components.models.mimo_v2_flash.parallelization import (
-    register_mimo_v2_parallel_strategies,
-    setup_mimo_te_context_parallel,
-)
 from nemo_automodel.components.models.mimo_v2_flash.state_dict_adapter import MiMoV2FlashStateDictAdapter
 from nemo_automodel.components.models.mimo_v2_flash.vision import MiMoVisionTransformer
 from nemo_automodel.components.moe.config import MoEConfig
@@ -414,7 +410,6 @@ class MiMoV2FlashAttention(nn.Module):
                 self.register_buffer("attention_sink_bias", torch.empty(self.num_attention_heads, dtype=torch.float32))
             else:
                 self.attention_sink_bias = None
-        self._cp_mesh = None
 
     def _validate_a2a_cp_size(self, cp_size: int) -> None:
         """Validate the head partition required by TE's a2a CP transport."""
@@ -428,8 +423,8 @@ class MiMoV2FlashAttention(nn.Module):
                 f"kv_heads={self.num_key_value_heads}, cp_size={cp_size}."
             )
 
-    def setup_cp_attention(self, cp_mesh) -> None:
-        """Attach TE a2a context parallelism and reject non-TE backends."""
+    def setup_cp_attention(self, cp_mesh, *, cp_stream: torch.cuda.Stream | None = None) -> None:
+        """Validate and attach TE all-to-all context parallelism."""
         if self.backend.attn != "te" or self.attn_module is None:
             raise ValueError(
                 "MiMo context parallelism requires backend.attn='te' with THD packed sequences; "
@@ -437,15 +432,15 @@ class MiMoV2FlashAttention(nn.Module):
             )
         cp_size = int(cp_mesh.size())
         self._validate_a2a_cp_size(cp_size)
-        self._cp_mesh = cp_mesh
         if cp_size <= 1:
             return
+        cp_stream = cp_stream if cp_stream is not None else torch.cuda.Stream()
         cp_group = cp_mesh.get_group()
         cp_ranks = torch.distributed.get_process_group_ranks(cp_group)
         self.attn_module.set_context_parallel_group(
             cp_group,
             cp_ranks,
-            torch.cuda.Stream(),
+            cp_stream,
             cp_comm_type="a2a",
         )
 
@@ -1400,12 +1395,9 @@ class MiMoV2FlashForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 "MiMo context parallelism requires packed THD input. NEAT/dense packed masks cannot be "
                 "mapped to Transformer Engine document boundaries; set packing_strategy='thd'."
             )
-        cp_mesh = getattr(self, "cp_mesh", None)
-        if cp_mesh is None or cp_mesh.size() <= 1:
-            raise RuntimeError("MiMo context-parallel input preparation requires an active CP mesh")
-        setup_mimo_te_context_parallel(self, cp_mesh)
         return {
             "cp_sharder": make_mimo_te_cp_sharder(
+                model=self,
                 num_chunks=num_chunks,
                 image_token_id=getattr(self.config, "image_token_id", None),
                 video_token_id=getattr(self.config, "video_token_id", None),
@@ -1458,6 +1450,3 @@ class MiMoV2ForCausalLM(MiMoV2FlashForCausalLM):
 
 
 ModelClass = MiMoV2FlashForCausalLM
-
-
-register_mimo_v2_parallel_strategies()

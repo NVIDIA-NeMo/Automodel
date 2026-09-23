@@ -12,12 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
 import torch
 
+from nemo_automodel.components.models.mimo_v2_flash.model import MiMoV2FlashAttention
 from nemo_automodel.components.models.mimo_v2_flash.parallelization import (
+    ensure_mimo_te_context_parallel,
     setup_mimo_te_context_parallel,
 )
 
@@ -33,12 +36,15 @@ class _FakeDotProductAttention(torch.nn.Module):
         self.calls.append((args, kwargs))
 
 
-class _FakeSelfAttention(torch.nn.Module):
-    def __init__(self, attn_module, query_heads=8, kv_heads=4):
-        super().__init__()
-        self.attn_module = attn_module
-        self.num_attention_heads = query_heads
-        self.num_key_value_heads = kv_heads
+def _mimo_attention(attn_module, *, query_heads=8, kv_heads=4, backend="te"):
+    attention = MiMoV2FlashAttention.__new__(MiMoV2FlashAttention)
+    torch.nn.Module.__init__(attention)
+    attention.attn_module = attn_module
+    attention.backend = SimpleNamespace(attn=backend)
+    attention.num_attention_heads = query_heads
+    attention.num_key_value_heads = kv_heads
+    attention.layer_idx = 0
+    return attention
 
 
 class _Block(torch.nn.Module):
@@ -54,19 +60,15 @@ class _Model(torch.nn.Module):
         self.cp_mesh = None
 
 
-def _cp_mesh(size=2):
+def _cp_mesh(size=2, group=None):
     mesh = Mock()
     mesh.size.return_value = size
-    mesh.get_group.return_value = object()
+    mesh.get_group.return_value = group if group is not None else object()
     return mesh
 
 
 def _setup_patches(stream):
     return (
-        patch(
-            "nemo_automodel.components.models.mimo_v2_flash.parallelization.safe_import_from",
-            return_value=(True, _FakeDotProductAttention),
-        ),
         patch("torch.distributed.get_process_group_ranks", return_value=[0, 1]),
         patch("torch.cuda.Stream", return_value=stream),
     )
@@ -75,16 +77,16 @@ def _setup_patches(stream):
 def test_setup_mimo_te_cp_forces_a2a_on_every_attention():
     dpa0 = _FakeDotProductAttention()
     dpa1 = _FakeDotProductAttention()
-    model = _Model([_FakeSelfAttention(dpa0), _FakeSelfAttention(dpa1)])
+    model = _Model([_mimo_attention(dpa0), _mimo_attention(dpa1)])
     mesh = _cp_mesh()
     stream = object()
-    import_patch, ranks_patch, stream_patch = _setup_patches(stream)
+    ranks_patch, stream_patch = _setup_patches(stream)
 
-    with import_patch, ranks_patch, stream_patch:
-        configured = setup_mimo_te_context_parallel(model, mesh)
+    with ranks_patch, stream_patch:
+        result = setup_mimo_te_context_parallel(model, mesh)
 
-    assert configured == 2
-    assert model.cp_mesh is mesh
+    assert result is None
+    assert model._mimo_te_cp_configured_group is mesh.get_group()
     for dpa in (dpa0, dpa1):
         assert len(dpa.calls) == 1
         args, kwargs = dpa.calls[0]
@@ -95,25 +97,25 @@ def test_setup_mimo_te_cp_forces_a2a_on_every_attention():
 def test_setup_mimo_te_cp_unwraps_checkpointed_attention():
     dpa = _FakeDotProductAttention()
     wrapper = torch.nn.Module()
-    wrapper._checkpoint_wrapped_module = _FakeSelfAttention(dpa)
+    wrapper._checkpoint_wrapped_module = _mimo_attention(dpa)
     model = _Model([wrapper])
     stream = object()
-    import_patch, ranks_patch, stream_patch = _setup_patches(stream)
+    ranks_patch, stream_patch = _setup_patches(stream)
 
-    with import_patch, ranks_patch, stream_patch:
-        configured = setup_mimo_te_context_parallel(model, _cp_mesh())
+    with ranks_patch, stream_patch:
+        result = setup_mimo_te_context_parallel(model, _cp_mesh())
 
-    assert configured == 1
+    assert result is None
     assert dpa.calls[0][1]["cp_comm_type"] == "a2a"
 
 
 def test_setup_mimo_te_cp_rejects_non_te_attention():
-    model = _Model([_FakeSelfAttention(torch.nn.Identity())])
+    model = _Model([_mimo_attention(torch.nn.Identity(), backend="torch")])
     stream = object()
-    import_patch, ranks_patch, stream_patch = _setup_patches(stream)
+    ranks_patch, stream_patch = _setup_patches(stream)
 
-    with import_patch, ranks_patch, stream_patch:
-        with pytest.raises(ValueError, match="only supports Transformer Engine DotProductAttention"):
+    with ranks_patch, stream_patch:
+        with pytest.raises(ValueError, match="requires backend.attn='te'"):
             setup_mimo_te_context_parallel(model, _cp_mesh())
 
 
@@ -126,19 +128,35 @@ def test_setup_mimo_te_cp_rejects_non_te_attention():
 )
 def test_setup_mimo_te_cp_validates_query_and_kv_head_divisibility(query_heads, kv_heads):
     dpa = _FakeDotProductAttention(query_heads=query_heads, kv_heads=kv_heads)
-    model = _Model([_FakeSelfAttention(dpa, query_heads=query_heads, kv_heads=kv_heads)])
+    model = _Model([_mimo_attention(dpa, query_heads=query_heads, kv_heads=kv_heads)])
     stream = object()
-    import_patch, ranks_patch, stream_patch = _setup_patches(stream)
+    ranks_patch, stream_patch = _setup_patches(stream)
 
-    with import_patch, ranks_patch, stream_patch:
-        with pytest.raises(ValueError, match="query and KV head counts divisible by cp_size"):
+    with ranks_patch, stream_patch:
+        with pytest.raises(ValueError, match="requires both query and key/value head counts to be divisible"):
             setup_mimo_te_context_parallel(model, _cp_mesh(size=2))
 
     assert dpa.calls == []
 
 
 def test_setup_mimo_te_cp_is_noop_without_active_cp():
-    model = _Model([_FakeSelfAttention(torch.nn.Identity())])
+    model = _Model([torch.nn.Identity()])
 
-    assert setup_mimo_te_context_parallel(model, _cp_mesh(size=1)) == 0
-    assert model.cp_mesh is None
+    assert setup_mimo_te_context_parallel(model, _cp_mesh(size=1)) is None
+    assert model._mimo_te_cp_configured_group is None
+
+
+def test_ensure_mimo_te_cp_configures_a2a_only_once():
+    dpa = _FakeDotProductAttention()
+    model = _Model([_mimo_attention(dpa)])
+    group = object()
+    first_mesh = _cp_mesh(group=group)
+    second_mesh = _cp_mesh(group=group)
+    stream = object()
+    ranks_patch, stream_patch = _setup_patches(stream)
+
+    with ranks_patch, stream_patch:
+        ensure_mimo_te_context_parallel(model, first_mesh)
+        ensure_mimo_te_context_parallel(model, second_mesh)
+
+    assert len(dpa.calls) == 1
