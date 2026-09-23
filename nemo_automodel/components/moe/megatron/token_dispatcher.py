@@ -364,7 +364,13 @@ _STATIC_ROUTING_PAD_PIN = os.environ.get("NEMO_STATIC_ROUTING_PAD_PIN", "1") != 
 
 def _assert_no_hybridep_overflow(handle, capacity: int) -> None:
     """Device-side guard: HybridEP truncates silently when the capacity is exceeded and sets
-    ``overflow_flag`` (handle item 10); fail loudly instead of training on dropped tokens."""
+    ``overflow_flag`` (handle item 10); fail loudly instead of training on dropped tokens.
+
+    Args:
+        handle: HybridEP dispatch handle (tuple). Item 10, when present, is the one-element device
+            ``overflow_flag`` tensor, non-zero after a truncated dispatch.
+        capacity: Permuted-row capacity the dispatch buffers were sized to (quoted in the message).
+    """
     flag = handle[10] if isinstance(handle, (tuple, list)) and len(handle) > 10 else None
     if torch.is_tensor(flag):
         torch._assert_async(
@@ -565,6 +571,11 @@ class _HybridEPManager(_DispatchManager):
         free; the capacity is that count times ``hybridep_capacity_factor``, aligned to the HybridEP
         token alignment (and ``pad_multiple``), taken as the EP-group maximum once so every rank
         allocates the same buffers.
+
+        Args:
+            tokens_per_expert: ``[num_local_experts]`` integer tensor of routed rows per local expert, as
+                returned by the blocking calibration dispatch; its sum is read on the host here.
+            device: Device for the EP-group max all-reduce of the capacity.
         """
         actual = int(tokens_per_expert.sum())
         align = max(int(self.pad_multiple or 0), _HYBRIDEP_TOKEN_ALIGNMENT)
@@ -647,13 +658,16 @@ class TokenDispatcherConfig:
     None means no changes for dtype."""
 
     moe_flex_dispatcher_backend: Literal["deepep", "hybridep", "uccl_ep"] = "deepep"
-
-    # HybridEP capacity mode, see BackendConfig.dispatcher_capacity_factor
+    """Backend for the flex token dispatcher. Options: 'deepep', 'hybridep', or 'uccl_ep'."""
 
     moe_hybridep_capacity_factor: float | None = None
-    # HybridEP: skip the per-dispatch pad-size all-reduce, see BackendConfig.dispatcher_equal_token_counts
+    """HybridEP capacity mode (mirrors BackendConfig.dispatcher_capacity_factor): after one blocking
+    calibration dispatch, size every later dispatch to the calibrated permuted row count times this
+    factor and run it non-blocking. None keeps the blocking path."""
+
     moe_hybridep_equal_token_counts: bool = False
-    """Backend for the flex token dispatcher. Options: 'deepep', 'hybridep', or 'uccl_ep'."""
+    """HybridEP (mirrors BackendConfig.dispatcher_equal_token_counts): every EP rank dispatches the
+    same row count, so the per-dispatch pad-size all-reduce and its host sync are skipped."""
 
     moe_deepep_num_sms: int = 20
     """Number of SMs to use for DeepEP backend."""
