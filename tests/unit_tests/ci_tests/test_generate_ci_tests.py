@@ -96,6 +96,23 @@ def test_release_keeps_glm_53_cudnn_dsa_recipe_with_container_flashmla():
     assert "glm_5.3_tulu3_4k_cudnn_100step" in pipeline
 
 
+@pytest.mark.parametrize(
+    "config_path",
+    [
+        "examples/llm_finetune/ling/ling_1t_sft.yaml",
+        "examples/llm_finetune/minimax_m2/minimax_m2.5_hellaswag_pp.yaml",
+        "examples/llm_finetune/glm/glm_5.2_hellaswag_pp.yaml",
+    ],
+)
+def test_slow_hybridep_pp_recipes_use_runtime_dispatcher_initialization(config_path):
+    recipe = YAML(typ="safe").load(Path(config_path))
+
+    assert recipe["model"]["backend"]["dispatcher"] == "hybridep"
+    assert recipe["distributed"]["pp_size"] > 1
+    assert "pp_seq_len" not in recipe["distributed"]["pipeline"]
+    assert "prewarm" not in recipe
+
+
 def test_generate_gpt_oss_120b_benchmark_job_uses_ep64_without_activation_checkpointing():
     config = Path("examples/llm_benchmark/gpt_oss/gptoss_120b_te_deepep.yaml")
 

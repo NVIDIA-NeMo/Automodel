@@ -29,6 +29,8 @@ def _restore_buffer():
     """Save/restore module-global dispatch state so tests don't leak state."""
     saved = fused_a2a._buffer
     saved_hybridep = fused_a2a._hybrid_ep_buffer
+    saved_hybridep_signature = fused_a2a._hybrid_ep_runtime_signature
+    saved_hybridep_capacity = fused_a2a._hybrid_ep_initialized_capacity
     saved_recorder = fused_a2a._hybridep_dispatch_replay_state.recorder
     saved_mode = fused_a2a._hybridep_dispatch_replay_state.mode
     try:
@@ -36,6 +38,8 @@ def _restore_buffer():
     finally:
         fused_a2a._buffer = saved
         fused_a2a._hybrid_ep_buffer = saved_hybridep
+        fused_a2a._hybrid_ep_runtime_signature = saved_hybridep_signature
+        fused_a2a._hybrid_ep_initialized_capacity = saved_hybridep_capacity
         fused_a2a._hybridep_dispatch_replay_state.recorder = saved_recorder
         fused_a2a._hybridep_dispatch_replay_state.mode = saved_mode
 
