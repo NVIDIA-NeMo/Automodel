@@ -70,8 +70,7 @@ AVATAR_PATTERN = re.compile(rb"cdn-avatars\.huggingface\.co/[^\"&]+")
 USER_AGENT = "nemo-automodel-docs/1.0"
 SPRITE_COLUMNS = 12
 SPRITE_CELL_SIZE = 64
-DISPLAY_CELL_REM = 1.25
-DATA_URI_PATTERN = re.compile(r'url\("data:image/png;base64,([A-Za-z0-9+/=]+)"\)')
+DATA_URI_PATTERN = re.compile(r'href="data:image/png;base64,([A-Za-z0-9+/=]+)"')
 
 
 def _request(url: str, *, accept: str) -> bytes:
@@ -123,50 +122,38 @@ def _build_sprite(images: dict[str, bytes]) -> bytes:
     return output.getvalue()
 
 
-def _provider_selector(provider: str) -> str:
-    return f'a.fern-sidebar-link[href*="/model-coverage/"][href$="/{provider}"]'
-
-
-def _render_css(sprite: bytes) -> str:
+def _render_svg(sprite: bytes) -> str:
     providers = sorted(PROVIDER_ORGS)
     rows = math.ceil(len(providers) / SPRITE_COLUMNS)
     encoded = base64.b64encode(sprite).decode("ascii")
-    selectors = ",\n".join(f"{_provider_selector(provider)}::before" for provider in providers)
-    rules = []
+    views = []
     for index, provider in enumerate(providers):
         column = index % SPRITE_COLUMNS
         row = index // SPRITE_COLUMNS
-        rules.append(
-            f"{_provider_selector(provider)} {{\n"
-            f"  --provider-icon-x: {-column * DISPLAY_CELL_REM:g}rem;\n"
-            f"  --provider-icon-y: {-row * DISPLAY_CELL_REM:g}rem;\n"
-            f"}}"
+        views.append(
+            f'  <view id="{provider}" '
+            f'viewBox="{column * SPRITE_CELL_SIZE} {row * SPRITE_CELL_SIZE} '
+            f'{SPRITE_CELL_SIZE} {SPRITE_CELL_SIZE}"/>'
         )
-    width = SPRITE_COLUMNS * DISPLAY_CELL_REM
-    height = rows * DISPLAY_CELL_REM
+    width = SPRITE_COLUMNS * SPRITE_CELL_SIZE
+    height = rows * SPRITE_CELL_SIZE
     return (
-        "/* Provider logo sprite. */\n"
-        f"{selectors} {{\n"
-        '  content: "";\n'
-        f"  width: {DISPLAY_CELL_REM:g}rem;\n"
-        f"  height: {DISPLAY_CELL_REM:g}rem;\n"
-        f"  flex: 0 0 {DISPLAY_CELL_REM:g}rem;\n"
-        f'  background-image: url("data:image/png;base64,{encoded}");\n'
-        "  background-position: var(--provider-icon-x) var(--provider-icon-y);\n"
-        "  background-repeat: no-repeat;\n"
-        f"  background-size: {width:g}rem {height:g}rem;\n"
-        "}\n\n" + "\n\n".join(rules) + "\n"
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
+        f'viewBox="0 0 {width} {height}">\n' + "\n".join(views) + "\n"
+        f'  <image width="{width}" height="{height}" '
+        f'href="data:image/png;base64,{encoded}"/>\n'
+        "</svg>\n"
     )
 
 
-def _check(output_css: Path, legacy_dir: Path) -> list[str]:
+def _check(output_svg: Path, legacy_dir: Path) -> list[str]:
     problems = []
-    if not output_css.is_file():
-        return [f"missing {output_css}"]
-    stylesheet = output_css.read_text(encoding="ascii")
-    matches = DATA_URI_PATTERN.findall(stylesheet)
+    if not output_svg.is_file():
+        return [f"missing {output_svg}"]
+    sprite_document = output_svg.read_text(encoding="ascii")
+    matches = DATA_URI_PATTERN.findall(sprite_document)
     if len(matches) != 1:
-        problems.append(f"expected one embedded PNG sprite in {output_css}, found {len(matches)}")
+        problems.append(f"expected one embedded PNG sprite in {output_svg}, found {len(matches)}")
     else:
         try:
             sprite = base64.b64decode(matches[0], validate=True)
@@ -175,14 +162,13 @@ def _check(output_css: Path, legacy_dir: Path) -> list[str]:
                 expected_size = (SPRITE_COLUMNS * SPRITE_CELL_SIZE, expected_rows * SPRITE_CELL_SIZE)
                 if image.format != "PNG" or image.size != expected_size:
                     problems.append(
-                        f"invalid sprite in {output_css}: expected PNG {expected_size}, got {image.format} {image.size}"
+                        f"invalid sprite in {output_svg}: expected PNG {expected_size}, got {image.format} {image.size}"
                     )
         except (ValueError, OSError) as exc:
-            problems.append(f"invalid base64 sprite in {output_css}: {exc}")
+            problems.append(f"invalid base64 sprite in {output_svg}: {exc}")
     for provider in PROVIDER_ORGS:
-        selector = _provider_selector(provider)
-        if selector not in stylesheet:
-            problems.append(f"missing provider selector {provider!r} in {output_css}")
+        if f'<view id="{provider}" ' not in sprite_document:
+            problems.append(f"missing provider view {provider!r} in {output_svg}")
     legacy_icons = sorted(legacy_dir.glob("*.png")) if legacy_dir.is_dir() else []
     if legacy_icons:
         problems.append(f"legacy provider icons remain in {legacy_dir}")
@@ -194,9 +180,9 @@ def main() -> int:
     repo_root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--output-css",
+        "--output-svg",
         type=Path,
-        default=repo_root / "docs" / "fern" / "provider-icons.css",
+        default=repo_root / "docs" / "fern" / "assets" / "provider-sprite.svg",
     )
     parser.add_argument(
         "--source-dir",
@@ -208,7 +194,7 @@ def main() -> int:
     legacy_dir = repo_root / "docs" / "fern" / "assets" / "providers"
 
     if args.check:
-        problems = _check(args.output_css, legacy_dir)
+        problems = _check(args.output_svg, legacy_dir)
         if problems:
             print("\n".join(problems), file=sys.stderr)
             return 1
@@ -225,18 +211,18 @@ def main() -> int:
                 raise FileNotFoundError(source)
             images[provider] = source.read_bytes()
 
-    stylesheet = _render_css(_build_sprite(images))
-    args.output_css.parent.mkdir(parents=True, exist_ok=True)
+    sprite_document = _render_svg(_build_sprite(images))
+    args.output_svg.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
         mode="w",
         encoding="ascii",
-        dir=args.output_css.parent,
+        dir=args.output_svg.parent,
         delete=False,
     ) as temporary:
-        temporary.write(stylesheet)
+        temporary.write(sprite_document)
         temporary_path = Path(temporary.name)
-    temporary_path.replace(args.output_css)
-    print(f"Updated {args.output_css.relative_to(repo_root)} with {len(PROVIDER_ORGS)} providers")
+    temporary_path.replace(args.output_svg)
+    print(f"Updated {args.output_svg.relative_to(repo_root)} with {len(PROVIDER_ORGS)} providers")
     return 0
 
 
