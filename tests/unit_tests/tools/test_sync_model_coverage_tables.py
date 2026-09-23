@@ -349,6 +349,14 @@ def test_model_coverage_pages_use_provider_sections_and_checkpoint_slugs():
             expected_provider_route = f"model-coverage/{category_slug}/{provider_slug}"
             if not index_path.is_file() or _frontmatter_slug(index_path) != expected_provider_route:
                 offenders.append(f"{provider_slug}: invalid provider index route")
+            else:
+                index_document = index_path.read_text(encoding="utf-8")
+                for label, href in re.findall(r"^- \[`([^`]+)`\]\(([^)]+)\)$", index_document, re.MULTILINE):
+                    checkpoint_name = href.rstrip("/").rsplit("/", 1)[-1]
+                    if label != checkpoint_name:
+                        offenders.append(
+                            f"{provider_slug}: provider index label {label!r} does not match {checkpoint_name!r}"
+                        )
 
             icon = provider.get("icon")
             if not isinstance(icon, str):
@@ -383,9 +391,13 @@ def test_model_coverage_pages_use_provider_sections_and_checkpoint_slugs():
                 sidebar_label = page.get("page")
                 if not isinstance(sidebar_label, str) or not sidebar_label:
                     offenders.append(f"{path}: model entry has no sidebar label")
-                elif sidebar_label[0].islower():
-                    offenders.append(f"{path}: sidebar label must use human-readable capitalization")
+                elif sidebar_label != model_id:
+                    offenders.append(f"{path}: sidebar label {sidebar_label!r} does not match {model_id!r}")
                 document = model_path.read_text(encoding="utf-8")
+                title_match = re.search(r'^title: "?([^"\r\n]+)"?$', document, flags=re.MULTILINE)
+                if title_match is None or title_match.group(1) != model_id:
+                    title = title_match.group(1) if title_match is not None else None
+                    offenders.append(f"{path}: page title {title!r} does not match {model_id!r}")
                 hf_models = re.findall(
                     r"https://huggingface\.co/[A-Za-z0-9_.-]+/([A-Za-z0-9_.-]+)",
                     document,
