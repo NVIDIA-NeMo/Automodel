@@ -328,11 +328,15 @@ def test_model_coverage_pages_use_provider_sections_and_checkpoint_slugs():
     navigated_model_pages: list[Path] = []
     provider_slugs: set[str] = set()
     provider_sprites: set[str] = set()
+    provider_models: dict[tuple[str, str], list[str]] = {}
 
     for category in (item for item in model_coverage["contents"] if "section" in item):
         category_slug = str(category.get("slug"))
         category_directory = category_directories[category_slug]
         provider_sections = category.get("contents", [])[1:]
+        provider_labels = [str(provider.get("section")) for provider in provider_sections]
+        if provider_labels != sorted(provider_labels, key=str.casefold):
+            offenders.append(f"{category_slug}: provider sections are not alphabetized")
         for provider in provider_sections:
             if "section" not in provider:
                 offenders.append(f"{category_slug}: expected provider section, found {provider}")
@@ -356,6 +360,10 @@ def test_model_coverage_pages_use_provider_sections_and_checkpoint_slugs():
                 else:
                     provider_sprites.add(sprite_match.group(1))
             provider_slugs.add(provider_slug)
+            model_labels = [str(page.get("page")) for page in provider.get("contents", [])]
+            provider_models[(category_slug, provider_slug)] = model_labels
+            if model_labels != sorted(model_labels, key=str.casefold):
+                offenders.append(f"{category_slug}/{provider_slug}: model entries are not alphabetized")
 
             for page in provider.get("contents", []):
                 path = page.get("path")
@@ -384,6 +392,14 @@ def test_model_coverage_pages_use_provider_sections_and_checkpoint_slugs():
                 )
                 if model_id not in hf_models:
                     offenders.append(f"{path}: URL model ID {model_id!r} is not linked by the card")
+
+    if "Llama" in provider_models.get(("large-language-models", "meta"), []):
+        offenders.append("large-language-models/meta: catch-all Llama label remains")
+    for category_slug in ("large-language-models", "vision-language-models"):
+        if "Muse-Glimmer-30B" not in provider_models.get((category_slug, "meta"), []):
+            offenders.append(f"{category_slug}/meta: Muse-Glimmer-30B is not grouped under Meta")
+        if (category_slug, "muse") in provider_models:
+            offenders.append(f"{category_slug}: Muse remains a standalone provider")
 
     expected_model_pages = {
         path.resolve()

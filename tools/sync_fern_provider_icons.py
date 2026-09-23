@@ -65,6 +65,7 @@ PROVIDER_ORGS = {
     "xiaomimimo": "XiaomiMiMo",
     "z-lab": "z-lab",
 }
+NAVIGATION_PROVIDERS = set(PROVIDER_ORGS) - {"muse"}
 
 AVATAR_PATTERN = re.compile(rb"cdn-avatars\.huggingface\.co/[^\"&]+")
 USER_AGENT = "nemo-automodel-docs/1.0"
@@ -184,8 +185,8 @@ def _check(navigation_path: Path, legacy_dir: Path, legacy_sprite: Path) -> list
     problems = []
     icons = _navigation_icons(navigation_path)
     providers = {provider for provider, _ in icons}
-    if providers != set(PROVIDER_ORGS):
-        missing = sorted(set(PROVIDER_ORGS) - providers)
+    if providers != NAVIGATION_PROVIDERS:
+        missing = sorted(NAVIGATION_PROVIDERS - providers)
         problems.append(f"provider icons missing from {navigation_path}: {missing}")
     encoded_sprites = set()
     for provider, icon in icons:
@@ -243,7 +244,7 @@ def main() -> int:
         if problems:
             print("\n".join(problems), file=sys.stderr)
             return 1
-        print(f"Checked one embedded sprite for {len(PROVIDER_ORGS)} providers")
+        print(f"Checked one embedded sprite for {len(NAVIGATION_PROVIDERS)} navigation providers")
         return 0
 
     images = {}
