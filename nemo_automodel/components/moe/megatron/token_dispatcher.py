@@ -364,14 +364,16 @@ _STATIC_ROUTING_PAD_PIN = os.environ.get("NEMO_STATIC_ROUTING_PAD_PIN", "1") != 
 
 def _assert_no_hybridep_overflow(handle, capacity: int) -> None:
     """Device-side guard: HybridEP truncates silently when the capacity is exceeded and sets
-    ``overflow_flag`` (handle item 10); fail loudly instead of training on dropped tokens.
+    ``overflow_flag``, the last handle item; fail loudly instead of training on dropped tokens.
 
     Args:
-        handle: HybridEP dispatch handle (tuple). Item 10, when present, is the one-element device
-            ``overflow_flag`` tensor, non-zero after a truncated dispatch.
+        handle: HybridEP dispatch handle (tuple). Its last item is the one-element device
+            ``overflow_flag`` tensor, non-zero after a truncated dispatch. DeepEP keeps the flag last
+            precisely so callers read it as ``handle[-1]`` (the slot count changed at 10d4dd7, which
+            inserted ``num_of_valid_tokens`` before it).
         capacity: Permuted-row capacity the dispatch buffers were sized to (quoted in the message).
     """
-    flag = handle[10] if isinstance(handle, (tuple, list)) and len(handle) > 10 else None
+    flag = handle[-1] if isinstance(handle, (tuple, list)) and handle else None
     if torch.is_tensor(flag):
         torch._assert_async(
             (flag == 0).reshape(()),

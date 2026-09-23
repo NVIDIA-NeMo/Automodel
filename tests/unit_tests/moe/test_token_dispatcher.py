@@ -285,7 +285,8 @@ class TestHybridEPCapacityMode:
             passed.append(num_permuted_tokens)
             # blocking mode returns host-side counts; non-blocking returns device-side (cpu stands in) counts
             tpe = torch.tensor(tpe_rows, dtype=torch.int64)
-            handle = tuple([None] * 10 + [torch.tensor(overflow)])
+            # DeepEP 10d4dd7 layout: slot 10 is num_of_valid_tokens (a Python int), the overflow flag is last
+            handle = tuple([None] * 10 + [int(tpe.sum()), torch.tensor(overflow)])
             rows = int(tpe.sum()) if num_permuted_tokens is None else int(num_permuted_tokens)
             return x.new_zeros(rows, x.shape[1]), probs, None, tpe, handle
 
