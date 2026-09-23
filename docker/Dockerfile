@@ -114,9 +114,10 @@ RUN if [ "$INSTALL_TE" = "True" ]; then \
     fi
 
 # Install HybridEP / DeepEP: apt rdma-core v60 (build==runtime libibverbs), nvshmem wheel 3.6.5.
-# DEEPEP_COMMIT = 17cfb817 + DeepEP #638, padding max_num_of_tokens_per_rank to the combine-kernel chunk size.
+# The pinned hybrid-ep revision includes DeepEP #699, which inherits PyTorch's C++ standard
+# instead of forcing C++17 (PyTorch's Rubin builds require C++20).
 COPY docker/common/deepep.patch /opt/deepep.patch
-ARG DEEPEP_COMMIT=42144303752422ade37f24bca9e2dde12df70e09
+ARG DEEPEP_COMMIT=10d4dd7377d5bce900fbb4b80cce863764892b95
 ENV HYBRID_EP_MULTINODE=1
 ENV RDMA_CORE_HOME=/opt/rdma-core/build
 ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64/:$LD_LIBRARY_PATH
@@ -138,7 +139,9 @@ RUN apt-get update && apt-get install -y --allow-change-held-packages \
     NVSHMEM_LIB_PATH=$(pip show nvidia-nvshmem-cu13 | grep "Location:" | cut -d' ' -f2)/nvidia/nvshmem/lib && \
     ln -sf ${NVSHMEM_LIB_PATH}/libnvshmem_host.so.3 ${NVSHMEM_LIB_PATH}/libnvshmem_host.so && \
     apt-get update && apt-get install -y --no-install-recommends libnvidia-ml-dev && \
-    TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" pip install --no-cache-dir --no-build-isolation -v . && \
+    CPLUS_INCLUDE_PATH=/usr/local/cuda/include/cccl \
+        TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" \
+        pip install --no-cache-dir --no-build-isolation -v . && \
     apt-get purge -y libnvidia-ml-dev && apt-get autoremove -y && \
     rm -rf /var/lib/apt/lists/* /opt/deepep.patch && \
     cd / && rm -rf DeepEP

@@ -458,10 +458,12 @@ class BackendConfig:
         compile_attn: torch.compile(fullgraph) the attention module's forward — both the
             DeepSeek-V3 MLA and standard GQA attention (e.g. Qwen3-MoE) honor it. Requires
             attn="sdpa", linear="torch", rms_norm="torch", rope_fusion=False.
-        compile_situ: torch.compile the fp32 chunk cores of the SiTU expert
-            activation (currently used by Kimi K3), fusing the elementwise fp32
-            chain in both the forward and the backward recompute. Compiled
-            numerics are allclose to eager but not bitwise-identical.
+        compile_situ: torch.compile the SiTU expert activation of models that opt in
+            (currently Kimi K3): the weighted-SiTU forward and backward run as one fused
+            whole-tensor kernel each (low-precision in/out, fp32 math inside, no chunk loop),
+            the dense / shared-expert ``SituAndMul`` uses a compiled core, and the attn-res
+            mixing chain is compiled as well. Compiled numerics are allclose to eager but
+            not bitwise-identical.
         compile_norm: torch.compile the fp32 RMSNorm chain of models that opt in
             (currently Kimi K3), fusing cast/pow/mean/rsqrt/mul into one kernel.
             Same lazy once-per-process pattern as ``compile_situ``; numerics are
@@ -469,6 +471,11 @@ class BackendConfig:
         shared_expert_overlap: run the shared experts of opted-in MoE models (currently Kimi K3)
             on a side CUDA stream so their GEMMs overlap the expert-parallel dispatch / combine
             communication of the routed path; numerics unchanged. Default False.
+        compile_router_weight: torch.compile the fp32 router-weight multiply applied to
+            expert outputs (``GroupedExperts`` / ``GroupedExpertsDeepEP``, all MoE models),
+            so each pass is one fused kernel instead of the eager per-chunk cast/multiply/
+            cast/slice-assign loop. Same lazy once-per-process pattern as ``compile_situ``;
+            numerics are allclose to eager but not bitwise-identical.
         benchmark_static_routing: Benchmark-only. Requires ``fake_balanced_gate=True``
             with ``fake_gate_noise=0.0``, where routing metadata (tokens per expert,
             permuted token counts) is identical for every microbatch. Skips the
@@ -518,9 +525,9 @@ class BackendConfig:
     # fullgraph can't trace), so it requires attn="sdpa", linear="torch", rms_norm="torch",
     # rope_fusion=False. Default False.
     compile_attn: bool = False
-    # When True, torch.compile the fp32 SiTU chunk cores (forward and backward recompute)
-    # of models using the SiTU expert activation (currently Kimi K3). Fuses the hot fp32
-    # elementwise chains; numerics are allclose to eager, not bitwise-identical. Default False.
+    # When True, torch.compile the SiTU expert activation of models that opt in (currently
+    # Kimi K3): fused whole-tensor weighted-SiTU forward/backward, the dense SituAndMul core
+    # and the attn-res chain. Numerics are allclose to eager, not bitwise-identical. Default False.
     compile_situ: bool = False
     # When True, torch.compile the fp32 RMSNorm chain of opted-in models (currently Kimi K3),
     # same lazy once-per-process pattern as compile_situ. Numerics are allclose to eager,
@@ -531,6 +538,10 @@ class BackendConfig:
     # GEMMs overlap the expert-parallel dispatch / combine communication (Megatron-Core's
     # moe_shared_expert_overlap). Same math, only the execution order changes. Default False.
     shared_expert_overlap: bool = False
+    # When True, torch.compile the fp32 router-weight multiply on expert outputs (shared by
+    # all MoE expert modules), same lazy once-per-process pattern as compile_situ. Numerics
+    # are allclose to eager, not bitwise-identical. Default False.
+    compile_router_weight: bool = False
     # Benchmark-only: cache per-microbatch routing metadata (tokens per expert, permuted
     # token counts) after the first microbatch to remove recurring device-to-host syncs.
     # Valid ONLY with fake_balanced_gate=True and fake_gate_noise=0.0 (enforced in

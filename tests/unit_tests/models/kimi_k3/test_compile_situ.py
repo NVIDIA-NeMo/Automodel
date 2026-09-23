@@ -15,13 +15,15 @@
 import pytest
 import torch
 
+import nemo_automodel.components.models.kimi_k3.model as kimi_k3_model
 import nemo_automodel.components.models.kimi_k3.situ as kimi_k3_situ
+import nemo_automodel.components.moe.optimized_ops as optimized_ops
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.kimi_k3.config import KimiK3TextConfig
-from nemo_automodel.components.models.kimi_k3.model import KimiK3MoE, _build_moe_config
+from nemo_automodel.components.models.kimi_k3.model import KimiDecoderLayer, KimiK3MoE, _build_moe_config
 
 
-def _tiny_config() -> KimiK3TextConfig:
+def _tiny_config(**overrides) -> KimiK3TextConfig:
     return KimiK3TextConfig(
         vocab_size=64,
         hidden_size=32,
@@ -52,6 +54,7 @@ def _tiny_config() -> KimiK3TextConfig:
             "gate_lower_bound": -5.0,
         },
         attn_res_block_size=1,
+        **overrides,
     )
 
 
@@ -72,18 +75,36 @@ def _torch_backend(**overrides) -> BackendConfig:
     )
 
 
+_SITU_STATE_ATTRS = (
+    "_situ_fwd_core",
+    "_situ_bwd_core",
+    "_attn_res_core",
+    "_weighted_situ_fwd_fused_dispatch",
+    "_weighted_situ_bwd_fused_dispatch",
+    "_dense_situ_dispatch",
+    "_SITU_CORES_COMPILED",
+)
+
+
 @pytest.fixture
 def restore_situ_cores():
     """Snapshot and restore the module-level SiTU cores around a test."""
-    orig_fwd = kimi_k3_situ._situ_fwd_core
-    orig_bwd = kimi_k3_situ._situ_bwd_core
-    orig_attn_res = kimi_k3_situ._attn_res_core
-    orig_flag = kimi_k3_situ._SITU_CORES_COMPILED
+    snapshot = {name: getattr(kimi_k3_situ, name) for name in _SITU_STATE_ATTRS}
+    rw_snapshot = (
+        optimized_ops._rw_fwd_dispatch,
+        optimized_ops._rw_bwd_x_dispatch,
+        optimized_ops._rw_bwd_probs_dispatch,
+        optimized_ops._RW_CORES_COMPILED,
+    )
     yield
-    kimi_k3_situ._situ_fwd_core = orig_fwd
-    kimi_k3_situ._situ_bwd_core = orig_bwd
-    kimi_k3_situ._attn_res_core = orig_attn_res
-    kimi_k3_situ._SITU_CORES_COMPILED = orig_flag
+    for name, value in snapshot.items():
+        setattr(kimi_k3_situ, name, value)
+    (
+        optimized_ops._rw_fwd_dispatch,
+        optimized_ops._rw_bwd_x_dispatch,
+        optimized_ops._rw_bwd_probs_dispatch,
+        optimized_ops._RW_CORES_COMPILED,
+    ) = rw_snapshot
 
 
 def test_compile_situ_defaults_to_false():
@@ -123,3 +144,45 @@ def test_compile_situ_wraps_cores_once(restore_situ_cores):
     _build_moe(_torch_backend(compile_situ=True))
     assert kimi_k3_situ._situ_fwd_core is compiled_fwd
     assert kimi_k3_situ._situ_bwd_core is compiled_bwd
+    # The fused whole-tensor passes and the dense core are wrapped by the same flag.
+    assert kimi_k3_situ._weighted_situ_fwd_fused_dispatch is not kimi_k3_situ._weighted_situ_fwd_fused
+    assert kimi_k3_situ._weighted_situ_bwd_fused_dispatch is not kimi_k3_situ._weighted_situ_bwd_fused
+    assert kimi_k3_situ._dense_situ_dispatch is not kimi_k3_situ._dense_situ_core
+
+
+def _build_decoder_layer(backend: BackendConfig, **config_knobs) -> KimiDecoderLayer:
+    config = _tiny_config(**config_knobs)  # the K3-only kernel knobs live on the model config
+    moe_config = _build_moe_config(config, torch.float32, None)
+    # layer 1 is a full-attention MoE layer of the tiny config (first_k_dense_replace=0), with attention
+    # residuals on (attn_res_block_size=1), so both kernel flags have a call site to reach.
+    return KimiDecoderLayer(config, 1, moe_config, backend)
+
+
+def test_situ_triton_flag_wires_decoder_layer(monkeypatch):
+    calls = []
+    monkeypatch.setattr(kimi_k3_model, "_enable_situ_triton", lambda: calls.append("situ"))
+    assert _tiny_config().situ_triton is False and not hasattr(BackendConfig(), "situ_triton")
+    _build_decoder_layer(_torch_backend())
+    assert calls == []
+    _build_decoder_layer(_torch_backend(), situ_triton=True)
+    assert calls == ["situ"]
+
+
+def test_attn_res_triton_flag_wires_decoder_layer(monkeypatch):
+    calls = []
+    monkeypatch.setattr(kimi_k3_model, "_enable_attn_res_triton", lambda: calls.append("attn_res"))
+    assert _tiny_config().attn_res_triton is False and not hasattr(BackendConfig(), "attn_res_triton")
+    layer = _build_decoder_layer(_torch_backend())
+    assert layer.use_attn_residuals and calls == []
+    _build_decoder_layer(_torch_backend(), attn_res_triton=True)
+    assert calls == ["attn_res"]
+
+
+def test_compile_router_weight_defaults_false_and_wires_k3_moe(restore_situ_cores):
+    assert BackendConfig().compile_router_weight is False
+    optimized_ops._RW_CORES_COMPILED = False
+    _build_moe(_torch_backend())
+    assert optimized_ops._RW_CORES_COMPILED is False
+    _build_moe(_torch_backend(compile_router_weight=True))
+    assert optimized_ops._RW_CORES_COMPILED is True
+    assert optimized_ops._rw_fwd_dispatch is not optimized_ops._rw_fwd_core

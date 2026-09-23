@@ -24,7 +24,7 @@ from torch.autograd import Function
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 
-from nemo_automodel.components.moe.optimized_ops import _apply_router_weight_fp32
+from nemo_automodel.components.moe.optimized_ops import _apply_router_weight_fp32, _compile_router_weight_cores
 from nemo_automodel.components.moe.state_dict_utils import create_dtensor_from_local
 
 try:
@@ -428,6 +428,8 @@ class GroupedExperts(nn.Module):
         # GEMMs through torchao's MXFP8 kernel (see _torch_mm_experts_fwd).
         self.use_torch_mm = backend is not None and backend.experts in ("torch_mm", "torch_mm_mxfp8")
         self.use_mxfp8 = backend is not None and backend.experts == "torch_mm_mxfp8"
+        if backend is not None and getattr(backend, "compile_router_weight", False):
+            _compile_router_weight_cores()
 
         # Allocate projection tensor - size depends on whether activation is gated
         # Gated (SwiGLU, Quick-GEGLU): [n_experts, dim, 2*inter_dim]
@@ -949,6 +951,8 @@ class GroupedExpertsDeepEP(nn.Module):
         # GEMMs through torchao's MXFP8 kernel (see _torch_mm_experts_fwd).
         self.use_torch_mm = backend is not None and backend.experts in ("torch_mm", "torch_mm_mxfp8")
         self.use_mxfp8 = backend is not None and backend.experts == "torch_mm_mxfp8"
+        if backend is not None and getattr(backend, "compile_router_weight", False):
+            _compile_router_weight_cores()
         # Benchmark-only (BackendConfig.benchmark_static_routing, validated there): routing
         # metadata is identical per microbatch, so host copies of it can be cached.
         self.static_routing = backend is not None and backend.benchmark_static_routing

@@ -125,6 +125,8 @@ ci:
     # tp_size stays at the base value (1): the dense Nemotron-H custom path is FSDP2-only.
     # Use the same cached family tokenizer for the long parity document.
     tokenizer_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+    # Pair the remote-code HF receiver with the legacy adapter export.
     trust_remote_code: true
+    checkpoint.v4_compatible: true
     dataset.limit_dataset_samples: 500
     validation_dataset.limit_dataset_samples: 500
