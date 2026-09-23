@@ -22,7 +22,9 @@ compression, no indexer); both ship a training recipe in their `training/` folde
 | `configs/moonlight_v4_16b_hf.yaml` | baseline: stock transformers `DeepseekV4ForCausalLM` driven by the benchmark recipe |
 | `configs/moonlight_v4_16b_torch.yaml` | NeMo Automodel native DeepSeek-V4, portable backends (eager attention, `torch._grouped_mm` experts, torch dispatcher) |
 | `configs/moonlight_v4_16b_tilelang_deepep.yaml` | NeMo Automodel with TileLang sparse-attention / indexer / Sinkhorn kernels and DeepEP (Hopper-class GPUs) |
-| `configs/pretrain_moonlight_v4_16b.yaml` | from-scratch pre-training on Megatron-format data (8 GPUs, EP 8) |
+| `configs/pretrain_moonlight_v4_16b.yaml` | from-scratch pre-training on FineWeb-edu, 700 steps at micro-batch 1 (8 GPUs, EP 8) |
+| `configs/pretrain_moonlight_v4_16b_10k.yaml` | the 10,000-step run on the MFU-tuned backends, micro-batch 2, chained 4-hour jobs |
+| `pretrain.sh`, `prepare_fineweb.py`, `finite_nanogpt.py` | container launcher (data preparation, auto-resume, Weights & Biases), FineWeb-edu tokenisation, bounded validation dataset |
 | `profile_layer.py` | per-layer fwd+bwd profiling (attention SWA/CSA/HCA, MoE, block, RMSNorm, mHC mixer), Automodel vs transformers |
 | `nsys_profiles/` | the nsys commands behind the lecture's profiles and a script to regenerate them |
 | `run_bench.sh` | 8-GPU benchmark runner behind the reference tables below; `run_bench.sh journey` is the stage-by-stage comparison on the 4-layer model |
@@ -43,8 +45,10 @@ python examples/scalable_ai/profile_layer.py --layer attn --compress-ratio 4 --n
 python examples/scalable_ai/profile_layer.py --layer attn --compress-ratio 4 --backend-attn tilelang --no-nsys   # Hopper
 python examples/scalable_ai/profile_layer.py --layer attn --compress-ratio 0 --use-hf --no-nsys
 
-# Pre-training (replace the data paths in the yaml first)
-automodel examples/scalable_ai/configs/pretrain_moonlight_v4_16b.yaml --nproc-per-node 8
+# Pre-training on 8 GPUs (inside the container; tokenises FineWeb-edu on first use, resumes from the latest checkpoint)
+bash examples/scalable_ai/pretrain.sh
+CFG=examples/scalable_ai/configs/pretrain_moonlight_v4_16b_10k.yaml DATA=$WORK/data/fineweb_edu_moonshot_6b \
+    CKPT=$WORK/checkpoints/moonlight_v4_16b_10k PREP_FILES=14 TRAIN_TOKENS=5.6B SHARD_TOKENS=100M bash examples/scalable_ai/pretrain.sh
 ```
 
 ## What the profiles show
@@ -142,6 +146,37 @@ Rerun the stage when that happens; the cause was not investigated here.
 Operational notes for containers: put `TILELANG_CACHE_DIR`, `TRITON_CACHE_DIR` and `TORCHINDUCTOR_CACHE_DIR` on a
 writable filesystem (`run_bench.sh` does); when tilelang cannot create its cache directory its import fails and
 Automodel silently falls back to the transformers model class, which then rejects the `backend` argument.
+
+## Pre-training runs (8x H100, 2026-09-20 to 2026-09-22)
+
+Two from-scratch runs of Moonlight-V4-16B-A3B on FineWeb-edu (sample-10BT, tokenised on the node by
+`prepare_fineweb.py` with the Moonshot tokenizer into NanogptDataset shards), sequence 2048, global batch 256
+sequences (524k tokens per step), AdamW at 4.2e-4 with cosine decay to 4.2e-5, in the 26.08 container.
+
+| run | backends | micro-batch | steps | tokens | step time | tokens/s | peak memory | final train / val loss |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pretrain_moonlight_v4_16b.yaml` | TileLang attention, DeepEP, `torch_mm` experts | 1 | 700 | 367M | 19 s | 27k | 50 GB | 3.78 / 3.79 |
+| `pretrain_moonlight_v4_16b_10k.yaml` | + grouped_gemm experts, compiled mHC cores, bf16 mixer/output projections and gradient reduction | 2 | 10,000 | 5.2B | 12.2 s | 43k | 61 GB | 2.62 / 2.72 |
+
+Loss of the 10k run: 12.50 at step 0, 6.28 at 100 (500-step warm-up), 3.54 at 1000, 3.05 at 3000, 2.79 at 5000,
+2.67 at 7500 and 2.62 at the last step (2.56 averaged over the last 100 steps); validation loss tracked training
+within 0.1 throughout and ended at 2.72. The tuned backends made the
+full model 1.75x faster than the first run (48k vs 27k tokens/s at the same global batch when measured on mock data;
+43k sustained with real data and checkpointing). Micro-batch 4 runs out of memory in the first backward pass on the
+27-layer model, so micro-batch 2 with 16 accumulation steps is the ceiling on 80 GB GPUs; the 138k tokens/s and 44 GB
+in the MFU slides are the 12-layer profiling shape.
+
+Operations. The `batch` partition allows 4 hours per job, so the 10k run was a chain of eleven jobs submitted with
+`--dependency=afterany`, each resuming from the latest 95 GB checkpoint (saved every 100 steps in about 20 s, two
+kept): 43 node-hours of compute over 51 hours of wall clock, seven of which the last job spent in the queue. Every handover cost the steps since the last checkpoint (up to 100) plus a resume. Resume time grew from
+3 minutes early on to 35-95 minutes after step 7500: `NanogptDataset` has no `state_dict`, so the
+`StatefulDataLoader` replays and discards every consumed sample (270-320k per rank by then) with the GPUs idle.
+A dataset that records its position would remove that cost. With real routing, the DeepEP dispatcher died once in
+three consecutive attempts with `DeepEP error: CPU recv timeout` in a diagnostic, but the launcher's retry
+(three attempts, then the torch dispatcher) never had to fire during the 10k run itself. Weights & Biases ran
+offline (no credentials on the cluster); segments were uploaded with `wandb sync --legacy --append`, since the
+default sync does not re-upload a partially synced offline file. Write to a filesystem with headroom: the first
+attempt died at its first checkpoint save on a Lustre pool that was 99% full.
 
 ## Changes from the January 2026 edition
 
