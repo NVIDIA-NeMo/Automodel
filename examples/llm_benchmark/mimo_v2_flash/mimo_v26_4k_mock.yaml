@@ -17,7 +17,7 @@
 # EP64, TP=CP=PP=1, DP64; LBS=2, GBS=128, GA=1.
 # 30 total iterations: 10 warmup + 20 measured.
 # Requires MiMo V2.6 model support from PR #3992. See README.md for MFU scope,
-# kernel/runtime requirements, results and the 8K validation limitation.
+# kernel/runtime requirements and measured results.
 # Launch through the dedicated benchmark recipe:
 # automodel examples/llm_benchmark/mimo_v2_flash/mimo_v26_4k_mock.yaml --nnodes 8 --nproc-per-node 8
 

@@ -1,17 +1,16 @@
-# MiMo V2.6 text throughput benchmarks
+# MiMo V2.6 text throughput benchmark
 
-These examples run the dedicated LLM benchmark recipe with the complete 48-layer
+This example runs the dedicated LLM benchmark recipe with the complete 48-layer
 text backbone of [XiaomiMiMo/MiMo-V2.6-Flash-RL](https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Flash-RL).
-They require the MiMo V2.6 implementation in [PR #3992](https://github.com/NVIDIA-NeMo/Automodel/pull/3992).
+It requires the MiMo V2.6 implementation in [PR #3992](https://github.com/NVIDIA-NeMo/Automodel/pull/3992).
 No checkpoint weights, images, audio or MTP heads are loaded.
 
 | Configuration | Sequence length | GPUs | EP / CP / PP | Local / global batch | Accumulation |
 | --- | ---: | ---: | --- | --- | ---: |
 | [4K mock](mimo_v26_4k_mock.yaml) | 4096 | 64 H100 SXM | 64 / 1 / 1 | 2 / 128 | 1 |
-| [8K mock](mimo_v26_8k_mock.yaml) | 8192 | 64 H100 SXM | 64 / 1 / 1 | 2 / 128 | 1 |
 
-Both run 30 iterations, including 10 warmup iterations. Mock data is non-packed;
-each row is one full-length sequence. Fake balanced routing and static routing
+The benchmark runs 30 iterations, including 10 warmup iterations. Mock data is
+non-packed; each row is one full-length sequence. Fake balanced routing and static routing
 metadata are enabled for throughput measurement, not convergence measurement.
 
 ## Run
@@ -22,18 +21,17 @@ Launch inside a scheduler allocation of eight nodes with eight GPUs per node:
 automodel examples/llm_benchmark/mimo_v2_flash/mimo_v26_4k_mock.yaml --nnodes 8 --nproc-per-node 8
 ```
 
-Use the 8K YAML for the longer sequence. The recipe reports per-iteration MFU and
-writes a JSON summary under `training_logs/`. W&B is commented out; enable the
-block with your own project/entity to log a run.
+The recipe reports per-iteration MFU and writes a JSON summary under
+`training_logs/`. W&B is commented out; enable the block with your own project/entity to log a run.
 
-The configs retain the measured kernel choices: TE attention, linear and RMSNorm;
+The config retains the measured kernel choices: TE attention, linear and RMSNorm;
 `torch_mm` experts; HybridEP with 20 communication SMs; fused linear cross entropy;
 TE FusedAdam; FSDP2 prefetch and optimizations; activation checkpointing; and
-`reshard_after_forward: true` for both dense and expert parameters. They use BF16,
+`reshard_after_forward: true` for both dense and expert parameters. It uses BF16,
 not FP8. HybridEP needs a working DeepEP/DOCA multi-node installation.
 
-The recorded runs used cuDNN 9.26 with Transformer Engine. These are non-packed
-BSHD/CP1 examples. The separate packed THD sink-attention path requires cuDNN
+The recorded run used cuDNN 9.26 with Transformer Engine. This is a non-packed
+BSHD/CP1 example. The separate packed THD sink-attention path requires cuDNN
 9.26 or newer; see the runtime notes in PR #3992.
 
 ## FLOPs accounting
@@ -81,8 +79,7 @@ Full attention has `P = S(S+1)/2`. SWA has
 This includes the causal ramp at the start of each sequence. QK and V have
 different dimensions; TE's padded V width is not model work.
 
-At GBS 128 this gives **48.125875807322112 PFLOPs/step at 4K** and
-**98.631682583691264 PFLOPs/step at 8K**. MFU is:
+At GBS 128 this gives **48.125875807322112 PFLOPs/step at 4K**. MFU is:
 
 ```text
 100 * global_step_FLOPs / (GPU_count * step_seconds * peak_FLOPs_per_GPU)
@@ -104,7 +101,7 @@ embedding lookups are elementwise or lookup work and are outside this
 matrix-FLOPs convention. Communication, optimizer updates, activation
 recomputation and backend padding are also excluded. Packed batches with
 multiple constituent sequences need their actual lengths for attention FLOPs;
-these fixed-length examples do not claim packed or multimodal FLOPs coverage.
+this fixed-length example does not claim packed or multimodal FLOPs coverage.
 
 ## Recorded measurements
 
@@ -114,9 +111,3 @@ Over measured steps 10–29, averaging each step's slowest-rank duration gives
 3.3088171 seconds, **2475.8 tokens/s/GPU**, and **22.98% MFU** with this formula.
 Rank 0 reported 61.15 GiB maximum allocated memory. The W&B run predates this
 formula; its generic-formula MFU is incorrect and has not been rewritten.
-
-The original 8K run failed before a measured iteration while HybridEP/DOCA
-created queue pairs (`Failed to create 0th QP with status 6`):
-[W&B nyu009ks](https://wandb.ai/Nemo-automodel/automodel-mimo-v26/runs/nyu009ks).
-The 8K YAML is provided for reproduction; 8K throughput, MFU and memory have
-not been validated. The failure was not a reported CUDA OOM.
