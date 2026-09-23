@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import base64
 import os
 import re
 import subprocess
@@ -309,6 +310,13 @@ def test_model_coverage_pages_use_provider_sections_and_checkpoint_slugs():
     repo_root = Path(__file__).parents[3]
     docs_config = yaml.safe_load((repo_root / "docs" / "fern" / "docs.yml").read_text(encoding="utf-8"))
     assert docs_config.get("theme", {}).get("sidebar") == "default", "Provider icons require the default sidebar"
+    assert docs_config.get("layout", {}).get("breadcrumbs", {}).get("current-page") is True
+    provider_css = repo_root / "docs" / "fern" / "provider-icons.css"
+    assert docs_config.get("css") == "./provider-icons.css"
+    stylesheet = provider_css.read_text(encoding="ascii")
+    sprites = re.findall(r"data:image/png;base64,([A-Za-z0-9+/=]+)", stylesheet)
+    assert len(sprites) == 1, "Provider logos must share one base64 sprite"
+    assert base64.b64decode(sprites[0], validate=True).startswith(b"\x89PNG\r\n\x1a\n")
     config_path = repo_root / "docs" / "fern" / "versions" / "nightly.yml"
     navigation = yaml.safe_load(config_path.read_text(encoding="utf-8"))["navigation"]
     model_coverage = next(item for item in navigation if item.get("section") == "Model Coverage")
@@ -324,7 +332,7 @@ def test_model_coverage_pages_use_provider_sections_and_checkpoint_slugs():
     }
     offenders: list[str] = []
     navigated_model_pages: list[Path] = []
-    provider_icons: dict[str, str] = {}
+    provider_slugs: set[str] = set()
 
     for category in (item for item in model_coverage["contents"] if "section" in item):
         category_slug = str(category.get("slug"))
@@ -343,16 +351,9 @@ def test_model_coverage_pages_use_provider_sections_and_checkpoint_slugs():
             if not index_path.is_file() or _frontmatter_slug(index_path) != expected_provider_route:
                 offenders.append(f"{provider_slug}: invalid provider index route")
 
-            icon = provider.get("icon")
-            if not isinstance(icon, str):
-                offenders.append(f"{provider_slug}: provider section has no icon")
-            else:
-                icon_path = (config_path.parent / icon).resolve()
-                if not icon_path.is_file():
-                    offenders.append(f"{provider_slug}: missing provider icon {icon!r}")
-                previous_icon = provider_icons.setdefault(provider_slug, icon)
-                if previous_icon != icon:
-                    offenders.append(f"{provider_slug}: provider icon must be consistent across categories")
+            if "icon" in provider:
+                offenders.append(f"{provider_slug}: provider logo must come from the shared sprite")
+            provider_slugs.add(provider_slug)
 
             for page in provider.get("contents", []):
                 path = page.get("path")
@@ -392,6 +393,13 @@ def test_model_coverage_pages_use_provider_sections_and_checkpoint_slugs():
         offenders.append("nightly navigation does not contain every model card exactly once")
     if len(navigated_model_pages) != len(set(navigated_model_pages)):
         offenders.append("nightly navigation contains duplicate model cards")
+    for provider_slug in sorted(provider_slugs):
+        selector = f'[href$="/{provider_slug}"]'
+        if selector not in stylesheet:
+            offenders.append(f"{provider_slug}: missing provider sprite selector")
+    legacy_icons = list((repo_root / "docs" / "fern" / "assets" / "providers").glob("*.png"))
+    if legacy_icons:
+        offenders.append("individual provider icons remain alongside the embedded sprite")
 
     assert not offenders, "Model coverage provider hierarchy violations:\n" + "\n".join(
         f"  - {offender}" for offender in offenders

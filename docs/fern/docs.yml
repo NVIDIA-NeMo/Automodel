@@ -21,6 +21,12 @@ global-theme: nvidia
 theme:
   sidebar: default
 
+layout:
+  breadcrumbs:
+    current-page: true
+
+css: ./provider-icons.css
+
 # NVIDIA green (#76B900) does not meet WCAG AA contrast for normal text on
 # white. Keep the brand hue while using accessible light and dark variants.
 colors:
