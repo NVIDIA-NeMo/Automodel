@@ -53,7 +53,7 @@ from torch.distributed.checkpoint.metadata import Metadata, TensorStorageMetadat
 from torch.distributed.checkpoint.storage import StorageReader, StorageWriter
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import FSDPModule
-from torch.distributed.tensor import DTensor, distribute_tensor
+from torch.distributed.tensor import DTensor, Replicate, distribute_tensor
 from torch.nn.parallel import DistributedDataParallel
 from torch.overrides import TorchFunctionMode
 from torch.serialization import MAP_LOCATION, FileLike
@@ -120,9 +120,10 @@ class _DTensorInitCopyMode(TorchFunctionMode):
             types: Tensor types participating in the operation.
             args: Operation arguments. For ``copy_``, the destination has arbitrary
                 global shape and the source is broadcastable to that shape. A plain
-                source is distributed from mesh rank zero to the destination's mesh
-                and placements before the in-place copy; existing DTensor sources
-                and plain destinations keep their normal behavior.
+                source is privately copied, broadcast from mesh rank zero, and
+                locally sharded to the destination's placements before the in-place
+                copy; existing DTensor sources and plain destinations keep their
+                normal behavior.
             kwargs: Keyword arguments to the operation, including an optional
                 ``other`` source tensor with the same contract as above.
 
@@ -135,11 +136,12 @@ class _DTensorInitCopyMode(TorchFunctionMode):
             destination = args[0]
             source = args[1] if len(args) > 1 else kwargs["other"]
             if isinstance(source, torch.Tensor) and not isinstance(source, DTensor):
+                # Broadcast then shard locally to avoid persistent NCCL scatter memory.
                 source = distribute_tensor(
                     source.to(device=destination.device, copy=True).expand(destination.shape),
                     destination.device_mesh,
-                    destination.placements,
-                )
+                    [Replicate()] * destination.device_mesh.ndim,
+                ).redistribute(placements=destination.placements)
                 if len(args) > 1:
                     args = (destination, source, *args[2:])
                 else:
