@@ -150,9 +150,16 @@ class HybridEPDispatchReplayRecorder:
     def record(self, handle, tokens_per_expert, num_permuted_tokens=None) -> None:
         """Log one checkpoint-forward dispatch.
 
-        When the forward already ran with a host-side extent (capacity mode, static-routing pin),
-        that integer is the extent its output was sized to and the one the replay must reuse;
+        When the forward already ran with a host ``int`` extent (capacity mode), that integer is
+        the extent its output was sized to and the one the replay must reuse;
         recording it also spares ``finalize`` the device-to-host reduction for that dispatch.
+
+        Args:
+            handle: HybridEP dispatch handle the recompute replays from.
+            tokens_per_expert: ``[num_local_experts]`` integer tensor of rows per local expert; when no
+                host extent is recorded, ``finalize`` reduces it to the extent (one device-to-host read).
+            num_permuted_tokens: Host ``int`` extent the forward output was sized to (capacity mode), or
+                a tensor / ``None`` (blocking path, static-routing pin) when ``finalize`` must reduce it.
         """
         extent = num_permuted_tokens if isinstance(num_permuted_tokens, int) else None
         self._records.append([handle, tokens_per_expert, extent])

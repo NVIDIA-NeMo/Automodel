@@ -489,15 +489,13 @@ class TestBackendConfigPartialCudaGraphs:
             )
 
 
-def test_dispatcher_capacity_factor_defaults_off():
-    from nemo_automodel.components.models.common.utils import BackendConfig
+class TestBackendConfigHybridEPSyncFree:
+    """The two HybridEP sync-free knobs default off and pass through unchanged."""
 
-    assert BackendConfig().dispatcher_capacity_factor is None
-    assert BackendConfig(dispatcher_capacity_factor=1.5).dispatcher_capacity_factor == 1.5
+    def test_dispatcher_capacity_factor_defaults_off(self):
+        assert BackendConfig().dispatcher_capacity_factor is None
+        assert BackendConfig(dispatcher_capacity_factor=1.5).dispatcher_capacity_factor == 1.5
 
-
-def test_dispatcher_equal_token_counts_defaults_off():
-    from nemo_automodel.components.models.common.utils import BackendConfig
-
-    assert BackendConfig().dispatcher_equal_token_counts is False
-    assert BackendConfig(dispatcher_equal_token_counts=True).dispatcher_equal_token_counts is True
+    def test_dispatcher_equal_token_counts_defaults_off(self):
+        assert BackendConfig().dispatcher_equal_token_counts is False
+        assert BackendConfig(dispatcher_equal_token_counts=True).dispatcher_equal_token_counts is True
