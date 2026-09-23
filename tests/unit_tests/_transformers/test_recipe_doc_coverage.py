@@ -239,8 +239,6 @@ _HF_ORG_TO_DOC_SLUG = {
     "ibm-granite": "ibm",
     "meta-llama": "meta",
     "MiniMaxAI": "minimax",
-    "OpenGVLab": "internlm",  # InternVL docs live on internlm/ alongside InternLM
-    "openai-community": "openai",  # gpt2 mirror
     "zai-org": "thudm",  # zai-org (née THUDM) publishes GLM-4+
 }
 

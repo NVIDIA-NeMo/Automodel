@@ -45,6 +45,7 @@ from tests.ci_tests.utils.sync_model_coverage_tables import (
     _validate_dated_support_tables_are_generated,
     _validate_generated_tables_are_not_committed,
 )
+from tools.sync_fern_provider_icons import PROVIDER_ORGS
 
 # Over the default 5s budget on purpose: this module drives git through subprocesses over throwaway repositories.
 # Shrink the work or the process count before raising this further.
@@ -398,12 +399,21 @@ def test_model_coverage_pages_use_provider_sections_and_checkpoint_slugs():
                 if title_match is None or title_match.group(1) != model_id:
                     title = title_match.group(1) if title_match is not None else None
                     offenders.append(f"{path}: page title {title!r} does not match {model_id!r}")
-                hf_models = re.findall(
-                    r"https://huggingface\.co/[A-Za-z0-9_.-]+/([A-Za-z0-9_.-]+)",
+                hf_checkpoints = re.findall(
+                    r"https://huggingface\.co/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)",
                     document,
                 )
-                if model_id not in hf_models:
+                canonical_publishers = {owner for owner, checkpoint in hf_checkpoints if checkpoint == model_id}
+                if not canonical_publishers:
                     offenders.append(f"{path}: URL model ID {model_id!r} is not linked by the card")
+                expected_publisher = PROVIDER_ORGS.get(provider_slug)
+                if expected_publisher is None or all(
+                    owner.casefold() != expected_publisher.casefold() for owner in canonical_publishers
+                ):
+                    offenders.append(
+                        f"{path}: checkpoint publisher {sorted(canonical_publishers)!r} does not match provider "
+                        f"{provider_slug!r}"
+                    )
 
     if "Llama" in provider_models.get(("large-language-models", "meta"), []):
         offenders.append("large-language-models/meta: catch-all Llama label remains")
@@ -522,16 +532,18 @@ def test_recipe_backed_model_sizes_have_exact_index_routes_and_one_card():
             if f"{provider_href}/{model_name}" in navigated_routes
             or f"/nemo/automodel{provider_href}/{model_name}" in redirects
         }
-        if len(provider_hrefs) != 1:
-            missing.append((release.model_type, release.hf_model_id, f"provider mapping {sorted(provider_hrefs)}"))
+        destinations = {
+            redirects.get(
+                f"/nemo/automodel{provider_href}/{model_name}", f"/nemo/automodel{provider_href}/{model_name}"
+            ).removeprefix("/nemo/automodel")
+            for provider_href in provider_hrefs
+        }
+        destinations &= navigated_routes
+        if len(destinations) != 1:
+            missing.append((release.model_type, release.hf_model_id, f"card destinations {sorted(destinations)}"))
             continue
-        provider_href = next(iter(provider_hrefs))
-        exact_href = f"{provider_href}/{model_name}"
-        source = f"/nemo/automodel{exact_href}"
-        destination = redirects.get(source, source).removeprefix("/nemo/automodel")
-        if destination not in navigated_routes:
-            missing.append((release.model_type, release.hf_model_id, f"navigated card {destination}"))
-            continue
+        destination = next(iter(destinations))
+        provider_href = destination.rsplit("/", 1)[0]
         if destination not in index_routes.get(provider_href, set()):
             missing.append((release.model_type, release.hf_model_id, f"provider index card {destination}"))
             continue
