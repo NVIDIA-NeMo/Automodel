@@ -730,9 +730,7 @@ class MiMoV2FlashModel(nn.Module):
                 for layer_id in range(config.num_hidden_layers)
             }
         )
-        self.norm = _initialize_mimo_rms_norm(
-            backend, config.hidden_size, eps=config.layernorm_epsilon, dtype=dtype
-        )
+        self.norm = _initialize_mimo_rms_norm(backend, config.hidden_size, eps=config.layernorm_epsilon, dtype=dtype)
         self.rotary_emb = MiMoV2FlashRotaryEmbedding(
             rope_theta=float(config.rope_theta),
             head_dim=int(config.head_dim),
@@ -978,11 +976,7 @@ class MiMoV2FlashModel(nn.Module):
                 raise ValueError(
                     "MiMo TE BSHD attention expects a 2D padding mask [batch, sequence], "
                     f"got {type(attention_mask).__name__}"
-                    + (
-                        f" with shape {tuple(attention_mask.shape)}"
-                        if isinstance(attention_mask, torch.Tensor)
-                        else ""
-                    )
+                    + (f" with shape {tuple(attention_mask.shape)}" if isinstance(attention_mask, torch.Tensor) else "")
                 )
             # TE constructs the causal mask internally and applies each layer's
             # window_size. Passing the original padding mask avoids expanding an
