@@ -69,8 +69,8 @@ PROVIDER_ORGS = {
 AVATAR_PATTERN = re.compile(rb"cdn-avatars\.huggingface\.co/[^\"&]+")
 USER_AGENT = "nemo-automodel-docs/1.0"
 SPRITE_COLUMNS = 12
-SPRITE_CELL_SIZE = 64
-DATA_URI_PATTERN = re.compile(r'href="data:image/png;base64,([A-Za-z0-9+/=]+)"')
+SPRITE_CELL_SIZE = 20
+DATA_URI_PATTERN = re.compile(r'href="data:image/webp;base64,([A-Za-z0-9+/=]+)"')
 
 
 def _request(url: str, *, accept: str) -> bytes:
@@ -118,60 +118,104 @@ def _build_sprite(images: dict[str, bytes]) -> bytes:
         sprite.alpha_composite(logo, (x, y))
 
     output = io.BytesIO()
-    sprite.save(output, format="PNG", optimize=True)
+    sprite.save(output, format="WEBP", lossless=True, method=6)
     return output.getvalue()
 
 
-def _render_svg(sprite: bytes) -> str:
+def _render_icon(provider: str, encoded: str) -> str:
     providers = sorted(PROVIDER_ORGS)
-    rows = math.ceil(len(providers) / SPRITE_COLUMNS)
-    encoded = base64.b64encode(sprite).decode("ascii")
-    views = []
-    for index, provider in enumerate(providers):
-        column = index % SPRITE_COLUMNS
-        row = index // SPRITE_COLUMNS
-        views.append(
-            f'  <view id="{provider}" '
-            f'viewBox="{column * SPRITE_CELL_SIZE} {row * SPRITE_CELL_SIZE} '
-            f'{SPRITE_CELL_SIZE} {SPRITE_CELL_SIZE}"/>'
-        )
+    index = providers.index(provider)
+    column = index % SPRITE_COLUMNS
+    row = index // SPRITE_COLUMNS
     width = SPRITE_COLUMNS * SPRITE_CELL_SIZE
-    height = rows * SPRITE_CELL_SIZE
+    height = math.ceil(len(providers) / SPRITE_COLUMNS) * SPRITE_CELL_SIZE
     return (
-        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
-        f'viewBox="0 0 {width} {height}">\n' + "\n".join(views) + "\n"
-        f'  <image width="{width}" height="{height}" '
-        f'href="data:image/png;base64,{encoded}"/>\n'
-        "</svg>\n"
+        f'<svg xmlns="http://www.w3.org/2000/svg" '
+        f'viewBox="{column * SPRITE_CELL_SIZE} {row * SPRITE_CELL_SIZE} '
+        f'{SPRITE_CELL_SIZE} {SPRITE_CELL_SIZE}">'
+        f'<image width="{width}" height="{height}" '
+        f'href="data:image/webp;base64,{encoded}"/></svg>'
     )
 
 
-def _check(output_svg: Path, legacy_dir: Path) -> list[str]:
+def _navigation_icons(navigation_path: Path) -> list[tuple[str, str]]:
+    lines = navigation_path.read_text(encoding="utf-8").splitlines()
+    icons = []
+    for index, line in enumerate(lines[:-1]):
+        stripped = line.strip()
+        next_line = lines[index + 1].strip()
+        if not stripped.startswith("icon: ") or not next_line.startswith("slug: "):
+            continue
+        provider = next_line.removeprefix("slug: ").strip('"')
+        if provider in PROVIDER_ORGS:
+            icons.append((provider, stripped.removeprefix("icon: ").strip("'")))
+    return icons
+
+
+def _update_navigation(navigation_path: Path, sprite: bytes) -> int:
+    lines = navigation_path.read_text(encoding="utf-8").splitlines()
+    encoded = base64.b64encode(sprite).decode("ascii")
+    updated = 0
+    for index, line in enumerate(lines[:-1]):
+        next_line = lines[index + 1].strip()
+        if not line.strip().startswith("icon: ") or not next_line.startswith("slug: "):
+            continue
+        provider = next_line.removeprefix("slug: ").strip('"')
+        if provider not in PROVIDER_ORGS:
+            continue
+        indent = line[: len(line) - len(line.lstrip())]
+        lines[index] = f"{indent}icon: '{_render_icon(provider, encoded)}'"
+        updated += 1
+    if updated == 0:
+        raise RuntimeError(f"No provider icon entries found in {navigation_path}")
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=navigation_path.parent,
+        delete=False,
+    ) as temporary:
+        temporary.write("\n".join(lines) + "\n")
+        temporary_path = Path(temporary.name)
+    temporary_path.replace(navigation_path)
+    return updated
+
+
+def _check(navigation_path: Path, legacy_dir: Path, legacy_sprite: Path) -> list[str]:
     problems = []
-    if not output_svg.is_file():
-        return [f"missing {output_svg}"]
-    sprite_document = output_svg.read_text(encoding="ascii")
-    matches = DATA_URI_PATTERN.findall(sprite_document)
-    if len(matches) != 1:
-        problems.append(f"expected one embedded PNG sprite in {output_svg}, found {len(matches)}")
+    icons = _navigation_icons(navigation_path)
+    providers = {provider for provider, _ in icons}
+    if providers != set(PROVIDER_ORGS):
+        missing = sorted(set(PROVIDER_ORGS) - providers)
+        problems.append(f"provider icons missing from {navigation_path}: {missing}")
+    encoded_sprites = set()
+    for provider, icon in icons:
+        match = DATA_URI_PATTERN.search(icon)
+        if match is None:
+            problems.append(f"{provider}: icon does not embed the provider sprite")
+            continue
+        encoded_sprites.add(match.group(1))
+        expected_view_box = _render_icon(provider, match.group(1)).split('viewBox="', 1)[1].split('"', 1)[0]
+        if f'viewBox="{expected_view_box}"' not in icon:
+            problems.append(f"{provider}: incorrect sprite view box")
+    if len(encoded_sprites) != 1:
+        problems.append(f"expected one shared base64 sprite, found {len(encoded_sprites)}")
     else:
         try:
-            sprite = base64.b64decode(matches[0], validate=True)
+            sprite = base64.b64decode(next(iter(encoded_sprites)), validate=True)
             with Image.open(io.BytesIO(sprite)) as image:
                 expected_rows = math.ceil(len(PROVIDER_ORGS) / SPRITE_COLUMNS)
                 expected_size = (SPRITE_COLUMNS * SPRITE_CELL_SIZE, expected_rows * SPRITE_CELL_SIZE)
-                if image.format != "PNG" or image.size != expected_size:
+                if image.format != "WEBP" or image.size != expected_size:
                     problems.append(
-                        f"invalid sprite in {output_svg}: expected PNG {expected_size}, got {image.format} {image.size}"
+                        f"invalid embedded sprite: expected WEBP {expected_size}, got {image.format} {image.size}"
                     )
         except (ValueError, OSError) as exc:
-            problems.append(f"invalid base64 sprite in {output_svg}: {exc}")
-    for provider in PROVIDER_ORGS:
-        if f'<view id="{provider}" ' not in sprite_document:
-            problems.append(f"missing provider view {provider!r} in {output_svg}")
+            problems.append(f"invalid base64 sprite: {exc}")
     legacy_icons = sorted(legacy_dir.glob("*.png")) if legacy_dir.is_dir() else []
     if legacy_icons:
         problems.append(f"legacy provider icons remain in {legacy_dir}")
+    if legacy_sprite.exists():
+        problems.append(f"legacy external sprite remains at {legacy_sprite}")
     return problems
 
 
@@ -180,9 +224,9 @@ def main() -> int:
     repo_root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--output-svg",
+        "--navigation",
         type=Path,
-        default=repo_root / "docs" / "fern" / "assets" / "provider-sprite.svg",
+        default=repo_root / "docs" / "fern" / "versions" / "nightly.yml",
     )
     parser.add_argument(
         "--source-dir",
@@ -192,9 +236,10 @@ def main() -> int:
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
     legacy_dir = repo_root / "docs" / "fern" / "assets" / "providers"
+    legacy_sprite = repo_root / "docs" / "fern" / "assets" / "provider-sprite.svg"
 
     if args.check:
-        problems = _check(args.output_svg, legacy_dir)
+        problems = _check(args.navigation, legacy_dir, legacy_sprite)
         if problems:
             print("\n".join(problems), file=sys.stderr)
             return 1
@@ -211,18 +256,8 @@ def main() -> int:
                 raise FileNotFoundError(source)
             images[provider] = source.read_bytes()
 
-    sprite_document = _render_svg(_build_sprite(images))
-    args.output_svg.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        mode="w",
-        encoding="ascii",
-        dir=args.output_svg.parent,
-        delete=False,
-    ) as temporary:
-        temporary.write(sprite_document)
-        temporary_path = Path(temporary.name)
-    temporary_path.replace(args.output_svg)
-    print(f"Updated {args.output_svg.relative_to(repo_root)} with {len(PROVIDER_ORGS)} providers")
+    updated = _update_navigation(args.navigation, _build_sprite(images))
+    print(f"Updated {updated} provider icons in {args.navigation.relative_to(repo_root)}")
     return 0
 
 
