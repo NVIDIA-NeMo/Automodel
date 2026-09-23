@@ -1,62 +1,55 @@
 ---
 title: "gpt2"
-description: ""
+description: "Pretrain gpt2 with NeMo AutoModel using a documented checkpoint, runnable recipe, setup guidance, model reference details, and links to the pretraining guide."
 slug: model-coverage/large-language-models/openai-community/gpt2
 ---
-[GPT-2](https://huggingface.co/openai-community/gpt2) is OpenAI's foundational decoder-only transformer. NeMo AutoModel uses it as a baseline for the Megatron pretraining smoke test and tutorials — its small footprint makes it a convenient target to validate data pipelines, distributed configs, and logging without needing large compute.
 
-<Info>
+[GPT-2](https://huggingface.co/openai-community/gpt2) is OpenAI's foundational decoder-only transformer. NeMo AutoModel uses it as a baseline for the Megatron pretraining smoke test and tutorials - its small footprint makes it a convenient target to validate data pipelines, distributed configs, and logging without needing large compute.
 
-| | |
-|---|---|
-| **Task** | Text Generation (pretraining baseline) |
-| **Architecture** | `GPT2LMHeadModel` |
-| **Parameters** | 124M – 1.5B |
-| **HF Org** | [openai-community](https://huggingface.co/openai-community) |
+Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
-</Info>
+## Pretrain gpt2
 
-## Available Models
+From the repository root, run:
+
+```bash
+uv run automodel --nproc-per-node=8 examples/llm_pretrain/megatron_pretrain_gpt2.yaml
+```
+
+## Choose a Workflow
+
+| Goal | Start Here |
+| --- | --- |
+| Megatron pretraining smoke test - GPT-2 on FineWeb-Edu | Use [megatron_pretrain_gpt2.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/megatron_pretrain_gpt2.yaml). |
+
+## Model Reference
+
+### Model Summary
+
+| Property | Value |
+| --- | --- |
+| Task | Text Generation (pretraining baseline) |
+| Architecture | `GPT2LMHeadModel` |
+| Parameters | 124M - 1.5B |
+| Hugging Face Organization | [openai-community](https://huggingface.co/openai-community) |
+
+### Available Models
 
 - **gpt2** (124M)
 - **gpt2-medium** (355M)
 - **gpt2-large** (774M)
 - **gpt2-xl** (1.5B)
 
-## Architecture
+### Model Architecture
 
 - `GPT2LMHeadModel`
 
-## Example HF Models
+### Available Checkpoints
 
 | Model | HF ID |
 |---|---|
 | GPT-2 | [`openai-community/gpt2`](https://huggingface.co/openai-community/gpt2) |
 
-## Example Recipes
+## Related Resources
 
-| Recipe | Description |
-|---|---|
-| [megatron_pretrain_gpt2.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/megatron_pretrain_gpt2.yaml) | Megatron pretraining smoke test — GPT-2 on FineWeb-Edu |
-
-## Try with NeMo AutoModel
-
-**1. Clone and install from source** ([full instructions](/get-started/installation)):
-
-```bash
-git clone https://github.com/NVIDIA-NeMo/Automodel.git
-cd Automodel
-uv sync --locked --all-groups --all-extras
-```
-
-**2. Run the recipe** from inside the repo:
-
-```bash
-uv run automodel --nproc-per-node=8 examples/llm_pretrain/megatron_pretrain_gpt2.yaml
-```
-
-See the [Installation Guide](/get-started/installation) and [LLM Pretraining Guide](/recipes-e2e-examples/pretraining).
-
-## Hugging Face Model Cards
-
-- [openai-community/gpt2](https://huggingface.co/openai-community/gpt2)
+- [LLM Pretraining Guide](/recipes-e2e-examples/pretraining)

@@ -1,59 +1,54 @@
 ---
 title: "BAGEL-7B-MoT"
-description: ""
+description: "Use BAGEL-7B-MoT with NeMo AutoModel for multimodal pretraining, with documented checkpoints, runnable recipes, setup guidance, and model reference details."
 slug: model-coverage/multimodal/bytedance-seed/BAGEL-7B-MoT
 ---
+
 [BAGEL-7B-MoT](https://huggingface.co/ByteDance-Seed/BAGEL-7B-MoT) is a unified multimodal model from ByteDance Seed. It combines a Qwen2 language backbone, a SigLIP-NaViT vision encoder, and mixture-of-transformations layers for mixed understanding and visual-generation training.
 
-<Info>
+Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
-| | |
-|---|---|
-| **Task** | Multimodal Input/Output |
-| **Architecture** | `BagelForUnifiedMultimodal`, `BagelForConditionalGeneration` |
-| **Parameters** | 14B (two 7B towers) |
-| **HF Org** | [ByteDance-Seed](https://huggingface.co/ByteDance-Seed) |
+## Pretrain BAGEL-7B-MoT
 
-</Info>
-
-## Available Models
-
-- **BAGEL-7B-MoT**
-
-## Architecture
-
-- `BagelForUnifiedMultimodal`
-- `BagelForConditionalGeneration`
-
-## Example HF Models
-
-| Model | HF ID |
-|---|---|
-| BAGEL-7B-MoT | [`ByteDance-Seed/BAGEL-7B-MoT`](https://huggingface.co/ByteDance-Seed/BAGEL-7B-MoT) |
-
-## Example Recipes
-
-| Recipe | Dataset | Description |
-|---|---|---|
-| [bagel_pretrain.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/multimodal_pretrain/bagel/bagel_pretrain.yaml) | BAGEL-style packed multimodal data | Joint text-understanding and image-generation pretraining |
-| [bagel_sft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/multimodal_finetune/bagel/bagel_sft.yaml) | BAGEL-style packed multimodal data | Joint understanding + generation fine-tuning |
-
-## Try with NeMo AutoModel
-
-**1. Clone and install from source** ([full instructions](/get-started/installation)):
-
-```bash
-git clone https://github.com/NVIDIA-NeMo/Automodel.git
-cd Automodel
-uv sync --locked --all-groups --all-extras
-```
-
-**2. Run the recipe** from inside the repo:
+From the repository root, run:
 
 ```bash
 uv run automodel --nproc-per-node=8 examples/multimodal_pretrain/bagel/bagel_pretrain.yaml
 ```
 
-## Hugging Face Model Cards
+## Choose a Workflow
 
-- [ByteDance-Seed/BAGEL-7B-MoT](https://huggingface.co/ByteDance-Seed/BAGEL-7B-MoT)
+| Goal | Start Here |
+| --- | --- |
+| Joint text-understanding and image-generation pretraining | Use [bagel_pretrain.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/multimodal_pretrain/bagel/bagel_pretrain.yaml). Dataset: BAGEL-style packed multimodal data. |
+| Joint understanding + generation fine-tuning | Use [bagel_sft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/multimodal_finetune/bagel/bagel_sft.yaml). Dataset: BAGEL-style packed multimodal data. |
+
+## Model Reference
+
+### Model Summary
+
+| Property | Value |
+| --- | --- |
+| Task | Multimodal Input/Output |
+| Architecture | `BagelForUnifiedMultimodal`, `BagelForConditionalGeneration` |
+| Parameters | 14B (two 7B towers) |
+| Hugging Face Organization | [ByteDance-Seed](https://huggingface.co/ByteDance-Seed) |
+
+### Available Models
+
+- **BAGEL-7B-MoT**
+
+### Model Architecture
+
+- `BagelForUnifiedMultimodal`
+- `BagelForConditionalGeneration`
+
+### Available Checkpoints
+
+| Model | HF ID |
+|---|---|
+| BAGEL-7B-MoT | [`ByteDance-Seed/BAGEL-7B-MoT`](https://huggingface.co/ByteDance-Seed/BAGEL-7B-MoT) |
+
+## Related Resources
+
+- [Pretraining Guide](/recipes-e2e-examples/pretraining)

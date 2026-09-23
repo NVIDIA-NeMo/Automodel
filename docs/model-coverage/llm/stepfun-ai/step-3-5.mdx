@@ -1,91 +1,58 @@
 ---
 title: "Step-3.5-Flash"
-description: ""
+description: "Use Step-3.5-Flash with NeMo AutoModel for language model fine-tuning, with documented checkpoints, runnable recipes, setup guidance, and model reference details."
 slug: model-coverage/large-language-models/stepfun-ai/Step-3.5-Flash
 ---
+
 [Step-3.5-Flash](https://huggingface.co/stepfun-ai/Step-3.5-Flash) is a Mixture-of-Experts language model from Stepfun AI, designed for efficient inference.
 
-<Info>
+Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
-| | |
-|---|---|
-| **Task** | Text Generation (MoE) |
-| **Architecture** | `Step3p5ForCausalLM` |
-| **Parameters** | varies |
-| **HF Org** | [stepfun-ai](https://huggingface.co/stepfun-ai) |
-
-</Info>
-
-## Available Models
-
-- **Step-3.5-Flash**
-
-## Architecture
-
-- `Step3p5ForCausalLM`
-
-## Example HF Models
-
-| Model | HF ID |
-|---|---|
-| Step-3.5-Flash | [`stepfun-ai/Step-3.5-Flash`](https://huggingface.co/stepfun-ai/Step-3.5-Flash) |
-
-## Example Recipes
-
-| Recipe | Description |
-|---|---|
-| [step_3.5_flash_hellaswag_pp.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/stepfun/step_3.5_flash_hellaswag_pp.yaml) | SFT — Step-3.5-Flash on HellaSwag with pipeline parallelism |
-
-## Try with NeMo AutoModel
-
-**1. Clone and install from source** ([full instructions](/get-started/installation)):
-
-```bash
-git clone https://github.com/NVIDIA-NeMo/Automodel.git
-cd Automodel
-uv sync --locked --all-groups --all-extras
-```
+## Fine-Tune Step-3.5-Flash
 
 <Note>
-This recipe was validated on **16 nodes × 8 GPUs (128 H100s)**. See the [Launcher Guide](/job-launchers/slurm-cluster) for multi-node setup.
+This recipe was validated on **16 nodes x 8 GPUs (128 H100s)**. See the [Launcher Guide](/job-launchers/slurm-cluster) for multi-node setup.
 
 </Note>
 
-**2. Run the recipe** from inside the repo:
+From the repository root, run:
 
 ```bash
 uv run automodel --nproc-per-node=8 examples/llm_finetune/stepfun/step_3.5_flash_hellaswag_pp.yaml
 ```
 
-<Accordion title="Run with Docker">
-**1. Pull the container** and mount a checkpoint directory:
+## Choose a Workflow
 
-```bash
-docker run --gpus all -it --rm \
-  --shm-size=8g \
-  -v $(pwd)/checkpoints:/opt/Automodel/checkpoints \
-  nvcr.io/nvidia/nemo-automodel:26.06.00
-```
+| Goal | Start Here |
+| --- | --- |
+| Supervised fine-tuning (SFT) - Step-3.5-Flash on HellaSwag with pipeline parallelism | Use [step_3.5_flash_hellaswag_pp.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/stepfun/step_3.5_flash_hellaswag_pp.yaml). |
 
-**2.** Navigate to the AutoModel directory (where the recipes are):
+## Model Reference
 
-```bash
-cd /opt/Automodel
-```
+### Model Summary
 
-**3. Run the recipe**:
+| Property | Value |
+| --- | --- |
+| Task | Text Generation (MoE) |
+| Architecture | `Step3p5ForCausalLM` |
+| Parameters | varies |
+| Hugging Face Organization | [stepfun-ai](https://huggingface.co/stepfun-ai) |
 
-```bash
-automodel --nproc-per-node=8 examples/llm_finetune/stepfun/step_3.5_flash_hellaswag_pp.yaml
-```
-</Accordion>
+### Available Models
 
-See the [Installation Guide](/get-started/installation) and [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).
+- **Step-3.5-Flash**
 
-## Fine-Tuning
+### Model Architecture
 
-See the [Large MoE Fine-Tuning Guide](/recipes-e2e-examples/large-moe-fine-tuning).
+- `Step3p5ForCausalLM`
 
-## Hugging Face Model Cards
+### Available Checkpoints
 
-- [stepfun-ai/Step-3.5-Flash](https://huggingface.co/stepfun-ai/Step-3.5-Flash)
+| Model | HF ID |
+|---|---|
+| Step-3.5-Flash | [`stepfun-ai/Step-3.5-Flash`](https://huggingface.co/stepfun-ai/Step-3.5-Flash) |
+
+## Related Resources
+
+- [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
+- [Large MoE Fine-Tuning Guide](/recipes-e2e-examples/large-moe-fine-tuning)
