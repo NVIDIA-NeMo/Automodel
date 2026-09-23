@@ -4,11 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import io
 import re
 import sys
 import tempfile
 import urllib.request
 from pathlib import Path
+
+from PIL import Image
 
 PROVIDER_ORGS = {
     "allenai": "allenai",
@@ -80,22 +83,27 @@ def _fetch_avatar(org: str) -> bytes:
     if match is None:
         raise RuntimeError(f"No Hugging Face avatar found for {org}")
     avatar_url = f"https://{match.group().decode('ascii')}"
-    image = _request(avatar_url, accept="image/webp")
-    if not (image.startswith(b"RIFF") and image[8:12] == b"WEBP"):
+    source = _request(avatar_url, accept="image/webp")
+    if not (source.startswith(b"RIFF") and source[8:12] == b"WEBP"):
         raise RuntimeError(f"Hugging Face did not return WebP for {org}")
-    return image
+
+    output = io.BytesIO()
+    with Image.open(io.BytesIO(source)) as image:
+        image.seek(0)
+        image.save(output, format="PNG", optimize=True)
+    return output.getvalue()
 
 
 def _check(output_dir: Path) -> list[str]:
     problems = []
     for provider in PROVIDER_ORGS:
-        path = output_dir / f"{provider}.webp"
+        path = output_dir / f"{provider}.png"
         if not path.is_file():
             problems.append(f"missing {path}")
             continue
         image = path.read_bytes()
-        if not (image.startswith(b"RIFF") and image[8:12] == b"WEBP"):
-            problems.append(f"invalid WebP {path}")
+        if not image.startswith(b"\x89PNG\r\n\x1a\n"):
+            problems.append(f"invalid PNG {path}")
     return problems
 
 
@@ -121,7 +129,7 @@ def main() -> int:
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     for provider, org in PROVIDER_ORGS.items():
-        destination = args.output_dir / f"{provider}.webp"
+        destination = args.output_dir / f"{provider}.png"
         image = _fetch_avatar(org)
         with tempfile.NamedTemporaryFile(dir=args.output_dir, delete=False) as temporary:
             temporary.write(image)
