@@ -68,3 +68,16 @@ def test_moe_only_wraps_only_the_moe_sub_block_and_is_bitwise_identical() -> Non
     assert torch.equal(loss_block, ref_loss)
     for name in ref_grads:
         assert torch.equal(grads_block[name], ref_grads[name]), name
+
+
+def test_moe_lookup_sees_through_the_checkpoint_wrapper() -> None:
+    """apply_fsdp separates expert parameters via _get_moe_module; it must find a wrapped MoE."""
+    from nemo_automodel.components.moe.layers import MoE
+    from nemo_automodel.components.moe.parallelizer import _get_moe_module
+
+    model = _build_model(reuse_routes=True)
+    apply_ac(model, ignore_router=True, moe_only=True)
+    for _, block in _layers(model).items():
+        if hasattr(block, "mlp"):
+            assert isinstance(block.mlp, CheckpointWrapper)
+            assert isinstance(_get_moe_module(block), MoE)

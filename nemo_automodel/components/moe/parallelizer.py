@@ -142,8 +142,15 @@ def _get_cp_stream() -> torch.cuda.Stream:
 
 
 def _get_moe_module(block: nn.Module) -> MoE | None:
+    """Return the block's MoE sub-block, looking through a checkpoint wrapper around it.
+
+    With ``checkpoint_moe_only`` the MoE sub-block itself is the checkpoint unit, so the
+    FSDP wrapping that separates expert parameters from the block must still find it.
+    """
     for name in ("moe", "mlp"):
         module = getattr(block, name, None)
+        # A checkpoint wrapper forwards attribute access but not isinstance; look inside.
+        module = getattr(module, "_checkpoint_wrapped_module", module)
         if isinstance(module, MoE):
             return module
 
