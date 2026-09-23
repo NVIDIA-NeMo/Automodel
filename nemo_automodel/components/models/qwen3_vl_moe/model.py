@@ -17,7 +17,11 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from transformers.models.qwen3_vl_moe.configuration_qwen3_vl_moe import Qwen3VLMoeConfig, Qwen3VLMoeTextConfig
+from transformers.models.qwen3_vl_moe.configuration_qwen3_vl_moe import (
+    Qwen3VLMoeConfig,
+    Qwen3VLMoeTextConfig,
+    Qwen3VLMoeVisionConfig,
+)
 from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
     Qwen3VLMoeForConditionalGeneration as HFQwen3VLMoeForConditionalGeneration,
 )
@@ -63,7 +67,24 @@ class Fp32SafeQwen3VLMoeTextRotaryEmbedding(Qwen3VLMoeTextRotaryEmbedding):
 
 
 class Fp32SafeQwen3VLMoeVisionRotaryEmbedding(Qwen3VLMoeVisionRotaryEmbedding):
-    """Ensure the vision rotary inv_freq buffer remains float32."""
+    """Ensure the vision rotary inv_freq buffer remains float32.
+
+    transformers >= 5.17 changed the vision rotary embedding constructor from
+    ``(dim, ...)`` to ``(config, ...)``. Accept both: a legacy int ``dim`` is
+    converted into a minimal axial vision config with ``head_dim = dim``.
+    """
+
+    def __init__(self, config: Any = None, *args: Any, dim: int | None = None, **kwargs: Any):
+        if isinstance(config, int):
+            dim = config
+            config = None
+        if config is None:
+            if dim is None:
+                raise TypeError("Fp32SafeQwen3VLMoeVisionRotaryEmbedding requires a config or an int dim")
+            config = Qwen3VLMoeVisionConfig(hidden_size=dim * 4, num_heads=4)
+            config.head_dim = dim
+            config.rope_parameters = {"rope_type": "axial", "rope_theta": 10000.0}
+        super().__init__(config, *args, **kwargs)
 
     def _apply(self, fn: Any, recurse: bool = True):
         fp32_buffers = {

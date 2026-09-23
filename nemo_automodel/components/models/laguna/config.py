@@ -109,14 +109,48 @@ class LagunaConfig(PretrainedConfig):
     ):
         if rope_parameters is None:
             rope_parameters = {"rope_type": "default", "rope_theta": 500000.0}
-        if swa_rope_parameters is None and isinstance(rope_parameters, dict):
-            swa_rope_parameters = rope_parameters.get("sliding_attention")
+
+        # ``rope_parameters`` may be a nested per-layer mapping keyed by layer type
+        # (``full_attention`` / ``sliding_attention``). transformers >= 5.17 validates such a
+        # mapping strictly (``validate_rope`` iterates every value expecting a per-layer dict, and
+        # ``yarn``/``llama3``/``longrope`` require a ``factor`` key), and ``standardize_rope_params``
+        # additionally hoists the scalar ``rope_theta``/``partial_rotary_factor`` into it. Keep the
+        # config's ``rope_parameters`` flat (the full-attention / default params) so validation is
+        # well-formed, and keep the per-layer mapping for the SWA rotary in ``swa_rope_parameters``.
+        def _default_scaling_factor(params):
+            if isinstance(params, dict) and params.get("rope_type", params.get("type")) in (
+                "yarn",
+                "llama3",
+                "longrope",
+            ):
+                params = {**params}
+                params.setdefault("factor", 1.0)
+            return params
+
+        _is_nested = isinstance(rope_parameters, dict) and any(
+            isinstance(value, dict) for value in rope_parameters.values()
+        )
+        if _is_nested:
+            full_attention_rope = rope_parameters.get("full_attention")
+            if swa_rope_parameters is None:
+                swa_rope_parameters = rope_parameters.get("sliding_attention")
+            # Flatten to the full-attention (or first) per-layer dict for the config attribute.
+            if isinstance(full_attention_rope, dict):
+                rope_parameters = dict(full_attention_rope)
+            else:
+                rope_parameters = next(
+                    (dict(value) for value in rope_parameters.values() if isinstance(value, dict)),
+                    {"rope_type": "default", "rope_theta": 500000.0},
+                )
 
         if partial_rotary_factor is not None:
             if isinstance(rope_parameters, dict) and "partial_rotary_factor" not in rope_parameters:
                 rope_parameters = {**rope_parameters, "partial_rotary_factor": partial_rotary_factor}
             if isinstance(swa_rope_parameters, dict) and "partial_rotary_factor" not in swa_rope_parameters:
                 swa_rope_parameters = {**swa_rope_parameters, "partial_rotary_factor": partial_rotary_factor}
+
+        rope_parameters = _default_scaling_factor(rope_parameters)
+        swa_rope_parameters = _default_scaling_factor(swa_rope_parameters)
 
         if layer_types is None:
             layer_types = ["full_attention"] * num_hidden_layers
@@ -182,6 +216,25 @@ class LagunaConfig(PretrainedConfig):
             use_cache=use_cache,
             **kwargs,
         )
+
+        # transformers >= 5.17 ``standardize_rope_params`` hoists the config's scalar
+        # ``rope_theta``/``partial_rotary_factor`` into a nested (per-layer) ``rope_parameters``
+        # mapping, and ``validate_rope`` then iterates every value expecting a per-layer dict,
+        # raising ``'float'/'int' object has no attribute 'get'``. After construction, keep the
+        # nested mapping to per-layer dicts only (the scalars stay on the config attributes) so the
+        # RoPE init reads a clean per-layer dict.
+        self._strip_nested_rope_scalars()
+
+    def _strip_nested_rope_scalars(self):
+        rope_parameters = getattr(self, "rope_parameters", None)
+        layer_types = getattr(self, "layer_types", None) or []
+        if (
+            isinstance(rope_parameters, dict)
+            and layer_types
+            and not set(rope_parameters).isdisjoint(set(layer_types))
+            and any(not isinstance(value, dict) for value in rope_parameters.values())
+        ):
+            self.rope_parameters = {key: value for key, value in rope_parameters.items() if isinstance(value, dict)}
 
 
 __all__ = ["LagunaConfig"]
