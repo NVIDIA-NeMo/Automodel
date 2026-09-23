@@ -105,6 +105,7 @@ def test_lock_manifest_pins_build_and_runtime_requirements(tmp_path):
 
 def test_te_wheel_build_disables_optional_nccl_ep():
     assert "export NVTE_WITH_NCCL_EP=0" in _BUILD_SCRIPT.read_text()
+    assert 'NVTE_WITH_NCCL_EP: "0"' in Path(".github/workflows/install-test.yml").read_text()
 
 
 def test_unrelated_lock_change_preserves_cache_fingerprint(tmp_path):
