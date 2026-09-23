@@ -169,8 +169,11 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
             lambda match: f"{match.group('outer') or ''}model.norm.weight",
             key,
         )
+        # Accept singular ``embedding`` (transformers save_pretrained / RL toy
+        # assets) and plural ``embeddings`` (released nvidia checkpoints). Export
+        # stays plural via ``_native_key_to_hf``. Matches nvidia remote-code load_hook.
         key = re.sub(
-            rf"^(?P<outer>base_model\.model\.)?{hf_root}\.embeddings\.weight$",
+            rf"^(?P<outer>base_model\.model\.)?{hf_root}\.embeddings?\.weight$",
             lambda match: f"{match.group('outer') or ''}model.embed_tokens.weight",
             key,
         )
