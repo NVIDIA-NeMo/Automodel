@@ -425,7 +425,6 @@ class RecipeConfig:
                 "collate_max_length",
                 "attn_implementation",
                 "packing_format",
-                "sequence_alignment",
                 "enabled",
                 "pretokenize",
                 "max_length",
@@ -443,7 +442,6 @@ class RecipeConfig:
                 collate_max_length=packing_node.get("collate_max_length", None),
                 attn_implementation=packing_node.get("attn_implementation", None),
                 packing_format=packing_node.get("packing_format", "neat"),
-                sequence_alignment=packing_node.get("sequence_alignment", None),
             )
 
         loader_kwargs = _as_dict(dataloader_node)

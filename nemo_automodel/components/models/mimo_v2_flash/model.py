@@ -1131,25 +1131,22 @@ class MiMoV2FlashForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         *,
         pixel_values: torch.Tensor | None = None,
         image_grid_thw: torch.Tensor | None = None,
-        image_embeds: torch.Tensor | None = None,
         image_feature_indices: torch.Tensor | None = None,
         pixel_values_videos: torch.Tensor | None = None,
         video_grid_thw: torch.Tensor | None = None,
-        video_embeds: torch.Tensor | None = None,
         video_feature_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Encode global media and splice only this TE THD shard's feature rows."""
-        has_image = image_embeds is not None or pixel_values is not None
-        has_video = video_embeds is not None or pixel_values_videos is not None
+        has_image = pixel_values is not None
+        has_video = pixel_values_videos is not None
         if not has_image and not has_video:
             return inputs_embeds
         if self.visual is None:
             raise ValueError("Image or video inputs require a non-empty vision_config")
 
         if has_image:
-            if image_embeds is None:
-                image_grid_thw = _normalize_image_grid(image_grid_thw)
-                image_embeds = self.visual(pixel_values, image_grid_thw)
+            image_grid_thw = _normalize_image_grid(image_grid_thw)
+            image_embeds = self.visual(pixel_values, image_grid_thw)
             if image_feature_indices is not None:
                 image_embeds = image_embeds.index_select(0, image_feature_indices.to(image_embeds.device))
             inputs_embeds = _replace_modal_embeddings(
@@ -1159,9 +1156,8 @@ class MiMoV2FlashForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 image_embeds,
             )
         if has_video:
-            if video_embeds is None:
-                video_grid_thw = _normalize_image_grid(video_grid_thw)
-                video_embeds = self.visual(pixel_values_videos, video_grid_thw)
+            video_grid_thw = _normalize_image_grid(video_grid_thw)
+            video_embeds = self.visual(pixel_values_videos, video_grid_thw)
             if video_feature_indices is not None:
                 video_embeds = video_embeds.index_select(0, video_feature_indices.to(video_embeds.device))
             inputs_embeds = _replace_modal_embeddings(
@@ -1264,11 +1260,8 @@ class MiMoV2FlashForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         padding_mask: torch.Tensor | None = None,
         pixel_values: torch.Tensor | None = None,
         image_grid_thw: torch.Tensor | None = None,
-        image_embeds: torch.Tensor | None = None,
         pixel_values_videos: torch.Tensor | None = None,
-        video_pixel_values: torch.Tensor | None = None,
         video_grid_thw: torch.Tensor | None = None,
-        video_embeds: torch.Tensor | None = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
         output_hidden_states: bool | None = None,
         **kwargs: Any,
@@ -1287,10 +1280,6 @@ class MiMoV2FlashForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         if cp_size > 1 and self.config.vision_config is not None and is_thd and local_thd_indices is None:
             raise ValueError("MiMo VLM TE context parallelism requires the local THD index map from its model sharder.")
 
-        if pixel_values_videos is not None and video_pixel_values is not None:
-            raise ValueError("Pass only one of pixel_values_videos and video_pixel_values")
-        if pixel_values_videos is None:
-            pixel_values_videos = video_pixel_values
         pixel_values, image_grid_thw, pixel_values_videos, video_grid_thw = self._pull_pipeline_media(
             input_ids,
             pixel_values,
@@ -1302,7 +1291,7 @@ class MiMoV2FlashForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         )
 
         integer_tokens = input_ids is not None and not torch.is_floating_point(input_ids)
-        has_media = any(value is not None for value in (pixel_values, image_embeds, pixel_values_videos, video_embeds))
+        has_media = pixel_values is not None or pixel_values_videos is not None
         if inputs_embeds is None and integer_tokens and has_media:
             if self.model.embed_tokens is None:
                 raise ValueError("The first pipeline stage must own embed_tokens")
@@ -1314,11 +1303,9 @@ class MiMoV2FlashForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 inputs_embeds,
                 pixel_values=pixel_values,
                 image_grid_thw=image_grid_thw,
-                image_embeds=image_embeds,
                 image_feature_indices=image_feature_indices,
                 pixel_values_videos=pixel_values_videos,
                 video_grid_thw=video_grid_thw,
-                video_embeds=video_embeds,
                 video_feature_indices=video_feature_indices,
             )
             input_ids = None

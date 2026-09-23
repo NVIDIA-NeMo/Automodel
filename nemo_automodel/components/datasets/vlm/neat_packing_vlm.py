@@ -663,14 +663,10 @@ class NeatPackConfig:
     """Optional packed-mask backend override used only with context parallelism."""
     packing_format: Literal["neat", "thd"] = "neat"
     """Packed collator format. ``thd`` emits Transformer Engine sequence metadata."""
-    sequence_alignment: int | None = None
-    """Optional fixed per-document alignment; ``None`` derives it from THD CP size."""
 
     def __post_init__(self) -> None:
         if self.packing_format not in ("neat", "thd"):
             raise ValueError(f"Unsupported VLM packing_format {self.packing_format!r}; expected 'neat' or 'thd'")
-        if self.sequence_alignment is not None and self.sequence_alignment < 1:
-            raise ValueError(f"sequence_alignment must be at least 1, got {self.sequence_alignment}.")
 
     def build(
         self,
@@ -691,23 +687,12 @@ class NeatPackConfig:
                 ``len(dataset)`` when ``None``.
             get_rope_index: Optional ``model.get_rope_index`` callable for mRoPE support.
             processor: Optional HuggingFace processor for accurate media token estimation.
-            cp_size: Runtime context-parallel size. By default, THD packing
-                aligns every document to ``2 * cp_size`` when greater than one.
-                An explicit ``sequence_alignment`` keeps packing identical across
-                CP sizes and must be a multiple of ``2 * cp_size`` for THD.
+            cp_size: Runtime context-parallel size. THD packing aligns every
+                document to ``2 * cp_size`` when greater than one.
         """
         if cp_size < 1:
             raise ValueError(f"cp_size must be at least 1, got {cp_size}.")
-        required_alignment = 2 * cp_size if cp_size > 1 else 1
-        if self.sequence_alignment is None:
-            sequence_alignment = required_alignment if self.packing_format == "thd" and cp_size > 1 else 1
-        else:
-            sequence_alignment = self.sequence_alignment
-            if self.packing_format == "thd" and sequence_alignment % required_alignment != 0:
-                raise ValueError(
-                    "VLM THD sequence_alignment must be a multiple of 2 * cp_size, "
-                    f"got sequence_alignment={sequence_alignment}, cp_size={cp_size}."
-                )
+        sequence_alignment = 2 * cp_size if self.packing_format == "thd" and cp_size > 1 else 1
         if sequence_alignment > 1:
             if get_rope_index is not None:
                 raise NotImplementedError(
@@ -715,9 +700,8 @@ class NeatPackConfig:
                 )
             if self.collate_max_length is not None and self.collate_max_length % sequence_alignment != 0:
                 raise ValueError(
-                    "VLM collate_max_length must be divisible by sequence_alignment, "
-                    f"got collate_max_length={self.collate_max_length}, "
-                    f"sequence_alignment={sequence_alignment}."
+                    "VLM THD collate_max_length must be divisible by 2 * cp_size, "
+                    f"got collate_max_length={self.collate_max_length}, cp_size={cp_size}."
                 )
         return neat_pack_dataset_vlm(
             dataset=dataset,

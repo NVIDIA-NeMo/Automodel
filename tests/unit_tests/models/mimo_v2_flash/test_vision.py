@@ -93,6 +93,11 @@ def _backend() -> BackendConfig:
     )
 
 
+class _PassthroughVision(torch.nn.Module):
+    def forward(self, pixel_values: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
+        return pixel_values
+
+
 def test_vision_checkpoint_names_and_shapes():
     vision = MiMoVisionTransformer(_vision_config(), dtype=torch.float32)
     state = vision.state_dict()
@@ -137,16 +142,20 @@ def test_vision_rotary_rebuilds_meta_buffer_on_materialized_device():
 
 def test_multimodal_embeddings_replace_processor_token_slots():
     model = MiMoV2ForCausalLM(_model_config(), backend=_backend())
+    model.visual = _PassthroughVision()
     input_ids = torch.tensor([[3, 62, 4, 63]])
     inputs_embeds = model.get_input_embeddings()(input_ids)
     image_embed = torch.arange(16, dtype=torch.float32).unsqueeze(0)
     video_embed = -image_embed
+    grid_thw = torch.ones((1, 3), dtype=torch.long)
 
     output = model._get_multimodal_embeds(
         input_ids,
         inputs_embeds,
-        image_embeds=image_embed,
-        video_embeds=video_embed,
+        pixel_values=image_embed,
+        image_grid_thw=grid_thw,
+        pixel_values_videos=video_embed,
+        video_grid_thw=grid_thw,
     )
 
     torch.testing.assert_close(output[0, 1], image_embed[0].to(output.dtype))
@@ -271,9 +280,11 @@ def test_vlm_te_cp_maps_global_media_to_local_dual_chunk_tokens():
     torch.testing.assert_close(layout.local_token_global_indices, local_indices)
 
     model = MiMoV2ForCausalLM(_model_config(), backend=_backend())
+    model.visual = _PassthroughVision()
     inputs_embeds = model.get_input_embeddings()(local_batch["input_ids"])
     image_embeds = torch.arange(3 * 16, dtype=torch.float32).reshape(3, 16)
     video_embeds = -torch.arange(3 * 16, dtype=torch.float32).reshape(3, 16)
+    grid_thw = torch.ones((1, 3), dtype=torch.long)
     image_feature_indices = model._local_modal_feature_indices(
         local_batch[_MIMO_GLOBAL_IMAGE_MASK],
         local_batch[_MIMO_THD_LOCAL_INDICES],
@@ -286,9 +297,11 @@ def test_vlm_te_cp_maps_global_media_to_local_dual_chunk_tokens():
     output = model._get_multimodal_embeds(
         local_batch["input_ids"],
         inputs_embeds,
-        image_embeds=image_embeds,
+        pixel_values=image_embeds,
+        image_grid_thw=grid_thw,
         image_feature_indices=image_feature_indices,
-        video_embeds=video_embeds,
+        pixel_values_videos=video_embeds,
+        video_grid_thw=grid_thw,
         video_feature_indices=video_feature_indices,
     )
 
