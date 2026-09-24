@@ -52,6 +52,7 @@ model:
   torch_dtype: torch.bfloat16
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
+    dispatcher: hybridep
     attn: te
     linear: te
     rms_norm: torch_fp32
@@ -87,9 +88,10 @@ distributed:
     frozen_sharding: replicate
 
 freeze_config:
-  freeze_vision_tower: true
-  freeze_audio_tower: true
-  freeze_language_model: false
+  freeze_modules:
+    - path: vision_model
+  unfreeze_modules:
+    - path: vision_projector
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
