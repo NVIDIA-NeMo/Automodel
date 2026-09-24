@@ -125,6 +125,17 @@ def _get_supported_backbone_class(model_type: str, task: str) -> type[nn.Module]
 
     arch_name = task_map.get(task)
     if arch_name is None:
+        if task == "embedding":
+            # A backbone may be registered for one task only -- qwen3 registers "score"
+            # for the causal reranker and has no custom embedding class. Returning None
+            # lets the caller reach the generic AutoModel + ``is_causal=False`` path it
+            # used before that registration existed, instead of failing outright on a
+            # task the registry simply has no custom class for.
+            logger.info(
+                f"No registered 'embedding' backbone for model type '{model_type}'; "
+                "falling back to HuggingFace Auto classes"
+            )
+            return None
         raise ValueError(
             f"Unsupported task '{task}' for model type '{model_type}'. Available tasks: {', '.join(task_map)}."
         )
@@ -175,7 +186,9 @@ def _build_backbone_from_extracted_submodel(
     task_map = SUPPORTED_BACKBONES.get(model_type.lower())
     has_supported_target = task_map is not None and task in task_map
 
-    if task_map is not None and not has_supported_target and task != "score":
+    # "score" and "embedding" both have a generic fallback below, so a model type that is
+    # registered for only one of them must not hard-fail on the other.
+    if task_map is not None and not has_supported_target and task not in ("score", "embedding"):
         raise ValueError(
             f"Unsupported task '{task}' for model type '{model_type}'. Available tasks: {', '.join(task_map)}."
         )
@@ -467,11 +480,23 @@ _MINISTRAL3_BIDIREC_TASKS = {
 _LLAMA_NEMOTRON_VL_TASKS = {
     "embedding": "LlamaNemotronVLModel",
 }
+# Only "qwen3" is needed, with no "qwen3_reranker" alias: Qwen3RerankerConfig.to_dict()
+# rewrites the serialized identity to plain qwen3 so checkpoints load in vLLM, and no
+# config.json ever carries the custom name. Contrast llama_bidirec, which keeps its own
+# identity on disk and therefore needs both keys.
+#
+# "score" only. qwen3 has no custom embedding backbone, and listing the model type here
+# must not take qwen3 embedding runs away from the generic AutoModel path they used before
+# this entry existed -- see the "embedding" fallbacks in _get_supported_backbone_class and
+# _build_backbone_from_extracted_submodel.
+_QWEN3_RERANKER_TASKS = {"score": "Qwen3RerankerForCausalReranking"}
+
 SUPPORTED_BACKBONES = {
     "llama": _LLAMA_TASKS,
     "llama_bidirec": _LLAMA_TASKS,
     "ministral3_bidirec": _MINISTRAL3_BIDIREC_TASKS,
     "llama_nemotron_vl": _LLAMA_NEMOTRON_VL_TASKS,
+    "qwen3": _QWEN3_RERANKER_TASKS,
 }
 
 
