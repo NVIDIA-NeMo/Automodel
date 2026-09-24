@@ -245,9 +245,10 @@ class KDLoss(nn.Module):
         # Exclude padding / ignored tokens from the loss.
         valid_mask = (labels != self.ignore_index).view(-1)
         if valid_mask.sum() == 0:
-            # Keep the zero connected to student logits so pure-KD training can
-            # backpropagate through a fully masked microbatch.
-            return student_logits.sum() * 0.0
+            # Keep a zero student gradient without reducing the ignored logits.
+            if _HAVE_DTENSOR and isinstance(student_logits, DTensor):
+                student_logits = student_logits.to_local()
+            return student_logits[..., :0].sum()
 
         if student_logits.ndim > 2:
             student_logits = student_logits.view(-1, student_logits.shape[-1])
