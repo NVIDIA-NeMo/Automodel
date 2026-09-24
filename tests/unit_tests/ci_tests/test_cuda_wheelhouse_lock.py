@@ -17,7 +17,7 @@ from pathlib import Path
 from scripts.cuda_wheelhouse_lock import cache_fingerprint, load_locked_inputs
 
 _BUILD_SCRIPT = Path(".github/scripts/build-cuda-wheelhouse.sh")
-_CUDA_IMAGE = "nvcr.io/nvidia/cuda-dl-base:26.04-cuda13.2-devel-ubuntu24.04"
+_CUDA_IMAGE = "nvcr.io/nvidia/cuda-dl-base:26.08-cuda13.4-devel-ubuntu24.04"
 _TORCH_INDEX = "https://download.pytorch.org/whl/cu130"
 
 
