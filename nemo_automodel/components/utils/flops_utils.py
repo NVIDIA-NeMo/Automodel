@@ -1973,7 +1973,7 @@ def step3_5_flash_flops(config, gbs=1, seq_len=None):
 
 def get_flops_formula_for_hf_config(config: Any) -> Callable | None:
     """
-    Get the appropriate FLOPs formula function for a given HuggingFace config.
+    Get a config-owned FLOPs formula, or a legacy formula for a HuggingFace config.
 
     Args:
         config: HuggingFace model config object
@@ -1983,6 +1983,12 @@ def get_flops_formula_for_hf_config(config: Any) -> Callable | None:
         composite config. Pass its text config explicitly when only text-backbone
         FLOPs are intended.
     """
+    # Local configs can own their formula without putting architecture logic here.
+    # The callable follows the existing formula(config, gbs=..., seq_len=...) contract.
+    model_formula = getattr(config, "flops_formula", None)
+    if callable(model_formula):
+        return model_formula
+
     # Get config class name
     config_class_name = config.__class__.__name__
 
