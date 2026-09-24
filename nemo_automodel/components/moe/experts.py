@@ -435,7 +435,7 @@ class _ChunkedBiasAdd(Function):
     """Add expert bias without materializing a full-size expanded bias."""
 
     @staticmethod
-    def forward(ctx, value, bias, token_counts, probs=None):
+    def forward(ctx, value, bias, token_counts, probs=None, reuse_input=False):
         """Add optionally weighted expert bias in bounded row chunks.
 
         Args:
@@ -444,6 +444,7 @@ class _ChunkedBiasAdd(Function):
             bias: Per-expert bias of shape [experts, hidden].
             token_counts: Tensor of shape [experts] containing nonnegative token counts.
             probs: Optional FP32 routing probabilities of shape [tokens, 1].
+            reuse_input: Whether the caller transfers ownership of ``value`` so its storage can hold the result.
 
         Returns:
             Tensor of shape [tokens, hidden] and the same dtype as ``value``.
@@ -456,7 +457,11 @@ class _ChunkedBiasAdd(Function):
         ctx.has_probs = probs is not None
         tensors_to_save = (bias, token_counts) if probs is None else (bias, token_counts, probs)
         ctx.save_for_backward(*tensors_to_save)
-        output = torch.empty_like(value)
+        if reuse_input:
+            ctx.mark_dirty(value)
+            output = value
+        else:
+            output = torch.empty_like(value)
         compute_dtype = torch.promote_types(value.dtype, bias.dtype)
         if probs is not None:
             compute_dtype = torch.promote_types(compute_dtype, probs.dtype)
@@ -514,10 +519,10 @@ class _ChunkedBiasAdd(Function):
                 grad_probs[start:end] = (
                     (grad_output[start:end].to(compute_dtype) * bias_rows).sum(dim=-1, keepdim=True).to(probs.dtype)
                 )
-        return grad_value, grad_bias, None, grad_probs
+        return grad_value, grad_bias, None, grad_probs, None
 
 
-def _apply_bias(value, bias, tokens_per_expert, permuted_probs=None):
+def _apply_bias(value, bias, tokens_per_expert, permuted_probs=None, reuse_input=False):
     """Apply per-expert bias to grouped GEMM output.
 
     NOTE: torch._grouped_mm accepts a `bias` kwarg in its schema but raises
@@ -531,10 +536,12 @@ def _apply_bias(value, bias, tokens_per_expert, permuted_probs=None):
         tokens_per_expert: Token counts, shape [num_experts].
         permuted_probs: Optional routing probabilities broadcastable to
             [total_tokens, features], typically [total_tokens, 1].
+        reuse_input: Reuse ``value`` storage for the result when the bounded-memory path supports it. The caller
+            must not read ``value`` afterward.
 
     Returns:
         Grouped GEMM output with per-expert bias applied, shape
-        [total_tokens, features]. The inputs are not mutated.
+        [total_tokens, features]. Inputs are not mutated unless ``reuse_input`` is true.
     """
     if bias is None:
         return value
@@ -547,8 +554,8 @@ def _apply_bias(value, bias, tokens_per_expert, permuted_probs=None):
     chunkable_probs = permuted_probs is None or (
         permuted_probs.dim() == 2 and permuted_probs.shape == (flat_value.shape[0], 1)
     )
-    if chunkable_probs and flat_value.shape[0] > _BIAS_CHUNK_THRESHOLD:
-        return _ChunkedBiasAdd.apply(flat_value, bias, token_counts, permuted_probs).view(shape)
+    if chunkable_probs and (reuse_input or flat_value.shape[0] > _BIAS_CHUNK_THRESHOLD):
+        return _ChunkedBiasAdd.apply(flat_value, bias, token_counts, permuted_probs, reuse_input).view(shape)
     if torch.is_grad_enabled() and bias.requires_grad:
         bias_to_expand = bias
         if permuted_probs is not None:
@@ -904,7 +911,7 @@ class GroupedExperts(nn.Module):
                 # v0.17.0 has no bias arg). bf16 path byte-identical.
                 grouped_mm = select_grouped_mm(self.use_mxfp8)
                 output1 = grouped_mm(permuted_x, gate_and_up_projs, offs)
-                output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
+                output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert, reuse_input=True)
                 output1 = self.expert_activation_grouped(output1, activation_probs)
                 output2 = grouped_mm(output1, down_projs, offs)
                 output2 = _apply_bias(
@@ -912,6 +919,7 @@ class GroupedExperts(nn.Module):
                     down_proj_bias,
                     tokens_per_expert,
                     None if self.config.apply_router_weight_after_down else permuted_probs,
+                    reuse_input=True,
                 )
             else:
                 output2 = _torch_mm_experts_fwd(
@@ -1258,7 +1266,7 @@ class GroupedExpertsDeepEP(nn.Module):
                 # select_grouped_mm) so a bias-shifted value can't overflow the e8m0
                 # block scale -> nan (seen on gpt-oss). The bias-add stays a bf16
                 # separate add (torchao v0.17.0 has no bias arg). bf16 path unchanged.
-                output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
+                output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert, reuse_input=True)
                 output1 = self.expert_activation(output1, activation_probs)
                 output2 = grouped_mm(output1, down_projs, offs)
                 down_bias = self.down_proj_bias.to_local()
@@ -1267,6 +1275,7 @@ class GroupedExpertsDeepEP(nn.Module):
                     down_bias,
                     tokens_per_expert,
                     None if self.config.apply_router_weight_after_down else permuted_probs,
+                    reuse_input=True,
                 )
             else:
                 output2 = _torch_mm_experts_fwd(

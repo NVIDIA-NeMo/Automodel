@@ -990,6 +990,43 @@ class TestGroupedExpertsDeepEP:
         torch.testing.assert_close(value.grad, expected_value.grad)
         torch.testing.assert_close(bias.grad, expected_bias.grad)
 
+    @pytest.mark.parametrize("weighted", [False, True])
+    def test_grouped_experts_deepep_apply_bias_can_reuse_owned_output(self, moe_config, weighted):
+        """Owned grouped-GEMM outputs are updated in place without changing gradients."""
+        _ = GroupedExpertsDeepEP(moe_config)
+        tokens_per_expert = torch.tensor([0, 4097, 8192, 0])
+        n_tokens = int(tokens_per_expert.sum())
+
+        torch.manual_seed(654)
+        value_source = torch.randn(n_tokens, 4, dtype=torch.float64, requires_grad=True)
+        value = value_source * 1.0
+        original_value = value.detach().clone()
+        bias = torch.randn(4, 4, dtype=torch.float64, requires_grad=True)
+        permuted_probs = torch.rand(n_tokens, 1, dtype=torch.float64, requires_grad=True) if weighted else None
+        upstream_grad = torch.randn_like(value)
+
+        expected_bias = bias.detach().clone().requires_grad_()
+        expected_probs = permuted_probs.detach().clone().requires_grad_() if permuted_probs is not None else None
+        expected_bias_rows = torch.repeat_interleave(
+            expected_bias,
+            tokens_per_expert,
+            dim=0,
+            output_size=n_tokens,
+        )
+        expected = original_value + expected_bias_rows * (expected_probs if expected_probs is not None else 1)
+        expected.backward(upstream_grad)
+
+        value_ptr = value.data_ptr()
+        result = _apply_bias(value, bias, tokens_per_expert, permuted_probs, reuse_input=True)
+        result.backward(upstream_grad)
+
+        assert result.data_ptr() == value_ptr
+        torch.testing.assert_close(result, expected)
+        torch.testing.assert_close(value_source.grad, upstream_grad)
+        torch.testing.assert_close(bias.grad, expected_bias.grad)
+        if permuted_probs is not None:
+            torch.testing.assert_close(permuted_probs.grad, expected_probs.grad)
+
     @pytest.mark.parametrize(
         ("bias_requires_grad", "use_probs", "expected_bias_grad_dtype", "expected_probs_grad_dtype"),
         [
@@ -2425,7 +2462,13 @@ class TestGroupedMM:
         experts = self._init_experts(torch_mm_config_with_bias, torch_mm_backend, device)
 
         num_tokens = 16
-        x = torch.randn(num_tokens, torch_mm_config_with_bias.dim, dtype=torch.bfloat16, device=device)
+        x = torch.randn(
+            num_tokens,
+            torch_mm_config_with_bias.dim,
+            dtype=torch.bfloat16,
+            device=device,
+            requires_grad=True,
+        )
         token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
         weights = torch.rand(
             num_tokens, torch_mm_config_with_bias.n_activated_experts, dtype=torch.bfloat16, device=device
@@ -2441,6 +2484,11 @@ class TestGroupedMM:
 
         assert output.shape == x.shape
         assert not torch.isnan(output).any()
+
+        output.sum().backward()
+        assert x.grad is not None
+        assert experts.gate_up_proj_bias.grad is not None
+        assert experts.down_proj_bias.grad is not None
 
     def test_forward_matches_loop_path(self, torch_mm_config, torch_mm_backend, device):
         """Test that torch_mm and loop paths produce similar outputs."""
