@@ -920,7 +920,10 @@ def _find_call_by_first_arg(mock_obj, target_first_arg):
 
 
 @pytest.mark.parametrize("experts_reshard_after_forward", [None, True])
-def test_apply_fsdp_calls_with_ignored_params_and_shard_for_experts(monkeypatch, experts_reshard_after_forward):
+@pytest.mark.parametrize("is_mtp_head", [False, True])
+def test_apply_fsdp_calls_with_ignored_params_and_shard_for_experts(
+    monkeypatch, experts_reshard_after_forward, is_mtp_head
+):
     P = _import_parallelizer_with_stubs(monkeypatch)
     # Patch MoE symbol for isinstance
     monkeypatch.setattr(P, "MoE", DummyMoE)
@@ -950,6 +953,11 @@ def test_apply_fsdp_calls_with_ignored_params_and_shard_for_experts(monkeypatch,
     embed_norm = object()
     lm = object()
     model = DummyModel([block], embed_tokens=embed, embed_norm=embed_norm, lm_head=lm)
+    if is_mtp_head:
+        # A repeated/tied MTP expert group must stay gathered even when the
+        # backbone's much larger routed-expert stack is configured to reshard.
+        model.layers = LayerContainer([])
+        model.mtp = types.SimpleNamespace(layers=LayerContainer([block]))
 
     fsdp_mesh = type("Mesh", (), {"ndim": 1, "size": lambda self: 2})()
     ep_shard_mesh = type("Mesh", (), {"size": lambda self: 2})()
@@ -978,7 +986,7 @@ def test_apply_fsdp_calls_with_ignored_params_and_shard_for_experts(monkeypatch,
     assert experts_call is not None
     _, experts_kwargs = experts_call
     assert experts_kwargs["mesh"] is ep_shard_mesh
-    assert experts_kwargs["reshard_after_forward"] is (experts_reshard_after_forward is True)
+    assert experts_kwargs["reshard_after_forward"] is (experts_reshard_after_forward is True and not is_mtp_head)
     assert experts_kwargs["offload_policy"] is offload_policy
     assert experts_kwargs["mp_policy"] == ("INTERNAL_MP_POLICY", "MP_POLICY")
     assert callable(experts_kwargs["shard_placement_fn"])  # lambda _: Shard(1)
