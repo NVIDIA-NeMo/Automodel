@@ -191,7 +191,7 @@ RUN if [ "$INSTALL_UCCL_EP" = "True" ]; then \
     fi
 
 # ---- Wheel builder: compile the heavy AOT source packages off the uv-sync path (cached across uv.lock bumps).
-# Build torchao then FA3/FA4 sequentially and cap compiler parallelism to stay within CI memory limits.
+# Build torchao, FlashMLA, then FA3/FA4 sequentially and cap compiler parallelism to stay within CI memory limits.
 FROM automodel_dep AS wheel_builder
 
 # torchao MXFP8: build w/ submodules (PyPI wheels omit mxfp8 CUDA kernels on aarch64); pin v0.17.0 (v0.14.1 ~2.5x slower; main needs nvidia-cutlass-dsl).
@@ -202,6 +202,17 @@ RUN mkdir -p /wheels && \
     TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" MAX_JOBS=8 \
         pip wheel --no-cache-dir --no-build-isolation --no-deps -w /wheels /tmp/torchao && \
     rm -rf /tmp/torchao
+
+# FlashMLA sparse prefill forward used by the GLM-5.2/5.3 cuDNN DSA backend.
+# This is the source revision used for the cuDNN numerical and full-model validation.
+ARG FLASH_MLA_REF=b7643bd54521f563b839b98289b5cd048c062ba2
+RUN git clone --filter=blob:none --no-checkout \
+        https://github.com/deepseek-ai/FlashMLA.git /tmp/FlashMLA && \
+    git -C /tmp/FlashMLA checkout "${FLASH_MLA_REF}" && \
+    git -C /tmp/FlashMLA submodule update --init --recursive && \
+    CPLUS_INCLUDE_PATH=/usr/local/cuda/include/cccl MAX_JOBS=8 NVCC_THREADS=2 \
+        pip wheel --no-cache-dir --no-build-isolation --no-deps -w /wheels /tmp/FlashMLA && \
+    rm -rf /tmp/FlashMLA
 
 # FA3 (Hopper-only, SM90a-locked, ~25 min nvcc) + FA4 cute (Blackwell, lightweight). arm64 -> skip FA3: GB200 target, QEMU cross-build impractical.
 # Pin >= #2762/#2507: older refs rebuilt the CuTe compile key every call when max_seqlen
@@ -231,8 +242,9 @@ FROM automodel_dep AS automodel_final
 
 WORKDIR /opt/Automodel
 
-# torchao MXFP8 + FA3/FA4: prebuilt wheels from the wheel_builder stage, installed into system site-packages
-# before uv sync — pip targets system deps, uv the venv (torchao/FA gated `never`), so uv sync won't prune or shadow them.
+# torchao MXFP8 + FlashMLA + FA3/FA4: prebuilt wheels from the wheel_builder stage, installed into system site-packages
+# before uv sync — pip targets system deps, uv the venv (torchao/FA gated `never`, FlashMLA absent from the lock),
+# so uv sync won't prune or shadow them.
 COPY --from=wheel_builder /wheels /tmp/wheels/
 ARG INSTALL_FA4=true
 RUN pip install --no-cache-dir --no-deps /tmp/wheels/*.whl && \
