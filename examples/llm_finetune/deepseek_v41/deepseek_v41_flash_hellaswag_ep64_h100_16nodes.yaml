@@ -187,3 +187,11 @@ wandb:
   mode: online
   dir: ../logs/wandb
 
+ci:
+  recipe_owner: linmuchuiyang
+  nodes: 16
+  time: "01:00:00"
+  nproc_per_node: 8
+  cluster_tag: h100
+  env_vars:
+    NCCL_PXN_DISABLE: "1"

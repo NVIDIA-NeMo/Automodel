@@ -34,7 +34,8 @@ import argparse
 import os
 import time
 
-from transformers import AutoTokenizer
+from datasets import Dataset
+from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from nemo_automodel.components.datasets.llm.chat_dataset import ChatDataset
 from nemo_automodel.components.datasets.llm.packed_sequence import pack_dataset, tokenize_dataset_parallel
@@ -43,7 +44,27 @@ DATASET_ID = "allenai/tulu-3-sft-mixture"
 KEEP_COLUMNS = ("input_ids", "labels", "attention_mask", "loss_mask", "position_ids", "seq_lens", "seq_lens_padded")
 
 
-def build_chat_dataset(tokenizer, template, split, seq_length, padding, shuffle_seed):
+def build_chat_dataset(
+    tokenizer: PreTrainedTokenizerBase,
+    template: str,
+    split: str,
+    seq_length: int,
+    padding: str | bool,
+    shuffle_seed: int,
+) -> ChatDataset:
+    """Build a Tulu3 split with assistant-only labels and the requested padding.
+
+    Args:
+        tokenizer: DeepSeek tokenizer used to encode each conversation.
+        template: Jinja chat template containing generation blocks.
+        split: Hugging Face split or slice expression.
+        seq_length: Maximum token count per conversation.
+        padding: Tokenizer padding mode.
+        shuffle_seed: Seed applied before slicing the dataset.
+
+    Returns:
+        Lazily tokenized chat dataset.
+    """
     return ChatDataset(
         DATASET_ID,
         tokenizer,
@@ -56,14 +77,29 @@ def build_chat_dataset(tokenizer, template, split, seq_length, padding, shuffle_
     )
 
 
-def materialize(chat_ds, num_proc):
-    # Materialize ChatDataset.__getitem__ in parallel into an HF Dataset; drop non-tensor helper columns.
+def materialize(chat_ds: ChatDataset, num_proc: int) -> Dataset:
+    """Tokenize chat rows in parallel and retain the training columns.
+
+    Args:
+        chat_ds: Lazily tokenized chat dataset.
+        num_proc: Number of tokenization worker processes.
+
+    Returns:
+        Arrow-backed dataset containing tokenized training rows.
+    """
     ds = tokenize_dataset_parallel(chat_ds, num_proc=num_proc)
     drop = [c for c in ds.column_names if c not in KEEP_COLUMNS]
     return ds.remove_columns(drop) if drop else ds
 
 
-def summarize(name, ds, pad_token_id):
+def summarize(name: str, ds: Dataset, pad_token_id: int | None) -> None:
+    """Print length, supervision, and padding statistics for prepared rows.
+
+    Args:
+        name: Label identifying the layout and split.
+        ds: Nonempty dataset containing input_ids and labels columns.
+        pad_token_id: Token ID counted as padding in the first row.
+    """
     n = len(ds)
     row = ds[0]
     lens = [len(ds[i]["input_ids"]) for i in range(min(n, 256))]
@@ -77,15 +113,22 @@ def summarize(name, ds, pad_token_id):
     )
 
 
-def main():
+def main() -> None:
+    """Prepare and save the padded and packed Tulu3 datasets requested by the CLI."""
     p = argparse.ArgumentParser()
-    p.add_argument("--model-path", required=True, help="local HF snapshot of deepseek-ai/DeepSeek-V4.1-Flash (DS41_CHECKPOINT)")
+    p.add_argument(
+        "--model-path", required=True, help="local HF snapshot of deepseek-ai/DeepSeek-V4.1-Flash (DS41_CHECKPOINT)"
+    )
     p.add_argument(
         "--template",
         default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "tulu3_chat_template.jinja"),
         help="chat template; defaults to tulu3_chat_template.jinja next to this script",
     )
-    p.add_argument("--out-root", required=True, help="output root; DS41_DATA_ROOT is <out-root>/tulu3_4k_padded or <out-root>/tulu3_32k_packed")
+    p.add_argument(
+        "--out-root",
+        required=True,
+        help="output root; DS41_DATA_ROOT is <out-root>/tulu3_4k_padded or <out-root>/tulu3_32k_packed",
+    )
     p.add_argument("--shuffle-seed", type=int, default=42)
     p.add_argument("--num-proc", type=int, default=32)
     # 4k right-padded rows (CP recipe): 100 updates x GBS 64/128 consume 6400/12800 rows.
