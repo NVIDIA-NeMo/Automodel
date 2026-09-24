@@ -176,6 +176,9 @@ class MoEParallelizerConfig:
     # torch.utils.checkpoint raise a CheckpointError on the backward recompute.
     ignore_router_for_ac: bool = True
     reshard_after_forward: bool = False
+    # None follows the block policy; set explicitly to release large EP-sharded
+    # expert weights after forward without changing attention/PP block sharding.
+    experts_reshard_after_forward: bool | None = None
     lm_head_precision: Union[str, torch.dtype] | None = None
     wrap_outer_model: bool = True
     mp_policy: MixedPrecisionPolicy | None = None

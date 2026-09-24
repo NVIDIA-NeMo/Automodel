@@ -919,7 +919,8 @@ def _find_call_by_first_arg(mock_obj, target_first_arg):
     return None
 
 
-def test_apply_fsdp_calls_with_ignored_params_and_shard_for_experts(monkeypatch):
+@pytest.mark.parametrize("experts_reshard_after_forward", [None, True])
+def test_apply_fsdp_calls_with_ignored_params_and_shard_for_experts(monkeypatch, experts_reshard_after_forward):
     P = _import_parallelizer_with_stubs(monkeypatch)
     # Patch MoE symbol for isinstance
     monkeypatch.setattr(P, "MoE", DummyMoE)
@@ -961,6 +962,7 @@ def test_apply_fsdp_calls_with_ignored_params_and_shard_for_experts(monkeypatch)
         ep_shard_enabled=True,
         ep_shard_mesh=ep_shard_mesh,
         offload_policy=offload_policy,
+        experts_reshard_after_forward=experts_reshard_after_forward,
     )
 
     distribute_tensor_mock.assert_called_once_with(
@@ -976,7 +978,7 @@ def test_apply_fsdp_calls_with_ignored_params_and_shard_for_experts(monkeypatch)
     assert experts_call is not None
     _, experts_kwargs = experts_call
     assert experts_kwargs["mesh"] is ep_shard_mesh
-    assert experts_kwargs["reshard_after_forward"] is False
+    assert experts_kwargs["reshard_after_forward"] is (experts_reshard_after_forward is True)
     assert experts_kwargs["offload_policy"] is offload_policy
     assert experts_kwargs["mp_policy"] == ("INTERNAL_MP_POLICY", "MP_POLICY")
     assert callable(experts_kwargs["shard_placement_fn"])  # lambda _: Shard(1)
@@ -987,6 +989,7 @@ def test_apply_fsdp_calls_with_ignored_params_and_shard_for_experts(monkeypatch)
     _, block_kwargs = block_call
     assert block_kwargs["mesh"] is fsdp_mesh
     assert block_kwargs["mp_policy"] == "MP_POLICY"
+    assert block_kwargs["reshard_after_forward"] is False
     ignored = block_kwargs.get("ignored_params")
     assert isinstance(ignored, set) and len(ignored) == len(list(experts.parameters()))
 

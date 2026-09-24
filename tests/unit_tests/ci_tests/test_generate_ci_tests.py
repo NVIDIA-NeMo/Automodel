@@ -118,6 +118,8 @@ def test_generate_deepseek_v3_1024_benchmark_job_runs_without_activation_checkpo
 
     assert jobs[""]["variables"]["TEST_NODE_COUNT"] == 128
     assert recipe["distributed"]["activation_checkpointing"] is False
+    assert recipe["distributed"]["moe"]["reshard_after_forward"] is False
+    assert recipe["distributed"]["moe"]["experts_reshard_after_forward"] is True
 
 
 @pytest.mark.parametrize(

@@ -84,6 +84,9 @@ distributed:
     layers_per_stage: 4
 
   moe:
+    # Keep only the EP-sharded expert weights between microbatches. Retaining
+    # every full expert all-gather across the PP stage exhausts GPU 0 headroom.
+    experts_reshard_after_forward: true
     reshard_after_forward: false
     wrap_outer_model: false
 

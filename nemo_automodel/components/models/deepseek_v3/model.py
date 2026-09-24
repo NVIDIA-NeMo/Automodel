@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import logging
-import os
 from dataclasses import dataclass, replace
 from typing import Any, Union
 
@@ -43,8 +41,6 @@ from nemo_automodel.components.moe.layers import MLP, MoE
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
-logger = logging.getLogger(__name__)
-
 
 class Block(nn.Module):
     def __init__(
@@ -73,7 +69,6 @@ class Block(nn.Module):
             backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, dtype=dtype
         )
         self.layer_idx = layer_idx
-        self._memory_profile_calls = 0
 
     def forward(
         self,
@@ -98,11 +93,6 @@ class Block(nn.Module):
         if attention_mask is not None and padding_mask is None:
             padding_mask = attention_mask.bool().logical_not()
 
-        profile_memory = os.environ.get("RANK") == "0" and self._memory_profile_calls < 16
-        if profile_memory:
-            start_allocated = torch.cuda.memory_allocated()
-            start_free, _ = torch.cuda.mem_get_info()
-
         attn_out = self.self_attn(
             x=self.input_layernorm(x),
             freqs_cis=freqs_cis,
@@ -111,38 +101,11 @@ class Block(nn.Module):
         )
         x = x + attn_out
 
-        if profile_memory:
-            logger.warning(
-                "MEMPROF layer=%d call=%d phase=mla allocated=%d delta=%d free=%d free_delta=%d peak=%d",
-                self.layer_idx,
-                self._memory_profile_calls,
-                torch.cuda.memory_allocated(),
-                torch.cuda.memory_allocated() - start_allocated,
-                torch.cuda.mem_get_info()[0],
-                torch.cuda.mem_get_info()[0] - start_free,
-                torch.cuda.max_memory_allocated(),
-            )
-            start_allocated = torch.cuda.memory_allocated()
-            start_free, _ = torch.cuda.mem_get_info()
-
         mlp_out = self._mlp(
             x=self.post_attention_layernorm(x),
             padding_mask=padding_mask,
         )
         x = x + mlp_out
-
-        if profile_memory:
-            logger.warning(
-                "MEMPROF layer=%d call=%d phase=mlp allocated=%d delta=%d free=%d free_delta=%d peak=%d",
-                self.layer_idx,
-                self._memory_profile_calls,
-                torch.cuda.memory_allocated(),
-                torch.cuda.memory_allocated() - start_allocated,
-                torch.cuda.mem_get_info()[0],
-                torch.cuda.mem_get_info()[0] - start_free,
-                torch.cuda.max_memory_allocated(),
-            )
-            self._memory_profile_calls += 1
 
         return x
 
