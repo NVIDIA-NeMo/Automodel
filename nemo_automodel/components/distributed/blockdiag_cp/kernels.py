@@ -17,17 +17,48 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
+from typing import Any
 
 import torch
 
-from nemo_automodel.shared.import_utils import safe_import_from, safe_import_te
+from nemo_automodel.shared.import_utils import safe_import_te
 
 logger = logging.getLogger(__name__)
 
-# Availability probes only -- the kernel symbols themselves are imported at the
-# call sites so a per-call stub (tests) or lazy TE extension load keeps working.
-HAS_FLASH_VARLEN, _ = safe_import_from("flash_attn", "flash_attn_varlen_func")
-HAS_TE, _ = safe_import_te()
+
+_FLASH_FUNCTIONS: tuple[Callable[..., Any] | None, Callable[..., Any] | None] | None = None
+
+
+def _get_flash_functions() -> tuple[Callable[..., Any] | None, Callable[..., Any] | None]:
+    """Load FlashAttention functions through Transformers' supported loader.
+
+    Cached after the first successful call. ``lazy_import_flash_attention`` is not a
+    pure probe: it overwrites Transformers' module-global "currently loaded"
+    implementation whenever the requested one differs from what is already loaded.
+    A model attending with a different implementation (flash_attention_3, a Hub
+    kernel id, ...) reloads that global back on every real attention call, so
+    probing "flash_attention_2" fresh here on every CP layer/step would thrash the
+    global against the model's own forward pass instead of just reading it once.
+    """
+    global _FLASH_FUNCTIONS
+    if _FLASH_FUNCTIONS is None:
+        from transformers.modeling_flash_attention_utils import lazy_import_flash_attention
+
+        flash_functions, _ = lazy_import_flash_attention("flash_attention_2")
+        _FLASH_FUNCTIONS = (flash_functions[0], flash_functions[1])
+    return _FLASH_FUNCTIONS
+
+
+def _has_flash_varlen() -> bool:
+    """Return True when flash varlen is available via pip or Hub."""
+    try:
+        _, flash_attn_varlen_func = _get_flash_functions()
+    except Exception:
+        logger.debug("FlashAttention varlen loader is unavailable", exc_info=True)
+        return False
+    return flash_attn_varlen_func is not None
+
 
 _CP_FLASH_DETERMINISTIC = False
 _CP_FLASH_WARNED = False
@@ -36,6 +67,7 @@ _CP_VARLEN_SHAPE_LOGGED = False
 _CP_FLASH_LONG_SEGMENT_WARNED = False
 _CP_TE_DROPOUT_WARNED = False
 _TE_DPA_CACHE = {}
+HAS_TE, _ = safe_import_te()
 
 
 def _varlen_backend_unavailable_reason(
@@ -65,7 +97,7 @@ def _varlen_backend_unavailable_reason(
     if device.type != "cuda":
         return f"varlen CP attention requires CUDA, got device={device}"
     if backend == "flash":
-        if not HAS_FLASH_VARLEN:
+        if not _has_flash_varlen():
             return "flash_attn varlen kernel is unavailable"
         return None
     if backend == "te":
@@ -282,7 +314,9 @@ def _flash_varlen_with_long_prefix_guard(
     Returns:
         Packed attention output ``[n_real, Hq, D]``.
     """
-    from flash_attn import flash_attn_func, flash_attn_varlen_func
+    flash_attn_func, flash_attn_varlen_func = _get_flash_functions()
+    if flash_attn_func is None or flash_attn_varlen_func is None:
+        raise RuntimeError("flash_attn func/varlen unavailable")
 
     first_q = int(meta.get("first_q", 0))
     first_k = int(meta.get("first_k", 0))
@@ -568,7 +602,7 @@ def _cp_blockdiag_varlen(
             )
             _CP_TE_DROPOUT_WARNED = True
         return None
-    if backend == "flash" and not HAS_FLASH_VARLEN:
+    if backend == "flash" and not _has_flash_varlen():
         if not _CP_FLASH_WARNED:
             logger.warning("flash_attn is unavailable; reporting the unavailable varlen path to the caller")
             _CP_FLASH_WARNED = True

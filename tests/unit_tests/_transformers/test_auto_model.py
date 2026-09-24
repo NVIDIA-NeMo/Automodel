@@ -320,6 +320,7 @@ class TestUtilityFunctions:
         # Test fallback from highest to lowest priority
         assert _get_next_fallback_attn("flash_attention_3") == "flash_attention_2"
         assert _get_next_fallback_attn("flash_attention_2") == "sdpa"
+        assert _get_next_fallback_attn("kernels-community/flash-attn2") == "sdpa"
         assert _get_next_fallback_attn("sdpa") == "eager"
 
         # Test that eager falls back to itself (lowest priority)
@@ -1557,6 +1558,85 @@ class TestBuildModelRetryDepth:
             result = _BaseNeMoAutoModelClass._build_model(mock_config, **build_kwargs)
             assert result is sentinel_model
             assert mock_init.call_count == 2
+
+    def test_hf_pretrained_forwards_kernel_options_during_load(self):
+        """Transformers owns kernelization when it loads an HF checkpoint."""
+        build_kwargs, mock_config = self._make_build_kwargs()
+        sentinel_model = MagicMock()
+        kernel_config = MagicMock()
+        build_kwargs.update(use_kernels=True, allow_all_kernels=True, kernel_config=kernel_config)
+
+        with (
+            patch("nemo_automodel._transformers.auto_model._apply_preload_overrides", return_value=("eager", False)),
+            patch("nemo_automodel._transformers.auto_model.get_hf_config", return_value=mock_config) as mock_get_config,
+            patch(
+                "nemo_automodel._transformers.auto_model._init_model", return_value=(False, sentinel_model)
+            ) as mock_init,
+            patch("nemo_automodel._transformers.auto_model.get_world_size_safe", return_value=1),
+            patch("nemo_automodel._transformers.auto_model.apply_model_runtime_patches", return_value=sentinel_model),
+            patch("nemo_automodel._transformers.auto_model._verify_sdpa_support"),
+            patch("nemo_automodel._transformers.capabilities.attach_capabilities_and_validate"),
+            patch("nemo_automodel._transformers.auto_model.apply_model_infrastructure", return_value=sentinel_model),
+            patch("torch.cuda.current_device", return_value=0),
+        ):
+            result = _BaseNeMoAutoModelClass._build_model("test-model", **build_kwargs)
+
+        assert result is sentinel_model
+        assert mock_get_config.call_args.kwargs == {}
+        assert mock_init.call_args.kwargs["use_kernels"] is True
+        assert mock_init.call_args.kwargs["allow_all_kernels"] is True
+        assert mock_init.call_args.kwargs["kernel_config"] is kernel_config
+        sentinel_model.set_use_kernels.assert_not_called()
+
+    def test_from_config_does_not_forward_allow_all_kernels(self):
+        """Only ``from_pretrained`` (a string path) pops ``allow_all_kernels`` before
+        constructing the model; ``_from_config`` forwards unrecognized kwargs straight
+        into ``cls(config, **kwargs)``, so a stock HF model would raise ``TypeError``
+        if this reached model construction on the ``from_config`` path."""
+        build_kwargs, mock_config = self._make_build_kwargs()
+        sentinel_model = MagicMock()
+        build_kwargs.update(allow_all_kernels=True)
+
+        with (
+            patch("nemo_automodel._transformers.auto_model._apply_preload_overrides", return_value=("eager", False)),
+            patch(
+                "nemo_automodel._transformers.auto_model._init_model", return_value=(False, sentinel_model)
+            ) as mock_init,
+            patch("nemo_automodel._transformers.auto_model.get_world_size_safe", return_value=1),
+            patch("nemo_automodel._transformers.auto_model.apply_model_runtime_patches", return_value=sentinel_model),
+            patch("nemo_automodel._transformers.auto_model._verify_sdpa_support"),
+            patch("nemo_automodel._transformers.capabilities.attach_capabilities_and_validate"),
+            patch("nemo_automodel._transformers.auto_model.apply_model_infrastructure", return_value=sentinel_model),
+            patch("torch.cuda.current_device", return_value=0),
+        ):
+            result = _BaseNeMoAutoModelClass._build_model(mock_config, **build_kwargs)
+
+        assert result is sentinel_model
+        assert "allow_all_kernels" not in mock_init.call_args.kwargs
+
+    def test_meta_model_rejects_layer_kernel_replacement(self):
+        """Layer replacement must not mutate a meta model before sharding."""
+        build_kwargs, mock_config = self._make_build_kwargs()
+        sentinel_model = MagicMock()
+        kernel_config = MagicMock()
+        build_kwargs.update(is_hf_model=False, kernel_config=kernel_config)
+
+        with (
+            patch(
+                "nemo_automodel._transformers.auto_model._init_model", return_value=(True, sentinel_model)
+            ) as mock_init,
+            patch("nemo_automodel._transformers.auto_model.get_world_size_safe", return_value=1),
+            patch("nemo_automodel._transformers.auto_model.apply_model_runtime_patches", return_value=sentinel_model),
+            patch("nemo_automodel._transformers.capabilities.attach_capabilities_and_validate"),
+            patch("nemo_automodel._transformers.auto_model.apply_model_infrastructure", return_value=sentinel_model),
+            patch("torch.cuda.current_device", return_value=0),
+        ):
+            with pytest.raises(ValueError, match="meta device"):
+                _BaseNeMoAutoModelClass._build_model(mock_config, **build_kwargs)
+
+        assert "use_kernels" not in mock_init.call_args.kwargs
+        assert "kernel_config" not in mock_init.call_args.kwargs
+        sentinel_model.set_use_kernels.assert_not_called()
 
     def test_build_model_applies_runtime_patches_before_infrastructure(self):
         """Model runtime hooks run after construction and before sharding/checkpoint infra."""
