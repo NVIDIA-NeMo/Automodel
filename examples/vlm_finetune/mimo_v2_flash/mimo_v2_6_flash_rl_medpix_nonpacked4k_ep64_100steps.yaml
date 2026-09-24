@@ -1,0 +1,156 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Full-parameter MiMo-V2.6-Flash-RL fine-tuning on MedPix-VQA with non-packed
+# 4096-token inputs.
+#
+# Hardware target: 8 nodes x 8 H100 GPUs with EP64 and CP1.
+
+recipe: FinetuneRecipeForVLM
+seed: 1234
+
+step_scheduler:
+  global_batch_size: 128
+  local_batch_size: 1
+  ckpt_every_steps: 1000
+  save_checkpoint_every_epoch: false
+  val_every_steps: 1000
+  log_remote_every_steps: 1
+  gc_every_steps: 5
+  num_epochs: 1
+  max_steps: 100
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 120
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1234
+  ranked: true
+  deterministic: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_config
+  config:
+    _target_: nemo_automodel.components.models.mimo_v2_flash.config.MiMoV2Config.from_pretrained
+    pretrained_model_name_or_path: XiaomiMiMo/MiMo-V2.6-Flash-RL
+    name_or_path: XiaomiMiMo/MiMo-V2.6-Flash-RL
+    use_cache: false
+    output_hidden_states: true
+    num_nextn_predict_layers: 0
+  trust_remote_code: false
+  load_base_model: true
+  torch_dtype: bfloat16
+  use_liger_kernel: false
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: te
+    linear: torch
+    rms_norm: torch_fp32
+    experts: torch_mm
+    dispatcher: hybridep
+    rope_fusion: false
+    gate_precision: float32
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+
+processor:
+  _target_: transformers.AutoProcessor.from_pretrained
+  pretrained_model_name_or_path: XiaomiMiMo/MiMo-V2.6-Flash-RL
+  trust_remote_code: false
+  max_pixels: 1048576
+
+checkpoint:
+  enabled: false
+  checkpoint_dir: checkpoints/mimo_v2_6_flash_rl_medpix_nonpacked4k_ep64_100steps/
+  model_save_format: safetensors
+  save_consolidated: false
+  dequantize_base_checkpoint: true
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 64
+  sequence_parallel: false
+  activation_checkpointing: true
+  reshard_after_forward: true
+  defer_fsdp_grad_sync: false
+  moe:
+    reshard_after_forward: true
+    wrap_outer_model: true
+    ignore_router_for_ac: true
+
+freeze_config:
+  freeze_vision_tower: true
+  freeze_audio_tower: true
+  freeze_language_model: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
+  path_or_dataset: mmoukouba/MedPix-VQA
+  split: train
+
+packed_sequence:
+  packed_sequence_size: 0
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 4
+  persistent_workers: true
+  pin_memory: true
+  shuffle: false
+  drop_last: true
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn
+    # The collater shifts inputs and labels once, yielding 4096 model tokens.
+    max_length: 4097
+
+validation_dataset: none
+validation_dataloader: none
+
+optimizer:
+  _target_: torch.optim.AdamW
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  lr: 5.0e-6
+  weight_decay: 0.1
+
+lr_scheduler:
+  lr_decay_style: constant
+
+clip_grad_norm:
+  max_norm: 1.0
+
+# wandb:
+#   enable: true
+#   entity: <your_wandb_entity>
+#   project: automodel-mimo-v2-6
+#   name: mimo_v2_6_flash_rl_medpix_nonpacked4k_ep64_100steps
+#   group: mimo_v2_6_flash_rl_medpix_4k
+#   tags: [mimo-v2.6, vlm, medpix, nonpacked4k, ep64]
+#   mode: online
+#   dir: logs/mimo_v2_6_flash_rl_medpix_nonpacked4k_ep64_100steps/wandb
+
+ci:
+  recipe_owner: huiyingl
+  nodes: 8
+  time: "01:00:00"
+  max_steps: 5
