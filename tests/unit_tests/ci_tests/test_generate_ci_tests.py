@@ -123,25 +123,32 @@ def test_generate_deepseek_v3_1024_benchmark_job_uses_activation_checkpointing()
 
 
 @pytest.mark.parametrize(
-    "config_path",
+    ("config_path", "activation_checkpointing"),
     [
-        "examples/llm_benchmark/deepseek/deepseek_v3_te_deepep.yaml",
-        "examples/llm_benchmark/deepseek/deepseek_v3_te_deepep_1024.yaml",
-        "examples/llm_benchmark/glm/glm_4.5_air_te_deepep.yaml",
-        "examples/llm_benchmark/kimi/kimi_k2_te_deepep.yaml",
-        "examples/llm_benchmark/qwen/qwen3_moe_235b_te_deepep.yaml",
-        "examples/llm_benchmark/qwen/qwen3_moe_30b_te_deepep.yaml",
-        "examples/llm_benchmark/qwen/qwen3_moe_30b_torch.yaml",
-        "examples/llm_finetune/deepseek_v32/deepseek_v32_hellaswag_pp.yaml",
-        "examples/llm_finetune/qwen/qwen3_moe_30b_lora.yaml",
+        ("examples/llm_benchmark/deepseek/deepseek_v3_te_deepep.yaml", True),
+        ("examples/llm_benchmark/deepseek/deepseek_v3_te_deepep_1024.yaml", True),
+        ("examples/llm_benchmark/glm/glm_4.5_air_te_deepep.yaml", True),
+        ("examples/llm_benchmark/gpt_oss/gptoss_120b_te_deepep.yaml", False),
+        ("examples/llm_benchmark/kimi/kimi_k2_te_deepep.yaml", True),
+        ("examples/llm_benchmark/qwen/qwen3_moe_235b_te_deepep.yaml", True),
+        ("examples/llm_benchmark/qwen/qwen3_moe_30b_te_deepep.yaml", True),
+        ("examples/llm_benchmark/qwen/qwen3_moe_30b_torch.yaml", True),
+        ("examples/llm_benchmark/qwen/qwen3_next_te_deepep.yaml", True),
+        ("examples/llm_finetune/deepseek_v32/deepseek_v32_hellaswag_pp.yaml", True),
+        ("examples/llm_finetune/qwen/qwen1_5_moe_a2_7b_qlora.yaml", True),
+        ("examples/llm_finetune/qwen/qwen3_moe_2layer_proxy_torch_sdpa.yaml", True),
+        ("examples/llm_finetune/qwen/qwen3_moe_30b_lora.yaml", True),
+        ("examples/llm_finetune/qwen/qwen3_moe_30b_te_deepep.yaml", True),
+        ("examples/llm_finetune/qwen/qwen3_moe_30b_te_packed_sequence.yaml", True),
+        ("examples/llm_finetune/qwen/qwen3_next_te_deepep.yaml", True),
     ],
 )
-def test_migrated_moe_recipes_preserve_activation_checkpointing(config_path):
-    """The #1225 config migration must not silently change these recipes' AC policy."""
+def test_migrated_moe_recipes_preserve_activation_checkpointing(config_path, activation_checkpointing):
+    """Pin the effective AC policy across benchmark and finetune recipes touched by #1225/#1285."""
     recipe = YAML(typ="safe").load(Path(config_path))
 
-    assert recipe["distributed"]["activation_checkpointing"] is True
-    assert parse_distributed_section(recipe["distributed"])["activation_checkpointing"] is True
+    assert recipe["distributed"]["activation_checkpointing"] is activation_checkpointing
+    assert parse_distributed_section(recipe["distributed"])["activation_checkpointing"] is activation_checkpointing
 
 
 @pytest.mark.parametrize(
