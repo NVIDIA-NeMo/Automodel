@@ -311,7 +311,8 @@ def test_checkpointed_chunked_expert_mlp_matches_full_cuda_gradients(
         expected_tensors[5],
         apply_router_weight_after_down,
     )
-    tolerance = {"rtol": 2e-2, "atol": 4e-2} if dtype == torch.bfloat16 else {"rtol": 2e-5, "atol": 2e-5}
+    # Chunking changes grouped-GEMM accumulation order, whose FP32 rounding varies slightly across GPU architectures.
+    tolerance = {"rtol": 2e-2, "atol": 4e-2} if dtype == torch.bfloat16 else {"rtol": 2e-5, "atol": 5e-5}
     torch.testing.assert_close(result, expected, **tolerance)
 
     upstream_grad = torch.randn_like(result)
