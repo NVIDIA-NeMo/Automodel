@@ -59,6 +59,13 @@ def main() -> None:
     # PyTorch or CUDA symbols cannot be resolved by the final image runtime.
     importlib.import_module("transformer_engine.pytorch")
 
+    flash_mla_version = version("flash-mla")
+    if flash_mla_version != "1.0.0+b7643bd":
+        raise RuntimeError(f"FlashMLA 1.0.0+b7643bd is required, found {flash_mla_version}")
+    flash_mla = importlib.import_module("flash_mla")
+    if not callable(getattr(flash_mla, "flash_mla_sparse_fwd", None)):
+        raise RuntimeError("FlashMLA does not provide the required flash_mla_sparse_fwd kernel")
+
 
 if __name__ == "__main__":
     main()
