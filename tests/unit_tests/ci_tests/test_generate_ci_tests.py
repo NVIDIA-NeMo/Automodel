@@ -110,14 +110,14 @@ def test_generate_gpt_oss_120b_benchmark_job_uses_ep64_without_activation_checkp
     assert recipe["distributed"]["activation_checkpointing"] is False
 
 
-def test_generate_deepseek_v3_1024_benchmark_job_uses_activation_checkpointing():
+def test_generate_deepseek_v3_1024_benchmark_job_runs_without_activation_checkpointing():
     config = Path("examples/llm_benchmark/deepseek/deepseek_v3_te_deepep_1024.yaml")
 
     jobs = dict(generate_job(config, {}, "performance", "llm_benchmark", "."))
     recipe = YAML(typ="safe").load(config)
 
     assert jobs[""]["variables"]["TEST_NODE_COUNT"] == 128
-    assert recipe["distributed"]["activation_checkpointing"] is True
+    assert recipe["distributed"]["activation_checkpointing"] is False
 
 
 @pytest.mark.parametrize(
