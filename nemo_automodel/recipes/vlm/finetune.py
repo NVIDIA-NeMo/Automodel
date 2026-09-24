@@ -897,6 +897,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self.device_mesh,
             batch,
             padding_token_id=_padding_id,
+            num_chunks=self.pp.pp_batch_size // self.pp.pp_microbatch_size if self.pp_enabled else 1,
             invoke_pre_embed=True,
         )
         model = self.model_parts[0]
