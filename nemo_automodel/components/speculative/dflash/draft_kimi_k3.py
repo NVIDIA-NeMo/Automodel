@@ -330,8 +330,7 @@ def build_kimi_k3_dflash_target_kwargs(recipe_cfg) -> dict:
     * ``backend`` selects the expert-parallel token dispatcher and the HF
       state-dict adapter (which also dequantizes an FP8 base checkpoint on load),
       mirroring the frozen large-MoE target backends the DSpark recipe builds.
-      ``experts`` defaults to ``torch_mm`` rather than ``gmm`` because the latter
-      needs the optional ``grouped_gemm`` package. ``attn`` is left at ``eager``
+      ``experts`` defaults to the native ``torch_mm`` backend. ``attn`` is left at ``eager``
       and is inert -- ``KimiK3ForCausalLM`` never reads ``backend.attn``, since
       its MLA and KDA layers each have a fixed attention path -- and
       ``gate_precision`` is left unset because K3 already defaults it to fp32.

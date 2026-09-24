@@ -88,6 +88,35 @@ class RMSNorm(nn.Module):
         return (self.weight.to(torch.float32) * hidden_states).to(input_dtype)
 
 
+def _pixel_shuffle(x: torch.Tensor, scale_factor: float, ps_version: str) -> torch.Tensor:
+    """Rearrange spatial patches into channels with the checkpoint layout.
+
+    Args:
+        x: Features shaped [batch, grid_height, grid_width, hidden_size].
+        scale_factor: Spatial downsampling ratio.
+        ps_version: Pixel-shuffle layout version.
+
+    Returns:
+        Features with downsampled spatial axes and expanded channels.
+    """
+    n, w, h, c = x.size()
+    x = x.view(n, w, int(h * scale_factor), int(c / scale_factor))
+    x = x.permute(0, 2, 1, 3).contiguous()
+    x = x.view(
+        n,
+        int(h * scale_factor),
+        int(w * scale_factor),
+        int(c / (scale_factor * scale_factor)),
+    )
+    if ps_version == "v1":
+        warnings.warn(
+            "In ps_version 'v1', the height and width have not been swapped back, which results in a transposed image."
+        )
+    else:
+        x = x.permute(0, 2, 1, 3).contiguous()
+    return x
+
+
 class VisionProjector(nn.Module):
     """MLP projector from vision encoder to LLM hidden space.
 
@@ -97,7 +126,8 @@ class VisionProjector(nn.Module):
         mlp1.3.weight  ->  Linear2 weight  (llm_hidden_size, projector_hidden_size)
 
     Between linear1 and linear2 there is a SquaredReLU activation (index 2 in Sequential,
-    but it has no weight).
+    but it has no weight). Super 3.5 also stores a vision_final_layernorm here;
+    forward applies it before pixel shuffle.
     """
 
     def __init__(
@@ -106,15 +136,66 @@ class VisionProjector(nn.Module):
         projector_hidden_size: int,
         llm_hidden_size: int,
         downsample_ratio: float = 0.5,
-    ):
+        *,
+        vision_final_layernorm_eps: float | None = None,
+    ) -> None:
+        """Build the projector and optional checkpoint-owned vision LayerNorm.
+
+        Args:
+            vit_hidden_size: Feature width before pixel shuffle.
+            projector_hidden_size: Hidden width of the projector MLP.
+            llm_hidden_size: Output width of the language model.
+            downsample_ratio: Spatial scale applied by pixel shuffle.
+            vision_final_layernorm_eps: LayerNorm epsilon, or None for models
+                without a final vision norm.
+        """
         super().__init__()
+        self.vision_final_layernorm = (
+            nn.LayerNorm(vit_hidden_size, eps=vision_final_layernorm_eps)
+            if vision_final_layernorm_eps is not None
+            else None
+        )
+        self.downsample_ratio = downsample_ratio
         pixel_shuffle_channels = vit_hidden_size * int(1 / downsample_ratio) ** 2
         self.norm = RMSNorm(pixel_shuffle_channels, eps=1e-5)
         self.linear1 = nn.Linear(pixel_shuffle_channels, projector_hidden_size, bias=False)
         self.activation = SquaredReLU()
         self.linear2 = nn.Linear(projector_hidden_size, llm_hidden_size, bias=False)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        patch_grid_shapes: list[tuple[int, int]] | None = None,
+        ps_version: str = "v2",
+    ) -> torch.Tensor:
+        """Normalize raw patch features, shuffle each image, then project.
+
+        Args:
+            x: Raw features [batch, sum_patches, vit_hidden_size] when
+                patch_grid_shapes is provided; otherwise already shuffled
+                features [batch, image_tokens, pixel_shuffle_channels].
+            patch_grid_shapes: Per-image (height, width) in patches.
+            ps_version: Checkpoint pixel-shuffle layout version.
+
+        Returns:
+            Projected features [batch, image_tokens, llm_hidden_size].
+        """
+        # Keep all projector-owned parameters inside this forward so FSDP
+        # materializes the final LayerNorm weights before they are accessed.
+        if patch_grid_shapes is not None:
+            if self.vision_final_layernorm is not None:
+                x = self.vision_final_layernorm(x)
+            chunks = torch.split(x, [h * w for h, w in patch_grid_shapes], dim=1)
+            x = torch.cat(
+                [
+                    _pixel_shuffle(chunk.reshape(chunk.shape[0], h, w, -1), self.downsample_ratio, ps_version).flatten(
+                        1, 2
+                    )
+                    for chunk, (h, w) in zip(chunks, patch_grid_shapes)
+                ],
+                dim=1,
+            )
         x = self.norm(x)
         x = self.linear1(x)
         x = self.activation(x)
@@ -460,6 +541,13 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
             projector_hidden_size=projector_hidden_size,
             llm_hidden_size=llm_hidden_size,
             downsample_ratio=self.downsample_ratio,
+            # This norm belongs to the pretrained Super 3.5 vision architecture.
+            # Disabling the language MTP objective must not remove it.
+            vision_final_layernorm_eps=(
+                vision_config.layer_norm_eps
+                if "NemotronH_Omni_Reasoning_V3" in (getattr(config, "architectures", None) or [])
+                else None
+            ),
         ).to(dtype)
         logger.info(
             f"NemotronOmni: Vision projector created "
@@ -621,23 +709,7 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         Returns:
             Shuffled tensor [N, W*scale, H*scale, C/(scale^2)]
         """
-        n, w, h, c = x.size()
-        x = x.view(n, w, int(h * scale_factor), int(c / scale_factor))
-        x = x.permute(0, 2, 1, 3).contiguous()
-        x = x.view(
-            n,
-            int(h * scale_factor),
-            int(w * scale_factor),
-            int(c / (scale_factor * scale_factor)),
-        )
-        if self.ps_version == "v1":
-            warnings.warn(
-                "In ps_version 'v1', the height and width have not been swapped back, "
-                "which results in a transposed image."
-            )
-        else:
-            x = x.permute(0, 2, 1, 3).contiguous()
-        return x
+        return _pixel_shuffle(x, scale_factor, self.ps_version)
 
     def extract_feature(self, pixel_values: "torch.Tensor | list[torch.Tensor]") -> "torch.Tensor | list[torch.Tensor]":
         """Extract vision features from pixel values through RADIO + projector.
@@ -672,7 +744,14 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
                 self.vision_model.train()
 
     def _extract_feature_dense(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        """RADIO + pixel-shuffle + projector for one dense [B, C, H, W] batch."""
+        """Encode a dense image batch, applying the final norm before pixel shuffle.
+
+        Args:
+            pixel_values: Images shaped [batch, channels, height, width].
+
+        Returns:
+            Projected features shaped [batch, image_tokens, llm_hidden_size].
+        """
         vit_embeds = self.vision_model(pixel_values).features
         vit_embeds = vit_embeds.to(dtype=torch.bfloat16)
 
@@ -683,16 +762,10 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
             patch_size = self.vision_model.radio_model.model.patch_generator.patch_size
         else:
             patch_size = self.vision_model.patch_size
-        B, _, H, W = pixel_values.shape
-        h = H // patch_size
-        w = W // patch_size
-        vit_embeds = vit_embeds.reshape(B, h, w, -1)
-        vit_embeds = self.pixel_shuffle(vit_embeds, scale_factor=self.downsample_ratio)
-        vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], -1, vit_embeds.shape[-1])
-
-        vit_embeds = self.vision_projector(vit_embeds)
-
-        return vit_embeds
+        _, _, H, W = pixel_values.shape
+        return self.vision_projector(
+            vit_embeds, patch_grid_shapes=[(H // patch_size, W // patch_size)], ps_version=self.ps_version
+        )
 
     def extract_feature_dynamic(
         self,
@@ -766,13 +839,12 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         if was_training:
             self.vision_model.train()
 
-        # Concatenate per-image features along the sequence dim so
-        # `_pixel_shuffle_dynamic_res` can split-and-shuffle them per image.
         vit_embeds = torch.cat(per_image_feats, dim=-2)
-        vit_embeds = self._pixel_shuffle_dynamic_res(vit_embeds, imgs_sizes_list)
-        vit_embeds = self.vision_projector(vit_embeds)
-
-        return vit_embeds
+        return self.vision_projector(
+            vit_embeds,
+            patch_grid_shapes=[(h // self.patch_size, w // self.patch_size) for h, w in imgs_sizes_list],
+            ps_version=self.ps_version,
+        )
 
     def _pixel_shuffle_dynamic_res(self, x: torch.Tensor, imgs_sizes: list[tuple[int, int]]) -> torch.Tensor:
         """Per-image pixel-shuffle for dynamic-resolution outputs.
@@ -829,13 +901,9 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
 
         vit_embeds = vit_embeds.to(dtype=torch.bfloat16)
         patch_size = pg.patch_size
-        h = H // patch_size
-        w = W // patch_size
-        vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], h, w, -1)
-        vit_embeds = self.pixel_shuffle(vit_embeds, scale_factor=self.downsample_ratio)
-        vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], -1, vit_embeds.shape[-1])
-        vit_embeds = self.vision_projector(vit_embeds)
-        return vit_embeds
+        return self.vision_projector(
+            vit_embeds, patch_grid_shapes=[(H // patch_size, W // patch_size)], ps_version=self.ps_version
+        )
 
     def extract_sound_feature(
         self,

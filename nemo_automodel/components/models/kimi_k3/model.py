@@ -1102,8 +1102,9 @@ class KimiK3MoE(MoE):
             self.gate = KimiK3Gate(moe_config, gate_precision=torch.float32)
         if backend.compile_situ:
             _compile_situ_cores()
-        if getattr(config, "situ_triton", False):
-            _enable_situ_triton()
+        situ_backend = getattr(config, "situ_backend", "torch")
+        if situ_backend != "torch":
+            _enable_situ_triton(fast_math=situ_backend == "triton_fast_math")
         if backend.compile_norm:
             _compile_norm_core()
         expert_activation = partial(
