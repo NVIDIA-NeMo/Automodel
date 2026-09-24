@@ -15,7 +15,8 @@ Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com
 From the repository root, run:
 
 ```bash
-uv run automodel --nproc-per-node=8 examples/llm_finetune/devstral/devstral2_small_2512_squad.yaml
+uv run automodel examples/llm_finetune/mistral/ministral3_3b_squad.yaml \
+  --nproc-per-node 8
 ```
 
 ## Model Reference

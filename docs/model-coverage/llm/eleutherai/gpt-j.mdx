@@ -1,21 +1,14 @@
 ---
 title: "gpt-j-6b"
-description: "Use gpt-j-6b with NeMo AutoModel for language model fine-tuning, with documented checkpoints, a runnable starting command, setup guidance, and model reference details."
+description: "Reference gpt-j-6b checkpoint and architecture details for NeMo AutoModel, with model-family information, setup guidance, and upstream resources."
 slug: model-coverage/large-language-models/eleutherai/gpt-j-6b
 ---
 
 [GPT-J](https://github.com/kingoflolz/mesh-transformer-jax) is a 6B parameter transformer language model trained by EleutherAI on the Pile dataset. It was one of the earliest large open-weight models.
 
-Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
-
-## Fine-Tune gpt-j-6b
-
-From the repository root, run:
-
-```bash
-uv run automodel --nproc-per-node=8 examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
-  --model.pretrained_model_name_or_path "EleutherAI/gpt-j-6b"
-```
+Use this page as a checkpoint and architecture reference. Set up NeMo AutoModel with the
+[latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the
+[installation instructions](/get-started/installation).
 
 ## Model Reference
 

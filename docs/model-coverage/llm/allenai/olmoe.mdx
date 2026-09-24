@@ -1,21 +1,14 @@
 ---
 title: "OLMoE-1B-7B-0924"
-description: "Use OLMoE-1B-7B-0924 with NeMo AutoModel for language model fine-tuning, with documented checkpoints, a runnable starting command, setup, and model reference details."
+description: "Reference OLMoE-1B-7B-0924 checkpoint and architecture details for NeMo AutoModel, with model-family information, setup guidance, and upstream resources."
 slug: model-coverage/large-language-models/allenai/OLMoE-1B-7B-0924
 ---
 
 [OLMoE](https://allenai.org/olmo) is Allen AI's open Mixture-of-Experts language model. It activates 1B parameters per token from a 7B total parameter pool.
 
-Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
-
-## Fine-Tune OLMoE-1B-7B-0924
-
-From the repository root, run:
-
-```bash
-uv run automodel --nproc-per-node=8 examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
-  --model.pretrained_model_name_or_path "allenai/OLMoE-1B-7B-0924"
-```
+Use this page as a checkpoint and architecture reference. Set up NeMo AutoModel with the
+[latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the
+[installation instructions](/get-started/installation).
 
 ## Model Reference
 

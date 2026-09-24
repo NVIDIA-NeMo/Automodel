@@ -1,21 +1,14 @@
 ---
 title: "EXAONE-3.0-7.8B-Instruct"
-description: "Use EXAONE-3.0-7.8B-Instruct with NeMo AutoModel for language model fine-tuning, including checkpoints, a runnable starting command, setup, and reference details."
+description: "Reference EXAONE-3.0-7.8B-Instruct checkpoint and architecture details for NeMo AutoModel, with model-family information, setup guidance, and upstream resources."
 slug: model-coverage/large-language-models/lgai-exaone/EXAONE-3.0-7.8B-Instruct
 ---
 
 EXAONE is a bilingual (Korean-English) language model series from LG AI Research, with strong performance on Korean-language benchmarks.
 
-Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
-
-## Fine-Tune EXAONE-3.0-7.8B-Instruct
-
-From the repository root, run:
-
-```bash
-uv run automodel --nproc-per-node=8 examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
-  --model.pretrained_model_name_or_path "LGAI-EXAONE/EXAONE-3.0-7.8B-Instruct"
-```
+Use this page as a checkpoint and architecture reference. Set up NeMo AutoModel with the
+[latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the
+[installation instructions](/get-started/installation).
 
 ## Model Reference
 

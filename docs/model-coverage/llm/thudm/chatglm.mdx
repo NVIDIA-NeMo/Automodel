@@ -1,21 +1,14 @@
 ---
 title: "chatglm3-6b"
-description: "Use chatglm3-6b with NeMo AutoModel for language model fine-tuning, with documented checkpoints, a runnable starting command, setup guidance, and model reference details."
+description: "Reference chatglm3-6b checkpoint and architecture details for NeMo AutoModel, with model-family information, setup guidance, and upstream resources."
 slug: model-coverage/large-language-models/thudm/chatglm3-6b
 ---
 
 [ChatGLM](https://github.com/zai-org/ChatGLM-6B) is a bilingual (Chinese-English) conversational language model from Zhipu AI. ChatGLM2 and ChatGLM3 extend the original with improved performance, longer context, and more efficient attention.
 
-Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
-
-## Fine-Tune chatglm3-6b
-
-From the repository root, run:
-
-```bash
-uv run automodel --nproc-per-node=8 examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
-  --model.pretrained_model_name_or_path "zai-org/chatglm3-6b"
-```
+Use this page as a checkpoint and architecture reference. Set up NeMo AutoModel with the
+[latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the
+[installation instructions](/get-started/installation).
 
 ## Model Reference
 

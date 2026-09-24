@@ -1,21 +1,14 @@
 ---
 title: "granite-3.0-1b-a400m-base"
-description: "Use granite-3.0-1b-a400m-base with NeMo AutoModel for language model fine-tuning, including checkpoints, a runnable starting command, setup, and reference details."
+description: "Reference granite-3.0-1b-a400m-base checkpoint and architecture details for NeMo AutoModel, with model-family information, setup guidance, and upstream resources."
 slug: model-coverage/large-language-models/ibm/granite-3.0-1b-a400m-base
 ---
 
 IBM Granite MoE models extend the Granite architecture with Mixture-of-Experts layers for more efficient scaling. PowerMoE (IBM Research) also uses this architecture.
 
-Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
-
-## Fine-Tune granite-3.0-1b-a400m-base
-
-From the repository root, run:
-
-```bash
-uv run automodel --nproc-per-node=8 examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
-  --model.pretrained_model_name_or_path "ibm-granite/granite-3.0-1b-a400m-base"
-```
+Use this page as a checkpoint and architecture reference. Set up NeMo AutoModel with the
+[latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the
+[installation instructions](/get-started/installation).
 
 ## Model Reference
 

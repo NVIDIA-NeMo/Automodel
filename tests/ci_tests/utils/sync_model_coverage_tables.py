@@ -441,19 +441,21 @@ def _load_model_releases(repo_root: Path, model_docs: dict[str, list[_ModelDoc]]
 
 def _strip_automodel_route_prefix(route: str) -> str:
     for prefix in ("/nemo/automodel/nightly", "/nemo/automodel"):
-        if route.startswith(prefix):
-            return route.removeprefix(prefix)
+        if route.casefold().startswith(prefix.casefold()):
+            return route[len(prefix) :]
     return route
 
 
 def _resolve_redirect(source: str, redirects: dict[str, str]) -> str:
     route = f"/nemo/automodel{source}"
     visited = set()
-    while route in redirects:
-        if route in visited:
+    route_key = route.casefold()
+    while route_key in redirects:
+        if route_key in visited:
             raise ValueError(f"Model-card redirect cycle starts at {source}")
-        visited.add(route)
-        route = redirects[route]
+        visited.add(route_key)
+        route = redirects[route_key]
+        route_key = route.casefold()
     return _strip_automodel_route_prefix(route)
 
 
@@ -467,11 +469,43 @@ def _resolve_model_card_routes(
     docs_config_path = repo_root / "docs" / "fern" / "docs.yml"
     try:
         docs_config = yaml.safe_load(docs_config_path.read_text(encoding="utf-8"))
-        redirects = {redirect["source"]: redirect["destination"] for redirect in docs_config["redirects"]}
+        redirect_entries = docs_config["redirects"]
+        redirects: dict[str, str] = {}
+        redirect_sources: dict[str, str] = {}
+        for redirect in redirect_entries:
+            source = redirect["source"]
+            destination = redirect["destination"]
+            source_key = source.casefold()
+            previous_source = redirect_sources.get(source_key)
+            if previous_source is not None:
+                raise ValueError(
+                    f"Fern redirects contain case-insensitive duplicate sources: {previous_source} and {source}"
+                )
+            redirect_sources[source_key] = source
+            redirects[source_key] = destination
     except (OSError, KeyError, TypeError, yaml.YAMLError) as error:
         raise ValueError(f"Could not load Fern redirects from {docs_config_path}: {error}") from error
 
-    card_routes = {model.docs_page for model in documented_models}
+    card_routes_by_key: dict[str, str] = {}
+    for model in documented_models:
+        route_key = model.docs_page.casefold()
+        previous_route = card_routes_by_key.get(route_key)
+        if previous_route is not None and previous_route != model.docs_page:
+            raise ValueError(f"Model-card routes collide case-insensitively: {previous_route} and {model.docs_page}")
+        card_routes_by_key[route_key] = model.docs_page
+
+    canonical_sources = {
+        f"{prefix}{route}".casefold()
+        for route in card_routes_by_key.values()
+        for prefix in ("/nemo/automodel", "/nemo/automodel/nightly")
+    }
+    colliding_sources = sorted(redirect_sources[source] for source in canonical_sources & redirects.keys())
+    if colliding_sources:
+        raise ValueError(
+            "Fern redirect sources collide case-insensitively with canonical model-card routes: "
+            + ", ".join(colliding_sources)
+        )
+
     provider_routes_by_owner: dict[str, set[str]] = {}
     for hf_model_id, docs in model_docs.items():
         owner = hf_model_id.split("/", 1)[0].casefold()
@@ -490,9 +524,10 @@ def _resolve_model_card_routes(
 
         def card_destinations(routes: set[str]) -> set[str]:
             return {
-                destination
+                card_routes_by_key[destination.casefold()]
                 for provider_route in routes
-                if (destination := _resolve_redirect(f"{provider_route}/{model_name}", redirects)) in card_routes
+                if (destination := _resolve_redirect(f"{provider_route}/{model_name}", redirects)).casefold()
+                in card_routes_by_key
             }
 
         destinations = card_destinations(preferred_routes)

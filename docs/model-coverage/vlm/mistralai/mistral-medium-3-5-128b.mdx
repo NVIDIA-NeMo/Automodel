@@ -9,11 +9,8 @@ The Hugging Face configuration declares the `Mistral3ForConditionalGeneration` a
 
 ## Fine-Tune Mistral-Medium-3.5-128B
 
-Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
-
-```bash
-uv run automodel <recipe-path>
-```
+Follow the [installation instructions](/get-started/installation), then review the checked-in recipe and
+its declared topology below before choosing a local or cluster launcher.
 
 Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node run.
 
@@ -41,6 +38,7 @@ Start with the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/b
 | --- | --- |
 | Task | Image-text-to-text |
 | Architecture | `Mistral3ForConditionalGeneration` |
+| NeMo AutoModel FP8 Architecture | `Mistral3FP8VLMForConditionalGeneration` |
 
 ### Available Models
 

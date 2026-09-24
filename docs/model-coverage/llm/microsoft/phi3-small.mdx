@@ -1,21 +1,14 @@
 ---
 title: "Phi-3-small-8k-instruct"
-description: "Use Phi-3-small-8k-instruct with NeMo AutoModel for language model fine-tuning, including checkpoints, a runnable starting command, setup, and reference details."
+description: "Reference Phi-3-small-8k-instruct checkpoint and architecture details for NeMo AutoModel, with model-family information, setup guidance, and upstream resources."
 slug: model-coverage/large-language-models/microsoft/Phi-3-small-8k-instruct
 ---
 
 [Phi-3-Small](https://azure.microsoft.com/en-us/products/phi) is Microsoft's 7B model using a distinct `Phi3SmallForCausalLM` architecture with blocksparse attention, separate from the standard Phi-3 family.
 
-Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
-
-## Fine-Tune Phi-3-small-8k-instruct
-
-From the repository root, run:
-
-```bash
-uv run automodel --nproc-per-node=8 examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
-  --model.pretrained_model_name_or_path "microsoft/Phi-3-small-8k-instruct"
-```
+Use this page as a checkpoint and architecture reference. Set up NeMo AutoModel with the
+[latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the
+[installation instructions](/get-started/installation).
 
 ## Model Reference
 

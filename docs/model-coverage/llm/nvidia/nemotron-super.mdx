@@ -1,21 +1,14 @@
 ---
 title: "Llama-3_3-Nemotron-Super-49B-v1"
-description: "Use Llama-3_3-Nemotron-Super-49B-v1 with NeMo AutoModel for language model fine-tuning, including checkpoints, a runnable starting command, setup, and reference details."
+description: "Reference Llama-3_3-Nemotron-Super-49B-v1 checkpoint and architecture details for NeMo AutoModel, with model-family information, setup guidance, and upstream resources."
 slug: model-coverage/large-language-models/nvidia/Llama-3_3-Nemotron-Super-49B-v1
 ---
 
 [Llama-3.3-Nemotron-Super-49B-v1](https://huggingface.co/nvidia/Llama-3_3-Nemotron-Super-49B-v1) is a NVIDIA model derived from Llama-3.1-70B through Neural Architecture Search (NAS)-based pruning and knowledge distillation, resulting in a 49B model with strong reasoning capabilities. It uses the `DeciLMForCausalLM` architecture.
 
-Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
-
-## Fine-Tune Llama-3_3-Nemotron-Super-49B-v1
-
-From the repository root, run:
-
-```bash
-uv run automodel --nproc-per-node=8 examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
-  --model.pretrained_model_name_or_path "nvidia/Llama-3_3-Nemotron-Super-49B-v1"
-```
+Use this page as a checkpoint and architecture reference. Set up NeMo AutoModel with the
+[latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the
+[installation instructions](/get-started/installation).
 
 ## Model Reference
 

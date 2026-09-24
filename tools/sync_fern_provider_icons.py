@@ -1,12 +1,25 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 #!/usr/bin/env python3
-"""Build the embedded provider-logo sprite used by Fern navigation."""
+"""Build compact embedded provider logos used by Fern navigation."""
 
 from __future__ import annotations
 
 import argparse
 import base64
 import io
-import math
 import re
 import sys
 import tempfile
@@ -71,8 +84,8 @@ PROVIDER_ORGS = {
 
 AVATAR_PATTERN = re.compile(rb"cdn-avatars\.huggingface\.co/[^\"&]+")
 USER_AGENT = "nemo-automodel-docs/1.0"
-SPRITE_COLUMNS = 12
-SPRITE_CELL_SIZE = 20
+ICON_SIZE = 20
+MAX_TOTAL_ENCODED_BYTES = 256 * 1024
 DATA_URI_PATTERN = re.compile(r'href="data:image/webp;base64,([A-Za-z0-9+/=]+)"')
 
 
@@ -95,48 +108,29 @@ def _fetch_avatar(org: str) -> bytes:
     if not (source.startswith(b"RIFF") and source[8:12] == b"WEBP"):
         raise RuntimeError(f"Hugging Face did not return WebP for {org}")
 
-    output = io.BytesIO()
-    with Image.open(io.BytesIO(source)) as image:
-        image.seek(0)
-        image.save(output, format="PNG", optimize=True)
-    return output.getvalue()
+    return source
 
 
-def _build_sprite(images: dict[str, bytes]) -> bytes:
-    providers = sorted(PROVIDER_ORGS)
-    rows = math.ceil(len(providers) / SPRITE_COLUMNS)
-    sprite = Image.new(
-        "RGBA",
-        (SPRITE_COLUMNS * SPRITE_CELL_SIZE, rows * SPRITE_CELL_SIZE),
-        (0, 0, 0, 0),
-    )
-    for index, provider in enumerate(providers):
+def _build_icons(images: dict[str, bytes]) -> dict[str, bytes]:
+    icons = {}
+    for provider in sorted(PROVIDER_ORGS):
         with Image.open(io.BytesIO(images[provider])) as source:
             logo = source.convert("RGBA")
-            logo.thumbnail((SPRITE_CELL_SIZE, SPRITE_CELL_SIZE), Image.Resampling.LANCZOS)
-        column = index % SPRITE_COLUMNS
-        row = index // SPRITE_COLUMNS
-        x = column * SPRITE_CELL_SIZE + (SPRITE_CELL_SIZE - logo.width) // 2
-        y = row * SPRITE_CELL_SIZE + (SPRITE_CELL_SIZE - logo.height) // 2
-        sprite.alpha_composite(logo, (x, y))
+            logo.thumbnail((ICON_SIZE, ICON_SIZE), Image.Resampling.LANCZOS)
+        icon = Image.new("RGBA", (ICON_SIZE, ICON_SIZE), (0, 0, 0, 0))
+        x = (ICON_SIZE - logo.width) // 2
+        y = (ICON_SIZE - logo.height) // 2
+        icon.alpha_composite(logo, (x, y))
+        output = io.BytesIO()
+        icon.save(output, format="WEBP", lossless=True, method=6)
+        icons[provider] = output.getvalue()
+    return icons
 
-    output = io.BytesIO()
-    sprite.save(output, format="WEBP", lossless=True, method=6)
-    return output.getvalue()
 
-
-def _render_icon(provider: str, encoded: str) -> str:
-    providers = sorted(PROVIDER_ORGS)
-    index = providers.index(provider)
-    column = index % SPRITE_COLUMNS
-    row = index // SPRITE_COLUMNS
-    width = SPRITE_COLUMNS * SPRITE_CELL_SIZE
-    height = math.ceil(len(providers) / SPRITE_COLUMNS) * SPRITE_CELL_SIZE
+def _render_icon(encoded: str) -> str:
     return (
-        f'<svg xmlns="http://www.w3.org/2000/svg" '
-        f'viewBox="{column * SPRITE_CELL_SIZE} {row * SPRITE_CELL_SIZE} '
-        f'{SPRITE_CELL_SIZE} {SPRITE_CELL_SIZE}">'
-        f'<image width="{width}" height="{height}" '
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {ICON_SIZE} {ICON_SIZE}">'
+        f'<image width="{ICON_SIZE}" height="{ICON_SIZE}" '
         f'href="data:image/webp;base64,{encoded}"/></svg>'
     )
 
@@ -155,9 +149,8 @@ def _navigation_icons(navigation_path: Path) -> list[tuple[str, str]]:
     return icons
 
 
-def _update_navigation(navigation_path: Path, sprite: bytes) -> int:
+def _update_navigation(navigation_path: Path, icons: dict[str, bytes]) -> int:
     lines = navigation_path.read_text(encoding="utf-8").splitlines()
-    encoded = base64.b64encode(sprite).decode("ascii")
     updated = 0
     for index, line in enumerate(lines[:-1]):
         next_line = lines[index + 1].strip()
@@ -167,7 +160,8 @@ def _update_navigation(navigation_path: Path, sprite: bytes) -> int:
         if provider not in PROVIDER_ORGS:
             continue
         indent = line[: len(line) - len(line.lstrip())]
-        lines[index] = f"{indent}icon: '{_render_icon(provider, encoded)}'"
+        encoded = base64.b64encode(icons[provider]).decode("ascii")
+        lines[index] = f"{indent}icon: '{_render_icon(encoded)}'"
         updated += 1
     if updated == 0:
         raise RuntimeError(f"No provider icon entries found in {navigation_path}")
@@ -190,30 +184,28 @@ def _check(navigation_path: Path, legacy_dir: Path, legacy_sprite: Path) -> list
     if providers != set(PROVIDER_ORGS):
         missing = sorted(set(PROVIDER_ORGS) - providers)
         problems.append(f"provider icons missing from {navigation_path}: {missing}")
-    encoded_sprites = set()
+    total_encoded_bytes = 0
     for provider, icon in icons:
         match = DATA_URI_PATTERN.search(icon)
         if match is None:
-            problems.append(f"{provider}: icon does not embed the provider sprite")
+            problems.append(f"{provider}: icon does not embed a WebP provider logo")
             continue
-        encoded_sprites.add(match.group(1))
-        expected_view_box = _render_icon(provider, match.group(1)).split('viewBox="', 1)[1].split('"', 1)[0]
-        if f'viewBox="{expected_view_box}"' not in icon:
-            problems.append(f"{provider}: incorrect sprite view box")
-    if len(encoded_sprites) != 1:
-        problems.append(f"expected one shared base64 sprite, found {len(encoded_sprites)}")
-    else:
+        encoded = match.group(1)
+        total_encoded_bytes += len(encoded)
+        if f'viewBox="0 0 {ICON_SIZE} {ICON_SIZE}"' not in icon:
+            problems.append(f"{provider}: incorrect icon view box")
         try:
-            sprite = base64.b64decode(next(iter(encoded_sprites)), validate=True)
-            with Image.open(io.BytesIO(sprite)) as image:
-                expected_rows = math.ceil(len(PROVIDER_ORGS) / SPRITE_COLUMNS)
-                expected_size = (SPRITE_COLUMNS * SPRITE_CELL_SIZE, expected_rows * SPRITE_CELL_SIZE)
+            provider_icon = base64.b64decode(encoded, validate=True)
+            with Image.open(io.BytesIO(provider_icon)) as image:
+                expected_size = (ICON_SIZE, ICON_SIZE)
                 if image.format != "WEBP" or image.size != expected_size:
-                    problems.append(
-                        f"invalid embedded sprite: expected WEBP {expected_size}, got {image.format} {image.size}"
-                    )
+                    problems.append(f"{provider}: expected WEBP {expected_size}, got {image.format} {image.size}")
         except (ValueError, OSError) as exc:
-            problems.append(f"invalid base64 sprite: {exc}")
+            problems.append(f"{provider}: invalid base64 WebP: {exc}")
+    if total_encoded_bytes > MAX_TOTAL_ENCODED_BYTES:
+        problems.append(
+            f"provider icon payload is {total_encoded_bytes} bytes; expected at most {MAX_TOTAL_ENCODED_BYTES}"
+        )
     legacy_icons = sorted(legacy_dir.glob("*.png")) if legacy_dir.is_dir() else []
     if legacy_icons:
         problems.append(f"legacy provider icons remain in {legacy_dir}")
@@ -246,7 +238,7 @@ def main() -> int:
         if problems:
             print("\n".join(problems), file=sys.stderr)
             return 1
-        print(f"Checked one embedded sprite for {len(PROVIDER_ORGS)} providers")
+        print(f"Checked {len(PROVIDER_ORGS)} compact embedded provider icons")
         return 0
 
     images = {}
@@ -259,7 +251,7 @@ def main() -> int:
                 raise FileNotFoundError(source)
             images[provider] = source.read_bytes()
 
-    updated = _update_navigation(args.navigation, _build_sprite(images))
+    updated = _update_navigation(args.navigation, _build_icons(images))
     print(f"Updated {updated} provider icons in {args.navigation.relative_to(repo_root)}")
     return 0
 

@@ -1,21 +1,14 @@
 ---
 title: "OLMo-1B-hf"
-description: "Use OLMo-1B-hf with NeMo AutoModel for language model fine-tuning, with documented checkpoints, a runnable starting command, setup guidance, and model reference details."
+description: "Reference OLMo-1B-hf checkpoint and architecture details for NeMo AutoModel, with model-family information, setup guidance, and upstream resources."
 slug: model-coverage/large-language-models/allenai/OLMo-1B-hf
 ---
 
 [OLMo](https://allenai.org/olmo) (Open Language Model) is Allen AI's fully open language model - open weights, open training data, and open training code. OLMo-1B and OLMo-7B are trained on Dolma.
 
-Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
-
-## Fine-Tune OLMo-1B-hf
-
-From the repository root, run:
-
-```bash
-uv run automodel --nproc-per-node=8 examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
-  --model.pretrained_model_name_or_path "allenai/OLMo-1B-hf"
-```
+Use this page as a checkpoint and architecture reference. Set up NeMo AutoModel with the
+[latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the
+[installation instructions](/get-started/installation).
 
 ## Model Reference
 

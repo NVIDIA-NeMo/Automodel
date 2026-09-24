@@ -1,73 +1,40 @@
 ---
-title: "gemma-4-12B"
-description: "Use gemma-4-12B with NeMo AutoModel for vision-language fine-tuning, with documented checkpoints, runnable recipes, setup guidance, and model reference details."
-slug: model-coverage/vision-language-models/google/gemma-4-12B
+title: "gemma-4-31B-it"
+description: "Fine-tune gemma-4-31B-it for image-text tasks with NeMo AutoModel using checked-in full-parameter, LoRA, tensor-parallel, and pipeline-parallel recipes."
+slug: model-coverage/vision-language-models/google/gemma-4-31B-it
 ---
 
-[Gemma 4](https://ai.google.dev/gemma) is Google's next-generation multimodal Gemma family, supporting image-text inputs with a Mixture-of-Experts (MoE) language backbone at larger scales. NeMo AutoModel replaces the HF-native dense matmul over experts with the NeMo `GroupedExperts` backend, enabling Expert Parallelism (EP) through the standard MoE parallelizer.
+[gemma-4-31B-it](https://huggingface.co/google/gemma-4-31B-it) is a multimodal Gemma 4 checkpoint for image-text inputs. NeMo AutoModel provides full-parameter and Low-Rank Adaptation (LoRA) recipes, including tensor-parallel and pipeline-parallel variants.
 
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
-## Fine-Tune gemma-4-12B
+## Fine-Tune gemma-4-31B-it
 
-From the repository root, run:
+From the repository root, run the 8-GPU recipe:
 
 ```bash
-uv run automodel --nproc-per-node=8 examples/vlm_finetune/gemma4/gemma4_4b.yaml
+uv run automodel examples/vlm_finetune/gemma4/gemma4_31b.yaml --nproc-per-node 8
 ```
 
 ## Choose a Workflow
 
 | Goal | Start Here |
 | --- | --- |
-| Supervised fine-tuning (SFT) - Gemma 4 12B on HellaSwag | Use [gemma_4_12b_hellaswag.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gemma/gemma_4_12b_hellaswag.yaml). |
-| Supervised fine-tuning (SFT) - Gemma 4 E2B on MedPix | Use [gemma4_2b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_2b.yaml). |
-| Low-rank adaptation (LoRA) - Gemma 4 E2B on MedPix | Use [gemma4_2b_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_2b_peft.yaml). |
-| Supervised fine-tuning (SFT) - Gemma 4 E4B on MedPix | Use [gemma4_4b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_4b.yaml). |
-| Low-rank adaptation (LoRA) - Gemma 4 E4B on MedPix | Use [gemma4_4b_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_4b_peft.yaml). |
-| Supervised fine-tuning (SFT) - Gemma 4 31B on MedPix | Use [gemma4_31b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_31b.yaml). |
-| Low-rank adaptation (LoRA) - Gemma 4 31B on MedPix | Use [gemma4_31b_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_31b_peft.yaml). |
-| Supervised fine-tuning (SFT) - Gemma 4 31B with TP=4 | Use [gemma4_31b_tp4.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_31b_tp4.yaml). |
-| Supervised fine-tuning (SFT) - Gemma 4 31B with TP=4, PP=2 | Use [gemma4_31b_tp4_pp2.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_31b_tp4_pp2.yaml). |
-| Supervised fine-tuning (SFT) - Gemma 4 31B with TP=4, PP=4 (multi-node) | Use [gemma4_31b_tp4_pp4.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_31b_tp4_pp4.yaml). |
-| Supervised fine-tuning (SFT) - Gemma 4 26B-A4B MoE on MedPix | Use [gemma4_26b_a4b_moe.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_26b_a4b_moe.yaml). |
-| Low-rank adaptation (LoRA) - Gemma 4 26B-A4B MoE on MedPix | Use [gemma4_26b_a4b_moe_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_26b_a4b_moe_peft.yaml). |
+| Fine-tune on MedPix-VQA | Use [gemma4_31b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_31b.yaml). |
+| Fine-tune with LoRA | Use [gemma4_31b_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_31b_peft.yaml). |
+| Fine-tune with tensor parallelism | Use [gemma4_31b_tp4.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_31b_tp4.yaml). |
+| Fine-tune with tensor and pipeline parallelism | Use [gemma4_31b_tp4_pp2.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_31b_tp4_pp2.yaml) or the [multi-node PP4 recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_31b_tp4_pp4.yaml). |
 
 ## Model Reference
 
-### Model Summary
+### Model Architecture
 
 | Property | Value |
 | --- | --- |
-| Task | Image-Text-to-Text |
-| Architecture | `Gemma4UnifiedForConditionalGeneration`, `Gemma4ForConditionalGeneration` |
-| Parameters | 2B - 31B (dense) / 26B-A4B (MoE) |
-| Hugging Face Organization | [google](https://huggingface.co/google) |
-
-### Available Models
-
-- **Gemma 4 12B** (unified multimodal)
-- **Gemma 4 E2B IT** (VL, dense, kv-shared layers)
-- **Gemma 4 E4B IT** (VL, dense, kv-shared layers), **Gemma 4 E4B IT Assistant** (Assistant/drafter model for MTP)
-- **Gemma 4 31B IT** (VL, dense)
-- **Gemma 4 26B-A4B IT** (VL, MoE)
-
-### Model Architecture
-
-- `Gemma4UnifiedForConditionalGeneration` - unified 12B model
-- `Gemma4ForConditionalGeneration`
-- `Gemma4AssistantForCausalLM` (MTP drafter / assistant head for speculative decoding; co-trainable with the target Gemma 4 base using `Gemma4WithDrafter`)
-
-### Available Checkpoints
-
-| Model | HF ID |
-|---|---|
-| Gemma 4 12B | [`google/gemma-4-12B`](https://huggingface.co/google/gemma-4-12B) |
-| Gemma 4 E2B IT | [`google/gemma-4-E2B-it`](https://huggingface.co/google/gemma-4-E2B-it) |
-| Gemma 4 E4B IT | [`google/gemma-4-E4B-it`](https://huggingface.co/google/gemma-4-E4B-it) |
-| Gemma 4 31B IT | [`google/gemma-4-31B-it`](https://huggingface.co/google/gemma-4-31B-it) |
-| Gemma 4 26B-A4B IT (MoE) | [`google/gemma-4-26B-A4B-it`](https://huggingface.co/google/gemma-4-26B-A4B-it) |
+| Task | Image-text-to-text |
+| Hugging Face Architecture | `Gemma4ForConditionalGeneration` |
+| Checkpoint | [`google/gemma-4-31B-it`](https://huggingface.co/google/gemma-4-31B-it) |
 
 ## Related Resources
 
-- [VLM Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n)
+- [Gemma 4 Fine-Tuning Guide](/recipes-e2e-examples/gemma-4)

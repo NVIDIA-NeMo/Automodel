@@ -1,21 +1,14 @@
 ---
 title: "GritLM-7B-vllm"
-description: "Use GritLM-7B-vllm with NeMo AutoModel for language model fine-tuning, with documented checkpoints, a runnable starting command, setup, and model reference details."
+description: "Reference GritLM-7B-vllm checkpoint and architecture details for NeMo AutoModel, with model-family information, setup guidance, and upstream resources."
 slug: model-coverage/large-language-models/parasail-ai/GritLM-7B-vllm
 ---
 
 [GritLM](https://github.com/ContextualAI/gritlm) (Generative Representational Instruction Tuning) is a unified model that performs both generative language modeling and text embedding in a single model, from Parasail AI.
 
-Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
-
-## Fine-Tune GritLM-7B-vllm
-
-From the repository root, run:
-
-```bash
-uv run automodel --nproc-per-node=8 examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
-  --model.pretrained_model_name_or_path "parasail-ai/GritLM-7B-vllm"
-```
+Use this page as a checkpoint and architecture reference. Set up NeMo AutoModel with the
+[latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the
+[installation instructions](/get-started/installation).
 
 ## Model Reference
 

@@ -104,7 +104,6 @@ pip install transformer-engine[pytorch]==2.8.0
 # Flash-attn version should be selected to satisfy TE requirements
 # https://github.com/NVIDIA/TransformerEngine/blob/v2.4/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
 pip install flash-attn==2.7.4.post1
-pip install grouped_gemm
 ```
 
 ## Development Dependencies

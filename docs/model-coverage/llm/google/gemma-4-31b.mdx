@@ -1,6 +1,6 @@
 ---
 title: "gemma-4-31B"
-description: "Use NeMo AutoModel to fine-tune Gemma-4-31B for LLM workflows with checked-in text generation recipes and documented distributed settings."
+description: "Fine-tune gemma-4-31B for text generation with NeMo AutoModel using checked-in recipes and documented distributed settings."
 slug: model-coverage/large-language-models/google/gemma-4-31B
 ---
 
@@ -9,11 +9,8 @@ The Hugging Face configuration declares the `Gemma4ForConditionalGeneration` arc
 
 ## Fine-Tune Gemma-4-31B
 
-Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
-
-```bash
-uv run automodel <recipe-path>
-```
+Follow the [installation instructions](/get-started/installation), then review the checked-in recipe and
+its declared topology below before choosing a local or cluster launcher.
 
 Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node run.
 

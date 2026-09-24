@@ -343,3 +343,16 @@ def test_to_hf_still_emits_legacy_radio_keys_for_native_radio(native_adapter):
         "vision_model.radio_model.model.blocks.0.attn.proj.weight",
     }
     assert out["vision_model.radio_model.model.blocks.0.attn.qkv.weight"].shape == (9, 4)
+
+
+def test_super35_final_vision_norm_roundtrip(adapter):
+    """Preserve both affine tensors under their original HF checkpoint names."""
+    hf = {
+        "vision_projector.vision_final_layernorm.weight": torch.randn(8),
+        "vision_projector.vision_final_layernorm.bias": torch.randn(8),
+    }
+    converted = adapter.from_hf(dict(hf))
+    restored = adapter.to_hf(dict(converted))
+    assert set(converted) == set(hf) == set(restored)
+    for key in hf:
+        assert torch.equal(restored[key], hf[key])

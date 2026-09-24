@@ -33,6 +33,7 @@ from tests.ci_tests.utils.sync_model_coverage_tables import (
     SUPPORT_LOG_START_MARKER,
     TABLE_ROW_COUNT,
     _generate_tables,
+    _iter_pretrained_model_ids,
     _load_model_doc_catalog,
     _load_model_docs,
     _load_model_releases,
@@ -48,7 +49,7 @@ from tests.ci_tests.utils.sync_model_coverage_tables import (
     _validate_dated_support_tables_are_generated,
     _validate_generated_tables_are_not_committed,
 )
-from tools.sync_fern_provider_icons import PROVIDER_ORGS
+from tools.sync_fern_provider_icons import MAX_TOTAL_ENCODED_BYTES, PROVIDER_ORGS
 
 # Over the default 5s budget on purpose: this module drives git through subprocesses over throwaway repositories.
 # Shrink the work or the process count before raising this further.
@@ -143,6 +144,15 @@ def _frontmatter_slug(path: Path) -> str | None:
     frontmatter = yaml.safe_load(document[4:closing]) or {}
     slug = frontmatter.get("slug")
     return str(slug).strip("/") if slug else None
+
+
+def _model_card_paths(repo_root: Path) -> list[Path]:
+    coverage_root = repo_root / "docs" / "model-coverage"
+    return sorted(
+        path
+        for path in coverage_root.rglob("*.mdx")
+        if path.name != "index.mdx" and len(path.relative_to(coverage_root).parts) == 3
+    )
 
 
 def _collect_fern_routes(
@@ -287,6 +297,52 @@ def test_recipe_model_id_can_redirect_to_one_shared_model_card(tmp_path):
     assert routes == {("org/model", "LLM"): model_doc.docs_page}
 
 
+def test_recipe_model_redirects_are_case_insensitive(tmp_path):
+    docs_config_path = tmp_path / "docs" / "fern" / "docs.yml"
+    docs_config_path.parent.mkdir(parents=True)
+    docs_config_path.write_text(
+        yaml.safe_dump(
+            {
+                "redirects": [
+                    {
+                        "source": "/nemo/automodel/model-coverage/large-language-models/org/model",
+                        "destination": "/nemo/automodel/model-coverage/large-language-models/org/Canonical-Model",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    model_doc = _ModelDoc("LLM", "/model-coverage/large-language-models/org/Canonical-Model", ())
+    release = _ModelRelease("2026-01-01", "org/Model", "https://huggingface.co/org/Model", "LLM", "recipe.yaml")
+
+    routes = _resolve_model_card_routes(tmp_path, [release], {"org/Canonical-Model": [model_doc]}, [model_doc])
+
+    assert routes == {("org/Model", "LLM"): model_doc.docs_page}
+
+
+def test_case_insensitive_redirect_cannot_shadow_a_canonical_card(tmp_path):
+    docs_config_path = tmp_path / "docs" / "fern" / "docs.yml"
+    docs_config_path.parent.mkdir(parents=True)
+    docs_config_path.write_text(
+        yaml.safe_dump(
+            {
+                "redirects": [
+                    {
+                        "source": "/nemo/automodel/model-coverage/large-language-models/org/model",
+                        "destination": "/nemo/automodel/model-coverage/large-language-models/org",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    model_doc = _ModelDoc("LLM", "/model-coverage/large-language-models/org/Model", ())
+
+    with pytest.raises(ValueError, match="collide case-insensitively with canonical model-card routes"):
+        _resolve_model_card_routes(tmp_path, [], {"org/Model": [model_doc]}, [model_doc])
+
+
 def test_recipe_model_id_without_model_card_is_rejected(tmp_path):
     docs_config_path = tmp_path / "docs" / "fern" / "docs.yml"
     docs_config_path.parent.mkdir(parents=True)
@@ -407,7 +463,8 @@ def test_model_coverage_pages_use_provider_sections_and_checkpoint_slugs():
     offenders: list[str] = []
     navigated_model_pages: list[Path] = []
     provider_slugs: set[str] = set()
-    provider_sprites: set[str] = set()
+    provider_icons: dict[str, set[str]] = {}
+    total_provider_icon_bytes = 0
     provider_models: dict[tuple[str, str], list[str]] = {}
 
     for category in (item for item in model_coverage["contents"] if "section" in item):
@@ -442,11 +499,16 @@ def test_model_coverage_pages_use_provider_sections_and_checkpoint_slugs():
             if not isinstance(icon, str):
                 offenders.append(f"{provider_slug}: missing provider icon")
             else:
-                sprite_match = re.search(r"data:image/webp;base64,([A-Za-z0-9+/=]+)", icon)
-                if sprite_match is None:
-                    offenders.append(f"{provider_slug}: provider icon does not embed the shared sprite")
+                icon_match = re.search(r"data:image/webp;base64,([A-Za-z0-9+/=]+)", icon)
+                if icon_match is None:
+                    offenders.append(f"{provider_slug}: provider icon does not embed a WebP logo")
                 else:
-                    provider_sprites.add(sprite_match.group(1))
+                    encoded = icon_match.group(1)
+                    provider_icons.setdefault(provider_slug, set()).add(encoded)
+                    total_provider_icon_bytes += len(encoded)
+                    provider_icon = base64.b64decode(encoded, validate=True)
+                    if not (provider_icon.startswith(b"RIFF") and provider_icon[8:12] == b"WEBP"):
+                        offenders.append(f"{provider_slug}: embedded provider icon is not WebP")
             provider_slugs.add(provider_slug)
             model_labels = [str(page.get("page")) for page in provider.get("contents", [])]
             provider_models[(category_slug, provider_slug)] = model_labels
@@ -512,21 +574,96 @@ def test_model_coverage_pages_use_provider_sections_and_checkpoint_slugs():
         offenders.append("nightly navigation does not contain every model card exactly once")
     if len(navigated_model_pages) != len(set(navigated_model_pages)):
         offenders.append("nightly navigation contains duplicate model cards")
-    if len(provider_sprites) != 1:
-        offenders.append(f"provider icons must share one base64 sprite, found {len(provider_sprites)}")
-    else:
-        sprite = base64.b64decode(next(iter(provider_sprites)), validate=True)
-        if not (sprite.startswith(b"RIFF") and sprite[8:12] == b"WEBP"):
-            offenders.append("embedded provider sprite is not WebP")
+    inconsistent_icons = {provider: len(icons) for provider, icons in provider_icons.items() if len(icons) != 1}
+    if inconsistent_icons:
+        offenders.append(f"providers use inconsistent icons across categories: {inconsistent_icons}")
+    if total_provider_icon_bytes > MAX_TOTAL_ENCODED_BYTES:
+        offenders.append(
+            f"provider icon payload is {total_provider_icon_bytes} bytes; expected at most {MAX_TOTAL_ENCODED_BYTES}"
+        )
     legacy_icons = list((repo_root / "docs" / "fern" / "assets" / "providers").glob("*.png"))
     if legacy_icons:
         offenders.append("individual provider icons remain alongside the embedded sprite")
     if (repo_root / "docs" / "fern" / "assets" / "provider-sprite.svg").exists():
-        offenders.append("provider sprite must be embedded in navigation rather than stored as an external asset")
+        offenders.append("provider icons must be embedded in navigation rather than stored as an external asset")
 
     assert not offenders, "Model coverage provider hierarchy violations:\n" + "\n".join(
         f"  - {offender}" for offender in offenders
     )
+
+
+def test_model_card_descriptions_meet_seo_contract():
+    repo_root = Path(__file__).parents[3]
+    offenders: list[str] = []
+
+    for path in _model_card_paths(repo_root):
+        document = path.read_text(encoding="utf-8")
+        closing = document.find("\n---\n", 4)
+        frontmatter = yaml.safe_load(document[4:closing]) or {}
+        title = str(frontmatter.get("title", ""))
+        description = str(frontmatter.get("description", ""))
+        reasons = []
+        if not 120 <= len(description) <= 170:
+            reasons.append(f"length {len(description)} is outside 120-170 characters")
+        if title not in description:
+            reasons.append(f"does not contain the exact title {title!r}")
+        if "NeMo AutoModel" not in description:
+            reasons.append("does not contain 'NeMo AutoModel'")
+        if not description.isascii():
+            reasons.append("contains non-ASCII characters")
+        if reasons:
+            offenders.append(f"{path.relative_to(repo_root)}: {', '.join(reasons)}")
+
+    assert not offenders, "Invalid model-card descriptions:\n" + "\n".join(f"  - {item}" for item in offenders)
+
+
+def test_model_card_commands_use_checked_in_recipes():
+    repo_root = Path(__file__).parents[3]
+    offenders: list[str] = []
+
+    for path in _model_card_paths(repo_root):
+        document = path.read_text(encoding="utf-8")
+        lines = document.splitlines()
+        documented_model_ids = set(
+            re.findall(
+                r"https://huggingface\.co/([A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*)",
+                document,
+            )
+        )
+        for index, line in enumerate(lines):
+            if re.search(r"(?:^|\s)(?:uv run )?(?:automodel|torchrun)\s", line) is None:
+                continue
+            command_lines = [line]
+            while command_lines[-1].rstrip().endswith("\\") and index + len(command_lines) < len(lines):
+                command_lines.append(lines[index + len(command_lines)])
+            command = "\n".join(command_lines)
+            if "<recipe-path>" in command:
+                offenders.append(f"{path.relative_to(repo_root)}: contains a recipe placeholder")
+                continue
+            if "--model.pretrained_model_name_or_path" in command:
+                offenders.append(f"{path.relative_to(repo_root)}: substitutes a checkpoint into a different recipe")
+            recipe_paths = re.findall(r"examples/[A-Za-z0-9_./-]+\.yaml", command)
+            if len(recipe_paths) != 1:
+                offenders.append(
+                    f"{path.relative_to(repo_root)}: command must reference exactly one recipe, found {recipe_paths}"
+                )
+                continue
+            recipe_path = repo_root / recipe_paths[0]
+            if not recipe_path.is_file():
+                offenders.append(f"{path.relative_to(repo_root)}: recipe does not exist: {recipe_paths[0]}")
+                continue
+            recipe = yaml.safe_load(recipe_path.read_text(encoding="utf-8"))
+            recipe_model_ids = _iter_pretrained_model_ids(recipe.get("model", {}))
+            documented_model_ids_by_case = {model_id.casefold() for model_id in documented_model_ids}
+            recipe_model_ids_by_case = {model_id.casefold() for model_id in recipe_model_ids}
+            if recipe_model_ids and documented_model_ids_by_case.isdisjoint(recipe_model_ids_by_case):
+                offenders.append(
+                    f"{path.relative_to(repo_root)}: {recipe_paths[0]} uses "
+                    f"{', '.join(sorted(recipe_model_ids))}, but the card documents "
+                    f"{', '.join(sorted(documented_model_ids)) or 'no Hugging Face model IDs'}"
+                )
+
+    assert not offenders, "Invalid model-card commands:\n" + "\n".join(f"  - {item}" for item in offenders)
 
 
 def _model_size_key(hf_model_id: str) -> tuple[str, str]:
@@ -543,6 +680,9 @@ def _model_size_key(hf_model_id: str) -> tuple[str, str]:
     normalized_stem = model_stem.casefold().replace("_", "-")
     if organization.casefold() == "meta-llama":
         normalized_stem = re.sub(r"^meta-", "", normalized_stem)
+    # These Hub IDs omit a parameter count, but both checkpoints use the same 310B-scale MiMo-V2 backbone.
+    size_aliases = {("xiaomimimo", "mimo-v2.6-flash-rl"): "mimo-v2"}
+    normalized_stem = size_aliases.get((organization.casefold(), normalized_stem), normalized_stem)
     return organization.casefold(), normalized_stem
 
 
@@ -605,8 +745,9 @@ def test_retired_model_routes_redirect_to_provider_indexes():
     docs_config = yaml.safe_load((repo_root / "docs" / "fern" / "docs.yml").read_text(encoding="utf-8"))
     redirects = docs_config["redirects"]
     sources = [redirect["source"] for redirect in redirects]
-    assert len(sources) == len(set(sources)), "Fern redirects contain duplicate sources"
-    assert all(redirect["source"] != redirect["destination"] for redirect in redirects)
+    folded_sources = [source.casefold() for source in sources]
+    assert len(folded_sources) == len(set(folded_sources)), "Fern redirects contain case-insensitive duplicate sources"
+    assert all(redirect["source"].casefold() != redirect["destination"].casefold() for redirect in redirects)
 
     config_path = repo_root / "docs" / "fern" / "versions" / "nightly.yml"
     navigation = yaml.safe_load(config_path.read_text(encoding="utf-8"))["navigation"]
@@ -637,7 +778,10 @@ def test_retired_model_routes_redirect_to_provider_indexes():
     canonical_model_sources |= {
         source.replace("/nemo/automodel/", "/nemo/automodel/nightly/", 1) for source in canonical_model_sources
     }
-    assert not canonical_model_sources.intersection(sources), "A canonical model URL must not also be a redirect source"
+    canonical_model_sources = {source.casefold() for source in canonical_model_sources}
+    assert not canonical_model_sources.intersection(folded_sources), (
+        "A canonical model URL must not also be a case-insensitive redirect source"
+    )
 
     expected_moonlight_redirects = {
         "/nemo/automodel/model-coverage/large-language-models/moonshotai/moonlight": (

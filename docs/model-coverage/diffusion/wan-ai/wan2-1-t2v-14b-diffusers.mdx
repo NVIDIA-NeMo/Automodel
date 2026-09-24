@@ -8,10 +8,13 @@ slug: model-coverage/diffusion/wan-ai/Wan2.1-T2V-14B-Diffusers
 
 ## Fine-Tune Wan2.1-T2V-14B-Diffusers
 
-Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+Follow the [installation instructions](/get-started/installation), then review the checked-in recipe and
+its declared topology below before choosing a local or cluster launcher.
 
 ```bash
-uv run automodel <recipe-path>
+uv run torchrun --nproc-per-node=8 \
+  examples/diffusion/finetune/finetune.py \
+  -c examples/diffusion/finetune/wan2_1_t2v_flow.yaml
 ```
 
 ## Standard Recipe Configuration

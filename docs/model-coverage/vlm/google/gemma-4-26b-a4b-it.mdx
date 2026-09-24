@@ -1,6 +1,6 @@
 ---
 title: "gemma-4-26B-A4B-it"
-description: "Use NeMo AutoModel to fine-tune Gemma-4-26B-A4B-it for VLM workflows with checked-in image-text-to-text recipes and documented distributed settings."
+description: "Fine-tune gemma-4-26B-A4B-it for image-text-to-text tasks with NeMo AutoModel using checked-in recipes and distributed settings."
 slug: model-coverage/vision-language-models/google/gemma-4-26B-A4B-it
 ---
 
@@ -9,10 +9,12 @@ The Hugging Face configuration declares the `Gemma4ForConditionalGeneration` arc
 
 ## Fine-Tune Gemma-4-26B-A4B-it
 
-Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+Follow the [installation instructions](/get-started/installation), then review the checked-in recipe and
+its declared topology below before choosing a local or cluster launcher.
 
 ```bash
-uv run automodel <recipe-path>
+uv run automodel examples/vlm_finetune/gemma4/gemma4_26b_a4b_moe.yaml \
+  --nproc-per-node 8
 ```
 
 ## Standard Recipe Configuration

@@ -9,10 +9,12 @@ The Hugging Face configuration declares the `NemotronHForCausalLM` architecture.
 
 ## Fine-Tune NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
 
-Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+Follow the [installation instructions](/get-started/installation), then review the checked-in recipe and
+its declared topology below before choosing a local or cluster launcher.
 
 ```bash
-uv run automodel <recipe-path>
+uv run automodel examples/llm_finetune/nemotron/nemotron_nano_v3_cp_test.yaml \
+  --nproc-per-node 8
 ```
 
 ## Standard Recipe Configuration

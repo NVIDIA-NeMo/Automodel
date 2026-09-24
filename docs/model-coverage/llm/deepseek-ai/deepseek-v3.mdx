@@ -1,6 +1,6 @@
 ---
 title: "DeepSeek-V3"
-description: "Use DeepSeek-V3 with NeMo AutoModel for language model fine-tuning, with documented checkpoints, runnable recipes, setup guidance, and model reference details."
+description: "Reference DeepSeek-V3 checkpoint and architecture details for NeMo AutoModel, with model-family information, setup guidance, and upstream resources."
 slug: model-coverage/large-language-models/deepseek-ai/DeepSeek-V3
 ---
 
@@ -10,18 +10,8 @@ slug: model-coverage/large-language-models/deepseek-ai/DeepSeek-V3
 
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
-## Fine-Tune DeepSeek-V3
-
-<Note>
-This recipe was validated on **32 nodes x 8 GPUs (256 H100s)**. See the [Launcher Guide](/job-launchers/slurm-cluster) for multi-node setup.
-
-</Note>
-
-From the repository root, run:
-
-```bash
-uv run automodel --nproc-per-node=8 examples/llm_finetune/deepseek_v32/deepseek_v32_hellaswag_pp.yaml
-```
+This page provides a checkpoint and architecture reference. The workflows below identify related
+model-family recipes when they are available.
 
 ## Choose a Workflow
 

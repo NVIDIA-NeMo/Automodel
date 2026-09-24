@@ -13,7 +13,8 @@ Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com
 From the repository root, run:
 
 ```bash
-uv run automodel --nproc-per-node=8 examples/llm_finetune/nemotron/nemotron_nano_9b_squad.yaml
+uv run automodel examples/llm_finetune/nemotron/nemotron_nano_4b_squad.yaml \
+  --nproc-per-node 8
 ```
 
 ## Choose a Workflow

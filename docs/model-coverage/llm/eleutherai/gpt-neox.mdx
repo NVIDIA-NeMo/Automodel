@@ -1,21 +1,14 @@
 ---
 title: "gpt-neox-20b"
-description: "Use gpt-neox-20b with NeMo AutoModel for language model fine-tuning, with documented checkpoints, a runnable starting command, setup, and model reference details."
+description: "Reference gpt-neox-20b checkpoint and architecture details for NeMo AutoModel, with model-family information, setup guidance, and upstream resources."
 slug: model-coverage/large-language-models/eleutherai/gpt-neox-20b
 ---
 
 [GPT-NeoX](https://github.com/EleutherAI/gpt-neox) is EleutherAI's large-scale language model architecture. The same `GPTNeoXForCausalLM` architecture is used by the Pythia scaling suite, OpenAssistant, Databricks Dolly, and StableLM models.
 
-Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
-
-## Fine-Tune gpt-neox-20b
-
-From the repository root, run:
-
-```bash
-uv run automodel --nproc-per-node=8 examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
-  --model.pretrained_model_name_or_path "EleutherAI/gpt-neox-20b"
-```
+Use this page as a checkpoint and architecture reference. Set up NeMo AutoModel with the
+[latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the
+[installation instructions](/get-started/installation).
 
 ## Model Reference
 

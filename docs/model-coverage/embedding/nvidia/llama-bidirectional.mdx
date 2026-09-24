@@ -15,7 +15,9 @@ Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com
 From the repository root, run:
 
 ```bash
-uv run automodel examples/retrieval/bi_encoder/llama3_2_1b.yaml --nproc-per-node 8
+uv run automodel \
+  examples/retrieval/bi_encoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml \
+  --nproc-per-node 8
 ```
 
 ## Choose a Workflow

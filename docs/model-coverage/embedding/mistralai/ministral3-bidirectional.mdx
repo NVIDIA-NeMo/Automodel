@@ -1,6 +1,6 @@
 ---
 title: "Ministral-3-3B-Base-2512"
-description: "Use Ministral-3-3B-Base-2512 with NeMo AutoModel for embedding training, with documented checkpoints, a runnable starting command, setup, and model reference details."
+description: "Reference Ministral-3-3B-Base-2512 checkpoint and architecture details for NeMo AutoModel, with model-family information, setup guidance, and upstream resources."
 slug: model-coverage/embedding-models/mistralai/Ministral-3-3B-Base-2512
 ---
 
@@ -10,13 +10,8 @@ The encoder can be loaded directly from text-only checkpoints (e.g. `mistralai/M
 
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
-## Train Embeddings with Ministral-3-3B-Base-2512
-
-From the repository root, run:
-
-```bash
-uv run automodel examples/retrieval/bi_encoder/ministral3_3b_instruct.yaml --nproc-per-node 8
-```
+This page provides checkpoint and architecture details. Use the available checkpoint table below to
+choose the base or instruct variant.
 
 ## Model Reference
 

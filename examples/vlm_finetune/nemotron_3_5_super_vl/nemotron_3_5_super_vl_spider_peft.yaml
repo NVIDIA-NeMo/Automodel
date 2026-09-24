@@ -58,6 +58,7 @@ model:
   torch_dtype: torch.bfloat16
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
+    dispatcher: hybridep
     attn: te
     linear: te
     rms_norm: torch_fp32

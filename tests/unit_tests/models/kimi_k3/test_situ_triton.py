@@ -16,6 +16,7 @@ import pytest
 import torch
 
 import nemo_automodel.components.models.kimi_k3.situ as situ_mod
+from nemo_automodel.components.models.kimi_k3.config import KimiK3TextConfig
 from nemo_automodel.components.models.kimi_k3.situ import (
     _dense_situ_core,
     _enable_situ_triton,
@@ -251,3 +252,53 @@ def test_function_and_dense_entry_route_through_triton(triton_enabled, monkeypat
     _dense_situ_core(x_e, BETA, LINEAR_BETA).sum().backward()
     torch.testing.assert_close(x.grad.float(), x_e.grad, rtol=2e-2, atol=2e-2)
     assert calls["fwd"] >= 3 and calls["bwd"] >= 2
+
+
+def test_situ_backend_choices_are_validated_at_config_time():
+    assert KimiK3TextConfig().situ_backend == "torch"
+    assert KimiK3TextConfig(situ_backend="triton_fast_math").situ_backend == "triton_fast_math"
+    with pytest.raises(ValueError, match="situ_backend"):
+        KimiK3TextConfig(situ_backend="fast")
+
+
+def test_enable_records_fast_math(monkeypatch):
+    monkeypatch.setattr(situ_mod, "_SITU_TRITON_ENABLED", False)
+    monkeypatch.setattr(situ_mod, "_SITU_FAST_MATH", False)
+    monkeypatch.setattr(situ_mod, "_HAVE_SITU_TRITON", True)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    _enable_situ_triton()
+    assert situ_mod._SITU_TRITON_ENABLED is True and situ_mod._SITU_FAST_MATH is False
+    _enable_situ_triton(fast_math=True)  # a later opt-in switches the already-enabled routing to the SFU kernels
+    assert situ_mod._SITU_FAST_MATH is True
+    _enable_situ_triton()  # and a later layer without the flag does not switch it back
+    assert situ_mod._SITU_FAST_MATH is True
+
+
+@needs_gpu_triton
+@pytest.mark.runtime_budget(
+    60,
+    hard_timeout=300,
+    reason="Compiles the exact and the SFU variants of the Triton SiTU kernels on a cold cache.",
+)
+def test_fast_math_within_one_bf16_ulp_of_exact():
+    torch.manual_seed(1)
+    rows, half = 4096, 256
+    gu = (torch.randn(rows, 2 * half, device="cuda") * 6).to(torch.bfloat16)
+    rw = torch.rand(rows, 1, dtype=torch.float32, device="cuda")
+    go = torch.randn(rows, half, device="cuda", dtype=torch.bfloat16)
+    exact = situ_fwd_triton(gu, rw, BETA, LINEAR_BETA)
+    fast = situ_fwd_triton(gu, rw, BETA, LINEAR_BETA, fast_math=True)
+    ulp = torch.finfo(torch.bfloat16).eps * exact.float().abs().clamp(min=1e-3)
+    assert ((fast.float() - exact.float()).abs() <= ulp + 1e-6).float().mean().item() > 0.995
+    torch.testing.assert_close(fast.float(), exact.float(), rtol=8e-3, atol=2e-3)
+    d_exact, drw_exact = situ_bwd_triton(gu, rw, go, BETA, LINEAR_BETA, True)
+    d_fast, drw_fast = situ_bwd_triton(gu, rw, go, BETA, LINEAR_BETA, True, fast_math=True)
+    # d/dg carries (1 - tanh^2), which amplifies the tanh approximation's relative error near saturation
+    # (|g / beta| > 3 for a few percent of these inputs); the spec bound 2^-11 allows more than 8e-3 there, so the
+    # gradient tolerance is the loose bf16-training one. The forward and the routing-weight reduction stay tight.
+    torch.testing.assert_close(d_fast.float(), d_exact.float(), rtol=2e-2, atol=1e-2)
+    torch.testing.assert_close(drw_fast, drw_exact, rtol=8e-3, atol=2e-3)
+    # the dense entry (no routing weights, no bounded-linear branch) takes the same SFU path
+    dense_exact = situ_fwd_triton(gu, None, BETA, None)
+    dense_fast = situ_fwd_triton(gu, None, BETA, None, fast_math=True)
+    torch.testing.assert_close(dense_fast.float(), dense_exact.float(), rtol=8e-3, atol=2e-3)

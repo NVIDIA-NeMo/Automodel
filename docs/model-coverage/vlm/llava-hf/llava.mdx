@@ -1,21 +1,14 @@
 ---
 title: "llava-1.5-7b-hf"
-description: "Use llava-1.5-7b-hf with NeMo AutoModel for vision-language fine-tuning, with documented checkpoints, a runnable starting command, setup, and model reference details."
+description: "Reference llava-1.5-7b-hf checkpoint and architecture details for NeMo AutoModel, with model-family information, setup guidance, and upstream resources."
 slug: model-coverage/vision-language-models/llava-hf/llava-1.5-7b-hf
 ---
 
 [LLaVA](https://llava-vl.github.io/) (Large Language and Vision Assistant) is a pioneering open-source multimodal model connecting a vision encoder to a language model via a projection layer. Multiple versions and variants are supported via the `llava-hf` organization on Hugging Face.
 
-Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
-
-## Fine-Tune llava-1.5-7b-hf
-
-From the repository root, run:
-
-```bash
-uv run automodel --nproc-per-node=8 examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2.yaml \
-  --model.pretrained_model_name_or_path "llava-hf/llava-1.5-7b-hf"
-```
+Use this page as a checkpoint and architecture reference. Set up NeMo AutoModel with the
+[latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the
+[installation instructions](/get-started/installation).
 
 ## Model Reference
 

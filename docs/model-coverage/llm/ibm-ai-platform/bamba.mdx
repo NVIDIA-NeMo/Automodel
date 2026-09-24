@@ -1,21 +1,14 @@
 ---
 title: "Bamba-9B"
-description: "Use Bamba-9B with NeMo AutoModel for language model fine-tuning, with documented checkpoints, a runnable starting command, setup guidance, and model reference details."
+description: "Reference Bamba-9B checkpoint and architecture details for NeMo AutoModel, with model-family information, setup guidance, and upstream resources."
 slug: model-coverage/large-language-models/ibm-ai-platform/Bamba-9B
 ---
 
 [Bamba](https://huggingface.co/ibm-ai-platform/Bamba-9B) is a hybrid SSM-attention language model from IBM, combining Mamba-2 selective state space layers with standard transformer attention for efficient long-context processing.
 
-Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
-
-## Fine-Tune Bamba-9B
-
-From the repository root, run:
-
-```bash
-uv run automodel --nproc-per-node=8 examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
-  --model.pretrained_model_name_or_path "ibm-ai-platform/Bamba-9B"
-```
+Use this page as a checkpoint and architecture reference. Set up NeMo AutoModel with the
+[latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the
+[installation instructions](/get-started/installation).
 
 ## Model Reference
 

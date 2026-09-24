@@ -9,10 +9,12 @@ The Hugging Face configuration declares the `Qwen3_5ForConditionalGeneration` ar
 
 ## Fine-Tune Qwen3.5-9B
 
-Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+Follow the [installation instructions](/get-started/installation), then review the checked-in recipe and
+its declared topology below before choosing a local or cluster launcher.
 
 ```bash
-uv run automodel <recipe-path>
+uv run automodel examples/vlm_finetune/qwen3_5/qwen3_5_9b.yaml \
+  --nproc-per-node 8
 ```
 
 ## Standard Recipe Configuration
