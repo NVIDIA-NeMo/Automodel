@@ -41,7 +41,7 @@ model:
     attn: te
     linear: te
     rms_norm: torch_fp32
-    experts: gmm
+    experts: torch_mm
     dispatcher: deepep
     gate_precision: float32
     fake_balanced_gate: false

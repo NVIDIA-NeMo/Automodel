@@ -89,6 +89,8 @@ class KimiK3TextConfig(PretrainedConfig):
         kda_disable_recompute: bool = False,
         kda_conv_backend: str = "triton",
         kda_transpose_state_layout: bool = True,
+        situ_backend: str = "torch",
+        attn_res_triton: bool = False,
         attn_res_block_size: int | None = 12,
         activation_situ_beta: float | None = 4.0,
         activation_situ_linear_beta: float | None = 25.0,
@@ -163,6 +165,14 @@ class KimiK3TextConfig(PretrainedConfig):
         self.kda_disable_recompute = kda_disable_recompute
         self.kda_conv_backend = kda_conv_backend
         self.kda_transpose_state_layout = kda_transpose_state_layout
+        # Kimi-K3-only kernel switches. situ_backend selects the SiTU activation kernels: "torch" (the eager chunked
+        # cores, optionally torch.compiled through BackendConfig.compile_situ), "triton" (kimi_k3/situ_triton.py) or
+        # "triton_fast_math" (the same kernels with SFU tanh.approx / exp2 / rcp.approx, <= 1 bf16 ulp from libdevice);
+        # under the Triton choices compile_situ still governs the shapes the Triton kernels do not take. attn_res_triton
+        # routes the attention-residual mix through kimi_k3/attn_res_triton.py. The Triton choices and attn_res_triton
+        # are no-ops without Triton.
+        self.situ_backend = situ_backend
+        self.attn_res_triton = attn_res_triton
         self.attn_res_block_size = attn_res_block_size
         self.activation_situ_beta = activation_situ_beta
         self.activation_situ_linear_beta = activation_situ_linear_beta
@@ -185,6 +195,8 @@ class KimiK3TextConfig(PretrainedConfig):
             raise ValueError("kda_mode must be 'chunk' or 'fused_recurrent'.")
         if self.kda_conv_backend not in {"triton", "cuda"}:
             raise ValueError("kda_conv_backend must be 'triton' or 'cuda'.")
+        if self.situ_backend not in {"torch", "triton", "triton_fast_math"}:
+            raise ValueError("situ_backend must be 'torch', 'triton' or 'triton_fast_math'.")
         if self.linear_attn_config is None:
             return
         if "kda_layers" not in self.linear_attn_config or "full_attn_layers" not in self.linear_attn_config:
