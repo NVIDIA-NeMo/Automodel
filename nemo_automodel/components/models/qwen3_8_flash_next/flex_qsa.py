@@ -26,9 +26,29 @@ produce exactly zero output and zero gradients.
 from __future__ import annotations
 
 import functools
+from dataclasses import dataclass
 
 import torch
-from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+from torch.nn.attention.flex_attention import BlockMask, create_block_mask, flex_attention
+
+
+@dataclass(frozen=True)
+class FlexQSAMask:
+    """Route-derived FlexAttention mask for one QSA layer call.
+
+    Attributes:
+        block_mask: ``BlockMask`` over ``[batch, query_length, kv_length]`` built from the
+            routed token IDs and shared by all heads.
+        has_routes: Boolean tensor of shape ``[batch, query_length]`` marking query rows with
+            at least one real route; rows without routes are zeroed after attention.
+        query_length: Number of query rows the mask was built for.
+        kv_length: Number of physical K/V rows the mask was built for.
+    """
+
+    block_mask: BlockMask
+    has_routes: torch.Tensor
+    query_length: int
+    kv_length: int
 
 
 @functools.cache
@@ -104,44 +124,31 @@ def _membership_flat_offset(
     return flat_query * kv_length + kv_idx.to(torch.int64)
 
 
-def flex_sparse_gqa_attention(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
+def build_flex_qsa_mask(
     selected_token_ids: torch.Tensor,
     *,
-    softmax_scale: float | None = None,
-) -> torch.Tensor:
-    """Run route-sparse GQA through FlexAttention.
+    kv_length: int,
+    device: torch.device,
+) -> FlexQSAMask:
+    """Build the FlexAttention mask for a set of routed token IDs.
+
+    Building the mask is the CPU-heavy part of the flex QSA path (a scatter into a
+    ``[B, S_q, kv_length]`` table followed by ``create_block_mask``). Callers that
+    evaluate the same routes twice, checkpoint forward and recompute, build it once
+    and hand it to :func:`flex_sparse_gqa_attention`.
 
     Args:
-        query: BF16 CUDA queries ``[B, S_q, Hq, D]``.
-        key: BF16 CUDA keys ``[B, S_kv, Hkv, D]``. ``S_kv`` may differ from
-            ``S_q``; under context parallelism it is the gathered global
-            length.
-        value: BF16 CUDA values ``[B, S_kv, Hkv, D]``.
-        selected_token_ids: int32/int64 route IDs ``[B, S_q, K]`` in global
-            K/V coordinates; ``-1`` and out-of-range entries are padding.
-        softmax_scale: Positive QK scale, defaulting to ``1 / sqrt(D)``.
+        selected_token_ids: int32/int64 route IDs ``[B, S_q, K]`` in global K/V
+            coordinates; ``-1`` and out-of-range entries are padding.
+        kv_length: Number of physical K/V rows.
+        device: CUDA device the attention will run on.
 
     Returns:
-        BF16 attention output ``[B, S_q, Hq, D]``. Padding-query rows are
-        exactly zero, matching the PyTorch oracle contract.
+        The block mask, the ``[B, S_q]`` has-routes marker, and the extents it was built for.
     """
-    if query.ndim != 4 or key.ndim != 4 or value.ndim != 4:
-        raise ValueError("flex QSA expects [B, S, H, D] query/key/value")
-    if key.shape != value.shape:
-        raise ValueError(f"key and value shapes must match, got {tuple(key.shape)} and {tuple(value.shape)}")
-    batch_size, query_length, num_query_heads, head_dim = query.shape
-    kv_length, num_kv_heads = key.shape[1], key.shape[2]
-    if num_kv_heads <= 0 or num_query_heads % num_kv_heads != 0:
-        raise ValueError(f"flex QSA requires Hq divisible by Hkv, got Hq={num_query_heads}, Hkv={num_kv_heads}")
-    if selected_token_ids.ndim != 3 or selected_token_ids.shape[:2] != (batch_size, query_length):
-        raise ValueError(
-            f"selected_token_ids must be [B, S_q, K] matching the queries; got {tuple(selected_token_ids.shape)}"
-        )
-    scale = head_dim**-0.5 if softmax_scale is None else float(softmax_scale)
-
+    if selected_token_ids.ndim != 3:
+        raise ValueError(f"selected_token_ids must be [B, S_q, K]; got {tuple(selected_token_ids.shape)}")
+    batch_size, query_length, _ = selected_token_ids.shape
     membership, has_routes = _routes_to_membership(selected_token_ids, kv_length)
     # Looked up through a flat int64 offset rather than membership[b, q, kv]:
     # the inlined mask_mod indexes this table in int32, which overflows for
@@ -164,8 +171,60 @@ def flex_sparse_gqa_attention(
         H=None,
         Q_LEN=query_length,
         KV_LEN=kv_length,
-        device=str(query.device),
+        device=str(device),
     )
+    return FlexQSAMask(block_mask=block_mask, has_routes=has_routes, query_length=query_length, kv_length=kv_length)
+
+
+def flex_sparse_gqa_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    selected_token_ids: torch.Tensor,
+    *,
+    softmax_scale: float | None = None,
+    mask: FlexQSAMask | None = None,
+) -> torch.Tensor:
+    """Run route-sparse GQA through FlexAttention.
+
+    Args:
+        query: BF16 CUDA queries ``[B, S_q, Hq, D]``.
+        key: BF16 CUDA keys ``[B, S_kv, Hkv, D]``. ``S_kv`` may differ from
+            ``S_q``; under context parallelism it is the gathered global
+            length.
+        value: BF16 CUDA values ``[B, S_kv, Hkv, D]``.
+        selected_token_ids: int32/int64 route IDs ``[B, S_q, K]`` in global
+            K/V coordinates; ``-1`` and out-of-range entries are padding.
+        softmax_scale: Positive QK scale, defaulting to ``1 / sqrt(D)``.
+        mask: Optional mask previously built from ``selected_token_ids`` with
+            :func:`build_flex_qsa_mask`; built here when omitted.
+
+    Returns:
+        BF16 attention output ``[B, S_q, Hq, D]``. Padding-query rows are
+        exactly zero, matching the PyTorch oracle contract.
+    """
+    if query.ndim != 4 or key.ndim != 4 or value.ndim != 4:
+        raise ValueError("flex QSA expects [B, S, H, D] query/key/value")
+    if key.shape != value.shape:
+        raise ValueError(f"key and value shapes must match, got {tuple(key.shape)} and {tuple(value.shape)}")
+    batch_size, query_length, num_query_heads, head_dim = query.shape
+    kv_length, num_kv_heads = key.shape[1], key.shape[2]
+    if num_kv_heads <= 0 or num_query_heads % num_kv_heads != 0:
+        raise ValueError(f"flex QSA requires Hq divisible by Hkv, got Hq={num_query_heads}, Hkv={num_kv_heads}")
+    if selected_token_ids.ndim != 3 or selected_token_ids.shape[:2] != (batch_size, query_length):
+        raise ValueError(
+            f"selected_token_ids must be [B, S_q, K] matching the queries; got {tuple(selected_token_ids.shape)}"
+        )
+    scale = head_dim**-0.5 if softmax_scale is None else float(softmax_scale)
+
+    if mask is None:
+        mask = build_flex_qsa_mask(selected_token_ids, kv_length=kv_length, device=query.device)
+    elif mask.query_length != query_length or mask.kv_length != kv_length:
+        raise ValueError(
+            "flex QSA mask extents disagree with the query/key tensors; "
+            f"mask=({mask.query_length}, {mask.kv_length}), tensors=({query_length}, {kv_length})"
+        )
+    block_mask, has_routes = mask.block_mask, mask.has_routes
     output = _compiled_flex()(
         query.permute(0, 2, 1, 3),
         key.permute(0, 2, 1, 3),
@@ -179,4 +238,4 @@ def flex_sparse_gqa_attention(
     return output.masked_fill(~has_routes[:, :, None, None], 0)
 
 
-__all__ = ["flex_sparse_gqa_attention"]
+__all__ = ["FlexQSAMask", "build_flex_qsa_mask", "flex_sparse_gqa_attention"]

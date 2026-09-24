@@ -24,9 +24,14 @@ every forward, while gradients flow through the main attention Q/K/V path.
 from __future__ import annotations
 
 import math
+import threading
+from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager, contextmanager, nullcontext
+from dataclasses import dataclass
 
 import torch
 from torch import nn
+from torch.utils._python_dispatch import _disable_current_modes
 
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.gpt_oss.rope_utils import apply_rotary_emb
@@ -34,7 +39,7 @@ from nemo_automodel.components.models.qwen3_8_flash_next.cp import (
     Qwen3_8_FlashNextCPContext,
     qwen3_8_flash_next_cp_all_gather,
 )
-from nemo_automodel.components.models.qwen3_8_flash_next.flex_qsa import flex_sparse_gqa_attention
+from nemo_automodel.components.models.qwen3_8_flash_next.flex_qsa import FlexQSAMask, flex_sparse_gqa_attention
 from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextRMSNorm
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
@@ -396,6 +401,7 @@ def qsa_gqa_attention(
     *,
     backend: str,
     softmax_scale: float | None = None,
+    flex_mask: FlexQSAMask | None = None,
 ) -> torch.Tensor:
     """Dispatch QSA to FlexAttention on CUDA or the PyTorch oracle elsewhere.
 
@@ -403,6 +409,19 @@ def qsa_gqa_attention(
     inspection, and distributed CPU parity tests need no compiled kernels.
     CUDA execution is strict: unsupported backends or dtypes are reported
     rather than silently falling back to the gathered implementation.
+
+    Args:
+        query: Queries ``[B, S_q, Hq, D]``.
+        key: Keys ``[B, S_kv, Hkv, D]``; ``S_kv`` is the gathered global length under CP.
+        value: Values ``[B, S_kv, Hkv, D]``.
+        selected_token_ids: int32/int64 route IDs ``[B, S_q, K]`` in global K/V coordinates.
+        backend: Attention backend name; CUDA requires ``"flex"``.
+        softmax_scale: Positive QK scale, defaulting to ``1 / sqrt(D)``.
+        flex_mask: Optional FlexAttention mask already built from ``selected_token_ids``
+            (see :func:`build_flex_qsa_mask`); ignored by the CPU oracle.
+
+    Returns:
+        Attention output ``[B, S_q, Hq, D]`` in the query dtype.
     """
     if not query.is_cuda:
         return gathered_qsa_gqa_attention(
@@ -425,7 +444,143 @@ def qsa_gqa_attention(
         value,
         selected_token_ids,
         softmax_scale=softmax_scale,
+        mask=flex_mask,
     )
+
+
+@dataclass(frozen=True)
+class QSARouteSelection:
+    """Routes chosen by the frozen indexer for one QSA layer call.
+
+    Attributes:
+        selected_token_ids: int32 route IDs ``[B, S_q, attention_width]`` in global
+            K/V coordinates; ``-1`` marks padding.
+        flex_mask: FlexAttention mask built from the same routes when the layer runs
+            on CUDA with the ``flex`` backend, otherwise ``None``.
+    """
+
+    selected_token_ids: torch.Tensor
+    flex_mask: FlexQSAMask | None
+
+
+class QSARouteReplayRecorder:
+    """Record the checkpoint-forward route selections of one decoder block for replay.
+
+    Activation checkpointing reruns the block during backward. The indexer is frozen and
+    its top-k selection is deterministic, so the recompute would reproduce the same routes
+    bit for bit; replaying the recorded selection skips the indexer and the FlexAttention
+    mask build, which dominate the block's CPU time, without changing any value the
+    trainable path sees. Records are consumed in call order; ``rewind`` restarts replay.
+    """
+
+    def __init__(self) -> None:
+        self._records: list[QSARouteSelection] = []
+        self._cursor = 0
+        self.replay_misses = 0
+
+    def record(self, selection: QSARouteSelection) -> None:
+        """Append one forward selection."""
+        self._records.append(selection)
+
+    def take(self) -> QSARouteSelection | None:
+        """Return the next recorded selection, or ``None`` when replay diverges from forward."""
+        if self._cursor >= len(self._records):
+            self.replay_misses += 1
+            return None
+        selection = self._records[self._cursor]
+        self._cursor += 1
+        return selection
+
+    def rewind(self) -> None:
+        """Restart replay from the first recorded selection."""
+        self._cursor = 0
+
+    def __len__(self) -> int:
+        return len(self._records)
+
+
+class _QSARouteReplayState(threading.local):
+    def __init__(self) -> None:
+        self.recorder: QSARouteReplayRecorder | None = None
+        self.mode: str | None = None
+
+
+_qsa_route_replay_state = _QSARouteReplayState()
+
+
+@contextmanager
+def qsa_route_replay_scope(recorder: QSARouteReplayRecorder | None, mode: str) -> Iterator[None]:
+    """Bind a route recorder for the checkpoint forward (``record``) or recompute (``replay``).
+
+    Args:
+        recorder: Recorder shared by the forward and recompute of one checkpointed block;
+            ``None`` disables replay inside the scope.
+        mode: ``"record"`` or ``"replay"``.
+    """
+    if mode not in ("record", "replay"):
+        raise ValueError(f"Unsupported QSA route replay mode: {mode}")
+    previous_recorder = _qsa_route_replay_state.recorder
+    previous_mode = _qsa_route_replay_state.mode
+    _qsa_route_replay_state.recorder = recorder
+    _qsa_route_replay_state.mode = mode if recorder is not None else None
+    try:
+        yield
+    finally:
+        _qsa_route_replay_state.recorder = previous_recorder
+        _qsa_route_replay_state.mode = previous_mode
+
+
+def current_qsa_route_replay() -> tuple[QSARouteReplayRecorder, str] | None:
+    """Return the active ``(recorder, mode)`` binding, or ``None`` outside a replay scope."""
+    recorder = _qsa_route_replay_state.recorder
+    if recorder is None or _qsa_route_replay_state.mode is None:
+        return None
+    return recorder, _qsa_route_replay_state.mode
+
+
+def qsa_route_replay_checkpoint_context_fn(
+    context_fn: Callable[[], tuple[AbstractContextManager, AbstractContextManager]] | None,
+) -> Callable[[], tuple[AbstractContextManager, AbstractContextManager]]:
+    """Wrap a checkpoint ``context_fn`` so QSA routes are recorded in forward and replayed in recompute.
+
+    Args:
+        context_fn: Existing ``torch.utils.checkpoint`` context factory returning the
+            ``(forward, recompute)`` context managers, or ``None`` for no other contexts.
+
+    Returns:
+        A context factory that binds a fresh :class:`QSARouteReplayRecorder` per checkpoint call.
+    """
+
+    def checkpoint_context_fn() -> tuple[AbstractContextManager, AbstractContextManager]:
+        forward_context, recompute_context = context_fn() if context_fn is not None else (nullcontext(), nullcontext())
+        recorder = QSARouteReplayRecorder()
+
+        @contextmanager
+        def scoped(mode: str, inner: AbstractContextManager) -> Iterator[None]:
+            if mode == "replay":
+                recorder.rewind()
+            with qsa_route_replay_scope(recorder, mode):
+                with inner:
+                    yield
+
+        return scoped("record", forward_context), scoped("replay", recompute_context)
+
+    return checkpoint_context_fn
+
+
+@contextmanager
+def qsa_route_selection_region() -> Iterator[None]:
+    """Run route selection outside any active TorchDispatch mode.
+
+    Selective activation checkpointing records every op of the checkpoint forward
+    through a TorchDispatch mode and expects the recompute to issue the same op
+    sequence. Replaying recorded routes skips the indexer's ops during recompute, so
+    those ops must be invisible to the mode during forward as well. The indexer runs
+    under ``torch.no_grad`` and the mask is integer-only, so nothing here is needed by
+    autograd; hiding the region only affects checkpoint bookkeeping.
+    """
+    with _disable_current_modes():
+        yield
 
 
 class Qwen3_8_FlashNextQSAIndexer(nn.Module):
