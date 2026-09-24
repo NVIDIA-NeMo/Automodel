@@ -15,7 +15,67 @@
 import pytest
 import torch
 
-from nemo_automodel.components.moe.experts import _BIAS_GRAD_TRITON_AVAILABLE, _apply_bias
+from nemo_automodel.components.moe.experts import (
+    _BIAS_GRAD_TRITON_AVAILABLE,
+    _apply_bias,
+    _checkpointed_chunked_expert_mlp,
+)
+
+
+def _quick_geglu(value: torch.Tensor, probs: torch.Tensor) -> torch.Tensor:
+    """Apply the GPT-OSS expert activation used by the parity tests.
+
+    Args:
+        value: Tensor of shape [tokens, 2 * intermediate] in concatenated gate/up layout.
+        probs: Tensor of shape [tokens, 1] containing routing probabilities.
+
+    Returns:
+        Tensor of shape [tokens, intermediate].
+    """
+    gate, up = value.chunk(2, dim=-1)
+    return (gate * torch.sigmoid(1.702 * gate) * (up + 1.0) * probs).to(value.dtype)
+
+
+def _full_grouped_expert_mlp(
+    hidden_states,
+    gate_and_up_projs,
+    down_projs,
+    gate_up_proj_bias,
+    down_proj_bias,
+    tokens_per_expert,
+    permuted_probs,
+    apply_router_weight_after_down,
+):
+    """Compute the unchunked reference expert MLP.
+
+    Args:
+        hidden_states: Tensor of shape [tokens, hidden], grouped contiguously by expert.
+        gate_and_up_projs: Tensor of shape [experts, hidden, 2 * intermediate].
+        down_projs: Tensor of shape [experts, intermediate, hidden].
+        gate_up_proj_bias: Optional tensor of shape [experts, 2 * intermediate].
+        down_proj_bias: Optional tensor of shape [experts, hidden].
+        tokens_per_expert: Tensor of shape [experts] containing contiguous row counts.
+        permuted_probs: Tensor of shape [tokens, 1] containing routing probabilities.
+        apply_router_weight_after_down: Whether to apply routing probabilities after the down projection.
+
+    Returns:
+        Tensor of shape [tokens, hidden].
+    """
+    offs = tokens_per_expert.cumsum(dim=0).to(torch.int32)
+    gate_up = torch._grouped_mm(hidden_states, gate_and_up_projs, offs=offs)
+    gate_up = _apply_bias(gate_up, gate_up_proj_bias, tokens_per_expert)
+    activation_probs = torch.ones_like(permuted_probs) if apply_router_weight_after_down else permuted_probs
+    activated = _quick_geglu(gate_up, activation_probs)
+    output = torch._grouped_mm(activated, down_projs, offs=offs)
+    output = _apply_bias(
+        output,
+        down_proj_bias,
+        tokens_per_expert,
+        None if apply_router_weight_after_down else permuted_probs,
+    )
+    if apply_router_weight_after_down:
+        output = (output.float() * permuted_probs.float()).to(hidden_states.dtype)
+    return output
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -212,3 +272,91 @@ def test_apply_bias_large_weighted_double_backward_is_deterministic():
             first_second_grad = second_grad.clone()
         else:
             torch.testing.assert_close(second_grad, first_second_grad, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("apply_router_weight_after_down", [False, True])
+def test_checkpointed_chunked_expert_mlp_matches_full_cuda_gradients(
+    monkeypatch,
+    dtype,
+    apply_router_weight_after_down,
+):
+    """Real grouped-MM chunks preserve forward values and every trainable gradient."""
+    monkeypatch.setattr("nemo_automodel.components.moe.experts._BIAS_CHUNK_ROWS", 6)
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    token_counts = torch.tensor([0, 5, 12, 0], dtype=torch.long, device=device)
+    n_tokens = int(token_counts.sum())
+    torch.manual_seed(2468)
+    tensors = [
+        torch.randn(n_tokens, 32, dtype=dtype, device=device, requires_grad=True),
+        (torch.randn(4, 32, 96, dtype=dtype, device=device) * 0.02).requires_grad_(),
+        (torch.randn(4, 48, 32, dtype=dtype, device=device) * 0.02).requires_grad_(),
+        (torch.randn(4, 96, dtype=dtype, device=device) * 0.02).requires_grad_(),
+        (torch.randn(4, 32, dtype=dtype, device=device) * 0.02).requires_grad_(),
+        torch.rand(n_tokens, 1, dtype=torch.float32, device=device, requires_grad=True),
+    ]
+    expected_tensors = [tensor.detach().clone().requires_grad_() for tensor in tensors]
+
+    result = _checkpointed_chunked_expert_mlp(
+        *tensors[:5],
+        token_counts,
+        tensors[5],
+        _quick_geglu,
+        apply_router_weight_after_down,
+    )
+    expected = _full_grouped_expert_mlp(
+        *expected_tensors[:5],
+        token_counts,
+        expected_tensors[5],
+        apply_router_weight_after_down,
+    )
+    tolerance = {"rtol": 2e-2, "atol": 4e-2} if dtype == torch.bfloat16 else {"rtol": 2e-5, "atol": 2e-5}
+    torch.testing.assert_close(result, expected, **tolerance)
+
+    upstream_grad = torch.randn_like(result)
+    result.backward(upstream_grad)
+    expected.backward(upstream_grad)
+    for actual, reference in zip(tensors, expected_tensors):
+        torch.testing.assert_close(actual.grad, reference.grad, **tolerance)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_checkpointed_chunked_expert_mlp_does_not_materialize_full_gate_up_output():
+    """Gradient-enabled peak memory stays bounded across checkpoint recomputation."""
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    dtype = torch.bfloat16
+    n_tokens = 32768
+    dim = 256
+    inter_dim = 512
+    n_experts = 4
+    token_counts = torch.tensor([0, 8193, 16383, 8192], dtype=torch.long, device=device)
+    hidden = torch.randn(n_tokens, dim, dtype=dtype, device=device, requires_grad=True)
+    gate_up = torch.randn(n_experts, dim, 2 * inter_dim, dtype=dtype, device=device, requires_grad=True)
+    down = torch.randn(n_experts, inter_dim, dim, dtype=dtype, device=device, requires_grad=True)
+    gate_bias = torch.randn(n_experts, 2 * inter_dim, dtype=dtype, device=device, requires_grad=True)
+    down_bias = torch.randn(n_experts, dim, dtype=dtype, device=device, requires_grad=True)
+    probs = torch.rand(n_tokens, 1, dtype=torch.float32, device=device, requires_grad=True)
+
+    torch.cuda.synchronize(device)
+    baseline = torch.cuda.memory_allocated(device)
+    torch.cuda.reset_peak_memory_stats(device)
+    output = _checkpointed_chunked_expert_mlp(
+        hidden,
+        gate_up,
+        down,
+        gate_bias,
+        down_bias,
+        token_counts,
+        probs,
+        _quick_geglu,
+        False,
+    )
+    output.backward(torch.randn_like(output))
+    torch.cuda.synchronize(device)
+
+    peak_increment = torch.cuda.max_memory_allocated(device) - baseline
+    full_gate_up_bytes = n_tokens * 2 * inter_dim * hidden.element_size()
+    assert output.shape == (n_tokens, dim)
+    assert peak_increment < 3 * full_gate_up_bytes
+    assert all(tensor.grad is not None for tensor in (hidden, gate_up, down, gate_bias, down_bias, probs))

@@ -28,6 +28,7 @@ from nemo_automodel.components.moe.experts import (
     GroupedExperts,
     GroupedExpertsDeepEP,
     _apply_bias,
+    _checkpointed_chunked_expert_mlp,
     _DeterministicBiasRepeatInterleave,
     _permute_tokens_for_grouped_mm,
     _stabilize_empty_routing_probs_dtype,
@@ -828,6 +829,42 @@ class TestGroupedExpertsForwardLoopDTensorBias:
 class TestGroupedExpertsDeepEP:
     """Test GroupedExpertsDeepEP module."""
 
+    @staticmethod
+    def _prepare_forward_path(experts, num_tokens):
+        """Install a local dispatcher and materialized weights for forward-path tests."""
+        hidden_states = torch.arange(
+            num_tokens * experts.config.dim,
+            dtype=torch.float32,
+        ).view(num_tokens, experts.config.dim)
+        tokens_per_expert = torch.zeros(experts.config.n_routed_experts, dtype=torch.long)
+        tokens_per_expert[0] = num_tokens
+        permuted_probs = torch.linspace(0.25, 0.75, num_tokens, dtype=torch.float32)
+
+        dispatcher = Mock()
+        dispatcher.token_permutation2.return_value = (
+            hidden_states,
+            tokens_per_expert,
+            permuted_probs,
+        )
+        dispatcher.token_unpermutation.side_effect = lambda output: output
+        experts.token_dispatcher = dispatcher
+        experts.n_routed_experts = experts.config.n_routed_experts
+        experts.ep_size = 1
+
+        # Production installs DTensor parameters before this forward. These tests
+        # keep the tensors local while preserving the same ``to_local`` contract.
+        experts.gate_and_up_projs.to_local = lambda: experts.gate_and_up_projs
+        experts.down_projs.to_local = lambda: experts.down_projs
+        if experts.expert_bias:
+            experts.gate_up_proj_bias.to_local = lambda: experts.gate_up_proj_bias
+            experts.down_proj_bias.to_local = lambda: experts.down_proj_bias
+
+        x = torch.zeros(num_tokens, experts.config.dim, dtype=torch.float32)
+        token_mask = torch.ones(num_tokens, dtype=torch.bool)
+        weights = torch.zeros(num_tokens, experts.config.n_activated_experts, dtype=torch.float32)
+        indices = torch.zeros(num_tokens, experts.config.n_activated_experts, dtype=torch.long)
+        return x, token_mask, weights, indices, hidden_states, permuted_probs
+
     def test_grouped_experts_deepep_init(self, moe_config):
         """Test GroupedExpertsDeepEP initialization."""
         experts = GroupedExpertsDeepEP(moe_config)
@@ -872,6 +909,94 @@ class TestGroupedExpertsDeepEP:
             assert experts.ep_size == 2
             assert experts.ep_rank == 0
             mock_init_buffer.assert_called_once_with(mock_mesh.get_group.return_value)
+
+    @pytest.mark.parametrize(
+        ("threshold_delta", "expect_chunked"),
+        [pytest.param(0, False, id="at-threshold"), pytest.param(-1, True, id="above-threshold")],
+    )
+    def test_grouped_experts_deepep_forward_selects_chunked_path_at_byte_threshold(
+        self,
+        moe_config,
+        monkeypatch,
+        threshold_delta,
+        expect_chunked,
+    ):
+        """Production forward uses chunking only when the gate/up allocation exceeds the byte limit."""
+        experts = GroupedExpertsDeepEP(moe_config)
+        args = self._prepare_forward_path(experts, num_tokens=2)
+        hidden_states = args[4]
+        gate_up_bytes = hidden_states.shape[0] * experts.gate_and_up_projs.shape[-1] * hidden_states.element_size()
+        monkeypatch.setattr(
+            "nemo_automodel.components.moe.experts._EXPERT_MLP_CHUNK_BYTES",
+            gate_up_bytes + threshold_delta,
+        )
+
+        chunked = Mock(side_effect=lambda hidden, *_args: hidden.new_full(hidden.shape, 11.0))
+        whole_dispatch = Mock(side_effect=lambda hidden, *_args, **_kwargs: hidden.new_full(hidden.shape, 7.0))
+        monkeypatch.setattr("nemo_automodel.components.moe.experts._checkpointed_chunked_expert_mlp", chunked)
+        monkeypatch.setattr("nemo_automodel.components.moe.experts._torch_mm_experts_fwd", whole_dispatch)
+
+        output = experts(*args[:4])
+
+        if expect_chunked:
+            chunked.assert_called_once()
+            whole_dispatch.assert_not_called()
+            torch.testing.assert_close(output, torch.full_like(hidden_states, 11.0))
+        else:
+            chunked.assert_not_called()
+            whole_dispatch.assert_called_once()
+            torch.testing.assert_close(output, torch.full_like(hidden_states, 7.0))
+
+    def test_grouped_experts_deepep_forward_excludes_mxfp8_from_chunked_path(self, moe_config, monkeypatch):
+        """Large MXFP8 dispatches retain their quantized whole-dispatch implementation."""
+        backend = BackendConfig(experts="torch_mm_mxfp8", dispatcher="deepep")
+        experts = GroupedExpertsDeepEP(moe_config, backend=backend)
+        args = self._prepare_forward_path(experts, num_tokens=2)
+        hidden_states = args[4]
+        monkeypatch.setattr("nemo_automodel.components.moe.experts._EXPERT_MLP_CHUNK_BYTES", 0)
+
+        chunked = Mock()
+        whole_dispatch = Mock(side_effect=lambda hidden, *_args, **_kwargs: hidden.new_full(hidden.shape, 5.0))
+        monkeypatch.setattr("nemo_automodel.components.moe.experts._checkpointed_chunked_expert_mlp", chunked)
+        monkeypatch.setattr("nemo_automodel.components.moe.experts._torch_mm_experts_fwd", whole_dispatch)
+
+        output = experts(*args[:4])
+
+        chunked.assert_not_called()
+        whole_dispatch.assert_called_once()
+        assert whole_dispatch.call_args.kwargs["use_mxfp8"] is True
+        torch.testing.assert_close(output, torch.full_like(hidden_states, 5.0))
+
+    def test_grouped_experts_deepep_forward_does_not_reapply_chunked_router_weights(
+        self,
+        moe_config,
+        monkeypatch,
+    ):
+        """Chunked apply-after-down output bypasses the outer router-weight multiply."""
+        moe_config.apply_router_weight_after_down = True
+        experts = GroupedExpertsDeepEP(moe_config)
+        args = self._prepare_forward_path(experts, num_tokens=3)
+        hidden_states, permuted_probs = args[4], args[5]
+        monkeypatch.setattr("nemo_automodel.components.moe.experts._EXPERT_MLP_CHUNK_BYTES", 0)
+
+        def chunked_output(hidden, *_args):
+            """Stand in for the helper's already-weighted expert output."""
+            helper_probs = _args[5]
+            apply_after_down = _args[7]
+            assert apply_after_down is True
+            return torch.ones_like(hidden) * helper_probs
+
+        chunked = Mock(side_effect=chunked_output)
+        outer_router_weight = Mock(side_effect=lambda value, probs, dtype: value * probs)
+        monkeypatch.setattr("nemo_automodel.components.moe.experts._checkpointed_chunked_expert_mlp", chunked)
+        monkeypatch.setattr("nemo_automodel.components.moe.experts._apply_router_weight_fp32", outer_router_weight)
+
+        output = experts(*args[:4])
+
+        chunked.assert_called_once()
+        outer_router_weight.assert_not_called()
+        expected = permuted_probs.unsqueeze(-1).expand_as(hidden_states)
+        torch.testing.assert_close(output, expected)
 
     def test_grouped_experts_deepep_apply_bias_no_bias(self, moe_config):
         """Test _apply_bias method with no bias."""
@@ -1026,6 +1151,102 @@ class TestGroupedExpertsDeepEP:
         torch.testing.assert_close(bias.grad, expected_bias.grad)
         if permuted_probs is not None:
             torch.testing.assert_close(permuted_probs.grad, expected_probs.grad)
+
+    @pytest.mark.parametrize("with_bias", [False, True])
+    @pytest.mark.parametrize("apply_router_weight_after_down", [False, True])
+    def test_checkpointed_chunked_expert_mlp_matches_full_dispatch(
+        self,
+        monkeypatch,
+        with_bias,
+        apply_router_weight_after_down,
+    ):
+        """Chunk boundaries, empty experts, biases, and router weighting preserve full-dispatch gradients."""
+
+        def fake_grouped_mm(value, weights, offs):
+            """Apply a CPU grouped matrix multiplication.
+
+            Args:
+                value: Tensor of shape [tokens, input_features], grouped contiguously by expert.
+                weights: Tensor of shape [experts, input_features, output_features].
+                offs: Tensor of shape [experts] containing cumulative group ends.
+
+            Returns:
+                Tensor of shape [tokens, output_features].
+            """
+            starts = [0, *offs.tolist()]
+            parts = [value[starts[i] : starts[i + 1]] @ weights[i] for i in range(weights.shape[0])]
+            return torch.cat(parts, dim=0)
+
+        def activation(value, probs):
+            """Apply the test's gated expert activation.
+
+            Args:
+                value: Tensor of shape [tokens, 2 * intermediate] in concatenated gate/up layout.
+                probs: Tensor of shape [tokens, 1] containing routing probabilities.
+
+            Returns:
+                Tensor of shape [tokens, intermediate].
+            """
+            gate, up = value.chunk(2, dim=-1)
+            return (gate * torch.sigmoid(1.702 * gate) * (up + 1.0) * probs).to(value.dtype)
+
+        monkeypatch.setattr("nemo_automodel.components.moe.experts._BIAS_CHUNK_ROWS", 3)
+        monkeypatch.setattr(
+            "nemo_automodel.components.moe.experts.select_grouped_mm", lambda use_mxfp8: fake_grouped_mm
+        )
+        token_counts = torch.tensor([0, 2, 5, 0, 4])
+        n_tokens = int(token_counts.sum())
+        torch.manual_seed(987)
+        tensors = [
+            torch.randn(n_tokens, 4, dtype=torch.float64, requires_grad=True),
+            torch.randn(5, 4, 6, dtype=torch.float64, requires_grad=True),
+            torch.randn(5, 3, 4, dtype=torch.float64, requires_grad=True),
+            torch.randn(5, 6, dtype=torch.float64, requires_grad=True) if with_bias else None,
+            torch.randn(5, 4, dtype=torch.float64, requires_grad=True) if with_bias else None,
+            torch.rand(n_tokens, 1, dtype=torch.float64, requires_grad=True),
+        ]
+        expected_tensors = [
+            tensor.detach().clone().requires_grad_() if tensor is not None else None for tensor in tensors
+        ]
+
+        result = _checkpointed_chunked_expert_mlp(
+            tensors[0],
+            tensors[1],
+            tensors[2],
+            tensors[3],
+            tensors[4],
+            token_counts,
+            tensors[5],
+            activation,
+            apply_router_weight_after_down,
+        )
+
+        expected_hidden, expected_gate_up, expected_down, expected_gate_bias, expected_down_bias, expected_probs = (
+            expected_tensors
+        )
+        offs = token_counts.cumsum(dim=0).to(torch.int32)
+        expected = fake_grouped_mm(expected_hidden, expected_gate_up, offs)
+        bias_rows = None
+        if expected_gate_bias is not None:
+            bias_rows = torch.repeat_interleave(expected_gate_bias, token_counts, dim=0, output_size=n_tokens)
+            expected = expected + bias_rows
+        activation_probs = torch.ones_like(expected_probs) if apply_router_weight_after_down else expected_probs
+        expected = activation(expected, activation_probs)
+        expected = fake_grouped_mm(expected, expected_down, offs)
+        if expected_down_bias is not None:
+            bias_rows = torch.repeat_interleave(expected_down_bias, token_counts, dim=0, output_size=n_tokens)
+            expected = expected + (bias_rows if apply_router_weight_after_down else bias_rows * expected_probs)
+        if apply_router_weight_after_down:
+            expected = (expected.float() * expected_probs.float()).to(expected.dtype)
+
+        upstream_grad = torch.randn_like(result)
+        result.backward(upstream_grad)
+        expected.backward(upstream_grad)
+
+        torch.testing.assert_close(result, expected)
+        for actual, reference in zip(tensors, expected_tensors):
+            if actual is not None:
+                torch.testing.assert_close(actual.grad, reference.grad)
 
     @pytest.mark.parametrize(
         ("bias_requires_grad", "use_probs", "expected_bias_grad_dtype", "expected_probs_grad_dtype"),

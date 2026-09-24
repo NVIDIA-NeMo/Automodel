@@ -20,6 +20,7 @@ import torch.distributed as dist
 import torch.distributed.nn.functional as dist_nn_f
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint as torch_checkpoint
 from torch.autograd import Function
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
@@ -42,6 +43,10 @@ _BIAS_GRAD_TRITON_AVAILABLE = _HAVE_TRITON and _HAVE_TRITON_LANGUAGE and hasattr
 # dispatches on the faster single-operation path.
 _BIAS_CHUNK_ROWS = 4096
 _BIAS_CHUNK_THRESHOLD = 12288
+# Above this size, materializing both grouped-GEMM intermediates can exhaust
+# memory even when bias additions themselves are bounded. Recompute row chunks
+# during backward instead of retaining full expert-MLP activations.
+_EXPERT_MLP_CHUNK_BYTES = 256 * 1024 * 1024
 
 
 def _allocate_triton_workspace(size: int, alignment: int, stream: int | None) -> torch.Tensor:
@@ -1081,6 +1086,116 @@ def _stabilize_empty_routing_probs_dtype(permuted_probs: torch.Tensor, compute_d
     return permuted_probs
 
 
+def _checkpointed_chunked_expert_mlp(
+    hidden_states: torch.Tensor,
+    gate_and_up_projs: torch.Tensor,
+    down_projs: torch.Tensor,
+    gate_up_proj_bias: torch.Tensor | None,
+    down_proj_bias: torch.Tensor | None,
+    tokens_per_expert: torch.Tensor,
+    permuted_probs: torch.Tensor,
+    activation_fn,
+    apply_router_weight_after_down: bool,
+) -> torch.Tensor:
+    """Run a grouped expert MLP in bounded row chunks.
+
+    Each chunk is independently checkpointed, so backward recomputes its two
+    grouped GEMMs instead of retaining full ``[tokens, 2 * inter_dim]`` and
+    ``[tokens, inter_dim]`` activations. The final ``[tokens, hidden]`` tensor
+    is allocated once and populated by slice assignment; no concatenation or
+    stateful scratch buffer is used.
+
+    This helper is for the plain ``torch._grouped_mm`` path. MXFP8 uses a
+    different quantization contract and remains on its existing whole-dispatch
+    implementation.
+
+    Args:
+        hidden_states: Tensor of shape [tokens, hidden], with rows grouped contiguously by expert.
+        gate_and_up_projs: Tensor of shape [experts, hidden, gate_up], where ``gate_up`` stores the fused gate and
+            up projections in the ordering required by ``activation_fn``.
+        down_projs: Tensor of shape [experts, intermediate, hidden].
+        gate_up_proj_bias: Optional tensor of shape [experts, gate_up].
+        down_proj_bias: Optional tensor of shape [experts, hidden].
+        tokens_per_expert: Tensor of shape [experts] containing the number of contiguous rows for each expert.
+        permuted_probs: Tensor of shape [tokens, 1] containing each routed token's probability.
+        activation_fn: Callable mapping tensors of shape [chunk_tokens, gate_up] and [chunk_tokens, 1] to a tensor
+            of shape [chunk_tokens, intermediate].
+        apply_router_weight_after_down: Whether to apply ``permuted_probs`` after the down projection instead of in
+            ``activation_fn``.
+
+    Returns:
+        Tensor of shape [tokens, hidden] in ``hidden_states.dtype`` with independent storage.
+    """
+    output = torch.empty(
+        (hidden_states.shape[0], down_projs.shape[-1]),
+        dtype=hidden_states.dtype,
+        device=hidden_states.device,
+    )
+    token_counts = torch.as_tensor(tokens_per_expert, device=hidden_states.device, dtype=torch.long)
+    token_offsets = torch.cat((token_counts.new_zeros(1), token_counts.cumsum(dim=0)))
+    grouped_mm = select_grouped_mm(use_mxfp8=False)
+
+    def run_chunk(
+        chunk_hidden,
+        chunk_probs,
+        chunk_counts,
+        gate_up_weights,
+        down_weights,
+        gate_up_bias,
+        down_bias,
+    ):
+        """Compute one contiguous routing chunk.
+
+        Args:
+            chunk_hidden: Tensor of shape [chunk_tokens, hidden].
+            chunk_probs: Tensor of shape [chunk_tokens, 1].
+            chunk_counts: Tensor of shape [experts] containing this chunk's per-expert row counts.
+            gate_up_weights: Tensor of shape [experts, hidden, gate_up].
+            down_weights: Tensor of shape [experts, intermediate, hidden].
+            gate_up_bias: Optional tensor of shape [experts, gate_up].
+            down_bias: Optional tensor of shape [experts, hidden].
+
+        Returns:
+            Tensor of shape [chunk_tokens, hidden].
+        """
+        chunk_offs = chunk_counts.cumsum(dim=0).to(torch.int32)
+        gate_up = grouped_mm(chunk_hidden, gate_up_weights, chunk_offs)
+        gate_up = _apply_bias(gate_up, gate_up_bias, chunk_counts, reuse_input=True)
+        activation_probs = torch.ones_like(chunk_probs) if apply_router_weight_after_down else chunk_probs
+        activated = activation_fn(gate_up, activation_probs)
+        expert_output = grouped_mm(activated, down_weights, chunk_offs)
+        expert_output = _apply_bias(
+            expert_output,
+            down_bias,
+            chunk_counts,
+            None if apply_router_weight_after_down else chunk_probs,
+            reuse_input=True,
+        )
+        if apply_router_weight_after_down:
+            expert_output = _apply_router_weight_fp32(expert_output, chunk_probs, hidden_states.dtype)
+        return expert_output
+
+    for chunk_start in range(0, hidden_states.shape[0], _BIAS_CHUNK_ROWS):
+        chunk_end = min(chunk_start + _BIAS_CHUNK_ROWS, hidden_states.shape[0])
+        clipped_offsets = token_offsets.clamp(min=chunk_start, max=chunk_end)
+        chunk_counts = clipped_offsets[1:] - clipped_offsets[:-1]
+        args = (
+            hidden_states[chunk_start:chunk_end],
+            permuted_probs[chunk_start:chunk_end],
+            chunk_counts,
+            gate_and_up_projs,
+            down_projs,
+            gate_up_proj_bias,
+            down_proj_bias,
+        )
+        if torch.is_grad_enabled():
+            chunk_output = torch_checkpoint.checkpoint(run_chunk, *args, use_reentrant=False)
+        else:
+            chunk_output = run_chunk(*args)
+        output[chunk_start:chunk_end] = chunk_output
+    return output
+
+
 class GroupedExpertsDeepEP(nn.Module):
     """
     Sparse MoE implementation using grouped GEMM with DeepEP token dispatch.
@@ -1249,10 +1364,29 @@ class GroupedExpertsDeepEP(nn.Module):
         # With static routing (forced balance, no noise) every expert receives tokens by
         # construction, so the count_nonzero device-to-host read (one per microbatch, and
         # again per activation-checkpoint recompute) can be skipped.
+        router_weight_already_applied = False
         if self.static_routing or torch.count_nonzero(tokens_per_expert) > 0:
             tokens_per_expert_gpu = tokens_per_expert.to(device=permuted_local_hidden_states.device, non_blocking=True)
+            gate_up_output_bytes = (
+                permuted_local_hidden_states.shape[0]
+                * gate_and_up_projs.shape[-1]
+                * permuted_local_hidden_states.element_size()
+            )
 
-            if self.expert_bias:
+            if not self.use_mxfp8 and gate_up_output_bytes > _EXPERT_MLP_CHUNK_BYTES:
+                output2 = _checkpointed_chunked_expert_mlp(
+                    permuted_local_hidden_states,
+                    gate_and_up_projs,
+                    down_projs,
+                    self.gate_up_proj_bias.to_local() if self.expert_bias else None,
+                    self.down_proj_bias.to_local() if self.expert_bias else None,
+                    tokens_per_expert_gpu,
+                    permuted_probs,
+                    self.expert_activation,
+                    self.config.apply_router_weight_after_down,
+                )
+                router_weight_already_applied = self.config.apply_router_weight_after_down
+            elif self.expert_bias:
                 # torch._grouped_mm does not support bias yet (raises
                 # "RuntimeError: Bias not supported yet" as of PyTorch 2.10).
                 # Apply bias manually after each grouped GEMM via _apply_bias.
@@ -1292,7 +1426,7 @@ class GroupedExpertsDeepEP(nn.Module):
             output1_ = self.expert_activation(output1, activation_probs)
             output2 = torch.matmul(output1_, down_projs[0])
 
-        if self.config.apply_router_weight_after_down:
+        if self.config.apply_router_weight_after_down and not router_weight_already_applied:
             # HybridEP/DeepEP combine expects the expert activation dtype. Keep
             # the multiply in fp32, then cast each routed expert output back.
             # Chunked custom-autograd path: saves the raw inputs only, instead
