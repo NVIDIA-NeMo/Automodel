@@ -89,6 +89,13 @@ def test_generate_gpt_oss_120b_release_job_uses_ep64():
     assert recipe["distributed"]["activation_checkpointing"] is False
 
 
+def test_release_keeps_glm_53_cudnn_dsa_recipe_with_container_flashmla():
+    pipeline = generate_pipeline(".", "release", "llm_finetune")
+
+    assert "glm_5.2_tulu3_4k_cudnn_100k" not in pipeline
+    assert "glm_5.3_tulu3_4k_cudnn_100step" in pipeline
+
+
 def test_generate_gpt_oss_120b_benchmark_job_uses_ep64_without_activation_checkpointing():
     config = Path("examples/llm_benchmark/gpt_oss/gptoss_120b_te_deepep.yaml")
 

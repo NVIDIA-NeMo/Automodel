@@ -14,12 +14,12 @@
 
 # Benchmarking config for DeepSeek-V3 (671B) attn=sdpa + torch.compile(MLA) + experts=te (TE GroupedLinear, NO fp8), GB200 (BF16), NO PP — WAVE 11 bake-off.
 #
-# Single-variable delta vs deepseek_v3_sdpa_compile_gb200.yaml: experts gmm -> te.
+# TE expert-backend variant of deepseek_v3_sdpa_compile_gb200.yaml.
 # No te_fp8 block => TE GroupedLinear runs in BF16 (not fp8). Same compiled-MLA op point
 # (attn:sdpa/compile_attn/linear+norm=torch/rope_fusion=false, lbs2/GBS128/GA1/16N/ep64/AC).
 # ep_size=64 == world (16N x 4) => experts:te params NOT FSDP-wrapped (plain tensors) while the
 # rest are DTensor; optimizer.foreach=false avoids aten._foreach_lerp_ batching plain-Tensor +
-# DTensor (same fix as TE-mxfp8 ep==world). Baselines: gmm 26.48% MFU@2500 / 3.091s; torch_mm 24.95% / 3.281s.
+# DTensor (same fix as TE-mxfp8 ep==world). Native torch_mm comparison: 24.95% MFU@2500 / 3.281s.
 #
 # GB200 deltas vs the generic deepseek_v3_te_deepep.yaml:
 #   - peak_tflops: 989 -> 2500  (GB200 BF16 dense peak; generic recipe uses H100 989)
@@ -83,7 +83,7 @@ model:
     rms_norm: torch   # non-TE: TE RMSNorm is also compiler-disabled → breaks MLA fullgraph
     rope_fusion: false  # fused RoPE is a TE/compiler-disabled custom op → breaks fullgraph
     compile_attn: true
-    experts: te  # WAVE 11: TE GroupedLinear bf16 (no fp8); vs gmm 26.48% / torch_mm 24.95%
+    experts: te  # WAVE 11: TE GroupedLinear bf16 (no fp8); vs torch_mm 24.95%
     dispatcher: hybridep  # GB200: deepep fails EP-buffer init ('invalid resource handle')
     fake_balanced_gate: true
     enable_hf_state_dict_adapter: false

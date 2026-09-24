@@ -748,7 +748,7 @@ class TrainDSparkRecipe(BaseRecipe):
                     linear="torch",
                     rms_norm="torch_fp32",
                     rope_fusion=False,
-                    experts=str(recipe_cfg.get("target_experts", "gmm")),
+                    experts=str(recipe_cfg.get("target_experts", "torch_mm")),
                     dispatcher="hybridep",
                     enable_hf_state_dict_adapter=True,
                     enable_fsdp_optimizations=True,

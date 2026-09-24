@@ -16,6 +16,7 @@ import importlib.util
 import logging
 import math
 import os
+import warnings
 from collections.abc import Collection
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
@@ -39,7 +40,6 @@ logger = logging.getLogger(__name__)
 HAVE_TE = importlib.util.find_spec("transformer_engine") is not None
 HAVE_DEEP_EP = importlib.util.find_spec("deep_ep") is not None
 HAVE_UCCL_EP = importlib.util.find_spec("uccl") is not None or importlib.util.find_spec("ep") is not None
-HAVE_GMM = importlib.util.find_spec("grouped_gemm") is not None
 
 # ---------------------------------------------------------------------------
 #  Global state flags for training coordination
@@ -429,8 +429,8 @@ class BackendConfig:
             integrated for Llama-family rotary embeddings.
         rope_fusion: Whether to use fused RoPE (requires TE).
         experts: MoE expert GEMM backend. "torch" uses per-expert loop,
-            "te" uses TE GroupedLinear, "gmm" uses grouped_gemm.ops.gmm,
-            "torch_mm" uses torch._grouped_mm, "torch_mm_mxfp8" uses torch._grouped_mm
+            "te" uses TE GroupedLinear, "torch_mm" uses torch._grouped_mm,
+            "gmm" is a deprecated compatibility alias for "torch_mm", and "torch_mm_mxfp8" uses torch._grouped_mm
             dispatch but routes the expert grouped GEMMs through torchao's MXFP8
             scaled grouped GEMM (training-only; GB200/sm_100+ with torchao installed,
             else falls back to torch._grouped_mm at runtime).
@@ -595,6 +595,13 @@ class BackendConfig:
         if isinstance(self.gate_precision, str):
             self.gate_precision = dtype_from_str(self.gate_precision, default=None)
 
+        if self.experts == "gmm":
+            warnings.warn(
+                "experts='gmm' is deprecated; use experts='torch_mm' instead.",
+                FutureWarning,
+                stacklevel=2,
+            )
+
         # enable_deepep was removed. It is no longer honored; warn (once, on rank 0) if a stale
         # config still sets it so the user migrates to explicit dispatcher/experts. The field is
         # retained only so loading an old config does not crash this kw_only dataclass.
@@ -608,7 +615,8 @@ class BackendConfig:
                 )
             self.enable_deepep = None
 
-        # Backward compatibility
+        # TE grouped experts require a flex dispatcher. Keep the existing standard-
+        # dispatcher fallback for the deprecated gmm alias as well.
         if self.experts in ("te", "gmm") and self.dispatcher not in ("deepep", "hybridep", "uccl_ep", "mok"):
             if (
                 torch.distributed.is_initialized() and torch.distributed.get_rank() == 0
