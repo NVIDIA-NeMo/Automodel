@@ -1063,6 +1063,68 @@ class TestGroupedExpertsDeepEP:
         assert bias.grad is not None
         torch.testing.assert_close(bias.grad, expected_grad, rtol=0, atol=0)
 
+    def test_grouped_experts_deepep_apply_bias_large_cpu_fallback_multiplies_before_widening(self, moe_config):
+        """Large BF16/FP32 bias gradients retain the established FP32 product semantics."""
+        _ = GroupedExpertsDeepEP(moe_config)
+        n_tokens = 12290
+        value = torch.zeros(n_tokens, 1, dtype=torch.bfloat16)
+        bias = torch.zeros(1, 1, dtype=torch.bfloat16, requires_grad=True)
+        tokens_per_expert = torch.tensor([n_tokens])
+        permuted_probs = torch.empty(n_tokens, 1, dtype=torch.float32)
+        upstream_grad = torch.empty(n_tokens, 1, dtype=torch.bfloat16)
+        upstream_grad[0::2] = 2.921875
+        permuted_probs[0::2] = 0.14865228533744812
+        upstream_grad[1::2] = -0.64453125
+        permuted_probs[1::2] = 0.6738903522491455
+
+        _apply_bias(value, bias, tokens_per_expert, permuted_probs).backward(upstream_grad)
+
+        expected_grad = (upstream_grad.float() * permuted_probs).double().sum(dim=0).to(torch.bfloat16)
+        assert bias.grad is not None
+        torch.testing.assert_close(bias.grad[0], expected_grad, rtol=0, atol=0)
+
+    def test_grouped_experts_deepep_apply_bias_large_mixed_dtype_bias_gradient(self, moe_config):
+        """Large mixed-dtype bias gradients retain the forward's promoted precision."""
+        _ = GroupedExpertsDeepEP(moe_config)
+        tokens_per_expert = torch.tensor([1, 12288])
+        n_tokens = int(tokens_per_expert.sum())
+        torch.manual_seed(456)
+        value = torch.randn(n_tokens, 2, dtype=torch.float32, requires_grad=True)
+        bias = torch.randn(2, 2, dtype=torch.float64, requires_grad=True)
+        permuted_probs = torch.rand(n_tokens, 1, dtype=torch.float32, requires_grad=True)
+        upstream_grad = torch.randn_like(value)
+
+        expected_value = value.detach().clone().requires_grad_()
+        expected_bias = bias.detach().clone().requires_grad_()
+        expected_probs = permuted_probs.detach().clone().requires_grad_()
+        expected_bias_rows = torch.repeat_interleave(
+            expected_bias,
+            tokens_per_expert,
+            dim=0,
+            output_size=n_tokens,
+        )
+        expected = (expected_value + expected_bias_rows * expected_probs).to(expected_value.dtype)
+        expected.backward(upstream_grad)
+
+        result = _apply_bias(value, bias, tokens_per_expert, permuted_probs)
+        result.backward(upstream_grad)
+
+        compiled_value = value.detach().clone().requires_grad_()
+        compiled_bias = bias.detach().clone().requires_grad_()
+        compiled_probs = permuted_probs.detach().clone().requires_grad_()
+        compiled_apply_bias = torch.compile(_apply_bias, backend="aot_eager", fullgraph=True)
+        compiled_result = compiled_apply_bias(compiled_value, compiled_bias, tokens_per_expert, compiled_probs)
+        compiled_result.backward(upstream_grad)
+
+        torch.testing.assert_close(result, expected)
+        torch.testing.assert_close(value.grad, expected_value.grad)
+        torch.testing.assert_close(bias.grad, expected_bias.grad)
+        torch.testing.assert_close(permuted_probs.grad, expected_probs.grad)
+        torch.testing.assert_close(compiled_result, expected)
+        torch.testing.assert_close(compiled_value.grad, expected_value.grad)
+        torch.testing.assert_close(compiled_bias.grad, expected_bias.grad)
+        torch.testing.assert_close(compiled_probs.grad, expected_probs.grad)
+
     def test_deterministic_bias_repeat_interleave_supports_higher_order_gradients(self):
         """The differentiable fallback preserves the custom function's double backward."""
         bias = torch.randn(3, 2, dtype=torch.float64, requires_grad=True)

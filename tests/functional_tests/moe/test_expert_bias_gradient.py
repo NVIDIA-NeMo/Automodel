@@ -158,3 +158,57 @@ def test_apply_bias_triton_backward_is_inductor_fullgraph_compatible():
     assert value.grad is not None
     assert bias.grad is not None
     assert permuted_probs.grad is not None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_apply_bias_chunked_fallback_preserves_cuda_float64_gradient():
+    """The non-Triton CUDA fallback keeps float64 products and accumulation."""
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    n_tokens = 16384
+    value = torch.zeros(n_tokens, 1, dtype=torch.float64, device=device)
+    bias = torch.zeros(1, 1, dtype=torch.float64, device=device, requires_grad=True)
+    tokens_per_expert = torch.tensor([n_tokens], dtype=torch.long, device=device)
+    permuted_probs = torch.ones(n_tokens, 1, dtype=torch.float64, device=device)
+    permuted_probs[n_tokens // 2 :] = 1.0 - 1.0e-10
+    upstream_grad = torch.ones_like(value)
+    upstream_grad[n_tokens // 2 :] = -1.0
+
+    _apply_bias(value, bias, tokens_per_expert, permuted_probs).backward(upstream_grad)
+
+    expected_grad = (upstream_grad * permuted_probs).sum(dim=0)
+    assert bias.grad is not None
+    torch.testing.assert_close(bias.grad[0], expected_grad, rtol=1.0e-9, atol=1.0e-12)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_apply_bias_large_weighted_double_backward_is_deterministic():
+    """Large weighted bias second derivatives use deterministic segmented reductions."""
+    assert _BIAS_GRAD_TRITON_AVAILABLE
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    n_tokens = 16384
+    hidden = 8
+    tokens_per_expert = torch.tensor([0, n_tokens // 2, n_tokens // 2, 0], dtype=torch.long, device=device)
+    value = torch.zeros(n_tokens, hidden, dtype=torch.bfloat16, device=device)
+    bias_data = torch.randn(4, hidden, dtype=torch.bfloat16, device=device)
+    probs_data = torch.rand(n_tokens, 1, dtype=torch.float32, device=device)
+    upstream_grad = torch.randn_like(value)
+    second_upstream = torch.randn_like(probs_data)
+
+    expected_rows = (upstream_grad.float() * second_upstream).to(torch.bfloat16)
+    expected_grad = torch.stack(
+        [segment.double().sum(dim=0) for segment in torch.split(expected_rows, tokens_per_expert.tolist())]
+    ).to(torch.bfloat16)
+
+    first_second_grad = None
+    for _ in range(5):
+        bias = bias_data.clone().requires_grad_()
+        probs = probs_data.clone().requires_grad_()
+        output = _apply_bias(value, bias, tokens_per_expert, probs)
+        grad_probs = torch.autograd.grad(output, probs, grad_outputs=upstream_grad, create_graph=True)[0]
+        second_grad = torch.autograd.grad(grad_probs, bias, grad_outputs=second_upstream)[0]
+
+        torch.testing.assert_close(second_grad, expected_grad)
+        if first_second_grad is None:
+            first_second_grad = second_grad.clone()
+        else:
+            torch.testing.assert_close(second_grad, first_second_grad, rtol=0, atol=0)
