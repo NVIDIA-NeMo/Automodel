@@ -842,7 +842,8 @@ def test_fully_shard_by_dtype_internal_child_preserves_natural_output_dtype(monk
     assert mp_policy.output_dtype == torch.float32
 
 
-def test_fully_shard_by_dtype_excludes_ep_params_and_uses_custom_sharder():
+@pytest.mark.parametrize("nested_moe", [False, True], ids=["flat", "nested"])
+def test_fully_shard_by_dtype_excludes_ep_params_and_uses_custom_sharder(nested_moe):
     """Ignored EP experts do not affect grouping and remain excluded from the block unit."""
 
     class Router(nn.Module):
@@ -856,11 +857,15 @@ def test_fully_shard_by_dtype_excludes_ep_params_and_uses_custom_sharder():
             super().__init__()
             self.bulk_1 = nn.Linear(4, 4, bias=False).to(torch.bfloat16)
             self.bulk_2 = nn.Linear(4, 4, bias=False).to(torch.bfloat16)
-            self.gate = Router()
-            self.experts = nn.Linear(4, 4, bias=False).to(torch.bfloat16)
+            if nested_moe:
+                self.mlp = nn.Module()
+            owner = self.mlp if nested_moe else self
+            owner.gate = Router()
+            owner.experts = nn.Linear(4, 4, bias=False).to(torch.bfloat16)
 
     block = MoEBlock()
-    expert_params = set(block.experts.parameters())
+    moe = block.mlp if nested_moe else block
+    expert_params = set(moe.experts.parameters())
     calls: list[tuple[nn.Module, dict]] = []
 
     def custom_fully_shard(module, **kwargs):
@@ -877,12 +882,18 @@ def test_fully_shard_by_dtype_excludes_ep_params_and_uses_custom_sharder():
         fully_shard_fn=custom_fully_shard,
     )
 
-    assert [module for module, _ in calls] == [block.gate, block]
-    assert calls[0][1]["mp_policy"].param_dtype == torch.float32
-    assert "ignored_params" not in calls[0][1]
+    assert len(calls) == 2
+    router_unit, router_kwargs = calls[0]
+    assert set(router_unit.parameters()) - router_kwargs.get("ignored_params", set()) == {moe.gate.weight}
+    router_policy = router_kwargs["mp_policy"]
+    assert router_policy.param_dtype == torch.float32
+    assert router_policy.reduce_dtype == torch.float32
+    assert router_policy.output_dtype is None
+    assert router_policy.cast_forward_inputs is False
+    assert calls[1][0] is block
     assert calls[1][1]["mp_policy"].param_dtype == torch.bfloat16
     assert calls[1][1]["ignored_params"] == expert_params
-    assert all(module is not block.experts for module, _ in calls)
+    assert all(module is not moe.experts for module, _ in calls)
 
 
 def test_fully_shard_by_dtype_fp32_holder_preserves_natural_output_dtype():

@@ -694,6 +694,10 @@ def apply_fsdp(
         from nemo_automodel.components.models.deepseek_v4.fsdp import fully_shard_deepseek_v4
 
         fully_shard_impl = fully_shard_deepseek_v4
+    elif getattr(model, "_nemo_fully_shard_fn", None) is not None:
+        # Model-owned ``fully_shard`` replacement for every FSDP unit of this model (same contract as the DeepSeek-V4
+        # branch above), e.g. Beam keeps its fp32 RoPE tensors across the block boundary. Absent attribute: unchanged.
+        fully_shard_impl = model._nemo_fully_shard_fn
 
     fully_shard_default = functools.partial(
         fully_shard_impl,

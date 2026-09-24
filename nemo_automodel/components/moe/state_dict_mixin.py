@@ -49,6 +49,89 @@ class MoESplitExpertsStateDictMixin:
     # - self.config: Model configuration object
     # - self.backend: Backend configuration object
 
+    def to_hf(
+        self,
+        state_dict: dict[str, Any],
+        exclude_key_regex: str | None = None,
+        quantization: bool = False,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Export split experts and pass through other model state.
+
+        Args:
+            state_dict: Native mapping. Grouped gate/up tensors have shape
+                [experts, hidden, 2 * expert_hidden] and down tensors have shape
+                [experts, expert_hidden, hidden], where expert_hidden is the FFN width.
+                Other tensors have arbitrary model-owned layouts; extra state may be non-tensor metadata.
+                Expert DTensors follow the sharding contract of _split_experts_weights.
+            exclude_key_regex: Pattern selecting exported keys to omit.
+            quantization: Forward the shared expert converter's quantization option.
+            **kwargs: Adapter options, including v4_compatible and for_checkpoint_load.
+
+        Returns:
+            HF mapping with per-expert gate/up tensors [expert_hidden, hidden] and
+            down tensors [hidden, expert_hidden]. Other values pass through by alias.
+            LoRA layouts follow convert_single_tensor_to_hf. Checkpoint-load expert
+            destinations alias native storage on backends supporting write-through loading.
+        """
+        return {
+            key: value
+            for fqn, tensor in state_dict.items()
+            for key, value in self.convert_single_tensor_to_hf(
+                fqn, tensor, exclude_key_regex=exclude_key_regex, quantization=quantization, **kwargs
+            )
+        }
+
+    def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs: Any) -> list[tuple[str, Any]]:
+        """Export one grouped expert, LoRA tensor, or unchanged model-state entry.
+
+        Args:
+            fqn: Native parameter or state-entry name.
+            tensor: Grouped gate/up weight [experts, hidden, 2 * expert_hidden], down
+                weight [experts, expert_hidden, hidden], or an arbitrary non-expert value.
+                LoRA inputs follow _convert_lora_to_paramwrapper's documented layouts.
+            **kwargs: Shared conversion options including exclude_key_regex,
+                quantization, v4_compatible, and for_checkpoint_load.
+
+        Returns:
+            HF name/value pairs. Expert gate/up weights have shape [expert_hidden, hidden]
+            and down weights [hidden, expert_hidden]. LoRA outputs follow
+            _convert_lora_to_paramwrapper, or _convert_lora_expert_to_hf in v4 mode.
+            Non-expert values pass through by alias. Expert load destinations preserve
+            _convert_single_merged_expert_to_hf_split_experts's write-through semantics.
+        """
+        result = self._convert_single_merged_expert_to_hf_split_experts(fqn, tensor, **kwargs)
+        if result is None:
+            result = [(fqn, tensor)]
+        exclude_key_regex = kwargs.get("exclude_key_regex")
+        if exclude_key_regex:
+            result = [(key, value) for key, value in result if not re.match(exclude_key_regex, key)]
+        return result
+
+    def from_hf(
+        self, hf_state_dict: dict[str, Any], device_mesh: DeviceMesh | None = None, **kwargs: Any
+    ) -> dict[str, Any]:
+        """Import split experts and ParamWrapper LoRA, preserving other model state.
+
+        Args:
+            hf_state_dict: Mapping consumed by this call, with per-expert gate/up tensors [expert_hidden, hidden]
+                and down tensors [hidden, expert_hidden]. Other tensors retain arbitrary
+                model-owned layouts. ParamWrapper tensors follow _convert_paramwrapper_to_native.
+            device_mesh: Optional expert-parallel mesh; only this rank's experts are loaded.
+            **kwargs: Compatibility options accepted by the StateDictAdapter API.
+
+        Returns:
+            Native mapping with grouped gate/up tensors [local_experts, hidden, 2 * expert_hidden]
+            and down tensors [local_experts, expert_hidden, hidden]. Non-expert values
+            pass through by alias. DTensor placement and already-loaded expert handling
+            follow _from_hf_w_merged_experts; LoRA layouts follow _convert_paramwrapper_to_native.
+        """
+        for key in hf_state_dict:
+            if f".{self._expert_path_segment}." in key and key.endswith(".weight"):
+                self._uses_model_prefix = key.startswith("model.")
+                break
+        return self._from_hf_w_merged_experts(hf_state_dict, device_mesh)
+
     @property
     def supports_write_through_checkpoint_load(self) -> bool:
         """Whether every checkpoint tensor, including expert tensors, loads directly into model weights."""
