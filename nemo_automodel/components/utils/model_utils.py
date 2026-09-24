@@ -313,8 +313,9 @@ def print_trainable_parameters(model: nn.Module, name: str = "Model") -> tuple[i
 
 def _freeze_module_by_attribute_and_patterns(model, attribute_name, name_patterns):
     """Freeze a legacy model attribute and modules matching name substrings."""
-    if attribute_name is not None and hasattr(model, attribute_name):
-        getattr(model, attribute_name).requires_grad_(False)
+    module = getattr(model, attribute_name, None) if attribute_name is not None else None
+    if module is not None:
+        module.requires_grad_(False)
 
     for name, module in model.named_modules():
         if any(pattern in name.lower() for pattern in name_patterns):
