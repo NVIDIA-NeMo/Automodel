@@ -766,7 +766,6 @@ def apply_fsdp(
     mp_policy: MixedPrecisionPolicy | None = None,
     offload_policy: OffloadPolicy | None = None,
     reshard_after_forward: bool = False,
-    experts_reshard_after_forward: bool | None = None,
     lm_head_precision: str | torch.dtype | None = None,
     wrap_outer_model: bool = True,
     frozen_multimodal_sharding: FrozenMultimodalSharding = "root",
@@ -898,10 +897,7 @@ def apply_fsdp(
                 device_mesh=fsdp_mesh,
                 placements=[Replicate()] * fsdp_mesh.ndim,
             )
-        expert_reshard_policy = (
-            reshard_after_forward if experts_reshard_after_forward is None else experts_reshard_after_forward
-        )
-        block_experts_reshard_after_forward = False if id(block) in mtp_block_ids else expert_reshard_policy
+        experts_reshard_after_forward = False if id(block) in mtp_block_ids else reshard_after_forward
         if isinstance(moe_module, MoE) and ep_shard_enabled:
             if (
                 isinstance(moe_module.experts, GroupedExpertsMoK)
@@ -919,7 +915,7 @@ def apply_fsdp(
                 moe_module.experts,
                 mesh=ep_shard_mesh,
                 shard_placement_fn=_moe_shard_placement,
-                reshard_after_forward=block_experts_reshard_after_forward,
+                reshard_after_forward=experts_reshard_after_forward,
                 mp_policy=experts_mp_policy,
                 offload_policy=offload_policy,
             )
@@ -1151,7 +1147,6 @@ def parallelize_model(
     ignore_router_for_ac: bool = True,
     activation_checkpointing_scope: str | list[str] | tuple[str, ...] = "all",
     reshard_after_forward: bool = False,
-    experts_reshard_after_forward: bool | None = None,
     lm_head_precision: str | torch.dtype | None = None,
     wrap_outer_model: bool = True,
     mp_policy: MixedPrecisionPolicy | None = None,
@@ -1261,7 +1256,6 @@ def parallelize_model(
             mp_policy=mp_policy,
             offload_policy=offload_policy,
             reshard_after_forward=reshard_after_forward,
-            experts_reshard_after_forward=experts_reshard_after_forward,
             lm_head_precision=lm_head_precision,
             wrap_outer_model=wrap_outer_model,
             frozen_multimodal_sharding=frozen_multimodal_sharding,

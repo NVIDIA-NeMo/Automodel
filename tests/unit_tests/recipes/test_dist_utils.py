@@ -292,16 +292,10 @@ class TestMoE:
     def test_moe_fields_pass_through(self):
         cfg = {
             "ep_size": 2,
-            "moe": {
-                "ignore_router_for_ac": True,
-                "reshard_after_forward": True,
-                "experts_reshard_after_forward": False,
-                "wrap_outer_model": False,
-            },
+            "moe": {"ignore_router_for_ac": True, "reshard_after_forward": True, "wrap_outer_model": False},
         }
         result = parse_distributed_section(cfg)
         assert result["moe_parallel_config"].reshard_after_forward is True
-        assert result["moe_parallel_config"].experts_reshard_after_forward is False
         assert result["moe_parallel_config"].wrap_outer_model is False
 
     def test_empty_moe_dict_uses_defaults(self):
