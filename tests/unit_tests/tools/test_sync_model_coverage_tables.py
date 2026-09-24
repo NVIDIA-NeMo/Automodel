@@ -36,10 +36,13 @@ from tests.ci_tests.utils.sync_model_coverage_tables import (
     _load_model_doc_catalog,
     _load_model_docs,
     _load_model_releases,
+    _ModelDoc,
+    _ModelRelease,
     _parse_doc_arch_aliases,
     _parse_registry_entries,
     _render_registry_table,
     _replace_generated_block,
+    _resolve_model_card_routes,
     _strip_generated_tables,
     _sync_tables,
     _validate_dated_support_tables_are_generated,
@@ -249,6 +252,82 @@ def test_model_release_docs_pages_exist_in_nightly_navigation():
     missing_pages = sorted(internal_pages - _collect_fern_routes(navigation, config_dir=config_path.parent))
 
     assert not missing_pages, f"Model release docs pages missing from nightly navigation: {missing_pages}"
+
+
+def test_recipe_model_id_can_redirect_to_one_shared_model_card(tmp_path):
+    docs_config_path = tmp_path / "docs" / "fern" / "docs.yml"
+    docs_config_path.parent.mkdir(parents=True)
+    docs_config_path.write_text(
+        yaml.safe_dump(
+            {
+                "redirects": [
+                    {
+                        "source": "/nemo/automodel/model-coverage/large-language-models/org/model",
+                        "destination": "/nemo/automodel/model-coverage/large-language-models/org/model-instruct",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    model_doc = _ModelDoc(
+        "LLM",
+        "/model-coverage/large-language-models/org/model-instruct",
+        (),
+    )
+    release = _ModelRelease("2026-01-01", "org/model", "https://huggingface.co/org/model", "LLM", "recipe.yaml")
+
+    routes = _resolve_model_card_routes(
+        tmp_path,
+        [release],
+        {"org/model-instruct": [model_doc]},
+        [model_doc],
+    )
+
+    assert routes == {("org/model", "LLM"): model_doc.docs_page}
+
+
+def test_recipe_model_id_without_model_card_is_rejected(tmp_path):
+    docs_config_path = tmp_path / "docs" / "fern" / "docs.yml"
+    docs_config_path.parent.mkdir(parents=True)
+    docs_config_path.write_text("redirects: []\n", encoding="utf-8")
+    model_doc = _ModelDoc(
+        "LLM",
+        "/model-coverage/large-language-models/org/other-model",
+        (),
+    )
+    release = _ModelRelease(
+        "2026-01-01",
+        "org/missing-model",
+        "https://huggingface.co/org/missing-model",
+        "LLM",
+        "recipe.yaml",
+    )
+
+    with pytest.raises(ValueError, match=r"missing: LLM: org/missing-model"):
+        _resolve_model_card_routes(
+            tmp_path,
+            [release],
+            {"org/other-model": [model_doc]},
+            [model_doc],
+        )
+
+
+def test_recipe_model_id_with_multiple_model_cards_is_rejected(tmp_path):
+    docs_config_path = tmp_path / "docs" / "fern" / "docs.yml"
+    docs_config_path.parent.mkdir(parents=True)
+    docs_config_path.write_text("redirects: []\n", encoding="utf-8")
+    first_doc = _ModelDoc("LLM", "/model-coverage/large-language-models/first/model", ())
+    second_doc = _ModelDoc("LLM", "/model-coverage/large-language-models/second/model", ())
+    release = _ModelRelease("2026-01-01", "org/model", "https://huggingface.co/org/model", "LLM", "recipe.yaml")
+
+    with pytest.raises(ValueError, match=r"ambiguous: LLM: org/model"):
+        _resolve_model_card_routes(
+            tmp_path,
+            [release],
+            {"org/first": [first_doc], "org/second": [second_doc]},
+            [first_doc, second_doc],
+        )
 
 
 def test_embedding_and_reranking_releases_are_discovered_from_recipes():
@@ -469,32 +548,16 @@ def _model_size_key(hf_model_id: str) -> tuple[str, str]:
 
 def test_recipe_backed_model_sizes_have_exact_index_routes_and_one_card():
     repo_root = Path(__file__).parents[3]
-    model_docs, _ = _load_model_docs(repo_root / "docs")
+    model_docs, _, documented_models = _load_model_doc_catalog(repo_root / "docs")
     releases = _load_model_releases(repo_root, model_docs)
-    unavailable_hf_models = {
-        # The checked-in recipe currently names an unpublished Hugging Face repository.
-        "nvidia/NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained",
-    }
-    category_by_type = {
-        "LLM": "large-language-models",
-        "Encoder-Decoder": "large-language-models",
-        "VLM": "vision-language-models",
-        "Multimodal": "multimodal",
-        "Omni": "omni",
-        "dLLM": "dllm",
-        "Diffusion": "diffusion",
-        "Embedding": "embedding-models",
-        "Reranking": "reranking-models",
-    }
+    model_card_routes = _resolve_model_card_routes(repo_root, releases, model_docs, documented_models)
 
     index_routes: dict[str, set[str]] = {}
-    providers_by_owner: dict[tuple[str, str], set[str]] = {}
     duplicates: list[tuple[str, str]] = []
     for index_path in (repo_root / "docs" / "model-coverage").glob("*/*/index.mdx"):
         provider_route = _frontmatter_slug(index_path)
         assert provider_route is not None
         provider_href = f"/{provider_route}"
-        category = provider_route.split("/")[1]
         document = index_path.read_text(encoding="utf-8")
         labels = set()
         for label, href in re.findall(r"^- \[`([^`]+)`\]\((/model-coverage/[^)]+)\)$", document, re.MULTILINE):
@@ -503,46 +566,16 @@ def test_recipe_backed_model_sizes_have_exact_index_routes_and_one_card():
                 duplicates.append((provider_href, label))
             labels.add(normalized_label)
             index_routes.setdefault(provider_href, set()).add(href)
-        for card_path in index_path.parent.glob("*.mdx"):
-            if card_path.name == "index.mdx":
-                continue
-            card = card_path.read_text(encoding="utf-8")
-            for owner in re.findall(r"https://huggingface\.co/([A-Za-z0-9_.-]+)/[A-Za-z0-9_.-]+", card):
-                providers_by_owner.setdefault((category, owner.casefold()), set()).add(provider_href)
     assert not duplicates, f"Duplicate model names within one provider index: {duplicates}"
 
     docs_config = yaml.safe_load((repo_root / "docs" / "fern" / "docs.yml").read_text(encoding="utf-8"))
     redirects = {redirect["source"]: redirect["destination"] for redirect in docs_config["redirects"]}
-    config_path = repo_root / "docs" / "fern" / "versions" / "nightly.yml"
-    navigation = yaml.safe_load(config_path.read_text(encoding="utf-8"))["navigation"]
-    navigated_routes = _collect_fern_routes(navigation, config_dir=config_path.parent)
 
     destinations_by_group: dict[tuple[str, tuple[str, str]], set[str]] = {}
     destination_groups: dict[tuple[str, str], set[tuple[str, str]]] = {}
     missing = []
     for release in releases:
-        if release.hf_model_id in unavailable_hf_models:
-            continue
-        category = category_by_type[release.model_type]
-        owner, model_name = release.hf_model_id.split("/", 1)
-        model_name = model_name.replace("_", "-")
-        provider_hrefs = {
-            provider_href
-            for provider_href in providers_by_owner.get((category, owner.casefold()), set())
-            if f"{provider_href}/{model_name}" in navigated_routes
-            or f"/nemo/automodel{provider_href}/{model_name}" in redirects
-        }
-        destinations = {
-            redirects.get(
-                f"/nemo/automodel{provider_href}/{model_name}", f"/nemo/automodel{provider_href}/{model_name}"
-            ).removeprefix("/nemo/automodel")
-            for provider_href in provider_hrefs
-        }
-        destinations &= navigated_routes
-        if len(destinations) != 1:
-            missing.append((release.model_type, release.hf_model_id, f"card destinations {sorted(destinations)}"))
-            continue
-        destination = next(iter(destinations))
+        destination = model_card_routes[(release.hf_model_id, release.model_type)]
         provider_href = destination.rsplit("/", 1)[0]
         if destination not in index_routes.get(provider_href, set()):
             missing.append((release.model_type, release.hf_model_id, f"provider index card {destination}"))
@@ -687,7 +720,7 @@ def test_sync_tables_writes_support_log_homepage_and_registry(tmp_path):
     model_docs, _ = _load_model_docs(tmp_path / "docs")
     releases = _load_model_releases(tmp_path, model_docs)
 
-    changed_paths = _sync_tables(tmp_path, check=False)
+    changed_paths = _sync_tables(tmp_path, check=False, validate_model_cards=False)
 
     assert changed_paths == [
         tmp_path / "docs" / "model-coverage" / "latest-models.mdx",
@@ -730,7 +763,7 @@ def test_sync_tables_writes_support_log_homepage_and_registry(tmp_path):
     assert "| `NewModel` | NeMo native | `models.new.NewModel` |" in (
         tmp_path / "docs" / "model-coverage" / "overview.mdx"
     ).read_text(encoding="utf-8")
-    assert _sync_tables(tmp_path, check=True) == []
+    assert _sync_tables(tmp_path, check=True, validate_model_cards=False) == []
 
 
 def test_model_release_uses_first_recipe_addition_date(tmp_path):
@@ -917,7 +950,7 @@ def test_sync_tables_check_rejects_stale_generated_support_log(tmp_path):
     )
 
     with pytest.raises(ValueError, match="latest-models.mdx"):
-        _sync_tables(tmp_path, check=True)
+        _sync_tables(tmp_path, check=True, validate_model_cards=False)
 
 
 @pytest.mark.parametrize("table_header", [DATED_SUPPORT_TABLE_HEADER, DATED_MODEL_TABLE_HEADER])
