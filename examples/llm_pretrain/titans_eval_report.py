@@ -34,6 +34,9 @@ CAVEATS = (
     "No compatible parameter-matched floor or full-attention control is available; "
     "the figures compare Titans architectures and the within-checkpoint TTT on/off intervention only.",
     "S-NIAH-N / essay at context length 512 is unavailable and is not interpolated or otherwise imputed.",
+    "The co-author protocol established n=300 cells as three 100-sample seeds. "
+    "These AutoModel runs contain 300 deterministic samples per cell, but their manifests do not establish "
+    "three-seed provenance; treat them as protocol-aligned rather than bit-exact replications.",
 )
 RULER_FIELDS = (
     "architecture",
