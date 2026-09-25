@@ -419,7 +419,10 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         kwargs = dict(kwargs)  # Defensive copy so retries get clean state
         has_packed_sequence = kwargs.pop("has_packed_sequence", False)
         freeze_config = kwargs.pop("freeze_config", None)
-        cache_dir = kwargs.get("cache_dir", hf_constants.HF_HUB_CACHE)
+        cache_dir = kwargs.pop("cache_dir", hf_constants.HF_HUB_CACHE)
+        if isinstance(pretrained_model_name_or_path_or_config, str):
+            # Hub loaders need the cache location; from_config constructors do not.
+            kwargs["cache_dir"] = cache_dir
 
         def _retry(**override):
             """Re-enter ``_build_model`` with overridden parameters."""

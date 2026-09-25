@@ -26,6 +26,7 @@ from transformers import AutoConfig
 
 from nemo_automodel import NeMoAutoConfig
 from nemo_automodel.components.config.loader import ConfigNode
+from tests.unit_tests._transformers._cache_ref_writer import _truncate_ref
 
 A, B = "a" * 40, "b" * 40
 REPO = "test/config-race"
@@ -104,14 +105,6 @@ def test_plain_transformers_target_keeps_online_semantics(hf_config_hub):
     assert requests
 
 
-def _truncate_ref(ref, download_done, ref_empty, release_writer):
-    assert download_done.wait(10)
-    with ref.open("w") as stream:
-        ref_empty.set()
-        assert release_writer.wait(10)
-        stream.write(B)
-
-
 @pytest.mark.parametrize("writer_kind", ["thread", "process"])
 @pytest.mark.parametrize("loader", [AutoConfig, NeMoAutoConfig])
 def test_concurrent_ref_truncation_after_download(hf_config_hub, monkeypatch, loader, writer_kind):
@@ -129,7 +122,7 @@ def test_concurrent_ref_truncation_after_download(hf_config_hub, monkeypatch, lo
     monkeypatch.setattr("transformers.utils.hub.hf_hub_download", interleaved_download)
     monkeypatch.setattr("nemo_automodel._transformers.auto_config.hf_hub_download", interleaved_download)
     writer_class = context.Process if writer_kind == "process" else context.Thread
-    writing = writer_class(target=_truncate_ref, args=(ref, download_done, ref_empty, release_writer))
+    writing = writer_class(target=_truncate_ref, args=(ref, download_done, ref_empty, release_writer, B))
     writing.start()
     try:
         if loader is AutoConfig:
