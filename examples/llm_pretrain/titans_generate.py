@@ -8,9 +8,41 @@ import json
 from pathlib import Path
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from safetensors.torch import load_file
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 import nemo_automodel.components.models.titans  # noqa: F401 - registers Titans with HF Auto*
+
+
+def load_consolidated_state_dict(checkpoint: Path) -> dict[str, torch.Tensor]:
+    """Load every tensor from a consolidated HF safetensors checkpoint."""
+    index_path = checkpoint / "model.safetensors.index.json"
+    single_path = checkpoint / "model.safetensors"
+    if index_path.is_file():
+        with index_path.open() as stream:
+            weight_map = json.load(stream)["weight_map"]
+        shard_names = sorted(set(weight_map.values()))
+        expected_keys = set(weight_map)
+    elif single_path.is_file():
+        shard_names = [single_path.name]
+        expected_keys = None
+    else:
+        raise FileNotFoundError(f"No Hugging Face safetensors found in {checkpoint}")
+
+    state_dict: dict[str, torch.Tensor] = {}
+    for shard_name in shard_names:
+        shard = load_file(str(checkpoint / shard_name), device="cpu")
+        duplicate_keys = state_dict.keys() & shard.keys()
+        if duplicate_keys:
+            raise RuntimeError(f"Duplicate checkpoint tensors: {sorted(duplicate_keys)[:10]}")
+        state_dict.update(shard)
+
+    if expected_keys is not None and set(state_dict) != expected_keys:
+        raise RuntimeError(
+            f"Safetensors index mismatch: missing={sorted(expected_keys - state_dict.keys())[:10]}, "
+            f"unexpected={sorted(state_dict.keys() - expected_keys)[:10]}"
+        )
+    return state_dict
 
 
 class TitansGenerator:
@@ -20,23 +52,16 @@ class TitansGenerator:
         self.device = device
         dtype = torch.bfloat16 if device.startswith("cuda") else torch.float32
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer, trust_remote_code=True)
-        self.model, loading_info = AutoModelForCausalLM.from_pretrained(
-            checkpoint,
-            torch_dtype=dtype,
-            trust_remote_code=True,
-            key_mapping={
-                r"^(.*\.memory)\.A_log$": r"\1._fp32_params.A_log",
-                r"^(.*\.memory)\.dt_bias$": r"\1._fp32_params.dt_bias",
-            },
-            output_loading_info=True,
-        )
-        load_errors = {
-            name: loading_info.get(name, [])
-            for name in ("missing_keys", "unexpected_keys", "mismatched_keys", "error_msgs")
-            if loading_info.get(name)
-        }
-        if load_errors:
-            raise RuntimeError(f"Checkpoint did not load strictly from {checkpoint}: {load_errors}")
+        config = AutoConfig.from_pretrained(checkpoint, trust_remote_code=True)
+        config.torch_dtype = dtype
+        self.model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
+        if not hasattr(self.model, "state_dict_adapter"):
+            raise TypeError(f"{checkpoint} did not construct an AutoModel Titans causal LM")
+
+        hf_state_dict = load_consolidated_state_dict(checkpoint)
+        native_state_dict = self.model.state_dict_adapter.from_hf(hf_state_dict)
+        self.model.load_state_dict(native_state_dict, strict=True)
+        self.model.tie_weights()
         self.model.to(device)
         self.model.eval()
         if not hasattr(self.model, "generate_full_prefix"):
