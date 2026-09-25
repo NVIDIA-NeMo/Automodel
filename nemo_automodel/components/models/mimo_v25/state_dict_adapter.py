@@ -120,6 +120,19 @@ class MiMoV2StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
         return hf_state_dict
 
     def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
+        """Convert one parameter into HF weights and FP8 scale tensors.
+
+        Args:
+            fqn: Automodel parameter name.
+            tensor: Parameter tensor, possibly a DTensor with global shape.
+            **kwargs: Adapter options, including ``for_checkpoint_load`` when
+                allocating destinations for the pretrained checkpoint.
+
+        Returns:
+            Named tensors in HF layout. For checkpoint loading, fused QKV
+            scales have shape [tp * ceil(rows_per_tp / 128), ceil(hidden / 128)]
+            and are replicated regular tensors, including for sharded weights.
+        """
         exclude_key_regex = kwargs.get("exclude_key_regex", None)
 
         expert_result = self._convert_single_merged_expert_to_hf_split_experts(fqn, tensor, **kwargs)
@@ -133,7 +146,19 @@ class MiMoV2StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
             if _should_quantize_key(key):
                 quantized = value.to(dtype=torch.float8_e4m3fn)
                 quantized_result.append((key, quantized))
-                quantized_result.append((key + "_scale_inv", create_scale_inv_for_weight(quantized)))
+                if kwargs.get("for_checkpoint_load", False) and key.endswith(".self_attn.qkv_proj.weight"):
+                    # Checkpoint TP shards each start a fresh FP8 block grid;
+                    # rounding the concatenated row count loses boundary blocks.
+                    checkpoint_tp = int(self.config.num_key_value_heads)
+                    rows_per_shard = quantized.shape[0] // checkpoint_tp
+                    scale_shape = (
+                        checkpoint_tp * ((rows_per_shard + 127) // 128),
+                        (quantized.shape[1] + 127) // 128,
+                    )
+                    scale_inv = torch.ones(scale_shape, dtype=torch.float32, device=quantized.device)
+                else:
+                    scale_inv = create_scale_inv_for_weight(quantized)
+                quantized_result.append((key + "_scale_inv", scale_inv))
             else:
                 quantized_result.append((key, value))
         return quantized_result

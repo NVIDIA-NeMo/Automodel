@@ -17,7 +17,27 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.mimo_v25.state_dict_adapter import MiMoV2StateDictAdapter
+
+
+@pytest.mark.parametrize("layer_idx", [0, 1])
+def test_checkpoint_load_allocates_tp8_qkv_scale_grid(layer_idx):
+    adapter = MiMoV2StateDictAdapter.__new__(MiMoV2StateDictAdapter)
+    adapter.config = SimpleNamespace(num_key_value_heads=8)
+    adapter.moe_config = SimpleNamespace(n_routed_experts=384, moe_inter_dim=2048)
+    adapter.backend = BackendConfig()
+    adapter._uses_model_prefix = True
+    key = f"model.layers.{layer_idx}.self_attn.qkv_proj.weight"
+    # Real checkpoint dimensions, without materializing the 167M-element weight.
+    weight = torch.empty(27136, 6144, device="meta", dtype=torch.bfloat16)
+
+    result = adapter.to_hf({key: weight}, quantization=True, for_checkpoint_load=True)
+
+    assert result[key].shape == (27136, 6144)
+    assert result[key].dtype == torch.float8_e4m3fn
+    assert result[key + "_scale_inv"].shape == (216, 48)
+    assert result[key + "_scale_inv"].dtype == torch.float32
 
 
 @pytest.mark.parametrize("layer_idx", [0, 1])
