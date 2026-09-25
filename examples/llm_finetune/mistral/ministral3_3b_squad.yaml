@@ -45,6 +45,12 @@ model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: mistralai/Ministral-3-3B-Instruct-2512
 
+# Language-only adaptation: SQuAD never executes either visual branch.
+freeze_config:
+  freeze_modules:
+    - path: model.vision_tower
+    - path: model.multi_modal_projector
+
 checkpoint:
   enabled: true
   checkpoint_dir: checkpoints/
@@ -113,10 +119,6 @@ ci:
     cross_tp_size: 2
     dataset.limit_dataset_samples: 500
     validation_dataset.limit_dataset_samples: 500
-    # vision_tower params receive no grads from text-only batches, so Adam
-    # never materialises per-param `step` state for them; DCP resume load is
-    # strict and fails with `Missing key ... optim.state.model.vision_tower.*`.
-    skip_resume: true
 
 # Uncomment and configure for W&B logging
 # wandb:

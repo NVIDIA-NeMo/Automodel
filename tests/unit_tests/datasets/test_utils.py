@@ -914,3 +914,39 @@ class TestPackFeaturesForThd:
         assert batch["qkv_format"] == "thd"
         assert batch["input_ids"].shape == (1, 5)
         assert batch["seq_lens"][0].tolist() == [3, 2]
+
+
+def test_default_collater_does_not_reshape_caller_tensors() -> None:
+    """Collating must not reshape the dataset's own sample tensors.
+
+    ``batchify`` unsqueezes a 1-D tensor in place and returns the same object, so
+    applying it to an example's tensor rewrites that example from ``[S]`` to
+    ``[1, S]`` -- and ``len(sample["input_ids"])`` then reports 1 instead of S.
+    """
+    sample_a = {"input_ids": torch.arange(4), "labels": torch.arange(4)}
+    sample_b = {"input_ids": torch.arange(4), "labels": torch.arange(4)}
+
+    out = sftp.default_collater([sample_a, sample_b])
+
+    assert tuple(out["input_ids"].shape) == (2, 4)
+    for sample in (sample_a, sample_b):
+        assert tuple(sample["input_ids"].shape) == (4,), "collater reshaped the caller's tensor"
+        assert len(sample["input_ids"]) == 4
+
+
+def test_default_collater_leaves_reused_examples_intact_across_epochs() -> None:
+    """An in-memory dataset hands back the same objects every epoch.
+
+    Collating epoch 0 must not leave those examples in a shape that a later
+    consumer -- another epoch, a metric, a packer reading ``shape[0]`` -- would
+    read differently.
+    """
+    samples = [{"input_ids": torch.arange(3)}, {"input_ids": torch.arange(3)}]
+
+    first = sftp.default_collater(samples)
+    for sample in samples:
+        assert tuple(sample["input_ids"].shape) == (3,)
+
+    second = sftp.default_collater(samples)
+    assert torch.equal(first["input_ids"], second["input_ids"])
+    assert tuple(second["input_ids"].shape) == (2, 3)

@@ -70,7 +70,7 @@ The shipped example configs only cover a subset.
 - **Kimi K3** (`KimiK3ForCausalLM`, `KimiK3ForConditionalGeneration`): EAGLE-3,
   using a dedicated NoPE-MLA draft class (eager attention, no context or
   tensor parallelism and no sequence packing, see
-  `eagle3/README_kimi_k3.md`).
+  `eagle3/README-kimi-k3.md`).
 - **DFlash / DFlash 2 / Domino / JetSpec**: `Qwen3ForCausalLM`, `Qwen3MoeForCausalLM`,
   `Qwen3_5ForCausalLM`, `Qwen3_5ForConditionalGeneration`, `Qwen3_5MoeForCausalLM`,
   `Qwen3_5MoeForConditionalGeneration` (the Qwen3.5 family, which `Qwen/Qwen3.8-27B`
@@ -81,7 +81,7 @@ The shipped example configs only cover a subset.
   using a dedicated dense MLA draft class. Plain DFlash only (Domino's projector
   head is Qwen3-only, and there is no DFlash 2 draft for it), and it requires
   `attention_backend: sdpa`. Sequence packing and context parallelism are
-  rejected, because K3 owns both itself. See `dflash/README_kimi_k3.md`.
+  rejected, because K3 owns both itself. See `dflash/README-kimi-k3.md`.
 - **DSpark**: `Qwen3ForCausalLM`, `Qwen3MoeForCausalLM`,
   `DeepseekV4ForCausalLM`, GLM-5.2 (`GlmMoeDsaForCausalLM`), Gemma4
   (`Gemma4ForConditionalGeneration`, `Gemma4UnifiedForConditionalGeneration`),
@@ -94,7 +94,7 @@ draft class that reuses the target's YaRN rotary embedding but keeps the on-disk
 `architectures` string as the Llama EAGLE-3 draft so inference engines load it
 unchanged. The large-MoE DSpark targets (DeepSeek-V4, GLM-5.2, MiniMax M3) load
 frozen through the same expert-parallel / FSDP paths their fine-tuning recipes use.
-Per-target notes are in `dspark/README_*.md`.
+Per-target notes are in `dspark/README-*.md`.
 
 ## Quickstart
 

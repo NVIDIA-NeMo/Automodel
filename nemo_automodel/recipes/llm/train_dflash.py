@@ -62,6 +62,7 @@ from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
 from nemo_automodel.recipes.base_recipe import BaseRecipe, _is_checkpoint_model_config_compatible
 from nemo_automodel.recipes.llm._spec_train_utils import (
+    apply_draft_activation_checkpointing,
     apply_draft_compile,
     apply_draft_fp8,
     make_warmup_cosine_schedule,
@@ -324,10 +325,13 @@ class TrainDFlashRecipe(BaseRecipe):
                 attention_backend=attention_backend,
             )
         self.draft_model = draft_cls(draft_config_obj).to(device=self.device, dtype=self.compute_dtype)
-        # Optional FP8 draft compute, in place (see apply_draft_fp8); must precede the DDP wrap.
+        # Optional FP8 draft compute, in place (see apply_draft_fp8); must precede AC and the DDP wrap.
         apply_draft_fp8(self.draft_model, self.cfg.get("fp8", None))
         # Optional torch.compile of the draft, in place; after the fp8 swap.
         apply_draft_compile(self.draft_model, self.cfg.get("compile", None))
+        apply_draft_activation_checkpointing(
+            self.draft_model, self.cfg.get("distributed.activation_checkpointing", False)
+        )
 
         trainer_module = self._build_trainer_module(attention_backend, recipe_cfg).to(self.device)
         if self.dist_env.world_size > 1:

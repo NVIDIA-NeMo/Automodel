@@ -106,6 +106,10 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
     This class extends TrainFinetuneRecipeForNextTokenPrediction to provide
     a simplified benchmarking-focused training loop with timers and profiling support.
     It reuses the setup() and _forward_backward_step() methods from the parent class.
+
+    benchmark.flops_scope defaults to "model". Explicit "text" scope counts
+    only the text backbone over the complete measured iteration time; vision
+    encoder and projector FLOPs are excluded.
     """
 
     def __init__(self, cfg):
@@ -122,6 +126,9 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         self._bench_nsys_end = bench_cfg.nsys_end
         self._bench_nsys_ranks = bench_cfg.nsys_ranks
         self._bench_json_output_path = getattr(bench_cfg, "json_output_path", None)
+        self._bench_flops_scope = getattr(bench_cfg, "flops_scope", "model")
+        if self._bench_flops_scope not in ("model", "text"):
+            raise ValueError(f"benchmark.flops_scope must be 'model' or 'text', got {self._bench_flops_scope!r}")
         self._wandb_enabled = cfg.get("wandb", None) is not None
 
         # Infer max_steps from step_scheduler
@@ -171,8 +178,19 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         global_batch_size = self.cfg.step_scheduler.global_batch_size
 
         # Calculate FLOPs
-        flops_formula = get_flops_formula_for_hf_config(self.model_parts[0].config)
-        flops = flops_formula(self.model_parts[0].config, gbs=global_batch_size, seq_len=seq_len)
+        flops_config = self.model_parts[0].config
+        if self._bench_flops_scope == "text":
+            get_text_config = getattr(flops_config, "get_text_config", None)
+            if callable(get_text_config):
+                flops_config = get_text_config()
+        flops_formula = get_flops_formula_for_hf_config(flops_config)
+        if flops_formula is None:
+            raise ValueError(
+                f"No FLOPs formula for {type(flops_config).__name__} with "
+                f"benchmark.flops_scope={self._bench_flops_scope!r}. "
+                "Set benchmark.flops_scope='text' to explicitly count only the text backbone."
+            )
+        flops = flops_formula(flops_config, gbs=global_batch_size, seq_len=seq_len)
         self.tflops = flops / (10**12)
 
         # Add Multi-Token-Prediction (MTP) head FLOPs (e.g. Nemotron-3 Ultra). The backbone
@@ -217,7 +235,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                 logger.info(f"TFLOPS multiplier for PEFT: (2 + {param_ratio:.4f}) / 3 = {tflops_multiplier:.4f}")
 
         if self.dist_env.is_main:
-            logger.info(f"TFLOPs/GPU: {self.tflops:.6f}")
+            logger.info(f"TFLOPs/GPU: {self.tflops:.6f} | FLOPs scope: {self._bench_flops_scope}")
 
         # Log setup time to wandb
         if self._wandb_enabled:
@@ -451,7 +469,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                 reference_mfu=peak_tflops,
             )
             logger.info(f"Max iter time: {max_iter_time:.6f} seconds")
-            logger.info(f"MFU: {mfu:.6f}%")
+            logger.info(f"MFU: {mfu:.6f}% | FLOPs scope: {self._bench_flops_scope}")
 
         # Log detailed timers
         timer_names = [iter_timer, "optimizer"] + [f"forward_backward_{ga_step_idx}" for ga_step_idx in range(ga_steps)]
@@ -510,7 +528,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
 
             mfu = calculate_mfu(self.tflops, self.dist_env.world_size, avg_iter_time, reference_mfu=peak_tflops)
             logger.info(
-                f"Average MFU: {mfu:.6f}%"
+                f"Average MFU: {mfu:.6f}% | FLOPs scope: {self._bench_flops_scope}"
                 + (
                     f" (excluding first {warmup_steps} warmup iterations)"
                     if steps > warmup_steps
@@ -529,6 +547,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                 "training_time_seconds": iter_time,
                 "avg_iter_time_seconds": avg_iter_time,
                 "avg_mfu_percent": mfu,
+                "flops_scope": self._bench_flops_scope,
                 "tflops_per_gpu": self.tflops,
                 "peak_tflops": peak_tflops,
                 "world_size": self.dist_env.world_size,
@@ -552,7 +571,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                         ["Warmup Time (s)", warmup_time],
                         ["Training Time (s)", iter_time],
                         ["Avg Iteration Time (s)", avg_iter_time],
-                        ["Avg MFU (%)", mfu],
+                        ["Avg MFU (%)" if self._bench_flops_scope == "model" else "Avg text-backbone MFU (%)", mfu],
                         ["TFLOPs/GPU/s", peak_tflops * mfu / 100],
                         ["Peak TFLOPs", peak_tflops],
                         ["World Size", self.dist_env.world_size],
@@ -568,6 +587,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                     {
                         "summary/avg_iter_time_seconds": avg_iter_time,
                         "summary/avg_mfu_percent": mfu,
+                        "summary/flops_scope": self._bench_flops_scope,
                         "summary/training_time_seconds": iter_time,
                         "summary/tflops_per_gpu": self.tflops,
                     }

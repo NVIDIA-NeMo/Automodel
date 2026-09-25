@@ -16,8 +16,8 @@
 # TransformerEngine, tuned for GB200. Head-to-head vs the torchao MXFP8 path
 # (qwen3_moe_30b_te_deepep_mxfp8_gb200.yaml, experts=torch_mm_mxfp8).
 #
-# Delta vs qwen3_moe_30b_te_deepep_gb200.yaml (bf16, experts=gmm):
-#   - model.backend.experts: gmm -> te
+# Delta vs qwen3_moe_30b_te_deepep_gb200.yaml (bf16, experts=torch_mm):
+#   - model.backend.experts: torch_mm -> te
 #     Uses TE's GroupedLinear expert GEMMs (GroupedExpertsTE), native FP8 support.
 #   - model.backend.te_fp8.recipe: mxfp8
 #     Enables TE's MXFP8BlockScaling recipe for the expert GEMMs.
@@ -25,7 +25,7 @@
 # Qwen3-MoE has expert_bias=False, so (unlike gpt-oss) there is no 1D-bias FSDP
 # sharding edge case and no bias-induced backward NaN — this is a clean perf
 # comparison of the TE grouped-GEMM MXFP8 path vs torchao's. torchao works for qwen
-# (no bias) at lbs=16 ~9.122 s/iter, 26.44% MFU; bf16 (gmm/torch_mm) ~9.371 s.
+# (no bias) at lbs=16 ~9.122 s/iter, 26.44% MFU; bf16 (torch_mm) ~9.371 s.
 #
 # The te_fp8 autocast wraps the forward at train_ft._forward_backward_step (fp8_ctx),
 # reused by the BenchmarkingRecipe. attn/linear/rms_norm stay TE bf16.

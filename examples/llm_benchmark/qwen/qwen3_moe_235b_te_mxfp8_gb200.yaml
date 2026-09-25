@@ -16,7 +16,7 @@
 # TransformerEngine, tuned for GB200.
 #
 # Delta vs qwen3_moe_235b_te_deepep_gb200.yaml (the BF16 baseline) — three lines:
-#   - backend.experts: gmm -> te          (TE GroupedLinear expert GEMMs)
+#   - backend.experts: torch_mm -> te     (TE GroupedLinear expert GEMMs)
 #   - backend.te_fp8.recipe: mxfp8         (TE MXFP8BlockScaling on the expert GEMMs)
 #   - optimizer.foreach: false             (at ep==world the experts=te params stay
 #       plain Tensors while the rest is DTensor; per-param Adam avoids the

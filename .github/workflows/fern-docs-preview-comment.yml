@@ -33,6 +33,7 @@ on:
 permissions:
   pull-requests: write
   actions: read
+  contents: read
 
 jobs:
   preview:
@@ -57,6 +58,15 @@ jobs:
         with:
           node-version: '20'
 
+      - name: Checkout trusted docs tooling
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          path: trusted-source
+          persist-credentials: false
+          sparse-checkout: tools/apply_fern_code_styles.py
+          sparse-checkout-cone-mode: false
+
       - name: Generate preview URL
         id: generate-docs
         env:
@@ -71,6 +81,7 @@ jobs:
           # before the preview build; the version navs mount it via
           # `folder: ../product-docs/...` and `generate --docs` fatals without it.
           npx -y "fern-api@$fern_version" docs md generate
+          python3 "$GITHUB_WORKSPACE/trusted-source/tools/apply_fern_code_styles.py" --repo-root "$GITHUB_WORKSPACE"
           PREVIEW_ID="preview/$(echo "$HEAD_SHA" | cut -c1-12)"
           OUTPUT=$(npx -y "fern-api@$fern_version" generate --docs --preview --id "$PREVIEW_ID" 2>&1)
           echo "$OUTPUT"

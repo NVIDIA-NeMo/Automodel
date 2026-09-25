@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import sys
+from dataclasses import dataclass, field
 from unittest import mock
 
 import pytest
@@ -278,3 +279,71 @@ class TestSubmitNemoRunJob:
                             detach=True, tail_logs=False)
         mr.Experiment.assert_called_once_with("automodel")
         me.add.assert_called_once_with(script, executor=executor, name="automodel")
+
+
+@dataclass
+class _FakeSlurmExecutor:
+    """Stand-in with fixed fields, like the NeMo-Run executor dataclasses.
+
+    The tests above use ``MagicMock``, which fabricates any attribute on access,
+    so they cannot tell a real field from a name the executor does not have.
+    """
+
+    nodes: int = 1
+    ntasks_per_node: int = 1
+    partition: str = "batch"
+    env_vars: dict = field(default_factory=dict)
+    container_mounts: list = field(default_factory=list)
+
+
+class TestApplyOverridesRejectsUnknownAttributes:
+    def test_unknown_key_raises_instead_of_creating_a_phantom_attribute(self):
+        """A mistyped YAML key must fail loudly, not be silently absorbed."""
+        executor = _FakeSlurmExecutor()
+
+        with pytest.raises(ValueError, match="ntasks_per_nodes"):
+            apply_overrides(executor, {"ntasks_per_nodes": 8})
+
+        assert not hasattr(executor, "ntasks_per_nodes")
+        assert executor.ntasks_per_node == 1
+
+    def test_error_names_the_executor_and_lists_available_attributes(self):
+        executor = _FakeSlurmExecutor()
+
+        with pytest.raises(ValueError) as exc_info:
+            apply_overrides(executor, {"gpus_per_node": 8})
+
+        message = str(exc_info.value)
+        assert "_FakeSlurmExecutor" in message
+        assert "ntasks_per_node" in message
+        assert "partition" in message
+
+    def test_known_keys_still_apply_on_a_real_object(self):
+        """The accepted path must keep working off a MagicMock."""
+        executor = _FakeSlurmExecutor(env_vars={"EXISTING": "a"}, container_mounts=["/data:/data"])
+
+        apply_overrides(
+            executor,
+            {
+                "nodes": 4,
+                "partition": "gpu",
+                "env_vars": {"NEW": "b"},
+                "container_mounts": ["/models:/models"],
+            },
+        )
+
+        assert executor.nodes == 4
+        assert executor.partition == "gpu"
+        assert executor.env_vars == {"EXISTING": "a", "NEW": "b"}
+        assert executor.container_mounts == ["/data:/data", "/models:/models"]
+
+    def test_no_override_is_applied_when_a_later_key_is_unknown(self):
+        """The raise happens before the bad key is written; earlier keys already applied."""
+        executor = _FakeSlurmExecutor()
+
+        with pytest.raises(ValueError, match="paritition"):
+            apply_overrides(executor, {"nodes": 2, "paritition": "gpu"})
+
+        assert executor.nodes == 2
+        assert executor.partition == "batch"
+        assert not hasattr(executor, "paritition")

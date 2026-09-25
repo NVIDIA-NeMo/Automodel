@@ -48,6 +48,7 @@ enabling them does not change the subsequent training trajectory.
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
@@ -76,12 +77,26 @@ class PrewarmConfig:
             for every Mamba mixer shape in the model.
         comm_groups: Eagerly create the NCCL communicators that grad-norm
             clipping will use on its first collective.
+        pipeline_stage_compile: Under pipeline parallelism, run one forward +
+            backward microbatch on every local pipeline stage before the
+            training loop, with inputs shaped from the stage's static
+            ``inputs_meta``. The first real step otherwise pays each stage's
+            one-time compile / JIT / autotune (torch.compile islands, Triton
+            kernels, HybridEP, FLA) *serially* along the pipeline, because a
+            stage cannot start until its predecessor's first microbatch
+            arrives: on a 64-node Kimi-K3 run (pp8) iteration 0 took 600 s
+            versus 70 s on the same stack without PP. Stages warm concurrently
+            here, so the first step pays one stage's compile, not eight.
+            Gradients produced by the warmup are dropped and the RNG state is
+            restored; expert-parallel dispatch runs for real within each
+            stage's EP group.
     """
 
     cublas_backward: bool = False
     fla_gdn_autotune: bool = False
     mamba_ssd_autotune: bool = False
     comm_groups: bool = False
+    pipeline_stage_compile: bool = False
 
     def apply(
         self,
@@ -90,6 +105,7 @@ class PrewarmConfig:
         device: torch.device | int | str | None,
         batch_size: int = 1,
         pp_mesh: DeviceMesh | None = None,
+        stages: list[Any] | None = None,
     ) -> None:
         """Run the enabled prewarms.
 
@@ -102,6 +118,9 @@ class PrewarmConfig:
             pp_mesh: The pipeline-parallel submesh, if pipeline parallelism is
                 enabled (its process group is warmed for the grad-norm
                 all-reduce).
+            stages: The local ``PipelineStage`` objects (``AutoPipeline.info.stages``)
+                when pipeline parallelism is enabled; ``pipeline_stage_compile``
+                reads their ``inputs_meta`` and runs their ``submod``.
         """
         if self.cublas_backward:
             try:
@@ -123,6 +142,11 @@ class PrewarmConfig:
                 _prewarm_comm_groups(model_parts, device, pp_mesh=pp_mesh)
             except Exception:
                 logger.exception("Communication-group prewarm failed; continuing without it.")
+        if self.pipeline_stage_compile:
+            try:
+                _prewarm_pipeline_stages(stages, device)
+            except Exception:
+                logger.exception("Pipeline-stage compile prewarm failed; continuing without it.")
 
 
 def _prewarm_cublas_backward(device: torch.device | int | str | None, size: int = 16) -> bool:
@@ -683,3 +707,114 @@ def _prewarm_comm_groups(
         torch.cuda.synchronize(device)
     logger.info("Prewarmed %d process group(s) for grad-norm clipping.", len(groups))
     return len(groups)
+
+
+def _prewarm_pipeline_stages(stages: list[Any] | None, device: torch.device | int | str | None) -> int:
+    """Run one forward + backward microbatch on every local pipeline stage.
+
+    Each stage's inputs are built from its static ``inputs_meta`` (set by
+    ``pipelining.functional`` before the first step): random ids in
+    ``[1, vocab)`` for integer inputs, small random activations for floating
+    inputs. All ranks of a stage call this together, so FSDP all-gathers and
+    expert-parallel dispatch inside the stage see their full groups; different
+    stages run concurrently, which is the whole point. The warmup's gradients
+    are discarded, the module's train/eval flag is restored and the CPU and
+    device RNG states are forked so data order and initialisation after the
+    prewarm are unchanged.
+
+    Args:
+        stages: Local ``PipelineStage`` objects; None or empty (no PP) is a no-op.
+        device: Device for the synthetic inputs.
+
+    Returns:
+        The number of stages warmed.
+    """
+    if not stages:
+        logger.info("Skipping pipeline-stage compile prewarm: no pipeline stages.")
+        return 0
+    if device is None:
+        device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
+    device = torch.device("cuda", device) if isinstance(device, int) else torch.device(device)
+    fork_devices = (
+        [device.index if device.index is not None else torch.cuda.current_device()] if device.type == "cuda" else []
+    )
+    warmed = 0
+    t0 = time.perf_counter()
+    with torch.random.fork_rng(devices=fork_devices):
+        for stage in stages:
+            submod = getattr(stage, "submod", None)
+            metas = getattr(stage, "inputs_meta", None)
+            if submod is None or not metas:
+                logger.info("Skipping pipeline-stage compile prewarm for a stage without inputs_meta.")
+                continue
+            vocab = getattr(getattr(submod, "config", None), "vocab_size", None) or 32000
+            inputs: list[torch.Tensor] = []
+            for meta in metas:
+                if meta.is_floating_point():
+                    inputs.append(
+                        torch.randn(meta.shape, dtype=meta.dtype, device=device).mul_(0.02).requires_grad_(True)
+                    )
+                else:
+                    inputs.append(torch.randint(1, int(vocab), meta.shape, dtype=meta.dtype, device=device))
+            was_training = submod.training
+            submod.train()
+            t_fwd = time.perf_counter()
+            out = submod(*inputs)
+            tensors = _floating_tensors(out)
+            if not tensors:
+                raise RuntimeError(
+                    "pipeline-stage compile prewarm: the stage produced no floating-point output to backpropagate"
+                )
+            loss = sum(t.float().sum() for t in tensors)
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            t_bwd = time.perf_counter()
+            loss.backward()
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            t_end = time.perf_counter()
+            for p in submod.parameters():
+                p.grad = None
+            submod.train(was_training)
+            del out, tensors, loss, inputs
+            logger.info(
+                "Pipeline-stage compile prewarm: stage %d forward %.1f s, backward %.1f s.",
+                warmed,
+                t_bwd - t_fwd,
+                t_end - t_bwd,
+            )
+            warmed += 1
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    logger.info("Pipeline-stage compile prewarm: %d stage(s) warmed in %.1f s.", warmed, time.perf_counter() - t0)
+    _log_compile_times()
+    return warmed
+
+
+def _log_compile_times(max_lines: int = 12) -> None:
+    """Log torch.compile's per-phase compile-time table (what the prewarm actually paid for)."""
+    try:
+        from torch._dynamo.utils import compile_times
+
+        table = compile_times(repr="str", aggregate=True)
+    except Exception:  # pragma: no cover - dynamo unavailable or API drift
+        return
+    if table:
+        lines = str(table).splitlines()
+        logger.info("torch.compile time by phase (aggregate):\n%s", "\n".join(lines[:max_lines]))
+
+
+def _floating_tensors(out: Any) -> list[torch.Tensor]:
+    """Collect the floating-point tensors of a stage output (tensor, tuple/list, or a ModelOutput-like object)."""
+    if torch.is_tensor(out):
+        return [out] if out.is_floating_point() else []
+    if isinstance(out, (tuple, list)):
+        return [t for item in out for t in _floating_tensors(item)]
+    if isinstance(out, dict):
+        return [t for item in out.values() for t in _floating_tensors(item)]
+    found: list[torch.Tensor] = []
+    for name in ("logits", "last_hidden_state", "hidden_states"):
+        value = getattr(out, name, None)
+        if value is not None:
+            found.extend(_floating_tensors(value))
+    return found
