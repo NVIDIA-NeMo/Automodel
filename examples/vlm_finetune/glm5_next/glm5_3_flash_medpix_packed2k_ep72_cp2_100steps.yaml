@@ -52,8 +52,8 @@ model:
     num_nextn_predict_layers: 0
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
-    # KDA layers remain on FLA; this selects cuDNN/FlashMLA for sparse MLA layers.
-    attn: cudnn
+    # KDA layers remain on FLA; sparse MLA uses the image-supported SDPA path.
+    attn: sdpa
     linear: torch
     rms_norm: torch_fp32
     experts: torch_mm
@@ -151,4 +151,4 @@ ci:
   recipe_owner: HuiyingLi
   nodes: 9
   time: "01:00:00"
-  max_steps: 5
+  max_steps: 10
