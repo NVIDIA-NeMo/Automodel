@@ -177,9 +177,11 @@ class TestInitializeAttnModuleAndFunc:
             v = torch.randn(1, 2, 3, 8)
             attn_mask = torch.ones(1, 1, 3, 3, dtype=torch.bool)
 
-            result = attn_func(q, k, v, attn_mask=attn_mask)
+            with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as prof:
+                result = attn_func(q, k, v, attn_mask=attn_mask)
 
             assert result is sentinel
+            assert "aten::item" not in {event.key for event in prof.key_averages()}
             wrapper.assert_called_once()
             args, kwargs = wrapper.call_args
             assert torch.equal(args[0], q)
