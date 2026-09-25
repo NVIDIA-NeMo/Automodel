@@ -197,6 +197,22 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ),
         ),
         (
+            "Mistral3BidirectionalModel",
+            (
+                "nemo_automodel.components.models.ministral_bidirectional.model",
+                "Mistral3BidirectionalModel",
+                {"retrieval"},
+            ),
+        ),
+        (
+            "Mistral3VLBidirectionalForSequenceClassification",
+            (
+                "nemo_automodel.components.models.ministral_bidirectional.model",
+                "Mistral3VLBidirectionalForSequenceClassification",
+                {"retrieval"},
+            ),
+        ),
+        (
             "Mistral4ForCausalLM",
             ("nemo_automodel.components.models.mistral4.model", "Mistral4ForCausalLM"),
         ),
@@ -378,6 +394,10 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
     "ministral3_bidirec": (
         "nemo_automodel.components.models.ministral_bidirectional.model",
         "Ministral3BidirectionalConfig",
+    ),
+    "mistral3_bidirec": (
+        "nemo_automodel.components.models.ministral_bidirectional.model",
+        "Mistral3BidirectionalConfig",
     ),
     "mistral4": ("nemo_automodel.components.models.mistral4.configuration", "Mistral4Config"),
     "muse_glimmer": ("nemo_automodel.components.models.muse_glimmer.config", "MuseGlimmerConfig"),

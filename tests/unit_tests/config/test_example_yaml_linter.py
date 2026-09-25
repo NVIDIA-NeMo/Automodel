@@ -55,6 +55,17 @@ def test_linter_exempts_command_only_precompute_configs():
         assert errors == []
 
 
+def test_linter_exempts_command_only_retrieval_mining_configs():
+    """Mining configs are consumed by their script and have no recipe-class target."""
+    for name in ("mining_config.yaml", "mining_multimodal_config.yaml"):
+        errors = lint_yaml_text(
+            "mining: {}\n",
+            Path("examples/retrieval/data_utils") / name,
+            Path.cwd(),
+        )
+        assert errors == []
+
+
 def test_linter_requires_recipe_first():
     errors = lint_yaml_text(
         "step_scheduler: {}\nrecipe: TrainFinetuneRecipeForNextTokenPrediction\n",

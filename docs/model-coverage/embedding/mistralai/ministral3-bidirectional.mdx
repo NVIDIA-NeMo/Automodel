@@ -6,12 +6,14 @@ slug: model-coverage/embedding-models/mistralai/ministral3-bidirectional
 
 NeMo AutoModel loads [Mistral AI's Ministral3](https://mistral.ai/news/ministraux/) with the stock Hugging Face `Ministral3Model` and sets `is_causal: false` for embedding and dense retrieval tasks. Each token can therefore attend to both past and future tokens without requiring a custom model implementation.
 
-The encoder can be loaded directly from text-only checkpoints (e.g. `mistralai/Ministral-3B-Instruct`) and also automatically extracts the language model from Ministral3 VLM checkpoints (e.g. `mistralai/Ministral-3-3B-Base-2512` or `mistralai/Ministral-3-3B-Instruct-2512`). The custom `Ministral3BidirectionalModel` remains available through the legacy `ministral3_bidirec` model type for compatibility with existing checkpoints.
+The encoder loads text-only checkpoints directly. For Ministral3 vision-language model (VLM) checkpoints, the default retrieval path retains the vision tower. Set `model.extract_submodel: language_model` to train a text-only encoder instead. The custom `Ministral3BidirectionalModel` remains available through the legacy `ministral3_bidirec` model type for compatibility with existing checkpoints.
+
+For multimodal retrieval training, the registered `Mistral3BidirectionalModel` combines the Pixtral vision tower with a bidirectional Ministral3 language tower. `Mistral3VLBidirectionalForSequenceClassification` adds the corresponding reranking head.
 
 | | |
 |---|---|
-| **Tasks** | Embedding, Dense Retrieval |
-| **Architecture** | `Ministral3Model` with `is_causal: false` (preferred); `Ministral3BidirectionalModel` (legacy) |
+| **Tasks** | Embedding, Dense Retrieval, Reranking |
+| **Architecture** | `Ministral3Model` for text-only retrieval; `Mistral3BidirectionalModel` for vision-language retrieval |
 | **Parameters** | 3B |
 | **HF Org** | [mistralai](https://huggingface.co/mistralai) |
 
@@ -19,8 +21,8 @@ The encoder can be loaded directly from text-only checkpoints (e.g. `mistralai/M
 
 Any Ministral3 checkpoint can be loaded as a non-causal backbone. The following configurations are tested:
 
-- **Ministral-3-3B-Base-2512** — VLM checkpoint, language model is extracted automatically
-- **Ministral-3-3B-Instruct-2512** — VLM checkpoint, language model is extracted automatically
+- **Ministral-3-3B-Base-2512** — VLM checkpoint; text-only extraction is optional
+- **Ministral-3-3B-Instruct-2512** — VLM checkpoint; text-only extraction is optional
 
 ## Embedding Models
 
@@ -29,9 +31,10 @@ The stock non-causal bi-encoder path is used for embedding generation and dense 
 | Architecture | Task | Auto Class | Description |
 |---|---|---|---|
 | `Ministral3Model` with `is_causal: false` | Embedding | [`NeMoAutoModelBiEncoder`](https://github.com/NVIDIA-NeMo/Automodel/blob/8dc00dcb4a35c2413c52c6e7eb7ac8f1c24836aa/nemo_automodel/_transformers/auto_model.py#L991) | Preferred stock Hugging Face path for bidirectional dense embeddings |
-| `Ministral3BidirectionalModel` | Embedding | [`NeMoAutoModelBiEncoder`](https://github.com/NVIDIA-NeMo/Automodel/blob/8dc00dcb4a35c2413c52c6e7eb7ac8f1c24836aa/nemo_automodel/_transformers/auto_model.py#L991) | Legacy compatibility path for custom retrieval checkpoints |
+| `Ministral3BidirectionalModel` | Embedding | [`NeMoAutoModelBiEncoder`](https://github.com/NVIDIA-NeMo/Automodel/blob/8dc00dcb4a35c2413c52c6e7eb7ac8f1c24836aa/nemo_automodel/_transformers/auto_model.py#L991) | Legacy compatibility path for text-only retrieval checkpoints |
+| `Mistral3BidirectionalModel` | Multimodal embedding | [`NeMoAutoModelBiEncoder`](https://github.com/NVIDIA-NeMo/Automodel/blob/8dc00dcb4a35c2413c52c6e7eb7ac8f1c24836aa/nemo_automodel/_transformers/auto_model.py#L991) | Pixtral vision tower with a bidirectional Ministral3 language tower |
 
-For cross-encoder scoring, stock `ministral3` checkpoints use Hugging Face `Ministral3ForSequenceClassification`. The legacy `ministral3_bidirec` type does not provide a cross-encoder scoring class.
+For multimodal cross-encoder scoring, `mistral3` checkpoints with a Ministral3 text tower use `Mistral3VLBidirectionalForSequenceClassification`. Text-only `ministral3` checkpoints continue to use Hugging Face `Ministral3ForSequenceClassification`.
 
 ## Pooling Strategies
 
@@ -61,13 +64,24 @@ cd Automodel
 uv sync --locked --all-groups --all-extras
 ```
 
-**2. Run the Ministral3 recipe** from inside the repo:
+**2. Prepare your retrieval dataset.** Use the [corpus-ID JSON format](/datasets/retrieval-dataset#corpus-id-based-json) to associate each query with positive and negative document IDs. Include the referenced corpus and its `merlin_metadata.json` file, with a corpus class that matches your document format. These recipes do not require a particular dataset.
+
+In the example you select, replace `dataset.data_dir_list[0].path` with the path to your training JSON file. The example path `<DATASETS_PATH>/retrieval/train.json` is a placeholder, not a bundled dataset.
+
+Both examples set `dataset.use_text_in_document: false`: image documents use the image without companion text, and text-only documents retain their text. Set this field to `true` to train on image-and-text documents. This changes the model's training input.
+
+**3. Run one of the Mistral3 VL retrieval recipes** from inside the repo:
 
 ```bash
-uv run automodel examples/retrieval/bi_encoder/ministral3_3b_instruct.yaml --nproc-per-node 8
+uv run automodel examples/retrieval/bi_encoder/mistral3_vl_embedding.yaml --nproc-per-node 8
+uv run automodel examples/retrieval/cross_encoder/mistral3_vl_reranker.yaml --nproc-per-node 8
 ```
 
 See the [Installation Guide](/get-started/installation).
+
+The reranker applies `model.temperature` in the score tensor's dtype, which is BF16 in the example. The recipe then casts scores to FP32 for cross entropy. Keep the top-level `temperature: 1.0` when using a non-unit model temperature; setup rejects two active temperature sources.
+
+To freeze model towers, use the top-level `freeze_config` section. For example, setting `freeze_vision_tower: true` and `freeze_language_model: true` within that section leaves the projector and, for reranking, the scoring head trainable.
 
 {/* TODO: uncomment when finetune guide is published.
 ## Fine-Tuning

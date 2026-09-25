@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import hashlib
 import warnings
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Union, cast
 
@@ -20,12 +19,7 @@ import torch
 from transformers import DataCollatorWithPadding, PreTrainedTokenizerBase, ProcessorMixin
 from transformers.file_utils import PaddingStrategy
 
-
-def _doc_id_str_to_int64(doc_id: str) -> int:
-    """Stable 63-bit int for corpus doc id strings (for in-batch duplicate masking)."""
-    h = hashlib.md5(doc_id.encode("utf-8")).digest()[:8]
-    return int.from_bytes(h, "little", signed=False) & ((1 << 63) - 1)
-
+from nemo_automodel.shared.retrieval_ids import document_id_to_int64
 
 if TYPE_CHECKING:
     from transformers import BatchEncoding
@@ -216,7 +210,7 @@ class BiEncoderCollator:
         if doc_id_groups and all(doc_ids and all(doc_ids) for doc_ids in doc_id_groups):
             doc_id_flat = [doc_id for doc_ids in doc_id_groups for doc_id in doc_ids]
             merged_batch_dict["passage_doc_ids"] = torch.tensor(
-                [_doc_id_str_to_int64(s) for s in doc_id_flat],
+                [document_id_to_int64(s) for s in doc_id_flat],
                 dtype=torch.long,
             )
 
@@ -321,10 +315,21 @@ class ProcessorMethodCollator:
             tokenizer: Runtime multimodal processor.
             collator_fn_name: Processor method used to collate each batch.
         """
+        self.processor = tokenizer
         self.collate_fn = cast(
             Callable[[list[dict[str, object]]], dict[str, object]],
             getattr(tokenizer, collator_fn_name),
         )
+
+    @property
+    def query_prefix(self) -> str:
+        """Return the query prefix owned by the underlying processor."""
+        return cast(str, getattr(self.processor, "query_prefix"))
+
+    @property
+    def passage_prefix(self) -> str:
+        """Return the passage prefix owned by the underlying processor."""
+        return cast(str, getattr(self.processor, "passage_prefix"))
 
     def __call__(self, batch: list[dict[str, object]]) -> dict[str, object]:
         """Collate retrieval examples with the resolved processor method.

@@ -694,8 +694,11 @@ def _maybe_save_custom_model_code(
     hub id (e.g. ``nvidia/Nemotron-Flash-1B``) and the loaded model has ``auto_map`` custom
     code, copy the ``.py`` files from the cached ``transformers_modules`` directory so the
     consolidated checkpoint carries ``modeling_*.py`` locally and reloads without needing
-    ``trust_remote_code=True``.
+    ``trust_remote_code=True``. Models marked for stock export intentionally skip this copy.
     """
+    if model_part is not None and getattr(model_part, "_export_as_stock_model", False):
+        return
+
     copied: set[str] = set()
 
     def _copy_py_tree(src_dir: str) -> None:

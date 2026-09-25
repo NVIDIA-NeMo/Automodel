@@ -21,7 +21,7 @@ from collections.abc import Callable
 from contextlib import contextmanager
 from functools import lru_cache
 from types import FunctionType
-from typing import Any, Dict, Generator, List, Sequence, Tuple, Union
+from typing import Any, Dict, Generator, List, Protocol, Sequence, Tuple, Union, runtime_checkable
 
 import torch
 import transformers
@@ -2130,13 +2130,25 @@ def _get_model_layer_group_specs() -> Dict[Any, Dict[str, List[str]]]:
     }
 
 
+@runtime_checkable
+class _ModelLayerGroupProvider(Protocol):
+    """Model-owned block discovery used by sharding and activation checkpointing."""
+
+    def get_model_layer_groups(self) -> dict[str, list[nn.Module]]:
+        """Return role-to-block mappings with each block listed once in forward order."""
+        ...
+
+
 def _extract_model_layer_groups(model: nn.Module) -> Dict[str, List[nn.Module]]:
     """Extract transformer layers grouped by model role."""
     model_cls = type(model)
-    if model_cls.__name__ in {"BiEncoderModel", "CrossEncoderModel", "FSDPBiEncoderModel"}:
+    if model_cls.__name__ in {"BiEncoderModel", "CrossEncoderModel", "FSDPBiEncoderModel", "FSDPCrossEncoderModel"}:
         inner_model = getattr(model, "model", None)
         if isinstance(inner_model, nn.Module):
             return _extract_model_layer_groups(inner_model)
+
+    if isinstance(model, _ModelLayerGroupProvider):
+        return model.get_model_layer_groups()
 
     model_cls_to_layer_groups = _get_model_layer_group_specs()
     layer_group_specs = None

@@ -165,6 +165,7 @@ def test_instantiate_simple(tmp_module):
     assert isinstance(obj, mod.Point)
     assert (obj.x, obj.y) == (1, 2)
 
+
 @pytest.mark.parametrize(
     "path, exists",
     [
@@ -300,6 +301,27 @@ def test_str_does_not_include_internal_original_strings_mapping():
     assert "_original_strings" not in repr(cfg)
 
 
+def test_to_yaml_dict_serializes_noncallable_target_overrides():
+    """Intentional target and callback replacements must not revert to their original imports."""
+    cfg = ConfigNode({"_target_": "builtins.len", "callback_fn": "builtins.len"})
+    cfg._target_ = "builtins.sorted"
+    cfg.callback_fn = None
+
+    assert cfg.to_yaml_dict(use_orig_values=True) == {
+        "_target_": "builtins.sorted",
+        "callback_fn": None,
+    }
+
+
+def test_to_yaml_dict_uses_live_callable_when_original_target_cannot_resolve():
+    """A stale original import must not mask a serializable live callable."""
+    cfg = ConfigNode({"_target_": "builtins.len"})
+    cfg._target_ = sorted
+    cfg._original_strings["_target_"] = "missing.module.target"
+
+    assert cfg.to_yaml_dict(use_orig_values=True)["_target_"] == "builtins.sorted"
+
+
 def test_load_yaml_config(tmp_path):
     """YAML helper must produce a ConfigNode with translated values."""
     yml = tmp_path / "cfg.yaml"
@@ -330,6 +352,7 @@ def test_load_yaml_config_resolves_oc_env(monkeypatch, tmp_path: Path):
     )
     cfg = load_yaml_config(str(yml))
     assert cfg.dataset.delta_storage_options.DATABRICKS_HOST == "https://example.databricks.local"
+
 
 def test_load_yaml_config_oc_env_default(monkeypatch, tmp_path: Path):
     monkeypatch.delenv("NOT_SET", raising=False)
