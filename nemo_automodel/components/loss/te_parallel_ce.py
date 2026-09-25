@@ -148,6 +148,11 @@ class TEParallelCrossEntropy:
 
         Returns:
             Computed loss tensor
+
+        Note:
+            Per-token upstream gradients are supported for unreduced losses.
+            This class does not accept ``loss_weights``, so
+            ``_supports_loss_weights`` still rejects it for sample-weighted recipes.
         """
         if not HAVE_TE_PARALLEL_CE:
             raise ImportError(MISSING_TE_PARALLEL_CE_MSG)
@@ -185,7 +190,7 @@ class TEParallelCrossEntropy:
         elif self.reduction == "sum":
             loss = te_loss.sum()
             if num_label_tokens is not None:
-                loss = loss / num_label_tokens
+                loss = loss * 0.0 if num_label_tokens == 0 else loss / num_label_tokens
             return loss
         else:
             raise ValueError(f"Invalid reduction: {self.reduction}. Must be one of 'none', 'mean', 'sum'")

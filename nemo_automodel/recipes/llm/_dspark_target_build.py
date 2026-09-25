@@ -249,9 +249,8 @@ def build_glm_5_2_backend(recipe_cfg) -> BackendConfig:
     is frozen / forward-only, so SDPA attention is used by default (the DSA indexer
     emits an additive float bias that SDPA's explicit-mask path accepts);
     ``target_attn_backend=tilelang`` switches to the fused sparse kernels when a
-    TileLang build is available. ``target_experts`` defaults to ``torch_mm`` (like
-    the V4 DSpark backend) because ``gmm`` needs the optional ``grouped_gemm``
-    package, which the current AutoModel image does not ship.
+    TileLang build is available. ``target_experts`` defaults to the native ``torch_mm``
+    backend.
     """
     return BackendConfig(
         attn=str(recipe_cfg.get("target_attn_backend", "sdpa")),
@@ -332,9 +331,8 @@ def build_kimi_k3_backend(recipe_cfg) -> BackendConfig:
 
     Mirrors :func:`build_glm_5_2_backend`: the hybrid-EP token dispatcher shards the
     routed experts and the HF state-dict adapter maps (and dequantizes, when the base
-    checkpoint is FP8) the HF weights on load. ``target_experts`` defaults to
-    ``torch_mm`` (like the V4 and GLM DSpark backends) because ``gmm`` needs the
-    optional ``grouped_gemm`` package, which the current AutoModel image does not ship.
+    checkpoint is FP8) the HF weights on load. ``target_experts`` defaults to the
+    native ``torch_mm`` backend.
 
     Two fields differ from the GLM backend by design:
 

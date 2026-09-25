@@ -248,8 +248,14 @@ def test_vllm_greedy_matches_hf():
     if adapter_path is not None and merge_lora:
         merged_dir = tempfile.mkdtemp(prefix="merged_adapter_", dir=os.path.dirname(os.path.normpath(adapter_path)))
         print(f"[merge] merging adapter into base model -> {merged_dir}")
-        hf_model.merge_and_unload().save_pretrained(merged_dir)
+        merged_model = hf_model.merge_and_unload()
+        # Some checkpoints carry top_p with sampling disabled. HF ignores it during
+        # greedy generation, but rejects it when saving the merged model's config.
+        if not merged_model.generation_config.do_sample:
+            merged_model.generation_config.top_p = 1.0
+        merged_model.save_pretrained(merged_dir)
         tokenizer.save_pretrained(merged_dir)
+        del merged_model
 
     del hf_model
     if adapter_path is not None:

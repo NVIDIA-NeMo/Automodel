@@ -164,6 +164,41 @@ class TestFallbackAdditiveMask:
 
 
 class TestMiMoV2FlashRotaryEmbedding:
+    def test_bf16_constructor_keeps_exact_fp32_inverse_frequencies(self):
+        rope = MiMoV2FlashRotaryEmbedding(
+            rope_theta=5000000.0,
+            head_dim=192,
+            partial_rotary_factor=0.334,
+            dtype=torch.bfloat16,
+        )
+        rotary_dim = int(192 * 0.334)
+        rotary_dim -= rotary_dim % 2
+        expected = 1.0 / (5000000.0 ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32) / rotary_dim))
+        assert rope.inv_freq.dtype == torch.float32
+        torch.testing.assert_close(rope.inv_freq, expected, rtol=0, atol=0)
+
+    def test_forward_rebuilds_nonpersistent_buffer_after_meta_materialization(self):
+        with torch.device("meta"):
+            rope = MiMoV2FlashRotaryEmbedding(
+                rope_theta=10000.0,
+                head_dim=8,
+                partial_rotary_factor=1.0,
+                dtype=torch.bfloat16,
+            )
+        assert rope.inv_freq.is_meta
+        rope.to_empty(device="cpu")
+        rope.inv_freq.fill_(float("nan"))
+
+        x = torch.zeros(1, 2, 8, dtype=torch.bfloat16)
+        position_ids = torch.arange(2).unsqueeze(0)
+        cos, sin = rope(x, position_ids)
+
+        expected = 1.0 / (10000.0 ** (torch.arange(0, 8, 2, dtype=torch.float32) / 8))
+        assert rope.inv_freq.dtype == torch.float32
+        torch.testing.assert_close(rope.inv_freq, expected, rtol=0, atol=0)
+        assert torch.isfinite(cos).all()
+        assert torch.isfinite(sin).all()
+
     def test_rotary_dim_matches_partial_factor(self):
         rope = MiMoV2FlashRotaryEmbedding(rope_theta=10000.0, head_dim=16, partial_rotary_factor=0.5)
         # rotary_dim = 16 * 0.5 = 8 → inv_freq has 4 entries.

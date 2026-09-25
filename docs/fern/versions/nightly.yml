@@ -431,6 +431,9 @@ navigation:
       - page: "Nemotron 3.5 Super VL: Text-to-SQL with LoRA"
         path: ../../guides/vlm/nemotron-3-5-super-vl-text-to-sql.mdx
         slug: nemotron-3-5-super-vl-text-to-sql
+      - page: "Nemotron 3.5 Super VL: Continued Pretraining on FineWeb"
+        path: ../../guides/vlm/nemotron-3-5-super-vl-continued-pretraining.mdx
+        slug: nemotron-3-5-super-vl-continued-pretraining
       - page: "Mistral Medium 3.5 VL"
         path: ../../guides/vlm/mistral-medium-3-5.mdx
         slug: mistral-medium-3-5

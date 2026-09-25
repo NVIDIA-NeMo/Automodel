@@ -79,7 +79,7 @@ model:
     linear: te
     rms_norm: te
     rope_fusion: true
-    experts: gmm
+    experts: torch_mm
     dispatcher: hybridep  # DeepEP timed out in multi-node EP32 CI.
     fake_balanced_gate: true
     enable_hf_state_dict_adapter: true
@@ -112,5 +112,5 @@ optimizer:
   weight_decay: 0
 
 ci:
-  time: "00:30:00"
+  time: "00:45:00"
   nodes: 8
