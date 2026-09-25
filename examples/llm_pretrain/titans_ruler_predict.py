@@ -24,7 +24,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_completed_indices(path: Path) -> set[int]:
+def load_completed_samples(path: Path) -> set[int]:
     if not path.exists():
         return set()
     completed = set()
@@ -33,15 +33,18 @@ def load_completed_indices(path: Path) -> set[int]:
             if not line.strip():
                 continue
             row = json.loads(line)
-            if "index" not in row:
-                raise ValueError(f"{path}:{line_number}: missing 'index'")
-            completed.add(row["index"])
+            if "_sample_ordinal" not in row:
+                raise ValueError(
+                    f"{path}:{line_number}: missing '_sample_ordinal'; "
+                    "refusing an unsafe resume because RULER 'index' values are not unique"
+                )
+            completed.add(row["_sample_ordinal"])
     return completed
 
 
 def main() -> None:
     args = parse_args()
-    completed = load_completed_indices(args.output_jsonl)
+    completed = load_completed_samples(args.output_jsonl)
     generator = TitansGenerator(args.checkpoint, args.tokenizer, args.device)
     args.output_jsonl.parent.mkdir(parents=True, exist_ok=True)
 
@@ -53,7 +56,7 @@ def main() -> None:
             missing = {"index", "input", "outputs"} - sample.keys()
             if missing:
                 raise ValueError(f"{args.data_jsonl}:{line_number}: missing fields {sorted(missing)}")
-            if sample["index"] in completed:
+            if line_number in completed:
                 continue
 
             result = generator.generate(
@@ -68,6 +71,7 @@ def main() -> None:
                 json.dumps(
                     {
                         **sample,
+                        "_sample_ordinal": line_number,
                         "pred": prediction,
                         "prompt_tokens": result["prompt_tokens"],
                         "generated_tokens": result["generated_tokens"],

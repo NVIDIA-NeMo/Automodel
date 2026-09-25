@@ -10,6 +10,7 @@ RULER_REPO=${RULER_REPO:-"$TITANS_WORK_ROOT/third_party/RULER"}
 TOKENIZER=${TITANS_TOKENIZER:-NousResearch/Llama-2-7b-hf}
 NUM_SAMPLES=${TITANS_RULER_NUM_SAMPLES:-500}
 CONTEXT_LENGTH=${TITANS_RULER_CONTEXT_LENGTH:-${SLURM_JOB_NAME##*_}}
+RESULT_NAMESPACE=${TITANS_RULER_RESULT_NAMESPACE:-ruler}
 
 if [[ ! $CONTEXT_LENGTH =~ ^[0-9]+$ ]]; then
   echo "Could not derive numeric context length from job name $SLURM_JOB_NAME" >&2
@@ -31,6 +32,7 @@ if [[ ${TITANS_EVAL_IN_CONTAINER:-0} != 1 ]]; then
       TITANS_TOKENIZER="$TOKENIZER" \
       TITANS_RULER_NUM_SAMPLES="$NUM_SAMPLES" \
       TITANS_RULER_CONTEXT_LENGTH="$CONTEXT_LENGTH" \
+      TITANS_RULER_RESULT_NAMESPACE="$RESULT_NAMESPACE" \
       PYTHONPATH="$AUTOMODEL_CHECKOUT${PYTHONPATH:+:$PYTHONPATH}" \
       HF_HOME="$TITANS_WORK_ROOT/cache/huggingface" \
       bash "$AUTOMODEL_CHECKOUT/examples/llm_pretrain/slurm/titans_blackwell_ruler.sbatch"
@@ -71,7 +73,7 @@ for architecture in lmm mac mag mal; do
   root="$TITANS_WORK_ROOT/outputs/${RUNS[$architecture]}"
   latest=$(readlink "$root/LATEST")
   checkpoint="$root/$latest/model/consolidated"
-  result_root="$TITANS_WORK_ROOT/results/eval/ruler/$architecture"
+  result_root="$TITANS_WORK_ROOT/results/eval/$RESULT_NAMESPACE/$architecture"
   log="$TITANS_WORK_ROOT/logs/titans-ruler-${architecture}-${CONTEXT_LENGTH}.log"
 
   CUDA_VISIBLE_DEVICES=$gpu python examples/llm_pretrain/titans_ruler.py \

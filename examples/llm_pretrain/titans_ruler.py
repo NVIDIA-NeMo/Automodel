@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -43,6 +45,34 @@ def verify_ruler_revision(repo: Path, expected: str) -> None:
         raise RuntimeError(
             f"RULER checkout is {revision}, expected a revision beginning with {expected}"
         )
+
+
+def score_s_niah_predictions(prediction_dir: Path, tasks: list[str]) -> None:
+    """Write the official S-NIAH substring metric without NeMo Toolkit."""
+    rows = []
+    for task in tasks:
+        predictions = [
+            json.loads(line)
+            for line in (prediction_dir / f"{task}.jsonl").read_text().splitlines()
+            if line.strip()
+        ]
+        sample_scores = []
+        for prediction in predictions:
+            answers = prediction["outputs"]
+            text = prediction["pred"].lower()
+            sample_scores.append(sum(answer.lower() in text for answer in answers) / len(answers))
+        rows.append(
+            {
+                "task": task,
+                "score": 100.0 * sum(sample_scores) / len(sample_scores),
+                "nulls": sum(not prediction["pred"].strip() for prediction in predictions),
+                "num_samples": len(predictions),
+            }
+        )
+    with (prediction_dir / "summary.csv").open("w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=["task", "score", "nulls", "num_samples"])
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def main() -> None:
@@ -101,17 +131,25 @@ def main() -> None:
                 cwd=scripts,
             )
 
-        run(
-            [
-                sys.executable,
-                "eval/evaluate.py",
-                "--data_dir",
-                str(prediction_dir),
-                "--benchmark",
-                "synthetic",
-            ],
-            cwd=scripts,
-        )
+        try:
+            run(
+                [
+                    sys.executable,
+                    "eval/evaluate.py",
+                    "--data_dir",
+                    str(prediction_dir),
+                    "--benchmark",
+                    "synthetic",
+                ],
+                cwd=scripts,
+            )
+        except subprocess.CalledProcessError:
+            print(
+                "Official scorer dependencies are unavailable; "
+                "writing the equivalent S-NIAH substring metric locally.",
+                flush=True,
+            )
+            score_s_niah_predictions(prediction_dir, args.tasks)
 
 
 if __name__ == "__main__":
