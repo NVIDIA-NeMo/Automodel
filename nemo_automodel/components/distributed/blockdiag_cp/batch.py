@@ -31,9 +31,11 @@ def _cp_blockdiag_doc_ids(batch: dict, seq_len: int, device, batch_size: int) ->
     """Resolve per-position document ids ``[B, S]`` (0 == padding) for the mask.
 
     Prefers the collator's ``_packed_seq_ids`` (1-based document index per token,
-    present when a pack holds >1 document). Otherwise falls back to the 4-D
-    block-causal ``attention_mask`` diagonal (valid positions) or, lacking both,
-    treats the whole sequence as a single document.
+    present when a pack holds >1 document). THD batches instead carry
+    ``seq_lens`` and ``seq_lens_padded``; those are expanded into document ids
+    while keeping inter-document padding at id 0. Otherwise falls back to the
+    4-D block-causal ``attention_mask`` diagonal (valid positions) or, lacking
+    both, treats the whole sequence as a single document.
 
     Args:
         batch: The training batch; may contain ``_packed_seq_ids`` ``[B, S]``
@@ -49,6 +51,44 @@ def _cp_blockdiag_doc_ids(batch: dict, seq_len: int, device, batch_size: int) ->
     seq_ids = batch.get("_packed_seq_ids", None)
     if seq_ids is not None:
         return seq_ids.to(device=device, dtype=torch.long)
+    seq_lens = batch.get("seq_lens")
+    if isinstance(seq_lens, torch.Tensor):
+        padded_lens = batch.get("seq_lens_padded", seq_lens)
+        if not isinstance(padded_lens, torch.Tensor):
+            raise ValueError("THD block-diagonal CP requires tensor seq_lens_padded metadata.")
+        if seq_lens.ndim == 1:
+            seq_lens = seq_lens.unsqueeze(0)
+        if padded_lens.ndim == 1:
+            padded_lens = padded_lens.unsqueeze(0)
+        if seq_lens.shape[0] != batch_size or padded_lens.shape[0] != batch_size:
+            raise ValueError(
+                "THD block-diagonal CP sequence metadata batch dimension must match input_ids: "
+                f"seq_lens={tuple(seq_lens.shape)}, seq_lens_padded={tuple(padded_lens.shape)}, "
+                f"batch_size={batch_size}."
+            )
+
+        rows = []
+        for row_idx in range(batch_size):
+            pieces = []
+            document_id = 1
+            for actual, padded in zip(seq_lens[row_idx].tolist(), padded_lens[row_idx].tolist()):
+                if actual < 0 or padded < 0:
+                    continue
+                if actual > padded:
+                    raise ValueError(f"THD sequence length {actual} exceeds padded length {padded}.")
+                pieces.append(torch.full((actual,), document_id, dtype=torch.long, device=device))
+                if padded > actual:
+                    pieces.append(torch.zeros(padded - actual, dtype=torch.long, device=device))
+                document_id += 1
+            row = torch.cat(pieces) if pieces else torch.empty(0, dtype=torch.long, device=device)
+            if row.numel() > seq_len:
+                raise ValueError(
+                    f"THD sequence metadata covers {row.numel()} tokens, exceeding sequence length {seq_len}."
+                )
+            if row.numel() < seq_len:
+                row = torch.cat([row, torch.zeros(seq_len - row.numel(), dtype=torch.long, device=device)])
+            rows.append(row)
+        return torch.stack(rows)
     attn = batch.get("attention_mask", None)
     if attn is not None and attn.dim() == 4:
         # [B, 1, S, S] block-causal bool -> diagonal gives per-position validity.
