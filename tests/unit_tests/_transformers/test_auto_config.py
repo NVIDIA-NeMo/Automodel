@@ -24,7 +24,7 @@ import yaml
 from huggingface_hub import hf_hub_download
 from transformers import AutoConfig
 
-from nemo_automodel._transformers.auto_config import NeMoAutoConfig
+from nemo_automodel import NeMoAutoConfig
 from nemo_automodel.components.config.loader import ConfigNode
 
 A, B = "a" * 40, "b" * 40
@@ -83,7 +83,7 @@ def test_explicit_yaml_target_preserves_nested_overrides(hf_config_hub):
     root, _, _, _ = hf_config_hub
     cfg = ConfigNode(
         {
-            "_target_": "nemo_automodel._transformers.auto_config.NeMoAutoConfig.from_pretrained",
+            "_target_": "nemo_automodel.NeMoAutoConfig.from_pretrained",
             "pretrained_model_name_or_path": REPO,
             "cache_dir": str(root),
             "n_layer": 3,
@@ -175,7 +175,8 @@ def test_shipped_yaml_uses_explicit_nemo_config_adapter():
     for path in (root / "examples").rglob("*.yaml"):
         source = path.read_text()
         assert "transformers.AutoConfig.from_pretrained" not in source, path
-        if "auto_config.NeMoAutoConfig.from_pretrained" in source:
+        assert "nemo_automodel._transformers.auto_config.NeMoAutoConfig" not in source, path
+        if "nemo_automodel.NeMoAutoConfig.from_pretrained" in source:
             assert yaml.safe_load(source) is not None
             migrated.append(path)
     assert migrated
