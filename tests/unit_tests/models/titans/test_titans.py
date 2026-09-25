@@ -631,6 +631,25 @@ def test_disabled_deep_ttt_has_no_write_effect_but_keeps_read_output_path():
     assert (enabled - disabled_after).abs().max().item() > 1e-6
 
 
+def test_disabled_deep_ttt_supports_non_chunk_aligned_prefixes():
+    torch.manual_seed(36)
+    memory = NeuralMemory(
+        dim=16,
+        mem_dim=8,
+        num_heads=2,
+        mem_depth=2,
+        chunk_size=4,
+        qkv_conv_kernel_size=0,
+        dtype=torch.float64,
+    ).eval()
+
+    with torch.no_grad():
+        output = memory(torch.randn(1, 7, 16, dtype=torch.float64), enable_ttt_updates=False)
+
+    assert output.shape == (1, 7, 16)
+    assert torch.isfinite(output).all()
+
+
 def test_disabled_linear_ttt_reads_static_zero_fast_weights():
     torch.manual_seed(33)
     memory = NeuralMemory(

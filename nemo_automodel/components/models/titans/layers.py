@@ -690,7 +690,7 @@ class NeuralMemory(nn.Module):
             momentum = [m.to(device=q.device, dtype=compute_dtype) for m in momentum]
 
         if not enable_ttt_updates:
-            retrieved = self._mem_forward(qf, weights)
+            retrieved = self._mem_forward(qf[:, :S], weights)
             retrieved = retrieved.reshape(B, H, S, D).transpose(1, 2).reshape(B, S, H, D)
             if return_state:
                 return retrieved, (weights, momentum)

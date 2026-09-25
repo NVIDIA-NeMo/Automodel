@@ -92,7 +92,8 @@ for architecture in lmm mac mag mal; do
   latest=$(readlink "$root/LATEST")
   checkpoint="$root/$latest/model/consolidated"
   result_root="$TITANS_WORK_ROOT/results/eval/$RESULT_NAMESPACE/$architecture"
-  log="$TITANS_WORK_ROOT/logs/titans-ruler-${architecture}-${CONTEXT_LENGTH}.log"
+  log_namespace=${RESULT_NAMESPACE//\//_}
+  log="$TITANS_WORK_ROOT/logs/titans-ruler-${log_namespace}-${architecture}-${CONTEXT_LENGTH}.log"
 
   CUDA_VISIBLE_DEVICES=$gpu python examples/llm_pretrain/titans_ruler.py \
     --ruler-repo "$RULER_REPO" \
