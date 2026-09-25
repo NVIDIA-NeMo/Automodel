@@ -276,14 +276,16 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
 
         # Synchronize unsharded TP replicas, then calculate the distributed-aware gradient norm.
         synchronize_tp_replica_gradients(self.model_parts, self.device_mesh)
+        moe_mesh = getattr(self, "moe_mesh", None)
         grad_norm = clip_grad_norm(
             max_grad_norm=self.max_grad_norm,
             model_parts=self.model_parts,
             norm_type=2.0,
             pp_enabled=self._get_pp_rank() != 0 if hasattr(self, "_get_pp_rank") else False,
             device_mesh=self.device_mesh,
-            moe_mesh=self.moe_mesh,
-            ep_axis_name="ep" if self.moe_mesh is not None and "ep" in (self.moe_mesh.mesh_dim_names or ()) else None,
+            # setup() is what assigns moe_mesh, and this step is reachable without it.
+            moe_mesh=moe_mesh,
+            ep_axis_name="ep" if moe_mesh is not None and "ep" in (moe_mesh.mesh_dim_names or ()) else None,
         )
 
         # Calculate accuracy
