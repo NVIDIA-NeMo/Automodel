@@ -21,7 +21,7 @@ import pickle
 import threading
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -960,7 +960,7 @@ class Checkpointer:
         model_path: str,
         is_init_step: bool = False,
         use_checkpoint_id: bool = True,
-        key_mapping: dict[str, str] | None = None,
+        key_mapping: dict[str, str] | Callable[[str], str] | None = None,
         allow_checkpoint_key_subset: bool = False,
     ) -> None:
         """
@@ -977,7 +977,8 @@ class Checkpointer:
             model_path: Path to the model checkpoint directory or HF snapshot.
             is_init_step: If True, treat load as initialization from a base checkpoint.
             use_checkpoint_id: Pass `checkpoint_id` to DCP if True; disable when using direct HF paths.
-            key_mapping: Optional key remapping when reading from HF checkpoints.
+            key_mapping: Optional regex mapping or callable renaming HF checkpoint keys.
+                Tensor-merging conversions require a regex mapping.
             allow_checkpoint_key_subset: If True, keep the model's current initialization for
                 parameters that are absent from the checkpoint instead of requiring an exact key match.
         """
@@ -1003,6 +1004,8 @@ class Checkpointer:
 
         # For models that need tensor merging and don't have an adapter, try using transformers' conversion
         if is_init_step and model_type and requires_tensor_merging(model_type) and not has_state_dict_adapter:
+            if callable(key_mapping):
+                raise ValueError("Tensor-merging checkpoint loads require a regex key mapping, not a callable.")
             converted_state_dict = _convert_checkpoint_with_transformers(model_state.model[0], model_path, key_mapping)
             if converted_state_dict:
                 materialized_tied_lm_head = materialize_missing_tied_lm_head(
@@ -1557,7 +1560,12 @@ class Checkpointer:
             assert model_name is not None, "model_name is required when loading base model"
             # Get combined key mapping from model attribute and model-type specific conversions
             model_key_mapping = getattr(model, "_checkpoint_conversion_mapping", None)
-            key_mapping = get_combined_key_mapping(model_type, model_key_mapping)
+            # Adapters and tensor converters own their complete conversion. Standard
+            # HF models also need the scoped renames declared by nested submodels.
+            mapping_model = (
+                model if not hasattr(model, "state_dict_adapter") and not requires_tensor_merging(model_type) else None
+            )
+            key_mapping = get_combined_key_mapping(model_type, model_key_mapping, model=mapping_model)
             # NemotronH remote code (trust_remote_code) uses backbone.* params matching checkpoint keys
             # skip backbone.*→model.* conversion to avoid key mismatch
             if model_type == "nemotron_h" and hasattr(model, "backbone"):
@@ -2159,7 +2167,7 @@ fi
     def _get_storage_reader(
         self,
         model_path: str,
-        key_mapping: dict[str, str] | None,
+        key_mapping: dict[str, str] | Callable[[str], str] | None,
         is_init_step: bool = False,
         is_safetensors: bool | None = None,
     ) -> StorageReader | None:
@@ -2174,7 +2182,7 @@ fi
 
         Args:
             model_path: Path to the model checkpoint directory or HF snapshot.
-            key_mapping: Optional key remapping for conversion.
+            key_mapping: Optional regex mapping or callable renaming checkpoint keys.
             is_init_step: If True, always produce a reader for base HF load.
             is_safetensors: Whether `model_path` holds a safetensors checkpoint; computed
                 from the directory contents when not supplied.
@@ -2614,10 +2622,10 @@ def _apply(module, fn, recurse=True) -> nn.Module:
 
 def _apply_key_mapping(
     state_dict: dict[str, torch.Tensor],
-    key_mapping: dict[str, str],
+    key_mapping: dict[str, str] | Callable[[str], str],
 ) -> dict[str, torch.Tensor]:
     """
-    Rename state-dict keys using regex-based ``key_mapping``.
+    Rename state-dict keys using a regex mapping or a scoped rename callable.
 
     This mirrors the renaming logic used by the DCP / HuggingFace storage
     reader but operates directly on an in-memory state dict.  It is needed
@@ -2626,11 +2634,13 @@ def _apply_key_mapping(
     parameter FQNs (e.g. ``model.language_model.X``).
 
     Args:
-        state_dict: Original state dict whose keys may need renaming.
-        key_mapping: ``{regex_pattern: replacement}`` pairs applied in order.
+        state_dict: Original state dict mapping keys to tensors of arbitrary shape.
+            Tensor layout, dtype, device, and storage are preserved.
+        key_mapping: First-match ``{regex_pattern: replacement}`` pairs or a
+            callable applying the complete key conversion.
 
     Returns:
-        A new dict with renamed keys.
+        A new dict with renamed keys and the same tensor objects as the input.
     """
     from nemo_automodel.components.checkpoint._backports.hf_storage import (
         _get_key_renaming_mapping,
