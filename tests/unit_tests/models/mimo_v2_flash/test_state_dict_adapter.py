@@ -93,7 +93,6 @@ def adapter(hf_config, moe_config, backend_config):
 def v26_adapter(moe_config, backend_config):
     config = SimpleNamespace(
         attention_projection_layout="fused_qkv",
-        quantization_config={"quant_method": "fp8", "store_dtype": "mxfp4"},
         hybrid_layer_pattern=[0, 1],
         hidden_size=64,
         num_attention_heads=4,
@@ -423,8 +422,8 @@ class TestMiMoV26CheckpointLayouts:
         assert not hasattr(v26_adapter, "_mxfp4_load_views")
 
     def test_fused_qkv_rejects_head_counts_not_divisible_by_checkpoint_tp(self, v26_adapter):
-        v26_adapter.config.num_attention_heads = 6
-        with pytest.raises(ValueError, match="checkpoint TP 4"):
+        v26_adapter.config.num_key_value_heads = 2
+        with pytest.raises(ValueError, match="divisible by 4"):
             _split_fused_qkv(
                 torch.empty(1, 64),
                 None,

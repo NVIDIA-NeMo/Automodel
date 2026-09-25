@@ -33,6 +33,7 @@ from nemo_automodel.components.moe.state_dict_mixin import MoESplitExpertsStateD
 logger = logging.getLogger(__name__)
 
 _MXFP4_BLOCK_SIZE = 32
+_FUSED_QKV_TP_SIZE = 4
 _FUSED_QKV_WEIGHT = re.compile(r"^(.*\.layers\.(\d+)\.self_attn)\.qkv_proj\.weight$")
 _SPLIT_Q_WEIGHT = re.compile(r"^(.*\.layers\.(\d+)\.self_attn)\.q_proj\.weight$")
 _E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
@@ -100,9 +101,6 @@ def _dequantize_mxfp4(
 
 def _fused_qkv_sizes(config: Any, layer_idx: int) -> tuple[int, int, int]:
     """Return per-checkpoint-shard Q, K, and V row counts for one layer."""
-    # Published fused MiMo checkpoints use one full-attention KV head per
-    # checkpoint shard: TP8 for V2.5-Pro and TP4 for V2.6-Flash-RL.
-    checkpoint_tp = int(config.num_key_value_heads)
     is_swa = bool(config.hybrid_layer_pattern[layer_idx])
     if is_swa:
         query_heads = int(config.swa_num_attention_heads)
@@ -114,15 +112,15 @@ def _fused_qkv_sizes(config: Any, layer_idx: int) -> tuple[int, int, int]:
         key_value_heads = int(config.num_key_value_heads)
         head_dim = int(config.head_dim)
         value_head_dim = int(config.v_head_dim)
-    if checkpoint_tp <= 0 or query_heads % checkpoint_tp or key_value_heads % checkpoint_tp:
+    if query_heads % _FUSED_QKV_TP_SIZE or key_value_heads % _FUSED_QKV_TP_SIZE:
         raise ValueError(
-            f"MiMo fused QKV requires query and key/value head counts divisible by positive checkpoint TP {checkpoint_tp}, "
+            f"MiMo fused QKV requires query and key/value head counts divisible by {_FUSED_QKV_TP_SIZE}, "
             f"got {query_heads} and {key_value_heads} at layer {layer_idx}"
         )
     return (
-        query_heads // checkpoint_tp * head_dim,
-        key_value_heads // checkpoint_tp * head_dim,
-        key_value_heads // checkpoint_tp * value_head_dim,
+        query_heads // _FUSED_QKV_TP_SIZE * head_dim,
+        key_value_heads // _FUSED_QKV_TP_SIZE * head_dim,
+        key_value_heads // _FUSED_QKV_TP_SIZE * value_head_dim,
     )
 
 
@@ -135,14 +133,12 @@ def _split_fused_qkv(
     dtype: torch.dtype,
     name: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Convert MiMo's TP-interleaved fused QKV matrix to split projections.
+    """Convert MiMo's TP4-interleaved fused QKV matrix to split projections.
 
     Args:
-        weight: Fused tensor of shape [checkpoint_tp * (q_rows + k_rows + v_rows), hidden].
+        weight: Fused tensor of shape [4 * (q_rows + k_rows + v_rows), hidden].
         scale_inv: Optional FP8 inverse scales of shape
-            [checkpoint_tp * ceil((q_rows + k_rows + v_rows) / 128), ceil(hidden / 128)].
-            Here checkpoint_tp is the full-attention KV head count, independent
-            of the runtime tensor-parallel mesh.
+            [4 * ceil((q_rows + k_rows + v_rows) / 128), hidden / 128].
         config: MiMo model configuration.
         layer_idx: Decoder layer index used to select full or sliding dimensions.
         dtype: Floating-point dtype for dequantized weights.
@@ -153,14 +149,13 @@ def _split_fused_qkv(
         [k_total, hidden], and [v_total, hidden].
     """
     q_rows, k_rows, v_rows = _fused_qkv_sizes(config, layer_idx)
-    checkpoint_tp = int(config.num_key_value_heads)
     rows_per_shard = q_rows + k_rows + v_rows
-    expected_rows = checkpoint_tp * rows_per_shard
+    expected_rows = _FUSED_QKV_TP_SIZE * rows_per_shard
     hidden_size = int(config.hidden_size)
     if weight.ndim != 2 or tuple(weight.shape) != (expected_rows, hidden_size):
         raise ValueError(
             f"{name} has shape {tuple(weight.shape)}; expected "
-            f"[{expected_rows}, {hidden_size}] for TP{checkpoint_tp}-interleaved QKV"
+            f"[{expected_rows}, {hidden_size}] for TP{_FUSED_QKV_TP_SIZE}-interleaved QKV"
         )
 
     weight_shards = weight.split(rows_per_shard, dim=0)
@@ -172,7 +167,7 @@ def _split_fused_qkv(
         if scale_inv.dtype != torch.float32:
             raise TypeError(f"{name}_scale_inv must be float32, got {scale_inv.dtype}")
         scale_rows_per_shard = (rows_per_shard + 127) // 128
-        expected_scale_rows = checkpoint_tp * scale_rows_per_shard
+        expected_scale_rows = _FUSED_QKV_TP_SIZE * scale_rows_per_shard
         expected_scale_columns = (hidden_size + 127) // 128
         if scale_inv.ndim != 2 or tuple(scale_inv.shape) != (expected_scale_rows, expected_scale_columns):
             raise ValueError(
@@ -215,10 +210,6 @@ class MiMoV2FlashStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
         self.backend = backend
         self.dtype = dtype
         self._uses_model_prefix = True
-        # HF checkpoint metadata distinguishes FP8 experts from the V2.6
-        # MXFP4 storage extension; fused attention alone does not imply MXFP4.
-        quantization_config = getattr(config, "quantization_config", None) or {}
-        self._uses_mxfp4_experts = quantization_config.get("store_dtype") == "mxfp4"
         self.hf_to_internal_map: dict[str, str] = {}
         if self.backend.attn == "te":
             self.hf_to_internal_map["self_attn.attention_sink_bias"] = "self_attn.attn_module.softmax_offset"
@@ -247,7 +238,7 @@ class MiMoV2FlashStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
 
     @property
     def _uses_fused_qkv_checkpoint(self) -> bool:
-        """Whether checkpoint attention tensors use fused QKV projections."""
+        """Whether checkpoint tensors use MiMo-V2.6 fused QKV and MXFP4 experts."""
         return getattr(self.config, "attention_projection_layout", "split") == "fused_qkv"
 
     def from_hf(
@@ -272,9 +263,8 @@ class MiMoV2FlashStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
 
         Args:
             state_dict: Checkpoint tensor mapping. Fused QKV weights have shape
-                [checkpoint_tp * local_qkv_rows, hidden], and optional scale tensors have
-                shape [checkpoint_tp * local_scale_rows, hidden_blocks], where
-                checkpoint_tp is the full-attention KV head count.
+                [4 * local_qkv_rows, hidden], and optional scale tensors have
+                shape [4 * local_scale_rows, hidden_blocks].
 
         Returns:
             The mutated mapping with split query, key, and value weights.
@@ -379,7 +369,7 @@ class MiMoV2FlashStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
         """Convert native tensors to MiMo checkpoint keys and load destinations."""
         load_mode = quantization and kwargs.get("for_checkpoint_load", False)
         if quantization and self._uses_fused_qkv_checkpoint and not load_mode:
-            raise ValueError("MiMo fused-QKV quantized conversion is only supported for checkpoint loading")
+            raise ValueError("MiMo-V2.6 quantized conversion is only supported for checkpoint loading")
         fused_qkv_keys: set[str] = set()
         if load_mode and self._uses_fused_qkv_checkpoint:
             self._mxfp4_load_views: dict[str, torch.Tensor] = {}
@@ -464,7 +454,7 @@ class MiMoV2FlashStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
         key: torch.Tensor,
         value: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        """Create fused-QKV checkpoint buffers for three native weights.
+        """Create V2.6 fused-QKV checkpoint buffers for three native weights.
 
         Args:
             prefix: Projection prefix ending in ``self_attn``.
@@ -479,11 +469,10 @@ class MiMoV2FlashStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
         """
         local_views = tuple(self._local_tensor(tensor) for tensor in (query, key, value))
         q_rows, k_rows, v_rows = _fused_qkv_sizes(self.config, layer_idx)
-        checkpoint_tp = int(self.config.num_key_value_heads)
         expected_shapes = (
-            (checkpoint_tp * q_rows, int(self.config.hidden_size)),
-            (checkpoint_tp * k_rows, int(self.config.hidden_size)),
-            (checkpoint_tp * v_rows, int(self.config.hidden_size)),
+            (_FUSED_QKV_TP_SIZE * q_rows, int(self.config.hidden_size)),
+            (_FUSED_QKV_TP_SIZE * k_rows, int(self.config.hidden_size)),
+            (_FUSED_QKV_TP_SIZE * v_rows, int(self.config.hidden_size)),
         )
         actual_shapes = tuple(tuple(tensor.shape) for tensor in (query, key, value))
         if actual_shapes != expected_shapes:
@@ -493,9 +482,9 @@ class MiMoV2FlashStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
             raise ValueError(f"Native QKV local views at {prefix} span devices {sorted(map(str, local_devices))}")
 
         rows_per_shard = q_rows + k_rows + v_rows
-        fused_rows = checkpoint_tp * rows_per_shard
+        fused_rows = _FUSED_QKV_TP_SIZE * rows_per_shard
         hidden_size = int(self.config.hidden_size)
-        scale_rows = checkpoint_tp * ((rows_per_shard + 127) // 128)
+        scale_rows = _FUSED_QKV_TP_SIZE * ((rows_per_shard + 127) // 128)
         scale_columns = (hidden_size + 127) // 128
         device = local_views[0].device
         self._fused_qkv_load_views[prefix] = ((query, key, value), local_views)
@@ -510,7 +499,7 @@ class MiMoV2FlashStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
 
         split_kwargs = kwargs
         load_mode = kwargs.get("quantization", False) and kwargs.get("for_checkpoint_load", False)
-        if load_mode and self._uses_mxfp4_experts:
+        if load_mode and self._uses_fused_qkv_checkpoint:
             split_kwargs = {**kwargs, "quantization": False}
         expert_result = self._convert_single_merged_expert_to_hf_split_experts(fqn, tensor, **split_kwargs)
         result = expert_result if expert_result is not None else [(fqn, tensor)]
@@ -519,7 +508,7 @@ class MiMoV2FlashStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
         if exclude_key_regex:
             result = [(key, value) for key, value in result if not re.match(exclude_key_regex, key)]
 
-        if load_mode and self._uses_mxfp4_experts:
+        if load_mode and self._uses_fused_qkv_checkpoint:
             packed_result: list[tuple[str, Any]] = []
             for key, value in result:
                 if re.search(r"\.mlp\.experts\.\d+\.(?:gate|up|down)_proj\.weight$", key):
