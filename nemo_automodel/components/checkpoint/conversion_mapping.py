@@ -186,6 +186,8 @@ _VLM_KEY_MAPPINGS: dict[str, dict[str, str]] = {
 def get_combined_key_mapping(
     model_type: str,
     model_key_mapping: dict[str, str] | None = None,
+    *,
+    model: "nn.Module | None" = None,
 ) -> dict[str, str] | None:
     """
     Get combined key mapping for simple regex-based key renaming.
@@ -201,6 +203,11 @@ def get_combined_key_mapping(
         model_type: The model type string from config.model_type
         model_key_mapping: Optional key mapping from the model's
                           `_checkpoint_conversion_mapping` attribute
+        model: Optional runtime model. Its class hierarchy is checked before
+               falling back to ``model_type`` because some Transformers
+               conversions are specific to a task-head class. Checking the
+               hierarchy keeps those mappings visible through wrappers such
+               as FSDP2's dynamically created subclasses.
 
     Returns:
         Combined key mapping dictionary (regex pattern -> replacement),
@@ -221,7 +228,14 @@ def get_combined_key_mapping(
 
     # Try to get conversion mapping from transformers and extract simple renamings
     if _TRANSFORMERS_AVAILABLE:
-        conversions = get_checkpoint_conversion_mapping(model_type)
+        conversions = None
+        model_class_names = [model_class.__name__ for model_class in type(model).__mro__] if model is not None else []
+        for model_identifier in (*model_class_names, model_type):
+            if model_identifier is None:
+                continue
+            conversions = get_checkpoint_conversion_mapping(model_identifier)
+            if conversions is not None:
+                break
         if conversions:
             for conv in conversions:
                 # Only extract simple WeightRenaming, not WeightConverter
