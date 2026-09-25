@@ -748,7 +748,7 @@ class TestGetHfConfigCustomRegistry:
 
         with (
             patch(
-                "nemo_automodel._transformers.model_init.PretrainedConfig.get_config_dict",
+                "nemo_automodel._transformers.model_init.AutoConfig.get_config_dict",
                 return_value=(
                     {"model_type": "am_future", "hidden_size": 123, "architectures": ["FutureForCausalLM"]},
                     {"output_hidden_states": True},
@@ -772,7 +772,7 @@ class TestGetHfConfigCustomRegistry:
         fallback_config = MagicMock()
         with (
             patch(
-                "nemo_automodel._transformers.model_init.PretrainedConfig.get_config_dict",
+                "nemo_automodel._transformers.model_init.AutoConfig.get_config_dict",
                 return_value=({"model_type": "not_registered"}, {}),
             ),
             patch("nemo_automodel._transformers.model_init.resolve_custom_config_cls", return_value=None),
@@ -926,7 +926,7 @@ class TestResolveModelDir:
             mock_sd.return_value = str(tmp_path)
             result = _resolve_model_dir("some/repo-id")
 
-        mock_sd.assert_called_once_with("some/repo-id", local_files_only=True)
+        mock_sd.assert_called_once_with("some/repo-id", revision=None, cache_dir=None, local_files_only=True)
         assert result == str(tmp_path)
 
 
@@ -1215,7 +1215,7 @@ class TestLayerTypesFix:
         }
 
     @patch("transformers.dynamic_module_utils.get_class_from_dynamic_module")
-    @patch("nemo_automodel._transformers.model_init.PretrainedConfig.get_config_dict")
+    @patch("nemo_automodel._transformers.model_init.AutoConfig.get_config_dict")
     def test_truncates_layer_types_via_dynamic_module(self, mock_get_dict, mock_get_cls):
         mock_get_dict.return_value = (self._config_dict(), {})
         built = MagicMock()
@@ -1233,7 +1233,7 @@ class TestLayerTypesFix:
         mock_get_cls.assert_called_once_with("configuration_step3p5.Step3p5Config", "stepfun-ai/Step-3.5-Flash")
 
     @patch("transformers.models.auto.configuration_auto.CONFIG_MAPPING", new_callable=MagicMock)
-    @patch("nemo_automodel._transformers.model_init.PretrainedConfig.get_config_dict")
+    @patch("nemo_automodel._transformers.model_init.AutoConfig.get_config_dict")
     def test_resolves_via_config_mapping_when_not_trust_remote_code(self, mock_get_dict, mock_mapping):
         cfg_dict = self._config_dict()
         cfg_dict.pop("auto_map")
@@ -1251,7 +1251,7 @@ class TestLayerTypesFix:
         mock_mapping.get.assert_called_once_with("step3p5")
 
     @patch("transformers.models.auto.configuration_auto.CONFIG_MAPPING", new_callable=MagicMock)
-    @patch("nemo_automodel._transformers.model_init.PretrainedConfig.get_config_dict")
+    @patch("nemo_automodel._transformers.model_init.AutoConfig.get_config_dict")
     def test_matching_lengths_leaves_layer_types_untouched(self, mock_get_dict, mock_mapping):
         cfg_dict = self._config_dict(n_layers=45, n_layer_types=45)
         original = list(cfg_dict["layer_types"])
@@ -1267,7 +1267,7 @@ class TestLayerTypesFix:
         assert passed_dict["layer_types"] == original
 
     @patch("transformers.models.auto.configuration_auto.CONFIG_MAPPING", new_callable=MagicMock)
-    @patch("nemo_automodel._transformers.model_init.PretrainedConfig.get_config_dict")
+    @patch("nemo_automodel._transformers.model_init.AutoConfig.get_config_dict")
     def test_raises_when_config_class_cannot_be_resolved(self, mock_get_dict, mock_mapping):
         cfg_dict = self._config_dict()
         cfg_dict.pop("auto_map")
@@ -1455,3 +1455,46 @@ class TestTieWeightsNemoConfigGate:
         torch.testing.assert_close(resumed.lm_head.weight, checkpoint["lm_head.weight"])
         torch.testing.assert_close(resumed.model.embed_tokens.weight, checkpoint["model.embed_tokens.weight"])
         assert resumed.lm_head.weight.data_ptr() != resumed.model.embed_tokens.weight.data_ptr()
+
+
+def test_direct_config_and_weights_keep_one_revision(hf_config_hub, monkeypatch):
+    from huggingface_hub import snapshot_download
+
+    from nemo_automodel._transformers import model_init
+
+    root, cache, ref, requests = hf_config_hub
+    config = get_hf_config("test/config-race", "eager", cache_dir=str(root))
+    assert config.n_embd == 64
+    assert config._commit_hash == "b" * 40
+    # Another caller advances or rewrites main after this model chose its config.
+    ref.write_text("a" * 40)
+    selected = []
+
+    def download(*args, **kwargs):
+        path = snapshot_download(*args, **kwargs)
+        selected.append(path)
+        return path
+
+    monkeypatch.setattr(model_init, "snapshot_download", download)
+    model_init._download_model_weights(config, "test/config-race", cache_dir=str(root), local_files_only=True)
+    assert selected == [str(cache / "snapshots" / ("b" * 40))]
+    assert ref.read_text() == "a" * 40
+
+
+def test_registered_config_keeps_resolved_commit(hf_config_hub, monkeypatch):
+    root, _, _, _ = hf_config_hub
+    from transformers import GPT2Config
+
+    from nemo_automodel._transformers import model_init
+
+    monkeypatch.setattr(model_init, "resolve_custom_config_cls", lambda model_type: GPT2Config)
+    config = get_hf_config("test/config-race", "eager", cache_dir=str(root))
+    assert isinstance(config, GPT2Config)
+    assert config.n_embd == 64
+    assert config._commit_hash == "b" * 40
+
+
+def test_streaming_directory_uses_config_snapshot_and_subfolder(hf_config_hub):
+    root, cache, _, _ = hf_config_hub
+    result = _resolve_model_dir("test/config-race", revision="b" * 40, cache_dir=str(root), subfolder="nested")
+    assert result == str(cache / "snapshots" / ("b" * 40) / "nested")

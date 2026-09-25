@@ -47,14 +47,14 @@ model:
   # options. We will update this path once DeepSeek can be validated cleanly;
   # current attempts fail in DeepEP dispatch before we can compare memory.
   config:
-    _target_: transformers.AutoConfig.from_pretrained
+    _target_: nemo_automodel._transformers.auto_config.NeMoAutoConfig.from_pretrained
     pretrained_model_name_or_path: deepseek-ai/DeepSeek-V3
 
 # Option 2 - more fine-grained builder
 # model:
 #   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
 #   config:
-#     _target_: transformers.AutoConfig.from_pretrained
+#     _target_: nemo_automodel._transformers.auto_config.NeMoAutoConfig.from_pretrained
 #     pretrained_model_name_or_path: deepseek-ai/DeepSeek-V3
 #   backend:
 #     _target_: nemo_automodel.components.models.common.BackendConfig
