@@ -48,16 +48,23 @@ from torch.distributed.tensor import DTensor, Shard
 
 # Over the default 5s budget on purpose: this module spawns worker processes; every child re-imports torch from scratch.
 # Shrink the work or the process count before raising this further.
+#
+# This budget MUST stay above _JOIN_TIMEOUT_S below. The spawn guard terminates its
+# children and fails with a usable message; pytest-timeout just kills the test, which
+# leaves the workers running and every later test in the session fails on the leftover
+# child processes. Whichever number is smaller decides which of those two happens.
 pytestmark = [
     pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is required"),
-    pytest.mark.timeout(60),
+    pytest.mark.timeout(240),
 ]
 
 MAX_NORM = 1.0
 _WORLD = 4
 # Bounds a deadlock: without it a regression that hangs the collectives would
-# burn the whole job timeout instead of reporting a failed test.
-_JOIN_TIMEOUT_S = 300.0
+# burn the whole job timeout instead of reporting a failed test. Kept under the
+# module's pytest-timeout budget so this guard is the one that fires -- it cleans
+# up the workers, and pytest-timeout does not.
+_JOIN_TIMEOUT_S = 180.0
 
 
 def _expert_model(expert: nn.Parameter, attribute: str = "mlp") -> nn.Module:
@@ -202,31 +209,52 @@ def _scenario_torch_fast_path(rank: int) -> None:
 
 
 @contextmanager
-def _fused_backend_forced():
-    """Take the fused branch on CPU, with the module's own reference reductions.
+def _fused_backend_forced(*, force_selector: bool = False):
+    """Make the fused machinery usable on CPU, with the module's own reference reductions.
 
-    The kernel is CUDA-only, so forcing the branch means swapping the two kernel
-    entry points as well. The branch under test, and the reduction that follows
-    it, are the real ones.
+    The kernel is CUDA-only, so forcing the branch means swapping the two kernel entry
+    points as well. The reduction that follows the branch is the real one.
+
+    Availability alone does not reach the branch: the selector answers from the
+    representative parameter's device, which is CPU here. ``force_selector`` overrides
+    the selector too, so a scenario that means to cover the fused branch has to say so.
+    Scenarios exercising the selector itself leave it off and get the real answer.
+
+    Yields:
+        The list of fused-reducer calls made inside the block, so a scenario can assert
+        the branch it means to cover actually ran.
     """
     from nemo_automodel.components.training import utils as training_utils
     from nemo_automodel.components.training.triton import grad_norm
+
+    fused_calls = []
+
+    def _recording(reference):
+        def wrapper(gradients):
+            fused_calls.append(len(gradients))
+            return reference(gradients)
+
+        return wrapper
 
     originals = (
         training_utils.HAVE_FUSED_GRAD_NORM,
         training_utils.multi_tensor_sumsq,
         training_utils.multi_tensor_absmax,
+        training_utils._use_fused_grad_norm,
     )
     training_utils.HAVE_FUSED_GRAD_NORM = True
-    training_utils.multi_tensor_sumsq = grad_norm.sumsq_reference
-    training_utils.multi_tensor_absmax = grad_norm.absmax_reference
+    training_utils.multi_tensor_sumsq = _recording(grad_norm.sumsq_reference)
+    training_utils.multi_tensor_absmax = _recording(grad_norm.absmax_reference)
+    if force_selector:
+        training_utils._use_fused_grad_norm = lambda *_: True
     try:
-        yield
+        yield fused_calls
     finally:
         (
             training_utils.HAVE_FUSED_GRAD_NORM,
             training_utils.multi_tensor_sumsq,
             training_utils.multi_tensor_absmax,
+            training_utils._use_fused_grad_norm,
         ) = originals
 
 
@@ -287,8 +315,13 @@ def _scenario_fused_backend(rank: int) -> None:
     expert.grad = torch.full((2, 8), 10.0 if rank == 0 else 0.1)
     model = _expert_model(expert)
 
-    with _fused_backend_forced():
+    with _fused_backend_forced(force_selector=True) as fused_calls:
         total_norm = _clip(model, moe_mesh)
+
+    # Both paths reach the same number and the float32 cast below makes them bit
+    # identical, so the assertion cannot tell them apart. The coverage this scenario
+    # exists for has to be asserted directly.
+    assert fused_calls, "the fused reducer never ran: this scenario no longer covers the fused branch"
 
     correct = (16 * 100.0 + (_WORLD - 1) * 16 * 0.01) ** 0.5
     torch.testing.assert_close(torch.tensor(total_norm), torch.tensor(correct))
