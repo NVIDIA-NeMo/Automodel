@@ -9,8 +9,15 @@ TITANS_IMAGE=${TITANS_IMAGE:-nvcr.io#nvidia/nemo-automodel:26.04}
 RULER_REPO=${RULER_REPO:-"$TITANS_WORK_ROOT/third_party/RULER"}
 TOKENIZER=${TITANS_TOKENIZER:-NousResearch/Llama-2-7b-hf}
 NUM_SAMPLES=${TITANS_RULER_NUM_SAMPLES:-500}
+SAMPLE_START=${TITANS_RULER_SAMPLE_START:-0}
+SAMPLE_END=${TITANS_RULER_SAMPLE_END:-$NUM_SAMPLES}
+RULER_MODE=${TITANS_RULER_MODE:-all}
+RULER_TASKS=${TITANS_RULER_TASKS:-"niah_single_1 niah_single_2 niah_single_3"}
+MAX_NEW_TOKENS=${TITANS_RULER_MAX_NEW_TOKENS:-128}
+ENABLE_TTT_UPDATES=${TITANS_ENABLE_TTT_UPDATES:-1}
 CONTEXT_LENGTH=${TITANS_RULER_CONTEXT_LENGTH:-${SLURM_JOB_NAME##*_}}
 RESULT_NAMESPACE=${TITANS_RULER_RESULT_NAMESPACE:-ruler}
+SHARED_DATA_DIR="$TITANS_WORK_ROOT/results/eval/$RESULT_NAMESPACE/prepared-data"
 
 if [[ ! $CONTEXT_LENGTH =~ ^[0-9]+$ ]]; then
   echo "Could not derive numeric context length from job name $SLURM_JOB_NAME" >&2
@@ -31,6 +38,12 @@ if [[ ${TITANS_EVAL_IN_CONTAINER:-0} != 1 ]]; then
       RULER_REPO="$RULER_REPO" \
       TITANS_TOKENIZER="$TOKENIZER" \
       TITANS_RULER_NUM_SAMPLES="$NUM_SAMPLES" \
+      TITANS_RULER_SAMPLE_START="$SAMPLE_START" \
+      TITANS_RULER_SAMPLE_END="$SAMPLE_END" \
+      TITANS_RULER_MODE="$RULER_MODE" \
+      TITANS_RULER_TASKS="$RULER_TASKS" \
+      TITANS_RULER_MAX_NEW_TOKENS="$MAX_NEW_TOKENS" \
+      TITANS_ENABLE_TTT_UPDATES="$ENABLE_TTT_UPDATES" \
       TITANS_RULER_CONTEXT_LENGTH="$CONTEXT_LENGTH" \
       TITANS_RULER_RESULT_NAMESPACE="$RESULT_NAMESPACE" \
       PYTHONPATH="$AUTOMODEL_CHECKOUT${PYTHONPATH:+:$PYTHONPATH}" \
@@ -66,6 +79,11 @@ declare -A RUNS=(
   [mag]=titans-170m-mag-15B-blackwell-mag-v1
   [mal]=titans-170m-mal-15B-blackwell-mal-v1
 )
+read -r -a task_args <<<"$RULER_TASKS"
+ttt_args=()
+if [[ "$ENABLE_TTT_UPDATES" != 1 ]]; then
+  ttt_args+=(--disable-ttt-updates)
+fi
 
 pids=()
 gpu=0
@@ -81,10 +99,15 @@ for architecture in lmm mac mag mal; do
     --checkpoint "$checkpoint" \
     --tokenizer "$TOKENIZER" \
     --output-dir "$result_root" \
+    --data-dir "$SHARED_DATA_DIR" \
     --context-lengths "$CONTEXT_LENGTH" \
-    --tasks niah_single_1 niah_single_2 niah_single_3 \
+    --tasks "${task_args[@]}" \
     --num-samples "$NUM_SAMPLES" \
-    --max-new-tokens 128 \
+    --sample-start "$SAMPLE_START" \
+    --sample-end "$SAMPLE_END" \
+    --mode "$RULER_MODE" \
+    --max-new-tokens "$MAX_NEW_TOKENS" \
+    "${ttt_args[@]}" \
     >"$log" 2>&1 &
   pids+=("$!")
   gpu=$((gpu + 1))

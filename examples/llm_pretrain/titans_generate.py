@@ -50,6 +50,7 @@ class TitansGenerator:
 
     def __init__(self, checkpoint: Path, tokenizer: str, device: str) -> None:
         self.device = device
+        self.enable_ttt_updates = True
         dtype = torch.bfloat16 if device.startswith("cuda") else torch.float32
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer, trust_remote_code=True)
         config = AutoConfig.from_pretrained(checkpoint, trust_remote_code=True)
@@ -76,6 +77,7 @@ class TitansGenerator:
         do_sample: bool = False,
         temperature: float = 1.0,
         top_k: int | None = None,
+        enable_ttt_updates: bool = True,
     ) -> dict:
         encoded = self.tokenizer(prompt, return_tensors="pt", add_special_tokens=True)
         input_ids = encoded.input_ids.to(self.device)
@@ -86,6 +88,7 @@ class TitansGenerator:
             do_sample=do_sample,
             temperature=temperature,
             top_k=top_k,
+            enable_ttt_updates=enable_ttt_updates,
         )
         continuation = generated[:, input_ids.shape[1] :]
         return {
@@ -96,6 +99,7 @@ class TitansGenerator:
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse generation command-line arguments."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--tokenizer", default="NousResearch/Llama-2-7b-hf")
@@ -106,12 +110,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--do-sample", action="store_true")
+    parser.add_argument("--disable-ttt-updates", action="store_true")
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-k", type=int)
     return parser.parse_args()
 
 
 def load_requests(args: argparse.Namespace) -> list[dict]:
+    """Load one prompt or a JSONL batch of generation requests."""
     if args.prompt is not None:
         return [{"id": "prompt", "prompt": args.prompt}]
     requests = []
@@ -128,6 +134,7 @@ def load_requests(args: argparse.Namespace) -> list[dict]:
 
 
 def main() -> None:
+    """Load a consolidated checkpoint and generate requested continuations."""
     args = parse_args()
     generator = TitansGenerator(args.checkpoint, args.tokenizer, args.device)
 
@@ -140,6 +147,7 @@ def main() -> None:
             do_sample=args.do_sample,
             temperature=args.temperature,
             top_k=args.top_k,
+            enable_ttt_updates=not args.disable_ttt_updates,
         )
         results.append({"id": request["id"], **result})
 

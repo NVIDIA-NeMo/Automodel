@@ -150,6 +150,7 @@ class TitansModel(TitansPreTrainedModel):
         inputs_embeds: torch.Tensor | None = None,
         inference_state: TitansInferenceState | None = None,
         return_inference_state: bool = False,
+        enable_ttt_updates: bool = True,
     ) -> torch.Tensor | tuple[torch.Tensor, TitansInferenceState]:
         streaming = inference_state is not None or return_inference_state
         if streaming:
@@ -178,11 +179,7 @@ class TitansModel(TitansPreTrainedModel):
                 f"received {input_length} tokens, expected a multiple of "
                 f"{self.config.attention_segment_size}."
             )
-        persistent_length = (
-            self.config.num_persistent_memory_tokens
-            if self.config.architecture_variant != "mac"
-            else 0
-        )
+        persistent_length = self.config.num_persistent_memory_tokens if self.config.architecture_variant != "mac" else 0
         if self.config.architecture_variant == "mac":
             h, mac_padding = self._insert_longterm_memory(h)
         elif persistent_length and inference_state is None:
@@ -202,17 +199,18 @@ class TitansModel(TitansPreTrainedModel):
             if self.gradient_checkpointing and self.training:
                 if streaming:
                     raise ValueError("Stateful inference is incompatible with training-time gradient checkpointing.")
-                h = self._gradient_checkpointing_func(layer.__call__, h)
+                h = self._gradient_checkpointing_func(layer.__call__, h, None, False, enable_ttt_updates)
             elif streaming:
-                past_memory = (
-                    inference_state.memory_states[layer_index]
-                    if inference_state is not None
-                    else None
+                past_memory = inference_state.memory_states[layer_index] if inference_state is not None else None
+                h, next_memory = layer(
+                    h,
+                    past_state=past_memory,
+                    return_state=True,
+                    enable_ttt_updates=enable_ttt_updates,
                 )
-                h, next_memory = layer(h, past_state=past_memory, return_state=True)
                 next_memory_states.append(next_memory)
             else:
-                h = layer(h)
+                h = layer(h, enable_ttt_updates=enable_ttt_updates)
         h = self.norm(h)
         if self.config.architecture_variant == "mac":
             h = self._remove_longterm_memory(h, mac_padding)
@@ -274,6 +272,7 @@ class TitansForCausalLM(HFCheckpointingMixin, TitansPreTrainedModel):
         logits_to_keep: Union[int, torch.Tensor] = 0,
         inference_state: TitansInferenceState | None = None,
         return_inference_state: bool = False,
+        enable_ttt_updates: bool = True,
         **kwargs,
     ) -> CausalLMOutputWithPast:
         model_result = self.model(
@@ -281,6 +280,7 @@ class TitansForCausalLM(HFCheckpointingMixin, TitansPreTrainedModel):
             inputs_embeds=inputs_embeds,
             inference_state=inference_state,
             return_inference_state=return_inference_state,
+            enable_ttt_updates=enable_ttt_updates,
         )
         if return_inference_state:
             hidden, next_inference_state = model_result
@@ -312,6 +312,7 @@ class TitansForCausalLM(HFCheckpointingMixin, TitansPreTrainedModel):
         input_ids: torch.Tensor,
         inference_state: TitansInferenceState | None = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
+        enable_ttt_updates: bool = True,
     ) -> CausalLMOutputWithPast:
         """Run one aligned LMM/MAC prefill and return detached recurrent state."""
         output = self.forward(
@@ -319,6 +320,7 @@ class TitansForCausalLM(HFCheckpointingMixin, TitansPreTrainedModel):
             logits_to_keep=logits_to_keep,
             inference_state=inference_state,
             return_inference_state=True,
+            enable_ttt_updates=enable_ttt_updates,
         )
         output.past_key_values = output.past_key_values.detach()
         return output
@@ -333,6 +335,7 @@ class TitansForCausalLM(HFCheckpointingMixin, TitansPreTrainedModel):
         do_sample: bool = False,
         temperature: float = 1.0,
         top_k: int | None = None,
+        enable_ttt_updates: bool = True,
     ) -> torch.Tensor:
         """Generate by recomputing the complete prefix at every decoding step.
 
@@ -356,7 +359,11 @@ class TitansForCausalLM(HFCheckpointingMixin, TitansPreTrainedModel):
         stop_id = self.config.eos_token_id if eos_token_id is None else eos_token_id
 
         for _ in range(max_new_tokens):
-            next_logits = self(generated, logits_to_keep=1).logits[:, -1]
+            next_logits = self(
+                generated,
+                logits_to_keep=1,
+                enable_ttt_updates=enable_ttt_updates,
+            ).logits[:, -1]
             if do_sample:
                 next_logits = next_logits / temperature
                 if top_k is not None:

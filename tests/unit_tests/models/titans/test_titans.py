@@ -50,9 +50,7 @@ from nemo_automodel.shared.import_utils import safe_import
 
 CUDA = torch.cuda.is_available()
 cuda_only = pytest.mark.skipif(not CUDA, reason="fla GDN kernel requires CUDA")
-HAVE_ACCELERATED_SCAN, accelerated_scan = safe_import(
-    "nemo_automodel.components.models.titans.accelerated_scan"
-)
+HAVE_ACCELERATED_SCAN, accelerated_scan = safe_import("nemo_automodel.components.models.titans.accelerated_scan")
 accelerated_scan_only = pytest.mark.skipif(
     not (CUDA and HAVE_ACCELERATED_SCAN),
     reason="Titans accelerated scan requires CUDA and Triton",
@@ -537,6 +535,141 @@ def test_public_backend_prefill_requires_memory_batch_boundaries():
         model.prefill(input_ids)
 
 
+def _tiny_ttt_toggle_config(variant="lmm", **overrides):
+    config_overrides = dict(
+        vocab_size=32,
+        hidden_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        head_dim=8,
+        intermediate_size=32,
+        architecture_variant=variant,
+        mem_depth=2,
+        chunk_size=2,
+        qkv_conv_kernel_size=0,
+        torch_dtype="float32",
+    )
+    if variant == "mac":
+        config_overrides.update(attention_segment_size=4, num_longterm_memory_tokens=2)
+    config_overrides.update(overrides)
+    return _tiny_config(**config_overrides)
+
+
+@pytest.mark.parametrize("variant", ["lmm", "mac", "mag", "mal"])
+@pytest.mark.parametrize("mem_depth", [1, 2])
+def test_ttt_updates_default_to_enabled_for_every_architecture(variant, mem_depth):
+    torch.manual_seed(30)
+    config = _tiny_ttt_toggle_config(variant, mem_depth=mem_depth)
+    model = TitansForCausalLM(config).eval()
+    input_ids = torch.randint(0, config.vocab_size, (1, 4))
+
+    with torch.no_grad():
+        default_logits = model(input_ids).logits
+        enabled_logits = model(input_ids, enable_ttt_updates=True).logits
+
+    torch.testing.assert_close(default_logits, enabled_logits, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("backend", ["reference", "titans_pytorch"])
+def test_disabled_ttt_updates_preserve_deep_fast_weight_state(backend):
+    torch.manual_seed(31)
+    memory = NeuralMemory(
+        dim=16,
+        mem_dim=8,
+        num_heads=2,
+        mem_depth=2,
+        chunk_size=2,
+        qkv_conv_kernel_size=0,
+        deep_memory_backend=backend,
+        memory_batch_size=4 if backend == "titans_pytorch" else None,
+        dtype=torch.float64,
+    ).double()
+    first_input = torch.randn(1, 4, 16, dtype=torch.float64)
+    second_input = torch.randn(1, 4, 16, dtype=torch.float64)
+
+    with torch.no_grad():
+        _, written_state = memory(first_input, return_state=True)
+        disabled_output, preserved_state = memory(
+            second_input,
+            past_state=written_state,
+            return_state=True,
+            enable_ttt_updates=False,
+        )
+
+    assert disabled_output.abs().max().item() > 0
+    for actual, expected in zip(preserved_state.weights, written_state.weights):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    for actual, expected in zip(preserved_state.momentum, written_state.momentum):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_disabled_deep_ttt_has_no_write_effect_but_keeps_read_output_path():
+    torch.manual_seed(32)
+    memory = NeuralMemory(
+        dim=16,
+        mem_dim=8,
+        num_heads=2,
+        mem_depth=2,
+        chunk_size=2,
+        qkv_conv_kernel_size=0,
+        dtype=torch.float64,
+    ).double()
+    x = torch.randn(1, 6, 16, dtype=torch.float64)
+
+    with torch.no_grad():
+        disabled_before = memory(x, enable_ttt_updates=False)
+        memory.k_proj.weight.normal_(mean=5.0, std=2.0)
+        memory.v_proj.weight.normal_(mean=-4.0, std=3.0)
+        memory.b_proj.weight.fill_(20.0)
+        memory.a_proj.weight.fill_(-20.0)
+        memory.m_proj.weight.fill_(10.0)
+        disabled_after = memory(x, enable_ttt_updates=False)
+        enabled = memory(x, enable_ttt_updates=True)
+
+    assert disabled_before.abs().max().item() > 0
+    torch.testing.assert_close(disabled_after, disabled_before, rtol=0, atol=0)
+    assert (enabled - disabled_after).abs().max().item() > 1e-6
+
+
+def test_disabled_linear_ttt_reads_static_zero_fast_weights():
+    torch.manual_seed(33)
+    memory = NeuralMemory(
+        dim=16,
+        mem_dim=8,
+        num_heads=2,
+        mem_depth=1,
+        qkv_conv_kernel_size=0,
+        dtype=torch.float64,
+    ).double()
+    x = torch.randn(1, 6, 16, dtype=torch.float64)
+
+    with torch.no_grad():
+        disabled = memory(x, enable_ttt_updates=False)
+        enabled = memory(x, enable_ttt_updates=True)
+
+    torch.testing.assert_close(disabled, torch.zeros_like(disabled), rtol=0, atol=0)
+    assert enabled.abs().max().item() > 1e-6
+
+
+def test_mag_attention_branch_is_unchanged_when_ttt_updates_are_disabled():
+    torch.manual_seed(34)
+    config = _tiny_ttt_toggle_config("mag")
+    model = TitansForCausalLM(config).eval()
+    input_ids = torch.randint(0, config.vocab_size, (1, 4))
+    attention_outputs = []
+    hook = model.model.layers[0].attention.register_forward_hook(
+        lambda _module, _inputs, output: attention_outputs.append(output.detach().clone())
+    )
+
+    with torch.no_grad():
+        enabled_logits = model(input_ids, enable_ttt_updates=True).logits
+        disabled_logits = model(input_ids, enable_ttt_updates=False).logits
+    hook.remove()
+
+    torch.testing.assert_close(attention_outputs[0], attention_outputs[1], rtol=0, atol=0)
+    assert (enabled_logits - disabled_logits).abs().max().item() > 1e-8
+
+
 @pytest.mark.parametrize("variant", ["lmm", "mac", "mag", "mal"])
 def test_full_prefix_generation_supports_every_architecture(variant):
     torch.manual_seed(9)
@@ -561,6 +694,31 @@ def test_full_prefix_generation_supports_every_architecture(variant):
     )
 
     assert generated.shape == (2, 6)
+    torch.testing.assert_close(generated[:, 4], expected_first)
+
+
+def test_full_prefix_generation_propagates_disabled_ttt_updates():
+    torch.manual_seed(35)
+    config = _tiny_ttt_toggle_config()
+    model = TitansForCausalLM(config).eval()
+    prompt = torch.randint(0, config.vocab_size, (2, 4))
+
+    expected_first = (
+        model(
+            prompt,
+            logits_to_keep=1,
+            enable_ttt_updates=False,
+        )
+        .logits[:, -1]
+        .argmax(dim=-1)
+    )
+    generated = model.generate_full_prefix(
+        prompt,
+        max_new_tokens=1,
+        eos_token_id=-1,
+        enable_ttt_updates=False,
+    )
+
     torch.testing.assert_close(generated[:, 4], expected_first)
 
 
@@ -607,9 +765,7 @@ def test_larger_lmm_recipes_match_paper_parameter_classes(
     expected_parameters,
 ):
     root = Path(__file__).parents[4]
-    recipe = yaml.safe_load(
-        (root / f"examples/llm_pretrain/titans_{scale}_lmm.yaml").read_text()
-    )
+    recipe = yaml.safe_load((root / f"examples/llm_pretrain/titans_{scale}_lmm.yaml").read_text())
     model = recipe["model"]["config"]
 
     assert recipe["step_scheduler"]["global_batch_size"] * recipe["dataset"]["seq_len"] == 524_288
@@ -621,11 +777,7 @@ def test_larger_lmm_recipes_match_paper_parameter_classes(
     assert model["deep_memory_backend"] == "titans_pytorch"
     assert model["num_persistent_memory_tokens"] == 128
 
-    config_values = {
-        key: value
-        for key, value in model.items()
-        if key not in {"_target_", "architectures"}
-    }
+    config_values = {key: value for key, value in model.items() if key not in {"_target_", "architectures"}}
     with torch.device("meta"):
         instantiated = TitansForCausalLM(TitansConfig(**config_values))
     assert sum(parameter.numel() for parameter in instantiated.parameters()) == expected_parameters
@@ -633,9 +785,7 @@ def test_larger_lmm_recipes_match_paper_parameter_classes(
 
 def test_170m_mac_recipe_pins_public_reference_topology():
     root = Path(__file__).parents[4]
-    recipe = yaml.safe_load(
-        (root / "examples/llm_pretrain/titans_170m_mac.yaml").read_text()
-    )
+    recipe = yaml.safe_load((root / "examples/llm_pretrain/titans_170m_mac.yaml").read_text())
     model = recipe["model"]["config"]
 
     assert model["architecture_variant"] == "mac"
@@ -647,11 +797,7 @@ def test_170m_mac_recipe_pins_public_reference_topology():
     assert recipe["dataset"]["seq_len"] == 4096
     assert recipe["step_scheduler"]["max_steps"] == 28_610
 
-    config_values = {
-        key: value
-        for key, value in model.items()
-        if key not in {"_target_", "architectures"}
-    }
+    config_values = {key: value for key, value in model.items() if key not in {"_target_", "architectures"}}
     with torch.device("meta"):
         instantiated = TitansForCausalLM(TitansConfig(**config_values))
     assert sum(parameter.numel() for parameter in instantiated.parameters()) > 173_695_680
@@ -660,9 +806,7 @@ def test_170m_mac_recipe_pins_public_reference_topology():
 @pytest.mark.parametrize("variant", ["mag", "mal"])
 def test_170m_mag_mal_recipes_pin_paper_window_and_token_batch(variant):
     root = Path(__file__).parents[4]
-    recipe = yaml.safe_load(
-        (root / f"examples/llm_pretrain/titans_170m_{variant}.yaml").read_text()
-    )
+    recipe = yaml.safe_load((root / f"examples/llm_pretrain/titans_170m_{variant}.yaml").read_text())
     model = recipe["model"]["config"]
 
     assert model["architecture_variant"] == variant
@@ -677,9 +821,7 @@ def test_170m_mag_mal_recipes_pin_paper_window_and_token_batch(variant):
 
 def test_lmm_recipe_distributed_section_supports_fsdp2_and_ddp():
     root = Path(__file__).parents[4]
-    distributed = yaml.safe_load(
-        (root / "examples/llm_pretrain/titans_170m_lmm.yaml").read_text()
-    )["distributed"]
+    distributed = yaml.safe_load((root / "examples/llm_pretrain/titans_170m_lmm.yaml").read_text())["distributed"]
 
     assert isinstance(parse_distributed_section(distributed)["strategy_config"], FSDP2Config)
 
@@ -711,26 +853,20 @@ def test_multinode_ablation_runner_preserves_paper_batch_and_uses_c10d():
 
 def test_blackwell_submitter_resolves_portable_topology():
     root = Path(__file__).parents[4]
-    runner = (
-        root / "examples/llm_pretrain/slurm/titans_blackwell_lmm_pilot.sbatch"
-    ).read_text()
-    full_runner = (
-        root / "examples/llm_pretrain/slurm/titans_blackwell_lmm_full.sbatch"
-    ).read_text()
-    data_runner = (
-        root / "examples/llm_pretrain/slurm/titans_blackwell_fineweb_prepare.sbatch"
-    ).read_text()
+    runner = (root / "examples/llm_pretrain/slurm/titans_blackwell_lmm_pilot.sbatch").read_text()
+    full_runner = (root / "examples/llm_pretrain/slurm/titans_blackwell_lmm_full.sbatch").read_text()
+    data_runner = (root / "examples/llm_pretrain/slurm/titans_blackwell_fineweb_prepare.sbatch").read_text()
     submitter = (root / "tools/submit_titans_blackwell.sh").read_text()
 
-    assert "--total-gpus \"$TOTAL_GPUS\"" in submitter
+    assert '--total-gpus "$TOTAL_GPUS"' in submitter
     assert "--gpu-family blackwell" in submitter
     assert "--require-shared-root" in submitter
     assert "SHARED_ROOT=${TARGET[5]}" in submitter
     assert "MOUNT_ROOT=${TITANS_MOUNT_ROOT:-/scratch}" in submitter
     assert "job recommend-target" in submitter
-    assert "--nodes \"$SUBMIT_NODES\"" in submitter
+    assert '--nodes "$SUBMIT_NODES"' in submitter
     assert "TITANS_TRAIN_NODES=%q" in submitter
-    assert "--gpus \"$GPUS_PER_NODE\"" in submitter
+    assert '--gpus "$GPUS_PER_NODE"' in submitter
     assert "aws-pdx-slurm-1" in submitter
     assert "nsc-svg-slurm-1" in submitter
     assert "aws-cmh-slurm-1" in submitter

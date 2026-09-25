@@ -62,9 +62,7 @@ from torch import nn
 from nemo_automodel.shared.import_utils import safe_import
 
 _HAVE_FLA, _fla = safe_import("fla.ops.gated_delta_rule")
-_HAVE_ACCELERATED_SCAN, _accelerated_scan = safe_import(
-    "nemo_automodel.components.models.titans.accelerated_scan"
-)
+_HAVE_ACCELERATED_SCAN, _accelerated_scan = safe_import("nemo_automodel.components.models.titans.accelerated_scan")
 
 
 @dataclass
@@ -97,6 +95,7 @@ def titans_delta_rule_recurrence(
     beta: torch.Tensor,
     eta: torch.Tensor,
     scale: float | None = None,
+    enable_ttt_updates: bool = True,
 ) -> torch.Tensor:
     """Naive (sequential) Titans linear-memory recurrence.
 
@@ -110,6 +109,9 @@ def titans_delta_rule_recurrence(
         beta: ``[B, T, H]`` delta-rule surprise step size (learning rate).
         eta: ``[B, T, H]`` data-dependent momentum coefficient in ``[0, 1)``.
         scale: query scale; defaults to ``1/sqrt(D)``.
+        enable_ttt_updates: Whether to evolve the zero-initialized linear fast
+            weights. When ``False``, retrieval still runs against the static zero
+            state, so the memory branch output is zero before its output path.
 
     Returns:
         ``[B, T, H, D]`` retrieved values.
@@ -130,13 +132,14 @@ def titans_delta_rule_recurrence(
     M = q.new_zeros(B, H, K, Vd)
     o = q.new_zeros(B, H, T, Vd)
     for t in range(T):
-        alpha = g[:, :, t].exp()[..., None, None]  # [B,H,1,1]
-        S = S * alpha
-        pred = (S * k[:, :, t][..., None]).sum(-2)  # (alpha S)^T k -> [B,H,V]
-        dv = (v[:, :, t] - pred) * beta[:, :, t][..., None]  # [B,H,V]
-        surprise = k[:, :, t].unsqueeze(-1) * dv.unsqueeze(-2)  # [B,H,K,V]
-        M = M * eta[:, :, t][..., None, None] + surprise
-        S = S + M
+        if enable_ttt_updates:
+            alpha = g[:, :, t].exp()[..., None, None]  # [B,H,1,1]
+            S = S * alpha
+            pred = (S * k[:, :, t][..., None]).sum(-2)  # (alpha S)^T k -> [B,H,V]
+            dv = (v[:, :, t] - pred) * beta[:, :, t][..., None]  # [B,H,V]
+            surprise = k[:, :, t].unsqueeze(-1) * dv.unsqueeze(-2)  # [B,H,K,V]
+            M = M * eta[:, :, t][..., None, None] + surprise
+            S = S + M
         o[:, :, t] = torch.einsum("bhd,bhdm->bhm", q[:, :, t], S)
     return o.transpose(1, 2).contiguous()
 
@@ -225,12 +228,9 @@ class NeuralMemory(nn.Module):
             raise ValueError(f"chunk_size must be positive; got {chunk_size}.")
         if deep_memory_backend not in {"reference", "titans_pytorch"}:
             raise ValueError(
-                "deep_memory_backend must be 'reference' or 'titans_pytorch'; "
-                f"got {deep_memory_backend!r}."
+                f"deep_memory_backend must be 'reference' or 'titans_pytorch'; got {deep_memory_backend!r}."
             )
-        if memory_batch_size is not None and (
-            memory_batch_size <= 0 or memory_batch_size % chunk_size != 0
-        ):
+        if memory_batch_size is not None and (memory_batch_size <= 0 or memory_batch_size % chunk_size != 0):
             raise ValueError("memory_batch_size must be positive and divisible by chunk_size.")
         if num_heads is None:
             if dim % mem_dim != 0:
@@ -536,10 +536,7 @@ class NeuralMemory(nn.Module):
             original_shape = adjusted_inputs.shape
             flat_inputs = adjusted_inputs.reshape(*original_shape[:2], -1).transpose(1, 2).contiguous()
             flat_gates = (
-                expanded_gates.expand_as(adjusted_inputs)
-                .reshape(*original_shape[:2], -1)
-                .transpose(1, 2)
-                .contiguous()
+                expanded_gates.expand_as(adjusted_inputs).reshape(*original_shape[:2], -1).transpose(1, 2).contiguous()
             )
             scanned = _accelerated_scan.scan(flat_gates, flat_inputs)
             return scanned.transpose(1, 2).reshape(original_shape)
@@ -597,9 +594,7 @@ class NeuralMemory(nn.Module):
         padded_q = F.pad(q.reshape(N, num_chunks * chunk_size, dim), (0, 0, 1, chunk_size - 1))
         retrieval_count = num_chunks + 1
         retrieval_weights = [
-            torch.cat((weight[:, None], trajectory), dim=1).reshape(
-                N * retrieval_count, *weight.shape[1:]
-            )
+            torch.cat((weight[:, None], trajectory), dim=1).reshape(N * retrieval_count, *weight.shape[1:])
             for weight, trajectory in zip(weights, weight_trajectories)
         ]
         retrieved = self._mem_forward(
@@ -624,6 +619,7 @@ class NeuralMemory(nn.Module):
         eta: torch.Tensor | None,
         past_state: tuple[list[torch.Tensor], list[torch.Tensor]] | None = None,
         return_state: bool = False,
+        enable_ttt_updates: bool = True,
     ) -> torch.Tensor | tuple[torch.Tensor, tuple[list[torch.Tensor], list[torch.Tensor]]]:
         """Chunkwise test-time gradient descent on the per-head deep MLP memory.
 
@@ -640,6 +636,9 @@ class NeuralMemory(nn.Module):
             theta: ``[B, S, H]`` per-head learning rate (Phase-1 ``beta``).
             g: ``[B, S, H]`` log-decay (``g <= 0``); keep-factor is ``exp(g)``.
             eta: ``[B, S, H]`` momentum coefficient, or ``None`` when momentum is off.
+            enable_ttt_updates: Whether to apply surprise, forgetting, and momentum
+                updates. When ``False``, every token reads the static incoming
+                fast weights and the returned weight/momentum state is unchanged.
 
         Returns:
             ``[B, S, H, mem_dim]`` retrieved values (anchor-causal at chunk granularity).
@@ -690,10 +689,15 @@ class NeuralMemory(nn.Module):
             weights = [w.to(device=q.device, dtype=compute_dtype) for w in weights]
             momentum = [m.to(device=q.device, dtype=compute_dtype) for m in momentum]
 
+        if not enable_ttt_updates:
+            retrieved = self._mem_forward(qf, weights)
+            retrieved = retrieved.reshape(B, H, S, D).transpose(1, 2).reshape(B, S, H, D)
+            if return_state:
+                return retrieved, (weights, momentum)
+            return retrieved
+
         if self.deep_memory_backend == "titans_pytorch":
-            segment_chunks = (
-                n_chunks if self.memory_batch_size is None else self.memory_batch_size // self.chunk_size
-            )
+            segment_chunks = n_chunks if self.memory_batch_size is None else self.memory_batch_size // self.chunk_size
             retrieved_segments = []
             for start in range(0, n_chunks, segment_chunks):
                 stop = min(start + segment_chunks, n_chunks)
@@ -735,8 +739,17 @@ class NeuralMemory(nn.Module):
         x: torch.Tensor,
         past_state: NeuralMemoryState | None = None,
         return_state: bool = False,
+        enable_ttt_updates: bool = True,
     ) -> torch.Tensor | tuple[torch.Tensor, NeuralMemoryState]:
-        """Map ``x: [B, S, dim]`` to retrieved memory output ``[B, S, dim]``."""
+        """Map ``x: [B, S, dim]`` to retrieved memory output ``[B, S, dim]``.
+
+        Args:
+            x: Residual-stream input with shape ``[B, S, dim]``.
+            past_state: Optional incoming deep-memory streaming state.
+            return_state: Whether to return the next deep-memory streaming state.
+            enable_ttt_updates: Whether test-time surprise, forgetting, and
+                momentum may evolve fast-weight state. Defaults to ``True``.
+        """
         B, S, _ = x.shape
         H, D = self.num_heads, self.mem_dim
         if (past_state is not None or return_state) and self.mem_depth < 2:
@@ -777,6 +790,7 @@ class NeuralMemory(nn.Module):
                 eta,
                 past_state=deep_past,
                 return_state=return_state,
+                enable_ttt_updates=enable_ttt_updates,
             )
             if return_state:
                 core, (next_weights, next_momentum) = deep_result
@@ -788,9 +802,19 @@ class NeuralMemory(nn.Module):
             q = F.normalize(q.float(), dim=-1)
             k = F.normalize(k.float(), dim=-1)
             v = v.float()
+            eta = self.m_proj(x).sigmoid() if self.momentum else torch.zeros(B, S, H, device=x.device)
 
-            if self.momentum:
-                eta = self.m_proj(x).sigmoid()  # [B,S,H] in (0,1)
+            if not enable_ttt_updates:
+                core = titans_delta_rule_recurrence(
+                    q,
+                    k,
+                    v,
+                    g,
+                    beta,
+                    eta,
+                    enable_ttt_updates=False,
+                )
+            elif self.momentum:
                 core = titans_delta_rule_recurrence(q, k, v, g, beta, eta)
             elif _HAVE_FLA:
                 # Momentum disabled == Gated DeltaNet: use the fused fla chunk kernel.
@@ -798,7 +822,6 @@ class NeuralMemory(nn.Module):
                     q, k, v, g.float(), beta.float(), use_qk_l2norm_in_kernel=False, output_final_state=False
                 )
             else:
-                eta = torch.zeros(B, S, H, device=x.device)
                 core = titans_delta_rule_recurrence(q, k, v, g, beta, eta)
 
         core = core.reshape(B, S, H, D)
@@ -877,10 +900,7 @@ class SegmentedCausalAttention(nn.Module):
         self.persistent_kv = nn.Parameter(
             torch.empty(2, self.num_heads, self.num_persistent_tokens, self.head_dim, dtype=dtype)
         )
-        inv_freq = 1.0 / (
-            10000
-            ** (torch.arange(0, self.head_dim, 2, dtype=torch.float32) / self.head_dim)
-        )
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, self.head_dim, 2, dtype=torch.float32) / self.head_dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def _apply_rope(self, x: torch.Tensor) -> torch.Tensor:
@@ -896,8 +916,7 @@ class SegmentedCausalAttention(nn.Module):
         batch, sequence, _ = x.shape
         if sequence % self.segment_length:
             raise ValueError(
-                f"MAC augmented sequence length {sequence} must be divisible by "
-                f"segment length {self.segment_length}."
+                f"MAC augmented sequence length {sequence} must be divisible by segment length {self.segment_length}."
             )
         groups = sequence // self.segment_length
 
@@ -956,10 +975,7 @@ class CausalAttention(nn.Module):
         self.k_proj = nn.Linear(config.hidden_size, self.inner_dim, bias=False, dtype=dtype)
         self.v_proj = nn.Linear(config.hidden_size, self.inner_dim, bias=False, dtype=dtype)
         self.o_proj = nn.Linear(self.inner_dim, config.hidden_size, bias=False, dtype=dtype)
-        inv_freq = 1.0 / (
-            10000
-            ** (torch.arange(0, self.head_dim, 2, dtype=torch.float32) / self.head_dim)
-        )
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, self.head_dim, 2, dtype=torch.float32) / self.head_dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def _apply_rope(self, x: torch.Tensor) -> torch.Tensor:
@@ -1019,11 +1035,13 @@ class TitansBlock(nn.Module):
         x: torch.Tensor,
         past_state: NeuralMemoryState | None = None,
         return_state: bool = False,
+        enable_ttt_updates: bool = True,
     ) -> torch.Tensor | tuple[torch.Tensor, NeuralMemoryState]:
         memory_result = self.memory(
             self.input_layernorm(x),
             past_state=past_state,
             return_state=return_state,
+            enable_ttt_updates=enable_ttt_updates,
         )
         if return_state:
             memory_out, next_state = memory_result
@@ -1055,11 +1073,13 @@ class TitansMACBlock(TitansBlock):
         x: torch.Tensor,
         past_state: NeuralMemoryState | None = None,
         return_state: bool = False,
+        enable_ttt_updates: bool = True,
     ) -> torch.Tensor | tuple[torch.Tensor, NeuralMemoryState]:
         memory_result = self.memory(
             self.input_layernorm(x),
             past_state=past_state,
             return_state=return_state,
+            enable_ttt_updates=enable_ttt_updates,
         )
         if return_state:
             memory_out, next_state = memory_result
@@ -1086,8 +1106,16 @@ class TitansMALBlock(TitansBlock):
         self.attention_layernorm = TitansRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.attention = CausalAttention(config, dtype=dtype)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.memory(self.input_layernorm(x))
+    def forward(
+        self,
+        x: torch.Tensor,
+        past_state: NeuralMemoryState | None = None,
+        return_state: bool = False,
+        enable_ttt_updates: bool = True,
+    ) -> torch.Tensor:
+        if past_state is not None or return_state:
+            raise NotImplementedError("Stateful inference for MAL requires attention-cache state.")
+        x = x + self.memory(self.input_layernorm(x), enable_ttt_updates=enable_ttt_updates)
         x = x + self.attention(self.attention_layernorm(x))
         x = x + self.mlp(self.post_attention_layernorm(x))
         return x
@@ -1108,12 +1136,18 @@ class TitansMAGBlock(TitansBlock):
         self.memory_output_norm = TitansRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.attention_output_norm = TitansRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        memory_out = self.memory(self.input_layernorm(x))
+    def forward(
+        self,
+        x: torch.Tensor,
+        past_state: NeuralMemoryState | None = None,
+        return_state: bool = False,
+        enable_ttt_updates: bool = True,
+    ) -> torch.Tensor:
+        if past_state is not None or return_state:
+            raise NotImplementedError("Stateful inference for MAG requires attention-cache state.")
+        memory_out = self.memory(self.input_layernorm(x), enable_ttt_updates=enable_ttt_updates)
         attention_out = self.attention(self.attention_layernorm(x))
-        fused = F.silu(self.memory_output_norm(memory_out)) * F.silu(
-            self.attention_output_norm(attention_out)
-        )
+        fused = F.silu(self.memory_output_norm(memory_out)) * F.silu(self.attention_output_norm(attention_out))
         x = x + fused
         x = x + self.mlp(self.post_attention_layernorm(x))
         return x
