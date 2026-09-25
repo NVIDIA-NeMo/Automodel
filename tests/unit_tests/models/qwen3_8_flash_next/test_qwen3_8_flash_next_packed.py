@@ -84,10 +84,10 @@ def _config(*, token_budget: int = 8, compress_ratio: int = 2) -> Qwen3_8_FlashN
     )
 
 
-def _backend() -> BackendConfig:
+def _backend(attn: str = "sdpa") -> BackendConfig:
     return BackendConfig(
         linear="torch",
-        attn="sdpa",
+        attn=attn,
         rms_norm="torch",
         experts="torch",
         dispatcher="torch",
@@ -339,7 +339,7 @@ def test_gdn_wrapper_builds_packed_segments_with_padding_tail(monkeypatch: pytes
     torch.testing.assert_close(captured[1].packed_cu_seqlens, torch.tensor([0, 16]))
 
 
-def _packed_cp_parity_worker(rank: int, world_size: int, store_path: str) -> None:
+def _packed_cp_parity_worker(rank: int, world_size: int, store_path: str, device: str = "cpu") -> None:
     import torch.distributed as dist
 
     from nemo_automodel.components.models.qwen3_8_flash_next.cp import (
@@ -349,15 +349,24 @@ def _packed_cp_parity_worker(rank: int, world_size: int, store_path: str) -> Non
 
     try:
         torch.set_num_threads(1)
+        if device == "cuda":
+            torch.cuda.set_device(rank)
         dist.init_process_group(
-            "gloo",
+            "nccl" if device == "cuda" else "gloo",
             init_method=f"file://{store_path}",
             rank=rank,
             world_size=world_size,
         )
         from torch.distributed.device_mesh import init_device_mesh
 
-        cp_mesh = init_device_mesh("cpu", (world_size,), mesh_dim_names=("cp",))["cp"]
+        cp_mesh = init_device_mesh(device, (world_size,), mesh_dim_names=("cp",))["cp"]
+        dtype = torch.bfloat16 if device == "cuda" else torch.float32
+        # bf16 flex attention versus the same bf16 packed CP1 forward; fp32 CPU keeps the tight oracle bounds.
+        tolerance = dict(rtol=2e-2, atol=2e-2) if device == "cuda" else dict(rtol=1e-5, atol=1e-6)
+        grad_tolerance = dict(rtol=2e-2, atol=2e-2) if device == "cuda" else dict(rtol=2e-5, atol=2e-6)
+        # Parameter gradients are all-reduced across CP ranks; on CUDA that sums two bf16 partials,
+        # so the reduction runs in fp32 and the bound is loosened once more.
+        parameter_tolerance = dict(rtol=5e-2, atol=5e-2) if device == "cuda" else grad_tolerance
 
         # ---- packed sharder: boundaries survive as replicated global context ----
         boundaries = (0, 3, 10)
@@ -394,16 +403,22 @@ def _packed_cp_parity_worker(rank: int, world_size: int, store_path: str) -> Non
 
         # ---- QSA packed CP2 vs packed CP1 ----
         torch.manual_seed(321)
-        config = _config(token_budget=4, compress_ratio=2)
-        reference = Qwen3_8_FlashNextQSAAttention(config, layer_idx=0, backend=_backend())
+        # CUDA dispatches to flex, which needs kernel-shaped heads; CPU keeps the small oracle.
+        config = _full_size_config() if device == "cuda" else _config(token_budget=4, compress_ratio=2)
+        backend = _backend("flex" if device == "cuda" else "sdpa")
+        reference = Qwen3_8_FlashNextQSAAttention(config, layer_idx=0, backend=backend)
         reference.init_weights(torch.device("cpu"))
-        cp_attention = Qwen3_8_FlashNextQSAAttention(config, layer_idx=0, backend=_backend())
+        cp_attention = Qwen3_8_FlashNextQSAAttention(config, layer_idx=0, backend=backend)
         cp_attention.load_state_dict(reference.state_dict())
+        reference = reference.to(device=device, dtype=dtype)
+        cp_attention = cp_attention.to(device=device, dtype=dtype)
 
-        full_freqs = _document_relative_freqs(padded_boundaries)
+        full_freqs = _document_relative_freqs(padded_boundaries, rotary_width=config.head_dim).to(
+            device=device, dtype=dtype
+        )
         torch.manual_seed(99)
-        full_hidden_values = torch.randn(1, 16, config.hidden_size)
-        grad_output = torch.randn(1, 16, config.hidden_size)
+        full_hidden_values = torch.randn(1, 16, config.hidden_size).to(device=device, dtype=dtype)
+        grad_output = torch.randn(1, 16, config.hidden_size).to(device=device, dtype=dtype)
 
         reference_hidden = full_hidden_values[:, :total_tokens].clone().requires_grad_(True)
         reference_routes: list[torch.Tensor] = []
@@ -411,7 +426,7 @@ def _packed_cp_parity_worker(rank: int, world_size: int, store_path: str) -> Non
         reference_output = reference(
             reference_hidden,
             freqs_cis=full_freqs[:, :total_tokens],
-            cu_seqlens=torch.tensor(boundaries, dtype=torch.int32),
+            cu_seqlens=torch.tensor(boundaries, dtype=torch.int32, device=device),
         )
         handle.remove()
         reference_output.backward(grad_output[:, :total_tokens])
@@ -420,11 +435,11 @@ def _packed_cp_parity_worker(rank: int, world_size: int, store_path: str) -> Non
             group=dist.group.WORLD,
             rank=rank,
             size=world_size,
-            global_input_ids=torch.nn.functional.pad(input_ids, (0, 16 - total_tokens)),
-            global_padding_mask=torch.arange(16).view(1, -1) >= total_tokens,
+            global_input_ids=torch.nn.functional.pad(input_ids, (0, 16 - total_tokens)).to(device),
+            global_padding_mask=(torch.arange(16).view(1, -1) >= total_tokens).to(device),
             local_sequence_start=local_start,
             local_sequence_length=local_length,
-            global_cu_seqlens=torch.tensor(boundaries, dtype=torch.long),
+            global_cu_seqlens=torch.tensor(boundaries, dtype=torch.long, device=device),
         )
         local_hidden = full_hidden_values[:, local_start : local_start + local_length].clone().requires_grad_(True)
         cp_routes: list[torch.Tensor] = []
@@ -455,14 +470,12 @@ def _packed_cp_parity_worker(rank: int, world_size: int, store_path: str) -> Non
             torch.testing.assert_close(
                 cp_output[:, :real_length],
                 reference_output[:, local_start : local_start + real_length],
-                rtol=1e-5,
-                atol=1e-6,
+                **tolerance,
             )
             torch.testing.assert_close(
                 local_hidden.grad[:, :real_length],
                 reference_hidden.grad[:, local_start : local_start + real_length],
-                rtol=2e-5,
-                atol=2e-6,
+                **grad_tolerance,
             )
         if real_length < local_length:
             assert bool((cp_output[:, real_length:] == 0).all())
@@ -474,9 +487,10 @@ def _packed_cp_parity_worker(rank: int, world_size: int, store_path: str) -> Non
             if parameter.grad is None:
                 assert reference_gradient is None
                 continue
-            dist.all_reduce(parameter.grad, group=dist.group.WORLD)
+            summed_gradient = parameter.grad.float()
+            dist.all_reduce(summed_gradient, group=dist.group.WORLD)
             assert reference_gradient is not None
-            torch.testing.assert_close(parameter.grad, reference_gradient, rtol=2e-5, atol=2e-6)
+            torch.testing.assert_close(summed_gradient, reference_gradient.float(), **parameter_tolerance)
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()
@@ -489,6 +503,36 @@ def test_two_rank_packed_qsa_and_sharder_match_packed_cp1(tmp_path) -> None:
         nprocs=2,
         join=True,
     )
+
+
+@requires_h100
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA devices")
+def test_two_rank_packed_qsa_cuda_flex_mask_covers_gathered_keys(tmp_path) -> None:
+    """Packed CP on the flex path: the QSA mask must span the all-gathered global K/V.
+
+    Regression for the route-replay change picking the local shard length as the
+    mask extent under packed CP (``mask=(8, 8)`` versus ``tensors=(8, 16)``).
+    """
+    torch.multiprocessing.spawn(
+        _packed_cp_parity_worker,
+        args=(2, str(tmp_path / "qwen3-8-flash-next-packed-cp-nccl"), "cuda"),
+        nprocs=2,
+        join=True,
+    )
+
+
+def test_qsa_route_extents_follow_gathered_keys_under_packed_cp() -> None:
+    """Route width is bounded by the longest document, the mask extent by the global K/V length."""
+    from types import SimpleNamespace
+
+    from nemo_automodel.components.models.qwen3_8_flash_next.layers import _qsa_route_extents
+
+    boundaries = torch.tensor([0, 3, 10])
+    cp_context = SimpleNamespace(global_sequence_length=16)
+    assert _qsa_route_extents(8, packed_cu_seqlens=boundaries, cp_context=cp_context) == (7, 16)
+    assert _qsa_route_extents(16, packed_cu_seqlens=boundaries, cp_context=None) == (7, 16)
+    assert _qsa_route_extents(8, packed_cu_seqlens=None, cp_context=cp_context) == (16, 16)
+    assert _qsa_route_extents(16, packed_cu_seqlens=None, cp_context=None) == (16, 16)
 
 
 def test_gdn_wrapper_synthesizes_document_ids_for_packed_conv(monkeypatch: pytest.MonkeyPatch) -> None:
