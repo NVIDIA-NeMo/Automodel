@@ -1,0 +1,190 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Full Qwen3-8B random-initialized pretraining on a real FineWeb-Edu corpus.
+# PRETRAIN_DATA must contain Megatron indexed shards produced with the Qwen3-8B
+# tokenizer; see tools/preprocess_megatron_dataset.py. Run on one 8-GPU node:
+#   PRETRAIN_DATA=/path/to/fineweb_edu_qwen3 \
+#     automodel examples/llm_pretrain/qwen3_8b_fineweb_edu_pretrain.yaml \
+#     --nproc-per-node 8
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+seed: 1234
+
+step_scheduler:
+  global_batch_size: 8
+  local_batch_size: 1
+  num_epochs: null
+  max_steps: 100000
+  val_every_steps: 1000
+  # A full exact-resume checkpoint is ~93 GiB. Saving every validation interval
+  # makes async checkpoint I/O overlap training continuously; checkpoint less
+  # often while retaining 1k-step validation visibility.
+  ckpt_every_steps: 10000
+  save_checkpoint_every_epoch: false
+  log_remote_every_steps: 10
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  config:
+    _target_: transformers.Qwen3Config
+    architectures: [Qwen3ForCausalLM]
+    vocab_size: 151936
+    hidden_size: 4096
+    intermediate_size: 12288
+    num_hidden_layers: 36
+    num_attention_heads: 32
+    num_key_value_heads: 8
+    head_dim: 128
+    max_position_embeddings: 40960
+    max_window_layers: 36
+    hidden_act: silu
+    rms_norm_eps: 1.0e-6
+    initializer_range: 0.02
+    rope_theta: 1000000.0
+    rope_scaling: null
+    sliding_window: null
+    use_sliding_window: false
+    attention_bias: false
+    attention_dropout: 0.0
+    tie_word_embeddings: false
+    bos_token_id: 151643
+    eos_token_id: 151645
+    use_cache: false
+  torch_dtype: bfloat16
+  load_base_model: false
+  force_hf: false
+  use_liger_kernel: false
+  attn_implementation: sdpa
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: sdpa
+    linear: torch
+    rms_norm: torch_fp32
+    rope_fusion: false
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: ${oc.env:PRETRAIN_CHECKPOINT_DIR,checkpoints/qwen3_8b_fineweb_edu}
+  model_save_format: torch_save
+  save_consolidated: false
+  restore_from: LATEST
+  is_async: true
+  wait_for_staging: true
+  max_recent_checkpoints: 2
+
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 2
+  cp_size: 1
+  pp_size: 1
+  sequence_parallel: false
+  activation_checkpointing: true
+  mp_policy:
+    _target_: torch.distributed.fsdp.MixedPrecisionPolicy
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    output_dtype: bfloat16
+    cast_forward_inputs: true
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+clip_grad_norm:
+  max_norm: 1.0
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.megatron_dataset.MegatronPretrainingConfig
+  paths: ${oc.env:PRETRAIN_DATA}/processed_data_*_text_document*
+  index_mapping_dir: ${oc.env:PRETRAIN_INDEX_DIR,./fineweb_edu_qwen3_mapping}
+  tokenizer:
+    _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: Qwen/Qwen3-8B
+  seq_length: 2048
+  seed: 1234
+  split: "999,1,0"
+  splits_to_build: train
+  num_dataset_builder_threads: 4
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: torch.utils.data.default_collate
+  dataloader_type: cyclic
+  # Megatron indexed readers own mmap/file handles and stay in the rank process.
+  num_workers: 0
+  pin_memory: true
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.megatron_dataset.MegatronPretrainingConfig
+  paths: ${oc.env:PRETRAIN_DATA}/processed_data_*_text_document*
+  index_mapping_dir: ${oc.env:PRETRAIN_INDEX_DIR,./fineweb_edu_qwen3_mapping}
+  tokenizer:
+    _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: Qwen/Qwen3-8B
+  seq_length: 2048
+  seed: 1234
+  split: "999,1,0"
+  splits_to_build: validation
+  num_val_samples: 64
+  num_dataset_builder_threads: 4
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: torch.utils.data.default_collate
+  dataloader_type: single
+  num_workers: 0
+  pin_memory: true
+
+optimizer:
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+  lr: 3.0e-4
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  weight_decay: 0.1
+  adam_w_mode: true
+  bias_correction: true
+  master_weights: true
+  store_param_remainders: true
+  exp_avg_dtype: torch.float32
+  exp_avg_sq_dtype: torch.float32
+
+lr_scheduler:
+  lr_decay_style: cosine
+  lr_warmup_steps: 2000
+  lr_decay_steps: 100000
+  init_lr: 0.0
+  min_lr: 3.0e-5
+
+# Add a wandb block or CLI overrides for remote experiment tracking, e.g.:
+# wandb:
+#   project: automodel
+#   entity: your-team
+#   name: qwen3-8b-fineweb-edu-100k
+#   dir: result/wandb
+
+ci:
+  recipe_owner: akoumpa
+  nodes: 1
+  time: "00:20:00"
+  nproc_per_node: 8
+  cluster_tag: h100
+  env_vars:
+    REQUIRE_FINITE_METRICS: "true"
