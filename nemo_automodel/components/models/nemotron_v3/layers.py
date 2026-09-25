@@ -386,7 +386,13 @@ class NemotronV3Mamba2Mixer(nn.Module):
             dt_limit_kwargs = {} if self.time_step_limit == (0.0, float("inf")) else {"dt_limit": self.time_step_limit}
 
             if self.cp is not None:
-                cu_seqlens_cp = kwargs.get("cu_seqlens")
+                # ``MambaContextParallel`` uses a non-None ``cu_seqlens`` to
+                # select its packed 2D THD transport. SDPA/flex attention
+                # keeps qkv_format="thd" inputs in 3D BSHD, where the CP
+                # transport must instead reorder along the sequence dimension.
+                # Keep global cu_seqlens above for constructing seq_idx, but
+                # only pass it to the transport for genuinely squeezed THD.
+                cu_seqlens_cp = kwargs.get("cu_seqlens") if squeezed else None
                 # CP reorder helpers expect 2D [T, H] when cu_seqlens is provided (THD format).
                 # The mixer unsqueezes 2D input to [1, T, H] above, so squeeze back for CP methods.
                 if squeezed and cu_seqlens_cp is not None:
@@ -662,9 +668,14 @@ class NemotronV3Block(nn.Module):
             dtype=get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16),
         )
 
-        # Determine layer type from config
-        # 'M' → mamba, '*' → attention, '-' → mlp, other → moe
-        self.block_type = block_type if block_type is not None else config.layers_block_type[layer_idx]
+        # Transformers 5.15 canonicalized the hybrid discriminators. Keep the
+        # local implementation's names at the boundary so downstream routing and
+        # cache logic remain unchanged.
+        configured_block_type = block_type if block_type is not None else config.layers_block_type[layer_idx]
+        self.block_type = {
+            "linear_attention": "mamba",
+            "full_attention": "attention",
+        }.get(configured_block_type, configured_block_type)
 
         # Create mixer based on block type
         if self.block_type == "mamba":

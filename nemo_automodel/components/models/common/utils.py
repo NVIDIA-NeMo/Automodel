@@ -14,15 +14,25 @@
 
 import importlib.util
 import logging
+import math
+import os
+import warnings
+from collections.abc import Collection
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 import torch
 from torch import nn
+from torch.distributed.fsdp import FSDPModule
+from torch.distributed.tensor import Replicate, Shard
+from torch.distributed.tensor.experimental import register_sharding
+from transformers import PretrainedConfig
+from transformers.generation import GenerationConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from nemo_automodel.shared.import_utils import safe_import_from
+from nemo_automodel.shared.import_utils import safe_import, safe_import_from
+from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 from nemo_automodel.shared.utils import dtype_from_str
 
 logger = logging.getLogger(__name__)
@@ -30,7 +40,6 @@ logger = logging.getLogger(__name__)
 HAVE_TE = importlib.util.find_spec("transformer_engine") is not None
 HAVE_DEEP_EP = importlib.util.find_spec("deep_ep") is not None
 HAVE_UCCL_EP = importlib.util.find_spec("uccl") is not None or importlib.util.find_spec("ep") is not None
-HAVE_GMM = importlib.util.find_spec("grouped_gemm") is not None
 
 # ---------------------------------------------------------------------------
 #  Global state flags for training coordination
@@ -78,6 +87,125 @@ def get_is_first_microbatch() -> bool | None:
         True/False/None indicating microbatch position for FP8 weight caching.
     """
     return IS_FIRST_MICROBATCH
+
+
+# Hub loading options ``PreTrainedModel.from_pretrained`` threads into every file it
+# reads for a checkpoint, the generation config included (see
+# ``GenerativePreTrainedModel.adjust_generation_fn``).
+HUB_LOADING_KWARGS = ("cache_dir", "force_download", "proxies", "local_files_only", "token", "revision", "subfolder")
+
+
+def generation_config_from_model_config(config: PretrainedConfig) -> GenerationConfig:
+    """Generation config a custom causal LM starts with, seeded the way transformers does it.
+
+    ``PreTrainedModel.__init__`` derives ``generation_config`` from the model config so
+    the bos/eos/pad ids are set from the start. A custom model that builds a bare
+    ``GenerationConfig()`` instead has no stop token, and because the consolidated
+    export writes ``model.generation_config`` out as ``generation_config.json`` (which
+    beats ``config.json`` on reload), the exported model never stops generating either.
+    Objects that are not ``PretrainedConfig`` instances (test doubles) get the defaults.
+    """
+    if not isinstance(config, PretrainedConfig):
+        return GenerationConfig()
+    try:
+        return GenerationConfig.from_model_config(config)
+    except NotImplementedError:
+        return GenerationConfig()
+
+
+def load_pretrained_generation_config(
+    pretrained_model_name_or_path: str | os.PathLike[str],
+    config: PretrainedConfig | None = None,
+    config_overrides: Collection[str] | None = None,
+    **loading_kwargs: Any,
+) -> GenerationConfig | None:
+    """The generation config a checkpoint carries, or ``None`` when it carries none.
+
+    Mirrors what ``PreTrainedModel.from_pretrained`` does once the weights are in:
+    ``generation_config.json`` wins when present, because that is where hub checkpoints
+    keep extra stop tokens (Nemotron-3 lists ``[2, 11]`` there but only ``2`` in
+    ``config.json``) and their sampling defaults. Without it, the generation fields of
+    the raw ``config.json`` are used, as HF does for legacy checkpoints that still keep
+    ``do_sample``/``temperature`` there (the in-memory config has already dropped them).
+
+    Args:
+        pretrained_model_name_or_path: Hub id or local directory of the checkpoint.
+        config: The model's in-memory config. Its explicit values (an ``eos_token_id``
+            passed to ``from_pretrained`` lands here) win over the ``config.json``
+            fallback, which cannot know about them.
+        config_overrides: Names the caller explicitly set on *config*. Needed because a
+            value cannot be recognized as deliberate once it equals a default.
+        **loading_kwargs: The ``HUB_LOADING_KWARGS`` the caller was loading with, so the
+            generation config is read from the same place as the weights.
+    """
+    subfolder = loading_kwargs.pop("subfolder", None) or ""
+    if subfolder and os.path.isdir(pretrained_model_name_or_path):
+        # GenerationConfig.from_pretrained joins ``subfolder`` in front of an absolute
+        # local path, which resolves to the parent's file whenever one exists there
+        # (transformers 5.12.1), so resolve the directory here and let the child win.
+        pretrained_model_name_or_path = os.path.join(pretrained_model_name_or_path, subfolder)
+    elif subfolder:
+        loading_kwargs["subfolder"] = subfolder
+
+    try:
+        return GenerationConfig.from_pretrained(pretrained_model_name_or_path, **loading_kwargs)
+    except OSError:
+        logger.info(
+            "No generation_config.json in %s, using the generation fields of config.json.",
+            pretrained_model_name_or_path,
+        )
+    try:
+        generation_config = GenerationConfig.from_pretrained(
+            pretrained_model_name_or_path, config_file_name="config.json", _from_model_config=True, **loading_kwargs
+        )
+    except (OSError, TypeError):
+        # transformers resolves a missing non-default config file to None and then
+        # fails to open it (TypeError) instead of raising OSError.
+        return None
+    if config is not None:
+        # The raw file only contributes the legacy sampling fields; the token ids and
+        # anything else set on the in-memory config, overrides included, stay on top.
+        generation_config.update(**generation_config_from_model_config(config).to_diff_dict())
+        # ``to_diff_dict`` drops values that equal a GenerationConfig default, so an
+        # explicit ``eos_token_id=None`` would be indistinguishable from "unset" above
+        # and the file's stop token would win. Re-apply what the caller actually set.
+        if config_overrides:
+            generation_fields = set(GenerationConfig().to_dict())
+            generation_config.update(
+                **{
+                    name: getattr(config, name)
+                    for name in config_overrides
+                    if name in generation_fields and hasattr(config, name)
+                }
+            )
+    return generation_config
+
+
+def restore_pretrained_generation_config(
+    model: nn.Module,
+    pretrained_model_name_or_path: str | os.PathLike[str],
+    config_overrides: Collection[str] | None = None,
+    **loading_kwargs: Any,
+) -> None:
+    """Replace a model's ``generation_config`` with the one its checkpoint carries, if any.
+
+    Applies only to models that expose a real ``GenerationConfig`` (the ones that can
+    generate); a model without one, or a checkpoint without generation settings, is
+    left as it is. ``config_overrides`` names what the caller explicitly set on the
+    model's config, and ``loading_kwargs`` are the ``HUB_LOADING_KWARGS`` the model was
+    loaded with.
+    """
+    if not isinstance(getattr(model, "generation_config", None), GenerationConfig):
+        return
+    config = getattr(model, "config", None)
+    generation_config = load_pretrained_generation_config(
+        pretrained_model_name_or_path,
+        config=config if isinstance(config, PretrainedConfig) else None,
+        config_overrides=config_overrides,
+        **loading_kwargs,
+    )
+    if generation_config is not None:
+        model.generation_config = generation_config
 
 
 def is_tensor_unallocated(tensor: torch.Tensor) -> bool:
@@ -188,32 +316,132 @@ class CudaGraphConfig:
             raise ValueError("'moe_preprocess' in cuda_graph.modules requires 'moe_router'")
 
 
+class _MoKFunctionalConfig(Protocol):
+    """Structural type for the optional ``mok.functional.MoKConfig``."""
+
+    fwd_num_comm_sms: int
+    bwd_num_comm_sms: int
+    minibatch_size: int
+    macrobatch_size: int
+    schedule_capacity_multiplier: float
+    all_gather_top_experts_chunk_bytes: int
+
+
+@dataclass(kw_only=True, frozen=True)
+class MoKBackendConfig:
+    """Configuration for the optional Mixture-of-Kittens MoE backend.
+
+    Attributes:
+        precision: Routed-expert compute precision. ``"bf16"`` passes the
+            materialized BF16 weights directly to MoK; ``"mxfp8"`` quantizes
+            them with MoK's E4M3 data and E8M0 block-scale format.
+        fwd_num_comm_sms: Communication SMs reserved during the forward megakernel.
+        bwd_num_comm_sms: Communication SMs reserved during the backward megakernel.
+        minibatch_size: Routed-token overlap granularity, divisible by 256.
+        macrobatch_size: Routed-token ring-buffer capacity and a multiple of
+            ``minibatch_size``.
+        schedule_capacity_multiplier: Worst-case fraction of routes sent to one EP rank.
+        all_gather_top_experts_chunk_bytes: Routing all-gather chunk size in bytes.
+    """
+
+    precision: Literal["bf16", "mxfp8"] = "bf16"
+    fwd_num_comm_sms: int = 40
+    bwd_num_comm_sms: int = 28
+    minibatch_size: int = 4096
+    macrobatch_size: int = 131072
+    schedule_capacity_multiplier: float = 0.5
+    all_gather_top_experts_chunk_bytes: int = 2048
+
+    def __post_init__(self) -> None:
+        """Validate settings that do not depend on a CUDA device or EP group."""
+        if self.precision not in ("bf16", "mxfp8"):
+            raise ValueError(f"mok.precision must be 'bf16' or 'mxfp8'; got {self.precision!r}")
+        for name, value in (
+            ("fwd_num_comm_sms", self.fwd_num_comm_sms),
+            ("bwd_num_comm_sms", self.bwd_num_comm_sms),
+        ):
+            if type(value) is not int or value <= 0 or value % 2 != 0:
+                raise ValueError(f"mok.{name} must be a positive even integer")
+        if type(self.minibatch_size) is not int or self.minibatch_size <= 0 or self.minibatch_size % 256 != 0:
+            raise ValueError("mok.minibatch_size must be a positive multiple of 256")
+        if (
+            type(self.macrobatch_size) is not int
+            or self.macrobatch_size <= 0
+            or self.macrobatch_size % self.minibatch_size != 0
+        ):
+            raise ValueError("mok.macrobatch_size must be a positive multiple of mok.minibatch_size")
+        if (
+            type(self.schedule_capacity_multiplier) not in (int, float)
+            or not math.isfinite(self.schedule_capacity_multiplier)
+            or self.schedule_capacity_multiplier <= 0
+        ):
+            raise ValueError("mok.schedule_capacity_multiplier must be a positive finite number")
+        if (
+            type(self.all_gather_top_experts_chunk_bytes) is not int
+            or self.all_gather_top_experts_chunk_bytes <= 0
+            or self.all_gather_top_experts_chunk_bytes % 16 != 0
+        ):
+            raise ValueError("mok.all_gather_top_experts_chunk_bytes must be a positive multiple of 16")
+
+    def build(self) -> _MoKFunctionalConfig:
+        """Build the optional MoK runtime configuration.
+
+        Returns:
+            A ``mok.functional.MoKConfig`` with these declarative settings.
+
+        Raises:
+            UnavailableError: If Mixture-of-Kittens is not installed.
+        """
+        _, mok_functional = safe_import(
+            "mok.functional",
+            msg=(
+                "dispatcher='mok' requires a built Mixture-of-Kittens installation or an importable "
+                "mixture-of-kittens checkout."
+            ),
+        )
+        return mok_functional.MoKConfig(
+            fwd_num_comm_sms=self.fwd_num_comm_sms,
+            bwd_num_comm_sms=self.bwd_num_comm_sms,
+            minibatch_size=self.minibatch_size,
+            macrobatch_size=self.macrobatch_size,
+            schedule_capacity_multiplier=self.schedule_capacity_multiplier,
+            all_gather_top_experts_chunk_bytes=self.all_gather_top_experts_chunk_bytes,
+        )
+
+
 @dataclass(kw_only=True)
 class BackendConfig:
     """Backend configuration for model components.
 
     Attributes:
-        attn: Attention backend ("te", "sdpa", "flex", "eager", or "tilelang").
+        attn: Attention backend ("te", "sdpa", "flex", "eager", "tilelang", or "cudnn").
             For DeepSeek V4, "tilelang" enables the TileLang sparse attention,
-            indexer, and Sinkhorn kernels together.
+            indexer, and Sinkhorn kernels together. For GLM DSA, "tilelang" and
+            "cudnn" select their respective packed sparse-attention kernels.
+            For Qwen3.8-Flash-Next, "flex" selects FlexAttention sparse GQA on
+            CUDA BF16; CPU execution retains the PyTorch numerical oracle.
+        sparse_attn: Sparse-attention backend. "generic" preserves each model's
+            existing sparse mask plus ``attn`` path; "msa" selects the optional
+            SM100 MSA kernels a model provides for its sparse layers only.
         linear: Linear layer backend ("torch", "te", or "quack").
         rms_norm: RMSNorm backend ("torch", "torch_fp32", "te", or "quack").
         rope: Rotary embedding backend ("torch" or "quack"). QuACK is currently
             integrated for Llama-family rotary embeddings.
         rope_fusion: Whether to use fused RoPE (requires TE).
         experts: MoE expert GEMM backend. "torch" uses per-expert loop,
-            "te" uses TE GroupedLinear, "gmm" uses grouped_gemm.ops.gmm,
-            "torch_mm" uses torch._grouped_mm, "torch_mm_mxfp8" uses torch._grouped_mm
+            "te" uses TE GroupedLinear, "torch_mm" uses torch._grouped_mm,
+            "gmm" is a deprecated compatibility alias for "torch_mm", and "torch_mm_mxfp8" uses torch._grouped_mm
             dispatch but routes the expert grouped GEMMs through torchao's MXFP8
             scaled grouped GEMM (training-only; GB200/sm_100+ with torchao installed,
             else falls back to torch._grouped_mm at runtime).
         dispatcher: MoE token dispatcher. "torch" uses DTensor all-gather/reduce-scatter,
-            "deepep" uses DeepEP for token dispatch,
-            "uccl_ep" uses UCCL-EP for token dispatch across heterogeneous GPUs and NICs.
+            "deepep" uses DeepEP, "hybridep" uses HybridEP, "uccl_ep" uses UCCL-EP,
+            and "mok" uses Mixture-of-Kittens' fused communication and SwiGLU megakernel.
+        mok: Mixture-of-Kittens tuning settings used when ``dispatcher="mok"``.
         dispatcher_share_token_dispatcher: Whether flex token dispatchers share a communication
             manager instance across MoE layers.
-        dispatcher_async_dispatch: Whether DeepEP/UCCL-EP dispatch should return asynchronously
-            and allocate dispatched tensors on the communication stream.
+        dispatcher_async_dispatch: Whether DeepEP/UCCL-EP dispatch and combine should return
+            asynchronously and allocate their outputs on the communication stream.
         enable_deepep: Removed and ignored. Logs a warning if set; configure "dispatcher"
             and "experts" explicitly instead.
         fake_balanced_gate: If True, replace the learned Gate with FakeBalancedGate
@@ -230,10 +458,39 @@ class BackendConfig:
         compile_attn: torch.compile(fullgraph) the attention module's forward — both the
             DeepSeek-V3 MLA and standard GQA attention (e.g. Qwen3-MoE) honor it. Requires
             attn="sdpa", linear="torch", rms_norm="torch", rope_fusion=False.
+        compile_situ: torch.compile the SiTU expert activation of models that opt in
+            (currently Kimi K3): the weighted-SiTU forward and backward run as one fused
+            whole-tensor kernel each (low-precision in/out, fp32 math inside, no chunk loop),
+            the dense / shared-expert ``SituAndMul`` uses a compiled core, and the attn-res
+            mixing chain is compiled as well. Compiled numerics are allclose to eager but
+            not bitwise-identical.
+        compile_norm: torch.compile the fp32 RMSNorm chain of models that opt in
+            (currently Kimi K3), fusing cast/pow/mean/rsqrt/mul into one kernel.
+            Same lazy once-per-process pattern as ``compile_situ``; numerics are
+            allclose to eager but not bitwise-identical.
+        shared_expert_overlap: run the shared experts of opted-in MoE models (currently Kimi K3)
+            on a side CUDA stream so their GEMMs overlap the expert-parallel dispatch / combine
+            communication of the routed path; numerics unchanged. Default False.
+        compile_router_weight: torch.compile the fp32 router-weight multiply applied to
+            expert outputs (``GroupedExperts`` / ``GroupedExpertsDeepEP``, all MoE models),
+            so each pass is one fused kernel instead of the eager per-chunk cast/multiply/
+            cast/slice-assign loop. Same lazy once-per-process pattern as ``compile_situ``;
+            numerics are allclose to eager but not bitwise-identical.
+        benchmark_static_routing: Benchmark-only. Requires ``fake_balanced_gate=True``
+            with ``fake_gate_noise=0.0``, where routing metadata (tokens per expert,
+            permuted token counts) is identical for every microbatch. Skips the
+            per-microbatch device-to-host reads of that metadata (`.tolist()` /
+            `count_nonzero` / dispatcher size checks) by caching the first
+            microbatch's values, removing recurring host-sync stalls on the hot
+            path. Never enable with a learned gate: cached metadata would go
+            stale and silently corrupt expert dispatch.
         cuda_graph: Scoped partial CUDA-graph configuration.
     """
 
-    attn: Literal["te", "sdpa", "flex", "eager", "tilelang"] = "te" if HAVE_TE and torch.cuda.is_available() else "sdpa"
+    attn: Literal["te", "sdpa", "flex", "eager", "tilelang", "cudnn"] = (
+        "te" if HAVE_TE and torch.cuda.is_available() else "sdpa"
+    )
+    sparse_attn: Literal["generic", "msa"] = "generic"
     linear: Literal["torch", "te", "quack"] = "te" if HAVE_TE and torch.cuda.is_available() else "torch"
     rms_norm: Literal["torch", "torch_fp32", "te", "quack"] = "torch_fp32"
     rope: Literal["torch", "quack"] = "torch"
@@ -241,7 +498,7 @@ class BackendConfig:
     experts: Literal["torch", "te", "gmm", "torch_mm", "torch_mm_mxfp8"] = (
         "torch_mm" if torch.cuda.is_available() else "torch"
     )
-    dispatcher: Literal["torch", "deepep", "hybridep", "uccl_ep"] = (
+    dispatcher: Literal["torch", "deepep", "hybridep", "uccl_ep", "mok"] = (
         "deepep"
         if HAVE_DEEP_EP and torch.cuda.is_available()
         else "uccl_ep"
@@ -251,6 +508,7 @@ class BackendConfig:
     dispatcher_num_sms: int = 20
     dispatcher_share_token_dispatcher: bool = True
     dispatcher_async_dispatch: bool = False
+    mok: MoKBackendConfig = field(default_factory=MoKBackendConfig)
     enable_deepep: bool | None = None  # Removed: ignored with a warning; set dispatcher/experts explicitly
     fake_balanced_gate: bool = False
     # Approximate max/mean load ratios (64 experts, top-8, 4096 tokens):
@@ -267,9 +525,43 @@ class BackendConfig:
     # fullgraph can't trace), so it requires attn="sdpa", linear="torch", rms_norm="torch",
     # rope_fusion=False. Default False.
     compile_attn: bool = False
+    # When True, torch.compile the SiTU expert activation of models that opt in (currently
+    # Kimi K3): fused whole-tensor weighted-SiTU forward/backward, the dense SituAndMul core
+    # and the attn-res chain. Numerics are allclose to eager, not bitwise-identical. Default False.
+    compile_situ: bool = False
+    # When True, torch.compile the fp32 RMSNorm chain of opted-in models (currently Kimi K3),
+    # same lazy once-per-process pattern as compile_situ. Numerics are allclose to eager,
+    # not bitwise-identical. Default False.
+    compile_norm: bool = False
+    # When True, models that opt in (currently Kimi K3) run their shared experts on a side CUDA
+    # stream, launched before the routed-expert path and joined after it, so the shared-expert
+    # GEMMs overlap the expert-parallel dispatch / combine communication (Megatron-Core's
+    # moe_shared_expert_overlap). Same math, only the execution order changes. Default False.
+    shared_expert_overlap: bool = False
+    # When True, torch.compile the fp32 router-weight multiply on expert outputs (shared by
+    # all MoE expert modules), same lazy once-per-process pattern as compile_situ. Numerics
+    # are allclose to eager, not bitwise-identical. Default False.
+    compile_router_weight: bool = False
+    # Benchmark-only: cache per-microbatch routing metadata (tokens per expert, permuted
+    # token counts) after the first microbatch to remove recurring device-to-host syncs.
+    # Valid ONLY with fake_balanced_gate=True and fake_gate_noise=0.0 (enforced in
+    # __post_init__), where that metadata is constant by construction. Default False.
+    benchmark_static_routing: bool = False
     cuda_graph: CudaGraphConfig = field(default_factory=CudaGraphConfig)
 
     def __post_init__(self) -> None:
+        # benchmark_static_routing caches routing metadata across microbatches, which is
+        # only sound when routing is constant by construction (forced balance, no noise).
+        if self.benchmark_static_routing and not (self.fake_balanced_gate and self.fake_gate_noise == 0.0):
+            raise ValueError(
+                "benchmark_static_routing=True requires fake_balanced_gate=True and "
+                "fake_gate_noise=0.0; with a learned or noisy gate the cached routing "
+                "metadata would go stale and corrupt expert dispatch."
+            )
+
+        if self.sparse_attn not in ("generic", "msa"):
+            raise ValueError(f"Unsupported sparse_attn={self.sparse_attn!r}; expected 'generic' or 'msa'.")
+
         # QuACK consumes position-gathered cosine/sine tables. TE's fused RoPE path
         # instead assumes contiguous [0, seq_len) positions, so combining the two
         # silently produces incorrect phases for packed, offset, or per-example
@@ -295,8 +587,20 @@ class BackendConfig:
         elif not isinstance(self.cuda_graph, CudaGraphConfig):
             raise TypeError("cuda_graph must be a CudaGraphConfig or mapping")
 
+        if isinstance(self.mok, dict):
+            self.mok = MoKBackendConfig(**self.mok)
+        elif not isinstance(self.mok, MoKBackendConfig):
+            raise TypeError("mok must be a MoKBackendConfig or mapping")
+
         if isinstance(self.gate_precision, str):
             self.gate_precision = dtype_from_str(self.gate_precision, default=None)
+
+        if self.experts == "gmm":
+            warnings.warn(
+                "experts='gmm' is deprecated; use experts='torch_mm' instead.",
+                FutureWarning,
+                stacklevel=2,
+            )
 
         # enable_deepep was removed. It is no longer honored; warn (once, on rank 0) if a stale
         # config still sets it so the user migrates to explicit dispatcher/experts. The field is
@@ -311,8 +615,9 @@ class BackendConfig:
                 )
             self.enable_deepep = None
 
-        # Backward compatibility
-        if self.experts in ("te", "gmm") and self.dispatcher not in ("deepep", "hybridep", "uccl_ep"):
+        # TE grouped experts require a flex dispatcher. Keep the existing standard-
+        # dispatcher fallback for the deprecated gmm alias as well.
+        if self.experts in ("te", "gmm") and self.dispatcher not in ("deepep", "hybridep", "uccl_ep", "mok"):
             if (
                 torch.distributed.is_initialized() and torch.distributed.get_rank() == 0
             ) or not torch.distributed.is_initialized():
@@ -353,13 +658,121 @@ class BackendConfig:
             )
 
 
+# Keep the forward opaque so grad/no_grad compilation uses the same computation.
+@torch.library.custom_op("nemo_automodel::float32_rms_norm", mutates_args=())
+def _float32_rms_norm_impl(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    """Compute RMSNorm in fp32 with an opaque, device-independent forward.
+
+    Args:
+        x: Tensor of shape [..., hidden], with arbitrary leading dimensions.
+        weight: Tensor of shape [hidden] on the same device as x.
+        eps: Epsilon added to the mean square.
+
+    Returns:
+        Tensor of shape [..., hidden] in x's dtype, without aliasing either input.
+    """
+    return torch.nn.functional.rms_norm(x.float(), (x.shape[-1],), weight.float(), eps).to(x.dtype)
+
+
+@_float32_rms_norm_impl.register_fake
+def _float32_rms_norm_meta(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    """Describe the output metadata for inputs x [..., hidden] and weight [hidden].
+
+    Args:
+        x: Tensor of shape [..., hidden], with arbitrary leading dimensions.
+        weight: Tensor of shape [hidden] on the same device as x.
+        eps: Epsilon added to the mean square.
+
+    Returns:
+        Tensor of shape [..., hidden] with x's dtype and device.
+    """
+    # Native RMSNorm can choose a different output layout on CPU and CUDA.
+    return torch.nn.functional.rms_norm(x.float(), (x.shape[-1],), weight.float(), eps).to(x.dtype)
+
+
+@register_sharding(torch.ops.nemo_automodel.float32_rms_norm.default)
+def _float32_rms_norm_sharding(x, weight, eps):
+    """Keep the normalized axis complete while allowing leading-axis sharding.
+
+    Args:
+        x: Tensor metadata of global shape [..., hidden].
+        weight: Tensor metadata of global shape [hidden].
+        eps: Epsilon added to the mean square.
+
+    Returns:
+        Supported output/input placements on each mesh axis. Leading dimensions
+        may be sharded; weight and the hidden dimension must be replicated.
+    """
+    strategies = [([Replicate()], [Replicate(), Replicate(), None])]
+    strategies.extend(([Shard(dim)], [Shard(dim), Replicate(), None]) for dim in range(x.ndim - 1))
+    return strategies
+
+
+def _float32_rms_norm_setup_context(ctx, inputs, output):
+    """Save the inputs required for the RMSNorm gradient.
+
+    Args:
+        ctx: Autograd context that owns the saved tensors.
+        inputs: Tuple containing x [..., hidden], weight [hidden], and eps.
+        output: Tensor of shape [..., hidden] in x's dtype.
+    """
+    x, weight, eps = inputs
+    ctx.save_for_backward(x, weight)
+    ctx.eps = eps
+
+
+def _float32_rms_norm_backward(ctx, grad_output):
+    """Differentiate the fp32 RMSNorm computation.
+
+    Args:
+        ctx: Autograd context containing x [..., hidden] and weight [hidden].
+        grad_output: Output gradient of shape [..., hidden].
+
+    Returns:
+        Gradients for x [..., hidden] and weight [hidden] in their input dtypes,
+        or None for frozen inputs, followed by None for the scalar eps.
+    """
+    x, weight = ctx.saved_tensors
+    x_f32 = x.float()
+    w_f32 = weight.float()
+    g_f32 = grad_output.float()
+
+    r = torch.rsqrt(x_f32.pow(2).mean(-1, keepdim=True) + ctx.eps)
+    xnorm = x_f32 * r
+
+    grad_w = (g_f32 * xnorm).sum_to_size(weight.shape)
+
+    gw = g_f32 * w_f32
+    grad_x = r * (gw - xnorm * (gw * xnorm).mean(-1, keepdim=True))
+
+    return (
+        grad_x.to(x.dtype) if x.requires_grad else None,
+        grad_w.to(weight.dtype) if weight.requires_grad else None,
+        None,  # eps is not differentiable
+    )
+
+
+_float32_rms_norm_impl.register_autograd(
+    _float32_rms_norm_backward,
+    setup_context=_float32_rms_norm_setup_context,
+)
+
+
 @torch.compile(dynamic=True)
 def _float32_rms_norm_fwd(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    """Compiled fp32 RMSNorm forward — standalone function to minimize dynamo guards."""
-    input_dtype = x.dtype
-    x = x.float()
-    x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
-    return (weight * x).to(input_dtype)
+    """Compiled fp32 RMSNorm forward — standalone function to minimize dynamo guards.
+
+    The opaque forward keeps the same computation in grad and no_grad contexts.
+
+    Args:
+        x: Tensor of shape [..., hidden], with arbitrary leading dimensions.
+        weight: Tensor of shape [hidden] on the same device as x.
+        eps: Epsilon added to the mean square.
+
+    Returns:
+        Tensor of shape [..., hidden] in x's dtype.
+    """
+    return torch.ops.nemo_automodel.float32_rms_norm(x, weight, eps)
 
 
 class Float32RMSNorm(nn.Module):
@@ -778,7 +1191,7 @@ def _restore_fp32_tensor_snapshots(
         # module. Try the literal FQN first for buffers registered on the wrapped
         # leaf, then strip the wrapper alias as a fallback for forwarded names.
         candidate_names = [name]
-        stripped_name = name.replace("._checkpoint_wrapped_module", "")
+        stripped_name = canonical_parameter_fqn(name)
         if stripped_name != name:
             candidate_names.append(stripped_name)
 
@@ -878,6 +1291,10 @@ def compute_lm_head_logits(
       to fp32 (e.g. via the MoE ``lm_head_precision`` setting). The matmul goes
       through ``lm_head`` (``nn.Linear``, DTensor-aware under FSDP2) rather than
       ``F.linear`` so DTensor redistribution is preserved.
+    - Otherwise, cast the sliced input to the head's effective compute dtype.
+      For a standalone FSDP2 head this comes from its mixed-precision policy,
+      since its sharded weight may still expose the master-copy dtype before the
+      forward pre-hook runs. Other heads use their materialized weight dtype.
     - ``output_hidden_states``: when set, the (full-sequence, THD-restored)
       ``hidden_states`` are attached to the output so the fused cross-entropy
       path can recompute logits over every position; otherwise the field is
@@ -915,7 +1332,14 @@ def compute_lm_head_logits(
         if fp32_lm_head:
             logits = lm_head(sliced.float()).to(hidden_states.dtype)
         else:
-            logits = lm_head(sliced)
+            compute_dtype = None
+            if isinstance(lm_head, FSDPModule):
+                compute_dtype = lm_head._get_fsdp_state()._mp_policy.param_dtype
+            lm_head_weight = getattr(lm_head, "weight", None)
+            if compute_dtype is None and isinstance(lm_head_weight, torch.Tensor):
+                compute_dtype = lm_head_weight.dtype
+            projection_input = sliced.to(compute_dtype) if compute_dtype is not None else sliced
+            logits = lm_head(projection_input)
     if is_thd and logits.dim() == 2:
         logits = logits.unsqueeze(0)
 
@@ -927,13 +1351,15 @@ def compute_lm_head_logits(
 
 
 def cast_frozen_modules_to_compute_dtype(model: nn.Module, compute_dtype: torch.dtype | None) -> None:
-    """Cast the floating-point tensors of frozen submodules to ``compute_dtype``.
+    """Cast frozen floating-point tensors to ``compute_dtype``.
 
     When parameters are stored in fp32 (the fp32-master-weights pattern) while compute runs
     in bf16, a fully frozen submodule -- such as a frozen vision tower -- can still produce
     fp32 values that flow into bf16 trainable modules and raise a dtype mismatch in the next
-    matmul. This walks each maximal fully-frozen submodule and casts its parameters and
-    buffers to ``compute_dtype``, handling the two tensor kinds differently:
+    matmul. This walks each tensor independently so frozen base weights are still cast when
+    a module also contains trainable adapter weights. In that mixed-module case, its trainable
+    plain-tensor descendants are cast as well so unsharded execution does not introduce a new
+    mismatch in the adapter path. Parameters and buffers are handled differently:
 
     * **Parameters** are cast only when they are plain (unsharded) tensors. Sharded (DTensor)
       params are left as-is: FSDP all-gathers them to the compute dtype during forward, and
@@ -945,8 +1371,9 @@ def cast_frozen_modules_to_compute_dtype(model: nn.Module, compute_dtype: torch.
 
     Tensors whose qualified name matches ``_keep_in_fp32_modules`` or
     ``_keep_in_fp32_modules_strict`` are left in fp32. The function is a no-op when
-    ``compute_dtype`` is None and for tensors already in ``compute_dtype``. Frozen modules are
-    never updated, so casting them does not affect training accuracy.
+    ``compute_dtype`` is None and for tensors already in ``compute_dtype``. Frozen parameters
+    are never updated during training. Trainable plain tensors are cast only in mixed subtrees,
+    where unsharded execution must match the requested compute dtype.
 
     Args:
         model: The model, already materialized, checkpoint-loaded, and sharded.
@@ -965,41 +1392,71 @@ def cast_frozen_modules_to_compute_dtype(model: nn.Module, compute_dtype: torch.
     def _is_fp32_pinned(name: str) -> bool:
         return any(kw in name for kw in fp32_keywords)
 
-    # ``named_modules`` yields parents before children, so the first fully-frozen subtree
-    # we accept is always maximal; descendants are skipped via the ancestor check below.
-    # Sharded subtrees are included so their buffers get cast; their params are skipped per-tensor.
-    selected: list[str] = []
-    for name, module in model.named_modules():
-        params = list(module.parameters(recurse=True))
-        if not params:
-            continue
-        if any(p.requires_grad for p in params):
-            continue
-        if any(name == anc or name.startswith(anc + ".") for anc in selected):
-            continue
-        selected.append(name)
+    # A LoRA-style module directly owns frozen base params and registers trainable adapter
+    # descendants. On a one-rank run FSDP is skipped, so cast the whole mixed subtree to keep
+    # both matmul paths uniform. With FSDP, the trainable params are DTensors and remain managed
+    # by its mixed-precision policy.
+    named_params = list(model.named_parameters())
+    frozen_param_owners: set[str] = set()
+    parameter_subtrees: set[str] = set()
+    trainable_subtrees: set[str] = set()
+    for name, param in named_params:
+        owner_name, _, _ = name.rpartition(".")
+        subtree = owner_name
+        while True:
+            parameter_subtrees.add(subtree)
+            if not subtree:
+                break
+            subtree, _, _ = subtree.rpartition(".")
+        if param.requires_grad:
+            subtree = owner_name
+            while True:
+                trainable_subtrees.add(subtree)
+                if not subtree:
+                    break
+                subtree, _, _ = subtree.rpartition(".")
+        elif param.is_floating_point() and not _is_fp32_pinned(name) and not (DTensor and isinstance(param, DTensor)):
+            frozen_param_owners.add(owner_name)
 
-    for name in selected:
-        module = model.get_submodule(name) if name else model
-        prefix = f"{name}." if name else ""
-        # Parameters: cast plain (unsharded) floats; leave sharded (DTensor) params to FSDP.
-        for param_name, param in module.named_parameters():
-            full_name = prefix + param_name
-            if _is_fp32_pinned(full_name):
-                continue
-            if DTensor and isinstance(param, DTensor):
-                continue
-            if param.is_floating_point() and param.dtype != compute_dtype:
-                param.data = param.data.to(compute_dtype)
-        # Buffers: never FSDP-managed (always plain tensors), so always safe to cast.
-        for buffer_name, buf in module.named_buffers():
-            full_name = prefix + buffer_name
-            if _is_fp32_pinned(full_name):
-                continue
-            if buf.is_floating_point() and buf.dtype != compute_dtype:
-                owner_name, _, leaf = buffer_name.rpartition(".")
-                owner = module.get_submodule(owner_name) if owner_name else module
-                owner._buffers[leaf] = buf.to(compute_dtype)
+    mixed_subtrees = frozen_param_owners & trainable_subtrees
+
+    def _is_in_subtrees(name: str, subtrees: set[str]) -> bool:
+        subtree = name
+        while True:
+            if subtree in subtrees:
+                return True
+            if not subtree:
+                return False
+            subtree, _, _ = subtree.rpartition(".")
+
+    # Parameters: cast frozen plain floats and plain floats in mixed adapter subtrees; leave
+    # all other trainable params and every sharded (DTensor) param to FSDP mixed precision.
+    for name, param in named_params:
+        if (param.requires_grad and not _is_in_subtrees(name, mixed_subtrees)) or _is_fp32_pinned(name):
+            continue
+        if DTensor and isinstance(param, DTensor):
+            continue
+        if param.is_floating_point() and param.dtype != compute_dtype:
+            param.data = param.data.to(compute_dtype)
+
+    # Preserve the existing buffer scope: fully frozen parameter subtrees plus the newly
+    # supported mixed adapter subtrees. Buffers never participate in FSDP parameter sharding.
+    fully_frozen_subtrees: set[str] = set()
+    for module_name, _ in model.named_modules():
+        if module_name not in parameter_subtrees or module_name in trainable_subtrees:
+            continue
+        if _is_in_subtrees(module_name, fully_frozen_subtrees):
+            continue
+        fully_frozen_subtrees.add(module_name)
+    buffer_subtrees = fully_frozen_subtrees | mixed_subtrees
+
+    for name, buf in model.named_buffers():
+        if not _is_in_subtrees(name, buffer_subtrees) or _is_fp32_pinned(name):
+            continue
+        if buf.is_floating_point() and buf.dtype != compute_dtype:
+            owner_name, _, leaf = name.rpartition(".")
+            owner = model.get_submodule(owner_name) if owner_name else model
+            owner._buffers[leaf] = buf.to(compute_dtype)
 
 
 __all__ = [

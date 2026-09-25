@@ -22,7 +22,13 @@ from transformers.configuration_utils import PretrainedConfig
 
 
 class KimiK3TextConfig(PretrainedConfig):
-    """Configuration for the Kimi K3 hybrid KDA/MLA text backbone."""
+    """Configuration for the Kimi K3 hybrid KDA/MLA text backbone.
+
+    Defaults reproduce the released ``moonshotai/Kimi-K3`` checkpoint (``config.json`` text_config;
+    tech report Table 1): 93 layers (69 KDA + 24 gated MLA), 96 attention heads, dense FFN 33792,
+    896 latent-MoE experts (16 active, 2 shared), so ``from_config`` builds the same shape that
+    ``from_pretrained`` loads.
+    """
 
     model_type = "kimi_linear"
     architectures = ["KimiK3ForCausalLM"]
@@ -33,9 +39,9 @@ class KimiK3TextConfig(PretrainedConfig):
         vocab_size: int = 163840,
         hidden_size: int = 7168,
         head_dim: int | None = None,
-        intermediate_size: int = 18432,
+        intermediate_size: int = 33792,
         num_hidden_layers: int = 93,
-        num_attention_heads: int = 56,
+        num_attention_heads: int = 96,
         num_key_value_heads: int | None = None,
         hidden_act: str = "situ",
         initializer_range: float = 0.02,
@@ -79,7 +85,13 @@ class KimiK3TextConfig(PretrainedConfig):
         kda_mode: str = "chunk",
         kda_unpad_inputs: bool = True,
         kda_use_fused_gate: bool = True,
+        kda_chunk_impl: str = "fla",
         kda_use_qk_l2norm_in_kernel: bool = True,
+        kda_disable_recompute: bool = False,
+        kda_conv_backend: str = "triton",
+        kda_transpose_state_layout: bool = True,
+        situ_backend: str = "torch",
+        attn_res_triton: bool = False,
         attn_res_block_size: int | None = 12,
         activation_situ_beta: float | None = 4.0,
         activation_situ_linear_beta: float | None = 25.0,
@@ -150,7 +162,19 @@ class KimiK3TextConfig(PretrainedConfig):
         self.kda_mode = kda_mode
         self.kda_unpad_inputs = kda_unpad_inputs
         self.kda_use_fused_gate = kda_use_fused_gate
+        self.kda_chunk_impl = kda_chunk_impl
         self.kda_use_qk_l2norm_in_kernel = kda_use_qk_l2norm_in_kernel
+        self.kda_disable_recompute = kda_disable_recompute
+        self.kda_conv_backend = kda_conv_backend
+        self.kda_transpose_state_layout = kda_transpose_state_layout
+        # Kimi-K3-only kernel switches. situ_backend selects the SiTU activation kernels: "torch" (the eager chunked
+        # cores, optionally torch.compiled through BackendConfig.compile_situ), "triton" (kimi_k3/situ_triton.py) or
+        # "triton_fast_math" (the same kernels with SFU tanh.approx / exp2 / rcp.approx, <= 1 bf16 ulp from libdevice);
+        # under the Triton choices compile_situ still governs the shapes the Triton kernels do not take. attn_res_triton
+        # routes the attention-residual mix through kimi_k3/attn_res_triton.py. The Triton choices and attn_res_triton
+        # are no-ops without Triton.
+        self.situ_backend = situ_backend
+        self.attn_res_triton = attn_res_triton
         self.attn_res_block_size = attn_res_block_size
         self.activation_situ_beta = activation_situ_beta
         self.activation_situ_linear_beta = activation_situ_linear_beta
@@ -171,6 +195,20 @@ class KimiK3TextConfig(PretrainedConfig):
             raise ValueError("moe_router_activation_func must be 'sigmoid' or 'softmax'.")
         if self.kda_mode not in {"chunk", "fused_recurrent"}:
             raise ValueError("kda_mode must be 'chunk' or 'fused_recurrent'.")
+        if self.kda_conv_backend not in {"triton", "cuda"}:
+            raise ValueError("kda_conv_backend must be 'triton' or 'cuda'.")
+        if self.situ_backend not in {"torch", "triton", "triton_fast_math"}:
+            raise ValueError("situ_backend must be 'torch', 'triton' or 'triton_fast_math'.")
+        if self.kda_chunk_impl not in {"fla", "fused"}:
+            raise ValueError(
+                "kda_chunk_impl must be 'fla' (flash-linear-attention) or 'fused' (fused CUDA forward + Triton backward)."
+            )
+        if self.kda_chunk_impl == "fused" and self.kda_mode != "chunk":
+            raise ValueError("kda_chunk_impl='fused' requires kda_mode='chunk'.")
+        if self.kda_chunk_impl == "fused" and not getattr(self, "kda_use_qk_l2norm_in_kernel", True):
+            raise ValueError(
+                "kda_chunk_impl='fused' requires kda_use_qk_l2norm_in_kernel=True (the kernels normalise q and k)."
+            )
         if self.linear_attn_config is None:
             return
         if "kda_layers" not in self.linear_attn_config or "full_attn_layers" not in self.linear_attn_config:

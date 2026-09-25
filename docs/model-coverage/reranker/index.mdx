@@ -20,6 +20,13 @@ For first-stage dense retrieval, see [Embedding Models](/model-coverage/embeddin
 
 Any Hugging Face model loadable using `AutoModelForSequenceClassification` can be used as a reranking backbone. This fallback path uses the model's native attention; no bidirectional conversion is applied.
 
+## Supported Models
+
+This table combines recipe-backed checkpoints with documented model families. Dates show when the current checkpoint first appeared in a recipe, or when a documentation-only family page was added. See the [combined model support log](/model-coverage/release-log) for recipe-backed checkpoints of every model type.
+
+{/* BEGIN GENERATED MODEL SUPPORT LOG */}
+{/* END GENERATED MODEL SUPPORT LOG */}
+
 ## Supported Workflows
 
 - **Fine-tuning (Cross-Encoder):** Cross-entropy training on query-document pairs to produce rerankers

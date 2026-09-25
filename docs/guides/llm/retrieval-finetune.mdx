@@ -124,21 +124,23 @@ The following table summarizes the supported model families and their effective 
 | Model `config.model_type` | Bi-Encoder Behavior | Cross-Encoder Behavior | Effective Retrieval Keyword Arguments |
 |---------------------------|---------------------|------------------------|----------------------------|
 | `llama`, `llama_bidirec` | Uses `LlamaBidirectionalModel` | Uses `LlamaBidirectionalForSequenceClassification` | Bi-encoder: `pooling`, wrapper-level `l2_normalize`, and top-level recipe `temperature`. Cross-encoder: `pooling`, `num_labels`, and `temperature` on the Llama scoring config. |
-| `ministral3`, `ministral3_bidirec` | Uses `Ministral3BidirectionalModel` | Direct cross-encoder scoring is not supported by the custom retrieval registry today. Use a different direct cross-encoder backbone. | Bi-encoder: `pooling`, wrapper-level `l2_normalize`, and top-level recipe `temperature`. |
+| `ministral3` | Uses the stock Hugging Face `Ministral3Model` with `is_causal: false` | Uses the stock Hugging Face `Ministral3ForSequenceClassification` | Bi-encoder: wrapper-level `pooling` and `l2_normalize`, plus top-level recipe `temperature`. Cross-encoder: forwards `num_labels`; custom `pooling` and `temperature` are ignored. |
+| `ministral3_bidirec` | Uses the legacy custom `Ministral3BidirectionalModel` | Direct cross-encoder scoring is not supported by the custom retrieval registry. | Bi-encoder: `pooling`, wrapper-level `l2_normalize`, and top-level recipe `temperature`. |
 | `llama_nemotron_vl` | Uses `LlamaNemotronVLModel` | Direct cross-encoder scoring is not supported by the custom retrieval registry today. | Bi-encoder: `pooling`, wrapper-level `l2_normalize`, and top-level recipe `temperature`. |
-| Any model type without a retrieval registry entry | Falls back to `AutoModel` | Falls back to `AutoModelForSequenceClassification` | Bi-encoder fallback receives standard Hugging Face `from_pretrained` keyword arguments. `pooling` and `l2_normalize` still apply in the AutoModel wrapper. Cross-encoder fallback forwards only `num_labels`. Custom `pooling` and `temperature` are ignored. |
+| Any model type without a retrieval registry entry | Falls back to `AutoModel` and sets `config.is_causal: false` | Falls back to `AutoModelForSequenceClassification` | Bi-encoder fallback receives standard Hugging Face `from_pretrained` keyword arguments. `pooling` and `l2_normalize` still apply in the AutoModel wrapper. Cross-encoder fallback forwards only `num_labels`. Custom `pooling` and `temperature` are ignored. |
 
 Known model types with a registry entry fail fast when the requested retrieval task is unsupported rather than falling
-back silently. For example, direct `ministral3` loading is supported for bi-encoder embeddings but not for the
-cross-encoder scoring recipe. If you are extracting a text tower from a parent checkpoint, set
-`model.extract_submodel: language_model`. Extracted text backbones use the extraction path, where supported extracted
-types use registered retrieval classes and unsupported extracted types can fall back to Hugging Face sequence
-classification for cross-encoder scoring.
+back silently. For example, the legacy `ministral3_bidirec` type supports bi-encoder embeddings but not cross-encoder
+scoring. The stock `ministral3` type is not a custom registry entry, so it follows the Hugging Face fallback and supports
+both `Ministral3Model` embeddings and `Ministral3ForSequenceClassification` scoring. If you are extracting a text tower
+from a parent checkpoint, set `model.extract_submodel: language_model`. Extracted text backbones use the extraction path,
+where supported extracted types use registered retrieval classes and other extracted types can fall back to Hugging Face
+sequence classification for cross-encoder scoring.
 
-Treat unregistered decoder-only fallback models as an architecture experiment, not just a drop-in model swap. Registered
-retrieval backbones such as the Llama bidirectional path use retrieval-specific attention behavior. A vanilla
-Hugging Face `AutoModel` fallback can keep the source model's original causal behavior, which might be lower quality for
-symmetric embedding retrieval.
+Treat unregistered decoder-only fallback models as an architecture experiment, not just a drop-in model swap. AutoModel
+sets `config.is_causal: false` for embedding fallbacks, while registered retrieval backbones such as the Llama
+bidirectional path use retrieval-specific implementations. Confirm that an unregistered architecture honors the
+`is_causal` flag and produces the expected bidirectional attention before relying on it for symmetric retrieval.
 
 ## Prepare Data
 
@@ -354,11 +356,13 @@ dataloader:
 The following settings control bi-encoder behavior:
 
 - `pooling`: controls how token hidden states become one embedding. Common single-vector choices are `avg`, `cls`,
-  `last`, and `weighted_avg`. The shipped hard-negative miner currently loads the bi-encoder wrapper with its default
-  `avg` pooling and does not expose a mining override. Do not use it for a model trained with a different pooling mode or
-  with `colbert` pooling, which returns token-level embeddings.
+  `last`, and `weighted_avg`. The shipped hard-negative miner does not expose a pooling override. When a checkpoint
+  contains supported Sentence Transformers metadata, the miner restores the saved pooling mode. Otherwise, the loader
+  uses the backbone configuration or `avg`. Do not use the miner with `colbert` pooling, which returns token-level
+  embeddings.
 - `l2_normalize`: normalizes embeddings before scoring. When enabled, the recipe divides scores by `temperature`. The
-  shipped miner currently uses the bi-encoder wrapper default, `true`, and does not expose a mining override.
+  shipped miner does not expose a normalization override. When a checkpoint contains supported Sentence Transformers
+  metadata, the miner restores the saved normalization setting. Otherwise, the loader enables L2 normalization.
 - `q_max_len` and `p_max_len`: set separate truncation lengths for queries and passages.
 - `query_prefix` and `passage_prefix`: add task-specific text before tokenization. Keep these aligned between training,
   hard-negative mining, and inference.
@@ -678,9 +682,11 @@ Match these mining settings to training:
 - Set `use_negatives_from_file` when you want to keep existing negatives before appending mined negatives. Deduplicate
   and audit the combined list.
 
-The miner does not accept `pooling` or `l2_normalize` settings. It uses the bi-encoder wrapper defaults of `avg`
-pooling and L2 normalization. Use this helper only when those settings match training. For other settings, use a custom
-mining workflow that loads the encoder with the required wrapper arguments.
+The miner does not accept `pooling` or `l2_normalize` settings. It calls
+`NeMoAutoModelBiEncoder.from_pretrained` without those arguments. The loader restores pooling and normalization from
+supported Sentence Transformers checkpoint metadata. If the metadata is unavailable, pooling uses the backbone
+configuration or `avg`, and L2 normalization is enabled. Confirm that these fallback settings match training before
+mining from a legacy or external checkpoint.
 
 Use a new, empty `cache_embeddings_dir` for every model, input, prefix, sequence length, `corpus_chunk_size`, and world
 size. The miner reuses expected shard files even when `load_embeddings_from_cache` is `false`, and it does not record

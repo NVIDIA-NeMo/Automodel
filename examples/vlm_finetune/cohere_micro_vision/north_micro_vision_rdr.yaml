@@ -1,0 +1,106 @@
+# LoRA fine-tune of North Micro Vision Instruct on the RDR
+# image-description dataset -- the smallest end-to-end check that the model,
+# LoRA injection, FSDP2 and checkpointing all work before committing to a real
+# run. RDR is 48 rows in a single `train` split, so at global_batch_size 8 an
+# epoch is 6 optimizer steps; three epochs is 18. There is no validation split,
+# and no LR scheduler: warmup and cosine decay are meaningless over 18 steps.
+# For an actual training run use north_micro_vision_shopify_full.yaml.
+#
+#   automodel examples/vlm_finetune/cohere_micro_vision/north_micro_vision_rdr.yaml \
+#     --nproc-per-node 2
+#
+# Requires transformers 5.15.0.dev0 at the validated commit 71c6f699, NOT the
+# transformers==5.8.1 that nemo-automodel==0.5.0 pins: the model's remote code
+# imports symbols absent from 5.8.1 (e.g. transformers.utils.generic.get_max_seqlen).
+
+recipe: FinetuneRecipeForVLM
+
+step_scheduler:
+  # 48 rows / 8 = 6 steps per epoch; local_batch_size 1 x 2 ranks => grad accum 4.
+  global_batch_size: 8
+  local_batch_size: 1
+  ckpt_every_steps: 10
+  val_every_steps: 10
+  num_epochs: 3
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 10
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 42
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
+  pretrained_model_name_or_path: CohereLabs/North-Micro-Vision-Instruct
+  # sdpa, not flash_attention_2: flash-attn is not installed.
+  attn_implementation: sdpa
+  trust_remote_code: true
+
+processor:
+  _target_: transformers.AutoProcessor.from_pretrained
+  pretrained_model_name_or_path: CohereLabs/North-Micro-Vision-Instruct
+  trust_remote_code: true
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints_rdr/
+  model_save_format: safetensors
+
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 1
+  cp_size: 1
+  sequence_parallel: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_rdr_dataset
+  path_or_dataset: quintend/rdr-items
+  split: train
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 0
+  pin_memory: true
+  collate_fn:
+    # CohereCompassProcessor is not registered in COLLATE_FNS, so the generic
+    # path is used. RDR images are small, so no max_length cap is needed.
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1e-4
+  weight_decay: 0.01
+  betas: [0.9, 0.95]
+
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  match_all_linear: false
+  # Verified present in CohereCompassForConditionalGeneration.
+  target_modules:
+    - "*q_proj"
+    - "*k_proj"
+    - "*v_proj"
+    - "*o_proj"
+    - "*gate_proj"
+    - "*up_proj"
+    - "*down_proj"
+  dim: 16
+  alpha: 32
+  dropout: 0.05
+  use_triton: true
+
+freeze_config:
+  freeze_vision_tower: true
+  freeze_language_model: false
+
+ci:
+  recipe_owner: HuiyingLi
+  time: "00:10:00"
+  nodes: 1

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib.util
 import math
 from datetime import timedelta
 from unittest.mock import Mock
@@ -20,14 +21,20 @@ import pytest
 import torch
 import torch.nn as nn
 
+import nemo_automodel.components.training.utils as training_utils
 from nemo_automodel.components.training.utils import (
     ScopedModuleOffloading,
+    _all_reduce_scalar,
     clip_grad_norm,
     count_tail_padding,
     get_expert_tp_replication_factor,
     move_to_device,
     scale_grads_and_clip_grad_norm,
 )
+
+# Over the default 5s budget on purpose: this module spawns worker processes; every child re-imports torch from scratch.
+# Shrink the work or the process count before raising this further.
+pytestmark = pytest.mark.timeout(60)
 
 
 def test_docstring_example():
@@ -101,7 +108,9 @@ def test_clip_grad_norm_with_pp_and_tp():
 
     device_mesh = Mock()
     device_mesh.mesh_dim_names = ["pp", "tp"]
-    device_mesh.__getitem__ = Mock(side_effect=lambda key: Mock(size=Mock(return_value=2)))
+    # device_type must be a real string: a DeviceMesh always exposes one, and the norm
+    # reduction compares it against the accumulator's device to pick the comm device.
+    device_mesh.__getitem__ = Mock(side_effect=lambda key: Mock(size=Mock(return_value=2), device_type="cpu"))
 
     grad_norm = clip_grad_norm(
         max_grad_norm=1.0,
@@ -125,7 +134,30 @@ def test_clip_grad_norm_works_without_pp():
         pp_enabled=False,
     )
 
+    assert isinstance(grad_norm, torch.Tensor)
     assert grad_norm > 0
+
+
+@pytest.mark.parametrize(
+    ("gradient", "expected"),
+    [
+        (0.0, 0.0),
+        (float("inf"), float("inf")),
+        (float("nan"), float("nan")),
+    ],
+)
+def test_clip_grad_norm_preserves_zero_and_nonfinite_results(gradient: float, expected: float):
+    """Branch-free scaling preserves the prior zero and non-finite norm behavior."""
+    model = torch.nn.Linear(1, 1, bias=False)
+    model.weight.grad = torch.full_like(model.weight, gradient)
+
+    grad_norm = clip_grad_norm(max_grad_norm=1.0, model_parts=[model])
+
+    assert isinstance(grad_norm, torch.Tensor)
+    if math.isnan(expected):
+        assert torch.isnan(grad_norm)
+    else:
+        torch.testing.assert_close(grad_norm, torch.tensor(expected, dtype=grad_norm.dtype))
 
 
 def test_clip_grad_norm_uses_torch_fast_path_when_requested(monkeypatch):
@@ -151,6 +183,57 @@ def test_clip_grad_norm_uses_torch_fast_path_when_requested(monkeypatch):
     assert clip_grad_norm_mock.call_args.kwargs["error_if_nonfinite"] is False
     assert clip_grad_norm_mock.call_args.kwargs["foreach"] is True
     clip_grads_with_norm_mock.assert_not_called()
+
+
+@pytest.mark.parametrize("backend", [None, "triton", "te"])
+def test_clip_grad_norm_selects_requested_backend(monkeypatch, backend):
+    model = torch.nn.Linear(2, 1, bias=False)
+    gradient = torch.tensor([[3.0, 4.0]])
+    model.weight.grad = gradient.clone()
+
+    triton_norm = Mock(return_value=torch.tensor(25.0, dtype=torch.float64))
+    te_norm = Mock(return_value=torch.tensor(5.0, dtype=torch.float64))
+    monkeypatch.setattr(training_utils, "_use_fused_grad_norm", lambda *_: True)
+    monkeypatch.setattr(training_utils, "multi_tensor_sumsq", triton_norm)
+    monkeypatch.setattr(training_utils, "_local_te_l2_norm", te_norm)
+
+    options = {} if backend is None else {"grad_norm_backend": backend}
+    observed = clip_grad_norm(max_grad_norm=1.0, model_parts=[model], **options)
+
+    torch.testing.assert_close(observed, torch.tensor(5.0, dtype=torch.float64))
+    torch.testing.assert_close(model.weight.grad, gradient / (5.0 + 1e-6))
+    assert triton_norm.call_count == (backend != "te")
+    assert te_norm.call_count == (backend == "te")
+
+
+def test_clip_grad_norm_rejects_invalid_backend():
+    model = torch.nn.Linear(1, 1, bias=False)
+    model.weight.grad = torch.ones_like(model.weight)
+
+    with pytest.raises(ValueError, match="grad_norm_backend must be 'triton' or 'te'"):
+        clip_grad_norm(max_grad_norm=1.0, model_parts=[model], grad_norm_backend="invalid")
+
+
+def test_clip_grad_norm_disables_torch_fast_path_for_owner_shard(monkeypatch):
+    """A model-owned local shard requires the contract's global norm group."""
+    model = torch.nn.Linear(2, 1, bias=False)
+    model.weight.grad = torch.tensor([[3.0, 4.0]])
+    model.weight._nemo_model_owned_grad_divisor = 1.0
+
+    torch_clip_mock = Mock(return_value=torch.tensor(-1.0))
+    sharding_aware_clip_mock = Mock()
+    monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", torch_clip_mock)
+    monkeypatch.setattr(torch.nn.utils, "clip_grads_with_norm_", sharding_aware_clip_mock)
+
+    grad_norm = clip_grad_norm(
+        max_grad_norm=10.0,
+        model_parts=[model],
+        use_torch_clip_grad_norm=True,
+    )
+
+    torch.testing.assert_close(grad_norm, torch.tensor(5.0, dtype=torch.float64))
+    torch_clip_mock.assert_not_called()
+    sharding_aware_clip_mock.assert_called_once()
 
 
 def test_clip_grad_norm_returns_zero_when_max_grad_norm_is_none():
@@ -296,6 +379,69 @@ def test_clip_grad_norm_handles_empty_local_dtensor_shards(tmp_path):
         nprocs=2,
         join=True,
     )
+
+
+class _FakeMesh:
+    """Minimal DeviceMesh stand-in; ``_all_reduce_scalar`` needs only these two members."""
+
+    def __init__(self, device_type: str):
+        self.device_type = device_type
+
+    def get_group(self, mesh_dim=None):
+        return f"pg:{mesh_dim}"
+
+
+def test_all_reduce_scalar_reduces_in_place_when_devices_match(monkeypatch):
+    """Without CPU offload the scalar already sits on the mesh device: reduce in place.
+
+    This is the guard that the fix is inert for every non-offload recipe -- the same
+    tensor object goes into the same in-place all_reduce and comes back out.
+    """
+    seen = {}
+
+    def fake_all_reduce(tensor, op=None, group=None):
+        seen["tensor"] = tensor
+        seen["group"] = group
+        tensor.add_(1.0)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+
+    mesh = _FakeMesh("cpu")
+    scalar = torch.zeros((), dtype=torch.float64)
+    out = _all_reduce_scalar(scalar, torch.distributed.ReduceOp.MAX, mesh, 0)
+
+    assert out is scalar
+    assert seen["tensor"] is scalar
+    assert seen["group"] == "pg:0"
+    assert out.item() == 1.0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_all_reduce_scalar_moves_offloaded_scalar_to_mesh_device(monkeypatch):
+    """CPU-offloaded gradients must not be all-reduced on the NCCL group as CPU tensors.
+
+    Regression test for the CPUOffloadPolicy crash: FSDP2 leaves the local gradient
+    shard -- and therefore the norm accumulator derived from it -- on CPU, while the
+    mesh's process group is NCCL and has no CPU backend.
+    """
+    seen = {}
+
+    def fake_all_reduce(tensor, op=None, group=None):
+        seen["device"] = tensor.device
+        tensor.add_(1.0)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+
+    mesh = _FakeMesh("cuda")
+    scalar = torch.zeros((), dtype=torch.float64)  # on CPU, as under CPUOffloadPolicy
+    out = _all_reduce_scalar(scalar, torch.distributed.ReduceOp.SUM, mesh, 1)
+
+    # Pre-fix this was "cpu", which NCCL rejects with
+    # "No backend type associated with device type cpu".
+    assert seen["device"].type == "cuda"
+    # The result returns to the gradients' device so the clip math stays consistent.
+    assert out.device.type == "cpu"
+    assert out.item() == 1.0
 
 
 def test_clip_grad_norm_with_inf_norm():
@@ -462,6 +608,20 @@ class _MoEModule(nn.Module):
 class TestScaleGradsAndClipGradNorm:
     """Tests for scale_grads_and_clip_grad_norm with EP scaling."""
 
+    def test_owner_shard_uses_explicit_gradient_divisor(self):
+        """Owner scaling is declared by the model and independent of DP arguments."""
+        model = nn.Linear(2, 1, bias=False)
+        model.weight.grad = torch.full_like(model.weight, 8.0)
+        model.weight._nemo_model_owned_grad_divisor = 4.0
+
+        scale_grads_and_clip_grad_norm(
+            max_grad_norm=None,
+            model_parts=[model],
+            dp_group_size=999,
+        )
+
+        torch.testing.assert_close(model.weight.grad, torch.full_like(model.weight, 2.0))
+
     def test_ep_scaling_for_expert_params_by_name(self):
         """Test that expert params are scaled by EP ratio based on param name."""
         model = _MoEModule()
@@ -509,9 +669,8 @@ class TestScaleGradsAndClipGradNorm:
 
         # Base EP divisor = 4/2 = 2; replicated TP tokens add another 2.
         assert torch.allclose(expert_param.grad, torch.ones_like(expert_param) * 2.0)
-        # Router/dense replicas stay identical across TP ranks via the
-        # fail-closed identical-pretrained-weights invariant (no separate
-        # sync) and must never receive the expert-only divisor.
+        # Router/dense replicas must never receive the expert-only divisor;
+        # their TP synchronization is owned separately at the optimizer boundary.
         assert torch.allclose(model.gate.weight.grad, torch.ones_like(model.gate.weight) * 8.0)
 
     @pytest.mark.parametrize(
@@ -600,3 +759,53 @@ class TestScaleGradsAndClipGradNorm:
         # Non-expert params: only PP scaling -> 4
         assert torch.allclose(model.gate.weight.grad, torch.ones_like(model.gate.weight) * 4.0)
         assert torch.allclose(expert_param.grad, torch.ones_like(expert_param) * 2.0)
+
+
+@pytest.mark.parametrize("norm_type", [1.0, 2.0, 3.0, float("inf")])
+@pytest.mark.parametrize("transposed", [False, True])
+def test_clip_large_gradient_matches_dense_float64_reference(norm_type, transposed):
+    """Check large contiguous/strided gradients and clipping against a dense FP64 reference."""
+    torch.manual_seed(4128)
+    gradient = torch.randn(1025, 2049)
+    if transposed:
+        gradient = gradient.t()
+    parameter = torch.nn.Parameter(torch.empty_like(gradient))
+    parameter.grad = gradient.clone(memory_format=torch.preserve_format)
+    reference_norm = torch.linalg.vector_norm(gradient.double(), ord=norm_type)
+    reference = gradient * (0.3 / (reference_norm + 1e-6)).clamp(max=1.0)
+    from nemo_automodel.components.training.utils import _clip_grad_norm_impl
+
+    actual_norm = _clip_grad_norm_impl([parameter], 0.3, norm_type=norm_type)
+    torch.testing.assert_close(actual_norm, reference_norm, atol=0, rtol=2e-7)
+    torch.testing.assert_close(parameter.grad, reference, atol=0, rtol=3e-7)
+
+
+@pytest.mark.parametrize("backend", ["triton", "te"])
+def test_optional_te_is_not_loaded_for_import_or_cpu_clipping(monkeypatch: pytest.MonkeyPatch, backend: str) -> None:
+    """A broken optional TE binary must not prevent import or CPU gradient clipping."""
+    from nemo_automodel.components.training import utils
+    from nemo_automodel.shared import import_utils
+
+    original_import = import_utils.safe_import
+    te_imports = []
+
+    def import_with_broken_te(module, **kwargs):
+        if module.startswith("transformer_engine"):
+            te_imports.append(module)
+            raise OSError("undefined symbol: cublasLtGroupedMatrixLayoutInit_internal")
+        return original_import(module, **kwargs)
+
+    monkeypatch.setattr(import_utils, "safe_import", import_with_broken_te)
+    spec = importlib.util.spec_from_file_location("_training_utils_import_test", utils.__file__)
+    isolated_utils = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(isolated_utils)
+
+    parameter = nn.Parameter(torch.tensor([1.0, 2.0]))
+    parameter.grad = torch.tensor([3.0, 4.0])
+    norm = isolated_utils._clip_grad_norm_impl([parameter], 1.0, grad_norm_backend=backend)
+    torch.testing.assert_close(norm, torch.tensor(5.0, dtype=torch.float64))
+    expected_gradient = torch.tensor([3.0, 4.0]) / (5.0 + 1e-6)
+    torch.testing.assert_close(parameter.grad, expected_gradient)
+    torch.optim.SGD([parameter], lr=0.1).step()
+    torch.testing.assert_close(parameter, torch.tensor([1.0, 2.0]) - 0.1 * expected_gradient)
+    assert not te_imports

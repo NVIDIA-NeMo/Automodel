@@ -14,8 +14,8 @@
 
 # Benchmarking config for Qwen3 MoE 30B (A3B) bf16, experts=torch_mm, GB200 (WAVE 11 bake-off).
 #
-# Single-variable delta vs qwen3_moe_30b_te_deepep_gb200.yaml: experts gmm -> torch_mm
-# (torch._grouped_mm bf16). Same lbs16/GBS512/ep8/2N/attn:te op point. gmm baseline = 26.12% MFU@2500 / 9.237s.
+# Native torch._grouped_mm bf16 variant of qwen3_moe_30b_te_deepep_gb200.yaml.
+# Same lbs16/GBS512/ep8/2N/attn:te operating point.
 #
 # GB200 deltas vs the generic qwen3_moe_30b_te_deepep.yaml:
 #   - peak_tflops: 2500  (GB200 BF16 dense peak; generic recipe uses H100 989)
@@ -83,7 +83,7 @@ model:
     linear: te
     rms_norm: te
     rope_fusion: true
-    experts: torch_mm  # WAVE 11: torch._grouped_mm bf16 (vs gmm); single-variable swap
+    experts: torch_mm  # WAVE 11: native torch._grouped_mm bf16 backend
     dispatcher: hybridep  # GB200: deepep fails EP-buffer init ('invalid resource handle')
     fake_balanced_gate: true
     enable_hf_state_dict_adapter: true

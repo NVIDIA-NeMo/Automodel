@@ -15,6 +15,31 @@
 import ast
 from pathlib import Path
 
+from nemo_automodel.components.config.loader import load_yaml_config
+from nemo_automodel.components.models.bagel.configuration import BagelBackendConfig
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+BAGEL_SFT_CONFIG_PATH = REPO_ROOT / "examples/multimodal_finetune/bagel/bagel_sft.yaml"
+
+
+def test_bagel_sft_auto_backend_uses_bagel_config():
+    """The shipped auto-init recipe must pass a typed BAGEL backend to AutoModel."""
+    config = load_yaml_config(BAGEL_SFT_CONFIG_PATH)
+
+    def capture_backend(*, backend: object, **_: object) -> object:
+        return backend
+
+    config.set_by_dotted("model._target_", capture_backend)
+    backend = config.model.instantiate()
+
+    assert config.model.get("init_mode", "auto") == "auto"
+    assert isinstance(backend, BagelBackendConfig)
+    assert backend.linear == "te"
+    assert backend.rms_norm == "te"
+    assert backend.mot_grouped is True
+    assert backend.fused_swiglu is True
+    assert backend.fused_rope is True
+
 
 def test_bagel_auto_model_path_uses_distributed_setup_kwarg():
     """BAGEL's AutoModel path must match the shared VLM build_model API."""

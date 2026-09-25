@@ -28,8 +28,10 @@ import pytest
 import torch
 from transformers import LlamaConfig, LlamaForCausalLM
 
+import nemo_automodel.components.speculative.eagle.ring_attention as ring_attention
 import nemo_automodel.components.speculative.target_cp as target_cp
 import nemo_automodel.recipes.llm.train_eagle3 as train_eagle3
+from nemo_automodel.components.speculative.eagle.draft_llama import Eagle3LlamaAttention, attach_eagle3_cp_attention
 from nemo_automodel.components.speculative.eagle.target import HFEagle3TargetModel
 from nemo_automodel.recipes.llm.train_eagle3 import _validate_cp_gates
 
@@ -117,6 +119,128 @@ def test_cp_gate_rejects_remote_backend():
 def test_cp_gate_rejects_sequence_packing():
     with pytest.raises(NotImplementedError, match="sequence packing"):
         _validate_cp_gates(cp_size=2, backend="colocated", packed_sequence_size=4)
+
+
+# --------------------------------------------------------------------------- #
+# Recipe CP gates: ulysses mode (composes with packing)
+# --------------------------------------------------------------------------- #
+def test_cp_gate_ulysses_allows_packing(monkeypatch):
+    """Ulysses gathers the full sequence for block-0, so packing is allowed."""
+    monkeypatch.setattr(ring_attention, "require_flash_attn_version", lambda: None)
+    _validate_cp_gates(cp_size=2, backend="colocated", packed_sequence_size=4, seq_length=8, cp_mode="ulysses")
+
+
+def test_cp_gate_ulysses_requires_flash(monkeypatch):
+    monkeypatch.setattr(ring_attention, "HAVE_FLASH_ATTN", False)
+    with pytest.raises(RuntimeError, match="flash-attn package"):
+        _validate_cp_gates(cp_size=2, backend="colocated", packed_sequence_size=0, seq_length=8, cp_mode="ulysses")
+
+
+def test_cp_gate_ulysses_rejects_zigzag():
+    # The zig-zag guard fires before the flash-version check, so no patching is needed.
+    with pytest.raises(NotImplementedError, match="ring-only"):
+        _validate_cp_gates(cp_size=2, backend="colocated", packed_sequence_size=0, cp_zigzag=True, cp_mode="ulysses")
+
+
+def test_cp_gate_ulysses_requires_seq_divisible_by_cp(monkeypatch):
+    monkeypatch.setattr(ring_attention, "require_flash_attn_version", lambda: None)
+    with pytest.raises(ValueError, match="divisible by cp_size"):
+        _validate_cp_gates(cp_size=2, backend="colocated", packed_sequence_size=0, seq_length=7, cp_mode="ulysses")
+
+
+def test_cp_gate_rejects_unknown_mode():
+    with pytest.raises(ValueError, match="Unknown cp_mode"):
+        _validate_cp_gates(cp_size=2, backend="colocated", packed_sequence_size=0, cp_mode="bogus")
+
+
+def test_cp_gate_ring_still_rejects_packing_explicit():
+    with pytest.raises(NotImplementedError, match="sequence packing"):
+        _validate_cp_gates(cp_size=2, backend="colocated", packed_sequence_size=4, cp_mode="ring")
+
+
+# --------------------------------------------------------------------------- #
+# attach_eagle3_cp_attention: mode routing
+# --------------------------------------------------------------------------- #
+def _tiny_draft_config() -> LlamaConfig:
+    return LlamaConfig(
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        vocab_size=64,
+        max_position_embeddings=32,
+    )
+
+
+def test_attach_cp_attention_sets_ulysses_mode():
+    attn = Eagle3LlamaAttention(_tiny_draft_config())
+    group = SimpleNamespace()  # attach only stores the group; no collective runs
+    attach_eagle3_cp_attention(torch.nn.ModuleList([attn]), group, mode="ulysses")
+    assert attn._cp_mode == "ulysses"
+    assert attn._cp_group is group
+    assert attn._cp_zigzag is False
+
+
+def test_attach_cp_attention_defaults_to_ring():
+    attn = Eagle3LlamaAttention(_tiny_draft_config())
+    attach_eagle3_cp_attention(torch.nn.ModuleList([attn]), SimpleNamespace())
+    assert attn._cp_mode == "ring"
+
+
+def test_attach_cp_attention_rejects_unknown_mode():
+    attn = Eagle3LlamaAttention(_tiny_draft_config())
+    with pytest.raises(ValueError, match="Unknown CP attention mode"):
+        attach_eagle3_cp_attention(torch.nn.ModuleList([attn]), SimpleNamespace(), mode="bogus")
+
+
+def test_attach_cp_attention_raises_without_eagle_attention():
+    with pytest.raises(NotImplementedError, match="no such attention"):
+        attach_eagle3_cp_attention(torch.nn.Linear(4, 4), SimpleNamespace(), mode="ulysses")
+
+
+# --------------------------------------------------------------------------- #
+# _maybe_shard_cp: non-packed overwrites position_ids, packed preserves them
+# --------------------------------------------------------------------------- #
+def _fake_cp_recipe(cp_size: int, cp_rank: int, zigzag: bool = False) -> SimpleNamespace:
+    return SimpleNamespace(
+        cp_group=SimpleNamespace(),  # non-None -> sharding active
+        cp_mesh=SimpleNamespace(size=lambda: cp_size, get_local_rank=lambda: cp_rank),
+        cp_zigzag=zigzag,
+    )
+
+
+def test_maybe_shard_cp_noop_without_cp():
+    inputs = {"input_ids": torch.arange(8).view(1, 8)}
+    out = train_eagle3.TrainEagle3Recipe._maybe_shard_cp(SimpleNamespace(cp_group=None), inputs)
+    assert out is inputs
+
+
+def test_maybe_shard_cp_nonpacked_overwrites_position_ids():
+    self_ = _fake_cp_recipe(cp_size=2, cp_rank=1)
+    inputs = {"input_ids": torch.arange(8).view(1, 8), "aux_hidden_states": torch.randn(1, 8, 4)}
+    out = train_eagle3.TrainEagle3Recipe._maybe_shard_cp(self_, inputs)
+    # rank 1 of 2, contiguous shard -> global indices [4, 8)
+    assert out["input_ids"].shape == (1, 4)
+    assert out["aux_hidden_states"].shape == (1, 4, 4)
+    assert torch.equal(out["input_ids"][0], torch.arange(4, 8))
+    assert torch.equal(out["position_ids"][0], torch.arange(4, 8))
+
+
+def test_maybe_shard_cp_packed_preserves_per_document_position_ids():
+    self_ = _fake_cp_recipe(cp_size=2, cp_rank=0)
+    # Two packed documents of length 4: positions reset at the boundary.
+    pos = torch.tensor([[0, 1, 2, 3, 0, 1, 2, 3]])
+    inputs = {
+        "input_ids": torch.arange(8).view(1, 8),
+        "position_ids": pos,
+        "seq_lens": torch.tensor([[4, 4]]),
+    }
+    out = train_eagle3.TrainEagle3Recipe._maybe_shard_cp(self_, inputs)
+    # rank 0 gets global [0, 4): the SLICED packed positions, not a global arange.
+    assert torch.equal(out["position_ids"][0], torch.tensor([0, 1, 2, 3]))
+    # seq_lens is not [batch, sequence]-shaped, so it passes through as the global value.
+    assert torch.equal(out["seq_lens"], torch.tensor([[4, 4]]))
 
 
 # --------------------------------------------------------------------------- #

@@ -72,7 +72,6 @@ distributed:
     reshard_after_forward: false
 
 freeze_config:
-  freeze_embeddings: true
   freeze_vision_tower: true
   freeze_language_model: false
 
@@ -124,15 +123,19 @@ ci:
   checkpoint_robustness:
     # PP=4 with pp_microbatch_size=1 requires at least four pipeline microbatches.
     step_scheduler.local_batch_size: 4
-    check_source_load_parity: true
-    # Fresh PP4/EP8 DCP and consolidated reloads are bit-identical to each other,
-    # but both differ from the still-warm in-memory runtime. Bound that distributed
-    # BF16 execution delta separately from the native-vs-HF implementation delta.
-    kl_threshold: 5e-2
-    source_load_kl_threshold: 1e-2
-    source_load_mean_kl_threshold: 2e-3
-    source_load_cosine_threshold: 0.999
-    hf_kl_threshold: 5e-2
+    # Promote HF RMSNorm, RoPE, router scoring, and expert accumulation to FP32.
+    # Corroborated by vLLM CUDA norm/router/expert-sum and FlashInfer RoPE paths.
+    # Projections, activations, and checkpoint storage retain their native dtypes.
+    # The reference context selects eager experts for both source and reload.
+    # Reference precision audit: https://linear.app/nvidia/issue/AM-821
+    hf_reference_compute_fp32: true
+    # BF16 fused expert arithmetic and equivalent reduction orders perturb
+    # hard top-k choices across 36 layers, even with aligned FP32 scoring.
+    # Full-depth router replay passes standard; independent HF arithmetic
+    # variants reproduce the remaining drift. Keep AutoModel reload standard.
+    parity_tolerance_profile_overrides:
+      source_load: relaxed
+      hf_reload: relaxed
     hf_device_map_auto: true
     # Transformers' load-time dequantization leaves Mistral4 expert weights in
     # FP8, while native forward requires an optional kernel absent from CI.

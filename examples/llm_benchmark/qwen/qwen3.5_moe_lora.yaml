@@ -53,6 +53,8 @@ distributed:
 
   moe:
     reshard_after_forward: false
+    # fake_balanced_gate routes deterministically, so router recomputation under AC is safe and faster.
+    ignore_router_for_ac: false
 
 dist_env:
   backend: nccl
@@ -70,7 +72,7 @@ model:
     linear: te
     rms_norm: te
     rope_fusion: false
-    experts: gmm
+    experts: torch_mm
     dispatcher: deepep
     fake_balanced_gate: true
     enable_hf_state_dict_adapter: true

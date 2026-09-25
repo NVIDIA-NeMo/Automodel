@@ -62,3 +62,9 @@ if grep -q "Using MaskedCrossEntropy instead" "$LOG_FILE"; then
     echo "ERROR: FusedLinearCrossEntropy was silently downgraded to MaskedCrossEntropy under PP"
     exit 1
 fi
+
+# Guard against bug in commit 00f40419 (PR #2983).
+if grep -Eiq "dynamic .*metadata inference" "$LOG_FILE"; then
+    echo "ERROR: pipeline stages fell back to dynamic metadata inference instead of static metadata"
+    exit 1
+fi

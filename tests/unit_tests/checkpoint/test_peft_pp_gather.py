@@ -35,10 +35,11 @@ import pytest
 import torch
 from torch import nn
 
-from nemo_automodel.components.checkpoint.addons import _extract_target_modules
+from nemo_automodel.components.checkpoint.addons import _extract_target_modules, _extract_target_parameters
 from nemo_automodel.components.checkpoint.stateful_wrappers import (
     _gather_peft_state_dict_across_pp,
 )
+from nemo_automodel.components.moe.state_dict_mixin import MoESplitExpertsStateDictMixin
 
 
 class _FakePPGroup:
@@ -47,6 +48,14 @@ class _FakePPGroup:
     def __init__(self, ranks_state_dicts):
         # ranks_state_dicts: list of per-rank payloads the fake all_gather returns.
         self.ranks_state_dicts = ranks_state_dicts
+
+
+class _V5MoEAdapter(MoESplitExpertsStateDictMixin):
+    """Minimal adapter that opts into fused PEFT v5 expert parameters."""
+
+    @property
+    def _v5_peft_target_parameters(self):
+        return ("mlp.experts.gate_up_proj", "mlp.experts.down_proj")
 
 
 def _install_fake_distributed(monkeypatch, per_rank_payloads):
@@ -246,6 +255,19 @@ class TestExtractTargetModulesPPUnion:
         )
         result = _extract_target_modules(model, pp_group=None)
         assert result == ["model.layers.0.self_attn.wq_a"]
+
+
+class TestExtractTargetParametersPPUnion:
+    def test_remote_expert_lora_enables_v5_metadata_on_every_stage(self, monkeypatch):
+        """A PP rank without experts must emit metadata when another rank owns them."""
+        local_model = nn.Module()
+        local_model.state_dict_adapter = _V5MoEAdapter()
+        payloads = [False, True]
+        _install_fake_distributed(monkeypatch, payloads)
+
+        result = _extract_target_parameters(local_model, pp_group=_FakePPGroup(payloads))
+
+        assert result == ["mlp.experts.gate_up_proj", "mlp.experts.down_proj"]
 
 
 if __name__ == "__main__":

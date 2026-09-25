@@ -57,7 +57,7 @@ dist_env:
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
   config:
-    _target_: nemo_automodel.components.models.mimo_v25.config.MiMoV2Config.from_pretrained
+    _target_: nemo_automodel.components.models.mimo_v2_flash.config.MiMoV2Config.from_pretrained
     pretrained_model_name_or_path: XiaomiMiMo/MiMo-V2.5-Pro
     name_or_path: XiaomiMiMo/MiMo-V2.5-Pro
   trust_remote_code: false

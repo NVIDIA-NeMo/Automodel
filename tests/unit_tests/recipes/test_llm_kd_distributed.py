@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import time
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -23,6 +24,8 @@ from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Replicate
 
+from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.recipes.llm import kd as llm_kd
 
 
@@ -91,6 +94,7 @@ def _make_recipe(model, device_mesh, moe_mesh):
     recipe.cfg = {}
     recipe.timestamp = time.perf_counter() - 1.0
     recipe.step_scheduler = SimpleNamespace(step=1, epoch=0)
+    recipe.loss_fn = MaskedCrossEntropy(ignore_index=0)
     recipe.kd_ratio = 0.5
     recipe.kd_loss_fn = SimpleNamespace(temperature=1.0)
     recipe._ce_loss_buffer = []
@@ -134,11 +138,13 @@ def test_llm_kd_non_pp_step_clips_gradients_across_device_meshes(single_rank_glo
     recipe._forward_backward_step = Mock(return_value=(torch.tensor(1.0), torch.tensor(0.75), torch.tensor(0.25)))
 
     metrics = recipe._run_train_optim_step(
-        [{"labels": torch.tensor([[1, 2]])}],
+        [{"labels": torch.tensor([[0, 1], [0, 2]])}],
         max_grad_norm=2.5,
     )
 
     assert metrics.metrics["grad_norm"] == pytest.approx(5.0)
+    assert metrics.metrics["num_label_tokens"] == 2
+    assert MoEAuxLossAutoScaler.main_loss_backward_scale.item() == pytest.approx(1.0)
     torch.testing.assert_close(model.expert.to_local().detach(), torch.tensor([9.85]))
     torch.testing.assert_close(model.dense.to_local().detach(), torch.tensor([19.8]))
     assert model.expert.grad is None
@@ -167,6 +173,7 @@ def test_llm_kd_non_pp_step_undoes_expert_tp_replication(single_rank_gloo):
     # Expert grad 6.0 is divided by the tp_size=2 replication factor to 3.0,
     # the dense grad is untouched, so the global norm is √(3²+4²)=5.0.
     assert metrics.metrics["grad_norm"] == pytest.approx(5.0)
+    assert MoEAuxLossAutoScaler.main_loss_backward_scale.item() == pytest.approx(1.0)
     # Clipping halves both grads (2.5/5.0), then SGD(lr=0.1) applies them.
     torch.testing.assert_close(model.expert.to_local().detach(), torch.tensor([9.85]))
     torch.testing.assert_close(model.dense.to_local().detach(), torch.tensor([19.8]))
@@ -191,13 +198,14 @@ def test_llm_kd_pp_step_undoes_expert_tp_replication(single_rank_gloo):
 
     recipe = _make_recipe(model, device_mesh, expert_mesh)
     recipe.pp_enabled = True
+    recipe.pp = SimpleNamespace(pp_batch_size=2, pp_microbatch_size=1)
     recipe.dist_env = SimpleNamespace(device=torch.device("cpu"), rank=0, is_main=True)
     recipe._forward_backward_step_pp = Mock(
         side_effect=lambda i, batch, loss_buffer, num_label_tokens, num_batches: loss_buffer.append(torch.tensor(1.0))
     )
 
     metrics = recipe._run_train_optim_step(
-        [{"labels": torch.tensor([[1, 2]])}],
+        [{"labels": torch.tensor([[0, 1], [0, 2]])}],
         max_grad_norm=1.25,
     )
 
@@ -205,6 +213,34 @@ def test_llm_kd_pp_step_undoes_expert_tp_replication(single_rank_gloo):
     # then the tp_size=2 replication factor halves the expert grad (3→1.5),
     # so the global norm is √(1.5²+2²)=2.5.
     assert metrics.metrics["grad_norm"] == pytest.approx(2.5)
+    assert metrics.metrics["num_label_tokens"] == 2
+    assert MoEAuxLossAutoScaler.main_loss_backward_scale.item() == pytest.approx(1.0)
     # Clipping halves both grads (1.25/2.5), then SGD(lr=0.1) applies them.
     torch.testing.assert_close(model.expert.to_local().detach(), torch.tensor([9.925]))
     torch.testing.assert_close(model.dense.to_local().detach(), torch.tensor([19.9]))
+
+
+def test_llm_kd_validation_uses_loss_ignore_index(monkeypatch):
+    monkeypatch.setattr(llm_kd, "ScopedRNG", lambda **kwargs: nullcontext())
+    monkeypatch.setattr(llm_kd.torch.cuda, "max_memory_allocated", lambda: 0)
+    recipe = object.__new__(llm_kd.KnowledgeDistillationRecipeForNextTokenPrediction)
+    recipe.pp_enabled = False
+    recipe.model_parts = [nn.Linear(1, 1)]
+    recipe.loss_fn = MaskedCrossEntropy(ignore_index=0)
+    recipe.dist_env = SimpleNamespace(device=torch.device("cpu"))
+    recipe.step_scheduler = SimpleNamespace(step=1, epoch=0)
+    recipe.optimizer = [SimpleNamespace(param_groups=[{"lr": 0.1}])]
+    recipe._dp_allreduce = lambda tensor, include_cp=False: tensor
+    seen_num_label_tokens = []
+
+    def _forward_backward_step(idx, batch, *, num_label_tokens, num_batches, is_train=True):
+        seen_num_label_tokens.append(num_label_tokens)
+        return torch.tensor(1.0), torch.tensor(0.75), torch.tensor(0.25)
+
+    recipe._forward_backward_step = _forward_backward_step
+
+    metrics = recipe._run_validation_epoch([{"labels": torch.tensor([[0, 1], [0, 2]])}])
+
+    assert seen_num_label_tokens == [2]
+    assert metrics.metrics["num_label_tokens"] == 2
+    assert metrics.metrics["val_loss"] == pytest.approx(1.0)

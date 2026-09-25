@@ -34,7 +34,6 @@ _WHEEL_REQUIREMENTS = (
     "causal-conv1d",
     "flash-attn",
     "mamba-ssm",
-    "nv-grouped-gemm",
     "transformer-engine",
     "transformer-engine-torch",
 )

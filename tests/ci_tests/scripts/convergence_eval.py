@@ -17,9 +17,16 @@
 
 Reads a recipe's ``ci.downstream_eval`` block, runs IFEval on the trained
 consolidated checkpoint via ``examples/convergence/tulu3/eval/run_eval.sh``, and
-asserts the score is within ``k * stderr`` of the recorded baseline.
+asserts the score has not dropped more than ``k * stderr`` below the recorded
+baseline.
 
-PASS (exit 0) iff ``abs(ci_score - baseline) < k * stderr``.
+PASS (exit 0) iff ``ci_score > baseline - k * stderr``.
+
+The gate is one-sided on purpose: it is a regression detector, so a score above
+the baseline passes. Legitimate correctness fixes (#3028 fused RoPE, #3359 MoE
+aux-loss scaling) each raised these scores and failed a two-sided gate from
+above, which cost more than it caught. Re-baseline upward when a score settles
+higher, rather than gating on it.
 
 Invoked by convergence_tests_launcher.sh after training + eval-env setup:
 
@@ -201,17 +208,17 @@ def main() -> int:
     stderr = float(cfg["stderr"])
     k = float(cfg.get("k", 2))
     tol = k * stderr
-    diff = abs(score - baseline)
-    passed = diff < tol
+    floor = baseline - tol
+    passed = score > floor
 
     summary = (
         f"[convergence_eval] metric={cfg['metric']} score={score:.4f} baseline={baseline:.4f} "
-        f"|diff|={diff:.4f} tol={k}*{stderr:.4f}={tol:.4f}"
+        f"floor={baseline:.4f}-{k}*{stderr:.4f}={floor:.4f}"
     )
     if passed:
         print(f"{summary} -> PASS", flush=True)
         return 0
-    print(f"{summary} -> FAIL: eval score out of threshold", flush=True)
+    print(f"{summary} -> FAIL: eval score below threshold", flush=True)
     return 1
 
 

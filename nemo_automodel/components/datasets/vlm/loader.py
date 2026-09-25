@@ -220,7 +220,12 @@ class VlmDataloaderConfig:
             if isinstance(self.dataset_config, RankedVlmDatasetConfig):
                 dataset = self.dataset_config.build(rank=dp_rank, world_size=dp_world_size)
             elif isinstance(self.dataset_config, TokenizerDatasetConfig):
-                dataset = self.dataset_config.build(tokenizer=processor)
+                # These configs are text datasets (e.g. ChatDataset) that consume a tokenizer,
+                # not the full processor: a ProcessorMixin does not proxy tokenizer attributes
+                # (eos_token_id, pad_token, ...) -- those live on processor.tokenizer. Forward the
+                # wrapped tokenizer so both a genuine processor and a bare tokenizer work.
+                source_tokenizer = processor.tokenizer if isinstance(processor, ProcessorMixin) else processor
+                dataset = self.dataset_config.build(tokenizer=source_tokenizer)
             else:
                 dataset = self.dataset_config.build()
         return dataset, processor
@@ -250,7 +255,8 @@ class VlmDataloaderConfig:
             packing_attn_implementation: Resolved attention backend for packed-mask construction.
             pp_n_microbatches: Optional pipeline microbatch count used to pre-chunk media tensors.
             cp_size: Runtime context-parallel world size. Neat-packed CP uses
-                compact document IDs instead of a dense quadratic attention mask.
+                compact document IDs instead of a dense quadratic attention mask;
+                THD packing also accounts for per-document CP alignment.
 
         Returns:
             Named result containing the stateful dataloader and runtime processor.
@@ -279,6 +285,7 @@ class VlmDataloaderConfig:
                 ds_raw=raw_dataset,
                 get_rope_index=get_rope_index,
                 processor=processor,
+                cp_size=cp_size,
             )
             if self.packing.packing_format == "thd":
                 logger.info("Configured VLM THD packing (Transformer Engine, qkv_format=thd)")

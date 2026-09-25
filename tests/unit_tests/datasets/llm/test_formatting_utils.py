@@ -11,6 +11,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from pathlib import Path
+
 import pytest
 
 from nemo_automodel.components.datasets.llm import formatting_utils
@@ -301,3 +303,72 @@ def test_reasoning_mask_rejects_noncontiguous_truncation_window():
             seq_length=1,
             unpadded_full_ids=[12345],
         )
+
+
+class _GenerationBlockTokenizer(_RewritingTokenizer):
+    """A rewriting template that ALSO wraps assistant turns in ``{% generation %}``.
+
+    Same rewrite behavior as :class:`_RewritingTokenizer` (a prefix render is not a
+    token prefix of the full render, so ``_build_multiturn_assistant_mask`` would
+    refuse), but because the template contains the generation keyword the tokenizer
+    returns ``assistant_masks`` directly and the prefix-arithmetic fallback is never
+    consulted. This is the contract the shipped Gemma4 CoderForge template relies on.
+    """
+
+    chat_template = "<dummy template with {% generation %}...{% endgeneration %}>"
+
+    def apply_chat_template(self, messages, return_assistant_tokens_mask=False, **kwargs):
+        last_user = max((i for i, msg in enumerate(messages) if msg["role"] == "user"), default=-1)
+        ids, amask = [], []
+        for i, msg in enumerate(messages):
+            is_asst = msg["role"] == "assistant"
+            ids.append(self._ROLE_TOKEN)  # role header is the generation prompt, never supervised
+            amask.append(0)
+            if is_asst and i > last_user and msg.get("reasoning_content"):
+                reasoning = [self._REASONING_TOKEN] * len(msg["reasoning_content"].split())
+                ids.extend(reasoning)
+                amask.extend([1] * len(reasoning))
+            content = [self._id_for_token(tok) for tok in str(msg["content"]).split()]
+            ids.extend(content)
+            amask.extend([1 if is_asst else 0] * len(content))
+        out = {"input_ids": ids, "attention_mask": [1] * len(ids)}
+        if return_assistant_tokens_mask:
+            out["assistant_masks"] = amask
+        return out
+
+
+def test_format_chat_template_generation_block_uses_direct_assistant_mask():
+    # The same conversation that raises with a no-generation template
+    # (test_format_chat_template_raises_on_rewriting_template) now succeeds: a
+    # generation-block template returns the assistant mask directly, so the
+    # prefix-arithmetic fallback is never reached and labels supervise exactly the
+    # assistant tokens (role header and user/tool tokens stay -100).
+    tok = _GenerationBlockTokenizer()
+    formatted = _rewriting_conversation()
+
+    out = formatting_utils.format_chat_template(
+        tok,
+        formatted_text=formatted,
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.eos_token_id,
+        answer_only_loss_mask=True,
+    )
+
+    full = tok.apply_chat_template(formatted, return_assistant_tokens_mask=True)
+    ids, amask = full["input_ids"], full["assistant_masks"]
+    # Standard shifted NTP: labels drop the first token; labels[i] supervises ids[i+1].
+    expected = [ids[i + 1] if amask[i + 1] else -100 for i in range(len(ids) - 1)]
+    assert out["labels"] == expected
+    assert any(label != -100 for label in out["labels"])  # assistant content is supervised
+    assert tok._ROLE_TOKEN not in out["labels"]  # role-header/scaffolding tokens are not
+
+
+def test_shipped_gemma4_coderforge_template_has_generation_block():
+    # Guard the shipped artifact: the recipe/validate/check_masking point ChatDataset
+    # at this file, and it must trip the generation-keyword path (GENERATION_REGEX)
+    # with balanced tags, or ChatDataset silently falls back to the guarded builder.
+    template = (
+        Path(__file__).parents[4] / "examples/long_context_validation/gemma4_31B/gemma4_coderforge_chat_template.jinja"
+    ).read_text()
+    assert formatting_utils.GENERATION_REGEX.search(template) is not None
+    assert template.count("{% generation %}") == template.count("{% endgeneration %}") >= 1

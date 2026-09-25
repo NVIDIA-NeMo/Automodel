@@ -20,12 +20,17 @@ import time
 from contextlib import nullcontext
 
 import torch
-import wandb
 
-from nemo_automodel._transformers.mfu import AutoMFU
+from nemo_automodel.shared.import_utils import safe_import
+
+_HAS_WANDB, wandb = safe_import(
+    "wandb", msg="wandb is not installed. To enable W&B experiment tracking, run: uv add nemo-automodel[wandb]"
+)
+
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
+from nemo_automodel.components.distributed.tp_replicas import synchronize_tp_replica_gradients
 from nemo_automodel.components.distributed.utils import FirstRankPerNode
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
@@ -33,7 +38,7 @@ from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_mes
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.utils import clip_grad_norm
 from nemo_automodel.components.utils.flops_utils import calculate_mfu
-from nemo_automodel.components.utils.model_utils import filter_forward_kwargs
+from nemo_automodel.components.utils.model_utils import FreezeConfig, ModuleSelector, filter_forward_kwargs
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config, shard_optimizers_for_megatron_fsdp
 from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.base_recipe import BaseRecipe
@@ -106,7 +111,11 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         )
 
         self.peft_config = self.cfg.instantiate_path("peft")
-        # fp32 master-weight default planned to be enabled in follow-up PR (resolve_storage_dtype).
+        freeze_config = self.cfg.get("freeze_config", None)
+        if freeze_config is None and self.peft_config is not None:
+            # Preserve the pre-freeze_config behavior for existing PEFT sequence
+            # classification recipes; new configs declare this selector directly.
+            freeze_config = FreezeConfig(unfreeze_modules=[ModuleSelector(glob="*classifier")])
         model = build_model(
             cfg_model=self.cfg.model,
             cfg_peft=self.peft_config,
@@ -115,7 +124,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             cfg_compile=self.cfg.get("compile", None),
             cfg_quantization=self.cfg.get("quantization", None),
             distributed_setup=self.distributed_setup,
-            unfreeze_modules=["classifier"] if self.peft_config is not None else None,
+            cfg_freeze=freeze_config,
         )
         optimizer = self.cfg.optimizer.build(model, device_mesh=self.device_mesh, is_peft=self.peft_config is not None)
         allow_megatron_fsdp_sharding = getattr(self.cfg.optimizer, "supports_megatron_fsdp_sharding", True)
@@ -124,7 +133,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         )
 
         self.model_parts = [model]
-        self.mfu_calculator = AutoMFU.from_config(self.model_parts[0])
+        self.mfu_calculator = self.cfg.mfu.build(model=self.model_parts[0])
 
         _, self.tokenizer = _build_tokenizer(self.cfg.model, self.cfg.dataset)
 
@@ -225,24 +234,48 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         )
         num_tokens_in_batch = self._dp_allreduce(num_tokens_in_batch).item()
 
+        # Global number of labels over the whole accumulated batch and every DP
+        # rank. Normalizing the backward loss by this -- rather than by a local
+        # per-microbatch mean -- is what makes the gradient invariant to both the
+        # micro-batch split and dp_size. It is the convention train_ft.py uses
+        # with num_label_tokens, and it is what makes the `* dp_size` below
+        # correct: that factor cancels the DP gradient average, which only
+        # reconstructs the global mean when the denominator is already global.
+        num_label_samples = torch.tensor(
+            sum(batch["labels"].numel() for batch in batches),
+            dtype=torch.long,
+        )
+        num_label_samples = max(int(self._dp_allreduce(num_label_samples).item()), 1)
+
         for batch in batches:
             batch = {
                 k: (v.to(self.dist_env.device, non_blocking=True) if v is not None else None) for k, v in batch.items()
             }
             labels = batch.pop("labels")
             batch = filter_forward_kwargs(model, batch)
-            out = model(**batch)
-            logits = getattr(out, "logits", out)
-            loss = self.loss_fn(logits, labels.view(-1))
-            losses.append(loss.detach().clone())
+            with self._autocast_context():
+                out = model(**batch)
+                logits = getattr(out, "logits", out)
+                loss = self.loss_fn(logits, labels.view(-1))
+            # Keep the summed loss, not the per-microbatch mean: means cannot be
+            # added back together, and the reported metric is normalized by the
+            # same global label count the gradient uses.
+            losses.append((loss * labels.numel()).detach().clone())
 
             # Collect predictions for accuracy calculation
             preds = torch.argmax(logits, dim=-1)
             all_preds.append(preds.detach())
             all_labels.append(labels.view(-1).detach())
-            (loss * self._get_dp_group_size(include_cp=True)).backward()
+            # `loss` is the mean over this micro-batch, so `loss * n_local` is its
+            # summed loss; dividing by the global count gives this micro-batch's
+            # share of the global mean. Every sequence-classification sample
+            # carries exactly one label, so `numel()` is the supervised count and
+            # matches how num_label_samples above was accumulated.
+            local_loss = loss * labels.numel() / num_label_samples
+            (local_loss * self._get_dp_group_size(include_cp=True)).backward()
 
-        # Calculate gradient norm (distributed-aware)
+        # Synchronize unsharded TP replicas, then calculate the distributed-aware gradient norm.
+        synchronize_tp_replica_gradients(self.model_parts, self.device_mesh)
         grad_norm = clip_grad_norm(
             max_grad_norm=self.max_grad_norm,
             model_parts=self.model_parts,
@@ -299,11 +332,20 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
                 step_flops = self._dp_allreduce(
                     torch.tensor(step_flops, dtype=torch.float64, device=self.dist_env.device), include_cp=True
                 ).item()
-                mfu = calculate_mfu(step_flops / 1e12, self.dist_env.world_size, time_delta)
+                mfu = calculate_mfu(
+                    step_flops / 1e12,
+                    self.dist_env.world_size,
+                    time_delta,
+                    reference_mfu=mfu_calculator.reference_mfu,
+                )
 
+        # Global summed loss over every micro-batch and DP rank, divided by the
+        # same global label count as the gradient. Dividing by len(batches)
+        # instead would report a mean of means: inflated by dp_size, and wrong
+        # whenever micro-batches are unevenly sized.
         total_loss = torch.sum(torch.stack(losses))
         total_loss = self._dp_allreduce(total_loss, include_cp=True).detach()
-        loss = total_loss / len(batches)
+        loss = total_loss / num_label_samples
 
         return MetricsSample(
             step=self.step_scheduler.step,
@@ -335,9 +377,10 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             }
             labels = batch.pop("labels")
             batch = filter_forward_kwargs(model, batch)
-            out = model(**batch)
-            logits = getattr(out, "logits", out)
-            loss = self.loss_fn(logits, labels.view(-1))
+            with self._autocast_context():
+                out = model(**batch)
+                logits = getattr(out, "logits", out)
+                loss = self.loss_fn(logits, labels.view(-1))
             total_loss += loss.detach()
 
             # Collect predictions for accuracy
@@ -394,7 +437,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         if not self.dist_env.is_main or log_data is None:
             return
 
-        if wandb.run is not None:
+        if _HAS_WANDB and wandb.run is not None:
             wandb.log(log_data.to_dict(), step=log_data.step)
 
         # JSONL validation log
@@ -431,7 +474,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
 
         # Log to remote services (WandB) according to step_scheduler frequency
         if self.step_scheduler.is_remote_logging_step:
-            if wandb.run is not None:
+            if _HAS_WANDB and wandb.run is not None:
                 wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
 
         # JSONL training log (always log for detailed local records)

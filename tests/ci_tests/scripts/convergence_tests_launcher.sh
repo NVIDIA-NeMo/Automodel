@@ -38,12 +38,54 @@ esac
 CONFIG_RESOLVER="python3 /opt/Automodel/tests/ci_tests/scripts/config_resolver.py"
 TEST_DIR="$PIPELINE_DIR/$TEST_NAME"
 mkdir -p "$TEST_DIR"
+CONVERGENCE_NODE_ID=${SLURM_NODEID:-${SLURM_PROCID:-0}}
+RESOLVED_FINETUNE_CONFIG="$TEST_DIR/finetune_config.yaml"
+MODEL_CONFIG_READY="$TEST_DIR/.model_config_ready_${SLURM_JOB_ID}"
 
-# --- Resolve finetune config (phase=convergence; recipe.ci.convergence restores 1000 steps) ---
-RESOLVED_FINETUNE_CONFIG=$($CONFIG_RESOLVER \
-  --base "/opt/Automodel/${CONFIG_PATH}" \
-  --phase convergence \
-  --output "$TEST_DIR/finetune_config.yaml")
+# --- Resolve finetune config and warm the shared Hugging Face config cache ---
+# This launcher runs once per node, while every node and local rank shares HF_HOME on Lustre.
+# Letting all 32 Gemma4 ranks cold-load config.json caused one rank to observe a config without
+# model_type; that rank exited and the remaining ranks waited for the one-hour NCCL timeout.
+# Node 0 resolves the shared recipe and validates the model config before any torchrun starts.
+if [[ "${CONVERGENCE_NODE_ID}" == "0" ]]; then
+  if ! $CONFIG_RESOLVER \
+    --base "/opt/Automodel/${CONFIG_PATH}" \
+    --phase convergence \
+    --output "${RESOLVED_FINETUNE_CONFIG}"; then
+    echo "[convergence] failed to resolve the finetune config" >&2
+    exit 1
+  fi
+  if ! python3 - "${RESOLVED_FINETUNE_CONFIG}" <<'PY'
+import sys
+
+import yaml
+from transformers import AutoConfig
+
+with open(sys.argv[1], encoding="utf-8") as config_file:
+    recipe = yaml.safe_load(config_file) or {}
+model_id = (recipe.get("model") or {}).get("pretrained_model_name_or_path")
+if not model_id:
+    raise ValueError("convergence recipe is missing model.pretrained_model_name_or_path")
+model_config = AutoConfig.from_pretrained(model_id, trust_remote_code=False)
+if not model_config.model_type:
+    raise ValueError(f"model config for {model_id} is missing model_type")
+print(f"[convergence] model config ready: {model_id} ({model_config.model_type})", flush=True)
+PY
+  then
+    echo "[convergence] failed to prepare the model config" >&2
+    exit 1
+  fi
+  touch "${MODEL_CONFIG_READY}"
+else
+  CONFIG_WAIT_START=$SECONDS
+  until [[ -f "${MODEL_CONFIG_READY}" ]]; do
+    if (( SECONDS - CONFIG_WAIT_START >= 600 )); then
+      echo "[convergence] timed out waiting for node 0 to prepare the model config" >&2
+      exit 1
+    fi
+    sleep 2
+  done
+fi
 
 export WANDB_API_KEY="${WANDB_AUTOMODEL_API_KEY}"
 # Enable wandb in CI: the recipes ship `wandb.enable: false` (example-yaml linter requirement), so
@@ -101,6 +143,19 @@ echo "{\"test\":\"${TEST_NAME}\",\"phase\":\"train\",\"seconds\":$((SECONDS - TR
 if [[ "$TRAIN_EXIT_CODE" -ne 0 ]]; then
   echo "[convergence] Training failed with exit code ${TRAIN_EXIT_CODE}, skipping eval"
   exit $TRAIN_EXIT_CODE
+fi
+
+# --- Eval runs once, on the first node ---
+# This script body executes on every node (torchrun rendezvous), so without this guard
+# steps 2-3 clone lm-eval, build the venv and run the whole vLLM eval once per node. The
+# duplicate work is not just wasted GPU hours -- it multiplies the exposure to a flaky
+# clone. In pipeline 61927701 the gemma4 4-node job hit
+#   fatal: could not read Username for 'https://github.com'
+# on 2 of its 4 nodes; setup_lm_eval.sh aborted there, those tasks exited non-zero, and
+# srun tore down the eval that the two healthy nodes were still running.
+if [[ "${CONVERGENCE_NODE_ID}" != "0" ]]; then
+  echo "[convergence] node ${CONVERGENCE_NODE_ID}: training done; eval runs on node 0 only"
+  exit 0
 fi
 
 # --- 2. Eval-env setup (model-agnostic, idempotent) ---

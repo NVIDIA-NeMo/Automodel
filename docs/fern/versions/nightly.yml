@@ -76,6 +76,10 @@ navigation:
             path: ../../model-coverage/llm/qwen/qwen3.mdx
           - page: "Qwen3 MoE"
             path: ../../model-coverage/llm/qwen/qwen3-moe.mdx
+          - page: "Qwen3.8-2.4T-A95B"
+            path: ../../model-coverage/llm/qwen/qwen3-8-2-4t-a95b.mdx
+          - page: "Qwen3.8-Flash-Next"
+            path: ../../model-coverage/llm/qwen/qwen3-8-flash-next.mdx
           - page: "Qwen3-Next"
             path: ../../model-coverage/llm/qwen/qwen3-next.mdx
           - page: "ERNIE 4.5"
@@ -89,6 +93,8 @@ navigation:
             path: ../../model-coverage/llm/deepseek-ai/dsv4-flash.mdx
           - page: "DeepSeek-V4 Pro"
             path: ../../model-coverage/llm/deepseek-ai/dsv4-pro.mdx
+          - page: "DeepSeek-V4.1 Flash"
+            path: ../../model-coverage/llm/deepseek-ai/deepseek-v41-flash.mdx
           - page: "Mistral"
             path: ../../model-coverage/llm/mistralai/mistral.mdx
           - page: "Mixtral"
@@ -120,7 +126,7 @@ navigation:
           - page: "GLM-4 MoE (GLM-4.5 / GLM-4.7)"
             path: ../../model-coverage/llm/thudm/glm4-moe.mdx
             slug: glm-4-moe-glm-4-5-glm-4-7
-          - page: "GLM-5 / GLM-5.2 MoE (DSA)"
+          - page: "GLM-5 / GLM-5.3 (MoE + DSA)"
             path: ../../model-coverage/llm/thudm/glm5-moe-dsa.mdx
             slug: glm-5-moe-dsa
           - page: "Granite"
@@ -170,6 +176,8 @@ navigation:
             path: ../../model-coverage/llm/openbmb/minicpm.mdx
           - page: "Moonlight"
             path: ../../model-coverage/llm/moonshotai/moonlight.mdx
+          - page: "Kimi Linear"
+            path: ../../model-coverage/llm/moonshotai/kimi-linear.mdx
           - page: "Kimi K3"
             path: ../../model-coverage/llm/moonshotai/kimi-k3.mdx
             slug: kimi-k3
@@ -208,10 +216,15 @@ navigation:
           - page: "Overview"
             path: ../../model-coverage/vlm/index.mdx
             slug: overview
+          - page: "MuseGlimmer"
+            path: ../../model-coverage/vlm/muse/muse_glimmer.mdx
           - page: "Kimi-VL"
             path: ../../model-coverage/vlm/moonshotai/kimi-vl.mdx
           - page: "Kimi-K3"
             path: ../../model-coverage/vlm/moonshotai/kimi-k3.mdx
+          - page: "North Micro Vision"
+            path: ../../model-coverage/vlm/coherelabs/north-micro-vision.mdx
+            slug: north-micro-vision
           - page: "Inkling"
             path: ../../model-coverage/vlm/thinkingmachines/inkling.mdx
           - page: "Gemma 3 / Gemma 3n"
@@ -231,6 +244,9 @@ navigation:
           - page: "Qwen3.6"
             path: ../../model-coverage/vlm/qwen/qwen3-6-vl.mdx
             slug: qwen3-6-vl
+          - page: "Qwen3.8"
+            path: ../../model-coverage/vlm/qwen/qwen3-8-vl.mdx
+            slug: qwen3-8-vl
           - page: "Nemotron-Parse"
             path: ../../model-coverage/vlm/nvidia/nemotron-parse.mdx
           - page: "Ministral3 VL"
@@ -256,6 +272,9 @@ navigation:
           - page: "MiniMax-M3"
             path: ../../model-coverage/vlm/minimax/minimax-m3.mdx
             slug: minimax-m3
+          - page: "GLM-5.3-Flash"
+            path: ../../model-coverage/vlm/thudm/glm-5-3-flash.mdx
+            slug: glm-5-3-flash
       - section: "Multimodal"
         slug: multimodal
         contents:
@@ -279,6 +298,8 @@ navigation:
             path: ../../model-coverage/omni/microsoft/phi4-multimodal.mdx
           - page: "Nemotron-Omni"
             path: ../../model-coverage/omni/nvidia/nemotron-omni.mdx
+          - page: "Nemotron 3.5 Super VL"
+            path: ../../model-coverage/omni/nvidia/nemotron-3-5-super-vl.mdx
       - section: "Diffusion Language Models"
         slug: dllm
         contents:
@@ -334,7 +355,7 @@ navigation:
           - page: "Llama (Bidirectional)"
             path: ../../model-coverage/embedding/nvidia/llama-bidirectional.mdx
             slug: llama-bidirectional
-          - page: "Ministral3 (Bidirectional)"
+          - page: "Ministral3"
             path: ../../model-coverage/embedding/mistralai/ministral3-bidirectional.mdx
             slug: ministral3-bidirectional
       - section: "Reranking Models"
@@ -400,9 +421,21 @@ navigation:
       - page: "Qwen3.5-VL"
         path: ../../guides/vlm/qwen3-5.mdx
         slug: qwen3-5-vl
+      - page: "Fine-Tune Qwen3.8-27B"
+        path: ../../guides/vlm/qwen3-8.mdx
+        slug: qwen3-8-27b
       - page: "Nemotron-Omni"
         path: ../../guides/vlm/nemotron-omni.mdx
         slug: nemotron-omni
+      - page: "Nemotron 3.5 Super VL"
+        path: ../../guides/vlm/nemotron-3-5-super-vl.mdx
+        slug: nemotron-3-5-super-vl
+      - page: "Nemotron 3.5 Super VL: Text-to-SQL with LoRA"
+        path: ../../guides/vlm/nemotron-3-5-super-vl-text-to-sql.mdx
+        slug: nemotron-3-5-super-vl-text-to-sql
+      - page: "Nemotron 3.5 Super VL: Continued Pretraining on FineWeb"
+        path: ../../guides/vlm/nemotron-3-5-super-vl-continued-pretraining.mdx
+        slug: nemotron-3-5-super-vl-continued-pretraining
       - page: "Mistral Medium 3.5 VL"
         path: ../../guides/vlm/mistral-medium-3-5.mdx
         slug: mistral-medium-3-5
@@ -424,6 +457,9 @@ navigation:
       - page: "Train an EAGLE Drafter for Speculative Decoding"
         path: ../../guides/speculative/eagle.mdx
         slug: eagle-speculative-decoding
+      - page: "Train a DFlash Drafter for Speculative Decoding"
+        path: ../../guides/speculative/dflash.mdx
+        slug: dflash-speculative-decoding
       - page: "Train a DSpark Drafter for Speculative Decoding"
         path: ../../guides/speculative/dspark.mdx
         slug: dspark-speculative-decoding

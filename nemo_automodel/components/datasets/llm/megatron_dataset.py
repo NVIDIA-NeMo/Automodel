@@ -21,7 +21,7 @@ import os
 from dataclasses import dataclass
 from importlib.util import find_spec
 from pathlib import Path
-from typing import ClassVar, Dict, List, Optional, Union
+from typing import ClassVar, Dict, List, Union
 
 import torch.distributed as dist
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
@@ -132,24 +132,24 @@ class MegatronPretraining:
         self,
         paths: Path | List | Dict[str, List],
         seq_length: int = 2048,
-        tokenizer: Optional[PreTrainedTokenizerBase] = None,
+        tokenizer: PreTrainedTokenizerBase | None = None,
         micro_batch_size: int = 4,
         global_batch_size: int = 8,
         create_attention_mask: bool = False,
         seed: int = 1234,
         split: str = "900,50,50",
-        index_mapping_dir: Optional[str] = None,
+        index_mapping_dir: str | None = None,
         num_dataset_builder_threads: int = 1,
-        num_train_samples: Optional[int] = None,
-        num_val_samples: Optional[int] = None,
-        num_test_samples: Optional[int] = None,
-        trainer_max_steps: Optional[int] = None,
+        num_train_samples: int | None = None,
+        num_val_samples: int | None = None,
+        num_test_samples: int | None = None,
+        trainer_max_steps: int | None = None,
         trainer_val_check_interval: int = 1000,
         trainer_limit_val_batches: Union[int, float] = 1,
         trainer_limit_test_batches: Union[int, float] = 1,
         mmap_bin_files: bool = True,
-        splits_to_build: Optional[Union[str, List[str]]] = None,
-        object_storage_config: Optional[Union[Dict, "ObjectStorageConfig"]] = None,
+        splits_to_build: Union[str, List[str]] | None = None,
+        object_storage_config: Union[Dict, "ObjectStorageConfig"] | None = None,
     ) -> None:
         """Pretraining dataset class for Megatron-LM datasets.
         Args:
@@ -474,7 +474,7 @@ def get_list_of_files(path: str):
 
 def try_load_blend_from_json(
     path: Union[str, Path],
-) -> Optional[Union[Dict[str, List], List]]:
+) -> Union[Dict[str, List], List] | None:
     """
     Load a data blend configuration from a JSON file.
 

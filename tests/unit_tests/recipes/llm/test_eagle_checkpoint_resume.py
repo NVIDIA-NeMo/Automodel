@@ -277,7 +277,7 @@ def test_eagle1_save_checkpoint_writes_expected_artifacts(tmp_path):
 
     recipe.checkpointer.save_model.assert_called_once()
     recipe.checkpointer.save_optimizer.assert_called_once()
-    recipe.checkpointer.save_on_dp_ranks.assert_called_once()
+    recipe.checkpointer.save_on_global_ranks.assert_called_once_with(recipe.rng, "rng", ckpt_path)
 
     meta = torch.load(os.path.join(ckpt_path, "eagle_meta.pt"), weights_only=False)
     assert meta["global_step"] == 5
@@ -575,7 +575,7 @@ def test_eagle1_load_checkpoint_rng_missing_is_nonfatal(tmp_path):
     target = os.path.join(ckpt_dir, "epoch_1_step_5")
     os.makedirs(target, exist_ok=True)
     torch.save({"global_step": 5, "epoch": 1}, os.path.join(target, "eagle_meta.pt"))
-    recipe.checkpointer.load_on_dp_ranks.side_effect = FileNotFoundError("no rng")
+    recipe.checkpointer.load_on_global_ranks.side_effect = FileNotFoundError("no rng")
 
     recipe.load_checkpoint(None)
 
@@ -743,7 +743,7 @@ def test_eagle3_load_checkpoint_rng_missing_is_nonfatal(tmp_path):
         },
         os.path.join(target, "eagle_meta.pt"),
     )
-    recipe.checkpointer.load_on_dp_ranks.side_effect = FileNotFoundError("no rng")
+    recipe.checkpointer.load_on_global_ranks.side_effect = FileNotFoundError("no rng")
 
     recipe.load_checkpoint(None)
 

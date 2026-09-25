@@ -58,7 +58,7 @@ model:
     linear: te
     rms_norm: torch_fp32
     rope_fusion: false
-    experts: gmm
+    experts: torch_mm
     dispatcher: hybridep
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
@@ -97,7 +97,6 @@ distributed:
     wrap_outer_model: true
 
 freeze_config:
-  freeze_embeddings: true
   freeze_vision_tower: true
   freeze_audio_tower: true
   freeze_language_model: false
@@ -156,3 +155,4 @@ wandb:
 ci:
   recipe_owner: athitten
   nodes: 16
+  time: "01:00:00"

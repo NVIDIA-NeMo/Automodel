@@ -29,8 +29,8 @@ from typing import TYPE_CHECKING, ClassVar
 
 import torch
 import torch.utils.data
+from datasets import Dataset, load_dataset
 from datasets import Image as HfImage
-from datasets import load_dataset
 from PIL import Image
 
 if TYPE_CHECKING:
@@ -44,6 +44,21 @@ from nemo_automodel.components.datasets.vlm.utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _replacement_rng(idx: int) -> random.Random:
+    """Per-sample RNG for picking a substitute when sample ``idx`` is unusable.
+
+    Seeded from the ORIGINAL sample index only, so every rank (and every
+    dp/cp world size) that materializes sample ``idx`` substitutes the same
+    replacement. Drawing from the process-global ``random`` instead made the
+    substitute rank-dependent: ranks whose global RNG stream had advanced
+    differently (e.g. the per-node dataset-building rank) picked a different
+    document, so context-parallel ranks in one CP group ended up with
+    different packs / ``cu_seqlens`` for the same microbatch -- corrupting the
+    ring-attention gradient accumulation (inf/nan or silently wrong dk/dv).
+    """
+    return random.Random(0x9E3779B9 + 2654435761 * int(idx))
 
 
 @dataclass
@@ -461,6 +476,102 @@ def make_tulu3_dataset(
     return dataset.map(_convert_sharegpt_to_conversation, remove_columns=dataset.column_names)
 
 
+# User-turn template shared by the text-to-SQL datasets: the database schema followed by the question.
+TEXT_TO_SQL_PROMPT = "Given the SQL schema:\n{context}\n\nWrite the SQL query that answers this question: {question}"
+
+
+def _load_hf_or_local(path_or_dataset: str, split: str, **kwargs):
+    """``load_dataset`` for an HF Hub id or a local ``.json``/``.jsonl``/``.parquet`` file."""
+    suffix = os.path.splitext(str(path_or_dataset))[1].lower()
+    if suffix in (".json", ".jsonl", ".parquet"):
+        builder = "parquet" if suffix == ".parquet" else "json"
+        return load_dataset(builder, data_files=str(path_or_dataset), split=split, **kwargs)
+    return load_dataset(path_or_dataset, split=split, **kwargs)
+
+
+def spider_schema_to_ddl(schema_row: dict) -> str:
+    """Render one ``richardr1126/spider-schema`` row as ``CREATE TABLE`` statements.
+
+    The schema dataset lists every database as ``table : col (type) , col (type) | table : ...`` plus
+    ``Primary Keys`` (``table : col | ...``) and ``Foreign Keys`` (``t1 : c1 equals t2 : c2 | ...``).
+    Column and table names are emitted with spaces replaced by underscores, which is how the Spider
+    SQL queries reference them.
+    """
+
+    def ident(name: str) -> str:
+        return name.strip().replace(" ", "_")
+
+    pks: dict[str, list[str]] = {}
+    for part in filter(None, (p.strip() for p in (schema_row.get("Primary Keys") or "").split("|"))):
+        table, _, col = part.partition(":")
+        pks.setdefault(ident(table), []).append(ident(col))
+    fks: dict[str, list[str]] = {}
+    for part in filter(None, (p.strip() for p in (schema_row.get("Foreign Keys") or "").split("|"))):
+        left, _, right = part.partition(" equals ")
+        t1, _, c1 = left.partition(":")
+        t2, _, c2 = right.partition(":")
+        fks.setdefault(ident(t1), []).append(f"FOREIGN KEY ({ident(c1)}) REFERENCES {ident(t2)}({ident(c2)})")
+    statements = []
+    for table_block in filter(None, (t.strip() for t in schema_row["Schema (values (type))"].split("|"))):
+        table, _, cols = table_block.partition(":")
+        table = ident(table)
+        columns = []
+        for col in filter(None, (c.strip() for c in cols.split(","))):
+            name, _, col_type = col.rpartition(" (")
+            columns.append(f"{ident(name)} {col_type.rstrip(')').strip().upper()}")
+        if table in pks:
+            columns.append(f"PRIMARY KEY ({', '.join(pks[table])})")
+        columns.extend(fks.get(table, []))
+        statements.append(f"CREATE TABLE {table} ({', '.join(columns)})")
+    return "\n".join(statements)
+
+
+def make_spider_dataset(
+    path_or_dataset: str = "xlangai/spider",
+    split: str = "train",
+    schema_dataset: str = "richardr1126/spider-schema",
+    limit_dataset_samples: int | None = None,
+    **kwargs,
+):
+    """Load Spider (``xlangai/spider``) as text-only conversations for cross-domain text-to-SQL.
+
+    Spider rows carry only ``db_id`` / ``question`` / ``query``; the database schemas come from
+    ``richardr1126/spider-schema`` and are rendered as ``CREATE TABLE`` statements with
+    :func:`spider_schema_to_ddl`. The user turn presents the full schema of the row's database and the
+    question with :data:`TEXT_TO_SQL_PROMPT`; the assistant turn is the gold SQL query with its
+    whitespace collapsed to single spaces. Spider's ``validation`` split uses 20 databases that never
+    appear in ``train``, so it measures generalization to unseen schemas.
+
+    Args:
+        path_or_dataset: HF Hub id of the Spider split files, or a local ``.parquet``/``.json`` file.
+        split: ``"train"`` (7,000 rows, 140 databases) or ``"validation"`` (1,034 rows, 20 databases),
+            optionally sliced (``"validation[:20]"``).
+        schema_dataset: HF Hub id, or local ``.json`` file, of the per-database schema table.
+        limit_dataset_samples: Optional cap on the number of samples (applied as a split slice).
+        **kwargs: Ignored. Accepted so recipe-level dataset keys forwarded to the dataset target do
+            not raise.
+
+    Returns:
+        datasets.Dataset: Rows with a single ``conversation`` column of text-only user/assistant turns.
+    """
+    if limit_dataset_samples is not None:
+        split = f"{split}[:{limit_dataset_samples}]"
+    dataset = _load_hf_or_local(path_or_dataset, split)
+    schemas = {row["db_id"]: spider_schema_to_ddl(row) for row in _load_hf_or_local(schema_dataset, "train")}
+
+    def format(example):
+        prompt = TEXT_TO_SQL_PROMPT.format(context=schemas[example["db_id"]], question=example["question"].strip())
+        answer = re.sub(r"\s+", " ", example["query"]).strip()
+        return {
+            "conversation": [
+                {"role": "user", "content": [{"type": "text", "text": prompt}]},
+                {"role": "assistant", "content": [{"type": "text", "text": answer}]},
+            ],
+        }
+
+    return dataset.map(format, remove_columns=dataset.column_names)
+
+
 @dataclass
 class UnimmChatDatasetConfig:
     """Construction-time configuration for the UniMM-Chat dataset."""
@@ -520,6 +631,97 @@ def make_unimm_chat_dataset(path_or_dataset="Yirany/UniMM-Chat", split="train", 
         return {"conversation": conversation}
 
     return [format(example) for example in dataset]
+
+
+SHOPIFY_PRODUCT_CATALOGUE_PROMPT = "What product category does this item belong to?"
+
+
+@dataclass
+class ShopifyProductCatalogueDatasetConfig:
+    """Construction-time configuration for the Shopify product-catalogue dataset."""
+
+    path_or_dataset: str = "Shopify/product-catalogue"
+    """HuggingFace dataset id or local path for the Shopify product catalogue."""
+    split: str = "train"
+    """Dataset split to load (e.g. ``"train"``, ``"test"``)."""
+    limit_dataset_samples: int | None = None
+    """Optional maximum number of samples to load."""
+
+    def build(self) -> Dataset:
+        """Build the Shopify product-catalogue dataset from this config."""
+        return make_shopify_product_catalogue_dataset(
+            path_or_dataset=self.path_or_dataset,
+            split=self.split,
+            limit_dataset_samples=self.limit_dataset_samples,
+        )
+
+
+def make_shopify_product_catalogue_dataset(
+    path_or_dataset="Shopify/product-catalogue",
+    split="train",
+    limit_dataset_samples: int | None = None,
+    **kwargs,
+) -> Dataset:
+    """Load the Shopify product-catalogue dataset for image-to-text fine-tuning.
+
+    The task is product image -> taxonomy category, supervised on the dataset's
+    ``ground_truth_category`` field.
+
+    Formatting is deferred to ``__getitem__`` via ``with_transform`` so the
+    dataset stays Arrow-backed, as in :func:`make_medpix_dataset`. The train
+    split holds 38,631 product photos; materialising formatted rows measured
+    ~8.1 GB per 1,500 rows (~209 GB for the full split) because each retained
+    row pins its decoded image. Images are loaded undecoded
+    (``Image(decode=False)``) and wrapped as lazy ``PIL`` handles, so the pixel
+    decode happens in the DataLoader workers.
+
+    Note:
+        Product photos are full resolution (up to 2084x2084). Bound the visual
+        token count through the processor (e.g. Qwen2.5-VL's ``max_pixels``) or
+        via ``max_length`` on the collate function.
+
+    Args:
+        path_or_dataset: HuggingFace dataset id or local path.
+        split: Dataset split to load.
+        limit_dataset_samples: Optional maximum number of samples to load.
+        **kwargs: Unused; accepted for parity with the other dataset builders.
+
+    Returns:
+        Dataset: Arrow-backed dataset yielding ``{"conversation": [...]}`` rows.
+    """
+    dataset = load_dataset(path_or_dataset, split=split)
+    if limit_dataset_samples is not None:
+        dataset = dataset.select(range(min(limit_dataset_samples, len(dataset))))
+    if "product_image" in getattr(dataset, "features", {}):
+        dataset = dataset.cast_column("product_image", HfImage(decode=False))
+
+    def lazy_image(value):
+        # ``Image(decode=False)`` yields a ``{"bytes": ..., "path": ...}`` dict.
+        if isinstance(value, dict):
+            if value.get("bytes") is not None:
+                return Image.open(io.BytesIO(value["bytes"]))
+            if value.get("path"):
+                return value["path"]
+        return value
+
+    def transform(batch):
+        return {
+            "conversation": [
+                [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "image": lazy_image(image)},
+                            {"type": "text", "text": SHOPIFY_PRODUCT_CATALOGUE_PROMPT},
+                        ],
+                    },
+                    {"role": "assistant", "content": [{"type": "text", "text": category}]},
+                ]
+                for image, category in zip(batch["product_image"], batch["ground_truth_category"])
+            ]
+        }
+
+    return dataset.with_transform(transform)
 
 
 def convert_sharegpt_to_conversation(
@@ -1376,6 +1578,7 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
         return len(self.dataset)
 
     def __getitem__(self, idx):
+        rng = _replacement_rng(idx)
         from nemo_automodel.components.datasets.vlm.collate_fns import (
             _extract_media_from_conversations,
             build_labels_from_template,
@@ -1454,7 +1657,7 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
                             seq_len,
                             self.max_length,
                         )
-                        idx = random.randint(0, len(self.dataset) - 1)
+                        idx = rng.randint(0, len(self.dataset) - 1)
                         continue
 
                 # Build labels BEFORE truncation so the full assistant text
@@ -1489,7 +1692,7 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
                         idx,
                         mismatch,
                     )
-                    idx = random.randint(0, len(self.dataset) - 1)
+                    idx = rng.randint(0, len(self.dataset) - 1)
                     continue
 
                 output = {
@@ -1525,7 +1728,7 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
                     self.max_retries,
                     e,
                 )
-                idx = random.randint(0, len(self.dataset) - 1)
+                idx = rng.randint(0, len(self.dataset) - 1)
 
         raise RuntimeError(f"Failed to load a valid sample after {self.max_retries} retries")
 
@@ -1554,6 +1757,7 @@ class RobustDatasetWrapper(torch.utils.data.Dataset):
         return len(self.dataset)
 
     def __getitem__(self, idx):
+        rng = _replacement_rng(idx)
         from nemo_automodel.components.datasets.vlm.fake_image import (
             _conversation_has_media,
             inject_fake_image_into_conversation,
@@ -1572,7 +1776,7 @@ class RobustDatasetWrapper(torch.utils.data.Dataset):
                 return example
             except Exception as e:
                 logger.warning(f"Error loading sample {idx}: {e}. Retrying with a different sample.")
-                idx = random.randint(0, len(self.dataset) - 1)
+                idx = rng.randint(0, len(self.dataset) - 1)
         raise RuntimeError(f"Failed to load a valid sample after {self.max_retries} retries")
 
     def robust_collate(self, collate_fn):

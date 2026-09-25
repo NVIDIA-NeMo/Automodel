@@ -37,6 +37,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     CheckpointImpl,
+    CheckpointWrapper,
     checkpoint_wrapper,
 )
 from torch.nn.attention import SDPBackend, sdpa_kernel
@@ -334,6 +335,15 @@ def ensure_fsdp_ops_sac_ignored() -> None:
     # flat communication buffer. When forward prefetch has already unsharded
     # the parameters, these setup ops occur only during recomputation. They do
     # not produce model activations: the FSDP copy ops populate the allocations.
+    #
+    # Parameters sharded on a non-zero dim (``fsdp_placement.dim != 0``, e.g.
+    # MoE expert weights under an expert-parallel FSDP shard axis) take a second
+    # copy-out path in ``foreach_all_gather_copy_out``: ``torch.chunk`` (which
+    # dispatches as ``aten.split.Tensor``) followed by ``torch.cat(..., out=)``
+    # into the unsharded parameter. Those two ops are parameter management as
+    # well and otherwise fail SAC replay with ``aten.split.Tensor encountered
+    # during backward but not found in storage`` whenever the expert unit is
+    # resharded between forward and recompute (per-microbatch gradient sync).
     ignore_sac_ops(
         list(
             map(
@@ -347,6 +357,8 @@ def ensure_fsdp_ops_sac_ignored() -> None:
                     "aten.empty.memory_format",
                     "aten.empty_like",
                     "aten.view",
+                    "aten.split.Tensor",
+                    "aten.cat.out",
                 ],
             )
         )
@@ -640,6 +652,26 @@ def _replace_child_module(root: nn.Module, target: nn.Module, replacement: nn.Mo
         if _replace_child_module(child, target, replacement):
             return True
     return False
+
+
+def apply_full_layer_checkpointing_to_layers(model: nn.Module, layers: List[nn.Module]) -> None:
+    """Wrap transformer layers with non-reentrant activation checkpointing."""
+    context_fn = functools.partial(
+        transformer_engine_attention_backend_snapshot_context_fn,
+        sdpa_backend_snapshot_context_fn,
+    )
+    for index, layer in enumerate(layers):
+        if isinstance(layer, CheckpointWrapper):
+            continue
+        wrapped_layer = checkpoint_wrapper(
+            layer,
+            checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+            context_fn=context_fn,
+            preserve_rng_state=True,
+        )
+        if not _replace_child_module(model, layer, wrapped_layer):
+            raise RuntimeError(f"Could not replace layer {index} with an activation checkpoint wrapper.")
+        layers[index] = wrapped_layer
 
 
 def detect_kv_sharing_and_maybe_disable_cache(model: nn.Module) -> bool:

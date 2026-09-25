@@ -12,21 +12,35 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Callable, Optional
+import warnings
+from typing import Any, Callable
 
 
-def calculate_mfu(tflops, world_size, time_seconds, reference_mfu=1979.0):
+def calculate_mfu(
+    tflops: float,
+    world_size: int,
+    time_seconds: float,
+    reference_mfu: float | None = None,
+) -> float:
     """Calculate Model FLOPs Utilization (MFU).
 
     Args:
-        tflops: TFLOPs per GPU
-        world_size: Total number of GPUs
-        time_seconds: Time taken for computation
-        reference_mfu: Peak TFLOPs of the hardware (default: H100)
+        tflops: Total TFLOPs across all devices for the measured step.
+        world_size: Total number of GPUs.
+        time_seconds: Time taken for computation.
+        reference_mfu: Peak TFLOPs/s per device for the training precision. The
+            legacy default is the H100 dense-FP8 peak.
 
     Returns:
-        MFU as a percentage
+        MFU as a percentage.
     """
+    if reference_mfu is None:
+        warnings.warn(
+            "Omitting reference_mfu is deprecated; pass the peak TFLOPs/s for the training precision.",
+            FutureWarning,
+            stacklevel=2,
+        )
+        reference_mfu = 1979.0
     mfu = tflops / (world_size * time_seconds)
     mfu = mfu / reference_mfu
     return mfu * 100
@@ -728,7 +742,7 @@ def attention_flops_calculator(
     hidden_size,
     num_attention_heads,
     num_query_groups,
-    kv_channels: Optional[int] = None,
+    kv_channels: int | None = None,
     is_swa: bool = False,
     swa_window_size: int = 128,
 ):
@@ -786,9 +800,9 @@ def gpt_oss_flops_calculator(
     moe_ffn_hidden_size,
     moe_router_topk,
     vocab_size,
-    kv_channels: Optional[int] = None,
+    kv_channels: int | None = None,
     swa_window_size: int = 128,
-    window_attn_skip_freq: Optional[int] = 2,
+    window_attn_skip_freq: int | None = 2,
 ):
     """Calculate the flops for the GPT-OSS model"""
     flops = 0
@@ -1422,6 +1436,412 @@ def mla_moe_flops(config, gbs=1, seq_len=None):
     )
 
 
+def _kda_attention_per_layer_flops(
+    gbs: int,
+    seq_len: int,
+    hs: int,
+    head_dim: int,
+    num_heads: int,
+    conv_kernel_size: int,
+    use_full_rank_gate: bool,
+    chunk_size: int = 64,
+) -> float:
+    """Per-layer FLOPs for Kimi Delta Attention (KDA, gated delta-rule linear attention).
+
+    Projections follow the KDA layer definition (Kimi Linear, arXiv:2510.26692):
+    q/k/v with short causal convolutions, the low-rank forget gate
+    (``f_a``/``f_b``), the beta projection, the output gate (full-rank ``g_proj``
+    or low-rank ``g_a``/``g_b``) and ``o_proj``. The chunkwise kernel is costed
+    with the paper's own count, ``FLOPs_KDA(T; C, d_h) = 6 T d_h^2 + 3 T C d_h + T C^2``
+    per head (forward, chunk size ``C``), halved to MAC-equivalents so the shared
+    ``6 x`` (forward + backward) factor of this module applies.
+    """
+    proj = num_heads * head_dim
+    gate_params = hs * proj if use_full_rank_gate else hs * head_dim + head_dim * proj
+    linear_params = (
+        3 * hs * proj  # q, k, v projections
+        + hs * head_dim
+        + head_dim * proj  # forget gate f_a / f_b
+        + hs * num_heads  # beta projection
+        + gate_params  # output gate
+        + proj * hs  # o_proj
+    )
+    conv_per_token = 3 * proj * conv_kernel_size
+    kernel_per_token = num_heads * (6 * head_dim**2 + 3 * chunk_size * head_dim + chunk_size**2) / 2
+    return 6 * gbs * seq_len * (linear_params + conv_per_token + kernel_per_token)
+
+
+def kimi_k3_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> float:
+    """Model FLOPs for Kimi K3 (hybrid KDA / gated-MLA attention + latent MoE with a SiTU shared expert).
+
+    Accepts ``KimiK3TextConfig`` or the multimodal ``KimiK3Config`` wrapper (its
+    ``text_config`` is used; the vision tower is not counted, as for other VL entries).
+
+    The layer pattern is read from the config rather than assumed: 1-based
+    ``linear_attn_config["kda_layers"]`` marks KDA layers and every other layer
+    is MLA (with an extra output-gate projection when ``mla_use_output_gate``);
+    ``first_k_dense_replace`` / ``moe_layer_freq`` mark dense vs MoE MLPs, using
+    the same rule as ``KimiDecoderLayer``. Routed experts run in a latent space
+    of ``routed_expert_hidden_size`` behind shared down/up projections, and the
+    shared expert is one SiTU MLP of ``moe_intermediate_size * num_shared_experts``.
+    The router GEMM (``hidden_size x num_experts``, about 0.6% of the total), norms
+    and the scalar attention-residual projections are omitted, matching the other
+    MoE formulas in this module.
+
+    The router top-k field on this config is ``num_experts_per_token`` (not the
+    ``num_experts_per_tok`` that the generic ``transformer_flops`` fallback probes),
+    which is why K3 was previously costed as a dense 93-layer transformer at well
+    under half of its real FLOPs. For the released checkpoint's configuration
+    (96 attention heads, dense ``intermediate_size`` 33792) the formula counts
+    104.0B active matmul parameters per token and 2.78T total, matching the
+    model card ("104B activated / 2.8T") and the tech report's Table 1 (104.2B /
+    2.78T) to within 0.2%, which is inside the accounting difference for the
+    non-GEMM parameters (router, norms, gate biases). The report's
+    single MTP layer is not shipped in the checkpoint (``num_nextn_predict_layers``
+    is 0) and is not modelled by Automodel, so it is not counted.
+    """
+    if hasattr(config, "text_config") and not hasattr(config, "num_hidden_layers"):
+        config = config.text_config
+
+    if seq_len is None:
+        seq_len = getattr(config, "max_position_embeddings", 2048)
+
+    layers = config.num_hidden_layers
+    hs = config.hidden_size
+    vocab_size = config.vocab_size
+
+    # --- attention layer pattern (1-based kda_layers list) ---
+    linear_attn_config = getattr(config, "linear_attn_config", None) or {}
+    kda_layer_ids = set(linear_attn_config.get("kda_layers", []))
+    num_kda_layers = sum(1 for layer in range(1, layers + 1) if layer in kda_layer_ids)
+    num_mla_layers = layers - num_kda_layers
+
+    attention_heads = config.num_attention_heads
+    mla_per_layer = _mla_attention_per_layer_flops(
+        gbs,
+        seq_len,
+        hs,
+        attention_heads,
+        getattr(config, "q_lora_rank", None),
+        config.kv_lora_rank,
+        config.qk_rope_head_dim,
+        config.qk_nope_head_dim,
+        config.v_head_dim,
+    )
+    if getattr(config, "mla_use_output_gate", False):
+        mla_per_layer += 6 * gbs * seq_len * hs * attention_heads * config.v_head_dim
+
+    kda_per_layer = 0
+    if num_kda_layers:
+        kda_per_layer = _kda_attention_per_layer_flops(
+            gbs,
+            seq_len,
+            hs,
+            linear_attn_config["head_dim"],
+            linear_attn_config["num_heads"],
+            linear_attn_config.get("short_conv_kernel_size", 4),
+            linear_attn_config.get("use_full_rank_gate", False),
+        )
+    attention_flops = num_mla_layers * mla_per_layer + num_kda_layers * kda_per_layer
+
+    # --- MLP layer pattern (same rule as KimiDecoderLayer) ---
+    num_experts = getattr(config, "num_experts", None)
+    is_moe = num_experts is not None and num_experts > 1
+    first_k_dense = getattr(config, "first_k_dense_replace", 0) or 0
+    moe_layer_freq = getattr(config, "moe_layer_freq", 1) or 1
+    num_moe_layers = sum(1 for i in range(layers) if is_moe and i >= first_k_dense and i % moe_layer_freq == 0)
+    num_dense_layers = layers - num_moe_layers
+
+    dense_ffn_params = 3 * hs * config.intermediate_size  # SiTU MLP: gate, up, down
+    moe_ffn_params = 0
+    if is_moe:
+        moe_topk = getattr(config, "num_experts_per_token", None)
+        if moe_topk is None:
+            moe_topk = getattr(config, "num_experts_per_tok", 1)
+        moe_ffn_hs = config.moe_intermediate_size
+        latent = getattr(config, "routed_expert_hidden_size", None)
+        expert_in = latent or hs
+        routed_params = moe_topk * 3 * expert_in * moe_ffn_hs
+        latent_proj_params = 2 * hs * latent if latent else 0
+        shared_params = 3 * hs * moe_ffn_hs * (getattr(config, "num_shared_experts", 0) or 0)
+        moe_ffn_params = routed_params + latent_proj_params + shared_params
+    ffn_flops = 6 * gbs * seq_len * (num_dense_layers * dense_ffn_params + num_moe_layers * moe_ffn_params)
+
+    # --- vocab ---
+    vocab_flops = 6 * gbs * seq_len * hs * vocab_size
+
+    return attention_flops + ffn_flops + vocab_flops
+
+
+def _sum_min_floor_div(seq_len: int, ratio: int, cap: int | None) -> int:
+    """``sum_{j=1..seq_len} min(cap, floor(j / ratio))`` in closed form (``cap=None`` disables the cap).
+
+    ``floor(j / ratio)`` is the number of complete compressed groups visible to the query at
+    zero-based position ``j - 1``; the cap is the sparse top-k. Closed form so million-token
+    sequences cost nothing to evaluate.
+    """
+
+    def floor_sum(n: int) -> int:
+        q, rem = divmod(n, ratio)
+        return ratio * q * (q - 1) // 2 + q * (rem + 1)
+
+    if cap is None or seq_len <= cap * ratio:
+        return floor_sum(seq_len)
+    threshold = cap * ratio  # from here on every query sees at least ``cap`` groups
+    return floor_sum(threshold) + (seq_len - threshold) * cap
+
+
+def _sum_min_window(seq_len: int, window: int) -> int:
+    """``sum_{i=0..seq_len-1} min(i + 1, window)``: causal sliding-window keys per query, summed."""
+    if seq_len <= window:
+        return seq_len * (seq_len + 1) // 2
+    return window * (window + 1) // 2 + (seq_len - window) * window
+
+
+def deepseek_v41_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> float:
+    """Model FLOPs for DeepSeek-V4.1 (CSA2 sparse attention, single-pass mHC, Engram, MoE).
+
+    Accepts ``DeepseekV41TextConfig`` or the multimodal ``DeepseekV41Config`` wrapper (its
+    ``text_config`` is used; the vision tower is not counted, as for other VL entries). The
+    module shapes follow ``nemo_automodel/components/models/deepseek_v41``:
+
+    * attention linears per layer: ``wq_a`` (hidden x q_lora_rank), ``wq_b`` (q_lora_rank x
+      heads*head_dim), ``wkv`` (hidden x head_dim, one shared latent), grouped ``wo_a``
+      (heads*head_dim -> o_groups*o_lora_rank) and ``wo_b`` (o_groups*o_lora_rank x hidden);
+    * compressors on ``kv_source_layer_ids``: ``wkv`` and, for ratio > 1, ``wgate`` (hidden x
+      head_dim each, applied to every token before pooling);
+    * sparse attention BMMs: every query attends to ``min(i+1, sliding_window)`` local keys plus
+      ``min(index_topk, floor((i+1)/ratio))`` selected compressed keys (SWA-only layers have
+      ``compress_ratios[i] == 0``); QK^T and PV each cost ``heads * head_dim`` MACs per key;
+    * the indexer is frozen (``_Indexer.requires_grad_(False)``; hard top-k has no gradient), so
+      its projections and its causal scoring over the compressed positions are counted forward
+      only (2 x MACs) — the implementation scores the full ``[S, S/ratio]`` block before
+      masking, which is executed work but not model work;
+    * MoE per layer: router GEMM (hidden x n_routed_experts) plus ``num_experts_per_tok +
+      n_shared_experts`` experts of ``3 * hidden * moe_intermediate_size``;
+    * single-pass mHC: two coefficient projections per layer (``hc_mult*(hc_mult+2)`` x
+      ``hc_mult*hidden``); the stream collapse/expand are elementwise and not counted;
+    * Engram on ``engram_layer_ids``: the fused key/value projection
+      (``(engram_max_ngram_size-1)*engram_n_heads*engram_head_dim`` x ``hidden*(hc_mult+1)``);
+      the table gather, hashing, norms, RoPE and quantize/dequantize boundaries are not GEMMs;
+    * the FP32 language-model head (hidden x vocab).
+
+    Trainable GEMMs and attention BMMs cost 6 x MACs (forward + backward); activation
+    recomputation is excluded (that is HFU). For the released Flash configuration the formula
+    counts 16.09B active GEMM parameters per token (model card: 16B activated during decode)
+    and 105.6 GFLOPs/token at 4096 tokens, 1.095x the dense-FFN identity ``6 x active``.
+
+    Args:
+        config: ``DeepseekV41TextConfig``, or a ``DeepseekV41Config`` wrapper whose ``text_config`` is used.
+        gbs: Number of sequences per step.
+        seq_len: Tokens per sequence; defaults to ``config.max_position_embeddings``.
+
+    Returns:
+        Model FLOPs for one training step of ``gbs`` sequences of ``seq_len`` tokens.
+    """
+    if hasattr(config, "text_config") and not hasattr(config, "num_hidden_layers"):
+        config = config.text_config
+
+    if seq_len is None:
+        seq_len = getattr(config, "max_position_embeddings", 4096)
+    seq_len = int(seq_len)
+
+    layers = config.num_hidden_layers
+    hs = config.hidden_size
+    vocab_size = config.vocab_size
+    heads = config.num_attention_heads
+    head_dim = config.head_dim
+    q_lora_rank = config.q_lora_rank
+    o_lora_rank = config.o_lora_rank
+    o_groups = config.o_groups
+    window = config.sliding_window
+    compress_ratios = list(config.compress_ratios)
+    kv_source_layer_ids = set(config.kv_source_layer_ids)
+    index_source_layer_ids = set(config.index_source_layer_ids)
+    index_n_heads = config.index_n_heads
+    index_head_dim = config.index_head_dim
+    index_topk = config.index_topk
+    hc_mult = config.hc_mult
+    moe_inter = config.moe_intermediate_size
+    n_routed = config.n_routed_experts
+    topk = config.num_experts_per_tok
+    n_shared = config.n_shared_experts
+    engram_layers = [lid for lid in config.engram_layer_ids if lid < layers]
+    engram_hash_heads = (config.engram_max_ngram_size - 1) * config.engram_n_heads
+    engram_head_dim = config.engram_head_dim
+
+    # --- trainable GEMM MACs per token (6x) ---
+    attn_linear = (
+        hs * q_lora_rank
+        + q_lora_rank * heads * head_dim
+        + hs * head_dim
+        + heads * head_dim * o_lora_rank  # grouped wo_a: (heads*head_dim/o_groups) x o_lora_rank per group
+        + o_groups * o_lora_rank * hs
+    )
+    compressor = sum(
+        hs * head_dim * (2 if compress_ratios[lid] > 1 else 1) for lid in kv_source_layer_ids if lid < layers
+    )
+    experts = (topk + n_shared) * 3 * hs * moe_inter
+    router = hs * n_routed
+    mhc = 2 * (hc_mult * (hc_mult + 2)) * hc_mult * hs
+    engram = len(engram_layers) * engram_hash_heads * engram_head_dim * hs * (hc_mult + 1)
+    lm_head = hs * vocab_size
+    trainable_macs_per_token = layers * (attn_linear + experts + router + mhc) + compressor + engram + lm_head
+    trainable_flops = 6 * gbs * seq_len * trainable_macs_per_token
+
+    # --- sparse attention BMMs (6x), summed over query positions ---
+    bmm_macs = 0
+    for lid in range(layers):
+        ratio = compress_ratios[lid]
+        keys = _sum_min_window(seq_len, window)
+        if ratio:
+            keys += _sum_min_floor_div(seq_len, ratio, index_topk)
+        bmm_macs += 2 * heads * head_dim * keys  # QK^T and PV
+    attention_flops = 6 * gbs * bmm_macs
+
+    # --- frozen indexer: forward only (2x) ---
+    indexer_macs = 0
+    for lid in index_source_layer_ids:
+        if lid >= layers:
+            continue
+        ratio = compress_ratios[lid]
+        indexer_macs += seq_len * (q_lora_rank * index_n_heads * index_head_dim + hs * index_n_heads)
+        if lid in kv_source_layer_ids:
+            indexer_macs += (seq_len // ratio) * head_dim * index_head_dim  # wk on compressed tokens
+        indexer_macs += index_n_heads * index_head_dim * _sum_min_floor_div(seq_len, ratio, None)
+    indexer_flops = 2 * gbs * indexer_macs
+
+    return float(trainable_flops + attention_flops + indexer_flops)
+
+
+def _sum_mod(seq_len: int, ratio: int) -> int:
+    """``sum_{j=1..seq_len} (j mod ratio)`` in closed form.
+
+    ``j mod ratio`` is the length of the incomplete compressed tail visible to the query at
+    zero-based position ``j - 1``.
+    """
+    full_cycles, remainder = divmod(seq_len, ratio)
+    return full_cycles * (ratio * (ratio - 1) // 2) + remainder * (remainder + 1) // 2
+
+
+def qwen3_8_flash_next_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> float:
+    """Model FLOPs for Qwen3.8-Flash-Next (GDN + compressed-block QSA, HyperConnections, Engram PLE, MoE).
+
+    Accepts ``Qwen3_8_FlashNextTextConfig`` or the multimodal ``Qwen3_8_FlashNextConfig`` wrapper
+    (its ``text_config`` is used; the vision tower is not loaded by the training path). The module
+    shapes follow ``nemo_automodel/components/models/qwen3_8_flash_next``:
+
+    * GatedDeltaNet layers (``layers_block_type == "linear_attention"``): the shared
+      ``_gdn_attention_per_layer_flops`` term (QKV/Z/B/A projections, causal conv, chunked
+      delta-rule recurrence, output projection);
+    * QSA full-attention layers: gated ``q_proj`` (hidden x 2*heads*head_dim), ``k_proj``/``v_proj``
+      (hidden x kv_heads*head_dim) and ``o_proj``; the sparse GQA BMMs where the query at zero-based
+      position ``t`` attends to ``ratio * min(indexer_budget / ratio, floor((t+1)/ratio))`` routed tokens
+      plus the ``(t+1) mod ratio`` tokens of its incomplete causal tail, QK^T and PV each costing
+      ``heads * head_dim`` MACs per key;
+    * the QSA indexer is frozen (``requires_grad_(False)``; hard top-k has no gradient), so its
+      ``index_qk_proj`` and its causal scoring of ``indexer_n_heads`` queries against the
+      ``floor((t+1)/ratio)`` compressed keys are counted forward only (2 x MACs);
+    * MoE per layer: router GEMM (hidden x num_experts), ``num_experts_per_tok`` routed plus one shared
+      expert of ``3 * hidden * moe_intermediate_size`` / ``shared_expert_intermediate_size``, and the
+      shared-expert gate (hidden x 1);
+    * HyperConnections: two mixers per layer (attention and MoE), each with ``input_mix_weight_down``
+      (hc_count*hidden x hc_lowrank), ``input_mix_weight_up`` (hc_lowrank x hc_count*hidden) and
+      ``block_inject_weight`` (hc_count*hidden x hc_count); the final read mixer has no inject weight;
+    * Engram PLE on ``ple_layer_ids``: ``key_proj`` (ple_embed_dim x hc_count*hidden), ``value_proj``
+      (ple_embed_dim x hidden) and the depthwise causal convolution (hc_count*hidden x kernel); the
+      table gather, hashing and norms are not GEMMs;
+    * the untied language-model head (hidden x vocab). The checkpoint's MTP head is not loaded.
+
+    Trainable GEMMs and attention BMMs cost 6 x MACs (forward + backward); activation recomputation
+    is excluded (that is HFU). On the released configuration the formula counts 6.14B active GEMM
+    parameters per token excluding the LM head (model card: 6B activated), implies a 125.8B backbone
+    excluding the 51.2B Engram table (model card: 125B), and gives 42.0 GFLOPs/token at 4096 tokens,
+    1.034x the dense identity ``6 x active``.
+
+    Args:
+        config: ``Qwen3_8_FlashNextTextConfig``, or a ``Qwen3_8_FlashNextConfig`` wrapper whose
+            ``text_config`` is used.
+        gbs: Number of sequences per step.
+        seq_len: Tokens per sequence; defaults to ``config.max_position_embeddings``.
+
+    Returns:
+        Model FLOPs for one training step of ``gbs`` sequences of ``seq_len`` tokens.
+    """
+    if hasattr(config, "text_config") and not hasattr(config, "num_hidden_layers"):
+        config = config.text_config
+
+    if seq_len is None:
+        seq_len = getattr(config, "max_position_embeddings", 4096)
+    seq_len = int(seq_len)
+
+    layers = config.num_hidden_layers
+    hs = config.hidden_size
+    vocab_size = config.vocab_size
+    heads = config.num_attention_heads
+    kv_heads = config.num_key_value_heads
+    head_dim = config.head_dim
+    hc_count = config.hc_count
+    hc_lowrank = config.hc_lowrank
+    flat_hs = hc_count * hs
+    moe_inter = config.moe_intermediate_size
+    shared_inter = config.shared_expert_intermediate_size
+    n_routed = config.num_experts
+    topk = config.num_experts_per_tok
+    ratio = config.indexer_compress_ratio
+    budget_blocks = config.indexer_budget // ratio
+    index_heads = config.indexer_n_heads
+    index_kv_heads = config.indexer_kv_heads
+    index_head_dim = config.indexer_head_dim
+    ple_embed_dim = config.ple_embed_dim
+    ple_kernel = config.ple_conv_kernel_size
+    num_ple_layers = len(config.ple_layer_ids)
+
+    block_types = config.layers_block_type
+    num_full_attn_layers = sum(1 for block_type in block_types if block_type == "attention")
+    num_gdn_layers = layers - num_full_attn_layers
+
+    # --- trainable GEMM MACs per token (6x) ---
+    attn_linear = hs * heads * head_dim * 2 + 2 * hs * kv_heads * head_dim + heads * head_dim * hs
+    experts = topk * 3 * hs * moe_inter + 3 * hs * shared_inter
+    router = hs * n_routed + hs  # routed gate + shared-expert gate
+    hyper_connection = 2 * (2 * flat_hs * hc_lowrank + flat_hs * hc_count)  # attention + MoE mixers
+    final_mixer = 2 * flat_hs * hc_lowrank
+    ple = num_ple_layers * (ple_embed_dim * flat_hs + ple_embed_dim * hs + flat_hs * ple_kernel)
+    lm_head = hs * vocab_size
+    trainable_macs_per_token = (
+        num_full_attn_layers * attn_linear
+        + layers * (experts + router + hyper_connection)
+        + final_mixer
+        + ple
+        + lm_head
+    )
+    trainable_flops = 6 * gbs * seq_len * trainable_macs_per_token
+
+    # --- GDN layers (already 6x, includes projections and recurrence) ---
+    gdn_flops = num_gdn_layers * _gdn_attention_per_layer_flops(
+        gbs,
+        seq_len,
+        hs,
+        config.linear_key_head_dim,
+        config.linear_value_head_dim,
+        config.linear_num_key_heads,
+        config.linear_num_value_heads,
+        config.linear_conv_kernel_dim,
+    )
+
+    # --- sparse QSA BMMs (6x), summed over query positions ---
+    routed_keys = ratio * _sum_min_floor_div(seq_len, ratio, budget_blocks) + _sum_mod(seq_len, ratio)
+    attention_flops = 6 * gbs * num_full_attn_layers * 2 * heads * head_dim * routed_keys  # QK^T and PV
+
+    # --- frozen indexer: forward only (2x) ---
+    indexer_macs = seq_len * hs * (index_heads + index_kv_heads) * index_head_dim
+    indexer_macs += index_heads * index_head_dim * _sum_min_floor_div(seq_len, ratio, None)
+    indexer_flops = 2 * gbs * num_full_attn_layers * indexer_macs
+
+    return float(trainable_flops + gdn_flops + attention_flops + indexer_flops)
+
+
 def step3_5_flash_flops(config, gbs=1, seq_len=None):
     """Model FLOPs for Step3.5-Flash (GQA + sliding-window / full attention + MoE).
 
@@ -1551,7 +1971,7 @@ def step3_5_flash_flops(config, gbs=1, seq_len=None):
     return gbs * (total_attn + total_mlp + total_vocab + mtp_total)
 
 
-def get_flops_formula_for_hf_config(config: Any) -> Optional[Callable]:
+def get_flops_formula_for_hf_config(config: Any) -> Callable | None:
     """
     Get the appropriate FLOPs formula function for a given HuggingFace config.
 
@@ -1559,7 +1979,9 @@ def get_flops_formula_for_hf_config(config: Any) -> Optional[Callable]:
         config: HuggingFace model config object
 
     Returns:
-        The appropriate FLOPs formula function, or None if model type is not supported
+        The appropriate FLOPs formula function, or None for an unregistered
+        composite config. Pass its text config explicitly when only text-backbone
+        FLOPs are intended.
     """
     # Get config class name
     config_class_name = config.__class__.__name__
@@ -1582,6 +2004,12 @@ def get_flops_formula_for_hf_config(config: Any) -> Optional[Callable]:
         "Qwen3_5Config": qwen3_5_flops,
         "Qwen3_5MoeConfig": qwen3_5_flops,
         "Qwen3NextConfig": qwen3_5_flops,  # Qwen3.5 Small 4B/9B (GDN + MoE)
+        # Qwen3.8-Flash-Next (GDN + compressed-block QSA + HyperConnections + Engram PLE + MoE);
+        # the multimodal wrapper and the pre-rename ``qwen4_exp`` aliases use text_config.
+        "Qwen3_8_FlashNextConfig": qwen3_8_flash_next_flops,
+        "Qwen3_8_FlashNextTextConfig": qwen3_8_flash_next_flops,
+        "Qwen3_8_FlashNextLegacyConfig": qwen3_8_flash_next_flops,
+        "Qwen3_8_FlashNextLegacyTextConfig": qwen3_8_flash_next_flops,
         "Qwen3VLMoeConfig": qwen3_flops,  # Qwen3 VL 235B text backbone
         "Qwen3VLMoeTextConfig": qwen3_flops,
         "Qwen3VLConfig": qwen3_flops,
@@ -1593,6 +2021,9 @@ def get_flops_formula_for_hf_config(config: Any) -> Optional[Callable]:
         "ElectraConfig": bert_flops,
         # DeepSeek V3 / V3.2
         "DeepseekV3Config": deepseekv3_flops,
+        # DeepSeek V4.1 (CSA2 sparse attention + single-pass mHC + Engram + MoE; wrapper uses text_config)
+        "DeepseekV41Config": deepseek_v41_flops,
+        "DeepseekV41TextConfig": deepseek_v41_flops,
         # GPT-OSS
         "GptOssConfig": gpt_oss_flops,
         # GLM family
@@ -1606,6 +2037,8 @@ def get_flops_formula_for_hf_config(config: Any) -> Optional[Callable]:
         "Mistral3Config": mla_moe_flops,  # Mistral Small 4 (VL wrapper, extracts text_config)
         "KimiK2Config": mla_moe_flops,  # Kimi K2 / K2.5
         "KimiK25Config": mla_moe_flops,
+        "KimiK3TextConfig": kimi_k3_flops,  # Kimi K3 (hybrid KDA/MLA + latent MoE)
+        "KimiK3Config": kimi_k3_flops,  # Kimi K3 multimodal wrapper (text_config)
         # Step3.5-Flash
         "Step3p5Config": step3_5_flash_flops,
         "LongcatFlashConfig": mla_moe_flops,  # MLA + MoE
@@ -1626,6 +2059,9 @@ def get_flops_formula_for_hf_config(config: Any) -> Optional[Callable]:
 
     # If no exact match, try to match by model_type as fallback
     if formula is None:
+        get_text_config = getattr(config, "get_text_config", None)
+        if callable(get_text_config) and get_text_config() is not config:
+            return None
         formula = transformer_flops
 
     return formula

@@ -93,6 +93,7 @@ def _resolve_args(custom_args):
     model_cfg = cfg.get("model", {})
     tokenizer_cfg = cfg.get("tokenizer", {})
     ci_cfg = cfg.get("ci", {})
+    ckpt_robustness_cfg = ci_cfg.get("checkpoint_robustness") or {}
 
     # -- model_path and adapter_path --
     if mode == "peft":
@@ -115,6 +116,8 @@ def _resolve_args(custom_args):
     # -- tokenizer --
     if "tokenizer" in custom_args:
         tokenizer = custom_args["tokenizer"]
+    elif ckpt_robustness_cfg.get("tokenizer_name"):
+        tokenizer = ckpt_robustness_cfg["tokenizer_name"]
     elif tokenizer_cfg.get("pretrained_model_name_or_path"):
         tokenizer = tokenizer_cfg["pretrained_model_name_or_path"]
     else:
@@ -123,7 +126,6 @@ def _resolve_args(custom_args):
     # -- flags --
     # trust_remote_code placement varies: top-level `model:` or nested under
     # `ci.checkpoint_robustness:`. Accept any source that says true.
-    ckpt_robustness_cfg = ci_cfg.get("checkpoint_robustness") or {}
     trust_remote_code = bool(
         custom_args.get("trust_remote_code")
         or model_cfg.get("trust_remote_code")
@@ -246,8 +248,14 @@ def test_vllm_greedy_matches_hf():
     if adapter_path is not None and merge_lora:
         merged_dir = tempfile.mkdtemp(prefix="merged_adapter_", dir=os.path.dirname(os.path.normpath(adapter_path)))
         print(f"[merge] merging adapter into base model -> {merged_dir}")
-        hf_model.merge_and_unload().save_pretrained(merged_dir)
+        merged_model = hf_model.merge_and_unload()
+        # Some checkpoints carry top_p with sampling disabled. HF ignores it during
+        # greedy generation, but rejects it when saving the merged model's config.
+        if not merged_model.generation_config.do_sample:
+            merged_model.generation_config.top_p = 1.0
+        merged_model.save_pretrained(merged_dir)
         tokenizer.save_pretrained(merged_dir)
+        del merged_model
 
     del hf_model
     if adapter_path is not None:

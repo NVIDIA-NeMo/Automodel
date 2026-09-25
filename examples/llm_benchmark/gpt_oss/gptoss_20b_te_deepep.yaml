@@ -63,6 +63,9 @@ dist_env:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  # FusedLinearCrossEntropy consumes the final hidden states without materializing
+  # the full [batch, sequence, vocab] logits tensor (GitHub issue #3907).
+  output_hidden_states: true
   config:
     _target_: transformers.AutoConfig.from_pretrained
     pretrained_model_name_or_path: openai/gpt-oss-20b
@@ -73,7 +76,7 @@ model:
     linear: te
     rms_norm: te
     rope_fusion: true
-    experts: gmm
+    experts: torch_mm
     dispatcher: deepep
     fake_balanced_gate: true
     enable_hf_state_dict_adapter: false
@@ -82,8 +85,7 @@ checkpoint:
   enabled: false
 
 loss_fn:
-  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
-  fp32_upcast: false
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDataset

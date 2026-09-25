@@ -66,7 +66,7 @@ model:
     linear: te
     rms_norm: torch_fp32
     rope_fusion: false
-    experts: gmm
+    experts: torch_mm
     dispatcher: deepep
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
@@ -88,7 +88,6 @@ distributed:
 # Full fine-tune: audio tower + language model trainable; only the vision tower
 # stays frozen (we never feed images). No PEFT adapters.
 freeze_config:
-  freeze_embeddings: false
   freeze_vision_tower: true
   freeze_audio_tower: false
   freeze_language_model: false

@@ -146,13 +146,19 @@ class BiEncoderCollator:
             if self.passage_prefix:
                 doc_examples_flat = [self.passage_prefix + " " + passage for passage in doc_examples_flat]
 
+        # Some tokenizer backends, including MistralCommonBackend, do not support
+        # the return_token_type_ids kwarg and do not advertise token type IDs.
+        token_type_kwargs = {}
+        if "token_type_ids" in getattr(self.tokenizer, "model_input_names", []):
+            token_type_kwargs["return_token_type_ids"] = False
+
         # Tokenize queries (no padding yet)
         query_encodings = self.tokenizer(
             query_examples,
             max_length=self.q_max_len,
             padding=PaddingStrategy.DO_NOT_PAD,
             truncation=True,
-            return_token_type_ids=False,
+            **token_type_kwargs,
         )
 
         # Tokenize documents (no padding yet)
@@ -161,7 +167,7 @@ class BiEncoderCollator:
             max_length=self.p_max_len,
             padding=PaddingStrategy.DO_NOT_PAD,
             truncation=True,
-            return_token_type_ids=False,
+            **token_type_kwargs,
         )
 
         # Merge into features format for unpacking

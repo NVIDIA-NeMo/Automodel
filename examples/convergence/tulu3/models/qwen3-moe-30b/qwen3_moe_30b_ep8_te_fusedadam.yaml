@@ -118,9 +118,10 @@ wandb:
   dir: /tmp/wandb
 
 # ── Weekly Tulu-3 convergence CI (train 1000 steps -> IFEval -> threshold gate) ──
-# Passes iff |CI IFEval prompt_level_strict_acc - baseline| < k * stderr. The SFT
-# model is evaluated WITH --thinking (its training mode); without it the empty
-# <think> prefill sends the model OOD and IFEval collapses. baseline/stderr measured.
+# Regression gate, one-sided: passes iff CI IFEval prompt_level_strict_acc >
+# baseline - k * stderr. A higher score always passes. The SFT model is evaluated WITH
+# --thinking (its training mode); without it the empty <think> prefill sends the model
+# OOD and IFEval collapses. baseline/stderr measured.
 ci:
   recipe_owner: athitten
   nodes: 1
@@ -135,6 +136,7 @@ ci:
     thinking: true
     extra_model_args: "think_end_token=</think>,max_model_len=8192"
     metric: prompt_level_strict_acc
-    baseline: 0.5767
-    stderr: 0.0213
+    # Re-baselined after #3359: the eval score improved.
+    baseline: 0.6380
+    stderr: 0.0204
     k: 2

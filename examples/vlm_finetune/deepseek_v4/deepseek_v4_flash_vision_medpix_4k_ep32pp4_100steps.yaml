@@ -1,0 +1,144 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Full DeepSeek-V4-Flash-Vision-Exp MedPix fine-tune at 4096 tokens.
+# World size is PP4 x EP32 = 128 GPUs (16 eight-GPU nodes). Visual CP/THD is
+# intentionally disabled: DSV4 image spans use a model-owned bidirectional
+# sparse-attention window that currently supports unpacked CP1 execution.
+
+recipe: FinetuneRecipeForVLM
+
+seed: 1234
+
+step_scheduler:
+  # EP32 is also the 32-rank data-parallel mesh: 4 samples/rank x 32.
+  global_batch_size: 128
+  # PP requires at least one microbatch per stage; four one-sample
+  # microbatches form each local pipeline batch.
+  local_batch_size: 4
+  ckpt_every_steps: 1000
+  val_every_steps: 1000
+  log_remote_every_steps: 1
+  gc_every_steps: 5
+  num_epochs: 4
+  max_steps: 100
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 120
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1234
+  ranked: true
+  deterministic: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
+  pretrained_model_name_or_path: deepseek-ai/DeepSeek-V4-Flash-Vision-Exp
+  trust_remote_code: false
+  torch_dtype: bfloat16
+  # Visual pseudo-token shifting is not defined by the released MTP path.
+  num_nextn_predict_layers: 0
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: tilelang
+    linear: torch
+    rms_norm: torch_fp32
+    rope_fusion: false
+    dispatcher: hybridep
+    experts: torch_mm
+    gate_precision: float32
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+
+processor:
+  _target_: nemo_automodel.components.models.deepseek_v4.processing.DeepseekV4VisionProcessor.from_pretrained
+  pretrained_model_name_or_path: deepseek-ai/DeepSeek-V4-Flash-Vision-Exp
+  trust_remote_code: false
+
+checkpoint:
+  enabled: false
+  checkpoint_dir: checkpoints/deepseek_v4_flash_vision_medpix_4k_ep32pp4_100steps/
+  model_save_format: safetensors
+  save_consolidated: false
+  dequantize_base_checkpoint: true
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 4
+  ep_size: 32
+  sequence_parallel: false
+  activation_checkpointing: true
+  defer_fsdp_grad_sync: false
+  pipeline:
+    pp_schedule: interleaved1f1b
+    pp_microbatch_size: 1
+    layers_per_stage: 2
+    round_virtual_stages_to_pp_multiple: down
+    scale_grads_in_schedule: false
+    patch_inner_model: false
+    patch_causal_lm_model: false
+  moe:
+    reshard_after_forward: false
+    wrap_outer_model: true
+
+freeze_config:
+  freeze_vision_tower: false
+  freeze_audio_tower: true
+  freeze_language_model: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+  fp32_upcast: false
+
+dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
+  path_or_dataset: mmoukouba/MedPix-VQA
+  split: train
+
+packed_sequence:
+  packed_sequence_size: 0
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 1
+  persistent_workers: true
+  pin_memory: true
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn
+    # The VLM collator shifts inputs/labels once after processing, yielding
+    # the requested 4096-token model sequence.
+    max_length: 4097
+  drop_last: true
+
+validation_dataset: none
+validation_dataloader: none
+
+optimizer:
+  _target_: torch.optim.AdamW
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  lr: 5.0e-6
+  weight_decay: 0.1
+
+lr_scheduler:
+  lr_decay_style: constant
+
+wandb:
+  # Examples keep remote logging opt-in; the validation launcher overrides
+  # this to true and supplies a unique job-specific run name.
+  enable: false
+  project: huiyingl_workspace
+  entity: Nemo-automodel
+  name: deepseek_v4_flash_vision_medpix_4k_ep32pp4_100steps
+  group: deepseek_v4_flash_vision_medpix_4k
+  tags: [deepseek-v4, vision, medpix, 4k, ep32, pp4, full-finetune]
+  dir: logs/deepseek_v4_flash_vision_medpix_4k_ep32pp4_100steps/wandb
+
+ci:
+  recipe_owner: HuiyingLi
+  nodes: 16
+  time: "04:00:00"

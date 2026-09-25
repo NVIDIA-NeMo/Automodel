@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Literal, Optional
+from typing import Any, Callable, Dict, Literal
 
 import torch
 
@@ -122,7 +122,7 @@ _ENABLE_FN_BY_MODE = {
 }
 
 
-def get_quantizer_mode(quantizer: object) -> Optional[str]:
+def get_quantizer_mode(quantizer: object) -> str | None:
     """Return a short mode string for a known torchao QAT quantizer.
 
     Returns None when the quantizer is unrecognized.
@@ -131,19 +131,19 @@ def get_quantizer_mode(quantizer: object) -> Optional[str]:
     return _QUANTIZER_TO_MODE.get(type(quantizer), None)
 
 
-def get_disable_fake_quant_fn(mode: str) -> Optional[Callable]:
+def get_disable_fake_quant_fn(mode: str) -> Callable | None:
     """Return the disable fake-quant function for a given quantizer mode."""
 
     return _DISABLE_FN_BY_MODE.get(mode, None)
 
 
-def get_enable_fake_quant_fn(mode: str) -> Optional[Callable]:
+def get_enable_fake_quant_fn(mode: str) -> Callable | None:
     """Return the enable fake-quant function for a given quantizer mode."""
 
     return _ENABLE_FN_BY_MODE.get(mode, None)
 
 
-def prepare_qat_model(model, quantizer) -> tuple[object, Optional[str]]:
+def prepare_qat_model(model, quantizer) -> tuple[object, str | None]:
     """Apply a torchao QAT quantizer to the given model.
 
     Returns the (possibly wrapped) model and a mode string if recognized.

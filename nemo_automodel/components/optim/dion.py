@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import Any, Optional, Protocol
+from typing import Any, Protocol
 
 import torch.nn as nn
 
@@ -161,7 +161,7 @@ def build_dion_optimizer(
     config: "_DionFamilyConfig",
     model: nn.Module,
     *,
-    device_mesh: Optional[Any] = None,
+    device_mesh: Any | None = None,
     mesh_kwarg: str | None = "distributed_mesh",
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """

@@ -557,6 +557,47 @@ def test_producer_main_resume_rejects_changed_config(monkeypatch, tmp_path):
     assert read_manifest(str(tmp_path)) == manifest_before
 
 
+def test_manifest_records_dataset_identity_fields(monkeypatch, tmp_path):
+    """The manifest must record the dataset-identity fields so a reordering
+    resume can be detected; num_samples / selected_token_ids are order-invariant."""
+    _patch_producer(monkeypatch, num_samples=5, batch_size=2)
+    assert pe.main(_producer_argv(tmp_path, extra=["--shuffle-seed", "42"])) == 0
+    manifest = read_manifest(str(tmp_path))
+    assert manifest["input_data"] == "fake-data"
+    assert manifest["shuffle_seed"] == 42
+    assert "split" in manifest
+
+
+def test_producer_main_resume_rejects_changed_shuffle_seed(monkeypatch, tmp_path):
+    """--resume with a different --shuffle-seed must refuse: the dataset is
+    reordered, so appended shards would interleave a second ordering while
+    num_samples and the frequency-based selected_token_ids stay byte-identical."""
+    _patch_producer(monkeypatch, num_samples=5, batch_size=2)
+    assert pe.main(_producer_argv(tmp_path, extra=["--shuffle-seed", "42"])) == 0
+    manifest_before = read_manifest(str(tmp_path))
+
+    _patch_producer(monkeypatch, num_samples=5, batch_size=2)
+    with pytest.raises(ValueError, match="mismatched fields.*shuffle_seed"):
+        pe.main(_producer_argv(tmp_path, extra=["--resume", "--shuffle-seed", "7"]))
+
+    # The refused run must not touch the recorded manifest or shards.
+    assert read_manifest(str(tmp_path)) == manifest_before
+    assert sorted(existing_shard_indices(str(tmp_path))) == [0, 1, 2]
+
+
+def test_producer_main_resume_rejects_changed_input_data(monkeypatch, tmp_path):
+    """--resume against a different --input-data must refuse even at the same
+    sample count: a same-sized slice of another dataset yields shards indexed
+    under an unrelated sample order."""
+    _patch_producer(monkeypatch, num_samples=5, batch_size=2)
+    assert pe.main(_producer_argv(tmp_path)) == 0
+
+    _patch_producer(monkeypatch, num_samples=5, batch_size=2)
+    argv = [a if a != "fake-data" else "other-data" for a in _producer_argv(tmp_path, extra=["--resume"])]
+    with pytest.raises(ValueError, match="mismatched fields.*input_data"):
+        pe.main(argv)
+
+
 def test_producer_main_resume_rejects_shards_without_manifest(monkeypatch, tmp_path):
     """--resume against shards whose manifest is gone cannot verify compatibility."""
     _patch_producer(monkeypatch, num_samples=5, batch_size=2)
@@ -637,3 +678,54 @@ def test_load_safetensors_missing_raises(monkeypatch):
 def test_trainer_module_rejects_nonpositive_ttt_steps():
     with pytest.raises(ValueError, match="ttt_steps"):
         _build_module(ttt_steps=0)
+
+
+def test_parser_mask_option_flags():
+    parser = _build_parser()
+    args = parser.parse_args(_producer_argv("out"))
+    assert (args.mask_reasoning_content, args.mask_generation_prompt) == (False, False)
+    args = parser.parse_args(_producer_argv("out", extra=["--mask-reasoning-content", "--mask-generation-prompt"]))
+    assert (args.mask_reasoning_content, args.mask_generation_prompt) == (True, True)
+
+
+def test_producer_forwards_mask_options_to_dataloader_and_manifest(monkeypatch, tmp_path):
+    """The cached loss_mask is produced by the dataloader, so the flags must reach it and
+    be recorded so the trainer can refuse a cache built with other settings."""
+    _patch_producer(monkeypatch, num_samples=2, batch_size=2)
+    loader_factory = pe.build_eagle3_dataloader
+    seen = {}
+
+    def spy(**kwargs):
+        seen.update(kwargs)
+        return loader_factory(**kwargs)
+
+    monkeypatch.setattr(pe, "build_eagle3_dataloader", spy)
+    assert pe.main(_producer_argv(tmp_path, extra=["--mask-reasoning-content", "--mask-generation-prompt"])) == 0
+    assert (seen["mask_reasoning_content"], seen["mask_generation_prompt"]) == (True, True)
+    manifest = read_manifest(str(tmp_path))
+    assert (manifest["mask_reasoning_content"], manifest["mask_generation_prompt"]) == (True, True)
+
+    _patch_producer(monkeypatch, num_samples=2, batch_size=2)
+    monkeypatch.setattr(pe, "build_eagle3_dataloader", spy)
+    assert pe.main(_producer_argv(tmp_path / "off")) == 0
+    assert (seen["mask_reasoning_content"], seen["mask_generation_prompt"]) == (False, False)
+    manifest = read_manifest(str(tmp_path / "off"))
+    assert (manifest["mask_reasoning_content"], manifest["mask_generation_prompt"]) == (False, False)
+
+
+def test_legacy_manifest_without_mask_options_reads_and_resumes_as_false(monkeypatch, tmp_path):
+    """The producer never had mask flags before, so a manifest without them was built with both off."""
+    _patch_producer(monkeypatch, num_samples=2, batch_size=2)
+    assert pe.main(_producer_argv(tmp_path)) == 0
+    legacy = read_manifest(str(tmp_path))
+    del legacy["mask_reasoning_content"], legacy["mask_generation_prompt"]
+    write_manifest(str(tmp_path), legacy)
+
+    manifest = read_manifest(str(tmp_path))
+    assert (manifest["mask_reasoning_content"], manifest["mask_generation_prompt"]) == (False, False)
+    # Resuming under the default matches the legacy cache; the flag does not.
+    _patch_producer(monkeypatch, num_samples=2, batch_size=2)
+    assert pe.main(_producer_argv(tmp_path, extra=["--resume"])) == 0
+    _patch_producer(monkeypatch, num_samples=2, batch_size=2)
+    with pytest.raises(ValueError, match="mismatched fields.*mask_generation_prompt"):
+        pe.main(_producer_argv(tmp_path, extra=["--resume", "--mask-generation-prompt"]))

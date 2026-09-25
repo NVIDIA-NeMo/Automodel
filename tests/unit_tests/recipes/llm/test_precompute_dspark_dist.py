@@ -116,6 +116,7 @@ _IDENTITY_KWARGS = dict(
     shuffle_seed=42,
     mask_reasoning_content=False,
     chat_template_sha256="0" * 64,
+    mask_generation_prompt=False,
 )
 
 
@@ -146,6 +147,7 @@ def test_build_manifest_schema():
     assert manifest["train_split"] == "train"
     assert manifest["shuffle_seed"] == 42
     assert manifest["mask_reasoning_content"] is False
+    assert manifest["mask_generation_prompt"] is False
     assert manifest["chat_template_sha256"] == "0" * 64
 
 
@@ -179,6 +181,7 @@ def test_ensure_output_dir_compatible_rejects_different_input_identity(tmp_path)
         ("train_split", "train[:50]"),
         ("shuffle_seed", 7),
         ("mask_reasoning_content", True),
+        ("mask_generation_prompt", True),
         ("chat_template_sha256", "f" * 64),
     ]:
         with pytest.raises(ValueError, match=field):
@@ -239,7 +242,10 @@ def test_build_target_rejects_minimax():
 
 @pytest.mark.parametrize(
     "model_type,builder_attr",
-    [(pdd._DEEPSEEK_V4_MODEL_TYPE, "build_deepseek_v4_target"), (pdd._GLM_5_2_MODEL_TYPE, "build_glm_5_2_target")],
+    [
+        (pdd._DEEPSEEK_V4_MODEL_TYPE, "build_deepseek_v4_target"),
+        (pdd._GLM_5_2_MODEL_TYPE, "build_glm_5_2_target"),
+    ],
 )
 def test_build_target_dispatches_sharded_builders(monkeypatch, model_type, builder_attr):
     captured = {}
@@ -263,6 +269,58 @@ def test_build_target_dispatches_sharded_builders(monkeypatch, model_type, build
     assert captured["world_size"] == 16
     assert captured["target_path"] == "big"
     assert captured["trust_remote_code"] is True
+
+
+@pytest.mark.parametrize("custom_backends", [False, True])
+def test_build_target_dispatches_model_owned_v41_config(monkeypatch, custom_backends):
+    captured = {}
+    setup = object()
+    model = SimpleNamespace(config="target-config")
+
+    def _fake_setup(cfg, world_size):
+        captured["world_size"] = world_size
+        return setup
+
+    def _fake_build(self, **kwargs):
+        captured["options"] = self
+        captured.update(kwargs)
+        return model
+
+    monkeypatch.setattr(pdd, "create_distributed_setup_from_config", _fake_setup)
+    monkeypatch.setattr(pdd.DeepseekV41DSparkTargetConfig, "build", _fake_build)
+    overrides = (
+        dict(
+            target_attn_backend="eager",
+            target_dispatcher="torch",
+            target_experts="torch",
+            target_enable_fsdp_optimizations=False,
+        )
+        if custom_backends
+        else {}
+    )
+    config, actual = pdd._build_target(
+        cfg=_Cfg(),
+        recipe_cfg=_recipe_cfg(**overrides),
+        world_size=64,
+        device=torch.device("cuda"),
+        compute_dtype=torch.bfloat16,
+        model_type=pdd._DEEPSEEK_V41_MODEL_TYPE,
+        target_path="deepseek-v41",
+        trust_remote_code=True,
+    )
+    assert config == "target-config"
+    assert actual is model
+    assert captured["world_size"] == 64
+    assert captured["distributed_setup"] is setup
+    assert captured["device"] == torch.device("cuda")
+    assert captured["compute_dtype"] == torch.bfloat16
+    options = captured["options"]
+    assert options.target_path == "deepseek-v41"
+    assert options.trust_remote_code is True
+    assert options.attn_backend == ("eager" if custom_backends else "tilelang")
+    assert options.dispatcher == ("torch" if custom_backends else "hybridep")
+    assert options.experts == ("torch" if custom_backends else "torch_mm")
+    assert options.enable_fsdp_optimizations is not custom_backends
 
 
 def test_build_target_generic_replicated_path(monkeypatch):
@@ -402,10 +460,12 @@ def test_run_writes_cache_single_process(monkeypatch, tmp_path):
         lambda *_a, **_k: SimpleNamespace(chat_template="{{ messages }}", apply_chat_template=lambda *a, **k: None),
     )
     monkeypatch.setattr(pdd, "HFDSparkTargetModel", _FakeWrapper)
+    loader_kwargs = {}
     monkeypatch.setattr(
         pdd,
         "build_eagle3_dataloader",
-        lambda **_kw: DataLoader(
+        lambda **_kw: loader_kwargs.update(_kw)
+        or DataLoader(
             _TokenDataset(3),
             batch_size=2,
             shuffle=False,
@@ -418,13 +478,16 @@ def test_run_writes_cache_single_process(monkeypatch, tmp_path):
     cfg = _Cfg(
         {
             "dist_env": {"backend": "gloo"},
-            "recipe_args": _recipe_cfg(cache_output_dir=cache_dir),
+            "recipe_args": _recipe_cfg(cache_output_dir=cache_dir, mask_generation_prompt=True),
         }
     )
     assert pdd.run(cfg) == 0
 
     manifest = read_manifest(cache_dir)
     assert manifest["num_samples"] == 3
+    # The loss-mask option reaches both the dataloader and the recorded input identity.
+    assert loader_kwargs["mask_generation_prompt"] is True
+    assert manifest["mask_generation_prompt"] is True
     assert manifest["target_layer_ids"] == _LAYERS
     dataset = CachedDSparkDataset(cache_dir)
     assert len(dataset) == 3
@@ -453,3 +516,25 @@ def test_main_parses_config_and_runs(monkeypatch):
     monkeypatch.setattr(pdd, "run", _fake_run)
     assert pdd.main("some.yaml") == 0
     assert seen["cfg"] is sentinel_cfg
+
+
+def test_manifest_without_mask_generation_prompt_matches_default(tmp_path):
+    """Caches written before the field existed compare as ``mask_generation_prompt=False``."""
+    from nemo_automodel.components.datasets.llm.dspark_cache import (
+        manifest_mismatch_fields,
+        read_manifest,
+        write_manifest,
+    )
+
+    current = pdd.build_cache_manifest(**_manifest_kwargs())
+    legacy = {k: v for k, v in current.items() if k != "mask_generation_prompt"}
+    write_manifest(str(tmp_path), legacy)
+
+    # The reader fills the field in, so the legacy cache compares (and trains) as False.
+    recorded = read_manifest(str(tmp_path), allow_incomplete=True)
+    assert recorded["mask_generation_prompt"] is False
+    assert manifest_mismatch_fields(recorded, current) == []
+    assert manifest_mismatch_fields(
+        recorded, pdd.build_cache_manifest(**_manifest_kwargs(mask_generation_prompt=True))
+    ) == ["mask_generation_prompt"]
+    pdd._ensure_output_dir_compatible(str(tmp_path), current)  # no raise

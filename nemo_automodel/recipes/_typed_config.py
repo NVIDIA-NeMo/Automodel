@@ -21,8 +21,8 @@ recipe body only ever sees typed component configs and calls
 
 Known sections are exposed as cached, typed attributes that own a ``build()`` or
 ``apply()``: ``wandb``/``mlflow``/``step_scheduler``/``lr_scheduler``/``prewarm``/
-``embedding_row_repair`` map to component config dataclasses; the ``optimizer``
-and ``loss_fn`` blocks resolve to a component
+``embedding_row_repair``/``mfu``/``domain_mixture`` map to component config
+dataclasses; the ``optimizer`` and ``loss_fn`` blocks resolve to a component
 :class:`~nemo_automodel.components.optim.optimizer.OptimizerConfig` /
 :class:`~nemo_automodel.components.loss.loss.LossConfig` via
 ``build_optimizer_config`` / ``build_loss_config`` (which own a ``build()``),
@@ -51,6 +51,7 @@ from nemo_automodel.components.optim.optimizer import LRSchedulerConfig
 from nemo_automodel.components.training.step_scheduler import StepSchedulerConfig
 
 if TYPE_CHECKING:
+    from nemo_automodel._transformers.mfu import MFUConfig
     from nemo_automodel.components.checkpoint.config import CheckpointingConfig
     from nemo_automodel.components.config.loader import ConfigNode
     from nemo_automodel.components.datasets.diffusion.loader import DiffusionDataloaderConfig
@@ -60,6 +61,7 @@ if TYPE_CHECKING:
     from nemo_automodel.components.loss.loss import LossConfig
     from nemo_automodel.components.loss.mtp import MTPLossConfig
     from nemo_automodel.components.optim.optimizer import OptimizerConfig
+    from nemo_automodel.components.training.domain_mixture import DomainMixtureConfig
     from nemo_automodel.components.training.embedding_row_repair import EmbeddingRowRepairConfig
     from nemo_automodel.components.training.prewarm import PrewarmConfig
 
@@ -131,7 +133,7 @@ class RecipeConfig:
     """Typed view over the YAML config consumed by recipes.
 
     ``wandb``, ``mlflow``, ``step_scheduler``, ``lr_scheduler``, ``optimizer``,
-    ``loss_fn`` and ``checkpoint`` are exposed as typed objects (``optimizer`` is an
+    ``loss_fn``, ``domain_mixture`` and ``checkpoint`` are exposed as typed objects (``optimizer`` is an
     :class:`~nemo_automodel.components.optim.optimizer.OptimizerConfig`,
     ``checkpoint`` a
     :class:`~nemo_automodel.components.checkpoint.config.CheckpointingConfig`);
@@ -375,6 +377,10 @@ class RecipeConfig:
         from nemo_automodel.components.datasets.vlm.neat_packing_vlm import NeatPackConfig
 
         target, dataset_kwargs = _callable_and_kwargs(dataset_node)
+        # `tokenizer`/`processor` are runtime build args, not declarative dataset fields.
+        # Drop them here as the LLM path (`_resolve_dataloader`) does, so a `dataset.tokenizer`
+        # block (valid on the LLM path) does not reach the dataset config, which rejects unknown fields.
+        dataset_kwargs.pop("tokenizer", None)
         chat_template = dataset_kwargs.pop("chat_template", None)
         legacy_packing = dataset_kwargs.pop("packing", None)
         dataset_pretokenize = dataset_kwargs.pop("pretokenize", None)
@@ -555,6 +561,12 @@ class RecipeConfig:
         return self.resolve_diffusion_dataloader(node) if node is not None else None
 
     @cached_property
+    def diffusion_validation_dataloader(self) -> "DiffusionDataloaderConfig" | None:
+        """Typed diffusion validation dataloader config resolved from ``data.validation_dataloader``."""
+        node = self._raw.get("data.validation_dataloader", None)
+        return self.resolve_diffusion_dataloader(node) if node is not None else None
+
+    @cached_property
     def bagel_dataloader(self) -> "BagelDataloaderConfig" | None:
         """Typed packed-dataset and dataloader config for BAGEL recipes."""
         from nemo_automodel.components.datasets.multimodal.datasets import BagelDatasetConfig
@@ -601,8 +613,8 @@ class RecipeConfig:
     @cached_property
     def mtp(self) -> "MTPLossConfig":
         # MTP loss params are model-driven (scaling_factor comes from the model
-        # output / get_mtp_loss_scaling_factor; ignore_index is fixed) and are not
-        # exposed via YAML.  This typed accessor just lets recipes build MTP through
+        # output / get_mtp_loss_scaling_factor; ignore_index comes from the loss)
+        # and are not exposed via YAML. This typed accessor lets recipes build MTP through
         # the typed-config boundary like the other sections.
         from nemo_automodel.components.loss.mtp import MTPLossConfig
 
@@ -616,11 +628,35 @@ class RecipeConfig:
         return PrewarmConfig(**_section_kwargs(node)) if node else None
 
     @cached_property
+    def mfu(self) -> "MFUConfig":
+        from nemo_automodel._transformers.mfu import MFUConfig
+
+        node = self._raw.get("mfu", None)
+        return MFUConfig(**_section_kwargs(node)) if node else MFUConfig()
+
+    @cached_property
     def embedding_row_repair(self) -> "EmbeddingRowRepairConfig | None":
         from nemo_automodel.components.training.embedding_row_repair import EmbeddingRowRepairConfig
 
         node = self._raw.get("embedding_row_repair", None)
         return EmbeddingRowRepairConfig(**_section_kwargs(node)) if node else None
+
+    @cached_property
+    def domain_mixture(self) -> "DomainMixtureConfig | None":
+        """Resolve the optional named-domain objective configuration."""
+        from nemo_automodel.components.training.domain_mixture import DomainMixtureConfig, DomainWeightConfig
+
+        node = self._raw.get("domain_mixture", None)
+        if node is None:
+            return None
+        kwargs = _section_kwargs(node)
+        domains = kwargs.pop("domains", None)
+        if domains is None:
+            raise ValueError("domain_mixture.domains is required")
+        return DomainMixtureConfig(
+            domains=tuple(DomainWeightConfig(**_as_dict(domain)) for domain in domains),
+            **kwargs,
+        )
 
     @cached_property
     def checkpoint(self) -> "CheckpointingConfig":

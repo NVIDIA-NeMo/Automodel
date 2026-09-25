@@ -24,7 +24,7 @@ This is a self-contained implementation that includes all necessary components:
 import logging
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Tuple, Union
 
 import numpy as np
 import torch
@@ -94,18 +94,18 @@ class KimiK25VLConfig(PretrainedConfig):
 
     def __init__(
         self,
-        vision_config: Optional[Union[Dict, MoonViT3dConfig]] = None,
-        text_config: Optional[Union[Dict, DeepseekV3Config]] = None,
+        vision_config: Union[Dict, MoonViT3dConfig] | None = None,
+        text_config: Union[Dict, DeepseekV3Config] | None = None,
         ignore_index: int = -100,
         media_placeholder_token_id: int = 163605,
         pad_token_id: int = 0,
         tie_word_embeddings: bool = False,  # Must be False for pipeline parallelism
         # MM Projector parameters
         mm_projector_type: str = "patchmerger",
-        mm_hidden_size: Optional[int] = None,
+        mm_hidden_size: int | None = None,
         projector_hidden_act: str = "gelu",
         projector_ln_eps: float = 1e-5,
-        architectures: Optional[List[str]] = None,
+        architectures: List[str] | None = None,
         **kwargs,
     ):
         if vision_config is None:
@@ -117,6 +117,10 @@ class KimiK25VLConfig(PretrainedConfig):
         if text_config is None:
             text_config = DeepseekV3Config()
         elif isinstance(text_config, dict):
+            text_config = text_config.copy()
+            quantization_config = text_config.pop("quantization_config", None)
+            if quantization_config is not None:
+                kwargs.setdefault("quantization_config", quantization_config)
             text_config = DeepseekV3Config(**text_config)
         self.text_config = text_config
 
@@ -680,8 +684,8 @@ class KimiK25VLModel(nn.Module):
         inputs_embeds: torch.Tensor,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-        labels: Optional[torch.Tensor] = None,
-        target_seq_length: Optional[int] = None,
+        labels: torch.Tensor | None = None,
+        target_seq_length: int | None = None,
     ):
         """Merge image features into input embeddings.
 
@@ -1009,7 +1013,7 @@ class KimiK25VLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDP
         labels=None,
         use_cache=None,
         output_attentions=None,
-        output_hidden_states: Optional[bool] = None,
+        output_hidden_states: bool | None = None,
         return_dict=None,
         pixel_values=None,
         grid_thws=None,

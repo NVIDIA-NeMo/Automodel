@@ -118,6 +118,11 @@ class _SupportedVisionModel:
     supports_cp_vision_frame_sharding = True
 
 
+class _PackedCPModel:
+    def __init__(self, *, supported):
+        self.supports_cp_with_sequence_packing = supported
+
+
 def test_cp_vision_frame_sharding_rejects_model_without_capability():
     policy = CpVisionFrameShardingConfig(enabled=True)
 
@@ -138,6 +143,32 @@ def test_disabled_cp_vision_frame_sharding_accepts_model_without_capability():
     policy = CpVisionFrameShardingConfig(enabled=False)
 
     vlm_finetune._validate_cp_vision_frame_sharding_support(_UnsupportedVisionModel(), policy)
+
+
+def test_packed_cp_rejects_unsupported_qwen_backend_before_dataloader_build():
+    with pytest.raises(ValueError, match="Disable sequence packing, use cp_size=1"):
+        vlm_finetune._validate_cp_packing_support(
+            _PackedCPModel(supported=False),
+            packing_enabled=True,
+            cp_size=8,
+        )
+
+
+@pytest.mark.parametrize(("packing_enabled", "cp_size"), [(False, 8), (True, 1)])
+def test_packed_cp_validation_is_inactive_without_composed_path(packing_enabled, cp_size):
+    vlm_finetune._validate_cp_packing_support(
+        _PackedCPModel(supported=False),
+        packing_enabled=packing_enabled,
+        cp_size=cp_size,
+    )
+
+
+def test_packed_cp_accepts_model_owned_backend():
+    vlm_finetune._validate_cp_packing_support(
+        _PackedCPModel(supported=True),
+        packing_enabled=True,
+        cp_size=8,
+    )
 
 
 def test_cp_vision_frame_sharding_context_resets_published_group_after_failure(monkeypatch):
@@ -209,7 +240,10 @@ class _PPSpy(SimpleNamespace):
         return self.info.schedule.step(*schedule_args, target=target, losses=losses, **kwargs)
 
 
-def test_forward_backward_step_pp_cp_first_stage_sunk_keeps_input_ids_full(monkeypatch):
+@pytest.mark.parametrize(("pp_microbatch_size", "expected_chunks"), [(1, 2), (2, 1)])
+def test_forward_backward_step_pp_cp_first_stage_sunk_keeps_input_ids_full(
+    monkeypatch, pp_microbatch_size, expected_chunks
+):
     """Sunk model on the FIRST PP stage under CP: the sharder-only hook is invoked
     (consumes nothing), so input_ids stays full-length, update_seq_len sees the
     full seq_len, and the full-length input_ids is fed to the pipeline schedule
@@ -227,7 +261,8 @@ def test_forward_backward_step_pp_cp_first_stage_sunk_keeps_input_ids_full(monke
     recipe.model_parts = [model]
     recipe.pp_enabled = True
     recipe.pp = _PPSpy(
-        pp_microbatch_size=2,
+        pp_batch_size=2,
+        pp_microbatch_size=pp_microbatch_size,
         info=SimpleNamespace(
             has_first_stage=True,
             has_last_stage=True,
@@ -273,6 +308,7 @@ def test_forward_backward_step_pp_cp_first_stage_sunk_keeps_input_ids_full(monke
     )
 
     assert len(model.calls) == 1
+    assert model.calls[0]["num_chunks"] == expected_chunks
     # Sharder-only: input_ids stays full, no inputs_embeds injected.
     assert "input_ids" in seen_cp_batch
     assert tuple(seen_cp_batch["input_ids"].shape) == (2, 6)
@@ -300,7 +336,7 @@ class _SunkSpyVLM:
         raise AssertionError("CP prepare must call prepare_model_inputs_for_cp directly, not __call__")
 
 
-def _run_nonfirst_stage_fbstep(monkeypatch, model):
+def _run_nonfirst_stage_fbstep(monkeypatch, model, *, pp_microbatch_size):
     """Drive _forward_backward_step for a non-first (has_first_stage=False) PP+CP stage."""
     labels = torch.arange(12, dtype=torch.long).reshape(2, 6)
     schedule = _ScheduleSpy()
@@ -313,7 +349,8 @@ def _run_nonfirst_stage_fbstep(monkeypatch, model):
     recipe.model_parts = [model]
     recipe.pp_enabled = True
     recipe.pp = _PPSpy(
-        pp_microbatch_size=2,
+        pp_batch_size=2,
+        pp_microbatch_size=pp_microbatch_size,
         info=SimpleNamespace(
             has_first_stage=False,
             has_last_stage=True,
@@ -354,17 +391,23 @@ def _run_nonfirst_stage_fbstep(monkeypatch, model):
     return seen_cp_batch, seq_lens, recipe.pp.step_batches, schedule.calls
 
 
-def test_forward_backward_step_pp_cp_sunk_model_nonfirst_stage_invokes_hook_keeps_input_ids_full(monkeypatch):
+@pytest.mark.parametrize(("pp_microbatch_size", "expected_chunks"), [(1, 2), (2, 1)])
+def test_forward_backward_step_pp_cp_sunk_model_nonfirst_stage_invokes_hook_keeps_input_ids_full(
+    monkeypatch, pp_microbatch_size, expected_chunks
+):
     """Regression: a sunk model must invoke its sharder-only hook on NON-first PP
     stages under cp>1, so input_ids stays full-length and update_seq_len (which
     drives the CP-aware stage metas) sees the FULL seq_len — not the local length
     the generic sharder would produce, which would ÷cp a second time and truncate
     the inter-stage hidden (the text-decoder RoPE size mismatch)."""
     model = _SunkSpyVLM()
-    seen_cp_batch, seq_lens, step_batches, schedule_calls = _run_nonfirst_stage_fbstep(monkeypatch, model)
+    seen_cp_batch, seq_lens, step_batches, schedule_calls = _run_nonfirst_stage_fbstep(
+        monkeypatch, model, pp_microbatch_size=pp_microbatch_size
+    )
 
     # Hook invoked on the non-first stage (this is the fix).
     assert len(model.calls) == 1
+    assert model.calls[0]["num_chunks"] == expected_chunks
     # Sharder-only hook consumes nothing: input_ids stays full-length (seq=6).
     assert "input_ids" in seen_cp_batch
     assert tuple(seen_cp_batch["input_ids"].shape) == (2, 6)

@@ -43,8 +43,6 @@ flash-attention remain follow-ups (orthogonal to the MLA attention this file add
 
 from __future__ import annotations
 
-from typing import Optional
-
 import torch
 import torch.nn as nn
 from transformers import PretrainedConfig, PreTrainedModel
@@ -351,7 +349,7 @@ class DeepseekV3Eagle3DraftModel(PreTrainedModel):
         self.target_hidden_size = getattr(config, "target_hidden_size", config.hidden_size)
         self.draft_vocab_size = getattr(config, "draft_vocab_size", config.vocab_size)
 
-        self.model = Eagle3DeepseekModel(config)
+        self.model = self._build_inner_model(config)
         self.lm_head = nn.Linear(config.hidden_size, self.draft_vocab_size, bias=False)
 
         # d2t/t2d only when the draft vocab is compressed (matches draft_llama).
@@ -361,6 +359,19 @@ class DeepseekV3Eagle3DraftModel(PreTrainedModel):
             self.register_buffer("t2d", torch.zeros(config.vocab_size, dtype=torch.bool), persistent=True)
 
         self.post_init()
+
+    def _build_inner_model(self, config: PretrainedConfig) -> nn.Module:
+        """Build the inner backbone.
+
+        A subclass that keeps this class's EAGLE-3 API but swaps the backbone overrides
+        this one method; the returned module must expose ``embed_tokens``, ``fc``, the
+        optional ``fc_norm``, ``layers`` and ``norm``.
+        """
+        return Eagle3DeepseekModel(config)
+
+    def freeze_embeddings(self) -> None:
+        """Freeze the draft input embeddings (matches ``LlamaEagle3DraftModel``)."""
+        self.model.embed_tokens.weight.requires_grad_(False)
 
     def copy_embeddings_from_target(self, target_embedding: nn.Embedding) -> None:
         """Seed the draft embedding table from the (possibly FSDP-sharded) target embeddings."""
@@ -409,9 +420,9 @@ class DeepseekV3Eagle3DraftModel(PreTrainedModel):
         input_ids: torch.Tensor,
         projected_hidden_states: torch.Tensor,
         attention_mask: torch.Tensor,
-        position_ids: Optional[torch.Tensor] = None,
-        cache_hidden: Optional[list[list[torch.Tensor]]] = None,
-        seq_lens: Optional[torch.Tensor] = None,
+        position_ids: torch.Tensor | None = None,
+        cache_hidden: list[list[torch.Tensor]] | None = None,
+        seq_lens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run one EAGLE-3 TTT draft step (eager attention).
 
@@ -435,7 +446,7 @@ class DeepseekV3Eagle3DraftModel(PreTrainedModel):
             # would give every document after the first a global (wrong) RoPE
             # phase. Fail loud, matching the target-side guard in target.py.
             raise ValueError(
-                "DeepseekV3Eagle3DraftModel: sequence packing (seq_lens) requires per-document "
+                f"{type(self).__name__}: sequence packing (seq_lens) requires per-document "
                 "position_ids (reset to range(doc_len) within each document), but none were provided."
             )
         if position_ids is None:

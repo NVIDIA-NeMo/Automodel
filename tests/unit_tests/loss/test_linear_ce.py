@@ -21,6 +21,65 @@ from nemo_automodel.components.loss.linear_ce import (
 )
 
 
+class _FakeMesh:
+    ndim = 1
+
+    @staticmethod
+    def size():
+        return 2
+
+
+class _FakeDTensor:
+    requires_grad = True
+    device_mesh = _FakeMesh()
+
+    def __init__(self):
+        self.grad_placements = None
+        self.full = torch.ones(4, requires_grad=True)
+
+    def full_tensor(self, *, grad_placements=None):
+        self.grad_placements = grad_placements
+        return self.full
+
+
+def test_flce_materialized_weight_reduces_partial_gradient_into_shard(monkeypatch):
+    from torch.distributed.tensor import Partial
+
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
+    weight = _FakeDTensor()
+    raw_grads = []
+
+    def capture_raw_grad(grad):
+        raw_grads.append(grad)
+        return grad
+
+    weight.full.register_hook(capture_raw_grad)
+
+    full = FusedLinearCrossEntropy.materialize_lm_weight(
+        weight,
+        grad_reduce_group=object(),
+    )
+    full.square().sum().backward()
+
+    assert len(weight.grad_placements) == 1
+    assert isinstance(weight.grad_placements[0], Partial)
+    # The normalization hook must return a new tensor instead of modifying the
+    # gradient object received by earlier hooks.
+    assert torch.equal(raw_grads[0], torch.full_like(weight.full, 2.0))
+    # Raw grad is 2; divide by the two-rank reduction world size restores 1.
+    assert torch.equal(weight.full.grad, torch.ones_like(weight.full))
+
+
+def test_flce_materialized_weight_rejects_mismatched_reduction_group(monkeypatch):
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 4)
+
+    with pytest.raises(ValueError, match="mesh size=2, reduction group size=4"):
+        FusedLinearCrossEntropy.materialize_lm_weight(
+            _FakeDTensor(),
+            grad_reduce_group=object(),
+        )
+
+
 @pytest.mark.skipif(not HAVE_CUT_CROSS_ENTROPY, reason="Linear loss CE is not installed")
 def test_fused_cross_entropy():
     """Tests FusedLinearCrossEntropy against PyTorch's CE.
@@ -177,7 +236,7 @@ def test_fused_cross_entropy_normalizes_by_num_tokens(monkeypatch):
     def _fake_linear_ce(hidden, weight, targets=None, **kwargs):  # noqa: D401,E501 - signature match not required
         return torch.tensor(20.0)
 
-    monkeypatch.setattr(linear_ce_mod, "linear_cross_entropy", _fake_linear_ce)
+    monkeypatch.setattr(linear_ce_mod, "linear_cross_entropy", _fake_linear_ce, raising=False)
 
     loss_fn = linear_ce_mod.FusedLinearCrossEntropy(reduction="sum")
 
@@ -191,3 +250,61 @@ def test_fused_cross_entropy_normalizes_by_num_tokens(monkeypatch):
     # The stub returns 20, so after division by 10 we expect 2.0
     assert torch.is_tensor(out)
     assert out.item() == pytest.approx(2.0)
+
+
+def test_fused_cross_entropy_applies_per_token_weights(monkeypatch):
+    """The fused path requests unreduced values before applying objective weights."""
+    from nemo_automodel.components.loss import linear_ce as linear_ce_mod
+
+    monkeypatch.setattr(linear_ce_mod, "HAVE_CUT_CROSS_ENTROPY", True)
+    captured = {}
+
+    def _fake_linear_ce(hidden, weight, targets=None, **kwargs):
+        captured["reduction"] = kwargs["reduction"]
+        return torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+
+    monkeypatch.setattr(linear_ce_mod, "linear_cross_entropy", _fake_linear_ce, raising=False)
+    loss_weights = torch.tensor([[0.5, 0.5], [1.5, 1.5]])
+    out = linear_ce_mod.FusedLinearCrossEntropy(reduction="sum")(
+        torch.randn(2, 2, 3),
+        torch.zeros(2, 2, dtype=torch.long),
+        torch.randn(5, 3),
+        num_label_tokens=4,
+        loss_weights=loss_weights,
+    )
+
+    assert captured["reduction"] == "none"
+    assert out.item() == pytest.approx((0.5 + 1.0 + 4.5 + 6.0) / 4)
+
+
+@pytest.mark.skipif(not HAVE_CUT_CROSS_ENTROPY or not torch.cuda.is_available(), reason="requires fused CE on CUDA")
+def test_fused_weighted_cross_entropy_matches_pytorch_gradient():
+    """A real fused kernel must match the weighted PyTorch loss and gradients."""
+    torch.manual_seed(3)
+    hidden = torch.randn(2, 3, 8, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    weight = torch.randn(13, 8, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    labels = torch.tensor([[1, 2, -100], [3, 4, 5]], device="cuda")
+    loss_weights = torch.tensor([[0.5] * 3, [1.5] * 3], device="cuda")
+
+    loss = FusedLinearCrossEntropy()(
+        hidden,
+        labels,
+        weight,
+        num_label_tokens=5,
+        loss_weights=loss_weights,
+    )
+    reference_hidden = hidden.detach().float().requires_grad_()
+    reference_weight = weight.detach().float().requires_grad_()
+    logits = reference_hidden @ reference_weight.T
+    per_token = F.cross_entropy(
+        logits.reshape(-1, logits.shape[-1]),
+        labels.reshape(-1),
+        reduction="none",
+    ).reshape_as(labels)
+    reference = (per_token * loss_weights).sum() / 5
+
+    torch.testing.assert_close(loss, reference)
+    loss.backward()
+    reference.backward()
+    torch.testing.assert_close(hidden.grad.float(), reference_hidden.grad, rtol=2.0e-2, atol=3.0e-3)
+    torch.testing.assert_close(weight.grad.float(), reference_weight.grad, rtol=2.0e-2, atol=3.0e-3)

@@ -142,7 +142,7 @@ model:
     linear: torch
     rms_norm: torch_fp32
     rope_fusion: false
-    experts: gmm
+    experts: torch_mm
     dispatcher: deepep
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
@@ -152,7 +152,6 @@ distributed:
   ep_size: 8            # 128 MoE experts across 8 GPUs
 
 freeze_config:
-  freeze_embeddings: true
   freeze_vision_tower: true
   freeze_audio_tower: true
   freeze_language_model: false

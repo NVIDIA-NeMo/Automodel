@@ -13,7 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Callable, Iterator, Optional
+import logging
+from typing import Any, Callable, Iterator
 
 import torch
 from torch.distributed.fsdp import FSDPModule, fully_shard
@@ -22,6 +23,8 @@ from torch.nn.parallel import DistributedDataParallel
 
 from nemo_automodel.components.models.common.utils import get_is_optim_step
 from nemo_automodel.shared.multimodal_fsdp import iter_multimodal_modules
+
+logger = logging.getLogger(__name__)
 
 
 def _iter_fsdp_modules(module: torch.nn.Module) -> Iterator[FSDPModule]:
@@ -112,11 +115,37 @@ def _configure_fsdp_module(
 
 
 def _run_post_backward_hooks(fsdp_module: FSDPModule) -> Callable:
+    """Run post-backward for every FSDP state and return the root final callback.
+
+    Both the per-state ``post_backward()`` calls and the returned callback
+    tolerate FSDP modules that never ran forward in this step. With
+    ``FusedLinearCrossEntropy`` under pipeline parallelism the ``lm_head``
+    weight is consumed inside the loss function, so its FSDP module never
+    runs forward and its ``FSDPCommContext`` is never lazily initialized;
+    ``post_backward()`` then raises ``AttributeError`` (``'FSDPCommContext'
+    object has no attribute 'post_forward_order'``). A never-forwarded group
+    has no gradients to reduce, so it is safe to skip.
+    """
     fsdp_state = fully_shard.state(fsdp_module)  # type: ignore[attr-defined]
     for state in fsdp_state._state_ctx.all_states:
         if state._fsdp_param_group:
-            state._fsdp_param_group.post_backward()
-    return fsdp_state._root_post_backward_final_callback
+            try:
+                state._fsdp_param_group.post_backward()
+            except AttributeError as exc:
+                if "post_forward_order" not in str(exc):
+                    raise
+                logger.debug("Skipping post_backward for never-forwarded FSDP group: %s", exc)
+                continue
+
+    def _final_callback() -> None:
+        try:
+            fsdp_state._root_post_backward_final_callback()
+        except AttributeError as exc:
+            if "post_forward_order" not in str(exc):
+                raise
+            logger.debug("Skipping root post-backward callback for never-forwarded FSDP root: %s", exc)
+
+    return _final_callback
 
 
 class MoEFSDPSyncMixin:
@@ -223,7 +252,7 @@ def patched_backward_maybe_with_nosync(
     backward_type,
     bwd_kwargs: dict,
     last_backward: bool = False,
-) -> tuple[tuple[Optional[torch.Tensor], ...], Optional[list[dict[str, Any]]]]:
+) -> tuple[tuple[torch.Tensor | None, ...], list[dict[str, Any]] | None]:
     """
     Whether using PP with FSDP or DDP, there are some runtime differences between the last backward step and the
     other steps.  Namely, we need to accumulate gradients on previous steps and reduce them on the last step, but
@@ -235,7 +264,7 @@ def patched_backward_maybe_with_nosync(
         backward_type,
     ) -> Callable[
         [],
-        tuple[tuple[Optional[torch.Tensor], ...], Optional[list[dict[str, Any]]]],
+        tuple[tuple[torch.Tensor | None, ...], list[dict[str, Any]] | None],
     ]:
         if backward_type == "full":
             return lambda: (

@@ -45,7 +45,7 @@ model:
     linear: te
     rms_norm: torch_fp32
     rope_fusion: false
-    experts: gmm
+    experts: torch_mm
     dispatcher: deepep
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
@@ -67,7 +67,6 @@ distributed:
   sequence_parallel: false
 
 freeze_config:
-  freeze_embeddings: false
   freeze_vision_tower: true
   freeze_audio_tower: true
   freeze_language_model: false

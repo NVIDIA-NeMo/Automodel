@@ -22,7 +22,9 @@ from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.mimo_v2_flash.state_dict_adapter import (
     NON_QUANTIZED_KEY_PATTERNS,
     MiMoV2FlashStateDictAdapter,
+    _dequantize_mxfp4,
     _should_quantize_key,
+    _split_fused_qkv,
 )
 from nemo_automodel.components.moe.config import MoEConfig
 
@@ -87,6 +89,30 @@ def adapter(hf_config, moe_config, backend_config):
     )
 
 
+@pytest.fixture
+def v26_adapter(moe_config, backend_config):
+    config = SimpleNamespace(
+        attention_projection_layout="fused_qkv",
+        quantization_config={"quant_method": "fp8", "store_dtype": "mxfp4"},
+        hybrid_layer_pattern=[0, 1],
+        hidden_size=64,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        head_dim=16,
+        v_head_dim=8,
+        swa_num_attention_heads=4,
+        swa_num_key_value_heads=4,
+        swa_head_dim=16,
+        swa_v_head_dim=8,
+    )
+    return MiMoV2FlashStateDictAdapter(
+        config=config,
+        moe_config=moe_config,
+        backend=backend_config,
+        dtype=torch.float32,
+    )
+
+
 class TestShouldQuantizeKey:
     @pytest.mark.parametrize(
         "key",
@@ -132,6 +158,15 @@ class TestMiMoV2FlashStateDictAdapterInit:
         assert adapter.backend is backend_config
         assert adapter.dtype is torch.bfloat16
         assert adapter._uses_model_prefix is True
+        assert adapter.hf_to_internal_map == {}
+        assert adapter.internal_to_hf_map == {}
+
+    def test_te_backend_registers_bidirectional_sink_mapping(self, hf_config, moe_config, backend_config):
+        backend_config.attn = "te"
+        adapter = MiMoV2FlashStateDictAdapter(hf_config, moe_config, backend_config)
+
+        assert adapter.hf_to_internal_map == {"self_attn.attention_sink_bias": "self_attn.attn_module.softmax_offset"}
+        assert adapter.internal_to_hf_map == {"self_attn.attn_module.softmax_offset": "self_attn.attention_sink_bias"}
 
 
 class TestFromHf:
@@ -172,8 +207,254 @@ class TestFromHf:
             adapter.from_hf(hf_state, device_mesh=mesh)
         assert mock_merge.call_args[0][1] is mesh
 
+    def test_te_sink_maps_to_fp32_softmax_offset(self, hf_config, moe_config, backend_config):
+        backend_config.attn = "te"
+        adapter = MiMoV2FlashStateDictAdapter(hf_config, moe_config, backend_config)
+        sink = torch.randn(4, dtype=torch.bfloat16)
+        hf_state = {"model.layers.0.self_attn.attention_sink_bias": sink}
+
+        with patch.object(adapter, "_from_hf_w_merged_experts", side_effect=lambda sd, _: sd):
+            out = adapter.from_hf(hf_state)
+
+        internal_key = "model.layers.0.self_attn.attn_module.softmax_offset"
+        assert internal_key in out
+        assert "model.layers.0.self_attn.attention_sink_bias" not in out
+        assert out[internal_key].dtype is torch.float32
+        torch.testing.assert_close(out[internal_key], sink.float())
+
+    def test_non_te_sink_key_is_unchanged(self, adapter):
+        key = "model.layers.0.self_attn.attention_sink_bias"
+        sink = torch.randn(4)
+        with patch.object(adapter, "_from_hf_w_merged_experts", side_effect=lambda sd, _: sd):
+            out = adapter.from_hf({key: sink})
+
+        assert out[key] is sink
+
+
+class TestMiMoV26CheckpointLayouts:
+    def test_mxfp4_dequantizes_low_nibble_first_and_applies_e8m0_scale(self):
+        packed = torch.tensor(
+            [[0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE] * 2],
+            dtype=torch.uint8,
+        )
+        scale = torch.tensor([[128]], dtype=torch.uint8)
+        output = _dequantize_mxfp4(packed, scale, dtype=torch.float32)
+        base = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0])
+        torch.testing.assert_close(output, torch.cat((base, base)).unsqueeze(0) * 2.0)
+
+    def test_fused_qkv_deinterleaves_checkpoint_tp4_shards(self):
+        config = SimpleNamespace(
+            hybrid_layer_pattern=[0],
+            hidden_size=3,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            head_dim=2,
+            v_head_dim=2,
+            swa_num_attention_heads=4,
+            swa_num_key_value_heads=4,
+            swa_head_dim=2,
+            swa_v_head_dim=2,
+        )
+        shards = []
+        for shard_idx in range(4):
+            query = torch.full((2, 3), float(shard_idx))
+            key = torch.full((2, 3), float(10 + shard_idx))
+            value = torch.full((2, 3), float(20 + shard_idx))
+            shards.append(torch.cat((query, key, value)))
+        query, key, value = _split_fused_qkv(
+            torch.cat(shards),
+            None,
+            config=config,
+            layer_idx=0,
+            dtype=torch.float32,
+            name="model.layers.0.self_attn.qkv_proj.weight",
+        )
+        for shard_idx in range(4):
+            assert torch.all(query[2 * shard_idx : 2 * shard_idx + 2] == shard_idx)
+            assert torch.all(key[2 * shard_idx : 2 * shard_idx + 2] == 10 + shard_idx)
+            assert torch.all(value[2 * shard_idx : 2 * shard_idx + 2] == 20 + shard_idx)
+
+    def test_quantized_load_requests_fused_qkv_and_restores_native_views(self, v26_adapter):
+        prefix = "model.layers.0.self_attn"
+        query = torch.zeros(64, 64)
+        key = torch.zeros(64, 64)
+        value = torch.zeros(32, 64)
+        native = {
+            f"{prefix}.q_proj.weight": query,
+            f"{prefix}.k_proj.weight": key,
+            f"{prefix}.v_proj.weight": value,
+        }
+
+        destinations = v26_adapter.to_hf(native, quantization=True, for_checkpoint_load=True)
+        weight_key = f"{prefix}.qkv_proj.weight"
+        scale_key = f"{weight_key}_scale_inv"
+        assert set(destinations) == {weight_key, scale_key}
+        assert destinations[weight_key].shape == (160, 64)
+        assert destinations[weight_key].dtype == torch.float8_e4m3fn
+        assert destinations[scale_key].shape == (4, 1)
+        assert destinations[scale_key].dtype == torch.float32
+
+        shards = []
+        expected_query, expected_key, expected_value = [], [], []
+        for shard_idx in range(4):
+            query_shard = torch.full((16, 64), float(shard_idx + 1))
+            key_shard = torch.full((16, 64), float(shard_idx + 5))
+            value_shard = torch.full((8, 64), float(-shard_idx - 1))
+            shards.append(torch.cat((query_shard, key_shard, value_shard)))
+            expected_query.append(query_shard)
+            expected_key.append(key_shard)
+            expected_value.append(value_shard)
+        destinations[weight_key].copy_(torch.cat(shards).to(torch.float8_e4m3fn))
+
+        with (
+            patch.object(v26_adapter, "_from_hf_w_merged_experts", side_effect=lambda state, _: state),
+            patch(
+                "nemo_automodel.components.models.mimo_v2_flash.state_dict_adapter.dequantize_from_fp8",
+                side_effect=lambda weight, _scale, dtype, name: weight.to(dtype),
+            ),
+        ):
+            restored = v26_adapter.from_hf(destinations)
+
+        assert restored[f"{prefix}.q_proj.weight"] is query
+        assert restored[f"{prefix}.k_proj.weight"] is key
+        assert restored[f"{prefix}.v_proj.weight"] is value
+        torch.testing.assert_close(query, torch.cat(expected_query))
+        torch.testing.assert_close(key, torch.cat(expected_key))
+        torch.testing.assert_close(value, torch.cat(expected_value))
+
+    def test_quantized_load_requests_mxfp4_expert_layout(self, v26_adapter):
+        prefix = "model.layers.1.mlp.experts"
+        native = {
+            f"{prefix}.gate_and_up_projs": torch.empty(4, 64, 64),
+            f"{prefix}.down_projs": torch.empty(4, 32, 64),
+        }
+        destinations = v26_adapter.to_hf(native, quantization=True, for_checkpoint_load=True)
+
+        assert len(destinations) == 24
+        assert not any(key.endswith("weight_scale_inv") for key in destinations)
+        for expert_idx in range(4):
+            for projection in ("gate", "up"):
+                weight_key = f"{prefix}.{expert_idx}.{projection}_proj.weight"
+                assert destinations[weight_key].shape == (32, 32)
+                assert destinations[weight_key].dtype == torch.uint8
+                assert destinations[f"{weight_key}_scale"].shape == (32, 2)
+                assert destinations[f"{weight_key}_scale"].dtype == torch.uint8
+            down_key = f"{prefix}.{expert_idx}.down_proj.weight"
+            assert destinations[down_key].shape == (64, 16)
+            assert destinations[down_key].dtype == torch.uint8
+            assert destinations[f"{down_key}_scale"].shape == (64, 1)
+            assert destinations[f"{down_key}_scale"].dtype == torch.uint8
+
+        for checkpoint_key, tensor in destinations.items():
+            tensor.fill_(127 if checkpoint_key.endswith("_scale") else 0)
+        restored = v26_adapter.from_hf(destinations)
+        assert restored[f"{prefix}.gate_and_up_projs"].shape == (4, 64, 64)
+        assert restored[f"{prefix}.down_projs"].shape == (4, 32, 64)
+        assert torch.count_nonzero(restored[f"{prefix}.gate_and_up_projs"]) == 0
+        assert torch.count_nonzero(restored[f"{prefix}.down_projs"]) == 0
+
+    def test_mxfp4_decode_writes_noncontiguous_load_view(self, v26_adapter):
+        key = "model.layers.1.mlp.experts.0.gate_proj.weight"
+        storage = torch.empty(32, 2)
+        destination = storage.t()
+        assert not destination.is_contiguous()
+        v26_adapter._mxfp4_load_views = {key: destination}
+        state = {
+            key: torch.zeros((2, 16), dtype=torch.uint8),
+            f"{key}_scale": torch.full((2, 1), 127, dtype=torch.uint8),
+        }
+
+        restored = v26_adapter._dequantize_mxfp4_experts(state)
+
+        assert restored[key] is destination
+        assert restored[key].data_ptr() == storage.data_ptr()
+        assert torch.count_nonzero(destination) == 0
+        assert not hasattr(v26_adapter, "_mxfp4_load_views")
+
+    def test_mxfp4_load_destinations_preserve_dtensor_global_shape(self, v26_adapter):
+        class FakeDTensor:
+            ndim = 2
+            shape = torch.Size((4096, 2048))
+            device_mesh = object()
+            placements = (object(),)
+
+            def __init__(self):
+                self.local = torch.empty(4096, 1024)
+
+            def to_local(self):
+                return self.local
+
+        packed_dtensor = Mock(shape=torch.Size((4096, 1024)))
+        scale_dtensor = Mock(shape=torch.Size((4096, 64)))
+        with patch(
+            "torch.distributed.tensor.DTensor.from_local",
+            side_effect=(packed_dtensor, scale_dtensor),
+        ) as from_local:
+            destinations = v26_adapter._make_mxfp4_load_destinations("expert.weight", FakeDTensor())
+
+        assert destinations == [("expert.weight", packed_dtensor), ("expert.weight_scale", scale_dtensor)]
+        assert from_local.call_count == 2
+        packed_local = from_local.call_args_list[0].args[0]
+        scale_local = from_local.call_args_list[1].args[0]
+        assert packed_local.shape == (4096, 512)
+        assert scale_local.shape == (4096, 32)
+        assert from_local.call_args_list[0].kwargs == {"run_check": False}
+        assert from_local.call_args_list[1].kwargs == {"run_check": False}
+
+    def test_mxfp4_decode_localizes_dtensor_buffers_and_destination(self, v26_adapter):
+        class FakeDTensor:
+            def __init__(self, local):
+                self.local = local
+                self.dtype = local.dtype
+
+            def to_local(self):
+                return self.local
+
+        key = "model.layers.1.mlp.experts.0.down_proj.weight"
+        packed = FakeDTensor(torch.zeros((2, 16), dtype=torch.uint8))
+        scale = FakeDTensor(torch.full((2, 1), 127, dtype=torch.uint8))
+        destination = FakeDTensor(torch.full((2, 32), float("nan")))
+        v26_adapter._mxfp4_load_views = {key: destination}
+
+        restored = v26_adapter._dequantize_mxfp4_experts({key: packed, f"{key}_scale": scale})
+
+        assert restored[key] is destination
+        assert torch.count_nonzero(destination.local) == 0
+        assert not hasattr(v26_adapter, "_mxfp4_load_views")
+
+    def test_fused_qkv_rejects_head_counts_not_divisible_by_checkpoint_tp(self, v26_adapter):
+        v26_adapter.config.num_attention_heads = 6
+        with pytest.raises(ValueError, match="checkpoint TP 4"):
+            _split_fused_qkv(
+                torch.empty(1, 64),
+                None,
+                config=v26_adapter.config,
+                layer_idx=0,
+                dtype=torch.float32,
+                name="model.layers.0.self_attn.qkv_proj.weight",
+            )
+
 
 class TestConvertSingleTensorToHf:
+    def test_te_softmax_offset_maps_back_to_attention_sink_bias(
+        self,
+        hf_config,
+        moe_config,
+        backend_config,
+    ):
+        backend_config.attn = "te"
+        adapter = MiMoV2FlashStateDictAdapter(hf_config, moe_config, backend_config)
+        sink = torch.randn(4, dtype=torch.float32)
+
+        with patch.object(adapter, "_convert_single_merged_expert_to_hf_split_experts", return_value=None):
+            out = adapter.to_hf(
+                {"model.layers.0.self_attn.attn_module.softmax_offset": sink},
+                quantization=False,
+            )
+
+        assert set(out) == {"model.layers.0.self_attn.attention_sink_bias"}
+        assert out["model.layers.0.self_attn.attention_sink_bias"] is sink
+
     def test_non_expert_passthrough(self, adapter):
         tensor = torch.randn(4, 4)
         with patch.object(adapter, "_convert_single_merged_expert_to_hf_split_experts", return_value=None):
@@ -186,7 +467,12 @@ class TestConvertSingleTensorToHf:
     def test_quantizes_quantizable_key(self, adapter):
         tensor = torch.randn(8, 8)
         with patch.object(adapter, "_convert_single_merged_expert_to_hf_split_experts", return_value=None):
-            out = adapter.convert_single_tensor_to_hf("model.layers.0.self_attn.q_proj.weight", tensor)
+            out = adapter.convert_single_tensor_to_hf(
+                "model.layers.0.self_attn.q_proj.weight",
+                tensor,
+                quantization=True,
+                for_checkpoint_load=True,
+            )
         # Returns (weight in fp8, weight_scale_inv) pair.
         keys = [k for k, _ in out]
         assert "model.layers.0.self_attn.q_proj.weight" in keys
@@ -200,7 +486,12 @@ class TestConvertSingleTensorToHf:
             ("model.layers.0.mlp.experts.0.up_proj.weight", torch.randn(32, 16)),
         ]
         with patch.object(adapter, "_convert_single_merged_expert_to_hf_split_experts", return_value=split_pairs):
-            out = adapter.convert_single_tensor_to_hf("model.layers.0.mlp.experts.gate_and_up_projs", tensor)
+            out = adapter.convert_single_tensor_to_hf(
+                "model.layers.0.mlp.experts.gate_and_up_projs",
+                tensor,
+                quantization=True,
+                for_checkpoint_load=True,
+            )
         keys = [k for k, _ in out]
         # The split expert weight must be fp8'd and a scale_inv must be emitted.
         assert "model.layers.0.mlp.experts.0.up_proj.weight" in keys
@@ -417,14 +708,8 @@ class TestRoundTrip:
         """
         original_sd = {k: v.detach().clone() for k, v in tiny_model.state_dict().items()}
 
-        # Disable FP8 quantization so the round-trip can be compared directly.
-        # The FP8 path itself is tested by TestConvertSingleTensorToHf above.
-        with patch(
-            "nemo_automodel.components.models.mimo_v2_flash.state_dict_adapter._should_quantize_key",
-            return_value=False,
-        ):
-            hf_sd = round_trip_adapter.to_hf(original_sd)
-            restored_sd = round_trip_adapter.from_hf(hf_sd)
+        hf_sd = round_trip_adapter.to_hf(original_sd, quantization=False)
+        restored_sd = round_trip_adapter.from_hf(hf_sd)
 
         missing = set(original_sd) - set(restored_sd)
         assert not missing, f"Keys lost during round-trip: {sorted(missing)[:5]}"

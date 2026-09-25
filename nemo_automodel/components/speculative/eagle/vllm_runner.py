@@ -51,7 +51,7 @@ import glob
 import json
 import logging
 import os
-from typing import Optional, Sequence
+from typing import Sequence
 
 import torch
 
@@ -64,7 +64,7 @@ _VLLM_DTYPE_STRINGS = {
 }
 
 
-def vllm_dtype_str(dtype: Optional[torch.dtype]) -> str:
+def vllm_dtype_str(dtype: torch.dtype | None) -> str:
     """Map a torch dtype to the string form vLLM's ``dtype`` argument expects.
 
     ``None`` means "let vLLM pick" (``"auto"``).
@@ -155,12 +155,12 @@ class VLLMTargetRunner:
         self,
         model_path: str,
         *,
-        dtype: Optional[torch.dtype] = None,
+        dtype: torch.dtype | None = None,
         tp_size: int = 1,
         trust_remote_code: bool = False,
         gpu_memory_utilization: float = 0.5,
-        shared_storage_path: Optional[str] = None,
-        vllm_kwargs: Optional[dict] = None,
+        shared_storage_path: str | None = None,
+        vllm_kwargs: dict | None = None,
     ):
         from transformers import AutoConfig
 
@@ -182,22 +182,22 @@ class VLLMTargetRunner:
         self.model = _VLLMModelShim(hf_config, torch.device("cuda", torch.cuda.current_device()))
 
         self._llm = None
-        self._aux_layer_ids: Optional[list[int]] = None
+        self._aux_layer_ids: list[int] | None = None
         self._sampling_params = None
         self._hsc = None
         # Lazily loaded once (see ``_ensure_weights_loaded``): input embeddings
         # (original dtype, for the draft to copy), the final RMSNorm weight (fp32),
         # and the LM head already cast to fp32 and transposed to ``[hidden, vocab]``.
-        self._embed_w: Optional[torch.Tensor] = None
-        self._norm_w: Optional[torch.Tensor] = None
-        self._lm_head_w: Optional[torch.Tensor] = None
+        self._embed_w: torch.Tensor | None = None
+        self._norm_w: torch.Tensor | None = None
+        self._lm_head_w: torch.Tensor | None = None
 
     @classmethod
     def build(  # pragma: no cover - requires GPU + vLLM
         cls,
         model_path: str,
         *,
-        dtype: Optional[torch.dtype] = None,
+        dtype: torch.dtype | None = None,
         tp_size: int = 1,
         trust_remote_code: bool = False,
         **vllm_kwargs,

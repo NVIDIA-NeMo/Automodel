@@ -7,16 +7,12 @@ Diffusion language models (dLLMs) generate text by **denoising** rather than by 
 
 ## Supported Models
 
-| Owner | Model Family | Architectures |
-|---|---|---|
-| GSAI-ML | [LLaDA](/model-coverage/dllm/gsai-ml/llada) | `LLaDAModelLM` (using Hugging Face `trust_remote_code`) |
-| inclusionAI | [LLaDA 2.1](/model-coverage/dllm/inclusionai/llada2) | `LLaDA2MoeModelLM` (using Hugging Face `trust_remote_code`) |
-| NVIDIA | [Nemotron-Labs-Diffusion](/model-coverage/dllm/nvidia/nemotron-labs-diffusion) | `NemotronLabsDiffusionModel` (using Hugging Face `trust_remote_code`) |
-| Google | [DiffusionGemma](/model-coverage/dllm/google/diffusiongemma) | `DiffusionGemmaForBlockDiffusion` |
-| z-lab | [DFlash](/model-coverage/dllm/z-lab/dflash) | `DFlashDraftModel` (using Hugging Face `trust_remote_code`) |
-| Qwen | [Qwen3 I-DLM](/model-coverage/dllm/qwen/qwen3-idlm) | `Qwen3ForCausalLM` with the I-DLM objective |
-
 LLaDA, LLaDA2, Nemotron-Labs-Diffusion, and DFlash load through their Hugging Face remote-code implementations. DiffusionGemma has a native NeMo AutoModel implementation, and I-DLM converts a supported autoregressive checkpoint with a diffusion training objective.
+
+This table combines recipe-backed checkpoints with documented model families. Dates show when the current checkpoint first appeared in a recipe, or when a documentation-only family page was added. See the [combined model support log](/model-coverage/release-log) for recipe-backed checkpoints of every model type.
+
+{/* BEGIN GENERATED MODEL SUPPORT LOG */}
+{/* END GENERATED MODEL SUPPORT LOG */}
 
 ## Fine-Tuning
 

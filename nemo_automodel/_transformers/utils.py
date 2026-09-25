@@ -16,16 +16,16 @@ import inspect
 import logging
 from collections import deque
 from collections.abc import Callable
-from typing import Any, Optional
+from typing import Any
 
 import torch
 import torch.nn as nn
-from transformers import AutoConfig
+from transformers import AutoConfig, PretrainedConfig
 
 logger = logging.getLogger(__name__)
 
 
-def resolve_get_rope_index(model: nn.Module) -> Optional[Callable]:
+def resolve_get_rope_index(model: nn.Module) -> Callable | None:
     """Locate a model's mRoPE position-id builder.
 
     Transformers does not keep ``get_rope_index`` at a fixed depth, and a plain
@@ -93,13 +93,13 @@ def resolve_get_rope_index(model: nn.Module) -> Optional[Callable]:
 
 def _should_load_before_shard(
     *,
-    autopipeline: Optional[object],
+    autopipeline: object | None,
     tp_size: int,
     ep_size: int,
     dp_shard_size: int = 1,
     pretrained_model_name_or_path: str,
     load_base_model: bool,
-    peft_config: Optional[object],
+    peft_config: object | None,
 ) -> bool:
     """Decide whether to load the checkpoint before FSDP/TP/EP sharding.
 
@@ -226,6 +226,28 @@ def apply_cache_compatibility_patches():
     _patch_special_tokens_pattern()
 
     import transformers.cache_utils as cache_utils
+    import transformers.utils.import_utils as import_utils
+
+    # Remote v4 checkpoints still import this predicate; v4 defined it as
+    # is_torch_available(), so retain those semantics on v5.
+    if not hasattr(import_utils, "is_torch_fx_available"):
+        import_utils.is_torch_fx_available = import_utils.is_torch_available
+
+    # v5 moved default RoPE initialization into individual model classes.
+    # Remote v4 models still look it up in this registry using their v4 config.
+    from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+
+    if "default" not in ROPE_INIT_FUNCTIONS:
+
+        def _default_rope_parameters(
+            config: PretrainedConfig, device: torch.device | None = None, seq_len: int | None = None
+        ) -> tuple[torch.Tensor, float]:
+            head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+            dim = int(head_dim * getattr(config, "partial_rotary_factor", 1.0))
+            indices = torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float32)
+            return 1.0 / (config.rope_theta ** (indices / dim)), 1.0
+
+        ROPE_INIT_FUNCTIONS["default"] = _default_rope_parameters
 
     # SlidingWindowCache was removed in transformers v5.x
     if not hasattr(cache_utils, "SlidingWindowCache"):
@@ -261,9 +283,22 @@ def apply_cache_compatibility_patches():
 
         DynamicCache.to_legacy_cache = _to_legacy_cache
 
+    # OutputRecorder moved from transformers.utils.generic to
+    # transformers.utils.output_capturing in transformers v5.x. Pre-v5
+    # remote-code models (e.g. Kimi-Linear and MiniMax-M2 checkpoints) import
+    # it from the old location for their auxiliary router-logit recorders and
+    # otherwise fail at module import. Alias the relocated class back; v5.x
+    # re-exports it from transformers.modeling_utils.
+    import transformers.modeling_utils as mu
+    import transformers.utils.generic as generic_utils
+
+    if not hasattr(generic_utils, "OutputRecorder"):
+        _output_recorder = getattr(mu, "OutputRecorder", None)
+        if _output_recorder is not None:
+            generic_utils.OutputRecorder = _output_recorder
+
     # _tied_weights_keys changed from list to dict in transformers v5.x.
     # Patch post_init to auto-convert list -> dict for remote-code models.
-    import transformers.modeling_utils as mu
 
     if not getattr(mu.PreTrainedModel.post_init, "_nemo_tied_keys_patched", False):
         _orig_post_init = mu.PreTrainedModel.post_init

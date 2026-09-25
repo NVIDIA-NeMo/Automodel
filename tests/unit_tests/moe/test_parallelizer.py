@@ -14,10 +14,15 @@
 
 import sys
 import types
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from unittest.mock import MagicMock, patch
 
 import pytest
+
+# torch.utils.checkpoint.create_selective_checkpoint_contexts returns
+# ``(forward_ctx, recompute_ctx)``, and apply_ac's context wrappers unpack it,
+# so the stubs below must return a pair rather than a bare sentinel.
+SELECTIVE_CTX = ("CTX_FORWARD", "CTX_RECOMPUTE")
 
 
 class DummyParam:
@@ -258,9 +263,10 @@ def _install_torch_and_layers_stubs(monkeypatch):
         PREFER_RECOMPUTE = 2
 
     def create_selective_checkpoint_contexts(policy_factory):
-        return "CTX"
+        return SELECTIVE_CTX
 
     utils_checkpoint_stub.CheckpointPolicy = CheckpointPolicy
+    utils_checkpoint_stub._allowed_determinism_checks_to_fns = {"default": object(), "none": object()}
     utils_checkpoint_stub.create_selective_checkpoint_contexts = create_selective_checkpoint_contexts
 
     # Router ops used by the targeted activation-checkpointing policy.
@@ -340,6 +346,16 @@ def _install_torch_and_layers_stubs(monkeypatch):
     experts_stub.GroupedExpertsTE = GroupedExpertsTE
     monkeypatch.setitem(sys.modules, "nemo_automodel.components.moe.experts", experts_stub)
 
+    # Stub MoK experts to keep this import-isolation test independent of the
+    # real DTensor stack, just like the TE and DeepEP expert implementations.
+    mok_experts_stub = types.ModuleType("nemo_automodel.components.moe.mok_experts")
+
+    class GroupedExpertsMoK:
+        pass
+
+    mok_experts_stub.GroupedExpertsMoK = GroupedExpertsMoK
+    monkeypatch.setitem(sys.modules, "nemo_automodel.components.moe.mok_experts", mok_experts_stub)
+
 
 def _import_parallelizer_with_stubs(monkeypatch):
     import importlib
@@ -349,6 +365,7 @@ def _import_parallelizer_with_stubs(monkeypatch):
         "nemo_automodel.components.moe.parallelizer",
         "nemo_automodel.components.moe.layers",
         "nemo_automodel.components.moe.experts",
+        "nemo_automodel.components.moe.mok_experts",
         "nemo_automodel.components.distributed.pipelining",
         "nemo_automodel.components.distributed.pipelining.config",
         "nemo_automodel.components.distributed.pipelining.hf_utils",
@@ -422,6 +439,27 @@ def _import_parallelizer_with_stubs(monkeypatch):
         fully_shard_fn(module, **kwargs)
 
     parallelizer_utils_stub.fully_shard_by_dtype = fully_shard_by_dtype
+    parallelizer_utils_stub.get_internal_fsdp_mp_policy = lambda mp_policy: ("INTERNAL_MP_POLICY", mp_policy)
+    parallelizer_utils_stub.configure_fsdp_unused_param_reduction = lambda module: 0
+
+    def reject_unsupported_mtp_cp(model):
+        if model.supports.mtp_enabled and not model.supports.supports_mtp_cp:
+            raise RuntimeError("Model does not support MTP with context parallelism")
+
+    parallelizer_utils_stub.reject_unsupported_mtp_cp = reject_unsupported_mtp_cp
+
+    def reject_unsupported_mtp_cp_pp(model):
+        is_pp_stage_fn = getattr(model, "_is_pipeline_parallel_stage", None)
+        if (
+            model.supports.mtp_enabled
+            and not model.supports.supports_mtp_cp_pp
+            and callable(is_pp_stage_fn)
+            and is_pp_stage_fn()
+        ):
+            raise NotImplementedError("MTP with context and pipeline parallelism is not supported")
+
+    parallelizer_utils_stub.reject_unsupported_mtp_cp_pp = reject_unsupported_mtp_cp_pp
+
     monkeypatch.setitem(
         sys.modules,
         "nemo_automodel.components.distributed.parallelizer_utils",
@@ -442,13 +480,38 @@ def _import_parallelizer_with_stubs(monkeypatch):
     activation_checkpointing_stub = types.ModuleType("nemo_automodel.components.distributed.activation_checkpointing")
     activation_checkpointing_stub.ensure_fsdp_ops_sac_ignored = lambda: None
     activation_checkpointing_stub.ensure_profiler_ops_sac_ignored = lambda: None
-    activation_checkpointing_stub.transformer_engine_attention_backend_snapshot_context_fn = (
-        lambda context_fn=None: context_fn() if context_fn is not None else (nullcontext(), nullcontext())
+    activation_checkpointing_stub.transformer_engine_attention_backend_snapshot_context_fn = lambda context_fn=None: (
+        context_fn() if context_fn is not None else (nullcontext(), nullcontext())
     )
     monkeypatch.setitem(
         sys.modules,
         "nemo_automodel.components.distributed.activation_checkpointing",
         activation_checkpointing_stub,
+    )
+
+    # apply_ac wraps each block's context in the DeepEP dispatch-replay recorder,
+    # which imports fused_a2a lazily. Stub it so this module does not depend on
+    # some earlier test having imported it under the real torch.
+    fused_a2a_stub = types.ModuleType("nemo_automodel.components.moe.megatron.fused_a2a")
+
+    class _StubDispatchReplayRecorder:
+        def __init__(self):
+            self.replay_misses = 0
+            self.rewind_count = 0
+
+        def rewind(self):
+            self.rewind_count += 1
+
+    @contextmanager
+    def _stub_dispatch_replay_scope(recorder, mode):
+        yield
+
+    fused_a2a_stub.DispatchReplayRecorder = _StubDispatchReplayRecorder
+    fused_a2a_stub.dispatch_replay_scope = _stub_dispatch_replay_scope
+    monkeypatch.setitem(
+        sys.modules,
+        "nemo_automodel.components.moe.megatron.fused_a2a",
+        fused_a2a_stub,
     )
 
     distributed_config_stub = types.ModuleType("nemo_automodel.components.distributed.config")
@@ -613,6 +676,35 @@ def test_apply_ep_parallelizes_moe_experts(monkeypatch):
     assert isinstance(kwargs["parallelize_plan"], P.ExpertParallel)
 
 
+def test_apply_ep_excludes_te_owned_experts_from_tp_replica_sync(monkeypatch):
+    """TE's plain local expert tensors remain owned by the folded EP mesh."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+
+    class DummyGroupedExpertsTE:
+        def __init__(self):
+            self.init_token_dispatcher = MagicMock()
+
+    experts = DummyGroupedExpertsTE()
+    moe = DummyMoE()
+    moe.experts = experts
+    block = DummyBlock(mlp=moe)
+    model = DummyModel([block])
+    ep_mesh = type("Mesh", (), {"size": lambda self: 2})()
+    moe_mesh = object()
+
+    monkeypatch.setattr(P, "GroupedExpertsTE", DummyGroupedExpertsTE)
+    exclude_mock = MagicMock()
+    tp_replicas_stub = types.ModuleType("nemo_automodel.components.distributed.tp_replicas")
+    tp_replicas_stub.exclude_from_tp_replica_sync = exclude_mock
+    monkeypatch.setitem(sys.modules, "nemo_automodel.components.distributed.tp_replicas", tp_replicas_stub)
+
+    P.apply_ep(model, ep_mesh, moe_mesh=moe_mesh)
+
+    experts.init_token_dispatcher.assert_called_once_with(ep_mesh=ep_mesh, moe_mesh=moe_mesh)
+    exclude_mock.assert_called_once_with(experts)
+
+
 def test_apply_ep_parallelizes_diffusion_style_block_moe(monkeypatch):
     """Diffusion Gemma exposes the MoE branch as block.moe, not block.mlp."""
     P = _import_parallelizer_with_stubs(monkeypatch)
@@ -641,13 +733,13 @@ def test_apply_ac_wraps_blocks_with_and_without_context(monkeypatch):
     P = _import_parallelizer_with_stubs(monkeypatch)
     wrapper_returns = [object(), object()]
 
-    def fake_wrapper(block, preserve_rng_state, context_fn=None):
+    def fake_wrapper(block, preserve_rng_state, determinism_check=None, context_fn=None):
         assert preserve_rng_state is True
         # if ignore_router=True, context_fn should be provided
         return wrapper_returns.pop(0)
 
     wrapper_mock = MagicMock(side_effect=fake_wrapper)
-    ctx_mock = MagicMock(return_value="CTX")
+    ctx_mock = MagicMock(return_value=SELECTIVE_CTX)
     monkeypatch.setattr(P, "ptd_checkpoint_wrapper", wrapper_mock)
     monkeypatch.setattr(P, "create_selective_checkpoint_contexts", ctx_mock)
 
@@ -674,10 +766,33 @@ def test_apply_ac_wraps_blocks_with_and_without_context(monkeypatch):
     assert len(model.layers.registered) == 2
 
 
+@pytest.mark.parametrize("selective", [False, True])
+def test_apply_ac_skips_model_owned_eager_block(monkeypatch, selective):
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    if selective:
+        dense_stub = types.ModuleType("nemo_automodel.components.distributed.activation_checkpointing")
+        dense_stub.make_selective_checkpoint_context_fn = MagicMock(return_value=object())
+        dense_stub.SELECTIVE_AC_WRAPPER_FLAG = "_nemo_selective_ac"
+        dense_stub.transformer_engine_attention_backend_snapshot_context_fn = lambda context_fn=None: context_fn
+        monkeypatch.setitem(sys.modules, "nemo_automodel.components.distributed.activation_checkpointing", dense_stub)
+
+    eager_block = DummyBlock()
+    eager_block._nemo_disable_activation_checkpointing = True
+    wrapped_block = types.SimpleNamespace()
+    wrapper_mock = MagicMock(return_value=wrapped_block)
+    monkeypatch.setattr(P, "ptd_checkpoint_wrapper", wrapper_mock)
+
+    model = DummyModel([DummyBlock(), eager_block])
+    P.apply_ac(model, ignore_router=True, hidden_size=7168, num_experts=256, selective=selective)
+
+    wrapper_mock.assert_called_once()
+    assert model.layers.registered == {"0": wrapped_block}
+
+
 def test_apply_ac_warns_when_router_is_recomputed(monkeypatch):
     P = _import_parallelizer_with_stubs(monkeypatch)
     monkeypatch.setattr(P, "ptd_checkpoint_wrapper", MagicMock(side_effect=lambda block, **kw: block))
-    monkeypatch.setattr(P, "create_selective_checkpoint_contexts", MagicMock(return_value="CTX"))
+    monkeypatch.setattr(P, "create_selective_checkpoint_contexts", MagicMock(return_value=SELECTIVE_CTX))
     logger_mock = MagicMock()
     monkeypatch.setattr(P, "logger", logger_mock)
 
@@ -690,6 +805,38 @@ def test_apply_ac_warns_when_router_is_recomputed(monkeypatch):
     logger_mock.reset_mock()
     P.apply_ac(DummyModel([DummyBlock()]), ignore_router=True, hidden_size=7168, num_experts=256)
     logger_mock.warning.assert_not_called()
+
+
+@pytest.mark.parametrize("selective", [False, True])
+def test_apply_ac_replays_hybridep_layout_for_full_and_selective_ac(monkeypatch, selective):
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    expert = P.GroupedExpertsDeepEP()
+    expert.dispatcher_backend = "hybridep"
+
+    class HybridEPModel(DummyModel):
+        def modules(self):
+            return iter((self, expert))
+
+    if selective:
+        activation_checkpointing_stub = sys.modules["nemo_automodel.components.distributed.activation_checkpointing"]
+        activation_checkpointing_stub.make_selective_checkpoint_context_fn = lambda: (
+            lambda: (nullcontext(), nullcontext())
+        )
+        activation_checkpointing_stub.SELECTIVE_AC_WRAPPER_FLAG = "_nemo_selective_ac"
+
+    replay_wrapper = MagicMock(side_effect=lambda context_fn: context_fn)
+    monkeypatch.setattr(P, "_replay_hybridep_dispatch_on_recompute", replay_wrapper)
+    monkeypatch.setattr(P, "ptd_checkpoint_wrapper", MagicMock(side_effect=lambda block, **kwargs: block))
+
+    P.apply_ac(
+        HybridEPModel([DummyBlock()]),
+        ignore_router=True,
+        hidden_size=7168,
+        num_experts=384,
+        selective=selective,
+    )
+
+    replay_wrapper.assert_called_once()
 
 
 def test_apply_ac_uses_generic_wrapper_even_when_block_local_checkpointing_is_available(monkeypatch):
@@ -726,12 +873,16 @@ def test_apply_ac_custom_policy_saves_router_projection_and_topk(monkeypatch):
     def fake_create_selective_checkpoint_contexts(policy_cb):
         nonlocal captured_policy
         captured_policy = policy_cb
-        return "CTX"
+        return SELECTIVE_CTX
 
-    def fake_wrapper(block, preserve_rng_state, context_fn=None):
+    def fake_wrapper(block, preserve_rng_state, determinism_check=None, context_fn=None):
         assert preserve_rng_state is True
         assert callable(context_fn)
-        assert context_fn() == "CTX"
+        # The selective contexts are wrapped for DeepEP dispatch replay, so what
+        # comes back is the wrapper's pair rather than SELECTIVE_CTX itself.
+        forward_ctx, recompute_ctx = context_fn()
+        assert hasattr(forward_ctx, "__enter__")
+        assert hasattr(recompute_ctx, "__enter__")
         return block
 
     monkeypatch.setattr(P, "create_selective_checkpoint_contexts", fake_create_selective_checkpoint_contexts)
@@ -827,6 +978,7 @@ def test_apply_fsdp_calls_with_ignored_params_and_shard_for_experts(monkeypatch)
     assert experts_kwargs["mesh"] is ep_shard_mesh
     assert experts_kwargs["reshard_after_forward"] is False
     assert experts_kwargs["offload_policy"] is offload_policy
+    assert experts_kwargs["mp_policy"] == ("INTERNAL_MP_POLICY", "MP_POLICY")
     assert callable(experts_kwargs["shard_placement_fn"])  # lambda _: Shard(1)
 
     # Block should be sharded with ignored_params when ep_enabled
@@ -869,6 +1021,34 @@ def test_apply_fsdp_installs_accumulated_grad_guard(monkeypatch):
     )
 
     guard_mock.assert_called_once_with()
+
+
+def test_apply_fsdp_rejects_mok_mxfp8_with_ep_shard(monkeypatch):
+    P = _import_parallelizer_with_stubs(monkeypatch)
+
+    class MoKExperts(DummyExperts):
+        def __init__(self):
+            super().__init__()
+            self.runtime = types.SimpleNamespace(mok_config=types.SimpleNamespace(precision="mxfp8"))
+
+    class MoEModule:
+        def __init__(self):
+            self.experts = MoKExperts()
+            self.gate = None
+
+    monkeypatch.setattr(P, "MoE", MoEModule)
+    monkeypatch.setattr(P, "GroupedExpertsMoK", MoKExperts)
+    monkeypatch.setattr(P, "fully_shard", MagicMock())
+    monkeypatch.setattr(P, "MixedPrecisionPolicy", MagicMock(return_value="MP_POLICY"))
+
+    with pytest.raises(ValueError, match="MoK MXFP8 currently requires ep_shard size 1"):
+        P.apply_fsdp(
+            model=DummyModel([DummyBlock(mlp=MoEModule())]),
+            fsdp_mesh=object(),
+            ep_enabled=True,
+            ep_shard_enabled=True,
+            ep_shard_mesh=object(),
+        )
 
 
 def test_apply_fsdp_routes_strict_fp32_contract_and_expert_exclusions_to_shared_sharder(monkeypatch):
@@ -995,6 +1175,90 @@ def test_apply_fsdp_without_ep_enabled_has_no_ignored_params(monkeypatch):
     _, block_kwargs = block_call
     assert block_kwargs["mesh"] is fsdp_mesh
     assert block_kwargs.get("ignored_params") is None
+
+
+def test_apply_fsdp_excludes_model_owned_shard_from_block_and_root(monkeypatch):
+    """A model-owned parameter shard must not be sharded again by FSDP."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+    fully_shard_mock = MagicMock()
+    monkeypatch.setattr(P, "fully_shard", fully_shard_mock)
+    monkeypatch.setattr(P, "MixedPrecisionPolicy", MagicMock(return_value="MP_POLICY"))
+
+    owner_weight = DummyParam()
+    owner_weight._nemo_model_owned_grad_divisor = 1.0
+
+    class OwnerShardedBlock(DummyBlock):
+        def parameters(self):
+            yield owner_weight
+
+    class OwnerShardedModel(DummyModel):
+        def parameters(self):
+            yield owner_weight
+
+    block = OwnerShardedBlock(mlp=DummyMoE())
+    model = OwnerShardedModel([block])
+    fsdp_mesh = object()
+
+    P.apply_fsdp(
+        model=model,
+        fsdp_mesh=fsdp_mesh,
+        ep_enabled=False,
+        ep_shard_enabled=False,
+    )
+
+    block_call = _find_call_by_first_arg(fully_shard_mock, block)
+    assert block_call is not None
+    assert block_call[1]["ignored_params"] == {owner_weight}
+    root_call = _find_call_by_first_arg(fully_shard_mock, model)
+    assert root_call is not None
+    assert root_call[1]["ignored_params"] == {owner_weight}
+
+
+def test_apply_fsdp_prepares_and_excludes_final_model_owned_dtensor_identity(monkeypatch):
+    """The model hook runs before every FSDP unit snapshots ignored params."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+    fully_shard_mock = MagicMock()
+    monkeypatch.setattr(P, "fully_shard", fully_shard_mock)
+    monkeypatch.setattr(P, "MixedPrecisionPolicy", MagicMock(return_value="MP_POLICY"))
+
+    # ``_import_parallelizer_with_stubs`` gives the module its own minimal
+    # ``torch.nn.Parameter`` class.  Use that exact runtime class so this test
+    # exercises the production type guard instead of mixing the real and
+    # stubbed torch modules.
+    distributed_weight = P.nn.Parameter()
+    distributed_weight._nemo_model_owned_grad_divisor = 2.0
+
+    class ModelOwnedDTensorBlock(DummyBlock):
+        def parameters(self):
+            yield distributed_weight
+
+    class ModelOwnedDTensorModel(DummyModel):
+        def parameters(self):
+            yield distributed_weight
+
+        def _nemo_prepare_model_owned_dtensors(self, mesh):
+            assert mesh is fsdp_mesh
+            return {distributed_weight}
+
+    block = ModelOwnedDTensorBlock(mlp=DummyMoE())
+    model = ModelOwnedDTensorModel([block])
+    fsdp_mesh = object()
+
+    P.apply_fsdp(
+        model=model,
+        fsdp_mesh=fsdp_mesh,
+        ep_enabled=False,
+        ep_shard_enabled=False,
+    )
+
+    block_call = _find_call_by_first_arg(fully_shard_mock, block)
+    assert block_call is not None
+    assert block_call[1]["ignored_params"] == {distributed_weight}
+    root_call = _find_call_by_first_arg(fully_shard_mock, model)
+    assert root_call is not None
+    assert root_call[1]["ignored_params"] == {distributed_weight}
 
 
 @pytest.mark.parametrize(
@@ -1581,7 +1845,14 @@ def test_parallelize_model_applies_tp_before_cp_ep_ac_and_fsdp(monkeypatch):
     model = type(
         "Outer",
         (),
-        {"moe_config": type("MC", (), {"n_routed_experts": 4})()},
+        {
+            "moe_config": type("MC", (), {"n_routed_experts": 4})(),
+            "supports": types.SimpleNamespace(
+                mtp_enabled=False,
+                supports_mtp_cp=False,
+                supports_mtp_cp_pp=False,
+            ),
+        },
     )()
 
     P.parallelize_model(
@@ -1593,9 +1864,10 @@ def test_parallelize_model_applies_tp_before_cp_ep_ac_and_fsdp(monkeypatch):
         tp_axis_name="tp",
         ep_axis_name="ep",
         activation_checkpointing=True,
+        reapply_trainability=lambda _model: calls.append("trainability"),
     )
 
-    assert calls == ["tp", "tie", "cp", "ep", "ac", "fsdp"]
+    assert calls == ["tp", "tie", "cp", "ep", "ac", "trainability", "fsdp"]
     assert model._nemo_moe_tp_requires_replica_sync is True
     assert model._nemo_moe_tp_requires_pretrained_weights is True
     P._resolve_moe_tp_plan.assert_called_once_with(
@@ -1604,6 +1876,82 @@ def test_parallelize_model_applies_tp_before_cp_ep_ac_and_fsdp(monkeypatch):
         tp_shard_plan=None,
         tp_size=2,
     )
+
+
+def test_parallelize_model_rejects_cp_mtp_pipeline_stage_before_ep_or_cp(monkeypatch):
+    """The MoE/EP path must reject the same unsupported topology on every PP stage."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    apply_cp_mock = MagicMock()
+    apply_ep_mock = MagicMock()
+    monkeypatch.setattr(P, "apply_cp", apply_cp_mock)
+    monkeypatch.setattr(P, "apply_ep", apply_ep_mock)
+
+    world_mesh = FakeWorldMesh(
+        {"cp": 2, ("dp",): 2},
+        mesh_dim_names=["dp", "cp"],
+    )
+    moe_mesh = FakeMoeMesh({"ep": 2})
+    model = type(
+        "PipelineStage",
+        (),
+        {
+            "supports": types.SimpleNamespace(mtp_enabled=True, supports_mtp_cp_pp=False),
+            "mtp_config": type("MTP", (), {"enabled": True})(),
+            "moe_config": type("MC", (), {"n_routed_experts": 4})(),
+            "_is_pipeline_parallel_stage": lambda self: True,
+        },
+    )()
+
+    with pytest.raises(NotImplementedError, match="MTP with context and pipeline parallelism"):
+        P.parallelize_model(
+            model=model,
+            world_mesh=world_mesh,
+            moe_mesh=moe_mesh,
+            dp_axis_names=("dp",),
+            cp_axis_name="cp",
+            ep_axis_name="ep",
+        )
+
+    apply_cp_mock.assert_not_called()
+    apply_ep_mock.assert_not_called()
+
+
+def test_parallelize_model_rejects_cp_mtp_without_capability_before_ep_or_cp(monkeypatch):
+    """The MoE/EP path must enforce the same MTP+CP capability as the dense path."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    apply_cp_mock = MagicMock()
+    apply_ep_mock = MagicMock()
+    monkeypatch.setattr(P, "apply_cp", apply_cp_mock)
+    monkeypatch.setattr(P, "apply_ep", apply_ep_mock)
+
+    world_mesh = FakeWorldMesh({"cp": 2, ("dp",): 2}, mesh_dim_names=["dp", "cp"])
+    moe_mesh = FakeMoeMesh({"ep": 2})
+    model = type(
+        "UnsupportedMTPModel",
+        (),
+        {
+            "supports": types.SimpleNamespace(
+                mtp_enabled=True,
+                supports_mtp_cp=False,
+                supports_mtp_cp_pp=False,
+            ),
+            "mtp_config": type("MTP", (), {"enabled": True})(),
+            "moe_config": type("MC", (), {"n_routed_experts": 4})(),
+        },
+    )()
+
+    with pytest.raises(RuntimeError, match="does not support MTP with context parallelism"):
+        P.parallelize_model(
+            model=model,
+            world_mesh=world_mesh,
+            moe_mesh=moe_mesh,
+            dp_axis_names=("dp",),
+            cp_axis_name="cp",
+            ep_axis_name="ep",
+        )
+
+    apply_cp_mock.assert_not_called()
+    apply_ep_mock.assert_not_called()
 
 
 def test_parallelize_model_forwards_offload_policy_to_fsdp(monkeypatch):
@@ -1712,22 +2060,19 @@ def test_apply_fsdp_without_lm_head_precision_uses_default_policy(monkeypatch):
     assert mp_policy_mock.call_count == 1
 
 
-def test_apply_fsdp_uses_dsv4_wrapper_only_for_deepseek_v4(monkeypatch):
-    """DeepSeek-V4 gets its model-specific dtype wrapper without changing generic MoE FSDP."""
+@pytest.mark.parametrize("model_owned_sharding", [False, True])
+def test_apply_fsdp_uses_model_wrapper_or_default(monkeypatch: pytest.MonkeyPatch, model_owned_sharding: bool) -> None:
+    """Language and multimodal units share one model-selected FSDP callback."""
     P = _import_parallelizer_with_stubs(monkeypatch)
     monkeypatch.setattr(P, "MoE", DummyMoE)
-
-    fully_shard_mock = MagicMock()
-    monkeypatch.setattr(P, "fully_shard", fully_shard_mock)
-
-    dsv4_fsdp_stub = types.ModuleType("nemo_automodel.components.models.deepseek_v4.fsdp")
-    dsv4_fully_shard_mock = MagicMock()
-    dsv4_fsdp_stub.fully_shard_deepseek_v4 = dsv4_fully_shard_mock
-    monkeypatch.setitem(sys.modules, "nemo_automodel.components.models.deepseek_v4.fsdp", dsv4_fsdp_stub)
-
+    default_shard = MagicMock()
+    model_shard = MagicMock()
+    monkeypatch.setattr(P, "fully_shard", default_shard)
     block = DummyBlock(mlp=DummyMoE())
     model = DummyModel([block])
-    model.config = types.SimpleNamespace(model_type="deepseek_v4")
+    model.visual = DummyExperts()
+    if model_owned_sharding:
+        model._nemo_fully_shard = model_shard
 
     P.apply_fsdp(
         model=model,
@@ -1737,8 +2082,11 @@ def test_apply_fsdp_uses_dsv4_wrapper_only_for_deepseek_v4(monkeypatch):
         lm_head_precision=None,
     )
 
-    assert _find_call_by_first_arg(dsv4_fully_shard_mock, block) is not None
-    assert _find_call_by_first_arg(fully_shard_mock, block) is None
+    selected = model_shard if model_owned_sharding else default_shard
+    other = default_shard if model_owned_sharding else model_shard
+    for module in (block, model.visual, model):
+        assert _find_call_by_first_arg(selected, module) is not None
+        assert _find_call_by_first_arg(other, module) is None
 
 
 def test_parallelize_model_passes_lm_head_precision_to_apply_fsdp(monkeypatch):
@@ -2060,9 +2408,9 @@ def test_apply_ac_derives_hidden_size_and_num_experts_from_config(monkeypatch):
                     break
             if captured_hidden_size is not None:
                 break
-        return "CTX"
+        return SELECTIVE_CTX
 
-    def fake_wrapper(block, preserve_rng_state, context_fn=None):
+    def fake_wrapper(block, preserve_rng_state, determinism_check=None, context_fn=None):
         if context_fn is not None:
             context_fn()  # Trigger the context function to capture values
         return block
@@ -2136,9 +2484,9 @@ def test_apply_ac_derives_num_experts_from_num_local_experts(monkeypatch):
             result = policy_cb(None, torch_stub.ops.aten.mm.default, object(), rhs)
             if result == P.CheckpointPolicy.MUST_SAVE:
                 captured_num_experts = ne
-        return "CTX"
+        return SELECTIVE_CTX
 
-    def fake_wrapper(block, preserve_rng_state, context_fn=None):
+    def fake_wrapper(block, preserve_rng_state, determinism_check=None, context_fn=None):
         if context_fn is not None:
             context_fn()
         return block
@@ -2178,9 +2526,9 @@ def test_apply_ac_accepts_explicit_hidden_size_and_num_experts(monkeypatch):
         if result == P.CheckpointPolicy.MUST_SAVE:
             captured_hidden_size = 512
             captured_num_experts = 32
-        return "CTX"
+        return SELECTIVE_CTX
 
-    def fake_wrapper(block, preserve_rng_state, context_fn=None):
+    def fake_wrapper(block, preserve_rng_state, determinism_check=None, context_fn=None):
         if context_fn is not None:
             context_fn()
         return block
@@ -2217,9 +2565,9 @@ def test_apply_ac_explicit_params_override_config(monkeypatch):
         if result == P.CheckpointPolicy.MUST_SAVE:
             captured_hidden_size = 1024
             captured_num_experts = 64
-        return "CTX"
+        return SELECTIVE_CTX
 
-    def fake_wrapper(block, preserve_rng_state, context_fn=None):
+    def fake_wrapper(block, preserve_rng_state, determinism_check=None, context_fn=None):
         if context_fn is not None:
             context_fn()
         return block
@@ -2265,9 +2613,9 @@ def test_apply_ac_derives_from_llm_config(monkeypatch):
                     break
             if captured_hidden_size is not None:
                 break
-        return "CTX"
+        return SELECTIVE_CTX
 
-    def fake_wrapper(block, preserve_rng_state, context_fn=None):
+    def fake_wrapper(block, preserve_rng_state, determinism_check=None, context_fn=None):
         if context_fn is not None:
             context_fn()
         return block
@@ -2313,7 +2661,7 @@ def test_apply_ac_text_config_takes_priority_over_llm_config(monkeypatch):
                     break
             if captured_hidden_size is not None:
                 break
-        return "CTX"
+        return SELECTIVE_CTX
 
     monkeypatch.setattr(P, "create_selective_checkpoint_contexts", fake_create_selective_checkpoint_contexts)
     monkeypatch.setattr(
@@ -2372,7 +2720,7 @@ def test_apply_ac_routes_through_get_text_module(monkeypatch):
         return m.language_model if hasattr(m, "language_model") else m
 
     monkeypatch.setattr(P, "get_text_module", vlm_get_text_module)
-    monkeypatch.setattr(P, "create_selective_checkpoint_contexts", MagicMock(return_value="CTX"))
+    monkeypatch.setattr(P, "create_selective_checkpoint_contexts", MagicMock(return_value=SELECTIVE_CTX))
     monkeypatch.setattr(P, "ptd_checkpoint_wrapper", MagicMock(side_effect=lambda b, **kw: b))
 
     lm_blocks = [DummyBlock(), DummyBlock()]
@@ -2515,7 +2863,7 @@ def test_apply_ac_selective_wraps_blocks_with_shared_policy(monkeypatch):
         def __init__(self, block):
             self.block = block
 
-    def fake_wrapper(block, preserve_rng_state, context_fn=None):
+    def fake_wrapper(block, preserve_rng_state, determinism_check=None, context_fn=None):
         assert preserve_rng_state is True
         assert callable(context_fn)
         assert context_fn() is sentinel_ctx
@@ -2538,6 +2886,53 @@ def test_apply_ac_selective_wraps_blocks_with_shared_policy(monkeypatch):
     # (preserving the selective policy) rather than collapsing to inner compile.
     for w in wrapped:
         assert getattr(w, sentinel_flag, False) is True
+
+
+@pytest.mark.parametrize("selective", [False, True])
+def test_apply_ac_repeated_mtp_checkpoints_dense_blocks_and_skips_moe(monkeypatch, selective):
+    """Weight-tied MTP AC skips only blocks with the unsafe shared experts group."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+
+    if selective:
+        sentinel_flag = "_nemo_selective_ac"
+        dense_stub = types.ModuleType("nemo_automodel.components.distributed.activation_checkpointing")
+        dense_stub.make_selective_checkpoint_context_fn = MagicMock(return_value=object())
+        dense_stub.SELECTIVE_AC_WRAPPER_FLAG = sentinel_flag
+        dense_stub.transformer_engine_attention_backend_snapshot_context_fn = lambda context_fn=None: context_fn
+        monkeypatch.setitem(sys.modules, "nemo_automodel.components.distributed.activation_checkpointing", dense_stub)
+
+    wrapped = []
+
+    class _Wrapper:
+        def __init__(self, block):
+            self.block = block
+
+    def fake_wrapper(block, **_kwargs):
+        wrapper = _Wrapper(block)
+        wrapped.append(wrapper)
+        return wrapper
+
+    monkeypatch.setattr(P, "ptd_checkpoint_wrapper", MagicMock(side_effect=fake_wrapper))
+
+    backbone = DummyBlock(mlp=object())
+    mtp_attention = DummyBlock(mlp=object())
+    mtp_moe = DummyBlock(mlp=DummyMoE())
+    model = types.SimpleNamespace(
+        model=DummyModel([backbone]),
+        mtp=types.SimpleNamespace(
+            layers=LayerContainer([mtp_attention, mtp_moe]),
+            mtp_config=types.SimpleNamespace(use_repeated_layer=True),
+        ),
+    )
+
+    P.apply_ac(model, selective=selective, hidden_size=8, num_experts=4)
+
+    assert [wrapper.block for wrapper in wrapped] == [backbone, mtp_attention]
+    assert set(model.model.layers.registered) == {"0"}
+    assert set(model.mtp.layers.registered) == {"0"}
+    if selective:
+        assert all(getattr(wrapper, sentinel_flag, False) for wrapper in wrapped)
 
 
 # ============================================================================
@@ -2634,9 +3029,9 @@ def test_apply_ac_derives_num_experts_from_moe_num_experts(monkeypatch):
             if result == P.CheckpointPolicy.MUST_SAVE:
                 captured_num_experts = ne
                 break
-        return "CTX"
+        return SELECTIVE_CTX
 
-    def fake_wrapper(block, preserve_rng_state, context_fn=None):
+    def fake_wrapper(block, preserve_rng_state, determinism_check=None, context_fn=None):
         if context_fn is not None:
             context_fn()
         return block
@@ -2677,9 +3072,9 @@ def test_apply_ac_prefers_num_experts_over_moe_num_experts(monkeypatch):
             if result == P.CheckpointPolicy.MUST_SAVE:
                 captured_num_experts = ne
                 break
-        return "CTX"
+        return SELECTIVE_CTX
 
-    def fake_wrapper(block, preserve_rng_state, context_fn=None):
+    def fake_wrapper(block, preserve_rng_state, determinism_check=None, context_fn=None):
         if context_fn is not None:
             context_fn()
         return block
@@ -2721,9 +3116,9 @@ def test_apply_ac_derives_num_experts_from_moe_config(monkeypatch):
             if result == P.CheckpointPolicy.MUST_SAVE:
                 captured_num_experts = ne
                 break
-        return "CTX"
+        return SELECTIVE_CTX
 
-    def fake_wrapper(block, preserve_rng_state, context_fn=None):
+    def fake_wrapper(block, preserve_rng_state, determinism_check=None, context_fn=None):
         if context_fn is not None:
             context_fn()
         return block
@@ -2769,9 +3164,9 @@ def test_apply_ac_prefers_moe_config_over_config_attrs(monkeypatch):
             if result == P.CheckpointPolicy.MUST_SAVE:
                 captured_num_experts = ne
                 break
-        return "CTX"
+        return SELECTIVE_CTX
 
-    def fake_wrapper(block, preserve_rng_state, context_fn=None):
+    def fake_wrapper(block, preserve_rng_state, determinism_check=None, context_fn=None):
         if context_fn is not None:
             context_fn()
         return block
@@ -2970,9 +3365,9 @@ def test_apply_ac_derives_hidden_size_and_num_experts_from_text_config(monkeypat
                     break
             if captured_hidden_size is not None:
                 break
-        return "CTX"
+        return SELECTIVE_CTX
 
-    def fake_wrapper(block, preserve_rng_state, context_fn=None):
+    def fake_wrapper(block, preserve_rng_state, determinism_check=None, context_fn=None):
         if context_fn is not None:
             context_fn()
         return block

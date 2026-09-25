@@ -53,12 +53,24 @@ from nemo_automodel.components.models.kimi_k3.cp import (
     document_causal_flex_attention,
     shard_batch_for_kimi_cp,
 )
+from nemo_automodel.components.models.kimi_k3.kda_fused import fused_chunk_kda, fused_kda_unsupported_reason
+from nemo_automodel.components.models.kimi_k3.situ import (
+    _apply_attn_res,
+    _compile_norm_core,
+    _compile_situ_cores,
+    _enable_attn_res_triton,
+    _enable_situ_triton,
+    _rms_norm,
+    _weighted_situ,
+    dense_situ,
+)
 from nemo_automodel.components.models.kimi_k3.state_dict_adapter import KimiK3StateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.experts import GroupedExperts, GroupedExpertsDeepEP
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
-from nemo_automodel.components.moe.layers import Gate, MoE
+from nemo_automodel.components.moe.layers import FakeBalancedGate, Gate, MoE
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
+from nemo_automodel.shared.embedding_padding import zero_embedding_row_
 from nemo_automodel.shared.import_utils import UnavailableError, safe_import_from
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
@@ -71,6 +83,22 @@ _FUSED_RMSNORM_GATED_OK, FusedRMSNormGated = safe_import_from(
 )
 _CHUNK_KDA_OK, chunk_kda = safe_import_from("fla.ops.kda", "chunk_kda", msg=_FLA_MSG)
 _RECURRENT_KDA_OK, fused_recurrent_kda = safe_import_from("fla.ops.kda", "fused_recurrent_kda", msg=_FLA_MSG)
+_CHUNK_KDA_HAS_DISABLE_RECOMPUTE = _CHUNK_KDA_OK and "disable_recompute" in inspect.signature(chunk_kda).parameters
+
+
+def _short_conv_backend_kwargs(backend: str) -> dict[str, str]:
+    """Return the ``ShortConvolution`` keyword for a non-default conv backend.
+
+    Older FLA releases have no ``backend`` parameter; the default Triton backend is then the only
+    choice and no keyword is passed, so the module still constructs.
+    """
+    if backend == "triton" or not _SHORT_CONV_OK:
+        return {}
+    if "backend" not in inspect.signature(ShortConvolution.__init__).parameters:
+        return {}
+    return {"backend": backend}
+
+
 _KDA_GATE_OK, fused_kda_gate = safe_import_from("fla.ops.kda.gate", "fused_kda_gate", msg=_FLA_MSG)
 try:
     _FUSED_KDA_GATE_HAS_G_BIAS = _KDA_GATE_OK and "g_bias" in inspect.signature(fused_kda_gate).parameters
@@ -145,14 +173,12 @@ class SituAndMul(nn.Module):
         self.linear_beta = linear_beta
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply SiTU to ``[... , 2 * intermediate]`` gate/up projections."""
-        gate, up = x.chunk(2, dim=-1)
-        gate = gate.float()
-        up = up.float()
-        activated = self.beta * torch.tanh(gate / self.beta) * torch.sigmoid(gate)
-        if self.linear_beta is not None:
-            up = self.linear_beta * torch.tanh(up / self.linear_beta)
-        return (activated * up).to(x.dtype)
+        """Apply SiTU to ``[... , 2 * intermediate]`` gate/up projections.
+
+        Runs through the module-level dense core in ``situ.py`` so that
+        ``BackendConfig.compile_situ`` fuses the fp32 chain into one kernel.
+        """
+        return dense_situ(x, self.beta, self.linear_beta)
 
 
 def _index_first_axis(x: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
@@ -223,6 +249,12 @@ def _pad_input(hidden_states: torch.Tensor, indices: torch.Tensor, batch_size: i
     return output.reshape(batch_size, seq_len, *hidden_states.shape[1:])
 
 
+# One cached upper-triangular mask per (dtype, device), grown on demand and
+# sliced per call, so repeated microbatches skip rebuilding the [S, S] mask on
+# the hot path while the cache stays bounded to a single largest-size entry.
+_CAUSAL_MASK_CACHE: dict[tuple[torch.dtype, torch.device], torch.Tensor] = {}
+
+
 def _make_causal_mask(
     inputs_embeds: torch.Tensor,
     packed_context: "KimiPackedContext | None",
@@ -249,10 +281,14 @@ def _make_causal_mask(
             q_global_start=0,
             dtype=dtype,
         )
-    min_value = torch.finfo(dtype).min
-    mask = torch.full((seq_len, seq_len), min_value, device=inputs_embeds.device, dtype=dtype)
-    mask = torch.triu(mask, diagonal=1)
-    return mask[None, None, :, :].expand(batch_size, 1, -1, -1)
+    cache_key = (dtype, inputs_embeds.device)
+    mask = _CAUSAL_MASK_CACHE.get(cache_key)
+    if mask is None or mask.shape[0] < seq_len:
+        min_value = torch.finfo(dtype).min
+        mask = torch.full((seq_len, seq_len), min_value, device=inputs_embeds.device, dtype=dtype)
+        mask = torch.triu(mask, diagonal=1)
+        _CAUSAL_MASK_CACHE[cache_key] = mask
+    return mask[None, None, :seq_len, :seq_len].expand(batch_size, 1, -1, -1)
 
 
 def _packed_context_from_inputs(
@@ -298,11 +334,7 @@ class KimiRMSNorm(nn.Module):
         Returns:
             Tensor of shape [batch, sequence, hidden].
         """
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
+        return _rms_norm(hidden_states, self.weight, self.variance_epsilon)
 
     def reset_parameters(self) -> None:
         nn.init.ones_(self.weight)
@@ -735,12 +767,16 @@ class KimiDeltaAttention(nn.Module):
         self.q_proj = nn.Linear(self.hidden_size, projection_k_size, bias=False, dtype=dtype)
         self.k_proj = nn.Linear(self.hidden_size, projection_k_size, bias=False, dtype=dtype)
         self.v_proj = nn.Linear(self.hidden_size, projection_size, bias=False, dtype=dtype)
+        # FLA's ShortConvolution defaults to its Triton kernels; ``kda_conv_backend: cuda`` selects the
+        # causal-conv1d CUDA kernels when that package is installed (FLA falls back to Triton otherwise).
+        conv_kwargs = _short_conv_backend_kwargs(getattr(config, "kda_conv_backend", "triton"))
         self.q_conv1d = _KimiFp32Module(
             ShortConvolution(
                 hidden_size=projection_k_size,
                 kernel_size=self.conv_size,
                 activation="silu",
                 dtype=torch.float32,
+                **conv_kwargs,
             )
         )
         self.k_conv1d = _KimiFp32Module(
@@ -749,6 +785,7 @@ class KimiDeltaAttention(nn.Module):
                 kernel_size=self.conv_size,
                 activation="silu",
                 dtype=torch.float32,
+                **conv_kwargs,
             )
         )
         self.v_conv1d = _KimiFp32Module(
@@ -757,6 +794,7 @@ class KimiDeltaAttention(nn.Module):
                 kernel_size=self.conv_size,
                 activation="silu",
                 dtype=torch.float32,
+                **conv_kwargs,
             )
         )
 
@@ -920,23 +958,52 @@ class KimiDeltaAttention(nn.Module):
         kernel = chunk_kda if mode == "chunk" else fused_recurrent_kda
         kernel_options = {
             "use_qk_l2norm_in_kernel": use_qk_l2norm_in_kernel,
-            "transpose_state_layout": True,
+            # FLA's transposed [K, V] state layout is the reference default; the plain layout runs the
+            # chunk kernels slightly faster on GB200 and yields the same output up to fp32 summation order.
+            "transpose_state_layout": bool(getattr(self.config, "kda_transpose_state_layout", True)),
         }
         if mode == "chunk":
             kernel_options["safe_gate"] = self.gate_lower_bound is not None
-        o, _ = kernel(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            initial_state=None,
-            # Under CP the final state is owned by FLA's rank-to-rank handoff.
-            output_final_state=cp_context is None,
-            cu_seqlens=cu_seqlens,
-            **kernel_options,
-            **kernel_kwargs,
-        )
+            if getattr(self.config, "kda_disable_recompute", False) and _CHUNK_KDA_HAS_DISABLE_RECOMPUTE:
+                # Under activation checkpointing the layer forward is already re-run right before its
+                # backward, so FLA's own in-backward recompute of w/u/qg/kg and the chunk states is
+                # redundant work: keep them from that forward instead (transient memory, freed at the
+                # end of the layer backward).
+                kernel_options["disable_recompute"] = True
+        if getattr(self.config, "kda_chunk_impl", "fla") == "fused":
+            # Opt-in fused kernels: a CUDA forward and a Triton backward that recomputes from the raw inputs
+            # (nothing but q/k/v/g/beta/cu_seqlens is saved). Same math as FLA's chunk_kda at the K3 call; the kernels
+            # are specialised to that call, so an unsupported call raises instead of silently running FLA.
+            reason = fused_kda_unsupported_reason(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                cu_seqlens,
+                mode=mode,
+                cp_context=cp_context,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                safe_gate=self.gate_lower_bound is not None,
+            )
+            if reason is not None:
+                raise ValueError(f"kda_chunk_impl='fused' cannot run this KDA call: {reason}")
+            o, _ = fused_chunk_kda(q, k, v, g, beta, cu_seqlens)
+        else:
+            o, _ = kernel(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                initial_state=None,
+                # The final recurrent state is never consumed in training (and under CP it is owned by
+                # FLA's rank-to-rank handoff), so do not have the kernel materialise it.
+                output_final_state=False,
+                cu_seqlens=cu_seqlens,
+                **kernel_options,
+                **kernel_kwargs,
+            )
 
         if self.use_full_rank_gate:
             gate = self.g_proj(hidden_states)
@@ -971,24 +1038,6 @@ class KimiDeltaAttention(nn.Module):
                 conv.reset_parameters()
             if hasattr(self.o_norm, "reset_parameters"):
                 self.o_norm.reset_parameters()
-
-
-def _weighted_situ(
-    gate_up: torch.Tensor,
-    routing_weights: torch.Tensor,
-    *,
-    beta: float,
-    linear_beta: float | None,
-) -> torch.Tensor:
-    """Apply SiTU and routing weights to ``[tokens, 2 * intermediate]`` projections."""
-    input_dtype = gate_up.dtype
-    gate, up = gate_up.chunk(2, dim=-1)
-    gate = gate.float()
-    up = up.float()
-    activated = beta * torch.tanh(gate / beta) * torch.sigmoid(gate)
-    if linear_beta is not None:
-        up = linear_beta * torch.tanh(up / linear_beta)
-    return (activated * up * routing_weights.float()).to(input_dtype)
 
 
 class KimiK3Gate(Gate):
@@ -1043,6 +1092,19 @@ class KimiK3Gate(Gate):
         return weights * self.route_scale, indices, None
 
 
+_SHARED_EXPERT_STREAMS: dict[int, torch.cuda.Stream] = {}
+
+
+def _shared_expert_stream(device: torch.device) -> torch.cuda.Stream:
+    """Return the per-device side stream used for shared-expert overlap (created lazily, one per process)."""
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    stream = _SHARED_EXPERT_STREAMS.get(index)
+    if stream is None:
+        stream = torch.cuda.Stream(device=index)
+        _SHARED_EXPERT_STREAMS[index] = stream
+    return stream
+
+
 class KimiK3MoE(MoE):
     """K3 routed experts with latent projections and a SiTU shared expert."""
 
@@ -1052,7 +1114,20 @@ class KimiK3MoE(MoE):
         self.dim = moe_config.dim
         self.n_routed_experts = moe_config.n_routed_experts
         self.n_activated_experts = moe_config.n_activated_experts
-        self.gate = KimiK3Gate(moe_config, gate_precision=torch.float32)
+        if backend.fake_balanced_gate:
+            # Mirror the base MoE: with random-init weights the learned gate's
+            # near-equal scores make topk pick experts [0..topk) for every token,
+            # collapsing all traffic onto each EP group's first rank.
+            self.gate = FakeBalancedGate(moe_config, noise=backend.fake_gate_noise)
+        else:
+            self.gate = KimiK3Gate(moe_config, gate_precision=torch.float32)
+        if backend.compile_situ:
+            _compile_situ_cores()
+        situ_backend = getattr(config, "situ_backend", "torch")
+        if situ_backend != "torch":
+            _enable_situ_triton(fast_math=situ_backend == "triton_fast_math")
+        if backend.compile_norm:
+            _compile_norm_core()
         expert_activation = partial(
             _weighted_situ,
             beta=config.activation_situ_beta or 1.0,
@@ -1118,6 +1193,24 @@ class KimiK3MoE(MoE):
         gate_cp_mesh = cp_mesh if cp_mesh is not None else self.cp_mesh
         weights, indices, _ = self.gate(identity, token_mask, gate_cp_mesh)
         routed_input = self.routed_expert_down_proj(identity)
+        # Shared-expert overlap (BackendConfig.shared_expert_overlap): the shared experts only
+        # depend on ``identity``, so launch them on a side stream before the routed path and
+        # join after it. Under expert parallelism the routed path spends most of its time in
+        # dispatch / combine communication on the current stream, which leaves SMs free for the
+        # shared-expert GEMMs (same idea as Megatron-Core's ``moe_shared_expert_overlap``).
+        # Autograd replays each backward op on the stream its forward op used; measured on an
+        # 8-node EP32 K3 mini the win comes from the forward and recompute passes (launching the
+        # shared experts after the routed path to reorder the backward was slower: the routed path
+        # host-syncs on tokens_per_expert, which serializes the shared experts behind it).
+        shared_output = None
+        shared_stream = None
+        if self.shared_experts is not None and self.backend.shared_expert_overlap and identity.is_cuda:
+            shared_stream = _shared_expert_stream(identity.device)
+            shared_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(shared_stream):
+                shared_output = self.shared_experts(identity)
+            # ``identity`` was allocated on the current stream; keep its block alive for the side stream.
+            identity.record_stream(shared_stream)
         if not self.training and not self._has_distributed_experts():
             routed = self._forward_reference_order(routed_input, indices, weights)
         else:
@@ -1125,7 +1218,12 @@ class KimiK3MoE(MoE):
         if self.routed_expert_norm is not None:
             routed = self.routed_expert_norm(routed)
         output = self.routed_expert_up_proj(routed)
-        if self.shared_experts is not None:
+        if shared_output is not None:
+            current = torch.cuda.current_stream()
+            current.wait_stream(shared_stream)
+            shared_output.record_stream(current)
+            output = output + shared_output
+        elif self.shared_experts is not None:
             output = output + self.shared_experts(identity)
         return output.view(shape)
 
@@ -1181,22 +1279,6 @@ class KimiK3MoE(MoE):
             self.shared_experts.init_weights(buffer_device, init_std)
 
 
-def _apply_attn_res(
-    prefix_sum: torch.Tensor,
-    block_residual: torch.Tensor,
-    projection: nn.Linear,
-    norm: KimiRMSNorm,
-) -> torch.Tensor:
-    """Mix ``[tokens, hidden]`` with prior ``[tokens, blocks, hidden]`` residuals."""
-    values = torch.cat((block_residual, prefix_sum.unsqueeze(1)), dim=1)
-    values_fp32 = values.float()
-    variance = values_fp32.pow(2).mean(-1, keepdim=True)
-    keys = values_fp32 * torch.rsqrt(variance + norm.variance_epsilon)
-    score_weight = norm.weight.float() * projection.weight.squeeze(0).float()
-    probabilities = (keys * score_weight).sum(-1).softmax(-1).unsqueeze(1)
-    return torch.matmul(probabilities, values_fp32).squeeze(1).to(values.dtype)
-
-
 class KimiDecoderLayer(nn.Module):
     """Kimi decoder block with KDA/MLA attention and dense or MoE MLP."""
 
@@ -1229,6 +1311,8 @@ class KimiDecoderLayer(nn.Module):
         self.post_attention_layernorm = KimiRMSNorm(config.hidden_size, eps=config.rms_norm_eps, dtype=dtype)
         self.use_attn_residuals = config.attn_res_block_size is not None
         if self.use_attn_residuals:
+            if getattr(config, "attn_res_triton", False):
+                _enable_attn_res_triton()
             self.attn_res_block_size = config.attn_res_block_size
             self.self_attention_res_norm = KimiRMSNorm(
                 config.hidden_size,
@@ -1510,7 +1594,11 @@ class KimiK3TextModel(nn.Module):
         Returns:
             Binary padding mask tensor of shape [batch, sequence], or None when no KDA mask is needed.
         """
-        if cache_position[0] > 0 or (attention_mask is not None and torch.all(attention_mask == 1)):
+        if attention_mask is None:
+            # Both branches below return None for this input; returning early skips
+            # a per-microbatch device-to-host sync on cache_position[0].
+            return None
+        if cache_position[0] > 0 or torch.all(attention_mask == 1):
             return None
         return attention_mask
 
@@ -1663,7 +1751,7 @@ class KimiK3TextModel(nn.Module):
             if self.embed_tokens is not None:
                 nn.init.normal_(self.embed_tokens.weight, mean=0.0, std=init_std)
                 if self.padding_idx is not None:
-                    self.embed_tokens.weight[self.padding_idx].zero_()
+                    zero_embedding_row_(self.embed_tokens.weight, self.padding_idx)
             if self.norm is not None:
                 self.norm.reset_parameters()
             if self.use_attn_residuals:

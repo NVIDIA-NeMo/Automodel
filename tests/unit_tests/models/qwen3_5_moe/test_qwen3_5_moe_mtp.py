@@ -73,6 +73,39 @@ def _backend():
 
 
 class TestQwen3_5MoeMTP:
+    def test_vlm_declares_mtp_cp_and_prepares_multi_axis_inputs(self):
+        model = Qwen3_5MoeForConditionalGeneration(_tiny_vl_config(mtp_num_hidden_layers=1), backend=_backend())
+        batch = {
+            "input_ids": torch.tensor([[10, 11, 20, 21]]),
+            "labels": torch.tensor([[11, 12, 21, 22]]),
+            "position_ids": torch.tensor(
+                [
+                    [[0, 1, 0, 1]],
+                    [[10, 11, 20, 21]],
+                    [[30, 31, 40, 41]],
+                ]
+            ),
+            "_packed_seq_ids": torch.tensor([[0, 0, 1, 1]]),
+        }
+
+        prepared = model.prepare_mtp_inputs_for_cp(batch, ignore_index=-100)
+
+        assert model.ModelCapabilities().supports_mtp_cp
+        assert prepared.position_ids_seq_dim == 2
+        torch.testing.assert_close(prepared.input_ids[0], torch.tensor([[11, 0, 21, 0]]))
+        torch.testing.assert_close(
+            prepared.position_ids[0],
+            torch.tensor(
+                [
+                    [[1, 0, 1, 0]],
+                    [[11, 0, 21, 0]],
+                    [[31, 0, 41, 0]],
+                ]
+            ),
+        )
+        torch.testing.assert_close(prepared.targets[0], torch.tensor([[12, -100, 22, -100]]))
+        torch.testing.assert_close(prepared.valid_masks[0], torch.tensor([[True, False, True, False]]))
+
     def test_moe_mtp_builds_full_attention_moe_block(self):
         model = Qwen3_5MoeForConditionalGeneration(_tiny_vl_config(mtp_num_hidden_layers=1), backend=_backend())
 

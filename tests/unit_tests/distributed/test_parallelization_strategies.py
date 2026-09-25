@@ -15,8 +15,9 @@
 """Tests for the parallelization strategy pattern."""
 
 import logging
+import sys
 from abc import ABC
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import pytest
@@ -81,6 +82,18 @@ class MockNemotronHModel(nn.Module):
 
     def __init__(self):
         super().__init__()
+
+        class MockSupports:
+            def __init__(self, model):
+                self.model = model
+                self.supports_mtp_cp = True
+                self.supports_mtp_cp_pp = False
+
+            @property
+            def mtp_enabled(self):
+                return bool(getattr(getattr(self.model, "mtp_config", None), "enabled", False))
+
+        self.supports = MockSupports(self)
         self.config = SimpleNamespace(
             num_attention_heads=8,
             num_key_value_heads=8,
@@ -310,6 +323,7 @@ class TestDefaultParallelizationStrategy:
             "dp_shard_cp_mesh_name",
             "tp_mesh_name",
             "frozen_multimodal_sharding",
+            "reapply_trainability",
         ]
 
         for param in required_params:
@@ -336,6 +350,135 @@ class TestDefaultParallelizationStrategy:
         mock_distributed_env["apply_fsdp"].assert_called_once()
         mock_distributed_env["fully_shard"].assert_called()
 
+    def test_fsdp_sharding_hook_forwards_the_positional_contract(
+        self, strategy, mock_device_mesh, mock_distributed_env, monkeypatch
+    ):
+        """``_apply_fsdp_sharding`` hands ``apply_fsdp2_sharding_recursively`` its exact argument shape.
+
+        Subclasses override the hook with the same signature, so a reordered positional
+        argument here would silently misconfigure every strategy that does not.
+        """
+        mesh, _, _, _ = mock_device_mesh
+        dp_mesh = MagicMock()
+        monkeypatch.setattr(
+            "nemo_automodel.components.distributed.parallelizer.get_fsdp_dp_mesh",
+            lambda *_args, **_kwargs: dp_mesh,
+        )
+        model = MockModel()
+        mp_policy = MagicMock()
+        offload_policy = MagicMock()
+
+        strategy.parallelize(
+            model=model,
+            device_mesh=mesh,
+            mp_policy=mp_policy,
+            offload_policy=offload_policy,
+            enable_fsdp2_prefetch=False,
+            fsdp2_backward_prefetch_depth=5,
+            fsdp2_forward_prefetch_depth=4,
+            reshard_after_forward=True,
+        )
+
+        mock_distributed_env["apply_fsdp"].assert_called_once_with(
+            model,
+            dp_mesh,
+            mp_policy,
+            offload_policy,
+            False,
+            5,
+            4,
+            True,
+            fully_shard_fn=mock_distributed_env["fully_shard"],
+            frozen_multimodal_sharding="root",
+            ignored_multimodal_params=set(),
+        )
+        assert mock_distributed_env["apply_fsdp"].call_args.args[1] is dp_mesh
+
+    @pytest.mark.parametrize(
+        ("reshard_after_forward", "expected_input_reshard", "expected_output_reshard"),
+        [(None, True, False), (True, True, False), (False, False, False)],
+    )
+    def test_parallelize_splits_untied_input_and_output_embeddings(
+        self,
+        strategy,
+        mock_device_mesh,
+        mock_distributed_env,
+        reshard_after_forward,
+        expected_input_reshard,
+        expected_output_reshard,
+    ):
+        """Untied trainable tables become separate FSDP units before the root."""
+        mesh, _, _, _ = mock_device_mesh
+        model = MockModel()
+        model.model.embed_tokens = nn.Embedding(32, 10)
+        model.lm_head = nn.Linear(10, 32, bias=False)
+        model.get_input_embeddings = lambda: model.model.embed_tokens
+        model.get_output_embeddings = lambda: model.lm_head
+
+        strategy.parallelize(
+            model=model,
+            device_mesh=mesh,
+            sequence_parallel=False,
+            activation_checkpointing=False,
+            reshard_after_forward=reshard_after_forward,
+        )
+
+        calls = mock_distributed_env["fully_shard"].call_args_list
+        modules = [item.args[0] for item in calls]
+        assert model.model.embed_tokens in modules
+        assert model.lm_head in modules
+        assert modules[-1] is model
+        embed_call = next(item for item in calls if item.args[0] is model.model.embed_tokens)
+        head_call = next(item for item in calls if item.args[0] is model.lm_head)
+        assert embed_call.kwargs["reshard_after_forward"] is expected_input_reshard
+        assert head_call.kwargs["reshard_after_forward"] is expected_output_reshard
+
+    def test_parallelize_keeps_tied_embeddings_in_root(self, strategy, mock_device_mesh, mock_distributed_env):
+        """Input/output parameters sharing storage must not acquire two FSDP owners."""
+        mesh, _, _, _ = mock_device_mesh
+        model = MockModel()
+        model.config.tie_word_embeddings = True
+        model.model.embed_tokens = nn.Embedding(32, 10)
+        model.lm_head = nn.Linear(10, 32, bias=False)
+        model.lm_head.weight = nn.Parameter(model.model.embed_tokens.weight.detach())
+        assert model.lm_head.weight is not model.model.embed_tokens.weight
+        assert model.lm_head.weight.data_ptr() == model.model.embed_tokens.weight.data_ptr()
+        model.get_input_embeddings = lambda: model.model.embed_tokens
+        model.get_output_embeddings = lambda: model.lm_head
+
+        strategy.parallelize(
+            model=model,
+            device_mesh=mesh,
+            sequence_parallel=False,
+            activation_checkpointing=False,
+        )
+
+        modules = [item.args[0] for item in mock_distributed_env["fully_shard"].call_args_list]
+        assert model.model.embed_tokens not in modules
+        assert model.lm_head not in modules
+        assert modules[-1] is model
+
+    def test_parallelize_keeps_frozen_embeddings_in_root(self, strategy, mock_device_mesh, mock_distributed_env):
+        """Frozen tables do not need standalone gradient communication units."""
+        mesh, _, _, _ = mock_device_mesh
+        model = MockModel()
+        model.model.embed_tokens = nn.Embedding(32, 10).requires_grad_(False)
+        model.lm_head = nn.Linear(10, 32, bias=False).requires_grad_(False)
+        model.get_input_embeddings = lambda: model.model.embed_tokens
+        model.get_output_embeddings = lambda: model.lm_head
+
+        strategy.parallelize(
+            model=model,
+            device_mesh=mesh,
+            sequence_parallel=False,
+            activation_checkpointing=False,
+        )
+
+        modules = [item.args[0] for item in mock_distributed_env["fully_shard"].call_args_list]
+        assert model.model.embed_tokens not in modules
+        assert model.lm_head not in modules
+        assert modules[-1] is model
+
     def test_parallelize_with_tensor_parallel(self, strategy, mock_device_mesh, mock_distributed_env):
         """Test parallelization with tensor parallelism enabled."""
         mesh, dp_replicate_mesh, dp_shard_mesh, tp_mesh = mock_device_mesh
@@ -354,6 +497,24 @@ class TestDefaultParallelizationStrategy:
         mock_distributed_env["validate_tp"].assert_called_once_with(model, tp_mesh)
         mock_distributed_env["get_plan"].assert_called_once()
         mock_distributed_env["parallelize_module"].assert_called_once()
+
+    def test_trainability_rebind_runs_after_tp_and_before_fsdp(self, strategy, mock_device_mesh, mock_distributed_env):
+        """FSDP captures the selector result on the post-TP hierarchy."""
+        mesh, _, _, tp_mesh = mock_device_mesh
+        tp_mesh.size.return_value = 2
+        model = MockModel()
+        events = []
+
+        mock_distributed_env["parallelize_module"].side_effect = lambda *_args, **_kwargs: events.append("tp")
+        mock_distributed_env["apply_fsdp"].side_effect = lambda *_args, **_kwargs: events.append("fsdp")
+
+        strategy.parallelize(
+            model=model,
+            device_mesh=mesh,
+            reapply_trainability=lambda _model: events.append("trainability"),
+        )
+
+        assert events == ["tp", "trainability", "fsdp"]
 
     def test_parallelize_with_activation_checkpointing(self, strategy, mock_device_mesh, mock_distributed_env):
         """Test parallelization with activation checkpointing enabled."""
@@ -459,6 +620,201 @@ class TestNemotronHParallelizationStrategy:
         """Test that NemotronHParallelizationStrategy can be instantiated."""
         assert isinstance(strategy, NemotronHParallelizationStrategy)
         assert isinstance(strategy, ParallelizationStrategy)
+
+    @pytest.mark.parametrize("mtp_enabled", [True, False])
+    def test_configures_only_enabled_mtp_attention_and_mamba_for_cp(
+        self,
+        strategy,
+        mock_device_mesh,
+        nemotron_model,
+        monkeypatch,
+        mtp_enabled,
+    ):
+        """The strategy installs CP collectives only on enabled MTP blocks."""
+        mesh, dp_replicate_mesh, dp_shard_mesh, tp_mesh = mock_device_mesh
+        cp_group = object()
+        cp_mesh = MagicMock()
+        cp_mesh.size.return_value = 2
+        cp_mesh.get_group.return_value = cp_group
+        mesh.mesh_dim_names = ("dp_replicate", "dp_shard_cp", "cp", "tp")
+        mesh.__getitem__.side_effect = lambda key: {
+            "dp_replicate": dp_replicate_mesh,
+            "dp_shard_cp": dp_shard_mesh,
+            "cp": cp_mesh,
+            "tp": tp_mesh,
+            ("dp_replicate", "dp_shard_cp"): dp_shard_mesh,
+        }[key]
+
+        class FakeDotProductAttention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.set_context_parallel_group = MagicMock()
+
+        attention_module = FakeDotProductAttention()
+        attention_layer = nn.Module()
+        attention_layer.block_type = "attention"
+        attention_layer.mixer = nn.Module()
+        attention_layer.mixer.attn_module = attention_module
+        attention_module_2 = FakeDotProductAttention()
+        attention_layer_2 = nn.Module()
+        attention_layer_2.block_type = "attention"
+        attention_layer_2.mixer = nn.Module()
+        attention_layer_2.mixer.attn_module = attention_module_2
+
+        mamba_layer = nn.Module()
+        mamba_layer.block_type = "mamba"
+        mamba_layer.mixer = nn.Module()
+        mamba_layer.mixer.num_heads = 8
+        mamba_layer.mixer.head_dim = 16
+        mamba_layer.mixer.n_groups = 2
+        mamba_layer.mixer.ssm_state_size = 64
+
+        nemotron_model.mtp_config = SimpleNamespace(enabled=mtp_enabled)
+        nemotron_model.mtp = nn.Module()
+        nemotron_model.mtp.layers = nn.ModuleList([attention_layer, attention_layer_2, mamba_layer])
+
+        transformer_engine = ModuleType("transformer_engine")
+        transformer_engine.__path__ = []
+        transformer_engine_pytorch = ModuleType("transformer_engine.pytorch")
+        transformer_engine_pytorch.__path__ = []
+        transformer_engine_attention = ModuleType("transformer_engine.pytorch.attention")
+        transformer_engine_attention.DotProductAttention = FakeDotProductAttention
+        monkeypatch.setitem(sys.modules, "transformer_engine", transformer_engine)
+        monkeypatch.setitem(sys.modules, "transformer_engine.pytorch", transformer_engine_pytorch)
+        monkeypatch.setitem(sys.modules, "transformer_engine.pytorch.attention", transformer_engine_attention)
+
+        from nemo_automodel.components.distributed.context_parallel import mamba as mamba_module
+
+        mamba_cp = object()
+        mamba_cp_ctor = MagicMock(return_value=mamba_cp)
+        monkeypatch.setattr(mamba_module, "MambaContextParallel", mamba_cp_ctor)
+        cp_ranks = [0, 1]
+        get_cp_ranks = MagicMock(return_value=cp_ranks)
+        cp_stream = object()
+        monkeypatch.setattr(parallelizer_mod.torch.distributed, "get_process_group_ranks", get_cp_ranks)
+        monkeypatch.setattr(parallelizer_mod.torch.cuda, "Stream", lambda: cp_stream)
+        monkeypatch.setattr(parallelizer_mod, "fully_shard", lambda model, **_kwargs: model)
+        monkeypatch.setattr(
+            parallelizer_mod.parallelizer_utils,
+            "fully_shard_by_dtype",
+            lambda model, **_kwargs: model,
+        )
+
+        strategy.parallelize(model=nemotron_model, device_mesh=mesh)
+
+        if not mtp_enabled:
+            attention_module.set_context_parallel_group.assert_not_called()
+            attention_module_2.set_context_parallel_group.assert_not_called()
+            mamba_cp_ctor.assert_not_called()
+            assert not hasattr(mamba_layer.mixer, "cp")
+            return
+
+        attention_module.set_context_parallel_group.assert_called_once_with(
+            cp_group,
+            cp_ranks,
+            cp_stream,
+            cp_comm_type="p2p",
+        )
+        attention_module_2.set_context_parallel_group.assert_called_once_with(
+            cp_group,
+            cp_ranks,
+            cp_stream,
+            cp_comm_type="p2p",
+        )
+        get_cp_ranks.assert_called_once_with(cp_group)
+        mamba_cp_ctor.assert_called_once_with(
+            cp_group=cp_group,
+            num_heads=8,
+            head_dim=16,
+            n_groups=2,
+            d_state=64,
+            mixer=mamba_layer.mixer,
+        )
+        assert mamba_layer.mixer.cp is mamba_cp
+
+    def test_cp_mtp_pipeline_stage_raises_explicit_unsupported_topology(
+        self,
+        strategy,
+        mock_device_mesh,
+        nemotron_model,
+        monkeypatch,
+    ):
+        """Every trimmed PP stage must fail before stage-specific CP wiring."""
+        mesh, dp_replicate_mesh, dp_shard_mesh, tp_mesh = mock_device_mesh
+        cp_group = object()
+        cp_mesh = MagicMock()
+        cp_mesh.size.return_value = 2
+        cp_mesh.get_group.return_value = cp_group
+        mesh.mesh_dim_names = ("dp_replicate", "dp_shard_cp", "cp", "tp")
+        mesh.__getitem__.side_effect = lambda key: {
+            "dp_replicate": dp_replicate_mesh,
+            "dp_shard_cp": dp_shard_mesh,
+            "cp": cp_mesh,
+            "tp": tp_mesh,
+            ("dp_replicate", "dp_shard_cp"): dp_shard_mesh,
+        }[key]
+        nemotron_model.mtp_config = SimpleNamespace(enabled=True)
+        nemotron_model.mtp = None
+        nemotron_model._is_pipeline_parallel_stage = lambda: True
+        monkeypatch.setattr(parallelizer_mod.torch.distributed, "get_process_group_ranks", lambda _group: [0, 1])
+
+        with pytest.raises(NotImplementedError, match="MTP with context and pipeline parallelism"):
+            strategy.parallelize(model=nemotron_model, device_mesh=mesh)
+
+    def test_cp_raises_when_enabled_mtp_layers_are_unavailable(
+        self,
+        strategy,
+        mock_device_mesh,
+        nemotron_model,
+        monkeypatch,
+    ):
+        mesh, dp_replicate_mesh, dp_shard_mesh, tp_mesh = mock_device_mesh
+        cp_group = object()
+        cp_mesh = MagicMock()
+        cp_mesh.size.return_value = 2
+        cp_mesh.get_group.return_value = cp_group
+        mesh.mesh_dim_names = ("dp_replicate", "dp_shard_cp", "cp", "tp")
+        mesh.__getitem__.side_effect = lambda key: {
+            "dp_replicate": dp_replicate_mesh,
+            "dp_shard_cp": dp_shard_mesh,
+            "cp": cp_mesh,
+            "tp": tp_mesh,
+            ("dp_replicate", "dp_shard_cp"): dp_shard_mesh,
+        }[key]
+        nemotron_model.mtp_config = SimpleNamespace(enabled=True)
+        nemotron_model.mtp = nn.Module()
+        monkeypatch.setattr(parallelizer_mod.torch.distributed, "get_process_group_ranks", lambda _group: [0, 1])
+
+        with pytest.raises(RuntimeError, match=r"MTP is enabled but model\.mtp\.layers is unavailable"):
+            strategy.parallelize(model=nemotron_model, device_mesh=mesh)
+
+    def test_cp_rejects_enabled_mtp_without_capability(
+        self,
+        strategy,
+        mock_device_mesh,
+        nemotron_model,
+        monkeypatch,
+    ):
+        mesh, dp_replicate_mesh, dp_shard_mesh, tp_mesh = mock_device_mesh
+        cp_mesh = MagicMock()
+        cp_mesh.size.return_value = 2
+        cp_mesh.get_group.return_value = object()
+        mesh.mesh_dim_names = ("dp_replicate", "dp_shard_cp", "cp", "tp")
+        mesh.__getitem__.side_effect = lambda key: {
+            "dp_replicate": dp_replicate_mesh,
+            "dp_shard_cp": dp_shard_mesh,
+            "cp": cp_mesh,
+            "tp": tp_mesh,
+            ("dp_replicate", "dp_shard_cp"): dp_shard_mesh,
+        }[key]
+        nemotron_model.mtp_config = SimpleNamespace(enabled=True)
+        nemotron_model.mtp = nn.Module()
+        nemotron_model.mtp.layers = nn.ModuleList([nn.Module()])
+        nemotron_model.supports.supports_mtp_cp = False
+        monkeypatch.setattr(parallelizer_mod.torch.distributed, "get_process_group_ranks", lambda _group: [0, 1])
+
+        with pytest.raises(RuntimeError, match="does not support MTP with context parallelism"):
+            strategy.parallelize(model=nemotron_model, device_mesh=mesh)
 
     def test_sequence_parallel_not_supported(self, strategy, mock_device_mesh, nemotron_model):
         """Test that sequence parallelism raises assertion error."""
@@ -606,6 +962,16 @@ class TestNemotronHParallelizationStrategy:
         assert mock_checkpoint.call_count == expected_checkpoint_calls
 
 
+class _MockQwen35Model(nn.Module):
+    """Minimal Qwen3.5-shaped model: a decoder ``layers`` list under ``model``."""
+
+    def __init__(self):
+        super().__init__()
+        self.config = SimpleNamespace(num_attention_heads=8, num_key_value_heads=8, hidden_size=64)
+        self.model = nn.Module()
+        self.model.layers = nn.ModuleList([nn.Linear(10, 10), nn.Linear(10, 10)])
+
+
 class TestQwen3_5ParallelizationStrategy:
     """Test the Qwen3.5 dtype-based FSDP strategy."""
 
@@ -672,6 +1038,56 @@ class TestQwen3_5ParallelizationStrategy:
             assert root_kwargs["ignored_params"] == frozen_vision_params
         else:
             assert "ignored_params" not in root_kwargs
+
+    @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
+    @patch("nemo_automodel.components.distributed.parallelizer_utils.fully_shard_by_dtype")
+    def test_dtype_sharding_does_not_mutate_module_globals(
+        self,
+        fully_shard_by_dtype,
+        fully_shard,
+        strategy,
+        mock_device_mesh,
+    ):
+        """Qwen3.5 overrides sharding through a subclass hook, not the module global.
+
+        The override used to be installed by rebinding
+        ``parallelizer.apply_fsdp2_sharding_recursively`` for the duration of the call,
+        which any concurrent or nested parallelize of another model would have picked
+        up. Assert the global is untouched *while* Qwen3.5 shards, not just after.
+        """
+        mesh, _, _, _ = mock_device_mesh
+        default_walk = parallelizer_mod.apply_fsdp2_sharding_recursively
+        observed = []
+
+        def record(module, *args, **kwargs):
+            observed.append(parallelizer_mod.apply_fsdp2_sharding_recursively)
+            return module
+
+        fully_shard.side_effect = lambda model, **kwargs: model
+        fully_shard_by_dtype.side_effect = record
+
+        strategy.parallelize(model=_MockQwen35Model(), device_mesh=mesh)
+
+        assert observed, "expected the dtype-aware sharder to run"
+        assert all(fn is default_walk for fn in observed)
+        assert parallelizer_mod.apply_fsdp2_sharding_recursively is default_walk
+
+    @patch("nemo_automodel.components.distributed.parallelizer_utils.fully_shard_by_dtype")
+    def test_dtype_walk_honors_fully_shard_fn(self, fully_shard_by_dtype, strategy, mock_device_mesh):
+        """A model-specific ``fully_shard_fn`` reaches every unit: decoder layers and the root."""
+        mesh, _, _, _ = mock_device_mesh
+        model = _MockQwen35Model()
+        custom_fully_shard = MagicMock(side_effect=lambda module, **_kwargs: module)
+        fully_shard_by_dtype.side_effect = lambda module, *_args, **_kwargs: module
+
+        result = strategy.parallelize(model=model, device_mesh=mesh, fully_shard_fn=custom_fully_shard)
+
+        assert result is model
+        layer_calls = fully_shard_by_dtype.call_args_list
+        assert [call.args[0] for call in layer_calls] == list(model.model.layers)
+        assert all(call.kwargs["fully_shard_fn"] is custom_fully_shard for call in layer_calls)
+        # The root unit is wrapped by the same primitive, not by torch's fully_shard.
+        assert custom_fully_shard.call_args_list[-1].args[0] is model
 
 
 class TestStrategyRegistry:
@@ -1029,6 +1445,7 @@ class TestFsdp2StrategyParallelizeIntegration:
             "dp_shard_cp_mesh_name",
             "tp_mesh_name",
             "frozen_multimodal_sharding",
+            "reapply_trainability",
         ]
 
         for param in expected_params:

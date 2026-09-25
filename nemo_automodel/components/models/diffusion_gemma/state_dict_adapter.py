@@ -42,7 +42,7 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
-from typing import Any, Optional
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -90,7 +90,7 @@ class DiffusionGemmaStateDictAdapter(StateDictAdapter):
     def from_hf(
         self,
         hf_state_dict: dict[str, Any],
-        device_mesh: Optional[DeviceMesh] = None,
+        device_mesh: DeviceMesh | None = None,
         **kwargs,
     ) -> dict[str, Any]:
         n_experts = self.moe_config.n_routed_experts
@@ -254,11 +254,11 @@ class DiffusionGemmaStateDictAdapter(StateDictAdapter):
     def to_hf(
         self,
         state_dict: dict[str, Any],
-        exclude_key_regex: Optional[str] = None,
+        exclude_key_regex: str | None = None,
         quantization: bool = False,
         **kwargs,
     ) -> dict[str, Any]:
-        device_mesh: Optional[DeviceMesh] = kwargs.get("device_mesh")
+        device_mesh: DeviceMesh | None = kwargs.get("device_mesh")
         n_experts = self.moe_config.n_routed_experts
         hf_state_dict: dict[str, Any] = {}
 
@@ -354,7 +354,7 @@ class DiffusionGemmaStateDictAdapter(StateDictAdapter):
     def _gather_expert_tensor(
         self,
         tensor: torch.Tensor,
-        device_mesh: Optional[DeviceMesh],
+        device_mesh: DeviceMesh | None,
         n_experts: int,
     ) -> torch.Tensor:
         """Map a stacked expert tensor to its HF (global ``[n_experts, ...]``) form.

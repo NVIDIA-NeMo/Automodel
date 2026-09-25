@@ -44,7 +44,7 @@ model:
     linear: te
     rms_norm: te
     rope_fusion: false
-    experts: gmm
+    experts: torch_mm
     dispatcher: deepep
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
@@ -102,7 +102,6 @@ validation_dataloader:
     _target_: nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn
 
 freeze_config:
-  freeze_embeddings: true
   freeze_vision_tower: true
   freeze_audio_tower: true
   freeze_language_model: false

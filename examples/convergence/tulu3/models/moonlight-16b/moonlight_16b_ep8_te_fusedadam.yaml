@@ -121,8 +121,9 @@ wandb:
   dir: /tmp/wandb
 
 # ── Weekly Tulu-3 convergence CI (train 1000 steps -> IFEval -> threshold gate) ──
-# convergence_tests_launcher.sh reads downstream_eval and passes iff
-# |CI IFEval prompt_level_strict_acc - baseline| < k * stderr. baseline/stderr are
+# convergence_tests_launcher.sh reads downstream_eval and applies a one-sided
+# regression gate: passes iff CI IFEval prompt_level_strict_acc > baseline - k * stderr,
+# so a higher score always passes. baseline/stderr are
 # from our measured run (see models/moonlight-16b/run_te_fusedadam.md).
 ci:
   recipe_owner: athitten
