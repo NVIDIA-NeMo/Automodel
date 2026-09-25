@@ -189,6 +189,20 @@ ci:
     assert jobs["_vllm_deploy"]["variables"]["TIME"] == "00:30:00"
 
 
+@pytest.mark.parametrize(
+    "config_path",
+    [
+        "examples/llm_finetune/nemotron_flash/nemotron_flash_1b_squad.yaml",
+        "examples/llm_finetune/nemotron_flash/nemotron_flash_1b_squad_peft.yaml",
+    ],
+)
+def test_nemotron_flash_suppresses_unsupported_vllm_deploy(config_path):
+    jobs = dict(generate_job(Path(config_path), {}, "release", "llm_finetune", "."))
+
+    assert "" in jobs
+    assert "_vllm_deploy" not in jobs
+
+
 def test_generate_checkpoint_robustness_process_isolation_derives_phases(tmp_path):
     config = Path("large_lora.yaml")
     (tmp_path / config).write_text(
