@@ -21,7 +21,7 @@ import pickle
 import threading
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -52,8 +52,10 @@ from torch import nn
 from torch.distributed.checkpoint.metadata import Metadata, TensorStorageMetadata
 from torch.distributed.checkpoint.storage import StorageReader, StorageWriter
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.tensor import DTensor
+from torch.distributed.fsdp import FSDPModule
+from torch.distributed.tensor import DTensor, Replicate, distribute_tensor
 from torch.nn.parallel import DistributedDataParallel
+from torch.overrides import TorchFunctionMode
 from torch.serialization import MAP_LOCATION, FileLike
 
 from nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors import (
@@ -103,6 +105,48 @@ _CONSOLIDATED_SIZE_WARNING_THRESHOLD_BYTES = 50 * 1024**3
 _DEFAULT_HF_CONSOLIDATED_SHARD_SIZE_BYTES = 5 * 1024**3
 
 logger = logging.getLogger(__name__)
+
+
+class _DTensorInitCopyMode(TorchFunctionMode):
+    """Adapt full-tensor initialization copies to an already-sharded destination."""
+
+    def __torch_function__(
+        self, func: Callable, types: tuple[type, ...], args: tuple = (), kwargs: dict | None = None
+    ) -> Any:
+        """Preserve ``copy_`` semantics while matching the destination's DTensor layout.
+
+        Args:
+            func: Intercepted torch operation.
+            types: Tensor types participating in the operation.
+            args: Operation arguments. For ``copy_``, the destination has arbitrary
+                global shape and the source is broadcastable to that shape. A plain
+                source is privately copied, broadcast from mesh rank zero, and
+                locally sharded to the destination's placements before the in-place
+                copy; existing DTensor sources and plain destinations keep their
+                normal behavior.
+            kwargs: Keyword arguments to the operation, including an optional
+                ``other`` source tensor with the same contract as above.
+
+        Returns:
+            The operation result; ``copy_`` returns and mutates the original
+            destination without replacing its parameter object or local storage.
+        """
+        kwargs = kwargs or {}
+        if func is torch.Tensor.copy_ and isinstance(args[0], DTensor):
+            destination = args[0]
+            source = args[1] if len(args) > 1 else kwargs["other"]
+            if isinstance(source, torch.Tensor) and not isinstance(source, DTensor):
+                # Broadcast then shard locally to avoid persistent NCCL scatter memory.
+                source = distribute_tensor(
+                    source.to(device=destination.device, copy=True).expand(destination.shape),
+                    destination.device_mesh,
+                    [Replicate()] * destination.device_mesh.ndim,
+                ).redistribute(placements=destination.placements)
+                if len(args) > 1:
+                    args = (destination, source, *args[2:])
+                else:
+                    kwargs = {**kwargs, "other": source}
+        return func(*args, **kwargs)
 
 
 def _format_restricted_load_error(f: FileLike) -> str:
@@ -1504,16 +1548,30 @@ class Checkpointer:
                 saved_padding_idx = [(mod, mod.padding_idx) for mod in padded_embeddings]
                 for mod, _ in saved_padding_idx:
                     mod.padding_idx = None
+                # Newer HF versions classify FSDP's generated class as custom code
+                # and skip container initializers that populate child buffers.
+                # Bind the query to the original model class only during init.
+                bind_original_hf_class = (
+                    isinstance(model, FSDPModule)
+                    and hasattr(model, "is_custom_code")
+                    and "is_custom_code" not in vars(model)
+                )
                 try:
-                    try:
-                        if param_dtype is not None:
-                            model.initialize_weights(dtype=param_dtype)
-                        else:
+                    if bind_original_hf_class:
+                        original_class = next(cls for cls in type(model).__mro__ if not issubclass(cls, FSDPModule))
+                        model.is_custom_code = original_class.is_custom_code
+                    with _DTensorInitCopyMode():
+                        try:
+                            if param_dtype is not None:
+                                model.initialize_weights(dtype=param_dtype)
+                            else:
+                                model.initialize_weights()
+                        except TypeError:
+                            # Model's initialize_weights() does not accept a dtype kwarg.
                             model.initialize_weights()
-                    except TypeError:
-                        # Model's initialize_weights() does not accept a dtype kwarg.
-                        model.initialize_weights()
                 finally:
+                    if bind_original_hf_class:
+                        del model.is_custom_code
                     for mod, padding_idx in saved_padding_idx:
                         mod.padding_idx = padding_idx
                 for mod, padding_idx in saved_padding_idx:
