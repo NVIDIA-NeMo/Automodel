@@ -866,6 +866,59 @@ class TestDictConfigOverrideKeepsCustomPath:
         # otherwise collide with the positional config and/or raise TypeError).
         assert "config" not in captured_kwargs
 
+    @patch("nemo_automodel._transformers.model_init.restore_pretrained_generation_config")
+    @patch("nemo_automodel._transformers.model_init._download_model_weights")
+    @patch("nemo_automodel._transformers.model_init.get_hf_config")
+    @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")
+    def test_hub_kwargs_not_forwarded_to_custom_init(
+        self, mock_resolve_cls, mock_get_hf_config, mock_download, mock_restore
+    ):
+        hf_config = self._make_config()
+        hf_config._commit_hash = "a" * 40
+        mock_get_hf_config.return_value = hf_config
+        captured_kwargs = {}
+
+        def fake_model_cls(config, **kwargs):
+            captured_kwargs.update(kwargs)
+            return MagicMock()
+
+        fake_model_cls.__module__ = "nemo_automodel.components.models.fake"
+        mock_resolve_cls.return_value = fake_model_cls
+
+        is_custom, _ = _init_model(
+            cls=MagicMock(),
+            pretrained_model_name_or_path_or_config="fake/model",
+            attn_implementation="flash_attention_2",
+            torch_dtype="auto",
+            quantization_config=None,
+            force_hf=False,
+            cache_dir="/tmp/hub-cache",
+            token="token",
+            local_files_only=True,
+            force_download=True,
+            subfolder="nested",
+            code_revision="code-main",
+        )
+
+        assert is_custom is True
+        assert (
+            not {
+                "cache_dir",
+                "token",
+                "local_files_only",
+                "force_download",
+                "subfolder",
+                "revision",
+                "_commit_hash",
+                "code_revision",
+            }
+            & captured_kwargs.keys()
+        )
+        assert mock_download.call_args.kwargs["cache_dir"] == "/tmp/hub-cache"
+        assert mock_download.call_args.kwargs["revision"] == "a" * 40
+        assert mock_restore.call_args.kwargs["cache_dir"] == "/tmp/hub-cache"
+        assert mock_restore.call_args.kwargs["revision"] == "a" * 40
+
 
 class TestSetupBnbLoadingKwargs:
     """_setup_bnb_loading_kwargs sets a per-GPU device_map and disables HF async weight loading."""

@@ -1347,6 +1347,8 @@ def __init_model(
             # them: the generation-config restore below has to read from the same
             # subfolder/revision the weights came from.
             loading_kwargs = {key: kwargs[key] for key in HUB_LOADING_KWARGS if key in kwargs}
+            for key in (*HUB_LOADING_KWARGS, "_commit_hash", "code_revision", "use_auth_token"):
+                kwargs.pop(key, None)
             # Treat config-related kwargs as config overrides (HF behavior) and
             # avoid forwarding them into model __init__.
             init_param_names = _get_init_param_names(model_cls)
