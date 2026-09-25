@@ -404,6 +404,24 @@ def collect_lm(roots: list[Path]) -> list[ReportRow]:
     return rows
 
 
+def evaluation_caveats(rows: list[ReportRow]) -> list[str]:
+    """Return static caveats plus data-dependent scientific warnings."""
+    caveats = list(CAVEATS)
+    paired: dict[tuple[Any, ...], dict[str, float | int]] = {}
+    for row in rows:
+        if row.ttt_mode not in {"on", "off"} or not row.valid or not row.complete or row.value is None:
+            continue
+        key = (row.source, row.architecture, row.task_or_benchmark, row.context_length, row.metric)
+        paired.setdefault(key, {})[row.ttt_mode] = row.value
+    matched = [modes for modes in paired.values() if modes.keys() == {"on", "off"}]
+    if matched and all(modes["on"] == modes["off"] for modes in matched):
+        caveats.append(
+            "Every matched aggregate metric is exactly identical with TTT updates on and off. "
+            "Treat the dashed ablation curves as coincident, not as independent evidence of a TTT benefit."
+        )
+    return caveats
+
+
 def write_tidy_outputs(rows: list[ReportRow], output_dir: Path, roots: dict[str, list[Path]]) -> tuple[Path, Path]:
     """Write deterministic tidy CSV and JSON aggregate files."""
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -427,7 +445,7 @@ def write_tidy_outputs(rows: list[ReportRow], output_dir: Path, roots: dict[str,
     payload = {
         "schema_version": 1,
         "roots": {kind: [str(path) for path in paths] for kind, paths in roots.items()},
-        "caveats": list(CAVEATS),
+        "caveats": evaluation_caveats(rows),
         "records": [asdict(row) for row in ordered],
     }
     json_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
@@ -631,7 +649,7 @@ def write_html(rows: list[ReportRow], output_dir: Path, figure_paths: list[Path]
         if figure_cards
         else '<div class="card"><p>No figures were embedded because matplotlib was unavailable.</p></div>'
     )
-    caveats = "".join(f"<li>{html.escape(caveat)}</li>" for caveat in CAVEATS)
+    caveats = "".join(f"<li>{html.escape(caveat)}</li>" for caveat in evaluation_caveats(rows))
     document = f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">

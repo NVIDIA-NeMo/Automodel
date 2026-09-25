@@ -172,4 +172,5 @@ def test_writes_outputs_and_self_contained_report(tmp_path: Path) -> None:
     assert "<svg" in report
     assert "No compatible parameter-matched floor or full-attention control" in report
     assert "essay at context length 512 is unavailable" in report
+    assert "Every matched aggregate metric is exactly identical with TTT updates on and off" in report
     assert 'src="' not in report
