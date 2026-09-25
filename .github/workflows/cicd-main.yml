@@ -499,7 +499,7 @@ jobs:
           # sets the stage floor. A 40-minute timeout leaves more than 2x headroom
           # over the measured merged runtime while bounding timeout retries.
           - test-name: L2_HF_Transformer
-            test-folder: hf_transformer,hf_transformer_llm,data
+            test-folder: hf_transformer,hf_transformer_llm,data,models/test_qwen3_8_flash_next_deepselect.py
             timeout: 40
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
@@ -595,7 +595,7 @@ jobs:
           # floor). Leaves this matrix at 9 entries, one slot of headroom.
           # Include models/minimax_m3_vl here; its runtime is not part of the 10.5 min median.
           - test-name: L2_HF_Transformer
-            test-folder: hf_transformer,hf_transformer_llm,data,models/minimax_m3_vl
+            test-folder: hf_transformer,hf_transformer_llm,data,models/minimax_m3_vl,models/test_qwen3_8_flash_next_deepselect.py
             timeout: 40
           - test-name: L2_HF_Transformer_Finetune
             test-folder: hf_transformer_finetune
