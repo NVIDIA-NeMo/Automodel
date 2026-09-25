@@ -20,7 +20,10 @@ from dataclasses import dataclass
 
 import torch
 
-from nemo_automodel.components.models.common.packing import get_unpad_data, is_indexed_packed_mask
+from nemo_automodel.components.models.common.packing import (
+    flatten_packed_sequence_metadata,
+    is_indexed_packed_mask,
+)
 
 
 @dataclass(frozen=True)
@@ -47,14 +50,21 @@ class GatedDeltaPackedMetadata:
 def prepare_gated_delta_packed_metadata(
     attention_mask: torch.Tensor | None,
     packed_seq_ids: torch.Tensor | None,
+    packed_token_indices: torch.Tensor | None,
+    cu_seqlens: torch.Tensor | None,
 ) -> GatedDeltaPackedMetadata | None:
-    """Build shared GatedDeltaNet metadata once for a model forward.
+    """Prepare dataset-provided GatedDeltaNet metadata once per model forward.
 
     Args:
         attention_mask: Optional indexed document mask of shape [batch,
             sequence] or a backend-specific attention mask.
         packed_seq_ids: Optional indexed document IDs of shape [batch,
             sequence] supplied beside a backend-specific attention mask.
+        packed_token_indices: Optional valid-token indices of shape [batch,
+            sequence] before model-entry normalization or [tokens] afterward.
+        cu_seqlens: Optional cumulative document lengths of shape [batch,
+            max_documents + 1] before model-entry normalization or
+            [documents + 1] afterward.
 
     Returns:
         Device and CPU packed-sequence metadata whose tensor layouts are
@@ -66,31 +76,29 @@ def prepare_gated_delta_packed_metadata(
     # device scalar decision. Otherwise a structurally eligible 2D attention
     # mask is the only candidate.
     document_ids = None
-    document_ids_cpu = None
     for candidate in (packed_seq_ids, attention_mask):
         if candidate is None or candidate.dtype == torch.bool or candidate.dim() != 2:
             continue
         candidate_cpu = candidate.detach().to(device="cpu")
         if is_indexed_packed_mask(candidate_cpu):
             document_ids = candidate
-            document_ids_cpu = candidate_cpu
             break
-    if document_ids is None or document_ids_cpu is None:
+    if document_ids is None:
         return None
 
-    # FLA needs a CPU cu_seqlens mirror for host-side chunk planning. Derive all
-    # dynamic-size metadata from the single host copy above, and coalesce indices
-    # + cu_seqlens into one H2D transfer. The normal packed path therefore replaces
-    # three CUDA scalar reads, two dynamic ``nonzero`` synchronizations, and a
-    # final D2H mirror with one boundary in each direction per model forward.
-    indices_cpu, cu_seqlens_cpu, _ = get_unpad_data(document_ids_cpu)
-    indices_cpu = indices_cpu.to(torch.long)
-    cu_seqlens_cpu = cu_seqlens_cpu.to(torch.long)
-    num_indices = indices_cpu.numel()
-    device_metadata = torch.cat((indices_cpu, cu_seqlens_cpu)).to(device=document_ids.device)
+    if packed_token_indices is None or cu_seqlens is None:
+        raise ValueError("Packed Qwen3.5 inputs require dataset-provided packed_token_indices and cu_seqlens.")
+    if packed_token_indices.ndim != 1 or cu_seqlens.ndim != 1:
+        packed_token_indices, cu_seqlens = flatten_packed_sequence_metadata(
+            packed_token_indices,
+            cu_seqlens,
+            batch_size=document_ids.shape[0],
+            sequence_length=document_ids.shape[1],
+        )
+    cu_seqlens = cu_seqlens.to(torch.long)
     return GatedDeltaPackedMetadata(
         document_ids=document_ids,
-        indices=device_metadata[:num_indices],
-        cu_seqlens=device_metadata[num_indices:],
-        cu_seqlens_cpu=cu_seqlens_cpu,
+        indices=packed_token_indices,
+        cu_seqlens=cu_seqlens,
+        cu_seqlens_cpu=cu_seqlens.detach().cpu(),
     )

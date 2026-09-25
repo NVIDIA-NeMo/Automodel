@@ -282,6 +282,8 @@ def test_thd_packed_inputs_run_through_the_batched_layers():
         bshd = model(
             input_ids=input_ids,
             attention_mask=torch.tensor([[1, 1, 1, 2, 2, 2]], dtype=torch.int32),
+            packed_token_indices=torch.arange(6).unsqueeze(0),
+            cu_seqlens=cu_seqlens,
         ).logits
 
     assert thd.shape == (1, 6, model.vocab_size)
