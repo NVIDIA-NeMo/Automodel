@@ -150,13 +150,9 @@ class TEParallelCrossEntropy:
             Computed loss tensor
 
         Note:
-            This loss deliberately does NOT accept ``loss_weights``. TE's Triton
-            backward reads ``grad_output`` as a single scalar
-            (``tl.load(grad_output_ptr)`` with no program-id offset), so a
-            per-token upstream gradient would silently collapse to the first
-            token's value: the loss would look right while every token trained
-            with one sample's multiplier. Omitting the parameter makes
-            ``_supports_loss_weights`` reject this class at recipe setup instead.
+            Per-token upstream gradients are supported for unreduced losses.
+            This class does not accept ``loss_weights``, so
+            ``_supports_loss_weights`` still rejects it for sample-weighted recipes.
         """
         if not HAVE_TE_PARALLEL_CE:
             raise ImportError(MISSING_TE_PARALLEL_CE_MSG)
