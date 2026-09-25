@@ -123,9 +123,7 @@ def test_mimo_te_sharder_uses_te_dual_chunk_indices_and_reports_layout():
             "nemo_automodel.components.models.mimo_v2_flash.cp.make_cp_batch_for_te",
             return_value=delegated,
         ),
-        patch(
-            "nemo_automodel.components.models.mimo_v2_flash.cp.ensure_mimo_te_context_parallel"
-        ) as ensure_cp,
+        patch("nemo_automodel.components.models.mimo_v2_flash.cp.ensure_mimo_te_context_parallel") as ensure_cp,
     ):
         _, result, layout = shard_batch_for_mimo_te(
             mesh,

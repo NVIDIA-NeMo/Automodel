@@ -1,59 +1,22 @@
 ---
-title: "DiffusionGemma"
-description: ""
-slug: model-coverage/dllm/google/diffusiongemma
+title: "diffusiongemma-26B-A4B-it"
+description: "Use diffusiongemma-26B-A4B-it with NeMo AutoModel for diffusion language model fine-tuning, including checkpoints, runnable recipes, setup, and reference details."
+slug: model-coverage/dllm/google/diffusiongemma-26B-A4B-it
 ---
+
 [DiffusionGemma](https://huggingface.co/google) is a block-diffusion language model from Google. Instead of generating tokens left-to-right, it denoises a fixed-length canvas of tokens in parallel: a causal encoder reads the prompt and a bidirectional decoder iteratively refines the response canvas. The released checkpoint is a Mixture-of-Experts model with 26B total parameters and ~4B active per token.
 
-<Info>
+Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
+## Fine-Tune diffusiongemma-26B-A4B-it
 
-| | |
-|---|---|
-| **Task** | Text Generation (Block Diffusion, MoE) |
-| **Architecture** | `DiffusionGemmaForBlockDiffusion` |
-| **Parameters** | 26B total / ~4B active |
-| **HF Org** | [google](https://huggingface.co/google) |
-
-</Info>
-
-## Available Models
-
-- **DiffusionGemma 26B-A4B-it** (`DiffusionGemmaForBlockDiffusion`): instruction-tuned block-diffusion MoE.
-
-## Architectures
-
-- `DiffusionGemmaForBlockDiffusion` — block-diffusion MoE (causal prompt encoder + bidirectional canvas decoder).
-
-## Example HF Models
-
-| Model | HF ID |
-|---|---|
-| DiffusionGemma 26B-A4B-it | [`google/diffusiongemma-26B-A4B-it`](https://huggingface.co/google/diffusiongemma-26B-A4B-it) |
-
-## Example Recipes
-
-| Recipe | Description |
-|---|---|
-| [diffusion_gemma_sft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/diffusion_gemma_sft.yaml) | Full SFT — DiffusionGemma 26B-A4B with FSDP2 + Expert Parallelism |
-| [diffusion_gemma_lora.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/diffusion_gemma_lora.yaml) | LoRA SFT — DiffusionGemma 26B-A4B with FSDP2 + Expert Parallelism |
-
-## Try with NeMo AutoModel
-
-**1. Clone the source checkout** that contains the example recipes:
-
-```bash
-git clone https://github.com/NVIDIA-NeMo/Automodel.git
-cd Automodel
-```
-
-**2. Install that checkout's locked environment** ([full instructions](/get-started/installation)):
+Install the repository's locked environment:
 
 ```bash
 uv sync --locked --all-groups --extra all
 ```
 
-**3. Generate the GSM8K chat dataset** required by both DiffusionGemma recipes. Run this from the repository root; it writes `gsm8k_chat_train.jsonl`, the path used by both YAML files:
+Generate the GSM8K chat dataset required by both DiffusionGemma recipes. Run this from the repository root; it writes `gsm8k_chat_train.jsonl`, the path used by both YAML files:
 
 ```bash
 uv run python examples/dllm_sft/prep_gsm8k.py
@@ -61,12 +24,11 @@ uv run python examples/dllm_sft/prep_gsm8k.py
 
 <Note>
 
-
-This recipe was validated with **Expert Parallelism (EP=8)** on a single 8×H100 node. See the [Launcher Guide](/job-launchers/slurm-cluster) for multi-node setup.
+This recipe was validated with **Expert Parallelism (EP=8)** on a single 8xH100 node. See the [Launcher Guide](/job-launchers/slurm-cluster) for multi-node setup.
 
 </Note>
 
-**4. Run either recipe** from inside the repository:
+Then run either recipe:
 
 ```bash
 # Full SFT
@@ -76,10 +38,38 @@ uv run automodel examples/dllm_sft/diffusion_gemma_sft.yaml --nproc-per-node 8
 uv run automodel examples/dllm_sft/diffusion_gemma_lora.yaml --nproc-per-node 8
 ```
 
-## Fine-Tuning
+## Choose a Workflow
 
-See the [DiffusionGemma Fine-Tuning Guide](/recipes-e2e-examples/diffusiongemma) for the block-diffusion training objective, self-conditioning, and the full list of supported features (SFT, LoRA, Expert Parallelism, activation checkpointing).
+| Goal | Start Here |
+| --- | --- |
+| Full SFT - DiffusionGemma 26B-A4B with FSDP2 + Expert Parallelism | Use [diffusion_gemma_sft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/diffusion_gemma_sft.yaml). |
+| Low-rank adaptation (LoRA) SFT - DiffusionGemma 26B-A4B with FSDP2 + Expert Parallelism | Use [diffusion_gemma_lora.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/diffusion_gemma_lora.yaml). |
 
-## Hugging Face Model Cards
+## Model Reference
 
-- [google/diffusiongemma-26B-A4B-it](https://huggingface.co/google/diffusiongemma-26B-A4B-it)
+### Model Summary
+
+| Property | Value |
+| --- | --- |
+| Task | Text Generation (Block Diffusion, MoE) |
+| Architecture | `DiffusionGemmaForBlockDiffusion` |
+| Parameters | 26B total / ~4B active |
+| Hugging Face Organization | [google](https://huggingface.co/google) |
+
+### Available Models
+
+- **DiffusionGemma 26B-A4B-it** (`DiffusionGemmaForBlockDiffusion`): instruction-tuned block-diffusion MoE.
+
+### Model Architectures
+
+- `DiffusionGemmaForBlockDiffusion` - block-diffusion MoE (causal prompt encoder + bidirectional canvas decoder).
+
+### Available Checkpoints
+
+| Model | HF ID |
+|---|---|
+| DiffusionGemma 26B-A4B-it | [`google/diffusiongemma-26B-A4B-it`](https://huggingface.co/google/diffusiongemma-26B-A4B-it) |
+
+## Related Resources
+
+- [DiffusionGemma Fine-Tuning Guide](/recipes-e2e-examples/diffusiongemma)

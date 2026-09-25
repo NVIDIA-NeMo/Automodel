@@ -1,0 +1,51 @@
+---
+title: "Qwen-Image-Edit-2511"
+description: "Use NeMo AutoModel to fine-tune Qwen-Image-Edit-2511 for Diffusion workflows with checked-in image to image recipes and documented distributed settings."
+slug: model-coverage/diffusion/qwen/Qwen-Image-Edit-2511
+---
+
+[Qwen-Image-Edit-2511](https://huggingface.co/Qwen/Qwen-Image-Edit-2511) has a checked-in NeMo AutoModel recipe for image to image.
+
+## Fine-Tune Qwen-Image-Edit-2511
+
+Follow the [installation instructions](/get-started/installation), then review the checked-in recipe and
+its declared topology below before choosing a local or cluster launcher.
+
+```bash
+uv run torchrun --nproc-per-node=8 \
+  examples/diffusion/finetune/finetune.py \
+  -c examples/diffusion/finetune/qwen_image_edit_2511_flow.yaml
+```
+
+## Standard Recipe Configuration
+
+Start with the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/qwen_image_edit_2511_flow.yaml).
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | - |
+| Strategy | - |
+| Nodes | 1 |
+| Features | Checkpointing (enabled=true) |
+| Advanced | bfloat16 |
+
+## Alternate Recipe Configuration
+
+- [`generate_qwen_image_edit.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/generate/configs/generate_qwen_image_edit.yaml)
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+| --- | --- |
+| Task | Image to image |
+| Architecture | - |
+
+### Available Models
+
+- [`Qwen/Qwen-Image-Edit-2511`](https://huggingface.co/Qwen/Qwen-Image-Edit-2511)
+
+## Related Resources
+
+- [Diffusion fine-tuning guide](/recipes-e2e-examples/diffusion-fine-tuning)

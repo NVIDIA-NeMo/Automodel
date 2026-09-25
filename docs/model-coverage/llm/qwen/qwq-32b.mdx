@@ -1,0 +1,51 @@
+---
+title: "QwQ-32B"
+description: "Use NeMo AutoModel to fine-tune QwQ-32B for LLM workflows with checked-in text generation recipes and documented distributed settings."
+slug: model-coverage/large-language-models/qwen/QwQ-32B
+---
+
+[QwQ-32B](https://huggingface.co/Qwen/QwQ-32B) has a checked-in NeMo AutoModel recipe for text generation.
+The Hugging Face configuration declares the `Qwen2ForCausalLM` architecture.
+
+## Fine-Tune QwQ-32B
+
+Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+
+```bash
+automodel examples/llm_finetune/qwen/qwq_32b_squad.yaml --nproc-per-node 8
+```
+
+Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node run.
+
+## Standard Recipe Configuration
+
+Start with the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwq_32b_squad.yaml).
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | - |
+| Strategy | FSDP2; tp_size=4, cp_size=1 |
+| Nodes | 2 |
+| Features | - |
+| Advanced | bf16 |
+
+## Alternate Recipe Configuration
+
+- [`qwq_32b_squad_peft.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwq_32b_squad_peft.yaml)
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| Architecture | `Qwen2ForCausalLM` |
+
+### Available Models
+
+- [`Qwen/QwQ-32B`](https://huggingface.co/Qwen/QwQ-32B)
+
+## Related Resources
+
+- [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)

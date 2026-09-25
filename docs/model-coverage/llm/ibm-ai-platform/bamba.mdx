@@ -1,0 +1,40 @@
+---
+title: "Bamba-9B"
+description: "Reference Bamba-9B checkpoint and architecture details for NeMo AutoModel, with model-family information, setup guidance, and upstream resources."
+slug: model-coverage/large-language-models/ibm-ai-platform/Bamba-9B
+---
+
+[Bamba](https://huggingface.co/ibm-ai-platform/Bamba-9B) is a hybrid SSM-attention language model from IBM, combining Mamba-2 selective state space layers with standard transformer attention for efficient long-context processing.
+
+Use this page as a checkpoint and architecture reference. Set up NeMo AutoModel with the
+[latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the
+[installation instructions](/get-started/installation).
+
+## Model Reference
+
+### Model Summary
+
+| Property | Value |
+| --- | --- |
+| Task | Text Generation |
+| Architecture | `BambaForCausalLM` |
+| Parameters | 9B |
+| Hugging Face Organization | [ibm-ai-platform](https://huggingface.co/ibm-ai-platform) |
+
+### Available Models
+
+- **Bamba-9B**: 9B parameters
+
+### Model Architecture
+
+- `BambaForCausalLM`
+
+### Available Checkpoints
+
+| Model | HF ID |
+|---|---|
+| Bamba 9B | [`ibm-ai-platform/Bamba-9B`](https://huggingface.co/ibm-ai-platform/Bamba-9B) |
+
+## Related Resources
+
+- [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)

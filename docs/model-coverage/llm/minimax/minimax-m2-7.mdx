@@ -1,0 +1,51 @@
+---
+title: "MiniMax-M2.7"
+description: "Use NeMo AutoModel to fine-tune MiniMax-M2.7 for LLM workflows with checked-in text generation recipes and documented distributed settings."
+slug: model-coverage/large-language-models/minimax/MiniMax-M2.7
+---
+
+[MiniMax-M2.7](https://huggingface.co/MiniMaxAI/MiniMax-M2.7) has a checked-in NeMo AutoModel recipe for text generation.
+The Hugging Face configuration declares the `MiniMaxM2ForCausalLM` architecture.
+
+## Fine-Tune MiniMax-M2.7
+
+Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+
+```bash
+automodel examples/llm_finetune/minimax_m2/minimax_m2.7_hellaswag_pp.yaml --nproc-per-node 8
+```
+
+Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node run.
+
+## Standard Recipe Configuration
+
+Start with the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/minimax_m2/minimax_m2.7_hellaswag_pp.yaml).
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | - |
+| Strategy | FSDP2; tp_size=1, pp_size=2, cp_size=1, ep_size=16 |
+| Nodes | 8 |
+| Features | Activation checkpointing (activation_checkpointing=true), Transformer Engine, HybridEP (dispatcher=hybridep) |
+| Advanced | attention=te, linear=te, experts=torch_mm, dispatcher=hybridep |
+
+## Alternate Recipe Configuration
+
+- [`minimax_m2.7_hellaswag_lora.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/minimax_m2/minimax_m2.7_hellaswag_lora.yaml)
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| Architecture | `MiniMaxM2ForCausalLM` |
+
+### Available Models
+
+- [`MiniMaxAI/MiniMax-M2.7`](https://huggingface.co/MiniMaxAI/MiniMax-M2.7)
+
+## Related Resources
+
+- [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)

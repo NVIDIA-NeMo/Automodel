@@ -1,0 +1,47 @@
+---
+title: "Qwen3-4B-Base"
+description: "Use NeMo AutoModel to fine-tune Qwen3-4B-Base for LLM workflows with checked-in text generation recipes and documented distributed settings."
+slug: model-coverage/large-language-models/qwen/Qwen3-4B-Base
+---
+
+[Qwen3-4B-Base](https://huggingface.co/Qwen/Qwen3-4B-Base) has a checked-in NeMo AutoModel recipe for text generation.
+The Hugging Face configuration declares the `Qwen3ForCausalLM` architecture.
+
+## Fine-Tune Qwen3-4B-Base
+
+Follow the [installation instructions](/get-started/installation), then review the checked-in recipe and
+its declared topology below before choosing a local or cluster launcher.
+
+## Standard Recipe Configuration
+
+Start with the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/convergence/tulu3/models/qwen3-4b/qwen3_4b_cp1_flashoptim.yaml).
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | - |
+| Strategy | FSDP2; tp_size=1, pp_size=1, cp_size=1 |
+| Nodes | - |
+| Features | Checkpointing (enabled=true), Activation checkpointing (activation_checkpointing=true) |
+| Advanced | sequence length 2048 |
+
+## Alternate Recipe Configuration
+
+- [`qwen3_4b_cp1_te_fusedadam.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/convergence/tulu3/models/qwen3-4b/qwen3_4b_cp1_te_fusedadam.yaml)
+- [`qwen3_4b_cp2_flashoptim.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/convergence/tulu3/models/qwen3-4b/qwen3_4b_cp2_flashoptim.yaml)
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| Architecture | `Qwen3ForCausalLM` |
+
+### Available Models
+
+- [`Qwen/Qwen3-4B-Base`](https://huggingface.co/Qwen/Qwen3-4B-Base)
+
+## Related Resources
+
+- [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)

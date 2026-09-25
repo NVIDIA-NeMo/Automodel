@@ -1,0 +1,46 @@
+---
+title: "Qwen2.5-Omni-7B"
+description: "Use NeMo AutoModel to fine-tune Qwen2.5-Omni-7B for Omni workflows with checked-in any to any recipes and documented distributed settings."
+slug: model-coverage/omni/qwen/Qwen2.5-Omni-7B
+---
+
+[Qwen2.5-Omni-7B](https://huggingface.co/Qwen/Qwen2.5-Omni-7B) has a checked-in NeMo AutoModel recipe for any to any.
+The Hugging Face configuration declares the `Qwen2_5OmniModel` architecture.
+
+## Fine-Tune Qwen2.5-Omni-7B
+
+Follow the [installation instructions](/get-started/installation), then review the checked-in recipe and
+its declared topology below before choosing a local or cluster launcher.
+
+## Standard Recipe Configuration
+
+Start with the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/audio_finetune/qwen2_5_omni_asr/ami_sft_7b.yaml).
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | - |
+| Strategy | FSDP2; tp_size=1, pp_size=1, cp_size=1 |
+| Nodes | - |
+| Features | Checkpointing (enabled=true), Activation checkpointing (activation_checkpointing=true), Transformer Engine |
+| Advanced | attention=sdpa, linear=te |
+
+## Alternate Recipe Configuration
+
+- [Standard recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/audio_finetune/qwen2_5_omni_asr/ami_sft_7b.yaml)
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+| --- | --- |
+| Task | Any to any |
+| Architecture | `Qwen2_5OmniModel` |
+
+### Available Models
+
+- [`Qwen/Qwen2.5-Omni-7B`](https://huggingface.co/Qwen/Qwen2.5-Omni-7B)
+
+## Related Resources
+
+- [Multimodal fine-tuning guide](/recipes-e2e-examples/gemma-3-3n)

@@ -1,0 +1,42 @@
+---
+title: "SmolVLM-Instruct"
+description: "Reference SmolVLM-Instruct checkpoint and architecture details for NeMo AutoModel, with model-family information, setup guidance, and upstream resources."
+slug: model-coverage/vision-language-models/huggingfacetb/SmolVLM-Instruct
+---
+
+[SmolVLM](https://huggingface.co/blog/smolvlm) is HuggingFace's compact vision language model designed for on-device and memory-constrained deployment, featuring an efficient image token compression strategy.
+
+Use this page as a checkpoint and architecture reference. Set up NeMo AutoModel with the
+[latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the
+[installation instructions](/get-started/installation).
+
+## Model Reference
+
+### Model Summary
+
+| Property | Value |
+| --- | --- |
+| Task | Image-Text-to-Text |
+| Architecture | `SmolVLMForConditionalGeneration` |
+| Parameters | 256M - 2B |
+| Hugging Face Organization | [HuggingFaceTB](https://huggingface.co/HuggingFaceTB) |
+
+### Available Models
+
+- **SmolVLM-Instruct**: 2B
+- **SmolVLM-256M-Instruct**: 256M
+
+### Model Architecture
+
+- `SmolVLMForConditionalGeneration`
+
+### Available Checkpoints
+
+| Model | HF ID |
+|---|---|
+| SmolVLM Instruct | [`HuggingFaceTB/SmolVLM-Instruct`](https://huggingface.co/HuggingFaceTB/SmolVLM-Instruct) |
+| SmolVLM 256M Instruct | [`HuggingFaceTB/SmolVLM-256M-Instruct`](https://huggingface.co/HuggingFaceTB/SmolVLM-256M-Instruct) |
+
+## Related Resources
+
+- [VLM Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n)

@@ -1,0 +1,54 @@
+---
+title: "InternVL3_5-4B"
+description: "Use InternVL3_5-4B with NeMo AutoModel for vision-language fine-tuning, with documented checkpoints, runnable recipes, setup guidance, and model reference details."
+slug: model-coverage/vision-language-models/opengvlab/InternVL3_5-4B
+---
+
+[InternVL](https://github.com/OpenGVLab/InternVL) is a vision language model from Shanghai AI Laboratory (OpenGVLab), combining a large vision encoder with an InternLM language backbone for strong multimodal performance.
+
+Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
+
+## Fine-Tune InternVL3_5-4B
+
+From the repository root, run:
+
+```bash
+uv run automodel --nproc-per-node=8 examples/vlm_finetune/internvl/internvl_3_5_4b.yaml
+```
+
+## Choose a Workflow
+
+| Goal | Start Here |
+| --- | --- |
+| Supervised fine-tuning (SFT) - InternVL3.5 4B on MedPix | Use [internvl_3_5_4b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/internvl/internvl_3_5_4b.yaml). Dataset: MedPix-VQA. |
+
+## Model Reference
+
+### Model Summary
+
+| Property | Value |
+| --- | --- |
+| Task | Image-Text-to-Text |
+| Architecture | `InternVLForConditionalGeneration` |
+| Parameters | 4B - 8B |
+| Hugging Face Organization | [OpenGVLab](https://huggingface.co/OpenGVLab) |
+
+### Available Models
+
+- **InternVL3.5-4B**
+- **InternVL3.5-8B**
+
+### Model Architecture
+
+- `InternVLForConditionalGeneration`
+
+### Available Checkpoints
+
+| Model | HF ID |
+|---|---|
+| InternVL3.5 4B | [`OpenGVLab/InternVL3_5-4B`](https://huggingface.co/OpenGVLab/InternVL3_5-4B) |
+| InternVL3.5 4B HF | [`OpenGVLab/InternVL3_5-4B-hf`](https://huggingface.co/OpenGVLab/InternVL3_5-4B-hf) |
+
+## Related Resources
+
+- [VLM Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n)

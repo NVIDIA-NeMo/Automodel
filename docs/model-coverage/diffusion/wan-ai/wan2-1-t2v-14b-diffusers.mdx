@@ -1,0 +1,51 @@
+---
+title: "Wan2.1-T2V-14B-Diffusers"
+description: "Use NeMo AutoModel to fine-tune Wan2.1-T2V-14B-Diffusers for Diffusion workflows with checked-in text to video recipes and documented distributed settings."
+slug: model-coverage/diffusion/wan-ai/Wan2.1-T2V-14B-Diffusers
+---
+
+[Wan2.1-T2V-14B-Diffusers](https://huggingface.co/Wan-AI/Wan2.1-T2V-14B-Diffusers) has a checked-in NeMo AutoModel recipe for text to video.
+
+## Fine-Tune Wan2.1-T2V-14B-Diffusers
+
+Follow the [installation instructions](/get-started/installation), then review the checked-in recipe and
+its declared topology below before choosing a local or cluster launcher.
+
+```bash
+uv run torchrun --nproc-per-node=8 \
+  examples/diffusion/finetune/finetune.py \
+  -c examples/diffusion/finetune/wan2_1_t2v_flow.yaml
+```
+
+## Standard Recipe Configuration
+
+Start with the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/wan2_1_t2v_flow.yaml).
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | - |
+| Strategy | - |
+| Nodes | - |
+| Features | Checkpointing (enabled=true) |
+| Advanced | float32 |
+
+## Alternate Recipe Configuration
+
+- [`wan2_1_t2v_flow_lora.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/wan2_1_t2v_flow_lora.yaml)
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+| --- | --- |
+| Task | Text to video |
+| Architecture | - |
+
+### Available Models
+
+- [`Wan-AI/Wan2.1-T2V-14B-Diffusers`](https://huggingface.co/Wan-AI/Wan2.1-T2V-14B-Diffusers)
+
+## Related Resources
+
+- [Diffusion fine-tuning guide](/recipes-e2e-examples/diffusion-fine-tuning)

@@ -1,0 +1,49 @@
+---
+title: "LLaVA-OneVision-1.5-8B-Instruct"
+description: "Use NeMo AutoModel to fine-tune LLaVA-OneVision-1.5-8B-Instruct for VLM workflows with checked-in image-text-to-text recipes and documented distributed settings."
+slug: model-coverage/vision-language-models/lmms-lab/LLaVA-OneVision-1.5-8B-Instruct
+---
+
+[LLaVA-OneVision-1.5-8B-Instruct](https://huggingface.co/lmms-lab/LLaVA-OneVision-1.5-8B-Instruct) has a checked-in NeMo AutoModel recipe for image-text-to-text.
+The Hugging Face configuration declares the `LLaVAOneVision1_5_ForConditionalGeneration` architecture.
+
+## Fine-Tune LLaVA-OneVision-1.5-8B-Instruct
+
+Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+
+```bash
+automodel examples/vlm_finetune/llava_onevision/llava_ov_1_5_8b_lora.yaml --nproc-per-node 8
+```
+
+## Standard Recipe Configuration
+
+Start with the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/llava_onevision/llava_ov_1_5_8b_lora.yaml).
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | - |
+| Strategy | FSDP2; tp_size=1, cp_size=1 |
+| Nodes | - |
+| Features | Checkpointing (enabled=true), LoRA |
+| Advanced | - |
+
+## Alternate Recipe Configuration
+
+- [Standard recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/llava_onevision/llava_ov_1_5_8b_lora.yaml)
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+| --- | --- |
+| Task | Image-text-to-text |
+| Architecture | `LLaVAOneVision1_5_ForConditionalGeneration` |
+
+### Available Models
+
+- [`lmms-lab/LLaVA-OneVision-1.5-8B-Instruct`](https://huggingface.co/lmms-lab/LLaVA-OneVision-1.5-8B-Instruct)
+
+## Related Resources
+
+- [Vision-language model fine-tuning guide](/recipes-e2e-examples/gemma-3-3n)

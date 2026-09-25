@@ -1,0 +1,49 @@
+---
+title: "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16"
+description: "Use NeMo AutoModel to fine-tune NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16 for LLM workflows with checked-in text generation recipes and documented distributed settings."
+slug: model-coverage/large-language-models/nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16
+---
+
+[NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16) has a checked-in NeMo AutoModel recipe for text generation.
+The Hugging Face configuration declares the `NemotronHForCausalLM` architecture.
+
+## Fine-Tune NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16
+
+Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+
+```bash
+automodel examples/llm_finetune/nemotron/nemotron_nano_v3_5_lightning_hellaswag_peft.yaml --nproc-per-node 8
+```
+
+## Standard Recipe Configuration
+
+Start with the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_nano_v3_5_lightning_hellaswag_peft.yaml).
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | - |
+| Strategy | FSDP2; tp_size=1, cp_size=1, ep_size=8 |
+| Nodes | 1 |
+| Features | Checkpointing (enabled=true), LoRA, Transformer Engine, DeepEP (dispatcher=deepep) |
+| Advanced | attention=te, linear=te, experts=gmm, dispatcher=deepep |
+
+## Alternate Recipe Configuration
+
+- [`nemotron_nano_v3_5_lightning_singlegpu_lora.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_nano_v3_5_lightning_singlegpu_lora.yaml)
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| Architecture | `NemotronHForCausalLM` |
+
+### Available Models
+
+- [`nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16`](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16)
+
+## Related Resources
+
+- [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)

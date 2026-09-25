@@ -1,0 +1,52 @@
+---
+title: "Qwen3-VL-235B-A22B-Instruct"
+description: "Use NeMo AutoModel to fine-tune Qwen3-VL-235B-A22B-Instruct for VLM workflows with checked-in image-text-to-text recipes and documented distributed settings."
+slug: model-coverage/vision-language-models/qwen/Qwen3-VL-235B-A22B-Instruct
+---
+
+[Qwen3-VL-235B-A22B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-235B-A22B-Instruct) has a checked-in NeMo AutoModel recipe for image-text-to-text.
+The Hugging Face configuration declares the `Qwen3VLMoeForConditionalGeneration` architecture.
+
+## Fine-Tune Qwen3-VL-235B-A22B-Instruct
+
+Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+
+```bash
+automodel examples/vlm_finetune/qwen3/qwen3_vl_moe_235b.yaml --nproc-per-node 8
+```
+
+Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node run.
+
+## Standard Recipe Configuration
+
+Start with the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3/qwen3_vl_moe_235b.yaml).
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | - |
+| Strategy | FSDP2; tp_size=1, pp_size=4, cp_size=1, ep_size=32 |
+| Nodes | 32 |
+| Features | Transformer Engine, HybridEP (dispatcher=hybridep) |
+| Advanced | attention=sdpa, linear=te, experts=gmm, dispatcher=hybridep |
+
+## Alternate Recipe Configuration
+
+- [`qwen3_vl_235b_te_deepep.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_benchmark/qwen/qwen3_vl_235b_te_deepep.yaml)
+- [`qwen3vl235b_lora.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_benchmark/qwen/qwen3vl235b_lora.yaml)
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+| --- | --- |
+| Task | Image-text-to-text |
+| Architecture | `Qwen3VLMoeForConditionalGeneration` |
+
+### Available Models
+
+- [`Qwen/Qwen3-VL-235B-A22B-Instruct`](https://huggingface.co/Qwen/Qwen3-VL-235B-A22B-Instruct)
+
+## Related Resources
+
+- [Vision-language model fine-tuning guide](/recipes-e2e-examples/gemma-3-3n)

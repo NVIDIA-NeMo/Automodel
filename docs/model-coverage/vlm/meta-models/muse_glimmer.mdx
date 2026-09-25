@@ -1,0 +1,51 @@
+---
+title: "Muse-Glimmer-30B"
+description: "Use Muse-Glimmer-30B with NeMo AutoModel for vision-language fine-tuning, with documented checkpoints, runnable recipes, setup guidance, and model reference details."
+slug: model-coverage/vision-language-models/meta-models/Muse-Glimmer-30B
+---
+
+[Muse-Glimmer-30B](https://huggingface.co/meta-models/Muse-Glimmer-30B) is a dense vision-language model with a 52-layer language backbone, a 50-layer vision tower, and a multimodal projector.
+
+Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
+
+## Fine-Tune Muse-Glimmer-30B
+
+The recipes use the Hugging Face checkpoint `meta-models/Muse-Glimmer-30B` by default:
+
+```bash
+uv run automodel --nproc-per-node=8 \
+  examples/vlm_finetune/muse_glimmer/muse_glimmer_30b_medpix.yaml
+```
+
+The implementation supports FSDP2, activation checkpointing, TP1/TP2, context parallelism, Transformer Engine packed THD inputs, pipeline parallelism, and LoRA. Multi-axis mRoPE with packed THD context parallelism is not supported.
+
+## Choose a Workflow
+
+| Goal | Start Here |
+| --- | --- |
+| Full-parameter VLM SFT | Use [muse_glimmer_30b_medpix.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/muse_glimmer/muse_glimmer_30b_medpix.yaml). Dataset: MedPix-VQA. |
+| Single-node LoRA SFT | Use [muse_glimmer_30b_medpix_lora.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/muse_glimmer/muse_glimmer_30b_medpix_lora.yaml). Dataset: MedPix-VQA. |
+| Single-node 16K packed text SFT with TP2 and CP4 | Use [muse_glimmer_30b_tulu3_te_tp2_cp4_packed_16k.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/muse_glimmer/muse_glimmer_30b_tulu3_te_tp2_cp4_packed_16k.yaml). Dataset: Tulu 3. |
+
+## Model Reference
+
+### Model Summary
+
+| Property | Value |
+| --- | --- |
+| Task | Image-Text-to-Text |
+| Architecture | `MuseGlimmerForConditionalGeneration` |
+| Model types | `muse_glimmer`, `muse_glimmer_text`, `muse_glimmer_vision` |
+| Parameters | 30B |
+| HF ID | [`meta-models/Muse-Glimmer-30B`](https://huggingface.co/meta-models/Muse-Glimmer-30B) |
+
+### Model Architecture
+
+- Dense grouped-query attention language model with 32 query heads and 2 key-value heads
+- Alternating sliding and full attention across a 52-layer text backbone
+- Vision transformer with window and full attention across 50 layers
+- One-dimensional position IDs for packed Transformer Engine context parallelism
+
+## Related Resources
+
+- [VLM Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n)

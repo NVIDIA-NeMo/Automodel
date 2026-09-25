@@ -1,96 +1,48 @@
 ---
 title: "MiMo-V2-Flash"
-description: "Fine-tune the MiMo-V2-Flash hybrid attention MoE language model and the MiMo-V2.6-Flash-RL multimodal checkpoint with NeMo AutoModel."
-slug: model-coverage/large-language-models/xiaomimimo/mimo-v2-flash
+description: "Fine-tune MiMo-V2-Flash and explore MiMo-V2.6-Flash-RL language and vision-language recipes, checkpoints, and settings with NeMo AutoModel."
+slug: model-coverage/large-language-models/xiaomimimo/MiMo-V2-Flash
 ---
-[MiMo-V2-Flash](https://huggingface.co/XiaomiMiMo/MiMo-V2-Flash) is Xiaomi's hybrid attention Mixture-of-Experts (MoE) language model. It alternates full and sliding-window attention layers, uses a `sigmoid_with_bias` router with group-limited expert routing, and ships as an FP8 HF checkpoint.
 
-[MiMo-V2.6-Flash-RL](https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Flash-RL) uses the registered `MiMoV2ForCausalLM` architecture. It adds an image tower, fused FP8 QKV checkpoint tensors, and MXFP4 expert tensors while retaining the hybrid MiMo text backbone.
+[MiMo-V2-Flash](https://huggingface.co/XiaomiMiMo/MiMo-V2-Flash) is a Mixture-of-Experts (MoE) language model with a hybrid attention architecture. It interleaves sliding-window and global attention.
 
-<Info>
+[MiMo-V2.6-Flash-RL](https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Flash-RL) uses the registered `MiMoV2ForCausalLM` model class. When `vision_config` is not `None`, the implementation sets `self.visual` to a `MiMoVisionTransformer`.
 
-| | |
-|---|---|
-| **Task** | Text Generation (MoE, hybrid attention) |
-| **Architecture** | `MiMoV2FlashForCausalLM` |
-| **Parameters** | MiMo-V2-Flash: 309B total, 15B active ([model card](https://huggingface.co/XiaomiMiMo/MiMo-V2-Flash#2-model-downloads)) |
-| **HF Org** | [XiaomiMiMo](https://huggingface.co/XiaomiMiMo) |
+Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
-</Info>
+## Fine-Tune MiMo-V2-Flash
 
-## Available Models
+Use the checked-in recipes to fine-tune either supported checkpoint.
 
-- **MiMo-V2-Flash**: Hybrid full and sliding-window attention with FP8 weights.
-- **MiMo-V2.6-Flash-RL**: Multimodal `MiMoV2ForCausalLM` checkpoint with FP8 attention and MXFP4 experts.
+## Choose a Workflow
 
-## Architecture
+Choose a recipe for your checkpoint and workload. The MiMo-V2-Flash recipe is configured for 16 nodes with 8 H100 GPUs per node. The MiMo-V2.6-Flash-RL recipes target 8 nodes with 8 H100 GPUs per node.
 
-- `MiMoV2FlashForCausalLM`
-- Sliding-window attention using the `MiMoV2FlashAttention(is_swa=True)` path.
-- MoE blocks use the shared `nemo_automodel.components.moe.layers.MoE` with `score_func="sigmoid_with_bias"` and `gate_precision=fp32` so routing decisions stay numerically stable when activations are bf16.
-- FP8 round-trip in `MiMoV2FlashStateDictAdapter` covers the bulk of attention and expert weights; layer norms, the gate, `lm_head`, and `embed_tokens` stay in bf16 per `NON_QUANTIZED_KEY_PATTERNS`.
+| Goal | Start Here |
+| --- | --- |
+| Fine-tune MiMo-V2-Flash on HellaSwag | Use [mimo_v2_flash_hellaswag.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mimo_v2_flash/mimo_v2_flash_hellaswag.yaml). |
+| Fine-tune MiMo-V2.6-Flash-RL on packed Tulu3 text | Use [mimo_v2_6_flash_rl_tulu3_packed4k_ep64_cp2_100steps.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mimo_v2_flash/mimo_v2_6_flash_rl_tulu3_packed4k_ep64_cp2_100steps.yaml). |
+| Fine-tune MiMo-V2.6-Flash-RL on MedPix-VQA | Use [mimo_v2_6_flash_rl_medpix_nonpacked4k_ep64_100steps.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mimo_v2_flash/mimo_v2_6_flash_rl_medpix_nonpacked4k_ep64_100steps.yaml). |
 
-## Example HF Models
+Follow the [launcher guide](/job-launchers/overview) to run a multi-node recipe.
 
-| Model | HF ID |
-|---|---|
+## Model Reference
+
+### Model Architecture
+
+- `MiMoV2FlashForCausalLM` backs MiMo-V2-Flash.
+- `MiMoV2ForCausalLM` backs MiMo-V2.6-Flash-RL.
+- Sliding-window attention uses the `MiMoV2FlashAttention(is_swa=True)` path.
+- Expert routing maps `scoring_func="sigmoid"` to `score_func="sigmoid_with_bias"`; the recipes set `gate_precision=float32`.
+
+### Available Checkpoints
+
+| Model | Hugging Face ID |
+| --- | --- |
 | MiMo-V2-Flash | [`XiaomiMiMo/MiMo-V2-Flash`](https://huggingface.co/XiaomiMiMo/MiMo-V2-Flash) |
 | MiMo-V2.6-Flash-RL | [`XiaomiMiMo/MiMo-V2.6-Flash-RL`](https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Flash-RL) |
 
-## Example Recipes
+## Related Resources
 
-| Recipe | Description |
-|---|---|
-| [mimo_v2_flash_hellaswag.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mimo_v2_flash/mimo_v2_flash_hellaswag.yaml) | SFT, MiMo-V2-Flash on HellaSwag |
-| [mimo_v2_6_flash_rl_tulu3_packed4k_ep64_cp2_100steps.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mimo_v2_flash/mimo_v2_6_flash_rl_tulu3_packed4k_ep64_cp2_100steps.yaml) | SFT, MiMo-V2.6-Flash-RL on Tulu3 with packed 4K THD sequences, EP64, and CP2 |
-| [mimo_v2_6_flash_rl_medpix_nonpacked4k_ep64_100steps.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mimo_v2_flash/mimo_v2_6_flash_rl_medpix_nonpacked4k_ep64_100steps.yaml) | VLM SFT, MiMo-V2.6-Flash-RL on MedPix-VQA with non-packed 4K sequences and EP64 |
-
-## Try with NeMo AutoModel
-
-**1. Clone and install from source** ([full instructions](/get-started/installation)):
-
-```bash
-git clone https://github.com/NVIDIA-NeMo/Automodel.git
-cd Automodel
-uv sync --locked --all-groups --all-extras
-```
-
-**2. Run the recipe** from inside the repo:
-
-```bash
-uv run automodel --nproc-per-node=8 examples/llm_finetune/mimo_v2_flash/mimo_v2_flash_hellaswag.yaml
-```
-
-<Accordion title="Run with Docker">
-**1. Pull the container** and mount a checkpoint directory:
-
-```bash
-docker run --gpus all -it --rm \
-  --shm-size=8g \
-  -v $(pwd)/checkpoints:/opt/Automodel/checkpoints \
-  nvcr.io/nvidia/nemo-automodel:26.06.00
-```
-
-**2. Navigate to `/opt/Automodel`**:
-
-```bash
-cd /opt/Automodel
-```
-
-**3. Run the recipe**:
-
-```bash
-automodel --nproc-per-node=8 examples/llm_finetune/mimo_v2_flash/mimo_v2_flash_hellaswag.yaml
-```
-</Accordion>
-
-See the [Installation Guide](/get-started/installation) and [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).
-
-## Fine-Tuning
-
-See the [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).
-
-## Hugging Face Model Cards
-
-- [XiaomiMiMo/MiMo-V2-Flash](https://huggingface.co/XiaomiMiMo/MiMo-V2-Flash)
-- [XiaomiMiMo/MiMo-V2.6-Flash-RL](https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Flash-RL)
+- [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
+- [Launcher Guide](/job-launchers/overview)

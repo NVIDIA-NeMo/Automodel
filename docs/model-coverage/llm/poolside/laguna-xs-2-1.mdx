@@ -1,0 +1,49 @@
+---
+title: "Laguna-XS-2.1"
+description: "Use NeMo AutoModel to fine-tune Laguna-XS-2.1 for LLM workflows with checked-in text generation recipes and documented distributed settings."
+slug: model-coverage/large-language-models/poolside/Laguna-XS-2.1
+---
+
+[Laguna-XS-2.1](https://huggingface.co/poolside/Laguna-XS-2.1) has a checked-in NeMo AutoModel recipe for text generation.
+The Hugging Face configuration declares the `LagunaForCausalLM` architecture.
+
+## Fine-Tune Laguna-XS-2.1
+
+Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+
+```bash
+automodel examples/llm_finetune/laguna/laguna_xs_2p1_hellaswag_ep8.yaml --nproc-per-node 8
+```
+
+## Standard Recipe Configuration
+
+Start with the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/laguna/laguna_xs_2p1_hellaswag_ep8.yaml).
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | - |
+| Strategy | FSDP2; tp_size=1, pp_size=1, cp_size=1, ep_size=8 |
+| Nodes | 1 |
+| Features | Activation checkpointing (activation_checkpointing=true), Packed sequences (packed_sequence_size=1024) |
+| Advanced | bfloat16, attention=sdpa, linear=torch, experts=torch_mm, dispatcher=torch |
+
+## Alternate Recipe Configuration
+
+- [Standard recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/laguna/laguna_xs_2p1_hellaswag_ep8.yaml)
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| Architecture | `LagunaForCausalLM` |
+
+### Available Models
+
+- [`poolside/Laguna-XS-2.1`](https://huggingface.co/poolside/Laguna-XS-2.1)
+
+## Related Resources
+
+- [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)

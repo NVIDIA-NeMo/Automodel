@@ -1,52 +1,16 @@
 ---
-title: "Hy-MT2 (Hunyuan-MT2)"
-description: ""
-slug: model-coverage/large-language-models/tencent/hy-mt2
+title: "Hy-MT2-30B-A3B"
+description: "Use Hy-MT2-30B-A3B with NeMo AutoModel for language model fine-tuning, with documented checkpoints, runnable recipes, setup guidance, and model reference details."
+slug: model-coverage/large-language-models/tencent/Hy-MT2-30B-A3B
 ---
-[Hy-MT2-30B-A3B](https://huggingface.co/tencent/Hy-MT2-30B-A3B) is Tencent's translation Mixture-of-Experts language model with 30B total parameters and 3B activated per token. It features 48 transformer layers (layer 0 dense, layers 1–47 MoE), 128 routed experts plus 1 shared expert with top-8 sigmoid routing, Grouped Query Attention (32 Q / 4 KV heads), per-head QK RMSNorm, RoPE, and an in-forward fp32 upcast on the language-model head (`enable_lm_head_fp32`). It supports a 256K context window.
 
-<Info>
+[Hy-MT2-30B-A3B](https://huggingface.co/tencent/Hy-MT2-30B-A3B) is Tencent's translation Mixture-of-Experts language model with 30B total parameters and 3B activated per token. It features 48 transformer layers (layer 0 dense, layers 1-47 MoE), 128 routed experts plus 1 shared expert with top-8 sigmoid routing, Grouped Query Attention (32 Q / 4 KV heads), per-head QK RMSNorm, RoPE, and an in-forward fp32 upcast on the language-model head (`enable_lm_head_fp32`). It supports a 256K context window.
 
-| | |
-|---|---|
-| **Task** | Text Generation (MoE, translation) |
-| **Architecture** | `HyMT2ForCausalLM` |
-| **Parameters** | 30B total / 3B activated |
-| **HF Org** | [tencent](https://huggingface.co/tencent) |
+Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
-</Info>
+## Fine-Tune Hy-MT2-30B-A3B
 
-## Available Models
-
-- **Hy-MT2-30B-A3B**: 30B total, top-8 routed experts (out of 128) activated per token, plus 1 shared expert
-
-## Architectures
-
-- `HyMT2ForCausalLM`
-
-## Example HF Models
-
-| Model | HF ID |
-|---|---|
-| Hy-MT2-30B-A3B | [`tencent/Hy-MT2-30B-A3B`](https://huggingface.co/tencent/Hy-MT2-30B-A3B) |
-
-## Example Recipes
-
-| Recipe | Description |
-|---|---|
-| [hy_mt2_30b_a3b_sft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/hy_mt2/hy_mt2_30b_a3b_sft.yaml) | SFT — Hy-MT2-30B-A3B with FSDP2 + EP8 + fp32 LM head |
-
-## Try with NeMo AutoModel
-
-**1. Clone and install from source** ([full instructions](/get-started/installation)):
-
-```bash
-git clone https://github.com/NVIDIA-NeMo/Automodel.git
-cd Automodel
-uv sync --locked --all-groups --all-extras
-```
-
-**2. Run the recipe** from inside the repo:
+From the repository root, run:
 
 ```bash
 uv run automodel --nproc-per-node=8 examples/llm_finetune/hy_mt2/hy_mt2_30b_a3b_sft.yaml
@@ -54,10 +18,38 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/hy_mt2/hy_mt2_30b_a3b_
 
 Refer to the [NeMo AutoModel Installation Guide](/get-started/installation) and [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).
 
-## Fine-Tune the Model
+## Choose a Workflow
 
-Refer to the [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft) and the [Large MoE Fine-Tuning Guide](/recipes-e2e-examples/large-moe-fine-tuning).
+| Goal | Start Here |
+| --- | --- |
+| Supervised fine-tuning (SFT) - Hy-MT2-30B-A3B with FSDP2 + EP8 + fp32 LM head | Use [hy_mt2_30b_a3b_sft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/hy_mt2/hy_mt2_30b_a3b_sft.yaml). |
 
-## Hugging Face Model Cards
+## Model Reference
 
-- [tencent/Hy-MT2-30B-A3B](https://huggingface.co/tencent/Hy-MT2-30B-A3B)
+### Model Summary
+
+| Property | Value |
+| --- | --- |
+| Task | Text Generation (MoE, translation) |
+| Architecture | `HyMT2ForCausalLM` |
+| Parameters | 30B total / 3B activated |
+| Hugging Face Organization | [tencent](https://huggingface.co/tencent) |
+
+### Available Models
+
+- **Hy-MT2-30B-A3B**: 30B total, top-8 routed experts (out of 128) activated per token, plus 1 shared expert
+
+### Model Architectures
+
+- `HyMT2ForCausalLM`
+
+### Available Checkpoints
+
+| Model | HF ID |
+|---|---|
+| Hy-MT2-30B-A3B | [`tencent/Hy-MT2-30B-A3B`](https://huggingface.co/tencent/Hy-MT2-30B-A3B) |
+
+## Related Resources
+
+- [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
+- [Large MoE Fine-Tuning Guide](/recipes-e2e-examples/large-moe-fine-tuning)

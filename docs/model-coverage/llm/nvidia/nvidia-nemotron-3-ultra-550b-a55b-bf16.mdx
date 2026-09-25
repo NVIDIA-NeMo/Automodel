@@ -1,0 +1,50 @@
+---
+title: "NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16"
+description: "Use NeMo AutoModel to fine-tune NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16 for LLM workflows with checked-in text generation recipes and documented distributed settings."
+slug: model-coverage/large-language-models/nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16
+---
+
+[NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16) has a checked-in NeMo AutoModel recipe for text generation.
+The Hugging Face configuration declares the `NemotronHForCausalLM` architecture.
+
+## Fine-Tune NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16
+
+Follow the [installation instructions](/get-started/installation), then review the checked-in recipe and
+its declared topology below before choosing a local or cluster launcher.
+
+Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node run.
+
+## Standard Recipe Configuration
+
+Start with the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_ultra_v3_squad.yaml).
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | - |
+| Strategy | FSDP2; tp_size=1, pp_size=4, cp_size=1, ep_size=64 |
+| Nodes | 32 |
+| Features | Checkpointing (enabled=true), Activation checkpointing (activation_checkpointing=true), Packed sequences (packed_sequence_size=4096), Transformer Engine, HybridEP (dispatcher=hybridep) |
+| Advanced | attention=te, linear=te, experts=gmm, dispatcher=hybridep |
+
+## Alternate Recipe Configuration
+
+- [`nemotron_ultra_v3_te_deepep.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/nemotron/nemotron_ultra_v3_te_deepep.yaml)
+- [`nemotron_ultra_v3_hellaswag_peft.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_ultra_v3_hellaswag_peft.yaml)
+- [`nemotron_ultra_v3_hellaswag_peft_gb200.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_ultra_v3_hellaswag_peft_gb200.yaml)
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| Architecture | `NemotronHForCausalLM` |
+
+### Available Models
+
+- [`nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16`](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16)
+
+## Related Resources
+
+- [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)
