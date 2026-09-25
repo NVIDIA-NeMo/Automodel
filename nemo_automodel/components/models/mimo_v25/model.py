@@ -213,13 +213,16 @@ class MiMoV2Attention(nn.Module):
         self.o_hidden_size = self.num_attention_heads * self.v_head_dim
         self.v_scale = getattr(config, "attention_value_scale", None)
 
-        self.attention_sink_bias = (
-            nn.Parameter(torch.empty(self.num_attention_heads), requires_grad=False)
+        # Frozen checkpoint state stays replicated and must not join bf16 FSDP
+        # parameter groups as a directly-owned fp32 parameter.
+        self.register_buffer(
+            "attention_sink_bias",
+            torch.zeros(self.num_attention_heads, dtype=torch.float32)
             if (
                 (getattr(config, "add_full_attention_sink_bias", False) and not is_swa)
                 or (getattr(config, "add_swa_attention_sink_bias", False) and is_swa)
             )
-            else None
+            else None,
         )
 
         attention_bias = getattr(config, "attention_bias", False)
@@ -429,6 +432,7 @@ class MiMoV2Model(nn.Module):
     def __init__(self, config: MiMoV2Config, moe_config: MoEConfig, backend: BackendConfig):
         super().__init__()
         self.config = config
+        self.moe_config = moe_config
         self.backend = backend
 
         if backend.gate_precision is None:
@@ -451,8 +455,19 @@ class MiMoV2Model(nn.Module):
         inputs_embeds: torch.Tensor,
         attention_mask: torch.Tensor | dict[str, torch.Tensor] | None,
         position_ids: torch.Tensor,
-        cache_position: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
+        """Build full and sliding masks for the uncached training sequence.
+
+        Args:
+            inputs_embeds: Embeddings of shape [batch, sequence, hidden].
+            attention_mask: Padding mask of shape [batch, sequence], an additive
+                mask of shape [batch, 1, sequence, sequence], or a mapping of
+                attention types to masks with that four-dimensional layout.
+            position_ids: Positions of shape [batch, sequence] or [1, sequence].
+
+        Returns:
+            Full and sliding additive masks of shape [batch, 1, sequence, sequence].
+        """
         batch_size, seq_len = inputs_embeds.shape[:2]
         dtype = inputs_embeds.dtype
         device = inputs_embeds.device
@@ -483,7 +498,6 @@ class MiMoV2Model(nn.Module):
             config=self.config,
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
-            cache_position=cache_position,
             past_key_values=None,
             position_ids=position_ids,
         )
@@ -511,7 +525,7 @@ class MiMoV2Model(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.LongTensor | None = None,
+        input_ids: torch.Tensor | None = None,
         *,
         inputs_embeds: torch.FloatTensor | None = None,
         position_ids: torch.LongTensor | None = None,
@@ -520,11 +534,30 @@ class MiMoV2Model(nn.Module):
         cache_position: torch.LongTensor | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
+        """Run the decoder layers owned by this pipeline stage.
+
+        Args:
+            input_ids: Token IDs of shape [batch, sequence] on the embedding
+                stage, or hidden states of shape [batch, sequence, hidden] on
+                later stages.
+            inputs_embeds: Optional embeddings of shape [batch, sequence, hidden].
+            position_ids: Optional positions of shape [batch, sequence] or
+                [1, sequence] for broadcasting across the batch.
+            attention_mask: Optional padding mask of shape [batch, sequence] or
+                additive attention mask of shape [batch, 1, sequence, sequence].
+            padding_mask: Optional padding indicators of shape [batch, sequence].
+            cache_position: Optional token positions of shape [sequence].
+            **kwargs: Unused compatibility arguments.
+
+        Returns:
+            Hidden states of shape [batch, sequence, hidden], normalized only
+            on the stage that owns the final norm.
+        """
         del kwargs
         if inputs_embeds is None:
             if input_ids is None:
                 raise ValueError("input_ids or inputs_embeds must be provided")
-            inputs_embeds = self.embed_tokens(input_ids)
+            inputs_embeds = self.embed_tokens(input_ids) if self.embed_tokens is not None else input_ids
 
         if cache_position is None:
             cache_position = torch.arange(0, inputs_embeds.shape[1], device=inputs_embeds.device)
@@ -538,7 +571,6 @@ class MiMoV2Model(nn.Module):
             inputs_embeds,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            cache_position=cache_position,
         )
 
         hidden_states = inputs_embeds
@@ -556,7 +588,7 @@ class MiMoV2Model(nn.Module):
                 padding_mask=padding_mask,
             )
 
-        return self.norm(hidden_states)
+        return self.norm(hidden_states) if self.norm is not None else hidden_states
 
     @torch.no_grad()
     def init_weights(self, buffer_device: torch.device | None = None) -> None:
@@ -678,7 +710,7 @@ class MiMoV2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 
     def forward(
         self,
-        input_ids: torch.LongTensor | None = None,
+        input_ids: torch.Tensor | None = None,
         *,
         inputs_embeds: torch.FloatTensor | None = None,
         position_ids: torch.LongTensor | None = None,
@@ -688,6 +720,29 @@ class MiMoV2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         output_hidden_states: bool | None = None,
         **kwargs: Any,
     ) -> CausalLMOutputWithPast:
+        """Compute logits or pass hidden states to the next pipeline stage.
+
+        Args:
+            input_ids: Token IDs of shape [batch, sequence] on the first stage,
+                or hidden states of shape [batch, sequence, hidden] thereafter.
+            inputs_embeds: Optional embeddings of shape [batch, sequence, hidden].
+            position_ids: Optional positions of shape [batch, sequence] or
+                [1, sequence] for broadcasting across the batch.
+            attention_mask: Optional padding mask of shape [batch, sequence] or
+                additive attention mask of shape [batch, 1, sequence, sequence].
+            padding_mask: Optional padding indicators of shape [batch, sequence].
+            logits_to_keep: Number of trailing token positions to retain, or
+                indices of shape [retained_sequence]. Zero retains all positions.
+            output_hidden_states: Whether to include the decoder hidden states.
+            **kwargs: Additional decoder arguments, including optional
+                cache_position of shape [sequence].
+
+        Returns:
+            A model output containing logits of shape [batch, retained_sequence,
+            vocab] on the last stage, or hidden states of shape [batch, sequence,
+            hidden] on intermediate stages. Requested hidden states contain a
+            tensor of shape [batch, sequence, hidden].
+        """
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None
