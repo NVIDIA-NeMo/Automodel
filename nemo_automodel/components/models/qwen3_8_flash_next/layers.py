@@ -456,6 +456,38 @@ class Qwen3_8_FlashNextHyperConnection(nn.Module):
             nn.init.trunc_normal_(self.block_inject_weight.weight, mean=0.0, std=init_std)
 
 
+def _qsa_route_extents(
+    local_sequence_length: int,
+    *,
+    packed_cu_seqlens: torch.Tensor | None,
+    cp_context: Qwen3_8_FlashNextCPContext | None,
+) -> tuple[int, int]:
+    """Bound the QSA route width and name the physical K/V extent for one forward.
+
+    Valid route IDs are contiguous and a causal row can never see more than the
+    longest document (packed) or the whole sequence (dense), so the indexer's
+    fixed-width output can be trimmed without changing attention. Routes are
+    global K/V coordinates: under CP the keys are all-gathered to the global
+    length, so the mask extent follows the CP context whether or not the row is
+    packed.
+
+    Args:
+        local_sequence_length: Number of query positions on this rank.
+        packed_cu_seqlens: Optional packed-document boundaries ``[num_docs + 1]``.
+        cp_context: Optional contiguous CP metadata.
+
+    Returns:
+        ``(max_visible_tokens, kv_length)``: the route-width bound and the number of
+        physical K/V rows the FlexAttention mask must cover.
+    """
+    kv_length = cp_context.global_sequence_length if cp_context is not None else local_sequence_length
+    if packed_cu_seqlens is not None:
+        max_visible_tokens = int(packed_cu_seqlens.diff().max())
+    else:
+        max_visible_tokens = kv_length
+    return max_visible_tokens, kv_length
+
+
 class Qwen3_8_FlashNextQSAAttention(Qwen3NextAttention):
     """Qwen3.8-Flash-Next gated attention with compressed-block QSA routing.
 
@@ -633,20 +665,9 @@ class Qwen3_8_FlashNextQSAAttention(Qwen3NextAttention):
                 cp_context=cp_context,
                 cu_seqlens=packed_cu_seqlens,
             )
-            sequence_length = x.shape[1]
-            # Keep the indexer's fixed-width output hookable for parity while
-            # avoiding 2,051 padded gathers on short sequences.  Valid IDs are
-            # contiguous and a causal row can never contain more than S tokens
-            # (or, when packed, more than the longest document).
-            if packed_cu_seqlens is not None:
-                max_visible_tokens = int(packed_cu_seqlens.diff().max())
-                kv_length = sequence_length
-            elif cp_context is not None:
-                max_visible_tokens = cp_context.global_sequence_length
-                kv_length = cp_context.global_sequence_length
-            else:
-                max_visible_tokens = sequence_length
-                kv_length = sequence_length
+            max_visible_tokens, kv_length = _qsa_route_extents(
+                x.shape[1], packed_cu_seqlens=packed_cu_seqlens, cp_context=cp_context
+            )
             attention_width = min(max_visible_tokens, selected_token_ids.shape[-1])
             selected_token_ids = selected_token_ids[..., :attention_width]
             flex_mask = None
