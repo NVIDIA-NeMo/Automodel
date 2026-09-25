@@ -803,6 +803,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     if self.moe_mesh is not None and "ep" in (self.moe_mesh.mesh_dim_names or ())
                     else None
                 ),
+                stages=(self.pp.info.stages if self.pp is not None else None),
             )
 
         _packed_seq_size = self.cfg.get("packed_sequence.packed_sequence_size", 0)

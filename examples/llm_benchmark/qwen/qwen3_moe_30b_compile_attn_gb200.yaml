@@ -88,7 +88,7 @@ model:
     rms_norm: torch  # WAVE 13: TE RMSNorm also compiler-disabled
     rope_fusion: false  # WAVE 13: fused RoPE is a TE compiler-disabled op
     compile_attn: true  # WAVE 13: torch.compile(fullgraph) the GQA attention forward
-    experts: te  # TE GroupedLinear bf16 (no fp8) — fastest bf16 expert backend (bake-off: te 26.27% > gmm 26.12% > torch_mm 25.45%)
+    experts: te  # TE GroupedLinear bf16 (no fp8) — fastest retained bf16 backend (te 26.27% > torch_mm 25.45%)
     dispatcher: hybridep  # GB200: deepep fails EP-buffer init ('invalid resource handle')
     fake_balanced_gate: true
     enable_hf_state_dict_adapter: true

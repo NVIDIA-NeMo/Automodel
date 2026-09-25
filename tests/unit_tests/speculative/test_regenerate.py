@@ -22,6 +22,9 @@ from types import SimpleNamespace
 import pytest
 
 from nemo_automodel.components.speculative.regenerate import (
+    _MANIFEST_BACKFILL,
+    _MANIFEST_NAME,
+    _build_parser,
     GenerationConfig,
     _build_manifest,
     _chat_completion,
@@ -153,6 +156,7 @@ def test_resume_manifest_mismatch_raises(tmp_path: Path):
         max_new_tokens=128,
         temperature=0.0,
         top_p=1.0,
+        top_k=0,
         reasoning="none",
     )
     manifest = _build_manifest(args)
@@ -182,6 +186,7 @@ def test_resume_without_manifest_and_existing_shards_raises(tmp_path: Path):
         "max_new_tokens": 128,
         "temperature": 0.0,
         "top_p": 1.0,
+        "top_k": 0,
         "reasoning": "none",
     }
     with pytest.raises(ValueError, match="manifest.json is missing"):
@@ -204,6 +209,7 @@ def test_fresh_run_with_existing_shards_refuses_to_clobber(tmp_path: Path):
         max_new_tokens=128,
         temperature=0.0,
         top_p=1.0,
+        top_k=0,
         reasoning="none",
     )
     with pytest.raises(ValueError, match="already contains"):
@@ -230,6 +236,7 @@ def test_fresh_run_into_empty_dir_writes_manifest(tmp_path: Path):
         max_new_tokens=128,
         temperature=0.0,
         top_p=1.0,
+        top_k=0,
         reasoning="none",
     )
     manifest = _build_manifest(args)
@@ -238,28 +245,37 @@ def test_fresh_run_into_empty_dir_writes_manifest(tmp_path: Path):
     assert written == manifest
 
 
+def _manifest_args(**overrides):
+    """Args for ``_build_manifest``, derived from the CLI parser's own defaults.
+
+    Deriving rather than hand-listing is deliberate: a hand-written namespace
+    silently rots the moment production grows a field, and every fixture that
+    duplicates the default set has to be found and patched. Anything the parser
+    knows about is present here automatically.
+    """
+    args = _build_parser().parse_args(
+        [
+            "--input-data",
+            "dataset-a",
+            "--output-dir",
+            "/some/path",
+            "--target-server",
+            "http://localhost:30000/v1",
+            "--model",
+            "model-a",
+        ]
+    )
+    for key, value in overrides.items():
+        setattr(args, key, value)
+    return args
+
+
 def test_build_manifest_excludes_self_referential_and_operational_fields():
     """The manifest must not encode output_dir (it lives inside output_dir) or knobs
     that only affect throughput (concurrency / timeout_s / max_retries)."""
-    args = SimpleNamespace(
-        input_data="dataset-a",
-        output_dir="/some/path",
-        target_server="http://localhost:30000/v1",
-        model="model-a",
-        messages_column="messages",
-        split="train",
-        dataset_name=None,
-        shuffle_seed=None,
-        shard_size=1000,
-        max_new_tokens=128,
-        temperature=0.0,
-        reasoning="none",
-        top_p=1.0,
-        # Operational knobs that intentionally do NOT belong in the manifest.
-        concurrency=99,
-        timeout_s=123.0,
-        max_retries=42,
-    )
+    # Operational knobs are set explicitly so their absence from the manifest is
+    # a real assertion rather than an accident of the defaults.
+    args = _manifest_args(concurrency=99, timeout_s=123.0, max_retries=42)
     manifest = _build_manifest(args)
     assert "output_dir" not in manifest
     for operational in ("concurrency", "timeout_s", "max_retries"):
@@ -419,6 +435,7 @@ def _run_args(tmp_path: Path, *, resume: bool, shard_size: int = 2) -> SimpleNam
         max_new_tokens=8,
         temperature=0.0,
         top_p=1.0,
+        top_k=0,
         timeout_s=5.0,
         max_retries=0,
         resume=resume,
@@ -626,3 +643,54 @@ def test_reasoning_none_sends_no_chat_template_kwargs():
     (call,) = session.calls
     assert "chat_template_kwargs" not in call["json"]
     assert "extra_body" not in call["json"]
+
+
+@pytest.mark.parametrize("missing_key", sorted(_MANIFEST_BACKFILL))
+def test_resume_tolerates_every_manifest_key_added_after_the_format_shipped(tmp_path, missing_key):
+    """A run started before a manifest key existed must still resume.
+
+    ``_ensure_manifest_compatible`` compares with a strict ``!=``, so every key
+    added later is a silent breaking change for in-flight output directories --
+    identical settings, different dicts. Parametrising over ``_MANIFEST_BACKFILL``
+    means a future key is covered the moment it is registered there, without
+    anyone remembering to write a test.
+    """
+    args = _manifest_args(output_dir=str(tmp_path))
+    current = _build_manifest(args)
+    assert current[missing_key] == _MANIFEST_BACKFILL[missing_key]
+
+    legacy = {k: v for k, v in current.items() if k != missing_key}
+    (tmp_path / _MANIFEST_NAME).write_text(json.dumps(legacy), encoding="utf-8")
+
+    _ensure_manifest_compatible(tmp_path, current, resume=True, existing_shards={0})
+
+
+@pytest.mark.parametrize("changed_key", ["temperature", "top_p", "top_k", "model"])
+def test_resume_still_rejects_a_genuinely_different_manifest(tmp_path, changed_key):
+    """The backfill must not soften the check it compensates for.
+
+    A key that is *present* but different -- including a backfilled one -- still
+    means the shards on disk came from another configuration.
+    """
+    args = _manifest_args(output_dir=str(tmp_path))
+    current = _build_manifest(args)
+    value = current[changed_key]
+    stale = {**current, changed_key: (value + 1) if isinstance(value, (int, float)) else f"{value}-other"}
+    (tmp_path / _MANIFEST_NAME).write_text(json.dumps(stale), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="does not match"):
+        _ensure_manifest_compatible(tmp_path, current, resume=True, existing_shards={0})
+
+
+def test_every_manifest_key_is_settable_from_the_cli():
+    """A manifest field with no CLI flag records a constant and cannot vary.
+
+    That is what made ``top_k`` dead weight when it was first added here: it went
+    into the manifest before ``--top-k`` existed, so it logged 0 forever while
+    also breaking resume for older runs.
+    """
+    parser_defaults = vars(
+        _build_parser().parse_args(["--input-data", "d", "--output-dir", "o", "--target-server", "s", "--model", "m"])
+    )
+    for key in _build_manifest(_manifest_args()):
+        assert key in parser_defaults, f"manifest key {key!r} is not settable from the CLI"

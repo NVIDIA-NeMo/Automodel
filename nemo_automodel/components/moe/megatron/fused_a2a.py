@@ -17,8 +17,13 @@
 # Copyright (c) 2025 DeepSeek
 # Licensed under the MIT License - https://github.com/deepseek-ai/DeepEP/blob/main/LICENSE
 
+import atexit
+import logging
 import os
+import shutil
+import tempfile
 import threading
+import time
 from contextlib import contextmanager
 
 try:
@@ -130,6 +135,8 @@ import torch
 _buffer = None
 _nvshmem_available = None
 _uccl_buffer = None
+
+logger = logging.getLogger(__name__)
 
 
 class HybridEPDispatchReplayRecorder:
@@ -522,6 +529,91 @@ except ImportError:
 
 _hybrid_ep_buffer = None
 
+# HybridEP compiles its preprocessing / dispatch / combine kernels with nvcc on first use into a
+# per-process directory (``$HYBRID_EP_CACHE_DIR`` or ``$HOME``, then ``.deepep/hybrid_ep/jit/proc-<pid>``),
+# so every process of every job compiles them again (7 nvcc runs, ~50 s per process for the Kimi-K3
+# shapes). ``NEMO_HYBRIDEP_JIT_CACHE=<dir>`` warm-starts that per-process directory from a shared
+# cache and stores newly compiled kernels back into it. The compiled .so files depend only on the
+# kernel config and the toolchain (rank and job id only appear in the transient file name), and
+# HybridEP's ``load_cached_kernels`` loads every .so present in the per-process directory when the
+# buffer is constructed, keyed by file stem.
+_JIT_CACHE_ROOT = os.environ.get("NEMO_HYBRIDEP_JIT_CACHE")
+_jit_proc_dir: str | None = None
+_jit_shared_dir: str | None = None
+_jit_stored = False
+
+
+def _deep_ep_version() -> str:
+    """Installed DeepEP version (dist-info first: the package itself carries no ``__version__``)."""
+    try:
+        from importlib.metadata import version
+
+        return version("deep_ep")
+    except Exception:
+        import deep_ep
+
+        return str(getattr(deep_ep, "__version__", "unknown"))
+
+
+def _hybrid_ep_jit_dirs() -> tuple[str, str]:
+    """Return (shared cache dir for this toolchain and GPU, this process's HybridEP JIT dir).
+
+    The per-process path mirrors ``get_jit_dir()`` in DeepEP's ``csrc/hybrid_ep/jit/compiler.cu``.
+    """
+    base = os.environ.get("HYBRID_EP_CACHE_DIR")
+    if not base:
+        base = tempfile.mkdtemp(prefix="hybrid_ep_jit_")
+        os.environ["HYBRID_EP_CACHE_DIR"] = base
+    proc_dir = os.path.join(base, ".deepep", "hybrid_ep", "jit", f"proc-{os.getpid()}")
+    major, minor = torch.cuda.get_device_capability()
+    fingerprint = f"deep_ep-{_deep_ep_version()}_cuda-{torch.version.cuda}_sm{major}{minor}"
+    return os.path.join(_JIT_CACHE_ROOT, fingerprint), proc_dir
+
+
+def _warm_start_hybrid_ep_jit() -> bool:
+    """Copy the shared cache's kernels into this process's JIT dir. Returns whether the cache is active."""
+    global _jit_proc_dir, _jit_shared_dir
+    if not _JIT_CACHE_ROOT:
+        return False
+    _jit_shared_dir, _jit_proc_dir = _hybrid_ep_jit_dirs()
+    os.makedirs(_jit_proc_dir, exist_ok=True)
+    loaded = 0
+    if os.path.isdir(_jit_shared_dir):
+        for name in sorted(os.listdir(_jit_shared_dir)):
+            if name.endswith(".so"):
+                shutil.copy2(os.path.join(_jit_shared_dir, name), os.path.join(_jit_proc_dir, name))
+                loaded += 1
+    logger.info("HybridEP JIT cache: warm-started %d kernel(s) from %s", loaded, _jit_shared_dir)
+    atexit.register(store_hybrid_ep_jit_cache)
+    return True
+
+
+def store_hybrid_ep_jit_cache() -> int:
+    """Store the kernels HybridEP compiled in this process into the shared cache (local rank 0 only).
+
+    Files are written to a temporary name and atomically renamed, so concurrent writers from
+    several nodes leave a complete file behind; existing entries are kept.
+    """
+    if not _jit_proc_dir or not _jit_shared_dir or int(os.environ.get("LOCAL_RANK", "0")) != 0:
+        return 0
+    if not os.path.isdir(_jit_proc_dir):
+        return 0
+    os.makedirs(_jit_shared_dir, exist_ok=True)
+    stored = 0
+    for name in sorted(os.listdir(_jit_proc_dir)):
+        if not name.endswith(".so"):
+            continue
+        dst = os.path.join(_jit_shared_dir, name)
+        if os.path.exists(dst):
+            continue
+        tmp = f"{dst}.{os.getpid()}.tmp"
+        shutil.copy2(os.path.join(_jit_proc_dir, name), tmp)
+        os.replace(tmp, dst)
+        stored += 1
+    if stored:
+        logger.info("HybridEP JIT cache: stored %d new kernel(s) into %s", stored, _jit_shared_dir)
+    return stored
+
 
 def init_hybrid_ep_buffer(
     group: torch.distributed.ProcessGroup,
@@ -549,6 +641,7 @@ def init_hybrid_ep_buffer(
     """
     assert not fp8_dispatch, "HybridEP dispatcher does not support fp8 dispatch now"
     global _hybrid_ep_buffer
+    load_cached_kernels = _warm_start_hybrid_ep_jit()
     _hybrid_ep_buffer = HybridEPBuffer(
         group=group,
         hidden_dim=hidden_dim,
@@ -557,6 +650,7 @@ def init_hybrid_ep_buffer(
         use_fp8=fp8_dispatch,
         num_sms_dispatch_api=num_sms_dispatch_api,
         num_sms_combine_api=num_sms_combine_api,
+        **({"load_cached_kernels": True} if load_cached_kernels else {}),
     )
 
 
@@ -583,7 +677,9 @@ class HybridEPDispatch(torch.autograd.Function):
         pad_multiple=None,
     ):
         """Forward pass of fused dispatch of the HybridEP backend."""
-        if _hybrid_ep_buffer is None:
+        first_call = _hybrid_ep_buffer is None
+        if first_call:
+            t_first = time.perf_counter()
             seq_len, hidden_dim = x.shape[-2:]
             fp8_dispatch = False
             init_hybrid_ep_buffer(
@@ -640,6 +736,13 @@ class HybridEPDispatch(torch.autograd.Function):
 
         ctx.handle = handle
         ctx.pad_multiple = pad_multiple
+        if first_call:
+            # One-time cost: buffer allocation + handle exchange + nvcc JIT of the preprocessing /
+            # dispatch / combine kernels (HybridEP compiles per process, so every job pays it).
+            torch.cuda.synchronize(x.device)
+            logger.info(
+                "HybridEP first dispatch (buffer init + kernel JIT + call): %.1f s", time.perf_counter() - t_first
+            )
         if recorder is not None and _hybridep_dispatch_replay_state.mode == "record":
             # Keep only the reusable layout and its output extent. Recomputed
             # activations and probabilities are still redispatched through it.
@@ -659,6 +762,11 @@ class HybridEPDispatch(torch.autograd.Function):
         combined_hidden, combined_probs = _hybrid_ep_buffer.combine_with_unpermute(
             hidden=grad_x, probs=grad_probs, handle=handle, pad_multiple=ctx.pad_multiple
         )
+        global _jit_stored
+        if _JIT_CACHE_ROOT and not _jit_stored:
+            # The backward combine is the last HybridEP kernel variant compiled in a training step.
+            _jit_stored = True
+            store_hybrid_ep_jit_cache()
         return combined_hidden, None, combined_probs, None, None, None, None, None, None
 
 

@@ -3,7 +3,7 @@
 # The 896 target experts are sharded with expert parallelism; the trainable draft
 # is one fused K3 MLA layer that keeps Q-LoRA, the compressed KV latent, NoPE, the
 # output gate, K3 RMSNorm and the SiTU MLP, and drops KDA, MoE and the
-# attention-residual mixer. See README_kimi_k3.md.
+# attention-residual mixer. See README-kimi-k3.md.
 
 recipe: TrainEagle3Recipe
 

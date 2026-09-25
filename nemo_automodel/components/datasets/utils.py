@@ -29,6 +29,12 @@ def batchify(tensor, default_tensor_cls=torch.LongTensor):
     Returns:
         torch.Tensor:  The tensor with an extra dimension added if it was originally 1-dimensional.
         Otherwise, the tensor is returned as-is.
+
+    Warning:
+        A 1-D tensor is unsqueezed **in place** and returned as the same object, so the
+        caller's tensor is reshaped from ``[S]`` to ``[1, S]`` as a side effect. Do not
+        pass a tensor owned by someone else -- add the batch axis with ``unsqueeze(0)``
+        instead.
     """
     if not isinstance(tensor, torch.Tensor):
         tensor = default_tensor_cls(tensor)
@@ -254,7 +260,8 @@ def default_collater(
             sequence length, and becomes ``[B, S]`` after padding, where ``B`` is the number of examples and
             ``S`` is the padded maximum. A tensor-valued field is already batched as ``[B_i, ...]`` with
             arbitrary trailing axes and becomes ``[sum_i(B_i), ...]``. The optional
-            ``___PAD_TOKEN_IDS___`` entry is removed from the first input mapping in place.
+            ``___PAD_TOKEN_IDS___`` entry is removed from the first input mapping in place. Apart from
+            that removal, the input examples and their tensors are left unmodified.
         pad_seq_len_divisible: If set, round padded ``S`` up to a multiple of this value.
 
     Returns:
@@ -273,7 +280,10 @@ def default_collater(
         if all(isinstance(v, torch.Tensor) and v.ndim > 0 for v in values):
             # Pre-batched fields: each value is a [batch_size, seq_len] tensor; concatenate along the
             # batch dim rather than treating it as a ragged list[int] to be padded.
-            ans[key] = torch.cat([batchify(v) for v in values], dim=0)
+            # These tensors belong to the caller's examples, so add the batch axis
+            # out-of-place: ``batchify`` unsqueezes 1-D input in place, which would
+            # reshape the dataset's own sample from [S] to [1, S] as a side effect.
+            ans[key] = torch.cat([v.unsqueeze(0) if v.ndim == 1 else v for v in values], dim=0)
         elif all(is_scalar_field(v) for v in values):
             # One scalar per example (e.g. dataset_id from a blended dataset):
             # stack to [B]. Padding this as a ragged sequence raises, and
