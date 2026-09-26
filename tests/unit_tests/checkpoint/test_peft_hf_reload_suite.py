@@ -31,6 +31,7 @@ gap is visible and closing the bug turns the test green instead of leaving it
 uncovered.
 """
 
+import json
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -304,6 +305,10 @@ class _Family:
             same class as the source. AutoModel trains Omni's thinker on its own and the
             adapter adds the ``thinker.`` segment, so the artifact targets the full model.
         reference_path: Attribute on the reference that corresponds to the source model.
+        legacy_namespace: Module prefix the ``v4_compatible`` export targets, when that is
+            a Transformers v4 layout this environment cannot build. The legacy artifact is
+            then checked for internal consistency instead of reloaded -- see
+            ``test_legacy_export_names_one_namespace``.
         xfail: Issue reference when this family has a known, filed export defect.
     """
 
@@ -312,12 +317,20 @@ class _Family:
     peft_kwargs: dict = field(default_factory=dict)
     build_reference: Callable[[], nn.Module] | None = None
     reference_path: str | None = None
+    legacy_namespace: str | None = None
     xfail: str | None = None
 
 
 _FAMILIES = (
     _Family("llama_dense", _build_llama, {"target_modules": ["*.q_proj", "*.v_proj"]}),
-    _Family("nemotron_v3", _build_nemotron_v3, {"exclude_modules": ["*.out_proj"]}),
+    # v4 keeps the checkpoint's ``backbone.`` namespace, which is the Transformers v4
+    # NemotronH layout; v5 renames it to ``model.``. Only the v5 target is buildable here.
+    _Family(
+        "nemotron_v3",
+        _build_nemotron_v3,
+        {"exclude_modules": ["*.out_proj"]},
+        legacy_namespace="backbone.",
+    ),
     _Family("qwen3_moe", _build_qwen3_moe, {"target_modules": ["*.q_proj", "*.v_proj"]}),
     _Family("minimax_m2", _build_minimax_m2, {"target_modules": ["*.q_proj", "*.v_proj"]}),
     # Scoped to the thinker: the talker and code2wav towers add adapters the thinker's
@@ -402,7 +415,9 @@ def _adapted_model(family: _Family, source: Path):
     return model, reference, peft_config
 
 
-def _save_through_checkpointer(model: nn.Module, peft_config: PeftConfig, tmp_path: Path) -> Path:
+def _save_through_checkpointer(
+    model: nn.Module, peft_config: PeftConfig, tmp_path: Path, *, v4_compatible: bool = False
+) -> Path:
     """Write the adapter with the production checkpoint path, not a direct adapter call."""
     checkpointer = Checkpointer(
         CheckpointingConfig(
@@ -413,6 +428,7 @@ def _save_through_checkpointer(model: nn.Module, peft_config: PeftConfig, tmp_pa
             model_save_format="safetensors",
             save_consolidated=False,
             is_peft=True,
+            v4_compatible=v4_compatible,
         ),
         dp_rank=0,
         tp_rank=0,
@@ -423,26 +439,52 @@ def _save_through_checkpointer(model: nn.Module, peft_config: PeftConfig, tmp_pa
     return tmp_path / "peft" / "model"
 
 
+def _fmt(v4_compatible: bool) -> str:
+    """Name the export format for assertion messages."""
+    return "v4" if v4_compatible else "v5"
+
+
+def _module_of(tensor_key: str) -> str:
+    """The module an exported adapter tensor belongs to, as target_modules names it."""
+    return tensor_key.removeprefix("base_model.model.").rsplit(".lora_", 1)[0]
+
+
 # --------------------------------------------------------------------------- tests
 
 
+# Both export formats are supported, so both have to be checked against the real
+# consumer. They are the same artifact for most families; nemotron_v3 is the one that
+# genuinely differs, because v4 keeps the checkpoint's ``backbone.`` namespace where v5
+# uses ``model.`` -- in the tensor keys and in target_modules alike.
+_FORMATS = [pytest.param(False, id="v5"), pytest.param(True, id="v4")]
+
+
+@pytest.mark.parametrize("v4_compatible", _FORMATS)
 @pytest.mark.parametrize("family", _params())
-def test_exported_adapter_loads_into_hf_peft(family: _Family, tmp_path: Path, peft_process_group):
+def test_exported_adapter_loads_into_hf_peft(
+    family: _Family, v4_compatible: bool, tmp_path: Path, peft_process_group
+):
     """Save through the real path, reload with real PEFT, and require identical behavior."""
     from peft import PeftModel, get_peft_model_state_dict
     from safetensors.torch import load_file
 
+    if v4_compatible and family.legacy_namespace is not None:
+        pytest.skip(
+            f"{family.id} v4 targets the {family.legacy_namespace!r} layout, which this "
+            f"Transformers cannot build; test_legacy_export_names_one_namespace covers it"
+        )
+
     model, reference, peft_config = _adapted_model(family, tmp_path / "source")
-    adapter_dir = _save_through_checkpointer(model, peft_config, tmp_path)
+    adapter_dir = _save_through_checkpointer(model, peft_config, tmp_path, v4_compatible=v4_compatible)
 
     exported = load_file(str(adapter_dir / "adapter_model.safetensors"))
-    assert exported, f"{family.id}: the export wrote no adapter tensors"
-    assert len(set(exported)) == len(exported), f"{family.id}: duplicate keys in the export"
+    assert exported, f"{family.id}/{_fmt(v4_compatible)}: the export wrote no adapter tensors"
+    assert len(set(exported)) == len(exported), f"{family.id}/{_fmt(v4_compatible)}: duplicate keys in the export"
 
     loaded = PeftModel.from_pretrained(reference, str(adapter_dir), key_mapping={}, autocast_adapter_dtype=False).eval()
     loaded_state = get_peft_model_state_dict(loaded, save_embedding_layers=False)
     assert set(loaded_state) == set(exported), (
-        f"{family.id}: PEFT loaded a different tensor set than was exported; "
+        f"{family.id}/{_fmt(v4_compatible)}: PEFT loaded a different tensor set than was exported; "
         f"missing={sorted(set(exported) - set(loaded_state))} extra={sorted(set(loaded_state) - set(exported))}"
     )
     for name, value in exported.items():
@@ -459,8 +501,11 @@ def test_exported_adapter_loads_into_hf_peft(family: _Family, tmp_path: Path, pe
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
 
 
+@pytest.mark.parametrize("v4_compatible", _FORMATS)
 @pytest.mark.parametrize("family", _params())
-def test_bulk_and_per_tensor_exports_agree(family: _Family, tmp_path: Path, peft_process_group):
+def test_bulk_and_per_tensor_exports_agree(
+    family: _Family, v4_compatible: bool, tmp_path: Path, peft_process_group
+):
     """``to_hf`` and ``convert_single_tensor_to_hf`` feed different consumers; they must match.
 
     Streaming consumers convert one tensor at a time, which cannot see the sibling
@@ -472,14 +517,49 @@ def test_bulk_and_per_tensor_exports_agree(family: _Family, tmp_path: Path, peft
         pytest.skip(f"{family.id} has no state-dict adapter; the boundary names its tensors directly")
 
     native = ModelState(model, is_peft=True).state_dict()
-    bulk = adapter.to_hf(dict(native))
+    bulk = adapter.to_hf(dict(native), v4_compatible=v4_compatible)
     streamed = dict(
-        item for name, tensor in native.items() for item in adapter.convert_single_tensor_to_hf(name, tensor)
+        item
+        for name, tensor in native.items()
+        for item in adapter.convert_single_tensor_to_hf(name, tensor, v4_compatible=v4_compatible)
     )
 
     assert set(streamed) == set(bulk), (
-        f"{family.id}: per-tensor export disagrees on keys; "
+        f"{family.id}/{_fmt(v4_compatible)}: per-tensor export disagrees on keys; "
         f"bulk_only={sorted(set(bulk) - set(streamed))} streamed_only={sorted(set(streamed) - set(bulk))}"
     )
     for name, value in bulk.items():
         torch.testing.assert_close(streamed[name], value, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("family", _params())
+def test_legacy_export_names_one_namespace(family: _Family, tmp_path: Path, peft_process_group):
+    """The legacy artifact has to name the same modules in its tensors and its metadata.
+
+    PEFT resolves target_modules by suffix against the receiving model, then looks for
+    tensors under the names that matched. An entry with no tensor leaves a randomly
+    initialized adapter; a tensor with no entry is never loaded. Neither raises, which is
+    what made #3944 silent.
+
+    The v5 format gets this checked by the reload test above. The legacy format cannot:
+    its target is a Transformers v4 model that this environment cannot build, so a reload
+    would only prove the two versions disagree. The agreement between the two halves of
+    the artifact is the part that is still ours to keep correct, and it is checkable here.
+    """
+    from safetensors.torch import load_file
+
+    model, _, peft_config = _adapted_model(family, tmp_path / "source")
+    adapter_dir = _save_through_checkpointer(model, peft_config, tmp_path, v4_compatible=True)
+
+    exported = load_file(str(adapter_dir / "adapter_model.safetensors"))
+    assert exported, f"{family.id}/v4: the export wrote no adapter tensors"
+
+    config = json.loads((adapter_dir / "adapter_config.json").read_text(encoding="utf-8"))
+    targets = set(config.get("target_modules") or [])
+    assert targets, f"{family.id}/v4: the export declared no target_modules"
+
+    modules = {_module_of(key) for key in exported}
+    assert modules == targets, (
+        f"{family.id}/v4: tensors and target_modules name different modules; "
+        f"tensors_only={sorted(modules - targets)} targets_only={sorted(targets - modules)}"
+    )
