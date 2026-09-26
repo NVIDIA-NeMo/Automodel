@@ -1656,6 +1656,58 @@ def test_vlm_maybe_downgrade_loss_fn(
         assert result.ignore_index == -7
 
 
+def test_vlm_maybe_downgrade_keeps_masked_ce_object():
+    from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+
+    loss_fn = MaskedCrossEntropy()
+    assert _maybe_downgrade_loss_fn(loss_fn, _StageWithoutLogitsToKeep(), pp_enabled=True) is loss_fn
+
+
+def test_vlm_maybe_downgrade_pp_fallback_preserves_reduction_and_warns(caplog):
+    from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+    from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+
+    with caplog.at_level("WARNING"):
+        result = _maybe_downgrade_loss_fn(
+            FusedLinearCrossEntropy(ignore_index=-7, reduction="mean"), _StageWithLogitsToKeep(), pp_enabled=True
+        )
+
+    assert isinstance(result, MaskedCrossEntropy)
+    assert result.ignore_index == -7
+    assert result.reduction == "mean"
+    assert "not supported under pipeline parallelism" in caplog.text
+
+
+class _StageWithDynamicHiddenStateSupport(_StageWithLogitsToKeep):
+    def __init__(self, supported):
+        super().__init__()
+        self._supported = supported
+
+    @property
+    def _pp_return_hidden_states_supported(self):
+        return self._supported
+
+
+@pytest.mark.parametrize("supported", [True, False])
+def test_vlm_maybe_downgrade_reads_class_level_marker(supported):
+    """Models declare support as a class attribute or property (e.g. Qwen3.5-MoE without MTP)."""
+    from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+
+    result = _maybe_downgrade_loss_fn(
+        FusedLinearCrossEntropy(), _StageWithDynamicHiddenStateSupport(supported), pp_enabled=True
+    )
+
+    assert isinstance(result, FusedLinearCrossEntropy) is supported
+
+
+def test_vlm_maybe_downgrade_keeps_logit_losses_under_pp():
+    """Logit-based losses no longer fall back under PP once the stage forward accepts logits_to_keep."""
+    from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy
+
+    loss_fn = ChunkedCrossEntropy()
+    assert _maybe_downgrade_loss_fn(loss_fn, _StageWithLogitsToKeep(), pp_enabled=True) is loss_fn
+
+
 def test_configure_pipeline_fused_ce_requests_hidden_states():
     from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 
