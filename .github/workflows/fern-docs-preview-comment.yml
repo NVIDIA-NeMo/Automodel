@@ -71,6 +71,7 @@ jobs:
         id: generate-docs
         env:
           FERN_TOKEN: ${{ secrets.DOCS_FERN_TOKEN }}
+          FERN_DOCS_DEPLOY_MODE: ledger
           HEAD_SHA: ${{ steps.metadata.outputs.head_sha }}
         working-directory: ./docs/fern
         run: |

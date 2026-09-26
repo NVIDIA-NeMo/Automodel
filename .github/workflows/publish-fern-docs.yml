@@ -74,6 +74,7 @@ jobs:
       - name: Publish Docs
         env:
           FERN_TOKEN: ${{ secrets.DOCS_FERN_TOKEN }}
+          FERN_DOCS_DEPLOY_MODE: ledger
         working-directory: ./docs/fern
         run: |
           # Pin the Fern CLI to the version in fern.config.json so production
