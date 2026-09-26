@@ -53,7 +53,7 @@ from nemo_automodel.components.models.kimi_k3.cp import (
     document_causal_flex_attention,
     shard_batch_for_kimi_cp,
 )
-from nemo_automodel.components.models.kimi_k3.fa4_mla import document_causal_fa4_attention
+from nemo_automodel.components.models.kimi_k3.fa4_mla import causal_fa4_attention, document_causal_fa4_attention
 from nemo_automodel.components.models.kimi_k3.kda_fused import fused_chunk_kda, fused_kda_unsupported_reason
 from nemo_automodel.components.models.kimi_k3.situ import (
     _apply_attn_res,
@@ -450,7 +450,7 @@ class KimiMLAAttention(nn.Module):
                 **attention_kwargs,
             )
         self._cp_mesh = None
-        self.cp_attn_backend = getattr(config, "mla_cp_attn_backend", "flex")
+        self.use_fa4 = getattr(config, "mla_attn_backend", "default") == "fa4"
 
     def setup_cp_attention(self, cp_mesh) -> None:
         """Attach the context-parallel mesh used to gather full-sequence keys and values.
@@ -512,7 +512,22 @@ class KimiMLAAttention(nn.Module):
 
         key_states, value_states = self._expand_key_value_groups(key_states, value_states, seq_length)
 
-        if self.backend.attn == "eager":
+        if self.use_fa4:
+            if packed_context is not None and packed_context.has_multiple_documents:
+                attn_output = document_causal_fa4_attention(
+                    query_states,
+                    key_states,
+                    value_states,
+                    q_doc_ids=packed_context.doc_ids,
+                    kv_doc_ids=packed_context.doc_ids,
+                    q_global_start=0,
+                    scale=self.scaling,
+                )
+            else:
+                # Right padding needs no mask: valid tokens never see later positions under causal attention.
+                attn_output = causal_fa4_attention(query_states, key_states, value_states, scale=self.scaling)
+            attn_output = attn_output.transpose(1, 2).contiguous()
+        elif self.backend.attn == "eager":
             attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * self.scaling
             if attention_mask is not None:
                 attn_weights = attn_weights + attention_mask[:, :, :, : key_states.shape[-2]]
@@ -597,7 +612,7 @@ class KimiMLAAttention(nn.Module):
         qk_rope_head_dim`` values per token, far smaller than the expanded per-head
         keys and values -- is all-gathered across the context-parallel group and
         expanded locally. Attention then runs as FlexAttention (or FA4, see
-        ``mla_cp_attn_backend``) with a causal, per-document mask over the full sequence.
+        ``mla_attn_backend``) with a causal, per-document mask over the full sequence.
 
         Args:
             hidden_states: Tensor of shape [batch, local_sequence, hidden].
@@ -636,7 +651,7 @@ class KimiMLAAttention(nn.Module):
         key_states = torch.cat((k_pass, k_rot), dim=-1)
         key_states, value_states = self._expand_key_value_groups(key_states, value_states, full_seq_length)
 
-        if self.cp_attn_backend == "fa4":
+        if self.use_fa4:
             document_causal_attention = document_causal_fa4_attention
         else:
             document_causal_attention = document_causal_flex_attention
