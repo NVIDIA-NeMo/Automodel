@@ -34,6 +34,7 @@ from nemo_automodel.components.models.qwen3_8_flash_next.cp import (
     Qwen3_8_FlashNextCPContext,
     qwen3_8_flash_next_cp_all_gather,
 )
+from nemo_automodel.components.models.qwen3_8_flash_next.fa4_qsa import fa4_sparse_gqa_attention
 from nemo_automodel.components.models.qwen3_8_flash_next.flex_qsa import flex_sparse_gqa_attention
 from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextRMSNorm
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
@@ -435,12 +436,25 @@ def qsa_gqa_attention(
     backend: str,
     softmax_scale: float | None = None,
 ) -> torch.Tensor:
-    """Dispatch QSA to FlexAttention on CUDA or the PyTorch oracle elsewhere.
+    """Dispatch QSA to the selected CUDA kernel or the PyTorch CPU oracle.
 
     CPU execution always uses the oracle so model construction, checkpoint
     inspection, and distributed CPU parity tests need no compiled kernels.
     CUDA execution is strict: unsupported backends or dtypes are reported
     rather than silently falling back to the gathered implementation.
+
+    Args:
+        query: Tensor [batch, local_queries, query_heads, head_dim].
+        key: Tensor [batch, global_keys, kv_heads, head_dim].
+        value: Tensor with key's layout. Q/K/V share one dtype and device.
+        selected_token_ids: Signed IDs [batch, local_queries, routes] in global
+            K/V coordinates; invalid CUDA IDs are padding and duplicates collapse.
+        backend: CUDA backend, "flex" or "cute". FA4 requires SM90 BF16 D256.
+        softmax_scale: Optional positive QK score multiplier.
+
+    Returns:
+        Independent tensor [batch, local_queries, query_heads, head_dim] with
+        query's dtype/device. Empty route rows produce zero.
     """
     if not query.is_cuda:
         return gathered_qsa_gqa_attention(
@@ -450,9 +464,11 @@ def qsa_gqa_attention(
             selected_token_ids,
             softmax_scale=softmax_scale,
         )
+    if backend == "cute":
+        return fa4_sparse_gqa_attention(query, key, value, selected_token_ids, softmax_scale=softmax_scale)
     if backend != "flex":
         raise RuntimeError(
-            f"Qwen3.8-Flash-Next CUDA QSA requires backend.attn='flex', got {backend!r}; "
+            f"Qwen3.8-Flash-Next CUDA QSA requires backend.attn='flex' or 'cute', got {backend!r}; "
             "call gathered_qsa_gqa_attention directly for a numerical oracle"
         )
     if any(tensor.dtype != torch.bfloat16 for tensor in (query, key, value)):
