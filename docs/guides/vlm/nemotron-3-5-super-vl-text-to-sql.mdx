@@ -13,7 +13,7 @@ appear in training.**
 
 ## What is Nemotron 3.5 Super VL?
 
-Nemotron 3.5 Super VL (`nvidia/NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained`, architecture
+Nemotron 3.5 Super VL (`nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16`, architecture
 `NemotronH_Omni_Reasoning_V3`) is the 121B member of the Nemotron 3.5 family: a NemotronV3 hybrid backbone
 (88 layers: 40 Mamba2, 8 attention, 40 MoE with 512 routed experts and top-22 routing) with a RADIO v2.5-H
 vision encoder. This guide uses it as a text-only model: the vision tower is loaded but never receives an
@@ -33,8 +33,8 @@ well the model writes SQL for schemas it has never seen.
 | `question` | How many heads of the departments are older than 56 ? |
 | `query` | `SELECT count(*) FROM head WHERE age > 56` |
 
-The **base model** answers such a question with a paragraph of reasoning that might not end in a
-query. After fine-tuning, it outputs **exactly one SQL query** against the schema it is given.
+The **model before task-specific fine-tuning** answers such a question with a paragraph of reasoning
+that might not end in a query. After fine-tuning, it outputs **exactly one SQL query** against the schema it is given.
 
 ## Guide Overview
 
@@ -157,7 +157,7 @@ step_scheduler:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
-  pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained
+  pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16
   trust_remote_code: true
   num_nextn_predict_layers: 0
   torch_dtype: torch.bfloat16
@@ -332,7 +332,7 @@ from transformers import AutoModel, AutoProcessor
 from datasets import load_dataset
 from nemo_automodel.components.datasets.vlm.datasets import TEXT_TO_SQL_PROMPT, spider_schema_to_ddl
 
-BASE = "nvidia/NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained"
+BASE = "nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16"
 ADAPTER = "vlm_checkpoints/nemotron_3_5_super_vl_spider_peft/LATEST/model"  # pragma: allowlist secret
 NUM_SAMPLES, STRIDE = 20, 51
 
@@ -409,7 +409,7 @@ a paragraph of reasoning before (or instead of) the query.
 
 | Model | Exact Match | Mean Similarity | Median Similarity | Similarity above 0.9 |
 |---|---|---|---|---|
-| Base (`NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained`) | 0/20 | 0.140 | 0.141 | 0/20 |
+| Before fine-tuning (`NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16`) | 0/20 | 0.140 | 0.141 | 0/20 |
 | LoRA, step 99 (`LOWEST_VAL`, val loss 0.230) | 7/20 | 0.847 | 0.956 | 12/20 |
 | LoRA, step 399 (`LATEST`, val loss 0.248) | **10/20** | **0.905** | **0.984** | **14/20** |
 

@@ -12,7 +12,7 @@ then inference and evaluation on the CORD-v2 validation split.**
 
 ## What is Nemotron 3.5 Super VL?
 
-Nemotron 3.5 Super VL (`nvidia/NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained`,
+Nemotron 3.5 Super VL (`nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16`,
 architecture `NemotronH_Omni_Reasoning_V3`) is the 121B member of the Nemotron 3.5 family.
 
 Key architectural details:
@@ -34,7 +34,7 @@ This guide fine-tunes the model on **CORD-v2**
 | `sub_total` | Subtotal, tax, discount |
 | `total` | Total price, cash paid, change |
 
-The **base model** produces free-form descriptions. After fine-tuning, it outputs
+The **model before task-specific fine-tuning** produces free-form descriptions. After fine-tuning, it outputs
 **structured XML-like token sequences** matching the receipt fields.
 
 ## Guide Overview
@@ -143,7 +143,7 @@ step_scheduler:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
-  pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained
+  pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16
   trust_remote_code: true
   num_nextn_predict_layers: 0
   torch_dtype: torch.bfloat16
@@ -433,8 +433,8 @@ for i in range(NUM_SAMPLES):
 print(f"exact match {exact}/{NUM_SAMPLES} | mean similarity {similarity / NUM_SAMPLES:.3f}")
 ```
 
-Pointing `CKPT` at the base checkpoint id (`nvidia/NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained`)
-scores the un-tuned model the same way.
+Pointing `CKPT` at the BF16 checkpoint ID (`nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16`)
+scores the model before task-specific fine-tuning the same way.
 
 ### LoRA PEFT Inference
 
@@ -449,7 +449,7 @@ from pathlib import Path
 
 from safetensors import safe_open
 
-BASE = "nvidia/NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained"
+BASE = "nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16"
 ADAPTER = "vlm_checkpoints/nemotron_3_5_super_vl_cord_v2_peft/LOWEST_VAL/model"  # pragma: allowlist secret
 
 processor = AutoProcessor.from_pretrained(BASE, trust_remote_code=True)
@@ -489,7 +489,7 @@ its free-form descriptions run to the token limit.
 
 | Model | Exact match | Mean similarity | Structured output |
 |---|---|---|---|
-| Base (`NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained`) | 0/20 | 0.048 | 0/20 (free-form description of the photo) |
+| Before fine-tuning (`NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16`) | 0/20 | 0.048 | 0/20 (free-form description of the photo) |
 | Full SFT, step 299 (`LOWEST_VAL`, val loss 0.068) | **8/20** | **0.965** (median 0.997; 16/20 above 0.9) | 20/20 |
 | Full SFT, step 399 (`LATEST`, lr=5e-5, 400 steps) | 5/20 | 0.923 (median 0.989; 14/20 above 0.9) | 20/20 |
 | LoRA PEFT, step 199 (`LOWEST_VAL`, val loss 0.039) | 8/20 | 0.954 (median 0.997; 15/20 above 0.9) | 20/20 |

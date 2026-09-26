@@ -1,19 +1,18 @@
 ---
-title: "NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained"
-description: "Use NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained with NeMo AutoModel for multimodal fine-tuning, with a checkpoint, recipe, setup, and reference details."
-slug: model-coverage/omni/nvidia/NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained
+title: "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16"
+description: "Use NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16 with NeMo AutoModel for multimodal fine-tuning, with checkpoints, recipes, setup, and reference details."
+slug: model-coverage/omni/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16
 ---
 
-[NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained)
+[NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16)
 pairs a Nemotron Super NemotronH (hybrid Mamba-2 and Attention) Mixture-of-Experts (MoE) language
 backbone with a RADIO v2.5-H vision encoder, sharing its `NemotronH_Omni_Reasoning_V3`
 architecture and vision stack with [Nemotron-3-Nano-Omni](/model-coverage/omni/nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16).
-This midtrain checkpoint is vision-pretrained only (`sound_config` is absent).
-There is no audio encoder, so audio inputs are not supported on this checkpoint.
+The BF16 checkpoint has no audio encoder, so audio inputs are not supported.
 
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
-## Fine-Tune NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained
+## Fine-Tune NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16
 
 From the repository root, run:
 
@@ -66,7 +65,8 @@ states for them, so the 121B model trains on a single node of 8 H100 (`cp_size 1
 
 ### Available Models
 
-- **NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained**: 121B total (MoE), vision-pretrained, no audio encoder
+- **NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16**: 121B total (MoE), post-trained, no audio encoder
+- **[NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-Base-BF16](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-Base-BF16)**: 121B total (MoE), pretrained only, no audio encoder
 
 ### Model Architecture
 
