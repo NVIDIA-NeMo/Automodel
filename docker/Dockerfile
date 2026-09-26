@@ -134,6 +134,8 @@ RUN if [ "$INSTALL_TE" = "True" ] || \
 # Install HybridEP / DeepEP: apt rdma-core v60 (build==runtime libibverbs), nvshmem wheel 3.6.5.
 # The pinned hybrid-ep revision includes DeepEP #699, which inherits PyTorch's C++ standard
 # instead of forcing C++17 (PyTorch's Rubin builds require C++20).
+# deepep.patch also backports https://github.com/deepseek-ai/DeepEP/pull/564 for NVSHMEM 3.6.5 compatibility.
+# Remove the configs.cuh/ibgda_device.cuh hunks when the pinned revision includes that fix.
 COPY docker/common/deepep.patch /opt/deepep.patch
 ARG DEEPEP_COMMIT=10d4dd7377d5bce900fbb4b80cce863764892b95
 ENV HYBRID_EP_MULTINODE=1
