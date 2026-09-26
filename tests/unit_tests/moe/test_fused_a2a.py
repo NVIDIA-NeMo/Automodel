@@ -112,7 +112,7 @@ class _DriftingHybridEPBuffer:
         return combined_hidden, combined_probs
 
 
-def _run_checkpointed_hybridep(context_fn):
+def _run_checkpointed_hybridep(context_fn, num_permuted_tokens=None):
     x = torch.randn(4, 3, requires_grad=True)
     routing_map = torch.ones(4, 2, dtype=torch.bool)
     probs = torch.full((4, 2), 0.5, requires_grad=True)
@@ -126,7 +126,7 @@ def _run_checkpointed_hybridep(context_fn):
             1,
             24,
             24,
-            None,
+            num_permuted_tokens,
             None,
         )
         return dispatched_hidden.sin().sum() + dispatched_probs.square().sum()
@@ -181,3 +181,32 @@ def test_hybridep_checkpoint_replay_preserves_selective_op_trace():
     assert buffer.cached_dispatches == 1
     assert buffer.replayed_num_permuted_tokens == 5
     assert isinstance(buffer.replayed_num_permuted_tokens, int)
+
+
+def test_hybridep_recorder_keeps_a_host_extent_without_reducing_tokens_per_expert():
+    recorder = fused_a2a.HybridEPDispatchReplayRecorder()
+    tokens_per_expert = mock.MagicMock(spec=torch.Tensor)
+    # capacity mode / static pin: the forward already ran with a host-side extent
+    recorder.record("layout", tokens_per_expert, 24)
+    # blocking dispatch: the extent comes from the reduction, after the checkpoint context exits
+    recorder.record("layout", torch.tensor([2, 3]))
+    recorder.finalize()
+
+    assert recorder.take() == ["layout", tokens_per_expert, 24]
+    assert recorder.take()[2] == 5
+    tokens_per_expert.sum.assert_not_called()
+
+
+def test_hybridep_checkpoint_replay_reuses_the_forward_capacity_extent():
+    from nemo_automodel.components.moe.parallelizer import _replay_hybridep_dispatch_on_recompute
+
+    buffer = _DriftingHybridEPBuffer()
+    fused_a2a._hybrid_ep_buffer = buffer
+    context_fn = _replay_hybridep_dispatch_on_recompute(lambda: (nullcontext(), nullcontext()))
+
+    _run_checkpointed_hybridep(context_fn, num_permuted_tokens=24)
+
+    assert buffer.full_dispatches == 1
+    assert buffer.cached_dispatches == 1
+    # the recompute output must be sized like the forward's (capacity rows), not to this dispatch's token count
+    assert buffer.replayed_num_permuted_tokens == 24
