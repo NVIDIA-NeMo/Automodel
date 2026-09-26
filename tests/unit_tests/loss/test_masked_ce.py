@@ -54,12 +54,14 @@ def test_masked_cross_entropy_with_mask():
     targets = torch.randint(high=num_classes, size=(batch_size,))
     mask = torch.tensor([1, 0, 1, 0])  # Only positions 0 and 2 are used
 
-    # Our loss
-    loss_custom = MaskedCrossEntropy()(logits, targets, mask=mask)
-
-    # Reference: Manually mask out positions by setting target to -100
+    # Reference: Manually mask out positions by setting target to -100.
+    # Snapshot before calling the loss -- cloning afterwards would re-apply an
+    # already-applied mask and hide any in-place write to ``targets``.
     targets_ref = targets.clone()
     targets_ref[mask == 0] = -100
+
+    # Our loss
+    loss_custom = MaskedCrossEntropy()(logits, targets, mask=mask)
     loss_ref = F.cross_entropy(logits, targets_ref, reduction="sum")
 
     assert torch.allclose(loss_custom, loss_ref), (
@@ -196,3 +198,52 @@ def test_masked_cross_entropy_per_token_weights_match_loss_and_gradient_referenc
         logits -= 0.1 * logits.grad
         reference_logits -= 0.1 * reference_logits.grad
     torch.testing.assert_close(logits, reference_logits)
+
+
+def test_masked_cross_entropy_does_not_mutate_labels():
+    """The caller's ``labels`` tensor must survive a masked loss unchanged.
+
+    ``labels.view(-1)`` aliases the caller's storage, so an in-place
+    ``masked_fill_`` would write ``ignore_index`` straight into the batch.
+    """
+    torch.manual_seed(0)
+    logits = torch.randn(4, 3)
+    labels = torch.randint(high=3, size=(4,))
+    mask = torch.tensor([1, 0, 1, 0])
+
+    before = labels.clone()
+    MaskedCrossEntropy()(logits, labels, mask=mask)
+
+    assert torch.equal(labels, before), f"labels were mutated in place: {before.tolist()} -> {labels.tolist()}"
+
+
+def test_masked_cross_entropy_reused_labels_with_two_masks():
+    """Two different masks over one labels tensor must each score independently.
+
+    This is the observable failure: with an in-place fill, the first call
+    writes ``ignore_index`` over its masked positions, so a second call with a
+    disjoint mask sees a fully-ignored tensor and returns exactly 0.0 -- a
+    silent zero gradient rather than an error.
+    """
+    torch.manual_seed(0)
+    n_tokens, n_classes = 6, 5
+    logits = torch.randn(n_tokens, n_classes)
+    labels = torch.randint(high=n_classes, size=(n_tokens,))
+    mask_a = torch.tensor([1, 1, 1, 0, 0, 0])
+    mask_b = torch.tensor([0, 0, 0, 1, 1, 1])
+
+    def reference(mask):
+        targets = labels.clone()
+        targets[mask == 0] = -100
+        return F.cross_entropy(logits, targets, reduction="sum")
+
+    loss_fn = MaskedCrossEntropy(reduction="sum")
+    shared = labels.clone()
+    loss_a = loss_fn(logits, shared, mask=mask_a)
+    loss_b = loss_fn(logits, shared, mask=mask_b)
+
+    assert torch.allclose(loss_a, reference(mask_a))
+    assert torch.allclose(loss_b, reference(mask_b)), (
+        f"second mask scored {loss_b.item():.6f}, expected {reference(mask_b).item():.6f}"
+    )
+    assert loss_b.item() != 0.0
