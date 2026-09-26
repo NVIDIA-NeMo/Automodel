@@ -29,17 +29,15 @@ The implementation supports FSDP2, activation checkpointing, TP1/TP2, context pa
 
 ## Model Reference
 
-### Model Summary
+### Model Architecture
 
 | Property | Value |
 | --- | --- |
 | Task | Image-Text-to-Text |
 | Architecture | `MuseGlimmerForConditionalGeneration` |
-| Model types | `muse_glimmer`, `muse_glimmer_text`, `muse_glimmer_vision` |
 | Parameters | 30B |
+| Model types | `muse_glimmer`, `muse_glimmer_text`, `muse_glimmer_vision` |
 | HF ID | [`meta-models/Muse-Glimmer-30B`](https://huggingface.co/meta-models/Muse-Glimmer-30B) |
-
-### Model Architecture
 
 - Dense grouped-query attention language model with 32 query heads and 2 key-value heads
 - Alternating sliding and full attention across a 52-layer text backbone

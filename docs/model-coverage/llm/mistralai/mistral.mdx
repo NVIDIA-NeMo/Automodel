@@ -22,37 +22,24 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/mistral/mistral_7b_squ
 | --- | --- |
 | Supervised fine-tuning (SFT) - Mistral 7B on SQuAD | Use [mistral_7b_squad.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mistral/mistral_7b_squad.yaml). |
 | Low-rank adaptation (LoRA) - Mistral 7B on SQuAD | Use [mistral_7b_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mistral/mistral_7b_squad_peft.yaml). |
-| Supervised fine-tuning (SFT) - Mistral Nemo 2407 on SQuAD | Use [mistral_nemo_2407_squad.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mistral/mistral_nemo_2407_squad.yaml). |
-| Low-rank adaptation (LoRA) - Mistral Nemo 2407 on SQuAD | Use [mistral_nemo_2407_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mistral/mistral_nemo_2407_squad_peft.yaml). |
 
 ## Model Reference
 
-### Model Summary
+### Model Architecture
 
 | Property | Value |
 | --- | --- |
 | Task | Text Generation |
 | Architecture | `MistralForCausalLM` |
-| Parameters | 7B - 12B |
+| Parameters | 7B |
 | Hugging Face Organization | [mistralai](https://huggingface.co/mistralai) |
 
 ### Available Models
-
-- **Mistral-7B**: v0.1, v0.2, v0.3
-- **Mistral-7B-Instruct**: v0.1, v0.2, v0.3
-- **Mistral-Nemo-Instruct-2407**: 12B
-
-### Model Architecture
-
-- `MistralForCausalLM`
-
-### Available Checkpoints
 
 | Model | HF ID |
 |---|---|
 | Mistral 7B v0.1 | [`mistralai/Mistral-7B-v0.1`](https://huggingface.co/mistralai/Mistral-7B-v0.1) |
 | Mistral 7B Instruct v0.1 | [`mistralai/Mistral-7B-Instruct-v0.1`](https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.1) |
-| Mistral Nemo Instruct 2407 | [`mistralai/Mistral-Nemo-Instruct-2407`](https://huggingface.co/mistralai/Mistral-Nemo-Instruct-2407) |
 
 ## Related Resources
 

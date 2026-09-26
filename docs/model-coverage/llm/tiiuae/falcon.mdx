@@ -8,45 +8,22 @@ slug: model-coverage/large-language-models/tiiuae/falcon-7b
 
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
-This page provides a checkpoint and architecture reference. The workflows below identify related
-model-family recipes when they are available.
-
-## Choose a Workflow
-
-| Goal | Start Here |
-| --- | --- |
-| Supervised fine-tuning (SFT) - Falcon3 7B Instruct on SQuAD | Use [falcon3_7b_instruct_squad.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/falcon/falcon3_7b_instruct_squad.yaml). |
-| Low-rank adaptation (LoRA) - Falcon3 7B Instruct on SQuAD | Use [falcon3_7b_instruct_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/falcon/falcon3_7b_instruct_squad_peft.yaml). |
-
 ## Model Reference
 
-### Model Summary
+### Model Architecture
 
 | Property | Value |
 | --- | --- |
 | Task | Text Generation |
 | Architecture | `FalconForCausalLM` |
-| Parameters | 7B - 40B |
+| Parameters | 7B |
 | Hugging Face Organization | [tiiuae](https://huggingface.co/tiiuae) |
 
 ### Available Models
 
-- **Falcon-40B**, **Falcon-40B-Instruct**
-- **Falcon-7B**, **Falcon-7B-Instruct**
-- **Falcon-RW-7B**
-- **Falcon3-7B-Instruct**
-
-### Model Architecture
-
-- `FalconForCausalLM`
-
-### Available Checkpoints
-
 | Model | HF ID |
 |---|---|
 | Falcon 7B | [`tiiuae/falcon-7b`](https://huggingface.co/tiiuae/falcon-7b) |
-| Falcon 40B | [`tiiuae/falcon-40b`](https://huggingface.co/tiiuae/falcon-40b) |
-| Falcon RW 7B | [`tiiuae/falcon-rw-7b`](https://huggingface.co/tiiuae/falcon-rw-7b) |
 
 ## Related Resources
 

@@ -21,11 +21,10 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/mistral/mixtral-8x7b-v
 | Goal | Start Here |
 | --- | --- |
 | Supervised fine-tuning (SFT) - Mixtral 8x7B on SQuAD | Use [mixtral-8x7b-v0-1_squad.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mistral/mixtral-8x7b-v0-1_squad.yaml). |
-| Low-rank adaptation (LoRA) - Mixtral 8x7B on SQuAD | Use [mixtral-8x7b-v0-1_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mistral/mixtral-8x7b-v0-1_squad_peft.yaml). |
 
 ## Model Reference
 
-### Model Summary
+### Model Architecture
 
 | Property | Value |
 | --- | --- |
@@ -36,20 +35,9 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/mistral/mixtral-8x7b-v
 
 ### Available Models
 
-- **Mixtral-8x7B**: 8 experts, 2 active per token (~13B active)
-- **Mixtral-8x7B-Instruct**: instruction-tuned variant
-- **Mixtral-8x22B**: 8 experts, 2 active per token (~39B active)
-
-### Model Architecture
-
-- `MixtralForCausalLM`
-
-### Available Checkpoints
-
 | Model | HF ID |
 |---|---|
 | Mixtral 8x7B v0.1 | [`mistralai/Mixtral-8x7B-v0.1`](https://huggingface.co/mistralai/Mixtral-8x7B-v0.1) |
-| Mixtral 8x7B Instruct v0.1 | [`mistralai/Mixtral-8x7B-Instruct-v0.1`](https://huggingface.co/mistralai/Mixtral-8x7B-Instruct-v0.1) |
 
 ## Related Resources
 

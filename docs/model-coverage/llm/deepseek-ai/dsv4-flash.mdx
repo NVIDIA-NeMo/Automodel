@@ -29,24 +29,16 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/deepseek_v4/deepseek_v
 
 ## Model Reference
 
-### Model Summary
+### Model Architecture
 
 | Property | Value |
 | --- | --- |
 | Task | Text Generation (MoE) |
 | Architecture | `DeepseekV4ForCausalLM` |
-| Parameters | fine-grained MoE, 256 routed + 1 shared expert |
+| Experts | fine-grained MoE, 256 routed + 1 shared expert |
 | Hugging Face Organization | [deepseek-ai](https://huggingface.co/deepseek-ai) |
 
 ### Available Models
-
-- **DeepSeek-V4-Flash**
-
-### Model Architecture
-
-- `DeepseekV4ForCausalLM`
-
-### Available Checkpoints
 
 | Model | HF ID |
 |---|---|

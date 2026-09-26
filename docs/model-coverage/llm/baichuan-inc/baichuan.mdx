@@ -8,43 +8,22 @@ slug: model-coverage/large-language-models/baichuan-inc/Baichuan2-13B-Chat
 
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
-This page provides a checkpoint and architecture reference. The workflows below identify related
-model-family recipes when they are available.
-
-## Choose a Workflow
-
-| Goal | Start Here |
-| --- | --- |
-| Supervised fine-tuning (SFT) - Baichuan2 7B on SQuAD | Use [baichuan_2_7b_squad.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/baichuan/baichuan_2_7b_squad.yaml). |
-| Low-rank adaptation (LoRA) - Baichuan2 7B on SQuAD | Use [baichuan_2_7b_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/baichuan/baichuan_2_7b_squad_peft.yaml). |
-
 ## Model Reference
 
-### Model Summary
+### Model Architecture
 
 | Property | Value |
 | --- | --- |
 | Task | Text Generation |
 | Architecture | `BaiChuanForCausalLM` |
-| Parameters | 7B - 13B |
+| Parameters | 13B |
 | Hugging Face Organization | [baichuan-inc](https://huggingface.co/baichuan-inc) |
 
 ### Available Models
 
-- **Baichuan2-13B-Chat**
-- **Baichuan2-7B-Chat**
-- **Baichuan-7B**
-
-### Model Architecture
-
-- `BaiChuanForCausalLM`
-
-### Available Checkpoints
-
 | Model | HF ID |
 |---|---|
 | Baichuan2 13B Chat | [`baichuan-inc/Baichuan2-13B-Chat`](https://huggingface.co/baichuan-inc/Baichuan2-13B-Chat) |
-| Baichuan 7B | [`baichuan-inc/Baichuan-7B`](https://huggingface.co/baichuan-inc/Baichuan-7B) |
 
 ## Related Resources
 

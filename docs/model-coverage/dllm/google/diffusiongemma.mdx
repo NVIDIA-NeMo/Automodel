@@ -47,7 +47,7 @@ uv run automodel examples/dllm_sft/diffusion_gemma_lora.yaml --nproc-per-node 8
 
 ## Model Reference
 
-### Model Summary
+### Model Architecture
 
 | Property | Value |
 | --- | --- |
@@ -56,15 +56,9 @@ uv run automodel examples/dllm_sft/diffusion_gemma_lora.yaml --nproc-per-node 8
 | Parameters | 26B total / ~4B active |
 | Hugging Face Organization | [google](https://huggingface.co/google) |
 
-### Available Models
-
-- **DiffusionGemma 26B-A4B-it** (`DiffusionGemmaForBlockDiffusion`): instruction-tuned block-diffusion MoE.
-
-### Model Architectures
-
 - `DiffusionGemmaForBlockDiffusion` - block-diffusion MoE (causal prompt encoder + bidirectional canvas decoder).
 
-### Available Checkpoints
+### Available Models
 
 | Model | HF ID |
 |---|---|

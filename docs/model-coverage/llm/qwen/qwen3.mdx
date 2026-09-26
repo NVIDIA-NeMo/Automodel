@@ -21,35 +21,23 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/qwen/qwen3_0p6b_hellas
 | Goal | Start Here |
 | --- | --- |
 | Supervised fine-tuning (SFT) - Qwen3 0.6B on HellaSwag | Use [qwen3_0p6b_hellaswag.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen3_0p6b_hellaswag.yaml). |
-| Supervised fine-tuning (SFT) - Qwen3 8B on SQuAD (Spark) | Use [qwen3_8b_squad_spark.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen3_8b_squad_spark.yaml). |
 
 ## Model Reference
 
-### Model Summary
+### Model Architecture
 
 | Property | Value |
 | --- | --- |
 | Task | Text Generation |
 | Architecture | `Qwen3ForCausalLM` |
-| Parameters | 0.6B - 32B |
+| Parameters | 0.6B |
 | Hugging Face Organization | [Qwen](https://huggingface.co/Qwen) |
 
 ### Available Models
 
-- **Qwen3**: 0.6B, 1.7B, 4B, 8B, 14B, 32B
-
-### Model Architecture
-
-- `Qwen3ForCausalLM`
-
-### Available Checkpoints
-
 | Model | HF ID |
 |---|---|
 | Qwen3 0.6B | [`Qwen/Qwen3-0.6B`](https://huggingface.co/Qwen/Qwen3-0.6B) |
-| Qwen3 4B | [`Qwen/Qwen3-4B`](https://huggingface.co/Qwen/Qwen3-4B) |
-| Qwen3 8B | [`Qwen/Qwen3-8B`](https://huggingface.co/Qwen/Qwen3-8B) |
-| Qwen3 32B | [`Qwen/Qwen3-32B`](https://huggingface.co/Qwen/Qwen3-32B) |
 
 ## Related Resources
 

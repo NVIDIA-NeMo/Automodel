@@ -16,47 +16,32 @@ From the repository root, run:
 uv run automodel --nproc-per-node=8 examples/llm_finetune/ernie4_5/ernie4_5_0p3b_hellaswag.yaml
 ```
 
-For the MoE checkpoint, run:
-
-```bash
-uv run automodel --nproc-per-node=8 examples/llm_finetune/ernie4_5/ernie4_5_21b_a3b_hellaswag.yaml
-```
-
 ## Choose a Workflow
 
 | Goal | Start Here |
 | --- | --- |
 | Supervised fine-tuning (SFT) - ERNIE 4.5 0.3B on HellaSwag with the Hugging Face implementation | Use [ernie4_5_0p3b_hellaswag.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/ernie4_5/ernie4_5_0p3b_hellaswag.yaml). |
-| Supervised fine-tuning (SFT) - ERNIE 4.5 21B A3B on HellaSwag with TE attention and DeepEP | Use [ernie4_5_21b_a3b_hellaswag.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/ernie4_5/ernie4_5_21b_a3b_hellaswag.yaml). |
 
 ## Model Reference
 
-### Model Summary
+### Model Architecture
 
 | Property | Value |
 | --- | --- |
 | Task | Text Generation |
 | Architectures | `Ernie4_5ForCausalLM`, `Ernie4_5_MoeForCausalLM` |
-| Parameters | 0.36B dense; 21B total / 3B active MoE |
+| Parameters | 0.36B |
 | Context Length | 131,072 tokens |
 | Hugging Face Organization | [baidu](https://huggingface.co/baidu) |
-
-### Available Models
-
-- **ERNIE-4.5-0.3B-PT**: dense text checkpoint with 0.36B parameters.
-- **ERNIE-4.5-21B-A3B-PT**: text MoE checkpoint with 21B total parameters and 3B activated parameters per token.
-
-### Model Architectures
 
 - `Ernie4_5ForCausalLM`: dense Hugging Face implementation path.
 - `Ernie4_5_MoeForCausalLM`: custom NeMo AutoModel implementation with expert parallelism support.
 
-### Available Checkpoints
+### Available Models
 
 | Model | HF ID |
 |---|---|
 | ERNIE 4.5 0.3B PT | [`baidu/ERNIE-4.5-0.3B-PT`](https://huggingface.co/baidu/ERNIE-4.5-0.3B-PT) |
-| ERNIE 4.5 21B A3B PT | [`baidu/ERNIE-4.5-21B-A3B-PT`](https://huggingface.co/baidu/ERNIE-4.5-21B-A3B-PT) |
 
 ## Related Resources
 

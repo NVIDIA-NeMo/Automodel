@@ -26,37 +26,23 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/minimax_m2/minimax_m2.
 | Goal | Start Here |
 | --- | --- |
 | Supervised fine-tuning (SFT) - MiniMax-M2.1 on HellaSwag with pipeline parallelism | Use [minimax_m2.1_hellaswag_pp.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/minimax_m2/minimax_m2.1_hellaswag_pp.yaml). |
-| Supervised fine-tuning (SFT) - MiniMax-M2.5 on HellaSwag with pipeline parallelism | Use [minimax_m2.5_hellaswag_pp.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/minimax_m2/minimax_m2.5_hellaswag_pp.yaml). |
-| Supervised fine-tuning (SFT) - MiniMax-M2.7 on HellaSwag with pipeline parallelism | Use [minimax_m2.7_hellaswag_pp.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/minimax_m2/minimax_m2.7_hellaswag_pp.yaml). |
 
 ## Model Reference
 
-### Model Summary
+### Model Architecture
 
 | Property | Value |
 | --- | --- |
 | Task | Text Generation (MoE) |
 | Architecture | `MiniMaxM2ForCausalLM` |
-| Parameters | varies |
+| Parameters | 229B total |
 | Hugging Face Organization | [MiniMaxAI](https://huggingface.co/MiniMaxAI) |
 
 ### Available Models
 
-- **MiniMax-M2.1**
-- **MiniMax-M2.5**
-- **MiniMax-M2.7**
-
-### Model Architecture
-
-- `MiniMaxM2ForCausalLM`
-
-### Available Checkpoints
-
 | Model | HF ID |
 |---|---|
 | MiniMax M2.1 | [`MiniMaxAI/MiniMax-M2.1`](https://huggingface.co/MiniMaxAI/MiniMax-M2.1) |
-| MiniMax M2.5 | [`MiniMaxAI/MiniMax-M2.5`](https://huggingface.co/MiniMaxAI/MiniMax-M2.5) |
-| MiniMax M2.7 | [`MiniMaxAI/MiniMax-M2.7`](https://huggingface.co/MiniMaxAI/MiniMax-M2.7) |
 
 ## Related Resources
 

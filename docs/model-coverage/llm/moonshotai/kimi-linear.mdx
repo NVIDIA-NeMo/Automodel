@@ -25,7 +25,7 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/kimi/kimi_linear_48b_a
 
 ## Model Reference
 
-### Model Summary
+### Model Architecture
 
 | Property | Value |
 | --- | --- |
@@ -33,12 +33,6 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/kimi/kimi_linear_48b_a
 | Architecture | `KimiLinear48BForCausalLM` |
 | Parameters | 48B total / 3B active |
 | Hugging Face Organization | [moonshotai](https://huggingface.co/moonshotai) |
-
-### Available Models
-
-- **Kimi-Linear-48B-A3B-Instruct**: 48B total, 3B activated
-
-### Model Architecture
 
 - `KimiLinear48BForCausalLM` (`model_type: kimi_linear_48b_a3b`)
 - Hybrid attention stack: KDA linear-attention layers interleaved with MLA layers
@@ -61,7 +55,7 @@ NeMo AutoModel already carry the distinct identity and load without that overrid
 | Context parallelism (CP) | Contiguous per-rank sequence shards. KDA passes its recurrent state from rank to rank, and MLA gathers the compressed KV latent |
 | Packed sequences | Document boundaries from the THD collater are honored by both layer types, including under CP |
 
-### Available Checkpoints
+### Available Models
 
 | Model | HF ID |
 |---|---|

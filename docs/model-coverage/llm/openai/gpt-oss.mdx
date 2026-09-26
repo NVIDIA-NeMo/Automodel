@@ -6,6 +6,8 @@ slug: model-coverage/large-language-models/openai/gpt-oss-20b
 
 [GPT-OSS](https://huggingface.co/openai/gpt-oss-20b) is OpenAI's open-weight model family featuring QuickGELU activations and activation clamping for training stability.
 
+The documented workflows cover full-parameter fine-tuning, LoRA, packed sequences, and a DGX Spark LoRA configuration.
+
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
 ## Fine-Tune gpt-oss-20b
@@ -20,35 +22,27 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/gpt_oss/gpt_oss_20b.ya
 
 | Goal | Start Here |
 | --- | --- |
-| Supervised fine-tuning (SFT) - GPT-OSS 20B | Use [gpt_oss_20b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gpt_oss/gpt_oss_20b.yaml). |
-| Supervised fine-tuning (SFT) - GPT-OSS 120B | Use [gpt_oss_120b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gpt_oss/gpt_oss_120b.yaml). |
+| Full-parameter fine-tuning | Use the [full-parameter recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gpt_oss/gpt_oss_20b.yaml). |
+| LoRA fine-tuning | Use the [LoRA recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gpt_oss/gpt_oss_20b_peft.yaml). |
+| Fine-tuning with 1,024-token packed sequences | Use the [packed-sequence recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gpt_oss/gpt_oss_20b_te_packed_sequence.yaml). |
+| LoRA fine-tuning on DGX Spark | Use the [DGX Spark recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gpt_oss/gpt_oss_20b_single_gpu_peft.yaml). |
 
 ## Model Reference
 
-### Model Summary
+### Model Architecture
 
 | Property | Value |
 | --- | --- |
 | Task | Text Generation |
 | Architecture | `GptOssForCausalLM` |
-| Parameters | 20B - 120B |
+| Parameters | 21B total / 3.6B active |
 | Hugging Face Organization | [openai](https://huggingface.co/openai) |
 
 ### Available Models
 
-- **gpt-oss-20b**: 20B parameters
-- **gpt-oss-120b**: 120B parameters
-
-### Model Architecture
-
-- `GptOssForCausalLM`
-
-### Available Checkpoints
-
 | Model | HF ID |
 |---|---|
 | GPT-OSS 20B | [`openai/gpt-oss-20b`](https://huggingface.co/openai/gpt-oss-20b) |
-| GPT-OSS 120B | [`openai/gpt-oss-120b`](https://huggingface.co/openai/gpt-oss-120b) |
 
 ## Related Resources
 

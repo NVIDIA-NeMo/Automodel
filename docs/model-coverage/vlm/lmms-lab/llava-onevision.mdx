@@ -21,36 +21,27 @@ uv run automodel --nproc-per-node=8 examples/vlm_finetune/llava_onevision/llava_
 | Goal | Start Here |
 | --- | --- |
 | Supervised fine-tuning (SFT) - LLaVA-OneVision-1.5 4B on LLaVA-Instruct-150K | Use [llava_ov_1_5_4b_finetune.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/llava_onevision/llava_ov_1_5_4b_finetune.yaml). |
-| Low-rank adaptation (LoRA) - LLaVA-OneVision-1.5 8B on LLaVA-Instruct-150K | Use [llava_ov_1_5_8b_lora.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/llava_onevision/llava_ov_1_5_8b_lora.yaml). |
 
 ## Model Reference
 
-### Model Summary
+### Model Architecture
 
 | Property | Value |
 | --- | --- |
 | Task | Image-Text-to-Text |
 | Architecture | `LlavaOneVisionForConditionalGeneration` |
-| Parameters | 4B / 8B |
+| Parameters | 4B |
 | Hugging Face Organization | [lmms-lab](https://huggingface.co/lmms-lab) |
-
-### Available Models
-
-- **LLaVA-OneVision 1.5 4B**: Qwen3 4B text backbone + Rice ViT (1024 hidden, 24 layers)
-- **LLaVA-OneVision 1.5 8B**: Qwen3 8B text backbone + Rice ViT (1024 hidden, 24 layers)
-
-### Model Architecture
 
 - `LlavaOneVisionForConditionalGeneration`
 
 Vision tower is the **Rice Transformer**: 14x14 patch embed with 2D RoPE, standard Transformer blocks (LayerNorm + Attention + MLP), and a 2x2 spatial Patch Merger that projects to the language-model hidden size.
 
-### Available Checkpoints
+### Available Models
 
 | Model | HF ID |
 |---|---|
 | LLaVA-OneVision-1.5 4B Instruct | [`lmms-lab/LLaVA-OneVision-1.5-4B-Instruct`](https://huggingface.co/lmms-lab/LLaVA-OneVision-1.5-4B-Instruct) |
-| LLaVA-OneVision-1.5 8B Instruct | [`lmms-lab/LLaVA-OneVision-1.5-8B-Instruct`](https://huggingface.co/lmms-lab/LLaVA-OneVision-1.5-8B-Instruct) |
 
 ## Related Resources
 

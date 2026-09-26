@@ -25,30 +25,20 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/qwen/qwen3_moe_30b_te_
 
 ## Model Reference
 
-### Model Summary
+### Model Architecture
 
 | Property | Value |
 | --- | --- |
 | Task | Text Generation (MoE) |
 | Architecture | `Qwen3MoeForCausalLM` |
-| Parameters | 30B - 235B total |
+| Parameters | 30B total / 3B active |
 | Hugging Face Organization | [Qwen](https://huggingface.co/Qwen) |
 
 ### Available Models
 
-- **Qwen3-30B-A3B**: 30B total parameters, 3B activated per token
-- **Qwen3-235B-A22B**: 235B total parameters, 22B activated per token
-
-### Model Architecture
-
-- `Qwen3MoeForCausalLM`
-
-### Available Checkpoints
-
 | Model | HF ID |
 |---|---|
 | Qwen3 30B A3B | [`Qwen/Qwen3-30B-A3B`](https://huggingface.co/Qwen/Qwen3-30B-A3B) |
-| Qwen3 235B A22B | [`Qwen/Qwen3-235B-A22B`](https://huggingface.co/Qwen/Qwen3-235B-A22B) |
 
 ## Related Resources
 

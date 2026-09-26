@@ -54,7 +54,7 @@ states for them, so the 121B model trains on a single node of 8 H100 (`cp_size 1
 
 ## Model Reference
 
-### Model Summary
+### Model Architecture
 
 | Property | Value |
 | --- | --- |
@@ -63,18 +63,16 @@ states for them, so the 121B model trains on a single node of 8 H100 (`cp_size 1
 | Parameters | 121B total (MoE, 512 routed experts, 22 active per token; 124B with the MTP head) |
 | Hugging Face Organization | [nvidia](https://huggingface.co/nvidia) |
 
-### Available Models
-
-- **NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16**: 121B total (MoE), post-trained, no audio encoder
-- **[NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-Base-BF16](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-Base-BF16)**: 121B total (MoE), pretrained only, no audio encoder
-
-### Model Architecture
-
 - `NemotronH_Omni_Reasoning_V3` reuses the same `NemotronOmniForConditionalGeneration`
   wrapper, vision tower, and state-dict adapter as `NemotronH_Nano_Omni_Reasoning_V3`;
   only the LLM sub-config scale differs (Super compared to Nano). The `sound_encoder` and
   `sound_projection` submodules are constructed only when the checkpoint's
   `sound_config` is present, so this checkpoint loads with audio disabled.
+
+### Available Models
+
+- **NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16**: 121B total (MoE), post-trained, no audio encoder
+- **[NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-Base-BF16](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-Base-BF16)**: 121B total (MoE), pretrained only, no audio encoder
 
 ## Related Resources
 

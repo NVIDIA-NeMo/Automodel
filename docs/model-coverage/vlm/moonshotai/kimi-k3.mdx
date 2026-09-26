@@ -24,7 +24,7 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/kimi/k3_hellaswag.yaml
 
 ## Model Reference
 
-### Model Summary
+### Model Architecture
 
 | Property | Value |
 | --- | --- |
@@ -32,12 +32,10 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/kimi/k3_hellaswag.yaml
 | Architectures | `KimiK3ForConditionalGeneration`, `KimiK3ForCausalLM` |
 | Hugging Face Organization | [moonshotai](https://huggingface.co/moonshotai) |
 
-### Model Architecture
-
 - `KimiK3ForConditionalGeneration` combines the MoonViT3d vision tower and multimodal projector with the Kimi Linear language backbone.
 - `KimiK3ForCausalLM` exposes the text-only Kimi Linear backbone.
 
-### Available Checkpoints
+### Available Models
 
 | Model | HF ID |
 |---|---|
