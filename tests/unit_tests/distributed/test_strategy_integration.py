@@ -132,12 +132,16 @@ def test_backward_compatibility_standard_model(
 
     model = MockStandardModel()
 
-    result = fsdp2_strategy_parallelize(
-        model=model,
-        device_mesh=mock_device_mesh,
-        sequence_parallel=False,
-        activation_checkpointing=False,
-    )
+    with patch(
+        "nemo_automodel.components.distributed.fsdp2.fsdp2_sharding_enabled",
+        return_value=True,
+    ):
+        result = fsdp2_strategy_parallelize(
+            model=model,
+            device_mesh=mock_device_mesh,
+            sequence_parallel=False,
+            activation_checkpointing=False,
+        )
 
     # Should return the model unchanged
     assert result is model
@@ -161,12 +165,16 @@ def test_backward_compatibility_nemotron_model(
 
     model = MockNemotronModel()
 
-    result = fsdp2_strategy_parallelize(
-        model=model,
-        device_mesh=mock_device_mesh,
-        sequence_parallel=False,
-        activation_checkpointing=False,
-    )
+    with patch(
+        "nemo_automodel.components.distributed.fsdp2.fsdp2_sharding_enabled",
+        return_value=True,
+    ):
+        result = fsdp2_strategy_parallelize(
+            model=model,
+            device_mesh=mock_device_mesh,
+            sequence_parallel=False,
+            activation_checkpointing=False,
+        )
 
     # Should return the model unchanged
     assert result is model

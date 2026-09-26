@@ -45,13 +45,86 @@ except (ImportError, FileNotFoundError, OSError):
     HAS_MEGATRON_FSDP = False
 
 
+def parallelize_megatron_fsdp(
+    model: nn.Module,
+    config: MegatronFSDPConfig,
+    device_mesh: DeviceMesh,
+    *,
+    optimizer: torch.optim.Optimizer | None = None,
+    reapply_trainability: Callable[[nn.Module], None] | None = None,
+) -> tuple[nn.Module, torch.optim.Optimizer | None]:
+    """Apply Megatron-FSDP and tensor parallelism from a typed config."""
+    if dist.get_world_size() == 1:
+        logger.info("World size is 1, skipping parallelization.")
+        model = model.to("cuda").to(torch.bfloat16)
+        if config.activation_checkpointing:
+            if hasattr(model, "gradient_checkpointing_enable"):
+                model.gradient_checkpointing_enable()
+            else:
+                logger.error("Model does not support gradient checkpointing. Skipping.")
+        if reapply_trainability is not None:
+            reapply_trainability(model)
+        return model, optimizer
+
+    if config.activation_checkpointing:
+        logger.error("Activation checkpointing is not yet supported with MegatronFSDP. Skipping.")
+
+    if config.zero_dp_strategy != 3 and device_mesh.get_rank() == 0:
+        logger.warning("MegatronFSDP zero_dp_strategy is not 3. Parameters will not be sharded.")
+
+    if device_mesh["tp"].size() > 1:
+        # Delegate plan selection to central helper. MegatronFSDP currently does not support SP.
+        tp_shard_plan = _get_parallel_plan(
+            model,
+            sequence_parallel=False,
+            tp_shard_plan=None,
+            tp_size=device_mesh["tp"].size(),
+        )
+    else:
+        tp_shard_plan = None
+
+    # ``dp_cp`` is normally produced by DeviceMesh._flatten(), so it lives in
+    # the root mesh's private flatten mapping rather than in ``mesh_dim_names``.
+    try:
+        get_flat_mesh(device_mesh, "dp_cp")
+    except KeyError:
+        dp_shard_dim = "dp"
+    else:
+        dp_shard_dim = "dp_cp"
+
+    return megatron_fsdp_strategy_parallelize(
+        model,
+        device_mesh=device_mesh,
+        optimizer=optimizer,
+        megatron_fsdp_unit_modules=config.megatron_fsdp_unit_modules,
+        tp_shard_plan=tp_shard_plan,
+        zero_dp_strategy=config.zero_dp_strategy,
+        init_fsdp_with_meta_device=config.init_fsdp_with_meta_device,
+        grad_reduce_in_fp32=config.grad_reduce_in_fp32,
+        preserve_fp32_weights=config.preserve_fp32_weights,
+        overlap_grad_reduce=config.overlap_grad_reduce,
+        overlap_param_gather=config.overlap_param_gather,
+        check_for_nan_in_grad=config.check_for_nan_in_grad,
+        report_nan_in_param_grad=config.report_nan_in_param_grad,
+        average_in_collective=config.average_in_collective,
+        disable_bucketing=config.disable_bucketing,
+        calculate_per_token_loss=config.calculate_per_token_loss,
+        keep_fp8_transpose_cache=config.keep_fp8_transpose_cache,
+        nccl_ub=config.nccl_ub,
+        fsdp_double_buffer=config.fsdp_double_buffer,
+        dp_shard_dim=dp_shard_dim,
+        tp_dim="tp",
+        reapply_trainability=reapply_trainability,
+    )
+
+
 class MegatronFSDPManager:
     """Deprecated compatibility wrapper for Megatron-FSDP parallelization.
 
-    .. deprecated:: 0.6
+    .. deprecated:: 0.7
         Pass :class:`MegatronFSDPConfig` through the config-driven infrastructure
         and provide model-specific behavior with :class:`ModelParallelizer`. This
-        compatibility class is scheduled for removal in 0.7.
+        compatibility class is scheduled for removal in 0.8.
 
     This manager applies parallelization to the model using a prescribed
     TP sharding plan. It supports mixed precision and various FSDP options.
@@ -70,7 +143,7 @@ class MegatronFSDPManager:
         device_mesh: DeviceMesh,
     ):
         warnings.warn(
-            "MegatronFSDPManager is deprecated and will be removed in 0.7; pass MegatronFSDPConfig through the "
+            "MegatronFSDPManager is deprecated and will be removed in 0.8; pass MegatronFSDPConfig through the "
             "config-driven infrastructure and use ModelParallelizer for model-owned behavior.",
             DeprecationWarning,
             stacklevel=2,
@@ -78,23 +151,8 @@ class MegatronFSDPManager:
         self.config = config
         self.device_mesh = device_mesh
 
-        # Extract config fields for easy access
-        self.megatron_fsdp_unit_modules = config.megatron_fsdp_unit_modules
-        self.zero_dp_strategy = config.zero_dp_strategy
-        self.init_fsdp_with_meta_device = config.init_fsdp_with_meta_device
-        self.grad_reduce_in_fp32 = config.grad_reduce_in_fp32
-        self.preserve_fp32_weights = config.preserve_fp32_weights
-        self.overlap_grad_reduce = config.overlap_grad_reduce
-        self.overlap_param_gather = config.overlap_param_gather
-        self.check_for_nan_in_grad = config.check_for_nan_in_grad
-        self.report_nan_in_param_grad = config.report_nan_in_param_grad
-        self.average_in_collective = config.average_in_collective
-        self.disable_bucketing = config.disable_bucketing
-        self.calculate_per_token_loss = config.calculate_per_token_loss
-        self.keep_fp8_transpose_cache = config.keep_fp8_transpose_cache
-        self.nccl_ub = config.nccl_ub
-        self.fsdp_double_buffer = config.fsdp_double_buffer
-        self.activation_checkpointing = config.activation_checkpointing
+    def __getattr__(self, name):
+        return getattr(self.config, name)
 
     def parallelize(
         self,
@@ -117,77 +175,13 @@ class MegatronFSDPManager:
         Returns:
             tuple: (parallelized_model, optimizer)
         """
-        if dist.get_world_size() == 1:
-            logger.info("World size is 1, skipping parallelization.")
-            model = model.to("cuda").to(torch.bfloat16)
-            if self.activation_checkpointing:
-                if hasattr(model, "gradient_checkpointing_enable"):
-                    model.gradient_checkpointing_enable()
-                else:
-                    logger.error("Model does not support gradient checkpointing. Skipping.")
-            if reapply_trainability is not None:
-                reapply_trainability(model)
-            return model, optimizer
-
-        if self.activation_checkpointing:
-            logger.error("Activation checkpointing is not yet supported with MegatronFSDP. Skipping.")
-
-        if self.zero_dp_strategy != 3:
-            if self.device_mesh.get_rank() == 0:
-                print("Warning: MegatronFSDP zero_dp_strategy is not 3. Parameters will not be sharded.")
-
-        if self.device_mesh["tp"].size() > 1:
-            # Delegate plan selection to central helper. MegatronFSDP currently does not support SP.
-            tp_shard_plan = _get_parallel_plan(
-                model,
-                sequence_parallel=False,  # explicit: SP not supported here
-                tp_shard_plan=None,
-                tp_size=self.device_mesh["tp"].size(),
-            )
-        else:
-            tp_shard_plan = None
-
-        # ``dp_cp`` is normally produced by DeviceMesh._flatten(), so it lives
-        # in the root mesh's private flatten mapping rather than in
-        # ``mesh_dim_names``.  A name-only check silently drops CP from the
-        # Megatron-FSDP shard group on real MeshContext meshes.  Resolve it
-        # through the same compatibility helper used by the rest of the
-        # distributed stack; older meshes with a literal ``dp_cp`` dimension
-        # continue to work as well.
-        try:
-            get_flat_mesh(self.device_mesh, "dp_cp")
-        except KeyError:
-            dp_shard_dim = "dp"
-        else:
-            dp_shard_dim = "dp_cp"
-        tp_dim = "tp"
-
-        model, optimizer = megatron_fsdp_strategy_parallelize(
+        return parallelize_megatron_fsdp(
             model,
-            device_mesh=self.device_mesh,
+            self.config,
+            self.device_mesh,
             optimizer=optimizer,
-            megatron_fsdp_unit_modules=self.megatron_fsdp_unit_modules,
-            tp_shard_plan=tp_shard_plan,
-            zero_dp_strategy=self.zero_dp_strategy,
-            init_fsdp_with_meta_device=self.init_fsdp_with_meta_device,
-            grad_reduce_in_fp32=self.grad_reduce_in_fp32,
-            preserve_fp32_weights=self.preserve_fp32_weights,
-            overlap_grad_reduce=self.overlap_grad_reduce,
-            overlap_param_gather=self.overlap_param_gather,
-            check_for_nan_in_grad=self.check_for_nan_in_grad,
-            report_nan_in_param_grad=self.report_nan_in_param_grad,
-            average_in_collective=self.average_in_collective,
-            disable_bucketing=self.disable_bucketing,
-            calculate_per_token_loss=self.calculate_per_token_loss,
-            keep_fp8_transpose_cache=self.keep_fp8_transpose_cache,
-            nccl_ub=self.nccl_ub,
-            fsdp_double_buffer=self.fsdp_double_buffer,
-            dp_shard_dim=dp_shard_dim,
-            tp_dim=tp_dim,
             reapply_trainability=reapply_trainability,
         )
-
-        return model, optimizer
 
 
 def fully_shard_optimizer(

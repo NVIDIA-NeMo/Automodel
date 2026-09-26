@@ -28,9 +28,7 @@ from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor import DTensor
 
 from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
-from nemo_automodel.components.distributed.config import FSDP2Config
-from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
-from nemo_automodel.components.distributed.mesh import MeshContext
+from nemo_automodel.components.distributed import FSDP2Config, MeshContext, ParallelizeContext
 
 _WORLD_SIZE = 2
 _FEATURES = 4
@@ -126,13 +124,14 @@ def _worker(rank: int, port: int) -> None:
             ),
             enable_fsdp2_prefetch=False,
         )
+        mesh_context = MeshContext.from_meshes(mesh)
         model = apply_model_infrastructure(
             model=model,
             is_meta_device=False,
             device=torch.device("cuda", rank),
             load_base_model=False,
-            model_wrapper=FSDP2Manager(config, device_mesh=mesh),
-            mesh=MeshContext.from_meshes(mesh),
+            model_wrapper=ParallelizeContext(mesh=mesh_context, strategy=config),
+            mesh=mesh_context,
             freeze_config={
                 "freeze_modules": [{"path": "backbone"}],
                 "unfreeze_modules": [{"path": "classifier"}],

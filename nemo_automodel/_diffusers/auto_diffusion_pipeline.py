@@ -23,37 +23,39 @@ This module provides a single pipeline class that handles:
 
 Usage:
     # Finetuning (from_pretrained) - no pipeline_spec needed
-    pipe, managers = NeMoAutoDiffusionPipeline.from_pretrained(
+    pipe, contexts = NeMoAutoDiffusionPipeline.from_pretrained(
         "black-forest-labs/FLUX.1-dev",
         load_for_training=True,
-        parallel_scheme={"transformer": manager_args},
+        parallel_scheme={"transformer": parallelization_args},
     )
 
     # Pretraining (from_config) - pipeline_spec required in YAML
-    pipe, managers = NeMoAutoDiffusionPipeline.from_config(
+    pipe, contexts = NeMoAutoDiffusionPipeline.from_config(
         "black-forest-labs/FLUX.1-dev",
         pipeline_spec={
             "transformer_cls": "FluxTransformer2DModel",
             "subfolder": "transformer",
         },
-        parallel_scheme={"transformer": manager_args},
+        parallel_scheme={"transformer": parallelization_args},
     )
 """
 
 import logging
 import os
-from dataclasses import dataclass
-from typing import Any, Dict, Iterable, Tuple, Union
+from dataclasses import dataclass, fields
+from typing import Any, Dict, Iterable, Tuple
 
 import torch
 import torch.nn as nn
 
 from nemo_automodel._diffusers._hf_cache import resolve_diffusion_model_dir
 from nemo_automodel._diffusers.parallelization import attach_parallelizer
-from nemo_automodel.components.distributed import DistributedSetup, ParallelismSizes
+from nemo_automodel.components.distributed import DistributedSetup, ParallelismSizes, ParallelizeContext
 from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config
-from nemo_automodel.components.distributed.ddp import DDPManager
-from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
+from nemo_automodel.components.distributed.model_parallelizer import (
+    compile_parallelized_model,
+    parallelize_model,
+)
 from nemo_automodel.shared.import_utils import safe_import_te
 from nemo_automodel.shared.utils import dtype_from_str
 
@@ -68,9 +70,6 @@ except Exception:
 
 
 logger = logging.getLogger(__name__)
-
-# Type alias for parallel managers
-ParallelManager = Union[FSDP2Manager, DDPManager]
 
 
 @dataclass
@@ -366,20 +365,18 @@ def _fuse_transformer_qkv_projections(module: nn.Module, module_name: str, *, co
     return fused
 
 
-def _create_parallel_manager(manager_args: Dict[str, Any]) -> ParallelManager:
-    """
-    Factory function to create the appropriate parallel manager based on config.
+def _create_parallelize_context(parallelization_args: Dict[str, Any]) -> ParallelizeContext:
+    """Create a model parallelization context from the diffusion config.
 
-    Builds a ``DistributedSetup`` via ``DistributedSetup.build(...)``, then instantiates the
-    requested manager from the setup's strategy config and meshes. This mirrors
-    the pattern used by ``_instantiate_distributed`` in the transformers infrastructure.
+    Builds a ``DistributedSetup`` via ``DistributedSetup.build(...)`` and packages
+    its typed strategy and meshes for the model-owned ``ModelParallelizer``.
 
-    The manager type is determined by the ``_manager_type`` key in *manager_args*:
-    - ``'ddp'``: Creates a DDP ``DistributedSetup`` + ``DDPManager``
-    - ``'fsdp2'`` (default): Creates an FSDP2 ``DistributedSetup`` + ``FSDP2Manager``
+    The strategy type is determined by the compatibility ``_manager_type`` key:
+    - ``'ddp'``: Creates a DDP ``DistributedSetup`` and context.
+    - ``'fsdp2'`` (default): Creates an FSDP2 ``DistributedSetup`` and context.
 
     Args:
-        manager_args: Flat dictionary of arguments.  Recognised keys:
+        parallelization_args: Flat dictionary of arguments. Recognised keys:
 
             Common:
                 ``_manager_type`` (str): ``'fsdp2'`` or ``'ddp'``.
@@ -396,16 +393,16 @@ def _create_parallel_manager(manager_args: Dict[str, Any]) -> ParallelManager:
                 ``offload_policy``, ``defer_fsdp_grad_sync`` (bool).
 
     Returns:
-        Either an FSDP2Manager or DDPManager instance.
+        Runtime context for model-owned parallelization.
 
     Raises:
-        ValueError: If an unknown manager type is specified.
+        ValueError: If an unknown strategy type is specified.
     """
-    args = manager_args.copy()
-    manager_type = args.pop("_manager_type", "fsdp2").lower()
+    args = parallelization_args.copy()
+    strategy_type = args.pop("_manager_type", "fsdp2").lower()
     if "backend" in args:
         raise ValueError(
-            "backend is not a parallel manager option; configure the process group before parallelization."
+            "backend is not a model parallelizer option; configure the process group before parallelization."
         )
     parallelism = ParallelismSizes(
         dp_size=args.get("dp_size"),
@@ -416,78 +413,57 @@ def _create_parallel_manager(manager_args: Dict[str, Any]) -> ParallelManager:
         ep_size=args.get("ep_size", 1),
     )
 
-    if manager_type == "ddp":
-        distributed_setup = DistributedSetup.build(
-            strategy=DDPConfig(
-                activation_checkpointing=args.get("activation_checkpointing", False),
-                find_unused_parameters=args.get("find_unused_parameters", False),
-            ),
-            parallelism_sizes=parallelism,
-            activation_checkpointing=args.get("activation_checkpointing", False),
-            world_size=args.get("world_size"),
-        )
-        logger.info("[Parallel] Creating DDPManager with config: %s", distributed_setup.strategy_config)
-        return DDPManager(distributed_setup.strategy_config)
-
-    elif manager_type == "fsdp2":
-        world_size = args.get("world_size")
-        if world_size is None:
-            world_size = torch.distributed.get_world_size()
-
-        distributed_setup = DistributedSetup.build(
-            strategy=FSDP2Config(
-                mp_policy=args["mp_policy"] if "mp_policy" in args else None,
-                sequence_parallel=args.get("sequence_parallel", False),
-                tp_plan=args.get("tp_plan", None),
-                patch_is_packed_sequence=args.get("patch_is_packed_sequence", False),
-                offload_policy=args.get("offload_policy", None),
-                defer_fsdp_grad_sync=args.get("defer_fsdp_grad_sync", True),
-                enable_async_tensor_parallel=args.get("enable_async_tensor_parallel", False),
-                enable_compile=args.get("enable_compile", False),
-                enable_fsdp2_prefetch=args.get("enable_fsdp2_prefetch", False),
-                fsdp2_backward_prefetch_depth=args.get("fsdp2_backward_prefetch_depth", 2),
-                fsdp2_forward_prefetch_depth=args.get("fsdp2_forward_prefetch_depth", 1),
-                activation_checkpointing=args.get("activation_checkpointing", False),
-            ),
-            parallelism_sizes=parallelism,
-            activation_checkpointing=args.get("activation_checkpointing", False),
-            world_size=world_size,
-        )
-
-        mesh_context = distributed_setup.mesh_context
-        logger.info("[Parallel] Creating FSDP2Manager with config: %s", distributed_setup.strategy_config)
-        return FSDP2Manager(
-            distributed_setup.strategy_config,
-            device_mesh=mesh_context.device_mesh,
-            moe_mesh=mesh_context.moe_mesh,
-        )
-
+    if strategy_type == "ddp":
+        strategy_class = DDPConfig
+    elif strategy_type == "fsdp2":
+        strategy_class = FSDP2Config
     else:
-        raise ValueError(f"Unknown manager type: '{manager_type}'. Expected 'ddp' or 'fsdp2'.")
+        raise ValueError(f"Unknown strategy type: '{strategy_type}'. Expected 'ddp' or 'fsdp2'.")
+
+    strategy_field_names = {field.name for field in fields(strategy_class)}
+    strategy_config = strategy_class(**{key: value for key, value in args.items() if key in strategy_field_names})
+    world_size = args.get("world_size")
+    if strategy_type == "fsdp2" and world_size is None:
+        world_size = torch.distributed.get_world_size()
+    distributed_setup = DistributedSetup.build(
+        strategy=strategy_config,
+        parallelism_sizes=parallelism,
+        activation_checkpointing=args.get("activation_checkpointing", False),
+        world_size=world_size,
+    )
+    logger.info("[Parallel] Creating %s context with config: %s", strategy_type.upper(), strategy_config)
+    return ParallelizeContext(
+        mesh=distributed_setup.mesh_context,
+        strategy=distributed_setup.strategy_config,
+        moe=getattr(distributed_setup, "moe_parallel_config", None),
+        activation_checkpointing=distributed_setup.activation_checkpointing,
+    )
 
 
 def _enable_context_parallel(
-    module: nn.Module, module_name: str, manager: ParallelManager, manager_args: Dict[str, Any]
+    module: nn.Module,
+    module_name: str,
+    context: ParallelizeContext,
+    parallelization_args: Dict[str, Any],
 ) -> None:
     """Enable diffusers context parallelism on a transformer before FSDP2 sharding.
 
     Registers diffusers' CP hooks (sequence-dim input split / output gather driven by
     the model's ``_cp_plan``) on *module*, reusing the ``cp`` axis of the FSDP2 device
     mesh instead of letting diffusers initialize a second world mesh. Must run before
-    ``manager.parallelize`` so hooks and FSDP2 wrapping compose on the same modules.
+    ``ModelParallelizer.parallelize`` so hooks and FSDP2 wrapping compose on the same modules.
 
     Args:
         module: The diffusers transformer to enable CP on. Must expose
             ``enable_parallelism`` and define a ``_cp_plan``.
         module_name: Component name, for error messages.
-        manager: The parallel manager created for this component. Must be an
-            ``FSDP2Manager`` (its device mesh provides the ``cp`` axis).
-        manager_args: Flat manager-args dict. Reads ``cp_size`` and the optional
+        context: FSDP2 context whose device mesh provides the ``cp`` axis.
+        parallelization_args: Flat parallelization-args dict. Reads ``cp_size`` and the optional
             ``cp_ring_degree`` / ``cp_ulysses_degree`` split (defaults to pure
             Ulysses, i.e. ``ring=1, ulysses=cp_size``).
 
     Raises:
-        ValueError: If the manager is not FSDP2, the ring/ulysses split does not
+        ValueError: If the strategy is not FSDP2, the ring/ulysses split does not
             multiply to ``cp_size``, ring is requested (training backward is
             broken in diffusers<=0.39), or the model has no ``_cp_plan``.
     """
@@ -504,12 +480,12 @@ def _enable_context_parallel(
     apply_native_flash_backward_patch()
     apply_cudnn_attention_patch()
 
-    cp_size = int(manager_args.get("cp_size", 1))
-    ring_degree = int(manager_args.get("cp_ring_degree", 1))
-    ulysses_degree = int(manager_args.get("cp_ulysses_degree", cp_size // ring_degree if ring_degree else 0))
+    cp_size = int(parallelization_args.get("cp_size", 1))
+    ring_degree = int(parallelization_args.get("cp_ring_degree", 1))
+    ulysses_degree = int(parallelization_args.get("cp_ulysses_degree", cp_size // ring_degree if ring_degree else 0))
 
-    if not isinstance(manager, FSDP2Manager):
-        raise ValueError(f"cp_size={cp_size} requires the fsdp2 manager; DDP does not support context parallelism.")
+    if not isinstance(context.strategy, FSDP2Config):
+        raise ValueError(f"cp_size={cp_size} requires FSDP2; DDP does not support context parallelism.")
     if ring_degree * ulysses_degree != cp_size:
         raise ValueError(
             f"cp_ring_degree ({ring_degree}) * cp_ulysses_degree ({ulysses_degree}) must equal cp_size ({cp_size})."
@@ -526,7 +502,13 @@ def _enable_context_parallel(
             "diffusers context-parallel plan (_cp_plan). Provide a custom plan upstream or disable CP."
         )
 
-    cp_mesh = create_ring_ulysses_mesh(manager.device_mesh, ring_degree=ring_degree, ulysses_degree=ulysses_degree)
+    if context.mesh.device_mesh is None:
+        raise ValueError("Diffusers context parallelism requires a device mesh.")
+    cp_mesh = create_ring_ulysses_mesh(
+        context.mesh.device_mesh,
+        ring_degree=ring_degree,
+        ulysses_degree=ulysses_degree,
+    )
     logger.info(
         "[CP] Enabling context parallelism on %s: ring=%d ulysses=%d mesh=%s",
         module_name,
@@ -542,7 +524,7 @@ def _enable_context_parallel(
 def _apply_parallelization(
     pipe,
     parallel_scheme: Dict[str, Dict[str, Any]] | None,
-) -> Dict[str, ParallelManager]:
+) -> Dict[str, ParallelizeContext]:
     """Apply FSDP2/DDP parallelization to pipeline components.
 
     Each parallelized component is stamped with ``_pre_shard_hf_state_dict_keys``:
@@ -555,35 +537,34 @@ def _apply_parallelization(
     state-dict keys gain a ``module.`` prefix, and DDP delegates attribute access
     to the inner module.
     """
-    created_managers: Dict[str, ParallelManager] = {}
+    created_contexts: Dict[str, ParallelizeContext] = {}
     if parallel_scheme is None:
-        return created_managers
+        return created_contexts
 
     assert torch.distributed.is_initialized(), "Distributed environment must be initialized for parallelization"
     for comp_name, comp_module in _iter_pipeline_modules(pipe):
-        manager_args = parallel_scheme.get(comp_name)
-        if manager_args is None:
+        parallelization_args = parallel_scheme.get(comp_name)
+        if parallelization_args is None:
             continue
         logger.info("[INFO] Applying parallelization to %s", comp_name)
         attach_parallelizer(comp_module)
-        manager = _create_parallel_manager(manager_args)
-        created_managers[comp_name] = manager
+        context = _create_parallelize_context(parallelization_args)
+        created_contexts[comp_name] = context
         pre_shard_hf_state_dict_keys = list(comp_module.state_dict().keys())
         # CP hooks must be registered before fully_shard so diffusers sees the
         # final module tree by name and FSDP2 wraps the hook-carrying modules.
-        if int(manager_args.get("cp_size", 1)) > 1:
-            _enable_context_parallel(comp_module, comp_name, manager, manager_args)
-        parallel_module = manager.parallelize(comp_module)
-        if hasattr(manager, "maybe_compile"):
-            manager.maybe_compile(parallel_module)
-        if isinstance(manager, DDPManager):
+        if int(parallelization_args.get("cp_size", 1)) > 1:
+            _enable_context_parallel(comp_module, comp_name, context, parallelization_args)
+        parallel_module = parallelize_model(comp_module, context)
+        compile_parallelized_model(parallel_module, context)
+        if isinstance(context.strategy, DDPConfig):
             inner_module = getattr(parallel_module, "module", parallel_module)
             setattr(inner_module, "_pre_shard_hf_state_dict_keys", pre_shard_hf_state_dict_keys)
         else:
             setattr(parallel_module, "_pre_shard_hf_state_dict_keys", pre_shard_hf_state_dict_keys)
         setattr(pipe, comp_name, parallel_module)
 
-    return created_managers
+    return created_contexts
 
 
 class NeMoAutoDiffusionPipeline:
@@ -602,14 +583,14 @@ class NeMoAutoDiffusionPipeline:
       Requires pipeline_spec with transformer_cls in YAML config
 
     Features:
-    - Accepts a per-component mapping from component name to parallel manager init args
+    - Accepts a per-component mapping from component name to parallel strategy arguments
     - Moves all nn.Module components to the chosen device/dtype
-    - Parallelizes only components present in the mapping by constructing a manager per component
-    - Supports both FSDP2Manager and DDPManager via '_manager_type' key in config
+    - Parallelizes only components present in the mapping by constructing a context per component
+    - Supports both FSDP2 and DDP via the compatibility '_manager_type' config key
     - Gradient checkpointing support for memory efficiency
 
     parallel_scheme:
-    - Dict[str, Dict[str, Any]]: component name -> kwargs for parallel manager
+    - Dict[str, Dict[str, Any]]: component name -> parallelization arguments
     - Each component's kwargs should include '_manager_type': 'fsdp2' or 'ddp' (defaults to 'fsdp2')
     """
 
@@ -652,7 +633,7 @@ class NeMoAutoDiffusionPipeline:
         compact_fused_qkv_projections: bool = False,
         attention_backend: str | None = None,
         **kwargs,
-    ) -> Tuple[DiffusionPipeline, Dict[str, ParallelManager]]:
+    ) -> Tuple[DiffusionPipeline, Dict[str, ParallelizeContext]]:
         """
         Load pipeline from pretrained weights using DiffusionPipeline auto-detection.
 
@@ -663,7 +644,7 @@ class NeMoAutoDiffusionPipeline:
 
         Args:
             pretrained_model_name_or_path: HuggingFace model ID or local path
-            parallel_scheme: Dict mapping component names to parallel manager kwargs.
+            parallel_scheme: Dict mapping component names to parallelization arguments.
                            Each component's kwargs should include '_manager_type': 'fsdp2' or 'ddp'
             device: Device to load model to
             torch_dtype: Data type for model parameters
@@ -689,7 +670,7 @@ class NeMoAutoDiffusionPipeline:
             **kwargs: Additional arguments passed to DiffusionPipeline.from_pretrained
 
         Returns:
-            Tuple of (DiffusionPipeline, Dict[str, ParallelManager])
+            Tuple of (DiffusionPipeline, Dict[str, ParallelizeContext])
         """
         if not DIFFUSERS_AVAILABLE:
             raise RuntimeError(
@@ -812,8 +793,8 @@ class NeMoAutoDiffusionPipeline:
 
         if peft_cfg is not None:
             transformer_parallel_args = (parallel_scheme or {}).get("transformer", {})
-            manager_type = str(transformer_parallel_args.get("_manager_type", "fsdp2")).lower()
-            if manager_type == "ddp":
+            strategy_type = str(transformer_parallel_args.get("_manager_type", "fsdp2")).lower()
+            if strategy_type == "ddp":
                 for param_name, param in pipe.transformer.named_parameters():
                     if "lora_" not in param_name and param.requires_grad:
                         param.requires_grad_(False)
@@ -823,7 +804,7 @@ class NeMoAutoDiffusionPipeline:
         # FSDP2 LoRA: all params are trainable when fully_shard() runs so FSDP2
         # sets up gradient reduction for lora_A/lora_B correctly. Freeze happens below.
         # DDP LoRA: base weights are frozen before wrapping so DDP only reduces LoRA gradients.
-        created_managers = _apply_parallelization(pipe, parallel_scheme)
+        created_contexts = _apply_parallelization(pipe, parallel_scheme)
 
         # Freeze base weights after FSDP2 wrapping — mirrors the LLM pattern in
         # nemo_automodel/_transformers/infrastructure.py lines 513-518.
@@ -836,7 +817,7 @@ class NeMoAutoDiffusionPipeline:
                     param.requires_grad_(False)
             logger.info("[LoRA] Froze base weights after parallelization")
 
-        return pipe, created_managers
+        return pipe, created_contexts
 
     @classmethod
     def from_config(
@@ -854,7 +835,7 @@ class NeMoAutoDiffusionPipeline:
         compact_fused_qkv_projections: bool = False,
         attention_backend: str | None = None,
         **kwargs,
-    ) -> Tuple["NeMoAutoDiffusionPipeline", Dict[str, ParallelManager]]:
+    ) -> Tuple["NeMoAutoDiffusionPipeline", Dict[str, ParallelizeContext]]:
         """
         Initialize pipeline with random weights using YAML-specified transformer class.
 
@@ -871,7 +852,7 @@ class NeMoAutoDiffusionPipeline:
             pipeline_spec: Dict from YAML config with transformer_cls, subfolder, etc.
             torch_dtype: Data type for model parameters
             device: Device to load model to
-            parallel_scheme: Dict mapping component names to parallel manager kwargs
+            parallel_scheme: Dict mapping component names to parallelization arguments
             move_to_device: Whether to move modules to device
             components_to_load: Which components to process (default: all)
             transformer_engine_linear: Whether to replace torch.nn.Linear modules in the transformer with TE Linear.
@@ -883,7 +864,7 @@ class NeMoAutoDiffusionPipeline:
             **kwargs: Additional arguments
 
         Returns:
-            Tuple of (NeMoAutoDiffusionPipeline or DiffusionPipeline, Dict[str, ParallelManager])
+            Tuple of (NeMoAutoDiffusionPipeline or DiffusionPipeline, Dict[str, ParallelizeContext])
         """
         if not DIFFUSERS_AVAILABLE:
             raise RuntimeError(
@@ -967,6 +948,6 @@ class NeMoAutoDiffusionPipeline:
                 _ensure_params_trainable(module, module_name=name)
 
         # Apply parallelization (FSDP2 or DDP)
-        created_managers = _apply_parallelization(pipe, parallel_scheme)
+        created_contexts = _apply_parallelization(pipe, parallel_scheme)
 
-        return pipe, created_managers
+        return pipe, created_contexts

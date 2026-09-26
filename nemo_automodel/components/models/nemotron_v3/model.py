@@ -516,7 +516,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         Wraps every decoder block (and MTP block, when present) with a
         non-reentrant checkpoint wrapper so that block activations are recomputed
         during the backward pass instead of being stored. This is the single-GPU
-        entry point: ``FSDP2Manager.parallelize`` calls it when ``world_size == 1``
+        entry point: ``ModelParallelizer.parallelize`` calls it when ``world_size == 1``
         (the expert-parallel path performs the equivalent wrapping inside the MoE
         parallelizer's ``apply_ac``). Without it, the hybrid Mamba2/Attention MoE
         keeps every block's activations live, which is what pushes single-GPU LoRA

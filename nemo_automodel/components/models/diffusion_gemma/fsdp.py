@@ -16,7 +16,7 @@
 
 At ``ep_size=1`` there is no MoE mesh, so the model is sharded by the generic
 :class:`~nemo_automodel.components.distributed.parallelizer.DefaultParallelizationStrategy`
-(via ``FSDP2Manager.parallelize``), which applies ``fully_shard`` per decoder
+(via ``ModelParallelizer.parallelize``), which applies ``fully_shard`` per decoder
 layer and to the root.  The generic ``fully_shard`` flattens *all* of a decoder
 layer's parameters into one FSDP unit, which folds each layer's grouped-expert
 tensors (``moe.experts.{gate_and_up_projs,down_projs}``, the bulk of the 26B

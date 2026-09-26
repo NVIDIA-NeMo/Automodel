@@ -160,7 +160,7 @@ def _calculate_throughput_metrics(
     }
 
 
-def _build_diffusion_parallel_manager_args(
+def _build_diffusion_parallelization_args(
     *,
     fsdp_cfg: Dict[str, Any] | None,
     ddp_cfg: Dict[str, Any] | None,
@@ -169,7 +169,7 @@ def _build_diffusion_parallel_manager_args(
     compute_dtype: torch.dtype | None = None,
     lora_enabled: bool,
 ) -> Dict[str, Any]:
-    """Build diffusion transformer manager args through the shared distributed parser."""
+    """Build diffusion transformer parallelization args through the shared distributed parser."""
     if compute_dtype is None:
         compute_dtype = dtype
 
@@ -377,7 +377,7 @@ def build_diffusion_pipeline(
         logging.info("[INFO] Using DDP (DistributedDataParallel) for training")
     else:
         logging.info("[INFO] Using FSDP2 (Fully Sharded Data Parallel) for training")
-    manager_args = _build_diffusion_parallel_manager_args(
+    parallelization_args = _build_diffusion_parallelization_args(
         fsdp_cfg=fsdp_cfg,
         ddp_cfg=ddp_cfg,
         world_size=world_size,
@@ -386,14 +386,14 @@ def build_diffusion_pipeline(
         lora_enabled=lora_enabled,
     )
 
-    parallel_scheme = {"transformer": manager_args}
+    parallel_scheme = {"transformer": parallelization_args}
 
     if finetune_mode:
         # Finetuning: load from pretrained weights
         logging.info("[INFO] Loading pretrained model for finetuning")
         if active_transformer is not None:
             logging.info("[INFO] Active transformer: %s", active_transformer)
-        pipe, created_managers = NeMoAutoDiffusionPipeline.from_pretrained(
+        pipe, parallelize_contexts = NeMoAutoDiffusionPipeline.from_pretrained(
             model_id,
             torch_dtype=dtype,
             device=device,
@@ -421,7 +421,7 @@ def build_diffusion_pipeline(
                 "    subfolder: 'transformer'"
             )
         logging.info("[INFO] Initializing model with random weights for pretraining")
-        pipe, created_managers = NeMoAutoDiffusionPipeline.from_config(
+        pipe, parallelize_contexts = NeMoAutoDiffusionPipeline.from_config(
             model_id,
             pipeline_spec=pipeline_spec,
             torch_dtype=dtype,
@@ -434,7 +434,7 @@ def build_diffusion_pipeline(
             compact_fused_qkv_projections=compact_fused_qkv_projections,
             attention_backend=attention_backend,
         )
-    fsdp2_manager = created_managers["transformer"]
+    parallelize_context = parallelize_contexts["transformer"]
     transformer_module = pipe.transformer
 
     if lora_enabled:
@@ -467,7 +467,7 @@ def build_diffusion_pipeline(
 
     logging.info("[INFO] NeMoAutoDiffusion pipeline setup complete")
 
-    return pipe, getattr(fsdp2_manager, "device_mesh", None)
+    return pipe, parallelize_context.mesh.device_mesh
 
 
 class TrainDiffusionRecipe(BaseRecipe):

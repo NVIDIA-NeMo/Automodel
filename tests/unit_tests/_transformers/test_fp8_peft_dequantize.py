@@ -117,12 +117,12 @@ class TestMetaDeviceWithNativeQuantConfig:
     @staticmethod
     def _compute_is_meta_device(model_wrapper, world_size, is_hf_model, quantization_config, hf_native_quant_cfg):
         """Replicate the is_meta_device logic from _build_model."""
-        from nemo_automodel.components.distributed.ddp import DDPManager
-        from nemo_automodel.components.distributed.megatron_fsdp import MegatronFSDPManager
+        from nemo_automodel._transformers.infrastructure import _get_strategy_config
+        from nemo_automodel.components.distributed import DDPConfig, MegatronFSDPConfig
 
         return all(
             [
-                not isinstance(model_wrapper, (MegatronFSDPManager, DDPManager)),
+                not isinstance(_get_strategy_config(model_wrapper), (MegatronFSDPConfig, DDPConfig)),
                 world_size > 1 or not is_hf_model,
                 quantization_config is None and hf_native_quant_cfg is None,
             ]

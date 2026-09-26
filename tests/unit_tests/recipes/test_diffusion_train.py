@@ -26,7 +26,7 @@ from nemo_automodel.components.optim.optimizer import LRSchedulerConfig, Optimiz
 from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.diffusion.train import (
     TrainDiffusionRecipe,
-    _build_diffusion_parallel_manager_args,
+    _build_diffusion_parallelization_args,
     _reject_removed_diffusion_keys,
     _resolve_model_dtypes,
     _validate_precision_configuration,
@@ -420,8 +420,8 @@ def test_recipe_config_rejects_unknown_diffusion_dataloader_field():
         RecipeConfig.resolve_diffusion_dataloader(raw)
 
 
-def test_manager_args_default_to_pure_ulysses_cp_split():
-    args = _build_diffusion_parallel_manager_args(
+def test_parallelization_args_default_to_pure_ulysses_cp_split():
+    args = _build_diffusion_parallelization_args(
         fsdp_cfg={"cp_size": 2},
         ddp_cfg=None,
         world_size=8,
@@ -434,8 +434,8 @@ def test_manager_args_default_to_pure_ulysses_cp_split():
     assert args["cp_ulysses_degree"] == 2
 
 
-def test_manager_args_pass_explicit_ring_ulysses_split_through():
-    args = _build_diffusion_parallel_manager_args(
+def test_parallelization_args_pass_explicit_ring_ulysses_split_through():
+    args = _build_diffusion_parallelization_args(
         fsdp_cfg={"cp_size": 4, "cp_ring_degree": 2, "cp_ulysses_degree": 2},
         ddp_cfg=None,
         world_size=8,
@@ -449,8 +449,8 @@ def test_manager_args_pass_explicit_ring_ulysses_split_through():
     assert args["cp_ulysses_degree"] == 2
 
 
-def test_manager_args_derive_ulysses_from_ring_when_unset():
-    args = _build_diffusion_parallel_manager_args(
+def test_parallelization_args_derive_ulysses_from_ring_when_unset():
+    args = _build_diffusion_parallelization_args(
         fsdp_cfg={"cp_size": 4, "cp_ring_degree": 2},
         ddp_cfg=None,
         world_size=8,
@@ -462,8 +462,8 @@ def test_manager_args_derive_ulysses_from_ring_when_unset():
     assert args["cp_ulysses_degree"] == 2
 
 
-def test_manager_args_cp_knobs_default_when_cp_disabled():
-    args = _build_diffusion_parallel_manager_args(
+def test_parallelization_args_cp_knobs_default_when_cp_disabled():
+    args = _build_diffusion_parallelization_args(
         fsdp_cfg={},
         ddp_cfg=None,
         world_size=8,

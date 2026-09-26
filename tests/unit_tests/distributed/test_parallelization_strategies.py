@@ -1344,12 +1344,16 @@ class TestFsdp2StrategyParallelizeIntegration:
         # Test with regular model (should use default strategy)
         model = MockModel("RegularModel")
 
-        result = fsdp2_strategy_parallelize(
-            model=model,
-            device_mesh=mesh,
-            sequence_parallel=False,
-            activation_checkpointing=False,
-        )
+        with patch(
+            "nemo_automodel.components.distributed.fsdp2.fsdp2_sharding_enabled",
+            return_value=True,
+        ):
+            result = fsdp2_strategy_parallelize(
+                model=model,
+                device_mesh=mesh,
+                sequence_parallel=False,
+                activation_checkpointing=False,
+            )
 
         assert result is model
         # Verify that default strategy functions were called
@@ -1366,7 +1370,13 @@ class TestFsdp2StrategyParallelizeIntegration:
         fully_shard.side_effect = lambda model, **kwargs: model
         fully_shard_by_dtype.side_effect = lambda model, **kwargs: model
         model = MockNemotronHModel()
-        with patch.object(type(model), "parallelizer", nemotron_parallelization.PARALLELIZER, create=True):
+        with (
+            patch.object(type(model), "parallelizer", nemotron_parallelization.PARALLELIZER, create=True),
+            patch(
+                "nemo_automodel.components.distributed.fsdp2.fsdp2_sharding_enabled",
+                return_value=True,
+            ),
+        ):
             result = fsdp2_strategy_parallelize(
                 model=model,
                 device_mesh=mesh,
@@ -1375,6 +1385,7 @@ class TestFsdp2StrategyParallelizeIntegration:
             )
 
         assert result is model
+        fully_shard.assert_called()
 
     def test_backward_compatibility_arguments(self, mock_device_mesh, mock_distributed_env):
         """Test that all original function arguments are still supported."""
@@ -1382,18 +1393,22 @@ class TestFsdp2StrategyParallelizeIntegration:
         model = MockModel("RegularModel")
 
         # Test with all possible arguments
-        result = fsdp2_strategy_parallelize(
-            model=model,
-            device_mesh=mesh,
-            mp_policy=None,
-            offload_policy=None,
-            sequence_parallel=False,
-            activation_checkpointing=True,
-            tp_shard_plan=None,
-            dp_replicate_mesh_name="dp_replicate",
-            dp_shard_cp_mesh_name="dp_shard_cp",
-            tp_mesh_name="tp",
-        )
+        with patch(
+            "nemo_automodel.components.distributed.fsdp2.fsdp2_sharding_enabled",
+            return_value=True,
+        ):
+            result = fsdp2_strategy_parallelize(
+                model=model,
+                device_mesh=mesh,
+                mp_policy=None,
+                offload_policy=None,
+                sequence_parallel=False,
+                activation_checkpointing=True,
+                tp_shard_plan=None,
+                dp_replicate_mesh_name="dp_replicate",
+                dp_shard_cp_mesh_name="dp_shard_cp",
+                tp_mesh_name="tp",
+            )
 
         assert result is model
 

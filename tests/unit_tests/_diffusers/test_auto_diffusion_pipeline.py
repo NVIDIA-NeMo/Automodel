@@ -14,7 +14,7 @@
 
 import logging
 from types import SimpleNamespace
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import MagicMock, Mock, call, patch
 
 import pytest
 import torch
@@ -372,12 +372,12 @@ def test_pipeline_spec_validate_for_from_config_passes_with_cls():
 
 
 # =============================================================================
-# _create_parallel_manager tests
+# _create_parallelize_context tests
 # =============================================================================
 
 
-def test_create_parallel_manager_fsdp2_default():
-    from nemo_automodel._diffusers.auto_diffusion_pipeline import _create_parallel_manager
+def test_create_parallelize_context_fsdp2_default():
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import _create_parallelize_context
 
     mock_config = Mock()
     mock_mesh = Mock()
@@ -385,31 +385,30 @@ def test_create_parallel_manager_fsdp2_default():
     mock_setup = SimpleNamespace(
         strategy_config=mock_config,
         mesh_context=SimpleNamespace(device_mesh=mock_mesh, moe_mesh=mock_moe_mesh),
+        moe_parallel_config=None,
+        activation_checkpointing=False,
     )
-    with (
-        patch(f"{MODULE_PATH}.FSDP2Manager") as MockFSDP2,
-        patch(f"{MODULE_PATH}.DistributedSetup.build", return_value=mock_setup) as MockBuildSetup,
-    ):
-        MockFSDP2.return_value = Mock()
-        manager = _create_parallel_manager({"world_size": 1})
+    with patch(f"{MODULE_PATH}.DistributedSetup.build", return_value=mock_setup) as MockBuildSetup:
+        context = _create_parallelize_context({"world_size": 1})
 
     MockBuildSetup.assert_called_once()
     assert MockBuildSetup.call_args.kwargs["world_size"] == 1
-    MockFSDP2.assert_called_once_with(mock_config, device_mesh=mock_mesh, moe_mesh=mock_moe_mesh)
-    assert manager is MockFSDP2.return_value
+    assert context.strategy is mock_config
+    assert context.mesh is mock_setup.mesh_context
 
 
-def test_create_parallel_manager_ddp():
-    from nemo_automodel._diffusers.auto_diffusion_pipeline import _create_parallel_manager
+def test_create_parallelize_context_ddp():
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import _create_parallelize_context
 
     mock_config = Mock()
-    mock_setup = SimpleNamespace(strategy_config=mock_config)
-    with (
-        patch(f"{MODULE_PATH}.DDPManager") as MockDDP,
-        patch(f"{MODULE_PATH}.DistributedSetup.build", return_value=mock_setup) as MockBuildSetup,
-    ):
-        MockDDP.return_value = Mock()
-        manager = _create_parallel_manager({"_manager_type": "ddp", "some_arg": "value"})
+    mock_mesh_context = Mock()
+    mock_setup = SimpleNamespace(
+        strategy_config=mock_config,
+        mesh_context=mock_mesh_context,
+        activation_checkpointing=False,
+    )
+    with patch(f"{MODULE_PATH}.DistributedSetup.build", return_value=mock_setup) as MockBuildSetup:
+        context = _create_parallelize_context({"_manager_type": "ddp", "some_arg": "value"})
 
     MockBuildSetup.assert_called_once()
     build_kwargs = MockBuildSetup.call_args.kwargs
@@ -419,52 +418,42 @@ def test_create_parallel_manager_ddp():
     assert build_kwargs["activation_checkpointing"] is False
     assert not hasattr(build_kwargs["strategy"], "backend")
     assert build_kwargs["strategy"].find_unused_parameters is False
-    MockDDP.assert_called_once_with(mock_config)
-    assert manager is MockDDP.return_value
+    assert context.strategy is mock_config
+    assert context.mesh is mock_mesh_context
 
 
-def test_create_parallel_manager_ddp_passes_find_unused_parameters():
-    from nemo_automodel._diffusers.auto_diffusion_pipeline import _create_parallel_manager
+def test_create_parallelize_context_ddp_preserves_strategy_options():
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import _create_parallelize_context
 
     mock_config = Mock()
-    mock_setup = SimpleNamespace(strategy_config=mock_config)
-    with (
-        patch(f"{MODULE_PATH}.DDPManager") as MockDDP,
-        patch(f"{MODULE_PATH}.DistributedSetup.build", return_value=mock_setup) as MockBuildSetup,
-    ):
-        MockDDP.return_value = Mock()
-        manager = _create_parallel_manager({"_manager_type": "ddp", "find_unused_parameters": True})
+    mock_setup = SimpleNamespace(
+        strategy_config=mock_config,
+        mesh_context=Mock(),
+        activation_checkpointing=False,
+    )
+    with patch(f"{MODULE_PATH}.DistributedSetup.build", return_value=mock_setup) as MockBuildSetup:
+        context = _create_parallelize_context(
+            {
+                "_manager_type": "ddp",
+                "activation_checkpointing_scope": "vision",
+                "find_unused_parameters": True,
+                "static_graph": True,
+                "bucket_cap_mb": 42.0,
+            }
+        )
 
     MockBuildSetup.assert_called_once()
     build_kwargs = MockBuildSetup.call_args.kwargs
     assert isinstance(build_kwargs["strategy"], DDPConfig)
+    assert build_kwargs["strategy"].activation_checkpointing_scope == ("vision",)
     assert build_kwargs["strategy"].find_unused_parameters is True
-    MockDDP.assert_called_once_with(mock_config)
-    assert manager is MockDDP.return_value
+    assert build_kwargs["strategy"].static_graph is True
+    assert build_kwargs["strategy"].bucket_cap_mb == 42.0
+    assert context.strategy is mock_config
 
 
-def test_create_parallel_manager_explicit_fsdp2():
-    from nemo_automodel._diffusers.auto_diffusion_pipeline import _create_parallel_manager
-
-    mock_config = Mock()
-    mock_mesh = Mock()
-    mock_moe_mesh = Mock()
-    mock_setup = SimpleNamespace(
-        strategy_config=mock_config,
-        mesh_context=SimpleNamespace(device_mesh=mock_mesh, moe_mesh=mock_moe_mesh),
-    )
-    with (
-        patch(f"{MODULE_PATH}.FSDP2Manager") as MockFSDP2,
-        patch(f"{MODULE_PATH}.DistributedSetup.build", return_value=mock_setup),
-    ):
-        MockFSDP2.return_value = Mock()
-        _create_parallel_manager({"_manager_type": "fsdp2", "world_size": 1})
-
-    MockFSDP2.assert_called_once_with(mock_config, device_mesh=mock_mesh, moe_mesh=mock_moe_mesh)
-
-
-def test_create_parallel_manager_fsdp2_passes_perf_options():
-    from nemo_automodel._diffusers.auto_diffusion_pipeline import _create_parallel_manager
+def test_create_parallelize_context_explicit_fsdp2():
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import _create_parallelize_context
 
     mock_config = Mock()
     mock_mesh = Mock()
@@ -472,19 +461,39 @@ def test_create_parallel_manager_fsdp2_passes_perf_options():
     mock_setup = SimpleNamespace(
         strategy_config=mock_config,
         mesh_context=SimpleNamespace(device_mesh=mock_mesh, moe_mesh=mock_moe_mesh),
+        moe_parallel_config=None,
+        activation_checkpointing=False,
     )
-    with (
-        patch(f"{MODULE_PATH}.FSDP2Manager") as MockFSDP2,
-        patch(f"{MODULE_PATH}.DistributedSetup.build", return_value=mock_setup) as MockBuildSetup,
-    ):
-        MockFSDP2.return_value = Mock()
-        _create_parallel_manager(
+    with patch(f"{MODULE_PATH}.DistributedSetup.build", return_value=mock_setup):
+        context = _create_parallelize_context({"_manager_type": "fsdp2", "world_size": 1})
+
+    assert context.strategy is mock_config
+    assert context.mesh.device_mesh is mock_mesh
+    assert context.mesh.moe_mesh is mock_moe_mesh
+
+
+def test_create_parallelize_context_fsdp2_passes_perf_options():
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import _create_parallelize_context
+
+    mock_config = Mock()
+    mock_mesh = Mock()
+    mock_moe_mesh = Mock()
+    mock_setup = SimpleNamespace(
+        strategy_config=mock_config,
+        mesh_context=SimpleNamespace(device_mesh=mock_mesh, moe_mesh=mock_moe_mesh),
+        moe_parallel_config=None,
+        activation_checkpointing=False,
+    )
+    with patch(f"{MODULE_PATH}.DistributedSetup.build", return_value=mock_setup) as MockBuildSetup:
+        _create_parallelize_context(
             {
                 "_manager_type": "fsdp2",
                 "world_size": 1,
                 "sequence_parallel": True,
                 "tp_plan": {"layer": "colwise"},
                 "patch_is_packed_sequence": True,
+                "activation_checkpointing_scope": "language",
+                "reshard_after_forward": False,
                 "defer_fsdp_grad_sync": False,
                 "enable_async_tensor_parallel": True,
                 "enable_compile": True,
@@ -499,6 +508,8 @@ def test_create_parallel_manager_fsdp2_passes_perf_options():
     assert strategy_config.sequence_parallel is True
     assert strategy_config.tp_plan == {"layer": "colwise"}
     assert strategy_config.patch_is_packed_sequence is True
+    assert strategy_config.activation_checkpointing_scope == ("language",)
+    assert strategy_config.reshard_after_forward is False
     assert strategy_config.defer_fsdp_grad_sync is False
     assert strategy_config.enable_async_tensor_parallel is True
     assert strategy_config.enable_compile is True
@@ -507,29 +518,33 @@ def test_create_parallel_manager_fsdp2_passes_perf_options():
     assert strategy_config.fsdp2_forward_prefetch_depth == 3
 
 
-def test_create_parallel_manager_unknown_type_raises():
-    from nemo_automodel._diffusers.auto_diffusion_pipeline import _create_parallel_manager
+def test_create_parallelize_context_unknown_type_raises():
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import _create_parallelize_context
 
-    with pytest.raises(ValueError, match="Unknown manager type"):
-        _create_parallel_manager({"_manager_type": "unknown"})
-
-
-def test_create_parallel_manager_rejects_backend_option():
-    from nemo_automodel._diffusers.auto_diffusion_pipeline import _create_parallel_manager
-
-    with pytest.raises(ValueError, match="backend is not a parallel manager option"):
-        _create_parallel_manager({"_manager_type": "ddp", "backend": "gloo"})
+    with pytest.raises(ValueError, match="Unknown strategy type"):
+        _create_parallelize_context({"_manager_type": "unknown"})
 
 
-def test_create_parallel_manager_does_not_mutate_input():
-    from nemo_automodel._diffusers.auto_diffusion_pipeline import _create_parallel_manager
+def test_create_parallelize_context_rejects_backend_option():
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import _create_parallelize_context
+
+    with pytest.raises(ValueError, match="backend is not a model parallelizer option"):
+        _create_parallelize_context({"_manager_type": "ddp", "backend": "gloo"})
+
+
+def test_create_parallelize_context_does_not_mutate_input():
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import _create_parallelize_context
 
     original = {"_manager_type": "ddp", "key": "val"}
     original_copy = original.copy()
 
-    with patch(f"{MODULE_PATH}.DDPManager") as MockDDP:
-        MockDDP.return_value = Mock()
-        _create_parallel_manager(original)
+    mock_setup = SimpleNamespace(
+        strategy_config=Mock(),
+        mesh_context=Mock(),
+        activation_checkpointing=False,
+    )
+    with patch(f"{MODULE_PATH}.DistributedSetup.build", return_value=mock_setup):
+        _create_parallelize_context(original)
 
     assert original == original_copy
 
@@ -547,26 +562,33 @@ def test_apply_parallelization_returns_empty_when_scheme_is_none():
     assert result == {}
 
 
-def test_apply_parallelization_creates_managers_and_replaces_modules():
+def _parallelize_context(strategy=None):
+    from nemo_automodel.components.distributed import FSDP2Config, MeshContext, ParallelizeContext
+
+    return ParallelizeContext(mesh=MeshContext(), strategy=strategy or FSDP2Config())
+
+
+def test_apply_parallelization_creates_contexts_and_replaces_modules():
     from nemo_automodel._diffusers.auto_diffusion_pipeline import _apply_parallelization
 
     unet = DummyModule()
     new_unet = DummyModule()
     pipe = DummyPipeline({"unet": unet, "text_encoder": DummyModule()})
 
-    mock_manager = Mock()
-    mock_manager.parallelize.return_value = new_unet
+    context = _parallelize_context()
 
     with (
         patch(f"{MODULE_PATH}.torch.distributed.is_initialized", return_value=True),
-        patch(f"{MODULE_PATH}._create_parallel_manager", return_value=mock_manager) as mock_create,
+        patch(f"{MODULE_PATH}._create_parallelize_context", return_value=context) as mock_create,
+        patch(f"{MODULE_PATH}.parallelize_model", return_value=new_unet) as parallelize,
+        patch(f"{MODULE_PATH}.compile_parallelized_model"),
         patch(f"{MODULE_PATH}.attach_parallelizer"),
     ):
-        managers = _apply_parallelization(pipe, {"unet": {"_manager_type": "fsdp2"}})
+        contexts = _apply_parallelization(pipe, {"unet": {"_manager_type": "fsdp2"}})
 
     mock_create.assert_called_once_with({"_manager_type": "fsdp2"})
-    mock_manager.parallelize.assert_called_once_with(unet)
-    assert managers == {"unet": mock_manager}
+    parallelize.assert_called_once_with(unet, context)
+    assert contexts == {"unet": context}
     # unet was replaced on the pipeline
     assert pipe.unet is new_unet
 
@@ -578,19 +600,20 @@ def test_apply_parallelization_skips_components_not_in_scheme():
     text_encoder = DummyModule()
     pipe = DummyPipeline({"unet": unet, "text_encoder": text_encoder})
 
-    mock_manager = Mock()
-    mock_manager.parallelize.return_value = DummyModule()
+    context = _parallelize_context()
 
     with (
         patch(f"{MODULE_PATH}.torch.distributed.is_initialized", return_value=True),
-        patch(f"{MODULE_PATH}._create_parallel_manager", return_value=mock_manager),
+        patch(f"{MODULE_PATH}._create_parallelize_context", return_value=context),
+        patch(f"{MODULE_PATH}.parallelize_model", side_effect=lambda model, _context: model),
+        patch(f"{MODULE_PATH}.compile_parallelized_model"),
         patch(f"{MODULE_PATH}.attach_parallelizer"),
     ):
-        managers = _apply_parallelization(pipe, {"unet": {"_manager_type": "fsdp2"}})
+        contexts = _apply_parallelization(pipe, {"unet": {"_manager_type": "fsdp2"}})
 
     # Only unet should be parallelized
-    assert "unet" in managers
-    assert "text_encoder" not in managers
+    assert "unet" in contexts
+    assert "text_encoder" not in contexts
     # text_encoder should be unchanged
     assert pipe.text_encoder is text_encoder
 
@@ -603,12 +626,13 @@ def test_apply_parallelization_stamps_pre_shard_keys_on_parallelized_module():
     new_unet = DummyModule()
     pipe = DummyPipeline({"unet": unet})
 
-    mock_manager = Mock()
-    mock_manager.parallelize.return_value = new_unet
+    context = _parallelize_context()
 
     with (
         patch(f"{MODULE_PATH}.torch.distributed.is_initialized", return_value=True),
-        patch(f"{MODULE_PATH}._create_parallel_manager", return_value=mock_manager),
+        patch(f"{MODULE_PATH}._create_parallelize_context", return_value=context),
+        patch(f"{MODULE_PATH}.parallelize_model", return_value=new_unet),
+        patch(f"{MODULE_PATH}.compile_parallelized_model"),
         patch(f"{MODULE_PATH}.attach_parallelizer"),
     ):
         _apply_parallelization(pipe, {"unet": {"_manager_type": "fsdp2"}})
@@ -619,7 +643,7 @@ def test_apply_parallelization_stamps_pre_shard_keys_on_parallelized_module():
 
 
 def test_apply_parallelization_stamps_pre_shard_keys_on_inner_module_for_ddp():
-    from nemo_automodel._diffusers.auto_diffusion_pipeline import DDPManager, _apply_parallelization
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import _apply_parallelization
 
     class DDPLikeWrapper(torch.nn.Module):
         def __init__(self, module):
@@ -631,12 +655,13 @@ def test_apply_parallelization_stamps_pre_shard_keys_on_inner_module_for_ddp():
     wrapper = DDPLikeWrapper(unet)
     pipe = DummyPipeline({"unet": unet})
 
-    mock_manager = Mock(spec=DDPManager)
-    mock_manager.parallelize.return_value = wrapper
+    context = _parallelize_context(DDPConfig())
 
     with (
         patch(f"{MODULE_PATH}.torch.distributed.is_initialized", return_value=True),
-        patch(f"{MODULE_PATH}._create_parallel_manager", return_value=mock_manager),
+        patch(f"{MODULE_PATH}._create_parallelize_context", return_value=context),
+        patch(f"{MODULE_PATH}.parallelize_model", return_value=wrapper),
+        patch(f"{MODULE_PATH}.compile_parallelized_model"),
         patch(f"{MODULE_PATH}.attach_parallelizer"),
     ):
         _apply_parallelization(pipe, {"unet": {"_manager_type": "ddp"}})
@@ -653,7 +678,7 @@ def test_apply_parallelization_stamps_pre_shard_keys_on_inner_module_for_ddp():
 # =============================================================================
 
 
-def test_from_pretrained_returns_pipe_and_managers_tuple(caplog):
+def test_from_pretrained_returns_pipe_and_contexts_tuple(caplog):
     from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
 
     m1, m2 = DummyModule(), DummyModule()
@@ -671,12 +696,12 @@ def test_from_pretrained_returns_pipe_and_managers_tuple(caplog):
         caplog.set_level(logging.WARNING)
         result = NeMoAutoDiffusionPipeline.from_pretrained("dummy")
 
-    # from_pretrained now returns (pipe, managers) tuple
+    # from_pretrained returns (pipe, parallelization contexts).
     assert isinstance(result, tuple)
     assert len(result) == 2
-    pipe, managers = result
+    pipe, contexts = result
     assert pipe is dummy_pipe
-    assert isinstance(managers, dict)
+    assert isinstance(contexts, dict)
     assert mock_diffusion_pipeline.from_pretrained.call_count == 1
     # Both modules should be moved to device once
     assert mock_to.call_count == 2
@@ -700,35 +725,33 @@ def test_from_pretrained_skips_move_when_flag_false():
     mock_to.assert_not_called()
 
 
-def test_from_pretrained_parallel_scheme_applies_managers_and_sets_attrs():
+def test_from_pretrained_parallel_scheme_applies_contexts_and_sets_attrs():
     from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
 
     unet = DummyModule()
     text_encoder = DummyModule()
     dummy_pipe = DummyPipeline({"unet": unet, "text_encoder": text_encoder})
 
-    # Mock managers returned by _create_parallel_manager
     new_unet = DummyModule()
-    mgr_unet = Mock()
-    mgr_unet.parallelize.return_value = new_unet
-    mgr_text = Mock()
-    mgr_text.parallelize.return_value = text_encoder
+    context_unet = _parallelize_context()
+    context_text = _parallelize_context()
 
     mock_diffusion_pipeline = MagicMock()
     mock_diffusion_pipeline.from_pretrained.return_value = dummy_pipe
 
-    # _create_parallel_manager is called once per component; return different managers
-    manager_sequence = [mgr_unet, mgr_text]
+    context_sequence = [context_unet, context_text]
 
     with (
         patch(f"{MODULE_PATH}.DIFFUSERS_AVAILABLE", True),
         patch(f"{MODULE_PATH}.DiffusionPipeline", mock_diffusion_pipeline),
         patch(f"{MODULE_PATH}.torch.distributed.is_initialized", return_value=True),
-        patch(f"{MODULE_PATH}._create_parallel_manager", side_effect=manager_sequence),
+        patch(f"{MODULE_PATH}._create_parallelize_context", side_effect=context_sequence),
+        patch(f"{MODULE_PATH}.parallelize_model", side_effect=[new_unet, text_encoder]) as parallelize,
+        patch(f"{MODULE_PATH}.compile_parallelized_model"),
         patch(f"{MODULE_PATH}.attach_parallelizer"),
     ):
         # parallel_scheme values are now dicts (manager kwargs), not manager objects
-        pipe, managers = NeMoAutoDiffusionPipeline.from_pretrained(
+        pipe, contexts = NeMoAutoDiffusionPipeline.from_pretrained(
             "dummy",
             parallel_scheme={"unet": {"_manager_type": "fsdp2"}, "text_encoder": {"_manager_type": "fsdp2"}},
             move_to_device=False,
@@ -739,9 +762,8 @@ def test_from_pretrained_parallel_scheme_applies_managers_and_sets_attrs():
     assert dummy_pipe.components["unet"] is new_unet
     # text_encoder unchanged (mgr_text.parallelize returns same object)
     assert dummy_pipe.components["text_encoder"] is text_encoder
-    mgr_unet.parallelize.assert_called_once_with(unet)
-    mgr_text.parallelize.assert_called_once_with(text_encoder)
-    assert managers == {"unet": mgr_unet, "text_encoder": mgr_text}
+    assert parallelize.call_args_list == [call(unet, context_unet), call(text_encoder, context_text)]
+    assert contexts == {"unet": context_unet, "text_encoder": context_text}
 
 
 def test_from_pretrained_parallel_scheme_propagates_errors():
@@ -751,8 +773,7 @@ def test_from_pretrained_parallel_scheme_propagates_errors():
     comp = DummyModule()
     dummy_pipe = DummyPipeline({"unet": comp})
 
-    mgr = Mock()
-    mgr.parallelize.side_effect = RuntimeError("boom")
+    context = _parallelize_context()
 
     mock_diffusion_pipeline = MagicMock()
     mock_diffusion_pipeline.from_pretrained.return_value = dummy_pipe
@@ -761,7 +782,8 @@ def test_from_pretrained_parallel_scheme_propagates_errors():
         patch(f"{MODULE_PATH}.DIFFUSERS_AVAILABLE", True),
         patch(f"{MODULE_PATH}.DiffusionPipeline", mock_diffusion_pipeline),
         patch(f"{MODULE_PATH}.torch.distributed.is_initialized", return_value=True),
-        patch(f"{MODULE_PATH}._create_parallel_manager", return_value=mgr),
+        patch(f"{MODULE_PATH}._create_parallelize_context", return_value=context),
+        patch(f"{MODULE_PATH}.parallelize_model", side_effect=RuntimeError("boom")),
         patch(f"{MODULE_PATH}.attach_parallelizer"),
     ):
         with pytest.raises(RuntimeError, match="boom"):
@@ -1187,12 +1209,13 @@ def _cp_module():
     return module
 
 
-def _fsdp2_manager_mock():
-    from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
+def _fsdp2_context():
+    from nemo_automodel.components.distributed import ParallelizeContext
 
-    manager = Mock(spec=FSDP2Manager)
-    manager.device_mesh = Mock()
-    return manager
+    return ParallelizeContext(
+        mesh=SimpleNamespace(device_mesh=Mock()),
+        strategy=FSDP2Config(),
+    )
 
 
 def test_enable_context_parallel_derives_mesh_and_enables(monkeypatch):
@@ -1204,10 +1227,10 @@ def test_enable_context_parallel_derives_mesh_and_enables(monkeypatch):
     monkeypatch.setattr(mesh_utils, "create_ring_ulysses_mesh", create_mesh)
 
     module = _cp_module()
-    manager = _fsdp2_manager_mock()
-    _enable_context_parallel(module, "transformer", manager, {"cp_size": 2})
+    context = _fsdp2_context()
+    _enable_context_parallel(module, "transformer", context, {"cp_size": 2})
 
-    create_mesh.assert_called_once_with(manager.device_mesh, ring_degree=1, ulysses_degree=2)
+    create_mesh.assert_called_once_with(context.mesh.device_mesh, ring_degree=1, ulysses_degree=2)
     module.enable_parallelism.assert_called_once()
     config = module.enable_parallelism.call_args.kwargs["config"]
     assert config.ring_degree == 1
@@ -1215,13 +1238,13 @@ def test_enable_context_parallel_derives_mesh_and_enables(monkeypatch):
     assert config.mesh is cp_mesh
 
 
-def test_enable_context_parallel_rejects_ddp_manager():
+def test_enable_context_parallel_rejects_ddp_context():
     from nemo_automodel._diffusers.auto_diffusion_pipeline import _enable_context_parallel
-    from nemo_automodel.components.distributed.ddp import DDPManager
+    from nemo_automodel.components.distributed import ParallelizeContext
 
-    manager = Mock(spec=DDPManager)
-    with pytest.raises(ValueError, match="requires the fsdp2 manager"):
-        _enable_context_parallel(_cp_module(), "transformer", manager, {"cp_size": 2})
+    context = ParallelizeContext(mesh=SimpleNamespace(device_mesh=None), strategy=DDPConfig())
+    with pytest.raises(ValueError, match="requires FSDP2"):
+        _enable_context_parallel(_cp_module(), "transformer", context, {"cp_size": 2})
 
 
 def test_enable_context_parallel_rejects_ring_degree():
@@ -1231,7 +1254,7 @@ def test_enable_context_parallel_rejects_ring_degree():
         _enable_context_parallel(
             _cp_module(),
             "transformer",
-            _fsdp2_manager_mock(),
+            _fsdp2_context(),
             {"cp_size": 2, "cp_ring_degree": 2, "cp_ulysses_degree": 1},
         )
 
@@ -1243,7 +1266,7 @@ def test_enable_context_parallel_rejects_mismatched_split():
         _enable_context_parallel(
             _cp_module(),
             "transformer",
-            _fsdp2_manager_mock(),
+            _fsdp2_context(),
             {"cp_size": 2, "cp_ulysses_degree": 4},
         )
 
@@ -1254,7 +1277,7 @@ def test_enable_context_parallel_requires_cp_plan():
     module = Mock(spec=["enable_parallelism", "_cp_plan"])
     module._cp_plan = None
     with pytest.raises(ValueError, match="_cp_plan"):
-        _enable_context_parallel(module, "transformer", _fsdp2_manager_mock(), {"cp_size": 2})
+        _enable_context_parallel(module, "transformer", _fsdp2_context(), {"cp_size": 2})
 
 
 def test_apply_parallelization_enables_cp_before_parallelize(monkeypatch):
@@ -1264,9 +1287,10 @@ def test_apply_parallelization_enables_cp_before_parallelize(monkeypatch):
     module = torch.nn.Linear(2, 2)
     pipe = SimpleNamespace(components={"transformer": module})
 
-    manager = Mock()
-    manager.parallelize = Mock(side_effect=lambda m: call_order.append("parallelize") or m)
-    monkeypatch.setattr(adp, "_create_parallel_manager", Mock(return_value=manager))
+    context = _fsdp2_context()
+    monkeypatch.setattr(adp, "_create_parallelize_context", Mock(return_value=context))
+    monkeypatch.setattr(adp, "parallelize_model", Mock(side_effect=lambda m, c: call_order.append("parallelize") or m))
+    monkeypatch.setattr(adp, "compile_parallelized_model", Mock())
     monkeypatch.setattr(adp, "attach_parallelizer", Mock())
     monkeypatch.setattr(
         adp, "_enable_context_parallel", Mock(side_effect=lambda *a, **k: call_order.append("enable_cp"))
@@ -1284,9 +1308,10 @@ def test_apply_parallelization_skips_cp_when_disabled(monkeypatch):
     module = torch.nn.Linear(2, 2)
     pipe = SimpleNamespace(components={"transformer": module})
 
-    manager = Mock()
-    manager.parallelize = Mock(side_effect=lambda m: m)
-    monkeypatch.setattr(adp, "_create_parallel_manager", Mock(return_value=manager))
+    context = _fsdp2_context()
+    monkeypatch.setattr(adp, "_create_parallelize_context", Mock(return_value=context))
+    monkeypatch.setattr(adp, "parallelize_model", Mock(side_effect=lambda m, c: m))
+    monkeypatch.setattr(adp, "compile_parallelized_model", Mock())
     monkeypatch.setattr(adp, "attach_parallelizer", Mock())
     enable_cp = Mock()
     monkeypatch.setattr(adp, "_enable_context_parallel", enable_cp)

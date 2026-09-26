@@ -26,7 +26,7 @@ from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.diffusion import train as diffusion_train
 from nemo_automodel.recipes.diffusion.train import (
     TrainDiffusionRecipe,
-    _build_diffusion_parallel_manager_args,
+    _build_diffusion_parallelization_args,
     _calculate_throughput_metrics,
     _count_local_batch_group_samples,
     _get_diffusion_microbatch_size,
@@ -419,8 +419,8 @@ class _TinyTransformer(nn.Module):
         self.attention_backend = attention_backend
 
 
-def test_build_diffusion_parallel_manager_args_uses_shared_fsdp_defaults():
-    manager_args = _build_diffusion_parallel_manager_args(
+def test_build_diffusion_parallelization_args_uses_shared_fsdp_defaults():
+    parallelization_args = _build_diffusion_parallelization_args(
         fsdp_cfg=None,
         ddp_cfg=None,
         world_size=8,
@@ -428,24 +428,24 @@ def test_build_diffusion_parallel_manager_args_uses_shared_fsdp_defaults():
         lora_enabled=False,
     )
 
-    assert manager_args["_manager_type"] == "fsdp2"
-    assert manager_args["world_size"] == 8
-    assert manager_args["dp_size"] is None
-    assert manager_args["tp_size"] == 1
-    assert manager_args["pp_size"] == 1
-    assert manager_args["cp_size"] == 1
-    assert manager_args["ep_size"] == 1
-    assert manager_args["activation_checkpointing"] is True
-    assert manager_args["defer_fsdp_grad_sync"] is True
-    assert manager_args["enable_fsdp2_prefetch"] is True
-    assert manager_args["use_hf_tp_plan"] is False
-    assert manager_args["mp_policy"].param_dtype == torch.float16
-    assert manager_args["mp_policy"].reduce_dtype == torch.float32
-    assert manager_args["mp_policy"].output_dtype == torch.float16
+    assert parallelization_args["_manager_type"] == "fsdp2"
+    assert parallelization_args["world_size"] == 8
+    assert parallelization_args["dp_size"] is None
+    assert parallelization_args["tp_size"] == 1
+    assert parallelization_args["pp_size"] == 1
+    assert parallelization_args["cp_size"] == 1
+    assert parallelization_args["ep_size"] == 1
+    assert parallelization_args["activation_checkpointing"] is True
+    assert parallelization_args["defer_fsdp_grad_sync"] is True
+    assert parallelization_args["enable_fsdp2_prefetch"] is True
+    assert parallelization_args["use_hf_tp_plan"] is False
+    assert parallelization_args["mp_policy"].param_dtype == torch.float16
+    assert parallelization_args["mp_policy"].reduce_dtype == torch.float32
+    assert parallelization_args["mp_policy"].output_dtype == torch.float16
 
 
-def test_build_diffusion_parallel_manager_args_keeps_lora_param_dtype_uncast():
-    manager_args = _build_diffusion_parallel_manager_args(
+def test_build_diffusion_parallelization_args_keeps_lora_param_dtype_uncast():
+    parallelization_args = _build_diffusion_parallelization_args(
         fsdp_cfg={},
         ddp_cfg=None,
         world_size=1,
@@ -453,12 +453,12 @@ def test_build_diffusion_parallel_manager_args_keeps_lora_param_dtype_uncast():
         lora_enabled=True,
     )
 
-    assert manager_args["mp_policy"].param_dtype is None
-    assert manager_args["mp_policy"].output_dtype == torch.bfloat16
+    assert parallelization_args["mp_policy"].param_dtype is None
+    assert parallelization_args["mp_policy"].output_dtype == torch.bfloat16
 
 
-def test_build_diffusion_parallel_manager_args_parses_ddp_config():
-    manager_args = _build_diffusion_parallel_manager_args(
+def test_build_diffusion_parallelization_args_parses_ddp_config():
+    parallelization_args = _build_diffusion_parallelization_args(
         fsdp_cfg=None,
         ddp_cfg={"activation_checkpointing": True},
         world_size=4,
@@ -466,7 +466,7 @@ def test_build_diffusion_parallel_manager_args_parses_ddp_config():
         lora_enabled=False,
     )
 
-    assert manager_args == {
+    assert parallelization_args == {
         "_manager_type": "ddp",
         "world_size": 4,
         "activation_checkpointing": True,
@@ -480,8 +480,8 @@ def test_build_diffusion_parallel_manager_args_parses_ddp_config():
     }
 
 
-def test_build_diffusion_parallel_manager_args_accepts_confignode_fsdp_config():
-    manager_args = _build_diffusion_parallel_manager_args(
+def test_build_diffusion_parallelization_args_accepts_confignode_fsdp_config():
+    parallelization_args = _build_diffusion_parallelization_args(
         fsdp_cfg=ConfigNode({"dp_size": 8, "cpu_offload": False}),
         ddp_cfg=None,
         world_size=8,
@@ -489,12 +489,12 @@ def test_build_diffusion_parallel_manager_args_accepts_confignode_fsdp_config():
         lora_enabled=False,
     )
 
-    assert manager_args["_manager_type"] == "fsdp2"
-    assert manager_args["dp_size"] == 8
+    assert parallelization_args["_manager_type"] == "fsdp2"
+    assert parallelization_args["dp_size"] == 8
 
 
-def test_build_diffusion_parallel_manager_args_accepts_confignode_ddp_config():
-    manager_args = _build_diffusion_parallel_manager_args(
+def test_build_diffusion_parallelization_args_accepts_confignode_ddp_config():
+    parallelization_args = _build_diffusion_parallelization_args(
         fsdp_cfg=None,
         ddp_cfg=ConfigNode({"backend": "nccl", "activation_checkpointing": False}),
         world_size=4,
@@ -502,7 +502,7 @@ def test_build_diffusion_parallel_manager_args_accepts_confignode_ddp_config():
         lora_enabled=False,
     )
 
-    assert manager_args == {
+    assert parallelization_args == {
         "_manager_type": "ddp",
         "world_size": 4,
         "activation_checkpointing": False,
@@ -518,13 +518,13 @@ def test_build_diffusion_parallel_manager_args_accepts_confignode_ddp_config():
 
 def test_build_diffusion_pipeline_forwards_perf_options(monkeypatch):
     pipe = SimpleNamespace(transformer=_TinyTransformer())
-    manager = SimpleNamespace(device_mesh="mesh")
+    context = SimpleNamespace(mesh=SimpleNamespace(device_mesh="mesh"))
     calls = {}
 
     def fake_from_pretrained(model_id, **kwargs):
         calls["model_id"] = model_id
         calls.update(kwargs)
-        return pipe, {"transformer": manager}
+        return pipe, {"transformer": context}
 
     monkeypatch.setattr(
         diffusion_train.NeMoAutoDiffusionPipeline,
@@ -558,17 +558,17 @@ def test_build_diffusion_pipeline_forwards_perf_options(monkeypatch):
         compact_fused_qkv_projections=True,
     )
 
-    manager_args = calls["parallel_scheme"]["transformer"]
-    assert manager_args["sequence_parallel"] is True
-    assert manager_args["tp_plan"] == {"layers.0": "colwise"}
-    assert manager_args["patch_is_packed_sequence"] is True
-    assert manager_args["defer_fsdp_grad_sync"] is False
-    assert manager_args["enable_async_tensor_parallel"] is True
-    assert manager_args["enable_compile"] is True
-    assert manager_args["enable_fsdp2_prefetch"] is False
-    assert manager_args["fsdp2_backward_prefetch_depth"] == 4
-    assert manager_args["fsdp2_forward_prefetch_depth"] == 3
-    assert manager_args["mp_policy"].reduce_dtype is torch.bfloat16
+    parallelization_args = calls["parallel_scheme"]["transformer"]
+    assert parallelization_args["sequence_parallel"] is True
+    assert parallelization_args["tp_plan"] == {"layers.0": "colwise"}
+    assert parallelization_args["patch_is_packed_sequence"] is True
+    assert parallelization_args["defer_fsdp_grad_sync"] is False
+    assert parallelization_args["enable_async_tensor_parallel"] is True
+    assert parallelization_args["enable_compile"] is True
+    assert parallelization_args["enable_fsdp2_prefetch"] is False
+    assert parallelization_args["fsdp2_backward_prefetch_depth"] == 4
+    assert parallelization_args["fsdp2_forward_prefetch_depth"] == 3
+    assert parallelization_args["mp_policy"].reduce_dtype is torch.bfloat16
     assert calls["transformer_engine_linear"] is True
     assert calls["transformer_engine_fp8_safe_only"] is True
     assert calls["fuse_qkv_projections"] is True
@@ -582,12 +582,12 @@ def test_build_diffusion_pipeline_forwards_perf_options(monkeypatch):
 
 def test_build_diffusion_pipeline_raises_when_lora_params_missing(monkeypatch):
     pipe = SimpleNamespace(transformer=_TinyTransformer())
-    manager = SimpleNamespace(device_mesh=None)
+    context = SimpleNamespace(mesh=SimpleNamespace(device_mesh=None))
 
     monkeypatch.setattr(
         diffusion_train.NeMoAutoDiffusionPipeline,
         "from_pretrained",
-        staticmethod(lambda *_args, **_kwargs: (pipe, {"transformer": manager})),
+        staticmethod(lambda *_args, **_kwargs: (pipe, {"transformer": context})),
     )
     monkeypatch.setattr(diffusion_train.torch.cuda, "is_available", lambda: False)
 

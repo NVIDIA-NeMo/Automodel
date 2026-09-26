@@ -14,7 +14,7 @@
 
 """Infrastructure instantiation and application.
 
-Distributed manager instantiation, sharding, PEFT/quantization application,
+Model-parallelization setup, sharding, PEFT/quantization application,
 and checkpoint loading utilities.  These free functions operate on an
 already-instantiated ``nn.Module`` and have no coupling to the
 ``_BaseNeMoAutoModelClass`` hierarchy.
@@ -51,15 +51,17 @@ from nemo_automodel.components.distributed.config import (
     MegatronFSDPConfig,
     MoEParallelizerConfig,
 )
-from nemo_automodel.components.distributed.ddp import DDPManager
-from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
 from nemo_automodel.components.distributed.init_utils import get_world_size_safe
 from nemo_automodel.components.distributed.megatron_fsdp import (
-    MegatronFSDPManager,
     restore_distributed_param_attrs,
     snapshot_distributed_param_attrs,
 )
 from nemo_automodel.components.distributed.mesh import MeshContext
+from nemo_automodel.components.distributed.model_parallelizer import (
+    ParallelizeContext,
+    compile_parallelized_model,
+    parallelize_model,
+)
 from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPipeline
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
 from nemo_automodel.components.distributed.tp_replicas import broadcast_tp_replicas
@@ -219,6 +221,8 @@ def _shard_ep_fsdp(model, model_wrapper, parallelize_fn, mesh: MeshContext, reap
             reapply_trainability=reapply_trainability,
             **mesh.parallelize_axis_kwargs(),
         )
+    elif isinstance(model_wrapper, ParallelizeContext):
+        model = parallelize_model(model, replace(model_wrapper, reapply_trainability=reapply_trainability))
     elif callable(getattr(model_wrapper, "parallelize", None)):
         model = model_wrapper.parallelize(model, reapply_trainability=reapply_trainability)
         model = (
@@ -228,43 +232,42 @@ def _shard_ep_fsdp(model, model_wrapper, parallelize_fn, mesh: MeshContext, reap
 
 
 #  Infrastructure instantiation (config -> runtime objects)
-def _instantiate_distributed(
+def _create_parallelize_context(
     config: DistributedStrategyConfig | None,
     mesh: MeshContext,
     moe_config: MoEParallelizerConfig | None = None,
-) -> Union[FSDP2Manager, MegatronFSDPManager, DDPManager, None]:
-    """Instantiate the appropriate distributed manager from config.
+) -> ParallelizeContext | None:
+    """Create the model-owned parallelization context from typed configuration.
 
     Args:
         config: Distributed config (FSDP2Config, MegatronFSDPConfig, or DDPConfig).
         mesh: MeshContext holding device_mesh and moe_mesh references.
 
     Returns:
-        The instantiated manager, or None if config is None.
+        The parallelization context, or None when no strategy or expert
+        parallelism is configured.
 
     Raises:
         ValueError: If device_mesh is required but not provided.
     """
-    if config is None:
+    if config is None and mesh.ep_size <= 1:
         return None
 
     if isinstance(config, FSDP2Config):
         if mesh.device_mesh is None:
             raise ValueError("device_mesh is required for FSDP2Config")
-        return FSDP2Manager(
-            config,
-            device_mesh=mesh.device_mesh,
-            moe_mesh=mesh.moe_mesh,
-            moe_config=moe_config,
-        )
     elif isinstance(config, MegatronFSDPConfig):
         if mesh.device_mesh is None:
             raise ValueError("device_mesh is required for MegatronFSDPConfig")
-        return MegatronFSDPManager(config, device_mesh=mesh.device_mesh)
-    elif isinstance(config, DDPConfig):
-        return DDPManager(config)
-    else:
+    elif config is not None and not isinstance(config, DDPConfig):
         raise ValueError(f"Unknown distributed config type: {type(config)}")
+
+    return ParallelizeContext(
+        mesh=mesh,
+        strategy=config,
+        moe=moe_config,
+        activation_checkpointing=getattr(config, "activation_checkpointing", False),
+    )
 
 
 def _with_activation_checkpointing(
@@ -330,18 +333,17 @@ def _instantiate_qat(
 def parallelize_for_pp(
     model: torch.nn.Module,
     *,
-    model_wrapper: Union[FSDP2Manager, MegatronFSDPManager, DDPManager] | None = None,
+    context: ParallelizeContext | None = None,
     reapply_trainability: Callable[[torch.nn.Module], None] | None = None,
     **kwargs,
 ) -> torch.nn.Module:
-    """Adapt pipeline/EP call sites to the distributed manager contract.
+    """Adapt pipeline/EP call sites to the model parallelizer contract.
 
-    This function adapts the pipeline parallelism interface to use model_wrapper.parallelize().
-    FSDP2 then performs dense or MoE dispatch from one typed context.
+    FSDP2 performs dense or MoE dispatch from one typed context.
 
     Args:
         model: The model to parallelize.
-        model_wrapper: Distributed manager instance.
+        context: Runtime topology and distributed strategy.
         reapply_trainability: Callback that re-resolves the trainability policy
             after pipeline-stage surgery and immediately before wrapping.
         **kwargs: Additional arguments (world_mesh, moe_mesh, axis names) passed by
@@ -350,10 +352,9 @@ def parallelize_for_pp(
     Returns:
         The parallelized model.
     """
-    if model_wrapper is not None:
-        if callable(getattr(model_wrapper, "parallelize", None)):
-            model = model_wrapper.parallelize(model, reapply_trainability=reapply_trainability)
-    return model
+    if context is None:
+        return model
+    return parallelize_model(model, replace(context, reapply_trainability=reapply_trainability))
 
 
 def instantiate_infrastructure(
@@ -384,11 +385,11 @@ def instantiate_infrastructure(
         mesh: MeshContext holding device meshes, sizes, and axis names.
 
     Returns:
-        tuple: (model_wrapper, autopipeline, parallelize_fn, qat_quantizer)
-            - model_wrapper: Distributed manager instance (or None)
+        tuple: (parallelize_context, autopipeline, parallelize_fn, qat_quantizer)
+            - parallelize_context: Model parallelization context (or None)
             - autopipeline: AutoPipeline instance (or None)
             - parallelize_fn: Parallelization function (or None), built for EP
-                or PP through the distributed manager when available.
+                or PP through the model parallelizer when available.
             - qat_quantizer: QAT quantizer instance (or None)
     """
     if mesh is None:
@@ -401,32 +402,16 @@ def instantiate_infrastructure(
     if mesh.ep_size > 1 and moe_parallel_config is None:
         moe_parallel_config = MoEParallelizerConfig()
 
-    model_wrapper = _instantiate_distributed(distributed_config, mesh, moe_parallel_config)
+    parallelize_context = _create_parallelize_context(distributed_config, mesh, moe_parallel_config)
     autopipeline = _instantiate_pipeline(pipeline_config, mesh, device, distributed_config)
 
     parallelize_fn = None
-    if mesh.ep_size > 1:
-        if isinstance(model_wrapper, FSDP2Manager):
-            parallelize_fn = partial(parallelize_for_pp, model_wrapper=model_wrapper)
-        else:
-            from nemo_automodel.components.moe.parallelizer import parallelize_model as parallelize_moe_model
-
-            parallelize_fn = partial(
-                parallelize_moe_model,
-                activation_checkpointing=activation_checkpointing,
-                activation_checkpointing_scope=getattr(
-                    distributed_config,
-                    "activation_checkpointing_scope",
-                    "all",
-                ),
-                **moe_parallel_config.to_dict(),
-            )
-    elif autopipeline is not None and model_wrapper is not None:
-        parallelize_fn = partial(parallelize_for_pp, model_wrapper=model_wrapper)
+    if parallelize_context is not None and (mesh.ep_size > 1 or autopipeline is not None):
+        parallelize_fn = partial(parallelize_for_pp, context=parallelize_context)
 
     qat_quantizer = _instantiate_qat(qat_config)
 
-    return model_wrapper, autopipeline, parallelize_fn, qat_quantizer
+    return parallelize_context, autopipeline, parallelize_fn, qat_quantizer
 
 
 def _uses_te_attention(model) -> bool:
@@ -491,6 +476,13 @@ def _apply_trainability_policy(
     freeze_minimax_m3_indexer_params(model)
 
 
+def _get_strategy_config(model_wrapper) -> DistributedStrategyConfig | None:
+    """Return the typed strategy from a context or legacy compatibility wrapper."""
+    if isinstance(model_wrapper, ParallelizeContext):
+        return model_wrapper.strategy
+    return getattr(model_wrapper, "config", None)
+
+
 #  apply_model_infrastructure  --  the main post-init orchestration function
 def apply_model_infrastructure(
     model,
@@ -529,7 +521,7 @@ def apply_model_infrastructure(
         model: The model to apply infrastructure to
         is_meta_device: Whether model was initialized on meta device
         device: Target device for model
-        model_wrapper: Model wrapper (FSDP2Manager, DDPManager, etc.). Default: None
+        model_wrapper: ParallelizeContext or deprecated manager compatibility wrapper. Default: None
         mesh: MeshContext with parallelism sizes (tp_size, cp_size, etc.) and mesh
             references. Default: None (treated as single-GPU defaults).
         peft_config: PEFT/LoRA configuration dict. Default: None
@@ -557,6 +549,7 @@ def apply_model_infrastructure(
     """
     if mesh is None:
         mesh = MeshContext()
+    strategy_config = _get_strategy_config(model_wrapper)
 
     # Create a checkpointer for loading base weights only. Keep consolidation disabled
     # so load-only infrastructure does not emit save/export warnings.
@@ -574,7 +567,9 @@ def apply_model_infrastructure(
         0,
         0,
         0,
-        getattr(model_wrapper, "moe_mesh", None),
+        model_wrapper.mesh.moe_mesh
+        if isinstance(model_wrapper, ParallelizeContext)
+        else getattr(model_wrapper, "moe_mesh", None),
         process_group=getattr(mesh, "process_group", None),
     )
 
@@ -685,13 +680,17 @@ def apply_model_infrastructure(
         # objects and drop that state; snapshot it now and re-apply it afterwards.
         mfsdp_param_attrs = snapshot_distributed_param_attrs(model)
         _ensure_tied_lm_heads(model)
-        if compile_config is not None and not isinstance(model_wrapper, FSDP2Manager):
+        if compile_config is not None and not isinstance(strategy_config, FSDP2Config):
             model = compile_model(model, compile_config)
-        if isinstance(model_wrapper, FSDP2Manager):
+        if isinstance(strategy_config, FSDP2Config) and isinstance(model_wrapper, ParallelizeContext):
+            model_parts = model.parts if hasattr(model, "parts") else [model]
+            for mp in model_parts:
+                compile_parallelized_model(mp, model_wrapper)
+        elif isinstance(strategy_config, FSDP2Config) and hasattr(model_wrapper, "maybe_compile"):
             model_parts = model.parts if hasattr(model, "parts") else [model]
             for mp in model_parts:
                 model_wrapper.maybe_compile(mp)
-        if isinstance(model_wrapper, DDPManager):
+        if isinstance(strategy_config, DDPConfig):
             ddp_model = getattr(model, "module", model)
             setattr(ddp_model, "_pre_shard_hf_state_dict_keys", pre_shard_hf_state_dict_keys)
         else:
@@ -714,13 +713,13 @@ def apply_model_infrastructure(
             [
                 get_world_size_safe() == 1,
                 parallelize_fn is not None and get_world_size_safe() > 1,
-                callable(getattr(model_wrapper, "parallelize", None)),
+                isinstance(model_wrapper, ParallelizeContext) or callable(getattr(model_wrapper, "parallelize", None)),
             ]
         )
     )
     # When FSDP2 CPU offload is enabled, params must be materialized on CPU —
     # FSDP2 manages GPU placement itself during forward/backward.
-    _has_cpu_offload = model_wrapper is not None and getattr(model_wrapper, "offload_policy", None) is not None
+    _has_cpu_offload = isinstance(strategy_config, FSDP2Config) and strategy_config.offload_policy is not None
     if need_materialize:
         init_device = torch.device("cpu") if _has_cpu_offload else device
         model_parts = model.parts if hasattr(model, "parts") else [model]
@@ -759,7 +758,7 @@ def apply_model_infrastructure(
     trainability_models: list[torch.nn.Module]
     if hasattr(model, "parts"):
         trainability_models = list(model.parts)
-    elif isinstance(model_wrapper, (DDPManager, MegatronFSDPManager)):
+    elif isinstance(strategy_config, (DDPConfig, MegatronFSDPConfig)):
         trainability_models = [getattr(model, "module", model)]
     else:
         trainability_models = [model]
@@ -835,7 +834,7 @@ def apply_model_infrastructure(
                     "DotProductAttention modules were found on the model."
                 )
         if mesh.cp_size > 1 and (not uses_te_attention or uses_thd_only_te_attention):
-            is_compile_enabled = isinstance(model_wrapper, FSDP2Manager) and model_wrapper.enable_compile
+            is_compile_enabled = isinstance(strategy_config, FSDP2Config) and strategy_config.enable_compile
             cp_mesh = mesh.device_mesh["cp"] if is_compile_enabled else None
             for mp in model_parts:
                 attach_context_parallel_hooks(mp)
@@ -852,7 +851,10 @@ def apply_model_infrastructure(
     # parameters keep their storage dtype (compute dtype is owned by autocast or the
     # distributed mixed-precision policy). No-op for pure-fp32 / pure-bf16 runs and when
     # no mp_policy is available (DDP/PP).
-    compute_dtype = getattr(getattr(model_wrapper, "mp_policy", None), "param_dtype", None)
+    mp_policy = getattr(strategy_config, "mp_policy", None)
+    if mp_policy is None:
+        mp_policy = getattr(model_wrapper, "mp_policy", None)
+    compute_dtype = getattr(mp_policy, "param_dtype", None)
     if compute_dtype is not None:
         for mp in model.parts if hasattr(model, "parts") else [model]:
             cast_frozen_modules_to_compute_dtype(mp, compute_dtype)

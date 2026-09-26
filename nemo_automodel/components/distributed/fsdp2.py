@@ -12,34 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import logging
 import warnings
 from collections.abc import Callable
 
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 
-from nemo_automodel.components.distributed.activation_checkpointing import (
-    apply_submodule_checkpointing,
-    detect_kv_sharing_and_maybe_disable_cache,
-    is_selective_activation_checkpointing,
-)
 from nemo_automodel.components.distributed.config import FSDP2Config, MoEParallelizerConfig
 from nemo_automodel.components.distributed.init_utils import get_world_size_safe
 from nemo_automodel.components.distributed.mesh import MeshContext
-from nemo_automodel.components.distributed.model_parallelizer import ParallelizeContext, parallelize_model
-from nemo_automodel.components.distributed.parallelizer import (
-    _extract_model_layer_groups,
-    _filter_layer_groups_for_activation_checkpointing,
-    _should_use_hf_native_gradient_checkpointing,
-    apply_selective_activation_checkpointing,
+from nemo_automodel.components.distributed.model_parallelizer import (
+    ParallelizeContext,
+    compile_parallelized_model,
+    parallelize_model,
 )
-
-logger = logging.getLogger(__name__)
 
 
 def fsdp2_sharding_enabled(device_mesh: DeviceMesh) -> bool:
-    """Report whether :meth:`FSDP2Manager.parallelize` shards the model for this mesh.
+    """Report whether :class:`ModelParallelizer` shards the model for this mesh.
 
     Parallelization is skipped on a single-rank world or a single-element mesh, which
     also skips every side effect of ``fully_shard`` — most importantly the
@@ -47,7 +37,7 @@ def fsdp2_sharding_enabled(device_mesh: DeviceMesh) -> bool:
     depend on that cast must check this instead of assuming FSDP2 is active.
 
     Args:
-        device_mesh: Device mesh the ``FSDP2Manager`` was constructed with.
+        device_mesh: Device mesh from the model's parallelization context.
 
     Returns:
         True when ``fully_shard`` is applied, False when parallelization is skipped.
@@ -89,10 +79,10 @@ def _patch_is_packed_sequence_for_training() -> None:
 class FSDP2Manager:
     """Deprecated compatibility wrapper for FSDP2 parallelization.
 
-    .. deprecated:: 0.6
+    .. deprecated:: 0.7
         Pass :class:`FSDP2Config` through the config-driven infrastructure and
         provide model-specific behavior with :class:`ModelParallelizer`. This
-        compatibility class is scheduled for removal in 0.7.
+        compatibility class is scheduled for removal in 0.8.
 
     This manager applies parallelization to the model using a prescribed
     TP sharding plan. It supports mixed precision and CPU offloading options.
@@ -116,7 +106,7 @@ class FSDP2Manager:
         moe_config: MoEParallelizerConfig | None = None,
     ):
         warnings.warn(
-            "FSDP2Manager is deprecated and will be removed in 0.7; pass FSDP2Config through the "
+            "FSDP2Manager is deprecated and will be removed in 0.8; pass FSDP2Config through the "
             "config-driven infrastructure and use ModelParallelizer for model-owned behavior.",
             DeprecationWarning,
             stacklevel=2,
@@ -126,21 +116,10 @@ class FSDP2Manager:
         self.moe_mesh = moe_mesh
         self.moe_config = moe_config
 
-        # Extract config fields for easy access
-        self.sequence_parallel = config.sequence_parallel
-        self.tp_plan = config.tp_plan
-        self.mp_policy = config.mp_policy
-        self.offload_policy = config.offload_policy
-        self.activation_checkpointing = config.activation_checkpointing
-        self.activation_checkpointing_scope = config.activation_checkpointing_scope
-        self.defer_fsdp_grad_sync = config.defer_fsdp_grad_sync
-        self.reshard_after_forward = config.reshard_after_forward
-        self.enable_async_tensor_parallel = config.enable_async_tensor_parallel
-        self.enable_compile = config.enable_compile
-        self.enable_fsdp2_prefetch = config.enable_fsdp2_prefetch
-        self.fsdp2_backward_prefetch_depth = config.fsdp2_backward_prefetch_depth
-        self.fsdp2_forward_prefetch_depth = config.fsdp2_forward_prefetch_depth
-        self.frozen_multimodal_sharding = config.multimodal.frozen_sharding
+    def __getattr__(self, name):
+        if name == "frozen_multimodal_sharding":
+            return self.config.multimodal.frozen_sharding
+        return getattr(self.config, name)
 
     def parallelize(
         self,
@@ -158,40 +137,6 @@ class FSDP2Manager:
         Returns:
             The parallelized model.
         """
-        if not fsdp2_sharding_enabled(self.device_mesh):
-            logger.info("World size or FSDP mesh size is 1, skipping parallelization.")
-            if self.activation_checkpointing:
-                if is_selective_activation_checkpointing(self.activation_checkpointing):
-                    # Selective AC works on a plain model (no FSDP required), so
-                    # honor it on a single GPU instead of silently falling back
-                    # to full HF gradient checkpointing.
-                    apply_selective_activation_checkpointing(
-                        model,
-                        enable_compile=self.enable_compile,
-                        activation_checkpointing_scope=self.activation_checkpointing_scope,
-                    )
-                else:
-                    layer_groups = _extract_model_layer_groups(model)
-                    layers, ac_scopes = _filter_layer_groups_for_activation_checkpointing(
-                        layer_groups,
-                        self.activation_checkpointing_scope,
-                    )
-                    if _should_use_hf_native_gradient_checkpointing(
-                        model,
-                        layer_groups,
-                        ac_scopes,
-                        enable_compile=self.enable_compile,
-                    ):
-                        model.gradient_checkpointing_enable()
-                    else:
-                        apply_submodule_checkpointing(layers, detect_kv_sharing_and_maybe_disable_cache(model))
-            if reapply_trainability is not None:
-                reapply_trainability(model)
-            return model
-
-        if self.config.patch_is_packed_sequence:
-            _patch_is_packed_sequence_for_training()
-
         context = ParallelizeContext(
             mesh=MeshContext.from_meshes(self.device_mesh, self.moe_mesh),
             strategy=self.config,
@@ -208,7 +153,10 @@ class FSDP2Manager:
 
     def maybe_compile(self, model):
         """Apply per-layer compile after sharding, alongside whole-model compile_model()."""
-        if self.enable_compile or (self.enable_async_tensor_parallel and self.device_mesh["tp"].size() > 1):
-            from nemo_automodel.components.distributed.parallelizer import _apply_per_layer_compile
-
-            _apply_per_layer_compile(model)
+        context = ParallelizeContext(
+            mesh=MeshContext.from_meshes(self.device_mesh, self.moe_mesh),
+            strategy=self.config,
+            moe=self.moe_config,
+            activation_checkpointing=self.activation_checkpointing,
+        )
+        compile_parallelized_model(model, context)

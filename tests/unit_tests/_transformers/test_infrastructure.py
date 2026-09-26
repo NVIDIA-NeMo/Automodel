@@ -110,60 +110,60 @@ class TestShouldLoadBeforeShard:
         assert _should_load_before_shard(**{**self._DEFAULTS, "ep_size": 1}) is True
 
 
-def test_moe_infrastructure_routes_fsdp2_through_manager_contract():
-    """EP and FSDP2 share the manager's model-parallelization contract."""
+def test_moe_infrastructure_routes_fsdp2_through_model_parallelizer_contract():
+    """EP and FSDP2 share the model-owned parallelization contract."""
     from nemo_automodel._transformers.infrastructure import instantiate_infrastructure, parallelize_for_pp
-    from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
+    from nemo_automodel.components.distributed import FSDP2Config, ParallelizeContext
 
-    manager = object.__new__(FSDP2Manager)
+    context = ParallelizeContext(mesh=SimpleNamespace(ep_size=2), strategy=FSDP2Config())
     mesh = SimpleNamespace(ep_size=2)
 
     with (
-        patch(f"{_INFRA_MODULE}._instantiate_distributed", return_value=manager),
+        patch(f"{_INFRA_MODULE}._create_parallelize_context", return_value=context),
         patch(f"{_INFRA_MODULE}._instantiate_pipeline", return_value=None),
         patch(f"{_INFRA_MODULE}._instantiate_qat", return_value=None),
     ):
-        model_wrapper, _, parallelize_fn, _ = instantiate_infrastructure(
+        returned_context, _, parallelize_fn, _ = instantiate_infrastructure(
             distributed_config=SimpleNamespace(activation_checkpointing=False),
             mesh=mesh,
         )
 
-    assert model_wrapper is manager
+    assert returned_context is context
     assert parallelize_fn.func is parallelize_for_pp
-    assert parallelize_fn.keywords == {"model_wrapper": manager}
+    assert parallelize_fn.keywords == {"context": context}
 
 
-def test_instantiate_distributed_forwards_moe_policy_to_fsdp2_manager():
-    """The manager receives the MoE policy used to build ParallelizeContext."""
-    from nemo_automodel._transformers.infrastructure import _instantiate_distributed
+def test_create_parallelize_context_includes_moe_policy():
+    """The model parallelizer context carries the resolved MoE policy."""
+    from nemo_automodel._transformers.infrastructure import _create_parallelize_context
     from nemo_automodel.components.distributed.config import FSDP2Config, MoEParallelizerConfig
 
     config = FSDP2Config()
     moe_config = MoEParallelizerConfig()
     mesh = SimpleNamespace(device_mesh=object(), moe_mesh=object())
 
-    with patch(f"{_INFRA_MODULE}.FSDP2Manager") as manager_type:
-        _instantiate_distributed(config, mesh, moe_config)
+    context = _create_parallelize_context(config, mesh, moe_config)
 
-    manager_type.assert_called_once_with(
-        config,
-        device_mesh=mesh.device_mesh,
-        moe_mesh=mesh.moe_mesh,
-        moe_config=moe_config,
-    )
+    assert context is not None
+    assert context.strategy is config
+    assert context.mesh is mesh
+    assert context.moe is moe_config
 
 
 def test_pipeline_parallelizer_forwards_trainability_rebind():
     """Each PP stage receives the same pre-wrapper trainability policy."""
-    from nemo_automodel._transformers.infrastructure import parallelize_for_pp
+    from nemo_automodel._transformers import infrastructure
+    from nemo_automodel.components.distributed import FSDP2Config, MeshContext, ParallelizeContext
 
     model = torch.nn.Linear(2, 2)
     callback = MagicMock()
-    manager = MagicMock()
-    manager.parallelize.return_value = model
+    context = ParallelizeContext(mesh=MeshContext(), strategy=FSDP2Config())
 
-    assert parallelize_for_pp(model, model_wrapper=manager, reapply_trainability=callback) is model
-    manager.parallelize.assert_called_once_with(model, reapply_trainability=callback)
+    with patch.object(infrastructure, "parallelize_model", return_value=model) as parallelize:
+        assert infrastructure.parallelize_for_pp(model, context=context, reapply_trainability=callback) is model
+
+    forwarded_context = parallelize.call_args.args[1]
+    assert forwarded_context.reapply_trainability is callback
 
 
 # =============================================================================
@@ -235,15 +235,14 @@ def _run_freeze_config_ddp(rank: int, world_size: int, init_file: str, result_di
     )
     try:
         from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
-        from nemo_automodel.components.distributed.config import DDPConfig
-        from nemo_automodel.components.distributed.ddp import DDPManager
+        from nemo_automodel.components.distributed import DDPConfig, MeshContext, ParallelizeContext
 
         model = apply_model_infrastructure(
             model=_TinyTrainabilityModel(),
             is_meta_device=False,
             device=torch.device("cpu"),
             load_base_model=False,
-            model_wrapper=DDPManager(DDPConfig()),
+            model_wrapper=ParallelizeContext(mesh=MeshContext(), strategy=DDPConfig()),
             freeze_config=_GENERIC_FREEZE_CONFIG,
         )
 
@@ -484,10 +483,10 @@ def _run_apply_model_infrastructure(*, is_meta_device, load_base_model, model_wr
 def test_apply_model_infrastructure_handles_unwrapped_single_rank_ddp_model():
     """Single-rank DDP skips wrapping, so the returned model may not have ``.module``."""
     from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
-    from nemo_automodel.components.distributed.ddp import DDPManager
+    from nemo_automodel.components.distributed import DDPConfig, MeshContext, ParallelizeContext
 
     model = _DummyModel()
-    model_wrapper = object.__new__(DDPManager)
+    model_wrapper = ParallelizeContext(mesh=MeshContext(), strategy=DDPConfig())
 
     with (
         patch(f"{_INFRA_MODULE}.get_world_size_safe", return_value=1),
@@ -566,21 +565,6 @@ class TestApplyModelInfrastructurePostShardInit:
     def test_non_meta_skips_initialize_model_weights(self):
         """Non-meta device model should not call initialize_model_weights."""
         _, mock_ckpt = _run_apply_model_infrastructure(is_meta_device=False, load_base_model=False)
-
-        mock_ckpt.initialize_model_weights.assert_not_called()
-
-    def test_megatron_fsdp_skips_post_shard_init(self):
-        """MegatronFSDPManager wrapper should skip post-shard initialize_model_weights."""
-        mock_wrapper = MagicMock(spec=["parallelize", "moe_mesh"])
-        mock_wrapper.moe_mesh = None
-        # Make isinstance check work for MegatronFSDPManager
-        from nemo_automodel.components.distributed.megatron_fsdp import MegatronFSDPManager
-
-        mock_wrapper.__class__ = MegatronFSDPManager
-
-        _, mock_ckpt = _run_apply_model_infrastructure(
-            is_meta_device=True, load_base_model=False, model_wrapper=mock_wrapper
-        )
 
         mock_ckpt.initialize_model_weights.assert_not_called()
 
@@ -1173,25 +1157,22 @@ def test_apply_model_infrastructure_configures_dense_thd_te_for_tp_without_cp():
 
 def test_instantiate_infrastructure_threads_ac_scope_into_moe_parallelize_fn():
     """Expert-parallel configs must inherit the strategy config's normalized AC scope."""
-    from nemo_automodel._transformers.infrastructure import instantiate_infrastructure
+    from nemo_automodel._transformers.infrastructure import instantiate_infrastructure, parallelize_for_pp
     from nemo_automodel.components.distributed.config import DDPConfig
-    from nemo_automodel.components.moe.parallelizer import parallelize_model
 
     distributed_config = DDPConfig(activation_checkpointing=True, activation_checkpointing_scope="vision")
     mesh = SimpleNamespace(ep_size=2, pp_size=1, device_mesh=None, moe_mesh=None)
 
-    # The manager needs an initialized process group; the scope is read from the
-    # strategy config, so the manager itself is irrelevant here.
-    with patch(f"{_INFRA_MODULE}._instantiate_distributed", return_value=None):
-        _, _, parallelize_fn, _ = instantiate_infrastructure(
-            distributed_config=distributed_config,
-            mesh=mesh,
-        )
+    context, _, parallelize_fn, _ = instantiate_infrastructure(
+        distributed_config=distributed_config,
+        mesh=mesh,
+    )
 
-    assert parallelize_fn.func is parallelize_model
-    assert parallelize_fn.keywords["activation_checkpointing"] is True
-    # DDPConfig.__post_init__ normalizes the scope; the partial must carry it through.
-    assert parallelize_fn.keywords["activation_checkpointing_scope"] == ("vision",)
+    assert context is not None
+    assert parallelize_fn.func is parallelize_for_pp
+    assert parallelize_fn.keywords["context"] is context
+    assert context.activation_checkpointing is True
+    assert context.strategy.activation_checkpointing_scope == ("vision",)
 
 
 @pytest.mark.parametrize("dp_shard_size,cp_size", [(1, 1), (1, 8), (2, 1), (2, 4)])

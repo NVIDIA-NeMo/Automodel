@@ -2649,15 +2649,20 @@ class TestSelectiveCheckpointCompile:
 
 
 class TestSingleGpuActivationCheckpointing:
-    """FSDP2Manager single-GPU (world_size==1) activation-checkpointing behavior."""
+    """ModelParallelizer single-GPU activation-checkpointing behavior."""
 
-    def _make_manager(self, monkeypatch, activation_checkpointing):
+    def _make_parallelizer_and_context(self, monkeypatch, activation_checkpointing):
         import nemo_automodel.components.distributed.fsdp2 as fsdp2_mod
-        from nemo_automodel.components.distributed.config import FSDP2Config
+        from nemo_automodel.components.distributed import FSDP2Config, ModelParallelizer, ParallelizeContext
 
         monkeypatch.setattr(fsdp2_mod, "get_world_size_safe", lambda: 1)
         config = FSDP2Config(activation_checkpointing=activation_checkpointing)
-        return fsdp2_mod.FSDP2Manager(config, device_mesh=MagicMock())
+        context = ParallelizeContext(
+            mesh=SimpleNamespace(device_mesh=MagicMock(), ep_size=1),
+            strategy=config,
+            activation_checkpointing=activation_checkpointing,
+        )
+        return ModelParallelizer(), context
 
     def test_selective_wraps_layers_on_single_gpu(self, monkeypatch):
         """Selective AC is honored on a single GPU (not silently full-checkpointed)."""
@@ -2665,9 +2670,9 @@ class TestSingleGpuActivationCheckpointing:
 
         from nemo_automodel.components.distributed.activation_checkpointing import SELECTIVE_AC_WRAPPER_FLAG
 
-        manager = self._make_manager(monkeypatch, "selective")
+        model_parallelizer, context = self._make_parallelizer_and_context(monkeypatch, "selective")
         model = _make_model_for_ac(num_kv_shared_layers=0)
-        manager.parallelize(model)
+        model_parallelizer.parallelize(model, context)
 
         for layer in model.model.layers:
             assert isinstance(layer, CheckpointWrapper)
@@ -2678,9 +2683,9 @@ class TestSingleGpuActivationCheckpointing:
         """KV-shared models fall back to sub-module checkpointing, not whole-block."""
         from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
 
-        manager = self._make_manager(monkeypatch, "selective")
+        model_parallelizer, context = self._make_parallelizer_and_context(monkeypatch, "selective")
         model = _make_model_for_ac(num_kv_shared_layers=20)
-        manager.parallelize(model)
+        model_parallelizer.parallelize(model, context)
 
         for layer in model.model.layers:
             assert not isinstance(layer, CheckpointWrapper)
@@ -2691,10 +2696,10 @@ class TestSingleGpuActivationCheckpointing:
         """Non-selective AC wraps layers on single GPU when the model is not an HF native GC candidate."""
         from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
 
-        manager = self._make_manager(monkeypatch, True)
+        model_parallelizer, context = self._make_parallelizer_and_context(monkeypatch, True)
         model = _make_model_for_ac(num_kv_shared_layers=0)
         model.gradient_checkpointing_enable = MagicMock()
-        manager.parallelize(model)
+        model_parallelizer.parallelize(model, context)
 
         model.gradient_checkpointing_enable.assert_not_called()
         for layer in model.model.layers:

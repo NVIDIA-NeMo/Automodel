@@ -98,11 +98,11 @@ def test_legacy_manager_classes_are_deprecated(monkeypatch):
 
     monkeypatch.setattr(ddp.DDPManager, "_setup_distributed", lambda self: None)
 
-    with pytest.warns(DeprecationWarning, match="DDPManager is deprecated"):
+    with pytest.warns(DeprecationWarning, match="DDPManager is deprecated and will be removed in 0.8"):
         ddp.DDPManager(DDPConfig())
-    with pytest.warns(DeprecationWarning, match="FSDP2Manager is deprecated"):
+    with pytest.warns(DeprecationWarning, match="FSDP2Manager is deprecated and will be removed in 0.8"):
         fsdp2.FSDP2Manager(FSDP2Config(), device_mesh=Mock())
-    with pytest.warns(DeprecationWarning, match="MegatronFSDPManager is deprecated"):
+    with pytest.warns(DeprecationWarning, match="MegatronFSDPManager is deprecated and will be removed in 0.8"):
         megatron_fsdp.MegatronFSDPManager(MegatronFSDPConfig(), device_mesh=Mock())
 
 
@@ -129,3 +129,20 @@ def test_specialized_sidecar_routes_ep_through_unified_moe_executor(monkeypatch)
 
     assert adapter.parallelize(model, context) is model
     call.assert_called_once_with(model, context)
+
+
+@pytest.mark.parametrize(
+    ("strategy", "executor_name"),
+    [
+        (DDPConfig(), "_parallelize_ddp"),
+        (MegatronFSDPConfig(), "_parallelize_megatron_fsdp"),
+    ],
+)
+def test_model_parallelizer_dispatches_non_fsdp2_strategies(monkeypatch, strategy, executor_name):
+    model = nn.Linear(2, 2)
+    context = ParallelizeContext(mesh=MeshContext(), strategy=strategy)
+    executor = Mock(return_value=model)
+    monkeypatch.setattr(f"nemo_automodel.components.distributed.model_parallelizer.{executor_name}", executor)
+
+    assert ModelParallelizer().parallelize(model, context) is model
+    executor.assert_called_once_with(model, context)

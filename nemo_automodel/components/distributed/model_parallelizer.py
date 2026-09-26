@@ -22,7 +22,12 @@ from typing import TYPE_CHECKING
 
 from torch import nn
 
-from nemo_automodel.components.distributed.config import FSDP2Config, MoEParallelizerConfig
+from nemo_automodel.components.distributed.config import (
+    DDPConfig,
+    FSDP2Config,
+    MegatronFSDPConfig,
+    MoEParallelizerConfig,
+)
 
 if TYPE_CHECKING:
     from nemo_automodel.components.distributed.config import ActivationCheckpointingMode, DistributedStrategyConfig
@@ -43,15 +48,7 @@ class ParallelizeContext:
 
 @dataclass(frozen=True, slots=True)
 class ModelParallelizer:
-    """Model-owned parallelization sidecar.
-
-    Models may attach an instance to their class as ``parallelizer``. Passing a
-    specialized strategy customizes dense FSDP2 execution; without one, the
-    shared dense or expert-parallel implementation is used.
-
-    Args:
-        strategy: Optional model-specific FSDP2 strategy.
-    """
+    """Model-owned sidecar with an optional dense FSDP2 strategy."""
 
     strategy: ParallelizationStrategy | None = None
 
@@ -61,10 +58,12 @@ class ModelParallelizer:
             return _parallelize_moe(model, context)
         if isinstance(context.strategy, FSDP2Config):
             return _parallelize_fsdp2(model, context, strategy=self.strategy)
-        raise TypeError(
-            "ModelParallelizer supports FSDP2 or expert-parallel execution; "
-            f"got strategy={type(context.strategy).__name__}."
-        )
+        if isinstance(context.strategy, DDPConfig):
+            return _parallelize_ddp(model, context)
+        if isinstance(context.strategy, MegatronFSDPConfig):
+            return _parallelize_megatron_fsdp(model, context)
+        name = type(context.strategy).__name__
+        raise TypeError(f"ModelParallelizer does not support strategy={name}.")
 
 
 _DEFAULT_PARALLELIZER = ModelParallelizer()
@@ -75,12 +74,9 @@ def get_model_parallelizer(model: nn.Module) -> ModelParallelizer:
     parallelizer = getattr(type(model), "parallelizer", None)
     if parallelizer is None:
         return _DEFAULT_PARALLELIZER
-    parallelize = getattr(parallelizer, "parallelize", None)
-    if not callable(parallelize):
-        raise TypeError(
-            f"{type(model).__name__}.parallelizer must implement parallelize(model, context); "
-            f"got {type(parallelizer).__name__}."
-        )
+    if not callable(getattr(parallelizer, "parallelize", None)):
+        name = type(parallelizer).__name__
+        raise TypeError(f"{type(model).__name__}.parallelizer must implement parallelize(model, context); got {name}.")
     return parallelizer
 
 
@@ -95,23 +91,28 @@ def _parallelize_fsdp2(
     *,
     strategy: ParallelizationStrategy | None = None,
 ) -> nn.Module:
-    """Apply the existing dense FSDP2 executor from a typed context."""
+    from nemo_automodel.components.distributed.fsdp2 import (
+        _patch_is_packed_sequence_for_training,
+        fsdp2_sharding_enabled,
+    )
     from nemo_automodel.components.distributed.parallelizer import DefaultParallelizationStrategy
 
     config = context.strategy
-    if not isinstance(config, FSDP2Config):
-        raise TypeError(f"FSDP2 parallelization requires FSDP2Config, got {type(config).__name__}.")
+    assert isinstance(config, FSDP2Config)
     if context.mesh.device_mesh is None:
         raise ValueError("FSDP2 parallelization requires context.mesh.device_mesh.")
+
+    if config.patch_is_packed_sequence:
+        _patch_is_packed_sequence_for_training()
+    if not fsdp2_sharding_enabled(context.mesh.device_mesh):
+        return _parallelize_unsharded_fsdp2(model, context)
 
     if strategy is None:
         strategy = DefaultParallelizationStrategy()
     parallelize = getattr(strategy, "parallelize", None)
     if not callable(parallelize):
-        raise TypeError(
-            "ModelParallelizer.strategy must implement parallelize(model, device_mesh, ...); "
-            f"got {type(strategy).__name__}."
-        )
+        name = type(strategy).__name__
+        raise TypeError(f"ModelParallelizer.strategy must implement parallelize(model, device_mesh, ...); got {name}.")
 
     return parallelize(
         model=model,
@@ -120,7 +121,7 @@ def _parallelize_fsdp2(
         tp_shard_plan=config.tp_plan,
         offload_policy=config.offload_policy,
         sequence_parallel=config.sequence_parallel,
-        activation_checkpointing=config.activation_checkpointing,
+        activation_checkpointing=context.activation_checkpointing,
         enable_async_tensor_parallel=config.enable_async_tensor_parallel,
         enable_compile=config.enable_compile,
         enable_fsdp2_prefetch=config.enable_fsdp2_prefetch,
@@ -133,8 +134,84 @@ def _parallelize_fsdp2(
     )
 
 
+def _parallelize_unsharded_fsdp2(model: nn.Module, context: ParallelizeContext) -> nn.Module:
+    from nemo_automodel.components.distributed.activation_checkpointing import (
+        apply_submodule_checkpointing,
+        detect_kv_sharing_and_maybe_disable_cache,
+        is_selective_activation_checkpointing,
+    )
+    from nemo_automodel.components.distributed.parallelizer import (
+        _extract_model_layer_groups,
+        _filter_layer_groups_for_activation_checkpointing,
+        _should_use_hf_native_gradient_checkpointing,
+        apply_selective_activation_checkpointing,
+    )
+
+    config = context.strategy
+    assert isinstance(config, FSDP2Config)
+
+    if context.activation_checkpointing:
+        if is_selective_activation_checkpointing(context.activation_checkpointing):
+            apply_selective_activation_checkpointing(
+                model,
+                enable_compile=config.enable_compile,
+                activation_checkpointing_scope=config.activation_checkpointing_scope,
+            )
+        else:
+            layer_groups = _extract_model_layer_groups(model)
+            layers, ac_scopes = _filter_layer_groups_for_activation_checkpointing(
+                layer_groups,
+                config.activation_checkpointing_scope,
+            )
+            if _should_use_hf_native_gradient_checkpointing(
+                model,
+                layer_groups,
+                ac_scopes,
+                enable_compile=config.enable_compile,
+            ):
+                model.gradient_checkpointing_enable()
+            else:
+                apply_submodule_checkpointing(layers, detect_kv_sharing_and_maybe_disable_cache(model))
+    if context.reapply_trainability is not None:
+        context.reapply_trainability(model)
+    return model
+
+
+def _parallelize_ddp(model: nn.Module, context: ParallelizeContext) -> nn.Module:
+    from nemo_automodel.components.distributed.ddp import parallelize_ddp
+
+    config = context.strategy
+    assert isinstance(config, DDPConfig)
+    return parallelize_ddp(model, config, reapply_trainability=context.reapply_trainability)
+
+
+def _parallelize_megatron_fsdp(model: nn.Module, context: ParallelizeContext) -> nn.Module:
+    from nemo_automodel.components.distributed.megatron_fsdp import parallelize_megatron_fsdp
+
+    config = context.strategy
+    assert isinstance(config, MegatronFSDPConfig)
+    if context.mesh.device_mesh is None:
+        raise ValueError("Megatron-FSDP parallelization requires context.mesh.device_mesh.")
+    return parallelize_megatron_fsdp(
+        model,
+        config,
+        context.mesh.device_mesh,
+        reapply_trainability=context.reapply_trainability,
+    )[0]
+
+
+def compile_parallelized_model(model: nn.Module, context: ParallelizeContext) -> None:
+    """Compile FSDP2 layers after parallelization when requested."""
+    config = context.strategy
+    if not isinstance(config, FSDP2Config) or context.mesh.device_mesh is None:
+        return
+    if config.enable_compile or (config.enable_async_tensor_parallel and context.mesh.device_mesh["tp"].size() > 1):
+        from nemo_automodel.components.distributed.parallelizer import _apply_per_layer_compile
+
+        _apply_per_layer_compile(model)
+
+
 def _parallelize_moe(model: nn.Module, context: ParallelizeContext) -> nn.Module:
-    """Apply the existing TP, CP, EP, activation-checkpointing, and FSDP flow."""
     from nemo_automodel.components.moe.parallelizer import parallelize_model as parallelize_moe_model
 
     mesh = context.mesh
@@ -189,6 +266,7 @@ def _parallelize_moe(model: nn.Module, context: ParallelizeContext) -> nn.Module
 __all__ = [
     "ModelParallelizer",
     "ParallelizeContext",
+    "compile_parallelized_model",
     "get_model_parallelizer",
     "parallelize_model",
 ]
