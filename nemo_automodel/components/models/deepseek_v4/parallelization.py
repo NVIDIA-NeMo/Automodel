@@ -22,16 +22,11 @@ from nemo_automodel.components.models.deepseek_v4.fsdp import fully_shard_deepse
 class DeepseekV4ParallelizationStrategy(DefaultParallelizationStrategy):
     """Keep DeepSeek-V4 reference-sensitive parameters in fp32 FSDP units."""
 
-    def parallelize(self, model, device_mesh, dp_shard_cp_mesh_name="dp_shard_cp", **kwargs):
-        return super().parallelize(
-            model,
-            device_mesh,
-            dp_shard_cp_mesh_name=dp_shard_cp_mesh_name,
-            fully_shard_fn=fully_shard_deepseek_v4,
-            **kwargs,
-        )
+    def _fully_shard_module(self, module, **kwargs):
+        return fully_shard_deepseek_v4(module, **kwargs)
 
 
-PARALLELIZER = ModelParallelizer(DeepseekV4ParallelizationStrategy())
+_STRATEGY = DeepseekV4ParallelizationStrategy()
+PARALLELIZER = ModelParallelizer(_STRATEGY, _STRATEGY)
 
 __all__ = ["PARALLELIZER"]

@@ -19,6 +19,7 @@ import logging
 import weakref
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
@@ -60,6 +61,9 @@ from nemo_automodel.components.moe.tp_plan_validation import _validate_moe_tp_pl
 from nemo_automodel.shared.model_utils import iter_transformer_and_mtp_blocks
 from nemo_automodel.shared.tied_weights import ensure_tied_lm_head
 from nemo_automodel.shared.utils import dtype_from_str
+
+if TYPE_CHECKING:
+    from nemo_automodel.components.distributed.parallelizer import ParallelizationStrategy
 
 logger = logging.getLogger(__name__)
 _CP_STREAM = None
@@ -769,6 +773,7 @@ def apply_fsdp(
     lm_head_precision: str | torch.dtype | None = None,
     wrap_outer_model: bool = True,
     frozen_multimodal_sharding: FrozenMultimodalSharding = "root",
+    parallelization_strategy: "ParallelizationStrategy | None" = None,
 ) -> None:
     """Apply FSDP wrapping to MoE transformer blocks and model-level modules."""
     frozen_multimodal_sharding = normalize_frozen_multimodal_sharding(frozen_multimodal_sharding)
@@ -794,10 +799,10 @@ def apply_fsdp(
     experts_mp_policy = parallelizer_utils.get_internal_fsdp_mp_policy(mp_policy)
     fp32_compute_module_names = tuple(getattr(model, "_keep_in_fp32_modules_strict", None) or ())
 
-    fully_shard_impl = getattr(model, "_nemo_fully_shard", fully_shard)
+    shard_module = fully_shard if parallelization_strategy is None else parallelization_strategy._fully_shard_module
 
     fully_shard_default = functools.partial(
-        fully_shard_impl,
+        shard_module,
         mesh=fsdp_mesh,
         reshard_after_forward=reshard_after_forward,
         mp_policy=mp_policy,
@@ -941,7 +946,7 @@ def apply_fsdp(
             fp32_compute_module_names=fp32_compute_module_names,
             reshard_after_forward=reshard_after_forward,
             ignored_params=ignored_params or None,
-            fully_shard_fn=fully_shard_impl,
+            parallelization_strategy=parallelization_strategy,
         )
 
     # Re-establish weight tying before detecting it: a device/dtype move during
@@ -1156,6 +1161,7 @@ def parallelize_model(
     enable_async_tensor_parallel: bool = False,
     frozen_multimodal_sharding: FrozenMultimodalSharding = "root",
     reapply_trainability: Callable[[nn.Module], None] | None = None,
+    parallelization_strategy: "ParallelizationStrategy | None" = None,
 ) -> None:
     """Apply tensor, context, expert, activation-checkpointing, and FSDP parallelism.
 
@@ -1259,6 +1265,7 @@ def parallelize_model(
             lm_head_precision=lm_head_precision,
             wrap_outer_model=wrap_outer_model,
             frozen_multimodal_sharding=frozen_multimodal_sharding,
+            parallelization_strategy=parallelization_strategy,
         )
         if cp_enabled:
             configured_units = parallelizer_utils.configure_fsdp_unused_param_reduction(model)

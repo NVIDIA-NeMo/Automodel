@@ -49,7 +49,6 @@ class Qwen3_5ParallelizationStrategy(DefaultParallelizationStrategy):
         fsdp2_backward_prefetch_depth: int = 2,
         fsdp2_forward_prefetch_depth: int = 1,
         reshard_after_forward: bool | None = None,
-        fully_shard_fn=None,
         frozen_multimodal_sharding: FrozenMultimodalSharding = "root",
         ignored_multimodal_params: set[nn.Parameter] | None = None,
     ) -> None:
@@ -70,7 +69,6 @@ class Qwen3_5ParallelizationStrategy(DefaultParallelizationStrategy):
                     mp_policy,
                     offload_policy,
                     reshard_after_forward=reshard_after_forward,
-                    fully_shard_fn=fully_shard_fn,
                     frozen_multimodal_sharding=frozen_multimodal_sharding,
                     ignored_multimodal_params=ignored_multimodal_params,
                 )
@@ -89,7 +87,7 @@ class Qwen3_5ParallelizationStrategy(DefaultParallelizationStrategy):
                     offload_policy,
                     fp32_compute_module_names=self._fp32_compute_module_names,
                     reshard_after_forward=layer_reshard_after_forward,
-                    fully_shard_fn=fully_shard_fn,
+                    parallelization_strategy=self,
                 )
             return
 
@@ -108,7 +106,6 @@ class Qwen3_5ParallelizationStrategy(DefaultParallelizationStrategy):
                 mp_policy,
                 offload_policy,
                 reshard_after_forward=reshard_after_forward,
-                fully_shard_fn=fully_shard_fn,
                 frozen_multimodal_sharding=frozen_multimodal_sharding,
                 ignored_multimodal_params=ignored_multimodal_params,
             )

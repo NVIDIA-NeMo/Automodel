@@ -18,6 +18,8 @@ from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import MixedPrecisionPolicy, OffloadPolicy, fully_shard
 
+from nemo_automodel.components.distributed import ModelParallelizer
+from nemo_automodel.components.distributed.parallelizer import DefaultParallelizationStrategy
 from nemo_automodel.components.models.deepseek_v4.fsdp import fully_shard_deepseek_v4
 from nemo_automodel.components.models.deepseek_v4.vision import DeepseekV4VisionBlock, DeepseekV4VisionTransformer
 
@@ -59,3 +61,16 @@ def fully_shard_deepseek_v41(
         reshard_after_forward=reshard_after_forward,
         ignored_params=ignored_params,
     )
+
+
+class DeepseekV41ParallelizationStrategy(DefaultParallelizationStrategy):
+    """Keep DeepSeek-V4.1 vision parameters in dtype-safe FSDP units."""
+
+    def _fully_shard_module(self, module, **kwargs):
+        return fully_shard_deepseek_v41(module, **kwargs)
+
+
+_STRATEGY = DeepseekV41ParallelizationStrategy()
+PARALLELIZER = ModelParallelizer(_STRATEGY, _STRATEGY)
+
+__all__ = ["PARALLELIZER", "fully_shard_deepseek_v41"]

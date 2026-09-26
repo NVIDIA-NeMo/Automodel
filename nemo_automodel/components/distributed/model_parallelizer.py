@@ -48,14 +48,15 @@ class ParallelizeContext:
 
 @dataclass(frozen=True, slots=True)
 class ModelParallelizer:
-    """Model-owned sidecar with an optional dense FSDP2 strategy."""
+    """Model-owned sidecar with optional dense and MoE FSDP2 strategies."""
 
     strategy: ParallelizationStrategy | None = None
+    moe_strategy: ParallelizationStrategy | None = None
 
     def parallelize(self, model: nn.Module, context: ParallelizeContext, /) -> nn.Module:
         """Apply TP, CP, EP, activation checkpointing, and data parallelism."""
         if context.mesh.ep_size > 1:
-            return _parallelize_moe(model, context)
+            return _parallelize_moe(model, context, strategy=self.moe_strategy)
         if isinstance(context.strategy, FSDP2Config):
             return _parallelize_fsdp2(model, context, strategy=self.strategy)
         if isinstance(context.strategy, DDPConfig):
@@ -211,7 +212,12 @@ def compile_parallelized_model(model: nn.Module, context: ParallelizeContext) ->
         _apply_per_layer_compile(model)
 
 
-def _parallelize_moe(model: nn.Module, context: ParallelizeContext) -> nn.Module:
+def _parallelize_moe(
+    model: nn.Module,
+    context: ParallelizeContext,
+    *,
+    strategy: ParallelizationStrategy | None = None,
+) -> nn.Module:
     from nemo_automodel.components.moe.parallelizer import parallelize_model as parallelize_moe_model
 
     mesh = context.mesh
@@ -258,6 +264,7 @@ def _parallelize_moe(model: nn.Module, context: ParallelizeContext) -> nn.Module
         enable_async_tensor_parallel=enable_async_tensor_parallel,
         frozen_multimodal_sharding=frozen_multimodal_sharding,
         reapply_trainability=context.reapply_trainability,
+        parallelization_strategy=strategy,
         **mesh.parallelize_axis_kwargs(),
     )
     return model

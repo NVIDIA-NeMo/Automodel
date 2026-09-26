@@ -1494,12 +1494,13 @@ def test_default_parallelization_replicated_frozen_multimodal_params_are_ignored
         module.set_modules_to_backward_prefetch = MagicMock()
         return module
 
-    result = DefaultParallelizationStrategy().parallelize(
+    strategy = DefaultParallelizationStrategy()
+    monkeypatch.setattr(strategy, "_fully_shard_module", fake_fully_shard)
+    result = strategy.parallelize(
         model=model,
         device_mesh=device_mesh,
         activation_checkpointing=False,
         frozen_multimodal_sharding="replicate",
-        fully_shard_fn=fake_fully_shard,
     )
 
     assert result is model
@@ -1542,13 +1543,14 @@ def test_default_parallelization_warns_for_per_layer_frozen_multimodal_policy(mo
         module.set_modules_to_backward_prefetch = MagicMock()
         return module
 
+    strategy = DefaultParallelizationStrategy()
+    monkeypatch.setattr(strategy, "_fully_shard_module", fake_fully_shard)
     with caplog.at_level("WARNING"):
-        DefaultParallelizationStrategy().parallelize(
+        strategy.parallelize(
             model=model,
             device_mesh=device_mesh,
             activation_checkpointing=False,
             frozen_multimodal_sharding="per_layer",
-            fully_shard_fn=fake_fully_shard,
         )
 
     assert "rank-asymmetric modality execution can hang" in caplog.text

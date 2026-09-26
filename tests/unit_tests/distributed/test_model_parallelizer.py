@@ -47,7 +47,7 @@ def _context() -> ParallelizeContext:
 
 def test_contract_is_runtime_lightweight():
     assert hasattr(ModelParallelizer, "parallelize")
-    assert ModelParallelizer.__dataclass_fields__.keys() == {"strategy"}
+    assert ModelParallelizer.__dataclass_fields__.keys() == {"strategy", "moe_strategy"}
     assert ParallelizeContext.__dataclass_fields__.keys() == {
         "mesh",
         "strategy",
@@ -121,14 +121,14 @@ def test_specialized_fsdp2_sidecar_uses_strategy(monkeypatch):
 
 def test_specialized_sidecar_routes_ep_through_unified_moe_executor(monkeypatch):
     strategy = Mock()
-    adapter = ModelParallelizer(strategy)
+    adapter = ModelParallelizer(strategy, strategy)
     model = nn.Linear(2, 2)
     context = ParallelizeContext(mesh=SimpleNamespace(ep_size=2), strategy=FSDP2Config())
     call = Mock(return_value=model)
     monkeypatch.setattr("nemo_automodel.components.distributed.model_parallelizer._parallelize_moe", call)
 
     assert adapter.parallelize(model, context) is model
-    call.assert_called_once_with(model, context)
+    call.assert_called_once_with(model, context, strategy=strategy)
 
 
 @pytest.mark.parametrize(

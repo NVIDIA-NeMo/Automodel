@@ -120,14 +120,8 @@ def fully_shard_diffusion_gemma(module: nn.Module, mesh, mp_policy, offload_poli
 class DiffusionGemmaParallelizationStrategy(DefaultParallelizationStrategy):
     """Pure-FSDP2 strategy that shards grouped experts as their own units."""
 
-    def parallelize(self, model, device_mesh, dp_shard_cp_mesh_name="dp_shard_cp", **kwargs):
-        return super().parallelize(
-            model,
-            device_mesh,
-            dp_shard_cp_mesh_name=dp_shard_cp_mesh_name,
-            fully_shard_fn=fully_shard_diffusion_gemma,
-            **kwargs,
-        )
+    def _fully_shard_module(self, module, **kwargs):
+        return fully_shard_diffusion_gemma(module, **kwargs)
 
 
 PARALLELIZER = ModelParallelizer(DiffusionGemmaParallelizationStrategy())

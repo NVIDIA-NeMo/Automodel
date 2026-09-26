@@ -455,7 +455,9 @@ def test_image_masks_reach_engram_and_modality_routing() -> None:
 def test_shared_vision_fsdp_keeps_all_norms_fp32(monkeypatch: pytest.MonkeyPatch, vision_block: bool) -> None:
     from nemo_automodel.components.models.deepseek_v4 import fsdp as v4_fsdp
     from nemo_automodel.components.models.deepseek_v4.model import DeepseekV4ForCausalLM
+    from nemo_automodel.components.models.deepseek_v4.parallelization import PARALLELIZER as V4_PARALLELIZER
     from nemo_automodel.components.models.deepseek_v4.vision import DeepseekV4VisionRMSNorm
+    from nemo_automodel.components.models.deepseek_v41.fsdp import PARALLELIZER as V41_PARALLELIZER
     from nemo_automodel.components.models.deepseek_v41.fsdp import fully_shard_deepseek_v41
 
     config = _config()
@@ -469,8 +471,10 @@ def test_shared_vision_fsdp_keeps_all_norms_fp32(monkeypatch: pytest.MonkeyPatch
         param_dtype=torch.bfloat16, reduce_dtype=torch.float32, output_dtype=torch.bfloat16
     )
 
-    assert DeepseekV4ForCausalLM._nemo_fully_shard is v4_fsdp.fully_shard_deepseek_v4
-    assert DeepseekV41ForCausalLM._nemo_fully_shard is fully_shard_deepseek_v41
+    assert DeepseekV4ForCausalLM.parallelizer is V4_PARALLELIZER
+    assert DeepseekV41ForCausalLM.parallelizer is V41_PARALLELIZER
+    assert V4_PARALLELIZER.moe_strategy is V4_PARALLELIZER.strategy
+    assert V41_PARALLELIZER.moe_strategy is V41_PARALLELIZER.strategy
     fully_shard_deepseek_v41(module, mesh=object(), mp_policy=policy, reshard_after_forward=True)
 
     assert [child for child, _ in calls] == [*norms, module]

@@ -30,6 +30,7 @@ from nemo_automodel.components.models.diffusion_gemma import fsdp as dg4_fsdp
 def test_sidecar_owns_diffusion_gemma_strategy():
     assert isinstance(dg4_fsdp.PARALLELIZER, ModelParallelizer)
     assert isinstance(dg4_fsdp.PARALLELIZER.strategy, DefaultParallelizationStrategy)
+    assert dg4_fsdp.PARALLELIZER.moe_strategy is None
 
 
 def test_fully_shard_wraps_experts_before_the_layer(monkeypatch):

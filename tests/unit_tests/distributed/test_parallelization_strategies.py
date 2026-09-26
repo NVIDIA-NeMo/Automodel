@@ -232,7 +232,7 @@ def mock_distributed_env(monkeypatch):
         raising=False,
     )
 
-    # Mock apply_fsdp2_sharding_recursively
+    # Mock the strategy-aware recursive FSDP walk.
     apply_fsdp_mock = MagicMock()
     monkeypatch.setattr(
         "nemo_automodel.components.distributed.parallelizer.apply_fsdp2_sharding_recursively",
@@ -389,7 +389,7 @@ class TestDefaultParallelizationStrategy:
             5,
             4,
             True,
-            fully_shard_fn=mock_distributed_env["fully_shard"],
+            parallelization_strategy=strategy,
             frozen_multimodal_sharding="root",
             ignored_multimodal_params=set(),
         )
@@ -1075,21 +1075,21 @@ class TestQwen3_5ParallelizationStrategy:
         assert all(fn is default_walk for fn in observed)
         assert parallelizer_mod.apply_fsdp2_sharding_recursively is default_walk
 
-    @patch("nemo_automodel.components.models.qwen3_5.parallelization.fully_shard_by_dtype")
-    def test_dtype_walk_honors_fully_shard_fn(self, fully_shard_by_dtype, strategy, mock_device_mesh):
-        """A model-specific ``fully_shard_fn`` reaches every unit: decoder layers and the root."""
+    def test_dtype_walk_uses_sidecar_sharder(self, strategy, mock_device_mesh, monkeypatch):
+        """The sidecar's sharding methods own decoder-layer and root wrapping."""
         mesh, _, _, _ = mock_device_mesh
         model = _MockQwen35Model()
         custom_fully_shard = MagicMock(side_effect=lambda module, **_kwargs: module)
-        fully_shard_by_dtype.side_effect = lambda module, *_args, **_kwargs: module
+        fully_shard_by_dtype = MagicMock(side_effect=lambda module, *_args, **_kwargs: module)
+        monkeypatch.setattr(strategy, "_fully_shard_module", custom_fully_shard)
+        monkeypatch.setattr(qwen3_5_parallelization, "fully_shard_by_dtype", fully_shard_by_dtype)
 
-        result = strategy.parallelize(model=model, device_mesh=mesh, fully_shard_fn=custom_fully_shard)
+        result = strategy.parallelize(model=model, device_mesh=mesh)
 
         assert result is model
         layer_calls = fully_shard_by_dtype.call_args_list
         assert [call.args[0] for call in layer_calls] == list(model.model.layers)
-        assert all(call.kwargs["fully_shard_fn"] is custom_fully_shard for call in layer_calls)
-        # The root unit is wrapped by the same primitive, not by torch's fully_shard.
+        assert all(call.kwargs["parallelization_strategy"] is strategy for call in layer_calls)
         assert custom_fully_shard.call_args_list[-1].args[0] is model
 
 
