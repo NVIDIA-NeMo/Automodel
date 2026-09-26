@@ -8,6 +8,15 @@ slug: model-coverage/diffusion/black-forest-labs/FLUX.2-dev
 
 NeMo AutoModel includes full-parameter and Low-Rank Adaptation (LoRA) text-to-image fine-tuning recipes for this checkpoint.
 
+## Fine-Tune FLUX.2-dev
+
+From the repository root, run:
+
+```bash
+uv run torchrun --nproc-per-node=8 examples/diffusion/finetune/finetune.py \
+  -c examples/diffusion/finetune/flux2_t2i_flow.yaml
+```
+
 ## Model Reference
 
 ### Model Architecture
@@ -36,10 +45,5 @@ NeMo AutoModel includes full-parameter and Low-Rank Adaptation (LoRA) text-to-im
 |---|---|
 | [`black-forest-labs/FLUX.2-dev`](https://huggingface.co/black-forest-labs/FLUX.2-dev) | [Full fine-tuning](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/flux2_t2i_flow.yaml) |
 | [`black-forest-labs/FLUX.2-dev`](https://huggingface.co/black-forest-labs/FLUX.2-dev) | [LoRA](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/flux2_t2i_flow_lora.yaml) |
-
-```bash
-uv run torchrun --nproc-per-node=8 examples/diffusion/finetune/finetune.py \
-  -c examples/diffusion/finetune/flux2_t2i_flow.yaml
-```
 
 See the [Diffusion Fine-Tuning Guide](/recipes-e2e-examples/diffusion-fine-tuning).
