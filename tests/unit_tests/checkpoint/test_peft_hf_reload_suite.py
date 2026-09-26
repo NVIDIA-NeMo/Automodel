@@ -461,9 +461,7 @@ _FORMATS = [pytest.param(False, id="v5"), pytest.param(True, id="v4")]
 
 @pytest.mark.parametrize("v4_compatible", _FORMATS)
 @pytest.mark.parametrize("family", _params())
-def test_exported_adapter_loads_into_hf_peft(
-    family: _Family, v4_compatible: bool, tmp_path: Path, peft_process_group
-):
+def test_exported_adapter_loads_into_hf_peft(family: _Family, v4_compatible: bool, tmp_path: Path, peft_process_group):
     """Save through the real path, reload with real PEFT, and require identical behavior."""
     from peft import PeftModel, get_peft_model_state_dict
     from safetensors.torch import load_file
@@ -503,9 +501,7 @@ def test_exported_adapter_loads_into_hf_peft(
 
 @pytest.mark.parametrize("v4_compatible", _FORMATS)
 @pytest.mark.parametrize("family", _params())
-def test_bulk_and_per_tensor_exports_agree(
-    family: _Family, v4_compatible: bool, tmp_path: Path, peft_process_group
-):
+def test_bulk_and_per_tensor_exports_agree(family: _Family, v4_compatible: bool, tmp_path: Path, peft_process_group):
     """``to_hf`` and ``convert_single_tensor_to_hf`` feed different consumers; they must match.
 
     Streaming consumers convert one tensor at a time, which cannot see the sibling
@@ -618,9 +614,7 @@ def test_adapter_written_by_peft_loads_through_our_path(family: _Family, tmp_pat
         key.replace("base_model.model.model.", f"base_model.model.{family.legacy_namespace}", 1): value
         for key, value in written.items()
     }
-    assert legacy != written, (
-        f"{family.id}: the legacy rewrite changed nothing, so this case is not being exercised"
-    )
+    assert legacy != written, f"{family.id}: the legacy rewrite changed nothing, so this case is not being exercised"
 
     normalized = adapter.from_hf(dict(legacy))
     assert set(normalized) == set(ours), (
@@ -628,3 +622,56 @@ def test_adapter_written_by_peft_loads_through_our_path(family: _Family, tmp_pat
         f"namespace; legacy_only={sorted(set(normalized) - set(ours))} "
         f"ours_only={sorted(set(ours) - set(normalized))}"
     )
+
+
+@pytest.mark.parametrize("family", _params())
+def test_merged_weights_match_the_native_lora_math(family: _Family, tmp_path: Path, peft_process_group):
+    """Merging through real PEFT has to reproduce the delta our own tensors describe.
+
+    The reload test reads the delta through the logits of two models we both built.
+    This reads it per weight instead: each adapted weight has to equal its base plus
+    ``(B @ A) * alpha / r``, computed from the native tensors. A delta that lands on
+    the wrong module, at the wrong magnitude, or is compensated for elsewhere has
+    nowhere to hide in that comparison.
+
+    This is the merge half of the coverage #3867 asks for. The fused-expert merge in
+    tests/unit_tests/models/test_moe_peft_v5_state_dict_adapters.py stays where it is:
+    it drives ``target_parameters`` on grouped expert LoRA, which this suite cannot
+    build, because applying LoRA to a Transformers model only wraps ``nn.Linear``.
+    """
+    from peft import PeftModel
+
+    model, reference, peft_config = _adapted_model(family, tmp_path / "source")
+    adapter_dir = _save_through_checkpointer(model, peft_config, tmp_path)
+
+    native = ModelState(model, is_peft=True).state_dict()
+    target = reference if family.reference_path is None else getattr(reference, family.reference_path)
+    before = {name: parameter.detach().clone() for name, parameter in target.named_parameters()}
+
+    loaded = PeftModel.from_pretrained(reference, str(adapter_dir), key_mapping={}, autocast_adapter_dtype=False)
+    merged = loaded.merge_and_unload()
+    merged_root = merged if family.reference_path is None else getattr(merged, family.reference_path)
+    after = dict(merged_root.named_parameters())
+
+    factors: dict[str, dict[str, torch.Tensor]] = {}
+    for key, tensor in native.items():
+        side = "A" if ".lora_A" in key else "B" if ".lora_B" in key else None
+        if side is not None:
+            factors.setdefault(_module_of(key), {})[side] = tensor
+    assert factors, f"{family.id}: no lora_A/lora_B pairs to check the merge against"
+
+    scale = peft_config.alpha / peft_config.dim
+    for module, pair in sorted(factors.items()):
+        assert set(pair) == {"A", "B"}, f"{family.id}: {module} exported {sorted(pair)}, not both factors"
+        name = f"{module}.weight"
+        assert name in after, f"{family.id}: the merged model has no {name}"
+        expected = before[name] + scale * (pair["B"] @ pair["A"])
+        torch.testing.assert_close(
+            after[name],
+            expected,
+            rtol=1e-5,
+            atol=1e-6,
+            msg=lambda formatted, module=module: (
+                f"{family.id}: merged {module} is not base + scaled B@A -- {formatted}"
+            ),
+        )
