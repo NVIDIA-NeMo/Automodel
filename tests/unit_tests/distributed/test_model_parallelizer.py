@@ -28,7 +28,11 @@ from nemo_automodel.components.distributed import (
     ModelParallelizer,
     ParallelizeContext,
 )
-from nemo_automodel.components.distributed.model_parallelizer import get_model_parallelizer, parallelize_model
+from nemo_automodel.components.distributed.model_parallelizer import (
+    _parallelize_moe,
+    get_model_parallelizer,
+    parallelize_model,
+)
 
 
 class _Sidecar:
@@ -129,6 +133,23 @@ def test_specialized_sidecar_routes_ep_through_unified_moe_executor(monkeypatch)
 
     assert adapter.parallelize(model, context) is model
     call.assert_called_once_with(model, context, strategy=strategy)
+
+
+def test_moe_executor_receives_model_owned_strategy(monkeypatch):
+    strategy = Mock()
+    model = nn.Linear(2, 2)
+    mesh = SimpleNamespace(
+        ep_size=2,
+        device_mesh=object(),
+        moe_mesh=object(),
+        parallelize_axis_kwargs=lambda: {},
+    )
+    context = ParallelizeContext(mesh=mesh, strategy=FSDP2Config())
+    executor = Mock()
+    monkeypatch.setattr("nemo_automodel.components.moe.parallelizer.parallelize_model", executor)
+
+    assert _parallelize_moe(model, context, strategy=strategy) is model
+    assert executor.call_args.kwargs["parallelization_strategy"] is strategy
 
 
 @pytest.mark.parametrize(

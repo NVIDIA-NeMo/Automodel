@@ -225,18 +225,20 @@ def _parallelize_moe(
         raise ValueError("Expert parallelization requires both device_mesh and moe_mesh.")
 
     moe = context.moe or MoEParallelizerConfig()
-    strategy = context.strategy
-    if isinstance(strategy, FSDP2Config):
-        mp_policy = moe.mp_policy if moe.mp_policy is not None else strategy.mp_policy
-        tp_shard_plan = strategy.tp_plan
-        sequence_parallel = strategy.sequence_parallel
-        offload_policy = strategy.offload_policy
+    strategy_config = context.strategy
+    if isinstance(strategy_config, FSDP2Config):
+        mp_policy = moe.mp_policy if moe.mp_policy is not None else strategy_config.mp_policy
+        tp_shard_plan = strategy_config.tp_plan
+        sequence_parallel = strategy_config.sequence_parallel
+        offload_policy = strategy_config.offload_policy
         reshard_after_forward = (
-            strategy.reshard_after_forward if strategy.reshard_after_forward is not None else moe.reshard_after_forward
+            strategy_config.reshard_after_forward
+            if strategy_config.reshard_after_forward is not None
+            else moe.reshard_after_forward
         )
-        enable_async_tensor_parallel = strategy.enable_async_tensor_parallel
-        activation_checkpointing_scope = strategy.activation_checkpointing_scope
-        frozen_multimodal_sharding = strategy.multimodal.frozen_sharding
+        enable_async_tensor_parallel = strategy_config.enable_async_tensor_parallel
+        activation_checkpointing_scope = strategy_config.activation_checkpointing_scope
+        frozen_multimodal_sharding = strategy_config.multimodal.frozen_sharding
     else:
         mp_policy = moe.mp_policy
         tp_shard_plan = None
