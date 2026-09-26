@@ -455,7 +455,7 @@ class Qwen3_8_FlashNextQSAAttention(Qwen3NextAttention):
     The main query/key/value, output gate, and output projection retain the
     Qwen3-Next equations.  A separate frozen indexer returns logical token IDs,
     then the model-owned QSA dispatcher evaluates only those IDs. CUDA BF16
-    training uses FlexAttention over a route-membership BlockMask; CPU and
+    training selects FlexAttention or SM90 CuTe through backend.attn; CPU and
     explicit reference backends use the PyTorch oracle. Main Q/K/V remain
     differentiable.
     """
@@ -463,7 +463,7 @@ class Qwen3_8_FlashNextQSAAttention(Qwen3NextAttention):
     def __init__(self, config: object, layer_idx: int, backend: BackendConfig) -> None:
         # QSA owns its sparse-attention dispatch. The inherited constructor is
         # reused only for projections/norms, but its generic attention factory
-        # does not implement ``flex``. Give that factory an isolated SDPA
+        # does not implement ``flex`` or ``cute``. Give it an isolated SDPA
         # copy, then discard the unused callable and retain the real backend.
         parent_backend = replace(backend, attn="sdpa")
         super().__init__(config, layer_idx, parent_backend)
@@ -585,7 +585,7 @@ class Qwen3_8_FlashNextQSAAttention(Qwen3NextAttention):
             value = qwen3_8_flash_next_cp_all_gather(value, cp_context, sequence_dim=1, differentiable=True)
 
         # One dispatcher serves dense, packed, and CP layouts: routes are
-        # global K/V coordinates and FlexAttention accepts S_q != S_kv, so
+        # global K/V coordinates and both CUDA backends accept S_q != S_kv, so
         # packed rows need no dedicated kernel path. CPU keeps the oracle.
         attn_output = qsa_gqa_attention(
             query,
