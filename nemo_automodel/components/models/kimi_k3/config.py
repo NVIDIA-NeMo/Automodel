@@ -80,6 +80,7 @@ class KimiK3TextConfig(PretrainedConfig):
         v_head_dim: int | None = 128,
         mla_use_nope: bool = True,
         mla_use_output_gate: bool = True,
+        mla_attn_backend: str = "default",
         # KDA and residual mixing.
         linear_attn_config: dict[str, Any] | None = None,
         kda_mode: str = "chunk",
@@ -157,6 +158,10 @@ class KimiK3TextConfig(PretrainedConfig):
         self.v_head_dim = v_head_dim
         self.mla_use_nope = mla_use_nope
         self.mla_use_output_gate = mla_use_output_gate
+        # MLA attention kernel: "default" keeps FlexAttention under context parallelism and BackendConfig.attn
+        # otherwise; "fa4" runs FlashAttention 4 varlen on both paths with native 192/128 head dims
+        # (kimi_k3/fa4_mla.py).
+        self.mla_attn_backend = mla_attn_backend
 
         self.linear_attn_config = linear_attn_config
         self.kda_mode = kda_mode
@@ -199,6 +204,8 @@ class KimiK3TextConfig(PretrainedConfig):
             raise ValueError("kda_conv_backend must be 'triton' or 'cuda'.")
         if self.situ_backend not in {"torch", "triton", "triton_fast_math"}:
             raise ValueError("situ_backend must be 'torch', 'triton' or 'triton_fast_math'.")
+        if self.mla_attn_backend not in {"default", "fa4"}:
+            raise ValueError("mla_attn_backend must be 'default' or 'fa4'.")
         if self.kda_chunk_impl not in {"fla", "fused"}:
             raise ValueError(
                 "kda_chunk_impl must be 'fla' (flash-linear-attention) or 'fused' (fused CUDA forward + Triton backward)."
