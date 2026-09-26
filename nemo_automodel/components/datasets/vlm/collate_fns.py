@@ -1516,12 +1516,17 @@ def neat_packed_vlm_collater(
     Packs arrive with **variable lengths** (no pre-padding).  This collater:
 
     1. Pads all text tensors to a common length.
-    2. Converts the indexed ``attention_mask`` to the appropriate format:
-       - ``flash_attention_2``: keeps the indexed ``[B, S]`` mask (values
-         1, 2, … for documents, 0 for padding).  The monkey-patched
-         ``_get_unpad_data`` converts this to ``cu_seqlens`` for
-         ``flash_attn_varlen_func``.
-       - ``sdpa`` / ``eager``: converts to a 4D block-causal bool mask.
+    2. Converts the indexed ``attention_mask`` to the representation
+       ``materialize_4d_mask`` selects:
+       - True: a 4D block-causal bool mask. SDPA reads it directly;
+         HF eager consumers must convert it to an additive mask.
+       - False: the indexed ``[B, S]`` map itself (values 1, 2, … for
+         documents, 0 for padding), for consumers that recover document
+         bounds from ``_packed_seq_ids`` rather than from a mask.
+       ``attn_implementation="flash_attention_2"`` also keeps the compact map,
+       whatever ``materialize_4d_mask`` says: the monkey-patched
+       ``_get_unpad_data`` converts it to ``cu_seqlens`` for
+       ``flash_attn_varlen_func``.
     3. Concatenates media tensors across the batch dimension.
 
     **No autoregressive shift** — it was already applied during packing.
@@ -1533,13 +1538,16 @@ def neat_packed_vlm_collater(
             If ``None`` (default), pad to the longest pack in the batch.
             A fixed length avoids recompilation with ``torch.compile``
             and ensures uniform tensor shapes across steps.
-        attn_implementation: Attention backend (``"flash_attention_2"``,
-            ``"sdpa"``, or ``"eager"``).
-        materialize_4d_mask: Whether SDPA/eager packing should expand the
-            indexed ``[B, S]`` document map into a dense
-            ``[B, 1, S, S]`` block-causal mask. Context-parallel VLM paths
-            rebuild their local mask from ``_packed_seq_ids`` and set this to
-            False to avoid the quadratic allocation.
+        attn_implementation: Attention backend the batch is collated for. Only
+            ``"flash_attention_2"`` changes behaviour here, by keeping the
+            compact map; every other value defers to ``materialize_4d_mask``.
+        materialize_4d_mask: Whether packing should expand the indexed
+            ``[B, S]`` document map into a dense ``[B, 1, S, S]`` block-causal
+            mask. Callers set this to False when the consumer recovers document
+            boundaries from ``_packed_seq_ids`` instead of from the mask:
+            context-parallel paths rebuild their local mask from it, and flash
+            attention and Transformer Engine cannot use a dense mask at all.
+            False therefore also forces ``_packed_seq_ids`` to be emitted.
 
     Returns:
         Dict with batched tensors ready for model forward.
