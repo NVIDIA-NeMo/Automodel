@@ -84,6 +84,8 @@ _VISION_PROJ_HF_TO_CUSTOM = {
     "mlp1.0.weight": "vision_projector.norm.weight",
     "mlp1.1.weight": "vision_projector.linear1.weight",
     "mlp1.3.weight": "vision_projector.linear2.weight",
+    "vision_projector.vision_final_layernorm.weight": "vision_projector.vision_final_layernorm.weight",
+    "vision_projector.vision_final_layernorm.bias": "vision_projector.vision_final_layernorm.bias",
 }
 _VISION_PROJ_CUSTOM_TO_HF = {v: k for k, v in _VISION_PROJ_HF_TO_CUSTOM.items()}
 
@@ -286,7 +288,7 @@ class NemotronOmniStateDictAdapter(StateDictAdapter):
                 debug_counts["vision_model"] += 1
 
             # 2. Vision projector keys (mlp1.* -> vision_projector.*)
-            elif key.startswith("mlp1."):
+            elif key.startswith("mlp1.") or key in _VISION_PROJ_HF_TO_CUSTOM:
                 if key in _VISION_PROJ_HF_TO_CUSTOM:
                     new_key = _VISION_PROJ_HF_TO_CUSTOM[key]
                     result[new_key] = value
@@ -444,13 +446,17 @@ class NemotronOmniStateDictAdapter(StateDictAdapter):
         """
         exclude_key_regex = kwargs.get("exclude_key_regex", None)
 
-        # Vision model (pass through, or rename for native RadioModel checkpoints)
+        # Vision model: pass through unchanged.
+        #
+        # For native RadioModel checkpoints the legacy layout fuses q/k/v into one
+        # ``attn.qkv`` tensor, which a per-tensor conversion cannot rebuild (it only sees
+        # one of query/key/value at a time). ``to_hf`` (whole state dict) still emits the
+        # legacy layout; here we keep the native names so a streaming consumer (e.g. the
+        # NeMo-RL -> vLLM refit) can load q/k/v as individual shards. Renaming to the
+        # legacy tree without fusing would produce keys no loader recognizes and the
+        # vision tower would silently keep its previous (or dummy) weights.
         if fqn.startswith("vision_model."):
-            if self.vision_uses_native_radio:
-                sub_key = fqn[len("vision_model.") :]
-                new_fqn = f"vision_model.{_rename_radio_key(sub_key, _RADIO_NATIVE_TO_LEGACY_RENAMES)}"
-            else:
-                new_fqn = fqn
+            new_fqn = fqn
 
         # Vision projector
         elif fqn.startswith("vision_projector."):

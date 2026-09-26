@@ -100,6 +100,7 @@ class DecodeEvalConfig:
     max_new_tokens: int = 256
     temperature: float = 0.0
     top_p: float = 1.0
+    top_k: int = 0
     messages_column: str = "messages"
     prompt_column: str | None = None
     split: str = "train"
@@ -501,6 +502,7 @@ def _bench_args(cfg: DecodeEvalConfig, server: str) -> Namespace:
         max_new_tokens=cfg.max_new_tokens,
         temperature=cfg.temperature,
         top_p=cfg.top_p,
+        top_k=cfg.top_k,
         messages_column=cfg.messages_column,
         prompt_column=cfg.prompt_column,
         prompt_context_column=None,
