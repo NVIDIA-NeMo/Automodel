@@ -13,7 +13,7 @@
 # limitations under the License.
 #
 # ruff: noqa
-# Adapt from https://github.com/tile-ai/tilelang/blob/4ff81c7d40803d269569e157e847623e84553f78/examples/deepseek_v32/sparse_mla_bwd.py
+# Adapt from https://github.com/tile-ai/tilelang/blob/6f75a92fed8ad8062c495cebb6fdfc45cc3e10fd/examples/deepseek_v32/sparse_mla_bwd.py
 import torch
 
 from nemo_automodel.components.models.glm_moe_dsa.kernels._tilelang import T, tilelang
@@ -108,7 +108,7 @@ def bwd(
     is_causal=True,
     block_size=32,
     num_stages=0,
-    threads=128,
+    threads=None,
     indices_dtype=T.int32,
     dtype=T.bfloat16,
     accum_dtype=T.float32,
@@ -137,6 +137,11 @@ def bwd(
     H = H_kv
     padded_H = max(tilelang.math.next_power_of_2(H_kv), 16)
     block_H = min(64, padded_H)
+    # This kernel is memory-pipe bound. For a full 64-head block, eight warps keep
+    # more cp.async transfers in flight; smaller blocks lack enough GEMM work for
+    # 256 threads and retain the four-warp launch.
+    if threads is None:
+        threads = 256 if block_H >= 64 else 128
     assert padded_H % block_H == 0
     NH = padded_H // block_H
     BS = block_size
