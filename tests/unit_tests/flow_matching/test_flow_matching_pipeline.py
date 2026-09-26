@@ -103,6 +103,16 @@ def pipeline(simple_adapter):
 class TestLinearInterpolationSchedule:
     """Test the linear interpolation noise schedule."""
 
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+    def test_interpolation_preserves_float32_coefficient_promotion(self, dtype):
+        """The shared schedule retains its original float32 interpolation."""
+        clean = torch.tensor([1.0078125, 1.0], dtype=dtype).view(2, 1, 1, 1)
+        noise = torch.tensor([1.015625, 2.0], dtype=dtype).view_as(clean)
+        sigma = torch.tensor([0.25, 0.75])
+        expected = torch.tensor([1.009765625, 1.75]).view_as(clean)
+        actual = LinearInterpolationSchedule().forward(clean, noise, sigma)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
     def test_interpolation_at_sigma_zero(self):
         """At sigma=0, x_t should equal x_0 (clean latents)."""
         schedule = LinearInterpolationSchedule()
@@ -567,6 +577,34 @@ class TestLossComputation:
                 model_adapter=simple_adapter,
                 use_loss_weighting=True,
                 loss_weighting_scheme="invalid_scheme",
+            )
+
+    @pytest.mark.parametrize("kwargs", [{"num_train_timesteps": 1}, {"flow_shift": 0}, {"sigma_min": 1.0}])
+    def test_discrete_schedule_rejects_invalid_grid(self, simple_adapter, kwargs):
+        with pytest.raises(ValueError, match="discrete flow grid"):
+            FlowMatchingPipeline(model_adapter=simple_adapter, timestep_sampling="uniform_discrete", **kwargs)
+
+    def test_discrete_sampling_preserves_sigma_bounds(self, simple_adapter, monkeypatch):
+        pipeline = FlowMatchingPipeline(
+            model_adapter=simple_adapter,
+            timestep_sampling="uniform_discrete",
+            flow_shift=5.0,
+            sigma_min=0.2,
+            sigma_max=0.8,
+            device=torch.device("cpu"),
+        )
+        monkeypatch.setattr(torch, "randint", lambda *args, **kwargs: torch.arange(1000))
+        sigma, _, _ = pipeline.sample_timesteps(1000)
+        assert sigma.min().item() == pytest.approx(0.2)
+        assert sigma.max().item() == pytest.approx(0.8)
+
+    def test_shifted_weights_reject_a_degenerate_clamped_grid(self, simple_adapter):
+        with pytest.raises(ValueError, match="no variation"):
+            FlowMatchingPipeline(
+                model_adapter=simple_adapter,
+                flow_shift=5.0,
+                sigma_max=0.001,
+                loss_weighting_scheme="bsmntw_shifted",
             )
 
 
