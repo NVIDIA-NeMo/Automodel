@@ -46,24 +46,11 @@ from torch import nn
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.tensor import DTensor, Shard
 
-# Over the default 5s budget on purpose: this module spawns worker processes; every child re-imports torch from scratch.
-# Shrink the work or the process count before raising this further.
-#
-# This budget MUST stay above _JOIN_TIMEOUT_S below. The spawn guard terminates its
-# children and fails with a usable message; pytest-timeout just kills the test, which
-# leaves the workers running and every later test in the session fails on the leftover
-# child processes. Whichever number is smaller decides which of those two happens.
-pytestmark = [
-    pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is required"),
-    pytest.mark.timeout(240),
-]
+pytestmark = pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is required")
 
 MAX_NORM = 1.0
 _WORLD = 4
-# Bounds a deadlock: without it a regression that hangs the collectives would
-# burn the whole job timeout instead of reporting a failed test. Kept under the
-# module's pytest-timeout budget so this guard is the one that fires -- it cleans
-# up the workers, and pytest-timeout does not.
+# Leave time to reap all workers before the test's 240s hard watchdog fires.
 _JOIN_TIMEOUT_S = 180.0
 
 
@@ -391,18 +378,30 @@ def _run_scenarios(rank: int, world: int, store_path: str) -> None:
         dist.destroy_process_group()
 
 
+@pytest.mark.runtime_budget(
+    180,
+    hard_timeout=240,
+    reason="four fresh Torch workers run nine Gloo/DTensor scenarios; CI exceeded the default 60s watchdog",
+)
 def test_ep_grad_clip_agrees_across_ranks(tmp_path):
     """All EP clipping scenarios, one process group, one spawn."""
     store = str(tmp_path / "s").replace("\\", "/")
     context = mp.spawn(_run_scenarios, args=(_WORLD, store), nprocs=_WORLD, join=False)
 
-    deadline = time.monotonic() + _JOIN_TIMEOUT_S
-    while not context.join(timeout=5.0):
-        if time.monotonic() > deadline:
-            for process in context.processes:
-                if process.is_alive():
-                    process.terminate()
-            pytest.fail(f"ranks did not finish within {_JOIN_TIMEOUT_S:.0f}s; the clip collectives deadlocked")
+    try:
+        deadline = time.monotonic() + _JOIN_TIMEOUT_S
+        while not context.join(timeout=5.0):
+            if time.monotonic() > deadline:
+                pytest.fail(f"ranks did not finish within {_JOIN_TIMEOUT_S:.0f}s")
+    finally:
+        for process in context.processes:
+            if process.is_alive():
+                process.terminate()
+        for process in context.processes:
+            process.join(timeout=5.0)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=5.0)
 
 
 def test_moe_mesh_none_keeps_single_process_behavior():
