@@ -38,8 +38,8 @@ from nemo_automodel.shared.torch_patches import apply_torch_patches
 
 apply_torch_patches()
 from huggingface_hub import constants as hf_constants  # noqa: E402
+from huggingface_hub import snapshot_download
 from transformers import (  # noqa: E402
-    AutoConfig,
     AutoModelForCausalLM,
     AutoModelForImageTextToText,
     AutoModelForMultimodalLM,
@@ -76,6 +76,7 @@ if TYPE_CHECKING:
 # that import NEED_SETUP_CACHE_CLASSES_MAPPING from transformers.generation.utils.
 import transformers.generation.utils as _gen_utils  # noqa: E402
 
+from nemo_automodel._transformers.auto_config import NeMoAutoConfig as AutoConfig
 from nemo_automodel._transformers.infrastructure import (
     MeshContext,
     apply_model_infrastructure,
@@ -199,6 +200,8 @@ def _patch_remote_code_compat():
 
 _AUTO_CONFIG_HUB_KWARG_KEYS = (
     "revision",
+    "_commit_hash",
+    "force_download",
     "subfolder",
     "token",
     "use_auth_token",
@@ -417,6 +420,9 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         has_packed_sequence = kwargs.pop("has_packed_sequence", False)
         freeze_config = kwargs.pop("freeze_config", None)
         cache_dir = kwargs.pop("cache_dir", hf_constants.HF_HUB_CACHE)
+        if isinstance(pretrained_model_name_or_path_or_config, str):
+            # Hub loaders need the cache location; from_config constructors do not.
+            kwargs["cache_dir"] = cache_dir
 
         def _retry(**override):
             """Re-enter ``_build_model`` with overridden parameters."""
@@ -611,6 +617,16 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         # during init.  Custom models and meta-device initialization do not load weights
         # here; they rely on apply_model_infrastructure to load the checkpoint later.
         weights_already_loaded = not is_custom_model and not is_meta_device and load_base_model
+        if load_base_model and pretrained_path and not os.path.isdir(pretrained_path) and _hf_config._commit_hash:
+            # Give the checkpointer the selected snapshot, not a repo id whose
+            # cache may also contain an unrelated (or newer) weight index.
+            pretrained_path = snapshot_download(
+                pretrained_path,
+                revision=_hf_config._commit_hash,
+                cache_dir=cache_dir,
+                local_files_only=True,
+            )
+            pretrained_path = os.path.join(pretrained_path, kwargs.get("subfolder", ""))
 
         from nemo_automodel._transformers.capabilities import attach_capabilities_and_validate
 
@@ -756,6 +772,10 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 hf_config = get_hf_config(pretrained_model_name_or_path, attn_implementation, **kwargs)
             else:
                 raise
+        # Keep config rereads, remote code, and weights on the same snapshot.
+        if hf_config._commit_hash is not None:
+            kwargs["revision"] = hf_config._commit_hash
+            kwargs["_commit_hash"] = hf_config._commit_hash
         is_hf_model = get_is_hf_model(hf_config, force_hf)
 
         # Layer 2: reject loading a checkpoint with tie_word_embeddings flipped from the

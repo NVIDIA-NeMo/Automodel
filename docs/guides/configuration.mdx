@@ -46,6 +46,36 @@ model:
 - **Dotted paths**: `pkg.module.symbol`
 - **Local file paths**: `/abs/path/to/file.py:symbol`
 
+### Load a Hugging Face Model Configuration
+
+For a nested model configuration, use the explicit NeMo target:
+
+```yaml
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  config:
+    _target_: nemo_automodel.NeMoAutoConfig.from_pretrained
+    pretrained_model_name_or_path: openai-community/gpt2
+    n_layer: 6
+```
+
+`NeMoAutoConfig` retains the commit selected by the Hub download so concurrent
+updates to a shared cache's branch reference cannot change the config lookup.
+It preserves normal online freshness checks and the Transformers options
+`revision`, `cache_dir`, `subfolder`, `token`, `local_files_only`,
+`force_download`, and `trust_remote_code`. Nested model overrides continue to
+work, including CLI overrides such as `--model.config.n_layer 6`.
+
+The NeMo model API uses the same resolution internally and keeps subsequent
+config and pretrained-weight reads on the selected commit. To make separate
+jobs or independently starting ranks use a predetermined version, set `revision`
+to an immutable Hub commit in the model-loading arguments.
+
+`ConfigNode` invokes the configured callable without applying library-specific
+cache policy. Existing `transformers.AutoConfig.from_pretrained` targets remain
+valid and retain upstream behavior; change their target to `NeMoAutoConfig` to
+use the shared-cache fix.
+
 ### Target Resolution and Code Execution
 
 Target resolution is intentionally permissive and should be treated as code execution:

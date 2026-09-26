@@ -16,6 +16,8 @@
 
 from unittest.mock import MagicMock, patch
 
+from transformers import PretrainedConfig
+
 from nemo_automodel._transformers.auto_model import _BaseNeMoAutoModelClass, _maybe_dequantize_fp8_for_peft
 
 # ---------------------------------------------------------------------------
@@ -220,8 +222,7 @@ class TestKwargsConfigInjectionGate:
     @staticmethod
     def _run_build_model_with_native_fp8(is_hf_model):
         quant_cfg = {"quant_method": "fp8", "dequantize": False}
-        hf_config = MagicMock()
-        hf_config.quantization_config = quant_cfg
+        hf_config = PretrainedConfig(quantization_config=quant_cfg)
         sentinel_model = MagicMock()
 
         with (
