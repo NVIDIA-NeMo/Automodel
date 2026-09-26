@@ -1,0 +1,100 @@
+# Qwen-Image-2.1 text-to-image LoRA finetune.
+#
+# Preprocess with `--processor qwen_image_21` (see qwen_image_21_t2i_flow.yaml).
+# Requires a diffusers build that ships QwenImage21Pipeline.
+
+seed: 42
+
+wandb:
+  enable: false
+  project: qwen-image-2.1-lora-finetuning
+  mode: online
+  name: qwen_image_21_lora_run_1
+
+dist_env:
+  backend: "nccl"
+  init_method: "env://"
+
+model:
+  pretrained_model_name_or_path: "Qwen/Qwen-Image-2.1"
+  model_type: "qwen_image_21"
+  mode: "finetune"
+  cache_dir: null
+
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  dim: 64
+  alpha: 64
+  dropout: 0.0
+  target_modules:
+    - "*.attn.to_q"
+    - "*.attn.to_k"
+    - "*.attn.to_v"
+    - "*.attn.to_out.0"
+    - "*.img_mlp.proj"
+    - "*.img_mlp.gate_layer"
+    - "*.img_mlp.out"
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 3e-5
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+  foreach: false
+  fused: true
+
+lr_scheduler:
+  lr_decay_style: cosine
+  lr_warmup_steps: 0
+  min_lr: 3e-6
+
+ddp:
+  backend: "nccl"
+  activation_checkpointing: true
+  find_unused_parameters: false
+
+flow_matching:
+  adapter_type: "qwen_image_21"
+  adapter_kwargs: {}
+  timestep_sampling: "logit_normal"
+  logit_mean: 0.0
+  logit_std: 1.0
+  # Qwen-Image-2.1 samples with exponential time shift mu(seq_len); exp(mu) ~= 2.0 at 1024x1024.
+  flow_shift: 2.0
+  mix_uniform_ratio: 0.0
+  sigma_min: 0.0
+  sigma_max: 1.0
+  num_train_timesteps: 1000
+  i2v_prob: 0.0
+  # Qwen-Image-2.1 is sampled without classifier-free guidance.
+  cfg_dropout_prob: 0.0
+  use_loss_weighting: false
+  log_interval: 100
+  summary_log_interval: 10
+
+step_scheduler:
+  num_epochs: 10
+  local_batch_size: 2
+  global_batch_size: 16
+  ckpt_every_steps: 500
+  save_checkpoint_every_epoch: false
+  log_remote_every_steps: 1
+  # max_steps: null  # Set to limit training to a specific number of steps
+
+data:
+  dataloader:
+    _target_: nemo_automodel.components.datasets.diffusion.build_text_to_image_multiresolution_dataloader
+    cache_dir: PATH_TO_YOUR_DATA
+    train_text_encoder: false
+    num_workers: 2
+    base_resolution: [1024, 1024]
+    dynamic_batch_size: false
+    shuffle: true
+    drop_last: false
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: PATH_TO_YOUR_CKPT_DIR
+  model_save_format: torch_save
+  save_consolidated: false
+  restore_from: null
