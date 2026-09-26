@@ -865,6 +865,9 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
     # forward() pulls per-microbatch pixel_values from _vlm_pixel_values_chunks;
     # patch_hf_model_for_pp must not replace it under PP.
     _pp_keep_self_forward: bool = True
+    # The PP stage path never runs MTP, so the last stage can return hidden states
+    # for FusedLinearCrossEntropy (see _pp_return_hidden_states in forward).
+    _pp_return_hidden_states_supported: bool = True
     # CP submesh, installed by the parallelizer's apply_cp when context parallelism
     # is active; None means the forward embeds and shards nothing for CP.
     cp_mesh = None
@@ -1391,7 +1394,7 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
                     **model_kwargs,
                 )
                 hidden_states = getattr(text_out, "last_hidden_state", text_out)
-            if not is_last_stage:
+            if not is_last_stage or getattr(self, "_pp_return_hidden_states", False) is True:
                 return hidden_states
             return self.lm_head(hidden_states)
 
