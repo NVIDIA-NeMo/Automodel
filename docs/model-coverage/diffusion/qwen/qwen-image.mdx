@@ -1,10 +1,10 @@
 ---
 title: "Qwen-Image"
-description: "Train Qwen-Image text-to-image and Qwen-Image-Edit-2511 image-editing models."
+description: "Train Qwen-Image and Qwen-Image-2.1 text-to-image and Qwen-Image-Edit-2511 image-editing models."
 slug: model-coverage/diffusion/qwen/qwen-image
 ---
 
-[Qwen-Image](https://huggingface.co/Qwen/Qwen-Image) is Alibaba Cloud's flow-matching image model. NeMo AutoModel supports Qwen-Image text-to-image training and cached, full-parameter training of [Qwen-Image-Edit-2511](https://huggingface.co/Qwen/Qwen-Image-Edit-2511).
+[Qwen-Image](https://huggingface.co/Qwen/Qwen-Image) is Alibaba Cloud's flow-matching image model. NeMo AutoModel supports Qwen-Image and [Qwen-Image-2.1](https://huggingface.co/Qwen/Qwen-Image-2.1) text-to-image training and cached, full-parameter training of [Qwen-Image-Edit-2511](https://huggingface.co/Qwen/Qwen-Image-Edit-2511).
 
 <Info>
 
@@ -21,6 +21,7 @@ slug: model-coverage/diffusion/qwen/qwen-image
 | Model | HF ID | Training scope |
 |---|---|---|
 | Qwen-Image | [`Qwen/Qwen-Image`](https://huggingface.co/Qwen/Qwen-Image) | Text-to-image training and fine-tuning |
+| Qwen-Image-2.1 | [`Qwen/Qwen-Image-2.1`](https://huggingface.co/Qwen/Qwen-Image-2.1) | Text-to-image full and LoRA fine-tuning |
 | Qwen-Image-Edit-2511 | [`Qwen/Qwen-Image-Edit-2511`](https://huggingface.co/Qwen/Qwen-Image-Edit-2511) | Cached, full-parameter, single-node training |
 
 Qwen-Image-Edit-2511 training is intentionally limited to cached target/context latents and cached Qwen2.5-VL prompt conditioning. Raw-image online encoding, LoRA, older Qwen image-edit checkpoints, and multinode tuning are not supported by the training recipe. Image-edit inference is supported by the generic generation script.
@@ -32,6 +33,42 @@ Qwen-Image-Edit-2511 training is intentionally limited to cached target/context 
 | [qwen_image_edit_2511_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/qwen_image_edit_2511_flow.yaml) | Eight-GPU BF16 FSDP2 baseline for full-parameter Qwen-Image-Edit-2511 training |
 | [qwen_image_t2i_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/qwen_image_t2i_flow.yaml) | Fine-tune Qwen-Image with flow matching |
 | [qwen_image_t2i_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/pretrain/qwen_image_t2i_flow.yaml) | Pretrain Qwen-Image with flow matching |
+| [qwen_image_21_t2i_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/qwen_image_21_t2i_flow.yaml) | Full fine-tune of Qwen-Image-2.1 with FSDP2 |
+| [qwen_image_21_t2i_flow_lora.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/qwen_image_21_t2i_flow_lora.yaml) | LoRA fine-tune of Qwen-Image-2.1 |
+
+## Qwen-Image-2.1 Text-to-Image
+
+Qwen-Image-2.1 is a 7B single-stream, block-causal DiT conditioned on Qwen3-VL hidden states. It uses a 64-channel RGBA VAE with 16x spatial compression, so image sides must be multiples of 32 pixels. It requires a Diffusers build that provides `QwenImage21Pipeline`.
+
+Cache VAE latents and Qwen3-VL prompt embeddings with the `qwen_image_21` processor. RGB images receive an opaque alpha channel before VAE encoding:
+
+```bash
+uv run python -m tools.diffusion.preprocessing_multiprocess image \
+  --dataset_name lambdalabs/naruto-blip-captions \
+  --dataset_media_column image --dataset_caption_column text \
+  --processor qwen_image_21 \
+  --resolution_preset 1024p \
+  --verify \
+  --output_dir /cache/naruto-qwen-image-21
+```
+
+Set `data.dataloader.cache_dir` and `checkpoint.checkpoint_dir`, then launch one FSDP2 rank per GPU:
+
+```bash
+uv run torchrun --nproc-per-node=8 \
+  examples/diffusion/finetune/finetune.py \
+  -c examples/diffusion/finetune/qwen_image_21_t2i_flow.yaml
+```
+
+The `qwen_image_21` adapter supervises only the target-image tokens of the joint text/image sequence and masks padded prompt tokens. Qwen-Image-2.1 is sampled without classifier-free guidance, so the recipes set `cfg_dropout_prob: 0.0`. On 8x H100 80 GB at 1024x1024 with a global batch of 16, the full fine-tune runs at about 1.45 s per step and uses about 55 GB per GPU.
+
+Generate with the base model or a training checkpoint:
+
+```bash
+uv run python examples/diffusion/generate/generate.py \
+  -c examples/diffusion/generate/configs/generate_qwen_image_21.yaml \
+  --model.checkpoint /checkpoints/qwen-image-21/epoch_7_step_599
+```
 
 ## Prepare MagicBrush
 

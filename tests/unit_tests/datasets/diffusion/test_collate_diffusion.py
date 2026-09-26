@@ -172,6 +172,13 @@ class TestCollateFnProduction:
         assert torch.count_nonzero(result["prompt_embeds"][0, 3:]) == 0
         torch.testing.assert_close(result["prompt_embeds"][1, :5], second_prompt_embeds)
         assert torch.count_nonzero(result["prompt_embeds"][1, 5:]) == 0
+        expected_mask = torch.zeros(2, 8, dtype=torch.bool)
+        expected_mask[0, :3] = True
+        expected_mask[1, :5] = True
+        torch.testing.assert_close(result["prompt_embeds_mask"], expected_mask)
+
+        image_batch = collate_fn_text_to_image(batch)
+        torch.testing.assert_close(image_batch["text_attention_mask"], expected_mask)
 
 
 # =============================================================================
