@@ -49,6 +49,7 @@ from nemo_automodel.components.models.nemotron_v3.mtp import (
     build_mtp_config_from_hf,
     build_nemotron_v3_mtp,
 )
+from nemo_automodel.components.models.nemotron_v3.parallelization import PARALLELIZER
 from nemo_automodel.components.models.nemotron_v3.state_dict_adapter import NemotronV3StateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
@@ -1207,4 +1208,5 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         cast_model_to_dtype(self, dtype, skip_modules=("_fp32_params",))
 
 
+NemotronHForCausalLM.parallelizer = PARALLELIZER
 ModelClass = NemotronHForCausalLM

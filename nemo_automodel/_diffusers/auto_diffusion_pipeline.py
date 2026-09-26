@@ -49,14 +49,11 @@ import torch
 import torch.nn as nn
 
 from nemo_automodel._diffusers._hf_cache import resolve_diffusion_model_dir
-from nemo_automodel.components.distributed import DistributedSetup, ParallelismSizes, parallelizer
+from nemo_automodel._diffusers.parallelization import attach_parallelizer
+from nemo_automodel.components.distributed import DistributedSetup, ParallelismSizes
 from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config
 from nemo_automodel.components.distributed.ddp import DDPManager
 from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
-from nemo_automodel.components.distributed.parallelizer import (
-    HunyuanParallelizationStrategy,
-    WanParallelizationStrategy,
-)
 from nemo_automodel.shared.import_utils import safe_import_te
 from nemo_automodel.shared.utils import dtype_from_str
 
@@ -137,12 +134,6 @@ def _import_diffusers_class(class_name: str):
             f"Class '{class_name}' not found in diffusers. Check pipeline_spec.transformer_cls in your YAML config."
         )
     return getattr(diffusers, class_name)
-
-
-def _init_parallelizer():
-    """Register custom parallelization strategies."""
-    parallelizer.PARALLELIZATION_STRATEGIES["WanTransformer3DModel"] = WanParallelizationStrategy()
-    parallelizer.PARALLELIZATION_STRATEGIES["HunyuanVideo15Transformer3DModel"] = HunyuanParallelizationStrategy()
 
 
 def _choose_device(device: torch.device | None) -> torch.device:
@@ -569,13 +560,12 @@ def _apply_parallelization(
         return created_managers
 
     assert torch.distributed.is_initialized(), "Distributed environment must be initialized for parallelization"
-    _init_parallelizer()
-
     for comp_name, comp_module in _iter_pipeline_modules(pipe):
         manager_args = parallel_scheme.get(comp_name)
         if manager_args is None:
             continue
         logger.info("[INFO] Applying parallelization to %s", comp_name)
+        attach_parallelizer(comp_module)
         manager = _create_parallel_manager(manager_args)
         created_managers[comp_name] = manager
         pre_shard_hf_state_dict_keys = list(comp_module.state_dict().keys())

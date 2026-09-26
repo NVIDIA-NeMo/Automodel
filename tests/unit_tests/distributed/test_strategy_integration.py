@@ -20,11 +20,14 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch.nn as nn
 
-from nemo_automodel.components.distributed.parallelizer import (
-    DefaultParallelizationStrategy,
+from nemo_automodel.components.distributed import DefaultModelParallelizer
+from nemo_automodel.components.distributed.model_parallelizer import get_model_parallelizer
+from nemo_automodel.components.distributed.parallelizer import fsdp2_strategy_parallelize
+from nemo_automodel.components.models.nemotron_v3.parallelization import (
+    PARALLELIZER as NEMOTRON_PARALLELIZER,
+)
+from nemo_automodel.components.models.nemotron_v3.parallelization import (
     NemotronHParallelizationStrategy,
-    fsdp2_strategy_parallelize,
-    get_parallelization_strategy,
 )
 
 
@@ -43,6 +46,8 @@ class MockStandardModel(nn.Module):
 
 class MockNemotronModel(nn.Module):
     """Mock NemotronH model."""
+
+    parallelizer = NEMOTRON_PARALLELIZER
 
     def __init__(self):
         super().__init__()
@@ -96,21 +101,20 @@ def mock_device_mesh():
 
 
 def test_strategy_selection_standard_model():
-    """Test that standard models use DefaultParallelizationStrategy."""
+    """Test that standard models use the default model parallelizer."""
     model = MockStandardModel()
-    strategy = get_parallelization_strategy(model)
+    parallelizer = get_model_parallelizer(model)
 
-    assert isinstance(strategy, DefaultParallelizationStrategy)
-    assert not isinstance(strategy, NemotronHParallelizationStrategy)
+    assert isinstance(parallelizer, DefaultModelParallelizer)
 
 
 def test_strategy_selection_nemotron_model():
-    """Test that NemotronH models use NemotronHParallelizationStrategy."""
+    """Test that NemotronH models own their specialized strategy."""
     model = MockNemotronModel()
-    strategy = get_parallelization_strategy(model)
+    parallelizer = get_model_parallelizer(model)
 
-    assert isinstance(strategy, NemotronHParallelizationStrategy)
-    assert not isinstance(strategy, DefaultParallelizationStrategy)
+    assert parallelizer is NEMOTRON_PARALLELIZER
+    assert isinstance(parallelizer.strategy, NemotronHParallelizationStrategy)
 
 
 @patch("torch.distributed.get_process_group_ranks", return_value=[0])
@@ -145,11 +149,15 @@ def test_backward_compatibility_standard_model(
 
 
 @patch("torch.distributed.get_process_group_ranks", return_value=[0])
-@patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
-@patch("nemo_automodel.components.distributed.parallelizer.parallelize_module")
-def test_backward_compatibility_nemotron_model(mock_parallelize_module, mock_fully_shard, mock_gpgr, mock_device_mesh):
+@patch("nemo_automodel.components.models.nemotron_v3.parallelization.fully_shard_by_dtype")
+@patch("nemo_automodel.components.models.nemotron_v3.parallelization.fully_shard")
+@patch("nemo_automodel.components.models.nemotron_v3.parallelization.parallelize_module")
+def test_backward_compatibility_nemotron_model(
+    mock_parallelize_module, mock_fully_shard, mock_fully_shard_by_dtype, mock_gpgr, mock_device_mesh
+):
     """Test that the refactored code maintains backward compatibility for NemotronH models."""
     mock_fully_shard.side_effect = lambda model, **kwargs: model
+    mock_fully_shard_by_dtype.side_effect = lambda model, **kwargs: model
 
     model = MockNemotronModel()
 
@@ -207,7 +215,15 @@ def test_no_runtime_errors_with_different_model_types(mock_device_mesh):
         patch(
             "nemo_automodel.components.distributed.parallelizer.fully_shard", side_effect=lambda model, **kwargs: model
         ),
-        patch("nemo_automodel.components.distributed.parallelizer.parallelize_module"),
+        patch(
+            "nemo_automodel.components.models.nemotron_v3.parallelization.fully_shard",
+            side_effect=lambda model, **kwargs: model,
+        ),
+        patch(
+            "nemo_automodel.components.models.nemotron_v3.parallelization.fully_shard_by_dtype",
+            side_effect=lambda model, **kwargs: model,
+        ),
+        patch("nemo_automodel.components.models.nemotron_v3.parallelization.parallelize_module"),
     ):
         with patch("nemo_automodel.components.distributed.parallelizer.apply_fsdp2_sharding_recursively"):
             with patch(

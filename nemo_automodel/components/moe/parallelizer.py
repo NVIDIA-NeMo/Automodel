@@ -33,16 +33,13 @@ from torch.distributed.tensor.parallel import ParallelStyle, parallelize_module
 from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts
 
 from nemo_automodel.components.distributed import parallelizer_utils
-from nemo_automodel.components.distributed.pipelining.hf_utils import get_text_module
-from nemo_automodel.components.moe.experts import GroupedExpertsDeepEP, GroupedExpertsTE
-from nemo_automodel.components.moe.layers import (
-    Gate,
-    MoE,
+from nemo_automodel.components.distributed.fsdp_patches import (
+    patch_fsdp_accumulated_grad_guard as _patch_fsdp_accumulated_grad_guard,
 )
-from nemo_automodel.components.moe.mok_experts import GroupedExpertsMoK
-from nemo_automodel.components.moe.tp_plan_validation import _validate_moe_tp_plan
-from nemo_automodel.shared.model_utils import iter_transformer_and_mtp_blocks
-from nemo_automodel.shared.multimodal_fsdp import (
+from nemo_automodel.components.distributed.fsdp_patches import (
+    patch_fsdp_uniform_reduce_dtype as _patch_fsdp_uniform_reduce_dtype,
+)
+from nemo_automodel.components.distributed.multimodal_fsdp import (
     MULTIMODAL_TOWER_NAMES,
     FrozenMultimodalSharding,
     ignored_params_for_root,
@@ -52,13 +49,16 @@ from nemo_automodel.shared.multimodal_fsdp import (
     normalize_frozen_multimodal_sharding,
     shard_multimodal_module,
 )
+from nemo_automodel.components.distributed.pipelining.hf_utils import get_text_module
+from nemo_automodel.components.moe.experts import GroupedExpertsDeepEP, GroupedExpertsTE
+from nemo_automodel.components.moe.layers import (
+    Gate,
+    MoE,
+)
+from nemo_automodel.components.moe.mok_experts import GroupedExpertsMoK
+from nemo_automodel.components.moe.tp_plan_validation import _validate_moe_tp_plan
+from nemo_automodel.shared.model_utils import iter_transformer_and_mtp_blocks
 from nemo_automodel.shared.tied_weights import ensure_tied_lm_head
-from nemo_automodel.shared.torch_patches import (
-    patch_fsdp_accumulated_grad_guard as _patch_fsdp_accumulated_grad_guard,
-)
-from nemo_automodel.shared.torch_patches import (
-    patch_fsdp_uniform_reduce_dtype as _patch_fsdp_uniform_reduce_dtype,
-)
 from nemo_automodel.shared.utils import dtype_from_str
 
 logger = logging.getLogger(__name__)

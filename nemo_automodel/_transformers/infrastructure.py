@@ -231,6 +231,7 @@ def _shard_ep_fsdp(model, model_wrapper, parallelize_fn, mesh: MeshContext, reap
 def _instantiate_distributed(
     config: DistributedStrategyConfig | None,
     mesh: MeshContext,
+    moe_config: MoEParallelizerConfig | None = None,
 ) -> Union[FSDP2Manager, MegatronFSDPManager, DDPManager, None]:
     """Instantiate the appropriate distributed manager from config.
 
@@ -250,7 +251,12 @@ def _instantiate_distributed(
     if isinstance(config, FSDP2Config):
         if mesh.device_mesh is None:
             raise ValueError("device_mesh is required for FSDP2Config")
-        return FSDP2Manager(config, device_mesh=mesh.device_mesh, moe_mesh=mesh.moe_mesh)
+        return FSDP2Manager(
+            config,
+            device_mesh=mesh.device_mesh,
+            moe_mesh=mesh.moe_mesh,
+            moe_config=moe_config,
+        )
     elif isinstance(config, MegatronFSDPConfig):
         if mesh.device_mesh is None:
             raise ValueError("device_mesh is required for MegatronFSDPConfig")
@@ -328,10 +334,10 @@ def parallelize_for_pp(
     reapply_trainability: Callable[[torch.nn.Module], None] | None = None,
     **kwargs,
 ) -> torch.nn.Module:
-    """Parallelize model for pipeline parallelism (non-MoE case).
+    """Adapt pipeline/EP call sites to the distributed manager contract.
 
     This function adapts the pipeline parallelism interface to use model_wrapper.parallelize().
-    For MoE models, use parallelize_model from nemo_automodel.components.moe.parallelizer directly.
+    FSDP2 then performs dense or MoE dispatch from one typed context.
 
     Args:
         model: The model to parallelize.
@@ -381,8 +387,8 @@ def instantiate_infrastructure(
         tuple: (model_wrapper, autopipeline, parallelize_fn, qat_quantizer)
             - model_wrapper: Distributed manager instance (or None)
             - autopipeline: AutoPipeline instance (or None)
-            - parallelize_fn: Parallelization function (or None) - built for EP
-                (MoE-specific parallelizer when ep_size > 1) or PP (via model_wrapper)
+            - parallelize_fn: Parallelization function (or None), built for EP
+                or PP through the distributed manager when available.
             - qat_quantizer: QAT quantizer instance (or None)
     """
     if mesh is None:
@@ -392,50 +398,29 @@ def instantiate_infrastructure(
         activation_checkpointing = bool(getattr(distributed_config, "activation_checkpointing", False))
     distributed_config = _with_activation_checkpointing(distributed_config, activation_checkpointing)
 
-    model_wrapper = _instantiate_distributed(distributed_config, mesh)
+    if mesh.ep_size > 1 and moe_parallel_config is None:
+        moe_parallel_config = MoEParallelizerConfig()
+
+    model_wrapper = _instantiate_distributed(distributed_config, mesh, moe_parallel_config)
     autopipeline = _instantiate_pipeline(pipeline_config, mesh, device, distributed_config)
 
     parallelize_fn = None
     if mesh.ep_size > 1:
-        from nemo_automodel.components.moe.parallelizer import parallelize_model
-
-        if moe_parallel_config is None:
-            moe_parallel_config = MoEParallelizerConfig()
-        # Forward the model wrapper's mp_policy (from FSDP2Config) to expert
-        # sharding when the MoE config doesn't set its own, so a custom precision
-        # policy isn't silently dropped for EP models.
-        moe_kwargs = moe_parallel_config.to_dict()
-        if moe_kwargs.get("mp_policy") is None and model_wrapper is not None:
-            moe_kwargs["mp_policy"] = getattr(model_wrapper, "mp_policy", None)
         if isinstance(model_wrapper, FSDP2Manager):
-            # The dedicated MoE parallelizer replaces FSDP2Manager.parallelize
-            # whenever EP is enabled, so forward every FSDP2 setting it owns
-            # rather than silently dropping TP/SP/offload configuration.
-            moe_kwargs.setdefault("tp_shard_plan", model_wrapper.tp_plan)
-            moe_kwargs.setdefault("sequence_parallel", bool(model_wrapper.sequence_parallel))
-            moe_kwargs.setdefault("offload_policy", model_wrapper.offload_policy)
-            if model_wrapper.reshard_after_forward is not None:
-                # FSDP2Config is the canonical distributed policy. Preserve
-                # the MoE-specific default only when the manager leaves this
-                # setting unspecified.
-                moe_kwargs["reshard_after_forward"] = model_wrapper.reshard_after_forward
-            moe_kwargs.setdefault(
-                "enable_async_tensor_parallel",
-                bool(model_wrapper.enable_async_tensor_parallel),
+            parallelize_fn = partial(parallelize_for_pp, model_wrapper=model_wrapper)
+        else:
+            from nemo_automodel.components.moe.parallelizer import parallelize_model as parallelize_moe_model
+
+            parallelize_fn = partial(
+                parallelize_moe_model,
+                activation_checkpointing=activation_checkpointing,
+                activation_checkpointing_scope=getattr(
+                    distributed_config,
+                    "activation_checkpointing_scope",
+                    "all",
+                ),
+                **moe_parallel_config.to_dict(),
             )
-            moe_kwargs.setdefault(
-                "frozen_multimodal_sharding",
-                model_wrapper.frozen_multimodal_sharding,
-            )
-        parallelize_fn = partial(
-            parallelize_model,
-            activation_checkpointing=activation_checkpointing,
-            # The AC scope lives on the strategy config (normalized in its
-            # __post_init__); thread it through so expert-parallel configs keep
-            # scope parity with the generic FSDP2/DDP path.
-            activation_checkpointing_scope=getattr(distributed_config, "activation_checkpointing_scope", "all"),
-            **moe_kwargs,
-        )
     elif autopipeline is not None and model_wrapper is not None:
         parallelize_fn = partial(parallelize_for_pp, model_wrapper=model_wrapper)
 

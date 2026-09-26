@@ -25,15 +25,21 @@ from torch.distributed.fsdp import (
     fully_shard,
 )
 
-from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
-from nemo_automodel.shared.torch_patches import (
+from nemo_automodel.components.distributed.fsdp_patches import (
     patch_fsdp_uniform_reduce_dtype as _patch_fsdp_uniform_reduce_dtype,
 )
-from nemo_automodel.shared.torch_patches import (
+from nemo_automodel.components.distributed.fsdp_patches import (
     patch_fsdp_unused_param_reduction as _patch_fsdp_unused_param_reduction,
 )
+from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 
 UniformSubtreeItem = Union[Tuple[nn.Module, torch.dtype], Tuple[str, nn.Module, torch.dtype]]
+
+__all__ = [
+    "fully_shard_by_dtype",
+    "reject_unsupported_mtp_cp",
+    "reject_unsupported_mtp_cp_pp",
+]
 
 
 def reject_unsupported_mtp_cp(model: nn.Module) -> None:

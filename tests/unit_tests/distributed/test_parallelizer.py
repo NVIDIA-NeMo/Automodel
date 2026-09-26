@@ -1120,7 +1120,7 @@ class TestGetHfTpShardPlan:
         model = MockModel()
         model.config.tie_word_embeddings = True
 
-        with pytest.raises(AssertionError, match="Hugging Face tp plan is not supported"):
+        with pytest.raises(ValueError, match="Hugging Face TP plan is not supported"):
             get_hf_tp_shard_plan(model)
 
     def test_invalid_parallel_style_error(self):
@@ -2339,25 +2339,6 @@ class TestActivationCheckpointingKVSharing:
             assert isinstance(layer.input_layernorm, self._Wrapped)
             assert isinstance(layer.post_attention_layernorm, self._Wrapped)
 
-    def test_bagel_parallelize_uses_full_layer_checkpointing(self):
-        """BAGEL wraps whole Qwen/SigLIP layers through the special AC path."""
-        model = _make_bagel_model(num_language_layers=2, num_vision_layers=2)
-
-        self._run_parallelize(model, activation_checkpointing=True)
-
-        language_layers = model.model.language_model.model.layers
-        vision_layers = model.model.vit_model.vision_model.encoder.layers
-        assert all(isinstance(layer, self._Wrapped) for layer in language_layers)
-        assert all(isinstance(layer, self._Wrapped) for layer in vision_layers)
-
-    # ------------------------------------------------------------------ #
-    # HF native gradient-checkpointing path
-    # ------------------------------------------------------------------ #
-
-    # ------------------------------------------------------------------ #
-    # Exception / edge-case branches
-    # ------------------------------------------------------------------ #
-
     def test_frozen_config_use_cache_except_branch(self):
         """When ``model.config.use_cache = False`` raises, the except branch runs."""
         model = _make_model_for_ac(use_cache=True, num_kv_shared_layers=0)
@@ -3104,12 +3085,8 @@ class TestExtractModelLayers:
             assert [id(m) for m in groups["language"]] == [id(item) for item in lang], cls.__name__
             assert [id(m) for m in groups["vision"]] == [id(item) for item in vis], cls.__name__
 
-    def test_spec_resolving_no_modules_warns_and_returns_empty(self, caplog):
-        """A mapped model class whose spec FQNs all fail to resolve must warn.
-
-        This is the transformers-version-drift failure mode: extraction used to
-        return ``{}`` silently and activation checkpointing became a no-op.
-        """
+    def test_version_drift_uses_structural_layer_discovery(self):
+        """An unrecognized version-specific tree still exposes its language layers."""
         from transformers.models.qwen2_vl.modeling_qwen2_vl import (
             Qwen2VLForConditionalGeneration,
         )
@@ -3122,13 +3099,9 @@ class TestExtractModelLayers:
         language_model.layers = self._make_layers(2)
         model.language_model = language_model
 
-        with caplog.at_level("WARNING", logger=parallelizer.logger.name):
-            groups = _extract_model_layer_groups(model)
+        groups = _extract_model_layer_groups(model)
 
-        assert groups == {}
-        assert "Qwen2VLForConditionalGeneration" in caplog.text
-        assert "model.language_model.layers" in caplog.text
-        assert "model.visual.blocks" in caplog.text
+        assert groups == {"language": list(language_model.layers)}
 
     def test_moduledict_layer_container_flattens(self):
         """PP post-split: ``_reduce_attrs`` returns a ModuleDict.
@@ -3410,43 +3383,3 @@ class TestExtractModelLayers:
         assert len(result) == 5
         assert [id(r) for r in result[:2]] == [id(layer) for layer in language_layers]
         assert [id(r) for r in result[2:]] == [id(layer) for layer in vision_layers]
-
-
-class TestBagelFullLayerActivationCheckpointing:
-    """Tests for native BAGEL-style whole-layer activation checkpointing."""
-
-    def test_get_module_by_fqn_resolves_nested_module_and_missing_path(self):
-        """Nested FQN lookup returns the module or None for missing paths."""
-        model = _make_bagel_model()
-
-        result = parallelizer._get_module_by_fqn(model, "model.vit_model.vision_model.encoder.layers")
-
-        assert result is model.model.vit_model.vision_model.encoder.layers
-        assert parallelizer._get_module_by_fqn(model, "model.missing.layers") is None
-
-    def test_apply_bagel_full_layer_activation_checkpointing_wraps_each_layer(self, monkeypatch):
-        """BAGEL wraps Qwen and SigLIP layers once and skips already wrapped layers."""
-        model = _make_bagel_model(num_language_layers=2, num_vision_layers=3)
-        wrap_calls = []
-
-        def _fake_checkpoint_wrapper(module, **kwargs):
-            wrap_calls.append((module, kwargs))
-            return _CheckpointWrapped(module, **kwargs)
-
-        monkeypatch.setattr(parallelizer, "checkpoint_wrapper", _fake_checkpoint_wrapper)
-
-        assert parallelizer._apply_bagel_full_layer_activation_checkpointing(model) is True
-
-        language_layers = model.model.language_model.model.layers
-        vision_layers = model.model.vit_model.vision_model.encoder.layers
-        wrapped_layers = list(language_layers) + list(vision_layers)
-        assert len(wrap_calls) == 5
-        assert all(isinstance(layer, _CheckpointWrapped) for layer in wrapped_layers)
-        assert all(call_kwargs["checkpoint_impl"].name == "NO_REENTRANT" for _, call_kwargs in wrap_calls)
-
-        assert parallelizer._apply_bagel_full_layer_activation_checkpointing(model) is False
-        assert len(wrap_calls) == 5
-
-    def test_apply_bagel_full_layer_activation_checkpointing_ignores_other_models(self):
-        """Non-BAGEL models continue through the generic checkpointing path."""
-        assert parallelizer._apply_bagel_full_layer_activation_checkpointing(nn.Module()) is False

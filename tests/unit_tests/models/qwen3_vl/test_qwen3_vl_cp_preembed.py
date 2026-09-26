@@ -31,10 +31,7 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
 
 import nemo_automodel.components.models.qwen3_vl.model as qwen3_vl_model_module
 from nemo_automodel.components.distributed.context_parallel.sharder import ContextParallelSharder
-from nemo_automodel.components.distributed.parallelizer import (
-    DefaultParallelizationStrategy,
-    get_parallelization_strategy,
-)
+from nemo_automodel.components.distributed.parallelizer import DefaultParallelizationStrategy
 from nemo_automodel.components.models.qwen3_vl.model import Qwen3VLForConditionalGeneration
 
 
@@ -118,7 +115,7 @@ def test_parallelization_strategy_installs_cp_mesh(monkeypatch):
         lambda _self, parallel_model, _device_mesh, **_kwargs: parallel_model,
     )
 
-    strategy = get_parallelization_strategy(model)
+    strategy = model.parallelizer.strategy
     result = strategy.parallelize(model, device_mesh)
 
     assert type(strategy).__name__ == "Qwen3VLParallelizationStrategy"

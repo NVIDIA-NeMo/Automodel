@@ -23,14 +23,15 @@ from nemo_automodel.components.distributed.activation_checkpointing import (
     detect_kv_sharing_and_maybe_disable_cache,
     is_selective_activation_checkpointing,
 )
-from nemo_automodel.components.distributed.config import FSDP2Config
+from nemo_automodel.components.distributed.config import FSDP2Config, MoEParallelizerConfig
 from nemo_automodel.components.distributed.init_utils import get_world_size_safe
+from nemo_automodel.components.distributed.mesh import MeshContext
+from nemo_automodel.components.distributed.model_parallelizer import ParallelizeContext, parallelize_model
 from nemo_automodel.components.distributed.parallelizer import (
     _extract_model_layer_groups,
     _filter_layer_groups_for_activation_checkpointing,
     _should_use_hf_native_gradient_checkpointing,
     apply_selective_activation_checkpointing,
-    fsdp2_strategy_parallelize,
 )
 
 logger = logging.getLogger(__name__)
@@ -97,6 +98,8 @@ class FSDP2Manager:
         config (FSDP2Config): Configuration for FSDP2 distributed training.
         device_mesh (DeviceMesh): Device mesh for distributed operations.
         moe_mesh (Optional[DeviceMesh]): Optional device mesh for expert parallelism.
+        moe_config: Optional expert-parallel policy included in the model's
+            :class:`ParallelizeContext`.
 
     Example:
         from nemo_automodel.components.distributed.config import FSDP2Config
@@ -112,10 +115,12 @@ class FSDP2Manager:
         config: FSDP2Config,
         device_mesh: DeviceMesh,
         moe_mesh: DeviceMesh | None = None,
+        moe_config: MoEParallelizerConfig | None = None,
     ):
         self.config = config
         self.device_mesh = device_mesh
         self.moe_mesh = moe_mesh
+        self.moe_config = moe_config
 
         # Extract config fields for easy access
         self.sequence_parallel = config.sequence_parallel
@@ -183,23 +188,16 @@ class FSDP2Manager:
         if self.config.patch_is_packed_sequence:
             _patch_is_packed_sequence_for_training()
 
-        fsdp2_strategy_parallelize(
-            model,
-            device_mesh=self.device_mesh,
-            mp_policy=self.mp_policy,
-            tp_shard_plan=self.tp_plan,
-            offload_policy=self.offload_policy,
-            sequence_parallel=bool(self.sequence_parallel),
+        context = ParallelizeContext(
+            mesh=MeshContext.from_meshes(self.device_mesh, self.moe_mesh),
+            strategy=self.config,
+            moe=self.moe_config,
             activation_checkpointing=self.activation_checkpointing,
-            enable_async_tensor_parallel=self.enable_async_tensor_parallel,
-            enable_compile=self.enable_compile,
-            enable_fsdp2_prefetch=self.enable_fsdp2_prefetch,
-            fsdp2_backward_prefetch_depth=self.fsdp2_backward_prefetch_depth,
-            fsdp2_forward_prefetch_depth=self.fsdp2_forward_prefetch_depth,
-            reshard_after_forward=self.reshard_after_forward,
-            activation_checkpointing_scope=self.activation_checkpointing_scope,
-            frozen_multimodal_sharding=self.frozen_multimodal_sharding,
             reapply_trainability=reapply_trainability,
+        )
+        model = parallelize_model(
+            model,
+            context,
         )
 
         return model

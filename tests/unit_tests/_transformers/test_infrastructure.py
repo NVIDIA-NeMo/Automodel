@@ -110,19 +110,12 @@ class TestShouldLoadBeforeShard:
         assert _should_load_before_shard(**{**self._DEFAULTS, "ep_size": 1}) is True
 
 
-def test_moe_infrastructure_forwards_fsdp2_tp_sequence_and_offload_settings():
-    """EP's dedicated parallelizer must retain the FSDP2 manager's TP settings."""
-    from nemo_automodel._transformers.infrastructure import instantiate_infrastructure
+def test_moe_infrastructure_routes_fsdp2_through_manager_contract():
+    """EP and FSDP2 share the manager's model-parallelization contract."""
+    from nemo_automodel._transformers.infrastructure import instantiate_infrastructure, parallelize_for_pp
     from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
 
     manager = object.__new__(FSDP2Manager)
-    manager.tp_plan = {"lm_head": object()}
-    manager.sequence_parallel = False
-    manager.offload_policy = object()
-    manager.mp_policy = object()
-    manager.reshard_after_forward = True
-    manager.enable_async_tensor_parallel = False
-    manager.frozen_multimodal_sharding = "replicate"
     mesh = SimpleNamespace(ep_size=2)
 
     with (
@@ -136,13 +129,28 @@ def test_moe_infrastructure_forwards_fsdp2_tp_sequence_and_offload_settings():
         )
 
     assert model_wrapper is manager
-    assert parallelize_fn.keywords["tp_shard_plan"] is manager.tp_plan
-    assert parallelize_fn.keywords["sequence_parallel"] is False
-    assert parallelize_fn.keywords["offload_policy"] is manager.offload_policy
-    assert parallelize_fn.keywords["mp_policy"] is manager.mp_policy
-    assert parallelize_fn.keywords["reshard_after_forward"] is True
-    assert parallelize_fn.keywords["enable_async_tensor_parallel"] is False
-    assert parallelize_fn.keywords["frozen_multimodal_sharding"] == "replicate"
+    assert parallelize_fn.func is parallelize_for_pp
+    assert parallelize_fn.keywords == {"model_wrapper": manager}
+
+
+def test_instantiate_distributed_forwards_moe_policy_to_fsdp2_manager():
+    """The manager receives the MoE policy used to build ParallelizeContext."""
+    from nemo_automodel._transformers.infrastructure import _instantiate_distributed
+    from nemo_automodel.components.distributed.config import FSDP2Config, MoEParallelizerConfig
+
+    config = FSDP2Config()
+    moe_config = MoEParallelizerConfig()
+    mesh = SimpleNamespace(device_mesh=object(), moe_mesh=object())
+
+    with patch(f"{_INFRA_MODULE}.FSDP2Manager") as manager_type:
+        _instantiate_distributed(config, mesh, moe_config)
+
+    manager_type.assert_called_once_with(
+        config,
+        device_mesh=mesh.device_mesh,
+        moe_mesh=mesh.moe_mesh,
+        moe_config=moe_config,
+    )
 
 
 def test_pipeline_parallelizer_forwards_trainability_rebind():

@@ -32,8 +32,8 @@ from torch.distributed.tensor import DTensor
 
 from nemo_automodel.components.distributed.parallelizer import (
     DefaultParallelizationStrategy,
-    Qwen3_5ParallelizationStrategy,
 )
+from nemo_automodel.components.models.qwen3_5.parallelization import Qwen3_5ParallelizationStrategy
 
 # Over the default 5s budget on purpose: this module spawns worker processes; every child re-imports torch from scratch.
 # Shrink the work or the process count before raising this further.
@@ -136,7 +136,9 @@ def _run_case(
 
     if tied and not shared_module and (input_in_container or output_in_container):
         original_parameters = list(model.parameters())
-        with pytest.raises(ValueError, match="Distinct tied input/output embedding modules inside a ModuleList or ModuleDict"):
+        with pytest.raises(
+            ValueError, match="Distinct tied input/output embedding modules inside a ModuleList or ModuleDict"
+        ):
             strategy.parallelize(model, device_mesh=mesh, mp_policy=mp_policy)
         assert model.get_input_embeddings().weight is model.get_output_embeddings().weight
         assert [id(param) for param in model.parameters()] == [id(param) for param in original_parameters]

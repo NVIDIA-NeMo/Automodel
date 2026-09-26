@@ -44,7 +44,10 @@ import torch
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
 
 from nemo_automodel.components.distributed.cp_vision_frame_shard import CpVisionFrameShardingConfig
-from nemo_automodel.shared.multimodal_fsdp import FrozenMultimodalSharding, normalize_frozen_multimodal_sharding
+from nemo_automodel.components.distributed.multimodal_fsdp import (
+    FrozenMultimodalSharding,
+    normalize_frozen_multimodal_sharding,
+)
 
 if TYPE_CHECKING:
     from nemo_automodel.components.distributed.mesh import MeshContext, ParallelismSizes
@@ -301,7 +304,7 @@ class FSDP2Config:
     """
 
     sequence_parallel: bool = False
-    tp_plan: dict | None = None
+    tp_plan: dict | str | None = None
     patch_is_packed_sequence: bool = False
     mp_policy: MixedPrecisionPolicy | None = field(
         default_factory=lambda: MixedPrecisionPolicy(

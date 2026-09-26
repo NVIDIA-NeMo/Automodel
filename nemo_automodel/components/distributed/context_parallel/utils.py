@@ -873,3 +873,6 @@ def _shard_thd_chunk_for_te(
         ).contiguous()
 
     return output_batch, local_indices
+
+
+__all__ = ["attach_te_context_parallel"]

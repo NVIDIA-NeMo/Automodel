@@ -22,6 +22,10 @@ import torch.nn as nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
 from torch.distributed.fsdp import MixedPrecisionPolicy
 
+from nemo_automodel.components.distributed.fsdp_patches import (
+    patch_fsdp_uniform_reduce_dtype,
+    patch_fsdp_unused_param_reduction,
+)
 from nemo_automodel.components.distributed.parallelizer_utils import (
     _fully_shard,
     _get_module_from_path,
@@ -34,10 +38,6 @@ from nemo_automodel.components.distributed.parallelizer_utils import (
     iter_maximal_uniform_dtype_subtrees,
     reject_unsupported_mtp_cp,
     reject_unsupported_mtp_cp_pp,
-)
-from nemo_automodel.shared.torch_patches import (
-    patch_fsdp_uniform_reduce_dtype,
-    patch_fsdp_unused_param_reduction,
 )
 
 
@@ -1025,9 +1025,7 @@ def test_compute_dtype_pins_logical_names_through_activation_checkpointing():
     model = nn.Module()
     model.attn = checkpoint_wrapper(attention)
 
-    compute_dtype_of = _make_compute_dtype_fn(
-        model, _make_mp_policy(), ("attn.sinks_param",)
-    )
+    compute_dtype_of = _make_compute_dtype_fn(model, _make_mp_policy(), ("attn.sinks_param",))
 
     assert compute_dtype_of(attention.sinks_param.weight) == torch.float32
     assert compute_dtype_of(attention.sinks_param.scale) == torch.float32
