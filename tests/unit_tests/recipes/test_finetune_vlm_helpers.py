@@ -31,6 +31,7 @@ from nemo_automodel.components.datasets.vlm.pp_media import (
 )
 from nemo_automodel.components.distributed.cp_vision_frame_shard import CpVisionFrameShardingConfig
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
+from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.components.optim.optimizer import LRSchedulerConfig, build_optimizer_config
 from nemo_automodel.components.training.step_scheduler import StepSchedulerConfig
@@ -1613,54 +1614,47 @@ def _prepare_pp_vlm_batch(batch, n_microbatches=2):
 
 class _StageWithLogitsToKeep(nn.Module):
     def forward(self, input_ids=None, logits_to_keep=0, **kwargs):
-        return input_ids
+        return None
 
 
-class _StageWithoutLogitsToKeep(nn.Module):
+class _StageNoLogitsToKeep(nn.Module):
     def forward(self, input_ids=None, **kwargs):
-        return input_ids
+        return None
 
 
 @pytest.mark.parametrize(
-    "has_logits_to_keep, has_hidden_state_marker, pp_enabled, expect_fused",
+    "has_logits_to_keep, has_marker, pp_enabled, expect_fused",
     [
-        (True, True, True, True),
-        (False, True, True, False),
-        (True, False, True, False),
-        (True, False, False, True),
+        (True, True, True, True),  # PP generic patched forward -> fused CE kept
+        (False, True, True, False),  # PP, no logits_to_keep -> fall back
+        (True, False, True, False),  # PP, logits_to_keep but no hidden-states marker (MoE/custom) -> fall back
+        (True, False, False, True),  # non-PP: the hidden-states marker gate does not apply -> fused CE kept
     ],
 )
-def test_vlm_maybe_downgrade_loss_fn(
-    has_logits_to_keep,
-    has_hidden_state_marker,
-    pp_enabled,
-    expect_fused,
-):
+def test_maybe_downgrade_loss_fn(has_logits_to_keep, has_marker, pp_enabled, expect_fused):
+    """FusedLinearCrossEntropy survives only when the probed stage module supports
+    logits_to_keep and (under PP) advertises hidden-states emission via
+    _pp_return_hidden_states_supported; otherwise it downgrades to MaskedCrossEntropy."""
     from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
-    from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+    from nemo_automodel.recipes.vlm.finetune import _maybe_downgrade_loss_fn
 
-    stage_cls = _StageWithLogitsToKeep if has_logits_to_keep else _StageWithoutLogitsToKeep
-    probe = stage_cls()
-    if has_hidden_state_marker:
-        probe._pp_return_hidden_states_supported = True
+    probe = (_StageWithLogitsToKeep if has_logits_to_keep else _StageNoLogitsToKeep)()
+    if has_marker:
+        probe._pp_return_hidden_states_supported = True  # set by patch_hf_model_for_pp on the generic forward
 
-    result = _maybe_downgrade_loss_fn(
-        FusedLinearCrossEntropy(ignore_index=-7),
-        probe,
-        pp_enabled=pp_enabled,
-    )
+    result = _maybe_downgrade_loss_fn(FusedLinearCrossEntropy(ignore_index=0), probe, pp_enabled=pp_enabled)
 
     assert isinstance(result, FusedLinearCrossEntropy) is expect_fused
     if not expect_fused:
         assert isinstance(result, MaskedCrossEntropy)
-        assert result.ignore_index == -7
+        assert result.ignore_index == 0
 
 
 def test_vlm_maybe_downgrade_keeps_masked_ce_object():
     from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 
     loss_fn = MaskedCrossEntropy()
-    assert _maybe_downgrade_loss_fn(loss_fn, _StageWithoutLogitsToKeep(), pp_enabled=True) is loss_fn
+    assert _maybe_downgrade_loss_fn(loss_fn, _StageNoLogitsToKeep(), pp_enabled=True) is loss_fn
 
 
 def test_vlm_maybe_downgrade_pp_fallback_preserves_reduction_and_warns(caplog):

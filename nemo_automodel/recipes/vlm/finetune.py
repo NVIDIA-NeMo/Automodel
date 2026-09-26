@@ -589,18 +589,16 @@ class FinetuneRecipeForVLM(BaseRecipe):
             model, optimizer, self.distributed_config, allow=allow_megatron_fsdp_sharding
         )
 
-        self.loss_fn = _maybe_downgrade_loss_fn(
-            self.loss_fn,
-            capability_model,
-            isinstance(model, AutoPipeline),
-        )
-
         if isinstance(model, AutoPipeline):
             self.model_parts = model.parts
             self.pp = model
         else:
             self.model_parts = [model]
             self.pp = None
+
+        # Loss-function capability check
+        self.loss_fn = _maybe_downgrade_loss_fn(self.loss_fn, self.model_parts[0], self.pp is not None)
+
         if self.pp_enabled:
             self._configure_pipeline_loss_fn()
 
@@ -1086,7 +1084,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         if last_stage_model is None:
             raise RuntimeError("Pipeline reports a last stage, but no last-stage model part was found")
 
-        # FusedLinearCrossEntropy consumes hidden states and applies the LM head inside the loss.
+        # FusedLinearCrossEntropy consumes hidden states: flag the last stage to emit them
         if isinstance(self.loss_fn, FusedLinearCrossEntropy):
             last_stage_model._pp_return_hidden_states = True
 
