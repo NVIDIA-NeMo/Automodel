@@ -54,6 +54,7 @@ if not hasattr(_generic_utils, "check_model_inputs"):
 
     _generic_utils.check_model_inputs = _check_model_inputs
 
+from nemo_automodel._transformers.hf_cache import call_with_cached_files_first
 from nemo_automodel._transformers.utils import apply_qwen3_omni_config_patch
 
 apply_qwen3_omni_config_patch()
@@ -277,7 +278,9 @@ def _load_registered_custom_config(pretrained_model_name_or_path, attn_implement
     config_kwargs.pop("code_revision", None)
 
     try:
-        config_dict, unused_kwargs = PretrainedConfig.get_config_dict(pretrained_model_name_or_path, **config_kwargs)
+        config_dict, unused_kwargs = call_with_cached_files_first(
+            PretrainedConfig.get_config_dict, pretrained_model_name_or_path, **config_kwargs
+        )
     except Exception:
         logger.debug("Could not pre-read config for %s", pretrained_model_name_or_path, exc_info=True)
         return None
@@ -322,7 +325,8 @@ def get_hf_config(pretrained_model_name_or_path, attn_implementation, **kwargs):
         hf_config = _load_registered_custom_config(pretrained_model_name_or_path, attn_implementation, **kwargs)
     if hf_config is None:
         try:
-            hf_config = AutoConfig.from_pretrained(
+            hf_config = call_with_cached_files_first(
+                AutoConfig.from_pretrained,
                 pretrained_model_name_or_path,
                 **kwargs,
                 trust_remote_code=trust_remote_code,
@@ -366,7 +370,9 @@ def _load_config_with_layer_types_fix(pretrained_model_name_or_path, attn_implem
     """
     from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
-    config_dict, _ = PretrainedConfig.get_config_dict(pretrained_model_name_or_path, **kwargs)
+    config_dict, _ = call_with_cached_files_first(
+        PretrainedConfig.get_config_dict, pretrained_model_name_or_path, **kwargs
+    )
     n = config_dict.get("num_hidden_layers")
     lt = config_dict.get("layer_types")
     if isinstance(n, int) and isinstance(lt, list) and len(lt) > n:

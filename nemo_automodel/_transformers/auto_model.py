@@ -76,6 +76,7 @@ if TYPE_CHECKING:
 # that import NEED_SETUP_CACHE_CLASSES_MAPPING from transformers.generation.utils.
 import transformers.generation.utils as _gen_utils  # noqa: E402
 
+from nemo_automodel._transformers.hf_cache import call_with_cached_files_first
 from nemo_automodel._transformers.infrastructure import (
     MeshContext,
     apply_model_infrastructure,
@@ -229,7 +230,8 @@ def _alias_remote_auto_map_for_target(args, kwargs, target_key):
         pretrained_path = args[0]
         hub_kwargs = {k: kwargs[k] for k in _AUTO_CONFIG_HUB_KWARG_KEYS if k in kwargs}
         try:
-            config = AutoConfig.from_pretrained(
+            config = call_with_cached_files_first(
+                AutoConfig.from_pretrained,
                 pretrained_path,
                 trust_remote_code=True,
                 **hub_kwargs,
@@ -280,7 +282,8 @@ def _maybe_reject_tie_word_embeddings_flip(pretrained_model_name_or_path, hf_con
         return
     hub_kwargs = {k: kwargs[k] for k in _AUTO_CONFIG_HUB_KWARG_KEYS if k in kwargs}
     try:
-        raw_config = AutoConfig.from_pretrained(
+        raw_config = call_with_cached_files_first(
+            AutoConfig.from_pretrained,
             pretrained_model_name_or_path,
             trust_remote_code=kwargs.get("trust_remote_code", resolve_trust_remote_code(pretrained_model_name_or_path)),
             **hub_kwargs,

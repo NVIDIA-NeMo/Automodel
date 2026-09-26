@@ -496,6 +496,16 @@ class ConfigNode:
         import traceback
 
         try:
+            if (
+                getattr(func, "__name__", "") == "from_pretrained"
+                and getattr(getattr(func, "__self__", None), "__name__", None) == "AutoConfig"
+            ):
+                from transformers import AutoConfig
+
+                if getattr(func, "__self__", None) is AutoConfig:
+                    from nemo_automodel._transformers.hf_cache import call_with_cached_files_first
+
+                    return call_with_cached_files_first(func, *args, **config_kwargs)
             return func(*args, **config_kwargs)
         except Exception as e:
             sig = inspect.signature(func)
