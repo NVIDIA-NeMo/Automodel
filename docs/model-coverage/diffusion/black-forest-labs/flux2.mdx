@@ -4,7 +4,9 @@ description: "Fine-tune FLUX.2-dev for text-to-image generation with NeMo AutoMo
 slug: model-coverage/diffusion/black-forest-labs/FLUX.2-dev
 ---
 
-[FLUX.2-dev](https://huggingface.co/black-forest-labs/FLUX.2-dev) is a text-to-image diffusion model supported by NeMo AutoModel's flow-matching training recipe.
+[FLUX.2-dev](https://huggingface.co/black-forest-labs/FLUX.2-dev) is Black Forest Labs' 32B rectified flow transformer for text-to-image generation and single- or multi-reference image editing.
+
+NeMo AutoModel includes full-parameter and Low-Rank Adaptation (LoRA) text-to-image fine-tuning recipes for this checkpoint.
 
 ## Model Reference
 
@@ -12,9 +14,21 @@ slug: model-coverage/diffusion/black-forest-labs/FLUX.2-dev
 
 | Property | Value |
 |---|---|
-| **Task** | Text-to-Image |
-| **Architecture** | Diffusion Transformer (Flow Matching) |
-| **HF Org** | [black-forest-labs](https://huggingface.co/black-forest-labs) |
+| Upstream Tasks | Text-to-image generation; single- and multi-reference image editing |
+| Model Type | Rectified flow transformer |
+| Parameters | 32B |
+| Reference Architecture | `Flux2` |
+| Transformer Blocks | 8 double-stream / 48 single-stream |
+| Hidden Size | 6,144 |
+| Attention | 48 heads |
+| Feed-Forward Ratio | 3.0 |
+| Text Encoder | `Mistral-Small-3.2-24B-Instruct-2506` |
+| Text Feature Width | 15,360 |
+| Latent Channels | 128 input / 128 output |
+| Position Axes | 4 axes with 32 dimensions each |
+| Rotary Position Embedding Theta | 2,000 |
+| Guidance | Guidance-distilled with guidance embedding enabled |
+| Weight Dtype | `BF16` |
 
 ## Example Model and Recipes
 
