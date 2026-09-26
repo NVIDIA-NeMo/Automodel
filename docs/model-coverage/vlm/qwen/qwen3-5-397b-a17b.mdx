@@ -17,9 +17,14 @@ automodel examples/vlm_finetune/qwen3_5_moe/qwen3_5_moe_medpix.yaml --nproc-per-
 
 Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node run.
 
-## Standard Recipe Configuration
+## Choose a Workflow
 
-Start with the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5_moe/qwen3_5_moe_medpix.yaml).
+| Goal | Start Here |
+| --- | --- |
+| Run the primary recipe for this model | Use the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5_moe/qwen3_5_moe_medpix.yaml). |
+| Prepare your environment | Follow the [installation instructions](/get-started/installation). |
+
+### Configuration
 
 | Setting | Configuration |
 | --- | --- |
@@ -28,10 +33,6 @@ Start with the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/b
 | Nodes | 32 |
 | Features | HybridEP (dispatcher=hybridep) |
 | Advanced | attention=sdpa, linear=torch, experts=gmm, dispatcher=hybridep |
-
-## Alternate Recipe Configuration
-
-- [Standard recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5_moe/qwen3_5_moe_medpix.yaml)
 
 ## Model Reference
 

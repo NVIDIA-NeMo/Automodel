@@ -15,9 +15,14 @@ Follow the [installation instructions](/get-started/installation), then run the 
 automodel examples/llm_finetune/qwen/qwen3_8b_squad_spark.yaml --nproc-per-node 8
 ```
 
-## Standard Recipe Configuration
+## Choose a Workflow
 
-Start with the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen3_8b_squad_spark.yaml).
+| Goal | Start Here |
+| --- | --- |
+| Run the primary recipe for this model | Use the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen3_8b_squad_spark.yaml). |
+| Try another checked-in recipe for this model | Use the [alternate recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen3_8b_hellaswag_pp_peft.yaml). |
+
+### Configuration
 
 | Setting | Configuration |
 | --- | --- |
@@ -27,7 +32,7 @@ Start with the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/b
 | Features | Packed sequences (packed_sequence_size=1024) |
 | Advanced | - |
 
-## Alternate Recipe Configuration
+### More Recipes for This Model
 
 - [`qwen3_8b_hellaswag_pp_peft.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen3_8b_hellaswag_pp_peft.yaml)
 - [`qwen3_8b_squad_rtx_spark.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen3_8b_squad_rtx_spark.yaml)

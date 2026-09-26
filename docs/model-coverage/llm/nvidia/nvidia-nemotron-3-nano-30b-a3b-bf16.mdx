@@ -17,9 +17,14 @@ uv run automodel examples/llm_finetune/nemotron/nemotron_nano_v3_cp_test.yaml \
   --nproc-per-node 8
 ```
 
-## Standard Recipe Configuration
+## Choose a Workflow
 
-Start with the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_nano_v3_cp_test.yaml).
+| Goal | Start Here |
+| --- | --- |
+| Run the primary recipe for this model | Use the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_nano_v3_cp_test.yaml). |
+| Try another checked-in recipe for this model | Use the [alternate recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/nemotron/nemotron_nano_v3_te_deepep.yaml). |
+
+### Configuration
 
 | Setting | Configuration |
 | --- | --- |
@@ -29,7 +34,7 @@ Start with the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/b
 | Features | Transformer Engine |
 | Advanced | attention=te |
 
-## Alternate Recipe Configuration
+### More Recipes for This Model
 
 - [`nemotron_nano_v3_te_deepep.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/nemotron/nemotron_nano_v3_te_deepep.yaml)
 - [`customizer_nemotron_nano_full_sft.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/customizer_nemotron_nano_full_sft.yaml)

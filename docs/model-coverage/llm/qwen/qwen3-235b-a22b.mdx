@@ -17,9 +17,14 @@ automodel examples/llm_benchmark/qwen/qwen3_moe_235b_te_deepep.yaml --nproc-per-
 
 Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node run.
 
-## Standard Recipe Configuration
+## Choose a Workflow
 
-Start with the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/qwen/qwen3_moe_235b_te_deepep.yaml).
+| Goal | Start Here |
+| --- | --- |
+| Run the primary recipe for this model | Use the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/qwen/qwen3_moe_235b_te_deepep.yaml). |
+| Try another checked-in recipe for this model | Use the [alternate recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/qwen/qwen3_moe_235b_te_deepep_gb200.yaml). |
+
+### Configuration
 
 | Setting | Configuration |
 | --- | --- |
@@ -29,7 +34,7 @@ Start with the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/b
 | Features | Activation checkpointing (activation_checkpointing=true), Transformer Engine, DeepEP (dispatcher=deepep) |
 | Advanced | attention=te, linear=te, experts=gmm, dispatcher=deepep |
 
-## Alternate Recipe Configuration
+### More Recipes for This Model
 
 - [`qwen3_moe_235b_te_deepep_gb200.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/qwen/qwen3_moe_235b_te_deepep_gb200.yaml)
 - [`qwen3_moe_235b_te_mxfp8_gb200.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/qwen/qwen3_moe_235b_te_mxfp8_gb200.yaml)
