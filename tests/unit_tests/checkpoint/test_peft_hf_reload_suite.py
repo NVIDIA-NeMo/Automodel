@@ -563,3 +563,68 @@ def test_legacy_export_names_one_namespace(family: _Family, tmp_path: Path, peft
         f"{family.id}/v4: tensors and target_modules name different modules; "
         f"tensors_only={sorted(modules - targets)} targets_only={sorted(targets - modules)}"
     )
+
+
+@pytest.mark.parametrize("family", _params())
+def test_adapter_written_by_peft_loads_through_our_path(family: _Family, tmp_path: Path, peft_process_group):
+    """An adapter this repo did not write has to load through the same boundary.
+
+    Every other test here starts from our own export, so it can only prove the two
+    directions agree with each other. A checkpoint produced by the PEFT trainer is the
+    case that actually turns up on resume, and ``from_hf`` is what has to accept it.
+    If our naming drifts from the ecosystem's, this is the test that notices.
+    """
+    from peft import LoraConfig, get_peft_model
+    from safetensors.torch import load_file
+
+    model, _, peft_config = _adapted_model(family, tmp_path / "source")
+    adapter = getattr(model, "state_dict_adapter", None)
+    if adapter is None:
+        pytest.skip(f"{family.id} has no state-dict adapter; the boundary names its tensors directly")
+
+    ours = ModelState(model, is_peft=True).state_dict()
+    leaves = sorted({_module_of(key).rsplit(".", 1)[-1] for key in ours})
+
+    # Same modules, adapted by PEFT itself and written by PEFT itself.
+    theirs, _ = family.build()
+    wrapped = get_peft_model(theirs.eval(), LoraConfig(r=2, lora_alpha=4, target_modules=leaves, lora_dropout=0.0))
+    written_dir = tmp_path / "written-by-peft"
+    wrapped.save_pretrained(str(written_dir))
+    written_dir = written_dir / "default" if (written_dir / "default").exists() else written_dir
+    written = load_file(str(written_dir / "adapter_model.safetensors"))
+
+    # PEFT also stores the frozen base weight for modules it has to replace wholesale.
+    # That is its own bookkeeping, not an adapter tensor, and no export produces it.
+    written = {key: value for key, value in written.items() if ".base_layer." not in key}
+    assert written, f"{family.id}: PEFT wrote no adapter tensors to load back"
+
+    loaded = adapter.from_hf(dict(written))
+
+    assert set(loaded) == set(ours), (
+        f"{family.id}: loading a PEFT-written adapter lands on different names than our own "
+        f"export uses; theirs_only={sorted(set(loaded) - set(ours))} "
+        f"ours_only={sorted(set(ours) - set(loaded))}"
+    )
+    for name, value in written.items():
+        torch.testing.assert_close(loaded[name], value, rtol=0, atol=0)
+
+    if family.legacy_namespace is None:
+        return
+
+    # The harder half of "existing checkpoint": one saved while the model still used the
+    # legacy namespace. from_hf carries the normalization for exactly this, and nothing
+    # else here feeds it a legacy-namespaced adapter.
+    legacy = {
+        key.replace("base_model.model.model.", f"base_model.model.{family.legacy_namespace}", 1): value
+        for key, value in written.items()
+    }
+    assert legacy != written, (
+        f"{family.id}: the legacy rewrite changed nothing, so this case is not being exercised"
+    )
+
+    normalized = adapter.from_hf(dict(legacy))
+    assert set(normalized) == set(ours), (
+        f"{family.id}: a {family.legacy_namespace!r} adapter did not normalize to the native "
+        f"namespace; legacy_only={sorted(set(normalized) - set(ours))} "
+        f"ours_only={sorted(set(ours) - set(normalized))}"
+    )
