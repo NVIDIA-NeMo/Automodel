@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Super 3.5 VL text-only mock benchmark: 4 nodes x 4 GB200, one NVLink domain.
+# NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16 text-only mock benchmark: 4 nodes x 4 GB200, one NVLink domain.
 # Native entry: nemo_automodel/recipes/llm/benchmark.py
 # Required environment: PYTORCH_ALLOC_CONF=expandable_segments:True
 # To enable online W&B, set wandb.enable: true and provide authentication.
@@ -37,7 +37,7 @@ model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
   config:
     _target_: transformers.AutoConfig.from_pretrained
-    pretrained_model_name_or_path: /lustre/fsw/portfolios/coreai/users/huiyingl/super35_perf_hsg_20260915/model_full
+    pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16
     trust_remote_code: true
   dtype: bfloat16
   num_nextn_predict_layers: 0
