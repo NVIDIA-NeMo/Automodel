@@ -574,7 +574,7 @@ def test_nemotron_h_omni_reasoning_v3_registered_in_arch_mapping():
 
     assert "NemotronH_Omni_Reasoning_V3" in MODEL_ARCH_MAPPING, (
         "NemotronH_Omni_Reasoning_V3 missing from MODEL_ARCH_MAPPING. "
-        "nvidia/NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained (and other "
+        "nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16 (and other "
         "Super-scale omni checkpoints) declare this architecture and need it routed "
         "to the in-tree model implementation."
     )

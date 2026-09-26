@@ -85,6 +85,7 @@ class KimiK3TextConfig(PretrainedConfig):
         kda_mode: str = "chunk",
         kda_unpad_inputs: bool = True,
         kda_use_fused_gate: bool = True,
+        kda_chunk_impl: str = "fla",
         kda_use_qk_l2norm_in_kernel: bool = True,
         kda_disable_recompute: bool = False,
         kda_conv_backend: str = "triton",
@@ -161,6 +162,7 @@ class KimiK3TextConfig(PretrainedConfig):
         self.kda_mode = kda_mode
         self.kda_unpad_inputs = kda_unpad_inputs
         self.kda_use_fused_gate = kda_use_fused_gate
+        self.kda_chunk_impl = kda_chunk_impl
         self.kda_use_qk_l2norm_in_kernel = kda_use_qk_l2norm_in_kernel
         self.kda_disable_recompute = kda_disable_recompute
         self.kda_conv_backend = kda_conv_backend
@@ -197,6 +199,16 @@ class KimiK3TextConfig(PretrainedConfig):
             raise ValueError("kda_conv_backend must be 'triton' or 'cuda'.")
         if self.situ_backend not in {"torch", "triton", "triton_fast_math"}:
             raise ValueError("situ_backend must be 'torch', 'triton' or 'triton_fast_math'.")
+        if self.kda_chunk_impl not in {"fla", "fused"}:
+            raise ValueError(
+                "kda_chunk_impl must be 'fla' (flash-linear-attention) or 'fused' (fused CUDA forward + Triton backward)."
+            )
+        if self.kda_chunk_impl == "fused" and self.kda_mode != "chunk":
+            raise ValueError("kda_chunk_impl='fused' requires kda_mode='chunk'.")
+        if self.kda_chunk_impl == "fused" and not getattr(self, "kda_use_qk_l2norm_in_kernel", True):
+            raise ValueError(
+                "kda_chunk_impl='fused' requires kda_use_qk_l2norm_in_kernel=True (the kernels normalise q and k)."
+            )
         if self.linear_attn_config is None:
             return
         if "kda_layers" not in self.linear_attn_config or "full_attn_layers" not in self.linear_attn_config:

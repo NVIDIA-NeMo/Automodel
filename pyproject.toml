@@ -408,6 +408,7 @@ source = ["nemo_automodel"]
 parallel = true
 concurrency = ["thread", "multiprocessing"]
 omit = [
+    "nemo_automodel/components/models/kimi_k3/kda_fused/chunk_kda_bwd_triton.py",
     "nemo_automodel/components/checkpoint/_backports/*.py",
     "tests/*",
     "nemo_automodel/components/_peft/lora_kernel.py",

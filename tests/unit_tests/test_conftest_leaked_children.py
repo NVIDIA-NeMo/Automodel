@@ -44,6 +44,10 @@ def _hang(rank):
 @pytest.mark.timeout(1)
 def test_hanging_worker():
     mp.spawn(_hang, nprocs=1, join=True)
+
+
+def test_next_test_has_no_stale_workers():
+    assert not mp.active_children(), "timeout cleanup left stale multiprocessing children"
 """
 
 _HANGING_POPEN = """
@@ -100,7 +104,7 @@ def test_pytest_exits_after_timed_out_spawn(pytester: pytest.Pytester, monkeypat
     pytester.makepyfile(test_hang=_HANGING_WORKER)
     # Without the cleanup, interpreter shutdown blocks on the sleeping worker and this raises TimeoutExpired.
     result = pytester.runpytest_subprocess("-p", "no:cacheprovider", timeout=40)
-    result.assert_outcomes(failed=1, errors=1)
+    result.assert_outcomes(passed=1, failed=1, errors=1)
     result.stdout.fnmatch_lines(["*Timeout (>1.0s) from pytest-timeout*"])
     result.stdout.fnmatch_lines(["*left * child process(es) running*"])
 

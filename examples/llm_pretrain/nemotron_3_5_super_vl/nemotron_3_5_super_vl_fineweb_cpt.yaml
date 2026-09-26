@@ -42,7 +42,7 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained
+  pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16
   trust_remote_code: true
   torch_dtype: torch.bfloat16
   num_nextn_predict_layers: 0
@@ -94,7 +94,7 @@ dataset:
   index_mapping_dir: /path/to/shared/super35_fineweb/megatron/index_mapping
   tokenizer:
     _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
-    pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained
+    pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16
     trust_remote_code: true
   seq_length: 4096
   seed: 1234
@@ -113,7 +113,7 @@ validation_dataset:
   index_mapping_dir: /path/to/shared/super35_fineweb/megatron/index_mapping
   tokenizer:
     _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
-    pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained
+    pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16
     trust_remote_code: true
   seq_length: 4096
   seed: 1234

@@ -511,6 +511,7 @@ def test_forward_backward_step_routes_thd_batch_through_te(monkeypatch):
     assert "use_te" not in captured
     assert "magi" not in captured
     assert captured["padding_token_id"] == 7
+    assert captured["num_chunks"] == 1
 
 
 @pytest.mark.cuda(False)
@@ -1554,6 +1555,8 @@ class _MockAutoPipeline:
     def __init__(self, has_first_stage=True, has_last_stage=True, n_microbatches=2, add_losses=True):
         self._info = _MockPPInfo(has_first_stage, has_last_stage, n_microbatches, add_losses)
         self.info = self._info
+        self.pp_batch_size = n_microbatches
+        self.pp_microbatch_size = 1
         self.step_batches = []
 
     def update_seq_len(self, seq_len: int) -> None:
@@ -1744,6 +1747,51 @@ class TestForwardBackwardStepPP:
 
         # Loss buffer should be empty (no forward pass)
         assert len(loss_buffer) == 0
+
+    def test_pp_thd_uses_pipeline_chunks_and_local_sequence_length(self, pp_recipe, monkeypatch):
+        """TE THD sharding runs per PP microbatch and reports its local token length."""
+        pp_recipe.pp = _MockAutoPipeline(has_first_stage=True, has_last_stage=True, n_microbatches=2)
+        pp_recipe.mesh_context = SimpleNamespace(cp_size=2)
+        pp_recipe.pp.update_seq_len = MagicMock()
+        captured = {}
+
+        local_input_ids = torch.tensor([[1, 2, 7, 8], [9, 10, 15, 16]])
+        local_labels = torch.tensor([[2, 3, -100, -100], [10, 11, -100, -100]])
+        local_cu_seqlens = torch.tensor([[0, 4], [0, 4]], dtype=torch.int32)
+
+        def make_thd_sharder(model, device_mesh, batch, **kwargs):
+            del model, device_mesh, batch
+            captured.update(kwargs)
+
+            def shard(actual):
+                actual["input_ids"] = local_input_ids
+                actual["labels"] = local_labels
+                actual["cu_seqlens"] = local_cu_seqlens
+                return nullcontext, actual
+
+            return SimpleNamespace(shard=shard)
+
+        monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.ContextParallelSharder", make_thd_sharder)
+
+        pp_recipe._forward_backward_step(
+            idx=0,
+            batch={
+                "input_ids": torch.arange(16).reshape(2, 8),
+                "labels": torch.arange(16).reshape(2, 8),
+                "qkv_format": "thd",
+            },
+            loss_buffer=[],
+            num_label_tokens=8,
+            num_batches=1,
+            is_train=True,
+        )
+
+        assert captured["num_chunks"] == 2
+        pp_recipe.pp.update_seq_len.assert_called_once_with(4)
+        step_call = pp_recipe.pp.info.schedule.step.call_args
+        assert torch.equal(step_call.args[0], local_input_ids)
+        assert torch.equal(step_call.kwargs["target"], local_labels)
+        assert torch.equal(step_call.kwargs["cu_seqlens"], local_cu_seqlens)
 
     def test_pp_vlm_chunking_equal_images_and_batch(self, pp_recipe, monkeypatch):
         """Test VLM pixel_values chunking when n_images == batch_size."""
