@@ -6,15 +6,15 @@ slug: model-coverage/diffusion/qwen/Qwen-Image
 
 [Qwen-Image](https://huggingface.co/Qwen/Qwen-Image) is Alibaba Cloud's flow-matching image model. NeMo AutoModel supports Qwen-Image text-to-image training and cached, full-parameter training of [Qwen-Image-Edit-2511](https://huggingface.co/Qwen/Qwen-Image-Edit-2511).
 
-<Info>
+## Model Reference
 
-| | |
+### Model Architecture
+
+| Property | Value |
 |---|---|
 | **Tasks** | Text-to-Image, instruction-based image editing |
 | **Architecture** | Diffusion Transformer (Flow Matching) |
 | **HF Org** | [Qwen](https://huggingface.co/Qwen) |
-
-</Info>
 
 ## Available Models
 
@@ -39,7 +39,7 @@ The validation protocol uses [`osunlp/MagicBrush`](https://huggingface.co/datase
 
 The generic exporter maps dataset columns to ordered editing roles. Mapping `source_img` to both `context` and `condition` writes the image only once while retaining both role entries. The dataset's mask is retained in source-manifest metadata for future masked-edit adapters.
 
-Create the 64-example correctness cache with aspect-ratio-preserving processing limited to approximately 1024² total pixels:
+Create the 64-example correctness cache with aspect-ratio-preserving processing limited to approximately 1024^2 total pixels:
 
 ```bash
 uv run python -m tools.diffusion.preprocessing_multiprocess image-edit \
@@ -81,7 +81,7 @@ uv run python -m tools.diffusion.preprocessing_multiprocess image-edit \
   --output_dir /cache/magicbrush-qwen-edit-performance
 ```
 
-The performance preset resizes both source and target to 1024×1024. If that shape cannot complete without an out-of-memory error, use the 768p preset for every compared run and record the fallback.
+The performance preset resizes both source and target to 1024x1024. If that shape cannot complete without an out-of-memory error, use the 768p preset for every compared run and record the fallback.
 
 ## Cache Contract
 

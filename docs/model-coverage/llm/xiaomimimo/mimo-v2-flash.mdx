@@ -30,12 +30,14 @@ Follow the [launcher guide](/job-launchers/overview) to run a multi-node recipe.
 
 ### Model Architecture
 
-- `MiMoV2FlashForCausalLM` backs MiMo-V2-Flash.
-- `MiMoV2ForCausalLM` backs MiMo-V2.6-Flash-RL.
-- Sliding-window attention uses the `MiMoV2FlashAttention(is_swa=True)` path.
-- Expert routing maps `scoring_func="sigmoid"` to `score_func="sigmoid_with_bias"`; the recipes set `gate_precision=float32`.
+| Property | Value |
+| --- | --- |
+| Model Implementation | `MiMoV2FlashForCausalLM` backs MiMo-V2-Flash. |
+| Model Implementation | `MiMoV2ForCausalLM` backs MiMo-V2.6-Flash-RL. |
+| Sliding-Window Attention | Sliding-window attention uses the `MiMoV2FlashAttention(is_swa=True)` path. |
+| Expert Routing | Expert routing maps `scoring_func="sigmoid"` to `score_func="sigmoid_with_bias"`; the recipes set `gate_precision=float32`. |
 
-### Available Checkpoints
+### Available Models
 
 | Model | Hugging Face ID |
 | --- | --- |

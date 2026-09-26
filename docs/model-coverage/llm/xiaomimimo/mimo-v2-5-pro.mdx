@@ -5,16 +5,16 @@ slug: model-coverage/large-language-models/xiaomimimo/MiMo-V2.5-Pro
 ---
 [MiMo-V2.5-Pro](https://huggingface.co/XiaomiMiMo/MiMo-V2.5-Pro) is Xiaomi's hybrid attention Mixture-of-Experts (MoE) language model. It alternates full and sliding-window attention layers, uses a `sigmoid_with_bias` router with group-limited expert routing, and ships as an FP8 HF checkpoint.
 
-<Info>
+## Model Reference
 
-| | |
+### Model Architecture
+
+| Property | Value |
 |---|---|
 | **Task** | Text Generation (MoE, hybrid attention) |
 | **Architecture** | `MiMoV2ForCausalLM` (NeMo AutoModel alias: `MiMoV25ForCausalLM`) |
 | **Validated hardware** | 18 nodes, 144 H100 80GB GPUs; PP18 / EP8 |
 | **HF Org** | [XiaomiMiMo](https://huggingface.co/XiaomiMiMo) |
-
-</Info>
 
 ## Available Models
 

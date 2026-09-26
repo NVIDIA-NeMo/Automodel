@@ -96,6 +96,21 @@ def _repo_root() -> pathlib.Path:
     return pathlib.Path(__file__).resolve().parents[3]
 
 
+def _model_card_documents() -> list[tuple[pathlib.Path, str]]:
+    """Return rendered model-card documents, excluding section landing pages."""
+    docs_dir = _repo_root() / "docs" / "model-coverage"
+    excluded_names = {"index.mdx", "latest-models.mdx", "overview.mdx"}
+    documents = []
+    for path in sorted(docs_dir.rglob("*.mdx")):
+        if path.name in excluded_names:
+            continue
+        content = path.read_text(encoding="utf-8")
+        frontmatter = content.split("---", maxsplit=2)
+        if len(frontmatter) == 3 and "slug: model-coverage/" in frontmatter[1]:
+            documents.append((path, content))
+    return documents
+
+
 def _without_generated_registry_table(content: str) -> str:
     start_marker = "{/* BEGIN GENERATED MODEL ARCHITECTURES */}"
     end_marker = "{/* END GENERATED MODEL ARCHITECTURES */}"
@@ -104,6 +119,35 @@ def _without_generated_registry_table(content: str) -> str:
     if start == -1 or end == -1:
         return content
     return content[:start] + content[end + len(end_marker) :]
+
+
+def test_every_model_card_has_architecture_reference_table():
+    """Every rendered model card must use the shared architecture-section contract."""
+    documents = _model_card_documents()
+    assert documents, "No rendered model cards found under docs/model-coverage/"
+
+    invalid = []
+    for path, content in documents:
+        reasons = []
+        if "## Model Reference" not in content:
+            reasons.append("missing '## Model Reference'")
+        if "### Model Architecture" not in content:
+            reasons.append("missing '### Model Architecture'")
+        else:
+            architecture_section = content.split("### Model Architecture", maxsplit=1)[1]
+            architecture_section = architecture_section.split("\n##", maxsplit=1)[0]
+            if "| Property | Value |" not in architecture_section:
+                reasons.append("missing architecture Property/Value table")
+        if "### Model Summary" in content:
+            reasons.append("uses legacy '### Model Summary' heading")
+        if "### Available Checkpoints" in content:
+            reasons.append("uses legacy '### Available Checkpoints' heading")
+        if not content.isascii():
+            reasons.append("contains non-ASCII characters")
+        if reasons:
+            invalid.append(f"  - {path.relative_to(_repo_root())}: {', '.join(reasons)}")
+
+    assert not invalid, "Model cards that violate the shared page contract:\n" + "\n".join(invalid)
 
 
 def test_every_registered_arch_has_model_coverage_doc():

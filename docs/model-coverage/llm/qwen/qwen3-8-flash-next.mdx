@@ -12,9 +12,11 @@ persistent HyperConnection streams and an Engram N-gram Embedding table (named
 reference path exposes discrete top-k IDs but no auxiliary loss or
 straight-through gradient.
 
-<Info>
+## Model Reference
 
-| | |
+### Model Architecture
+
+| Property | Value |
 |---|---|
 | **Task** | Text generation (MoE, hybrid attention, Engram N-gram Embedding) |
 | **Architecture** | `Qwen3_8_FlashNextForConditionalGeneration` |
@@ -23,8 +25,6 @@ straight-through gradient.
 | **Experts** | 512 routed experts, top-10 routing, plus one shared expert per layer |
 | **Engram** | One 51.2B-parameter N-gram Embedding table in decoder layer 2 |
 | **Sequence length** | 262,144 native; validated here at 4,096 tokens |
-
-</Info>
 
 ## Architecture
 

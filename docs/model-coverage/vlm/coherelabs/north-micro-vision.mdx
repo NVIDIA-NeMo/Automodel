@@ -10,9 +10,11 @@ slug: model-coverage/vision-language-models/coherelabs/North-Micro-Vision-Instru
 `nemo-automodel==0.5.0` pins `transformers==5.8.1`, but the model's remote code calls 5.15 APIs. Install transformers separately with `--no-deps` at commit `71c6f699`; `uv pip check` will then report the environment as inconsistent, which is expected.
 </Warning>
 
-<Info>
+## Model Reference
 
-| | |
+### Model Architecture
+
+| Property | Value |
 |---|---|
 | **Task** | Image-Text-to-Text (native resolution) |
 | **Architecture** | `CohereCompassForConditionalGeneration` |
@@ -20,8 +22,6 @@ slug: model-coverage/vision-language-models/coherelabs/North-Micro-Vision-Instru
 | **Layers** | 28 language (21 sliding + 7 full attention), 27 vision |
 | **Context Length** | 64K input, 8K output |
 | **HF Org** | [CohereLabs](https://huggingface.co/CohereLabs) |
-
-</Info>
 
 ## Architecture
 
