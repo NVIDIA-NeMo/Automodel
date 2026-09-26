@@ -19,6 +19,57 @@ import torch
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.mimo_v25.state_dict_adapter import MiMoV2StateDictAdapter
+from nemo_automodel.components.moe.config import MoEConfig
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_unquantized_export_preserves_dense_and_expert_weights(dtype):
+    adapter = MiMoV2StateDictAdapter(
+        SimpleNamespace(num_key_value_heads=2),
+        MoEConfig(
+            dim=8,
+            inter_dim=16,
+            moe_inter_dim=4,
+            n_routed_experts=2,
+            n_activated_experts=1,
+            n_shared_experts=0,
+            n_expert_groups=1,
+            n_limited_groups=1,
+            train_gate=True,
+            gate_bias_update_factor=0.0,
+            aux_loss_coeff=0.0,
+            score_func="sigmoid_with_bias",
+            route_scale=1.0,
+            norm_topk_prob=True,
+        ),
+        BackendConfig(experts="torch", dispatcher="torch"),
+        dtype=dtype,
+    )
+    torch.manual_seed(2514)
+    hf = {
+        "model.layers.0.self_attn.qkv_proj.weight": torch.randn(24, 8, dtype=dtype),
+        "model.layers.0.mlp.gate.weight": torch.randn(2, 8, dtype=dtype),
+        "model.layers.0.mlp.gate.e_score_correction_bias": torch.randn(2),
+        "model.layers.0.self_attn.attention_sink_bias": torch.randn(4),
+    }
+    for expert in range(2):
+        for projection, shape in [("gate", (4, 8)), ("up", (4, 8)), ("down", (8, 4))]:
+            hf[f"model.layers.0.mlp.experts.{expert}.{projection}_proj.weight"] = torch.randn(*shape, dtype=dtype)
+    native = adapter.from_hf(dict(hf))
+    exported = adapter.to_hf(native, quantization=False)
+    assert exported.keys() == hf.keys()
+    for key, expected in hf.items():
+        torch.testing.assert_close(exported[key], expected, rtol=0, atol=0)
+    restored = adapter.from_hf(dict(exported))
+    assert restored.keys() == native.keys()
+    for key, expected in native.items():
+        torch.testing.assert_close(restored[key], expected, rtol=0, atol=0)
+
+
+def test_quantized_export_rejects_unimplemented_conversion():
+    adapter = MiMoV2StateDictAdapter.__new__(MiMoV2StateDictAdapter)
+    with pytest.raises(ValueError, match="FP8 export is unsupported"):
+        adapter.to_hf({"model.layers.0.self_attn.qkv_proj.weight": torch.ones(24, 8)}, quantization=True)
 
 
 @pytest.mark.parametrize("layer_idx", [0, 1])

@@ -99,13 +99,24 @@ class MiMoV2StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
         quantization: bool = False,
         **kwargs,
     ) -> dict[str, Any]:
-        """Convert Automodel state_dict to the HF MiMo-V2.5-Pro layout.
+        """Export HF weights or allocate destinations for an FP8 base checkpoint.
 
-        Note: The ``quantization`` parameter is accepted for interface
-        compatibility but is **ignored**. MiMo-V2.5-Pro is distributed as an
-        FP8 HF checkpoint, so this adapter always emits FP8 weights plus
-        ``_scale_inv`` companions for keys that match ``_should_quantize_key``,
-        regardless of the caller's preference.
+        Args:
+            state_dict: Native tensors with their original shapes and dtypes.
+                Grouped gate/up weights have shape [experts, hidden, 2 * intermediate]
+                and down weights have shape [experts, intermediate, hidden].
+                Fused QKV weights have shape [q_rows + k_rows + v_rows, hidden]
+                in canonical [Q, K, V] row order.
+            exclude_key_regex: Optional pattern for omitted parameter names.
+            quantization: Allocate FP8 tensors when loading the base checkpoint.
+                Quantized export is unsupported; ordinary export retains precision.
+            **kwargs: Adapter options, including ``for_checkpoint_load``.
+
+        Returns:
+            HF tensors preserving input dtypes and canonical QKV order. Experts
+            are split into gate/up [intermediate, hidden] and down [hidden,
+            intermediate] tensors, which may alias the grouped input storage.
+            FP8 load destinations include per-block scale tensors instead.
         """
         hf_state_dict: dict[str, Any] = {}
         for fqn, tensor in state_dict.items():
@@ -124,7 +135,8 @@ class MiMoV2StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
 
         Args:
             fqn: Automodel parameter name.
-            tensor: Parameter tensor, possibly a DTensor with global shape.
+            tensor: Parameter tensor with the native layout documented by
+                ``to_hf``; a DTensor retains its global shape and placements.
             **kwargs: Adapter options, including ``for_checkpoint_load`` when
                 allocating destinations for the pretrained checkpoint.
 
@@ -134,12 +146,19 @@ class MiMoV2StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
             and are replicated regular tensors, including for sharded weights.
         """
         exclude_key_regex = kwargs.get("exclude_key_regex", None)
+        quantization = kwargs.get("quantization", False)
+        for_checkpoint_load = kwargs.get("for_checkpoint_load", False)
+        if quantization and not for_checkpoint_load:
+            raise ValueError("MiMo-V2.5-Pro FP8 export is unsupported; use quantization=False to preserve weights")
 
         expert_result = self._convert_single_merged_expert_to_hf_split_experts(fqn, tensor, **kwargs)
         result = expert_result if expert_result is not None else [(fqn, tensor)]
 
         if exclude_key_regex:
             result = [(key, value) for key, value in result if not re.match(exclude_key_regex, key)]
+
+        if not quantization:
+            return result
 
         quantized_result: list[tuple[str, Any]] = []
         for key, value in result:

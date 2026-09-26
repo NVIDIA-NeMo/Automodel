@@ -12,27 +12,33 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# 16 H100 nodes (128 GPUs):
-#   torchrun --nproc-per-node 8 -m nemo_automodel.cli.app examples/llm_finetune/mimo_v25/mimo_v25_pro_hellaswag.yaml
+# Pretrained training sanity check: 18 H100 80GB nodes (144 GPUs).
+# Launch with multi-node torchrun and PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True.
+# BF16 weights and AdamW state match the validated memory-constrained setup.
+# PP18/EP8 keeps expert dispatch within each node and at most four MoE layers per rank.
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 seed: 1234
 
 step_scheduler:
-  global_batch_size: 256
-  local_batch_size: 8
-  ckpt_every_steps: 25
-  val_every_steps: 500
+  global_batch_size: 288
+  local_batch_size: 36
+  ckpt_every_steps: 1000000
+  val_every_steps: 5
   num_epochs: 1
-  max_steps: 100
+  max_steps: 20
+  save_checkpoint_every_epoch: false
+  validate_on_checkpoint: false
+  log_remote_every_steps: 1
 
 distributed:
   strategy: fsdp2
   tp_size: 1
   cp_size: 1
-  pp_size: 4
-  ep_size: 32
+  pp_size: 18
+  ep_size: 8
+  defer_fsdp_grad_sync: true
 
   sequence_parallel: false
   activation_checkpointing: true
@@ -40,7 +46,7 @@ distributed:
   pipeline:
     pp_schedule: interleaved1f1b
     pp_microbatch_size: 1
-    layers_per_stage: 2
+    layers_per_stage: 1
     round_virtual_stages_to_pp_multiple: down
     scale_grads_in_schedule: false
     patch_inner_model: false
@@ -77,7 +83,7 @@ model:
     enable_fsdp_optimizations: true
 
 checkpoint:
-  enabled: true
+  enabled: false
   checkpoint_dir: checkpoints/mimo_v25_pro
   model_save_format: safetensors
   save_consolidated: false
@@ -90,6 +96,7 @@ dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   path_or_dataset: rowan/hellaswag
   split: train
+  num_samples_limit: 6144
   tokenizer:
     _target_: transformers.AutoTokenizer.from_pretrained
     pretrained_model_name_or_path: XiaomiMiMo/MiMo-V2.5-Pro
@@ -109,7 +116,7 @@ validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   path_or_dataset: rowan/hellaswag
   split: validation
-  num_samples_limit: 64
+  num_samples_limit: 576
   tokenizer:
     _target_: transformers.AutoTokenizer.from_pretrained
     pretrained_model_name_or_path: XiaomiMiMo/MiMo-V2.5-Pro
@@ -129,15 +136,16 @@ optimizer:
   eps: 1e-8
   lr: 1e-5
   weight_decay: 0.1
+  foreach: false
 
 wandb:
   enable: false
   project: automodel-mimo-v25-pro
-  name: mimo_v25_pro_hellaswag_16n
+  name: mimo_v25_pro_hellaswag_18n
   mode: online
 
 ci:
   recipe_owner: Simar-malhotra09
-  # pp_size(4) * ep_size(32) = 128 GPUs => 16 nodes (8 H100/node).
-  nodes: 16
+  # pp_size(18) * ep_size(8) = 144 GPUs => 18 nodes (8 H100/node).
+  nodes: 18
   time: "00:15:00"
