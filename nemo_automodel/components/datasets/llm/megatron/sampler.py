@@ -14,6 +14,7 @@
 
 import abc
 import logging
+from collections.abc import Sized
 from dataclasses import dataclass
 from itertools import chain
 from typing import Literal
@@ -364,11 +365,11 @@ class MegatronSamplerConfig:
     drop_last: bool = True
     pad_samples_to_global_batch_size: bool = False
 
-    def build(self, *, dataset_len: int, rank: int, world_size: int) -> BaseMegatronSampler:
+    def build(self, *, dataset: Sized, rank: int, world_size: int) -> BaseMegatronSampler:
         """Build a Megatron sampler for one data-parallel rank.
 
         Args:
-            dataset_len: Number of samples in the materialized dataset.
+            dataset: The materialized dataset; only its length is used.
             rank: Rank within the data-parallel group.
             world_size: Size of the data-parallel group.
 
@@ -376,7 +377,7 @@ class MegatronSamplerConfig:
             Sampler yielding one local micro-batch of dataset indices at a time.
         """
         return create_megatron_sampler(
-            dataset_len=dataset_len,
+            dataset_len=len(dataset),
             micro_batch_size=self.micro_batch_size,
             global_batch_size=self.global_batch_size,
             dataloader_type=self.dataloader_type,
