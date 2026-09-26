@@ -14,7 +14,7 @@
 
 """Model-owned distributed parallelization for DeepSeek-V4."""
 
-from nemo_automodel.components.distributed import FSDP2ModelParallelizer
+from nemo_automodel.components.distributed import ModelParallelizer
 from nemo_automodel.components.distributed.parallelizer import DefaultParallelizationStrategy
 from nemo_automodel.components.models.deepseek_v4.fsdp import fully_shard_deepseek_v4
 
@@ -32,6 +32,6 @@ class DeepseekV4ParallelizationStrategy(DefaultParallelizationStrategy):
         )
 
 
-PARALLELIZER = FSDP2ModelParallelizer(DeepseekV4ParallelizationStrategy())
+PARALLELIZER = ModelParallelizer(DeepseekV4ParallelizationStrategy())
 
 __all__ = ["PARALLELIZER"]

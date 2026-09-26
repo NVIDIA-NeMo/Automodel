@@ -21,9 +21,9 @@ import pytest
 import torch.nn as nn
 
 from nemo_automodel.components.distributed import (
-    DefaultModelParallelizer,
+    DDPConfig,
     FSDP2Config,
-    FSDP2ModelParallelizer,
+    MegatronFSDPConfig,
     MeshContext,
     ModelParallelizer,
     ParallelizeContext,
@@ -47,6 +47,7 @@ def _context() -> ParallelizeContext:
 
 def test_contract_is_runtime_lightweight():
     assert hasattr(ModelParallelizer, "parallelize")
+    assert ModelParallelizer.__dataclass_fields__.keys() == {"strategy"}
     assert ParallelizeContext.__dataclass_fields__.keys() == {
         "mesh",
         "strategy",
@@ -81,7 +82,7 @@ def test_model_inherits_sidecar_from_base_class():
 
 
 def test_missing_sidecar_uses_default():
-    assert isinstance(get_model_parallelizer(nn.Linear(2, 2)), DefaultModelParallelizer)
+    assert isinstance(get_model_parallelizer(nn.Linear(2, 2)), ModelParallelizer)
 
 
 def test_invalid_sidecar_fails_at_setup():
@@ -92,9 +93,22 @@ def test_invalid_sidecar_fails_at_setup():
         get_model_parallelizer(Model())
 
 
+def test_legacy_manager_classes_are_deprecated(monkeypatch):
+    from nemo_automodel.components.distributed import ddp, fsdp2, megatron_fsdp
+
+    monkeypatch.setattr(ddp.DDPManager, "_setup_distributed", lambda self: None)
+
+    with pytest.warns(DeprecationWarning, match="DDPManager is deprecated"):
+        ddp.DDPManager(DDPConfig())
+    with pytest.warns(DeprecationWarning, match="FSDP2Manager is deprecated"):
+        fsdp2.FSDP2Manager(FSDP2Config(), device_mesh=Mock())
+    with pytest.warns(DeprecationWarning, match="MegatronFSDPManager is deprecated"):
+        megatron_fsdp.MegatronFSDPManager(MegatronFSDPConfig(), device_mesh=Mock())
+
+
 def test_specialized_fsdp2_sidecar_uses_strategy(monkeypatch):
     strategy = Mock()
-    adapter = FSDP2ModelParallelizer(strategy)
+    adapter = ModelParallelizer(strategy)
     model = nn.Linear(2, 2)
     sentinel = nn.Linear(2, 2)
     context = _context()
@@ -107,7 +121,7 @@ def test_specialized_fsdp2_sidecar_uses_strategy(monkeypatch):
 
 def test_specialized_sidecar_routes_ep_through_unified_moe_executor(monkeypatch):
     strategy = Mock()
-    adapter = FSDP2ModelParallelizer(strategy)
+    adapter = ModelParallelizer(strategy)
     model = nn.Linear(2, 2)
     context = ParallelizeContext(mesh=SimpleNamespace(ep_size=2), strategy=FSDP2Config())
     call = Mock(return_value=model)

@@ -20,7 +20,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch.nn as nn
 
-from nemo_automodel.components.distributed import DefaultModelParallelizer
+from nemo_automodel.components.distributed import ModelParallelizer
 from nemo_automodel.components.distributed.model_parallelizer import get_model_parallelizer
 from nemo_automodel.components.distributed.parallelizer import fsdp2_strategy_parallelize
 from nemo_automodel.components.models.nemotron_v3.parallelization import (
@@ -105,7 +105,7 @@ def test_strategy_selection_standard_model():
     model = MockStandardModel()
     parallelizer = get_model_parallelizer(model)
 
-    assert isinstance(parallelizer, DefaultModelParallelizer)
+    assert isinstance(parallelizer, ModelParallelizer)
 
 
 def test_strategy_selection_nemotron_model():

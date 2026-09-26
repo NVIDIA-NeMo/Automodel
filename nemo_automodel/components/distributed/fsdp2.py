@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+import warnings
 from collections.abc import Callable
 
 from torch import nn
@@ -86,8 +87,12 @@ def _patch_is_packed_sequence_for_training() -> None:
 
 
 class FSDP2Manager:
-    """
-    Manager for parallelizing models using FSDP2 with TP, DP, CP sharding.
+    """Deprecated compatibility wrapper for FSDP2 parallelization.
+
+    .. deprecated:: 0.6
+        Pass :class:`FSDP2Config` through the config-driven infrastructure and
+        provide model-specific behavior with :class:`ModelParallelizer`. This
+        compatibility class is scheduled for removal in 0.7.
 
     This manager applies parallelization to the model using a prescribed
     TP sharding plan. It supports mixed precision and CPU offloading options.
@@ -101,13 +106,6 @@ class FSDP2Manager:
         moe_config: Optional expert-parallel policy included in the model's
             :class:`ParallelizeContext`.
 
-    Example:
-        from nemo_automodel.components.distributed.config import FSDP2Config
-
-        config = FSDP2Config(sequence_parallel=True, activation_checkpointing=True)
-        # device_mesh created externally via MeshContext.build()
-        manager = FSDP2Manager(config, device_mesh=device_mesh, moe_mesh=moe_mesh)
-        model = manager.parallelize(model)
     """
 
     def __init__(
@@ -117,6 +115,12 @@ class FSDP2Manager:
         moe_mesh: DeviceMesh | None = None,
         moe_config: MoEParallelizerConfig | None = None,
     ):
+        warnings.warn(
+            "FSDP2Manager is deprecated and will be removed in 0.7; pass FSDP2Config through the "
+            "config-driven infrastructure and use ModelParallelizer for model-owned behavior.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self.config = config
         self.device_mesh = device_mesh
         self.moe_mesh = moe_mesh

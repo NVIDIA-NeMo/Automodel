@@ -22,13 +22,13 @@ monkeypatched ``fully_shard`` so no process group / GPU is required.
 
 import torch.nn as nn
 
-from nemo_automodel.components.distributed import FSDP2ModelParallelizer
+from nemo_automodel.components.distributed import ModelParallelizer
 from nemo_automodel.components.distributed.parallelizer import DefaultParallelizationStrategy
 from nemo_automodel.components.models.diffusion_gemma import fsdp as dg4_fsdp
 
 
 def test_sidecar_owns_diffusion_gemma_strategy():
-    assert isinstance(dg4_fsdp.PARALLELIZER, FSDP2ModelParallelizer)
+    assert isinstance(dg4_fsdp.PARALLELIZER, ModelParallelizer)
     assert isinstance(dg4_fsdp.PARALLELIZER.strategy, DefaultParallelizationStrategy)
 
 

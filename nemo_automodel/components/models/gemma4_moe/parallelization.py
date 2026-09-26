@@ -29,7 +29,7 @@ from torch.distributed.tensor import DTensor, distribute_tensor
 from torch.distributed.tensor.parallel import ColwiseParallel, ParallelStyle
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
-from nemo_automodel.components.distributed import FSDP2ModelParallelizer
+from nemo_automodel.components.distributed import ModelParallelizer
 from nemo_automodel.components.distributed.parallel_styles import ReplicatedWithGradAllReduce
 from nemo_automodel.components.distributed.parallelizer import DefaultParallelizationStrategy
 
@@ -297,6 +297,6 @@ class Gemma4ParallelizationStrategy(DefaultParallelizationStrategy):
         return super().parallelize(model, device_mesh, **kwargs)
 
 
-PARALLELIZER = FSDP2ModelParallelizer(Gemma4ParallelizationStrategy())
+PARALLELIZER = ModelParallelizer(Gemma4ParallelizationStrategy())
 
 __all__ = ["PARALLELIZER"]

@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING
 
 from torch import nn
 
@@ -41,50 +41,33 @@ class ParallelizeContext:
     reapply_trainability: Callable[[nn.Module], None] | None = None
 
 
-class ModelParallelizer(Protocol):
-    """Model-owned contract for applying requested parallelisms."""
+@dataclass(frozen=True, slots=True)
+class ModelParallelizer:
+    """Model-owned parallelization sidecar.
+
+    Models may attach an instance to their class as ``parallelizer``. Passing a
+    specialized strategy customizes dense FSDP2 execution; without one, the
+    shared dense or expert-parallel implementation is used.
+
+    Args:
+        strategy: Optional model-specific FSDP2 strategy.
+    """
+
+    strategy: ParallelizationStrategy | None = None
 
     def parallelize(self, model: nn.Module, context: ParallelizeContext, /) -> nn.Module:
         """Apply TP, CP, EP, activation checkpointing, and data parallelism."""
-        ...
-
-
-@dataclass(frozen=True, slots=True)
-class DefaultModelParallelizer:
-    """Infrastructure-owned implementation used when a model has no sidecar."""
-
-    def parallelize(self, model: nn.Module, context: ParallelizeContext, /) -> nn.Module:
-        """Apply the standard dense or expert-parallel execution path."""
-        if context.mesh.ep_size > 1:
-            return _parallelize_moe(model, context)
-        if isinstance(context.strategy, FSDP2Config):
-            return _parallelize_fsdp2(model, context)
-        raise TypeError(
-            "DefaultModelParallelizer supports FSDP2 or expert-parallel execution; "
-            f"got strategy={type(context.strategy).__name__}."
-        )
-
-
-_DEFAULT_PARALLELIZER = DefaultModelParallelizer()
-
-
-@dataclass(frozen=True, slots=True)
-class FSDP2ModelParallelizer(DefaultModelParallelizer):
-    """Adapt an FSDP2 strategy to the model-owned sidecar contract.
-
-    Args:
-        strategy: Object implementing the exported FSDP2 strategy API.
-    """
-
-    strategy: ParallelizationStrategy
-
-    def parallelize(self, model: nn.Module, context: ParallelizeContext, /) -> nn.Module:
-        """Apply MoE execution or the sidecar's specialized FSDP2 strategy."""
         if context.mesh.ep_size > 1:
             return _parallelize_moe(model, context)
         if isinstance(context.strategy, FSDP2Config):
             return _parallelize_fsdp2(model, context, strategy=self.strategy)
-        return super().parallelize(model, context)
+        raise TypeError(
+            "ModelParallelizer supports FSDP2 or expert-parallel execution; "
+            f"got strategy={type(context.strategy).__name__}."
+        )
+
+
+_DEFAULT_PARALLELIZER = ModelParallelizer()
 
 
 def get_model_parallelizer(model: nn.Module) -> ModelParallelizer:
@@ -126,7 +109,7 @@ def _parallelize_fsdp2(
     parallelize = getattr(strategy, "parallelize", None)
     if not callable(parallelize):
         raise TypeError(
-            "FSDP2ModelParallelizer.strategy must implement parallelize(model, device_mesh, ...); "
+            "ModelParallelizer.strategy must implement parallelize(model, device_mesh, ...); "
             f"got {type(strategy).__name__}."
         )
 
@@ -204,8 +187,6 @@ def _parallelize_moe(model: nn.Module, context: ParallelizeContext) -> nn.Module
 
 
 __all__ = [
-    "DefaultModelParallelizer",
-    "FSDP2ModelParallelizer",
     "ModelParallelizer",
     "ParallelizeContext",
     "get_model_parallelizer",

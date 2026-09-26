@@ -22,7 +22,7 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper,
 )
 
-from nemo_automodel.components.distributed import FSDP2ModelParallelizer
+from nemo_automodel.components.distributed import ModelParallelizer
 from nemo_automodel.components.distributed.parallelizer import DefaultParallelizationStrategy
 
 logger = logging.getLogger(__name__)
@@ -73,6 +73,6 @@ class BagelParallelizationStrategy(DefaultParallelizationStrategy):
         return super().parallelize(model, *args, **kwargs)
 
 
-PARALLELIZER = FSDP2ModelParallelizer(BagelParallelizationStrategy())
+PARALLELIZER = ModelParallelizer(BagelParallelizationStrategy())
 
 __all__ = ["PARALLELIZER"]

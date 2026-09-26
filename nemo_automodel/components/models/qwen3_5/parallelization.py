@@ -20,7 +20,7 @@ from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import MixedPrecisionPolicy, OffloadPolicy
 
-from nemo_automodel.components.distributed import FSDP2ModelParallelizer
+from nemo_automodel.components.distributed import ModelParallelizer
 from nemo_automodel.components.distributed.multimodal_fsdp import (
     FrozenMultimodalSharding,
     is_multimodal_module_name,
@@ -134,6 +134,6 @@ class Qwen3_5ParallelizationStrategy(DefaultParallelizationStrategy):
         return result
 
 
-PARALLELIZER = FSDP2ModelParallelizer(Qwen3_5ParallelizationStrategy())
+PARALLELIZER = ModelParallelizer(Qwen3_5ParallelizationStrategy())
 
 __all__ = ["PARALLELIZER"]

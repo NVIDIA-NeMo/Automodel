@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from nemo_automodel.components.distributed import FSDP2ModelParallelizer
+from nemo_automodel.components.distributed import ModelParallelizer
 from nemo_automodel.components.distributed.parallelizer import DefaultParallelizationStrategy
 
 
@@ -30,6 +30,6 @@ class Qwen3VLParallelizationStrategy(DefaultParallelizationStrategy):
         return result
 
 
-PARALLELIZER = FSDP2ModelParallelizer(Qwen3VLParallelizationStrategy())
+PARALLELIZER = ModelParallelizer(Qwen3VLParallelizationStrategy())
 
 __all__ = ["PARALLELIZER"]

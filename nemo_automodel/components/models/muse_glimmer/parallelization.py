@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from nemo_automodel.components.distributed import FSDP2ModelParallelizer
+from nemo_automodel.components.distributed import ModelParallelizer
 from nemo_automodel.components.distributed.parallelizer import DefaultParallelizationStrategy
 
 
@@ -51,6 +51,6 @@ class MuseGlimmerParallelizationStrategy(DefaultParallelizationStrategy):
         return result
 
 
-PARALLELIZER = FSDP2ModelParallelizer(MuseGlimmerParallelizationStrategy())
+PARALLELIZER = ModelParallelizer(MuseGlimmerParallelizationStrategy())
 
 __all__ = ["PARALLELIZER"]

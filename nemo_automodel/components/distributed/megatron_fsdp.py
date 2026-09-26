@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+import warnings
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
@@ -45,8 +46,12 @@ except (ImportError, FileNotFoundError, OSError):
 
 
 class MegatronFSDPManager:
-    """
-    Manager for parallelizing models using MegatronFSDP with TP, DP, CP sharding.
+    """Deprecated compatibility wrapper for Megatron-FSDP parallelization.
+
+    .. deprecated:: 0.6
+        Pass :class:`MegatronFSDPConfig` through the config-driven infrastructure
+        and provide model-specific behavior with :class:`ModelParallelizer`. This
+        compatibility class is scheduled for removal in 0.7.
 
     This manager applies parallelization to the model using a prescribed
     TP sharding plan. It supports mixed precision and various FSDP options.
@@ -57,13 +62,6 @@ class MegatronFSDPManager:
         config (MegatronFSDPConfig): Configuration for MegatronFSDP distributed training.
         device_mesh (DeviceMesh): Device mesh for distributed operations.
 
-    Example:
-        from nemo_automodel.components.distributed.config import MegatronFSDPConfig
-
-        config = MegatronFSDPConfig(zero_dp_strategy=3, overlap_grad_reduce=True)
-        # device_mesh created externally via MeshContext.build()
-        manager = MegatronFSDPManager(config, device_mesh=device_mesh)
-        model, optimizer = manager.parallelize(model, optimizer)
     """
 
     def __init__(
@@ -71,6 +69,12 @@ class MegatronFSDPManager:
         config: MegatronFSDPConfig,
         device_mesh: DeviceMesh,
     ):
+        warnings.warn(
+            "MegatronFSDPManager is deprecated and will be removed in 0.7; pass MegatronFSDPConfig through the "
+            "config-driven infrastructure and use ModelParallelizer for model-owned behavior.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self.config = config
         self.device_mesh = device_mesh
 

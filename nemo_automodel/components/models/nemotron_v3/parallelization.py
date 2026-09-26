@@ -26,7 +26,7 @@ from torch.distributed.fsdp import MixedPrecisionPolicy, OffloadPolicy, fully_sh
 from torch.distributed.tensor.parallel import ColwiseParallel, ParallelStyle, RowwiseParallel, parallelize_module
 from torch.distributed.tensor.placement_types import Shard
 
-from nemo_automodel.components.distributed import FSDP2ModelParallelizer
+from nemo_automodel.components.distributed import ModelParallelizer
 from nemo_automodel.components.distributed.mesh_utils import get_fsdp_dp_mesh
 from nemo_automodel.components.distributed.parallel_styles import translate_to_lora
 from nemo_automodel.components.distributed.parallelizer import ParallelizationStrategy
@@ -159,6 +159,6 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
         )
 
 
-PARALLELIZER = FSDP2ModelParallelizer(NemotronHParallelizationStrategy())
+PARALLELIZER = ModelParallelizer(NemotronHParallelizationStrategy())
 
 __all__ = ["PARALLELIZER"]

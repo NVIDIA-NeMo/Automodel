@@ -50,7 +50,7 @@ from __future__ import annotations
 from torch import nn
 from torch.distributed.fsdp import fully_shard
 
-from nemo_automodel.components.distributed import FSDP2ModelParallelizer
+from nemo_automodel.components.distributed import ModelParallelizer
 from nemo_automodel.components.distributed.parallelizer import DefaultParallelizationStrategy
 
 
@@ -130,6 +130,6 @@ class DiffusionGemmaParallelizationStrategy(DefaultParallelizationStrategy):
         )
 
 
-PARALLELIZER = FSDP2ModelParallelizer(DiffusionGemmaParallelizationStrategy())
+PARALLELIZER = ModelParallelizer(DiffusionGemmaParallelizationStrategy())
 
 __all__ = ["PARALLELIZER", "fully_shard_diffusion_gemma"]

@@ -29,7 +29,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import MixedPrecisionPolicy, OffloadPolicy, fully_shard
 from torch.distributed.tensor.parallel import ColwiseParallel, ParallelStyle, RowwiseParallel, parallelize_module
 
-from nemo_automodel.components.distributed import FSDP2ModelParallelizer, ModelParallelizer
+from nemo_automodel.components.distributed import ModelParallelizer
 from nemo_automodel.components.distributed.mesh_utils import get_fsdp_dp_mesh
 from nemo_automodel.components.distributed.parallelizer import (
     DefaultParallelizationStrategy,
@@ -232,10 +232,10 @@ class QwenImageEditParallelizationStrategy(DefaultParallelizationStrategy):
 
 
 _PARALLELIZERS: dict[str, ModelParallelizer] = {
-    "HunyuanVideo15Transformer3DModel": FSDP2ModelParallelizer(HunyuanParallelizationStrategy()),
-    "LTX2VideoTransformer3DModel": FSDP2ModelParallelizer(LTX2ParallelizationStrategy()),
-    "QwenImageTransformer2DModel": FSDP2ModelParallelizer(QwenImageEditParallelizationStrategy()),
-    "WanTransformer3DModel": FSDP2ModelParallelizer(WanParallelizationStrategy()),
+    "HunyuanVideo15Transformer3DModel": ModelParallelizer(HunyuanParallelizationStrategy()),
+    "LTX2VideoTransformer3DModel": ModelParallelizer(LTX2ParallelizationStrategy()),
+    "QwenImageTransformer2DModel": ModelParallelizer(QwenImageEditParallelizationStrategy()),
+    "WanTransformer3DModel": ModelParallelizer(WanParallelizationStrategy()),
 }
 
 

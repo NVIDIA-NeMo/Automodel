@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+import warnings
 from collections.abc import Callable
 
 import torch
@@ -36,8 +37,12 @@ logger = logging.getLogger(__name__)
 
 
 class DDPManager:
-    """
-    Manager for distributed training using PyTorch's DDP.
+    """Deprecated compatibility wrapper for PyTorch DDP.
+
+    .. deprecated:: 0.6
+        Pass :class:`DDPConfig` through the config-driven infrastructure and
+        provide model-specific behavior with :class:`ModelParallelizer`. This
+        compatibility class is scheduled for removal in 0.7.
 
     This manager wraps models with DistributedDataParallel for data-parallel
     distributed training.
@@ -45,15 +50,15 @@ class DDPManager:
     Args:
         config (DDPConfig): Configuration for DDP distributed training.
 
-    Example:
-        from nemo_automodel.components.distributed.config import DDPConfig
-
-        config = DDPConfig(activation_checkpointing=True)
-        manager = DDPManager(config)
-        model = manager.parallelize(model)
     """
 
     def __init__(self, config: DDPConfig):
+        warnings.warn(
+            "DDPManager is deprecated and will be removed in 0.7; pass DDPConfig through the "
+            "config-driven infrastructure and use ModelParallelizer for model-owned behavior.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self.config = config
 
         # Extract config fields for easy access
