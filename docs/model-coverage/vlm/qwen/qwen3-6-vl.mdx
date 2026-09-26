@@ -6,6 +6,14 @@ slug: model-coverage/vision-language-models/qwen/Qwen3.6-27B
 
 Qwen3.6 is Alibaba Cloud's unified vision-language model generation following Qwen3.5. NeMo AutoModel supports both the dense 27B checkpoint and the 35B-A3B MoE checkpoint.
 
+## Fine-Tune Qwen3.6-27B
+
+```bash
+uv run automodel --nproc-per-node=8 examples/vlm_finetune/qwen3_5/qwen3_6_27b.yaml
+```
+
+Install the `vlm-media` extra before running these recipes. See the [Installation Guide](/get-started/installation) and [VLM Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n).
+
 ## Model Reference
 
 ### Model Architecture
@@ -25,11 +33,3 @@ Qwen3.6 is Alibaba Cloud's unified vision-language model generation following Qw
 | [`Qwen/Qwen3.6-27B`](https://huggingface.co/Qwen/Qwen3.6-27B) | [qwen3_6_27b_lora.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5/qwen3_6_27b_lora.yaml) | LoRA on MedPix-VQA |
 | [`Qwen/Qwen3.6-35B-A3B`](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) | [qwen3_6_35b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5_moe/qwen3_6_35b.yaml) | Full SFT on MedPix-VQA |
 | [`Qwen/Qwen3.6-35B-A3B`](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) | [qwen3_6_35b_lora.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5_moe/qwen3_6_35b_lora.yaml) | LoRA on MedPix-VQA |
-
-## Run a Recipe
-
-```bash
-uv run automodel --nproc-per-node=8 examples/vlm_finetune/qwen3_5/qwen3_6_27b.yaml
-```
-
-Install the `vlm-media` extra before running these recipes. See the [Installation Guide](/get-started/installation) and [VLM Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n).

@@ -9,6 +9,22 @@ and video inputs. It retains the Qwen3.5 hybrid Gated DeltaNet and gated-attenti
 architecture, so NeMo AutoModel uses its existing native
 `Qwen3_5ForConditionalGeneration` implementation for the checkpoint.
 
+## Fine-Tune Qwen3.8-27B
+
+```bash
+uv run automodel --nproc-per-node=8 examples/vlm_finetune/qwen3_8/qwen3_8_27b.yaml
+uv run automodel --nproc-per-node=8 examples/vlm_finetune/qwen3_8/qwen3_8_27b_lora.yaml
+```
+
+Install the `vlm-media` extra before running either recipe. See the
+[Installation Guide](/get-started/installation) and the
+[Qwen3.8 fine-tuning guide](/recipes-e2e-examples/qwen3-8-27b) for setup,
+validation details, and measured training-loss curves.
+
+The checked-in recipes use FSDP2 data parallelism on eight GPUs. The shared
+Qwen3.5 dense model implementation also supports TP, CP, and PP, but the
+Qwen3.8 runs documented here validate the DP8 recipes specifically.
+
 ## Model Reference
 
 ### Model Architecture
@@ -27,19 +43,3 @@ architecture, so NeMo AutoModel uses its existing native
 |---|---|---|
 | [`Qwen/Qwen3.8-27B`](https://huggingface.co/Qwen/Qwen3.8-27B) | [qwen3_8_27b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_8/qwen3_8_27b.yaml) | Full-parameter SFT on MedPix-VQA |
 | [`Qwen/Qwen3.8-27B`](https://huggingface.co/Qwen/Qwen3.8-27B) | [qwen3_8_27b_lora.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_8/qwen3_8_27b_lora.yaml) | LoRA on MedPix-VQA |
-
-## Run the Recipes
-
-```bash
-uv run automodel --nproc-per-node=8 examples/vlm_finetune/qwen3_8/qwen3_8_27b.yaml
-uv run automodel --nproc-per-node=8 examples/vlm_finetune/qwen3_8/qwen3_8_27b_lora.yaml
-```
-
-Install the `vlm-media` extra before running either recipe. See the
-[Installation Guide](/get-started/installation) and the
-[Qwen3.8 fine-tuning guide](/recipes-e2e-examples/qwen3-8-27b) for setup,
-validation details, and measured training-loss curves.
-
-The checked-in recipes use FSDP2 data parallelism on eight GPUs. The shared
-Qwen3.5 dense model implementation also supports TP, CP, and PP, but the
-Qwen3.8 runs documented here validate the DP8 recipes specifically.

@@ -5,9 +5,19 @@ slug: model-coverage/large-language-models/moonshotai/Kimi-K3
 ---
 [Kimi K3](https://huggingface.co/moonshotai/Kimi-K3) is Moonshot AI's 2.8T-parameter, 104B-active Mixture-of-Experts model. NeMo AutoModel provides a native implementation of the text model and loads its public checkpoint without `trust_remote_code`.
 
+## Fine-Tune Kimi-K3
+
 <Warning>
 Kimi K3 training in NeMo AutoModel is currently validated only on NVIDIA GB200 systems.
 </Warning>
+
+Allocate 64 GB200 nodes with four GPUs per node through your cluster launcher, then run:
+
+```bash
+uv run automodel --nproc-per-node=4 examples/llm_finetune/kimi/k3_hellaswag.yaml
+```
+
+See the [Slurm Launcher Guide](/job-launchers/slurm-cluster) for multi-node setup and the [Large MoE Fine-Tuning Guide](/recipes-e2e-examples/large-moe-fine-tuning) for distributed MoE configuration.
 
 ## Model Reference
 
@@ -45,16 +55,6 @@ The combined EP32 and PP8 configuration is validated on 256 GB200 GPUs.
 | Recipe | Description |
 |---|---|
 | [k3_hellaswag.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/kimi/k3_hellaswag.yaml) | 100-step full-parameter SFT on HellaSwag with FSDP2, EP32, and PP8 |
-
-## Run the Recipe
-
-Allocate 64 GB200 nodes with four GPUs per node through your cluster launcher, then run:
-
-```bash
-uv run automodel --nproc-per-node=4 examples/llm_finetune/kimi/k3_hellaswag.yaml
-```
-
-See the [Slurm Launcher Guide](/job-launchers/slurm-cluster) for multi-node setup and the [Large MoE Fine-Tuning Guide](/recipes-e2e-examples/large-moe-fine-tuning) for distributed MoE configuration.
 
 ## References
 

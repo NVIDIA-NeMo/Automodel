@@ -6,6 +6,14 @@ slug: model-coverage/large-language-models/google-t5/t5-small
 
 [T5](https://huggingface.co/google-t5/t5-small) is Google's encoder-decoder text-to-text transformer family.
 
+## Fine-Tune t5-small
+
+From the repository root, run:
+
+```bash
+uv run automodel --nproc-per-node=8 examples/llm_finetune/t5/t5_small_squad.yaml
+```
+
 ## Model Reference
 
 ### Model Architecture
@@ -21,11 +29,5 @@ slug: model-coverage/large-language-models/google-t5/t5-small
 | Model | Recipe |
 |---|---|
 | [`google-t5/t5-small`](https://huggingface.co/google-t5/t5-small) | [SQuAD fine-tuning](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/t5/t5_small_squad.yaml) |
-
-## Run the Recipe
-
-```bash
-uv run automodel --nproc-per-node=8 examples/llm_finetune/t5/t5_small_squad.yaml
-```
 
 See the [Installation Guide](/get-started/installation) and [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).

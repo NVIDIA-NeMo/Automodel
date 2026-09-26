@@ -6,6 +6,14 @@ slug: model-coverage/dllm/nvidia/Nemotron-Labs-Diffusion-8B-Base
 
 [Nemotron-Labs-Diffusion](https://huggingface.co/nvidia/Nemotron-Labs-Diffusion-8B-Base) is NVIDIA's 8B diffusion language model.
 
+## Fine-Tune Nemotron-Labs-Diffusion-8B-Base
+
+From the repository root, run:
+
+```bash
+uv run automodel --nproc-per-node=8 examples/dllm_sft/nemotron_labs_diffusion_sft.yaml
+```
+
 ## Model Reference
 
 ### Model Architecture
@@ -23,9 +31,5 @@ slug: model-coverage/dllm/nvidia/Nemotron-Labs-Diffusion-8B-Base
 |---|---|
 | [`nvidia/Nemotron-Labs-Diffusion-8B-Base`](https://huggingface.co/nvidia/Nemotron-Labs-Diffusion-8B-Base) | [Full SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/nemotron_labs_diffusion_sft.yaml) |
 | [`nvidia/Nemotron-Labs-Diffusion-8B-Base`](https://huggingface.co/nvidia/Nemotron-Labs-Diffusion-8B-Base) | [LoRA](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/nemotron_labs_diffusion_lora.yaml) |
-
-```bash
-uv run automodel --nproc-per-node=8 examples/dllm_sft/nemotron_labs_diffusion_sft.yaml
-```
 
 See the [dLLM Fine-Tuning Guide](/recipes-e2e-examples/dllm-fine-tuning).
