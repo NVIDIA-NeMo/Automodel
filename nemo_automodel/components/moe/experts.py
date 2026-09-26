@@ -29,7 +29,11 @@ from nemo_automodel.components.moe.megatron.moe_utils import (
     weighted_bias_geglu_impl,
     weighted_bias_swiglu_impl,
 )
-from nemo_automodel.components.moe.megatron.token_dispatcher import MoEFlexTokenDispatcher, TokenDispatcherConfig
+from nemo_automodel.components.moe.megatron.token_dispatcher import (
+    HybridEPPipelineRuntimeInitializer,
+    MoEFlexTokenDispatcher,
+    TokenDispatcherConfig,
+)
 from nemo_automodel.components.moe.mxfp8 import select_grouped_mm
 from nemo_automodel.components.moe.optimized_ops import _apply_router_weight_fp32, _compile_router_weight_cores
 from nemo_automodel.components.moe.state_dict_utils import create_dtensor_from_local
@@ -1016,6 +1020,20 @@ class GroupedExpertsDeepEP(nn.Module):
         dtype_size = max(torch.empty((), dtype=self.config.dtype).element_size(), 2)
         get_buffer(ep_group, self.config.expert_dim * dtype_size)
 
+    def get_pipeline_runtime_initializers(self) -> tuple[HybridEPPipelineRuntimeInitializer, ...]:
+        """Return dispatcher-owned resources that must be ready before a PP step.
+
+        Returns:
+            HybridEP runtime initializers supplied by this expert module's token dispatcher.
+        """
+        token_dispatcher = getattr(self, "token_dispatcher", None)
+        if token_dispatcher is None:
+            return ()
+        return token_dispatcher.get_pipeline_runtime_initializers(
+            hidden_dim=self.config.expert_dim,
+            dtype=self.config.dtype,
+        )
+
     def forward(
         self,
         x: torch.Tensor,
@@ -1545,6 +1563,19 @@ class GroupedExpertsTE(nn.Module):
 
         self.fp8_padding = Fp8Padding(self.num_local_experts)
         self.fp8_unpadding = Fp8Unpadding(self.num_local_experts)
+
+    def get_pipeline_runtime_initializers(self) -> tuple[HybridEPPipelineRuntimeInitializer, ...]:
+        """Return dispatcher-owned resources that must be ready before a PP step.
+
+        Returns:
+            HybridEP runtime initializers supplied by this expert module's token dispatcher.
+        """
+        if self.token_dispatcher is None:
+            return ()
+        return self.token_dispatcher.get_pipeline_runtime_initializers(
+            hidden_dim=self.config.expert_dim,
+            dtype=self.config.dtype,
+        )
 
     def forward(
         self,
