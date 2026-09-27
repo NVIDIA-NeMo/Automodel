@@ -51,6 +51,10 @@ def diagnose_memory(memory: NeuralMemory, hidden: torch.Tensor) -> dict[str, Any
     momentum_norms = [float(torch.linalg.vector_norm(value.float())) for value in enabled_state.momentum]
     return {
         "input_shape": list(hidden.shape),
+        "initial_fast_weights": [
+            tensor_stats(value) for value in memory._deep_init_weights(hidden.shape[0], torch.float32)
+        ],
+        "enabled_fast_weights": [tensor_stats(value) for value in enabled_state.weights],
         "beta": tensor_stats(beta),
         "forget_keep": tensor_stats(keep),
         "momentum_eta": tensor_stats(eta),
