@@ -27,6 +27,23 @@ TOKENIZER=${TITANS_TOKENIZER:-NousResearch/Llama-2-7b-hf}
 MODE=${MODE:-evaluate}
 BENCHMARK=${BENCHMARK:?Set BENCHMARK to wikitext103, lambada, or fineweb_edu}
 RESULT_ROOT=${RESULT_ROOT:-"$TITANS_WORK_ROOT/results/eval/lm"}
+MODEL_REGISTRY=${TITANS_MODEL_REGISTRY:-"$AUTOMODEL_CHECKOUT/examples/llm_pretrain/titans_eval_registry.json"}
+MODEL_NAME=${TITANS_MODEL:-}
+
+if [[ -z ${CHECKPOINT:-} && -n $MODEL_NAME ]]; then
+  while IFS=$'\t' read -r name checkpoint enable_ttt; do
+    if [[ $enable_ttt == "${ENABLE_TTT_UPDATES:-1}" ]]; then
+      CHECKPOINT=$checkpoint
+      ttt_label=$([[ $enable_ttt == 1 ]] && echo on || echo off)
+      RESULT_ROOT="$RESULT_ROOT/$name/ttt-$ttt_label"
+      break
+    fi
+  done < <(
+    python "$AUTOMODEL_CHECKOUT/examples/llm_pretrain/titans_eval_registry.py" \
+      "$MODEL_REGISTRY" --work-root "$TITANS_WORK_ROOT" --model "$MODEL_NAME"
+  )
+  [[ -n ${CHECKPOINT:-} ]] || { echo "Could not resolve $MODEL_NAME from $MODEL_REGISTRY" >&2; exit 1; }
+fi
 
 if [[ ${TITANS_EVAL_IN_CONTAINER:-0} != 1 ]]; then
   mounts=/scratch:/scratch
@@ -44,6 +61,8 @@ if [[ ${TITANS_EVAL_IN_CONTAINER:-0} != 1 ]]; then
       AUTOMODEL_CHECKOUT="$AUTOMODEL_CHECKOUT" \
       TITANS_WORK_ROOT="$TITANS_WORK_ROOT" \
       TITANS_TOKENIZER="$TOKENIZER" \
+      TITANS_MODEL_REGISTRY="$MODEL_REGISTRY" \
+      TITANS_MODEL="$MODEL_NAME" \
       MODE="$MODE" \
       BENCHMARK="$BENCHMARK" \
       RESULT_ROOT="$RESULT_ROOT" \

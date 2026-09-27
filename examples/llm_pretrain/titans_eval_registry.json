@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "models": [
+    {
+      "name": "lmm",
+      "run_root": "titans-170m-baseline-15B-blackwell-optimized",
+      "memory_model": true,
+      "enabled": true
+    },
+    {
+      "name": "mac",
+      "run_root": "titans-170m-mac-15B-blackwell-mac-v1",
+      "memory_model": true,
+      "enabled": true
+    },
+    {
+      "name": "mag",
+      "run_root": "titans-170m-mag-15B-blackwell-mag-v1",
+      "memory_model": true,
+      "enabled": true
+    },
+    {
+      "name": "mal",
+      "run_root": "titans-170m-mal-15B-blackwell-mal-v1",
+      "memory_model": true,
+      "enabled": true
+    },
+    {
+      "name": "local_raw",
+      "run_root": "titans-170m-local_raw-15B-blackwell",
+      "memory_model": false,
+      "enabled": false
+    },
+    {
+      "name": "local_matched",
+      "run_root": "titans-170m-local_matched-15B-blackwell",
+      "memory_model": false,
+      "enabled": false
+    },
+    {
+      "name": "full_matched",
+      "run_root": "titans-170m-full_matched-15B-blackwell",
+      "memory_model": false,
+      "enabled": false
+    },
+    {
+      "name": "mac_every4",
+      "run_root": "titans-170m-mac_every4-15B-blackwell",
+      "memory_model": true,
+      "enabled": false
+    },
+    {
+      "name": "mac_chunk64",
+      "run_root": "titans-170m-mac_chunk64-15B-blackwell",
+      "memory_model": true,
+      "enabled": false
+    },
+    {
+      "name": "mac_no_persistent",
+      "run_root": "titans-170m-mac_no_persistent-15B-blackwell",
+      "memory_model": true,
+      "enabled": false
+    }
+  ]
+}

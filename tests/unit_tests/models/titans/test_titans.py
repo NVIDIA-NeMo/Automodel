@@ -42,6 +42,8 @@ from nemo_automodel.components.distributed.parallelizer import _apply_titans_act
 from nemo_automodel.components.models.titans.config import TitansConfig
 from nemo_automodel.components.models.titans.layers import (
     NeuralMemory,
+    TitansAttentionBlock,
+    TitansMACBlock,
     titans_delta_rule_recurrence,
 )
 from nemo_automodel.components.models.titans.model import TitansForCausalLM
@@ -50,6 +52,8 @@ from nemo_automodel.shared.import_utils import safe_import
 
 CUDA = torch.cuda.is_available()
 cuda_only = pytest.mark.skipif(not CUDA, reason="fla GDN kernel requires CUDA")
+HAVE_FLA, _ = safe_import("fla.ops.gated_delta_rule")
+fla_cuda_only = pytest.mark.skipif(not (CUDA and HAVE_FLA), reason="fla GDN kernel requires CUDA and fla")
 HAVE_ACCELERATED_SCAN, accelerated_scan = safe_import("nemo_automodel.components.models.titans.accelerated_scan")
 accelerated_scan_only = pytest.mark.skipif(
     not (CUDA and HAVE_ACCELERATED_SCAN),
@@ -80,6 +84,20 @@ def test_titans_activation_checkpointing_wraps_neural_memory():
     _apply_titans_activation_checkpointing(model)
 
     assert all(isinstance(layer.memory, CheckpointWrapper) for layer in model.model.layers)
+
+
+def test_titans_activation_checkpointing_accepts_attention_only_controls():
+    model = TitansForCausalLM(
+        _tiny_config(
+            architecture_variant="local_attention",
+            num_longterm_memory_tokens=0,
+            num_persistent_memory_tokens=0,
+        )
+    )
+
+    _apply_titans_activation_checkpointing(model)
+
+    assert all(isinstance(layer, TitansAttentionBlock) for layer in model.model.layers)
 
 
 def test_persistent_memory_is_prepended_without_changing_logit_length():
@@ -156,6 +174,97 @@ def test_mac_requires_longterm_memory_tokens():
         _tiny_config(architecture_variant="mac", num_longterm_memory_tokens=0)
 
 
+@pytest.mark.parametrize("variant", ["local_attention", "full_attention"])
+def test_attention_only_controls_have_no_memory_parameters_and_roundtrip(variant):
+    config = _tiny_config(
+        architecture_variant=variant,
+        attention_segment_size=4,
+        num_longterm_memory_tokens=0,
+        num_persistent_memory_tokens=0,
+    )
+    model = TitansForCausalLM(config).eval()
+
+    assert all(isinstance(layer, TitansAttentionBlock) for layer in model.model.layers)
+    assert all(not hasattr(layer, "memory") for layer in model.model.layers)
+    assert not hasattr(model.model, "longterm_memory")
+    assert not hasattr(model.model, "persistent_memory")
+    assert not any("persistent_kv" in name or ".memory." in name for name, _ in model.named_parameters())
+
+    input_ids = torch.randint(0, config.vocab_size, (1, 8))
+    with torch.no_grad():
+        expected = model(input_ids).logits
+    restored = TitansForCausalLM(config).eval()
+    restored.load_state_dict(model.state_dict(), strict=True)
+    with torch.no_grad():
+        actual = restored(input_ids).logits
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_local_attention_control_is_segment_isolated_but_full_attention_is_not():
+    torch.manual_seed(12)
+    common = dict(
+        attention_segment_size=4,
+        num_longterm_memory_tokens=0,
+        num_persistent_memory_tokens=0,
+        num_hidden_layers=1,
+    )
+    local = TitansForCausalLM(_tiny_config(architecture_variant="local_attention", **common)).eval()
+    full = TitansForCausalLM(_tiny_config(architecture_variant="full_attention", **common)).eval()
+    full.load_state_dict(local.state_dict(), strict=True)
+    original = torch.randint(0, local.config.vocab_size, (1, 8))
+    changed = original.clone()
+    changed[:, 0] = (changed[:, 0] + 1) % local.config.vocab_size
+
+    with torch.no_grad():
+        local_original = local(original).logits
+        local_changed = local(changed).logits
+        full_original = full(original).logits
+        full_changed = full(changed).logits
+
+    torch.testing.assert_close(local_original[:, 4:], local_changed[:, 4:], rtol=0, atol=0)
+    assert (full_original[:, 4:] - full_changed[:, 4:]).abs().max().item() > 0
+
+
+def test_sparse_mac_places_memory_only_at_declared_layers():
+    config = _tiny_config(
+        architecture_variant="mac",
+        num_hidden_layers=6,
+        attention_segment_size=4,
+        num_longterm_memory_tokens=2,
+        memory_layer_indices=[1, 5],
+        mem_depth=2,
+        chunk_size=2,
+    )
+    model = TitansForCausalLM(config)
+
+    assert [index for index, layer in enumerate(model.model.layers) if isinstance(layer, TitansMACBlock)] == [1, 5]
+    assert all(
+        isinstance(layer, TitansMACBlock if index in {1, 5} else TitansAttentionBlock)
+        for index, layer in enumerate(model.model.layers)
+    )
+    logits = model(torch.randint(0, config.vocab_size, (1, 8))).logits
+    assert logits.shape == (1, 8, config.vocab_size)
+
+
+def test_attention_control_and_sparse_mac_config_validation():
+    with pytest.raises(ValueError, match="attention-only controls require"):
+        _tiny_config(architecture_variant="local_attention")
+    with pytest.raises(ValueError, match="supported only for MAC"):
+        _tiny_config(memory_layer_indices=[0])
+    with pytest.raises(ValueError, match="sorted and unique"):
+        _tiny_config(
+            architecture_variant="mac",
+            num_longterm_memory_tokens=2,
+            memory_layer_indices=[1, 0],
+        )
+    with pytest.raises(ValueError, match=r"within \[0, 2\)"):
+        _tiny_config(
+            architecture_variant="mac",
+            num_longterm_memory_tokens=2,
+            memory_layer_indices=[2],
+        )
+
+
 @pytest.mark.parametrize("variant", ["mag", "mal"])
 def test_mag_and_mal_preserve_shape_gradient_and_causality(variant):
     torch.manual_seed(11)
@@ -187,7 +296,7 @@ def test_mag_and_mal_preserve_shape_gradient_and_causality(variant):
 # --------------------------------------------------------------------------- #
 # (c) Reduction check: Titans (eta=0) == Gated DeltaNet (fla)
 # --------------------------------------------------------------------------- #
-@cuda_only
+@fla_cuda_only
 def test_reduction_recurrence_matches_fla_gdn():
     """titans_delta_rule_recurrence(eta=0) == fla.chunk_gated_delta_rule."""
     from fla.ops.gated_delta_rule import chunk_gated_delta_rule
@@ -822,6 +931,39 @@ def test_170m_mac_recipe_pins_public_reference_topology():
     assert sum(parameter.numel() for parameter in instantiated.parameters()) > 173_695_680
 
 
+def test_170m_attention_control_recipes_are_memory_free_and_parameter_matched():
+    root = Path(__file__).parents[4]
+    expected = {
+        "local_raw": ("local_attention", 3072, 162_417_408),
+        "local_matched": ("local_attention", 4593, 204_470_016),
+        "full_matched": ("full_attention", 4593, 204_470_016),
+    }
+    for name, (variant, width, parameter_count) in expected.items():
+        recipe = yaml.safe_load((root / f"examples/llm_pretrain/titans_170m_{name}.yaml").read_text())
+        model = recipe["model"]["config"]
+        assert model["architecture_variant"] == variant
+        assert model["intermediate_size"] == width
+        assert model["num_longterm_memory_tokens"] == 0
+        assert model["num_persistent_memory_tokens"] == 0
+        assert recipe["dataset"]["seq_len"] == 4096
+        assert recipe["step_scheduler"]["global_batch_size"] == 128
+        assert recipe["step_scheduler"]["max_steps"] == 28_610
+        config_values = {key: value for key, value in model.items() if key not in {"_target_", "architectures"}}
+        with torch.device("meta"):
+            instantiated = TitansForCausalLM(TitansConfig(**config_values))
+        assert sum(parameter.numel() for parameter in instantiated.parameters()) == parameter_count
+
+    mac_recipe = yaml.safe_load((root / "examples/llm_pretrain/titans_170m_mac.yaml").read_text())
+    mac_values = {
+        key: value
+        for key, value in mac_recipe["model"]["config"].items()
+        if key not in {"_target_", "architectures"}
+    }
+    with torch.device("meta"):
+        mac = TitansForCausalLM(TitansConfig(**mac_values))
+    assert sum(parameter.numel() for parameter in mac.parameters()) - expected["local_matched"][2] == 4_032
+
+
 @pytest.mark.parametrize("variant", ["mag", "mal"])
 def test_170m_mag_mal_recipes_pin_paper_window_and_token_batch(variant):
     root = Path(__file__).parents[4]
@@ -925,6 +1067,17 @@ def test_blackwell_submitter_resolves_portable_topology():
     assert "mag|mal) GLOBAL_BATCH_SIZE=256" in runner
     assert "WANDB_GROUP=mag-$TITANS_SCALE" in runner
     assert "WANDB_GROUP=mal-$TITANS_SCALE" in runner
+    for variant in (
+        "local_raw",
+        "local_matched",
+        "full_matched",
+        "mac_every4",
+        "mac_chunk64",
+        "mac_no_persistent",
+    ):
+        assert f"{variant})" in runner or f"{variant}|" in runner
+        assert variant in full_runner
+        assert variant in submitter
     for scale in ("170m", "340m", "760m"):
         assert scale in runner
 

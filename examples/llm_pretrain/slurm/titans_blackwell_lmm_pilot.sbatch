@@ -34,6 +34,9 @@ case "$TITANS_SCALE" in
   760m) DEFAULT_LOCAL_BATCH_SIZE=2 ;;
 esac
 [[ $TITANS_EXPERIMENT == mac ]] && DEFAULT_LOCAL_BATCH_SIZE=4
+[[ $TITANS_EXPERIMENT == mac_every4 || $TITANS_EXPERIMENT == mac_chunk64 || \
+   $TITANS_EXPERIMENT == mac_no_persistent ]] && DEFAULT_LOCAL_BATCH_SIZE=4
+[[ $TITANS_EXPERIMENT == full_matched ]] && DEFAULT_LOCAL_BATCH_SIZE=2
 [[ $TITANS_EXPERIMENT == mag || $TITANS_EXPERIMENT == mal ]] && DEFAULT_LOCAL_BATCH_SIZE=4
 (( DEFAULT_LOCAL_BATCH_SIZE > MAX_LOCAL_BATCH_SIZE )) && \
   DEFAULT_LOCAL_BATCH_SIZE=$MAX_LOCAL_BATCH_SIZE
@@ -69,6 +72,10 @@ fi
 case "$TITANS_EXPERIMENT" in
   baseline) MODEL_OVERRIDES="" ;;
   mac) MODEL_OVERRIDES="" ;;
+  local_raw|local_matched|full_matched) MODEL_OVERRIDES="" ;;
+  mac_every4) MODEL_OVERRIDES="--model.config.memory_layer_indices=[3,7,11]" ;;
+  mac_chunk64) MODEL_OVERRIDES="--model.config.chunk_size=64 --model.config.memory_batch_size=6144" ;;
+  mac_no_persistent) MODEL_OVERRIDES="--model.config.num_persistent_memory_tokens=0" ;;
   mag|mal) MODEL_OVERRIDES="" ;;
   no_persistent)
     MODEL_OVERRIDES="--model.config.num_persistent_memory_tokens=0 --model.config.memory_batch_size=4096"
@@ -85,7 +92,13 @@ case "$TITANS_EXPERIMENT" in
   *) echo "unknown Titans experiment: $TITANS_EXPERIMENT" >&2; exit 2 ;;
 esac
 
-if [[ $TITANS_EXPERIMENT == mac || $TITANS_EXPERIMENT == mag || $TITANS_EXPERIMENT == mal ]]; then
+if [[ $TITANS_EXPERIMENT == local_raw || $TITANS_EXPERIMENT == local_matched || \
+      $TITANS_EXPERIMENT == full_matched ]]; then
+  RECIPE=examples/llm_pretrain/titans_${TITANS_SCALE}_${TITANS_EXPERIMENT}.yaml
+elif [[ $TITANS_EXPERIMENT == mac_every4 || $TITANS_EXPERIMENT == mac_chunk64 || \
+        $TITANS_EXPERIMENT == mac_no_persistent ]]; then
+  RECIPE=examples/llm_pretrain/titans_${TITANS_SCALE}_mac.yaml
+elif [[ $TITANS_EXPERIMENT == mac || $TITANS_EXPERIMENT == mag || $TITANS_EXPERIMENT == mal ]]; then
   RECIPE=examples/llm_pretrain/titans_${TITANS_SCALE}_${TITANS_EXPERIMENT}.yaml
 else
   RECIPE=examples/llm_pretrain/titans_${TITANS_SCALE}_lmm.yaml
@@ -103,12 +116,30 @@ case "$TITANS_EXPERIMENT" in
   mac) WANDB_GROUP=mac-$TITANS_SCALE ;;
   mag) WANDB_GROUP=mag-$TITANS_SCALE ;;
   mal) WANDB_GROUP=mal-$TITANS_SCALE ;;
+  local_raw|local_matched|full_matched) WANDB_GROUP=controls-$TITANS_SCALE ;;
+  mac_every4|mac_chunk64|mac_no_persistent) WANDB_GROUP=mac-bridges-$TITANS_SCALE ;;
   *) WANDB_GROUP=ablations-170m ;;
 esac
 
 mkdir -p "$TITANS_WORK_ROOT"/{cache,logs,outputs} "$DATA_ROOT/train" \
   "$TITANS_WORK_ROOT/cache"/{triton,torchinductor,wandb,wandb-data} \
   "$TITANS_WORK_ROOT/.config/wandb" "$AUTOMODEL_CHECKOUT/slurm_jobs"
+python3 - "$CHECKPOINT_ROOT/run_manifest.json" <<PY
+import json, pathlib
+path = pathlib.Path("$CHECKPOINT_ROOT/run_manifest.json")
+path.parent.mkdir(parents=True, exist_ok=True)
+path.write_text(json.dumps({
+    "git_sha": "$(git -C "$AUTOMODEL_CHECKOUT" rev-parse HEAD)",
+    "slurm_job_id": "$SLURM_JOB_ID",
+    "scale": "$TITANS_SCALE",
+    "experiment": "$TITANS_EXPERIMENT",
+    "recipe": "$RECIPE",
+    "model_overrides": "$MODEL_OVERRIDES",
+    "pilot_steps": $PILOT_STEPS,
+    "global_batch_size": $GLOBAL_BATCH_SIZE,
+    "sequence_length": $SEQUENCE_LENGTH,
+}, indent=2, sort_keys=True) + "\n")
+PY
 
 if ! grep -qs "api.wandb.ai" "$HOME/.netrc" && [[ -z ${WANDB_API_KEY:-} ]]; then
   echo "W&B authentication is required for Blackwell pilots" >&2

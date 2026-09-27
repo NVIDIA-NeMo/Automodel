@@ -35,6 +35,7 @@ from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFChe
 from nemo_automodel.components.models.titans.config import TitansConfig
 from nemo_automodel.components.models.titans.layers import (
     NeuralMemoryState,
+    TitansAttentionBlock,
     TitansBlock,
     TitansMACBlock,
     TitansMAGBlock,
@@ -74,7 +75,13 @@ class TitansPreTrainedModel(PreTrainedModel):
     config_class = TitansConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
-    _no_split_modules = ["TitansBlock", "TitansMACBlock", "TitansMAGBlock", "TitansMALBlock"]
+    _no_split_modules = [
+        "TitansBlock",
+        "TitansMACBlock",
+        "TitansMAGBlock",
+        "TitansMALBlock",
+        "TitansAttentionBlock",
+    ]
     # A_log / dt_bias are exponentiated in the decay gate; keep them fp32 under
     # any mixed-precision sharding (see layers.NeuralMemory and state_dict_adapter).
     _keep_in_fp32_modules = ["A_log", "dt_bias"]
@@ -112,14 +119,28 @@ class TitansModel(TitansPreTrainedModel):
                 torch.empty(config.num_longterm_memory_tokens, config.hidden_size, dtype=dtype)
             )
             nn.init.trunc_normal_(self.longterm_memory, mean=0.0, std=config.initializer_range)
-            block_cls = TitansMACBlock
+            memory_layers = (
+                set(range(config.num_hidden_layers))
+                if config.memory_layer_indices is None
+                else set(config.memory_layer_indices)
+            )
+            self.layers = nn.ModuleList(
+                [
+                    (TitansMACBlock if index in memory_layers else TitansAttentionBlock)(config, dtype=dtype)
+                    for index in range(config.num_hidden_layers)
+                ]
+            )
+        elif config.architecture_variant in {"local_attention", "full_attention"}:
+            self.layers = nn.ModuleList(
+                [TitansAttentionBlock(config, dtype=dtype) for _ in range(config.num_hidden_layers)]
+            )
         else:
             block_cls = {
                 "lmm": TitansBlock,
                 "mag": TitansMAGBlock,
                 "mal": TitansMALBlock,
             }[config.architecture_variant]
-        self.layers = nn.ModuleList([block_cls(config, dtype=dtype) for _ in range(config.num_hidden_layers)])
+            self.layers = nn.ModuleList([block_cls(config, dtype=dtype) for _ in range(config.num_hidden_layers)])
         self.norm = TitansRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.gradient_checkpointing = False
         self.post_init()
@@ -159,6 +180,8 @@ class TitansModel(TitansPreTrainedModel):
                     "Stateful inference currently supports LMM and segment-aligned MAC; "
                     "MAG/MAL also require attention-cache state."
                 )
+            if self.config.architecture_variant == "mac" and self.config.memory_layer_indices is not None:
+                raise NotImplementedError("Stateful inference is not implemented for sparse-memory MAC.")
             if self.config.mem_depth < 2:
                 raise NotImplementedError("Stateful inference requires deep memory (mem_depth >= 2).")
             if inference_state is not None and len(inference_state.memory_states) != len(self.layers):

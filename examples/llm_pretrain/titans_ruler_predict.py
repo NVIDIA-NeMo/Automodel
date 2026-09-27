@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import subprocess
 from collections.abc import Iterator
@@ -36,6 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--requested-samples", type=int)
     parser.add_argument("--task")
     parser.add_argument("--context-length", type=int)
+    parser.add_argument("--data-seed", type=int, required=True)
     parser.add_argument("--ruler-revision", default="unknown")
     parser.add_argument("--code-revision")
     parser.add_argument("--max-new-tokens", type=int, default=128)
@@ -49,6 +51,15 @@ def count_samples(path: Path) -> int:
     """Count nonblank JSONL records."""
     with path.open() as stream:
         return sum(bool(line.strip()) for line in stream)
+
+
+def sha256_file(path: Path) -> str:
+    """Return the SHA-256 digest of a file."""
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def validate_sample_range(sample_start: int, sample_end: int, sample_count: int) -> None:
@@ -154,7 +165,9 @@ def main() -> None:
         "code_git_revision": args.code_revision or git_revision(Path(__file__).resolve().parent),
         "task": args.task or args.data_jsonl.parent.name,
         "context_length": args.context_length,
+        "data_seed": args.data_seed,
         "requested_sample_count": requested_samples,
+        "prepared_data_sha256": sha256_file(args.data_jsonl),
         "shard_range": {"start": args.sample_start, "end": sample_end},
         "generation_settings": {
             "max_new_tokens": args.max_new_tokens,

@@ -69,8 +69,9 @@ class TitansConfig(PretrainedConfig):
             ``chunk_size``. ``None`` uses the full input sequence.
         architecture_variant: ``"lmm"`` for neural memory as the token mixer,
             ``"mac"`` for the public Memory-as-Context topology, ``"mag"`` for
-            parallel gated memory/attention, or ``"mal"`` for sequential
-            memory-then-attention layers.
+            parallel gated memory/attention, ``"mal"`` for sequential
+            memory-then-attention layers, or ``"local_attention"`` /
+            ``"full_attention"`` for no-memory controls.
         attention_segment_size: Number of ordinary tokens in each MAC local
             attention segment.
         num_longterm_memory_tokens: Learned MAC tokens appended to each segment
@@ -78,6 +79,9 @@ class TitansConfig(PretrainedConfig):
         num_persistent_memory_tokens: Number of learned, input-independent
             vectors prepended to LMM inputs or exposed as per-layer attention
             prefix key/value pairs in MAC.
+        memory_layer_indices: Optional sorted zero-based MAC layer indices that
+            retain neural memory. Other MAC layers use segmented attention plus
+            SwiGLU only. ``None`` retains memory in every layer.
         tie_word_embeddings: Whether ``lm_head`` shares weights with ``embed_tokens``.
         initializer_range: Stddev for truncated-normal weight init.
         torch_dtype: Default compute dtype (``A_log`` / ``dt_bias`` always stay fp32).
@@ -110,6 +114,7 @@ class TitansConfig(PretrainedConfig):
         attention_segment_size: int = 512,
         num_longterm_memory_tokens: int = 256,
         num_persistent_memory_tokens: int = 0,
+        memory_layer_indices: list[int] | None = None,
         tie_word_embeddings: bool = True,
         initializer_range: float = 0.02,
         torch_dtype: str = "bfloat16",
@@ -141,6 +146,7 @@ class TitansConfig(PretrainedConfig):
         self.attention_segment_size = attention_segment_size
         self.num_longterm_memory_tokens = num_longterm_memory_tokens
         self.num_persistent_memory_tokens = num_persistent_memory_tokens
+        self.memory_layer_indices = memory_layer_indices
         self.initializer_range = initializer_range
         self.torch_dtype = torch_dtype
 
@@ -159,10 +165,10 @@ class TitansConfig(PretrainedConfig):
                 "TitansConfig: deep_memory_backend must be 'reference' or 'titans_pytorch'; "
                 f"got {deep_memory_backend!r}."
             )
-        if architecture_variant not in {"lmm", "mac", "mag", "mal"}:
+        if architecture_variant not in {"lmm", "mac", "mag", "mal", "local_attention", "full_attention"}:
             raise ValueError(
                 "TitansConfig: architecture_variant must be one of "
-                "'lmm', 'mac', 'mag', or 'mal'; "
+                "'lmm', 'mac', 'mag', 'mal', 'local_attention', or 'full_attention'; "
                 f"got {architecture_variant!r}."
             )
         if attention_segment_size <= 0:
@@ -171,6 +177,25 @@ class TitansConfig(PretrainedConfig):
             raise ValueError("TitansConfig: num_longterm_memory_tokens must be non-negative.")
         if architecture_variant == "mac" and num_longterm_memory_tokens == 0:
             raise ValueError("TitansConfig: MAC requires num_longterm_memory_tokens > 0.")
+        if architecture_variant in {"local_attention", "full_attention"} and (
+            num_longterm_memory_tokens or num_persistent_memory_tokens
+        ):
+            raise ValueError(
+                "TitansConfig: attention-only controls require "
+                "num_longterm_memory_tokens=0 and num_persistent_memory_tokens=0."
+            )
+        if memory_layer_indices is not None:
+            if architecture_variant != "mac":
+                raise ValueError("TitansConfig: memory_layer_indices is supported only for MAC.")
+            if any(not isinstance(index, int) for index in memory_layer_indices):
+                raise ValueError("TitansConfig: memory_layer_indices must contain integers.")
+            if memory_layer_indices != sorted(set(memory_layer_indices)):
+                raise ValueError("TitansConfig: memory_layer_indices must be sorted and unique.")
+            if any(index < 0 or index >= num_hidden_layers for index in memory_layer_indices):
+                raise ValueError(
+                    "TitansConfig: memory_layer_indices must be within "
+                    f"[0, {num_hidden_layers}); got {memory_layer_indices}."
+                )
         if memory_batch_size is not None:
             if memory_batch_size <= 0:
                 raise ValueError("TitansConfig: memory_batch_size must be positive when provided.")

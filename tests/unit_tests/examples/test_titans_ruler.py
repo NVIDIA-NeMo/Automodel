@@ -32,6 +32,7 @@ def load_module(name: str, filename: str):
 
 RULER = load_module("titans_ruler_test_module", "titans_ruler.py")
 PREDICT = load_module("titans_ruler_predict_test_module", "titans_ruler_predict.py")
+REGISTRY = load_module("titans_eval_registry_test_module", "titans_eval_registry.py")
 
 
 def write_jsonl(path: Path, rows: list[dict], *, blank_after_first: bool = False) -> None:
@@ -153,3 +154,62 @@ def test_scoring_reads_merged_raw_jsonl(tmp_path: Path) -> None:
     with (predictions / "summary.csv").open(newline="") as stream:
         summary = list(csv.DictReader(stream))
     assert summary == [{"task": "niah_single_1", "score": "50.0", "nulls": "1", "num_samples": "2"}]
+
+
+def test_prepare_dataset_forwards_and_records_explicit_seed(tmp_path: Path, monkeypatch) -> None:
+    commands = []
+
+    def fake_run(command, *, cwd):
+        commands.append((command, cwd))
+        output = Path(command[command.index("--save_dir") + 1])
+        task = command[command.index("--task") + 1]
+        write_jsonl(output / task / "validation.jsonl", [sample(0), sample(1)])
+
+    monkeypatch.setattr(RULER, "run", fake_run)
+    prepared = RULER.prepare_dataset(
+        scripts=tmp_path / "RULER" / "scripts",
+        data_dir=tmp_path / "data",
+        task="niah_single_1",
+        tokenizer="tokenizer",
+        context_length=2048,
+        num_samples=2,
+        model_template_type="base",
+        ruler_revision="revision",
+        seed=43,
+    )
+
+    assert prepared.exists()
+    assert commands[0][0][commands[0][0].index("--random_seed") + 1] == "43"
+    manifest = json.loads((prepared.parent / "manifest.json").read_text())
+    assert manifest["random_seed"] == 43
+
+
+def test_eval_registry_resolves_enabled_models_and_ttt_modes(tmp_path: Path) -> None:
+    outputs = tmp_path / "outputs"
+    memory_root = outputs / "memory"
+    control_root = outputs / "control"
+    for root in (memory_root, control_root):
+        checkpoint = root / "checkpoint_step_1" / "model" / "consolidated"
+        checkpoint.mkdir(parents=True)
+        (root / "LATEST").symlink_to("checkpoint_step_1")
+    registry = tmp_path / "registry.json"
+    registry.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "models": [
+                    {"name": "memory", "run_root": "memory", "memory_model": True, "enabled": True},
+                    {"name": "control", "run_root": "control", "memory_model": False, "enabled": True},
+                    {"name": "planned", "run_root": "missing", "memory_model": True, "enabled": False},
+                ],
+            }
+        )
+    )
+
+    rows = REGISTRY.evaluation_rows(registry, tmp_path)
+
+    assert [(name, enabled) for name, _, enabled in rows] == [
+        ("memory", True),
+        ("memory", False),
+        ("control", True),
+    ]

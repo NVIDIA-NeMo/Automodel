@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import csv
 import fcntl
+import hashlib
 import json
 import logging
 import subprocess
@@ -46,6 +47,7 @@ def parse_args() -> argparse.Namespace:
         default=["niah_single_1", "niah_single_2", "niah_single_3"],
     )
     parser.add_argument("--num-samples", type=int, default=4)
+    parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--sample-start", type=int, default=0)
     parser.add_argument("--sample-end", type=int)
     parser.add_argument("--max-new-tokens", type=int, default=128)
@@ -81,6 +83,29 @@ def count_jsonl_rows(path: Path) -> int:
         return sum(bool(line.strip()) for line in stream)
 
 
+def sha256_file(path: Path) -> str:
+    """Return the SHA-256 digest of a file."""
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def validate_unique_jsonl_rows(path: Path) -> None:
+    """Reject byte-independent duplicate JSON records."""
+    fingerprints: set[str] = set()
+    with path.open() as stream:
+        for line_number, line in enumerate(stream, start=1):
+            if not line.strip():
+                continue
+            canonical = json.dumps(json.loads(line), sort_keys=True, separators=(",", ":"))
+            fingerprint = hashlib.sha256(canonical.encode()).hexdigest()
+            if fingerprint in fingerprints:
+                raise ValueError(f"{path}:{line_number}: duplicate JSONL record")
+            fingerprints.add(fingerprint)
+
+
 def write_json_atomic(path: Path, value: dict[str, Any]) -> None:
     """Atomically write formatted JSON."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -99,6 +124,7 @@ def prepare_dataset(
     num_samples: int,
     model_template_type: str,
     ruler_revision: str,
+    seed: int,
 ) -> Path:
     """Prepare one task dataset under an inter-process lock and safely reuse it."""
     task_dir = data_dir / task
@@ -110,6 +136,7 @@ def prepare_dataset(
         "task": task,
         "context_length": context_length,
         "requested_sample_count": num_samples,
+        "random_seed": seed,
         "generation_settings": {
             "benchmark": "synthetic",
             "model_template_type": model_template_type,
@@ -120,13 +147,15 @@ def prepare_dataset(
     lock_path = data_dir / f".{task}.prepare.lock"
     with lock_path.open("w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        if (
-            validation_path.exists()
-            and manifest_path.exists()
-            and json.loads(manifest_path.read_text()) == expected_manifest
-            and count_jsonl_rows(validation_path) == num_samples
-        ):
-            return validation_path
+        if validation_path.exists() and manifest_path.exists():
+            manifest = json.loads(manifest_path.read_text())
+            if (
+                all(manifest.get(key) == value for key, value in expected_manifest.items())
+                and manifest.get("sha256") == sha256_file(validation_path)
+                and count_jsonl_rows(validation_path) == num_samples
+            ):
+                validate_unique_jsonl_rows(validation_path)
+                return validation_path
 
         with tempfile.TemporaryDirectory(prefix=f".{task}.prepare-", dir=data_dir) as temporary:
             temporary_dir = Path(temporary)
@@ -150,6 +179,8 @@ def prepare_dataset(
                     model_template_type,
                     "--num_samples",
                     str(num_samples),
+                    "--random_seed",
+                    str(seed),
                 ],
                 cwd=scripts,
             )
@@ -157,9 +188,10 @@ def prepare_dataset(
             generated_count = count_jsonl_rows(generated)
             if generated_count != num_samples:
                 raise ValueError(f"RULER generated {generated_count} rows for {task}, expected {num_samples}")
+            validate_unique_jsonl_rows(generated)
             task_dir.mkdir(parents=True, exist_ok=True)
             generated.replace(validation_path)
-            write_json_atomic(manifest_path, expected_manifest)
+            write_json_atomic(manifest_path, {**expected_manifest, "sha256": sha256_file(validation_path)})
     return validation_path
 
 
@@ -286,8 +318,12 @@ def main() -> None:
     code_revision = git_revision(Path(__file__).resolve().parents[2])
 
     for context_length in args.context_lengths:
-        length_root = args.output_dir.resolve() / str(context_length)
-        data_dir = args.data_dir.resolve() / str(context_length) if args.data_dir is not None else length_root / "data"
+        length_root = args.output_dir.resolve() / str(context_length) / f"seed-{args.seed}"
+        data_dir = (
+            args.data_dir.resolve() / str(context_length) / f"seed-{args.seed}"
+            if args.data_dir is not None
+            else length_root / "data"
+        )
         prediction_dir = length_root / "pred"
         prediction_dir.mkdir(parents=True, exist_ok=True)
 
@@ -303,6 +339,7 @@ def main() -> None:
                     num_samples=args.num_samples,
                     model_template_type=args.model_template_type,
                     ruler_revision=ruler_revision,
+                    seed=args.seed,
                 )
             if args.mode in {"all", "predict"}:
                 shard_dir = prediction_dir / "shards" / task
@@ -328,6 +365,8 @@ def main() -> None:
                     task,
                     "--context-length",
                     str(context_length),
+                    "--data-seed",
+                    str(args.seed),
                     "--ruler-revision",
                     ruler_revision,
                     "--code-revision",
@@ -354,6 +393,7 @@ def main() -> None:
                         "code_git_revision": code_revision,
                         "task": task,
                         "context_length": context_length,
+                        "data_seed": args.seed,
                         "requested_sample_count": args.num_samples,
                         "generation_settings": {
                             "max_new_tokens": args.max_new_tokens,
@@ -372,6 +412,7 @@ def main() -> None:
                         "code_git_revision": code_revision,
                         "task": task,
                         "context_length": context_length,
+                        "data_seed": args.seed,
                         "requested_sample_count": args.num_samples,
                         "shard_range": {"start": 0, "end": args.num_samples},
                         "generation_settings": {
@@ -379,7 +420,19 @@ def main() -> None:
                             "stop_words": args.stop_word,
                             "enable_ttt_updates": not args.disable_ttt_updates,
                         },
-                        "source_shards": [path.name for path in sorted(shard_paths)],
+                        "source_shards": [
+                            {
+                                "path": path.name,
+                                "rows": count_jsonl_rows(path),
+                                "sha256": sha256_file(path),
+                            }
+                            for path in sorted(shard_paths)
+                        ],
+                        "merged": {
+                            "path": merged_path.name,
+                            "rows": count_jsonl_rows(merged_path),
+                            "sha256": sha256_file(merged_path),
+                        },
                     },
                 )
             score_s_niah_predictions(prediction_dir, args.tasks)

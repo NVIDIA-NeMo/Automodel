@@ -897,9 +897,12 @@ class SegmentedCausalAttention(nn.Module):
         self.k_proj = nn.Linear(config.hidden_size, self.inner_dim, bias=False, dtype=dtype)
         self.v_proj = nn.Linear(config.hidden_size, self.inner_dim, bias=False, dtype=dtype)
         self.o_proj = nn.Linear(self.inner_dim, config.hidden_size, bias=False, dtype=dtype)
-        self.persistent_kv = nn.Parameter(
-            torch.empty(2, self.num_heads, self.num_persistent_tokens, self.head_dim, dtype=dtype)
-        )
+        if self.num_persistent_tokens:
+            self.persistent_kv = nn.Parameter(
+                torch.empty(2, self.num_heads, self.num_persistent_tokens, self.head_dim, dtype=dtype)
+            )
+        else:
+            self.register_parameter("persistent_kv", None)
         inv_freq = 1.0 / (10000 ** (torch.arange(0, self.head_dim, 2, dtype=torch.float32) / self.head_dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
@@ -958,7 +961,8 @@ class SegmentedCausalAttention(nn.Module):
     def init_weights(self, init_std: float = 0.02):
         for linear in (self.q_proj, self.k_proj, self.v_proj, self.o_proj):
             nn.init.trunc_normal_(linear.weight, mean=0.0, std=init_std)
-        nn.init.trunc_normal_(self.persistent_kv, mean=0.0, std=init_std)
+        if self.persistent_kv is not None:
+            nn.init.trunc_normal_(self.persistent_kv, mean=0.0, std=init_std)
 
 
 class CausalAttention(nn.Module):
@@ -1096,6 +1100,44 @@ class TitansMACBlock(TitansBlock):
         super().init_weights(init_std)
         self.attention_layernorm.reset_parameters()
         self.attention.init_weights(init_std)
+
+
+class TitansAttentionBlock(nn.Module):
+    """Attention-only pre-norm decoder block used by matched controls and sparse MAC."""
+
+    def __init__(self, config, dtype: torch.dtype = torch.bfloat16):
+        super().__init__()
+        self.input_layernorm = TitansRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        if config.architecture_variant in {"mac", "local_attention"}:
+            self.attention = SegmentedCausalAttention(config, dtype=dtype)
+        elif config.architecture_variant == "full_attention":
+            self.attention = CausalAttention(config, dtype=dtype)
+        else:
+            raise ValueError(
+                "TitansAttentionBlock requires the 'mac', 'local_attention', "
+                f"or 'full_attention' architecture; got {config.architecture_variant!r}."
+            )
+        self.post_attention_layernorm = TitansRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.mlp = TitansMLP(config.hidden_size, config.intermediate_size, dtype=dtype)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        past_state: NeuralMemoryState | None = None,
+        return_state: bool = False,
+        enable_ttt_updates: bool = True,
+    ) -> torch.Tensor:
+        del enable_ttt_updates
+        if past_state is not None or return_state:
+            raise NotImplementedError("Attention-only blocks do not expose neural-memory state.")
+        x = x + self.attention(self.input_layernorm(x))
+        return x + self.mlp(self.post_attention_layernorm(x))
+
+    def init_weights(self, init_std: float = 0.02):
+        self.input_layernorm.reset_parameters()
+        self.post_attention_layernorm.reset_parameters()
+        self.attention.init_weights(init_std)
+        self.mlp.init_weights(init_std)
 
 
 class TitansMALBlock(TitansBlock):

@@ -15,8 +15,8 @@ MAX_STEPS_PER_RUN=${TITANS_MAX_STEPS_PER_RUN:-1700}
 TARGET_SEGMENT_SECONDS=${TITANS_TARGET_SEGMENT_SECONDS:-13200}
 WORLD_SIZE=$((SLURM_NNODES * TITANS_GPUS_PER_NODE))
 case "$TITANS_EXPERIMENT" in
-  mag|mal) GLOBAL_BATCH_SIZE=256 ;;
-  *) GLOBAL_BATCH_SIZE=128 ;;
+  mag|mal) GLOBAL_BATCH_SIZE=256; SEQUENCE_LENGTH=2048 ;;
+  *) GLOBAL_BATCH_SIZE=128; SEQUENCE_LENGTH=4096 ;;
 esac
 if (( GLOBAL_BATCH_SIZE % WORLD_SIZE != 0 )); then
   echo "global batch $GLOBAL_BATCH_SIZE must be divisible by world size $WORLD_SIZE" >&2
@@ -41,6 +41,9 @@ case "$TITANS_SCALE" in
   760m) DEFAULT_LOCAL_BATCH_SIZE=2 ;;
 esac
 [[ $TITANS_EXPERIMENT == mac ]] && DEFAULT_LOCAL_BATCH_SIZE=4
+[[ $TITANS_EXPERIMENT == mac_every4 || $TITANS_EXPERIMENT == mac_chunk64 || \
+   $TITANS_EXPERIMENT == mac_no_persistent ]] && DEFAULT_LOCAL_BATCH_SIZE=4
+[[ $TITANS_EXPERIMENT == full_matched ]] && DEFAULT_LOCAL_BATCH_SIZE=2
 [[ $TITANS_EXPERIMENT == mag || $TITANS_EXPERIMENT == mal ]] && DEFAULT_LOCAL_BATCH_SIZE=4
 (( DEFAULT_LOCAL_BATCH_SIZE > MAX_LOCAL_BATCH_SIZE )) && \
   DEFAULT_LOCAL_BATCH_SIZE=$MAX_LOCAL_BATCH_SIZE
@@ -79,6 +82,10 @@ fi
 case "$TITANS_EXPERIMENT" in
   baseline) MODEL_OVERRIDES="" ;;
   mac) MODEL_OVERRIDES="" ;;
+  local_raw|local_matched|full_matched) MODEL_OVERRIDES="" ;;
+  mac_every4) MODEL_OVERRIDES="--model.config.memory_layer_indices=[3,7,11]" ;;
+  mac_chunk64) MODEL_OVERRIDES="--model.config.chunk_size=64 --model.config.memory_batch_size=6144" ;;
+  mac_no_persistent) MODEL_OVERRIDES="--model.config.num_persistent_memory_tokens=0" ;;
   mag|mal) MODEL_OVERRIDES="" ;;
   no_persistent)
     MODEL_OVERRIDES="--model.config.num_persistent_memory_tokens=0 --model.config.memory_batch_size=4096"
@@ -95,7 +102,13 @@ case "$TITANS_EXPERIMENT" in
   *) echo "unknown Titans experiment: $TITANS_EXPERIMENT" >&2; exit 2 ;;
 esac
 
-if [[ $TITANS_EXPERIMENT == mac || $TITANS_EXPERIMENT == mag || $TITANS_EXPERIMENT == mal ]]; then
+if [[ $TITANS_EXPERIMENT == local_raw || $TITANS_EXPERIMENT == local_matched || \
+      $TITANS_EXPERIMENT == full_matched ]]; then
+  RECIPE=examples/llm_pretrain/titans_${TITANS_SCALE}_${TITANS_EXPERIMENT}.yaml
+elif [[ $TITANS_EXPERIMENT == mac_every4 || $TITANS_EXPERIMENT == mac_chunk64 || \
+        $TITANS_EXPERIMENT == mac_no_persistent ]]; then
+  RECIPE=examples/llm_pretrain/titans_${TITANS_SCALE}_mac.yaml
+elif [[ $TITANS_EXPERIMENT == mac || $TITANS_EXPERIMENT == mag || $TITANS_EXPERIMENT == mal ]]; then
   RECIPE=examples/llm_pretrain/titans_${TITANS_SCALE}_${TITANS_EXPERIMENT}.yaml
 else
   RECIPE=examples/llm_pretrain/titans_${TITANS_SCALE}_lmm.yaml
@@ -119,6 +132,8 @@ case "$TITANS_EXPERIMENT" in
   mac) WANDB_GROUP=mac-$TITANS_SCALE ;;
   mag) WANDB_GROUP=mag-$TITANS_SCALE ;;
   mal) WANDB_GROUP=mal-$TITANS_SCALE ;;
+  local_raw|local_matched|full_matched) WANDB_GROUP=controls-$TITANS_SCALE ;;
+  mac_every4|mac_chunk64|mac_no_persistent) WANDB_GROUP=mac-bridges-$TITANS_SCALE ;;
   *) WANDB_GROUP=ablations-170m ;;
 esac
 
@@ -136,6 +151,31 @@ if [[ -s "$RUN_SHA_FILE" ]]; then
   fi
 fi
 printf '%s\n' "$CURRENT_SHA" >"$RUN_SHA_FILE"
+python3 - "$CHECKPOINT_ROOT/run_manifest.json" "$CURRENT_SHA" "$SLURM_JOB_ID" \
+  "$TITANS_SCALE" "$TITANS_EXPERIMENT" "$RECIPE" "$MODEL_OVERRIDES" \
+  "$TOKEN_BUDGET" "$TOTAL_STEPS" "$GLOBAL_BATCH_SIZE" "$SEQUENCE_LENGTH" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+manifest = json.loads(path.read_text()) if path.exists() else {
+    "git_sha": sys.argv[2],
+    "scale": sys.argv[4],
+    "experiment": sys.argv[5],
+    "recipe": sys.argv[6],
+    "model_overrides": sys.argv[7],
+    "ordinary_token_budget": sys.argv[8],
+    "optimizer_steps": int(sys.argv[9]),
+    "global_batch_size": int(sys.argv[10]),
+    "sequence_length": int(sys.argv[11]),
+    "segment_jobs": [],
+}
+if manifest["git_sha"] != sys.argv[2]:
+    raise SystemExit("run manifest revision mismatch")
+manifest["segment_jobs"].append(sys.argv[3])
+path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+PY
 
 if ! grep -qs "api.wandb.ai" "$HOME/.netrc" && [[ -z ${WANDB_API_KEY:-} ]]; then
   echo "W&B authentication is required for full Titans runs" >&2
