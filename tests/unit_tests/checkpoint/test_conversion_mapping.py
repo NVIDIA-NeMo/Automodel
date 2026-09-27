@@ -14,6 +14,8 @@
 
 """Tests for ``nemo_automodel.components.checkpoint.conversion_mapping``."""
 
+import pytest
+
 from nemo_automodel.components.checkpoint._backports.hf_storage import _get_key_renaming_mapping
 from nemo_automodel.components.checkpoint.conversion_mapping import get_combined_key_mapping
 
@@ -49,3 +51,30 @@ def test_gemma3_strips_legacy_vision_model_prefix():
         _get_key_renaming_mapping("multi_modal_projector.mm_input_projection_weight", mapping)
         == "model.multi_modal_projector.mm_input_projection_weight"
     )
+
+
+@pytest.mark.parametrize(
+    ("model_type", "model_class_name"),
+    [
+        ("qwen2_5_vl", "Qwen2_5_VLForConditionalGeneration"),
+        ("qwen2_vl", "Qwen2VLForConditionalGeneration"),
+    ],
+)
+def test_qwen_vl_uses_class_registered_checkpoint_mapping(model_type, model_class_name):
+    """Qwen-VL class mappings remain visible through a runtime wrapper."""
+    model_class = type(model_class_name, (), {})
+    wrapped_model_class = type(f"FSDP{model_class_name}", (model_class,), {})
+    mapping = get_combined_key_mapping(model_type, model=wrapped_model_class())
+    assert mapping is not None
+
+    assert (
+        _get_key_renaming_mapping("visual.patch_embed.proj.weight", mapping) == "model.visual.patch_embed.proj.weight"
+    )
+    assert (
+        _get_key_renaming_mapping("model.layers.0.self_attn.q_proj.weight", mapping)
+        == "model.language_model.layers.0.self_attn.q_proj.weight"
+    )
+
+    # In-memory-format keys must not be nested under model.language_model twice.
+    in_memory_key = "model.language_model.layers.0.self_attn.q_proj.weight"
+    assert _get_key_renaming_mapping(in_memory_key, mapping) == in_memory_key
