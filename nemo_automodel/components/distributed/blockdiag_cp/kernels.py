@@ -361,8 +361,9 @@ def _cp_blockdiag_mask(
     local_len: int,
     full_len: int,
     batch_size: int,
+    window_size: tuple[int, int] | None = None,
 ) -> torch.Tensor:
-    """Per-document causal attention mask for block-diagonal CP, shape ``[B, 1, L, S]``.
+    """Per-document causal or sliding mask for block-diagonal CP, shape ``[B, 1, L, S]``.
 
     ``doc_ids`` is the full (all-rank, padded) per-position document index ``[B, S]``
     (0 == padding). Query rows are this rank's local positions
@@ -381,6 +382,8 @@ def _cp_blockdiag_mask(
         local_len: ``L``, the number of local query rows.
         full_len: ``S``, the number of key columns (full padded sequence).
         batch_size: ``B``, used to expand a 1D ``doc_ids``.
+        window_size: Optional inclusive ``(left, right)`` local-attention window.
+            Negative values leave that side unbounded.
 
     Returns:
         Boolean allow-mask ``[B, 1, L, S]`` (True == may attend).
@@ -396,6 +399,12 @@ def _cp_blockdiag_mask(
     row_pos = torch.arange(row_offset, row_offset + L, device=device).view(1, L, 1)
     col_pos = torch.arange(S, device=device).view(1, 1, S)
     causal = row_pos >= col_pos  # [1, L, S]
+    if window_size is not None:
+        left, right = window_size
+        if left is not None and left >= 0:
+            causal = causal & (col_pos >= row_pos - left)
+        if right is not None and right > 0:
+            causal = causal & (col_pos <= row_pos + right)
     # Always allow the diagonal (q_pos == k_pos) so every query attends to >=1 key even
     # in all-pad/empty rows -- prevents NaN/hang.
     self_diag = row_pos == col_pos  # [1, L, S]

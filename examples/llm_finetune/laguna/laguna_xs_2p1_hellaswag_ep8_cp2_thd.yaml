@@ -4,7 +4,7 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+# http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -12,14 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# SFT recipe for Poolside Laguna XS 2.1.
+# Laguna XS 2.1 SFT with native THD packing, CP2, EP8, and FSDP2.
 #
-# Hardware target: 1 node x 8 GPUs for full SFT with EP8 + FSDP2.
-#   automodel examples/llm_finetune/laguna/laguna_xs_2p1_hellaswag_ep8.yaml --nproc-per-node 8
+# Hardware target: 1 node x 8 GPUs.
+#   automodel examples/llm_finetune/laguna/laguna_xs_2p1_hellaswag_ep8_cp2_thd.yaml --nproc-per-node 8
 #
-# EP size must divide num_experts (256). ep_size=8 -> 32 experts/rank.
-# This baseline uses SDPA with NEAT packing and no context parallelism. See
-# laguna_xs_2p1_hellaswag_ep8_cp2_thd.yaml for native THD packing with CP2.
+# CP2 shards every packed document across two ranks with block-diagonal SDPA.
+# EP8 partitions the checkpoint's 256 routed experts into 32 experts per rank.
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
@@ -60,14 +59,14 @@ model:
 
 checkpoint:
   enabled: false
-  checkpoint_dir: checkpoints/laguna_xs_2p1_hellaswag_ep8_torch_dispatch
+  checkpoint_dir: checkpoints/laguna_xs_2p1_hellaswag_ep8_cp2_thd
   model_save_format: safetensors
   save_consolidated: final
 
 distributed:
   strategy: fsdp2
   tp_size: 1
-  cp_size: 1
+  cp_size: 2
   pp_size: 1
   ep_size: 8
 
@@ -93,13 +92,11 @@ dataset:
 
 packed_sequence:
   packed_sequence_size: 1024
-  packing_strategy: neat
+  packing_strategy: thd
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn:
-    _target_: nemo_automodel.components.datasets.utils.default_collater
-    pad_seq_len_divisible: 64
+  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
   shuffle: true
   num_workers: 4
 
@@ -116,9 +113,7 @@ validation_dataset:
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn:
-    _target_: nemo_automodel.components.datasets.utils.default_collater
-    pad_seq_len_divisible: 64
+  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
   shuffle: false
   drop_last: true
   num_workers: 4
@@ -133,11 +128,12 @@ optimizer:
 wandb:
   enable: false
   project: laguna-xs-2p1-sft
-  name: laguna_xs_2p1_hellaswag_ep8_neat_1k
+  name: laguna_xs_2p1_hellaswag_ep8_cp2_thd_1k
   mode: online
 
 ci:
-  recipe_owner: HuiyingLi
-  # pp_size(1) * ep_size(8) = 8 GPUs => 1 node (8 H100/node).
+  recipe_owner: akoumpa
+  # cp_size(2) and ep_size(8) share one 8-GPU node.
   nodes: 1
+  nproc_per_node: 8
   time: "01:00:00"

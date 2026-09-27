@@ -17,6 +17,7 @@ from __future__ import annotations
 import copy
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Union
 
 import torch
@@ -26,6 +27,15 @@ from transformers.masking_utils import create_causal_mask, create_sliding_window
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 
+from nemo_automodel.components.attention.utils import (
+    initialize_attn_module_and_func,
+    postprocess_output_for_attn,
+    preprocess_args_and_kwargs_for_attn,
+)
+from nemo_automodel.components.distributed.context_parallel.sharder import (
+    ContextParallelSharder,
+    contiguous_local_indices,
+)
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import (
@@ -42,6 +52,7 @@ from nemo_automodel.components.models.laguna.state_dict_adapter import LagunaSta
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MLP, MoE
+from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
@@ -68,10 +79,13 @@ def _apply_rotary_pos_emb(
     """Apply RoPE to query and key states.
 
     Args:
-        q: Query tensor of shape [batch, heads, sequence, head_dim].
-        k: Key tensor of shape [batch, key_value_heads, sequence, head_dim].
-        cos: Cosine tensor of shape [batch, sequence, rotary_dim].
-        sin: Sine tensor of shape [batch, sequence, rotary_dim].
+        q: Query tensor of shape [batch, heads, sequence, head_dim] for BSHD or
+            [total_tokens, heads, head_dim] for THD.
+        k: Key tensor of shape [batch, key_value_heads, sequence, head_dim] for
+            BSHD or [total_tokens, key_value_heads, head_dim] for THD.
+        cos: Cosine tensor of shape [batch, sequence, rotary_dim] for BSHD or
+            [total_tokens, rotary_dim] for THD.
+        sin: Sine tensor with the same shape as ``cos``.
 
     Returns:
         Tuple of rotated query and key tensors with the same shapes as ``q`` and ``k``.
@@ -364,12 +378,18 @@ class LagunaRotaryEmbedding(nn.Module):
         """Compute RoPE cosine and sine tables.
 
         Args:
-            x: Activation tensor of shape [batch, sequence, hidden], used for device and dtype.
-            position_ids: Position tensor of shape [batch, sequence].
+            x: Activation tensor of shape [batch, sequence, hidden] for BSHD or
+                [total_tokens, hidden] for THD, used for device and dtype.
+            position_ids: Position tensor of shape [batch, sequence] for BSHD or
+                [total_tokens] for THD.
 
         Returns:
-            Tuple of cosine and sine tensors, each of shape [batch, sequence, rotary_dim].
+            Tuple of cosine and sine tensors shaped [batch, sequence, rotary_dim]
+            for BSHD or [total_tokens, rotary_dim] for THD.
         """
+        is_thd = position_ids.ndim == 1
+        if is_thd:
+            position_ids = position_ids.unsqueeze(0)
         inv_freq = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
         position_ids = position_ids[:, None, :].float()
         device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
@@ -378,7 +398,12 @@ class LagunaRotaryEmbedding(nn.Module):
             emb = torch.cat((freqs, freqs), dim=-1)
             cos = emb.cos() * self.attention_scaling
             sin = emb.sin() * self.attention_scaling
-        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+        cos = cos.to(dtype=x.dtype)
+        sin = sin.to(dtype=x.dtype)
+        if is_thd:
+            cos = cos.squeeze(0)
+            sin = sin.squeeze(0)
+        return cos, sin
 
 
 class LagunaAttention(nn.Module):
@@ -449,6 +474,19 @@ class LagunaAttention(nn.Module):
 
         self.q_norm = LagunaRMSNorm(self.head_dim, eps=config.rms_norm_eps, dtype=dtype)
         self.k_norm = LagunaRMSNorm(self.head_dim, eps=config.rms_norm_eps, dtype=dtype)
+        if backend.attn == "te":
+            # Ordinary BSHD inputs retain Laguna's HuggingFace-compatible attention
+            # path. TE is selected only for native packed THD batches.
+            self._te_thd_only = True
+            self.attn_module, self.attn_func = initialize_attn_module_and_func(
+                attn_impl="te",
+                num_attention_heads=self.num_heads,
+                num_qk_channels=self.head_dim,
+                num_v_channels=self.head_dim,
+                softmax_scale=self.scaling,
+                num_gqa_groups=self.num_key_value_heads,
+                attention_dropout=self.attention_dropout,
+            )
 
     def forward(
         self,
@@ -460,17 +498,80 @@ class LagunaAttention(nn.Module):
         """Run Laguna attention for one decoder layer.
 
         Args:
-            hidden_states: Tensor of shape [batch, sequence, hidden].
+            hidden_states: Tensor of shape [batch, sequence, hidden] for BSHD or
+                [total_tokens, hidden] for packed THD.
             position_embeddings: Tuple of cosine and sine RoPE tensors, each of shape
-                [batch, sequence, rotary_dim].
+                [batch, sequence, rotary_dim] for BSHD or [total_tokens, rotary_dim]
+                for THD.
             attention_mask: Optional additive mask broadcastable to
                 [batch, heads, sequence, key_sequence].
-            **kwargs: Additional attention backend arguments.
+            **kwargs: Additional attention backend arguments. THD requires
+                ``qkv_format='thd'`` and ``cu_seqlens``; CP additionally supplies
+                ``cp_size`` and ``cp_rank``.
 
         Returns:
-            Tuple of attention output [batch, sequence, hidden] and optional attention weights
-            [batch, heads, sequence, key_sequence].
+            Tuple of attention output shaped like ``hidden_states`` and optional BSHD
+            attention weights. THD returns ``None`` for the weights.
         """
+        if kwargs.get("qkv_format") == "thd":
+            if hidden_states.ndim != 2:
+                raise ValueError(f"THD attention requires hidden_states [T, H], got {tuple(hidden_states.shape)}.")
+
+            token_count = hidden_states.shape[0]
+            query_states = self.q_proj(hidden_states).view(token_count, self.num_heads, self.head_dim)
+            key_states = self.k_proj(hidden_states).view(token_count, self.num_key_value_heads, self.head_dim)
+            value_states = self.v_proj(hidden_states).view(token_count, self.num_key_value_heads, self.head_dim)
+            query_states = self.q_norm(query_states)
+            key_states = self.k_norm(key_states)
+            cos, sin = position_embeddings
+            query_states, key_states = _apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+            window_size = (-1, 0) if self.sliding_window is None else (self.sliding_window - 1, 0)
+            from nemo_automodel.components.distributed.blockdiag_cp import (
+                cp_blockdiag_sdpa,
+                current_blockdiag_cp_state,
+            )
+
+            if current_blockdiag_cp_state() is not None:
+                if self.backend.attn != "sdpa":
+                    raise ValueError("Laguna packed context parallelism requires backend.attn='sdpa'.")
+                attn_output = cp_blockdiag_sdpa(
+                    query_states.transpose(0, 1).unsqueeze(0),
+                    key_states.transpose(0, 1).unsqueeze(0),
+                    value_states.transpose(0, 1).unsqueeze(0),
+                    dropout_p=0.0 if not self.training else self.attention_dropout,
+                    scale=self.scaling,
+                    enable_gqa=True,
+                    window_size=window_size,
+                )
+                attn_output = attn_output.squeeze(0).transpose(0, 1).contiguous().flatten(1)
+            else:
+                if getattr(self, "attn_module", None) is None:
+                    raise ValueError(
+                        "Packed THD attention requires backend.attn='te', or backend.attn='sdpa' with context parallelism."
+                    )
+                query_states, key_states, value_states, te_kwargs = preprocess_args_and_kwargs_for_attn(
+                    query_states,
+                    key_states,
+                    value_states,
+                    attention_mask,
+                    "te",
+                    window_size=window_size,
+                    **kwargs,
+                )
+                attn_output = self.attn_func(query_states, key_states, value_states, **te_kwargs)
+                attn_output = postprocess_output_for_attn(attn_output, "te").flatten(1)
+
+            if self.g_proj is not None:
+                gate = F.softplus(self.g_proj(hidden_states).float()).to(attn_output.dtype)
+                if self.gating_mode == "per-head":
+                    attn_output = (
+                        attn_output.view(token_count, self.num_heads, self.head_dim) * gate.unsqueeze(-1)
+                    ).flatten(1)
+                else:
+                    attn_output = attn_output * gate
+            return self.o_proj(attn_output), None
+
         batch, seq_len = hidden_states.shape[:2]
         query_states = self.q_proj(hidden_states).view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = self.k_proj(hidden_states).view(
@@ -525,6 +626,12 @@ class LagunaAttention(nn.Module):
                 attn_output = attn_output * gate
 
         return self.o_proj(attn_output), attn_weights
+
+    def setup_cp_attention(self, cp_mesh) -> None:
+        """Record that Laguna uses its model-owned packed block-diagonal CP path."""
+        del cp_mesh
+        if self.backend.attn != "sdpa":
+            raise ValueError("Laguna packed context parallelism requires backend.attn='sdpa'.")
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
         del buffer_device
@@ -784,33 +891,48 @@ class LagunaModel(nn.Module):
         """Run the Laguna decoder stack.
 
         Args:
-            input_ids: Optional token IDs of shape [batch, sequence].
-            inputs_embeds: Optional embeddings of shape [batch, sequence, hidden].
-            position_ids: Optional position IDs of shape [batch, sequence].
+            input_ids: Optional token IDs of shape [batch, sequence] for BSHD or
+                [total_tokens] for packed THD.
+            inputs_embeds: Optional embeddings of shape [batch, sequence, hidden]
+                for BSHD or [total_tokens, hidden] for THD.
+            position_ids: Optional position IDs of shape [batch, sequence] for BSHD
+                or [total_tokens] for THD.
             attention_mask: Optional 2D bool/int mask of shape [batch, sequence], a 4D additive
                 mask, or a mapping with per-attention-type masks keyed by "full_attention" and
                 "sliding_attention".
             padding_mask: Optional bool tensor of shape [batch, sequence], where True marks tokens
                 excluded from MoE routing.
-            **kwargs: Additional attention backend arguments.
+            **kwargs: Additional attention backend arguments. Packed THD sets
+                ``qkv_format='thd'`` and carries cumulative document lengths.
 
         Returns:
-            Final hidden states of shape [batch, sequence, hidden].
+            Final hidden states shaped like ``inputs_embeds``.
         """
         if inputs_embeds is None:
             if input_ids is None:
                 raise ValueError("input_ids or inputs_embeds must be provided")
             inputs_embeds = self.embed_tokens(input_ids)
+        is_thd = kwargs.get("qkv_format") == "thd"
+        if is_thd and inputs_embeds.ndim != 2:
+            raise ValueError(f"THD model input must be [T, H], got {tuple(inputs_embeds.shape)}.")
         if position_ids is None:
-            position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device).unsqueeze(0)
+            if is_thd:
+                if kwargs.get("cp_size", 1) > 1:
+                    raise ValueError("THD context parallelism requires explicit position_ids.")
+                position_ids = torch.arange(inputs_embeds.shape[0], device=inputs_embeds.device)
+            else:
+                position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device).unsqueeze(0)
         if padding_mask is None and isinstance(attention_mask, torch.Tensor):
             padding_mask = _derive_padding_mask(attention_mask)
 
-        causal_mask_mapping = self._build_causal_mask_mapping(
-            inputs_embeds,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-        )
+        if is_thd:
+            causal_mask_mapping = {"full_attention": None, "sliding_attention": None}
+        else:
+            causal_mask_mapping = self._build_causal_mask_mapping(
+                inputs_embeds,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+            )
 
         hidden_states = inputs_embeds
         full_position_embeddings = self.rotary_emb(hidden_states, position_ids)
@@ -854,6 +976,8 @@ class LagunaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     """Causal LM wrapper for Laguna with Automodel checkpoint adapters."""
 
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+    _supports_cp_sdpa = True
+    _packed_cp_attn_backends = ("sdpa",)
     _keep_in_fp32_modules_strict = ["mlp.gate.e_score_correction_bias", "rotary_emb"]
     _skip_init_weights_on_load = True
 
@@ -862,9 +986,10 @@ class LagunaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         """Declared parallelism capabilities for this model class."""
 
         supports_tp: bool = False
-        supports_cp: bool = False
+        supports_cp: bool = True
         supports_pp: bool = False
         supports_ep: bool = True
+        supports_thd: bool = True
 
     @classmethod
     def from_config(
@@ -928,6 +1053,37 @@ class LagunaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             if isinstance(layer.mlp, MoE) and layer.mlp.gate.bias_update_factor > 0:
                 layer.mlp.gate.update_bias()
 
+    def prepare_model_inputs_for_cp(self, batch: dict[str, Any], *, num_chunks: int = 1) -> dict[str, Any]:
+        """Select input preparation for packed Laguna inputs.
+
+        Args:
+            batch: Full packed batch with token tensors shaped [batch, sequence]
+                and THD ``seq_lens`` metadata.
+            num_chunks: Number of pipeline chunks; Laguna currently supports one.
+
+        Returns:
+            A mapping containing the model-owned context-parallel sharder for
+            SDPA. TE returns an empty mapping so the framework selects its native
+            THD sharder, including when context parallelism is disabled.
+        """
+        if num_chunks != 1:
+            raise ValueError("Laguna packed context parallelism does not support pipeline microbatch chunking.")
+        if batch.get("qkv_format") != "thd":
+            raise ValueError("Laguna context parallelism requires packed THD inputs.")
+        if self.backend.attn == "te":
+            return {}
+        if self.backend.attn != "sdpa":
+            raise ValueError("Laguna packed THD input preparation requires model.backend.attn='te' or 'sdpa'.")
+
+        from nemo_automodel.components.distributed.blockdiag_cp import make_cp_blockdiag_batch_and_ctx
+
+        return {
+            "cp_sharder": ContextParallelSharder(
+                shard_batch=partial(make_cp_blockdiag_batch_and_ctx, shard_primary=True),
+                local_token_global_indices=contiguous_local_indices,
+            )
+        }
+
     def forward(
         self,
         input_ids: torch.Tensor | None = None,
@@ -945,9 +1101,12 @@ class LagunaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         """Run the Laguna causal language model.
 
         Args:
-            input_ids: Optional token IDs of shape [batch, sequence].
-            inputs_embeds: Optional embeddings of shape [batch, sequence, hidden].
-            position_ids: Optional position IDs of shape [batch, sequence].
+            input_ids: Optional token IDs of shape [batch, sequence] for BSHD or
+                [1, total_tokens] for packed THD input preparation.
+            inputs_embeds: Optional embeddings of shape [batch, sequence, hidden]
+                for BSHD or [1, total_tokens, hidden] for THD preparation.
+            position_ids: Optional position IDs of shape [batch, sequence] or
+                [1, total_tokens] for THD.
             attention_mask: Optional 2D bool/int mask of shape [batch, sequence], a 4D additive
                 mask, or a mapping with per-attention-type masks keyed by "full_attention" and
                 "sliding_attention".
@@ -958,7 +1117,8 @@ class LagunaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             logits_to_keep: If 0, compute logits for all sequence positions. If an int or tensor,
                 compute logits only for the selected trailing positions.
             output_hidden_states: When true, include final hidden states in the output.
-            **kwargs: Additional attention backend arguments.
+            **kwargs: Additional attention backend arguments. THD requires
+                ``qkv_format='thd'`` and cumulative document lengths.
 
         Returns:
             Causal LM output with logits and optional hidden states.
@@ -970,6 +1130,19 @@ class LagunaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             if output_hidden_states is not None
             else getattr(self.config, "output_hidden_states", False)
         )
+        is_thd = kwargs.get("qkv_format") == "thd"
+        if is_thd:
+            if position_ids is None:
+                raise ValueError("Packed THD input requires position_ids.")
+            input_ids, position_ids, padding_mask, kwargs = squeeze_input_for_thd(
+                input_ids,
+                position_ids,
+                padding_mask,
+                kwargs,
+            )
+            if inputs_embeds is not None and inputs_embeds.ndim > 2:
+                inputs_embeds = inputs_embeds.squeeze(0)
+            attention_mask = None
         hidden = self.model(
             input_ids=input_ids,
             inputs_embeds=inputs_embeds,
@@ -982,6 +1155,7 @@ class LagunaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             self.lm_head,
             hidden,
             logits_to_keep,
+            is_thd=is_thd,
             output_hidden_states=output_hidden_states,
         )
 
