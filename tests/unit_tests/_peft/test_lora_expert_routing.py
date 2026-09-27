@@ -20,7 +20,6 @@ These tests do not establish native DeepEP or multi-rank collective correctness.
 """
 
 from copy import deepcopy
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -32,14 +31,13 @@ from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.experts import GroupedExperts, GroupedExpertsDeepEP
 
 _ADAPTER_NAMES = {"lora_gate_and_up_A", "lora_gate_and_up_B", "lora_down_A", "lora_down_B"}
-_BACKENDS = ("loop", "grouped_mm", "deepep_torch", "deepep_gmm")
+_BACKENDS = ("loop", "grouped_mm", "deepep_torch")
 
 
 @pytest.fixture(autouse=True)
 def _cpu_kernels(monkeypatch):
     """Exercise real routing math without CUDA kernels or compiler dependencies."""
     monkeypatch.setattr(torch, "_grouped_mm", _grouped_mm, raising=False)
-    monkeypatch.setattr(lora_experts, "ops", SimpleNamespace(gmm=_gmm))
     with torch.compiler.set_stance("force_eager"), torch.random.fork_rng(devices=[]):
         torch.manual_seed(913)
         yield
@@ -61,22 +59,6 @@ def _grouped_mm(x: torch.Tensor, weight: torch.Tensor, *, offs: torch.Tensor) ->
     boundaries = [0, *offs.tolist()]
     assert boundaries[-1] == x.shape[0]
     return torch.cat([x[start:end] @ w for start, end, w in zip(boundaries, boundaries[1:], weight)])
-
-
-def _gmm(x: torch.Tensor, weight: torch.Tensor, counts: torch.Tensor, *, trans_b: bool) -> torch.Tensor:
-    """Adapt grouped_gemm's count-based interface to the CPU double.
-
-    Args:
-        x: Tensor of shape [routed_tokens, in], grouped by expert.
-        weight: Tensor of shape [experts, in, out], matching x's dtype/device.
-        counts: Integer tensor of shape [experts], per-expert token counts.
-        trans_b: Must be false for the expert weight layout.
-
-    Returns:
-        Tensor of shape [routed_tokens, out], in x's dtype/device.
-    """
-    assert not trans_b
-    return _grouped_mm(x, weight, offs=counts.cumsum(0))
 
 
 class _CPUDispatcher:
@@ -169,7 +151,8 @@ def _source(*, backend: str, after_down: bool, bias: bool, dtype: torch.dtype, a
     else:
         source = GroupedExperts(config)
     source.to(dtype=dtype)
-    source.use_torch_mm = backend in ("grouped_mm", "deepep_torch")
+    if not backend.startswith("deepep"):
+        source.use_torch_mm = backend == "grouped_mm"
     with torch.no_grad():
         for parameter in source.parameters():
             parameter.uniform_(-0.7, 0.7)
@@ -249,7 +232,7 @@ def _dense_reference(
     if module.expert_bias:
         bias = module.down_proj_bias.to(x.dtype)[indices]
         output = output + bias * (1.0 if after_down else weights[..., None])
-        if module.use_torch_mm or dispatch_rounding:
+        if dispatch_rounding or (isinstance(module, lora_experts.GroupedExpertsLoRA) and module.use_torch_mm):
             output = output.to(x.dtype)
     if after_down:
         output = output.float() * weights[..., None]
@@ -269,7 +252,8 @@ def test_wrapper_preserves_storage_flags_and_parameter_paths(backend, dtype, lor
     before = deepcopy(source.state_dict())
     wrapped = _wrap(source, lora_dtype=lora_dtype)
     assert wrapped.config is source.config
-    assert wrapped.use_torch_mm is source.use_torch_mm
+    if not backend.startswith("deepep"):
+        assert wrapped.use_torch_mm is source.use_torch_mm
     assert wrapped.use_mxfp8 is source.use_mxfp8
     assert set(dict(wrapped.named_parameters())) == set(before) | _ADAPTER_NAMES
     assert set(wrapped.state_dict()) == set(before) | _ADAPTER_NAMES
@@ -313,7 +297,8 @@ def test_peft_entry_uses_the_imported_expert_class(backend):
     )
     patched = patch_moe_module(source, dim=2)
     assert isinstance(patched, expected)
-    assert patched.use_torch_mm is source.use_torch_mm
+    if not backend.startswith("deepep"):
+        assert patched.use_torch_mm is source.use_torch_mm
     assert set(source.state_dict()).issubset(patched.state_dict())
 
 

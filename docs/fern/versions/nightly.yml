@@ -202,6 +202,8 @@ navigation:
             path: ../../model-coverage/llm/tencent/hy-mt2.mdx
           - page: "MiMo-V2-Flash"
             path: ../../model-coverage/llm/xiaomimimo/mimo-v2-flash.mdx
+          - page: "MiMo-V2.5-Pro"
+            path: ../../model-coverage/llm/xiaomimimo/mimo-v2-5-pro.mdx
           - page: "Ling 2.0"
             path: ../../model-coverage/llm/inclusionai/ling-2.mdx
             slug: ling-2-0
@@ -431,6 +433,9 @@ navigation:
       - page: "Nemotron 3.5 Super VL: Text-to-SQL with LoRA"
         path: ../../guides/vlm/nemotron-3-5-super-vl-text-to-sql.mdx
         slug: nemotron-3-5-super-vl-text-to-sql
+      - page: "Nemotron 3.5 Super VL: Continued Pretraining on FineWeb"
+        path: ../../guides/vlm/nemotron-3-5-super-vl-continued-pretraining.mdx
+        slug: nemotron-3-5-super-vl-continued-pretraining
       - page: "Mistral Medium 3.5 VL"
         path: ../../guides/vlm/mistral-medium-3-5.mdx
         slug: mistral-medium-3-5

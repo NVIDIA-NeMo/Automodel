@@ -1,12 +1,12 @@
 ---
 title: "DeepSeek-V4.1 Flash"
-description: "DeepSeek V4.1 backbone fine-tuning with expert parallelism and sharded Engram memory."
+description: "DeepSeek-V4.1 Flash backbone fine-tuning with expert parallelism and sharded Engram memory."
 slug: model-coverage/large-language-models/deepseek-ai/deepseek-v41-flash
 ---
 
 [DeepSeek-V4.1 Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash)
-uses a 40-layer causal encoder/decoder backbone with 384 routed experts, one
-shared expert, and six selected experts per token. Its CSA2 attention shares
+uses a 40-layer causal encoder/decoder Mixture-of-Experts (MoE) backbone with
+384 routed experts, one shared expert, and six selected experts per token. Its CSA2 attention shares
 compressed KV and index state between Full, Reuse, and Reindex layers.
 Single-pass mHC carries four residual streams, and two trainable Engram tables
 at layers 1 and 14 provide tokenizer-dependent N-gram memory. The approximately
@@ -14,7 +14,7 @@ at layers 1 and 14 provide tokenizer-dependent N-gram memory. The approximately
 
 | Setting | Value |
 |---|---|
-| **Architecture** | `DeepseekV41ForCausalLM` |
+| Architecture | `DeepseekV41ForCausalLM` |
 | Model ID | `deepseek-ai/DeepSeek-V4.1-Flash` |
 | Reference revision | `df42c109f1defefcbfcedbe7d905718a12266e40` |
 | Configuration | `DeepseekV41Config` with typed `text_config` and `vision_config` |
@@ -31,6 +31,7 @@ receive the owner divisor once before clipping.
 | Recipe | Topology and Batch | Optimizer Moments and Checkpoints |
 |---|---|---|
 | [HellaSwag EP64](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_hellaswag_ep64_16nodes.yaml) | 16 nodes × 4 GB200; EP64, owner64, TP1/PP1/CP1; global batch 64, local batch 1 | BF16 moments; checkpoint saving disabled |
+| [HellaSwag EP64, H100](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_hellaswag_ep64_h100_16nodes.yaml) | 16 nodes × 8 H100 80 GB; EP64 with ep_shard2, owner128, TP1/PP1/CP1; global batch 128, local batch 1 | BF16 moments; checkpoint saving disabled; see [H100 80 GB Systems](#h100-80-gb-systems) |
 
 The configuration requests 100 updates with validation every 50 updates,
 activation checkpointing, and reshard-after-forward. It uses no gradient
@@ -62,10 +63,93 @@ FSDP mixed precision must use `param_dtype: bfloat16`, `reduce_dtype: float32`,
 `lm_head_precision: float32`. These settings preserve FP32 mHC coefficients
 across module boundaries; the language-model head returns FP32 logits.
 
-See the [Slurm launcher guide](/job-launchers/slurm-cluster) and
-[installation guide](/get-started/installation) for setup. Compilation caches
+See the [Slurm Launcher Guide](/job-launchers/slurm-cluster) and
+[Installation Guide](/get-started/installation) for setup. Compilation caches
 and communication prewarming must match the backend, topology, and local
 input shapes.
+
+## Context Parallelism
+
+Unpacked, right-padded text supports context parallelism with contiguous sequence
+shards. Set `distributed.cp_size` and retain the same global batch size when
+comparing CP sizes. The model's sharder pads the global sequence so each rank
+owns complete compression groups and preserves global position IDs. Shift
+labels before sharding and use the recipe's external loss; direct `labels=`
+loss is unavailable when CP is active.
+
+Queries and hidden activations remain local. Window KV, newly compressed KV,
+and index keys are gathered across the CP group; reused compressed KV retains
+its gradient history across layers. Engram gathers integer token history for
+N-gram hashing, then looks up only the local tokens through the existing row
+owners. CP does not gather full Engram tables. TP, PP, packed documents, and
+image inputs remain outside this CP path.
+
+The [Tulu3 CP recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_tulu3_cp.yaml)
+uses 4,096-token sequences, TE RMSNorm, EP64, and 64 Engram owners. At global
+batch 64 and local batch 1, CP1 uses one microbatch per update and CP8 uses
+eight. Both runs must use the same prepared Arrow data, tokenizer, initial
+checkpoint, optimizer, and seed. The provided chat template follows the
+released chat-mode message format and masks loss to assistant content.
+
+The Tulu3 CP recipes explicitly set `clip_grad_norm.backend: triton`.
+This uses the shared fused FP64 gradient-norm reduction from main and avoids
+gradient-sized norm temporaries for contiguous CUDA owner shards. Set
+`clip_grad_norm.backend: te` to select the shared Transformer Engine reducer.
+
+## H100 80 GB Systems
+
+The GB200 recipes place 748B trainable parameters on 64 GPUs, about 117 GB per
+GPU for BF16 weights, BF16 gradients, BF16 moments, and int16 master
+remainders. On 80 GB H100 parts the same recipes need twice the ranks: with
+`ep_size: 64` on 128 or more GPUs the mesh derives an additional `ep_shard`
+FSDP axis over the routed experts, which halves the per-rank expert state.
+The variants below were validated on 8-GPU H100 nodes with InfiniBand, 100
+updates each, using the NGC `nemo-automodel:26.08` container plus this
+repository at `e2c47c5b` (torch 2.13, NCCL 2.30.5).
+
+| Recipe | Topology and Batch | Overrides Compared to the GB200 Recipe | Peak Memory / Result |
+|---|---|---|---|
+| [HellaSwag EP64, H100](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_hellaswag_ep64_h100_16nodes.yaml) | 16 × 8 H100; EP64, ep_shard2, owner128; GBS 128, LBS 1, one microbatch | `global_batch_size: 128` | 58.4 GiB; train 1.8185, validation 1.9800 (GB200: 1.8177 / 2.0173) |
+| [HellaSwag LoRA, H100](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_hellaswag_lora_h100_8nodes.yaml) | 8 × 8 H100; EP32, ep_shard2, owner64; GBS 64, LBS 1, one microbatch | None | 43.9 GiB; train 2.2655, validation 2.5737 |
+| [Tulu3 CP8, H100](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_tulu3_cp8_h100_32nodes.yaml) | 32 × 8 H100; EP64, ep_shard4, CP8; GBS 64, LBS 1, two microbatches | `defer_fsdp_grad_sync: false`, `moe.reshard_after_forward: false` | 65.7 GiB; validation 0.5541 / 0.5444 (CP1 reference at 16 nodes, GBS 128: 0.5477 / 0.5384) |
+| [Tulu3 packed CP8 32k, H100](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_tulu3_packed_cp8_32k_h100_64nodes.yaml) | 64 × 8 H100; EP64, ep_shard8, CP8; GBS 64, LBS 1, one microbatch | `moe.reshard_after_forward: false` | 62.5 GiB; validation 0.5853 / 0.5778; one checkpoint ≈ 8.2 TB |
+
+Prepare `DS41_DATA_ROOT` for the two Tulu3 variants with
+[prepare_tulu3_data.py](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/prepare_tulu3_data.py), which materializes
+`ChatDataset` with `tulu3_chat_template.jinja` into the padded 4,096-token
+layout and the prepacked 32,768-token THD layout.
+
+Three points apply to every H100 variant:
+
+- **Set `NCCL_PXN_DISABLE=1`, or `NCCL_NET_PLUGIN=none NCCL_NET=IB`,** on
+  multi-node InfiniBand systems. With the container's default NCCL network
+  plugin and PXN both active, the Engram row-owner all-to-all received
+  byte-shifted token IDs from the first node's ranks and the recipe stopped in
+  `_validate_received_ids` during the first forward, with NCCL 2.30.5 and
+  2.30.7 alike, and with both HPC-X 2.50 plugins the image ships (the default
+  Spectrum-X `spcx` and IBext). Either switch alone avoids it: disabling PXN
+  with the plugin kept, or bypassing the plugin with PXN kept, both completed
+  100 updates with matching losses. See
+  [issue #3959](https://github.com/NVIDIA-NeMo/Automodel/issues/3959).
+- **Gradient accumulation needs `defer_fsdp_grad_sync: false`.** The default
+  keeps unsharded parameters and gradients of every FSDP unit resident across
+  microbatches, about 33 GB here regardless of `dp`, which fits GB200 but not
+  80 GB parts. With per-microbatch gradient sync and `reshard_after_forward:
+  true`, torch 2.13 hits an activation-checkpoint recompute mismatch on the
+  expert all-gather copy-out ([issue #3958](https://github.com/NVIDIA-NeMo/Automodel/issues/3958)).
+  `moe.reshard_after_forward: false` avoids it at about 8.5 GB per rank and
+  becomes unnecessary once [PR #3961](https://github.com/NVIDIA-NeMo/Automodel/pull/3961)
+  is merged.
+- **Point the JIT caches at node-local storage** (`HYBRID_EP_CACHE_DIR`,
+  `TILELANG_CACHE_DIR`, `TRITON_CACHE_DIR`). HybridEP resolves its cache from
+  the passwd home directory rather than `$HOME`, and compiling into a parallel
+  file system can stretch the first step past the NCCL timeout.
+
+Checkpoint saving is enabled in the packed recipe, as on GB200. One
+`torch_save` checkpoint of the full model and optimizer is about 8.2 TB and
+took 2.5 minutes to write from 512 ranks; reaching `max_steps` triggers a final
+save regardless of `ckpt_every_steps`. Resuming with
+`checkpoint.restore_from: LATEST` was verified to continue the loss curve.
 
 ## Loading and Inputs
 
@@ -94,22 +178,22 @@ preserves released parameter names, required FP32 weights, and logical Engram
 rows while removing the original quantization metadata. Quantized re-export
 is not supported.
 
-Recipe initialization uses the NeMo wrapper's internal Checkpointer and DCP
+Recipe initialization uses the NeMo AutoModel wrapper's internal Checkpointer and DCP
 path to load the base checkpoint into the distributed model.
 
 Text inputs use unpacked `input_ids [batch, sequence]`, right padding, and
 zero-based positions. The optional `labels [batch, sequence]` API computes
 shifted causal cross-entropy with `-100` ignored. Attention KV and index
-quantize/dequantize boundaries remain part of every forward and use
+quantize and dequantize boundaries remain part of every forward and use
 straight-through gradients; there is no quantization toggle.
 
 The released vision tower is enabled by the default model configuration and
 disabled by the HellaSwag recipe. `DeepseekV41Processor` supports ordinary
-text/image conversations and save/reload. Image inputs require unpacked
+text and image conversations and save/reload. Image inputs require unpacked
 `input_ids [batch, sequence]`, `pixel_values [all_patches, 3, patch_size, patch_size]`,
 `image_grid_hws [images, 2]`, and `vision_token_types [batch, sequence]`.
 The image encoder and projector reuse DeepSeek V4 modules; image delimiters
-and visual router bias are retained. Specialized tool/reasoning formatting
+and visual router bias are retained. Specialized tool and reasoning formatting
 should be rendered with the official encoder before processing.
 
 ## Numerical Validation
@@ -117,7 +201,7 @@ should be rendered with the official encoder before processing.
 At PR commit `d5c8b5e45176bd6de54c139b311937516be4e0d2`, a real-weight comparison
 covered all 40 layers, 4,096 positions, and all 129,280 vocabulary entries
 against the pinned checkpoint's unchanged official `inference/` implementation.
-Official TP1 was compared with native EP4 and four Engram owners using
+Official TP1 was compared with native EP4 and 4 Engram owners using
 `torch_mm`, native HybridEP dispatch and combine, and TileLang. Dense and expert
 reference weights were decoded for BF16 compute, with the original cache/index quantization retained;
 this was not a default FP8/FP4 GEMM comparison.
@@ -142,8 +226,8 @@ The fixed gates still failed: mean KL exceeded 0.001 and cosine was below
 This is a measured baseline, not a strict parity pass.
 
 An earlier PR commit, `ae380ea74b8417a000c1639ebd64991aafeb42b8`, completed
-three resident forward/backward iterations using the now-removed custom FP32
-combine. It used four GB200 GPUs, the released first four layers and full
+three resident forward and backward iterations using the now-removed custom FP32
+combine. It used 4 GB200 GPUs, the released first four layers and full
 layer-1 Engram table, EP4, activation checkpointing, and resharding. All local
 trainable gradients were present and finite, including nonzero Engram and
 expert gradients. This check performed no clipping or optimizer updates and
@@ -170,10 +254,13 @@ restoration, or full-model convergence.
 
 ## Current Scope
 
-THD packing, TP, PP, CP, incremental generation caches, bounded decoder replay,
+THD packing, TP, PP, incremental generation caches, bounded decoder replay,
 and million-token training are unsupported. Image inputs also require
 unpacked batches. Indexers remain frozen because hard top-k selection has no
-language-model gradient; indexer distillation and DSpark draft training are
-outside this implementation. Fine-tuning does not reproduce the report's
+language-model gradient; indexer distillation is outside this implementation.
+Native DSpark draft training is available through the
+[DSpark training guide](/recipes-e2e-examples/dspark-speculative-decoding), with
+the target frozen and DSpark gradients isolated from the target backbone.
+Fine-tuning does not reproduce the report's
 Engram pretraining optimizer. Bitwise training continuation is not established
 for the TileLang backward kernels.

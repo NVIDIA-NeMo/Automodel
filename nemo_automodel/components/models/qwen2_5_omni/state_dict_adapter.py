@@ -26,6 +26,9 @@ logger = logging.getLogger(__name__)
 
 _THINKER_PREFIX = "thinker."
 _DROP_PREFIXES = ("talker.", "token2wav.")
+# The outer prefix PEFT saves carry (added in ModelState.state_dict); the
+# thinker namespace nests inside it on those keys.
+_PEFT_PREFIX = "base_model.model."
 
 # Keys the NeMo Thinker class deletes at __init__ time (so the HF base
 # checkpoint must not be allowed to repopulate them, otherwise load_state_dict
@@ -71,7 +74,7 @@ class Qwen2_5OmniStateDictAdapter(StateDictAdapter):
         **kwargs,
     ) -> dict[str, Any]:
         if self._uses_thinker_prefix:
-            hf_state_dict = {_THINKER_PREFIX + k: v for k, v in state_dict.items()}
+            hf_state_dict = {self._add_thinker_prefix(k): v for k, v in state_dict.items()}
         else:
             hf_state_dict = dict(state_dict)
 
@@ -89,13 +92,18 @@ class Qwen2_5OmniStateDictAdapter(StateDictAdapter):
         out: dict[str, Any] = {}
         saw_thinker = False
         for key, value in hf_state_dict.items():
-            if key.startswith(_DROP_PREFIXES):
+            # Drop talker/token2wav keys in either position: bare (full omni
+            # checkpoints) or nested inside the PEFT prefix (external
+            # full-omni adapters).
+            if key.startswith(_DROP_PREFIXES) or key.removeprefix(_PEFT_PREFIX).startswith(_DROP_PREFIXES):
                 continue
-            stripped = key[len(_THINKER_PREFIX) :] if key.startswith(_THINKER_PREFIX) else key
+            stripped = self._strip_thinker_prefix(key)
             # Drop keys for parameters the NeMo Thinker deletes at __init__.
             if any(sub in stripped for sub in _DROP_THINKER_KEY_SUBSTRINGS):
                 continue
-            if key.startswith(_THINKER_PREFIX):
+            # _strip_thinker_prefix changes the key iff it carried the
+            # thinker namespace in either position.
+            if stripped != key:
                 saw_thinker = True
             out[stripped] = value
         self._uses_thinker_prefix = saw_thinker or self._uses_thinker_prefix
@@ -103,8 +111,36 @@ class Qwen2_5OmniStateDictAdapter(StateDictAdapter):
 
     def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
         exclude_key_regex = kwargs.get("exclude_key_regex", None)
-        key = _THINKER_PREFIX + fqn if self._uses_thinker_prefix else fqn
+        key = self._add_thinker_prefix(fqn) if self._uses_thinker_prefix else fqn
         if exclude_key_regex:
             if re.match(exclude_key_regex, key):
                 return []
         return [(key, tensor)]
+
+    @staticmethod
+    def _add_thinker_prefix(key: str) -> str:
+        """Namespace a native key the way the HF omni checkpoint expects.
+
+        PEFT adapter keys keep their ``base_model.model.`` outer prefix, so for
+        those the ``thinker.`` namespace goes inside it — matching how PEFT
+        names modules on the actual HF omni model.
+        """
+        if key.startswith(_PEFT_PREFIX):
+            return _PEFT_PREFIX + _THINKER_PREFIX + key.removeprefix(_PEFT_PREFIX)
+        return _THINKER_PREFIX + key
+
+    @staticmethod
+    def _strip_thinker_prefix(key: str) -> str:
+        """Remove the omni checkpoint's ``thinker.`` namespace."""
+        if key.startswith(_PEFT_PREFIX + _THINKER_PREFIX):
+            return _PEFT_PREFIX + key.removeprefix(_PEFT_PREFIX + _THINKER_PREFIX)
+        return key.removeprefix(_THINKER_PREFIX)
+
+    def map_peft_target_module_to_hf(self, name: str) -> str:
+        """Namespace adapter_config.json target_modules under ``thinker.``.
+
+        Without it, PEFT's suffix matching on the full omni model also hits
+        the talker's structurally identical submodules and injects adapter
+        modules the saved file has no weights for.
+        """
+        return _THINKER_PREFIX + name

@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 from ruamel.yaml import YAML
 
+from nemo_automodel.recipes._dist_utils import parse_distributed_section
 from tests.ci_tests.utils.generate_ci_tests import generate_job, generate_pipeline
 
 # Over the default 5s budget on purpose: this module parses every example config under examples/.
@@ -89,6 +90,13 @@ def test_generate_gpt_oss_120b_release_job_uses_ep64():
     assert recipe["distributed"]["activation_checkpointing"] is False
 
 
+def test_release_keeps_glm_53_cudnn_dsa_recipe_with_container_flashmla():
+    pipeline = generate_pipeline(".", "release", "llm_finetune")
+
+    assert "glm_5.2_tulu3_4k_cudnn_100k" not in pipeline
+    assert "glm_5.3_tulu3_4k_cudnn_100step" in pipeline
+
+
 def test_generate_gpt_oss_120b_benchmark_job_uses_ep64_without_activation_checkpointing():
     config = Path("examples/llm_benchmark/gpt_oss/gptoss_120b_te_deepep.yaml")
 
@@ -101,6 +109,66 @@ def test_generate_gpt_oss_120b_benchmark_job_uses_ep64_without_activation_checkp
     assert variables["EP_SIZE"] == world_size
     assert recipe["distributed"]["ep_size"] == world_size
     assert recipe["distributed"]["activation_checkpointing"] is False
+
+
+def test_generate_deepseek_v3_1024_benchmark_job_uses_activation_checkpointing():
+    config = Path("examples/llm_benchmark/deepseek/deepseek_v3_te_deepep_1024.yaml")
+
+    jobs = dict(generate_job(config, {}, "performance", "llm_benchmark", "."))
+    recipe = YAML(typ="safe").load(config)
+
+    assert jobs[""]["variables"]["TEST_NODE_COUNT"] == 128
+    assert recipe["distributed"]["activation_checkpointing"] is True
+    assert recipe["step_scheduler"]["local_batch_size"] == 4
+
+
+def test_glm_4_5_air_benchmark_recipe_still_generates_with_checkpointing():
+    config = Path("examples/llm_benchmark/glm/glm_4.5_air_te_deepep.yaml")
+
+    jobs = dict(generate_job(config, {}, "performance", "llm_benchmark", "."))
+    recipe = YAML(typ="safe").load(config)
+
+    assert jobs[""]["variables"]["TEST_NODE_COUNT"] == 64
+    assert recipe["distributed"]["activation_checkpointing"] is True
+    assert parse_distributed_section(recipe["distributed"])["activation_checkpointing"] is True
+
+
+@pytest.mark.parametrize(
+    "config_path",
+    [
+        "examples/llm_benchmark/deepseek/deepseek_v3_te_deepep.yaml",
+        "examples/llm_benchmark/deepseek/deepseek_v3_te_deepep_1024.yaml",
+        "examples/llm_benchmark/glm/glm_4.5_air_te_deepep.yaml",
+        "examples/llm_benchmark/kimi/kimi_k2_te_deepep.yaml",
+        "examples/llm_benchmark/qwen/qwen3_moe_235b_te_deepep.yaml",
+        "examples/llm_benchmark/qwen/qwen3_moe_30b_te_deepep.yaml",
+        "examples/llm_benchmark/qwen/qwen3_moe_30b_torch.yaml",
+        "examples/llm_finetune/deepseek_v32/deepseek_v32_hellaswag_pp.yaml",
+        "examples/llm_finetune/qwen/qwen3_moe_30b_lora.yaml",
+    ],
+)
+def test_migrated_moe_recipes_preserve_activation_checkpointing(config_path):
+    """The #1225 config migration must not silently change these recipes' AC policy."""
+    recipe = YAML(typ="safe").load(Path(config_path))
+
+    assert recipe["distributed"]["activation_checkpointing"] is True
+    assert parse_distributed_section(recipe["distributed"])["activation_checkpointing"] is True
+
+
+@pytest.mark.parametrize(
+    ("config_path", "activation_checkpointing"),
+    [
+        ("examples/llm_benchmark/gpt_oss/gptoss_20b_te_deepep.yaml", None),
+        ("examples/llm_benchmark/gpt_oss/gptoss_120b_te_deepep_gb200.yaml", True),
+    ],
+)
+def test_gpt_oss_oom_benchmark_configs_use_fused_loss(config_path, activation_checkpointing):
+    recipe = YAML(typ="safe").load(Path(config_path))
+
+    assert recipe["model"]["output_hidden_states"] is True
+    assert recipe["loss_fn"]["_target_"] == ("nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy")
+    if activation_checkpointing is not None:
+        assert recipe["distributed"]["activation_checkpointing"] is activation_checkpointing
 
 
 def test_generate_vllm_deploy_time_override(tmp_path):

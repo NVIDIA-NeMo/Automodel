@@ -34,6 +34,7 @@ from nemo_automodel.components.models.qwen3_8_flash_next.cp import (
     Qwen3_8_FlashNextCPContext,
     qwen3_8_flash_next_cp_all_gather,
 )
+from nemo_automodel.components.models.qwen3_8_flash_next.fa4_qsa import fa4_sparse_gqa_attention
 from nemo_automodel.components.models.qwen3_8_flash_next.flex_qsa import flex_sparse_gqa_attention
 from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextRMSNorm
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
@@ -117,6 +118,27 @@ def apply_qsa_rope(states: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tenso
     return apply_rotary_emb(states, cos, sin)
 
 
+_QSA_SCORE_BUDGET_BYTES = 256 * 1024 * 1024
+
+
+def _qsa_query_chunk_rows(query_chunk_size: int | None, *, num_heads: int, num_blocks: int, rows: int) -> int:
+    """Rows scored per chunk: the explicit setting, or as many as fit the fp32 score budget.
+
+    Args:
+        query_chunk_size: Explicit maximum rows per chunk, or ``None`` for the memory-based default.
+        num_heads: Index query heads (``H_index``); the score tensor is ``[rows, H_index, num_blocks]`` fp32.
+        num_blocks: Compressed key blocks visible to this batch row.
+        rows: Number of valid query rows to cover.
+
+    Returns:
+        A positive chunk size no larger than ``rows``.
+    """
+    if query_chunk_size is not None:
+        return query_chunk_size
+    bytes_per_row = max(num_heads * num_blocks * 4, 1)
+    return max(1, min(rows, _QSA_SCORE_BUDGET_BYTES // bytes_per_row))
+
+
 @torch.no_grad()
 def select_qsa_token_ids(
     index_queries: torch.Tensor,
@@ -125,7 +147,7 @@ def select_qsa_token_ids(
     *,
     token_budget: int,
     compress_ratio: int,
-    query_chunk_size: int = 128,
+    query_chunk_size: int | None = None,
     query_position_offset: int = 0,
     global_sequence_length: int | None = None,
 ) -> torch.Tensor:
@@ -138,6 +160,11 @@ def select_qsa_token_ids(
     the 0--``compress_ratio - 1`` tokens in the current incomplete causal tail
     are appended.  Invalid slots are ``-1``.
 
+    The selection is vectorized over query rows: the only host synchronization
+    is one read of ``sequence_lengths``; chunk boundaries, the first sparse row,
+    and the tail slots follow from positions known on the host, so no
+    data-dependent branch waits on the device.
+
     Args:
         index_queries: Normalized and rotated local index queries
             ``[B, S_query, H_index, D_index]``.
@@ -146,8 +173,10 @@ def select_qsa_token_ids(
         sequence_lengths: Right-padded logical lengths ``[B]``.
         token_budget: Maximum number of tokens contributed by complete blocks.
         compress_ratio: Number of consecutive tokens represented by one block.
-        query_chunk_size: Query rows scored together.  This bounds the temporary
-            FP32 score tensor without changing top-k semantics.
+        query_chunk_size: Maximum query rows scored together. ``None`` sizes
+            chunks so the temporary FP32 score tensor ``[rows, H_index,
+            blocks]`` stays within 256 MiB (one chunk for 4k-16k sequences).
+            Chunking bounds memory without changing top-k semantics.
         query_position_offset: Global position represented by local query row
             zero. It is zero without CP and ``cp_rank * S_query`` for the
             contiguous CP layout.
@@ -173,7 +202,7 @@ def select_qsa_token_ids(
             "QSA requires a positive token_budget divisible by compress_ratio > 1; "
             f"got token_budget={token_budget}, compress_ratio={compress_ratio}"
         )
-    if query_chunk_size <= 0:
+    if query_chunk_size is not None and query_chunk_size <= 0:
         raise ValueError(f"query_chunk_size must be positive, got {query_chunk_size}")
     if num_heads <= 0 or head_dim <= 0:
         raise ValueError("QSA index queries require positive head count and head dimension")
@@ -187,76 +216,86 @@ def select_qsa_token_ids(
             f"got global={global_sequence_length}, offset={query_position_offset}, local={query_sequence_length}"
         )
 
-    lengths = sequence_lengths.to(device=index_queries.device, dtype=torch.long)
-    if bool(((lengths < 0) | (lengths > global_sequence_length)).any()):
+    # The single host synchronization of this routine.
+    lengths = [int(length) for length in sequence_lengths.tolist()]
+    if any(length < 0 or length > global_sequence_length for length in lengths):
         raise ValueError(f"QSA logical lengths must lie in [0, {global_sequence_length}]")
-    required_blocks = torch.div(lengths, compress_ratio, rounding_mode="floor")
     num_blocks = compressed_keys.shape[1]
-    if bool((required_blocks > num_blocks).any()):
+    required_blocks = max((length // compress_ratio for length in lengths), default=0)
+    if required_blocks > num_blocks:
         raise ValueError(
             "compressed_keys do not contain every complete logical block; "
-            f"need at least {int(required_blocks.max())}, got {num_blocks}"
+            f"need at least {required_blocks}, got {num_blocks}"
         )
 
+    device = index_queries.device
     block_budget = token_budget // compress_ratio
     final_width = token_budget + compress_ratio - 1
     selected_tokens = torch.full(
         (batch_size, query_sequence_length, final_width),
         -1,
         dtype=torch.int32,
-        device=index_queries.device,
+        device=device,
     )
-    block_offsets = torch.arange(compress_ratio, device=index_queries.device, dtype=torch.long)
-    tail_offsets = torch.arange(compress_ratio - 1, device=index_queries.device, dtype=torch.long)
+    block_offsets = torch.arange(compress_ratio, device=device, dtype=torch.long)
+    tail_offsets = torch.arange(compress_ratio - 1, device=device, dtype=torch.long)
     score_scale = math.sqrt(head_dim)
+    # Gold fast_topk preserves causal block order while all visible blocks fit
+    # the budget; score-ordered top-k starts at the first position whose
+    # visible block count exceeds it (t=2051 for c4/budget=2048).  Sparse rows
+    # are therefore a contiguous suffix of every chunk.
+    first_sparse_position = (block_budget + 1) * compress_ratio - 1
 
-    for batch_idx in range(batch_size):
-        logical_length = int(lengths[batch_idx])
+    for batch_idx, logical_length in enumerate(lengths):
         available_blocks = logical_length // compress_ratio
         keys = compressed_keys[batch_idx, :available_blocks, 0].float()
         local_valid_length = min(max(logical_length - query_position_offset, 0), query_sequence_length)
-        for query_start in range(0, local_valid_length, query_chunk_size):
-            query_end = min(query_start + query_chunk_size, local_valid_length)
-            query_positions = torch.arange(
-                query_position_offset + query_start,
-                query_position_offset + query_end,
-                device=index_queries.device,
-            )
-            visible_blocks = torch.div(query_positions + 1, compress_ratio, rounding_mode="floor")
+        if local_valid_length == 0:
+            continue
+        topk_width = min(block_budget, available_blocks)
+        chunk_rows = _qsa_query_chunk_rows(
+            query_chunk_size, num_heads=num_heads, num_blocks=max(available_blocks, 1), rows=local_valid_length
+        )
+        for query_start in range(0, local_valid_length, chunk_rows):
+            query_end = min(query_start + chunk_rows, local_valid_length)
             rows = query_end - query_start
-            result = torch.full((rows, final_width), -1, dtype=torch.int32, device=index_queries.device)
+            first_position = query_position_offset + query_start
+            query_positions = torch.arange(first_position, first_position + rows, device=device)
+            visible_blocks = torch.div(query_positions + 1, compress_ratio, rounding_mode="floor")
+            result = torch.full((rows, final_width), -1, dtype=torch.int32, device=device)
 
-            topk_width = min(block_budget, available_blocks)
             if topk_width:
-                # Gold fast_topk preserves causal block order while all visible
-                # blocks fit the budget.  It starts score-ordered top-k only on
-                # the first genuinely sparse row (t=2051 for c4/budget=2048).
-                candidate_blocks = torch.arange(topk_width, device=index_queries.device)
-                top_blocks = candidate_blocks.unsqueeze(0).expand(rows, -1).clone()
+                candidate_blocks = torch.arange(topk_width, device=device)
+                top_blocks = candidate_blocks.unsqueeze(0).expand(rows, -1)
                 valid_blocks = candidate_blocks.unsqueeze(0) < visible_blocks.unsqueeze(1)
-                sparse_rows = visible_blocks > block_budget
-                if bool(sparse_rows.any()):
-                    sparse_queries = index_queries[batch_idx, query_start:query_end][sparse_rows].float()
+                sparse_start = min(max(first_sparse_position - first_position, 0), rows)
+                if sparse_start < rows:
+                    sparse_queries = index_queries[batch_idx, query_start + sparse_start : query_end].float()
                     scores = torch.einsum("qhd,pd->qhp", sparse_queries, keys)
                     scores = torch.relu(scores).sum(dim=1) / score_scale
-                    block_ids = torch.arange(available_blocks, device=index_queries.device)
-                    sparse_visible = visible_blocks[sparse_rows]
+                    block_ids = torch.arange(available_blocks, device=device)
+                    sparse_visible = visible_blocks[sparse_start:]
                     scores = scores.masked_fill(block_ids.unsqueeze(0) >= sparse_visible.unsqueeze(1), -torch.inf)
-                    top_blocks[sparse_rows] = torch.topk(scores, k=block_budget, dim=-1).indices
-                    valid_blocks[sparse_rows] = True
+                    sparse_top_blocks = torch.topk(scores, k=block_budget, dim=-1).indices
+                    top_blocks = torch.cat([top_blocks[:sparse_start], sparse_top_blocks], dim=0)
+                    valid_blocks = torch.cat(
+                        [valid_blocks[:sparse_start], torch.ones_like(valid_blocks[sparse_start:])], dim=0
+                    )
                 expanded = top_blocks.unsqueeze(-1) * compress_ratio + block_offsets
-                expanded = torch.where(valid_blocks.unsqueeze(-1), expanded, -torch.ones_like(expanded))
+                expanded = torch.where(valid_blocks.unsqueeze(-1), expanded, torch.full_like(expanded, -1))
                 result[:, : topk_width * compress_ratio] = expanded.reshape(rows, -1).to(torch.int32)
 
+            # Tail slots start right after the valid blocks; every slot they
+            # address still holds -1, so writing -1 for absent tail tokens is a
+            # no-op and no data-dependent indexing is needed.
             tail_start = visible_blocks * compress_ratio
             tail_count = query_positions + 1 - tail_start
-            valid_block_count = torch.minimum(visible_blocks, torch.full_like(visible_blocks, block_budget))
+            valid_block_count = torch.clamp(visible_blocks, max=block_budget)
             tail_values = tail_start.unsqueeze(1) + tail_offsets.unsqueeze(0)
             tail_valid = tail_offsets.unsqueeze(0) < tail_count.unsqueeze(1)
-            if bool(tail_valid.any()):
-                destination = valid_block_count.unsqueeze(1) * compress_ratio + tail_offsets.unsqueeze(0)
-                row_ids = torch.arange(rows, device=index_queries.device).unsqueeze(1).expand_as(tail_valid)
-                result[row_ids[tail_valid], destination[tail_valid]] = tail_values[tail_valid].to(torch.int32)
+            destination = valid_block_count.unsqueeze(1) * compress_ratio + tail_offsets.unsqueeze(0)
+            tail_written = torch.where(tail_valid, tail_values, torch.full_like(tail_values, -1)).to(torch.int32)
+            result.scatter_(1, destination, tail_written)
 
             selected_tokens[batch_idx, query_start:query_end] = result
 
@@ -397,12 +436,25 @@ def qsa_gqa_attention(
     backend: str,
     softmax_scale: float | None = None,
 ) -> torch.Tensor:
-    """Dispatch QSA to FlexAttention on CUDA or the PyTorch oracle elsewhere.
+    """Dispatch QSA to the selected CUDA kernel or the PyTorch CPU oracle.
 
     CPU execution always uses the oracle so model construction, checkpoint
     inspection, and distributed CPU parity tests need no compiled kernels.
     CUDA execution is strict: unsupported backends or dtypes are reported
     rather than silently falling back to the gathered implementation.
+
+    Args:
+        query: Tensor [batch, local_queries, query_heads, head_dim].
+        key: Tensor [batch, global_keys, kv_heads, head_dim].
+        value: Tensor with key's layout. Q/K/V share one dtype and device.
+        selected_token_ids: Signed IDs [batch, local_queries, routes] in global
+            K/V coordinates; invalid CUDA IDs are padding and duplicates collapse.
+        backend: CUDA backend, "flex" or "cute". FA4 requires SM90 BF16 D256.
+        softmax_scale: Optional positive QK score multiplier.
+
+    Returns:
+        Independent tensor [batch, local_queries, query_heads, head_dim] with
+        query's dtype/device. Empty route rows produce zero.
     """
     if not query.is_cuda:
         return gathered_qsa_gqa_attention(
@@ -412,9 +464,11 @@ def qsa_gqa_attention(
             selected_token_ids,
             softmax_scale=softmax_scale,
         )
+    if backend == "cute":
+        return fa4_sparse_gqa_attention(query, key, value, selected_token_ids, softmax_scale=softmax_scale)
     if backend != "flex":
         raise RuntimeError(
-            f"Qwen3.8-Flash-Next CUDA QSA requires backend.attn='flex', got {backend!r}; "
+            f"Qwen3.8-Flash-Next CUDA QSA requires backend.attn='flex' or 'cute', got {backend!r}; "
             "call gathered_qsa_gqa_attention directly for a numerical oracle"
         )
     if any(tensor.dtype != torch.bfloat16 for tensor in (query, key, value)):
@@ -451,15 +505,16 @@ class Qwen3_8_FlashNextQSAIndexer(nn.Module):
         self.head_dim = int(getattr(config, "indexer_head_dim"))
         self.token_budget = int(getattr(config, "indexer_budget"))
         self.compress_ratio = int(getattr(config, "indexer_compress_ratio"))
-        self.query_chunk_size = int(getattr(config, "qsa_indexer_query_chunk_size", 128))
+        query_chunk_size = getattr(config, "qsa_indexer_query_chunk_size", None)
+        self.query_chunk_size = None if query_chunk_size is None else int(query_chunk_size)
         if self.num_query_heads <= 0 or self.head_dim <= 0:
             raise ValueError("QSA index head count and dimension must be positive")
         if self.num_key_heads != 1:
             raise ValueError(f"Qwen3.8-Flash-Next QSA requires one index KV head, got {self.num_key_heads}")
         if self.compress_ratio <= 1 or self.token_budget <= 0 or self.token_budget % self.compress_ratio != 0:
             raise ValueError("QSA indexer_budget must be positive and divisible by indexer_compress_ratio > 1")
-        if self.query_chunk_size <= 0:
-            raise ValueError("qsa_indexer_query_chunk_size must be positive")
+        if self.query_chunk_size is not None and self.query_chunk_size <= 0:
+            raise ValueError("qsa_indexer_query_chunk_size must be positive or None (size by score memory)")
 
         dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
         self.index_qk_proj = initialize_linear_module(

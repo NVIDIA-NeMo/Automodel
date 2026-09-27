@@ -2195,7 +2195,7 @@ class TestPermuteTokensForGroupedMM:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for torch._grouped_mm")
-class TestTorchGroupedMM:
+class TestGroupedMM:
     """Test GroupedExperts with torch._grouped_mm backend (use_torch_mm=True)."""
 
     @pytest.fixture
@@ -2238,7 +2238,7 @@ class TestTorchGroupedMM:
         from functools import partial
 
         if isinstance(fn, partial):
-            inner = TestTorchGroupedMM._unwrap_compiled(fn.func)
+            inner = TestGroupedMM._unwrap_compiled(fn.func)
             if inner is not fn.func:
                 return partial(inner, *fn.args, **fn.keywords)
             return fn
@@ -2260,13 +2260,19 @@ class TestTorchGroupedMM:
         return experts
 
     def test_init_sets_use_torch_mm(self, torch_mm_config, torch_mm_backend):
-        """Test that use_torch_mm flag is set correctly."""
+        """Test that torch_mm selects the native grouped operation."""
         experts = GroupedExperts(torch_mm_config, backend=torch_mm_backend)
         assert experts.use_torch_mm is True
         assert hasattr(experts, "expert_activation_grouped")
 
-    def test_init_without_backend_disables_torch_mm(self, torch_mm_config):
-        """Test that use_torch_mm is False without backend."""
+    def test_gmm_alias_selects_grouped_mm(self, torch_mm_config):
+        """Test that the deprecated backend name remains a compatibility alias."""
+        with pytest.warns(FutureWarning, match="experts='gmm' is deprecated"):
+            backend = BackendConfig(experts="gmm", dispatcher="torch")
+        assert GroupedExperts(torch_mm_config, backend=backend).use_torch_mm is True
+
+    def test_init_without_backend_disables_grouped_mm(self, torch_mm_config):
+        """Test that grouped MM is disabled without a backend."""
         experts = GroupedExperts(torch_mm_config)
         assert experts.use_torch_mm is False
         # expert_activation_grouped is always initialized (used by both loop and grouped_mm paths)
@@ -2441,12 +2447,12 @@ class TestTorchGroupedMM:
     def test_deepep_init_with_torch_mm(self, torch_mm_config, torch_mm_backend):
         """Test GroupedExpertsDeepEP initializes with torch_mm backend."""
         experts = GroupedExpertsDeepEP(torch_mm_config, backend=torch_mm_backend)
-        assert experts.use_torch_mm is True
+        assert experts.use_mxfp8 is False
 
-    def test_deepep_init_without_torch_mm(self, torch_mm_config):
-        """Test GroupedExpertsDeepEP defaults to gmm without torch_mm backend."""
+    def test_deepep_init_without_backend_uses_native_gmm(self, torch_mm_config):
+        """Test GroupedExpertsDeepEP defaults to native grouped MM."""
         experts = GroupedExpertsDeepEP(torch_mm_config)
-        assert experts.use_torch_mm is False
+        assert experts.use_mxfp8 is False
 
 
 class TestTorchMMExpertsFwd:

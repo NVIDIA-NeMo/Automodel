@@ -28,6 +28,7 @@ FrozenMultimodalSharding = Literal["root", "per_layer", "replicate"]
 # drifts silently, and the drift only shows up as a sharding difference.
 MULTIMODAL_TOWER_NAMES = (
     "visual",
+    "vision",
     "vision_tower",
     "vision_model",
     "vit_model",
@@ -46,6 +47,7 @@ MULTIMODAL_PROJECTOR_NAMES = (
     "embed_vision",
     "embed_audio",
     "mm_projector",
+    "aligner",
     "multi_modal_projector",
     "multimodal_projector",
     "vision_projector",
