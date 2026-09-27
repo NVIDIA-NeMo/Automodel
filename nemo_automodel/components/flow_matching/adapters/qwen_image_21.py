@@ -46,11 +46,14 @@ class QwenImage21Adapter(ModelAdapter):
 
     Qwen-Image-2.1 transformer forward interface:
     - hidden_states: Flattened latents [B, H*W, 64]
-    - encoder_hidden_states: Text embeddings [B, seq_len, 4096]
-    - encoder_hidden_states_mask: [B, seq_len] bool, or None when nothing is padded
+    - encoder_hidden_states: Text embeddings [B, text_len, 4096]
     - timestep: Normalized timesteps [0, 1]
     - img_shapes: [[(1, H, W)]] per sample
-    - img_mask: [B, seq_len + H*W/4] bool, True at target-image slots
+    - img_mask: [B, text_len + H*W/4] bool, True at target-image slots
+
+    The transformer lays out RoPE from row 0 of ``img_mask`` for the whole batch, and every text position
+    (padding included) advances the target image's frame index. Each sample is therefore run as its own
+    unpadded transformer call, so it sees exactly the positions of single-prompt inference.
     """
 
     @staticmethod
@@ -66,6 +69,17 @@ class QwenImage21Adapter(ModelAdapter):
         if n != height * width:
             raise ValueError(f"Expected {height * width} target tokens for a {height}x{width} latent, got {n}")
         return latents.transpose(1, 2).reshape(b, c, height, width)
+
+    @staticmethod
+    def _build_img_mask(batch_size: int, text_len: int, image_tokens: int, device: torch.device) -> torch.Tensor:
+        """Text positions first, then one slot per 2x2 group of target latent tokens."""
+        return torch.cat(
+            [
+                torch.zeros(batch_size, text_len, dtype=torch.bool, device=device),
+                torch.ones(batch_size, image_tokens // _IMG_TOKENS_PER_SLOT, dtype=torch.bool, device=device),
+            ],
+            dim=1,
+        )
 
     def prepare_inputs(self, context: FlowMatchingContext) -> Dict[str, Any]:
         """
@@ -103,40 +117,22 @@ class QwenImage21Adapter(ModelAdapter):
                 f"{tuple(text_embeddings.shape[:2])}"
             )
 
-        # Drop trailing padding shared by every sample: the collate pads to a multiple of 8, and every extra
-        # position shifts the target image's RoPE frame index away from what inference sees.
-        text_len = int(text_mask.sum(dim=1).max().item())
-        text_embeddings = text_embeddings[:, :text_len]
-        text_mask = text_mask[:, :text_len]
+        # Prompts are right-padded, so each sample's valid tokens are a prefix of its row.
+        text_lengths = text_mask.sum(dim=1).tolist()
+        text_embeddings = text_embeddings[:, : max(text_lengths)]
 
         if random.random() < context.cfg_dropout_prob:
             text_embeddings = torch.zeros_like(text_embeddings)
-
-        packed_latents = self._pack_latents(noisy_latents)
-
-        # Text positions first, then one slot per 2x2 group of target latent tokens.
-        img_mask = torch.cat(
-            [
-                torch.zeros(batch_size, text_len, dtype=torch.bool, device=device),
-                torch.ones(batch_size, height * width // _IMG_TOKENS_PER_SLOT, dtype=torch.bool, device=device),
-            ],
-            dim=1,
-        )
-        img_shapes = [[(1, height, width)]] * batch_size
-
-        # A mask with no padding carries no information and forces the slower masked attention path.
-        encoder_hidden_states_mask = None if bool(text_mask.all()) else text_mask
 
         # Normalize timesteps to [0, 1]
         timesteps = context.timesteps.to(dtype) / 1000.0
 
         return {
-            "hidden_states": packed_latents,
+            "hidden_states": self._pack_latents(noisy_latents),
             "encoder_hidden_states": text_embeddings,
-            "encoder_hidden_states_mask": encoder_hidden_states_mask,
             "timestep": timesteps,
-            "img_shapes": img_shapes,
-            "img_mask": img_mask,
+            "img_shapes": [[(1, height, width)]] * batch_size,
+            "_text_lengths": text_lengths,
             "_original_shape": (batch_size, channels, height, width),
         }
 
@@ -144,21 +140,29 @@ class QwenImage21Adapter(ModelAdapter):
         """
         Execute forward pass for Qwen-Image-2.1 model.
 
-        Returns target-image prediction in [B, C, H, W] format.
+        Runs one transformer call per sample, trimmed to that sample's prompt length, and returns the
+        target-image prediction in [B, C, H, W] format.
+
+        The call count is always the local batch size, never the number of distinct prompt lengths: under FSDP
+        every call issues collectives, so all ranks must make the same number of calls, and the diffusion
+        sampler gives every rank the same local batch size.
         """
         _, _, height, width = inputs["_original_shape"]
+        image_tokens = height * width
+        hidden_states = inputs["hidden_states"]
 
-        model_pred = model(
-            hidden_states=inputs["hidden_states"],
-            encoder_hidden_states=inputs["encoder_hidden_states"],
-            encoder_hidden_states_mask=inputs["encoder_hidden_states_mask"],
-            timestep=inputs["timestep"],
-            img_shapes=inputs["img_shapes"],
-            img_mask=inputs["img_mask"],
-            return_dict=False,
-        )
-        pred = self.post_process_prediction(model_pred)
+        preds = []
+        for index, text_len in enumerate(inputs["_text_lengths"]):
+            model_pred = model(
+                hidden_states=hidden_states[index : index + 1],
+                encoder_hidden_states=inputs["encoder_hidden_states"][index : index + 1, :text_len],
+                encoder_hidden_states_mask=None,
+                timestep=inputs["timestep"][index : index + 1],
+                img_shapes=inputs["img_shapes"][index : index + 1],
+                img_mask=self._build_img_mask(1, text_len, image_tokens, hidden_states.device),
+                return_dict=False,
+            )
+            # The transformer predicts the whole joint sequence; the target image is the trailing block.
+            preds.append(self.post_process_prediction(model_pred)[:, -image_tokens:])
 
-        # The transformer predicts the whole joint sequence; the target image is the trailing block.
-        pred = pred[:, -height * width :]
-        return self._unpack_latents(pred, height, width)
+        return self._unpack_latents(torch.cat(preds), height, width)
