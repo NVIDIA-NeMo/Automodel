@@ -15,7 +15,7 @@ NeMo AutoModel integrates with Hugging Face `transformers`. Any LLM or VLM that 
 | `AutoModelForImageTextToText` | Image-Text-to-Text (VLM) | Supported | See [VLM model list](/model-coverage/vision-language-models/overview) |
 | Custom multimodal models | Unified multimodal training | Supported | See [Multimodal model list](/model-coverage/multimodal/overview) |
 | `AutoModelForSequenceClassification` | Sequence Classification | Work in Progress | Early support; interfaces might change |
-| Diffusers Pipelines | Diffusion Generation (T2I, T2V) | Supported | See [Diffusion model list](/model-coverage/diffusion/overview) |
+| Diffusers Pipelines | Diffusion Generation (T2I, T2V, Character Animation) | Supported | See [Diffusion model list](/model-coverage/diffusion/overview) |
 | `NeMoAutoModelBiEncoder` | Embedding Models | Supported | See [Embedding model list](/model-coverage/embedding-models/overview) |
 | `NeMoAutoModelCrossEncoder` | Reranking Models | Supported | See [Reranking model list](/model-coverage/reranking-models/overview) |
 
@@ -94,7 +94,7 @@ Hugging Face `transformers` or NeMo AutoModel.
 
 The following table lists architectures represented by the ready-to-run YAML recipes in this repository. It includes both NeMo-native implementations and models that use the standard Hugging Face implementation path.
 
-This is a practical starting set rather than an exhaustive compatibility list. NeMo AutoModel can also work with additional models supported by the installed version of the Hugging Face `transformers` library, although models without a checked-in recipe might require some configuration for a particular training setup.
+This is a practical starting set rather than an exhaustive compatibility list. NeMo AutoModel can also work with additional models supported by the installed version of Hugging Face `transformers`. Models without a checked-in recipe might require some configuration for a particular training setup.
 
 {/* BEGIN GENERATED MODEL ARCHITECTURES */}
 {/* END GENERATED MODEL ARCHITECTURES */}

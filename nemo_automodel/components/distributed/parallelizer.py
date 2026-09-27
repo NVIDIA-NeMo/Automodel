@@ -1186,12 +1186,16 @@ class QwenImageEditParallelizationStrategy(DefaultParallelizationStrategy):
 
 
 # Strategy registry mapping model class names to parallelization strategies
-PARALLELIZATION_STRATEGIES: Dict[str, ParallelizationStrategy] = {
+PARALLELIZATION_STRATEGIES: dict[str, ParallelizationStrategy | tuple[str, str]] = {
     "NemotronHForCausalLM": NemotronHParallelizationStrategy(),
     "DeepseekV4ForCausalLM": DeepseekV4ParallelizationStrategy(),
     "Qwen3_5ForConditionalGeneration": Qwen3_5ParallelizationStrategy(),
     "Qwen3_5ForCausalLM": Qwen3_5ParallelizationStrategy(),
     "WanTransformer3DModel": WanParallelizationStrategy(),
+    "WanAnimate2Transformer3DModel": (
+        "nemo_automodel.components.models.wan_animate2.parallelization",
+        "WanAnimate2ParallelizationStrategy",
+    ),
     "HunyuanVideo15Transformer3DModel": HunyuanParallelizationStrategy(),
     "LTX2VideoTransformer3DModel": LTX2ParallelizationStrategy(),
     "QwenImageTransformer2DModel": QwenImageEditParallelizationStrategy(),
@@ -1204,7 +1208,12 @@ _DEFAULT_STRATEGY = DefaultParallelizationStrategy()
 def get_parallelization_strategy(model: nn.Module) -> ParallelizationStrategy:
     """Get the appropriate parallelization strategy for the given model."""
     model_name = type(model).__name__
-    return PARALLELIZATION_STRATEGIES.get(model_name, _DEFAULT_STRATEGY)
+    strategy = PARALLELIZATION_STRATEGIES.get(model_name, _DEFAULT_STRATEGY)
+    if isinstance(strategy, tuple):
+        module_name, class_name = strategy
+        strategy = getattr(importlib.import_module(module_name), class_name)()
+        PARALLELIZATION_STRATEGIES[model_name] = strategy
+    return strategy
 
 
 def register_parallel_strategy(arg=None, *, name: str | None = None):

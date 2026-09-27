@@ -273,7 +273,12 @@ def _apply_op_patch(op_name: str, fixed_op, buggy_marker: str) -> bool:
         logger.warning("[CP patch] Could not inspect %s source; not patching", op_name)
         return False
 
-    if buggy_marker not in source:
+    # Diffusers 0.40 saves model-layout tensors and correctly transposes every
+    # Q/K/V input once. Its key transpose alone no longer identifies the old bug.
+    fixed_model_layout = (
+        buggy_marker == _BUGGY_KV_TRANSPOSE_MARKER and "query = query.transpose(1, 2).contiguous()" in source
+    )
+    if buggy_marker not in source or fixed_model_layout:
         logger.info("[CP patch] diffusers %s already fixed upstream; not patching", op_name)
         return False
 

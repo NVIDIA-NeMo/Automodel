@@ -20,6 +20,7 @@ dataclass used to pass data between the pipeline and adapters.
 """
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Dict
 
@@ -100,6 +101,57 @@ class ModelAdapter(ABC):
 
         pipeline = FlowMatchingPipelineV2(model_adapter=MyCustomAdapter())
     """
+
+    def prepare_latents(self, latents: torch.Tensor, batch: dict[str, Any]) -> torch.Tensor:
+        """Assemble the clean prediction target before sampling its noise.
+
+        Args:
+            latents: Clean tensor [batch, channels, frames, height, width] for
+                video or [batch, channels, height, width] for images.
+            batch: Cached conditioning fields, with model-specific layouts.
+
+        Returns:
+            Clean tensor to noise and supervise, preserving batch and channel
+            axes. The default returns ``latents`` unchanged and aliases it.
+        """
+        return latents
+
+    def sample_noise(self, latents: torch.Tensor) -> torch.Tensor:
+        """Sample the noise that determines interpolation and target precision.
+
+        Args:
+            latents: Clean tensor [batch, channels, frames, height, width] for
+                video or [batch, channels, height, width] for images.
+
+        Returns:
+            Float32 Gaussian noise with the same shape and device as ``latents``.
+            Adapters may preserve latent precision to match their training reference.
+        """
+        return torch.randn_like(latents, dtype=torch.float32)
+
+    def add_noise(
+        self,
+        latents: torch.Tensor,
+        noise: torch.Tensor,
+        sigma: torch.Tensor,
+        *,
+        noise_schedule: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],
+    ) -> torch.Tensor:
+        """Apply the pipeline's configured noise schedule.
+
+        Args:
+            latents: Clean tensor [batch, channels, ...], with arbitrary trailing
+                latent dimensions.
+            noise: Noise with the same shape and dtype as ``latents``.
+            sigma: Noise levels [batch].
+            noise_schedule: Interpolation callable accepting latents, noise, and
+                sigma in that order.
+
+        Returns:
+            Noisy tensor with the same shape as ``latents``, as returned by the
+            configured schedule.
+        """
+        return noise_schedule(latents, noise, sigma)
 
     @abstractmethod
     def prepare_inputs(self, context: FlowMatchingContext) -> Dict[str, Any]:
