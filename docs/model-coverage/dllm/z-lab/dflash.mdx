@@ -8,34 +8,11 @@ slug: model-coverage/dllm/z-lab/Qwen3-4B-DFlash-b16
 
 ## Train Qwen3-4B-DFlash-b16
 
-This quick start requires Docker, the NVIDIA Container Toolkit, and eight GPUs.
-If the model or dataset requires Hugging Face authentication, export `HF_TOKEN`
-in the host shell first. For other installation methods, see the
-[Installation Guide](/get-started/installation).
-
-Run this complete block in a host shell. It downloads the container, installs
-the mounted checkout, starts training, and keeps downloaded files and
-checkpoints on the host.
+From the repository root, run:
 
 ```bash
-git clone --depth=1 https://github.com/NVIDIA-NeMo/Automodel.git
-cd Automodel
-mkdir -p .cache/huggingface checkpoints
-
-docker pull nvcr.io/nvidia/nemo-automodel:26.08.00
-docker run --gpus all --network=host -it --rm \
-  --shm-size=32g \
-  -e HF_TOKEN \
-  -v "$(pwd)":/opt/Automodel \
-  -v "$(pwd)/.cache/huggingface":/root/.cache/huggingface \
-  -w /opt/Automodel \
-  nvcr.io/nvidia/nemo-automodel:26.08.00 \
-  /bin/bash -lc '
-    bash docker/common/update_pyproject_pytorch.sh /opt/Automodel &&
-    uv sync --locked --extra all --all-groups &&
-    uv run torchrun --nproc-per-node=8 nemo_automodel/recipes/dllm/train_ft.py \
-      -c examples/dllm_sft/dflash_sft.yaml
-  '
+uv run torchrun --nproc-per-node=8 nemo_automodel/recipes/dllm/train_ft.py \
+  -c examples/dllm_sft/dflash_sft.yaml
 ```
 
 ## Model Reference

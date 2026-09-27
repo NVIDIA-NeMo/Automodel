@@ -12,36 +12,13 @@ Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com
 
 ## Fine-Tune Moonlight
 
-This quick start requires Docker, the NVIDIA Container Toolkit, and eight GPUs.
-If Hugging Face requires authentication, export `HF_TOKEN` in the host shell
-first. For other installation methods, see the
-[Installation Guide](/get-started/installation).
-
-Run this complete block in a host shell. It downloads the container, installs
-the mounted checkout, starts fine-tuning, and keeps downloaded files and
-checkpoints on the host.
+From the repository root, run:
 
 ```bash
-git clone --depth=1 https://github.com/NVIDIA-NeMo/Automodel.git
-cd Automodel
-mkdir -p .cache/huggingface checkpoints/moonlight
-
-docker pull nvcr.io/nvidia/nemo-automodel:26.08.00
-docker run --gpus all --network=host -it --rm \
-  --shm-size=32g \
-  -e HF_TOKEN \
-  -v "$(pwd)":/opt/Automodel \
-  -v "$(pwd)/.cache/huggingface":/root/.cache/huggingface \
-  -w /opt/Automodel \
-  nvcr.io/nvidia/nemo-automodel:26.08.00 \
-  /bin/bash -lc '
-    bash docker/common/update_pyproject_pytorch.sh /opt/Automodel &&
-    uv sync --locked --extra all --all-groups &&
-    uv run automodel examples/llm_finetune/moonlight/moonlight_16b_te.yaml \
-      --nproc-per-node 8 \
-      --checkpoint.enabled true \
-      --checkpoint.checkpoint_dir checkpoints/moonlight
-  '
+uv run automodel examples/llm_finetune/moonlight/moonlight_16b_te.yaml \
+  --nproc-per-node 8 \
+  --checkpoint.enabled true \
+  --checkpoint.checkpoint_dir checkpoints/moonlight
 ```
 
 ## Choose a Workflow
