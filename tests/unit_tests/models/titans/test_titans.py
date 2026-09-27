@@ -504,6 +504,23 @@ def test_deep_memory_exposes_residual_norm_fast_weight():
     assert state["model.layers.0.memory.mem_norm_weight"].shape == (4, 32)
 
 
+def test_meta_materialization_initializes_deep_fast_weights():
+    """Distributed from-config construction must not leave deep memory at zero."""
+    config = _tiny_config(mem_depth=2)
+    with torch.device("meta"):
+        model = TitansForCausalLM(config)
+    model.to_empty(device=torch.device("cpu"))
+
+    model.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
+
+    for layer in model.model.layers:
+        assert all(torch.count_nonzero(weight) > 0.99 * weight.numel() for weight in layer.memory.mem_weights)
+        torch.testing.assert_close(
+            layer.memory.mem_norm_weight,
+            torch.ones_like(layer.memory.mem_norm_weight),
+        )
+
+
 def test_neural_memory_builds_causal_qkv_convolutions():
     """The paper's width-four Q/K/V convolutions are part of the checkpoint."""
     from transformers import AutoModelForCausalLM

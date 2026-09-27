@@ -301,8 +301,12 @@ class NeuralMemory(nn.Module):
     def _init_mem_weights(self) -> None:
         """Xavier-uniform init of each per-head deep-memory weight matrix."""
         for w in self.mem_weights:
-            for h in range(self.num_heads):
-                nn.init.xavier_uniform_(w[h])
+            # Initialize the complete parameter rather than indexing one head at
+            # a time. After FSDP2 parallelization ``w`` may be a DTensor, and
+            # initializing an indexed DTensor view does not update its parent.
+            fan_in, fan_out = w.shape[-2:]
+            bound = (6.0 / (fan_in + fan_out)) ** 0.5
+            nn.init.uniform_(w, -bound, bound)
         if self.memory_residual_norm:
             nn.init.ones_(self.mem_norm_weight)
 
