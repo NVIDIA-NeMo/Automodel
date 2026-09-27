@@ -29,10 +29,24 @@ sys.modules[SPEC.name] = REPORT
 SPEC.loader.exec_module(REPORT)
 
 
-def _write_ruler_fixture(root: Path, mode: str, task: str, context: int, *, complete: bool = True) -> None:
-    prediction_dir = root / mode / "lmm" / str(context) / "pred"
+def _write_ruler_fixture(
+    root: Path,
+    mode: str,
+    task: str,
+    context: int,
+    *,
+    architecture: str = "lmm",
+    complete: bool = True,
+    score: float = 75.0,
+    seed: int | None = None,
+) -> None:
+    if seed is None:
+        prediction_dir = root / mode / architecture / str(context) / "pred"
+        sample_count = 2
+    else:
+        prediction_dir = root / architecture / mode.replace("_", "-") / str(context) / f"seed-{seed}" / "pred"
+        sample_count = 100
     prediction_dir.mkdir(parents=True, exist_ok=True)
-    sample_count = 2
     summary_path = prediction_dir / "summary.csv"
     existing = []
     if summary_path.exists():
@@ -42,12 +56,9 @@ def _write_ruler_fixture(root: Path, mode: str, task: str, context: int, *, comp
         writer = csv.DictWriter(stream, fieldnames=["task", "score", "nulls", "num_samples"])
         writer.writeheader()
         writer.writerows(existing)
-        writer.writerow({"task": task, "score": 75.0, "nulls": 0, "num_samples": sample_count})
+        writer.writerow({"task": task, "score": score, "nulls": 0, "num_samples": sample_count})
     merged = prediction_dir / f"{task}.jsonl"
-    rows = [
-        {"_sample_ordinal": 0, "pred": "first"},
-        {"_sample_ordinal": 1, "pred": "second"},
-    ]
+    rows = [{"_sample_ordinal": ordinal, "pred": f"prediction-{ordinal}"} for ordinal in range(sample_count)]
     if not complete:
         rows.pop()
     merged.write_text("".join(json.dumps(row) + "\n" for row in rows))
@@ -59,6 +70,7 @@ def _write_ruler_fixture(root: Path, mode: str, task: str, context: int, *, comp
                 "task": task,
                 "context_length": context,
                 "requested_sample_count": sample_count,
+                **({"data_seed": seed} if seed is not None else {}),
                 "generation_settings": {"enable_ttt_updates": mode == "ttt_on"},
             }
         )
@@ -138,6 +150,63 @@ def test_marks_incomplete_ruler_cell_without_inventing_value(tmp_path: Path) -> 
     assert "incomplete" in row.status
 
 
+def test_aggregates_new_seeded_layout_with_provenance(tmp_path: Path) -> None:
+    root = tmp_path / "ruler"
+    for seed, score in ((42, 60.0), (43, 75.0), (44, 90.0)):
+        _write_ruler_fixture(root, "ttt_on", "s_niah_pk", 4096, score=score, seed=seed)
+
+    rows = REPORT.collect_ruler([root])
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.architecture == "lmm"
+    assert row.ttt_mode == "on"
+    assert row.value == pytest.approx(75.0)
+    assert row.sample_count == 300
+    assert row.seed_count == 3
+    assert row.seeds == "42,43,44"
+    assert row.valid is True
+    assert row.complete is True
+    assert len(json.loads(row.artifacts)) == 3
+    assert all("seed-" in artifact for artifact in json.loads(row.artifacts))
+
+
+def test_preserves_but_does_not_plot_incomplete_seeded_cell(tmp_path: Path) -> None:
+    root = tmp_path / "ruler"
+    for seed in (42, 43):
+        _write_ruler_fixture(root, "ttt_off", "s_niah_n", 8192, seed=seed)
+
+    row = REPORT.collect_ruler([root])[0]
+
+    assert row.value == 75.0
+    assert row.sample_count == 200
+    assert row.seed_count == 2
+    assert row.valid is True
+    assert row.complete is False
+    assert "expected 3 seeds, found 2" in row.status
+
+
+def test_plots_mac_recovery_only_from_exact_matched_control_cells(tmp_path: Path) -> None:
+    root = tmp_path / "ruler"
+    _write_ruler_fixture(root, "ttt_off", "s_niah_pk", 2048, architecture="local_matched", score=20.0)
+    _write_ruler_fixture(root, "ttt_off", "s_niah_pk", 2048, architecture="full_matched", score=80.0)
+    _write_ruler_fixture(root, "ttt_on", "s_niah_pk", 2048, architecture="mac", score=50.0)
+    rows = REPORT.collect_ruler([root])
+    plt = REPORT._matplotlib()
+    if plt is None:
+        pytest.skip("matplotlib is not installed")
+
+    assert (
+        REPORT.plot_mac_recovery([row for row in rows if row.architecture != "full_matched"], tmp_path, {}, plt) == []
+    )
+    figures = REPORT.plot_mac_recovery(rows, tmp_path, {}, plt)
+
+    assert {path.name for path in figures} == {
+        "titans_mac_bridge_recovery.png",
+        "titans_mac_bridge_recovery.svg",
+    }
+
+
 def test_writes_outputs_and_self_contained_report(tmp_path: Path) -> None:
     ruler_root = tmp_path / "ruler"
     lm_root = tmp_path / "lm"
@@ -170,8 +239,8 @@ def test_writes_outputs_and_self_contained_report(tmp_path: Path) -> None:
     assert (output_dir / "titans_lm_lambada.png").is_file()
     report = html_path.read_text()
     assert "<svg" in report
-    assert "No compatible parameter-matched floor or full-attention control" in report
-    assert "essay at context length 512 is unavailable" in report
-    assert "protocol-aligned rather than bit-exact replications" in report
+    assert "FSDP2 zero-fast-weight initialization bug" in report
+    assert "Parameter-matched no-memory controls now exist" in report
+    assert "Missing task/context cells are not interpolated" in report
     assert "Every matched aggregate metric is exactly identical with TTT updates on and off" in report
     assert 'src="' not in report

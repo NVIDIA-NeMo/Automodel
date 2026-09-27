@@ -31,12 +31,15 @@ from typing import Any
 LOGGER = logging.getLogger(__name__)
 
 CAVEATS = (
-    "No compatible parameter-matched floor or full-attention control is available; "
-    "the figures compare Titans architectures and the within-checkpoint TTT on/off intervention only.",
-    "S-NIAH-N / essay at context length 512 is unavailable and is not interpolated or otherwise imputed.",
-    "The co-author protocol established n=300 cells as three 100-sample seeds. "
-    "These AutoModel runs contain 300 deterministic samples per cell, but their manifests do not establish "
-    "three-seed provenance; treat them as protocol-aligned rather than bit-exact replications.",
+    "Historical old memory checkpoints had an FSDP2 zero-fast-weight initialization bug and are invalid for "
+    "neural-memory or test-time-training (TTT) conclusions.",
+    "Parameter-matched no-memory controls now exist: local_matched is the local-attention floor and full_matched "
+    "is the full-attention control.",
+    "Seeded RULER cells are complete only when three independently manifested 100-sample seeds are present. "
+    "Scores are sample-weighted; incomplete cells are preserved in tidy outputs but omitted from figures.",
+    "MAC bridge recovery is (score - local_matched) / (full_matched - local_matched) for the exact same task and "
+    "context. Cells without both controls, or with equal control scores, are omitted.",
+    "Missing task/context cells are not interpolated or otherwise imputed.",
 )
 RULER_FIELDS = (
     "architecture",
@@ -55,6 +58,9 @@ RULER_FIELDS = (
     "status",
     "source",
     "artifact",
+    "seed_count",
+    "seeds",
+    "artifacts",
 )
 COLORS = ("#0b7285", "#e8590c", "#5c940d", "#9c36b5", "#2a78d6", "#c92a2a")
 
@@ -79,6 +85,9 @@ class ReportRow:
     status: str
     source: str
     artifact: str
+    seed_count: int | None = None
+    seeds: str | None = None
+    artifacts: str | None = None
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -124,16 +133,32 @@ def _jsonl_count(path: Path) -> tuple[int, list[int] | None]:
     return count, ordinals or None
 
 
-def _ruler_location(root: Path, summary_path: Path) -> tuple[str, str, int]:
+def _ruler_location(root: Path, summary_path: Path) -> tuple[str, str, int, int | None]:
     relative = summary_path.relative_to(root)
     parts = relative.parts
     if len(parts) < 5 or parts[-2:] != ("pred", "summary.csv"):
-        raise ValueError(f"{summary_path}: expected <ttt_mode>/<architecture>/<context>/pred/summary.csv below {root}")
+        raise ValueError(
+            f"{summary_path}: expected <ttt_mode>/<architecture>/<context>/pred/summary.csv or "
+            f"<architecture>/<ttt_mode>/<context>/seed-<seed>/pred/summary.csv below {root}"
+        )
+    seed_match = re.fullmatch(r"seed-(\d+)", parts[-3])
+    if seed_match:
+        if len(parts) < 6:
+            raise ValueError(f"{summary_path}: seeded layout is missing architecture or TTT mode")
+        context_part = parts[-4]
+        ttt_mode = parts[-5]
+        architecture = parts[-6]
+        seed = int(seed_match.group(1))
+    else:
+        context_part = parts[-3]
+        ttt_mode = parts[-5]
+        architecture = parts[-4]
+        seed = None
     try:
-        context_length = int(parts[-3])
+        context_length = int(context_part)
     except ValueError as error:
         raise ValueError(f"{summary_path}: context directory must be an integer") from error
-    return _ttt_mode(parts[-5]), parts[-4], context_length
+    return _ttt_mode(ttt_mode), architecture, context_length, seed
 
 
 def _ruler_task_row(
@@ -142,6 +167,7 @@ def _ruler_task_row(
     architecture: str,
     ttt_mode: str,
     context_length: int,
+    seed: int | None,
     summary_row: dict[str, str],
 ) -> ReportRow:
     task = summary_row.get("task", "")
@@ -186,6 +212,8 @@ def _ruler_task_row(
         for key, expected in checks.items():
             if manifest.get(key) != expected:
                 issues.append(f"manifest {key} mismatch")
+        if seed is not None and manifest.get("data_seed") != seed:
+            issues.append("manifest data_seed mismatch")
         if expected_mode is not None and settings.get("enable_ttt_updates") is not expected_mode:
             issues.append("manifest TTT mode mismatch")
 
@@ -229,7 +257,111 @@ def _ruler_task_row(
         status=status,
         source="ruler",
         artifact=str(summary_path),
+        seed_count=1 if seed is not None else None,
+        seeds=str(seed) if seed is not None else None,
+        artifacts=json.dumps([str(summary_path)]) if seed is not None else None,
     )
+
+
+def _aggregate_seeded_ruler(rows: list[ReportRow]) -> list[ReportRow]:
+    """Aggregate seeded RULER rows without filling absent or invalid observations."""
+    unseeded = [row for row in rows if row.seed_count is None]
+    seeded: dict[tuple[str, str, str, int | None, str, str], list[ReportRow]] = {}
+    for row in rows:
+        if row.seed_count is None:
+            continue
+        key = (
+            row.architecture,
+            row.ttt_mode,
+            row.task_or_benchmark,
+            row.context_length,
+            row.metric,
+            row.unit,
+        )
+        seeded.setdefault(key, []).append(row)
+
+    aggregates: list[ReportRow] = []
+    for key, cell_rows in sorted(seeded.items()):
+        architecture, ttt_mode, task, context_length, metric, unit = key
+        seed_values = [int(row.seeds) for row in cell_rows if row.seeds is not None]
+        unique_seeds = sorted(set(seed_values))
+        issues: list[str] = []
+        if len(unique_seeds) != len(seed_values):
+            issues.append("duplicate seed")
+        if len(unique_seeds) != 3:
+            issues.append(f"expected 3 seeds, found {len(unique_seeds)}")
+        if any(row.sample_count != 100 for row in cell_rows):
+            issues.append("expected 100 samples per seed")
+        if any(not row.valid for row in cell_rows):
+            issues.append("one or more seed artifacts are invalid")
+        if any(not row.complete for row in cell_rows):
+            issues.append("one or more seed artifacts are incomplete")
+
+        checkpoints = {row.checkpoint for row in cell_rows}
+        revisions = {row.code_revision for row in cell_rows}
+        if len(checkpoints) != 1:
+            issues.append("checkpoint differs across seeds")
+        if len(revisions) != 1:
+            issues.append("code revision differs across seeds")
+
+        values_and_counts = [
+            (float(row.value), row.sample_count)
+            for row in cell_rows
+            if row.value is not None and row.sample_count is not None
+        ]
+        sample_count = (
+            sum(count for _, count in values_and_counts) if len(values_and_counts) == len(cell_rows) else None
+        )
+        value = (
+            sum(seed_value * count for seed_value, count in values_and_counts) / sample_count if sample_count else None
+        )
+        if value is None:
+            issues.append("one or more seed scores are unavailable")
+
+        valid = not any(
+            issue
+            for issue in issues
+            if issue
+            in {
+                "duplicate seed",
+                "one or more seed artifacts are invalid",
+                "checkpoint differs across seeds",
+                "code revision differs across seeds",
+                "one or more seed scores are unavailable",
+            }
+        )
+        complete = not issues
+        seed_summary = ",".join(str(seed) for seed in unique_seeds)
+        status = (
+            f"valid and complete; aggregated seeds {seed_summary} ({sample_count} samples)"
+            if complete
+            else "; ".join(issues)
+        )
+        artifacts = [row.artifact for row in sorted(cell_rows, key=lambda row: int(row.seeds or -1))]
+        aggregates.append(
+            ReportRow(
+                architecture=architecture,
+                ttt_mode=ttt_mode,
+                task_or_benchmark=task,
+                context_length=context_length,
+                metric=metric,
+                value=value,
+                unit=unit,
+                sample_count=sample_count,
+                token_count=None,
+                checkpoint=next(iter(checkpoints)) if len(checkpoints) == 1 else None,
+                code_revision=next(iter(revisions)) if len(revisions) == 1 else None,
+                valid=valid,
+                complete=complete,
+                status=status,
+                source="ruler",
+                artifact=artifacts[0],
+                seed_count=len(unique_seeds),
+                seeds=seed_summary,
+                artifacts=json.dumps(artifacts),
+            )
+        )
+    return unseeded + aggregates
 
 
 def collect_ruler(roots: list[Path]) -> list[ReportRow]:
@@ -238,7 +370,7 @@ def collect_ruler(roots: list[Path]) -> list[ReportRow]:
     for root in roots:
         for summary_path in sorted(root.rglob("summary.csv")):
             try:
-                mode, architecture, context_length = _ruler_location(root, summary_path)
+                mode, architecture, context_length, seed = _ruler_location(root, summary_path)
             except ValueError as error:
                 LOGGER.warning("%s", error)
                 continue
@@ -250,10 +382,11 @@ def collect_ruler(roots: list[Path]) -> list[ReportRow]:
                             architecture=architecture,
                             ttt_mode=mode,
                             context_length=context_length,
+                            seed=seed,
                             summary_row=summary_row,
                         )
                     )
-    return rows
+    return _aggregate_seeded_ruler(rows)
 
 
 def _lm_location(root: Path, summary_path: Path) -> tuple[str, str, str]:
@@ -491,6 +624,27 @@ def _style_axes(axis: Any) -> None:
     axis.spines[["top", "right"]].set_visible(False)
 
 
+def _architecture_label(architecture: str, mode: str) -> str:
+    labels = {
+        "local_raw": "Local attention · raw-size control",
+        "local_matched": "Local attention · matched floor",
+        "full_matched": "Full attention · matched control",
+        "mac_every4": "MAC · memory every 4 layers",
+        "mac_chunk64": "MAC · 64-token memory chunks",
+        "mac_no_persistent": "MAC · no persistent memory",
+    }
+    label = labels.get(architecture, architecture)
+    return label if architecture in {"local_raw", "local_matched", "full_matched"} else f"{label} · TTT {mode}"
+
+
+def _architecture_style(architecture: str, mode: str) -> tuple[str, str]:
+    if architecture in {"local_raw", "local_matched", "full_matched"}:
+        return "-.", "s"
+    if architecture.startswith("mac_"):
+        return "-" if mode == "on" else "--", "^"
+    return "-" if mode == "on" else "--" if mode == "off" else ":", "o"
+
+
 def plot_ruler(rows: list[ReportRow], output_dir: Path, task_overrides: dict[str, str], plt: Any) -> list[Path]:
     """Render S-NIAH accuracy-versus-context figures without imputing absent cells."""
     outputs: list[Path] = []
@@ -515,14 +669,15 @@ def plot_ruler(rows: list[ReportRow], output_dir: Path, task_overrides: dict[str
         color_map = {architecture: COLORS[index % len(COLORS)] for index, architecture in enumerate(architectures)}
         for (architecture, mode), series in sorted(grouped.items()):
             series = sorted(series, key=lambda row: row.context_length or -1)
+            linestyle, marker = _architecture_style(architecture, mode)
             axis.plot(
                 [row.context_length for row in series],
                 [row.value for row in series],
                 color=color_map[architecture],
-                linestyle="-" if mode == "on" else "--" if mode == "off" else ":",
-                marker="o",
+                linestyle=linestyle,
+                marker=marker,
                 linewidth=2,
-                label=f"{architecture} · TTT {mode}",
+                label=_architecture_label(architecture, mode),
             )
         if not grouped:
             axis.text(
@@ -532,21 +687,78 @@ def plot_ruler(rows: list[ReportRow], output_dir: Path, task_overrides: dict[str
         axis.set_xlabel("Context length (tokens)")
         axis.set_ylabel("Accuracy (%)")
         axis.set_ylim(0, 100)
-        if group == "n":
-            axis.text(
-                0.01,
-                0.01,
-                "essay@512 unavailable; no value imputed",
-                transform=axis.transAxes,
-                fontsize=9,
-                color="#9b5a00",
-            )
         if grouped:
             axis.legend(frameon=False, fontsize=8, ncol=2)
         _style_axes(axis)
         figure.tight_layout()
         outputs.extend(_save_figure(figure, output_dir, stem))
         plt.close(figure)
+    return outputs
+
+
+def plot_mac_recovery(rows: list[ReportRow], output_dir: Path, task_overrides: dict[str, str], plt: Any) -> list[Path]:
+    """Plot MAC bridge recovery between exact-cell matched local and full-attention controls."""
+    usable = [
+        row
+        for row in rows
+        if row.source == "ruler" and row.metric == "accuracy" and row.value is not None and row.valid and row.complete
+    ]
+    controls: dict[tuple[str, int | None, str], float] = {}
+    for row in usable:
+        if row.architecture in {"local_matched", "full_matched"}:
+            controls[(row.task_or_benchmark, row.context_length, row.architecture)] = float(row.value)
+
+    bridge_architectures = {"mac", "mac_every4", "mac_chunk64", "mac_no_persistent"}
+    bridge_rows = [row for row in usable if row.architecture in bridge_architectures]
+    if not bridge_rows:
+        return []
+
+    figure, axes = plt.subplots(1, 2, figsize=(11.2, 4.5))
+    groups = (("pk", "S-NIAH-PK / noise"), ("n", "S-NIAH-N / essay"))
+    plotted_any = False
+    for axis, (group, title) in zip(axes, groups):
+        series: dict[tuple[str, str], list[tuple[int, float]]] = {}
+        for row in bridge_rows:
+            if _task_group(row.task_or_benchmark, task_overrides) != group or row.context_length is None:
+                continue
+            floor = controls.get((row.task_or_benchmark, row.context_length, "local_matched"))
+            ceiling = controls.get((row.task_or_benchmark, row.context_length, "full_matched"))
+            if floor is None or ceiling is None or ceiling == floor:
+                continue
+            recovery = 100 * (float(row.value) - floor) / (ceiling - floor)
+            series.setdefault((row.architecture, row.ttt_mode), []).append((row.context_length, recovery))
+        architectures = sorted({architecture for architecture, _ in series})
+        color_map = {architecture: COLORS[index % len(COLORS)] for index, architecture in enumerate(architectures)}
+        for (architecture, mode), points in sorted(series.items()):
+            points.sort()
+            linestyle, marker = _architecture_style(architecture, mode)
+            axis.plot(
+                [context for context, _ in points],
+                [recovery for _, recovery in points],
+                color=color_map[architecture],
+                linestyle=linestyle,
+                marker=marker,
+                linewidth=2,
+                label=_architecture_label(architecture, mode),
+            )
+            plotted_any = True
+        axis.axhline(0, color="#777", linewidth=0.8)
+        axis.axhline(100, color="#777", linewidth=0.8)
+        axis.set_title(title, fontsize=10)
+        axis.set_xlabel("Context length (tokens)")
+        axis.set_ylabel("Recovery from matched floor (%)")
+        if series:
+            axis.legend(frameon=False, fontsize=7)
+        else:
+            axis.text(0.5, 0.5, "No exact matched-control cells", ha="center", va="center", transform=axis.transAxes)
+        _style_axes(axis)
+    if not plotted_any:
+        plt.close(figure)
+        return []
+    figure.suptitle("MAC bridge recovery", x=0.05, ha="left", fontweight="bold")
+    figure.tight_layout()
+    outputs = _save_figure(figure, output_dir, "titans_mac_bridge_recovery")
+    plt.close(figure)
     return outputs
 
 
@@ -643,7 +855,8 @@ def write_html(rows: list[ReportRow], output_dir: Path, figure_paths: list[Path]
             "<tr>"
             f"<td>{html.escape(row.source)}</td><td>{html.escape(row.architecture)}</td>"
             f"<td>{html.escape(row.ttt_mode)}</td><td>{html.escape(row.task_or_benchmark)}</td>"
-            f"<td>{context}</td><td>{html.escape(row.metric)}</td><td>{value}</td>"
+            f"<td>{context}</td><td>{html.escape(row.seeds or '—')}</td>"
+            f"<td>{html.escape(row.metric)}</td><td>{value}</td>"
             f'<td><span class="pill {state}">{html.escape(row.status)}</span></td>'
             "</tr>"
         )
@@ -687,12 +900,13 @@ Missing cells remain unavailable; this report performs no interpolation or imput
 <div class="figures">{generated_figures}</div></section>
 <section><p class="kicker">Provenance and integrity</p><h2>All aggregated observations</h2>
 <div class="card"><table><thead><tr><th>source</th><th>architecture</th><th>TTT</th><th>task / benchmark</th>
-<th>context</th><th>metric</th><th>value</th><th>validity / completeness</th></tr></thead>
+<th>context</th><th>seeds</th><th>metric</th><th>value</th><th>validity / completeness</th></tr></thead>
 <tbody>{"".join(table_rows)}</tbody></table></div>
 <p class="note">Checkpoint and code-revision provenance is preserved in the accompanying tidy JSON and CSV.
-Null provenance fields mean the source evaluator did not record that value. “Complete” means all samples declared
-by a RULER merged manifest, or all source indices and partials in an LM merge, are present; it does not claim that
-an LM subset is the entire upstream benchmark.</p></section>
+Seeded RULER records also retain every source artifact path. Null provenance fields mean the source evaluator did
+not record that value. “Complete” means three valid 100-sample RULER seeds, all samples declared by a legacy RULER
+merged manifest, or all source indices and partials in an LM merge, are present; it does not claim that an LM subset
+is the entire upstream benchmark.</p></section>
 </body></html>
 """
     path = output_dir / "titans_eval_report.html"
@@ -742,6 +956,7 @@ def main() -> None:
     plt = _matplotlib()
     if plt is not None:
         figure_paths.extend(plot_ruler(rows, args.output_dir, _task_overrides(args.task_group), plt))
+        figure_paths.extend(plot_mac_recovery(rows, args.output_dir, _task_overrides(args.task_group), plt))
         figure_paths.extend(plot_lm(rows, args.output_dir, plt))
     html_path = write_html(rows, args.output_dir, figure_paths)
     LOGGER.info("Wrote %s, %s, and %s (%d records)", csv_path, json_path, html_path, len(rows))
