@@ -22,7 +22,6 @@ from nemo_automodel.components.distributed.config import FSDP2Config, MoEParalle
 from nemo_automodel.components.distributed.init_utils import get_world_size_safe
 from nemo_automodel.components.distributed.mesh import MeshContext
 from nemo_automodel.components.distributed.model_parallelizer import (
-    ParallelizeContext,
     compile_parallelized_model,
     parallelize_model,
 )
@@ -94,7 +93,7 @@ class FSDP2Manager:
         device_mesh (DeviceMesh): Device mesh for distributed operations.
         moe_mesh (Optional[DeviceMesh]): Optional device mesh for expert parallelism.
         moe_config: Optional expert-parallel policy included in the model's
-            :class:`ParallelizeContext`.
+            :class:`MeshContext`.
 
     """
 
@@ -137,26 +136,28 @@ class FSDP2Manager:
         Returns:
             The parallelized model.
         """
-        context = ParallelizeContext(
-            mesh=MeshContext.from_meshes(self.device_mesh, self.moe_mesh),
-            strategy=self.config,
-            moe=self.moe_config,
+        mesh_context = MeshContext.from_meshes(
+            self.device_mesh,
+            self.moe_mesh,
+            strategy_config=self.config,
+            moe_parallel_config=self.moe_config,
             activation_checkpointing=self.activation_checkpointing,
             reapply_trainability=reapply_trainability,
         )
         model = parallelize_model(
             model,
-            context,
+            mesh_context,
         )
 
         return model
 
     def maybe_compile(self, model):
         """Apply per-layer compile after sharding, alongside whole-model compile_model()."""
-        context = ParallelizeContext(
-            mesh=MeshContext.from_meshes(self.device_mesh, self.moe_mesh),
-            strategy=self.config,
-            moe=self.moe_config,
+        mesh_context = MeshContext.from_meshes(
+            self.device_mesh,
+            self.moe_mesh,
+            strategy_config=self.config,
+            moe_parallel_config=self.moe_config,
             activation_checkpointing=self.activation_checkpointing,
         )
-        compile_parallelized_model(model, context)
+        compile_parallelized_model(model, mesh_context)

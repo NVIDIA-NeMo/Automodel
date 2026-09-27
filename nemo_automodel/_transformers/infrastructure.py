@@ -58,7 +58,6 @@ from nemo_automodel.components.distributed.megatron_fsdp import (
 )
 from nemo_automodel.components.distributed.mesh import MeshContext
 from nemo_automodel.components.distributed.model_parallelizer import (
-    ParallelizeContext,
     compile_parallelized_model,
     parallelize_model,
 )
@@ -221,7 +220,7 @@ def _shard_ep_fsdp(model, model_wrapper, parallelize_fn, mesh: MeshContext, reap
             reapply_trainability=reapply_trainability,
             **mesh.parallelize_axis_kwargs(),
         )
-    elif isinstance(model_wrapper, ParallelizeContext):
+    elif isinstance(model_wrapper, MeshContext):
         model = parallelize_model(model, replace(model_wrapper, reapply_trainability=reapply_trainability))
     elif callable(getattr(model_wrapper, "parallelize", None)):
         model = model_wrapper.parallelize(model, reapply_trainability=reapply_trainability)
@@ -232,19 +231,19 @@ def _shard_ep_fsdp(model, model_wrapper, parallelize_fn, mesh: MeshContext, reap
 
 
 #  Infrastructure instantiation (config -> runtime objects)
-def _create_parallelize_context(
+def _with_parallelization_policy(
     config: DistributedStrategyConfig | None,
     mesh: MeshContext,
     moe_config: MoEParallelizerConfig | None = None,
-) -> ParallelizeContext | None:
-    """Create the model-owned parallelization context from typed configuration.
+) -> MeshContext | None:
+    """Return the mesh context with its resolved execution policy attached.
 
     Args:
         config: Distributed config (FSDP2Config, MegatronFSDPConfig, or DDPConfig).
         mesh: MeshContext holding device_mesh and moe_mesh references.
 
     Returns:
-        The parallelization context, or None when no strategy or expert
+        The resolved mesh context, or None when no strategy or expert
         parallelism is configured.
 
     Raises:
@@ -262,10 +261,10 @@ def _create_parallelize_context(
     elif config is not None and not isinstance(config, DDPConfig):
         raise ValueError(f"Unknown distributed config type: {type(config)}")
 
-    return ParallelizeContext(
-        mesh=mesh,
-        strategy=config,
-        moe=moe_config,
+    return replace(
+        mesh,
+        strategy_config=config,
+        moe_parallel_config=moe_config,
         activation_checkpointing=getattr(config, "activation_checkpointing", False),
     )
 
@@ -333,7 +332,7 @@ def _instantiate_qat(
 def parallelize_for_pp(
     model: torch.nn.Module,
     *,
-    context: ParallelizeContext | None = None,
+    mesh_context: MeshContext | None = None,
     reapply_trainability: Callable[[torch.nn.Module], None] | None = None,
     **kwargs,
 ) -> torch.nn.Module:
@@ -343,7 +342,7 @@ def parallelize_for_pp(
 
     Args:
         model: The model to parallelize.
-        context: Runtime topology and distributed strategy.
+        mesh_context: Runtime topology and distributed strategy.
         reapply_trainability: Callback that re-resolves the trainability policy
             after pipeline-stage surgery and immediately before wrapping.
         **kwargs: Additional arguments (world_mesh, moe_mesh, axis names) passed by
@@ -352,9 +351,9 @@ def parallelize_for_pp(
     Returns:
         The parallelized model.
     """
-    if context is None:
+    if mesh_context is None:
         return model
-    return parallelize_model(model, replace(context, reapply_trainability=reapply_trainability))
+    return parallelize_model(model, replace(mesh_context, reapply_trainability=reapply_trainability))
 
 
 def instantiate_infrastructure(
@@ -385,8 +384,8 @@ def instantiate_infrastructure(
         mesh: MeshContext holding device meshes, sizes, and axis names.
 
     Returns:
-        tuple: (parallelize_context, autopipeline, parallelize_fn, qat_quantizer)
-            - parallelize_context: Model parallelization context (or None)
+        tuple: (mesh_context, autopipeline, parallelize_fn, qat_quantizer)
+            - mesh_context: Resolved model parallelization context (or None)
             - autopipeline: AutoPipeline instance (or None)
             - parallelize_fn: Parallelization function (or None), built for EP
                 or PP through the model parallelizer when available.
@@ -402,16 +401,16 @@ def instantiate_infrastructure(
     if mesh.ep_size > 1 and moe_parallel_config is None:
         moe_parallel_config = MoEParallelizerConfig()
 
-    parallelize_context = _create_parallelize_context(distributed_config, mesh, moe_parallel_config)
+    resolved_mesh_context = _with_parallelization_policy(distributed_config, mesh, moe_parallel_config)
     autopipeline = _instantiate_pipeline(pipeline_config, mesh, device, distributed_config)
 
     parallelize_fn = None
-    if parallelize_context is not None and (mesh.ep_size > 1 or autopipeline is not None):
-        parallelize_fn = partial(parallelize_for_pp, context=parallelize_context)
+    if resolved_mesh_context is not None and (mesh.ep_size > 1 or autopipeline is not None):
+        parallelize_fn = partial(parallelize_for_pp, mesh_context=resolved_mesh_context)
 
     qat_quantizer = _instantiate_qat(qat_config)
 
-    return parallelize_context, autopipeline, parallelize_fn, qat_quantizer
+    return resolved_mesh_context, autopipeline, parallelize_fn, qat_quantizer
 
 
 def _uses_te_attention(model) -> bool:
@@ -478,8 +477,8 @@ def _apply_trainability_policy(
 
 def _get_strategy_config(model_wrapper) -> DistributedStrategyConfig | None:
     """Return the typed strategy from a context or legacy compatibility wrapper."""
-    if isinstance(model_wrapper, ParallelizeContext):
-        return model_wrapper.strategy
+    if isinstance(model_wrapper, MeshContext):
+        return model_wrapper.strategy_config
     return getattr(model_wrapper, "config", None)
 
 
@@ -521,7 +520,7 @@ def apply_model_infrastructure(
         model: The model to apply infrastructure to
         is_meta_device: Whether model was initialized on meta device
         device: Target device for model
-        model_wrapper: ParallelizeContext or deprecated manager compatibility wrapper. Default: None
+        model_wrapper: MeshContext or deprecated manager compatibility wrapper. Default: None
         mesh: MeshContext with parallelism sizes (tp_size, cp_size, etc.) and mesh
             references. Default: None (treated as single-GPU defaults).
         peft_config: PEFT/LoRA configuration dict. Default: None
@@ -567,9 +566,7 @@ def apply_model_infrastructure(
         0,
         0,
         0,
-        model_wrapper.mesh.moe_mesh
-        if isinstance(model_wrapper, ParallelizeContext)
-        else getattr(model_wrapper, "moe_mesh", None),
+        model_wrapper.moe_mesh if isinstance(model_wrapper, MeshContext) else getattr(model_wrapper, "moe_mesh", None),
         process_group=getattr(mesh, "process_group", None),
     )
 
@@ -682,7 +679,7 @@ def apply_model_infrastructure(
         _ensure_tied_lm_heads(model)
         if compile_config is not None and not isinstance(strategy_config, FSDP2Config):
             model = compile_model(model, compile_config)
-        if isinstance(strategy_config, FSDP2Config) and isinstance(model_wrapper, ParallelizeContext):
+        if isinstance(strategy_config, FSDP2Config) and isinstance(model_wrapper, MeshContext):
             model_parts = model.parts if hasattr(model, "parts") else [model]
             for mp in model_parts:
                 compile_parallelized_model(mp, model_wrapper)
@@ -713,7 +710,7 @@ def apply_model_infrastructure(
             [
                 get_world_size_safe() == 1,
                 parallelize_fn is not None and get_world_size_safe() > 1,
-                isinstance(model_wrapper, ParallelizeContext) or callable(getattr(model_wrapper, "parallelize", None)),
+                isinstance(model_wrapper, MeshContext) or callable(getattr(model_wrapper, "parallelize", None)),
             ]
         )
     )

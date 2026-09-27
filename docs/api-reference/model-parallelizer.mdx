@@ -4,7 +4,7 @@ description: "Implement model-owned parallelization policy without duplicating N
 ---
 
 The model parallelizer is a lightweight, model-owned sidecar. It has one public
-operation: `parallelize(model, context)`. Shared distributed infrastructure
+operation: `parallelize(model, mesh_context)`. Shared distributed infrastructure
 selects and sequences DDP, FSDP2, TP, CP, EP, and MoE behavior from the resolved
 context; the model only supplies architecture-specific customization.
 
@@ -16,9 +16,9 @@ attribute, NeMo AutoModel uses `ModelParallelizer()`.
 | Symbol | Responsibility |
 |---|---|
 | `ModelParallelizer` | The sole model-facing parallelization contract and the shared default implementation. Import it from `nemo_automodel.components.distributed`. |
-| `ParallelizeContext` | Runtime input containing the resolved `MeshContext`, distributed strategy configuration, optional MoE configuration, activation-checkpointing mode, and trainability callback. Loaders construct this context; model sidecars consume it through shared dispatch. |
+| `MeshContext` | The sole runtime input, containing resolved meshes and axis names together with strategy, MoE, activation-checkpointing, and trainability policy. |
 
-`ModelParallelizer.parallelize(model, context)` dispatches by the resolved
+`ModelParallelizer.parallelize(model, mesh_context)` dispatches by the resolved
 runtime configuration inside shared infrastructure:
 
 | Condition | Execution path |
@@ -30,7 +30,7 @@ runtime configuration inside shared infrastructure:
 
 Model code never branches among `parallelize_fsdp2`, `parallelize_moe`, or
 similar operations. It always calls or supplies the same `parallelize(model,
-context)` contract. A sidecar does not parse distributed configuration, build
+mesh_context)` contract. A sidecar does not parse distributed configuration, build
 meshes, or reproduce TP/CP/EP sequencing.
 
 ### Diffusion pipeline boundary
@@ -38,19 +38,25 @@ meshes, or reproduce TP/CP/EP sequencing.
 `NeMoAutoDiffusionPipeline` follows the same topology-ownership rule. The
 caller supplies one resolved `MeshContext`; the loader returns the pipeline
 itself after replacing every selected component with its parallelized module.
-Internal `ParallelizeContext` objects are not part of the return value.
 
 ```python
 pipe = NeMoAutoDiffusionPipeline.from_pretrained(
     model_id,
     mesh_context=mesh_context,
-    parallel_scheme={"transformer": transformer_policy},
+    components_to_load=["transformer"],
 )
 ```
 
-When `parallel_scheme` is omitted, `mesh_context` may also be omitted. When a
-scheme is supplied, `mesh_context` is required and is the single source of
-truth for TP, CP, EP, and data-parallel topology.
+When `mesh_context` is omitted, the pipeline is loaded without distributed
+parallelization. There is no second per-component policy map: the selected
+components all consume the same resolved context.
+
+### Architecture guardrail
+
+`python tools/lint_model_parallelizer_contract.py` runs in the main lint CI job.
+It rejects a second `ParallelizeContext` or `parallel_scheme` API, runtime imports
+from distributed infrastructure back into model/adapter implementations, and
+model sidecars that import distributed symbols not declared in `__all__`.
 
 ## Add a Model Sidecar
 

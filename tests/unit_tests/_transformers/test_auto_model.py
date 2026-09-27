@@ -140,7 +140,7 @@ class TestResolveMeshContext:
 
         assert context is not None
         assert parallelize_fn is not None
-        assert context.strategy.multimodal.frozen_sharding == "replicate"
+        assert context.strategy_config.multimodal.frozen_sharding == "replicate"
 
 
 class TestFromPretrainedDeviceMesh:
@@ -1703,12 +1703,9 @@ class TestBuildModelRetryDepth:
         """HF meta init errors should retry even when Automodel did not pick meta init."""
         build_kwargs, mock_config = self._make_build_kwargs()
         sentinel_model = MagicMock()
-        from nemo_automodel.components.distributed import MegatronFSDPConfig, MeshContext, ParallelizeContext
+        from nemo_automodel.components.distributed import MegatronFSDPConfig, MeshContext
 
-        build_kwargs["model_wrapper"] = ParallelizeContext(
-            mesh=MeshContext(),
-            strategy=MegatronFSDPConfig(),
-        )
+        build_kwargs["model_wrapper"] = MeshContext(strategy_config=MegatronFSDPConfig())
         with (
             patch("nemo_automodel._transformers.auto_model._apply_preload_overrides", return_value=("eager", False)),
             patch("nemo_automodel._transformers.auto_model._init_model") as mock_init,
@@ -1741,9 +1738,9 @@ class TestBuildModelRetryDepth:
         """
         build_kwargs, mock_config = self._make_build_kwargs()
         build_kwargs["is_hf_model"] = False
-        from nemo_automodel.components.distributed import DDPConfig, MeshContext, ParallelizeContext
+        from nemo_automodel.components.distributed import DDPConfig, MeshContext
 
-        build_kwargs["model_wrapper"] = ParallelizeContext(mesh=MeshContext(), strategy=DDPConfig())
+        build_kwargs["model_wrapper"] = MeshContext(strategy_config=DDPConfig())
         sentinel_model = MagicMock()
         captured = {}
 

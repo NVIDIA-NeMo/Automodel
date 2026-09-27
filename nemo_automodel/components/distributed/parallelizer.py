@@ -84,7 +84,7 @@ from nemo_automodel.shared.import_utils import UnavailableMeta, safe_import_from
 from nemo_automodel.shared.tied_weights import ensure_tied_lm_head
 
 if TYPE_CHECKING:
-    from nemo_automodel.components.distributed.model_parallelizer import ParallelizeContext
+    from nemo_automodel.components.distributed.mesh import MeshContext
 
 __all__ = [
     "ModelParallelizer",
@@ -257,13 +257,13 @@ class ModelParallelizer:
     def parallelize(
         self,
         model: nn.Module,
-        context: "ParallelizeContext",
+        mesh_context: "MeshContext",
         /,
     ) -> nn.Module:
         """Apply every requested parallelism and return the parallelized model."""
         from nemo_automodel.components.distributed.model_parallelizer import _apply_model_parallelizer
 
-        return _apply_model_parallelizer(self, model, context)
+        return _apply_model_parallelizer(self, model, mesh_context)
 
     def _fully_shard_module(self, module: nn.Module, **kwargs) -> nn.Module:
         """Apply the FSDP2 primitive used by this model sidecar."""
@@ -1578,7 +1578,7 @@ def fsdp2_strategy_parallelize(
     """
     from nemo_automodel.components.distributed.config import FSDP2Config, MultimodalDistributedConfig
     from nemo_automodel.components.distributed.mesh import MeshContext
-    from nemo_automodel.components.distributed.model_parallelizer import ParallelizeContext, parallelize_model
+    from nemo_automodel.components.distributed.model_parallelizer import parallelize_model
 
     if (dp_replicate_mesh_name, dp_shard_cp_mesh_name, tp_mesh_name) != (
         "dp_replicate",
@@ -1605,13 +1605,13 @@ def fsdp2_strategy_parallelize(
         activation_checkpointing_scope=activation_checkpointing_scope,
         multimodal=MultimodalDistributedConfig(frozen_sharding=frozen_multimodal_sharding),
     )
-    context = ParallelizeContext(
-        mesh=MeshContext.from_meshes(device_mesh),
-        strategy=config,
+    mesh_context = MeshContext.from_meshes(
+        device_mesh,
+        strategy_config=config,
         activation_checkpointing=activation_checkpointing,
         reapply_trainability=reapply_trainability,
     )
-    return parallelize_model(model, context)
+    return parallelize_model(model, mesh_context)
 
 
 def _megatron_fsdp_compat_kwargs(

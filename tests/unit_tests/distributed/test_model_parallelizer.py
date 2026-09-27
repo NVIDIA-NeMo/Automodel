@@ -26,7 +26,6 @@ from nemo_automodel.components.distributed import (
     MegatronFSDPConfig,
     MeshContext,
     ModelParallelizer,
-    ParallelizeContext,
 )
 from nemo_automodel.components.distributed.model_parallelizer import (
     _parallelize_moe,
@@ -45,20 +44,21 @@ class _Sidecar:
         return model
 
 
-def _context() -> ParallelizeContext:
-    return ParallelizeContext(mesh=MeshContext(), strategy=FSDP2Config())
+def _context() -> MeshContext:
+    return MeshContext(strategy_config=FSDP2Config())
 
 
 def test_contract_is_runtime_lightweight():
     assert hasattr(ModelParallelizer, "parallelize")
     assert not hasattr(ModelParallelizer(), "strategy")
-    assert ParallelizeContext.__dataclass_fields__.keys() == {
-        "mesh",
-        "strategy",
-        "moe",
+    assert {
+        "device_mesh",
+        "moe_mesh",
+        "strategy_config",
+        "moe_parallel_config",
         "activation_checkpointing",
         "reapply_trainability",
-    }
+    } <= MeshContext.__dataclass_fields__.keys()
 
 
 def test_model_class_supplies_sidecar():
@@ -125,7 +125,7 @@ def test_fsdp2_dispatch_receives_model_parallelizer(monkeypatch):
 def test_specialized_sidecar_routes_ep_through_unified_moe_executor(monkeypatch):
     parallelizer = ModelParallelizer()
     model = nn.Linear(2, 2)
-    context = ParallelizeContext(mesh=SimpleNamespace(ep_size=2), strategy=FSDP2Config())
+    context = SimpleNamespace(ep_size=2, strategy_config=FSDP2Config())
     call = Mock(return_value=model)
     monkeypatch.setattr("nemo_automodel.components.distributed.model_parallelizer._parallelize_moe", call)
 
@@ -136,13 +136,16 @@ def test_specialized_sidecar_routes_ep_through_unified_moe_executor(monkeypatch)
 def test_moe_executor_uses_generic_sharding_by_default(monkeypatch):
     parallelizer = ModelParallelizer()
     model = nn.Linear(2, 2)
-    mesh = SimpleNamespace(
+    context = SimpleNamespace(
         ep_size=2,
         device_mesh=object(),
         moe_mesh=object(),
+        strategy_config=FSDP2Config(),
+        moe_parallel_config=None,
+        activation_checkpointing=False,
+        reapply_trainability=None,
         parallelize_axis_kwargs=lambda: {},
     )
-    context = ParallelizeContext(mesh=mesh, strategy=FSDP2Config())
     executor = Mock()
     monkeypatch.setattr("nemo_automodel.components.moe.parallelizer.parallelize_model", executor)
 
@@ -156,13 +159,16 @@ def test_moe_executor_receives_opted_in_model_parallelizer(monkeypatch):
 
     parallelizer = MoEModelParallelizer()
     model = nn.Linear(2, 2)
-    mesh = SimpleNamespace(
+    context = SimpleNamespace(
         ep_size=2,
         device_mesh=object(),
         moe_mesh=object(),
+        strategy_config=FSDP2Config(),
+        moe_parallel_config=None,
+        activation_checkpointing=False,
+        reapply_trainability=None,
         parallelize_axis_kwargs=lambda: {},
     )
-    context = ParallelizeContext(mesh=mesh, strategy=FSDP2Config())
     executor = Mock()
     monkeypatch.setattr("nemo_automodel.components.moe.parallelizer.parallelize_model", executor)
 
@@ -179,7 +185,7 @@ def test_moe_executor_receives_opted_in_model_parallelizer(monkeypatch):
 )
 def test_model_parallelizer_dispatches_non_fsdp2_strategies(monkeypatch, strategy, executor_name):
     model = nn.Linear(2, 2)
-    context = ParallelizeContext(mesh=MeshContext(), strategy=strategy)
+    context = MeshContext(strategy_config=strategy)
     executor = Mock(return_value=model)
     monkeypatch.setattr(f"nemo_automodel.components.distributed.model_parallelizer.{executor_name}", executor)
 

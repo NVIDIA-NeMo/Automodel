@@ -416,7 +416,7 @@ torchrun --nproc-per-node=8 \
   examples/diffusion/generate/generate.py \
   -c examples/diffusion/generate/configs/generate_wan.yaml \
   --distributed.backend nccl \
-  --distributed.parallel_scheme.transformer.tp_size 8
+  --distributed.parallelism.tp_size 8
 ```
 
 **With a fine-tuned checkpoint:**

@@ -55,9 +55,10 @@ class TestMeshContextDefaults:
 
     def test_default_config_fields(self):
         ctx = MeshContext()
-        assert not hasattr(ctx, "strategy_config")
+        assert ctx.strategy_config is None
         assert not hasattr(ctx, "pipeline_config")
-        assert not hasattr(ctx, "moe_config")
+        assert ctx.moe_parallel_config is None
+        assert ctx.activation_checkpointing is False
         assert ctx.device_mesh is None
         assert ctx.moe_mesh is None
 

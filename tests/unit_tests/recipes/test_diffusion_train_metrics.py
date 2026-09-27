@@ -15,18 +15,19 @@
 import logging
 import sys
 from types import SimpleNamespace
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 import torch
 import torch.nn as nn
 
 from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config
 from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.diffusion import train as diffusion_train
 from nemo_automodel.recipes.diffusion.train import (
     TrainDiffusionRecipe,
-    _build_diffusion_parallelization_args,
+    _build_diffusion_mesh_context,
     _calculate_throughput_metrics,
     _count_local_batch_group_samples,
     _get_diffusion_microbatch_size,
@@ -419,107 +420,103 @@ class _TinyTransformer(nn.Module):
         self.attention_backend = attention_backend
 
 
-def test_build_diffusion_parallelization_args_uses_shared_fsdp_defaults():
-    parallelization_args = _build_diffusion_parallelization_args(
-        fsdp_cfg=None,
-        ddp_cfg=None,
-        world_size=8,
-        dtype=torch.float16,
-        lora_enabled=False,
-    )
+def test_build_diffusion_mesh_context_uses_shared_fsdp_defaults():
+    mesh_context = object()
+    with patch.object(diffusion_train.MeshContext, "build", return_value=mesh_context) as build_mesh:
+        result = _build_diffusion_mesh_context(
+            fsdp_cfg=None,
+            ddp_cfg=None,
+            world_size=8,
+            dtype=torch.float16,
+            lora_enabled=False,
+        )
 
-    assert parallelization_args["_manager_type"] == "fsdp2"
-    assert parallelization_args["world_size"] == 8
-    assert parallelization_args["dp_size"] is None
-    assert parallelization_args["tp_size"] == 1
-    assert parallelization_args["pp_size"] == 1
-    assert parallelization_args["cp_size"] == 1
-    assert parallelization_args["ep_size"] == 1
-    assert parallelization_args["activation_checkpointing"] is True
-    assert parallelization_args["defer_fsdp_grad_sync"] is True
-    assert parallelization_args["enable_fsdp2_prefetch"] is True
-    assert parallelization_args["use_hf_tp_plan"] is False
-    assert parallelization_args["mp_policy"].param_dtype == torch.float16
-    assert parallelization_args["mp_policy"].reduce_dtype == torch.float32
-    assert parallelization_args["mp_policy"].output_dtype == torch.float16
-
-
-def test_build_diffusion_parallelization_args_keeps_lora_param_dtype_uncast():
-    parallelization_args = _build_diffusion_parallelization_args(
-        fsdp_cfg={},
-        ddp_cfg=None,
-        world_size=1,
-        dtype=torch.bfloat16,
-        lora_enabled=True,
-    )
-
-    assert parallelization_args["mp_policy"].param_dtype is None
-    assert parallelization_args["mp_policy"].output_dtype == torch.bfloat16
+    assert result is mesh_context
+    kwargs = build_mesh.call_args.kwargs
+    assert kwargs["world_size"] == 8
+    assert kwargs["parallelism_sizes"].dp_size is None
+    assert kwargs["parallelism_sizes"].tp_size == 1
+    assert kwargs["parallelism_sizes"].pp_size == 1
+    assert kwargs["parallelism_sizes"].cp_size == 1
+    assert kwargs["parallelism_sizes"].ep_size == 1
+    assert kwargs["activation_checkpointing"] is True
+    strategy_config = kwargs["strategy_config"]
+    assert isinstance(strategy_config, FSDP2Config)
+    assert strategy_config.defer_fsdp_grad_sync is True
+    assert strategy_config.enable_fsdp2_prefetch is True
+    assert strategy_config.mp_policy.param_dtype == torch.float16
+    assert strategy_config.mp_policy.reduce_dtype == torch.float32
+    assert strategy_config.mp_policy.output_dtype == torch.float16
 
 
-def test_build_diffusion_parallelization_args_parses_ddp_config():
-    parallelization_args = _build_diffusion_parallelization_args(
-        fsdp_cfg=None,
-        ddp_cfg={"activation_checkpointing": True},
-        world_size=4,
-        dtype=torch.bfloat16,
-        lora_enabled=False,
-    )
+def test_build_diffusion_mesh_context_keeps_lora_param_dtype_uncast():
+    with patch.object(diffusion_train.MeshContext, "build") as build_mesh:
+        _build_diffusion_mesh_context(
+            fsdp_cfg={},
+            ddp_cfg=None,
+            world_size=1,
+            dtype=torch.bfloat16,
+            lora_enabled=True,
+        )
 
-    assert parallelization_args == {
-        "_manager_type": "ddp",
-        "world_size": 4,
-        "activation_checkpointing": True,
-        "activation_checkpointing_scope": ("all",),
-        "broadcast_buffers": False,
-        "find_unused_parameters": False,
-        "static_graph": False,
-        "bucket_cap_mb": None,
-        "gradient_as_bucket_view": False,
-        "autocast_dtype": None,
-    }
+    policy = build_mesh.call_args.kwargs["strategy_config"].mp_policy
+    assert policy.param_dtype is None
+    assert policy.output_dtype == torch.bfloat16
 
 
-def test_build_diffusion_parallelization_args_accepts_confignode_fsdp_config():
-    parallelization_args = _build_diffusion_parallelization_args(
-        fsdp_cfg=ConfigNode({"dp_size": 8, "cpu_offload": False}),
-        ddp_cfg=None,
-        world_size=8,
-        dtype=torch.bfloat16,
-        lora_enabled=False,
-    )
+def test_build_diffusion_mesh_context_parses_ddp_config():
+    with patch.object(diffusion_train.MeshContext, "build") as build_mesh:
+        _build_diffusion_mesh_context(
+            fsdp_cfg=None,
+            ddp_cfg={"activation_checkpointing": True},
+            world_size=4,
+            dtype=torch.bfloat16,
+            lora_enabled=False,
+        )
 
-    assert parallelization_args["_manager_type"] == "fsdp2"
-    assert parallelization_args["dp_size"] == 8
+    kwargs = build_mesh.call_args.kwargs
+    strategy_config = kwargs["strategy_config"]
+    assert isinstance(strategy_config, DDPConfig)
+    assert kwargs["world_size"] == 4
+    assert kwargs["activation_checkpointing"] is True
+    assert strategy_config.activation_checkpointing_scope == ("all",)
+    assert strategy_config.find_unused_parameters is False
+    assert strategy_config.static_graph is False
 
 
-def test_build_diffusion_parallelization_args_accepts_confignode_ddp_config():
-    parallelization_args = _build_diffusion_parallelization_args(
-        fsdp_cfg=None,
-        ddp_cfg=ConfigNode({"backend": "nccl", "activation_checkpointing": False}),
-        world_size=4,
-        dtype=torch.bfloat16,
-        lora_enabled=False,
-    )
+def test_build_diffusion_mesh_context_accepts_confignode_fsdp_config():
+    with patch.object(diffusion_train.MeshContext, "build") as build_mesh:
+        _build_diffusion_mesh_context(
+            fsdp_cfg=ConfigNode({"dp_size": 8, "cpu_offload": False}),
+            ddp_cfg=None,
+            world_size=8,
+            dtype=torch.bfloat16,
+            lora_enabled=False,
+        )
 
-    assert parallelization_args == {
-        "_manager_type": "ddp",
-        "world_size": 4,
-        "activation_checkpointing": False,
-        "activation_checkpointing_scope": ("all",),
-        "broadcast_buffers": False,
-        "find_unused_parameters": False,
-        "static_graph": False,
-        "bucket_cap_mb": None,
-        "gradient_as_bucket_view": False,
-        "autocast_dtype": None,
-    }
+    assert build_mesh.call_args.kwargs["parallelism_sizes"].dp_size == 8
+
+
+def test_build_diffusion_mesh_context_accepts_confignode_ddp_config():
+    with patch.object(diffusion_train.MeshContext, "build") as build_mesh:
+        _build_diffusion_mesh_context(
+            fsdp_cfg=None,
+            ddp_cfg=ConfigNode({"backend": "nccl", "activation_checkpointing": False}),
+            world_size=4,
+            dtype=torch.bfloat16,
+            lora_enabled=False,
+        )
+
+    kwargs = build_mesh.call_args.kwargs
+    assert isinstance(kwargs["strategy_config"], DDPConfig)
+    assert kwargs["activation_checkpointing"] is False
 
 
 def test_build_diffusion_pipeline_forwards_perf_options(monkeypatch):
     pipe = SimpleNamespace(transformer=_TinyTransformer())
     mesh_context = SimpleNamespace(device_mesh="mesh")
     calls = {}
+    build_mesh = MagicMock(return_value=mesh_context)
 
     def fake_from_pretrained(model_id, **kwargs):
         calls["model_id"] = model_id
@@ -531,7 +528,7 @@ def test_build_diffusion_pipeline_forwards_perf_options(monkeypatch):
         "from_pretrained",
         staticmethod(fake_from_pretrained),
     )
-    monkeypatch.setattr(diffusion_train, "_create_mesh_context", lambda _args: mesh_context)
+    monkeypatch.setattr(diffusion_train.MeshContext, "build", build_mesh)
     monkeypatch.setattr(diffusion_train.torch.cuda, "is_available", lambda: False)
 
     built_pipe, device_mesh = build_diffusion_pipeline(
@@ -559,17 +556,17 @@ def test_build_diffusion_pipeline_forwards_perf_options(monkeypatch):
         compact_fused_qkv_projections=True,
     )
 
-    parallelization_args = calls["parallel_scheme"]["transformer"]
-    assert parallelization_args["sequence_parallel"] is True
-    assert parallelization_args["tp_plan"] == {"layers.0": "colwise"}
-    assert parallelization_args["patch_is_packed_sequence"] is True
-    assert parallelization_args["defer_fsdp_grad_sync"] is False
-    assert parallelization_args["enable_async_tensor_parallel"] is True
-    assert parallelization_args["enable_compile"] is True
-    assert parallelization_args["enable_fsdp2_prefetch"] is False
-    assert parallelization_args["fsdp2_backward_prefetch_depth"] == 4
-    assert parallelization_args["fsdp2_forward_prefetch_depth"] == 3
-    assert parallelization_args["mp_policy"].reduce_dtype is torch.bfloat16
+    strategy_config = build_mesh.call_args.kwargs["strategy_config"]
+    assert strategy_config.sequence_parallel is True
+    assert strategy_config.tp_plan == {"layers.0": "colwise"}
+    assert strategy_config.patch_is_packed_sequence is True
+    assert strategy_config.defer_fsdp_grad_sync is False
+    assert strategy_config.enable_async_tensor_parallel is True
+    assert strategy_config.enable_compile is True
+    assert strategy_config.enable_fsdp2_prefetch is False
+    assert strategy_config.fsdp2_backward_prefetch_depth == 4
+    assert strategy_config.fsdp2_forward_prefetch_depth == 3
+    assert strategy_config.mp_policy.reduce_dtype is torch.bfloat16
     assert calls["transformer_engine_linear"] is True
     assert calls["transformer_engine_fp8_safe_only"] is True
     assert calls["fuse_qkv_projections"] is True
@@ -591,7 +588,7 @@ def test_build_diffusion_pipeline_raises_when_lora_params_missing(monkeypatch):
         "from_pretrained",
         staticmethod(lambda *_args, **_kwargs: pipe),
     )
-    monkeypatch.setattr(diffusion_train, "_create_mesh_context", lambda _args: mesh_context)
+    monkeypatch.setattr(diffusion_train.MeshContext, "build", MagicMock(return_value=mesh_context))
     monkeypatch.setattr(diffusion_train.torch.cuda, "is_available", lambda: False)
 
     with pytest.raises(RuntimeError, match="no LoRA params found"):

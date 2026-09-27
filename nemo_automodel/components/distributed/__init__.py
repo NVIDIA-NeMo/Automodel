@@ -24,7 +24,6 @@ from nemo_automodel.components.distributed.init_utils import DistInfo, initializ
 from nemo_automodel.components.distributed.mesh import MeshContext, ParallelismSizes
 from nemo_automodel.components.distributed.model_parallelizer import (
     ModelParallelizer,
-    ParallelizeContext,
 )
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
 
@@ -39,7 +38,6 @@ __all__ = [
     "MoEParallelizerConfig",
     "MultimodalDistributedConfig",
     "ParallelismSizes",
-    "ParallelizeContext",
     "PipelineConfig",
     "initialize_distributed",
 ]

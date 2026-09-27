@@ -37,7 +37,7 @@ Usage:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Tuple, Union
 
 import torch
@@ -108,6 +108,19 @@ class DistributedSetup:
     moe_parallel_config: "MoEParallelizerConfig | None" = None
     activation_checkpointing: ActivationCheckpointingMode = False
 
+    def __post_init__(self) -> None:
+        """Keep the compatibility bundle and its MeshContext policy in sync."""
+        object.__setattr__(
+            self,
+            "mesh_context",
+            replace(
+                self.mesh_context,
+                strategy_config=self.strategy_config,
+                moe_parallel_config=self.moe_parallel_config,
+                activation_checkpointing=self.activation_checkpointing,
+            ),
+        )
+
     @classmethod
     def build(
         cls,
@@ -155,6 +168,8 @@ class DistributedSetup:
         mesh_context = MeshContext.build(
             strategy_config,
             parallelism_sizes=parallelism_sizes,
+            moe_parallel_config=moe_parallel_config,
+            activation_checkpointing=activation_checkpointing,
             world_size=world_size,
             timeout_minutes=timeout_minutes,
             ranks=ranks,

@@ -2655,14 +2655,16 @@ class TestSingleGpuActivationCheckpointing:
 
     def _make_parallelizer_and_context(self, monkeypatch, activation_checkpointing):
         import nemo_automodel.components.distributed.fsdp2 as fsdp2_mod
-        from nemo_automodel.components.distributed import FSDP2Config, ModelParallelizer, ParallelizeContext
+        from nemo_automodel.components.distributed import FSDP2Config, ModelParallelizer
 
         monkeypatch.setattr(fsdp2_mod, "get_world_size_safe", lambda: 1)
         config = FSDP2Config(activation_checkpointing=activation_checkpointing)
-        context = ParallelizeContext(
-            mesh=SimpleNamespace(device_mesh=MagicMock(), ep_size=1),
-            strategy=config,
+        context = SimpleNamespace(
+            device_mesh=MagicMock(),
+            ep_size=1,
+            strategy_config=config,
             activation_checkpointing=activation_checkpointing,
+            reapply_trainability=None,
         )
         return ModelParallelizer(), context
 
