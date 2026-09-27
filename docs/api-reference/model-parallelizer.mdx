@@ -34,6 +34,25 @@ The shared runtime chooses the path before invoking model-owned policy. A
 sidecar does not need to parse configuration, build meshes, or reproduce the
 TP/CP/EP sequencing.
 
+### Diffusion pipeline boundary
+
+`NeMoAutoDiffusionPipeline` follows the same topology-ownership rule. The
+caller supplies one resolved `MeshContext`; the loader returns the pipeline
+itself after replacing every selected component with its parallelized module.
+Internal `ParallelizeContext` objects are not part of the return value.
+
+```python
+pipe = NeMoAutoDiffusionPipeline.from_pretrained(
+    model_id,
+    mesh_context=mesh_context,
+    parallel_scheme={"transformer": transformer_policy},
+)
+```
+
+When `parallel_scheme` is omitted, `mesh_context` may also be omitted. When a
+scheme is supplied, `mesh_context` is required and is the single source of
+truth for TP, CP, EP, and data-parallel topology.
+
 ## Add a Model Sidecar
 
 Create a small `parallelization.py` module next to the model. Subclass the

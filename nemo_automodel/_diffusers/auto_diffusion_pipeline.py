@@ -23,19 +23,21 @@ This module provides a single pipeline class that handles:
 
 Usage:
     # Finetuning (from_pretrained) - no pipeline_spec needed
-    pipe, contexts = NeMoAutoDiffusionPipeline.from_pretrained(
+    pipe = NeMoAutoDiffusionPipeline.from_pretrained(
         "black-forest-labs/FLUX.1-dev",
         load_for_training=True,
+        mesh_context=mesh_context,
         parallel_scheme={"transformer": parallelization_args},
     )
 
     # Pretraining (from_config) - pipeline_spec required in YAML
-    pipe, contexts = NeMoAutoDiffusionPipeline.from_config(
+    pipe = NeMoAutoDiffusionPipeline.from_config(
         "black-forest-labs/FLUX.1-dev",
         pipeline_spec={
             "transformer_cls": "FluxTransformer2DModel",
             "subfolder": "transformer",
         },
+        mesh_context=mesh_context,
         parallel_scheme={"transformer": parallelization_args},
     )
 """
@@ -43,14 +45,14 @@ Usage:
 import logging
 import os
 from dataclasses import dataclass, fields
-from typing import Any, Dict, Iterable, Tuple
+from typing import Any, Dict, Iterable
 
 import torch
 import torch.nn as nn
 
 from nemo_automodel._diffusers._hf_cache import resolve_diffusion_model_dir
 from nemo_automodel._diffusers.parallelization import attach_parallelizer
-from nemo_automodel.components.distributed import DistributedSetup, ParallelismSizes, ParallelizeContext
+from nemo_automodel.components.distributed import MeshContext, ParallelismSizes, ParallelizeContext
 from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config
 from nemo_automodel.components.distributed.model_parallelizer import (
     compile_parallelized_model,
@@ -145,7 +147,7 @@ def _choose_device(device: torch.device | None) -> torch.device:
     return torch.device("cpu")
 
 
-def _iter_pipeline_modules(pipe) -> Iterable[Tuple[str, nn.Module]]:
+def _iter_pipeline_modules(pipe) -> Iterable[tuple[str, nn.Module]]:
     """Iterate over nn.Module components in a pipeline."""
     # Prefer Diffusers' components registry when available
     if hasattr(pipe, "components") and isinstance(pipe.components, dict):
@@ -365,54 +367,16 @@ def _fuse_transformer_qkv_projections(module: nn.Module, module_name: str, *, co
     return fused
 
 
-def _create_parallelize_context(parallelization_args: Dict[str, Any]) -> ParallelizeContext:
-    """Create a model parallelization context from the diffusion config.
-
-    Builds a ``DistributedSetup`` via ``DistributedSetup.build(...)`` and packages
-    its typed strategy and meshes for the model-owned ``ModelParallelizer``.
-
-    The strategy type is determined by the compatibility ``_manager_type`` key:
-    - ``'ddp'``: Creates a DDP ``DistributedSetup`` and context.
-    - ``'fsdp2'`` (default): Creates an FSDP2 ``DistributedSetup`` and context.
-
-    Args:
-        parallelization_args: Flat dictionary of arguments. Recognised keys:
-
-            Common:
-                ``_manager_type`` (str): ``'fsdp2'`` or ``'ddp'``.
-                ``activation_checkpointing`` (bool): Enable activation checkpointing.
-
-            FSDP2-specific (mesh creation):
-                ``world_size`` (int): Total number of processes.
-                ``dp_size``, ``dp_replicate_size``, ``tp_size``, ``cp_size``,
-                ``pp_size``, ``ep_size`` (int): Parallelism dimensions.
-
-            FSDP2-specific (config):
-                ``mp_policy``: :class:`MixedPrecisionPolicy` instance.
-                ``sequence_parallel`` (bool), ``tp_plan`` (dict),
-                ``offload_policy``, ``defer_fsdp_grad_sync`` (bool).
-
-    Returns:
-        Runtime context for model-owned parallelization.
-
-    Raises:
-        ValueError: If an unknown strategy type is specified.
-    """
+def _parse_parallelization_args(
+    parallelization_args: Dict[str, Any],
+) -> tuple[Dict[str, Any], DDPConfig | FSDP2Config]:
+    """Parse a component's execution policy without constructing topology."""
     args = parallelization_args.copy()
     strategy_type = args.pop("_manager_type", "fsdp2").lower()
     if "backend" in args:
         raise ValueError(
             "backend is not a model parallelizer option; configure the process group before parallelization."
         )
-    parallelism = ParallelismSizes(
-        dp_size=args.get("dp_size"),
-        dp_replicate_size=args.get("dp_replicate_size"),
-        tp_size=args.get("tp_size", 1),
-        pp_size=args.get("pp_size", 1),
-        cp_size=args.get("cp_size", 1),
-        ep_size=args.get("ep_size", 1),
-    )
-
     if strategy_type == "ddp":
         strategy_class = DDPConfig
     elif strategy_type == "fsdp2":
@@ -422,21 +386,41 @@ def _create_parallelize_context(parallelization_args: Dict[str, Any]) -> Paralle
 
     strategy_field_names = {field.name for field in fields(strategy_class)}
     strategy_config = strategy_class(**{key: value for key, value in args.items() if key in strategy_field_names})
+    return args, strategy_config
+
+
+def _create_mesh_context(parallelization_args: Dict[str, Any]) -> MeshContext:
+    """Build the caller-owned diffusion topology from recipe arguments."""
+    args, strategy_config = _parse_parallelization_args(parallelization_args)
+    parallelism = ParallelismSizes(
+        dp_size=args.get("dp_size"),
+        dp_replicate_size=args.get("dp_replicate_size"),
+        tp_size=args.get("tp_size", 1),
+        pp_size=args.get("pp_size", 1),
+        cp_size=args.get("cp_size", 1),
+        ep_size=args.get("ep_size", 1),
+    )
     world_size = args.get("world_size")
-    if strategy_type == "fsdp2" and world_size is None:
+    if isinstance(strategy_config, FSDP2Config) and world_size is None:
         world_size = torch.distributed.get_world_size()
-    distributed_setup = DistributedSetup.build(
-        strategy=strategy_config,
+    return MeshContext.build(
+        strategy_config=strategy_config,
         parallelism_sizes=parallelism,
-        activation_checkpointing=args.get("activation_checkpointing", False),
         world_size=world_size,
     )
-    logger.info("[Parallel] Creating %s context with config: %s", strategy_type.upper(), strategy_config)
+
+
+def _create_parallelize_context(
+    parallelization_args: Dict[str, Any],
+    mesh_context: MeshContext,
+) -> ParallelizeContext:
+    """Combine caller-owned topology with a component's execution policy."""
+    args, strategy_config = _parse_parallelization_args(parallelization_args)
+    logger.info("[Parallel] Creating context with config: %s", strategy_config)
     return ParallelizeContext(
-        mesh=distributed_setup.mesh_context,
-        strategy=distributed_setup.strategy_config,
-        moe=getattr(distributed_setup, "moe_parallel_config", None),
-        activation_checkpointing=distributed_setup.activation_checkpointing,
+        mesh=mesh_context,
+        strategy=strategy_config,
+        activation_checkpointing=args.get("activation_checkpointing", False),
     )
 
 
@@ -458,34 +442,21 @@ def _enable_context_parallel(
             ``enable_parallelism`` and define a ``_cp_plan``.
         module_name: Component name, for error messages.
         context: FSDP2 context whose device mesh provides the ``cp`` axis.
-        parallelization_args: Flat parallelization-args dict. Reads ``cp_size`` and the optional
+        parallelization_args: Flat parallelization-args dict. Reads the optional
             ``cp_ring_degree`` / ``cp_ulysses_degree`` split (defaults to pure
-            Ulysses, i.e. ``ring=1, ulysses=cp_size``).
+            Ulysses, i.e. ``ring=1, ulysses=mesh_context.cp_size``).
 
     Raises:
         ValueError: If the strategy is not FSDP2, the ring/ulysses split does not
             multiply to ``cp_size``, ring is requested (training backward is
             broken in diffusers<=0.39), or the model has no ``_cp_plan``.
     """
-    from diffusers import ContextParallelConfig
+    if not isinstance(context.strategy, FSDP2Config):
+        raise ValueError("Context parallelism requires FSDP2; DDP is not supported.")
 
-    from nemo_automodel._diffusers.diffusers_patches import (
-        apply_cudnn_attention_patch,
-        apply_native_flash_backward_patch,
-    )
-    from nemo_automodel.components.distributed.mesh_utils import create_ring_ulysses_mesh
-
-    # Interim fixes for the diffusers<=0.39 _native_flash/_native_cudnn backward
-    # bugs on the CP path; feature-detected, no-ops once upstream ships the fix.
-    apply_native_flash_backward_patch()
-    apply_cudnn_attention_patch()
-
-    cp_size = int(parallelization_args.get("cp_size", 1))
+    cp_size = context.mesh.cp_size
     ring_degree = int(parallelization_args.get("cp_ring_degree", 1))
     ulysses_degree = int(parallelization_args.get("cp_ulysses_degree", cp_size // ring_degree if ring_degree else 0))
-
-    if not isinstance(context.strategy, FSDP2Config):
-        raise ValueError(f"cp_size={cp_size} requires FSDP2; DDP does not support context parallelism.")
     if ring_degree * ulysses_degree != cp_size:
         raise ValueError(
             f"cp_ring_degree ({ring_degree}) * cp_ulysses_degree ({ulysses_degree}) must equal cp_size ({cp_size})."
@@ -504,6 +475,20 @@ def _enable_context_parallel(
 
     if context.mesh.device_mesh is None:
         raise ValueError("Diffusers context parallelism requires a device mesh.")
+
+    from diffusers import ContextParallelConfig
+
+    from nemo_automodel._diffusers.diffusers_patches import (
+        apply_cudnn_attention_patch,
+        apply_native_flash_backward_patch,
+    )
+    from nemo_automodel.components.distributed.mesh_utils import create_ring_ulysses_mesh
+
+    # Interim fixes for the diffusers<=0.39 _native_flash/_native_cudnn backward
+    # bugs on the CP path; feature-detected, no-ops once upstream ships the fix.
+    apply_native_flash_backward_patch()
+    apply_cudnn_attention_patch()
+
     cp_mesh = create_ring_ulysses_mesh(
         context.mesh.device_mesh,
         ring_degree=ring_degree,
@@ -524,7 +509,8 @@ def _enable_context_parallel(
 def _apply_parallelization(
     pipe,
     parallel_scheme: Dict[str, Dict[str, Any]] | None,
-) -> Dict[str, ParallelizeContext]:
+    mesh_context: MeshContext | None,
+):
     """Apply FSDP2/DDP parallelization to pipeline components.
 
     Each parallelized component is stamped with ``_pre_shard_hf_state_dict_keys``:
@@ -537,9 +523,10 @@ def _apply_parallelization(
     state-dict keys gain a ``module.`` prefix, and DDP delegates attribute access
     to the inner module.
     """
-    created_contexts: Dict[str, ParallelizeContext] = {}
     if parallel_scheme is None:
-        return created_contexts
+        return pipe
+    if mesh_context is None:
+        raise ValueError("mesh_context is required when parallel_scheme is provided.")
 
     assert torch.distributed.is_initialized(), "Distributed environment must be initialized for parallelization"
     for comp_name, comp_module in _iter_pipeline_modules(pipe):
@@ -548,12 +535,11 @@ def _apply_parallelization(
             continue
         logger.info("[INFO] Applying parallelization to %s", comp_name)
         attach_parallelizer(comp_module)
-        context = _create_parallelize_context(parallelization_args)
-        created_contexts[comp_name] = context
+        context = _create_parallelize_context(parallelization_args, mesh_context)
         pre_shard_hf_state_dict_keys = list(comp_module.state_dict().keys())
         # CP hooks must be registered before fully_shard so diffusers sees the
         # final module tree by name and FSDP2 wraps the hook-carrying modules.
-        if int(parallelization_args.get("cp_size", 1)) > 1:
+        if context.mesh.cp_size > 1:
             _enable_context_parallel(comp_module, comp_name, context, parallelization_args)
         parallel_module = parallelize_model(comp_module, context)
         compile_parallelized_model(parallel_module, context)
@@ -564,7 +550,7 @@ def _apply_parallelization(
             setattr(parallel_module, "_pre_shard_hf_state_dict_keys", pre_shard_hf_state_dict_keys)
         setattr(pipe, comp_name, parallel_module)
 
-    return created_contexts
+    return pipe
 
 
 class NeMoAutoDiffusionPipeline:
@@ -584,6 +570,7 @@ class NeMoAutoDiffusionPipeline:
 
     Features:
     - Accepts a per-component mapping from component name to parallel strategy arguments
+    - Accepts the caller-owned MeshContext used by every parallelized component
     - Moves all nn.Module components to the chosen device/dtype
     - Parallelizes only components present in the mapping by constructing a context per component
     - Supports both FSDP2 and DDP via the compatibility '_manager_type' config key
@@ -619,6 +606,7 @@ class NeMoAutoDiffusionPipeline:
         pretrained_model_name_or_path: str,
         *model_args,
         parallel_scheme: Dict[str, Dict[str, Any]] | None = None,
+        mesh_context: MeshContext | None = None,
         device: torch.device | None = None,
         torch_dtype: Any = torch.bfloat16,
         move_to_device: bool = True,
@@ -633,7 +621,7 @@ class NeMoAutoDiffusionPipeline:
         compact_fused_qkv_projections: bool = False,
         attention_backend: str | None = None,
         **kwargs,
-    ) -> Tuple[DiffusionPipeline, Dict[str, ParallelizeContext]]:
+    ) -> DiffusionPipeline:
         """
         Load pipeline from pretrained weights using DiffusionPipeline auto-detection.
 
@@ -646,6 +634,7 @@ class NeMoAutoDiffusionPipeline:
             pretrained_model_name_or_path: HuggingFace model ID or local path
             parallel_scheme: Dict mapping component names to parallelization arguments.
                            Each component's kwargs should include '_manager_type': 'fsdp2' or 'ddp'
+            mesh_context: Caller-owned distributed topology. Required when ``parallel_scheme`` is provided.
             device: Device to load model to
             torch_dtype: Data type for model parameters
             move_to_device: Whether to move modules to device
@@ -670,13 +659,15 @@ class NeMoAutoDiffusionPipeline:
             **kwargs: Additional arguments passed to DiffusionPipeline.from_pretrained
 
         Returns:
-            Tuple of (DiffusionPipeline, Dict[str, ParallelizeContext])
+            The loaded pipeline with requested components replaced by their parallelized modules.
         """
         if not DIFFUSERS_AVAILABLE:
             raise RuntimeError(
                 "diffusers is required for NeMoAutoDiffusionPipeline.from_pretrained. "
                 "Install with: pip install nemo_automodel[diffusion]"
             )
+        if parallel_scheme is not None and mesh_context is None:
+            raise ValueError("mesh_context is required when parallel_scheme is provided.")
 
         logger.info("[INFO] Loading pipeline from pretrained: %s", pretrained_model_name_or_path)
 
@@ -804,7 +795,7 @@ class NeMoAutoDiffusionPipeline:
         # FSDP2 LoRA: all params are trainable when fully_shard() runs so FSDP2
         # sets up gradient reduction for lora_A/lora_B correctly. Freeze happens below.
         # DDP LoRA: base weights are frozen before wrapping so DDP only reduces LoRA gradients.
-        created_contexts = _apply_parallelization(pipe, parallel_scheme)
+        _apply_parallelization(pipe, parallel_scheme, mesh_context)
 
         # Freeze base weights after FSDP2 wrapping — mirrors the LLM pattern in
         # nemo_automodel/_transformers/infrastructure.py lines 513-518.
@@ -817,7 +808,7 @@ class NeMoAutoDiffusionPipeline:
                     param.requires_grad_(False)
             logger.info("[LoRA] Froze base weights after parallelization")
 
-        return pipe, created_contexts
+        return pipe
 
     @classmethod
     def from_config(
@@ -827,6 +818,7 @@ class NeMoAutoDiffusionPipeline:
         torch_dtype: torch.dtype = torch.bfloat16,
         device: torch.device | None = None,
         parallel_scheme: Dict[str, Dict[str, Any]] | None = None,
+        mesh_context: MeshContext | None = None,
         move_to_device: bool = True,
         components_to_load: Iterable[str] | None = None,
         transformer_engine_linear: bool = False,
@@ -835,7 +827,7 @@ class NeMoAutoDiffusionPipeline:
         compact_fused_qkv_projections: bool = False,
         attention_backend: str | None = None,
         **kwargs,
-    ) -> Tuple["NeMoAutoDiffusionPipeline", Dict[str, ParallelizeContext]]:
+    ) -> "NeMoAutoDiffusionPipeline | DiffusionPipeline":
         """
         Initialize pipeline with random weights using YAML-specified transformer class.
 
@@ -853,6 +845,7 @@ class NeMoAutoDiffusionPipeline:
             torch_dtype: Data type for model parameters
             device: Device to load model to
             parallel_scheme: Dict mapping component names to parallelization arguments
+            mesh_context: Caller-owned distributed topology. Required when ``parallel_scheme`` is provided.
             move_to_device: Whether to move modules to device
             components_to_load: Which components to process (default: all)
             transformer_engine_linear: Whether to replace torch.nn.Linear modules in the transformer with TE Linear.
@@ -864,13 +857,15 @@ class NeMoAutoDiffusionPipeline:
             **kwargs: Additional arguments
 
         Returns:
-            Tuple of (NeMoAutoDiffusionPipeline or DiffusionPipeline, Dict[str, ParallelizeContext])
+            The initialized pipeline with requested components replaced by their parallelized modules.
         """
         if not DIFFUSERS_AVAILABLE:
             raise RuntimeError(
                 "diffusers is required for NeMoAutoDiffusionPipeline.from_config. "
                 "Install with: pip install nemo_automodel[diffusion]"
             )
+        if parallel_scheme is not None and mesh_context is None:
+            raise ValueError("mesh_context is required when parallel_scheme is provided.")
 
         # Parse and validate pipeline spec
         spec = PipelineSpec.from_dict(pipeline_spec)
@@ -948,6 +943,6 @@ class NeMoAutoDiffusionPipeline:
                 _ensure_params_trainable(module, module_name=name)
 
         # Apply parallelization (FSDP2 or DDP)
-        created_contexts = _apply_parallelization(pipe, parallel_scheme)
+        _apply_parallelization(pipe, parallel_scheme, mesh_context)
 
-        return pipe, created_contexts
+        return pipe

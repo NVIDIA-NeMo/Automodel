@@ -30,7 +30,7 @@ _HAS_WANDB, wandb = safe_import(
 )
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
 
-from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
+from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline, _create_mesh_context
 from nemo_automodel.components.distributed.fsdp2 import fsdp2_sharding_enabled
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.tp_replicas import broadcast_tp_replicas, synchronize_tp_replica_gradients
@@ -387,17 +387,19 @@ def build_diffusion_pipeline(
     )
 
     parallel_scheme = {"transformer": parallelization_args}
+    mesh_context = _create_mesh_context(parallelization_args)
 
     if finetune_mode:
         # Finetuning: load from pretrained weights
         logging.info("[INFO] Loading pretrained model for finetuning")
         if active_transformer is not None:
             logging.info("[INFO] Active transformer: %s", active_transformer)
-        pipe, parallelize_contexts = NeMoAutoDiffusionPipeline.from_pretrained(
+        pipe = NeMoAutoDiffusionPipeline.from_pretrained(
             model_id,
             torch_dtype=dtype,
             device=device,
             parallel_scheme=parallel_scheme,
+            mesh_context=mesh_context,
             components_to_load=["transformer"],
             load_for_training=True,
             low_cpu_mem_usage=True,
@@ -421,12 +423,13 @@ def build_diffusion_pipeline(
                 "    subfolder: 'transformer'"
             )
         logging.info("[INFO] Initializing model with random weights for pretraining")
-        pipe, parallelize_contexts = NeMoAutoDiffusionPipeline.from_config(
+        pipe = NeMoAutoDiffusionPipeline.from_config(
             model_id,
             pipeline_spec=pipeline_spec,
             torch_dtype=dtype,
             device=device,
             parallel_scheme=parallel_scheme,
+            mesh_context=mesh_context,
             components_to_load=["transformer"],
             transformer_engine_linear=transformer_engine_linear,
             transformer_engine_fp8_safe_only=transformer_engine_fp8_safe_only,
@@ -434,7 +437,6 @@ def build_diffusion_pipeline(
             compact_fused_qkv_projections=compact_fused_qkv_projections,
             attention_backend=attention_backend,
         )
-    parallelize_context = parallelize_contexts["transformer"]
     transformer_module = pipe.transformer
 
     if lora_enabled:
@@ -467,7 +469,7 @@ def build_diffusion_pipeline(
 
     logging.info("[INFO] NeMoAutoDiffusion pipeline setup complete")
 
-    return pipe, parallelize_context.mesh.device_mesh
+    return pipe, mesh_context.device_mesh
 
 
 class TrainDiffusionRecipe(BaseRecipe):

@@ -107,7 +107,7 @@ def load_pipeline(cfg, dist_info):
     Returns:
         A diffusers pipeline instance.
     """
-    from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline, _create_mesh_context
 
     model_id = cfg.model.pretrained_model_name_or_path
     dtype_str = getattr(cfg.inference, "dtype", "bfloat16")
@@ -120,18 +120,22 @@ def load_pipeline(cfg, dist_info):
 
     # Build parallel_scheme from distributed config (None for single-GPU).
     parallel_scheme = None
+    mesh_context = None
     if dist_info is not None and hasattr(cfg.distributed, "parallel_scheme"):
         parallel_scheme = _build_parallel_scheme(cfg.distributed.parallel_scheme, dist_info)
+        if parallel_scheme:
+            mesh_context = _create_mesh_context(next(iter(parallel_scheme.values())))
 
     # CPU offload requires modules to stay on CPU so enable_model_cpu_offload()
     # can install per-module device hooks (called later in apply_optimizations).
     vae_cfg = getattr(cfg, "vae", None)
     cpu_offload = vae_cfg is not None and getattr(vae_cfg, "enable_cpu_offload", False)
 
-    pipe, _ = NeMoAutoDiffusionPipeline.from_pretrained(
+    pipe = NeMoAutoDiffusionPipeline.from_pretrained(
         model_id,
         torch_dtype=torch_dtype,
         parallel_scheme=parallel_scheme,
+        mesh_context=mesh_context,
         move_to_device=not cpu_offload,
     )
 
@@ -170,7 +174,7 @@ def _build_parallel_scheme(scheme_cfg, dist_info):
         dist_info: DistInfo with distributed environment details.
 
     Returns:
-        Dict mapping component names to manager kwargs dicts.
+        Dict mapping component names to parallelization-policy kwargs.
     """
     parallel_scheme = {}
     for comp_name in dir(scheme_cfg):
@@ -179,8 +183,7 @@ def _build_parallel_scheme(scheme_cfg, dist_info):
         comp_cfg = getattr(scheme_cfg, comp_name)
         if comp_cfg is None:
             continue
-        manager_args = {
-            "backend": "nccl",
+        parallelization_args = {
             "world_size": dist_info.world_size,
             "use_hf_tp_plan": False,
         }
@@ -188,8 +191,8 @@ def _build_parallel_scheme(scheme_cfg, dist_info):
         for key in ("tp_size", "cp_size", "pp_size", "dp_size", "dp_replicate_size"):
             val = getattr(comp_cfg, key, None)
             if val is not None:
-                manager_args[key] = val
-        parallel_scheme[comp_name] = manager_args
+                parallelization_args[key] = val
+        parallel_scheme[comp_name] = parallelization_args
     return parallel_scheme
 
 

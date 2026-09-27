@@ -518,19 +518,20 @@ def test_build_diffusion_parallelization_args_accepts_confignode_ddp_config():
 
 def test_build_diffusion_pipeline_forwards_perf_options(monkeypatch):
     pipe = SimpleNamespace(transformer=_TinyTransformer())
-    context = SimpleNamespace(mesh=SimpleNamespace(device_mesh="mesh"))
+    mesh_context = SimpleNamespace(device_mesh="mesh")
     calls = {}
 
     def fake_from_pretrained(model_id, **kwargs):
         calls["model_id"] = model_id
         calls.update(kwargs)
-        return pipe, {"transformer": context}
+        return pipe
 
     monkeypatch.setattr(
         diffusion_train.NeMoAutoDiffusionPipeline,
         "from_pretrained",
         staticmethod(fake_from_pretrained),
     )
+    monkeypatch.setattr(diffusion_train, "_create_mesh_context", lambda _args: mesh_context)
     monkeypatch.setattr(diffusion_train.torch.cuda, "is_available", lambda: False)
 
     built_pipe, device_mesh = build_diffusion_pipeline(
@@ -576,19 +577,21 @@ def test_build_diffusion_pipeline_forwards_perf_options(monkeypatch):
     # attention_backend is forwarded to from_pretrained, which applies it via
     # set_attention_backend before sharding (required for context parallelism).
     assert calls["attention_backend"] == "flash"
+    assert calls["mesh_context"] is mesh_context
     assert built_pipe is pipe
     assert device_mesh == "mesh"
 
 
 def test_build_diffusion_pipeline_raises_when_lora_params_missing(monkeypatch):
     pipe = SimpleNamespace(transformer=_TinyTransformer())
-    context = SimpleNamespace(mesh=SimpleNamespace(device_mesh=None))
+    mesh_context = SimpleNamespace(device_mesh=None)
 
     monkeypatch.setattr(
         diffusion_train.NeMoAutoDiffusionPipeline,
         "from_pretrained",
-        staticmethod(lambda *_args, **_kwargs: (pipe, {"transformer": context})),
+        staticmethod(lambda *_args, **_kwargs: pipe),
     )
+    monkeypatch.setattr(diffusion_train, "_create_mesh_context", lambda _args: mesh_context)
     monkeypatch.setattr(diffusion_train.torch.cuda, "is_available", lambda: False)
 
     with pytest.raises(RuntimeError, match="no LoRA params found"):
