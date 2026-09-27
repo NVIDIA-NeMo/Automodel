@@ -44,24 +44,15 @@ def test_accepts_single_mesh_context_contract():
     assert _messages("def parallelize(model, mesh_context):\n    return model\n") == []
 
 
-def test_rejects_distributed_import_of_model_implementation():
-    path = Path("nemo_automodel/components/distributed/example.py")
-    for source in (
-        "from nemo_automodel.components.models.foo import Model\n",
-        "import nemo_automodel._diffusers.auto_diffusion_pipeline\n",
-        "from ..models.foo import Model\n",
-    ):
-        assert _messages(source, path) == ["distributed infrastructure may not import model or adapter implementations"]
-
-
-def test_allows_type_only_distributed_import_of_model_implementation():
-    path = Path("nemo_automodel/components/distributed/example.py")
-    source = (
-        "from typing import TYPE_CHECKING\n"
-        "if TYPE_CHECKING:\n"
-        "    from nemo_automodel.components.models.foo import Model\n"
+def test_model_parallelizer_signature_is_fixed():
+    path = Path("nemo_automodel/components/distributed/parallelizer.py")
+    valid = "class ModelParallelizer:\n    def parallelize(self, model, mesh_context, /):\n        return model\n"
+    invalid = (
+        "class ModelParallelizer:\n    def parallelize(self, model, mesh_context, policy=None):\n        return model\n"
     )
-    assert _messages(source, path) == []
+
+    assert _messages(valid, path) == []
+    assert _messages(invalid, path) == ["ModelParallelizer must expose exactly parallelize(self, model, mesh_context)"]
 
 
 def test_model_sidecar_may_import_only_exported_distributed_symbols(tmp_path):
@@ -98,4 +89,65 @@ def test_model_sidecar_rejects_distributed_module_import(tmp_path):
 
     assert [error.message for error in errors] == [
         "model sidecars must import named public distributed symbols, not modules"
+    ]
+
+
+@pytest.mark.parametrize("method_name", ["parallelize", "parallelize_fsdp", "parallelize_component"])
+def test_model_sidecar_must_use_inherited_parallelize_interface(tmp_path, method_name):
+    distributed = tmp_path / "nemo_automodel/components/distributed"
+    distributed.mkdir(parents=True)
+    (distributed / "__init__.py").write_text('__all__ = ["ModelParallelizer"]\n')
+    source = (
+        "from nemo_automodel.components.distributed import ModelParallelizer\n"
+        f"class Sidecar(ModelParallelizer):\n    def {method_name}(self):\n        pass\n"
+    )
+
+    errors = lint_sidecar_exports(
+        source,
+        tmp_path / "nemo_automodel/components/models/example/parallelization.py",
+        tmp_path,
+    )
+
+    assert [error.message for error in errors] == [
+        "model sidecars must use the inherited parallelize(model, mesh_context) interface"
+    ]
+
+
+def test_diffusion_sidecar_is_checked(tmp_path):
+    distributed = tmp_path / "nemo_automodel/components/distributed"
+    distributed.mkdir(parents=True)
+    (distributed / "__init__.py").write_text('__all__ = ["ModelParallelizer"]\n')
+    source = (
+        "from nemo_automodel.components.distributed import ModelParallelizer\n"
+        "class Sidecar(ModelParallelizer):\n    def parallelize_pipeline(self):\n        pass\n"
+    )
+
+    errors = lint_sidecar_exports(
+        source,
+        tmp_path / "nemo_automodel/_diffusers/parallelization.py",
+        tmp_path,
+    )
+
+    assert [error.message for error in errors] == [
+        "model sidecars must use the inherited parallelize(model, mesh_context) interface"
+    ]
+
+
+def test_aliased_model_parallelizer_is_checked(tmp_path):
+    distributed = tmp_path / "nemo_automodel/components/distributed"
+    distributed.mkdir(parents=True)
+    (distributed / "__init__.py").write_text('__all__ = ["ModelParallelizer"]\n')
+    source = (
+        "from nemo_automodel.components.distributed import ModelParallelizer as BaseParallelizer\n"
+        "class Sidecar(BaseParallelizer):\n    def parallelize_model(self):\n        pass\n"
+    )
+
+    errors = lint_sidecar_exports(
+        source,
+        tmp_path / "nemo_automodel/components/models/example/parallelization.py",
+        tmp_path,
+    )
+
+    assert [error.message for error in errors] == [
+        "model sidecars must use the inherited parallelize(model, mesh_context) interface"
     ]

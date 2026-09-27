@@ -17,7 +17,7 @@ from typing import Iterable, NamedTuple
 
 DEFAULT_PATHS = (Path("nemo_automodel"), Path("examples"))
 FORBIDDEN_NAMES = {"ParallelizeContext", "parallel_scheme"}
-MODEL_LAYERS = ("nemo_automodel.components.models", "nemo_automodel._diffusers", "nemo_automodel._transformers")
+SIDECAR_PATHS = ("nemo_automodel/components/models/", "nemo_automodel/_diffusers/")
 
 
 class LintError(NamedTuple):
@@ -44,32 +44,8 @@ def _identifiers(node: ast.AST) -> list[str]:
     return []
 
 
-def _type_only_nodes(tree: ast.AST) -> set[int]:
-    result = set()
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.If):
-            continue
-        is_type_checking = (isinstance(node.test, ast.Name) and node.test.id == "TYPE_CHECKING") or (
-            isinstance(node.test, ast.Attribute) and node.test.attr == "TYPE_CHECKING"
-        )
-        if is_type_checking:
-            result.update(id(child) for statement in node.body for child in ast.walk(statement))
-    return result
-
-
-def _imports_model_layer(node: ast.AST) -> bool:
-    if isinstance(node, ast.Import):
-        return any(alias.name.startswith(MODEL_LAYERS) for alias in node.names)
-    if not isinstance(node, ast.ImportFrom):
-        return False
-    module = node.module or ""
-    return module.startswith(MODEL_LAYERS) or (
-        node.level > 0 and module.split(".", 1)[0] in {"models", "_diffusers", "_transformers"}
-    )
-
-
 def lint_source(source: str, path: Path = Path("<string>")) -> list[LintError]:
-    """Check forbidden names and reverse runtime imports."""
+    """Check names that would create a second parallelization contract."""
 
     try:
         tree = ast.parse(source, filename=str(path))
@@ -87,14 +63,35 @@ def lint_source(source: str, path: Path = Path("<string>")) -> list[LintError]:
                         f"{identifier} creates a second model-parallelization interface; use MeshContext only",
                     )
                 )
-    if "nemo_automodel/components/distributed" in path.as_posix():
-        type_only = _type_only_nodes(tree)
-        errors.extend(
-            LintError(path, node.lineno, "distributed infrastructure may not import model or adapter implementations")
-            for node in ast.walk(tree)
-            if id(node) not in type_only and _imports_model_layer(node)
+    if path.as_posix().endswith("nemo_automodel/components/distributed/parallelizer.py"):
+        parallelizer = next(
+            (node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "ModelParallelizer"),
+            None,
         )
+        methods = (
+            [
+                node
+                for node in parallelizer.body
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "parallelize"
+            ]
+            if parallelizer
+            else []
+        )
+        if len(methods) != 1 or _argument_names(methods[0].args) != ["self", "model", "mesh_context"]:
+            errors.append(
+                LintError(
+                    path,
+                    methods[0].lineno if methods else parallelizer.lineno if parallelizer else 1,
+                    "ModelParallelizer must expose exactly parallelize(self, model, mesh_context)",
+                )
+            )
     return errors
+
+
+def _argument_names(arguments: ast.arguments) -> list[str] | None:
+    if arguments.vararg or arguments.kwarg or arguments.kwonlyargs or arguments.defaults:
+        return None
+    return [argument.arg for argument in (*arguments.posonlyargs, *arguments.args)]
 
 
 def _module_path(module: str, root: Path) -> Path:
@@ -124,19 +121,43 @@ def _exports(path: Path) -> set[str] | None:
 
 
 def lint_sidecar_exports(source: str, path: Path, root: Path) -> list[LintError]:
-    """Check that model sidecars consume only exported distributed symbols."""
+    """Check that sidecars keep one interface and consume only public infrastructure."""
 
-    if "nemo_automodel/components/models/" not in path.as_posix():
+    if not any(prefix in path.as_posix() for prefix in SIDECAR_PATHS):
         return []
     try:
         tree = ast.parse(source, filename=str(path))
     except SyntaxError:
         return []
     nodes = list(ast.walk(tree))
-    if not any("ModelParallelizer" in _identifiers(node) for node in nodes):
+    parallelizer_names = {"ModelParallelizer"}
+    parallelizer_names.update(
+        alias.asname
+        for node in nodes
+        if isinstance(node, ast.ImportFrom) and (node.module or "").startswith("nemo_automodel.components.distributed")
+        for alias in node.names
+        if alias.name == "ModelParallelizer" and alias.asname
+    )
+    sidecar_classes = [
+        node
+        for node in nodes
+        if isinstance(node, ast.ClassDef)
+        and any(parallelizer_names.intersection(_identifiers(base)) for base in node.bases)
+    ]
+    if not sidecar_classes:
         return []
 
-    errors = []
+    errors = [
+        LintError(
+            path,
+            method.lineno,
+            "model sidecars must use the inherited parallelize(model, mesh_context) interface",
+        )
+        for class_node in sidecar_classes
+        for method in class_node.body
+        if isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and (method.name == "parallelize" or method.name.startswith("parallelize_"))
+    ]
     for node in nodes:
         if isinstance(node, ast.Import) and any(
             alias.name.startswith("nemo_automodel.components.distributed") for alias in node.names

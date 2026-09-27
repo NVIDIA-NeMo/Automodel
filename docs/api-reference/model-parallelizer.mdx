@@ -53,10 +53,12 @@ components all consume the same resolved context.
 
 ### Architecture guardrail
 
-`python tools/lint_model_parallelizer_contract.py` runs in the main lint CI job.
-It rejects a second `ParallelizeContext` or `parallel_scheme` API, runtime imports
-from distributed infrastructure back into model/adapter implementations, and
-model sidecars that import distributed symbols not declared in `__all__`.
+Two checks run in CI. The standard `import-linter` contract prevents distributed
+infrastructure from importing model or adapter implementations. The focused
+`python tools/lint_model_parallelizer_contract.py` check rejects a second
+`ParallelizeContext` or `parallel_scheme` API, model-specific public
+`parallelize_*` methods, and sidecars that import distributed symbols not
+declared in `__all__`.
 
 ## Add a Model Sidecar
 
