@@ -42,7 +42,7 @@ model:
   pretrained_model_name_or_path: nvidia/Nemotron-Flash-1B
   trust_remote_code: true
   config:
-    _target_: transformers.AutoConfig.from_pretrained
+    _target_: nemo_automodel.NeMoAutoConfig.from_pretrained
     pretrained_model_name_or_path: nvidia/Nemotron-Flash-1B
     trust_remote_code: True
     attn_implementation_new: flash_attention_2

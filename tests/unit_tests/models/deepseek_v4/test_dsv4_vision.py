@@ -62,6 +62,7 @@ from nemo_automodel.components.models.deepseek_v4.state_dict_adapter import Deep
 from nemo_automodel.components.models.deepseek_v4.vision import (
     DeepseekV4VisionAligner,
     DeepseekV4VisionBlock,
+    DeepseekV4VisionRMSNorm,
     DeepseekV4VisionTransformer,
 )
 from nemo_automodel.components.moe.config import MoEConfig
@@ -674,8 +675,12 @@ def test_vision_blocks_expose_fp32_norm_islands_to_dsv4_fsdp():
     assert fp32_modules == [block.norm1, block.norm2]
 
 
-def test_vision_norm_fsdp_policy_preserves_bf16_activation_dtype(monkeypatch):
-    block = DeepseekV4VisionBlock(_vision_config(torch_dtype="bfloat16"))
+@pytest.mark.parametrize("whole_tower", [False, True])
+def test_vision_norm_fsdp_policy_preserves_bf16_activation_dtype(
+    monkeypatch: pytest.MonkeyPatch, whole_tower: bool
+) -> None:
+    config = _vision_config(torch_dtype="bfloat16")
+    block = DeepseekV4VisionTransformer(config) if whole_tower else DeepseekV4VisionBlock(config)
     calls = []
 
     def fake_fully_shard(module, **kwargs):
@@ -697,8 +702,11 @@ def test_vision_norm_fsdp_policy_preserves_bf16_activation_dtype(monkeypatch):
         offload_policy=object(),
     )
 
-    norm_policies = [kwargs["mp_policy"] for module, kwargs in calls if module in (block.norm1, block.norm2)]
-    assert len(norm_policies) == 2
+    norms = [module for module in block.modules() if isinstance(module, DeepseekV4VisionRMSNorm)]
+    norm_policies = [kwargs["mp_policy"] for module, kwargs in calls if module in norms]
+    assert len(norm_policies) == len(norms)
+    if whole_tower:
+        assert any(module is block.norm for module, _ in calls)
     assert all(policy.param_dtype == torch.float32 for policy in norm_policies)
     assert all(policy.reduce_dtype == torch.float32 for policy in norm_policies)
     assert all(policy.output_dtype is None for policy in norm_policies)

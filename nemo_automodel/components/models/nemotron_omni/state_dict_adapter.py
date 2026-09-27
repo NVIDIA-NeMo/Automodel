@@ -84,6 +84,8 @@ _VISION_PROJ_HF_TO_CUSTOM = {
     "mlp1.0.weight": "vision_projector.norm.weight",
     "mlp1.1.weight": "vision_projector.linear1.weight",
     "mlp1.3.weight": "vision_projector.linear2.weight",
+    "vision_projector.vision_final_layernorm.weight": "vision_projector.vision_final_layernorm.weight",
+    "vision_projector.vision_final_layernorm.bias": "vision_projector.vision_final_layernorm.bias",
 }
 _VISION_PROJ_CUSTOM_TO_HF = {v: k for k, v in _VISION_PROJ_HF_TO_CUSTOM.items()}
 
@@ -286,7 +288,7 @@ class NemotronOmniStateDictAdapter(StateDictAdapter):
                 debug_counts["vision_model"] += 1
 
             # 2. Vision projector keys (mlp1.* -> vision_projector.*)
-            elif key.startswith("mlp1."):
+            elif key.startswith("mlp1.") or key in _VISION_PROJ_HF_TO_CUSTOM:
                 if key in _VISION_PROJ_HF_TO_CUSTOM:
                     new_key = _VISION_PROJ_HF_TO_CUSTOM[key]
                     result[new_key] = value

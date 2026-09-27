@@ -1,0 +1,69 @@
+---
+title: "MiMo-V2.5-Pro"
+description: "Fine-tune the MiMo-V2.5-Pro hybrid attention MoE language model with NeMo AutoModel."
+slug: model-coverage/large-language-models/xiaomimimo/mimo-v2-5-pro
+---
+[MiMo-V2.5-Pro](https://huggingface.co/XiaomiMiMo/MiMo-V2.5-Pro) is Xiaomi's hybrid attention Mixture-of-Experts (MoE) language model. It alternates full and sliding-window attention layers, uses a `sigmoid_with_bias` router with group-limited expert routing, and ships as an FP8 HF checkpoint.
+
+<Info>
+
+| | |
+|---|---|
+| **Task** | Text Generation (MoE, hybrid attention) |
+| **Architecture** | `MiMoV2ForCausalLM` (NeMo AutoModel alias: `MiMoV25ForCausalLM`) |
+| **Validated hardware** | 18 nodes, 144 H100 80GB GPUs; PP18 / EP8 |
+| **HF Org** | [XiaomiMiMo](https://huggingface.co/XiaomiMiMo) |
+
+</Info>
+
+## Available Models
+
+- **MiMo-V2.5-Pro**: Hybrid full and sliding-window attention with FP8 weights.
+
+## Architecture
+
+- The checkpoint declares `MiMoV2ForCausalLM`; the recipe selects the dedicated `mimo_v25` implementation with `architectures: [MiMoV25ForCausalLM]`.
+- Sliding-window attention using the `MiMoV2Attention(is_swa=True)` path.
+- MoE blocks use `nemo_automodel.components.moe.layers.MoE` with `score_func="sigmoid_with_bias"` and `gate_precision=fp32`.
+- `MiMoV2StateDictAdapter` dequantizes the pretrained FP8 checkpoint and restores canonical QKV row order. Unquantized export preserves weight precision; FP8 export is unsupported.
+
+## Example HF Models
+
+| Model | HF ID |
+|---|---|
+| MiMo-V2.5-Pro | [`XiaomiMiMo/MiMo-V2.5-Pro`](https://huggingface.co/XiaomiMiMo/MiMo-V2.5-Pro) |
+
+## Example Recipes
+
+| Recipe | Description |
+|---|---|
+| [mimo_v25_pro_hellaswag.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mimo_v25/mimo_v25_pro_hellaswag.yaml) | SFT: MiMo-V2.5-Pro on HellaSwag |
+
+## Try with NeMo AutoModel
+
+**1. Install** ([full instructions](/get-started/installation)):
+
+```bash
+uv pip install nemo-automodel
+```
+
+**2. Clone the repo** to get the example recipes:
+
+```bash
+git clone https://github.com/NVIDIA-NeMo/Automodel.git
+cd Automodel
+```
+
+**3. Launch on the cluster** with an 18-node allocation and eight GPU workers per node, using the [SLURM cluster guide](/job-launchers/slurm-cluster). Set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` in each worker's environment and select `examples/llm_finetune/mimo_v25/mimo_v25_pro_hellaswag.yaml`.
+
+The recipe runs a 20-step pretrained training sanity check with validation every five steps and checkpoint writing disabled. It uses BF16 weights and AdamW state; its measured memory requirement applies to this precision choice. The validated run used PP18 / EP8 with expert dispatch confined to each node. A single-node launch cannot run this recipe.
+
+See the [Installation Guide](/get-started/installation) and [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).
+
+## Fine-Tuning
+
+See the [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).
+
+## Hugging Face Model Cards
+
+- [XiaomiMiMo/MiMo-V2.5-Pro](https://huggingface.co/XiaomiMiMo/MiMo-V2.5-Pro)

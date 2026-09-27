@@ -2380,10 +2380,36 @@ def _fixed_flex_attention_for_parity(model_parts: Sequence[torch.nn.Module]) -> 
         FlexAttention.flex_attn = original
 
 
+@contextmanager
+def _fixed_mamba_cumsum_for_parity() -> Iterator[None]:
+    """Use one Mamba cumsum tile for serial AutoModel and HF parity forwards.
+
+    Different autotuned head tiles change rounding and can flip downstream MoE
+    routes despite identical weights. A controlled 1 -> 4 -> 1 tile replay gave
+    mean KL 0 -> 0.002839 -> 0 against the trained reference on 2048 tokens.
+    Training retains its original configurations and autotune cache.
+
+    Yields:
+        None while the optional Mamba cumsum kernel uses head tile 1.
+    """
+    available, chunk_state = safe_import("mamba_ssm.ops.triton.ssd_chunk_state")
+    if not available:
+        yield
+        return
+    kernel = chunk_state._chunk_cumsum_fwd_kernel
+    config = next((config for config in kernel.configs if config.kwargs == {"BLOCK_SIZE_H": 1}), None)
+    if config is None:
+        raise RuntimeError("Mamba parity requires a cumsum forward configuration with BLOCK_SIZE_H=1")
+    # Triton's single-config path bypasses both benchmarking and cached choices.
+    # Restore the original candidate list even when the model forward fails.
+    with patch.object(kernel, "configs", [config]):
+        yield
+
+
 def _get_logits(model, input_ids, device, trainer=None) -> torch.Tensor:
     """Run a parity forward and return float32 CPU logits of shape [1, sequence, vocab]."""
     model_parts = trainer.model_parts if trainer is not None else [model]
-    with _fixed_flex_attention_for_parity(model_parts):
+    with _fixed_flex_attention_for_parity(model_parts), _fixed_mamba_cumsum_for_parity():
         if trainer is not None and getattr(trainer, "pp_enabled", False):
             return _get_logits_pp(trainer, input_ids, device)
 

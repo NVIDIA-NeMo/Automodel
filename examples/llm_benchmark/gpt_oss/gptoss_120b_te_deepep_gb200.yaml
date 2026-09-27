@@ -78,7 +78,7 @@ model:
   # the full [batch, sequence, vocab] logits tensor (GitHub issue #3907).
   output_hidden_states: true
   config:
-    _target_: transformers.AutoConfig.from_pretrained
+    _target_: nemo_automodel.NeMoAutoConfig.from_pretrained
     pretrained_model_name_or_path: openai/gpt-oss-120b
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig

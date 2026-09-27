@@ -66,3 +66,9 @@ repos:
         entry: python tools/lint_example_yamls.py
         files: '^examples/.*\.ya?ml$'
         types: [file]
+      - id: no-globals
+        name: "Disallow globals()"
+        language: system
+        entry: python tools/lint_no_globals.py
+        files: '^(nemo_automodel|tools|scripts|examples|tutorials)/.*\.py$|^app\.py$'
+        types: [file]

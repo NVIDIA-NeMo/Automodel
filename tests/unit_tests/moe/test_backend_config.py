@@ -64,14 +64,15 @@ class TestBackendConfigExpertsDispatcherValidation:
     """Test BackendConfig validation for experts and dispatcher fields."""
 
     def test_te_experts_falls_back_to_torch(self):
-        """Test that BackendConfig falls back te experts to torch_mm when dispatcher is not deepep."""
+        """Test that BackendConfig falls back TE experts to native torch_mm with the torch dispatcher."""
         config = BackendConfig(experts="te", dispatcher="torch")
         assert config.experts == "torch_mm"
         assert config.dispatcher == "torch"
 
-    def test_gmm_experts_falls_back_to_torch(self):
-        """Test that BackendConfig falls back gmm experts to torch_mm when dispatcher is not deepep."""
-        config = BackendConfig(experts="gmm", dispatcher="torch")
+    def test_gmm_experts_alias_is_deprecated(self):
+        """Test that the old gmm name warns while remaining compatible."""
+        with pytest.warns(FutureWarning, match="experts='gmm' is deprecated"):
+            config = BackendConfig(experts="gmm", dispatcher="torch")
         assert config.experts == "torch_mm"
         assert config.dispatcher == "torch"
 
@@ -79,12 +80,6 @@ class TestBackendConfigExpertsDispatcherValidation:
         """Test that te experts with deepep dispatcher is valid."""
         config = BackendConfig(experts="te", dispatcher="deepep")
         assert config.experts == "te"
-        assert config.dispatcher == "deepep"
-
-    def test_gmm_experts_with_deepep_valid(self):
-        """Test that gmm experts with deepep dispatcher is valid."""
-        config = BackendConfig(experts="gmm", dispatcher="deepep")
-        assert config.experts == "gmm"
         assert config.dispatcher == "deepep"
 
     def test_torch_experts_with_torch_dispatcher_valid(self):
@@ -138,18 +133,18 @@ class TestBackendConfigEnableDeepepRemoved:
     def test_enable_deepep_true_is_ignored_and_warns(self, caplog):
         """enable_deepep=True is ignored; dispatcher/experts keep their explicit values and a warning is logged."""
         with caplog.at_level(logging.WARNING):
-            config = BackendConfig(dispatcher="hybridep", experts="gmm", enable_deepep=True)
+            config = BackendConfig(dispatcher="hybridep", experts="torch_mm", enable_deepep=True)
         assert config.dispatcher == "hybridep"  # not overridden to "deepep"
-        assert config.experts == "gmm"
+        assert config.experts == "torch_mm"
         assert config.enable_deepep is None  # cleared after the warning
         assert "enable_deepep is no longer supported" in caplog.text
 
     def test_enable_deepep_false_is_ignored_and_warns(self, caplog):
         """enable_deepep=False is ignored; the dispatcher is NOT forced to torch and a warning is logged."""
         with caplog.at_level(logging.WARNING):
-            config = BackendConfig(dispatcher="deepep", experts="gmm", enable_deepep=False)
+            config = BackendConfig(dispatcher="deepep", experts="torch_mm", enable_deepep=False)
         assert config.dispatcher == "deepep"  # not forced to "torch"
-        assert config.experts == "gmm"
+        assert config.experts == "torch_mm"
         assert config.enable_deepep is None
         assert "enable_deepep is no longer supported" in caplog.text
 
@@ -222,10 +217,10 @@ class TestBackendConfigHybridEP:
         assert config.experts == "te"
         assert config.dispatcher == "hybridep"
 
-    def test_gmm_experts_falls_back_with_hybridep(self):
-        """Test that gmm experts with hybridep dispatcher is valid (no fallback)."""
-        config = BackendConfig(experts="gmm", dispatcher="hybridep")
-        assert config.experts == "gmm"
+    def test_torch_mm_experts_with_hybridep(self):
+        """Test that torch_mm experts with hybridep dispatcher is valid."""
+        config = BackendConfig(experts="torch_mm", dispatcher="hybridep")
+        assert config.experts == "torch_mm"
         assert config.dispatcher == "hybridep"
 
 
@@ -328,15 +323,15 @@ class TestBackendConfigMXFP8:
         for other in ("torch", "torch_mm", "gmm", "te"):
             assert _use_mxfp8(other) is False
 
-    def test_use_torch_mm_includes_both_torch_mm_variants(self):
-        """use_torch_mm (experts.py) covers both torch_mm and torch_mm_mxfp8."""
+    def test_use_torch_mm_includes_deprecated_gmm_alias(self):
+        """The grouped-MM selector covers torch_mm, its deprecated alias, and MXFP8."""
 
         def _use_torch_mm(experts):
-            return experts in ("torch_mm", "torch_mm_mxfp8")
+            return experts in ("gmm", "torch_mm", "torch_mm_mxfp8")
 
+        assert _use_torch_mm("gmm") is True
         assert _use_torch_mm("torch_mm") is True
         assert _use_torch_mm("torch_mm_mxfp8") is True
-        assert _use_torch_mm("gmm") is False
 
 
 class TestTEFp8ConfigRecipe:

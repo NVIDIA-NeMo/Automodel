@@ -104,7 +104,6 @@ pip install transformer-engine[pytorch]==2.8.0
 # Flash-attn version should be selected to satisfy TE requirements
 # https://github.com/NVIDIA/TransformerEngine/blob/v2.4/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
 pip install flash-attn==2.7.4.post1
-pip install grouped_gemm
 ```
 
 ## Development Dependencies
@@ -164,6 +163,20 @@ Format:
 ```bash
 ruff check --fix .
 ruff format .
+```
+
+Ruff does not cover every rule we enforce. `tools/lint_no_globals.py` rejects `globals()`
+and its equivalents (module-scope `vars()`, `sys.modules[__name__].__dict__`,
+`setattr(sys.modules[__name__], ...)`). These are usually used to swap a module-level
+function so that another function picks up the replacement — a process-wide mutation that
+changes behavior for every concurrent or nested caller. Pass the collaborator in, or expose
+a method subclasses can override, instead. The one exception is the PEP 562 lazy-import
+cache: `globals()[name] = attr` written directly inside a module-level `def __getattr__(name)`.
+The check covers the same paths as Bandit (`app.py`, `nemo_automodel/`, `examples/`,
+`scripts/`, `tools/`, `tutorials/`); `tests/` is excluded, as it is for Ruff. Run it with:
+
+```bash
+python tools/lint_no_globals.py
 ```
 
 ## Pre-commit

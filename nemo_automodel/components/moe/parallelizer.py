@@ -794,11 +794,7 @@ def apply_fsdp(
     experts_mp_policy = parallelizer_utils.get_internal_fsdp_mp_policy(mp_policy)
     fp32_compute_module_names = tuple(getattr(model, "_keep_in_fp32_modules_strict", None) or ())
 
-    fully_shard_impl = fully_shard
-    if _is_deepseek_v4_model(model):
-        from nemo_automodel.components.models.deepseek_v4.fsdp import fully_shard_deepseek_v4
-
-        fully_shard_impl = fully_shard_deepseek_v4
+    fully_shard_impl = getattr(model, "_nemo_fully_shard", fully_shard)
 
     fully_shard_default = functools.partial(
         fully_shard_impl,
@@ -912,7 +908,7 @@ def apply_fsdp(
             # shards than experts (dim=0).
             # Preserve the enclosing policy's parameter, reduction, and input-cast
             # settings so FP32 master weights still compute in param_dtype (required
-            # by BF16 GMM / TE kernels). Experts are an internal FSDP boundary, so
+            # by BF16 grouped-MM / TE kernels). Experts are an internal FSDP boundary, so
             # their policy does not override the activation dtype returned to the
             # rest of the block.
             fully_shard(

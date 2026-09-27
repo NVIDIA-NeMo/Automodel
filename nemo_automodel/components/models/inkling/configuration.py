@@ -59,7 +59,7 @@ class InklingTextConfig(PretrainedConfig):
         mlp_layer_types: list[str] | None = None,
         intermediate_size: int = 24576,
         hidden_act: str = "silu",
-        moe_intermediate_size: int = 3072,
+        moe_intermediate_size: int | None = None,
         n_routed_experts: int = 256,
         num_experts_per_tok: int = 6,
         n_shared_experts: int = 2,
@@ -90,6 +90,9 @@ class InklingTextConfig(PretrainedConfig):
             layer_types = ["hybrid_sliding" if i in local_layers else "hybrid" for i in range(num_hidden_layers)]
         if mlp_layer_types is None:
             mlp_layer_types = ["dense" if i < dense_mlp_idx else "sparse" for i in range(num_hidden_layers)]
+        if moe_intermediate_size is None:
+            # Raw checkpoints use intermediate_size for experts and a separate dense width.
+            moe_intermediate_size = intermediate_size if dense_intermediate_size is not None else 3072
         if dense_intermediate_size is not None:
             intermediate_size = dense_intermediate_size
 
