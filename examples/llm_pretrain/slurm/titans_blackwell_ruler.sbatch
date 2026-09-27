@@ -19,6 +19,7 @@ TTT_MODE=${TITANS_TTT_MODE:-both}
 CONTEXT_LENGTH=${TITANS_RULER_CONTEXT_LENGTH:-${SLURM_JOB_NAME##*_}}
 RESULT_NAMESPACE=${TITANS_RULER_RESULT_NAMESPACE:-ruler}
 MODEL_REGISTRY=${TITANS_MODEL_REGISTRY:-"$AUTOMODEL_CHECKOUT/examples/llm_pretrain/titans_eval_registry.json"}
+MODEL_NAME=${TITANS_MODEL_NAME:-}
 SHARED_DATA_DIR="$TITANS_WORK_ROOT/results/eval/$RESULT_NAMESPACE/prepared-data"
 
 if [[ ! $CONTEXT_LENGTH =~ ^[0-9]+$ ]]; then
@@ -50,6 +51,7 @@ if [[ ${TITANS_EVAL_IN_CONTAINER:-0} != 1 ]]; then
       TITANS_RULER_CONTEXT_LENGTH="$CONTEXT_LENGTH" \
       TITANS_RULER_RESULT_NAMESPACE="$RESULT_NAMESPACE" \
       TITANS_MODEL_REGISTRY="$MODEL_REGISTRY" \
+      TITANS_MODEL_NAME="$MODEL_NAME" \
       PYTHONPATH="$AUTOMODEL_CHECKOUT${PYTHONPATH:+:$PYTHONPATH}" \
       HF_HOME="$TITANS_WORK_ROOT/cache/huggingface" \
       bash "$AUTOMODEL_CHECKOUT/examples/llm_pretrain/slurm/titans_blackwell_ruler.sbatch"
@@ -79,9 +81,11 @@ fi
 
 read -r -a task_args <<<"$RULER_TASKS"
 case "$TTT_MODE" in both|on|off) ;; *) echo "TITANS_TTT_MODE must be both, on, or off" >&2; exit 2 ;; esac
+model_args=()
+[[ -n $MODEL_NAME ]] && model_args=(--model "$MODEL_NAME")
 mapfile -t model_rows < <(
   python examples/llm_pretrain/titans_eval_registry.py \
-    "$MODEL_REGISTRY" --work-root "$TITANS_WORK_ROOT"
+    "$MODEL_REGISTRY" --work-root "$TITANS_WORK_ROOT" "${model_args[@]}"
 )
 (( ${#model_rows[@]} )) || { echo "Model registry has no enabled checkpoints" >&2; exit 1; }
 read -r -a seeds <<<"$RULER_SEEDS"
