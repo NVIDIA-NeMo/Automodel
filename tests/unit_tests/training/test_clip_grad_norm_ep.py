@@ -370,7 +370,7 @@ _SCENARIOS = (
 
 
 def _run_scenarios(rank: int, world: int, store_path: str) -> None:
-    dist.init_process_group("gloo", rank=rank, world_size=world, init_method=f"file:///{store_path}")
+    dist.init_process_group("gloo", rank=rank, world_size=world, init_method=f"file://{store_path}")
     try:
         for scenario in _SCENARIOS:
             scenario(rank)
