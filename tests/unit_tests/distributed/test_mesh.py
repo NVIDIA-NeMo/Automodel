@@ -194,6 +194,13 @@ class TestHelperMethods:
 
 
 class TestDistributedSetup:
+    def test_setup_without_policy_preserves_mesh_context(self):
+        mesh_context = MeshContext()
+
+        setup = DistributedSetup(mesh_context=mesh_context)
+
+        assert setup.mesh_context is mesh_context
+
     def test_minimal_setup_holds_mesh_and_policy(self):
         setup = DistributedSetup(mesh_context=MeshContext(), strategy_config=FSDP2Config(activation_checkpointing=True))
 

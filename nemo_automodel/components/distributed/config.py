@@ -110,6 +110,8 @@ class DistributedSetup:
 
     def __post_init__(self) -> None:
         """Keep the compatibility bundle and its MeshContext policy in sync."""
+        if self.strategy_config is None and self.moe_parallel_config is None and not self.activation_checkpointing:
+            return
         object.__setattr__(
             self,
             "mesh_context",
