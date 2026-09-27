@@ -94,3 +94,8 @@ dist_env:
   timeout_minutes: 30
 
 seed: 42
+
+ci:
+  recipe_owner: HuiyingLi
+  time: "01:00:00"
+  nodes: 1

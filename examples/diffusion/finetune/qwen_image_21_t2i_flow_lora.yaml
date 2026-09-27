@@ -103,3 +103,8 @@ checkpoint:
   model_save_format: torch_save
   save_consolidated: false
   restore_from: null
+
+ci:
+  recipe_owner: HuiyingLi
+  time: "01:00:00"
+  nodes: 1
