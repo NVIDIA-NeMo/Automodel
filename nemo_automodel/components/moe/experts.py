@@ -1080,7 +1080,7 @@ class GroupedExpertsDeepEP(nn.Module):
             Expert-sorted activations [dispatched_tokens, hidden], counts [local_experts],
             and probabilities [dispatched_tokens, 1]. Nonempty probabilities retain the
             dispatcher's dtype and autograd connection; empty probabilities use the
-            dispatched activation dtype.
+            configured compute dtype.
         """
         indices = indices.masked_fill(~token_mask.unsqueeze(-1), -1)
         (permuted_local_hidden_states, tokens_per_expert, permuted_probs) = self.token_dispatcher.token_permutation2(
@@ -1089,7 +1089,7 @@ class GroupedExpertsDeepEP(nn.Module):
             token_probs=weights,
             token_indices=indices,
         )
-        permuted_probs = _stabilize_empty_routing_probs_dtype(permuted_probs, permuted_local_hidden_states.dtype)
+        permuted_probs = _stabilize_empty_routing_probs_dtype(permuted_probs, self.config.dtype)
         permuted_probs = permuted_probs.unsqueeze(-1)
         return permuted_local_hidden_states, tokens_per_expert, permuted_probs
 
