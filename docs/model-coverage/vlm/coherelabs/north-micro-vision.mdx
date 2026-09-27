@@ -11,11 +11,38 @@ slug: model-coverage/vision-language-models/coherelabs/North-Micro-Vision-Instru
 `nemo-automodel==0.5.0` pins `transformers==5.8.1`, but the model's remote code calls 5.15 APIs. Install transformers separately with `--no-deps` at commit `71c6f699`; `uv pip check` will then report the environment as inconsistent, which is expected.
 </Warning>
 
+This quick start requires Docker, the NVIDIA Container Toolkit, and two GPUs.
+If Hugging Face requires authentication, export `HF_TOKEN` in the host shell
+first. For other installation methods, see the
+[Installation Guide](/get-started/installation).
+
+Run this complete block in a host shell. It downloads the container, installs
+the mounted checkout and validated Transformers revision, starts fine-tuning,
+and keeps downloaded files and checkpoints on the host.
+
 ```bash
-uv run automodel --nproc-per-node=2 examples/vlm_finetune/cohere_micro_vision/north_micro_vision_rdr.yaml
+git clone --depth=1 https://github.com/NVIDIA-NeMo/Automodel.git
+cd Automodel
+mkdir -p .cache/huggingface checkpoints
+
+docker pull nvcr.io/nvidia/nemo-automodel:26.08.00
+docker run --gpus all --network=host -it --rm \
+  --shm-size=32g \
+  -e HF_TOKEN \
+  -v "$(pwd)":/opt/Automodel \
+  -v "$(pwd)/.cache/huggingface":/root/.cache/huggingface \
+  -w /opt/Automodel \
+  nvcr.io/nvidia/nemo-automodel:26.08.00 \
+  /bin/bash -lc '
+    bash docker/common/update_pyproject_pytorch.sh /opt/Automodel &&
+    uv sync --locked --extra all --extra vlm-media --all-groups &&
+    uv pip install --no-deps \
+      "git+https://github.com/huggingface/transformers.git@71c6f699ac9b3f8fc42a6a3e9dc59034c349a678" &&
+    uv run automodel --nproc-per-node=2 examples/vlm_finetune/cohere_micro_vision/north_micro_vision_rdr.yaml
+  '
 ```
 
-Weights are pulled from the Hub and checkpoints are written relative to the working directory. Containers must use a `-devel` CUDA image, because `use_triton: true` JIT-compiles the LoRA kernels and needs a C compiler.
+Weights are pulled from the Hub and checkpoints are written relative to the working directory. The recipe needs a C compiler because `use_triton: true` JIT-compiles the LoRA kernels.
 
 The RDR recipe is 18 optimizer steps and exists to prove the pipeline. A full epoch of the Shopify recipe is 2,415 steps, completes in about an hour on two GPUs, and takes validation loss from 0.90 to 0.43.
 

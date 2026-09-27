@@ -11,15 +11,41 @@ architecture, so NeMo AutoModel uses its existing native
 
 ## Fine-Tune Qwen3.8-27B
 
+This quick start requires Docker, the NVIDIA Container Toolkit, and eight GPUs.
+If Hugging Face requires authentication, export `HF_TOKEN` in the host shell
+first. For other installation methods, see the
+[Installation Guide](/get-started/installation).
+
+Run this complete block in a host shell. It downloads the container, installs
+the VLM dependencies, starts full-parameter fine-tuning, and keeps downloaded
+files and checkpoints on the host.
+
 ```bash
-uv run automodel --nproc-per-node=8 examples/vlm_finetune/qwen3_8/qwen3_8_27b.yaml
-uv run automodel --nproc-per-node=8 examples/vlm_finetune/qwen3_8/qwen3_8_27b_lora.yaml
+git clone --depth=1 https://github.com/NVIDIA-NeMo/Automodel.git
+cd Automodel
+mkdir -p .cache/huggingface checkpoints/qwen3-8-27b
+
+docker pull nvcr.io/nvidia/nemo-automodel:26.08.00
+docker run --gpus all --network=host -it --rm \
+  --shm-size=32g \
+  -e HF_TOKEN \
+  -v "$(pwd)":/opt/Automodel \
+  -v "$(pwd)/.cache/huggingface":/root/.cache/huggingface \
+  -w /opt/Automodel \
+  nvcr.io/nvidia/nemo-automodel:26.08.00 \
+  /bin/bash -lc '
+    bash docker/common/update_pyproject_pytorch.sh /opt/Automodel &&
+    uv sync --locked --extra all --extra vlm-media --all-groups &&
+    uv run automodel --nproc-per-node=8 examples/vlm_finetune/qwen3_8/qwen3_8_27b.yaml \
+      --checkpoint.checkpoint_dir checkpoints/qwen3-8-27b
+  '
 ```
 
-Install the `vlm-media` extra before running either recipe. See the
-[Installation Guide](/get-started/installation) and the
-[Qwen3.8 fine-tuning guide](/recipes-e2e-examples/qwen3-8-27b) for setup,
-validation details, and measured training-loss curves.
+For LoRA instead of full-parameter fine-tuning, replace the recipe path with
+`examples/vlm_finetune/qwen3_8/qwen3_8_27b_lora.yaml`. The quick start installs
+the required `vlm-media` extra. See the
+[Qwen3.8 fine-tuning guide](/recipes-e2e-examples/qwen3-8-27b) for additional
+setup, validation details, and measured training-loss curves.
 
 The checked-in recipes use FSDP2 data parallelism on eight GPUs. The shared
 Qwen3.5 dense model implementation also supports TP, CP, and PP, but the

@@ -8,11 +8,40 @@ slug: model-coverage/diffusion/diffusers/LTX-2.3-Diffusers
 
 ## Fine-Tune LTX-2.3-Diffusers
 
-From the repository root, run:
+This quick start requires Docker, the NVIDIA Container Toolkit, eight GPUs, and
+a cache created with the [Diffusion Dataset Preparation Guide](/datasets/diffusion-dataset).
+If Hugging Face requires access approval for the checkpoint, export `HF_TOKEN`
+in the host shell first. For other installation methods, see the
+[Installation Guide](/get-started/installation).
+
+Run this complete block in a host shell. When prompted, enter the absolute path
+to the prepared data cache. The checkout, Hugging Face cache, and training
+checkpoints remain on the host after the container exits.
 
 ```bash
-uv run torchrun --nproc-per-node=8 examples/diffusion/finetune/finetune.py \
-  -c examples/diffusion/finetune/ltx2_3_t2v_flow.yaml
+git clone --depth=1 https://github.com/NVIDIA-NeMo/Automodel.git
+cd Automodel
+read -rp "Absolute path to the prepared LTX-2.3 data cache: " DATA_CACHE
+test -d "$DATA_CACHE"
+mkdir -p .cache/huggingface checkpoints/ltx-2-3
+
+docker pull nvcr.io/nvidia/nemo-automodel:26.08.00
+docker run --gpus all --network=host -it --rm \
+  --shm-size=32g \
+  -e HF_TOKEN \
+  -v "$(pwd)":/opt/Automodel \
+  -v "$(pwd)/.cache/huggingface":/root/.cache/huggingface \
+  -v "$DATA_CACHE":/data/cache:ro \
+  -w /opt/Automodel \
+  nvcr.io/nvidia/nemo-automodel:26.08.00 \
+  /bin/bash -lc '
+    bash docker/common/update_pyproject_pytorch.sh /opt/Automodel &&
+    uv sync --locked --extra all --extra diffusion-media --all-groups &&
+    uv run torchrun --nproc-per-node=8 examples/diffusion/finetune/finetune.py \
+      -c examples/diffusion/finetune/ltx2_3_t2v_flow.yaml \
+      --data.dataloader.cache_dir /data/cache \
+      --checkpoint.checkpoint_dir checkpoints/ltx-2-3
+  '
 ```
 
 ## Model Reference
