@@ -60,7 +60,7 @@ uv run torchrun --nproc-per-node=8 \
   -c examples/diffusion/finetune/qwen_image_21_t2i_flow.yaml
 ```
 
-The `qwen_image_21` adapter supervises only the target-image tokens of the joint text/image sequence. The transformer lays out RoPE positions once per batch, and prompt padding would shift the image positions, so the adapter runs each sample as its own unpadded transformer call and sees the positions of single-prompt inference. Qwen-Image-2.1 is sampled without classifier-free guidance, so the recipes set `cfg_dropout_prob: 0.0`. On 8x H100 80 GB at 1024x1024 with a global batch of 16, the full fine-tune runs at about 1.45 s per step and uses about 55 GB per GPU.
+The `qwen_image_21` adapter supervises only the target-image tokens of the joint text/image sequence. The transformer lays out RoPE positions once per batch, and prompt padding would shift the image positions, so the adapter runs each sample as its own unpadded transformer call and sees the positions of single-prompt inference. Qwen-Image-2.1 is sampled without classifier-free guidance, so the recipes set `cfg_dropout_prob: 0.0`. On 8x H100 80 GB at 1024x1024 with a global batch of 16, the full fine-tune runs at about 1.4 s per step and uses about 60 GB per GPU; LoRA runs at about 1.05 s per step and uses about 56 GB per GPU.
 
 Generate with the base model or a training checkpoint:
 
