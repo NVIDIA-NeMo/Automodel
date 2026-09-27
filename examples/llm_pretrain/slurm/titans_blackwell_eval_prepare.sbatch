@@ -5,7 +5,7 @@ set -euo pipefail
 
 AUTOMODEL_CHECKOUT=${AUTOMODEL_CHECKOUT:-$PWD}
 TITANS_WORK_ROOT=${TITANS_WORK_ROOT:-$(cd "$AUTOMODEL_CHECKOUT/../.." && pwd)}
-NPROC_PER_NODE=${NPROC_PER_NODE:-${SLURM_GPUS_ON_NODE:-4}}
+NPROC_PER_NODE=${NPROC_PER_NODE:-1}
 NUM_THREADS=${NUM_THREADS:-8}
 TITANS_IMAGE=${TITANS_IMAGE:-nvcr.io#nvidia/nemo-automodel:26.04}
 
@@ -29,12 +29,16 @@ fi
 cd "$AUTOMODEL_CHECKOUT"
 export PYTHONPATH="$AUTOMODEL_CHECKOUT${PYTHONPATH:+:$PYTHONPATH}"
 
-RUNS=(
-  titans-170m-baseline-15B-blackwell-optimized
-  titans-170m-mac-15B-blackwell-mac-v1
-  titans-170m-mag-15B-blackwell-mag-v1
-  titans-170m-mal-15B-blackwell-mal-v1
-)
+if [[ -n ${TITANS_RUNS:-} ]]; then
+  read -r -a RUNS <<<"$TITANS_RUNS"
+else
+  RUNS=(
+    titans-170m-baseline-15B-blackwell-optimized
+    titans-170m-mac-15B-blackwell-mac-v1
+    titans-170m-mag-15B-blackwell-mag-v1
+    titans-170m-mal-15B-blackwell-mal-v1
+  )
+fi
 
 for run in "${RUNS[@]}"; do
   root="$TITANS_WORK_ROOT/outputs/$run"
