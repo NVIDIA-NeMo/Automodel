@@ -572,8 +572,8 @@ def test_te_attention_is_constructed_natively(monkeypatch):
     "tp_size",
     [1, 2],
 )
-def test_parallel_strategy_accepts_supported_tp_sizes(monkeypatch, tp_size):
-    from nemo_automodel.components.distributed.parallelizer import DefaultParallelizationStrategy
+def test_model_parallelizer_accepts_supported_tp_sizes(monkeypatch, tp_size):
+    from nemo_automodel.components.distributed.parallelizer import ModelParallelizer
 
     class _SubMesh:
         def __init__(self, size):
@@ -589,8 +589,8 @@ def test_parallel_strategy_accepts_supported_tp_sizes(monkeypatch, tp_size):
             return _SubMesh(tp_size if name == "tp" else 1)
 
     monkeypatch.setattr(
-        DefaultParallelizationStrategy,
-        "parallelize",
+        ModelParallelizer,
+        "_apply",
         lambda _self, model, _device_mesh, **_kwargs: model,
     )
     model = MuseGlimmerForConditionalGeneration(
@@ -598,14 +598,14 @@ def test_parallel_strategy_accepts_supported_tp_sizes(monkeypatch, tp_size):
         backend=BackendConfig(attn="sdpa"),
     )
 
-    model.parallelizer.strategy.parallelize(model, _Mesh())
+    model.parallelizer._apply(model, _Mesh())
 
     assert all(not hasattr(layer.self_attn, "te_tp_replicated") for layer in model.model.layers)
 
 
 @pytest.mark.parametrize("tp_size", [4, 8])
-def test_parallel_strategy_rejects_tp_above_kv_head_count(monkeypatch, tp_size):
-    from nemo_automodel.components.distributed.parallelizer import DefaultParallelizationStrategy
+def test_model_parallelizer_rejects_tp_above_kv_head_count(monkeypatch, tp_size):
+    from nemo_automodel.components.distributed.parallelizer import ModelParallelizer
 
     class _SubMesh:
         def __init__(self, size):
@@ -621,8 +621,8 @@ def test_parallel_strategy_rejects_tp_above_kv_head_count(monkeypatch, tp_size):
             return _SubMesh(tp_size if name == "tp" else 1)
 
     monkeypatch.setattr(
-        DefaultParallelizationStrategy,
-        "parallelize",
+        ModelParallelizer,
+        "_apply",
         lambda _self, model, _device_mesh, **_kwargs: model,
     )
     model = MuseGlimmerForConditionalGeneration(
@@ -631,4 +631,4 @@ def test_parallel_strategy_rejects_tp_above_kv_head_count(monkeypatch, tp_size):
     )
 
     with pytest.raises(ValueError, match=r"supports TP1 or TP2.*tp_size=[48]"):
-        model.parallelizer.strategy.parallelize(model, _Mesh())
+        model.parallelizer._apply(model, _Mesh())

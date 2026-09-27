@@ -31,19 +31,15 @@ from torch.distributed.tensor.parallel import ColwiseParallel, ParallelStyle, Ro
 
 from nemo_automodel.components.distributed import ModelParallelizer
 from nemo_automodel.components.distributed.mesh_utils import get_fsdp_dp_mesh
-from nemo_automodel.components.distributed.parallelizer import (
-    DefaultParallelizationStrategy,
-    ParallelizationStrategy,
-    apply_fsdp2_sharding_recursively,
-)
+from nemo_automodel.components.distributed.parallelizer import apply_fsdp2_sharding_recursively
 
 logger = logging.getLogger(__name__)
 
 
-class WanParallelizationStrategy(ParallelizationStrategy):
+class WanModelParallelizer(ModelParallelizer):
     """Apply Wan-specific tensor parallelism, checkpointing, and FSDP."""
 
-    def parallelize(
+    def _apply(
         self,
         model: nn.Module,
         device_mesh: DeviceMesh,
@@ -129,10 +125,10 @@ class WanParallelizationStrategy(ParallelizationStrategy):
         )
 
 
-class HunyuanParallelizationStrategy(ParallelizationStrategy):
+class HunyuanModelParallelizer(ModelParallelizer):
     """Apply whole-block checkpointing and FSDP to Hunyuan-style models."""
 
-    def parallelize(
+    def _apply(
         self,
         model: nn.Module,
         device_mesh: DeviceMesh,
@@ -182,7 +178,7 @@ class HunyuanParallelizationStrategy(ParallelizationStrategy):
         )
 
 
-class LTX2ParallelizationStrategy(HunyuanParallelizationStrategy):
+class LTX2ModelParallelizer(HunyuanModelParallelizer):
     """Apply Hunyuan-style whole-block checkpointing to LTX-2."""
 
 
@@ -215,10 +211,10 @@ def _apply_qwen_block_activation_checkpointing(model: nn.Module) -> None:
     logger.info("Applied whole-block activation checkpointing to %d Qwen image transformer blocks", wrapped_count)
 
 
-class QwenImageEditParallelizationStrategy(DefaultParallelizationStrategy):
+class QwenImageEditModelParallelizer(ModelParallelizer):
     """Shard Qwen image transformer blocks as complete FSDP2 units."""
 
-    def parallelize(self, model: nn.Module, *args, **kwargs) -> nn.Module:
+    def _apply(self, model: nn.Module, *args, **kwargs) -> nn.Module:
         _validate_qwen_transformer_blocks(model)
         activation_checkpointing = kwargs.get("activation_checkpointing", False)
         selective = (
@@ -228,14 +224,14 @@ class QwenImageEditParallelizationStrategy(DefaultParallelizationStrategy):
         if activation_checkpointing and not selective:
             _apply_qwen_block_activation_checkpointing(model)
             kwargs["activation_checkpointing"] = False
-        return super().parallelize(model, *args, **kwargs)
+        return super()._apply(model, *args, **kwargs)
 
 
 _PARALLELIZERS: dict[str, ModelParallelizer] = {
-    "HunyuanVideo15Transformer3DModel": ModelParallelizer(HunyuanParallelizationStrategy()),
-    "LTX2VideoTransformer3DModel": ModelParallelizer(LTX2ParallelizationStrategy()),
-    "QwenImageTransformer2DModel": ModelParallelizer(QwenImageEditParallelizationStrategy()),
-    "WanTransformer3DModel": ModelParallelizer(WanParallelizationStrategy()),
+    "HunyuanVideo15Transformer3DModel": HunyuanModelParallelizer(),
+    "LTX2VideoTransformer3DModel": LTX2ModelParallelizer(),
+    "QwenImageTransformer2DModel": QwenImageEditModelParallelizer(),
+    "WanTransformer3DModel": WanModelParallelizer(),
 }
 
 

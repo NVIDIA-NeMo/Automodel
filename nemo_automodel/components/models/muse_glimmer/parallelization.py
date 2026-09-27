@@ -17,13 +17,12 @@
 from __future__ import annotations
 
 from nemo_automodel.components.distributed import ModelParallelizer
-from nemo_automodel.components.distributed.parallelizer import DefaultParallelizationStrategy
 
 
-class MuseGlimmerParallelizationStrategy(DefaultParallelizationStrategy):
+class MuseGlimmerModelParallelizer(ModelParallelizer):
     """Apply standard dense parallelism and install the model-owned CP mesh."""
 
-    def parallelize(self, model, device_mesh, **kwargs):
+    def _apply(self, model, device_mesh, **kwargs):
         tp_mesh = device_mesh["tp"] if "tp" in device_mesh.mesh_dim_names else None
         tp_size = tp_mesh.size() if tp_mesh is not None else 1
         cp_mesh = device_mesh["cp"] if "cp" in device_mesh.mesh_dim_names else None
@@ -33,7 +32,7 @@ class MuseGlimmerParallelizationStrategy(DefaultParallelizationStrategy):
             raise ValueError(
                 f"MuseGlimmer supports TP1 or TP2 because it has {num_kv_heads} KV heads; got tp_size={tp_size}."
             )
-        result = super().parallelize(model, device_mesh, **kwargs)
+        result = super()._apply(model, device_mesh, **kwargs)
         model.cp_mesh = cp_mesh if cp_mesh is not None and cp_mesh.size() > 1 else None
         model.model.cp_mesh = model.cp_mesh
         # The generic dense-TE pass configures every CP run. TP-only native
@@ -51,6 +50,6 @@ class MuseGlimmerParallelizationStrategy(DefaultParallelizationStrategy):
         return result
 
 
-PARALLELIZER = ModelParallelizer(MuseGlimmerParallelizationStrategy())
+PARALLELIZER = MuseGlimmerModelParallelizer()
 
 __all__ = ["PARALLELIZER"]

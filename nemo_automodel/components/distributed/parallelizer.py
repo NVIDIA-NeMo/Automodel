@@ -16,12 +16,11 @@ import importlib
 import inspect
 import logging
 import warnings
-from abc import ABC, abstractmethod
 from collections.abc import Callable
 from contextlib import contextmanager
 from functools import lru_cache
 from types import FunctionType
-from typing import Any, Dict, Generator, List, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, Generator, List, Sequence, Tuple, Union
 
 import torch
 from torch import nn
@@ -84,9 +83,11 @@ from nemo_automodel.components.distributed.parallel_styles import ReplicatedWith
 from nemo_automodel.shared.import_utils import UnavailableMeta, safe_import_from
 from nemo_automodel.shared.tied_weights import ensure_tied_lm_head
 
+if TYPE_CHECKING:
+    from nemo_automodel.components.distributed.model_parallelizer import ParallelizeContext
+
 __all__ = [
-    "DefaultParallelizationStrategy",
-    "ParallelizationStrategy",
+    "ModelParallelizer",
     "apply_fsdp2_sharding_recursively",
     "apply_selective_activation_checkpointing",
     "fsdp2_strategy_parallelize",
@@ -158,36 +159,6 @@ def apply_selective_activation_checkpointing(
         return
     has_kv_sharing = detect_kv_sharing_and_maybe_disable_cache(model)
     apply_selective_checkpointing_to_layers(model, layers, has_kv_sharing, enable_compile=enable_compile)
-
-
-class ParallelizationStrategy(ABC):
-    """Abstract base class for model parallelization strategies."""
-
-    def _fully_shard_module(self, module: nn.Module, **kwargs) -> nn.Module:
-        """Apply the FSDP2 primitive used by this model sidecar."""
-        return fully_shard(module, **kwargs)
-
-    @abstractmethod
-    def parallelize(
-        self,
-        model: nn.Module,
-        device_mesh: DeviceMesh,
-        mp_policy: MixedPrecisionPolicy | None = None,
-        offload_policy: OffloadPolicy | None = None,
-        sequence_parallel: bool = False,
-        activation_checkpointing: bool = False,
-        tp_shard_plan: Union[Dict[str, ParallelStyle], str] | None = None,
-        dp_replicate_mesh_name: str = "dp_replicate",
-        dp_shard_cp_mesh_name: str = "dp_shard_cp",
-        tp_mesh_name: str = "tp",
-        reshard_after_forward: bool | None = None,
-        activation_checkpointing_scope: ActivationCheckpointingScope | None = "all",
-        frozen_multimodal_sharding: FrozenMultimodalSharding = "root",
-        reapply_trainability: Callable[[nn.Module], None] | None = None,
-        **kwargs,
-    ) -> nn.Module:
-        """Apply parallelization strategy to the model."""
-        pass
 
 
 def _get_input_output_embeddings(model: nn.Module) -> tuple[nn.Module | None, nn.Module | None]:
@@ -278,10 +249,27 @@ def _fully_shard_untied_input_output_embeddings(
         logger.info("Sharded %s as an independent FSDP unit", role)
 
 
-class DefaultParallelizationStrategy(ParallelizationStrategy):
-    """Default parallelization strategy used by most models."""
+class ModelParallelizer:
+    """Single model-owned parallelization sidecar contract."""
+
+    _customizes_moe_fsdp = False
 
     def parallelize(
+        self,
+        model: nn.Module,
+        context: "ParallelizeContext",
+        /,
+    ) -> nn.Module:
+        """Apply every requested parallelism and return the parallelized model."""
+        from nemo_automodel.components.distributed.model_parallelizer import _apply_model_parallelizer
+
+        return _apply_model_parallelizer(self, model, context)
+
+    def _fully_shard_module(self, module: nn.Module, **kwargs) -> nn.Module:
+        """Apply the FSDP2 primitive used by this model sidecar."""
+        return fully_shard(module, **kwargs)
+
+    def _apply(
         self,
         model: nn.Module,
         device_mesh: DeviceMesh,
@@ -303,7 +291,7 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
         frozen_multimodal_sharding: FrozenMultimodalSharding = "root",
         reapply_trainability: Callable[[nn.Module], None] | None = None,
     ) -> nn.Module:
-        """Apply the default parallelization flow."""
+        """Apply the shared dense FSDP2 implementation."""
         frozen_multimodal_sharding = normalize_frozen_multimodal_sharding(frozen_multimodal_sharding)
         tp_mesh = device_mesh[tp_mesh_name]
         # Set FSDP sharding mesh to context parallel mesh if CP > 1, else default to the data parallel mesh.
@@ -537,7 +525,7 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
             fsdp2_backward_prefetch_depth,
             fsdp2_forward_prefetch_depth,
             reshard_after_forward,
-            parallelization_strategy=self,
+            model_parallelizer=self,
             frozen_multimodal_sharding=frozen_multimodal_sharding,
             ignored_multimodal_params=ignored_multimodal_params,
         )
@@ -579,7 +567,7 @@ def _apply_per_layer_compile(model: nn.Module) -> None:
     LoRA and other trainable-parameter gradients.
 
     Prerequisite: NO_REENTRANT checkpoint_wrapper must already be applied to self_attn
-    and mlp before FSDP2 sharding (done in DefaultParallelizationStrategy).  This
+    and mlp before FSDP2 sharding (done by ``ModelParallelizer``).  This
     function only handles the compile step.
 
     Whole-block selective-AC wrappers (tagged with ``SELECTIVE_AC_WRAPPER_FLAG``)
@@ -663,7 +651,7 @@ def apply_fsdp2_sharding_recursively(
     fsdp2_backward_prefetch_depth: int = 2,
     fsdp2_forward_prefetch_depth: int = 1,
     reshard_after_forward: bool | None = None,
-    parallelization_strategy: ParallelizationStrategy | None = None,
+    model_parallelizer: ModelParallelizer | None = None,
     frozen_multimodal_sharding: FrozenMultimodalSharding = "root",
     ignored_multimodal_params: set[nn.Parameter] | None = None,
 ) -> None:
@@ -690,7 +678,7 @@ def apply_fsdp2_sharding_recursively(
         fsdp2_forward_prefetch_depth (int): Forward prefetch depth.
         reshard_after_forward (Optional[bool]): Optional override for each layer's
             ``fully_shard`` reshard behavior.
-        parallelization_strategy: Optional model sidecar strategy that owns the
+        model_parallelizer: Optional model sidecar that owns the
             FSDP primitive.
         frozen_multimodal_sharding: Whether fully frozen multimodal modules are
             owned by the root FSDP unit, sharded per layer, or replicated.
@@ -701,7 +689,7 @@ def apply_fsdp2_sharding_recursively(
         FSDP2-subclassed versions.
     """
     frozen_multimodal_sharding = normalize_frozen_multimodal_sharding(frozen_multimodal_sharding)
-    shard_module = fully_shard if parallelization_strategy is None else parallelization_strategy._fully_shard_module
+    shard_module = fully_shard if model_parallelizer is None else model_parallelizer._fully_shard_module
     pp_enabled = "pp" in mesh.mesh_dim_names and mesh["pp"].size() > 1
 
     if isinstance(module, (nn.ModuleList, nn.ModuleDict)):
@@ -729,7 +717,7 @@ def apply_fsdp2_sharding_recursively(
                 fsdp2_backward_prefetch_depth,
                 fsdp2_forward_prefetch_depth,
                 reshard_after_forward,
-                parallelization_strategy=parallelization_strategy,
+                model_parallelizer=model_parallelizer,
                 frozen_multimodal_sharding=frozen_multimodal_sharding,
                 ignored_multimodal_params=ignored_multimodal_params,
             )
@@ -795,7 +783,7 @@ def apply_fsdp2_sharding_recursively(
                 fsdp2_backward_prefetch_depth,
                 fsdp2_forward_prefetch_depth,
                 reshard_after_forward,
-                parallelization_strategy=parallelization_strategy,
+                model_parallelizer=model_parallelizer,
                 frozen_multimodal_sharding=frozen_multimodal_sharding,
                 ignored_multimodal_params=ignored_multimodal_params,
             )

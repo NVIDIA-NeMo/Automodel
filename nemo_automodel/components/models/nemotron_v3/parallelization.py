@@ -29,7 +29,6 @@ from torch.distributed.tensor.placement_types import Shard
 from nemo_automodel.components.distributed import ModelParallelizer
 from nemo_automodel.components.distributed.mesh_utils import get_fsdp_dp_mesh
 from nemo_automodel.components.distributed.parallel_styles import translate_to_lora
-from nemo_automodel.components.distributed.parallelizer import ParallelizationStrategy
 from nemo_automodel.components.distributed.parallelizer_utils import (
     fully_shard_by_dtype,
     reject_unsupported_mtp_cp,
@@ -47,10 +46,10 @@ def _decoder_blocks(model: nn.Module) -> tuple[nn.Module, list[nn.Module]]:
     return container, blocks
 
 
-class NemotronHParallelizationStrategy(ParallelizationStrategy):
+class NemotronHModelParallelizer(ModelParallelizer):
     """Apply Nemotron-H's specialized TP, CP, AC, and FSDP policy."""
 
-    def parallelize(
+    def _apply(
         self,
         model: nn.Module,
         device_mesh: DeviceMesh,
@@ -159,6 +158,6 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
         )
 
 
-PARALLELIZER = ModelParallelizer(NemotronHParallelizationStrategy())
+PARALLELIZER = NemotronHModelParallelizer()
 
 __all__ = ["PARALLELIZER"]

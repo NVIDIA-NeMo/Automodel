@@ -425,7 +425,7 @@ def _import_parallelizer_with_stubs(monkeypatch):
         fp32_compute_module_names=(),
         reshard_after_forward=None,
         ignored_params=None,
-        parallelization_strategy=None,
+        model_parallelizer=None,
     ):
         kwargs = {
             "mesh": mesh,
@@ -438,8 +438,8 @@ def _import_parallelizer_with_stubs(monkeypatch):
             kwargs["ignored_params"] = ignored_params
         shard_module = (
             sys.modules["nemo_automodel.components.moe.parallelizer"].fully_shard
-            if parallelization_strategy is None
-            else parallelization_strategy._fully_shard_module
+            if model_parallelizer is None
+            else model_parallelizer._fully_shard_module
         )
         shard_module(module, **kwargs)
 
@@ -1093,7 +1093,7 @@ def test_apply_fsdp_routes_strict_fp32_contract_and_expert_exclusions_to_shared_
         ),
         reshard_after_forward=True,
         ignored_params=set(block.mlp.experts.parameters()),
-        parallelization_strategy=None,
+        model_parallelizer=None,
     )
 
 
@@ -2078,9 +2078,9 @@ def test_apply_fsdp_uses_sidecar_sharder_or_default(
     block = DummyBlock(mlp=DummyMoE())
     model = DummyModel([block])
     model.visual = DummyExperts()
-    strategy = None
+    model_parallelizer = None
     if model_owned_sharding:
-        strategy = types.SimpleNamespace(
+        model_parallelizer = types.SimpleNamespace(
             _fully_shard_module=model_shard,
         )
 
@@ -2090,7 +2090,7 @@ def test_apply_fsdp_uses_sidecar_sharder_or_default(
         ep_enabled=False,
         ep_shard_enabled=False,
         lm_head_precision=None,
-        parallelization_strategy=strategy,
+        model_parallelizer=model_parallelizer,
     )
 
     selected = model_shard if model_owned_sharding else default_shard

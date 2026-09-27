@@ -12,11 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for the parallelization strategy pattern."""
+"""Tests for model-owned parallelization implementations."""
 
 import logging
 import sys
-from abc import ABC
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
@@ -26,24 +25,23 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor.parallel import ColwiseParallel
 
 from nemo_automodel._diffusers import parallelization as diffusers_parallelization
-from nemo_automodel._diffusers.parallelization import HunyuanParallelizationStrategy, WanParallelizationStrategy
+from nemo_automodel._diffusers.parallelization import HunyuanModelParallelizer, WanModelParallelizer
 from nemo_automodel.components.distributed import parallelizer as parallelizer_mod
 from nemo_automodel.components.distributed.activation_checkpointing import sdpa_backend_snapshot_context_fn
 
 # Import the components under test
 from nemo_automodel.components.distributed.parallelizer import (
-    DefaultParallelizationStrategy,
-    ParallelizationStrategy,
+    ModelParallelizer,
     _extract_model_layers,
     fsdp2_strategy_parallelize,
 )
 from nemo_automodel.components.models.nemotron_v3 import parallelization as nemotron_parallelization
 from nemo_automodel.components.models.nemotron_v3.parallelization import (
-    NemotronHParallelizationStrategy,
+    NemotronHModelParallelizer,
     _decoder_blocks,
 )
 from nemo_automodel.components.models.qwen3_5 import parallelization as qwen3_5_parallelization
-from nemo_automodel.components.models.qwen3_5.parallelization import Qwen3_5ParallelizationStrategy
+from nemo_automodel.components.models.qwen3_5.parallelization import Qwen3_5ModelParallelizer
 
 
 class MockModel(nn.Module):
@@ -271,40 +269,21 @@ def mock_distributed_env(monkeypatch):
     }
 
 
-class TestParallelizationStrategy:
-    """Test the abstract ParallelizationStrategy base class."""
-
-    def test_is_abstract(self):
-        """Test that ParallelizationStrategy is abstract and cannot be instantiated."""
-        with pytest.raises(TypeError, match="Can't instantiate abstract class"):
-            ParallelizationStrategy()  # type: ignore
-
-    def test_has_abstract_parallelize_method(self):
-        """Test that the parallelize method is abstract."""
-        assert hasattr(ParallelizationStrategy, "parallelize")
-        assert getattr(ParallelizationStrategy.parallelize, "__isabstractmethod__", False)
-
-    def test_inherits_from_abc(self):
-        """Test that ParallelizationStrategy inherits from ABC."""
-        assert issubclass(ParallelizationStrategy, ABC)
-
-
-class TestDefaultParallelizationStrategy:
-    """Test the DefaultParallelizationStrategy class."""
+class TestModelParallelizer:
+    """Test the shared ModelParallelizer implementation."""
 
     @pytest.fixture
     def strategy(self):
-        """Create a DefaultParallelizationStrategy instance."""
-        return DefaultParallelizationStrategy()
+        """Create a ModelParallelizer instance."""
+        return ModelParallelizer()
 
     def test_can_be_instantiated(self, strategy):
-        """Test that DefaultParallelizationStrategy can be instantiated."""
-        assert isinstance(strategy, DefaultParallelizationStrategy)
-        assert isinstance(strategy, ParallelizationStrategy)
+        """Test that ModelParallelizer can be instantiated."""
+        assert isinstance(strategy, ModelParallelizer)
 
     def test_parallelize_method_signature(self, strategy):
         """Test that parallelize method has the correct signature."""
-        method = strategy.parallelize
+        method = strategy._apply
         assert callable(method)
 
         # Check that all required parameters are supported
@@ -331,12 +310,12 @@ class TestDefaultParallelizationStrategy:
             assert param in sig.parameters
 
     def test_parallelize_basic_flow(self, strategy, mock_device_mesh, mock_distributed_env):
-        """Test the basic parallelization flow of DefaultParallelizationStrategy."""
+        """Test the basic dense FSDP2 flow of ModelParallelizer."""
         mesh, dp_replicate_mesh, dp_shard_mesh, tp_mesh = mock_device_mesh
         model = MockModel()
 
         # Call the strategy
-        result = strategy.parallelize(
+        result = strategy._apply(
             model=model,
             device_mesh=mesh,
             sequence_parallel=False,
@@ -369,7 +348,7 @@ class TestDefaultParallelizationStrategy:
         mp_policy = MagicMock()
         offload_policy = MagicMock()
 
-        strategy.parallelize(
+        strategy._apply(
             model=model,
             device_mesh=mesh,
             mp_policy=mp_policy,
@@ -389,7 +368,7 @@ class TestDefaultParallelizationStrategy:
             5,
             4,
             True,
-            parallelization_strategy=strategy,
+            model_parallelizer=strategy,
             frozen_multimodal_sharding="root",
             ignored_multimodal_params=set(),
         )
@@ -416,7 +395,7 @@ class TestDefaultParallelizationStrategy:
         model.get_input_embeddings = lambda: model.model.embed_tokens
         model.get_output_embeddings = lambda: model.lm_head
 
-        strategy.parallelize(
+        strategy._apply(
             model=model,
             device_mesh=mesh,
             sequence_parallel=False,
@@ -447,7 +426,7 @@ class TestDefaultParallelizationStrategy:
         model.get_input_embeddings = lambda: model.model.embed_tokens
         model.get_output_embeddings = lambda: model.lm_head
 
-        strategy.parallelize(
+        strategy._apply(
             model=model,
             device_mesh=mesh,
             sequence_parallel=False,
@@ -468,7 +447,7 @@ class TestDefaultParallelizationStrategy:
         model.get_input_embeddings = lambda: model.model.embed_tokens
         model.get_output_embeddings = lambda: model.lm_head
 
-        strategy.parallelize(
+        strategy._apply(
             model=model,
             device_mesh=mesh,
             sequence_parallel=False,
@@ -487,7 +466,7 @@ class TestDefaultParallelizationStrategy:
 
         model = MockModel()
 
-        strategy.parallelize(
+        strategy._apply(
             model=model,
             device_mesh=mesh,
             sequence_parallel=False,
@@ -509,7 +488,7 @@ class TestDefaultParallelizationStrategy:
         mock_distributed_env["parallelize_module"].side_effect = lambda *_args, **_kwargs: events.append("tp")
         mock_distributed_env["apply_fsdp"].side_effect = lambda *_args, **_kwargs: events.append("fsdp")
 
-        strategy.parallelize(
+        strategy._apply(
             model=model,
             device_mesh=mesh,
             reapply_trainability=lambda _model: events.append("trainability"),
@@ -531,7 +510,7 @@ class TestDefaultParallelizationStrategy:
 
         model = MockModel()
 
-        strategy.parallelize(
+        strategy._apply(
             model=model,
             device_mesh=mesh,
             sequence_parallel=False,
@@ -565,7 +544,7 @@ class TestDefaultParallelizationStrategy:
 
         model = MockModel()
 
-        strategy.parallelize(
+        strategy._apply(
             model=model,
             device_mesh=mesh,
             dp_replicate_mesh_name="custom_dp_replicate",
@@ -593,7 +572,7 @@ class TestDefaultParallelizationStrategy:
         monkeypatch.setattr(parallelizer_mod, "get_fsdp_dp_mesh", lambda *args, **kwargs: dp_mesh)
 
         with caplog.at_level(logging.WARNING, logger=parallelizer_mod.__name__):
-            strategy.parallelize(
+            strategy._apply(
                 model=MockModel(),
                 device_mesh=mesh,
                 sequence_parallel=False,
@@ -604,13 +583,13 @@ class TestDefaultParallelizationStrategy:
         assert "reshard_after_forward=True overrides the pipeline-parallel default" in caplog.text
 
 
-class TestNemotronHParallelizationStrategy:
-    """Test the NemotronHParallelizationStrategy class."""
+class TestNemotronHModelParallelizer:
+    """Test the NemotronHModelParallelizer class."""
 
     @pytest.fixture
     def strategy(self):
-        """Create a NemotronHParallelizationStrategy instance."""
-        return NemotronHParallelizationStrategy()
+        """Create a NemotronHModelParallelizer instance."""
+        return NemotronHModelParallelizer()
 
     @pytest.fixture
     def nemotron_model(self):
@@ -618,9 +597,9 @@ class TestNemotronHParallelizationStrategy:
         return MockNemotronHModel()
 
     def test_can_be_instantiated(self, strategy):
-        """Test that NemotronHParallelizationStrategy can be instantiated."""
-        assert isinstance(strategy, NemotronHParallelizationStrategy)
-        assert isinstance(strategy, ParallelizationStrategy)
+        """Test that NemotronHModelParallelizer can be instantiated."""
+        assert isinstance(strategy, NemotronHModelParallelizer)
+        assert isinstance(strategy, ModelParallelizer)
 
     @pytest.mark.parametrize("mtp_enabled", [True, False])
     def test_configures_only_enabled_mtp_attention_and_mamba_for_cp(
@@ -697,7 +676,7 @@ class TestNemotronHParallelizationStrategy:
         monkeypatch.setattr(nemotron_parallelization, "fully_shard", lambda model, **_kwargs: model)
         monkeypatch.setattr(nemotron_parallelization, "fully_shard_by_dtype", lambda model, **_kwargs: model)
 
-        strategy.parallelize(model=nemotron_model, device_mesh=mesh)
+        strategy._apply(model=nemotron_model, device_mesh=mesh)
 
         if not mtp_enabled:
             attention_module.set_context_parallel_group.assert_not_called()
@@ -758,7 +737,7 @@ class TestNemotronHParallelizationStrategy:
         )
 
         with pytest.raises(NotImplementedError, match="MTP with context and pipeline parallelism"):
-            strategy.parallelize(model=nemotron_model, device_mesh=mesh)
+            strategy._apply(model=nemotron_model, device_mesh=mesh)
 
     def test_cp_raises_when_enabled_mtp_layers_are_unavailable(
         self,
@@ -787,7 +766,7 @@ class TestNemotronHParallelizationStrategy:
         )
 
         with pytest.raises(RuntimeError, match=r"MTP is enabled but model\.mtp\.layers is unavailable"):
-            strategy.parallelize(model=nemotron_model, device_mesh=mesh)
+            strategy._apply(model=nemotron_model, device_mesh=mesh)
 
     def test_cp_rejects_enabled_mtp_without_capability(
         self,
@@ -817,14 +796,14 @@ class TestNemotronHParallelizationStrategy:
         )
 
         with pytest.raises(RuntimeError, match="does not support MTP with context parallelism"):
-            strategy.parallelize(model=nemotron_model, device_mesh=mesh)
+            strategy._apply(model=nemotron_model, device_mesh=mesh)
 
     def test_sequence_parallel_not_supported(self, strategy, mock_device_mesh, nemotron_model):
         """Test that sequence parallelism raises assertion error."""
         mesh, _, _, _ = mock_device_mesh
 
         with pytest.raises(ValueError, match="Sequence parallelism is not supported"):
-            strategy.parallelize(
+            strategy._apply(
                 model=nemotron_model,
                 device_mesh=mesh,
                 sequence_parallel=True,
@@ -855,7 +834,7 @@ class TestNemotronHParallelizationStrategy:
         old_level = logger.level
         logger.setLevel(logging.DEBUG)
         try:
-            result = strategy.parallelize(
+            result = strategy._apply(
                 model=nemotron_model,
                 device_mesh=mesh,
                 tp_shard_plan={"test": ColwiseParallel()},
@@ -884,7 +863,7 @@ class TestNemotronHParallelizationStrategy:
         fully_shard_by_dtype.side_effect = lambda model, **kwargs: model
         tp_mesh.size.return_value = tp_size
 
-        strategy.parallelize(
+        strategy._apply(
             model=nemotron_model,
             device_mesh=mesh,
             activation_checkpointing=False,
@@ -919,7 +898,7 @@ class TestNemotronHParallelizationStrategy:
         fully_shard.side_effect = lambda model, **kwargs: model
         fully_shard_by_dtype.side_effect = lambda model, **kwargs: model
 
-        strategy.parallelize(
+        strategy._apply(
             model=nemotron_model,
             device_mesh=mesh,
             activation_checkpointing=False,
@@ -954,7 +933,7 @@ class TestNemotronHParallelizationStrategy:
         setattr(mamba_layer, "block_type", "mamba")
         nemotron_model.backbone.layers.append(mamba_layer)
 
-        strategy.parallelize(
+        strategy._apply(
             model=nemotron_model,
             device_mesh=mesh,
             activation_checkpointing=True,
@@ -975,13 +954,13 @@ class _MockQwen35Model(nn.Module):
         self.model.layers = nn.ModuleList([nn.Linear(10, 10), nn.Linear(10, 10)])
 
 
-class TestQwen3_5ParallelizationStrategy:
-    """Test the Qwen3.5 dtype-based FSDP strategy."""
+class TestQwen3_5ModelParallelizer:
+    """Test the Qwen3.5 dtype-based model parallelizer."""
 
     @pytest.fixture
     def strategy(self):
-        """Create a Qwen3_5ParallelizationStrategy instance."""
-        return Qwen3_5ParallelizationStrategy()
+        """Create a Qwen3_5ModelParallelizer instance."""
+        return Qwen3_5ModelParallelizer()
 
     @pytest.mark.parametrize(
         "frozen_multimodal_sharding, expected_ignored, expected_vision_sharded",
@@ -1026,7 +1005,7 @@ class TestQwen3_5ParallelizationStrategy:
         fully_shard.side_effect = lambda model, **kwargs: model
         fully_shard_by_dtype.side_effect = lambda model, *args, **kwargs: model
 
-        result = strategy.parallelize(
+        result = strategy._apply(
             model=model,
             device_mesh=mesh,
             frozen_multimodal_sharding=frozen_multimodal_sharding,
@@ -1069,7 +1048,7 @@ class TestQwen3_5ParallelizationStrategy:
         fully_shard.side_effect = lambda model, **kwargs: model
         fully_shard_by_dtype.side_effect = record
 
-        strategy.parallelize(model=_MockQwen35Model(), device_mesh=mesh)
+        strategy._apply(model=_MockQwen35Model(), device_mesh=mesh)
 
         assert observed, "expected the dtype-aware sharder to run"
         assert all(fn is default_walk for fn in observed)
@@ -1084,31 +1063,31 @@ class TestQwen3_5ParallelizationStrategy:
         monkeypatch.setattr(strategy, "_fully_shard_module", custom_fully_shard)
         monkeypatch.setattr(qwen3_5_parallelization, "fully_shard_by_dtype", fully_shard_by_dtype)
 
-        result = strategy.parallelize(model=model, device_mesh=mesh)
+        result = strategy._apply(model=model, device_mesh=mesh)
 
         assert result is model
         layer_calls = fully_shard_by_dtype.call_args_list
         assert [call.args[0] for call in layer_calls] == list(model.model.layers)
-        assert all(call.kwargs["parallelization_strategy"] is strategy for call in layer_calls)
+        assert all(call.kwargs["model_parallelizer"] is strategy for call in layer_calls)
         assert custom_fully_shard.call_args_list[-1].args[0] is model
 
 
 class TestModelSidecars:
-    """Model-specific strategies are owned by immutable sidecars."""
+    """Model-specific parallelizers are owned by their model classes."""
 
-    def test_nemotron_sidecar_owns_nemotron_strategy(self):
-        assert isinstance(nemotron_parallelization.PARALLELIZER.strategy, NemotronHParallelizationStrategy)
+    def test_nemotron_sidecar_is_specialized(self):
+        assert isinstance(nemotron_parallelization.PARALLELIZER, NemotronHModelParallelizer)
 
-    def test_qwen35_sidecar_owns_qwen35_strategy(self):
-        assert isinstance(qwen3_5_parallelization.PARALLELIZER.strategy, Qwen3_5ParallelizationStrategy)
+    def test_qwen35_sidecar_is_specialized(self):
+        assert isinstance(qwen3_5_parallelization.PARALLELIZER, Qwen3_5ModelParallelizer)
 
 
-class TestWanParallelizationStrategy:
-    """Tests for WanParallelizationStrategy."""
+class TestWanModelParallelizer:
+    """Tests for WanModelParallelizer."""
 
     @pytest.fixture
     def wan_strategy(self):
-        return WanParallelizationStrategy()
+        return WanModelParallelizer()
 
     @pytest.fixture
     def wan_model(self):
@@ -1197,7 +1176,7 @@ class TestWanParallelizationStrategy:
         mesh, dp_mesh, tp_mesh = mesh_tp1
         env = self._mock_env(monkeypatch, dp_mesh_sentinel=dp_mesh)
 
-        result = wan_strategy.parallelize(model=wan_model, device_mesh=mesh)
+        result = wan_strategy._apply(model=wan_model, device_mesh=mesh)
 
         # No TP calls when tp size == 1
         env["parallelize_module"].assert_not_called()
@@ -1210,7 +1189,7 @@ class TestWanParallelizationStrategy:
         mesh, dp_mesh, tp_mesh = mesh_tp2
         env = self._mock_env(monkeypatch, dp_mesh_sentinel=dp_mesh)
 
-        result = wan_strategy.parallelize(model=wan_model, device_mesh=mesh)
+        result = wan_strategy._apply(model=wan_model, device_mesh=mesh)
 
         # parallelize_module should be called for text_embedder, time_embedder, time_proj, each block.ffn, and proj_out
         # There are 2 blocks with ffn → 2 calls + 3 condition embedder + 1 proj_out = 6
@@ -1245,7 +1224,7 @@ class TestWanParallelizationStrategy:
         )
 
         caplog.set_level(logging.WARNING)
-        result = wan_strategy.parallelize(model=wan_model, device_mesh=mesh)
+        result = wan_strategy._apply(model=wan_model, device_mesh=mesh)
 
         # We should have logged a warning from one of the try/excepts
         assert "Wan strategy: failed" in caplog.text
@@ -1264,7 +1243,7 @@ class TestWanParallelizationStrategy:
             ("custom_dp_repl", "custom_dp_shard"): dp_mesh,
         }[key]
 
-        result = wan_strategy.parallelize(
+        result = wan_strategy._apply(
             model=wan_model,
             device_mesh=mesh,
             dp_replicate_mesh_name="custom_dp_repl",
@@ -1279,12 +1258,12 @@ class TestWanParallelizationStrategy:
         assert result is wan_model
 
 
-class TestHunyuanParallelizationStrategy:
-    """Tests for HunyuanParallelizationStrategy."""
+class TestHunyuanModelParallelizer:
+    """Tests for HunyuanModelParallelizer."""
 
     @pytest.fixture
     def hunyuan_strategy(self):
-        return HunyuanParallelizationStrategy()
+        return HunyuanModelParallelizer()
 
     @pytest.fixture
     def hunyuan_model(self):
@@ -1318,7 +1297,7 @@ class TestHunyuanParallelizationStrategy:
             raising=False,
         )
 
-        result = hunyuan_strategy.parallelize(
+        result = hunyuan_strategy._apply(
             model=hunyuan_model,
             device_mesh=mesh,
             enable_fsdp2_prefetch=False,
@@ -1462,9 +1441,7 @@ class TestSidecarExtensibility:
 
     def test_model_sidecars_are_isolated(self):
         assert nemotron_parallelization.PARALLELIZER is not qwen3_5_parallelization.PARALLELIZER
-        assert type(nemotron_parallelization.PARALLELIZER.strategy) is not type(
-            qwen3_5_parallelization.PARALLELIZER.strategy
-        )
+        assert type(nemotron_parallelization.PARALLELIZER) is not type(qwen3_5_parallelization.PARALLELIZER)
 
 
 class TestDeciLMNemotronNASValidation:
@@ -1541,8 +1518,8 @@ class TestDeciLMNemotronNASValidation:
         validate_nemotron_nas_tp_mesh(model, tp_size=2)
 
 
-class TestQwenImageEditParallelizationStrategy:
-    """Tests for the Qwen image-edit whole-block checkpointing strategy."""
+class TestQwenImageEditModelParallelizer:
+    """Tests for the Qwen image-edit model parallelizer."""
 
     @staticmethod
     def _tiny_transformer():
@@ -1586,7 +1563,7 @@ class TestQwenImageEditParallelizationStrategy:
         }
         assert expected_branch_parameters <= set(actual_state)
 
-    def test_strategy_checkpoints_blocks_before_standard_fsdp_flow(self, monkeypatch):
+    def test_parallelizer_checkpoints_blocks_before_standard_fsdp_flow(self, monkeypatch):
         """Cover complete Qwen blocks before delegating to repository FSDP2."""
         import torch
         from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
@@ -1595,13 +1572,13 @@ class TestQwenImageEditParallelizationStrategy:
         delegated = {}
 
         def fake_parallelize(self, model, *args, **kwargs):
-            """Capture the model handed to the standard distributed strategy."""
+            """Capture the model handed to the standard distributed flow."""
             delegated["model"] = model
             delegated.update(kwargs)
             return model
 
-        monkeypatch.setattr(DefaultParallelizationStrategy, "parallelize", fake_parallelize)
-        result = diffusers_parallelization.QwenImageEditParallelizationStrategy().parallelize(
+        monkeypatch.setattr(ModelParallelizer, "_apply", fake_parallelize)
+        result = diffusers_parallelization.QwenImageEditModelParallelizer()._apply(
             model=model,
             device_mesh=object(),
             activation_checkpointing=True,
@@ -1622,7 +1599,7 @@ class TestQwenImageEditParallelizationStrategy:
         model_type = type("QwenImageTransformer2DModel", (nn.Module,), {})
         model = model_type()
         diffusers_parallelization.attach_parallelizer(model)
-        assert isinstance(model.parallelizer.strategy, diffusers_parallelization.QwenImageEditParallelizationStrategy)
+        assert isinstance(model.parallelizer, diffusers_parallelization.QwenImageEditModelParallelizer)
 
     def test_strategy_rejects_blocks_missing_text_branch(self):
         """Prevent silent omission of Qwen text-MLP parameters from sharding."""

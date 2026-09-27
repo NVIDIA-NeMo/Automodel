@@ -15,7 +15,7 @@
 """FSDP2 sharding for ``diffusion_gemma`` under pure FSDP (``ep_size=1``).
 
 At ``ep_size=1`` there is no MoE mesh, so the model is sharded by the generic
-:class:`~nemo_automodel.components.distributed.parallelizer.DefaultParallelizationStrategy`
+:class:`~nemo_automodel.components.distributed.parallelizer.ModelParallelizer`
 (via ``ModelParallelizer.parallelize``), which applies ``fully_shard`` per decoder
 layer and to the root.  The generic ``fully_shard`` flattens *all* of a decoder
 layer's parameters into one FSDP unit, which folds each layer's grouped-expert
@@ -51,7 +51,6 @@ from torch import nn
 from torch.distributed.fsdp import fully_shard
 
 from nemo_automodel.components.distributed import ModelParallelizer
-from nemo_automodel.components.distributed.parallelizer import DefaultParallelizationStrategy
 
 
 def _has_fsdp_state(module: nn.Module) -> bool:
@@ -117,13 +116,13 @@ def fully_shard_diffusion_gemma(module: nn.Module, mesh, mp_policy, offload_poli
     )
 
 
-class DiffusionGemmaParallelizationStrategy(DefaultParallelizationStrategy):
+class DiffusionGemmaModelParallelizer(ModelParallelizer):
     """Pure-FSDP2 strategy that shards grouped experts as their own units."""
 
     def _fully_shard_module(self, module, **kwargs):
         return fully_shard_diffusion_gemma(module, **kwargs)
 
 
-PARALLELIZER = ModelParallelizer(DiffusionGemmaParallelizationStrategy())
+PARALLELIZER = DiffusionGemmaModelParallelizer()
 
 __all__ = ["PARALLELIZER", "fully_shard_diffusion_gemma"]

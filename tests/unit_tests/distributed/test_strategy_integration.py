@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Integration tests to verify the strategy pattern maintains backward compatibility."""
+"""Integration tests for model-owned parallelization."""
 
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -27,7 +27,7 @@ from nemo_automodel.components.models.nemotron_v3.parallelization import (
     PARALLELIZER as NEMOTRON_PARALLELIZER,
 )
 from nemo_automodel.components.models.nemotron_v3.parallelization import (
-    NemotronHParallelizationStrategy,
+    NemotronHModelParallelizer,
 )
 
 
@@ -100,7 +100,7 @@ def mock_device_mesh():
     return mesh
 
 
-def test_strategy_selection_standard_model():
+def test_parallelizer_selection_standard_model():
     """Test that standard models use the default model parallelizer."""
     model = MockStandardModel()
     parallelizer = get_model_parallelizer(model)
@@ -108,13 +108,13 @@ def test_strategy_selection_standard_model():
     assert isinstance(parallelizer, ModelParallelizer)
 
 
-def test_strategy_selection_nemotron_model():
-    """Test that NemotronH models own their specialized strategy."""
+def test_parallelizer_selection_nemotron_model():
+    """Test that NemotronH models own their specialized parallelizer."""
     model = MockNemotronModel()
     parallelizer = get_model_parallelizer(model)
 
     assert parallelizer is NEMOTRON_PARALLELIZER
-    assert isinstance(parallelizer.strategy, NemotronHParallelizationStrategy)
+    assert isinstance(parallelizer, NemotronHModelParallelizer)
 
 
 @patch("torch.distributed.get_process_group_ranks", return_value=[0])

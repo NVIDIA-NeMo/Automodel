@@ -34,7 +34,7 @@ from nemo_automodel.components.distributed.fsdp_patches import (
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 
 if TYPE_CHECKING:
-    from nemo_automodel.components.distributed.parallelizer import ParallelizationStrategy
+    from nemo_automodel.components.distributed.parallelizer import ModelParallelizer
 
 UniformSubtreeItem = Union[Tuple[nn.Module, torch.dtype], Tuple[str, nn.Module, torch.dtype]]
 
@@ -359,7 +359,7 @@ def fully_shard_by_dtype(
     fp32_compute_module_names: Tuple[str, ...] = (),
     reshard_after_forward: bool | int | None = None,
     ignored_params: set[nn.Parameter] | None = None,
-    parallelization_strategy: "ParallelizationStrategy | None" = None,
+    model_parallelizer: "ModelParallelizer | None" = None,
 ) -> None:
     """Fully shard a module so every parameter computes in its required dtype.
 
@@ -395,10 +395,10 @@ def fully_shard_by_dtype(
         ignored_params: Parameters already owned by another FSDP or parallelism
             unit. They are excluded from dtype grouping and forwarded to the
             enclosing FSDP unit.
-        parallelization_strategy: Optional model sidecar strategy that owns the
+        model_parallelizer: Optional model sidecar that owns the
             FSDP primitive.
     """
-    shard_module = fully_shard if parallelization_strategy is None else parallelization_strategy._fully_shard_module
+    shard_module = fully_shard if model_parallelizer is None else model_parallelizer._fully_shard_module
     ignored_params = set(ignored_params or ())
     ignored_param_ids = {id(param) for param in ignored_params}
     compute_dtype_of = _make_compute_dtype_fn(

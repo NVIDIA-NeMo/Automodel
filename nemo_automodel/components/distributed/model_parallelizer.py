@@ -28,11 +28,11 @@ from nemo_automodel.components.distributed.config import (
     MegatronFSDPConfig,
     MoEParallelizerConfig,
 )
+from nemo_automodel.components.distributed.parallelizer import ModelParallelizer
 
 if TYPE_CHECKING:
     from nemo_automodel.components.distributed.config import ActivationCheckpointingMode, DistributedStrategyConfig
     from nemo_automodel.components.distributed.mesh import MeshContext
-    from nemo_automodel.components.distributed.parallelizer import ParallelizationStrategy
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -44,27 +44,6 @@ class ParallelizeContext:
     moe: MoEParallelizerConfig | None = None
     activation_checkpointing: ActivationCheckpointingMode = False
     reapply_trainability: Callable[[nn.Module], None] | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class ModelParallelizer:
-    """Model-owned sidecar with optional dense and MoE FSDP2 strategies."""
-
-    strategy: ParallelizationStrategy | None = None
-    moe_strategy: ParallelizationStrategy | None = None
-
-    def parallelize(self, model: nn.Module, context: ParallelizeContext, /) -> nn.Module:
-        """Apply TP, CP, EP, activation checkpointing, and data parallelism."""
-        if context.mesh.ep_size > 1:
-            return _parallelize_moe(model, context, strategy=self.moe_strategy)
-        if isinstance(context.strategy, FSDP2Config):
-            return _parallelize_fsdp2(model, context, strategy=self.strategy)
-        if isinstance(context.strategy, DDPConfig):
-            return _parallelize_ddp(model, context)
-        if isinstance(context.strategy, MegatronFSDPConfig):
-            return _parallelize_megatron_fsdp(model, context)
-        name = type(context.strategy).__name__
-        raise TypeError(f"ModelParallelizer does not support strategy={name}.")
 
 
 _DEFAULT_PARALLELIZER = ModelParallelizer()
@@ -86,17 +65,34 @@ def parallelize_model(model: nn.Module, context: ParallelizeContext) -> nn.Modul
     return get_model_parallelizer(model).parallelize(model, context)
 
 
+def _apply_model_parallelizer(
+    parallelizer: ModelParallelizer,
+    model: nn.Module,
+    context: ParallelizeContext,
+) -> nn.Module:
+    """Execute shared strategy dispatch for one model-owned parallelizer."""
+    if context.mesh.ep_size > 1:
+        return _parallelize_moe(model, context, parallelizer=parallelizer)
+    if isinstance(context.strategy, FSDP2Config):
+        return _parallelize_fsdp2(model, context, parallelizer=parallelizer)
+    if isinstance(context.strategy, DDPConfig):
+        return _parallelize_ddp(model, context)
+    if isinstance(context.strategy, MegatronFSDPConfig):
+        return _parallelize_megatron_fsdp(model, context)
+    name = type(context.strategy).__name__
+    raise TypeError(f"ModelParallelizer does not support strategy={name}.")
+
+
 def _parallelize_fsdp2(
     model: nn.Module,
     context: ParallelizeContext,
     *,
-    strategy: ParallelizationStrategy | None = None,
+    parallelizer: ModelParallelizer,
 ) -> nn.Module:
     from nemo_automodel.components.distributed.fsdp2 import (
         _patch_is_packed_sequence_for_training,
         fsdp2_sharding_enabled,
     )
-    from nemo_automodel.components.distributed.parallelizer import DefaultParallelizationStrategy
 
     config = context.strategy
     assert isinstance(config, FSDP2Config)
@@ -108,14 +104,7 @@ def _parallelize_fsdp2(
     if not fsdp2_sharding_enabled(context.mesh.device_mesh):
         return _parallelize_unsharded_fsdp2(model, context)
 
-    if strategy is None:
-        strategy = DefaultParallelizationStrategy()
-    parallelize = getattr(strategy, "parallelize", None)
-    if not callable(parallelize):
-        name = type(strategy).__name__
-        raise TypeError(f"ModelParallelizer.strategy must implement parallelize(model, device_mesh, ...); got {name}.")
-
-    return parallelize(
+    return parallelizer._apply(
         model=model,
         device_mesh=context.mesh.device_mesh,
         mp_policy=config.mp_policy,
@@ -216,7 +205,7 @@ def _parallelize_moe(
     model: nn.Module,
     context: ParallelizeContext,
     *,
-    strategy: ParallelizationStrategy | None = None,
+    parallelizer: ModelParallelizer,
 ) -> nn.Module:
     from nemo_automodel.components.moe.parallelizer import parallelize_model as parallelize_moe_model
 
@@ -266,7 +255,7 @@ def _parallelize_moe(
         enable_async_tensor_parallel=enable_async_tensor_parallel,
         frozen_multimodal_sharding=frozen_multimodal_sharding,
         reapply_trainability=context.reapply_trainability,
-        parallelization_strategy=strategy,
+        model_parallelizer=parallelizer if parallelizer._customizes_moe_fsdp else None,
         **mesh.parallelize_axis_kwargs(),
     )
     return model

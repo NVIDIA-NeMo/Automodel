@@ -473,8 +473,8 @@ def test_shared_vision_fsdp_keeps_all_norms_fp32(monkeypatch: pytest.MonkeyPatch
 
     assert DeepseekV4ForCausalLM.parallelizer is V4_PARALLELIZER
     assert DeepseekV41ForCausalLM.parallelizer is V41_PARALLELIZER
-    assert V4_PARALLELIZER.moe_strategy is V4_PARALLELIZER.strategy
-    assert V41_PARALLELIZER.moe_strategy is V41_PARALLELIZER.strategy
+    assert type(V4_PARALLELIZER).__name__ == "DeepseekV4ModelParallelizer"
+    assert type(V41_PARALLELIZER).__name__ == "DeepseekV41ModelParallelizer"
     fully_shard_deepseek_v41(module, mesh=object(), mp_policy=policy, reshard_after_forward=True)
 
     assert [child for child, _ in calls] == [*norms, module]

@@ -17,19 +17,18 @@
 from __future__ import annotations
 
 from nemo_automodel.components.distributed import ModelParallelizer
-from nemo_automodel.components.distributed.parallelizer import DefaultParallelizationStrategy
 
 
-class Qwen3VLParallelizationStrategy(DefaultParallelizationStrategy):
+class Qwen3VLModelParallelizer(ModelParallelizer):
     """Install the CP submesh used by Qwen3-VL's model-owned forward."""
 
-    def parallelize(self, model, device_mesh, **kwargs):
-        result = super().parallelize(model, device_mesh, **kwargs)
+    def _apply(self, model, device_mesh, **kwargs):
+        result = super()._apply(model, device_mesh, **kwargs)
         cp_mesh = device_mesh["cp"] if "cp" in device_mesh.mesh_dim_names else None
         model.cp_mesh = cp_mesh if cp_mesh is not None and cp_mesh.size() > 1 else None
         return result
 
 
-PARALLELIZER = ModelParallelizer(Qwen3VLParallelizationStrategy())
+PARALLELIZER = Qwen3VLModelParallelizer()
 
 __all__ = ["PARALLELIZER"]

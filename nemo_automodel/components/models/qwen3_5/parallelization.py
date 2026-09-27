@@ -28,13 +28,12 @@ from nemo_automodel.components.distributed.multimodal_fsdp import (
     module_parameters,
     normalize_frozen_multimodal_sharding,
 )
-from nemo_automodel.components.distributed.parallelizer import DefaultParallelizationStrategy
 from nemo_automodel.components.distributed.parallelizer_utils import fully_shard_by_dtype
 
 logger = logging.getLogger(__name__)
 
 
-class Qwen3_5ParallelizationStrategy(DefaultParallelizationStrategy):
+class Qwen3_5ModelParallelizer(ModelParallelizer):
     """Keep mixed-dtype GatedDeltaNet parameters in dtype-uniform FSDP units."""
 
     _fp32_compute_module_names: tuple[str, ...] = ("_fp32_params",)
@@ -87,7 +86,7 @@ class Qwen3_5ParallelizationStrategy(DefaultParallelizationStrategy):
                     offload_policy,
                     fp32_compute_module_names=self._fp32_compute_module_names,
                     reshard_after_forward=layer_reshard_after_forward,
-                    parallelization_strategy=self,
+                    model_parallelizer=self,
                 )
             return
 
@@ -110,11 +109,11 @@ class Qwen3_5ParallelizationStrategy(DefaultParallelizationStrategy):
                 ignored_multimodal_params=ignored_multimodal_params,
             )
 
-    def parallelize(self, model, device_mesh, dp_shard_cp_mesh_name="dp_shard_cp", **kwargs):
+    def _apply(self, model, device_mesh, dp_shard_cp_mesh_name="dp_shard_cp", **kwargs):
         """Apply generic TP/AC/FSDP and install Qwen3.5's CP mesh."""
         cp_mesh_name = dp_shard_cp_mesh_name.replace("dp_shard_", "")
         cp_enabled = cp_mesh_name in device_mesh.mesh_dim_names and device_mesh[cp_mesh_name].size() > 1
-        result = super().parallelize(
+        result = super()._apply(
             model,
             device_mesh,
             dp_shard_cp_mesh_name=dp_shard_cp_mesh_name,
@@ -131,6 +130,6 @@ class Qwen3_5ParallelizationStrategy(DefaultParallelizationStrategy):
         return result
 
 
-PARALLELIZER = ModelParallelizer(Qwen3_5ParallelizationStrategy())
+PARALLELIZER = Qwen3_5ModelParallelizer()
 
 __all__ = ["PARALLELIZER"]

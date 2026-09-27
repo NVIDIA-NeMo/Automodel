@@ -395,10 +395,10 @@ def test_indexers_are_frozen_by_the_model_constructor() -> None:
     assert expected and frozen == expected
 
 
-def test_v41_uses_generic_moe_parallelization() -> None:
+def test_v41_uses_unified_moe_parallelization() -> None:
     model = DeepseekV41ForCausalLM(_tiny_config(), backend=_backend())
     assert not _is_deepseek_v4_model(model)
-    assert type(get_model_parallelizer(model)) is ModelParallelizer
+    assert isinstance(get_model_parallelizer(model), ModelParallelizer)
     assert not dsv4_fsdp._is_deepseek_v4_module(model)
     assert not _is_deepseek_v4(model)
     assert _is_deepseek_v4(SimpleNamespace(config=SimpleNamespace(model_type="deepseek_v4")))

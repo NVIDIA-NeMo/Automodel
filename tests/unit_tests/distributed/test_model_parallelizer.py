@@ -51,7 +51,7 @@ def _context() -> ParallelizeContext:
 
 def test_contract_is_runtime_lightweight():
     assert hasattr(ModelParallelizer, "parallelize")
-    assert ModelParallelizer.__dataclass_fields__.keys() == {"strategy", "moe_strategy"}
+    assert not hasattr(ModelParallelizer(), "strategy")
     assert ParallelizeContext.__dataclass_fields__.keys() == {
         "mesh",
         "strategy",
@@ -110,33 +110,31 @@ def test_legacy_manager_classes_are_deprecated(monkeypatch):
         megatron_fsdp.MegatronFSDPManager(MegatronFSDPConfig(), device_mesh=Mock())
 
 
-def test_specialized_fsdp2_sidecar_uses_strategy(monkeypatch):
-    strategy = Mock()
-    adapter = ModelParallelizer(strategy)
+def test_fsdp2_dispatch_receives_model_parallelizer(monkeypatch):
+    parallelizer = ModelParallelizer()
     model = nn.Linear(2, 2)
     sentinel = nn.Linear(2, 2)
     context = _context()
     call = Mock(return_value=sentinel)
     monkeypatch.setattr("nemo_automodel.components.distributed.model_parallelizer._parallelize_fsdp2", call)
 
-    assert adapter.parallelize(model, context) is sentinel
-    call.assert_called_once_with(model, context, strategy=strategy)
+    assert parallelizer.parallelize(model, context) is sentinel
+    call.assert_called_once_with(model, context, parallelizer=parallelizer)
 
 
 def test_specialized_sidecar_routes_ep_through_unified_moe_executor(monkeypatch):
-    strategy = Mock()
-    adapter = ModelParallelizer(strategy, strategy)
+    parallelizer = ModelParallelizer()
     model = nn.Linear(2, 2)
     context = ParallelizeContext(mesh=SimpleNamespace(ep_size=2), strategy=FSDP2Config())
     call = Mock(return_value=model)
     monkeypatch.setattr("nemo_automodel.components.distributed.model_parallelizer._parallelize_moe", call)
 
-    assert adapter.parallelize(model, context) is model
-    call.assert_called_once_with(model, context, strategy=strategy)
+    assert parallelizer.parallelize(model, context) is model
+    call.assert_called_once_with(model, context, parallelizer=parallelizer)
 
 
-def test_moe_executor_receives_model_owned_strategy(monkeypatch):
-    strategy = Mock()
+def test_moe_executor_uses_generic_sharding_by_default(monkeypatch):
+    parallelizer = ModelParallelizer()
     model = nn.Linear(2, 2)
     mesh = SimpleNamespace(
         ep_size=2,
@@ -148,8 +146,28 @@ def test_moe_executor_receives_model_owned_strategy(monkeypatch):
     executor = Mock()
     monkeypatch.setattr("nemo_automodel.components.moe.parallelizer.parallelize_model", executor)
 
-    assert _parallelize_moe(model, context, strategy=strategy) is model
-    assert executor.call_args.kwargs["parallelization_strategy"] is strategy
+    assert _parallelize_moe(model, context, parallelizer=parallelizer) is model
+    assert executor.call_args.kwargs["model_parallelizer"] is None
+
+
+def test_moe_executor_receives_opted_in_model_parallelizer(monkeypatch):
+    class MoEModelParallelizer(ModelParallelizer):
+        _customizes_moe_fsdp = True
+
+    parallelizer = MoEModelParallelizer()
+    model = nn.Linear(2, 2)
+    mesh = SimpleNamespace(
+        ep_size=2,
+        device_mesh=object(),
+        moe_mesh=object(),
+        parallelize_axis_kwargs=lambda: {},
+    )
+    context = ParallelizeContext(mesh=mesh, strategy=FSDP2Config())
+    executor = Mock()
+    monkeypatch.setattr("nemo_automodel.components.moe.parallelizer.parallelize_model", executor)
+
+    assert _parallelize_moe(model, context, parallelizer=parallelizer) is model
+    assert executor.call_args.kwargs["model_parallelizer"] is parallelizer
 
 
 @pytest.mark.parametrize(

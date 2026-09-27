@@ -1455,9 +1455,9 @@ class TestApplyFsdpShardingRecursively:
         )
 
 
-def test_default_parallelization_replicated_frozen_multimodal_params_are_ignored_by_root(monkeypatch):
+def test_model_parallelizer_replicated_frozen_multimodal_params_are_ignored_by_root(monkeypatch):
     """The dense root FSDP unit must ignore frozen multimodal params when replication is requested."""
-    from nemo_automodel.components.distributed.parallelizer import DefaultParallelizationStrategy
+    from nemo_automodel.components.distributed.parallelizer import ModelParallelizer
 
     class InnerModel(nn.Module):
         def __init__(self):
@@ -1494,9 +1494,9 @@ def test_default_parallelization_replicated_frozen_multimodal_params_are_ignored
         module.set_modules_to_backward_prefetch = MagicMock()
         return module
 
-    strategy = DefaultParallelizationStrategy()
-    monkeypatch.setattr(strategy, "_fully_shard_module", fake_fully_shard)
-    result = strategy.parallelize(
+    model_parallelizer = ModelParallelizer()
+    monkeypatch.setattr(model_parallelizer, "_fully_shard_module", fake_fully_shard)
+    result = model_parallelizer._apply(
         model=model,
         device_mesh=device_mesh,
         activation_checkpointing=False,
@@ -1508,9 +1508,9 @@ def test_default_parallelization_replicated_frozen_multimodal_params_are_ignored
     assert root_kwargs["ignored_params"] == set(model.model.vision_tower.parameters())
 
 
-def test_default_parallelization_warns_for_per_layer_frozen_multimodal_policy(monkeypatch, caplog):
+def test_model_parallelizer_warns_for_per_layer_frozen_multimodal_policy(monkeypatch, caplog):
     """The expert per-layer policy makes its rank-uniform collective contract visible."""
-    from nemo_automodel.components.distributed.parallelizer import DefaultParallelizationStrategy
+    from nemo_automodel.components.distributed.parallelizer import ModelParallelizer
 
     class InnerModel(nn.Module):
         def __init__(self):
@@ -1543,10 +1543,10 @@ def test_default_parallelization_warns_for_per_layer_frozen_multimodal_policy(mo
         module.set_modules_to_backward_prefetch = MagicMock()
         return module
 
-    strategy = DefaultParallelizationStrategy()
-    monkeypatch.setattr(strategy, "_fully_shard_module", fake_fully_shard)
+    model_parallelizer = ModelParallelizer()
+    monkeypatch.setattr(model_parallelizer, "_fully_shard_module", fake_fully_shard)
     with caplog.at_level("WARNING"):
-        strategy.parallelize(
+        model_parallelizer._apply(
             model=model,
             device_mesh=device_mesh,
             activation_checkpointing=False,
@@ -1954,7 +1954,7 @@ def _make_model_for_ac(
 
 class TestActivationCheckpointingKVSharing:
     """Tests for the KV-sharing–aware activation-checkpointing guards
-    in ``DefaultParallelizationStrategy.parallelize``.
+    in ``ModelParallelizer._apply``.
     """
 
     @pytest.fixture(autouse=True)
@@ -2014,14 +2014,14 @@ class TestActivationCheckpointingKVSharing:
         enable_compile=False,
     ):
         """Invoke the strategy under test and return the model."""
-        from nemo_automodel.components.distributed.parallelizer import DefaultParallelizationStrategy
+        from nemo_automodel.components.distributed.parallelizer import ModelParallelizer
 
-        strategy = DefaultParallelizationStrategy()
+        model_parallelizer = ModelParallelizer()
         mesh = MagicMock(spec=DeviceMesh)
         tp_mesh = MagicMock()
         tp_mesh.size.return_value = 1  # no TP
         mesh.__getitem__ = lambda self_, key: tp_mesh
-        return strategy.parallelize(
+        return model_parallelizer._apply(
             model=model,
             device_mesh=mesh,
             activation_checkpointing=activation_checkpointing,

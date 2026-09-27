@@ -23,7 +23,6 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 )
 
 from nemo_automodel.components.distributed import ModelParallelizer
-from nemo_automodel.components.distributed.parallelizer import DefaultParallelizationStrategy
 
 logger = logging.getLogger(__name__)
 
@@ -58,10 +57,10 @@ def _apply_full_layer_checkpointing(model: nn.Module) -> None:
     logger.info("Applied BAGEL full-layer activation checkpointing to %d layers", wrapped_count)
 
 
-class BagelParallelizationStrategy(DefaultParallelizationStrategy):
+class BagelModelParallelizer(ModelParallelizer):
     """Apply BAGEL whole-layer checkpointing before the generic FSDP2 flow."""
 
-    def parallelize(self, model: nn.Module, *args, **kwargs) -> nn.Module:
+    def _apply(self, model: nn.Module, *args, **kwargs) -> nn.Module:
         activation_checkpointing = kwargs.get("activation_checkpointing", False)
         selective = (
             isinstance(activation_checkpointing, str)
@@ -70,9 +69,9 @@ class BagelParallelizationStrategy(DefaultParallelizationStrategy):
         if activation_checkpointing and not selective:
             _apply_full_layer_checkpointing(model)
             kwargs["activation_checkpointing"] = False
-        return super().parallelize(model, *args, **kwargs)
+        return super()._apply(model, *args, **kwargs)
 
 
-PARALLELIZER = ModelParallelizer(BagelParallelizationStrategy())
+PARALLELIZER = BagelModelParallelizer()
 
 __all__ = ["PARALLELIZER"]

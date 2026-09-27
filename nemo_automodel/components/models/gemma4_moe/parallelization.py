@@ -31,7 +31,6 @@ from torch.distributed.tensor.placement_types import Replicate, Shard
 
 from nemo_automodel.components.distributed import ModelParallelizer
 from nemo_automodel.components.distributed.parallel_styles import ReplicatedWithGradAllReduce
-from nemo_automodel.components.distributed.parallelizer import DefaultParallelizationStrategy
 
 
 class _ReduceFromTensorParallelRegion(torch.autograd.Function):
@@ -260,10 +259,10 @@ def _get_attention_head_counts(text_config) -> set[tuple[int, int]]:
     }
 
 
-class Gemma4ParallelizationStrategy(DefaultParallelizationStrategy):
+class Gemma4ModelParallelizer(ModelParallelizer):
     """Apply the variant-aware Gemma4 TP plan before standard FSDP2."""
 
-    def parallelize(self, model: nn.Module, device_mesh: DeviceMesh, **kwargs: Any) -> nn.Module:
+    def _apply(self, model: nn.Module, device_mesh: DeviceMesh, **kwargs: Any) -> nn.Module:
         """Validate and apply Gemma4 tensor parallelism."""
         tp_mesh_name = kwargs.get("tp_mesh_name", "tp")
         tp_mesh = device_mesh[tp_mesh_name]
@@ -294,9 +293,9 @@ class Gemma4ParallelizationStrategy(DefaultParallelizationStrategy):
                     sequence_parallel=bool(kwargs.get("sequence_parallel", False)),
                 )
 
-        return super().parallelize(model, device_mesh, **kwargs)
+        return super()._apply(model, device_mesh, **kwargs)
 
 
-PARALLELIZER = ModelParallelizer(Gemma4ParallelizationStrategy())
+PARALLELIZER = Gemma4ModelParallelizer()
 
 __all__ = ["PARALLELIZER"]

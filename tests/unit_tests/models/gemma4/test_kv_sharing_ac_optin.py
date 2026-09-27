@@ -14,7 +14,7 @@
 
 """Gemma4's opt-in to whole-block activation checkpointing for KV-shared models.
 
-``DefaultParallelizationStrategy`` keeps KV-shared models off whole-block
+``ModelParallelizer`` keeps KV-shared models off whole-block
 checkpointing unless the model class declares its shared-K/V store safe under
 checkpoint replay. Gemma4 E2B/E4B depend on that declaration to keep attention
 inside the recomputed region; without it they drop to

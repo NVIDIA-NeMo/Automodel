@@ -14,7 +14,7 @@
 
 """Unit tests for ``diffusion_gemma`` pure-FSDP2 (ep_size=1) sharding.
 
-These cover the model-owned ``DiffusionGemmaParallelizationStrategy`` and
+These cover the model-owned ``DiffusionGemmaModelParallelizer`` and
 the per-module wrapping order of ``fully_shard_diffusion_gemma`` (grouped
 experts wrapped as their own FSDP unit before the rest of the layer). They use a
 monkeypatched ``fully_shard`` so no process group / GPU is required.
@@ -23,14 +23,12 @@ monkeypatched ``fully_shard`` so no process group / GPU is required.
 import torch.nn as nn
 
 from nemo_automodel.components.distributed import ModelParallelizer
-from nemo_automodel.components.distributed.parallelizer import DefaultParallelizationStrategy
 from nemo_automodel.components.models.diffusion_gemma import fsdp as dg4_fsdp
 
 
-def test_sidecar_owns_diffusion_gemma_strategy():
+def test_sidecar_owns_diffusion_gemma_parallelizer():
     assert isinstance(dg4_fsdp.PARALLELIZER, ModelParallelizer)
-    assert isinstance(dg4_fsdp.PARALLELIZER.strategy, DefaultParallelizationStrategy)
-    assert dg4_fsdp.PARALLELIZER.moe_strategy is None
+    assert isinstance(dg4_fsdp.PARALLELIZER, dg4_fsdp.DiffusionGemmaModelParallelizer)
 
 
 def test_fully_shard_wraps_experts_before_the_layer(monkeypatch):
