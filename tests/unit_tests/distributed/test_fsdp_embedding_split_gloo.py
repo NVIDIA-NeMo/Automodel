@@ -32,8 +32,8 @@ from torch.distributed.tensor import DTensor
 
 from nemo_automodel.components.distributed.parallelizer import (
     DefaultParallelizationStrategy,
-    Qwen3_5ParallelizationStrategy,
 )
+from nemo_automodel.components.models.qwen3_5.parallelization import Qwen3_5ParallelizationStrategy
 
 # Over the default 5s budget on purpose: this module spawns worker processes; every child re-imports torch from scratch.
 # Shrink the work or the process count before raising this further.

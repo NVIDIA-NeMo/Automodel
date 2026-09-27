@@ -241,8 +241,9 @@ class _ReplicatedGradSync:
         for parameter, local_parameter, used in zip(parameters, local_parameters, globally_used):
             next_offset = offset + local_parameter.numel()
             if not used:
-                # Globally unused parameters retain grad=None, so optimizers do
-                # not apply weight decay or advance state for them.
+                # Globally unused parameters retain grad=None. Optimizers skip
+                # their parameter update and weight decay; optimizers such as TE
+                # FusedAdam may still advance optimizer-group bookkeeping.
                 parameter.grad = None
                 offset = next_offset
                 continue

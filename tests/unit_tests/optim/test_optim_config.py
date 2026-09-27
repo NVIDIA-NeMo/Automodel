@@ -156,6 +156,13 @@ def test_te_master_ownership_uses_resident_fp32_parameter_directly_after_resume(
             assert zero_buffer
             self.state[parameter][state_name] = torch.zeros_like(parameter, dtype=torch.float32)
 
+        def load_state_dict(self, state_dict):
+            """Mirror TE's second state rebuild after PyTorch's loader returns."""
+            super().load_state_dict(state_dict)
+            for saved_group, live_group in zip(state_dict["param_groups"], self.param_groups, strict=True):
+                for saved_id, parameter in zip(saved_group["params"], live_group["params"], strict=True):
+                    self.state[parameter] = dict(state_dict["state"].get(saved_id, {}))
+
     optimizer = FakeFusedAdam()
     _avoid_redundant_te_master_weights_for_fp32_params(optimizer)
 
@@ -241,6 +248,21 @@ class TestOptimizerFromFactoryConfig:
             kwargs={"lr": 1e-3, "master_weight_dtype": "torch.bfloat16"},
         ).build(_model())
         assert captured["master_weight_dtype"] is torch.bfloat16
+
+    def test_non_te_factory_preserves_explicit_none_dtype_kwarg(self):
+        captured = {}
+
+        def fake_factory(params, **kwargs):
+            captured.update(kwargs)
+            return torch.optim.SGD(params, lr=0.01)
+
+        OptimizerFromFactoryConfig(
+            factory=fake_factory,
+            kwargs={"master_weight_dtype": None},
+        ).build(_model())
+
+        assert "master_weight_dtype" in captured
+        assert captured["master_weight_dtype"] is None
 
     def test_build_requires_callable_factory(self):
         with pytest.raises(AssertionError, match="must be a callable"):

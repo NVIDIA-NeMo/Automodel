@@ -43,7 +43,12 @@ def main() -> None:
     if "master_param" not in optimizer.state[model.bf16_weight]:
         raise AssertionError("TE must retain an FP32 master_param for a BF16 resident parameter")
 
-    optimizer.load_state_dict(optimizer.state_dict())
+    checkpoint = optimizer.state_dict()
+    for saved_group, live_group in zip(checkpoint["param_groups"], optimizer.param_groups, strict=True):
+        for saved_id, parameter in zip(saved_group["params"], live_group["params"], strict=True):
+            if parameter is model.fp32_weight:
+                checkpoint["state"][saved_id]["master_param"] = model.fp32_weight.detach().clone()
+    optimizer.load_state_dict(checkpoint)
     if "master_param" in optimizer.state[model.fp32_weight]:
         raise AssertionError("optimizer resume restored a redundant FP32 master_param")
     if "master_param" not in optimizer.state[model.bf16_weight]:

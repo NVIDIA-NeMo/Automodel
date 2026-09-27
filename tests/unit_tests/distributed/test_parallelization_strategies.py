@@ -38,13 +38,14 @@ from nemo_automodel.components.distributed.parallelizer import (
     HunyuanParallelizationStrategy,
     NemotronHParallelizationStrategy,
     ParallelizationStrategy,
-    Qwen3_5ParallelizationStrategy,
     WanParallelizationStrategy,
     _extract_model_layers,
     _nemotronh_decoder_blocks,
     fsdp2_strategy_parallelize,
     get_parallelization_strategy,
 )
+from nemo_automodel.components.models.qwen3_5 import parallelization as qwen3_5_parallelization
+from nemo_automodel.components.models.qwen3_5.parallelization import Qwen3_5ParallelizationStrategy
 
 
 class MockModel(nn.Module):
@@ -987,16 +988,19 @@ class TestQwen3_5ParallelizationStrategy:
         [(64, None, True), (0, None, False), (64, torch.float32, False)],
         ids=("bf16-fit", "bf16-oversized", "uniform-fp32-compute"),
     )
-    @patch("nemo_automodel.components.distributed.parallelizer.make_fully_shard_with_replicated_parameter_grad_sync")
-    @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
-    @patch("nemo_automodel.components.distributed.parallelizer.fully_shard_with_compute_dtype_fallback")
+    @patch(
+        "nemo_automodel.components.models.qwen3_5.parallelization.make_fully_shard_with_replicated_parameter_grad_sync"
+    )
+    @patch("nemo_automodel.components.models.qwen3_5.parallelization.fully_shard")
+    @patch("nemo_automodel.components.models.qwen3_5.parallelization.parallelizer_utils.fully_shard_by_dtype")
     def test_small_fp32_parameters_are_replicated_with_bounded_fallback(
         self,
-        fully_shard_with_compute_dtype_fallback,
+        fully_shard_by_dtype,
         fully_shard,
         make_fully_shard_with_replicated_parameter_grad_sync,
         strategy,
         mock_device_mesh,
+        monkeypatch,
         max_replicated_bytes,
         param_dtype,
         expect_replication,
@@ -1025,6 +1029,11 @@ class TestQwen3_5ParallelizationStrategy:
         mesh, _, _, _ = mock_device_mesh
         model = MockQwen35Model()
         sensitive_params = set(model.model.layers[0]._fp32_params.parameters())
+        monkeypatch.setattr(
+            qwen3_5_parallelization,
+            "_MAX_REPLICATED_FP32_BYTES_PER_MODULE",
+            max_replicated_bytes,
+        )
         fully_shard.side_effect = lambda module, **kwargs: module
 
         def fake_make_fully_shard_with_grad_sync(root_module, parameters, mesh, *, fully_shard_fn):
@@ -1037,8 +1046,8 @@ class TestQwen3_5ParallelizationStrategy:
             return wrapped_fully_shard
 
         make_fully_shard_with_replicated_parameter_grad_sync.side_effect = fake_make_fully_shard_with_grad_sync
-        fully_shard_with_compute_dtype_fallback.side_effect = lambda module, *, fully_shard_fn, **kwargs: (
-            fully_shard_fn(module, **kwargs)
+        fully_shard_by_dtype.side_effect = lambda module, *args, fully_shard_fn, **kwargs: fully_shard_fn(
+            module, **kwargs
         )
 
         parallelize_kwargs = {}
@@ -1051,24 +1060,24 @@ class TestQwen3_5ParallelizationStrategy:
         result = strategy.parallelize(
             model=model,
             device_mesh=mesh,
-            max_replicated_fp32_param_bytes_per_module=max_replicated_bytes,
             **parallelize_kwargs,
         )
 
         assert result is model
         if expect_replication:
             make_fully_shard_with_replicated_parameter_grad_sync.assert_called_once()
-            assert fully_shard_with_compute_dtype_fallback.call_count == fully_shard.call_count
             layer_call = next(
-                call_args for call_args in fully_shard.call_args_list if call_args.args[0] is model.model.layers[0]
+                call_args
+                for call_args in fully_shard_by_dtype.call_args_list
+                if call_args.args[0] is model.model.layers[0]
             )
             assert layer_call.kwargs["ignored_params"] == sensitive_params
             assert fully_shard.call_args_list[-1].kwargs["ignored_params"] == sensitive_params
             assert hasattr(model, "_nemo_fsdp2_replicated_grad_sync")
         else:
             make_fully_shard_with_replicated_parameter_grad_sync.assert_not_called()
-            assert fully_shard_with_compute_dtype_fallback.call_count == fully_shard.call_count
-            assert all("ignored_params" not in call_args.kwargs for call_args in fully_shard.call_args_list)
+            assert all(call_args.kwargs["ignored_params"] is None for call_args in fully_shard_by_dtype.call_args_list)
+            assert "ignored_params" not in fully_shard.call_args_list[-1].kwargs
             assert not hasattr(model, "_nemo_fsdp2_replicated_grad_sync")
 
     @pytest.mark.parametrize(
@@ -1079,12 +1088,10 @@ class TestQwen3_5ParallelizationStrategy:
             ("replicate", True, False),
         ],
     )
-    @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
-    @patch("nemo_automodel.components.distributed.fsdp2_extensions.utils.fully_shard_by_dtype")
-    @patch("nemo_automodel.components.distributed.parallelizer.fully_shard_with_compute_dtype_fallback")
+    @patch("nemo_automodel.components.models.qwen3_5.parallelization.fully_shard")
+    @patch("nemo_automodel.components.models.qwen3_5.parallelization.parallelizer_utils.fully_shard_by_dtype")
     def test_frozen_multimodal_modules_are_not_separately_sharded(
         self,
-        fully_shard_with_compute_dtype_fallback,
         fully_shard_by_dtype,
         fully_shard,
         strategy,
@@ -1114,8 +1121,7 @@ class TestQwen3_5ParallelizationStrategy:
             param.requires_grad_(False)
         frozen_vision_params = set(model.model.vision_tower.parameters())
         fully_shard.side_effect = lambda model, **kwargs: model
-        fully_shard_by_dtype.side_effect = lambda model, *args, **kwargs: model
-        fully_shard_with_compute_dtype_fallback.side_effect = lambda model, *, fully_shard_fn, **kwargs: fully_shard_fn(
+        fully_shard_by_dtype.side_effect = lambda model, *args, fully_shard_fn, **kwargs: fully_shard_fn(
             model, **kwargs
         )
 
@@ -1127,8 +1133,6 @@ class TestQwen3_5ParallelizationStrategy:
 
         sharded_modules = [call_args.args[0] for call_args in fully_shard.call_args_list]
         assert result is model
-        assert fully_shard_by_dtype.call_count == 0
-        assert fully_shard_with_compute_dtype_fallback.call_count == fully_shard.call_count
         assert model.model.layers[0] in sharded_modules
         assert (model.model.vision_tower.layers[0] in sharded_modules) is expected_vision_sharded
         root_kwargs = fully_shard.call_args_list[-1].kwargs
@@ -1137,8 +1141,8 @@ class TestQwen3_5ParallelizationStrategy:
         else:
             assert "ignored_params" not in root_kwargs
 
-    @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
-    @patch("nemo_automodel.components.distributed.parallelizer_utils.fully_shard_by_dtype")
+    @patch("nemo_automodel.components.models.qwen3_5.parallelization.fully_shard")
+    @patch("nemo_automodel.components.models.qwen3_5.parallelization.parallelizer_utils.fully_shard_by_dtype")
     def test_dtype_sharding_does_not_mutate_module_globals(
         self,
         fully_shard_by_dtype,
@@ -1170,7 +1174,7 @@ class TestQwen3_5ParallelizationStrategy:
         assert all(fn is default_walk for fn in observed)
         assert parallelizer_mod.apply_fsdp2_sharding_recursively is default_walk
 
-    @patch("nemo_automodel.components.distributed.parallelizer_utils.fully_shard_by_dtype")
+    @patch("nemo_automodel.components.models.qwen3_5.parallelization.parallelizer_utils.fully_shard_by_dtype")
     def test_dtype_walk_honors_fully_shard_fn(self, fully_shard_by_dtype, strategy, mock_device_mesh):
         """A model-specific ``fully_shard_fn`` reaches every unit: decoder layers and the root."""
         mesh, _, _, _ = mock_device_mesh

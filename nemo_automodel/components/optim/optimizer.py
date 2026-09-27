@@ -67,6 +67,16 @@ logger = logging.getLogger(__name__)
 _DTYPE_FIELDS = ("master_weight_dtype", "exp_avg_dtype", "exp_avg_sq_dtype")
 
 
+def _normalize_optional_dtype_kwargs(kwargs: dict[str, Any], *, omit_none: bool = False) -> None:
+    """Resolve configured dtype strings and preserve omission-based defaults."""
+    for name in _DTYPE_FIELDS:
+        value = kwargs.get(name)
+        if value is None and omit_none:
+            kwargs.pop(name, None)
+        elif isinstance(value, str):
+            kwargs[name] = dtype_from_str(value)
+
+
 # ---------------------------------------------------------------------------
 # Typed optimizer configs
 # ---------------------------------------------------------------------------
@@ -325,9 +335,9 @@ def _avoid_redundant_te_master_weights_for_fp32_params(optimizer: torch.optim.Op
     switch. Mixed BF16/FP32 models need it for BF16 parameters, but its FP32
     update path operates directly on the resident parameter and never consumes
     ``master_param``. Pre-initializing only the two moments for resident FP32
-    parameters makes TE skip its generic three-state initializer. A post-load
-    hook applies the same ownership rule to old checkpoints that contain the
-    redundant state.
+    parameters makes TE skip its generic three-state initializer. A pre-load
+    hook removes legacy redundant masters from the nested checkpoint state
+    before TE rebuilds its optimizer-owned state after PyTorch's loader returns.
 
     Args:
         optimizer: Transformer Engine FusedAdam instance whose parameter groups
@@ -360,8 +370,47 @@ def _avoid_redundant_te_master_weights_for_fp32_params(optimizer: torch.optim.Op
                 if scales is not None:
                     scales.pop("master_param", None)
 
+    def remove_legacy_fp32_masters(
+        loaded_optimizer: torch.optim.Optimizer,
+        state_dict: dict[str, Any],
+    ) -> None:
+        """Remove redundant masters before TE reprocesses the original state dict.
+
+        TE FusedAdam overrides ``load_state_dict`` and rebuilds its state from
+        the checkpoint after ``Optimizer.load_state_dict`` (and therefore after
+        PyTorch post-load hooks) returns. PyTorch passes pre-load hooks a shallow
+        outer copy, so mutating the nested per-parameter state here also updates
+        the mapping that TE subsequently consumes.
+        """
+        saved_groups = state_dict.get("param_groups", ())
+        if len(saved_groups) != len(loaded_optimizer.param_groups):
+            return
+        saved_state = state_dict.get("state", {})
+        for saved_group, live_group in zip(saved_groups, loaded_optimizer.param_groups, strict=True):
+            saved_ids = saved_group.get("params", ())
+            live_parameters = live_group.get("params", ())
+            if len(saved_ids) != len(live_parameters):
+                return
+            for saved_id, parameter in zip(saved_ids, live_parameters, strict=True):
+                local_parameter = parameter.to_local() if isinstance(parameter, DTensor) else parameter
+                if local_parameter.dtype is torch.float32:
+                    saved_state.get(saved_id, {}).pop("master_param", None)
+
     enforce_fp32_ownership(optimizer)
-    optimizer.register_load_state_dict_post_hook(enforce_fp32_ownership)
+    optimizer.register_load_state_dict_pre_hook(remove_legacy_fp32_masters)
+
+
+def _build_te_fused_adam(
+    factory: Callable[..., Any],
+    params: list[Any],
+    kwargs: dict[str, Any],
+) -> torch.optim.Optimizer:
+    """Construct TE FusedAdam with its dtype, empty-shard, and ownership rules."""
+    kwargs = dict(kwargs)
+    _normalize_optional_dtype_kwargs(kwargs, omit_none=True)
+    optimizer = factory(_drop_empty_local_shards(params), **kwargs)
+    _avoid_redundant_te_master_weights_for_fp32_params(optimizer)
+    return optimizer
 
 
 @dataclass
@@ -375,16 +424,12 @@ class FusedAdamConfig(OptimizerConfig):
     adam_w_mode: bool = True
     bias_correction: bool = True
     master_weights: bool = True
-    master_weight_dtype: str = "fp32"
+    master_weight_dtype: str | None = None
 
     def _build_optimizer(self, params, *, foreach: bool | None = None) -> torch.optim.Optimizer:
         from transformer_engine.pytorch.optimizers import FusedAdam
 
-        kwargs = self._constructor_kwargs()
-        kwargs["master_weight_dtype"] = dtype_from_str(kwargs["master_weight_dtype"])
-        optimizer = FusedAdam(_drop_empty_local_shards(params), **kwargs)
-        _avoid_redundant_te_master_weights_for_fp32_params(optimizer)
-        return optimizer
+        return _build_te_fused_adam(FusedAdam, params, self._constructor_kwargs())
 
 
 @dataclass
@@ -582,10 +627,8 @@ class OptimizerFromFactoryConfig(OptimizerConfig):
         # so an override set either way is honored.
         kwargs_overrides = kwargs.pop("param_group_overrides", [])
         overrides = self.param_group_overrides or _coerce_param_group_overrides(kwargs_overrides)
-        for attr in _DTYPE_FIELDS:
-            val = kwargs.get(attr, None)
-            if isinstance(val, str):
-                kwargs[attr] = dtype_from_str(val)
+        is_te_fused_adam = _is_te_fused_adam(self.factory)
+        _normalize_optional_dtype_kwargs(kwargs, omit_none=is_te_fused_adam)
         # Only inject ``foreach`` for factories that actually accept it. The TP>1 path sets
         # ``foreach=False`` via ``_foreach_for_mesh``; passing it to a factory that does not take
         # ``foreach`` (e.g. TE ``FusedAdam``) would raise.  Honour an explicit user-provided value.
@@ -601,9 +644,10 @@ class OptimizerFromFactoryConfig(OptimizerConfig):
             # TE FusedAdam's multi_tensor_apply faults on zero-numel local shards; see
             # _drop_empty_local_shards.  Same guard as FusedAdamConfig, for the YAML
             # ``_target_: transformer_engine...FusedAdam`` escape hatch.
-            if _is_te_fused_adam(self.factory):
-                params = _drop_empty_local_shards(params)
-            optimizers.append(self.factory(params=params, **kwargs))
+            if is_te_fused_adam:
+                optimizers.append(_build_te_fused_adam(self.factory, params, kwargs))
+            else:
+                optimizers.append(self.factory(params=params, **kwargs))
         warn_if_torch_adam_with_bf16_params(optimizer=optimizers, is_peft=is_peft, context="optim", logger=logger)
         return optimizers
 
@@ -617,15 +661,13 @@ class OptimizerFromFactoryConfig(OptimizerConfig):
         foreach = _foreach_for_mesh(device_mesh)
 
         kwargs = dict(self.kwargs)
-        for attr in _DTYPE_FIELDS:
-            val = kwargs.get(attr, None)
-            if isinstance(val, str):
-                kwargs[attr] = dtype_from_str(val)
+        is_te_fused_adam = _is_te_fused_adam(self.factory)
+        _normalize_optional_dtype_kwargs(kwargs, omit_none=is_te_fused_adam)
         if foreach is not None and "foreach" not in kwargs and _accepts_foreach(self.factory):
             kwargs["foreach"] = foreach
 
-        if _is_te_fused_adam(self.factory):
-            param_groups = _drop_empty_local_shards(param_groups)
+        if is_te_fused_adam:
+            return _build_te_fused_adam(self.factory, param_groups, kwargs)
         return self.factory(params=param_groups, **kwargs)
 
 
@@ -860,14 +902,14 @@ def _is_te_fused_adam(factory: Callable[..., Any]) -> bool:
     return isinstance(te_fused_adam, type) and isinstance(factory, type) and issubclass(factory, te_fused_adam)
 
 
-def _accepts_foreach(optim_cls: type["torch.optim.Optimizer"]) -> bool:
+def _accepts_foreach(factory: Callable[..., Any]) -> bool:
     """Return ``True`` if ``factory`` accepts a ``foreach`` kwarg.
 
     ``torch.optim`` optimizers take ``foreach``; external factories such as TE
     ``FusedAdam`` do not, so passing it would raise ``TypeError``.
     """
     try:
-        sig = inspect.signature(optim_cls)
+        sig = inspect.signature(factory)
     except (TypeError, ValueError):
         return False
     return "foreach" in sig.parameters

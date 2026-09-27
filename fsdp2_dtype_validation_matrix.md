@@ -63,8 +63,9 @@ policy.
 
 ## Replication Limit Rationale
 
-The `max_replicated_fp32_param_bytes_per_module` default is **8 MiB per managed
-module**, not a model-wide budget. The repository currently contains 131
+The Qwen3.5 model-owned policy uses an internal **8 MiB per managed module**
+limit, not a generic distributed-config setting or a model-wide budget. The
+repository currently contains 131
 example PEFT configurations with the following LoRA rank distribution:
 
 | LoRA rank (`peft.dim`) | Example count |
@@ -105,7 +106,7 @@ The following cases should be crossed with at least D1 and D3.
 | F13 | Embedding and LM-head weights are tied | Preserve the alias before ownership | Keep one logical parameter, one owner, and stable checkpoint keys |
 | F14 | A state dict is loaded after FSDP initialization | Reinstall extensions only for the sharded single-owner fallback | Restore compute metadata without duplicate hooks or extensions; replicated parameters retain ordinary module state |
 | F15 | Model and optimizer state are saved and resumed | Preserve the selected storage contract | D1 restores FP32 bulk shards plus replicated FP32 sensitive weights; D3 restores BF16 bulk shards, replicated FP32 sensitive weights, and the optimizer's separate FP32 bulk master state |
-| F16 | A selected replicated trainable parameter is unused in an optimizer step | Communicate local-use bits in the coalesced FP32 payload | Zero-fill a missing rank-local contribution only when at least one DP rank used the parameter; keep `grad=None` everywhere when it was globally unused so weight decay and optimizer state do not advance |
+| F16 | A selected replicated trainable parameter is unused in an optimizer step | Communicate local-use bits in the coalesced FP32 payload | Zero-fill a missing rank-local contribution only when at least one DP rank used the parameter; keep `grad=None` everywhere when it was globally unused so its update, weight decay, and per-parameter moments do not advance. Optimizers with group-level counters, including TE FusedAdam, may still advance that group bookkeeping. |
 | F17 | HSDP uses non-trivial replicate and shard mesh dimensions | Reduce the same coalesced FP32 buffer over both dimensions | Match a global four-rank reference and issue one replicated-gradient all-reduce per mesh dimension |
 
 ## Casting and Numerical Assertions
@@ -134,7 +135,10 @@ local-use value per managed parameter. Those values add only
 `4 * (1 + parameter_count)` bytes and do not add a collective. After reduction,
 a parameter used on only some ranks receives the missing ranks' zero
 contributions and is divided by the full DP world size. A parameter unused on
-all ranks retains `grad=None`.
+all ranks retains `grad=None`. This suppresses its parameter update, weight
+decay, and per-parameter moment initialization. It does not promise that an
+optimizer-wide or parameter-group step counter remains unchanged; TE FusedAdam
+uses such a group-level counter for bias correction.
 
 ## Executable Coverage
 

@@ -62,9 +62,6 @@ from nemo_automodel.components.distributed.config import (
 from nemo_automodel.components.distributed.fsdp2_extensions.compat import (
     patch_fsdp_accumulated_grad_guard as _patch_fsdp_accumulated_grad_guard,
 )
-from nemo_automodel.components.distributed.fsdp2_extensions.replicated import (
-    DEFAULT_MAX_REPLICATED_PARAM_BYTES_PER_MODULE,
-)
 from nemo_automodel.components.distributed.mesh_utils import get_fsdp_dp_mesh
 from nemo_automodel.shared.multimodal_fsdp import (
     FrozenMultimodalSharding,
@@ -254,7 +251,6 @@ class ParallelizationStrategy(ABC):
         activation_checkpointing_scope: ActivationCheckpointingScope | None = "all",
         frozen_multimodal_sharding: FrozenMultimodalSharding = "root",
         reapply_trainability: Callable[[nn.Module], None] | None = None,
-        max_replicated_fp32_param_bytes_per_module: int = DEFAULT_MAX_REPLICATED_PARAM_BYTES_PER_MODULE,
         **kwargs,
     ) -> nn.Module:
         """Apply parallelization strategy to the model."""
@@ -375,10 +371,8 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
         reapply_trainability: Callable[[nn.Module], None] | None = None,
         fully_shard_fn=None,
         replicated_params: set[nn.Parameter] | None = None,
-        max_replicated_fp32_param_bytes_per_module: int = DEFAULT_MAX_REPLICATED_PARAM_BYTES_PER_MODULE,
     ) -> nn.Module:
         """Apply the default parallelization flow."""
-        del max_replicated_fp32_param_bytes_per_module
         frozen_multimodal_sharding = normalize_frozen_multimodal_sharding(frozen_multimodal_sharding)
         tp_mesh = device_mesh[tp_mesh_name]
         if fully_shard_fn is None:
@@ -767,130 +761,6 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
         )
 
 
-class Qwen3_5ParallelizationStrategy(DefaultParallelizationStrategy):
-    """Parallelization strategy that adds Qwen3.5 GatedDeltaNet CP wiring."""
-
-    # The Qwen3.5 model builds CPAwareGatedDeltaNet with a fp32 ``SSMGate``
-    # (``_fp32_params``) at construction — no runtime patch needed. Keep those
-    # params in their own dtype-uniform fp32 FSDP group (true master weights).
-    _fp32_compute_module_names: tuple[str, ...] = ("_fp32_params",)
-
-    def _apply_fsdp_sharding(
-        self,
-        module: nn.Module,
-        mesh: DeviceMesh,
-        mp_policy: MixedPrecisionPolicy | None,
-        offload_policy: OffloadPolicy | None = None,
-        enable_fsdp2_prefetch: bool = True,
-        fsdp2_backward_prefetch_depth: int = 2,
-        fsdp2_forward_prefetch_depth: int = 1,
-        reshard_after_forward: bool | None = None,
-        fully_shard_fn=None,
-        frozen_multimodal_sharding: FrozenMultimodalSharding = "root",
-        ignored_multimodal_params: set[nn.Parameter] | None = None,
-    ) -> None:
-        """Shard each decoder layer with :func:`fully_shard_by_dtype`.
-
-        Overrides the default recursive walk so fp32 and bfloat16 parameters end up
-        in separate, dtype-uniform FSDP groups. ``fully_shard_fn`` is forwarded to
-        every unit; the prefetch knobs are not supported by the dtype walk.
-        """
-        del enable_fsdp2_prefetch, fsdp2_backward_prefetch_depth, fsdp2_forward_prefetch_depth
-        frozen_multimodal_sharding = normalize_frozen_multimodal_sharding(frozen_multimodal_sharding)
-        pp_enabled = "pp" in mesh.mesh_dim_names and mesh["pp"].size() > 1
-
-        if isinstance(module, (nn.ModuleList, nn.ModuleDict)):
-            all_items = list(module.items()) if isinstance(module, nn.ModuleDict) else list(enumerate(module))
-            flat_layer_items = [
-                (layer_id, child)
-                for layer_id, child in all_items
-                if not isinstance(child, (nn.ModuleList, nn.ModuleDict))
-            ]
-            nested_items = [
-                (layer_id, child) for layer_id, child in all_items if isinstance(child, (nn.ModuleList, nn.ModuleDict))
-            ]
-
-            for _, child in nested_items:
-                self._apply_fsdp_sharding(
-                    child,
-                    mesh,
-                    mp_policy,
-                    offload_policy,
-                    reshard_after_forward=reshard_after_forward,
-                    fully_shard_fn=fully_shard_fn,
-                    frozen_multimodal_sharding=frozen_multimodal_sharding,
-                    ignored_multimodal_params=ignored_multimodal_params,
-                )
-
-            for enum_id, (_, child) in enumerate(flat_layer_items):
-                if reshard_after_forward is not None:
-                    layer_reshard_after_forward = reshard_after_forward
-                elif pp_enabled:
-                    layer_reshard_after_forward = False
-                else:
-                    layer_reshard_after_forward = enum_id < len(flat_layer_items) - 1
-                parallelizer_utils.fully_shard_by_dtype(
-                    child,
-                    mesh,
-                    mp_policy,
-                    offload_policy,
-                    fp32_compute_module_names=self._fp32_compute_module_names,
-                    reshard_after_forward=layer_reshard_after_forward,
-                    fully_shard_fn=fully_shard_fn,
-                )
-        else:
-            for name, sub in module.named_children():
-                if is_multimodal_module_name(name) and module_is_fully_frozen(sub):
-                    if frozen_multimodal_sharding in ("root", "replicate"):
-                        logger.info(
-                            "Keeping frozen multimodal module %s at FSDP policy %s",
-                            name,
-                            frozen_multimodal_sharding,
-                        )
-                        if frozen_multimodal_sharding == "replicate" and ignored_multimodal_params is not None:
-                            ignored_multimodal_params.update(module_parameters(sub))
-                        continue
-                self._apply_fsdp_sharding(
-                    sub,
-                    mesh,
-                    mp_policy,
-                    offload_policy,
-                    reshard_after_forward=reshard_after_forward,
-                    fully_shard_fn=fully_shard_fn,
-                    frozen_multimodal_sharding=frozen_multimodal_sharding,
-                    ignored_multimodal_params=ignored_multimodal_params,
-                )
-
-    def parallelize(self, model, device_mesh, dp_shard_cp_mesh_name="dp_shard_cp", **kwargs):
-        cp_mesh_name = dp_shard_cp_mesh_name.replace("dp_shard_", "")
-        cp_enabled = cp_mesh_name in device_mesh.mesh_dim_names and device_mesh[cp_mesh_name].size() > 1
-
-        # TP, AC and mixed precision come from the default strategy; the FSDP wrapping
-        # step is customized through the ``_apply_fsdp_sharding`` hook above.
-        result = super().parallelize(
-            model,
-            device_mesh,
-            dp_shard_cp_mesh_name=dp_shard_cp_mesh_name,
-            **kwargs,
-        )
-
-        # Set CP mesh on CPAwareGatedDeltaNet modules
-        if cp_enabled:
-            from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import CPAwareGatedDeltaNet
-
-            cp_mesh = device_mesh[cp_mesh_name]
-            for _, mod in model.named_modules():
-                if isinstance(mod, CPAwareGatedDeltaNet):
-                    mod._cp_mesh = cp_mesh
-            # Hand the CP submesh to the model so a forward that embeds and
-            # sequence-shards its own primary stream (Megatron-style per-microbatch
-            # CP; see shard_sequence_for_cp_round_robin / shard_batch_aux_only) can build this
-            # rank's round-robin shard.
-            model.cp_mesh = cp_mesh
-
-        return result
-
-
 class DeepseekV4ParallelizationStrategy(DefaultParallelizationStrategy):
     """DeepSeek-V4 keeps a small set of reference-sensitive parameters in fp32."""
 
@@ -1180,8 +1050,6 @@ class QwenImageEditParallelizationStrategy(DefaultParallelizationStrategy):
 PARALLELIZATION_STRATEGIES: Dict[str, ParallelizationStrategy] = {
     "NemotronHForCausalLM": NemotronHParallelizationStrategy(),
     "DeepseekV4ForCausalLM": DeepseekV4ParallelizationStrategy(),
-    "Qwen3_5ForConditionalGeneration": Qwen3_5ParallelizationStrategy(),
-    "Qwen3_5ForCausalLM": Qwen3_5ParallelizationStrategy(),
     "WanTransformer3DModel": WanParallelizationStrategy(),
     "HunyuanVideo15Transformer3DModel": HunyuanParallelizationStrategy(),
     "LTX2VideoTransformer3DModel": LTX2ParallelizationStrategy(),
@@ -2594,7 +2462,6 @@ def fsdp2_strategy_parallelize(
     activation_checkpointing_scope: ActivationCheckpointingScope | None = "all",
     frozen_multimodal_sharding: FrozenMultimodalSharding = "root",
     reapply_trainability: Callable[[nn.Module], None] | None = None,
-    max_replicated_fp32_param_bytes_per_module: int = DEFAULT_MAX_REPLICATED_PARAM_BYTES_PER_MODULE,
 ) -> nn.Module:
     """
     Apply parallelisms and activation checkpointing to the model.
@@ -2664,7 +2531,6 @@ def fsdp2_strategy_parallelize(
         activation_checkpointing_scope=activation_checkpointing_scope,
         frozen_multimodal_sharding=frozen_multimodal_sharding,
         reapply_trainability=reapply_trainability,
-        max_replicated_fp32_param_bytes_per_module=max_replicated_fp32_param_bytes_per_module,
     )
 
 
