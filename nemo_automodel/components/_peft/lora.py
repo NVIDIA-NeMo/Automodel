@@ -572,16 +572,12 @@ def patch_moe_module(
         raise NotImplementedError("LoRA is not supported for Transformer Engine (TE) expert modules.")
     elif isinstance(orig_module, GroupedExpertsDeepEP):
         if mxfp4:
-            new_module = GroupedExpertsDeepEPLoRAMXFP4(
-                orig_module, passthrough=orig_module.gate_and_up_projs.is_meta, **common
-            )
+            new_module = GroupedExpertsDeepEPLoRAMXFP4(orig_module, **common)
         else:
             new_module = GroupedExpertsDeepEPLoRA(orig_module, **common)
     elif isinstance(orig_module, GroupedExperts):
         if mxfp4:
-            new_module = GroupedExpertsLoRAMXFP4(
-                orig_module, passthrough=orig_module.gate_and_up_projs.is_meta, **common
-            )
+            new_module = GroupedExpertsLoRAMXFP4(orig_module, **common)
         else:
             new_module = GroupedExpertsLoRA(orig_module, **common)
     else:

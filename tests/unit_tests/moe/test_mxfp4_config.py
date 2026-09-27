@@ -52,7 +52,7 @@ def moe_config() -> MoEConfig:
     )
 
 
-@pytest.mark.parametrize("passthrough", (False, True))
+@pytest.mark.parametrize("device", ("cpu", "meta"))
 @pytest.mark.parametrize(
     "cls",
     (
@@ -63,21 +63,31 @@ def moe_config() -> MoEConfig:
     ),
 )
 def test_rejects_router_weight_after_down(
-    cls: type[torch.nn.Module], passthrough: bool, moe_config: MoEConfig
+    cls: type[torch.nn.Module], device: str, moe_config: MoEConfig
 ) -> None:
     config = replace(moe_config, apply_router_weight_after_down=True)
     base = GroupedExpertsDeepEP if issubclass(cls, GroupedExpertsDeepEP) else GroupedExperts
-    with torch.device("meta"):
+    with torch.device(device):
         orig = base(config, BackendConfig(experts="torch_mm"))
         with pytest.raises(NotImplementedError, match="apply_router_weight_after_down=True"):
-            cls(orig, passthrough=passthrough)
+            cls(orig)
 
 
+@pytest.mark.parametrize("lora", (False, True))
+@pytest.mark.parametrize("expert_bias", (False, True))
 @pytest.mark.parametrize("expert_cls", (GroupedExperts, GroupedExpertsDeepEP))
-def test_patch_mxfp4_meta_loads_packed_checkpoint(expert_cls: type[torch.nn.Module], moe_config: MoEConfig) -> None:
+def test_mxfp4_meta_loads_packed_checkpoint(
+    expert_cls: type[torch.nn.Module], expert_bias: bool, lora: bool, moe_config: MoEConfig
+) -> None:
+    config = replace(moe_config, expert_bias=expert_bias)
     with torch.device("meta"):
-        original = expert_cls(moe_config, BackendConfig(experts="torch_mm"))
+        original = expert_cls(config, BackendConfig(experts="torch_mm"))
+    # Construction follows the original's device even outside the meta context.
+    if lora:
         patched = patch_moe_module(original, dim=4, expert_weight_format="mxfp4")
+    else:
+        cls = GroupedExpertsMXFP4 if expert_cls is GroupedExperts else GroupedExpertsDeepEPMXFP4
+        patched = cls(original)
 
     assert "gate_and_up_projs" not in patched.state_dict()
     assert "down_projs" not in patched.state_dict()
@@ -90,13 +100,19 @@ def test_patch_mxfp4_meta_loads_packed_checkpoint(expert_cls: type[torch.nn.Modu
         packed, scales = quantize_mxfp4(torch.full(shape, 0.5))
         checkpoint[name + "_packed"] = packed
         checkpoint[name + "_scales"] = scales
+    if expert_bias:
+        checkpoint["gate_up_proj_bias"] = torch.full((4, 128), 0.125)
+        checkpoint["down_proj_bias"] = torch.full((4, 64), -0.25)
     patched.to_empty(device="cpu")
-    patched.init_lora_weights("xavier")
+    if lora:
+        patched.init_lora_weights("xavier")
     result = patched.load_state_dict(checkpoint, strict=False)
-    adapters = {"lora_gate_and_up_A", "lora_gate_and_up_B", "lora_down_A", "lora_down_B"}
+    adapters = {"lora_gate_and_up_A", "lora_gate_and_up_B", "lora_down_A", "lora_down_B"} if lora else set()
     assert set(result.missing_keys) == adapters
     assert result.unexpected_keys == []
     assert {name for name, param in patched.named_parameters() if param.requires_grad} == adapters
+    # The shared initializer must neither recreate floating bases nor overwrite packed data.
+    patched.init_weights(torch.device("cpu"))
     for name, expected in checkpoint.items():
         actual = getattr(patched, name)
         assert not actual.is_meta
@@ -104,18 +120,34 @@ def test_patch_mxfp4_meta_loads_packed_checkpoint(expert_cls: type[torch.nn.Modu
         torch.testing.assert_close(actual.view(torch.uint8), expected.view(torch.uint8), rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("lora", (False, True))
+@pytest.mark.parametrize("expert_bias", (False, True))
 @pytest.mark.parametrize("expert_cls", (GroupedExperts, GroupedExpertsDeepEP))
-def test_patch_mxfp4_preserves_loaded_weights(expert_cls: type[torch.nn.Module], moe_config: MoEConfig) -> None:
-    original = expert_cls(moe_config, BackendConfig(experts="torch_mm"))
+def test_mxfp4_preserves_loaded_weights(
+    expert_cls: type[torch.nn.Module], expert_bias: bool, lora: bool, moe_config: MoEConfig
+) -> None:
+    original = expert_cls(replace(moe_config, expert_bias=expert_bias), BackendConfig(experts="torch_mm"))
     with torch.no_grad():
         original.gate_and_up_projs.fill_(0.5)
         original.down_projs.fill_(-0.25)
-    patched = patch_moe_module(original, dim=4, expert_weight_format="mxfp4")
+        if expert_bias:
+            original.gate_up_proj_bias.fill_(0.125)
+            original.down_proj_bias.fill_(-0.5)
+    if lora:
+        patched = patch_moe_module(original, dim=4, expert_weight_format="mxfp4")
+    else:
+        cls = GroupedExpertsMXFP4 if expert_cls is GroupedExperts else GroupedExpertsDeepEPMXFP4
+        patched = cls(original)
     for name in ("gate_and_up_projs", "down_projs"):
         packed, scales = getattr(patched, name + "_packed"), getattr(patched, name + "_scales")
         assert not packed.is_meta
+        assert not packed.requires_grad and not scales.requires_grad
         decoded = dequantize_mxfp4(packed, scales, torch.float32).transpose(-2, -1)
         torch.testing.assert_close(decoded, getattr(original, name), rtol=0, atol=0)
+    if expert_bias:
+        for name in ("gate_up_proj_bias", "down_proj_bias"):
+            torch.testing.assert_close(getattr(patched, name), getattr(original, name), rtol=0, atol=0)
+            assert not getattr(patched, name).requires_grad
 
 
 def test_unquantized_storage_supports_fp32(moe_config: MoEConfig) -> None:

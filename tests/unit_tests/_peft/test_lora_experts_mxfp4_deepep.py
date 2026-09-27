@@ -173,7 +173,7 @@ def test_passthrough_deepep_registers_packed_params_on_meta(moe_config):
         orig = GroupedExpertsDeepEP(moe_config)
     orig.use_torch_mm = True
 
-    mx = GroupedExpertsDeepEPMXFP4(orig, passthrough=True)
+    mx = GroupedExpertsDeepEPMXFP4(orig)
     assert mx._mxfp4_resident
     assert not hasattr(mx, "gate_and_up_projs")  # never created bf16 storage
     up_proj_dim = 2 * moe_config.moe_inter_dim  # gated

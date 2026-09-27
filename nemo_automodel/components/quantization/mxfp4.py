@@ -23,6 +23,7 @@ packed at steady state during LoRA training.
 """
 
 import torch
+from torch.autograd.function import FunctionCtx
 
 MXFP4_BLOCK_SIZE = 32
 
@@ -135,7 +136,21 @@ class MXFP4GroupedMM(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, x: torch.Tensor, packed: torch.Tensor, scales: torch.Tensor, offs: torch.Tensor) -> torch.Tensor:
+    def forward(
+        ctx: FunctionCtx, x: torch.Tensor, packed: torch.Tensor, scales: torch.Tensor, offs: torch.Tensor
+    ) -> torch.Tensor:
+        """Multiply activations grouped by expert by packed frozen weights.
+
+        Args:
+            x: Tensor of shape [tokens, in_dim], grouped contiguously by local expert.
+            packed: Int8 tensor of shape [local_experts, out_dim, in_dim // 2].
+            scales: E8M0 tensor of shape [local_experts, out_dim, in_dim // 32].
+            offs: Int32 tensor of shape [local_experts], holding cumulative token counts.
+                All tensors must be on the same device.
+
+        Returns:
+            Tensor of shape [tokens, out_dim] with the activation dtype.
+        """
         w_t = dequantize_mxfp4(packed, scales, x.dtype)  # [E, N, K]
         # Pass the transposed view directly; torch._grouped_mm handles the
         # strided mat2 (transB), avoiding a full bf16 weight copy per forward.
@@ -144,7 +159,16 @@ class MXFP4GroupedMM(torch.autograd.Function):
         return out
 
     @staticmethod
-    def backward(ctx, grad_out: torch.Tensor):
+    def backward(ctx: FunctionCtx, grad_out: torch.Tensor) -> tuple[torch.Tensor, None, None, None]:
+        """Backpropagate through activations while keeping the packed base frozen.
+
+        Args:
+            grad_out: Tensor of shape [tokens, out_dim], in the forward output dtype.
+
+        Returns:
+            Activation gradient of shape [tokens, in_dim], followed by None for
+            the packed weights, scales, and offsets.
+        """
         packed, scales, offs = ctx.saved_tensors
         w_t = dequantize_mxfp4(packed, scales, grad_out.dtype)  # [E, N, K] == W^T
         grad_x = torch._grouped_mm(grad_out.contiguous(), w_t, offs=offs)

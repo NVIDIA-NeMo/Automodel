@@ -53,7 +53,7 @@ _INTER = 256
 _EXPERTS = 4
 
 
-def _model(variant: str, dispatcher: str, device: torch.device) -> torch.nn.Module:
+def _model(variant: str, dispatcher: str, device: torch.device, lora_rank: int) -> torch.nn.Module:
     """Construct identical rounded weights for the CPU reference and CUDA implementation."""
     config = MoEConfig(
         n_routed_experts=_EXPERTS,
@@ -93,7 +93,7 @@ def _model(variant: str, dispatcher: str, device: torch.device) -> torch.nn.Modu
         with torch.device(device):
             model = patch_moe_module(
                 orig,
-                dim=8,
+                dim=lora_rank,
                 alpha=16,
                 expert_weight_format="mxfp4" if device.type == "cuda" and variant == "mxfp4_lora" else "unquantized",
             )
@@ -138,7 +138,7 @@ def _compare(actual: torch.Tensor, expected: torch.Tensor, name: str) -> dict[st
     return {"relative_l2": relative_l2, "max_abs": max_abs}
 
 
-def _run_case(variant: str, dispatcher: str, case: str) -> None:
+def _run_case(variant: str, dispatcher: str, case: str, lora_rank: int) -> None:
     rank, world = dist.get_rank(), dist.get_world_size()
     device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
     lengths = [16] * world if case == "balanced" else [17 + 14 * r for r in range(world)]
@@ -154,12 +154,12 @@ def _run_case(variant: str, dispatcher: str, case: str) -> None:
     mask[0] = False
     upstream = torch.randn(x.shape, generator=generator).to(torch.bfloat16).float()
 
-    reference = _model(variant, "torch", torch.device("cpu"))
+    reference = _model(variant, "torch", torch.device("cpu"), lora_rank)
     expected = reference(x, mask, weights, indices)
     expected.backward(upstream)
     assert x.grad is not None and weights.grad is not None
 
-    model = _model(variant, dispatcher, device)
+    model = _model(variant, dispatcher, device, lora_rank)
     mesh = init_device_mesh("cuda", (world,), mesh_dim_names=("ep",))
     # Match checkpoint passthrough: shard meta parameters before loading their local values.
     # NCCL cannot broadcast float8_e8m0fnu scales from materialized full parameters.
@@ -206,7 +206,16 @@ def _run_case(variant: str, dispatcher: str, case: str) -> None:
             if param.requires_grad:
                 checks[name + ".step"] = _compare(param.to_local(), ref_params[name][expert_start:expert_end], name)
     print(
-        json.dumps({"rank": rank, "dispatcher": dispatcher, "variant": variant, "case": case, "checks": checks}),
+        json.dumps(
+            {
+                "rank": rank,
+                "dispatcher": dispatcher,
+                "variant": variant,
+                "case": case,
+                "lora_rank": lora_rank,
+                "checks": checks,
+            }
+        ),
         flush=True,
     )
     dist.barrier()
@@ -217,19 +226,21 @@ def main() -> None:
     parser.add_argument("--dispatcher", choices=("torch", "deepep", "hybridep"), default="torch")
     parser.add_argument("--variants", nargs="+", choices=_VARIANTS, default=list(_VARIANTS))
     parser.add_argument("--cases", nargs="+", choices=_CASES, default=list(_CASES))
+    parser.add_argument("--lora-rank", type=int, default=8)
     args = parser.parse_args()
     initialize_distributed("nccl", timeout_minutes=1)
     try:
         for variant in args.variants:
             for case in args.cases:
-                _run_case(variant, args.dispatcher, case)
+                _run_case(variant, args.dispatcher, case, args.lora_rank)
     finally:
         destroy_global_state()
 
 
+@pytest.mark.parametrize("lora_rank", (4, 8))
 @pytest.mark.parametrize("dispatcher", ("torch", "deepep", "hybridep"))
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA devices for real EP collectives")
-def test_mxfp4_expert_parallel(dispatcher: str) -> None:
+def test_mxfp4_expert_parallel(dispatcher: str, lora_rank: int) -> None:
     """Exercise unequal shards and checkpointed empty routing with actual dispatchers."""
     package = {"deepep": "deep_ep", "hybridep": "hybrid_ep_cpp"}.get(dispatcher)
     if package is not None and importlib.util.find_spec(package) is None:
@@ -250,6 +261,8 @@ def test_mxfp4_expert_parallel(dispatcher: str) -> None:
             str(Path(__file__).resolve()),
             "--dispatcher",
             dispatcher,
+            "--lora-rank",
+            str(lora_rank),
         ],
         env=env,
         check=True,
