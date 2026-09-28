@@ -59,7 +59,6 @@ for model_row in "${model_rows[@]}"; do
     --tokenizer "$TOKENIZER" \
     --prompt "$PROMPT" \
     --max-new-tokens 1 \
-    --enable-ttt-updates \
     --output-jsonl "$output"
 
   python - "$output" "$architecture" <<'PY'
