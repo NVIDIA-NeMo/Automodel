@@ -1,0 +1,212 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Full-model throughput benchmark: 48 layers, 8 nodes x 8 H100 80GB, EP64,
+# sequence length 8192, LBS 1 / GBS 64, random weights and mock token batches.
+# Requires the image's FA4, FLA, HybridEP, and Transformer Engine dependencies.
+# The inline model config needs no checkpoint or tokenizer download.
+#
+# Use the complete training loop, including gradient clipping and LR updates.
+# Discard steps 0-19 for warmup and measure steps 20-49 (30 optimizer steps).
+# For the PR's full-loop TPS/GPU metric, divide 8191 label tokens per GPU by
+# mean complete-loop wall time, including data loading and metric logging.
+# The built-in train_tps metric times the training step only.
+#
+# From the repository root:
+#   export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+#   cp slurm.sub qwen3_8_flash_next_fa4.sub
+# Set CONFIG in the copied script to this YAML; retain 8 nodes and 8 GPUs/node.
+# Configure the cluster account, image, mounts, and walltime, then submit:
+#   sbatch qwen3_8_flash_next_fa4.sub
+# On the validated DFW image, also export NCCL_NET_PLUGIN=none and NCCL_NET=IB
+# in the submission script to use NCCL's internal IB path for Engram collectives.
+#
+# W&B is opt-in: set wandb.enable=true and your project/entity before submission.
+# To compare FlexAttention, change only model.backend.attn from cute to flex.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
+seed: 1234
+
+step_scheduler:
+  global_batch_size: 64
+  local_batch_size: 1
+  max_steps: 50
+  num_epochs: 1
+  ckpt_every_steps: 1000
+  save_checkpoint_every_epoch: false
+  val_every_steps: 1000
+  gc_every_steps: 1000
+  log_remote_every_steps: 1
+  loss_average_window_steps: 1
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 10
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  config:
+    _target_: nemo_automodel.components.models.qwen3_8_flash_next.config.Qwen3_8_FlashNextConfig
+    language_model_only: true
+    output_hidden_states: true
+    text_config:
+      vocab_size: 248320
+      hidden_size: 2560
+      num_hidden_layers: 48
+      full_attention_interval: 4
+      num_attention_heads: 24
+      num_key_value_heads: 2
+      head_dim: 256
+      hidden_act: silu
+      attention_bias: false
+      attention_dropout: 0.0
+      rms_norm_eps: 1.0e-6
+      max_position_embeddings: 262144
+      tie_word_embeddings: false
+      dtype: bfloat16
+      rope_parameters:
+        rope_type: default
+        rope_theta: 10000000
+        partial_rotary_factor: 0.25
+        mrope_interleaved: true
+        mrope_section: [11, 11, 10]
+      # 36 GatedDeltaNet layers use FLA; the 12 full-attention layers use QSA.
+      output_gate_type: sigmoid
+      linear_conv_kernel_dim: 4
+      linear_key_head_dim: 128
+      linear_value_head_dim: 128
+      linear_num_key_heads: 16
+      linear_num_value_heads: 48
+      mamba_ssm_dtype: float32
+      num_experts: 512
+      num_experts_per_tok: 10
+      moe_intermediate_size: 640
+      shared_expert_intermediate_size: 640
+      hc_count: 4
+      hc_lowrank: 320
+      # PLE layer IDs are one-based. Keep the full owner-sharded Engram table.
+      ple_layer_ids: [2]
+      ple_embed_dim: 2560
+      ple_conv_kernel_size: 4
+      ngram_size: 3
+      heads_per_ngram: 8
+      ngram_vocab_size_base: 20000000
+      make_ngram_vocab_size_divisible_by: 128
+      split_ngram_parts: 128
+      indexer_budget: 2048
+      indexer_compress_ratio: 4
+      indexer_head_dim: 128
+      indexer_kv_heads: 1
+      indexer_n_heads: 4
+      # Torch top-k and the original scheduling isolate the FA4 change.
+      qsa_indexer_query_chunk_size: 128
+  trust_remote_code: false
+  load_base_model: false
+  torch_dtype: bfloat16
+  use_liger_kernel: false
+  use_sdpa_patching: false
+  backend:
+    _target_: nemo_automodel.components.models.qwen3_8_flash_next.backend.Qwen3_8_FlashNextBackendConfig
+    attn: cute
+    linear: torch
+    rms_norm: torch_fp32
+    rope_fusion: false
+    experts: gmm
+    dispatcher: hybridep
+    dispatcher_num_sms: 20
+    dispatcher_async_dispatch: false
+    fake_balanced_gate: true
+    fake_gate_noise: 0.0
+    benchmark_static_routing: false
+    gate_precision: float32
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 64
+  sequence_parallel: false
+  activation_checkpointing: true
+  enable_compile: false
+  reshard_after_forward: true
+  moe:
+    reshard_after_forward: true
+    wrap_outer_model: true
+    ignore_router_for_ac: false
+
+checkpoint:
+  enabled: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
+  ignore_index: -100
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDataset
+  seq_len: 8192
+  vocab_size: 248320
+  batch_size: 1
+  num_samples: 100000
+
+packed_sequence:
+  packed_sequence_size: 0
+
+dataloader:
+  _target_: torch.utils.data.DataLoader
+  batch_size: null  # MockIterableDataset already yields [batch, sequence].
+  num_workers: 0
+
+optimizer:
+  # BF16 model storage with FP32 master weights and Adam moments.
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  lr: 1.0e-5
+  weight_decay: 0.1
+  adam_w_mode: true
+  bias_correction: true
+  master_weights: true
+  master_weight_dtype: torch.float32
+  store_param_remainders: true
+  exp_avg_dtype: torch.float32
+  exp_avg_sq_dtype: torch.float32
+  param_group_overrides:
+    - pattern: '\.ple\.ple_embedding\.ngram_embedding\.weight$'
+      lr_mult: 5.0
+      wd_mult: 0.0
+
+lr_scheduler:
+  lr_warmup_steps: 10
+  lr_decay_steps: 200
+  lr_decay_style: cosine
+  min_lr: 1.0e-6
+
+clip_grad_norm:
+  max_norm: 1.0
+  backend: triton
+
+wandb:
+  enable: false
+  project: qwen3-8-flash-next-benchmark
+  name: qwen3_8_flash_next_fa4_ep64_8k
+  dir: wandb
+
+ci:
+  recipe_owner: huiyingl
+  nodes: 8
+  time: "00:35:00"

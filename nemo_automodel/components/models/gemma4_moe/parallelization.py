@@ -29,6 +29,8 @@ from torch.distributed.tensor import DTensor, distribute_tensor
 from torch.distributed.tensor.parallel import ColwiseParallel, ParallelStyle
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
+from nemo_automodel.components.distributed.parallel_styles import ReplicatedWithGradAllReduce
+
 
 class _ReduceFromTensorParallelRegion(torch.autograd.Function):
     """Sum local TP values in forward and leave replicated gradients local."""
@@ -222,6 +224,8 @@ def _gemma4_tp_plan(model: nn.Module, sequence_parallel: bool = False) -> dict[s
         f"{model_prefix}.embed_tokens": _Gemma4VocabParallelEmbedding(),
         f"{model_prefix}.layers.*.self_attn.q_proj": ColwiseParallel(),
         f"{model_prefix}.layers.*.self_attn.k_proj": ColwiseParallel(),
+        f"{model_prefix}.layers.*.self_attn.q_norm": ReplicatedWithGradAllReduce(),
+        f"{model_prefix}.layers.*.self_attn.k_norm": ReplicatedWithGradAllReduce(),
         f"{model_prefix}.layers.*.self_attn.v_proj": ColwiseParallel(),
         f"{model_prefix}.layers.*.self_attn.o_proj": _Gemma4RowwiseParallel(output_holder),
         f"{model_prefix}.layers.*.mlp.up_proj": ColwiseParallel(),

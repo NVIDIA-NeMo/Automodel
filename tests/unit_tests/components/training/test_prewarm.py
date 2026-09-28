@@ -452,3 +452,71 @@ def test_comm_groups_prewarm_warms_groups_on_two_ranks(tmp_path):
         nprocs=2,
         join=True,
     )
+
+
+class _StageBlock(torch.nn.Module):
+    def __init__(self, first: bool):
+        super().__init__()
+        self.first = first
+        self.embed = torch.nn.Embedding(50, 8) if first else None
+        self.proj = torch.nn.Linear(8, 8)
+        self.calls = 0
+
+    def forward(self, x, block_residual=None):
+        self.calls += 1
+        h = self.embed(x) if self.first else x
+        if block_residual is not None:
+            h = h + block_residual.view(h.shape[0], h.shape[1], -1, h.shape[2]).sum(2)
+        return self.proj(h)
+
+
+class _StageConfig:
+    vocab_size = 50
+
+
+def _fake_stage(block, metas):
+    from types import SimpleNamespace
+
+    block.config = _StageConfig()
+    return SimpleNamespace(submod=block, inputs_meta=metas)
+
+
+def test_pipeline_stage_prewarm_runs_fwd_bwd_on_every_stage_and_restores_state():
+    first = _StageBlock(first=True)
+    later = _StageBlock(first=False)
+    later.eval()  # must be restored to eval afterwards
+    stages = [
+        _fake_stage(first, (torch.empty(2, 3, device="meta", dtype=torch.long),)),
+        _fake_stage(
+            later,
+            (
+                torch.empty(2, 3, 8, device="meta", dtype=torch.float32),
+                torch.empty(6, 2, 8, device="meta", dtype=torch.float32),
+            ),
+        ),
+    ]
+    torch.manual_seed(1234)
+    before = torch.rand(3)
+    torch.manual_seed(1234)
+    warmed = prewarm._prewarm_pipeline_stages(stages, torch.device("cpu"))
+    after = torch.rand(3)
+    assert warmed == 2 and first.calls == 1 and later.calls == 1
+    assert all(p.grad is None for p in list(first.parameters()) + list(later.parameters()))
+    assert first.training is True and later.training is False
+    assert torch.equal(before, after), "RNG state must be restored after the prewarm"
+
+
+def test_pipeline_stage_prewarm_noop_without_stages():
+    assert prewarm._prewarm_pipeline_stages(None, torch.device("cpu")) == 0
+    assert prewarm._prewarm_pipeline_stages([], torch.device("cpu")) == 0
+
+
+def test_prewarm_config_routes_pipeline_stage_compile(monkeypatch):
+    calls = {}
+    monkeypatch.setattr(
+        prewarm, "_prewarm_pipeline_stages", lambda stages, device: calls.setdefault("n", len(stages or []))
+    )
+    PrewarmConfig(pipeline_stage_compile=True).apply(model_parts=[], device=None, stages=[object(), object()])
+    assert calls == {"n": 2}
+    PrewarmConfig().apply(model_parts=[], device=None, stages=[object()])
+    assert calls == {"n": 2}  # default off: not called again

@@ -15,12 +15,13 @@
 import json
 from contextlib import nullcontext
 from copy import deepcopy
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
 import torch
-from transformers import AutoModelForCausalLM, PretrainedConfig
+from transformers import AutoModelForCausalLM, PretrainedConfig, PreTrainedModel
 
 from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_biencoder import (
     _extract_custom_args as _extract_biencoder_custom_args,
@@ -58,6 +59,7 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm
     _prepare_consolidated_hf_cache_once,
     _raise_distributed_failure,
     _record_deferred_failure,
+    _reinit_rotary_per_module,
     _repair_legacy_partial_rotary_config,
     _repeatability_policy,
     _replace_nemo_owned_reference_config,
@@ -1993,6 +1995,53 @@ def test_record_deferred_failure_preserves_all_comparison_failures():
     _record_deferred_failure(failures, "Phase 4 HF reload parity", "HF parity failed")
 
     assert failures == ["Phase 4 HF reload parity:\nHF parity failed"]
+
+
+def test_ling_reference_restores_rotary_frequencies_after_hf_load(tmp_path: Path) -> None:
+    """Legacy Ling initializes RoPE only in __init__, which HF meta loading discards."""
+
+    class LegacyConfig(PretrainedConfig):
+        model_type = "bailing_moe"
+
+    class LegacyRotary(torch.nn.Module):
+        def __init__(self, config: LegacyConfig) -> None:
+            super().__init__()
+            self.config = config
+            inv_freq, _ = self.rope_init_fn(config, torch.device("cpu"))
+            self.register_buffer("inv_freq", inv_freq, persistent=False)
+            self.original_inv_freq = inv_freq
+
+        @staticmethod
+        def rope_init_fn(config: LegacyConfig, device: torch.device) -> tuple[torch.Tensor, float]:
+            return torch.tensor([1.0, 0.1, 0.01, 0.001], device=device), 1.0
+
+    class LegacyReference(PreTrainedModel):
+        config_class = LegacyConfig
+
+        def __init__(self, config: LegacyConfig) -> None:
+            super().__init__(config)
+            self.proj = torch.nn.Linear(8, 8, bias=False)
+            self.rotary_emb = LegacyRotary(config)
+            self.post_init()
+
+        def _init_weights(self, module: torch.nn.Module) -> None:
+            # The checkpoint-owned Ling initializer only initializes stored weights.
+            if isinstance(module, torch.nn.Linear):
+                torch.nn.init.zeros_(module.weight)
+
+    original = LegacyReference(LegacyConfig())
+    expected = original.rotary_emb.inv_freq.clone()
+    assert "rotary_emb.inv_freq" not in original.state_dict()
+    original.save_pretrained(tmp_path)
+    loaded = LegacyReference.from_pretrained(tmp_path, dtype=torch.bfloat16, device_map={"": "cpu"})
+    # Make the omitted buffer's invalid storage deterministic across HF versions.
+    loaded.rotary_emb.inv_freq.fill_(float("nan"))
+    _reinit_rotary_per_module(loaded, torch.device("cpu"))
+
+    assert loaded.proj.weight.dtype == torch.bfloat16
+    torch.testing.assert_close(loaded.rotary_emb.inv_freq, expected, rtol=0, atol=0)
+    torch.testing.assert_close(loaded.rotary_emb.original_inv_freq, expected, rtol=0, atol=0)
+    assert loaded.rotary_emb.inv_freq.dtype == torch.float32
 
 
 def _legacy_partial_rotary_minimax_config(**overrides):

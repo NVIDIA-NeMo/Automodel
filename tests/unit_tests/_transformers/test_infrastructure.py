@@ -1184,3 +1184,48 @@ def test_instantiate_infrastructure_threads_ac_scope_into_moe_parallelize_fn():
     assert parallelize_fn.keywords["activation_checkpointing"] is True
     # DDPConfig.__post_init__ normalizes the scope; the partial must carry it through.
     assert parallelize_fn.keywords["activation_checkpointing_scope"] == ("vision",)
+
+
+@pytest.mark.parametrize("dp_shard_size,cp_size", [(1, 1), (1, 8), (2, 1), (2, 4)])
+def test_checkpoint_load_order_includes_cp_sharding(dp_shard_size: int, cp_size: int) -> None:
+    """CP-only FSDP must shard before allocating and loading model weights."""
+    from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
+
+    model = _DummyModel()
+    mesh = SimpleNamespace(
+        tp_size=1,
+        ep_size=1,
+        cp_size=cp_size,
+        dp_shard_size=dp_shard_size,
+        process_group=None,
+        device_mesh=None,
+    )
+    wrapper = SimpleNamespace(parallelize=MagicMock(), offload_policy=None)
+    events = MagicMock()
+    with (
+        patch(f"{_INFRA_MODULE}.get_world_size_safe", return_value=dp_shard_size * cp_size),
+        patch(f"{_INFRA_MODULE}._supports_logits_to_keep", return_value=True),
+        patch(f"{_INFRA_MODULE}.print_trainable_parameters"),
+        patch(f"{_INFRA_MODULE}._uses_te_attention", return_value=False),
+        patch("nemo_automodel.components.distributed.context_parallel.utils.attach_context_parallel_hooks"),
+        patch(f"{_INFRA_MODULE}._shard_ep_fsdp", return_value=model) as shard,
+        patch(f"{_INFRA_MODULE}.Checkpointer") as checkpointer,
+    ):
+        checkpoint = checkpointer.return_value
+        checkpoint.config.dequantize_base_checkpoint = False
+        events.attach_mock(shard, "shard")
+        events.attach_mock(checkpoint.initialize_model_weights, "initialize")
+        events.attach_mock(checkpoint.load_base_model, "load")
+        apply_model_infrastructure(
+            model,
+            is_meta_device=True,
+            device=torch.device("cpu"),
+            model_wrapper=wrapper,
+            mesh=mesh,
+            load_base_model=True,
+            pretrained_model_name_or_path="test/model",
+        )
+    expected = (
+        ["initialize", "load", "shard"] if (dp_shard_size, cp_size) == (1, 1) else ["shard", "initialize", "load"]
+    )
+    assert [event[0] for event in events.mock_calls] == expected

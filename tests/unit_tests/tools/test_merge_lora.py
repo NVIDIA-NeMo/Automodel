@@ -372,6 +372,7 @@ class TestParseArgs:
         assert args.no_save_tokenizer is False
         assert args.trust_remote_code is False
         assert args.model_class is None
+        assert args.automodel_native_export is False
 
     def test_all_flags(self, monkeypatch):
         from tools.merge_lora import parse_args
@@ -509,6 +510,73 @@ class TestMergeLoraFunction:
         mock_model.named_parameters.return_value = []
         mock_model.named_modules.return_value = []
         return mock_model
+
+    def test_opt_in_automodel_export_uses_torch_backend(self, tmp_path, monkeypatch):
+        import nemo_automodel
+        from nemo_automodel.components.models.common import BackendConfig
+        from tools import merge_lora as merge_mod
+
+        adapter_dir = tmp_path / "adapter"
+        adapter_dir.mkdir()
+        (adapter_dir / "adapter_config.json").write_text(
+            json.dumps({"peft_type": "LORA", "task_type": "CAUSAL_LM", "r": 192, "lora_alpha": 384}),
+            encoding="utf-8",
+        )
+        (adapter_dir / "automodel_peft_config.json").write_text(
+            json.dumps({"moe_rank_scaling": True}), encoding="utf-8"
+        )
+        model = self._make_mock_model()
+        automodel_cls = MagicMock()
+        automodel_cls.from_pretrained.return_value = model
+        native_export = MagicMock()
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "prog",
+                "-m",
+                "/fake/model",
+                "-a",
+                str(adapter_dir),
+                "-o",
+                str(tmp_path / "merged"),
+                "--dtype",
+                "bfloat16",
+                "--no-save-tokenizer",
+                "--automodel-native-export",
+            ],
+        )
+
+        with patch.dict(
+            nemo_automodel.__dict__,
+            {
+                "NeMoAutoModelForCausalLM": automodel_cls,
+                "export_merged_peft_checkpoint": native_export,
+            },
+        ):
+            merge_mod.main()
+
+        load_kwargs = automodel_cls.from_pretrained.call_args.kwargs
+        assert isinstance(load_kwargs["backend"], BackendConfig)
+        assert load_kwargs["backend"].linear == "torch"
+        assert load_kwargs["peft_config"].dim == 192
+        assert load_kwargs["peft_config"].moe_rank_scaling is True
+        native_export.assert_called_once_with(
+            model,
+            adapter_path=str(adapter_dir),
+            output_dir=str(tmp_path / "merged"),
+        )
+
+    def test_automodel_native_export_rejects_qlora(self, monkeypatch):
+        from tools import merge_lora as merge_mod
+
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["prog", "-m", "/model", "-a", "/adapter", "-o", "/out", "--qlora", "--automodel-native-export"],
+        )
+        with pytest.raises(ValueError, match="--qlora cannot be combined"):
+            merge_mod.main()
 
     @patch("tools.merge_lora.gc")
     @patch("tools.merge_lora.torch")

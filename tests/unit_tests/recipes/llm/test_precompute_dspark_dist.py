@@ -242,7 +242,10 @@ def test_build_target_rejects_minimax():
 
 @pytest.mark.parametrize(
     "model_type,builder_attr",
-    [(pdd._DEEPSEEK_V4_MODEL_TYPE, "build_deepseek_v4_target"), (pdd._GLM_5_2_MODEL_TYPE, "build_glm_5_2_target")],
+    [
+        (pdd._DEEPSEEK_V4_MODEL_TYPE, "build_deepseek_v4_target"),
+        (pdd._GLM_5_2_MODEL_TYPE, "build_glm_5_2_target"),
+    ],
 )
 def test_build_target_dispatches_sharded_builders(monkeypatch, model_type, builder_attr):
     captured = {}
@@ -266,6 +269,58 @@ def test_build_target_dispatches_sharded_builders(monkeypatch, model_type, build
     assert captured["world_size"] == 16
     assert captured["target_path"] == "big"
     assert captured["trust_remote_code"] is True
+
+
+@pytest.mark.parametrize("custom_backends", [False, True])
+def test_build_target_dispatches_model_owned_v41_config(monkeypatch, custom_backends):
+    captured = {}
+    setup = object()
+    model = SimpleNamespace(config="target-config")
+
+    def _fake_setup(cfg, world_size):
+        captured["world_size"] = world_size
+        return setup
+
+    def _fake_build(self, **kwargs):
+        captured["options"] = self
+        captured.update(kwargs)
+        return model
+
+    monkeypatch.setattr(pdd, "create_distributed_setup_from_config", _fake_setup)
+    monkeypatch.setattr(pdd.DeepseekV41DSparkTargetConfig, "build", _fake_build)
+    overrides = (
+        dict(
+            target_attn_backend="eager",
+            target_dispatcher="torch",
+            target_experts="torch",
+            target_enable_fsdp_optimizations=False,
+        )
+        if custom_backends
+        else {}
+    )
+    config, actual = pdd._build_target(
+        cfg=_Cfg(),
+        recipe_cfg=_recipe_cfg(**overrides),
+        world_size=64,
+        device=torch.device("cuda"),
+        compute_dtype=torch.bfloat16,
+        model_type=pdd._DEEPSEEK_V41_MODEL_TYPE,
+        target_path="deepseek-v41",
+        trust_remote_code=True,
+    )
+    assert config == "target-config"
+    assert actual is model
+    assert captured["world_size"] == 64
+    assert captured["distributed_setup"] is setup
+    assert captured["device"] == torch.device("cuda")
+    assert captured["compute_dtype"] == torch.bfloat16
+    options = captured["options"]
+    assert options.target_path == "deepseek-v41"
+    assert options.trust_remote_code is True
+    assert options.attn_backend == ("eager" if custom_backends else "tilelang")
+    assert options.dispatcher == ("torch" if custom_backends else "hybridep")
+    assert options.experts == ("torch" if custom_backends else "torch_mm")
+    assert options.enable_fsdp_optimizations is not custom_backends
 
 
 def test_build_target_generic_replicated_path(monkeypatch):

@@ -27,6 +27,7 @@ import torch
 from nemo_automodel.components._peft.lora import patch_moe_module
 from nemo_automodel.components._peft.lora_experts import GroupedExpertsDeepEPLoRA
 from nemo_automodel.components._peft.lora_experts_mxfp4 import GroupedExpertsDeepEPLoRAMXFP4
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.experts import GroupedExpertsDeepEP
 from nemo_automodel.components.moe.quantized_experts import (
@@ -87,7 +88,7 @@ def _make_representable_(experts) -> None:
             param.data.copy_(dequantize_mxfp4(packed, scales, param.dtype).transpose(-2, -1))
 
 
-def _make_deepep(moe_config, device, *, use_torch_mm=True, representable=False):
+def _make_deepep(moe_config, device, *, representable=False):
     """Build a materialized GroupedExpertsDeepEP with single-rank dispatcher state injected."""
     orig = GroupedExpertsDeepEP(moe_config).to(device).to(torch.bfloat16)
     with torch.no_grad():
@@ -97,7 +98,6 @@ def _make_deepep(moe_config, device, *, use_torch_mm=True, representable=False):
     orig.n_routed_experts = moe_config.n_routed_experts
     orig.ep_size = 1
     orig.ep_rank = 0
-    orig.use_torch_mm = use_torch_mm
     return orig
 
 
@@ -130,7 +130,6 @@ def test_frozen_deepep_mxfp4_packs_and_freezes(moe_config, device):
     assert mx.gate_and_up_projs_packed.shape == (4, 2 * moe_config.moe_inter_dim, moe_config.dim // 2)
     # DeepEP dispatcher knobs are carried over.
     assert mx.dispatcher_backend == orig.dispatcher_backend
-    assert mx.use_torch_mm is True
     # Fully frozen.
     assert [n for n, p in mx.named_parameters() if p.requires_grad] == []
 
@@ -159,19 +158,30 @@ def test_patch_moe_module_deepep_mxfp4(moe_config, device):
     assert not isinstance(patched_bf16, GroupedExpertsDeepEPLoRAMXFP4)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_deepep_mxfp4_requires_torch_mm_backend(moe_config, device):
-    orig = _make_deepep(moe_config, device, use_torch_mm=False)  # gmm path -> unsupported
-    with pytest.raises(NotImplementedError, match="torch_mm"):
-        GroupedExpertsDeepEPMXFP4(orig)
-    with pytest.raises(NotImplementedError, match="torch_mm"):
-        GroupedExpertsDeepEPLoRAMXFP4(orig, lora_dim=8, alpha=16)
+@pytest.mark.parametrize("backend_name", (None, "torch_mm", "gmm"))
+@pytest.mark.parametrize("lora", (False, True))
+def test_deepep_mxfp4_native_backends(moe_config: MoEConfig, backend_name: str | None, lora: bool) -> None:
+    """Default DeepEP and both native grouped-MM backend names accept packed storage."""
+    backend = BackendConfig(experts=backend_name) if backend_name is not None else None
+    with torch.device("meta"):
+        original = GroupedExpertsDeepEP(moe_config, backend)
+    if lora:
+        packed = GroupedExpertsDeepEPLoRAMXFP4(original, lora_dim=8, alpha=16)
+    else:
+        packed = GroupedExpertsDeepEPMXFP4(original)
+
+    assert packed.gate_and_up_projs_packed.shape == (4, 128, 32)
+    assert packed.down_projs_packed.shape == (4, 64, 32)
+    assert packed.gate_and_up_projs_packed.dtype == torch.int8
+    assert packed.down_projs_scales.dtype == torch.float8_e8m0fnu
+    assert all(param.is_meta for param in packed.parameters())
+    trainable = {name for name, param in packed.named_parameters() if param.requires_grad}
+    assert trainable == ({"lora_gate_and_up_A", "lora_gate_and_up_B", "lora_down_A", "lora_down_B"} if lora else set())
 
 
 def test_passthrough_deepep_registers_packed_params_on_meta(moe_config):
     with torch.device("meta"):
         orig = GroupedExpertsDeepEP(moe_config)
-    orig.use_torch_mm = True
 
     mx = GroupedExpertsDeepEPMXFP4(orig)
     assert mx._mxfp4_resident
@@ -238,7 +248,6 @@ def test_lora_deepep_mxfp4_forward_matches_bf16(moe_config, device):
     orig = _make_deepep(moe_config, device, representable=True)
 
     ref = GroupedExpertsDeepEPLoRA(orig, lora_dim=8, alpha=16).to(device).to(torch.bfloat16)
-    ref.use_torch_mm = True
     # Pack on CPU-allocated base params, then move packed storage + adapters to device.
     mx = GroupedExpertsDeepEPLoRAMXFP4(orig, lora_dim=8, alpha=16).to(device)
     # Give LoRA non-trivial values (B is zero-init by default) and sync both modules. The

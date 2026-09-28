@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import List, Literal, Tuple
@@ -355,6 +357,8 @@ class _HybridEPMetadataProcessor(nn.Module):
 # DeepEP's hybrid-ep metadata allgather asserts bytes_per_rank % 16 == 0 on a
 # 4-byte-per-token array, so per-rank token counts must be multiples of 4.
 _HYBRIDEP_TOKEN_ALIGNMENT = 4
+# Benchmark A/B switch for the static-routing pad-size pin (default on); see _HybridEPManager.dispatch.
+_STATIC_ROUTING_PAD_PIN = os.environ.get("NEMO_STATIC_ROUTING_PAD_PIN", "1") != "0"
 
 
 class _HybridEPManager(_DispatchManager):
@@ -392,6 +396,10 @@ class _HybridEPManager(_DispatchManager):
         # persist num_permuted_tokens across dispatches, see dispatch()/reset.
         self.benchmark_static_routing = benchmark_static_routing
         self.num_permuted_tokens = None
+        # Benchmark-only companion pin: the EP-group padded token count (see dispatch()). Under static
+        # routing every dispatch pads to the same size, so the per-dispatch MAX all-reduce + host sync
+        # that computes it runs once. NEMO_STATIC_ROUTING_PAD_PIN=0 keeps the per-dispatch path (A/B).
+        self._static_target_tokens: int | None = None
 
         # Metadata
         self.token_probs: torch.Tensor | None = None
@@ -472,9 +480,21 @@ class _HybridEPManager(_DispatchManager):
         self.num_unpadded_tokens = None
         if torch.distributed.is_initialized() and torch.distributed.get_world_size(self.group) > 1:
             num_tokens = hidden_states.shape[0]
-            group_max = torch.tensor(num_tokens, device=hidden_states.device)
-            torch.distributed.all_reduce(group_max, op=torch.distributed.ReduceOp.MAX, group=self.group)
-            target_tokens = -(-int(group_max) // _HYBRIDEP_TOKEN_ALIGNMENT) * _HYBRIDEP_TOKEN_ALIGNMENT
+            pin = self.benchmark_static_routing and _STATIC_ROUTING_PAD_PIN
+            if pin and self._static_target_tokens is not None and self._static_target_tokens >= num_tokens:
+                target_tokens = self._static_target_tokens
+            else:
+                group_max = torch.tensor(num_tokens, device=hidden_states.device)
+                torch.distributed.all_reduce(group_max, op=torch.distributed.ReduceOp.MAX, group=self.group)
+                target_tokens = -(-int(group_max) // _HYBRIDEP_TOKEN_ALIGNMENT) * _HYBRIDEP_TOKEN_ALIGNMENT
+                if pin:
+                    self._static_target_tokens = target_tokens
+                    if torch.distributed.get_rank() == 0:
+                        logging.getLogger(__name__).info(
+                            "benchmark_static_routing: HybridEP pad size pinned at %d tokens "
+                            "(per-dispatch EP-group max all-reduce + host sync skipped from now on)",
+                            target_tokens,
+                        )
             pad_tokens = target_tokens - num_tokens
             if pad_tokens > 0:
                 self.num_unpadded_tokens = num_tokens

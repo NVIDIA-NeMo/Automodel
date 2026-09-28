@@ -17,7 +17,14 @@
 # Copyright (c) 2025 DeepSeek
 # Licensed under the MIT License - https://github.com/deepseek-ai/DeepEP/blob/main/LICENSE
 
+import atexit
+import logging
 import os
+import shutil
+import tempfile
+import threading
+import time
+from contextlib import contextmanager
 
 try:
     from deep_ep import Buffer
@@ -26,6 +33,87 @@ try:
     HAVE_DEEP_EP = True
 except ImportError:
     HAVE_DEEP_EP = False
+
+
+# ── DeepEP dispatch replay across activation-checkpoint recompute ────────────
+#
+# Activation checkpointing replays a block's forward during backward, which
+# re-runs its MoE dispatch from scratch: DeepEP recomputes the routing layout
+# (`get_dispatch_layout` -> `notify_dispatch`) and then moves the tokens. The
+# layout is pure a function of the routing, and the routing is identical on the
+# replay (checkpointing restores the same inputs and the AC policy pins the
+# router's top-k), so that recomputation is redundant.
+#
+# DeepEP already exposes the cheap path: passing the `handle` returned by a
+# previous dispatch skips the layout exchange entirely -- that is what
+# `FusedDispatch.backward` does, and it is why the backward dispatch costs
+# ~4 ms against ~4.4 s for the layout-computing forward dispatches.
+#
+# Recording is scoped to one checkpoint frame: the AC wrapper builds a recorder
+# per checkpointed call, the forward appends each dispatch's handle and routing
+# metadata in call order, and the recompute consumes them in the same order.
+# Only the handle and the (small) per-token routing metadata are retained --
+# the dispatched activations themselves are still re-communicated, so the
+# memory that activation checkpointing saves is preserved.
+class DispatchReplayRecorder:
+    """Per-checkpoint-frame log of DeepEP dispatch results, replayed on recompute."""
+
+    def __init__(self) -> None:
+        self._records: list = []
+        self._cursor = 0
+        self.replay_misses = 0
+
+    def record(self, entry) -> None:
+        self._records.append(entry)
+
+    def take(self):
+        """Next recorded dispatch, or None when the replay outruns the log."""
+        if self._cursor >= len(self._records):
+            # Recompute issued more dispatches than the forward did. Fall back to
+            # a full dispatch rather than replaying a mismatched layout.
+            self.replay_misses += 1
+            return None
+        entry = self._records[self._cursor]
+        self._cursor += 1
+        return entry
+
+    def rewind(self) -> None:
+        self._cursor = 0
+
+
+class _DispatchReplayState(threading.local):
+    """Thread-local replay binding. ``threading.local`` runs ``__init__`` once per
+    thread, so both attributes always exist on every thread that touches it."""
+
+    def __init__(self) -> None:
+        self.recorder: DispatchReplayRecorder | None = None
+        self.mode: str | None = None
+
+
+_dispatch_replay_state = _DispatchReplayState()
+
+
+def _replay_mode() -> str | None:
+    return _dispatch_replay_state.mode
+
+
+def _active_recorder() -> "DispatchReplayRecorder | None":
+    return _dispatch_replay_state.recorder
+
+
+@contextmanager
+def dispatch_replay_scope(recorder: "DispatchReplayRecorder | None", mode: str):
+    """Bind ``recorder`` for the enclosed region. ``mode`` is 'record' or 'replay'."""
+    prev_recorder = _dispatch_replay_state.recorder
+    prev_mode = _dispatch_replay_state.mode
+    _dispatch_replay_state.recorder = recorder
+    _dispatch_replay_state.mode = mode if recorder is not None else None
+    try:
+        yield
+    finally:
+        _dispatch_replay_state.recorder = prev_recorder
+        _dispatch_replay_state.mode = prev_mode
+
 
 try:
     import importlib.util
@@ -47,6 +135,68 @@ import torch
 _buffer = None
 _nvshmem_available = None
 _uccl_buffer = None
+
+logger = logging.getLogger(__name__)
+
+
+class HybridEPDispatchReplayRecorder:
+    """Record HybridEP layouts from checkpoint forward for deterministic replay."""
+
+    def __init__(self) -> None:
+        self._records: list = []
+        self._cursor = 0
+        self.replay_misses = 0
+
+    def record(self, handle, tokens_per_expert) -> None:
+        self._records.append([handle, tokens_per_expert, None])
+
+    def finalize(self) -> None:
+        """Cache each layout extent after the checkpoint-forward op context exits."""
+        for entry in self._records:
+            if entry[2] is None:
+                # HybridEP's sync-free replay API expects a host integer.  Do
+                # both the reduction and device-to-host scalar conversion only
+                # after the selective-checkpoint context exits; otherwise the
+                # replay-only conversion adds aten._local_scalar_dense to the
+                # recompute trace.
+                entry[2] = int(entry[1].sum().item())
+
+    def take(self):
+        """Return the next forward dispatch record, or ``None`` on divergence."""
+        if self._cursor >= len(self._records):
+            self.replay_misses += 1
+            return None
+        entry = self._records[self._cursor]
+        self._cursor += 1
+        return entry
+
+    def rewind(self) -> None:
+        self._cursor = 0
+
+
+class _HybridEPDispatchReplayState(threading.local):
+    def __init__(self) -> None:
+        self.recorder: HybridEPDispatchReplayRecorder | None = None
+        self.mode: str | None = None
+
+
+_hybridep_dispatch_replay_state = _HybridEPDispatchReplayState()
+
+
+@contextmanager
+def hybridep_dispatch_replay_scope(recorder: HybridEPDispatchReplayRecorder | None, mode: str):
+    """Bind a HybridEP dispatch recorder for checkpoint forward or recompute."""
+    if mode not in ("record", "replay"):
+        raise ValueError(f"Unsupported HybridEP dispatch replay mode: {mode}")
+    previous_recorder = _hybridep_dispatch_replay_state.recorder
+    previous_mode = _hybridep_dispatch_replay_state.mode
+    _hybridep_dispatch_replay_state.recorder = recorder
+    _hybridep_dispatch_replay_state.mode = mode if recorder is not None else None
+    try:
+        yield
+    finally:
+        _hybridep_dispatch_replay_state.recorder = previous_recorder
+        _hybridep_dispatch_replay_state.mode = previous_mode
 
 
 def _is_nvshmem_available() -> bool:
@@ -154,8 +304,32 @@ class FusedDispatch(torch.autograd.Function):
         previous_event = None
         if async_finish:
             previous_event = EventOverlap(EventHandle())
-        # Calculate layout before actual dispatch
         buffer = get_buffer(group, get_hidden_bytes(x))
+
+        # Activation-checkpoint replay: reuse the layout this dispatch computed
+        # on the original forward instead of recomputing it. Cached-mode dispatch
+        # returns only recv_x, so the routing metadata comes from the record.
+        recorder = _active_recorder()
+        if recorder is not None and _replay_mode() == "replay":
+            replayed = recorder.take()
+            if replayed is not None:
+                cached_handle, recv_token_indices, recv_token_probs, tokens_per_expert = replayed
+                recv_x, _, _, _, _, after_event_overlap = buffer.dispatch(
+                    x,
+                    handle=cached_handle,
+                    previous_event=previous_event,
+                    async_finish=async_finish,
+                    allocate_on_comm_stream=allocate_on_comm_stream,
+                )
+                if async_finish:
+                    after_event_overlap.current_stream_wait()
+                ctx.group = group
+                ctx.handle = cached_handle
+                ctx.async_finish = async_finish
+                ctx.allocate_on_comm_stream = allocate_on_comm_stream
+                return (recv_x, recv_token_indices, recv_token_probs, tokens_per_expert, cached_handle)
+
+        # Calculate layout before actual dispatch
         (
             num_tokens_per_rank,
             num_tokens_per_rdma_rank,
@@ -203,6 +377,11 @@ class FusedDispatch(torch.autograd.Function):
         ctx.async_finish = async_finish
         ctx.allocate_on_comm_stream = allocate_on_comm_stream
         tokens_per_expert = torch.tensor(num_recv_tokens_per_expert_list)
+
+        if recorder is not None and _replay_mode() == "record":
+            # Keep the handle and routing metadata (small) so the recompute can
+            # skip the layout exchange; recv_x is deliberately not retained.
+            recorder.record((handle, recv_token_indices, recv_token_probs, tokens_per_expert))
 
         return (recv_x, recv_token_indices, recv_token_probs, tokens_per_expert, handle)
 
@@ -350,6 +529,91 @@ except ImportError:
 
 _hybrid_ep_buffer = None
 
+# HybridEP compiles its preprocessing / dispatch / combine kernels with nvcc on first use into a
+# per-process directory (``$HYBRID_EP_CACHE_DIR`` or ``$HOME``, then ``.deepep/hybrid_ep/jit/proc-<pid>``),
+# so every process of every job compiles them again (7 nvcc runs, ~50 s per process for the Kimi-K3
+# shapes). ``NEMO_HYBRIDEP_JIT_CACHE=<dir>`` warm-starts that per-process directory from a shared
+# cache and stores newly compiled kernels back into it. The compiled .so files depend only on the
+# kernel config and the toolchain (rank and job id only appear in the transient file name), and
+# HybridEP's ``load_cached_kernels`` loads every .so present in the per-process directory when the
+# buffer is constructed, keyed by file stem.
+_JIT_CACHE_ROOT = os.environ.get("NEMO_HYBRIDEP_JIT_CACHE")
+_jit_proc_dir: str | None = None
+_jit_shared_dir: str | None = None
+_jit_stored = False
+
+
+def _deep_ep_version() -> str:
+    """Installed DeepEP version (dist-info first: the package itself carries no ``__version__``)."""
+    try:
+        from importlib.metadata import version
+
+        return version("deep_ep")
+    except Exception:
+        import deep_ep
+
+        return str(getattr(deep_ep, "__version__", "unknown"))
+
+
+def _hybrid_ep_jit_dirs() -> tuple[str, str]:
+    """Return (shared cache dir for this toolchain and GPU, this process's HybridEP JIT dir).
+
+    The per-process path mirrors ``get_jit_dir()`` in DeepEP's ``csrc/hybrid_ep/jit/compiler.cu``.
+    """
+    base = os.environ.get("HYBRID_EP_CACHE_DIR")
+    if not base:
+        base = tempfile.mkdtemp(prefix="hybrid_ep_jit_")
+        os.environ["HYBRID_EP_CACHE_DIR"] = base
+    proc_dir = os.path.join(base, ".deepep", "hybrid_ep", "jit", f"proc-{os.getpid()}")
+    major, minor = torch.cuda.get_device_capability()
+    fingerprint = f"deep_ep-{_deep_ep_version()}_cuda-{torch.version.cuda}_sm{major}{minor}"
+    return os.path.join(_JIT_CACHE_ROOT, fingerprint), proc_dir
+
+
+def _warm_start_hybrid_ep_jit() -> bool:
+    """Copy the shared cache's kernels into this process's JIT dir. Returns whether the cache is active."""
+    global _jit_proc_dir, _jit_shared_dir
+    if not _JIT_CACHE_ROOT:
+        return False
+    _jit_shared_dir, _jit_proc_dir = _hybrid_ep_jit_dirs()
+    os.makedirs(_jit_proc_dir, exist_ok=True)
+    loaded = 0
+    if os.path.isdir(_jit_shared_dir):
+        for name in sorted(os.listdir(_jit_shared_dir)):
+            if name.endswith(".so"):
+                shutil.copy2(os.path.join(_jit_shared_dir, name), os.path.join(_jit_proc_dir, name))
+                loaded += 1
+    logger.info("HybridEP JIT cache: warm-started %d kernel(s) from %s", loaded, _jit_shared_dir)
+    atexit.register(store_hybrid_ep_jit_cache)
+    return True
+
+
+def store_hybrid_ep_jit_cache() -> int:
+    """Store the kernels HybridEP compiled in this process into the shared cache (local rank 0 only).
+
+    Files are written to a temporary name and atomically renamed, so concurrent writers from
+    several nodes leave a complete file behind; existing entries are kept.
+    """
+    if not _jit_proc_dir or not _jit_shared_dir or int(os.environ.get("LOCAL_RANK", "0")) != 0:
+        return 0
+    if not os.path.isdir(_jit_proc_dir):
+        return 0
+    os.makedirs(_jit_shared_dir, exist_ok=True)
+    stored = 0
+    for name in sorted(os.listdir(_jit_proc_dir)):
+        if not name.endswith(".so"):
+            continue
+        dst = os.path.join(_jit_shared_dir, name)
+        if os.path.exists(dst):
+            continue
+        tmp = f"{dst}.{os.getpid()}.tmp"
+        shutil.copy2(os.path.join(_jit_proc_dir, name), tmp)
+        os.replace(tmp, dst)
+        stored += 1
+    if stored:
+        logger.info("HybridEP JIT cache: stored %d new kernel(s) into %s", stored, _jit_shared_dir)
+    return stored
+
 
 def init_hybrid_ep_buffer(
     group: torch.distributed.ProcessGroup,
@@ -377,6 +641,7 @@ def init_hybrid_ep_buffer(
     """
     assert not fp8_dispatch, "HybridEP dispatcher does not support fp8 dispatch now"
     global _hybrid_ep_buffer
+    load_cached_kernels = _warm_start_hybrid_ep_jit()
     _hybrid_ep_buffer = HybridEPBuffer(
         group=group,
         hidden_dim=hidden_dim,
@@ -385,6 +650,7 @@ def init_hybrid_ep_buffer(
         use_fp8=fp8_dispatch,
         num_sms_dispatch_api=num_sms_dispatch_api,
         num_sms_combine_api=num_sms_combine_api,
+        **({"load_cached_kernels": True} if load_cached_kernels else {}),
     )
 
 
@@ -411,7 +677,9 @@ class HybridEPDispatch(torch.autograd.Function):
         pad_multiple=None,
     ):
         """Forward pass of fused dispatch of the HybridEP backend."""
-        if _hybrid_ep_buffer is None:
+        first_call = _hybrid_ep_buffer is None
+        if first_call:
+            t_first = time.perf_counter()
             seq_len, hidden_dim = x.shape[-2:]
             fp8_dispatch = False
             init_hybrid_ep_buffer(
@@ -423,6 +691,31 @@ class HybridEPDispatch(torch.autograd.Function):
                 num_sms_combine_api,
                 fp8_dispatch,
             )
+
+        recorder = _hybridep_dispatch_replay_state.recorder
+        if recorder is not None and _hybridep_dispatch_replay_state.mode == "replay":
+            replayed = recorder.take()
+            if replayed is not None:
+                handle, tokens_per_expert, num_permuted_tokens = replayed
+                replayed_outputs = _hybrid_ep_buffer.dispatch_with_permute(
+                    hidden=x,
+                    probs=probs,
+                    scaling_factor=None,
+                    handle=handle,
+                    pad_multiple=pad_multiple,
+                    num_permuted_tokens=num_permuted_tokens,
+                )
+                dispatched_hidden, dispatched_probs, dispatched_scaling_factor, _, _ = replayed_outputs
+                ctx.handle = handle
+                ctx.pad_multiple = pad_multiple
+                return (
+                    dispatched_hidden,
+                    dispatched_probs,
+                    dispatched_scaling_factor,
+                    tokens_per_expert,
+                    handle,
+                )
+
         non_blocking = num_permuted_tokens is not None
         (
             dispatched_hidden,
@@ -443,6 +736,17 @@ class HybridEPDispatch(torch.autograd.Function):
 
         ctx.handle = handle
         ctx.pad_multiple = pad_multiple
+        if first_call:
+            # One-time cost: buffer allocation + handle exchange + nvcc JIT of the preprocessing /
+            # dispatch / combine kernels (HybridEP compiles per process, so every job pays it).
+            torch.cuda.synchronize(x.device)
+            logger.info(
+                "HybridEP first dispatch (buffer init + kernel JIT + call): %.1f s", time.perf_counter() - t_first
+            )
+        if recorder is not None and _hybridep_dispatch_replay_state.mode == "record":
+            # Keep only the reusable layout and its output extent. Recomputed
+            # activations and probabilities are still redispatched through it.
+            recorder.record(handle, tokens_per_expert)
         return (
             dispatched_hidden,
             dispatched_probs,
@@ -458,6 +762,11 @@ class HybridEPDispatch(torch.autograd.Function):
         combined_hidden, combined_probs = _hybrid_ep_buffer.combine_with_unpermute(
             hidden=grad_x, probs=grad_probs, handle=handle, pad_multiple=ctx.pad_multiple
         )
+        global _jit_stored
+        if _JIT_CACHE_ROOT and not _jit_stored:
+            # The backward combine is the last HybridEP kernel variant compiled in a training step.
+            _jit_stored = True
+            store_hybrid_ep_jit_cache()
         return combined_hidden, None, combined_probs, None, None, None, None, None, None
 
 

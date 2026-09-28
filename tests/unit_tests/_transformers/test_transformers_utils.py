@@ -13,9 +13,11 @@
 # limitations under the License.
 
 import importlib
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
+import torch
 import torch.nn as nn
 
 from nemo_automodel._transformers.utils import (
@@ -298,6 +300,60 @@ class TestPatchSpecialTokensPattern:
 
 class TestApplyCacheCompatibilityPatchesIntegration:
     """Tests for apply_cache_compatibility_patches calling the new sub-patches."""
+
+    def test_restores_legacy_torch_fx_import(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Checkpoint-owned v4 code can still import the removed FX predicate."""
+        import transformers.utils.import_utils as import_utils
+
+        monkeypatch.delattr(import_utils, "is_torch_fx_available", raising=False)
+        apply_cache_compatibility_patches()
+
+        from transformers.utils.import_utils import is_torch_fx_available
+
+        assert is_torch_fx_available() == import_utils.is_torch_available()
+
+    def test_preserves_existing_torch_fx_predicate(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An upstream predicate remains authoritative when it exists."""
+        import transformers.utils.import_utils as import_utils
+
+        original = Mock(return_value=False)
+        monkeypatch.setattr(import_utils, "is_torch_fx_available", original, raising=False)
+        apply_cache_compatibility_patches()
+
+        assert import_utils.is_torch_fx_available is original
+        assert import_utils.is_torch_fx_available() is False
+
+    @pytest.mark.parametrize(
+        "dimensions",
+        [
+            {"hidden_size": 32, "num_attention_heads": 4},
+            {"head_dim": 8},
+            {"head_dim": 16, "partial_rotary_factor": 0.5},
+        ],
+    )
+    def test_restores_legacy_default_rope(self, monkeypatch: pytest.MonkeyPatch, dimensions: dict) -> None:
+        """Remote v4 configs retain their original full or partial RoPE frequencies."""
+        from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+
+        monkeypatch.delitem(ROPE_INIT_FUNCTIONS, "default", raising=False)
+        apply_cache_compatibility_patches()
+
+        config = SimpleNamespace(rope_theta=10000.0, **dimensions)
+        inv_freq, attention_factor = ROPE_INIT_FUNCTIONS["default"](config, torch.device("cpu"), seq_len=2048)
+
+        torch.testing.assert_close(inv_freq, torch.tensor([1.0, 0.1, 0.01, 0.001]))
+        assert inv_freq.dtype == torch.float32
+        assert attention_factor == 1.0
+
+    def test_preserves_existing_default_rope(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An upstream default initializer remains authoritative when present."""
+        from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+
+        original = Mock()
+        monkeypatch.setitem(ROPE_INIT_FUNCTIONS, "default", original)
+        apply_cache_compatibility_patches()
+
+        assert ROPE_INIT_FUNCTIONS["default"] is original
 
     def test_calls_bytes_to_unicode_patch(self):
         """apply_cache_compatibility_patches invokes _patch_bytes_to_unicode."""

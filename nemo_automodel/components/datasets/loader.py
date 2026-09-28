@@ -196,6 +196,9 @@ class ThdPackingConfig(PackingConfig):
     Requires a model whose forward accepts ``seq_lens`` — packing is skipped (with a warning) otherwise.
     """
 
+    pad_to_multiple_of: int = 1
+    """Align each document's physical span, counting padding within the pack budget."""
+
     def build(
         self,
         dataset: object,
@@ -223,6 +226,7 @@ class ThdPackingConfig(PackingConfig):
             dataset,
             split=split,
             packed_sequence_size=self.packed_sequence_size,
+            pad_to_multiple_of=self.pad_to_multiple_of,
             max_packs=self.max_packs,
             padding_idx=pad_token_id,
             cp_size=cp_size,

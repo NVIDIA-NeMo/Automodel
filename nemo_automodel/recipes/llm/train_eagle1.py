@@ -41,6 +41,7 @@ from nemo_automodel.components.config._arg_parser import parse_args_and_load_con
 from nemo_automodel.components.datasets.llm.eagle3 import build_eagle3_dataloader
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
+from nemo_automodel.components.distributed.tp_replicas import broadcast_tp_replicas, synchronize_tp_replica_gradients
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.wandb_utils import init_wandb_run, suppress_wandb_log_messages
 from nemo_automodel.components.speculative.eagle.core_v12 import EagleTrainerModule, FeatureNoiseConfig
@@ -300,6 +301,10 @@ class TrainEagle1Recipe(BaseRecipe):
                 process_group=dp_process_group,
             )
         self.trainer_module = trainer_module
+        # DDP broadcasts only inside the DP subgroup. The draft is replicated
+        # across TP, so align those independently initialized copies before the
+        # optimizer captures them and TP replica gradients are averaged.
+        broadcast_tp_replicas([self.trainer_module], self.device_mesh)
 
         self._finalize_setup(recipe_cfg=recipe_cfg, target_path=target_path, wandb_name_prefix="eagle1_")
 
@@ -799,6 +804,10 @@ class TrainEagle1Recipe(BaseRecipe):
                     pending_micro_batches += 1
 
                     if pending_micro_batches == self.grad_accumulation_steps:
+                        synchronize_tp_replica_gradients(
+                            [self.trainer_module],
+                            getattr(self, "device_mesh", None),
+                        )
                         grad_norm = torch.nn.utils.clip_grad_norm_(self.trainer_module.parameters(), self.max_grad_norm)
                         self.optimizer.step()
                         self.optimizer.zero_grad(set_to_none=True)
@@ -877,9 +886,13 @@ class TrainEagle1Recipe(BaseRecipe):
                 # non-padding / variable-length sampler is ever introduced, revisit
                 # this: a divergent per-rank ``scale`` would desync parameters, and
                 # a rank that lands on ``pending_micro_batches == 0`` would skip the
-                # flush (and the ``clip_grad_norm_`` collective inside it) while its
+                # flush (and the TP gradient synchronization inside it) while its
                 # peers step, hanging on the mismatched collective.
                 if pending_micro_batches > 0:
+                    synchronize_tp_replica_gradients(
+                        [self.trainer_module],
+                        getattr(self, "device_mesh", None),
+                    )
                     scale = float(self.grad_accumulation_steps) / float(pending_micro_batches)
                     for p in self.trainer_module.parameters():
                         if p.grad is not None:

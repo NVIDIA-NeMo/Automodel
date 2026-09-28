@@ -211,8 +211,8 @@ class GroupedExpertsDeepEPLoRAMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsDeepE
     adapters (and optional expert biases) stay in floating point and their grouped GEMMs
     are unchanged.
 
-    Requires the torch_mm experts backend; the grouped_gemm (``gmm``) path has no packed
-    variant. Meta bases become packed checkpoint placeholders; materialized bases
+    The DeepEP parent always uses native grouped MM.
+    Meta bases become packed checkpoint placeholders; materialized bases
     are quantized immediately.
     """
 
@@ -248,7 +248,6 @@ class GroupedExpertsDeepEPLoRAMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsDeepE
         grouped GEMMs with ``MXFP4GroupedMM`` over the packed weights.
         """
         assert not isinstance(x, DTensor)
-        assert self.use_torch_mm, "mxfp4-resident DeepEP experts require the torch_mm experts backend."
         assert self.n_routed_experts % self.ep_size == 0
 
         permuted_local_hidden_states, tokens_per_expert, permuted_probs = self._dispatch_tokens(

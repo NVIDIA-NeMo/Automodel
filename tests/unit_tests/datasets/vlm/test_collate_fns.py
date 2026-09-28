@@ -3362,6 +3362,33 @@ def test_thd_vlm_collater_empty_batch():
     assert packed_sequence_thd_vlm_collater([]) == {}
 
 
+def test_thd_vlm_collater_preserves_multi_media_pack_counts_for_pp():
+    from nemo_automodel.components.datasets.vlm.collate_fns import packed_sequence_thd_vlm_collater
+    from nemo_automodel.components.datasets.vlm.pp_media import VLM_PP_MEDIA_KEY, prepare_vlm_media_for_pp
+
+    sample = _thd_vlm_make_sample([6])
+    sample.update(
+        pixel_values=torch.randn(8, 8),
+        image_grid_thw=torch.tensor([[1, 2, 2], [1, 2, 2]]),
+        n_images=2,
+        pixel_values_videos=torch.randn(8, 8),
+        video_grid_thw=torch.tensor([[1, 2, 2], [1, 2, 2]]),
+        n_videos=2,
+    )
+
+    batch = packed_sequence_thd_vlm_collater([sample], padding_idx=0)
+
+    assert batch["n_images_per_sample"].tolist() == [2]
+    assert batch["n_videos_per_sample"].tolist() == [2]
+
+    prepared = prepare_vlm_media_for_pp(batch, batch_size=1, n_microbatches=1)
+    media = prepared[VLM_PP_MEDIA_KEY]
+    assert tuple(media["pixel_values"][0].shape) == (8, 8)
+    assert tuple(media["image_grid_hws"][0].shape) == (2, 3)
+    assert tuple(media["pixel_values_videos"][0].shape) == (8, 8)
+    assert tuple(media["video_grid_thw"][0].shape) == (2, 3)
+
+
 def test_merge_media_values_flattens_mixed_tensor_and_list_packs():
     from nemo_automodel.components.datasets.vlm.collate_fns import _merge_media_values
 

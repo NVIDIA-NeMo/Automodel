@@ -32,6 +32,8 @@ from torch.distributed.tensor.parallel import (
 )
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
+from nemo_automodel.components.distributed.parallel_styles import ReplicatedWithGradAllReduce
+
 # These are needed only for annotations and for PARALLELIZE_FUNCTIONS keys. Importing
 # any one of them at module scope drags in the whole transformers model zoo --
 # transformers.models.gemma3 alone pulls sklearn -> pandas/scipy plus torchvision and
@@ -190,6 +192,8 @@ def _parallelize_gemma3(
         f"{model_prefix}.embed_tokens": VocabParallelEmbedding(input_layouts=Replicate()),
         f"{model_prefix}.layers.*.self_attn.q_proj": ColwiseParallel(),
         f"{model_prefix}.layers.*.self_attn.k_proj": ColwiseParallel(),
+        f"{model_prefix}.layers.*.self_attn.q_norm": ReplicatedWithGradAllReduce(),
+        f"{model_prefix}.layers.*.self_attn.k_norm": ReplicatedWithGradAllReduce(),
         f"{model_prefix}.layers.*.self_attn.v_proj": ColwiseParallel(),
         f"{model_prefix}.layers.*.self_attn.o_proj": RowwiseParallel(),
         f"{model_prefix}.layers.*.mlp.up_proj": ColwiseParallel(),
@@ -516,13 +520,14 @@ def _parallelize_qwen(
             "model.layers.*.input_layernorm": SequenceParallelAllGatherActivation(),
             "model.layers.*.self_attn.q_proj": ColwiseParallel(),
             "model.layers.*.self_attn.k_proj": ColwiseParallel(),
+            "model.layers.*.self_attn.q_norm": ReplicatedWithGradAllReduce(),
+            "model.layers.*.self_attn.k_norm": ReplicatedWithGradAllReduce(),
             "model.layers.*.self_attn.v_proj": ColwiseParallel(),
             "model.layers.*.self_attn.qkv_proj": ColwiseParallel(),
             # Rowwise projections reduce-scatter back to sequence-sharded activations.
             "model.layers.*.self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1), use_local_output=False),
-            # NOTE: Qwen3 has `q_norm`/`k_norm` inside attention. These operate on the
-            # head-sharded outputs of q_proj/k_proj. Do NOT wrap them with SequenceParallel,
-            # which would incorrectly tag head-sharded activations as sequence-sharded.
+            # Qwen3 q_norm/k_norm operate independently on head-sharded Q/K.
+            # Their parameters stay replicated, while partial-head gradients sum.
             "model.layers.*.post_attention_layernorm": SequenceParallelAllGatherActivation(),
             "model.layers.*.mlp.up_proj": ColwiseParallel(),
             "model.layers.*.mlp.gate_proj": ColwiseParallel(),
@@ -538,6 +543,8 @@ def _parallelize_qwen(
             ),
             "model.layers.*.self_attn.q_proj": ColwiseParallel(),
             "model.layers.*.self_attn.k_proj": ColwiseParallel(),
+            "model.layers.*.self_attn.q_norm": ReplicatedWithGradAllReduce(),
+            "model.layers.*.self_attn.k_norm": ReplicatedWithGradAllReduce(),
             "model.layers.*.self_attn.v_proj": ColwiseParallel(),
             "model.layers.*.self_attn.qkv_proj": ColwiseParallel(),
             "model.layers.*.self_attn.o_proj": RowwiseParallel(),
@@ -583,6 +590,14 @@ def _parallelize_phi(
         "model.layers.*.mlp.fc2": RowwiseParallel(),
         "lm_head": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
     }
+
+    if model.config.qk_layernorm:
+        base_model_tp_plan.update(
+            {
+                "model.layers.*.self_attn.q_layernorm": ReplicatedWithGradAllReduce(),
+                "model.layers.*.self_attn.k_layernorm": ReplicatedWithGradAllReduce(),
+            }
+        )
 
     if sequence_parallel:
         base_model_sp_plan: dict[str, ParallelStyle] = {

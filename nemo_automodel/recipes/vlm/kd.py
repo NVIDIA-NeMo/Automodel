@@ -58,8 +58,10 @@ from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.distributed.config import DistributedSetup
 from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
+from nemo_automodel.components.distributed.tp_replicas import synchronize_tp_replica_gradients
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
+from nemo_automodel.components.loss.utils import _count_label_tokens, _get_loss_ignore_index, _normalize_kd_labels
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 from nemo_automodel.components.training.rng import ScopedRNG
 from nemo_automodel.components.training.signal_handler import DistributedSignalHandler
@@ -394,10 +396,15 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
                 )
             del hidden_states
 
+            kd_labels = _normalize_kd_labels(
+                labels,
+                loss_ignore_index=_get_loss_ignore_index(self.loss_fn),
+                kd_ignore_index=_get_loss_ignore_index(self.kd_loss_fn),
+            )
             kd_loss = self.kd_loss_fn(
                 student_logits,
                 teacher_logits,
-                labels,
+                kd_labels,
                 num_batch_labels=num_label_tokens,
             )
             del teacher_logits
@@ -411,8 +418,9 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
 
     def _run_train_optim_step(self, batches, max_grad_norm: float | None = None):
         """Execute a single training step with KD loss tracking."""
+        ignore_index = _get_loss_ignore_index(self.loss_fn)
         num_label_tokens = torch.tensor(
-            sum((batch["labels"] != -100).sum().item() for batch in batches), dtype=torch.long
+            sum(_count_label_tokens(batch["labels"], ignore_index) for batch in batches), dtype=torch.long
         )
         num_label_tokens = self._dp_allreduce(num_label_tokens).item()
 
@@ -440,6 +448,7 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
             if i == 0:
                 prepare_after_first_microbatch()
 
+        synchronize_tp_replica_gradients(self.model_parts, self.device_mesh)
         grad_norm = scale_grads_and_clip_grad_norm(
             max_grad_norm=max_grad_norm,
             model_parts=self.model_parts,
@@ -533,9 +542,10 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
             total_kd_loss = 0.0
             total_num_label_tokens = 0
             loss_buffer: list[torch.Tensor] = []
+            ignore_index = _get_loss_ignore_index(self.loss_fn)
 
             for batch in val_dataloader:
-                num_label_tokens = (batch["labels"] != -100).sum().item()
+                num_label_tokens = _count_label_tokens(batch["labels"], ignore_index)
                 self._forward_backward_step(
                     0,
                     batch,

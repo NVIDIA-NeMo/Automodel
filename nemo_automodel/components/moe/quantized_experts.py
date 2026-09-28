@@ -73,10 +73,11 @@ class MXFP4ExpertStorageMixin:
         """Reject execution modes that the packed expert computation does not implement."""
         if self.config.apply_router_weight_after_down:
             raise NotImplementedError("MXFP4 experts do not support apply_router_weight_after_down=True.")
-        if not self.use_torch_mm:
+        # DeepEP experts always use native grouped MM; only plain experts can select the loop backend.
+        if isinstance(self, GroupedExperts) and not self.use_torch_mm:
             raise NotImplementedError(
                 "mxfp4-resident expert weights require the torch_mm experts backend (backend.experts='torch_mm'). "
-                "The grouped_gemm path (backend.experts='gmm') has no packed variant; with DeepEP dispatch use "
+                "The per-expert loop has no packed variant; with DeepEP dispatch use "
                 "backend.dispatcher='deepep' together with backend.experts='torch_mm'."
             )
 
@@ -289,8 +290,7 @@ class GroupedExpertsDeepEPMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsDeepEP):
     unchanged — mxfp4 only changes the two post-dispatch grouped GEMMs, which read the
     packed base weights via ``MXFP4GroupedMM`` instead of bf16 ``torch._grouped_mm``.
 
-    Requires the torch_mm experts backend (``backend.experts='torch_mm'``); the
-    grouped_gemm (``gmm``) path has no packed variant.
+    The DeepEP parent always uses native grouped MM.
     """
 
     def __init__(self, orig_module: GroupedExpertsDeepEP) -> None:
@@ -304,7 +304,6 @@ class GroupedExpertsDeepEPMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsDeepEP):
                 dispatcher_share_token_dispatcher=orig_module.dispatcher_share_token_dispatcher,
                 dispatcher_async_dispatch=orig_module.dispatcher_async_dispatch,
             )
-        self.use_torch_mm = orig_module.use_torch_mm
         # These fresh parameters have no autograd history or optimizer references.
         for name in self._MXFP4_BASE_NAMES:
             getattr(self, name).data = _to_local(getattr(orig_module, name)).clone()
@@ -327,7 +326,6 @@ class GroupedExpertsDeepEPMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsDeepEP):
         ``torch._grouped_mm`` calls with ``MXFP4GroupedMM`` over the packed weights.
         """
         assert not isinstance(x, DTensor)
-        assert self.use_torch_mm, "mxfp4-resident DeepEP experts require the torch_mm experts backend."
         assert self.n_routed_experts % self.ep_size == 0, (
             f"Number of experts must be divisible by ep_size (ep_size={self.ep_size})"
         )
