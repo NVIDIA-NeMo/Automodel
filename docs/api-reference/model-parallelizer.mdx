@@ -54,11 +54,12 @@ components all consume the same resolved context.
 ### Architecture guardrail
 
 Two checks run in CI. The standard `import-linter` contract prevents distributed
-infrastructure from importing model or adapter implementations. The focused
+infrastructure from directly importing model or adapter implementations. The focused
 `python tools/lint_model_parallelizer_contract.py` check rejects a second
-`ParallelizeContext` or `parallel_scheme` API, model-specific public
-`parallelize_*` methods, and sidecars that import distributed symbols not
-declared in `__all__`.
+`ParallelizeContext` or `parallel_scheme` API, any additional public sidecar
+method, and sidecars that import distributed symbols not declared in `__all__`.
+The focused check also runs as the `model-parallelizer-contract` pre-commit hook,
+so the same failure is visible before a change reaches CI.
 
 ## Add a Model Sidecar
 
@@ -114,6 +115,12 @@ mixed-precision, prefetch, CP, EP, and root-wrapping behavior.
   boundaries, such as dtype-uniform groups. Continue to use
   `self._fully_shard_module` (or helpers that accept the parallelizer) so custom
   wrapping remains consistent at every level.
+- Override `_validate_tp_mesh(model, tp_mesh)` when the model exposes
+  heterogeneous per-layer attention shapes that cannot be validated through a
+  single global head count.
+- Override `_use_full_layer_activation_checkpointing(model)` only when the
+  model can safely replay a complete decoder layer, including any shared-K/V
+  state, during backward.
 - Override `_apply(...)` only when model-specific work must surround or replace
   the complete dense FSDP2 flow. Call `super()._apply(...)` to retain the common
   ordering and validations. The public `parallelize(model, context)` method

@@ -90,7 +90,7 @@ def _parallelize_fsdp2(
     if config.patch_is_packed_sequence:
         _patch_is_packed_sequence_for_training()
     if not fsdp2_sharding_enabled(mesh_context.device_mesh):
-        return _parallelize_unsharded_fsdp2(model, mesh_context)
+        return _parallelize_unsharded_fsdp2(model, mesh_context, parallelizer=parallelizer)
 
     return parallelizer._apply(
         model=model,
@@ -112,8 +112,14 @@ def _parallelize_fsdp2(
     )
 
 
-def _parallelize_unsharded_fsdp2(model: nn.Module, mesh_context: MeshContext) -> nn.Module:
+def _parallelize_unsharded_fsdp2(
+    model: nn.Module,
+    mesh_context: MeshContext,
+    *,
+    parallelizer: ModelParallelizer,
+) -> nn.Module:
     from nemo_automodel.components.distributed.activation_checkpointing import (
+        apply_full_layer_checkpointing_to_layers,
         apply_submodule_checkpointing,
         detect_kv_sharing_and_maybe_disable_cache,
         is_selective_activation_checkpointing,
@@ -141,13 +147,16 @@ def _parallelize_unsharded_fsdp2(model: nn.Module, mesh_context: MeshContext) ->
                 layer_groups,
                 config.activation_checkpointing_scope,
             )
-            if _should_use_hf_native_gradient_checkpointing(
+            use_hf_native_checkpointing = _should_use_hf_native_gradient_checkpointing(
                 model,
                 layer_groups,
                 ac_scopes,
                 enable_compile=config.enable_compile,
-            ):
+            )
+            if use_hf_native_checkpointing:
                 model.gradient_checkpointing_enable()
+            elif parallelizer._use_full_layer_activation_checkpointing(model):
+                apply_full_layer_checkpointing_to_layers(model, layers)
             else:
                 apply_submodule_checkpointing(layers, detect_kv_sharing_and_maybe_disable_cache(model))
     if mesh_context.reapply_trainability is not None:

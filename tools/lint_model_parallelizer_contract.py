@@ -150,13 +150,17 @@ def lint_sidecar_exports(source: str, path: Path, root: Path) -> list[LintError]
     errors = [
         LintError(
             path,
-            method.lineno,
+            member.lineno,
             "model sidecars must use the inherited parallelize(model, mesh_context) interface",
         )
         for class_node in sidecar_classes
-        for method in class_node.body
-        if isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and (method.name == "parallelize" or method.name.startswith("parallelize_"))
+        for member in class_node.body
+        if (
+            isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and not member.name.startswith("_")
+            or isinstance(member, (ast.Assign, ast.AnnAssign))
+            and any(name == "parallelize" for target in _assignment_targets(member) for name in _identifiers(target))
+        )
     ]
     for node in nodes:
         if isinstance(node, ast.Import) and any(
@@ -180,6 +184,10 @@ def lint_sidecar_exports(source: str, path: Path, root: Path) -> list[LintError]
             if exported is None or alias.name not in exported
         )
     return errors
+
+
+def _assignment_targets(node: ast.Assign | ast.AnnAssign) -> list[ast.expr]:
+    return node.targets if isinstance(node, ast.Assign) else [node.target]
 
 
 def collect_python_files(paths: Iterable[Path]) -> list[Path]:

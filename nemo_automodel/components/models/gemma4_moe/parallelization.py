@@ -262,27 +262,34 @@ def _get_attention_head_counts(text_config) -> set[tuple[int, int]]:
 class Gemma4ModelParallelizer(ModelParallelizer):
     """Apply the variant-aware Gemma4 TP plan before standard FSDP2."""
 
+    def _validate_tp_mesh(self, model: nn.Module, tp_mesh: DeviceMesh) -> None:
+        """Validate every heterogeneous Gemma4 attention-head shape."""
+        tp_size = tp_mesh.size()
+        text_config = model.config.text_config
+        if text_config.enable_moe_block:
+            raise ValueError("Gemma4 MoE does not support tensor parallelism; use expert parallelism instead.")
+        incompatible_head_counts = {
+            head_counts
+            for head_counts in _get_attention_head_counts(text_config)
+            if head_counts[0] % tp_size != 0 or head_counts[1] % tp_size != 0
+        }
+        if incompatible_head_counts:
+            raise ValueError(
+                "Gemma4 TP requires every layer attention head count to be divisible by tp_size; "
+                f"got incompatible_head_counts={sorted(incompatible_head_counts)}, tp_size={tp_size}."
+            )
+
+    def _use_full_layer_activation_checkpointing(self, model: nn.Module) -> bool:
+        """Keep Gemma4's replay-safe shared attention inside the checkpoint region."""
+        return bool(getattr(model, "kv_sharing_survives_checkpoint_replay", False))
+
     def _apply(self, model: nn.Module, device_mesh: DeviceMesh, **kwargs: Any) -> nn.Module:
-        """Validate and apply Gemma4 tensor parallelism."""
+        """Apply Gemma4 tensor parallelism."""
         tp_mesh_name = kwargs.get("tp_mesh_name", "tp")
         tp_mesh = device_mesh[tp_mesh_name]
         tp_size = tp_mesh.size()
-        text_config = model.config.text_config
 
         if tp_size > 1:
-            if text_config.enable_moe_block:
-                raise ValueError("Gemma4 MoE does not support tensor parallelism; use expert parallelism instead.")
-            attention_head_counts = _get_attention_head_counts(text_config)
-            incompatible_head_counts = {
-                head_counts
-                for head_counts in attention_head_counts
-                if head_counts[0] % tp_size != 0 or head_counts[1] % tp_size != 0
-            }
-            if incompatible_head_counts:
-                raise ValueError(
-                    "Gemma4 TP requires every layer attention head count to be divisible by tp_size; "
-                    f"got incompatible_head_counts={sorted(incompatible_head_counts)}, tp_size={tp_size}."
-                )
             model._gemma4_tp_enabled = True
             model._gemma4_tp_size = tp_size
             model._gemma4_tp_mesh = tp_mesh

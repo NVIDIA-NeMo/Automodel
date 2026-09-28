@@ -269,6 +269,14 @@ class ModelParallelizer:
         """Apply the FSDP2 primitive used by this model sidecar."""
         return fully_shard(module, **kwargs)
 
+    def _validate_tp_mesh(self, model: nn.Module, tp_mesh: DeviceMesh) -> None:
+        """Validate the model's attention topology against its TP mesh."""
+        validate_tp_mesh(model, tp_mesh)
+
+    def _use_full_layer_activation_checkpointing(self, model: nn.Module) -> bool:
+        """Return whether this model safely opts into whole-layer checkpointing."""
+        return False
+
     def _apply(
         self,
         model: nn.Module,
@@ -316,7 +324,7 @@ class ModelParallelizer:
                 raise ValueError("enable_async_tensor_parallel=True requires sequence_parallel=True")
 
             # Validate that attention heads are divisible by TP size
-            validate_tp_mesh(model, tp_mesh)
+            self._validate_tp_mesh(model, tp_mesh)
 
             # Generate or use tensor parallel plan
             model_parallel_plan = {
@@ -388,12 +396,16 @@ class ModelParallelizer:
                         if m is not None:
                             setattr(layer, attr, checkpoint_wrapper(m, checkpoint_impl=CheckpointImpl.NO_REENTRANT))
             else:
-                if _should_use_hf_native_gradient_checkpointing(
-                    model,
-                    layer_groups,
-                    ac_scopes,
-                    enable_compile=enable_compile,
-                ) and (not _has_kv_sharing or _kv_sharing_survives_checkpoint_replay(model)):
+                use_full_layer_checkpointing = self._use_full_layer_activation_checkpointing(model) or (
+                    _should_use_hf_native_gradient_checkpointing(
+                        model,
+                        layer_groups,
+                        ac_scopes,
+                        enable_compile=enable_compile,
+                    )
+                    and (not _has_kv_sharing or _kv_sharing_survives_checkpoint_replay(model))
+                )
+                if use_full_layer_checkpointing:
                     # Work around a PyTorch FSDP2 bug that skips mixed-precision input casts during
                     # checkpoint recomputation. Remove when the minimum PyTorch version is 2.13.
                     apply_full_layer_checkpointing_to_layers(model, ac_layers)

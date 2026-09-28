@@ -2012,11 +2012,12 @@ class TestActivationCheckpointingKVSharing:
         activation_checkpointing=True,
         activation_checkpointing_scope="all",
         enable_compile=False,
+        model_parallelizer=None,
     ):
         """Invoke the strategy under test and return the model."""
         from nemo_automodel.components.distributed.parallelizer import ModelParallelizer
 
-        model_parallelizer = ModelParallelizer()
+        model_parallelizer = model_parallelizer or ModelParallelizer()
         mesh = MagicMock(spec=DeviceMesh)
         tp_mesh = MagicMock()
         tp_mesh.size.return_value = 1  # no TP
@@ -2466,6 +2467,19 @@ class TestActivationCheckpointingKVSharing:
         assert all(not isinstance(inner.mlp, self._Wrapped) for inner in inner_layers)
         assert all(not isinstance(inner.self_attn, self._Wrapped) for inner in inner_layers)
 
+    def test_model_sidecar_can_opt_into_full_layer_checkpointing(self):
+        """A protected sidecar hook owns model-specific whole-layer checkpointing."""
+        from nemo_automodel.components.distributed.parallelizer import ModelParallelizer
+
+        class FullLayerParallelizer(ModelParallelizer):
+            def _use_full_layer_activation_checkpointing(self, model):
+                return True
+
+        model = _make_model_for_ac(num_kv_shared_layers=20)
+        self._run_parallelize(model, model_parallelizer=FullLayerParallelizer())
+
+        assert all(isinstance(layer, self._Wrapped) for layer in model.model.layers)
+
     def test_hf_native_candidate_with_plain_kv_sharing_uses_submodule_checkpointing(self, monkeypatch):
         """A KV-shared model that does not opt in stays off whole-block checkpointing.
 
@@ -2710,6 +2724,21 @@ class TestSingleGpuActivationCheckpointing:
             assert not isinstance(layer, CheckpointWrapper)
             assert isinstance(layer.mlp, CheckpointWrapper)
             assert isinstance(layer.self_attn, CheckpointWrapper)
+
+    def test_model_sidecar_can_opt_into_full_layer_checkpointing_on_single_gpu(self, monkeypatch):
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
+
+        from nemo_automodel.components.distributed import ModelParallelizer
+
+        class FullLayerParallelizer(ModelParallelizer):
+            def _use_full_layer_activation_checkpointing(self, model):
+                return True
+
+        _, context = self._make_parallelizer_and_context(monkeypatch, True)
+        model = _make_model_for_ac(num_kv_shared_layers=20)
+        FullLayerParallelizer().parallelize(model, context)
+
+        assert all(isinstance(layer, CheckpointWrapper) for layer in model.model.layers)
 
 
 class TestFsdp2ShardingEnabled:

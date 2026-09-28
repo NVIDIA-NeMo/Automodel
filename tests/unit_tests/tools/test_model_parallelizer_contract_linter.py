@@ -92,14 +92,52 @@ def test_model_sidecar_rejects_distributed_module_import(tmp_path):
     ]
 
 
-@pytest.mark.parametrize("method_name", ["parallelize", "parallelize_fsdp", "parallelize_component"])
-def test_model_sidecar_must_use_inherited_parallelize_interface(tmp_path, method_name):
+@pytest.mark.parametrize("method_name", ["parallelize", "parallelize_fsdp", "apply_fsdp"])
+def test_model_sidecar_must_not_add_a_public_interface(tmp_path, method_name):
     distributed = tmp_path / "nemo_automodel/components/distributed"
     distributed.mkdir(parents=True)
     (distributed / "__init__.py").write_text('__all__ = ["ModelParallelizer"]\n')
     source = (
         "from nemo_automodel.components.distributed import ModelParallelizer\n"
         f"class Sidecar(ModelParallelizer):\n    def {method_name}(self):\n        pass\n"
+    )
+
+    errors = lint_sidecar_exports(
+        source,
+        tmp_path / "nemo_automodel/components/models/example/parallelization.py",
+        tmp_path,
+    )
+
+    assert [error.message for error in errors] == [
+        "model sidecars must use the inherited parallelize(model, mesh_context) interface"
+    ]
+
+
+def test_model_sidecar_may_implement_protected_hooks(tmp_path):
+    distributed = tmp_path / "nemo_automodel/components/distributed"
+    distributed.mkdir(parents=True)
+    (distributed / "__init__.py").write_text('__all__ = ["ModelParallelizer"]\n')
+    source = (
+        "from nemo_automodel.components.distributed import ModelParallelizer\n"
+        "class Sidecar(ModelParallelizer):\n    def _validate_tp_mesh(self, model, mesh):\n        pass\n"
+    )
+
+    errors = lint_sidecar_exports(
+        source,
+        tmp_path / "nemo_automodel/components/models/example/parallelization.py",
+        tmp_path,
+    )
+
+    assert errors == []
+
+
+def test_model_sidecar_cannot_replace_parallelize_by_assignment(tmp_path):
+    distributed = tmp_path / "nemo_automodel/components/distributed"
+    distributed.mkdir(parents=True)
+    (distributed / "__init__.py").write_text('__all__ = ["ModelParallelizer"]\n')
+    source = (
+        "from nemo_automodel.components.distributed import ModelParallelizer\n"
+        "class Sidecar(ModelParallelizer):\n    parallelize = custom_parallelize\n"
     )
 
     errors = lint_sidecar_exports(
