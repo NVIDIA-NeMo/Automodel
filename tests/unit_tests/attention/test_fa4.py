@@ -65,6 +65,11 @@ def test_varlen_segments_tile_every_row():
 
 
 @pytest.mark.skipif(not _fa4_available(), reason="requires FlashAttention 4 on an SM90 or SM100 GPU")
+@pytest.mark.runtime_budget(
+    30,
+    hard_timeout=60,
+    reason="the first case in a process JIT-compiles FA4's CuTe forward and backward kernels (~6 s on H100 CI)",
+)
 @pytest.mark.parametrize(
     ("layout", "q_global_start", "local_len"),
     [
