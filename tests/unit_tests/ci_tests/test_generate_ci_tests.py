@@ -25,6 +25,37 @@ from tests.ci_tests.utils.generate_ci_tests import generate_job, generate_pipeli
 pytestmark = pytest.mark.timeout(60)
 
 
+def test_llm_benchmark_configs_define_required_benchmark_fields():
+    required_fields = {
+        "warmup_steps",
+        "peak_tflops",
+        "nsys_start",
+        "nsys_end",
+        "nsys_ranks",
+    }
+    violations = []
+
+    for config in Path("examples/llm_benchmark").rglob("*.yaml"):
+        recipe = YAML(typ="safe").load(config) or {}
+        benchmark = recipe.get("benchmark") or {}
+        missing = sorted(required_fields - benchmark.keys())
+        if missing:
+            violations.append(f"{config}: {', '.join(missing)}")
+
+    assert not violations, "Benchmark configs are missing required fields:\n" + "\n".join(violations)
+
+
+def test_super35_vl_benchmark_waits_for_public_checkpoint():
+    config = Path("examples/llm_benchmark/nemotron/super35_vl_text_8k_ep16_fused_adam.yaml")
+    recipe = YAML(typ="safe").load(config)
+
+    assert recipe["model"]["config"]["pretrained_model_name_or_path"] == (
+        "nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16"
+    )
+    assert recipe["ci"]["known_issue_id"] == "AMINT-383"
+    assert generate_job(config, {}, "performance", "llm_benchmark", ".") == []
+
+
 def test_example_checkpoint_robustness_configs_do_not_use_removed_fields():
     removed_keys = {
         "automodel_reload_cosine_threshold",
@@ -95,6 +126,23 @@ def test_release_keeps_glm_53_cudnn_dsa_recipe_with_container_flashmla():
 
     assert "glm_5.2_tulu3_4k_cudnn_100k" not in pipeline
     assert "glm_5.3_tulu3_4k_cudnn_100step" in pipeline
+
+
+@pytest.mark.parametrize(
+    "config_path",
+    [
+        "examples/llm_finetune/ling/ling_1t_sft.yaml",
+        "examples/llm_finetune/minimax_m2/minimax_m2.5_hellaswag_pp.yaml",
+        "examples/llm_finetune/glm/glm_5.2_hellaswag_pp.yaml",
+    ],
+)
+def test_slow_hybridep_pp_recipes_use_runtime_dispatcher_initialization(config_path):
+    recipe = YAML(typ="safe").load(Path(config_path))
+
+    assert recipe["model"]["backend"]["dispatcher"] == "hybridep"
+    assert recipe["distributed"]["pp_size"] > 1
+    assert "pp_seq_len" not in recipe["distributed"]["pipeline"]
+    assert "prewarm" not in recipe
 
 
 def test_generate_gpt_oss_120b_benchmark_job_uses_ep64_without_activation_checkpointing():
@@ -187,6 +235,20 @@ ci:
 
     assert jobs[""]["variables"]["TIME"] == "00:25:00"
     assert jobs["_vllm_deploy"]["variables"]["TIME"] == "00:30:00"
+
+
+@pytest.mark.parametrize(
+    "config_path",
+    [
+        "examples/llm_finetune/nemotron_flash/nemotron_flash_1b_squad.yaml",
+        "examples/llm_finetune/nemotron_flash/nemotron_flash_1b_squad_peft.yaml",
+    ],
+)
+def test_nemotron_flash_suppresses_unsupported_vllm_deploy(config_path):
+    jobs = dict(generate_job(Path(config_path), {}, "release", "llm_finetune", "."))
+
+    assert "" in jobs
+    assert "_vllm_deploy" not in jobs
 
 
 def test_generate_checkpoint_robustness_process_isolation_derives_phases(tmp_path):
