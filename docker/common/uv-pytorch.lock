@@ -3370,7 +3370,7 @@ wheels = [
 [[package]]
 name = "magi-attention"
 version = "1.1.1"
-source = { git = "https://github.com/SandAI-org/MagiAttention.git?rev=65c6c48b84eda2b3eee4f44038b766d6680f0c8b#65c6c48b84eda2b3eee4f44038b766d6680f0c8b" }
+source = { git = "https://github.com/akoumpa/MagiAttention.git?rev=65c6c48b84eda2b3eee4f44038b766d6680f0c8b#65c6c48b84eda2b3eee4f44038b766d6680f0c8b" }
 
 [[package]]
 name = "mako"
@@ -4392,7 +4392,7 @@ linting = [
     { name = "ruff", specifier = "~=0.12.0" },
     { name = "ty", specifier = ">=0.0.20" },
 ]
-magi = [{ name = "magi-attention", git = "https://github.com/SandAI-org/MagiAttention.git?rev=65c6c48b84eda2b3eee4f44038b766d6680f0c8b" }]
+magi = [{ name = "magi-attention", git = "https://github.com/akoumpa/MagiAttention.git?rev=65c6c48b84eda2b3eee4f44038b766d6680f0c8b" }]
 test = [
     { name = "coverage" },
     { name = "onnxruntime-gpu", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'", index = "https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-13/pypi/simple/" },
