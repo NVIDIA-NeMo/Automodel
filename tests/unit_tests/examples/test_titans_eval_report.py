@@ -138,6 +138,14 @@ def test_collects_tidy_ruler_and_lm_rows_with_integrity(tmp_path: Path) -> None:
     assert all(row.code_revision is None for row in lm_rows)
 
 
+def test_resolves_registry_lm_result_layout(tmp_path: Path) -> None:
+    summary = tmp_path / "mac_chunk64" / "ttt-off" / "wikitext103.summary.json"
+    summary.parent.mkdir(parents=True)
+    summary.write_text("{}")
+
+    assert REPORT._lm_location(tmp_path, summary) == ("off", "mac_chunk64", "wikitext103")
+
+
 def test_marks_incomplete_ruler_cell_without_inventing_value(tmp_path: Path) -> None:
     root = tmp_path / "ruler"
     _write_ruler_fixture(root, "ttt_off", "s_niah_n", 2048, complete=False)

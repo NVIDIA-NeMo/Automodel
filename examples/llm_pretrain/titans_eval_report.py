@@ -391,10 +391,17 @@ def collect_ruler(roots: list[Path]) -> list[ReportRow]:
 
 def _lm_location(root: Path, summary_path: Path) -> tuple[str, str, str]:
     parts = summary_path.relative_to(root).parts
-    if len(parts) < 4 or parts[-3] != "lm" or not parts[-1].endswith(".summary.json"):
-        raise ValueError(f"{summary_path}: expected <ttt_mode>/lm/<architecture>/<benchmark>.summary.json below {root}")
+    if not parts[-1].endswith(".summary.json"):
+        raise ValueError(f"{summary_path}: expected a benchmark .summary.json below {root}")
     benchmark = parts[-1][: -len(".summary.json")]
-    return _ttt_mode(parts[-4]), parts[-2], benchmark
+    if len(parts) >= 4 and parts[-3] == "lm":
+        return _ttt_mode(parts[-4]), parts[-2], benchmark
+    if len(parts) >= 3 and _ttt_mode(parts[-2]) in {"on", "off"}:
+        return _ttt_mode(parts[-2]), parts[-3], benchmark
+    raise ValueError(
+        f"{summary_path}: expected <ttt_mode>/lm/<architecture>/<benchmark>.summary.json "
+        f"or <architecture>/ttt-<mode>/<benchmark>.summary.json below {root}"
+    )
 
 
 def _lm_integrity(
