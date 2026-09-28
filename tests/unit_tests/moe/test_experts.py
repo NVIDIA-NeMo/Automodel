@@ -873,6 +873,18 @@ class TestGroupedExpertsDeepEP:
             assert experts.ep_rank == 0
             mock_init_buffer.assert_called_once_with(mock_mesh.get_group.return_value)
 
+    def test_grouped_experts_provides_dispatcher_pipeline_runtime_initializers(self, moe_config):
+        experts = GroupedExpertsDeepEP(moe_config)
+        initializer = object()
+        experts.token_dispatcher = Mock()
+        experts.token_dispatcher.get_pipeline_runtime_initializers.return_value = (initializer,)
+
+        assert experts.get_pipeline_runtime_initializers() == (initializer,)
+        experts.token_dispatcher.get_pipeline_runtime_initializers.assert_called_once_with(
+            hidden_dim=moe_config.expert_dim,
+            dtype=moe_config.dtype,
+        )
+
     def test_grouped_experts_deepep_apply_bias_no_bias(self, moe_config):
         """Test _apply_bias method with no bias."""
         _ = GroupedExpertsDeepEP(moe_config)
