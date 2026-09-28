@@ -179,6 +179,7 @@ trap 'rm -f "$JOB_BODY"' EXIT
   printf 'export TITANS_PILOT_STEPS=%q\n' "${TITANS_PILOT_STEPS:-10}"
   printf 'export TITANS_TOTAL_STEPS=%q\n' "${TITANS_TOTAL_STEPS:-}"
   printf 'export TITANS_LEARNING_RATE=%q\n' "${TITANS_LEARNING_RATE:-}"
+  printf 'export TITANS_GLOBAL_BATCH_SIZE=%q\n' "${TITANS_GLOBAL_BATCH_SIZE:-}"
   printf 'export TITANS_MAX_STEPS_PER_RUN=%q\n' "${TITANS_MAX_STEPS_PER_RUN:-}"
   printf 'export TITANS_LOCAL_BATCH_SIZE=%q\n' "${TITANS_LOCAL_BATCH_SIZE:-}"
   printf 'export TITANS_ACTIVATION_CHECKPOINTING=%q\n' "${TITANS_ACTIVATION_CHECKPOINTING:-false}"
