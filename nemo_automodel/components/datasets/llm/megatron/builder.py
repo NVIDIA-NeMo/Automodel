@@ -177,8 +177,8 @@ class BlendedDataset(torch.utils.data.Dataset):
                 with open(path_to_description, "wt") as writer:
                     writer.write(self.unique_description)
                 # Save the indexes
-                numpy.save(path_to_dataset_index, dataset_index, allow_pickle=True)
-                numpy.save(path_to_dataset_sample_index, dataset_sample_index, allow_pickle=True)
+                numpy.save(path_to_dataset_index, dataset_index, allow_pickle=False)
+                numpy.save(path_to_dataset_sample_index, dataset_sample_index, allow_pickle=False)
             else:
                 logger.warning(f"Cannot save the {type(self).__name__} indexes because path_to_cache is None")
 
@@ -191,13 +191,13 @@ class BlendedDataset(torch.utils.data.Dataset):
 
         logger.info(f"\tLoad the dataset index from {path_to_dataset_index}")
         t_beg = time.time()
-        dataset_index = numpy.load(path_to_dataset_index, allow_pickle=True, mmap_mode="r")
+        dataset_index = numpy.load(path_to_dataset_index, allow_pickle=False, mmap_mode="r")
         t_end = time.time()
         logger.debug(f"\t> time elapsed: {t_end - t_beg:4f} seconds")
 
         logger.info(f"\tLoad the dataset sample index from {path_to_dataset_sample_index}")
         t_beg = time.time()
-        dataset_sample_index = numpy.load(path_to_dataset_sample_index, allow_pickle=True, mmap_mode="r")
+        dataset_sample_index = numpy.load(path_to_dataset_sample_index, allow_pickle=False, mmap_mode="r")
         t_end = time.time()
         logger.debug(f"\t> time elapsed: {t_end - t_beg:4f} seconds")
 
