@@ -337,6 +337,8 @@ NVTE_BUILD_USE_NVIDIA_WHEELS = "1"
 NVTE_WITH_NCCL_EP = "0"
 
 [tool.uv.sources]
+mamba-ssm = { git = "https://github.com/akoumpa/cute-mamba.git", rev = "a8b8882fa03668613f7b06831950d504a03b647a" }
+causal-conv1d = { git = "https://github.com/akoumpa/cute-causal-conv1d.git", rev = "1cf8fa0326222c6f07693899ff8f0457c513171d" }
 megatron-fsdp = { git = "https://github.com/yuhezhang-ai/Megatron-LM.git", rev = "455389c480af6b3acdca74c7830c68b3274eb083", subdirectory = "megatron/core/distributed/fsdp/src" }
 deep_ep = { git = "https://github.com/deepseek-ai/DeepEP.git", rev = "10d4dd7377d5bce900fbb4b80cce863764892b95" }
 cut-cross-entropy = { git = "https://github.com/apple/ml-cross-entropy.git", rev = "87a86aba72cfd2f0d8abecaf81c13c4528ea07d8" }
@@ -404,6 +406,23 @@ requires-dist = ["torch", "packaging", "ninja"]
 name = "magi_attention"
 version = "1.1.1"
 requires-dist = []
+
+[[tool.uv.dependency-metadata]]
+name = "mamba-ssm"
+version = "2.3.0"
+requires-python = ">=3.9"
+requires-dist = [
+    "torch", "triton", "ninja", "einops", "transformers", "packaging", "setuptools>=61.0.0",
+    'causal-conv1d>=1.2.0; extra == "causal-conv1d"',
+    'pytest; extra == "dev"',
+]
+provides-extra = ["causal-conv1d", "dev"]
+
+[[tool.uv.dependency-metadata]]
+name = "causal-conv1d"
+version = "1.6.0"
+requires-python = ">=3.9"
+requires-dist = ["torch", "packaging", "ninja"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

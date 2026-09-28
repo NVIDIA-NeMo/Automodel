@@ -90,6 +90,12 @@ overrides = [
 ]
 
 [[manifest.dependency-metadata]]
+name = "causal-conv1d"
+version = "1.6.0"
+requires-dist = ["torch", "packaging", "ninja"]
+requires-python = ">=3.9"
+
+[[manifest.dependency-metadata]]
 name = "deep-ep"
 version = "1.2.1+10d4dd7"
 requires-dist = ["torch", "packaging", "ninja"]
@@ -97,6 +103,13 @@ requires-dist = ["torch", "packaging", "ninja"]
 [[manifest.dependency-metadata]]
 name = "magi-attention"
 version = "1.1.1"
+
+[[manifest.dependency-metadata]]
+name = "mamba-ssm"
+version = "2.3.0"
+requires-dist = ["torch", "triton", "ninja", "einops", "transformers", "packaging", "setuptools>=61.0.0", "causal-conv1d>=1.2.0 ; extra == 'causal-conv1d'", "pytest ; extra == 'dev'"]
+requires-python = ">=3.9"
+provides-extras = ["causal-conv1d", "dev"]
 
 [[package]]
 name = "absl-py"
@@ -859,7 +872,7 @@ wheels = [
 [[package]]
 name = "causal-conv1d"
 version = "1.6.0"
-source = { registry = "https://pypi.org/simple" }
+source = { git = "https://github.com/akoumpa/cute-causal-conv1d.git?rev=1cf8fa0326222c6f07693899ff8f0457c513171d#1cf8fa0326222c6f07693899ff8f0457c513171d" }
 dependencies = [
     { name = "ninja" },
     { name = "packaging" },
@@ -867,7 +880,6 @@ dependencies = [
     { name = "torch", version = "2.10.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform != 'darwin' and sys_platform != 'linux'" },
     { name = "torch", version = "2.10.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform == 'linux'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/db/df/63a384c49743b9fc8fec4c05dbd0b515e1c1c2b07e4559acc4fc37c69223/causal_conv1d-1.6.0.tar.gz", hash = "sha256:4eae3220d08e1e88238f3a0a88783147cbdf47f612cc610add75127c7a37ca3e", size = 29356, upload-time = "2026-01-12T17:33:32.794Z" }
 
 [[package]]
 name = "certifi"
@@ -3368,7 +3380,7 @@ wheels = [
 [[package]]
 name = "mamba-ssm"
 version = "2.3.0"
-source = { registry = "https://pypi.org/simple" }
+source = { git = "https://github.com/akoumpa/cute-mamba.git?rev=a8b8882fa03668613f7b06831950d504a03b647a#a8b8882fa03668613f7b06831950d504a03b647a" }
 dependencies = [
     { name = "einops" },
     { name = "ninja" },
@@ -3381,7 +3393,6 @@ dependencies = [
     { name = "triton", version = "3.4.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux'" },
     { name = "triton", version = "3.6.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'linux'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/54/69/a87f06d9dba78c041adb81f2228e978aab179477c64f1a210c0fe0d63e8d/mamba_ssm-2.3.0.tar.gz", hash = "sha256:8294e12125f76021e4e190f4137e84a84935920eeda5d0037a6917524456b303", size = 121116, upload-time = "2026-01-12T17:07:22.152Z" }
 
 [[package]]
 name = "markdown-it-py"
@@ -4281,7 +4292,7 @@ requires-dist = [
     { name = "backoff", marker = "extra == 'vlm'" },
     { name = "bitsandbytes", marker = "extra == 'cuda-source'" },
     { name = "boto3", marker = "extra == 's3'", specifier = ">=1.34" },
-    { name = "causal-conv1d", marker = "extra == 'cuda'" },
+    { name = "causal-conv1d", marker = "extra == 'cuda'", git = "https://github.com/akoumpa/cute-causal-conv1d.git?rev=1cf8fa0326222c6f07693899ff8f0457c513171d" },
     { name = "databricks-sql-connector", marker = "extra == 'delta-databricks'", specifier = ">=4.4.0" },
     { name = "datasets", specifier = ">=4.0.0" },
     { name = "decord", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin' and extra == 'vlm-media'" },
@@ -4297,7 +4308,7 @@ requires-dist = [
     { name = "imageio", marker = "extra == 'diffusion'" },
     { name = "imageio-ffmpeg", marker = "extra == 'diffusion-media'" },
     { name = "kernels", marker = "extra == 'diffusion-kernels'" },
-    { name = "mamba-ssm", marker = "extra == 'cuda'" },
+    { name = "mamba-ssm", marker = "extra == 'cuda'", git = "https://github.com/akoumpa/cute-mamba.git?rev=a8b8882fa03668613f7b06831950d504a03b647a" },
     { name = "megatron-fsdp", git = "https://github.com/yuhezhang-ai/Megatron-LM.git?subdirectory=megatron%2Fcore%2Fdistributed%2Ffsdp%2Fsrc&rev=455389c480af6b3acdca74c7830c68b3274eb083" },
     { name = "mistral-common", marker = "extra == 'vlm'", specifier = ">=1.11.0" },
     { name = "mistral-common", extras = ["audio", "hf-hub", "sentencepiece"] },
