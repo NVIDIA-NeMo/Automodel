@@ -106,7 +106,7 @@ def _map_vision_proj_key_to_hf(bare_fqn: str) -> str:
         if bare_fqn == custom_prefix:
             return hf_prefix
         if bare_fqn.startswith(f"{custom_prefix}."):
-            return f"{hf_prefix}.{bare_fqn[len(custom_prefix) + 1:]}"
+            return f"{hf_prefix}.{bare_fqn[len(custom_prefix) + 1 :]}"
     return bare_fqn
 
 
@@ -116,7 +116,7 @@ def _map_vision_proj_key_to_custom(bare_key: str) -> str:
         if bare_key == hf_prefix:
             return custom_prefix
         if bare_key.startswith(f"{hf_prefix}."):
-            return f"{custom_prefix}.{bare_key[len(hf_prefix) + 1:]}"
+            return f"{custom_prefix}.{bare_key[len(hf_prefix) + 1 :]}"
     return bare_key
 
 
