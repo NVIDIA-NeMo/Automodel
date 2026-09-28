@@ -192,6 +192,7 @@ class TitansModel(TitansPreTrainedModel):
 
         h = inputs_embeds if inputs_embeds is not None else self.embed_tokens(input_ids)
         input_length = h.shape[1]
+        local_padding = 0
         if (
             streaming
             and self.config.architecture_variant == "mac"
@@ -205,6 +206,10 @@ class TitansModel(TitansPreTrainedModel):
         persistent_length = self.config.num_persistent_memory_tokens if self.config.architecture_variant != "mac" else 0
         if self.config.architecture_variant == "mac":
             h, mac_padding = self._insert_longterm_memory(h)
+        elif self.config.architecture_variant == "local_attention":
+            local_padding = (-input_length) % self.config.attention_segment_size
+            if local_padding:
+                h = nn.functional.pad(h, (0, 0, 0, local_padding))
         elif persistent_length and inference_state is None:
             persistent = self.persistent_memory.unsqueeze(0).expand(h.shape[0], -1, -1)
             h = torch.cat((persistent, h), dim=1)
@@ -237,6 +242,8 @@ class TitansModel(TitansPreTrainedModel):
         h = self.norm(h)
         if self.config.architecture_variant == "mac":
             h = self._remove_longterm_memory(h, mac_padding)
+        elif local_padding:
+            h = h[:, :input_length]
         elif persistent_length and inference_state is None:
             h = h[:, persistent_length:]
         if return_inference_state:

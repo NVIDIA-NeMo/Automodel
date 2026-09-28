@@ -225,6 +225,24 @@ def test_local_attention_control_is_segment_isolated_but_full_attention_is_not()
     assert (full_original[:, 4:] - full_changed[:, 4:]).abs().max().item() > 0
 
 
+def test_local_attention_control_accepts_partial_segments_during_generation():
+    config = _tiny_config(
+        architecture_variant="local_attention",
+        attention_segment_size=4,
+        num_longterm_memory_tokens=0,
+        num_persistent_memory_tokens=0,
+    )
+    model = TitansForCausalLM(config).eval()
+    prompt = torch.randint(0, config.vocab_size, (1, 3))
+
+    with torch.no_grad():
+        logits = model(prompt).logits
+        generated = model.generate_full_prefix(prompt, max_new_tokens=2, eos_token_id=-1)
+
+    assert logits.shape == (1, 3, config.vocab_size)
+    assert generated.shape == (1, 5)
+
+
 def test_sparse_mac_places_memory_only_at_declared_layers():
     config = _tiny_config(
         architecture_variant="mac",
