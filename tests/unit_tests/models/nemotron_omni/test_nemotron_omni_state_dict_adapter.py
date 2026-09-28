@@ -445,6 +445,9 @@ def test_map_peft_target_module_to_hf(adapter):
         == "language_model.backbone.layers.0.self_attn.q_proj"
     )
     assert adapter.map_peft_target_module_to_hf("sound_encoder.layers.0.conv") == "sound_encoder.encoder.layers.0.conv"
+    assert adapter.map_peft_target_module_to_hf("vision_projector.linear1") == "mlp1.1"
+    assert adapter.map_peft_target_module_to_hf("vision_projector.linear2") == "mlp1.3"
+    assert adapter.map_peft_target_module_to_hf("vision_projector.norm") == "mlp1.0"
     assert adapter.map_peft_target_module_to_hf("vision_projector.norm.weight") == "mlp1.0.weight"
     assert adapter.map_peft_target_module_to_hf("other.module") == "other.module"
 
@@ -491,7 +494,8 @@ def test_peft_end_to_end_with_real_v3_adapter():
         f"{base_expert}.lora_gate_and_up_A": torch.randn(2, 32, 4),
         f"{base_expert}.lora_gate_and_up_B": torch.randn(2, 4, 16),
         "base_model.model.sound_encoder.layers.0.weight": torch.randn(4, 32),
-        "base_model.model.vision_projector.norm.weight": torch.randn(8),
+        "base_model.model.vision_projector.linear1.lora_A.weight": torch.randn(4, 16),
+        "base_model.model.vision_projector.linear1.lora_B.weight": torch.randn(8, 4),
     }
 
     hf_sd = real_adapter.to_hf(dict(peft_sd))
@@ -503,10 +507,342 @@ def test_peft_end_to_end_with_real_v3_adapter():
     assert "base_model.model.language_model.backbone.layers.0.mixer.experts.1.up_proj.lora_A.weight" in hf_sd
     assert "base_model.model.language_model.backbone.layers.0.mixer.experts.1.up_proj.lora_B.weight" in hf_sd
     assert "base_model.model.sound_encoder.encoder.layers.0.weight" in hf_sd
-    assert "base_model.model.mlp1.0.weight" in hf_sd
+    assert "base_model.model.mlp1.1.lora_A.weight" in hf_sd
+    assert "base_model.model.mlp1.1.lora_B.weight" in hf_sd
 
     # Round trip back through from_hf
     recovered_sd = real_adapter.from_hf(dict(hf_sd))
     assert set(recovered_sd.keys()) == set(peft_sd.keys())
     for k in peft_sd:
         torch.testing.assert_close(recovered_sd[k], peft_sd[k])
+
+
+def test_default_v4_compatible_false_export_selection():
+    """When v4_compatible=False is passed (production default), LLM export targets remote-code backbone layout."""
+    from types import SimpleNamespace
+
+    from nemo_automodel.components.models.common import BackendConfig
+    from nemo_automodel.components.moe.config import MoEConfig
+
+    moe = MoEConfig(
+        dim=32,
+        inter_dim=64,
+        moe_inter_dim=16,
+        n_routed_experts=2,
+        n_shared_experts=0,
+        n_activated_experts=1,
+        n_expert_groups=1,
+        n_limited_groups=1,
+        train_gate=True,
+        gate_bias_update_factor=0.0,
+        score_func="softmax",
+        route_scale=1.0,
+        aux_loss_coeff=0.0,
+        norm_topk_prob=False,
+        expert_bias=False,
+        router_bias=False,
+        expert_activation="relu2",
+        softmax_before_topk=True,
+    )
+    real_adapter = NemotronOmniStateDictAdapter(
+        config=SimpleNamespace(),
+        llm_config=SimpleNamespace(),
+        moe_config=moe,
+        backend=BackendConfig(linear="torch", rms_norm="torch", attn="sdpa"),
+    )
+
+    # 1. to_hf with explicit v4_compatible=False
+    sd = {"base_model.model.language_model.model.layers.0.mixer.in_proj.lora_A.weight": torch.randn(4, 32)}
+    hf_sd = real_adapter.to_hf(dict(sd), v4_compatible=False)
+    assert "base_model.model.language_model.backbone.layers.0.mixer.in_proj.lora_A.weight" in hf_sd
+
+    # 2. convert_single_tensor_to_hf with explicit v4_compatible=False
+    converted = real_adapter.convert_single_tensor_to_hf(
+        "base_model.model.language_model.model.layers.0.mixer.in_proj.lora_A.weight",
+        sd["base_model.model.language_model.model.layers.0.mixer.in_proj.lora_A.weight"],
+        v4_compatible=False,
+    )
+    assert converted[0][0] == "base_model.model.language_model.backbone.layers.0.mixer.in_proj.lora_A.weight"
+
+    # 3. map_peft_target_module_to_hf with explicit v4_compatible=False
+    target = real_adapter.map_peft_target_module_to_hf(
+        "language_model.model.layers.0.mixer.in_proj", v4_compatible=False
+    )
+    assert target == "language_model.backbone.layers.0.mixer.in_proj"
+
+
+def test_native_radio_vision_lora_partial_qkv():
+    """Native RADIO vision LoRA with partial QKV selection must not crash in _radio_native_to_legacy."""
+    from types import SimpleNamespace
+
+    from nemo_automodel.components.models.common import BackendConfig
+    from nemo_automodel.components.moe.config import MoEConfig
+
+    moe = MoEConfig(
+        dim=32,
+        inter_dim=64,
+        moe_inter_dim=16,
+        n_routed_experts=2,
+        n_shared_experts=0,
+        n_activated_experts=1,
+        n_expert_groups=1,
+        n_limited_groups=1,
+        train_gate=True,
+        gate_bias_update_factor=0.0,
+        score_func="softmax",
+        route_scale=1.0,
+        aux_loss_coeff=0.0,
+        norm_topk_prob=False,
+        expert_bias=False,
+        router_bias=False,
+        expert_activation="relu2",
+        softmax_before_topk=True,
+    )
+    adapter = NemotronOmniStateDictAdapter(
+        config=SimpleNamespace(),
+        llm_config=SimpleNamespace(),
+        moe_config=moe,
+        backend=BackendConfig(linear="torch", rms_norm="torch", attn="sdpa"),
+        vision_uses_native_radio=True,
+    )
+
+    # Only query projection has LoRA
+    query_key = "base_model.model.vision_model.encoder.layer.0.attention.attention.query.lora_A.weight"
+    peft_sd = {query_key: torch.randn(2, 8)}
+    hf_sd = adapter.to_hf(dict(peft_sd))
+
+    assert query_key in hf_sd
+    assert torch.equal(hf_sd[query_key], peft_sd[query_key])
+
+    # Round trip back through from_hf
+    recovered = adapter.from_hf(dict(hf_sd))
+    assert query_key in recovered
+    assert torch.equal(recovered[query_key], peft_sd[query_key])
+
+
+def test_native_radio_vision_lora_complete_qkv():
+    """Native RADIO vision LoRA with complete QKV selection must retain native factors and naming."""
+    from types import SimpleNamespace
+
+    from nemo_automodel.components.models.common import BackendConfig
+    from nemo_automodel.components.moe.config import MoEConfig
+
+    moe = MoEConfig(
+        dim=32,
+        inter_dim=64,
+        moe_inter_dim=16,
+        n_routed_experts=2,
+        n_shared_experts=0,
+        n_activated_experts=1,
+        n_expert_groups=1,
+        n_limited_groups=1,
+        train_gate=True,
+        gate_bias_update_factor=0.0,
+        score_func="softmax",
+        route_scale=1.0,
+        aux_loss_coeff=0.0,
+        norm_topk_prob=False,
+        expert_bias=False,
+        router_bias=False,
+        expert_activation="relu2",
+        softmax_before_topk=True,
+    )
+    adapter = NemotronOmniStateDictAdapter(
+        config=SimpleNamespace(),
+        llm_config=SimpleNamespace(),
+        moe_config=moe,
+        backend=BackendConfig(linear="torch", rms_norm="torch", attn="sdpa"),
+        vision_uses_native_radio=True,
+    )
+
+    base_attn = "base_model.model.vision_model.encoder.layer.0.attention.attention"
+    peft_sd = {
+        f"{base_attn}.query.lora_A.weight": torch.randn(2, 8),
+        f"{base_attn}.query.lora_B.weight": torch.randn(8, 2),
+        f"{base_attn}.key.lora_A.weight": torch.randn(2, 8),
+        f"{base_attn}.key.lora_B.weight": torch.randn(8, 2),
+        f"{base_attn}.value.lora_A.weight": torch.randn(2, 8),
+        f"{base_attn}.value.lora_B.weight": torch.randn(8, 2),
+    }
+    hf_sd = adapter.to_hf(dict(peft_sd))
+
+    # Must retain native keys (not fused into invalid attn.qkv)
+    assert set(hf_sd.keys()) == set(peft_sd.keys())
+    for k in peft_sd:
+        assert torch.equal(hf_sd[k], peft_sd[k])
+
+
+def test_production_save_and_hf_peft_reload(tmp_path, monkeypatch):
+    """Production Checkpointer.save_model with recipe defaults and PeftModel.from_pretrained reload."""
+    from types import SimpleNamespace
+
+    import peft.import_utils
+    from peft import PeftModel, get_peft_model_state_dict
+    from safetensors.torch import load_file
+    from torch import nn
+    monkeypatch.setattr(peft.import_utils, "is_torchao_available", lambda: False, raising=False)
+    import peft.tuners.lora.torchao
+    monkeypatch.setattr(peft.tuners.lora.torchao, "is_torchao_available", lambda: False, raising=False)
+
+    from nemo_automodel.components._peft.lora import PeftConfig
+    from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
+    from nemo_automodel.components.checkpoint.config import CheckpointingConfig
+    from nemo_automodel.components.models.common import BackendConfig
+    from nemo_automodel.components.moe.config import MoEConfig
+    from nemo_automodel.components.moe.state_dict_mixin import MoESplitExpertsStateDictMixin
+
+    moe = MoEConfig(
+        dim=16,
+        inter_dim=32,
+        moe_inter_dim=8,
+        n_routed_experts=2,
+        n_shared_experts=0,
+        n_activated_experts=1,
+        n_expert_groups=1,
+        n_limited_groups=1,
+        train_gate=True,
+        gate_bias_update_factor=0.0,
+        score_func="softmax",
+        route_scale=1.0,
+        aux_loss_coeff=0.0,
+        norm_topk_prob=False,
+        expert_bias=False,
+        router_bias=False,
+        expert_activation="relu2",
+        softmax_before_topk=True,
+    )
+    adapter = NemotronOmniStateDictAdapter(
+        config=SimpleNamespace(),
+        llm_config=SimpleNamespace(),
+        moe_config=moe,
+        backend=BackendConfig(linear="torch", rms_norm="torch", attn="sdpa"),
+        vision_uses_native_radio=True,
+    )
+    assert isinstance(adapter, MoESplitExpertsStateDictMixin)
+
+    # 1. Construct tiny Automodel source module
+    class SourceModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            # LLM
+            self.language_model = nn.Module()
+            self.language_model.model = nn.Module()
+            layer = nn.Module()
+            layer.mixer = nn.Module()
+            layer.mixer.in_proj = nn.Module()
+            layer.mixer.in_proj.lora_A = nn.Linear(16, 2, bias=False)
+            layer.mixer.in_proj.lora_B = nn.Linear(2, 16, bias=False)
+            layer.mixer.experts = nn.Module()
+            # Expert parameters
+            layer.mixer.experts.gate_and_up_projs = nn.Parameter(torch.randn(2, 16, 16), requires_grad=False)
+            layer.mixer.experts.lora_gate_and_up_A = nn.Parameter(torch.randn(2, 16, 2), requires_grad=True)
+            layer.mixer.experts.lora_gate_and_up_B = nn.Parameter(torch.randn(2, 2, 8), requires_grad=True)
+            layer.mixer.experts.down_projs = nn.Parameter(torch.randn(2, 8, 16), requires_grad=False)
+            layer.mixer.experts.lora_down_A = nn.Parameter(torch.randn(2, 8, 2), requires_grad=True)
+            layer.mixer.experts.lora_down_B = nn.Parameter(torch.randn(2, 2, 16), requires_grad=True)
+            self.language_model.model.layers = nn.ModuleList([layer])
+
+            # Vision projector
+            self.vision_projector = nn.Module()
+            self.vision_projector.linear1 = nn.Module()
+            self.vision_projector.linear1.lora_A = nn.Linear(8, 2, bias=False)
+            self.vision_projector.linear1.lora_B = nn.Linear(2, 16, bias=False)
+
+            # Native RADIO vision
+            self.vision_model = nn.Module()
+            self.vision_model.encoder = nn.Module()
+            vlayer = nn.Module()
+            vlayer.attention = nn.Module()
+            vlayer.attention.attention = nn.Module()
+            vlayer.attention.attention.query = nn.Module()
+            vlayer.attention.attention.query.lora_A = nn.Linear(8, 2, bias=False)
+            vlayer.attention.attention.query.lora_B = nn.Linear(2, 8, bias=False)
+            self.vision_model.encoder.layer = nn.ModuleList([vlayer])
+
+    source_model = SourceModel()
+    source_model.state_dict_adapter = adapter
+
+    # 2. Save through production Checkpointer (v4_compatible=False by default)
+    checkpointer = Checkpointer(
+        CheckpointingConfig(
+            enabled=True,
+            checkpoint_dir=str(tmp_path / "checkpoints"),
+            model_cache_dir=str(tmp_path),
+            model_repo_id="source",
+            model_save_format="safetensors",
+            save_consolidated=False,
+            is_peft=True,
+        ),
+        dp_rank=0,
+        tp_rank=0,
+        pp_rank=0,
+    )
+    peft_config = PeftConfig(dim=2, alpha=4, use_triton=False)
+    checkpointer.save_model(source_model, str(tmp_path / "peft"), peft_config=peft_config)
+    adapter_dir = tmp_path / "peft" / "model"
+
+    exported = load_file(str(adapter_dir / "adapter_model.safetensors"))
+    assert exported, "Exported adapter wrote no tensors"
+
+    # Verify exported keys match remote-code receiver naming
+    assert "base_model.model.language_model.backbone.layers.0.mixer.in_proj.lora_A.weight" in exported
+    assert "base_model.model.language_model.backbone.layers.0.mixer.experts.0.up_proj.lora_A.weight" in exported
+    assert "base_model.model.language_model.backbone.layers.0.mixer.experts.0.down_proj.lora_A.weight" in exported
+    assert "base_model.model.mlp1.1.lora_A.weight" in exported
+    assert "base_model.model.vision_model.encoder.layer.0.attention.attention.query.lora_A.weight" in exported
+
+    # 3. Construct tiny remote-code receiver module for PeftModel
+    class HFReceiverModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.language_model = nn.Module()
+            self.language_model.backbone = nn.Module()
+            layer = nn.Module()
+            layer.mixer = nn.Module()
+            layer.mixer.in_proj = nn.Linear(16, 16)
+            layer.mixer.experts = nn.ModuleList([
+                nn.Module(),
+                nn.Module(),
+            ])
+            layer.mixer.experts[0].gate_proj = nn.Linear(16, 8)
+            layer.mixer.experts[0].up_proj = nn.Linear(16, 8)
+            layer.mixer.experts[0].down_proj = nn.Linear(8, 16)
+            layer.mixer.experts[1].gate_proj = nn.Linear(16, 8)
+            layer.mixer.experts[1].up_proj = nn.Linear(16, 8)
+            layer.mixer.experts[1].down_proj = nn.Linear(8, 16)
+            self.language_model.backbone.layers = nn.ModuleList([layer])
+
+            # Vision projector in HF is mlp1 (Sequential: 0=norm, 1=linear1, 2=act, 3=linear2)
+            self.mlp1 = nn.Sequential(
+                nn.Identity(),
+                nn.Linear(8, 16),
+                nn.Identity(),
+                nn.Linear(16, 8),
+            )
+
+            # Native RADIO vision
+            self.vision_model = nn.Module()
+            self.vision_model.encoder = nn.Module()
+            vlayer = nn.Module()
+            vlayer.attention = nn.Module()
+            vlayer.attention.attention = nn.Module()
+            vlayer.attention.attention.query = nn.Linear(8, 8)
+            vlayer.attention.attention.key = nn.Linear(8, 8)
+            vlayer.attention.attention.value = nn.Linear(8, 8)
+            self.vision_model.encoder.layer = nn.ModuleList([vlayer])
+
+        def prepare_inputs_for_generation(self, *args, **kwargs):
+            return {}
+
+    receiver_model = HFReceiverModel()
+
+    # 4. Load with real PeftModel.from_pretrained
+    loaded = PeftModel.from_pretrained(receiver_model, str(adapter_dir), autocast_adapter_dtype=False).eval()
+    loaded_state = get_peft_model_state_dict(loaded, save_embedding_layers=False)
+
+    assert set(loaded_state) == set(exported), (
+        f"PEFT loaded tensor set mismatch: "
+        f"missing={sorted(set(exported) - set(loaded_state))} extra={sorted(set(loaded_state) - set(exported))}"
+    )
+    for name, value in exported.items():
+        torch.testing.assert_close(loaded_state[name], value, rtol=0, atol=0)
