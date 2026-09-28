@@ -30,7 +30,7 @@ RESULT_ROOT=${RESULT_ROOT:-"$TITANS_WORK_ROOT/results/eval/lm"}
 MODEL_REGISTRY=${TITANS_MODEL_REGISTRY:-"$AUTOMODEL_CHECKOUT/examples/llm_pretrain/titans_eval_registry.json"}
 MODEL_NAME=${TITANS_MODEL:-}
 
-if [[ -z ${CHECKPOINT:-} && -n $MODEL_NAME ]]; then
+if [[ ${TITANS_EVAL_IN_CONTAINER:-0} == 1 && -z ${CHECKPOINT:-} && -n $MODEL_NAME ]]; then
   while IFS=$'\t' read -r name checkpoint enable_ttt; do
     if [[ $enable_ttt == "${ENABLE_TTT_UPDATES:-1}" ]]; then
       CHECKPOINT=$checkpoint
