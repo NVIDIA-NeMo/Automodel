@@ -1063,6 +1063,7 @@ def test_blackwell_submitter_resolves_portable_topology():
     assert '--nodes "$SUBMIT_NODES"' in submitter
     assert "TITANS_TRAIN_NODES=%q" in submitter
     assert '--gpus "$GPUS_PER_NODE"' in submitter
+    assert "oci-jhb-slurm-1" in submitter
     assert "aws-pdx-slurm-1" in submitter
     assert "nsc-svg-slurm-1" in submitter
     assert "aws-cmh-slurm-1" in submitter
