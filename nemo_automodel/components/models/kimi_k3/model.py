@@ -53,6 +53,7 @@ from nemo_automodel.components.models.kimi_k3.cp import (
     document_causal_flex_attention,
     shard_batch_for_kimi_cp,
 )
+from nemo_automodel.components.models.kimi_k3.kda_fused import fused_chunk_kda, fused_kda_unsupported_reason
 from nemo_automodel.components.models.kimi_k3.situ import (
     _apply_attn_res,
     _compile_norm_core,
@@ -969,20 +970,40 @@ class KimiDeltaAttention(nn.Module):
                 # redundant work: keep them from that forward instead (transient memory, freed at the
                 # end of the layer backward).
                 kernel_options["disable_recompute"] = True
-        o, _ = kernel(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            initial_state=None,
-            # The final recurrent state is never consumed in training (and under CP it is owned by
-            # FLA's rank-to-rank handoff), so do not have the kernel materialise it.
-            output_final_state=False,
-            cu_seqlens=cu_seqlens,
-            **kernel_options,
-            **kernel_kwargs,
-        )
+        if getattr(self.config, "kda_chunk_impl", "fla") == "fused":
+            # Opt-in fused kernels: a CUDA forward and a Triton backward that recomputes from the raw inputs
+            # (nothing but q/k/v/g/beta/cu_seqlens is saved). Same math as FLA's chunk_kda at the K3 call; the kernels
+            # are specialised to that call, so an unsupported call raises instead of silently running FLA.
+            reason = fused_kda_unsupported_reason(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                cu_seqlens,
+                mode=mode,
+                cp_context=cp_context,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                safe_gate=self.gate_lower_bound is not None,
+            )
+            if reason is not None:
+                raise ValueError(f"kda_chunk_impl='fused' cannot run this KDA call: {reason}")
+            o, _ = fused_chunk_kda(q, k, v, g, beta, cu_seqlens)
+        else:
+            o, _ = kernel(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                initial_state=None,
+                # The final recurrent state is never consumed in training (and under CP it is owned by
+                # FLA's rank-to-rank handoff), so do not have the kernel materialise it.
+                output_final_state=False,
+                cu_seqlens=cu_seqlens,
+                **kernel_options,
+                **kernel_kwargs,
+            )
 
         if self.use_full_rank_gate:
             gate = self.g_proj(hidden_states)
@@ -1102,8 +1123,9 @@ class KimiK3MoE(MoE):
             self.gate = KimiK3Gate(moe_config, gate_precision=torch.float32)
         if backend.compile_situ:
             _compile_situ_cores()
-        if getattr(config, "situ_triton", False):
-            _enable_situ_triton()
+        situ_backend = getattr(config, "situ_backend", "torch")
+        if situ_backend != "torch":
+            _enable_situ_triton(fast_math=situ_backend == "triton_fast_math")
         if backend.compile_norm:
             _compile_norm_core()
         expert_activation = partial(

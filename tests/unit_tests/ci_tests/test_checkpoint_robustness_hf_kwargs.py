@@ -55,6 +55,7 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm
     _patch_remote_fla_api_compatibility,
     _patch_remote_masking_api_compatibility,
     _peft_adapter_load_kwargs,
+    _peft_input_embeddings_context,
     _post_load_dequant_max_memory,
     _prepare_consolidated_hf_cache_once,
     _raise_distributed_failure,
@@ -572,6 +573,134 @@ def test_peft_no_split_modules_are_normalized_for_accelerate():
     _normalize_peft_no_split_modules(model)
 
     assert model._no_split_modules == ["FirstLayer", "SecondLayer"]
+
+
+@pytest.mark.parametrize("wrapped_accessor", [False, True])
+def test_peft_reload_with_input_dependent_embeddings(tmp_path, wrapped_accessor):
+    from peft import LoraConfig, PeftModel, get_peft_model
+
+    class InputDependentModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed_tokens = torch.nn.Embedding(8, 4)
+
+        def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+            """Embed token IDs.
+
+            Args:
+                input_ids: Tensor of shape [batch, sequence].
+
+            Returns:
+                Tensor of shape [batch, sequence, hidden].
+            """
+            return self.embed_tokens(input_ids)
+
+    class LegacyModel(PreTrainedModel):
+        config_class = PretrainedConfig
+        _tied_weights_keys = ["lm_head.weight"]
+
+        def __init__(self):
+            # None matches the published remote config: tying is unspecified.
+            super().__init__(PretrainedConfig(tie_word_embeddings=None))
+            self.model = InputDependentModel()
+            self.proj = torch.nn.Linear(4, 4, bias=False)
+            self.lm_head = torch.nn.Linear(4, 8, bias=False)
+            if not wrapped_accessor:
+                self.get_input_embeddings = self.model.get_input_embeddings
+            self.post_init()
+
+        def get_input_embeddings(self) -> torch.nn.Module:
+            return self.model.get_input_embeddings()
+
+        def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+            """Run the unchanged input-dependent embedding path.
+
+            Args:
+                input_ids: Tensor of shape [batch, sequence].
+
+            Returns:
+                Logits of shape [batch, sequence, vocab].
+            """
+            return self.lm_head(self.proj(self.model.get_input_embeddings(input_ids)))
+
+    from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
+
+    apply_cache_compatibility_patches()
+    torch.manual_seed(0)
+    lora_config = LoraConfig(target_modules=["proj"], r=2, lora_alpha=2)
+    # Before the reload phase enabled compatibility patches, PEFT consumed
+    # list-form metadata without asking the model for its embedding module.
+    legacy_base = LegacyModel()
+    legacy_base._tied_weights_keys = ["lm_head.weight"]
+    legacy_peft = get_peft_model(legacy_base, lora_config)
+    assert "default" in legacy_peft.base_model.model.proj.lora_A
+    with pytest.raises(TypeError, match="input_ids"):
+        get_peft_model(LegacyModel(), lora_config)
+
+    base = LegacyModel()
+    base_state = deepcopy(base.state_dict())
+    with _peft_input_embeddings_context(base):
+        peft_model = get_peft_model(base, lora_config)
+    with torch.no_grad():
+        peft_model.base_model.model.proj.lora_B["default"].weight.fill_(0.25)
+    input_ids = torch.tensor([[1, 2, 3]])
+    expected_logits = peft_model(input_ids).detach()
+    peft_model.save_pretrained(tmp_path, save_embedding_layers=False)
+
+    reloaded_base = LegacyModel()
+    reloaded_base.load_state_dict(base_state)
+    original_accessor = reloaded_base.get_input_embeddings
+    original_inner_accessor = reloaded_base.model.get_input_embeddings
+    with _peft_input_embeddings_context(reloaded_base):
+        assert reloaded_base.get_input_embeddings() is reloaded_base.model.embed_tokens
+        reloaded = PeftModel.from_pretrained(reloaded_base, tmp_path, autocast_adapter_dtype=False)
+
+    assert reloaded_base.get_input_embeddings == original_accessor
+    assert reloaded_base.model.get_input_embeddings == original_inner_accessor
+    assert set(reloaded.state_dict()) == set(peft_model.state_dict())
+    for key, tensor in peft_model.state_dict().items():
+        torch.testing.assert_close(reloaded.state_dict()[key], tensor, rtol=0, atol=0)
+    torch.testing.assert_close(reloaded(input_ids), expected_logits, rtol=0, atol=0)
+
+
+def test_peft_embedding_context_restores_accessor_on_failure():
+    class BrokenAccessorModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed_tokens = torch.nn.Embedding(8, 4)
+            self._nemo_tied_weights_keys = {"lm_head.weight": "embed_tokens.weight"}
+
+        def get_input_embeddings(self) -> torch.nn.Module:
+            raise TypeError("input_ids required")
+
+    model = BrokenAccessorModel()
+    original_accessor = model.get_input_embeddings
+    with pytest.raises(RuntimeError, match="adapter load failed"):
+        with _peft_input_embeddings_context(model):
+            assert model.get_input_embeddings() is model.embed_tokens
+            replacement = torch.nn.Embedding(8, 4)
+            model.embed_tokens = replacement
+            assert model.get_input_embeddings() is replacement
+            raise RuntimeError("adapter load failed")
+    assert model.get_input_embeddings == original_accessor
+    assert "get_input_embeddings" not in model.__dict__
+
+
+def test_peft_embedding_context_preserves_standard_accessor():
+    class StandardModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed_tokens = torch.nn.Embedding(8, 4)
+            self._nemo_tied_weights_keys = {"lm_head.weight": "embed_tokens.weight"}
+
+        def get_input_embeddings(self) -> torch.nn.Module:
+            return self.embed_tokens
+
+    model = StandardModel()
+    original_accessor = model.get_input_embeddings
+    with _peft_input_embeddings_context(model):
+        assert model.get_input_embeddings == original_accessor
+        assert model.get_input_embeddings() is model.embed_tokens
 
 
 @pytest.mark.parametrize(("offline", "expected_local_files_only"), [(None, False), ("1", True)])

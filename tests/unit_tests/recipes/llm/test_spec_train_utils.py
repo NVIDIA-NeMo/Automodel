@@ -15,16 +15,20 @@
 """Unit tests for the shared speculative-recipe training utilities.
 
 These pin the grad-accumulation bookkeeping and the warmup+cosine LR schedule
-that EAGLE-1/2, EAGLE-3, and DFlash now share, so a change is caught for all of
-them at once (the drift these utilities exist to prevent). Recipe-level
-integration of the same logic lives in each recipe's own grad-accum tests.
+that EAGLE-1/2, EAGLE-3, DFlash, and DSpark share, plus the draft
+activation-checkpointing wiring that DFlash and DSpark share (EAGLE-1/2 and
+EAGLE-3 do not call it yet), so a change is caught for all current callers at
+once (the drift these utilities exist to prevent). Recipe-level integration of
+the same logic lives in each recipe's own tests.
 """
 
 import math
 
 import pytest
+import torch
 
 from nemo_automodel.recipes.llm._spec_train_utils import (
+    apply_draft_activation_checkpointing,
     make_warmup_cosine_schedule,
     optim_steps_per_epoch,
     should_sync_grads,
@@ -137,3 +141,65 @@ def test_warmup_cosine_schedule_clamps_past_the_end():
     # progress is clamped to [0, 1], so steps past total stay at min_lr_ratio.
     assert sched(50) == pytest.approx(0.2)
     assert not math.isnan(sched(50))
+
+
+# ---------------------------------------------------------------------------
+# apply_draft_activation_checkpointing (recipes that DDP/fully_shard the draft
+# directly bypass FSDP2Manager/DDPManager's own AC wiring, so this must be
+# called explicitly)
+# ---------------------------------------------------------------------------
+
+
+class _DraftLayer(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.self_attn = torch.nn.Linear(4, 4)
+        self.mlp = torch.nn.Linear(4, 4)
+        self.input_layernorm = torch.nn.LayerNorm(4)
+        self.post_attention_layernorm = torch.nn.LayerNorm(4)
+
+
+class _Draft(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layers = torch.nn.ModuleList([_DraftLayer(), _DraftLayer()])
+
+
+def test_draft_activation_checkpointing_wraps_trainable_submodules():
+    draft = _Draft()
+    apply_draft_activation_checkpointing(draft, True)
+    for layer in draft.layers:
+        assert hasattr(layer.self_attn, "_checkpoint_wrapped_module")
+        assert hasattr(layer.mlp, "_checkpoint_wrapped_module")
+        assert hasattr(layer.input_layernorm, "_checkpoint_wrapped_module")
+        assert hasattr(layer.post_attention_layernorm, "_checkpoint_wrapped_module")
+
+
+def test_draft_activation_checkpointing_false_is_noop():
+    draft = _Draft()
+    original_attention = draft.layers[0].self_attn
+    apply_draft_activation_checkpointing(draft, False)
+    assert draft.layers[0].self_attn is original_attention
+
+
+@pytest.mark.parametrize("spelling", ["off", "none", "disabled", "no", "OFF"])
+def test_draft_activation_checkpointing_disabled_spellings_are_noop(spelling):
+    """Must recognize the same disabled spellings ``_normalize_activation_checkpointing``
+    does for the target, or ``distributed: {activation_checkpointing: off}`` leaves the
+    target uncheckpointed while fully checkpointing the draft."""
+    draft = _Draft()
+    original_attention = draft.layers[0].self_attn
+    apply_draft_activation_checkpointing(draft, spelling)
+    assert draft.layers[0].self_attn is original_attention
+
+
+def test_draft_activation_checkpointing_rejects_an_unrecognized_string():
+    with pytest.raises(ValueError, match="activation_checkpointing"):
+        apply_draft_activation_checkpointing(_Draft(), "sometimes")
+
+
+def test_draft_activation_checkpointing_warns_when_draft_has_no_layers():
+    draft = torch.nn.Module()
+    # Must not raise -- a draft with an unexpected shape should be a loud warning,
+    # not a crash, since fp8/compile before it already succeeded.
+    apply_draft_activation_checkpointing(draft, True)

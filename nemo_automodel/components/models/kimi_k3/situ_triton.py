@@ -78,6 +78,39 @@ def _tile_configs() -> list:
     ]
 
 
+@triton.jit
+def _tanh_fast(x):
+    """MUFU.TANH (``tanh.approx.f32``, sm_75+): one SFU op, |rel err| <= 2^-11 — below bf16 resolution."""
+    return tl.inline_asm_elementwise("tanh.approx.f32 $0, $1;", "=r,r", [x], dtype=tl.float32, is_pure=True, pack=1)
+
+
+@triton.jit
+def _rcp_fast(x):
+    """``rcp.approx.ftz.f32`` on an fp32 block of any shape (one SFU op; results below 2^-126 flush to zero)."""
+    return tl.inline_asm_elementwise("rcp.approx.ftz.f32 $0, $1;", "=r,r", [x], dtype=tl.float32, is_pure=True, pack=1)
+
+
+@triton.jit
+def _situ_tanh(x, FAST: tl.constexpr):
+    """tanh of an fp32 block of any shape: the SFU approximation when ``FAST``, libdevice otherwise."""
+    if FAST:
+        return _tanh_fast(x)
+    else:
+        return _libdevice.tanh(x)
+
+
+@triton.jit
+def _situ_sigmoid(x, FAST: tl.constexpr):
+    """sigmoid of an fp32 block of any shape: SFU exp2 + approximate reciprocal when ``FAST``, ``tl.sigmoid`` otherwise."""
+    if FAST:
+        # 1 / (1 + 2^(-x * log2 e)): the exact path already lowers its exp to the SFU (ex2.approx), so what the fast
+        # variant removes is tl.sigmoid's IEEE divide sequence. The kernels sit at 43-52 % of HBM bandwidth because
+        # they are bound by the transcendental/ALU work, not by memory.
+        return _rcp_fast(1.0 + tl.exp2(x * -1.4426950408889634))
+    else:
+        return tl.sigmoid(x)
+
+
 @triton.autotune(configs=_tile_configs(), key=["half"])
 @triton.jit
 def _situ_fwd_kernel(
@@ -92,6 +125,7 @@ def _situ_fwd_kernel(
     linear_beta,
     HAS_RW: tl.constexpr,
     HAS_LINEAR: tl.constexpr,
+    FAST_MATH: tl.constexpr,
     BLOCK_R: tl.constexpr,
     BLOCK_C: tl.constexpr,
 ):
@@ -107,10 +141,10 @@ def _situ_fwd_kernel(
     gu_off = rows64[:, None] * stride_gu + cols[None, :]
     g = tl.load(gu_ptr + gu_off, mask=mask, other=0.0).to(tl.float32)
     u0 = tl.load(gu_ptr + gu_off + half, mask=mask, other=0.0).to(tl.float32)
-    tg = _libdevice.tanh(g / beta)
-    a = beta * tg * tl.sigmoid(g)
+    tg = _situ_tanh(g / beta, FAST_MATH)
+    a = beta * tg * _situ_sigmoid(g, FAST_MATH)
     if HAS_LINEAR:
-        u = linear_beta * _libdevice.tanh(u0 / linear_beta)
+        u = linear_beta * _situ_tanh(u0 / linear_beta, FAST_MATH)
     else:
         u = u0
     out = a * u
@@ -139,6 +173,7 @@ def _situ_bwd_kernel(
     HAS_RW: tl.constexpr,
     HAS_LINEAR: tl.constexpr,
     WANT_DRW: tl.constexpr,
+    FAST_MATH: tl.constexpr,
     BLOCK_R: tl.constexpr,
     BLOCK_C: tl.constexpr,
 ):
@@ -158,8 +193,8 @@ def _situ_bwd_kernel(
         g = tl.load(gu_ptr + gu_off, mask=mask, other=0.0).to(tl.float32)
         u0 = tl.load(gu_ptr + gu_off + half, mask=mask, other=0.0).to(tl.float32)
         go = tl.load(go_ptr + rows64[:, None] * stride_go + cols[None, :], mask=mask, other=0.0).to(tl.float32)
-        tg = _libdevice.tanh(g / beta)
-        sg = tl.sigmoid(g)
+        tg = _situ_tanh(g / beta, FAST_MATH)
+        sg = _situ_sigmoid(g, FAST_MATH)
         a = beta * tg * sg
         da_dg = (1.0 - tg * tg) * sg + beta * tg * sg * (1.0 - sg)
         if HAS_RW:
@@ -167,7 +202,7 @@ def _situ_bwd_kernel(
         else:
             gow = go
         if HAS_LINEAR:
-            tu = _libdevice.tanh(u0 / linear_beta)
+            tu = _situ_tanh(u0 / linear_beta, FAST_MATH)
             u = linear_beta * tu
             d_u = gow * a * (1.0 - tu * tu)
         else:
@@ -194,6 +229,8 @@ def situ_fwd_triton(
     routing_weights2: torch.Tensor | None,
     beta: float,
     linear_beta: float | None,
+    *,
+    fast_math: bool = False,
 ) -> torch.Tensor:
     """Weighted (or dense) SiTU forward on ``[rows, 2 * intermediate]`` projections.
 
@@ -204,6 +241,8 @@ def situ_fwd_triton(
             dtype, contiguous), or None for the dense activation.
         beta: SiTU beta applied to the gate branch.
         linear_beta: Optional bounded-linear beta applied to the up branch.
+        fast_math: SFU ``tanh.approx`` / ``exp2`` / ``rcp.approx`` instead of libdevice tanh and an IEEE divide
+            (``KimiK3TextConfig.situ_backend = "triton_fast_math"``); at most one bf16 ulp from the exact chain.
 
     Returns:
         Tensor of shape [rows, intermediate] in ``gate_up2``'s dtype.
@@ -231,6 +270,7 @@ def situ_fwd_triton(
         float(linear_beta) if linear_beta is not None else 0.0,
         HAS_RW=has_rw,
         HAS_LINEAR=linear_beta is not None,
+        FAST_MATH=bool(fast_math),
     )
     return out
 
@@ -242,6 +282,8 @@ def situ_bwd_triton(
     beta: float,
     linear_beta: float | None,
     want_drw: bool,
+    *,
+    fast_math: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Weighted (or dense) SiTU backward.
 
@@ -252,6 +294,8 @@ def situ_bwd_triton(
         beta: SiTU beta applied to the gate branch.
         linear_beta: Optional bounded-linear beta applied to the up branch.
         want_drw: Whether to reduce the routing-weight gradient (requires weights).
+        fast_math: Same SFU variants as in :func:`situ_fwd_triton`; the autograd Functions in ``situ.py`` pass
+            the setting their forward used.
 
     Returns:
         ``(d_gate_up2, d_routing_weights2)`` in the inputs' dtypes; the second
@@ -290,5 +334,6 @@ def situ_bwd_triton(
         HAS_RW=has_rw,
         HAS_LINEAR=linear_beta is not None,
         WANT_DRW=want_drw,
+        FAST_MATH=bool(fast_math),
     )
     return d_gu, d_rw

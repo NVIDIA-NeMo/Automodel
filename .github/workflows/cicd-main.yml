@@ -45,8 +45,9 @@ jobs:
 
   pre-flight:
     needs: [ephemeral-runner-routing]
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@d0878a142525ff79366ca96fbc0b306cd8d64670 # v1.9.0
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@037094bcc9138c72bc125418e6e3653f9e1c4160 # v1.11.0
     with:
+      workflow_ref: 037094bcc9138c72bc125418e6e3653f9e1c4160  # pragma: allowlist secret
       default_runner_prefix: ${{ vars.DEFAULT_RUNNER_PREFIX }}
       non_nvidia_runner_prefix: ${{ needs.ephemeral-runner-routing.outputs.runner_label_base }}
       default_test_data_path: ${{ vars.DEFAULT_TEST_DATA_PATH }}
@@ -399,8 +400,15 @@ jobs:
           push: true
           context: .
           platforms: ${{ steps.platform.outputs.platforms }}
+          # Opt-in build parallelism (Dockerfile defaults keep the serial/lower values). Any
+          # consumer sharing this BuildKit cache must pass identical values to hit the same layers.
+          # Keep comments out of the block below: build-push-action passes `#` lines through.
           build-args: |
             BASE_IMAGE=pytorch
+            FA3_MAX_JOBS=24
+            UV_SYNC_MAX_JOBS=24
+            BNB_BUILD_MAX_JOBS=8
+            BNB_BUILD_THREADS_PER_JOB=8
           cache-from: type=registry,ref=${{ steps.cache_from.outputs.donor }},mode=max
           cache-to: ${{ steps.cache_keys.outputs.cache-to }}
           no-cache: false
@@ -424,13 +432,14 @@ jobs:
           - test-name: L0_Unit_Tests_GPU_1_of_2
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             cpu-only: false
-            timeout: 30
+            # GPU shards take ~30 minutes before teardown and coverage finish.
+            timeout: 40
             shard-id: 0
             num-shards: 2
           - test-name: L0_Unit_Tests_GPU_2_of_2
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             cpu-only: false
-            timeout: 30
+            timeout: 40
             shard-id: 1
             num-shards: 2
     needs: [pre-flight, cicd-wait-in-queue, cicd-container-build]
