@@ -70,6 +70,7 @@ def test_varlen_segments_tile_every_row():
     [
         ("causal", 0, 512),
         ("packed", 0, 512),
+        ("left_pad", 0, 512),
         ("causal", 0, 256),
         ("causal", 256, 256),
         ("packed", 256, 256),
@@ -89,6 +90,8 @@ def test_document_causal_fa4_attention_matches_reference(layout, q_global_start,
     if layout == "two_rows":
         doc_ids[1, 300:] = 2
         doc_ids[1, 301:] = 3
+    elif layout == "left_pad":
+        doc_ids[:, :37] = 0
     elif layout == "empty_rank":
         doc_ids[:, local_len:] = 0
     q_doc_ids = doc_ids[:, q_global_start : q_global_start + local_len]

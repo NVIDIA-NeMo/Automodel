@@ -101,8 +101,23 @@ _LAYOUT_CACHE: dict[tuple, Any] = {}
 _LAYOUT_GENERATION: list[Any] = [None, None]
 
 
-def _varlen_layout(q_doc_ids: torch.Tensor, kv_doc_ids: torch.Tensor, *, q_global_start: int):
-    """Build (and cache for the step) FA4 varlen ``cu_seqlens`` and max lengths."""
+def _varlen_layout(
+    q_doc_ids: torch.Tensor, kv_doc_ids: torch.Tensor, *, q_global_start: int
+) -> tuple[torch.Tensor, torch.Tensor, int, int]:
+    """Build (and cache for the step) FA4 varlen ``cu_seqlens`` and max lengths.
+
+    Args:
+        q_doc_ids: Integer tensor [batch, query_sequence] of 1-based document ids (0 = padding) for the local queries;
+            equal to ``kv_doc_ids[:, q_global_start : q_global_start + query_sequence]``.
+        kv_doc_ids: Integer tensor [batch, key_sequence] of document ids for all keys, on the attention device. Its
+            storage identifies the step: a new tensor invalidates the cache.
+        q_global_start: Global sequence offset of the first local query.
+
+    Returns:
+        ``(cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k)``: two int32 tensors of shape [segments + 1] on
+        ``kv_doc_ids.device`` with the cumulative per-segment query and key lengths (the key segments tile
+        ``batch * key_sequence``), and the two maxima as Python ints.
+    """
     pointer = kv_doc_ids.data_ptr()
     if pointer != _LAYOUT_GENERATION[0]:
         _LAYOUT_CACHE.clear()

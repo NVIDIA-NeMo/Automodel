@@ -177,6 +177,23 @@ def test_tiny_qwen3_8_flash_next_forward_backward_and_state_layout(backend_sourc
     assert "model.language_model.hyper_connection_mixer.block_inject_weight.weight" not in keys
 
 
+@pytest.mark.parametrize(("legacy_attn", "expected"), [("cute", "fa4"), ("flex", "flex")])
+def test_legacy_backend_target_still_loads(legacy_attn: str, expected: str, caplog: pytest.LogCaptureFixture) -> None:
+    """Existing YAMLs that target the removed model-local backend keep loading; ``cute`` maps to ``fa4``."""
+    with caplog.at_level("WARNING"):
+        backend = ConfigNode(
+            {
+                "_target_": "nemo_automodel.components.models.qwen3_8_flash_next.backend.Qwen3_8_FlashNextBackendConfig",
+                "attn": legacy_attn,
+                "linear": "torch",
+            }
+        ).instantiate()
+    assert isinstance(backend, BackendConfig)
+    assert backend.attn == expected
+    assert "Qwen3_8_FlashNextBackendConfig is deprecated" in caplog.text
+    assert ("use backend.attn='fa4'" in caplog.text) is (legacy_attn == "cute")
+
+
 def test_output_hidden_states_defaults_to_model_config() -> None:
     config = _tiny_config()
     config.output_hidden_states = True

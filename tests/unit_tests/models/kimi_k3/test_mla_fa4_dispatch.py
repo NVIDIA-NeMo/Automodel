@@ -42,6 +42,11 @@ def test_backend_attn_selects_fa4(attn, use_fa4):
     assert module.attn_module is None
 
 
+def test_fa4_rejects_attention_dropout():
+    with pytest.raises(ValueError, match="does not support attention dropout"):
+        kimi_model.KimiMLAAttention(_small_config(attention_dropout=0.1), 3, BackendConfig(attn="fa4", linear="torch"))
+
+
 def test_backend_attn_rejects_unsupported():
     with pytest.raises(ValueError, match="does not support backend.attn"):
         kimi_model.KimiMLAAttention(_small_config(), 3, BackendConfig(attn="flex", linear="torch"))
@@ -77,16 +82,24 @@ def test_cp_forward_dispatches_on_backend_attn(monkeypatch, attn):
     assert calls == [("flex" if attn == "eager" else "fa4", (1, 4), 4)]
 
 
-@pytest.mark.parametrize(("packed", "expected"), [(False, ("causal", None, None)), (True, ("fa4", (1, 8), 0))])
-def test_non_cp_forward_uses_fa4(monkeypatch, packed, expected):
+@pytest.mark.parametrize(
+    ("layout", "expected"),
+    [
+        (None, ("causal", None, None)),
+        ([1, 1, 1, 2, 2, 2, 0, 0], ("fa4", (1, 8), 0)),
+        # A single left-padded document must not fall back to plain causal: valid queries would see padding keys.
+        ([0, 0, 1, 1, 1, 1, 1, 1], ("fa4", (1, 8), 0)),
+        ([1, 1, 1, 1, 1, 1, 0, 0], ("fa4", (1, 8), 0)),
+    ],
+)
+def test_non_cp_forward_uses_fa4(monkeypatch, layout, expected):
     calls = []
     monkeypatch.setattr(kimi_model, "causal_fa4_attention", _fake_attention(calls, "causal"))
     monkeypatch.setattr(kimi_model, "document_causal_fa4_attention", _fake_attention(calls, "fa4"))
 
     module = kimi_model.KimiMLAAttention(_small_config(), 3, BackendConfig(attn="fa4", linear="torch"))
     hidden_states = torch.randn(1, 8, 64)
-    doc_ids = torch.tensor([[1, 1, 1, 2, 2, 2, 0, 0]], dtype=torch.int32)
-    packed_context = KimiPackedContext(doc_ids) if packed else None
+    packed_context = None if layout is None else KimiPackedContext(torch.tensor([layout], dtype=torch.int32))
     output = module(hidden_states, packed_context=packed_context)
 
     assert output.shape == hidden_states.shape

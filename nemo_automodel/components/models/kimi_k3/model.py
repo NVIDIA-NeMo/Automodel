@@ -453,6 +453,11 @@ class KimiMLAAttention(nn.Module):
         # backend.attn="fa4" runs MLA through FlashAttention 4 on both the CP and non-CP paths (components/attention/fa4.py);
         # the other backends keep FlexAttention under context parallelism.
         self.use_fa4 = backend.attn == "fa4"
+        if self.use_fa4 and self.attention_dropout != 0.0:
+            raise ValueError(
+                f"Kimi K3 MLA with backend.attn='fa4' does not support attention dropout "
+                f"(attention_dropout={self.attention_dropout}); set attention_dropout to 0 or use backend.attn='te'."
+            )
 
     def setup_cp_attention(self, cp_mesh) -> None:
         """Attach the context-parallel mesh used to gather full-sequence keys and values.
@@ -515,7 +520,9 @@ class KimiMLAAttention(nn.Module):
         key_states, value_states = self._expand_key_value_groups(key_states, value_states, seq_length)
 
         if self.use_fa4:
-            if packed_context is not None and packed_context.has_multiple_documents:
+            if packed_context is not None:
+                # Any document map (packed rows, left or right padding) goes through the document-causal varlen path
+                # so valid queries never attend to padding keys; plain causal is only for unmasked batches.
                 attn_output = document_causal_fa4_attention(
                     query_states,
                     key_states,
@@ -526,7 +533,6 @@ class KimiMLAAttention(nn.Module):
                     scale=self.scaling,
                 )
             else:
-                # Right padding needs no mask: valid tokens never see later positions under causal attention.
                 attn_output = causal_fa4_attention(query_states, key_states, value_states, scale=self.scaling)
             attn_output = attn_output.transpose(1, 2).contiguous()
         elif self.backend.attn == "eager":

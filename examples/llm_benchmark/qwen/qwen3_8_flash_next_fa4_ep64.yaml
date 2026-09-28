@@ -33,7 +33,7 @@
 # in the submission script to use NCCL's internal IB path for Engram collectives.
 #
 # W&B is opt-in: set wandb.enable=true and your project/entity before submission.
-# To compare FlexAttention, change only model.backend.attn from cute to flex.
+# To compare FlexAttention, change only model.backend.attn from fa4 to flex.
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
