@@ -41,6 +41,7 @@ from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config
 from nemo_automodel.components.distributed.parallelizer import _apply_titans_activation_checkpointing
 from nemo_automodel.components.models.titans.config import TitansConfig
 from nemo_automodel.components.models.titans.layers import (
+    CausalAttention,
     NeuralMemory,
     TitansAttentionBlock,
     TitansMACBlock,
@@ -223,6 +224,34 @@ def test_local_attention_control_is_segment_isolated_but_full_attention_is_not()
 
     torch.testing.assert_close(local_original[:, 4:], local_changed[:, 4:], rtol=0, atol=0)
     assert (full_original[:, 4:] - full_changed[:, 4:]).abs().max().item() > 0
+
+
+def test_full_attention_matches_explicit_causal_reference():
+    torch.manual_seed(19)
+    config = _tiny_config(
+        architecture_variant="full_attention",
+        num_longterm_memory_tokens=0,
+        num_persistent_memory_tokens=0,
+    )
+    attention = CausalAttention(config, dtype=torch.float32).eval()
+    inputs = torch.randn(2, 7, config.hidden_size)
+
+    def project(layer):
+        value = layer(inputs).view(2, 7, config.num_attention_heads, config.head_dim)
+        return value.transpose(1, 2)
+
+    queries = attention._apply_rope(project(attention.q_proj))
+    keys = attention._apply_rope(project(attention.k_proj))
+    values = project(attention.v_proj)
+    scores = queries @ keys.transpose(-1, -2) / config.head_dim**0.5
+    scores.masked_fill_(torch.ones(7, 7, dtype=torch.bool).triu(diagonal=1), float("-inf"))
+    reference = scores.softmax(dim=-1) @ values
+    reference = reference.transpose(1, 2).reshape(2, 7, attention.inner_dim)
+    reference = attention.o_proj(reference)
+
+    actual = attention(inputs)
+
+    torch.testing.assert_close(actual, reference, rtol=1e-5, atol=2e-6)
 
 
 def test_local_attention_control_accepts_partial_segments_during_generation():
