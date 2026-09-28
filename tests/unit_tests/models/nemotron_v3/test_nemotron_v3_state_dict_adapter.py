@@ -221,6 +221,25 @@ class TestNemotronV3AdapterDense:
         assert not any(k.endswith("norm_f.weight") for k in native)
         assert adapter._uses_model_prefix is False
 
+    @pytest.mark.parametrize("embed_key", ["backbone.embedding.weight", "backbone.embeddings.weight", "model.embedding.weight"])
+    def test_from_hf_accepts_singular_or_plural_embedding(self, adapter, embed_key):
+        """RL#4211: transformers save_pretrained may emit singular ``embedding``."""
+        tensor = torch.randn(100, 256)
+        native = adapter.from_hf({embed_key: tensor})
+
+        assert set(native) == {"model.embed_tokens.weight"}
+        torch.testing.assert_close(native["model.embed_tokens.weight"], tensor, rtol=0, atol=0)
+
+    def test_singular_embedding_exports_as_plural(self, adapter):
+        """Canonical HF export stays plural to match released nvidia checkpoints."""
+        tensor = torch.randn(100, 256)
+        native = adapter.from_hf({"backbone.embedding.weight": tensor})
+        exported = adapter.to_hf(dict(native))
+
+        assert set(exported) == {"backbone.embeddings.weight"}
+        torch.testing.assert_close(exported["backbone.embeddings.weight"], tensor, rtol=0, atol=0)
+        assert "backbone.embedding.weight" not in exported
+
     def test_round_trip_dense(self, adapter):
         hf_sd = {
             "backbone.embeddings.weight": torch.randn(100, 256),
@@ -270,6 +289,28 @@ class TestNemotronV3AdapterDense:
         key = "base_model.model.model.layers.0.mixer.in_proj.lora_A.weight"
         assert set(exported) == {key}
         torch.testing.assert_close(exported[key], tensor, rtol=0, atol=0)
+
+    @pytest.mark.parametrize("base_prefix", ["backbone", "model"])
+    @pytest.mark.parametrize("adapter_prefix", ["backbone", "model"])
+    def test_adapter_restore_preserves_base_checkpoint_namespace(self, adapter, base_prefix, adapter_prefix):
+        """Legacy LoRA names must not rename frozen embeddings in the merged export."""
+        base_state = {
+            f"{base_prefix}.embeddings.weight": torch.randn(16, 8),
+            f"{base_prefix}.norm_f.weight": torch.randn(8),
+        }
+        native_base = adapter.from_hf(dict(base_state))
+        lora_tensor = torch.randn(2, 8)
+        native_lora = adapter.from_hf(
+            {f"base_model.model.{adapter_prefix}.layers.0.mixer.in_proj.lora_A.weight": lora_tensor}
+        )
+        native_key = "base_model.model.model.layers.0.mixer.in_proj.lora_A.weight"
+        assert set(native_lora) == {native_key}
+        torch.testing.assert_close(native_lora[native_key], lora_tensor, rtol=0, atol=0)
+
+        exported = adapter.to_hf(dict(native_base))
+        assert set(exported) == set(base_state)
+        for key in base_state:
+            torch.testing.assert_close(exported[key], base_state[key], rtol=0, atol=0)
 
 
 class TestNemotronV3AdapterMTP:

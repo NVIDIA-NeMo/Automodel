@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-ARG CUDA_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.04-cuda13.2-devel-ubuntu24.04
+ARG CUDA_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.08-cuda13.4-devel-ubuntu24.04
 ARG PYTORCH_IMAGE=nvcr.io/nvidia/pytorch:26.08-py3
 ARG BASE_IMAGE=cuda
 
@@ -101,24 +101,41 @@ FROM update_base_container AS automodel_dep
 
 # Install TE
 ARG INSTALL_TE=True
-ARG TE_COMMIT=release_v2.14
-RUN if [ "$INSTALL_TE" = "True" ]; then \
+ARG TE_COMMIT=v2.19.0
+# TE 2.19 expands the 100 family target to 107a when CUDA 13.4+ is used.
+ARG TE_CUDA_ARCHS="80;90;100;120"
+ARG TE_BUILD_MAX_JOBS=8
+ARG TE_BUILD_THREADS_PER_JOB=8
+# INSTALL_TE=False may reuse TE from the base image only when its PyTorch
+# binding is already compatible. Otherwise rebuild it against the exact
+# PyTorch/CUDA stack in this image to avoid carrying a stale native extension.
+RUN if [ "$INSTALL_TE" = "True" ] || \
+        ! python -c "from importlib.metadata import version; from packaging.version import Version; assert Version(version('transformer-engine')) >= Version('2.19.0'); import transformer_engine.pytorch"; then \
+    pip uninstall -y transformer-engine transformer-engine-cu12 transformer-engine-cu13 transformer-engine-torch && \
     git clone https://github.com/NVIDIA/TransformerEngine.git && \
     cd TransformerEngine && \
-    git fetch origin $TE_COMMIT && \
+    git fetch origin "$TE_COMMIT" && \
     git checkout FETCH_HEAD && \
-    git submodule init && git submodule update && \
+    git submodule update --init --recursive && \
     pip install nvidia-mathdx==25.1.1 && \
-    env NVTE_CUDA_ARCHS="80;90;100;120" NVTE_BUILD_THREADS_PER_JOB=8 pip install --no-cache-dir --no-build-isolation -v . && \
+    env \
+        NVTE_FRAMEWORK=pytorch \
+        NVTE_RELEASE_BUILD=0 \
+        NVTE_BUILD_METAPACKAGE=0 \
+        NVTE_CUDA_ARCHS="$TE_CUDA_ARCHS" \
+        NVTE_WITH_NCCL_EP=0 \
+        NVTE_BUILD_MAX_JOBS="$TE_BUILD_MAX_JOBS" \
+        NVTE_BUILD_THREADS_PER_JOB="$TE_BUILD_THREADS_PER_JOB" \
+        NVTE_NO_LOCAL_VERSION=1 \
+        pip install --no-cache-dir --no-build-isolation -v . && \
     cd ../ && rm -rf TransformerEngine; \
     fi
 
-# Install HybridEP / DeepEP. Build with apt rdma-core v60 (so build==runtime libibverbs)
-# and RDMA_CORE_HOME symlinked to the system install; create the libnvshmem_host.so->.so.3
-# symlink required for DeepEP fabric handle ops; use the nvshmem wheel 3.6.5 and pin
-# DEEPEP_COMMIT to upstream hybrid-ep at 58397eac, which carries the merged
-# DeepEP #673 compact top-k routing scan.
-ARG DEEPEP_COMMIT=58397eac493b075b0baea5861ac6e9793d8d7a21
+# Install HybridEP / DeepEP: apt rdma-core v60 (build==runtime libibverbs), nvshmem wheel 3.6.5.
+# The pinned hybrid-ep revision includes DeepEP #699, which inherits PyTorch's C++ standard
+# instead of forcing C++17 (PyTorch's Rubin builds require C++20).
+COPY docker/common/deepep.patch /opt/deepep.patch
+ARG DEEPEP_COMMIT=10d4dd7377d5bce900fbb4b80cce863764892b95
 ENV HYBRID_EP_MULTINODE=1
 ENV RDMA_CORE_HOME=/opt/rdma-core/build
 ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64/:$LD_LIBRARY_PATH
@@ -135,6 +152,7 @@ RUN apt-get update && apt-get install -y --allow-change-held-packages \
     cd DeepEP && \
     git fetch origin $DEEPEP_COMMIT && \
     git checkout FETCH_HEAD && \
+    patch -p1 < /opt/deepep.patch && \
     pip install --no-cache-dir nvidia-nvshmem-cu13==3.6.5 && \
     NVSHMEM_LIB_PATH=$(pip show nvidia-nvshmem-cu13 | grep "Location:" | cut -d' ' -f2)/nvidia/nvshmem/lib && \
     ln -sf ${NVSHMEM_LIB_PATH}/libnvshmem_host.so.3 ${NVSHMEM_LIB_PATH}/libnvshmem_host.so && \
@@ -143,12 +161,16 @@ RUN apt-get update && apt-get install -y --allow-change-held-packages \
         TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" \
         pip install --no-cache-dir --no-build-isolation -v . && \
     apt-get purge -y libnvidia-ml-dev && apt-get autoremove -y && \
-    rm -rf /var/lib/apt/lists/* && \
+    rm -rf /var/lib/apt/lists/* /opt/deepep.patch && \
     cd / && rm -rf DeepEP
 
 # Install Bitsandbytes
 ARG INSTALL_BITSANDBYTES=True
 ARG BITSANDBYTES_COMMIT=0.49.2
+# Unset by default so cmake/make run exactly as before (serial make, no nvcc --threads);
+# upstream CI passes values to run make -j and compile the 8 CUDA targets in parallel.
+ARG BNB_BUILD_MAX_JOBS
+ARG BNB_BUILD_THREADS_PER_JOB
 # Include native Blackwell targets, especially SM121 for DGX Spark, instead of relying on forward-compatible PTX.
 RUN if [ $INSTALL_BITSANDBYTES = "True" ]; then \
     git clone https://github.com/bitsandbytes-foundation/bitsandbytes.git && \
@@ -156,10 +178,12 @@ RUN if [ $INSTALL_BITSANDBYTES = "True" ]; then \
     git pull && \
     git fetch origin $BITSANDBYTES_COMMIT && \
     git checkout FETCH_HEAD && \
-    cmake -DCOMPUTE_BACKEND=cuda -DCOMPUTE_CAPABILITY="80;86;90;100;110;120;121" -S . && \
-    make && \
+    cmake -DCOMPUTE_BACKEND=cuda -DCOMPUTE_CAPABILITY="80;86;90;100;110;120;121" \
+        ${BNB_BUILD_THREADS_PER_JOB:+"-DCMAKE_CUDA_FLAGS=--threads ${BNB_BUILD_THREADS_PER_JOB}"} \
+        -S . && \
+    make ${BNB_BUILD_MAX_JOBS:+"-j${BNB_BUILD_MAX_JOBS}"} && \
     cmake -DCOMPUTE_BACKEND=cpu -S . && \
-    make && \
+    make ${BNB_BUILD_MAX_JOBS:+"-j${BNB_BUILD_MAX_JOBS}"} && \
     pip install . && \
     cd ../ && rm -rf bitsandbytes; \
     fi
@@ -173,7 +197,7 @@ RUN if [ "$INSTALL_UCCL_EP" = "True" ]; then \
     fi
 
 # ---- Wheel builder: compile the heavy AOT source packages off the uv-sync path (cached across uv.lock bumps).
-# Build torchao then FA3/FA4 sequentially and cap compiler parallelism to stay within CI memory limits.
+# Build torchao, FlashMLA, then FA3/FA4 sequentially and cap compiler parallelism to stay within CI memory limits.
 FROM automodel_dep AS wheel_builder
 
 # torchao MXFP8: build w/ submodules (PyPI wheels omit mxfp8 CUDA kernels on aarch64); pin v0.17.0 (v0.14.1 ~2.5x slower; main needs nvidia-cutlass-dsl).
@@ -185,6 +209,17 @@ RUN mkdir -p /wheels && \
         pip wheel --no-cache-dir --no-build-isolation --no-deps -w /wheels /tmp/torchao && \
     rm -rf /tmp/torchao
 
+# FlashMLA sparse prefill forward used by the GLM-5.2/5.3 cuDNN DSA backend.
+# This is the source revision used for the cuDNN numerical and full-model validation.
+ARG FLASH_MLA_REF=b7643bd54521f563b839b98289b5cd048c062ba2
+RUN git clone --filter=blob:none --no-checkout \
+        https://github.com/deepseek-ai/FlashMLA.git /tmp/FlashMLA && \
+    git -C /tmp/FlashMLA checkout "${FLASH_MLA_REF}" && \
+    git -C /tmp/FlashMLA submodule update --init --recursive && \
+    CPLUS_INCLUDE_PATH=/usr/local/cuda/include/cccl MAX_JOBS=8 NVCC_THREADS=2 \
+        pip wheel --no-cache-dir --no-build-isolation --no-deps -w /wheels /tmp/FlashMLA && \
+    rm -rf /tmp/FlashMLA
+
 # FA3 (Hopper-only, SM90a-locked, ~25 min nvcc) + FA4 cute (Blackwell, lightweight). arm64 -> skip FA3: GB200 target, QEMU cross-build impractical.
 # Pin >= #2762/#2507: older refs rebuilt the CuTe compile key every call when max_seqlen
 # is a tensor (varlen/packed), so HF models recompiled each step. Also picks up #2745
@@ -193,6 +228,9 @@ ARG FLASH_ATTN_REF=ce088ab9ce0fc0434dcd8afa0a791da9fcc3a820
 ARG INSTALL_FA3=true
 ARG INSTALL_FA4=true
 ARG TARGETARCH
+# MAX_JOBS (ninja jobs) for the FA3 build; the default keeps today's behavior, upstream CI passes
+# a higher value. NVCC_THREADS cannot help: each FA3 file compiles for one gencode target (sm_90a).
+ARG FA3_MAX_JOBS=16
 RUN if [ "$TARGETARCH" = "arm64" ]; then INSTALL_FA3=false; fi && \
     if [ "$INSTALL_FA3" = "true" ] || [ "$INSTALL_FA4" = "true" ]; then \
         git clone --filter=blob:none https://github.com/Dao-AILab/flash-attention.git /tmp/fa && \
@@ -201,7 +239,7 @@ RUN if [ "$TARGETARCH" = "arm64" ]; then INSTALL_FA3=false; fi && \
     fi && \
     if [ "$INSTALL_FA3" = "true" ]; then \
         cd /tmp/fa/hopper && \
-        FLASH_ATTENTION_DISABLE_SM80=TRUE MAX_JOBS=16 NVCC_THREADS=2 \
+        FLASH_ATTENTION_DISABLE_SM80=TRUE MAX_JOBS=${FA3_MAX_JOBS} NVCC_THREADS=2 \
         pip wheel --no-cache-dir --no-build-isolation --no-deps -w /wheels . ; \
     fi && \
     if [ "$INSTALL_FA4" = "true" ]; then \
@@ -213,8 +251,9 @@ FROM automodel_dep AS automodel_final
 
 WORKDIR /opt/Automodel
 
-# torchao MXFP8 + FA3/FA4: prebuilt wheels from the wheel_builder stage, installed into system site-packages
-# before uv sync — pip targets system deps, uv the venv (torchao/FA gated `never`), so uv sync won't prune or shadow them.
+# torchao MXFP8 + FlashMLA + FA3/FA4: prebuilt wheels from the wheel_builder stage, installed into system site-packages
+# before uv sync — pip targets system deps, uv the venv (torchao/FA gated `never`, FlashMLA absent from the lock),
+# so uv sync won't prune or shadow them.
 COPY --from=wheel_builder /wheels /tmp/wheels/
 ARG INSTALL_FA4=true
 RUN pip install --no-cache-dir --no-deps /tmp/wheels/*.whl && \
@@ -258,25 +297,23 @@ ARG AUTOMODEL_INSTALL=all
 # `msa` is SM100-only so it stays out of `all`, but the image needs it: the MiniMax M3 MSA
 # recipe under examples/vlm_finetune/ is auto-discovered into release CI.
 ARG UV_SYNC_ARGS="--locked"
+# MAX_JOBS for source builds inside uv sync (MagiAttention dominates); the default keeps today's
+# behavior, upstream CI passes a higher value.
+ARG UV_SYNC_MAX_JOBS=8
 # Preserve locally built wheels for source-only CUDA packages such as flash-attn,
-# causal-conv1d, mamba-ssm, and nv-grouped-gemm across BuildKit builds.
+# causal-conv1d and mamba-ssm across BuildKit builds.
 # ray/jars/ray_dist.jar vendors a flagged jackson (GHSA-r7wm-3cxj-wff9) that upstream
 # has not bumped; Automodel uses Ray from Python only, so drop the Java worker jars.
-# DeepEP is already compiled above against the PyTorch image's Torch. The final
-# PyTorch sync must not rebuild it after the lock intentionally removes runtime Torch.
 RUN --mount=type=cache,target=/opt/uv_cache,sharing=locked \
     if [ "$BASE_IMAGE" = "pytorch" ]; then \
-        bash docker/common/update_pyproject_pytorch.sh /opt/Automodel && \
-        DEEPEP_SYNC_ARGS="--no-install-package deep-ep"; \
-    else \
-        DEEPEP_SYNC_ARGS=""; \
+        bash docker/common/update_pyproject_pytorch.sh /opt/Automodel; \
     fi && \
     MAGI_ATTENTION_BUILD_COMPUTE_CAPABILITY="90,100" \
         MAGI_ATTENTION_PREBUILD_FFA=0 \
-        MAX_JOBS=8 \
+        MAX_JOBS=${UV_SYNC_MAX_JOBS} \
         UV_CONCURRENT_INSTALLS=8 \
-        uv sync --extra $AUTOMODEL_INSTALL --all-groups $UV_SYNC_ARGS $DEEPEP_SYNC_ARGS && \
-    python -c "import importlib.metadata as m; import magi_attention; print('magi-attention', m.version('magi-attention')); assert m.version('deep-ep') == '1.2.1+58397ea'" && \
+        uv sync --extra $AUTOMODEL_INSTALL --extra msa --all-groups $UV_SYNC_ARGS && \
+    python -c "import importlib.metadata as m; import magi_attention; print('magi-attention', m.version('magi-attention'))" && \
     rm -rf ${UV_PROJECT_ENVIRONMENT}/lib/python*/site-packages/ray/jars && \
     chown -R "${RUNTIME_UID}:${RUNTIME_GID}" ${UV_PROJECT_ENVIRONMENT}
 
@@ -294,6 +331,11 @@ RUN git config --system --add safe.directory /opt/Automodel
 RUN if [ "$BASE_IMAGE" = "pytorch" ]; then \
         bash docker/common/update_pyproject_pytorch.sh /opt/Automodel; \
     fi
+
+# Fail the image build before publication if PyTorch headers cannot compile as
+# C++20, torch._grouped_mm is unavailable, or a bundled native extension has
+# unresolved PyTorch/CUDA symbols.
+RUN MAX_JOBS=2 python docker/common/verify_native_runtime.py
 
 WORKDIR /opt/Automodel
 

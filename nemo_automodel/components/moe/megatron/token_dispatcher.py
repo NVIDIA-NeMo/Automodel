@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import List, Literal, Tuple
@@ -23,8 +25,10 @@ from torch import nn
 from .fused_a2a import (
     fused_combine,
     fused_dispatch,
+    get_hybrid_ep_initialized_capacity,
     hybrid_ep_combine,
     hybrid_ep_dispatch,
+    publish_hybrid_ep_initialized_capacity,
     set_deepep_num_sms,
     set_uccl_num_sms,
     uccl_fused_combine,
@@ -329,7 +333,15 @@ class _HybridEPMetadataProcessor(nn.Module):
         self.permute_fusion = permute_fusion
 
     def forward(self, token_indices: torch.Tensor, token_probs: torch.Tensor) -> torch.Tensor:
-        """Expand top-k probabilities without materializing a dense routing map."""
+        """Expand top-k probabilities without materializing a dense routing map.
+
+        Args:
+            token_indices: Expert indices with shape [tokens, top_k]. Invalid slots contain -1.
+            token_probs: Routing probabilities with shape [tokens, top_k].
+
+        Returns:
+            Dense routing probabilities with shape [tokens, experts].
+        """
         valid = token_indices != -1
         safe_indices = token_indices.masked_fill(~valid, 0).long()
         safe_probs = torch.where(valid, token_probs, torch.zeros_like(token_probs)).float()
@@ -343,6 +355,8 @@ class _HybridEPMetadataProcessor(nn.Module):
 # DeepEP's hybrid-ep metadata allgather asserts bytes_per_rank % 16 == 0 on a
 # 4-byte-per-token array, so per-rank token counts must be multiples of 4.
 _HYBRIDEP_TOKEN_ALIGNMENT = 4
+# Benchmark A/B switch for the static-routing pad-size pin (default on); see _HybridEPManager.dispatch.
+_STATIC_ROUTING_PAD_PIN = os.environ.get("NEMO_STATIC_ROUTING_PAD_PIN", "1") != "0"
 
 
 class _HybridEPManager(_DispatchManager):
@@ -388,6 +402,10 @@ class _HybridEPManager(_DispatchManager):
         # persist num_permuted_tokens across dispatches, see dispatch()/reset.
         self.benchmark_static_routing = benchmark_static_routing
         self.num_permuted_tokens = None
+        # Benchmark-only companion pin: the EP-group padded token count (see dispatch()). Under static
+        # routing every dispatch pads to the same size, so the per-dispatch MAX all-reduce + host sync
+        # that computes it runs once. NEMO_STATIC_ROUTING_PAD_PIN=0 keeps the per-dispatch path (A/B).
+        self._static_target_tokens: int | None = None
 
         # Metadata
         self.token_probs: torch.Tensor | None = None
@@ -449,7 +467,16 @@ class _HybridEPManager(_DispatchManager):
         async_finish: bool = True,  # noqa: ARG002 - not supported by HybridEP backend
         allocate_on_comm_stream: bool = True,  # noqa: ARG002 - not supported by HybridEP backend
     ) -> torch.Tensor:
-        """Dispatch ``hidden_states[T, H]`` using compact top-k metadata when available."""
+        """Dispatch hidden states using compact top-k metadata when available.
+
+        Args:
+            hidden_states: Hidden states with shape [tokens, hidden].
+            async_finish: Ignored because HybridEP does not expose asynchronous completion here.
+            allocate_on_comm_stream: Ignored because HybridEP owns its communication stream.
+
+        Returns:
+            Dispatched hidden states with shape [dispatched_tokens, hidden].
+        """
         # Reset num_permuted_tokens to None to avoid reusing cached state from a prior dispatch.
         # This can happen in non-reentrant activation checkpointing mode.
         # Benchmark-only exception: with static routing every dispatch permutes the same
@@ -472,9 +499,21 @@ class _HybridEPManager(_DispatchManager):
         self.num_unpadded_tokens = None
         if torch.distributed.is_initialized() and torch.distributed.get_world_size(self.group) > 1:
             num_tokens = hidden_states.shape[0]
-            group_max = torch.tensor(num_tokens, device=hidden_states.device)
-            torch.distributed.all_reduce(group_max, op=torch.distributed.ReduceOp.MAX, group=self.group)
-            target_tokens = -(-int(group_max) // _HYBRIDEP_TOKEN_ALIGNMENT) * _HYBRIDEP_TOKEN_ALIGNMENT
+            pin = self.benchmark_static_routing and _STATIC_ROUTING_PAD_PIN
+            if pin and self._static_target_tokens is not None and self._static_target_tokens >= num_tokens:
+                target_tokens = self._static_target_tokens
+            else:
+                group_max = torch.tensor(num_tokens, device=hidden_states.device)
+                torch.distributed.all_reduce(group_max, op=torch.distributed.ReduceOp.MAX, group=self.group)
+                target_tokens = -(-int(group_max) // _HYBRIDEP_TOKEN_ALIGNMENT) * _HYBRIDEP_TOKEN_ALIGNMENT
+                if pin:
+                    self._static_target_tokens = target_tokens
+                    if torch.distributed.get_rank() == 0:
+                        logging.getLogger(__name__).info(
+                            "benchmark_static_routing: HybridEP pad size pinned at %d tokens "
+                            "(per-dispatch EP-group max all-reduce + host sync skipped from now on)",
+                            target_tokens,
+                        )
             pad_tokens = target_tokens - num_tokens
             if pad_tokens > 0:
                 self.num_unpadded_tokens = num_tokens
@@ -538,6 +577,189 @@ class _HybridEPManager(_DispatchManager):
 
     def get_number_of_tokens_per_expert(self) -> torch.Tensor:
         return self.tokens_per_expert
+
+    def initialize_runtime(
+        self,
+        *,
+        num_tokens: int,
+        hidden_dim: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
+        """Initialize HybridEP's dispatch/combine kernels for a capacity without running a model stage.
+
+        HybridEP JIT-compiles dispatch and combine kernels on first use.  Under
+        pipeline parallelism, allowing that work to happen in the real schedule
+        serializes the compile cost across PP stages while earlier stages have
+        outstanding receives.  Exercise the dispatcher directly so independent
+        EP groups initialize concurrently before the PP schedule posts P2P work.
+
+        The synthetic tensors are local to the dispatcher and no model parameter
+        participates in autograd.  Manager fields used by a real dispatch are
+        restored even if initialization fails.
+        """
+        if num_tokens <= 0:
+            raise ValueError(f"num_tokens must be positive, got {num_tokens}")
+        if hidden_dim <= 0:
+            raise ValueError(f"hidden_dim must be positive, got {hidden_dim}")
+        if not dtype.is_floating_point:
+            raise TypeError(f"HybridEP hidden dtype must be floating point, got {dtype}")
+
+        transient_names = (
+            "token_probs",
+            "routing_map",
+            "handle",
+            "pad_multiple",
+            "num_unpadded_tokens",
+            "tokens_per_expert",
+            "dispatched_probs",
+            "num_permuted_tokens",
+            "_static_target_tokens",
+            "_static_num_permuted_tokens",
+        )
+        missing = object()
+        saved = {name: getattr(self, name, missing) for name in transient_names}
+
+        try:
+            # Validation loops commonly run under inference_mode.  HybridEP's
+            # backward kernel variants still need a real autograd graph here.
+            with torch.inference_mode(False), torch.enable_grad():
+                token_ids = torch.arange(num_tokens, device=device).unsqueeze(1)
+                topk_offsets = torch.arange(self.router_topk, device=device).unsqueeze(0)
+                expert_indices = (token_ids * self.router_topk + topk_offsets) % self.num_experts
+                routing_map = torch.zeros((num_tokens, self.num_experts), dtype=torch.bool, device=device)
+                routing_map.scatter_(1, expert_indices, True)
+                token_probs = torch.zeros((num_tokens, self.num_experts), dtype=torch.float32, device=device)
+                token_probs.scatter_(1, expert_indices, 1.0 / self.router_topk)
+                token_probs.requires_grad_()
+                self.setup_metadata(routing_map, token_probs)
+
+                hidden = torch.ones((num_tokens, hidden_dim), dtype=dtype, device=device, requires_grad=True)
+                dispatched = self.dispatch(hidden)
+                dispatched_probs = self.dispatched_probs
+                if dispatched_probs is None or dispatched_probs.numel() != dispatched.shape[0]:
+                    raise RuntimeError(
+                        "HybridEP runtime initialization expected one routing probability per dispatched token"
+                    )
+                prob_shape = (dispatched.shape[0],) + (1,) * (dispatched.ndim - 1)
+                combined = self.combine(dispatched * dispatched_probs.reshape(prob_shape).to(dispatched.dtype))
+                combined.float().sum().backward()
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+        finally:
+            for name, value in saved.items():
+                if value is missing:
+                    if hasattr(self, name):
+                        delattr(self, name)
+                else:
+                    setattr(self, name, value)
+
+
+class HybridEPPipelineRuntimeInitializer:
+    """Prepare HybridEP's process-global buffer before pipeline traffic."""
+
+    def __init__(self, manager: _HybridEPManager, hidden_dim: int, dtype: torch.dtype) -> None:
+        self.manager = manager
+        self.hidden_dim = hidden_dim
+        self.dtype = dtype
+
+    @property
+    def resource_key(self) -> tuple[type["HybridEPPipelineRuntimeInitializer"], str]:
+        """Identify the single HybridEP buffer owned by this process."""
+        return (HybridEPPipelineRuntimeInitializer, "process_global_buffer")
+
+    @property
+    def signature(self) -> tuple[object, ...]:
+        """Return the immutable configuration served by the global buffer."""
+        return (
+            id(self.manager.group),
+            self.hidden_dim,
+            self.dtype,
+            self.manager.num_local_experts,
+            self.manager.num_experts,
+            self.manager.router_topk,
+            self.manager.moe_hybridep_num_sms,
+            self.manager.pad_multiple,
+            int(os.environ.get("NUM_OF_TOKENS_PER_CHUNK_COMBINE_API", "64")),
+        )
+
+    @staticmethod
+    def required_capacity(num_tokens: int) -> int:
+        """Match HybridEP's token-capacity floor and rounding for its JIT key.
+
+        Args:
+            num_tokens: Requested local token count.
+
+        Returns:
+            Normalized token capacity used by HybridEP's compiled runtime.
+        """
+        # HybridEP's Python wrapper first rounds dynamic requests to 16, then
+        # its Configurer floors the buffer at 512 and rounds to the combine
+        # chunk size (64 by default, configurable by the same environment key).
+        aligned_tokens = -(-num_tokens // 16) * 16
+        capacity = max(aligned_tokens, 512)
+        combine_chunk = int(os.environ.get("NUM_OF_TOKENS_PER_CHUNK_COMBINE_API", "64"))
+        return capacity if combine_chunk <= 0 else -(-capacity // combine_chunk) * combine_chunk
+
+    def _resolve_group_capacity(self, *, num_tokens: int, device: torch.device) -> int:
+        """Return the EP-group maximum JIT capacity for this batch."""
+        capacity = self.required_capacity(num_tokens)
+        if not torch.distributed.is_initialized() or torch.distributed.get_world_size(self.manager.group) == 1:
+            return capacity
+
+        group_capacity = torch.tensor(capacity, dtype=torch.int64, device=device)
+        torch.distributed.all_reduce(group_capacity, op=torch.distributed.ReduceOp.MAX, group=self.manager.group)
+        return int(group_capacity.item())
+
+    def prepare(
+        self,
+        *,
+        num_tokens: int,
+        device: torch.device,
+    ) -> None:
+        """Initialize the group capacity when the upcoming pipeline shape grows.
+
+        Args:
+            num_tokens: Maximum number of tokens in the upcoming pipeline microbatch.
+            device: Runtime device used for group capacity exchange and initialization.
+
+        Raises:
+            ValueError: If the token capacity is not positive.
+            RuntimeError: If the process-global resource signature conflicts or initialization fails.
+        """
+        if num_tokens <= 0:
+            raise ValueError(f"HybridEP runtime preparation requires a positive token capacity, got {num_tokens}")
+
+        if device.type == "cuda" and device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
+        active_signature = (*self.signature, device)
+        required_capacity = self._resolve_group_capacity(
+            num_tokens=num_tokens,
+            device=device,
+        )
+        if required_capacity <= get_hybrid_ep_initialized_capacity(active_signature):
+            return
+
+        try:
+            self.manager.initialize_runtime(
+                num_tokens=required_capacity,
+                hidden_dim=self.hidden_dim,
+                dtype=self.dtype,
+                device=device,
+            )
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "HybridEP runtime initialization failed before the requested capacity was initialized."
+            )
+            raise
+        else:
+            publish_hybrid_ep_initialized_capacity(active_signature, required_capacity)
+            logging.getLogger(__name__).info(
+                "Initialized HybridEP runtime before PP schedule (capacity=%d, hidden=%d, dtype=%s).",
+                required_capacity,
+                self.hidden_dim,
+                self.dtype,
+            )
 
 
 @dataclass
@@ -736,6 +958,25 @@ class MoEFlexTokenDispatcher:
                 f"Invalid backend: {backend}. Please set moe_flex_dispatcher_backend='deepep', 'hybridep', or 'uccl_ep'"
             )
 
+    def get_pipeline_runtime_initializers(
+        self,
+        *,
+        hidden_dim: int,
+        dtype: torch.dtype,
+    ) -> tuple[HybridEPPipelineRuntimeInitializer, ...]:
+        """Return model-owned initializers needed before a pipeline step.
+
+        Args:
+            hidden_dim: Hidden dimension dispatched to experts.
+            dtype: Hidden-state data type used by the expert module.
+
+        Returns:
+            A HybridEP initializer for HybridEP dispatchers, otherwise an empty tuple.
+        """
+        if not isinstance(self._comm_manager, _HybridEPManager):
+            return ()
+        return (HybridEPPipelineRuntimeInitializer(self._comm_manager, hidden_dim, dtype),)
+
     def _initialize_metadata(self, num_local_tokens: int, probs: torch.Tensor) -> torch.Tensor:
         """
         Initialize the routing map and probs to a unified format covering the TPxEP group.
@@ -757,12 +998,22 @@ class MoEFlexTokenDispatcher:
         token_probs: torch.Tensor,
         token_indices: torch.Tensor,
     ):
-        """Prepare ``hidden_states[..., H]`` and routing metadata for dispatch.
+        """Prepare hidden states and routing metadata for dispatch.
 
         DeepEP consumes ``token_indices[T, K]`` and ``token_probs[T, K]`` directly. HybridEP
         uses its established dense routing map by default. Compact routing can be enabled to
         keep top-k indices for metadata communication while expanding probabilities to ``[T, E]``
         so the existing dense router-gradient layout is preserved.
+
+        Args:
+            hidden_states: Hidden states with shape [..., hidden].
+            num_local_tokens: Number of tokens before expert-parallel dispatch.
+            token_probs: Top-k routing probabilities with shape [tokens, top_k].
+            token_indices: Expert indices with shape [tokens, top_k].
+
+        Returns:
+            Flattened hidden states with shape [tokens, hidden] and routing probabilities with
+            shape [tokens, top_k] for DeepEP or [tokens, experts] for HybridEP.
         """
         self.hidden_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_shape[-1])

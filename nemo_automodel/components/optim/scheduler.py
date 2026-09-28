@@ -304,6 +304,11 @@ class OptimizerParamScheduler:
         """
         Load the state dict.
 
+        Every restored field is applied before the final :meth:`step` call, so the
+        learning rate and weight decay written into ``optimizer.param_groups`` both
+        reflect the checkpoint's schedule rather than the constructor's.  The step
+        count is treated as absolute, so loading is idempotent.
+
         Args:
             state_dict (dict): state dict to be load
         """
@@ -337,12 +342,6 @@ class OptimizerParamScheduler:
             lr_decay_style_ = state_dict["lr_decay_style"]
         self.lr_decay_style = self._check_and_set(self.lr_decay_style, lr_decay_style_, "learning rate decay style")
 
-        if "num_iters" in state_dict:
-            num_steps = state_dict["num_iters"]
-        else:
-            num_steps = state_dict["num_steps"]
-        self.step(increment=num_steps)
-
         if "start_wd" in state_dict:
             self.start_wd = self._check_and_set(self.start_wd, state_dict["start_wd"], "start weight decay")
             self.end_wd = self._check_and_set(self.end_wd, state_dict["end_wd"], "end weight decay")
@@ -354,3 +353,13 @@ class OptimizerParamScheduler:
             self.wd_incr_style = self._check_and_set(
                 self.wd_incr_style, state_dict["wd_incr_style"], "weight decay incr style"
             )
+
+        if "num_iters" in state_dict:
+            num_steps = state_dict["num_iters"]
+        else:
+            num_steps = state_dict["num_steps"]
+        # ``step`` writes the resolved LR and weight decay into the optimizer, so it runs
+        # last, once every restored field is in place.  ``num_steps`` is an absolute count,
+        # so replay it from zero instead of folding it into whatever has been counted here.
+        self.num_steps = 0
+        self.step(increment=num_steps)

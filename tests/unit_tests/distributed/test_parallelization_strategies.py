@@ -350,6 +350,50 @@ class TestDefaultParallelizationStrategy:
         mock_distributed_env["apply_fsdp"].assert_called_once()
         mock_distributed_env["fully_shard"].assert_called()
 
+    def test_fsdp_sharding_hook_forwards_the_positional_contract(
+        self, strategy, mock_device_mesh, mock_distributed_env, monkeypatch
+    ):
+        """``_apply_fsdp_sharding`` hands ``apply_fsdp2_sharding_recursively`` its exact argument shape.
+
+        Subclasses override the hook with the same signature, so a reordered positional
+        argument here would silently misconfigure every strategy that does not.
+        """
+        mesh, _, _, _ = mock_device_mesh
+        dp_mesh = MagicMock()
+        monkeypatch.setattr(
+            "nemo_automodel.components.distributed.parallelizer.get_fsdp_dp_mesh",
+            lambda *_args, **_kwargs: dp_mesh,
+        )
+        model = MockModel()
+        mp_policy = MagicMock()
+        offload_policy = MagicMock()
+
+        strategy.parallelize(
+            model=model,
+            device_mesh=mesh,
+            mp_policy=mp_policy,
+            offload_policy=offload_policy,
+            enable_fsdp2_prefetch=False,
+            fsdp2_backward_prefetch_depth=5,
+            fsdp2_forward_prefetch_depth=4,
+            reshard_after_forward=True,
+        )
+
+        mock_distributed_env["apply_fsdp"].assert_called_once_with(
+            model,
+            dp_mesh,
+            mp_policy,
+            offload_policy,
+            False,
+            5,
+            4,
+            True,
+            fully_shard_fn=mock_distributed_env["fully_shard"],
+            frozen_multimodal_sharding="root",
+            ignored_multimodal_params=set(),
+        )
+        assert mock_distributed_env["apply_fsdp"].call_args.args[1] is dp_mesh
+
     @pytest.mark.parametrize(
         ("reshard_after_forward", "expected_input_reshard", "expected_output_reshard"),
         [(None, True, False), (True, True, False), (False, False, False)],
@@ -918,6 +962,16 @@ class TestNemotronHParallelizationStrategy:
         assert mock_checkpoint.call_count == expected_checkpoint_calls
 
 
+class _MockQwen35Model(nn.Module):
+    """Minimal Qwen3.5-shaped model: a decoder ``layers`` list under ``model``."""
+
+    def __init__(self):
+        super().__init__()
+        self.config = SimpleNamespace(num_attention_heads=8, num_key_value_heads=8, hidden_size=64)
+        self.model = nn.Module()
+        self.model.layers = nn.ModuleList([nn.Linear(10, 10), nn.Linear(10, 10)])
+
+
 class TestQwen3_5ParallelizationStrategy:
     """Test the Qwen3.5 dtype-based FSDP strategy."""
 
@@ -984,6 +1038,56 @@ class TestQwen3_5ParallelizationStrategy:
             assert root_kwargs["ignored_params"] == frozen_vision_params
         else:
             assert "ignored_params" not in root_kwargs
+
+    @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
+    @patch("nemo_automodel.components.distributed.parallelizer_utils.fully_shard_by_dtype")
+    def test_dtype_sharding_does_not_mutate_module_globals(
+        self,
+        fully_shard_by_dtype,
+        fully_shard,
+        strategy,
+        mock_device_mesh,
+    ):
+        """Qwen3.5 overrides sharding through a subclass hook, not the module global.
+
+        The override used to be installed by rebinding
+        ``parallelizer.apply_fsdp2_sharding_recursively`` for the duration of the call,
+        which any concurrent or nested parallelize of another model would have picked
+        up. Assert the global is untouched *while* Qwen3.5 shards, not just after.
+        """
+        mesh, _, _, _ = mock_device_mesh
+        default_walk = parallelizer_mod.apply_fsdp2_sharding_recursively
+        observed = []
+
+        def record(module, *args, **kwargs):
+            observed.append(parallelizer_mod.apply_fsdp2_sharding_recursively)
+            return module
+
+        fully_shard.side_effect = lambda model, **kwargs: model
+        fully_shard_by_dtype.side_effect = record
+
+        strategy.parallelize(model=_MockQwen35Model(), device_mesh=mesh)
+
+        assert observed, "expected the dtype-aware sharder to run"
+        assert all(fn is default_walk for fn in observed)
+        assert parallelizer_mod.apply_fsdp2_sharding_recursively is default_walk
+
+    @patch("nemo_automodel.components.distributed.parallelizer_utils.fully_shard_by_dtype")
+    def test_dtype_walk_honors_fully_shard_fn(self, fully_shard_by_dtype, strategy, mock_device_mesh):
+        """A model-specific ``fully_shard_fn`` reaches every unit: decoder layers and the root."""
+        mesh, _, _, _ = mock_device_mesh
+        model = _MockQwen35Model()
+        custom_fully_shard = MagicMock(side_effect=lambda module, **_kwargs: module)
+        fully_shard_by_dtype.side_effect = lambda module, *_args, **_kwargs: module
+
+        result = strategy.parallelize(model=model, device_mesh=mesh, fully_shard_fn=custom_fully_shard)
+
+        assert result is model
+        layer_calls = fully_shard_by_dtype.call_args_list
+        assert [call.args[0] for call in layer_calls] == list(model.model.layers)
+        assert all(call.kwargs["fully_shard_fn"] is custom_fully_shard for call in layer_calls)
+        # The root unit is wrapped by the same primitive, not by torch's fully_shard.
+        assert custom_fully_shard.call_args_list[-1].args[0] is model
 
 
 class TestStrategyRegistry:

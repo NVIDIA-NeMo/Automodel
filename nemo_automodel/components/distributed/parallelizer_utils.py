@@ -25,6 +25,7 @@ from torch.distributed.fsdp import (
     fully_shard,
 )
 
+from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 from nemo_automodel.shared.torch_patches import (
     patch_fsdp_uniform_reduce_dtype as _patch_fsdp_uniform_reduce_dtype,
 )
@@ -321,6 +322,7 @@ def _make_compute_dtype_fn(
     pinned_ids: Set[int] = set()
     if fp32_compute_module_names:
         for name, tensor in (*module.named_parameters(), *module.named_buffers()):
+            name = canonical_parameter_fqn(name)
             if id(tensor) not in ignored_param_ids and any(token in name for token in fp32_compute_module_names):
                 pinned_ids.add(id(tensor))
 

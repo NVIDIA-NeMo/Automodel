@@ -638,6 +638,99 @@ class TestNemotronHForCausalLM:
         assert hasattr(model, "generation_config")
         assert isinstance(model.generation_config, GenerationConfig)
 
+    def test_causal_lm_generation_config_takes_stop_tokens_from_config(self, config, backend):
+        """Seeded from the model config like PreTrainedModel, not a bare GenerationConfig()."""
+        from transformers import PretrainedConfig
+
+        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+
+        hf_config = PretrainedConfig(is_encoder_decoder=False, bos_token_id=3, eos_token_id=1, pad_token_id=0)
+        for attr, val in vars(config).items():
+            setattr(hf_config, attr, val)
+
+        model = NemotronHForCausalLM(hf_config, backend=backend)
+
+        assert model.generation_config.bos_token_id == 3
+        assert model.generation_config.eos_token_id == 1
+        assert model.generation_config.pad_token_id == 0
+
+    @staticmethod
+    def _tiny_nemotron_h_config():
+        """A real NemotronHConfig small enough to build on CPU (one Mamba and one MLP layer)."""
+        from transformers.models.nemotron_h.configuration_nemotron_h import NemotronHConfig
+
+        return NemotronHConfig(
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            hybrid_override_pattern="M-",
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            mamba_num_heads=2,
+            mamba_head_dim=8,
+            ssm_state_size=8,
+            conv_kernel=4,
+            n_groups=1,
+            bos_token_id=1,
+            eos_token_id=2,
+            pad_token_id=0,
+            tie_word_embeddings=False,
+        )
+
+    def test_causal_lm_from_pretrained_restores_and_exports_checkpoint_generation_config(self, backend, tmp_path):
+        """The checkpoint's generation_config.json survives the load and the consolidated export.
+
+        Hub Nemotron-3 checkpoints list their extra stop token and sampling defaults
+        only there. Exporting a blank generation_config.json instead used to leave
+        the exported model with no stop token, since that file beats config.json
+        on reload.
+        """
+        from transformers import GenerationConfig
+
+        from nemo_automodel.components.checkpoint.addons import _save_generated_hf_assets
+        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+
+        checkpoint_dir = tmp_path / "checkpoint"
+        self._tiny_nemotron_h_config().save_pretrained(checkpoint_dir)
+        GenerationConfig(
+            bos_token_id=1, eos_token_id=[2, 11], pad_token_id=0, do_sample=True, temperature=0.7
+        ).save_pretrained(checkpoint_dir)
+
+        model = NemotronHForCausalLM.from_pretrained(str(checkpoint_dir), backend=backend)
+
+        assert model.generation_config.eos_token_id == [2, 11]
+        assert model.generation_config.do_sample is True
+        assert model.generation_config.temperature == 0.7
+
+        export_dir = tmp_path / "export"
+        export_dir.mkdir()
+        _save_generated_hf_assets(model, None, str(export_dir), tokenizer=None, v4_compatible=False)
+        exported = GenerationConfig.from_pretrained(export_dir)
+
+        assert exported.eos_token_id == [2, 11]
+        assert exported.do_sample is True
+
+    def test_causal_lm_from_pretrained_without_generation_file_keeps_config_stop_tokens(self, backend, tmp_path):
+        """With no generation_config.json in the checkpoint, the export still carries config.json's eos."""
+        from transformers import GenerationConfig
+
+        from nemo_automodel.components.checkpoint.addons import _save_generated_hf_assets
+        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+
+        checkpoint_dir = tmp_path / "checkpoint"
+        self._tiny_nemotron_h_config().save_pretrained(checkpoint_dir)
+
+        model = NemotronHForCausalLM.from_pretrained(str(checkpoint_dir), backend=backend)
+
+        assert model.generation_config.eos_token_id == 2
+
+        export_dir = tmp_path / "export"
+        export_dir.mkdir()
+        _save_generated_hf_assets(model, None, str(export_dir), tokenizer=None, v4_compatible=False)
+
+        assert GenerationConfig.from_pretrained(export_dir).eos_token_id == 2
+
     def test_causal_lm_forward_returns_causal_lm_output(self, config, backend):
         """Test that forward returns CausalLMOutputWithPast."""
         from transformers.modeling_outputs import CausalLMOutputWithPast
