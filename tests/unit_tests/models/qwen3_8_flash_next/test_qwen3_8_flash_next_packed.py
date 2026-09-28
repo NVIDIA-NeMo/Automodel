@@ -544,7 +544,7 @@ def test_packed_boundaries_from_seq_lens_matches_loader_contract() -> None:
         packed_boundaries_from_seq_lens(torch.tensor([5, 7]), total_tokens=10)
 
 
-@pytest.mark.parametrize("attn_backend", ["flex", "cute"])
+@pytest.mark.parametrize("attn_backend", ["flex", "fa4"])
 def test_model_advertises_packed_cp_for_sparse_backends(attn_backend: str) -> None:
     """The recipe capability gates admit both route-indexed CUDA backends."""
     from types import SimpleNamespace
@@ -554,7 +554,7 @@ def test_model_advertises_packed_cp_for_sparse_backends(attn_backend: str) -> No
         Qwen3_8_FlashNextForConditionalGeneration,
     )
 
-    assert Qwen3_8_FlashNextForConditionalGeneration._packed_cp_attn_backends == ("flex", "cute")
+    assert Qwen3_8_FlashNextForConditionalGeneration._packed_cp_attn_backends == ("flex", "fa4")
 
     class _FakeModel:
         __class__ = Qwen3_8_FlashNextForConditionalGeneration

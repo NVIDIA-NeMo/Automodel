@@ -434,7 +434,7 @@ class KimiMLAAttention(nn.Module):
             )
         self.attn_module = None
         self.attn_func = None
-        if backend.attn != "eager":
+        if backend.attn not in ("eager", "fa4"):
             if backend.attn not in ("te", "sdpa"):
                 raise ValueError(f"Kimi K3 MLA does not support backend.attn={backend.attn!r}.")
             attention_kwargs = {"attention_dropout": self.attention_dropout} if backend.attn == "te" else {}
@@ -450,7 +450,9 @@ class KimiMLAAttention(nn.Module):
                 **attention_kwargs,
             )
         self._cp_mesh = None
-        self.use_fa4 = getattr(config, "mla_attn_backend", "default") == "fa4"
+        # backend.attn="fa4" runs MLA through FlashAttention 4 on both the CP and non-CP paths (kimi_k3/fa4_mla.py);
+        # the other backends keep FlexAttention under context parallelism.
+        self.use_fa4 = backend.attn == "fa4"
 
     def setup_cp_attention(self, cp_mesh) -> None:
         """Attach the context-parallel mesh used to gather full-sequence keys and values.
@@ -611,8 +613,8 @@ class KimiMLAAttention(nn.Module):
         Queries stay local while the compressed KV latent -- ``kv_lora_rank +
         qk_rope_head_dim`` values per token, far smaller than the expanded per-head
         keys and values -- is all-gathered across the context-parallel group and
-        expanded locally. Attention then runs as FlexAttention (or FA4, see
-        ``mla_attn_backend``) with a causal, per-document mask over the full sequence.
+        expanded locally. Attention then runs as FlexAttention (or FA4 with
+        ``backend.attn="fa4"``) with a causal, per-document mask over the full sequence.
 
         Args:
             hidden_states: Tensor of shape [batch, local_sequence, hidden].

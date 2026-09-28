@@ -46,11 +46,17 @@ def _small_config(**kwargs) -> KimiK3TextConfig:
     )
 
 
-def test_mla_attn_backend_defaults_and_rejects_unknown():
-    assert _small_config().mla_attn_backend == "default"
-    assert _small_config(mla_attn_backend="fa4").mla_attn_backend == "fa4"
-    with pytest.raises(ValueError, match="mla_attn_backend"):
-        _small_config(mla_attn_backend="flex")
+@pytest.mark.parametrize(("attn", "use_fa4"), [("eager", False), ("fa4", True)])
+def test_backend_attn_selects_fa4(attn, use_fa4):
+    module = kimi_model.KimiMLAAttention(_small_config(), 3, BackendConfig(attn=attn, linear="torch"))
+    assert module.use_fa4 is use_fa4
+    # FA4 is called directly; no TE/SDPA attention module is built for it.
+    assert module.attn_module is None
+
+
+def test_backend_attn_rejects_unsupported():
+    with pytest.raises(ValueError, match="does not support backend.attn"):
+        kimi_model.KimiMLAAttention(_small_config(), 3, BackendConfig(attn="flex", linear="torch"))
 
 
 def test_varlen_segments_split_documents_at_the_local_shard():
@@ -83,23 +89,21 @@ def _fake_attention(calls, name):
     return attention
 
 
-@pytest.mark.parametrize("backend", ["default", "fa4"])
-def test_cp_forward_dispatches_on_mla_attn_backend(monkeypatch, backend):
+@pytest.mark.parametrize("attn", ["eager", "fa4"])
+def test_cp_forward_dispatches_on_backend_attn(monkeypatch, attn):
     calls = []
     monkeypatch.setattr(kimi_model, "all_gather_sequence", lambda tensor, group, dim: torch.cat([tensor] * 2, dim))
     monkeypatch.setattr(kimi_model, "document_causal_flex_attention", _fake_attention(calls, "flex"))
     monkeypatch.setattr(kimi_model, "document_causal_fa4_attention", _fake_attention(calls, "fa4"))
 
-    module = kimi_model.KimiMLAAttention(
-        _small_config(mla_attn_backend=backend), 3, BackendConfig(attn="eager", linear="torch")
-    )
+    module = kimi_model.KimiMLAAttention(_small_config(), 3, BackendConfig(attn=attn, linear="torch"))
     module.setup_cp_attention(_FakeCPMesh())
     hidden_states = torch.randn(1, 4, 64)
     doc_ids = torch.ones(1, 8, dtype=torch.int32)
     output = module(hidden_states, packed_context=KimiPackedContext(doc_ids, seq_start=4, cp_size=2))
 
     assert output.shape == hidden_states.shape
-    assert calls == [("flex" if backend == "default" else "fa4", (1, 4), 4)]
+    assert calls == [("flex" if attn == "eager" else "fa4", (1, 4), 4)]
 
 
 @pytest.mark.parametrize(("packed", "expected"), [(False, ("causal", None, None)), (True, ("fa4", (1, 8), 0))])
@@ -108,9 +112,7 @@ def test_non_cp_forward_uses_fa4(monkeypatch, packed, expected):
     monkeypatch.setattr(kimi_model, "causal_fa4_attention", _fake_attention(calls, "causal"))
     monkeypatch.setattr(kimi_model, "document_causal_fa4_attention", _fake_attention(calls, "fa4"))
 
-    module = kimi_model.KimiMLAAttention(
-        _small_config(mla_attn_backend="fa4"), 3, BackendConfig(attn="eager", linear="torch")
-    )
+    module = kimi_model.KimiMLAAttention(_small_config(), 3, BackendConfig(attn="fa4", linear="torch"))
     hidden_states = torch.randn(1, 8, 64)
     doc_ids = torch.tensor([[1, 1, 1, 2, 2, 2, 0, 0]], dtype=torch.int32)
     packed_context = KimiPackedContext(doc_ids) if packed else None

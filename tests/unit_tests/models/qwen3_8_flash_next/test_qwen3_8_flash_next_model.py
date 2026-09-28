@@ -19,7 +19,6 @@ import torch
 
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.qwen3_8_flash_next.backend import Qwen3_8_FlashNextBackendConfig
 from nemo_automodel.components.models.qwen3_8_flash_next.config import (
     Qwen3_8_FlashNextConfig,
     Qwen3_8_FlashNextTextConfig,
@@ -114,12 +113,12 @@ def test_multimodal_configuration_fails_closed() -> None:
         )
 
 
-@pytest.mark.parametrize("backend_source", ["shared", "cute_yaml", "cute_typed"])
+@pytest.mark.parametrize("backend_source", ["shared", "fa4_yaml", "fa4_typed"])
 def test_tiny_qwen3_8_flash_next_forward_backward_and_state_layout(backend_source: str) -> None:
     config = _tiny_config()
     settings = dict(
         linear="torch",
-        attn="sdpa" if backend_source == "shared" else "cute",
+        attn="sdpa" if backend_source == "shared" else "fa4",
         rms_norm="torch",
         experts="torch",
         dispatcher="torch",
@@ -127,18 +126,18 @@ def test_tiny_qwen3_8_flash_next_forward_backward_and_state_layout(backend_sourc
     )
     if backend_source == "shared":
         backend = BackendConfig(**settings)
-    elif backend_source == "cute_yaml":
+    elif backend_source == "fa4_yaml":
         backend = ConfigNode(
             {
-                "_target_": "nemo_automodel.components.models.qwen3_8_flash_next.backend.Qwen3_8_FlashNextBackendConfig",
+                "_target_": "nemo_automodel.components.models.common.BackendConfig",
                 **settings,
             }
         ).instantiate()
     else:
-        backend = Qwen3_8_FlashNextBackendConfig(**settings)
+        backend = BackendConfig(**settings)
     if backend_source != "shared":
-        assert isinstance(backend, Qwen3_8_FlashNextBackendConfig)
-        assert backend.attn == "cute"
+        assert isinstance(backend, BackendConfig)
+        assert backend.attn == "fa4"
     model = Qwen3_8_FlashNextForConditionalGeneration.from_config(
         config,
         moe_config=_tiny_moe_config(config.text_config),

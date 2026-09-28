@@ -14,7 +14,7 @@
 
 """FlashAttention 4 varlen attention for Kimi K3 MLA, with and without context parallelism.
 
-Selected with ``KimiK3TextConfig.mla_attn_backend = "fa4"``. Document-causal attention of a contiguous query
+Selected with ``BackendConfig.attn = "fa4"``. Document-causal attention of a contiguous query
 shard against the global keys is expressed as FA4 varlen segments, so no mask is materialized or evaluated per
 element and MLA's native 192/128 QK/V head dims run without padding:
 
@@ -46,7 +46,7 @@ def _load_fa4() -> tuple[Callable, Callable]:
     """Import FA4 entry points once; raise a clear error if they are unavailable."""
     available, interface = safe_import("flash_attn.cute.interface")
     if not available:
-        raise ImportError("mla_attn_backend='fa4' requires FlashAttention 4 (flash_attn.cute) and nvidia-cutlass-dsl.")
+        raise ImportError("backend.attn='fa4' requires FlashAttention 4 (flash_attn.cute) and nvidia-cutlass-dsl.")
     return interface.flash_attn_func, interface.flash_attn_varlen_func
 
 

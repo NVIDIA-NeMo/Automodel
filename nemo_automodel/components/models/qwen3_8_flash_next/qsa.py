@@ -449,7 +449,7 @@ def qsa_gqa_attention(
         value: Tensor with key's layout. Q/K/V share one dtype and device.
         selected_token_ids: Signed IDs [batch, local_queries, routes] in global
             K/V coordinates; invalid CUDA IDs are padding and duplicates collapse.
-        backend: CUDA backend, "flex" or "cute". FA4 requires SM90 BF16 D256.
+        backend: CUDA backend, "flex" or "fa4". FA4 requires SM90 BF16 D256.
         softmax_scale: Optional positive QK score multiplier.
 
     Returns:
@@ -464,11 +464,11 @@ def qsa_gqa_attention(
             selected_token_ids,
             softmax_scale=softmax_scale,
         )
-    if backend == "cute":
+    if backend == "fa4":
         return fa4_sparse_gqa_attention(query, key, value, selected_token_ids, softmax_scale=softmax_scale)
     if backend != "flex":
         raise RuntimeError(
-            f"Qwen3.8-Flash-Next CUDA QSA requires backend.attn='flex' or 'cute', got {backend!r}; "
+            f"Qwen3.8-Flash-Next CUDA QSA requires backend.attn='flex' or 'fa4', got {backend!r}; "
             "call gathered_qsa_gqa_attention directly for a numerical oracle"
         )
     if any(tensor.dtype != torch.bfloat16 for tensor in (query, key, value)):
