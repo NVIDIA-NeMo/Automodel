@@ -56,6 +56,13 @@ def test_super35_vl_benchmark_waits_for_public_checkpoint():
     assert generate_job(config, {}, "performance", "llm_benchmark", ".") == []
 
 
+def test_qwen35_moe_lora_benchmark_disables_mtp():
+    config = Path("examples/llm_benchmark/qwen/qwen3.5_moe_te_deepep_lora.yaml")
+    recipe = YAML(typ="safe").load(config)
+
+    assert recipe["model"]["num_nextn_predict_layers"] == 0
+
+
 def test_example_checkpoint_robustness_configs_do_not_use_removed_fields():
     removed_keys = {
         "automodel_reload_cosine_threshold",
