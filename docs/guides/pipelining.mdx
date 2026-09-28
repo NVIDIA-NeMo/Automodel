@@ -143,7 +143,7 @@ wide stage inputs those buffers can exceed the activations themselves — Kimi-K
 2k-token rows with 64 microbatches needs ~52 GiB of them on middle stages.
 
 Under the 1F1B schedule only `num_stages - stage_index` microbatches are ever in
-flight on a stage, so `pp_recv_buffer_pool: true` rebinds the per-microbatch
+flight on a stage, so AutoModel automatically rebinds the per-microbatch
 receive slots onto a ring of `(num_stages - stage_index) + pp_recv_buffer_pool_slack`
 real buffer sets (default slack 2). The values flowing through the schedule are
 unchanged; only which buffer object receives each chunk differs.
@@ -152,14 +152,14 @@ unchanged; only which buffer object receives each chunk differs.
 distributed:
   pipeline:
     pp_schedule: 1f1b
-    pp_recv_buffer_pool: true        # default false
-    pp_recv_buffer_pool_slack: 2     # extra buffer sets beyond the in-flight depth
+    pp_recv_buffer_pool: false       # optional: disable pooling
 ```
 
-The option applies only to schedules with a bounded in-flight depth (currently
-`1f1b`); other schedules keep the stock allocation with a warning. If the installed
+Pooling applies only to schedules with a bounded in-flight depth (currently
+`1f1b`); other schedules keep the stock allocation. If the installed
 torch exposes neither of the two known `PipelineStage` layouts, the pool is not
-installed and stock behavior is kept (logged at install time).
+installed and stock behavior is kept (logged at install time). The default
+`pp_recv_buffer_pool_slack` is 2 extra buffer sets beyond the in-flight depth.
 
 ### Model Patching Flags
 
