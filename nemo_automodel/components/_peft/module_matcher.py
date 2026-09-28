@@ -33,9 +33,20 @@ def _is_linear_module(module):
 
 @lru_cache(maxsize=1000)
 def _compile_wildcard_pattern(pattern):
-    pattern = re.sub(r"(?<!\.)\*", r".*", pattern)  # replace [^\.]* with `.*` ie insert "." before "*"
-    pattern = re.sub(r"\.\*", "(.*)", pattern)  # replace .* -> (.*)
-    return re.compile("^" + pattern + "$")
+    # "*" and ".*" are both wildcards. A ".*" right after a complete dotted segment (text that starts the
+    # pattern or begins with ".") keeps its dot as a separator, matching that segment's children or nothing,
+    # so "*.layers.1.*" does not also match "layers.10". After a bare fragment, as in ".*fc.*", it still
+    # matches any text.
+    parts = re.split(r"(\.?\*)", pattern)
+    regex = ""
+    for i, part in enumerate(parts):
+        if i % 2 == 0:
+            regex += part
+        elif part == ".*" and (parts[i - 1].startswith(".") or (i == 1 and parts[0])):
+            regex += r"(\..*)?"
+        else:
+            regex += "(.*)"
+    return re.compile("^" + regex + "$")
 
 
 def wildcard_match(pattern, key):
