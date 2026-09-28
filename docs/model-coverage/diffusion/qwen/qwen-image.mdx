@@ -1,20 +1,20 @@
 ---
 title: "Qwen-Image"
-description: "Train Qwen-Image and Qwen-Image-2.1 text-to-image and Qwen-Image-Edit-2511 image-editing models."
-slug: model-coverage/diffusion/qwen/qwen-image
+description: "Train Qwen-Image and Qwen-Image-2.1 text-to-image and Qwen-Image-Edit-2511 image-editing checkpoints with NeMo AutoModel using checked-in flow-matching and generation recipes."
+slug: model-coverage/diffusion/qwen/Qwen-Image
 ---
 
 [Qwen-Image](https://huggingface.co/Qwen/Qwen-Image) is Alibaba Cloud's flow-matching image model. NeMo AutoModel supports Qwen-Image and [Qwen-Image-2.1](https://huggingface.co/Qwen/Qwen-Image-2.1) text-to-image training and cached, full-parameter training of [Qwen-Image-Edit-2511](https://huggingface.co/Qwen/Qwen-Image-Edit-2511).
 
-<Info>
+## Model Reference
 
-| | |
+### Model Architecture
+
+| Property | Value |
 |---|---|
 | **Tasks** | Text-to-Image, Instruction-Based Image Editing |
 | **Architecture** | Diffusion Transformer (Flow Matching) |
 | **HF Org** | [Qwen](https://huggingface.co/Qwen) |
-
-</Info>
 
 ## Available Models
 
@@ -76,7 +76,7 @@ The validation protocol uses [`osunlp/MagicBrush`](https://huggingface.co/datase
 
 The generic exporter maps dataset columns to ordered editing roles. Mapping `source_img` to both `context` and `condition` writes the image only once while retaining both role entries. The dataset's mask is retained in source-manifest metadata for future masked-edit adapters.
 
-Create the 64-example correctness cache with aspect-ratio-preserving processing limited to approximately 1024² total pixels:
+Create the 64-example correctness cache with aspect-ratio-preserving processing limited to approximately 1024^2 total pixels:
 
 ```bash
 uv run python -m tools.diffusion.preprocessing_multiprocess image-edit \
