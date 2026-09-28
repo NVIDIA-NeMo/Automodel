@@ -23,11 +23,21 @@ def _target_metrics(
     target: str,
     *,
     enable_ttt_updates: bool,
-) -> dict[str, float | int]:
+) -> dict[str, Any]:
     tokenizer = generator.tokenizer
     prompt_ids = tokenizer(prompt, return_tensors="pt", add_special_tokens=True).input_ids.to(generator.device)
-    target_ids = tokenizer(target, return_tensors="pt", add_special_tokens=False).input_ids.to(generator.device)
-    input_ids = torch.cat((prompt_ids, target_ids), dim=1)
+    response_text = " " + target
+    input_ids = tokenizer(prompt + response_text, return_tensors="pt", add_special_tokens=True).input_ids.to(
+        generator.device
+    )
+    prefix_ok = torch.equal(input_ids[:, : prompt_ids.shape[1]], prompt_ids)
+    if prefix_ok:
+        target_ids = input_ids[:, prompt_ids.shape[1] :]
+    else:
+        target_ids = tokenizer(response_text, return_tensors="pt", add_special_tokens=False).input_ids.to(
+            generator.device
+        )
+        input_ids = torch.cat((prompt_ids, target_ids), dim=1)
     with torch.no_grad():
         logits = generator.model(input_ids, enable_ttt_updates=enable_ttt_updates).logits.float()
         prompt_last_logits = generator.model(
@@ -52,6 +62,7 @@ def _target_metrics(
         "target_nll": float(losses.mean().item()),
         "target_perplexity": float(math.exp(min(losses.mean().item(), 30.0))),
         "target_token_accuracy": float((predictions == target_ids).float().mean().item()),
+        "tokenization_prefix_ok": prefix_ok,
         "first_target_rank": first_rank,
         "first_target_token_id": int(first_target.item()),
         "first_target_token_text": tokenizer.decode(first_target),
