@@ -63,6 +63,17 @@ def test_qwen35_moe_lora_benchmark_disables_mtp():
     assert recipe["model"]["num_nextn_predict_layers"] == 0
 
 
+def test_nemotron_super_v3_lora_uses_lbs4_on_eight_nodes():
+    config = Path("examples/llm_benchmark/nemotron/nemotron_super_v3_lora.yaml")
+    recipe = YAML(typ="safe").load(config)
+
+    assert recipe["ci"]["nodes"] == 8
+    assert recipe["distributed"]["ep_size"] == 64
+    assert recipe["model"]["backend"]["dispatcher"] == "hybridep"
+    assert recipe["step_scheduler"]["global_batch_size"] == 512
+    assert recipe["step_scheduler"]["local_batch_size"] == 4
+
+
 def test_example_checkpoint_robustness_configs_do_not_use_removed_fields():
     removed_keys = {
         "automodel_reload_cosine_threshold",
