@@ -155,22 +155,50 @@ def main() -> None:
                 break
     if len(samples) != args.samples:
         raise ValueError(f"requested {args.samples} samples, found {len(samples)}")
-    records = [
-        probe_sample(
+    records = []
+    for sample_index, sample in enumerate(samples):
+        record = probe_sample(
             generator,
             sample,
             enable_ttt_updates=not args.disable_ttt_updates,
             max_new_tokens=args.max_new_tokens,
         )
-        for sample in samples
-    ]
+        shuffled_answer = str(samples[(sample_index + 1) % len(samples)]["outputs"][0])
+        shuffled_metrics = _target_metrics(
+            generator,
+            str(sample["input"]) + str(sample.get("answer_prefix", "")),
+            shuffled_answer,
+            enable_ttt_updates=not args.disable_ttt_updates,
+        )
+        record.update(
+            {
+                "shuffled_answer": shuffled_answer,
+                "shuffled_answer_nll": shuffled_metrics["answer_nll"],
+                "shuffled_answer_token_accuracy": shuffled_metrics["answer_token_accuracy"],
+                "shuffled_first_answer_rank": shuffled_metrics["first_answer_rank"],
+            }
+        )
+        records.append(record)
     aggregate = {
         "checkpoint": str(args.checkpoint),
         "samples": len(records),
         "prefixed_exact_accuracy": sum(record["prefixed_exact_contains"] for record in records) / len(records),
         "mean_answer_nll": sum(record["answer_nll"] for record in records) / len(records),
+        "mean_shuffled_answer_nll": sum(record["shuffled_answer_nll"] for record in records) / len(records),
+        "matched_vs_shuffled_nll_gain": sum(
+            record["shuffled_answer_nll"] - record["answer_nll"] for record in records
+        )
+        / len(records),
         "mean_answer_token_accuracy": sum(record["answer_token_accuracy"] for record in records) / len(records),
+        "mean_shuffled_answer_token_accuracy": sum(
+            record["shuffled_answer_token_accuracy"] for record in records
+        )
+        / len(records),
         "mean_first_answer_rank": sum(record["first_answer_rank"] for record in records) / len(records),
+        "mean_shuffled_first_answer_rank": sum(
+            record["shuffled_first_answer_rank"] for record in records
+        )
+        / len(records),
         "records": records,
     }
     args.output_json.parent.mkdir(parents=True, exist_ok=True)
