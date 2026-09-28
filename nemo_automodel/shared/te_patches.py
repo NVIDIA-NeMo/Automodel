@@ -123,9 +123,12 @@ def _apply_fused_adam_empty_shard_patch() -> None:
     parameter/state columns at the Python/native boundary so state_dict keys,
     parameter groups, and the update for every nonempty shard stay intact.
     """
-    from nemo_automodel.shared.import_utils import safe_import
+    from nemo_automodel.shared.import_utils import safe_import, safe_import_te
 
-    available, fused_adam = safe_import("transformer_engine.pytorch.optimizers.fused_adam")
+    have_te, _ = safe_import_te()
+    available, fused_adam = (
+        safe_import("transformer_engine.pytorch.optimizers.fused_adam") if have_te else (False, None)
+    )
     if not available:
         _logger.debug("Skipping FusedAdam empty-shard patch: Transformer Engine is unavailable")
         return

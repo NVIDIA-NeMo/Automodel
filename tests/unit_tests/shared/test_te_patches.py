@@ -158,6 +158,35 @@ class TestFusedAdamEmptyShardPatch:
         original.assert_not_called()
 
 
+@pytest.mark.parametrize("error_type", ["FileNotFoundError", "OSError", "ImportError"])
+def test_apply_te_patches_tolerates_missing_native_extension(tmp_path, monkeypatch, error_type):
+    """A successful top-level TE import does not guarantee its torch extension loads."""
+    import importlib
+    import sys
+
+    package = tmp_path / "transformer_engine"
+    (package / "pytorch").mkdir(parents=True)
+    (package / "__init__.py").write_text(
+        'import warnings\nwarnings.warn("PyTorch extension is unavailable", UserWarning)\n'
+    )
+    (package / "pytorch" / "__init__.py").write_text(
+        f'raise {error_type}("Could not load Transformer Engine torch lib")\n'
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    with patch.dict(sys.modules):
+        for name in list(sys.modules):
+            if name == "transformer_engine" or name.startswith("transformer_engine."):
+                del sys.modules[name]
+        with pytest.warns(UserWarning, match="PyTorch extension is unavailable"):
+            importlib.import_module("transformer_engine")
+        monkeypatch.setattr(te_patches_module, "_TE_PATCHES_APPLIED", False)
+        # TE >= 2.12 takes the existing version-gated patch's early return.
+        with patch(_MOCK_TE_VERSION, return_value=True):
+            apply_te_patches()
+        assert te_patches_module._TE_PATCHES_APPLIED
+        assert "transformer_engine.pytorch.optimizers.fused_adam" not in sys.modules
+
+
 class TestFusedAdamQuantizedTensorPatch:
     def teardown_method(self):
         te_patches_module._TE_PATCHES_APPLIED = False
