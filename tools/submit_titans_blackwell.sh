@@ -73,7 +73,7 @@ if [[ $LOCAL_SHA != "$PUSHED_SHA" ]]; then
   exit 1
 fi
 
-read -r -a CANDIDATES <<<"${TITANS_BLACKWELL_CLUSTERS:-oci-jhb-slurm-1 aws-pdx-slurm-1 nsc-svg-slurm-1 aws-cmh-slurm-1 oci-hsg-cs-001}"
+read -r -a CANDIDATES <<<"${TITANS_BLACKWELL_CLUSTERS:-oci-aga-slurm-1 oci-jhb-slurm-1 aws-pdx-slurm-1 nsc-svg-slurm-1 aws-cmh-slurm-1 oci-hsg-cs-001}"
 TARGET_ARGS=()
 for cluster in "${CANDIDATES[@]}"; do
   TARGET_ARGS+=(--cluster "$cluster")
