@@ -28,6 +28,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+from nemo_automodel.components.attention.fa4 import causal_fa4_attention, document_causal_fa4_attention
 from nemo_automodel.components.attention.utils import (
     initialize_attn_module_and_func,
     postprocess_output_for_attn,
@@ -53,7 +54,6 @@ from nemo_automodel.components.models.kimi_k3.cp import (
     document_causal_flex_attention,
     shard_batch_for_kimi_cp,
 )
-from nemo_automodel.components.models.kimi_k3.fa4_mla import causal_fa4_attention, document_causal_fa4_attention
 from nemo_automodel.components.models.kimi_k3.kda_fused import fused_chunk_kda, fused_kda_unsupported_reason
 from nemo_automodel.components.models.kimi_k3.situ import (
     _apply_attn_res,
@@ -450,7 +450,7 @@ class KimiMLAAttention(nn.Module):
                 **attention_kwargs,
             )
         self._cp_mesh = None
-        # backend.attn="fa4" runs MLA through FlashAttention 4 on both the CP and non-CP paths (kimi_k3/fa4_mla.py);
+        # backend.attn="fa4" runs MLA through FlashAttention 4 on both the CP and non-CP paths (components/attention/fa4.py);
         # the other backends keep FlexAttention under context parallelism.
         self.use_fa4 = backend.attn == "fa4"
 

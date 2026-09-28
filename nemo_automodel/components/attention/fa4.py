@@ -12,26 +12,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""FlashAttention 4 varlen attention for Kimi K3 MLA, with and without context parallelism.
+"""FlashAttention 4 (``flash_attn.cute``) helpers for models that support ``BackendConfig.attn = "fa4"``.
 
-Selected with ``BackendConfig.attn = "fa4"``. Document-causal attention of a contiguous query
-shard against the global keys is expressed as FA4 varlen segments, so no mask is materialized or evaluated per
-element and MLA's native 192/128 QK/V head dims run without padding:
+* :func:`import_fa4_modules` imports the optional FA4/CuTe modules with one clear error when they are missing.
+* :func:`causal_fa4_attention` runs plain causal attention.
+* :func:`document_causal_fa4_attention` runs causal, per-document attention of a contiguous query shard against the
+  global keys (packed sequences, and context parallelism with contiguous shards). It is expressed as FA4 varlen
+  segments, so no mask is materialized or evaluated per element and unequal QK/V head dims (e.g. MLA's 192/128) run
+  without padding:
 
-* Every document run of a row (padding runs included) is split at the end of the local query shard.
-* A piece that overlaps the shard contributes its overlapping queries and all of its keys; FA4's causal mask is
-  aligned to the bottom-right corner of each segment, which is exactly "query at global position p sees keys of
-  its document up to p".
-* Pieces without local queries (other ranks' later tokens, earlier documents) become zero-query segments, so the
-  key segments tile the flattened ``[batch * key_sequence]`` tensor and no gather is needed.
+  - Every document run of a row (padding runs included) is split at the end of the local query shard.
+  - A piece that overlaps the shard contributes its overlapping queries and all of its keys; FA4's causal mask is
+    aligned to the bottom-right corner of each segment, which is exactly "query at global position p sees keys of
+    its document up to p".
+  - Pieces without local queries (other ranks' later tokens, earlier documents) become zero-query segments, so the
+    key segments tile the flattened ``[batch * key_sequence]`` tensor and no gather is needed.
 
-Optional FA4/CuTe dependencies are loaded on the first call.
+Optional FA4/CuTe dependencies are imported on first use.
 """
 
 from __future__ import annotations
 
 import functools
 from collections.abc import Callable
+from types import ModuleType
 from typing import Any
 
 import torch
@@ -41,12 +45,29 @@ from nemo_automodel.shared.import_utils import safe_import
 _PAD_DOC_ID = 0
 
 
+def import_fa4_modules(*names: str) -> tuple[ModuleType, ...]:
+    """Import optional FlashAttention 4 / CuTe DSL modules, raising one clear error if any is missing.
+
+    Args:
+        *names: Fully qualified module names, e.g. ``"flash_attn.cute.interface"`` or ``"cutlass.cute"``.
+
+    Returns:
+        The imported modules, in the order requested.
+    """
+    imported = [safe_import(name) for name in names]
+    missing = [name for name, (available, _) in zip(names, imported) if not available]
+    if missing:
+        raise ImportError(
+            f"backend.attn='fa4' requires FlashAttention 4 (flash_attn.cute) and nvidia-cutlass-dsl; "
+            f"could not import {', '.join(missing)}."
+        )
+    return tuple(module for _, module in imported)
+
+
 @functools.cache
 def _load_fa4() -> tuple[Callable, Callable]:
-    """Import FA4 entry points once; raise a clear error if they are unavailable."""
-    available, interface = safe_import("flash_attn.cute.interface")
-    if not available:
-        raise ImportError("backend.attn='fa4' requires FlashAttention 4 (flash_attn.cute) and nvidia-cutlass-dsl.")
+    """Import the FA4 dense and varlen entry points once."""
+    (interface,) = import_fa4_modules("flash_attn.cute.interface")
     return interface.flash_attn_func, interface.flash_attn_varlen_func
 
 
