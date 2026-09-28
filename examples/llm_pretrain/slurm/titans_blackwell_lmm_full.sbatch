@@ -26,15 +26,25 @@ MAX_LOCAL_BATCH_SIZE=$((GLOBAL_BATCH_SIZE / WORLD_SIZE))
 
 case "$TITANS_SCALE" in
   170m|340m)
-    TOTAL_STEPS=28610
+    DEFAULT_TOTAL_STEPS=28610
     TOKEN_BUDGET=15B
     ;;
   760m)
-    TOTAL_STEPS=57220
+    DEFAULT_TOTAL_STEPS=57220
     TOKEN_BUDGET=30B
     ;;
   *) echo "unsupported Titans scale: $TITANS_SCALE" >&2; exit 2 ;;
 esac
+TOTAL_STEPS=${TITANS_TOTAL_STEPS:-$DEFAULT_TOTAL_STEPS}
+[[ $TOTAL_STEPS =~ ^[1-9][0-9]*$ ]] || { echo "TITANS_TOTAL_STEPS must be a positive integer" >&2; exit 2; }
+OPTIMIZER_OVERRIDES=""
+if [[ -n ${TITANS_LEARNING_RATE:-} ]]; then
+  [[ $TITANS_LEARNING_RATE =~ ^[0-9]+([.][0-9]+)?([eE][-+]?[0-9]+)?$ ]] || {
+    echo "TITANS_LEARNING_RATE must be a non-negative number" >&2
+    exit 2
+  }
+  OPTIMIZER_OVERRIDES="--optimizer.lr=$TITANS_LEARNING_RATE"
+fi
 case "$TITANS_SCALE" in
   170m) DEFAULT_LOCAL_BATCH_SIZE=8 ;;
   340m) DEFAULT_LOCAL_BATCH_SIZE=4 ;;
@@ -239,6 +249,7 @@ srun \
       --wandb.id='$WANDB_RUN_ID' \
       --wandb.resume=allow \
       --wandb.dir='$CHECKPOINT_ROOT/wandb' \
+      $OPTIMIZER_OVERRIDES \
       $MODEL_OVERRIDES
   "
 
