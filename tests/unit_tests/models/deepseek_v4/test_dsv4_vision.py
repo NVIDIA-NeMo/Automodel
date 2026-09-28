@@ -686,6 +686,11 @@ def test_checkpoint_wrapped_vision_norms_are_single_fsdp_units(monkeypatch: pyte
     dsv4_fsdp.fully_shard_deepseek_v4(block, mesh=object(), mp_policy=policy)
 
     assert [child for child, _ in calls] == [block.norm1, block.norm2, block]
+    # The wrapped norms return the bf16 activation dtype expected by attn/mlp.
+    norm_policies = [kwargs["mp_policy"] for _, kwargs in calls[:2]]
+    assert all(norm_policy.param_dtype == torch.float32 for norm_policy in norm_policies)
+    assert all(norm_policy.output_dtype is None for norm_policy in norm_policies)
+    assert all(norm_policy.cast_forward_inputs is False for norm_policy in norm_policies)
 
 
 @pytest.mark.parametrize("whole_tower", [False, True])

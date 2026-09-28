@@ -163,13 +163,16 @@ def _fully_shard_once(module: nn.Module, *, mesh, mp_policy, offload_policy, fp3
     if module is None or _has_fsdp_state(module):
         return module
 
+    # An activation-checkpoint wrapper can own an fp32 island's FSDP unit; the
+    # wrapped module still decides whether the unit keeps the activation dtype.
+    wrapped = getattr(module, "_checkpoint_wrapped_module", module)
     return fully_shard(
         module,
         mesh=mesh,
         mp_policy=(
             _fp32_mp_policy(
                 mp_policy,
-                preserve_activation_dtype=module.__class__.__name__ in _DSV4_SELF_CASTING_FP32_MODULE_CLASS_NAMES,
+                preserve_activation_dtype=wrapped.__class__.__name__ in _DSV4_SELF_CASTING_FP32_MODULE_CLASS_NAMES,
             )
             if fp32_policy
             else mp_policy
