@@ -528,6 +528,43 @@ except ImportError:
     HAVE_HYBRIDEP = False
 
 _hybrid_ep_buffer = None
+_hybrid_ep_runtime_signature: tuple[object, ...] | None = None
+_hybrid_ep_initialized_capacity = 0
+
+
+def get_hybrid_ep_initialized_capacity(signature: tuple[object, ...]) -> int:
+    """Return process-global initialized capacity after validating the resource signature.
+
+    Args:
+        signature: Full configuration and device signature for the HybridEP buffer.
+
+    Returns:
+        The greatest successfully initialized token capacity, or zero before initialization.
+
+    Raises:
+        RuntimeError: If the active process-global buffer has an incompatible signature.
+    """
+    if _hybrid_ep_runtime_signature is not None and _hybrid_ep_runtime_signature != signature:
+        raise RuntimeError("HybridEP's process-global buffer is already active with an incompatible signature")
+    return _hybrid_ep_initialized_capacity
+
+
+def publish_hybrid_ep_initialized_capacity(signature: tuple[object, ...], capacity: int) -> None:
+    """Publish a successfully initialized process-global HybridEP capacity.
+
+    Args:
+        signature: Full configuration and device signature for the HybridEP buffer.
+        capacity: Successfully initialized token capacity.
+
+    Raises:
+        RuntimeError: If the active process-global buffer has an incompatible signature.
+    """
+    global _hybrid_ep_runtime_signature, _hybrid_ep_initialized_capacity
+    if _hybrid_ep_runtime_signature is not None and _hybrid_ep_runtime_signature != signature:
+        raise RuntimeError("HybridEP's process-global buffer is already active with an incompatible signature")
+    _hybrid_ep_runtime_signature = signature
+    _hybrid_ep_initialized_capacity = max(_hybrid_ep_initialized_capacity, capacity)
+
 
 # HybridEP compiles its preprocessing / dispatch / combine kernels with nvcc on first use into a
 # per-process directory (``$HYBRID_EP_CACHE_DIR`` or ``$HOME``, then ``.deepep/hybrid_ep/jit/proc-<pid>``),
@@ -655,9 +692,11 @@ def init_hybrid_ep_buffer(
 
 
 def reset_hybrid_ep_buffer():
-    """Reset the HybridEP buffer."""
-    global _hybrid_ep_buffer
+    """Reset the HybridEP buffer and its published pipeline runtime state."""
+    global _hybrid_ep_buffer, _hybrid_ep_runtime_signature, _hybrid_ep_initialized_capacity
     _hybrid_ep_buffer = None
+    _hybrid_ep_runtime_signature = None
+    _hybrid_ep_initialized_capacity = 0
 
 
 class HybridEPDispatch(torch.autograd.Function):

@@ -27,10 +27,11 @@ import os
 import shutil
 import threading
 from contextlib import contextmanager
+from typing import Any
 
 import torch
 from huggingface_hub import snapshot_download
-from transformers import AutoConfig, PretrainedConfig
+from transformers import PretrainedConfig
 
 try:
     from huggingface_hub.errors import StrictDataclassClassValidationError
@@ -54,6 +55,7 @@ if not hasattr(_generic_utils, "check_model_inputs"):
 
     _generic_utils.check_model_inputs = _check_model_inputs
 
+from nemo_automodel._transformers.auto_config import NeMoAutoConfig as AutoConfig
 from nemo_automodel._transformers.utils import apply_qwen3_omni_config_patch
 
 apply_qwen3_omni_config_patch()
@@ -277,7 +279,7 @@ def _load_registered_custom_config(pretrained_model_name_or_path, attn_implement
     config_kwargs.pop("code_revision", None)
 
     try:
-        config_dict, unused_kwargs = PretrainedConfig.get_config_dict(pretrained_model_name_or_path, **config_kwargs)
+        config_dict, unused_kwargs = AutoConfig.get_config_dict(pretrained_model_name_or_path, **config_kwargs)
     except Exception:
         logger.debug("Could not pre-read config for %s", pretrained_model_name_or_path, exc_info=True)
         return None
@@ -366,7 +368,7 @@ def _load_config_with_layer_types_fix(pretrained_model_name_or_path, attn_implem
     """
     from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
-    config_dict, _ = PretrainedConfig.get_config_dict(pretrained_model_name_or_path, **kwargs)
+    config_dict, _ = AutoConfig.get_config_dict(pretrained_model_name_or_path, **kwargs)
     n = config_dict.get("num_hidden_layers")
     lt = config_dict.get("layer_types")
     if isinstance(n, int) and isinstance(lt, list) and len(lt) > n:
@@ -383,7 +385,14 @@ def _load_config_with_layer_types_fix(pretrained_model_name_or_path, attn_implem
     if trust_remote_code and "AutoConfig" in auto_map:
         from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
-        config_cls = get_class_from_dynamic_module(auto_map["AutoConfig"], pretrained_model_name_or_path)
+        code_kwargs = {
+            key: kwargs[key]
+            for key in ("revision", "code_revision", "cache_dir", "token", "local_files_only", "force_download")
+            if key in kwargs
+        }
+        if config_dict.get("_commit_hash") is not None:
+            code_kwargs["revision"] = config_dict["_commit_hash"]
+        config_cls = get_class_from_dynamic_module(auto_map["AutoConfig"], pretrained_model_name_or_path, **code_kwargs)
     if config_cls is None:
         model_type = config_dict.get("model_type")
         config_cls = CONFIG_MAPPING.get(model_type)
@@ -402,7 +411,13 @@ def get_is_hf_model(config, force_hf):
     return _resolve_custom_model_cls_for_config(config) is None
 
 
-def _download_model_weights(hf_config, pretrained_model_name_or_path, process_group=None):
+def _download_model_weights(
+    hf_config: PretrainedConfig,
+    pretrained_model_name_or_path: str,
+    process_group: torch.distributed.ProcessGroup | None = None,
+    **kwargs: Any,
+) -> None:
+    """Download weights at the config's resolved commit, retaining Hub options."""
     if not os.path.isdir(pretrained_model_name_or_path):
         if os.environ.get("HF_HUB_OFFLINE", "0") == "1":
             logger.info(
@@ -421,7 +436,14 @@ def _download_model_weights(hf_config, pretrained_model_name_or_path, process_gr
         # Import via module reference (vs bound name) so unit tests can patch
         # `nemo_automodel.components.distributed.utils.FirstRankPerNode`.
         with dist_utils.FirstRankPerNode(group=process_group):
-            snapshot_download(pretrained_model_name_or_path)
+            download_kwargs = {
+                key: kwargs[key]
+                for key in ("cache_dir", "revision", "token", "local_files_only", "force_download")
+                if key in kwargs
+            }
+            if hf_config._commit_hash is not None:
+                download_kwargs["revision"] = hf_config._commit_hash
+            snapshot_download(pretrained_model_name_or_path, **download_kwargs)
 
 
 def _prepopulate_remote_code_cache(hf_config, pretrained_model_name_or_path, kwargs, process_group=None):
@@ -764,11 +786,20 @@ def _check_fp8_dequantize_will_fit(
     )
 
 
-def _resolve_model_dir(pretrained_model_name_or_path: str) -> str:
+def _resolve_model_dir(
+    pretrained_model_name_or_path: str,
+    *,
+    revision: str | None = None,
+    cache_dir: str | None = None,
+    subfolder: str = "",
+) -> str:
     """Resolve a HF repo id or local path to a local directory with model files."""
-    if os.path.isdir(pretrained_model_name_or_path):
-        return pretrained_model_name_or_path
-    return snapshot_download(pretrained_model_name_or_path, local_files_only=True)
+    model_dir = pretrained_model_name_or_path
+    if not os.path.isdir(model_dir):
+        model_dir = snapshot_download(
+            pretrained_model_name_or_path, revision=revision, cache_dir=cache_dir, local_files_only=True
+        )
+    return os.path.join(model_dir, subfolder) if subfolder else model_dir
 
 
 def _has_safetensors(model_dir: str) -> bool:
@@ -995,10 +1026,15 @@ def _init_model_bnb_streaming(
 
     # 1. Download weights if needed
     disable_mmap = bool(kwargs.pop("disable_mmap", False))
-    _download_model_weights(hf_config, pretrained_model_name_or_path)
+    _download_model_weights(hf_config, pretrained_model_name_or_path, **kwargs)
 
     # 2. Resolve to local directory & verify safetensors
-    model_dir = _resolve_model_dir(pretrained_model_name_or_path)
+    model_dir = _resolve_model_dir(
+        pretrained_model_name_or_path,
+        revision=hf_config._commit_hash,
+        cache_dir=kwargs.get("cache_dir"),
+        subfolder=kwargs.get("subfolder", ""),
+    )
     if not _has_safetensors(model_dir):
         raise FileNotFoundError(f"Streaming BnB loading requires safetensors checkpoint, but none found in {model_dir}")
 
@@ -1181,6 +1217,9 @@ def __init_model(
     pretrained_model_name_or_path = (
         pretrained_model_name_or_path_or_config if is_pretrained_init else getattr(hf_config, "name_or_path")
     )
+    if is_pretrained_init and hf_config._commit_hash is not None:
+        kwargs["revision"] = hf_config._commit_hash
+        kwargs["_commit_hash"] = hf_config._commit_hash
     # A plain-dict ``config`` override (e.g. from ``--model.config.num_hidden_layers``)
     # has already been folded into ``hf_config`` by ``get_hf_config`` above. Drop it from
     # kwargs so it is not also forwarded into the model constructor / HF from_pretrained
@@ -1301,13 +1340,15 @@ def __init_model(
         else:
             # Download model weights on local rank 0; skip for from_config or local paths
             if pretrained_model_name_or_path:
-                _download_model_weights(hf_config, pretrained_model_name_or_path, process_group=process_group)
+                _download_model_weights(hf_config, pretrained_model_name_or_path, process_group=process_group, **kwargs)
             logger.info(f"Using custom model implementation for {architectures[0]}")
             kwargs.pop("trust_remote_code", None)
             # Keep the hub loading options before the constructor-argument filter drops
             # them: the generation-config restore below has to read from the same
             # subfolder/revision the weights came from.
             loading_kwargs = {key: kwargs[key] for key in HUB_LOADING_KWARGS if key in kwargs}
+            for key in (*HUB_LOADING_KWARGS, "_commit_hash", "code_revision", "use_auth_token"):
+                kwargs.pop(key, None)
             # Treat config-related kwargs as config overrides (HF behavior) and
             # avoid forwarding them into model __init__.
             init_param_names = _get_init_param_names(model_cls)

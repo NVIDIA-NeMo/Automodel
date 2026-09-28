@@ -1,7 +1,7 @@
 ---
 title: "GLM-5.3-Flash"
-description: "Fine-tune the GLM-5.3-Flash mixture-of-experts vision-language model with packed context and expert parallelism."
-slug: model-coverage/vision-language-models/thudm/glm-5-3-flash
+description: "Fine-tune GLM-5.3-Flash for vision-language tasks with NeMo AutoModel using a checked-in packed-context and expert-parallel recipe."
+slug: model-coverage/vision-language-models/thudm/GLM-5.3-Flash
 ---
 
 [GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) is a
@@ -10,9 +10,11 @@ backbone combines Kimi Delta Attention (KDA), KPool-indexed DeepSeek Sparse
 Attention (DSA), Mixture-of-Experts (MoE) layers, and four-stream
 Manifold-Constrained Hyper-Connections (mHC).
 
-<Info>
+## Model Reference
 
-| | |
+### Model Architecture
+
+| Property | Value |
 |---|---|
 | **Task** | Image-Text-to-Text |
 | **Architecture** | `Glm5NextForConditionalGeneration` |
@@ -22,8 +24,6 @@ Manifold-Constrained Hyper-Connections (mHC).
 | **Context Length** | 1,048,576 in the checkpoint configuration; validated here at 2,048 and 4,096 tokens |
 | **Training Precision** | BF16 after FP8 checkpoint dequantization |
 | **HF Org** | [zai-org](https://huggingface.co/zai-org) |
-
-</Info>
 
 ## Architecture
 
