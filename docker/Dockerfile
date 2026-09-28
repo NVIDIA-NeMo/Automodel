@@ -333,8 +333,8 @@ RUN if [ "$BASE_IMAGE" = "pytorch" ]; then \
     fi
 
 # Fail the image build before publication if PyTorch headers cannot compile as
-# C++20, torch._grouped_mm is unavailable, or a bundled native extension has
-# unresolved PyTorch/CUDA symbols.
+# C++20, torch._grouped_mm is unavailable, a bundled native extension has
+# unresolved PyTorch/CUDA symbols, or FlashAttention 4 (INSTALL_FA4) is missing.
 RUN MAX_JOBS=2 python docker/common/verify_native_runtime.py
 
 WORKDIR /opt/Automodel
