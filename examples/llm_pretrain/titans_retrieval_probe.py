@@ -52,25 +52,46 @@ def _target_metrics(
         reduction="none",
     )
     predictions = target_logits.argmax(dim=-1)
-    first_logits = target_logits[0, 0]
-    first_target = target_ids[0, 0]
-    first_rank = int((first_logits > first_logits[first_target]).sum().item()) + 1
-    teacher_first_prediction = first_logits.argmax()
-    prompt_first_prediction = prompt_last_logits[0].argmax()
+    answer_offset = next(
+        (
+            index
+            for index, token_id in enumerate(target_ids[0])
+            if tokenizer.decode(token_id).strip()
+        ),
+        None,
+    )
+    if answer_offset is None:
+        raise ValueError(f"target contains no non-whitespace tokens: {target!r}")
+    answer_losses = losses[answer_offset:]
+    answer_predictions = predictions[:, answer_offset:]
+    answer_ids = target_ids[:, answer_offset:]
+    first_answer_logits = target_logits[0, answer_offset]
+    first_answer_token = answer_ids[0, 0]
+    first_answer_rank = (
+        int((first_answer_logits > first_answer_logits[first_answer_token]).sum().item()) + 1
+    )
+    first_answer_prediction = first_answer_logits.argmax()
+    boundary_teacher_prediction = target_logits[0, 0].argmax()
+    boundary_prompt_prediction = prompt_last_logits[0].argmax()
     return {
-        "target_tokens": int(target_ids.numel()),
-        "target_nll": float(losses.mean().item()),
-        "target_perplexity": float(math.exp(min(losses.mean().item(), 30.0))),
-        "target_token_accuracy": float((predictions == target_ids).float().mean().item()),
+        "answer_token_offset": answer_offset,
+        "answer_tokens": int(answer_ids.numel()),
+        "answer_nll": float(answer_losses.mean().item()),
+        "answer_perplexity": float(math.exp(min(answer_losses.mean().item(), 30.0))),
+        "answer_token_accuracy": float((answer_predictions == answer_ids).float().mean().item()),
         "tokenization_prefix_ok": prefix_ok,
-        "first_target_rank": first_rank,
-        "first_target_token_id": int(first_target.item()),
-        "first_target_token_text": tokenizer.decode(first_target),
-        "teacher_first_prediction_id": int(teacher_first_prediction.item()),
-        "teacher_first_prediction_text": tokenizer.decode(teacher_first_prediction),
-        "prompt_first_prediction_id": int(prompt_first_prediction.item()),
-        "prompt_first_prediction_text": tokenizer.decode(prompt_first_prediction),
-        "prefix_logit_max_abs_diff": float((first_logits - prompt_last_logits[0]).abs().max().item()),
+        "first_answer_rank": first_answer_rank,
+        "first_answer_token_id": int(first_answer_token.item()),
+        "first_answer_token_text": tokenizer.decode(first_answer_token),
+        "first_answer_prediction_id": int(first_answer_prediction.item()),
+        "first_answer_prediction_text": tokenizer.decode(first_answer_prediction),
+        "boundary_teacher_prediction_id": int(boundary_teacher_prediction.item()),
+        "boundary_teacher_prediction_text": tokenizer.decode(boundary_teacher_prediction),
+        "boundary_prompt_prediction_id": int(boundary_prompt_prediction.item()),
+        "boundary_prompt_prediction_text": tokenizer.decode(boundary_prompt_prediction),
+        "prefix_logit_max_abs_diff": float(
+            (target_logits[0, 0] - prompt_last_logits[0]).abs().max().item()
+        ),
     }
 
 
@@ -147,9 +168,9 @@ def main() -> None:
         "checkpoint": str(args.checkpoint),
         "samples": len(records),
         "prefixed_exact_accuracy": sum(record["prefixed_exact_contains"] for record in records) / len(records),
-        "mean_target_nll": sum(record["target_nll"] for record in records) / len(records),
-        "mean_target_token_accuracy": sum(record["target_token_accuracy"] for record in records) / len(records),
-        "mean_first_target_rank": sum(record["first_target_rank"] for record in records) / len(records),
+        "mean_answer_nll": sum(record["answer_nll"] for record in records) / len(records),
+        "mean_answer_token_accuracy": sum(record["answer_token_accuracy"] for record in records) / len(records),
+        "mean_first_answer_rank": sum(record["first_answer_rank"] for record in records) / len(records),
         "records": records,
     }
     args.output_json.parent.mkdir(parents=True, exist_ok=True)
