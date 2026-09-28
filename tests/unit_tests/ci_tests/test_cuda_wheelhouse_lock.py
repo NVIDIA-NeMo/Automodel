@@ -14,6 +14,11 @@
 
 from pathlib import Path
 
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib  # ty: ignore[unresolved-import]
+
 from scripts.cuda_wheelhouse_lock import cache_fingerprint, load_locked_inputs
 
 _BUILD_SCRIPT = Path(".github/scripts/build-cuda-wheelhouse.sh")
@@ -106,6 +111,19 @@ def test_lock_manifest_pins_build_and_runtime_requirements(tmp_path):
 def test_te_wheel_build_disables_optional_nccl_ep():
     assert "export NVTE_WITH_NCCL_EP=0" in _BUILD_SCRIPT.read_text()
     assert 'NVTE_WITH_NCCL_EP: "0"' in Path(".github/workflows/install-test.yml").read_text()
+
+
+def test_uv_cuda_builds_use_required_headers_without_nccl_ep():
+    build_variables = tomllib.loads(Path("pyproject.toml").read_text())["tool"]["uv"]["extra-build-variables"]
+
+    assert build_variables["deep-ep"] == {
+        "CPLUS_INCLUDE_PATH": "/usr/local/cuda/include/cccl",
+    }
+    assert build_variables["transformer-engine-torch"] == {
+        "CPLUS_INCLUDE_PATH": "/usr/local/cuda/include:/usr/local/cuda/include/cccl",
+        "NVTE_BUILD_USE_NVIDIA_WHEELS": "1",
+        "NVTE_WITH_NCCL_EP": "0",
+    }
 
 
 def test_unrelated_lock_change_preserves_cache_fingerprint(tmp_path):

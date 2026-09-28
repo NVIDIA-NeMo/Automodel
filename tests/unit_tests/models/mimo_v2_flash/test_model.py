@@ -285,9 +285,7 @@ class TestMiMoV2FlashModel:
             model = MiMoV2FlashModel(tiny_config, backend_config)
 
         expected_norms = [
-            norm
-            for layer in model.layers.values()
-            for norm in (layer.input_layernorm, layer.post_attention_layernorm)
+            norm for layer in model.layers.values() for norm in (layer.input_layernorm, layer.post_attention_layernorm)
         ]
         expected_norms.append(model.norm)
         assert rms_norm_factory.call_count == 2 * tiny_config.num_hidden_layers + 1

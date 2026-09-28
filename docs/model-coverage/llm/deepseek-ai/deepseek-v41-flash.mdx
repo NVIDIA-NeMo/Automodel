@@ -1,7 +1,7 @@
 ---
-title: "DeepSeek-V4.1 Flash"
-description: "DeepSeek-V4.1 Flash backbone fine-tuning with expert parallelism and sharded Engram memory."
-slug: model-coverage/large-language-models/deepseek-ai/deepseek-v41-flash
+title: "DeepSeek-V4.1-Flash"
+description: "Fine-tune DeepSeek-V4.1-Flash with NeMo AutoModel using checked-in expert-parallel text recipes and sharded Engram memory."
+slug: model-coverage/large-language-models/deepseek-ai/DeepSeek-V4.1-Flash
 ---
 
 [DeepSeek-V4.1 Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash)
@@ -12,7 +12,11 @@ Single-pass mHC carries four residual streams, and two trainable Engram tables
 at layers 1 and 14 provide tokenizer-dependent N-gram memory. The approximately
 552B backbone is accompanied by 196B Engram parameters.
 
-| Setting | Value |
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
 |---|---|
 | Architecture | `DeepseekV41ForCausalLM` |
 | Model ID | `deepseek-ai/DeepSeek-V4.1-Flash` |
@@ -30,8 +34,8 @@ receive the owner divisor once before clipping.
 
 | Recipe | Topology and Batch | Optimizer Moments and Checkpoints |
 |---|---|---|
-| [HellaSwag EP64](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_hellaswag_ep64_16nodes.yaml) | 16 nodes × 4 GB200; EP64, owner64, TP1/PP1/CP1; global batch 64, local batch 1 | BF16 moments; checkpoint saving disabled |
-| [HellaSwag EP64, H100](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_hellaswag_ep64_h100_16nodes.yaml) | 16 nodes × 8 H100 80 GB; EP64 with ep_shard2, owner128, TP1/PP1/CP1; global batch 128, local batch 1 | BF16 moments; checkpoint saving disabled; see [H100 80 GB Systems](#h100-80-gb-systems) |
+| [HellaSwag EP64](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_hellaswag_ep64_16nodes.yaml) | 16 nodes x 4 GB200; EP64, owner64, TP1/PP1/CP1; global batch 64, local batch 1 | BF16 moments; checkpoint saving disabled |
+| [HellaSwag EP64, H100](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_hellaswag_ep64_h100_16nodes.yaml) | 16 nodes x 8 H100 80 GB; EP64 with ep_shard2, owner128, TP1/PP1/CP1; global batch 128, local batch 1 | BF16 moments; checkpoint saving disabled; see [H100 80 GB Systems](#h100-80-gb-systems) |
 
 The configuration requests 100 updates with validation every 50 updates,
 activation checkpointing, and reshard-after-forward. It uses no gradient
@@ -109,10 +113,10 @@ repository at `e2c47c5b` (torch 2.13, NCCL 2.30.5).
 
 | Recipe | Topology and Batch | Overrides Compared to the GB200 Recipe | Peak Memory / Result |
 |---|---|---|---|
-| [HellaSwag EP64, H100](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_hellaswag_ep64_h100_16nodes.yaml) | 16 × 8 H100; EP64, ep_shard2, owner128; GBS 128, LBS 1, one microbatch | `global_batch_size: 128` | 58.4 GiB; train 1.8185, validation 1.9800 (GB200: 1.8177 / 2.0173) |
-| [HellaSwag LoRA, H100](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_hellaswag_lora_h100_8nodes.yaml) | 8 × 8 H100; EP32, ep_shard2, owner64; GBS 64, LBS 1, one microbatch | None | 43.9 GiB; train 2.2655, validation 2.5737 |
-| [Tulu3 CP8, H100](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_tulu3_cp8_h100_32nodes.yaml) | 32 × 8 H100; EP64, ep_shard4, CP8; GBS 64, LBS 1, two microbatches | `defer_fsdp_grad_sync: false`, `moe.reshard_after_forward: false` | 65.7 GiB; validation 0.5541 / 0.5444 (CP1 reference at 16 nodes, GBS 128: 0.5477 / 0.5384) |
-| [Tulu3 packed CP8 32k, H100](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_tulu3_packed_cp8_32k_h100_64nodes.yaml) | 64 × 8 H100; EP64, ep_shard8, CP8; GBS 64, LBS 1, one microbatch | `moe.reshard_after_forward: false` | 62.5 GiB; validation 0.5853 / 0.5778; one checkpoint ≈ 8.2 TB |
+| [HellaSwag EP64, H100](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_hellaswag_ep64_h100_16nodes.yaml) | 16 x 8 H100; EP64, ep_shard2, owner128; GBS 128, LBS 1, one microbatch | `global_batch_size: 128` | 58.4 GiB; train 1.8185, validation 1.9800 (GB200: 1.8177 / 2.0173) |
+| [HellaSwag LoRA, H100](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_hellaswag_lora_h100_8nodes.yaml) | 8 x 8 H100; EP32, ep_shard2, owner64; GBS 64, LBS 1, one microbatch | None | 43.9 GiB; train 2.2655, validation 2.5737 |
+| [Tulu3 CP8, H100](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_tulu3_cp8_h100_32nodes.yaml) | 32 x 8 H100; EP64, ep_shard4, CP8; GBS 64, LBS 1, two microbatches | `defer_fsdp_grad_sync: false`, `moe.reshard_after_forward: false` | 65.7 GiB; validation 0.5541 / 0.5444 (CP1 reference at 16 nodes, GBS 128: 0.5477 / 0.5384) |
+| [Tulu3 packed CP8 32k, H100](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_tulu3_packed_cp8_32k_h100_64nodes.yaml) | 64 x 8 H100; EP64, ep_shard8, CP8; GBS 64, LBS 1, one microbatch | `moe.reshard_after_forward: false` | 62.5 GiB; validation 0.5853 / 0.5778; one checkpoint about 8.2 TB |
 
 Prepare `DS41_DATA_ROOT` for the two Tulu3 variants with
 [prepare_tulu3_data.py](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/prepare_tulu3_data.py), which materializes
@@ -215,7 +219,7 @@ sample rather than broad prompt coverage.
 
 | Metric | PR `d5c8b5e4` Native-Combine Streamed-40 Result |
 |---|---:|
-| Mean KL(reference‖native) | 0.0034285025 |
+| Mean KL(reference || native) | 0.0034285025 |
 | P95 KL | 0.0003751850 |
 | Maximum KL | 3.8604531288 |
 | Logit cosine | 0.9939242168 |
@@ -241,7 +245,7 @@ code, or full-resident 40-layer PR training.
 ## Original Implementation Training Result
 
 The original implementation at `0d5919a5a506dd35dc4f55769410feb98ae854b8`
-completed 100 HellaSwag optimizer updates on 16 nodes × 4 GB200 with EP64,
+completed 100 HellaSwag optimizer updates on 16 nodes x 4 GB200 with EP64,
 64 Engram owners, the now-removed custom FP32 combine, BF16 optimizer moments,
 and checkpoint saving disabled.
 Training loss changed from 2.9959 at update 1 to 1.8177 at update 100;

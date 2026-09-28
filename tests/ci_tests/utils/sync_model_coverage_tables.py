@@ -18,7 +18,7 @@ import argparse
 import ast
 import re
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import yaml
@@ -31,7 +31,7 @@ SUPPORT_LOG_END_MARKER = "{/* END GENERATED MODEL SUPPORT LOG */}"
 REGISTRY_START_MARKER = "{/* BEGIN GENERATED MODEL ARCHITECTURES */}"
 REGISTRY_END_MARKER = "{/* END GENERATED MODEL ARCHITECTURES */}"
 HF_MODEL_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
-DOCS_PAGE_PATTERN = re.compile(r"^/[a-z0-9][a-z0-9/-]*$")
+DOCS_PAGE_PATTERN = re.compile(r"^/[A-Za-z0-9][A-Za-z0-9._/-]*$")
 MARKDOWN_UNSAFE_PATTERN = re.compile(r"[\[\]|<>`\r\n]")
 REPOSITORY_URL = "https://github.com/NVIDIA-NeMo/Automodel/blob/main"
 DATED_SUPPORT_TABLE_HEADER = "| Date | Type | Model | Recipe |"
@@ -46,6 +46,17 @@ MODEL_TYPE_OVERVIEW_PATHS = (
     ("Embedding", "embedding/index.mdx"),
     ("Reranking", "reranker/index.mdx"),
 )
+MODEL_TYPE_ROUTE_CATEGORIES = {
+    "LLM": "large-language-models",
+    "Encoder-Decoder": "large-language-models",
+    "VLM": "vision-language-models",
+    "Multimodal": "multimodal",
+    "Omni": "omni",
+    "dLLM": "dllm",
+    "Diffusion": "diffusion",
+    "Embedding": "embedding-models",
+    "Reranking": "reranking-models",
+}
 GENERATED_MARKER_PAIRS = (
     (HOMEPAGE_START_MARKER, HOMEPAGE_END_MARKER),
     (SUPPORT_LOG_START_MARKER, SUPPORT_LOG_END_MARKER),
@@ -328,6 +339,8 @@ def _load_model_doc_catalog(
     model_coverage_root = docs_root / "model-coverage"
     for directory, model_type in directory_types.items():
         for path in sorted((model_coverage_root / directory).glob("*/*.mdx")):
+            if path.name == "index.mdx":
+                continue
             document = path.read_text(encoding="utf-8")
             slug_match = re.search(r'^slug: "?([^"\r\n]+)"?$', document, flags=re.MULTILINE)
             if slug_match is None:
@@ -398,9 +411,15 @@ def _load_model_releases(repo_root: Path, model_docs: dict[str, list[_ModelDoc]]
                 documented_type = next(iter(documented_types))
                 if documented_type in {"Omni", "Multimodal"}:
                     model_type = documented_type
+            typed_docs = [model_doc for model_doc in matching_docs if model_doc.model_type == model_type]
+            hf_model_name = hf_model_id.rsplit("/", 1)[1]
             docs_page = next(
-                (model_doc.docs_page for model_doc in matching_docs if model_doc.model_type == model_type),
-                f"https://huggingface.co/{hf_model_id}",
+                (
+                    model_doc.docs_page
+                    for model_doc in typed_docs
+                    if model_doc.docs_page.rsplit("/", 1)[-1] == hf_model_name
+                ),
+                typed_docs[0].docs_page if typed_docs else f"https://huggingface.co/{hf_model_id}",
             )
             recipe_string = str(recipe)
             release_date = introduction_dates.get((recipe_string, hf_model_id))
@@ -418,6 +437,128 @@ def _load_model_releases(repo_root: Path, model_docs: dict[str, list[_ModelDoc]]
     )
     releases.sort(key=lambda release: release.release_date, reverse=True)
     return releases
+
+
+def _strip_automodel_route_prefix(route: str) -> str:
+    for prefix in ("/nemo/automodel/nightly", "/nemo/automodel"):
+        if route.casefold().startswith(prefix.casefold()):
+            return route[len(prefix) :]
+    return route
+
+
+def _resolve_redirect(source: str, redirects: dict[str, str]) -> str:
+    route = f"/nemo/automodel{source}"
+    visited = set()
+    route_key = route.casefold()
+    while route_key in redirects:
+        if route_key in visited:
+            raise ValueError(f"Model-card redirect cycle starts at {source}")
+        visited.add(route_key)
+        route = redirects[route_key]
+        route_key = route.casefold()
+    return _strip_automodel_route_prefix(route)
+
+
+def _resolve_model_card_routes(
+    repo_root: Path,
+    releases: list[_ModelRelease],
+    model_docs: dict[str, list[_ModelDoc]],
+    documented_models: list[_ModelDoc],
+) -> dict[tuple[str, str], str]:
+    """Resolve every recipe model ID and model type to exactly one model card."""
+    docs_config_path = repo_root / "docs" / "fern" / "docs.yml"
+    try:
+        docs_config = yaml.safe_load(docs_config_path.read_text(encoding="utf-8"))
+        redirect_entries = docs_config["redirects"]
+        redirects: dict[str, str] = {}
+        redirect_sources: dict[str, str] = {}
+        for redirect in redirect_entries:
+            source = redirect["source"]
+            destination = redirect["destination"]
+            source_key = source.casefold()
+            previous_source = redirect_sources.get(source_key)
+            if previous_source is not None:
+                raise ValueError(
+                    f"Fern redirects contain case-insensitive duplicate sources: {previous_source} and {source}"
+                )
+            redirect_sources[source_key] = source
+            redirects[source_key] = destination
+    except (OSError, KeyError, TypeError, yaml.YAMLError) as error:
+        raise ValueError(f"Could not load Fern redirects from {docs_config_path}: {error}") from error
+
+    card_routes_by_key: dict[str, str] = {}
+    for model in documented_models:
+        route_key = model.docs_page.casefold()
+        previous_route = card_routes_by_key.get(route_key)
+        if previous_route is not None and previous_route != model.docs_page:
+            raise ValueError(f"Model-card routes collide case-insensitively: {previous_route} and {model.docs_page}")
+        card_routes_by_key[route_key] = model.docs_page
+
+    canonical_sources = {
+        f"{prefix}{route}".casefold()
+        for route in card_routes_by_key.values()
+        for prefix in ("/nemo/automodel", "/nemo/automodel/nightly")
+    }
+    colliding_sources = sorted(redirect_sources[source] for source in canonical_sources & redirects.keys())
+    if colliding_sources:
+        raise ValueError(
+            "Fern redirect sources collide case-insensitively with canonical model-card routes: "
+            + ", ".join(colliding_sources)
+        )
+
+    provider_routes_by_owner: dict[str, set[str]] = {}
+    for hf_model_id, docs in model_docs.items():
+        owner = hf_model_id.split("/", 1)[0].casefold()
+        for model_doc in docs:
+            provider_routes_by_owner.setdefault(owner, set()).add(model_doc.docs_page.rsplit("/", 1)[0])
+
+    resolved: dict[tuple[str, str], str] = {}
+    missing: list[tuple[str, str]] = []
+    ambiguous: list[tuple[str, str, list[str]]] = []
+    for release in releases:
+        owner, model_name = release.hf_model_id.split("/", 1)
+        model_name = model_name.replace("_", "-")
+        provider_routes = provider_routes_by_owner.get(owner.casefold(), set())
+        category = MODEL_TYPE_ROUTE_CATEGORIES[release.model_type]
+        preferred_routes = {route for route in provider_routes if route.startswith(f"/model-coverage/{category}/")}
+
+        def card_destinations(routes: set[str]) -> set[str]:
+            return {
+                card_routes_by_key[destination.casefold()]
+                for provider_route in routes
+                if (destination := _resolve_redirect(f"{provider_route}/{model_name}", redirects)).casefold()
+                in card_routes_by_key
+            }
+
+        destinations = card_destinations(preferred_routes)
+        if not destinations:
+            # Some checkpoints are reused by a workflow classified differently
+            # from the card, for example an Omni checkpoint in an LLM recipe.
+            destinations = card_destinations(provider_routes)
+
+        key = (release.hf_model_id, release.model_type)
+        if not destinations:
+            missing.append(key)
+        elif len(destinations) > 1:
+            ambiguous.append((*key, sorted(destinations)))
+        else:
+            resolved[key] = next(iter(destinations))
+
+    if missing or ambiguous:
+        details = []
+        if missing:
+            details.extend(f"  - missing: {model_type}: {hf_model_id}" for hf_model_id, model_type in missing)
+        if ambiguous:
+            details.extend(
+                f"  - ambiguous: {model_type}: {hf_model_id} -> {', '.join(destinations)}"
+                for hf_model_id, model_type, destinations in ambiguous
+            )
+        raise ValueError(
+            "Every recipe model ID must resolve to exactly one model card.\n"
+            + "\n".join(details)
+            + "\nAdd an exact model-card route or one Fern redirect to the intended card."
+        )
+    return resolved
 
 
 def _render_recipe_link(release: _ModelRelease) -> str:
@@ -607,7 +748,7 @@ def _render_registry_table(
     )
 
 
-def _generate_tables(repo_root: Path) -> dict[Path, str]:
+def _generate_tables(repo_root: Path, *, validate_model_cards: bool = True) -> dict[Path, str]:
     _validate_dated_support_tables_are_generated(repo_root)
     docs_root = repo_root / "docs"
     support_log_path = repo_root / "docs" / "model-coverage" / "latest-models.mdx"
@@ -631,6 +772,12 @@ def _generate_tables(repo_root: Path) -> dict[Path, str]:
 
     model_docs, documented_architectures, documented_models = _load_model_doc_catalog(docs_root)
     releases = _load_model_releases(repo_root, model_docs)
+    if validate_model_cards:
+        model_card_routes = _resolve_model_card_routes(repo_root, releases, model_docs, documented_models)
+        releases = [
+            replace(release, docs_page=model_card_routes[(release.hf_model_id, release.model_type)])
+            for release in releases
+        ]
     generated_support_log = _render_support_log_table(releases)
     generated_homepage = _render_homepage_table(releases)
     generated_registry = _render_registry_table(
@@ -665,8 +812,8 @@ def _generate_tables(repo_root: Path) -> dict[Path, str]:
     return generated_documents
 
 
-def _sync_tables(repo_root: Path, *, check: bool) -> list[Path]:
-    generated_documents = _generate_tables(repo_root)
+def _sync_tables(repo_root: Path, *, check: bool, validate_model_cards: bool = True) -> list[Path]:
+    generated_documents = _generate_tables(repo_root, validate_model_cards=validate_model_cards)
     changed_paths = [
         path for path, generated in generated_documents.items() if path.read_text(encoding="utf-8") != generated
     ]
