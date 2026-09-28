@@ -237,6 +237,7 @@ srun \
       '$RECIPE' \
       --step_scheduler.max_steps='$TOTAL_STEPS' \
       --step_scheduler.max_steps_per_run='$MAX_STEPS_PER_RUN' \
+      --step_scheduler.global_batch_size='$GLOBAL_BATCH_SIZE' \
       --step_scheduler.local_batch_size='$LOCAL_BATCH_SIZE' \
       --distributed.activation_checkpointing='$ACTIVATION_CHECKPOINTING' \
       $DISTRIBUTED_OVERRIDES \
