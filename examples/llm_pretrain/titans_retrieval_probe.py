@@ -30,6 +30,11 @@ def _target_metrics(
     input_ids = torch.cat((prompt_ids, target_ids), dim=1)
     with torch.no_grad():
         logits = generator.model(input_ids, enable_ttt_updates=enable_ttt_updates).logits.float()
+        prompt_last_logits = generator.model(
+            prompt_ids,
+            logits_to_keep=1,
+            enable_ttt_updates=enable_ttt_updates,
+        ).logits[:, -1].float()
     target_logits = logits[:, prompt_ids.shape[1] - 1 : input_ids.shape[1] - 1]
     losses = F.cross_entropy(
         target_logits.reshape(-1, target_logits.shape[-1]),
@@ -40,12 +45,21 @@ def _target_metrics(
     first_logits = target_logits[0, 0]
     first_target = target_ids[0, 0]
     first_rank = int((first_logits > first_logits[first_target]).sum().item()) + 1
+    teacher_first_prediction = first_logits.argmax()
+    prompt_first_prediction = prompt_last_logits[0].argmax()
     return {
         "target_tokens": int(target_ids.numel()),
         "target_nll": float(losses.mean().item()),
         "target_perplexity": float(math.exp(min(losses.mean().item(), 30.0))),
         "target_token_accuracy": float((predictions == target_ids).float().mean().item()),
         "first_target_rank": first_rank,
+        "first_target_token_id": int(first_target.item()),
+        "first_target_token_text": tokenizer.decode(first_target),
+        "teacher_first_prediction_id": int(teacher_first_prediction.item()),
+        "teacher_first_prediction_text": tokenizer.decode(teacher_first_prediction),
+        "prompt_first_prediction_id": int(prompt_first_prediction.item()),
+        "prompt_first_prediction_text": tokenizer.decode(prompt_first_prediction),
+        "prefix_logit_max_abs_diff": float((first_logits - prompt_last_logits[0]).abs().max().item()),
     }
 
 
