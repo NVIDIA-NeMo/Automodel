@@ -108,6 +108,33 @@ class FusedLinearCEConfig(LossConfig):
 
 
 @dataclass
+class ChunkedCEConfig(LossConfig):
+    """Chunked output projection and cross entropy.
+
+    Attributes:
+        chunk_len: Maximum token rows per output projection.
+        compile: Compile each chunk's projection and CE.
+        ignore_index: Ignored target value.
+        reduction: Reduction across all tokens.
+    """
+
+    chunk_len: int = 512
+    compile: bool = True
+    ignore_index: int = -100
+    reduction: str = "sum"
+
+    def build(self) -> nn.Module:
+        from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy
+
+        return ChunkedCrossEntropy(
+            chunk_len=self.chunk_len,
+            compile=self.compile,
+            ignore_index=self.ignore_index,
+            reduction=self.reduction,
+        )
+
+
+@dataclass
 class TEParallelCEConfig(LossConfig):
     """``TEParallelCrossEntropy``.
 
@@ -193,6 +220,7 @@ class LossFromFactoryConfig(LossConfig):
 LOSS_CONFIG_REGISTRY: dict[str, type[LossConfig]] = {
     "MaskedCrossEntropy": MaskedCrossEntropyConfig,
     "FusedLinearCrossEntropy": FusedLinearCEConfig,
+    "ChunkedCrossEntropy": ChunkedCEConfig,
     "TEParallelCrossEntropy": TEParallelCEConfig,
     "KDLoss": KDLossConfig,
 }

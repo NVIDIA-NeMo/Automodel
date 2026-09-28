@@ -3298,3 +3298,80 @@ def test_default_collater_batches_per_sample_dataset_id():
     # [B], not [1, B] and not padded as a ragged sequence.
     assert out["dataset_id"].tolist() == [0, 1]
     assert out["input_ids"].shape == (2, 4)
+
+
+@pytest.mark.parametrize("tied", [False, True])
+def test_recipe_profiles_model_and_loss_without_full_logits(tied):
+    import torch.nn.functional as F
+    from torch.profiler import ProfilerActivity, profile
+    from transformers import LlamaConfig, LlamaForCausalLM
+
+    from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy
+    from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
+
+    torch.manual_seed(31)
+    tokens, vocab = 128, 4096
+    config = LlamaConfig(
+        vocab_size=vocab,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        tie_word_embeddings=tied,
+        use_cache=False,
+    )
+    model = LlamaForCausalLM(config)
+    reference = LlamaForCausalLM(config)
+    reference.load_state_dict(model.state_dict())
+    recipe = SimpleNamespace(
+        model_parts=[model],
+        loss_fn=ChunkedCrossEntropy(8, compile=False),
+        dist_env=SimpleNamespace(device=torch.device("cpu")),
+        pp_enabled=False,
+        device_mesh=None,
+        tokenizer=None,
+        domain_mixture=None,
+        te_fp8=None,
+        distributed_config=SimpleNamespace(defer_fsdp_grad_sync=True),
+        _get_cp_group_size=lambda: 1,
+        _get_dp_group_size=lambda **kw: 1,
+        _get_dp_group=lambda **kw: None,
+    )
+    labels = torch.randint(vocab, (1, tokens))
+    labels[:, :9] = -100
+    input_ids = torch.randint(vocab, (1, tokens))
+    losses = []
+    with profile(activities=[ProfilerActivity.CPU], profile_memory=True, record_shapes=True) as prof:
+        TrainFinetuneRecipeForNextTokenPrediction._forward_backward_step(
+            recipe,
+            0,
+            {"input_ids": input_ids, "labels": labels},
+            loss_buffer=losses,
+            num_label_tokens=tokens - 9,
+            num_batches=1,
+        )
+    # Profile the production recipe, including model.forward, so changing its
+    # dispatch back to full logits also fails this regression.
+    assert max(event.cpu_memory_usage for event in prof.events()) < tokens * vocab * 4
+    ref_loss = F.cross_entropy(reference(input_ids).logits.flatten(0, 1), labels.flatten())
+    ref_loss.backward()
+    torch.testing.assert_close(losses[0], ref_loss)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    ref_optimizer = torch.optim.SGD(reference.parameters(), lr=0.1)
+    for parameter, ref_parameter in zip(model.parameters(), reference.parameters()):
+        torch.testing.assert_close(parameter.grad, ref_parameter.grad, rtol=1e-4, atol=2e-6)
+    optimizer.step()
+    ref_optimizer.step()
+    for parameter, ref_parameter in zip(model.parameters(), reference.parameters()):
+        torch.testing.assert_close(parameter, ref_parameter, rtol=1e-4, atol=2e-6)
+
+
+@pytest.mark.parametrize("pp_enabled", [False, True])
+def test_chunked_ce_never_silently_falls_back_to_full_logits(pp_enabled):
+    from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy
+    from nemo_automodel.recipes.llm.train_ft import _maybe_downgrade_loss_fn
+
+    probe = _StageWithLogitsToKeep() if pp_enabled else _StageNoLogitsToKeep()
+    with pytest.raises(ValueError, match="ChunkedCrossEntropy requires"):
+        _maybe_downgrade_loss_fn(ChunkedCrossEntropy(compile=False), probe, pp_enabled)

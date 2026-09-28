@@ -12,245 +12,225 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Callable
+from typing import Any
+
 import torch
-import torch.nn as nn
+import torch.distributed as dist
 import torch.nn.functional as F
 
-_compiled_compute_cross_entropy = None
-
-
-def _validate_chunk_len(chunk_len: int) -> int:
-    """Validate that ``chunk_len`` is positive."""
-    chunk_len = int(chunk_len)
-    if chunk_len <= 0:
-        raise ValueError(f"chunk_len must be greater than zero; got {chunk_len}.")
-    return chunk_len
-
-
-class _ChunkedCrossEntropySum(torch.autograd.Function):
-    """Sum-reduced cross-entropy with recomputed fp32 chunk activations."""
-
-    @staticmethod
-    def forward(
-        ctx,
-        logits: torch.Tensor,
-        labels: torch.Tensor,
-        loss_weights: torch.Tensor | None,
-        ignore_index: int,
-        chunk_len: int,
-    ) -> torch.Tensor:
-        """Compute sum-reduced cross-entropy one fp32 chunk at a time.
-
-        Args:
-            ctx: Autograd context used to save tensors for backward.
-            logits: Prediction scores of shape [tokens, vocab]. The tensor stays
-                in its original floating-point dtype and is not mutated.
-            labels: Target class indices of shape [tokens]. Positions equal to
-                ``ignore_index`` contribute zero loss and gradient.
-            loss_weights: Per-token multipliers of shape [tokens], or an empty
-                tensor when no weighting is requested.
-            ignore_index: Target value excluded from the loss.
-            chunk_len: Maximum number of token rows upcast to fp32 at once.
-
-        Returns:
-            Scalar fp32 tensor containing the sum-reduced loss.
-        """
-        chunk_len = _validate_chunk_len(chunk_len)
-        if logits.ndim != 2 or labels.ndim != 1 or logits.shape[0] != labels.shape[0]:
-            raise ValueError(
-                "_ChunkedCrossEntropySum requires logits shaped [tokens, vocab] and labels shaped [tokens]; "
-                f"got logits.shape={tuple(logits.shape)} and labels.shape={tuple(labels.shape)}."
-            )
-        has_loss_weights = loss_weights is not None
-        if has_loss_weights and loss_weights.shape != labels.shape:
-            raise ValueError(
-                f"loss_weights.shape must match labels.shape, got {tuple(loss_weights.shape)} and {tuple(labels.shape)}"
-            )
-
-        valid = labels != ignore_index
-        safe_labels = torch.where(valid, labels, torch.zeros_like(labels))
-        total = torch.zeros((), dtype=torch.float32, device=logits.device)
-        for start in range(0, logits.shape[0], chunk_len):
-            end = min(start + chunk_len, logits.shape[0])
-            logits_chunk = logits[start:end].float()
-            log_normalizer = torch.logsumexp(logits_chunk, dim=-1)
-            target_logits = logits_chunk.gather(1, safe_labels[start:end].unsqueeze(1)).squeeze(1)
-            term = (log_normalizer - target_logits) * valid[start:end]
-            if has_loss_weights:
-                term = term * loss_weights[start:end]
-            total = total + term.sum()
-
-        ctx.save_for_backward(logits, safe_labels, valid, loss_weights)
-        ctx.chunk_len = chunk_len
-        ctx.has_loss_weights = has_loss_weights
-        return total
-
-    @staticmethod
-    @torch.autograd.function.once_differentiable
-    def backward(ctx, grad_out: torch.Tensor) -> tuple[torch.Tensor, None, None, None, None]:
-        """Recompute the fp32 softmax chunks and return the logits gradient.
-
-        Args:
-            ctx: Autograd context containing the original-dtype tensors saved by
-                :meth:`forward`.
-            grad_out: Scalar tensor containing the upstream loss gradient.
-
-        Returns:
-            Tuple whose first element is the logits gradient of shape [tokens,
-            vocab] in the logits' original dtype. The remaining entries are
-            ``None`` for non-differentiable inputs.
-        """
-        logits, safe_labels, valid, loss_weights = ctx.saved_tensors
-        grad = torch.empty_like(logits)
-        for start in range(0, logits.shape[0], ctx.chunk_len):
-            end = min(start + ctx.chunk_len, logits.shape[0])
-            logits_chunk = logits[start:end].float()
-            grad_chunk = torch.softmax(logits_chunk, dim=-1)
-            grad_chunk.scatter_add_(
-                1,
-                safe_labels[start:end].unsqueeze(1),
-                torch.full((end - start, 1), -1.0, dtype=torch.float32, device=logits.device),
-            )
-            scale = valid[start:end].unsqueeze(1) * grad_out
-            if ctx.has_loss_weights:
-                scale = scale * loss_weights[start:end].unsqueeze(1)
-            grad_chunk = grad_chunk * scale
-            grad[start:end] = grad_chunk.to(grad.dtype)
-        return grad, None, None, None, None
+from nemo_automodel.components.loss.linear_ce_base import LinearCrossEntropy
 
 
 def compute_cross_entropy(
     logits: torch.Tensor,
     targets: torch.Tensor,
-    ignore_index=-100,
-    reduction="sum",
-):
-    """Computes the cross-entropy loss between logits and targets.
+    ignore_index: int = -100,
+    reduction: str = "sum",
+) -> torch.Tensor:
+    """Compute fp32 CE.
 
     Args:
-        logits (torch.Tensor): Model predictions of shape (sequence_length, num_classes).
-        targets (torch.Tensor): Ground-truth labels of shape (sequence_length,).
-        ignore_index (int, optional): Target value that is ignored when computing the loss.
-            Defaults to -100.
+        logits: Scores shaped [tokens, vocab].
+        targets: Class indices shaped [tokens].
+        ignore_index: Ignored target value.
+        reduction: PyTorch CE reduction.
 
     Returns:
-        torch.Tensor: The sum of cross-entropy losses over the sequence.
+        Scalar loss, or [tokens] losses for reduction="none".
     """
     return F.cross_entropy(logits.float(), targets, ignore_index=ignore_index, reduction=reduction)
 
 
-class ChunkedCrossEntropy(nn.Module):
-    """Cross-entropy loss computed over sequence chunks."""
+def _linear_cross_entropy(
+    hidden: torch.Tensor, weight: torch.Tensor, labels: torch.Tensor, ignore_index: int
+) -> torch.Tensor:
+    """Project one token chunk and compute CE.
+
+    Args:
+        hidden: Local hidden states shaped [chunk_tokens, hidden].
+        weight: Dense LM-head weight shaped [vocab, hidden].
+        labels: Target indices shaped [chunk_tokens].
+        ignore_index: Ignored target value.
+
+    Returns:
+        FP32 losses shaped [chunk_tokens].
+    """
+    return compute_cross_entropy(F.linear(hidden, weight), labels, ignore_index, "none")
+
+
+class _ChunkedLinearCE(torch.autograd.Function):
+    @staticmethod
+    @torch.amp.custom_fwd(device_type="cuda")
+    def forward(
+        ctx: Any,
+        hidden: torch.Tensor,
+        weight: torch.Tensor,
+        labels: torch.Tensor,
+        chunk_len: int,
+        ignore_index: int,
+        compute_loss: Callable[[torch.Tensor, torch.Tensor, torch.Tensor, int], torch.Tensor],
+    ) -> torch.Tensor:
+        """Compute chunk losses without retaining logits.
+
+        Args:
+            ctx: Autograd context.
+            hidden: Local hidden states shaped [tokens, hidden].
+            weight: Dense projection weight shaped [vocab, hidden].
+            labels: Target indices shaped [tokens].
+            chunk_len: Maximum token rows per projection.
+            ignore_index: Ignored target value.
+            compute_loss: Eager or compiled per-chunk loss.
+
+        Returns:
+            FP32 losses shaped [tokens]; inputs are not mutated.
+        """
+        losses = torch.empty(labels.shape, dtype=torch.float32, device=hidden.device)
+        for start in range(0, hidden.shape[0], chunk_len):
+            end = start + chunk_len
+            losses[start:end] = compute_loss(hidden[start:end], weight, labels[start:end], ignore_index)
+        ctx.save_for_backward(hidden, weight, labels)
+        ctx.chunk_len = chunk_len
+        ctx.ignore_index = ignore_index
+        ctx.compute_loss = compute_loss
+        return losses
+
+    @staticmethod
+    @torch.autograd.function.once_differentiable
+    @torch.amp.custom_bwd(device_type="cuda")
+    def backward(
+        ctx: Any, grad_out: torch.Tensor
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, None, None, None, None]:
+        """Recompute one projection/CE graph at a time.
+
+        Args:
+            ctx: Context holding [tokens, hidden] states, [vocab, hidden]
+                weight and [tokens] labels.
+            grad_out: Upstream loss gradients shaped [tokens].
+
+        Returns:
+            Hidden-state and weight gradients matching the original shapes and
+            dtypes, followed by four None entries. No input is mutated.
+        """
+        hidden, weight, labels = ctx.saved_tensors
+        need_hidden, need_weight = ctx.needs_input_grad[:2]
+        grad_hidden = torch.empty_like(hidden) if need_hidden else None
+        # Accumulate across chunks in fp32, avoiding repeated bf16 rounding.
+        accum_dtype = torch.float64 if weight.dtype == torch.float64 else torch.float32
+        grad_weight = torch.zeros_like(weight, dtype=accum_dtype) if need_weight else None
+        with torch.enable_grad():
+            local_weight = weight.detach().requires_grad_(need_weight)
+            for start in range(0, hidden.shape[0], ctx.chunk_len):
+                end = start + ctx.chunk_len
+                local_hidden = hidden[start:end].detach().requires_grad_(need_hidden)
+                inputs = [x for x in (local_hidden, local_weight) if x.requires_grad]
+                loss = ctx.compute_loss(local_hidden, local_weight, labels[start:end], ctx.ignore_index)
+                grads = torch.autograd.grad(loss, inputs, grad_out[start:end])
+                if need_hidden:
+                    grad_hidden[start:end] = grads[0]
+                if need_weight:
+                    grad_weight.add_(grads[-1])
+                del loss, grads
+        return grad_hidden, grad_weight.to(weight.dtype) if need_weight else None, None, None, None, None
+
+
+class ChunkedCrossEntropy(LinearCrossEntropy):
+    """Chunk the LM-head projection and CE, recomputing each chunk in backward.
+
+    Unlike a logits-based loss, this consumes final hidden states and the
+    projection weight. Neither full logits nor a full logits gradient is
+    allocated. Only one chunk's vocabulary activations are live at a time.
+    Higher-order gradients are not supported.
+    """
 
     def __init__(
         self,
-        chunk_len: int = 32,
+        chunk_len: int = 512,
         compile: bool = True,
         ignore_index: int = -100,
         reduction: str = "sum",
-    ):
-        """
-        Chunked cross-entropy loss.
-
-        With the default ``reduction="sum"`` the loss is computed by the
-        memory-efficient chunked kernel (:class:`_ChunkedCrossEntropySum`): each
-        ``[chunk_len, V]`` slice is upcast to fp32 transiently, only the
-        original-dtype logits are saved for backward, and the softmax is
-        recomputed per chunk in backward. Other reductions fall back to the
-        legacy per-chunk ``torch.compile``-d ``F.cross_entropy`` loop.
+    ) -> None:
+        """Initialize chunked projection/CE.
 
         Args:
-            chunk_len (int, optional): The size of each chunk. The sequence will be split
-                along the first dimension in chunks of this length. Defaults to 32.
-            compile (bool, optional): If True, uses the compiled compute_cross_entropy function
-                on the legacy (non-"sum") path. The "sum" path uses the chunked kernel and
-                does not involve ``torch.compile``. Defaults to True.
-            ignore_index (int, optional): Target value that is ignored when computing the loss.
-                Defaults to -100.
-            reduction (str, optional): Type of reduction. Defaults to "sum".
+            chunk_len: Maximum token rows per chunk; must be positive.
+            compile: Compile the per-chunk projection and CE, including backward.
+            ignore_index: Ignored target value.
+            reduction: "sum", "mean", or "none" across all valid tokens.
         """
         super().__init__()
-        self.chunk_len = _validate_chunk_len(chunk_len)
+        if chunk_len <= 0:
+            raise ValueError(f"chunk_len must be greater than zero; got {chunk_len}.")
+        if reduction not in ("sum", "mean", "none"):
+            raise ValueError(f"Unsupported reduction: {reduction!r}")
+        self.chunk_len = chunk_len
         self.compile = compile
         self.ignore_index = ignore_index
         self.reduction = reduction
+        self._compute_loss: Callable[[torch.Tensor, torch.Tensor, torch.Tensor, int], torch.Tensor] = (
+            torch.compile(_linear_cross_entropy, dynamic=True) if compile else _linear_cross_entropy
+        )
 
     def forward(
         self,
-        logits: torch.Tensor,
+        hidden_states: torch.Tensor,
         labels: torch.Tensor,
-        mask: torch.Tensor | None = None,
+        lm_weight: torch.Tensor,
         num_label_tokens: int | None = None,
+        grad_reduce_group: dist.ProcessGroup | None = None,
         loss_weights: torch.Tensor | None = None,
+        *,
+        mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Computes cross-entropy loss in chunks to handle long sequences more efficiently.
+        """Compute CE directly from hidden states, with no full-logit allocation.
 
         Args:
-            logits: Model output tensor of shape [..., vocab], with arbitrary
-                leading token dimensions.
-            labels: Target indices of shape [...] matching ``logits.shape[:-1]``.
-                When ``mask`` is provided, ignored positions are replaced with
-                ``ignore_index`` in this tensor.
-            mask: Optional tensor of shape [...] matching ``labels``. Nonzero
-                positions contribute to the loss and zero positions are ignored.
-            num_label_tokens: Optional global count used to normalize the
-                sum-reduced scalar loss.
-            loss_weights: Optional per-token multipliers matching
-                ``labels.shape``. Only supported with ``reduction="sum"``.
+            hidden_states: Rank-local states shaped [..., hidden], with arbitrary
+                leading token dimensions, including packed [tokens, hidden].
+            labels: Target indices shaped [...] matching the token dimensions.
+            lm_weight: Weight shaped [vocab, hidden]; FSDP DTensors use the
+                LinearCrossEntropy.materialize_lm_weight contract. TP-sharded
+                vocabulary/hidden states are not supported by this loss.
+            num_label_tokens: Global count normalizing a sum-reduced loss.
+            grad_reduce_group: DP/CP group contributing independent token losses.
+            loss_weights: Optional constant multipliers shaped [...], sum only.
+            mask: Optional mask shaped [...]; zero positions are ignored.
 
         Returns:
-            Scalar tensor containing the reduced cross-entropy loss.
+            FP32 scalar, or losses shaped [...] for reduction="none". Inputs
+            are not mutated. A fully ignored sum is zero with zero gradients.
         """
-        # copied the following block from masked_ce
-        # this may happen with CPUOffloadPolicy
-        if labels.device != logits.device:
-            labels = labels.to(logits.device)  # pragma: no cover
-        labels_shape = labels.shape
-        if loss_weights is not None:
-            if self.reduction != "sum":
-                raise ValueError("loss_weights is only supported when reduction is 'sum'")
-            if loss_weights.shape != labels_shape:
-                raise ValueError(
-                    f"loss_weights.shape must match labels.shape, got {tuple(loss_weights.shape)} "
-                    f"and {tuple(labels_shape)}"
-                )
-            loss_weights = loss_weights.reshape(-1).to(device=logits.device, dtype=torch.float32)
-
-        # reshape to (N, C) and (N,) respectively
-        logits = logits.view(-1, logits.size(-1))
-        labels = labels.view(-1)
+        if hidden_states.shape[:-1] != labels.shape:
+            raise ValueError("hidden_states token dimensions must match labels.shape")
+        if lm_weight.ndim != 2 or hidden_states.shape[-1] != lm_weight.shape[-1]:
+            raise ValueError("lm_weight must have shape [vocab, hidden] matching hidden_states")
+        if (num_label_tokens is not None or loss_weights is not None) and self.reduction != "sum":
+            raise ValueError("num_label_tokens and loss_weights are only supported when reduction is 'sum'")
+        labels = labels.to(hidden_states.device)
         if mask is not None:
-            with torch.no_grad():
-                if mask.device != labels.device:
-                    mask = mask.to(labels.device)  # pragma: no cover
-                labels.masked_fill_(mask.view(-1) == 0, self.ignore_index)
-                del mask
-
-        if self.reduction == "sum":
-            # Save only original-dtype logits and recompute each fp32 softmax
-            # chunk in backward.
-            loss = _ChunkedCrossEntropySum.apply(
-                logits,
-                labels,
-                loss_weights,
-                self.ignore_index,
-                self.chunk_len,
-            )
-        else:
-            compute_loss = compute_cross_entropy
-            if self.compile:
-                global _compiled_compute_cross_entropy
-                if _compiled_compute_cross_entropy is None:
-                    _compiled_compute_cross_entropy = torch.compile(compute_cross_entropy, dynamic=True)
-                compute_loss = _compiled_compute_cross_entropy
-
-            seq_len = logits.shape[0]
-            num_chunks = (seq_len + self.chunk_len - 1) // self.chunk_len
-            loss = 0.0
-            for logits_chunk, targets_chunk in zip(logits.chunk(num_chunks, dim=0), labels.chunk(num_chunks, dim=0)):
-                loss += compute_loss(logits_chunk, targets_chunk, self.ignore_index, self.reduction)
+            if mask.shape != labels.shape:
+                raise ValueError("mask.shape must match labels.shape")
+            labels = labels.masked_fill(mask.to(labels.device) == 0, self.ignore_index)
+        if loss_weights is not None and loss_weights.shape != labels.shape:
+            raise ValueError("loss_weights.shape must match labels.shape")
+        weight = self.materialize_lm_weight(lm_weight, grad_reduce_group=grad_reduce_group)
+        # FSDP can expose fp32 master weights outside the head's forward.
+        weight = weight.to(hidden_states.dtype)
+        losses = _ChunkedLinearCE.apply(
+            hidden_states.reshape(-1, hidden_states.shape[-1]),
+            weight,
+            labels.reshape(-1),
+            self.chunk_len,
+            self.ignore_index,
+            self._compute_loss,
+        ).reshape(labels.shape)
+        if loss_weights is not None:
+            losses = losses * loss_weights.to(device=losses.device, dtype=torch.float32)
+        if self.reduction == "none":
+            return losses
+        loss = losses.sum()
+        if self.reduction == "mean":
+            loss = loss / (labels != self.ignore_index).sum()
         if num_label_tokens is not None:
-            if self.reduction != "sum":
-                raise ValueError("num_label_tokens is only supported when reduction is 'sum'")
-            loss = loss * 0.0 if num_label_tokens == 0 else loss / num_label_tokens  # pragma: no cover
+            loss = loss * 0.0 if num_label_tokens == 0 else loss / num_label_tokens
         return loss

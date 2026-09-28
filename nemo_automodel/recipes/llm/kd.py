@@ -61,7 +61,7 @@ from nemo_automodel.components.distributed.pipelining.config import PipelineConf
 from nemo_automodel.components.distributed.tp_replicas import synchronize_tp_replica_gradients
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
-from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+from nemo_automodel.components.loss.linear_ce_base import LinearCrossEntropy
 from nemo_automodel.components.loss.utils import (
     _count_label_tokens,
     _get_loss_ignore_index,
@@ -363,11 +363,11 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         teacher_device = self.dist_env.device if not self._offload_teacher_model else "cpu"
 
         if self.pp_enabled:
-            # FusedLinearCrossEntropy needs hidden_states; the last PP stage only has logits.
-            if isinstance(self.loss_fn, FusedLinearCrossEntropy):
+            # Linear CE needs hidden_states; the last PP stage only has logits.
+            if isinstance(self.loss_fn, LinearCrossEntropy):
                 raise ValueError(
                     "Pipeline parallelism with KD requires a loss that uses only logits and labels "
-                    "(e.g. MaskedCrossEntropy). FusedLinearCrossEntropy is not supported for PP KD."
+                    f"(e.g. MaskedCrossEntropy). {type(self.loss_fn).__name__} is not supported for PP KD."
                 )
             self.teacher_model = _build_teacher_model_with_pp(
                 cfg_teacher=self.cfg.get("teacher_model", None),

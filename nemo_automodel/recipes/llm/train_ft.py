@@ -81,7 +81,8 @@ from nemo_automodel.components.loggers.mlflow_utils import (
     to_float_metrics,
 )
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
-from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy
+from nemo_automodel.components.loss.linear_ce_base import LinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.loss.mtp import calculate_mtp_loss
 from nemo_automodel.components.loss.utils import (
@@ -175,6 +176,8 @@ def _should_precompute_pp_causal_masks(model_config: Any) -> bool:
 def _maybe_downgrade_loss_fn(loss_fn: nn.Module, probe_module: nn.Module, pp_enabled: bool) -> nn.Module:
     """Downgrade to MaskedCrossEntropy when the requested loss cannot run."""
     if not _supports_logits_to_keep(probe_module) and not isinstance(loss_fn, MaskedCrossEntropy):
+        if isinstance(loss_fn, ChunkedCrossEntropy):
+            raise ValueError("ChunkedCrossEntropy requires a model supporting logits_to_keep to avoid full logits")
         logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
         return MaskedCrossEntropy(
             ignore_index=_get_loss_ignore_index(loss_fn),
@@ -182,9 +185,11 @@ def _maybe_downgrade_loss_fn(loss_fn: nn.Module, probe_module: nn.Module, pp_ena
         )
     if (
         pp_enabled
-        and isinstance(loss_fn, FusedLinearCrossEntropy)
+        and isinstance(loss_fn, LinearCrossEntropy)
         and not getattr(probe_module, "_pp_return_hidden_states_supported", False)
     ):
+        if isinstance(loss_fn, ChunkedCrossEntropy):
+            raise ValueError("ChunkedCrossEntropy requires pipeline stages that can return hidden states")
         logger.warning(
             "FusedLinearCrossEntropy is not supported under pipeline parallelism for this "
             "model. Using MaskedCrossEntropy instead."
@@ -652,10 +657,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     f"domain_mixture requires a loss function with explicit reduction='sum'; got {reduction!r}"
                 )
             _validate_domain_sampling_weights(self.domain_mixture, self.cfg.dataloader)
-        if self.magi.hf_dispatch and isinstance(self.loss_fn, FusedLinearCrossEntropy):  # pragma: no cover
+        if self.magi.hf_dispatch and isinstance(self.loss_fn, LinearCrossEntropy):  # pragma: no cover
             raise ValueError(
                 "The magi HF backend needs full logits and is incompatible with "
-                "FusedLinearCrossEntropy; use a logits-based loss (e.g. MaskedCrossEntropy)."
+                f"{type(self.loss_fn).__name__}; use a logits-based loss (e.g. MaskedCrossEntropy)."
             )
 
         # Pipeline runtime fields: override pp_batch_size and pp_microbatch_size
@@ -1036,8 +1041,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if last_stage_model is None:
             raise RuntimeError("Pipeline reports a last stage, but no last-stage model part was found")
 
-        # FusedLinearCrossEntropy consumes hidden states: flag the last stage to emit them
-        if isinstance(self.loss_fn, FusedLinearCrossEntropy):
+        # Linear CE consumes hidden states: flag the last stage to emit them
+        if isinstance(self.loss_fn, LinearCrossEntropy):
             last_stage_model._pp_return_hidden_states = True
 
         self.pp.info.schedule._loss_fn = self.cfg.mtp.build(
@@ -1316,22 +1321,22 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             )
             with train_ctx(), sync_ctx, fp8_ctx:
                 batch = filter_forward_kwargs(model, batch)
-                if isinstance(self.loss_fn, FusedLinearCrossEntropy):
+                if isinstance(self.loss_fn, LinearCrossEntropy):
                     # use num_logits_to_keep to avoid full logits matrix in memory
-                    out = model(logits_to_keep=1, **batch)
+                    out = model(**{**batch, "logits_to_keep": 1, "output_hidden_states": True})
                     if "hidden_states" not in out:
                         raise ValueError(
-                            "FusedLinearCrossEntropy requires the model to output hidden states. Set `model.output_hidden_states=True` in the config."
+                            f"{type(self.loss_fn).__name__} requires the model to output hidden states. Set `model.output_hidden_states=True` in the config."
                         )
                 else:
                     out = model(**batch)
 
                 # Gather the LM head once and share it across the main loss and
-                # all MTP depths (FusedLinearCrossEntropy path) to avoid redundant
+                # all MTP depths (linear CE path) to avoid redundant
                 # full_tensor() gathers that accumulate on-device and OOM.
                 loss_distributed_kwargs = {}
                 shared_lm_weight = None
-                if isinstance(self.loss_fn, FusedLinearCrossEntropy):
+                if isinstance(self.loss_fn, LinearCrossEntropy):
                     grad_reduce_group = self._get_dp_group(include_cp=True) if is_train else None
                     shared_lm_weight = self.loss_fn.materialize_lm_weight(
                         _get_lm_head_weight(model),

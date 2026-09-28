@@ -18,7 +18,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+from nemo_automodel.components.loss.linear_ce_base import LinearCrossEntropy
 
 _DATASET_IGNORE_INDEX = -100
 
@@ -137,17 +137,17 @@ def _get_final_hidden_states(model_output: Any) -> Any | None:
 
 
 def calculate_loss(loss_fn: nn.Module, **kwargs: Any) -> torch.Tensor:
-    """Calculate a logit-based or fused linear cross-entropy loss.
+    """Calculate a logits-based or linear-projection cross-entropy loss.
 
     Args:
-        loss_fn: Loss module. ``FusedLinearCrossEntropy`` consumes
+        loss_fn: Loss module. ``LinearCrossEntropy`` implementations consume
             ``hidden_states`` with shape ``[batch, sequence, hidden]``, labels
             with shape ``[batch, sequence]``, and an LM-head weight with global
             shape ``[vocab, hidden]``. Other loss modules consume logits with
             shape ``[batch, sequence, vocab]`` and labels.
         **kwargs: Loss inputs. Rank-local tensors keep their existing layout;
             ``grad_reduce_group`` describes the ranks contributing independent
-            fused-loss shards. The caller's mapping and tensors are not mutated.
+            linear-loss shards. The caller's mapping and tensors are not mutated.
 
     Returns:
         Scalar loss tensor that does not alias an input.
@@ -157,7 +157,7 @@ def calculate_loss(loss_fn: nn.Module, **kwargs: Any) -> torch.Tensor:
     loss_weights = kwargs.pop("loss_weights", None)
     if loss_weights is not None:
         loss_fn_kwargs["loss_weights"] = loss_weights
-    if isinstance(loss_fn, FusedLinearCrossEntropy):
+    if isinstance(loss_fn, LinearCrossEntropy):
         model = kwargs.pop("model")
         # Reuse a caller-materialized LM head when provided so a single
         # full_tensor() all-gather is shared across the main loss and every MTP
