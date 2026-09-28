@@ -181,8 +181,15 @@ def _fully_shard_once(module: nn.Module, *, mesh, mp_policy, offload_policy, fp3
 
 def _iter_dsv4_fp32_modules(module: nn.Module):
     seen: set[int] = set()
+    selected_prefixes: list[str] = []
     for name, submodule in module.named_modules():
         if not name or id(submodule) in seen:
+            continue
+        # Activation checkpointing replaces an fp32 island with a wrapper that
+        # recursively contains the original module.  Once the wrapper is an
+        # FSDP unit, selecting its child as another unit would shard the same
+        # parameter twice on the same mesh.
+        if any(name.startswith(f"{prefix}.") for prefix in selected_prefixes):
             continue
         # A standalone vision tower names its final norm simply "norm".
         # Match the shared vision norm type as well as paths relative to a model.
@@ -193,6 +200,7 @@ def _iter_dsv4_fp32_modules(module: nn.Module):
         if _floating_param_dtypes(submodule) != {torch.float32}:
             continue
         seen.add(id(submodule))
+        selected_prefixes.append(name)
         yield submodule
 
 
