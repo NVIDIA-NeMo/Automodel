@@ -624,7 +624,21 @@ def _style_axes(axis: Any) -> None:
     axis.spines[["top", "right"]].set_visible(False)
 
 
-def _architecture_label(architecture: str, mode: str) -> str:
+def _collapse_identical_ttt_rows(rows: list[ReportRow]) -> tuple[list[ReportRow], bool]:
+    """Drop redundant TTT-off rows when every complete on/off pair is identical."""
+    paired: dict[tuple[Any, ...], dict[str, float | int]] = {}
+    for row in rows:
+        if row.ttt_mode not in {"on", "off"} or not row.valid or not row.complete or row.value is None:
+            continue
+        key = (row.source, row.architecture, row.task_or_benchmark, row.context_length, row.metric)
+        paired.setdefault(key, {})[row.ttt_mode] = row.value
+    matched = [modes for modes in paired.values() if modes.keys() == {"on", "off"}]
+    if matched and all(modes["on"] == modes["off"] for modes in matched):
+        return [row for row in rows if row.ttt_mode != "off"], True
+    return rows, False
+
+
+def _architecture_label(architecture: str, mode: str, *, include_ttt_mode: bool = True) -> str:
     labels = {
         "local_raw": "Local attention · raw-size control",
         "local_matched": "Local attention · matched floor",
@@ -634,7 +648,9 @@ def _architecture_label(architecture: str, mode: str) -> str:
         "mac_no_persistent": "MAC · no persistent memory",
     }
     label = labels.get(architecture, architecture)
-    return label if architecture in {"local_raw", "local_matched", "full_matched"} else f"{label} · TTT {mode}"
+    if architecture in {"local_raw", "local_matched", "full_matched"} or not include_ttt_mode:
+        return label
+    return f"{label} · TTT {mode}"
 
 
 def _architecture_style(architecture: str, mode: str) -> tuple[str, str]:
@@ -647,6 +663,7 @@ def _architecture_style(architecture: str, mode: str) -> tuple[str, str]:
 
 def plot_ruler(rows: list[ReportRow], output_dir: Path, task_overrides: dict[str, str], plt: Any) -> list[Path]:
     """Render S-NIAH accuracy-versus-context figures without imputing absent cells."""
+    rows, collapsed_ttt = _collapse_identical_ttt_rows(rows)
     outputs: list[Path] = []
     labels = {
         "pk": ("S-NIAH-PK / noise", "titans_s_niah_pk_noise"),
@@ -677,7 +694,7 @@ def plot_ruler(rows: list[ReportRow], output_dir: Path, task_overrides: dict[str
                 linestyle=linestyle,
                 marker=marker,
                 linewidth=2,
-                label=_architecture_label(architecture, mode),
+                label=_architecture_label(architecture, mode, include_ttt_mode=not collapsed_ttt),
             )
         if not grouped:
             axis.text(
@@ -698,6 +715,7 @@ def plot_ruler(rows: list[ReportRow], output_dir: Path, task_overrides: dict[str
 
 def plot_mac_recovery(rows: list[ReportRow], output_dir: Path, task_overrides: dict[str, str], plt: Any) -> list[Path]:
     """Plot MAC bridge recovery between exact-cell matched local and full-attention controls."""
+    rows, collapsed_ttt = _collapse_identical_ttt_rows(rows)
     usable = [
         row
         for row in rows
@@ -739,7 +757,7 @@ def plot_mac_recovery(rows: list[ReportRow], output_dir: Path, task_overrides: d
                 linestyle=linestyle,
                 marker=marker,
                 linewidth=2,
-                label=_architecture_label(architecture, mode),
+                label=_architecture_label(architecture, mode, include_ttt_mode=not collapsed_ttt),
             )
             plotted_any = True
         axis.axhline(0, color="#777", linewidth=0.8)
@@ -764,6 +782,7 @@ def plot_mac_recovery(rows: list[ReportRow], output_dir: Path, task_overrides: d
 
 def plot_lm(rows: list[ReportRow], output_dir: Path, plt: Any) -> list[Path]:
     """Render standard-LM comparison panels for requested metrics."""
+    rows, collapsed_ttt = _collapse_identical_ttt_rows(rows)
     outputs: list[Path] = []
     configurations = (
         ("wikitext103", ("perplexity", "bits_per_byte"), "WikiText-103", "titans_lm_wikitext103"),
@@ -814,14 +833,14 @@ def plot_lm(rows: list[ReportRow], output_dir: Path, plt: Any) -> list[Path]:
                     linestyle="-" if mode == "on" else "--" if mode == "off" else ":",
                     marker="o",
                     linewidth=2,
-                    label=f"TTT {mode}",
+                    label=None if collapsed_ttt else f"TTT {mode}",
                 )
                 plotted = True
             axis.set_title(ylabels[metric], fontsize=10)
             axis.set_xticks(x_positions, architectures, rotation=25, ha="right")
             if metric == "last_word_exact_accuracy":
                 axis.set_ylim(0, 1)
-            if plotted:
+            if plotted and not collapsed_ttt:
                 axis.legend(frameon=False, fontsize=8)
             else:
                 axis.text(0.5, 0.5, "Unavailable", ha="center", va="center", transform=axis.transAxes)

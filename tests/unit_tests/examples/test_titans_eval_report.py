@@ -207,6 +207,37 @@ def test_plots_mac_recovery_only_from_exact_matched_control_cells(tmp_path: Path
     }
 
 
+def test_collapses_only_globally_identical_ttt_pairs() -> None:
+    base = {
+        "source": "lm",
+        "architecture": "mac",
+        "task_or_benchmark": "wikitext103",
+        "context_length": None,
+        "metric": "perplexity",
+        "unit": "ratio",
+        "sample_count": 2,
+        "token_count": 11,
+        "valid": True,
+        "complete": True,
+        "status": "ok",
+        "checkpoint": None,
+        "code_revision": None,
+        "artifact": "summary.json",
+        "artifacts": "[]",
+    }
+    on = REPORT.ReportRow(ttt_mode="on", value=4.5, **base)
+    off = REPORT.ReportRow(ttt_mode="off", value=4.5, **base)
+
+    collapsed, did_collapse = REPORT._collapse_identical_ttt_rows([on, off])
+
+    assert did_collapse is True
+    assert collapsed == [on]
+    differing = REPORT.ReportRow(ttt_mode="off", value=4.6, **base)
+    unchanged, did_collapse = REPORT._collapse_identical_ttt_rows([on, differing])
+    assert did_collapse is False
+    assert unchanged == [on, differing]
+
+
 def test_writes_outputs_and_self_contained_report(tmp_path: Path) -> None:
     ruler_root = tmp_path / "ruler"
     lm_root = tmp_path / "lm"
