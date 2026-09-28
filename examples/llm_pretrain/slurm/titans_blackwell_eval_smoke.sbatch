@@ -8,6 +8,8 @@ TITANS_WORK_ROOT=${TITANS_WORK_ROOT:-$(cd "$AUTOMODEL_CHECKOUT/../.." && pwd)}
 TITANS_IMAGE=${TITANS_IMAGE:-nvcr.io#nvidia/nemo-automodel:26.04}
 TOKENIZER=${TITANS_TOKENIZER:-NousResearch/Llama-2-7b-hf}
 PROMPT=${TITANS_SMOKE_PROMPT:-"The passkey is 314159. Question: What is the passkey? Answer:"}
+MODEL_REGISTRY=${TITANS_MODEL_REGISTRY:-"$AUTOMODEL_CHECKOUT/examples/llm_pretrain/titans_eval_registry.json"}
+MODEL_NAME=${TITANS_MODEL_NAME:-}
 
 if [[ ${TITANS_EVAL_IN_CONTAINER:-0} != 1 ]]; then
   exec srun \
@@ -22,6 +24,8 @@ if [[ ${TITANS_EVAL_IN_CONTAINER:-0} != 1 ]]; then
       TITANS_WORK_ROOT="$TITANS_WORK_ROOT" \
       TITANS_TOKENIZER="$TOKENIZER" \
       TITANS_SMOKE_PROMPT="$PROMPT" \
+      TITANS_MODEL_REGISTRY="$MODEL_REGISTRY" \
+      TITANS_MODEL_NAME="$MODEL_NAME" \
       PYTHONPATH="$AUTOMODEL_CHECKOUT${PYTHONPATH:+:$PYTHONPATH}" \
       HF_HOME="$TITANS_WORK_ROOT/cache/huggingface" \
       bash "$AUTOMODEL_CHECKOUT/examples/llm_pretrain/slurm/titans_blackwell_eval_smoke.sbatch"
@@ -34,17 +38,19 @@ export HF_HOME=${HF_HOME:-"$TITANS_WORK_ROOT/cache/huggingface"}
 RESULT_ROOT="$TITANS_WORK_ROOT/results/eval/smoke"
 mkdir -p "$RESULT_ROOT"
 
-declare -A RUNS=(
-  [lmm]=titans-170m-baseline-15B-blackwell-optimized
-  [mac]=titans-170m-mac-15B-blackwell-mac-v1
-  [mag]=titans-170m-mag-15B-blackwell-mag-v1
-  [mal]=titans-170m-mal-15B-blackwell-mal-v1
+model_args=()
+[[ -n $MODEL_NAME ]] && model_args=(--model "$MODEL_NAME")
+mapfile -t model_rows < <(
+  python examples/llm_pretrain/titans_eval_registry.py \
+    "$MODEL_REGISTRY" --work-root "$TITANS_WORK_ROOT" "${model_args[@]}"
 )
+(( ${#model_rows[@]} )) || { echo "Model registry has no enabled checkpoints" >&2; exit 1; }
+declare -A seen=()
 
-for architecture in lmm mac mag mal; do
-  root="$TITANS_WORK_ROOT/outputs/${RUNS[$architecture]}"
-  latest=$(readlink "$root/LATEST")
-  checkpoint="$root/$latest/model/consolidated"
+for model_row in "${model_rows[@]}"; do
+  IFS=$'\t' read -r architecture checkpoint enable_ttt <<<"$model_row"
+  [[ -z ${seen[$architecture]:-} ]] || continue
+  seen[$architecture]=1
   output="$RESULT_ROOT/${architecture}.jsonl"
 
   echo "=== $architecture: $checkpoint ==="
@@ -53,6 +59,7 @@ for architecture in lmm mac mag mal; do
     --tokenizer "$TOKENIZER" \
     --prompt "$PROMPT" \
     --max-new-tokens 1 \
+    --enable-ttt-updates \
     --output-jsonl "$output"
 
   python - "$output" "$architecture" <<'PY'
