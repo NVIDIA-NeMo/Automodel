@@ -23,6 +23,7 @@ from nemo_automodel.components.moe.state_dict_utils import (
     create_dtensor_from_local,
     get_expert_range_for_rank_from_mesh,
     get_expert_slice_for_rank,
+    get_sharded_expert_range,
     is_dtensor,
     should_load_expert_for_rank,
     split_experts_weights_dtensor_aware,
@@ -42,6 +43,24 @@ class TestIsDtensor:
             mock_tensor = Mock(spec=DTensor)
             mock_tensor.__class__ = DTensor
             assert is_dtensor(mock_tensor)
+
+
+class TestGetShardedExpertRange:
+    @pytest.mark.parametrize("n_experts, world_size", [(64, 8), (5, 4), (10, 4), (60, 8), (64, 24), (3, 5)])
+    def test_matches_torch_chunk_layout(self, n_experts, world_size):
+        """The ranges must match how Shard(0) and FSDP2 actually lay out the expert dimension."""
+        chunk_sizes = [len(c) for c in torch.chunk(torch.arange(n_experts), world_size)]
+        chunk_sizes += [0] * (world_size - len(chunk_sizes))
+
+        ranges = [get_sharded_expert_range(n_experts, world_size, rank) for rank in range(world_size)]
+
+        assert [end - start for start, end in ranges] == chunk_sizes
+        assert ranges[0][0] == 0 and ranges[-1][1] == n_experts
+        assert all(prev[1] == cur[0] for prev, cur in zip(ranges, ranges[1:]))
+
+    def test_trailing_ranks_can_hold_no_experts(self):
+        assert get_sharded_expert_range(5, 4, 3) == (5, 5)
+        assert get_sharded_expert_range(64, 24, 23) == (64, 64)
 
 
 class TestGetExpertSliceForRank:

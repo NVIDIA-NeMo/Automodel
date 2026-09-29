@@ -225,7 +225,7 @@ class KimiLinear48BStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdap
         """
         from torch.distributed._tensor.placement_types import Replicate, Shard
 
-        from nemo_automodel.components.moe.state_dict_utils import get_submesh, is_dtensor
+        from nemo_automodel.components.moe.state_dict_utils import get_sharded_expert_range, get_submesh, is_dtensor
 
         if not is_dtensor(weight) or "ep" in weight.device_mesh.mesh_dim_names:
             return super()._split_experts_weights(weight, n_experts)
@@ -244,9 +244,8 @@ class KimiLinear48BStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdap
             else:
                 mesh_rank = weight.device_mesh.get_local_rank()
                 mesh_size = weight.device_mesh.size()
-            # DTensor Shard(0) and FSDP2 split with torch.chunk semantics: leading ranks hold
-            # ceil(n_experts / mesh_size) experts and trailing ranks the remainder or nothing.
-            local_n_experts, start_expert = Shard.local_shard_size_and_offset(n_experts, mesh_size, mesh_rank)
+            start_expert, end_expert = get_sharded_expert_range(n_experts, mesh_size, mesh_rank)
+            local_n_experts = end_expert - start_expert
         else:
             start_expert = 0
             local_n_experts = local_tensor.shape[0]
