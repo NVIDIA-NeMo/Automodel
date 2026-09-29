@@ -23,6 +23,7 @@ from unittest.mock import patch
 import numpy as np
 import pytest
 
+from nemo_automodel.components.datasets.llm.megatron import megatron_utils
 from nemo_automodel.components.datasets.llm.megatron.helpers import build_sample_idx
 from nemo_automodel.components.datasets.llm.megatron.megatron_utils import compile_helper
 
@@ -31,11 +32,12 @@ from nemo_automodel.components.datasets.llm.megatron.megatron_utils import compi
 def helpers(tmp_path_factory):
     cache = tmp_path_factory.mktemp("megatron_extensions")
     with pytest.MonkeyPatch.context() as monkeypatch:
-        monkeypatch.setenv("TORCH_EXTENSIONS_DIR", str(cache))
+        monkeypatch.setattr(megatron_utils, "_HELPER_CACHE_ROOT", cache)
         monkeypatch.setenv("MAX_JOBS", "1")
         compile_helper.cache_clear()
-        yield compile_helper()
-        compile_helper.cache_clear()
+        module = compile_helper()
+    yield module
+    compile_helper.cache_clear()
 
 
 # A cold C++ compilation exceeds the normal 5s unit-test budget.
@@ -76,16 +78,39 @@ def test_blending_indices(helpers):
         np.testing.assert_array_equal(sample_index[dataset_index == dataset], np.arange([3, 5][dataset]))
 
 
-# Two fresh interpreters race on a cold cache, then a third verifies disk reuse.
+# Delayed source writes expose overlap before PyTorch's internal build lock.
 @pytest.mark.runtime_budget(
     90, hard_timeout=120, reason="Races two real cold-cache JIT loads and checks reuse in a fresh interpreter."
 )
 def test_concurrent_build_and_cache_reuse(tmp_path):
-    env = dict(os.environ, TORCH_EXTENSIONS_DIR=str(tmp_path), MAX_JOBS="1")
+    env = dict(os.environ, TEST_HELPER_CACHE=str(tmp_path), MAX_JOBS="1")
     script = """
+import os
+import time
 from pathlib import Path
 import numpy as np
+import torch.utils.cpp_extension as cpp_extension
+from nemo_automodel.components.datasets.llm.megatron import megatron_utils
 from nemo_automodel.components.datasets.llm.megatron.megatron_utils import compile_helper
+cache = Path(os.environ["TEST_HELPER_CACHE"])
+megatron_utils._HELPER_CACHE_ROOT = cache
+if os.environ.get("RACE_SOURCE_WRITES"):
+    (cache / f"ready-{os.getpid()}").touch()
+    deadline = time.monotonic() + 30
+    while len(list(cache.glob("ready-*"))) < 2:
+        assert time.monotonic() < deadline, "second worker did not start"
+        time.sleep(0.01)
+    original_write = cpp_extension._maybe_write
+    def slow_write(filename, content):
+        # Exclusive creation fails if another rank enters source generation.
+        active = cache / "source-write-active"
+        with active.open("x"):
+            try:
+                time.sleep(0.5)
+                original_write(filename, content)
+            finally:
+                active.unlink()
+    cpp_extension._maybe_write = slow_write
 module = compile_helper()
 actual = module.build_sample_idx_int32(np.array([8], dtype=np.int32), np.array([0], dtype=np.int32), 2, 1, 8, True, 1)
 np.testing.assert_array_equal(actual, [[0, 0], [0, 2], [0, 4], [0, 6]])
@@ -94,7 +119,11 @@ print(Path(module.__file__).resolve())
 """
     processes = [
         subprocess.Popen(
-            [sys.executable, "-c", script], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+            [sys.executable, "-c", script],
+            env=dict(env, RACE_SOURCE_WRITES="1"),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
         )
         for _ in range(2)
     ]
@@ -116,9 +145,31 @@ print(Path(module.__file__).resolve())
     assert paths[0].stat().st_mtime_ns == mtime
 
 
-def test_compile_failure_is_raised_and_can_be_retried():
+def test_compile_failure_is_raised_and_can_be_retried(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import fcntl
+
+    monkeypatch.setattr(megatron_utils, "_HELPER_CACHE_ROOT", tmp_path)
     compile_helper.cache_clear()
     with patch("torch.utils.cpp_extension.load_inline", side_effect=RuntimeError("compiler failed")):
         with pytest.raises(RuntimeError, match="compiler failed"):
             compile_helper()
     assert compile_helper.cache_info().currsize == 0
+    # A failed build must release the OS lock as well as leave the LRU empty.
+    lock_path = next(tmp_path.glob("*/compile.lock"))
+    with lock_path.open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def test_cache_stays_node_local(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("TORCH_EXTENSIONS_DIR", str(tmp_path / "shared-torch-cache"))
+    monkeypatch.setenv("TMPDIR", str(tmp_path / "shared-tmp"))
+    compile_helper.cache_clear()
+    try:
+        with patch("torch.utils.cpp_extension.load_inline") as load:
+            compile_helper()
+        build_directory = Path(load.call_args.kwargs["build_directory"])
+        assert build_directory.is_relative_to(Path("/tmp") / f"nemo_automodel_{os.getuid()}")
+        assert not (tmp_path / "shared-torch-cache").exists()
+        assert not (tmp_path / "shared-tmp").exists()
+    finally:
+        compile_helper.cache_clear()

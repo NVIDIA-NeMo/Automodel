@@ -12,9 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import fcntl
+import hashlib
+import os
+import sys
 from functools import lru_cache
+from pathlib import Path
 from types import ModuleType
 from typing import List, Tuple
+
+_HELPER_CACHE_ROOT = Path("/tmp") / f"nemo_automodel_{os.getuid()}"
 
 
 def get_blend_from_list(
@@ -60,24 +67,38 @@ def get_blend_from_list(
 
 @lru_cache(maxsize=1)
 def compile_helper() -> ModuleType:
-    """Load the CPU dataset helpers, compiling once into PyTorch's extension cache.
+    """Load the CPU dataset helpers from a locked, node-local build cache.
 
-    Requires a C++ compiler and Ninja. ``TORCH_EXTENSIONS_DIR`` can override
-    the cache location; the installed package directory is never modified.
-    PyTorch's build lock coordinates processes sharing the same cache, so
-    each rank can call this without a distributed barrier. The loaded module
-    is retained for the lifetime of this process.
+    Requires a C++ compiler and Ninja. Sources and build artifacts live in a
+    per-user directory under ``/tmp``, independent of ``TORCH_EXTENSIONS_DIR``
+    and ``TMPDIR``. Each source and Python/PyTorch environment has its own
+    cache entry. An exclusive file lock covers source generation, compilation,
+    and import, so ranks on the same node can call this without a distributed
+    barrier. The loaded module is retained for the lifetime of this process.
 
     Returns:
         The compiled module containing the dataset indexing functions.
     """
+    import torch
     from torch.utils.cpp_extension import load_inline
 
     from nemo_automodel.components.datasets.llm.megatron._helpers_source import CPP_SOURCE
 
-    return load_inline(
-        name="nemo_automodel_megatron_helpers",
-        cpp_sources=CPP_SOURCE,
-        extra_cflags=["-O3"],
-        with_cuda=False,
-    )
+    cache_key = hashlib.sha256(
+        f"{sys.version}\n{torch.__version__}\n{torch.__file__}\n{CPP_SOURCE}".encode()
+    ).hexdigest()
+    _HELPER_CACHE_ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
+    build_directory = _HELPER_CACHE_ROOT / cache_key
+    build_directory.mkdir(exist_ok=True)
+    # load_inline writes main.cpp before taking PyTorch's own build lock.
+    # Keep this separate lock file in place: unlinking it can split waiters
+    # across different inodes and allow concurrent source writers again.
+    with (build_directory / "compile.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return load_inline(
+            name="nemo_automodel_megatron_helpers",
+            cpp_sources=CPP_SOURCE,
+            extra_cflags=["-O3"],
+            with_cuda=False,
+            build_directory=str(build_directory),
+        )
