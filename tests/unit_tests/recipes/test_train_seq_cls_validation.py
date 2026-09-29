@@ -44,8 +44,38 @@ class _TinyClassifier(nn.Module):
         self.head = nn.Linear(HIDDEN, N_CLASSES, bias=False)
 
     def forward(self, input_ids, attention_mask=None):
+        """Return sequence-classification logits.
+
+        Args:
+            input_ids: Integer tensor of shape [batch, sequence].
+            attention_mask: Optional tensor of shape [batch, sequence]; unused here.
+
+        Returns:
+            Namespace whose logits field is a tensor of shape [batch, classes].
+        """
         pooled = self.embed(input_ids).mean(dim=1)
         return SimpleNamespace(logits=self.head(pooled))
+
+
+class _ConstantHalfLogits(nn.Module):
+    """Returns the same float16 logits for every sample, as a half-precision model would."""
+
+    def __init__(self, logits):
+        super().__init__()
+        self.logits = torch.tensor(logits, dtype=torch.float16)
+        self.anchor = nn.Parameter(torch.zeros(1))
+
+    def forward(self, input_ids, attention_mask=None):
+        """Return constant logits.
+
+        Args:
+            input_ids: Integer tensor of shape [batch, sequence]; only its batch size is used.
+            attention_mask: Optional tensor of shape [batch, sequence]; unused here.
+
+        Returns:
+            Namespace whose logits field is a float16 tensor of shape [batch, classes].
+        """
+        return SimpleNamespace(logits=self.logits.expand(input_ids.shape[0], -1))
 
 
 def _make_recipe(model, dp_size, allreduce):
@@ -62,7 +92,19 @@ def _make_recipe(model, dp_size, allreduce):
 
 
 def _val_shards(batch_sizes, dp_size, seed=123):
-    """Build one validation set and each DP rank's list of batches over it."""
+    """Build one validation set and each DP rank's list of batches over it.
+
+    Args:
+        batch_sizes: Sizes of the batches each rank sees, in order.
+        dp_size: Number of data-parallel ranks.
+        seed: Seed for the random inputs and labels.
+
+    Returns:
+        ``(input_ids, labels, shards)``: the whole set as input_ids of shape
+        [total, sequence] and labels of shape [total], and per rank a list of
+        batch dicts whose input_ids and attention_mask are [batch, sequence] and
+        whose labels are [batch].
+    """
     total = sum(batch_sizes) * dp_size
     torch.manual_seed(seed)
     input_ids = torch.randint(0, VOCAB, (total, SEQ))
@@ -97,6 +139,7 @@ def _run(batch_sizes, dp_size, seed=0):
     input_ids, labels, shards = _val_shards(batch_sizes, dp_size)
 
     def drive(rank_batches, allreduce):
+        """Run ``_validate_one_epoch`` over one rank's batch dicts ([batch, sequence] inputs, [batch] labels)."""
         recipe = _make_recipe(model, dp_size, allreduce)
         with mock.patch.object(torch.cuda, "max_memory_allocated", lambda: 0):
             return recipe._validate_one_epoch(rank_batches)
@@ -113,6 +156,7 @@ def _run(batch_sizes, dp_size, seed=0):
         idx = {"i": 0}
 
         def allreduce(t, *a, **k):
+            """Return the recorded cross-rank sum for this call; ``t`` is the 0-d tensor being reduced."""
             out = totals[idx["i"]]
             idx["i"] += 1
             return out.clone()
@@ -145,6 +189,19 @@ def test_val_loss_matches_whole_validation_set(batch_sizes, dp_size):
         assert got == pytest.approx(ref, rel=1e-5), (
             f"batches={batch_sizes}, dp={dp_size}, rank={rank}: val_loss {got:.4f} vs whole-set mean {ref:.4f}"
         )
+
+
+def test_half_precision_loss_does_not_overflow_the_sum():
+    """A float16 loss summed over many samples must not overflow to inf when the mean is finite."""
+    model = _ConstantHalfLogits([0.0, 10.0])
+    recipe = _make_recipe(model, dp_size=1, allreduce=lambda t, *a, **k: t)
+    batch = {"input_ids": torch.zeros(1024, SEQ, dtype=torch.long), "labels": torch.zeros(1024, dtype=torch.long)}
+
+    with mock.patch.object(torch.cuda, "max_memory_allocated", lambda: 0):
+        sample = recipe._validate_one_epoch([dict(batch) for _ in range(7)])
+
+    ref = F.cross_entropy(torch.tensor([[0.0, 10.0]]), torch.tensor([0]))
+    assert float(sample.metrics["val_loss"]) == pytest.approx(float(ref), rel=1e-3)
 
 
 def test_short_final_batch_differs_from_mean_of_means():

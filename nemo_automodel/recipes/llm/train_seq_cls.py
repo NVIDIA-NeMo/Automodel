@@ -386,8 +386,9 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
                 logits = getattr(out, "logits", out)
                 loss = self.loss_fn(logits, labels.view(-1))
             # Summed, not the batch mean: the last batch of a shard is usually
-            # short, so batch means cannot be averaged with equal weight.
-            total_loss += loss.detach() * labels.numel()
+            # short, so batch means cannot be averaged with equal weight. In FP32,
+            # so a half-precision loss cannot overflow while the sum grows.
+            total_loss += loss.detach().float() * labels.numel()
 
             # Collect predictions for accuracy
             preds = torch.argmax(logits, dim=-1)
