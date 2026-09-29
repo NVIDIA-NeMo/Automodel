@@ -69,6 +69,7 @@ def ref_cce(monkeypatch):
         shift=False,
         filter_eps=None,
         accum_e_fp32=False,
+        impl="cce",
     ):
         logits = hidden.float() @ lm_weight.float().t()
         return F.cross_entropy(

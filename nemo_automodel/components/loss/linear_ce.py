@@ -63,6 +63,7 @@
 
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as metadata_version
+from typing import Literal
 
 import torch
 import torch.distributed as dist
@@ -130,7 +131,13 @@ if HAVE_CUT_CROSS_ENTROPY:
 class FusedLinearCrossEntropy(nn.Module):
     """Fused linear-projection and cross-entropy loss module."""
 
-    def __init__(self, ignore_index: int = -100, logit_softcapping: float = 0, reduction: str = "sum"):
+    def __init__(
+        self,
+        ignore_index: int = -100,
+        logit_softcapping: float = 0,
+        reduction: str = "sum",
+        impl: Literal["cce", "torch_compile"] = "cce",
+    ):
         """
         Fused linear cross entropy loss.
 
@@ -138,11 +145,19 @@ class FusedLinearCrossEntropy(nn.Module):
             ignore_index (int): Target value that is ignored when computing the loss. Defaults to -100.
             logit_softcapping (float): Value for softcapping logits (0 means no capping). Defaults to 0.
             reduction (str): Type of reduction. Defaults to "sum".
+            impl: cut_cross_entropy implementation. ``"cce"`` never materializes logits,
+                so memory stays flat in sequence length, but it is the slowest. ``"torch_compile"``
+                compiles the projection and CE over the supervised tokens. It materializes their
+                BF16 logits, so memory grows as tokens x vocab, but it is several times faster,
+                deterministic, and at BF16 rounding accuracy.
         """
         super().__init__()
+        if impl not in ("cce", "torch_compile"):
+            raise ValueError(f"impl must be 'cce' or 'torch_compile', got {impl!r}")
         self.ignore_index = ignore_index
         self.logit_softcapping = logit_softcapping
         self.reduction = reduction
+        self.impl = impl
 
     @staticmethod
     def materialize_lm_weight(
@@ -259,11 +274,14 @@ class FusedLinearCrossEntropy(nn.Module):
         # First compute loss with sum reduction to handle normalization ourselves
         softcap = None if self.logit_softcapping == 0 else self.logit_softcapping
 
-        # Compute loss with shift=False to match PyTorch behavior
         # Set filter_eps=None to avoid any token filtering
         # accum_e_fp32 accumulates the hidden-state gradient in fp32. The default
         # atomically adds every vocab block into a bf16 buffer, which leaves the
         # hidden-state gradient ~6x above bf16 rounding error at 150K vocab.
+        # Both options only apply to the cce kernel.
+        cce_opts = {"filter_eps": None, "accum_e_fp32": True} if self.impl == "cce" else {}
+
+        # Compute loss with shift=False to match PyTorch behavior
         loss = linear_cross_entropy(
             hidden_states,
             lm_weight,
@@ -272,8 +290,8 @@ class FusedLinearCrossEntropy(nn.Module):
             softcap=softcap,
             reduction="none" if loss_weights is not None else self.reduction,
             shift=False,  # Match PyTorch behavior
-            filter_eps=None,  # No token filtering
-            accum_e_fp32=True,
+            impl=self.impl,
+            **cce_opts,
         )
         if loss_weights is not None:
             loss = (loss * loss_weights).sum()

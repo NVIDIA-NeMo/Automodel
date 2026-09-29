@@ -38,7 +38,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field, fields
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     from torch import nn
@@ -91,11 +91,14 @@ class FusedLinearCEConfig(LossConfig):
         ignore_index: Label value marking padding tokens.
         logit_softcapping: Softcap logits before CE (0 = disabled).
         reduction: Reduction mode.
+        impl: ``"cce"`` (flat memory, slowest) or ``"torch_compile"`` (faster,
+            memory grows with supervised tokens x vocab).
     """
 
     ignore_index: int = -100
     logit_softcapping: float = 0.0
     reduction: str = "sum"
+    impl: Literal["cce", "torch_compile"] = "cce"
 
     def build(self) -> nn.Module:
         from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
@@ -104,6 +107,7 @@ class FusedLinearCEConfig(LossConfig):
             ignore_index=self.ignore_index,
             logit_softcapping=self.logit_softcapping,
             reduction=self.reduction,
+            impl=self.impl,
         )
 
 

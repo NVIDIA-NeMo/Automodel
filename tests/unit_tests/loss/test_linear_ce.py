@@ -295,10 +295,38 @@ def test_fused_cross_entropy_accumulates_hidden_grad_in_fp32(monkeypatch):
 
     assert captured["accum_e_fp32"] is True
     assert captured["filter_eps"] is None
+    assert captured["impl"] == "cce"
+
+
+def test_fused_cross_entropy_torch_compile_impl_omits_cce_options(monkeypatch):
+    """impl='torch_compile' is forwarded without the cce-only kernel options."""
+    from nemo_automodel.components.loss import linear_ce as linear_ce_mod
+
+    monkeypatch.setattr(linear_ce_mod, "HAVE_CUT_CROSS_ENTROPY", True)
+    captured = {}
+
+    def _fake_linear_ce(hidden, weight, targets=None, **kwargs):
+        captured.update(kwargs)
+        return torch.tensor(1.0)
+
+    monkeypatch.setattr(linear_ce_mod, "linear_cross_entropy", _fake_linear_ce, raising=False)
+    linear_ce_mod.FusedLinearCrossEntropy(impl="torch_compile")(
+        torch.randn(1, 2, 3), torch.zeros(1, 2, dtype=torch.long), torch.randn(5, 3)
+    )
+
+    assert captured["impl"] == "torch_compile"
+    assert "accum_e_fp32" not in captured
+    assert "filter_eps" not in captured
+
+
+def test_fused_cross_entropy_rejects_unknown_impl():
+    with pytest.raises(ValueError, match="impl must be"):
+        FusedLinearCrossEntropy(impl="cce_exact")
 
 
 @pytest.mark.skipif(not HAVE_CUT_CROSS_ENTROPY or not torch.cuda.is_available(), reason="requires fused CE on CUDA")
-def test_fused_weighted_cross_entropy_matches_pytorch_gradient():
+@pytest.mark.parametrize("impl", ["cce", "torch_compile"])
+def test_fused_weighted_cross_entropy_matches_pytorch_gradient(impl):
     """A real fused kernel must match the weighted PyTorch loss and gradients."""
     torch.manual_seed(3)
     hidden = torch.randn(2, 3, 8, device="cuda", dtype=torch.bfloat16, requires_grad=True)
@@ -306,7 +334,7 @@ def test_fused_weighted_cross_entropy_matches_pytorch_gradient():
     labels = torch.tensor([[1, 2, -100], [3, 4, 5]], device="cuda")
     loss_weights = torch.tensor([[0.5] * 3, [1.5] * 3], device="cuda")
 
-    loss = FusedLinearCrossEntropy()(
+    loss = FusedLinearCrossEntropy(impl=impl)(
         hidden,
         labels,
         weight,
