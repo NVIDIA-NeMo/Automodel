@@ -328,6 +328,14 @@ override-dependencies = [
 ]
 prerelease = "allow"
 
+[tool.uv.extra-build-variables.deep-ep]
+CPLUS_INCLUDE_PATH = "/usr/local/cuda/include/cccl"
+
+[tool.uv.extra-build-variables.transformer-engine-torch]
+CPLUS_INCLUDE_PATH = "/usr/local/cuda/include:/usr/local/cuda/include/cccl"
+NVTE_BUILD_USE_NVIDIA_WHEELS = "1"
+NVTE_WITH_NCCL_EP = "0"
+
 [tool.uv.sources]
 megatron-fsdp = { git = "https://github.com/yuhezhang-ai/Megatron-LM.git", rev = "455389c480af6b3acdca74c7830c68b3274eb083", subdirectory = "megatron/core/distributed/fsdp/src" }
 deep_ep = { git = "https://github.com/deepseek-ai/DeepEP.git", rev = "10d4dd7377d5bce900fbb4b80cce863764892b95" }
@@ -549,6 +557,9 @@ modules = [
 ignore_imports = [
     # Dion needs the FSDP DP mesh resolver so its optimizer mesh matches parameter sharding.
     "nemo_automodel.components.optim.dion -> nemo_automodel.components.distributed.mesh_utils",
+    # Grad clipping needs the same resolver to find the EP process group, because a
+    # flattened ep axis is absent from mesh_dim_names and cannot be indexed directly.
+    "nemo_automodel.components.training.utils -> nemo_automodel.components.distributed.mesh_utils",
 ]
 
 [[tool.importlinter.contracts]]

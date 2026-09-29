@@ -77,4 +77,8 @@ repos:
         language: system
         entry: python tools/lint_model_parallelizer_contract.py
         files: '^(nemo_automodel|examples)/.*\.py$|^tools/lint_model_parallelizer_contract\.py$'
+      - id: numpy-no-pickle
+        name: "Require allow_pickle=False for NumPy load/save"
+        language: system
+        entry: python tools/lint_numpy_pickle.py
         types: [python]

@@ -21,7 +21,7 @@ import pickle
 import threading
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -52,8 +52,10 @@ from torch import nn
 from torch.distributed.checkpoint.metadata import Metadata, TensorStorageMetadata
 from torch.distributed.checkpoint.storage import StorageReader, StorageWriter
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.tensor import DTensor
+from torch.distributed.fsdp import FSDPModule
+from torch.distributed.tensor import DTensor, Replicate, distribute_tensor
 from torch.nn.parallel import DistributedDataParallel
+from torch.overrides import TorchFunctionMode
 from torch.serialization import MAP_LOCATION, FileLike
 
 from nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors import (
@@ -103,6 +105,48 @@ _CONSOLIDATED_SIZE_WARNING_THRESHOLD_BYTES = 50 * 1024**3
 _DEFAULT_HF_CONSOLIDATED_SHARD_SIZE_BYTES = 5 * 1024**3
 
 logger = logging.getLogger(__name__)
+
+
+class _DTensorInitCopyMode(TorchFunctionMode):
+    """Adapt full-tensor initialization copies to an already-sharded destination."""
+
+    def __torch_function__(
+        self, func: Callable, types: tuple[type, ...], args: tuple = (), kwargs: dict | None = None
+    ) -> Any:
+        """Preserve ``copy_`` semantics while matching the destination's DTensor layout.
+
+        Args:
+            func: Intercepted torch operation.
+            types: Tensor types participating in the operation.
+            args: Operation arguments. For ``copy_``, the destination has arbitrary
+                global shape and the source is broadcastable to that shape. A plain
+                source is privately copied, broadcast from mesh rank zero, and
+                locally sharded to the destination's placements before the in-place
+                copy; existing DTensor sources and plain destinations keep their
+                normal behavior.
+            kwargs: Keyword arguments to the operation, including an optional
+                ``other`` source tensor with the same contract as above.
+
+        Returns:
+            The operation result; ``copy_`` returns and mutates the original
+            destination without replacing its parameter object or local storage.
+        """
+        kwargs = kwargs or {}
+        if func is torch.Tensor.copy_ and isinstance(args[0], DTensor):
+            destination = args[0]
+            source = args[1] if len(args) > 1 else kwargs["other"]
+            if isinstance(source, torch.Tensor) and not isinstance(source, DTensor):
+                # Broadcast then shard locally to avoid persistent NCCL scatter memory.
+                source = distribute_tensor(
+                    source.to(device=destination.device, copy=True).expand(destination.shape),
+                    destination.device_mesh,
+                    [Replicate()] * destination.device_mesh.ndim,
+                ).redistribute(placements=destination.placements)
+                if len(args) > 1:
+                    args = (destination, source, *args[2:])
+                else:
+                    kwargs = {**kwargs, "other": source}
+        return func(*args, **kwargs)
 
 
 def _format_restricted_load_error(f: FileLike) -> str:
@@ -960,7 +1004,7 @@ class Checkpointer:
         model_path: str,
         is_init_step: bool = False,
         use_checkpoint_id: bool = True,
-        key_mapping: dict[str, str] | None = None,
+        key_mapping: dict[str, str] | Callable[[str], str] | None = None,
         allow_checkpoint_key_subset: bool = False,
     ) -> None:
         """
@@ -977,7 +1021,8 @@ class Checkpointer:
             model_path: Path to the model checkpoint directory or HF snapshot.
             is_init_step: If True, treat load as initialization from a base checkpoint.
             use_checkpoint_id: Pass `checkpoint_id` to DCP if True; disable when using direct HF paths.
-            key_mapping: Optional key remapping when reading from HF checkpoints.
+            key_mapping: Optional regex mapping or callable renaming HF checkpoint keys.
+                Tensor-merging conversions require a regex mapping.
             allow_checkpoint_key_subset: If True, keep the model's current initialization for
                 parameters that are absent from the checkpoint instead of requiring an exact key match.
         """
@@ -1003,6 +1048,8 @@ class Checkpointer:
 
         # For models that need tensor merging and don't have an adapter, try using transformers' conversion
         if is_init_step and model_type and requires_tensor_merging(model_type) and not has_state_dict_adapter:
+            if callable(key_mapping):
+                raise ValueError("Tensor-merging checkpoint loads require a regex key mapping, not a callable.")
             converted_state_dict = _convert_checkpoint_with_transformers(model_state.model[0], model_path, key_mapping)
             if converted_state_dict:
                 materialized_tied_lm_head = materialize_missing_tied_lm_head(
@@ -1504,16 +1551,30 @@ class Checkpointer:
                 saved_padding_idx = [(mod, mod.padding_idx) for mod in padded_embeddings]
                 for mod, _ in saved_padding_idx:
                     mod.padding_idx = None
+                # Newer HF versions classify FSDP's generated class as custom code
+                # and skip container initializers that populate child buffers.
+                # Bind the query to the original model class only during init.
+                bind_original_hf_class = (
+                    isinstance(model, FSDPModule)
+                    and hasattr(model, "is_custom_code")
+                    and "is_custom_code" not in vars(model)
+                )
                 try:
-                    try:
-                        if param_dtype is not None:
-                            model.initialize_weights(dtype=param_dtype)
-                        else:
+                    if bind_original_hf_class:
+                        original_class = next(cls for cls in type(model).__mro__ if not issubclass(cls, FSDPModule))
+                        model.is_custom_code = original_class.is_custom_code
+                    with _DTensorInitCopyMode():
+                        try:
+                            if param_dtype is not None:
+                                model.initialize_weights(dtype=param_dtype)
+                            else:
+                                model.initialize_weights()
+                        except TypeError:
+                            # Model's initialize_weights() does not accept a dtype kwarg.
                             model.initialize_weights()
-                    except TypeError:
-                        # Model's initialize_weights() does not accept a dtype kwarg.
-                        model.initialize_weights()
                 finally:
+                    if bind_original_hf_class:
+                        del model.is_custom_code
                     for mod, padding_idx in saved_padding_idx:
                         mod.padding_idx = padding_idx
                 for mod, padding_idx in saved_padding_idx:
@@ -1557,7 +1618,12 @@ class Checkpointer:
             assert model_name is not None, "model_name is required when loading base model"
             # Get combined key mapping from model attribute and model-type specific conversions
             model_key_mapping = getattr(model, "_checkpoint_conversion_mapping", None)
-            key_mapping = get_combined_key_mapping(model_type, model_key_mapping)
+            # Adapters and tensor converters own their complete conversion. Standard
+            # HF models also need the scoped renames declared by nested submodels.
+            mapping_model = (
+                model if not hasattr(model, "state_dict_adapter") and not requires_tensor_merging(model_type) else None
+            )
+            key_mapping = get_combined_key_mapping(model_type, model_key_mapping, model=mapping_model)
             # NemotronH remote code (trust_remote_code) uses backbone.* params matching checkpoint keys
             # skip backbone.*→model.* conversion to avoid key mismatch
             if model_type == "nemotron_h" and hasattr(model, "backbone"):
@@ -2159,7 +2225,7 @@ fi
     def _get_storage_reader(
         self,
         model_path: str,
-        key_mapping: dict[str, str] | None,
+        key_mapping: dict[str, str] | Callable[[str], str] | None,
         is_init_step: bool = False,
         is_safetensors: bool | None = None,
     ) -> StorageReader | None:
@@ -2174,7 +2240,7 @@ fi
 
         Args:
             model_path: Path to the model checkpoint directory or HF snapshot.
-            key_mapping: Optional key remapping for conversion.
+            key_mapping: Optional regex mapping or callable renaming checkpoint keys.
             is_init_step: If True, always produce a reader for base HF load.
             is_safetensors: Whether `model_path` holds a safetensors checkpoint; computed
                 from the directory contents when not supplied.
@@ -2614,10 +2680,10 @@ def _apply(module, fn, recurse=True) -> nn.Module:
 
 def _apply_key_mapping(
     state_dict: dict[str, torch.Tensor],
-    key_mapping: dict[str, str],
+    key_mapping: dict[str, str] | Callable[[str], str],
 ) -> dict[str, torch.Tensor]:
     """
-    Rename state-dict keys using regex-based ``key_mapping``.
+    Rename state-dict keys using a regex mapping or a scoped rename callable.
 
     This mirrors the renaming logic used by the DCP / HuggingFace storage
     reader but operates directly on an in-memory state dict.  It is needed
@@ -2626,11 +2692,13 @@ def _apply_key_mapping(
     parameter FQNs (e.g. ``model.language_model.X``).
 
     Args:
-        state_dict: Original state dict whose keys may need renaming.
-        key_mapping: ``{regex_pattern: replacement}`` pairs applied in order.
+        state_dict: Original state dict mapping keys to tensors of arbitrary shape.
+            Tensor layout, dtype, device, and storage are preserved.
+        key_mapping: First-match ``{regex_pattern: replacement}`` pairs or a
+            callable applying the complete key conversion.
 
     Returns:
-        A new dict with renamed keys.
+        A new dict with renamed keys and the same tensor objects as the input.
     """
     from nemo_automodel.components.checkpoint._backports.hf_storage import (
         _get_key_renaming_mapping,
