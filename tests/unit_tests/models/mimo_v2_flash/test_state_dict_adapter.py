@@ -93,6 +93,7 @@ def adapter(hf_config, moe_config, backend_config):
 def v26_adapter(moe_config, backend_config):
     config = SimpleNamespace(
         attention_projection_layout="fused_qkv",
+        checkpoint_tp_size=4,
         hybrid_layer_pattern=[0, 1],
         hidden_size=64,
         num_attention_heads=4,
@@ -241,21 +242,23 @@ class TestMiMoV26CheckpointLayouts:
         base = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0])
         torch.testing.assert_close(output, torch.cat((base, base)).unsqueeze(0) * 2.0)
 
-    def test_fused_qkv_deinterleaves_checkpoint_tp4_shards(self):
+    @pytest.mark.parametrize("checkpoint_tp_size", [4, 8])
+    def test_fused_qkv_deinterleaves_checkpoint_shards(self, checkpoint_tp_size):
         config = SimpleNamespace(
             hybrid_layer_pattern=[0],
+            checkpoint_tp_size=checkpoint_tp_size,
             hidden_size=3,
-            num_attention_heads=4,
-            num_key_value_heads=4,
+            num_attention_heads=checkpoint_tp_size,
+            num_key_value_heads=checkpoint_tp_size,
             head_dim=2,
             v_head_dim=2,
-            swa_num_attention_heads=4,
-            swa_num_key_value_heads=4,
+            swa_num_attention_heads=checkpoint_tp_size,
+            swa_num_key_value_heads=checkpoint_tp_size,
             swa_head_dim=2,
             swa_v_head_dim=2,
         )
         shards = []
-        for shard_idx in range(4):
+        for shard_idx in range(checkpoint_tp_size):
             query = torch.full((2, 3), float(shard_idx))
             key = torch.full((2, 3), float(10 + shard_idx))
             value = torch.full((2, 3), float(20 + shard_idx))
@@ -268,7 +271,7 @@ class TestMiMoV26CheckpointLayouts:
             dtype=torch.float32,
             name="model.layers.0.self_attn.qkv_proj.weight",
         )
-        for shard_idx in range(4):
+        for shard_idx in range(checkpoint_tp_size):
             assert torch.all(query[2 * shard_idx : 2 * shard_idx + 2] == shard_idx)
             assert torch.all(key[2 * shard_idx : 2 * shard_idx + 2] == 10 + shard_idx)
             assert torch.all(value[2 * shard_idx : 2 * shard_idx + 2] == 20 + shard_idx)
@@ -731,3 +734,59 @@ class TestRoundTrip:
                 rtol=1e-5,
                 msg=f"Round-trip mismatch at {key}",
             )
+
+
+class TestProCheckpointQKV:
+    def test_tp8_fp8_partial_blocks_and_native_destinations(self, moe_config, backend_config):
+        from nemo_automodel.components.models.mimo_v2_flash.config import MiMoV2Config
+
+        config = MiMoV2Config(
+            hidden_size=128,
+            num_hidden_layers=1,
+            num_attention_heads=128,
+            num_key_value_heads=8,
+            head_dim=192,
+            v_head_dim=128,
+            hybrid_layer_pattern=[0],
+            moe_layer_freq=[0],
+            checkpoint_tp_size=8,
+        )
+        adapter = MiMoV2FlashStateDictAdapter(config, moe_config, backend_config, dtype=torch.float32)
+        prefix = "model.layers.0.self_attn"
+        native = {
+            f"{prefix}.q_proj.weight": torch.zeros(24576, 128),
+            f"{prefix}.k_proj.weight": torch.zeros(1536, 128),
+            f"{prefix}.v_proj.weight": torch.zeros(1024, 128),
+        }
+        checkpoint = adapter.to_hf(native, quantization=True, for_checkpoint_load=True)
+        weight_key = f"{prefix}.qkv_proj.weight"
+        assert checkpoint[weight_key].shape == (27136, 128)
+        assert checkpoint[weight_key + "_scale_inv"].shape == (216, 1)
+        checkpoint[weight_key].fill_(1)
+        checkpoint[weight_key + "_scale_inv"].copy_(torch.arange(1, 217).float().view(216, 1))
+        restored = adapter.from_hf(checkpoint)
+        q, k, v = (native[f"{prefix}.{name}_proj.weight"] for name in ("q", "k", "v"))
+        for name in ("q", "k", "v"):
+            assert restored[f"{prefix}.{name}_proj.weight"] is native[f"{prefix}.{name}_proj.weight"]
+        # The first storage shard is Q=3072, K=192, V=128 rows. K/V share
+        # block 25, and V ends in a partially filled block 26.
+        assert torch.all(q[0] == 1)
+        assert torch.all(q[3071] == 24)
+        assert torch.all(q[3072] == 28)
+        assert torch.all(k[0:128] == 25)
+        assert torch.all(k[128:192] == 26)
+        assert torch.all(k[192] == 52)
+        assert torch.all(v[:64] == 26)
+        assert torch.all(v[64:128] == 27)
+        assert torch.all(v[128] == 53)
+        assert torch.all(v[-1] == 216)
+
+    def test_checkpoint_tp_config_roundtrip(self, tmp_path):
+        from nemo_automodel.components.models.mimo_v2_flash.config import MiMoV2Config
+
+        config = MiMoV2Config(checkpoint_tp_size=8)
+        config.save_pretrained(tmp_path)
+        assert MiMoV2Config.from_pretrained(tmp_path).checkpoint_tp_size == 8
+        assert MiMoV2Config().checkpoint_tp_size == 4
+        with pytest.raises(ValueError, match="checkpoint_tp_size must be positive"):
+            MiMoV2Config(checkpoint_tp_size=0)

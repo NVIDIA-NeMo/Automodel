@@ -44,6 +44,9 @@ def _mimo_attention(attn_module, *, query_heads=8, kv_heads=4, backend="te"):
     attention.num_attention_heads = query_heads
     attention.num_key_value_heads = kv_heads
     attention.layer_idx = 0
+    attention.head_dim = 192
+    attention.v_head_dim = 128
+    attention._te_v_head_dim = 128
     return attention
 
 
@@ -88,6 +91,7 @@ def test_setup_mimo_te_cp_forces_a2a_on_every_attention():
     assert result is None
     assert model._mimo_te_cp_configured_group is mesh.get_group()
     for dpa in (dpa0, dpa1):
+        assert dpa.hidden_size_per_attention_head_v == 192
         assert len(dpa.calls) == 1
         args, kwargs = dpa.calls[0]
         assert args == (mesh.get_group.return_value, [0, 1], stream)

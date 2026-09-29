@@ -33,7 +33,6 @@ from nemo_automodel.components.moe.state_dict_mixin import MoESplitExpertsStateD
 logger = logging.getLogger(__name__)
 
 _MXFP4_BLOCK_SIZE = 32
-_FUSED_QKV_TP_SIZE = 4
 _FUSED_QKV_WEIGHT = re.compile(r"^(.*\.layers\.(\d+)\.self_attn)\.qkv_proj\.weight$")
 _SPLIT_Q_WEIGHT = re.compile(r"^(.*\.layers\.(\d+)\.self_attn)\.q_proj\.weight$")
 _E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
@@ -101,6 +100,7 @@ def _dequantize_mxfp4(
 
 def _fused_qkv_sizes(config: Any, layer_idx: int) -> tuple[int, int, int]:
     """Return per-checkpoint-shard Q, K, and V row counts for one layer."""
+    checkpoint_tp_size = config.checkpoint_tp_size
     is_swa = bool(config.hybrid_layer_pattern[layer_idx])
     if is_swa:
         query_heads = int(config.swa_num_attention_heads)
@@ -112,15 +112,15 @@ def _fused_qkv_sizes(config: Any, layer_idx: int) -> tuple[int, int, int]:
         key_value_heads = int(config.num_key_value_heads)
         head_dim = int(config.head_dim)
         value_head_dim = int(config.v_head_dim)
-    if query_heads % _FUSED_QKV_TP_SIZE or key_value_heads % _FUSED_QKV_TP_SIZE:
+    if query_heads % checkpoint_tp_size or key_value_heads % checkpoint_tp_size:
         raise ValueError(
-            f"MiMo fused QKV requires query and key/value head counts divisible by {_FUSED_QKV_TP_SIZE}, "
+            f"MiMo fused QKV requires query and key/value head counts divisible by {checkpoint_tp_size}, "
             f"got {query_heads} and {key_value_heads} at layer {layer_idx}"
         )
     return (
-        query_heads // _FUSED_QKV_TP_SIZE * head_dim,
-        key_value_heads // _FUSED_QKV_TP_SIZE * head_dim,
-        key_value_heads // _FUSED_QKV_TP_SIZE * value_head_dim,
+        query_heads // checkpoint_tp_size * head_dim,
+        key_value_heads // checkpoint_tp_size * head_dim,
+        key_value_heads // checkpoint_tp_size * value_head_dim,
     )
 
 
@@ -133,12 +133,12 @@ def _split_fused_qkv(
     dtype: torch.dtype,
     name: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Convert MiMo's TP4-interleaved fused QKV matrix to split projections.
+    """Convert MiMo's checkpoint-TP-interleaved fused QKV matrix to split projections.
 
     Args:
-        weight: Fused tensor of shape [4 * (q_rows + k_rows + v_rows), hidden].
+        weight: Fused tensor of shape [checkpoint_tp_size * (q_rows + k_rows + v_rows), hidden].
         scale_inv: Optional FP8 inverse scales of shape
-            [4 * ceil((q_rows + k_rows + v_rows) / 128), hidden / 128].
+            [checkpoint_tp_size * ceil((q_rows + k_rows + v_rows) / 128), ceil(hidden / 128)].
         config: MiMo model configuration.
         layer_idx: Decoder layer index used to select full or sliding dimensions.
         dtype: Floating-point dtype for dequantized weights.
@@ -148,14 +148,15 @@ def _split_fused_qkv(
         Query, key, and value weights with shapes [q_total, hidden],
         [k_total, hidden], and [v_total, hidden].
     """
+    checkpoint_tp_size = config.checkpoint_tp_size
     q_rows, k_rows, v_rows = _fused_qkv_sizes(config, layer_idx)
     rows_per_shard = q_rows + k_rows + v_rows
-    expected_rows = _FUSED_QKV_TP_SIZE * rows_per_shard
+    expected_rows = checkpoint_tp_size * rows_per_shard
     hidden_size = int(config.hidden_size)
     if weight.ndim != 2 or tuple(weight.shape) != (expected_rows, hidden_size):
         raise ValueError(
             f"{name} has shape {tuple(weight.shape)}; expected "
-            f"[{expected_rows}, {hidden_size}] for TP{_FUSED_QKV_TP_SIZE}-interleaved QKV"
+            f"[{expected_rows}, {hidden_size}] for TP{checkpoint_tp_size}-interleaved QKV"
         )
 
     weight_shards = weight.split(rows_per_shard, dim=0)
@@ -167,7 +168,7 @@ def _split_fused_qkv(
         if scale_inv.dtype != torch.float32:
             raise TypeError(f"{name}_scale_inv must be float32, got {scale_inv.dtype}")
         scale_rows_per_shard = (rows_per_shard + 127) // 128
-        expected_scale_rows = _FUSED_QKV_TP_SIZE * scale_rows_per_shard
+        expected_scale_rows = checkpoint_tp_size * scale_rows_per_shard
         expected_scale_columns = (hidden_size + 127) // 128
         if scale_inv.ndim != 2 or tuple(scale_inv.shape) != (expected_scale_rows, expected_scale_columns):
             raise ValueError(
@@ -263,8 +264,8 @@ class MiMoV2FlashStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
 
         Args:
             state_dict: Checkpoint tensor mapping. Fused QKV weights have shape
-                [4 * local_qkv_rows, hidden], and optional scale tensors have
-                shape [4 * local_scale_rows, hidden_blocks].
+                [checkpoint_tp_size * local_qkv_rows, hidden], and optional scale tensors have
+                shape [checkpoint_tp_size * local_scale_rows, hidden_blocks].
 
         Returns:
             The mutated mapping with split query, key, and value weights.
@@ -468,11 +469,12 @@ class MiMoV2FlashStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
             checkpoint names and shapes.
         """
         local_views = tuple(self._local_tensor(tensor) for tensor in (query, key, value))
+        checkpoint_tp_size = self.config.checkpoint_tp_size
         q_rows, k_rows, v_rows = _fused_qkv_sizes(self.config, layer_idx)
         expected_shapes = (
-            (_FUSED_QKV_TP_SIZE * q_rows, int(self.config.hidden_size)),
-            (_FUSED_QKV_TP_SIZE * k_rows, int(self.config.hidden_size)),
-            (_FUSED_QKV_TP_SIZE * v_rows, int(self.config.hidden_size)),
+            (checkpoint_tp_size * q_rows, int(self.config.hidden_size)),
+            (checkpoint_tp_size * k_rows, int(self.config.hidden_size)),
+            (checkpoint_tp_size * v_rows, int(self.config.hidden_size)),
         )
         actual_shapes = tuple(tuple(tensor.shape) for tensor in (query, key, value))
         if actual_shapes != expected_shapes:
@@ -482,9 +484,9 @@ class MiMoV2FlashStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
             raise ValueError(f"Native QKV local views at {prefix} span devices {sorted(map(str, local_devices))}")
 
         rows_per_shard = q_rows + k_rows + v_rows
-        fused_rows = _FUSED_QKV_TP_SIZE * rows_per_shard
+        fused_rows = checkpoint_tp_size * rows_per_shard
         hidden_size = int(self.config.hidden_size)
-        scale_rows = _FUSED_QKV_TP_SIZE * ((rows_per_shard + 127) // 128)
+        scale_rows = checkpoint_tp_size * ((rows_per_shard + 127) // 128)
         scale_columns = (hidden_size + 127) // 128
         device = local_views[0].device
         self._fused_qkv_load_views[prefix] = ((query, key, value), local_views)

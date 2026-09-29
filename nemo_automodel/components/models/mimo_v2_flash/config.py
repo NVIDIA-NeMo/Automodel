@@ -59,6 +59,7 @@ class MiMoV2FlashConfig(PretrainedConfig):
         attention_bias: bool = False,
         attention_dropout: float = 0.0,
         attention_projection_layout: str = "split",
+        checkpoint_tp_size: int = 4,
         attention_value_scale: float | None = 0.707,
         add_full_attention_sink_bias: bool = False,
         add_swa_attention_sink_bias: bool = True,
@@ -115,6 +116,10 @@ class MiMoV2FlashConfig(PretrainedConfig):
                 f"got {attention_projection_layout!r}"
             )
         self.attention_projection_layout = attention_projection_layout
+        if checkpoint_tp_size < 1:
+            raise ValueError(f"checkpoint_tp_size must be positive, got {checkpoint_tp_size}")
+        # Storage interleaving in the checkpoint; independent of runtime TP.
+        self.checkpoint_tp_size = checkpoint_tp_size
         self.attention_value_scale = attention_value_scale
         self.add_full_attention_sink_bias = add_full_attention_sink_bias
         self.add_swa_attention_sink_bias = add_swa_attention_sink_bias
