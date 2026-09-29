@@ -78,11 +78,24 @@ class TestWildcardMatch:
         assert wildcard_match("*.layers.1.*", "model.layers.12.mlp.down_proj") is False
         assert wildcard_match("*.layers.1.*", "model.layers.1.mlp.down_proj") is True
 
+    @pytest.mark.parametrize("pattern", ["*layers.1.*", ".*layers.1.*", "model.layers.1.*"])
+    def test_layer_index_wildcard_spellings_select_only_that_layer(self, pattern):
+        assert wildcard_match(pattern, "model.layers.1.mlp.down_proj") is True
+        assert wildcard_match(pattern, "model.layers.12.mlp.down_proj") is False
+
+    def test_fully_qualified_pattern_matches_through_a_layer_wildcard(self):
+        assert wildcard_match("model.layers.*.self_attn.q_proj", "model.layers.7.self_attn.q_proj") is True
+        assert wildcard_match("model.layers.*.self_attn.q_proj", "model.layers.7.self_attn.k_proj") is False
+        # A pattern that starts with a full segment path matches its children, not a longer sibling name.
+        assert wildcard_match("model.layers.*", "model.layers.3.mlp.up_proj") is True
+        assert wildcard_match("model.layers.*", "model.layers_norm") is False
+
     def test_fragment_wildcard_still_matches_any_text(self):
         # The regex-style fragment documented for apply_lora_to_linear_modules must keep matching fc1/fc2.
         assert wildcard_match(".*fc.*", "model.decoder.layers.0.fc1") is True
         assert wildcard_match(".*fc.*", "vision_model.encoder.layers.3.mlp.fc2") is True
         assert wildcard_match("*mlp.*", "model.layers.0.mlp_gate.proj") is True
+        assert wildcard_match("*mlp.fc.*", "model.layers.0.mlp.fc1") is True
 
 
 # ------------------------------------------------------------------ #
