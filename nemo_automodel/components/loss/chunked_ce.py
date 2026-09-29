@@ -190,8 +190,10 @@ class ChunkedCrossEntropy(nn.Module):
                 leading token dimensions.
             labels: Target indices of shape [...] matching ``logits.shape[:-1]``.
                 When ``mask`` is provided, ignored positions are replaced with
-                ``ignore_index`` in this tensor.
-            mask: Optional tensor of shape [...] matching ``labels``. Nonzero
+                ``ignore_index`` on an internal copy; this tensor is left intact.
+            mask: Optional tensor of shape [...] matching ``labels``. ``labels`` is
+                not modified in place: masked positions are written to an internal
+                copy, so the caller's tensor is safe to reuse. Nonzero
                 positions contribute to the loss and zero positions are ignored.
             num_label_tokens: Optional global count used to normalize the
                 sum-reduced scalar loss.
@@ -223,7 +225,7 @@ class ChunkedCrossEntropy(nn.Module):
             with torch.no_grad():
                 if mask.device != labels.device:
                     mask = mask.to(labels.device)  # pragma: no cover
-                labels.masked_fill_(mask.view(-1) == 0, self.ignore_index)
+                labels = labels.masked_fill(mask.view(-1) == 0, self.ignore_index)
                 del mask
 
         if self.reduction == "sum":
