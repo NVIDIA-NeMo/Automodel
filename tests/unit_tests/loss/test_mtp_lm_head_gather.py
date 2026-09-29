@@ -60,7 +60,15 @@ def ref_cce(monkeypatch):
     """
 
     def _ref(
-        hidden, lm_weight, targets, ignore_index=-100, softcap=None, reduction="sum", shift=False, filter_eps=None
+        hidden,
+        lm_weight,
+        targets,
+        ignore_index=-100,
+        softcap=None,
+        reduction="sum",
+        shift=False,
+        filter_eps=None,
+        accum_e_fp32=False,
     ):
         logits = hidden.float() @ lm_weight.float().t()
         return F.cross_entropy(
