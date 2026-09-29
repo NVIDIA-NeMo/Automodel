@@ -12,13 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import logging
-import os
-import subprocess
-import sys
+from functools import lru_cache
+from pathlib import Path
+from types import ModuleType
 from typing import List, Tuple
-
-logger = logging.getLogger(__name__)
 
 
 def get_blend_from_list(
@@ -62,12 +59,24 @@ def get_blend_from_list(
     return prefix_per_dataset, weight_per_dataset
 
 
-def compile_helper():
-    """Compile helper function ar runtime. Make sure this
-    is invoked on a single process."""
+@lru_cache(maxsize=1)
+def compile_helper() -> ModuleType:
+    """Load the CPU dataset helpers, compiling once into PyTorch's extension cache.
 
-    path = os.path.abspath(os.path.dirname(__file__))
-    ret = subprocess.run(["make", "-C", path, f"PYTHON={sys.executable}"])
-    if ret.returncode != 0:
-        logger.error("Making C++ dataset helpers module failed, exiting.")
-        sys.exit(1)
+    Requires a C++ compiler and Ninja. ``TORCH_EXTENSIONS_DIR`` can override
+    the cache location; the installed package directory is never modified.
+    PyTorch's build lock coordinates processes sharing the same cache, so
+    each rank can call this without a distributed barrier. The loaded module
+    is retained for the lifetime of this process.
+
+    Returns:
+        The compiled module containing the dataset indexing functions.
+    """
+    from torch.utils.cpp_extension import load_inline
+
+    return load_inline(
+        name="nemo_automodel_megatron_helpers",
+        cpp_sources=Path(__file__).with_name("helpers.cpp").read_text(encoding="utf-8"),
+        extra_cflags=["-O3"],
+        with_cuda=False,
+    )

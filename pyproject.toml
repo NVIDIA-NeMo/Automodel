@@ -24,7 +24,7 @@ include = ["nemo_automodel", "nemo_automodel.*"]
 
 [tool.setuptools.package-data]
 nemo_automodel = [
-    "components/datasets/llm/megatron/Makefile",
+    "components/datasets/llm/megatron/helpers.cpp",
 ]
 
 [tool.setuptools.dynamic]
@@ -81,7 +81,7 @@ dependencies = [
     "datasets>=4.0.0",
     "megatron-fsdp==0.5.0",
     "mistral-common[audio,hf-hub,sentencepiece]",
-    "pybind11",
+    "ninja",
     "pyyaml",
     "tiktoken",
     "torch>=2.6.0",
@@ -603,7 +603,6 @@ allowed-unresolved-imports = [
     "megatron.**",
     "mlflow",
     "mlflow.**",
-    "nemo_automodel.components.datasets.llm.megatron.helpers_cpp",
     "nemo_run",
     "pynvml",
     "sky",

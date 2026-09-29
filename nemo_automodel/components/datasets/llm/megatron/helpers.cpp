@@ -835,7 +835,7 @@ py::array build_blocks_mapping(const py::array_t<int64_t> &docs_,
   }
 }
 
-PYBIND11_MODULE(helpers_cpp, m)
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
   m.def("build_mapping", &build_mapping);
   m.def("build_blocks_mapping", &build_blocks_mapping);
