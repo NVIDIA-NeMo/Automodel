@@ -13,7 +13,6 @@
 # limitations under the License.
 
 from functools import lru_cache
-from pathlib import Path
 from types import ModuleType
 from typing import List, Tuple
 
@@ -74,9 +73,11 @@ def compile_helper() -> ModuleType:
     """
     from torch.utils.cpp_extension import load_inline
 
+    from nemo_automodel.components.datasets.llm.megatron._helpers_source import CPP_SOURCE
+
     return load_inline(
         name="nemo_automodel_megatron_helpers",
-        cpp_sources=Path(__file__).with_name("helpers.cpp").read_text(encoding="utf-8"),
+        cpp_sources=CPP_SOURCE,
         extra_cflags=["-O3"],
         with_cuda=False,
     )

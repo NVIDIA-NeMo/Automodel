@@ -28,7 +28,7 @@ def build_sample_idx(
     drop_last_partial_sequence: bool = True,
     add_extra_token_to_sequence: bool = True,
 ) -> numpy.ndarray:
-    """Build the 2-D sample index using the properly typed templated C++ function from helpers.cpp
+    """Build the 2-D sample index using the properly typed templated C++ helper function
 
     Args:
         sizes (numpy.ndarray): The 1-D array of document lengths
