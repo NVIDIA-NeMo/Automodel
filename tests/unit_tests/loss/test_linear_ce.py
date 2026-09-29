@@ -344,6 +344,9 @@ def test_fused_weighted_cross_entropy_matches_pytorch_gradient(impl):
     reference_hidden = hidden.detach().float().requires_grad_()
     reference_weight = weight.detach().float().requires_grad_()
     logits = reference_hidden @ reference_weight.T
+    if impl == "torch_compile":
+        # torch_compile materializes BF16 logits before the fp32 CE, like MaskedCrossEntropy.
+        logits = logits.bfloat16().float()
     per_token = F.cross_entropy(
         logits.reshape(-1, logits.shape[-1]),
         labels.reshape(-1),

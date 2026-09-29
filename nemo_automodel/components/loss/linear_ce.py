@@ -147,9 +147,9 @@ class FusedLinearCrossEntropy(nn.Module):
             reduction (str): Type of reduction. Defaults to "sum".
             impl: cut_cross_entropy implementation. ``"cce"`` never materializes logits,
                 so memory stays flat in sequence length, but it is the slowest. ``"torch_compile"``
-                compiles the projection and CE over the supervised tokens. It materializes their
-                BF16 logits, so memory grows as tokens x vocab, but it is several times faster,
-                deterministic, and at BF16 rounding accuracy.
+                compiles the projection and CE over the supervised tokens. Like
+                ``MaskedCrossEntropy``, it rounds their logits to BF16 before the fp32 CE, and memory
+                grows as tokens x vocab. It is several times faster than ``"cce"`` and deterministic.
         """
         super().__init__()
         if impl not in ("cce", "torch_compile"):
