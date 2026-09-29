@@ -104,3 +104,50 @@ def test_non_cp_forward_uses_fa4(monkeypatch, layout, expected):
 
     assert output.shape == hidden_states.shape
     assert calls == [expected]
+
+
+def test_non_cp_forward_routes_standalone_padding_mask_to_document_path(monkeypatch):
+    calls = []
+    monkeypatch.setattr(kimi_model, "causal_fa4_attention", _fake_attention(calls, "causal"))
+
+    def document_attention(query, key, value, *, scale, q_doc_ids, kv_doc_ids, q_global_start):
+        calls.append(("fa4", q_doc_ids.tolist(), q_global_start))
+        return torch.zeros(*query.shape[:-1], value.shape[-1], dtype=value.dtype)
+
+    monkeypatch.setattr(kimi_model, "document_causal_fa4_attention", document_attention)
+    module = kimi_model.KimiMLAAttention(_small_config(), 3, BackendConfig(attn="fa4", linear="torch"))
+    padding_mask = torch.tensor([[True, True, False, False, False, False]])
+    module(torch.randn(1, 6, 64), padding_mask=padding_mask)
+
+    assert calls == [("fa4", [[0, 0, 1, 1, 1, 1]], 0)]
+
+
+def _reference_document_attention(query, key, value, *, scale, q_doc_ids, kv_doc_ids, q_global_start):
+    # [batch, heads, sequence, dim] eager stand-in for the FA4 document-causal kernel.
+    mask = kimi_model.build_document_causal_mask(
+        q_doc_ids, kv_doc_ids, q_global_start=q_global_start, dtype=query.dtype
+    )
+    weights = torch.softmax(query @ key.transpose(-2, -1) * scale + mask, dim=-1)
+    return weights @ value
+
+
+def _reference_causal_attention(query, key, value, *, scale):
+    return torch.nn.functional.scaled_dot_product_attention(query, key, value, is_causal=True, scale=scale)
+
+
+def test_standalone_padding_mask_makes_valid_outputs_independent_of_padding(monkeypatch):
+    monkeypatch.setattr(kimi_model, "causal_fa4_attention", _reference_causal_attention)
+    monkeypatch.setattr(kimi_model, "document_causal_fa4_attention", _reference_document_attention)
+    torch.manual_seed(0)
+    module = kimi_model.KimiMLAAttention(_small_config(), 3, BackendConfig(attn="fa4", linear="torch")).eval()
+    padding_mask = torch.tensor([[True, True, True, False, False, False, False, False]])
+    hidden_states = torch.randn(1, 8, 64)
+    perturbed = hidden_states.clone()
+    perturbed[padding_mask] = torch.randn(int(padding_mask.sum()), 64) * 10
+
+    with torch.no_grad():
+        output = module(hidden_states, padding_mask=padding_mask)
+        perturbed_output = module(perturbed, padding_mask=padding_mask)
+
+    valid = ~padding_mask
+    torch.testing.assert_close(perturbed_output[valid], output[valid], rtol=0, atol=0)

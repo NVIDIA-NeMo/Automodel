@@ -520,6 +520,9 @@ class KimiMLAAttention(nn.Module):
         key_states, value_states = self._expand_key_value_groups(key_states, value_states, seq_length)
 
         if self.use_fa4:
+            if packed_context is None and padding_mask is not None:
+                # A standalone padding mask carries the same document map as a binary attention mask.
+                packed_context = KimiPackedContext(doc_ids=doc_ids_from_attention_mask(padding_mask.logical_not()))
             if packed_context is not None:
                 # Any document map (packed rows, left or right padding) goes through the document-causal varlen path
                 # so valid queries never attend to padding keys; plain causal is only for unmasked batches.
