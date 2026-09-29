@@ -27,6 +27,7 @@ To check without modifying files:
 ruff format --check .   # exits non-zero if any file would change
 ruff check .            # exits non-zero on lint violations
 bandit -r app.py nemo_automodel examples scripts tools tutorials -t B614
+python tools/lint_numpy_pickle.py # requires explicit allow_pickle=False on NumPy load/save, including tests
 python tools/lint_no_globals.py   # exits non-zero on globals() / module-namespace mutation
 ```
 
