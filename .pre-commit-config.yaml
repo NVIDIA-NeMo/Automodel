@@ -72,3 +72,8 @@ repos:
         entry: python tools/lint_no_globals.py
         files: '^(nemo_automodel|tools|scripts|examples|tutorials)/.*\.py$|^app\.py$'
         types: [file]
+      - id: numpy-no-pickle
+        name: "Require allow_pickle=False for NumPy load/save"
+        language: system
+        entry: python tools/lint_numpy_pickle.py
+        types: [python]
