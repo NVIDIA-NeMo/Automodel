@@ -22,6 +22,14 @@ import torch.nn.functional as F
 from nemo_automodel.components.loss.linear_ce_base import LinearCrossEntropy
 
 
+def _validate_chunk_len(chunk_len: int) -> int:
+    """Validate that ``chunk_len`` is positive."""
+    chunk_len = int(chunk_len)
+    if chunk_len <= 0:
+        raise ValueError(f"chunk_len must be greater than zero; got {chunk_len}.")
+    return chunk_len
+
+
 def compute_cross_entropy(
     logits: torch.Tensor,
     targets: torch.Tensor,
@@ -159,8 +167,7 @@ class ChunkedCrossEntropy(LinearCrossEntropy):
             reduction: "sum", "mean", or "none" across all valid tokens.
         """
         super().__init__()
-        if chunk_len <= 0:
-            raise ValueError(f"chunk_len must be greater than zero; got {chunk_len}.")
+        chunk_len = _validate_chunk_len(chunk_len)
         if reduction not in ("sum", "mean", "none"):
             raise ValueError(f"Unsupported reduction: {reduction!r}")
         self.chunk_len = chunk_len
