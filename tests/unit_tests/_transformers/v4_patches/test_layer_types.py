@@ -65,13 +65,15 @@ def _restore(mapping, key, value):
         mapping[key] = value
 
 
-def _install_fake_transformers(initial_types=("sliding_attention", "full_attention")):
+def _install_fake_transformers(initial_types=("sliding_attention", "full_attention"), *, v5_split=True):
     """Register a minimal transformers package exposing ``configuration_utils``."""
     fake_pkg = types.ModuleType("transformers")
     fake_pkg.__path__ = []  # mark as package so submodule imports resolve
 
     fake_cu = types.ModuleType("transformers.configuration_utils")
     fake_cu.ALLOWED_LAYER_TYPES = tuple(initial_types)
+    if v5_split:
+        fake_cu.ALLOWED_ATTN_LAYER_TYPES = tuple(initial_types)
 
     fake_pkg.configuration_utils = fake_cu
 
@@ -90,16 +92,24 @@ class TestPatchAllowedLayerTypes:
         assert "sliding_attention" in fake_cu.ALLOWED_LAYER_TYPES  # preserved
         for extra in lt_mod.DEFAULT_EXTRA_LAYER_TYPES:
             assert extra in fake_cu.ALLOWED_LAYER_TYPES
+            assert extra in fake_cu.ALLOWED_ATTN_LAYER_TYPES
+
+    def test_extends_legacy_combined_allow_list(self, isolated_layer_types_state):
+        fake_cu = _install_fake_transformers(initial_types=("sliding_attention",), v5_split=False)
+
+        assert lt_mod.patch_allowed_layer_types() is True
+        for extra in lt_mod.DEFAULT_EXTRA_LAYER_TYPES:
+            assert extra in fake_cu.ALLOWED_LAYER_TYPES
 
     def test_idempotent_second_call_noop(self, isolated_layer_types_state):
         fake_cu = _install_fake_transformers(initial_types=("sliding_attention",))
 
         assert lt_mod.patch_allowed_layer_types() is True
-        after_first = fake_cu.ALLOWED_LAYER_TYPES
+        after_first = (fake_cu.ALLOWED_ATTN_LAYER_TYPES, fake_cu.ALLOWED_LAYER_TYPES)
 
         # _PATCHED should short-circuit; tuple must be identical.
         assert lt_mod.patch_allowed_layer_types() is False
-        assert fake_cu.ALLOWED_LAYER_TYPES == after_first
+        assert (fake_cu.ALLOWED_ATTN_LAYER_TYPES, fake_cu.ALLOWED_LAYER_TYPES) == after_first
 
     def test_no_duplicates_when_guard_reset(self, isolated_layer_types_state):
         """Even if the _PATCHED guard is bypassed, entries aren't duplicated."""
@@ -111,6 +121,7 @@ class TestPatchAllowedLayerTypes:
 
         for extra in lt_mod.DEFAULT_EXTRA_LAYER_TYPES:
             assert fake_cu.ALLOWED_LAYER_TYPES.count(extra) == 1
+            assert fake_cu.ALLOWED_ATTN_LAYER_TYPES.count(extra) == 1
 
     def test_custom_extra_argument(self, isolated_layer_types_state):
         fake_cu = _install_fake_transformers(initial_types=("existing",))
@@ -118,9 +129,12 @@ class TestPatchAllowedLayerTypes:
         assert lt_mod.patch_allowed_layer_types(extra=("foo", "bar")) is True
         assert "foo" in fake_cu.ALLOWED_LAYER_TYPES
         assert "bar" in fake_cu.ALLOWED_LAYER_TYPES
+        assert "foo" in fake_cu.ALLOWED_ATTN_LAYER_TYPES
+        assert "bar" in fake_cu.ALLOWED_ATTN_LAYER_TYPES
         # Defaults should NOT have been added when a custom extra is supplied.
         for default_extra in lt_mod.DEFAULT_EXTRA_LAYER_TYPES:
             assert default_extra not in fake_cu.ALLOWED_LAYER_TYPES
+            assert default_extra not in fake_cu.ALLOWED_ATTN_LAYER_TYPES
 
     def test_skips_when_attribute_missing(self, isolated_layer_types_state):
         fake_pkg = types.ModuleType("transformers")
@@ -156,6 +170,7 @@ class TestInstallLayerTypesPatchHook:
         assert lt_mod._PATCHED is True
         for extra in lt_mod.DEFAULT_EXTRA_LAYER_TYPES:
             assert extra in fake_cu.ALLOWED_LAYER_TYPES
+            assert extra in fake_cu.ALLOWED_ATTN_LAYER_TYPES
         finders = [f for f in sys.meta_path if isinstance(f, lt_mod._LayerTypesPatchFinder)]
         assert finders == []
 
@@ -189,6 +204,7 @@ class TestInstallLayerTypesPatchHook:
 
         fake_cu = types.ModuleType("transformers.configuration_utils")
         fake_cu.ALLOWED_LAYER_TYPES = ("sliding_attention",)
+        fake_cu.ALLOWED_ATTN_LAYER_TYPES = ("sliding_attention",)
 
         class _StubLoader:
             def exec_module(self, module):
@@ -218,6 +234,7 @@ class TestInstallLayerTypesPatchHook:
         assert lt_mod._PATCHED is True
         for extra in lt_mod.DEFAULT_EXTRA_LAYER_TYPES:
             assert extra in fake_cu.ALLOWED_LAYER_TYPES
+            assert extra in fake_cu.ALLOWED_ATTN_LAYER_TYPES
 
 
 def _install_fake_pretrained_config_tree():

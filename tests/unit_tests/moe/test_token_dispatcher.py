@@ -18,7 +18,9 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
+import nemo_automodel.components.moe.megatron.fused_a2a as fused_a2a
 from nemo_automodel.components.moe.megatron.token_dispatcher import (
+    HybridEPPipelineRuntimeInitializer,
     MoEFlexTokenDispatcher,
     _DeepepManager,
     _HybridEPManager,
@@ -40,6 +42,197 @@ def hybrid_ep_manager():
             router_topk=2,
         )
     return manager
+
+
+class TestHybridEPRuntimeInitialization:
+    @pytest.fixture(autouse=True)
+    def _reset_runtime_state(self):
+        fused_a2a.reset_hybrid_ep_buffer()
+        yield
+        fused_a2a.reset_hybrid_ep_buffer()
+
+    def test_direct_initialization_is_validation_safe_and_restores_state(self, hybrid_ep_manager, monkeypatch):
+        import nemo_automodel.components.moe.megatron.token_dispatcher as td
+
+        calls = []
+
+        def fake_dispatch(x, routing_map, probs, **kwargs):
+            assert torch.is_grad_enabled()
+            assert not torch.is_inference(x)
+            calls.append(("dispatch", x.shape, routing_map.clone(), probs.clone()))
+            token_rows = routing_map.nonzero(as_tuple=False)[:, 0]
+            dispatched_hidden = x[token_rows] * 2
+            dispatched_probs = probs[routing_map]
+            dispatched_hidden.register_hook(lambda grad: calls.append(("dispatch_backward_hidden", grad.clone())))
+            dispatched_probs.register_hook(lambda grad: calls.append(("dispatch_backward_probs", grad.clone())))
+            tokens_per_expert = routing_map.sum(dim=0)
+            return dispatched_hidden, dispatched_probs, None, tokens_per_expert, "runtime-handle"
+
+        def fake_combine(x, **kwargs):
+            calls.append(("combine", x.shape))
+            x.register_hook(lambda grad: calls.append(("combine_backward", grad.clone())))
+            return x.reshape(5, hybrid_ep_manager.router_topk, 4).sum(dim=1) * 3
+
+        monkeypatch.setattr(td, "hybrid_ep_dispatch", fake_dispatch)
+        monkeypatch.setattr(td, "hybrid_ep_combine", fake_combine)
+
+        old_routing = torch.ones(1, 8, dtype=torch.bool)
+        old_probs = torch.full((1, 8), 0.125)
+        old_handle = object()
+        hybrid_ep_manager.routing_map = old_routing
+        hybrid_ep_manager.token_probs = old_probs
+        hybrid_ep_manager.handle = old_handle
+        parameter = torch.nn.Parameter(torch.ones(1))
+        parameter.grad = torch.tensor([7.0])
+
+        torch.manual_seed(1234)
+        expected_rng = torch.rand(3)
+        torch.manual_seed(1234)
+        with torch.inference_mode():
+            hybrid_ep_manager.initialize_runtime(
+                num_tokens=5,
+                hidden_dim=4,
+                dtype=torch.float32,
+                device=torch.device("cpu"),
+            )
+        actual_rng = torch.rand(3)
+
+        assert [call[0] for call in calls[:2]] == ["dispatch", "combine"]
+        assert {call[0] for call in calls[2:]} == {
+            "combine_backward",
+            "dispatch_backward_hidden",
+            "dispatch_backward_probs",
+        }
+        assert calls[0][1] == torch.Size([5, 4])
+        assert calls[1][1] == torch.Size([10, 4])
+        assert torch.all(calls[0][2].sum(dim=1) == hybrid_ep_manager.router_topk)
+        prob_grad = next(call[1] for call in calls if call[0] == "dispatch_backward_probs")
+        assert prob_grad.shape == torch.Size([10]) and torch.count_nonzero(prob_grad) == 10
+        assert hybrid_ep_manager.routing_map is old_routing
+        assert hybrid_ep_manager.token_probs is old_probs
+        assert hybrid_ep_manager.handle is old_handle
+        assert torch.equal(parameter.grad, torch.tensor([7.0]))
+        assert torch.equal(actual_rng, expected_rng)
+
+    def test_runtime_capacity_matches_hybridep_floor_rounding_and_group_max(self, hybrid_ep_manager, monkeypatch):
+        initializer = HybridEPPipelineRuntimeInitializer(hybrid_ep_manager, 16, torch.bfloat16)
+        assert initializer.required_capacity(1) == 512
+        assert initializer.required_capacity(512) == 512
+        assert initializer.required_capacity(513) == 576
+
+        monkeypatch.setenv("NUM_OF_TOKENS_PER_CHUNK_COMBINE_API", "128")
+        assert initializer.required_capacity(513) == 640
+
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+        monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 2)
+        initialize_calls = []
+        monkeypatch.setattr(
+            hybrid_ep_manager,
+            "initialize_runtime",
+            lambda **kwargs: initialize_calls.append(kwargs),
+        )
+        fused_a2a.reset_hybrid_ep_buffer()
+        reduce_calls = []
+
+        def fake_all_reduce(tensor, op=None, group=None):
+            assert op == torch.distributed.ReduceOp.MAX
+            assert group is hybrid_ep_manager.group
+            reduce_calls.append(int(tensor.item()))
+            tensor.fill_(1024)
+
+        monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+        initializer.prepare(num_tokens=513, device=torch.device("cpu"))
+        initializer.prepare(num_tokens=513, device=torch.device("cpu"))
+
+        assert reduce_calls == [640, 640]
+        assert len(initialize_calls) == 1
+        assert initialize_calls[0]["num_tokens"] == 1024
+        assert fused_a2a._hybrid_ep_initialized_capacity == 1024
+
+    def test_runtime_state_is_process_global_and_reinitializes_only_on_growth(self, hybrid_ep_manager, monkeypatch):
+        with patch(
+            "nemo_automodel.components.moe.megatron.token_dispatcher.hybrid_ep_dispatch",
+            new=lambda *a, **kw: None,
+        ):
+            unshared_manager = _HybridEPManager(
+                group=None,
+                num_local_experts=2,
+                num_experts=8,
+                router_topk=2,
+            )
+        fused_a2a.reset_hybrid_ep_buffer()
+        calls = []
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+        monkeypatch.setattr(
+            hybrid_ep_manager,
+            "initialize_runtime",
+            lambda **kwargs: calls.append(("first", kwargs["num_tokens"])),
+        )
+        monkeypatch.setattr(
+            unshared_manager,
+            "initialize_runtime",
+            lambda **kwargs: calls.append(("second", kwargs["num_tokens"])),
+        )
+
+        first = HybridEPPipelineRuntimeInitializer(hybrid_ep_manager, 16, torch.bfloat16)
+        second = HybridEPPipelineRuntimeInitializer(unshared_manager, 16, torch.bfloat16)
+        assert first.signature == second.signature
+        first.prepare(num_tokens=160, device=torch.device("cpu"))
+        second.prepare(num_tokens=320, device=torch.device("cpu"))
+        second.prepare(num_tokens=513, device=torch.device("cpu"))
+        first.prepare(num_tokens=32, device=torch.device("cpu"))
+
+        assert calls == [("first", 512), ("second", 576)]
+        assert fused_a2a._hybrid_ep_initialized_capacity == 576
+        assert fused_a2a._hybrid_ep_runtime_signature[-1] == torch.device("cpu")
+
+        fused_a2a.reset_hybrid_ep_buffer()
+        assert fused_a2a._hybrid_ep_runtime_signature is None
+        assert fused_a2a._hybrid_ep_initialized_capacity == 0
+
+    def test_runtime_failure_does_not_publish_signature_or_capacity(self, hybrid_ep_manager, monkeypatch, caplog):
+        fused_a2a.reset_hybrid_ep_buffer()
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+        monkeypatch.setattr(
+            hybrid_ep_manager,
+            "initialize_runtime",
+            Mock(side_effect=RuntimeError("jit failed")),
+        )
+        initializer = HybridEPPipelineRuntimeInitializer(hybrid_ep_manager, 16, torch.bfloat16)
+
+        with caplog.at_level("ERROR"), pytest.raises(RuntimeError, match="jit failed"):
+            initializer.prepare(num_tokens=160, device=torch.device("cpu"))
+
+        assert fused_a2a._hybrid_ep_runtime_signature is None
+        assert fused_a2a._hybrid_ep_initialized_capacity == 0
+        assert "requested capacity was initialized" in caplog.text
+
+    def test_runtime_rejects_incompatible_process_global_signature(self, hybrid_ep_manager, monkeypatch):
+        with patch(
+            "nemo_automodel.components.moe.megatron.token_dispatcher.hybrid_ep_dispatch",
+            new=lambda *a, **kw: None,
+        ):
+            incompatible_manager = _HybridEPManager(
+                group=None,
+                num_local_experts=2,
+                num_experts=16,
+                router_topk=2,
+            )
+        fused_a2a.reset_hybrid_ep_buffer()
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+        monkeypatch.setattr(hybrid_ep_manager, "initialize_runtime", lambda **kwargs: None)
+        incompatible_init = Mock()
+        monkeypatch.setattr(incompatible_manager, "initialize_runtime", incompatible_init)
+        first = HybridEPPipelineRuntimeInitializer(hybrid_ep_manager, 16, torch.bfloat16)
+        second = HybridEPPipelineRuntimeInitializer(incompatible_manager, 16, torch.bfloat16)
+
+        assert first.resource_key == second.resource_key
+        assert first.signature != second.signature
+        first.prepare(num_tokens=160, device=torch.device("cpu"))
+
+        with pytest.raises(RuntimeError, match="process-global buffer"):
+            second.prepare(num_tokens=160, device=torch.device("cpu"))
+        incompatible_init.assert_not_called()
 
 
 class TestIndicesToMultihot:
