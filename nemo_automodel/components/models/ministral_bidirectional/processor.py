@@ -766,6 +766,7 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
                 push_to_hub=push_to_hub,
                 **kwargs,
             )
+        type(self).register_for_auto_class("AutoProcessor")
         return PixtralProcessor.save_pretrained(self, save_directory, push_to_hub=push_to_hub, **kwargs)
 
     @staticmethod
@@ -786,10 +787,3 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
         for prefix in _CONTROL_TOKEN_PREFIXES:
             text = text.replace(prefix, f"{prefix}{_CONTROL_TOKEN_ESCAPE}")
         return text
-
-
-def _register_with_hf_auto_classes() -> None:
-    Mistral3BiEncoderProcessor.register_for_auto_class("AutoProcessor")
-
-
-_register_with_hf_auto_classes()
