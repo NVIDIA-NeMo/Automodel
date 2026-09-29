@@ -18,6 +18,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy
 from nemo_automodel.components.loss.linear_ce_base import LinearCrossEntropy
 
 _DATASET_IGNORE_INDEX = -100
@@ -136,6 +137,29 @@ def _get_final_hidden_states(model_output: Any) -> Any | None:
     return hidden_states
 
 
+def prepare_lm_weight(
+    loss_fn: LinearCrossEntropy,
+    model: nn.Module,
+    *,
+    grad_reduce_group: torch.distributed.ProcessGroup | None = None,
+) -> torch.Tensor:
+    """Prepare one shared projection weight for main and auxiliary losses.
+
+    Args:
+        loss_fn: Linear-projection loss that owns materialization semantics.
+        model: Model with an output head of global shape [vocab, hidden].
+        grad_reduce_group: Group contributing independent token losses.
+
+    Returns:
+        Dense [vocab, hidden] weight under ``materialize_lm_weight``'s layout
+        and gradient contract. Chunked CE also honors the head's compute dtype;
+        share this result across loss calls to retain only one converted copy.
+    """
+    if isinstance(loss_fn, ChunkedCrossEntropy):
+        return loss_fn.prepare_lm_weight(_get_lm_head_module(model), grad_reduce_group=grad_reduce_group)
+    return loss_fn.materialize_lm_weight(_get_lm_head_weight(model), grad_reduce_group=grad_reduce_group)
+
+
 def calculate_loss(loss_fn: nn.Module, **kwargs: Any) -> torch.Tensor:
     """Calculate a logits-based or linear-projection cross-entropy loss.
 
@@ -166,7 +190,12 @@ def calculate_loss(loss_fn: nn.Module, **kwargs: Any) -> torch.Tensor:
         # on-device and OOM large-vocab MoE (e.g. Nemotron-Ultra, 256k vocab).
         lm_head = kwargs.pop("lm_weight", None)
         if lm_head is None:
-            lm_head = _get_lm_head_weight(model)
+            lm_head = prepare_lm_weight(loss_fn, model, grad_reduce_group=kwargs.get("grad_reduce_group"))
+        if isinstance(loss_fn, ChunkedCrossEntropy):
+            logits = kwargs.get("logits")
+            loss_fn_kwargs["logits_dtype"] = kwargs.pop(
+                "logits_dtype", logits.dtype if isinstance(logits, torch.Tensor) else None
+            )
         loss_fn_kwargs.update(
             {
                 "hidden_states": kwargs.pop("hidden_states"),

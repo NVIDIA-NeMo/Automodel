@@ -755,6 +755,7 @@ class Qwen3_5ForCausalLM(HFCheckpointingMixin, nn.Module):
         **kwargs: Any,
     ) -> Qwen3_5CausalLMOutputWithPast:
         del labels
+        kwargs.pop("output_hidden_states", None)
         effective_use_cache = False if use_cache is None else use_cache
         outputs = self.model(
             input_ids=input_ids,

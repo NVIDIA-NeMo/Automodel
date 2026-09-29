@@ -648,7 +648,10 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                 teacher_logits = separate_teacher_logits
 
             # Student forward.
-            student_batch = filter_forward_kwargs(model, batch)
+            student_batch = dict(batch)
+            if self.kd_ratio < 1.0 and isinstance(self.loss_fn, LinearCrossEntropy):
+                student_batch["output_hidden_states"] = True
+            student_batch = filter_forward_kwargs(model, student_batch)
             student_out = model(**student_batch)
 
             student_logits = getattr(student_out, "logits", student_out)  # shape (B, S, V)

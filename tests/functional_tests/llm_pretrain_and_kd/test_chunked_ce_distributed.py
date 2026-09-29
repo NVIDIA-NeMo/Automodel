@@ -28,6 +28,81 @@ from torch.distributed.tensor import Shard, distribute_tensor
 from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy
 
 
+def _check_fsdp_shared_projection(mesh, device, rank):
+    """Compare real FSDP head policies and main/MTP gradients to dense projection."""
+    from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
+
+    from nemo_automodel.components.loss.mtp import calculate_mtp_loss
+    from nemo_automodel.components.loss.utils import calculate_loss, prepare_lm_weight
+
+    for compute_dtype in (torch.bfloat16, torch.float32):
+        torch.manual_seed(71)
+        model = torch.nn.Module()
+        model.lm_head = torch.nn.Linear(16, 32, bias=False, device=device)
+        reference_weight = model.lm_head.weight.detach().clone().requires_grad_()
+        fully_shard(model.lm_head, mesh=mesh, mp_policy=MixedPrecisionPolicy(param_dtype=compute_dtype))
+        loss_fn = ChunkedCrossEntropy(4, compile=False)
+        weight = prepare_lm_weight(loss_fn, model, grad_reduce_group=dist.group.WORLD)
+        assert weight.dtype == compute_dtype
+        torch.testing.assert_close(weight, reference_weight.to(compute_dtype), rtol=0, atol=0)
+        states = [torch.randn(2, 9, 16, device=device, dtype=torch.bfloat16) for _ in range(3)]
+        local_states = [h[rank : rank + 1].clone().requires_grad_() for h in states]
+        ref_states = [h.clone().requires_grad_() for h in states]
+        labels = torch.randint(32, (2, 9), device=device)
+        labels[1] = -100  # the empty peer must still participate in the weight reduction
+        saved = []
+
+        def pack(tensor):
+            """Record the projection tensors retained by autograd.
+
+            Args:
+                tensor: Saved tensor of arbitrary shape; [vocab, hidden] weights are recorded.
+
+            Returns:
+                The input tensor unchanged, preserving shape, dtype and storage.
+            """
+            if tensor.shape == weight.shape:
+                saved.append(tensor)
+            return tensor
+
+        with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+            loss = calculate_loss(
+                loss_fn,
+                model=model,
+                hidden_states=local_states[0],
+                labels=labels[rank : rank + 1],
+                lm_weight=weight,
+                logits_dtype=torch.bfloat16,
+            )
+            loss = loss + calculate_mtp_loss(
+                loss_fn,
+                model=model,
+                mtp_per_depth_h=local_states[1:],
+                labels=labels[rank : rank + 1],
+                lm_weight=weight,
+                logits_dtype=torch.bfloat16,
+            )
+        assert len(saved) == 3
+        assert {tensor.data_ptr() for tensor in saved} == {weight.data_ptr()}
+        (loss * 2).backward()
+        reference = torch.zeros((), device=device)
+        for depth, hidden in enumerate(ref_states):
+            targets = labels.roll(-depth, -1)
+            if depth:
+                targets[..., -depth:] = -100
+            logits = F.linear(hidden.to(compute_dtype), reference_weight.to(compute_dtype)).bfloat16().float()
+            reference = reference + (1.0 if depth == 0 else 0.05) * F.cross_entropy(
+                logits.flatten(0, 1), targets.flatten(), reduction="sum"
+            )
+        reference.backward()
+        dist.all_reduce(loss.detach())
+        # BF16 GEMM rounding depends on the token tile size (chunked vs dense).
+        torch.testing.assert_close(loss, reference, rtol=2e-3, atol=2e-3)
+        torch.testing.assert_close(model.lm_head.weight.grad.full_tensor(), reference_weight.grad, rtol=2e-2, atol=2e-3)
+        for local, ref in zip(local_states, ref_states):
+            torch.testing.assert_close(local.grad / 2, ref.grad[rank : rank + 1], rtol=2e-2, atol=2e-3)
+
+
 def _worker():
     dist.init_process_group("nccl")
     try:
@@ -69,6 +144,7 @@ def _worker():
             optimizer.step()
             ref_optimizer.step()
             torch.testing.assert_close(sharded_weight.full_tensor(), ref_weight, rtol=2e-5, atol=2e-6)
+        _check_fsdp_shared_projection(mesh, device, rank)
         if rank == 0:
             print("CHUNKED_CE_DISTRIBUTED_PASS", flush=True)
     finally:

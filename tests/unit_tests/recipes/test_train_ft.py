@@ -3375,3 +3375,87 @@ def test_chunked_ce_never_silently_falls_back_to_full_logits(pp_enabled):
     probe = _StageWithLogitsToKeep() if pp_enabled else _StageNoLogitsToKeep()
     with pytest.raises(ValueError, match="ChunkedCrossEntropy requires"):
         _maybe_downgrade_loss_fn(ChunkedCrossEntropy(compile=False), probe, pp_enabled)
+
+
+@pytest.mark.parametrize("loss_kind", ["chunked", "fused"])
+def test_qwen35_hidden_state_request_in_recipe(monkeypatch, loss_kind):
+    from copy import deepcopy
+
+    from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
+
+    from nemo_automodel.components.loss import linear_ce
+    from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy
+    from nemo_automodel.components.models.common import BackendConfig
+    from nemo_automodel.components.models.qwen3_5.model import Qwen3_5ForCausalLM
+
+    # The fused kernel requires CUDA; use dense CE only at that kernel boundary
+    # to exercise the real fused loss and recipe's CPU model-forward contract.
+    def cpu_linear_ce(hidden, weight, *, targets, ignore_index, reduction, **kwargs):
+        """Compute the dense reference at the fused kernel boundary.
+
+        Args:
+            hidden: States of shape [batch, sequence, hidden].
+            weight: Projection weight of shape [vocab, hidden].
+            targets: Token labels of shape [batch, sequence].
+            ignore_index: Ignored label value.
+            reduction: Cross-entropy reduction.
+            **kwargs: Unused fused-kernel options.
+
+        Returns:
+            Scalar cross-entropy loss.
+        """
+        return torch.nn.functional.cross_entropy(
+            torch.nn.functional.linear(hidden, weight).flatten(0, 1),
+            targets.flatten(),
+            ignore_index=ignore_index,
+            reduction=reduction,
+        )
+
+    monkeypatch.setattr(linear_ce, "HAVE_CUT_CROSS_ENTROPY", True)
+    monkeypatch.setattr(linear_ce, "linear_cross_entropy", cpu_linear_ce, raising=False)
+    config = Qwen3_5TextConfig(
+        vocab_size=32,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=8,
+        max_position_embeddings=16,
+        layer_types=["full_attention"],
+        attn_implementation="eager",
+        torch_dtype="float32",
+        tie_word_embeddings=False,
+    )
+    model = Qwen3_5ForCausalLM(
+        config,
+        backend=BackendConfig(linear="torch", attn="sdpa", rms_norm="torch", rope_fusion=False, dispatcher="torch"),
+    )
+    reference = deepcopy(model)
+    recipe = SimpleNamespace(
+        model_parts=[model],
+        loss_fn=ChunkedCrossEntropy(2, compile=False)
+        if loss_kind == "chunked"
+        else linear_ce.FusedLinearCrossEntropy(),
+        dist_env=SimpleNamespace(device=torch.device("cpu")),
+        pp_enabled=False,
+        device_mesh=None,
+        tokenizer=None,
+        domain_mixture=None,
+        te_fp8=None,
+        distributed_config=SimpleNamespace(defer_fsdp_grad_sync=True),
+        _get_cp_group_size=lambda: 1,
+        _get_dp_group_size=lambda **kw: 1,
+        _get_dp_group=lambda **kw: None,
+    )
+    input_ids = torch.tensor([[1, 2, 3, 4]])
+    labels = torch.tensor([[2, -100, 4, 5]])
+    losses = []
+    TrainFinetuneRecipeForNextTokenPrediction._forward_backward_step(
+        recipe, 0, {"input_ids": input_ids, "labels": labels}, loss_buffer=losses, num_label_tokens=3, num_batches=1
+    )
+    expected = torch.nn.functional.cross_entropy(reference(input_ids).logits.flatten(0, 1), labels.flatten())
+    expected.backward()
+    torch.testing.assert_close(losses[0], expected)
+    for parameter, ref_parameter in zip(model.parameters(), reference.parameters()):
+        torch.testing.assert_close(parameter.grad, ref_parameter.grad, rtol=1e-4, atol=2e-6)

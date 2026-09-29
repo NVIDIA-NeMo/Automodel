@@ -171,3 +171,167 @@ def test_pipeline_hidden_states_loss():
     expected_grads = torch.autograd.grad(expected, (hidden, model.lm_head.weight))
     for actual_grad, expected_grad in zip(actual_grads, expected_grads):
         torch.testing.assert_close(actual_grad, expected_grad)
+
+
+@pytest.mark.parametrize("reduction", ["sum", "mean", "none"])
+def test_glm_packing_to_loss(reduction):
+    from types import SimpleNamespace
+
+    from nemo_automodel.components.datasets.utils import packed_sequence_thd_collater
+    from nemo_automodel.components.models.common.utils import compute_lm_head_logits
+    from nemo_automodel.components.models.glm_moe_dsa.cp import make_glm_dsa_packed_cp_batch_and_ctx
+
+    batch = packed_sequence_thd_collater(
+        [
+            {
+                "input_ids": [1, 2, 3, 4],
+                "labels": [2, -100, 4, 5],
+                "position_ids": [0, 1, 0, 1],
+                "seq_lens": [2, 2],
+                "seq_lens_padded": [2, 2],
+            },
+        ]
+    )
+    mesh = SimpleNamespace(size=lambda: 1, get_group=lambda: None, get_local_rank=lambda: 0)
+    _, packed = make_glm_dsa_packed_cp_batch_and_ctx(mesh, None, batch)
+    labels = packed["labels"]
+    assert labels.tolist() == [2, -100, 4, 5]
+    model = torch.nn.Module()
+    model.lm_head = torch.nn.Linear(7, 13, bias=False)
+    hidden = torch.randn(4, 7, requires_grad=True)
+    out = compute_lm_head_logits(model.lm_head, hidden, is_thd=True, output_hidden_states=True)
+    assert out.hidden_states.shape == (1, 4, 7)
+    actual = calculate_loss(
+        ChunkedCrossEntropy(3, compile=False, reduction=reduction),
+        model=model,
+        hidden_states=out.hidden_states,
+        logits=out.logits,
+        labels=labels,
+    )
+    expected = F.cross_entropy(out.logits.squeeze(0), labels, reduction=reduction)
+    assert actual.shape == expected.shape
+    torch.testing.assert_close(actual, expected)
+    actual_grads = torch.autograd.grad(actual.sum(), (hidden, model.lm_head.weight), retain_graph=True)
+    expected_grads = torch.autograd.grad(expected.sum(), (hidden, model.lm_head.weight))
+    for actual_grad, expected_grad in zip(actual_grads, expected_grads):
+        torch.testing.assert_close(actual_grad, expected_grad)
+
+
+@pytest.mark.parametrize(
+    "compiled",
+    [
+        False,
+        pytest.param(
+            True,
+            marks=pytest.mark.runtime_budget(
+                60, hard_timeout=120, reason="Cold Inductor compilation of mixed-dtype projection and backward"
+            ),
+        ),
+    ],
+)
+@pytest.mark.parametrize("cast_logits", [False, True])
+def test_fp32_head_bf16_hidden_matches_model_projection(cast_logits, compiled):
+    from nemo_automodel.components.models.common.utils import compute_lm_head_logits
+
+    torch.manual_seed(67)
+    model = torch.nn.Module()
+    model.lm_head = torch.nn.Linear(19, 37, bias=False)
+    hidden = torch.randn(2, 9, 19, dtype=torch.bfloat16, requires_grad=True)
+    labels = torch.randint(37, (2, 9))
+    out = compute_lm_head_logits(model.lm_head, hidden, fp32_lm_head=cast_logits, output_hidden_states=True)
+    actual = calculate_loss(
+        ChunkedCrossEntropy(4, compile=compiled),
+        model=model,
+        hidden_states=hidden,
+        logits=out.logits,
+        labels=labels,
+    )
+    expected = F.cross_entropy(out.logits.float().flatten(0, 1), labels.flatten(), reduction="sum")
+    torch.testing.assert_close(actual, expected)
+    actual_grads = torch.autograd.grad(actual, (hidden, model.lm_head.weight), retain_graph=True)
+    expected_grads = torch.autograd.grad(expected, (hidden, model.lm_head.weight))
+    for actual_grad, expected_grad in zip(actual_grads, expected_grads):
+        torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-5, atol=1e-6)
+
+
+def test_main_and_mtp_retain_one_shared_mixed_dtype_head():
+    from nemo_automodel.components.loss.mtp import calculate_mtp_loss
+    from nemo_automodel.components.loss.utils import prepare_lm_weight
+
+    model = torch.nn.Module()
+    model.lm_head = torch.nn.Linear(7, 13, bias=False)
+    hidden = [torch.randn(1, 9, 7, dtype=torch.bfloat16, requires_grad=True) for _ in range(3)]
+    labels = torch.randint(13, (1, 9))
+    loss_fn = ChunkedCrossEntropy(4, compile=False)
+    weight = prepare_lm_weight(loss_fn, model)
+    saved_weights = []
+
+    def pack(tensor):
+        """Record the projection tensors retained by autograd.
+
+        Args:
+            tensor: Saved tensor of arbitrary shape; [vocab, hidden] weights are recorded.
+
+        Returns:
+            The input tensor unchanged, preserving shape, dtype and storage.
+        """
+        if tensor.shape == weight.shape:
+            saved_weights.append(tensor)
+        return tensor
+
+    with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+        loss = calculate_loss(
+            loss_fn, model=model, hidden_states=hidden[0], labels=labels, lm_weight=weight, logits_dtype=torch.bfloat16
+        )
+        loss = loss + calculate_mtp_loss(
+            loss_fn,
+            model=model,
+            mtp_per_depth_h=hidden[1:],
+            labels=labels,
+            lm_weight=weight,
+            logits_dtype=torch.bfloat16,
+        )
+    assert len(saved_weights) == 3
+    assert {tensor.data_ptr() for tensor in saved_weights} == {weight.data_ptr()}
+    assert weight.data_ptr() == model.lm_head.weight.data_ptr()
+    # Dense reference includes the model-owned BF16 output cast at each depth.
+    reference = F.cross_entropy(
+        F.linear(hidden[0].float(), weight).bfloat16().float().flatten(0, 1), labels.flatten(), reduction="sum"
+    )
+    for depth, states in enumerate(hidden[1:], 1):
+        targets = labels.roll(-depth, -1)
+        targets[..., -depth:] = -100
+        reference = reference + 0.05 * F.cross_entropy(
+            F.linear(states.float(), weight).bfloat16().float().flatten(0, 1), targets.flatten(), reduction="sum"
+        )
+    torch.testing.assert_close(loss, reference)
+    actual_grads = torch.autograd.grad(loss, (*hidden, weight), retain_graph=True)
+    expected_grads = torch.autograd.grad(reference, (*hidden, weight))
+    for actual_grad, expected_grad in zip(actual_grads, expected_grads):
+        torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-5, atol=1e-6)
+
+
+def test_transformed_head_rejected_before_training():
+    from nemo_automodel.components.models.baichuan.model import NormHead
+    from nemo_automodel.recipes.llm.train_ft import _maybe_downgrade_loss_fn
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lm_head = NormHead(7, 13)
+
+        def forward(self, input_ids, logits_to_keep=0):
+            """Fail if setup incorrectly allows this transformed head.
+
+            Args:
+                input_ids: Token IDs of shape [batch, sequence].
+                logits_to_keep: Number of token positions to project.
+            """
+            raise AssertionError("must fail during setup")
+
+    model = Model().train()
+    original_weight = model.lm_head.weight.detach().clone()
+    with pytest.raises(ValueError, match="plain bias-free nn.Linear"):
+        _maybe_downgrade_loss_fn(ChunkedCrossEntropy(compile=False), model, False)
+    torch.testing.assert_close(model.lm_head.weight, original_weight)
+    assert model.lm_head.weight.grad is None

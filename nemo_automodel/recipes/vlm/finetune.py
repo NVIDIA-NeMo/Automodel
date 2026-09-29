@@ -80,9 +80,10 @@ from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.loss.mtp import calculate_mtp_loss
 from nemo_automodel.components.loss.utils import (
     _count_label_tokens,
-    _get_lm_head_weight,
+    _get_lm_head_module,
     _get_loss_ignore_index,
     calculate_loss,
+    prepare_lm_weight,
 )
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
@@ -575,6 +576,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 reduction=getattr(self.loss_fn, "reduction", "sum"),
             )
 
+        if isinstance(self.loss_fn, ChunkedCrossEntropy):
+            self.loss_fn.validate_lm_head(_get_lm_head_module(capability_model))
+
         if isinstance(model, AutoPipeline):
             self.model_parts = model.parts
             self.pp = model
@@ -989,8 +993,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
                 grad_reduce_group = self._get_dp_group(include_cp=True) if is_train else None
                 shared_lm_weight = (
-                    self.loss_fn.materialize_lm_weight(
-                        _get_lm_head_weight(model),
+                    prepare_lm_weight(
+                        self.loss_fn,
+                        model,
                         grad_reduce_group=grad_reduce_group,
                     )
                     if isinstance(self.loss_fn, LinearCrossEntropy)
@@ -1028,6 +1033,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                         num_label_tokens=num_label_tokens,
                         ignore_index=ignore_index,
                         lm_weight=shared_lm_weight,
+                        logits_dtype=out.logits.dtype,
                         grad_reduce_group=grad_reduce_group,
                         cu_seqlens=None if mtp_per_depth_targets is not None else batch.get("cu_seqlens"),
                     )

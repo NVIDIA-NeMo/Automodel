@@ -92,3 +92,23 @@ def test_cuda_gradient_parity(compiled, autocast):
     torch.testing.assert_close(loss, reference, rtol=2e-3, atol=2e-3)
     torch.testing.assert_close(hidden.grad.float(), ref_hidden.grad.float(), rtol=2e-2, atol=2e-4)
     torch.testing.assert_close(weight.grad.float(), ref_weight.grad.float(), rtol=2e-2, atol=2e-4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA mixed-dtype projection")
+@pytest.mark.parametrize("compiled", [False, True])
+def test_fp32_head_preserves_bf16_logits_rounding(compiled):
+    torch.manual_seed(67)
+    hidden = torch.randn(1, 19, 32, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    weight = torch.randn(67, 32, device="cuda", requires_grad=True)
+    labels = torch.randint(67, (1, 19), device="cuda")
+    ref_hidden = hidden.detach().clone().requires_grad_()
+    ref_weight = weight.detach().clone().requires_grad_()
+    loss = ChunkedCrossEntropy(4, compile=compiled)(hidden, labels, weight, logits_dtype=torch.bfloat16)
+    reference = F.cross_entropy(
+        F.linear(ref_hidden.float(), ref_weight).bfloat16().float().flatten(0, 1), labels.flatten(), reduction="sum"
+    )
+    loss.backward()
+    reference.backward()
+    torch.testing.assert_close(loss, reference, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(hidden.grad, ref_hidden.grad, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(weight.grad, ref_weight.grad, rtol=1e-5, atol=1e-5)

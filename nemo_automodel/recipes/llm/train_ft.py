@@ -87,9 +87,10 @@ from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.loss.mtp import calculate_mtp_loss
 from nemo_automodel.components.loss.utils import (
     _count_label_tokens,
-    _get_lm_head_weight,
+    _get_lm_head_module,
     _get_loss_ignore_index,
     calculate_loss,
+    prepare_lm_weight,
 )
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
 from nemo_automodel.components.training.domain_mixture import WEIGHTED_AGGREGATE_NAME
@@ -198,6 +199,10 @@ def _maybe_downgrade_loss_fn(loss_fn: nn.Module, probe_module: nn.Module, pp_ena
             ignore_index=_get_loss_ignore_index(loss_fn),
             reduction=getattr(loss_fn, "reduction", "sum"),
         )
+    if isinstance(loss_fn, ChunkedCrossEntropy):
+        lm_head = _get_lm_head_module(probe_module)
+        if lm_head is not None or not pp_enabled:
+            loss_fn.validate_lm_head(lm_head)
     return loss_fn
 
 
@@ -1338,11 +1343,14 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 shared_lm_weight = None
                 if isinstance(self.loss_fn, LinearCrossEntropy):
                     grad_reduce_group = self._get_dp_group(include_cp=True) if is_train else None
-                    shared_lm_weight = self.loss_fn.materialize_lm_weight(
-                        _get_lm_head_weight(model),
+                    shared_lm_weight = prepare_lm_weight(
+                        self.loss_fn,
+                        model,
                         grad_reduce_group=grad_reduce_group,
                     )
                     loss_distributed_kwargs["grad_reduce_group"] = grad_reduce_group
+                    if isinstance(self.loss_fn, ChunkedCrossEntropy):
+                        loss_distributed_kwargs["logits_dtype"] = out.logits.dtype
                 # Only forward the domain-mixture weights when configured, so
                 # loss paths that predate them keep their original signature.
                 if loss_weights is not None:
