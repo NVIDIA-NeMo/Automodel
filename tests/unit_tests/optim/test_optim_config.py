@@ -355,6 +355,27 @@ class TestDionFamilyConfigs:
         assert type(opt).__name__ == "Muon"
         assert len(opt.param_groups) >= 2  # matrix group + scalar/embed group(s)
 
+    def test_muon_updates_grouped_experts_as_independent_matrices(self):
+        dion = pytest.importorskip("dion")
+        from nemo_automodel.components.optim.optimizer import MuonConfig
+
+        torch.manual_seed(42)
+        model = torch.nn.Module()
+        model.experts = torch.nn.Parameter(torch.randn(4, 8, 16))
+        references = [torch.nn.Parameter(w.detach().clone()) for w in model.experts]
+        opt = MuonConfig(lr=1e-3, adjust_lr="rms_norm").build(model)[0]
+        reference_opt = dion.Muon(references, lr=1e-3, adjust_lr="rms_norm", weight_decay=0.0)
+        with torch._dynamo.config.patch(disable=True):
+            for _ in range(3):
+                gradient = torch.randn_like(model.experts)
+                model.experts.grad = gradient.clone()
+                for parameter, grad in zip(references, gradient):
+                    parameter.grad = grad.clone()
+                opt.step()
+                reference_opt.step()
+        torch.testing.assert_close(model.experts, torch.stack(references), atol=2e-5, rtol=0)
+        assert set(opt.state[model.experts]) == {"momentum"}
+
     @pytest.mark.parametrize("cls_name", ["Muon", "NorMuon", "Dion2", "Dion"])
     def test_all_dion_configs_build(self, cls_name):
         pytest.importorskip("dion")

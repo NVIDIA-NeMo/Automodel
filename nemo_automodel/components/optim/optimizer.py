@@ -398,6 +398,8 @@ class _DionConfigBase(OptimizerConfig):
 class MuonConfig(_DionConfigBase):
     """``dion.Muon`` — matrix-aware update for 2D+ params, scalar fallback for 1D."""
 
+    supports_batched_matrices: ClassVar[bool] = True
+
     mu: float = 0.95
     betas: tuple[float, float] = (0.9, 0.95)
     epsilon: float = 1e-8
@@ -410,6 +412,28 @@ class MuonConfig(_DionConfigBase):
         from dion import Muon
 
         return Muon(param_groups, **ctor_kwargs)
+
+
+@dataclass
+class MuownConfig(_DionConfigBase):
+    """Muown: per-neuron Adam magnitudes and Dion Muon directions, including MoE."""
+
+    supports_batched_matrices: ClassVar[bool] = True
+    use_matrix_layout: ClassVar[bool] = True
+
+    lr: float = 3e-4
+    mu: float = 0.95
+    betas: tuple[float, float] = (0.9, 0.95)
+    epsilon: float = 1e-8
+    nesterov: bool = True
+    ns_steps: int = 5
+    ns_epsilon: float = 1e-7
+
+    def _make_optimizer(self, param_groups: list[dict[str, Any]], ctor_kwargs: dict[str, Any]) -> torch.optim.Optimizer:
+        """Construct Muown using the tensor-layout contract documented on Muown."""
+        from nemo_automodel.components.optim.muown import Muown
+
+        return Muown(param_groups, **ctor_kwargs)
 
 
 @dataclass
@@ -816,6 +840,7 @@ OPTIMIZER_CONFIG_REGISTRY: dict[str, type[OptimizerConfig]] = {
     "fused_adam": FusedAdamConfig,
     "flash_adamw": FlashAdamWConfig,
     "muon": MuonConfig,
+    "muown": MuownConfig,
     "normuon": NorMuonConfig,
     "dion": DionConfig,
     "dion2": Dion2Config,
@@ -825,6 +850,7 @@ OPTIMIZER_CONFIG_REGISTRY: dict[str, type[OptimizerConfig]] = {
 # typed config that performs Dion's parameter grouping.  Keyed by ``cls.__name__``.
 _DION_CONFIG_FOR: dict[str, type[OptimizerConfig]] = {
     "Muon": MuonConfig,
+    "Muown": MuownConfig,
     "NorMuon": NorMuonConfig,
     "Dion2": Dion2Config,
     "Dion": DionConfig,
@@ -971,6 +997,7 @@ __all__ = [
     "FusedAdamConfig",
     "LRSchedulerConfig",
     "MuonConfig",
+    "MuownConfig",
     "NorMuonConfig",
     "OptimizerConfig",
     "OptimizerFromFactoryConfig",

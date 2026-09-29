@@ -15,6 +15,7 @@
 import math
 
 import pytest
+import torch
 import torch.nn as nn
 
 # ---------------------------------------------------------------------------
@@ -121,6 +122,25 @@ class TestSeparateParamGroups:
         # lm_head group
         assert groups[3]["algorithm"] == "adamw"
         assert groups[3]["weight_decay"] == 0.0
+
+    @pytest.mark.parametrize("supports_batched_matrices", [False, True])
+    def test_grouped_experts_follow_optimizer_capability(self, supports_batched_matrices):
+        model = TinyModel(with_bias=True)
+        model.experts = nn.Parameter(torch.randn(4, 8, 16))
+        groups = self._call(
+            model=model,
+            base_lr=1e-3,
+            scalar_opt="adamw",
+            weight_decay=0.0,
+            supports_batched_matrices=supports_batched_matrices,
+        )
+        matrix_ids = {id(p) for p in groups[0]["params"]}
+        scalar_ids = {id(p) for p in groups[1]["params"]}
+        assert (id(model.experts) in matrix_ids) == supports_batched_matrices
+        assert (id(model.experts) in scalar_ids) != supports_batched_matrices
+        assert id(model.linear.bias) in scalar_ids
+        assert id(model.embed_tokens.weight) not in matrix_ids
+        assert id(model.lm_head.weight) not in matrix_ids
 
     def test_no_lm_head(self):
         model = TinyModel(with_lm_head=False)
