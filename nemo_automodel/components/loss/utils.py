@@ -156,7 +156,11 @@ def prepare_lm_weight(
         share this result across loss calls to retain only one converted copy.
     """
     if isinstance(loss_fn, ChunkedCrossEntropy):
-        return loss_fn.prepare_lm_weight(_get_lm_head_module(model), grad_reduce_group=grad_reduce_group)
+        return loss_fn.prepare_lm_weight(
+            _get_lm_head_module(model),
+            model_config=getattr(model, "config", None),
+            grad_reduce_group=grad_reduce_group,
+        )
     return loss_fn.materialize_lm_weight(_get_lm_head_weight(model), grad_reduce_group=grad_reduce_group)
 
 

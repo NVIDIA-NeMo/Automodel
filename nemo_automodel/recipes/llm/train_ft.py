@@ -202,7 +202,7 @@ def _maybe_downgrade_loss_fn(loss_fn: nn.Module, probe_module: nn.Module, pp_ena
     if isinstance(loss_fn, ChunkedCrossEntropy):
         lm_head = _get_lm_head_module(probe_module)
         if lm_head is not None or not pp_enabled:
-            loss_fn.validate_lm_head(lm_head)
+            loss_fn.validate_lm_head(lm_head, model_config=getattr(probe_module, "config", None))
     return loss_fn
 
 

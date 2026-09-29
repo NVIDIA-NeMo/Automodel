@@ -577,7 +577,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
             )
 
         if isinstance(self.loss_fn, ChunkedCrossEntropy):
-            self.loss_fn.validate_lm_head(_get_lm_head_module(capability_model))
+            self.loss_fn.validate_lm_head(
+                _get_lm_head_module(capability_model), model_config=getattr(capability_model, "config", None)
+            )
 
         if isinstance(model, AutoPipeline):
             self.model_parts = model.parts

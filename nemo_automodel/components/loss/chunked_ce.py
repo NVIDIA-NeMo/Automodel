@@ -20,6 +20,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 from torch.distributed.fsdp import FSDPModule
+from transformers import PretrainedConfig
 
 from nemo_automodel.components.loss.linear_ce_base import LinearCrossEntropy
 
@@ -201,8 +202,27 @@ class ChunkedCrossEntropy(LinearCrossEntropy):
         ] = torch.compile(_linear_cross_entropy, dynamic=True) if compile else _linear_cross_entropy
 
     @staticmethod
-    def validate_lm_head(lm_head: nn.Module | None) -> nn.Linear:
-        """Validate and return a bias-free head whose linear forward can be reproduced."""
+    def validate_lm_head(lm_head: nn.Module | None, *, model_config: PretrainedConfig | None = None) -> nn.Linear:
+        """Validate the head and the owning model's output-logit configuration.
+
+        A linear module alone does not rule out post-projection transformations.
+        Read the text configuration through the HF config contract, including
+        multimodal models whose output settings live in a nested text config.
+
+        Args:
+            lm_head: Output head with weight of global shape [vocab, hidden].
+            model_config: Owning model's configuration, when available.
+
+        Returns:
+            The validated linear head, unchanged.
+        """
+        if model_config is not None:
+            text_config = model_config.get_text_config()
+            if getattr(text_config, "final_logit_softcapping", None) is not None:
+                raise ValueError(
+                    "ChunkedCrossEntropy does not support final_logit_softcapping; "
+                    "use MaskedCrossEntropy to preserve the model's post-projection transformation"
+                )
         # FSDP dynamically subclasses Linear but retains its forward method.
         if (
             not isinstance(lm_head, nn.Linear)
@@ -216,13 +236,18 @@ class ChunkedCrossEntropy(LinearCrossEntropy):
         return lm_head
 
     def prepare_lm_weight(
-        self, lm_head: nn.Module | None, *, grad_reduce_group: dist.ProcessGroup | None = None
+        self,
+        lm_head: nn.Module | None,
+        *,
+        model_config: PretrainedConfig | None = None,
+        grad_reduce_group: dist.ProcessGroup | None = None,
     ) -> torch.Tensor:
         """Materialize one head in its effective projection dtype for all losses.
 
         Args:
             lm_head: Plain linear head with weight of global shape [vocab, hidden].
                 Its FSDP policy, when present, owns the compute dtype.
+            model_config: Owning model config, used to reject post-projection transforms.
             grad_reduce_group: Group contributing independent token losses.
 
         Returns:
@@ -230,7 +255,7 @@ class ChunkedCrossEntropy(LinearCrossEntropy):
             gradient contract. Share this tensor across main and MTP losses;
             a dtype conversion allocates once and remains differentiable.
         """
-        lm_head = self.validate_lm_head(lm_head)
+        lm_head = self.validate_lm_head(lm_head, model_config=model_config)
         compute_dtype = lm_head.weight.dtype
         if isinstance(lm_head, FSDPModule):
             compute_dtype = lm_head._get_fsdp_state()._mp_policy.param_dtype or compute_dtype
