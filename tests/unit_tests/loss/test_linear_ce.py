@@ -277,6 +277,26 @@ def test_fused_cross_entropy_applies_per_token_weights(monkeypatch):
     assert out.item() == pytest.approx((0.5 + 1.0 + 4.5 + 6.0) / 4)
 
 
+def test_fused_cross_entropy_accumulates_hidden_grad_in_fp32(monkeypatch):
+    """The fused kernel must not accumulate the hidden-state gradient in bf16 or filter tokens."""
+    from nemo_automodel.components.loss import linear_ce as linear_ce_mod
+
+    monkeypatch.setattr(linear_ce_mod, "HAVE_CUT_CROSS_ENTROPY", True)
+    captured = {}
+
+    def _fake_linear_ce(hidden, weight, targets=None, **kwargs):
+        captured.update(kwargs)
+        return torch.tensor(1.0)
+
+    monkeypatch.setattr(linear_ce_mod, "linear_cross_entropy", _fake_linear_ce, raising=False)
+    linear_ce_mod.FusedLinearCrossEntropy()(
+        torch.randn(1, 2, 3), torch.zeros(1, 2, dtype=torch.long), torch.randn(5, 3)
+    )
+
+    assert captured["accum_e_fp32"] is True
+    assert captured["filter_eps"] is None
+
+
 @pytest.mark.skipif(not HAVE_CUT_CROSS_ENTROPY or not torch.cuda.is_available(), reason="requires fused CE on CUDA")
 def test_fused_weighted_cross_entropy_matches_pytorch_gradient():
     """A real fused kernel must match the weighted PyTorch loss and gradients."""

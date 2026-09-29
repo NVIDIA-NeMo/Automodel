@@ -261,6 +261,9 @@ class FusedLinearCrossEntropy(nn.Module):
 
         # Compute loss with shift=False to match PyTorch behavior
         # Set filter_eps=None to avoid any token filtering
+        # accum_e_fp32 accumulates the hidden-state gradient in fp32. The default
+        # atomically adds every vocab block into a bf16 buffer, which leaves the
+        # hidden-state gradient ~6x above bf16 rounding error at 150K vocab.
         loss = linear_cross_entropy(
             hidden_states,
             lm_weight,
@@ -270,6 +273,7 @@ class FusedLinearCrossEntropy(nn.Module):
             reduction="none" if loss_weights is not None else self.reduction,
             shift=False,  # Match PyTorch behavior
             filter_eps=None,  # No token filtering
+            accum_e_fp32=True,
         )
         if loss_weights is not None:
             loss = (loss * loss_weights).sum()
