@@ -19,11 +19,6 @@ import torch
 import torch.nn as nn
 
 try:
-    import grouped_gemm
-except ImportError:
-    grouped_gemm = None
-
-try:
     import transformer_engine  # noqa: F401
 
     HAS_TE = True
@@ -181,7 +176,6 @@ def test_grouped_experts_deepep_lora_preserves_dispatcher_settings(moe_config):
         dispatcher_share_token_dispatcher=False,
         dispatcher_async_dispatch=True,
     )
-    orig_experts.use_torch_mm = True
     orig_experts.use_mxfp8 = True
 
     lora_experts = GroupedExpertsDeepEPLoRA(orig_experts, lora_dim=4, alpha=8)
@@ -190,7 +184,6 @@ def test_grouped_experts_deepep_lora_preserves_dispatcher_settings(moe_config):
     assert lora_experts.dispatcher_num_sms == 24
     assert lora_experts.dispatcher_share_token_dispatcher is False
     assert lora_experts.dispatcher_async_dispatch is True
-    assert lora_experts.use_torch_mm is True
     assert lora_experts.use_mxfp8 is True
 
 
@@ -259,7 +252,7 @@ class MockDeepEPDispatcher:
 
     def token_permutation2(self, hidden_states, num_local_tokens, token_probs, token_indices):
         # Simply return the hidden states as if it was a single expert local dispatch
-        # To make it compatible with ops.gmm, we need a tokens_per_expert tensor
+        # Return one token-count entry per local expert.
         tokens_per_expert = torch.zeros(4, dtype=torch.long, device=hidden_states.device)
         return hidden_states, tokens_per_expert, token_probs
 
@@ -267,13 +260,13 @@ class MockDeepEPDispatcher:
         return hidden_states
 
 
-@pytest.mark.skipif(grouped_gemm is None or not torch.cuda.is_available(), reason="Requires grouped_gemm and CUDA")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.timeout(60)
 def test_grouped_experts_deepep_lora_forward_mocked(moe_config, device):
     """
     Test Forward pass of GroupedExpertsDeepEPLoRA using a Mock Dispatcher.
 
-    This test verifies the LoRA-wrapped gated GEMM logic (using grouped_gemm kernels)
+    This test verifies the LoRA-wrapped native grouped-MM logic
     independently of the DeepEP communication backend. This allows verification on
     non-Hopper (non-sm_90) hardware where DeepEP is physically unavailable.
     """
@@ -294,7 +287,7 @@ def test_grouped_experts_deepep_lora_forward_mocked(moe_config, device):
     lora_module = GroupedExpertsDeepEPLoRA(orig_experts, lora_dim=4).to(device).to(torch.bfloat16)
     mock_dispatcher = MockDeepEPDispatcher()
 
-    # Mock tokens_per_expert for ops.gmm - needs to sum to num_tokens
+    # Mock tokens_per_expert; counts must sum to num_tokens.
     num_tokens = 8
     # One expert gets all tokens for simplicity
     tokens_per_expert = torch.tensor([num_tokens, 0, 0, 0], dtype=torch.long, device="cpu")
@@ -316,7 +309,7 @@ def test_grouped_experts_deepep_lora_forward_mocked(moe_config, device):
     indices = torch.zeros(num_tokens, 1, dtype=torch.long, device=device)
     token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
 
-    # This will now reach the lora_module.forward -> ops.gmm calls!
+    # This reaches the native grouped-MM calls.
     out = lora_module(x, token_mask, weights, indices)
 
     # Verify equivalence with zero LoRA weights (DeepEP LoRA B is zero-init by default)
@@ -607,7 +600,7 @@ def test_lora_backward_pass_values(moe_config, device):
     )
 
 
-@pytest.mark.skipif(grouped_gemm is None or not torch.cuda.is_available(), reason="Requires grouped_gemm and CUDA")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_deepep_lora_zero_tokens(moe_config, device):
     """Test DeepEP LoRA forward pass with zero tokens routed to experts."""
     moe_config.n_routed_experts = 4
@@ -736,26 +729,6 @@ def test_lora_copies_use_torch_mm_flag(moe_config, device):
     orig_experts.use_torch_mm = True
     lora_experts = GroupedExpertsLoRA(orig_experts, lora_dim=4, alpha=8)
     assert lora_experts.use_torch_mm is True
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_deepep_lora_copies_use_torch_mm_flag(moe_config, device):
-    """Test that use_torch_mm flag is copied from the original DeepEP module."""
-    orig_experts = GroupedExpertsDeepEP(moe_config).to(device)
-    with torch.no_grad():
-        orig_experts.init_weights(device)
-
-    orig_experts.n_routed_experts = 4
-    orig_experts.ep_size = 1
-
-    # Default -> use_torch_mm is False
-    lora_module = GroupedExpertsDeepEPLoRA(orig_experts, lora_dim=4)
-    assert lora_module.use_torch_mm is False
-
-    # Simulate a module that had use_torch_mm=True
-    orig_experts.use_torch_mm = True
-    lora_module = GroupedExpertsDeepEPLoRA(orig_experts, lora_dim=4)
-    assert lora_module.use_torch_mm is True
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -915,9 +888,9 @@ def test_grouped_experts_lora_forward_torch_mm_with_bias(device):
     assert not torch.isnan(out).any()
 
 
-@pytest.mark.skipif(grouped_gemm is None or not torch.cuda.is_available(), reason="Requires grouped_gemm and CUDA")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_deepep_lora_forward_torch_mm(moe_config, device):
-    """Test DeepEP LoRA forward with use_torch_mm=True via mock dispatcher."""
+    """Test DeepEP LoRA forward with the native grouped-MM backend via a mock dispatcher."""
     moe_config.n_routed_experts = 4
     moe_config.dim = 16
     moe_config.moe_inter_dim = 32
@@ -929,11 +902,8 @@ def test_deepep_lora_forward_torch_mm(moe_config, device):
 
     orig_experts.n_routed_experts = 4
     orig_experts.ep_size = 1
-    orig_experts.use_torch_mm = True
-
     # lora_dim must be >= 8 for bf16 to satisfy torch._grouped_mm 16-byte stride alignment
     lora_module = GroupedExpertsDeepEPLoRA(orig_experts, lora_dim=8).to(device).to(torch.bfloat16)
-    assert lora_module.use_torch_mm is True
 
     mock_dispatcher = MockDeepEPDispatcher()
 
@@ -955,60 +925,6 @@ def test_deepep_lora_forward_torch_mm(moe_config, device):
     out = lora_module(x, token_mask, weights, indices)
     assert out.shape == (num_tokens, 16)
     assert not torch.isnan(out).any()
-
-
-@pytest.mark.skipif(grouped_gemm is None or not torch.cuda.is_available(), reason="Requires grouped_gemm and CUDA")
-def test_deepep_lora_forward_torch_mm_equivalence(moe_config, device):
-    """With zero-init B, torch_mm and grouped_gemm paths should match for DeepEP LoRA."""
-    moe_config.n_routed_experts = 4
-    moe_config.dim = 16
-    moe_config.moe_inter_dim = 32
-    moe_config.dtype = torch.bfloat16
-
-    orig_experts = GroupedExpertsDeepEP(moe_config).to(device).to(torch.bfloat16)
-    with torch.no_grad():
-        orig_experts.init_weights(device)
-    orig_experts.n_routed_experts = 4
-    orig_experts.ep_size = 1
-
-    # lora_dim must be >= 8 for bf16 to satisfy torch._grouped_mm 16-byte stride alignment
-    # Create two modules: one using grouped_gemm, one using torch_mm
-    lora_gg = GroupedExpertsDeepEPLoRA(orig_experts, lora_dim=8).to(device).to(torch.bfloat16)
-    lora_gg.use_torch_mm = False
-
-    lora_mm = GroupedExpertsDeepEPLoRA(orig_experts, lora_dim=8).to(device).to(torch.bfloat16)
-    lora_mm.use_torch_mm = True
-
-    # Sync LoRA weights
-    with torch.no_grad():
-        lora_mm.lora_gate_and_up_A.copy_(lora_gg.lora_gate_and_up_A)
-        lora_mm.lora_gate_and_up_B.copy_(lora_gg.lora_gate_and_up_B)
-        lora_mm.lora_down_A.copy_(lora_gg.lora_down_A)
-        lora_mm.lora_down_B.copy_(lora_gg.lora_down_B)
-
-    num_tokens = 8
-    tokens_per_expert = torch.tensor([num_tokens, 0, 0, 0], dtype=torch.long, device="cpu")
-    dtype = torch.bfloat16
-    permuted_x = torch.randn(num_tokens, 16, device=device).to(dtype)
-    permuted_probs = torch.ones(num_tokens, device=device).to(dtype)
-
-    mock_dispatcher_gg = MockDeepEPDispatcher()
-    mock_dispatcher_gg.token_permutation2 = MagicMock(return_value=(permuted_x, tokens_per_expert, permuted_probs))
-    mock_dispatcher_mm = MockDeepEPDispatcher()
-    mock_dispatcher_mm.token_permutation2 = MagicMock(return_value=(permuted_x, tokens_per_expert, permuted_probs))
-    lora_gg.token_dispatcher = mock_dispatcher_gg
-    lora_mm.token_dispatcher = mock_dispatcher_mm
-
-    x = torch.randn(num_tokens, 16, device=device).to(dtype)
-    weights = torch.ones(num_tokens, 1, device=device).to(dtype)
-    indices = torch.zeros(num_tokens, 1, dtype=torch.long, device=device)
-    token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
-
-    with torch.no_grad():
-        out_gg = lora_gg(x, token_mask, weights, indices)
-        out_mm = lora_mm(x, token_mask, weights, indices)
-
-    assert torch.allclose(out_gg, out_mm, atol=1e-3, rtol=1e-3)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -1057,9 +973,9 @@ def test_deepep_lora_kaiming_init(moe_config, device):
     assert not torch.allclose(lora_module.lora_down_A, torch.zeros_like(lora_module.lora_down_A))
 
 
-@pytest.mark.skipif(grouped_gemm is None or not torch.cuda.is_available(), reason="Requires grouped_gemm and CUDA")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_deepep_lora_forward_torch_mm_with_bias(device):
-    """Test DeepEP LoRA forward with use_torch_mm=True and expert_bias=True."""
+    """Test DeepEP LoRA forward with native grouped MM and expert_bias=True."""
     config = MoEConfig(
         n_routed_experts=4,
         n_shared_experts=0,
@@ -1085,62 +1001,8 @@ def test_deepep_lora_forward_torch_mm_with_bias(device):
         orig_experts.init_weights(device)
     orig_experts.n_routed_experts = 4
     orig_experts.ep_size = 1
-    orig_experts.use_torch_mm = True
-
     # lora_dim must be >= 8 for bf16 to satisfy torch._grouped_mm 16-byte stride alignment
     lora_module = GroupedExpertsDeepEPLoRA(orig_experts, lora_dim=8).to(device).to(torch.bfloat16)
-
-    mock_dispatcher = MockDeepEPDispatcher()
-    num_tokens = 8
-    tokens_per_expert = torch.tensor([num_tokens, 0, 0, 0], dtype=torch.long, device="cpu")
-    dtype = torch.bfloat16
-    permuted_x = torch.randn(num_tokens, 16, device=device).to(dtype)
-    permuted_probs = torch.ones(num_tokens, device=device).to(dtype)
-
-    mock_dispatcher.token_permutation2 = MagicMock(return_value=(permuted_x, tokens_per_expert, permuted_probs))
-    lora_module.token_dispatcher = mock_dispatcher
-
-    x = torch.randn(num_tokens, 16, device=device).to(dtype)
-    weights = torch.ones(num_tokens, 1, device=device).to(dtype)
-    indices = torch.zeros(num_tokens, 1, dtype=torch.long, device=device)
-    token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
-
-    out = lora_module(x, token_mask, weights, indices)
-    assert out.shape == (num_tokens, 16)
-    assert not torch.isnan(out).any()
-
-
-@pytest.mark.skipif(grouped_gemm is None or not torch.cuda.is_available(), reason="Requires grouped_gemm and CUDA")
-def test_deepep_lora_forward_grouped_gemm_with_bias(device):
-    """Test DeepEP LoRA forward with use_torch_mm=False (grouped_gemm) and expert_bias=True."""
-    config = MoEConfig(
-        n_routed_experts=4,
-        n_shared_experts=0,
-        n_activated_experts=2,
-        n_expert_groups=1,
-        n_limited_groups=1,
-        train_gate=True,
-        gate_bias_update_factor=0.0,
-        aux_loss_coeff=0.0,
-        score_func="softmax",
-        route_scale=1.0,
-        dim=16,
-        inter_dim=32,
-        moe_inter_dim=32,
-        norm_topk_prob=False,
-        expert_activation="swiglu",
-        dtype=torch.bfloat16,
-        expert_bias=True,
-    )
-
-    orig_experts = GroupedExpertsDeepEP(config).to(device).to(torch.bfloat16)
-    with torch.no_grad():
-        orig_experts.init_weights(device)
-    orig_experts.n_routed_experts = 4
-    orig_experts.ep_size = 1
-    orig_experts.use_torch_mm = False
-
-    lora_module = GroupedExpertsDeepEPLoRA(orig_experts, lora_dim=4).to(device).to(torch.bfloat16)
 
     mock_dispatcher = MockDeepEPDispatcher()
     num_tokens = 8

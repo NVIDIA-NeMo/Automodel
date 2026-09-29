@@ -16,10 +16,34 @@
 
 from __future__ import annotations
 
+import copy
 import math
-from typing import Any
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Protocol
 
 from transformers import AutoTokenizer, PretrainedConfig, PreTrainedTokenizerFast
+
+if TYPE_CHECKING:
+    import torch
+
+    from nemo_automodel.components.distributed.config import DistributedSetup
+    from nemo_automodel.components.models.deepseek_v41.dspark import DeepseekV41DSparkModel
+    from nemo_automodel.components.models.deepseek_v41.model import DeepseekV41ForCausalLM
+
+
+class _DSparkDraftOptions(Protocol):
+    """Declarative DSpark settings supplied by the generic training recipe."""
+
+    num_draft_layers: int
+    target_layer_ids: list[int]
+    block_size: int
+    num_anchors: int
+    mask_token_id: int
+    markov_rank: int
+    markov_head_type: str
+    confidence_head_alpha: float
+    confidence_head_with_markov: bool
+    confidence_head_stop_gradient: bool
 
 
 class DeepseekV41TextConfig(PretrainedConfig):
@@ -430,3 +454,170 @@ class DeepseekV41Config(PretrainedConfig):
         if not isinstance(tokenizer, PreTrainedTokenizerFast):
             raise TypeError("DeepSeek-V4.1 Engram requires the checkpoint's original fast tokenizer")
         return tokenizer
+
+    def build_dspark_draft(self, options: _DSparkDraftOptions) -> DeepseekV41DSparkModel:
+        """Build the model-owned DSpark training adapter.
+
+        Args:
+            options: Declarative draft settings supplied by the DSpark recipe.
+
+        Returns:
+            Native DeepSeek V4.1 DSpark model ready for device placement.
+        """
+        return DeepseekV41DSparkConfig(
+            text_config=self.text_config,
+            num_draft_layers=int(options.num_draft_layers),
+            target_layer_ids=tuple(int(layer_id) for layer_id in options.target_layer_ids),
+            block_size=int(options.block_size),
+            num_anchors=int(options.num_anchors),
+            mask_token_id=int(options.mask_token_id),
+            markov_rank=int(options.markov_rank),
+            markov_head_type=str(options.markov_head_type),
+            confidence_head_alpha=float(options.confidence_head_alpha),
+            confidence_head_with_markov=bool(options.confidence_head_with_markov),
+            confidence_head_stop_gradient=bool(options.confidence_head_stop_gradient),
+            quantization_config=copy.deepcopy(getattr(self, "quantization_config", None)),
+        ).build()
+
+
+@dataclass(frozen=True)
+class DeepseekV41DSparkConfig:
+    """Validated declarative configuration for the released V4.1 DSpark module."""
+
+    text_config: DeepseekV41TextConfig
+    num_draft_layers: int
+    target_layer_ids: tuple[int, ...]
+    block_size: int
+    num_anchors: int
+    mask_token_id: int
+    markov_rank: int
+    markov_head_type: str
+    confidence_head_alpha: float
+    confidence_head_with_markov: bool
+    confidence_head_stop_gradient: bool = False
+    quantization_config: dict[str, Any] | None = None
+
+    def build(self) -> DeepseekV41DSparkModel:
+        """Validate the released contract and build its training adapter.
+
+        Returns:
+            Newly initialized DeepSeek V4.1 DSpark training model.
+
+        Raises:
+            ValueError: If recipe settings disagree with the released checkpoint.
+        """
+        from nemo_automodel.components.models.deepseek_v41.dspark import DeepseekV41DSparkModel
+
+        expected = {
+            "num_draft_layers": self.text_config.num_nextn_predict_layers,
+            "block_size": self.text_config.dspark_block_size,
+            "mask_token_id": self.text_config.dspark_noise_token_id,
+            "markov_rank": self.text_config.dspark_markov_rank,
+        }
+        for name, expected_value in expected.items():
+            actual_value = getattr(self, name)
+            if actual_value != expected_value:
+                raise ValueError(
+                    f"DeepSeek V4.1 DSpark requires {name}={expected_value} from the target checkpoint, "
+                    f"got {actual_value}"
+                )
+        if list(self.target_layer_ids) != self.text_config.dspark_target_layer_ids:
+            raise ValueError(
+                "DeepSeek V4.1 DSpark target_layer_ids must match the target checkpoint: "
+                f"expected {self.text_config.dspark_target_layer_ids}, got {list(self.target_layer_ids)}"
+            )
+        if self.num_anchors <= 0:
+            raise ValueError(f"DeepSeek V4.1 DSpark requires num_anchors > 0, got {self.num_anchors}")
+        if not math.isfinite(self.confidence_head_alpha) or self.confidence_head_alpha < 0:
+            raise ValueError(
+                "DeepSeek V4.1 DSpark requires confidence_head_alpha to be finite and non-negative, "
+                f"got {self.confidence_head_alpha}"
+            )
+        if self.markov_head_type != "vanilla":
+            raise ValueError(f"DeepSeek V4.1 DSpark requires markov_head_type='vanilla', got {self.markov_head_type!r}")
+        if not self.confidence_head_with_markov:
+            raise ValueError("DeepSeek V4.1 DSpark requires confidence_head_with_markov=true")
+
+        draft_config = copy.deepcopy(self.text_config)
+        draft_config.architectures = ["DeepseekV41DSparkModel"]
+        draft_config.quantization_config = copy.deepcopy(self.quantization_config)
+        return DeepseekV41DSparkModel(
+            draft_config,
+            num_anchors=self.num_anchors,
+            enable_confidence_head=self.confidence_head_alpha > 0,
+            confidence_head_stop_gradient=self.confidence_head_stop_gradient,
+        )
+
+
+@dataclass
+class DeepseekV41DSparkTargetConfig:
+    """Construction settings for the frozen, text-only V4.1 DSpark target.
+
+    The released feature contract requires the full target depth. The native
+    MTP tensors belong to the separately trained draft.
+    """
+
+    target_path: str
+    trust_remote_code: bool = False
+    target_num_hidden_layers: int | None = None
+    attn_backend: str = "tilelang"
+    dispatcher: str = "hybridep"
+    experts: str = "torch_mm"
+    enable_fsdp_optimizations: bool = True
+
+    def build(
+        self,
+        *,
+        device: torch.device,
+        compute_dtype: torch.dtype,
+        distributed_setup: DistributedSetup,
+    ) -> DeepseekV41ForCausalLM:
+        """Load the text target through the supplied EP/FSDP infrastructure.
+
+        Args:
+            device: Resolved execution device; the sharded target requires CUDA.
+            compute_dtype: Precision used to load and compute the frozen target.
+            distributed_setup: Runtime parallelism configuration composed by the recipe.
+
+        Returns:
+            The pretrained target with its vision tower disabled.
+        """
+        # The transformers bridge also imports model configs during registration.
+        from nemo_automodel._transformers import NeMoAutoModelForCausalLM
+        from nemo_automodel.components.models.common import BackendConfig
+
+        if device.type != "cuda":
+            raise RuntimeError(
+                "DeepSeek V4.1 DSpark target requires CUDA: the target is loaded "
+                "with the expert-parallel / FSDP distributed path."
+            )
+        if self.target_num_hidden_layers is not None:
+            raise ValueError(
+                "DeepSeek V4.1 DSpark does not support target_num_hidden_layers: "
+                "the released target feature contract requires layers 37, 38, and 39"
+            )
+        target_config = DeepseekV41Config.from_pretrained(
+            self.target_path,
+            name_or_path=self.target_path,
+            vision_config={"num_hidden_layers": 0},
+        )
+        return NeMoAutoModelForCausalLM.from_config(
+            config=target_config,
+            backend=BackendConfig(
+                attn=self.attn_backend,
+                linear="torch",
+                rms_norm="torch_fp32",
+                rope_fusion=False,
+                gate_precision="float32",
+                dispatcher=self.dispatcher,
+                experts=self.experts,
+                enable_hf_state_dict_adapter=True,
+                enable_fsdp_optimizations=self.enable_fsdp_optimizations,
+            ),
+            distributed_setup=distributed_setup,
+            load_base_model=True,
+            torch_dtype=compute_dtype,
+            trust_remote_code=self.trust_remote_code,
+            use_liger_kernel=False,
+            use_sdpa_patching=False,
+        )

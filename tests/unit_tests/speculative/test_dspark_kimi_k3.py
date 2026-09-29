@@ -168,13 +168,13 @@ def test_target_backend_defaults_and_overrides():
         {
             "target_attn_backend": "sdpa",
             "target_dispatcher": "deepep",
-            "target_experts": "gmm",
+            "target_experts": "torch_mm",
             "target_enable_fsdp_optimizations": False,
         }
     )
     assert backend.attn == "sdpa"
     assert backend.dispatcher == "deepep"
-    assert backend.experts == "gmm"
+    assert backend.experts == "torch_mm"
     assert backend.enable_fsdp_optimizations is False
 
 
