@@ -523,9 +523,131 @@ def test_infonce_module_learnable_temperature():
     assert torch.allclose(loss_fn.current_temperature(), torch.tensor(0.05), atol=ATOL)
 
 
+@pytest.mark.parametrize("direction, in_batch", [("q2d", False), ("q2d", True), ("symmetric", True)])
+@pytest.mark.parametrize("mask_kind", ["all_valid", "ragged", "all_padding"])
+def test_infonce_learnable_temperature_with_masked_negatives(direction, in_batch, mask_kind):
+    torch.manual_seed(42)
+    inputs = [torch.randn(*shape, requires_grad=True) for shape in [(3, 8), (3, 8), (3, 2, 8)]]
+    mask = torch.tensor([[1, 0], [0, 0], [1, 1]], dtype=torch.bool)
+    if mask_kind == "all_valid":
+        mask.fill_(True)
+    elif mask_kind == "all_padding":
+        mask.fill_(False)
+    loss_fn = InfoNCELoss(
+        temperature=0.2,
+        learnable_temperature=True,
+        direction=direction,
+        use_in_batch_negatives=in_batch,
+        cross_device_negatives=False,
+    )
+    reference_inputs = [x.detach().clone().requires_grad_() for x in inputs]
+    log_inv_tau = loss_fn.log_inv_tau.detach().clone().requires_grad_()
+    q, d, negatives = [torch.nn.functional.normalize(x, dim=-1) for x in reference_inputs]
+
+    def reference_side(query, docs, include_negatives):
+        losses = []
+        for i in range(len(query)):
+            candidates = docs if in_batch else docs[i : i + 1]
+            if include_negatives:
+                candidates = torch.cat([candidates, negatives[i, mask[i]]])
+            scores = (candidates @ query[i]) * log_inv_tau.exp()
+            positive = i if in_batch else 0
+            losses.append(torch.logsumexp(scores, dim=0) - scores[positive])
+        return torch.stack(losses).mean()
+
+    expected = reference_side(q, d, True)
+    if direction == "symmetric":
+        expected = (expected + reference_side(d, q, False)) / 2
+    expected.backward()
+    actual = loss_fn(*inputs, hard_negatives_mask=mask)
+    actual.backward()
+
+    torch.testing.assert_close(actual, expected)
+    assert torch.isfinite(loss_fn.log_inv_tau.grad)
+    torch.testing.assert_close(loss_fn.log_inv_tau.grad, log_inv_tau.grad)
+    for actual_input, reference_input in zip(inputs, reference_inputs):
+        torch.testing.assert_close(actual_input.grad, reference_input.grad)
+
+
 # ---------------------------------------------------------------------------
 # InfoNCEDistillLoss module
 # ---------------------------------------------------------------------------
+@pytest.mark.parametrize("divergence", ["kl", "ce", "mse"])
+@pytest.mark.parametrize("direction, in_batch", [("q2d", False), ("q2d", True), ("symmetric", True)])
+@pytest.mark.parametrize("mask_kind", ["all_valid", "ragged", "all_padding"])
+def test_distill_learnable_temperature_with_masked_negatives(divergence, direction, in_batch, mask_kind):
+    s_q, s_d, t_q, t_d, s_n, t_n = _distill_inputs(seed=42, batch=3, k=2, requires_grad=True)
+    temperature = torch.tensor(0.2, requires_grad=True)
+    mask = torch.tensor([[1, 0], [0, 0], [1, 1]], dtype=torch.bool)
+    if mask_kind == "all_valid":
+        mask.fill_(True)
+    elif mask_kind == "all_padding":
+        mask.fill_(False)
+
+    reference_inputs = [x.detach().clone().requires_grad_() for x in (s_q, s_d, s_n)]
+    reference_temperature = temperature.detach().clone().requires_grad_()
+    sq, sd, sn = [torch.nn.functional.normalize(x, dim=-1) for x in reference_inputs]
+    tq, td, tn = [torch.nn.functional.normalize(x, dim=-1) for x in (t_q, t_d, t_n)]
+
+    def reference_side(s_query, s_docs, t_query, t_docs, include_negatives):
+        """Compare distributions after physically removing padded candidates.
+
+        Args:
+            s_query: Tensor of shape [batch, student_hidden].
+            s_docs: Tensor of shape [batch, student_hidden].
+            t_query: Tensor of shape [batch, teacher_hidden].
+            t_docs: Tensor of shape [batch, teacher_hidden].
+            include_negatives: Whether to include per-query document negatives.
+
+        Returns:
+            Scalar Tensor: mean divergence over the batch.
+        """
+        losses = []
+        for i in range(len(s_query)):
+            s_candidates = s_docs if in_batch else s_docs[i : i + 1]
+            t_candidates = t_docs if in_batch else t_docs[i : i + 1]
+            if include_negatives:
+                s_candidates = torch.cat([s_candidates, sn[i, mask[i]]])
+                t_candidates = torch.cat([t_candidates, tn[i, mask[i]]])
+            log_s = torch.log_softmax((s_candidates @ s_query[i]) / reference_temperature, dim=0)
+            with torch.no_grad():
+                log_t = torch.log_softmax((t_candidates @ t_query[i]) / reference_temperature, dim=0)
+            if divergence == "kl":
+                value = torch.nn.functional.kl_div(log_s, log_t, log_target=True, reduction="sum")
+            elif divergence == "ce":
+                value = -(log_t.exp() * log_s).sum()
+            else:
+                value = torch.nn.functional.mse_loss(log_s.exp(), log_t.exp(), reduction="sum")
+            losses.append(value)
+        return torch.stack(losses).mean()
+
+    expected = reference_side(sq, sd, tq, td, True)
+    if direction == "symmetric":
+        expected = (expected + reference_side(sd, sq, td, tq, False)) / 2
+    expected.backward()
+    actual = infonce_distill_loss(
+        s_q,
+        s_d,
+        t_q,
+        t_d,
+        s_n,
+        t_n,
+        hard_negatives_mask=mask,
+        temperature=temperature,
+        direction=direction,
+        use_in_batch_negatives=in_batch,
+        divergence=divergence,
+    )
+    actual.backward()
+
+    assert torch.isfinite(actual)
+    assert torch.isfinite(temperature.grad)
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(temperature.grad, reference_temperature.grad)
+    for actual_input, reference_input in zip((s_q, s_d, s_n), reference_inputs):
+        torch.testing.assert_close(actual_input.grad, reference_input.grad)
+
+
 def test_infonce_distill_module_forward():
     s_q, s_d, t_q, t_d, s_n, t_n = _distill_inputs()
     loss_fn = InfoNCEDistillLoss(divergence="kl")
