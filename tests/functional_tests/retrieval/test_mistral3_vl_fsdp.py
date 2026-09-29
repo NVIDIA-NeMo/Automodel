@@ -21,21 +21,28 @@ import subprocess
 import sys
 from datetime import timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.distributed as dist
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from torch.distributed.tensor import DTensor
 
 from nemo_automodel._transformers.retrieval import BiEncoderModel, CrossEncoderModel
-from nemo_automodel.components.distributed.parallelizer import apply_fsdp2_sharding_recursively
+from nemo_automodel.components.distributed.parallelizer import (
+    apply_fsdp2_sharding_recursively,
+    fsdp2_strategy_parallelize,
+)
 from nemo_automodel.components.models.ministral_bidirectional.model import (
     Mistral3BidirectionalConfig,
     Mistral3BidirectionalModel,
     Mistral3VLBidirectionalForSequenceClassification,
 )
+from nemo_automodel.recipes.retrieval.train_bi_encoder import TrainBiEncoderRecipe
+from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 
 
 def _tiny_config() -> Mistral3BidirectionalConfig:
@@ -175,12 +182,95 @@ def _run_case(reranker: bool) -> None:
     dist.barrier()
 
 
+def _run_biencoder_recipe_case() -> None:
+    """Compare the activation-checkpointed recipe step with an unsharded reference."""
+    device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+    torch.manual_seed(84)
+    model = BiEncoderModel(Mistral3BidirectionalModel(_tiny_config()), pooling="avg", l2_normalize=True).to(device)
+    reference = copy.deepcopy(model)
+    initial_state = {name: value.detach().clone() for name, value in reference.state_dict().items()}
+    mesh = init_device_mesh(
+        "cuda", (1, 2, 1, 1), mesh_dim_names=("dp_replicate", "dp_shard", "cp", "tp")
+    )
+    policy = MixedPrecisionPolicy(param_dtype=torch.float32, reduce_dtype=torch.float32)
+    fsdp2_strategy_parallelize(
+        model,
+        mesh,
+        mp_policy=policy,
+        activation_checkpointing=True,
+        activation_checkpointing_scope="all",
+        enable_fsdp2_prefetch=False,
+    )
+    assert any(isinstance(module, CheckpointWrapper) for module in model.modules())
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    reference_optimizer = torch.optim.Adam(reference.parameters(), lr=0.001)
+
+    query_ids = torch.tensor([[1, 2, 3, 4]], device=device)
+    passage_ids = torch.tensor(
+        [[10, 10, 10, 10, 1, 2], [1, 3, 4, 5, 0, 0]]
+        if dist.get_rank()
+        else [[1, 2, 3, 4, 0, 0], [1, 3, 4, 5, 0, 0]],
+        device=device,
+    )
+    batch = {
+        "q_input_ids": query_ids,
+        "q_attention_mask": torch.ones_like(query_ids),
+        "d_input_ids": passage_ids,
+        "d_attention_mask": (passage_ids != 0).long(),
+    }
+    if dist.get_rank():
+        batch["d_pixel_values"] = torch.arange(192, dtype=torch.float32, device=device).reshape(1, 3, 8, 8) / 255
+        batch["d_image_sizes"] = torch.tensor([[8, 8]], device=device)
+
+    def recipe_for(module: torch.nn.Module) -> TrainBiEncoderRecipe:
+        recipe = TrainBiEncoderRecipe.__new__(TrainBiEncoderRecipe)
+        recipe.dist_env = SimpleNamespace(device=device)
+        recipe.model_parts = [module]
+        recipe.distributed_config = SimpleNamespace(autocast_dtype=None, defer_fsdp_grad_sync=True)
+        recipe.train_n_passages = 2
+        recipe.temperature = 0.02
+        return recipe
+
+    model.train()
+    reference.train()
+    actual_losses: list[torch.Tensor] = []
+    reference_losses: list[torch.Tensor] = []
+    recipe_for(model)._forward_backward_step(0, batch, loss_buffer=actual_losses, num_batches=1)
+    recipe_for(reference)._forward_backward_step(0, batch, loss_buffer=reference_losses, num_batches=1)
+    torch.testing.assert_close(actual_losses[0], reference_losses[0], rtol=1e-4, atol=1e-6)
+
+    reference_params = dict(reference.named_parameters())
+    for parameter in reference_params.values():
+        if parameter.grad is None:
+            parameter.grad = torch.zeros_like(parameter)
+        dist.all_reduce(parameter.grad)
+        parameter.grad.div_(2)
+    for name, parameter in model.named_parameters():
+        expected_gradient = reference_params[canonical_parameter_fqn(name)].grad
+        assert parameter.grad is not None, name
+        gradient = parameter.grad.full_tensor() if isinstance(parameter.grad, DTensor) else parameter.grad
+        torch.testing.assert_close(
+            gradient, expected_gradient, rtol=1e-4, atol=1e-7, msg=lambda detail: f"{name}: {detail}"
+        )
+
+    optimizer.step()
+    reference_optimizer.step()
+    for name, value in model.state_dict().items():
+        value = value.full_tensor() if isinstance(value, DTensor) else value
+        torch.testing.assert_close(value, reference.state_dict()[name], rtol=1e-4, atol=1e-5, msg=name)
+    changed = {name for name, value in reference.state_dict().items() if not torch.equal(value, initial_state[name])}
+    for tower in ("vision_tower", "multi_modal_projector", "language_model"):
+        assert any(tower in name for name in changed), f"No real recipe update in {tower}"
+    dist.barrier()
+
+
 def _run_worker() -> None:
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     dist.init_process_group("nccl", timeout=timedelta(seconds=45))
     try:
         for reranker in (False, True):
             _run_case(reranker)
+        _run_biencoder_recipe_case()
         if dist.get_rank() == 0:
             print("MISTRAL3_VL_FSDP_PASS", flush=True)
     finally:
@@ -189,7 +279,7 @@ def _run_worker() -> None:
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA devices")
 def test_mistral3_vl_fsdp_mixed_modality_validation_and_updates() -> None:
-    """Both retrieval wrappers preserve distributed validation, gradients, and nonzero updates."""
+    """Retrieval wrappers and the checkpointed bi-encoder recipe match unsharded updates."""
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
@@ -214,7 +304,7 @@ def test_mistral3_vl_fsdp_mixed_modality_validation_and_updates() -> None:
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        timeout=180,
+        timeout=240,
         check=False,
     )
     assert completed.returncode == 0, completed.stdout

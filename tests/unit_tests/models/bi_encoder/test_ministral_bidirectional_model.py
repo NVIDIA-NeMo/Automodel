@@ -56,7 +56,8 @@ from nemo_automodel._transformers.retrieval import (
 )
 from nemo_automodel.components.checkpoint.addons import ConsolidatedHFAddon, _maybe_save_custom_model_code
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
-from nemo_automodel.components.datasets.llm.retrieval_dataset import load_corpus
+from nemo_automodel.components.datasets.llm.retrieval_collator import ProcessorMethodCollator
+from nemo_automodel.components.datasets.llm.retrieval_dataset import CorpusInfo, _transform_func, load_corpus
 from nemo_automodel._transformers.mining import CheckpointMiningEncoder, CheckpointMiningEncoderConfig
 from nemo_automodel.components.models.ministral_bidirectional.model import (
     Ministral3BidirectionalConfig,
@@ -77,8 +78,8 @@ from nemo_automodel.recipes.retrieval.train_bi_encoder import _configure_sentenc
 pytestmark = pytest.mark.timeout(60)
 
 
-def test_native_mining_real_processor_and_model_use_wikissnq_binary_pixels(tmp_path, monkeypatch):
-    """Actual pixel preprocessing and VL forward preserve batching and image dependence."""
+def test_native_mining_and_training_use_wikissnq_binary_pixels(tmp_path, monkeypatch):
+    """One binary-image corpus reaches mining and the training collator with the same pixels."""
     torch.manual_seed(42)
     monkeypatch.setattr("datasets.config.HF_DATASETS_CACHE", str(tmp_path / "datasets-cache"))
     monkeypatch.setattr(Mistral3BiEncoderProcessor, "check_argument_for_proper_class", lambda *args, **kwargs: None)
@@ -93,26 +94,32 @@ def test_native_mining_real_processor_and_model_use_wikissnq_binary_pixels(tmp_p
     config = _tiny_mistral3_bidirectional_vlm_config()
     config.image_token_id = processor.image_token_id
     model = BiEncoderModel(Mistral3BidirectionalModel(config), pooling="avg", l2_normalize=True).eval()
-    encoder = CheckpointMiningEncoder(model=model, processor=processor, device=torch.device("cpu"))
+    encoder = CheckpointMiningEncoder(
+        model=model, processor=processor, device=torch.device("cpu"), use_text_in_document=False
+    )
     red_image = Image.new("RGB", (16, 16), (255, 0, 0))
     image_buffer = BytesIO()
     red_image.save(image_buffer, format="PNG")
     image_bytes = image_buffer.getvalue()
+    blue_image = Image.new("RGB", (16, 16), (0, 0, 255))
+    blue_buffer = BytesIO()
+    blue_image.save(blue_buffer, format="PNG")
     corpus_dir = tmp_path / "corpus"
     corpus_dir.mkdir()
-    Dataset.from_dict({"docid": ["doc-1"], "text": ["literal"], "image": [image_bytes]}).to_parquet(
-        corpus_dir / "part-00000.parquet"
-    )
+    Dataset.from_dict(
+        {
+            "docid": ["doc-1", "doc-2"],
+            "text": ["literal", "literal"],
+            "image": [image_bytes, blue_buffer.getvalue()],
+        }
+    ).to_parquet(corpus_dir / "part-00000.parquet")
     (corpus_dir / "merlin_metadata.json").write_text(
         json.dumps({"class": "WikiSSNQDataset", "corpus_id": "wikissnq-test"})
     )
     corpus_id, corpus = load_corpus(str(corpus_dir))
     binary_document = corpus.get_document_by_id("doc-1")
     decoded_image = load_image({"bytes": binary_document["image"]}).convert("RGB")
-    documents = [
-        binary_document,
-        {"text": "literal", "image": Image.new("RGB", (16, 16), (0, 0, 255))},
-    ]
+    documents = [binary_document, corpus.get_document_by_id("doc-2")]
     together = encoder.encode_documents(documents, batch_size=2)
     separate = encoder.encode_documents(documents, batch_size=1)
     expected_red = encoder.encode_documents([{"text": "literal", "image": red_image}], batch_size=1)
@@ -128,6 +135,28 @@ def test_native_mining_real_processor_and_model_use_wikissnq_binary_pixels(tmp_p
     query = encoder.encode_queries(["literal"], batch_size=1)
     scores = query @ together.T
     assert not np.isclose(scores[0, 0], scores[0, 1], rtol=1e-5, atol=1e-6)
+
+    training_feature = _transform_func(
+        {
+            "question": "literal",
+            "corpus_id": corpus_id,
+            "pos_doc": [{"id": "doc-1"}],
+            "neg_doc": [{"id": "doc-2"}],
+        },
+        num_neg_docs=1,
+        corpus_dict={corpus_id: CorpusInfo({"corpus_id": corpus_id}, corpus)},
+        use_text_in_document=False,
+    )
+    training_batch = ProcessorMethodCollator(processor, "process_queries_documents_biencoder")([training_feature])
+
+    assert training_feature["doc_text"] == ["", ""]
+    assert training_feature["doc_image"][0].getpixel((0, 0)) == (255, 0, 0)
+    assert training_batch["d_pixel_values"].shape[0] == 2
+    assert training_batch["passage_modality"].tolist() == [PassageModality.IMAGE_ONLY, PassageModality.IMAGE_ONLY]
+    document_inputs = {key[2:]: value for key, value in training_batch.items() if key.startswith("d_")}
+    with torch.no_grad():
+        training_embeddings = model(document_inputs).numpy()
+    np.testing.assert_allclose(training_embeddings, together, rtol=1e-5, atol=1e-6)
 
 
 def tiny_bidirectional_config() -> Ministral3BidirectionalConfig:
