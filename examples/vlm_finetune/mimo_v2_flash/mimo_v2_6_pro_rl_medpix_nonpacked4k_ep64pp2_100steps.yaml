@@ -155,6 +155,14 @@ clip_grad_norm:
   max_norm: 1.0
   backend: te
 
+ci:
+  recipe_owner: huiyingl
+  nodes: 32
+  nproc_per_node: 4
+  cluster_tag: gb200
+  time: "01:00:00"
+  max_steps: 5
+
 # wandb:
 #   enable: true
 #   entity: <your_wandb_entity>
