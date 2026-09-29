@@ -1575,6 +1575,7 @@ class TestGroupedExpertsDeepEP:
         _ = GroupedExpertsDeepEP(moe_config)
         tokens_per_expert = torch.tensor(counts)
         n_tokens = int(tokens_per_expert.sum())
+        torch.manual_seed(42)
         value = torch.randn(n_tokens, 8, requires_grad=True)
         bias = torch.randn(4, 8, requires_grad=True)
         permuted_probs = torch.rand(n_tokens, 1, dtype=torch.float32, requires_grad=True) if use_probs else None
@@ -1597,12 +1598,21 @@ class TestGroupedExpertsDeepEP:
         torch.compiler.reset()
         compiled_apply_bias = torch.compile(apply_owned_bias, backend="aot_eager", fullgraph=True)
 
-        compiled_apply_bias(value, bias, tokens_per_expert, permuted_probs).square().sum().backward()
+        result = compiled_apply_bias(value, bias, tokens_per_expert, permuted_probs)
+        result.square().sum().backward()
 
-        assert value.grad is not None
-        assert bias.grad is not None
+        bias_rows = bias.detach().repeat_interleave(tokens_per_expert, dim=0)
+        probs = permuted_probs.detach() if permuted_probs is not None else 1
+        expected = value.detach() + bias_rows * probs
+        upstream = 2 * expected
+        expected_bias_grad = torch.stack(
+            [segment.double().sum(dim=0) for segment in torch.split(upstream * probs, counts)]
+        ).to(bias.dtype)
+        torch.testing.assert_close(result, expected)
+        torch.testing.assert_close(value.grad, upstream)
+        torch.testing.assert_close(bias.grad, expected_bias_grad)
         if permuted_probs is not None:
-            assert permuted_probs.grad is not None
+            torch.testing.assert_close(permuted_probs.grad, (upstream * bias_rows).sum(dim=-1, keepdim=True))
 
     def test_grouped_experts_deepep_init_with_hybridep_backend(self, moe_config):
         """Test GroupedExpertsDeepEP initialization with hybridep backend."""

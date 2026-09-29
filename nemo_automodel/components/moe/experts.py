@@ -558,7 +558,9 @@ def _apply_bias(value, bias, tokens_per_expert, permuted_probs=None, reuse_input
         bias = torch.stack(tuple(bias))
 
     shape = value.shape
-    flat_value = value.reshape(-1, shape[-1])
+    # Keep owned 2D outputs off the view-mutation path: AOTAutograd cannot trace
+    # the CopySlices backward created by marking a redundant reshape dirty.
+    flat_value = value if value.ndim == 2 else value.reshape(-1, shape[-1])
     token_counts = torch.as_tensor(tokens_per_expert, device=bias.device, dtype=torch.long)
     chunkable_probs = permuted_probs is None or (
         permuted_probs.dim() == 2 and permuted_probs.shape == (flat_value.shape[0], 1)
