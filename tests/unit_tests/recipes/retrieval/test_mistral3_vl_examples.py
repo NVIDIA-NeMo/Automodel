@@ -35,7 +35,7 @@ _EXAMPLES = [
         "TrainCrossEncoderRecipe",
         "cross_encoder",
         "process_queries_documents_crossencoder",
-        False,
+        True,
     ),
 ]
 

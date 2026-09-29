@@ -54,8 +54,8 @@ dataset:
   _target_: nemo_automodel.components.datasets.llm.retrieval_dataset.RetrievalDatasetConfig
   model_type: cross_encoder
   # Prepare corpus-ID JSON as described in the model coverage guide.
-  # Keep image documents image-only; set true to include their companion text.
-  use_text_in_document: false
+  # Include companion text with image documents, as in the embedding example.
+  use_text_in_document: true
   data_dir_list:
     - path: <DATASETS_PATH>/retrieval/train.json
   data_type: train
