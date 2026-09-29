@@ -39,7 +39,7 @@ def test_gpt_index_cache_rejects_pickle(tmp_path, poisoned_suffix):
         "shuffle_index": np.array([0], dtype=np.uint32),
     }
     for suffix, array in arrays.items():
-        np.save(tmp_path / f"{prefix}-{suffix}.npy", array)
+        np.save(tmp_path / f"{prefix}-{suffix}.npy", array, allow_pickle=False)
 
     loaded = dataset._build_document_sample_shuffle_indices()
     for actual, expected in zip(loaded, arrays.values()):
@@ -64,7 +64,7 @@ def test_blended_index_cache_rejects_pickle(tmp_path, poisoned_suffix):
         "dataset_sample_index": np.array([0], dtype=np.int64),
     }
     for suffix, array in arrays.items():
-        np.save(tmp_path / f"{prefix}-{suffix}.npy", array)
+        np.save(tmp_path / f"{prefix}-{suffix}.npy", array, allow_pickle=False)
 
     loaded = dataset._build_indices()
     for actual, expected in zip(loaded, arrays.values()):
