@@ -176,7 +176,7 @@ When the next GA cuts (e.g. `v0.5`):
 4. Add the new frozen-pin entry to `docs/fern/docs.yml` `versions:` (`display-name: "0.5.0 · 26.07"`, `slug: v0.5`, `availability: stable`); keep `v0.4` per support policy.
 5. Add redirects to `docs/fern/docs.yml` before the global catch-alls: map explicit `/nemo/automodel/v0.5/index.html` and `/nemo/automodel/v0.5/index` sources to `/nemo/automodel/v0.5`; map legacy `/nemo/automodel/0.5`, `/nemo/automodel/0.5/index.html`, and `/nemo/automodel/0.5/index` sources to `/nemo/automodel/v0.5`; and map `/nemo/automodel/0.5/:path*/index.html`, `/nemo/automodel/0.5/:path*.html`, and `/nemo/automodel/0.5/:path*` sources to `/nemo/automodel/v0.5/:path*`. Keep the root index rules explicit because `:path*` does not match an empty path.
 6. Commit `docs/fern/versions/v0.5/pages/` on the `docs-archive` branch and push that branch. On `main`, remove the pages subtree and add `docs/fern/versions/v0.5/pages/` to `.gitignore`; keep `v0.5.yml`, `latest.yml`, and `docs.yml` on `main`.
-7. Add `v0.5=docs-archive` to `archived-versions:` in `publish-fern-docs.yml`, `fern-docs-ci.yml`, and `fern-docs-preview-build.yml`. Update the `docs-stitch` target in `docs/fern/Makefile` to restore the new pages subtree for local builds as well.
+7. Add `v0.5=docs-archive` to `archived-versions:` in `publish-fern-docs.yml`, `fern-docs-ci.yml`, and `fern-docs-preview.yml`. Update the `docs-stitch` target in `docs/fern/Makefile` to restore the new pages subtree for local builds as well.
 8. Keep `docs/` moving forward as nightly. The `v0.4/pages/` and `v0.5/pages/` trees are frozen and change only through deliberate back-ports on `docs-archive`.
 9. After the release configuration and archived pages are available, tag and push `docs/v0.5.0` to publish the version train.
 
@@ -185,13 +185,12 @@ When the next GA cuts (e.g. `v0.5`):
 | Workflow | Trigger | Purpose |
 |---|---|---|
 | `fern-docs-ci.yml` | `push: pull-request/[0-9]+` (FW-CI mirror) | MDX syntax validation + `fern check` on PRs |
-| `fern-docs-preview-build.yml` | `pull_request` | Untrusted half: collect `docs/fern/` artifact (no secrets) |
-| `fern-docs-preview-comment.yml` | `workflow_run` after build | Trusted half: build preview with `DOCS_FERN_TOKEN`, post 🌿 comment |
+| `fern-docs-preview.yml` | `push: pull-request/[0-9]+` after CI approval | Build a hosted preview for docs changes and update the PR comment |
 | `publish-fern-docs.yml` | push to `main` (`docs/**`), `docs/v*` tag, or manual | Publish to docs.nvidia.com/nemo/automodel |
 
 Required org secret: **`DOCS_FERN_TOKEN`** (already wired for the existing `build-docs.yml`).
 
-PRs that touch `docs/**` get an automatic preview URL posted as a 🌿 comment.
+After an approved PR is mirrored to `pull-request/<number>`, changes to `docs/**` or `.github/workflows/fern-docs-ci.yml` get a preview URL posted as a 🌿 comment.
 
 ## Commits
 
