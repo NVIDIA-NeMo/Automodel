@@ -920,7 +920,8 @@ class GroupedExperts(nn.Module):
                 # v0.17.0 has no bias arg). bf16 path byte-identical.
                 grouped_mm = select_grouped_mm(self.use_mxfp8)
                 output1 = grouped_mm(permuted_x, gate_and_up_projs, offs)
-                output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert, reuse_input=True)
+                # Selective checkpointing may retain either GEMM output; bias must not mutate it.
+                output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
                 output1 = self.expert_activation_grouped(output1, activation_probs)
                 output2 = grouped_mm(output1, down_projs, offs)
                 output2 = _apply_bias(
@@ -928,7 +929,6 @@ class GroupedExperts(nn.Module):
                     down_proj_bias,
                     tokens_per_expert,
                     None if self.config.apply_router_weight_after_down else permuted_probs,
-                    reuse_input=True,
                 )
             else:
                 output2 = _torch_mm_experts_fwd(

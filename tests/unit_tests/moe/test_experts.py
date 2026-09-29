@@ -1168,11 +1168,11 @@ class TestGroupedExpertsDeepEP:
         if permuted_probs is not None:
             torch.testing.assert_close(permuted_probs.grad, expected_probs.grad)
 
-    @pytest.mark.parametrize("chunked", [False, True])
+    @pytest.mark.parametrize("dispatcher,chunked", [("torch", False), ("deepep", False), ("deepep", True)])
     @pytest.mark.parametrize("checkpoint_mode", ["full", "selective"])
     @pytest.mark.parametrize("apply_router_weight_after_down", [False, True])
     def test_forward_checkpoint_preserves_outputs_and_gradients(
-        self, moe_config, monkeypatch, chunked, checkpoint_mode, apply_router_weight_after_down
+        self, moe_config, monkeypatch, dispatcher, chunked, checkpoint_mode, apply_router_weight_after_down
     ):
         """Production dispatch preserves every gradient under full and selective checkpointing."""
         config = replace(
@@ -1187,12 +1187,16 @@ class TestGroupedExpertsDeepEP:
             apply_router_weight_after_down=apply_router_weight_after_down,
         )
         torch.manual_seed(42)
-        experts = GroupedExpertsDeepEP(config)
-        experts.n_routed_experts = 1
-        experts.ep_size = 1
+        if dispatcher == "torch":
+            experts = GroupedExperts(config, backend=BackendConfig(experts="torch_mm", dispatcher="torch"))
+        else:
+            experts = GroupedExpertsDeepEP(config)
+            experts.n_routed_experts = 1
+            experts.ep_size = 1
         for parameter in experts.parameters():
             torch.nn.init.normal_(parameter, std=0.1)
-            parameter.to_local = lambda parameter=parameter: parameter
+            if dispatcher == "deepep":
+                parameter.to_local = lambda parameter=parameter: parameter
 
         def dense_mm(value, weights, offs):
             """Multiply the single expert's inputs.
@@ -1234,10 +1238,13 @@ class TestGroupedExpertsDeepEP:
             gate, up = value.chunk(2, dim=-1)
             return torch.nn.functional.silu(gate) * up * probs
 
-        experts.expert_activation = activation
-        experts.token_dispatcher = Mock()
-        experts.token_dispatcher.token_permutation2.side_effect = dispatch
-        experts.token_dispatcher.token_unpermutation.side_effect = lambda output: output
+        if dispatcher == "torch":
+            experts.expert_activation_grouped = activation
+        else:
+            experts.expert_activation = activation
+            experts.token_dispatcher = Mock()
+            experts.token_dispatcher.token_permutation2.side_effect = dispatch
+            experts.token_dispatcher.token_unpermutation.side_effect = lambda output: output
         monkeypatch.setattr("nemo_automodel.components.moe.experts.select_grouped_mm", lambda use_mxfp8: dense_mm)
         monkeypatch.setattr("nemo_automodel.components.moe.experts._BIAS_CHUNK_ROWS", 3)
         monkeypatch.setattr("nemo_automodel.components.moe.experts._EXPERT_MLP_CHUNK_BYTES", 0 if chunked else 2**30)
