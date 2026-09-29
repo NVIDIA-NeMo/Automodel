@@ -1404,6 +1404,43 @@ def _normalize_peft_no_split_modules(model) -> None:
         model._no_split_modules = sorted(no_split_modules)
 
 
+@contextmanager
+def _peft_input_embeddings_context(model: torch.nn.Module) -> Iterator[None]:
+    """Expose a legacy model's resolved embedding module while PEFT loads adapters.
+
+    The Transformers compatibility patch already records the embedding source
+    when converting legacy tied-weight metadata. Some remote-code accessors
+    require token IDs, including through a zero-argument outer wrapper. PEFT
+    needs the module itself to inspect tied parameters. Reuse the recorded
+    source only for those accessors, restoring the reference API before forward.
+    Remove this bridge when supported remote models implement the HF accessor.
+
+    Args:
+        model: Loaded HF base model, before PEFT adapter injection.
+
+    Yields:
+        Control to adapter loading with a zero-argument embedding accessor.
+    """
+    accessor_context = nullcontext()
+    tied_keys = getattr(model, "_nemo_tied_weights_keys", None)
+    if tied_keys:
+        try:
+            model.get_input_embeddings()
+        except TypeError:
+            sources = set(tied_keys.values())
+            if len(sources) != 1:
+                raise
+            embedding_path = sources.pop().removesuffix(".weight")
+
+            def _get_input_embeddings() -> torch.nn.Module:
+                # Resolve on each call so PEFT can replace the embedding module.
+                return model.get_submodule(embedding_path)
+
+            accessor_context = patch.object(model, "get_input_embeddings", new=_get_input_embeddings)
+    with accessor_context:
+        yield
+
+
 def _explicit_tie_word_embeddings(config) -> bool | None:
     """Return an explicit tie_word_embeddings flag from a top-level or text config."""
     tie_word_embeddings = getattr(config, "tie_word_embeddings", None)
@@ -2873,12 +2910,13 @@ def _run_vanilla_hf_reload(
                 if should_fix_rotary_embeddings([base_model]):
                     fix_rotary_embeddings([base_model])
             _normalize_peft_no_split_modules(base_model)
-            peft_model = PeftModel.from_pretrained(
-                base_model,
-                str(ckpt_step_dir / "model"),
-                autocast_adapter_dtype=False,
-                **_peft_adapter_load_kwargs(hf_kwargs),
-            )
+            with _peft_input_embeddings_context(base_model):
+                peft_model = PeftModel.from_pretrained(
+                    base_model,
+                    str(ckpt_step_dir / "model"),
+                    autocast_adapter_dtype=False,
+                    **_peft_adapter_load_kwargs(hf_kwargs),
+                )
             adapter_path = ckpt_step_dir / "model" / "adapter_model.safetensors"
             matched_adapter_tensors, ignored_adapter_tensors = _assert_peft_adapter_matches_checkpoint(
                 peft_model,
