@@ -75,6 +75,8 @@ jobs:
         run: |
           mkdir -p preview-metadata
           echo "$PR_NUMBER" > preview-metadata/pr_number
+          echo "$GITHUB_RUN_ID" > preview-metadata/run_id
+          echo "$GITHUB_RUN_ATTEMPT" > preview-metadata/run_attempt
           # The trusted workflow_run job executes from main until this workflow
           # change is merged, so keep its legacy head_ref input SHA-specific.
           echo "preview/$(echo "$HEAD_SHA" | cut -c1-12)" > preview-metadata/head_ref
