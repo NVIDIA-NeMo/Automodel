@@ -12,9 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from functools import partial
+
 import pytest
 import torch
+from torch.utils.checkpoint import checkpoint
 
+from nemo_automodel.components.distributed.activation_checkpointing import make_selective_checkpoint_context_fn
 from nemo_automodel.components.moe.experts import (
     _BIAS_GRAD_TRITON_AVAILABLE,
     _apply_bias,
@@ -79,11 +83,11 @@ def _full_grouped_expert_mlp(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_apply_bias_has_deterministic_bf16_bias_gradient():
+@pytest.mark.parametrize("n_tokens", [4096, 16384], ids=["small", "large"])
+def test_apply_bias_has_deterministic_bf16_bias_gradient(n_tokens):
     """Imbalanced BF16 routing produces the same trainable bias gradient on every CUDA backward."""
     device = torch.device(f"cuda:{torch.cuda.current_device()}")
     n_experts = 64
-    n_tokens = 16384
     hidden = 512
 
     torch.manual_seed(1234)
@@ -199,11 +203,13 @@ def test_apply_bias_triton_handles_block_edges_empty_experts_and_noncontiguous_g
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_apply_bias_triton_backward_is_inductor_fullgraph_compatible():
+@pytest.mark.parametrize("counts", [[0, 2, 6, 1], [0, 4096, 8192, 1]], ids=["small", "large"])
+@pytest.mark.parametrize("reuse_input", [False, True])
+def test_apply_bias_triton_backward_is_inductor_fullgraph_compatible(counts, reuse_input):
     """The weighted Triton backward remains inside an Inductor full graph."""
     assert _BIAS_GRAD_TRITON_AVAILABLE
     device = torch.device(f"cuda:{torch.cuda.current_device()}")
-    tokens_per_expert = torch.tensor([0, 4096, 8192, 1], dtype=torch.long, device=device)
+    tokens_per_expert = torch.tensor(counts, dtype=torch.long, device=device)
     n_tokens = int(tokens_per_expert.sum())
 
     torch.manual_seed(7)
@@ -211,9 +217,39 @@ def test_apply_bias_triton_backward_is_inductor_fullgraph_compatible():
     bias = torch.randn(4, 8, dtype=torch.bfloat16, device=device, requires_grad=True)
     permuted_probs = torch.rand(n_tokens, 1, dtype=torch.float32, device=device, requires_grad=True)
     upstream_grad = torch.randn_like(value)
-    compiled_apply_bias = torch.compile(_apply_bias, fullgraph=True)
+
+    def apply_owned_bias(value, bias, counts, probs):
+        """Compile allocation and mutation together, as in a compiled expert MLP.
+
+        Args:
+            value: Tensor of shape [tokens, hidden].
+            bias: Tensor of shape [experts, hidden].
+            counts: Tensor of shape [experts] containing contiguous row counts.
+            probs: Optional tensor of shape [tokens, 1].
+
+        Returns:
+            Tensor of shape [tokens, hidden] with storage owned by this graph.
+        """
+        return _apply_bias(value * 1.0, bias, counts, probs, reuse_input=reuse_input)
+
+    # Each parameterized case exercises a separate compile contract.
+    torch.compiler.reset()
+    compiled_apply_bias = torch.compile(apply_owned_bias, fullgraph=True)
 
     compiled_apply_bias(value, bias, tokens_per_expert, permuted_probs).backward(upstream_grad)
+
+    expected_bias = torch.stack(
+        [
+            segment.double().sum(dim=0)
+            for segment in torch.split(upstream_grad.float() * permuted_probs.detach(), counts)
+        ]
+    ).to(bias.dtype)
+    expected_probs = (upstream_grad.float() * bias.detach().repeat_interleave(tokens_per_expert, dim=0).float()).sum(
+        dim=1, keepdim=True
+    )
+    torch.testing.assert_close(value.grad, upstream_grad)
+    torch.testing.assert_close(bias.grad, expected_bias)
+    torch.testing.assert_close(permuted_probs.grad, expected_probs)
 
     assert value.grad is not None
     assert bias.grad is not None
@@ -275,12 +311,14 @@ def test_apply_bias_large_weighted_double_backward_is_deterministic():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("selective", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("apply_router_weight_after_down", [False, True])
 def test_checkpointed_chunked_expert_mlp_matches_full_cuda_gradients(
     monkeypatch,
     dtype,
     apply_router_weight_after_down,
+    selective,
 ):
     """Real grouped-MM chunks preserve forward values and every trainable gradient."""
     monkeypatch.setattr("nemo_automodel.components.moe.experts._BIAS_CHUNK_ROWS", 6)
@@ -298,7 +336,10 @@ def test_checkpointed_chunked_expert_mlp_matches_full_cuda_gradients(
     ]
     expected_tensors = [tensor.detach().clone().requires_grad_() for tensor in tensors]
 
-    result = _checkpointed_chunked_expert_mlp(
+    run = _checkpointed_chunked_expert_mlp
+    if selective:
+        run = partial(checkpoint, run, use_reentrant=False, context_fn=make_selective_checkpoint_context_fn())
+    result = run(
         *tensors[:5],
         token_counts,
         tensors[5],

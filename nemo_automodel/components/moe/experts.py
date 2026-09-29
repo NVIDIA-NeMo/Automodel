@@ -546,7 +546,7 @@ def _apply_bias(value, bias, tokens_per_expert, permuted_probs=None, reuse_input
         permuted_probs: Optional routing probabilities broadcastable to
             [total_tokens, features], typically [total_tokens, 1].
         reuse_input: Reuse ``value`` storage for the result when the bounded-memory path supports it. The caller
-            must not read ``value`` afterward.
+            must not read ``value`` afterward or pass storage retained by a selective-checkpoint cache.
 
     Returns:
         Grouped GEMM output with per-expert bias applied, shape
@@ -1139,6 +1139,14 @@ def _checkpointed_chunked_expert_mlp(
     token_offsets = torch.cat((token_counts.new_zeros(1), token_counts.cumsum(dim=0)))
     grouped_mm = select_grouped_mm(use_mxfp8=False)
 
+    # Share one cast across all chunks so autograd combines bias gradients in
+    # FP32 before casting back to a low-precision parameter. Casting inside
+    # run_chunk would round every contribution before accumulation.
+    if gate_up_proj_bias is not None and gate_up_proj_bias.dtype in (torch.float16, torch.bfloat16):
+        gate_up_proj_bias = gate_up_proj_bias.float()
+    if down_proj_bias is not None and down_proj_bias.dtype in (torch.float16, torch.bfloat16):
+        down_proj_bias = down_proj_bias.float()
+
     def run_chunk(
         chunk_hidden,
         chunk_probs,
@@ -1164,7 +1172,8 @@ def _checkpointed_chunked_expert_mlp(
         """
         chunk_offs = chunk_counts.cumsum(dim=0).to(torch.int32)
         gate_up = grouped_mm(chunk_hidden, gate_up_weights, chunk_offs)
-        gate_up = _apply_bias(gate_up, gate_up_bias, chunk_counts, reuse_input=True)
+        # An outer selective checkpoint may retain either GEMM output.
+        gate_up = _apply_bias(gate_up, gate_up_bias, chunk_counts)
         activation_probs = torch.ones_like(chunk_probs) if apply_router_weight_after_down else chunk_probs
         activated = activation_fn(gate_up, activation_probs)
         expert_output = grouped_mm(activated, down_weights, chunk_offs)
@@ -1173,7 +1182,6 @@ def _checkpointed_chunked_expert_mlp(
             down_bias,
             chunk_counts,
             None if apply_router_weight_after_down else chunk_probs,
-            reuse_input=True,
         )
         if apply_router_weight_after_down:
             expert_output = _apply_router_weight_fp32(expert_output, chunk_probs, hidden_states.dtype)
@@ -1418,7 +1426,8 @@ class GroupedExpertsDeepEP(nn.Module):
                 # select_grouped_mm) so a bias-shifted value can't overflow the e8m0
                 # block scale -> nan (seen on gpt-oss). The bias-add stays a bf16
                 # separate add (torchao v0.17.0 has no bias arg). bf16 path unchanged.
-                output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert, reuse_input=True)
+                # Selective checkpointing can cache GEMM outputs for recomputation.
+                output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
                 output1 = self.expert_activation(output1, activation_probs)
                 output2 = grouped_mm(output1, down_projs, offs)
                 down_bias = self.down_proj_bias.to_local()
@@ -1427,7 +1436,6 @@ class GroupedExpertsDeepEP(nn.Module):
                     down_bias,
                     tokens_per_expert,
                     None if self.config.apply_router_weight_after_down else permuted_probs,
-                    reuse_input=True,
                 )
             else:
                 output2 = _torch_mm_experts_fwd(
