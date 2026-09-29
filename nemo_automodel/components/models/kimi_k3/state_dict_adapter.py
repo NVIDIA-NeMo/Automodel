@@ -479,14 +479,9 @@ class KimiK3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
             else:
                 mesh_rank = weight.device_mesh.get_local_rank()
                 mesh_size = weight.device_mesh.size()
-            experts_per_rank = n_experts // mesh_size
-            remainder = n_experts % mesh_size
-            if mesh_rank < remainder:
-                local_n_experts = experts_per_rank + 1
-                start_expert = mesh_rank * local_n_experts
-            else:
-                local_n_experts = experts_per_rank
-                start_expert = remainder * (experts_per_rank + 1) + (mesh_rank - remainder) * experts_per_rank
+            # DTensor Shard(0) and FSDP2 split with torch.chunk semantics: leading ranks hold
+            # ceil(n_experts / mesh_size) experts and trailing ranks the remainder or nothing.
+            local_n_experts, start_expert = Shard.local_shard_size_and_offset(n_experts, mesh_size, mesh_rank)
         else:
             start_expert = 0
             local_n_experts = local_tensor.shape[0]

@@ -93,19 +93,9 @@ def get_expert_slice_for_rank(experts_tensor: torch.Tensor, n_experts: int) -> t
         current_rank = expert_mesh.get_local_rank()
         world_size = expert_mesh.size()
 
-        # Calculate expert range for this rank
-        experts_per_rank = n_experts // world_size
-        remainder = n_experts % world_size
-
-        if current_rank < remainder:
-            # First `remainder` ranks get one extra expert
-            experts_on_rank = experts_per_rank + 1
-            start_expert = current_rank * experts_on_rank
-        else:
-            # Remaining ranks get standard number of experts
-            experts_on_rank = experts_per_rank
-            start_expert = remainder * (experts_per_rank + 1) + (current_rank - remainder) * experts_per_rank
-
+        # DTensor Shard(0) and FSDP2 split with torch.chunk semantics: each leading rank holds
+        # ceil(n_experts / world_size) experts and trailing ranks hold the remainder or nothing.
+        experts_on_rank, start_expert = Shard.local_shard_size_and_offset(n_experts, world_size, current_rank)
         end_expert = start_expert + experts_on_rank
         return local_tensor, start_expert, end_expert
     elif isinstance(placement, Replicate):
