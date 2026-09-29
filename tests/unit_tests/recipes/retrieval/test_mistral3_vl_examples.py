@@ -28,22 +28,25 @@ _EXAMPLES = [
         "TrainBiEncoderRecipe",
         "bi_encoder",
         "process_queries_documents_biencoder",
+        True,
     ),
     (
         _REPO_ROOT / "examples/retrieval/cross_encoder/mistral3_vl_reranker.yaml",
         "TrainCrossEncoderRecipe",
         "cross_encoder",
         "process_queries_documents_crossencoder",
+        False,
     ),
 ]
 
 
-@pytest.mark.parametrize(("config_path", "recipe", "model_type", "collator_method"), _EXAMPLES)
+@pytest.mark.parametrize(("config_path", "recipe", "model_type", "collator_method", "include_image_text"), _EXAMPLES)
 def test_mistral3_vl_example_is_portable(
     config_path: Path,
     recipe: str,
     model_type: str,
     collator_method: str,
+    include_image_text: bool,
 ) -> None:
     """The release examples use one public base model and no internal run paths."""
     config_text = config_path.read_text(encoding="utf-8")
@@ -54,7 +57,7 @@ def test_mistral3_vl_example_is_portable(
     assert config["tokenizer"]["pretrained_model_name_or_path"] == _MODEL_ID
     assert config["tokenizer"]["_target_"] == _PROCESSOR_TARGET
     assert config["dataset"]["model_type"] == model_type
-    assert config["dataset"]["use_text_in_document"] is False
+    assert config["dataset"]["use_text_in_document"] is include_image_text
     assert config["dataloader"]["collate_fn"]["collator_fn_name"] == collator_method
     assert len(config["dataset"]["data_dir_list"]) == 1
     assert not any(marker in config_text for marker in ("/lustre/", "submit_nemo_run", ".outputs/"))
@@ -70,10 +73,10 @@ def test_mistral3_vl_reranker_applies_temperature_once() -> None:
 
 
 def test_multimodal_mining_matches_embedding_image_text_policy() -> None:
-    """Example mining uses the same image-only documents as embedding training."""
+    """Example mining includes the same image and text content as embedding training."""
     training = yaml.safe_load(_EXAMPLES[0][0].read_text(encoding="utf-8"))
     mining_path = _REPO_ROOT / "examples/retrieval/data_utils/mining_multimodal_config.yaml"
     mining = yaml.safe_load(mining_path.read_text(encoding="utf-8"))
 
-    assert training["dataset"]["use_text_in_document"] is False
-    assert mining["mining"]["multimodal_encoder"]["use_text_in_document"] is False
+    assert training["dataset"]["use_text_in_document"] is True
+    assert mining["mining"]["multimodal_encoder"]["use_text_in_document"] is True

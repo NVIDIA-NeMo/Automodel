@@ -70,7 +70,7 @@ uv sync --locked --all-groups --all-extras
 
 In the example you select, replace `dataset.data_dir_list[0].path` with the path to your training JSON file. The example path `<DATASETS_PATH>/retrieval/train.json` is a placeholder, not a bundled dataset.
 
-Both examples set `dataset.use_text_in_document: false`: image documents use the image without companion text, and text-only documents retain their text. Set this field to `true` to train on image-and-text documents. This changes the model's training input.
+The embedding example and its matching mining example set `use_text_in_document: true`, so image documents include companion text. The reranker example sets it to `false`, so its image documents remain image-only. Text-only documents retain their text under either setting. Use the same document inputs when mining, training, and evaluating an embedding model.
 
 **3. Run one of the Mistral3 VL retrieval recipes** from inside the repo:
 

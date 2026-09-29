@@ -1867,6 +1867,10 @@ def test_mistral3_corpus_image_caption_policy_reaches_processor(
     ) is use_text_in_document
 
 
+@pytest.mark.runtime_budget(
+    15,
+    reason="reloads an exported model and processor in an isolated Python subprocess",
+)
 def test_mistral3_reranker_direct_export_reloads_without_repository(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

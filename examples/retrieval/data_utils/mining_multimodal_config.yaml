@@ -34,8 +34,8 @@ mining:
     _target_: nemo_automodel._transformers.mining.CheckpointMiningEncoderConfig
     q_max_length: 512
     p_max_length: 4096
-    # Match the embedding training example: image documents are image-only.
-    use_text_in_document: false
+    # Match embedding training: image documents include companion text.
+    use_text_in_document: true
     use_images: true
 
   load_embeddings_from_cache: false
