@@ -1822,19 +1822,30 @@ def test_mistral3_unsharded_eval_dummy_vision_is_opt_in() -> None:
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
-def test_mistral3_reranker_preserves_internal_bf16_temperature_order() -> None:
-    """Scaling occurs in score dtype before the recipe casts [batch, 1] logits to FP32."""
+@pytest.mark.parametrize("autocast_enabled", [False, True])
+def test_mistral3_reranker_fp32_scores_and_gradients(autocast_enabled: bool) -> None:
+    """BF16 weights retain FP32 reference scores and gradients, including under autocast."""
+    torch.manual_seed(42)
     config = _tiny_mistral3_bidirectional_vlm_config()
     config.temperature = 0.02
     config.num_labels = 1
     model = Mistral3VLBidirectionalForSequenceClassification(config).to(torch.bfloat16).eval()
-    raw_scores = []
-    hook = model.score.register_forward_hook(lambda module, inputs, output: raw_scores.append(output.detach().clone()))
-    with torch.no_grad():
+    pooled = []
+    hook = model.score.register_forward_pre_hook(lambda module, inputs: pooled.append(inputs[0]))
+    with torch.autocast("cpu", dtype=torch.bfloat16, enabled=autocast_enabled):
         logits = model(input_ids=torch.tensor([[1, 2, 3, 4]]), attention_mask=torch.ones(1, 4, dtype=torch.long)).logits
     hook.remove()
-    assert logits.dtype == torch.bfloat16
-    torch.testing.assert_close(logits, raw_scores[0] / config.temperature, rtol=0, atol=0)
+    reference_states = pooled[0].detach().float().requires_grad_()
+    reference_weight = model.score.weight.detach().float().requires_grad_()
+    reference_scores = torch.nn.functional.linear(reference_states, reference_weight) / config.temperature
+    assert model.score.weight.dtype == torch.bfloat16
+    assert logits.dtype == torch.float32
+    torch.testing.assert_close(logits, reference_scores, rtol=0, atol=0)
+    upstream = torch.randn_like(logits)
+    actual_gradients = torch.autograd.grad(logits, (pooled[0], model.score.weight), upstream)
+    reference_gradients = torch.autograd.grad(reference_scores, (reference_states, reference_weight), upstream)
+    for actual, reference in zip(actual_gradients, reference_gradients):
+        torch.testing.assert_close(actual, reference.to(actual.dtype), rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("use_text_in_document", [False, True])
@@ -1871,10 +1882,11 @@ def test_mistral3_corpus_image_caption_policy_reaches_processor(
     15,
     reason="reloads an exported model and processor in an isolated Python subprocess",
 )
-def test_mistral3_reranker_direct_export_reloads_without_repository(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("consolidated", [False, True])
+def test_mistral3_reranker_export_reloads_without_repository(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, consolidated: bool
 ) -> None:
-    """A direct export includes its model/processor code and preserves text/image scores exactly."""
+    """Both export paths include standalone code and preserve default CrossEncoder text/image scores."""
     monkeypatch.setattr(Mistral3BiEncoderProcessor, "check_argument_for_proper_class", lambda *args, **kwargs: None)
     processor = Mistral3BiEncoderProcessor(
         image_processor=PixtralImageProcessor(size={"longest_edge": 16}),
@@ -1882,6 +1894,7 @@ def test_mistral3_reranker_direct_export_reloads_without_repository(
         patch_size=4,
         padding=True,
         rerank_max_length=128,
+        use_prompt_template=True,
         export_as_stock_processor=False,
     )
     config = _tiny_mistral3_bidirectional_vlm_config()
@@ -1898,7 +1911,24 @@ def test_mistral3_reranker_direct_export_reloads_without_repository(
     with torch.no_grad():
         expected = encoder.model(**model_inputs).logits
     export_dir = tmp_path / "export"
-    encoder.save_pretrained(str(export_dir), tokenizer=processor)
+    if consolidated:
+        from safetensors.torch import save_file
+
+        export_dir.mkdir()
+        ConsolidatedHFAddon().pre_save(
+            model_state=SimpleNamespace(model=[encoder]),
+            hf_metadata_dir=str(export_dir),
+            fqn_to_file_index_mapping={},
+            original_model_path=None,
+            tokenizer=processor,
+        )
+        save_file(encoder.model.state_dict(), export_dir / "model.safetensors", metadata={"format": "pt"})
+    else:
+        encoder.save_pretrained(str(export_dir), tokenizer=processor)
+    metadata = json.loads((export_dir / "config_sentence_transformers.json").read_text())
+    assert metadata["model_type"] == "CrossEncoder"
+    assert metadata["activation_fn"] == "torch.nn.modules.linear.Identity"
+    assert "processing_kwargs" not in json.loads((export_dir / "sentence_bert_config.json").read_text())
     assert (export_dir / "model.py").is_file()
     assert (export_dir / "processor.py").is_file()
     torch.save(
@@ -1909,6 +1939,7 @@ import sys
 import torch
 from PIL import Image
 from transformers import AutoModelForSequenceClassification, AutoProcessor
+from sentence_transformers import CrossEncoder
 directory, expected_path = sys.argv[1:]
 model = AutoModelForSequenceClassification.from_pretrained(directory, trust_remote_code=True, attn_implementation="eager").eval()
 processor = AutoProcessor.from_pretrained(directory, trust_remote_code=True)
@@ -1926,6 +1957,15 @@ for key, value in model.state_dict().items():
     torch.testing.assert_close(value, expected["state"][key], rtol=0, atol=0)
 with torch.no_grad():
     torch.testing.assert_close(model(**inputs).logits, expected["logits"], rtol=0, atol=0)
+cross_encoder = CrossEncoder(directory, trust_remote_code=True, device="cpu", model_kwargs={"attn_implementation": "eager"})
+assert isinstance(cross_encoder.activation_fn, torch.nn.Identity)
+assert cross_encoder[0].processing_kwargs == {}
+pairs = [("What is shown?", "literal"), ("What is shown?", {"text": "Image doc", "image": Image.new("RGB", (16, 16), (255, 0, 0))})]
+standard_inputs = cross_encoder[0].preprocess(pairs)
+for key, value in expected["inputs"].items():
+    torch.testing.assert_close(standard_inputs[key], value, rtol=0, atol=0)
+scores = cross_encoder.predict(pairs, batch_size=2, convert_to_tensor=True, show_progress_bar=False)
+torch.testing.assert_close(scores.reshape(-1, 1), expected["logits"], rtol=0, atol=0)
 assert not any(name == "nemo_automodel" or name.startswith("nemo_automodel.") for name in sys.modules)
 """
     result = subprocess.run(
@@ -1937,3 +1977,50 @@ assert not any(name == "nemo_automodel" or name.startswith("nemo_automodel.") fo
         check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("use_prompt_template", [False, True])
+def test_mistral3_reranker_template_and_defaults_roundtrip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, use_prompt_template: bool
+) -> None:
+    """Default chat inference and the training helper agree after runtime overrides and reload."""
+    monkeypatch.setattr(Mistral3BiEncoderProcessor, "check_argument_for_proper_class", lambda *args, **kwargs: None)
+    processor = Mistral3BiEncoderProcessor(
+        image_processor=PixtralImageProcessor(size={"longest_edge": 16}),
+        tokenizer=FakePixtralTokenizer(),
+        patch_size=4,
+        padding=True,
+        rerank_max_length=128,
+        pad_to_multiple_of=8,
+        use_prompt_template=use_prompt_template,
+        export_as_stock_processor=False,
+    )
+    saved_template = processor.chat_template
+    processor.rerank_max_length = 64
+    processor.save_pretrained(tmp_path)
+    restored = Mistral3BiEncoderProcessor.from_pretrained(tmp_path)
+    assert restored.chat_template == saved_template
+    assert restored.tokenizer.chat_template == saved_template
+    assert restored.tokenizer.init_kwargs["max_length"] == restored.rerank_max_length == 64
+    features = [
+        {"question": "literal [IMG]", "doc_text": "literal " * 200, "doc_image": ""},
+        {"question": "What is shown?", "doc_text": "Image doc", "doc_image": Image.new("RGB", (16, 16), "red")},
+        {"question": "", "doc_text": "", "doc_image": ""},
+    ]
+    messages = []
+    for feature in features:
+        content = [{"type": "text", "text": feature["doc_text"]}]
+        if feature["doc_image"]:
+            content.append({"type": "image", "image": feature["doc_image"]})
+        messages.append([
+            {"role": "query", "content": [{"type": "text", "text": feature["question"]}]},
+            {"role": "document", "content": content},
+        ])
+    expected = restored.process_queries_documents_crossencoder(features)
+    actual = restored.apply_chat_template(messages, tokenize=True, return_dict=True, return_tensors="pt")
+    assert actual["input_ids"].shape[1] == 64
+    for key, value in expected.items():
+        if value is not None:
+            torch.testing.assert_close(actual[key], value, rtol=0, atol=0)
+    overridden = restored.apply_chat_template(messages, tokenize=True, return_dict=True, return_tensors="pt", max_length=96)
+    assert overridden["input_ids"].shape[1] == 96

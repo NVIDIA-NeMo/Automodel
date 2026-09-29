@@ -696,3 +696,71 @@ class _SentenceTransformerMetadataExporter:
             hf_metadata_dir,
             tokenizer,
         )
+
+
+class _CrossEncoderMetadataExporter:
+    """Export raw sequence-classification scores through a single Transformer module."""
+
+    def __init__(self, model_part: nn.Module) -> None:
+        self.model_part = model_part
+
+    def validate(self, *, tokenizer: object, original_model_path: str | None) -> None:
+        """Validate the processor contract before any rank writes checkpoint assets."""
+        if self.model_part._sentence_transformer_input_mode == "structured_multimodal":
+            if not isinstance(tokenizer, ProcessorMixin) or not tokenizer.chat_template:
+                raise ValueError("Multimodal CrossEncoder export requires a processor with a chat template.")
+        else:
+            if tokenizer is None:
+                raise ValueError("CrossEncoder export requires a tokenizer.")
+            _resolve_sentence_transformer_max_seq_length(self.model_part, tokenizer, original_model_path)
+
+    def _save_sentence_transformer_assets(
+        self, *, hf_metadata_dir: str, tokenizer: object, original_model_path: str | None
+    ) -> None:
+        """Write metadata from the wrapper's effective raw-score inference contract."""
+        forward_output = {"method": "forward", "method_output_name": "logits"}
+        transformer_config = {
+            "transformer_task": "sequence-classification",
+            "modality_config": {"text": forward_output},
+            "module_output_name": "scores",
+            "unpad_inputs": False,
+        }
+        if self.model_part._sentence_transformer_input_mode == "structured_multimodal":
+            transformer_config["modality_config"]["message"] = {**forward_output, "format": "structured"}
+        else:
+            transformer_config["max_seq_length"] = _resolve_sentence_transformer_max_seq_length(
+                self.model_part, tokenizer, original_model_path
+            )
+        _write_json(
+            os.path.join(hf_metadata_dir, "modules.json"),
+            [{"idx": 0, "name": "0", "path": "", "type": _SENTENCE_TRANSFORMER_EXPORT_MODULE_TYPES["transformer"]}],
+        )
+        _write_json(
+            os.path.join(hf_metadata_dir, "config_sentence_transformers.json"),
+            {
+                "model_type": "CrossEncoder",
+                "activation_fn": "torch.nn.modules.linear.Identity",
+                "prompts": {},
+                "default_prompt_name": None,
+            },
+        )
+        _write_json(os.path.join(hf_metadata_dir, "sentence_bert_config.json"), transformer_config)
+        _copy_source_legal_assets(original_model_path, hf_metadata_dir)
+
+    def save(self, *, hf_metadata_dir: str, tokenizer: object, original_model_path: str | None) -> None:
+        """Write custom model/processor code and CrossEncoder metadata for consolidation."""
+        from nemo_automodel.components.checkpoint.addons import _save_generated_hf_assets
+
+        # Native retrieval wrappers record the implementation directory here;
+        # copying the source checkpoint instead can resurrect stale model code.
+        _save_generated_hf_assets(
+            self.model_part.model,
+            self.model_part.name_or_path or original_model_path,
+            hf_metadata_dir,
+            tokenizer,
+            v4_compatible=False,
+            model_config=self.model_part.config,
+        )
+        self._save_sentence_transformer_assets(
+            hf_metadata_dir=hf_metadata_dir, tokenizer=tokenizer, original_model_path=original_model_path
+        )

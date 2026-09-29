@@ -414,6 +414,23 @@ def pool(
     raise ValueError(f"Unsupported pooling strategy: {pool_type!r}. Expected 'avg', 'cls', or 'last'.")
 
 
+class _Float32ScoringHead(nn.Linear):
+    """Keep scoring arithmetic in FP32 while retaining checkpoint parameter dtypes."""
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        """Project pooled states without autocast rounding the scores.
+
+        Args:
+            input: Pooled hidden states of shape [batch, hidden].
+
+        Returns:
+            FP32 scores of shape [batch, num_labels]. Gradients flow to the
+            original input and weight tensors in their respective dtypes.
+        """
+        with torch.autocast(device_type=input.device.type, enabled=False):
+            return nn.functional.linear(input.float(), self.weight.float())
+
+
 class Mistral3VLBidirectionalForSequenceClassification(Mistral3PreTrainedModel):
     """Bidirectional Mistral3 VLM with a sequence-scoring head."""
 
@@ -477,6 +494,8 @@ class Mistral3VLBidirectionalForSequenceClassification(Mistral3PreTrainedModel):
             **kwargs,
         )
 
+    _sentence_transformer_input_mode = "structured_multimodal"
+
     def __init__(self, config: Mistral3BidirectionalConfig) -> None:
         """Initialize the full vision-language cross-encoder.
 
@@ -486,7 +505,7 @@ class Mistral3VLBidirectionalForSequenceClassification(Mistral3PreTrainedModel):
         super().__init__(config)
         self.num_labels = config.num_labels
         self.model = Mistral3BidirectionalModel(config)
-        self.score = nn.Linear(config.text_config.hidden_size, self.num_labels, bias=False)
+        self.score = _Float32ScoringHead(config.text_config.hidden_size, self.num_labels, bias=False)
         self.post_init()
 
     def _nemo_apply_liger_kernel(self, liger_kernel_transformers) -> None:
@@ -555,7 +574,7 @@ class Mistral3VLBidirectionalForSequenceClassification(Mistral3PreTrainedModel):
             A ``SequenceClassifierOutputWithPast`` with these fields:
 
             - ``loss``: Always ``None``; the recipe computes the loss.
-            - ``logits``: Tensor of shape [batch, num_labels].
+            - ``logits``: FP32 tensor of shape [batch, num_labels].
             - ``past_key_values``: Optional updated cache with per-layer key and
               value tensors of shape [batch, kv_heads, cached_sequence, head_dim].
             - ``hidden_states``: Optional tuple of embedding and layer-output
@@ -595,7 +614,7 @@ class Mistral3VLBidirectionalForSequenceClassification(Mistral3PreTrainedModel):
             attention_mask=attention_mask,
             pool_type=self.config.pooling,
         )
-        # Preserve the checkpoint's score-dtype scaling (including BF16 rounding).
+        # The reference checkpoint projects and scales scores in FP32, including under autocast.
         # The recipe must not apply a second non-unit temperature.
         logits = self.score(pooled_hidden_states) / self.config.temperature
 

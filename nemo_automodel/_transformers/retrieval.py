@@ -38,6 +38,7 @@ from nemo_automodel._transformers.sentence_transformer_export import (
     SentenceTransformerExportConfig,
     SentenceTransformerWrapperOptions,
     _cache_hub_source_legal_assets,
+    _CrossEncoderMetadataExporter,
     _load_sentence_transformer_wrapper_options,
     _resolve_cached_source_model_path,
     _resolve_cached_source_repository_path,
@@ -583,11 +584,22 @@ def save_encoder_pretrained(model: nn.Module, save_directory: str, **kwargs) -> 
                 exc,
             )
             export_config = None
+    cross_encoder_exporter = None
+    if isinstance(model, CrossEncoderModel):
+        cross_encoder_exporter = model._get_consolidated_hf_metadata_exporter(
+            tokenizer=tokenizer, original_model_path=original_model_path
+        )
+        if cross_encoder_exporter is not None:
+            cross_encoder_exporter.validate(tokenizer=tokenizer, original_model_path=original_model_path)
     model.model.save_pretrained(save_directory)
     if deploy_config is not None:
         deploy_config.save_pretrained(save_directory)
     if tokenizer is not None:
         tokenizer.save_pretrained(save_directory)
+    if cross_encoder_exporter is not None:
+        cross_encoder_exporter._save_sentence_transformer_assets(
+            hf_metadata_dir=save_directory, tokenizer=tokenizer, original_model_path=original_model_path
+        )
     if export_config is None:
         return
     _save_generated_sentence_transformer_assets(model, export_config, original_model_path, save_directory, tokenizer)
@@ -915,6 +927,14 @@ class CrossEncoderModel(nn.Module):
         _set_text_backbone_is_causal(model, is_causal)
         _init_encoder_common(self, model)
         self.is_causal = is_causal
+
+    def _get_consolidated_hf_metadata_exporter(
+        self, *, tokenizer: object, original_model_path: str | None
+    ) -> _CrossEncoderMetadataExporter | None:
+        """Use the same CrossEncoder metadata contract for direct and consolidated saves."""
+        if tokenizer is None:
+            return None
+        return _CrossEncoderMetadataExporter(self)
 
     @property
     def effective_score_temperature(self) -> float:

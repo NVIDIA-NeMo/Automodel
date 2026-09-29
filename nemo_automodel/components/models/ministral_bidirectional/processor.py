@@ -36,7 +36,47 @@ _CONTROL_TOKEN_ESCAPE = "\u200c"
 _CONTROL_TOKEN_ESCAPE_POLICY = "mistral_retrieval_zwnj_prefix_v1"
 _CONTROL_TOKEN_PREFIXES = ("[", "<")
 
-_MISTRAL_RETRIEVAL_CHAT_TEMPLATE = """
+_MISTRAL_RETRIEVAL_CHAT_TEMPLATE = r"""
+{%- if messages | length == 2 and messages[0]['role'] == 'query' and messages[1]['role'] == 'document' -%}
+{# Render the checkpoint's query/document training format without BOS/EOS. #}
+{%- macro text_content(content) -%}
+  {%- if content is string -%}
+    {{- content | replace('[', '[\u200c') | replace('<', '<\u200c') -}}
+  {%- else -%}
+    {%- set ns = namespace(first=true) -%}
+    {%- for block in content -%}
+      {%- if block['type'] == 'text' -%}
+        {%- if not ns.first -%}{{- '\n\n' -}}{%- endif -%}
+        {{- block['text'] | replace('[', '[\u200c') | replace('<', '<\u200c') -}}
+        {%- set ns.first = false -%}
+      {%- elif block['type'] not in ['image', 'image_url'] -%}
+        {{- raise_exception('Only text and image documents are supported') -}}
+      {%- endif -%}
+    {%- endfor -%}
+  {%- endif -%}
+{%- endmacro -%}
+{%- set ns = namespace(images=0) -%}
+{%- if messages[0]['content'] is not string -%}
+  {%- for block in messages[0]['content'] -%}
+    {%- if block['type'] != 'text' -%}{{- raise_exception('Queries must be text') -}}{%- endif -%}
+  {%- endfor -%}
+{%- endif -%}
+{%- if messages[1]['content'] is not string -%}
+  {%- for block in messages[1]['content'] -%}
+    {%- if block['type'] in ['image', 'image_url'] -%}{%- set ns.images = ns.images + 1 -%}{%- endif -%}
+  {%- endfor -%}
+{%- endif -%}
+{%- if ns.images > 1 -%}{{- raise_exception('At most one image per document is supported') -}}{%- endif -%}
+{%- set rendered -%}
+  {%- if ns.images -%}{{- '[IMG] ' -}}{%- endif -%}
+  {%- if use_prompt_template | default(true) -%}{{- 'query: ' -}}{%- endif -%}
+  {{- text_content(messages[0]['content']) -}}
+  {{- '\n\npassage: ' if use_prompt_template | default(true) else '\n' -}}
+  {{- text_content(messages[1]['content']) -}}
+{%- endset -%}
+{{- rendered | trim if ns.images else rendered -}}
+
+{%- else -%}
 {# nemo-mistral-retrieval-v1
    Derived from the Mistral Ministral-3 instruct chat template render_content
    macro and its image-before-text canonicalization. Retrieval adaptation:
@@ -53,7 +93,7 @@ _MISTRAL_RETRIEVAL_CHAT_TEMPLATE = """
     {%- set ns = namespace(has_output=false) -%}
     {%- for block in content -%}
         {%- if block["type"] == "text" -%}
-            {%- if ns.has_output %}{{ "\\n\\n" }}{% endif -%}
+            {%- if ns.has_output %}{{ "\n\n" }}{% endif -%}
             {{- block["text"] -}}
             {%- set ns.has_output = true -%}
         {%- else -%}
@@ -99,6 +139,7 @@ _MISTRAL_RETRIEVAL_CHAT_TEMPLATE = """
     {{- render_user_content(messages[1]["content"]) -}}
 {%- else -%}
     {{- raise_exception("Retrieval inputs require one user message with an optional leading system prefix") -}}
+{%- endif -%}
 {%- endif -%}
 """.strip()
 
@@ -307,7 +348,15 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
             image_end_token=image_end_token,
             **kwargs,
         )
-        self.chat_template = _apply_mistral_retrieval_ownership_policy(self.tokenizer)
+        default_chat_template = _apply_mistral_retrieval_ownership_policy(self.tokenizer)
+        # Instruct templates must be converted, but saved retrieval templates own
+        # their formatting and must survive a load/save round trip unchanged.
+        if chat_template is not None and "{# nemo-mistral-retrieval-v1" in chat_template:
+            self.chat_template = chat_template
+        else:
+            prompt_setting = "true" if use_prompt_template else "false"
+            self.chat_template = "{%- set use_prompt_template = " + prompt_setting + " -%}\n" + default_chat_template
+        self.tokenizer.chat_template = self.chat_template
         self.q_max_length = q_max_length if q_max_length is not None else q_max_len
         self.p_max_length = p_max_length if p_max_length is not None else p_max_len
         self.rerank_max_length = rerank_max_length
@@ -319,6 +368,17 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
             self.image_longest_edge = image_longest_edge
         self.use_prompt_template = use_prompt_template
         self.export_as_stock_processor = export_as_stock_processor
+        self._sync_reranker_defaults()
+
+    def _sync_reranker_defaults(self) -> None:
+        """Expose effective reranker tokenization settings to standard processor calls."""
+        if not self.export_as_stock_processor:
+            self.tokenizer.init_kwargs.update(
+                padding=self.padding,
+                truncation=True,
+                max_length=self.rerank_max_length,
+                pad_to_multiple_of=self.pad_to_multiple_of,
+            )
 
     @property
     def image_longest_edge(self) -> int | None:
@@ -766,6 +826,7 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
                 push_to_hub=push_to_hub,
                 **kwargs,
             )
+        self._sync_reranker_defaults()
         type(self).register_for_auto_class("AutoProcessor")
         return PixtralProcessor.save_pretrained(self, save_directory, push_to_hub=push_to_hub, **kwargs)
 

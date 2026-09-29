@@ -1699,3 +1699,37 @@ def test_extract_submodel_without_config_raises():
 
     with pytest.raises(ValueError, match="has no .config attribute"):
         _extract_submodel(model, "language_model")
+
+
+@pytest.mark.parametrize("consolidated", [False, True])
+def test_cross_encoder_exports_raw_text_scores(tmp_path, consolidated):
+    from safetensors.torch import save_file
+
+    from nemo_automodel._transformers.retrieval import CrossEncoderModel
+    from nemo_automodel.components.checkpoint.addons import ConsolidatedHFAddon
+
+    CrossEncoder = pytest.importorskip("sentence_transformers").CrossEncoder
+    config = BertConfig(
+        vocab_size=32, hidden_size=16, intermediate_size=32, num_hidden_layers=1,
+        num_attention_heads=2, max_position_embeddings=64, num_labels=1,
+    )
+    config._attn_implementation = "eager"
+    encoder = CrossEncoderModel(BertForSequenceClassification(config)).eval()
+    tokenizer = _tiny_tokenizer()
+    pairs = [("hello", "world"), ("world", "hello world")]
+    inputs = tokenizer([p[0] for p in pairs], [p[1] for p in pairs], padding=True, return_tensors="pt")
+    with torch.no_grad():
+        expected = encoder(**inputs).logits.flatten()
+    if consolidated:
+        ConsolidatedHFAddon().pre_save(
+            model_state=SimpleNamespace(model=[encoder]), hf_metadata_dir=str(tmp_path),
+            fqn_to_file_index_mapping={}, original_model_path=None, tokenizer=tokenizer,
+        )
+        save_file(encoder.model.state_dict(), tmp_path / "model.safetensors", metadata={"format": "pt"})
+    else:
+        encoder.save_pretrained(str(tmp_path), tokenizer=tokenizer)
+    reloaded = CrossEncoder(str(tmp_path), device="cpu", model_kwargs={"attn_implementation": "eager"})
+    assert isinstance(reloaded.activation_fn, nn.Identity)
+    assert reloaded[0].max_seq_length == 32
+    actual = reloaded.predict(pairs, batch_size=2, convert_to_tensor=True, show_progress_bar=False)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
