@@ -181,8 +181,15 @@ def _fully_shard_once(module: nn.Module, *, mesh, mp_policy, offload_policy, fp3
 
 def _iter_dsv4_fp32_modules(module: nn.Module):
     seen: set[int] = set()
+    selected_names: list[str] = []
     for name, submodule in module.named_modules():
         if not name or id(submodule) in seen:
+            continue
+        # named_modules() is pre-order, so a selected island precedes its
+        # descendants. Skip them: an activation-checkpoint wrapper around an
+        # island (``norm1`` -> ``norm1._checkpoint_wrapped_module``) owns the
+        # same parameters, and sharding both raises an overlapping-mesh error.
+        if any(name.startswith(f"{selected}.") for selected in selected_names):
             continue
         # A standalone vision tower names its final norm simply "norm".
         # Match the shared vision norm type as well as paths relative to a model.
@@ -193,6 +200,7 @@ def _iter_dsv4_fp32_modules(module: nn.Module):
         if _floating_param_dtypes(submodule) != {torch.float32}:
             continue
         seen.add(id(submodule))
+        selected_names.append(name)
         yield submodule
 
 
