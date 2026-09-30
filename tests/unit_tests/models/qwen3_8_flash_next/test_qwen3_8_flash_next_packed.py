@@ -573,3 +573,97 @@ def test_model_advertises_packed_cp_for_sparse_backends(attn_backend: str) -> No
     model.backend = SimpleNamespace(attn="sdpa")
     sdpa_supports = ModelSupports(model, mesh=SimpleNamespace(cp_size=8, tp_size=1))
     assert not sdpa_supports.supports_cp_with_sequence_packing
+
+
+def test_packed_gdn_parent_forward_backward_matches_separate_documents() -> None:
+    """Exercise the inherited forward with three documents, including zero-based ID 2."""
+    import copy
+
+    import torch.nn.functional as F
+    from transformers.models.qwen3_5.modeling_qwen3_5 import torch_recurrent_gated_delta_rule
+
+    from nemo_automodel.components.models.qwen3_8_flash_next.layers import Qwen3_8_FlashNextGatedDeltaNet
+
+    def reference_conv(x, weight, bias, activation, seq_idx):
+        """Apply independent causal convolutions at document boundaries.
+
+        Args:
+            x: Tensor of shape [1, channels, tokens].
+            weight: Tensor of shape [channels, kernel].
+            bias: Optional tensor of shape [channels].
+            activation: Activation name, required to be silu.
+            seq_idx: Optional document IDs of shape [1, tokens].
+
+        Returns:
+            Tensor of shape [1, channels, tokens].
+        """
+        assert activation == "silu"
+        cuts = (
+            [0, x.shape[-1]]
+            if seq_idx is None
+            else ([0] + (torch.nonzero(seq_idx[0, 1:] != seq_idx[0, :-1]).flatten() + 1).tolist() + [x.shape[-1]])
+        )
+        return torch.cat(
+            [
+                F.silu(
+                    F.conv1d(
+                        x[:, :, start:end], weight[:, None], bias, padding=weight.shape[-1] - 1, groups=x.shape[1]
+                    )[:, :, : end - start]
+                )
+                for start, end in zip(cuts, cuts[1:])
+            ],
+            dim=-1,
+        )
+
+    def reference_gdn(q, k, v, *, g, beta, cu_seqlens=None, cu_seqlens_cpu=None, **kwargs):
+        """Evaluate HF's recurrent reference independently for every document.
+
+        Args:
+            q: Tensor of shape [1, tokens, heads, key_dim].
+            k: Tensor of shape [1, tokens, heads, key_dim].
+            v: Tensor of shape [1, tokens, heads, value_dim].
+            g: Tensor of shape [1, tokens, heads].
+            beta: Tensor of shape [1, tokens, heads].
+            cu_seqlens: Optional boundaries of shape [documents + 1].
+            cu_seqlens_cpu: Optional CPU mirror of shape [documents + 1].
+            **kwargs: Scalar reference-kernel options; initial_state is None.
+
+        Returns:
+            Tensor of shape [1, tokens, heads, value_dim] and None for the unused state.
+        """
+        cuts = [0, q.shape[1]] if cu_seqlens is None else cu_seqlens.tolist()
+        outputs = [
+            torch_recurrent_gated_delta_rule(
+                q[:, start:end], k[:, start:end], v[:, start:end], g[:, start:end], beta[:, start:end], **kwargs
+            )[0]
+            for start, end in zip(cuts, cuts[1:])
+        ]
+        return torch.cat(outputs, dim=1), None
+
+    torch.manual_seed(15)
+    config = _config()
+    config.layer_types = ["linear_attention"]
+    config.linear_conv_kernel_dim = 4
+    config.linear_key_head_dim = 4
+    config.linear_value_head_dim = 4
+    config.linear_num_key_heads = 1
+    config.linear_num_value_heads = 2
+    layer = Qwen3_8_FlashNextGatedDeltaNet(config, layer_idx=0).float()
+    with torch.no_grad():
+        layer._fp32_params.A_log.zero_()
+        layer._fp32_params.dt_bias.zero_()
+    layer.causal_conv1d_fn = reference_conv
+    layer.chunk_gated_delta_rule = reference_gdn
+    reference = copy.deepcopy(layer)
+    hidden = torch.randn(1, 10, config.hidden_size, requires_grad=True)
+    ref_hidden = hidden.detach().clone().requires_grad_()
+    boundaries = [0, 3, 6, 10]
+    output = layer(hidden, cu_seqlens=torch.tensor(boundaries, dtype=torch.int32))
+    expected = torch.cat([reference(ref_hidden[:, start:end]) for start, end in zip(boundaries, boundaries[1:])], dim=1)
+    upstream = torch.randn_like(output)
+    output.backward(upstream)
+    expected.backward(upstream)
+    torch.testing.assert_close(output, expected, rtol=3e-5, atol=1e-6)
+    torch.testing.assert_close(hidden.grad, ref_hidden.grad, rtol=3e-5, atol=1e-6)
+    for (name, param), (_, ref_param) in zip(layer.named_parameters(), reference.named_parameters()):
+        torch.testing.assert_close(param.grad, ref_param.grad, rtol=3e-5, atol=1e-6, msg=name)

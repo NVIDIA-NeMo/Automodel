@@ -1087,6 +1087,10 @@ class KimiLinear48BModel(nn.Module):
             attention_mask=packed_seq_ids if packed_seq_ids is not None else attention_mask,
             cu_seqlens=attn_kwargs.get("cu_seqlens"),
         )
+        # Packed attention consumes document metadata, but MoE routing still
+        # needs a separate mask for padding tokens, including in full-attention layers.
+        if padding_mask is None and packed_context is not None:
+            padding_mask = packed_context.local_doc_ids == 0
         linear_attn_mask = None if has_packed_inputs else self._update_linear_attn_mask(attention_mask, cache_position)
         causal_mask = (
             None
@@ -1098,7 +1102,7 @@ class KimiLinear48BModel(nn.Module):
         for decoder_layer in self.layers.values():
             layer_mask = linear_attn_mask if decoder_layer.is_linear_attn else causal_mask
             layer_padding_mask = padding_mask
-            if decoder_layer.is_linear_attn and layer_mask is not None:
+            if decoder_layer.is_linear_attn and layer_mask is not None and layer_padding_mask is None:
                 layer_padding_mask = layer_mask.bool().logical_not()
             hidden_states = decoder_layer(
                 hidden_states,

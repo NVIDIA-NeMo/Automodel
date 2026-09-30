@@ -747,6 +747,11 @@ class Qwen3_5MoeTextModelBackend(nn.Module):
         # hidden_states are [B, S_local]).  Both TE ring-attention and FLA CP
         # do not support padding masks, so we null them out.
         if getattr(self, "_cp_enabled", False):
+            if attn_kwargs.get("packed_token_indices") is not None or attn_kwargs.get("cu_seqlens") is not None:
+                raise ValueError(
+                    "Qwen3.5 packed sequence metadata is unsupported with load-balanced context parallelism. "
+                    "Disable packing or use the supported SDPA block-diagonal CP path for Qwen3.5-MoE."
+                )
             attention_mask = None
             from nemo_automodel.components.distributed.blockdiag_cp import current_blockdiag_cp_state
 
