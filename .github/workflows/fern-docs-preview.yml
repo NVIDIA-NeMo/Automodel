@@ -61,8 +61,11 @@ jobs:
               - tests/unit_tests/_transformers/test_doc_coverage.py
               - tests/ci_tests/utils/sync_model_coverage_tables.py
               - tools/apply_fern_code_styles.py
+              - tests/ci_tests/scripts/test_fern_preview_staging.sh
               - .github/workflows/fern-docs-ci.yml
               - .github/workflows/fern-docs-preview.yml
+      - name: Test preview staging
+        run: bash tests/ci_tests/scripts/test_fern_preview_staging.sh
       - name: Report docs preview gate
         env:
           DOCS_CHANGED: ${{ steps.changed-files.outputs.docs_any_changed }}
@@ -153,8 +156,9 @@ jobs:
             mkdir -p "$RUNNER_TEMP/fern-preview/$(dirname "$ROOT")"
             cp -R "trusted-source/$ROOT" "$RUNNER_TEMP/fern-preview/$ROOT"
             # Navigation, components and tooling stay on the trusted branch.
-            find "$RUNNER_TEMP/fern-preview/$ROOT" -regextype posix-extended -type f \
-              -regex "$CONTENT" ! -path '*/components/*' -delete
+            # Keep trusted pages as fallbacks for navigation added after the PR
+            # branched. Overlay PR content without removing those newer pages.
+            # Page removals take effect with their navigation changes on main.
             (cd pr-source && find "$ROOT" -regextype posix-extended -type f \
               -regex "$CONTENT" ! -path '*/.*' ! -path '*/components/*' \
               -exec cp --parents -- '{}' "$RUNNER_TEMP/fern-preview/" \;)
