@@ -139,8 +139,11 @@ ARG DEEPEP_COMMIT=10d4dd7377d5bce900fbb4b80cce863764892b95
 ENV HYBRID_EP_MULTINODE=1
 ENV RDMA_CORE_HOME=/opt/rdma-core/build
 ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64/:$LD_LIBRARY_PATH
-RUN apt-get update && apt-get install -y --allow-change-held-packages \
-        rdma-core libibverbs-dev && \
+RUN ARM_DEEPEP_PACKAGES="" && \
+    if [ "${TARGETARCH}" = "arm64" ]; then ARM_DEEPEP_PACKAGES="binutils"; fi && \
+    apt-get update && apt-get install -y --allow-change-held-packages \
+        rdma-core libibverbs-dev ${ARM_DEEPEP_PACKAGES} && \
+    if [ "${TARGETARCH}" = "arm64" ]; then command -v as; fi && \
     apt-get clean && \
     ARCH_LIB=$(dpkg-architecture -qDEB_HOST_MULTIARCH) && \
     test -f /usr/lib/${ARCH_LIB}/libmlx5.so || \
