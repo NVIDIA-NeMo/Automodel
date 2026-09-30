@@ -1,0 +1,220 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Preview Fern Docs
+
+on:
+  push:
+    branches:
+      - "pull-request/[0-9]+"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FERN_NO_VERSION_REDIRECTION: "true"
+
+jobs:
+  changed-files:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      docs: ${{ steps.changed-files.outputs.docs_any_changed }}
+    steps:
+      - name: Checkout approved PR mirror
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Get PR info
+        id: get-pr-info
+        uses: nv-gha-runners/get-pr-info@090577647b8ddc4e06e809e264f7881650ecdccf # main
+      - name: Get changed files
+        id: changed-files
+        uses: step-security/changed-files@2e07db73e5ccdb319b9a6c7766bd46d39d304bad # v47.0.5
+        with:
+          base_sha: ${{ fromJSON(steps.get-pr-info.outputs.pr-info).base.sha }}
+          sha: ${{ github.sha }}
+          files_yaml: |
+            docs:
+              - docs/**
+              - nemo_automodel/_transformers/registry.py
+              - examples/**
+              - tests/unit_tests/_transformers/test_doc_coverage.py
+              - tests/ci_tests/utils/sync_model_coverage_tables.py
+              - tools/apply_fern_code_styles.py
+              - .github/workflows/fern-docs-ci.yml
+              - .github/workflows/fern-docs-preview.yml
+      - name: Report docs preview gate
+        env:
+          DOCS_CHANGED: ${{ steps.changed-files.outputs.docs_any_changed }}
+        run: |
+          printf 'Docs or preview workflow changed: %s\n' "$DOCS_CHANGED" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  preview:
+    needs: changed-files
+    # An approved upstream mirror is the trust boundary, even for a fork PR.
+    # The original PR head repository does not change when its commit is mirrored.
+    if: >-
+      github.repository == 'NVIDIA-NeMo/Automodel' &&
+      needs.changed-files.outputs.docs == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Verify current PR against mirror push
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF" =~ ^refs/heads/pull-request/([1-9][0-9]*)$ ]]
+          PR_NUMBER=${BASH_REMATCH[1]}
+          gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" | jq -e \
+            --arg repo "$GITHUB_REPOSITORY" --arg sha "$GITHUB_SHA" --argjson number "$PR_NUMBER" \
+            '.number == $number and .state == "open" and .head.sha == $sha and
+             .base.repo.full_name == $repo'
+          echo "number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout trusted configuration
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: main
+          path: trusted-source
+          persist-credentials: false
+
+      - name: Checkout approved PR content
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          path: pr-source
+          persist-credentials: false
+
+      - name: Checkout archived version pages
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: docs-archive
+          path: archived-source
+          persist-credentials: false
+
+      - name: Restore trusted archived pages
+        run: |
+          set -euo pipefail
+          test -z "$(find pr-source/docs -type l -print -quit)"
+          for VERSION in v0.4 v0.5; do
+            ROOT="docs/fern/versions/$VERSION/pages"
+            test -d "archived-source/$ROOT"
+            rm -rf "pr-source/$ROOT"
+            mkdir -p "pr-source/$(dirname "$ROOT")"
+            cp -R "archived-source/$ROOT" "pr-source/$ROOT"
+          done
+
+      - name: Generate model coverage tables with trusted tooling
+        run: |
+          set -euo pipefail
+          # Replace the helper, not the PR model/document data it inspects.
+          test -z "$(find pr-source/tests pr-source/examples pr-source/nemo_automodel -type l -print -quit)"
+          test -z "$(find pr-source/docs -type l -print -quit)"
+          cp trusted-source/tests/ci_tests/utils/sync_model_coverage_tables.py \
+            pr-source/tests/ci_tests/utils/sync_model_coverage_tables.py
+          python3 -I pr-source/tests/ci_tests/utils/sync_model_coverage_tables.py
+
+      - name: Prepare preview docs
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/fern-preview"
+          CONTENT='.*\.(md|mdx|png|jpg|jpeg|gif|svg|webp|ico|pdf)'
+          for ROOT in docs; do
+            test -d "pr-source/$ROOT"
+            test -z "$(find "pr-source/$ROOT" -type l -print -quit)"
+            mkdir -p "$RUNNER_TEMP/fern-preview/$(dirname "$ROOT")"
+            cp -R "trusted-source/$ROOT" "$RUNNER_TEMP/fern-preview/$ROOT"
+            # Navigation, components and tooling stay on the trusted branch.
+            find "$RUNNER_TEMP/fern-preview/$ROOT" -regextype posix-extended -type f \
+              -regex "$CONTENT" ! -path '*/components/*' -delete
+            (cd pr-source && find "$ROOT" -regextype posix-extended -type f \
+              -regex "$CONTENT" ! -path '*/.*' ! -path '*/components/*' \
+              -exec cp --parents -- '{}' "$RUNNER_TEMP/fern-preview/" \;)
+          done
+          printf '%s\n' '{"organization":"nvidia","version":"5.139.0"}' \
+            > "$RUNNER_TEMP/fern-preview/docs/fern/fern.config.json"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '20'
+
+      - name: Install fixed Fern CLI
+        working-directory: ${{ runner.temp }}
+        run: npm install --prefix "$RUNNER_TEMP/fern-cli" --ignore-scripts --no-audit --no-fund fern-api@5.139.0
+
+      - name: Generate library reference with trusted configuration
+        env:
+          FERN_TOKEN: ${{ secrets.DOCS_FERN_TOKEN }}
+        working-directory: ${{ runner.temp }}/fern-preview/docs/fern
+        run: '"$RUNNER_TEMP/fern-cli/node_modules/.bin/fern" docs md generate'
+
+      - name: Style generated pages with trusted tooling
+        run: python3 -I trusted-source/tools/apply_fern_code_styles.py --repo-root "$RUNNER_TEMP/fern-preview"
+
+      - name: Generate preview
+        env:
+          FERN_TOKEN: ${{ secrets.DOCS_FERN_TOKEN }}
+          FERN_DOCS_DEPLOY_MODE: ledger
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        working-directory: ${{ runner.temp }}/fern-preview/docs/fern
+        run: |
+          "$RUNNER_TEMP/fern-cli/node_modules/.bin/fern" generate --docs --preview \
+            --id "pr-${PR_NUMBER}-${GITHUB_SHA:0:12}" > "$RUNNER_TEMP/fern-preview.log" 2>&1
+
+      - name: Read preview URL without credentials
+        id: preview
+        env:
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: |
+          set -euo pipefail
+          URL=$(sed -n 's/^.*Published docs to \(https:\/\/[^ ]*\) (.*/\1/p' "$RUNNER_TEMP/fern-preview.log")
+          HOST="nvidia-preview-pr-${PR_NUMBER}-${GITHUB_SHA:0:12}.docs.buildwithfern.com"
+          [[ "$URL" == "https://$HOST" || "$URL" == "https://$HOST/"* ]]
+          PATH_PART=${URL#"https://$HOST"}
+          [[ "$PATH_PART" =~ ^(/[a-zA-Z0-9/_-]*)?$ ]]
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+
+      - name: Post or update preview comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          PREVIEW_URL: ${{ steps.preview.outputs.url }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" | jq -e \
+            --arg sha "$GITHUB_SHA" '.state == "open" and .head.sha == $sha'
+          BODY=$(printf ':herb: **Preview your docs:** <%s>\n\n<!-- preview-docs -->' "$PREVIEW_URL")
+          COMMENT_ID=$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" \
+            --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | contains("<!-- preview-docs -->"))) | .id' | head -1)
+          if [ -n "$COMMENT_ID" ]; then
+            gh api "repos/$GITHUB_REPOSITORY/issues/comments/$COMMENT_ID" -X PATCH -f body="$BODY"
+          else
+            gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" -f body="$BODY"
+          fi
