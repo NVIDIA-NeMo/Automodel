@@ -12,8 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from nemo_automodel.components.models.mimo_v2_flash.config import MiMoV2FlashConfig
-from nemo_automodel.components.models.mimo_v2_flash.model import MiMoV2FlashForCausalLM, MiMoV2FlashModel
+from nemo_automodel.components.models.mimo_v2_flash.config import MiMoV2Config, MiMoV2FlashConfig
+from nemo_automodel.components.models.mimo_v2_flash.model import (
+    MiMoV2FlashForCausalLM,
+    MiMoV2FlashModel,
+    MiMoV2ForCausalLM,
+)
 from nemo_automodel.components.models.mimo_v2_flash.state_dict_adapter import MiMoV2FlashStateDictAdapter
 
-__all__ = ["MiMoV2FlashConfig", "MiMoV2FlashForCausalLM", "MiMoV2FlashModel", "MiMoV2FlashStateDictAdapter"]
+__all__ = [
+    "MiMoV2Config",
+    "MiMoV2FlashConfig",
+    "MiMoV2FlashForCausalLM",
+    "MiMoV2FlashModel",
+    "MiMoV2FlashStateDictAdapter",
+    "MiMoV2ForCausalLM",
+]

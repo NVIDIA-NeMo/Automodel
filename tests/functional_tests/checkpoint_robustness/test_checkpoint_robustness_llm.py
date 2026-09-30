@@ -1404,6 +1404,43 @@ def _normalize_peft_no_split_modules(model) -> None:
         model._no_split_modules = sorted(no_split_modules)
 
 
+@contextmanager
+def _peft_input_embeddings_context(model: torch.nn.Module) -> Iterator[None]:
+    """Expose a legacy model's resolved embedding module while PEFT loads adapters.
+
+    The Transformers compatibility patch already records the embedding source
+    when converting legacy tied-weight metadata. Some remote-code accessors
+    require token IDs, including through a zero-argument outer wrapper. PEFT
+    needs the module itself to inspect tied parameters. Reuse the recorded
+    source only for those accessors, restoring the reference API before forward.
+    Remove this bridge when supported remote models implement the HF accessor.
+
+    Args:
+        model: Loaded HF base model, before PEFT adapter injection.
+
+    Yields:
+        Control to adapter loading with a zero-argument embedding accessor.
+    """
+    accessor_context = nullcontext()
+    tied_keys = getattr(model, "_nemo_tied_weights_keys", None)
+    if tied_keys:
+        try:
+            model.get_input_embeddings()
+        except TypeError:
+            sources = set(tied_keys.values())
+            if len(sources) != 1:
+                raise
+            embedding_path = sources.pop().removesuffix(".weight")
+
+            def _get_input_embeddings() -> torch.nn.Module:
+                # Resolve on each call so PEFT can replace the embedding module.
+                return model.get_submodule(embedding_path)
+
+            accessor_context = patch.object(model, "get_input_embeddings", new=_get_input_embeddings)
+    with accessor_context:
+        yield
+
+
 def _explicit_tie_word_embeddings(config) -> bool | None:
     """Return an explicit tie_word_embeddings flag from a top-level or text config."""
     tie_word_embeddings = getattr(config, "tie_word_embeddings", None)
@@ -2380,10 +2417,36 @@ def _fixed_flex_attention_for_parity(model_parts: Sequence[torch.nn.Module]) -> 
         FlexAttention.flex_attn = original
 
 
+@contextmanager
+def _fixed_mamba_cumsum_for_parity() -> Iterator[None]:
+    """Use one Mamba cumsum tile for serial AutoModel and HF parity forwards.
+
+    Different autotuned head tiles change rounding and can flip downstream MoE
+    routes despite identical weights. A controlled 1 -> 4 -> 1 tile replay gave
+    mean KL 0 -> 0.002839 -> 0 against the trained reference on 2048 tokens.
+    Training retains its original configurations and autotune cache.
+
+    Yields:
+        None while the optional Mamba cumsum kernel uses head tile 1.
+    """
+    available, chunk_state = safe_import("mamba_ssm.ops.triton.ssd_chunk_state")
+    if not available:
+        yield
+        return
+    kernel = chunk_state._chunk_cumsum_fwd_kernel
+    config = next((config for config in kernel.configs if config.kwargs == {"BLOCK_SIZE_H": 1}), None)
+    if config is None:
+        raise RuntimeError("Mamba parity requires a cumsum forward configuration with BLOCK_SIZE_H=1")
+    # Triton's single-config path bypasses both benchmarking and cached choices.
+    # Restore the original candidate list even when the model forward fails.
+    with patch.object(kernel, "configs", [config]):
+        yield
+
+
 def _get_logits(model, input_ids, device, trainer=None) -> torch.Tensor:
     """Run a parity forward and return float32 CPU logits of shape [1, sequence, vocab]."""
     model_parts = trainer.model_parts if trainer is not None else [model]
-    with _fixed_flex_attention_for_parity(model_parts):
+    with _fixed_flex_attention_for_parity(model_parts), _fixed_mamba_cumsum_for_parity():
         if trainer is not None and getattr(trainer, "pp_enabled", False):
             return _get_logits_pp(trainer, input_ids, device)
 
@@ -2847,12 +2910,13 @@ def _run_vanilla_hf_reload(
                 if should_fix_rotary_embeddings([base_model]):
                     fix_rotary_embeddings([base_model])
             _normalize_peft_no_split_modules(base_model)
-            peft_model = PeftModel.from_pretrained(
-                base_model,
-                str(ckpt_step_dir / "model"),
-                autocast_adapter_dtype=False,
-                **_peft_adapter_load_kwargs(hf_kwargs),
-            )
+            with _peft_input_embeddings_context(base_model):
+                peft_model = PeftModel.from_pretrained(
+                    base_model,
+                    str(ckpt_step_dir / "model"),
+                    autocast_adapter_dtype=False,
+                    **_peft_adapter_load_kwargs(hf_kwargs),
+                )
             adapter_path = ckpt_step_dir / "model" / "adapter_model.safetensors"
             matched_adapter_tensors, ignored_adapter_tensors = _assert_peft_adapter_matches_checkpoint(
                 peft_model,
