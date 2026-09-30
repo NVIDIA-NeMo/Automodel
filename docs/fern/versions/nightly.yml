@@ -1039,4 +1039,7 @@ navigation:
     contents:
       - page: "API Reference"
         path: ../../api-reference/index.mdx
+      - page: "Model Parallelizer API"
+        path: ../../api-reference/model-parallelizer.mdx
+        slug: model-parallelizer
       - folder: ../product-docs/nemo-automodel/Full-Library-Reference

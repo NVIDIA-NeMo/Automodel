@@ -1150,7 +1150,7 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
     # forward() pulls per-microbatch pixel_values from _vlm_pixel_values_chunks;
     # patch_hf_model_for_pp must not replace it under PP.
     _pp_keep_self_forward: bool = True
-    # CP submesh, installed by Qwen3_5ParallelizationStrategy when context
+    # CP submesh, installed by Qwen3_5ModelParallelizer when context
     # parallelism is active; None means the forward embeds and shards nothing for CP.
     cp_mesh = None
 

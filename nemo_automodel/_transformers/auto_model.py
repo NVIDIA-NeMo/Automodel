@@ -29,7 +29,7 @@ import inspect
 import logging
 import os
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, List, Optional, Union
+from typing import TYPE_CHECKING, Any, List, Optional, Union
 
 import torch
 from torch.nn.attention import SDPBackend
@@ -53,10 +53,12 @@ from transformers.initialization import no_init_weights  # noqa: E402
 from transformers.models.auto.auto_factory import _BaseAutoModelClass  # noqa: E402
 from transformers.utils import ContextManagers  # noqa: E402
 
-from nemo_automodel.components.distributed.config import DistributedSetup  # noqa: E402
-from nemo_automodel.components.distributed.ddp import DDPManager  # noqa: E402
+from nemo_automodel.components.distributed.config import (  # noqa: E402
+    DDPConfig,
+    DistributedSetup,
+    MegatronFSDPConfig,
+)
 from nemo_automodel.components.distributed.init_utils import get_world_size_safe  # noqa: E402
-from nemo_automodel.components.distributed.megatron_fsdp import MegatronFSDPManager  # noqa: E402
 from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPipeline  # noqa: E402, F401
 from nemo_automodel.components.quantization.qat import QATConfig  # noqa: E402
 from nemo_automodel.components.utils.model_utils import (  # noqa: E402
@@ -79,6 +81,7 @@ import transformers.generation.utils as _gen_utils  # noqa: E402
 from nemo_automodel._transformers.auto_config import NeMoAutoConfig as AutoConfig
 from nemo_automodel._transformers.infrastructure import (
     MeshContext,
+    _get_strategy_config,
     apply_model_infrastructure,
     instantiate_infrastructure,
 )
@@ -514,13 +517,13 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 kwargs["config"] = _hf_config
 
         # Use meta device initialization when:
-        # - Not using MegatronFSDPManager or DDPManager (they handle their own initialization)
+        # - Not using Megatron-FSDP or DDP (they handle their own initialization)
         # - AND either multi-GPU (world_size > 1) or single-GPU custom model (not HF)
         # - AND not using quantization (we let HF handle BitsAndBytes/FP8; don't init meta device)
         #   For non-HF models, native quant config is ignored.
         is_meta_device = all(
             [
-                not isinstance(model_wrapper, (MegatronFSDPManager, DDPManager)),
+                not isinstance(_get_strategy_config(model_wrapper), (MegatronFSDPConfig, DDPConfig)),
                 get_world_size_safe() > 1 or not is_hf_model,
                 quantization_config is None and (_hf_native_quant_cfg is None or not is_hf_model),
             ]
@@ -1271,7 +1274,8 @@ class NeMoAutoModelBiEncoder(_NeMoAutoModelForRetrievalBase):
         l2_normalize: bool | None = None,
         do_distributed_inbatch_negative: bool = False,
         detach_distributed_inbatch_negatives: bool = True,
-        **kwargs,
+        is_causal: bool | None = None,
+        **kwargs: Any,
     ) -> PreTrainedModel:
         """Load a bi-encoder model with infrastructure.
 
@@ -1289,6 +1293,8 @@ class NeMoAutoModelBiEncoder(_NeMoAutoModelForRetrievalBase):
                 negatives during training.
             detach_distributed_inbatch_negatives: Whether to detach remote passage embeddings in distributed
                 in-batch-negative losses. Set to false for full cross-rank gradient flow.
+            is_causal: Whether the text backbone uses causal self-attention. When omitted, restores a saved policy or
+                defaults to non-causal attention.
             **kwargs: Forwarded to ``_NeMoAutoModelForRetrievalBase.from_pretrained``.
 
         Returns:
@@ -1300,6 +1306,7 @@ class NeMoAutoModelBiEncoder(_NeMoAutoModelForRetrievalBase):
             l2_normalize=l2_normalize,
             do_distributed_inbatch_negative=do_distributed_inbatch_negative,
             detach_distributed_inbatch_negatives=detach_distributed_inbatch_negatives,
+            is_causal=is_causal,
             **kwargs,
         )
 
@@ -1320,3 +1327,30 @@ class NeMoAutoModelCrossEncoder(_NeMoAutoModelForRetrievalBase):
     """
 
     _ENCODER_CLS_NAME = "CrossEncoderModel"
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: str,
+        *args: Any,
+        is_causal: bool | None = None,
+        **kwargs: Any,
+    ) -> PreTrainedModel:
+        """Load a cross-encoder model with a configurable self-attention mode.
+
+        Args:
+            pretrained_model_name_or_path: Path to pretrained model or model identifier.
+            *args: Positional arguments forwarded to the shared retrieval loader.
+            is_causal: Whether the text backbone uses causal self-attention. When omitted, restores a saved policy or
+                preserves the scoring backbone's native attention mode.
+            **kwargs: Forwarded to the shared retrieval loader.
+
+        Returns:
+            CrossEncoderModel instance with loaded weights and all infrastructure applied.
+        """
+        return super().from_pretrained(
+            pretrained_model_name_or_path,
+            *args,
+            is_causal=is_causal,
+            **kwargs,
+        )

@@ -20,7 +20,7 @@ These use real ``nn.Module`` trees (not doubles) so they exercise the same
 
 import torch.nn as nn
 
-from nemo_automodel.shared.multimodal_fsdp import (
+from nemo_automodel.components.distributed.multimodal_fsdp import (
     MULTIMODAL_MODULE_NAMES,
     MULTIMODAL_PROJECTOR_NAMES,
     MULTIMODAL_TOWER_NAMES,
