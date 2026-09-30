@@ -103,6 +103,7 @@ def _check_mixed_meshes(world_size, checkpoint_dir, use_triton=False):
                 ],
                 distributed_mesh=mesh,
                 weight_decay=0.1,
+                muon_update_scale=0.5,
                 use_triton=fused,
             )
 
@@ -196,8 +197,12 @@ def _check_fsdp_training(use_triton=False):
     fully_shard(model[0], mesh=mesh)
     fully_shard(model[2], mesh=mesh)
     fully_shard(model, mesh=mesh)
-    optimizer = MuownConfig(weight_decay=0.1, use_triton=use_triton).build(model, device_mesh=mesh)[0]
-    reference_optimizer = MuownConfig(weight_decay=0.1, use_triton=use_triton).build(reference)[0]
+    optimizer = MuownConfig(weight_decay=0.1, use_triton=use_triton, muon_update_scale=0.5).build(
+        model, device_mesh=mesh
+    )[0]
+    reference_optimizer = MuownConfig(weight_decay=0.1, use_triton=use_triton, muon_update_scale=0.5).build(reference)[
+        0
+    ]
     for _ in range(4):
         inputs = torch.randn(8 * dist.get_world_size(), 16, device="cuda")
         local_inputs = inputs.chunk(dist.get_world_size())[dist.get_rank()]

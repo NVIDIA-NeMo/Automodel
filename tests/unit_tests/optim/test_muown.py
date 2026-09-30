@@ -148,7 +148,8 @@ def test_magnitude_guard_preserves_sign_and_dtype(dtype):
     torch.testing.assert_close(magnitude, torch.tensor([[-2.0], [0.0], [2.0]], dtype=dtype), rtol=0, atol=0)
 
 
-def test_direction_update_does_not_round_scaled_update_to_bfloat16(monkeypatch):
+@pytest.mark.parametrize("update_scale", [0.0, 0.5, 1.0, 2.0])
+def test_direction_update_does_not_round_scaled_update_to_bfloat16(monkeypatch, update_scale):
     # The output/input ratio cancels the learned magnitude and row norm. It
     # must retain the FP32 learning-rate product even when NS returns BF16.
     import nemo_automodel.components.optim.muown as implementation
@@ -159,11 +160,14 @@ def test_direction_update_does_not_round_scaled_update_to_bfloat16(monkeypatch):
         lambda *args, **kwargs: torch.tensor([[0.0, 0.75]], dtype=torch.bfloat16),
     )
     weight = nn.Parameter(torch.tensor([[1.0, 0.0]]))
-    optimizer = Muown([weight], lr=0.0033, mu=0.0, nesterov=False)
-    weight.grad = torch.tensor([[0.0, 1.0]])
+    optimizer = Muown([weight], lr=0.0033, mu=0.0, nesterov=False, muon_update_scale=update_scale)
+    weight.grad = torch.tensor([[0.25, 1.0]])
     optimizer.step()
-    expected_ratio = -0.0033 * (0.2 * 2**0.5) * 0.75
+    expected_ratio = -0.0033 * update_scale * (0.2 * 2**0.5) * 0.75
     assert abs((weight[0, 1] / weight[0, 0]).item() - expected_ratio) < 1e-9
+    # At the first step Adam reduces a positive scalar magnitude by lr,
+    # independently of the direction multiplier (including zero).
+    torch.testing.assert_close(optimizer.state[weight]["g"], torch.tensor([[1.0 - 0.0033]]), rtol=0, atol=1e-7)
 
 
 def test_adamw_fallback_matches_torch_with_missing_grad_and_resume():
@@ -205,3 +209,9 @@ def test_zero_gradient_zero_row_stays_finite():
     for value in optimizer.state[weight].values():
         if isinstance(value, torch.Tensor):
             assert torch.isfinite(value).all()
+
+
+@pytest.mark.parametrize("scale", [-0.1, float("nan"), float("inf")])
+def test_invalid_direction_scale(scale):
+    with pytest.raises(ValueError, match="muon_update_scale"):
+        Muown([nn.Parameter(torch.ones(2, 2))], muon_update_scale=scale)

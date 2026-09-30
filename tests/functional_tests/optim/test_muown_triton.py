@@ -28,7 +28,8 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires 
 
 @pytest.mark.parametrize("shape,transposed", [((67, 89), False), ((267, 89), False), ((3, 89, 67), True)])
 @pytest.mark.parametrize("nesterov,decay", [(True, 0.0), (False, 0.1)])
-def test_triton_rows_match_torch_trajectory(shape, transposed, nesterov, decay):
+@pytest.mark.parametrize("update_scale", [0.0, 0.5, 1.0])
+def test_triton_rows_match_torch_trajectory(shape, transposed, nesterov, decay, update_scale):
     torch.manual_seed(73)
     baseline = nn.Parameter(torch.randn(shape, device="cuda") * 0.02)
     actual = nn.Parameter(baseline.detach().clone())
@@ -37,11 +38,13 @@ def test_triton_rows_match_torch_trajectory(shape, transposed, nesterov, decay):
         [{"params": [baseline], "matrix_transposed": transposed}],
         nesterov=nesterov,
         weight_decay=decay,
+        muon_update_scale=update_scale,
     )
     optimizer = Muown(
         [{"params": [actual, unused], "matrix_transposed": transposed}],
         nesterov=nesterov,
         weight_decay=decay,
+        muon_update_scale=update_scale,
         use_triton=True,
     )
     # Signed magnitudes and exact zero rows must preserve the reference guards.
@@ -79,11 +82,12 @@ def test_triton_rows_match_torch_trajectory(shape, transposed, nesterov, decay):
                 if step == 0:
                     torch.testing.assert_close(left, right, atol=2e-6, rtol=2e-5)
                 else:
-                    # Near-zero magnitudes amplify the last-bit differences
-                    # over repeated BF16 NS updates. Bound the whole state by
-                    # the same 5e-4 relative-L2 budget as the 30-step validation.
-                    relative_error = (left - right).norm() / right.norm().clamp_min(1e-30)
-                    assert relative_error < 5e-4, (step, key, relative_error.item())
+                    # BF16 NS can amplify last-bit reduction differences.
+                    # Bound total state error, with an absolute term for small
+                    # or cancelling magnitude moments. Shared-NS tests below
+                    # separately check the FP32 row kernels at tighter bounds.
+                    error, reference_norm = (left - right).norm(), right.norm()
+                    assert error <= 3e-5 + 5e-4 * reference_norm, (step, key, error.item(), reference_norm.item())
                 assert optimizer.state[actual][key].data_ptr() == buffers[key]
     assert optimizer.state[unused]["muown_step"] == 0
     torch.testing.assert_close(unused, torch.zeros_like(unused), atol=0, rtol=0)
@@ -129,10 +133,13 @@ def test_mimo_shapes_use_triton_and_match_torch(shape, transposed, monkeypatch):
     torch.manual_seed(91)
     expected = nn.Parameter(torch.randn(shape, device="cuda") * 0.02)
     actual = nn.Parameter(expected.detach().clone())
-    reference = Muown([{"params": [expected], "matrix_transposed": transposed}], weight_decay=0.1)
+    reference = Muown(
+        [{"params": [expected], "matrix_transposed": transposed}], weight_decay=0.1, muon_update_scale=0.5
+    )
     optimizer = Muown(
         [{"params": [actual], "matrix_transposed": transposed}],
         weight_decay=0.1,
+        muon_update_scale=0.5,
         use_triton=True,
     )
     calls = 0
@@ -156,3 +163,88 @@ def test_mimo_shapes_use_triton_and_match_torch(shape, transposed, monkeypatch):
                     optimizer.state[actual][key], reference.state[expected][key], atol=3e-5, rtol=5e-4
                 )
     assert calls == 3
+
+
+@pytest.mark.parametrize("use_triton", [False, True])
+@pytest.mark.parametrize("update_scale", [0.0, 0.5, 1.0, 2.0])
+@pytest.mark.parametrize("transposed", [False, True])
+def test_direction_scale_has_analytic_update_without_scaling_magnitude(
+    use_triton, update_scale, transposed, monkeypatch
+):
+    import nemo_automodel.components.optim.muown as implementation
+
+    update = torch.tensor([[0.0, 0.75]], device="cuda", dtype=torch.bfloat16)
+    value = torch.tensor([[1.0, 0.0]], device="cuda")
+    grad = torch.tensor([[0.25, 1.0]], device="cuda")
+    if transposed:
+        value, grad, update = value.mT.contiguous(), grad.mT.contiguous(), update.mT.contiguous()
+    monkeypatch.setattr(implementation, "_newton_schulz", lambda *args, **kwargs: update)
+    weight = nn.Parameter(value)
+    optimizer = Muown(
+        [{"params": [weight], "matrix_transposed": transposed}],
+        lr=0.0033,
+        mu=0.0,
+        nesterov=False,
+        muon_update_scale=update_scale,
+        use_triton=use_triton,
+    )
+    weight.grad = grad
+    with torch._dynamo.config.patch(disable=True):
+        optimizer.step()
+    result = weight.mT if transposed else weight
+    # This angle is independent of row normalization and the learned magnitude.
+    expected_ratio = -0.0033 * update_scale * (0.2 * 2**0.5) * 0.75
+    assert abs((result[0, 1] / result[0, 0]).item() - expected_ratio) < 1e-9
+    torch.testing.assert_close(
+        optimizer.state[weight]["g"],
+        torch.full_like(optimizer.state[weight]["g"], 1.0 - 0.0033),
+        rtol=0,
+        atol=1e-7,
+    )
+
+
+def test_scaled_triton_rows_with_shared_newton_schulz_updates(monkeypatch):
+    """Isolate local FP32 kernels from BF16 NS rounding across repeated steps."""
+    import nemo_automodel.components.optim.muown as implementation
+
+    torch.manual_seed(73)
+    expected = nn.Parameter(torch.randn(3, 89, 67, device="cuda") * 0.02)
+    actual = nn.Parameter(expected.detach().clone())
+    reference = Muown(
+        [{"params": [expected], "matrix_transposed": True}], nesterov=False, weight_decay=0.1, muon_update_scale=0.5
+    )
+    optimizer = Muown(
+        [{"params": [actual], "matrix_transposed": True}],
+        nesterov=False,
+        weight_decay=0.1,
+        muon_update_scale=0.5,
+        use_triton=True,
+    )
+    with torch.no_grad():
+        for weight, opt in ((expected, reference), (actual, optimizer)):
+            opt.state[weight]["g"].neg_()
+            weight[..., :, 0].zero_()
+            opt.state[weight]["g"][..., :, 0].zero_()
+    original = implementation._newton_schulz
+    updates = []
+
+    def capture(*args, **kwargs):
+        result = original(*args, **kwargs)
+        updates.append(result.clone())
+        return result
+
+    with torch._dynamo.config.patch(disable=True):
+        for step in range(8):
+            expected.grad = torch.randn_like(expected) * 0.01
+            actual.grad = expected.grad.clone()
+            for opt in (reference, optimizer):
+                opt.param_groups[0]["lr"] = 3e-4 * (1 - step / 9)
+            monkeypatch.setattr(implementation, "_newton_schulz", capture)
+            reference.step()
+            monkeypatch.setattr(implementation, "_newton_schulz", lambda *args, **kwargs: updates.pop(0))
+            optimizer.step()
+            torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-5)
+            for key in ("g", "v_norm", "m_g", "v_g", "momentum"):
+                torch.testing.assert_close(
+                    optimizer.state[actual][key], reference.state[expected][key], atol=2e-6, rtol=2e-5
+                )

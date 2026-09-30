@@ -926,6 +926,8 @@ optimizer:
   lm_head_lr: 3.0e-5
 ```
 
+Optionally set `optimizer.muon_update_scale` to multiply the shape-scaled Muon direction update. The default is `1.0`, preserving the original update; `0.5` halves it without directly scaling magnitude Adam or auxiliary AdamW learning rates. The value must be finite and nonnegative; `0.0` disables direction movement while magnitudes can still learn. This run-level value is read from the current config on resume and adds no optimizer checkpoint fields.
+
 Grouped expert tensors are treated as batches of independent matrices. AutoModel's grouped GEMM experts declare their `[expert, input, output]` storage layout so magnitude normalization follows output neurons. Linear weights use `[output, input]`. Embeddings, output heads, normalization parameters, and biases use the scalar optimizer. These groups also apply to `MuonConfig`, except that Muon does not learn neuron magnitudes.
 
 Muown selects communication groups from each parameter's DTensor placements, allowing dense FSDP weights and EP weights with a different FSDP mesh in one optimizer. A matrix may have one evenly sharded matrix axis plus sharded expert/batch axes. Sharding both matrix axes is unsupported. EP-local complete matrices are updated locally. Magnitude and direction states use the normal optimizer checkpoint path; FP32 master parameters are recommended.

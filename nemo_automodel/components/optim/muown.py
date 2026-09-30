@@ -256,6 +256,9 @@ class Muown(_MuonBase):
         nesterov: Enable Nesterov direction momentum.
         ns_steps: Newton-Schulz iteration count.
         ns_epsilon: Newton-Schulz normalization stabilizer.
+        muon_update_scale: Nonnegative multiplier for direction updates only.
+            Magnitude Adam and auxiliary AdamW/Lion updates are unchanged.
+            This run-level setting is read from config, including on resume.
         use_triton: Fuse local FP32 row updates on CUDA. Unsupported layouts,
             wide rows and input-feature shards retain the Torch implementation.
     """
@@ -273,6 +276,7 @@ class Muown(_MuonBase):
         nesterov: bool = True,
         ns_steps: int = 5,
         ns_epsilon: float = 1e-7,
+        muon_update_scale: float = 1.0,
         use_triton: bool = False,
     ) -> None:
         if not _HAS_DION:
@@ -283,6 +287,9 @@ class Muown(_MuonBase):
             raise ImportError("use_triton=True requires Triton.")
         if ns_steps < 1 or not isinstance(ns_steps, int) or ns_epsilon <= 0:
             raise ValueError("ns_steps must be a positive integer and ns_epsilon must be positive.")
+        if not math.isfinite(muon_update_scale) or muon_update_scale < 0:
+            raise ValueError("muon_update_scale must be finite and nonnegative.")
+        self.muon_update_scale = muon_update_scale
         super().__init__(
             params,
             distributed_mesh=distributed_mesh,
@@ -543,7 +550,7 @@ class Muown(_MuonBase):
         rows, cols = params[0].shape[-2:]
         if group["matrix_transposed"]:
             rows, cols = cols, rows
-        scale = 0.2 * math.sqrt(cols if rows == 3 * cols else max(rows, cols))
+        scale = self.muon_update_scale * 0.2 * math.sqrt(cols if rows == 3 * cols else max(rows, cols))
         beta1, beta2 = group["beta1"], group["beta2"]
         for param, state, direction, update, magnitude_grad, local_state in zip(
             params, states, directions, updates, magnitude_gradients, triton_states
