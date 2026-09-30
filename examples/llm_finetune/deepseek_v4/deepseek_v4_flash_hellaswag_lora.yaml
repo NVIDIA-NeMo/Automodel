@@ -57,6 +57,11 @@ model:
     num_nextn_predict_layers: 0
   trust_remote_code: false
   load_base_model: true
+  # Attention-only LoRA keeps the pretrained router state fixed. Retain the
+  # correction-bias buffer for base checkpoint loading, but disable its updates.
+  moe_overrides:
+    gate_bias_update_factor: 0.0
+    force_e_score_correction_bias: true
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: sdpa
