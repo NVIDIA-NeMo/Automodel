@@ -41,38 +41,25 @@ class _RetrievalProcessor(Protocol):
     ) -> dict[str, Any]: ...
 
 
-def _prepare_document(document: dict[str, Any], *, use_text_in_document: bool, use_images: bool) -> tuple[Any, str]:
-    """Apply content policy, normalizing missing images to None and blank text to an empty string."""
-    source_image = document.get("image")
-    if isinstance(source_image, str) and source_image == "":
-        source_image = None
-    image = source_image if use_images else None
+def _prepare_document(document: dict[str, Any]) -> tuple[Any, str]:
+    """Use all available document content, normalizing absent images and blank text."""
+    image = document.get("image")
+    if isinstance(image, str) and image == "":
+        image = None
     text = document.get("text")
-    if source_image is not None and not use_text_in_document:
-        text = ""
     title = document.get("title")
     if text and title:
         text = f"{title} {text}".strip()
     text = str(text) if text is not None and str(text).strip() else ""
     if image is None and not text:
         document_id = document.get("_mining_document_id", "<unknown>")
-        raise ValueError(
-            f"Document {document_id!r} has no encodable text or image under the configured multimodal mining policy."
-        )
+        raise ValueError(f"Document {document_id!r} has no encodable text or image.")
     return image, text
 
 
 @dataclass(frozen=True)
 class CheckpointMiningEncoderConfig:
-    """Checkpoint inference settings; omitted overrides preserve saved prompts and preprocessing."""
-
-    q_max_length: int | None = None
-    p_max_length: int | None = None
-    query_prefix: str | None = None
-    passage_prefix: str | None = None
-    image_longest_edge: int | None = None
-    use_text_in_document: bool = True
-    use_images: bool = True
+    """Build mining inference using the checkpoint's saved prompts and preprocessing."""
 
     def build(
         self,
@@ -116,21 +103,8 @@ class CheckpointMiningEncoderConfig:
                 trust_remote_code=trust_remote_code,
                 model_kwargs=model_kwargs,
             )
-            if self.image_longest_edge is not None:
-                image_processor = getattr(getattr(sentence_transformer[0], "processor", None), "image_processor", None)
-                if image_processor is None or "longest_edge" not in image_processor.size:
-                    raise ValueError("This SentenceTransformer checkpoint has no configurable image longest edge.")
-                image_processor.size["longest_edge"] = self.image_longest_edge
             logger.info("Using Sentence Transformers inference for mining checkpoint %s", model_name_or_path)
-            return SentenceTransformerMiningEncoder(
-                model=sentence_transformer,
-                q_max_length=self.q_max_length,
-                p_max_length=self.p_max_length,
-                query_prefix=self.query_prefix,
-                passage_prefix=self.passage_prefix,
-                use_text_in_document=self.use_text_in_document,
-                use_images=self.use_images,
-            )
+            return SentenceTransformerMiningEncoder(model=sentence_transformer)
 
         from nemo_automodel._transformers.auto_model import NeMoAutoModelBiEncoder
 
@@ -148,27 +122,14 @@ class CheckpointMiningEncoderConfig:
             raise ValueError("This checkpoint's backbone does not declare a supported retrieval processor.")
         module_name, class_name = processor_target.rsplit(".", 1)
         processor_class = getattr(import_module(module_name), class_name)
-        overrides = {
-            "q_max_length": self.q_max_length,
-            "p_max_length": self.p_max_length,
-            "query_prefix": self.query_prefix,
-            "passage_prefix": self.passage_prefix,
-            "image_longest_edge": self.image_longest_edge,
-        }
-        loading_options = {key: value for key, value in overrides.items() if value is not None}
+        loading_options = {}
         if model.config._commit_hash is not None:
             loading_options["revision"] = model.config._commit_hash
         processor = processor_class.from_pretrained(
             model.config.name_or_path or model.source_model_path, **loading_options
         )
         logger.info("Resolved checkpoint retrieval processor: %s", processor)
-        return CheckpointMiningEncoder(
-            model=model,
-            processor=processor,
-            device=device,
-            use_text_in_document=self.use_text_in_document,
-            use_images=self.use_images,
-        )
+        return CheckpointMiningEncoder(model=model, processor=processor, device=device)
 
 
 class CheckpointMiningEncoder:
@@ -180,15 +141,11 @@ class CheckpointMiningEncoder:
         model: torch.nn.Module,
         processor: _RetrievalProcessor,
         device: torch.device,
-        use_text_in_document: bool = True,
-        use_images: bool = True,
     ) -> None:
         """Keep the AutoModel backbone and its saved processor together for mining."""
         self.model: torch.nn.Module | None = model
         self.processor = processor
         self.device = device
-        self.use_text_in_document = use_text_in_document
-        self.use_images = use_images
 
     @property
     def pooling(self) -> str:
@@ -244,9 +201,7 @@ class CheckpointMiningEncoder:
         for start in range(0, len(documents), batch_size):
             processor_documents = []
             for document in documents[start : start + batch_size]:
-                image, text = _prepare_document(
-                    document, use_text_in_document=self.use_text_in_document, use_images=self.use_images
-                )
+                image, text = _prepare_document(document)
                 if isinstance(image, (bytes, bytearray, memoryview)):
                     image = {"bytes": bytes(image)}
                 processor_documents.append({"image": image, "text": text})
@@ -264,39 +219,18 @@ class CheckpointMiningEncoder:
 class SentenceTransformerMiningEncoder:
     """Adapt Sentence Transformers query/document inference to the mining corpus."""
 
-    def __init__(
-        self,
-        *,
-        model: Any,
-        q_max_length: int | None,
-        p_max_length: int | None,
-        query_prefix: str | None,
-        passage_prefix: str | None,
-        use_text_in_document: bool,
-        use_images: bool,
-    ) -> None:
-        """Keep runtime input policies separate from checkpoint-owned preprocessing."""
+    def __init__(self, *, model: Any) -> None:
+        """Keep the checkpoint's inference pipeline and its embedding metadata together."""
         self.model = model
-        self.q_max_length = q_max_length
-        self.p_max_length = p_max_length
-        self.query_prefix = query_prefix
-        self.passage_prefix = passage_prefix
-        self.use_text_in_document = use_text_in_document
-        self.use_images = use_images
         pooling = next((module.pooling_mode for module in model if hasattr(module, "pooling_mode")), None)
         self.pooling = "avg" if pooling == "mean" else pooling
         self.l2_normalize = any(type(module).__name__ == "Normalize" for module in model)
 
     def encode_queries(self, queries: list[str], *, batch_size: int) -> np.ndarray:
-        """Encode query strings with saved or explicitly overridden prompts."""
+        """Encode query strings with the checkpoint's saved prompts and sequence limits."""
         if self.model is None:
             raise RuntimeError("The multimodal mining model has already been released.")
-        options: dict[str, Any] = {}
-        if self.query_prefix is not None:
-            options["prompt"] = self.query_prefix
-        if self.q_max_length is not None:
-            options["processing_kwargs"] = {"text": {"max_length": self.q_max_length, "truncation": True}}
-        embeddings = np.asarray(self.model.encode_query(queries, batch_size=batch_size, **options), dtype=np.float32)
+        embeddings = np.asarray(self.model.encode_query(queries, batch_size=batch_size), dtype=np.float32)
         if embeddings.ndim != 2 or embeddings.shape[0] != len(queries) or not np.isfinite(embeddings).all():
             raise ValueError("Sentence Transformers must return one finite embedding per mining query.")
         return embeddings
@@ -307,9 +241,7 @@ class SentenceTransformerMiningEncoder:
             raise RuntimeError("The multimodal mining model has already been released.")
         groups: dict[str, list[tuple[int, Any]]] = {"text": [], "image": [], "message": []}
         for index, document in enumerate(documents):
-            image, text = _prepare_document(
-                document, use_text_in_document=self.use_text_in_document, use_images=self.use_images
-            )
+            image, text = _prepare_document(document)
             if isinstance(image, (bytes, bytearray, memoryview)):
                 with Image.open(BytesIO(image)) as decoded:
                     image = decoded.convert("RGB")
@@ -329,17 +261,12 @@ class SentenceTransformerMiningEncoder:
                 groups["image"].append((index, image))
             else:
                 groups["text"].append((index, text))
-        options: dict[str, Any] = {}
-        if self.passage_prefix is not None:
-            options["prompt"] = self.passage_prefix
-        if self.p_max_length is not None:
-            options["processing_kwargs"] = {"text": {"max_length": self.p_max_length, "truncation": True}}
         embeddings: list[np.ndarray | None] = [None] * len(documents)
         for group in groups.values():
             if not group:
                 continue
             group_embeddings = np.asarray(
-                self.model.encode_document([value for _, value in group], batch_size=batch_size, **options),
+                self.model.encode_document([value for _, value in group], batch_size=batch_size),
                 dtype=np.float32,
             )
             if (

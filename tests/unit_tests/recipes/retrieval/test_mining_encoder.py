@@ -99,8 +99,6 @@ def test_typed_config_owns_processor_construction(monkeypatch):
     config = ConfigNode(
         {
             "_target_": CheckpointMiningEncoderConfig,
-            "p_max_length": 2048,
-            "use_text_in_document": False,
         }
     ).instantiate()
 
@@ -116,12 +114,10 @@ def test_typed_config_owns_processor_construction(monkeypatch):
     encoder = config.build(model_name_or_path="/resolved-snapshot", device=torch.device("cpu"))
 
     assert encoder.processor is processor
-    assert encoder.use_text_in_document is False
-    assert from_pretrained.call_args.kwargs["p_max_length"] == 2048
-    from_pretrained.assert_called_once_with("/resolved-snapshot", p_max_length=2048)
+    from_pretrained.assert_called_once_with("/resolved-snapshot")
 
 
-def test_empty_prefix_is_an_explicit_override(monkeypatch):
+def test_checkpoint_processor_uses_pinned_revision(monkeypatch):
     load = MagicMock(return_value=_PixelProcessor())
     model = _PixelModel()
     model.model = SimpleNamespace(retrieval_processor_target="fixture.Processor")
@@ -132,8 +128,8 @@ def test_empty_prefix_is_an_explicit_override(monkeypatch):
         lambda _: SimpleNamespace(Processor=SimpleNamespace(from_pretrained=load)),
     )
     model.source_model_path = "/snapshot"
-    CheckpointMiningEncoderConfig(query_prefix="").build(model_name_or_path="/snapshot", device=torch.device("cpu"))
-    load.assert_called_once_with("org/model", query_prefix="", revision="pinned-sha")
+    CheckpointMiningEncoderConfig().build(model_name_or_path="/snapshot", device=torch.device("cpu"))
+    load.assert_called_once_with("org/model", revision="pinned-sha")
 
 
 def test_checkpoint_without_registered_processor_is_rejected(monkeypatch):
@@ -155,9 +151,7 @@ def test_sentence_transformer_checkpoint_is_selected_without_loading_automodel(t
         lambda _: (True, SimpleNamespace(SentenceTransformer=load)),
     )
 
-    encoder = CheckpointMiningEncoderConfig(q_max_length=32).build(
-        model_name_or_path=str(tmp_path), device=torch.device("cpu")
-    )
+    encoder = CheckpointMiningEncoderConfig().build(model_name_or_path=str(tmp_path), device=torch.device("cpu"))
 
     assert isinstance(encoder, SentenceTransformerMiningEncoder)
     assert encoder.pooling == "avg"
@@ -197,36 +191,25 @@ def test_cross_encoder_checkpoint_is_not_loaded_as_embedding_model(tmp_path, mon
     import_st.assert_not_called()
 
 
-def test_sentence_transformer_adapter_uses_saved_prompts_and_runtime_lengths():
+def test_sentence_transformer_adapter_preserves_checkpoint_inference_defaults():
     model = MagicMock()
     model.__iter__.return_value = iter([SimpleNamespace(pooling_mode="mean")])
     model.encode_query.return_value = np.ones((1, 2))
     model.encode_document.side_effect = [np.array([[1.0, 0.0]]), np.array([[0.0, 1.0]])]
     encoder = SentenceTransformerMiningEncoder(
         model=model,
-        q_max_length=32,
-        p_max_length=64,
-        query_prefix=None,
-        passage_prefix=None,
-        use_text_in_document=True,
-        use_images=True,
     )
 
     encoder.encode_queries(["question"], batch_size=1)
     embeddings = encoder.encode_documents([{"text": "text"}, {"text": "caption", "image": _png_bytes()}], batch_size=2)
 
-    model.encode_query.assert_called_once_with(
-        ["question"], batch_size=1, processing_kwargs={"text": {"max_length": 32, "truncation": True}}
-    )
+    model.encode_query.assert_called_once_with(["question"], batch_size=1)
     np.testing.assert_array_equal(embeddings, [[1.0, 0.0], [0.0, 1.0]])
     text_call, message_call = model.encode_document.call_args_list
     assert text_call.args[0] == ["text"]
     assert message_call.args[0][0][0]["content"][0]["image"].getpixel((0, 0)) == (255, 0, 0)
     assert message_call.args[0][0][0]["content"][1] == {"type": "text", "text": "caption"}
-    assert message_call.kwargs == {
-        "batch_size": 2,
-        "processing_kwargs": {"text": {"max_length": 64, "truncation": True}},
-    }
+    assert text_call.kwargs == message_call.kwargs == {"batch_size": 2}
 
 
 def test_pixels_change_same_text_embeddings_and_ranking_excludes_positive():
@@ -261,14 +244,12 @@ def test_pixels_change_same_text_embeddings_and_ranking_excludes_positive():
     assert negative_indices == [[1]]
 
 
-def test_image_only_and_mixed_documents_preserve_configured_content_policy():
+def test_image_only_and_mixed_documents_preserve_available_content():
     processor = _PixelProcessor()
     encoder = CheckpointMiningEncoder(
         model=_PixelModel(),
         processor=processor,
         device=torch.device("cpu"),
-        use_text_in_document=True,
-        use_images=True,
     )
 
     embeddings = encoder.encode_documents(
@@ -315,17 +296,16 @@ def test_binary_images_are_wrapped_for_the_strict_processor(binary_type):
     assert processor.documents == [{"text": "caption", "image": {"bytes": bytes(payload)}}]
 
 
-def test_policy_rejects_document_without_usable_text_or_image():
+def test_document_without_usable_text_or_image_is_rejected():
     encoder = CheckpointMiningEncoder(
         model=_PixelModel(),
         processor=_PixelProcessor(),
         device=torch.device("cpu"),
-        use_images=False,
     )
 
     with pytest.raises(ValueError, match="doc-7.*no encodable text or image"):
         encoder.encode_documents(
-            [{"_mining_document_id": "doc-7", "text": "", "image": 0.5}],
+            [{"_mining_document_id": "doc-7", "text": "", "image": None}],
             batch_size=1,
         )
 
@@ -392,12 +372,6 @@ def test_document_normalization_preserves_modalities_and_content(backend):
     else:
         encoder = SentenceTransformerMiningEncoder(
             model=model,
-            q_max_length=None,
-            p_max_length=None,
-            query_prefix=None,
-            passage_prefix=None,
-            use_text_in_document=True,
-            use_images=True,
         )
         model.encode_document.side_effect = [np.ones((1, 2)), np.ones((2, 2)), np.ones((1, 2))]
     image = Image.new("RGB", (2, 2))
@@ -431,11 +405,8 @@ def test_document_normalization_preserves_modalities_and_content(backend):
             ]
         ]
 
-    # Caption exclusion depends on the source image, even when images are disabled.
-    encoder.use_text_in_document = False
-    encoder.use_images = False
     with pytest.raises(ValueError, match="doc-7.*no encodable text or image"):
-        encoder.encode_documents([{"_mining_document_id": "doc-7", "image": image, "text": "caption"}], batch_size=1)
+        encoder.encode_documents([{"_mining_document_id": "doc-7", "image": "", "text": "  "}], batch_size=1)
 
 
 @pytest.mark.parametrize("backend", ["legacy", "native", "sentence_transformers"])
@@ -457,12 +428,6 @@ def test_recipe_unload_releases_model_and_preserves_metadata(backend):
             model[0].pooling_mode = "mean"
             encoder = SentenceTransformerMiningEncoder(
                 model=model,
-                q_max_length=None,
-                p_max_length=None,
-                query_prefix=None,
-                passage_prefix=None,
-                use_text_in_document=True,
-                use_images=True,
             )
         recipe.multimodal_encoder = encoder
         recipe._model_pooling = encoder.pooling

@@ -94,9 +94,7 @@ def test_native_mining_and_training_use_wikissnq_binary_pixels(tmp_path, monkeyp
     config = _tiny_mistral3_bidirectional_vlm_config()
     config.image_token_id = processor.image_token_id
     model = BiEncoderModel(Mistral3BidirectionalModel(config), pooling="avg", l2_normalize=True).eval()
-    encoder = CheckpointMiningEncoder(
-        model=model, processor=processor, device=torch.device("cpu"), use_text_in_document=False
-    )
+    encoder = CheckpointMiningEncoder(model=model, processor=processor, device=torch.device("cpu"))
     red_image = Image.new("RGB", (16, 16), (255, 0, 0))
     image_buffer = BytesIO()
     red_image.save(image_buffer, format="PNG")
@@ -145,14 +143,14 @@ def test_native_mining_and_training_use_wikissnq_binary_pixels(tmp_path, monkeyp
         },
         num_neg_docs=1,
         corpus_dict={corpus_id: CorpusInfo({"corpus_id": corpus_id}, corpus)},
-        use_text_in_document=False,
+        use_text_in_document=True,
     )
     training_batch = ProcessorMethodCollator(processor, "process_queries_documents_biencoder")([training_feature])
 
-    assert training_feature["doc_text"] == ["", ""]
+    assert training_feature["doc_text"] == ["literal", "literal"]
     assert training_feature["doc_image"][0].getpixel((0, 0)) == (255, 0, 0)
     assert training_batch["d_pixel_values"].shape[0] == 2
-    assert training_batch["passage_modality"].tolist() == [PassageModality.IMAGE_ONLY, PassageModality.IMAGE_ONLY]
+    assert training_batch["passage_modality"].tolist() == [PassageModality.IMAGE_TEXT, PassageModality.IMAGE_TEXT]
     document_inputs = {key[2:]: value for key, value in training_batch.items() if key.startswith("d_")}
     with torch.no_grad():
         training_embeddings = model(document_inputs).numpy()
@@ -506,18 +504,24 @@ def test_ministral3_biencoder_processor_saves_as_stock_pixtral_without_remote_co
     assert training_reload.tokenizer.backend_tokenizer.normalizer.normalize_str(marked_source) == source_with_zwnj
 
 
-@pytest.mark.parametrize("overrides", [{}, {"query_prefix": "", "passage_prefix": ""}, {"query_prefix": "Text:"}])
-def test_checkpoint_mining_restores_prompts_and_image_settings(tmp_path, overrides, monkeypatch):
+@pytest.mark.parametrize(
+    "saved_prompts",
+    [
+        {"query": "Document:", "document": "Image:"},
+        {"query": "", "document": ""},
+        {"query": "Text:", "document": "Image:"},
+    ],
+)
+def test_checkpoint_mining_restores_prompts_lengths_and_image_settings(tmp_path, saved_prompts, monkeypatch):
     """Actual saved metadata, not mining defaults, determines processor token IDs."""
     original = Mistral3BiEncoderProcessor(
         image_processor=PixtralImageProcessor(size={"longest_edge": 56}),
         tokenizer=FakePixtralTokenizer(),
         patch_size=14,
     )
+    original.tokenizer.model_max_length = 64
     original.save_pretrained(tmp_path)
-    (tmp_path / "config_sentence_transformers.json").write_text(
-        json.dumps({"prompts": {"query": "Document:", "document": "Image:"}})
-    )
+    (tmp_path / "config_sentence_transformers.json").write_text(json.dumps({"prompts": saved_prompts}))
     model = BiEncoderModel(Mistral3BidirectionalModel(_tiny_mistral3_bidirectional_vlm_config()))
     model.source_model_path = str(tmp_path)
     monkeypatch.setattr("nemo_automodel.recipes.retrieval.mining_encoder.cached_file", lambda *args, **kwargs: None)
@@ -525,15 +529,17 @@ def test_checkpoint_mining_restores_prompts_and_image_settings(tmp_path, overrid
         "nemo_automodel._transformers.auto_model.NeMoAutoModelBiEncoder.from_pretrained", lambda *args, **kwargs: model
     )
     loaded = (
-        CheckpointMiningEncoderConfig(**overrides)
-        .build(model_name_or_path=str(tmp_path), device=torch.device("cpu"))
-        .processor
+        CheckpointMiningEncoderConfig().build(model_name_or_path=str(tmp_path), device=torch.device("cpu")).processor
     )
-    expected_query = overrides.get("query_prefix", "Document:")
-    expected_passage = overrides.get("passage_prefix", "Image:")
+    expected_query = saved_prompts["query"]
+    expected_passage = saved_prompts["document"]
     assert loaded.query_prefix == expected_query
     assert loaded.passage_prefix == expected_passage
     assert loaded.image_longest_edge == 56
+    assert loaded.tokenizer.model_max_length == 64
+    long_text = "literal " * 128
+    assert loaded.process_queries([long_text])["input_ids"].shape == (1, 64)
+    assert loaded.process_documents([{"text": long_text, "image": None}])["input_ids"].shape == (1, 64)
     expected = Mistral3BiEncoderProcessor.from_pretrained(
         tmp_path, query_prefix=expected_query, passage_prefix=expected_passage
     )
@@ -1564,9 +1570,7 @@ def test_mistral3_vlm_exports_sentence_transformers_checkpoint(tmp_path, monkeyp
 
     image_bytes = BytesIO()
     image.save(image_bytes, format="PNG")
-    mining_encoder = CheckpointMiningEncoderConfig(q_max_length=64, p_max_length=64).build(
-        model_name_or_path=str(tmp_path), device=torch.device("cpu")
-    )
+    mining_encoder = CheckpointMiningEncoderConfig().build(model_name_or_path=str(tmp_path), device=torch.device("cpu"))
     np.testing.assert_allclose(
         mining_encoder.encode_queries(["Text query"], batch_size=1), actual_query.numpy(), atol=1e-5
     )

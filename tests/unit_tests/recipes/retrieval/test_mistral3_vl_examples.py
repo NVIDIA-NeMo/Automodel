@@ -72,11 +72,13 @@ def test_mistral3_vl_reranker_applies_temperature_once() -> None:
     assert config["model"]["temperature"] == 0.02
 
 
-def test_multimodal_mining_matches_embedding_image_text_policy() -> None:
-    """Example mining includes the same image and text content as embedding training."""
+def test_multimodal_mining_uses_checkpoint_defaults() -> None:
+    """The mining example selects checkpoint inference without preprocessing overrides."""
     training = yaml.safe_load(_EXAMPLES[0][0].read_text(encoding="utf-8"))
     mining_path = _REPO_ROOT / "examples/retrieval/data_utils/mining_multimodal_config.yaml"
     mining = yaml.safe_load(mining_path.read_text(encoding="utf-8"))
 
     assert training["dataset"]["use_text_in_document"] is True
-    assert mining["mining"]["multimodal_encoder"]["use_text_in_document"] is True
+    assert mining["mining"]["multimodal_encoder"] == {
+        "_target_": "nemo_automodel.recipes.retrieval.mining_encoder.CheckpointMiningEncoderConfig"
+    }

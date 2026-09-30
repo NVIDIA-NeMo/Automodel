@@ -268,8 +268,7 @@ def test_distributed_multimodal_chunk_fetches_only_rank_owned_documents(tmp_path
     assert result.shape == (0, 0)
 
 
-def test_mining_metadata_records_json_serializable_multimodal_config_and_disabled_cache_reuse(monkeypatch):
-    monkeypatch.setenv("MINING_TEST_PREFIX", "look up:")
+def test_mining_metadata_records_json_serializable_multimodal_config_and_disabled_cache_reuse():
     target = "nemo_automodel.recipes.retrieval.mining_encoder.CheckpointMiningEncoderConfig"
     cfg = ConfigNode(
         {
@@ -277,11 +276,6 @@ def test_mining_metadata_records_json_serializable_multimodal_config_and_disable
                 **_BASE_MINING,
                 "multimodal_encoder": {
                     "_target_": target,
-                    "query_prefix": "${oc.env:MINING_TEST_PREFIX}",
-                    "p_max_length": 4096,
-                    "image_longest_edge": 1284,
-                    "use_text_in_document": True,
-                    "use_images": True,
                 },
             }
         }
@@ -312,8 +306,9 @@ def test_mining_metadata_records_json_serializable_multimodal_config_and_disable
     assert recipe.model is None
     metadata = recipe._get_mining_args_dict()
 
-    assert metadata["multimodal_encoder"]["_target_"] == target
-    assert metadata["multimodal_encoder"]["query_prefix"] == "look up:"
+    assert metadata["multimodal_encoder"] == {"_target_": target}
+    for legacy_setting in ("query_prefix", "passage_prefix", "query_max_length", "passage_max_length"):
+        assert legacy_setting not in metadata
     assert metadata["cache_reuse"] is False
     auto_model.from_pretrained.assert_not_called()
     json.dumps(metadata)
@@ -326,7 +321,6 @@ def test_multimodal_mining_example_resolves_typed_encoder_without_downloads():
     encoder_config = cfg.mining.multimodal_encoder.instantiate()
 
     assert isinstance(encoder_config, CheckpointMiningEncoderConfig)
-    assert encoder_config.p_max_length == 4096
     assert cfg.mining.load_embeddings_from_cache is False
 
 

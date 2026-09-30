@@ -75,8 +75,8 @@ MINING_DEFAULTS = {
     "attn_implementation": None,  # None = use model default; "sdpa", "flash_attention_2", "eager"
     "trust_remote_code": False,
     "tokenizer_force_default": False,
-    # Optional typed, model-owned multimodal encoder config. Text-only behavior is
-    # unchanged when omitted.
+    # Optional checkpoint inference config; saved preprocessing settings are used.
+    # Legacy text-only behavior is unchanged when omitted.
     "multimodal_encoder": None,
 }
 
@@ -1171,7 +1171,7 @@ class MineHardNegativesRecipe:
         Returns:
             Dict containing all mining parameters for reproducibility.
         """
-        return {
+        metadata = {
             "train_qa_file_path": str(self.train_qa_file_path),
             "train_file_output_path": str(self.train_file_output_path),
             "cache_embeddings_dir": str(self.cache_embeddings_dir) if self.cache_embeddings_dir else None,
@@ -1183,24 +1183,28 @@ class MineHardNegativesRecipe:
             "document_embedding_batch_size": self.document_embedding_batch_size,
             "corpus_chunk_size": self.corpus_chunk_size,
             "use_negatives_from_file": self.use_negatives_from_file,
-            "query_prefix": self.query_prefix,
-            "passage_prefix": self.passage_prefix,
-            "query_max_length": self.query_max_length,
-            "passage_max_length": self.passage_max_length,
-            "add_bos_token": self.add_bos_token,  # None means "use Automodel tokenizer defaults"
-            "add_eos_token": self.add_eos_token,  # None means "use Automodel tokenizer defaults"
             "trust_remote_code": self.trust_remote_code,
-            "tokenizer_force_default": self.tokenizer_force_default,
             "multimodal_encoder": self.multimodal_encoder_config,
             "cache_reuse": self.load_embeddings_from_cache if self.multimodal_encoder is None else False,
             # Model info (loaded directly from path, not from config)
             "model_name_or_path": str(self.model_name_or_path),
-            "tokenizer_name_or_path": str(self.tokenizer_name_or_path),
             "pooling": self._model_pooling if hasattr(self, "_model_pooling") else self.model.pooling,
             "l2_normalize": self._model_l2_normalize
             if hasattr(self, "_model_l2_normalize")
             else self.model.l2_normalize,
         }
+        if self.multimodal_encoder is None:
+            metadata.update(
+                query_prefix=self.query_prefix,
+                passage_prefix=self.passage_prefix,
+                query_max_length=self.query_max_length,
+                passage_max_length=self.passage_max_length,
+                add_bos_token=self.add_bos_token,
+                add_eos_token=self.add_eos_token,
+                tokenizer_force_default=self.tokenizer_force_default,
+                tokenizer_name_or_path=str(self.tokenizer_name_or_path),
+            )
+        return metadata
 
     def _build_negative_docs_by_question_id(self) -> Dict[str, List[Dict[str, Any]]]:
         """Build mapping from question_id to mined negative documents with scores.
