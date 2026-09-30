@@ -134,7 +134,9 @@ jobs:
         run: |
           set -euo pipefail
           # Replace the helper, not the PR model/document data it inspects.
-          test -z "$(find pr-source/tests pr-source/examples pr-source/nemo_automodel -type l -print -quit)"
+          # Only inspect coverage inputs; unrelated source documentation may be symlinked.
+          test ! -L pr-source/nemo_automodel
+          test -z "$(find pr-source/tests pr-source/examples pr-source/nemo_automodel/_transformers -type l -print -quit)"
           test -z "$(find pr-source/docs -type l -print -quit)"
           cp trusted-source/tests/ci_tests/utils/sync_model_coverage_tables.py \
             pr-source/tests/ci_tests/utils/sync_model_coverage_tables.py
