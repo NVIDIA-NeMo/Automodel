@@ -26,10 +26,7 @@ from nemo_automodel.components.distributed.activation_checkpointing import make_
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.qwen3_8_flash_next.model import Qwen3_8_FlashNextForConditionalGeneration
 from nemo_automodel.components.models.qwen3_8_flash_next.qsa import (
-    QSARouteReplayRecorder,
-    QSARouteSelection,
-    current_qsa_route_replay,
-    qsa_route_replay_scope,
+    qsa_route_replay,
 )
 from nemo_automodel.components.moe.parallelizer import _with_model_checkpoint_context
 from tests.unit_tests.models.qwen3_8_flash_next.test_qwen3_8_flash_next_model import (
@@ -90,34 +87,6 @@ def _wrap_layer_with_checkpoint(model: nn.Module, *, selective: bool) -> None:
     layers["0"] = checkpoint_wrapper(block, preserve_rng_state=True, context_fn=context_fn)
 
 
-def test_recorder_replays_in_order_then_reports_misses() -> None:
-    recorder = QSARouteReplayRecorder()
-    first = QSARouteSelection(selected_token_ids=torch.tensor([[[0]]], dtype=torch.int32), flex_mask=None)
-    second = QSARouteSelection(selected_token_ids=torch.tensor([[[1]]], dtype=torch.int32), flex_mask=None)
-    recorder.record(first)
-    recorder.record(second)
-    assert len(recorder) == 2
-    assert recorder.take() is first
-    assert recorder.take() is second
-    assert recorder.take() is None
-    assert recorder.replay_misses == 1
-    recorder.rewind()
-    assert recorder.take() is first
-
-
-def test_replay_scope_binds_and_restores_thread_state() -> None:
-    assert current_qsa_route_replay() is None
-    recorder = QSARouteReplayRecorder()
-    with qsa_route_replay_scope(recorder, "record"):
-        assert current_qsa_route_replay() == (recorder, "record")
-        with qsa_route_replay_scope(recorder, "replay"):
-            assert current_qsa_route_replay() == (recorder, "replay")
-        assert current_qsa_route_replay() == (recorder, "record")
-    assert current_qsa_route_replay() is None
-    with qsa_route_replay_scope(None, "record"):
-        assert current_qsa_route_replay() is None
-
-
 def test_parallelizer_hook_only_wraps_blocks_that_expose_it() -> None:
     plain = nn.Linear(2, 2)
     sentinel = object()
@@ -129,10 +98,10 @@ def test_parallelizer_hook_only_wraps_blocks_that_expose_it() -> None:
     assert callable(wrapped)
     forward_ctx, recompute_ctx = wrapped()
     with forward_ctx:
-        binding = current_qsa_route_replay()
+        binding = qsa_route_replay.current()
         assert binding is not None and binding[1] == "record"
     with recompute_ctx:
-        binding = current_qsa_route_replay()
+        binding = qsa_route_replay.current()
         assert binding is not None and binding[1] == "replay"
 
     disabled = _build_model(reuse_routes=False)

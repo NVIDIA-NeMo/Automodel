@@ -44,9 +44,8 @@ from nemo_automodel.components.models.qwen3_8_flash_next.flex_qsa import build_f
 from nemo_automodel.components.models.qwen3_8_flash_next.qsa import (
     QSARouteSelection,
     Qwen3_8_FlashNextQSAIndexer,
-    current_qsa_route_replay,
     qsa_gqa_attention,
-    qsa_route_replay_checkpoint_context_fn,
+    qsa_route_replay,
     qsa_route_selection_region,
 )
 from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextAttention
@@ -651,7 +650,7 @@ class Qwen3_8_FlashNextQSAAttention(Qwen3NextAttention):
             The route IDs ``[batch, sequence, attention_width]`` and, on the CUDA flex path,
             the FlexAttention mask built from them.
         """
-        replay = current_qsa_route_replay() if self.reuse_routes_on_recompute else None
+        replay = qsa_route_replay.current() if self.reuse_routes_on_recompute else None
         if replay is not None and replay[1] == "replay":
             cached = replay[0].take()
             if cached is not None:
@@ -773,7 +772,7 @@ class Qwen3_8_FlashNextDecoderLayer(nn.Module):
         self_attn = getattr(self, "self_attn", None)
         if self_attn is None or not getattr(self_attn, "reuse_routes_on_recompute", False):
             return context_fn
-        return qsa_route_replay_checkpoint_context_fn(context_fn)
+        return qsa_route_replay.checkpoint_context_fn(context_fn)
 
     def _expand_initial_streams(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Expand a one-stream decoder input into the persistent HC layout.
