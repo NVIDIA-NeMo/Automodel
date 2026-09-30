@@ -260,20 +260,25 @@ class TestDenseTextBackbone:
         assert metadata.cu_seqlens_cpu.tolist() == [0, 2, 4]
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_packed_metadata_uses_pinned_h2d_transfer(self):
+    def test_packed_metadata_uses_pinned_h2d_transfer(self, monkeypatch):
         packed_seq_ids = torch.tensor([[1, 1, 2, 2, 0]], dtype=torch.long, device="cuda")
-        torch.cuda.synchronize()
+        pinned_buffers = []
+        original_pin_memory = torch.Tensor.pin_memory
 
-        with torch.profiler.profile(
-            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
-        ) as profiler:
-            metadata = qwen3_5_packing.prepare_gated_delta_packed_metadata(None, packed_seq_ids)
-            torch.cuda.synchronize()
+        def capture_pinned_buffer(tensor):
+            pinned_buffer = original_pin_memory(tensor)
+            pinned_buffers.append(pinned_buffer)
+            return pinned_buffer
+
+        monkeypatch.setattr(torch.Tensor, "pin_memory", capture_pinned_buffer)
+        metadata = qwen3_5_packing.prepare_gated_delta_packed_metadata(None, packed_seq_ids)
 
         assert metadata is not None
-        operator_names = {event.key for event in profiler.key_averages()}
-        assert "Memcpy HtoD (Pinned -> Device)" in operator_names
-        assert "Memcpy HtoD (Pageable -> Device)" not in operator_names
+        assert len(pinned_buffers) == 1
+        assert pinned_buffers[0].is_pinned()
+        assert pinned_buffers[0].numel() == metadata.indices.numel() + metadata.cu_seqlens.numel()
+        assert metadata.indices.tolist() == [0, 1, 2, 3]
+        assert metadata.cu_seqlens.tolist() == [0, 2, 4]
 
     def test_builds_expected_layer_types(self):
         cfg = _tiny_config(layer_types=("full_attention", "linear_attention"))
