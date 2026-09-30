@@ -324,8 +324,8 @@ def _run_scenario(
     assert_te_master_ownership()
 
     reference_params = dict(reference.named_parameters())
-    shard_world_size = mesh["dp_shard"].size() if world_size == 4 else world_size
-    shard_rank = mesh.get_local_rank(mesh_dim="dp_shard") if world_size == 4 else rank
+    shard_world_size = mesh["dp_shard"].size() if mesh.ndim == 2 else world_size
+    shard_rank = mesh.get_local_rank(mesh_dim="dp_shard") if mesh.ndim == 2 else rank
     for name, parameter in model.named_parameters():
         reference_name = name.replace("._checkpoint_wrapped_module", "")
         reference_parameter = reference_params[reference_name]
@@ -353,12 +353,18 @@ def main() -> None:
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
 
-    if world_size == 4:
+    hsdp_mesh_shape = os.getenv("HSDP_MESH_SHAPE")
+    if hsdp_mesh_shape:
+        mesh_shape = tuple(int(size) for size in hsdp_mesh_shape.split(","))
+        if len(mesh_shape) != 2 or mesh_shape[0] * mesh_shape[1] != world_size:
+            raise AssertionError(f"HSDP mesh shape {mesh_shape} does not match world_size={world_size}")
         mesh = init_device_mesh(
             "cuda",
-            (2, 2),
+            mesh_shape,
             mesh_dim_names=("dp_replicate", "dp_shard"),
         )
+    elif world_size == 4:
+        mesh = init_device_mesh("cuda", (2, 2), mesh_dim_names=("dp_replicate", "dp_shard"))
     else:
         mesh = init_device_mesh("cuda", (world_size,), mesh_dim_names=("dp",))
 
@@ -395,13 +401,17 @@ def main() -> None:
         if world_size == 4
         else Counter({"all_gather": 2, "reduce_scatter": 1, "all_reduce": 1})
     )
+    if hsdp_mesh_shape == "2,1":
+        # A trivial shard dimension replaces FSDP's reduce-scatter with an
+        # all-reduce; the replicated FP32 payload contributes the second one.
+        expected_nccl_kernel_counts = Counter({"all_reduce": 2})
     if profiled_counts != expected_nccl_kernel_counts:
         raise AssertionError(
             f"expected one FSDP unit to launch {dict(expected_nccl_kernel_counts)}, got {dict(profiled_counts)}"
         )
 
     if rank == 0:
-        mode = "HSDP" if world_size == 4 else "FSDP"
+        mode = "HSDP" if mesh.ndim == 2 else "FSDP"
         print(
             f"PASS: {len(scenarios)} {mode} dtype/ownership cases, "
             f"{sum(expected_nccl_kernel_counts.values())} profiled NCCL kernels, optimizer parity"

@@ -20,6 +20,6 @@ def test_fsdp_casting_ownership_profiles_expected_nccl_count() -> None:
     run_test_script("llm_pretrain_and_kd", "L2_FSDP_Casting_Ownership.sh")
 
 
-def test_hsdp_replicated_fp32_gradients_cover_both_mesh_dimensions() -> None:
-    """HSDP must synchronize replicated FP32 gradients over shard and replicate dimensions."""
+def test_hsdp_replicated_fp32_gradients_on_available_mesh() -> None:
+    """Check the replication dimension on two GPUs and both dimensions on four."""
     run_test_script("llm_pretrain_and_kd", "L2_HSDP_Casting_Ownership.sh")
