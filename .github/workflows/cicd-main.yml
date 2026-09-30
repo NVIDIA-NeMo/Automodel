@@ -95,6 +95,10 @@ jobs:
         run: |
           source ./venv/bin/activate
           uv run --active bandit -r app.py nemo_automodel examples scripts tools tutorials -t B614
+      - name: Reject unsafe NumPy load/save calls
+        run: |
+          source ./venv/bin/activate
+          uv run --active python tools/lint_numpy_pickle.py
       - name: Reject globals()
         run: |
           source ./venv/bin/activate
