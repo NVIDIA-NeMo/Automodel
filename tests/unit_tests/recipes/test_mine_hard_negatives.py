@@ -309,6 +309,7 @@ def test_mining_metadata_records_json_serializable_multimodal_config_and_disable
         auto_model.from_pretrained.return_value = model
         recipe.setup()
 
+    assert recipe.model is None
     metadata = recipe._get_mining_args_dict()
 
     assert metadata["multimodal_encoder"]["_target_"] == target

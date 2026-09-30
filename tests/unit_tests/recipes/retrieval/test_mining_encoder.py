@@ -14,7 +14,9 @@
 
 """CPU behavior tests for model-owned multimodal mining encoding."""
 
+import gc
 import json
+import weakref
 from io import BytesIO
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -378,3 +380,103 @@ def test_mining_preserves_checkpoint_dynamic_range(monkeypatch, dtype):
     expected = model.projection.weight.detach().float().numpy()[:, 0][None, :]
     np.testing.assert_array_equal(result, expected)
     assert np.isfinite(result).all()
+
+
+@pytest.mark.parametrize("backend", ["native", "sentence_transformers"])
+def test_document_normalization_preserves_modalities_and_content(backend):
+    model = MagicMock()
+    processor = MagicMock()
+    if backend == "native":
+        encoder = CheckpointMiningEncoder(model=_PixelModel(), processor=processor, device=torch.device("cpu"))
+        processor.process_documents.return_value = {"input_ids": torch.ones(4, 2)}
+    else:
+        encoder = SentenceTransformerMiningEncoder(
+            model=model,
+            q_max_length=None,
+            p_max_length=None,
+            query_prefix=None,
+            passage_prefix=None,
+            use_text_in_document=True,
+            use_images=True,
+        )
+        model.encode_document.side_effect = [np.ones((1, 2)), np.ones((2, 2)), np.ones((1, 2))]
+    image = Image.new("RGB", (2, 2))
+    documents = [
+        {"image": image, "text": None},
+        {"image": "", "text": "  passage  "},
+        {"image": image, "text": " \t "},
+        {"image": image, "text": "caption", "title": "Title"},
+    ]
+
+    embeddings = encoder.encode_documents(documents, batch_size=4)
+
+    assert embeddings.shape == (4, 2)
+    if backend == "native":
+        assert processor.process_documents.call_args.args[0] == [
+            {"image": image, "text": ""},
+            {"image": None, "text": "  passage  "},
+            {"image": image, "text": ""},
+            {"image": image, "text": "Title caption"},
+        ]
+    else:
+        text_call, image_call, message_call = model.encode_document.call_args_list
+        assert text_call.args[0] == ["  passage  "]
+        assert image_call.args[0] == [image, image]
+        assert message_call.args[0] == [
+            [
+                {
+                    "role": "user",
+                    "content": [{"type": "image", "image": image}, {"type": "text", "text": "Title caption"}],
+                }
+            ]
+        ]
+
+    # Caption exclusion depends on the source image, even when images are disabled.
+    encoder.use_text_in_document = False
+    encoder.use_images = False
+    with pytest.raises(ValueError, match="doc-7.*no encodable text or image"):
+        encoder.encode_documents([{"_mining_document_id": "doc-7", "image": image, "text": "caption"}], batch_size=1)
+
+
+@pytest.mark.parametrize("backend", ["legacy", "native", "sentence_transformers"])
+def test_recipe_unload_releases_model_and_preserves_metadata(backend):
+    recipe = MineHardNegativesRecipe(ConfigNode({}))
+    recipe.dist_env = SimpleNamespace(device=torch.device("cpu"), is_main=False)
+    model = torch.nn.Sequential(torch.nn.Linear(2, 2))
+    model.pooling_mode = "mean"
+    model.pooling = "avg"
+    model.l2_normalize = False
+    model_reference = weakref.ref(model)
+    parameter_reference = weakref.ref(next(model.parameters()))
+    if backend == "legacy":
+        recipe.model = model
+    else:
+        if backend == "native":
+            encoder = CheckpointMiningEncoder(model=model, processor=_PixelProcessor(), device=torch.device("cpu"))
+        else:
+            model[0].pooling_mode = "mean"
+            encoder = SentenceTransformerMiningEncoder(
+                model=model,
+                q_max_length=None,
+                p_max_length=None,
+                query_prefix=None,
+                passage_prefix=None,
+                use_text_in_document=True,
+                use_images=True,
+            )
+        recipe.multimodal_encoder = encoder
+        recipe._model_pooling = encoder.pooling
+        recipe._model_l2_normalize = encoder.l2_normalize
+    del model
+
+    recipe._unload_model()
+    recipe._unload_model()
+    gc.collect()
+
+    assert model_reference() is None
+    assert parameter_reference() is None
+    assert recipe._model_pooling == "avg"
+    assert recipe._model_l2_normalize is False
+    if backend != "legacy":
+        with pytest.raises(RuntimeError, match="already been released"):
+            encoder.encode_queries(["question"], batch_size=1)

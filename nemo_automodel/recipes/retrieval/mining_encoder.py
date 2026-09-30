@@ -41,20 +41,20 @@ class _RetrievalProcessor(Protocol):
     ) -> dict[str, Any]: ...
 
 
-def _prepare_document(document: dict[str, Any], *, use_text_in_document: bool, use_images: bool) -> tuple[Any, Any]:
-    """Apply the same mining content policy for both inference backends."""
+def _prepare_document(document: dict[str, Any], *, use_text_in_document: bool, use_images: bool) -> tuple[Any, str]:
+    """Apply content policy, normalizing missing images to None and blank text to an empty string."""
     source_image = document.get("image")
-    source_has_image = source_image is not None and not (isinstance(source_image, str) and source_image == "")
+    if isinstance(source_image, str) and source_image == "":
+        source_image = None
     image = source_image if use_images else None
     text = document.get("text")
-    if source_has_image and not use_text_in_document:
+    if source_image is not None and not use_text_in_document:
         text = ""
     title = document.get("title")
     if text and title:
         text = f"{title} {text}".strip()
-    has_image = image is not None and not (isinstance(image, str) and image == "")
-    has_text = text is not None and str(text).strip() != ""
-    if not has_image and not has_text:
+    text = str(text) if text is not None and str(text).strip() else ""
+    if image is None and not text:
         document_id = document.get("_mining_document_id", "<unknown>")
         raise ValueError(
             f"Document {document_id!r} has no encodable text or image under the configured multimodal mining policy."
@@ -255,8 +255,10 @@ class CheckpointMiningEncoder:
         return np.concatenate(embeddings, axis=0)
 
     def release_model(self) -> None:
-        """Release the encoder's model reference after embedding generation."""
-        self.model = None
+        """Move the model to CPU and release it after embedding generation; safe to repeat."""
+        if self.model is not None:
+            self.model.cpu()
+            self.model = None
 
 
 class SentenceTransformerMiningEncoder:
@@ -311,9 +313,7 @@ class SentenceTransformerMiningEncoder:
             if isinstance(image, (bytes, bytearray, memoryview)):
                 with Image.open(BytesIO(image)) as decoded:
                     image = decoded.convert("RGB")
-            has_image = image is not None and not (isinstance(image, str) and image == "")
-            has_text = text is not None and str(text).strip() != ""
-            if has_image and has_text:
+            if image is not None and text:
                 groups["message"].append(
                     (
                         index,
@@ -325,7 +325,7 @@ class SentenceTransformerMiningEncoder:
                         ],
                     )
                 )
-            elif has_image:
+            elif image is not None:
                 groups["image"].append((index, image))
             else:
                 groups["text"].append((index, text))
@@ -353,5 +353,7 @@ class SentenceTransformerMiningEncoder:
         return np.stack(embeddings)
 
     def release_model(self) -> None:
-        """Release the Sentence Transformers model after embedding generation."""
-        self.model = None
+        """Move the model to CPU and release it after embedding generation; safe to repeat."""
+        if self.model is not None:
+            self.model.cpu()
+            self.model = None

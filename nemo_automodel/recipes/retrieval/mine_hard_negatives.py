@@ -291,7 +291,6 @@ class MineHardNegativesRecipe:
                 trust_remote_code=self.trust_remote_code,
                 attn_implementation=self.attn_implementation,
             )
-            self.model = self.multimodal_encoder.model
             self._model_pooling = self.multimodal_encoder.pooling
             self._model_l2_normalize = self.multimodal_encoder.l2_normalize
 
@@ -1023,24 +1022,16 @@ class MineHardNegativesRecipe:
         Model metadata (pooling, l2_normalize) is extracted before unloading
         to ensure it's available for output generation.
         """
-        if self.model is None:
-            return
-
-        # Extract metadata needed for output before unloading
-        if not hasattr(self, "_model_pooling"):
-            self._model_pooling = self.model.pooling
-            self._model_l2_normalize = self.model.l2_normalize
-
-        logger.info("Unloading model to free GPU memory for mining...")
-
-        # Move model to CPU first (safer cleanup)
-        self.model = self.model.cpu()
         if self.multimodal_encoder is not None:
             self.multimodal_encoder.release_model()
-
-        # Delete model reference
-        del self.model
-        self.model = None
+        elif self.model is not None:
+            # Preserve legacy text-model metadata before releasing the model.
+            self._model_pooling = self.model.pooling
+            self._model_l2_normalize = self.model.l2_normalize
+            self.model.cpu()
+            self.model = None
+        else:
+            return
 
         # Clear CUDA cache
         torch.cuda.empty_cache()
