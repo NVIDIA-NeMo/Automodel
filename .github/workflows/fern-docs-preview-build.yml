@@ -40,6 +40,9 @@ on:
 permissions:
   contents: read
 
+env:
+  FERN_NO_VERSION_REDIRECTION: "true"
+
 jobs:
   collect:
     runs-on: ubuntu-latest

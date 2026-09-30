@@ -25,6 +25,9 @@ permissions:
   actions: read
   pull-requests: write
 
+env:
+  FERN_NO_VERSION_REDIRECTION: "true"
+
 jobs:
   preview:
     runs-on: ubuntu-latest
