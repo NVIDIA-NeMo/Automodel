@@ -138,6 +138,10 @@ ci:
     tokenizer_name: deepseek-ai/DeepSeek-V4-Flash
     trust_remote_code: true
     hf_device_map_auto: true
+    # The HF reference uses one 8-GPU node. Reserve room for the 8 GiB expert
+    # concatenation and allow CPU overflow while loading the full bf16 model.
+    hf_device_map_max_memory_gib: 60
+    hf_device_map_cpu_max_memory_gib: 256
     # EP32 sparse routing is inside the shared relaxed envelope; the separate
     # vanilla-HF reload gate remains enabled so reference-load regressions still fail.
     parity_tolerance_profile: relaxed
