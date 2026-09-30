@@ -20,7 +20,7 @@ from collections.abc import Callable
 from contextlib import contextmanager
 from functools import lru_cache
 from types import FunctionType
-from typing import TYPE_CHECKING, Any, Dict, Generator, List, Protocol, Sequence, Tuple, Union, runtime_checkable
+from typing import TYPE_CHECKING, Any, Dict, Generator, List, Sequence, Tuple, Union
 
 import torch
 from torch import nn
@@ -1102,26 +1102,9 @@ def _discover_layer_groups(model: nn.Module) -> Dict[str, List[nn.Module]]:
     return groups
 
 
-@runtime_checkable
-class _ModelLayerGroupProvider(Protocol):
-    """Model-owned block discovery used by sharding and activation checkpointing."""
-
-    def get_model_layer_groups(self) -> dict[str, list[nn.Module]]:
-        """Return role-to-block mappings with each block listed once in forward order."""
-        ...
-
-
 def _extract_model_layer_groups(model: nn.Module) -> Dict[str, List[nn.Module]]:
     """Extract transformer layers grouped by model role."""
     model_cls = type(model)
-    if model_cls.__name__ in {"BiEncoderModel", "CrossEncoderModel", "FSDPBiEncoderModel", "FSDPCrossEncoderModel"}:
-        inner_model = getattr(model, "model", None)
-        if isinstance(inner_model, nn.Module):
-            return _extract_model_layer_groups(inner_model)
-
-    if isinstance(model, _ModelLayerGroupProvider):
-        return model.get_model_layer_groups()
-
     layer_group_specs = getattr(model, "parallel_layer_groups", None)
 
     layer_groups: Dict[str, List[nn.Module]] = {}

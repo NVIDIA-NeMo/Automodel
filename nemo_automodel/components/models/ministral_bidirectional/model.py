@@ -237,17 +237,6 @@ class Mistral3BidirectionalModel(Mistral3Model):
         """
         return config.get_text_config().model_type in {"ministral3", "ministral3_bidirec"}
 
-    def get_model_layer_groups(self) -> dict[str, list[nn.Module]]:
-        """Return the model-owned transformer blocks for sharding and checkpointing.
-
-        Returns:
-            Language and vision blocks in their forward execution order.
-        """
-        return {
-            "language": list(self.language_model.layers),
-            "vision": list(self.vision_tower.transformer.layers),
-        }
-
     def get_hf_export_config(self) -> Mistral3Config:
         """Return the stock Transformers config used for portable inference export.
 
@@ -540,14 +529,6 @@ class Mistral3VLBidirectionalForSequenceClassification(Mistral3PreTrainedModel):
             Whether the checkpoint can use this scoring backbone.
         """
         return Mistral3BidirectionalModel.supports_config(config)
-
-    def get_model_layer_groups(self) -> dict[str, list[nn.Module]]:
-        """Return the backbone's ordered language and vision transformer blocks.
-
-        Returns:
-            Model-owned layer groups for sharding and activation checkpointing.
-        """
-        return self.model.get_model_layer_groups()
 
     @dataclass(frozen=True)
     class ModelCapabilities:

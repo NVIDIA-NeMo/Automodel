@@ -59,6 +59,7 @@ from nemo_automodel.components.checkpoint.addons import ConsolidatedHFAddon, _ma
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
 from nemo_automodel.components.datasets.llm.retrieval_collator import ProcessorMethodCollator
 from nemo_automodel.components.datasets.llm.retrieval_dataset import CorpusInfo, _transform_func, load_corpus
+from nemo_automodel.components.distributed.parallelizer import get_model_layer_groups
 from nemo_automodel.components.models.ministral_bidirectional.model import (
     Ministral3BidirectionalConfig,
     Ministral3BidirectionalModel,
@@ -1829,14 +1830,17 @@ def test_mistral3_native_mistral_tower_keeps_stock_dispatch(tmp_path: Path) -> N
 
 
 @pytest.mark.parametrize("reranker", [False, True])
-def test_mistral3_model_owns_layer_groups(reranker: bool) -> None:
-    """Real model-owned groups expose both towers without generic family paths."""
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_mistral3_layer_discovery_through_retrieval_wrappers(reranker: bool, wrapped: bool) -> None:
+    """Generic discovery returns every real tower block in order, with or without retrieval wrappers."""
     config = _tiny_mistral3_bidirectional_vlm_config()
     model_class = Mistral3VLBidirectionalForSequenceClassification if reranker else Mistral3BidirectionalModel
     assert model_class.supports_config(config)
     model = model_class(config)
     backbone = model.model if reranker else model
-    assert model.get_model_layer_groups() == {
+    if wrapped:
+        model = CrossEncoderModel(model) if reranker else BiEncoderModel(model)
+    assert get_model_layer_groups(model) == {
         "language": list(backbone.language_model.layers),
         "vision": list(backbone.vision_tower.transformer.layers),
     }
