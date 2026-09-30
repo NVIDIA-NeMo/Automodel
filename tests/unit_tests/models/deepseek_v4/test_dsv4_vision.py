@@ -711,3 +711,30 @@ def test_vision_norm_fsdp_policy_preserves_bf16_activation_dtype(
     assert all(policy.reduce_dtype == torch.float32 for policy in norm_policies)
     assert all(policy.output_dtype is None for policy in norm_policies)
     assert all(policy.cast_forward_inputs is False for policy in norm_policies)
+
+
+def test_fp32_islands_are_selected_once_under_activation_checkpoint_wrappers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An AC wrapper around a vision norm owns the norm's parameters; shard them once, via the wrapper."""
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
+
+    tower = DeepseekV4VisionTransformer(_vision_config(torch_dtype="bfloat16"))
+    for block in tower.blocks:
+        block.norm1 = checkpoint_wrapper(block.norm1)
+        block.norm2 = checkpoint_wrapper(block.norm2)
+    calls = []
+
+    def fake_fully_shard(module, **kwargs):
+        calls.append(module)
+        return module
+
+    monkeypatch.setattr(dsv4_fsdp, "fully_shard", fake_fully_shard)
+    policy = torch.distributed.fsdp.MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
+    dsv4_fsdp.fully_shard_deepseek_v4(tower, mesh=object(), mp_policy=policy, offload_policy=None)
+
+    islands = calls[:-1]
+    assert calls[-1] is tower
+    assert all(block.norm1 in islands and block.norm2 in islands for block in tower.blocks)
+    assert not any(block.norm1._checkpoint_wrapped_module in islands for block in tower.blocks)
+    assert tower.norm in islands
+    island_param_ids = [id(param) for island in islands for param in island.parameters()]
+    assert len(island_param_ids) == len(set(island_param_ids))
