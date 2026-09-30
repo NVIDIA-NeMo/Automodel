@@ -1,6 +1,6 @@
 ---
 title: "Llama (Bidirectional) for Reranking"
-description: ""
+description: "Llama bidirectional reranking models in NeMo AutoModel, including attention mode, recipes, and Hugging Face checkpoints."
 slug: model-coverage/reranking-models/nvidia/llama-bidirectional
 ---
 
@@ -20,7 +20,8 @@ For the bi-encoder variant, see [Llama (Bidirectional) for Embedding](/model-cov
 Any Llama checkpoint can be loaded as a bidirectional reranking backbone. The following configurations have been tested:
 
 - **Llama 3.2 1B** — fast iteration, fits on a single GPU
-- **Llama 3.1 8B** — higher-quality reranking for production use
+- **Llama 3.2 1B**: Fast iteration, fits on a single GPU
+- **Llama 3.1 8B**: Higher-quality reranking for production use
 
 ## Reranking Models
 
@@ -41,7 +42,7 @@ The cross-encoder path is used for pairwise relevance scoring and reranking.
 
 | Recipe | Description |
 |---|---|
-| [llama3_2_1b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/cross_encoder/llama3_2_1b.yaml) | Cross-encoder — Llama 3.2 1B reranker |
+| [llama3_2_1b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/cross_encoder/llama3_2_1b.yaml) | Cross-encoder, Llama 3.2 1B reranker |
 
 ## Try with NeMo AutoModel
 
@@ -69,7 +70,7 @@ docker run --gpus all -it --rm \
   nvcr.io/nvidia/nemo-automodel:26.04.00
 ```
 
-**2. Navigate to the AutoModel directory** (where the recipes are):
+**2. Navigate to `/opt/Automodel`** (where the recipes are):
 
 ```bash
 cd /opt/Automodel
@@ -92,6 +93,6 @@ See the [Embedding and Reranking Fine-Tuning Guide](/recipes-e2e-examples/retrie
 
 ## Hugging Face Model Cards
 
-NVIDIA trained and released the `Llama Nemotron Reranking 1B` model, optimized to produce a relevance logit score indicating how well a document matches a given query. The model was fine-tuned with a bidirectional attention mechanism for multilingual and cross-lingual question–answer retrieval, with support for long documents (up to 8,192 tokens).
+NVIDIA trained and released the `Llama Nemotron Reranking 1B` model, optimized to produce a relevance logit score indicating how well a document matches a given query. The model was fine-tuned with a bidirectional attention mechanism for multilingual and cross-lingual question-answer retrieval, with support for long documents (up to 8,192 tokens).
 
 - [nvidia/llama-nemotron-rerank-1b-v2](https://huggingface.co/nvidia/llama-nemotron-rerank-1b-v2)
