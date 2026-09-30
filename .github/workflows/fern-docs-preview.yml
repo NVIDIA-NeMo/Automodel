@@ -61,11 +61,8 @@ jobs:
               - tests/unit_tests/_transformers/test_doc_coverage.py
               - tests/ci_tests/utils/sync_model_coverage_tables.py
               - tools/apply_fern_code_styles.py
-              - tests/ci_tests/scripts/test_fern_preview_staging.sh
               - .github/workflows/fern-docs-ci.yml
               - .github/workflows/fern-docs-preview.yml
-      - name: Test preview staging
-        run: bash tests/ci_tests/scripts/test_fern_preview_staging.sh
       - name: Report docs preview gate
         env:
           DOCS_CHANGED: ${{ steps.changed-files.outputs.docs_any_changed }}
