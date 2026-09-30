@@ -335,6 +335,15 @@ def ensure_fsdp_ops_sac_ignored() -> None:
     # flat communication buffer. When forward prefetch has already unsharded
     # the parameters, these setup ops occur only during recomputation. They do
     # not produce model activations: the FSDP copy ops populate the allocations.
+    #
+    # Parameters sharded on a non-zero dim (``fsdp_placement.dim != 0``, e.g.
+    # MoE expert weights under an expert-parallel FSDP shard axis) take a second
+    # copy-out path in ``foreach_all_gather_copy_out``: ``torch.chunk`` (which
+    # dispatches as ``aten.split.Tensor``) followed by ``torch.cat(..., out=)``
+    # into the unsharded parameter. Those two ops are parameter management as
+    # well and otherwise fail SAC replay with ``aten.split.Tensor encountered
+    # during backward but not found in storage`` whenever the expert unit is
+    # resharded between forward and recompute (per-microbatch gradient sync).
     ignore_sac_ops(
         list(
             map(
@@ -348,6 +357,8 @@ def ensure_fsdp_ops_sac_ignored() -> None:
                     "aten.empty.memory_format",
                     "aten.empty_like",
                     "aten.view",
+                    "aten.split.Tensor",
+                    "aten.cat.out",
                 ],
             )
         )

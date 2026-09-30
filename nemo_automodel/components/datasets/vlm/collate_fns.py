@@ -1770,6 +1770,16 @@ def packed_sequence_thd_vlm_collater(
         if tensors:
             result[key] = torch.cat(tensors, dim=0)
 
+    # Preserve the pack-to-media mapping for pipeline-parallel microbatching.
+    # A packed row can contain multiple original image/video samples, so the
+    # flat media tensors cannot be split from the text batch dimension alone.
+    image_counts = [int(x.get("n_images", 0)) for x in batch]
+    video_counts = [int(x.get("n_videos", 0)) for x in batch]
+    if any(count > 0 for count in image_counts):
+        result["n_images_per_sample"] = torch.tensor(image_counts, dtype=torch.long)
+    if any(count > 0 for count in video_counts):
+        result["n_videos_per_sample"] = torch.tensor(video_counts, dtype=torch.long)
+
     return result
 
 

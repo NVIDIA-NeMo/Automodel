@@ -117,12 +117,15 @@ class DeepseekV41Block(nn.Module):
         self.ffn = MoE(moe_config, backend)
         # V4.1 uses exactly V4's modality-aware score routing with hash routing
         # disabled. The shared MoE keeps ownership of gate, experts and dispatch.
-        self.ffn.gate = DeepseekV4VisionGate(
-            DeepseekV4Config(vocab_size=config.vocab_size),
-            moe_config,
-            gate_precision=torch.float32,
-            hash_routing=False,
-        )
+        # As in DeepSeek-V4, BackendConfig.fake_balanced_gate keeps the
+        # FakeBalancedGate that MoE built (benchmark forced balance).
+        if not backend.fake_balanced_gate:
+            self.ffn.gate = DeepseekV4VisionGate(
+                DeepseekV4Config(vocab_size=config.vocab_size),
+                moe_config,
+                gate_precision=torch.float32,
+                hash_routing=False,
+            )
         norm = (
             partial(initialize_rms_norm_module, "te", device=self.attn.wq_a.weight.device)
             if backend.rms_norm == "te"
@@ -205,8 +208,10 @@ class DeepseekV41Block(nn.Module):
         hidden_states = self.attn_hc.expand(attended.hidden_states, hidden_states, attn_mix)
         ffn_mix = self.ffn_hc(hidden_states)
         collapsed = self.ffn_hc.collapse(hidden_states, attn_mix.pre)
-        vision_types = None if image_mask is None else image_mask.to(torch.int32) - 1
-        self.ffn.gate.set_routing_context(None, vision_types)
+        gate = self.ffn.gate
+        if isinstance(gate, DeepseekV4VisionGate):
+            vision_types = None if image_mask is None else image_mask.to(torch.int32) - 1
+            gate.set_routing_context(None, vision_types)
         padding_mask = None if attention_mask is None else ~attention_mask.bool()
         output = self.ffn(self.ffn_norm(collapsed), padding_mask)
         hidden_states = self.ffn_hc.expand(output, hidden_states, ffn_mix)
@@ -716,7 +721,8 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
             layer.ffn_hc.reset_parameters(std)
             nn.init.ones_(layer.attn_norm.weight)
             nn.init.ones_(layer.ffn_norm.weight)
-            layer.ffn.gate.bias_vl.zero_()
+            if isinstance(layer.ffn.gate, DeepseekV4VisionGate):
+                layer.ffn.gate.bias_vl.zero_()
             layer.attn.reset_parameters(std)
             if layer.engram is not None:
                 layer.engram.init_weights()

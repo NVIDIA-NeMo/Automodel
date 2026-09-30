@@ -61,6 +61,7 @@ _PIPELINE_OUTPUT_TYPES = {
     "FluxPipeline": "image",
     "Flux2Pipeline": "image",
     "QwenImagePipeline": "image",
+    "QwenImage21Pipeline": "image",
     "WanPipeline": "video",
     "HunyuanVideoPipeline": "video",
     "HunyuanVideo15Pipeline": "video",

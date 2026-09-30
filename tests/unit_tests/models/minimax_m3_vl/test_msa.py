@@ -279,21 +279,27 @@ def test_deterministic_algorithms_are_rejected_before_any_kernel_runs() -> None:
         torch.use_deterministic_algorithms(False)
 
 
-@pytest.mark.timeout(130)
+@pytest.mark.runtime_budget(
+    15,
+    hard_timeout=130,
+    reason="Starts a fresh Python process and imports torch plus the full model package.",
+)
 def test_optional_dependencies_are_lazy() -> None:
     # Importing the model package and building a microbatch must not touch the msa extra;
     # test_msa_import_guard covers the error a host without the extra gets at the first kernel call.
+    # Do not reject cutlass or quack here: TE 2.19 imports its FA4 backend when FA4 is installed,
+    # and that backend legitimately imports both without loading any model-private MSA kernels.
     # A fresh child must import torch and Automodel; revisit this exception when that cold start
-    # reliably fits the default 5s unit-test timeout in the CI container. The pytest budget must
+    # reliably fits the default 5s unit-test budget in the CI container. The hard timeout must
     # exceed subprocess.run's 120s limit so it can terminate the child first.
     script = """
 import sys
 import torch
-class RejectGpuImports:
+class RejectMsaImports:
     def find_spec(self, fullname, path=None, target=None):
-        if fullname.split(".")[0] in {"fmha_sm100", "cutlass", "quack"}:
+        if fullname.split(".")[0] == "fmha_sm100":
             raise AssertionError(fullname)
-sys.meta_path.insert(0, RejectGpuImports())
+sys.meta_path.insert(0, RejectMsaImports())
 from nemo_automodel.components.models.minimax_m3_vl import model, msa
 microbatch = msa.MSAMicrobatch.from_document_map(torch.ones(1, 8, dtype=torch.int64), forced_blocks=(0, 1))
 assert microbatch.cu_seqlens.tolist() == [0, 8]

@@ -15,7 +15,7 @@ model:
   attn_implementation: sdpa
   backend:
     _target_: nemo_automodel.components.models.common.utils.BackendConfig
-    experts: gmm
+    experts: torch_mm
     dispatcher: deepep
 distributed:
   _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
@@ -89,7 +89,7 @@ ci:
   checkpoint_robustness:
     tokenizer_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
     experts_implementation: grouped_mm
-    # EP8 GMM/DeepEP self-repeats are exact; only independent-process AutoModel reload
+    # EP8 torch_mm/DeepEP self-repeats are exact; only independent-process AutoModel reload
     # mean KL measured 0.003142, just above the standard 0.003 threshold.
     parity_threshold_overrides:
       automodel_reload:
