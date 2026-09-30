@@ -23,32 +23,31 @@ def _as_float(value: Any) -> float | None:
         return None
 
 
-def _group_ratios(optimizer: Optimizer) -> list[tuple[float, float]]:
-    """Return each param group's ``(lr, weight_decay)`` as a ratio to group 0's.
+def _set_group_mults(optimizer: Optimizer) -> None:
+    """Store each param group's constructed ``lr`` / ``weight_decay`` as ``lr_mult`` / ``wd_mult`` relative to group 0.
 
-    :meth:`OptimizerParamScheduler.step` rewrites every group's ``lr`` and ``weight_decay``, so a group built
-    with its own values (a no-decay group, a separate head LR) would otherwise be reset to the base schedule.
-    ``LRSchedulerConfig.build`` reads the schedule's base values from group 0, so each group keeps its ratio
-    to group 0 instead. A group that already carries ``lr_mult`` (or a per-group ``max_lr`` / ``min_lr``) or
-    ``wd_mult`` is scaled by those keys alone, as before, and a zero or non-numeric value gives a ratio of 1.0.
+    :meth:`OptimizerParamScheduler.step` rewrites every group's ``lr`` and ``weight_decay`` from the schedule, so a
+    group built with its own values (a no-decay group, a separate head LR) would otherwise be reset to the base
+    schedule. ``LRSchedulerConfig.build`` reads the schedule's base values from group 0, so each group keeps its ratio
+    to group 0 as a multiplier. The multipliers live in the param groups, so they are saved with the optimizer and
+    restored on resume instead of being recomputed from the resumed run's config.
+
+    A group that already carries ``lr_mult`` (or a per-group ``max_lr`` / ``min_lr``) or ``wd_mult`` keeps it
+    unchanged. Every other group, group 0 included, gets both keys so the saved param-group layout does not depend
+    on which groups happen to differ from group 0. The multiplier is 1.0 when group 0's value is zero or non-numeric
+    (e.g. relative-step Adafactor's ``lr=None``).
 
     Args:
         optimizer: Optimizer whose param groups still hold their constructed values.
-
-    Returns:
-        One ``(lr_ratio, wd_ratio)`` pair per param group, in param-group order.
     """
-    groups = optimizer.param_groups
-    base_lr = _as_float(groups[0]["lr"])
-    base_wd = _as_float(groups[0].get("weight_decay", 0.0))
-    ratios = []
-    for group in groups:
+    base_lr = _as_float(optimizer.param_groups[0]["lr"])
+    base_wd = _as_float(optimizer.param_groups[0].get("weight_decay", 0.0))
+    for group in optimizer.param_groups:
         lr, wd = _as_float(group["lr"]), _as_float(group.get("weight_decay", 0.0))
-        lr_is_explicit = "lr_mult" in group or "max_lr" in group or "min_lr" in group
-        lr_ratio = lr / base_lr if base_lr and lr is not None and not lr_is_explicit else 1.0
-        wd_ratio = wd / base_wd if base_wd and wd is not None and "wd_mult" not in group else 1.0
-        ratios.append((lr_ratio, wd_ratio))
-    return ratios
+        if "lr_mult" not in group and "max_lr" not in group and "min_lr" not in group:
+            group["lr_mult"] = lr / base_lr if base_lr and lr is not None else 1.0
+        if "wd_mult" not in group:
+            group["wd_mult"] = wd / base_wd if base_wd and wd is not None else 1.0
 
 
 class OptimizerParamScheduler:
@@ -151,10 +150,8 @@ class OptimizerParamScheduler:
         if self.override_opt_param_scheduler:
             assert not self.use_checkpoint_opt_param_scheduler, "both override and use-checkpoint are set."
 
-        # Read each group's own lr / weight_decay before step(0) overwrites them. The ratios live only on the
-        # scheduler: param groups and state_dict() gain no keys, so the optimizer checkpoint layout is unchanged
-        # and checkpoints saved before this change still load under DCP's strict load planner.
-        self._group_ratios = _group_ratios(optimizer)
+        # Record each group's own lr / weight_decay as multipliers before step(0) overwrites them.
+        _set_group_mults(optimizer)
 
         # Set the learning rate
         self.step(0)
@@ -291,20 +288,17 @@ class OptimizerParamScheduler:
         """
         Set lr and weight decay for all parameter groups.
 
-        Each group gets the scheduled value times its ``lr_mult`` / ``wd_mult`` and times the ratio of its
-        constructed ``lr`` / ``weight_decay`` to group 0's (see :func:`_group_ratios`).
+        Each group gets the scheduled value times its ``lr_mult`` / ``wd_mult`` (see :func:`_set_group_mults`).
 
         Args:
             increment (int): number of steps to increment
         """
         self.num_steps += increment
         new_wd = self.get_wd()
-        for idx, param_group in enumerate(self.optimizer.param_groups):
-            # A group added after the scheduler was built has no recorded ratio and follows the base schedule.
-            lr_ratio, wd_ratio = self._group_ratios[idx] if idx < len(self._group_ratios) else (1.0, 1.0)
+        for param_group in self.optimizer.param_groups:
             new_lr = self.get_lr(param_group)
-            param_group["lr"] = new_lr * param_group.get("lr_mult", 1.0) * lr_ratio
-            param_group["weight_decay"] = new_wd * param_group.get("wd_mult", 1.0) * wd_ratio
+            param_group["lr"] = new_lr * param_group.get("lr_mult", 1.0)
+            param_group["weight_decay"] = new_wd * param_group.get("wd_mult", 1.0)
 
     def state_dict(self) -> dict[str, Any]:
         """

@@ -447,14 +447,11 @@ def _grouped_adamw_with_scheduler() -> tuple[nn.Module, torch.optim.AdamW, Optim
 
 
 @pytest.mark.parametrize("native", [False, True], ids=["flattened", "native"])
-def test_optimizer_checkpoint_without_group_ratios_resumes_with_them(tmp_path, native):
+def test_optimizer_checkpoint_restores_group_mults(tmp_path, native):
     model, optimizer, scheduler = _grouped_adamw_with_scheduler()
     model(torch.ones(1, 2)).sum().backward()
     optimizer.step()
     scheduler.step(1)
-    # Checkpoints saved before the scheduler kept group ratios hold group 0's lr / weight_decay in every group.
-    for group in optimizer.param_groups:
-        group["lr"], group["weight_decay"] = 1e-3, 0.1
     checkpointer = Checkpointer(
         CheckpointingConfig(
             checkpoint_dir=tmp_path, model_save_format="safetensors", save_consolidated=False, is_peft=native
@@ -467,9 +464,14 @@ def test_optimizer_checkpoint_without_group_ratios_resumes_with_them(tmp_path, n
     checkpointer.save_optimizer(optimizer, model, str(tmp_path), [scheduler])
 
     resumed_model, resumed_optimizer, resumed_scheduler = _grouped_adamw_with_scheduler()
+    # A different head lr in the resumed run must not change the saved multiplier.
+    for group in resumed_optimizer.param_groups:
+        group["lr_mult"] = 1.0
     checkpointer.load_optimizer(resumed_optimizer, resumed_model, str(tmp_path), [resumed_scheduler])
 
     assert resumed_scheduler.num_steps == 1
+    assert [g["lr_mult"] for g in resumed_optimizer.param_groups] == pytest.approx([1.0, 1.0, 5.0])
+    assert [g["wd_mult"] for g in resumed_optimizer.param_groups] == pytest.approx([1.0, 0.0, 0.0])
     assert [g["weight_decay"] for g in resumed_optimizer.param_groups] == pytest.approx([0.1, 0.0, 0.0])
     assert [g["lr"] for g in resumed_optimizer.param_groups] == pytest.approx([1e-3, 1e-3, 5e-3])
     _assert_adam_states_equal(resumed_optimizer, optimizer)

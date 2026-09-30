@@ -1134,24 +1134,29 @@ def test_group_added_after_construction_follows_the_base_schedule():
     assert late_group["weight_decay"] == scheduler.get_wd()
 
 
-def test_group_ratios_add_no_param_group_or_state_dict_keys():
+def test_group_mults_are_stored_in_the_param_groups():
     optimizer = _optimizer_with_own_group_values()
-    group_keys = [set(group) for group in optimizer.param_groups]
-    scheduler = _cosine_scheduler(optimizer)
-    scheduler.step(5)
+    _cosine_scheduler(optimizer)
 
-    # Optimizer checkpoints store every param-group key and the scheduler state, and DCP loads them strictly,
-    # so a key added here would make every checkpoint saved before it fail to resume.
-    assert [set(group) for group in optimizer.param_groups] == group_keys
-    assert set(scheduler.state_dict()) == {
-        "max_lr",
-        "lr_warmup_steps",
-        "num_steps",
-        "lr_decay_style",
-        "lr_decay_steps",
-        "min_lr",
-        "start_wd",
-        "end_wd",
-        "wd_incr_style",
-        "wd_incr_steps",
-    }
+    # Stored in the param groups, the multipliers are saved with the optimizer and restored on resume.
+    assert [g["lr_mult"] for g in optimizer.param_groups] == pytest.approx([1.0, 1.0, 10.0])
+    assert [g["wd_mult"] for g in optimizer.param_groups] == pytest.approx([1.0, 0.0, 0.0])
+
+
+def test_restored_group_mults_win_over_the_resumed_config():
+    optimizer = _optimizer_with_own_group_values()
+    scheduler = _cosine_scheduler(optimizer)
+    scheduler.step(50)
+    saved_optimizer, saved_scheduler = optimizer.state_dict(), scheduler.state_dict()
+
+    # The resumed run doubles group 0's lr, which alone would halve the derived head multiplier.
+    resumed = _optimizer_with_own_group_values()
+    resumed.param_groups[0]["lr"] = 2e-3
+    resumed_scheduler = _cosine_scheduler(resumed)
+    resumed.load_state_dict(saved_optimizer)
+    resumed_scheduler.load_state_dict(saved_scheduler)
+
+    assert [g["lr"] for g in resumed.param_groups] == pytest.approx([g["lr"] for g in optimizer.param_groups])
+    assert [g["weight_decay"] for g in resumed.param_groups] == pytest.approx(
+        [g["weight_decay"] for g in optimizer.param_groups]
+    )
