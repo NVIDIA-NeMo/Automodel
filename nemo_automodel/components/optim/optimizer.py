@@ -428,6 +428,7 @@ class MuownConfig(_DionConfigBase):
     nesterov: bool = True
     ns_steps: int = 5
     ns_epsilon: float = 1e-7
+    use_triton: bool = False
 
     def _make_optimizer(self, param_groups: list[dict[str, Any]], ctor_kwargs: dict[str, Any]) -> torch.optim.Optimizer:
         """Construct Muown using the tensor-layout contract documented on Muown."""

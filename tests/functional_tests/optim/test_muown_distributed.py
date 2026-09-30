@@ -41,19 +41,19 @@ def _assert_parameters(actual, expected, atol=2e-5):
         torch.testing.assert_close(value, right, atol=atol, rtol=2e-5)
 
 
-def _worker(rank, world_size, port, checkpoint_dir):
+def _worker(rank, world_size, port, checkpoint_dir, use_triton=False):
     os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port))
     torch.cuda.set_device(rank)
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
     try:
         with torch._dynamo.config.patch(disable=True):
-            _check_mixed_meshes(world_size, checkpoint_dir)
-            _check_fsdp_training()
+            _check_mixed_meshes(world_size, checkpoint_dir, use_triton)
+            _check_fsdp_training(use_triton)
     finally:
         dist.destroy_process_group()
 
 
-def _check_mixed_meshes(world_size, checkpoint_dir):
+def _check_mixed_meshes(world_size, checkpoint_dir, use_triton=False):
     mesh = init_device_mesh("cuda", (world_size,), mesh_dim_names=("dp",))
     expert_mesh = init_device_mesh("cuda", (world_size // 2, 2), mesh_dim_names=("edp", "ep"))
     for axis in (1, 2):
@@ -93,7 +93,7 @@ def _check_mixed_meshes(world_size, checkpoint_dir):
                 }
             )
 
-        def optimizer_for(model: nn.ParameterDict) -> Muown:
+        def optimizer_for(model: nn.ParameterDict, *, fused: bool = False) -> Muown:
             """Construct one optimizer for the sharded_copy parameter contract."""
             return Muown(
                 [
@@ -103,10 +103,11 @@ def _check_mixed_meshes(world_size, checkpoint_dir):
                 ],
                 distributed_mesh=mesh,
                 weight_decay=0.1,
+                use_triton=fused,
             )
 
         model = sharded_copy(reference)
-        optimizer = optimizer_for(model)
+        optimizer = optimizer_for(model, fused=use_triton)
         ref_optimizer = optimizer_for(reference)
         # Use AM's exact stateful wrapper, including the untouched-parameter skeleton.
         for step in range(6):
@@ -117,7 +118,7 @@ def _check_mixed_meshes(world_size, checkpoint_dir):
                 for p, old in zip(model.parameters(), before):
                     torch.testing.assert_close(p.to_local(), old.to_local(), atol=0, rtol=0)
                 restored_model = sharded_copy(reference)
-                restored_optimizer = optimizer_for(restored_model)
+                restored_optimizer = optimizer_for(restored_model, fused=use_triton)
                 dcp.load({"optimizer": OptimizerState(restored_model, restored_optimizer)}, checkpoint_id=path)
                 # Weight checkpoints are orthogonal to optimizer row-state serialization.
                 with torch.no_grad():
@@ -140,6 +141,25 @@ def _check_mixed_meshes(world_size, checkpoint_dir):
                     torch.testing.assert_close(p.to_local(), restored.to_local(), atol=0, rtol=0)
         assert optimizer.state[model["unused"]]["muown_step"] == 0
 
+    # A global [3d, d] QKV matrix loses that ratio in its output shard.
+    # The fused local update must retain the global QKV learning-rate scale.
+    for transposed in (False, True):
+        torch.manual_seed(73)
+        value = torch.randn(96, 32, device="cuda")
+        if transposed:
+            value = value.mT.contiguous()
+        expected = nn.Parameter(value.clone())
+        placement = [Shard(1 if transposed else 0)]
+        actual = nn.Parameter(distribute_tensor(value, mesh, placement))
+        actual_optimizer = Muown([{"params": [actual], "matrix_transposed": transposed}], use_triton=use_triton)
+        reference_optimizer = Muown([{"params": [expected], "matrix_transposed": transposed}])
+        for _ in range(3):
+            expected.grad = torch.randn_like(expected)
+            actual.grad = distribute_tensor(expected.grad.clone(), mesh, placement)
+            actual_optimizer.step()
+            reference_optimizer.step()
+            torch.testing.assert_close(actual.full_tensor(), expected, atol=2e-5, rtol=2e-5)
+
     uneven = nn.Parameter(distribute_tensor(torch.randn(2 * world_size + 1, 8, device="cuda"), mesh, [Shard(0)]))
     with pytest.raises(ValueError, match="evenly sharded"):
         Muown([uneven])
@@ -157,17 +177,17 @@ def _check_mixed_meshes(world_size, checkpoint_dir):
     torch.manual_seed(100 + dist.get_rank())
     local = nn.Parameter(torch.randn(32, 48, device="cuda"))
     expected = nn.Parameter(local.detach().clone())
-    actual_optimizer = Muown([local], distributed_mesh=mesh)
+    actual_optimizer = Muown([local], distributed_mesh=mesh, use_triton=use_triton)
     expected_optimizer = Muown([expected])
     for _ in range(3):
         local.grad = torch.randn_like(local)
         expected.grad = local.grad.clone()
         actual_optimizer.step()
         expected_optimizer.step()
-        torch.testing.assert_close(local, expected, atol=0, rtol=0)
+        torch.testing.assert_close(local, expected, atol=2e-5 if use_triton else 0, rtol=2e-5 if use_triton else 0)
 
 
-def _check_fsdp_training():
+def _check_fsdp_training(use_triton=False):
     torch.manual_seed(41)
     reference = nn.Sequential(nn.Linear(16, 32), nn.GELU(), nn.Linear(32, 8)).cuda()
     model = nn.Sequential(nn.Linear(16, 32), nn.GELU(), nn.Linear(32, 8)).cuda()
@@ -176,8 +196,8 @@ def _check_fsdp_training():
     fully_shard(model[0], mesh=mesh)
     fully_shard(model[2], mesh=mesh)
     fully_shard(model, mesh=mesh)
-    optimizer = MuownConfig(weight_decay=0.1).build(model, device_mesh=mesh)[0]
-    reference_optimizer = MuownConfig(weight_decay=0.1).build(reference)[0]
+    optimizer = MuownConfig(weight_decay=0.1, use_triton=use_triton).build(model, device_mesh=mesh)[0]
+    reference_optimizer = MuownConfig(weight_decay=0.1, use_triton=use_triton).build(reference)[0]
     for _ in range(4):
         inputs = torch.randn(8 * dist.get_world_size(), 16, device="cuda")
         local_inputs = inputs.chunk(dist.get_world_size())[dist.get_rank()]
@@ -195,8 +215,9 @@ def _check_fsdp_training():
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA devices")
-def test_muown_fsdp_ep_checkpoint(tmp_path):
+@pytest.mark.parametrize("use_triton", [False, True])
+def test_muown_fsdp_ep_checkpoint(tmp_path, use_triton):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
-    mp.spawn(_worker, args=(2, port, str(tmp_path)), nprocs=2, join=True)
+    mp.spawn(_worker, args=(2, port, str(tmp_path), use_triton), nprocs=2, join=True)

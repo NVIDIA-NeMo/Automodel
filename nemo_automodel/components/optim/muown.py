@@ -32,6 +32,7 @@ from torch.distributed.tensor import DeviceMesh, DTensor, Replicate
 from torch.optim import Optimizer
 from torch.optim.optimizer import ParamsT
 
+from nemo_automodel.components.optim import muown_triton
 from nemo_automodel.shared.import_utils import safe_import
 
 _HAS_DION, _dion = safe_import("dion")
@@ -81,6 +82,10 @@ def _row_norm(value: Tensor, axis: int, epsilon: float) -> Tensor:
         for i, placement in enumerate(value.placements)
     )
     norm = _row_sum(norm_input.square(), axis).sqrt() if input_sharded else norm_input.norm(dim=axis, keepdim=True)
+    # A size-one input shard may still produce _NormPartial in DTensor. Resolve
+    # it before callers mutate the norm in place, just as _row_sum does.
+    if isinstance(norm, DTensor) and any(p.is_partial() for p in norm.placements):
+        norm = norm.redistribute(placements=[Replicate() if p.is_partial() else p for p in norm.placements])
     return (norm.clamp_min(epsilon) if epsilon else norm).to(value.dtype)
 
 
@@ -251,6 +256,8 @@ class Muown(_MuonBase):
         nesterov: Enable Nesterov direction momentum.
         ns_steps: Newton-Schulz iteration count.
         ns_epsilon: Newton-Schulz normalization stabilizer.
+        use_triton: Fuse local FP32 row updates on CUDA. Unsupported layouts,
+            wide rows and input-feature shards retain the Torch implementation.
     """
 
     def __init__(
@@ -266,11 +273,14 @@ class Muown(_MuonBase):
         nesterov: bool = True,
         ns_steps: int = 5,
         ns_epsilon: float = 1e-7,
+        use_triton: bool = False,
     ) -> None:
         if not _HAS_DION:
             raise ImportError(
                 "Muown requires the optional Dion dependency. Install the existing optional dependency with uv sync --extra dev."
             )
+        if use_triton and not muown_triton.HAVE_TRITON:
+            raise ImportError("use_triton=True requires Triton.")
         if ns_steps < 1 or not isinstance(ns_steps, int) or ns_epsilon <= 0:
             raise ValueError("ns_steps must be a positive integer and ns_epsilon must be positive.")
         super().__init__(
@@ -289,6 +299,7 @@ class Muown(_MuonBase):
             group.setdefault("matrix_transposed", False)
             group.setdefault("ns_steps", ns_steps)
             group.setdefault("ns_epsilon", ns_epsilon)
+            group.setdefault("use_triton", use_triton)
             if group["algorithm"] == "adamw":
                 group["fused"] = True
             if not isinstance(group["ns_steps"], int) or group["ns_steps"] < 1 or group["ns_epsilon"] <= 0:
@@ -455,8 +466,41 @@ class Muown(_MuonBase):
         """
         axis = -2 if group["matrix_transposed"] else -1
         states = [self.state[param] for param in params]
-        directions, updates, magnitude_gradients = [], [], []
+        directions, updates, magnitude_gradients, triton_states = [], [], [], []
         for param, state in zip(params, states):
+            local_state = None
+            if group.get("use_triton", False) and shard_dim != axis % param.ndim:
+                tensors = (
+                    param.detach(),
+                    param.grad,
+                    state["momentum"],
+                    state["g"],
+                    state["v_norm"],
+                    state["m_g"],
+                    state["v_g"],
+                )
+                local_tensors = tuple(t.to_local() if isinstance(t, DTensor) else t for t in tensors)
+                if muown_triton._supported(local_tensors, group["matrix_transposed"]):
+                    local_state = local_tensors
+            triton_states.append(local_state)
+            if local_state is not None:
+                weight, gradient, momentum, magnitude, norm, _, _ = local_state
+                direction, update, magnitude_grad = muown_triton._prepare(
+                    weight,
+                    gradient,
+                    momentum,
+                    magnitude,
+                    norm,
+                    transposed=group["matrix_transposed"],
+                    mu=group["mu"],
+                    epsilon=group["epsilon"],
+                    nesterov=group["nesterov"],
+                )
+                torch.autograd.graph.increment_version(state["momentum"])
+                directions.append(direction)
+                updates.append(update)
+                magnitude_gradients.append(magnitude_grad)
+                continue
             direction, magnitude_grad, direction_grad = _prepare_direction(
                 param.detach(), _nonzero_magnitude(state["g"], group["epsilon"]), state["v_norm"], param.grad, axis
             )
@@ -501,9 +545,32 @@ class Muown(_MuonBase):
             rows, cols = cols, rows
         scale = 0.2 * math.sqrt(cols if rows == 3 * cols else max(rows, cols))
         beta1, beta2 = group["beta1"], group["beta2"]
-        for param, state, direction, update, magnitude_grad in zip(
-            params, states, directions, updates, magnitude_gradients
+        for param, state, direction, update, magnitude_grad, local_state in zip(
+            params, states, directions, updates, magnitude_gradients, triton_states
         ):
+            if local_state is not None:
+                weight, _, _, magnitude, norm, first_moment, second_moment = local_state
+                state["muown_step"] += 1
+                muown_triton._finish(
+                    weight,
+                    magnitude,
+                    norm,
+                    first_moment,
+                    second_moment,
+                    direction,
+                    update,
+                    magnitude_grad,
+                    transposed=group["matrix_transposed"],
+                    lr=group["lr"],
+                    scale=scale,
+                    beta1=beta1,
+                    beta2=beta2,
+                    step=state["muown_step"],
+                    epsilon=group["epsilon"],
+                    weight_decay=group["weight_decay"],
+                )
+                torch.autograd.graph.increment_version([param, state["g"], state["v_norm"], state["m_g"], state["v_g"]])
+                continue
             local_direction = direction.to_local() if isinstance(direction, DTensor) else direction
             # add_ applies the scalar in the master-weight dtype. A separate
             # BF16 multiply would introduce another low-precision rounding.
