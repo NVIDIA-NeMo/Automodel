@@ -446,7 +446,11 @@ class BackendConfig:
             non-blocking mode with output buffers sized to the first microbatch's permuted row
             count times this factor (EP-group max, 4-token aligned) instead of letting every
             dispatch drain the compute stream to read the exact count. Overflow trips a
-            device-side assert. None (default) keeps the blocking reference path. Not supported
+            device-side assert. None (default) keeps the blocking reference path. The capacity is
+            calibrated once per communication manager from its first real batch and kept for the
+            run; with ``dispatcher_share_token_dispatcher=True`` (default) that is one calibration,
+            taken on the first local MoE layer's first microbatch, for every layer, so choose a factor
+            that covers the largest routing skew expected across layers and batches. Not supported
             for experts with ``expert_bias`` (``GroupedExpertsDeepEP`` rejects the combination).
         dispatcher_equal_token_counts: HybridEP only. Declare that every EP rank dispatches the
             same row count, so the per-dispatch EP-group max all-reduce (and its host sync)
@@ -518,11 +522,12 @@ class BackendConfig:
     dispatcher_num_sms: int = 20
     dispatcher_share_token_dispatcher: bool = True
     dispatcher_async_dispatch: bool = False
-    # HybridEP only, dynamic routing: after one blocking calibration dispatch per MoE layer, size every
-    # later dispatch's output buffers to ceil(calibrated rows x factor) (EP-group max, aligned) and run
-    # HybridEP in its non-blocking mode. Removes the per-dispatch compute-stream drain that HybridEP's
-    # blocking mode needs to learn the permuted row count (and the per-layer barrier it implies); an
-    # overflow of the capacity trips a device-side assert instead of silently truncating. None = blocking.
+    # HybridEP only, dynamic routing: after one blocking calibration dispatch per communication manager (one
+    # for all layers when the dispatcher is shared, the default), size every later dispatch's output buffers
+    # to ceil(calibrated rows x factor) (EP-group max, aligned) and run HybridEP in its non-blocking mode.
+    # Removes the per-dispatch compute-stream drain that HybridEP's blocking mode needs to learn the permuted
+    # row count (and the per-layer barrier it implies); an overflow of the capacity trips a device-side assert
+    # instead of silently truncating. None = blocking.
     # Rejected by GroupedExpertsDeepEP for expert_bias experts (the bias add sizes itself from the buffer rows).
     dispatcher_capacity_factor: float | None = None
     # HybridEP only: every EP rank dispatches the same number of rows (fixed-shape batches, which is
