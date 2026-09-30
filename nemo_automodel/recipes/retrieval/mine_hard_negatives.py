@@ -270,33 +270,30 @@ class MineHardNegativesRecipe:
         # Validate required parameters
         self._validate_mining_params()
 
-        # Load model directly from checkpoint path
-        # This loads the saved model without requiring architecture config
         logger.info(f"Loading encoder model from {self.model_name_or_path}...")
-        model_kwargs = {
-            "use_liger_kernel": False,  # Not needed for inference
-            "use_sdpa_patching": True,
-        }
-        if self.trust_remote_code:
-            model_kwargs["trust_remote_code"] = True
-        if self.attn_implementation is not None:
-            model_kwargs["attn_implementation"] = self.attn_implementation
-        self.model = NeMoAutoModelBiEncoder.from_pretrained(
-            self.model_name_or_path,
-            **model_kwargs,
-        )
-        self.model = self.model.to(self.dist_env.device)
-        self.model.eval()
-
-        # A configured multimodal encoder owns processor construction. The legacy
-        # text path continues to construct the tokenizer exactly as before.
         multimodal_encoder_cfg = self._get_mining_param("multimodal_encoder")
         if multimodal_encoder_cfg is None:
+            model_kwargs = {"use_liger_kernel": False, "use_sdpa_patching": True}
+            if self.trust_remote_code:
+                model_kwargs["trust_remote_code"] = True
+            if self.attn_implementation is not None:
+                model_kwargs["attn_implementation"] = self.attn_implementation
+            self.model = NeMoAutoModelBiEncoder.from_pretrained(self.model_name_or_path, **model_kwargs)
+            self.model = self.model.to(self.dist_env.device)
+            self.model.eval()
             self._configure_tokenizer()
         else:
             self.multimodal_encoder_config = multimodal_encoder_cfg.to_yaml_dict(resolve_env=True)
             encoder_config = multimodal_encoder_cfg.instantiate()
-            self.multimodal_encoder = encoder_config.build(model=self.model, device=self.dist_env.device)
+            self.multimodal_encoder = encoder_config.build(
+                model_name_or_path=self.model_name_or_path,
+                device=self.dist_env.device,
+                trust_remote_code=self.trust_remote_code,
+                attn_implementation=self.attn_implementation,
+            )
+            self.model = self.multimodal_encoder.model
+            self._model_pooling = self.multimodal_encoder.pooling
+            self._model_l2_normalize = self.multimodal_encoder.l2_normalize
 
         # Load dataset and corpus
         self._load_data()

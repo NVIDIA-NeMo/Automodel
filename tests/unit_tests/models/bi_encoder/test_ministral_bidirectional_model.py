@@ -46,6 +46,7 @@ pytest.importorskip("transformers.models.ministral3", reason="Ministral3 not ava
 from transformers.models.ministral3.modeling_ministral3 import Ministral3Model as HFMinistral3Model
 from transformers.models.mistral3.modeling_mistral3 import Mistral3Model
 
+from nemo_automodel._transformers.mining import CheckpointMiningEncoder, CheckpointMiningEncoderConfig
 from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel._transformers.retrieval import (
     BiEncoderModel,
@@ -58,7 +59,6 @@ from nemo_automodel.components.checkpoint.addons import ConsolidatedHFAddon, _ma
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
 from nemo_automodel.components.datasets.llm.retrieval_collator import ProcessorMethodCollator
 from nemo_automodel.components.datasets.llm.retrieval_dataset import CorpusInfo, _transform_func, load_corpus
-from nemo_automodel._transformers.mining import CheckpointMiningEncoder, CheckpointMiningEncoderConfig
 from nemo_automodel.components.models.ministral_bidirectional.model import (
     Ministral3BidirectionalConfig,
     Ministral3BidirectionalModel,
@@ -1554,6 +1554,28 @@ def test_mistral3_vlm_exports_sentence_transformers_checkpoint(tmp_path, monkeyp
     torch.testing.assert_close(torch.linalg.vector_norm(actual, dim=-1), torch.ones(1))
     torch.testing.assert_close(actual, expected)
 
+    image_bytes = BytesIO()
+    image.save(image_bytes, format="PNG")
+    mining_encoder = CheckpointMiningEncoderConfig(q_max_length=64, p_max_length=64).build(
+        model_name_or_path=str(tmp_path), device=torch.device("cpu")
+    )
+    np.testing.assert_allclose(
+        mining_encoder.encode_queries(["Text query"], batch_size=1), actual_query.numpy(), atol=1e-5
+    )
+    np.testing.assert_allclose(
+        mining_encoder.encode_documents(
+            [
+                {"text": "Text doc"},
+                {"image": image_bytes.getvalue()},
+                {"text": "Image doc", "image": image_bytes.getvalue()},
+            ],
+            batch_size=3,
+        ),
+        torch.cat((actual_text_document, actual_image_only, actual)).numpy(),
+        atol=1e-5,
+    )
+    mining_encoder.release_model()
+
     consolidated_dir = tmp_path / "consolidated"
     encoder.model.save_pretrained(consolidated_dir)
     ConsolidatedHFAddon().pre_save(
@@ -2027,10 +2049,12 @@ def test_mistral3_reranker_template_and_defaults_roundtrip(
         content = [{"type": "text", "text": feature["doc_text"]}]
         if feature["doc_image"]:
             content.append({"type": "image", "image": feature["doc_image"]})
-        messages.append([
-            {"role": "query", "content": [{"type": "text", "text": feature["question"]}]},
-            {"role": "document", "content": content},
-        ])
+        messages.append(
+            [
+                {"role": "query", "content": [{"type": "text", "text": feature["question"]}]},
+                {"role": "document", "content": content},
+            ]
+        )
     expected = restored.process_queries_documents_crossencoder(features)
     actual = restored.apply_chat_template(messages, tokenize=True, return_dict=True, return_tensors="pt")
     assert expected["input_ids"].shape[1] == 64
@@ -2039,7 +2063,9 @@ def test_mistral3_reranker_template_and_defaults_roundtrip(
         if value is not None:
             inference_value = actual[key][:, :64] if key in ("input_ids", "attention_mask") else actual[key]
             torch.testing.assert_close(inference_value, value, rtol=0, atol=0)
-    overridden = restored.apply_chat_template(messages, tokenize=True, return_dict=True, return_tensors="pt", max_length=128)
+    overridden = restored.apply_chat_template(
+        messages, tokenize=True, return_dict=True, return_tensors="pt", max_length=128
+    )
     assert overridden["input_ids"].shape[1] == 128
 
 

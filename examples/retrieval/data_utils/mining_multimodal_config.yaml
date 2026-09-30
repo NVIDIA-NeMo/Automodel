@@ -29,8 +29,9 @@ mining:
   train_file_output_path: null
 
   multimodal_encoder:
-    # Checkpoint selects its processor and supplies prompts, image preprocessing,
-    # pooling and normalization. Only runtime token budgets are overridden here.
+    # Sentence Transformers checkpoints use their saved inference pipeline;
+    # other checkpoints use AutoModel and their saved retrieval processor.
+    # Only runtime token budgets are overridden here.
     _target_: nemo_automodel._transformers.mining.CheckpointMiningEncoderConfig
     q_max_length: 512
     p_max_length: 4096

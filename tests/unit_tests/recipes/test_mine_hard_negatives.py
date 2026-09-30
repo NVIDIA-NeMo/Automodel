@@ -23,8 +23,8 @@ import numpy as np
 import pytest
 import torch
 
-from nemo_automodel.components.config.loader import ConfigNode, load_yaml_config
 from nemo_automodel._transformers.mining import CheckpointMiningEncoderConfig
+from nemo_automodel.components.config.loader import ConfigNode, load_yaml_config
 from nemo_automodel.recipes.retrieval.mine_hard_negatives import MINING_DEFAULTS, MineHardNegativesRecipe
 
 # ---------------------------------------------------------------------------
@@ -290,6 +290,9 @@ def test_mining_metadata_records_json_serializable_multimodal_config_and_disable
     model = MagicMock(pooling="avg", l2_normalize=True)
     model.to.return_value = model
     encoder = MagicMock()
+    encoder.model = model
+    encoder.pooling = "avg"
+    encoder.l2_normalize = True
 
     with (
         patch("nemo_automodel.recipes.retrieval.mine_hard_negatives.build_distributed") as build_dist,
@@ -311,6 +314,7 @@ def test_mining_metadata_records_json_serializable_multimodal_config_and_disable
     assert metadata["multimodal_encoder"]["_target_"] == target
     assert metadata["multimodal_encoder"]["query_prefix"] == "look up:"
     assert metadata["cache_reuse"] is False
+    auto_model.from_pretrained.assert_not_called()
     json.dumps(metadata)
 
 

@@ -14,6 +14,7 @@
 
 """CPU behavior tests for model-owned multimodal mining encoding."""
 
+import json
 from io import BytesIO
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -23,11 +24,12 @@ import pytest
 import torch
 from PIL import Image
 
-from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel._transformers.mining import (
     CheckpointMiningEncoder,
     CheckpointMiningEncoderConfig,
+    SentenceTransformerMiningEncoder,
 )
+from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.models.ministral_bidirectional.processor import load_image
 from nemo_automodel.recipes.retrieval.mine_hard_negatives import MineHardNegativesRecipe
 
@@ -127,6 +129,93 @@ def test_checkpoint_without_registered_processor_is_rejected():
     model.model = SimpleNamespace()
     with pytest.raises(ValueError, match="does not declare a supported retrieval processor"):
         CheckpointMiningEncoderConfig().build(model=model, device=torch.device("cpu"))
+
+
+def test_sentence_transformer_checkpoint_is_selected_without_loading_automodel(tmp_path, monkeypatch):
+    (tmp_path / "modules.json").write_text("[]")
+    (tmp_path / "config_sentence_transformers.json").write_text(json.dumps({"model_type": "SentenceTransformer"}))
+    sentence_transformer = MagicMock()
+    sentence_transformer.__iter__.return_value = iter([SimpleNamespace(pooling_mode="mean")])
+    load = MagicMock(return_value=sentence_transformer)
+    monkeypatch.setattr(
+        "nemo_automodel._transformers.mining.safe_import",
+        lambda _: (True, SimpleNamespace(SentenceTransformer=load)),
+    )
+
+    encoder = CheckpointMiningEncoderConfig(q_max_length=32).build(
+        model_name_or_path=str(tmp_path), device=torch.device("cpu")
+    )
+
+    assert isinstance(encoder, SentenceTransformerMiningEncoder)
+    assert encoder.pooling == "avg"
+    load.assert_called_once_with(str(tmp_path), device="cpu", trust_remote_code=False, model_kwargs=None)
+
+
+def test_checkpoint_without_sentence_transformer_modules_uses_automodel(tmp_path, monkeypatch):
+    model = _PixelModel()
+    model.model = SimpleNamespace(retrieval_processor_target="fixture.Processor")
+    model.config = SimpleNamespace(name_or_path=str(tmp_path), _commit_hash=None)
+    model.to = MagicMock(return_value=model)
+    model.eval = MagicMock()
+    load_model = MagicMock(return_value=model)
+    load_processor = MagicMock(return_value=_PixelProcessor())
+    monkeypatch.setattr(
+        "nemo_automodel._transformers.auto_model.NeMoAutoModelBiEncoder.from_pretrained", load_model
+    )
+    monkeypatch.setattr(
+        "nemo_automodel._transformers.mining.import_module",
+        lambda _: SimpleNamespace(Processor=SimpleNamespace(from_pretrained=load_processor)),
+    )
+
+    encoder = CheckpointMiningEncoderConfig().build(model_name_or_path=str(tmp_path), device=torch.device("cpu"))
+
+    assert isinstance(encoder, CheckpointMiningEncoder)
+    load_model.assert_called_once_with(str(tmp_path), use_liger_kernel=False, use_sdpa_patching=True)
+    load_processor.assert_called_once_with(str(tmp_path))
+
+
+def test_cross_encoder_checkpoint_is_not_loaded_as_embedding_model(tmp_path, monkeypatch):
+    (tmp_path / "modules.json").write_text("[]")
+    (tmp_path / "config_sentence_transformers.json").write_text(json.dumps({"model_type": "CrossEncoder"}))
+    import_st = MagicMock()
+    monkeypatch.setattr("nemo_automodel._transformers.mining.safe_import", import_st)
+
+    with pytest.raises(ValueError, match="not a SentenceTransformer embedding model"):
+        CheckpointMiningEncoderConfig().build(model_name_or_path=str(tmp_path), device=torch.device("cpu"))
+
+    import_st.assert_not_called()
+
+
+def test_sentence_transformer_adapter_uses_saved_prompts_and_runtime_lengths():
+    model = MagicMock()
+    model.__iter__.return_value = iter([SimpleNamespace(pooling_mode="mean")])
+    model.encode_query.return_value = np.ones((1, 2))
+    model.encode_document.side_effect = [np.array([[1.0, 0.0]]), np.array([[0.0, 1.0]])]
+    encoder = SentenceTransformerMiningEncoder(
+        model=model,
+        q_max_length=32,
+        p_max_length=64,
+        query_prefix=None,
+        passage_prefix=None,
+        use_text_in_document=True,
+        use_images=True,
+    )
+
+    encoder.encode_queries(["question"], batch_size=1)
+    embeddings = encoder.encode_documents([{"text": "text"}, {"text": "caption", "image": _png_bytes()}], batch_size=2)
+
+    model.encode_query.assert_called_once_with(
+        ["question"], batch_size=1, processing_kwargs={"text": {"max_length": 32, "truncation": True}}
+    )
+    np.testing.assert_array_equal(embeddings, [[1.0, 0.0], [0.0, 1.0]])
+    text_call, message_call = model.encode_document.call_args_list
+    assert text_call.args[0] == ["text"]
+    assert message_call.args[0][0][0]["content"][0]["image"].getpixel((0, 0)) == (255, 0, 0)
+    assert message_call.args[0][0][0]["content"][1] == {"type": "text", "text": "caption"}
+    assert message_call.kwargs == {
+        "batch_size": 2,
+        "processing_kwargs": {"text": {"max_length": 64, "truncation": True}},
+    }
 
 
 def test_pixels_change_same_text_embeddings_and_ranking_excludes_positive():
