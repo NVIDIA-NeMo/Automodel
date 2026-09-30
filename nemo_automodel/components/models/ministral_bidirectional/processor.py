@@ -376,9 +376,14 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
             self.tokenizer.init_kwargs.update(
                 padding=self.padding,
                 truncation=True,
-                max_length=self.rerank_max_length,
                 pad_to_multiple_of=self.pad_to_multiple_of,
             )
+            # Let standard calls fall back to model_max_length unless the
+            # reranker deliberately uses a different deployment limit.
+            if self.rerank_max_length is None or self.rerank_max_length == self.tokenizer.model_max_length:
+                self.tokenizer.init_kwargs.pop("max_length", None)
+            else:
+                self.tokenizer.init_kwargs["max_length"] = self.rerank_max_length
 
     @property
     def image_longest_edge(self) -> int | None:

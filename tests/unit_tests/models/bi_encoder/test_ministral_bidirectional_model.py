@@ -2025,3 +2025,42 @@ def test_mistral3_reranker_template_and_defaults_roundtrip(
             torch.testing.assert_close(actual[key], value, rtol=0, atol=0)
     overridden = restored.apply_chat_template(messages, tokenize=True, return_dict=True, return_tensors="pt", max_length=96)
     assert overridden["input_ids"].shape[1] == 96
+
+
+@pytest.mark.parametrize("rerank_max_length", [None, 64])
+def test_mistral3_reranker_omits_redundant_max_length(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, rerank_max_length: int | None
+) -> None:
+    """Canonical limits survive save/reload without masking later tokenizer overrides."""
+    monkeypatch.setattr(Mistral3BiEncoderProcessor, "check_argument_for_proper_class", lambda *args, **kwargs: None)
+    tokenizer = FakePixtralTokenizer()
+    tokenizer.model_max_length = 64
+    processor = Mistral3BiEncoderProcessor(
+        image_processor=PixtralImageProcessor(size={"longest_edge": 16}),
+        tokenizer=tokenizer,
+        patch_size=4,
+        rerank_max_length=32,
+        export_as_stock_processor=False,
+    )
+    assert processor.tokenizer.init_kwargs["max_length"] == 32
+    processor.rerank_max_length = rerank_max_length
+    processor.save_pretrained(tmp_path)
+    saved = json.loads((tmp_path / "tokenizer_config.json").read_text())
+    assert saved["model_max_length"] == 64
+    assert "max_length" not in saved
+    restored = Mistral3BiEncoderProcessor.from_pretrained(tmp_path)
+    assert "max_length" not in restored.tokenizer.init_kwargs
+    feature = {"question": "literal", "doc_text": "literal " * 120, "doc_image": ""}
+    messages = [{"role": "query", "content": feature["question"]}, {"role": "document", "content": feature["doc_text"]}]
+    inputs = restored.apply_chat_template(messages, tokenize=True, return_dict=True, return_tensors="pt")
+    helper = restored.process_queries_documents_crossencoder([feature])
+    assert inputs["input_ids"].shape[1] == 64
+    torch.testing.assert_close(inputs["input_ids"], helper["input_ids"], rtol=0, atol=0)
+    # Tokenization persists backend truncation state in tokenizer.json. Reload
+    # must also clear the redundant max_length reconstructed from that state.
+    restored.save_pretrained(tmp_path)
+    restored = Mistral3BiEncoderProcessor.from_pretrained(tmp_path)
+    assert "max_length" not in restored.tokenizer.init_kwargs
+    restored.tokenizer.model_max_length = 96
+    overridden = restored.apply_chat_template(messages, tokenize=True, return_dict=True, return_tensors="pt")
+    assert overridden["input_ids"].shape[1] == 96
