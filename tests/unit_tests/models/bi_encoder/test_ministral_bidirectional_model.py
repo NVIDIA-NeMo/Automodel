@@ -1889,12 +1889,14 @@ def test_mistral3_reranker_export_reloads_without_repository(
 ) -> None:
     """Both export paths include standalone code and preserve default CrossEncoder text/image scores."""
     monkeypatch.setattr(Mistral3BiEncoderProcessor, "check_argument_for_proper_class", lambda *args, **kwargs: None)
+    tokenizer = FakePixtralTokenizer()
+    tokenizer.model_max_length = 64
     processor = Mistral3BiEncoderProcessor(
         image_processor=PixtralImageProcessor(size={"longest_edge": 16}),
-        tokenizer=FakePixtralTokenizer(),
+        tokenizer=tokenizer,
         patch_size=4,
         padding=True,
-        rerank_max_length=128,
+        rerank_max_length=32,
         use_prompt_template=True,
         export_as_stock_processor=False,
     )
@@ -1932,7 +1934,9 @@ def test_mistral3_reranker_export_reloads_without_repository(
     transformer_config = json.loads((export_dir / "sentence_bert_config.json").read_text())
     assert "processing_kwargs" not in transformer_config
     assert "max_seq_length" not in transformer_config
-    assert json.loads((export_dir / "tokenizer_config.json").read_text())["model_max_length"] == 128
+    tokenizer_config = json.loads((export_dir / "tokenizer_config.json").read_text())
+    assert tokenizer_config["model_max_length"] == 64
+    assert "max_length" not in tokenizer_config
     assert (export_dir / "model.py").is_file()
     assert (export_dir / "processor.py").is_file()
     torch.save(
@@ -1987,11 +1991,13 @@ assert not any(name == "nemo_automodel" or name.startswith("nemo_automodel.") fo
 def test_mistral3_reranker_template_and_defaults_roundtrip(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, use_prompt_template: bool
 ) -> None:
-    """Default chat inference and the training helper agree after runtime overrides and reload."""
+    """Training truncation and checkpoint inference limits survive save and reload independently."""
     monkeypatch.setattr(Mistral3BiEncoderProcessor, "check_argument_for_proper_class", lambda *args, **kwargs: None)
+    tokenizer = FakePixtralTokenizer()
+    tokenizer.model_max_length = 96
     processor = Mistral3BiEncoderProcessor(
         image_processor=PixtralImageProcessor(size={"longest_edge": 16}),
-        tokenizer=FakePixtralTokenizer(),
+        tokenizer=tokenizer,
         patch_size=4,
         padding=True,
         rerank_max_length=128,
@@ -2005,9 +2011,10 @@ def test_mistral3_reranker_template_and_defaults_roundtrip(
     restored = Mistral3BiEncoderProcessor.from_pretrained(tmp_path)
     assert restored.chat_template == saved_template
     assert restored.tokenizer.chat_template == saved_template
-    assert restored.tokenizer.model_max_length == restored.rerank_max_length == 64
+    assert restored.tokenizer.model_max_length == 96
+    assert restored.rerank_max_length == 64
     assert "max_length" not in restored.tokenizer.init_kwargs
-    assert json.loads((tmp_path / "tokenizer_config.json").read_text())["model_max_length"] == 64
+    assert json.loads((tmp_path / "tokenizer_config.json").read_text())["model_max_length"] == 96
     features = [
         {"question": "literal [IMG]", "doc_text": "literal " * 200, "doc_image": ""},
         {"question": "What is shown?", "doc_text": "Image doc", "doc_image": Image.new("RGB", (16, 16), "red")},
@@ -2024,16 +2031,18 @@ def test_mistral3_reranker_template_and_defaults_roundtrip(
         ])
     expected = restored.process_queries_documents_crossencoder(features)
     actual = restored.apply_chat_template(messages, tokenize=True, return_dict=True, return_tensors="pt")
-    assert actual["input_ids"].shape[1] == 64
+    assert expected["input_ids"].shape[1] == 64
+    assert actual["input_ids"].shape[1] == 96
     for key, value in expected.items():
         if value is not None:
-            torch.testing.assert_close(actual[key], value, rtol=0, atol=0)
-    overridden = restored.apply_chat_template(messages, tokenize=True, return_dict=True, return_tensors="pt", max_length=96)
-    assert overridden["input_ids"].shape[1] == 96
+            inference_value = actual[key][:, :64] if key in ("input_ids", "attention_mask") else actual[key]
+            torch.testing.assert_close(inference_value, value, rtol=0, atol=0)
+    overridden = restored.apply_chat_template(messages, tokenize=True, return_dict=True, return_tensors="pt", max_length=128)
+    assert overridden["input_ids"].shape[1] == 128
 
 
 @pytest.mark.parametrize("rerank_max_length", [None, 64])
-def test_mistral3_reranker_omits_redundant_max_length(
+def test_mistral3_reranker_uses_tokenizer_limit_for_default_inference(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, rerank_max_length: int | None
 ) -> None:
     """Canonical limits survive save/reload without masking later tokenizer overrides."""
@@ -2047,7 +2056,8 @@ def test_mistral3_reranker_omits_redundant_max_length(
         rerank_max_length=32,
         export_as_stock_processor=False,
     )
-    assert processor.tokenizer.init_kwargs["max_length"] == 32
+    assert processor.tokenizer.model_max_length == 64
+    assert "max_length" not in processor.tokenizer.init_kwargs
     processor.rerank_max_length = rerank_max_length
     processor.save_pretrained(tmp_path)
     saved = json.loads((tmp_path / "tokenizer_config.json").read_text())

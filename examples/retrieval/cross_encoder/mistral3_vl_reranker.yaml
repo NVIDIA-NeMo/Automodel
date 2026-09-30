@@ -44,6 +44,7 @@ model:
 tokenizer:
   _target_: nemo_automodel.components.models.ministral_bidirectional.processor.Mistral3BiEncoderProcessor.from_pretrained
   pretrained_model_name_or_path: mistralai/Ministral-3-3B-Instruct-2512-BF16
+  model_max_length: 32768  # Checkpoint inference limit; training uses rerank_max_length below.
   rerank_max_length: 4096
   use_prompt_template: true
   export_as_stock_processor: false

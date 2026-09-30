@@ -371,19 +371,14 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
         self._sync_reranker_defaults()
 
     def _sync_reranker_defaults(self) -> None:
-        """Expose effective reranker tokenization settings to standard processor calls."""
+        """Keep standard processor defaults independent of the training truncation limit."""
         if not self.export_as_stock_processor:
             self.tokenizer.init_kwargs.update(
                 padding=self.padding,
                 truncation=True,
                 pad_to_multiple_of=self.pad_to_multiple_of,
             )
-            # Let standard calls fall back to model_max_length unless the
-            # reranker deliberately uses a different deployment limit.
-            if self.rerank_max_length is None or self.rerank_max_length == self.tokenizer.model_max_length:
-                self.tokenizer.init_kwargs.pop("max_length", None)
-            else:
-                self.tokenizer.init_kwargs["max_length"] = self.rerank_max_length
+            self.tokenizer.init_kwargs.pop("max_length", None)
 
     @property
     def image_longest_edge(self) -> int | None:
@@ -844,8 +839,6 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
                 push_to_hub=push_to_hub,
                 **kwargs,
             )
-        if self.rerank_max_length is not None:
-            self.tokenizer.model_max_length = self.rerank_max_length
         self._sync_reranker_defaults()
         type(self).register_for_auto_class("AutoProcessor")
         return PixtralProcessor.save_pretrained(self, save_directory, push_to_hub=push_to_hub, **kwargs)
