@@ -1098,6 +1098,7 @@ class _NeMoAutoModelForRetrievalBase:
     def from_pretrained(
         cls,
         pretrained_model_name_or_path: str,
+        *model_args: Any,
         attn_implementation: str = DEFAULT_ATTN_IMPLEMENTATION,
         use_liger_kernel: bool = True,
         use_sdpa_patching: bool = True,
@@ -1118,6 +1119,7 @@ class _NeMoAutoModelForRetrievalBase:
 
         Args:
             pretrained_model_name_or_path: Path to pretrained model or model identifier.
+            *model_args: Positional arguments forwarded to the backbone model's constructor.
             attn_implementation: Attention implementation to use (e.g.,
                 ``"flash_attention_2"``, ``"sdpa"``, ``"eager"``).
                 Defaults to ``DEFAULT_ATTN_IMPLEMENTATION``
@@ -1161,6 +1163,7 @@ class _NeMoAutoModelForRetrievalBase:
         def _retry(**override):
             return cls.from_pretrained(
                 pretrained_model_name_or_path,
+                *model_args,
                 attn_implementation=attn_implementation,
                 use_liger_kernel=override.get("use_liger_kernel", use_liger_kernel),
                 use_sdpa_patching=override.get("use_sdpa_patching", use_sdpa_patching),
@@ -1178,6 +1181,8 @@ class _NeMoAutoModelForRetrievalBase:
         build_kwargs.pop("tp_size", None)
         build_kwargs.pop("cp_size", None)
         build_kwargs.pop("has_packed_sequence", None)
+        if model_args:
+            build_kwargs["model_args"] = model_args
 
         setup = _resolve_distributed_setup(
             distributed_setup=distributed_setup,
@@ -1335,8 +1340,8 @@ class NeMoAutoModelCrossEncoder(_NeMoAutoModelForRetrievalBase):
     def from_pretrained(
         cls,
         pretrained_model_name_or_path: str,
+        *model_args: Any,
         attn_implementation: str = DEFAULT_ATTN_IMPLEMENTATION,
-        *args: Any,
         is_causal: bool | None = None,
         **kwargs: Any,
     ) -> PreTrainedModel:
@@ -1344,8 +1349,8 @@ class NeMoAutoModelCrossEncoder(_NeMoAutoModelForRetrievalBase):
 
         Args:
             pretrained_model_name_or_path: Path to pretrained model or model identifier.
+            *model_args: Positional arguments forwarded to the backbone model's constructor.
             attn_implementation: Attention implementation forwarded to the shared loader.
-            *args: Existing positional infrastructure options forwarded to the shared loader.
             is_causal: Whether the text backbone uses causal self-attention. When omitted, restores a saved policy or
                 preserves the scoring backbone's native attention mode.
             **kwargs: Forwarded to the shared retrieval loader.
@@ -1355,8 +1360,8 @@ class NeMoAutoModelCrossEncoder(_NeMoAutoModelForRetrievalBase):
         """
         return super().from_pretrained(
             pretrained_model_name_or_path,
-            attn_implementation,
-            *args,
+            *model_args,
+            attn_implementation=attn_implementation,
             is_causal=is_causal,
             **kwargs,
         )

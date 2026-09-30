@@ -305,28 +305,60 @@ def test_retrieval_public_apis_expose_is_causal():
         auto_model.NeMoAutoModelCrossEncoder.from_pretrained,
     ):
         assert "is_causal" in inspect.signature(callable_).parameters
+    for callable_ in (retrieval.CrossEncoderModel.build, auto_model.NeMoAutoModelCrossEncoder.from_pretrained):
+        assert inspect.signature(callable_).parameters["is_causal"].kind is inspect.Parameter.KEYWORD_ONLY
 
 
-def test_cross_encoder_new_attention_policy_preserves_existing_positional_slots(monkeypatch):
+def test_cross_encoder_model_args_reach_backbone_constructor(tmp_path, monkeypatch):
     from nemo_automodel._transformers import auto_model, retrieval
 
-    calls = []
+    config = BertConfig(
+        vocab_size=32,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+    )
+    model_dir = tmp_path / "bert_score"
+    BertForSequenceClassification(config).save_pretrained(model_dir)
 
-    def capture_load(cls, *args, **kwargs):
-        calls.append((cls, args, kwargs))
-        return "loaded"
+    setup = SimpleNamespace(
+        mesh_context=None,
+        strategy_config=None,
+        moe_parallel_config=None,
+        activation_checkpointing=None,
+    )
+    monkeypatch.setattr(auto_model, "_resolve_distributed_setup", lambda **_: setup)
+    monkeypatch.setattr(auto_model, "instantiate_infrastructure", lambda **_: (None, None, None, None))
+    monkeypatch.setattr(auto_model.torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(auto_model, "apply_model_infrastructure", lambda model, **_: model)
 
-    monkeypatch.setattr(auto_model._NeMoAutoModelForRetrievalBase, "from_pretrained", classmethod(capture_load))
-    loaded = auto_model.NeMoAutoModelCrossEncoder.from_pretrained("checkpoint", "sdpa", False, is_causal=False)
-    assert loaded == "loaded"
-    assert calls == [
-        (auto_model.NeMoAutoModelCrossEncoder, ("checkpoint", "sdpa", False), {"is_causal": False})
-    ]
+    with pytest.raises(TypeError, match="__init__"):
+        auto_model.NeMoAutoModelCrossEncoder.from_pretrained(
+            str(model_dir), "sdpa", use_liger_kernel=False, use_sdpa_patching=False
+        )
 
-    signature = inspect.signature(retrieval.CrossEncoderModel.build)
-    bound = signature.bind("checkpoint", True, is_causal=False)
-    assert bound.arguments["trust_remote_code"] is True
-    assert signature.parameters["is_causal"].kind is inspect.Parameter.KEYWORD_ONLY
+    class BertWithConstructorOption(BertForSequenceClassification):
+        def __init__(self, config: BertConfig, option: str) -> None:
+            super().__init__(config)
+            self.option = option
+
+    monkeypatch.setattr(retrieval, "_get_supported_backbone_class", lambda model_type, task: BertWithConstructorOption)
+    encoder = retrieval.CrossEncoderModel.build(str(model_dir), True, model_args=("constructor-option",))
+    assert encoder.model.option == "constructor-option"
+
+    def fail_liger_patch(model):
+        raise RuntimeError("Liger unavailable")
+
+    monkeypatch.setattr(auto_model, "_patch_liger_kernel", fail_liger_patch)
+    loaded = auto_model.NeMoAutoModelCrossEncoder.from_pretrained(
+        str(model_dir),
+        "constructor-option",
+        attn_implementation="sdpa",
+        use_sdpa_patching=False,
+    )
+    assert loaded.model.option == "constructor-option"
+    assert loaded.model.config._attn_implementation == "sdpa"
 
 
 def test_modified_retrieval_public_apis_are_fully_annotated():

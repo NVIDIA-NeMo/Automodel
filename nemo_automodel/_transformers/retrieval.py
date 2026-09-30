@@ -407,6 +407,8 @@ def build_encoder_backbone(
     temperature: float | None = None,
     is_causal: bool | None = None,
     loaded_config: PretrainedConfig | None = None,
+    *,
+    model_args: tuple[Any, ...] = (),
     **hf_kwargs: Any,
 ) -> PreTrainedModel:
     """Build an encoder backbone from a pretrained checkpoint.
@@ -432,6 +434,7 @@ def build_encoder_backbone(
         is_causal: Whether the retrieval text backbone uses causal self-attention. When omitted, a saved policy is
             restored; otherwise embedding defaults to bidirectional and scoring preserves the backbone's native mode.
         loaded_config: A previously loaded config used to keep model and metadata resolution on the same revision.
+        model_args: Positional arguments forwarded to the backbone model's constructor.
         **hf_kwargs: Extra keyword arguments forwarded to ``from_pretrained``.
 
     Returns:
@@ -459,6 +462,7 @@ def build_encoder_backbone(
             model_load_kwargs = {**hf_kwargs, "quantization_config": fp8_dequantization_config}
         model = AutoModel.from_pretrained(
             model_name_or_path,
+            *model_args,
             trust_remote_code=trust_remote_code,
             **model_load_kwargs,
         )
@@ -491,7 +495,7 @@ def build_encoder_backbone(
         if temperature is not None:
             hf_kwargs["temperature"] = temperature
         backbone = backbone_model_class.from_pretrained(
-            model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs
+            model_name_or_path, *model_args, trust_remote_code=trust_remote_code, **hf_kwargs
         )
     else:
         # Fallback: use HuggingFace Auto classes for model types not in SUPPORTED_BACKBONES
@@ -500,10 +504,12 @@ def build_encoder_backbone(
             hf_kwargs["num_labels"] = num_labels
         if task == "score":
             backbone = AutoModelForSequenceClassification.from_pretrained(
-                model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs
+                model_name_or_path, *model_args, trust_remote_code=trust_remote_code, **hf_kwargs
             )
         else:
-            backbone = AutoModel.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs)
+            backbone = AutoModel.from_pretrained(
+                model_name_or_path, *model_args, trust_remote_code=trust_remote_code, **hf_kwargs
+            )
     effective_is_causal = _resolve_text_backbone_is_causal(
         backbone,
         config,
@@ -954,14 +960,27 @@ class CrossEncoderModel(nn.Module):
         model_name_or_path: str,
         trust_remote_code: bool = False,
         *,
+        model_args: tuple[Any, ...] = (),
         is_causal: bool | None = None,
         **hf_kwargs: Any,
     ) -> "CrossEncoderModel":
-        """Build a cross-encoder while preserving saved or native attention by default."""
+        """Build a cross-encoder while preserving saved or native attention by default.
+
+        Args:
+            model_name_or_path: Path to a pretrained model or model identifier.
+            trust_remote_code: Whether to allow custom code from the model repository.
+            model_args: Positional arguments forwarded to the backbone model's constructor.
+            is_causal: Optional text-backbone attention policy.
+            **hf_kwargs: Keyword arguments forwarded to the backbone loader.
+
+        Returns:
+            Cross-encoder with a loaded scoring backbone.
+        """
         logger.info(f"Building CrossEncoderModel from {model_name_or_path}")
         backbone = build_encoder_backbone(
             model_name_or_path,
             task=cls._TASK,
+            model_args=model_args,
             is_causal=is_causal,
             trust_remote_code=trust_remote_code,
             **hf_kwargs,
