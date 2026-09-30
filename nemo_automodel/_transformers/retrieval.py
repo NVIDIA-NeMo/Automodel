@@ -663,7 +663,7 @@ class _StockHFMetadataExporter:
         del tokenizer, original_model_path
         self.model_part.get_hf_export_config()
 
-    def save(self, *, hf_metadata_dir: str, tokenizer, original_model_path: str | None) -> None:
+    def save(self, *, hf_metadata_dir: str, tokenizer, original_model_path: str | None, v4_compatible: bool) -> None:
         """Write stock model metadata and optional processor assets."""
         from nemo_automodel.components.checkpoint.addons import _save_generated_hf_assets
 
@@ -673,7 +673,7 @@ class _StockHFMetadataExporter:
             original_model_path,
             hf_metadata_dir,
             tokenizer,
-            v4_compatible=False,
+            v4_compatible=v4_compatible,
             model_config=deploy_config,
             save_custom_model_code=False,
         )

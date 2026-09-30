@@ -674,6 +674,7 @@ class _SentenceTransformerMetadataExporter:
         hf_metadata_dir: str,
         tokenizer,
         original_model_path: str | None,
+        v4_compatible: bool,
     ) -> None:
         """Write deployable Hugging Face metadata plus standard Sentence Transformers assets."""
         from nemo_automodel.components.checkpoint.addons import _save_generated_hf_assets
@@ -685,7 +686,7 @@ class _SentenceTransformerMetadataExporter:
             source_model_path,
             hf_metadata_dir,
             tokenizer,
-            v4_compatible=False,
+            v4_compatible=v4_compatible,
             model_config=deploy_config,
             save_custom_model_code=bool(getattr(deploy_config, "auto_map", None)),
         )
@@ -742,7 +743,9 @@ class _CrossEncoderMetadataExporter:
         _write_json(os.path.join(hf_metadata_dir, "sentence_bert_config.json"), transformer_config)
         _copy_source_legal_assets(original_model_path, hf_metadata_dir)
 
-    def save(self, *, hf_metadata_dir: str, tokenizer: object, original_model_path: str | None) -> None:
+    def save(
+        self, *, hf_metadata_dir: str, tokenizer: object, original_model_path: str | None, v4_compatible: bool
+    ) -> None:
         """Write custom model/processor code and CrossEncoder metadata for consolidation."""
         from nemo_automodel.components.checkpoint.addons import _save_generated_hf_assets
 
@@ -753,7 +756,7 @@ class _CrossEncoderMetadataExporter:
             self.model_part.name_or_path or original_model_path,
             hf_metadata_dir,
             tokenizer,
-            v4_compatible=False,
+            v4_compatible=v4_compatible,
             model_config=self.model_part.config,
         )
         self._save_sentence_transformer_assets(

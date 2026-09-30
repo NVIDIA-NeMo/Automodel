@@ -137,8 +137,9 @@ class _ConsolidatedHFMetadataExporter(Protocol):
         hf_metadata_dir: str,
         tokenizer: object,
         original_model_path: str | None,
+        v4_compatible: bool,
     ) -> None:
-        """Write model-specific metadata into the shared Hugging Face metadata directory."""
+        """Write model-specific metadata, honoring the requested v4 config layout."""
         ...
 
 
@@ -161,6 +162,7 @@ class ConsolidatedHFAddon:
             tokenizer (PreTrainedTokenizerBase | None): Optional tokenizer to save.
             fqn_to_dtype_mapping (dict[str, str] | None): Original HF safetensors dtype map.
             original_model_path (str | None): Authoritative source checkpoint snapshot.
+            v4_compatible (bool): Preserve the source config beside the generated v5 config when available.
         """
         model_state = kwargs["model_state"]
         hf_metadata_dir = kwargs["hf_metadata_dir"]
@@ -194,6 +196,7 @@ class ConsolidatedHFAddon:
                     hf_metadata_dir=hf_metadata_dir,
                     tokenizer=tokenizer,
                     original_model_path=original_model_path,
+                    v4_compatible=kwargs.get("v4_compatible", False),
                 )
             else:
                 _save_generated_hf_assets(

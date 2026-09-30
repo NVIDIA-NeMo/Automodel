@@ -1775,6 +1775,55 @@ def test_extract_submodel_without_config_raises():
         _extract_submodel(model, "language_model")
 
 
+@pytest.mark.parametrize("export_kind", ["embedding", "stock_embedding", "reranking"])
+def test_consolidated_retrieval_export_respects_v4_compatible(tmp_path, export_kind):
+    """Explicit v4 export retains the source config beside the generated deployment config."""
+    from nemo_automodel._transformers import retrieval
+    from nemo_automodel.components.checkpoint.addons import ConsolidatedHFAddon
+
+    if export_kind == "reranking":
+        config = BertConfig(
+            vocab_size=32,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            max_position_embeddings=64,
+            num_labels=1,
+        )
+        encoder = retrieval.CrossEncoderModel(BertForSequenceClassification(config))
+        source_dir = tmp_path / "source"
+        source_dir.mkdir()
+        config.to_json_file(source_dir / "config.json")
+    else:
+        source_dir, _ = _save_tiny_ministral_text_model(tmp_path)
+        backbone = retrieval.build_encoder_backbone(str(source_dir), task="embedding", pooling="avg")
+        encoder = retrieval.BiEncoderModel(backbone, pooling="avg")
+        if export_kind == "stock_embedding":
+            encoder.disable_sentence_transformer_export()
+
+    source_config_path = source_dir / "config.json"
+    source_config = json.loads(source_config_path.read_text())
+    source_config["source_marker"] = "preserved"
+    source_config_path.write_text(json.dumps(source_config))
+    export_dir = tmp_path / "export"
+    export_dir.mkdir()
+    ConsolidatedHFAddon().pre_save(
+        model_state=SimpleNamespace(model=[encoder]),
+        hf_metadata_dir=str(export_dir),
+        fqn_to_file_index_mapping={},
+        original_model_path=str(source_dir),
+        tokenizer=_tiny_tokenizer(),
+        v4_compatible=True,
+    )
+
+    assert json.loads((export_dir / "config.json").read_text()) == source_config
+    generated_config = json.loads((export_dir / "config.v5.json").read_text())
+    expected_model_type = config.model_type if export_kind == "reranking" else encoder.get_hf_export_config().model_type
+    assert generated_config["model_type"] == expected_model_type
+    assert "source_marker" not in generated_config
+
+
 @pytest.mark.parametrize("consolidated", [False, True])
 def test_cross_encoder_exports_raw_text_scores(tmp_path, consolidated):
     from safetensors.torch import save_file
