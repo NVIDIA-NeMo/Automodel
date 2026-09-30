@@ -905,7 +905,7 @@ optimizer:
       wd_mult: 1.0          # (optional) multiplier for weight decay; defaults to 1.0
 ```
 
-Each parameter joins the group of the **first** override whose `pattern` matches its name; parameters matching no pattern keep the base learning rate. A pattern that matches nothing is skipped with a warning. This works for the standard `torch.optim` optimizers; Dion-family optimizers do their own parameter grouping and ignore `param_group_overrides`.
+Each parameter joins the group of the **first** override whose `pattern` matches its name; parameters matching no pattern keep the base learning rate. A pattern that matches nothing is skipped with a warning. Standard optimizers support LR/WD overrides. Dion-family configs also support `algorithm: adamw` to route matching matrices to auxiliary AdamW. Their LR/WD multipliers apply to the selected group's base settings, including when no LR scheduler is configured; matrix layout groups remain separate. Only Dion-family configs accept the `algorithm` field.
 
 ### Muown for Dense and MoE Weights
 
@@ -927,6 +927,18 @@ optimizer:
 ```
 
 Optionally set `optimizer.muon_update_scale` to multiply the shape-scaled Muon direction update. The default is `1.0`, preserving the original update; `0.5` halves it without directly scaling magnitude Adam or auxiliary AdamW learning rates. The value must be finite and nonnegative; `0.0` disables direction movement while magnitudes can still learn. This run-level value is read from the current config on resume and adds no optimizer checkpoint fields.
+
+Router matrices keep the default Muown grouping unless you explicitly select AdamW. To opt in, add this to the optimizer block:
+
+```yaml
+param_group_overrides:
+  - pattern: '(^|\.)(gate|router)\.weight$'
+    algorithm: adamw
+    lr_mult: 1.0
+    wd_mult: 1.0
+```
+
+This optional rule matches modules named `gate` or `router` without matching expert `gate_proj` projections. Newly routed matrices inherit `scalar_lr`, `scalar_betas` and `scalar_eps`; `lr_mult` and `wd_mult` can further scale that group. Existing embedding/head settings are preserved, and frozen parameters are excluded.
 
 Grouped expert tensors are treated as batches of independent matrices. AutoModel's grouped GEMM experts declare their `[expert, input, output]` storage layout so magnitude normalization follows output neurons. Linear weights use `[output, input]`. Embeddings, output heads, normalization parameters, and biases use the scalar optimizer. These groups also apply to `MuonConfig`, except that Muon does not learn neuron magnitudes.
 

@@ -16,6 +16,7 @@
 
 import os
 import socket
+from collections import OrderedDict
 from pathlib import Path
 
 import pytest
@@ -48,7 +49,7 @@ def _worker(rank, world_size, port, checkpoint_dir, use_triton=False):
     try:
         with torch._dynamo.config.patch(disable=True):
             _check_mixed_meshes(world_size, checkpoint_dir, use_triton)
-            _check_fsdp_training(use_triton)
+            _check_fsdp_training(use_triton, checkpoint_dir)
     finally:
         dist.destroy_process_group()
 
@@ -188,21 +189,31 @@ def _check_mixed_meshes(world_size, checkpoint_dir, use_triton=False):
         torch.testing.assert_close(local, expected, atol=2e-5 if use_triton else 0, rtol=2e-5 if use_triton else 0)
 
 
-def _check_fsdp_training(use_triton=False):
+def _check_fsdp_training(use_triton=False, checkpoint_dir=None):
     torch.manual_seed(41)
-    reference = nn.Sequential(nn.Linear(16, 32), nn.GELU(), nn.Linear(32, 8)).cuda()
-    model = nn.Sequential(nn.Linear(16, 32), nn.GELU(), nn.Linear(32, 8)).cuda()
+    reference = nn.Sequential(OrderedDict(attn=nn.Linear(16, 32), act=nn.GELU(), router=nn.Linear(32, 8))).cuda()
+    model = nn.Sequential(OrderedDict(attn=nn.Linear(16, 32), act=nn.GELU(), router=nn.Linear(32, 8))).cuda()
     model.load_state_dict(reference.state_dict())
     mesh = init_device_mesh("cuda", (dist.get_world_size(),), mesh_dim_names=("dp",))
     fully_shard(model[0], mesh=mesh)
     fully_shard(model[2], mesh=mesh)
     fully_shard(model, mesh=mesh)
-    optimizer = MuownConfig(weight_decay=0.1, use_triton=use_triton, muon_update_scale=0.5).build(
-        model, device_mesh=mesh
-    )[0]
-    reference_optimizer = MuownConfig(weight_decay=0.1, use_triton=use_triton, muon_update_scale=0.5).build(reference)[
-        0
-    ]
+    config = MuownConfig(
+        weight_decay=0.1,
+        use_triton=use_triton,
+        muon_update_scale=0.5,
+        scalar_lr=1e-4,
+        param_group_overrides=[{"pattern": r"^router\.weight$", "algorithm": "adamw"}],
+    )
+    optimizer = config.build(model, device_mesh=mesh)[0]
+    reference_optimizer = config.build(reference)[0]
+    groups = {id(p): group for group in optimizer.param_groups for p in group["params"]}
+    assert groups[id(model.router.weight)]["algorithm"] == "adamw"
+    assert groups[id(model.attn.weight)]["algorithm"] == "muon"
+    # Parameter regrouping must retain native DCP save/load support.
+    path = str(Path(checkpoint_dir) / "router_groups")
+    dcp.save({"optimizer": OptimizerState(model, optimizer)}, checkpoint_id=path)
+    dcp.load({"optimizer": OptimizerState(model, optimizer)}, checkpoint_id=path)
     for _ in range(4):
         inputs = torch.randn(8 * dist.get_world_size(), 16, device="cuda")
         local_inputs = inputs.chunk(dist.get_world_size())[dist.get_rank()]

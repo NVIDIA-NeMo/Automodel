@@ -15,6 +15,7 @@
 """Muown layout, state, grouping and per-expert update regressions."""
 
 import copy
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -23,7 +24,13 @@ from torch import nn
 pytest.importorskip("dion")
 
 from nemo_automodel.components.optim.muown import Muown, _nonzero_magnitude
-from nemo_automodel.components.optim.optimizer import MuownConfig, build_optimizer_config
+from nemo_automodel.components.optim.optimizer import (
+    AdamWConfig,
+    LRSchedulerConfig,
+    MuownConfig,
+    ParamGroupOverride,
+    build_optimizer_config,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -215,3 +222,141 @@ def test_zero_gradient_zero_row_stays_finite():
 def test_invalid_direction_scale(scale):
     with pytest.raises(ValueError, match="muon_update_scale"):
         Muown([nn.Parameter(torch.ones(2, 2))], muon_update_scale=scale)
+
+
+@pytest.mark.parametrize("update_scale", [0.0, 0.5, 1.0])
+def test_router_override_matches_adamw_and_preserves_matrix_groups(update_scale):
+    torch.manual_seed(113)
+    model = nn.ModuleDict(
+        {
+            "attn": nn.Linear(8, 12, bias=False),
+            "router": nn.Linear(8, 4, bias=False),
+            "embed": nn.Embedding(16, 8),
+            "lm_head": nn.Linear(8, 16, bias=False),
+        }
+    )
+    config = MuownConfig(
+        lr=0.003,
+        scalar_lr=0.001,
+        embed_lr=0.0002,
+        lm_head_lr=0.0003,
+        weight_decay=0.1,
+        scalar_betas=(0.8, 0.9),
+        scalar_eps=1e-6,
+        muon_update_scale=update_scale,
+        param_group_overrides=[
+            {"pattern": r"^router\.weight$", "algorithm": "adamw", "lr_mult": 0.5, "wd_mult": 0.2},
+            # First match wins; this must not send attention matrices to AdamW.
+            {"pattern": "weight", "lr_mult": 1.0},
+        ],
+    )
+    opt = config.build(model)[0]
+    groups = {id(p): group for group in opt.param_groups for p in group["params"]}
+    assert len(groups) == len(list(model.parameters()))
+    assert groups[id(model["attn"].weight)]["algorithm"] == "muon"
+    router_group = groups[id(model["router"].weight)]
+    assert router_group["algorithm"] == "adamw"
+    assert "g" not in opt.state[model["router"].weight]
+    expected_router = nn.Parameter(model["router"].weight.detach().clone())
+    reference = torch.optim.AdamW(
+        [expected_router], lr=0.0005, betas=(0.8, 0.9), eps=1e-6, weight_decay=0.02, fused=True
+    )
+    # Also exercise the native scheduler: scalar LR must not become matrix LR.
+    schedule = LRSchedulerConfig(lr_warmup_steps=2, init_lr=0.0, min_lr=0.0003).build(
+        opt, SimpleNamespace(epoch_len=10, num_epochs=1, max_steps=10)
+    )[0]
+    for step in range(5):
+        if step:
+            schedule.step(1)
+        base_lr = schedule.get_lr({})
+        assert router_group["lr"] == pytest.approx(base_lr / 6)
+        assert router_group["weight_decay"] == pytest.approx(0.02)
+        assert groups[id(model["embed"].weight)]["lr"] == pytest.approx(base_lr / 15)
+        assert groups[id(model["lm_head"].weight)]["lr"] == pytest.approx(base_lr / 10)
+        assert groups[id(model["embed"].weight)]["weight_decay"] == 0.0
+        for param in model.parameters():
+            param.grad = torch.randn_like(param)
+        expected_router.grad = model["router"].weight.grad.clone()
+        reference.param_groups[0]["lr"] = base_lr / 6
+        opt.step()
+        reference.step()
+        torch.testing.assert_close(model["router"].weight, expected_router, rtol=0, atol=0)
+
+
+def test_algorithm_override_rejected_by_standard_optimizer():
+    config = AdamWConfig(param_group_overrides=[{"pattern": "weight", "algorithm": "adamw"}])
+    with pytest.raises(ValueError, match="Dion-family"):
+        config.build(nn.Linear(2, 2))
+
+
+def test_invalid_algorithm_override():
+    with pytest.raises(ValueError, match="algorithm"):
+        ParamGroupOverride(pattern="router", algorithm="typo")
+
+
+def test_override_preserves_transposed_experts_and_ignores_frozen_parameters(caplog):
+    class Experts(nn.Module):
+        _nemo_transposed_matrix_parameters = ("projection",)
+
+        def __init__(self):
+            super().__init__()
+            self.projection = nn.Parameter(torch.randn(2, 8, 12))
+
+    model = nn.ModuleDict({"experts": Experts(), "router": nn.Linear(8, 4, bias=False)})
+    model["router"].requires_grad_(False)
+    config = MuownConfig(
+        param_group_overrides=[
+            {"pattern": "router", "algorithm": "adamw"},
+            {"pattern": "experts", "lr_mult": 0.5},
+        ]
+    )
+    optimizer = config.build(model)[0]
+    groups = [g for g in optimizer.param_groups if g["params"]]
+    assert len(groups) == 1
+    assert groups[0]["matrix_transposed"]
+    assert groups[0]["algorithm"] == "muon"
+    assert groups[0]["params"][0] is model["experts"].projection
+    assert groups[0]["lr"] == pytest.approx(config.lr * 0.5)
+    assert "matched no parameters" in caplog.text
+
+
+def test_all_matrix_parameters_can_use_adamw_without_changing_scheduler_base():
+    model = nn.Linear(8, 4, bias=False)
+    config = MuownConfig(
+        lr=0.003,
+        scalar_lr=0.001,
+        weight_decay=0.1,
+        param_group_overrides=[{"pattern": "weight", "algorithm": "adamw", "lr_mult": 0.5, "wd_mult": 0.0}],
+    )
+    optimizer = config.build(model)[0]
+    assert len(optimizer.param_groups) == 1
+    assert optimizer.param_groups[0]["lr"] == 0.0005
+    schedule = LRSchedulerConfig(lr_warmup_steps=0, lr_decay_style="constant").build(
+        optimizer, SimpleNamespace(epoch_len=10, num_epochs=1, max_steps=10)
+    )[0]
+    assert schedule.max_lr == 0.003
+    assert optimizer.param_groups[0]["lr"] == 0.0005
+    assert optimizer.param_groups[0]["weight_decay"] == 0.0
+
+
+def test_optional_router_rule_excludes_expert_gate_proj():
+    config = MuownConfig(
+        param_group_overrides=[{"pattern": r"(^|\.)(gate|router)\.weight$", "algorithm": "adamw"}],
+        scalar_lr=1e-4,
+    )
+    model = nn.ModuleDict(
+        {
+            "mlp": nn.ModuleDict(
+                {
+                    "gate": nn.Linear(8, 4, bias=False),
+                    "gate_proj": nn.Linear(8, 16, bias=False),
+                }
+            ),
+        }
+    )
+    optimizer = config.build(model)[0]
+    groups = {id(p): group for group in optimizer.param_groups for p in group["params"]}
+    assert optimizer.muon_update_scale == 1.0
+    assert groups[id(model["mlp"]["gate"].weight)]["algorithm"] == "adamw"
+    assert groups[id(model["mlp"]["gate"].weight)]["lr"] == config.scalar_lr
+    assert groups[id(model["mlp"]["gate_proj"].weight)]["algorithm"] == "muon"
