@@ -1,6 +1,6 @@
 ---
 title: "Supervised Fine-Tuning (SFT) and Parameter-Efficient Fine-Tuning (PEFT) with NeMo AutoModel"
-description: ""
+description: "Fine-tune language models with NeMo AutoModel using SFT or PEFT (LoRA), from install and YAML config through training, evaluation, publish, and vLLM deploy."
 position: 2
 ---
 ## Introduction
@@ -125,7 +125,7 @@ Raw `ConfigNode` sections call `.instantiate()` inside the relevant recipe build
 
 Nested `_target_` blocks (such as a configured `collate_fn` inside `dataloader`) are recursively instantiated the same way. In contrast, `RecipeConfig` converts recognized sections to typed configs that own construction through `.build(...)`: optimizer receives the model and device mesh, step scheduler receives the dataloader, data-parallel (DP) size, and local batch size, and checkpoint receives runtime ranks and meshes.
 
-**The `recipe` key.** Every config file includes a top-level `recipe` key that tells the CLI *which recipe class* to run. You can write it as a **short name** or as a **fully-qualified Python path**, and both resolve to the same class:
+**The `recipe` key.** Every config file includes a top-level `recipe` key that tells the CLI *which recipe class* to run. You can write it as a **short name** or as a **fully qualified Python path**, and both resolve to the same class:
 
 ```yaml
 # Short name (the CLI looks up the class automatically)
@@ -215,7 +215,7 @@ peft:
 | Key | Role |
 |-----|------|
 | `_target_` | Points to [`PeftConfig`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/_peft/lora.py), which is a dataclass that describes which layers to adapt and how. Unlike the model and dataset sections, this instantiation produces a *config object*, not the adapter itself. The recipe passes the resulting `PeftConfig` into `build_model`, which applies LoRA adapters to the model. |
-| `target_modules` | A glob pattern matched against fully-qualified layer names (for example, `"*_proj"` matches Llama projection layers such as `q_proj`, `k_proj`, and `down_proj`). |
+| `target_modules` | A glob pattern matched against fully qualified layer names (for example, `"*_proj"` matches Llama projection layers such as `q_proj`, `k_proj`, and `down_proj`). |
 | `dim` | The low-rank dimension *r*, which controls adapter capacity. Larger values learn more but use more memory. |
 | `alpha` | Scaling factor applied to the adapter output (`alpha / dim`). Higher values give adapters more influence during training. |
 
@@ -225,7 +225,7 @@ Including a `peft:` section enables LoRA fine-tuning. Remove it entirely to run 
 
 If GPU memory is a constraint, [QLoRA](https://arxiv.org/abs/2305.14314) combines LoRA with 4-bit NormalFloat (NF4) quantization to reduce memory usage by up to 75% compared to full-parameter SFT in 16-bit precision, while maintaining comparable quality to standard LoRA.
 
-QLoRA requires `bitsandbytes`, which is provided by AutoModel's `cuda_source`
+QLoRA requires `bitsandbytes`, which is provided by NeMo AutoModel's `cuda_source`
 install profile. Add it to the active environment created above before running a
 QLoRA recipe:
 
@@ -354,7 +354,7 @@ checkpoint:
 
 ## Fine-Tune the Model
 
-You can run the recipe using the AutoModel CLI or directly with `torchrun` (advanced).
+You can run the recipe using the `automodel` CLI or directly with `torchrun` (advanced).
 
 ```bash
 automodel --nproc-per-node=8 finetune_config.yaml
@@ -875,7 +875,7 @@ The following table describes the config fields for the fine-tuning recipe.
 
 | Section | Required? | What to Change |
 |---------|-----------|----------------|
-| `recipe` | CLI only | Required by `automodel`; select `TrainFinetuneRecipeForNextTokenPrediction` by short name or fully-qualified path. |
+| `recipe` | CLI only | Required by `automodel`; select `TrainFinetuneRecipeForNextTokenPrediction` by short name or fully qualified path. |
 | `model` | Yes | Set `pretrained_model_name_or_path` to your Hugging Face model ID. Source: [`auto_model.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/_transformers/auto_model.py). |
 | `peft` | PEFT only | Remove entirely for SFT. Adjust `dim` and `alpha` to tune adapter capacity. `use_triton: True` enables an optimized LoRA kernel (requires the `triton` package). For reduced memory usage, see [QLoRA](#qlora-quantized-low-rank-adaptation). Source: [`lora.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/_peft/lora.py). |
 | `dataset` | Yes | Change `_target_`, `dataset_name`, and `split` for your data. Source: [`squad.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/datasets/llm/squad.py). |
@@ -887,7 +887,7 @@ The following table describes the config fields for the fine-tuning recipe.
 | `distributed` | Yes | `dp_size: null` means auto-detect from world size. Adjust `tp_size` for tensor parallelism across GPUs. |
 | `prewarm` | Optional | Enable only the targeted setup warmup associated with a first-step out-of-memory error. See [Prewarm One-Time CUDA Initialization](/get-started/configuration#prewarm-one-time-cuda-initialization). Source: [`prewarm.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/training/prewarm.py). |
 | `checkpoint` | Recommended | Set `checkpoint_dir` to a persistent path, especially in Docker. `save_consolidated` defaults to `final`: intermediate SFT checkpoints are sharded and the final checkpoint also exports consolidated HF weights. |
-| `optimizer` | Yes | Any supported `torch.optim` class can be selected using `_target_`; `RecipeConfig` normalizes it to an `OptimizerConfig` that owns construction. For long fine-tuning, especially full-parameter SFT, see the [mixed-precision training guide](/development/mixed-precision-training) before combining torch AdamW with bf16 resident parameters. |
+| `optimizer` | Yes | Any supported `torch.optim` class can be selected using `_target_`; `RecipeConfig` normalizes it to an `OptimizerConfig` that owns construction. For long fine-tuning, especially full-parameter SFT, see the [Mixed-Precision Training Guide](/development/mixed-precision-training) before combining torch AdamW with bf16 resident parameters. |
 | `wandb` | Optional | Uncomment and configure to enable Weights & Biases logging. |
 
 For the fine-tuning recipe itself, see [`train_ft.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/train_ft.py).
