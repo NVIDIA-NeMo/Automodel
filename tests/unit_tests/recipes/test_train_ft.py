@@ -3594,6 +3594,15 @@ def test_mtp_recipe_distinguishes_neat_metadata_from_thd_offsets(monkeypatch, pa
 
     class Model(torch.nn.Module):
         def forward(self, input_ids, **kwargs):
+            """Return base and MTP logits for the supplied token layout.
+
+            Args:
+                input_ids: Tokens of shape [batch, sequence].
+                **kwargs: Unused collated mask and metadata fields.
+
+            Returns:
+                Base logits and one MTP logit tensor of shape [batch, sequence, 8].
+            """
             logits = torch.zeros(*input_ids.shape, 8)
             return SimpleNamespace(logits=logits, mtp_per_depth_logits=[logits], mtp_loss_scaling_factor=1.0)
 

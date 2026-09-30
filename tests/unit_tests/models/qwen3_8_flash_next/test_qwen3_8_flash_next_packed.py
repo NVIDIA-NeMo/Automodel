@@ -699,6 +699,16 @@ def test_packed_gdn_canonicalizes_reused_ids_and_inconsistent_indices(monkeypatc
     captured = {}
 
     def capture(self, hidden_states, **kwargs):
+        """Capture parent inputs without changing activations.
+
+        Args:
+            hidden_states: Tensor of shape [1, sequence, hidden].
+            **kwargs: Boundaries [documents + 1], document IDs [1, sequence],
+                and indices [sequence].
+
+        Returns:
+            The unchanged hidden-state tensor.
+        """
         captured.update(kwargs)
         return hidden_states
 

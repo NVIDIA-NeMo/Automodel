@@ -541,8 +541,8 @@ class LlamaForCausalLM(HFCheckpointingMixin, LlamaPreTrainedModel):
 
     @property
     def _uses_hf_attention(self) -> bool:
-        """Only TE bypasses the HF attention dispatch in this model."""
-        return self.backend.attn != "te"
+        """BSHD and NEAT use HF dispatch; TE handles only pre-packed THD."""
+        return True
 
     @dataclass(frozen=True)
     class ModelCapabilities:

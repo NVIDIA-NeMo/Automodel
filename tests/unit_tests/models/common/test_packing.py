@@ -461,3 +461,22 @@ class TestConfigurePackingFA3FA4:
 
         assert "transformers.models.llama.modeling_llama" in _PACKING_PATCH_MODULES
         assert "transformers.models.qwen3.modeling_qwen3" in _PACKING_PATCH_MODULES
+
+
+def test_non_metadata_consumer_preserves_legacy_thd_boundaries():
+    class LegacyModel(torch.nn.Module):
+        def forward(self, **kwargs):
+            """Return legacy THD boundaries unchanged.
+
+            Args:
+                **kwargs: ``cu_seqlens`` of shape [documents + 1] and scalar format options.
+
+            Returns:
+                The original boundary tensor of shape [documents + 1].
+            """
+            return kwargs["cu_seqlens"]
+
+    model = LegacyModel()
+    configure_packing("sdpa", model=model)
+    boundaries = torch.tensor([0, 2, 5], dtype=torch.int32)
+    assert model(cu_seqlens=boundaries, qkv_format="thd") is boundaries

@@ -37,20 +37,25 @@ def _packed_sample():
     )
 
 
-@pytest.mark.parametrize("model_family", ["llama", "qwen2", "laguna"])
+@pytest.mark.parametrize("model_family", ["llama", "qwen2", "qwen3", "laguna"])
 @pytest.mark.parametrize("backend", ["sdpa", "te", "fa4"])
 def test_hf_dispatch_is_model_owned(model_family, backend):
     from nemo_automodel.components.models.laguna.model import LagunaForCausalLM
     from nemo_automodel.components.models.llama.model import LlamaForCausalLM
     from nemo_automodel.components.models.qwen2.model import Qwen2ForCausalLM
+    from nemo_automodel.components.models.qwen3.model import Qwen3ForCausalLM
 
-    cls = {"llama": LlamaForCausalLM, "qwen2": Qwen2ForCausalLM, "laguna": LagunaForCausalLM}[model_family]
+    cls = {
+        "llama": LlamaForCausalLM,
+        "qwen2": Qwen2ForCausalLM,
+        "qwen3": Qwen3ForCausalLM,
+        "laguna": LagunaForCausalLM,
+    }[model_family]
     model = cls.__new__(cls)
     torch.nn.Module.__init__(model)
     model.backend = BackendConfig(attn=backend)
     model.config = SimpleNamespace(_attn_implementation="flash_attention_4")
-    expected = "te" if backend == "te" and model_family != "laguna" else "flash_attention_4"
-    assert get_model_attn_implementation(model) == expected
+    assert get_model_attn_implementation(model) == "flash_attention_4"
 
 
 def test_backend_dispatched_model_preserves_document_isolation():
@@ -142,6 +147,18 @@ def test_qwen35_hybrid_packed_fa4_matches_sdpa(microbatch_size):
     from tests.unit_tests.models.qwen3_5.test_qwen3_5_dense_backbone import _backend, _tiny_config
 
     def conv(x, weight, bias, activation, seq_idx):
+        """Run separate document convolutions.
+
+        Args:
+            x: Activations of shape [1, channels, tokens].
+            weight: Convolution weights of shape [channels, kernel].
+            bias: Optional bias of shape [channels].
+            activation: Activation name, silu.
+            seq_idx: Document IDs of shape [1, tokens].
+
+        Returns:
+            Convolved activations of shape [1, channels, tokens].
+        """
         cuts = [0] + (torch.nonzero(seq_idx[0, 1:] != seq_idx[0, :-1]).flatten() + 1).tolist() + [x.shape[-1]]
         return torch.cat(
             [
@@ -156,6 +173,21 @@ def test_qwen35_hybrid_packed_fa4_matches_sdpa(microbatch_size):
         )
 
     def recurrence(q, k, v, *, g, beta, cu_seqlens, cu_seqlens_cpu=None, **kwargs):
+        """Evaluate HF's recurrent reference independently for each document.
+
+        Args:
+            q: Queries of shape [1, tokens, heads, key_dim].
+            k: Keys of shape [1, tokens, heads, key_dim].
+            v: Values of shape [1, tokens, heads, value_dim].
+            g: Log-decay gates of shape [1, tokens, heads].
+            beta: Update gates of shape [1, tokens, heads].
+            cu_seqlens: Document boundaries of shape [documents + 1].
+            cu_seqlens_cpu: Optional CPU mirror with the same shape.
+            **kwargs: Scalar reference-kernel options and optional initial state.
+
+        Returns:
+            Outputs of shape [1, tokens, heads, value_dim] and None for state.
+        """
         cuts = cu_seqlens.tolist()
         return torch.cat(
             [
@@ -228,3 +260,32 @@ def test_qwen35_hybrid_packed_fa4_matches_sdpa(microbatch_size):
         output.backward(upstream)
     for (name, param), (_, ref_param) in zip(model.named_parameters(), reference.named_parameters()):
         torch.testing.assert_close(param.grad, ref_param.grad, rtol=1e-4, atol=1e-5, msg=name)
+
+
+def test_default_te_qwen3_neat_packing_uses_its_hf_flash_dispatch():
+    from transformers import Qwen3Config
+
+    from nemo_automodel.components.models.qwen3.model import Qwen3ForCausalLM
+
+    config = Qwen3Config(
+        vocab_size=32,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=8,
+    )
+    config._attn_implementation = "sdpa"
+    # TE is used only by the THD branch; constructing it must not determine NEAT's mask.
+    with patch(
+        "nemo_automodel.components.models.qwen3.model.initialize_attn_module_and_func",
+        return_value=(torch.nn.Identity(), None),
+    ):
+        model = Qwen3ForCausalLM(config, backend=BackendConfig(attn="te", rope_fusion=False))
+    model.config._attn_implementation = "flash_attention_2"
+    contract = configure_packing(get_model_attn_implementation(model), model=model, unpad_data=get_unpad_data)
+    assert contract.packed_mask_type == "document_ids"
+    assert contract.patch_transformers
+    batch = neat_packed_collater([_packed_sample()], packing=contract)
+    assert batch["attention_mask"].tolist() == [[1, 1, 2, 2]]

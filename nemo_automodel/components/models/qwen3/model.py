@@ -340,6 +340,11 @@ class Qwen3ForCausalLM(HFCheckpointingMixin, Qwen3PreTrainedModel, GenerationMix
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
     _keep_in_fp32_modules = ["rotary_emb"]
 
+    @property
+    def _uses_hf_attention(self) -> bool:
+        """BSHD and NEAT use HF dispatch; TE handles only pre-packed THD."""
+        return True
+
     @dataclass(frozen=True)
     class ModelCapabilities:
         """Declared parallelism capabilities for this model class."""

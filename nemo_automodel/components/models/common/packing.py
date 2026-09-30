@@ -311,6 +311,32 @@ def _flatten_packed_metadata_at_model_entry(
     return args, updated_kwargs
 
 
+def _strip_unused_packed_metadata_at_model_entry(
+    _module: torch.nn.Module,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> tuple[tuple[Any, ...], dict[str, Any]] | None:
+    """Keep dataset-only NEAT offsets away from a legacy THD consumer.
+
+    Args:
+        _module: Model that does not require explicit NEAT metadata.
+        args: Positional model inputs, returned unchanged in their original layouts.
+        kwargs: Model inputs. ``packed_token_indices`` of shape [batch, sequence]
+            or [tokens] identifies NEAT metadata; its companion ``cu_seqlens``
+            has shape [batch, max_documents + 1] or [documents + 1].
+
+    Returns:
+        Inputs without NEAT token indices, cumulative lengths, and integer
+        ``max_seqlen``, or None if NEAT metadata is absent. Legacy THD boundaries
+        supplied without token indices are preserved.
+    """
+    if "packed_token_indices" not in kwargs:
+        return None
+    return args, {
+        key: value for key, value in kwargs.items() if key not in {"packed_token_indices", "cu_seqlens", "max_seqlen"}
+    }
+
+
 def _install_native_fa4_metadata_hook(model: torch.nn.Module) -> None:
     """Install the once-per-forward native FA4 metadata normalizer."""
     model = getattr(model, "module", model)
@@ -388,12 +414,13 @@ def _model_attn_implementation(model: torch.nn.Module) -> str | None:
 
 
 def get_model_attn_implementation(model: torch.nn.Module) -> str:
-    """Return the attention implementation used by a built model.
+    """Return the NEAT/BSHD attention implementation used by a built model.
 
     Custom models expose a typed ``backend.attn``. Hugging Face models record
     their resolved dispatch key on ``model.config``; this reflects preload and
     fallback decisions that are intentionally absent from the recipe config.
-    Models mixing native and HF attention declare which dispatch is active.
+    Models mixing native and HF attention declare which dispatch handles BSHD.
+    A separate pre-packed THD path does not determine the NEAT mask layout.
 
     Args:
         model: Constructed model, optionally wrapped in DDP.
@@ -539,7 +566,9 @@ def configure_packing(
     Hugging Face flash-attention variants require private Transformers adapters
     for the indexed document map. Native consumers receive explicit metadata and
     need no patch. The conversion callable is injected by the recipe so this
-    model component never imports the dataset implementation.
+    model component never imports the dataset implementation. Consumers that do
+    not require NEAT metadata strip it at entry, so a shared KD batch cannot
+    accidentally activate their legacy THD dispatch.
 
     Migration: resolve the backend with ``get_model_attn_implementation(model)``
     (replacing ``get_attn_implementation(cfg_model, model)``), supply the
@@ -566,6 +595,12 @@ def configure_packing(
         ValueError: If a Transformers adapter is required without ``unpad_data``.
     """
     capabilities = get_packing_capabilities(attn_implementation, model=model)
+    if model is not None and not capabilities.requires_packed_sequence_metadata:
+        model = getattr(model, "module", model)
+        if getattr(model, "_unused_packed_metadata_hook_handle", None) is None:
+            model._unused_packed_metadata_hook_handle = model.register_forward_pre_hook(
+                _strip_unused_packed_metadata_at_model_entry, with_kwargs=True
+            )
     if capabilities.uses_native_fa4:
         if model is None:
             raise ValueError("Native FA4 packing requires the built model")
