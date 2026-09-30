@@ -4,7 +4,7 @@ description: "Reference Ministral-3-3B-Base-2512 checkpoint and architecture det
 slug: model-coverage/embedding-models/mistralai/Ministral-3-3B-Base-2512
 ---
 
-NeMo AutoModel loads [Mistral AI's Ministral3](https://mistral.ai/news/ministraux/) with the stock Hugging Face `Ministral3Model` and sets `is_causal: false` for embedding and dense retrieval tasks. Each token can therefore attend to both past and future tokens without requiring a custom model implementation.
+NeMo AutoModel loads [Mistral AI's Ministral3](https://mistral.ai/news/ministraux/) with the stock Hugging Face `Ministral3Model` and configurable text attention for embedding and dense retrieval tasks. It defaults to `is_causal: false`, so each token can attend to both past and future tokens without requiring a custom model implementation.
 
 The encoder loads text-only checkpoints directly. For Ministral3 vision-language model (VLM) checkpoints, the default retrieval path retains the vision tower. Set `model.extract_submodel: language_model` to train a text-only encoder instead. The custom `Ministral3BidirectionalModel` remains available through the legacy `ministral3_bidirec` model type for compatibility with existing checkpoints.
 
@@ -28,7 +28,7 @@ choose the base or instruct variant.
 
 ### Embedding Models
 
-The stock non-causal bi-encoder path is used for embedding generation and dense retrieval.
+The stock bi-encoder path is used for embedding generation and dense retrieval.
 
 | Architecture | Task | Auto Class | Description |
 |---|---|---|---|
@@ -37,6 +37,13 @@ The stock non-causal bi-encoder path is used for embedding generation and dense 
 | `Mistral3BidirectionalModel` | Multimodal embedding | [`NeMoAutoModelBiEncoder`](https://github.com/NVIDIA-NeMo/Automodel/blob/8dc00dcb4a35c2413c52c6e7eb7ac8f1c24836aa/nemo_automodel/_transformers/auto_model.py#L991) | Pixtral vision tower with a bidirectional Ministral3 language tower |
 
 For multimodal cross-encoder scoring, `mistral3` checkpoints with a Ministral3 text tower use `Mistral3VLBidirectionalForSequenceClassification`. Text-only `ministral3` checkpoints continue to use Hugging Face `Ministral3ForSequenceClassification`.
+
+### Attention Mode
+
+Set `model.is_causal` to `true` or `false` in the bi-encoder recipe. An explicit value takes precedence over the
+saved text-config value; when neither exists, the model defaults to bidirectional attention. The resolved value is saved
+with the checkpoint. Changing the policy changes embeddings, so regenerate stored corpus embeddings before querying
+with the updated model.
 
 ### Pooling Strategies
 

@@ -53,10 +53,12 @@ from transformers.initialization import no_init_weights  # noqa: E402
 from transformers.models.auto.auto_factory import _BaseAutoModelClass  # noqa: E402
 from transformers.utils import ContextManagers  # noqa: E402
 
-from nemo_automodel.components.distributed.config import DistributedSetup  # noqa: E402
-from nemo_automodel.components.distributed.ddp import DDPManager  # noqa: E402
+from nemo_automodel.components.distributed.config import (  # noqa: E402
+    DDPConfig,
+    DistributedSetup,
+    MegatronFSDPConfig,
+)
 from nemo_automodel.components.distributed.init_utils import get_world_size_safe  # noqa: E402
-from nemo_automodel.components.distributed.megatron_fsdp import MegatronFSDPManager  # noqa: E402
 from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPipeline  # noqa: E402, F401
 from nemo_automodel.components.quantization.qat import QATConfig  # noqa: E402
 from nemo_automodel.components.utils.model_utils import (  # noqa: E402
@@ -80,6 +82,7 @@ import transformers.generation.utils as _gen_utils  # noqa: E402
 from nemo_automodel._transformers.auto_config import NeMoAutoConfig as AutoConfig
 from nemo_automodel._transformers.infrastructure import (
     MeshContext,
+    _get_strategy_config,
     apply_model_infrastructure,
     instantiate_infrastructure,
 )
@@ -515,13 +518,13 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 kwargs["config"] = _hf_config
 
         # Use meta device initialization when:
-        # - Not using MegatronFSDPManager or DDPManager (they handle their own initialization)
+        # - Not using Megatron-FSDP or DDP (they handle their own initialization)
         # - AND either multi-GPU (world_size > 1) or single-GPU custom model (not HF)
         # - AND not using quantization (we let HF handle BitsAndBytes/FP8; don't init meta device)
         #   For non-HF models, native quant config is ignored.
         is_meta_device = all(
             [
-                not isinstance(model_wrapper, (MegatronFSDPManager, DDPManager)),
+                not isinstance(_get_strategy_config(model_wrapper), (MegatronFSDPConfig, DDPConfig)),
                 get_world_size_safe() > 1 or not is_hf_model,
                 quantization_config is None and (_hf_native_quant_cfg is None or not is_hf_model),
             ]

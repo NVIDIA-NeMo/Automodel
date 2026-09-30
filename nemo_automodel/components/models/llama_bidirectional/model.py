@@ -94,6 +94,7 @@ class LlamaBidirectionalModel(LlamaModel):
         super().__init__(config)
         # Transformers mask builders read this per-attention flag; dual-mode parity tests guard that upstream contract.
         is_causal = getattr(config, "is_causal", False)
+        config.is_causal = is_causal
         for layer in self.layers:
             layer.self_attn.is_causal = is_causal
 

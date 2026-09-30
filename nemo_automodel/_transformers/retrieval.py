@@ -232,9 +232,16 @@ def _resolve_text_backbone_is_causal(
     is_causal: bool | None,
     *,
     default: bool | None = None,
-) -> bool:
+) -> bool | None:
     """Resolve explicit and saved policies before consulting a model's native mode."""
     saved_policy = _get_config_value(_get_text_config(config), "is_causal")
+    if getattr(model.config, "is_encoder_decoder", False) is True:
+        if is_causal is not None or saved_policy is not None or default is not None:
+            raise ValueError(
+                "Retrieval is_causal overrides are not supported for encoder-decoder models; "
+                "leave is_causal unset to preserve native scoring attention."
+            )
+        return None
     if is_causal is not None or saved_policy is not None:
         return _resolve_is_causal(config, is_causal)
     if default is not None:
@@ -242,13 +249,15 @@ def _resolve_text_backbone_is_causal(
     return _get_native_text_backbone_is_causal(model)
 
 
-def _set_text_backbone_is_causal(model: PreTrainedModel, is_causal: bool) -> None:
+def _set_text_backbone_is_causal(model: PreTrainedModel, is_causal: bool | None) -> None:
     """Persist and apply is_causal to a retrieval model's text backbone.
 
     Composite models are scoped to their text tower so that changing the text
     attention mode never changes vision attention. Custom retrieval checkpoints
     remain loadable for backward compatibility and honor the same policy as stock backbones.
     """
+    if is_causal is None:
+        return
     text_backbone, text_config = _get_text_backbone(model)
     if isinstance(text_config, dict):
         text_config["is_causal"] = is_causal
@@ -476,7 +485,7 @@ def build_encoder_backbone(
         )
         effective_is_causal = _resolve_text_backbone_is_causal(
             backbone,
-            backbone.config,
+            extracted_model.config,
             is_causal,
             default=False if task == "embedding" else None,
         )
@@ -994,7 +1003,7 @@ class CrossEncoderModel(nn.Module):
         self,
         input_dict: Mapping[str, Any] | None = None,
         **kwargs: Any,
-    ) -> ModelOutput:
+    ) -> ModelOutput | tuple[torch.Tensor, ...]:
         """Score tokenized query-document pairs with the wrapped backbone.
 
         Args:

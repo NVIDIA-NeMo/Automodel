@@ -19,8 +19,9 @@ import torch.nn as nn
 from torch.distributed.fsdp import FSDPModule
 from transformers import AutoConfig, AutoModel, AutoModelForSequenceClassification, PretrainedConfig
 from transformers import initialization as init
-from transformers.cache_utils import Cache
-from transformers.modeling_outputs import SequenceClassifierOutputWithPast
+from transformers.cache_utils import Cache, DynamicCache
+from transformers.masking_utils import create_bidirectional_mask
+from transformers.modeling_outputs import BaseModelOutputWithPast, SequenceClassifierOutputWithPast
 from transformers.models.ministral3.configuration_ministral3 import Ministral3Config
 from transformers.models.ministral3.modeling_ministral3 import Ministral3Model
 from transformers.models.mistral3.configuration_mistral3 import Mistral3Config
@@ -74,8 +75,99 @@ class Ministral3BidirectionalModel(Ministral3Model):
         super().__init__(config)
         # Transformers mask builders read this per-attention flag; dual-mode parity tests guard that upstream contract.
         is_causal = getattr(config, "is_causal", False)
+        config.is_causal = is_causal
         for layer in self.layers:
             layer.self_attn.is_causal = is_causal
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        use_cache: bool | None = None,
+        cache_position: torch.LongTensor | None = None,
+        **kwargs: Any,
+    ) -> BaseModelOutputWithPast:
+        """Forward pass with the attention mode stored in the model config.
+
+        Causal mode delegates to the Hugging Face parent implementation. Non-causal
+        mode uses the retrieval-specific bidirectional mask.
+
+        Args:
+            input_ids: Integer token IDs [batch, sequence], exclusive with inputs_embeds.
+            attention_mask: Optional padding mask [batch, sequence], with zero for padding.
+            position_ids: Integer positions [batch, sequence] or [1, sequence].
+            past_key_values: Optional Transformers cache in its native layout.
+            inputs_embeds: Floating-point embeddings [batch, sequence, hidden].
+            use_cache: Whether to populate the returned cache.
+            cache_position: Integer cache positions [sequence].
+            **kwargs: Additional Hugging Face forward options.
+
+        Returns:
+            Output with floating-point last_hidden_state [batch, sequence, hidden],
+            where hidden is config.hidden_size, and the optional Transformers cache.
+            In causal mode, optional hidden states and attentions follow the Hugging
+            Face Ministral3Model.forward output contract.
+        """
+        if getattr(self.config, "is_causal", False):
+            return super().forward(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                **kwargs,
+            )
+
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
+
+        if use_cache and past_key_values is None:
+            past_key_values = DynamicCache(config=self.config)
+
+        if cache_position is None:
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            cache_position = torch.arange(
+                past_seen_tokens,
+                past_seen_tokens + inputs_embeds.shape[1],
+                device=inputs_embeds.device,
+            )
+
+        if position_ids is None:
+            position_ids = cache_position.unsqueeze(0)
+
+        bidirectional_mask = create_bidirectional_mask(
+            config=self.config,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+        )
+
+        hidden_states = inputs_embeds
+        position_embeddings = self.rotary_emb(hidden_states, position_ids=position_ids)
+
+        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+            hidden_states = decoder_layer(
+                hidden_states,
+                attention_mask=bidirectional_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
+                **kwargs,
+            )
+        hidden_states = self.norm(hidden_states)
+        return BaseModelOutputWithPast(
+            last_hidden_state=hidden_states,
+            past_key_values=past_key_values if use_cache else None,
+        )
 
 
 class Mistral3BidirectionalConfig(Mistral3Config):
