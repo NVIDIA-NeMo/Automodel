@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -137,6 +138,41 @@ class TestHybridEPRuntimeInitialization:
         assert hybrid_ep_manager.handle is old_handle
         assert torch.equal(parameter.grad, torch.tensor([7.0]))
         assert torch.equal(actual_rng, expected_rng)
+
+    @pytest.mark.parametrize("calibrated", [None, 8])
+    def test_runtime_warmup_leaves_capacity_mode_uncalibrated(self, monkeypatch, caplog, calibrated):
+        """The synthetic warmup dispatch must neither become nor use capacity mode's calibration.
+
+        ``calibrated=8`` is the growth path: a re-warmup after real batches already calibrated the
+        capacity must not run the synthetic dispatch non-blocking at that capacity, nor recalibrate it.
+        """
+        import nemo_automodel.components.moe.megatron.token_dispatcher as td
+
+        with patch(
+            "nemo_automodel.components.moe.megatron.token_dispatcher.hybrid_ep_dispatch", new=lambda *a, **kw: None
+        ):
+            manager = _HybridEPManager(
+                group=None, num_local_experts=2, num_experts=8, router_topk=2, moe_hybridep_capacity_factor=1.5
+            )
+        manager._hybridep_capacity = calibrated
+        passed = []
+
+        def fake_dispatch(x, routing_map, probs, num_permuted_tokens=None, **kwargs):
+            passed.append(num_permuted_tokens)
+            token_rows = routing_map.nonzero(as_tuple=False)[:, 0]
+            return x[token_rows], probs[routing_map], None, routing_map.sum(dim=0), "runtime-handle"
+
+        monkeypatch.setattr(td, "hybrid_ep_dispatch", fake_dispatch)
+        monkeypatch.setattr(
+            td, "hybrid_ep_combine", lambda x, **kwargs: x.reshape(5, manager.router_topk, 4).sum(dim=1)
+        )
+        with caplog.at_level(logging.INFO, logger=td.__name__):
+            manager.initialize_runtime(num_tokens=5, hidden_dim=4, dtype=torch.float32, device=torch.device("cpu"))
+
+        assert passed == [None], "warmup dispatch ran on the blocking path (no capacity passed)"
+        assert manager._hybridep_capacity == calibrated, "calibration neither taken from nor changed by the warmup"
+        assert manager.hybridep_capacity_factor == 1.5, "knob restored after the warmup"
+        assert "HybridEP capacity mode: calibrated" not in caplog.text
 
     def test_runtime_capacity_matches_hybridep_floor_rounding_and_group_max(self, hybrid_ep_manager, monkeypatch):
         initializer = HybridEPPipelineRuntimeInitializer(hybrid_ep_manager, 16, torch.bfloat16)
