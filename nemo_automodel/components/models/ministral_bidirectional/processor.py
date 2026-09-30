@@ -227,7 +227,8 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
             Processor with Sentence Transformers query/document prompts and saved image settings.
 
         Raises:
-            ValueError: If saved retrieval prompt metadata is malformed.
+            ValueError: If saved retrieval prompt metadata is malformed or a prompt-policy override conflicts with
+                the saved retrieval chat template.
         """
         metadata_path = cached_file(
             pretrained_model_name_or_path,
@@ -352,6 +353,16 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
         # Instruct templates must be converted, but saved retrieval templates own
         # their formatting and must survive a load/save round trip unchanged.
         if chat_template is not None and "{# nemo-mistral-retrieval-v1" in chat_template:
+            saved_prompt_setting = chat_template.split("\n", 1)[0]
+            if (
+                saved_prompt_setting
+                in (
+                    "{%- set use_prompt_template = false -%}",
+                    "{%- set use_prompt_template = true -%}",
+                )
+                and saved_prompt_setting != f"{{%- set use_prompt_template = {str(use_prompt_template).lower()} -%}}"
+            ):
+                raise ValueError("use_prompt_template conflicts with the saved retrieval chat template")
             self.chat_template = chat_template
         else:
             prompt_setting = "true" if use_prompt_template else "false"

@@ -82,7 +82,7 @@ uv run automodel examples/retrieval/cross_encoder/mistral3_vl_reranker.yaml --np
 
 See the [Installation Guide](/get-started/installation).
 
-The reranker applies `model.temperature` in the score tensor's dtype, which is BF16 in the example. The recipe then casts scores to FP32 for cross entropy. Keep the top-level `temperature: 1.0` when using a non-unit model temperature; setup rejects two active temperature sources.
+The reranker's scoring projection and `model.temperature` scaling run in FP32, including under BF16 autocast. The recipe also computes cross entropy in FP32. Keep the top-level `temperature: 1.0` when using a non-unit model temperature; setup rejects two active temperature sources.
 
 To freeze model towers, use the top-level `freeze_config` section. For example, setting `freeze_vision_tower: true` and `freeze_language_model: true` within that section leaves the projector and, for reranking, the scoring head trainable.
 
@@ -95,5 +95,7 @@ See the [Embedding and Reranking Fine-Tuning Guide](/recipes-e2e-examples/retrie
 ## Related Resources
 
 - [NeMo AutoModel Repository](https://github.com/NVIDIA-NeMo/Automodel)
+- [Nemotron 3 Embed end-to-end fine-tuning recipe (text)](https://github.com/NVIDIA-NeMo/Nemotron/blob/main/docs/nemotron/embed/README.md)
+- [Mistral3 VL end-to-end fine-tuning recipe (in development)](https://github.com/NVIDIA-NeMo/Nemotron/pull/351)
 - [mistralai/Ministral-3-3B-Base-2512](https://huggingface.co/mistralai/Ministral-3-3B-Base-2512)
 - [mistralai/Ministral-3-3B-Instruct-2512](https://huggingface.co/mistralai/Ministral-3-3B-Instruct-2512)

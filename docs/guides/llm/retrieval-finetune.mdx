@@ -116,6 +116,11 @@ The following table compares the recipe components:
 | Collator | `BiEncoderCollator` | `CrossEncoderCollator` |
 | Training objective | Cross entropy over one positive plus negatives | Cross entropy over one positive plus negatives |
 
+For Python callers, `NeMoAutoModelCrossEncoder.from_pretrained` follows the Transformers positional argument
+convention: arguments after the checkpoint path are forwarded to the backbone constructor. Calls that previously
+passed the attention implementation as the second positional argument must now use a keyword, for example
+`NeMoAutoModelCrossEncoder.from_pretrained(checkpoint_path, attn_implementation="sdpa")`.
+
 The bi-encoder computes a query embedding and passage embeddings independently. The cross-encoder formats each
 query-passage pair into one sequence and predicts a score for each candidate passage.
 

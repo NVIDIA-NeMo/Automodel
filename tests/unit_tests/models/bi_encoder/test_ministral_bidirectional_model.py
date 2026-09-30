@@ -2008,6 +2008,8 @@ def test_mistral3_reranker_template_and_defaults_roundtrip(
     saved_template = processor.chat_template
     processor.rerank_max_length = 64
     processor.save_pretrained(tmp_path)
+    with pytest.raises(ValueError, match="use_prompt_template conflicts with the saved retrieval chat template"):
+        Mistral3BiEncoderProcessor.from_pretrained(tmp_path, use_prompt_template=not use_prompt_template)
     restored = Mistral3BiEncoderProcessor.from_pretrained(tmp_path)
     assert restored.chat_template == saved_template
     assert restored.tokenizer.chat_template == saved_template
