@@ -575,8 +575,8 @@ def test_model_advertises_packed_cp_for_sparse_backends(attn_backend: str) -> No
     assert not sdpa_supports.supports_cp_with_sequence_packing
 
 
-@pytest.mark.parametrize("explicit_document_ids", [False, True])
-def test_packed_gdn_parent_forward_backward_matches_separate_documents(explicit_document_ids: bool) -> None:
+@pytest.mark.parametrize("document_id_offset", [None, 0, 1])
+def test_packed_gdn_parent_forward_backward_matches_separate_documents(document_id_offset: int | None) -> None:
     """Exercise the inherited forward with three documents, including zero-based ID 2."""
     import copy
 
@@ -659,7 +659,9 @@ def test_packed_gdn_parent_forward_backward_matches_separate_documents(explicit_
     hidden = torch.randn(1, 10, config.hidden_size, requires_grad=True)
     ref_hidden = hidden.detach().clone().requires_grad_()
     boundaries = [0, 3, 6, 10]
-    attention_mask = torch.tensor([[0, 0, 0, 1, 1, 1, 2, 2, 2, 2]]) if explicit_document_ids else None
+    attention_mask = (
+        torch.tensor([[0, 0, 0, 1, 1, 1, 2, 2, 2, 2]]) + document_id_offset if document_id_offset is not None else None
+    )
     output = layer(hidden, cu_seqlens=torch.tensor(boundaries, dtype=torch.int32), attention_mask=attention_mask)
     expected = torch.cat([reference(ref_hidden[:, start:end]) for start, end in zip(boundaries, boundaries[1:])], dim=1)
     upstream = torch.randn_like(output)
@@ -669,3 +671,22 @@ def test_packed_gdn_parent_forward_backward_matches_separate_documents(explicit_
     torch.testing.assert_close(hidden.grad, ref_hidden.grad, rtol=3e-5, atol=1e-6)
     for (name, param), (_, ref_param) in zip(layer.named_parameters(), reference.named_parameters()):
         torch.testing.assert_close(param.grad, ref_param.grad, rtol=3e-5, atol=1e-6, msg=name)
+
+
+@pytest.mark.parametrize(
+    "boundaries,document_ids,message",
+    [
+        ([0, 3, 6, 10], [[1, 1, 1, 1, 1, 1, 2, 2, 2, 2]], "attention_mask document boundaries"),
+        ([0, 3, 6, 8], None, "one unpadded row"),
+        ([0, 6, 3, 10], None, "one unpadded row"),
+    ],
+)
+def test_packed_gdn_rejects_inconsistent_boundaries_before_kernels(boundaries, document_ids, message):
+    from nemo_automodel.components.models.qwen3_8_flash_next.layers import Qwen3_8_FlashNextGatedDeltaNet
+
+    layer = Qwen3_8_FlashNextGatedDeltaNet.__new__(Qwen3_8_FlashNextGatedDeltaNet)
+    torch.nn.Module.__init__(layer)
+    layer._cp_mesh = None
+    mask = None if document_ids is None else torch.tensor(document_ids)
+    with pytest.raises(ValueError, match=message):
+        layer(torch.randn(1, 10, 4), cu_seqlens=torch.tensor(boundaries), attention_mask=mask)

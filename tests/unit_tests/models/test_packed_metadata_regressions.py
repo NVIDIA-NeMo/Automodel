@@ -173,3 +173,12 @@ def test_kimi_kda_preserves_flat_cu_seqlens_only_inputs(family):
     upstream = torch.randn_like(output)
     output.backward(upstream)
     torch.testing.assert_close(hidden.grad, upstream * 2)
+
+
+@pytest.mark.parametrize("family", ["kimi_linear", "kimi_k3"])
+def test_kimi_kda_rejects_indices_without_boundaries(family):
+    module = importlib.import_module(f"nemo_automodel.components.models.{family}.model")
+    layer = module.KimiDeltaAttention.__new__(module.KimiDeltaAttention)
+    nn.Module.__init__(layer)
+    with pytest.raises(ValueError, match="dataset-provided packed_token_indices and cu_seqlens"):
+        layer(torch.randn(1, 5, 4), packed_token_indices=torch.arange(5))

@@ -167,23 +167,40 @@ class Qwen3_8_FlashNextGatedDeltaNet(CPAwareGatedDeltaNet):
         cu_seqlens = kwargs.pop("cu_seqlens", None)
         cp_active = self._cp_mesh is not None and self._cp_mesh.size() > 1
         if not cp_active or cu_seqlens is None:
-            if cu_seqlens is not None and kwargs.get("attention_mask") is None:
-                # The inherited packed conv path reads per-token document IDs
-                # from ``attention_mask``. Synthesize them from the boundaries
-                # for cu_seqlens-only packed batches.
-                boundaries = cu_seqlens.reshape(-1).to(device=hidden_states.device, dtype=torch.long)
-                document_ids = torch.repeat_interleave(
-                    torch.arange(boundaries.numel() - 1, device=hidden_states.device),
-                    boundaries.diff(),
+            if cu_seqlens is not None:
+                boundaries = cu_seqlens.to(device=hidden_states.device, dtype=torch.long)
+                if (
+                    hidden_states.shape[0] != 1
+                    or boundaries.ndim != 1
+                    or boundaries.numel() < 2
+                    or int(boundaries[0]) != 0
+                    or int(boundaries[-1]) != hidden_states.shape[1]
+                    or bool((boundaries.diff() <= 0).any())
+                ):
+                    raise ValueError(
+                        "Packed Qwen3.8 GDN cu_seqlens must strictly partition one unpadded row "
+                        "from zero through the full sequence length."
+                    )
+                document_ids = (
+                    torch.repeat_interleave(
+                        torch.arange(boundaries.numel() - 1, device=hidden_states.device),
+                        boundaries.diff(),
+                    )
+                    .unsqueeze(0)
+                    .to(torch.int32)
                 )
-                kwargs["attention_mask"] = document_ids.unsqueeze(0).to(torch.int32)
-            if cu_seqlens is not None and kwargs.get("indices") is None:
-                # This caller supplies a contiguous, unpadded row. The parent
-                # requires explicit valid-token indices for indexed masks,
-                # whether supplied by the caller or synthesized above.
-                kwargs["indices"] = torch.arange(
-                    hidden_states.shape[0] * hidden_states.shape[1], device=hidden_states.device
-                )
+                attention_mask = kwargs.get("attention_mask")
+                if attention_mask is None:
+                    kwargs["attention_mask"] = document_ids
+                elif attention_mask.shape != document_ids.shape or not torch.equal(
+                    attention_mask[:, 1:] != attention_mask[:, :-1],
+                    document_ids[:, 1:] != document_ids[:, :-1],
+                ):
+                    raise ValueError("Packed Qwen3.8 GDN attention_mask document boundaries must match cu_seqlens.")
+                if kwargs.get("indices") is None:
+                    # Conv and recurrence share the same document boundaries on
+                    # this contiguous, unpadded row, including with explicit IDs.
+                    kwargs["indices"] = torch.arange(document_ids.numel(), device=hidden_states.device)
             return super().forward(hidden_states, cu_seqlens=cu_seqlens, **kwargs)
         self._packed_global_cu_seqlens = cu_seqlens
         try:

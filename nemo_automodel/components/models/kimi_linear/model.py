@@ -597,7 +597,10 @@ class KimiDeltaAttention(nn.Module):
         Args:
             hidden_states: Tensor of shape [batch, sequence, hidden]; the sequence axis
                 holds this rank's contiguous shard under context parallelism.
-            attention_mask: Optional binary padding mask of shape [batch, sequence] where 1 marks valid tokens.
+            attention_mask: Optional tensor of shape [batch, sequence]. Without
+                packed metadata this is a binary validity mask (1 means valid).
+                With packed metadata it may hold 1-based document IDs and zero
+                for padding.
             packed_context: Optional document layout of the batch, required under
                 context parallelism and used to reset the recurrent state at every
                 packed-document boundary.
@@ -606,8 +609,11 @@ class KimiDeltaAttention(nn.Module):
                 -1 padding, or flat positions of shape [tokens]. ``cu_seqlens``
                 contains row-local boundaries of shape [batch, max_documents + 1]
                 with -1 unused entries, or flat boundaries of shape [documents + 1].
+                With token indices, boundaries address the unpadded valid-token
+                stream; alone, flat boundaries address one unpadded physical row.
                 ``_packed_seq_ids`` optionally carries document IDs of shape
-                [batch, sequence]; ``padding_mask`` has the same shape.
+                [batch, sequence]; ``padding_mask`` is boolean with the same
+                shape, where True marks padding.
 
         Returns:
             Tensor of shape [batch, sequence, hidden].
