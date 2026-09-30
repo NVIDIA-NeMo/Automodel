@@ -696,7 +696,11 @@ class _HybridEPManager(_DispatchManager):
 
         The synthetic tensors are local to the dispatcher and no model parameter
         participates in autograd.  Manager fields used by a real dispatch are
-        restored even if initialization fails.
+        restored even if initialization fails.  Capacity mode
+        (``hybridep_capacity_factor``) is suspended for the synthetic dispatch: its
+        capacity is calibrated from the first *real* batch, whose routing skew a
+        balanced synthetic batch cannot stand in for, so the factor and any
+        calibrated capacity are restored untouched.
         """
         if num_tokens <= 0:
             raise ValueError(f"num_tokens must be positive, got {num_tokens}")
@@ -717,11 +721,16 @@ class _HybridEPManager(_DispatchManager):
             "num_permuted_tokens",
             "_static_target_tokens",
             "_static_num_permuted_tokens",
+            "hybridep_capacity_factor",
+            "_hybridep_capacity",
         )
         missing = object()
         saved = {name: getattr(self, name, missing) for name in transient_names}
 
         try:
+            # The warmup dispatch must not become capacity mode's calibration dispatch (see the
+            # docstring); run it on the blocking path. Both fields are in transient_names.
+            self.hybridep_capacity_factor = None
             # Validation loops commonly run under inference_mode.  HybridEP's
             # backward kernel variants still need a real autograd graph here.
             with torch.inference_mode(False), torch.enable_grad():
