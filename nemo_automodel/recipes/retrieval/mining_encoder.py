@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Checkpoint-owned retrieval preprocessing for mining and evaluation."""
+"""Checkpoint inference adapters for the hard-negative mining recipe."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ import logging
 from dataclasses import dataclass
 from importlib import import_module
 from io import BytesIO
-from typing import TYPE_CHECKING, Any, Literal, Protocol
+from typing import Any, Literal, Protocol
 
 import numpy as np
 import torch
@@ -30,37 +30,15 @@ from transformers.utils.hub import cached_file
 
 from nemo_automodel.shared.import_utils import safe_import
 
-if TYPE_CHECKING:
-    from nemo_automodel._transformers.retrieval import BiEncoderModel
-
 logger = logging.getLogger(__name__)
 
 
 class _RetrievalProcessor(Protocol):
-    def process_queries(self, queries: list[str], *, return_tensors: Literal["pt"]) -> dict[str, Any]:
-        """Process query strings.
+    def process_queries(self, queries: list[str], *, return_tensors: Literal["pt"]) -> dict[str, Any]: ...
 
-        Args:
-            queries: Query strings in input order.
-            return_tensors: Tensor backend.
-
-        Returns:
-            Token IDs and attention mask tensors of shape [batch, sequence].
-        """
-        ...
-
-    def process_documents(self, documents: list[dict[str, Any]], *, return_tensors: Literal["pt"]) -> dict[str, Any]:
-        """Process text/image documents.
-
-        Args:
-            documents: Mappings containing text and optional decoded or local images.
-            return_tensors: Tensor backend.
-
-        Returns:
-            Token IDs/masks of shape [batch, sequence], optional pixel tensors of
-            shape [images, channels, height, width], and image sizes of shape [images, 2].
-        """
-        ...
+    def process_documents(
+        self, documents: list[dict[str, Any]], *, return_tensors: Literal["pt"]
+    ) -> dict[str, Any]: ...
 
 
 def _prepare_document(document: dict[str, Any], *, use_text_in_document: bool, use_images: bool) -> tuple[Any, Any]:
@@ -86,12 +64,7 @@ def _prepare_document(document: dict[str, Any], *, use_text_in_document: bool, u
 
 @dataclass(frozen=True)
 class CheckpointMiningEncoderConfig:
-    """Optional runtime overrides for the checkpoint's model-owned retrieval processor.
-
-    Omitted overrides preserve saved processor settings and Sentence Transformers
-    prompts. An explicitly empty prefix disables that prompt. The processor is
-    loaded from the same resolved snapshot as the model, not a second model path.
-    """
+    """Checkpoint inference settings; omitted overrides preserve saved prompts and preprocessing."""
 
     q_max_length: int | None = None
     p_max_length: int | None = None
@@ -105,8 +78,7 @@ class CheckpointMiningEncoderConfig:
         self,
         *,
         device: torch.device,
-        model_name_or_path: str | None = None,
-        model: "BiEncoderModel | None" = None,
+        model_name_or_path: str,
         trust_remote_code: bool = False,
         attn_implementation: str | None = None,
     ) -> "CheckpointMiningEncoder | SentenceTransformerMiningEncoder":
@@ -115,67 +87,61 @@ class CheckpointMiningEncoderConfig:
         Args:
             device: Device on which model inputs and embeddings are computed.
             model_name_or_path: Local checkpoint directory or Hugging Face model ID.
-            model: Already loaded bi-encoder, for callers that own model loading.
             trust_remote_code: Whether model loading may execute remote code.
             attn_implementation: Optional attention backend for model loading.
 
         Returns:
             A configured mining encoder.
         """
-        if model is None:
-            if model_name_or_path is None:
-                raise ValueError("Either model_name_or_path or model must be provided for mining.")
-            modules_file = cached_file(model_name_or_path, "modules.json", _raise_exceptions_for_missing_entries=False)
-            if modules_file is not None:
-                config_file = cached_file(
-                    model_name_or_path, "config_sentence_transformers.json", _raise_exceptions_for_missing_entries=False
-                )
-                if config_file is not None:
-                    with open(config_file, encoding="utf-8") as file:
-                        model_type = json.load(file).get("model_type", "SentenceTransformer")
-                    if model_type != "SentenceTransformer":
-                        raise ValueError(
-                            f"Checkpoint {model_name_or_path!r} is a {model_type}, not a SentenceTransformer "
-                            "embedding model."
-                        )
-                available, sentence_transformers = safe_import("sentence_transformers")
-                if not available:
-                    raise ImportError("Mining this checkpoint requires the sentence-transformers package.")
-                model_kwargs = {"attn_implementation": attn_implementation} if attn_implementation else None
-                sentence_transformer = sentence_transformers.SentenceTransformer(
-                    model_name_or_path,
-                    device=str(device),
-                    trust_remote_code=trust_remote_code,
-                    model_kwargs=model_kwargs,
-                )
-                if self.image_longest_edge is not None:
-                    image_processor = getattr(
-                        getattr(sentence_transformer[0], "processor", None), "image_processor", None
+        modules_file = cached_file(model_name_or_path, "modules.json", _raise_exceptions_for_missing_entries=False)
+        if modules_file is not None:
+            config_file = cached_file(
+                model_name_or_path, "config_sentence_transformers.json", _raise_exceptions_for_missing_entries=False
+            )
+            if config_file is not None:
+                with open(config_file, encoding="utf-8") as file:
+                    model_type = json.load(file).get("model_type", "SentenceTransformer")
+                if model_type != "SentenceTransformer":
+                    raise ValueError(
+                        f"Checkpoint {model_name_or_path!r} is a {model_type}, not a SentenceTransformer "
+                        "embedding model."
                     )
-                    if image_processor is None or "longest_edge" not in image_processor.size:
-                        raise ValueError("This SentenceTransformer checkpoint has no configurable image longest edge.")
-                    image_processor.size["longest_edge"] = self.image_longest_edge
-                logger.info("Using Sentence Transformers inference for mining checkpoint %s", model_name_or_path)
-                return SentenceTransformerMiningEncoder(
-                    model=sentence_transformer,
-                    q_max_length=self.q_max_length,
-                    p_max_length=self.p_max_length,
-                    query_prefix=self.query_prefix,
-                    passage_prefix=self.passage_prefix,
-                    use_text_in_document=self.use_text_in_document,
-                    use_images=self.use_images,
-                )
+            available, sentence_transformers = safe_import("sentence_transformers")
+            if not available:
+                raise ImportError("Mining this checkpoint requires the sentence-transformers package.")
+            model_kwargs = {"attn_implementation": attn_implementation} if attn_implementation else None
+            sentence_transformer = sentence_transformers.SentenceTransformer(
+                model_name_or_path,
+                device=str(device),
+                trust_remote_code=trust_remote_code,
+                model_kwargs=model_kwargs,
+            )
+            if self.image_longest_edge is not None:
+                image_processor = getattr(getattr(sentence_transformer[0], "processor", None), "image_processor", None)
+                if image_processor is None or "longest_edge" not in image_processor.size:
+                    raise ValueError("This SentenceTransformer checkpoint has no configurable image longest edge.")
+                image_processor.size["longest_edge"] = self.image_longest_edge
+            logger.info("Using Sentence Transformers inference for mining checkpoint %s", model_name_or_path)
+            return SentenceTransformerMiningEncoder(
+                model=sentence_transformer,
+                q_max_length=self.q_max_length,
+                p_max_length=self.p_max_length,
+                query_prefix=self.query_prefix,
+                passage_prefix=self.passage_prefix,
+                use_text_in_document=self.use_text_in_document,
+                use_images=self.use_images,
+            )
 
-            from nemo_automodel._transformers.auto_model import NeMoAutoModelBiEncoder
+        from nemo_automodel._transformers.auto_model import NeMoAutoModelBiEncoder
 
-            model_kwargs = {"use_liger_kernel": False, "use_sdpa_patching": True}
-            if trust_remote_code:
-                model_kwargs["trust_remote_code"] = True
-            if attn_implementation is not None:
-                model_kwargs["attn_implementation"] = attn_implementation
-            model = NeMoAutoModelBiEncoder.from_pretrained(model_name_or_path, **model_kwargs).to(device)
-            model.eval()
-            logger.info("Using AutoModel inference for mining checkpoint %s", model_name_or_path)
+        model_kwargs = {"use_liger_kernel": False, "use_sdpa_patching": True}
+        if trust_remote_code:
+            model_kwargs["trust_remote_code"] = True
+        if attn_implementation is not None:
+            model_kwargs["attn_implementation"] = attn_implementation
+        model = NeMoAutoModelBiEncoder.from_pretrained(model_name_or_path, **model_kwargs).to(device)
+        model.eval()
+        logger.info("Using AutoModel inference for mining checkpoint %s", model_name_or_path)
 
         processor_target = getattr(model.model, "retrieval_processor_target", None)
         if processor_target is None:
@@ -217,16 +183,7 @@ class CheckpointMiningEncoder:
         use_text_in_document: bool = True,
         use_images: bool = True,
     ) -> None:
-        """Initialize a multimodal mining encoder.
-
-        Args:
-            model: Bi-encoder module whose ``encode`` method returns a tensor of shape [batch, hidden].
-            processor: Processor that creates text tensors of shape [batch, sequence] and optional image tensors of
-                shape [images, channels, height, width].
-            device: Device on which model inputs and embeddings are computed.
-            use_text_in_document: Whether image-bearing documents retain their text.
-            use_images: Whether document images are forwarded to the processor.
-        """
+        """Keep the AutoModel backbone and its saved processor together for mining."""
         self.model: torch.nn.Module | None = model
         self.processor = processor
         self.device = device
@@ -244,18 +201,7 @@ class CheckpointMiningEncoder:
         return self.model.l2_normalize
 
     def _encode_batch(self, inputs: dict[str, Any]) -> np.ndarray:
-        """Encode one processor batch.
-
-        Args:
-            inputs: Model inputs containing token tensors of shape [batch, sequence] and optional image tensors of
-                shape [images, channels, height, width] plus image sizes of shape [images, 2].
-
-        Returns:
-            Embeddings of shape [batch, hidden].
-
-        Raises:
-            RuntimeError: If the model has been released or returns no embeddings.
-        """
+        """Return finite embeddings of shape [batch, hidden] for one processor batch."""
         if self.model is None:
             raise RuntimeError("The multimodal mining model has already been released.")
         device_inputs = {
@@ -285,15 +231,7 @@ class CheckpointMiningEncoder:
         return embeddings.cpu().float().numpy()
 
     def encode_queries(self, queries: list[str], *, batch_size: int) -> np.ndarray:
-        """Encode query text in stable input order.
-
-        Args:
-            queries: Query strings for a batch of size ``queries``.
-            batch_size: Maximum number of queries processed per model call.
-
-        Returns:
-            Embeddings of shape [queries, hidden].
-        """
+        """Encode queries in input order with bounded processor batches."""
         embeddings = []
         for start in range(0, len(queries), batch_size):
             inputs = self.processor.process_queries(queries[start : start + batch_size], return_tensors="pt")
@@ -301,15 +239,7 @@ class CheckpointMiningEncoder:
         return np.concatenate(embeddings, axis=0)
 
     def encode_documents(self, documents: list[dict[str, Any]], *, batch_size: int) -> np.ndarray:
-        """Encode text, image, and image-text documents in stable input order.
-
-        Args:
-            documents: Document mappings for a batch of size ``documents``, each with ``text`` and ``image`` fields.
-            batch_size: Maximum number of documents processed per model call.
-
-        Returns:
-            Embeddings of shape [documents, hidden].
-        """
+        """Encode corpus documents in input order with bounded processor batches."""
         embeddings = []
         for start in range(0, len(documents), batch_size):
             processor_documents = []

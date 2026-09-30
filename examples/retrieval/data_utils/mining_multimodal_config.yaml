@@ -32,7 +32,7 @@ mining:
     # Sentence Transformers checkpoints use their saved inference pipeline;
     # other checkpoints use AutoModel and their saved retrieval processor.
     # Only runtime token budgets are overridden here.
-    _target_: nemo_automodel._transformers.mining.CheckpointMiningEncoderConfig
+    _target_: nemo_automodel.recipes.retrieval.mining_encoder.CheckpointMiningEncoderConfig
     q_max_length: 512
     p_max_length: 4096
     # Match embedding training: image documents include companion text.

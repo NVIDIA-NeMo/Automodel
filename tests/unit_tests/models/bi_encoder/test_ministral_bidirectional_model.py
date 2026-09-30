@@ -46,7 +46,7 @@ pytest.importorskip("transformers.models.ministral3", reason="Ministral3 not ava
 from transformers.models.ministral3.modeling_ministral3 import Ministral3Model as HFMinistral3Model
 from transformers.models.mistral3.modeling_mistral3 import Mistral3Model
 
-from nemo_automodel._transformers.mining import CheckpointMiningEncoder, CheckpointMiningEncoderConfig
+from nemo_automodel.recipes.retrieval.mining_encoder import CheckpointMiningEncoder, CheckpointMiningEncoderConfig
 from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel._transformers.retrieval import (
     BiEncoderModel,
@@ -507,7 +507,7 @@ def test_ministral3_biencoder_processor_saves_as_stock_pixtral_without_remote_co
 
 
 @pytest.mark.parametrize("overrides", [{}, {"query_prefix": "", "passage_prefix": ""}, {"query_prefix": "Text:"}])
-def test_checkpoint_mining_restores_prompts_and_image_settings(tmp_path, overrides):
+def test_checkpoint_mining_restores_prompts_and_image_settings(tmp_path, overrides, monkeypatch):
     """Actual saved metadata, not mining defaults, determines processor token IDs."""
     original = Mistral3BiEncoderProcessor(
         image_processor=PixtralImageProcessor(size={"longest_edge": 56}),
@@ -520,7 +520,15 @@ def test_checkpoint_mining_restores_prompts_and_image_settings(tmp_path, overrid
     )
     model = BiEncoderModel(Mistral3BidirectionalModel(_tiny_mistral3_bidirectional_vlm_config()))
     model.source_model_path = str(tmp_path)
-    loaded = CheckpointMiningEncoderConfig(**overrides).build(model=model, device=torch.device("cpu")).processor
+    monkeypatch.setattr("nemo_automodel.recipes.retrieval.mining_encoder.cached_file", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "nemo_automodel._transformers.auto_model.NeMoAutoModelBiEncoder.from_pretrained", lambda *args, **kwargs: model
+    )
+    loaded = (
+        CheckpointMiningEncoderConfig(**overrides)
+        .build(model_name_or_path=str(tmp_path), device=torch.device("cpu"))
+        .processor
+    )
     expected_query = overrides.get("query_prefix", "Document:")
     expected_passage = overrides.get("passage_prefix", "Image:")
     assert loaded.query_prefix == expected_query

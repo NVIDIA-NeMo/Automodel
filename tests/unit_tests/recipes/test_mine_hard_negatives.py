@@ -23,7 +23,7 @@ import numpy as np
 import pytest
 import torch
 
-from nemo_automodel._transformers.mining import CheckpointMiningEncoderConfig
+from nemo_automodel.recipes.retrieval.mining_encoder import CheckpointMiningEncoderConfig
 from nemo_automodel.components.config.loader import ConfigNode, load_yaml_config
 from nemo_automodel.recipes.retrieval.mine_hard_negatives import MINING_DEFAULTS, MineHardNegativesRecipe
 
@@ -270,7 +270,7 @@ def test_distributed_multimodal_chunk_fetches_only_rank_owned_documents(tmp_path
 
 def test_mining_metadata_records_json_serializable_multimodal_config_and_disabled_cache_reuse(monkeypatch):
     monkeypatch.setenv("MINING_TEST_PREFIX", "look up:")
-    target = "nemo_automodel._transformers.mining.CheckpointMiningEncoderConfig"
+    target = "nemo_automodel.recipes.retrieval.mining_encoder.CheckpointMiningEncoderConfig"
     cfg = ConfigNode(
         {
             "mining": {
@@ -298,7 +298,7 @@ def test_mining_metadata_records_json_serializable_multimodal_config_and_disable
         patch("nemo_automodel.recipes.retrieval.mine_hard_negatives.build_distributed") as build_dist,
         patch("nemo_automodel.recipes.retrieval.mine_hard_negatives.NeMoAutoModelBiEncoder") as auto_model,
         patch(
-            "nemo_automodel._transformers.mining.CheckpointMiningEncoderConfig.build",
+            "nemo_automodel.recipes.retrieval.mining_encoder.CheckpointMiningEncoderConfig.build",
             return_value=encoder,
         ),
         patch.object(recipe, "_load_data"),

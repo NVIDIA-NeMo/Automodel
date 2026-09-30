@@ -24,7 +24,7 @@ import pytest
 import torch
 from PIL import Image
 
-from nemo_automodel._transformers.mining import (
+from nemo_automodel.recipes.retrieval.mining_encoder import (
     CheckpointMiningEncoder,
     CheckpointMiningEncoderConfig,
     SentenceTransformerMiningEncoder,
@@ -83,6 +83,14 @@ def _png_bytes() -> bytes:
     return buffer.getvalue()
 
 
+def _use_native_checkpoint(monkeypatch, model):
+    monkeypatch.setattr("nemo_automodel.recipes.retrieval.mining_encoder.cached_file", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "nemo_automodel._transformers.auto_model.NeMoAutoModelBiEncoder.from_pretrained",
+        MagicMock(return_value=model),
+    )
+
+
 def test_typed_config_owns_processor_construction(monkeypatch):
     processor = _PixelProcessor()
     from_pretrained = MagicMock(return_value=processor)
@@ -97,12 +105,13 @@ def test_typed_config_owns_processor_construction(monkeypatch):
     model = _PixelModel()
     model.model = SimpleNamespace(retrieval_processor_target="fixture.Processor")
     model.config = SimpleNamespace(name_or_path="", _commit_hash=None)
+    _use_native_checkpoint(monkeypatch, model)
     monkeypatch.setattr(
-        "nemo_automodel._transformers.mining.import_module",
+        "nemo_automodel.recipes.retrieval.mining_encoder.import_module",
         lambda _: SimpleNamespace(Processor=SimpleNamespace(from_pretrained=from_pretrained)),
     )
     model.source_model_path = "/resolved-snapshot"
-    encoder = config.build(model=model, device=torch.device("cpu"))
+    encoder = config.build(model_name_or_path="/resolved-snapshot", device=torch.device("cpu"))
 
     assert encoder.processor is processor
     assert encoder.use_text_in_document is False
@@ -115,20 +124,22 @@ def test_empty_prefix_is_an_explicit_override(monkeypatch):
     model = _PixelModel()
     model.model = SimpleNamespace(retrieval_processor_target="fixture.Processor")
     model.config = SimpleNamespace(name_or_path="org/model", _commit_hash="pinned-sha")
+    _use_native_checkpoint(monkeypatch, model)
     monkeypatch.setattr(
-        "nemo_automodel._transformers.mining.import_module",
+        "nemo_automodel.recipes.retrieval.mining_encoder.import_module",
         lambda _: SimpleNamespace(Processor=SimpleNamespace(from_pretrained=load)),
     )
     model.source_model_path = "/snapshot"
-    CheckpointMiningEncoderConfig(query_prefix="").build(model=model, device=torch.device("cpu"))
+    CheckpointMiningEncoderConfig(query_prefix="").build(model_name_or_path="/snapshot", device=torch.device("cpu"))
     load.assert_called_once_with("org/model", query_prefix="", revision="pinned-sha")
 
 
-def test_checkpoint_without_registered_processor_is_rejected():
+def test_checkpoint_without_registered_processor_is_rejected(monkeypatch):
     model = _PixelModel()
     model.model = SimpleNamespace()
+    _use_native_checkpoint(monkeypatch, model)
     with pytest.raises(ValueError, match="does not declare a supported retrieval processor"):
-        CheckpointMiningEncoderConfig().build(model=model, device=torch.device("cpu"))
+        CheckpointMiningEncoderConfig().build(model_name_or_path="/snapshot", device=torch.device("cpu"))
 
 
 def test_sentence_transformer_checkpoint_is_selected_without_loading_automodel(tmp_path, monkeypatch):
@@ -138,7 +149,7 @@ def test_sentence_transformer_checkpoint_is_selected_without_loading_automodel(t
     sentence_transformer.__iter__.return_value = iter([SimpleNamespace(pooling_mode="mean")])
     load = MagicMock(return_value=sentence_transformer)
     monkeypatch.setattr(
-        "nemo_automodel._transformers.mining.safe_import",
+        "nemo_automodel.recipes.retrieval.mining_encoder.safe_import",
         lambda _: (True, SimpleNamespace(SentenceTransformer=load)),
     )
 
@@ -159,11 +170,9 @@ def test_checkpoint_without_sentence_transformer_modules_uses_automodel(tmp_path
     model.eval = MagicMock()
     load_model = MagicMock(return_value=model)
     load_processor = MagicMock(return_value=_PixelProcessor())
+    monkeypatch.setattr("nemo_automodel._transformers.auto_model.NeMoAutoModelBiEncoder.from_pretrained", load_model)
     monkeypatch.setattr(
-        "nemo_automodel._transformers.auto_model.NeMoAutoModelBiEncoder.from_pretrained", load_model
-    )
-    monkeypatch.setattr(
-        "nemo_automodel._transformers.mining.import_module",
+        "nemo_automodel.recipes.retrieval.mining_encoder.import_module",
         lambda _: SimpleNamespace(Processor=SimpleNamespace(from_pretrained=load_processor)),
     )
 
@@ -178,7 +187,7 @@ def test_cross_encoder_checkpoint_is_not_loaded_as_embedding_model(tmp_path, mon
     (tmp_path / "modules.json").write_text("[]")
     (tmp_path / "config_sentence_transformers.json").write_text(json.dumps({"model_type": "CrossEncoder"}))
     import_st = MagicMock()
-    monkeypatch.setattr("nemo_automodel._transformers.mining.safe_import", import_st)
+    monkeypatch.setattr("nemo_automodel.recipes.retrieval.mining_encoder.safe_import", import_st)
 
     with pytest.raises(ValueError, match="not a SentenceTransformer embedding model"):
         CheckpointMiningEncoderConfig().build(model_name_or_path=str(tmp_path), device=torch.device("cpu"))
