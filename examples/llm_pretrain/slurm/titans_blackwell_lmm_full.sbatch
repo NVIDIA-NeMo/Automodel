@@ -11,7 +11,6 @@ TITANS_EXPERIMENT=${TITANS_EXPERIMENT:-baseline}
 TITANS_GPUS_PER_NODE=${TITANS_GPUS_PER_NODE:?set TITANS_GPUS_PER_NODE}
 TITANS_IMAGE=${TITANS_IMAGE:-nvcr.io#nvidia/nemo-automodel:26.04}
 TITANS_TIME_LIMIT=${TITANS_TIME_LIMIT:-4:00:00}
-MAX_STEPS_PER_RUN=${TITANS_MAX_STEPS_PER_RUN:-1700}
 TARGET_SEGMENT_SECONDS=${TITANS_TARGET_SEGMENT_SECONDS:-13200}
 WORLD_SIZE=$((SLURM_NNODES * TITANS_GPUS_PER_NODE))
 case "$TITANS_EXPERIMENT" in
@@ -38,6 +37,19 @@ case "$TITANS_SCALE" in
 esac
 TOTAL_STEPS=${TITANS_TOTAL_STEPS:-$DEFAULT_TOTAL_STEPS}
 [[ $TOTAL_STEPS =~ ^[1-9][0-9]*$ ]] || { echo "TITANS_TOTAL_STEPS must be a positive integer" >&2; exit 2; }
+# The first segment cannot use the adaptive throughput estimate below. Keep its
+# target safely below the four-hour allocation for the known slow configurations;
+# later clean segments tune this value from measured throughput.
+case "$TITANS_SCALE:$TITANS_EXPERIMENT" in
+  760m:*) DEFAULT_MAX_STEPS_PER_RUN=1400 ;;
+  *:depth4) DEFAULT_MAX_STEPS_PER_RUN=1000 ;;
+  *) DEFAULT_MAX_STEPS_PER_RUN=1700 ;;
+esac
+MAX_STEPS_PER_RUN=${TITANS_MAX_STEPS_PER_RUN:-$DEFAULT_MAX_STEPS_PER_RUN}
+[[ $MAX_STEPS_PER_RUN =~ ^[1-9][0-9]*$ ]] || {
+  echo "TITANS_MAX_STEPS_PER_RUN must be a positive integer" >&2
+  exit 2
+}
 OPTIMIZER_OVERRIDES=""
 if [[ -n ${TITANS_LEARNING_RATE:-} ]]; then
   [[ $TITANS_LEARNING_RATE =~ ^[0-9]+([.][0-9]+)?([eE][-+]?[0-9]+)?$ ]] || {

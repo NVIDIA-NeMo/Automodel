@@ -64,6 +64,57 @@ CLOUD_PATH_OPTIM = "msc://bucket/step-100/optim"
 LOCAL_PATH_MODEL = "/ckpts/step-100/model"
 
 
+def test_optimizer_load_allows_missing_lazy_parameter_state():
+    checkpointer = Checkpointer.__new__(Checkpointer)
+    checkpointer.config = SimpleNamespace(is_peft=False)
+    state_dict = {"optim": {}}
+
+    with (
+        patch(
+            "nemo_automodel.components.checkpoint.checkpointing.OptimizerState"
+        ) as optimizer_state_cls,
+        patch.object(checkpointer, "_do_load", return_value=state_dict) as do_load,
+    ):
+        optimizer_state_cls.return_value.state_dict.return_value = state_dict
+        checkpointer.load_optimizer(MagicMock(), MagicMock(), "/checkpoint")
+
+    do_load.assert_called_once_with(
+        state_dict,
+        "/checkpoint/optim",
+        allow_partial_load=True,
+    )
+    optimizer_state_cls.return_value.load_state_dict.assert_called_once_with(state_dict)
+
+
+def test_partial_dcp_load_uses_allow_partial_planner():
+    checkpointer = Checkpointer.__new__(Checkpointer)
+    checkpointer.config = SimpleNamespace(is_peft=False)
+    state_dict = {"optim": {}}
+    planner = MagicMock()
+
+    with (
+        patch(
+            "nemo_automodel.components.checkpoint.checkpointing._maybe_msc_reader",
+            return_value=None,
+        ),
+        patch(
+            "nemo_automodel.components.checkpoint.checkpointing.dcp.DefaultLoadPlanner",
+            return_value=planner,
+        ) as planner_cls,
+        patch("nemo_automodel.components.checkpoint.checkpointing.dcp.load") as dcp_load,
+    ):
+        result = checkpointer._do_load(state_dict, "/checkpoint/optim", allow_partial_load=True)
+
+    planner_cls.assert_called_once_with(allow_partial_load=True)
+    dcp_load.assert_called_once_with(
+        state_dict,
+        checkpoint_id="/checkpoint/optim",
+        storage_reader=None,
+        planner=planner,
+    )
+    assert result is state_dict
+
+
 def _make_keys(count: int) -> list[str]:
     return [f"layer.{i}" for i in range(count)]
 

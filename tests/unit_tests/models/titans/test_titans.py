@@ -1099,6 +1099,8 @@ def test_blackwell_submitter_resolves_portable_topology():
     assert "--rdzv-backend=c10d" in runner
     assert "--step_scheduler.max_steps_per_run='$MAX_STEPS_PER_RUN'" in full_runner
     assert "TARGET_SEGMENT_SECONDS=${TITANS_TARGET_SEGMENT_SECONDS:-13200}" in full_runner
+    assert "760m:*) DEFAULT_MAX_STEPS_PER_RUN=1400" in full_runner
+    assert "*:depth4) DEFAULT_MAX_STEPS_PER_RUN=1000" in full_runner
     assert "NEXT_SEGMENT_STEPS" in full_runner
     assert "DEFAULT_LOCAL_BATCH_SIZE=8" in full_runner
     assert "--step_scheduler.local_batch_size='$LOCAL_BATCH_SIZE'" in full_runner

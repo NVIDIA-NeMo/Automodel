@@ -560,7 +560,12 @@ class Checkpointer:
         """
         optimizer_state = OptimizerState(model, optimizer, scheduler, is_peft=self.config.is_peft)
         state_dict = optimizer_state.state_dict()
-        self._do_load(state_dict, os.path.join(weights_path, "optim"))
+        # Adam-family optimizers create per-parameter state lazily. Parameters
+        # disabled by an ablation can therefore be present in the model and in
+        # the fresh optimizer template while having no entry in the saved
+        # optimizer checkpoint. Preserve their fresh state instead of rejecting
+        # an otherwise valid resume.
+        self._do_load(state_dict, os.path.join(weights_path, "optim"), allow_partial_load=True)
         optimizer_state.load_state_dict(state_dict)
 
     @torch.no_grad()
@@ -1112,6 +1117,7 @@ class Checkpointer:
         path: str,
         storage_reader: Optional[_HuggingFaceStorageReader] = None,
         is_init_step: bool = False,
+        allow_partial_load: bool = False,
     ) -> dict[str, torch.Tensor]:
         """
         Load a state dictionary from `path` using DCP or PEFT special-case logic.
@@ -1121,6 +1127,7 @@ class Checkpointer:
             path: Checkpoint directory path.
             storage_reader: Optional HF storage reader for safetensors.
             is_init_step: True if loading from a base checkpoint during initialization.
+            allow_partial_load: Keep initialized values for keys absent from the checkpoint.
 
         Returns:
             The populated state dictionary (may be replaced for PEFT).
@@ -1132,7 +1139,11 @@ class Checkpointer:
             state_dict = _load_safetensors(_adapter_path(path))
         else:
             storage_reader = _maybe_msc_reader(path, storage_reader)
-            dcp.load(state_dict, checkpoint_id=path, storage_reader=storage_reader)
+            if allow_partial_load:
+                planner = dcp.DefaultLoadPlanner(allow_partial_load=True)
+                dcp.load(state_dict, checkpoint_id=path, storage_reader=storage_reader, planner=planner)
+            else:
+                dcp.load(state_dict, checkpoint_id=path, storage_reader=storage_reader)
         return state_dict
 
     def _do_save(
