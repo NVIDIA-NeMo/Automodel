@@ -712,7 +712,6 @@ class _CrossEncoderMetadataExporter:
         else:
             if tokenizer is None:
                 raise ValueError("CrossEncoder export requires a tokenizer.")
-            _resolve_sentence_transformer_max_seq_length(self.model_part, tokenizer, original_model_path)
 
     def _save_sentence_transformer_assets(
         self, *, hf_metadata_dir: str, tokenizer: object, original_model_path: str | None
@@ -727,10 +726,6 @@ class _CrossEncoderMetadataExporter:
         }
         if self.model_part._sentence_transformer_input_mode == "structured_multimodal":
             transformer_config["modality_config"]["message"] = {**forward_output, "format": "structured"}
-        else:
-            transformer_config["max_seq_length"] = _resolve_sentence_transformer_max_seq_length(
-                self.model_part, tokenizer, original_model_path
-            )
         _write_json(
             os.path.join(hf_metadata_dir, "modules.json"),
             [{"idx": 0, "name": "0", "path": "", "type": _SENTENCE_TRANSFORMER_EXPORT_MODULE_TYPES["transformer"]}],

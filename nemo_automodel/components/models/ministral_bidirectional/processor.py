@@ -844,6 +844,8 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
                 push_to_hub=push_to_hub,
                 **kwargs,
             )
+        if self.rerank_max_length is not None:
+            self.tokenizer.model_max_length = self.rerank_max_length
         self._sync_reranker_defaults()
         type(self).register_for_auto_class("AutoProcessor")
         return PixtralProcessor.save_pretrained(self, save_directory, push_to_hub=push_to_hub, **kwargs)

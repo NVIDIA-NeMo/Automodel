@@ -43,6 +43,7 @@ model:
 tokenizer:
   _target_: nemo_automodel.components.models.ministral_bidirectional.processor.Mistral3BiEncoderProcessor.from_pretrained
   pretrained_model_name_or_path: mistralai/Ministral-3-3B-Instruct-2512-BF16
+  model_max_length: 32768  # Saved tokenizer limit; training uses q_max_length and p_max_length below.
   q_max_length: 512
   p_max_length: 4096
   query_prefix: "query:"

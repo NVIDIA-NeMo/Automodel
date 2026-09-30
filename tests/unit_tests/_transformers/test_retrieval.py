@@ -1802,6 +1802,7 @@ def test_cross_encoder_exports_raw_text_scores(tmp_path, consolidated):
         save_file(encoder.model.state_dict(), tmp_path / "model.safetensors", metadata={"format": "pt"})
     else:
         encoder.save_pretrained(str(tmp_path), tokenizer=tokenizer)
+    assert "max_seq_length" not in json.loads((tmp_path / "sentence_bert_config.json").read_text())
     reloaded = CrossEncoder(str(tmp_path), device="cpu", model_kwargs={"attn_implementation": "eager"})
     assert isinstance(reloaded.activation_fn, nn.Identity)
     assert reloaded[0].max_seq_length == 32

@@ -1929,7 +1929,10 @@ def test_mistral3_reranker_export_reloads_without_repository(
     metadata = json.loads((export_dir / "config_sentence_transformers.json").read_text())
     assert metadata["model_type"] == "CrossEncoder"
     assert metadata["activation_fn"] == "torch.nn.modules.linear.Identity"
-    assert "processing_kwargs" not in json.loads((export_dir / "sentence_bert_config.json").read_text())
+    transformer_config = json.loads((export_dir / "sentence_bert_config.json").read_text())
+    assert "processing_kwargs" not in transformer_config
+    assert "max_seq_length" not in transformer_config
+    assert json.loads((export_dir / "tokenizer_config.json").read_text())["model_max_length"] == 128
     assert (export_dir / "model.py").is_file()
     assert (export_dir / "processor.py").is_file()
     torch.save(
@@ -2002,7 +2005,9 @@ def test_mistral3_reranker_template_and_defaults_roundtrip(
     restored = Mistral3BiEncoderProcessor.from_pretrained(tmp_path)
     assert restored.chat_template == saved_template
     assert restored.tokenizer.chat_template == saved_template
-    assert restored.tokenizer.init_kwargs["max_length"] == restored.rerank_max_length == 64
+    assert restored.tokenizer.model_max_length == restored.rerank_max_length == 64
+    assert "max_length" not in restored.tokenizer.init_kwargs
+    assert json.loads((tmp_path / "tokenizer_config.json").read_text())["model_max_length"] == 64
     features = [
         {"question": "literal [IMG]", "doc_text": "literal " * 200, "doc_image": ""},
         {"question": "What is shown?", "doc_text": "Image doc", "doc_image": Image.new("RGB", (16, 16), "red")},
