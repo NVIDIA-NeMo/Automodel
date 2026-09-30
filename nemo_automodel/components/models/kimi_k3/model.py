@@ -849,7 +849,13 @@ class KimiDeltaAttention(nn.Module):
             packed_context: Optional document layout of the batch, required under
                 context parallelism and used to reset the recurrent state at every
                 packed-document boundary.
-            **kwargs: Optional KDA kwargs, including ``cu_seqlens`` for packed sequences.
+            **kwargs: Optional KDA metadata. ``packed_token_indices`` contains
+                row-local valid-token positions of shape [batch, sequence] with
+                -1 padding, or flat positions of shape [tokens]. ``cu_seqlens``
+                contains row-local boundaries of shape [batch, max_documents + 1]
+                with -1 unused entries, or flat boundaries of shape [documents + 1].
+                ``_packed_seq_ids`` optionally carries document IDs of shape
+                [batch, sequence]; ``padding_mask`` has the same shape.
 
         Returns:
             Tensor of shape [batch, sequence, hidden].
@@ -859,10 +865,9 @@ class KimiDeltaAttention(nn.Module):
 
         packed_seq_ids = kwargs.get("_packed_seq_ids")
         packed_document_ids = packed_seq_ids if packed_seq_ids is not None else attention_mask
-        has_dataset_packing = packed_document_ids is not None and (
-            is_indexed_packed_mask(packed_document_ids)
-            or kwargs.get("packed_token_indices") is not None
-            or kwargs.get("cu_seqlens") is not None
+        has_dataset_packing = kwargs.get("packed_token_indices") is not None or (
+            packed_document_ids is not None
+            and (is_indexed_packed_mask(packed_document_ids) or kwargs.get("cu_seqlens") is not None)
         )
         if not has_dataset_packing and attention_mask is not None:
             if attention_mask.dim() != 2:

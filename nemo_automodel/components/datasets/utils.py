@@ -564,14 +564,20 @@ def neat_packed_collater(
     independently request flat-token metadata through the same contract.
 
     Args:
-        batch: List of sample dicts produced by ``neat_pack_dataset``.
+        batch: Sample mappings from ``neat_pack_dataset``. Each holds
+            ``input_ids``, ``labels``, ``position_ids``, and indexed
+            ``attention_mask`` tensors or lists of shape [sequence].
         attn_implementation: Deprecated attention-backend name retained for
             Python-call compatibility during the packing-contract migration.
         packing: Structural model contract selecting the packed mask representation.
             Defaults to block-causal masking without packed-sequence metadata.
 
     Returns:
-        Dict with batched tensors ready for model forward. Varlen output adds
+        Mapping with ``input_ids``, ``labels``, and ``position_ids`` of shape
+        [batch, sequence]. ``attention_mask`` has shape [batch, sequence] for
+        document IDs or [batch, 1, sequence, sequence] for block-causal masking.
+        Optional ``_packed_seq_ids`` retains the [batch, sequence] document map.
+        Varlen output adds
         int64 ``packed_token_indices`` of shape [batch, sequence], containing
         row-local token positions and -1 padding; int32 ``cu_seqlens`` of shape
         [batch, max_documents + 1], containing row-local cumulative lengths

@@ -427,7 +427,19 @@ def _pad_position_ids(position_ids: torch.Tensor, seq_dim: int, pad_len: int) ->
 
 
 def _global_doc_ids_from_batch(batch: dict, seq_len: int, device: torch.device) -> torch.Tensor:
-    """Resolve the global document-id map for a batch about to be CP-sharded."""
+    """Resolve the global document-id map for a batch about to be CP-sharded.
+
+    Args:
+        batch: Model inputs. ``_packed_seq_ids`` or a rank-two ``attention_mask``
+            carries document IDs of shape [batch, sequence]; ``seq_lens`` and
+            ``seq_lens_padded`` have shape [batch, documents]; ``padding_mask``
+            and ``input_ids`` have shape [batch, sequence].
+        seq_len: Global sequence length before context-parallel sharding.
+        device: Device of the global token tensors.
+
+    Returns:
+        Int32 document IDs of shape [batch, sequence], with zero marking padding.
+    """
     packed_seq_ids = batch.get("_packed_seq_ids")
     if packed_seq_ids is not None:
         return doc_ids_from_attention_mask(packed_seq_ids)

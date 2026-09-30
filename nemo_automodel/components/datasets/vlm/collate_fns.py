@@ -1533,7 +1533,14 @@ def neat_packed_vlm_collater(
     **No autoregressive shift** — it was already applied during packing.
 
     Args:
-        batch: List of packed sample dicts from ``PackedDatasetWrapper``.
+        batch: Packed sample mappings. ``input_ids``, ``labels``, indexed
+            ``attention_mask``, and optional ``mm_token_type_ids`` have shape
+            [sequence]. ``position_ids`` has shape [sequence] or [3, sequence]
+            for multimodal RoPE. Optional media values have a leading media or
+            patch axis and processor-defined trailing axes, or are lists of
+            per-image tensors with variable spatial sizes. Grid tensors have
+            shape [media, 3], image positions [patches, position_axes], and
+            ``second_per_grid_ts`` [videos].
         padding_idx: Token ID for padding ``input_ids`` (default 0).
         max_length: If set, pad every batch to this fixed length.
             If ``None`` (default), pad to the longest pack in the batch.
@@ -1550,7 +1557,15 @@ def neat_packed_vlm_collater(
             False to avoid the quadratic allocation.
 
     Returns:
-        Dict with batched tensors ready for model forward. Varlen output adds
+        Mapping with text IDs, labels, and token types of shape [batch, sequence];
+        positions of shape [batch, sequence] or [3, batch, sequence]; and an
+        attention mask of shape [batch, sequence] or [batch, 1, sequence, sequence].
+        Optional ``_packed_seq_ids`` has shape [batch, sequence]. Media values,
+        grids, image positions, and timestamps concatenate their leading axis
+        while preserving their trailing axes; variable-resolution media remain
+        a flattened list of per-image tensors. Pixel values are cast to bfloat16.
+        Media counts have shape [batch].
+        Varlen output adds
         int64 ``packed_token_indices`` of shape [batch, sequence], containing
         row-local token positions and -1 padding; int32 ``cu_seqlens`` of shape
         [batch, max_documents + 1], containing row-local cumulative lengths

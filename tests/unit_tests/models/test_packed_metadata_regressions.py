@@ -25,7 +25,7 @@ from nemo_automodel.components.datasets.packing import build_packed_sequence_met
 
 
 @pytest.mark.parametrize("family,class_name", [("kimi_linear", "KimiLinear48BModel"), ("kimi_k3", "KimiK3TextModel")])
-@pytest.mark.parametrize("mask_kind", ["indexed", "sdpa", "explicit", "thd"])
+@pytest.mark.parametrize("mask_kind", ["indexed", "sdpa", "explicit", "metadata_only"])
 def test_kimi_packed_forward_preserves_padding_for_every_layer(family, class_name, mask_kind):
     module = importlib.import_module(f"nemo_automodel.components.models.{family}.model")
     cls = getattr(module, class_name)
@@ -59,7 +59,7 @@ def test_kimi_packed_forward_preserves_padding_for_every_layer(family, class_nam
     if mask_kind == "sdpa":
         kwargs["_packed_seq_ids"] = doc_ids
         kwargs["attention_mask"] = torch.ones(1, 1, 6, 6, dtype=torch.bool)
-    elif mask_kind != "thd":
+    elif mask_kind != "metadata_only":
         kwargs["attention_mask"] = doc_ids
     expected = doc_ids == 0
     if mask_kind == "explicit":
@@ -101,3 +101,75 @@ def test_qwen_cp_rejects_unconverted_neat_metadata(family, class_name):
     assert local_batch["cu_seqlens"].tolist() == [[0, 2, 4, -1], [0, 2, 4, 6]]
     with pytest.raises(ValueError, match="unsupported with load-balanced context parallelism"):
         model(**local_batch)
+
+
+@pytest.mark.parametrize("family,class_name", [("kimi_linear", "KimiLinear48BModel"), ("kimi_k3", "KimiK3TextModel")])
+def test_kimi_explicit_metadata_reaches_kda_without_private_document_ids(family, class_name):
+    module = importlib.import_module(f"nemo_automodel.components.models.{family}.model")
+    cls = getattr(module, class_name)
+    model = cls.__new__(cls)
+    nn.Module.__init__(model)
+    model.norm = nn.Identity()
+    model.use_attn_residuals = False
+    kda = module.KimiDeltaAttention.__new__(module.KimiDeltaAttention)
+    nn.Module.__init__(kda)
+    kda.is_linear_attn = True
+
+    def recurrent_core(hidden_states: torch.Tensor, *, cu_seqlens: torch.Tensor) -> torch.Tensor:
+        """Use a segmented prefix sum to expose boundary and padding mistakes.
+
+        Args:
+            hidden_states: Unpadded tensor of shape [1, tokens, hidden].
+            cu_seqlens: Flat document boundaries of shape [documents + 1].
+
+        Returns:
+            Per-document prefix sums of shape [1, tokens, hidden].
+        """
+        assert hidden_states.shape == (1, 8, 4)
+        assert cu_seqlens.tolist() == [0, 2, 4, 7, 8]
+        cuts = cu_seqlens.tolist()
+        return torch.cat([hidden_states[:, start:end].cumsum(1) for start, end in zip(cuts, cuts[1:])], dim=1)
+
+    kda._kda_core = recurrent_core
+    model.layers = nn.ModuleDict({"0": kda})
+    doc_ids = torch.tensor([[1, 1, 2, 2, 0, 0], [1, 1, 1, 2, 0, 0]])
+    hidden = torch.randn(2, 6, 4, requires_grad=True)
+    ref_hidden = hidden.detach().clone().requires_grad_()
+    output = model(inputs_embeds=hidden, attention_mask=doc_ids, **build_packed_sequence_metadata(doc_ids))
+    expected = torch.zeros_like(ref_hidden)
+    for row, segments in enumerate([[(0, 2), (2, 4)], [(0, 3), (3, 4)]]):
+        for start, end in segments:
+            expected[row, start:end] = ref_hidden[row, start:end].cumsum(0)
+    torch.testing.assert_close(output, expected)
+    upstream = torch.randn_like(output)
+    output.backward(upstream)
+    expected.backward(upstream)
+    torch.testing.assert_close(hidden.grad, ref_hidden.grad)
+
+
+@pytest.mark.parametrize("family", ["kimi_linear", "kimi_k3"])
+def test_kimi_kda_preserves_flat_cu_seqlens_only_inputs(family):
+    module = importlib.import_module(f"nemo_automodel.components.models.{family}.model")
+    layer = module.KimiDeltaAttention.__new__(module.KimiDeltaAttention)
+    nn.Module.__init__(layer)
+
+    def core(hidden_states: torch.Tensor, *, cu_seqlens: torch.Tensor) -> torch.Tensor:
+        """Stand in for the GPU kernel while checking the existing THD contract.
+
+        Args:
+            hidden_states: Unpadded tensor of shape [1, tokens, hidden].
+            cu_seqlens: Flat boundaries of shape [documents + 1].
+
+        Returns:
+            A tensor of shape [1, tokens, hidden].
+        """
+        assert cu_seqlens.tolist() == [0, 2, 5]
+        return hidden_states * 2
+
+    layer._kda_core = core
+    hidden = torch.randn(1, 5, 4, requires_grad=True)
+    output = layer(hidden, cu_seqlens=torch.tensor([0, 2, 5], dtype=torch.int32))
+    torch.testing.assert_close(output, hidden * 2)
+    upstream = torch.randn_like(output)
+    output.backward(upstream)
+    torch.testing.assert_close(hidden.grad, upstream * 2)

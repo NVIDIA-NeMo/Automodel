@@ -575,7 +575,8 @@ def test_model_advertises_packed_cp_for_sparse_backends(attn_backend: str) -> No
     assert not sdpa_supports.supports_cp_with_sequence_packing
 
 
-def test_packed_gdn_parent_forward_backward_matches_separate_documents() -> None:
+@pytest.mark.parametrize("explicit_document_ids", [False, True])
+def test_packed_gdn_parent_forward_backward_matches_separate_documents(explicit_document_ids: bool) -> None:
     """Exercise the inherited forward with three documents, including zero-based ID 2."""
     import copy
 
@@ -658,7 +659,8 @@ def test_packed_gdn_parent_forward_backward_matches_separate_documents() -> None
     hidden = torch.randn(1, 10, config.hidden_size, requires_grad=True)
     ref_hidden = hidden.detach().clone().requires_grad_()
     boundaries = [0, 3, 6, 10]
-    output = layer(hidden, cu_seqlens=torch.tensor(boundaries, dtype=torch.int32))
+    attention_mask = torch.tensor([[0, 0, 0, 1, 1, 1, 2, 2, 2, 2]]) if explicit_document_ids else None
+    output = layer(hidden, cu_seqlens=torch.tensor(boundaries, dtype=torch.int32), attention_mask=attention_mask)
     expected = torch.cat([reference(ref_hidden[:, start:end]) for start, end in zip(boundaries, boundaries[1:])], dim=1)
     upstream = torch.randn_like(output)
     output.backward(upstream)

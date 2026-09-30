@@ -156,9 +156,10 @@ class Qwen3_8_FlashNextGatedDeltaNet(CPAwareGatedDeltaNet):
         Args:
             hidden_states: Tensor of shape [batch, sequence, hidden]. Packed
                 non-CP inputs have one row with no padding.
-            **kwargs: Inherited forward arguments, including optional cumulative
-                document boundaries ``cu_seqlens`` of shape [documents + 1]
-                and ``attention_mask`` of shape [batch, sequence].
+            **kwargs: Arguments with the tensor layouts documented by
+                :meth:`CPAwareGatedDeltaNet.forward`. ``cu_seqlens`` contains
+                document boundaries of shape [documents + 1], global under CP;
+                ``attention_mask`` has shape [batch, sequence].
 
         Returns:
             Tensor of shape [batch, sequence, hidden].
@@ -176,9 +177,13 @@ class Qwen3_8_FlashNextGatedDeltaNet(CPAwareGatedDeltaNet):
                     boundaries.diff(),
                 )
                 kwargs["attention_mask"] = document_ids.unsqueeze(0).to(torch.int32)
+            if cu_seqlens is not None and kwargs.get("indices") is None:
                 # This caller supplies a contiguous, unpadded row. The parent
-                # requires explicit valid-token indices for indexed masks.
-                kwargs["indices"] = torch.arange(document_ids.numel(), device=hidden_states.device)
+                # requires explicit valid-token indices for indexed masks,
+                # whether supplied by the caller or synthesized above.
+                kwargs["indices"] = torch.arange(
+                    hidden_states.shape[0] * hidden_states.shape[1], device=hidden_states.device
+                )
             return super().forward(hidden_states, cu_seqlens=cu_seqlens, **kwargs)
         self._packed_global_cu_seqlens = cu_seqlens
         try:
