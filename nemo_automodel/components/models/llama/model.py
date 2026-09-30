@@ -539,6 +539,11 @@ class LlamaForCausalLM(HFCheckpointingMixin, LlamaPreTrainedModel):
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
 
+    @property
+    def _uses_hf_attention(self) -> bool:
+        """Only TE bypasses the HF attention dispatch in this model."""
+        return self.backend.attn != "te"
+
     @dataclass(frozen=True)
     class ModelCapabilities:
         """Declared parallelism capabilities for this model class."""

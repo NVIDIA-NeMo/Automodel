@@ -1358,11 +1358,14 @@ def __init_model(
                     kwargs["backend"] = backend_config_resolver(kwargs["backend"])
                 else:
                     kwargs["backend"] = BackendConfig(**kwargs["backend"])
+            uses_native_fa4 = getattr(model_cls, "_uses_native_fa4", False) is True
+            if kwargs.get("backend") is None and attn_implementation == "flash_attention_4" and uses_native_fa4:
+                kwargs["backend"] = BackendConfig()
             if isinstance(kwargs.get("backend"), BackendConfig):
                 kwargs["backend"] = _resolve_custom_attention_backend(
                     attn_implementation,
                     kwargs["backend"],
-                    uses_native_fa4=getattr(model_cls, "_uses_native_fa4", False) is True,
+                    uses_native_fa4=uses_native_fa4,
                 )
             resolved_backend = kwargs.get("backend")
             kwargs = _filter_kwargs_for_init(model_cls, kwargs)

@@ -174,6 +174,7 @@ class DeepseekV32ForCausalLM(DeepseekV3ForCausalLM):
     Subclasses V3 ForCausalLM, using DeepseekV32Model and DeepSeekV32StateDictAdapter.
     """
 
+    _uses_native_fa4: bool = False
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
 
     @dataclass(frozen=True)
@@ -224,6 +225,8 @@ class DeepseekV32ForCausalLM(DeepseekV3ForCausalLM):
         # repeated here. replace() rather than in-place: the caller's BackendConfig
         # may be shared with other models, which must not inherit this default.
         resolved_backend = backend or BackendConfig()
+        if resolved_backend.attn == "fa4":
+            raise ValueError("DeepSeek V3.2 sparse attention does not support FA4. Use attn='te'/'sdpa'.")
         if resolved_backend.gate_precision is None:
             resolved_backend = replace(resolved_backend, gate_precision=torch.float32)
         self.backend = resolved_backend

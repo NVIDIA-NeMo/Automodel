@@ -38,8 +38,8 @@ def _packed_sdpa_reference(
 
     Args:
         q: Query tensor of shape [batch, sequence, heads, qk_head_dim].
-        k: Key tensor of shape [batch, sequence, heads, qk_head_dim].
-        v: Value tensor of shape [batch, sequence, heads, v_head_dim].
+        k: Key tensor of shape [batch, sequence, kv_heads, qk_head_dim].
+        v: Value tensor of shape [batch, sequence, kv_heads, v_head_dim].
         attention_mask: Indexed document mask of shape [batch, sequence].
         scale: Attention score scale.
 
@@ -60,12 +60,14 @@ def _packed_sdpa_reference(
                 v_document,
                 is_causal=True,
                 scale=scale,
+                enable_gqa=True,
             )
             output[batch_idx, positions] = document_output.squeeze(0).transpose(0, 1)
     return output
 
 
-def test_native_fa4_packed_forward_backward_matches_sdpa() -> None:
+@pytest.mark.parametrize("qk_head_dim,v_head_dim,kv_heads", [(192, 128, 4), (256, 256, 2)])
+def test_native_fa4_packed_forward_backward_matches_sdpa(qk_head_dim: int, v_head_dim: int, kv_heads: int) -> None:
     """Native packed FA4 matches independent SDPA outputs and input gradients."""
     if not torch.cuda.is_available():
         pytest.skip("FlashAttention-4 parity requires a CUDA device")
@@ -74,8 +76,6 @@ def test_native_fa4_packed_forward_backward_matches_sdpa() -> None:
 
     device = torch.device("cuda")
     dtype = torch.bfloat16
-    qk_head_dim = 192
-    v_head_dim = 128
     scale = qk_head_dim**-0.5
     attention_mask = torch.tensor(
         [[1] * 32 + [2] * 48 + [0] * 16, [1] * 24 + [2] * 24 + [3] * 48],
@@ -85,8 +85,8 @@ def test_native_fa4_packed_forward_backward_matches_sdpa() -> None:
 
     torch.manual_seed(1234)
     q = torch.randn(2, 96, 4, qk_head_dim, device=device, dtype=dtype, requires_grad=True)
-    k = torch.randn(2, 96, 4, qk_head_dim, device=device, dtype=dtype, requires_grad=True)
-    v = torch.randn(2, 96, 4, v_head_dim, device=device, dtype=dtype, requires_grad=True)
+    k = torch.randn(2, 96, kv_heads, qk_head_dim, device=device, dtype=dtype, requires_grad=True)
+    v = torch.randn(2, 96, kv_heads, v_head_dim, device=device, dtype=dtype, requires_grad=True)
     q_ref = q.detach().clone().requires_grad_()
     k_ref = k.detach().clone().requires_grad_()
     v_ref = v.detach().clone().requires_grad_()

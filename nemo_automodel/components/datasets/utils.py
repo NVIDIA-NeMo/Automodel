@@ -562,8 +562,13 @@ def neat_packed_collater(
 
     Returns:
         Dict with batched tensors ready for model forward. Varlen output adds
-        batch-major ``packed_token_indices`` and ``cu_seqlens`` tensors plus
-        scalar ``max_seqlen``.
+        int64 ``packed_token_indices`` of shape [batch, sequence], containing
+        row-local token positions and -1 padding; int32 ``cu_seqlens`` of shape
+        [batch, max_documents + 1], containing row-local cumulative lengths
+        and -1 after each row's last boundary; and a Python int ``max_seqlen``.
+        Model entry flattens these into [tokens] indices into batch * sequence
+        and [documents + 1] boundaries over the unpadded token stream. These
+        are not physical offsets for pre-packed THD buffers.
     """
     packing = resolve_packing_contract(packing, attn_implementation)
     if not batch:

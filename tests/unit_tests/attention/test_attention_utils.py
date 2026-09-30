@@ -41,7 +41,7 @@ def _reference_varlen_sdpa(
     softmax_scale: float,
     causal: bool,
     **kwargs,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, None]:
     """Evaluate independent per-document SDPA for a fake FA4 varlen kernel.
 
     Args:
@@ -57,8 +57,8 @@ def _reference_varlen_sdpa(
         **kwargs: Unused FA4 options accepted for signature compatibility.
 
     Returns:
-        Tensor of shape [tokens, heads, v_head_dim] containing independently
-        evaluated document outputs.
+        Pair of the independently evaluated output tensor of shape
+        [tokens, heads, v_head_dim] and None for the unused LSE, matching FA4.
     """
     del max_seqlen_q, max_seqlen_k, kwargs
     outputs = []
@@ -74,9 +74,10 @@ def _reference_varlen_sdpa(
             v_document,
             is_causal=causal,
             scale=softmax_scale,
+            enable_gqa=True,
         )
         outputs.append(output.squeeze(0).transpose(0, 1))
-    return torch.cat(outputs)
+    return torch.cat(outputs), None
 
 
 class TestInitializeAttnModuleAndFunc:
@@ -744,13 +745,24 @@ class TestFA4Backend:
         torch.testing.assert_close(k.grad, k_ref.grad)
         torch.testing.assert_close(v.grad, v_ref.grad)
 
-    def test_fa4_rejects_explicit_mask(self):
+    @pytest.mark.parametrize(
+        "metadata",
+        [
+            {},
+            {"cu_seqlens": torch.tensor([0, 16], dtype=torch.int32), "max_seqlen": 16},
+            {
+                "cu_seqlens_q": torch.tensor([0, 16], dtype=torch.int32),
+                "cu_seqlens_kv": torch.tensor([0, 16], dtype=torch.int32),
+            },
+        ],
+    )
+    def test_fa4_rejects_explicit_mask(self, metadata):
         """A dense mask must raise -- dropping it would attend across documents."""
         q = k = v = torch.randn(2, 8, 4, 16)
         dense_mask = torch.ones(2, 1, 8, 8, dtype=torch.bool)
 
         with pytest.raises(ValueError, match="cannot consume an explicit attention_mask"):
-            preprocess_args_and_kwargs_for_attn(q, k, v, dense_mask, "fa4")
+            preprocess_args_and_kwargs_for_attn(q, k, v, dense_mask, "fa4", **metadata)
 
     def test_fa4_output_is_not_transposed(self):
         """postprocess leaves FA4 output alone (already [b, s, nh, hd])."""
@@ -785,15 +797,43 @@ class TestFA4Backend:
                 )
         assert isinstance(exc_info.value.__cause__, RuntimeError)
 
-    def test_fa4_rejects_unsupported_qkv_format(self):
-        """Only bshd/thd are meaningful for FA4."""
+    @pytest.mark.parametrize("qkv_format", ["thd", "sbhd"])
+    def test_fa4_rejects_unsupported_qkv_format(self, qkv_format):
+        """The adapter accepts BSHD, not pre-packed THD buffers."""
         with mock.patch.dict("sys.modules", {"flash_attn.cute": mock.MagicMock()}):
-            with pytest.raises(ValueError, match="qkv_format"):
+            with pytest.raises(ValueError, match="requires BSHD"):
                 initialize_attn_module_and_func(
                     attn_impl="fa4",
                     num_attention_heads=4,
                     num_qk_channels=16,
                     num_v_channels=16,
                     softmax_scale=0.25,
-                    qkv_format="sbhd",
+                    qkv_format=qkv_format,
                 )
+
+    @pytest.mark.parametrize(
+        "shape,metadata",
+        [
+            ((8, 2, 4), {}),
+            ((2, 4, 2, 4), {"qkv_format": "thd"}),
+            ((2, 4, 2, 4), {"cu_seqlens_padded": torch.tensor([0, 4, 8], dtype=torch.int32)}),
+        ],
+    )
+    def test_fa4_rejects_thd_before_kernel(self, shape, metadata):
+        q = k = v = torch.randn(shape)
+        with pytest.raises(ValueError, match="pre-packed THD"):
+            preprocess_args_and_kwargs_for_attn(q, k, v, None, "fa4", **metadata)
+
+    def test_dense_fa4_unpacks_kernel_result_and_preserves_gradients(self):
+        q = k = v = torch.randn(2, 4, 2, 8, requires_grad=True)
+        expected = q * 2
+        flash_attn_cute = ModuleType("flash_attn.cute")
+        flash_attn_cute.flash_attn_func = mock.Mock(return_value=(expected, None))
+        flash_attn_cute.flash_attn_varlen_func = mock.Mock(side_effect=AssertionError("varlen selected"))
+        with mock.patch.dict(sys.modules, {"flash_attn.cute": flash_attn_cute}):
+            _, fa4 = initialize_attn_module_and_func("fa4", 2, 8, 8, 0.5)
+        output = fa4(q, k, v)
+        torch.testing.assert_close(output, expected)
+        upstream = torch.randn_like(output)
+        output.backward(upstream)
+        torch.testing.assert_close(q.grad, 2 * upstream)

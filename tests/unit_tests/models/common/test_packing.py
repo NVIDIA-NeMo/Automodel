@@ -100,17 +100,19 @@ class TestGetAttnImplementation:
         model.config = SimpleNamespace(_attn_implementation="sdpa")
         assert get_model_attn_implementation(model) == "te"
 
-    def test_hf_fa4_dispatch_takes_precedence_without_native_consumer(self):
+    def test_declared_hf_fa4_dispatch_takes_precedence(self):
         model = torch.nn.Module()
         model.backend = BackendConfig(attn="fa4")
         model.config = SimpleNamespace(_attn_implementation="flash_attention_4")
+        model._uses_hf_attention = True
 
         assert get_model_attn_implementation(model) == "flash_attention_4"
 
-    def test_non_native_fa4_backend_falls_back_to_live_hf_dispatch(self):
+    def test_declared_hf_dispatch_uses_live_hf_backend(self):
         model = torch.nn.Module()
         model.backend = BackendConfig(attn="fa4")
         model.config = SimpleNamespace(_attn_implementation="sdpa")
+        model._uses_hf_attention = True
 
         assert get_model_attn_implementation(model) == "sdpa"
 
@@ -169,12 +171,10 @@ class TestConfigurePacking:
         native_model = torch.nn.Module()
         native_model._uses_native_fa4 = True
 
-        hf_capabilities = get_packing_capabilities("fa4", model=hf_dispatched_model)
+        with pytest.raises(ValueError, match="declaring native FA4 support"):
+            get_packing_capabilities("fa4", model=hf_dispatched_model)
         native_capabilities = get_packing_capabilities("fa4", model=native_model)
 
-        assert hf_capabilities.patch_transformers is True
-        assert hf_capabilities.requires_packed_sequence_metadata is False
-        assert hf_capabilities.uses_native_fa4 is False
         assert native_capabilities.patch_transformers is False
         assert native_capabilities.requires_packed_sequence_metadata is True
         assert native_capabilities.uses_native_fa4 is True
@@ -214,6 +214,8 @@ class TestConfigurePacking:
         configure_packing("fa4", model=model)
         configure_packing("fa4", model=model)
         assert len(model._forward_pre_hooks) == 1
+        with pytest.raises(ValueError, match="pre-packed THD"):
+            model(torch.ones(2, 4, dtype=torch.long), qkv_format="thd")
 
         output = model(
             torch.ones(2, 4, dtype=torch.long),

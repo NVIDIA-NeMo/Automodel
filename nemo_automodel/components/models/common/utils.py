@@ -422,6 +422,8 @@ class BackendConfig:
             Blackwell FA4 kernels; it requires an INSTALL_FA4=true image. A rank-2 binary
             padding mask is converted to varlen metadata, while dense/block masks and indexed
             document masks without explicit packed metadata are rejected.
+            Inputs must use BSHD layout; pre-packed THD is unsupported. Packed
+            Qwen3Next and DeepSeek V3.2 sparse attention do not support FA4.
             For DeepSeek V4, "tilelang" enables the TileLang sparse attention,
             indexer, and Sinkhorn kernels together. For GLM DSA, "tilelang" and
             "cudnn" select their respective packed sparse-attention kernels.

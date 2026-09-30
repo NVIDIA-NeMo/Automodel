@@ -79,6 +79,16 @@ class NativeFA4Consumer(Protocol):
 
 
 @runtime_checkable
+class _HFAttentionConsumer(Protocol):
+    """Model whose active attention path dispatches through its HF config."""
+
+    @property
+    def _uses_hf_attention(self) -> bool:
+        """Whether HF's dispatch key controls attention rather than backend.attn."""
+        ...
+
+
+@runtime_checkable
 class AttentionBackendSelection(Protocol):
     """Typed attention selection carried by a built custom model."""
 
@@ -92,7 +102,17 @@ class UnpadData(Protocol):
     """Dataset-owned mask conversion accepted by the model-side HF adapter."""
 
     def __call__(self, attention_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, int]:
-        """Convert a mask of shape [batch, sequence] to flat varlen metadata."""
+        """Convert indexed document masks to unpadded token metadata.
+
+        Args:
+            attention_mask: Tensor of shape [batch, sequence], with positive
+                document IDs and zero for padding.
+
+        Returns:
+            Int64 indices of shape [tokens] into the flattened batch/sequence
+            axis, int32 cumulative lengths of shape [documents + 1], and the
+            maximum document length as a Python int.
+        """
         ...
 
 
@@ -111,17 +131,21 @@ def get_packing_capabilities(
     Returns:
         Structural capabilities consumed by dataset packing. Backend names do not
         cross the dataset boundary.
+
+    Raises:
+        ValueError: If native FA4 packing is requested without a native consumer.
     """
     model = getattr(model, "module", model)
     requires_metadata = isinstance(model, PackingMetadataConsumer) and model.requires_packed_sequence_metadata
     model_mask_type = model.packed_mask_type if isinstance(model, PackedMaskConsumer) else None
     if attn_implementation == "fa4":
         uses_native_fa4 = isinstance(model, NativeFA4Consumer) and model._uses_native_fa4
+        if not uses_native_fa4:
+            raise ValueError("Native FA4 packing requires a model declaring native FA4 support.")
         return PackingCapabilities(
             packed_mask_type="document_ids",
-            requires_packed_sequence_metadata=uses_native_fa4 or requires_metadata,
-            patch_transformers=not uses_native_fa4,
-            uses_native_fa4=uses_native_fa4,
+            requires_packed_sequence_metadata=True,
+            uses_native_fa4=True,
         )
     if attn_implementation in _FLASH_ATTN_IMPLEMENTATIONS:
         return PackingCapabilities(
@@ -258,9 +282,11 @@ def _flatten_packed_metadata_at_model_entry(
         ``None`` when neither packed-metadata tensor was supplied.
 
     Raises:
-        ValueError: If only one metadata tensor is supplied or either layout is
-            inconsistent with the current microbatch.
+        ValueError: If pre-packed THD is requested, only one metadata tensor is
+            supplied, or either layout is inconsistent with the current microbatch.
     """
+    if kwargs.get("qkv_format") == "thd":
+        raise ValueError("Native FA4 does not support pre-packed THD inputs. Use NEAT packing.")
     packed_token_indices = kwargs.get("packed_token_indices")
     cu_seqlens = kwargs.get("cu_seqlens")
     if packed_token_indices is None and cu_seqlens is None:
@@ -366,18 +392,25 @@ def get_model_attn_implementation(model: torch.nn.Module) -> str:
     Custom models expose a typed ``backend.attn``. Hugging Face models record
     their resolved dispatch key on ``model.config``; this reflects preload and
     fallback decisions that are intentionally absent from the recipe config.
+    Models mixing native and HF attention declare which dispatch is active.
+
+    Args:
+        model: Constructed model, optionally wrapped in DDP.
+
+    Returns:
+        The active attention backend or HF dispatch key, normalized for packing.
+
+    Raises:
+        TypeError: If model is not a torch.nn.Module.
     """
     if not isinstance(model, torch.nn.Module):
         raise TypeError(f"Expected a built torch.nn.Module, got {type(model).__name__}")
     model = getattr(model, "module", model)
     backend = getattr(model, "backend", None)
     hf_implementation = _model_attn_implementation(model)
-    uses_native_fa4 = isinstance(model, NativeFA4Consumer) and model._uses_native_fa4
-    if hf_implementation == "flash_attention_4" and not uses_native_fa4:
-        return hf_implementation
+    if isinstance(model, _HFAttentionConsumer) and model._uses_hf_attention:
+        return hf_implementation or "sdpa"
     if isinstance(backend, AttentionBackendSelection):
-        if backend.attn == "fa4" and not uses_native_fa4:
-            return hf_implementation or "sdpa"
         return backend.attn
     return hf_implementation or "sdpa"
 
@@ -506,6 +539,17 @@ def configure_packing(
     for the indexed document map. Native consumers receive explicit metadata and
     need no patch. The conversion callable is injected by the recipe so this
     model component never imports the dataset implementation.
+
+    Migration: resolve the backend with ``get_model_attn_implementation(model)``
+    (replacing ``get_attn_implementation(cfg_model, model)``), supply the
+    dataset-owned ``get_unpad_data`` from ``components.datasets.packing`` for
+    HF flash attention, and pass the returned contract as ``packing=`` to the
+    collater or ``packing_contract=`` to the dataloader config's ``build``.
+    ``get_seqlens_in_batch`` also moved to ``components.datasets.packing``.
+    The legacy collater ``attn_implementation=`` argument selects only a mask
+    layout; it cannot supply model-required metadata. Recipe YAML's old
+    ``packed_sequence.attn_implementation`` selector is ignored in favor of
+    the built model's backend.
 
     Args:
         attn_implementation: The attention implementation used by the model.

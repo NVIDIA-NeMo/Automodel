@@ -31,7 +31,15 @@ from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.qwen3_5_moe.model import Qwen3_5MoeTextModelBackend
 
 
-def test_reuses_packed_metadata_across_checkpointed_moe_layers():
+def test_reuses_packed_metadata_across_checkpointed_moe_layers(monkeypatch):
+    from nemo_automodel.components.moe.megatron import moe_utils
+
+    # Exercise the same activation math and custom backward eagerly: this test
+    # checks metadata reuse under checkpointing, not Inductor compilation. Its
+    # cold-start compiler cost otherwise exceeds the CPU unit-test budget.
+    for name in ("swiglu", "weighted_swiglu", "swiglu_back", "weighted_swiglu_back"):
+        compiled = getattr(moe_utils, name)
+        monkeypatch.setattr(moe_utils, name, compiled.__wrapped__)
     torch.manual_seed(123)
     config = Qwen3_5MoeTextConfig(
         vocab_size=32,

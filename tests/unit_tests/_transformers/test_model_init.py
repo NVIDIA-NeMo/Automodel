@@ -656,6 +656,16 @@ class TestBackendDictCoercion:
         assert cfg_model.backend.attn == "sdpa"
         assert captured["backend"].attn == "fa4"
 
+    @pytest.mark.parametrize("extra_kwargs", [{}, {"backend": None}])
+    @patch("nemo_automodel._transformers.model_init._download_model_weights")
+    @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")
+    def test_flash_attention_4_resolves_default_native_backend(self, mock_resolve_cls, _mock_download, extra_kwargs):
+        captured = self._run_init_model(
+            mock_resolve_cls, attn_implementation="flash_attention_4", uses_native_fa4=True, **extra_kwargs
+        )
+        assert isinstance(captured["backend"], BackendConfig)
+        assert captured["backend"].attn == "fa4"
+
     @patch("nemo_automodel._transformers.model_init._download_model_weights")
     @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")
     def test_flash_attention_4_preserves_backend_without_native_consumer(self, mock_resolve_cls, _mock_download):

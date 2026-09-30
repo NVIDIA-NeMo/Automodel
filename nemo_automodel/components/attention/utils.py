@@ -88,8 +88,8 @@ def initialize_attn_module_and_func(
 
         return None, attn_func
     elif attn_impl == "fa4":
-        # FlashAttention-4 (CuTe). Consumes the native [b, s, nh, hd] (bshd) / [t, nh, hd]
-        # (thd) layout directly, like TE -- no transpose on the way in or out. FA4 has no
+        # FlashAttention-4 (CuTe). BSHD inputs stay in [b, s, nh, hd] layout;
+        # packing gathers them to [t, nh, hd] internally, without transposing heads. FA4 has no
         # dense-mask entry point by design: `causal` plus varlen `cu_seqlens` are its only
         # mask forms, which is what makes it fast. preprocess_args_and_kwargs_for_attn
         # converts a rank-2 binary padding mask to varlen metadata and rejects dense masks.
@@ -113,8 +113,8 @@ def initialize_attn_module_and_func(
         flash_attn_func = flash_attn_cute.flash_attn_func
         flash_attn_varlen_func = flash_attn_cute.flash_attn_varlen_func
 
-        if qkv_format not in ("bshd", "thd"):
-            raise ValueError(f"attn_impl='fa4' supports qkv_format 'bshd' or 'thd', got {qkv_format!r}")
+        if qkv_format != "bshd":
+            raise ValueError(f"attn_impl='fa4' requires BSHD inputs; pre-packed THD is unsupported, got {qkv_format!r}")
 
         supported_fa4_kwargs = {
             "causal",
@@ -143,14 +143,19 @@ def initialize_attn_module_and_func(
                 v: Value tensor with the same leading layout as ``k`` and a
                     trailing dimension of v_head_dim.
                 **call_kwargs: FA4 options and optional packed-sequence metadata.
-                    ``packed_token_indices`` has shape [tokens] and
+                    ``cu_seqlens_q`` and ``cu_seqlens_kv`` are int32 tensors of
+                    shape [documents + 1], indexing the unpadded token stream.
+                    ``packed_token_indices`` is an int64 tensor of shape [tokens]
+                    indexing the flattened [batch * sequence] axis.
+                    ``learnable_sink`` has shape [heads].
                     ``_fa4_padded_output_shape`` is
                     [batch, sequence, heads, v_head_dim].
 
             Returns:
-                Attention output with trailing dimension v_head_dim, or a
-                restored tensor of shape [batch, sequence, heads, v_head_dim]
-                when packed inputs were unpadded before the kernel call.
+                Tensor of shape [batch, sequence, heads, v_head_dim] for dense
+                or restored packed input, or [tokens, heads, v_head_dim] for
+                an unpadded varlen call. Restored padding positions are zero.
+                The output does not alias q, k, or v.
             """
             unexpected_call_kwargs = call_kwargs.keys() - supported_fa4_kwargs
             if unexpected_call_kwargs:
@@ -167,11 +172,12 @@ def initialize_attn_module_and_func(
 
             cu_seqlens_q = call_kwargs.get("cu_seqlens_q")
             if cu_seqlens_q is None:
-                return flash_attn_func(q, k, v, **common)
+                output, _lse = flash_attn_func(q, k, v, **common)
+                return output
 
             cu_seqlens_kv = call_kwargs.get("cu_seqlens_kv", cu_seqlens_q)
             max_seqlen_q = call_kwargs.get("max_seqlen_q")
-            output = flash_attn_varlen_func(
+            output, _lse = flash_attn_varlen_func(
                 q,
                 k,
                 v,
@@ -251,7 +257,10 @@ def preprocess_args_and_kwargs_for_attn(
 
     Returns:
         Query, key, and value tensors in the backend layout plus its keyword
-        arguments. Packed BSHD FA4 tensors are unpadded to [tokens, heads,
+        arguments. SDPA/flex transpose to [batch, heads, sequence, head_dim];
+        TE/Magi retain the input layout. FA4 accepts BSHD input only and rejects
+        pre-packed THD (including physical padding offsets).
+        Packed BSHD FA4 tensors are unpadded to [tokens, heads,
         head_dim]; the FA4 callable restores its output to BSHD using the value
         head dimension.
     """
@@ -317,7 +326,14 @@ def preprocess_args_and_kwargs_for_attn(
                 attn_kwargs["max_seqlen_kv"] = kwargs["max_seqlen_kv"]
 
     elif attn_impl == "fa4":
-        # FA4 consumes the native [b, s, nh, hd] / [t, nh, hd] layout -- no transpose.
+        if q.ndim != 4 or kwargs.get("qkv_format") == "thd" or kwargs.get("cu_seqlens_padded") is not None:
+            raise ValueError("attn_impl='fa4' requires BSHD inputs; pre-packed THD is unsupported. Use NEAT packing.")
+        if attention_mask is not None and attention_mask.ndim != 2:
+            raise ValueError(
+                "attn_impl='fa4' cannot consume an explicit attention_mask "
+                f"(got shape {tuple(attention_mask.shape)}), even with cu_seqlens. Use attn='te'/'sdpa'."
+            )
+        # FA4 keeps BSHD axis order and gathers valid tokens below -- no transpose.
         # Window convention differs from the rest of the codebase: here (-1, 0) means
         # "causal, unbounded left context", whereas FA4 spells unbounded as None and
         # derives `local` from a non-None left window (_resolve_causal_local_window).
@@ -386,15 +402,6 @@ def preprocess_args_and_kwargs_for_attn(
                 attn_kwargs["max_seqlen_q"] = kwargs["max_seqlen_q"]
             if "max_seqlen_kv" in kwargs:
                 attn_kwargs["max_seqlen_kv"] = kwargs["max_seqlen_kv"]
-        elif attention_mask is not None:
-            # Anything left is either a padding mask (needs unpadding to varlen) or a dense
-            # block-causal mask. Silently dropping it would attend across documents/padding;
-            # materializing it is exactly the SDPA slow path FA4 exists to avoid.
-            raise ValueError(
-                "attn_impl='fa4' cannot consume an explicit attention_mask "
-                f"(got shape {tuple(attention_mask.shape)}). Pass packed sequences so the "
-                "model supplies cu_seqlens (varlen), or use attn='te'/'sdpa' for masked batches."
-            )
 
     elif attn_impl == "flex":
         attn_kwargs = kwargs
