@@ -211,9 +211,9 @@ class TestEmbedAndSpliceForCP:
     """The in-forward embed + vision splice (moved out of the CP hook)."""
 
     def test_static_splice_matches_masked_scatter_forward_and_gradients(self):
-        input_ids = torch.tensor([[7, 99, 8, 99]])
-        inputs_embeds = torch.randn(1, 4, 3, requires_grad=True)
-        features = torch.randn(2, 3, requires_grad=True)
+        input_ids = torch.tensor([[7, 99, 8, 99], [99, 8, 7, 8]])
+        inputs_embeds = torch.randn(2, 4, 3, requires_grad=True)
+        features = torch.randn(3, 3, requires_grad=True)
         grad_output = torch.randn_like(inputs_embeds)
 
         actual = _splice_multimodal_features(inputs_embeds, input_ids, features, 99, "Image")
@@ -231,6 +231,25 @@ class TestEmbedAndSpliceForCP:
         torch.testing.assert_close(actual_input_grad, inputs_embeds.grad)
         torch.testing.assert_close(actual_feature_grad, features.grad)
 
+    def test_static_splice_mixed_media_matches_masked_scatter_gradients(self):
+        input_ids = torch.tensor([[7, 99, 98, 99], [98, 8, 99, 7]])
+        inputs_embeds = torch.randn(2, 4, 3, requires_grad=True)
+        image_features = torch.randn(3, 3, requires_grad=True)
+        video_features = torch.randn(2, 3, requires_grad=True)
+        grad_output = torch.randn_like(inputs_embeds)
+
+        actual = _splice_multimodal_features(inputs_embeds, input_ids, image_features, 99, "Image")
+        actual = _splice_multimodal_features(actual, input_ids, video_features, 98, "Video")
+        actual_grads = torch.autograd.grad(actual, (inputs_embeds, image_features, video_features), grad_output)
+
+        expected = inputs_embeds.masked_scatter(input_ids.eq(99).unsqueeze(-1), image_features)
+        expected = expected.masked_scatter(input_ids.eq(98).unsqueeze(-1), video_features)
+        expected_grads = torch.autograd.grad(expected, (inputs_embeds, image_features, video_features), grad_output)
+
+        torch.testing.assert_close(actual, expected)
+        for actual_grad, expected_grad in zip(actual_grads, expected_grads):
+            torch.testing.assert_close(actual_grad, expected_grad)
+
     def test_static_splice_backward_has_no_dynamic_selection(self):
         input_ids = torch.tensor([[7, 99, 8, 99]])
         inputs_embeds = torch.randn(1, 4, 3, requires_grad=True)
@@ -244,19 +263,22 @@ class TestEmbedAndSpliceForCP:
         assert "aten::nonzero" not in operator_names
         assert "aten::masked_select" not in operator_names
 
-    def test_static_splice_rejects_placeholder_feature_mismatch(self):
+    @pytest.mark.parametrize("num_features", [1, 3])
+    def test_static_splice_rejects_placeholder_feature_mismatch(self, num_features):
         input_ids = torch.tensor([[7, 99, 8, 99]])
-        with pytest.raises(RuntimeError, match="Image features and placeholder tokens do not match"):
+        with pytest.raises(
+            ValueError, match=f"Image features and placeholder tokens do not match, tokens: 2, features: {num_features}"
+        ):
             _splice_multimodal_features(
                 torch.randn(1, 4, 3),
                 input_ids,
-                torch.randn(1, 3),
+                torch.randn(num_features, 3),
                 99,
                 "Image",
             )
 
     def test_image_features_scattered_into_embeds(self):
-        """pixel_values path: image features replace image-token embeddings via masked_scatter."""
+        """pixel_values path: image features replace image-token embeddings."""
         model = _build_model(image_token_id=99)
 
         # Visual with a rotary_pos_emb so the device-move branch is exercised.
@@ -269,12 +291,6 @@ class TestEmbedAndSpliceForCP:
         model.model.get_image_features = lambda pixel_values, image_grid_thw=None, return_dict=True: (
             types.SimpleNamespace(pooler_output=[feat])
         )
-
-        def _mask(input_ids, *, inputs_embeds=None, image_features=None, video_features=None):
-            image_mask = (input_ids == 99).unsqueeze(-1).expand_as(inputs_embeds)
-            return image_mask, torch.zeros_like(image_mask)
-
-        model.model.get_placeholder_mask = _mask
 
         ids = torch.tensor([[5, 99, 7]])
         emb = model._embed_and_splice_for_cp(
@@ -296,12 +312,6 @@ class TestEmbedAndSpliceForCP:
         model.model.get_video_features = lambda pixel_values_videos, video_grid_thw=None, return_dict=True: (
             types.SimpleNamespace(pooler_output=[feat])
         )
-
-        def _mask(input_ids, *, inputs_embeds=None, image_features=None, video_features=None):
-            video_mask = (input_ids == 88).unsqueeze(-1).expand_as(inputs_embeds)
-            return torch.zeros_like(video_mask), video_mask
-
-        model.model.get_placeholder_mask = _mask
 
         ids = torch.tensor([[5, 88, 7]])
         emb = model._embed_and_splice_for_cp(
@@ -355,14 +365,32 @@ class TestQwen3_5ModelForward:
         )
         return model
 
-    def test_media_forward_splices_with_static_indices_before_hf_forward(self, monkeypatch):
+    @pytest.mark.parametrize("media", ["image", "video", "mixed"])
+    def test_media_forward_splices_with_static_indices_before_hf_forward(self, monkeypatch, media):
         model = self._build_inner_model()
         captured = {}
+        captured_position = {}
+        vision_calls = {}
         sentinel = object()
         image_features = torch.full((1, 4), 8.0)
-        position_ids = torch.arange(3).view(1, 3)
-        model.get_image_features = lambda *args, **kwargs: types.SimpleNamespace(pooler_output=[image_features])
-        model.compute_3d_position_ids = lambda **kwargs: position_ids
+        video_features = torch.full((1, 4), 9.0)
+        position_ids = torch.arange(4).view(1, 4)
+
+        def _image_features(*args, **kwargs):
+            vision_calls["image"] = kwargs
+            return types.SimpleNamespace(pooler_output=[image_features])
+
+        def _video_features(*args, **kwargs):
+            vision_calls["video"] = kwargs
+            return types.SimpleNamespace(pooler_output=[video_features])
+
+        def _position_ids(**kwargs):
+            captured_position.update(kwargs)
+            return position_ids
+
+        model.get_image_features = _image_features
+        model.get_video_features = _video_features
+        model.compute_3d_position_ids = _position_ids
 
         def _fake_hf_forward(self, **kwargs):
             captured.update(kwargs)
@@ -370,20 +398,68 @@ class TestQwen3_5ModelForward:
 
         monkeypatch.setattr(HFQwen3_5Model, "forward", _fake_hf_forward)
 
-        input_ids = torch.tensor([[5, 99, 7]])
-        pixel_values = torch.randn(4, 8)
+        input_ids = torch.tensor([[5, 99, 98, 7]])
+        attention_mask = torch.ones_like(input_ids)
+        mm_token_type_ids = torch.tensor([[0, 1, 2, 0]])
+        image_interp_indices = torch.tensor([[1]])
+        video_cu_seqlens = torch.tensor([0, 4])
+        image_grid_thw = torch.tensor([[1, 2, 2]]) if media in ("image", "mixed") else None
+        video_grid_thw = torch.tensor([[1, 2, 2]]) if media in ("video", "mixed") else None
         out = model.forward(
             input_ids=input_ids,
-            pixel_values=pixel_values,
-            image_grid_thw=torch.tensor([[1, 2, 2]]),
+            attention_mask=attention_mask,
+            mm_token_type_ids=mm_token_type_ids,
+            pixel_values=torch.randn(4, 8) if image_grid_thw is not None else None,
+            pixel_values_videos=torch.randn(4, 8) if video_grid_thw is not None else None,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+            image_interp_indices=image_interp_indices,
+            video_cu_seqlens=video_cu_seqlens,
         )
 
         assert out is sentinel
         assert captured["input_ids"] is None
         assert captured["pixel_values"] is None
+        assert captured["pixel_values_videos"] is None
         assert captured["position_ids"] is position_ids
+        assert captured_position["input_ids"] is input_ids
+        assert captured_position["attention_mask"] is attention_mask
+        assert captured_position["mm_token_type_ids"] is mm_token_type_ids
         torch.testing.assert_close(captured["inputs_embeds"][0, 0], torch.full((4,), 5.0))
-        torch.testing.assert_close(captured["inputs_embeds"][0, 1], image_features[0])
+        torch.testing.assert_close(
+            captured["inputs_embeds"][0, 1], image_features[0] if image_grid_thw is not None else torch.full((4,), 99.0)
+        )
+        torch.testing.assert_close(
+            captured["inputs_embeds"][0, 2], video_features[0] if video_grid_thw is not None else torch.full((4,), 98.0)
+        )
+        if image_grid_thw is not None:
+            assert vision_calls["image"]["image_interp_indices"] is image_interp_indices
+        if video_grid_thw is not None:
+            assert vision_calls["video"]["video_cu_seqlens"] is video_cu_seqlens
+
+    def test_media_forward_preserves_given_position_ids(self, monkeypatch):
+        model = self._build_inner_model()
+        model.get_image_features = lambda *args, **kwargs: types.SimpleNamespace(
+            pooler_output=[torch.full((1, 4), 8.0)]
+        )
+        model.compute_3d_position_ids = lambda **kwargs: pytest.fail("position IDs should not be recomputed")
+        captured = {}
+
+        def _fake_hf_forward(self, **kwargs):
+            captured.update(kwargs)
+            return None
+
+        monkeypatch.setattr(HFQwen3_5Model, "forward", _fake_hf_forward)
+
+        position_ids = torch.tensor([[0, 1]])
+        model.forward(
+            input_ids=torch.tensor([[5, 99]]),
+            pixel_values=torch.randn(4, 8),
+            image_grid_thw=torch.tensor([[1, 2, 2]]),
+            position_ids=position_ids,
+        )
+
+        assert captured["position_ids"] is position_ids
 
     def test_media_forward_accepts_hidden_states_as_input_ids(self, monkeypatch):
         model = self._build_inner_model()
