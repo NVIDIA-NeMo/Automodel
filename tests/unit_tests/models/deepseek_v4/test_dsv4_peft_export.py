@@ -19,6 +19,7 @@ from pathlib import Path
 
 import pytest
 import torch
+import yaml
 from peft import PeftModel, get_peft_model_state_dict
 from safetensors.torch import load_file, save_file
 from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config as HFConfig
@@ -31,6 +32,7 @@ from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
 from nemo_automodel.components.models.deepseek_v4.model import DeepseekV4ForCausalLM
+from nemo_automodel.components.utils.model_utils import freeze_deepseek_v4_indexer_params
 
 # Real checkpoint save/load and PEFT construction exceed the default 5-second budget on cold CI workers.
 pytestmark = pytest.mark.timeout(120)
@@ -46,7 +48,10 @@ def peft_process_group(tmp_path: Path):
 
 
 @pytest.mark.parametrize("v4_compatible", [False, True])
-def test_peft_export_loads_in_hf_and_automodel(tmp_path: Path, peft_process_group, v4_compatible: bool):
+@pytest.mark.parametrize("recipe_targets", [False, True], ids=["all-projections", "recipe"])
+def test_peft_export_loads_in_hf_and_automodel(
+    tmp_path: Path, peft_process_group: None, v4_compatible: bool, recipe_targets: bool
+) -> None:
     """Exercise real metadata/tensor saves, HF consumption, and native checkpoint reload."""
     torch.manual_seed(42)
     config_values = dict(
@@ -81,20 +86,30 @@ def test_peft_export_loads_in_hf_and_automodel(tmp_path: Path, peft_process_grou
     )
     reference = HFModel(HFConfig(**config_values))
     reference.save_pretrained(tmp_path / "source")
+    target_modules = ["*wq_a", "*wq_b", "*wkv", "*wo_b"]
+    if recipe_targets:
+        recipe_path = (
+            Path(__file__).resolve().parents[4]
+            / "examples/llm_finetune/deepseek_v4/deepseek_v4_flash_hellaswag_lora.yaml"
+        )
+        target_modules = yaml.safe_load(recipe_path.read_text())["peft"]["target_modules"]
     peft_config = PeftConfig(
-        target_modules=["*wq_a", "*wq_b", "*wkv", "*wo_b"],
+        target_modules=target_modules,
         dim=2,
         alpha=4,
         use_memory_efficient_lora=False,
     )
     assert apply_lora_to_linear_modules(model, peft_config) > 0
+    if recipe_targets:
+        # Production trainability freezes the discrete indexer, including any adapters.
+        freeze_deepseek_v4_indexer_params(model)
 
     # These are the receiving model's public module names, independently of the export implementation.
     projections = {"wq_a": "q_a_proj", "wq_b": "q_b_proj", "wkv": "kv_proj", "wo_b": "o_b_proj"}
     module_pairs = []
     with torch.no_grad():
         for name, module in model.named_modules():
-            if not hasattr(module, "lora_A"):
+            if not hasattr(module, "lora_A") or not module.lora_A.weight.requires_grad:
                 continue
             prefix, leaf = name.rsplit(".", 1)
             hf_name = prefix + "." + projections[leaf]
@@ -103,7 +118,8 @@ def test_peft_export_loads_in_hf_and_automodel(tmp_path: Path, peft_process_grou
             module.lora_A.weight.normal_(std=0.05)
             module.lora_B.weight.normal_(std=0.05)
             module_pairs.append((name, hf_name))
-    assert any("compressor.indexer" in name for name, _ in module_pairs)
+    assert any("compressor.indexer" in name for name, _ in module_pairs) == (not recipe_targets)
+    assert any("compressor.wkv" in name for name, _ in module_pairs)
     native = {name: tensor.clone() for name, tensor in ModelState(model, is_peft=True).state_dict().items()}
     checkpointer = Checkpointer(
         CheckpointingConfig(
