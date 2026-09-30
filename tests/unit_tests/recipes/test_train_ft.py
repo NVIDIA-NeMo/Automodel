@@ -3581,3 +3581,60 @@ def test_chunked_ce_gemma4_post_projection_contract(implementation, softcap):
         raw_logits = torch.nn.functional.linear(hidden.detach(), reference.lm_head.weight.detach())
         raw_loss = torch.nn.functional.cross_entropy(raw_logits.float().flatten(0, 1), labels.flatten())
         assert abs(raw_loss.item() - expected.item()) > 0.01
+
+
+@pytest.mark.parametrize("packing_format,batch_size", [("neat", 1), ("neat", 2), ("thd", 1)])
+def test_mtp_recipe_distinguishes_neat_metadata_from_thd_offsets(monkeypatch, packing_format, batch_size):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+
+    from nemo_automodel.components.datasets.utils import neat_packed_collater
+    from nemo_automodel.components.models.common.packing import PackingCapabilities
+    from nemo_automodel.recipes.llm import train_ft
+
+    class Model(torch.nn.Module):
+        def forward(self, input_ids, **kwargs):
+            logits = torch.zeros(*input_ids.shape, 8)
+            return SimpleNamespace(logits=logits, mtp_per_depth_logits=[logits], mtp_loss_scaling_factor=1.0)
+
+    recipe = object.__new__(train_ft.TrainFinetuneRecipeForNextTokenPrediction)
+    recipe.cfg = SimpleNamespace(mtp=SimpleNamespace(scaling_factor=1.0))
+    recipe.dist_env = SimpleNamespace(device="cpu")
+    recipe.device_mesh = None
+    recipe.pp_enabled = False
+    recipe.tokenizer = None
+    recipe.te_fp8 = None
+    recipe.model_parts = [Model()]
+    recipe.loss_fn = object()
+    recipe._get_cp_group_size = lambda: 1
+    recipe._get_dp_group_size = lambda **kwargs: 1
+    sample = dict(
+        input_ids=[1, 2, 3, 4, 0],
+        labels=[2, -100, 4, -100, -100],
+        position_ids=[0, 1, 0, 1, 0],
+        attention_mask=[1, 1, 2, 2, 0],
+    )
+    batch = neat_packed_collater(
+        [sample] * batch_size, packing=PackingCapabilities("block_causal", requires_packed_sequence_metadata=True)
+    )
+    if packing_format == "thd":
+        batch.pop("packed_token_indices")
+        batch["cu_seqlens"] = torch.tensor([0, 2, 4, 5])
+    expected = None if packing_format == "neat" else batch["cu_seqlens"]
+    captured = {}
+
+    def mtp_loss(*args, **kwargs):
+        captured.update(kwargs)
+        return torch.tensor(0.0)
+
+    monkeypatch.setattr(
+        train_ft,
+        "ContextParallelSharder",
+        lambda *args, **kwargs: SimpleNamespace(shard=lambda actual: (nullcontext, actual)),
+    )
+    monkeypatch.setattr(train_ft, "calculate_loss", lambda *args, **kwargs: torch.tensor(0.0))
+    monkeypatch.setattr(train_ft, "calculate_mtp_loss", mtp_loss)
+    recipe._forward_backward_step(
+        0, batch, loss_buffer=[], num_label_tokens=2 * batch_size, num_batches=1, is_train=False
+    )
+    assert captured["cu_seqlens"] is expected

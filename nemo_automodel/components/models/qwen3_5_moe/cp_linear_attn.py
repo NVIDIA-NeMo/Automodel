@@ -191,8 +191,8 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
 
         if (
             not use_precomputed_states
-            and is_indexed_packed_mask(attention_mask)
             and (cu_seqlens is None or indices is None)
+            and is_indexed_packed_mask(attention_mask)
         ):
             raise ValueError("Packed Qwen3.5 linear attention requires dataset-provided indices and cu_seqlens.")
 

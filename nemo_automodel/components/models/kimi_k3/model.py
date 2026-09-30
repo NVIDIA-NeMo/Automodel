@@ -848,7 +848,8 @@ class KimiDeltaAttention(nn.Module):
             attention_mask: Optional tensor of shape [batch, sequence]. Without
                 packed metadata this is a binary validity mask (1 means valid).
                 With packed metadata it may hold 1-based document IDs and zero
-                for padding.
+                for padding. Non-2D masks are not consumed directly; the legacy
+                fallback reads ``padding_mask`` instead.
             packed_context: Optional document layout of the batch, required under
                 context parallelism and used to reset the recurrent state at every
                 packed-document boundary.
@@ -858,7 +859,8 @@ class KimiDeltaAttention(nn.Module):
                 contains row-local boundaries of shape [batch, max_documents + 1]
                 with -1 unused entries, or flat boundaries of shape [documents + 1].
                 With token indices, boundaries address the unpadded valid-token
-                stream; alone, flat boundaries address one unpadded physical row.
+                stream; alone, flat boundaries address one physical row only when
+                neither a document mask nor ``_packed_seq_ids`` is supplied.
                 ``_packed_seq_ids`` optionally carries document IDs of shape
                 [batch, sequence]; ``padding_mask`` is boolean with the same
                 shape, where True marks padding.

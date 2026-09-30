@@ -1564,7 +1564,7 @@ def neat_packed_vlm_collater(
         grids, image positions, and timestamps concatenate their leading axis
         while preserving their trailing axes; variable-resolution media remain
         a flattened list of per-image tensors. Pixel values are cast to bfloat16.
-        Media counts have shape [batch].
+        Optional media counts have shape [batch].
         Varlen output adds
         int64 ``packed_token_indices`` of shape [batch, sequence], containing
         row-local token positions and -1 padding; int32 ``cu_seqlens`` of shape

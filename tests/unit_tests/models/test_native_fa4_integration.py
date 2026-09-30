@@ -128,5 +128,103 @@ def test_deepseek_v32_rejects_fa4_before_sparse_layers():
     from nemo_automodel.components.models.deepseek_v32.model import DeepseekV32ForCausalLM
 
     assert DeepseekV32ForCausalLM._uses_native_fa4 is False
-    with pytest.raises(ValueError, match="sparse attention does not support FA4"):
+    with pytest.raises(ValueError, match="FA4 is unavailable for DeepSeek V3.2 sparse attention"):
         DeepseekV32ForCausalLM(DeepseekV32Config(), backend=BackendConfig(attn="fa4"))
+
+
+@pytest.mark.parametrize("microbatch_size", [1, 2])
+def test_qwen35_hybrid_packed_fa4_matches_sdpa(microbatch_size):
+    """Exercise collation, entry hook, recurrent/full attention, logits and gradients."""
+    from transformers.models.qwen3_5.modeling_qwen3_5 import torch_recurrent_gated_delta_rule
+
+    from nemo_automodel.components.models.qwen3_5.model import Qwen3_5ForCausalLM
+    from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import CPAwareGatedDeltaNet
+    from tests.unit_tests.models.qwen3_5.test_qwen3_5_dense_backbone import _backend, _tiny_config
+
+    def conv(x, weight, bias, activation, seq_idx):
+        cuts = [0] + (torch.nonzero(seq_idx[0, 1:] != seq_idx[0, :-1]).flatten() + 1).tolist() + [x.shape[-1]]
+        return torch.cat(
+            [
+                F.silu(
+                    F.conv1d(x[:, :, a:b], weight[:, None], bias, padding=weight.shape[-1] - 1, groups=x.shape[1])[
+                        :, :, : b - a
+                    ]
+                )
+                for a, b in zip(cuts, cuts[1:])
+            ],
+            dim=-1,
+        )
+
+    def recurrence(q, k, v, *, g, beta, cu_seqlens, cu_seqlens_cpu=None, **kwargs):
+        cuts = cu_seqlens.tolist()
+        return torch.cat(
+            [
+                torch_recurrent_gated_delta_rule(q[:, a:b], k[:, a:b], v[:, a:b], g[:, a:b], beta[:, a:b], **kwargs)[0]
+                for a, b in zip(cuts, cuts[1:])
+            ],
+            dim=1,
+        ), None
+
+    torch.manual_seed(31)
+    config = _tiny_config(
+        layer_types=("linear_attention", "full_attention"),
+        linear_key_head_dim=4,
+        linear_value_head_dim=4,
+        linear_num_key_heads=1,
+        linear_num_value_heads=2,
+        linear_conv_kernel_dim=4,
+    )
+    fa4 = ModuleType("flash_attn.cute")
+    fa4.flash_attn_func = None
+    fa4.flash_attn_varlen_func = _reference_varlen_sdpa
+    with patch.dict("sys.modules", {"flash_attn.cute": fa4}):
+        model = Qwen3_5ForCausalLM(config, backend=replace(_backend(), attn="fa4"))
+    reference = Qwen3_5ForCausalLM(config, backend=_backend())
+    for current in (model, reference):
+        for module in current.modules():
+            if isinstance(module, CPAwareGatedDeltaNet):
+                module.causal_conv1d_fn = conv
+                module.chunk_gated_delta_rule = recurrence
+                with torch.no_grad():
+                    module._fp32_params.A_log.zero_()
+                    module._fp32_params.dt_bias.zero_()
+    reference.load_state_dict(model.state_dict())
+    samples = [
+        dict(
+            input_ids=[1, 2, 3, 4, 0, 0],
+            labels=[2, -100, 4, -100, -100, -100],
+            attention_mask=[1, 1, 2, 2, 0, 0],
+            position_ids=[0, 1, 0, 1, 0, 0],
+        ),
+        dict(
+            input_ids=[5, 6, 7, 8, 9, 0],
+            labels=[6, 7, -100, 9, -100, -100],
+            attention_mask=[1, 1, 1, 2, 2, 0],
+            position_ids=[0, 1, 2, 0, 1, 0],
+        ),
+    ]
+    outputs = []
+    for current in (model, reference):
+        contract = configure_packing(get_model_attn_implementation(current), model=current)
+        batch = neat_packed_collater(samples, packing=contract)
+        batch.pop("labels")
+        outputs.append(
+            torch.cat(
+                [
+                    current(
+                        **{
+                            key: value[start : start + microbatch_size] if isinstance(value, torch.Tensor) else value
+                            for key, value in batch.items()
+                        }
+                    ).logits
+                    for start in range(0, 2, microbatch_size)
+                ]
+            )
+        )
+    valid = torch.tensor([sample["attention_mask"] for sample in samples]) > 0
+    torch.testing.assert_close(outputs[0][valid], outputs[1][valid], rtol=1e-4, atol=1e-5)
+    upstream = torch.randn_like(outputs[0]) * valid.unsqueeze(-1)
+    for output in outputs:
+        output.backward(upstream)
+    for (name, param), (_, ref_param) in zip(model.named_parameters(), reference.named_parameters()):
+        torch.testing.assert_close(param.grad, ref_param.grad, rtol=1e-4, atol=1e-5, msg=name)

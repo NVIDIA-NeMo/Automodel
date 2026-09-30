@@ -50,6 +50,7 @@ class GatedDeltaPackedMetadata:
 def prepare_gated_delta_packed_metadata(
     attention_mask: torch.Tensor | None,
     packed_seq_ids: torch.Tensor | None,
+    *,
     packed_token_indices: torch.Tensor | None,
     cu_seqlens: torch.Tensor | None,
 ) -> GatedDeltaPackedMetadata | None:

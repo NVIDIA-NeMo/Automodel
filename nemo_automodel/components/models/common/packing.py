@@ -32,7 +32,8 @@ This is the same approach used by LlamaFactory.
 """
 
 import logging
-from dataclasses import dataclass
+from collections.abc import Sequence
+from dataclasses import dataclass, replace
 from typing import Any, Literal, Protocol, runtime_checkable
 
 import torch
@@ -595,3 +596,31 @@ def configure_packing(
         sum(1 for m in _PACKING_PATCH_MODULES if sys.modules.get(m) is not None),
     )
     return capabilities
+
+
+def configure_packing_for_models(
+    models: Sequence[torch.nn.Module], *, unpad_data: UnpadData | None = None
+) -> PackingCapabilities:
+    """Configure local pipeline stages and combine their dataset requirements.
+
+    Args:
+        models: Nonempty sequence of built model stages consuming the same batch.
+        unpad_data: Dataset-owned indexed-mask conversion for HF flash attention.
+
+    Returns:
+        Packing contract with metadata enabled if any stage needs it.
+
+    Raises:
+        ValueError: If there are no models or their packed mask layouts disagree.
+    """
+    if not models:
+        raise ValueError("Packing setup requires at least one model")
+    contracts = [
+        configure_packing(get_model_attn_implementation(model), model=model, unpad_data=unpad_data) for model in models
+    ]
+    if any(contract.packed_mask_type != contracts[0].packed_mask_type for contract in contracts):
+        raise ValueError("Pipeline stages must agree on the NEAT packed mask layout")
+    return replace(
+        contracts[0],
+        requires_packed_sequence_metadata=any(contract.requires_packed_sequence_metadata for contract in contracts),
+    )

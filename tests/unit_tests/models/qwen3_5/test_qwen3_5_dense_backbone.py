@@ -245,8 +245,8 @@ class TestDenseTextBackbone:
         metadata = qwen3_5_packing.prepare_gated_delta_packed_metadata(
             attention_mask,
             packed_seq_ids,
-            packed_metadata["packed_token_indices"],
-            packed_metadata["cu_seqlens"],
+            packed_token_indices=packed_metadata["packed_token_indices"],
+            cu_seqlens=packed_metadata["cu_seqlens"],
         )
         reference_indices, reference_cu_seqlens, _ = get_unpad_data(packed_seq_ids)
 
@@ -264,8 +264,8 @@ class TestDenseTextBackbone:
         metadata = qwen3_5_packing.prepare_gated_delta_packed_metadata(
             attention_mask,
             packed_seq_ids,
-            packed_metadata["packed_token_indices"],
-            packed_metadata["cu_seqlens"],
+            packed_token_indices=packed_metadata["packed_token_indices"],
+            cu_seqlens=packed_metadata["cu_seqlens"],
         )
 
         assert metadata is not None

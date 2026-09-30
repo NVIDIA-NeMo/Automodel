@@ -517,10 +517,10 @@ def test_gdn_wrapper_synthesizes_document_ids_for_packed_conv(monkeypatch: pytes
     assert captured["attention_mask"].tolist() == [[0, 0, 0, 1, 1, 1, 1, 1, 1, 1]]
     assert captured["attention_mask"].dtype == torch.int32
 
-    # An explicit mask is preserved untouched.
+    # An explicit mask is normalized to canonical IDs.
     explicit = torch.zeros(1, 10, dtype=torch.int32)
     layer(torch.randn(1, 10, gdn_config.hidden_size), cu_seqlens=torch.tensor([0, 10]), attention_mask=explicit)
-    assert captured["attention_mask"] is explicit
+    torch.testing.assert_close(captured["attention_mask"], explicit)
 
 
 def test_packed_boundaries_from_seq_lens_matches_loader_contract() -> None:
@@ -690,3 +690,27 @@ def test_packed_gdn_rejects_inconsistent_boundaries_before_kernels(boundaries, d
     mask = None if document_ids is None else torch.tensor(document_ids)
     with pytest.raises(ValueError, match=message):
         layer(torch.randn(1, 10, 4), cu_seqlens=torch.tensor(boundaries), attention_mask=mask)
+
+
+def test_packed_gdn_canonicalizes_reused_ids_and_inconsistent_indices(monkeypatch):
+    from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import CPAwareGatedDeltaNet
+    from nemo_automodel.components.models.qwen3_8_flash_next.layers import Qwen3_8_FlashNextGatedDeltaNet
+
+    captured = {}
+
+    def capture(self, hidden_states, **kwargs):
+        captured.update(kwargs)
+        return hidden_states
+
+    monkeypatch.setattr(CPAwareGatedDeltaNet, "forward", capture)
+    layer = Qwen3_8_FlashNextGatedDeltaNet.__new__(Qwen3_8_FlashNextGatedDeltaNet)
+    torch.nn.Module.__init__(layer)
+    layer._cp_mesh = None
+    layer(
+        torch.randn(1, 10, 4),
+        cu_seqlens=torch.tensor([0, 3, 4, 7, 10]),
+        attention_mask=torch.tensor([[1, 1, 1, 2, 1, 1, 1, 3, 3, 3]]),
+        indices=torch.tensor([0, 2]),
+    )
+    assert captured["attention_mask"].tolist() == [[0, 0, 0, 1, 2, 2, 2, 3, 3, 3]]
+    assert captured["indices"].tolist() == list(range(10))

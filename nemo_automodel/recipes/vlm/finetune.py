@@ -86,6 +86,7 @@ from nemo_automodel.components.loss.utils import (
     calculate_loss,
     prepare_lm_weight,
 )
+from nemo_automodel.components.models.common.packing import PackingCapabilities
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
@@ -441,6 +442,12 @@ class FinetuneRecipeForVLM(BaseRecipe):
         """Whether this rank owns the trainable model and its components."""
         return True
 
+    def _configure_packing(self) -> PackingCapabilities:
+        """Configure local model stages before the VLM dataloader is built."""
+        from nemo_automodel.components.models.common.packing import configure_packing_for_models
+
+        return configure_packing_for_models(self.model_parts, unpad_data=get_unpad_data)
+
     def setup(self):
         """Builds all components needed for training/validation/logging/checkpointing/etc.
 
@@ -632,19 +639,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
             packing_enabled=dataloader_config.packing is not None,
             cp_size=self.mesh_context.cp_size,
         )
-        from nemo_automodel.components.models.common.packing import configure_packing, get_model_attn_implementation
-
         packing_contract = DEFAULT_PACKED_SEQUENCE_CONTRACT
         if dataloader_config.packing is not None and dataloader_config.packing.packing_format != "thd":
-            attn_implementation = get_model_attn_implementation(self.model_parts[0])
-            packing_contract = configure_packing(
-                attn_implementation,
-                model=self.model_parts[0],
-                unpad_data=get_unpad_data,
-            )
-            if packing_contract.uses_native_fa4:
-                for model_part in self.model_parts[1:]:
-                    configure_packing(attn_implementation, model=model_part)
+            packing_contract = self._configure_packing()
         process_group = getattr(self.mesh_context, "process_group", None)
         dataset_build_context = FirstRankPerNode(group=process_group)
         with ScopedRNG(seed=self.cfg.get("seed", 42), ranked=True):
@@ -1049,7 +1046,11 @@ class FinetuneRecipeForVLM(BaseRecipe):
                         lm_weight=shared_lm_weight,
                         logits_dtype=out.logits.dtype,
                         grad_reduce_group=grad_reduce_group,
-                        cu_seqlens=None if mtp_per_depth_targets is not None else batch.get("cu_seqlens"),
+                        cu_seqlens=(
+                            None
+                            if mtp_per_depth_targets is not None or "packed_token_indices" in batch
+                            else batch.get("cu_seqlens")
+                        ),
                     )
 
                 # Joint base + drafter co-training (Gemma4WithDrafter and

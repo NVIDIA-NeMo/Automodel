@@ -155,6 +155,7 @@ def test_kd_fused_loss_preserves_tensor_valued_hidden_states(monkeypatch, recipe
     batch = {
         "input_ids": torch.tensor([[0, 1, 2], [1, 2, 3]]),
         "labels": torch.tensor([[0, 1, 2], [1, 2, -100]]),
+        "max_seqlen": 3,
     }
     if recipe_module is vlm_kd:
         recipe._ce_loss_buffer = []
@@ -603,3 +604,115 @@ def test_chunked_kd_real_llama_loss_and_gradients(recipe_module, recipe_cls, _, 
     if is_train:
         for actual, expected in zip(student.parameters(), reference.parameters()):
             torch.testing.assert_close(actual.grad, expected.grad, atol=2e-6, rtol=1e-4)
+
+
+@pytest.mark.parametrize("recipe_module,recipe_cls,_", _RECIPE_CASES)
+@pytest.mark.parametrize("teacher_backend", ["sdpa", "fa4"])
+def test_kd_packing_covers_teacher_metadata_and_hooks(teacher_backend, recipe_module, recipe_cls, _):
+    from nemo_automodel.components.datasets.utils import neat_packed_collater
+    from nemo_automodel.components.models.common import BackendConfig
+
+    class Model(nn.Module):
+        packed_mask_type = "document_ids"
+        _uses_native_fa4 = True
+
+        def __init__(self, backend):
+            super().__init__()
+            self.backend = BackendConfig(attn=backend)
+
+        def forward(self, input_ids, packed_token_indices, cu_seqlens, **kwargs):
+            return packed_token_indices, cu_seqlens
+
+    recipe = object.__new__(recipe_cls)
+    recipe.cfg = _Cfg(**{"packed_sequence.packed_sequence_size": 6, "packed_sequence.packing_strategy": "neat"})
+    recipe.cfg.vlm_dataloader = SimpleNamespace(packing=SimpleNamespace(packing_format="neat"))
+    recipe.model_parts = [Model("sdpa")]
+    recipe.teacher_model = Model(teacher_backend)
+    recipe.teacher_pp = None
+    recipe.separate_meshes = False
+    contract = recipe._configure_packing()
+    assert contract.requires_packed_sequence_metadata
+    recipe._configure_teacher_packing()
+    batch = neat_packed_collater(
+        [
+            dict(
+                input_ids=[1, 2, 3, 0],
+                labels=[2, -100, -100, -100],
+                position_ids=[0, 1, 0, 0],
+                attention_mask=[1, 1, 2, 0],
+            ),
+            dict(
+                input_ids=[2, 3, 1, 0],
+                labels=[3, -100, -100, -100],
+                position_ids=[0, 1, 0, 0],
+                attention_mask=[1, 1, 2, 0],
+            ),
+        ],
+        packing=contract,
+    )
+    assert isinstance(batch["max_seqlen"], int)
+    indices, boundaries = recipe.teacher_model(**batch)
+    if teacher_backend == "fa4":
+        assert indices.tolist() == [0, 1, 2, 4, 5, 6]
+        assert boundaries.tolist() == [0, 2, 3, 5, 6]
+    else:
+        assert indices.shape == (2, 4)
+        assert boundaries.shape == (2, 3)
+
+
+@pytest.mark.parametrize("separate_meshes", [False, True])
+def test_llm_kd_packing_rejects_incompatible_mask_layouts(monkeypatch, separate_meshes):
+    from nemo_automodel.components.models.common import BackendConfig
+
+    student = nn.Module()
+    student.backend = BackendConfig(attn="sdpa")
+    teacher = nn.Module()
+    teacher.backend = BackendConfig(attn="fa4")
+    teacher._uses_native_fa4 = True
+    recipe = object.__new__(llm_kd.KnowledgeDistillationRecipeForNextTokenPrediction)
+    recipe.cfg = _Cfg(**{"packed_sequence.packed_sequence_size": 6, "packed_sequence.packing_strategy": "neat"})
+    recipe.model_parts = [student]
+    recipe.teacher_model = teacher if not separate_meshes else None
+    recipe.teacher_pp = None
+    recipe.separate_meshes = separate_meshes
+    if separate_meshes:
+        group = object()
+        recipe.kd_mesh_bridge = SimpleNamespace(is_student=True, control_group=group)
+        monkeypatch.setattr(torch.distributed, "get_world_size", lambda actual: 2 if actual is group else 0)
+
+        def gather(outputs, local, *, group):
+            assert local == ["block_causal"]
+            outputs[:] = [local, ["document_ids"]]
+
+        monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
+    with pytest.raises(ValueError, match="same packed mask layout"):
+        recipe._configure_teacher_packing()
+
+
+def _packing_contract_worker(rank, rendezvous):
+    import torch.distributed as dist
+
+    from nemo_automodel.components.models.common import BackendConfig
+    from nemo_automodel.recipes.kd_utils import configure_kd_teacher_packing
+
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2)
+    try:
+        control = dist.new_group(backend="gloo")
+        local = nn.Module()
+        local.backend = BackendConfig(attn="sdpa")
+        teacher_parts, student_parts = ([local], []) if rank == 1 else ([], [local])
+        configure_kd_teacher_packing(teacher_parts, student_parts, control_group=control)
+        if rank == 1:
+            local.packed_mask_type = "document_ids"
+        with pytest.raises(ValueError, match="same packed mask layout"):
+            configure_kd_teacher_packing(teacher_parts, student_parts, control_group=control)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.runtime_budget(
+    20, hard_timeout=60, reason="Two spawned CPU ranks import both recipe stacks; measured 8.6s locally"
+)
+def test_kd_packing_contract_agreement_across_real_cpu_ranks(tmp_path):
+    # Process startup imports both recipe stacks; leave room for cold CI workers.
+    torch.multiprocessing.spawn(_packing_contract_worker, args=(f"file://{tmp_path / 'rendezvous'}",), nprocs=2)

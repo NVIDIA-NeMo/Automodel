@@ -97,12 +97,6 @@ def _resolve_custom_attention_backend(
         return backend
     native_backend = _NATIVE_ATTENTION_BACKENDS.get(attn_implementation)
     if native_backend is None:
-        if attn_implementation in {"flash_attention_2", "flash_attention_3"}:
-            logger.warning(
-                "%r has no native custom-model backend; keeping backend.attn=%r.",
-                attn_implementation,
-                backend.attn,
-            )
         return backend
     if not uses_native_fa4:
         return backend

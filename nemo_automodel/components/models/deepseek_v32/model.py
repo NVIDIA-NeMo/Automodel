@@ -226,7 +226,7 @@ class DeepseekV32ForCausalLM(DeepseekV3ForCausalLM):
         # may be shared with other models, which must not inherit this default.
         resolved_backend = backend or BackendConfig()
         if resolved_backend.attn == "fa4":
-            raise ValueError("DeepSeek V3.2 sparse attention does not support FA4. Use attn='te'/'sdpa'.")
+            raise ValueError("FA4 is unavailable for DeepSeek V3.2 sparse attention. Use attn='te'/'sdpa'.")
         if resolved_backend.gate_precision is None:
             resolved_backend = replace(resolved_backend, gate_precision=torch.float32)
         self.backend = resolved_backend

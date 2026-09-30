@@ -93,6 +93,7 @@ from nemo_automodel.components.loss.utils import (
     calculate_loss,
     prepare_lm_weight,
 )
+from nemo_automodel.components.models.common.packing import PackingCapabilities
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
 from nemo_automodel.components.training.domain_mixture import WEIGHTED_AGGREGATE_NAME
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
@@ -552,6 +553,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         """Whether this rank owns the trainable model and its components."""
         return True
 
+    def _configure_packing(self) -> PackingCapabilities:
+        """Configure every local model stage and return its NEAT data requirements."""
+        from nemo_automodel.components.models.common.packing import configure_packing_for_models
+
+        return configure_packing_for_models(self.model_parts, unpad_data=get_unpad_data)
+
     def setup(self):
         """Builds all components needed for training/validation/logging/checkpointing/etc.
 
@@ -841,20 +848,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0
             and self.cfg.get("packed_sequence.packing_strategy", "thd") == "neat"
         ):
-            from nemo_automodel.components.models.common.packing import (
-                configure_packing,
-                get_model_attn_implementation,
-            )
-
-            attn_implementation = get_model_attn_implementation(self.model_parts[0])
-            packing_contract = configure_packing(
-                attn_implementation,
-                model=self.model_parts[0],
-                unpad_data=get_unpad_data,
-            )
-            if packing_contract.uses_native_fa4:
-                for model_part in self.model_parts[1:]:
-                    configure_packing(attn_implementation, model=model_part)
+            packing_contract = self._configure_packing()
         collate_wrapper = _build_pp_collate_wrapper(self.cfg.model, self.pp_enabled)
 
         def materialize_loader(config):
@@ -1400,7 +1394,11 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         num_label_tokens=num_label_tokens,
                         ignore_index=ignore_index,
                         # mask cross-boundary MTP label rolls in THD packing (matches the PP path)
-                        cu_seqlens=None if mtp_per_depth_targets is not None else batch.get("cu_seqlens"),
+                        cu_seqlens=(
+                            None
+                            if mtp_per_depth_targets is not None or "packed_token_indices" in batch
+                            else batch.get("cu_seqlens")
+                        ),
                         lm_weight=shared_lm_weight,
                         **loss_distributed_kwargs,
                     )

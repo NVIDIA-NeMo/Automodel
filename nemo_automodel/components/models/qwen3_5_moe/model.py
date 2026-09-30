@@ -213,8 +213,8 @@ class Qwen3_5MoeBlock(Block):
             packed_gdn_metadata = prepare_gated_delta_packed_metadata(
                 attention_mask,
                 attn_kwargs.get("_packed_seq_ids"),
-                attn_kwargs.get("packed_token_indices"),
-                attn_kwargs.get("cu_seqlens"),
+                packed_token_indices=attn_kwargs.get("packed_token_indices"),
+                cu_seqlens=attn_kwargs.get("cu_seqlens"),
             )
 
         if packed_gdn_metadata is not None:
@@ -712,7 +712,11 @@ class Qwen3_5MoeTextModelBackend(nn.Module):
             use_cache: Whether to use a cache; only ``False`` or ``None`` is
                 supported.
             **attn_kwargs: Backend-specific attention arguments, including optional
-                ``_packed_seq_ids`` of shape [batch, sequence].
+                ``_packed_seq_ids`` of shape [batch, sequence], ``packed_token_indices``
+                of shape [batch, sequence] or [tokens], ``cu_seqlens`` of shape
+                [batch, max_documents + 1] or [documents + 1], and integer
+                ``max_seqlen``. Batch-major metadata uses -1 padding. Explicit
+                token metadata is supported without context parallelism.
 
         Returns:
             Model output whose ``last_hidden_state`` has shape [batch, sequence,
@@ -779,8 +783,8 @@ class Qwen3_5MoeTextModelBackend(nn.Module):
             packed_gdn_metadata = prepare_gated_delta_packed_metadata(
                 attention_mask,
                 attn_kwargs.get("_packed_seq_ids"),
-                attn_kwargs.get("packed_token_indices"),
-                attn_kwargs.get("cu_seqlens"),
+                packed_token_indices=attn_kwargs.get("packed_token_indices"),
+                cu_seqlens=attn_kwargs.get("cu_seqlens"),
             )
 
         # --- Decoder layers (Qwen3Next Block, unmodified) ---

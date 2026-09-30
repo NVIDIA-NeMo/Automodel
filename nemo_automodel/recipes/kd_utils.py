@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import itertools
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -24,8 +25,14 @@ import torch
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor, Shard
 
+from nemo_automodel.components.datasets.packing import get_unpad_data
 from nemo_automodel.components.distributed.config import DDPConfig, DistributedSetup
 from nemo_automodel.components.distributed.context_parallel.utils import unshard_context_parallel_tensor
+from nemo_automodel.components.models.common.packing import (
+    configure_packing,
+    get_model_attn_implementation,
+    get_packing_capabilities,
+)
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config, parse_distributed_section
 
 if TYPE_CHECKING:
@@ -41,6 +48,42 @@ class _ConfigLike(Protocol):
     def get(self, key: str, default: Any = None) -> Any:
         """Return one configuration value or ``default``."""
         ...
+
+
+def configure_kd_teacher_packing(
+    teacher_parts: Sequence[torch.nn.Module],
+    student_parts: Sequence[torch.nn.Module],
+    *,
+    control_group: dist.ProcessGroup | None = None,
+) -> None:
+    """Adapt NEAT-packed teachers and check both roles consume the same mask layout.
+
+    Args:
+        teacher_parts: Locally owned teacher stages, empty on student-only ranks.
+        student_parts: Locally owned student stages, empty on teacher-only ranks.
+        control_group: Shared group for separate-mesh KD; all its ranks must call.
+            Same-mesh KD passes None and performs only a local check.
+
+    Raises:
+        ValueError: If teacher and student packed mask layouts disagree.
+    """
+    layouts = [
+        configure_packing(get_model_attn_implementation(part), model=part, unpad_data=get_unpad_data).packed_mask_type
+        for part in teacher_parts
+    ]
+    layouts.extend(
+        get_packing_capabilities(get_model_attn_implementation(part), model=part).packed_mask_type
+        for part in student_parts
+    )
+    if control_group is not None:
+        gathered_layouts: list[list[str]] = [[] for _ in range(dist.get_world_size(control_group))]
+        dist.all_gather_object(gathered_layouts, layouts, group=control_group)
+        layouts = [layout for rank_layouts in gathered_layouts for layout in rank_layouts]
+    if len(set(layouts)) != 1:
+        raise ValueError(
+            "NEAT-packed KD requires teacher and student to use the same packed mask layout. "
+            "Select compatible attention backends or disable sequence packing."
+        )
 
 
 def materialize_teacher_logits(
