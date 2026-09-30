@@ -35,8 +35,7 @@ from nemo_automodel.components.models.kimi_linear.cp import all_gather_sequence,
 # Run only on the GPU job. Each test mp.spawns two gloo worker processes that
 # re-import the full package, and these cover a multi-GPU feature, so they are
 # skipped on the CPU unit-test job.
-# Over the default 5s budget on purpose: this module spawns worker processes; every child re-imports torch from scratch.
-# Shrink the work or the process count before raising this further.
+# Keep a hard watchdog for spawned workers; each test declares its runtime budget below.
 pytestmark = [
     pytest.mark.timeout(60),
     pytest.mark.run_only_on("GPU"),
@@ -126,9 +125,15 @@ def _sharder_worker(rank: int, world_size: int, store_path: str) -> None:
             dist.destroy_process_group()
 
 
+@pytest.mark.runtime_budget(
+    20, hard_timeout=60, reason="Two spawned Gloo workers re-import torch; measured 7.13s in GPU CI"
+)
 def test_all_gather_sequence_round_trips_and_reduces_gradients(tmp_path: Path):
     mp.spawn(_all_gather_worker, args=(WORLD_SIZE, str(tmp_path / "all_gather_store")), nprocs=WORLD_SIZE, join=True)
 
 
+@pytest.mark.runtime_budget(
+    20, hard_timeout=60, reason="Two spawned Gloo workers re-import torch; measured 6.68s in GPU CI"
+)
 def test_shard_batch_matches_the_collective_layout_on_a_real_mesh(tmp_path: Path):
     mp.spawn(_sharder_worker, args=(WORLD_SIZE, str(tmp_path / "sharder_store")), nprocs=WORLD_SIZE, join=True)
