@@ -152,10 +152,20 @@ jobs:
             test -z "$(find "pr-source/$ROOT" -type l -print -quit)"
             mkdir -p "$RUNNER_TEMP/fern-preview/$(dirname "$ROOT")"
             cp -R "trusted-source/$ROOT" "$RUNNER_TEMP/fern-preview/$ROOT"
+            # Keep newer main pages as fallbacks, but honor explicit PR deletions.
+            BASE=$(git -C pr-source merge-base HEAD refs/remotes/origin/main)
+            git -C pr-source diff --no-renames --diff-filter=D --name-only -z \
+              "$BASE" HEAD -- "$ROOT/" > "$RUNNER_TEMP/fern-deleted-paths"
+            while IFS= read -r -d '' path; do
+              case "$path" in
+                */.*|*/components/*) continue ;;
+              esac
+              case "$path" in
+                *.md|*.mdx|*.png|*.jpg|*.jpeg|*.gif|*.svg|*.webp|*.ico|*.pdf)
+                  rm -f -- "$RUNNER_TEMP/fern-preview/$path" ;;
+              esac
+            done < "$RUNNER_TEMP/fern-deleted-paths"
             # Navigation, components and tooling stay on the trusted branch.
-            # Keep trusted pages as fallbacks for navigation added after the PR
-            # branched. Overlay PR content without removing those newer pages.
-            # Page removals take effect with their navigation changes on main.
             (cd pr-source && find "$ROOT" -regextype posix-extended -type f \
               -regex "$CONTENT" ! -path '*/.*' ! -path '*/components/*' \
               -exec cp --parents -- '{}' "$RUNNER_TEMP/fern-preview/" \;)
@@ -223,3 +233,31 @@ jobs:
           else
             gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" -f body="$BODY"
           fi
+
+  clear-preview:
+    needs: changed-files
+    if: >-
+      github.repository == 'NVIDIA-NeMo/Automodel' &&
+      needs.changed-files.outputs.docs == 'false'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Remove stale preview comments after docs changes are reverted
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF" =~ ^refs/heads/pull-request/([1-9][0-9]*)$ ]]
+          PR_NUMBER=${BASH_REMATCH[1]}
+          gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" | jq -e \
+            --arg repo "$GITHUB_REPOSITORY" --arg sha "$GITHUB_SHA" --argjson number "$PR_NUMBER" \
+            '.number == $number and .state == "open" and .head.sha == $sha and
+             .base.repo.full_name == $repo'
+          gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" \
+            --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | contains("<!-- preview-docs -->"))) | .id' \
+            > "$RUNNER_TEMP/fern-preview-comments"
+          while IFS= read -r comment; do
+            [[ "$comment" =~ ^[1-9][0-9]*$ ]]
+            gh api "repos/$GITHUB_REPOSITORY/issues/comments/$comment" -X DELETE
+          done < "$RUNNER_TEMP/fern-preview-comments"
