@@ -537,6 +537,12 @@ class TrainBiEncoderRecipe(BaseRecipe):
                 rank = torch.distributed.get_rank() if dist_initialized else 0
                 world_size = torch.distributed.get_world_size() if dist_initialized else 1
                 preserve_gather_grad = not getattr(attr_model, "detach_distributed_inbatch_negatives", True)
+                passage_doc_ids = batch.get("passage_doc_ids")
+                if world_size > 1:
+                    ranks_with_ids = torch.tensor(int(passage_doc_ids is not None), device=q_reps.device)
+                    torch.distributed.all_reduce(ranks_with_ids)
+                    if 0 < ranks_with_ids.item() < world_size:
+                        raise ValueError("Every rank must use the same present or absent passage_doc_ids policy")
 
                 if use_multi_vector_scoring:
                     all_p = dist_gather_tensor_with_dim1_padding(p_reps, preserve_grad=preserve_gather_grad)
@@ -562,7 +568,6 @@ class TrainBiEncoderRecipe(BaseRecipe):
                     labels = (torch.arange(local_bs, device=q_reps.device) + rank * local_bs) * n_passages
                 if attr_model.l2_normalize:
                     scores = scores / self.temperature
-                passage_doc_ids = batch.get("passage_doc_ids")
                 if passage_doc_ids is not None:
                     all_doc_ids = dist_gather_tensor(passage_doc_ids.contiguous())
                     mask_gathered_passages_same_doc_as_positive(

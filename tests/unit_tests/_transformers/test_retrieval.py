@@ -307,6 +307,28 @@ def test_retrieval_public_apis_expose_is_causal():
         assert "is_causal" in inspect.signature(callable_).parameters
 
 
+def test_cross_encoder_new_attention_policy_preserves_existing_positional_slots(monkeypatch):
+    from nemo_automodel._transformers import auto_model, retrieval
+
+    calls = []
+
+    def capture_load(cls, *args, **kwargs):
+        calls.append((cls, args, kwargs))
+        return "loaded"
+
+    monkeypatch.setattr(auto_model._NeMoAutoModelForRetrievalBase, "from_pretrained", classmethod(capture_load))
+    loaded = auto_model.NeMoAutoModelCrossEncoder.from_pretrained("checkpoint", "sdpa", False, is_causal=False)
+    assert loaded == "loaded"
+    assert calls == [
+        (auto_model.NeMoAutoModelCrossEncoder, ("checkpoint", "sdpa", False), {"is_causal": False})
+    ]
+
+    signature = inspect.signature(retrieval.CrossEncoderModel.build)
+    bound = signature.bind("checkpoint", True, is_causal=False)
+    assert bound.arguments["trust_remote_code"] is True
+    assert signature.parameters["is_causal"].kind is inspect.Parameter.KEYWORD_ONLY
+
+
 def test_modified_retrieval_public_apis_are_fully_annotated():
     from nemo_automodel._transformers import auto_model, retrieval
 
@@ -1658,6 +1680,26 @@ def test_extract_submodel_llama_score_selects_compatible_cross_encoder(
     assert outputs.logits.shape == (1, 1)
 
 
+def test_extract_submodel_llama_score_uses_constructed_backbone_default(tmp_path):
+    """Omitted is_causal keeps the extracted Llama reranker's bidirectional attention."""
+    from nemo_automodel._transformers import retrieval
+
+    model_dir, _ = _save_tiny_vlm(tmp_path, "llama")
+    encoder = retrieval.CrossEncoderModel.build(
+        str(model_dir), extract_submodel="language_model", num_labels=1
+    ).eval()
+    assert type(encoder.model) is LlamaBidirectionalForSequenceClassification
+    assert encoder.is_causal is False
+    assert all(layer.self_attn.is_causal is False for layer in encoder.model.model.layers)
+
+    tokens = torch.tensor([[3, 4, 5, 6]])
+    later_token_changed = torch.tensor([[3, 4, 5, 7]])
+    with torch.no_grad():
+        first_state = encoder.model.model(input_ids=tokens).last_hidden_state[:, 0]
+        changed_first_state = encoder.model.model(input_ids=later_token_changed).last_hidden_state[:, 0]
+    assert (first_state - changed_first_state).abs().max().item() > 1e-7
+
+
 def test_extract_submodel_ministral_score_from_local_vlm_converts_to_hf_cross_encoder(tmp_path):
     """Reranking still works when no registered score backbone exists for the text model."""
     from nemo_automodel._transformers import retrieval
@@ -1732,4 +1774,5 @@ def test_cross_encoder_exports_raw_text_scores(tmp_path, consolidated):
     assert isinstance(reloaded.activation_fn, nn.Identity)
     assert reloaded[0].max_seq_length == 32
     actual = reloaded.predict(pairs, batch_size=2, convert_to_tensor=True, show_progress_bar=False)
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    # The reloaded inference stack may select a different CPU reduction order.
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-7)

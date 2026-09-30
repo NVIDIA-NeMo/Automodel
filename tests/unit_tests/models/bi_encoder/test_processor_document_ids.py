@@ -14,7 +14,9 @@
 
 """Real CPU processor and distributed masking regression; no model downloads."""
 
+import json
 from datetime import timedelta
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -28,12 +30,15 @@ from tokenizers.pre_tokenizers import Whitespace
 from transformers import PixtralImageProcessor
 from transformers.tokenization_utils_tokenizers import TokenizersBackend
 
+from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.datasets.llm.retrieval_collator import ProcessorMethodCollator
+from nemo_automodel.components.datasets.llm.retrieval_dataset import make_retrieval_dataset
 from nemo_automodel.components.models.common.inbatch_neg_utils import (
     dist_gather_tensor,
     mask_gathered_passages_same_doc_as_positive,
 )
 from nemo_automodel.components.models.ministral_bidirectional.processor import Mistral3BiEncoderProcessor
+from nemo_automodel.recipes.retrieval.train_bi_encoder import TrainBiEncoderRecipe
 from nemo_automodel.shared.retrieval_ids import document_id_to_int64
 
 
@@ -97,6 +102,18 @@ def test_records_without_ids_remain_supported():
     assert result["d_input_ids"].shape[0] == 4
 
 
+def test_inline_jsonl_loader_omits_absent_ids_before_processor_collation(tmp_path):
+    source = tmp_path / "inline.jsonl"
+    source.write_text(json.dumps({"query": "user need", "pos_doc": "positive", "neg_doc": ["negative"]}) + "\n")
+    dataset = make_retrieval_dataset(data_dir_list=str(source), data_type="train", n_passages=2)
+    feature = dataset[0]
+    assert feature["doc_id"] == ["", ""]
+
+    batch = ProcessorMethodCollator(processor(), "process_queries_documents_biencoder")([feature])
+    assert "passage_doc_ids" not in batch
+    assert batch["d_input_ids"].shape[0] == 2
+
+
 def test_portable_processor_identity_matches_shared_text_collator_encoding():
     identifiers = ["ascii", "文档", "médicament", "a/b/page:1"] + [f"source-{index}" for index in range(20)]
     features = [
@@ -117,14 +134,29 @@ def test_portable_processor_identity_matches_shared_text_collator_encoding():
 def test_incomplete_or_misaligned_ids_fail_clearly(bad_ids):
     features = examples(False)
     features[1]["doc_id"] = bad_ids
-    with pytest.raises(ValueError, match="one nonempty string per candidate"):
+    with pytest.raises(ValueError, match="one aligned string per candidate"):
         processor().process_queries_documents_biencoder(features)
 
 
 def test_mixed_id_policy_is_not_silently_disabled():
     features = examples(False)
     del features[1]["doc_id"]
-    with pytest.raises(ValueError, match="every example"):
+    with pytest.raises(ValueError, match="same present or absent ID policy"):
+        processor().process_queries_documents_biencoder(features)
+
+
+def test_missing_and_all_empty_id_groups_both_mean_absent():
+    features = examples(False)
+    features[0]["doc_id"] = ["", ""]
+    del features[1]["doc_id"]
+    result = processor().process_queries_documents_biencoder(features)
+    assert "passage_doc_ids" not in result
+
+
+def test_mixed_present_and_all_empty_id_groups_fail_clearly():
+    features = examples(False)
+    features[1]["doc_id"] = ["", ""]
+    with pytest.raises(ValueError, match="same present or absent ID policy"):
         processor().process_queries_documents_biencoder(features)
 
 
@@ -159,5 +191,48 @@ def distributed_mask_worker(rank, world_size, rendezvous):
 
 
 @pytest.mark.parametrize("world_size", [1, 2])
+@pytest.mark.runtime_budget(25, reason="spawns real Gloo ranks and reimports PyTorch in each process")
 def test_native_ids_enable_duplicate_masking_across_real_processes(tmp_path, world_size):
     mp.spawn(distributed_mask_worker, args=(world_size, (tmp_path / "gloo").as_uri()), nprocs=world_size, join=True)
+
+
+class _PrecomputedEncoder(torch.nn.Module):
+    pooling = "avg"
+    l2_normalize = False
+    do_distributed_inbatch_negative = True
+
+    def forward(self, inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Return precomputed embeddings.
+
+        Args:
+            inputs: Mapping with ``embeddings`` of shape [batch, hidden].
+
+        Returns:
+            Tensor of shape [batch, hidden].
+        """
+        return inputs["embeddings"]
+
+
+def mixed_rank_id_policy_worker(rank, rendezvous):
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=15))
+    try:
+        recipe = TrainBiEncoderRecipe(ConfigNode({}))
+        recipe.model_parts = [_PrecomputedEncoder()]
+        recipe.dist_env = SimpleNamespace(device=torch.device("cpu"))
+        recipe.distributed_config = SimpleNamespace()
+        recipe.train_n_passages = 2
+        batch = {
+            "q_embeddings": torch.tensor([[1.0, 0.0]]),
+            "d_embeddings": torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
+        }
+        if rank == 0:
+            batch["passage_doc_ids"] = torch.tensor([1, 2])
+        with pytest.raises(ValueError, match="Every rank must use the same present or absent passage_doc_ids policy"):
+            recipe._forward_backward_step(0, batch, loss_buffer=[], num_batches=1, is_train=True)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.runtime_budget(25, reason="spawns real Gloo ranks to verify mixed ID policy fails symmetrically")
+def test_mixed_rank_id_policy_fails_without_hanging(tmp_path):
+    mp.spawn(mixed_rank_id_policy_worker, args=((tmp_path / "gloo_mixed").as_uri(),), nprocs=2, join=True)

@@ -81,6 +81,8 @@ def _mining_worker(rank: int, rendezvous: str, scratch: str) -> None:
         dist.destroy_process_group()
 
 
-@pytest.mark.runtime_budget(15, reason="spawns two rank processes and initializes Gloo collectives")
+@pytest.mark.runtime_budget(
+    30, reason="spawns two rank processes and initializes Gloo collectives on loaded CI workers"
+)
 def test_real_two_rank_mining_handles_empty_queries_and_tail_chunk(tmp_path):
     mp.spawn(_mining_worker, args=((tmp_path / "gloo").as_uri(), str(tmp_path / "scratch")), nprocs=2, join=True)

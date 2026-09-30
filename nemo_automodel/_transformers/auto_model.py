@@ -1335,6 +1335,8 @@ class NeMoAutoModelCrossEncoder(_NeMoAutoModelForRetrievalBase):
     def from_pretrained(
         cls,
         pretrained_model_name_or_path: str,
+        attn_implementation: str = DEFAULT_ATTN_IMPLEMENTATION,
+        *args: Any,
         is_causal: bool | None = None,
         **kwargs: Any,
     ) -> PreTrainedModel:
@@ -1342,6 +1344,8 @@ class NeMoAutoModelCrossEncoder(_NeMoAutoModelForRetrievalBase):
 
         Args:
             pretrained_model_name_or_path: Path to pretrained model or model identifier.
+            attn_implementation: Attention implementation forwarded to the shared loader.
+            *args: Existing positional infrastructure options forwarded to the shared loader.
             is_causal: Whether the text backbone uses causal self-attention. When omitted, restores a saved policy or
                 preserves the scoring backbone's native attention mode.
             **kwargs: Forwarded to the shared retrieval loader.
@@ -1351,6 +1355,8 @@ class NeMoAutoModelCrossEncoder(_NeMoAutoModelForRetrievalBase):
         """
         return super().from_pretrained(
             pretrained_model_name_or_path,
+            attn_implementation,
+            *args,
             is_causal=is_causal,
             **kwargs,
         )

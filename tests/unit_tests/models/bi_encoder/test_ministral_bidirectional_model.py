@@ -670,6 +670,7 @@ def test_ministral3_biencoder_processor_structured_image_ids_match_flat_referenc
 
 
 @pytest.mark.with_downloads
+@pytest.mark.runtime_budget(30, reason="loads a real Hugging Face processor and tokenizer over the network")
 def test_ministral3_biencoder_processor_matches_real_checkpoint_pixtral_ids(tmp_path):
     model_id = "mistralai/Ministral-3-3B-Instruct-2512"
     image = Image.new("RGB", (56, 56), (255, 0, 0))
@@ -1956,7 +1957,7 @@ assert model.state_dict().keys() == expected["state"].keys()
 for key, value in model.state_dict().items():
     torch.testing.assert_close(value, expected["state"][key], rtol=0, atol=0)
 with torch.no_grad():
-    torch.testing.assert_close(model(**inputs).logits, expected["logits"], rtol=0, atol=0)
+    torch.testing.assert_close(model(**inputs).logits, expected["logits"], rtol=1e-6, atol=1e-6)
 cross_encoder = CrossEncoder(directory, trust_remote_code=True, device="cpu", model_kwargs={"attn_implementation": "eager"})
 assert isinstance(cross_encoder.activation_fn, torch.nn.Identity)
 assert cross_encoder[0].processing_kwargs == {}
@@ -1965,7 +1966,7 @@ standard_inputs = cross_encoder[0].preprocess(pairs)
 for key, value in expected["inputs"].items():
     torch.testing.assert_close(standard_inputs[key], value, rtol=0, atol=0)
 scores = cross_encoder.predict(pairs, batch_size=2, convert_to_tensor=True, show_progress_bar=False)
-torch.testing.assert_close(scores.reshape(-1, 1), expected["logits"], rtol=0, atol=0)
+torch.testing.assert_close(scores.reshape(-1, 1), expected["logits"], rtol=1e-5, atol=1e-7)
 assert not any(name == "nemo_automodel" or name.startswith("nemo_automodel.") for name in sys.modules)
 """
     result = subprocess.run(

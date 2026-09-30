@@ -501,7 +501,8 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
         Args:
             features: Query examples with aligned ``doc_text`` and ``doc_image``
                 candidate lists. Optional ``doc_id`` lists must contain one
-                nonempty string per candidate in every example when supplied.
+                string per candidate. An all-empty list means IDs are absent;
+                populated IDs must be present for every candidate in the batch.
                 Distributed callers must use the same ID policy on every rank.
             return_tensors: Output format, ``"pt"`` or ``"np"``.
             **kwargs: Extra keyword arguments forwarded to the query and document processors.
@@ -522,26 +523,38 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
             the q_/d_ model-input namespaces, for duplicate-positive masking.
 
         Raises:
-            ValueError: Supplied document IDs are missing, empty, or misaligned.
+            ValueError: Supplied document IDs are partially populated or misaligned.
         """
         passage_doc_ids = None
         if any("doc_id" in feature for feature in features):
-            passage_doc_ids = []
+            id_groups = []
             for feature in features:
+                if "doc_id" not in feature:
+                    id_groups.append(None)
+                    continue
                 ids = feature.get("doc_id")
                 if (
                     not isinstance(ids, (list, tuple))
                     or len(ids) != len(feature["doc_text"])
                     or len(ids) != len(feature["doc_image"])
-                    or not all(isinstance(doc_id, str) and doc_id for doc_id in ids)
+                    or not all(isinstance(doc_id, str) for doc_id in ids)
+                    or (any(ids) and not all(ids))
                 ):
-                    raise ValueError("doc_id must contain one nonempty string per candidate in every example")
+                    raise ValueError(
+                        "doc_id must contain one aligned string per candidate, either all empty or all nonempty"
+                    )
+                id_groups.append(ids if all(ids) else None)
+            if any(ids is not None for ids in id_groups):
+                passage_doc_ids = []
                 # Keep this stdlib encoding inline so exported processors need
                 # no AutoModel installation. Tests lock parity with the shared
                 # text-collator encoding in shared/retrieval_ids.py.
-                for doc_id in ids:
-                    digest = hashlib.md5(doc_id.encode("utf-8")).digest()[:8]
-                    passage_doc_ids.append(int.from_bytes(digest, "little", signed=False) & ((1 << 63) - 1))
+                for ids in id_groups:
+                    if ids is None:
+                        raise ValueError("doc_id must use the same present or absent ID policy in every example")
+                    for doc_id in ids:
+                        digest = hashlib.md5(doc_id.encode("utf-8")).digest()[:8]
+                        passage_doc_ids.append(int.from_bytes(digest, "little", signed=False) & ((1 << 63) - 1))
         queries = []
         pos_neg_text_batch = []
         pos_neg_image_batch = []

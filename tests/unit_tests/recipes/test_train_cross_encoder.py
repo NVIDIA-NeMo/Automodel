@@ -31,21 +31,59 @@ from nemo_automodel.recipes.retrieval.train_cross_encoder import (
 # ---------------------------------------------------------------------------
 
 
-def test_recipe_rejects_two_active_non_unit_temperatures() -> None:
-    """Recipe and model temperature must not both scale logits."""
-    recipe = TrainCrossEncoderRecipe(ConfigNode({"temperature": 0.3}))
+@pytest.mark.parametrize("temperature", [1.0, 0.02])
+def test_cross_encoder_recipe_temperature_in_train_and_validation(temperature: float) -> None:
+    """The top-level temperature scales loss and training gradients."""
+
+    class FixedScores(torch.nn.Module):
+        effective_score_temperature = 1.0
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.scores = torch.nn.Parameter(torch.tensor([[0.5], [0.4]], dtype=torch.bfloat16))
+
+        def forward(self, **kwargs):
+            return SimpleNamespace(logits=self.scores)
+
+    recipe = TrainCrossEncoderRecipe(ConfigNode({"temperature": temperature}))
+    model = FixedScores()
+    recipe.model_parts = [model]
+    recipe.dist_env = SimpleNamespace(device=torch.device("cpu"))
+    recipe.distributed_config = SimpleNamespace()
+    recipe.train_n_passages = recipe.val_n_passages = 2
+    recipe.step_scheduler = SimpleNamespace(step=0, epoch=0)
+    recipe._acc_buffer = []
+    recipe._validate_model(recipe.model_parts[0])
+    batch = {"input_ids": torch.ones(2, 1, dtype=torch.long), "labels": torch.tensor([0])}
+    expected_logits = torch.tensor([[0.5, 0.4]], dtype=torch.bfloat16).float()
+    expected_logits = expected_logits / temperature
+    expected = torch.nn.functional.cross_entropy(expected_logits, batch["labels"])
+
+    losses = []
+    recipe._forward_backward_step(0, batch.copy(), loss_buffer=losses, num_batches=1, is_train=True)
+    torch.testing.assert_close(losses[0], expected)
+    expected_grad = torch.softmax(expected_logits, dim=-1)
+    expected_grad[0, 0] -= 1
+    expected_grad = expected_grad / temperature
+    torch.testing.assert_close(model.scores.grad, expected_grad.reshape(2, 1).to(torch.bfloat16))
+
+    metrics = recipe._run_validation_epoch([batch.copy()])
+    assert metrics.metrics["val_loss"] == pytest.approx(expected.item())
+
+
+def test_cross_encoder_rejects_two_active_temperatures() -> None:
+    """A model temperature and recipe temperature must not both scale scores."""
+    recipe = TrainCrossEncoderRecipe(ConfigNode({"temperature": 0.02}))
     model = SimpleNamespace(effective_score_temperature=0.02)
 
-    with pytest.raises(ValueError, match="Set either top-level temperature or model.temperature to 1.0"):
+    with pytest.raises(ValueError, match="configured twice"):
         recipe._validate_model(model)
 
 
-def test_recipe_allows_model_temperature_when_recipe_temperature_is_unit() -> None:
-    """A model-owned temperature is valid when recipe scaling is disabled."""
+def test_cross_encoder_allows_model_temperature_when_recipe_temperature_is_unit() -> None:
+    """The model may own scoring temperature when the recipe divisor is one."""
     recipe = TrainCrossEncoderRecipe(ConfigNode({"temperature": 1.0}))
-    model = SimpleNamespace(effective_score_temperature=0.02)
-
-    recipe._validate_model(model)
+    recipe._validate_model(SimpleNamespace(effective_score_temperature=0.02))
 
 
 # ---------------------------------------------------------------------------

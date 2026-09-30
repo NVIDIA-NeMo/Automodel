@@ -463,18 +463,18 @@ def build_encoder_backbone(
             **model_load_kwargs,
         )
         extracted_model = _extract_submodel(model, extract_submodel)
-        effective_is_causal = _resolve_text_backbone_is_causal(
-            extracted_model,
-            extracted_model.config,
-            is_causal,
-            default=False if task == "embedding" else None,
-        )
         backbone = _build_backbone_from_extracted_submodel(
             extracted_model,
             task=task,
             pooling=pooling,
             num_labels=num_labels,
             temperature=temperature,
+        )
+        effective_is_causal = _resolve_text_backbone_is_causal(
+            backbone,
+            backbone.config,
+            is_causal,
+            default=False if task == "embedding" else None,
         )
         _set_text_backbone_is_causal(backbone, effective_is_causal)
         return backbone
@@ -952,8 +952,9 @@ class CrossEncoderModel(nn.Module):
     def build(
         cls,
         model_name_or_path: str,
-        is_causal: bool | None = None,
         trust_remote_code: bool = False,
+        *,
+        is_causal: bool | None = None,
         **hf_kwargs: Any,
     ) -> "CrossEncoderModel":
         """Build a cross-encoder while preserving saved or native attention by default."""

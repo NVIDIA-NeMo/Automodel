@@ -305,9 +305,13 @@ distributed:
 ```
 
 For a cross-encoder, change `recipe`, `model._target_`, `dataset.model_type`, and `dataloader.collate_fn`
-to the cross-encoder values in the following example. Also set `model.num_labels: 1`, set the loss temperature under
-`model.temperature`, replace `q_max_len` and `p_max_len` with `rerank_max_length` in the collator, and use a separate
-`checkpoint.checkpoint_dir` such as `./output/llama3_2_1b_cross_encoder/checkpoints`.
+to the cross-encoder values in the following example. Also set `model.num_labels: 1`, choose model-side score scaling
+with `model.temperature`, replace `q_max_len` and `p_max_len` with `rerank_max_length` in the collator, and use a separate
+`checkpoint.checkpoint_dir` such as `./output/llama3_2_1b_cross_encoder/checkpoints`. The top-level `temperature`
+now scales the cross-encoder's listwise training and validation loss, as it does for the bi-encoder. When converting
+an existing cross-encoder config, set it to `1.0` to preserve the previous loss behavior. For a non-unit top-level
+temperature, keep `model.temperature: 1.0` so scores are not scaled twice. `model.temperature` also changes exported
+inference scores; the top-level temperature changes only the recipe loss.
 
 ## Configure a Bi-Encoder
 

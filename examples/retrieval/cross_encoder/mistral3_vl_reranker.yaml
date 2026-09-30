@@ -18,8 +18,8 @@
 
 recipe: TrainCrossEncoderRecipe
 seed: 42
-# The model applies the non-unit temperature in its score dtype (BF16 here).
-# The recipe casts the resulting scores to FP32 for cross entropy.
+# The model projects and scales scores in FP32, including under BF16 autocast.
+# Keep the recipe temperature at 1.0 because the model already scales its scores.
 temperature: 1.0
 
 step_scheduler:
