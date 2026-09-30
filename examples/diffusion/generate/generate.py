@@ -119,25 +119,26 @@ def load_pipeline(cfg, dist_info):
     if torch_dtype == torch.bfloat16:
         patch_t5_layer_norm()
 
-    # Build parallel_scheme from distributed config (None for single-GPU).
-    parallel_scheme = None
-    if dist_info is not None and hasattr(cfg.distributed, "parallel_scheme"):
-        parallel_scheme = _build_parallel_scheme(cfg.distributed.parallel_scheme, dist_info)
+    # Resolve one MeshContext from distributed config (None for single-GPU).
+    mesh_context = None
+    if dist_info is not None and hasattr(cfg.distributed, "parallelism"):
+        mesh_context = _build_mesh_context(cfg.distributed.parallelism, dist_info)
 
     # CPU offload requires modules to stay on CPU so enable_model_cpu_offload()
     # can install per-module device hooks (called later in apply_optimizations).
     vae_cfg = getattr(cfg, "vae", None)
     cpu_offload = vae_cfg is not None and getattr(vae_cfg, "enable_cpu_offload", False)
 
-    pipe, _ = NeMoAutoDiffusionPipeline.from_pretrained(
+    pipe = NeMoAutoDiffusionPipeline.from_pretrained(
         model_id,
         torch_dtype=torch_dtype,
-        parallel_scheme=parallel_scheme,
+        mesh_context=mesh_context,
+        components_to_load=["transformer"],
         move_to_device=not cpu_offload,
     )
 
     _fix_text_encoder_weight_tying(pipe)
-    logger.info("Loaded pipeline: %s (distributed=%s)", type(pipe).__name__, parallel_scheme is not None)
+    logger.info("Loaded pipeline: %s (distributed=%s)", type(pipe).__name__, mesh_context is not None)
     return pipe
 
 
@@ -163,35 +164,29 @@ def _fix_text_encoder_weight_tying(pipe):
         logger.info("Fixed UMT5 text encoder weight tying (shared.weight -> embed_tokens.weight)")
 
 
-def _build_parallel_scheme(scheme_cfg, dist_info):
-    """Build parallel_scheme dict from config for NeMoAutoDiffusionPipeline.
+def _build_mesh_context(parallelism_cfg, dist_info):
+    """Build the MeshContext consumed by NeMoAutoDiffusionPipeline.
 
     Args:
-        scheme_cfg: Config node mapping component names to their parallelism settings.
+        parallelism_cfg: Config node containing transformer parallelism settings.
         dist_info: DistInfo with distributed environment details.
 
     Returns:
-        Dict mapping component names to manager kwargs dicts.
+        Resolved MeshContext for the transformer.
     """
-    parallel_scheme = {}
-    for comp_name in dir(scheme_cfg):
-        if comp_name.startswith("_"):
-            continue
-        comp_cfg = getattr(scheme_cfg, comp_name)
-        if comp_cfg is None:
-            continue
-        manager_args = {
-            "backend": "nccl",
-            "world_size": dist_info.world_size,
-            "use_hf_tp_plan": False,
-        }
-        # Copy parallelism sizes from config
-        for key in ("tp_size", "cp_size", "pp_size", "dp_size", "dp_replicate_size"):
-            val = getattr(comp_cfg, key, None)
-            if val is not None:
-                manager_args[key] = val
-        parallel_scheme[comp_name] = manager_args
-    return parallel_scheme
+    from nemo_automodel.components.distributed import FSDP2Config, MeshContext, ParallelismSizes
+
+    return MeshContext.build(
+        FSDP2Config(),
+        parallelism_sizes=ParallelismSizes(
+            tp_size=getattr(parallelism_cfg, "tp_size", 1),
+            cp_size=getattr(parallelism_cfg, "cp_size", 1),
+            pp_size=getattr(parallelism_cfg, "pp_size", 1),
+            dp_size=getattr(parallelism_cfg, "dp_size", None),
+            dp_replicate_size=getattr(parallelism_cfg, "dp_replicate_size", None),
+        ),
+        world_size=dist_info.world_size,
+    )
 
 
 def load_checkpoint_into_pipeline(pipe, cfg):

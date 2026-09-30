@@ -59,12 +59,12 @@ def _two_rank_worker(
         from torch.distributed.device_mesh import init_device_mesh
         from torch.distributed.fsdp import MixedPrecisionPolicy
 
+        from nemo_automodel._diffusers.parallelization import QwenImageEditModelParallelizer
         from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
         from nemo_automodel.components.checkpoint.config import CheckpointingConfig
         from nemo_automodel.components.distributed.utils import get_sync_ctx
         from nemo_automodel.components.flow_matching.adapters.base import FlowMatchingContext
         from nemo_automodel.components.models.qwen_image_edit.adapter import QwenImageEditAdapter
-        from nemo_automodel.components.distributed.parallelizer import QwenImageEditParallelizationStrategy
         from nemo_automodel.components.training.utils import (
             prepare_after_first_microbatch,
             prepare_for_final_backward,
@@ -178,7 +178,7 @@ def _two_rank_worker(
             reduce_dtype=torch.float32,
             output_dtype=torch.float32,
         )
-        sharded = QwenImageEditParallelizationStrategy().parallelize(
+        sharded = QwenImageEditModelParallelizer()._apply(
             model=sharded,
             device_mesh=mesh,
             mp_policy=policy,
@@ -257,7 +257,7 @@ def _two_rank_worker(
         checkpointer.save_optimizer(optimizer, sharded, str(checkpoint_dir))
 
         resumed = copy.deepcopy(initial_model)
-        resumed = QwenImageEditParallelizationStrategy().parallelize(
+        resumed = QwenImageEditModelParallelizer()._apply(
             model=resumed,
             device_mesh=mesh,
             mp_policy=policy,

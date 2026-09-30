@@ -15,6 +15,7 @@
 import math
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -26,7 +27,7 @@ from nemo_automodel.components.optim.optimizer import LRSchedulerConfig, Optimiz
 from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.diffusion.train import (
     TrainDiffusionRecipe,
-    _build_diffusion_parallel_manager_args,
+    _build_diffusion_mesh_context,
     _reject_removed_diffusion_keys,
     _resolve_model_dtypes,
     _validate_precision_configuration,
@@ -420,57 +421,63 @@ def test_recipe_config_rejects_unknown_diffusion_dataloader_field():
         RecipeConfig.resolve_diffusion_dataloader(raw)
 
 
-def test_manager_args_default_to_pure_ulysses_cp_split():
-    args = _build_diffusion_parallel_manager_args(
-        fsdp_cfg={"cp_size": 2},
-        ddp_cfg=None,
-        world_size=8,
-        dtype=torch.bfloat16,
-        lora_enabled=False,
-    )
+def test_diffusion_mesh_context_defaults_to_pure_ulysses_cp_split():
+    with patch("nemo_automodel.recipes.diffusion.train.MeshContext.build") as build_mesh:
+        _build_diffusion_mesh_context(
+            fsdp_cfg={"cp_size": 2},
+            ddp_cfg=None,
+            world_size=8,
+            dtype=torch.bfloat16,
+            lora_enabled=False,
+        )
 
-    assert args["cp_size"] == 2
-    assert args["cp_ring_degree"] == 1
-    assert args["cp_ulysses_degree"] == 2
+    kwargs = build_mesh.call_args.kwargs
+    assert kwargs["parallelism_sizes"].cp_size == 2
+    assert kwargs["cp_ring_degree"] == 1
+    assert kwargs["cp_ulysses_degree"] == 2
 
 
-def test_manager_args_pass_explicit_ring_ulysses_split_through():
-    args = _build_diffusion_parallel_manager_args(
-        fsdp_cfg={"cp_size": 4, "cp_ring_degree": 2, "cp_ulysses_degree": 2},
-        ddp_cfg=None,
-        world_size=8,
-        dtype=torch.bfloat16,
-        lora_enabled=False,
-    )
+def test_diffusion_mesh_context_passes_explicit_ring_ulysses_split_through():
+    with patch("nemo_automodel.recipes.diffusion.train.MeshContext.build") as build_mesh:
+        _build_diffusion_mesh_context(
+            fsdp_cfg={"cp_size": 4, "cp_ring_degree": 2, "cp_ulysses_degree": 2},
+            ddp_cfg=None,
+            world_size=8,
+            dtype=torch.bfloat16,
+            lora_enabled=False,
+        )
 
     # The builder only threads the split through; ring > 1 is rejected later by
     # _enable_context_parallel, where the diffusers version constraint lives.
-    assert args["cp_ring_degree"] == 2
-    assert args["cp_ulysses_degree"] == 2
+    assert build_mesh.call_args.kwargs["cp_ring_degree"] == 2
+    assert build_mesh.call_args.kwargs["cp_ulysses_degree"] == 2
 
 
-def test_manager_args_derive_ulysses_from_ring_when_unset():
-    args = _build_diffusion_parallel_manager_args(
-        fsdp_cfg={"cp_size": 4, "cp_ring_degree": 2},
-        ddp_cfg=None,
-        world_size=8,
-        dtype=torch.bfloat16,
-        lora_enabled=False,
-    )
+def test_diffusion_mesh_context_derives_ulysses_from_ring_when_unset():
+    with patch("nemo_automodel.recipes.diffusion.train.MeshContext.build") as build_mesh:
+        _build_diffusion_mesh_context(
+            fsdp_cfg={"cp_size": 4, "cp_ring_degree": 2},
+            ddp_cfg=None,
+            world_size=8,
+            dtype=torch.bfloat16,
+            lora_enabled=False,
+        )
 
-    assert args["cp_ring_degree"] == 2
-    assert args["cp_ulysses_degree"] == 2
+    assert build_mesh.call_args.kwargs["cp_ring_degree"] == 2
+    assert build_mesh.call_args.kwargs["cp_ulysses_degree"] == 2
 
 
-def test_manager_args_cp_knobs_default_when_cp_disabled():
-    args = _build_diffusion_parallel_manager_args(
-        fsdp_cfg={},
-        ddp_cfg=None,
-        world_size=8,
-        dtype=torch.bfloat16,
-        lora_enabled=False,
-    )
+def test_diffusion_mesh_context_cp_knobs_default_when_cp_disabled():
+    with patch("nemo_automodel.recipes.diffusion.train.MeshContext.build") as build_mesh:
+        _build_diffusion_mesh_context(
+            fsdp_cfg={},
+            ddp_cfg=None,
+            world_size=8,
+            dtype=torch.bfloat16,
+            lora_enabled=False,
+        )
 
-    assert args["cp_size"] == 1
-    assert args["cp_ring_degree"] == 1
-    assert args["cp_ulysses_degree"] == 1
+    kwargs = build_mesh.call_args.kwargs
+    assert kwargs["parallelism_sizes"].cp_size == 1
+    assert kwargs["cp_ring_degree"] == 1
+    assert kwargs["cp_ulysses_degree"] == 1

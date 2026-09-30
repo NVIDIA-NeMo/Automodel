@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+import warnings
 from collections.abc import Callable
 
 import torch
@@ -35,9 +36,97 @@ from nemo_automodel.components.distributed.parallelizer import (
 logger = logging.getLogger(__name__)
 
 
+def _resolve_ddp_device() -> torch.device:
+    """Validate distributed state and return the device owned by this rank."""
+    if not dist.is_available():
+        raise RuntimeError("torch.distributed not available")
+    if not dist.is_initialized():
+        raise RuntimeError("expected torch.distributed to be initialized")
+
+    rank = dist.get_rank()
+    backend = str(dist.get_backend()).lower()
+    if "nccl" in backend and torch.cuda.is_available():
+        local_gpu = rank % torch.cuda.device_count()
+        torch.cuda.set_device(local_gpu)
+        return torch.device("cuda", index=local_gpu)
+    return torch.device("cpu")
+
+
+def parallelize_ddp(
+    model: torch.nn.Module,
+    config: DDPConfig,
+    *,
+    device: torch.device | None = None,
+    reapply_trainability: Callable[[torch.nn.Module], None] | None = None,
+) -> torch.nn.Module:
+    """Apply activation checkpointing and PyTorch DDP from a typed config."""
+    if device is None:
+        device = _resolve_ddp_device()
+
+    if dist.get_world_size() == 1:
+        logger.info("World size is 1, skipping parallelization.")
+        model = model.to(device)
+        if device.type == "cuda":
+            model = model.to(torch.bfloat16)
+        if config.activation_checkpointing:
+            if is_selective_activation_checkpointing(config.activation_checkpointing):
+                apply_selective_activation_checkpointing(
+                    model,
+                    activation_checkpointing_scope=config.activation_checkpointing_scope,
+                )
+            else:
+                layer_groups = _extract_model_layer_groups(model)
+                layers, ac_scopes = _filter_layer_groups_for_activation_checkpointing(
+                    layer_groups,
+                    config.activation_checkpointing_scope,
+                )
+                if _should_use_hf_native_gradient_checkpointing(model, layer_groups, ac_scopes):
+                    model.gradient_checkpointing_enable()
+                else:
+                    apply_submodule_checkpointing(layers, detect_kv_sharing_and_maybe_disable_cache(model))
+        if reapply_trainability is not None:
+            reapply_trainability(model)
+        return model
+
+    if config.activation_checkpointing:
+        has_kv_sharing = detect_kv_sharing_and_maybe_disable_cache(model)
+
+        if is_selective_activation_checkpointing(config.activation_checkpointing):
+            apply_selective_activation_checkpointing(
+                model,
+                activation_checkpointing_scope=config.activation_checkpointing_scope,
+            )
+        else:
+            layer_groups = _extract_model_layer_groups(model)
+            layers, _ = _filter_layer_groups_for_activation_checkpointing(
+                layer_groups,
+                config.activation_checkpointing_scope,
+            )
+            apply_submodule_checkpointing(layers, has_kv_sharing)
+
+    ddp_kwargs = {
+        "device_ids": [device] if device.type == "cuda" else None,
+        "broadcast_buffers": config.broadcast_buffers,
+        "find_unused_parameters": config.find_unused_parameters,
+        "static_graph": config.static_graph,
+        "gradient_as_bucket_view": config.gradient_as_bucket_view,
+    }
+    if config.bucket_cap_mb is not None:
+        ddp_kwargs["bucket_cap_mb"] = config.bucket_cap_mb
+
+    model = model.to(device)
+    if reapply_trainability is not None:
+        reapply_trainability(model)
+    return DDP(model, **ddp_kwargs)
+
+
 class DDPManager:
-    """
-    Manager for distributed training using PyTorch's DDP.
+    """Deprecated compatibility wrapper for PyTorch DDP.
+
+    .. deprecated:: 0.7
+        Pass :class:`DDPConfig` through the config-driven infrastructure and
+        provide model-specific behavior with :class:`ModelParallelizer`. This
+        compatibility class is scheduled for removal in 0.8.
 
     This manager wraps models with DistributedDataParallel for data-parallel
     distributed training.
@@ -45,28 +134,20 @@ class DDPManager:
     Args:
         config (DDPConfig): Configuration for DDP distributed training.
 
-    Example:
-        from nemo_automodel.components.distributed.config import DDPConfig
-
-        config = DDPConfig(activation_checkpointing=True)
-        manager = DDPManager(config)
-        model = manager.parallelize(model)
     """
 
     def __init__(self, config: DDPConfig):
+        warnings.warn(
+            "DDPManager is deprecated and will be removed in 0.8; pass DDPConfig through the "
+            "config-driven infrastructure and use ModelParallelizer for model-owned behavior.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self.config = config
-
-        # Extract config fields for easy access
-        self.activation_checkpointing = config.activation_checkpointing
-        self.activation_checkpointing_scope = config.activation_checkpointing_scope
-        self.broadcast_buffers = config.broadcast_buffers
-        self.find_unused_parameters = config.find_unused_parameters
-        self.static_graph = config.static_graph
-        self.bucket_cap_mb = config.bucket_cap_mb
-        self.gradient_as_bucket_view = config.gradient_as_bucket_view
-
-        # Setup distributed environment
         self._setup_distributed()
+
+    def __getattr__(self, name):
+        return getattr(self.config, name)
 
     def _setup_distributed(self):
         """
@@ -74,22 +155,9 @@ class DDPManager:
 
         Sets the rank, world_size, and device based on the process group backend.
         """
-        if not dist.is_available():
-            raise RuntimeError("torch.distributed not available")
-
-        if not dist.is_initialized():
-            raise RuntimeError("expected torch.distributed to be initialized")
-
+        self.device = _resolve_ddp_device()
         self.rank = dist.get_rank()
         self.world_size = dist.get_world_size()
-
-        backend = str(dist.get_backend()).lower()
-        if "nccl" in backend and torch.cuda.is_available():
-            local_gpu = self.rank % torch.cuda.device_count()
-            torch.cuda.set_device(local_gpu)
-            self.device = torch.device("cuda", index=local_gpu)
-        else:
-            self.device = torch.device("cpu")
 
     def parallelize(
         self,
@@ -110,58 +178,9 @@ class DDPManager:
         Returns:
             torch.nn.parallel.DistributedDataParallel: The DDP-wrapped model.
         """
-        if dist.get_world_size() == 1:
-            logger.info("World size is 1, skipping parallelization.")
-            model = model.to(self.device)
-            if self.device.type == "cuda":
-                model = model.to(torch.bfloat16)
-            if self.activation_checkpointing:
-                if is_selective_activation_checkpointing(self.activation_checkpointing):
-                    apply_selective_activation_checkpointing(
-                        model,
-                        activation_checkpointing_scope=self.activation_checkpointing_scope,
-                    )
-                else:
-                    layer_groups = _extract_model_layer_groups(model)
-                    layers, ac_scopes = _filter_layer_groups_for_activation_checkpointing(
-                        layer_groups,
-                        self.activation_checkpointing_scope,
-                    )
-                    if _should_use_hf_native_gradient_checkpointing(model, layer_groups, ac_scopes):
-                        model.gradient_checkpointing_enable()
-                    else:
-                        apply_submodule_checkpointing(layers, detect_kv_sharing_and_maybe_disable_cache(model))
-            if reapply_trainability is not None:
-                reapply_trainability(model)
-            return model
-
-        if self.activation_checkpointing:
-            has_kv_sharing = detect_kv_sharing_and_maybe_disable_cache(model)
-
-            if is_selective_activation_checkpointing(self.activation_checkpointing):
-                apply_selective_activation_checkpointing(
-                    model,
-                    activation_checkpointing_scope=self.activation_checkpointing_scope,
-                )
-            else:
-                layer_groups = _extract_model_layer_groups(model)
-                layers, _ = _filter_layer_groups_for_activation_checkpointing(
-                    layer_groups,
-                    self.activation_checkpointing_scope,
-                )
-                apply_submodule_checkpointing(layers, has_kv_sharing)
-
-        ddp_kwargs = {
-            "device_ids": [self.device] if self.device.type == "cuda" else None,
-            "broadcast_buffers": self.broadcast_buffers,
-            "find_unused_parameters": self.find_unused_parameters,
-            "static_graph": self.static_graph,
-            "gradient_as_bucket_view": self.gradient_as_bucket_view,
-        }
-        if self.bucket_cap_mb is not None:
-            ddp_kwargs["bucket_cap_mb"] = self.bucket_cap_mb
-
-        model = model.to(self.device)
-        if reapply_trainability is not None:
-            reapply_trainability(model)
-        return DDP(model, **ddp_kwargs)
+        return parallelize_ddp(
+            model,
+            self.config,
+            device=self.device,
+            reapply_trainability=reapply_trainability,
+        )
