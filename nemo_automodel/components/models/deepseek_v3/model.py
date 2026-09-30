@@ -237,9 +237,10 @@ class DeepseekV3Model(nn.Module):
         return h
 
     def update_moe_gate_bias(self) -> None:
+        """Update correction biases only for gates with adaptation enabled."""
         with torch.no_grad():
             for _, block in self.layers.named_children():
-                if isinstance(block.mlp, MoE):
+                if isinstance(block.mlp, MoE) and block.mlp.gate.bias_update_factor > 0:
                     block.mlp.gate.update_bias()
 
     @torch.no_grad()
@@ -402,9 +403,10 @@ class DeepseekV3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         )
 
     def update_moe_gate_bias(self) -> None:
+        """Update correction biases only for gates with adaptation enabled."""
         with torch.no_grad():
             for _, block in self.model.layers.named_children():
-                if isinstance(block.mlp, MoE):
+                if isinstance(block.mlp, MoE) and block.mlp.gate.bias_update_factor > 0:
                     block.mlp.gate.update_bias()
 
     @torch.no_grad()
