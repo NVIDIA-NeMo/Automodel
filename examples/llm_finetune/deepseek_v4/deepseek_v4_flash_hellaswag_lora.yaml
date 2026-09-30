@@ -130,7 +130,8 @@ optimizer:
 ci:
   # pp_size(1) * ep_size(32) = 32 GPUs => 4 nodes (8 H100/node).
   recipe_owner: hemildesai
-  time: "01:00:00"
+  # Two CPU-offloaded HF loads take about 20 minutes; allow the resume check to finish too.
+  time: "01:30:00"
   nodes: 4
   checkpoint_robustness:
     step_scheduler.global_batch_size: 32
