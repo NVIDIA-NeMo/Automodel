@@ -130,6 +130,7 @@ def _worker(rank: int, rendezvous: str, ep_size: int, activation_checkpointing: 
                 mesh.moe_mesh,
                 activation_checkpointing=activation_checkpointing,
                 mp_policy=policy,
+                model_parallelizer=BeamForCausalLM.parallelizer,
                 **mesh.parallelize_axis_kwargs(),
             )
         else:

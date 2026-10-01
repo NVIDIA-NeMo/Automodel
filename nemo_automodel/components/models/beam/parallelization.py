@@ -12,41 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Beam FSDP2 policy: isolate the fp32 router and preserve fp32 RoPE inputs.
+"""Model-owned FSDP2 parallelization for Beam: isolate the fp32 router and preserve fp32 RoPE inputs.
 
-DP/PP use the registered strategy; EP uses the model's _nemo_fully_shard_fn hook.
-Beam blocks disable automatic input casts and cast hidden states themselves,
-leaving RoPE tables untouched. All other units retain the resolved policy."""
+Every FSDP unit goes through ``BeamModelParallelizer._fully_shard_module``: Beam blocks disable FSDP's automatic
+forward-input cast and cast hidden states themselves, so the fp32 RoPE tables reach attention unchanged. Decoder
+blocks are sharded into dtype-uniform units, so the fp32 router (``_keep_in_fp32_modules_strict``) gets its own
+unit: the MoE/EP path does this through the shared ``fully_shard_by_dtype`` block sharding, the dense FSDP2 path
+through ``BeamModelParallelizer._apply_fsdp_sharding``."""
 
-from collections.abc import Callable, Iterable
 from dataclasses import replace
 from typing import Any
 
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
+from torch.distributed.fsdp import MixedPrecisionPolicy, OffloadPolicy, fully_shard
 
-from nemo_automodel.components.distributed import parallelizer_utils
+from nemo_automodel.components.distributed import ModelParallelizer
 from nemo_automodel.components.distributed.activation_checkpointing import unwrap_checkpoint_wrapper
-from nemo_automodel.components.distributed.parallelizer import (
-    DefaultParallelizationStrategy,
-    register_parallel_strategy,
-)
+from nemo_automodel.components.distributed.multimodal_fsdp import FrozenMultimodalSharding
+from nemo_automodel.components.distributed.parallelizer import apply_fsdp2_sharding_recursively
+from nemo_automodel.components.distributed.parallelizer_utils import fully_shard_by_dtype
 from nemo_automodel.components.models.beam.layers import Block
-
-# Attribute under which ``torch.distributed.algorithms._checkpoint.checkpoint_wrapper`` stores the wrapped module.
-CHECKPOINT_WRAPPER_ATTR = "_checkpoint_wrapped_module"
-
-
-def wrapper_tolerant_names(names: Iterable[str]) -> tuple[str, ...]:
-    """Expand dotted precision pins to match activation-checkpoint wrapper segments."""
-    out: list[str] = []
-    for name in names:
-        parts = name.split(".")
-        out.append(name)
-        for i in range(1, len(parts)):
-            out.append(".".join(parts[:i] + [CHECKPOINT_WRAPPER_ATTR] + parts[i:]))
-    return tuple(dict.fromkeys(out))
 
 
 def is_beam_block(module: nn.Module) -> bool:
@@ -55,69 +41,94 @@ def is_beam_block(module: nn.Module) -> bool:
 
 
 def beam_fully_shard_unit(
-    module: nn.Module,
-    *,
-    mp_policy: MixedPrecisionPolicy | None = None,
-    fully_shard_fn: Callable[..., nn.Module] | None = None,
-    **kwargs: Any,
+    module: nn.Module, *, mp_policy: MixedPrecisionPolicy | None = None, **kwargs: Any
 ) -> nn.Module:
-    """Shard a Beam block without casting its FP32 rotary inputs.
+    """Shard one FSDP unit without casting a Beam block's FP32 rotary inputs.
 
-    Clone the policy with cast_forward_inputs=False and record param_dtype on the
-    unwrapped block, whose forward casts hidden states. Other modules are unchanged;
-    fully_shard_fn selects the underlying sharder."""
-    shard = fully_shard_fn or fully_shard
+    For Beam blocks, clone the policy with cast_forward_inputs=False and record param_dtype on the unwrapped
+    block, whose forward casts hidden states itself. Other modules use the policy unchanged.
+
+    Args:
+        module: Module to wrap; a Beam block may be wrapped for activation checkpointing.
+        mp_policy: Mixed-precision policy for this unit.
+        **kwargs: Remaining ``fully_shard`` arguments (mesh, reshard_after_forward, offload_policy, ...).
+
+    Returns:
+        The sharded module."""
     if mp_policy is not None and is_beam_block(module):
         unwrap_checkpoint_wrapper(module)._fsdp_compute_dtype = mp_policy.param_dtype
         if mp_policy.cast_forward_inputs:
             mp_policy = replace(mp_policy, cast_forward_inputs=False)
-    return shard(module, mp_policy=mp_policy, **kwargs)
+    return fully_shard(module, mp_policy=mp_policy, **kwargs)
 
 
-@register_parallel_strategy(name="BeamForCausalLM")
-class BeamParallelizationStrategy(DefaultParallelizationStrategy):
-    """Default FSDP2 strategy with dtype-aware sharding for Beam decoder blocks."""
+class BeamModelParallelizer(ModelParallelizer):
+    """Shard Beam with an fp32 router unit and fp32 RoPE tables kept across block boundaries."""
 
-    def parallelize(
-        self, model: nn.Module, device_mesh: DeviceMesh, dp_shard_cp_mesh_name: str = "dp_shard_cp", **kwargs: Any
-    ) -> nn.Module:
-        """Apply the default strategy with Beam's dtype-aware sharder.
+    _customizes_moe_fsdp = True
 
-        Args:
-            model: Native Beam model or pipeline stage, modified in place.
-            device_mesh: Framework mesh containing the DP/CP axes.
-            dp_shard_cp_mesh_name: FSDP mesh name.
-            **kwargs: DefaultParallelizationStrategy options.
+    def _fully_shard_module(self, module: nn.Module, **kwargs: Any) -> nn.Module:
+        """Apply ``beam_fully_shard_unit`` to every FSDP unit."""
+        return beam_fully_shard_unit(module, **kwargs)
 
-        Returns:
-            The parallelized model."""
-        base_fully_shard = kwargs.pop("fully_shard_fn", None) or fully_shard
-        pins = wrapper_tolerant_names(getattr(model, "_keep_in_fp32_modules_strict", None) or ())
-
-        def beam_fully_shard(module, *, mesh, mp_policy=None, offload_policy=None, reshard_after_forward=None, **extra):
-            ignored_params = extra.pop("ignored_params", None)
-            if pins and is_beam_block(module):
-                # The block (or its checkpoint wrapper, exactly the object the default flow would wrap) becomes the
-                # bf16 unit; the Gate inside it gets its own fp32 unit. Pin names resolve through wrapper segments.
-                # ``beam_fully_shard_unit`` keeps the fp32 RoPE tensors across the block boundary.
-                parallelizer_utils.fully_shard_by_dtype(
-                    module,
-                    mesh=mesh,
-                    mp_policy=mp_policy,
-                    offload_policy=offload_policy,
-                    fp32_compute_module_names=pins,
-                    reshard_after_forward=reshard_after_forward,
-                    ignored_params=ignored_params,
-                    fully_shard_fn=lambda m, **kw: beam_fully_shard_unit(m, fully_shard_fn=base_fully_shard, **kw),
-                )
-                return module
-            call_kwargs = {"mesh": mesh, "mp_policy": mp_policy, "offload_policy": offload_policy, **extra}
-            if reshard_after_forward is not None:
-                call_kwargs["reshard_after_forward"] = reshard_after_forward
-            if ignored_params is not None:
-                call_kwargs["ignored_params"] = ignored_params
-            return base_fully_shard(module, **call_kwargs)
-
-        return super().parallelize(
-            model, device_mesh, dp_shard_cp_mesh_name=dp_shard_cp_mesh_name, fully_shard_fn=beam_fully_shard, **kwargs
+    def _apply_fsdp_sharding(
+        self,
+        module: nn.Module,
+        mesh: DeviceMesh,
+        mp_policy: MixedPrecisionPolicy | None,
+        offload_policy: OffloadPolicy | None = None,
+        enable_fsdp2_prefetch: bool = True,
+        fsdp2_backward_prefetch_depth: int = 2,
+        fsdp2_forward_prefetch_depth: int = 1,
+        reshard_after_forward: bool | None = None,
+        frozen_multimodal_sharding: FrozenMultimodalSharding = "root",
+        ignored_multimodal_params: set[nn.Parameter] | None = None,
+    ) -> None:
+        """Run the shared dense FSDP2 walk with Beam blocks sharded into dtype-uniform units."""
+        apply_fsdp2_sharding_recursively(
+            module,
+            mesh,
+            mp_policy,
+            offload_policy,
+            enable_fsdp2_prefetch,
+            fsdp2_backward_prefetch_depth,
+            fsdp2_forward_prefetch_depth,
+            reshard_after_forward,
+            model_parallelizer=_DenseBlockParallelizer(
+                self, tuple(getattr(module, "_keep_in_fp32_modules_strict", None) or ())
+            ),
+            frozen_multimodal_sharding=frozen_multimodal_sharding,
+            ignored_multimodal_params=ignored_multimodal_params,
         )
+
+
+class _DenseBlockParallelizer(ModelParallelizer):
+    """Dense FSDP2 walk helper: Beam blocks go through ``fully_shard_by_dtype``, other units unchanged.
+
+    The MoE path already shards each block with ``fully_shard_by_dtype``; the dense walk wraps each layer with a
+    single ``_fully_shard_module`` call, which this helper turns into the same dtype-aware block sharding."""
+
+    def __init__(self, unit_parallelizer: BeamModelParallelizer, fp32_compute_module_names: tuple[str, ...]) -> None:
+        self._unit_parallelizer = unit_parallelizer
+        self._fp32_compute_module_names = fp32_compute_module_names
+
+    def _fully_shard_module(self, module: nn.Module, **kwargs: Any) -> nn.Module:
+        """Shard a Beam block into dtype-uniform units; shard any other module as one Beam unit."""
+        if not (self._fp32_compute_module_names and is_beam_block(module)):
+            return self._unit_parallelizer._fully_shard_module(module, **kwargs)
+        fully_shard_by_dtype(
+            module,
+            mesh=kwargs["mesh"],
+            mp_policy=kwargs.get("mp_policy"),
+            offload_policy=kwargs.get("offload_policy"),
+            fp32_compute_module_names=self._fp32_compute_module_names,
+            reshard_after_forward=kwargs.get("reshard_after_forward"),
+            ignored_params=kwargs.get("ignored_params"),
+            model_parallelizer=self._unit_parallelizer,
+        )
+        return module
+
+
+PARALLELIZER = BeamModelParallelizer()
+
+__all__ = ["PARALLELIZER"]

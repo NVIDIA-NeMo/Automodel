@@ -102,15 +102,9 @@ class TestBeamStateDictAdapter:
         assert "lm_head.weight" not in back and "model.embed_tokens.weight" in back
 
 
-@pytest.mark.parametrize(
-    "experts,dispatcher,expected", [("torch", "torch", True), ("te", "torch", False), ("torch", "mok", False)]
-)
-def test_write_through_capability_respects_backend(adapter, experts, dispatcher, expected):
-    """The Beam opt-in must retain the shared backend restrictions."""
-    from types import SimpleNamespace
-
-    adapter.backend = SimpleNamespace(experts=experts, dispatcher=dispatcher)
-    assert adapter.supports_write_through_checkpoint_load is expected
+def test_low_memory_dcp_load_enabled(adapter):
+    """Beam inherits the Qwen3-MoE opt-in: its non-expert tensors pass through, so DCP loads into model storage."""
+    assert adapter.supports_low_memory_dcp_load
 
 
 def test_checkpoint_load_destinations_write_through_to_beam_weights(beam_config, backend_config):
@@ -120,7 +114,7 @@ def test_checkpoint_load_destinations_write_through_to_beam_weights(beam_config,
     model = BeamForCausalLM(beam_config, backend=backend_config)
     state = model.state_dict()
     destinations = model.state_dict_adapter.to_hf(state, for_checkpoint_load=True)
-    assert model.state_dict_adapter.supports_write_through_checkpoint_load
+    assert model.state_dict_adapter.supports_low_memory_dcp_load
     assert destinations
     expected = {}
     with torch.no_grad():

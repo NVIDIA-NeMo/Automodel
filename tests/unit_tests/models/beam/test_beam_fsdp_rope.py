@@ -21,11 +21,10 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
+from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy, fully_shard
 
-from nemo_automodel.components.distributed import parallelizer_utils
 from nemo_automodel.components.distributed.activation_checkpointing import apply_full_layer_checkpointing_to_layers
-from nemo_automodel.components.models.beam.parallelization import beam_fully_shard_unit, wrapper_tolerant_names
+from nemo_automodel.components.models.beam.parallelization import PARALLELIZER, beam_fully_shard_unit
 
 from .utils import capture_rope_calls, hf_model_and_checkpoint, native_from_hf
 
@@ -66,17 +65,8 @@ def _build(cfg, backend, storage_dtype, ac):
 
 
 def _shard(model, mesh, policy):
-    """Shard Beam blocks with their precision policy, then shard the root."""
-    pins = wrapper_tolerant_names(model._keep_in_fp32_modules_strict)
-    for block in model.model.layers.values():
-        parallelizer_utils.fully_shard_by_dtype(
-            block,
-            mesh=mesh,
-            mp_policy=policy,
-            offload_policy=None,
-            fp32_compute_module_names=pins,
-            fully_shard_fn=beam_fully_shard_unit,
-        )
+    """Shard through Beam's dense FSDP2 path (dtype-aware blocks), then shard the root."""
+    PARALLELIZER._apply_fsdp_sharding(model, mesh, policy)
     fully_shard(model, mesh=mesh, mp_policy=policy, reshard_after_forward=False)
     return model
 
@@ -114,6 +104,9 @@ def test_tables_stay_fp32_shared_and_exact_across_fsdp_boundary(beam_config, bac
     for block in model.model.layers.values():
         inner = getattr(block, "_checkpoint_wrapped_module", block)
         assert inner._fsdp_compute_dtype == torch.bfloat16
+        if hasattr(inner.mlp, "gate"):  # MoE block: the fp32 router is its own FSDP unit
+            assert isinstance(inner.mlp.gate, FSDPModule)
+            assert inner.mlp.gate.weight.dtype == torch.float32
     assert torch.isfinite(out).all()
 
 

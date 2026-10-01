@@ -29,7 +29,7 @@ from nemo_automodel.components.models.beam.layers import (
     window_size_for_backend,
 )
 from nemo_automodel.components.models.beam.model import BeamForCausalLM, beam_moe_config
-from nemo_automodel.components.models.beam.parallelization import BeamParallelizationStrategy, wrapper_tolerant_names
+from nemo_automodel.components.models.beam.parallelization import PARALLELIZER, BeamModelParallelizer
 from nemo_automodel.components.moe.layers import MLP, MoE
 
 from .utils import hf_model_and_checkpoint, native_from_hf
@@ -375,10 +375,11 @@ class TestFp32Router:
         nat_w = (nat_weights.float() / beam_config.routed_scaling_factor).gather(1, nat_order)
         torch.testing.assert_close(nat_w, hf_weights.float().gather(1, order), atol=1e-6, rtol=1e-5)
 
-    def test_beam_strategy_registered(self, beam_config, backend_config):
-        from nemo_automodel.components.distributed.parallelizer import get_parallelization_strategy
+    def test_beam_parallelizer_registered(self, beam_config, backend_config):
+        from nemo_automodel.components.distributed.model_parallelizer import get_model_parallelizer
 
         model = BeamForCausalLM(beam_config, backend=backend_config)
-        assert isinstance(get_parallelization_strategy(model), BeamParallelizationStrategy)
-        names = wrapper_tolerant_names(("mlp.gate.weight", "e_score_correction_bias"))
-        assert "mlp._checkpoint_wrapped_module.gate.weight" in names and "e_score_correction_bias" in names
+        parallelizer = get_model_parallelizer(model)
+        assert parallelizer is PARALLELIZER and isinstance(parallelizer, BeamModelParallelizer)
+        # the MoE/EP path only routes FSDP units through model sidecars that opt in
+        assert parallelizer._customizes_moe_fsdp

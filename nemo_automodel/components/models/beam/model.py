@@ -31,7 +31,7 @@ from nemo_automodel.components.models.beam.layers import (
     layer_rope_parameters,
     reject_flex_attention_mask,
 )
-from nemo_automodel.components.models.beam.parallelization import beam_fully_shard_unit
+from nemo_automodel.components.models.beam.parallelization import PARALLELIZER
 from nemo_automodel.components.models.beam.state_dict_adapter import BeamStateDictAdapter
 from nemo_automodel.components.models.common import (
     BackendConfig,
@@ -242,7 +242,6 @@ class BeamForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
     # Our own forward handles PP stage routing, THD and CP like the other native MoE models.
     _pp_keep_self_forward: bool = True
-    _nemo_fully_shard_fn = staticmethod(beam_fully_shard_unit)
     # fp32 router contract (HF ``_keep_in_fp32_modules_strict``): the router weight and the correction bias keep
     # their original fp32 values through the model cast and the checkpoint load, compute in fp32 (``gate_precision``),
     # and get their own fp32 FSDP unit (see ``beam.parallelization``), so they stay F32 in checkpoints and exports.
@@ -408,4 +407,5 @@ class BeamForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 rotary_emb.device = buffer_device
 
 
+BeamForCausalLM.parallelizer = PARALLELIZER
 ModelClass = BeamForCausalLM

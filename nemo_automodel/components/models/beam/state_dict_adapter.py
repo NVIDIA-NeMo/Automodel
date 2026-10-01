@@ -14,28 +14,18 @@
 
 """State-dict adapter between Hugging Face Beam checkpoints and the native grouped-experts layout."""
 
-from __future__ import annotations
-
-from typing import TYPE_CHECKING
-
-import torch
-
-from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.moe.config import MoEConfig
-from nemo_automodel.components.moe.state_dict_mixin import MoESplitExpertsStateDictMixin
-
-if TYPE_CHECKING:
-    from transformers.models.beam import BeamConfig
+from nemo_automodel.components.models.qwen3_moe.state_dict_adapter import Qwen3MoeStateDictAdapter
 
 
-class BeamStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
+class BeamStateDictAdapter(Qwen3MoeStateDictAdapter):
     """Converts between Hugging Face Beam checkpoints and the grouped-experts native format.
 
-    The native module tree mirrors the HF one, so every tensor outside the experts keeps its HF
-    name and passes through unchanged (attention projections and ``gate_bias``, q/k norms, the four
-    per-layer norms, the dense MLP, ``mlp.gate.weight`` and the ``mlp.gate.e_score_correction_bias``
-    buffer, embeddings, final norm, ``lm_head``). Experts differ:
+    Beam stores its experts exactly like Qwen3-MoE, so the Qwen3-MoE conversion (including fused PEFT v5
+    ParamWrapper LoRA export/import and low-memory DCP loading) applies unchanged. The native module tree
+    mirrors the HF one, so every tensor outside the experts keeps its HF name and passes through unchanged
+    (attention projections and ``gate_bias``, q/k norms, the four per-layer norms, the dense MLP,
+    ``mlp.gate.weight`` and the ``mlp.gate.e_score_correction_bias`` buffer, embeddings, final norm,
+    ``lm_head``). Experts differ:
 
     HF checkpoint (per expert, the ``qwen2_moe`` conversion mapping)::
 
@@ -51,19 +41,3 @@ class BeamStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
     ``to_hf`` therefore writes the per-expert layout that ``transformers`` itself produces with
     ``save_pretrained``, not the stacked in-memory layout.
     """
-
-    _supports_write_through_checkpoint_load = True
-
-    def __init__(
-        self, config: BeamConfig, moe_config: MoEConfig, backend: BackendConfig, dtype: torch.dtype = torch.float32
-    ) -> None:
-        self.config = config
-        self.moe_config = moe_config
-        self.backend = backend
-        self.dtype = dtype
-        self._uses_model_prefix = True
-
-    @property
-    def _v5_peft_target_parameters(self) -> tuple[str, ...]:
-        """Fused expert parameters of the HF model (transformers 5 stores experts as these two tensors)."""
-        return ("mlp.experts.gate_up_proj", "mlp.experts.down_proj")
