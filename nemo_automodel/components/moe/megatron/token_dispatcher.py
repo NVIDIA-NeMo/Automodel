@@ -325,31 +325,49 @@ class _DeepepManager(_DispatchManager):
 
 
 class _HybridEPMetadataProcessor(nn.Module):
-    """Graphable expansion of top-k probabilities for HybridEP dispatch."""
+    """Graphable conversion of top-k metadata for dense or compact HybridEP dispatch."""
 
-    def __init__(self, *, num_experts: int, permute_fusion: bool):
+    def __init__(self, *, num_experts: int, permute_fusion: bool, compact_routing: bool = False) -> None:
         super().__init__()
         self.num_experts = num_experts
         self.permute_fusion = permute_fusion
+        self.compact_routing = compact_routing
 
-    def forward(self, token_indices: torch.Tensor, token_probs: torch.Tensor) -> torch.Tensor:
-        """Expand top-k probabilities without materializing a dense routing map.
+    def forward(self, token_indices: torch.Tensor, token_probs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Convert top-k metadata while preserving the graph capture boundary.
 
         Args:
             token_indices: Expert indices with shape [tokens, top_k]. Invalid slots contain -1.
             token_probs: Routing probabilities with shape [tokens, top_k].
 
         Returns:
-            Dense routing probabilities with shape [tokens, experts].
+            Routing metadata and dense probabilities. In compact mode, the metadata aliases
+            token_indices with shape [tokens, top_k]. In dense mode, it is a Boolean routing map
+            with shape [tokens, experts]. Probabilities have shape [tokens, experts] in both modes.
         """
+        if not self.compact_routing:
+            if self.permute_fusion:
+                return fused_indices_to_multihot(token_indices, token_probs, self.num_experts)
+
+            batch_size = token_indices.shape[0]
+            routing_map = torch.zeros((batch_size, self.num_experts), dtype=torch.bool, device=token_indices.device)
+            multihot_probs = torch.zeros((batch_size, self.num_experts), dtype=torch.float, device=token_indices.device)
+            mask = token_indices != -1
+            valid_indices = token_indices[mask]
+            row_indices = torch.arange(batch_size, device=token_indices.device).repeat_interleave(mask.sum(dim=1))
+            routing_map[row_indices, valid_indices] = True
+            multihot_probs[row_indices, valid_indices] = token_probs[mask]
+            return routing_map, multihot_probs
+
         valid = token_indices != -1
         safe_indices = token_indices.masked_fill(~valid, 0).long()
         safe_probs = torch.where(valid, token_probs, torch.zeros_like(token_probs)).float()
-        return torch.zeros(
+        multihot_probs = torch.zeros(
             (token_indices.shape[0], self.num_experts),
             dtype=torch.float,
             device=token_indices.device,
         ).scatter_add(1, safe_indices, safe_probs)
+        return token_indices, multihot_probs
 
 
 # DeepEP's hybrid-ep metadata allgather asserts bytes_per_rank % 16 == 0 on a
@@ -383,11 +401,12 @@ class _HybridEPManager(_DispatchManager):
         permute_fusion: bool = False,
         moe_hybridep_num_sms: int = 24,
         moe_hybridep_permute_fusion: bool = False,
+        moe_hybridep_compact_routing: bool = False,
         moe_hybridep_num_sms_preprocessing: int | None = None,
         moe_hybridep_num_blocks_permute: int | None = None,
         moe_hybridep_num_blocks_unpermute: int | None = None,
         benchmark_static_routing: bool = False,
-    ):
+    ) -> None:
         self.group = group
         self.num_local_experts = num_local_experts
         self.num_experts = num_experts
@@ -395,6 +414,7 @@ class _HybridEPManager(_DispatchManager):
         self.permute_fusion = permute_fusion
         self.moe_hybridep_num_sms = moe_hybridep_num_sms
         self.moe_hybridep_permute_fusion = moe_hybridep_permute_fusion
+        self.moe_hybridep_compact_routing = moe_hybridep_compact_routing
         self.moe_hybridep_num_sms_preprocessing = moe_hybridep_num_sms_preprocessing
         self.moe_hybridep_num_blocks_permute = moe_hybridep_num_blocks_permute
         self.moe_hybridep_num_blocks_unpermute = moe_hybridep_num_blocks_unpermute
@@ -518,7 +538,10 @@ class _HybridEPManager(_DispatchManager):
             if pad_tokens > 0:
                 self.num_unpadded_tokens = num_tokens
                 hidden_states = nn.functional.pad(hidden_states, (0, 0, 0, pad_tokens))
-                self.routing_map = nn.functional.pad(self.routing_map, (0, 0, 0, pad_tokens))
+                if self.routing_map is not None:
+                    self.routing_map = nn.functional.pad(self.routing_map, (0, 0, 0, pad_tokens))
+                if self.token_indices is not None:
+                    self.token_indices = nn.functional.pad(self.token_indices, (0, 0, 0, pad_tokens), value=-1)
                 self.token_probs = nn.functional.pad(self.token_probs, (0, 0, 0, pad_tokens))
 
         dispatched_hidden, self.dispatched_probs, _, tokens_per_expert, self.handle = hybrid_ep_dispatch(
@@ -607,6 +630,7 @@ class _HybridEPManager(_DispatchManager):
 
         transient_names = (
             "token_probs",
+            "token_indices",
             "routing_map",
             "handle",
             "pad_multiple",
@@ -632,7 +656,12 @@ class _HybridEPManager(_DispatchManager):
                 token_probs = torch.zeros((num_tokens, self.num_experts), dtype=torch.float32, device=device)
                 token_probs.scatter_(1, expert_indices, 1.0 / self.router_topk)
                 token_probs.requires_grad_()
-                self.setup_metadata(routing_map, token_probs)
+                if self.moe_hybridep_compact_routing:
+                    self.token_indices = expert_indices
+                    self.routing_map = None
+                    self.token_probs = token_probs
+                else:
+                    self.setup_metadata(routing_map, token_probs)
 
                 hidden = torch.ones((num_tokens, hidden_dim), dtype=dtype, device=device, requires_grad=True)
                 dispatched = self.dispatch(hidden)
@@ -679,6 +708,11 @@ class HybridEPPipelineRuntimeInitializer:
             self.manager.num_experts,
             self.manager.router_topk,
             self.manager.moe_hybridep_num_sms,
+            self.manager.moe_hybridep_compact_routing,
+            self.manager.moe_hybridep_permute_fusion,
+            self.manager.moe_hybridep_num_sms_preprocessing,
+            self.manager.moe_hybridep_num_blocks_permute,
+            self.manager.moe_hybridep_num_blocks_unpermute,
             self.manager.pad_multiple,
             int(os.environ.get("NUM_OF_TOKENS_PER_CHUNK_COMBINE_API", "64")),
         )
@@ -929,12 +963,29 @@ class MoEFlexTokenDispatcher:
                         permute_fusion=self.config.moe_permute_fusion,
                         moe_hybridep_num_sms=self.config.moe_hybridep_num_sms,
                         moe_hybridep_permute_fusion=self.config.moe_hybridep_permute_fusion,
+                        moe_hybridep_compact_routing=self.config.moe_hybridep_compact_routing,
                         moe_hybridep_num_sms_preprocessing=self.config.moe_hybridep_num_sms_preprocessing,
                         moe_hybridep_num_blocks_permute=self.config.moe_hybridep_num_blocks_permute,
                         moe_hybridep_num_blocks_unpermute=self.config.moe_hybridep_num_blocks_unpermute,
                         benchmark_static_routing=self.config.moe_benchmark_static_routing,
                     )
                 self._comm_manager = MoEFlexTokenDispatcher.shared_hybridep_manager
+                if (
+                    self._comm_manager.moe_hybridep_compact_routing,
+                    self._comm_manager.moe_hybridep_permute_fusion,
+                    self._comm_manager.moe_hybridep_num_sms_preprocessing,
+                    self._comm_manager.moe_hybridep_num_blocks_permute,
+                    self._comm_manager.moe_hybridep_num_blocks_unpermute,
+                ) != (
+                    self.config.moe_hybridep_compact_routing,
+                    self.config.moe_hybridep_permute_fusion,
+                    self.config.moe_hybridep_num_sms_preprocessing,
+                    self.config.moe_hybridep_num_blocks_permute,
+                    self.config.moe_hybridep_num_blocks_unpermute,
+                ):
+                    raise ValueError(
+                        "Shared HybridEP dispatchers must use identical routing, fusion, and kernel tuning settings"
+                    )
             else:
                 self._comm_manager = _HybridEPManager(
                     group=ep_group,
@@ -944,6 +995,7 @@ class MoEFlexTokenDispatcher:
                     permute_fusion=self.config.moe_permute_fusion,
                     moe_hybridep_num_sms=self.config.moe_hybridep_num_sms,
                     moe_hybridep_permute_fusion=self.config.moe_hybridep_permute_fusion,
+                    moe_hybridep_compact_routing=self.config.moe_hybridep_compact_routing,
                     moe_hybridep_num_sms_preprocessing=self.config.moe_hybridep_num_sms_preprocessing,
                     moe_hybridep_num_blocks_permute=self.config.moe_hybridep_num_blocks_permute,
                     moe_hybridep_num_blocks_unpermute=self.config.moe_hybridep_num_blocks_unpermute,
@@ -952,6 +1004,7 @@ class MoEFlexTokenDispatcher:
             self.hybridep_metadata_processor = _HybridEPMetadataProcessor(
                 num_experts=self.tp_size * self.config.num_moe_experts,
                 permute_fusion=self.config.moe_permute_fusion,
+                compact_routing=self.config.moe_hybridep_compact_routing,
             )
         else:
             raise ValueError(
@@ -997,7 +1050,7 @@ class MoEFlexTokenDispatcher:
         num_local_tokens: int,
         token_probs: torch.Tensor,
         token_indices: torch.Tensor,
-    ):
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Prepare hidden states and routing metadata for dispatch.
 
         DeepEP consumes ``token_indices[T, K]`` and ``token_probs[T, K]`` directly. HybridEP
@@ -1019,14 +1072,15 @@ class MoEFlexTokenDispatcher:
         hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
 
         if isinstance(self._comm_manager, _HybridEPManager):
+            assert self.hybridep_metadata_processor is not None
+            routing_data, multihot_probs = self.hybridep_metadata_processor(token_indices, token_probs)
+            self._comm_manager.token_probs = multihot_probs
             if self.config.moe_hybridep_compact_routing:
-                assert self.hybridep_metadata_processor is not None
-                multihot_probs = self.hybridep_metadata_processor(token_indices, token_probs)
-                self._comm_manager.token_indices = token_indices
+                self._comm_manager.token_indices = routing_data
                 self._comm_manager.routing_map = None
-                self._comm_manager.token_probs = multihot_probs
             else:
-                self._comm_manager.setup_metadata_from_indices(token_indices, token_probs)
+                self._comm_manager.token_indices = None
+                self._comm_manager.routing_map = routing_data
         else:
             self._comm_manager.token_probs = token_probs
             self._comm_manager.token_indices = token_indices

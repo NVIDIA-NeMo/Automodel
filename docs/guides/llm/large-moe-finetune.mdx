@@ -103,7 +103,7 @@ Several large-scale MoE recipes use the [HybridEP dispatcher](https://github.com
 ```yaml
 model:
   backend:
-    experts: gmm
+    experts: torch_mm
     dispatcher: hybridep
 ```
 
@@ -117,7 +117,7 @@ Enable compact routing only after benchmarking the exact model, batch shape, GPU
 ```yaml
 model:
   backend:
-    experts: gmm
+    experts: torch_mm
     dispatcher: hybridep
     dispatcher_hybridep_compact_routing: true
 ```

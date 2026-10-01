@@ -713,23 +713,23 @@ class HybridEPDispatch(torch.autograd.Function):
 
     @staticmethod
     def forward(
-        ctx,
-        x,
-        routing_map,
-        probs,
-        group,
-        num_local_experts,
-        num_sms_dispatch_api=24,
-        num_sms_combine_api=24,
-        num_permuted_tokens=None,
-        pad_multiple=None,
-        topk_idx=None,
-        num_experts=None,
-        fuse_permute=False,
-        num_sms_preprocessing_api=None,
-        num_blocks_permute=None,
-        num_blocks_unpermute=None,
-    ):
+        ctx: torch.autograd.function.FunctionCtx,
+        x: torch.Tensor,
+        routing_map: torch.Tensor | None,
+        probs: torch.Tensor,
+        group: torch.distributed.ProcessGroup,
+        num_local_experts: int,
+        num_sms_dispatch_api: int = 24,
+        num_sms_combine_api: int = 24,
+        num_permuted_tokens: int | None = None,
+        pad_multiple: int | None = None,
+        topk_idx: torch.Tensor | None = None,
+        num_experts: int | None = None,
+        fuse_permute: bool = False,
+        num_sms_preprocessing_api: int | None = None,
+        num_blocks_permute: int | None = None,
+        num_blocks_unpermute: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor, object]:
         """Dispatch hidden states using compact indices or a dense routing map.
 
         The probability tensor remains dense so its gradient layout is unchanged. When both
@@ -746,7 +746,7 @@ class HybridEPDispatch(torch.autograd.Function):
             num_sms_combine_api: Number of SMs used by the combine API.
             num_permuted_tokens: Optional static dispatched-token capacity.
             pad_multiple: Optional token padding multiple.
-            topk_idx: Optional compact expert indices with shape [tokens, top_k].
+            topk_idx: Optional global expert indices with shape [tokens, top_k], with -1 for unused slots.
             num_experts: Global expert count required with compact indices.
             fuse_permute: Whether to fuse token permutation into dispatch.
             num_sms_preprocessing_api: Optional SM count for routing-metadata preprocessing.
@@ -754,9 +754,10 @@ class HybridEPDispatch(torch.autograd.Function):
             num_blocks_unpermute: Optional combine unpermutation block count.
 
         Returns:
-            Dispatched hidden states with shape [dispatched_tokens, hidden], dispatched
-            probabilities with shape [dispatched_tokens, local_experts], optional scaling
-            metadata, token counts with shape [local_experts], and an opaque combine handle.
+            Dispatched hidden states with shape [dispatched_tokens, hidden], grouped by local
+            expert; float32 probabilities with shape [dispatched_tokens], aligned with the
+            hidden-state rows; no scaling metadata (FP8 dispatch is unsupported); token counts
+            with shape [local_experts]; and an opaque combine handle.
         """
         first_call = _hybrid_ep_buffer is None
         if first_call:
@@ -846,13 +847,20 @@ class HybridEPDispatch(torch.autograd.Function):
         )
 
     @staticmethod
-    def backward(ctx, grad_x, grad_probs, grad_scaling_factor, grad_tokens_per_expert, grad_handle):
+    def backward(
+        ctx: torch.autograd.function.FunctionCtx,
+        grad_x: torch.Tensor,
+        grad_probs: torch.Tensor,
+        grad_scaling_factor: torch.Tensor | None,
+        grad_tokens_per_expert: torch.Tensor | None,
+        grad_handle: None,
+    ) -> tuple[torch.Tensor | None, ...]:
         """Combine gradients while retaining the dense probability-gradient layout.
 
         Args:
             ctx: Autograd context populated by ``forward``.
             grad_x: Hidden-state gradients with shape [dispatched_tokens, hidden].
-            grad_probs: Probability gradients with shape [dispatched_tokens, local_experts].
+            grad_probs: Probability gradients with shape [dispatched_tokens], aligned with grad_x.
             grad_scaling_factor: Optional gradient for dispatch scaling metadata.
             grad_tokens_per_expert: Ignored gradient for token counts with shape [local_experts].
             grad_handle: Ignored gradient for the opaque dispatch handle.
@@ -897,7 +905,14 @@ class HybridEPCombine(torch.autograd.Function):
     """Fused combine operation for permute + combine a2a + permute using the HybridEP backend."""
 
     @staticmethod
-    def forward(ctx, x, handle, num_permuted_tokens=None, pad_multiple=None, fuse_permute=False):
+    def forward(
+        ctx: torch.autograd.function.FunctionCtx,
+        x: torch.Tensor,
+        handle: object,
+        num_permuted_tokens: int | None = None,
+        pad_multiple: int | None = None,
+        fuse_permute: bool = False,
+    ) -> torch.Tensor:
         """Combine dispatched expert outputs through HybridEP.
 
         Args:
@@ -924,7 +939,9 @@ class HybridEPCombine(torch.autograd.Function):
         return combined_hidden
 
     @staticmethod
-    def backward(ctx, grad_x):
+    def backward(
+        ctx: torch.autograd.function.FunctionCtx, grad_x: torch.Tensor
+    ) -> tuple[torch.Tensor, None, None, None, None]:
         """Redispatch combined-output gradients through the saved layout.
 
         Args:
@@ -979,7 +996,7 @@ if HAVE_HYBRIDEP:
             num_sms_combine_api: SMs reserved for HybridEP combine.
             num_permuted_tokens: Static output capacity for non-blocking dispatch.
             pad_multiple: Optional token padding multiple.
-            topk_idx: Optional compact expert indices with shape [tokens, top_k].
+            topk_idx: Optional global expert indices with shape [tokens, top_k], with -1 for unused slots.
             num_experts: Global expert count required with compact indices.
             fuse_permute: Fuse token permutation into the dispatch kernel.
             num_sms_preprocessing_api: Optional SM count for routing-metadata preprocessing.
@@ -987,8 +1004,10 @@ if HAVE_HYBRIDEP:
             num_blocks_unpermute: Optional combine unpermutation block count.
 
         Returns:
-            Dispatched hidden states and probabilities, optional scaling metadata,
-            tokens per expert, and the opaque HybridEP combine handle.
+            Dispatched hidden states with shape [dispatched_tokens, hidden], grouped by local
+            expert; float32 probabilities with shape [dispatched_tokens], aligned with the
+            hidden-state rows; no scaling metadata (FP8 dispatch is unsupported); token counts
+            with shape [local_experts]; and the opaque HybridEP combine handle.
         """
         return HybridEPDispatch.apply(
             x,

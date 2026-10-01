@@ -22,6 +22,7 @@ import nemo_automodel.components.moe.megatron.fused_a2a as fused_a2a
 from nemo_automodel.components.moe.megatron.token_dispatcher import (
     HybridEPPipelineRuntimeInitializer,
     MoEFlexTokenDispatcher,
+    TokenDispatcherConfig,
     _DeepepManager,
     _HybridEPManager,
     _HybridEPMetadataProcessor,
@@ -51,14 +52,34 @@ class TestHybridEPRuntimeInitialization:
         yield
         fused_a2a.reset_hybrid_ep_buffer()
 
-    def test_direct_initialization_is_validation_safe_and_restores_state(self, hybrid_ep_manager, monkeypatch):
+    @pytest.mark.parametrize("compact", [False, True])
+    def test_direct_initialization_is_validation_safe_and_restores_state(self, hybrid_ep_manager, monkeypatch, compact):
         import nemo_automodel.components.moe.megatron.token_dispatcher as td
 
+        monkeypatch.setattr(hybrid_ep_manager, "moe_hybridep_compact_routing", compact)
         calls = []
 
         def fake_dispatch(x, routing_map, probs, **kwargs):
+            """Route identity expert rows for the runtime warmup.
+
+            Args:
+                x: Hidden states with shape [tokens, hidden].
+                routing_map: Optional Boolean routing with shape [tokens, experts].
+                probs: Dense probabilities with shape [tokens, experts].
+                **kwargs: Dispatch settings, including compact indices with shape [tokens, top_k].
+
+            Returns:
+                Hidden states with shape [dispatched_tokens, hidden], probabilities with shape
+                [dispatched_tokens], no scaling metadata, counts with shape [experts], and a handle.
+            """
             assert torch.is_grad_enabled()
             assert not torch.is_inference(x)
+            if compact:
+                assert routing_map is None
+                assert kwargs["topk_idx"].shape == (5, hybrid_ep_manager.router_topk)
+                routing_map = torch.zeros_like(probs, dtype=torch.bool).scatter_(1, kwargs["topk_idx"], True)
+            else:
+                assert kwargs["topk_idx"] is None
             calls.append(("dispatch", x.shape, routing_map.clone(), probs.clone()))
             token_rows = routing_map.nonzero(as_tuple=False)[:, 0]
             dispatched_hidden = x[token_rows] * 2
@@ -77,9 +98,11 @@ class TestHybridEPRuntimeInitialization:
         monkeypatch.setattr(td, "hybrid_ep_combine", fake_combine)
 
         old_routing = torch.ones(1, 8, dtype=torch.bool)
+        old_indices = torch.tensor([[0, 1]])
         old_probs = torch.full((1, 8), 0.125)
         old_handle = object()
         hybrid_ep_manager.routing_map = old_routing
+        hybrid_ep_manager.token_indices = old_indices
         hybrid_ep_manager.token_probs = old_probs
         hybrid_ep_manager.handle = old_handle
         parameter = torch.nn.Parameter(torch.ones(1))
@@ -109,6 +132,7 @@ class TestHybridEPRuntimeInitialization:
         prob_grad = next(call[1] for call in calls if call[0] == "dispatch_backward_probs")
         assert prob_grad.shape == torch.Size([10]) and torch.count_nonzero(prob_grad) == 10
         assert hybrid_ep_manager.routing_map is old_routing
+        assert hybrid_ep_manager.token_indices is old_indices
         assert hybrid_ep_manager.token_probs is old_probs
         assert hybrid_ep_manager.handle is old_handle
         assert torch.equal(parameter.grad, torch.tensor([7.0]))
@@ -234,6 +258,145 @@ class TestHybridEPRuntimeInitialization:
             second.prepare(num_tokens=160, device=torch.device("cpu"))
         incompatible_init.assert_not_called()
 
+    @pytest.mark.parametrize(
+        "setting,value",
+        [
+            ("moe_hybridep_permute_fusion", True),
+            ("moe_hybridep_compact_routing", True),
+            ("moe_hybridep_num_sms_preprocessing", 12),
+            ("moe_hybridep_num_blocks_permute", 16),
+            ("moe_hybridep_num_blocks_unpermute", 16),
+        ],
+    )
+    def test_runtime_rejects_incompatible_kernel_settings(self, hybrid_ep_manager, monkeypatch, setting, value):
+        initializer = HybridEPPipelineRuntimeInitializer(hybrid_ep_manager, 16, torch.bfloat16)
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+        initialize = Mock()
+        monkeypatch.setattr(hybrid_ep_manager, "initialize_runtime", initialize)
+        initializer.prepare(num_tokens=160, device=torch.device("cpu"))
+
+        monkeypatch.setattr(hybrid_ep_manager, setting, value)
+        with pytest.raises(RuntimeError, match="process-global buffer"):
+            initializer.prepare(num_tokens=160, device=torch.device("cpu"))
+        assert initialize.call_count == 1
+
+
+@pytest.mark.parametrize("compact", [False, True])
+@pytest.mark.parametrize("num_tokens,group_max", [(5, 5), (3, 5), (4, 4)])
+def test_hybridep_padding_preserves_routing_and_gradients(
+    hybrid_ep_manager, monkeypatch, compact, num_tokens, group_max
+):
+    """Padding must preserve real tokens and leave padded rows routed nowhere."""
+    import nemo_automodel.components.moe.megatron.token_dispatcher as td
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 2)
+
+    def group_max_reduce(tensor, op=None, group=None):
+        """Set the scalar [ ] token count to the simulated group's maximum."""
+        tensor.fill_(group_max)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", group_max_reduce)
+    hidden = torch.randn(num_tokens, 4, requires_grad=True)
+    indices = torch.tensor([[0, 3]]).expand(num_tokens, 2)
+    probs = torch.full((num_tokens, 2), 0.5, requires_grad=True)
+    dispatcher = object.__new__(MoEFlexTokenDispatcher)
+    dispatcher._comm_manager = hybrid_ep_manager
+    dispatcher.config = SimpleNamespace(moe_hybridep_compact_routing=compact)
+    dispatcher.hybridep_metadata_processor = _HybridEPMetadataProcessor(
+        num_experts=8, permute_fusion=False, compact_routing=compact
+    )
+    target_tokens = -(-group_max // 4) * 4
+
+    def dispatch(x, routing_map, probs, *, topk_idx, **kwargs):
+        """Apply identity experts weighted by dense probabilities.
+
+        Args:
+            x: Hidden states with shape [padded_tokens, hidden].
+            routing_map: Optional routing map with shape [padded_tokens, experts].
+            probs: Dense probabilities with shape [padded_tokens, experts].
+            topk_idx: Optional compact indices with shape [padded_tokens, top_k].
+            **kwargs: Unused communication settings.
+
+        Returns:
+            Weighted hidden states with shape [padded_tokens, hidden], dense probabilities,
+            no scaling metadata, expert counts with shape [experts], and a combine handle.
+        """
+        assert x.shape[0] == probs.shape[0] == target_tokens
+        if compact:
+            assert routing_map is None
+            torch.testing.assert_close(topk_idx[:num_tokens], indices)
+            assert topk_idx.shape[0] == target_tokens
+            assert torch.all(topk_idx[num_tokens:] == -1)
+        else:
+            assert topk_idx is None
+            assert routing_map.shape[0] == target_tokens
+            assert not torch.any(routing_map[num_tokens:])
+        assert not torch.any(probs[num_tokens:])
+        return x * probs.sum(dim=1, keepdim=True), probs, None, torch.ones(8, dtype=torch.int64), object()
+
+    monkeypatch.setattr(td, "hybrid_ep_dispatch", dispatch)
+    monkeypatch.setattr(td, "hybrid_ep_combine", lambda x, **kwargs: x)
+    prepared, _ = dispatcher.dispatch_preprocess2(hidden, num_tokens, probs, indices)
+    output = hybrid_ep_manager.combine(hybrid_ep_manager.dispatch(prepared))
+    weights = torch.arange(output.numel(), dtype=output.dtype).reshape_as(output)
+    (output * weights).sum().backward()
+
+    torch.testing.assert_close(output, hidden)
+    torch.testing.assert_close(hidden.grad, weights)
+    torch.testing.assert_close(probs.grad, (hidden.detach() * weights).sum(dim=1, keepdim=True).expand_as(probs))
+
+
+@pytest.mark.parametrize("compact", [False, True])
+def test_hybridep_preprocess_records_cuda_graph_sample(hybrid_ep_manager, monkeypatch, compact):
+    """Both routing representations must call the graph-owned preprocessing module."""
+    from nemo_automodel.components.cuda_graphs.partial import _PartialGraphEntry
+
+    monkeypatch.setattr(hybrid_ep_manager, "permute_fusion", True)
+    monkeypatch.setattr(
+        "nemo_automodel.components.moe.megatron.token_dispatcher.fused_indices_to_multihot",
+        lambda indices, probabilities, num_experts: hybrid_ep_manager._indices_to_multihot(indices, probabilities),
+    )
+    processor = _HybridEPMetadataProcessor(num_experts=8, permute_fusion=True, compact_routing=compact)
+    dispatcher = object.__new__(MoEFlexTokenDispatcher)
+    dispatcher._comm_manager = hybrid_ep_manager
+    dispatcher.config = SimpleNamespace(moe_hybridep_compact_routing=compact)
+    dispatcher.hybridep_metadata_processor = processor
+    entry = _PartialGraphEntry(name="test.moe_preprocess", target=processor)
+    entry.start_recording()
+    try:
+        dispatcher.dispatch_preprocess2(torch.randn(2, 4), 2, torch.ones(2, 2), torch.tensor([[0, 1], [2, 3]]))
+        entry.build_adapter()
+        assert len(entry.captured_calls()) == 1
+    finally:
+        entry.close()
+
+
+@pytest.mark.parametrize(
+    "setting,value",
+    [
+        ("moe_hybridep_compact_routing", True),
+        ("moe_hybridep_permute_fusion", True),
+        ("moe_hybridep_num_sms_preprocessing", 12),
+        ("moe_hybridep_num_blocks_permute", 16),
+        ("moe_hybridep_num_blocks_unpermute", 16),
+    ],
+)
+def test_shared_hybridep_manager_rejects_incompatible_settings(monkeypatch, setting, value):
+    """A shared manager must not silently discard another dispatcher's settings."""
+    monkeypatch.setattr(MoEFlexTokenDispatcher, "shared_hybridep_manager", None)
+    monkeypatch.setattr("nemo_automodel.components.moe.megatron.token_dispatcher.hybrid_ep_dispatch", Mock())
+    config = TokenDispatcherConfig(moe_flex_dispatcher_backend="hybridep", num_moe_experts=8)
+    group = Mock()
+    group.size.return_value = 4
+    first = MoEFlexTokenDispatcher(2, [0, 1], config, group)
+    second = MoEFlexTokenDispatcher(2, [0, 1], config, group)
+    assert first._comm_manager is second._comm_manager
+
+    monkeypatch.setattr(config, setting, value)
+    with pytest.raises(ValueError, match="identical routing, fusion, and kernel tuning"):
+        MoEFlexTokenDispatcher(2, [0, 1], config, group)
+
 
 class TestIndicesToMultihot:
     """Tests for _HybridEPManager._indices_to_multihot."""
@@ -258,19 +421,20 @@ class TestIndicesToMultihot:
     def test_scoped_processor_matches_existing_probabilities(self, hybrid_ep_manager):
         indices = torch.tensor([[0, 3], [1, -1]])
         probs = torch.tensor([[0.6, 0.4], [0.7, 0.0]])
-        processor = _HybridEPMetadataProcessor(num_experts=8, permute_fusion=False)
+        processor = _HybridEPMetadataProcessor(num_experts=8, permute_fusion=False, compact_routing=True)
 
         _, expected = hybrid_ep_manager._indices_to_multihot(indices, probs)
-        actual = processor(indices, probs)
+        actual_indices, actual = processor(indices, probs)
 
+        assert actual_indices is indices
         torch.testing.assert_close(actual, expected)
 
     def test_scoped_processor_preserves_dense_probability_gradients(self):
         indices = torch.tensor([[0, 3], [1, 5]])
         probs = torch.tensor([[0.6, 0.4], [0.7, 0.3]], requires_grad=True)
-        processor = _HybridEPMetadataProcessor(num_experts=8, permute_fusion=False)
+        processor = _HybridEPMetadataProcessor(num_experts=8, permute_fusion=False, compact_routing=True)
 
-        dense_probs = processor(indices, probs)
+        _, dense_probs = processor(indices, probs)
         dense_weights = torch.arange(16, dtype=dense_probs.dtype).reshape(2, 8)
         (dense_probs * dense_weights).sum().backward()
 
@@ -280,9 +444,9 @@ class TestIndicesToMultihot:
     def test_fused_configuration_preserves_dense_probability_gradients(self):
         indices = torch.tensor([[0, 3], [1, -1]])
         probs = torch.tensor([[0.6, 0.4], [0.7, 0.3]], requires_grad=True)
-        processor = _HybridEPMetadataProcessor(num_experts=8, permute_fusion=True)
+        processor = _HybridEPMetadataProcessor(num_experts=8, permute_fusion=True, compact_routing=True)
 
-        dense_probs = processor(indices, probs)
+        _, dense_probs = processor(indices, probs)
         dense_weights = torch.arange(16, dtype=dense_probs.dtype).reshape(2, 8)
         (dense_probs * dense_weights).sum().backward()
 
@@ -353,7 +517,9 @@ class TestIndicesToMultihot:
         dispatcher = object.__new__(MoEFlexTokenDispatcher)
         dispatcher._comm_manager = hybrid_ep_manager
         dispatcher.config = SimpleNamespace(moe_hybridep_compact_routing=True)
-        dispatcher.hybridep_metadata_processor = _HybridEPMetadataProcessor(num_experts=8, permute_fusion=False)
+        dispatcher.hybridep_metadata_processor = _HybridEPMetadataProcessor(
+            num_experts=8, permute_fusion=False, compact_routing=True
+        )
         hidden = torch.randn(2, 4)
         token_indices = torch.tensor([[0, 3], [1, 5]])
         token_probs = torch.tensor([[0.6, 0.4], [0.7, 0.3]])
