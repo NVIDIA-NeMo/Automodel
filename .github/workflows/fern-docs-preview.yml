@@ -130,6 +130,25 @@ jobs:
             cp -R "archived-source/$ROOT" "pr-source/$ROOT"
           done
 
+          # Pin links to retired recipes without changing archived prose/layout.
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          import subprocess
+
+          snapshot = "291a8f21681d86f0dbb4f91fb906d5219ea0d07a"
+          source = Path("pr-source")
+          pattern = re.compile(r"https://github\.com/NVIDIA-NeMo/Automodel/blob/main/(examples/[^\s)#]+\.ya?ml)")
+          for page in (source / "docs/fern/versions").glob("v*/pages/**/*"):
+              if not page.is_file() or page.suffix not in {".md", ".mdx"}:
+                  continue
+              def pin(match):
+                  recipe = match.group(1)
+                  exists = subprocess.run(["git", "-C", str(source), "cat-file", "-e", f"{snapshot}:{recipe}"], capture_output=True).returncode == 0
+                  return match.group(0).replace("/blob/main/", f"/blob/{snapshot}/") if not (source / recipe).is_file() and exists else match.group(0)
+              page.write_text(pattern.sub(pin, page.read_text()))
+          PY
+
       - name: Generate model coverage tables with trusted tooling
         run: |
           set -euo pipefail
@@ -230,7 +249,17 @@ jobs:
                   page["path"] = "../../" + card.relative_to(preview / "docs").as_posix()
                   provider["contents"].sort(key=lambda item: item["page"].casefold())
               overview = [item for item in category["contents"] if "section" not in item]
-              sections = sorted((item for item in category["contents"] if "section" in item), key=lambda item: item["section"].casefold())
+              sections = []
+              for provider in (item for item in category["contents"] if "section" in item):
+                  # Explicit PR deletions remove the page and its trusted-main
+                  # navigation entry. Keep providers with surviving cards.
+                  provider["contents"] = [
+                      page for page in provider["contents"]
+                      if (navigation_file.parent / page["path"]).is_file()
+                  ]
+                  if provider["contents"]:
+                      sections.append(provider)
+              sections.sort(key=lambda item: item["section"].casefold())
               category["contents"] = overview + sections
           navigation_file.write_text(yaml.safe_dump(navigation, sort_keys=False), encoding="utf-8")
 

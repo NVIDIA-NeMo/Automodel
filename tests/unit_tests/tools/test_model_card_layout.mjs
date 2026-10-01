@@ -26,7 +26,7 @@ description: Test model training in NeMo AutoModel.
 slug: model-coverage/test/provider/Test-Model
 ---
 
-A language model with repository-backed fine-tuning recipes.
+A compact language model with repository-backed fine-tuning recipes for text generation.
 
 ## Quick Start
 
@@ -43,6 +43,8 @@ uv run automodel ${recipe} --nproc-per-node 8
 | Fine-tune | [Recipe](${recipeUrl}) |
 
 ## Model Context
+
+This model provides a compact decoder for text generation and fine-tuning.
 
 | Property | Value |
 | --- | --- |
@@ -116,9 +118,22 @@ test("copying template placeholders cannot pass content validation", () => {
   assert.ok(check(template).length > 0);
 });
 
-test("architecture comes before free context", () => {
+test("a short context introduction immediately precedes architecture", () => {
   const source = validCard.replace("## Model Context\n", "## Model Context\n\nSetup notes before architecture.\n");
-  assert.ok(check(source).some(({ message }) => message.includes("must start with the architecture table")));
+  assert.ok(check(source).some(({ message }) => message.includes("introduction must be followed by the architecture table")));
+});
+
+test("table-only or code-only introductions fail in Markdown and MDX", () => {
+  const intro = "A compact language model with repository-backed fine-tuning recipes for text generation.";
+  const context = "This model provides a compact decoder for text generation and fine-tuning.";
+  for (const format of ["md", "mdx"]) {
+    for (const replacement of ["a", "| Model | Task |\n| --- | --- |\n| Test | Text |", "```text\nModel introduction\n```", "- Model introduction"]) {
+      assert.ok(check(validCard.replace(intro, replacement), recipes, format).some(({ message }) => message.includes("missing introduction paragraph")));
+    }
+    assert.ok(check(validCard.replace(context, ""), recipes, format).some(({ message }) => message.includes("Model Context must start with an introduction paragraph")));
+    assert.ok(check(validCard.replace(context, "a"), recipes, format).some(({ message }) => message.includes("Model Context introduction requires at least eight words")));
+    assert.ok(check(validCard.replace(context, "word ".repeat(41)), recipes, format).some(({ message }) => message.includes("Model Context introduction exceeds 40")));
+  }
 });
 
 test("free context accepts custom subsections, tables, code and callouts", () => {
@@ -169,7 +184,7 @@ for (const [name, source, diagnostic] of [
   ],
   [
     "missing intro",
-    validCard.replace("A language model with repository-backed fine-tuning recipes.", ""),
+    validCard.replace("A compact language model with repository-backed fine-tuning recipes for text generation.", ""),
     "missing introduction",
   ],
   ["missing frontmatter", validCard.replace(/^---[\s\S]*?---\n/, ""), "missing YAML frontmatter"],
@@ -273,7 +288,7 @@ for (const [name, source, diagnostic] of [
   ],
   [
     "long intro",
-    validCard.replace("A language model with repository-backed fine-tuning recipes.", "word ".repeat(81)),
+    validCard.replace("A compact language model with repository-backed fine-tuning recipes for text generation.", "word ".repeat(81)),
     "introduction exceeds 80",
   ],
   [
@@ -288,7 +303,7 @@ for (const [name, source, diagnostic] of [
   ],
   [
     "long unbroken prose",
-    validCard.replace("A language model with repository-backed fine-tuning recipes.", "x".repeat(801)),
+    validCard.replace("A compact language model with repository-backed fine-tuning recipes for text generation.", "x".repeat(801)),
     "introduction exceeds 80",
   ],
   [
@@ -444,3 +459,50 @@ test("the CI command fails for bad content and newly added Markdown cards", asyn
     await fs.rm(root, { recursive: true, force: true });
   }
 });
+
+for (const format of ["md", "mdx"]) {
+  test(`recipe deletion requires updating or removing its ${format} card`, async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "model-card-removal-"));
+    const survivor = recipe.replace("test_model.yaml", "surviving_workflow.yaml");
+    const controlRecipe = recipe.replace("test_model.yaml", "control_model.yaml");
+    const yaml = "recipe: TrainFinetuneRecipeForNextTokenPrediction\nmodel:\n  pretrained_model_name_or_path: provider/Test-Model\n";
+    try {
+      for (const directory of ["docs/templates", "docs/model-coverage/provider", path.dirname(recipe)])
+        await fs.mkdir(path.join(root, directory), { recursive: true });
+      await fs.writeFile(path.join(root, "docs/templates/model-card.mdx"), template);
+      const card = path.join(root, `docs/model-coverage/provider/Test-Model.${format}`);
+      await fs.writeFile(card, validCard);
+      await fs.writeFile(
+        path.join(root, `docs/model-coverage/provider/Control-Model.${format}`),
+        validCard.replaceAll("Test-Model", "Control-Model").replaceAll(recipe, controlRecipe),
+      );
+      await fs.writeFile(path.join(root, recipe), yaml);
+      await fs.writeFile(path.join(root, survivor), yaml);
+      await fs.writeFile(path.join(root, controlRecipe), yaml.replace("Test-Model", "Control-Model"));
+      const run = () =>
+        spawnSync(process.execPath, [path.join(repoRoot, "tools/validate_model_cards.mjs")], {
+          encoding: "utf8",
+          env: { ...process.env, MDX_LINT_REPO_ROOT: root },
+        });
+      assert.equal(run().status, 0);
+
+      await fs.unlink(path.join(root, recipe));
+      let result = run();
+      assert.equal(result.status, 1);
+      assert.match(result.stderr, /Quick Start recipe does not exist/);
+
+      await fs.writeFile(card, validCard.replaceAll(recipe, survivor));
+      assert.equal(run().status, 0, "a surviving matching workflow keeps the card valid");
+
+      await fs.unlink(path.join(root, survivor));
+      result = run();
+      assert.equal(result.status, 1);
+      assert.match(result.stderr, /if its last recipe is deleted, remove the card/);
+
+      await fs.unlink(card);
+      assert.equal(run().status, 0, "removing the orphaned card restores valid coverage");
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+}

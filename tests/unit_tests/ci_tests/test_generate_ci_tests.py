@@ -177,13 +177,13 @@ def test_generate_deepseek_v3_1024_benchmark_job_uses_activation_checkpointing()
     assert recipe["step_scheduler"]["local_batch_size"] == 4
 
 
-def test_glm_4_5_air_benchmark_recipe_still_generates_with_checkpointing():
-    config = Path("examples/llm_benchmark/glm/glm_4.5_air_te_deepep.yaml")
+def test_glm_4_7_flash_benchmark_recipe_generates_with_checkpointing():
+    config = Path("examples/llm_benchmark/glm/glm_4.7_flash_te_deepep.yaml")
 
     jobs = dict(generate_job(config, {}, "performance", "llm_benchmark", "."))
     recipe = YAML(typ="safe").load(config)
 
-    assert jobs[""]["variables"]["TEST_NODE_COUNT"] == 64
+    assert jobs[""]["variables"]["TEST_NODE_COUNT"] == 1
     assert recipe["distributed"]["activation_checkpointing"] is True
     assert parse_distributed_section(recipe["distributed"])["activation_checkpointing"] is True
 
@@ -193,7 +193,7 @@ def test_glm_4_5_air_benchmark_recipe_still_generates_with_checkpointing():
     [
         "examples/llm_benchmark/deepseek/deepseek_v3_te_deepep.yaml",
         "examples/llm_benchmark/deepseek/deepseek_v3_te_deepep_1024.yaml",
-        "examples/llm_benchmark/glm/glm_4.5_air_te_deepep.yaml",
+        "examples/llm_benchmark/glm/glm_4.7_flash_te_deepep.yaml",
         "examples/llm_benchmark/kimi/kimi_k2_te_deepep.yaml",
         "examples/llm_benchmark/qwen/qwen3_moe_235b_te_deepep.yaml",
         "examples/llm_benchmark/qwen/qwen3_moe_30b_te_deepep.yaml",

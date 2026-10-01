@@ -33,9 +33,6 @@ import pathlib
 # ready-to-run architecture table, and ``test_recipe_doc_coverage.py`` (arches
 # resolved from example YAMLs).
 _DOC_ARCH_ALIASES = {
-    # HF ships the class as ``BaiChuanForCausalLM`` (CamelCase) — registry
-    # uses ``BaichuanForCausalLM``. Documented on the Baichuan page.
-    "BaichuanForCausalLM": "BaiChuanForCausalLM",
     # HF upstream renamed ``Gemma3nForConditionalGeneration`` between releases;
     # the "Gemma 3n" variant is covered on the Gemma 3 VL page.
     "Gemma3nForConditionalGeneration": "Gemma 3n",
@@ -65,13 +62,6 @@ _DOC_ARCH_ALIASES = {
     # Mistral4 text model is the backbone of Mistral-Small-4 VLM; documented
     # on the Mistral-Small-4 page via the recipe path ``mistral4``.
     "Mistral4ForCausalLM": "mistral4",
-    # OLMo2 page uses the vendor-branded spelling ``OLMo2`` (all caps "OLM");
-    # HF normalized the class name to ``Olmo2``.
-    "Olmo2ForCausalLM": "OLMo2ForCausalLM",
-    # HF upstream added an extra underscore between "5" and "VL"
-    # (``Qwen2_5_VLForConditionalGeneration``); the Qwen2.5-VL page still uses
-    # the pre-rename spelling.
-    "Qwen2_5_VLForConditionalGeneration": "Qwen2_5VLForConditionalGeneration",
     # Qwen3-Omni and Qwen3-VL are documented with the VL-facing arch name; the
     # registry wires their MoE backbones under these keys.
     "Qwen3OmniMoeForConditionalGeneration": "Qwen3OmniForConditionalGeneration",

@@ -60,6 +60,17 @@ def _repo_root() -> pathlib.Path:
     return pathlib.Path(__file__).resolve().parents[3]
 
 
+def test_deprecation_warnings_reference_existing_recipes():
+    """Keep the legacy configs explicitly referenced by runtime deprecation warnings."""
+    from nemo_automodel.components.models.deprecation import _DEPRECATED_MODEL_YAMLS
+
+    root = _repo_root()
+    missing = sorted(
+        path for paths in _DEPRECATED_MODEL_YAMLS.values() for path in paths if not (root / path).is_file()
+    )
+    assert not missing, "Recipes referenced by deprecation.py must remain available:\n" + "\n".join(missing)
+
+
 def _iter_strings(node) -> Iterable[str]:
     """Yield every string value reachable from a nested YAML structure."""
     if isinstance(node, str):

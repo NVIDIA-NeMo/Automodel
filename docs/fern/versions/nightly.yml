@@ -57,19 +57,6 @@ navigation:
           - page: "Overview"
             path: ../../model-coverage/llm/index.mdx
             slug: overview
-          - section: "Allen AI"
-            icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><image width="20" height="20" href="data:image/webp;base64,UklGRo4BAABXRUJQVlA4TIIBAAAvE8AEAG/DoG0bQc7dP57nT+5Lw20kSYqUdQyPEknvv3+vO2okyZEi+7xlcvyp3Wt7/uPzS0hgMQIxrCGjWAwFCawVQbIWiSFEsAQJhgwiLP7/3+L9fB1ZnPOi6wUJYmA9rxdBsjafaInn+6Y0j8SAcWglu10URCshf4eznyXizCcL5Xnend9HaLsIRhas4VyugmUI60kwjUA4yzIxkBBYXAQWgwxJDoBY27bpKrZ58k5s27ZtfCNO/wW8sIOI/k8APFWjuYYGA966iWIKVYEP6ESubMYhIR5gRC5/ftYDFm7sfekXGO/Q6kzd/mQ97wy7Zp3umpzNG51+ds3auc+kCxAAUO30eTvlasJW+ZzEgy4lAWCgpn+XswaLxUlsV2/bHMNAyu82q22Sw6Q15suvFImQu8Kx6UfJmigX2gG3XYUAgGI6s3cu1vffxxGfLUMg6/Sm7qA1W437XZNOC7dNQs9iE+Wa4G6C5f8/hBi6B2TOVNYlfQBQQaWIER5FgwHhpQ=="/></svg>'
-            slug: allenai
-            path: ../../model-coverage/llm/allenai/index.mdx
-            contents:
-              - page: "OLMo-1B-hf"
-                path: ../../model-coverage/llm/allenai/OLMo-1B-hf.mdx
-              - page: "OLMo-2-0425-1B-Instruct"
-                path: ../../model-coverage/llm/allenai/OLMo-2-0425-1B-Instruct.mdx
-              - page: "OLMo2-7B-1124"
-                path: ../../model-coverage/llm/allenai/OLMo2-7B-1124.mdx
-              - page: "OLMoE-1B-7B-0924"
-                path: ../../model-coverage/llm/allenai/OLMoE-1B-7B-0924.mdx
           - section: "BAAI"
             icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><image width="20" height="20" href="data:image/webp;base64,UklGRkwCAABXRUJQVlA4TD8CAAAvE8AEAG8FoY0kSVLUrA7R4TjUR+j/eiozaECOJNlVVPNQV0zBb67YpXffFzPTDTuSJFdRzQIu4f8/vojTt2K65j+0MQQgDAEIpAHSEGFpiB6+mDFAuQ6aKITyP8SHQEtJAamtpJAqVKo1DftietixWJAAoYKRUira4bxRMCIr1tN1LnPE/6vFwXp1xTDH4Xf+OLP9vLekmpFC9tiMtlRQw9/yrwlqCEfXcpYtDYjfT2sjlqsMgCzpgpFscbCX7XaMKRDNvUAJARHK4QgCvdxjexNVkPhb/rx/P9kypALj7kPH9rF1KGk5oGK63Cz/c9Iqknb2BUNDoKSiivXxu/x7ez79zen18dDLREAaKlGIEOqoWlsZS6JJa8adhxE6UsF+NZSJMlGIcg38b8v3/49UC+3etq3j5KSxvT3f7h4xPF0BiLZtm272RVzbVmqbqW1bSW03qG3bxl+6/YGI/k8A/jXnnAKg/APOAXAAoPiUAASAt1xuAUosXRgAONgDAqfsrNx8R47kphBiDJuyYivYFsXFpjT6wamiKhNGiKmtiyZ2JYqk9GpfxJeG1bvDtDBRkQfbgrTUnBov64YElGcIw1ucPZtDDSsjI6I8YB60DLcA+AQCwa7wP3g/Mdu9Pl3bODo+x/7tJfYuDhdnJ18fp5ae7uYm+rbGOobfunS98xrt6sP0wv3NgK5TPNrWLesZV88MqVeUgyNnV/2qZ/327dYdpeplfdMAUrFQIpRAIhLCRA9fZ/iUMcY++W32owA="/></svg>'
             slug: baai
@@ -82,8 +69,6 @@ navigation:
             slug: baichuan-inc
             path: ../../model-coverage/llm/baichuan-inc/index.mdx
             contents:
-              - page: "Baichuan2-13B-Chat"
-                path: ../../model-coverage/llm/baichuan-inc/Baichuan2-13B-Chat.mdx
               - page: "Baichuan2-7B-Chat"
                 path: ../../model-coverage/llm/baichuan-inc/Baichuan2-7B-Chat.mdx
           - section: "Baidu"
@@ -95,17 +80,6 @@ navigation:
                 path: ../../model-coverage/llm/baidu/ERNIE-4.5-0.3B-PT.mdx
               - page: "ERNIE-4.5-21B-A3B-PT"
                 path: ../../model-coverage/llm/baidu/ERNIE-4.5-21B-A3B-PT.mdx
-          - section: "BigCode"
-            icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><image width="20" height="20" href="data:image/webp;base64,UklGRogDAABXRUJQVlA4THsDAAAvE8AEEA0obNu2TUHKbiP6HxF1K+BX/QcKMCCTtgm751/o7gkx2rZt0hqqioqmJpKkaMLj/8EFCMC/BeKLUdH/AMDjUQI8/BIlFoh/f/SYr6rI2wPb3m4dgBzZtlVbmWvf7y64u7tbB4jIiKifERFqZH2xDkAD3B0yd3d7cs89e3/phNza2hTJeV911U7XLDMzWcwospTC5qEImBWEYpAvS/76YpbHXDX1y5Ek2bWV7D73oSxMuf/1YWk47TiSJCdKNG5hEj9eGltxQJ8chW3bIKXhJYvytw6lD63GJCABAIEJhxAmQgQAAID8RV5RrCGDihQYZ4hU+KcwMFGDCgTAOIUypAmSjW8BGWFMi9fec//9vcTfC7WDayZX6WJcIEESmPFOIGj3fPpTdcXRz39tP2PhtevYj//2X/8ngYmJFgQAICpIhIEbx7b+WNIbqVEd/6g1SH85/vCTH44CAMTEl8OAmFJPgs8/58Aui3vjn6doUaiy42T+4U++uq2ycBAACINSsa+DLc3rd0d8TxX1ywBX8lG0KCC1eOJjRo6uHActepgsUGAgoswNGFmp//FotcmhvFQAgkSrKysV7ur8Ea1uGi4MxuxEG8jVv3BUbYf7x28dtVgtxM0fb73lUftXWTQSpeJ85zvfVQYwZlOKkf9s/VaN+kDHrY/XtWfTmupdfHylpjXqwuO4+eSh8PKv1B5mt6ZUCUJliofx+Dh6tIWXVB/f/x05X958uff7nYWjl8fyVF+/0Ag0I8P5Mc8HTLgKohXuwVTHhefXr3Bs23xvxeoHz+tJfmZ01ffBWXR5dp0eJfz4UGebnGpFITCAUPQQnzIX7xAcqUH//PEHUHR4YMwf+e/0d/L4UVw8o10lFQwAZNGh6F+GEM1CCqEqQuOUwBhTmJt2sWh2yowAACSqwmA8uiceHl6yJ1Eu8CVGeaSQwrgG4mPqGFU+RABAKMzF/3xdvXpduhLvnh7OQ9Xx6hXfPrDlkMzU3s3lU9piPXlW7W04ACAwJKpEqihTbO2P1f8+ejP33U2rutXyMutVf///dS4hUfiyCgzYF6QgAAlTZOiJMaWzXqV/cjlaiKZmuONhxI+/VwvjBgYIWKA8IgkAASMLt6hEq5VEKKxEcoHRIsIFBIyIYHe4tGCD7HAPqKhGViJCEW5UjqhGFBAalYALEqKHywQA"/></svg>'
-            slug: bigcode
-            path: ../../model-coverage/llm/bigcode/index.mdx
-            contents:
-              - page: "starcoder"
-                path: ../../model-coverage/llm/bigcode/starcoder.mdx
-              - page: "starcoder2-3b"
-                path: ../../model-coverage/llm/bigcode/starcoder2-3b.mdx
-              - page: "starcoder2-7b"
-                path: ../../model-coverage/llm/bigcode/starcoder2-7b.mdx
           - section: "ByteDance Seed"
             icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><image width="20" height="20" href="data:image/webp;base64,UklGRlgCAABXRUJQVlA4TEsCAAAvE8AEEE8EKbZtV9E6n5xMoAEBSMMPfhBAz7pnOT6ODSe1bdvK3Je/40mCkYdsrwSODE9hz4YcSZKrKnsXeSJwgSum4wT+aM2XO45q21qW+yvu7u5MKcFiqjkYU4QOdCCARnB3t08CAoUCiHcn8ucHVRgG/vwADCyymZLety9ZVSMccnwZfzUPKc1MlXH5y5oRqgLUqq9pqQiFdfZM5e04rF4cuDcct4t4Otas20b0evBP2z9Bi1DC//xJ//OP9h+Lxv4/34YfmUUomBAgQko9JN+mJrQOHU1xC6tiDH34tHj08TKsXfl3FA+X5alJYXtdtZ0m8I90/RJeD+RRaOFvQLEGHyUp0nAh2hEI5WEQpS0cSorK4NVO81X70TSh0n6gKRGm9RnE9HlU7JgP3L4Edlj8lkSLgoOCp1ppidJFPBN6ojzSmQy3tsw0uk7jMrVvu9KXfolYA8CJEIEEEYzHv24cP+anbXY6A/ueXQqAaFvbMeVHtgfZntxk2/Zk27Y7t/2huoOI/k/AzteOwT+n0dLRWnR1cftuaGTR1lVQ9fD4esqnTlNuaeHe4fOxhpVJY06JZ3f/+UiRaoNQoQXRydSpMrY2tixiw0MT8KreAYsk/0CH6oz59YUxi8TIYAc1shNmevsWwR0V5MCrmh4aWfnd1MCw70+WwB0R4lI8nQk+cAf4OSX7B2/nzA2OLGPFxIXFU5tdVv5yd3/NbH/fKibwQ32eJ//y5mObybWJcdP8TrHTaeisrEYc3UTeTXN7MV87FsBGj0RqAAA="/></svg>'
             slug: bytedance-seed
@@ -115,15 +89,6 @@ navigation:
                 path: ../../model-coverage/llm/bytedance-seed/Seed-Coder-8B-Instruct.mdx
               - page: "Seed-OSS-36B-Instruct"
                 path: ../../model-coverage/llm/bytedance-seed/Seed-OSS-36B-Instruct.mdx
-          - section: "Cohere"
-            icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><image width="20" height="20" href="data:image/webp;base64,UklGRvIBAABXRUJQVlA4TOUBAAAvE8AEAAfksI0kRaq9u2fmz+XzD+gYfyoNB5EkKVIds39D74YZd6YcN5KkSDmwe8z3vfPfOWaazvkPNQIhAgmokQAkCEiokNCfQMAMvUGxRPiT1BTp95ZI+qrqUsPzQTCrSIVQpSbLzKo3omsi/gQChEjxF5AIRDlJ0agvDYmokEiWaH55N37f/CTt56Z93kyPl/JxF6UZXi9W4vvT/X7K8xlIAUJA0u2fov8Zfl/l/uAfApkSmEGlEiFUppZojCBCCVACVFQiIAD9y58gIuzXIavksE29dyqsKEXRZxkFiW1M5G3xLXtZl2SlusdWUfW+1U5GdmCB/8h56RzLyqYaWm5BNLzfmv+fPGw+GSBKsm3aWdd3P5sxXmybN86zY9t2/v2q6n1BRP8nAJVNDp7jOI4EwQDBIOkQviYWFGVRmZ8dAWkQfa8cFEvlcrm4vTMEQeXA+OFaQnN9awoOlYC5QiKdTqeT8cTRqJYDM7sb6VQint3LTToJagGDJ8eZTH5/dfofBG3C8NLm6fLYry/ogT77/vz34w419Pa3eGFViXi5OL+31wy0Njd2RrRkPFzdXr/Vd8diTW1RLRFPZ5c3H3V9Xe0dPQFYVDI+H+9eGVe4urbKD6MMbDArS7IEqxWwWg1UJgA="/></svg>'
-            slug: cohere
-            path: ../../model-coverage/llm/cohere/index.mdx
-            contents:
-              - page: "c4ai-command-r-v01"
-                path: ../../model-coverage/llm/cohere/c4ai-command-r-v01.mdx
-              - page: "c4ai-command-r7b-12-2024"
-                path: ../../model-coverage/llm/cohere/c4ai-command-r7b-12-2024.mdx
           - section: "DeepSeek AI"
             icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><image width="20" height="20" href="data:image/webp;base64,UklGRvgBAABXRUJQVlA4TOsBAAAvE8AEANcEOZIkRVIcs+wn6367e8oPlHAbSZIi1TFI778J79vHq4tdENu2ESRJnuu/4Lv/aP4JJmmq7Rg2Afz/HWnB3YK7BZHTkQAiImJEAim4X7EHBDNxRUxJS+5XnI5RKcAEkBE8HnnY5/b72uPjNO0RE6sCmGBGWsK8nLj9BREJKLV7InEmExIQEgyTP9f8ICaQ2SUXEeSseibP1QPwxBmfkt11qhBEMhkREIcqIUZxMhRzRy5BEHci5m7N1QO1TChBhIBEpOVkBCEMEYp/gngmiENEUpgMEUpYIpp5GB4+Mw+HkhOx4P3N1+f5/g4gSLZt2tnv3Pt1vmLbtm3btp33f2zbznSdjCCi/xOA/02ChFYA9A1F4ksGkfwEcA4JDMtJ0utyTQAYIMVcNLKxtvqUCqeJVp+gtGSADNXXS7Zluzodz02PvW/P0dAg9uHwbGtxxbZ3E+fZs79TYCSJuqqEiqFLdXO4+za9ccwfAKEzBnAvO9ruiqy9O2tgCRC3Vcp3cMbxQbnfzEU+aQAtiuesQgOuOV/oV3dDIQCBgNcSFhEWx/F9+2khCwCQnPmSbUzpCw4fPWl3I/oAyXn3HfVX61mlg1PNrgp9AHFUy/zk7ECig7cX4UsBdvH1YPxQEgBIIvoOQET4YwA="/></svg>'
             slug: deepseek-ai
@@ -157,16 +122,10 @@ navigation:
             contents:
               - page: "functiongemma-270m-it"
                 path: ../../model-coverage/llm/google/functiongemma-270m-it.mdx
-              - page: "gemma-2-9b-it"
-                path: ../../model-coverage/llm/google/gemma-2-9b-it.mdx
-              - page: "gemma-3-270m"
-                path: ../../model-coverage/llm/google/gemma-3-270m.mdx
               - page: "gemma-4-12B"
                 path: ../../model-coverage/llm/google/gemma-4-12B.mdx
               - page: "gemma-4-31B"
                 path: ../../model-coverage/llm/google/gemma-4-31B.mdx
-              - page: "gemma-7b"
-                path: ../../model-coverage/llm/google/gemma-7b.mdx
           - section: "Google T5"
             icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><image width="20" height="20" href="data:image/webp;base64,UklGRjQCAABXRUJQVlA4TCcCAAAvE8AEAAEFbRs5t8d/+BM+EhH9H4Hubq3qbi6AHgaK2jaSPLNXn8Mf6UIhzDYqwvzp7nkYZtq2cbfxx1ggO/ofwwDR5QIAxG8EAJo/AaAUsiPZdq1m5pyLh0+QD1EZKiHv7a17z6QhMZIkRZI8as9ef0WZcVJCJEmOJHlm7556weH5Q3ybzoi3P/+tOXufrJ6Vk7UcbXl61qMW479X935THreHnuG/Rdxs4IZhbmKikcpXz+BueWZvTFfACGHBDAWwBpOJKWcbtiADhVEQoGjEwcpoRLQR5TdXqiZhsGWIDYghGRGaxfau7PVmuZ9R1lZZ5gBGIzQwdCka+dLrV/0uu1zL3VgOS4AjpqItjAm4/v8xvYbzr/wou9zInUtWallEAxmxrDP+/2V341Lmzq4/9bRbvVrWy0ETWVYAyvbnN6xW7Tk6886hf+a456JeWOd0lxWAWnbx64fTKOpQdO7o7PxmzzZbtAWU2pLt1yegmutY7YxVnXtNPXbeuz/0PLROWbbK9v3kRakMSGNBcYdz4ex87H6e3nJ379vLZWT79mazJQkyrnUwhAubOuva+fXwsnHxZrzL9im2FqEgBKFwp9VQGRALhdd6l/kJIggIK3dRMF3ZqRB3etUrrcv2EZPYZemqsSBEkG6GWsdhqdjm+8vLKO3YemACiVIkoeKhhqAXn8OzxrQZ1mDXyRAuKLsojfSwzM8YpbGwEaYyJmEPD1vCaGHpPwA="/></svg>'
             slug: google-t5
@@ -174,17 +133,6 @@ navigation:
             contents:
               - page: "t5-small"
                 path: ../../model-coverage/llm/google-t5/t5-small.mdx
-          - section: "IBM"
-            icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><image width="20" height="20" href="data:image/webp;base64,UklGRpQBAABXRUJQVlA4TIcBAAAvE8AEAK8DoZEkR1JUzcyeoXf8gbj/puGwjSRFqupjyD9UeGyGbds4or/sP3DT/MeLf5iTxGkgewIhAQQHJkAQToCQAKJIIslEkAAZiGBCxuzxRzAECTPO8/wFJMPvH3YGh/jreLnWVwinw2fNc5bTnkIw+IQgU3TWAJEUOs2aXiGdT6SeiHwWw8N/DxM2D0JIx9RLE5kYfFL2nAzEiTQwDJFwwhSMIIS0/DWdWB3hfd3mh/L/YRxAkCTZtPU85z70s23btr7N9217/xHmAiL6r7ZtG8beSuoZ+I9UqT7ToXoHOZGMiAAigEnkABR6p91kcTvAOV1qhc1uADTi3M3JcHJ0P06fHcc8O1d5kUbN/MtbifZuYb9Zv6zlL2ZCpIZOUJnmRZ8WXoKph421h5JQi1eUp/iRx/nnQGZ9bnO2KtRBTYGV7Xhnr3DQ6i8VG73VMKk04uz56WByeDdKXi96fd3brFgDGGx2o9VpVUrtNjkzvzUC5BLi2LtfMag4kn/103f98A8JAA=="/></svg>'
-            slug: ibm
-            path: ../../model-coverage/llm/ibm/index.mdx
-            contents:
-              - page: "granite-3.0-1b-a400m-base"
-                path: ../../model-coverage/llm/ibm/granite-3.0-1b-a400m-base.mdx
-              - page: "granite-3.0-2b-base"
-                path: ../../model-coverage/llm/ibm/granite-3.0-2b-base.mdx
-              - page: "granite-3.3-2b-instruct"
-                path: ../../model-coverage/llm/ibm/granite-3.3-2b-instruct.mdx
           - section: "IBM AI Platform"
             icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><image width="20" height="20" href="data:image/webp;base64,UklGRmYCAABXRUJQVlA4TFkCAAAvE8AEAA0oTNuGzZGkyzSi/wGww981G0mOrEQDM23bmD/idts9DAMS/U8AI/gPACQJAGRIUkRkZNunmVnbxlU373HfoJ/sM6wTTrZt23ZmISPiGwzbtg1Ddf+fvNhx20aSRHmv/KPd31TE/e9vOMfJFzlC3mTZjl0oP46EkoqHZDt8ERoTOJEO4BGDBaW9eMBYSloilWBSVA6oouUQ9BSq332wS3vpnZbKd4KUXWJA3kQAlLSiKdJCHbnt8wphp3iwo1AYQ41UXURlUxe2Qc+X3SWrZ0oaIvHCy6nAozKZYSul4vqji17z9zBFXff6hQ0aSWIiCkGKZlKUt2vX3682r3tsZabf83Ttu9cpkPzGY0LMqiuBGvH7dFGGumf19e71mszYfKkJNabKKCAcaXmxvuusfdeydzNyn6mO67O2elI3Wn+gPdI8Mlk5F7dT29MV6i/LnsHd6TNw7KrqESDkwB0UtHppXbdvWtp1ua4Pa+Luzdq2/TmiANxREVRmdf3S77vpXctdtdczhb/z/rUqP4Q73v0fUiUwYRq8swO3zG3y9LrDvYUxQEJmvVIBTTJhBBpfbg5ud6bNym5qV9Uijs3HWUI5uVKRQ8EqX55s3KTuy/ZxTqw1mRtwxoZn1tHB4yyPbSDyiNLUk6ZSOBfW7XF8XxszJn9JL4W3lNoghSzcyiXJoPN3t11ZfqtpqZWT139wBMLIYJWboi3sasAcmqnNnIPQqeLJlSAKhBb+Lm7heEXaowbJKBZjFFRdSU4V3ZXFig+BSycWrjqCfwxVFRAJZQ13gggcAA=="/></svg>'
             slug: ibm-ai-platform
@@ -246,19 +194,6 @@ navigation:
             contents:
               - page: "Muse-Glimmer-30B"
                 path: ../../model-coverage/llm/meta-models/Muse-Glimmer-30B.mdx
-          - section: "Microsoft"
-            icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><image width="20" height="20" href="data:image/webp;base64,UklGRngDAABXRUJQVlA4TGsDAAAvE8AEEPcHK5Jt10qvQ86gAiMYxRYO+Hs5v7NsOI4kyVGy0cp/R7CDL3ZoDduQI9tWVfW+uGRAKOQ/ZEgi8vXJhlvbtmpl7Xu+u9KAu8S0QBee0QYlWDVkxG4duPu998Rft76AAv5KgEVUM5QBZyjsoQAnwm8RChBEgOMfETmUpgqC0RQwpBIgBAjfJaDQiQaW77it/cjEH+DmLRxTOzbxZrmuBocNM0hBMFRH+r3BSy4B8crxDedj7jnEkFGEFAlOZq6duPxmqlAoBYrIJeAL/zTAIAQECKaAI8ORGg5DgA0bISKHIlHb0YGOEN8li21i2FR/FD25avs53J3ZhhVH6lTr+3d63tkd3m9eD//PZ/m39/rwvXPUXCOXjALE8IXt0ev/tnIzHaESoPxG7XGW3TfTEyXACmKxqCKw4dqi08/8birXrnQArkQJdKAAVyDBKRD+GjKASIFVpCx8SKqhIgGOLArSmIEpMc3cEJfFdE5TdRa/e1dWF8tsvv7a7Lk9nEo/+4c+6keBhAgnCFDAFw3BUIQQIEglJESJRCWqQEAwh18x0ym7RPbCA1yzL80pf4DLtMWXxXQiIfGTKEMBCmIoJBB87sLm2O6p1lRBqaRGGFO1y3rj21tyKxfLkO5/x73X0++kQeK2bcef2Lbt/Wbbtm3btu1l2zUz17J+ebnlWraP48e/4Xki+q8waQPGjmOOHZybAoBDMx2fHjx6/BAQ7h+f3rd99x7EXcuaP7+8cPrsmYs3zz+Z27tizeqVcGCg7ev7kwt3FvDutcWpbatGNuLw5r7W76/OEU8Qr9y6tzi3/8jw+jHc1N/6ZWn+KgDx9nWSHWs3rF83trWHdK9pTe1YQzpYN0Hf7M7xLZtGcbK35dvbU/MAly7feHp4+WBnVzcOHW3/8fHFO3yz9OH5s6q6hsaaeqitbvr/8/cvAPjz95+djaU1IlpZ2GqWGRhRYlie7e5sj4huFaXmDFwciOyc3HrpQckxCdEY61BoyqKmDkrS8qo6mSFpif4ACS7FxkwyIiAqxi9IyIjzjPD3hWhnEjY50kCYjHyRJBhOc1QyAlL9IhDDnEhYFVVkhYX4FEhCPXySvLyjXIvMGJV5EZFHiZAemBIaDxDsWGLCLCEuCAJSktqVuXk5AJCVX6Clq08AANDWAAA="/></svg>'
-            slug: microsoft
-            path: ../../model-coverage/llm/microsoft/index.mdx
-            contents:
-              - page: "phi-2"
-                path: ../../model-coverage/llm/microsoft/phi-2.mdx
-              - page: "Phi-3-mini-4k-instruct"
-                path: ../../model-coverage/llm/microsoft/Phi-3-mini-4k-instruct.mdx
-              - page: "Phi-3-small-8k-instruct"
-                path: ../../model-coverage/llm/microsoft/Phi-3-small-8k-instruct.mdx
-              - page: "Phi-4"
-                path: ../../model-coverage/llm/microsoft/Phi-4.mdx
           - section: "MiniMax AI"
             icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><image width="20" height="20" href="data:image/webp;base64,UklGRtwCAABXRUJQVlA4TNACAAAvE8AEAAEFbdswSvfHn/E0DhH9nwBFdyv0wx40UNQ2khMUW66GP7Z7HxYlkSQ5DQ++f1kRn4JHERJI2vj17/z+xwMwPhKUYSKhKA0ZzIdqdWp+EGJ3Zv/PpJClbZNpO39V9ep1bNs+J/YAsu9iOwM4g8hMNAXrKpe2bRsLvSqYRD1PILWRJEhyZN/z+FM8FDclt7ZtVcvWPp9kuGQUQAuWWkYdtEFKU/Ti7vxyvrt35NDfJYXLElyimrM0fEhNG+7FZdKSZZGGsDwcawD/oMDf+/rRN5Uf+/l+X2SwcDEOCRHAIAawgBg7drpxR2G95o62deYOFh5czAwHYEaVqF91axul9rq23bqN0g577Og5fy0rCQ4zBB04iNLJ3kLGA9dPu6+19Ljrp598Ti7hYiQQAIcGpZBrse/3akG8RdzcmxUlNvcSTtuP2avKT0GgIAAdRB/+v/qWTOqbOEm1BqCRoqNEqxdqfPULLCAkLYT1P/ufVT4XVZaAf6Dv/CUpADO6MH6lZdNKfFWONBmDABgRk4OZmU6mOITLq5NH1aJBSBAmCOPHAegXFTOzguJ0f9qP7CH09aiMU/yhOPlZLXqpPk4at6h8FABwIGnE1IC8JGXVZk9XpTeNUdb0lNkjnDl+Pv0UUoAh6IJDQzRt1F1Pv8nZsvf+Txo3X47c9Mn5ddBMBDEAh66QALch/usc1hV1VWNRvrLxaVWV3cRDAYAgAIRQIJ3rNDdQl9WUP89VT8z4RsQFyxUpAIRElGO2SVX+aETn5OWH1D5asqTq844lXFZdLf7fy/wjAHTRxFQDhm8Svu762U6XN1WFRZHfu12yowO7WN25LwmIQLqCuHS4PNzNCru5/vBe++Zg8bRFvszf/vvd1Fv/1vN7qiAFxEAhnRvxKvSXsx/a/6hFPLuX0B/JvuLl0oMPBYADME8yR8z5v6tF8+AlEhlcZPHQBBg="/></svg>'
             slug: minimax
@@ -281,16 +216,8 @@ navigation:
                 path: ../../model-coverage/llm/mistralai/Devstral-Small-2-24B-Instruct-2512.mdx
               - page: "Ministral-3-3B-Instruct-2512"
                 path: ../../model-coverage/llm/mistralai/Ministral-3-3B-Instruct-2512.mdx
-              - page: "Mistral-7B-v0.1"
-                path: ../../model-coverage/llm/mistralai/Mistral-7B-v0.1.mdx
-              - page: "Mistral-Nemo-Base-2407"
-                path: ../../model-coverage/llm/mistralai/Mistral-Nemo-Base-2407.mdx
               - page: "Mistral-Small-4-119B-2603"
                 path: ../../model-coverage/llm/mistralai/Mistral-Small-4-119B-2603.mdx
-              - page: "Mixtral-8x7B-Instruct-v0.1"
-                path: ../../model-coverage/llm/mistralai/Mixtral-8x7B-Instruct-v0.1.mdx
-              - page: "Mixtral-8x7B-v0.1"
-                path: ../../model-coverage/llm/mistralai/Mixtral-8x7B-v0.1.mdx
           - section: "Moonshot AI"
             icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><image width="20" height="20" href="data:image/webp;base64,UklGRpICAABXRUJQVlA4TIUCAAAvE8AEAA0obNu2TRHI7Ijof0REZQQ+DCaYGQAE4T9cA5G2TeHg/eu8AAJJG/f+nd//9IkBCAA4DsgVAMi0ndmZw2fbtl+cKilfHbtSZyd9OttOOtu2bScXz37vzE7wEw7btg0k2v3ff+KLIbZtJEmiZnfzT3fv6XaoTduAQVPKJRyIr7blfeN7+/v2FvtnOOnwGvvXjlj0NuJtvpPSOCFBXdO3iz+SAGUENnNIOrT1xts9r17H3R8N8DV16Ps3+6hNXQSr5R5fHr+nZTgzNp2MoF7u6Usps/Pi91aI4PHUuoXnTN7v2v6s6hnvsP34heiuN6cvwBrsik/vCx4QK+RMz3fI+z8wJ3mxdVr7tt4T7XGu0Mu+FMn4/m8Y2KVdagNidO+Y6NZLjsxmNqbjrD1RN3sRgAEjCVM/O3xOzpUJbsI/4wW4X8YoUxAm2p8EptcaSiav2DnrOcgTY1q4rtmqACFMHBhsne8Z4vf/o52nLFbumjcX6UaYChBGKJxHwrqjbfdt31wfH4JwchUDAMAwhmMSRjheI7crZ9irl2dz9LaZDToinwnNHGEqSSChhBOJdrVj6Mn1PzRr5gDVLOc+jDAKRSwxeL3sYvrybc23w3F3ggjvt1lkAQBEA0/oxYTQu9qlzZdn+ddHDs461nMBDyHAIabi0omLgpBMm+dFXficGUH4TSLAkLSSN5whHuKfmLvNHmmS417mWqEgwiMWUAuA2ERgQghJjOzaHAIJ/TL3ApIZzxq2MI2fEA4mCpsOxjC3N/JuZ1FYB8MI4D/CBCFs2shkDalx16KqrwAFYRNOJNHEghCI0EEGuyhAzxf7qhlkYGHiEko4UcRAIEQSo1hLARoA"/></svg>'
             slug: moonshotai
@@ -410,8 +337,6 @@ navigation:
                 path: ../../model-coverage/llm/qwen/Qwen3.8-2.4T-A95B.mdx
               - page: "Qwen3.8-Flash-Next"
                 path: ../../model-coverage/llm/qwen/Qwen3.8-Flash-Next.mdx
-              - page: "QwQ-32B"
-                path: ../../model-coverage/llm/qwen/QwQ-32B.mdx
           - section: "Stability AI"
             icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><image width="20" height="20" href="data:image/webp;base64,UklGRrwBAABXRUJQVlA4TLABAAAvE8AEEK/CNrJtJQd3iDwkJKIAqqUSmqAOd3m04biRJEXKmmVyYW1Z/3978D4PmKGnGEaSFKUB//zMP4tfF6e2bRvb/uzv+9XVbKP++X+7/0FQ7WQkJScbAQjowAAFgAAEIKC8f0IqUZ8cu4ufByp51cMa/21spwxl26xf0Xt6yx9+QLn53vYxfvmIelus+uGgh7PWtPCMmYKrfHT18jL7+R26jIrp5UHJZIv9SwkYqjaJxBQxXZi/oXcnWUVV1lu0Kx+1BONH9/3xkX3J6ePOGioPJVJ/XEqU7fhZ5HLSoi9nF9nxWlYF1nf7+kU1pKl9KM2pFc4EZ4I9Qzxh3K+3YhBDeUP3e39AdgBzqkNVM3U+dO1h20BBtewiINa2bbrK84tt2y/mtxknq/9eYhQQ0f8J4AauZm5DPGbCCUWSiXhqIQiHTIgEvD7PnENE0kF/OBoLzThwQqZeywEHMTGqzUalkEWU5H0C5Ivlr9JSBGmXQKsNxt3nPRsLuyc89sajYffjAbvZibKlC53+z9/v+2Cq2zQH6hYCT28vr8+A1aVypMiR+v/3twGsFdMBVws="/></svg>'
             slug: stabilityai
@@ -450,8 +375,6 @@ navigation:
                 path: ../../model-coverage/llm/tiiuae/Falcon-H1-34B-Instruct.mdx
               - page: "Falcon-H1-7B-Instruct"
                 path: ../../model-coverage/llm/tiiuae/Falcon-H1-7B-Instruct.mdx
-              - page: "Falcon3-7B-Instruct"
-                path: ../../model-coverage/llm/tiiuae/Falcon3-7B-Instruct.mdx
           - section: "Upstage"
             icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><image width="20" height="20" href="data:image/webp;base64,UklGRvoBAABXRUJQVlA4TO4BAAAvE8AEEMfjIJIkRcreexbwdv79y2HetgE5kmRXUfZ7yCsn7Svu4QZeiN3XjBpJElKzBF/4t8AbFeRmHUeyrSr3u7vb7uOEQCak/ve4O/e+9wISCwoK5Ek6IR+RD8hzmo0IrB8ruWAknKFpFQ4sQEuvqgY2/vHpMoVDYpgKwZUAL7YSBhBY3soywAAYOchKgBdSDGYhxTrIcIVIiZZYwcWPQsugzwIpZcpecsK32asYBnLGuf8tX/2It8i2d71mNYq1+7Hi6SC7Le82kamKxPADwE8QxYAybIItI8tfplsmVh7iM4CEMMBEDpbA/yIPBZwtXtduOOk3cSH79rM9zpB5f3/Dcvnoc7C+8PHw376Y77fv9fyqz9PHzh4OiLa1HYv6VePsxrZt22ZjO73n+nPdQET/J4BiFS27WIycNtRnoSrR8s3nCiSFGIlEJCHMf7z/LKdJvXR50H5cbUYBVEq/1+xWm+e05zw8JSqAUPU40N/fN9jY1Hs3gyQp0NkaaOlqG20dPVpAS0KNr18Ph0KhUMfJpInUCtabEZ/P5xsOr/7FUsUoeWjf3ztr6Qre7yApFFZeupuDdX6/f+i2DAEU/r1vE2PjTofL4f6aQweE2avP2osaMhamnw53LZGYkaylUGTjtXKLzDUWf7fJEg=="/></svg>'
             slug: upstage
@@ -475,10 +398,6 @@ navigation:
             contents:
               - page: "chatglm3-6b"
                 path: ../../model-coverage/llm/thudm/chatglm3-6b.mdx
-              - page: "glm-4-9b-chat-hf"
-                path: ../../model-coverage/llm/thudm/glm-4-9b-chat-hf.mdx
-              - page: "GLM-4.5-Air"
-                path: ../../model-coverage/llm/thudm/GLM-4.5-Air.mdx
               - page: "GLM-4.7"
                 path: ../../model-coverage/llm/thudm/GLM-4.7.mdx
               - page: "GLM-5"
@@ -516,8 +435,6 @@ navigation:
             slug: google
             path: ../../model-coverage/vlm/google/index.mdx
             contents:
-              - page: "gemma-3-4b-it"
-                path: ../../model-coverage/vlm/google/gemma-3-4b-it.mdx
               - page: "gemma-3n-E4B-it"
                 path: ../../model-coverage/vlm/google/gemma-3n-E4B-it.mdx
               - page: "gemma-4-26B-A4B-it"
@@ -619,8 +536,6 @@ navigation:
             slug: qwen
             path: ../../model-coverage/vlm/qwen/index.mdx
             contents:
-              - page: "Qwen2.5-VL-3B-Instruct"
-                path: ../../model-coverage/vlm/qwen/Qwen2.5-VL-3B-Instruct.mdx
               - page: "Qwen3-VL-235B-A22B-Instruct"
                 path: ../../model-coverage/vlm/qwen/Qwen3-VL-235B-A22B-Instruct.mdx
               - page: "Qwen3-VL-30B-A3B-Instruct"
@@ -689,13 +604,6 @@ navigation:
           - page: "Overview"
             path: ../../model-coverage/omni/index.mdx
             slug: overview
-          - section: "Microsoft"
-            icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><image width="20" height="20" href="data:image/webp;base64,UklGRngDAABXRUJQVlA4TGsDAAAvE8AEEPcHK5Jt10qvQ86gAiMYxRYO+Hs5v7NsOI4kyVGy0cp/R7CDL3ZoDduQI9tWVfW+uGRAKOQ/ZEgi8vXJhlvbtmpl7Xu+u9KAu8S0QBee0QYlWDVkxG4duPu998Rft76AAv5KgEVUM5QBZyjsoQAnwm8RChBEgOMfETmUpgqC0RQwpBIgBAjfJaDQiQaW77it/cjEH+DmLRxTOzbxZrmuBocNM0hBMFRH+r3BSy4B8crxDedj7jnEkFGEFAlOZq6duPxmqlAoBYrIJeAL/zTAIAQECKaAI8ORGg5DgA0bISKHIlHb0YGOEN8li21i2FR/FD25avs53J3ZhhVH6lTr+3d63tkd3m9eD//PZ/m39/rwvXPUXCOXjALE8IXt0ev/tnIzHaESoPxG7XGW3TfTEyXACmKxqCKw4dqi08/8birXrnQArkQJdKAAVyDBKRD+GjKASIFVpCx8SKqhIgGOLArSmIEpMc3cEJfFdE5TdRa/e1dWF8tsvv7a7Lk9nEo/+4c+6keBhAgnCFDAFw3BUIQQIEglJESJRCWqQEAwh18x0ym7RPbCA1yzL80pf4DLtMWXxXQiIfGTKEMBCmIoJBB87sLm2O6p1lRBqaRGGFO1y3rj21tyKxfLkO5/x73X0++kQeK2bcef2Lbt/Wbbtm3btu1l2zUz17J+ebnlWraP48e/4Xki+q8waQPGjmOOHZybAoBDMx2fHjx6/BAQ7h+f3rd99x7EXcuaP7+8cPrsmYs3zz+Z27tizeqVcGCg7ev7kwt3FvDutcWpbatGNuLw5r7W76/OEU8Qr9y6tzi3/8jw+jHc1N/6ZWn+KgDx9nWSHWs3rF83trWHdK9pTe1YQzpYN0Hf7M7xLZtGcbK35dvbU/MAly7feHp4+WBnVzcOHW3/8fHFO3yz9OH5s6q6hsaaeqitbvr/8/cvAPjz95+djaU1IlpZ2GqWGRhRYlie7e5sj4huFaXmDFwciOyc3HrpQckxCdEY61BoyqKmDkrS8qo6mSFpif4ACS7FxkwyIiAqxi9IyIjzjPD3hWhnEjY50kCYjHyRJBhOc1QyAlL9IhDDnEhYFVVkhYX4FEhCPXySvLyjXIvMGJV5EZFHiZAemBIaDxDsWGLCLCEuCAJSktqVuXk5AJCVX6Clq08AANDWAAA="/></svg>'
-            slug: microsoft
-            path: ../../model-coverage/omni/microsoft/index.mdx
-            contents:
-              - page: "Phi-4-multimodal-instruct"
-                path: ../../model-coverage/omni/microsoft/Phi-4-multimodal-instruct.mdx
           - section: "NVIDIA"
             icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><image width="20" height="20" href="data:image/webp;base64,UklGRiACAABXRUJQVlA4TBQCAAAvE8AEAJfkqI0kScqsnnueQ2QZLH9Ic1QGDceR5MbNLgSAsv10OA7C+Qeim8A6biRJkapheX/rypp9PpxBzHc9VPMfiAVCIJABEUgEAFGRTCEIOnlLIUJUS+dtd19/MxO62rPJDFRIVUaTDgjy/NDNd96lkr4+MjNAJmQWmT+gkRrUUIr+oTOR6IIGgYBChasQGgCpoousYIAhCiAUDZAgAqsBJJC6kgBRRGaVElbSs4iCir7zKg9hWR9PUfZtN+qiZXgKKfkeYAIFCL4L/D+Y3JliW0dl6njP1jEYiylT52chCgPaZrtnbavZ1f+3W8fg+m5MMUdncrdkrwhALNmbwwjKFNvo2czkrkimEM3sZore8Z4t2ZvcmWJyN7mb3JmiTJnCFEv2RPj50YhBuVgsw1Z9nACibdumm/1wYttOldpGUtupbdu29cuNvyCi/xOAVGckEblYGCnilwKmptZgdc2nG1wUGLzZLc39I0OjjZBE4DlXgz8nM9fR1jdYEYmDvddZ780oqrUMh8sjgZO1BwrTB4Jp3b7OUBQexo5AcX5eidXWVRcFAuizCkrLvnrCYyESR/pv/q36+/mu9ICJoJhf0upUa+rVZWiwIAcgxOTm0cH98+H53snVxcr6O0QQ4u12+nh/52P7dHzj7Hp3S8myhJmJuamXx8Wnm8vp14fZuwWwSDBLLJGQJaGQiEgYIVUB"/></svg>'
             slug: nvidia

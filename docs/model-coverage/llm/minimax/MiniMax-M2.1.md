@@ -26,6 +26,8 @@ uv run torchrun --nnodes 8 --nproc-per-node 8 \
 
 ## Model Context
 
+MiniMax-M2.1 is used for text generation (moe). Its model size is 229B total / 10B active parameters.
+
 | Property | Value |
 |---|---|
 | **Task** | Text Generation (MoE) |

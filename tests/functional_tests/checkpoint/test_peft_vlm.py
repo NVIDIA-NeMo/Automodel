@@ -646,7 +646,9 @@ def test_hf_peft_checkpoint():
     }
 
     script_path = Path(__file__).parent.resolve()
-    cfg = parse_args_and_load_config(script_path / "gemma3" / "gemma3_vl_4b_cord_v2_peft.yaml")
+    cfg = parse_args_and_load_config(
+        script_path.parent / "hf_transformer_vlm" / "configs" / "gemma3_vl_4b_cord_v2_peft.yaml"
+    )
     trainer = FinetuneRecipeForVLM(cfg)
     trainer.setup()
     trainer.run_train_validation_loop()

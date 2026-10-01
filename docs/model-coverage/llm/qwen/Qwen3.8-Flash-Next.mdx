@@ -30,6 +30,8 @@ uv run torchrun --nnodes 8 --nproc-per-node 8 \
 
 ## Model Context
 
+Qwen3.8-Flash-Next is used for text generation (moe, hybrid attention, engram n-gram embedding). Its model size is 125B backbone with 6B activated per token, plus the 51.2B Engram table; the checkpoint's 4B MTP head is not loaded parameters.
+
 | Property | Value |
 |---|---|
 | **Task** | Text generation (MoE, hybrid attention, Engram N-gram Embedding) |
