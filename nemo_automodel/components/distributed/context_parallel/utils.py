@@ -556,6 +556,10 @@ def _resolve_cp_sharder(
             )
             layout = None
             if local_indices is not None:
+                # Model-owned THD consumers need the exact partition applied to
+                # input_ids. Keep that map with the local batch while ShardLayout
+                # exposes the same tensor through the generic token verbs.
+                prepped["_thd_local_indices"] = local_indices
                 layout = ShardLayout(
                     local_token_global_indices=local_indices,
                     padded_seq_len=row_shape[0] * row_shape[1] if row_shape is not None else None,
@@ -873,3 +877,6 @@ def _shard_thd_chunk_for_te(
         ).contiguous()
 
     return output_batch, local_indices
+
+
+__all__ = ["attach_te_context_parallel"]

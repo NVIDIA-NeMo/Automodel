@@ -1979,7 +1979,9 @@ def get_flops_formula_for_hf_config(config: Any) -> Callable | None:
         config: HuggingFace model config object
 
     Returns:
-        The appropriate FLOPs formula function, or None if model type is not supported
+        The appropriate FLOPs formula function, or None for an unregistered
+        composite config. Pass its text config explicitly when only text-backbone
+        FLOPs are intended.
     """
     # Get config class name
     config_class_name = config.__class__.__name__
@@ -2057,6 +2059,9 @@ def get_flops_formula_for_hf_config(config: Any) -> Callable | None:
 
     # If no exact match, try to match by model_type as fallback
     if formula is None:
+        get_text_config = getattr(config, "get_text_config", None)
+        if callable(get_text_config) and get_text_config() is not config:
+            return None
         formula = transformer_flops
 
     return formula

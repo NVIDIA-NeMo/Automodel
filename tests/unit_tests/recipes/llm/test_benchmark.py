@@ -12,15 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import pathlib
 import types
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 import yaml
+from transformers import LlamaConfig, PretrainedConfig
 
+from nemo_automodel.components.utils.flops_utils import llama2_flops
 from nemo_automodel.recipes.llm.benchmark import BenchmarkingRecipeForNextTokenPrediction, _infer_vocab_size, main
 
 
@@ -176,6 +178,20 @@ class TestBenchmarkingRecipeInitialization:
             assert recipe._bench_nsys_ranks == []  # from benchmark.nsys_ranks
             assert recipe._bench_seq_len == 2048  # from dataset.seq_len
 
+    @pytest.mark.parametrize("scope", ["model", "text"])
+    def test_init_accepts_flops_scope(self, mock_config: ConfigNamespace, scope: str) -> None:
+        mock_config.benchmark.flops_scope = scope
+        with patch("nemo_automodel.recipes.llm.benchmark.TrainFinetuneRecipeForNextTokenPrediction.__init__"):
+            recipe = BenchmarkingRecipeForNextTokenPrediction(mock_config)
+        assert recipe._bench_flops_scope == scope
+
+    def test_init_rejects_invalid_flops_scope(self, mock_config: ConfigNamespace) -> None:
+        mock_config.benchmark.flops_scope = "vision"
+        with patch("nemo_automodel.recipes.llm.benchmark.TrainFinetuneRecipeForNextTokenPrediction.__init__") as parent:
+            with pytest.raises(ValueError, match="benchmark.flops_scope must be"):
+                BenchmarkingRecipeForNextTokenPrediction(mock_config)
+        parent.assert_not_called()
+
     def test_init_infers_max_steps_from_step_scheduler(self, mock_config):
         """Test that max_steps is inferred from step_scheduler."""
         with patch("nemo_automodel.recipes.llm.benchmark.TrainFinetuneRecipeForNextTokenPrediction.__init__"):
@@ -197,7 +213,7 @@ class TestBenchmarkingRecipeInitialization:
     def test_super35_recipe_uses_supported_shared_ci_inputs(self):
         """The Super 3.5 benchmark must keep its shared CI inputs within backend limits."""
         config_path = (
-            pathlib.Path(__file__).resolve().parents[4]
+            Path(__file__).resolve().parents[4]
             / "examples"
             / "llm_benchmark"
             / "nemotron"
@@ -205,10 +221,12 @@ class TestBenchmarkingRecipeInitialization:
         )
         config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
 
+        assert config["model"]["config"]["_target_"] == "nemo_automodel.NeMoAutoConfig.from_pretrained"
         assert config["model"]["config"]["pretrained_model_name_or_path"] == (
             "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"
         )
         assert config["ci"]["cluster_tag"] == "gb200"
+        assert "known_issue_id" not in config["ci"]
         assert config["ci"]["env_vars"]["CUDA_VISIBLE_DEVICES"] == "0,1,2,3"
         assert config["step_scheduler"]["local_batch_size"] == 2
 
@@ -325,6 +343,32 @@ class TestBenchmarkingRecipeInitialization:
 @pytest.mark.usefixtures("patch_torch_distributed_for_benchmark")
 class TestBenchmarkingRecipeSetup:
     """Test setup method of BenchmarkingRecipeForNextTokenPrediction."""
+
+    @pytest.mark.parametrize("scope", ["model", "text"])
+    def test_setup_requires_explicit_text_scope_for_composite(
+        self, mock_recipe: BenchmarkingRecipeForNextTokenPrediction, scope: str
+    ) -> None:
+        text = LlamaConfig(
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            vocab_size=256,
+        )
+        mock_recipe.model_parts[0].config = PretrainedConfig(text_config=text)
+        mock_recipe._bench_flops_scope = scope
+        with (
+            patch("nemo_automodel.recipes.llm.benchmark.TrainFinetuneRecipeForNextTokenPrediction.setup"),
+            patch.object(mock_recipe, "_mtp_tflops", return_value=0.0),
+        ):
+            if scope == "model":
+                with pytest.raises(ValueError, match="No FLOPs formula.*flops_scope='model'"):
+                    mock_recipe.setup()
+            else:
+                mock_recipe.setup()
+                expected = llama2_flops(text, gbs=256, seq_len=2048) / 1e12
+                assert mock_recipe.tflops == pytest.approx(expected)
 
     @patch("nemo_automodel.recipes.llm.benchmark.get_flops_formula_for_hf_config")
     def test_setup_clears_val_dataloader(self, mock_get_flops, mock_recipe):
@@ -738,10 +782,14 @@ class TestBenchmarkingRecipeJSONOutput:
 
             assert recipe._bench_json_output_path is None
 
-    def test_log_benchmark_summary_creates_json_file(self, mock_recipe, tmp_path):
+    @pytest.mark.parametrize("scope", ["model", "text"])
+    def test_log_benchmark_summary_creates_json_file(
+        self, mock_recipe: BenchmarkingRecipeForNextTokenPrediction, tmp_path: Path, scope: str
+    ) -> None:
         """Test that benchmark summary is written to JSON file."""
         json_file = tmp_path / "benchmark_summary.json"
         mock_recipe._bench_json_output_path = str(json_file)
+        mock_recipe._bench_flops_scope = scope
 
         # Mock timers
         mock_timer = MagicMock()
@@ -764,6 +812,7 @@ class TestBenchmarkingRecipeJSONOutput:
         with open(json_file) as f:
             summary_data = json.load(f)
 
+        assert summary_data["flops_scope"] == scope
         assert summary_data["total_steps"] == 30
         assert summary_data["warmup_steps"] == 10
         assert summary_data["training_steps"] == 20
@@ -799,10 +848,18 @@ class TestBenchmarkingRecipeJSONOutput:
 class TestBenchmarkingRecipeSummaryData:
     """Test benchmark summary data structure and WandB logging."""
 
+    @pytest.mark.parametrize("scope", ["model", "text"])
     @patch("wandb.log")
     @patch("wandb.Table")
-    def test_summary_wandb_table_structure(self, mock_table_class, mock_wandb_log, mock_recipe):
-        """Test that wandb table is created with correct structure."""
+    def test_summary_wandb_table_structure(
+        self,
+        mock_table_class: MagicMock,
+        mock_wandb_log: MagicMock,
+        mock_recipe: BenchmarkingRecipeForNextTokenPrediction,
+        scope: str,
+    ) -> None:
+        """Test that wandb table identifies the selected FLOPs scope."""
+        mock_recipe._bench_flops_scope = scope
         mock_recipe.wandb_run = MagicMock()
         mock_table_instance = MagicMock()
         mock_table_class.return_value = mock_table_instance
@@ -831,15 +888,20 @@ class TestBenchmarkingRecipeSummaryData:
         assert "Total Steps" in metric_names
         assert "Warmup Steps" in metric_names
         assert "Training Steps" in metric_names
-        assert "Avg MFU (%)" in metric_names
+        expected_mfu_label = "Avg MFU (%)" if scope == "model" else "Avg text-backbone MFU (%)"
+        assert expected_mfu_label in metric_names
         assert "TFLOPs/GPU/s" in metric_names
         assert "World Size" in metric_names
         assert "Global Batch Size" in metric_names
         assert "Sequence Length" in metric_names
 
+    @pytest.mark.parametrize("scope", ["model", "text"])
     @patch("wandb.log")
-    def test_summary_wandb_scalar_metrics(self, mock_wandb_log, mock_recipe):
-        """Test that scalar metrics are logged to wandb."""
+    def test_summary_wandb_scalar_metrics(
+        self, mock_wandb_log: MagicMock, mock_recipe: BenchmarkingRecipeForNextTokenPrediction, scope: str
+    ) -> None:
+        """Test that scalar metrics retain their FLOPs scope in W&B."""
+        mock_recipe._bench_flops_scope = scope
         mock_recipe.wandb_run = MagicMock()
 
         # Mock timers
@@ -869,6 +931,7 @@ class TestBenchmarkingRecipeSummaryData:
         scalar_metrics = scalar_call[0][0]
         assert "summary/avg_iter_time_seconds" in scalar_metrics
         assert "summary/avg_mfu_percent" in scalar_metrics
+        assert scalar_metrics["summary/flops_scope"] == scope
         assert "summary/training_time_seconds" in scalar_metrics
         assert "summary/tflops_per_gpu" in scalar_metrics
 

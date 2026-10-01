@@ -99,7 +99,7 @@ from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 from .cp_attention import attach_gemma4_cp_ring_attention, gemma4_vision_group_ids
 from .cp_batch import make_contiguous_aux_only_shard_cp_batch_and_ctx
-from .parallelization import register_gemma4_parallel_strategy
+from .parallelization import PARALLELIZER
 from .sdpa_fp32 import enable_gemma4_sdpa_fp32
 
 
@@ -1690,5 +1690,5 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
 
 
 if _GEMMA4_HF_AVAILABLE:
-    register_gemma4_parallel_strategy()
+    Gemma4ForConditionalGeneration.parallelizer = PARALLELIZER
     ModelClass = Gemma4ForConditionalGeneration

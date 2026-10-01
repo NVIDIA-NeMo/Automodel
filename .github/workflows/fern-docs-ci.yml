@@ -36,6 +36,9 @@ on:
 permissions:
   contents: read
 
+env:
+  FERN_NO_VERSION_REDIRECTION: "true"
+
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -62,6 +65,9 @@ jobs:
 
       - name: Generate model coverage tables
         run: python3 tests/ci_tests/utils/sync_model_coverage_tables.py
+
+      - name: Apply Fern code styles
+        run: python3 tools/apply_fern_code_styles.py
 
       - name: Validate MDX syntax
         run: |
