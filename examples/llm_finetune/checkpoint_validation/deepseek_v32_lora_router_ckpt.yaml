@@ -1,0 +1,139 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+
+# Temporary full-model native-checkpoint validation for PR #4076.
+# Uses real pretrained weights and routing with the recipe's adapter targets.
+# Scope: train/save, AutoModel reload, and optimizer resume across fresh processes.
+# Vanilla-HF parity is a separate contract and is not exercised by this scoped run.
+# The harness saves after step 2, continues to step 5, then resumes from step 2
+# and compares model/optimizer/buffer state and the same three subsequent steps.
+# 16 nodes x 8 H100, PP4/EP32; hard limit 90 minutes per case.
+# Derived from: examples/llm_benchmark/deepseek/dsv32_lora.yaml
+# Run: automodel examples/llm_finetune/checkpoint_validation/deepseek_v32_lora_router_ckpt.yaml --nproc-per-node 8
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
+seed: 1234
+step_scheduler:
+  gc_every_steps: 10
+  global_batch_size: 512
+  local_batch_size: 4
+  ckpt_every_steps: 2
+  val_every_steps: 1000
+  num_epochs: 1
+  max_steps: 2
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 4
+  ep_size: 32
+  sequence_parallel: false
+  activation_checkpointing: true
+  pipeline:
+    pp_schedule: interleaved1f1b
+    pp_microbatch_size: 1
+    round_virtual_stages_to_pp_multiple: down
+    scale_grads_in_schedule: false
+    patch_inner_model: false
+    patch_causal_lm_model: false
+    layers_per_stage: 2
+  moe:
+    reshard_after_forward: false
+    wrap_outer_model: false
+dist_env:
+  backend: nccl
+  timeout_minutes: 10
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  config:
+    _target_: nemo_automodel.components.models.deepseek_v32.config.DeepseekV32Config.from_pretrained
+    pretrained_model_name_or_path: deepseek-ai/DeepSeek-V3.2
+    name_or_path: deepseek-ai/DeepSeek-V3.2
+  # Adapter checkpoints omit router buffers; keep the pretrained correction bias fixed.
+  moe_overrides:
+    gate_bias_update_factor: 0.0
+    force_e_score_correction_bias: true
+  trust_remote_code: true
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: te
+    linear: te
+    rms_norm: te
+    rope_fusion: false
+    experts: torch_mm
+    dispatcher: hybridep  # DeepEP times out in multi-node EP32 CI.
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+  load_base_model: true
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  target_modules: ['*']
+  dim: 32
+  alpha: 32
+  dropout: 0.0
+  moe_rank_scaling: true
+checkpoint:
+  enabled: true
+  dequantize_base_checkpoint: true
+  model_save_format: safetensors
+  save_consolidated: true
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+  fp32_upcast: false
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  path_or_dataset: rowan/hellaswag
+  split: train
+
+  num_samples_limit: 4096
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+    pad_seq_len_divisible: 160
+  shuffle: true
+  drop_last: true
+
+optimizer:
+  _target_: torch.optim.Adam
+  betas: [0.9, 0.999]
+  eps: 1e-8
+  lr: 0.0001
+  weight_decay: 0
+
+ci:
+  nodes: 16
+  time: "01:30:00"
+  env_vars:
+    HF_HUB_OFFLINE: '0'
+    CHECKPOINT_ROBUSTNESS_PHASES: train_and_save automodel_reload resume
+    REQUIRE_FINITE_METRICS: 'true'
+  release:
+    step_scheduler.max_steps: 2
+    step_scheduler.ckpt_every_steps: 2
+    step_scheduler.val_every_steps: 1000
+  checkpoint_robustness:
+    step_scheduler.max_steps: 2
+    step_scheduler.ckpt_every_steps: 2
+    step_scheduler.val_every_steps: 1000
+    step_scheduler.global_batch_size: 512
+    step_scheduler.local_batch_size: 4
+    peft.use_triton: false
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  path_or_dataset: rowan/hellaswag
+  split: validation
+  num_samples_limit: 64
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+    pad_seq_len_divisible: 160
+  batch_size: 8
+  drop_last: true
+
+packed_sequence:
+  packed_sequence_size: 0
+  split_across_pack: false
+

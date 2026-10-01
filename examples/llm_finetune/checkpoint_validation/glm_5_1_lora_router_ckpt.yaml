@@ -1,0 +1,144 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+
+# Temporary full-model native-checkpoint validation for PR #4076.
+# Uses real pretrained weights and routing with the recipe's adapter targets.
+# Scope: train/save, AutoModel reload, and optimizer resume across fresh processes.
+# Vanilla-HF parity is a separate contract and is not exercised by this scoped run.
+# The harness saves after step 2, continues to step 5, then resumes from step 2
+# and compares model/optimizer/buffer state and the same three subsequent steps.
+# 16 nodes x 8 H100, PP4/EP32; hard limit 90 minutes per case.
+# Derived from: examples/llm_finetune/glm/glm_5.1_lora.yaml
+# Run: automodel examples/llm_finetune/checkpoint_validation/glm_5_1_lora_router_ckpt.yaml --nproc-per-node 8
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
+step_scheduler:
+  global_batch_size: 512
+  local_batch_size: 8
+  ckpt_every_steps: 2
+  val_every_steps: 1000
+  max_steps: 2
+
+  num_epochs: 1
+dist_env:
+  backend: nccl
+  timeout_minutes: 10
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1111
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: zai-org/GLM-5.1
+  # Adapter checkpoints omit router buffers; keep the pretrained correction bias fixed.
+  moe_overrides:
+    gate_bias_update_factor: 0.0
+    force_e_score_correction_bias: true
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: sdpa
+    linear: torch
+    rms_norm: torch_fp32
+    rope_fusion: false
+    dispatcher: hybridep
+    experts: torch_mm
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  match_all_linear: true
+  dim: 8
+  alpha: 32
+  use_triton: true
+
+checkpoint:
+  enabled: true
+
+  dequantize_base_checkpoint: true
+  model_save_format: safetensors
+  save_consolidated: true
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 4
+  ep_size: 32
+
+  sequence_parallel: false
+
+  pipeline:
+    pp_schedule: interleaved1f1b
+    pp_microbatch_size: 1
+    round_virtual_stages_to_pp_multiple: up
+    scale_grads_in_schedule: false
+    patch_inner_model: false
+    patch_causal_lm_model: false
+    layers_per_stage: 2
+
+  moe:
+    wrap_outer_model: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  path_or_dataset: rowan/hellaswag
+  split: train
+
+  num_samples_limit: 4096
+packed_sequence:
+  packed_sequence_size: 0
+  split_across_pack: false
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+    pad_seq_len_divisible: 160
+  shuffle: true
+  drop_last: true
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  path_or_dataset: rowan/hellaswag
+  split: validation
+  num_samples_limit: 64
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+    pad_seq_len_divisible: 160
+  batch_size: 8
+  drop_last: true
+
+optimizer:
+  _target_: torch.optim.Adam
+  betas: [0.9, 0.999]
+  eps: 1e-8
+  lr: 1.0e-5
+  weight_decay: 0.0
+
+ci:
+  # pp_size(4) * ep_size(32) = 128 GPUs => 16 nodes (8 H100/node).
+  nodes: 16
+  time: "01:30:00"
+  env_vars:
+    HF_HUB_OFFLINE: '0'
+    CHECKPOINT_ROBUSTNESS_PHASES: train_and_save automodel_reload resume
+    REQUIRE_FINITE_METRICS: 'true'
+  release:
+    step_scheduler.max_steps: 2
+    step_scheduler.ckpt_every_steps: 2
+    step_scheduler.val_every_steps: 1000
+  checkpoint_robustness:
+    step_scheduler.max_steps: 2
+    step_scheduler.ckpt_every_steps: 2
+    step_scheduler.val_every_steps: 1000
+    step_scheduler.global_batch_size: 512
+    step_scheduler.local_batch_size: 8
+    peft.use_triton: true
