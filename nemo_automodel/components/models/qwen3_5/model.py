@@ -23,7 +23,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
+from transformers.modeling_outputs import BaseModelOutputWithPast, BaseModelOutputWithPooling, CausalLMOutputWithPast
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config, Qwen3_5TextConfig
 from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5DecoderLayer,
@@ -37,6 +37,7 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
 from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5Model as HFQwen3_5Model,
 )
+from transformers.vision_utils import get_vision_cu_seqlens
 
 from nemo_automodel.components.distributed.context_parallel.sharder import (
     ContextParallelSharder,
@@ -585,6 +586,34 @@ class Qwen3_5Model(HFQwen3_5Model):
     @property
     def norm(self):
         return self.language_model.norm
+
+    def get_image_features(
+        self,
+        pixel_values: torch.Tensor,
+        image_grid_thw: torch.Tensor | None = None,
+        **kwargs: Any,
+    ) -> tuple | BaseModelOutputWithPooling:
+        """Encode image patches, keeping SDPA segment lengths on the host.
+
+        Args:
+            pixel_values: Tensor of shape [patches, patch_features], in image order.
+            image_grid_thw: Integer tensor of shape [images, 3], with temporal,
+                height, and width grid sizes in that order.
+            **kwargs: Additional Hugging Face vision-forward arguments.
+
+        Returns:
+            Vision output whose ``last_hidden_state`` has shape [patches, hidden]
+            and whose ``pooler_output`` contains one tensor of shape
+            [image_tokens, hidden] per image, or the equivalent tuple when
+            ``return_dict=False``. The return contract matches the HF method.
+        """
+        if self.visual.config._attn_implementation == "sdpa" and image_grid_thw is not None:
+            # HF's SDPA vision attention calls lengths.tolist() separately for Q,
+            # K, and V in every block. A single CPU grid mirror lets all blocks
+            # consume host cu_seqlens without repeating the device-to-host copy.
+            grid_cpu = image_grid_thw.detach().to(device="cpu")
+            kwargs["cu_seqlens"] = get_vision_cu_seqlens(grid_cpu)
+        return super().get_image_features(pixel_values, image_grid_thw, **kwargs)
 
     def forward(
         self,
