@@ -1,0 +1,90 @@
+---
+title: "HunyuanImage-3.0"
+description: "Fine-tune the HunyuanImage-3.0 80B MoE text-to-image model with NeMo AutoModel using expert parallelism, with full-parameter and LoRA flow-matching recipes."
+slug: model-coverage/diffusion/tencent/HunyuanImage-3.0
+---
+
+[HunyuanImage-3.0](https://huggingface.co/tencent/HunyuanImage-3.0) is Tencent's unified autoregressive text-to-image model. NeMo AutoModel supports full-parameter and LoRA fine-tuning of HunyuanImage-3.0 with expert parallelism.
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+|---|---|
+| **Task** | Text-to-Image |
+| **Architecture** | Mixture-of-Experts decoder (Flow Matching) |
+| **Parameters** | 80B total, 13B active |
+| **HF Org** | [tencent](https://huggingface.co/tencent) |
+
+## Available Models
+
+- [`tencent/HunyuanImage-3.0`](https://huggingface.co/tencent/HunyuanImage-3.0)
+
+## Recipes
+
+| Recipe | Description |
+|---|---|
+| [hunyuan_image3_t2i_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/hunyuan_image3_t2i_flow.yaml) | Full fine-tune on 4 nodes with expert parallelism and FSDP2 |
+| [hunyuan_image3_t2i_flow_lora.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/hunyuan_image3_t2i_flow_lora.yaml) | LoRA fine-tune on one node with expert parallelism |
+| [generate_hunyuan_image3.py](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/generate/generate_hunyuan_image3.py) | Generate images with the base model or a training checkpoint |
+
+## Overview
+
+HunyuanImage-3.0 is a single Mixture-of-Experts transformer that generates both text and images. It has 32 layers, each with 64 routed experts (8 active per token) and one shared expert. To generate an image, the model embeds noisy VAE latents into image slots of the prompt's token sequence. It runs the sequence with causal attention for text and bidirectional attention inside the image block, then decodes the image slots into a flow-matching velocity.
+
+NeMo AutoModel implements the MoE backbone natively, so the diffusion recipe shards the experts with expert parallelism (`fsdp.ep_size`) and the rest of the model with FSDP2. The image-side modules (VAE, patch embedding, final layer, timestep embedders) are built from the checkpoint's own remote code at runtime. Their numerics therefore match the release.
+
+The native model matches the release implementation: next-token logits have a mean KL divergence of about 6e-5 (top-1 agreement 100%), and image velocity predictions have a cosine similarity of 0.99999 under 8-way expert parallelism in bf16.
+
+## Prepare the Dataset
+
+Cache VAE latents and the tokenized conditional and unconditional prompt sequences with the `hunyuan_image3` processor:
+
+```bash
+uv run python -m tools.diffusion.preprocessing_multiprocess image \
+  --dataset_name lambdalabs/naruto-blip-captions \
+  --dataset_media_column image --dataset_caption_column text \
+  --processor hunyuan_image3 \
+  --model_name tencent/HunyuanImage-3.0 \
+  --resolution_preset 1024p \
+  --output_dir /cache/naruto-hunyuan-image3
+```
+
+## Fine-Tune HunyuanImage-3.0
+
+Set `data.dataloader.cache_dir` and `checkpoint.checkpoint_dir`. LoRA fits on one 8x H100 80 GB node:
+
+```bash
+uv run torchrun --nproc-per-node=8 \
+  examples/diffusion/finetune/finetune.py \
+  -c examples/diffusion/finetune/hunyuan_image3_t2i_flow_lora.yaml
+```
+
+The full fine-tune keeps fp32 master weights and Adam state for 80B parameters, so it needs 4 nodes (32 GPUs, two experts per GPU). Launch one `torchrun` per node with `--nnodes=4`:
+
+```bash
+uv run torchrun --nnodes=4 --node-rank=$NODE_RANK --nproc-per-node=8 \
+  --master-addr=$MASTER_ADDR --master-port=29500 \
+  examples/diffusion/finetune/finetune.py \
+  -c examples/diffusion/finetune/hunyuan_image3_t2i_flow.yaml
+```
+
+The `hunyuan_image3` adapter runs each sample as its own model call. Every rank therefore issues the same number of forward calls, which keeps the expert-parallel collectives aligned. At 1024x1024, LoRA on 8x H100 80 GB with a global batch of 16 runs at about 4.3 s per step and uses about 33 GB per GPU. The full fine-tune on 32x H100 80 GB with a global batch of 32 runs at about 3.8 s per step and uses about 44 GB per GPU. A full checkpoint with optimizer state is about 1 TB, so both recipes save only every `ckpt_every_steps` steps, not at every epoch.
+
+## Generate Images
+
+Generation runs the native model with expert parallelism across the GPUs of one node, with the release's classifier-free guidance and sampler:
+
+```bash
+uv run torchrun --nproc-per-node=8 examples/diffusion/generate/generate_hunyuan_image3.py \
+  --model /path/to/HunyuanImage-3.0 \
+  --prompts "a robot playing guitar" \
+  --output-dir outputs/hunyuan_image3
+```
+
+Pass `--peft-checkpoint <checkpoint_dir>/epoch_X_step_Y` to apply a LoRA checkpoint, or `--weights <checkpoint_dir>/epoch_X_step_Y/model/consolidated` to load full fine-tune weights.
+
+## Related Resources
+
+- [Diffusion fine-tuning guide](/recipes-e2e-examples/diffusion-fine-tuning)
