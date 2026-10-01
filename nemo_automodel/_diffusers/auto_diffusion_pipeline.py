@@ -564,10 +564,20 @@ def build_native_transformer(
     if isinstance(backend, dict):
         backend = BackendConfig(**backend)
     model_kwargs = {"backend": backend} if backend is not None else {}
+    distributed_setup = None
+    if mesh_context is not None:
+        # The model infrastructure (sharding, meta-device materialization, checkpoint loading) is only built when
+        # the setup carries a strategy, so lift the MeshContext policy onto the DistributedSetup.
+        distributed_setup = DistributedSetup(
+            mesh_context=mesh_context,
+            strategy_config=mesh_context.strategy_config,
+            moe_parallel_config=mesh_context.moe_parallel_config,
+            activation_checkpointing=mesh_context.activation_checkpointing,
+        )
     logger.info("[INFO] Building native transformer %s from %s", config.architectures[0], config_dir)
     return NeMoAutoModelForCausalLM.from_config(
         config,
-        distributed_setup=DistributedSetup(mesh_context=mesh_context) if mesh_context is not None else None,
+        distributed_setup=distributed_setup,
         load_base_model=load_base_model,
         torch_dtype=torch_dtype,
         trust_remote_code=False,
