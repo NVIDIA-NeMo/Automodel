@@ -57,6 +57,51 @@ if TYPE_CHECKING:
     from nemo_automodel.components.models.mistral3.model import Ministral3ForCausalLM
 
 
+def is_nemotron_flash_config(config) -> bool:
+    """Return whether a Transformers config identifies Nemotron-Flash."""
+    if config is None:
+        return False
+    if getattr(config, "model_type", None) == "nemotron_flash":
+        return True
+    if "NemotronFlashForCausalLM" in (getattr(config, "architectures", None) or ()):
+        return True
+    return "nemotron-flash" in (getattr(config, "name_or_path", "") or "").lower()
+
+
+def validate_nemotron_nas_tp_mesh(model, tp_size: int) -> None:
+    """Validate the heterogeneous attention layout of a Nemotron-NAS model."""
+    config = model.config
+    if config.num_attention_heads % tp_size:
+        raise ValueError("num_attention_heads in config does not match the TP size")
+    if len(config.block_configs) < config.num_hidden_layers:
+        raise ValueError("num_hidden_layers in config does not match the number of block configs")
+
+    for index, block in enumerate(config.block_configs[: config.num_hidden_layers]):
+        attention = block.attention
+        if attention.replace_with_linear:
+            continue
+        if attention.n_heads_in_group is not None:
+            num_key_value_heads = config.num_attention_heads // attention.n_heads_in_group
+            if num_key_value_heads % tp_size:
+                raise ValueError(f"layer {index}: num_key_value_heads in config does not match the TP size")
+        elif not attention.no_op:
+            raise ValueError(f"layer {index}: attention must define grouped heads, a linear replacement, or no_op")
+
+
+def validate_optimized_tp_mesh(model, tp_size: int) -> bool:
+    """Run a model-plan-specific TP validator, returning whether one matched."""
+    config = getattr(model, "config", None)
+    architectures = getattr(config, "architectures", None) or ()
+    if (
+        architectures
+        and architectures[0] == "DeciLMForCausalLM"
+        and getattr(config, "model_type", None) == "nemotron-nas"
+    ):
+        validate_nemotron_nas_tp_mesh(model, tp_size)
+        return True
+    return False
+
+
 class SequenceParallelAllGatherActivation(SequenceParallel):
     """SequenceParallel that all-gathers activations for sequence parallelism."""
 

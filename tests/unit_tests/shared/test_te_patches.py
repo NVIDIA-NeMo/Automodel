@@ -14,10 +14,12 @@
 
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 
 import nemo_automodel.shared.te_patches as te_patches_module
 from nemo_automodel.shared.te_patches import (
+    _apply_fused_adam_empty_shard_patch,
     _apply_fused_adam_quantized_tensor_patch,
     apply_te_patches,
 )
@@ -77,21 +79,112 @@ class TestApplyTePatchesIdempotent:
         te_patches_module._TE_PATCHES_APPLIED = False
 
     @patch.object(te_patches_module, "_apply_fused_adam_quantized_tensor_patch")
-    def test_apply_te_patches_calls_fused_adam_patch(self, mock_patch_fn):
+    @patch.object(te_patches_module, "_apply_fused_adam_empty_shard_patch")
+    def test_apply_te_patches_calls_fused_adam_patch(self, mock_empty_patch, mock_patch_fn):
         apply_te_patches()
         mock_patch_fn.assert_called_once()
+        mock_empty_patch.assert_called_once()
 
     @patch.object(te_patches_module, "_apply_fused_adam_quantized_tensor_patch")
-    def test_apply_te_patches_idempotent(self, mock_patch_fn):
+    @patch.object(te_patches_module, "_apply_fused_adam_empty_shard_patch")
+    def test_apply_te_patches_idempotent(self, mock_empty_patch, mock_patch_fn):
         apply_te_patches()
         apply_te_patches()
         mock_patch_fn.assert_called_once()
+        mock_empty_patch.assert_called_once()
 
     @patch.object(te_patches_module, "_apply_fused_adam_quantized_tensor_patch")
-    def test_apply_te_patches_sets_flag(self, mock_patch_fn):
+    @patch.object(te_patches_module, "_apply_fused_adam_empty_shard_patch")
+    def test_apply_te_patches_sets_flag(self, mock_empty_patch, mock_patch_fn):
         assert not te_patches_module._TE_PATCHES_APPLIED
         apply_te_patches()
         assert te_patches_module._TE_PATCHES_APPLIED
+
+
+class TestFusedAdamEmptyShardPatch:
+    def _patched_applier(self):
+        _, _, _, modules = _build_te_mocks()
+        fused_adam = modules["transformer_engine.pytorch.optimizers.fused_adam"]
+        original = MagicMock(return_value="updated")
+        fused_adam.multi_tensor_applier = original
+        modules["transformer_engine.pytorch.optimizers"].fused_adam = fused_adam
+        with patch.dict("sys.modules", modules):
+            _apply_fused_adam_empty_shard_patch()
+            _apply_fused_adam_empty_shard_patch()
+        return fused_adam.multi_tensor_applier, original
+
+    def test_filters_last_empty_slot_across_all_five_lists(self):
+        applier, original = self._patched_applier()
+        columns = [[torch.ones(1) for _ in range(29)] + [torch.empty(0)] for _ in range(5)]
+        result = applier("kernel", "overflow", columns, 1e-5)
+
+        assert result == "updated"
+        original.assert_called_once()
+        sent = original.call_args.args[2]
+        assert len(sent) == 5
+        assert all(len(column) == 29 for column in sent)
+        assert all(tensor.numel() == 1 for column in sent for tensor in column)
+        assert all(len(column) == 30 for column in columns)
+
+    def test_skips_all_empty_shards(self):
+        applier, original = self._patched_applier()
+        assert applier("kernel", "overflow", [[torch.empty(0)] for _ in range(5)]) is None
+        original.assert_not_called()
+
+    def test_checks_local_dtensor_shard_instead_of_global_shape(self):
+        applier, original = self._patched_applier()
+
+        class Shard:
+            def __init__(self):
+                self._local_tensor = torch.empty(0)
+
+            def numel(self):
+                return 8
+
+        assert applier("kernel", "overflow", [[Shard()] for _ in range(5)]) is None
+        original.assert_not_called()
+
+    def test_keeps_nonempty_input_unchanged(self):
+        applier, original = self._patched_applier()
+        columns = [[torch.ones(1)] for _ in range(5)]
+        assert applier("kernel", "overflow", columns) == "updated"
+        assert original.call_args.args[2] is columns
+
+    def test_rejects_mismatched_nonempty_parameter(self):
+        applier, original = self._patched_applier()
+        columns = [[torch.empty(0)], [torch.ones(1)], *[[torch.empty(0)] for _ in range(3)]]
+        with pytest.raises(RuntimeError, match="empty gradient"):
+            applier("kernel", "overflow", columns)
+        original.assert_not_called()
+
+
+@pytest.mark.parametrize("error_type", ["FileNotFoundError", "OSError", "ImportError"])
+def test_apply_te_patches_tolerates_missing_native_extension(tmp_path, monkeypatch, error_type):
+    """A successful top-level TE import does not guarantee its torch extension loads."""
+    import importlib
+    import sys
+
+    package = tmp_path / "transformer_engine"
+    (package / "pytorch").mkdir(parents=True)
+    (package / "__init__.py").write_text(
+        'import warnings\nwarnings.warn("PyTorch extension is unavailable", UserWarning)\n'
+    )
+    (package / "pytorch" / "__init__.py").write_text(
+        f'raise {error_type}("Could not load Transformer Engine torch lib")\n'
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    with patch.dict(sys.modules):
+        for name in list(sys.modules):
+            if name == "transformer_engine" or name.startswith("transformer_engine."):
+                del sys.modules[name]
+        with pytest.warns(UserWarning, match="PyTorch extension is unavailable"):
+            importlib.import_module("transformer_engine")
+        monkeypatch.setattr(te_patches_module, "_TE_PATCHES_APPLIED", False)
+        # TE >= 2.12 takes the existing version-gated patch's early return.
+        with patch(_MOCK_TE_VERSION, return_value=True):
+            apply_te_patches()
+        assert te_patches_module._TE_PATCHES_APPLIED
+        assert "transformer_engine.pytorch.optimizers.fused_adam" not in sys.modules
 
 
 class TestFusedAdamQuantizedTensorPatch:

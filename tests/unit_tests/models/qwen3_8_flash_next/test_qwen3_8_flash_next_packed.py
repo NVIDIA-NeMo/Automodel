@@ -491,6 +491,26 @@ def test_two_rank_packed_qsa_and_sharder_match_packed_cp1(tmp_path) -> None:
     )
 
 
+def test_qsa_route_extents_follow_gathered_keys_under_packed_cp() -> None:
+    """Route width is bounded by the longest document, the mask extent by the global K/V length.
+
+    Regression for the route-replay change picking the local shard length as the flex mask
+    extent under packed CP (``mask=(8, 8)`` versus all-gathered ``tensors=(8, 16)``). The
+    end-to-end two-GPU flex check lives in
+    ``tests/functional_tests/context_parallel/run_qwen3_8_flash_next_packed_cp.py``.
+    """
+    from types import SimpleNamespace
+
+    from nemo_automodel.components.models.qwen3_8_flash_next.layers import _qsa_route_extents
+
+    boundaries = torch.tensor([0, 3, 10])
+    cp_context = SimpleNamespace(global_sequence_length=16)
+    assert _qsa_route_extents(8, packed_cu_seqlens=boundaries, cp_context=cp_context) == (7, 16)
+    assert _qsa_route_extents(16, packed_cu_seqlens=boundaries, cp_context=None) == (7, 16)
+    assert _qsa_route_extents(8, packed_cu_seqlens=None, cp_context=cp_context) == (16, 16)
+    assert _qsa_route_extents(16, packed_cu_seqlens=None, cp_context=None) == (16, 16)
+
+
 def test_gdn_wrapper_synthesizes_document_ids_for_packed_conv(monkeypatch: pytest.MonkeyPatch) -> None:
     """cu_seqlens-only packed batches get per-token document IDs for conv."""
     from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import CPAwareGatedDeltaNet

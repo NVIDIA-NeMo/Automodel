@@ -449,11 +449,18 @@ def test_qsa_cuda_kernel_is_selected_once_at_setup(attn_backend: str) -> None:
     kernel = qwen3_8_flash_next_qsa.select_qsa_cuda_kernel(attn_backend)
     expected = {
         "flex": qwen3_8_flash_next_qsa._bf16_flex_sparse_gqa_attention,
-        "fa4": qwen3_8_flash_next_qsa.fa4_sparse_gqa_attention,
+        "fa4": qwen3_8_flash_next_qsa._fa4_qsa_attention,
         "sdpa": None,
     }[attn_backend]
 
     assert kernel is expected
+
+
+def test_fa4_qsa_kernel_rejects_a_flex_mask() -> None:
+    query = torch.randn(1, 3, 4, 3)
+    selected = torch.zeros(1, 3, 1, dtype=torch.int32)
+    with pytest.raises(ValueError, match="does not consume a FlexAttention mask"):
+        qwen3_8_flash_next_qsa._fa4_qsa_attention(query, query, query, selected, flex_mask=object())
 
 
 def test_qsa_cuda_without_a_kernel_is_rejected() -> None:

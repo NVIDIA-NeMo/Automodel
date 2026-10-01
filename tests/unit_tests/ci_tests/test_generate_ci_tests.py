@@ -25,6 +25,44 @@ from tests.ci_tests.utils.generate_ci_tests import generate_job, generate_pipeli
 pytestmark = pytest.mark.timeout(60)
 
 
+def test_llm_benchmark_configs_define_required_benchmark_fields():
+    required_fields = {
+        "warmup_steps",
+        "peak_tflops",
+        "nsys_start",
+        "nsys_end",
+        "nsys_ranks",
+    }
+    violations = []
+
+    for config in Path("examples/llm_benchmark").rglob("*.yaml"):
+        recipe = YAML(typ="safe").load(config) or {}
+        benchmark = recipe.get("benchmark") or {}
+        missing = sorted(required_fields - benchmark.keys())
+        if missing:
+            violations.append(f"{config}: {', '.join(missing)}")
+
+    assert not violations, "Benchmark configs are missing required fields:\n" + "\n".join(violations)
+
+
+def test_super35_vl_benchmark_waits_for_public_checkpoint():
+    config = Path("examples/llm_benchmark/nemotron/super35_vl_text_8k_ep16_fused_adam.yaml")
+    recipe = YAML(typ="safe").load(config)
+
+    assert recipe["model"]["config"]["pretrained_model_name_or_path"] == (
+        "nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16"
+    )
+    assert recipe["ci"]["known_issue_id"] == "AMINT-383"
+    assert generate_job(config, {}, "performance", "llm_benchmark", ".") == []
+
+
+def test_qwen35_moe_lora_benchmark_disables_mtp():
+    config = Path("examples/llm_benchmark/qwen/qwen3.5_moe_te_deepep_lora.yaml")
+    recipe = YAML(typ="safe").load(config)
+
+    assert recipe["model"]["num_nextn_predict_layers"] == 0
+
+
 def test_example_checkpoint_robustness_configs_do_not_use_removed_fields():
     removed_keys = {
         "automodel_reload_cosine_threshold",

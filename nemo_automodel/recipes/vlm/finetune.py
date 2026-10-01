@@ -74,14 +74,16 @@ from nemo_automodel.components.loggers.mlflow_utils import (
     to_float_metrics,
 )
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
-from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy
+from nemo_automodel.components.loss.linear_ce_base import LinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.loss.mtp import calculate_mtp_loss
 from nemo_automodel.components.loss.utils import (
     _count_label_tokens,
-    _get_lm_head_weight,
+    _get_lm_head_module,
     _get_loss_ignore_index,
     calculate_loss,
+    prepare_lm_weight,
 )
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
@@ -566,10 +568,17 @@ class FinetuneRecipeForVLM(BaseRecipe):
         )
 
         if not _supports_logits_to_keep(model) and not isinstance(self.loss_fn, MaskedCrossEntropy):
+            if isinstance(self.loss_fn, ChunkedCrossEntropy):
+                raise ValueError("ChunkedCrossEntropy requires a model supporting logits_to_keep to avoid full logits")
             logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
             self.loss_fn = MaskedCrossEntropy(
                 ignore_index=_get_loss_ignore_index(self.loss_fn),
                 reduction=getattr(self.loss_fn, "reduction", "sum"),
+            )
+
+        if isinstance(self.loss_fn, ChunkedCrossEntropy):
+            self.loss_fn.validate_lm_head(
+                _get_lm_head_module(capability_model), model_config=getattr(capability_model, "config", None)
             )
 
         if isinstance(model, AutoPipeline):
@@ -973,12 +982,12 @@ class FinetuneRecipeForVLM(BaseRecipe):
             )
             with sync_ctx, self._cp_vision_frame_sharding_context(), train_ctx():
                 batch = filter_forward_kwargs(model, batch)
-                if isinstance(self.loss_fn, FusedLinearCrossEntropy):
+                if isinstance(self.loss_fn, LinearCrossEntropy):
                     # use num_logits_to_keep to avoid full logits matrix in memory
-                    out = model(logits_to_keep=1, **batch)
+                    out = model(**{**batch, "logits_to_keep": 1, "output_hidden_states": True})
                     if "hidden_states" not in out:
                         raise ValueError(
-                            "FusedLinearCrossEntropy requires the model to output hidden states. "
+                            f"{type(self.loss_fn).__name__} requires the model to output hidden states. "
                             "Set `model.text_config.output_hidden_states=True` in the config."
                         )
                 else:
@@ -986,11 +995,12 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
                 grad_reduce_group = self._get_dp_group(include_cp=True) if is_train else None
                 shared_lm_weight = (
-                    self.loss_fn.materialize_lm_weight(
-                        _get_lm_head_weight(model),
+                    prepare_lm_weight(
+                        self.loss_fn,
+                        model,
                         grad_reduce_group=grad_reduce_group,
                     )
-                    if isinstance(self.loss_fn, FusedLinearCrossEntropy)
+                    if isinstance(self.loss_fn, LinearCrossEntropy)
                     else None
                 )
                 local_loss = calculate_loss(
@@ -1025,6 +1035,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                         num_label_tokens=num_label_tokens,
                         ignore_index=ignore_index,
                         lm_weight=shared_lm_weight,
+                        logits_dtype=out.logits.dtype,
                         grad_reduce_group=grad_reduce_group,
                         cu_seqlens=None if mtp_per_depth_targets is not None else batch.get("cu_seqlens"),
                     )
@@ -1232,8 +1243,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 labels = batch.pop("labels")
                 with self._cp_vision_frame_sharding_context(), train_ctx():
                     batch = filter_forward_kwargs(self.model_parts[0], batch)
-                    if isinstance(self.loss_fn, FusedLinearCrossEntropy):
-                        out = self.model_parts[0](logits_to_keep=1, **batch)
+                    if isinstance(self.loss_fn, LinearCrossEntropy):
+                        out = self.model_parts[0](**{**batch, "logits_to_keep": 1, "output_hidden_states": True})
                     else:
                         out = self.model_parts[0](**batch)
                     local_loss = calculate_loss(

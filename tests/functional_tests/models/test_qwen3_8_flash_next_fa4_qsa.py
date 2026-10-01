@@ -22,7 +22,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from nemo_automodel.components.models.qwen3_8_flash_next.fa4_qsa import fa4_sparse_gqa_attention
-from nemo_automodel.components.models.qwen3_8_flash_next.qsa import qsa_gqa_attention
+from nemo_automodel.components.models.qwen3_8_flash_next.qsa import qsa_gqa_attention, select_qsa_cuda_kernel
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0),
@@ -97,7 +97,7 @@ def test_output_and_all_gradients(seed: int, batch: int, sq: int, sk: int, width
         routes[:, 3 : sq // 2] = routes[:, 3 : sq // 2].remainder(sk // 3)
         routes[:, sq // 2 :] = routes[:, sq // 2 :].remainder(sk - sk * 2 // 3) + sk * 2 // 3
     scale = 0.125
-    out = qsa_gqa_attention(q, k, v, routes, cuda_kernel=fa4_sparse_gqa_attention, softmax_scale=scale)
+    out = qsa_gqa_attention(q, k, v, routes, cuda_kernel=select_qsa_cuda_kernel("fa4"), softmax_scale=scale)
     grads = torch.autograd.grad(out, (q, k, v), dy)
     inputs64 = [x.detach().double().requires_grad_() for x in (q, k, v)]
     ref, mask = _reference(*inputs64, routes, scale=scale)
