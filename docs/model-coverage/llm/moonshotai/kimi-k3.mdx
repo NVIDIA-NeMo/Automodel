@@ -47,6 +47,28 @@ per 32 input-channel values, together with matching compressed-tensors metadata.
 Shared experts, latent projections, routers, attention, vision, and other weights
 retain their existing export precision.
 
+For automatic final-step quantization in the training recipe, add:
+
+```yaml
+step_scheduler:
+  ckpt_every_steps: 50
+
+checkpoint:
+  enabled: true
+  model_save_format: safetensors
+  save_consolidated: final
+  quantization: true
+```
+
+Intermediate checkpoints keep floating-point weights for resume. Only the final
+scheduled save quantizes routed experts to MXFP4, with HF output under
+`<checkpoint_dir>/epoch_<epoch>_step_<step>/model/consolidated`.
+`save_consolidated` controls file consolidation, not quantization. The quantized
+final checkpoint is a deployment artifact, not a lossless training-resume
+checkpoint; to resume, set `restore_from.path` to an earlier unquantized checkpoint
+rather than `LATEST` after training completes. Keep that checkpoint when configuring
+retention. Omitting `checkpoint.quantization` preserves unquantized saves at every step.
+
 Save the in-memory trained model with `quantization=True` on every rank, using
 the existing checkpointer configured for safetensors and consolidated output:
 

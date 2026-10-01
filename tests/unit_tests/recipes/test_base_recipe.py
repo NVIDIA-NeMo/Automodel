@@ -16,6 +16,7 @@ import json
 import logging
 import os
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -38,6 +39,7 @@ from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.components.training.rng import StatefulRNG
+from nemo_automodel.components.training.step_scheduler import StepSchedulerConfig
 from nemo_automodel.recipes.base_recipe import BaseRecipe, is_distributed_stateful
 
 try:
@@ -100,9 +102,11 @@ def _patch_checkpoint_ops(monkeypatch):
             peft_config=None,
             tokenizer=None,
             is_final_checkpoint=False,
+            *,
+            quantization=False,
         ):
             """Save model state dict."""
-            del peft_config, tokenizer, is_final_checkpoint
+            del peft_config, tokenizer, is_final_checkpoint, quantization
             if model is None:
                 return
             model_dir = os.path.join(weights_path, "model")
@@ -489,6 +493,60 @@ def test_untrack_state_removes_state_from_checkpoint_tracking(tmp_path):
 
     assert recipe_inst.checkpointer.distributed_saves == []
     assert not (tmp_path / "epoch_0_step_11" / "distributed_state").exists()
+
+
+@pytest.mark.parametrize("model_kind", ["mixin", "plain", "native_hf", "single_part", "pipeline"])
+@pytest.mark.parametrize("quantization", [False, True])
+def test_save_checkpoint_quantizes_only_final_step(tmp_path, monkeypatch, model_kind, quantization):
+    """All save routes keep periodic checkpoints plain and opt in only at the last step."""
+    recipe = _ToyRecipe(tmp_path)
+    recipe.checkpointer.config.quantization = quantization
+    recipe.step_scheduler = StepSchedulerConfig(
+        global_batch_size=1, max_steps=125, ckpt_every_steps=50, preemption_signal=None
+    ).build(dataloader=range(125), dp_group_size=1, local_batch_size=1)
+    if model_kind != "mixin":
+        recipe.untrack_state("model")
+        if model_kind == "plain":
+            recipe.model = nn.Linear(2, 2)
+        elif model_kind == "native_hf":
+
+            class NativeHFModel(nn.Linear):
+                def save_pretrained(self, *args, **kwargs):
+                    raise AssertionError("Native save_pretrained must not bypass Checkpointer")
+
+            recipe.model = NativeHFModel(2, 2)
+        else:
+            recipe.model = [recipe.model] if model_kind == "single_part" else [recipe.model, _ToyModel(2, 2)]
+    save_model = Mock()
+    monkeypatch.setattr(recipe.checkpointer, "save_model", save_model)
+
+    for step in (49, 99, 124):
+        recipe.step_scheduler.step = step
+        assert recipe.step_scheduler.is_ckpt_step
+        recipe.save_checkpoint(epoch=0, step=step, train_loss=1.0)
+
+    assert [call.kwargs["is_final_checkpoint"] for call in save_model.call_args_list] == [False, False, True]
+    assert [call.kwargs["quantization"] for call in save_model.call_args_list] == [False, False, quantization]
+    assert recipe.checkpointer.config.quantization is quantization
+
+
+@pytest.mark.parametrize("stop_reason", ["epoch_end", "preemption", "no_scheduler"])
+def test_final_quantization_uses_training_completion_not_interruption(tmp_path, monkeypatch, stop_reason):
+    recipe = _ToyRecipe(tmp_path)
+    recipe.checkpointer.config.quantization = True
+    if stop_reason != "no_scheduler":
+        recipe.step_scheduler = StepSchedulerConfig(
+            global_batch_size=1, num_epochs=1, max_steps=100, preemption_signal=None
+        ).build(dataloader=range(10), dp_group_size=1, local_batch_size=1)
+        recipe.step_scheduler.step = 9 if stop_reason == "epoch_end" else 4
+        recipe.step_scheduler.sigterm_flag = stop_reason == "preemption"
+        assert recipe.step_scheduler.is_ckpt_step
+    save_model = Mock()
+    monkeypatch.setattr(recipe.checkpointer, "save_model", save_model)
+
+    recipe.save_checkpoint(epoch=0, step=9, train_loss=1.0)
+
+    assert save_model.call_args.kwargs["quantization"] is (stop_reason == "epoch_end")
 
 
 def test_is_distributed_stateful_requires_opt_in_and_state_api():

@@ -108,6 +108,23 @@ class TestCheckpointingConfig:
         assert cfg.best_metric_key == "default"
         assert cfg.consolidation_timeout_minutes == 30
         assert cfg.max_recent_checkpoints is None
+        assert cfg.quantization is False
+
+    def test_quantization_override(self):
+        assert CheckpointingConfig(quantization=True).quantization is True
+
+    @pytest.mark.parametrize("invalid_value", [None, 0, 1, "false", "true"])
+    def test_quantization_must_be_boolean(self, invalid_value):
+        with pytest.raises(ValueError, match="checkpoint.quantization must be a boolean"):
+            CheckpointingConfig(quantization=invalid_value)
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [{"is_peft": True}, {"model_save_format": "torch_save"}, {"is_peft": True, "model_save_format": "torch_save"}],
+    )
+    def test_quantization_requires_full_model_safetensors(self, kwargs):
+        with pytest.raises(ValueError, match="checkpoint.quantization requires full-model safetensors"):
+            CheckpointingConfig(quantization=True, **kwargs)
 
     def test_allow_legacy_pickle_restore_override(self):
         cfg = CheckpointingConfig(allow_legacy_pickle_restore=True)
