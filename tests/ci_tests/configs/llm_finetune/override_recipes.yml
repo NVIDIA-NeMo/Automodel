@@ -25,6 +25,39 @@ exempt_models:
   - starcoder
 
 exempt_configs:
+  # Model-card examples need GPU validation before automatic CI enrollment.
+  aquila_7b_squad_peft:
+    reason: "Model-card example; GPU training is not validated for CI enrollment"
+  deepseek_llm_7b_chat_squad_peft:
+    reason: "Model-card example; GPU training is not validated for CI enrollment"
+  gpt_j_6b_squad_peft:
+    reason: "Model-card example; GPU training is not validated for CI enrollment"
+  gpt_neox_20b_squad_peft:
+    reason: "Model-card example; GPU training is not validated for CI enrollment"
+  bamba_9b_squad_peft:
+    reason: "Model-card example; GPU training is not validated for CI enrollment"
+  jais_13b_squad_peft:
+    reason: "Model-card example; GPU training is not validated for CI enrollment"
+  internlm3_8b_instruct_squad_peft:
+    reason: "Model-card example; GPU training is not validated for CI enrollment"
+  exaone_3_0_7_8b_instruct_squad_peft:
+    reason: "Model-card example; GPU training is not validated for CI enrollment"
+  llama_3_3_nemotron_super_49b_v1_squad_peft:
+    reason: "Model-card example; GPU training is not validated for CI enrollment"
+  minitron_8b_base_squad_peft:
+    reason: "Model-card example; GPU training is not validated for CI enrollment"
+  orion_14b_base_squad_peft:
+    reason: "Model-card example; GPU training is not validated for CI enrollment"
+  gritlm_7b_vllm_squad_peft:
+    reason: "Model-card example; GPU training is not validated for CI enrollment"
+  stablelm_3b_4e1t_squad_peft:
+    reason: "Model-card example; GPU training is not validated for CI enrollment"
+  chatglm3_6b_squad_peft:
+    reason: "Model-card example; GPU training is not validated for CI enrollment"
+  falcon_7b_squad_peft:
+    reason: "Model-card example; GPU training is not validated for CI enrollment"
+  solar_pro_preview_instruct_squad_peft:
+    reason: "Model-card example; GPU training is not validated for CI enrollment"
   falcon3_7b_instruct_hellaswag_fp8:
     reason: "Deprecated for 26.10 (Falcon 3)"
   falcon3_7b_instruct_squad:

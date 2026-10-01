@@ -136,6 +136,58 @@ def test_release_keeps_glm_53_cudnn_dsa_recipe_with_container_flashmla():
 
 
 @pytest.mark.parametrize(
+    ("test_folder", "active_recipe", "example_recipes"),
+    [
+        (
+            "llm_finetune",
+            "gpt_oss_120b",
+            {
+                "aquila_7b_squad_peft",
+                "deepseek_llm_7b_chat_squad_peft",
+                "gpt_j_6b_squad_peft",
+                "gpt_neox_20b_squad_peft",
+                "bamba_9b_squad_peft",
+                "jais_13b_squad_peft",
+                "internlm3_8b_instruct_squad_peft",
+                "exaone_3_0_7_8b_instruct_squad_peft",
+                "llama_3_3_nemotron_super_49b_v1_squad_peft",
+                "minitron_8b_base_squad_peft",
+                "orion_14b_base_squad_peft",
+                "gritlm_7b_vllm_squad_peft",
+                "stablelm_3b_4e1t_squad_peft",
+                "chatglm3_6b_squad_peft",
+                "falcon_7b_squad_peft",
+                "solar_pro_preview_instruct_squad_peft",
+            },
+        ),
+        (
+            "vlm_finetune",
+            "gemma3n_vl_4b_medpix",
+            {
+                "smolvlm_instruct_medpix_peft",
+                "llava_1_5_7b_hf_medpix_peft",
+                "llama_4_scout_17b_16e_instruct_medpix_peft",
+                "qwen3_vl_4b_instruct_medpix_peft",
+            },
+        ),
+    ],
+)
+def test_model_card_examples_do_not_expand_release_gpu_ci(
+    test_folder: str, active_recipe: str, example_recipes: set[str]
+) -> None:
+    pipeline = generate_pipeline(".", "release", test_folder)
+    scheduled_recipes = {
+        Path(job["variables"]["CONFIG_PATH"]).stem for name, job in pipeline.items() if name != "include"
+    }
+
+    assert not example_recipes.intersection(scheduled_recipes)
+    assert active_recipe in pipeline
+    # The examples remain available to readers and to CPU documentation checks.
+    available_recipes = {path.stem for path in (Path("examples") / test_folder).rglob("*.yaml")}
+    assert example_recipes <= available_recipes
+
+
+@pytest.mark.parametrize(
     "config_path",
     [
         "examples/llm_finetune/ling/ling_1t_sft.yaml",

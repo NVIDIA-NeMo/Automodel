@@ -99,6 +99,19 @@ Only provider/section `index.md` and `index.mdx` pages and root `overview`,
 `latest-models`, and `troubleshooting` pages are excluded. Archived release trees
 are outside `docs/model-coverage/`. There is no per-model exception list.
 
+### GPU CI Enrollment
+
+Release CI automatically discovers LLM and VLM example YAMLs. When adding a
+recipe to support a model card, add its exact filename stem to `exempt_configs`
+in `tests/ci_tests/configs/<test_folder>/override_recipes.yml` until its GPU
+training is validated for CI. Record the reason there. This keeps the recipe
+available to readers and subject to documentation and YAML checks without
+automatically scheduling a GPU job.
+
+PR and nightly recipe scopes use explicit recipe lists. Enroll a validated recipe by
+removing its exemption and adding it to the intended lists as needed. Keep the
+recipe's owner and resource metadata so that enrollment is reviewable.
+
 CI verifies these deterministic contracts. Authors must also verify source facts,
 backend dependencies, data preparation, and GPU training before claiming a recipe
 has been validated on particular hardware.

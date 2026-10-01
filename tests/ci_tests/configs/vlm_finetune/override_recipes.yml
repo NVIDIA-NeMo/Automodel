@@ -21,5 +21,14 @@ exempt_models:
   - cohere_micro_vision
 
 exempt_configs:
+  # Model-card examples need GPU validation before automatic CI enrollment.
+  smolvlm_instruct_medpix_peft:
+    reason: "Model-card example; GPU training is not validated for CI enrollment"
+  llava_1_5_7b_hf_medpix_peft:
+    reason: "Model-card example; GPU training is not validated for CI enrollment"
+  llama_4_scout_17b_16e_instruct_medpix_peft:
+    reason: "Model-card example; GPU training is not validated for CI enrollment"
+  qwen3_vl_4b_instruct_medpix_peft:
+    reason: "Model-card example; GPU training is not validated for CI enrollment"
 
 known_issue:
