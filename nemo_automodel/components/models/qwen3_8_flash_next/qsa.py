@@ -24,10 +24,15 @@ every forward, while gradients flow through the main attention Q/K/V path.
 from __future__ import annotations
 
 import math
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
 
 import torch
 from torch import nn
+from torch.utils._python_dispatch import _disable_current_modes
 
+from nemo_automodel.components.distributed.recompute_replay import RecomputeReplay
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.gpt_oss.rope_utils import apply_rotary_emb
 from nemo_automodel.components.models.qwen3_8_flash_next.cp import (
@@ -35,7 +40,7 @@ from nemo_automodel.components.models.qwen3_8_flash_next.cp import (
     qwen3_8_flash_next_cp_all_gather,
 )
 from nemo_automodel.components.models.qwen3_8_flash_next.fa4_qsa import fa4_sparse_gqa_attention
-from nemo_automodel.components.models.qwen3_8_flash_next.flex_qsa import flex_sparse_gqa_attention
+from nemo_automodel.components.models.qwen3_8_flash_next.flex_qsa import FlexQSAMask, flex_sparse_gqa_attention
 from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextRMSNorm
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
@@ -435,6 +440,7 @@ def qsa_gqa_attention(
     *,
     backend: str,
     softmax_scale: float | None = None,
+    flex_mask: FlexQSAMask | None = None,
 ) -> torch.Tensor:
     """Dispatch QSA to the selected CUDA kernel or the PyTorch CPU oracle.
 
@@ -451,6 +457,8 @@ def qsa_gqa_attention(
             K/V coordinates; invalid CUDA IDs are padding and duplicates collapse.
         backend: CUDA backend, "flex" or "cute". FA4 requires SM90 BF16 D256.
         softmax_scale: Optional positive QK score multiplier.
+        flex_mask: Optional FlexAttention mask already built from ``selected_token_ids``
+            (see :func:`build_flex_qsa_mask`); used by the flex backend only.
 
     Returns:
         Independent tensor [batch, local_queries, query_heads, head_dim] with
@@ -479,7 +487,45 @@ def qsa_gqa_attention(
         value,
         selected_token_ids,
         softmax_scale=softmax_scale,
+        mask=flex_mask,
     )
+
+
+@dataclass(frozen=True)
+class QSARouteSelection:
+    """Routes chosen by the frozen indexer for one QSA layer call.
+
+    Attributes:
+        selected_token_ids: int32 route IDs ``[B, S_q, attention_width]`` in global
+            K/V coordinates; ``-1`` marks padding.
+        flex_mask: FlexAttention mask built from the same routes when the layer runs
+            on CUDA with the ``flex`` backend, otherwise ``None``.
+    """
+
+    selected_token_ids: torch.Tensor
+    flex_mask: FlexQSAMask | None
+
+
+# Checkpoint-recompute replay channel for the route selection of one QSA layer call.
+# The indexer is frozen and its top-k is deterministic, so the recompute would
+# reproduce the same routes bit for bit; replaying the recorded selection skips the
+# indexer and the FlexAttention mask build without changing any trainable value.
+qsa_route_replay: RecomputeReplay[QSARouteSelection] = RecomputeReplay("QSA route")
+
+
+@contextmanager
+def qsa_route_selection_region() -> Iterator[None]:
+    """Run route selection outside any active TorchDispatch mode.
+
+    Selective activation checkpointing records every op of the checkpoint forward
+    through a TorchDispatch mode and expects the recompute to issue the same op
+    sequence. Replaying recorded routes skips the indexer's ops during recompute, so
+    those ops must be invisible to the mode during forward as well. The indexer runs
+    under ``torch.no_grad`` and the mask is integer-only, so nothing here is needed by
+    autograd; hiding the region only affects checkpoint bookkeeping.
+    """
+    with _disable_current_modes():
+        yield
 
 
 class Qwen3_8_FlashNextQSAIndexer(nn.Module):
