@@ -240,7 +240,10 @@ class _PPSpy(SimpleNamespace):
         return self.info.schedule.step(*schedule_args, target=target, losses=losses, **kwargs)
 
 
-def test_forward_backward_step_pp_cp_first_stage_sunk_keeps_input_ids_full(monkeypatch):
+@pytest.mark.parametrize(("pp_microbatch_size", "expected_chunks"), [(1, 2), (2, 1)])
+def test_forward_backward_step_pp_cp_first_stage_sunk_keeps_input_ids_full(
+    monkeypatch, pp_microbatch_size, expected_chunks
+):
     """Sunk model on the FIRST PP stage under CP: the sharder-only hook is invoked
     (consumes nothing), so input_ids stays full-length, update_seq_len sees the
     full seq_len, and the full-length input_ids is fed to the pipeline schedule
@@ -258,7 +261,8 @@ def test_forward_backward_step_pp_cp_first_stage_sunk_keeps_input_ids_full(monke
     recipe.model_parts = [model]
     recipe.pp_enabled = True
     recipe.pp = _PPSpy(
-        pp_microbatch_size=2,
+        pp_batch_size=2,
+        pp_microbatch_size=pp_microbatch_size,
         info=SimpleNamespace(
             has_first_stage=True,
             has_last_stage=True,
@@ -304,6 +308,7 @@ def test_forward_backward_step_pp_cp_first_stage_sunk_keeps_input_ids_full(monke
     )
 
     assert len(model.calls) == 1
+    assert model.calls[0]["num_chunks"] == expected_chunks
     # Sharder-only: input_ids stays full, no inputs_embeds injected.
     assert "input_ids" in seen_cp_batch
     assert tuple(seen_cp_batch["input_ids"].shape) == (2, 6)
@@ -331,7 +336,7 @@ class _SunkSpyVLM:
         raise AssertionError("CP prepare must call prepare_model_inputs_for_cp directly, not __call__")
 
 
-def _run_nonfirst_stage_fbstep(monkeypatch, model):
+def _run_nonfirst_stage_fbstep(monkeypatch, model, *, pp_microbatch_size):
     """Drive _forward_backward_step for a non-first (has_first_stage=False) PP+CP stage."""
     labels = torch.arange(12, dtype=torch.long).reshape(2, 6)
     schedule = _ScheduleSpy()
@@ -344,7 +349,8 @@ def _run_nonfirst_stage_fbstep(monkeypatch, model):
     recipe.model_parts = [model]
     recipe.pp_enabled = True
     recipe.pp = _PPSpy(
-        pp_microbatch_size=2,
+        pp_batch_size=2,
+        pp_microbatch_size=pp_microbatch_size,
         info=SimpleNamespace(
             has_first_stage=False,
             has_last_stage=True,
@@ -385,17 +391,23 @@ def _run_nonfirst_stage_fbstep(monkeypatch, model):
     return seen_cp_batch, seq_lens, recipe.pp.step_batches, schedule.calls
 
 
-def test_forward_backward_step_pp_cp_sunk_model_nonfirst_stage_invokes_hook_keeps_input_ids_full(monkeypatch):
+@pytest.mark.parametrize(("pp_microbatch_size", "expected_chunks"), [(1, 2), (2, 1)])
+def test_forward_backward_step_pp_cp_sunk_model_nonfirst_stage_invokes_hook_keeps_input_ids_full(
+    monkeypatch, pp_microbatch_size, expected_chunks
+):
     """Regression: a sunk model must invoke its sharder-only hook on NON-first PP
     stages under cp>1, so input_ids stays full-length and update_seq_len (which
     drives the CP-aware stage metas) sees the FULL seq_len — not the local length
     the generic sharder would produce, which would ÷cp a second time and truncate
     the inter-stage hidden (the text-decoder RoPE size mismatch)."""
     model = _SunkSpyVLM()
-    seen_cp_batch, seq_lens, step_batches, schedule_calls = _run_nonfirst_stage_fbstep(monkeypatch, model)
+    seen_cp_batch, seq_lens, step_batches, schedule_calls = _run_nonfirst_stage_fbstep(
+        monkeypatch, model, pp_microbatch_size=pp_microbatch_size
+    )
 
     # Hook invoked on the non-first stage (this is the fix).
     assert len(model.calls) == 1
+    assert model.calls[0]["num_chunks"] == expected_chunks
     # Sharder-only hook consumes nothing: input_ids stays full-length (seq=6).
     assert "input_ids" in seen_cp_batch
     assert tuple(seen_cp_batch["input_ids"].shape) == (2, 6)

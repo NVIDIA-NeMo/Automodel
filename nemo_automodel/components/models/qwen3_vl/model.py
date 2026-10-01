@@ -41,7 +41,7 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
-from nemo_automodel.components.models.qwen3_vl.parallelization import register_qwen3_vl_parallel_strategy
+from nemo_automodel.components.models.qwen3_vl.parallelization import PARALLELIZER
 
 
 class Qwen3VLForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLForConditionalGeneration):
@@ -421,5 +421,5 @@ class Qwen3VLForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLForConditio
         )
 
 
-register_qwen3_vl_parallel_strategy()
+Qwen3VLForConditionalGeneration.parallelizer = PARALLELIZER
 ModelClass = Qwen3VLForConditionalGeneration

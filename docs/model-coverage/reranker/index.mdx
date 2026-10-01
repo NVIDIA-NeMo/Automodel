@@ -14,14 +14,16 @@ For first-stage dense retrieval, see [Embedding Models](/model-coverage/embeddin
 
 | Owner | Model | Architecture | Wrapper Class | Tasks |
 |---|---|---|---|---|
-| NVIDIA | [llama-nemotron-rerank-1b-v2](/model-coverage/reranking-models/nvidia/llama-bidirectional) | `LlamaBidirectionalForSequenceClassification` | `NeMoAutoModelCrossEncoder` | Reranking |
+| NVIDIA | [llama-nemotron-rerank-1b-v2](/model-coverage/reranking-models/nvidia/llama-nemotron-rerank-1b-v2) | `LlamaBidirectionalForSequenceClassification` | `NeMoAutoModelCrossEncoder` | Reranking |
 | Qwen | [Qwen3-Reranker-4B](https://huggingface.co/Qwen/Qwen3-Reranker-4B) | `Qwen3RerankerForCausalReranking` | `NeMoAutoModelCrossEncoder` | Reranking |
 
 The Llama backbones convert to bidirectional attention. `Qwen3RerankerForCausalReranking` stays causal: it reuses the pretrained `lm_head` and scores a pair as `logit("yes") - logit("no")` at the final non-padding token, adding no parameters. Its checkpoints serialize as a plain `Qwen3ForCausalLM`, so they load in stock Transformers and vLLM without custom code.
 
 ## Hugging Face Auto Backbones
 
-Any Hugging Face model loadable using `AutoModelForSequenceClassification` can be used as a reranking backbone. This fallback path uses the model's native attention; no bidirectional conversion is applied.
+Unregistered scoring architectures load through Hugging Face `AutoModelForSequenceClassification`. An explicit `model.is_causal` value overrides a saved text-config value. Without either setting, the fallback preserves the backbone's native attention mode. Verify that an unregistered architecture honors the selected policy before using it for retrieval training.
+
+Composite backbones must identify their text tower through matching `get_text_config(decoder=True)` and `get_decoder()` results. Only that tower's attention policy is changed.
 
 ## Supported Models
 
@@ -39,8 +41,6 @@ This table combines recipe-backed checkpoints with documented model families. Da
 
 Retrieval fine-tuning requires query-document pairs: each example is a query paired with one positive document and one or more negative documents. Both inline JSONL and corpus ID-based JSON formats are supported. See the [Retrieval Dataset](/datasets/retrieval-dataset) guide.
 
-{/* TODO: uncomment when finetune guide is published.
 ## Train Reranking Models
 
 For a complete walkthrough of training configuration, model-specific settings, and launch commands, see the [Embedding and Reranking Fine-Tuning Guide](/recipes-e2e-examples/retrieval-finetune).
-*/}

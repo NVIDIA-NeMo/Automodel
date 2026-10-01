@@ -27,7 +27,6 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
-from nemo_automodel.components.speculative.dspark.draft_qwen3 import Qwen3DSparkModel
 from nemo_automodel.components.speculative.dspark.loss import compute_dspark_loss
 
 
@@ -64,7 +63,7 @@ class DSparkTrainerModule(nn.Module):
 
     def __init__(
         self,
-        draft_model: Qwen3DSparkModel,
+        draft_model: nn.Module,
         *,
         loss_decay_gamma: float | None = None,
         ce_loss_alpha: float = 0.1,

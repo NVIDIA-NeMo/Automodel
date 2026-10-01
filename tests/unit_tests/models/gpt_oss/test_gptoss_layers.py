@@ -205,6 +205,26 @@ class TestGptOssAttention:
         assert not torch.equal(attention.q_proj.weight, original_q_weight)
         assert not torch.equal(attention.sinks, original_sinks)
 
+    def test_init_weights_initializes_projection_biases(self, gpt_config, backend_config):
+        """Test that meta-materialized projection biases are initialized."""
+        with torch.device("meta"):
+            attention = GptOssAttention(gpt_config, backend_config)
+
+        attention.to_empty(device="cpu")
+        projections = [attention.q_proj, attention.k_proj, attention.v_proj, attention.o_proj]
+
+        with torch.no_grad():
+            for projection in projections:
+                assert projection.bias is not None
+                projection.bias.fill_(float("nan"))
+
+        attention.init_weights(torch.device("cpu"), init_std=0.02)
+
+        assert all(torch.isfinite(parameter).all() for parameter in attention.parameters())
+        for projection in projections:
+            assert projection.bias is not None
+            assert torch.count_nonzero(projection.bias).item() == 0
+
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_rotary_embedding_application(self, gpt_config, backend_config, device):
         """Test that rotary embedding is correctly applied to q and k."""

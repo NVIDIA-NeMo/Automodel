@@ -64,12 +64,12 @@ else
   # Floor the eval stack: gemma4's head_dim makes vLLM auto-select the FA4 cute kernel
   # (vllm_flash_attn.cute). On older cutlass-dsl (the 4.5.x that vllm 0.25.x resolves
   # transitively) that kernel fails to compile -> GPUModuleOp / cudaErrorIllegalAddress.
-  # vllm 0.26.0 + cutlass-dsl 4.6.0 compiles it cleanly (verified: gemma4 IFEval
+  # vllm 0.28.0 + cutlass-dsl 4.6.0 compiles it cleanly (verified: gemma4 IFEval
   # prompt_level_strict_acc=0.5360).
-  # transformers 5.15.0 makes gemma4's per-layer head_dim raise
-  # AmbiguousGlobalPerLayerAttributeError on the plain getattr in vLLM's get_head_size(),
-  # so pin transformers too. 5.14.1 + vllm 0.26.0 is the combination we verified.
-  uv pip install -e ".[vllm]" "vllm==0.26.0" "transformers==5.14.1" "nvidia-cutlass-dsl>=4.6.0"
+  # vLLM 0.28.0 reads the per-layer head dimensions and KV-head counts written by
+  # the transformers 5.15.1 training stack; older vLLM releases expect the removed
+  # global fields and fail while constructing Gemma4 full-attention layers.
+  uv pip install -e ".[vllm]" "vllm==0.28.0" "transformers==5.15.1" "nvidia-cutlass-dsl>=4.6.0"
 
   echo "Setup complete. Activate with:  source $VENV_DIR/bin/activate"
 fi

@@ -269,10 +269,10 @@ def test_target_kwargs_defaults_and_overrides():
     backend = build_kimi_k3_dflash_target_kwargs(
         {
             "target_dispatcher": "deepep",
-            "target_experts": "gmm",
+            "target_experts": "torch_mm",
             "target_enable_fsdp_optimizations": False,
         }
     )["backend"]
     assert backend.dispatcher == "deepep"
-    assert backend.experts == "gmm"
+    assert backend.experts == "torch_mm"
     assert backend.enable_fsdp_optimizations is False

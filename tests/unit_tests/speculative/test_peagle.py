@@ -40,8 +40,9 @@ from nemo_automodel.components.speculative.eagle.peagle_data import (
 )
 from nemo_automodel.components.speculative.eagle.peagle_trainer import PEagleTrainerModule
 
-# Over the default 5s budget on purpose: CUDA FlexAttention compilation takes longer on a cold worker.
-# Reduce cold compiler startup before lowering this further.
+# Legacy module watchdog for the existing CUDA FlexAttention tests. New or modified
+# slow tests need an exact ``runtime_budget`` marker; inheriting this marker does
+# not exempt them from the default runtime budget.
 pytestmark = pytest.mark.timeout(60)
 
 # P-EAGLE's draft forward runs flex_attention, whose autograd is not implemented
@@ -409,6 +410,11 @@ def test_peagle_stacks_num_hidden_layers():
 
 
 @_gpu_only
+@pytest.mark.runtime_budget(
+    30,
+    hard_timeout=180,
+    reason="cold CUDA FlexAttention forward and backward compilation",
+)
 def test_peagle_deeper_layers_receive_gradient():
     """Stacked deeper layers must be in the autograd graph (their params update)."""
     torch.manual_seed(0)
