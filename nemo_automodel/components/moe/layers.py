@@ -917,7 +917,9 @@ class MoE(nn.Module):
             y = self.fc2_latent_proj(y.to(x_latent.dtype))
         if z is not None:
             y = y + z
-        return y.view(shape)
+        # FSDP2 registers its pre-backward hook on this module boundary. Return
+        # owned storage so an in-place residual update cannot drop that hook.
+        return y.view(shape).clone()
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
         init_weights_fn = partial(_init_weights, buffer_device=buffer_device, init_std=init_std)

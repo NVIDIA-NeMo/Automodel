@@ -600,11 +600,7 @@ class GroupedExperts(nn.Module):
             # Reduce and narrow to the original per-rank token boundaries.
             y = dist_nn_f.all_reduce(y, op=dist.ReduceOp.SUM, group=ep_group)
             start = sum(gathered_lens[:ep_rank])
-            # ``narrow`` along dim 0 can already be contiguous, making
-            # ``contiguous`` a no-op that leaves the returned tensor as a view.
-            # FSDP2 requires an owned output so its pre-backward hook cannot be
-            # lost when the caller applies an in-place residual update.
-            y = y.narrow(0, start, local_num_tokens).clone()
+            y = y.narrow(0, start, local_num_tokens).contiguous()
 
         if self.config.apply_router_weight_after_down:
             y = y.sum(dim=1)

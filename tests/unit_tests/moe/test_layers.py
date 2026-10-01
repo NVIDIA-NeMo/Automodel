@@ -1462,6 +1462,29 @@ class TestMoE:
             assert output.shape == x.shape
             assert output.device == device
 
+    def test_moe_output_owns_storage_and_preserves_backward(self, moe_config, backend_config):
+        """MoE output must own storage so FSDP2 keeps its pre-backward hook."""
+        moe_config.n_shared_experts = 0
+        moe = MoE(moe_config, backend_config)
+
+        batch_size, seq_len = 2, 4
+        x = torch.randn(batch_size, seq_len, moe_config.dim, requires_grad=True)
+        expert_output = x.view(-1, moe_config.dim) * 2
+        weights = torch.rand(batch_size * seq_len, moe_config.n_activated_experts)
+        indices = torch.randint(
+            0,
+            moe_config.n_routed_experts,
+            (batch_size * seq_len, moe_config.n_activated_experts),
+        )
+
+        with patch.object(moe.gate, "forward", return_value=(weights, indices, None)):
+            with patch.object(moe.experts, "forward", return_value=expert_output):
+                output = moe(x)
+
+        assert output._base is None
+        output.sum().backward()
+        torch.testing.assert_close(x.grad, torch.full_like(x, 2))
+
     def test_moe_forward_with_shared_experts(self, moe_config, backend_config, device):
         """Test MoE forward pass with shared experts."""
         moe_config.n_shared_experts = 2
