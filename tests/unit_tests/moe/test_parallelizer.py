@@ -789,6 +789,40 @@ def test_apply_ac_skips_model_owned_eager_block(monkeypatch, selective):
     assert model.layers.registered == {"0": wrapped_block}
 
 
+@pytest.mark.parametrize("selective", [False, True])
+def test_apply_ac_checkpoints_declared_submodules_of_model_owned_eager_block(monkeypatch, selective):
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    if selective:
+        dense_stub = types.ModuleType("nemo_automodel.components.distributed.activation_checkpointing")
+        dense_stub.make_selective_checkpoint_context_fn = MagicMock(return_value=object())
+        dense_stub.SELECTIVE_AC_WRAPPER_FLAG = "_nemo_selective_ac"
+        dense_stub.transformer_engine_attention_backend_snapshot_context_fn = lambda context_fn=None: context_fn
+        monkeypatch.setitem(sys.modules, "nemo_automodel.components.distributed.activation_checkpointing", dense_stub)
+
+    eager_block = DummyBlock()
+    eager_block.shared_experts = object()
+    eager_block.self_attn = object()
+    eager_block._nemo_disable_activation_checkpointing = True
+    eager_block._nemo_activation_checkpointing_submodules = ("mlp", "shared_experts")
+    eager_block.register_module = lambda name, module: setattr(eager_block, name, module)
+    wrapped_mlp = types.SimpleNamespace()
+    wrapped_shared_experts = types.SimpleNamespace()
+    wrapper_mock = MagicMock(side_effect=[wrapped_mlp, wrapped_shared_experts])
+    monkeypatch.setattr(P, "ptd_checkpoint_wrapper", wrapper_mock)
+
+    model = DummyModel([eager_block])
+    P.apply_ac(model, ignore_router=True, hidden_size=7168, num_experts=256, selective=selective)
+
+    assert wrapper_mock.call_count == 2
+    assert eager_block.mlp is wrapped_mlp
+    assert eager_block.shared_experts is wrapped_shared_experts
+    assert eager_block.self_attn is not wrapped_mlp and eager_block.self_attn is not wrapped_shared_experts
+    assert model.layers.registered == {}
+    if selective:
+        assert wrapped_mlp._nemo_selective_ac is True
+        assert wrapped_shared_experts._nemo_selective_ac is True
+
+
 def test_apply_ac_warns_when_router_is_recomputed(monkeypatch):
     P = _import_parallelizer_with_stubs(monkeypatch)
     monkeypatch.setattr(P, "ptd_checkpoint_wrapper", MagicMock(side_effect=lambda block, **kw: block))

@@ -657,9 +657,12 @@ class Block(nn.Module):
             self.self_attn = MiniMaxM3Attention(config, backend, is_sparse_attention_layer=is_sparse_attention_layer)
 
         # Whole-block non-reentrant checkpoint replay can retain a selector tensor from another packed
-        # microbatch, while MSA's custom autograd already owns its memory-efficient backward. Keep MSA
-        # blocks eager so each backward consumes the support built for the matching packed geometry.
+        # microbatch, while MSA's custom autograd already owns its memory-efficient backward. Keep the
+        # MSA attention eager, but checkpoint the memory-heavy feed-forward submodules separately.
         self._nemo_disable_activation_checkpointing = isinstance(self.self_attn, MiniMaxM3MSAAttention)
+        self._nemo_activation_checkpointing_submodules = (
+            ("mlp", "shared_experts") if self._nemo_disable_activation_checkpointing else ()
+        )
 
         moe_layer_freq = getattr(config, "moe_layer_freq", None)
         self.is_moe_layer = True if moe_layer_freq is None else moe_layer_freq[layer_idx] != 0

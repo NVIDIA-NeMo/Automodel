@@ -553,6 +553,44 @@ def _uses_hybridep_dispatch(model: nn.Module) -> bool:
     )
 
 
+def _checkpoint_model_owned_submodules(
+    block: nn.Module,
+    layer_id: str,
+    context_fn: Callable[[], tuple[AbstractContextManager, AbstractContextManager]] | None,
+    *,
+    determinism_check: str | None = None,
+    wrapper_flag: str | None = None,
+) -> bool:
+    """Checkpoint the submodules declared by a block that must otherwise stay eager."""
+    names = getattr(block, "_nemo_activation_checkpointing_submodules", ())
+    checkpointed = []
+    for name in names:
+        module = getattr(block, name, None)
+        if module is None:
+            continue
+        wrapper_kwargs = {}
+        if determinism_check is not None:
+            wrapper_kwargs["determinism_check"] = determinism_check
+        module = ptd_checkpoint_wrapper(
+            module,
+            preserve_rng_state=True,
+            context_fn=context_fn,
+            **wrapper_kwargs,
+        )
+        if wrapper_flag is not None:
+            setattr(module, wrapper_flag, True)
+        block.register_module(name, module)
+        checkpointed.append(name)
+
+    if checkpointed:
+        logger.info(
+            "Keeping model-owned block %s eager and checkpointing submodules: %s",
+            layer_id,
+            ", ".join(checkpointed),
+        )
+    return bool(checkpointed)
+
+
 def apply_ac(
     model: nn.Module,
     ignore_router: bool = True,
@@ -633,7 +671,14 @@ def apply_ac(
                 if id(block) in repeated_mtp_moe_block_ids:
                     continue
                 if bool(getattr(block, "_nemo_disable_activation_checkpointing", False)):
-                    logger.info("Skipping activation checkpointing for model-owned eager block %s", layer_id)
+                    context_fn = _preserve_gate_load_during_recompute(block, attention_context_fn)
+                    if not _checkpoint_model_owned_submodules(
+                        block,
+                        layer_id,
+                        context_fn,
+                        wrapper_flag=SELECTIVE_AC_WRAPPER_FLAG,
+                    ):
+                        logger.info("Skipping activation checkpointing for model-owned eager block %s", layer_id)
                     continue
                 block = ptd_checkpoint_wrapper(
                     block,
@@ -725,7 +770,25 @@ def apply_ac(
         if id(block) in repeated_mtp_moe_block_ids:
             continue
         if bool(getattr(block, "_nemo_disable_activation_checkpointing", False)):
-            logger.info("Skipping activation checkpointing for model-owned eager block %s", layer_id)
+            if ignore_router:
+                block_context_fn = _preserve_gate_load_during_recompute(
+                    block,
+                    _with_attention_backend_snapshot(selective_checkpointing_context_fn),
+                )
+                block_context_fn = _replay_deepep_dispatch_on_recompute(block_context_fn)
+                if uses_hybridep_dispatch:
+                    block_context_fn = _replay_hybridep_dispatch_on_recompute(block_context_fn)
+                determinism_check = _register_moe_checkpoint_determinism_check()
+            else:
+                block_context_fn = _preserve_gate_load_during_recompute(block, _with_attention_backend_snapshot())
+                determinism_check = None
+            if not _checkpoint_model_owned_submodules(
+                block,
+                layer_id,
+                block_context_fn,
+                determinism_check=determinism_check,
+            ):
+                logger.info("Skipping activation checkpointing for model-owned eager block %s", layer_id)
             continue
         if ignore_router:
             # Only this branch pins routing across recompute (the policy saves the

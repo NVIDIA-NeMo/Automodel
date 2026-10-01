@@ -356,6 +356,11 @@ def test_msa_blocks_opt_out_of_whole_block_activation_checkpointing() -> None:
 
     assert all(block._nemo_disable_activation_checkpointing for block in msa_model.model.layers.values())
     assert all(not block._nemo_disable_activation_checkpointing for block in generic_model.model.layers.values())
+    assert all(
+        block._nemo_activation_checkpointing_submodules == ("mlp", "shared_experts")
+        for block in msa_model.model.layers.values()
+    )
+    assert all(not block._nemo_activation_checkpointing_submodules for block in generic_model.model.layers.values())
 
 
 def test_msa_with_dense_layers_requires_a_varlen_attention_backend() -> None:
