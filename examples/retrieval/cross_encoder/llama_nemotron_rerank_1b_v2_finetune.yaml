@@ -67,3 +67,8 @@ distributed:
   tp_size: 1
   cp_size: 1
   sequence_parallel: false
+
+ci:
+  recipe_owner: akoumpa
+  time: "00:20:00"
+  nodes: 1

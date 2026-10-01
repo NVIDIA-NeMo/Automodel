@@ -80,3 +80,8 @@ checkpoint:
   checkpoint_dir: checkpoints/gpt_neox_20b
   model_save_format: safetensors
   save_consolidated: false
+
+ci:
+  recipe_owner: akoumpa
+  time: "00:20:00"
+  nodes: 1

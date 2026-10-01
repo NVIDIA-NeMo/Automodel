@@ -80,3 +80,8 @@ checkpoint:
   checkpoint_dir: checkpoints/granite_3_0_1b_a400m_base
   model_save_format: safetensors
   save_consolidated: false
+
+ci:
+  recipe_owner: akoumpa
+  time: "00:20:00"
+  nodes: 1
