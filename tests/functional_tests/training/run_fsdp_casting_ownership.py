@@ -45,7 +45,7 @@ from nemo_automodel.components.distributed.fsdp2_extensions.replicated import (
     select_small_fp32_parameters,
 )
 from nemo_automodel.components.models.qwen3_5 import parallelization as qwen_parallelization
-from nemo_automodel.components.optim.optimizer import AdamWConfig, FusedAdamConfig
+from nemo_automodel.components.optim.optimizer import AdamWConfig, FusedAdamConfig, OptimizerFromFactoryConfig
 from nemo_automodel.components.training.utils import clip_grad_norm
 
 
@@ -278,7 +278,19 @@ def _run_scenario(
         optimizer = optimizer_config.build(model, device_mesh=mesh)[0]
         reference_optimizer = optimizer_config.build(reference)[0]
     else:
-        optimizer = AdamWConfig(lr=1e-3, betas=(0.9, 0.95), weight_decay=0.1).build(model, device_mesh=mesh)[0]
+        optimizer_config = AdamWConfig(lr=1e-3, betas=(0.9, 0.95), weight_decay=0.1)
+        if scenario.model_sidecar:
+            if scenario.bulk_dtype is torch.bfloat16:
+                optimizer_config = OptimizerFromFactoryConfig(
+                    factory=torch.optim.AdamW, kwargs={"lr": 1e-3, "betas": (0.9, 0.95), "weight_decay": 0.1}
+                )
+            # Exercise both public explicit-group builders with the real mixed
+            # DTensor/plain layout, including the foreach CUDA step.
+            optimizer = optimizer_config.build_from_param_groups(
+                [{"params": list(model.parameters()), "weight_decay": 0.1}], device_mesh=mesh
+            )
+        else:
+            optimizer = optimizer_config.build(model, device_mesh=mesh)[0]
         reference_optimizer = torch.optim.AdamW(
             reference.parameters(),
             lr=1e-3,
