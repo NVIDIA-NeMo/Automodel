@@ -144,7 +144,8 @@ uses such a group-level counter for bias correction.
 
 | Matrix cases | Test owner | Observable contract |
 |---|---|---|
-| D1 replicated and optimized fallback; D2; D4 replicated and dtype-split | `run_fsdp_casting_ownership.py` | Resident dtype, FSDP-unit count, forward/backward and optimizer-step parity against an independent reference |
+| D1 replicated and optimized fallback; D2; D4 replicated and dtype-split | `run_fsdp_casting_ownership.py` | Resident dtype, FSDP-unit count, direct forward and gradient parity before the optimizer step, and optimizer-step parity against an independent reference |
+| D1/D4 through the Qwen3.5 model-owned sidecar | Functional sidecar cases with replication enabled and disabled | Shared traversal and prefetch, accumulation, production gradient norm and clipped-gradient parity |
 | D3 optimizer ownership | `run_te_fused_adam_master_ownership.py` | BF16 weights retain optimizer FP32 masters; resident FP32 weights do not allocate a redundant master; the same ownership survives resume |
 | D5-D8 and F9-F12 | `test_parallelizer_utils.py` | Unit-local selection chooses ordinary, optimized single-owner, or dtype-split fallback before wrapping |
 | F1, F4, and F5 | `test_parallelization_strategies.py` plus the functional root-after-child case | Ignored, replicated, frozen, and already child-owned parameters are not recaptured |

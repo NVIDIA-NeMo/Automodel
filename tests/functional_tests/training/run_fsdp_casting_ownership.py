@@ -25,6 +25,7 @@ from __future__ import annotations
 import os
 from collections import Counter
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import torch
 import torch.distributed as dist
@@ -43,7 +44,9 @@ from nemo_automodel.components.distributed.fsdp2_extensions.replicated import (
     replicated_parameters,
     select_small_fp32_parameters,
 )
+from nemo_automodel.components.models.qwen3_5 import parallelization as qwen_parallelization
 from nemo_automodel.components.optim.optimizer import AdamWConfig, FusedAdamConfig
+from nemo_automodel.components.training.utils import clip_grad_norm
 
 
 class _GateParams(nn.Module):
@@ -143,6 +146,19 @@ class _Root(nn.Module):
         return self.layer(inputs)
 
 
+class _SidecarRoot(nn.Module):
+    """Root exposing the layer structure consumed by the model-owned sidecar."""
+
+    def __init__(self, layer: nn.Module):
+        super().__init__()
+        self.layers = nn.ModuleList([layer])
+        self.config = SimpleNamespace(num_attention_heads=8, num_key_value_heads=8, hidden_size=8)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        """Map BF16 inputs of shape ``[batch, 8]`` to FP32 outputs of the same shape."""
+        return self.layers[0](inputs)
+
+
 @dataclass(frozen=True)
 class _Scenario:
     name: str
@@ -157,6 +173,8 @@ class _Scenario:
     te_optimizer: bool = False
     conditional_parameter: bool = False
     rank_asymmetric_use: bool = False
+    model_sidecar: bool = False
+    clip: bool = False
 
 
 def _input_for_rank(
@@ -194,6 +212,8 @@ def _run_scenario(
         layer._fp32_params = checkpoint_wrapper(layer._fp32_params)
     reference = _Root(reference_layer) if scenario.root_boundary else reference_layer
     model = _Root(layer) if scenario.root_boundary else layer
+    if scenario.model_sidecar:
+        reference, model = _SidecarRoot(reference_layer), _SidecarRoot(layer)
 
     replicated_params = replicated_parameters(
         select_small_fp32_parameters(
@@ -203,7 +223,7 @@ def _run_scenario(
         )
     )
     fully_shard_fn = fully_shard
-    if replicated_params:
+    if replicated_params and not scenario.model_sidecar:
         fully_shard_fn = make_fully_shard_with_replicated_parameter_grad_sync(
             model,
             replicated_params,
@@ -215,18 +235,28 @@ def _run_scenario(
         reduce_dtype=torch.float32,
         output_dtype=torch.float32,
     )
-    candidates = (layer, model) if scenario.root_boundary else (model,)
-    for candidate in candidates:
-        fully_shard_with_compute_dtype_fallback(
-            candidate,
-            fp32_compute_module_names=("_fp32_params",),
-            mesh=mesh,
-            mp_policy=mp_policy,
-            reshard_after_forward=not scenario.root_boundary or candidate is not model,
-            ignored_params=set(replicated_params),
-            fully_shard_fn=fully_shard_fn,
+    if scenario.model_sidecar:
+        sidecar_mesh = init_device_mesh(
+            "cuda", (world_size // 2, 2, 1), mesh_dim_names=("dp_replicate", "dp_shard_cp", "tp")
         )
-
+        previous_limit = qwen_parallelization._MAX_REPLICATED_FP32_BYTES_PER_MODULE
+        try:
+            qwen_parallelization._MAX_REPLICATED_FP32_BYTES_PER_MODULE = scenario.replication_limit
+            qwen_parallelization.PARALLELIZER._apply(model, sidecar_mesh, mp_policy=mp_policy)
+        finally:
+            qwen_parallelization._MAX_REPLICATED_FP32_BYTES_PER_MODULE = previous_limit
+    else:
+        candidates = (layer, model) if scenario.root_boundary else (model,)
+        for candidate in candidates:
+            fully_shard_with_compute_dtype_fallback(
+                candidate,
+                fp32_compute_module_names=("_fp32_params",),
+                mesh=mesh,
+                mp_policy=mp_policy,
+                reshard_after_forward=not scenario.root_boundary or candidate is not model,
+                ignored_params=set(replicated_params),
+                fully_shard_fn=fully_shard_fn,
+            )
     fsdp_units = [module for module in model.modules() if isinstance(module, FSDPModule)]
     if len(fsdp_units) != scenario.expected_fsdp_units:
         raise AssertionError(
@@ -271,34 +301,11 @@ def _run_scenario(
             if scenario.accumulation_steps > 1:
                 model.set_requires_gradient_sync(microbatch == scenario.accumulation_steps - 1)
             local_inputs = _input_for_rank(rank, microbatch, device, scenario.compute_dtype)
-            loss = model(local_inputs).square().mean() / scenario.accumulation_steps
+            reference_layer.use_conditional = scenario.rank_asymmetric_use and rank == 0
+            output = model(local_inputs)
+            torch.testing.assert_close(output, reference(local_inputs), rtol=0, atol=0)
+            loss = output.square().mean() / scenario.accumulation_steps
             loss.backward()
-
-    nccl_kernel_counts = Counter()
-    dist.barrier()
-    torch.cuda.synchronize(device)
-    if scenario.profile:
-        with torch.profiler.profile(
-            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
-        ) as profiler:
-            backward_all_microbatches()
-            optimizer.step()
-            torch.cuda.synchronize(device)
-        nccl_kernel_names = [event.key for event in profiler.events() if event.key.startswith("ncclDevKernel_")]
-        for kernel_name in nccl_kernel_names:
-            if "AllGather" in kernel_name:
-                nccl_kernel_counts["all_gather"] += 1
-            elif "ReduceScatter" in kernel_name:
-                nccl_kernel_counts["reduce_scatter"] += 1
-            elif "AllReduce" in kernel_name:
-                nccl_kernel_counts["all_reduce"] += 1
-            else:
-                nccl_kernel_counts["other"] += 1
-    else:
-        backward_all_microbatches()
-        optimizer.step()
-
-    assert_te_master_ownership()
 
     for microbatch in range(scenario.accumulation_steps):
         if scenario.rank_asymmetric_use:
@@ -316,6 +323,60 @@ def _run_scenario(
                 ]
             )
             (reference(global_inputs).square().mean() / scenario.accumulation_steps).backward()
+
+    nccl_kernel_counts = Counter()
+    dist.barrier()
+    torch.cuda.synchronize(device)
+    if scenario.profile:
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
+        ) as profiler:
+            backward_all_microbatches()
+            torch.cuda.synchronize(device)
+        nccl_kernel_names = [event.key for event in profiler.events() if event.key.startswith("ncclDevKernel_")]
+        for kernel_name in nccl_kernel_names:
+            if "AllGather" in kernel_name:
+                nccl_kernel_counts["all_gather"] += 1
+            elif "ReduceScatter" in kernel_name:
+                nccl_kernel_counts["reduce_scatter"] += 1
+            elif "AllReduce" in kernel_name:
+                nccl_kernel_counts["all_reduce"] += 1
+            else:
+                nccl_kernel_counts["other"] += 1
+    else:
+        backward_all_microbatches()
+
+    reference_params = dict(reference.named_parameters())
+    shard_world_size = mesh["dp_shard"].size() if world_size == 4 else world_size
+    shard_rank = mesh.get_local_rank(mesh_dim="dp_shard") if world_size == 4 else rank
+
+    def assert_gradient_parity(*, clipped: bool = False) -> None:
+        """Compare local gradient tensors against slices of the global-batch reference."""
+        for name, parameter in model.named_parameters():
+            reference_parameter = reference_params[name.replace("._checkpoint_wrapped_module", "")]
+            expected = reference_parameter.grad
+            actual = parameter.grad
+            if expected is None:
+                if actual is not None:
+                    raise AssertionError(f"{scenario.name}: unused parameter {name} acquired a gradient")
+                continue
+            if actual is None:
+                raise AssertionError(f"{scenario.name}: missing gradient for {name}")
+            if isinstance(actual, DTensor):
+                actual = actual.to_local()
+                expected = expected.chunk(shard_world_size, dim=0)[shard_rank]
+            # BF16 matmul/accumulation rounds locally before the DP reduction,
+            # whereas the independent reference rounds over the global batch.
+            torch.testing.assert_close(actual, expected, rtol=2e-2, atol=1e-4 if clipped else 1e-3)
+
+    assert_gradient_parity()
+    if scenario.clip:
+        actual_norm = clip_grad_norm(0.1, [model], device_mesh=mesh)
+        expected_norm = torch.nn.utils.clip_grad_norm_(reference.parameters(), 0.1)
+        torch.testing.assert_close(actual_norm.float(), expected_norm.float(), rtol=2e-2, atol=1e-3)
+        assert_gradient_parity(clipped=True)
+    optimizer.step()
+    assert_te_master_ownership()
     reference_optimizer.step()
 
     # Optimizer serialization must retain the same state ownership and remain
@@ -323,9 +384,6 @@ def _run_scenario(
     optimizer.load_state_dict(optimizer.state_dict())
     assert_te_master_ownership()
 
-    reference_params = dict(reference.named_parameters())
-    shard_world_size = mesh["dp_shard"].size() if world_size == 4 else world_size
-    shard_rank = mesh.get_local_rank(mesh_dim="dp_shard") if world_size == 4 else rank
     for name, parameter in model.named_parameters():
         reference_name = name.replace("._checkpoint_wrapped_module", "")
         reference_parameter = reference_params[reference_name]
@@ -382,6 +440,20 @@ def main() -> None:
             rank_asymmetric_use=True,
         ),
     ]
+    scenarios.extend(
+        _Scenario(
+            f"sidecar-{str(dtype).split('.')[-1]}-limit-{limit}",
+            dtype,
+            torch.bfloat16,
+            limit,
+            3 if dtype is torch.bfloat16 and limit == 0 else 2,
+            accumulation_steps=2,
+            model_sidecar=True,
+            clip=True,
+        )
+        for dtype in (torch.float32, torch.bfloat16)
+        for limit in (64, 0)
+    )
     if os.getenv("RUN_TE_FSDP_CASE") == "1":
         scenarios.append(_Scenario("D3-te-master", torch.bfloat16, torch.bfloat16, 64, 1, te_optimizer=True))
     profiled_counts = Counter()

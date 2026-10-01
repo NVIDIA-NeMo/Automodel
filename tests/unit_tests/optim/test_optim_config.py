@@ -108,6 +108,33 @@ class TestAdamWConfig:
 
 
 class TestOptimizerConfigBase:
+    @pytest.mark.parametrize("factory_config", [False, True])
+    def test_explicit_mixed_groups_preserve_options(self, monkeypatch, factory_config):
+        import nemo_automodel.components.optim.optimizer as optimizer_module
+
+        class FakeDTensor:
+            pass
+
+        sharded, plain = FakeDTensor(), object()
+        monkeypatch.setattr(optimizer_module, "DTensor", FakeDTensor)
+        captured = []
+
+        def factory(params, **kwargs):
+            captured.extend(params)
+            return MagicMock()
+
+        if factory_config:
+            config = OptimizerFromFactoryConfig(factory=factory)
+        else:
+            config = OptimizerConfig()
+            monkeypatch.setattr(config, "_build_optimizer", factory)
+        original = [{"params": [plain, sharded], "lr": 0.02, "weight_decay": 0.0, "lr_mult": 2.0}]
+        config.build_from_param_groups(original)
+
+        options = {"lr": 0.02, "weight_decay": 0.0, "lr_mult": 2.0}
+        assert captured == [{"params": [sharded], **options}, {"params": [plain], **options}]
+        assert original[0]["params"] == [plain, sharded]
+
     def test_isolates_plain_params_from_dtensor_foreach_group(self, monkeypatch):
         import nemo_automodel.components.optim.optimizer as optimizer_module
 
@@ -284,6 +311,27 @@ class TestOptimizerFromFactoryConfig:
 # ---------------------------------------------------------------------------
 # build_optimizer — (name_or_path, kwargs) tuple form
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("explicit_groups", [False, True])
+def test_tp_foreach_reaches_kwargs_factory(explicit_groups):
+    captured = {}
+
+    def factory(params, **kwargs):
+        captured.update(kwargs)
+        return torch.optim.SGD(params, **kwargs)
+
+    mesh = MagicMock()
+    mesh.mesh_dim_names = ("tp",)
+    mesh["tp"].size.return_value = 2
+    config = OptimizerFromFactoryConfig(factory=factory, kwargs={"lr": 0.01})
+    model = _model()
+    if explicit_groups:
+        config.build_from_param_groups([{"params": list(model.parameters())}], device_mesh=mesh)
+    else:
+        config.build(model, device_mesh=mesh)
+
+    assert captured["foreach"] is False
 
 
 class TestBuildOptimizerTuple:

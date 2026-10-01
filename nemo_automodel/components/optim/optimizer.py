@@ -287,7 +287,7 @@ class OptimizerConfig:
     ) -> torch.optim.Optimizer:
         """Build one optimizer from caller-defined parameter groups."""
         foreach = _foreach_for_mesh(device_mesh)
-        return self._build_optimizer(param_groups, foreach=foreach)
+        return self._build_optimizer(_split_dtensor_and_plain_params(param_groups), foreach=foreach)
 
 
 @dataclass
@@ -659,6 +659,7 @@ class OptimizerFromFactoryConfig(OptimizerConfig):
     ) -> torch.optim.Optimizer:
         assert callable(self.factory), "OptimizerFromFactoryConfig.factory must be a callable"
         foreach = _foreach_for_mesh(device_mesh)
+        param_groups = _split_dtensor_and_plain_params(param_groups)
 
         kwargs = dict(self.kwargs)
         is_te_fused_adam = _is_te_fused_adam(self.factory)
@@ -912,7 +913,9 @@ def _accepts_foreach(factory: Callable[..., Any]) -> bool:
         sig = inspect.signature(factory)
     except (TypeError, ValueError):
         return False
-    return "foreach" in sig.parameters
+    return "foreach" in sig.parameters or any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in sig.parameters.values()
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -78,7 +78,6 @@ def test_reject_unsupported_mtp_cp_allows_supported_or_disabled_model():
 
 
 def test_configure_fsdp_unused_param_reduction_uses_public_fsdp_api(monkeypatch):
-
     class FakeFSDPModule(nn.Module):
         def __init__(self):
             super().__init__()
