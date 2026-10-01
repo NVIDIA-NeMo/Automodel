@@ -18,8 +18,8 @@ The group-aware split is covered in ``test_retrieval_group_aware_split.py``. Thi
 covers the other half of the same change: carrying ``reasoning`` and ``global_query`` from
 the raw rows to the collator, and the argument validation that guards the builder.
 
-The loader is monkeypatched rather than reading files, so these stay CPU-only unit tests
-with no fixture corpus on disk.
+Loader wiring is isolated here. The real JSONL-to-collator path is covered by
+``test_qwen3_reranker_data_pipeline.py``.
 """
 
 import pytest
@@ -27,7 +27,7 @@ import pytest
 from nemo_automodel.components.datasets.llm import retrieval_dataset_inline as mod
 from nemo_automodel.components.datasets.llm.retrieval_dataset_inline import (
     _flatten_context_columns,
-    make_context_aware_retrieval_dataset,
+    ContextAwareRetrievalDatasetConfig,
 )
 
 # --------------------------------------------------------------------------------------
@@ -93,12 +93,12 @@ def test_no_context_columns_leaves_the_flattened_batch_untouched():
 
 def test_unknown_model_type_is_rejected():
     with pytest.raises(ValueError, match="model_type must be one of"):
-        make_context_aware_retrieval_dataset(data_dir_list=["unused"], model_type="tri_encoder")
+        ContextAwareRetrievalDatasetConfig(data_dir_list=["unused"], model_type="tri_encoder").build()
 
 
 def test_unknown_data_type_is_rejected():
     with pytest.raises(ValueError, match="Invalid data type"):
-        make_context_aware_retrieval_dataset(data_dir_list=["unused"], data_type="holdout")
+        ContextAwareRetrievalDatasetConfig(data_dir_list=["unused"], data_type="holdout").build()
 
 
 @pytest.mark.parametrize("fraction", [-0.1, 1.0, 1.5])
@@ -110,7 +110,7 @@ def test_validation_fraction_outside_zero_to_one_is_rejected(fraction):
     from the empty-side check, whose message blames the group count.
     """
     with pytest.raises(ValueError, match="validation_fraction must be in"):
-        make_context_aware_retrieval_dataset(data_dir_list=["unused"], validation_fraction=fraction)
+        ContextAwareRetrievalDatasetConfig(data_dir_list=["unused"], validation_fraction=fraction).build()
 
 
 # --------------------------------------------------------------------------------------
@@ -173,9 +173,9 @@ def stub_loader(monkeypatch):
 def test_builder_requests_the_configured_context_columns_from_the_loader(stub_loader):
     """The loader drops columns it was not asked for, so the names have to be threaded
     through -- otherwise the context silently never arrives."""
-    make_context_aware_retrieval_dataset(
+    ContextAwareRetrievalDatasetConfig(
         data_dir_list=["unused"], reasoning_column="trace", global_query_column="origin"
-    )
+    ).build()
 
     assert set(stub_loader["extra_columns"]) == {"trace", "origin"}
 
@@ -183,12 +183,12 @@ def test_builder_requests_the_configured_context_columns_from_the_loader(stub_lo
 def test_builder_renames_context_columns_to_the_collator_contract(stub_loader):
     """The collator reads ``reasoning``/``global_query``; the dataset may call them
     anything, so the transform has to rename them."""
-    make_context_aware_retrieval_dataset(
+    ContextAwareRetrievalDatasetConfig(
         data_dir_list=["unused"],
         model_type="bi_encoder",
         reasoning_column="trace",
         global_query_column="origin",
-    )
+    ).build()
 
     out = stub_loader["dataset"].transform(dict(RAW))
 
@@ -197,9 +197,9 @@ def test_builder_renames_context_columns_to_the_collator_contract(stub_loader):
 
 
 def test_cross_encoder_transform_flattens_while_bi_encoder_does_not(stub_loader):
-    make_context_aware_retrieval_dataset(
+    ContextAwareRetrievalDatasetConfig(
         data_dir_list=["unused"], model_type="cross_encoder", reasoning_column="trace", n_passages=2
-    )
+    ).build()
 
     out = stub_loader["dataset"].transform(dict(RAW))
 
@@ -208,14 +208,14 @@ def test_cross_encoder_transform_flattens_while_bi_encoder_does_not(stub_loader)
 
 
 def test_train_split_shuffles_and_windows_only_when_asked(stub_loader):
-    make_context_aware_retrieval_dataset(
+    ContextAwareRetrievalDatasetConfig(
         data_dir_list=["unused"],
         data_type="train",
         do_shuffle=True,
         seed=7,
         max_train_samples=1,
         train_data_select_offset=1,
-    )
+    ).build()
 
     dataset = stub_loader["dataset"]
     assert dataset.shuffled_with == 7
@@ -224,7 +224,7 @@ def test_train_split_shuffles_and_windows_only_when_asked(stub_loader):
 
 def test_eval_split_is_neither_shuffled_nor_windowed(stub_loader):
     """Shuffling an eval split would make the reported metric depend on the seed."""
-    make_context_aware_retrieval_dataset(data_dir_list=["unused"], data_type="eval", do_shuffle=True)
+    ContextAwareRetrievalDatasetConfig(data_dir_list=["unused"], data_type="eval", do_shuffle=True).build()
 
     assert stub_loader["dataset"].shuffled_with is None
     assert stub_loader["dataset"].selected is None

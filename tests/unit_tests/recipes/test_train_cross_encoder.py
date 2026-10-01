@@ -12,10 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for accuracy() and batch_mrr() from train_cross_encoder."""
+"""Cross-encoder metrics and loss precision in training and validation."""
 
+from contextlib import nullcontext
+from types import SimpleNamespace
+
+import pytest
 import torch
 
+from nemo_automodel.recipes.retrieval import train_cross_encoder as recipe_module
 from nemo_automodel.recipes.retrieval.train_cross_encoder import accuracy, batch_mrr
 
 # ---------------------------------------------------------------------------
@@ -113,3 +118,61 @@ def test_batch_mrr_wider_output():
     target = torch.tensor([2, 2, 3])
     mrr_sum = batch_mrr(output, target)
     torch.testing.assert_close(mrr_sum, torch.tensor(19.0 / 12.0))
+
+
+class _ScoreModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.scores = torch.nn.Parameter(
+            torch.tensor([9.875, 9.75, 9.625, 9.625, 9.875, 9.75], dtype=torch.bfloat16).view(6, 1)
+        )
+
+    def forward(self, input_ids, return_dict=True):
+        """Return fixed differentiable scores.
+
+        Args:
+            input_ids: Tensor of shape [pairs, sequence]; only batch size is checked.
+            return_dict: Match the recipe's model calling convention.
+
+        Returns:
+            Namespace with logits of shape [pairs, 1], aliasing the trainable scores.
+        """
+        assert input_ids.shape[0] == self.scores.shape[0]
+        return SimpleNamespace(logits=self.scores)
+
+
+@pytest.mark.parametrize("temperature", [1.0, 0.3])
+def test_recipe_loss_and_gradients_use_float32_before_temperature(monkeypatch, temperature):
+    model = _ScoreModel()
+    recipe = SimpleNamespace(
+        model_parts=[model],
+        temperature=temperature,
+        train_n_passages=3,
+        val_n_passages=3,
+        dist_env=SimpleNamespace(device=torch.device("cpu")),
+        distributed_config=None,
+        step_scheduler=SimpleNamespace(step=0, epoch=0),
+        _acc_buffer=[],
+    )
+    monkeypatch.setattr(recipe_module, "_get_autocast_ctx", lambda _: nullcontext())
+    monkeypatch.setattr(recipe_module, "get_sync_ctx", lambda *args, **kwargs: nullcontext())
+    batch = {"input_ids": torch.ones(6, 2, dtype=torch.long), "labels": torch.zeros(2, dtype=torch.long)}
+    scores = model.scores.detach().float().view(2, 3) / temperature
+    expected_loss = (torch.logsumexp(scores, dim=-1) - scores[:, 0]).mean()
+    # Analytic derivative of mean listwise cross-entropy, with two accumulated batches.
+    expected_grad = scores.softmax(dim=-1)
+    expected_grad[:, 0] -= 1
+    expected_grad /= 2 * temperature * 2
+
+    losses = []
+    recipe_module.TrainCrossEncoderRecipe._forward_backward_step(
+        recipe, 0, batch, loss_buffer=losses, num_batches=2, is_train=True
+    )
+    assert losses[0].dtype == torch.float32
+    torch.testing.assert_close(losses[0], expected_loss, rtol=1e-6, atol=2e-6)
+    torch.testing.assert_close(model.scores.grad, expected_grad.reshape(6, 1).to(torch.bfloat16), rtol=0, atol=0)
+
+    metrics = recipe_module.TrainCrossEncoderRecipe._run_validation_epoch(recipe, [batch]).metrics
+    assert metrics["val_loss"] == pytest.approx(expected_loss.item(), rel=1e-6, abs=2e-6)
+    assert metrics["val_acc1"] == 0.5
+    assert metrics["val_mrr"] == pytest.approx(2 / 3)

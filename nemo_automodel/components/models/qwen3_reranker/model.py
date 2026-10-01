@@ -102,7 +102,7 @@ class Qwen3RerankerConfig(Qwen3Config):
         self,
         yes_token_id: int | None = None,
         no_token_id: int | None = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> None:
         self.yes_token_id = yes_token_id
         self.no_token_id = no_token_id
@@ -336,8 +336,32 @@ class Qwen3RerankerForCausalReranking(Qwen3ForCausalLM):
         position_ids: torch.LongTensor | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
         labels: torch.LongTensor | None = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> SequenceClassifierOutputWithPast:
+        """Score each query-document pair at its last attended token.
+
+        Args:
+            input_ids: Tensor of shape [batch, sequence]; omit when inputs_embeds is given.
+            attention_mask: Tensor of shape [batch, sequence], with 1 for attended tokens
+                and 0 for padding. Left or right padding is supported; every row must
+                attend to at least one token.
+            position_ids: Optional tensor of shape [batch, sequence].
+            inputs_embeds: Optional tensor of shape [batch, sequence, hidden].
+            labels: Optional tensor of shape [batch] containing binary relevance classes
+                (0 for no, 1 for yes), not next-token IDs. The training recipe instead
+                computes its own loss over each query's candidate passages.
+            **kwargs: Hugging Face decoder options. Per-position vocabulary logits and
+                generation through this training class are unsupported.
+
+        Returns:
+            SequenceClassifierOutputWithPast with logits of shape [batch, 1], holding
+            logit(yes) - logit(no) in the LM head's output dtype. With labels, loss is a
+            float32 scalar. When requested, hidden_states contains tensors of shape
+            [batch, sequence, hidden], and attentions contains tensors of shape
+            [batch, heads, sequence, key_sequence]. past_key_values is the decoder's
+            Hugging Face cache, whose keys and values have shape
+            [batch, key_value_heads, cached_sequence, head_dim] per layer.
+        """
         if attention_mask is None:
             raise ValueError("attention_mask is required to locate the final token for yes/no scoring")
         if getattr(self.config, "yes_token_id", None) is None or getattr(self.config, "no_token_id", None) is None:

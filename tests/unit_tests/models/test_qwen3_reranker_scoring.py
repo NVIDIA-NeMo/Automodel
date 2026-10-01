@@ -64,7 +64,17 @@ def _tiny_model() -> Qwen3RerankerForCausalReranking:
 
 
 def _reference_p_yes(model, input_ids, attention_mask, last_idx) -> torch.Tensor:
-    """The model-card computation, run through the underlying causal LM."""
+    """Run the model-card probability computation through the underlying causal LM.
+
+    Args:
+        model: Causal language model with a vocabulary projection.
+        input_ids: Tensor of shape [batch, sequence].
+        attention_mask: Tensor of shape [batch, sequence], with zero padding positions.
+        last_idx: Tensor of shape [batch] with the scored position per row.
+
+    Returns:
+        Tensor of shape [batch] containing the probability of yes.
+    """
     hidden = model.model(input_ids=input_ids, attention_mask=attention_mask, return_dict=True).last_hidden_state
     logits = model.lm_head(hidden)  # [batch, sequence, vocab]
     last = logits[torch.arange(logits.shape[0]), last_idx]  # [batch, vocab]
@@ -172,7 +182,16 @@ def test_missing_attention_mask_raises():
 
 
 def _yes_minus_no_from_causal_lm(model, input_ids, attention_mask) -> torch.Tensor:
-    """Score a plain causal LM the way the model card does, at the final position."""
+    """Score a plain causal LM at the final position.
+
+    Args:
+        model: Causal language model with a vocabulary projection.
+        input_ids: Tensor of shape [batch, sequence], with an attended final token.
+        attention_mask: Tensor of shape [batch, sequence], with zero padding positions.
+
+    Returns:
+        Tensor of shape [batch] containing logit(yes) - logit(no).
+    """
     with torch.no_grad():
         logits = model(input_ids=input_ids, attention_mask=attention_mask).logits[:, -1, :]
     return logits[:, YES_ID] - logits[:, NO_ID]

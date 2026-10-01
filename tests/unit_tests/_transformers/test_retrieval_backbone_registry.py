@@ -56,7 +56,7 @@ def test_registered_embedding_backbone_still_wins():
 
 
 def test_unknown_task_still_raises_for_known_model_type():
-    """Only "embedding" falls through; a genuinely unknown task must still fail loudly."""
+    """Only supported tasks fall through; an unknown task must still fail loudly."""
     with pytest.raises(ValueError, match="Unsupported task 'captioning'"):
         _get_supported_backbone_class("qwen3", "captioning")
 

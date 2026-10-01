@@ -23,7 +23,7 @@ import pytest
 
 from nemo_automodel.components.datasets.llm.retrieval_dataset_inline import (
     _group_aware_split,
-    make_context_aware_retrieval_dataset,
+    ContextAwareRetrievalDatasetConfig,
 )
 
 SEED = 42
@@ -179,17 +179,17 @@ def test_zero_fraction_never_raises_even_with_one_group():
 @pytest.mark.parametrize("fraction", [-0.1, -1.0, 1.0, 1.5])
 def test_out_of_range_validation_fraction_is_rejected(fraction):
     with pytest.raises(ValueError, match=r"validation_fraction must be in \[0, 1\)"):
-        make_context_aware_retrieval_dataset(
+        ContextAwareRetrievalDatasetConfig(
             data_dir_list="unread.jsonl",
             validation_fraction=fraction,
             validation_group_key=GROUP_KEY,
-        )
+        ).build()
 
 
 def test_out_of_range_fraction_is_caught_before_any_data_is_read():
     """The path does not exist, so reaching the loader would raise something else."""
     with pytest.raises(ValueError, match="validation_fraction"):
-        make_context_aware_retrieval_dataset(
+        ContextAwareRetrievalDatasetConfig(
             data_dir_list="/nonexistent/path/never/opened.jsonl",
             validation_fraction=-0.5,
-        )
+        ).build()

@@ -563,97 +563,6 @@ def _group_aware_split(dataset, validation_fraction: float, group_key: str | Non
     return dataset.select(indices)
 
 
-def make_context_aware_retrieval_dataset(
-    data_dir_list: Union[List[str], str],
-    model_type: str = "cross_encoder",
-    data_type: str = "train",
-    n_passages: int = 8,
-    validation_fraction: float = 0.0,
-    validation_group_key: str | None = None,
-    reasoning_column: str | None = None,
-    global_query_column: str | None = None,
-    seed: int = 42,
-    do_shuffle: bool = False,
-    max_train_samples: int | None = None,
-    train_data_select_offset: int = 0,
-):
-    """Inline retrieval dataset that also carries per-query context columns.
-
-    Same ``pos_doc``/``neg_doc`` schema and loader as :func:`make_retrieval_dataset`,
-    plus two things it does not provide:
-
-    * ``reasoning_column`` / ``global_query_column`` are passed through as ``reasoning``
-      and ``global_query``. ``Qwen3RerankerCollator`` reads both with ``.get()`` and
-      selects its prompt mode from whichever survive its drop probabilities, so rows
-      missing them simply train in a narrower mode.
-    * ``validation_fraction`` carves a held-out slice at the level of
-      ``validation_group_key`` rather than the row, so rows sharing a group cannot land
-      on opposite sides.
-
-    Args:
-        data_dir_list: Path(s) to inline JSON/JSONL with ``query``/``pos_doc``/``neg_doc``.
-        model_type: ``"cross_encoder"`` or ``"bi_encoder"``.
-        data_type: ``"train"``, or ``"validation"``/``"eval"`` for the held-out side.
-        n_passages: Passages per query (1 positive + ``n_passages - 1`` negatives).
-        validation_fraction: Fraction of groups held out, in [0, 1). 0 uses the whole
-            split; values outside the range are rejected.
-        validation_group_key: Column defining a group; None groups by row.
-        reasoning_column: Column holding the reasoning trace.
-        global_query_column: Column holding the originating question.
-        seed: Seeds the split and any shuffle.
-        do_shuffle: Shuffle before subsetting (train only).
-        max_train_samples: Cap on training rows, applied after the split.
-        train_data_select_offset: Offset of the selected window.
-
-    Returns:
-        A ``Dataset`` whose transform emits question/doc_text plus the context columns.
-    """
-    _VALID_MODEL_TYPES = ("bi_encoder", "cross_encoder")
-    if model_type not in _VALID_MODEL_TYPES:
-        raise ValueError(f"model_type must be one of {_VALID_MODEL_TYPES}, got {model_type!r}")
-    if data_type not in ("train", "validation", "eval"):
-        raise ValueError(f"Invalid data type: {data_type}")
-    # Both ends fail silently rather than loudly if left unchecked. A negative fraction skips
-    # the split below entirely, so the validation build returns the WHOLE dataset and every
-    # training row is also an eval row -- total leakage, no error. A fraction of 1 or more
-    # puts every group in validation; that does raise, but from the empty-side check, whose
-    # message blames the group count and suggests changing the seed, none of which is the
-    # problem. Reject the value here, where it was supplied.
-    if not 0.0 <= validation_fraction < 1.0:
-        raise ValueError(f"validation_fraction must be in [0, 1), got {validation_fraction!r}")
-
-    requested = tuple(c for c in (reasoning_column, global_query_column, validation_group_key) if c)
-    dataset, corpus_dict = load_datasets(data_dir_list, concatenate=True, extra_columns=requested)
-    logging.info(f"Loaded dataset with {len(dataset)} examples")
-
-    if validation_fraction > 0:
-        dataset = _group_aware_split(dataset, validation_fraction, validation_group_key, data_type, seed)
-
-    if data_type == "train":
-        if do_shuffle:
-            dataset = dataset.shuffle(seed=seed)
-        if max_train_samples is not None:
-            dataset = dataset.select(
-                range(train_data_select_offset, min(train_data_select_offset + max_train_samples, len(dataset)))
-            )
-
-    context_columns = tuple(c for c in ((reasoning_column, "reasoning"), (global_query_column, "global_query")) if c[0])
-    negative_size = n_passages - 1
-
-    def transform(examples):
-        data = _retrieval_transform_func(examples, negative_size, corpus_dict)
-        for source, target in context_columns:
-            if source in examples:
-                data[target] = examples[source]
-        if model_type == "bi_encoder":
-            return data
-        return _flatten_context_columns(data, tuple(t for _, t in context_columns))
-
-    dataset.set_transform(transform)
-    logging.info(f"Created {data_type} dataset with {len(dataset)} examples")
-    return dataset
-
-
 @dataclass
 class InlineRetrievalDatasetConfig:
     """Construction-time configuration for inline retrieval datasets."""
@@ -687,7 +596,34 @@ class InlineRetrievalDatasetConfig:
 
 @dataclass
 class ContextAwareRetrievalDatasetConfig:
-    """Construction-time configuration for context-aware inline retrieval datasets."""
+    """Inline retrieval dataset that also carries per-query context columns.
+
+    Same ``pos_doc``/``neg_doc`` schema and loader as :func:`make_retrieval_dataset`,
+    plus two things it does not provide:
+
+    * ``reasoning_column`` / ``global_query_column`` are passed through as ``reasoning``
+      and ``global_query``. ``Qwen3ContextAwareRerankerCollator`` reads both with ``.get()`` and
+      selects its prompt mode from whichever survive its drop probabilities, so rows
+      missing them simply train in a narrower mode.
+    * ``validation_fraction`` carves a held-out slice at the level of
+      ``validation_group_key`` rather than the row, so rows sharing a group cannot land
+      on opposite sides.
+
+    Attributes:
+        data_dir_list: Path(s) to inline JSON/JSONL with ``query``/``pos_doc``/``neg_doc``.
+        model_type: ``"cross_encoder"`` or ``"bi_encoder"``.
+        data_type: ``"train"``, or ``"validation"``/``"eval"`` for the held-out side.
+        n_passages: Passages per query (1 positive + ``n_passages - 1`` negatives).
+        validation_fraction: Fraction of groups held out, in [0, 1). 0 uses the whole
+            split; values outside the range are rejected.
+        validation_group_key: Column defining a group; None groups by row.
+        reasoning_column: Column holding the reasoning trace.
+        global_query_column: Column holding the originating question.
+        seed: Seeds the split and any shuffle.
+        do_shuffle: Shuffle before subsetting (train only).
+        max_train_samples: Cap on training rows, applied after the split.
+        train_data_select_offset: Offset of the selected window.
+    """
 
     data_dir_list: list[str] | str
     model_type: str = "cross_encoder"
@@ -703,18 +639,61 @@ class ContextAwareRetrievalDatasetConfig:
     train_data_select_offset: int = 0
 
     def build(self) -> Dataset:
-        """Build the context-aware retrieval dataset from this config."""
-        return make_context_aware_retrieval_dataset(
-            data_dir_list=self.data_dir_list,
-            model_type=self.model_type,
-            data_type=self.data_type,
-            n_passages=self.n_passages,
-            validation_fraction=self.validation_fraction,
-            validation_group_key=self.validation_group_key,
-            reasoning_column=self.reasoning_column,
-            global_query_column=self.global_query_column,
-            seed=self.seed,
-            do_shuffle=self.do_shuffle,
-            max_train_samples=self.max_train_samples,
-            train_data_select_offset=self.train_data_select_offset,
+        """Build the dataset with normalized context and a group-aware split.
+
+        Returns:
+            Dataset whose transform emits question/doc_text plus the context columns.
+            Cross-encoder batches repeat each query's context once per passage.
+        """
+        model_type = self.model_type
+        _VALID_MODEL_TYPES = ("bi_encoder", "cross_encoder")
+        if model_type not in _VALID_MODEL_TYPES:
+            raise ValueError(f"model_type must be one of {_VALID_MODEL_TYPES}, got {model_type!r}")
+        if self.data_type not in ("train", "validation", "eval"):
+            raise ValueError(f"Invalid data type: {self.data_type}")
+        # Both ends fail silently rather than loudly if left unchecked. A negative fraction skips
+        # the split below entirely, so the validation build returns the WHOLE dataset and every
+        # training row is also an eval row -- total leakage, no error. A fraction of 1 or more
+        # puts every group in validation; that does raise, but from the empty-side check, whose
+        # message blames the group count and suggests changing the seed, none of which is the
+        # problem. Reject the value here, where it was supplied.
+        if not 0.0 <= self.validation_fraction < 1.0:
+            raise ValueError(f"validation_fraction must be in [0, 1), got {self.validation_fraction!r}")
+
+        requested = tuple(c for c in (self.reasoning_column, self.global_query_column, self.validation_group_key) if c)
+        dataset, corpus_dict = load_datasets(self.data_dir_list, concatenate=True, extra_columns=requested)
+        logging.info(f"Loaded dataset with {len(dataset)} examples")
+
+        if self.validation_fraction > 0:
+            dataset = _group_aware_split(
+                dataset, self.validation_fraction, self.validation_group_key, self.data_type, self.seed
+            )
+
+        if self.data_type == "train":
+            if self.do_shuffle:
+                dataset = dataset.shuffle(seed=self.seed)
+            if self.max_train_samples is not None:
+                dataset = dataset.select(
+                    range(
+                        self.train_data_select_offset,
+                        min(self.train_data_select_offset + self.max_train_samples, len(dataset)),
+                    )
+                )
+
+        context_columns = tuple(
+            c for c in ((self.reasoning_column, "reasoning"), (self.global_query_column, "global_query")) if c[0]
         )
+        negative_size = self.n_passages - 1
+
+        def transform(examples):
+            data = _retrieval_transform_func(examples, negative_size, corpus_dict)
+            for source, target in context_columns:
+                if source in examples:
+                    data[target] = examples[source]
+            if model_type == "bi_encoder":
+                return data
+            return _flatten_context_columns(data, tuple(t for _, t in context_columns))
+
+        dataset.set_transform(transform)
+        logging.info(f"Created {self.data_type} dataset with {len(dataset)} examples")
+        return dataset

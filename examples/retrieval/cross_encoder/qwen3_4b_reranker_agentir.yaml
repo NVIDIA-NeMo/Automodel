@@ -16,16 +16,17 @@
 # Qwen3-Reranker-4B, listwise: 1 positive + 7 hard negatives per query, scored as one
 # softmax per group.
 #
-# TODO: point this at the published Hugging Face dataset instead of a local JSONL, so the
-# example runs without first building data on a shared filesystem. The schema below is
-# what the loader expects either way and stays valid after the switch.
+# Supply your own JSONL using the schema below. Place it at
+# ./data/agentir_v39_inline.jsonl, or update both dataset.data_dir_list and
+# validation_dataset.data_dir_list to its path. The dataset is not bundled.
 #
 # EXPECTED DATA FORMAT
 # --------------------
 # JSONL, one training instance per line:
 #
 #   {
-#     "query_id":     "<str>",     required, unique per row
+#     "id":           "<str>",     optional row id; also accepts question_id, otherwise
+#                                  defaults to filename + row index
 #     "global_qid":   "<str>",     required, the session id -- shared by every turn of one
 #                                  trajectory, and by every labeling variant of the same
 #                                  question. This is the split key (validation_group_key)
@@ -55,13 +56,12 @@
 # (drop_seed, epoch, field, query), so it is identical across runs, workers and ranks.
 #
 # VALIDATION SPLIT. validation_group_key: global_qid holds every sub-query of one
-# originating question on the same side of the split. Keying on query_id would place sibling
-# sub-queries on opposite sides, which leaks -- and in the mixes query_id is not even unique,
-# since one sub-query appears once per labeling variant. Keying on global_query text is also
+# originating question on the same side of the split. Keying on a row/sub-query id would
+# place sibling sub-queries on opposite sides, which leaks. Keying on global_query text is also
 # wrong: it is a long free-text field, and a session whose rows disagree by one character
 # splits in two.
 #
-#   automodel examples/retrieval/cross_encoder/qwen3_4b_reranker_agentir.yaml --nproc-per-node 8
+#   uv run automodel examples/retrieval/cross_encoder/qwen3_4b_reranker_agentir.yaml --nproc-per-node 8
 recipe: TrainCrossEncoderRecipe
 
 seed: 42
@@ -116,8 +116,7 @@ dataloader:
     sub_query_max_length: 256
     reasoning_max_length: 512
     pad_to_multiple_of: 8
-    # Each context field is dropped independently per query, so one model covers the
-    # base and reasoning prompt modes.
+    # Independent drops cover base, reasoning, global-query, and combined prompt modes.
     reasoning_drop_prob: 0.5
     global_query_drop_prob: 0.5
     drop_seed: 42
