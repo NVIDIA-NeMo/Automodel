@@ -381,7 +381,7 @@ def test_accumulated_grad_bucketing_skips_units_that_never_ran_forward(monkeypat
 
     monkeypatch.setattr(FSDPParam, "to_accumulated_grad_if_needed", upstream_to_accumulated)
     monkeypatch.setattr(FSDPParamGroup, "post_backward", _upstream_like_post_backward([]))
-    # Same installation order as DefaultParallelizationStrategy.parallelize.
+    # Same installation order as ModelParallelizer._apply.
     patch_fsdp_accumulated_grad_guard()
     patch_fsdp_accumulated_grad_bucketing()
 
@@ -609,19 +609,21 @@ def test_get_module_from_path():
     assert mod2 is model.b.l2
 
 
-def test__fully_shard_calls_for_single_module(monkeypatch):
+def test__fully_shard_calls_for_single_module():
     calls: list[tuple[nn.Module, object, object, object]] = []
 
     def fake_fully_shard(mod, *, mesh, mp_policy, offload_policy, reshard_after_forward=None):
         calls.append((mod, mesh, mp_policy, offload_policy))
 
-    # Monkeypatch the symbol inside the utils module
-    monkeypatch.setattr(
-        "nemo_automodel.components.distributed.fsdp2_extensions.utils.fully_shard", fake_fully_shard, raising=True
-    )
     mod = nn.Linear(2, 2, bias=False)
     mesh, mp_policy, offload_policy = object(), object(), object()
-    _fully_shard(mod, mesh=mesh, mp_policy=mp_policy, offload_policy=offload_policy)
+    _fully_shard(
+        mod,
+        mesh=mesh,
+        mp_policy=mp_policy,
+        offload_policy=offload_policy,
+        shard_module=fake_fully_shard,
+    )
 
     assert len(calls) == 1
     called_mod, called_mesh, called_mp, called_offload = calls[0]
@@ -629,19 +631,21 @@ def test__fully_shard_calls_for_single_module(monkeypatch):
     assert called_mesh is mesh and called_mp is mp_policy and called_offload is offload_policy
 
 
-def test__fully_shard_calls_for_modulelist(monkeypatch):
+def test__fully_shard_calls_for_modulelist():
     calls: list[nn.Module] = []
 
     def fake_fully_shard(mod, *, mesh, mp_policy, offload_policy, reshard_after_forward=None):
         calls.append(mod)
 
-    monkeypatch.setattr(
-        "nemo_automodel.components.distributed.fsdp2_extensions.utils.fully_shard", fake_fully_shard, raising=True
-    )
-
     ml = nn.ModuleList([nn.Linear(2, 2, bias=False), nn.Linear(2, 2, bias=False)])
     mesh, mp_policy, offload_policy = object(), object(), object()
-    _fully_shard(ml, mesh=mesh, mp_policy=mp_policy, offload_policy=offload_policy)
+    _fully_shard(
+        ml,
+        mesh=mesh,
+        mp_policy=mp_policy,
+        offload_policy=offload_policy,
+        shard_module=fake_fully_shard,
+    )
 
     # Should call for each child, not the ModuleList itself
     assert len(calls) == 2
@@ -700,7 +704,7 @@ def test_fully_shard_by_dtype_no_params(monkeypatch):
     def fake_fully_shard(mod, *, mesh, mp_policy, offload_policy, reshard_after_forward=None):
         fully_calls.append(mod)
 
-    def fake__fully_shard(mod, *, mesh, mp_policy, offload_policy, reshard_after_forward=None):
+    def fake__fully_shard(mod, *, mesh, mp_policy, offload_policy, reshard_after_forward=None, **_kwargs):
         sub_calls.append(mod)
 
     monkeypatch.setattr(
@@ -725,7 +729,7 @@ def test_fully_shard_by_dtype_single_dtype(monkeypatch):
     def fake_fully_shard(mod, *, mesh, mp_policy, offload_policy, reshard_after_forward=None):
         fully_calls.append((mod, mp_policy, reshard_after_forward))
 
-    def fake__fully_shard(mod, *, mesh, mp_policy, offload_policy, reshard_after_forward=None):
+    def fake__fully_shard(mod, *, mesh, mp_policy, offload_policy, reshard_after_forward=None, **_kwargs):
         sub_calls.append((mod, mp_policy))
 
     monkeypatch.setattr(
@@ -817,14 +821,12 @@ def test_fully_shard_by_dtype_storage_equals_compute_keeps_storage_dtype(monkeyp
     def fake_fully_shard(mod, *, mesh, mp_policy, offload_policy, reshard_after_forward=None):
         fully_calls.append((mod, mp_policy))
 
-    monkeypatch.setattr(
-        "nemo_automodel.components.distributed.fsdp2_extensions.utils.fully_shard", fake_fully_shard, raising=True
-    )
-
     # bf16 storage and bf16 compute -> param_dtype stays bf16 (no decoupling needed).
     model = ToyModel(a_dtype=torch.bfloat16, b_dtype_l1=torch.bfloat16, b_dtype_l2=torch.bfloat16)
     mp_policy = _make_mp_policy()
-    fully_shard_by_dtype(model, mesh=object(), mp_policy=mp_policy, offload_policy=object())
+    fully_shard_by_dtype(
+        model, mesh=object(), mp_policy=mp_policy, offload_policy=object(), fully_shard_fn=fake_fully_shard
+    )
 
     assert [mod for mod, _ in fully_calls] == [model]
     assert fully_calls[0][1].param_dtype == torch.bfloat16
@@ -837,13 +839,11 @@ def test_fully_shard_by_dtype_genuine_fp32_compute_unchanged(monkeypatch):
     def fake_fully_shard(mod, *, mesh, mp_policy, offload_policy, reshard_after_forward=None):
         fully_calls.append((mod, mp_policy))
 
-    monkeypatch.setattr(
-        "nemo_automodel.components.distributed.fsdp2_extensions.utils.fully_shard", fake_fully_shard, raising=True
-    )
-
     model = ToyModel(a_dtype=torch.float32, b_dtype_l1=torch.float32, b_dtype_l2=torch.float32)
     mp_policy = MixedPrecisionPolicy(param_dtype=torch.float32, reduce_dtype=torch.float32, output_dtype=torch.float32)
-    fully_shard_by_dtype(model, mesh=object(), mp_policy=mp_policy, offload_policy=object())
+    fully_shard_by_dtype(
+        model, mesh=object(), mp_policy=mp_policy, offload_policy=object(), fully_shard_fn=fake_fully_shard
+    )
 
     assert [mod for mod, _ in fully_calls] == [model]
     assert fully_calls[0][1].param_dtype == torch.float32
@@ -1160,7 +1160,7 @@ def test_fully_shard_by_dtype_fp32_master_pins_compute(monkeypatch):
     def fake_fully_shard(mod, *, mesh, mp_policy, offload_policy, reshard_after_forward=None):
         fully_calls.append((mod, mp_policy, reshard_after_forward))
 
-    def fake__fully_shard(mod, *, mesh, mp_policy, offload_policy, reshard_after_forward=None):
+    def fake__fully_shard(mod, *, mesh, mp_policy, offload_policy, reshard_after_forward=None, **_kwargs):
         sub_calls.append((mod, mp_policy, reshard_after_forward))
 
     monkeypatch.setattr(
@@ -1212,7 +1212,7 @@ def test_fully_shard_by_dtype_fp32_master_hf_recorded_compute(monkeypatch):
     def fake_fully_shard(mod, *, mesh, mp_policy, offload_policy, reshard_after_forward=None):
         fully_calls.append((mod, mp_policy, reshard_after_forward))
 
-    def fake__fully_shard(mod, *, mesh, mp_policy, offload_policy, reshard_after_forward=None):
+    def fake__fully_shard(mod, *, mesh, mp_policy, offload_policy, reshard_after_forward=None, **_kwargs):
         sub_calls.append((mod, mp_policy, reshard_after_forward))
 
     monkeypatch.setattr(
@@ -1254,7 +1254,7 @@ def test_fully_shard_by_dtype_two_dtypes(monkeypatch):
     def fake_fully_shard(mod, *, mesh, mp_policy, offload_policy, reshard_after_forward=None):
         fully_calls.append((mod, mp_policy))
 
-    def fake__fully_shard(mod, *, mesh, mp_policy, offload_policy, reshard_after_forward=None):
+    def fake__fully_shard(mod, *, mesh, mp_policy, offload_policy, reshard_after_forward=None, **_kwargs):
         sub_calls.append((mod, mp_policy))
 
     monkeypatch.setattr(
@@ -1286,7 +1286,7 @@ def test_fully_shard_by_dtype_internal_child_preserves_natural_output_dtype(monk
     def fake_fully_shard(mod, *, mesh, mp_policy, offload_policy, reshard_after_forward=None):
         fully_calls.append((mod, mp_policy))
 
-    def fake__fully_shard(mod, *, mesh, mp_policy, offload_policy, reshard_after_forward=None):
+    def fake__fully_shard(mod, *, mesh, mp_policy, offload_policy, reshard_after_forward=None, **_kwargs):
         sub_calls.append((mod, mp_policy))
 
     monkeypatch.setattr(
@@ -1316,7 +1316,7 @@ def test_fully_shard_by_dtype_internal_child_preserves_natural_output_dtype(monk
     assert mp_policy.output_dtype == torch.float32
 
 
-def test_fully_shard_by_dtype_excludes_ep_params_and_uses_custom_sharder():
+def test_fully_shard_by_dtype_excludes_ep_params(monkeypatch):
     """Ignored EP experts do not affect grouping and remain excluded from the block unit."""
 
     class Router(nn.Module):
@@ -1340,6 +1340,10 @@ def test_fully_shard_by_dtype_excludes_ep_params_and_uses_custom_sharder():
     def custom_fully_shard(module, **kwargs):
         calls.append((module, kwargs))
 
+    monkeypatch.setattr(
+        "nemo_automodel.components.distributed.fsdp2_extensions.utils.fully_shard",
+        custom_fully_shard,
+    )
     fully_shard_by_dtype(
         block,
         mesh=object(),
@@ -1348,7 +1352,6 @@ def test_fully_shard_by_dtype_excludes_ep_params_and_uses_custom_sharder():
         fp32_compute_module_names=("gate.weight", "gate.e_score_correction_bias"),
         reshard_after_forward=False,
         ignored_params=expert_params,
-        fully_shard_fn=custom_fully_shard,
     )
 
     assert [module for module, _ in calls] == [block.gate, block]
@@ -1359,7 +1362,7 @@ def test_fully_shard_by_dtype_excludes_ep_params_and_uses_custom_sharder():
     assert all(module is not block.experts for module, _ in calls)
 
 
-def test_fully_shard_by_dtype_fp32_holder_preserves_natural_output_dtype():
+def test_fully_shard_by_dtype_fp32_holder_preserves_natural_output_dtype(monkeypatch):
     """Internal fp32 holders keep fp32 compute without forcing their output dtype."""
 
     class Fp32Holder(nn.Module):
@@ -1379,6 +1382,10 @@ def test_fully_shard_by_dtype_fp32_holder_preserves_natural_output_dtype():
 
     block = HybridBlock()
     calls: list[tuple[nn.Module, dict]] = []
+    monkeypatch.setattr(
+        "nemo_automodel.components.distributed.fsdp2_extensions.utils.fully_shard",
+        lambda module, **kwargs: calls.append((module, kwargs)),
+    )
 
     fully_shard_by_dtype(
         block,
@@ -1391,7 +1398,6 @@ def test_fully_shard_by_dtype_fp32_holder_preserves_natural_output_dtype():
         ),
         offload_policy=object(),
         fp32_compute_module_names=("_fp32_params",),
-        fully_shard_fn=lambda module, **kwargs: calls.append((module, kwargs)),
     )
 
     holder_policy = next(kwargs["mp_policy"] for module, kwargs in calls if module is block._fp32_params)
@@ -1401,7 +1407,7 @@ def test_fully_shard_by_dtype_fp32_holder_preserves_natural_output_dtype():
     assert holder_policy.cast_forward_inputs is False
 
 
-def test_fully_shard_by_dtype_ignored_params_do_not_change_uniform_storage_fallback():
+def test_fully_shard_by_dtype_ignored_params_do_not_change_uniform_storage_fallback(monkeypatch):
     """An ignored expert dtype must not make uniform managed master weights look mixed."""
 
     class BlockWithIgnoredExperts(nn.Module):
@@ -1413,6 +1419,10 @@ def test_fully_shard_by_dtype_ignored_params_do_not_change_uniform_storage_fallb
     block = BlockWithIgnoredExperts()
     expert_params = set(block.experts.parameters())
     calls: list[tuple[nn.Module, dict]] = []
+    monkeypatch.setattr(
+        "nemo_automodel.components.distributed.fsdp2_extensions.utils.fully_shard",
+        lambda module, **kwargs: calls.append((module, kwargs)),
+    )
 
     fully_shard_by_dtype(
         block,
@@ -1420,7 +1430,6 @@ def test_fully_shard_by_dtype_ignored_params_do_not_change_uniform_storage_fallb
         mp_policy=_make_mp_policy(),
         offload_policy=object(),
         ignored_params=expert_params,
-        fully_shard_fn=lambda module, **kwargs: calls.append((module, kwargs)),
     )
 
     assert [module for module, _ in calls] == [block]
@@ -1446,7 +1455,6 @@ def test_fully_shard_by_dtype_rejects_unisolatable_mixed_parameter_owner():
             mp_policy=_make_mp_policy(),
             offload_policy=object(),
             fp32_compute_module_names=("weight",),
-            fully_shard_fn=lambda *args, **kwargs: None,
         )
 
 
@@ -1457,7 +1465,7 @@ def test_fully_shard_by_dtype_three_dtypes(monkeypatch):
     def fake_fully_shard(mod, *, mesh, mp_policy, offload_policy, reshard_after_forward=None):
         fully_calls.append((mod, mp_policy))
 
-    def fake__fully_shard(mod, *, mesh, mp_policy, offload_policy, reshard_after_forward=None):
+    def fake__fully_shard(mod, *, mesh, mp_policy, offload_policy, reshard_after_forward=None, **_kwargs):
         sub_calls.append((mod, mp_policy))
 
     monkeypatch.setattr(
@@ -1500,9 +1508,7 @@ def test_compute_dtype_pins_logical_names_through_activation_checkpointing():
     model = nn.Module()
     model.attn = checkpoint_wrapper(attention)
 
-    compute_dtype_of = make_parameter_compute_dtype_resolver(
-        model, _make_mp_policy(), ("attn.sinks_param",)
-    )
+    compute_dtype_of = make_parameter_compute_dtype_resolver(model, _make_mp_policy(), ("attn.sinks_param",))
 
     assert compute_dtype_of(attention.sinks_param.weight) == torch.float32
     assert compute_dtype_of(attention.sinks_param.scale) == torch.float32

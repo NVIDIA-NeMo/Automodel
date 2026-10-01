@@ -12,22 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Qwen3.5 owns registration of its distributed precision policy."""
+"""Qwen3.5 owns its model-class parallelization sidecar."""
 
-from nemo_automodel.components.distributed.parallelizer import PARALLELIZATION_STRATEGIES
-from nemo_automodel.components.models.qwen3_5.parallelization import (
-    Qwen3_5ParallelizationStrategy,
-    register_qwen3_5_parallel_strategy,
-)
+from nemo_automodel.components.distributed.model_parallelizer import get_model_parallelizer
+from nemo_automodel.components.models.qwen3_5.model import Qwen3_5ForCausalLM, Qwen3_5ForConditionalGeneration
+from nemo_automodel.components.models.qwen3_5.parallelization import PARALLELIZER, Qwen3_5ModelParallelizer
 
 
-def test_qwen3_5_registers_both_native_model_classes_idempotently():
-    register_qwen3_5_parallel_strategy()
-    first = {
-        name: PARALLELIZATION_STRATEGIES[name] for name in ("Qwen3_5ForCausalLM", "Qwen3_5ForConditionalGeneration")
-    }
-
-    register_qwen3_5_parallel_strategy()
-
-    assert all(isinstance(strategy, Qwen3_5ParallelizationStrategy) for strategy in first.values())
-    assert all(PARALLELIZATION_STRATEGIES[name] is strategy for name, strategy in first.items())
+def test_qwen3_5_models_resolve_the_model_owned_sidecar():
+    assert isinstance(PARALLELIZER, Qwen3_5ModelParallelizer)
+    for cls in (Qwen3_5ForCausalLM, Qwen3_5ForConditionalGeneration):
+        model = cls.__new__(cls)
+        assert get_model_parallelizer(model) is PARALLELIZER

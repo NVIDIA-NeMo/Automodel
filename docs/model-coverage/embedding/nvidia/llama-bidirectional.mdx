@@ -1,36 +1,67 @@
 ---
-title: "Llama (Bidirectional) for Embedding"
-description: ""
-slug: model-coverage/embedding-models/nvidia/llama-bidirectional
+title: "llama-embed-nemotron-8b"
+description: "Use llama-embed-nemotron-8b with NeMo AutoModel for embedding training, with documented checkpoints, runnable recipes, setup guidance, and model reference details."
+slug: model-coverage/embedding-models/nvidia/llama-embed-nemotron-8b
 ---
 
-NeMo AutoModel provides a bidirectional variant of [Meta's Llama](https://www.llama.com/) for embedding and dense retrieval tasks. Unlike the standard causal (left-to-right) Llama used for text generation, this variant uses **bidirectional attention**, so each token can attend to both past and future tokens in the sequence, producing richer representations for semantic similarity and dense retrieval.
+NeMo AutoModel provides a retrieval variant of [Meta's Llama](https://www.llama.com/) for embedding and dense retrieval tasks. It defaults to **bidirectional attention**, so each token can attend to both past and future tokens in the sequence, and can also preserve or explicitly select standard causal attention.
 
-For the cross-encoder variant, see [Llama (Bidirectional) for Reranking](/model-coverage/reranking-models/nvidia/llama-bidirectional).
+For the cross-encoder variant, see [Llama (Bidirectional) for Reranking](/model-coverage/reranking-models/nvidia/llama-nemotron-rerank-1b-v2).
 
-| | |
-|---|---|
-| **Tasks** | Embedding, Dense Retrieval |
-| **Architecture** | `LlamaBidirectionalModel` |
-| **Parameters** | 1B – 8B |
-| **HF Org** | [meta-llama](https://huggingface.co/meta-llama) |
+Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
-## Available Models
+## Train Embeddings with llama-embed-nemotron-8b
 
-Any Llama checkpoint can be loaded as a bidirectional backbone. The following configurations are tested:
+From the repository root, run:
 
-- **Llama 3.2 1B** — fast iteration, fits on a single GPU
-- **Llama 3.1 8B** — higher-quality embeddings for production use
+```bash
+uv run automodel \
+  examples/retrieval/bi_encoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml \
+  --nproc-per-node 8
+```
 
-## Embedding Models
+## Choose a Workflow
+
+| Goal | Start Here |
+| --- | --- |
+| Bi-encoder - reproduction recipe for [`nvidia/llama-embed-nemotron-8b`](https://huggingface.co/nvidia/llama-embed-nemotron-8b) (uses [`nvidia/embed-nemotron-dataset-v1`](https://huggingface.co/datasets/nvidia/embed-nemotron-dataset-v1)) | Use [llama_embed_nemotron_8b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/bi_encoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml). |
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+| --- | --- |
+| Tasks | Embedding, Dense Retrieval |
+| Architecture | `LlamaBidirectionalModel` |
+| Parameters | 8B |
+| Hugging Face Organization | [meta-llama](https://huggingface.co/meta-llama) |
+
+### Embedding Models
 
 The bidirectional bi-encoder path is used for embedding generation and dense retrieval.
 
 | Architecture | Task | Auto Class | Description |
 |---|---|---|---|
-| `LlamaBidirectionalModel` | Embedding | [`NeMoAutoModelBiEncoder`](https://github.com/NVIDIA-NeMo/Automodel/blob/8dc00dcb4a35c2413c52c6e7eb7ac8f1c24836aa/nemo_automodel/_transformers/auto_model.py#L991) | Bidirectional Llama with mean pooling for dense embeddings |
+| `LlamaBidirectionalModel` | Embedding | [`NeMoAutoModelBiEncoder`](https://github.com/NVIDIA-NeMo/Automodel/blob/8dc00dcb4a35c2413c52c6e7eb7ac8f1c24836aa/nemo_automodel/_transformers/auto_model.py#L991) | Llama with configurable attention and mean pooling for dense embeddings |
 
-## Pooling Strategies
+### Attention Mode
+
+Set `model.is_causal` in a bi-encoder recipe:
+
+```yaml
+model:
+  _target_: nemo_automodel.NeMoAutoModelBiEncoder.from_pretrained
+  is_causal: false
+```
+
+An explicit value takes precedence over the value saved in the checkpoint's text config. When neither exists, the
+bi-encoder defaults to `false`. The resolved value is persisted when the model is saved. Cross-encoders expose their own
+`is_causal` setting and otherwise preserve their saved or native attention mode. For Llama Nemotron VL, the bi-encoder
+setting changes only the language tower; vision attention remains unchanged. Changing the policy changes embeddings, so
+regenerate any stored corpus embeddings before using the updated model.
+
+### Pooling Strategies
 
 The bi-encoder supports multiple pooling strategies to aggregate token representations into a single embedding vector:
 
@@ -41,70 +72,16 @@ The bi-encoder supports multiple pooling strategies to aggregate token represent
 | `last` | Last non-padding token hidden state |
 | `weighted_avg` | Weighted average of token hidden states |
 
-## Example HF Models
+### Available Models
 
 | Model | HF ID |
 |---|---|
-| Llama 3.2 1B | [`meta-llama/Llama-3.2-1B`](https://huggingface.co/meta-llama/Llama-3.2-1B) |
 | Llama 3.1 8B | [`meta-llama/Llama-3.1-8B`](https://huggingface.co/meta-llama/Llama-3.1-8B) |
+| llama-embed-nemotron-8b | [`nvidia/llama-embed-nemotron-8b`](https://huggingface.co/nvidia/llama-embed-nemotron-8b) |
 
-## Example Recipes
+## Related Resources
 
-| Recipe | Description |
-|---|---|
-| [llama3_2_1b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/bi_encoder/llama3_2_1b.yaml) | Bi-encoder — Llama 3.2 1B embedding model |
-| [llama_embed_nemotron_8b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/bi_encoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml) | Bi-encoder — reproduction recipe for [`nvidia/llama-embed-nemotron-8b`](https://huggingface.co/nvidia/llama-embed-nemotron-8b) (uses [`nvidia/embed-nemotron-dataset-v1`](https://huggingface.co/datasets/nvidia/embed-nemotron-dataset-v1)) |
+NVIDIA trained and released the `Llama Nemotron Embedding 1B` model, which uses a bidirectional attention mechanism for multilingual and cross-lingual question-answer retrieval. The model supports long documents (up to 8,192 tokens) and dynamic embedding sizes using Matryoshka embeddings. For more details, see the model card on Hugging Face.
 
-## Try with NeMo AutoModel
-
-**1. Clone and install from source** ([full instructions](/get-started/installation)):
-
-```bash
-git clone https://github.com/NVIDIA-NeMo/Automodel.git
-cd Automodel
-uv sync --locked --all-groups --all-extras
-```
-
-**2. Run the recipe** from inside the repo:
-
-```bash
-uv run automodel examples/retrieval/bi_encoder/llama3_2_1b.yaml --nproc-per-node 8
-```
-
-<Accordion title="Run with Docker">
-**1. Pull the container** and mount a checkpoint directory:
-
-```bash
-docker run --gpus all -it --rm \
-  --shm-size=8g \
-  -v $(pwd)/checkpoints:/opt/Automodel/checkpoints \
-  nvcr.io/nvidia/nemo-automodel:26.04.00
-```
-
-**2. Navigate** to the AutoModel directory (where the recipes are):
-
-```bash
-cd /opt/Automodel
-```
-
-**3. Run the recipe**:
-
-```bash
-uv run automodel examples/retrieval/bi_encoder/llama3_2_1b.yaml --nproc-per-node 8
-```
-</Accordion>
-
-See the [Installation Guide](/get-started/installation).
-
-{/* TODO: uncomment when finetune guide is published.
-## Fine-Tuning
-
-See the [Embedding and Reranking Fine-Tuning Guide](/recipes-e2e-examples/retrieval-finetune) for bi-encoder training instructions, including LoRA and PEFT configuration.
-*/}
-
-## Hugging Face Model Card
-
-NVIDIA trained and released the `Llama Nemotron Embedding 1B` model, which leverages a bidirectional attention mechanism for multilingual and cross-lingual question–answer retrieval. The model supports long documents (up to 8,192 tokens) and dynamic embedding sizes via Matryoshka embeddings. For more details, see the model card on Hugging Face.
-
+- [NeMo AutoModel Repository](https://github.com/NVIDIA-NeMo/Automodel)
 - [nvidia/llama-nemotron-embed-1b-v2](https://huggingface.co/nvidia/llama-nemotron-embed-1b-v2)
-- [nvidia/llama-embed-nemotron-8b](https://huggingface.co/nvidia/llama-embed-nemotron-8b)

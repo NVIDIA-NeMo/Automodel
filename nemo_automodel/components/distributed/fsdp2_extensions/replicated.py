@@ -373,3 +373,11 @@ def make_fully_shard_with_replicated_parameter_grad_sync(
         return wrapped
 
     return fully_shard_with_grad_sync
+
+
+__all__ = [
+    "DEFAULT_MAX_REPLICATED_PARAM_BYTES_PER_MODULE",
+    "make_fully_shard_with_replicated_parameter_grad_sync",
+    "replicated_parameters",
+    "select_small_fp32_parameters",
+]

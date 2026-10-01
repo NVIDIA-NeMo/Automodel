@@ -36,6 +36,7 @@ import gc
 import os
 import sys
 import tempfile
+from collections.abc import Collection
 
 import torch
 
@@ -44,6 +45,53 @@ PROMPTS = [
     "def fibonacci(n):\n    ",
     "Explain quantum computing in simple terms:",
 ]
+MIN_MATCH_PREFIX = 5
+
+
+def _assert_greedy_token_match(
+    hf_tokens: list[int],
+    vllm_tokens: list[int],
+    prompt: str,
+    prompt_index: int,
+    eos_token_ids: int | Collection[int] | None,
+) -> int:
+    """Verify enough leading greedy tokens match, including exact short outputs.
+
+    Generation may legitimately stop before ``MIN_MATCH_PREFIX`` when both
+    engines emit the same EOS-terminated sequence.  In that case, require the
+    complete short outputs to match so that an early stop by only one engine
+    cannot hide a divergence.
+    """
+    match_len = next(
+        (j for j, (a, b) in enumerate(zip(hf_tokens, vllm_tokens)) if a != b),
+        min(len(hf_tokens), len(vllm_tokens)),
+    )
+
+    if min(len(hf_tokens), len(vllm_tokens)) < MIN_MATCH_PREFIX:
+        assert hf_tokens and vllm_tokens, (
+            f"Empty output for prompt {prompt_index}: HF={len(hf_tokens)}, vLLM={len(vllm_tokens)}"
+        )
+        assert hf_tokens == vllm_tokens, (
+            f"Short greedy outputs differ for prompt {prompt_index}: {prompt!r}\n"
+            f"  Outputs shorter than {MIN_MATCH_PREFIX} tokens must match completely.\n"
+            f"  HF:   {hf_tokens}\n  vLLM: {vllm_tokens}"
+        )
+        expected_eos_ids = {eos_token_ids} if isinstance(eos_token_ids, int) else set(eos_token_ids or ())
+        assert hf_tokens[-1] in expected_eos_ids and vllm_tokens[-1] in expected_eos_ids, (
+            f"Short greedy outputs for prompt {prompt_index} did not end in a configured EOS token: {prompt!r}\n"
+            f"  Expected EOS token IDs: {sorted(expected_eos_ids)}\n"
+            f"  HF:   {hf_tokens}\n  vLLM: {vllm_tokens}"
+        )
+        return match_len
+
+    assert match_len >= MIN_MATCH_PREFIX, (
+        f"Token mismatch for prompt {prompt_index}: {prompt!r}\n"
+        f"  HF and vLLM agree on only {match_len} leading token(s) (require >= {MIN_MATCH_PREFIX}).\n"
+        f"  Divergence within the first tokens indicates a broken checkpoint load; "
+        f"later divergence is expected fp nondeterminism between engines.\n"
+        f"  HF:   {hf_tokens[:20]}...\n  vLLM: {vllm_tokens[:20]}..."
+    )
+    return match_len
 
 
 def _extract_custom_args(argv):
@@ -234,6 +282,9 @@ def test_vllm_greedy_matches_hf():
 
     hf_model.eval()
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=trust_remote_code)
+    eos_token_ids = hf_model.generation_config.eos_token_id
+    if eos_token_ids is None:
+        eos_token_ids = tokenizer.eos_token_id
 
     hf_outputs = []
     for idx, prompt in enumerate(PROMPTS):
@@ -304,23 +355,8 @@ def test_vllm_greedy_matches_hf():
         vllm_outputs.append(tokens)
         print(f"[vLLM] Prompt {idx}: generated {len(tokens)} tokens")
 
-    MIN_MATCH_PREFIX = 5
     for i, prompt in enumerate(PROMPTS):
         hf_tokens = hf_outputs[i]
         vllm_tokens = vllm_outputs[i]
-        assert min(len(hf_tokens), len(vllm_tokens)) >= MIN_MATCH_PREFIX, (
-            f"Too few tokens for prompt {i}: HF={len(hf_tokens)}, vLLM={len(vllm_tokens)} "
-            f"(need >= {MIN_MATCH_PREFIX} generated tokens to compare)"
-        )
-        match_len = next(
-            (j for j, (a, b) in enumerate(zip(hf_tokens, vllm_tokens)) if a != b),
-            min(len(hf_tokens), len(vllm_tokens)),
-        )
-        assert match_len >= MIN_MATCH_PREFIX, (
-            f"Token mismatch for prompt {i}: {prompt!r}\n"
-            f"  HF and vLLM agree on only {match_len} leading token(s) (require >= {MIN_MATCH_PREFIX}).\n"
-            f"  Divergence within the first tokens indicates a broken checkpoint load; "
-            f"later divergence is expected fp nondeterminism between engines.\n"
-            f"  HF:   {hf_tokens[:20]}...\n  vLLM: {vllm_tokens[:20]}..."
-        )
+        match_len = _assert_greedy_token_match(hf_tokens, vllm_tokens, prompt, i, eos_token_ids)
         print(f"Prompt {i}: PASS ({match_len}/{min(len(hf_tokens), len(vllm_tokens))} leading tokens match)")

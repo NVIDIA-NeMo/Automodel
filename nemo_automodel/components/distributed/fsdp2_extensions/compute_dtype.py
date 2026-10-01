@@ -401,3 +401,6 @@ def fully_shard_with_compute_dtype_fallback(
         fully_shard_fn=fully_shard_fn,
     )
     return module
+
+
+__all__ = ["fully_shard_with_compute_dtype_fallback"]

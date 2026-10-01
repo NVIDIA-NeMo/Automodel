@@ -23,7 +23,7 @@ Under the hood, NeMo AutoModel uses [flow matching](https://arxiv.org/abs/2210.0
 | Step | Section | What You Do |
 |------|---------|-------------|
 | **1. Install** | [Install NeMo AutoModel](#install-nemo-automodel) | Install the package with `uv` or Docker |
-| **2. Prepare Data** | [Prepare Your Dataset](#prepare-your-dataset) | Encode raw images/videos into latent cache files |
+| **2. Prepare Data** | [Prepare Your Dataset](#prepare-your-dataset) | Encode raw images or videos into latent cache files |
 | **3. Configure** | [Configure Your Training Recipe](#configure-your-training-recipe) | Write a YAML config specifying model, data, and training settings |
 | **4. Train** | [Fine-Tune the Model](#fine-tune-the-model) | Launch training with `torchrun` on a single node |
 | **4b. Multi-Node** | [Multi-Node Training](#multi-node-training) | Scale training across multiple nodes |
@@ -138,7 +138,7 @@ For the full set of arguments and input format details, see the [Diffusion Datas
 Fine-tuning is driven by two components:
 
 1. A recipe script, such as [`train.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/diffusion/train.py), orchestrates the training loop by loading the model, building the data loader, running forward and backward passes, computing the flow matching loss, checkpointing, and logging.
-2. A YAML configuration file is a text file in YAML format that specifies all settings the recipe uses: which model to fine-tune, where the data lives, optimizer hyperparameters, parallelism strategy, and other settings. You customize training by editing this file rather than modifying code, allowing you to scale seamlessly from one to hundreds of GPUs.
+2. A YAML configuration file is a text file in YAML format that specifies all settings the recipe uses: which model to fine-tune, where the data lives, optimizer hyperparameters, parallelism strategy, and other settings. You customize training by editing this file rather than modifying code, so you can scale from one to hundreds of GPUs.
 
 The following annotated [`wan2_1_t2v_flow.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/wan2_1_t2v_flow.yaml) config explains each section:
 
@@ -308,7 +308,7 @@ fsdp:
 
 A complete multi-node config is provided at [wan2_1_t2v_flow_multinode.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/wan2_1_t2v_flow_multinode.yaml).
 
-### Launch with torchrun
+### Launch with Torchrun
 
 Run the following command on **each node**, setting `NODE_RANK` to `0` on the first node, `1` on the second, and so on:
 
@@ -333,8 +333,8 @@ Use the following table to select a model for your use case:
 
 | Use Case | Model | Why Choose It |
 |----------|-------|---------------|
-| **Video generation on limited hardware** | [Wan 2.1 T2V 1.3B](#wan-21-t2v-13b) | Smallest model (1.3B params): fast iteration, fits on a single A100 40 GB |
-| **High-quality image generation** | [FLUX.1-dev](#flux1-dev-text-to-image) | State-of-the-art text-to-image with 12B params and guidance-based control |
+| **Video generation on limited hardware** | [Wan 2.1 T2V 1.3B](#wan-21-t2v-13b) | Smallest model (1.3B parameters): fast iteration, fits on a single A100 40 GB |
+| **High-quality image generation** | [FLUX.1-dev](#flux1-dev-text-to-image) | Text-to-image model with 12B parameters and guidance-based control |
 | **High-quality video generation** | [HunyuanVideo 1.5](#hunyuanvideo-15) | Larger video model with condition-latent support for richer motion and detail |
 | **Synchronized video and audio generation** | [LTX-2.3](#ltx-23) | Jointly denoises video and audio latents with a dual-stream transformer |
 
@@ -416,7 +416,7 @@ torchrun --nproc-per-node=8 \
   examples/diffusion/generate/generate.py \
   -c examples/diffusion/generate/configs/generate_wan.yaml \
   --distributed.backend nccl \
-  --distributed.parallel_scheme.transformer.tp_size 8
+  --distributed.parallelism.tp_size 8
 ```
 
 **With a fine-tuned checkpoint:**

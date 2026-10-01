@@ -80,7 +80,7 @@ def test_router_fp32_contract_is_model_owned():
     assert indices.shape == (8, TINY["num_experts_per_tok"])
 
 
-def test_gate_is_fp32_at_construction_for_fsdp_dtype_grouping():
+def test_gate_is_fp32_at_construction_for_fsdp_dtype_grouping(monkeypatch):
     """The gate must be fp32 from allocation, before any init or checkpoint cast.
 
     FSDP shards the freshly constructed (meta/from_pretrained) module: a
@@ -92,6 +92,11 @@ def test_gate_is_fp32_at_construction_for_fsdp_dtype_grouping():
     import torch.distributed.fsdp as fsdp
 
     from nemo_automodel.components.distributed.fsdp2_extensions.utils import fully_shard_by_dtype
+
+    monkeypatch.setattr(
+        "nemo_automodel.components.distributed.fsdp2_extensions.utils.fully_shard",
+        lambda *_args, **_kwargs: None,
+    )
 
     config = AutoConfig.for_model("minimax_m2", torch_dtype="bfloat16", **TINY)
     model = MiniMaxM2ForCausalLM(config, backend=_cpu_backend())
@@ -107,7 +112,6 @@ def test_gate_is_fp32_at_construction_for_fsdp_dtype_grouping():
         mp_policy=fsdp.MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32),
         offload_policy=None,
         fp32_compute_module_names=tuple(MiniMaxM2ForCausalLM._keep_in_fp32_modules_strict),
-        fully_shard_fn=lambda *args, **kwargs: None,
     )
 
 

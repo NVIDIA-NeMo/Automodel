@@ -71,7 +71,7 @@ def test_router_fp32_contract_is_model_owned():
     assert moe_block.self_attn.q_proj.weight.dtype == torch.bfloat16
 
 
-def test_gate_is_fp32_at_construction_for_fsdp_dtype_grouping():
+def test_gate_is_fp32_at_construction_for_fsdp_dtype_grouping(monkeypatch):
     """The gate must be fp32 from allocation, before any init or checkpoint cast.
 
     FSDP shards the freshly constructed module: a bf16-allocated gate weight
@@ -82,6 +82,11 @@ def test_gate_is_fp32_at_construction_for_fsdp_dtype_grouping():
     import torch.distributed.fsdp as fsdp
 
     from nemo_automodel.components.distributed.fsdp2_extensions.utils import fully_shard_by_dtype
+
+    monkeypatch.setattr(
+        "nemo_automodel.components.distributed.fsdp2_extensions.utils.fully_shard",
+        lambda *_args, **_kwargs: None,
+    )
 
     config = MiniMaxM3VLTextConfig(torch_dtype="bfloat16", **TINY_CFG)
     model = MiniMaxM3SparseForCausalLM(config, backend=_cpu_backend())
@@ -97,5 +102,4 @@ def test_gate_is_fp32_at_construction_for_fsdp_dtype_grouping():
         mp_policy=fsdp.MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32),
         offload_policy=None,
         fp32_compute_module_names=tuple(MiniMaxM3SparseForCausalLM._keep_in_fp32_modules_strict),
-        fully_shard_fn=lambda *args, **kwargs: None,
     )

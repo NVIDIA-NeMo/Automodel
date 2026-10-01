@@ -75,7 +75,7 @@ from nemo_automodel.components.models.deepseek_v41.attention import (
 from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41Config, DeepseekV41TextConfig
 from nemo_automodel.components.models.deepseek_v41.cp import gather_sequence, shard_cp_batch
 from nemo_automodel.components.models.deepseek_v41.engram import DeepseekV41Engram, DeepseekV41NgramHash
-from nemo_automodel.components.models.deepseek_v41.fsdp import fully_shard_deepseek_v41
+from nemo_automodel.components.models.deepseek_v41.fsdp import PARALLELIZER
 from nemo_automodel.components.models.deepseek_v41.layers import (
     DeepseekV41HyperConnection,
     DeepseekV41RMSNorm,
@@ -408,7 +408,6 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
     shard mesh must match the owner group exactly.
     """
 
-    _nemo_fully_shard = staticmethod(fully_shard_deepseek_v41)
     _owns_cp_attention: bool = True
     config_class: type[DeepseekV41Config] = DeepseekV41Config
     base_model_prefix: str = "model"
@@ -736,4 +735,5 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
                 layer.engram.embed.mark_sharding_contract()
 
 
+DeepseekV41ForCausalLM.parallelizer = PARALLELIZER
 ModelClass = DeepseekV41ForCausalLM

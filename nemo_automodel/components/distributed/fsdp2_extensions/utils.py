@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from copy import copy
-from typing import Callable, Dict, Iterator, List, Set, Tuple, Union
+from typing import TYPE_CHECKING, Callable, Dict, Iterator, List, Set, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -28,7 +28,16 @@ from nemo_automodel.components.distributed.fsdp2_extensions.compat import (
 )
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 
+if TYPE_CHECKING:
+    from nemo_automodel.components.distributed.parallelizer import ModelParallelizer
+
 UniformSubtreeItem = Union[Tuple[nn.Module, torch.dtype], Tuple[str, nn.Module, torch.dtype]]
+
+__all__ = [
+    "fully_shard_by_dtype",
+    "reject_unsupported_mtp_cp",
+    "reject_unsupported_mtp_cp_pp",
+]
 
 
 def reject_unsupported_mtp_cp(model: nn.Module) -> None:
@@ -185,7 +194,8 @@ def _fully_shard(
     offload_policy: OffloadPolicy | None,
     reshard_after_forward: bool | int | None = None,
     ignored_params: set[nn.Parameter] | None = None,
-    fully_shard_fn: Callable[..., None] | None = None,
+    *,
+    shard_module: Callable[..., None],
 ) -> None:
     if isinstance(module, nn.ModuleList):
         for layer in module:
@@ -196,7 +206,7 @@ def _fully_shard(
                 offload_policy,
                 reshard_after_forward,
                 ignored_params,
-                fully_shard_fn,
+                shard_module=shard_module,
             )
     else:
         _call_fully_shard(
@@ -206,7 +216,7 @@ def _fully_shard(
             offload_policy,
             reshard_after_forward,
             ignored_params,
-            fully_shard_fn,
+            shard_module=shard_module,
         )
 
 
@@ -217,11 +227,9 @@ def _call_fully_shard(
     offload_policy: OffloadPolicy | None,
     reshard_after_forward: bool | int | None = None,
     ignored_params: set[nn.Parameter] | None = None,
-    fully_shard_fn: Callable[..., None] | None = None,
+    *,
+    shard_module: Callable[..., None],
 ) -> None:
-    if fully_shard_fn is None:
-        fully_shard_fn = fully_shard
-
     kwargs = {
         "mesh": mesh,
         "mp_policy": mp_policy,
@@ -236,7 +244,7 @@ def _call_fully_shard(
         if module_ignored_params:
             kwargs["ignored_params"] = module_ignored_params
 
-    fully_shard_fn(module, **kwargs)
+    shard_module(module, **kwargs)
 
 
 def _mp_policy_with_param_dtype(
@@ -365,7 +373,9 @@ def fully_shard_by_dtype(
     fp32_compute_module_names: Tuple[str, ...] = (),
     reshard_after_forward: bool | int | None = None,
     ignored_params: set[nn.Parameter] | None = None,
-    fully_shard_fn: Callable[..., None] | None = None,
+    model_parallelizer: "ModelParallelizer | None" = None,
+    *,
+    fully_shard_fn: Callable[..., nn.Module] | None = None,
 ) -> None:
     """Fully shard a module so every parameter computes in its required dtype.
 
@@ -401,9 +411,12 @@ def fully_shard_by_dtype(
         ignored_params: Parameters already owned by another FSDP or parallelism
             unit. They are excluded from dtype grouping and forwarded to the
             enclosing FSDP unit.
-        fully_shard_fn: Optional model-specific replacement for ``fully_shard``.
-            Every FSDP unit created by this function uses this callback.
+        model_parallelizer: Optional model sidecar that owns the FSDP primitive.
+        fully_shard_fn: Per-invocation FSDP primitive used by compute-dtype materialization.
     """
+    shard_module = fully_shard_fn or (
+        fully_shard if model_parallelizer is None else model_parallelizer._fully_shard_module
+    )
     ignored_params = set(ignored_params or ())
     ignored_param_ids = {id(param) for param in ignored_params}
     compute_dtype_of = make_parameter_compute_dtype_resolver(
@@ -438,7 +451,7 @@ def fully_shard_by_dtype(
                 offload_policy,
                 reshard_after_forward,
                 ignored_params,
-                fully_shard_fn,
+                shard_module=shard_module,
             )
         return
     elif len(grouped_params) == 1:
@@ -450,7 +463,7 @@ def fully_shard_by_dtype(
             offload_policy,
             reshard_after_forward,
             ignored_params,
-            fully_shard_fn,
+            shard_module=shard_module,
         )
     else:
         least_items_key = min(grouped_params.items(), key=lambda x: len(x[1]))[0]
@@ -493,9 +506,11 @@ def fully_shard_by_dtype(
             }
             if ignored_params:
                 subtree_kwargs["ignored_params"] = ignored_params
-            if fully_shard_fn is not None:
-                subtree_kwargs["fully_shard_fn"] = fully_shard_fn
-            _fully_shard(_get_module_from_path(module, path), **subtree_kwargs)
+            _fully_shard(
+                _get_module_from_path(module, path),
+                shard_module=shard_module,
+                **subtree_kwargs,
+            )
         if len(grouped_params) == 2:
             parent_key = next(key for key in grouped_params if key != least_items_key)
             _call_fully_shard(
@@ -505,7 +520,7 @@ def fully_shard_by_dtype(
                 offload_policy,
                 reshard_after_forward,
                 ignored_params,
-                fully_shard_fn,
+                shard_module=shard_module,
             )
         elif ignored_params:
             # Preserve the caller's FSDP ownership boundary after every managed
@@ -517,5 +532,5 @@ def fully_shard_by_dtype(
                 offload_policy,
                 reshard_after_forward,
                 ignored_params,
-                fully_shard_fn,
+                shard_module=shard_module,
             )

@@ -30,10 +30,8 @@ from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy
 from torch.distributed.tensor import DTensor
 
-from nemo_automodel.components.distributed.parallelizer import (
-    DefaultParallelizationStrategy,
-)
-from nemo_automodel.components.models.qwen3_5.parallelization import Qwen3_5ParallelizationStrategy
+from nemo_automodel.components.distributed.parallelizer import ModelParallelizer
+from nemo_automodel.components.models.qwen3_5.parallelization import Qwen3_5ModelParallelizer
 
 # Over the default 5s budget on purpose: this module spawns worker processes; every child re-imports torch from scratch.
 # Shrink the work or the process count before raising this further.
@@ -115,7 +113,7 @@ def _free_port() -> int:
 def _run_case(
     mesh: DeviceMesh,
     *,
-    strategy: DefaultParallelizationStrategy,
+    parallelizer: ModelParallelizer,
     tied: bool,
     input_in_container: bool = False,
     output_in_container: bool = False,
@@ -139,13 +137,13 @@ def _run_case(
         with pytest.raises(
             ValueError, match="Distinct tied input/output embedding modules inside a ModuleList or ModuleDict"
         ):
-            strategy.parallelize(model, device_mesh=mesh, mp_policy=mp_policy)
+            parallelizer._apply(model, device_mesh=mesh, mp_policy=mp_policy)
         assert model.get_input_embeddings().weight is model.get_output_embeddings().weight
         assert [id(param) for param in model.parameters()] == [id(param) for param in original_parameters]
         assert not any(isinstance(module, FSDPModule) for module in model.modules())
         return
 
-    strategy.parallelize(model, device_mesh=mesh, mp_policy=mp_policy)
+    parallelizer._apply(model, device_mesh=mesh, mp_policy=mp_policy)
 
     assert isinstance(model, FSDPModule)
     if tied:
@@ -200,20 +198,20 @@ def _worker(rank: int, world_size: int, port: int) -> None:
     dist.init_process_group("gloo", rank=rank, world_size=world_size)
     try:
         mesh = init_device_mesh("cpu", (1, world_size, 1, 1), mesh_dim_names=("dp_replicate", "dp_shard", "cp", "tp"))
-        for strategy in (DefaultParallelizationStrategy(), Qwen3_5ParallelizationStrategy()):
+        for parallelizer in (ModelParallelizer(), Qwen3_5ModelParallelizer()):
             for tied in (False, True):
                 for input_in_container in (False, True):
                     for output_in_container in (False, True):
                         _run_case(
                             mesh,
-                            strategy=strategy,
+                            parallelizer=parallelizer,
                             tied=tied,
                             input_in_container=input_in_container,
                             output_in_container=output_in_container,
                         )
             _run_case(
                 mesh,
-                strategy=strategy,
+                parallelizer=parallelizer,
                 tied=True,
                 input_in_container=True,
                 output_in_container=True,
@@ -223,7 +221,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
             for input_in_container in (False, True):
                 _run_case(
                     mesh,
-                    strategy=strategy,
+                    parallelizer=parallelizer,
                     tied=True,
                     input_in_container=input_in_container,
                     shared_module=True,
