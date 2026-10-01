@@ -29,7 +29,6 @@ def test_parse_args_uses_defaults_for_optional_flags():
     assert args.model_name_or_path is None
     assert args.epoch is None
     assert args.step is None
-    assert args.quantization is False
 
 
 def test_infer_epoch_step_parses_checkpoint_name():
@@ -233,8 +232,7 @@ def test_close_trainer_closes_all_recipe_resources():
     trainer.checkpointer.close.assert_called_once()
 
 
-@pytest.mark.parametrize("quantization", [False, True])
-def test_main_exports_checkpoint_end_to_end(monkeypatch, tmp_path, quantization):
+def test_main_exports_checkpoint_end_to_end(monkeypatch, tmp_path):
     from scripts import export_llm_dcp_to_hf as script
 
     checkpoint_dir = tmp_path / "checkpoints" / "epoch_2_step_7"
@@ -252,8 +250,7 @@ def test_main_exports_checkpoint_end_to_end(monkeypatch, tmp_path, quantization)
         script, "save_config", lambda config, path: save_config_calls.update({"config": config, "path": path})
     )
 
-    argv = ["--checkpoint-dir", str(checkpoint_dir), "--output-dir", str(output_dir)]
-    script.main(argv + (["--quantization"] if quantization else []))
+    script.main(["--checkpoint-dir", str(checkpoint_dir), "--output-dir", str(output_dir)])
 
     export_root = output_dir / "epoch_2_step_7"
     assert export_root.is_dir()
@@ -267,7 +264,6 @@ def test_main_exports_checkpoint_end_to_end(monkeypatch, tmp_path, quantization)
     assert save_kwargs["model"] is model
     assert save_kwargs["weights_path"] == str(export_root)
     assert save_kwargs["is_final_checkpoint"] is True
-    assert save_kwargs["quantization"] is quantization
     assert save_kwargs["tokenizer"] is trainer.tokenizer
 
     # The exported config must come from to_yaml_dict(): to_dict() would serialize

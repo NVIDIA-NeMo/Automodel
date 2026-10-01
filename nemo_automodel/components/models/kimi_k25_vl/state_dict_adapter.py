@@ -14,6 +14,7 @@
 
 import logging
 import re
+from copy import deepcopy
 from typing import Any
 
 import torch
@@ -169,6 +170,46 @@ class KimiK25VLStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
         self._last_expected_hf_keys: set[str] | None = None
         self._uses_model_prefix = True
         self._quant_shapes_cache: dict[str, tuple] | None = None
+
+    def adapt_hf_config_for_save(self, config: dict[str, Any], *, quantization: bool = False) -> dict[str, Any]:
+        """Match HF metadata to the existing routed-expert INT4 encoder.
+
+        Args:
+            config: Serialized HF config dictionary, possibly with source
+                quantization metadata nested inside text_config.
+            quantization: Whether routed experts are exported as group-32 INT4.
+
+        Returns:
+            Independent config dictionary. Quantized saves use the top-level
+            compressed-tensors scheme expected by KimiK25VLConfig; ordinary
+            saves remove both top-level and nested quantization metadata.
+        """
+        config = deepcopy(config)
+        config.pop("quantization_config", None)
+        config.get("text_config", {}).pop("quantization_config", None)
+        if quantization:
+            config["quantization_config"] = {
+                "quant_method": "compressed-tensors",
+                "format": "pack-quantized",
+                "quantization_status": "compressed",
+                "config_groups": {
+                    "group_0": {
+                        "targets": [r"re:.*\.layers\.(?!0\.)\d+\.mlp\.experts\.\d+\.(gate|up|down)_proj$"],
+                        "weights": {
+                            "num_bits": 4,
+                            "type": "int",
+                            "symmetric": True,
+                            "strategy": "group",
+                            "group_size": 32,
+                            "dynamic": False,
+                        },
+                        "input_activations": None,
+                        "output_activations": None,
+                    }
+                },
+                "ignore": [],
+            }
+        return config
 
     def to_hf(
         self, state_dict: dict[str, Any], exclude_key_regex: str | None = None, quantization: bool = False, **kwargs

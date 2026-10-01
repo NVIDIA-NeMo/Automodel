@@ -26,7 +26,7 @@ Checkpointer is passed explicitly (dependency injection) - no global state.
 """
 
 import logging
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from transformers.tokenization_utils import PreTrainedTokenizerBase
@@ -56,9 +56,11 @@ class HFCheckpointingMixin:
     def save_pretrained(
         self,
         save_directory: str,
-        checkpointer: Optional["Checkpointer"] = None,
-        tokenizer: Optional["PreTrainedTokenizerBase"] = None,
-        **kwargs,
+        checkpointer: "Checkpointer | None" = None,
+        tokenizer: "PreTrainedTokenizerBase | None" = None,
+        *,
+        quantization: bool = False,
+        **kwargs: Any,
     ) -> None:
         """Save model in HF-compatible format using Checkpointer infrastructure.
 
@@ -68,9 +70,10 @@ class HFCheckpointingMixin:
             save_directory: Output path
             checkpointer: Checkpointer instance. Uses self._checkpointer if not provided.
             tokenizer: Optional tokenizer to save alongside model
+            quantization: Opt-in deployment export using the model adapter's
+                quantized format (Kimi K2.5 INT4 or Kimi K3 MXFP4).
             **kwargs: Additional arguments, including ``peft_config`` and
-                ``is_final_checkpoint`` and ``quantization`` (opt-in deployment export).
-                Direct callers that do not have recipe
+                ``is_final_checkpoint``. Direct callers that do not have recipe
                 step-scheduler context default ``is_final_checkpoint`` to
                 ``False``.
         """
@@ -89,5 +92,5 @@ class HFCheckpointingMixin:
             peft_config=kwargs.get("peft_config", None),
             tokenizer=tokenizer,
             is_final_checkpoint=kwargs.get("is_final_checkpoint", False),
-            quantization=kwargs.get("quantization", False),
+            quantization=quantization,
         )

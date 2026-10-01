@@ -47,23 +47,24 @@ per 32 input-channel values, together with matching compressed-tensors metadata.
 Shared experts, latent projections, routers, attention, vision, and other weights
 retain their existing export precision.
 
-Use the existing DCP-to-HF exporter with the same distributed topology as the
-training checkpoint, adding `--quantization` on each rank:
+Save the in-memory trained model with `quantization=True` on every rank, using
+the existing checkpointer configured for safetensors and consolidated output:
 
-```bash
-torchrun --nproc-per-node=4 scripts/export_llm_dcp_to_hf.py \
-    --checkpoint-dir /checkpoints/epoch_0_step_99 \
-    --output-dir /exports/kimi-k3-mxfp4 \
-    --quantization
+```python
+model.save_pretrained(
+    "/exports/kimi-k3-mxfp4",
+    checkpointer=checkpointer,
+    tokenizer=tokenizer,
+    quantization=True,
+    is_final_checkpoint=True,
+)
 ```
 
-For multi-node checkpoints, also supply the matching `torchrun` rendezvous and
-node arguments through your cluster launcher. The script rebuilds the model
-using the saved recipe; it does not reduce the number of required training ranks.
-Output is under `/exports/kimi-k3-mxfp4/epoch_0_step_99/model/consolidated`.
-Programmatic callers can pass `quantization=True` to
-`Checkpointer.save_model(...)` or `model.save_pretrained(..., checkpointer=...)`
-with safetensors saving enabled.
+Output is under `/exports/kimi-k3-mxfp4/model/consolidated`. The same keyword
+is available on `Checkpointer.save_model(...)`; no prior checkpoint or separate
+conversion script is required. Expert-parallel export supports complete local
+experts, not shards within an expert. Omitting the flag keeps the existing
+unquantized save behavior. Kimi K2.5 uses the same flag for its INT4 format.
 
 <Note>
 This is weight-only post-training quantization, not Kimi K3 QAT or native MXFP4

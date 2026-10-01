@@ -86,11 +86,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Explicit step number for the exported checkpoint directory name. Defaults to the source checkpoint.",
     )
-    parser.add_argument(
-        "--quantization",
-        action="store_true",
-        help="Quantize trained weights for deployment using the model adapter (currently Kimi K3 routed experts/MXFP4).",
-    )
     return parser.parse_args(argv)
 
 
@@ -244,7 +239,6 @@ def main(argv: Sequence[str] | None = None) -> None:
             weights_path=str(export_root),
             tokenizer=resolve_export_tokenizer(trainer),
             is_final_checkpoint=True,
-            quantization=args.quantization,
         )
     finally:
         close_trainer(trainer)
