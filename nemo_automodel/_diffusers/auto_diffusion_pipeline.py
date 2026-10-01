@@ -499,7 +499,7 @@ def native_transformer_config_dir(model_dir: str, subfolder: str = "transformer"
     """
     import json
 
-    from nemo_automodel._transformers.registry import MODEL_ARCH_MAPPING
+    from nemo_automodel._transformers.registry import ModelRegistry
 
     if os.path.isfile(os.path.join(model_dir, "model_index.json")):
         candidates = [os.path.join(model_dir, subfolder)]
@@ -511,7 +511,8 @@ def native_transformer_config_dir(model_dir: str, subfolder: str = "transformer"
             continue
         with open(config_path) as f:
             architectures = json.load(f).get("architectures") or []
-        if architectures and architectures[0] in MODEL_ARCH_MAPPING:
+        # The live registry also covers architectures registered at runtime or through entry points.
+        if architectures and ModelRegistry.has_custom_model(architectures[0]):
             return candidate
     return None
 
@@ -695,11 +696,6 @@ class NeMoAutoDiffusionPipeline:
         Returns:
             The loaded pipeline with requested components replaced by their parallelized modules.
         """
-        if not DIFFUSERS_AVAILABLE:
-            raise RuntimeError(
-                "diffusers is required for NeMoAutoDiffusionPipeline.from_pretrained. "
-                "Install with: pip install nemo_automodel[diffusion]"
-            )
         logger.info("[INFO] Loading pipeline from pretrained: %s", pretrained_model_name_or_path)
 
         # Resolve to a local snapshot dir so a warm HF cache is not re-validated
@@ -728,7 +724,18 @@ class NeMoAutoDiffusionPipeline:
             )
             if load_for_training and peft_cfg is None:
                 _ensure_params_trainable(transformer, "transformer")
-            return cls(transformer=transformer)
+            pipe = cls(transformer=transformer)
+            if peft_cfg is not None:
+                # Same contract as the diffusers path: the recipe hands this to the checkpointer.
+                pipe._peft_config = peft_cfg
+                pipe._lora_params = [p for n, p in transformer.named_parameters() if "lora_" in n and p.requires_grad]
+            return pipe
+
+        if not DIFFUSERS_AVAILABLE:
+            raise RuntimeError(
+                "diffusers is required for NeMoAutoDiffusionPipeline.from_pretrained. "
+                "Install with: pip install nemo_automodel[diffusion]"
+            )
 
         # Use DiffusionPipeline.from_pretrained for auto-detection
         pipe: DiffusionPipeline = DiffusionPipeline.from_pretrained(
@@ -912,11 +919,6 @@ class NeMoAutoDiffusionPipeline:
         Returns:
             The initialized pipeline with requested components replaced by their parallelized modules.
         """
-        if not DIFFUSERS_AVAILABLE:
-            raise RuntimeError(
-                "diffusers is required for NeMoAutoDiffusionPipeline.from_config. "
-                "Install with: pip install nemo_automodel[diffusion]"
-            )
         # Parse and validate pipeline spec
         spec = PipelineSpec.from_dict(pipeline_spec)
         native_dir = native_transformer_config_dir(resolve_diffusion_model_dir(model_id), spec.subfolder)
@@ -937,6 +939,11 @@ class NeMoAutoDiffusionPipeline:
             )
             _ensure_params_trainable(transformer, "transformer")
             return cls(transformer=transformer)
+        if not DIFFUSERS_AVAILABLE:
+            raise RuntimeError(
+                "diffusers is required for NeMoAutoDiffusionPipeline.from_config. "
+                "Install with: pip install nemo_automodel[diffusion]"
+            )
         spec.validate_for_from_config()
 
         logger.info("[INFO] Initializing pipeline from config with random weights")
