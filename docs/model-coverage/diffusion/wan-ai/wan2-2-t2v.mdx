@@ -8,7 +8,9 @@ slug: model-coverage/diffusion/wan-ai/Wan2.2-T2V-A14B-Diffusers
 
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
-## Fine-Tune Wan2.2-T2V-A14B-Diffusers
+## Quick Start
+
+### Fine-Tune Wan2.2-T2V-A14B-Diffusers
 
 From the repository root, run:
 
@@ -27,7 +29,9 @@ uv run torchrun --nproc-per-node=8 \
 | Fine-tune - two-stage with `model.stage` knob | Use [wan2_2_t2v_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/wan2_2_t2v_flow.yaml). |
 | Inference - loads both stage checkpoints | Use [generate_wan22.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/generate/configs/generate_wan22.yaml). |
 
-## Two-stage finetuning workflow
+## Model Context
+
+### Two-stage finetuning workflow
 
 Because each transformer is ~14B parameters, NeMo AutoModel finetunes them **one at a time**:
 
@@ -77,6 +81,10 @@ Each finetuning run only holds one of the two transformers on GPU - the recipe d
 
 </Note>
 
+### Task
+
+- Text-to-Video (T2V)
+
 ## Model Reference
 
 ### Model Architecture
@@ -87,10 +95,6 @@ Each finetuning run only holds one of the two transformers on GPU - the recipe d
 | Architecture | DiT (Flow Matching), two-stage |
 | Parameters | 14B + 14B (high-noise + low-noise) |
 | Hugging Face Organization | [Wan-AI](https://huggingface.co/Wan-AI) |
-
-### Task
-
-- Text-to-Video (T2V)
 
 ### Available Models
 

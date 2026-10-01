@@ -8,7 +8,9 @@ Qwen3.5 is Alibaba Cloud's unified vision-language model series, including dense
 
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
-## Fine-Tune Qwen3.5-4B
+## Quick Start
+
+### Fine-Tune Qwen3.5-4B
 
 From the repository root, run:
 
@@ -22,11 +24,13 @@ uv run automodel --nproc-per-node=8 examples/vlm_finetune/qwen3_5/qwen3_5_4b.yam
 | --- | --- |
 | Supervised fine-tuning (SFT) - Qwen3.5-VL 4B on MedPix | Use [qwen3_5_4b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5/qwen3_5_4b.yaml). Dataset: MedPix-VQA. |
 
-## Fine-Tuning
+## Model Context
+
+### Fine-Tuning
 
 See the [VLM Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n).
 
-### Validated Large-Model, Long-Context Scale
+#### Validated Large-Model, Long-Context Scale
 
 The Qwen3.5-MoE VLM training path has been validated at both
 **397-billion-parameter model scale** and **128K context length**.

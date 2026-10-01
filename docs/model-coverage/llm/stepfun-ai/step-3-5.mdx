@@ -8,7 +8,9 @@ slug: model-coverage/large-language-models/stepfun-ai/Step-3.5-Flash
 
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
-## Fine-Tune Step-3.5-Flash
+## Quick Start
+
+### Fine-Tune Step-3.5-Flash
 
 <Note>
 This recipe was validated on **16 nodes x 8 GPUs (128 H100s)**. See the [Launcher Guide](/job-launchers/slurm-cluster) for multi-node setup.
@@ -26,6 +28,8 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/stepfun/step_3.5_flash
 | Goal | Start Here |
 | --- | --- |
 | Supervised fine-tuning (SFT) - Step-3.5-Flash on HellaSwag with pipeline parallelism | Use [step_3.5_flash_hellaswag_pp.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/stepfun/step_3.5_flash_hellaswag_pp.yaml). |
+
+## Model Context
 
 ## Model Reference
 

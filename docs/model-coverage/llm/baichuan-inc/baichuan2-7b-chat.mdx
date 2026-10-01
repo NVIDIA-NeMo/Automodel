@@ -7,7 +7,9 @@ slug: model-coverage/large-language-models/baichuan-inc/Baichuan2-7B-Chat
 [Baichuan2-7B-Chat](https://huggingface.co/baichuan-inc/Baichuan2-7B-Chat) has a checked-in NeMo AutoModel recipe for text generation.
 The Hugging Face configuration declares the `BaichuanForCausalLM` architecture.
 
-## Fine-Tune Baichuan2-7B-Chat
+## Quick Start
+
+### Fine-Tune Baichuan2-7B-Chat
 
 Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
 
@@ -21,6 +23,8 @@ automodel examples/llm_finetune/baichuan/baichuan_2_7b_squad.yaml --nproc-per-no
 | --- | --- |
 | Run the primary recipe for this model | Use the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/baichuan/baichuan_2_7b_squad.yaml). |
 | Try another checked-in recipe for this model | Use the [alternate recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/baichuan/baichuan_2_7b_mock_fp8.yaml). |
+
+## Model Context
 
 ### Configuration
 
@@ -49,6 +53,11 @@ automodel examples/llm_finetune/baichuan/baichuan_2_7b_squad.yaml --nproc-per-no
 ### Available Models
 
 - [`baichuan-inc/Baichuan2-7B-Chat`](https://huggingface.co/baichuan-inc/Baichuan2-7B-Chat)
+
+| Checkpoint | Type |
+| --- | --- |
+| [Baichuan2-7B-Chat](https://huggingface.co/baichuan-inc/Baichuan2-7B-Chat) | Checkpoint documented on this page |
+| [`baichuan-inc/Baichuan2-7B-Chat`](https://huggingface.co/baichuan-inc/Baichuan2-7B-Chat) | Checkpoint documented on this page |
 
 ## Related Resources
 

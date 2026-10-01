@@ -8,7 +8,9 @@ slug: model-coverage/vision-language-models/mistralai/Mistral-Small-4-119B-2603
 
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
-## Fine-Tune Mistral-Small-4-119B-2603
+## Quick Start
+
+### Fine-Tune Mistral-Small-4-119B-2603
 
 <Note>
 This recipe was validated on **4 nodes x 8 GPUs (32 H100s)**. See the [Launcher Guide](/job-launchers/slurm-cluster) for multi-node setup.
@@ -26,6 +28,8 @@ uv run automodel --nproc-per-node=8 examples/vlm_finetune/mistral4/mistral4_medp
 | Goal | Start Here |
 | --- | --- |
 | Supervised fine-tuning (SFT) - Mistral-Small-4 on MedPix | Use [mistral4_medpix.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mistral4/mistral4_medpix.yaml). Dataset: MedPix-VQA. |
+
+## Model Context
 
 ## Model Reference
 

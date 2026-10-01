@@ -13,7 +13,9 @@ This model requires `trust_remote_code: true` in your recipe YAML.
 
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
-## Fine-Tune Nemotron-Flash-1B
+## Quick Start
+
+### Fine-Tune Nemotron-Flash-1B
 
 From the repository root, run:
 
@@ -27,6 +29,8 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/nemotron_flash/nemotro
 | --- | --- |
 | Supervised fine-tuning (SFT) - Nemotron-Flash 1B on SQuAD | Use [nemotron_flash_1b_squad.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron_flash/nemotron_flash_1b_squad.yaml). |
 | Low-rank adaptation (LoRA) - Nemotron-Flash 1B on SQuAD | Use [nemotron_flash_1b_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron_flash/nemotron_flash_1b_squad_peft.yaml). |
+
+## Model Context
 
 ## Model Reference
 

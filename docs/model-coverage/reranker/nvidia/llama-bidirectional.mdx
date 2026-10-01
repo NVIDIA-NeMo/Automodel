@@ -10,7 +10,9 @@ For the bi-encoder variant, see [Llama (Bidirectional) for Embedding](/model-cov
 
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
-## Train a Reranker with llama-nemotron-rerank-1b-v2
+## Quick Start
+
+### Train a Reranker with llama-nemotron-rerank-1b-v2
 
 From the repository root, run:
 
@@ -24,6 +26,16 @@ uv run automodel examples/retrieval/cross_encoder/llama3_2_1b.yaml --nproc-per-n
 | --- | --- |
 | Train a Llama 3.2 1B cross-encoder | Use [llama3_2_1b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/cross_encoder/llama3_2_1b.yaml). |
 
+## Model Context
+
+### Reranking Models
+
+The cross-encoder path is used for pairwise relevance scoring and reranking.
+
+| Architecture | Task | Wrapper Class | Description |
+|---|---|---|---|
+| `LlamaBidirectionalForSequenceClassification` | Reranking | `NeMoAutoModelCrossEncoder` | Bidirectional Llama with classification head for relevance scoring |
+
 ## Model Reference
 
 ### Model Architecture
@@ -34,14 +46,6 @@ uv run automodel examples/retrieval/cross_encoder/llama3_2_1b.yaml --nproc-per-n
 | Architecture | `LlamaBidirectionalForSequenceClassification` |
 | Parameters | 1B |
 | Hugging Face Organization | [meta-llama](https://huggingface.co/meta-llama) |
-
-### Reranking Models
-
-The cross-encoder path is used for pairwise relevance scoring and reranking.
-
-| Architecture | Task | Wrapper Class | Description |
-|---|---|---|---|
-| `LlamaBidirectionalForSequenceClassification` | Reranking | `NeMoAutoModelCrossEncoder` | Bidirectional Llama with classification head for relevance scoring |
 
 ### Available Models
 

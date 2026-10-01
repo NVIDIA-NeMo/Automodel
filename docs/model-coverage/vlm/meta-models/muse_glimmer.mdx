@@ -8,7 +8,9 @@ slug: model-coverage/vision-language-models/meta-models/Muse-Glimmer-30B
 
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
-## Fine-Tune Muse-Glimmer-30B
+## Quick Start
+
+### Fine-Tune Muse-Glimmer-30B
 
 The recipes use the Hugging Face checkpoint `meta-models/Muse-Glimmer-30B` by default:
 
@@ -27,6 +29,8 @@ The implementation supports FSDP2, activation checkpointing, TP1/TP2, context pa
 | Single-node LoRA SFT | Use [muse_glimmer_30b_medpix_lora.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/muse_glimmer/muse_glimmer_30b_medpix_lora.yaml). Dataset: MedPix-VQA. |
 | Single-node 16K packed text SFT with TP2 and CP4 | Use [muse_glimmer_30b_tulu3_te_tp2_cp4_packed_16k.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/muse_glimmer/muse_glimmer_30b_tulu3_te_tp2_cp4_packed_16k.yaml). Dataset: Tulu 3. |
 
+## Model Context
+
 ## Model Reference
 
 ### Model Architecture
@@ -43,6 +47,13 @@ The implementation supports FSDP2, activation checkpointing, TP1/TP2, context pa
 - Alternating sliding and full attention across a 52-layer text backbone
 - Vision transformer with window and full attention across 50 layers
 - One-dimensional position IDs for packed Transformer Engine context parallelism
+
+### Available Models
+
+| Checkpoint | Type |
+| --- | --- |
+| [Muse-Glimmer-30B](https://huggingface.co/meta-models/Muse-Glimmer-30B) | Checkpoint documented on this page |
+| [`meta-models/Muse-Glimmer-30B`](https://huggingface.co/meta-models/Muse-Glimmer-30B) | Checkpoint documented on this page |
 
 ## Related Resources
 

@@ -8,7 +8,9 @@ slug: model-coverage/large-language-models/openbmb/MiniCPM5-1B
 
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
-## Fine-Tune MiniCPM5-1B
+## Quick Start
+
+### Fine-Tune MiniCPM5-1B
 
 From the repository root, run:
 
@@ -19,6 +21,15 @@ uv run automodel examples/llm_finetune/minicpm/minicpm5_1b_squad.yaml --nproc-pe
 # LoRA fine-tuning
 uv run automodel examples/llm_finetune/minicpm/minicpm5_1b_squad_peft.yaml --nproc-per-node 8
 ```
+
+## Choose a Workflow
+
+| Goal | Start Here |
+| --- | --- |
+| Explore checkpoints | See [Available Models](#available-models). |
+| Configure NeMo AutoModel | Follow the [installation instructions](/get-started/installation). |
+
+## Model Context
 
 ## Model Reference
 

@@ -8,7 +8,9 @@ slug: model-coverage/large-language-models/microsoft/Phi-4
 
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
-## Fine-Tune Phi-4
+## Quick Start
+
+### Fine-Tune Phi-4
 
 From the repository root, run:
 
@@ -22,6 +24,8 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/phi/phi_4_squad.yaml
 | --- | --- |
 | Supervised fine-tuning (SFT) - Phi-4 on SQuAD | Use [phi_4_squad.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/phi/phi_4_squad.yaml). |
 | Low-rank adaptation (LoRA) - Phi-4 on SQuAD | Use [phi_4_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/phi/phi_4_squad_peft.yaml). |
+
+## Model Context
 
 ## Model Reference
 

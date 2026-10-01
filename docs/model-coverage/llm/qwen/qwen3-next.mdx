@@ -8,7 +8,9 @@ Qwen3-Next is an advanced MoE language model from Alibaba Cloud's Qwen team desi
 
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
-## Fine-Tune Qwen3-Next-80B-A3B-Instruct
+## Quick Start
+
+### Fine-Tune Qwen3-Next-80B-A3B-Instruct
 
 <Note>
 This recipe was validated on **4 nodes x 8 GPUs (32 H100s)**. See the [Launcher Guide](/job-launchers/slurm-cluster) for multi-node setup.
@@ -26,6 +28,8 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/qwen/qwen3_next_te_dee
 | Goal | Start Here |
 | --- | --- |
 | Supervised fine-tuning (SFT) - Qwen3-Next with TE + DeepEP | Use [qwen3_next_te_deepep.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen3_next_te_deepep.yaml). |
+
+## Model Context
 
 ## Model Reference
 

@@ -36,8 +36,8 @@ help:
 	@echo "  make docs-login             FIRST-TIME SETUP — provision Fern account + CLI auth"
 	@echo "  make docs                   Generate library reference and start Fern dev server"
 	@echo "  make docs-stitch            Restore frozen backward-version pages from the $(ARCHIVE_REF) branch"
-	@echo "  make docs-check             Run MDX syntax validation + 'fern check'"
-	@echo "  make docs-mdx-check         Run MDX syntax validation"
+	@echo "  make docs-check             Validate model card layouts, MDX syntax, and Fern configuration"
+	@echo "  make docs-mdx-check         Validate model card layouts and MDX syntax"
 	@echo "  make docs-model-tables      Generate release-log and model-registry tables"
 	@echo "  make docs-preview           Build a shared preview URL on *.docs.buildwithfern.com (needs DOCS_FERN_TOKEN)"
 	@echo "  make docs-publish           Trigger the 'Publish Fern Docs' workflow on origin/main"
@@ -119,10 +119,11 @@ docs-mdx-check: docs-model-tables docs-stitch
 	$(MAKE) _docs-mdx-check
 
 _docs-mdx-check:
-	@tmp_dir="$$(mktemp -d)"; \
+	@set -e; tmp_dir="$$(mktemp -d)"; \
 	trap 'rm -rf "$$tmp_dir"' EXIT; \
 	printf '%s\n' '{"private":true,"type":"module"}' > "$$tmp_dir/package.json"; \
-	npm --prefix "$$tmp_dir" install --silent @mdx-js/mdx@3 remark-frontmatter@5 remark-math@6 >/dev/null; \
+	npm --prefix "$$tmp_dir" install --silent --ignore-scripts --no-audit --no-fund @mdx-js/mdx@3 remark-frontmatter@5 remark-math@6 remark-gfm@4 yaml@2 >/dev/null; \
+	MDX_LINT_PREFIX="$$tmp_dir" MDX_LINT_REPO_ROOT="$(REPO_ROOT)" node "$(REPO_ROOT)/tools/validate_model_cards.mjs"; \
 	MDX_LINT_PREFIX="$$tmp_dir" MDX_LINT_REPO_ROOT="$(REPO_ROOT)" node "$(REPO_ROOT)/tools/validate_mdx_syntax.mjs" "$(REPO_ROOT)/docs"
 
 # Restore the frozen backward-version page trees into the working copy. They

@@ -8,7 +8,9 @@ slug: model-coverage/omni/qwen/Qwen3-Omni-30B-A3B-Instruct
 
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
-## Fine-Tune Qwen3-Omni-30B-A3B-Instruct
+## Quick Start
+
+### Fine-Tune Qwen3-Omni-30B-A3B-Instruct
 
 From the repository root, run:
 
@@ -24,7 +26,9 @@ uv run automodel --nproc-per-node=8 examples/vlm_finetune/qwen3/qwen3_omni_moe_3
 | ASR SFT - Qwen3-Omni 30B-A3B | Use [ami_sft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/audio_finetune/qwen3_omni_asr/ami_sft.yaml). Dataset: AMI. |
 | ASR SFT - Qwen3-Omni 30B-A3B | Use [multi_en_sft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/audio_finetune/qwen3_omni_asr/multi_en_sft.yaml). Dataset: Multi-corpus English mixture. |
 
-## Fine-Tuning
+## Model Context
+
+### Fine-Tuning
 
 See the [VLM / Omni Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n) and
 [Qwen3-Omni ASR Fine-Tuning Guide](/recipes-e2e-examples/qwen3-omni-asr).

@@ -6,13 +6,27 @@ slug: model-coverage/large-language-models/google/functiongemma-270m-it
 
 [FunctionGemma](https://huggingface.co/google/functiongemma-270m-it) is a compact Gemma model specialized for function calling.
 
-## Fine-Tune functiongemma-270m-it
+## Quick Start
+
+### Fine-Tune functiongemma-270m-it
 
 From the repository root, run:
 
 ```bash
 uv run automodel --nproc-per-node=8 examples/llm_finetune/gemma/functiongemma_xlam.yaml
 ```
+
+## Choose a Workflow
+
+| Goal | Start Here |
+| --- | --- |
+| [`google/functiongemma-270m-it`](https://huggingface.co/google/functiongemma-270m-it) | [xLAM function-calling SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gemma/functiongemma_xlam.yaml) |
+
+## Model Context
+
+### Recipe Notes
+
+See the [FunctionGemma Fine-Tuning Guide](/recipes-e2e-examples/function-calling).
 
 ## Model Reference
 
@@ -25,10 +39,12 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/gemma/functiongemma_xl
 | **Parameters** | 270M |
 | **HF Org** | [google](https://huggingface.co/google) |
 
-## Example Model and Recipe
+### Available Models
 
-| Model | Recipe |
-|---|---|
-| [`google/functiongemma-270m-it`](https://huggingface.co/google/functiongemma-270m-it) | [xLAM function-calling SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gemma/functiongemma_xlam.yaml) |
+| Checkpoint | Type |
+| --- | --- |
+| [`google/functiongemma-270m-it`](https://huggingface.co/google/functiongemma-270m-it) | Checkpoint linked by the example recipe |
 
-See the [FunctionGemma Fine-Tuning Guide](/recipes-e2e-examples/function-calling).
+## Related Resources
+
+- [Installation Instructions](/get-started/installation)

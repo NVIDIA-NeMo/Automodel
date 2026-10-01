@@ -8,7 +8,9 @@ slug: model-coverage/diffusion/hunyuanvideo-community/HunyuanVideo-1.5-Diffusers
 
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
-## Fine-Tune HunyuanVideo-1.5-Diffusers-720p_t2v
+## Quick Start
+
+### Fine-Tune HunyuanVideo-1.5-Diffusers-720p_t2v
 
 From the repository root, run:
 
@@ -24,6 +26,12 @@ uv run torchrun --nproc-per-node=8 \
 | --- | --- |
 | Fine-tune - HunyuanVideo 1.5 with flow matching | Use [hunyuan_t2v_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/hunyuan_t2v_flow.yaml). |
 
+## Model Context
+
+### Task
+
+- Text-to-Video (T2V)
+
 ## Model Reference
 
 ### Model Architecture
@@ -34,10 +42,6 @@ uv run torchrun --nproc-per-node=8 \
 | Architecture | DiT (Flow Matching) |
 | Parameters | 13B |
 | Hugging Face Organization | [hunyuanvideo-community](https://huggingface.co/hunyuanvideo-community) |
-
-### Task
-
-- Text-to-Video (T2V)
 
 ### Available Models
 

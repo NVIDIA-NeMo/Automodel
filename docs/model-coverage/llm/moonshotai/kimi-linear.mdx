@@ -8,7 +8,9 @@ slug: model-coverage/large-language-models/moonshotai/Kimi-Linear-48B-A3B-Instru
 
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
-## Fine-Tune Kimi-Linear-48B-A3B-Instruct
+## Quick Start
+
+### Fine-Tune Kimi-Linear-48B-A3B-Instruct
 
 From the repository root, run:
 
@@ -22,6 +24,17 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/kimi/kimi_linear_48b_a
 | --- | --- |
 | Supervised fine-tuning (SFT): Kimi Linear 48B A3B on HellaSwag with EP=8 | Use [kimi_linear_48b_a3b_hellaswag.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/kimi/kimi_linear_48b_a3b_hellaswag.yaml). |
 | Supervised fine-tuning (SFT): 32k packed sequences with CP=8 and EP=8 | Use [kimi_linear_48b_a3b_longcontext_cp8.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/kimi/kimi_linear_48b_a3b_longcontext_cp8.yaml). |
+
+## Model Context
+
+### Supported Parallelism
+
+| Feature | Notes |
+|---|---|
+| FSDP2 | Default sharding strategy for the recipes below |
+| Expert parallelism (EP) | Shards the MoE experts across ranks |
+| Context parallelism (CP) | Contiguous per-rank sequence shards. KDA passes its recurrent state from rank to rank, and MLA gathers the compressed KV latent |
+| Packed sequences | Document boundaries from the THD collater are honored by both layer types, including under CP |
 
 ## Model Reference
 
@@ -45,15 +58,6 @@ distinct identity, `kimi_linear_48b_a3b` / `KimiLinear48BForCausalLM`, and leave
 `kimi_linear` to the K3 text config. The example recipes name `KimiLinear48BConfig`
 explicitly, which is what a published Moonshot checkpoint needs; checkpoints saved by
 NeMo AutoModel already carry the distinct identity and load without that override.
-
-### Supported Parallelism
-
-| Feature | Notes |
-|---|---|
-| FSDP2 | Default sharding strategy for the recipes below |
-| Expert parallelism (EP) | Shards the MoE experts across ranks |
-| Context parallelism (CP) | Contiguous per-rank sequence shards. KDA passes its recurrent state from rank to rank, and MLA gathers the compressed KV latent |
-| Packed sequences | Document boundaries from the THD collater are honored by both layer types, including under CP |
 
 ### Available Models
 

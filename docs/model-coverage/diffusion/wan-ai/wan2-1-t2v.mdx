@@ -11,7 +11,9 @@ Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com
 The 1.3B fine-tuning configuration uses 16 data-parallel ranks. Use the
 [launcher guide](/job-launchers/slurm-cluster) to run it across the required ranks.
 
-## Fine-Tune Wan2.1-T2V-1.3B-Diffusers
+## Quick Start
+
+### Fine-Tune Wan2.1-T2V-1.3B-Diffusers
 
 From the repository root, run:
 
@@ -26,6 +28,12 @@ uv run automodel examples/diffusion/finetune/wan2_1_t2v_flow_multinode.yaml --np
 | Fine-tune - Wan 2.1 T2V 1.3B with flow matching | Use [wan2_1_t2v_flow_multinode.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/wan2_1_t2v_flow_multinode.yaml). |
 | Pretrain - Wan 2.1 T2V with flow matching | Use [wan2_1_t2v_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/pretrain/wan2_1_t2v_flow.yaml). |
 
+## Model Context
+
+### Task
+
+- Text-to-Video (T2V)
+
 ## Model Reference
 
 ### Model Architecture
@@ -36,10 +44,6 @@ uv run automodel examples/diffusion/finetune/wan2_1_t2v_flow_multinode.yaml --np
 | Architecture | DiT (Flow Matching) |
 | Parameters | 1.3B |
 | Hugging Face Organization | [Wan-AI](https://huggingface.co/Wan-AI) |
-
-### Task
-
-- Text-to-Video (T2V)
 
 ### Available Models
 

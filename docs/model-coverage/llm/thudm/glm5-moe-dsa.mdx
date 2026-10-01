@@ -13,94 +13,9 @@ Dynamic Sparse Attention (DSA). GLM-5.3 uses the same base model and
 `GlmMoeDsaForCausalLM` architecture as GLM-5.2, with its gains coming from
 post-training.
 
-## Model Reference
+## Quick Start
 
-### Model Architecture
-
-| Property | Value |
-|---|---|
-| **Task** | Text Generation |
-| **Architecture** | `GlmMoeDsaForCausalLM` |
-| **GLM-5.3 decoder** | 78 layers, 6,144 hidden size, 256 routed experts |
-| **GLM-5.3 context length** | 1,048,576 tokens in the model configuration; validated here at 4,096 tokens |
-| **HF Org** | [zai-org](https://huggingface.co/zai-org) |
-
-## Key Features
-
-GLM-5 family models in NeMo AutoModel support:
-
-- **Mixture-of-Experts (MoE)** with 256 routed experts, top-8 routing, and one
-  shared expert in the GLM-5.2/5.3 configuration. The first three layers use
-  dense feed-forward networks.
-- **IndexShare DSA for GLM-5.2 and GLM-5.3**. Shared DSA layers reuse the
-  previous full layer's top-k sparse-attention selection.
-- **Optional cuDNN DSA and FlashMLA sparse attention** on SM90 or later through
-  `backend.attn: cudnn`.
-- **Optional TileLang kernels** for the DSA indexer and sparse MLA path through
-  `backend.attn: tilelang`.
-- **Packed-sequence training and distributed execution** with FSDP2, expert
-  parallelism, HybridEP dispatch, and optional context parallelism.
-
-## Available Models
-
-- **GLM-5** (`GlmMoeDsaForCausalLM`)
-- **GLM-5.1** (`GlmMoeDsaForCausalLM`): Updated weights
-- **GLM-5.2** (`GlmMoeDsaForCausalLM`): IndexShare DSA with cuDNN and
-  TileLang backends
-- **GLM-5.3** (`GlmMoeDsaForCausalLM`): Same base architecture as GLM-5.2;
-  updated post-training
-
-## Example HF Models
-
-| Model | HF ID |
-|---|---|
-| GLM-5 | [`zai-org/GLM-5`](https://huggingface.co/zai-org/GLM-5) |
-| GLM-5.1 | [`zai-org/GLM-5.1`](https://huggingface.co/zai-org/GLM-5.1) |
-| GLM-5.2 | [`zai-org/GLM-5.2`](https://huggingface.co/zai-org/GLM-5.2) |
-| GLM-5.3 | [`zai-org/GLM-5.3`](https://huggingface.co/zai-org/GLM-5.3) |
-
-## Example Recipes
-
-| Recipe | Description |
-|---|---|
-| [glm_5.3_tulu3_4k_cudnn_100step.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.3_tulu3_4k_cudnn_100step.yaml) | Full-parameter GLM-5.3 SFT on Tulu3 with packed 4K sequences, cuDNN DSA, HybridEP, and EP64 |
-| [glm_5.2_tulu3_32k_tilelang_cp8.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.2_tulu3_32k_tilelang_cp8.yaml) | GLM-5.2 SFT on Tulu3 with packed 32K sequences, CP8, TileLang DSA, and EP64 |
-| [glm_5.2_tulu3_4k_tilelang_100k.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.2_tulu3_4k_tilelang_100k.yaml) | GLM-5.2 SFT on Tulu3 with packed 4K sequences and TileLang DSA |
-| [glm_5.2_tulu3_4k_cudnn_100k.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.2_tulu3_4k_cudnn_100k.yaml) | GLM-5.2 SFT on Tulu3 with packed 4K sequences and cuDNN DSA + FlashMLA |
-
-## Validated GLM-5.3 Configuration
-
-| Area | Validated configuration |
-|---|---|
-| Training | Full-parameter SFT with FSDP2 and activation checkpointing |
-| Distributed setup | EP64 / CP1 with HybridEP dispatch and expert `reshard_after_forward: true` |
-| Attention | cuDNN DSA with FlashMLA sparse forward |
-| Workload | `allenai/tulu-3-sft-mixture`, packed 4,096-token sequences |
-| Batch | Local batch size 4; global batch size 256 |
-| Scale | 32 nodes / 256 GPUs |
-| Duration | 100 optimizer steps |
-
-The relevant model and expert-distribution settings are:
-
-```yaml
-distributed:
-  strategy: fsdp2
-  ep_size: 64
-  activation_checkpointing: true
-  moe:
-    reshard_after_forward: true
-    wrap_outer_model: false
-    ignore_router_for_ac: true
-
-model:
-  pretrained_model_name_or_path: zai-org/GLM-5.3
-  backend:
-    attn: cudnn
-    dispatcher: hybridep
-    gate_precision: float32
-```
-
-## Install and Run
+### Install and Run
 
 Clone and install NeMo AutoModel from source:
 
@@ -137,9 +52,68 @@ multi-node launch. The published recipe is a distributed full-model workflow.
 
 </Note>
 
-## Numerical Validation
+## Choose a Workflow
 
-### Hugging Face Logit Parity
+| Goal | Start Here |
+| --- | --- |
+| Full-parameter GLM-5.3 SFT on Tulu3 with packed 4K sequences, cuDNN DSA, HybridEP, and EP64 | [glm_5.3_tulu3_4k_cudnn_100step.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.3_tulu3_4k_cudnn_100step.yaml) |
+| GLM-5.2 SFT on Tulu3 with packed 32K sequences, CP8, TileLang DSA, and EP64 | [glm_5.2_tulu3_32k_tilelang_cp8.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.2_tulu3_32k_tilelang_cp8.yaml) |
+| GLM-5.2 SFT on Tulu3 with packed 4K sequences and TileLang DSA | [glm_5.2_tulu3_4k_tilelang_100k.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.2_tulu3_4k_tilelang_100k.yaml) |
+| GLM-5.2 SFT on Tulu3 with packed 4K sequences and cuDNN DSA + FlashMLA | [glm_5.2_tulu3_4k_cudnn_100k.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.2_tulu3_4k_cudnn_100k.yaml) |
+
+## Model Context
+
+### Key Features
+
+GLM-5 family models in NeMo AutoModel support:
+
+- **Mixture-of-Experts (MoE)** with 256 routed experts, top-8 routing, and one
+  shared expert in the GLM-5.2/5.3 configuration. The first three layers use
+  dense feed-forward networks.
+- **IndexShare DSA for GLM-5.2 and GLM-5.3**. Shared DSA layers reuse the
+  previous full layer's top-k sparse-attention selection.
+- **Optional cuDNN DSA and FlashMLA sparse attention** on SM90 or later through
+  `backend.attn: cudnn`.
+- **Optional TileLang kernels** for the DSA indexer and sparse MLA path through
+  `backend.attn: tilelang`.
+- **Packed-sequence training and distributed execution** with FSDP2, expert
+  parallelism, HybridEP dispatch, and optional context parallelism.
+
+### Validated GLM-5.3 Configuration
+
+| Area | Validated configuration |
+|---|---|
+| Training | Full-parameter SFT with FSDP2 and activation checkpointing |
+| Distributed setup | EP64 / CP1 with HybridEP dispatch and expert `reshard_after_forward: true` |
+| Attention | cuDNN DSA with FlashMLA sparse forward |
+| Workload | `allenai/tulu-3-sft-mixture`, packed 4,096-token sequences |
+| Batch | Local batch size 4; global batch size 256 |
+| Scale | 32 nodes / 256 GPUs |
+| Duration | 100 optimizer steps |
+
+The relevant model and expert-distribution settings are:
+
+```yaml
+distributed:
+  strategy: fsdp2
+  ep_size: 64
+  activation_checkpointing: true
+  moe:
+    reshard_after_forward: true
+    wrap_outer_model: false
+    ignore_router_for_ac: true
+
+model:
+  pretrained_model_name_or_path: zai-org/GLM-5.3
+  backend:
+    attn: cudnn
+    dispatcher: hybridep
+    gate_precision: float32
+```
+
+### Numerical Validation
+
+#### Hugging Face Logit Parity
 
 The first four GLM-5.3 layers were compared with the Hugging Face reference.
 Representative loaded weights matched their source tensors exactly.
@@ -149,7 +123,7 @@ Representative loaded weights matched their source tensors exactly.
 | Logits relative L2 error | 0.639% |
 | Top-1 token agreement | 96.61% |
 
-### 100-Step Training
+#### 100-Step Training
 
 The full 32-node / 256-GPU configuration completed all 100 optimizer steps.
 Throughput statistics exclude the first 10 warmup steps.
@@ -163,7 +137,7 @@ Throughput statistics exclude the first 10 warmup steps.
 
 The run completed without non-finite metrics or critical rank errors.
 
-## Current Scope
+### Current Scope
 
 - The published GLM-5.3 path covers full-parameter SFT with cuDNN DSA,
   FlashMLA, HybridEP, and EP64 at 4K sequence length.
@@ -177,7 +151,35 @@ See the [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft) and the
 [Large MoE Fine-Tuning Guide](/recipes-e2e-examples/large-moe-fine-tuning) for
 dataset and training configuration details.
 
-## References
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+|---|---|
+| **Task** | Text Generation |
+| **Architecture** | `GlmMoeDsaForCausalLM` |
+| **GLM-5.3 decoder** | 78 layers, 6,144 hidden size, 256 routed experts |
+| **GLM-5.3 context length** | 1,048,576 tokens in the model configuration; validated here at 4,096 tokens |
+| **HF Org** | [zai-org](https://huggingface.co/zai-org) |
+
+### Available Models
+
+- **GLM-5** (`GlmMoeDsaForCausalLM`)
+- **GLM-5.1** (`GlmMoeDsaForCausalLM`): Updated weights
+- **GLM-5.2** (`GlmMoeDsaForCausalLM`): IndexShare DSA with cuDNN and
+  TileLang backends
+- **GLM-5.3** (`GlmMoeDsaForCausalLM`): Same base architecture as GLM-5.2;
+  updated post-training
+
+| Model | HF ID |
+|---|---|
+| GLM-5 | [`zai-org/GLM-5`](https://huggingface.co/zai-org/GLM-5) |
+| GLM-5.1 | [`zai-org/GLM-5.1`](https://huggingface.co/zai-org/GLM-5.1) |
+| GLM-5.2 | [`zai-org/GLM-5.2`](https://huggingface.co/zai-org/GLM-5.2) |
+| GLM-5.3 | [`zai-org/GLM-5.3`](https://huggingface.co/zai-org/GLM-5.3) |
+
+## Related Resources
 
 - [zai-org/GLM-5](https://huggingface.co/zai-org/GLM-5)
 - [zai-org/GLM-5.1](https://huggingface.co/zai-org/GLM-5.1)

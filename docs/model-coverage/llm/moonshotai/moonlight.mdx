@@ -10,7 +10,9 @@ The documented workflows cover HellaSwag fine-tuning, packed sequences, pretrain
 
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
-## Fine-Tune Moonlight
+## Quick Start
+
+### Fine-Tune Moonlight
 
 From the repository root, run:
 
@@ -29,6 +31,8 @@ uv run automodel examples/llm_finetune/moonlight/moonlight_16b_te.yaml \
 | Fine-tune with packed sequences | Use [`moonlight_16b_te_packed_sequence.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/moonlight/moonlight_16b_te_packed_sequence.yaml). It packs sequences to 1,024 tokens and uses `torch_mm` experts. |
 | Pretrain from configuration | Customize the [pretraining template](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/megatron_pretrain_moonlight_16b_te_slurm.yaml). Replace the data paths, configure Slurm, and submit it on one 8-GPU node. |
 | Reproduce the Tulu-3 workflow | Follow the [Tulu-3 run instructions](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/convergence/tulu3/models/moonlight-16b). Prefilter the data to 2,048 tokens and launch the fine-tuning script with `torchrun`. |
+
+## Model Context
 
 ## Model Reference
 

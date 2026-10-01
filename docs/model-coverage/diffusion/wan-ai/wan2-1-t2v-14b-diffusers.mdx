@@ -6,7 +6,9 @@ slug: model-coverage/diffusion/wan-ai/Wan2.1-T2V-14B-Diffusers
 
 [Wan2.1-T2V-14B-Diffusers](https://huggingface.co/Wan-AI/Wan2.1-T2V-14B-Diffusers) has a checked-in NeMo AutoModel recipe for text to video.
 
-## Fine-Tune Wan2.1-T2V-14B-Diffusers
+## Quick Start
+
+### Fine-Tune Wan2.1-T2V-14B-Diffusers
 
 Follow the [installation instructions](/get-started/installation), then review the checked-in recipe and
 its declared topology below before choosing a local or cluster launcher.
@@ -23,6 +25,8 @@ uv run torchrun --nproc-per-node=8 \
 | --- | --- |
 | Run the primary recipe for this model | Use the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/wan2_1_t2v_flow.yaml). |
 | Try another checked-in recipe for this model | Use the [alternate recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/wan2_1_t2v_flow_lora.yaml). |
+
+## Model Context
 
 ### Configuration
 
@@ -50,6 +54,11 @@ uv run torchrun --nproc-per-node=8 \
 ### Available Models
 
 - [`Wan-AI/Wan2.1-T2V-14B-Diffusers`](https://huggingface.co/Wan-AI/Wan2.1-T2V-14B-Diffusers)
+
+| Checkpoint | Type |
+| --- | --- |
+| [Wan2.1-T2V-14B-Diffusers](https://huggingface.co/Wan-AI/Wan2.1-T2V-14B-Diffusers) | Checkpoint documented on this page |
+| [`Wan-AI/Wan2.1-T2V-14B-Diffusers`](https://huggingface.co/Wan-AI/Wan2.1-T2V-14B-Diffusers) | Checkpoint documented on this page |
 
 ## Related Resources
 

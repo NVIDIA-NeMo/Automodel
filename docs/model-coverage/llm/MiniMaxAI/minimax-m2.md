@@ -1,45 +1,14 @@
-# MiniMax-M2
+---
+title: "MiniMax-M2.1"
+description: "Use MiniMax-M2.1 with NeMo AutoModel for language model fine-tuning, with documented checkpoints, runnable recipes, setup guidance, and model reference details."
+slug: model-coverage/large-language-models/minimax/MiniMax-M2.1
+---
 
 [MiniMax-M2](https://huggingface.co/MiniMaxAI) is MiniMax's large Mixture-of-Experts language model with linear attention for efficient long-context inference.
 
-<Info>
+## Quick Start
 
-| | |
-|---|---|
-| **Task** | Text Generation (MoE) |
-| **Architecture** | `MiniMaxM2ForCausalLM` |
-| **Parameters** | varies |
-| **HF Org** | [MiniMaxAI](https://huggingface.co/MiniMaxAI) |
-
-</Info>
-
-## Available Models
-
-- **MiniMax-M2.1**
-- **MiniMax-M2.5**
-- **MiniMax-M2.7**
-## Architecture
-
-- `MiniMaxM2ForCausalLM`
-
-## Example HF Models
-
-| Model | HF ID |
-|---|---|
-| MiniMax M2.1 | [`MiniMaxAI/MiniMax-M2.1`](https://huggingface.co/MiniMaxAI/MiniMax-M2.1) |
-| MiniMax M2.5 | [`MiniMaxAI/MiniMax-M2.5`](https://huggingface.co/MiniMaxAI/MiniMax-M2.5) |
-| MiniMax M2.7 | [`MiniMaxAI/MiniMax-M2.7`](https://huggingface.co/MiniMaxAI/MiniMax-M2.7) |
-
-## Example Recipes
-
-| Recipe | Description |
-|---|---|
-| [minimax_m2.1_hellaswag_pp.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/minimax_m2/minimax_m2.1_hellaswag_pp.yaml) | SFT — MiniMax-M2.1 on HellaSwag with pipeline parallelism |
-| [minimax_m2.5_hellaswag_pp.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/minimax_m2/minimax_m2.5_hellaswag_pp.yaml) | SFT — MiniMax-M2.5 on HellaSwag with pipeline parallelism |
-| [minimax_m2.7_hellaswag_pp.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/minimax_m2/minimax_m2.7_hellaswag_pp.yaml) | SFT — MiniMax-M2.7 on HellaSwag with pipeline parallelism |
-
-
-## Try with NeMo AutoModel
+### Try with NeMo AutoModel
 
 **1. Clone and install from source** ([full instructions](/get-started/installation)):
 
@@ -85,11 +54,48 @@ automodel --nproc-per-node=8 examples/llm_finetune/minimax_m2/minimax_m2.1_hella
 
 See the [Installation Guide](../../../guides/installation.mdx) and [LLM Fine-Tuning Guide](../../../guides/llm/finetune.mdx).
 
-## Fine-Tuning
+## Choose a Workflow
+
+| Goal | Start Here |
+| --- | --- |
+| SFT — MiniMax-M2.1 on HellaSwag with pipeline parallelism | [minimax_m2.1_hellaswag_pp.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/minimax_m2/minimax_m2.1_hellaswag_pp.yaml) |
+| SFT — MiniMax-M2.5 on HellaSwag with pipeline parallelism | [minimax_m2.5_hellaswag_pp.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/minimax_m2/minimax_m2.5_hellaswag_pp.yaml) |
+| SFT — MiniMax-M2.7 on HellaSwag with pipeline parallelism | [minimax_m2.7_hellaswag_pp.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/minimax_m2/minimax_m2.7_hellaswag_pp.yaml) |
+
+## Model Context
+
+### Architecture
+
+- `MiniMaxM2ForCausalLM`
+
+### Fine-Tuning
 
 See the [Large MoE Fine-Tuning Guide](../../../guides/llm/large-moe-finetune.mdx).
 
-## Hugging Face Model Cards
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+|---|---|
+| **Task** | Text Generation (MoE) |
+| **Architecture** | `MiniMaxM2ForCausalLM` |
+| **Parameters** | varies |
+| **HF Org** | [MiniMaxAI](https://huggingface.co/MiniMaxAI) |
+
+### Available Models
+
+- **MiniMax-M2.1**
+- **MiniMax-M2.5**
+- **MiniMax-M2.7**
+
+| Model | HF ID |
+|---|---|
+| MiniMax M2.1 | [`MiniMaxAI/MiniMax-M2.1`](https://huggingface.co/MiniMaxAI/MiniMax-M2.1) |
+| MiniMax M2.5 | [`MiniMaxAI/MiniMax-M2.5`](https://huggingface.co/MiniMaxAI/MiniMax-M2.5) |
+| MiniMax M2.7 | [`MiniMaxAI/MiniMax-M2.7`](https://huggingface.co/MiniMaxAI/MiniMax-M2.7) |
+
+## Related Resources
 
 - [MiniMaxAI/MiniMax-M2.1](https://huggingface.co/MiniMaxAI/MiniMax-M2.1)
 - [MiniMaxAI/MiniMax-M2.5](https://huggingface.co/MiniMaxAI/MiniMax-M2.5)

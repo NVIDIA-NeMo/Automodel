@@ -6,13 +6,28 @@ slug: model-coverage/dllm/nvidia/Nemotron-Labs-Diffusion-8B-Base
 
 [Nemotron-Labs-Diffusion](https://huggingface.co/nvidia/Nemotron-Labs-Diffusion-8B-Base) is NVIDIA's 8B diffusion language model.
 
-## Fine-Tune Nemotron-Labs-Diffusion-8B-Base
+## Quick Start
+
+### Fine-Tune Nemotron-Labs-Diffusion-8B-Base
 
 From the repository root, run:
 
 ```bash
 uv run automodel --nproc-per-node=8 examples/dllm_sft/nemotron_labs_diffusion_sft.yaml
 ```
+
+## Choose a Workflow
+
+| Goal | Start Here |
+| --- | --- |
+| [`nvidia/Nemotron-Labs-Diffusion-8B-Base`](https://huggingface.co/nvidia/Nemotron-Labs-Diffusion-8B-Base) | [Full SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/nemotron_labs_diffusion_sft.yaml) |
+| [`nvidia/Nemotron-Labs-Diffusion-8B-Base`](https://huggingface.co/nvidia/Nemotron-Labs-Diffusion-8B-Base) | [LoRA](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/nemotron_labs_diffusion_lora.yaml) |
+
+## Model Context
+
+### Recipe Notes
+
+See the [dLLM Fine-Tuning Guide](/recipes-e2e-examples/dllm-fine-tuning).
 
 ## Model Reference
 
@@ -25,11 +40,12 @@ uv run automodel --nproc-per-node=8 examples/dllm_sft/nemotron_labs_diffusion_sf
 | **Parameters** | 8B |
 | **HF Org** | [nvidia](https://huggingface.co/nvidia) |
 
-## Example Model and Recipes
+### Available Models
 
-| Model | Recipe |
-|---|---|
-| [`nvidia/Nemotron-Labs-Diffusion-8B-Base`](https://huggingface.co/nvidia/Nemotron-Labs-Diffusion-8B-Base) | [Full SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/nemotron_labs_diffusion_sft.yaml) |
-| [`nvidia/Nemotron-Labs-Diffusion-8B-Base`](https://huggingface.co/nvidia/Nemotron-Labs-Diffusion-8B-Base) | [LoRA](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/nemotron_labs_diffusion_lora.yaml) |
+| Checkpoint | Type |
+| --- | --- |
+| [`nvidia/Nemotron-Labs-Diffusion-8B-Base`](https://huggingface.co/nvidia/Nemotron-Labs-Diffusion-8B-Base) | Checkpoint linked by the example recipe |
 
-See the [dLLM Fine-Tuning Guide](/recipes-e2e-examples/dllm-fine-tuning).
+## Related Resources
+
+- [Installation Instructions](/get-started/installation)
