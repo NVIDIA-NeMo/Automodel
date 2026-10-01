@@ -41,6 +41,7 @@ function headings(nodes, depth) {
 }
 
 function section(nodes, heading) {
+  if (!heading) return [];
   const start = nodes.indexOf(heading) + 1;
   const end = nodes.findIndex(
     (node, index) => index >= start && node.type === "heading" && node.depth <= heading.depth,
@@ -49,7 +50,7 @@ function section(nodes, heading) {
 }
 
 /** Validate a parsed card against the section structure in the authoring template. */
-export function validateModelCard(source, template, format = "mdx") {
+export function validateModelCard(source, template, format = "mdx", recipes = new Map()) {
   const errors = [];
   const report = (node, message) => errors.push({ line: node?.position?.start?.line ?? 1, message });
   let tree;
@@ -68,6 +69,7 @@ export function validateModelCard(source, template, format = "mdx") {
   }
 
   const metadata = nodes[0];
+  let modelId;
   if (metadata?.type !== "yaml") {
     report(metadata, "missing YAML frontmatter");
   } else {
@@ -80,6 +82,18 @@ export function validateModelCard(source, template, format = "mdx") {
         if (typeof value !== "string" || value.trim().length === 0) {
           report(metadata, `frontmatter ${key} must be a nonempty string`);
         }
+      }
+      modelId = document.get("title");
+      if (typeof modelId === "string" && !/^[\w.-]+\/[\w.-]+$/.test(modelId)) {
+        report(metadata, "frontmatter title must be the full Hugging Face organization/model ID");
+      }
+      const slug = document.get("slug");
+      if (
+        typeof slug === "string" &&
+        typeof modelId === "string" &&
+        slug.split("/").at(-1) !== modelId.split("/").at(-1)
+      ) {
+        report(metadata, "slug checkpoint must match the title checkpoint (keep existing provider route aliases)");
       }
     }
   }
@@ -122,7 +136,7 @@ export function validateModelCard(source, template, format = "mdx") {
   for (const heading of actualHeadings) {
     const name = textContent(heading);
     const content = section(nodes, heading);
-    if (name !== "Model Context" && !hasContent(content)) {
+    if (!hasContent(content)) {
       report(heading, `${name} must contain content`);
     }
     if (name === "Choose a Workflow") {
@@ -136,22 +150,64 @@ export function validateModelCard(source, template, format = "mdx") {
         report(table, "Choose a Workflow requires at least one data row");
       }
     }
-    if (name === "Model Reference") {
-      const templateReference = headings(templateTree.children, 2).find((node) => textContent(node) === name);
-      const expectedSubheadings = headings(section(templateTree.children, templateReference), 3).map(textContent);
-      const subheadings = headings(content, 3);
-      if (JSON.stringify(subheadings.map(textContent)) !== JSON.stringify(expectedSubheadings)) {
-        report(heading, `Model Reference requires subsections in order: ${expectedSubheadings.join(" -> ")}`);
-      }
-      for (const subheading of subheadings) {
-        const table = section(content, subheading).find((node) => node.type === "table");
-        if (!table || table.children.length < 2) {
-          report(subheading, `${textContent(subheading)} requires a direct table with at least one data row`);
-        } else if (
-          textContent(subheading) === "Model Architecture" &&
-          JSON.stringify(table.children[0].children.map(textContent)) !== JSON.stringify(["Property", "Value"])
-        ) {
-          report(table, "Model Architecture requires Property | Value columns");
+    if (["Model Context", "Available Models"].includes(name)) {
+      const table = content.find((node) => node.type === "table");
+      if (!table || table.children.length < 2) {
+        report(heading, `${name} requires a direct table with at least one data row`);
+      } else if (name === "Model Context") {
+        if (JSON.stringify(table.children[0].children.map(textContent)) !== JSON.stringify(["Property", "Value"])) {
+          report(table, "Model Context requires a Property | Value architecture table");
+        }
+        for (const property of ["Architecture", "Task", "Parameters"]) {
+          if (
+            !table.children.slice(1).some(
+              (row) =>
+                textContent(row.children[0])
+                  .replace(/^Hugging Face /, "")
+                  .replace(/^Tasks$/, "Task")
+                  .replace(/^Architectures$/, "Architecture") === property && textContent(row.children[1]).trim(),
+            )
+          ) {
+            report(table, `Model Context requires a nonempty ${property} row`);
+          }
+        }
+        const rows = table.children.slice(1);
+        const dimensions = new Set([
+          "Decoder Layers",
+          "Layers",
+          "Transformer Blocks",
+          "Hidden Size",
+          "Attention",
+          "Context Length",
+          "Vocabulary Size",
+          "Experts",
+          "Vision Encoder",
+          "Language Backbone",
+          "Text Encoder",
+          "Latent Channels",
+          "Feed-Forward Sizes",
+        ]);
+        if (
+          rows.length < 5 ||
+          rows.filter((row) => dimensions.has(textContent(row.children[0])) && /\d/.test(textContent(row.children[1])))
+            .length < 2
+        )
+          report(
+            table,
+            "Model Context requires at least five architecture properties, including two numeric dimension rows (layers, hidden size, attention, context, vocabulary, experts, or vision)",
+          );
+        const parameters = rows.find((row) => textContent(row.children[0]) === "Parameters");
+        if (parameters && !/\d/.test(textContent(parameters.children[1])))
+          report(parameters, "Parameters must state a numeric parameter count");
+        for (const row of rows) {
+          if (
+            row.children.some(
+              (cell) =>
+                !textContent(cell).trim() ||
+                /^(?:-|tbd|todo|unknown|n\/a|placeholder)$/i.test(textContent(cell).trim()),
+            )
+          )
+            report(row, "architecture properties and values must be nonempty and cannot be placeholders");
         }
       }
     }
@@ -179,7 +235,214 @@ export function validateModelCard(source, template, format = "mdx") {
     for (const child of node.children ?? []) checkTables(child);
   };
   checkTables(tree);
+  const proseText = (node) =>
+    ["code", "heading", "yaml", "definition", "html", "mdxFlowExpression", "mdxTextExpression"].includes(node.type)
+      ? ""
+      : (node.value ?? (node.children ?? []).map(proseText).join(" "));
+  for (const [name, content, limit] of [
+    ["introduction", introduction, 80],
+    [
+      "Quick Start",
+      section(
+        nodes,
+        actualHeadings.find((node) => textContent(node) === "Quick Start"),
+      ),
+      60,
+    ],
+    [
+      "Choose a Workflow",
+      section(
+        nodes,
+        actualHeadings.find((node) => textContent(node) === "Choose a Workflow"),
+      ),
+      160,
+    ],
+  ]) {
+    const prose = content.map(proseText).join(" ").trim();
+    if (prose.split(/\s+/).filter(Boolean).length > limit || prose.length > limit * 10)
+      report(
+        content[0],
+        `${name} exceeds ${limit} prose words or ${limit * 10} characters; move details to Model Context`,
+      );
+  }
+  const quick = actualHeadings.find((node) => textContent(node) === "Quick Start");
+  const codeBlocks = quick ? section(nodes, quick).flatMap((node) => descendants(node, "code")) : [];
+  if (codeBlocks.length !== 1)
+    report(quick, "Quick Start requires exactly one code block; move setup and alternate commands to Model Context");
+  if (codeBlocks[0]?.value.split("\n").length > 12)
+    report(codeBlocks[0], "Quick Start command exceeds 12 lines; move setup to Model Context");
+  const chooser = actualHeadings.find((node) => textContent(node) === "Choose a Workflow");
+  const workflowTable = chooser && section(nodes, chooser).find((node) => node.type === "table");
+  if (workflowTable?.children.length > 7)
+    report(workflowTable, "Choose a Workflow exceeds 6 rows; move additional workflows to Model Context");
+  validateRecipes(nodes, actualHeadings, modelId, recipes, report);
   return errors;
+}
+
+function descendants(node, type) {
+  return [...(node.type === type ? [node] : []), ...(node.children ?? []).flatMap((child) => descendants(child, type))];
+}
+
+function links(nodes, definitions) {
+  return nodes.flatMap((node) => [
+    ...descendants(node, "link"),
+    ...descendants(node, "linkReference").map((link) => ({ ...link, url: definitions.get(link.identifier) })),
+  ]);
+}
+
+function checkpointId(url) {
+  return /^https:\/\/huggingface\.co\/([\w.-]+\/[\w.-]+)(?:[/?#]|$)/.exec(url ?? "")?.[1];
+}
+
+function recipePath(url) {
+  const file =
+    /^https:\/\/github\.com\/NVIDIA-NeMo\/Automodel\/(?:blob|tree)\/[^/]+\/(examples\/[^?#]+)(?:[?#]|$)/.exec(
+      url ?? "",
+    )?.[1];
+  return file && (!path.extname(file) || /\.ya?ml$/.test(file)) ? file : undefined;
+}
+
+function effectiveModel(config, text) {
+  const override = /--model\.(?:config\.)?pretrained_model_name_or_path(?:=|\s+)["']?([\w.-]+\/[\w.-]+)/.exec(text);
+  return (
+    override?.[1] ??
+    config.model?.pretrained_model_name_or_path ??
+    config.model?.config?.pretrained_model_name_or_path ??
+    config.model?.model_name ??
+    config.model?.llm_path
+  );
+}
+
+function validateRecipes(nodes, headings, modelId, recipes, report) {
+  const definitions = new Map(
+    nodes.filter((node) => node.type === "definition").map((node) => [node.identifier, node.url]),
+  );
+  const area = (name) => {
+    const heading = headings.find((node) => textContent(node) === name);
+    return heading ? section(nodes, heading) : [];
+  };
+  const checkpointTable = area("Available Models").find((node) => node.type === "table");
+  const checkpointIds = new Set(
+    links(checkpointTable ? [checkpointTable] : [], definitions)
+      .map((link) => checkpointId(link.url)?.toLowerCase())
+      .filter(Boolean),
+  );
+  const listed = (id) => typeof id === "string" && checkpointIds.has(id.toLowerCase());
+  const sameId = (left, right) =>
+    typeof left === "string" && typeof right === "string" && left.toLowerCase() === right.toLowerCase();
+  if (!listed(modelId)) report(checkpointTable, "Available Models must link the exact organization/model in the title");
+  const architectureTable = area("Model Context").find((node) => node.type === "table");
+  const alternate = architectureTable?.children
+    .slice(1)
+    .find((row) => textContent(row.children[0]) === "Recipe Checkpoint");
+  const quickModel = alternate ? checkpointId(links([alternate], definitions)[0]?.url) : modelId;
+  if (alternate && !listed(quickModel))
+    report(alternate, "Recipe Checkpoint must link a checkpoint in Available Models");
+
+  const quickStart = area("Quick Start");
+  const commands = quickStart
+    .flatMap((node) => descendants(node, "code"))
+    .filter((node) => ["bash", "sh", "shell", "console"].includes(node.lang));
+  const launches = commands.filter(
+    (node) =>
+      /(?:^|\s)(?:automodel|torchrun|python(?:3)?)(?:\s|$)/m.test(node.value.replace(/^\s*#.*$/gm, "")) &&
+      /\bexamples\/[\w./+-]+\.ya?ml\b/.test(node.value),
+  );
+  if (launches.length === 0)
+    report(
+      headings[0],
+      "Quick Start requires a shell training, pretraining, or benchmark launch command with an existing examples YAML config",
+    );
+  const quickRecipes = new Map();
+  for (const launch of launches) {
+    const text = launch.value.replace(/^\s*#.*$/gm, "").replace(/\\\n/g, " ");
+    if (
+      /-m\s+nemo_automodel\.cli\.app\s+/.test(text) &&
+      !/-m\s+nemo_automodel\.cli\.app\s+examples\/[\w./+-]+\.ya?ml(?:\s|$)/.test(text)
+    ) {
+      report(launch, "the CLI module must receive the recipe YAML as its first argument");
+    }
+    for (const file of [...new Set(text.match(/\bexamples\/[\w./+-]+\.ya?ml\b/g) ?? [])]) {
+      const config = recipes.get(file);
+      if (!config) {
+        report(launch, `Quick Start recipe does not exist: ${file}`);
+        continue;
+      }
+      if (/\bautomodel\s+/.test(text) && !config.recipe)
+        report(launch, `${file} has no recipe target; use its documented Python entry point`);
+      const id = effectiveModel(config, text);
+      if (!listed(id))
+        report(
+          launch,
+          `Quick Start recipe targets ${id ?? "an unspecified model"}, which is absent from Available Models: ${file}`,
+        );
+      if (quickRecipes.size === 0 && !sameId(id, quickModel))
+        report(launch, `first Quick Start command must target ${quickModel}; recipe targets ${id}`);
+      quickRecipes.set(file, id);
+      for (const owner of ["tokenizer", "processor"]) {
+        const override = new RegExp(
+          `--${owner}\\.pretrained_model_name_or_path(?:=|\\s+)["']?([\\w.-]+/[\\w.-]+)`,
+        ).exec(text);
+        const companion = override?.[1] ?? config[owner]?.pretrained_model_name_or_path;
+        if (companion && !sameId(companion, id))
+          report(launch, `${owner} checkpoint ${companion} differs from model ${id}; supply a matching override`);
+      }
+    }
+  }
+  const workflow = area("Choose a Workflow").find((node) => node.type === "table");
+  const workflowRecipes = new Map();
+  for (const row of workflow?.children.slice(1) ?? []) {
+    const recipeLinks = links([row], definitions)
+      .map((link) => recipePath(link.url))
+      .filter(Boolean);
+    if (!links([row], definitions).length) report(row, "each workflow row must contain a link");
+    for (const file of recipeLinks) {
+      const matches = [...recipes].filter(([name]) => name === file || name.startsWith(file.replace(/\/$/, "") + "/"));
+      if (!matches.length) report(row, `workflow recipe path does not exist: ${file}`);
+      for (const [name, config] of matches) {
+        const id = effectiveModel(config, textContent(row));
+        if (!listed(id))
+          report(
+            row,
+            `workflow recipe targets ${id ?? "an unspecified model"}, which is absent from Available Models: ${name}`,
+          );
+        workflowRecipes.set(name, id);
+      }
+    }
+  }
+  for (const [file, id] of quickRecipes) {
+    if (!sameId(workflowRecipes.get(file), id))
+      report(
+        workflow,
+        `Choose a Workflow must link Quick Start recipe ${file} with the same checkpoint (${id}) and overrides`,
+      );
+  }
+  if (![...workflowRecipes.keys()].some((file) => sameId(effectiveModel(recipes.get(file), ""), quickModel))) {
+    report(
+      workflow,
+      `every model card must link at least one checked-in recipe configured for ${quickModel} without checkpoint overrides`,
+    );
+  }
+}
+
+/** Read repository YAML configs; model identity comes from recipe contents, not filenames. */
+export async function loadRecipeCatalog(repoRoot) {
+  const recipes = new Map();
+  const visit = async (directory) => {
+    for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
+      const file = path.join(directory, entry.name);
+      if (entry.isDirectory()) await visit(file);
+      else if (entry.isFile() && /\.ya?ml$/.test(entry.name)) {
+        const document = parseDocument(await fs.readFile(file, "utf8"));
+        if (document.errors.length) throw new Error(`Invalid recipe YAML ${file}: ${document.errors[0].message}`);
+        const config = document.toJS();
+        if (config && typeof config === "object")
+          recipes.set(path.relative(repoRoot, file).split(path.sep).join("/"), config);
+      }
+    }
+  };
+  await visit(path.join(repoRoot, "examples"));
+  return recipes;
 }
 
 /** Find all Markdown and MDX cards, including files absent from Fern navigation. */

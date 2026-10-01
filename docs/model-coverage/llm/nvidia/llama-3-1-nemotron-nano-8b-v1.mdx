@@ -1,5 +1,5 @@
 ---
-title: "Llama-3.1-Nemotron-Nano-8B-v1"
+title: "nvidia/Llama-3.1-Nemotron-Nano-8B-v1"
 description: "Use NeMo AutoModel to fine-tune Llama-3.1-Nemotron-Nano-8B-v1 for LLM workflows with checked-in text generation recipes and documented distributed settings."
 slug: model-coverage/large-language-models/nvidia/Llama-3.1-Nemotron-Nano-8B-v1
 ---
@@ -8,8 +8,6 @@ slug: model-coverage/large-language-models/nvidia/Llama-3.1-Nemotron-Nano-8B-v1
 The Hugging Face configuration declares the `LlamaForCausalLM` architecture.
 
 ## Quick Start
-
-### Fine-Tune Llama-3.1-Nemotron-Nano-8B-v1
 
 Follow the [installation instructions](/get-started/installation), then review the checked-in recipe and
 its declared topology below before choosing a local or cluster launcher.
@@ -28,6 +26,18 @@ uv run automodel examples/llm_finetune/nemotron/nemotron_nano_8b_v1_squad.yaml \
 
 ## Model Context
 
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| Architecture | `LlamaForCausalLM` |
+| Parameters | 8.03B checkpoint parameters |
+| Decoder Layers | 32 |
+| Hidden Size | 4,096 |
+| Attention | 32 attention heads / 8 key-value heads |
+| Context Length | 131,072 tokens (checkpoint configuration) |
+| Vocabulary Size | 128,256 |
+| Configured Dtype | `bfloat16` |
+
 ### Configuration
 
 | Setting | Configuration |
@@ -42,16 +52,7 @@ uv run automodel examples/llm_finetune/nemotron/nemotron_nano_8b_v1_squad.yaml \
 
 - [`nemotron_nano_8b_v1_squad_peft.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_nano_8b_v1_squad_peft.yaml)
 
-## Model Reference
-
-### Model Architecture
-
-| Property | Value |
-| --- | --- |
-| Task | Text generation |
-| Architecture | `LlamaForCausalLM` |
-
-### Available Models
+## Available Models
 
 - [`nvidia/Llama-3.1-Nemotron-Nano-8B-v1`](https://huggingface.co/nvidia/Llama-3.1-Nemotron-Nano-8B-v1)
 
@@ -63,3 +64,5 @@ uv run automodel examples/llm_finetune/nemotron/nemotron_nano_8b_v1_squad.yaml \
 ## Related Resources
 
 - [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/nvidia/Llama-3.1-Nemotron-Nano-8B-v1/blob/54641c1611fcff44fa4865626462445e0a153fc7/config.json)

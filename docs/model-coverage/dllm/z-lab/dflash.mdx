@@ -1,5 +1,5 @@
 ---
-title: "Qwen3-4B-DFlash-b16"
+title: "z-lab/Qwen3-4B-DFlash-b16"
 description: "Train Qwen3-4B-DFlash-b16 as a speculative-decoding draft model with NeMo AutoModel using the checked-in DFlash recipe and frozen Qwen3 target."
 slug: model-coverage/dllm/z-lab/Qwen3-4B-DFlash-b16
 ---
@@ -7,8 +7,6 @@ slug: model-coverage/dllm/z-lab/Qwen3-4B-DFlash-b16
 [Qwen3-4B-DFlash-b16](https://huggingface.co/z-lab/Qwen3-4B-DFlash-b16) is a diffusion draft model trained against a frozen Qwen3 target for speculative decoding.
 
 ## Quick Start
-
-### Train Qwen3-4B-DFlash-b16
 
 From the repository root, run:
 
@@ -25,22 +23,25 @@ uv run torchrun --nproc-per-node=8 nemo_automodel/recipes/dllm/train_ft.py \
 
 ## Model Context
 
-### Recipe Notes
-
-See the [dLLM Fine-Tuning Guide](/recipes-e2e-examples/dllm-fine-tuning).
-
-## Model Reference
-
-### Model Architecture
-
 | Property | Value |
 |---|---|
 | **Task** | Diffusion Draft-Model Training |
 | **Architecture** | `DFlashDraftModel` with Hugging Face `trust_remote_code` |
 | **Target** | `Qwen/Qwen3-4B` |
 | **HF Org** | [z-lab](https://huggingface.co/z-lab) |
+| Parameters | 537.4M checkpoint parameters |
+| Decoder Layers | 5 |
+| Hidden Size | 2,560 |
+| Attention | 32 attention heads / 8 key-value heads |
+| Context Length | 40,960 tokens (checkpoint configuration) |
+| Vocabulary Size | 151,936 |
+| Configured Dtype | `bfloat16` |
 
-### Available Models
+### Recipe Notes
+
+See the [dLLM Fine-Tuning Guide](/recipes-e2e-examples/dllm-fine-tuning).
+
+## Available Models
 
 | Checkpoint | Type |
 | --- | --- |
@@ -49,3 +50,5 @@ See the [dLLM Fine-Tuning Guide](/recipes-e2e-examples/dllm-fine-tuning).
 ## Related Resources
 
 - [Installation Instructions](/get-started/installation)
+
+- [Checkpoint Configuration](https://huggingface.co/z-lab/Qwen3-4B-DFlash-b16/blob/b74e3a329c4d963783143b1e970d95b002be72bd/config.json)

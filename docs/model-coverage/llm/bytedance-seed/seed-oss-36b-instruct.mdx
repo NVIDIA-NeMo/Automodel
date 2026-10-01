@@ -1,5 +1,5 @@
 ---
-title: "Seed-OSS-36B-Instruct"
+title: "ByteDance-Seed/Seed-OSS-36B-Instruct"
 description: "Use NeMo AutoModel to fine-tune Seed-OSS-36B-Instruct for LLM workflows with checked-in text generation recipes and documented distributed settings."
 slug: model-coverage/large-language-models/bytedance-seed/Seed-OSS-36B-Instruct
 ---
@@ -8,8 +8,6 @@ slug: model-coverage/large-language-models/bytedance-seed/Seed-OSS-36B-Instruct
 The Hugging Face configuration declares the `SeedOssForCausalLM` architecture.
 
 ## Quick Start
-
-### Fine-Tune Seed-OSS-36B-Instruct
 
 Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
 
@@ -26,6 +24,18 @@ automodel examples/llm_finetune/seed/seed_oss_36B_hellaswag.yaml --nproc-per-nod
 
 ## Model Context
 
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| Architecture | `SeedOssForCausalLM` |
+| Parameters | 36.15B checkpoint parameters |
+| Decoder Layers | 64 |
+| Hidden Size | 5,120 |
+| Attention | 80 attention heads / 8 key-value heads |
+| Context Length | 524,288 tokens (checkpoint configuration) |
+| Vocabulary Size | 155,136 |
+| Configured Dtype | `bfloat16` |
+
 ### Configuration
 
 | Setting | Configuration |
@@ -40,16 +50,7 @@ automodel examples/llm_finetune/seed/seed_oss_36B_hellaswag.yaml --nproc-per-nod
 
 - [`seed_oss_36B_hellaswag_peft.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/seed/seed_oss_36B_hellaswag_peft.yaml)
 
-## Model Reference
-
-### Model Architecture
-
-| Property | Value |
-| --- | --- |
-| Task | Text generation |
-| Architecture | `SeedOssForCausalLM` |
-
-### Available Models
+## Available Models
 
 - [`ByteDance-Seed/Seed-OSS-36B-Instruct`](https://huggingface.co/ByteDance-Seed/Seed-OSS-36B-Instruct)
 
@@ -61,3 +62,5 @@ automodel examples/llm_finetune/seed/seed_oss_36B_hellaswag.yaml --nproc-per-nod
 ## Related Resources
 
 - [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/ByteDance-Seed/Seed-OSS-36B-Instruct/blob/497f1dca95ebdec98e41d517b9f060ee753c902f/config.json)

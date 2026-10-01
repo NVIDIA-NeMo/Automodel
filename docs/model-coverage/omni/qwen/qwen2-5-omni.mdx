@@ -1,5 +1,5 @@
 ---
-title: "Qwen2.5-Omni-3B"
+title: "Qwen/Qwen2.5-Omni-3B"
 description: "Use Qwen2.5-Omni-3B with NeMo AutoModel for multimodal fine-tuning, with documented checkpoints, runnable recipes, setup guidance, and model reference details."
 slug: model-coverage/omni/qwen/Qwen2.5-Omni-3B
 ---
@@ -9,8 +9,6 @@ slug: model-coverage/omni/qwen/Qwen2.5-Omni-3B
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
 ## Quick Start
-
-### Fine-Tune Qwen2.5-Omni-3B
 
 From the repository root, run:
 
@@ -26,16 +24,18 @@ uv run automodel --nproc-per-node=8 examples/audio_finetune/qwen2_5_omni_asr/ami
 
 ## Model Context
 
-## Model Reference
-
-### Model Architecture
-
 | Property | Value |
 | --- | --- |
 | Task | Omnimodal (Text/Image/Audio/Video) |
 | Architecture | `Qwen2_5OmniForConditionalGeneration` |
 | Parameters | 3B |
 | Hugging Face Organization | [Qwen](https://huggingface.co/Qwen) |
+| Decoder Layers | 36 |
+| Hidden Size | 2,048 |
+| Attention | 16 attention heads / 2 key-value heads |
+| Context Length | 32,768 tokens (checkpoint configuration) |
+| Vocabulary Size | 151,936 |
+| Configured Dtype | `bfloat16` |
 
 The registry wires the Qwen2.5-Omni Thinker backbone under the following architecture keys:
 
@@ -43,7 +43,7 @@ The registry wires the Qwen2.5-Omni Thinker backbone under the following archite
 - `Qwen2_5OmniModel`
 - `Qwen2_5OmniThinkerForConditionalGeneration`
 
-### Available Models
+## Available Models
 
 | Model | HF ID |
 |---|---|
@@ -52,3 +52,5 @@ The registry wires the Qwen2.5-Omni Thinker backbone under the following archite
 ## Related Resources
 
 - [VLM Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n)
+
+- [Checkpoint Configuration](https://huggingface.co/Qwen/Qwen2.5-Omni-3B/blob/f75b40e3da2003cdd6e1829b1f420ca70797c34e/config.json)

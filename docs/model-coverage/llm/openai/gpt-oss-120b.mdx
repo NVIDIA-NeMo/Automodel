@@ -1,5 +1,5 @@
 ---
-title: "gpt-oss-120b"
+title: "openai/gpt-oss-120b"
 description: "Fine-tune gpt-oss-120b for text generation with NeMo AutoModel using checked-in recipes and documented distributed settings."
 slug: model-coverage/large-language-models/openai/gpt-oss-120b
 ---
@@ -9,15 +9,13 @@ The Hugging Face configuration declares the `GptOssForCausalLM` architecture.
 
 ## Quick Start
 
-### Fine-Tune GPT-OSS 120B
-
-Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+Allocate 8 nodes with 8 GPUs each. Set `NODE_RANK` and `MASTER_ADDR` on every node; complete the recipe prerequisites in Model Context before launching.
 
 ```bash
-automodel examples/llm_finetune/gpt_oss/gpt_oss_120b.yaml --nproc-per-node 8
+uv run torchrun --nnodes 8 --nproc-per-node 8 \
+  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
+  -m nemo_automodel.cli.app examples/llm_finetune/gpt_oss/gpt_oss_120b.yaml
 ```
-
-Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node run.
 
 ## Choose a Workflow
 
@@ -27,6 +25,18 @@ Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node 
 | Try another checked-in recipe for this model | Use the [alternate recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/gpt_oss/gptoss_120b_te_deepep.yaml). |
 
 ## Model Context
+
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| Architecture | `GptOssForCausalLM` |
+| Decoder Layers | 36 |
+| Hidden Size | 2,880 |
+| Attention | 64 attention heads / 8 key-value heads |
+| Context Length | 131,072 tokens (checkpoint configuration) |
+| Vocabulary Size | 201,088 |
+| Experts | 128 routed / 4 selected per token |
+| Parameters | 117B total / 5.1B active |
 
 ### Configuration
 
@@ -44,16 +54,7 @@ Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node 
 - [`gptoss_120b_te_deepep_gb200.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/gpt_oss/gptoss_120b_te_deepep_gb200.yaml)
 - [`gptoss_120b_te_mxfp8_gb200.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/gpt_oss/gptoss_120b_te_mxfp8_gb200.yaml)
 
-## Model Reference
-
-### Model Architecture
-
-| Property | Value |
-| --- | --- |
-| Task | Text generation |
-| Architecture | `GptOssForCausalLM` |
-
-### Available Models
+## Available Models
 
 - [`openai/gpt-oss-120b`](https://huggingface.co/openai/gpt-oss-120b)
 
@@ -65,3 +66,5 @@ Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node 
 ## Related Resources
 
 - [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/openai/gpt-oss-120b/blob/b5c939de8f754692c1647ca79fbf85e8c1e70f8a/config.json)

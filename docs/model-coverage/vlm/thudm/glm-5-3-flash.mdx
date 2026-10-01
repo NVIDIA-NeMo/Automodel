@@ -1,5 +1,5 @@
 ---
-title: "GLM-5.3-Flash"
+title: "zai-org/GLM-5.3-Flash"
 description: "Fine-tune GLM-5.3-Flash for vision-language tasks with NeMo AutoModel using a checked-in packed-context and expert-parallel recipe."
 slug: model-coverage/vision-language-models/thudm/GLM-5.3-Flash
 ---
@@ -12,48 +12,36 @@ Manifold-Constrained Hyper-Connections (mHC).
 
 ## Quick Start
 
-### Install and Run
-
-Clone and install NeMo AutoModel from source:
+Follow the [installation instructions](/get-started/installation). Allocate 9 nodes with 8 GPUs each; run on every node with `NODE_RANK` and `MASTER_ADDR` set. Complete the [recipe setup](#recipe-setup) before launching.
 
 ```bash
-git clone https://github.com/NVIDIA-NeMo/Automodel.git
-cd Automodel
-uv sync --locked --all-groups --all-extras
+uv run torchrun --nnodes 9 --nproc-per-node 8 \
+  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
+  -m nemo_automodel.cli.app examples/vlm_finetune/glm5_next/glm5_3_flash_medpix_packed2k_ep72_cp2_100steps.yaml
 ```
-
-The cuDNN backend also requires FlashMLA's `flash_mla_sparse_fwd`, which is not
-published as a complete source distribution on PyPI. Install the tested
-revision with its submodules:
-
-```bash
-git clone --recursive https://github.com/deepseek-ai/FlashMLA.git /tmp/FlashMLA
-git -C /tmp/FlashMLA checkout b7643bd54521f563b839b98289b5cd048c062ba2
-git -C /tmp/FlashMLA submodule update --init --recursive
-uv pip install --no-build-isolation /tmp/FlashMLA
-```
-
-The recipe requires 9 nodes with 8 GPUs per node. Launch it through the cluster
-launcher from inside the repository:
-
-```bash
-uv run automodel --nproc-per-node=8 examples/vlm_finetune/glm5_next/glm5_3_flash_medpix_packed2k_ep72_cp2_100steps.yaml
-```
-
-<Note>
-Use the [Slurm Launcher Guide](/job-launchers/slurm-cluster) to configure the
-multi-node launch. If FlashMLA or cuDNN Frontend is unavailable, change
-`model.backend.attn` to `sdpa`; KDA still requires the FLA dependency.
-
-</Note>
 
 ## Choose a Workflow
 
 | Goal | Start Here |
 | --- | --- |
-| MedPix-VQA; Language-backbone SFT with packed 2K sequences, EP72, and CP2 | [glm5_3_flash_medpix_packed2k_ep72_cp2_100steps.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/glm5_next/glm5_3_flash_medpix_packed2k_ep72_cp2_100steps.yaml) |
+| Fine-tune zai-org/GLM-5.3-Flash | [glm5_3_flash_medpix_packed2k_ep72_cp2_100steps.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/glm5_next/glm5_3_flash_medpix_packed2k_ep72_cp2_100steps.yaml). 9 nodes, 8 GPUs per node; see [Recipe Setup](#recipe-setup). |
 
 ## Model Context
+
+| Property | Value |
+|---|---|
+| **Task** | Image-Text-to-Text |
+| **Architecture** | `Glm5NextForConditionalGeneration` |
+| **Parameters** | 320B total, 18B active |
+| **Decoder** | 45 layers: 34 KDA and 11 KPool-DSA layers |
+| **Experts** | 288 routed experts, top-8 routing, plus one shared expert |
+| **Context Length** | 1,048,576 in the checkpoint configuration; validated here at 2,048 and 4,096 tokens |
+| **Training Precision** | BF16 after FP8 checkpoint dequantization |
+| **HF Org** | [zai-org](https://huggingface.co/zai-org) |
+| Decoder Layers | 45 |
+| Hidden Size | 4,096 |
+| Attention | 64 attention heads / 64 key-value heads |
+| Vocabulary Size | 154,880 |
 
 ### Architecture
 
@@ -167,22 +155,46 @@ for SDPA and 1.2337 for cuDNN.
 - The cuDNN sparse-attention path requires SM90 or later, cuDNN Frontend, and
   FlashMLA. Use `backend.attn: sdpa` as the portable reference path.
 
-## Model Reference
+### Setup and Additional Examples
 
-### Model Architecture
+Clone and install NeMo AutoModel from source:
 
-| Property | Value |
-|---|---|
-| **Task** | Image-Text-to-Text |
-| **Architecture** | `Glm5NextForConditionalGeneration` |
-| **Parameters** | 320B total, 18B active |
-| **Decoder** | 45 layers: 34 KDA and 11 KPool-DSA layers |
-| **Experts** | 288 routed experts, top-8 routing, plus one shared expert |
-| **Context Length** | 1,048,576 in the checkpoint configuration; validated here at 2,048 and 4,096 tokens |
-| **Training Precision** | BF16 after FP8 checkpoint dequantization |
-| **HF Org** | [zai-org](https://huggingface.co/zai-org) |
+```bash
+git clone https://github.com/NVIDIA-NeMo/Automodel.git
+cd Automodel
+uv sync --locked --all-groups --all-extras
+```
 
-### Available Models
+The cuDNN backend also requires FlashMLA's `flash_mla_sparse_fwd`, which is not
+published as a complete source distribution on PyPI. Install the tested
+revision with its submodules:
+
+```bash
+git clone --recursive https://github.com/deepseek-ai/FlashMLA.git /tmp/FlashMLA
+git -C /tmp/FlashMLA checkout b7643bd54521f563b839b98289b5cd048c062ba2
+git -C /tmp/FlashMLA submodule update --init --recursive
+uv pip install --no-build-isolation /tmp/FlashMLA
+```
+
+The recipe requires 9 nodes with 8 GPUs per node. Launch it through the cluster
+launcher from inside the repository:
+
+```bash
+uv run automodel --nproc-per-node=8 examples/vlm_finetune/glm5_next/glm5_3_flash_medpix_packed2k_ep72_cp2_100steps.yaml
+```
+
+<Note>
+Use the [Slurm Launcher Guide](/job-launchers/slurm-cluster) to configure the
+multi-node launch. If FlashMLA or cuDNN Frontend is unavailable, change
+`model.backend.attn` to `sdpa`; KDA still requires the FLA dependency.
+
+</Note>
+
+### Recipe Setup
+
+Read [glm5_3_flash_medpix_packed2k_ep72_cp2_100steps.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/glm5_next/glm5_3_flash_medpix_packed2k_ep72_cp2_100steps.yaml) for checkpoint access, data paths, and backend dependencies. Use the [Slurm launcher guide](/job-launchers/slurm-cluster) to prepare the distributed allocation.
+
+## Available Models
 
 | Checkpoint | Type |
 | --- | --- |
@@ -194,3 +206,5 @@ for SDPA and 1.2337 for cuDNN.
 - [zai-org/GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash)
 - [GLM-5 technical report](https://arxiv.org/abs/2602.15763)
 - [FlashMLA](https://github.com/deepseek-ai/FlashMLA)
+
+- [Checkpoint Configuration](https://huggingface.co/zai-org/GLM-5.3-Flash/blob/eb9eb208eb0d988989d07a6a12d0fdeb5f52574a/config.json)

@@ -1,6 +1,6 @@
 ---
-title: "c4ai-command-r-v01"
-description: "Reference c4ai-command-r-v01 checkpoint and architecture details for NeMo AutoModel, with model-family information, setup guidance, and upstream resources."
+title: "CohereForAI/c4ai-command-r-v01"
+description: "Fine-tune CohereForAI/c4ai-command-r-v01 with NeMo AutoModel using a checked-in LoRA recipe, with checkpoint and architecture details."
 slug: model-coverage/large-language-models/cohere/c4ai-command-r-v01
 ---
 
@@ -10,22 +10,19 @@ Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com
 
 ## Quick Start
 
-This page provides checkpoint and architecture reference information rather
-than a model-specific launch command. Follow the
-[installation instructions](/get-started/installation) to set up NeMo AutoModel.
+Follow the [installation instructions](/get-started/installation). From the repository root, use 8 GPUs. This is an example configuration; GPU training and memory use still require validation.
+
+```bash
+uv run automodel examples/llm_finetune/cohereforai/c4ai_command_r_v01_squad_peft.yaml --nproc-per-node 8
+```
 
 ## Choose a Workflow
 
 | Goal | Start Here |
 | --- | --- |
-| Explore checkpoints | See [Available Models](#available-models). |
-| Configure NeMo AutoModel | Follow the [installation instructions](/get-started/installation). |
+| Fine-tune CohereForAI/c4ai-command-r-v01 | [c4ai_command_r_v01_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/cohereforai/c4ai_command_r_v01_squad_peft.yaml). Example LoRA configuration; validate GPU training. |
 
 ## Model Context
-
-## Model Reference
-
-### Model Architecture
 
 | Property | Value |
 | --- | --- |
@@ -33,11 +30,21 @@ than a model-specific launch command. Follow the
 | Architecture | `CohereForCausalLM` / `Cohere2ForCausalLM` |
 | Parameters | 35B |
 | Hugging Face Organization | [CohereForAI](https://huggingface.co/CohereForAI) |
+| Decoder Layers | 40 |
+| Hidden Size | 8,192 |
+| Attention | 64 attention heads / 64 key-value heads |
+| Context Length | 8,192 tokens (checkpoint configuration) |
+| Vocabulary Size | 256,000 |
+| Configured Dtype | `float16` |
 
 - `CohereForCausalLM` - Command-R v01, Plus
 - `Cohere2ForCausalLM` - Command-R7B
 
-### Available Models
+### Recipe Setup
+
+Read [c4ai_command_r_v01_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/cohereforai/c4ai_command_r_v01_squad_peft.yaml) for checkpoint access, data paths, and backend dependencies. It provides a small LoRA fine-tuning example.
+
+## Available Models
 
 | Model | HF ID |
 |---|---|
@@ -46,3 +53,5 @@ than a model-specific launch command. Follow the
 ## Related Resources
 
 - [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/CohereForAI/c4ai-command-r-v01/blob/760ddb6c203d87ebdbe3c9785b49570e1bf95585/config.json)

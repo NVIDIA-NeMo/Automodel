@@ -1,5 +1,5 @@
 ---
-title: "gemma-4-31B"
+title: "google/gemma-4-31B"
 description: "Fine-tune gemma-4-31B for text generation with NeMo AutoModel using checked-in recipes and documented distributed settings."
 slug: model-coverage/large-language-models/google/gemma-4-31B
 ---
@@ -9,21 +9,34 @@ The Hugging Face configuration declares the `Gemma4ForConditionalGeneration` arc
 
 ## Quick Start
 
-### Fine-Tune Gemma-4-31B
+Follow the [installation instructions](/get-started/installation). Allocate 4 nodes with 8 GPUs each; run on every node with `NODE_RANK` and `MASTER_ADDR` set. Complete the [recipe setup](#recipe-setup) before launching.
 
-Follow the [installation instructions](/get-started/installation), then review the checked-in recipe and
-its declared topology below before choosing a local or cluster launcher.
-
-Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node run.
+```bash
+uv run torchrun --nnodes 4 --nproc-per-node 8 \
+  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
+  -m nemo_automodel.cli.app examples/convergence/tulu3/models/gemma4-31b/gemma4_31b_tulu3_packed2k_cp1_gbs32_4node.yaml
+```
 
 ## Choose a Workflow
 
 | Goal | Start Here |
 | --- | --- |
-| Run the primary recipe for this model | Use the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/convergence/tulu3/models/gemma4-31b/gemma4_31b_tulu3_packed2k_cp1_gbs32_4node.yaml). |
+| Fine-tune google/gemma-4-31B | [gemma4_31b_tulu3_packed2k_cp1_gbs32_4node.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/convergence/tulu3/models/gemma4-31b/gemma4_31b_tulu3_packed2k_cp1_gbs32_4node.yaml). 4 nodes, 8 GPUs per node; see [Recipe Setup](#recipe-setup). |
 | Try another checked-in recipe for this model | Use the [alternate recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/long_context_validation/gemma4_31B/gemma4_31b_base_coderforge_cp8_64k_1e5_800steps.yaml). |
 
 ## Model Context
+
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| Architecture | `Gemma4ForConditionalGeneration` |
+| Parameters | 32.68B checkpoint parameters |
+| Decoder Layers | 60 |
+| Hidden Size | 5,376 |
+| Attention | 32 attention heads; 16 key-value heads in sliding layers / 4 in global layers |
+| Context Length | 262,144 tokens (checkpoint configuration) |
+| Vocabulary Size | 262,144 |
+| Configured Dtype | `bfloat16` |
 
 ### Configuration
 
@@ -39,16 +52,18 @@ Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node 
 
 - [`gemma4_31b_base_coderforge_cp8_64k_1e5_800steps.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/long_context_validation/gemma4_31B/gemma4_31b_base_coderforge_cp8_64k_1e5_800steps.yaml)
 
-## Model Reference
+### Setup and Additional Examples
 
-### Model Architecture
+Follow the [installation instructions](/get-started/installation), then review the checked-in recipe and
+its declared topology below before choosing a local or cluster launcher.
 
-| Property | Value |
-| --- | --- |
-| Task | Text generation |
-| Architecture | `Gemma4ForConditionalGeneration` |
+Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node run.
 
-### Available Models
+### Recipe Setup
+
+Read [gemma4_31b_tulu3_packed2k_cp1_gbs32_4node.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/convergence/tulu3/models/gemma4-31b/gemma4_31b_tulu3_packed2k_cp1_gbs32_4node.yaml) for checkpoint access, data paths, and backend dependencies. Use the [Slurm launcher guide](/job-launchers/slurm-cluster) to prepare the distributed allocation.
+
+## Available Models
 
 - [`google/gemma-4-31B`](https://huggingface.co/google/gemma-4-31B)
 
@@ -60,3 +75,5 @@ Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node 
 ## Related Resources
 
 - [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/google/gemma-4-31B/blob/5bbc2fb1c1b2c611d06e3d9f23c170ba21659d89/config.json)

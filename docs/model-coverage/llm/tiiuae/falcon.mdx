@@ -1,6 +1,6 @@
 ---
-title: "falcon-7b"
-description: "Reference falcon-7b checkpoint and architecture details for NeMo AutoModel, with model-family information, setup guidance, and upstream resources."
+title: "tiiuae/falcon-7b"
+description: "Fine-tune tiiuae/falcon-7b with NeMo AutoModel using a checked-in LoRA recipe, with checkpoint and architecture details."
 slug: model-coverage/large-language-models/tiiuae/falcon-7b
 ---
 
@@ -10,22 +10,19 @@ Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com
 
 ## Quick Start
 
-This page provides checkpoint and architecture reference information rather
-than a model-specific launch command. Follow the
-[installation instructions](/get-started/installation) to set up NeMo AutoModel.
+Follow the [installation instructions](/get-started/installation). From the repository root, use 8 GPUs. This is an example configuration; GPU training and memory use still require validation.
+
+```bash
+uv run automodel examples/llm_finetune/tiiuae/falcon_7b_squad_peft.yaml --nproc-per-node 8
+```
 
 ## Choose a Workflow
 
 | Goal | Start Here |
 | --- | --- |
-| Explore checkpoints | See [Available Models](#available-models). |
-| Configure NeMo AutoModel | Follow the [installation instructions](/get-started/installation). |
+| Fine-tune tiiuae/falcon-7b | [falcon_7b_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/tiiuae/falcon_7b_squad_peft.yaml). Example LoRA configuration; validate GPU training. |
 
 ## Model Context
-
-## Model Reference
-
-### Model Architecture
 
 | Property | Value |
 | --- | --- |
@@ -33,8 +30,17 @@ than a model-specific launch command. Follow the
 | Architecture | `FalconForCausalLM` |
 | Parameters | 7B |
 | Hugging Face Organization | [tiiuae](https://huggingface.co/tiiuae) |
+| Decoder Layers | 32 |
+| Hidden Size | 4,544 |
+| Attention | 71 attention heads |
+| Vocabulary Size | 65,024 |
+| Configured Dtype | `bfloat16` |
 
-### Available Models
+### Recipe Setup
+
+Read [falcon_7b_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/tiiuae/falcon_7b_squad_peft.yaml) for checkpoint access, data paths, and backend dependencies. It provides a small LoRA fine-tuning example.
+
+## Available Models
 
 | Model | HF ID |
 |---|---|
@@ -43,3 +49,5 @@ than a model-specific launch command. Follow the
 ## Related Resources
 
 - [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/tiiuae/falcon-7b/blob/ec89142b67d748a1865ea4451372db8313ada0d8/config.json)

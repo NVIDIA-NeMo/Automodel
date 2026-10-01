@@ -1,0 +1,69 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Fine-tuning example; validate training and memory on your hardware.
+# Run from the repository root:
+#   uv run automodel examples/retrieval/cross_encoder/llama_nemotron_rerank_1b_v2_finetune.yaml --nproc-per-node 8
+# Checkpoint configuration inspected at Hugging Face revision: 828765652b05bd439c9789d2a6d093db1caa1443
+
+recipe: TrainCrossEncoderRecipe
+seed: 42
+step_scheduler:
+  global_batch_size: 8
+  local_batch_size: 1
+  ckpt_every_steps: 50
+  val_every_steps: 50
+  num_epochs: 1
+  max_steps: 100
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+model:
+  _target_: nemo_automodel.NeMoAutoModelCrossEncoder.from_pretrained
+  pretrained_model_name_or_path: nvidia/llama-nemotron-rerank-1b-v2
+  num_labels: 1
+  temperature: 1.0
+  pooling: avg
+  use_liger_kernel: false
+  use_sdpa_patching: true
+  dtype: float32
+  attn_implementation: eager
+tokenizer:
+  _target_: nemo_automodel.NeMoAutoTokenizer.from_pretrained
+  pretrained_model_name_or_path: nvidia/llama-nemotron-rerank-1b-v2
+  add_eos_token: false
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.retrieval_dataset.RetrievalDatasetConfig
+  model_type: cross_encoder
+  data_dir_list:
+  - hf://nvidia/embed-nemotron-dataset-v1/FEVER
+  - hf://nvidia/embed-nemotron-dataset-v1/SyntheticClassificationData
+  data_type: train
+  n_passages: 5
+  seed: 42
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.llm.CrossEncoderCollator
+    rerank_max_length: 512
+    prompt_template: "question:{query} \n \n passage:{passage}"
+    pad_to_multiple_of: 8
+  shuffle: true
+  num_workers: 0
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 2.0e-06
+  weight_decay: 0.01
+lr_scheduler:
+  lr_warmup_steps: 100
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints/llama_nemotron_rerank_1b_v2
+  model_save_format: safetensors
+  save_consolidated: true
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 1
+  cp_size: 1
+  sequence_parallel: false

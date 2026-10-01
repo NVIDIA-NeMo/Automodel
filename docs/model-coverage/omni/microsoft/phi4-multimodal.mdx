@@ -1,5 +1,5 @@
 ---
-title: "Phi-4-multimodal-instruct"
+title: "microsoft/Phi-4-multimodal-instruct"
 description: "Use Phi-4-multimodal-instruct with NeMo AutoModel for multimodal fine-tuning, with documented checkpoints, runnable recipes, setup guidance, and model reference details."
 slug: model-coverage/omni/microsoft/Phi-4-multimodal-instruct
 ---
@@ -9,8 +9,6 @@ slug: model-coverage/omni/microsoft/Phi-4-multimodal-instruct
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
 ## Quick Start
-
-### Fine-Tune Phi-4-multimodal-instruct
 
 From the repository root, run:
 
@@ -26,18 +24,20 @@ uv run automodel --nproc-per-node=8 examples/vlm_finetune/phi4/phi4_mm_cv17.yaml
 
 ## Model Context
 
-## Model Reference
-
-### Model Architecture
-
 | Property | Value |
 | --- | --- |
 | Task | Omnimodal (Text/Image/Audio) |
 | Architecture | `Phi4MultimodalForCausalLM` |
 | Parameters | 5.6B |
 | Hugging Face Organization | [microsoft](https://huggingface.co/microsoft) |
+| Decoder Layers | 32 |
+| Hidden Size | 3,072 |
+| Attention | 24 attention heads / 8 key-value heads |
+| Context Length | 131,072 tokens (checkpoint configuration) |
+| Vocabulary Size | 200,064 |
+| Configured Dtype | `bfloat16` |
 
-### Available Models
+## Available Models
 
 | Model | HF ID |
 |---|---|
@@ -46,3 +46,5 @@ uv run automodel --nproc-per-node=8 examples/vlm_finetune/phi4/phi4_mm_cv17.yaml
 ## Related Resources
 
 - [VLM Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n)
+
+- [Checkpoint Configuration](https://huggingface.co/microsoft/Phi-4-multimodal-instruct/blob/93f923e1a7727d1c4f446756212d9d3e8fcc5d81/config.json)

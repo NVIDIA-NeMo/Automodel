@@ -1,5 +1,5 @@
 ---
-title: "gpt-oss-20b"
+title: "openai/gpt-oss-20b"
 description: "Use gpt-oss-20b with NeMo AutoModel for language model fine-tuning, with documented checkpoints, runnable recipes, setup guidance, and model reference details."
 slug: model-coverage/large-language-models/openai/gpt-oss-20b
 ---
@@ -11,8 +11,6 @@ The documented workflows cover full-parameter fine-tuning, LoRA, packed sequence
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
 ## Quick Start
-
-### Fine-Tune gpt-oss-20b
 
 From the repository root, run:
 
@@ -31,18 +29,20 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/gpt_oss/gpt_oss_20b.ya
 
 ## Model Context
 
-## Model Reference
-
-### Model Architecture
-
 | Property | Value |
 | --- | --- |
 | Task | Text Generation |
 | Architecture | `GptOssForCausalLM` |
 | Parameters | 21B total / 3.6B active |
 | Hugging Face Organization | [openai](https://huggingface.co/openai) |
+| Decoder Layers | 24 |
+| Hidden Size | 2,880 |
+| Attention | 64 attention heads / 8 key-value heads |
+| Context Length | 131,072 tokens (checkpoint configuration) |
+| Vocabulary Size | 201,088 |
+| Experts | 32 routed / 4 selected per token |
 
-### Available Models
+## Available Models
 
 | Model | HF ID |
 |---|---|
@@ -51,3 +51,5 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/gpt_oss/gpt_oss_20b.ya
 ## Related Resources
 
 - [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/openai/gpt-oss-20b/blob/6cee5e81ee83917806bbde320786a8fb61efebee/config.json)

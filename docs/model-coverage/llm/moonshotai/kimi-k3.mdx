@@ -1,5 +1,5 @@
 ---
-title: "Kimi-K3"
+title: "moonshotai/Kimi-K3"
 description: "Fine-tune Kimi-K3 for text generation with NeMo AutoModel using checked-in multi-node recipes with expert, pipeline, and context parallelism."
 slug: model-coverage/large-language-models/moonshotai/Kimi-K3
 ---
@@ -8,19 +8,13 @@ slug: model-coverage/large-language-models/moonshotai/Kimi-K3
 
 ## Quick Start
 
-### Fine-Tune Kimi-K3
-
-<Warning>
-Kimi K3 training in NeMo AutoModel is currently validated only on NVIDIA GB200 systems.
-</Warning>
-
-Allocate 64 GB200 nodes with four GPUs per node through your cluster launcher, then run:
+Allocate 64 nodes with 4 GPUs each. Set `NODE_RANK` and `MASTER_ADDR` on every node; complete the recipe prerequisites in Model Context before launching.
 
 ```bash
-uv run automodel --nproc-per-node=4 examples/llm_finetune/kimi/k3_hellaswag.yaml
+uv run torchrun --nnodes 64 --nproc-per-node 4 \
+  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
+  -m nemo_automodel.cli.app examples/llm_finetune/kimi/k3_hellaswag.yaml
 ```
-
-See the [Slurm Launcher Guide](/job-launchers/slurm-cluster) for multi-node setup and the [Large MoE Fine-Tuning Guide](/recipes-e2e-examples/large-moe-fine-tuning) for distributed MoE configuration.
 
 ## Choose a Workflow
 
@@ -29,6 +23,20 @@ See the [Slurm Launcher Guide](/job-launchers/slurm-cluster) for multi-node setu
 | 100-step full-parameter SFT on HellaSwag with FSDP2, EP32, and PP8 | [k3_hellaswag.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/kimi/k3_hellaswag.yaml) |
 
 ## Model Context
+
+| Property | Value |
+|---|---|
+| **Task** | Text Generation (MoE, hybrid attention) |
+| **Architecture** | `KimiK3ForCausalLM` |
+| **Parameters** | 2.8T total / 104B activated |
+| **Layers** | 93 (69 KDA + 24 Gated MLA) |
+| **Context Length** | 1,048,576 tokens |
+| **HF Org** | [moonshotai](https://huggingface.co/moonshotai) |
+| Hidden Size | 7,168 |
+| Attention | 96 attention heads / 96 key-value heads |
+| Vocabulary Size | 163,840 |
+| Experts | 896 routed / 2 shared / 16 selected per token |
+| Configured Dtype | `bfloat16` |
 
 ### Architecture
 
@@ -48,20 +56,7 @@ See the [Slurm Launcher Guide](/job-launchers/slurm-cluster) for multi-node setu
 
 The combined EP32 and PP8 configuration is validated on 256 GB200 GPUs.
 
-## Model Reference
-
-### Model Architecture
-
-| Property | Value |
-|---|---|
-| **Task** | Text Generation (MoE, hybrid attention) |
-| **Architecture** | `KimiK3ForCausalLM` |
-| **Parameters** | 2.8T total / 104B activated |
-| **Layers** | 93 (69 KDA + 24 Gated MLA) |
-| **Context Length** | 1,048,576 tokens |
-| **HF Org** | [moonshotai](https://huggingface.co/moonshotai) |
-
-### Available Models
+## Available Models
 
 | Checkpoint | Type |
 | --- | --- |
@@ -73,3 +68,5 @@ The combined EP32 and PP8 configuration is validated on 256 GB200 GPUs.
 - [Kimi K3 model card](https://huggingface.co/moonshotai/Kimi-K3)
 - [Kimi K3 technical report](https://github.com/MoonshotAI/Kimi-K3/blob/main/k3_tech_report.pdf)
 - [NeMo AutoModel Kimi K3 implementation](https://github.com/NVIDIA-NeMo/Automodel/pull/3259)
+
+- [Checkpoint Configuration](https://huggingface.co/moonshotai/Kimi-K3/blob/f831ab66814297da540d832a5235f8e904f29d06/config.json)

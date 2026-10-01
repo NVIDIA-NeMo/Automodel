@@ -1,5 +1,5 @@
 ---
-title: "functiongemma-270m-it"
+title: "google/functiongemma-270m-it"
 description: "Fine-tune functiongemma-270m-it for function-calling tasks with NeMo AutoModel using the checked-in text generation recipe."
 slug: model-coverage/large-language-models/google/functiongemma-270m-it
 ---
@@ -7,8 +7,6 @@ slug: model-coverage/large-language-models/google/functiongemma-270m-it
 [FunctionGemma](https://huggingface.co/google/functiongemma-270m-it) is a compact Gemma model specialized for function calling.
 
 ## Quick Start
-
-### Fine-Tune functiongemma-270m-it
 
 From the repository root, run:
 
@@ -24,22 +22,24 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/gemma/functiongemma_xl
 
 ## Model Context
 
-### Recipe Notes
-
-See the [FunctionGemma Fine-Tuning Guide](/recipes-e2e-examples/function-calling).
-
-## Model Reference
-
-### Model Architecture
-
 | Property | Value |
 |---|---|
 | **Task** | Function Calling / Text Generation |
 | **Architecture** | `Gemma3ForCausalLM` |
 | **Parameters** | 270M |
 | **HF Org** | [google](https://huggingface.co/google) |
+| Decoder Layers | 18 |
+| Hidden Size | 640 |
+| Attention | 4 attention heads / 1 key-value heads |
+| Context Length | 32,768 tokens (checkpoint configuration) |
+| Vocabulary Size | 262,144 |
+| Configured Dtype | `bfloat16` |
 
-### Available Models
+### Recipe Notes
+
+See the [FunctionGemma Fine-Tuning Guide](/recipes-e2e-examples/function-calling).
+
+## Available Models
 
 | Checkpoint | Type |
 | --- | --- |
@@ -48,3 +48,5 @@ See the [FunctionGemma Fine-Tuning Guide](/recipes-e2e-examples/function-calling
 ## Related Resources
 
 - [Installation Instructions](/get-started/installation)
+
+- [Checkpoint Configuration](https://huggingface.co/google/functiongemma-270m-it/blob/39eccb091651513a5dfb56892d3714c1b5b8276c/config.json)

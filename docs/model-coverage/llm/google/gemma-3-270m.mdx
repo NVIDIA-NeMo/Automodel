@@ -1,5 +1,5 @@
 ---
-title: "gemma-3-270m"
+title: "google/gemma-3-270m"
 description: "Fine-tune gemma-3-270m for text generation with NeMo AutoModel using checked-in recipes and documented distributed settings."
 slug: model-coverage/large-language-models/google/gemma-3-270m
 ---
@@ -8,8 +8,6 @@ slug: model-coverage/large-language-models/google/gemma-3-270m
 The Hugging Face configuration declares the `Gemma3ForCausalLM` architecture.
 
 ## Quick Start
-
-### Fine-Tune Gemma-3-270M
 
 Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
 
@@ -26,6 +24,18 @@ automodel examples/llm_finetune/gemma/gemma_3_270m_squad.yaml --nproc-per-node 8
 
 ## Model Context
 
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| Architecture | `Gemma3ForCausalLM` |
+| Parameters | 268.1M checkpoint parameters |
+| Decoder Layers | 18 |
+| Hidden Size | 640 |
+| Attention | 4 attention heads / 1 key-value heads |
+| Context Length | 32,768 tokens (checkpoint configuration) |
+| Vocabulary Size | 262,144 |
+| Configured Dtype | `bfloat16` |
+
 ### Configuration
 
 | Setting | Configuration |
@@ -40,16 +50,7 @@ automodel examples/llm_finetune/gemma/gemma_3_270m_squad.yaml --nproc-per-node 8
 
 - [`gemma_3_270m_squad_peft.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gemma/gemma_3_270m_squad_peft.yaml)
 
-## Model Reference
-
-### Model Architecture
-
-| Property | Value |
-| --- | --- |
-| Task | Text generation |
-| Architecture | `Gemma3ForCausalLM` |
-
-### Available Models
+## Available Models
 
 - [`google/gemma-3-270m`](https://huggingface.co/google/gemma-3-270m)
 
@@ -61,3 +62,5 @@ automodel examples/llm_finetune/gemma/gemma_3_270m_squad.yaml --nproc-per-node 8
 ## Related Resources
 
 - [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/google/gemma-3-270m/blob/9b0cfec892e2bc2afd938c98eabe4e4a7b1e0ca1/config.json)

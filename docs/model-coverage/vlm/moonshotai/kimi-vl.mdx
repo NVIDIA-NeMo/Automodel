@@ -1,5 +1,5 @@
 ---
-title: "Kimi-VL-A3B-Instruct"
+title: "moonshotai/Kimi-VL-A3B-Instruct"
 description: "Use Kimi-VL-A3B-Instruct with NeMo AutoModel for vision-language fine-tuning, with documented checkpoints, runnable recipes, setup guidance, and model reference details."
 slug: model-coverage/vision-language-models/moonshotai/Kimi-VL-A3B-Instruct
 ---
@@ -9,8 +9,6 @@ slug: model-coverage/vision-language-models/moonshotai/Kimi-VL-A3B-Instruct
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
 ## Quick Start
-
-### Fine-Tune Kimi-VL-A3B-Instruct
 
 From the repository root, run:
 
@@ -26,18 +24,21 @@ uv run automodel --nproc-per-node=8 examples/vlm_finetune/kimi/kimi2vl_cordv2.ya
 
 ## Model Context
 
-## Model Reference
-
-### Model Architecture
-
 | Property | Value |
 | --- | --- |
 | Task | Image-Text-to-Text |
 | Architecture | `KimiVLForConditionalGeneration` |
 | Parameters | ~3B active (MoE) |
 | Hugging Face Organization | [moonshotai](https://huggingface.co/moonshotai) |
+| Decoder Layers | 27 |
+| Hidden Size | 2,048 |
+| Attention | 16 attention heads / 16 key-value heads |
+| Context Length | 131,072 tokens (checkpoint configuration) |
+| Vocabulary Size | 163,840 |
+| Experts | 64 routed / 2 shared / 6 selected per token |
+| Configured Dtype | `bfloat16` |
 
-### Available Models
+## Available Models
 
 | Model | HF ID |
 |---|---|
@@ -46,3 +47,5 @@ uv run automodel --nproc-per-node=8 examples/vlm_finetune/kimi/kimi2vl_cordv2.ya
 ## Related Resources
 
 - [VLM Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n)
+
+- [Checkpoint Configuration](https://huggingface.co/moonshotai/Kimi-VL-A3B-Instruct/blob/398eede0903cd983a2bfa0cc634e9ac1d843f375/config.json)

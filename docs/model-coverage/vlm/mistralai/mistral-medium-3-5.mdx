@@ -1,5 +1,5 @@
 ---
-title: "Devstral-2-123B-Instruct-2512"
+title: "mistralai/Devstral-2-123B-Instruct-2512"
 description: "Fine-tune Devstral-2-123B-Instruct-2512 for text generation with NeMo AutoModel using the checked-in single-node tensor-parallel LoRA recipe."
 slug: model-coverage/vision-language-models/mistralai/Devstral-2-123B-Instruct-2512
 ---
@@ -9,8 +9,6 @@ slug: model-coverage/vision-language-models/mistralai/Devstral-2-123B-Instruct-2
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
 ## Quick Start
-
-### Fine-Tune Devstral-2-123B-Instruct-2512
 
 Run the checked-in recipe on one node with eight GPUs:
 
@@ -27,18 +25,21 @@ uv run automodel examples/llm_finetune/devstral/devstral2_123b_2512_squad_peft.y
 
 ## Model Context
 
-## Model Reference
-
-### Model Architecture
-
 | Property | Value |
 | --- | --- |
 | Task | Text Generation |
 | Architecture | `Ministral3ForCausalLM` |
 | Strategy | FSDP2 with tensor parallelism 8 and LoRA |
 | Hugging Face Organization | [mistralai](https://huggingface.co/mistralai) |
+| Parameters | 125.03B checkpoint parameters |
+| Decoder Layers | 88 |
+| Hidden Size | 12,288 |
+| Attention | 96 attention heads / 8 key-value heads |
+| Context Length | 262,144 tokens (checkpoint configuration) |
+| Vocabulary Size | 131,072 |
+| Configured Dtype | `bfloat16` |
 
-### Available Models
+## Available Models
 
 - [`mistralai/Devstral-2-123B-Instruct-2512`](https://huggingface.co/mistralai/Devstral-2-123B-Instruct-2512)
 
@@ -50,3 +51,5 @@ uv run automodel examples/llm_finetune/devstral/devstral2_123b_2512_squad_peft.y
 ## Related Resources
 
 - [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/mistralai/Devstral-2-123B-Instruct-2512/blob/1613bf01adb5e1c6fdc196b46e6b173eae75eb4a/config.json)

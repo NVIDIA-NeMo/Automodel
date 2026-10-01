@@ -1,5 +1,5 @@
 ---
-title: "Hy3-preview"
+title: "tencent/Hy3-preview"
 description: "Use Hy3-preview with NeMo AutoModel for language model fine-tuning, with documented checkpoints, runnable recipes, setup guidance, and model reference details."
 slug: model-coverage/large-language-models/tencent/Hy3-preview
 ---
@@ -10,15 +10,13 @@ Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com
 
 ## Quick Start
 
-### Fine-Tune Hy3-preview
-
-From the repository root, run:
+Allocate 8 nodes with 8 GPUs each. Set `NODE_RANK` and `MASTER_ADDR` on every node; complete the recipe prerequisites in Model Context before launching.
 
 ```bash
-uv run automodel --nproc-per-node=8 examples/llm_finetune/hy_v3/hy3_preview_deepep.yaml
+uv run torchrun --nnodes 8 --nproc-per-node 8 \
+  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
+  -m nemo_automodel.cli.app examples/llm_finetune/hy_v3/hy3_preview_deepep.yaml
 ```
-
-See the [NeMo AutoModel Installation Guide](/get-started/installation) and [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).
 
 ## Choose a Workflow
 
@@ -28,18 +26,20 @@ See the [NeMo AutoModel Installation Guide](/get-started/installation) and [LLM 
 
 ## Model Context
 
-## Model Reference
-
-### Model Architecture
-
 | Property | Value |
 | --- | --- |
 | Task | Text Generation (MoE) |
 | Architecture | `HYV3ForCausalLM` |
 | Parameters | 295B total |
 | Hugging Face Organization | [tencent](https://huggingface.co/tencent) |
+| Decoder Layers | 80 |
+| Hidden Size | 4,096 |
+| Attention | 64 attention heads / 8 key-value heads |
+| Context Length | 262,144 tokens (checkpoint configuration) |
+| Vocabulary Size | 120,832 |
+| Experts | 192 routed / 1 shared / 8 selected per token |
 
-### Available Models
+## Available Models
 
 | Model | HF ID |
 |---|---|
@@ -49,3 +49,5 @@ See the [NeMo AutoModel Installation Guide](/get-started/installation) and [LLM 
 
 - [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
 - [Large MoE Fine-Tuning Guide](/recipes-e2e-examples/large-moe-fine-tuning)
+
+- [Checkpoint Configuration](https://huggingface.co/tencent/Hy3-preview/blob/549c2b3a0fd5b9a6c6059a9935bf0d59ab69d75a/config.json)

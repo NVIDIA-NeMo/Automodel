@@ -1,5 +1,5 @@
 ---
-title: "HunyuanVideo-1.5-Diffusers-720p_t2v"
+title: "hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v"
 description: "Use HunyuanVideo-1.5-Diffusers-720p_t2v with NeMo AutoModel for diffusion training and fine-tuning, including checkpoints, runnable recipes, setup, and reference details."
 slug: model-coverage/diffusion/hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v
 ---
@@ -9,8 +9,6 @@ slug: model-coverage/diffusion/hunyuanvideo-community/HunyuanVideo-1.5-Diffusers
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
 ## Quick Start
-
-### Fine-Tune HunyuanVideo-1.5-Diffusers-720p_t2v
 
 From the repository root, run:
 
@@ -28,22 +26,21 @@ uv run torchrun --nproc-per-node=8 \
 
 ## Model Context
 
-### Task
-
-- Text-to-Video (T2V)
-
-## Model Reference
-
-### Model Architecture
-
 | Property | Value |
 | --- | --- |
 | Task | Text-to-Video |
 | Architecture | DiT (Flow Matching) |
 | Parameters | 13B |
 | Hugging Face Organization | [hunyuanvideo-community](https://huggingface.co/hunyuanvideo-community) |
+| Transformer Blocks | 54 |
+| Hidden Size | 2,048 |
+| Attention | 16 attention heads |
 
-### Available Models
+### Task
+
+- Text-to-Video (T2V)
+
+## Available Models
 
 | Model | HF ID |
 |---|---|
@@ -53,3 +50,5 @@ uv run torchrun --nproc-per-node=8 \
 
 - [Diffusion Fine-Tuning Guide](/recipes-e2e-examples/diffusion-fine-tuning)
 - [Dataset Preparation](/datasets/diffusion-dataset)
+
+- [Checkpoint Configuration](https://huggingface.co/hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v/blob/f4dbc4a1efa4ac8ea56680cdf79d9f455105e814/transformer/config.json)

@@ -1,5 +1,5 @@
 ---
-title: "DeepSeek-V4.1-Flash"
+title: "deepseek-ai/DeepSeek-V4.1-Flash"
 description: "Fine-tune DeepSeek-V4.1-Flash with NeMo AutoModel using checked-in expert-parallel text recipes and sharded Engram memory."
 slug: model-coverage/large-language-models/deepseek-ai/DeepSeek-V4.1-Flash
 ---
@@ -14,23 +14,42 @@ at layers 1 and 14 provide tokenizer-dependent N-gram memory. The approximately
 
 ## Quick Start
 
-Review the recipes in [Choose a Workflow](#choose-a-workflow), including their
-hardware and data requirements. Follow the [installation instructions](/get-started/installation)
-before launching a recipe.
+Follow the [installation instructions](/get-started/installation). Allocate 16 nodes with 4 GPUs each; run on every node with `NODE_RANK` and `MASTER_ADDR` set. Complete the [recipe setup](#recipe-setup) before launching.
+
+```bash
+uv run torchrun --nnodes 16 --nproc-per-node 4 \
+  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
+  -m nemo_automodel.cli.app examples/llm_finetune/deepseek_v41/deepseek_v41_flash_hellaswag_ep64_16nodes.yaml
+```
 
 ## Choose a Workflow
 
 | Goal | Start Here |
 | --- | --- |
-| Review the recipe requirements | [HellaSwag EP64](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_hellaswag_ep64_16nodes.yaml) |
+| Fine-tune deepseek-ai/DeepSeek-V4.1-Flash | [deepseek_v41_flash_hellaswag_ep64_16nodes.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_hellaswag_ep64_16nodes.yaml). 16 nodes, 4 GPUs per node; see [Recipe Setup](#recipe-setup). |
 | Review the recipe requirements | [HellaSwag EP64, H100](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_hellaswag_ep64_h100_16nodes.yaml) |
 | Review the recipe requirements | [Tulu3 CP recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_tulu3_cp.yaml) |
 | Review the recipe requirements | [HellaSwag LoRA, H100](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_hellaswag_lora_h100_8nodes.yaml) |
 | Review the recipe requirements | [Tulu3 CP8, H100](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_tulu3_cp8_h100_32nodes.yaml) |
 | Review the recipe requirements | [Tulu3 packed CP8 32k, H100](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_tulu3_packed_cp8_32k_h100_64nodes.yaml) |
-| Review the recipe requirements | [prepare_tulu3_data.py](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/prepare_tulu3_data.py) |
 
 ## Model Context
+
+| Property | Value |
+|---|---|
+| Task | Text Generation |
+| Architecture | `DeepseekV41ForCausalLM` |
+| Model ID | `deepseek-ai/DeepSeek-V4.1-Flash` |
+| Reference revision | `df42c109f1defefcbfcedbe7d905718a12266e40` |
+| Configuration | `DeepseekV41Config` with typed `text_config` and `vision_config` |
+| Decoder Layers | 40 |
+| Hidden Size | 5,120 |
+| Attention | 64 attention heads / 1 key-value heads |
+| Context Length | 1,048,576 tokens (checkpoint configuration) |
+| Vocabulary Size | 129,280 |
+| Experts | 384 routed / 1 shared / 6 selected per token |
+| Configured Dtype | `bfloat16` |
+| Parameters | Approximately 749B native backbone, including Engram and vision; excludes auxiliary prediction modules |
 
 ### Fine-Tuning
 
@@ -281,18 +300,23 @@ Fine-tuning does not reproduce the report's
 Engram pretraining optimizer. Bitwise training continuation is not established
 for the TileLang backward kernels.
 
-## Model Reference
+### Setup and Additional Examples
 
-### Model Architecture
+Review the recipes in [Choose a Workflow](#choose-a-workflow), including their
+hardware and data requirements. Follow the [installation instructions](/get-started/installation)
+before launching a recipe.
 
-| Property | Value |
-|---|---|
-| Architecture | `DeepseekV41ForCausalLM` |
-| Model ID | `deepseek-ai/DeepSeek-V4.1-Flash` |
-| Reference revision | `df42c109f1defefcbfcedbe7d905718a12266e40` |
-| Configuration | `DeepseekV41Config` with typed `text_config` and `vision_config` |
+### Recipe Setup
 
-### Available Models
+Read [deepseek_v41_flash_hellaswag_ep64_16nodes.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_hellaswag_ep64_16nodes.yaml) for checkpoint access, data paths, and backend dependencies. Use the [Slurm launcher guide](/job-launchers/slurm-cluster) to prepare the distributed allocation.
+
+### Additional Workflows
+
+| Goal | Start Here |
+| --- | --- |
+| Review the recipe requirements | [prepare_tulu3_data.py](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/prepare_tulu3_data.py) |
+
+## Available Models
 
 | Checkpoint | Type |
 | --- | --- |
@@ -301,3 +325,5 @@ for the TileLang backward kernels.
 ## Related Resources
 
 - [Installation Instructions](/get-started/installation)
+
+- [Checkpoint Configuration](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/2cba9e42aa026125f3ed06c6d98c1db82f7ca027/config.json)

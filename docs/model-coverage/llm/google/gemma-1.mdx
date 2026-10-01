@@ -1,5 +1,5 @@
 ---
-title: "gemma-7b"
+title: "google/gemma-7b"
 description: "Use gemma-7b with NeMo AutoModel for text generation, with supported architecture details, canonical checkpoints, and recipe references."
 slug: model-coverage/large-language-models/google/gemma-7b
 ---
@@ -7,8 +7,6 @@ slug: model-coverage/large-language-models/google/gemma-7b
 [Gemma 1](https://huggingface.co/google/gemma-7b) is the first generation of Google's open-weight Gemma language models.
 
 ## Quick Start
-
-### Fine-Tune gemma-7b
 
 From the repository root, run:
 
@@ -25,22 +23,24 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/gemma/gemma_7b_squad.y
 
 ## Model Context
 
-### Recipe Notes
-
-See the [Installation Guide](/get-started/installation) and [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).
-
-## Model Reference
-
-### Model Architecture
-
 | Property | Value |
 |---|---|
 | **Task** | Text Generation |
 | **Architecture** | `GemmaForCausalLM` |
 | **Parameters** | 2B, 7B |
 | **HF Org** | [google](https://huggingface.co/google) |
+| Decoder Layers | 28 |
+| Hidden Size | 3,072 |
+| Attention | 16 attention heads / 16 key-value heads |
+| Context Length | 8,192 tokens (checkpoint configuration) |
+| Vocabulary Size | 256,000 |
+| Configured Dtype | `bfloat16` |
 
-### Available Models
+### Recipe Notes
+
+See the [Installation Guide](/get-started/installation) and [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).
+
+## Available Models
 
 | Checkpoint | Type |
 | --- | --- |
@@ -49,3 +49,5 @@ See the [Installation Guide](/get-started/installation) and [LLM Fine-Tuning Gui
 ## Related Resources
 
 - [Installation Instructions](/get-started/installation)
+
+- [Checkpoint Configuration](https://huggingface.co/google/gemma-7b/blob/ff6768d9368919a1f025a54f9f5aa0ee591730bb/config.json)

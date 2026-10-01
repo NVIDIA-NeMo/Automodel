@@ -1,5 +1,5 @@
 ---
-title: "Mistral-Small-4-119B-2603"
+title: "mistralai/Mistral-Small-4-119B-2603"
 description: "Use Mistral-Small-4-119B-2603 with NeMo AutoModel for vision-language fine-tuning, with documented checkpoints, runnable recipes, setup, and model reference details."
 slug: model-coverage/vision-language-models/mistralai/Mistral-Small-4-119B-2603
 ---
@@ -10,17 +10,12 @@ Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com
 
 ## Quick Start
 
-### Fine-Tune Mistral-Small-4-119B-2603
-
-<Note>
-This recipe was validated on **4 nodes x 8 GPUs (32 H100s)**. See the [Launcher Guide](/job-launchers/slurm-cluster) for multi-node setup.
-
-</Note>
-
-From the repository root, run:
+Allocate 4 nodes with 8 GPUs each. Set `NODE_RANK` and `MASTER_ADDR` on every node; complete the recipe prerequisites in Model Context before launching.
 
 ```bash
-uv run automodel --nproc-per-node=8 examples/vlm_finetune/mistral4/mistral4_medpix.yaml
+uv run torchrun --nnodes 4 --nproc-per-node 8 \
+  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
+  -m nemo_automodel.cli.app examples/vlm_finetune/mistral4/mistral4_medpix.yaml
 ```
 
 ## Choose a Workflow
@@ -31,18 +26,21 @@ uv run automodel --nproc-per-node=8 examples/vlm_finetune/mistral4/mistral4_medp
 
 ## Model Context
 
-## Model Reference
-
-### Model Architecture
-
 | Property | Value |
 | --- | --- |
 | Task | Image-Text-to-Text |
 | Architecture | `MistralForConditionalGeneration` |
 | Parameters | 119B (MoE) |
 | Hugging Face Organization | [mistralai](https://huggingface.co/mistralai) |
+| Decoder Layers | 36 |
+| Hidden Size | 4,096 |
+| Attention | 32 attention heads / 32 key-value heads |
+| Context Length | 1,048,576 tokens (checkpoint configuration) |
+| Vocabulary Size | 131,072 |
+| Experts | 128 routed / 1 shared / 4 selected per token |
+| Configured Dtype | `bfloat16` |
 
-### Available Models
+## Available Models
 
 | Model | HF ID |
 |---|---|
@@ -51,3 +49,5 @@ uv run automodel --nproc-per-node=8 examples/vlm_finetune/mistral4/mistral4_medp
 ## Related Resources
 
 - [VLM Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n)
+
+- [Checkpoint Configuration](https://huggingface.co/mistralai/Mistral-Small-4-119B-2603/blob/a11f36bebf709121056b1dbcc943d1c6afbe494d/config.json)

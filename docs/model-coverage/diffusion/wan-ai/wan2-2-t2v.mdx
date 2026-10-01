@@ -1,5 +1,5 @@
 ---
-title: "Wan2.2-T2V-A14B-Diffusers"
+title: "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
 description: "Use Wan2.2-T2V-A14B-Diffusers with NeMo AutoModel for diffusion training and fine-tuning, including checkpoints, runnable recipes, setup, and reference details."
 slug: model-coverage/diffusion/wan-ai/Wan2.2-T2V-A14B-Diffusers
 ---
@@ -9,8 +9,6 @@ slug: model-coverage/diffusion/wan-ai/Wan2.2-T2V-A14B-Diffusers
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
 ## Quick Start
-
-### Fine-Tune Wan2.2-T2V-A14B-Diffusers
 
 From the repository root, run:
 
@@ -30,6 +28,16 @@ uv run torchrun --nproc-per-node=8 \
 | Inference - loads both stage checkpoints | Use [generate_wan22.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/generate/configs/generate_wan22.yaml). |
 
 ## Model Context
+
+| Property | Value |
+| --- | --- |
+| Task | Text-to-Video |
+| Architecture | DiT (Flow Matching), two-stage |
+| Parameters | 14B + 14B (high-noise + low-noise) |
+| Hugging Face Organization | [Wan-AI](https://huggingface.co/Wan-AI) |
+| Transformer Blocks | 40 |
+| Hidden Size | 5,120 |
+| Attention | 40 attention heads |
 
 ### Two-stage finetuning workflow
 
@@ -85,18 +93,7 @@ Each finetuning run only holds one of the two transformers on GPU - the recipe d
 
 - Text-to-Video (T2V)
 
-## Model Reference
-
-### Model Architecture
-
-| Property | Value |
-| --- | --- |
-| Task | Text-to-Video |
-| Architecture | DiT (Flow Matching), two-stage |
-| Parameters | 14B + 14B (high-noise + low-noise) |
-| Hugging Face Organization | [Wan-AI](https://huggingface.co/Wan-AI) |
-
-### Available Models
+## Available Models
 
 | Model | HF ID |
 |---|---|
@@ -106,3 +103,5 @@ Each finetuning run only holds one of the two transformers on GPU - the recipe d
 
 - [Diffusion Fine-Tuning Guide](/recipes-e2e-examples/diffusion-fine-tuning)
 - [Dataset Preparation](/datasets/diffusion-dataset)
+
+- [Checkpoint Configuration](https://huggingface.co/Wan-AI/Wan2.2-T2V-A14B-Diffusers/blob/5be7df9619b54f4e2667b2755bc6a756675b5cd7/transformer/config.json)

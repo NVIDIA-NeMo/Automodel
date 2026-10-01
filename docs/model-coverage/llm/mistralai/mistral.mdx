@@ -1,5 +1,5 @@
 ---
-title: "Mistral-7B-v0.1"
+title: "mistralai/Mistral-7B-v0.1"
 description: "Use Mistral-7B-v0.1 with NeMo AutoModel for language model fine-tuning, with documented checkpoints, runnable recipes, setup guidance, and model reference details."
 slug: model-coverage/large-language-models/mistralai/Mistral-7B-v0.1
 ---
@@ -9,8 +9,6 @@ slug: model-coverage/large-language-models/mistralai/Mistral-7B-v0.1
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
 ## Quick Start
-
-### Fine-Tune Mistral-7B-v0.1
 
 From the repository root, run:
 
@@ -27,18 +25,20 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/mistral/mistral_7b_squ
 
 ## Model Context
 
-## Model Reference
-
-### Model Architecture
-
 | Property | Value |
 | --- | --- |
 | Task | Text Generation |
 | Architecture | `MistralForCausalLM` |
 | Parameters | 7B |
 | Hugging Face Organization | [mistralai](https://huggingface.co/mistralai) |
+| Decoder Layers | 32 |
+| Hidden Size | 4,096 |
+| Attention | 32 attention heads / 8 key-value heads |
+| Context Length | 32,768 tokens (checkpoint configuration) |
+| Vocabulary Size | 32,000 |
+| Configured Dtype | `bfloat16` |
 
-### Available Models
+## Available Models
 
 | Model | HF ID |
 |---|---|
@@ -48,3 +48,5 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/mistral/mistral_7b_squ
 ## Related Resources
 
 - [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/mistralai/Mistral-7B-v0.1/blob/27d67f1b5f57dc0953326b2601d68371d40ea8da/config.json)

@@ -1,5 +1,5 @@
 ---
-title: "Llama-3.2-1B"
+title: "meta-llama/Llama-3.2-1B"
 description: "Use Llama-3.2-1B with NeMo AutoModel for language model fine-tuning, with documented checkpoints, runnable recipes, setup guidance, and model reference details."
 slug: model-coverage/large-language-models/meta/Llama-3.2-1B
 ---
@@ -9,8 +9,6 @@ slug: model-coverage/large-language-models/meta/Llama-3.2-1B
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
 ## Quick Start
-
-### Fine-Tune Llama-3.2-1B
 
 From the repository root, run:
 
@@ -26,18 +24,20 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/llama3_2/llama3_2_1b_s
 
 ## Model Context
 
-## Model Reference
-
-### Model Architecture
-
 | Property | Value |
 | --- | --- |
 | Task | Text Generation |
 | Architecture | `LlamaForCausalLM` |
 | Parameters | 1B |
 | Hugging Face Organization | [meta-llama](https://huggingface.co/meta-llama) |
+| Decoder Layers | 16 |
+| Hidden Size | 2,048 |
+| Attention | 32 attention heads / 8 key-value heads |
+| Context Length | 131,072 tokens (checkpoint configuration) |
+| Vocabulary Size | 128,256 |
+| Configured Dtype | `bfloat16` |
 
-### Available Models
+## Available Models
 
 | Model | HF ID |
 |---|---|
@@ -46,3 +46,5 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/llama3_2/llama3_2_1b_s
 ## Related Resources
 
 - [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/meta-llama/Llama-3.2-1B/blob/4e20de362430cd3b72f300e6b0f18e50e7166e08/config.json)

@@ -1,5 +1,5 @@
 ---
-title: "Kimi-Linear-48B-A3B-Instruct"
+title: "moonshotai/Kimi-Linear-48B-A3B-Instruct"
 description: "Use Kimi-Linear-48B-A3B-Instruct with NeMo AutoModel for language model fine-tuning, with documented checkpoints, runnable recipes, setup, and model reference details."
 slug: model-coverage/large-language-models/moonshotai/Kimi-Linear-48B-A3B-Instruct
 ---
@@ -9,8 +9,6 @@ slug: model-coverage/large-language-models/moonshotai/Kimi-Linear-48B-A3B-Instru
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
 ## Quick Start
-
-### Fine-Tune Kimi-Linear-48B-A3B-Instruct
 
 From the repository root, run:
 
@@ -27,25 +25,18 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/kimi/kimi_linear_48b_a
 
 ## Model Context
 
-### Supported Parallelism
-
-| Feature | Notes |
-|---|---|
-| FSDP2 | Default sharding strategy for the recipes below |
-| Expert parallelism (EP) | Shards the MoE experts across ranks |
-| Context parallelism (CP) | Contiguous per-rank sequence shards. KDA passes its recurrent state from rank to rank, and MLA gathers the compressed KV latent |
-| Packed sequences | Document boundaries from the THD collater are honored by both layer types, including under CP |
-
-## Model Reference
-
-### Model Architecture
-
 | Property | Value |
 | --- | --- |
 | Task | Text Generation (hybrid linear attention, MoE) |
 | Architecture | `KimiLinear48BForCausalLM` |
 | Parameters | 48B total / 3B active |
 | Hugging Face Organization | [moonshotai](https://huggingface.co/moonshotai) |
+| Decoder Layers | 27 |
+| Hidden Size | 2,304 |
+| Attention | 32 attention heads / 32 key-value heads |
+| Vocabulary Size | 163,840 |
+| Experts | 256 routed / 1 shared / 8 selected per token |
+| Configured Dtype | `bfloat16` |
 
 - `KimiLinear48BForCausalLM` (`model_type: kimi_linear_48b_a3b`)
 - Hybrid attention stack: KDA linear-attention layers interleaved with MLA layers
@@ -59,7 +50,16 @@ distinct identity, `kimi_linear_48b_a3b` / `KimiLinear48BForCausalLM`, and leave
 explicitly, which is what a published Moonshot checkpoint needs; checkpoints saved by
 NeMo AutoModel already carry the distinct identity and load without that override.
 
-### Available Models
+### Supported Parallelism
+
+| Feature | Notes |
+|---|---|
+| FSDP2 | Default sharding strategy for the recipes below |
+| Expert parallelism (EP) | Shards the MoE experts across ranks |
+| Context parallelism (CP) | Contiguous per-rank sequence shards. KDA passes its recurrent state from rank to rank, and MLA gathers the compressed KV latent |
+| Packed sequences | Document boundaries from the THD collater are honored by both layer types, including under CP |
+
+## Available Models
 
 | Model | HF ID |
 |---|---|
@@ -68,3 +68,5 @@ NeMo AutoModel already carry the distinct identity and load without that overrid
 ## Related Resources
 
 - [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/moonshotai/Kimi-Linear-48B-A3B-Instruct/blob/e1df551a447157d4658b573f9a695d57658590e9/config.json)

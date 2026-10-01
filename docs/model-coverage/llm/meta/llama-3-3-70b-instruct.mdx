@@ -1,5 +1,5 @@
 ---
-title: "Llama-3.3-70B-Instruct"
+title: "meta-llama/Llama-3.3-70B-Instruct"
 description: "Use NeMo AutoModel to fine-tune Llama-3.3-70B-Instruct for LLM workflows with checked-in text generation recipes and documented distributed settings."
 slug: model-coverage/large-language-models/meta/Llama-3.3-70B-Instruct
 ---
@@ -9,15 +9,13 @@ The Hugging Face configuration declares the `LlamaForCausalLM` architecture.
 
 ## Quick Start
 
-### Fine-Tune Llama-3.3-70B-Instruct
-
-Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+Allocate 4 nodes with 8 GPUs each. Set `NODE_RANK` and `MASTER_ADDR` on every node; complete the recipe prerequisites in Model Context before launching.
 
 ```bash
-automodel examples/llm_finetune/llama3_3/llama_3_3_70b_instruct_squad.yaml --nproc-per-node 8
+uv run torchrun --nnodes 4 --nproc-per-node 8 \
+  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
+  -m nemo_automodel.cli.app examples/llm_finetune/llama3_3/llama_3_3_70b_instruct_squad.yaml
 ```
-
-Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node run.
 
 ## Choose a Workflow
 
@@ -27,6 +25,18 @@ Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node 
 | Try another checked-in recipe for this model | Use the [alternate recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/llama3_3/custom_llama3_3_70b_instruct_peft_benchmark.yaml). |
 
 ## Model Context
+
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| Architecture | `LlamaForCausalLM` |
+| Parameters | 70.55B checkpoint parameters |
+| Decoder Layers | 80 |
+| Hidden Size | 8,192 |
+| Attention | 64 attention heads / 8 key-value heads |
+| Context Length | 131,072 tokens (checkpoint configuration) |
+| Vocabulary Size | 128,256 |
+| Configured Dtype | `bfloat16` |
 
 ### Configuration
 
@@ -48,16 +58,7 @@ Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node 
 - [`llama_3_3_70b_instruct_squad_peft_qlora_rtx_spark.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_3/llama_3_3_70b_instruct_squad_peft_qlora_rtx_spark.yaml)
 - [`llama_3_3_70b_instruct_squad_peft_qlora_spark.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_3/llama_3_3_70b_instruct_squad_peft_qlora_spark.yaml)
 
-## Model Reference
-
-### Model Architecture
-
-| Property | Value |
-| --- | --- |
-| Task | Text generation |
-| Architecture | `LlamaForCausalLM` |
-
-### Available Models
+## Available Models
 
 - [`meta-llama/Llama-3.3-70B-Instruct`](https://huggingface.co/meta-llama/Llama-3.3-70B-Instruct)
 
@@ -69,3 +70,5 @@ Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node 
 ## Related Resources
 
 - [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/meta-llama/Llama-3.3-70B-Instruct/blob/6f6073b423013f6a7d4d9f39144961bfbfbc386b/config.json)

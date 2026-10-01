@@ -1,33 +1,30 @@
 ---
-title: "chatglm3-6b"
-description: "Reference chatglm3-6b checkpoint and architecture details for NeMo AutoModel, with model-family information, setup guidance, and upstream resources."
+title: "zai-org/chatglm3-6b"
+description: "Fine-tune zai-org/chatglm3-6b with NeMo AutoModel using a checked-in LoRA recipe, with checkpoint and architecture details."
 slug: model-coverage/large-language-models/thudm/chatglm3-6b
 ---
 
 [ChatGLM](https://github.com/zai-org/ChatGLM-6B) is a bilingual (Chinese-English) conversational language model from Zhipu AI. ChatGLM2 and ChatGLM3 extend the original with improved performance, longer context, and more efficient attention.
 
-Use this page as a checkpoint and architecture reference. Set up NeMo AutoModel with the
+Set up NeMo AutoModel with the
 [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the
 [installation instructions](/get-started/installation).
 
 ## Quick Start
 
-This page provides checkpoint and architecture reference information rather
-than a model-specific launch command. Follow the
-[installation instructions](/get-started/installation) to set up NeMo AutoModel.
+Follow the [installation instructions](/get-started/installation). From the repository root, use 8 GPUs. This is an example configuration; GPU training and memory use still require validation.
+
+```bash
+uv run automodel examples/llm_finetune/zai_org/chatglm3_6b_squad_peft.yaml --nproc-per-node 8
+```
 
 ## Choose a Workflow
 
 | Goal | Start Here |
 | --- | --- |
-| Explore checkpoints | See [Available Models](#available-models). |
-| Configure NeMo AutoModel | Follow the [installation instructions](/get-started/installation). |
+| Fine-tune zai-org/chatglm3-6b | [chatglm3_6b_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/zai_org/chatglm3_6b_squad_peft.yaml). Example LoRA configuration; validate GPU training. |
 
 ## Model Context
-
-## Model Reference
-
-### Model Architecture
 
 | Property | Value |
 | --- | --- |
@@ -35,10 +32,20 @@ than a model-specific launch command. Follow the
 | Architecture | `ChatGLMModel` |
 | Parameters | 6B |
 | Hugging Face Organization | [zai-org](https://huggingface.co/zai-org) |
+| Decoder Layers | 28 |
+| Hidden Size | 4,096 |
+| Attention | 32 attention heads / 2 key-value heads |
+| Context Length | 8,192 tokens (checkpoint configuration) |
+| Vocabulary Size | 65,024 |
+| Configured Dtype | `float16` |
 
 - `ChatGLMModel` / `ChatGLMForConditionalGeneration`
 
-### Available Models
+### Recipe Setup
+
+Read [chatglm3_6b_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/zai_org/chatglm3_6b_squad_peft.yaml) for checkpoint access, data paths, and backend dependencies. It provides a small LoRA fine-tuning example.
+
+## Available Models
 
 | Model | HF ID |
 |---|---|
@@ -47,3 +54,5 @@ than a model-specific launch command. Follow the
 ## Related Resources
 
 - [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/zai-org/chatglm3-6b/blob/e9e0406d062cdb887444fe5bd546833920abd4ac/config.json)

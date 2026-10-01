@@ -1,5 +1,5 @@
 ---
-title: "Falcon-H1-34B-Instruct"
+title: "tiiuae/Falcon-H1-34B-Instruct"
 description: "Use NeMo AutoModel to fine-tune Falcon-H1-34B-Instruct for LLM workflows with checked-in text generation recipes and documented distributed settings."
 slug: model-coverage/large-language-models/tiiuae/Falcon-H1-34B-Instruct
 ---
@@ -8,8 +8,6 @@ slug: model-coverage/large-language-models/tiiuae/Falcon-H1-34B-Instruct
 The Hugging Face configuration declares the `FalconH1ForCausalLM` architecture.
 
 ## Quick Start
-
-### Fine-Tune Falcon-H1-34B-Instruct
 
 Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
 
@@ -26,6 +24,18 @@ automodel examples/llm_finetune/falcon/falcon_h1_34b_instruct_squad_peft.yaml --
 
 ## Model Context
 
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| Architecture | `FalconH1ForCausalLM` |
+| Parameters | 33.64B checkpoint parameters |
+| Decoder Layers | 72 |
+| Hidden Size | 5,120 |
+| Attention | 20 attention heads / 4 key-value heads |
+| Context Length | 262,144 tokens (checkpoint configuration) |
+| Vocabulary Size | 261,120 |
+| Configured Dtype | `bfloat16` |
+
 ### Configuration
 
 | Setting | Configuration |
@@ -36,16 +46,7 @@ automodel examples/llm_finetune/falcon/falcon_h1_34b_instruct_squad_peft.yaml --
 | Features | LoRA |
 | Advanced | bf16 |
 
-## Model Reference
-
-### Model Architecture
-
-| Property | Value |
-| --- | --- |
-| Task | Text generation |
-| Architecture | `FalconH1ForCausalLM` |
-
-### Available Models
+## Available Models
 
 - [`tiiuae/Falcon-H1-34B-Instruct`](https://huggingface.co/tiiuae/Falcon-H1-34B-Instruct)
 
@@ -57,3 +58,5 @@ automodel examples/llm_finetune/falcon/falcon_h1_34b_instruct_squad_peft.yaml --
 ## Related Resources
 
 - [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/tiiuae/Falcon-H1-34B-Instruct/blob/6e6890e26cba1f58b1e6ee70d654ddf054f9fce8/config.json)

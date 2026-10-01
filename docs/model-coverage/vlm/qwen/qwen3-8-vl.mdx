@@ -1,5 +1,5 @@
 ---
-title: "Qwen3.8-27B"
+title: "Qwen/Qwen3.8-27B"
 description: "Fine-tune Qwen3.8-27B for vision-language tasks with NeMo AutoModel using checked-in full-parameter and LoRA recipes with distributed settings."
 slug: model-coverage/vision-language-models/qwen/Qwen3.8-27B
 ---
@@ -11,7 +11,36 @@ architecture, so NeMo AutoModel uses its existing native
 
 ## Quick Start
 
-### Fine-Tune Qwen3.8-27B
+Follow the [installation instructions](/get-started/installation). From the repository root, use 8 GPUs. Complete the [recipe setup](#recipe-setup) before launching.
+
+```bash
+uv run automodel --nproc-per-node=8 examples/vlm_finetune/qwen3_8/qwen3_8_27b.yaml
+uv run automodel --nproc-per-node=8 examples/vlm_finetune/qwen3_8/qwen3_8_27b_lora.yaml
+```
+
+## Choose a Workflow
+
+| Goal | Start Here |
+| --- | --- |
+| Fine-tune Qwen/Qwen3.8-27B | [qwen3_8_27b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_8/qwen3_8_27b.yaml). 1 node, 8 GPUs per node; see [Recipe Setup](#recipe-setup). |
+| [`Qwen/Qwen3.8-27B`](https://huggingface.co/Qwen/Qwen3.8-27B); LoRA on MedPix-VQA | [qwen3_8_27b_lora.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_8/qwen3_8_27b_lora.yaml) |
+
+## Model Context
+
+| Property | Value |
+|---|---|
+| **Task** | Image-Text-to-Text |
+| **Architecture** | `Qwen3_5ForConditionalGeneration` |
+| **Parameters** | 27B dense |
+| **Context length** | 262,144 tokens |
+| **HF Org** | [Qwen](https://huggingface.co/Qwen) |
+| Decoder Layers | 64 |
+| Hidden Size | 5,120 |
+| Attention | 24 attention heads / 4 key-value heads |
+| Context Length | 262,144 tokens (checkpoint configuration) |
+| Vocabulary Size | 248,320 |
+
+### Setup and Additional Examples
 
 ```bash
 uv run automodel --nproc-per-node=8 examples/vlm_finetune/qwen3_8/qwen3_8_27b.yaml
@@ -27,28 +56,11 @@ The checked-in recipes use FSDP2 data parallelism on eight GPUs. The shared
 Qwen3.5 dense model implementation also supports TP, CP, and PP, but the
 Qwen3.8 runs documented here validate the DP8 recipes specifically.
 
-## Choose a Workflow
+### Recipe Setup
 
-| Goal | Start Here |
-| --- | --- |
-| [`Qwen/Qwen3.8-27B`](https://huggingface.co/Qwen/Qwen3.8-27B); Full-parameter SFT on MedPix-VQA | [qwen3_8_27b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_8/qwen3_8_27b.yaml) |
-| [`Qwen/Qwen3.8-27B`](https://huggingface.co/Qwen/Qwen3.8-27B); LoRA on MedPix-VQA | [qwen3_8_27b_lora.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_8/qwen3_8_27b_lora.yaml) |
+Read [qwen3_8_27b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_8/qwen3_8_27b.yaml) for checkpoint access, data paths, and backend dependencies.
 
-## Model Context
-
-## Model Reference
-
-### Model Architecture
-
-| Property | Value |
-|---|---|
-| **Task** | Image-Text-to-Text |
-| **Architecture** | `Qwen3_5ForConditionalGeneration` |
-| **Parameters** | 27B dense |
-| **Context length** | 262,144 tokens |
-| **HF Org** | [Qwen](https://huggingface.co/Qwen) |
-
-### Available Models
+## Available Models
 
 | Checkpoint | Type |
 | --- | --- |
@@ -57,3 +69,5 @@ Qwen3.8 runs documented here validate the DP8 recipes specifically.
 ## Related Resources
 
 - [Installation Instructions](/get-started/installation)
+
+- [Checkpoint Configuration](https://huggingface.co/Qwen/Qwen3.8-27B/blob/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0/config.json)

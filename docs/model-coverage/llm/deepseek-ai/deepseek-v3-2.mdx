@@ -1,5 +1,5 @@
 ---
-title: "DeepSeek-V3.2"
+title: "deepseek-ai/DeepSeek-V3.2"
 description: "Use NeMo AutoModel to fine-tune DeepSeek-V3.2 for LLM workflows with checked-in text generation recipes and documented distributed settings."
 slug: model-coverage/large-language-models/deepseek-ai/DeepSeek-V3.2
 ---
@@ -9,15 +9,13 @@ The Hugging Face configuration declares the `DeepseekV32ForCausalLM` architectur
 
 ## Quick Start
 
-### Fine-Tune DeepSeek-V3.2
-
-Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+Allocate 16 nodes with 8 GPUs each. Set `NODE_RANK` and `MASTER_ADDR` on every node; complete the recipe prerequisites in Model Context before launching.
 
 ```bash
-automodel examples/llm_benchmark/deepseek/dsv32_lora.yaml --nproc-per-node 8
+uv run torchrun --nnodes 16 --nproc-per-node 8 \
+  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
+  -m nemo_automodel.cli.app examples/llm_benchmark/deepseek/dsv32_lora.yaml
 ```
-
-Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node run.
 
 ## Choose a Workflow
 
@@ -27,6 +25,19 @@ Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node 
 | Prepare your environment | Follow the [installation instructions](/get-started/installation). |
 
 ## Model Context
+
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| Architecture | `DeepseekV32ForCausalLM` |
+| Parameters | 685.36B checkpoint parameters |
+| Decoder Layers | 61 |
+| Hidden Size | 7,168 |
+| Attention | 128 attention heads / 128 key-value heads |
+| Context Length | 163,840 tokens (checkpoint configuration) |
+| Vocabulary Size | 129,280 |
+| Experts | 256 routed / 1 shared / 8 selected per token |
+| Configured Dtype | `bfloat16` |
 
 ### Configuration
 
@@ -38,16 +49,7 @@ Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node 
 | Features | Activation checkpointing (activation_checkpointing=true), LoRA, Transformer Engine, DeepEP (dispatcher=deepep) |
 | Advanced | attention=te, linear=te, experts=gmm, dispatcher=deepep |
 
-## Model Reference
-
-### Model Architecture
-
-| Property | Value |
-| --- | --- |
-| Task | Text generation |
-| Architecture | `DeepseekV32ForCausalLM` |
-
-### Available Models
+## Available Models
 
 - [`deepseek-ai/DeepSeek-V3.2`](https://huggingface.co/deepseek-ai/DeepSeek-V3.2)
 
@@ -59,3 +61,5 @@ Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node 
 ## Related Resources
 
 - [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/deepseek-ai/DeepSeek-V3.2/blob/a7e62ac04ecb2c0a54d736dc46601c5606cf10a6/config.json)

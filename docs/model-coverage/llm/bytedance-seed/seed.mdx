@@ -1,5 +1,5 @@
 ---
-title: "Seed-Coder-8B-Instruct"
+title: "ByteDance-Seed/Seed-Coder-8B-Instruct"
 description: "Use Seed-Coder-8B-Instruct with NeMo AutoModel for language model fine-tuning, with documented checkpoints, runnable recipes, setup guidance, and model reference details."
 slug: model-coverage/large-language-models/bytedance-seed/Seed-Coder-8B-Instruct
 ---
@@ -9,8 +9,6 @@ slug: model-coverage/large-language-models/bytedance-seed/Seed-Coder-8B-Instruct
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
 ## Quick Start
-
-### Fine-Tune Seed-Coder-8B-Instruct
 
 From the repository root, run:
 
@@ -27,20 +25,22 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/seed/seed_coder_8b_ins
 
 ## Model Context
 
-## Model Reference
-
-### Model Architecture
-
 | Property | Value |
 | --- | --- |
 | Task | Text Generation |
 | Architecture | `Qwen2ForCausalLM` |
 | Parameters | 8B |
 | Hugging Face Organization | [ByteDance-Seed](https://huggingface.co/ByteDance-Seed) |
+| Decoder Layers | 32 |
+| Hidden Size | 4,096 |
+| Attention | 32 attention heads / 8 key-value heads |
+| Context Length | 32,768 tokens (checkpoint configuration) |
+| Vocabulary Size | 155,136 |
+| Configured Dtype | `bfloat16` |
 
 - `Qwen2ForCausalLM` (reuses Qwen2 architecture)
 
-### Available Models
+## Available Models
 
 | Model | HF ID |
 |---|---|
@@ -49,3 +49,5 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/seed/seed_coder_8b_ins
 ## Related Resources
 
 - [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/ByteDance-Seed/Seed-Coder-8B-Instruct/blob/1c5af72afa21c22c9272a0b60a3a404195e88fcd/config.json)

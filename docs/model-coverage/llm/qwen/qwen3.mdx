@@ -1,5 +1,5 @@
 ---
-title: "Qwen3-0.6B"
+title: "Qwen/Qwen3-0.6B"
 description: "Use Qwen3-0.6B with NeMo AutoModel for language model fine-tuning, with documented checkpoints, runnable recipes, setup guidance, and model reference details."
 slug: model-coverage/large-language-models/qwen/Qwen3-0.6B
 ---
@@ -9,8 +9,6 @@ slug: model-coverage/large-language-models/qwen/Qwen3-0.6B
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
 ## Quick Start
-
-### Fine-Tune Qwen3-0.6B
 
 From the repository root, run:
 
@@ -26,18 +24,20 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/qwen/qwen3_0p6b_hellas
 
 ## Model Context
 
-## Model Reference
-
-### Model Architecture
-
 | Property | Value |
 | --- | --- |
 | Task | Text Generation |
 | Architecture | `Qwen3ForCausalLM` |
 | Parameters | 0.6B |
 | Hugging Face Organization | [Qwen](https://huggingface.co/Qwen) |
+| Decoder Layers | 28 |
+| Hidden Size | 1,024 |
+| Attention | 16 attention heads / 8 key-value heads |
+| Context Length | 40,960 tokens (checkpoint configuration) |
+| Vocabulary Size | 151,936 |
+| Configured Dtype | `bfloat16` |
 
-### Available Models
+## Available Models
 
 | Model | HF ID |
 |---|---|
@@ -46,3 +46,5 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/qwen/qwen3_0p6b_hellas
 ## Related Resources
 
 - [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/Qwen/Qwen3-0.6B/blob/c1899de289a04d12100db370d81485cdf75e47ca/config.json)

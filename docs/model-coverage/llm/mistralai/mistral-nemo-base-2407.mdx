@@ -1,5 +1,5 @@
 ---
-title: "Mistral-Nemo-Base-2407"
+title: "mistralai/Mistral-Nemo-Base-2407"
 description: "Use NeMo AutoModel to fine-tune Mistral-Nemo-Base-2407 for LLM workflows with checked-in text generation recipes and documented distributed settings."
 slug: model-coverage/large-language-models/mistralai/Mistral-Nemo-Base-2407
 ---
@@ -8,8 +8,6 @@ slug: model-coverage/large-language-models/mistralai/Mistral-Nemo-Base-2407
 The Hugging Face configuration declares the `MistralForCausalLM` architecture.
 
 ## Quick Start
-
-### Fine-Tune Mistral-Nemo-Base-2407
 
 Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
 
@@ -26,6 +24,18 @@ automodel examples/llm_finetune/mistral/mistral_nemo_2407_squad.yaml --nproc-per
 
 ## Model Context
 
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| Architecture | `MistralForCausalLM` |
+| Parameters | 12.25B checkpoint parameters |
+| Decoder Layers | 40 |
+| Hidden Size | 5,120 |
+| Attention | 32 attention heads / 8 key-value heads |
+| Context Length | 131,072 tokens (checkpoint configuration) |
+| Vocabulary Size | 131,072 |
+| Configured Dtype | `bfloat16` |
+
 ### Configuration
 
 | Setting | Configuration |
@@ -41,16 +51,7 @@ automodel examples/llm_finetune/mistral/mistral_nemo_2407_squad.yaml --nproc-per
 - [`mistral_nemo_2407_hellaswag_fp8.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mistral/mistral_nemo_2407_hellaswag_fp8.yaml)
 - [`mistral_nemo_2407_squad_peft.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mistral/mistral_nemo_2407_squad_peft.yaml)
 
-## Model Reference
-
-### Model Architecture
-
-| Property | Value |
-| --- | --- |
-| Task | Text generation |
-| Architecture | `MistralForCausalLM` |
-
-### Available Models
+## Available Models
 
 - [`mistralai/Mistral-Nemo-Base-2407`](https://huggingface.co/mistralai/Mistral-Nemo-Base-2407)
 
@@ -62,3 +63,5 @@ automodel examples/llm_finetune/mistral/mistral_nemo_2407_squad.yaml --nproc-per
 ## Related Resources
 
 - [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/mistralai/Mistral-Nemo-Base-2407/blob/a4477a2f977929a969745b69bbd62e03043551a5/config.json)

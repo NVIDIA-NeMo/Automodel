@@ -1,5 +1,5 @@
 ---
-title: "Qwen3-VL-30B-A3B-Instruct"
+title: "Qwen/Qwen3-VL-30B-A3B-Instruct"
 description: "Use NeMo AutoModel to fine-tune Qwen3-VL-30B-A3B-Instruct for VLM workflows with checked-in image-text-to-text recipes and documented distributed settings."
 slug: model-coverage/vision-language-models/qwen/Qwen3-VL-30B-A3B-Instruct
 ---
@@ -8,8 +8,6 @@ slug: model-coverage/vision-language-models/qwen/Qwen3-VL-30B-A3B-Instruct
 The Hugging Face configuration declares the `Qwen3VLMoeForConditionalGeneration` architecture.
 
 ## Quick Start
-
-### Fine-Tune Qwen3-VL-30B-A3B-Instruct
 
 Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
 
@@ -26,6 +24,18 @@ automodel examples/vlm_finetune/qwen3/qwen3_vl_moe_30b_te_deepep.yaml --nproc-pe
 
 ## Model Context
 
+| Property | Value |
+| --- | --- |
+| Task | Image-text-to-text |
+| Architecture | `Qwen3VLMoeForConditionalGeneration` |
+| Parameters | 31.07B checkpoint parameters |
+| Decoder Layers | 48 |
+| Hidden Size | 2,048 |
+| Attention | 32 attention heads / 4 key-value heads |
+| Context Length | 262,144 tokens (checkpoint configuration) |
+| Vocabulary Size | 151,936 |
+| Experts | 128 routed / 8 selected per token |
+
 ### Configuration
 
 | Setting | Configuration |
@@ -40,16 +50,7 @@ automodel examples/vlm_finetune/qwen3/qwen3_vl_moe_30b_te_deepep.yaml --nproc-pe
 
 - [`qwen3_vl_moe_30b_neat_packing.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3/qwen3_vl_moe_30b_neat_packing.yaml)
 
-## Model Reference
-
-### Model Architecture
-
-| Property | Value |
-| --- | --- |
-| Task | Image-text-to-text |
-| Architecture | `Qwen3VLMoeForConditionalGeneration` |
-
-### Available Models
+## Available Models
 
 - [`Qwen/Qwen3-VL-30B-A3B-Instruct`](https://huggingface.co/Qwen/Qwen3-VL-30B-A3B-Instruct)
 
@@ -61,3 +62,5 @@ automodel examples/vlm_finetune/qwen3/qwen3_vl_moe_30b_te_deepep.yaml --nproc-pe
 ## Related Resources
 
 - [Vision-language model fine-tuning guide](/recipes-e2e-examples/gemma-3-3n)
+
+- [Checkpoint Configuration](https://huggingface.co/Qwen/Qwen3-VL-30B-A3B-Instruct/blob/9c4b90e1e4ba969fd3b5378b57d966d725f1b86c/config.json)

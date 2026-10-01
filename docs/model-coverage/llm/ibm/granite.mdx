@@ -1,6 +1,6 @@
 ---
-title: "granite-3.0-2b-base"
-description: "Reference granite-3.0-2b-base checkpoint and architecture details for NeMo AutoModel, with model-family information, setup guidance, and upstream resources."
+title: "ibm-granite/granite-3.0-2b-base"
+description: "Fine-tune ibm-granite/granite-3.0-2b-base with NeMo AutoModel using a checked-in LoRA recipe, with checkpoint and architecture details."
 slug: model-coverage/large-language-models/ibm/granite-3.0-2b-base
 ---
 
@@ -10,22 +10,19 @@ Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com
 
 ## Quick Start
 
-This page provides checkpoint and architecture reference information rather
-than a model-specific launch command. Follow the
-[installation instructions](/get-started/installation) to set up NeMo AutoModel.
+Follow the [installation instructions](/get-started/installation). From the repository root, use 8 GPUs. This is an example configuration; GPU training and memory use still require validation.
+
+```bash
+uv run automodel examples/llm_finetune/ibm_granite/granite_3_0_2b_base_squad_peft.yaml --nproc-per-node 8
+```
 
 ## Choose a Workflow
 
 | Goal | Start Here |
 | --- | --- |
-| Explore checkpoints | See [Available Models](#available-models). |
-| Configure NeMo AutoModel | Follow the [installation instructions](/get-started/installation). |
+| Fine-tune ibm-granite/granite-3.0-2b-base | [granite_3_0_2b_base_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/ibm_granite/granite_3_0_2b_base_squad_peft.yaml). Example LoRA configuration; validate GPU training. |
 
 ## Model Context
-
-## Model Reference
-
-### Model Architecture
 
 | Property | Value |
 | --- | --- |
@@ -33,8 +30,17 @@ than a model-specific launch command. Follow the
 | Architecture | `GraniteForCausalLM` |
 | Parameters | 2B |
 | Hugging Face Organization | [ibm-granite](https://huggingface.co/ibm-granite) |
+| Decoder Layers | 40 |
+| Hidden Size | 2,048 |
+| Attention | 32 attention heads / 8 key-value heads |
+| Context Length | 4,096 tokens (checkpoint configuration) |
+| Vocabulary Size | 49,152 |
 
-### Available Models
+### Recipe Setup
+
+Read [granite_3_0_2b_base_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/ibm_granite/granite_3_0_2b_base_squad_peft.yaml) for checkpoint access, data paths, and backend dependencies. It provides a small LoRA fine-tuning example.
+
+## Available Models
 
 | Model | HF ID |
 |---|---|
@@ -43,3 +49,5 @@ than a model-specific launch command. Follow the
 ## Related Resources
 
 - [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/ibm-granite/granite-3.0-2b-base/blob/a8462c21f5e1f27be4536dc36d6cc789da23fbd6/config.json)

@@ -1,5 +1,5 @@
 ---
-title: "LLaDA-8B-Base"
+title: "GSAI-ML/LLaDA-8B-Base"
 description: "Fine-tune LLaDA-8B-Base as a diffusion language model with NeMo AutoModel using checked-in full-parameter and LoRA recipes."
 slug: model-coverage/dllm/gsai-ml/LLaDA-8B-Base
 ---
@@ -7,8 +7,6 @@ slug: model-coverage/dllm/gsai-ml/LLaDA-8B-Base
 [LLaDA](https://huggingface.co/GSAI-ML/LLaDA-8B-Base) is a diffusion language model that generates text through iterative masked-token denoising.
 
 ## Quick Start
-
-### Fine-Tune LLaDA-8B-Base
 
 From the repository root, run:
 
@@ -25,22 +23,23 @@ uv run automodel --nproc-per-node=8 examples/dllm_sft/llada_sft.yaml
 
 ## Model Context
 
-### Recipe Notes
-
-See the [dLLM Fine-Tuning Guide](/recipes-e2e-examples/dllm-fine-tuning).
-
-## Model Reference
-
-### Model Architecture
-
 | Property | Value |
 |---|---|
 | **Task** | Diffusion Language Modeling |
 | **Architecture** | `LLaDAModelLM` with Hugging Face `trust_remote_code` |
 | **Parameters** | 8B |
 | **HF Org** | [GSAI-ML](https://huggingface.co/GSAI-ML) |
+| Decoder Layers | 32 |
+| Hidden Size | 4,096 |
+| Attention | 32 attention heads |
+| Context Length | 4,096 tokens (checkpoint configuration) |
+| Vocabulary Size | 126,464 |
 
-### Available Models
+### Recipe Notes
+
+See the [dLLM Fine-Tuning Guide](/recipes-e2e-examples/dllm-fine-tuning).
+
+## Available Models
 
 | Checkpoint | Type |
 | --- | --- |
@@ -49,3 +48,5 @@ See the [dLLM Fine-Tuning Guide](/recipes-e2e-examples/dllm-fine-tuning).
 ## Related Resources
 
 - [Installation Instructions](/get-started/installation)
+
+- [Checkpoint Configuration](https://huggingface.co/GSAI-ML/LLaDA-8B-Base/blob/0f2787f2d87eac5eed8a087d5ecd24277e6255b2/config.json)

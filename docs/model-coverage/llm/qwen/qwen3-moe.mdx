@@ -1,5 +1,5 @@
 ---
-title: "Qwen3-30B-A3B"
+title: "Qwen/Qwen3-30B-A3B"
 description: "Use Qwen3-30B-A3B with NeMo AutoModel for language model fine-tuning, with documented checkpoints, runnable recipes, setup guidance, and model reference details."
 slug: model-coverage/large-language-models/qwen/Qwen3-30B-A3B
 ---
@@ -9,8 +9,6 @@ slug: model-coverage/large-language-models/qwen/Qwen3-30B-A3B
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
 ## Quick Start
-
-### Fine-Tune Qwen3-30B-A3B
 
 From the repository root, run:
 
@@ -27,18 +25,21 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/qwen/qwen3_moe_30b_te_
 
 ## Model Context
 
-## Model Reference
-
-### Model Architecture
-
 | Property | Value |
 | --- | --- |
 | Task | Text Generation (MoE) |
 | Architecture | `Qwen3MoeForCausalLM` |
 | Parameters | 30B total / 3B active |
 | Hugging Face Organization | [Qwen](https://huggingface.co/Qwen) |
+| Decoder Layers | 48 |
+| Hidden Size | 2,048 |
+| Attention | 32 attention heads / 4 key-value heads |
+| Context Length | 40,960 tokens (checkpoint configuration) |
+| Vocabulary Size | 151,936 |
+| Experts | 128 routed / 8 selected per token |
+| Configured Dtype | `bfloat16` |
 
-### Available Models
+## Available Models
 
 | Model | HF ID |
 |---|---|
@@ -48,3 +49,5 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/qwen/qwen3_moe_30b_te_
 
 - [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
 - [Large MoE Fine-Tuning Guide](/recipes-e2e-examples/large-moe-fine-tuning)
+
+- [Checkpoint Configuration](https://huggingface.co/Qwen/Qwen3-30B-A3B/blob/ad44e777bcd18fa416d9da3bd8f70d33ebb85d39/config.json)

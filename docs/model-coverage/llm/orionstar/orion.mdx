@@ -1,33 +1,30 @@
 ---
-title: "Orion-14B-Base"
-description: "Reference Orion-14B-Base checkpoint and architecture details for NeMo AutoModel, with model-family information, setup guidance, and upstream resources."
+title: "OrionStarAI/Orion-14B-Base"
+description: "Fine-tune OrionStarAI/Orion-14B-Base with NeMo AutoModel using a checked-in LoRA recipe, with checkpoint and architecture details."
 slug: model-coverage/large-language-models/orionstar/Orion-14B-Base
 ---
 
 [Orion](https://github.com/OrionStarAI/Orion) is a bilingual (Chinese-English) language model from OrionStar AI, with 14B parameters and strong performance on Chinese benchmarks.
 
-Use this page as a checkpoint and architecture reference. Set up NeMo AutoModel with the
+Set up NeMo AutoModel with the
 [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the
 [installation instructions](/get-started/installation).
 
 ## Quick Start
 
-This page provides checkpoint and architecture reference information rather
-than a model-specific launch command. Follow the
-[installation instructions](/get-started/installation) to set up NeMo AutoModel.
+Follow the [installation instructions](/get-started/installation). From the repository root, use 8 GPUs. This is an example configuration; GPU training and memory use still require validation.
+
+```bash
+uv run automodel examples/llm_finetune/orionstarai/orion_14b_base_squad_peft.yaml --nproc-per-node 8
+```
 
 ## Choose a Workflow
 
 | Goal | Start Here |
 | --- | --- |
-| Explore checkpoints | See [Available Models](#available-models). |
-| Configure NeMo AutoModel | Follow the [installation instructions](/get-started/installation). |
+| Fine-tune OrionStarAI/Orion-14B-Base | [orion_14b_base_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/orionstarai/orion_14b_base_squad_peft.yaml). Example LoRA configuration; validate GPU training. |
 
 ## Model Context
-
-## Model Reference
-
-### Model Architecture
 
 | Property | Value |
 | --- | --- |
@@ -35,8 +32,18 @@ than a model-specific launch command. Follow the
 | Architecture | `OrionForCausalLM` |
 | Parameters | 14B |
 | Hugging Face Organization | [OrionStarAI](https://huggingface.co/OrionStarAI) |
+| Decoder Layers | 40 |
+| Hidden Size | 5,120 |
+| Attention | 40 attention heads / 40 key-value heads |
+| Context Length | 4,096 tokens (checkpoint configuration) |
+| Vocabulary Size | 84,608 |
+| Configured Dtype | `bfloat16` |
 
-### Available Models
+### Recipe Setup
+
+Read [orion_14b_base_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/orionstarai/orion_14b_base_squad_peft.yaml) for checkpoint access, data paths, and backend dependencies. It provides a small LoRA fine-tuning example.
+
+## Available Models
 
 | Model | HF ID |
 |---|---|
@@ -46,3 +53,5 @@ than a model-specific launch command. Follow the
 ## Related Resources
 
 - [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/OrionStarAI/Orion-14B-Base/blob/b988a511e9c880a465e704c57e3f297a3e7ef282/config.json)

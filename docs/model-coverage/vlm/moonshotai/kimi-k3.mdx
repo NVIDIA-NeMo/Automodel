@@ -1,5 +1,5 @@
 ---
-title: "Kimi-K3"
+title: "moonshotai/Kimi-K3"
 description: "Use Kimi-K3 with NeMo AutoModel for vision-language fine-tuning, with documented checkpoints, runnable recipes, setup guidance, and model reference details."
 slug: model-coverage/vision-language-models/moonshotai/Kimi-K3
 ---
@@ -10,12 +10,12 @@ Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com
 
 ## Quick Start
 
-### Fine-Tune Kimi-K3
-
-From the repository root, run:
+Allocate 64 nodes with 8 GPUs each. Set `NODE_RANK` and `MASTER_ADDR` on every node; complete the recipe prerequisites in Model Context before launching.
 
 ```bash
-uv run automodel --nproc-per-node=8 examples/llm_finetune/kimi/k3_hellaswag.yaml
+uv run torchrun --nnodes 64 --nproc-per-node 8 \
+  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
+  -m nemo_automodel.cli.app examples/llm_finetune/kimi/k3_hellaswag.yaml
 ```
 
 ## Choose a Workflow
@@ -26,20 +26,25 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/kimi/k3_hellaswag.yaml
 
 ## Model Context
 
-## Model Reference
-
-### Model Architecture
-
 | Property | Value |
 | --- | --- |
 | Task | Image-Text-to-Text / Text Generation |
 | Architectures | `KimiK3ForConditionalGeneration`, `KimiK3ForCausalLM` |
 | Hugging Face Organization | [moonshotai](https://huggingface.co/moonshotai) |
+| Architecture | `KimiK3ForConditionalGeneration` |
+| Parameters | 2.8T total / 104B activated (language path) |
+| Decoder Layers | 93 |
+| Hidden Size | 7,168 |
+| Attention | 96 attention heads / 96 key-value heads |
+| Context Length | 1,048,576 tokens (checkpoint configuration) |
+| Vocabulary Size | 163,840 |
+| Experts | 896 routed / 2 shared / 16 selected per token |
+| Configured Dtype | `bfloat16` |
 
 - `KimiK3ForConditionalGeneration` combines the MoonViT3d vision tower and multimodal projector with the Kimi Linear language backbone.
 - `KimiK3ForCausalLM` exposes the text-only Kimi Linear backbone.
 
-### Available Models
+## Available Models
 
 | Model | HF ID |
 |---|---|
@@ -49,3 +54,5 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/kimi/k3_hellaswag.yaml
 
 - [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
 - [VLM Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n)
+
+- [Checkpoint Configuration](https://huggingface.co/moonshotai/Kimi-K3/blob/f831ab66814297da540d832a5235f8e904f29d06/config.json)

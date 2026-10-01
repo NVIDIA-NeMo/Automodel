@@ -1,5 +1,5 @@
 ---
-title: "Devstral-Small-2-24B-Instruct-2512"
+title: "mistralai/Devstral-Small-2-24B-Instruct-2512"
 description: "Use NeMo AutoModel to fine-tune Devstral-Small-2-24B-Instruct-2512 for LLM workflows with checked-in text generation recipes and documented distributed settings."
 slug: model-coverage/large-language-models/mistralai/Devstral-Small-2-24B-Instruct-2512
 ---
@@ -8,8 +8,6 @@ slug: model-coverage/large-language-models/mistralai/Devstral-Small-2-24B-Instru
 The Hugging Face configuration declares the `Mistral3ForConditionalGeneration` architecture.
 
 ## Quick Start
-
-### Fine-Tune Devstral-Small-2-24B-Instruct-2512
 
 Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
 
@@ -26,6 +24,18 @@ automodel examples/llm_finetune/devstral/devstral2_small_2512_squad.yaml --nproc
 
 ## Model Context
 
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| Architecture | `Mistral3ForConditionalGeneration` |
+| Parameters | 24.01B checkpoint parameters |
+| Decoder Layers | 40 |
+| Hidden Size | 5,120 |
+| Attention | 32 attention heads / 8 key-value heads |
+| Context Length | 393,216 tokens (checkpoint configuration) |
+| Vocabulary Size | 131,072 |
+| Configured Dtype | `bfloat16` |
+
 ### Configuration
 
 | Setting | Configuration |
@@ -40,16 +50,7 @@ automodel examples/llm_finetune/devstral/devstral2_small_2512_squad.yaml --nproc
 
 - [`devstral2_small_2512_squad_peft.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/devstral/devstral2_small_2512_squad_peft.yaml)
 
-## Model Reference
-
-### Model Architecture
-
-| Property | Value |
-| --- | --- |
-| Task | Text generation |
-| Architecture | `Mistral3ForConditionalGeneration` |
-
-### Available Models
+## Available Models
 
 - [`mistralai/Devstral-Small-2-24B-Instruct-2512`](https://huggingface.co/mistralai/Devstral-Small-2-24B-Instruct-2512)
 
@@ -61,3 +62,5 @@ automodel examples/llm_finetune/devstral/devstral2_small_2512_squad.yaml --nproc
 ## Related Resources
 
 - [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/mistralai/Devstral-Small-2-24B-Instruct-2512/blob/55c5b41e98c2dbd21b0c8afffc540dcfc9eb5128/config.json)

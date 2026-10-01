@@ -1,5 +1,5 @@
 ---
-title: "gemma-4-31B-it"
+title: "google/gemma-4-31B-it"
 description: "Fine-tune gemma-4-31B-it for image-text tasks with NeMo AutoModel using checked-in full-parameter, LoRA, tensor-parallel, and pipeline-parallel recipes."
 slug: model-coverage/vision-language-models/google/gemma-4-31B-it
 ---
@@ -9,8 +9,6 @@ slug: model-coverage/vision-language-models/google/gemma-4-31B-it
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
 ## Quick Start
-
-### Fine-Tune gemma-4-31B-it
 
 From the repository root, run the 8-GPU recipe:
 
@@ -29,17 +27,20 @@ uv run automodel examples/vlm_finetune/gemma4/gemma4_31b.yaml --nproc-per-node 8
 
 ## Model Context
 
-## Model Reference
-
-### Model Architecture
-
 | Property | Value |
 | --- | --- |
 | Task | Image-text-to-text |
 | Hugging Face Architecture | `Gemma4ForConditionalGeneration` |
 | Checkpoint | [`google/gemma-4-31B-it`](https://huggingface.co/google/gemma-4-31B-it) |
+| Parameters | 31.27B checkpoint parameters |
+| Decoder Layers | 60 |
+| Hidden Size | 5,376 |
+| Attention | 32 attention heads; 16 key-value heads in sliding layers / 4 in global layers |
+| Context Length | 262,144 tokens (checkpoint configuration) |
+| Vocabulary Size | 262,144 |
+| Configured Dtype | `bfloat16` |
 
-### Available Models
+## Available Models
 
 | Checkpoint | Type |
 | --- | --- |
@@ -49,3 +50,5 @@ uv run automodel examples/vlm_finetune/gemma4/gemma4_31b.yaml --nproc-per-node 8
 ## Related Resources
 
 - [Gemma 4 Fine-Tuning Guide](/recipes-e2e-examples/gemma-4)
+
+- [Checkpoint Configuration](https://huggingface.co/google/gemma-4-31B-it/blob/842da3794eaa0b77d5f08bae87a17459d91ff475/config.json)

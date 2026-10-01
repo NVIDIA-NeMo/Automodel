@@ -1,5 +1,5 @@
 ---
-title: "Qwen3.6-27B"
+title: "Qwen/Qwen3.6-27B"
 description: "Fine-tune Qwen3.6-27B for vision-language tasks with NeMo AutoModel using checked-in full-parameter and LoRA recipes with distributed settings."
 slug: model-coverage/vision-language-models/qwen/Qwen3.6-27B
 ---
@@ -8,13 +8,11 @@ Qwen3.6 is Alibaba Cloud's unified vision-language model generation following Qw
 
 ## Quick Start
 
-### Fine-Tune Qwen3.6-27B
+Install the `vlm-media` extra before running these recipes. See the [Installation Guide](/get-started/installation) and [VLM Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n).
 
 ```bash
 uv run automodel --nproc-per-node=8 examples/vlm_finetune/qwen3_5/qwen3_6_27b.yaml
 ```
-
-Install the `vlm-media` extra before running these recipes. See the [Installation Guide](/get-started/installation) and [VLM Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n).
 
 ## Choose a Workflow
 
@@ -27,18 +25,19 @@ Install the `vlm-media` extra before running these recipes. See the [Installatio
 
 ## Model Context
 
-## Model Reference
-
-### Model Architecture
-
 | Property | Value |
 |---|---|
 | **Task** | Image-Text-to-Text |
 | **Architecture** | `Qwen3_5ForConditionalGeneration`, `Qwen3_5MoeForConditionalGeneration` |
 | **Parameters** | 27B dense; 35B total / 3B active MoE |
 | **HF Org** | [Qwen](https://huggingface.co/Qwen) |
+| Decoder Layers | 64 |
+| Hidden Size | 5,120 |
+| Attention | 24 attention heads / 4 key-value heads |
+| Context Length | 262,144 tokens (checkpoint configuration) |
+| Vocabulary Size | 248,320 |
 
-### Available Models
+## Available Models
 
 | Checkpoint | Type |
 | --- | --- |
@@ -48,3 +47,5 @@ Install the `vlm-media` extra before running these recipes. See the [Installatio
 ## Related Resources
 
 - [Installation Instructions](/get-started/installation)
+
+- [Checkpoint Configuration](https://huggingface.co/Qwen/Qwen3.6-27B/blob/6a9e13bd6fc8f0983b9b99948120bc37f49c13e9/config.json)

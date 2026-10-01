@@ -1,5 +1,5 @@
 ---
-title: "NVIDIA-Nemotron-3-Nano-4B-BF16"
+title: "nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16"
 description: "Use NVIDIA-Nemotron-3-Nano-4B-BF16 with NeMo AutoModel for language model fine-tuning, with documented checkpoints, runnable recipes, setup, and model reference details."
 slug: model-coverage/large-language-models/nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16
 ---
@@ -9,8 +9,6 @@ slug: model-coverage/large-language-models/nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
 ## Quick Start
-
-### Fine-Tune NVIDIA-Nemotron-3-Nano-4B-BF16
 
 From the repository root, run:
 
@@ -28,18 +26,20 @@ uv run automodel examples/llm_finetune/nemotron/nemotron_nano_4b_squad.yaml \
 
 ## Model Context
 
-## Model Reference
-
-### Model Architecture
-
 | Property | Value |
 | --- | --- |
 | Task | Text Generation |
 | Architecture | `NemotronHForCausalLM` |
 | Parameters | 4B |
 | Hugging Face Organization | [nvidia](https://huggingface.co/nvidia) |
+| Decoder Layers | 42 |
+| Hidden Size | 3,136 |
+| Attention | 40 attention heads / 8 key-value heads |
+| Context Length | 262,144 tokens (checkpoint configuration) |
+| Vocabulary Size | 131,072 |
+| Configured Dtype | `bfloat16` |
 
-### Available Models
+## Available Models
 
 | Model | HF ID |
 |---|---|
@@ -48,3 +48,5 @@ uv run automodel examples/llm_finetune/nemotron/nemotron_nano_4b_squad.yaml \
 ## Related Resources
 
 - [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16/blob/dfaf35de3e30f1867dd8dbc38a7fc9fb52d3914f/config.json)

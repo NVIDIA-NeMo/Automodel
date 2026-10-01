@@ -1,26 +1,19 @@
 ---
-title: "DeepSeek-V4-Flash"
+title: "deepseek-ai/DeepSeek-V4-Flash"
 description: "Use DeepSeek-V4-Flash with NeMo AutoModel for language model fine-tuning, with documented checkpoints, runnable recipes, setup guidance, and model reference details."
 slug: model-coverage/large-language-models/deepseek-ai/DeepSeek-V4-Flash
 ---
 
 [DeepSeek-V4 Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash) is DeepSeek's latest fine-grained Mixture-of-Experts language model. It uses a 43-layer all-MoE backbone with 256 routed experts plus one shared expert per block, top-6 routing, and a hybrid per-layer attention zoo (SWA / CSA / HCA) selectable through `compress_ratios`. The first `num_hash_layers` blocks use a hash-clustering gate, and every block maintains `hc_mult=4` Hyper-Connection streams mixed via a learned col-norm-first Sinkhorn router.
 
-Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
-
 ## Quick Start
 
-### Fine-Tune DeepSeek-V4-Flash
-
-<Note>
-The full 43-layer schedule requires a multi-node run; see the recipe yaml header for `ep_size` / `pp_size` guidance. See the [Launcher Guide](/job-launchers/slurm-cluster) for multi-node setup.
-
-</Note>
-
-From the repository root, run:
+Allocate 16 nodes with 8 GPUs each. Set `NODE_RANK` and `MASTER_ADDR` on every node; complete the recipe prerequisites in Model Context before launching.
 
 ```bash
-uv run automodel --nproc-per-node=8 examples/llm_finetune/deepseek_v4/deepseek_v4_flash_hellaswag.yaml
+uv run torchrun --nnodes 16 --nproc-per-node 8 \
+  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
+  -m nemo_automodel.cli.app examples/llm_finetune/deepseek_v4/deepseek_v4_flash_hellaswag.yaml
 ```
 
 ## Choose a Workflow
@@ -31,18 +24,25 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/deepseek_v4/deepseek_v
 
 ## Model Context
 
-## Model Reference
-
-### Model Architecture
-
 | Property | Value |
 | --- | --- |
 | Task | Text Generation (MoE) |
 | Architecture | `DeepseekV4ForCausalLM` |
 | Experts | fine-grained MoE, 256 routed + 1 shared expert |
 | Hugging Face Organization | [deepseek-ai](https://huggingface.co/deepseek-ai) |
+| Decoder Layers | 43 |
+| Hidden Size | 4,096 |
+| Attention | 64 attention heads / 1 key-value heads |
+| Context Length | 1,048,576 tokens (checkpoint configuration) |
+| Vocabulary Size | 129,280 |
+| Configured Dtype | `bfloat16` |
+| Parameters | 284.3B language backbone / 290.9B including the auxiliary MTP module |
 
-### Available Models
+### Model Overview
+
+Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
+
+## Available Models
 
 | Model | HF ID |
 |---|---|
@@ -53,3 +53,5 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/deepseek_v4/deepseek_v
 - [DeepSeek-V4 Flash Fine-Tuning Guide](/recipes-e2e-examples/deepseek-v4-flash)
 - [Large MoE Fine-Tuning Guide](/recipes-e2e-examples/large-moe-fine-tuning)
 - [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/config.json)
