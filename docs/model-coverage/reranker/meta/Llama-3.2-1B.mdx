@@ -36,7 +36,7 @@ uv run automodel examples/retrieval/cross_encoder/llama3_2_1b.yaml --nproc-per-n
 
 ### Recipe Setup
 
-The checked-in configuration uses FSDP2 with tensor and context parallel sizes of one. It selects `meta-llama/Llama-3.2-1B` directly for cross-encoder training. The language-model checkpoint is adapted as a cross-encoder with one output label and average pooling. Prepare the local training data specified in the recipe before launching; it is not the pretrained NVIDIA reranker checkpoint.
+The checked-in configuration uses FSDP2 with tensor and context parallel sizes of one. It selects `meta-llama/Llama-3.2-1B` directly for cross-encoder training. The language-model checkpoint is adapted as a cross-encoder with one output label and average pooling. The recipe reads the Hugging Face dataset locations listed in `dataset.data_dir_list`; ensure access before launching. This workflow trains the language-model checkpoint as a reranker.
 
 Checkpoint dimensions and the rounded tensor count come from the revision-pinned sources below. The checkpoint context limit is separate from the training sequence length configured by the recipe.
 
