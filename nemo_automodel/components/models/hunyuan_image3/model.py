@@ -193,7 +193,9 @@ class HunyuanImage3ForCausalMM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin
         supports_ep: bool = True
 
     @classmethod
-    def from_config(cls, config: Any, moe_config: MoEConfig | None = None, backend: BackendConfig | None = None, **kwargs):
+    def from_config(
+        cls, config: Any, moe_config: MoEConfig | None = None, backend: BackendConfig | None = None, **kwargs
+    ):
         return cls(config, moe_config, backend, **kwargs)
 
     @classmethod
@@ -226,7 +228,10 @@ class HunyuanImage3ForCausalMM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin
             setattr(self, name, module)
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = HunyuanImage3StateDictAdapter(
-                config, self.model.moe_config, self.backend, dtype=get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+                config,
+                self.model.moe_config,
+                self.backend,
+                dtype=get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16),
             )
 
     def get_input_embeddings(self):
@@ -292,16 +297,26 @@ class HunyuanImage3ForCausalMM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin
         if mode == "gen_text":
             x = self.model.embed_tokens(input_ids)
         elif mode == "gen_image":
-            for name, value in (("images", images), ("timestep", timestep), ("image_mask", image_mask),
-                                ("timestep_scatter_index", timestep_scatter_index)):
+            for name, value in (
+                ("images", images),
+                ("timestep", timestep),
+                ("image_mask", image_mask),
+                ("timestep_scatter_index", timestep_scatter_index),
+            ):
                 if value is None:
                     raise ValueError(f"`{name}` is required in gen_image mode")
-            x, token_h, token_w = self.embed_image_inputs(input_ids, images, timestep, image_mask, timestep_scatter_index)
+            x, token_h, token_w = self.embed_image_inputs(
+                input_ids, images, timestep, image_mask, timestep_scatter_index
+            )
         else:
             raise ValueError(f"Unknown mode {mode!r}")
 
         hidden, all_hidden = self.model(
-            x, cos=cos, sin=sin, attention_mask=attention_mask, padding_mask=padding_mask,
+            x,
+            cos=cos,
+            sin=sin,
+            attention_mask=attention_mask,
+            padding_mask=padding_mask,
             output_hidden_states=output_hidden_states,
         )
         hidden_states = tuple(all_hidden) if all_hidden is not None else None
@@ -321,7 +336,9 @@ class HunyuanImage3ForCausalMM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin
                     block.mlp.gate.update_bias()
 
     @torch.no_grad()
-    def initialize_weights(self, buffer_device: torch.device | None = None, dtype: torch.dtype = torch.bfloat16) -> None:
+    def initialize_weights(
+        self, buffer_device: torch.device | None = None, dtype: torch.dtype = torch.bfloat16
+    ) -> None:
         buffer_device = buffer_device or torch.device(f"cuda:{torch.cuda.current_device()}")
         with buffer_device:
             self.model.init_weights(buffer_device)

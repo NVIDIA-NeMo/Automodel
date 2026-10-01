@@ -78,6 +78,7 @@ def build_2d_rope_cos_sin(
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """Rotate the two halves of the last dimension: ``(x1, x2) -> (-x2, x1)``."""
     x1, x2 = x.chunk(2, dim=-1)
     return torch.cat((-x2, x1), dim=-1)
 

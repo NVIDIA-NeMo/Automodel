@@ -25,6 +25,7 @@ from .caption_loaders import (
 from .flux import FluxProcessor
 from .flux2 import Flux2Processor
 from .hunyuan import HunyuanVideoProcessor
+from .hunyuan_image3 import HunyuanImage3Processor
 from .ltx2 import LTX2Processor
 from .qwen_image import QwenImageProcessor
 from .qwen_image_21 import QwenImage21Processor
@@ -48,6 +49,7 @@ __all__ = [
     "WanProcessor",
     "Wan22Processor",
     "HunyuanVideoProcessor",
+    "HunyuanImage3Processor",
     "LTX2Processor",
     # Caption loaders
     "CaptionLoader",

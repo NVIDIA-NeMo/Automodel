@@ -109,6 +109,10 @@ def collate_fn_production(batch: List[Dict]) -> Dict:
             else:
                 output[key] = torch.stack(tensors)
 
+    if "conditioning" in batch[0]:
+        # Per-sample conditioning dicts may have different sequence lengths; keep them as a list.
+        output["conditioning"] = [item["conditioning"] for item in batch]
+
     return output
 
 
@@ -155,6 +159,9 @@ def collate_fn_text_to_image(batch: List[Dict]) -> Dict:
             image_batch["pooled_prompt_embeds"] = production_batch["pooled_prompt_embeds"]
         if "clip_hidden" in production_batch:
             image_batch["clip_hidden"] = production_batch["clip_hidden"]
+    elif "conditioning" in production_batch:
+        # Token-conditioned models (e.g. HunyuanImage-3.0) consume per-sample conditioning in their adapter.
+        image_batch["conditioning"] = production_batch["conditioning"]
     else:
         # Tokenized - need to encode during training (not supported yet)
         image_batch["t5_tokens"] = production_batch["t5_tokens"]

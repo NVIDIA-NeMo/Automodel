@@ -94,5 +94,9 @@ class TextToImageDataset(BaseMultiresolutionDataset):
                 output["pooled_prompt_embeds"] = data["pooled_prompt_embeds"].squeeze(0)
             if "prompt_embeds" in data:
                 output["prompt_embeds"] = data["prompt_embeds"].squeeze(0)
+            # Models that condition on token sequences (instead of text-encoder embeddings) cache them as a
+            # per-sample dict; it is passed through unchanged.
+            if "conditioning" in data:
+                output["conditioning"] = data["conditioning"]
 
         return output
