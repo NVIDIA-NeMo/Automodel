@@ -635,3 +635,31 @@ def test_two_stage_pipeline_forward_parity(monkeypatch):
         actual = model_parts[1](hidden_states, attention_mask=attention_mask, use_cache=False)
 
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+
+
+def test_balanced_inkling_dispatch_retains_learned_gate_gradients():
+    torch.manual_seed(123)
+    cfg = build_tiny_config().text_config
+    cfg.torch_dtype = torch.float32
+    backend = BackendConfig(
+        attn="sdpa",
+        linear="torch",
+        rms_norm="torch",
+        experts="torch",
+        dispatcher="torch",
+        force_balanced_routing=True,
+    )
+    moe = InklingMoE(cfg, backend)
+    moe.init_weights(torch.device("cpu"))
+    dispatched = []
+    handle = moe.experts.register_forward_pre_hook(lambda module, args: dispatched.append(args[3].detach()))
+    try:
+        with torch.compiler.set_stance("force_eager"):
+            output = moe(torch.randn(1, 8, cfg.hidden_size))
+            output.backward(torch.randn_like(output))
+    finally:
+        handle.remove()
+    counts = torch.bincount(dispatched[0].flatten(), minlength=cfg.n_routed_experts)
+    assert (counts == 2).all()
+    assert torch.isfinite(moe.gate.weight.grad).all()
+    assert moe.gate.weight.grad.abs().sum() > 0

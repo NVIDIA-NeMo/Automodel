@@ -98,3 +98,24 @@ def test_kimi_k3_fake_balanced_gate_spreads_tokens_across_experts():
     # number of (token, slot) assignments instead of collapsing onto [0..topk).
     counts = torch.bincount(indices.flatten(), minlength=moe.n_routed_experts)
     assert (counts == counts[0]).all()
+
+
+def test_kimi_k3_balanced_dispatch_retains_learned_gate_gradients():
+    torch.manual_seed(123)
+    moe = _build_moe(_torch_backend(force_balanced_routing=True))
+    with torch.no_grad():
+        for parameter in moe.parameters():
+            parameter.normal_(std=0.1)
+    dispatched = []
+    handle = moe.experts.register_forward_pre_hook(lambda module, args: dispatched.append(args[3].detach()))
+    try:
+        with torch.compiler.set_stance("force_eager"):
+            output = moe(torch.randn(1, 8, moe.dim))
+            output.backward(torch.randn_like(output))
+    finally:
+        handle.remove()
+    counts = torch.bincount(dispatched[0].flatten(), minlength=moe.n_routed_experts)
+    assert (counts == 4).all()
+    assert isinstance(moe.gate, KimiK3Gate)
+    assert torch.isfinite(moe.gate.weight.grad).all()
+    assert moe.gate.weight.grad.abs().sum() > 0

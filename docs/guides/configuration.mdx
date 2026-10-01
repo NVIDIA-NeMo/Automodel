@@ -332,3 +332,35 @@ sbatch my_cluster.sub
 ```
 
 All cluster-specific configuration, including SBATCH directives, the container image, mounts, secrets, and environment variables, resides in your `sbatch` script. See [Run on a Cluster](/job-launchers/slurm-cluster) for complete examples.
+
+## Benchmark Balanced MoE Routing
+
+To measure the effect of token imbalance while retaining learned router computation,
+set these fields in an existing MoE recipe's `model` configuration:
+
+```yaml
+model:
+  backend:
+    force_balanced_routing: true
+    fake_balanced_gate: false
+    fake_gate_noise: 0.0
+```
+
+`force_balanced_routing` executes the model's learned gate, including its projection,
+scoring, and expert selection, then replaces only the expert indices with cyclic
+assignments. Learned routing weights and their backward graph remain intact. For
+`tokens * activated_experts` assignments on each rank, expert counts differ by at
+most one and are exactly equal when the assignment count is divisible by the
+number of experts. Each token selects distinct experts. Assignment counts include
+padding rows; dispatchers that exclude padding may have uneven valid-token counts.
+
+This is a performance benchmark mode, not a training-quality setting: learned
+weights are applied to synthetic expert assignments. Auxiliary losses, bias updates,
+and router load diagnostics still reflect the original learned selection. It
+introduces a small amount of index-generation work after the learned gate.
+
+`fake_balanced_gate: true` instead replaces the gate entirely, omitting learned
+router forward and backward computation. Use that option when intentionally
+measuring performance without learned router work. The two options are mutually
+exclusive. `force_balanced_routing` requires zero `fake_gate_noise` and does not
+support `benchmark_static_routing`, which remains restricted to the fake gate.

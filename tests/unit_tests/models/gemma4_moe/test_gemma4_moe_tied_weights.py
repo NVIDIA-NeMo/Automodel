@@ -154,3 +154,27 @@ def test_top_level_flag_controls_tie_when_flags_disagree():
     # top-level False is the controlling flag -> untie is rejected even when text_config is True
     with pytest.raises(NotImplementedError, match="does not support tie_word_embeddings=False"):
         _build(tie_word_embeddings=False, text_tie=True)
+
+
+def test_balanced_gemma4_dispatch_retains_learned_gate_gradients():
+    torch.manual_seed(123)
+    cfg = _make_text_config(torch_dtype="float32")
+    backend = _make_cpu_backend()
+    backend.force_balanced_routing = True
+    model = Gemma4MoETextModelBackend(cfg, backend)
+    moe = model.layers["0"].moe
+    with torch.no_grad():
+        for parameter in moe.parameters():
+            parameter.normal_(std=0.1)
+    dispatched = []
+    handle = moe.experts.register_forward_pre_hook(lambda module, args: dispatched.append(args[3].detach()))
+    try:
+        with torch.compiler.set_stance("force_eager"):
+            output = moe(torch.randn(1, 8, cfg.hidden_size), gate_input=torch.randn(1, 8, cfg.hidden_size))
+            output.backward(torch.randn_like(output))
+    finally:
+        handle.remove()
+    counts = torch.bincount(dispatched[0].flatten(), minlength=cfg.num_experts)
+    assert (counts == 4).all()
+    assert torch.isfinite(moe.gate.proj.weight.grad).all()
+    assert moe.gate.proj.weight.grad.abs().sum() > 0

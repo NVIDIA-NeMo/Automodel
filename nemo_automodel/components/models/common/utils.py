@@ -445,7 +445,12 @@ class BackendConfig:
         enable_deepep: Removed and ignored. Logs a warning if set; configure "dispatcher"
             and "experts" explicitly instead.
         fake_balanced_gate: If True, replace the learned Gate with FakeBalancedGate
-            that assigns tokens to experts without learned routing weights.
+            that assigns tokens to experts without learned routing weights. This
+            omits learned router forward and backward computation.
+        force_balanced_routing: Benchmark-only. Execute the learned gate normally,
+            then replace expert indices with balanced cyclic assignments. Retains
+            learned routing weights, gradients, auxiliary losses, and gate statistics.
+            Mutually exclusive with fake_balanced_gate; fake_gate_noise must be zero.
         fake_gate_noise: Noise level [0, 1] for FakeBalancedGate. When > 0, uses
             biased topk selection seeded from the input content so routing varies
             dynamically across training steps (like real Gate) while remaining
@@ -511,6 +516,7 @@ class BackendConfig:
     mok: MoKBackendConfig = field(default_factory=MoKBackendConfig)
     enable_deepep: bool | None = None  # Removed: ignored with a warning; set dispatcher/experts explicitly
     fake_balanced_gate: bool = False
+    force_balanced_routing: bool = False
     # Approximate max/mean load ratios (64 experts, top-8, 4096 tokens):
     # 0.0→1.00x, 0.1→~1.2x, 0.3→~1.6x, 0.5→~2.0x, 1.0→~2.8x.
     fake_gate_noise: float = 0.0
@@ -550,6 +556,11 @@ class BackendConfig:
     cuda_graph: CudaGraphConfig = field(default_factory=CudaGraphConfig)
 
     def __post_init__(self) -> None:
+        if self.force_balanced_routing and self.fake_balanced_gate:
+            raise ValueError("force_balanced_routing and fake_balanced_gate are mutually exclusive")
+        if self.force_balanced_routing and self.fake_gate_noise != 0.0:
+            raise ValueError("force_balanced_routing requires fake_gate_noise=0.0")
+
         # benchmark_static_routing caches routing metadata across microbatches, which is
         # only sound when routing is constant by construction (forced balance, no noise).
         if self.benchmark_static_routing and not (self.fake_balanced_gate and self.fake_gate_noise == 0.0):

@@ -128,6 +128,8 @@ class FakeBalancedGate(nn.Module):
     Load balanced gate implementation, spreads tokens uniformly across all experts.
     The rationale for this class is to do performance experiments to understand
     how the load imbalance with real data is impacting end-to-end performance.
+    This implementation omits learned router forward and backward computation;
+    use ``backend.force_balanced_routing`` to retain that work in a benchmark.
 
     When ``noise > 0``, random perturbation is added to mimic realistic routing
     imbalance.  A noise value of 0.0 gives perfectly balanced assignment, while
@@ -847,6 +849,28 @@ class MoE(nn.Module):
         # Set during model parallelization (see parallelizer.apply_cp)
         self.cp_mesh: DeviceMesh | None = None
 
+    def _maybe_balance_routing(self, indices: torch.Tensor) -> torch.Tensor:
+        """Override expert assignments after learned gating for benchmarking.
+
+        Args:
+            indices: Local expert indices of shape [tokens, activated_experts].
+
+        Returns:
+            Indices with the same shape, dtype, and device. When forced balance is
+            enabled, each token selects distinct experts and per-rank assignment
+            counts differ by at most one. Counts include padding rows. Otherwise
+            returns the input unchanged. Learned weights and their autograd graph
+            are untouched; gate statistics and auxiliary losses describe the
+            original learned selection.
+        """
+        if not self.backend.force_balanced_routing:
+            return indices
+        return (
+            torch.arange(indices.numel(), device=indices.device, dtype=indices.dtype)
+            .view_as(indices)
+            .remainder(self.n_routed_experts)
+        )
+
     def forward(
         self,
         x: torch.Tensor,
@@ -881,12 +905,14 @@ class MoE(nn.Module):
         else:
             x_latent = x
 
+        weights, indices, aux_loss = self.gate(x, token_mask, cp_mesh)
+        indices = self._maybe_balance_routing(indices)
+
         if isinstance(self.experts, GroupedExpertsMoK):
             # MoK requires every EP rank to dispatch the same pre-aligned physical
             # token extent (at least 512 and divisible by 256). Its runtime validates
             # the local extent. THD padding rows remain in dispatch, while token_mask
             # excludes them from router load statistics and auxiliary losses.
-            weights, indices, aux_loss = self.gate(x, token_mask, cp_mesh)
             y = self.experts(
                 x_latent,
                 weights,
@@ -897,7 +923,6 @@ class MoE(nn.Module):
             )
             z = None
         else:
-            weights, indices, aux_loss = self.gate(x, token_mask, cp_mesh)
             # Shared-expert output (optionally gated), computed inline on the main stream.
             z = None
             if self.shared_experts is not None:

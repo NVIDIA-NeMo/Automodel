@@ -1182,7 +1182,16 @@ class KimiK3MoE(MoE):
         padding_mask: torch.Tensor | None = None,
         cp_mesh: Any = None,
     ) -> torch.Tensor:
-        """Run K3 MoE on ``[batch, sequence, hidden]`` states."""
+        """Run K3 shared and routed experts.
+
+        Args:
+            hidden_states: Local token states of shape [batch, sequence, hidden].
+            padding_mask: Optional boolean padding mask of shape [batch, sequence].
+            cp_mesh: Optional context-parallel mesh for the gate.
+
+        Returns:
+            Tensor of shape [batch, sequence, hidden].
+        """
         shape = hidden_states.shape
         identity = hidden_states.reshape(-1, shape[-1])
         token_mask = (
@@ -1192,6 +1201,7 @@ class KimiK3MoE(MoE):
         )
         gate_cp_mesh = cp_mesh if cp_mesh is not None else self.cp_mesh
         weights, indices, _ = self.gate(identity, token_mask, gate_cp_mesh)
+        indices = self._maybe_balance_routing(indices)
         routed_input = self.routed_expert_down_proj(identity)
         # Shared-expert overlap (BackendConfig.shared_expert_overlap): the shared experts only
         # depend on ``identity``, so launch them on a side stream before the routed path and
