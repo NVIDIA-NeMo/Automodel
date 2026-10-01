@@ -97,7 +97,7 @@ def test_output_and_all_gradients(seed: int, batch: int, sq: int, sk: int, width
         routes[:, 3 : sq // 2] = routes[:, 3 : sq // 2].remainder(sk // 3)
         routes[:, sq // 2 :] = routes[:, sq // 2 :].remainder(sk - sk * 2 // 3) + sk * 2 // 3
     scale = 0.125
-    out = qsa_gqa_attention(q, k, v, routes, backend="fa4", softmax_scale=scale)
+    out = qsa_gqa_attention(q, k, v, routes, cuda_kernel=fa4_sparse_gqa_attention, softmax_scale=scale)
     grads = torch.autograd.grad(out, (q, k, v), dy)
     inputs64 = [x.detach().double().requires_grad_() for x in (q, k, v)]
     ref, mask = _reference(*inputs64, routes, scale=scale)

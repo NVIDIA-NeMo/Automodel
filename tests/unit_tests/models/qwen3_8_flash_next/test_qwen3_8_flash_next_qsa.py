@@ -441,6 +441,28 @@ def test_qsa_sparse_backend_bypasses_generic_parent_initializer(attn_backend: st
     assert attention.backend.attn == attn_backend
     assert attention.attn_module is None
     assert attention.attn_func is None
+    assert attention.qsa_cuda_kernel is qwen3_8_flash_next_qsa.select_qsa_cuda_kernel(attn_backend)
+
+
+@pytest.mark.parametrize("attn_backend", ["flex", "fa4", "sdpa"])
+def test_qsa_cuda_kernel_is_selected_once_at_setup(attn_backend: str) -> None:
+    kernel = qwen3_8_flash_next_qsa.select_qsa_cuda_kernel(attn_backend)
+    expected = {
+        "flex": qwen3_8_flash_next_qsa._bf16_flex_sparse_gqa_attention,
+        "fa4": qwen3_8_flash_next_qsa.fa4_sparse_gqa_attention,
+        "sdpa": None,
+    }[attn_backend]
+
+    assert kernel is expected
+
+
+def test_qsa_cuda_without_a_kernel_is_rejected() -> None:
+    query = torch.randn(1, 3, 4, 3)
+    selected = torch.zeros(1, 3, 1, dtype=torch.int32)
+    # The rejection happens before any kernel runs, so a stand-in that reports CUDA is enough on a CPU job.
+    cuda_like = type("CudaLike", (), {"is_cuda": True})()
+    with pytest.raises(RuntimeError, match="requires backend.attn='flex' or 'fa4'"):
+        qwen3_8_flash_next_qsa.qsa_gqa_attention(cuda_like, query, query, selected, cuda_kernel=None)
 
 
 def test_qsa_flex_backend_uses_cpu_oracle(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -454,6 +476,8 @@ def test_qsa_flex_backend_uses_cpu_oracle(monkeypatch: pytest.MonkeyPatch) -> No
         pytest.fail("CPU QSA must not call the FlexAttention kernel")
 
     monkeypatch.setattr(qwen3_8_flash_next_qsa, "flex_sparse_gqa_attention", fail_if_called)
-    actual = qwen3_8_flash_next_qsa.qsa_gqa_attention(query, key, value, selected, backend="flex")
+    actual = qwen3_8_flash_next_qsa.qsa_gqa_attention(
+        query, key, value, selected, cuda_kernel=qwen3_8_flash_next_qsa.select_qsa_cuda_kernel("flex")
+    )
 
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)

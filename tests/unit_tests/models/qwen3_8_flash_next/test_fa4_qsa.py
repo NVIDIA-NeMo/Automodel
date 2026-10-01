@@ -22,6 +22,7 @@ from nemo_automodel.components.models.qwen3_8_flash_next import fa4_qsa
 from nemo_automodel.components.models.qwen3_8_flash_next.qsa import (
     gathered_qsa_gqa_attention,
     qsa_gqa_attention,
+    select_qsa_cuda_kernel,
 )
 
 
@@ -30,7 +31,7 @@ def test_cpu_fa4_dispatch_keeps_oracle(monkeypatch: pytest.MonkeyPatch) -> None:
     inputs = [torch.randn(1, 7, heads, 4, requires_grad=True) for heads in (4, 2, 2)]
     routes = torch.arange(7).view(1, 1, 7).expand(1, 7, 7)
     monkeypatch.setattr(fa4_qsa, "import_fa4_modules", lambda *args: pytest.fail("CPU must not load FA4"))
-    actual = qsa_gqa_attention(*inputs, routes, backend="fa4")
+    actual = qsa_gqa_attention(*inputs, routes, cuda_kernel=select_qsa_cuda_kernel("fa4"))
     expected = gathered_qsa_gqa_attention(*inputs, routes)
     dy = torch.randn_like(actual)
     grads = torch.autograd.grad(actual, inputs, dy)
