@@ -51,6 +51,8 @@ The model is auto-discovered by ``ModelRegistry`` via the ``ModelClass`` export.
 
 from copy import deepcopy
 from dataclasses import dataclass
+from os import PathLike
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -67,6 +69,20 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
 )
 
 logger = logging.get_logger(__name__)
+
+
+def _validate_reranker_options(
+    *, num_labels: int | None = None, pooling: str | None = None, temperature: float | None = None
+) -> None:
+    """Reject classifier options that cannot describe a single raw yes/no score."""
+    if num_labels not in (None, 1):
+        raise ValueError("Qwen3 causal reranking returns one score per pair; num_labels must be 1.")
+    if pooling is not None:
+        raise ValueError("Qwen3 causal reranking scores the final prompt token; pooling is not supported.")
+    if temperature is not None:
+        raise ValueError(
+            "Qwen3 causal reranking returns raw scores; set temperature on the training recipe, not model."
+        )
 
 
 class Qwen3RerankerConfig(Qwen3Config):
@@ -90,7 +106,10 @@ class Qwen3RerankerConfig(Qwen3Config):
     ) -> None:
         self.yes_token_id = yes_token_id
         self.no_token_id = no_token_id
+        num_labels = kwargs.pop("num_labels", None)
         super().__init__(**kwargs)
+        # A causal checkpoint's default label map does not describe reranker outputs.
+        self.num_labels = 1 if num_labels is None else num_labels
 
     def to_dict(self) -> dict:
         """Serialize as a plain ``Qwen3ForCausalLM`` config.
@@ -205,6 +224,11 @@ class Qwen3RerankerForCausalReranking(Qwen3ForCausalLM):
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config: Qwen3RerankerConfig) -> None:
+        _validate_reranker_options(
+            num_labels=config.num_labels,
+            pooling=getattr(config, "pooling", None),
+            temperature=getattr(config, "temperature", None),
+        )
         # Before super().__init__, on the original config, so an unsupported tie_word_embeddings
         # fails at construction rather than after the weights have loaded. BOTH accepts either
         # setting, so this never fires for this class today -- it is here so that narrowing the
@@ -227,7 +251,9 @@ class Qwen3RerankerForCausalReranking(Qwen3ForCausalLM):
         return bool(set(config.architectures or ()) & {"Qwen3ForCausalLM", cls.__name__})
 
     @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path, *args, **kwargs):
+    def from_pretrained(
+        cls, pretrained_model_name_or_path: str | PathLike[str] | None, *args: Any, **kwargs: Any
+    ) -> "Qwen3RerankerForCausalReranking":
         """Load weights and resolve the "yes"/"no" token ids if not already set.
 
         Explicit ``yes_token_id``/``no_token_id`` (e.g. from the recipe YAML or a
@@ -237,6 +263,11 @@ class Qwen3RerankerForCausalReranking(Qwen3ForCausalLM):
         In-memory loads use ``config.name_or_path`` to locate the tokenizer.
         A checkpoint's saved embedding ties cannot be overridden in either direction.
         """
+        _validate_reranker_options(
+            num_labels=kwargs.pop("num_labels", None),
+            pooling=kwargs.pop("pooling", None),
+            temperature=kwargs.pop("temperature", None),
+        )
         hub_kwargs = {
             key: kwargs[key]
             for key in ("cache_dir", "force_download", "local_files_only", "token", "revision", "subfolder")
@@ -250,6 +281,10 @@ class Qwen3RerankerForCausalReranking(Qwen3ForCausalLM):
         config = kwargs.pop("config", None)
         if isinstance(config, PretrainedConfig):
             config = deepcopy(config)
+            if not isinstance(config, cls.config_class):
+                attn_implementation = config._attn_implementation
+                config = cls.config_class.from_dict(config.to_dict())
+                config._attn_implementation = attn_implementation
         else:
             config, kwargs = cls.config_class.from_pretrained(
                 config or pretrained_model_name_or_path, return_unused_kwargs=True, **kwargs

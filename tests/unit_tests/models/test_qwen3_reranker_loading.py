@@ -14,6 +14,7 @@
 
 """Real tiny-checkpoint regression coverage for Qwen3 retrieval loading."""
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -22,6 +23,7 @@ from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from transformers import (
     AutoConfig,
+    AutoModelForCausalLM,
     PreTrainedTokenizerFast,
     Qwen3Config,
     Qwen3ForCausalLM,
@@ -29,7 +31,10 @@ from transformers import (
 )
 
 from nemo_automodel._transformers import retrieval
-from nemo_automodel.components.models.qwen3_reranker.model import Qwen3RerankerForCausalReranking
+from nemo_automodel.components.models.qwen3_reranker.model import (
+    Qwen3RerankerConfig,
+    Qwen3RerankerForCausalReranking,
+)
 
 
 @pytest.fixture
@@ -142,17 +147,75 @@ def test_causal_loading_resolves_tokens_and_preserves_scores(tmp_path, tiny_conf
         torch.testing.assert_close(parameter.grad, reference_parameters[name].grad, rtol=1e-5, atol=1e-6)
 
 
-def test_explicit_token_ids_do_not_require_tokenizer_or_mutate_config(tmp_path, tiny_config):
+@pytest.mark.parametrize("saved_tied", [False, True])
+def test_explicit_config_exports_as_stock_causal_lm_without_mutation(tmp_path, tiny_config, saved_tied):
+    tiny_config.tie_word_embeddings = saved_tied
     reference = Qwen3ForCausalLM(tiny_config)
     reference.save_pretrained(tmp_path)
     config = AutoConfig.from_pretrained(tmp_path)
+    config._attn_implementation = "eager"
+    original_config = config.to_dict()
     loaded = Qwen3RerankerForCausalReranking.from_pretrained(
         tmp_path, config=config, yes_token_id=5, no_token_id=7, local_files_only=True
-    )
+    ).eval()
+    assert isinstance(loaded.config, Qwen3RerankerConfig)
+    assert loaded.config._attn_implementation == "eager"
     assert loaded.config.yes_token_id == 5
     assert loaded.config.no_token_id == 7
-    assert getattr(config, "yes_token_id", None) is None
-    assert getattr(config, "no_token_id", None) is None
+    assert config.to_dict() == original_config
+
+    encoder = retrieval.CrossEncoderModel(loaded)
+    export_path = tmp_path / "export"
+    encoder.save_pretrained(export_path)
+    exported = json.loads((export_path / "config.json").read_text())
+    assert exported["architectures"] == ["Qwen3ForCausalLM"]
+    assert "auto_map" not in exported
+    reloaded = AutoModelForCausalLM.from_pretrained(export_path, local_files_only=True).eval()
+    assert type(reloaded) is Qwen3ForCausalLM
+    assert (reloaded.lm_head.weight is reloaded.model.embed_tokens.weight) is saved_tied
+    torch.testing.assert_close(reloaded.state_dict(), loaded.state_dict(), rtol=0, atol=0)
+    with torch.no_grad():
+        logits = reloaded(**_inputs()).logits[:, -1]
+        torch.testing.assert_close(encoder(_inputs()).logits[:, 0], logits[:, 5] - logits[:, 7])
+
+
+@pytest.mark.parametrize("extracted", [False, True])
+@pytest.mark.parametrize(
+    "options, message",
+    [
+        ({"num_labels": 2}, "num_labels must be 1"),
+        ({"pooling": "avg"}, "pooling is not supported"),
+        ({"temperature": 0.5}, "temperature on the training recipe"),
+    ],
+)
+def test_causal_loading_rejects_classifier_options(tmp_path, tiny_config, monkeypatch, extracted, options, message):
+    reference = Qwen3ForCausalLM(tiny_config).eval()
+    reference.save_pretrained(tmp_path)
+    _save_tokenizer(tmp_path)
+    if extracted:
+        monkeypatch.setattr(
+            retrieval.AutoModel, "from_pretrained", lambda *args, **kwargs: SimpleNamespace(language_model=reference)
+        )
+    with pytest.raises(ValueError, match=message):
+        retrieval.CrossEncoderModel.build(
+            str(tmp_path),
+            extract_submodel="language_model" if extracted else None,
+            local_files_only=True,
+            **options,
+        )
+
+
+def test_causal_checkpoint_default_labels_do_not_change_single_score(tmp_path, tiny_config):
+    # Standard causal configs default to two labels, despite having no classifier.
+    tiny_config.num_labels = 2
+    reference = Qwen3ForCausalLM(tiny_config).eval()
+    reference.save_pretrained(tmp_path)
+    _save_tokenizer(tmp_path)
+    loaded = retrieval.CrossEncoderModel.build(str(tmp_path), num_labels=1, local_files_only=True).eval()
+    assert loaded.config.num_labels == 1
+    with torch.no_grad():
+        logits = reference(**_inputs()).logits[:, -1]
+        torch.testing.assert_close(loaded(_inputs()).logits[:, 0], logits[:, 5] - logits[:, 7])
 
 
 def test_extracted_decoder_keeps_classification_fallback(tmp_path, tiny_config, monkeypatch):
