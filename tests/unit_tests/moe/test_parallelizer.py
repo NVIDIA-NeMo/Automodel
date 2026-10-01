@@ -823,6 +823,14 @@ def test_apply_ac_checkpoints_declared_submodules_of_model_owned_eager_block(mon
         assert wrapped_shared_experts._nemo_selective_ac is True
 
 
+def test_get_moe_module_finds_checkpoint_wrapped_mlp(monkeypatch):
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    moe = P.MoE()
+    wrapped_moe = types.SimpleNamespace(_checkpoint_wrapped_module=moe)
+
+    assert P._get_moe_module(types.SimpleNamespace(mlp=wrapped_moe)) is moe
+
+
 def test_apply_ac_warns_when_router_is_recomputed(monkeypatch):
     P = _import_parallelizer_with_stubs(monkeypatch)
     monkeypatch.setattr(P, "ptd_checkpoint_wrapper", MagicMock(side_effect=lambda block, **kw: block))
