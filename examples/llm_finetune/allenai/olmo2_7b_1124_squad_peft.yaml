@@ -80,3 +80,8 @@ checkpoint:
   checkpoint_dir: checkpoints/olmo2_7b_1124
   model_save_format: safetensors
   save_consolidated: false
+
+ci:
+  recipe_owner: akoumpa
+  time: "00:20:00"
+  nodes: 1

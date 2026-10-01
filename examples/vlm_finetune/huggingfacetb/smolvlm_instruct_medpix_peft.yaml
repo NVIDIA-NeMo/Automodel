@@ -84,3 +84,5 @@ freeze_config:
   freeze_language_model: false
 ci:
   recipe_owner: akoumpa
+  time: "00:20:00"
+  nodes: 1

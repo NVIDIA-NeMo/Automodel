@@ -80,3 +80,8 @@ checkpoint:
   checkpoint_dir: checkpoints/deepseek_llm_7b_chat
   model_save_format: safetensors
   save_consolidated: false
+
+ci:
+  recipe_owner: akoumpa
+  time: "00:20:00"
+  nodes: 1

@@ -80,3 +80,8 @@ checkpoint:
   checkpoint_dir: checkpoints/stablelm_3b_4e1t
   model_save_format: safetensors
   save_consolidated: false
+
+ci:
+  recipe_owner: akoumpa
+  time: "00:20:00"
+  nodes: 1
