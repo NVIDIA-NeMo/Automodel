@@ -942,13 +942,13 @@ This optional rule matches modules named `gate` or `router` without matching exp
 
 Grouped expert tensors are treated as batches of independent matrices. AutoModel's grouped GEMM experts declare their `[expert, input, output]` storage layout so magnitude normalization follows output neurons. Linear weights use `[output, input]`. Embeddings, output heads, normalization parameters, and biases use the scalar optimizer. These groups also apply to `MuonConfig`, except that Muon does not learn neuron magnitudes.
 
-Muown selects communication groups from each parameter's DTensor placements, allowing dense FSDP weights and EP weights with a different FSDP mesh in one optimizer. A matrix may have one evenly sharded matrix axis plus sharded expert/batch axes. Sharding both matrix axes is unsupported. EP-local complete matrices are updated locally. Magnitude and direction states use the normal optimizer checkpoint path; FP32 master parameters are recommended.
+Muown selects communication groups from each parameter's DTensor placements, allowing dense FSDP weights and EP weights with a different FSDP mesh in one optimizer. A matrix can have one evenly sharded matrix axis plus sharded expert or batch axes. Sharding both matrix axes is unsupported. EP-local complete matrices are updated locally. Magnitude and direction states use the normal optimizer checkpoint path; FP32 master parameters are recommended.
 
 Set `optimizer.use_triton: true` to fuse Muown's direction preparation, momentum, magnitude Adam update, and weight recomposition on CUDA. This optional path requires Triton and contiguous FP32 local weights, gradients, and states. It supports complete input-feature axes up to 16384 elements for ordinary matrices and 8192 for transposed expert storage; wider, strided, other-dtype, and input-sharded tensors use the Torch path. Newton–Schulz arithmetic and FSDP communication are unchanged. The default is `false`.
 
 The default Newton–Schulz update uses five BF16 polynomial iterations and the reference implementation's shape-based QKV convention: a logical `[3d, d]` matrix is split into three `[d, d]` matrices. This rule follows shape, rather than inspecting module identity.
 
-See the [Qwen3-30B-A3B Muown recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen3_moe_30b_tulu3_muown.yaml) for real Tulu3 training with EP8, non-packed 4K sequences, and FP32 master weights on eight GPUs. It runs a 30-step smoke test; tune learning rates and training duration for your workload.
+See the [Qwen3-30B-A3B Muown recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen3_moe_30b_tulu3_muown.yaml) for real Tulu3 training with EP8, non-packed 4K sequences, and FP32 master weights on 8 GPUs. It runs a 30-step smoke test; tune learning rates and training duration for your workload.
 
 ## Distributed Training with TP, PP, CP, and EP
 
