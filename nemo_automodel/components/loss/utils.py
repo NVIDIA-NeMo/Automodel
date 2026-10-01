@@ -18,7 +18,8 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy
+from nemo_automodel.components.loss.linear_ce_base import LinearCrossEntropy
 
 _DATASET_IGNORE_INDEX = -100
 
@@ -136,18 +137,45 @@ def _get_final_hidden_states(model_output: Any) -> Any | None:
     return hidden_states
 
 
-def calculate_loss(loss_fn: nn.Module, **kwargs: Any) -> torch.Tensor:
-    """Calculate a logit-based or fused linear cross-entropy loss.
+def prepare_lm_weight(
+    loss_fn: LinearCrossEntropy,
+    model: nn.Module,
+    *,
+    grad_reduce_group: torch.distributed.ProcessGroup | None = None,
+) -> torch.Tensor:
+    """Prepare one shared projection weight for main and auxiliary losses.
 
     Args:
-        loss_fn: Loss module. ``FusedLinearCrossEntropy`` consumes
+        loss_fn: Linear-projection loss that owns materialization semantics.
+        model: Model with an output head of global shape [vocab, hidden].
+        grad_reduce_group: Group contributing independent token losses.
+
+    Returns:
+        Dense [vocab, hidden] weight under ``materialize_lm_weight``'s layout
+        and gradient contract. Chunked CE also honors the head's compute dtype;
+        share this result across loss calls to retain only one converted copy.
+    """
+    if isinstance(loss_fn, ChunkedCrossEntropy):
+        return loss_fn.prepare_lm_weight(
+            _get_lm_head_module(model),
+            model_config=getattr(model, "config", None),
+            grad_reduce_group=grad_reduce_group,
+        )
+    return loss_fn.materialize_lm_weight(_get_lm_head_weight(model), grad_reduce_group=grad_reduce_group)
+
+
+def calculate_loss(loss_fn: nn.Module, **kwargs: Any) -> torch.Tensor:
+    """Calculate a logits-based or linear-projection cross-entropy loss.
+
+    Args:
+        loss_fn: Loss module. ``LinearCrossEntropy`` implementations consume
             ``hidden_states`` with shape ``[batch, sequence, hidden]``, labels
             with shape ``[batch, sequence]``, and an LM-head weight with global
             shape ``[vocab, hidden]``. Other loss modules consume logits with
             shape ``[batch, sequence, vocab]`` and labels.
         **kwargs: Loss inputs. Rank-local tensors keep their existing layout;
             ``grad_reduce_group`` describes the ranks contributing independent
-            fused-loss shards. The caller's mapping and tensors are not mutated.
+            linear-loss shards. The caller's mapping and tensors are not mutated.
 
     Returns:
         Scalar loss tensor that does not alias an input.
@@ -157,7 +185,7 @@ def calculate_loss(loss_fn: nn.Module, **kwargs: Any) -> torch.Tensor:
     loss_weights = kwargs.pop("loss_weights", None)
     if loss_weights is not None:
         loss_fn_kwargs["loss_weights"] = loss_weights
-    if isinstance(loss_fn, FusedLinearCrossEntropy):
+    if isinstance(loss_fn, LinearCrossEntropy):
         model = kwargs.pop("model")
         # Reuse a caller-materialized LM head when provided so a single
         # full_tensor() all-gather is shared across the main loss and every MTP
@@ -166,7 +194,12 @@ def calculate_loss(loss_fn: nn.Module, **kwargs: Any) -> torch.Tensor:
         # on-device and OOM large-vocab MoE (e.g. Nemotron-Ultra, 256k vocab).
         lm_head = kwargs.pop("lm_weight", None)
         if lm_head is None:
-            lm_head = _get_lm_head_weight(model)
+            lm_head = prepare_lm_weight(loss_fn, model, grad_reduce_group=kwargs.get("grad_reduce_group"))
+        if isinstance(loss_fn, ChunkedCrossEntropy):
+            logits = kwargs.get("logits")
+            loss_fn_kwargs["logits_dtype"] = kwargs.pop(
+                "logits_dtype", logits.dtype if isinstance(logits, torch.Tensor) else None
+            )
         loss_fn_kwargs.update(
             {
                 "hidden_states": kwargs.pop("hidden_states"),

@@ -22,11 +22,6 @@ include-package-data = true
 [tool.setuptools.packages.find]
 include = ["nemo_automodel", "nemo_automodel.*"]
 
-[tool.setuptools.package-data]
-nemo_automodel = [
-    "components/datasets/llm/megatron/Makefile",
-]
-
 [tool.setuptools.dynamic]
 version = { attr = "nemo_automodel.package_info.__version__" } # any module attribute compatible with ast.literal_eval
 readme = { file = "README.md", content-type = "text/markdown" }
@@ -81,7 +76,7 @@ dependencies = [
     "datasets>=4.0.0",
     "megatron-fsdp==0.5.0",
     "mistral-common[audio,hf-hub,sentencepiece]",
-    "pybind11",
+    "ninja",
     "pyyaml",
     "tiktoken",
     "torch>=2.6.0",
@@ -557,7 +552,21 @@ modules = [
 ignore_imports = [
     # Dion needs the FSDP DP mesh resolver so its optimizer mesh matches parameter sharding.
     "nemo_automodel.components.optim.dion -> nemo_automodel.components.distributed.mesh_utils",
+    # Grad clipping needs the same resolver to find the EP process group, because a
+    # flattened ep axis is absent from mesh_dim_names and cannot be indexed directly.
+    "nemo_automodel.components.training.utils -> nemo_automodel.components.distributed.mesh_utils",
 ]
+
+[[tool.importlinter.contracts]]
+name = "Distributed infrastructure must not import model implementations"
+type = "forbidden"
+source_modules = ["nemo_automodel.components.distributed"]
+forbidden_modules = [
+    "nemo_automodel.components.models",
+    "nemo_automodel._diffusers",
+    "nemo_automodel._transformers",
+]
+allow_indirect_imports = true
 
 # ty: type checking (https://github.com/astral-sh/ty)
 # Default: permissive. Strict checks are opt-in per-file via overrides below.
@@ -600,7 +609,6 @@ allowed-unresolved-imports = [
     "megatron.**",
     "mlflow",
     "mlflow.**",
-    "nemo_automodel.components.datasets.llm.megatron.helpers_cpp",
     "nemo_run",
     "pynvml",
     "sky",

@@ -187,6 +187,7 @@ def _run_git(repo_root: Path, arguments: list[str]) -> str:
             check=True,
             capture_output=True,
             text=True,
+            encoding="utf-8",
         )
     except (OSError, subprocess.CalledProcessError) as error:
         raise ValueError(f"Could not inspect Git history: {error}") from error
@@ -225,7 +226,7 @@ def _load_recipe_addition_dates(repo_root: Path) -> dict[str, str]:
             commit, commit_date = line.removeprefix("@@COMMIT@@").split(" ", 1)
         elif line.endswith(".yaml") and commit_date is not None:
             additions.setdefault(line, (commit_date, commit))
-    current_recipes = {str(path.relative_to(repo_root)) for path in (repo_root / "examples").rglob("*.yaml")}
+    current_recipes = {path.relative_to(repo_root).as_posix() for path in (repo_root / "examples").rglob("*.yaml")}
     missing_recipes = current_recipes - additions.keys()
     if missing_recipes:
         raise ValueError(
@@ -421,7 +422,7 @@ def _load_model_releases(repo_root: Path, model_docs: dict[str, list[_ModelDoc]]
                 ),
                 typed_docs[0].docs_page if typed_docs else f"https://huggingface.co/{hf_model_id}",
             )
-            recipe_string = str(recipe)
+            recipe_string = recipe.as_posix()
             release_date = introduction_dates.get((recipe_string, hf_model_id))
             if release_date is None:
                 raise ValueError(f"Could not find when {hf_model_id} was introduced in {recipe_string}")

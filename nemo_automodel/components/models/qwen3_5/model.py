@@ -61,6 +61,7 @@ from nemo_automodel.components.models.qwen3_5.packing import (
     GatedDeltaPackedMetadata,
     prepare_gated_delta_packed_metadata,
 )
+from nemo_automodel.components.models.qwen3_5.parallelization import PARALLELIZER
 from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import CPAwareGatedDeltaNet
 from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextRMSNorm
 from nemo_automodel.components.models.qwen3_next.model import Block
@@ -755,6 +756,7 @@ class Qwen3_5ForCausalLM(HFCheckpointingMixin, nn.Module):
         **kwargs: Any,
     ) -> Qwen3_5CausalLMOutputWithPast:
         del labels
+        kwargs.pop("output_hidden_states", None)
         effective_use_cache = False if use_cache is None else use_cache
         outputs = self.model(
             input_ids=input_ids,
@@ -1519,4 +1521,6 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         cast_model_to_dtype(self, dtype, skip_modules=("_fp32_params",))
 
 
+Qwen3_5ForCausalLM.parallelizer = PARALLELIZER
+Qwen3_5ForConditionalGeneration.parallelizer = PARALLELIZER
 ModelClass = Qwen3_5ForCausalLM
