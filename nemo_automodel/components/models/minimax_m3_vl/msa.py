@@ -542,12 +542,13 @@ class _SelectionPlan:
         """Score bf16 index_q[tokens, 4, 128] against index_k[tokens, 1, 128] -> int32 [4, tokens, 16] block ids."""
         # The score buffer is reused across layers, so tiles the kernel does not write hold the previous
         # layer's values; the selection rule rejects exactly those. v is never read with output_o=False.
-        _, max_score = msa_bindings.kernels().fmha_sm100(
+        max_score = _score_scratch(index_q.device, self.score_shape)
+        msa_bindings.kernels().fmha_sm100(
             index_q,
             index_k,
             index_k,
             self.plan,
-            max_score=_score_scratch(index_q.device, self.score_shape),
+            max_score=max_score,
             output_o=False,
             output_maxscore=True,
         )

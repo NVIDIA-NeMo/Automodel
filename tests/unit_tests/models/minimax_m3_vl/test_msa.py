@@ -101,7 +101,7 @@ def test_the_microbatch_exposes_the_packed_document_geometry() -> None:
     )
 
 
-def test_checkpoint_recompute_rebuilds_a_stale_selection_plan(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_checkpoint_recompute_rebuilds_stale_selection_state(monkeypatch: pytest.MonkeyPatch) -> None:
     tokens, blocks = 16_384, 128
     microbatch = msa.MSAMicrobatch.from_document_map(torch.ones(4, 4096, dtype=torch.int64), forced_blocks=_FORCED)
     current_plan = msa._SelectionPlan(
@@ -119,9 +119,11 @@ def test_checkpoint_recompute_rebuilds_a_stale_selection_plan(monkeypatch: pytes
         forced=torch.zeros(16, 1, dtype=torch.bool),
     )
 
+    stale_kernel_output = torch.empty(msa.NUM_INDEX_HEADS, 1, 16)
+
     def score(*args: object, max_score: torch.Tensor, **kwargs: object) -> tuple[None, torch.Tensor]:
         max_score.zero_()
-        return None, max_score
+        return None, stale_kernel_output
 
     monkeypatch.setattr(msa.msa_bindings, "kernels", lambda: SimpleNamespace(fmha_sm100=score))
     monkeypatch.setattr(msa._SelectionPlan, "build", classmethod(lambda cls, owner: current_plan))
