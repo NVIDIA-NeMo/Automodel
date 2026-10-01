@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Widen transformers' ``ALLOWED_LAYER_TYPES`` so legacy custom configs load.
+"""Widen transformers' layer-type allow-lists so legacy custom configs load.
 
 Some community models (e.g. ``nvidia/Nemotron-Flash-1B``) ship a custom
 ``configuration_*.py`` whose ``layer_types`` entries (e.g. ``'deltanet'``,
@@ -20,8 +20,11 @@ Some community models (e.g. ``nvidia/Nemotron-Flash-1B``) ship a custom
 via ``AutoConfig.from_pretrained`` triggers ``validate_layer_type`` and raises
 ``StrictDataclassClassValidationError`` before model instantiation.
 
-The validator performs a module-global lookup of ``ALLOWED_LAYER_TYPES`` at
-call time, so rebinding it in place takes effect on subsequent validations.
+The validator performs module-global lookups at call time, so rebinding the
+allow-lists takes effect on subsequent validations. Transformers 5.15 split
+attention layer types into ``ALLOWED_ATTN_LAYER_TYPES`` while retaining
+``ALLOWED_LAYER_TYPES`` for backwards compatibility, so both names must be
+patched when present.
 """
 
 from __future__ import annotations
@@ -35,6 +38,11 @@ logger = logging.getLogger(__name__)
 
 _TARGET_MODULE = "transformers.configuration_utils"
 
+_ALLOWED_TYPE_ATTRS: tuple[str, ...] = (
+    "ALLOWED_ATTN_LAYER_TYPES",
+    "ALLOWED_LAYER_TYPES",
+)
+
 DEFAULT_EXTRA_LAYER_TYPES: tuple[str, ...] = (
     "deltanet",
     "f",
@@ -46,7 +54,7 @@ _PATCHED: bool = False
 
 
 def patch_allowed_layer_types(extra: Iterable[str] = DEFAULT_EXTRA_LAYER_TYPES) -> bool:
-    """Extend ``transformers.configuration_utils.ALLOWED_LAYER_TYPES`` in place.
+    """Extend Transformers' available layer-type allow-lists in place.
 
     Idempotent and best-effort: any failure (missing attribute, transformers
     not installed, unexpected container type) is logged and swallowed so the
@@ -71,40 +79,52 @@ def patch_allowed_layer_types(extra: Iterable[str] = DEFAULT_EXTRA_LAYER_TYPES) 
         logger.warning("[v4_patches.layer_types] transformers import failed: %s", exc)
         return False
 
-    existing = getattr(cu, "ALLOWED_LAYER_TYPES", None)
-    if existing is None:
-        logger.debug("[v4_patches.layer_types] ALLOWED_LAYER_TYPES missing; nothing to patch.")
-        _PATCHED = True
-        return False
-
     try:
-        existing_set = set(existing)
-    except TypeError:
-        logger.warning(
-            "[v4_patches.layer_types] ALLOWED_LAYER_TYPES is not iterable (%s); skipping.",
-            type(existing).__name__,
-        )
-        return False
-
-    try:
-        additions = tuple(lt for lt in extra if lt not in existing_set)
+        extra_types = tuple(extra)
     except TypeError:
         logger.warning("[v4_patches.layer_types] `extra` is not iterable; skipping.")
         return False
 
-    if not additions:
+    found = False
+    failed = False
+    modified = False
+    for attr_name in _ALLOWED_TYPE_ATTRS:
+        existing = getattr(cu, attr_name, None)
+        if existing is None:
+            continue
+        found = True
+
+        try:
+            existing_tuple = tuple(existing)
+            existing_set = set(existing_tuple)
+        except TypeError:
+            logger.warning(
+                "[v4_patches.layer_types] %s is not iterable (%s); skipping.",
+                attr_name,
+                type(existing).__name__,
+            )
+            failed = True
+            continue
+
+        additions = tuple(layer_type for layer_type in extra_types if layer_type not in existing_set)
+        if not additions:
+            continue
+
+        try:
+            setattr(cu, attr_name, existing_tuple + additions)
+        except Exception as exc:
+            logger.warning("[v4_patches.layer_types] failed to rebind %s: %s", attr_name, exc)
+            failed = True
+            continue
+        modified = True
+        logger.info("[v4_patches.layer_types] extended %s with %s", attr_name, additions)
+
+    if not found:
+        logger.debug("[v4_patches.layer_types] no layer-type allow-list found; nothing to patch.")
+
+    if not failed:
         _PATCHED = True
-        return False
-
-    try:
-        cu.ALLOWED_LAYER_TYPES = tuple(existing) + additions
-    except Exception as exc:
-        logger.warning("[v4_patches.layer_types] failed to rebind ALLOWED_LAYER_TYPES: %s", exc)
-        return False
-
-    _PATCHED = True
-    logger.info("[v4_patches.layer_types] extended ALLOWED_LAYER_TYPES with %s", additions)
-    return True
+    return modified
 
 
 _HOOK_INSTALLED: bool = False

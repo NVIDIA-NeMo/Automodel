@@ -1116,3 +1116,47 @@ class TestAutoPipelineUpdateSeqLen:
         assert ap._model_config is None
         ap.build(model, loss_fn=lambda x, y: torch.tensor(0.0))
         assert ap._model_config is model.config
+
+    def test_runtime_initializers_prepare_after_shape_reset_on_every_call(self, monkeypatch):
+        events = []
+
+        class RecordingInitializer:
+            @staticmethod
+            def prepare(*, num_tokens, device):
+                events.append(("prepare", num_tokens, device))
+
+        ap = AutoPipeline(
+            world_mesh=FakeDeviceMesh(),
+            pp_axis_name="pp",
+            pp_schedule="1f1b",
+            pp_microbatch_size=2,
+            pp_batch_size=4,
+            device=torch.device("cpu"),
+        )
+        ap._model_config = object()
+        ap._info.schedule = object()
+        ap._info.stages = []
+        ap._runtime_initializers = [RecordingInitializer()]
+
+        def record_reset(*args, **kwargs):
+            events.append(("reset", args[4]))
+
+        monkeypatch.setattr(
+            "nemo_automodel.components.distributed.pipelining.autopipeline.reset_pp_stage_shapes",
+            record_reset,
+        )
+
+        ap.update_seq_len(8)
+        ap.update_seq_len(8)
+        ap.update_seq_len(16)
+        ap.update_seq_len(4)
+
+        assert events == [
+            ("reset", 8),
+            ("prepare", 16, torch.device("cpu")),
+            ("prepare", 16, torch.device("cpu")),
+            ("reset", 16),
+            ("prepare", 32, torch.device("cpu")),
+            ("reset", 4),
+            ("prepare", 8, torch.device("cpu")),
+        ]

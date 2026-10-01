@@ -70,7 +70,7 @@ def _rename_state_dict(state_dict: dict[str, Any], renames: dict[str, str]) -> d
 class Gemma4UnifiedStateDictAdapter(StateDictAdapter):
     """Translate Gemma4 Unified keys between model and published HF names."""
 
-    _supports_write_through_checkpoint_load = True
+    _supports_low_memory_dcp_load = True
 
     def to_hf(
         self,

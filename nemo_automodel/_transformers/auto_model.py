@@ -29,7 +29,7 @@ import inspect
 import logging
 import os
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, List, Optional, Union
+from typing import TYPE_CHECKING, Any, List, Optional, Union
 
 import torch
 from torch.nn.attention import SDPBackend
@@ -38,8 +38,8 @@ from nemo_automodel.shared.torch_patches import apply_torch_patches
 
 apply_torch_patches()
 from huggingface_hub import constants as hf_constants  # noqa: E402
+from huggingface_hub import snapshot_download
 from transformers import (  # noqa: E402
-    AutoConfig,
     AutoModelForCausalLM,
     AutoModelForImageTextToText,
     AutoModelForMultimodalLM,
@@ -53,10 +53,12 @@ from transformers.initialization import no_init_weights  # noqa: E402
 from transformers.models.auto.auto_factory import _BaseAutoModelClass  # noqa: E402
 from transformers.utils import ContextManagers  # noqa: E402
 
-from nemo_automodel.components.distributed.config import DistributedSetup  # noqa: E402
-from nemo_automodel.components.distributed.ddp import DDPManager  # noqa: E402
+from nemo_automodel.components.distributed.config import (  # noqa: E402
+    DDPConfig,
+    DistributedSetup,
+    MegatronFSDPConfig,
+)
 from nemo_automodel.components.distributed.init_utils import get_world_size_safe  # noqa: E402
-from nemo_automodel.components.distributed.megatron_fsdp import MegatronFSDPManager  # noqa: E402
 from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPipeline  # noqa: E402, F401
 from nemo_automodel.components.quantization.qat import QATConfig  # noqa: E402
 from nemo_automodel.components.utils.model_utils import (  # noqa: E402
@@ -76,8 +78,10 @@ if TYPE_CHECKING:
 # that import NEED_SETUP_CACHE_CLASSES_MAPPING from transformers.generation.utils.
 import transformers.generation.utils as _gen_utils  # noqa: E402
 
+from nemo_automodel._transformers.auto_config import NeMoAutoConfig as AutoConfig
 from nemo_automodel._transformers.infrastructure import (
     MeshContext,
+    _get_strategy_config,
     apply_model_infrastructure,
     instantiate_infrastructure,
 )
@@ -199,6 +203,8 @@ def _patch_remote_code_compat():
 
 _AUTO_CONFIG_HUB_KWARG_KEYS = (
     "revision",
+    "_commit_hash",
+    "force_download",
     "subfolder",
     "token",
     "use_auth_token",
@@ -417,6 +423,9 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         has_packed_sequence = kwargs.pop("has_packed_sequence", False)
         freeze_config = kwargs.pop("freeze_config", None)
         cache_dir = kwargs.pop("cache_dir", hf_constants.HF_HUB_CACHE)
+        if isinstance(pretrained_model_name_or_path_or_config, str):
+            # Hub loaders need the cache location; from_config constructors do not.
+            kwargs["cache_dir"] = cache_dir
 
         def _retry(**override):
             """Re-enter ``_build_model`` with overridden parameters."""
@@ -508,13 +517,13 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 kwargs["config"] = _hf_config
 
         # Use meta device initialization when:
-        # - Not using MegatronFSDPManager or DDPManager (they handle their own initialization)
+        # - Not using Megatron-FSDP or DDP (they handle their own initialization)
         # - AND either multi-GPU (world_size > 1) or single-GPU custom model (not HF)
         # - AND not using quantization (we let HF handle BitsAndBytes/FP8; don't init meta device)
         #   For non-HF models, native quant config is ignored.
         is_meta_device = all(
             [
-                not isinstance(model_wrapper, (MegatronFSDPManager, DDPManager)),
+                not isinstance(_get_strategy_config(model_wrapper), (MegatronFSDPConfig, DDPConfig)),
                 get_world_size_safe() > 1 or not is_hf_model,
                 quantization_config is None and (_hf_native_quant_cfg is None or not is_hf_model),
             ]
@@ -611,6 +620,16 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         # during init.  Custom models and meta-device initialization do not load weights
         # here; they rely on apply_model_infrastructure to load the checkpoint later.
         weights_already_loaded = not is_custom_model and not is_meta_device and load_base_model
+        if load_base_model and pretrained_path and not os.path.isdir(pretrained_path) and _hf_config._commit_hash:
+            # Give the checkpointer the selected snapshot, not a repo id whose
+            # cache may also contain an unrelated (or newer) weight index.
+            pretrained_path = snapshot_download(
+                pretrained_path,
+                revision=_hf_config._commit_hash,
+                cache_dir=cache_dir,
+                local_files_only=True,
+            )
+            pretrained_path = os.path.join(pretrained_path, kwargs.get("subfolder", ""))
 
         from nemo_automodel._transformers.capabilities import attach_capabilities_and_validate
 
@@ -685,7 +704,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 ``["flash_attention", "efficient_attention"]``). When ``None``,
                 auto-selects based on CP and activation checkpointing.
             torch_dtype (str | torch.dtype):
-                Data type passed to the underlying `from_pretrained` call. Defaults to `auto`.
+                Deprecated alias for ``dtype``. Defaults to ``auto``.
             attn_implementation (str, optional):
                 Specifies which attention implementation to use (e.g.,
                 ``"flash_attention_2"``, ``"eager"``). Only applied when the
@@ -712,6 +731,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             compile_config (CompileConfig | None, optional): Configuration for torch.compile.
                 If provided, the model will be compiled. Default: None.
             **kwargs: Additional keyword arguments. Notable ones include:
+                - dtype (str | torch.dtype): Model storage dtype. Takes precedence
+                  over ``torch_dtype`` when not ``None``; accepts ``auto``.
                 - has_packed_sequence (bool): Whether using packed sequences. Default: False.
                 - cache_dir (str): Cache directory for model weights.
 
@@ -720,6 +741,10 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             model instance with all infrastructure applied.
         """
         _reject_separate_distributed_kwargs(kwargs)
+        # Resolve HF's dtype alias before config overrides or model construction
+        # can consume it independently of AutoModel's storage-dtype handling.
+        if (dtype := kwargs.pop("dtype", None)) is not None:
+            torch_dtype = dtype
         setup = _resolve_distributed_setup(
             distributed_setup=distributed_setup,
             device_mesh=device_mesh,
@@ -750,6 +775,10 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 hf_config = get_hf_config(pretrained_model_name_or_path, attn_implementation, **kwargs)
             else:
                 raise
+        # Keep config rereads, remote code, and weights on the same snapshot.
+        if hf_config._commit_hash is not None:
+            kwargs["revision"] = hf_config._commit_hash
+            kwargs["_commit_hash"] = hf_config._commit_hash
         is_hf_model = get_is_hf_model(hf_config, force_hf)
 
         # Layer 2: reject loading a checkpoint with tie_word_embeddings flipped from the
@@ -814,9 +843,13 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 If config is passed as a string (e.g., model-id / local checkpoint),
                 it will create a config internally using AutoConfig.
             torch_dtype (str | torch.dtype):
-                Data type for model parameters. Defaults to `auto`, which selects ``torch.bfloat16``.
+                Deprecated alias for ``dtype``. Defaults to ``auto``, which selects ``torch.bfloat16``.
+            **kwargs: Additional arguments documented in ``from_pretrained``.
+                ``dtype`` takes precedence over ``torch_dtype`` when not ``None``.
         """
         _reject_separate_distributed_kwargs(kwargs)
+        if (dtype := kwargs.pop("dtype", None)) is not None:
+            torch_dtype = dtype
         setup = _resolve_distributed_setup(
             distributed_setup=distributed_setup,
             device_mesh=device_mesh,
@@ -1093,13 +1126,15 @@ class _NeMoAutoModelForRetrievalBase:
             use_liger_kernel: Whether to apply Liger kernel optimizations.
             use_sdpa_patching: Whether to apply SDPA patching.
             sdpa_method: SDPA backend methods to use.
-            torch_dtype: Data type passed to the underlying model initialization.
+            torch_dtype: Deprecated alias for ``dtype``. Defaults to ``auto``.
             distributed_setup: Resolved distributed topology and policy object.
             device_mesh: Pre-created Hugging Face-style device mesh. NeMo wraps it
                 in a topology-only ``DistributedSetup`` internally.
             compile_config: Configuration for torch.compile.
             peft_config: PEFT/LoRA configuration dictionary.
             **kwargs: Additional arguments passed to the encoder's ``build()`` method.
+                ``dtype`` selects model storage dtype and takes precedence over
+                ``torch_dtype`` when not ``None``; accepts ``auto``.
 
         Returns:
             Encoder model instance with loaded weights and all infrastructure applied.
@@ -1108,6 +1143,9 @@ class _NeMoAutoModelForRetrievalBase:
             If kernel patching fails, the method retries with adjusted parameters.
         """
         _reject_separate_distributed_kwargs(kwargs)
+        if (dtype := kwargs.pop("dtype", None)) is not None:
+            torch_dtype = dtype
+        torch_dtype = dtype_from_str(torch_dtype) if torch_dtype != "auto" else torch_dtype
         from nemo_automodel._transformers import retrieval as _enc_mod
 
         encoder_cls = getattr(_enc_mod, cls._ENCODER_CLS_NAME)
@@ -1163,7 +1201,7 @@ class _NeMoAutoModelForRetrievalBase:
         model = encoder_cls.build(
             model_name_or_path=pretrained_model_name_or_path,
             attn_implementation=attn_implementation,
-            torch_dtype=torch_dtype,
+            dtype=torch_dtype,
             **build_kwargs,
         )
 
@@ -1236,7 +1274,8 @@ class NeMoAutoModelBiEncoder(_NeMoAutoModelForRetrievalBase):
         l2_normalize: bool | None = None,
         do_distributed_inbatch_negative: bool = False,
         detach_distributed_inbatch_negatives: bool = True,
-        **kwargs,
+        is_causal: bool | None = None,
+        **kwargs: Any,
     ) -> PreTrainedModel:
         """Load a bi-encoder model with infrastructure.
 
@@ -1254,6 +1293,8 @@ class NeMoAutoModelBiEncoder(_NeMoAutoModelForRetrievalBase):
                 negatives during training.
             detach_distributed_inbatch_negatives: Whether to detach remote passage embeddings in distributed
                 in-batch-negative losses. Set to false for full cross-rank gradient flow.
+            is_causal: Whether the text backbone uses causal self-attention. When omitted, restores a saved policy or
+                defaults to non-causal attention.
             **kwargs: Forwarded to ``_NeMoAutoModelForRetrievalBase.from_pretrained``.
 
         Returns:
@@ -1265,6 +1306,7 @@ class NeMoAutoModelBiEncoder(_NeMoAutoModelForRetrievalBase):
             l2_normalize=l2_normalize,
             do_distributed_inbatch_negative=do_distributed_inbatch_negative,
             detach_distributed_inbatch_negatives=detach_distributed_inbatch_negatives,
+            is_causal=is_causal,
             **kwargs,
         )
 
@@ -1285,3 +1327,30 @@ class NeMoAutoModelCrossEncoder(_NeMoAutoModelForRetrievalBase):
     """
 
     _ENCODER_CLS_NAME = "CrossEncoderModel"
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: str,
+        *args: Any,
+        is_causal: bool | None = None,
+        **kwargs: Any,
+    ) -> PreTrainedModel:
+        """Load a cross-encoder model with a configurable self-attention mode.
+
+        Args:
+            pretrained_model_name_or_path: Path to pretrained model or model identifier.
+            *args: Positional arguments forwarded to the shared retrieval loader.
+            is_causal: Whether the text backbone uses causal self-attention. When omitted, restores a saved policy or
+                preserves the scoring backbone's native attention mode.
+            **kwargs: Forwarded to the shared retrieval loader.
+
+        Returns:
+            CrossEncoderModel instance with loaded weights and all infrastructure applied.
+        """
+        return super().from_pretrained(
+            pretrained_model_name_or_path,
+            *args,
+            is_causal=is_causal,
+            **kwargs,
+        )

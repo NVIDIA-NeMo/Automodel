@@ -17,6 +17,7 @@
 import sys
 import types
 
+from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.loggers.loggers import CometConfig, MLflowConfig, WandbConfig
 
 
@@ -60,6 +61,27 @@ class TestWandbConfig:
         assert captured["project"] == "flux"
         assert captured["mode"] == "online"
         assert captured["dir"] == "/tmp/w"
+
+    def test_build_forwards_environment_resolved_strings(self, monkeypatch):
+        captured = {}
+        fake_wandb = types.ModuleType("wandb")
+        fake_wandb.init = lambda **kw: captured.update(kw) or "run"
+        fake_wandb.Settings = lambda **kw: None
+        monkeypatch.setitem(sys.modules, "wandb", fake_wandb)
+        monkeypatch.setenv("TEST_WANDB_PROJECT", "resolved-project")
+        monkeypatch.setenv("TEST_WANDB_DIR", "/tmp/resolved-wandb")
+
+        wandb_node = ConfigNode(
+            {
+                "project": "${TEST_WANDB_PROJECT}",
+                "dir": "${TEST_WANDB_DIR}",
+            }
+        )
+        cfg = WandbConfig.from_kwargs(**wandb_node.to_dict())
+
+        assert cfg.build() == "run"
+        assert captured["project"] == "resolved-project"
+        assert captured["dir"] == "/tmp/resolved-wandb"
 
 
 class TestMLflowConfig:

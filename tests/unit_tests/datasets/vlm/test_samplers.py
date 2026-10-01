@@ -542,3 +542,51 @@ class TestEdgeCases:
         }
         length = LengthGroupedSampler([example], seed=0, processor=processor).lengths[0]
         assert length == 200
+
+
+# ---------------------------------------------------------------------------
+# max_length pre-filter threshold
+# ---------------------------------------------------------------------------
+
+
+class TestPreFilterThreshold:
+    """The pre-filter keeps samples up to ``max_length + 512``, and says so.
+
+    The log line is the only signal a user gets for why samples left the run, so
+    it has to name the threshold that was actually applied.
+    """
+
+    MAX_LENGTH = 2048
+    HEADROOM = 512
+
+    def _dataset_at(self, *estimates):
+        # The no-processor heuristic is ``len(text) // 3``.
+        return _make_dataset([_text_msg("x" * (3 * e)) for e in estimates])
+
+    def test_keeps_sample_exactly_at_threshold(self):
+        threshold = self.MAX_LENGTH + self.HEADROOM
+        ds = self._dataset_at(threshold)
+        sampler = LengthGroupedSampler(ds, seed=0, max_length=self.MAX_LENGTH)
+        assert sampler.lengths == [threshold]
+        assert len(sampler.sorted_indices) == 1, "a sample at the threshold must be kept"
+
+    def test_drops_sample_one_token_over_threshold(self):
+        threshold = self.MAX_LENGTH + self.HEADROOM
+        ds = self._dataset_at(threshold + 1)
+        sampler = LengthGroupedSampler(ds, seed=0, max_length=self.MAX_LENGTH)
+        assert len(sampler.sorted_indices) == 0
+
+    def test_log_reports_the_threshold_actually_applied(self, caplog):
+        threshold = self.MAX_LENGTH + self.HEADROOM
+        ds = self._dataset_at(8, threshold + 1)
+
+        with caplog.at_level("INFO", logger="nemo_automodel.components.datasets.vlm.samplers"):
+            sampler = LengthGroupedSampler(ds, seed=0, max_length=self.MAX_LENGTH)
+
+        assert len(sampler.sorted_indices) == 1
+        line = next(m for m in caplog.messages if "pre-filtered" in m)
+        assert f"> {threshold} tokens" in line
+        # `max_length + 512` is not `1.2 * max_length`; claiming so misstates the
+        # rule, and the gap grows with context length (0.4% headroom at 128k).
+        assert "1.2" not in line
+        assert str(int(self.MAX_LENGTH * 1.2)) not in line

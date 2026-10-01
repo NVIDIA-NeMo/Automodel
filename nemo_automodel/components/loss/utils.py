@@ -12,12 +12,79 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from numbers import Integral
 from typing import Any
 
 import torch
 import torch.nn as nn
 
-from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy
+from nemo_automodel.components.loss.linear_ce_base import LinearCrossEntropy
+
+_DATASET_IGNORE_INDEX = -100
+
+
+def _get_loss_ignore_index(loss_fn: object) -> int:
+    """Return the label sentinel consumed by ``loss_fn``."""
+    ignore_index = getattr(loss_fn, "ignore_index", _DATASET_IGNORE_INDEX)
+    return int(ignore_index) if isinstance(ignore_index, Integral) else _DATASET_IGNORE_INDEX
+
+
+def _normalize_loss_labels(labels: torch.Tensor, ignore_index: int) -> torch.Tensor:
+    """Map dataset padding to a loss's configured ignore index.
+
+    Args:
+        labels: Integer target tensor of any shape.
+        ignore_index: Label sentinel consumed by the loss.
+
+    Returns:
+        Target tensor with the same shape, dtype, and device as ``labels``.
+        The input is returned unchanged when ``ignore_index`` is ``-100``;
+        otherwise a new tensor maps dataset padding from ``-100`` to the
+        configured sentinel.
+    """
+    if ignore_index == _DATASET_IGNORE_INDEX:
+        return labels
+    return labels.masked_fill(labels == _DATASET_IGNORE_INDEX, ignore_index)
+
+
+def _normalize_kd_labels(
+    labels: torch.Tensor,
+    *,
+    loss_ignore_index: int,
+    kd_ignore_index: int,
+) -> torch.Tensor:
+    """Align KD supervision with the main loss mask.
+
+    Args:
+        labels: Integer target tensor of any shape.
+        loss_ignore_index: Label sentinel consumed by the main loss.
+        kd_ignore_index: Label sentinel consumed by the KD loss.
+
+    Returns:
+        Target tensor with the same shape, dtype, and device as ``labels``.
+        Positions ignored by the dataset or main loss contain
+        ``kd_ignore_index``. Valid labels equal to ``kd_ignore_index`` are
+        remapped to ``loss_ignore_index`` so they remain supervised.
+    """
+    labels = _normalize_loss_labels(labels, loss_ignore_index)
+    valid_mask = labels != loss_ignore_index
+    kd_labels = labels.masked_fill(~valid_mask, kd_ignore_index)
+    if kd_ignore_index != loss_ignore_index:
+        kd_labels = kd_labels.masked_fill(valid_mask & (kd_labels == kd_ignore_index), loss_ignore_index)
+    return kd_labels
+
+
+def _count_label_tokens(labels: torch.Tensor, ignore_index: int) -> int:
+    """Count supervised entries in an integer target tensor of any shape.
+
+    Both the dataset's ``-100`` padding and the configured ``ignore_index``
+    are excluded. The return value is a Python integer.
+    """
+    valid = labels != _DATASET_IGNORE_INDEX
+    if ignore_index != _DATASET_IGNORE_INDEX:
+        valid = valid & (labels != ignore_index)
+    return int(valid.sum().item())
 
 
 def _get_lm_head_module(model: nn.Module) -> nn.Module | None:
@@ -70,26 +137,56 @@ def _get_final_hidden_states(model_output: Any) -> Any | None:
     return hidden_states
 
 
-def calculate_loss(loss_fn: nn.Module, **kwargs: Any) -> torch.Tensor:
-    """Calculate a logit-based or fused linear cross-entropy loss.
+def prepare_lm_weight(
+    loss_fn: LinearCrossEntropy,
+    model: nn.Module,
+    *,
+    grad_reduce_group: torch.distributed.ProcessGroup | None = None,
+) -> torch.Tensor:
+    """Prepare one shared projection weight for main and auxiliary losses.
 
     Args:
-        loss_fn: Loss module. ``FusedLinearCrossEntropy`` consumes
+        loss_fn: Linear-projection loss that owns materialization semantics.
+        model: Model with an output head of global shape [vocab, hidden].
+        grad_reduce_group: Group contributing independent token losses.
+
+    Returns:
+        Dense [vocab, hidden] weight under ``materialize_lm_weight``'s layout
+        and gradient contract. Chunked CE also honors the head's compute dtype;
+        share this result across loss calls to retain only one converted copy.
+    """
+    if isinstance(loss_fn, ChunkedCrossEntropy):
+        return loss_fn.prepare_lm_weight(
+            _get_lm_head_module(model),
+            model_config=getattr(model, "config", None),
+            grad_reduce_group=grad_reduce_group,
+        )
+    return loss_fn.materialize_lm_weight(_get_lm_head_weight(model), grad_reduce_group=grad_reduce_group)
+
+
+def calculate_loss(loss_fn: nn.Module, **kwargs: Any) -> torch.Tensor:
+    """Calculate a logits-based or linear-projection cross-entropy loss.
+
+    Args:
+        loss_fn: Loss module. ``LinearCrossEntropy`` implementations consume
             ``hidden_states`` with shape ``[batch, sequence, hidden]``, labels
             with shape ``[batch, sequence]``, and an LM-head weight with global
             shape ``[vocab, hidden]``. Other loss modules consume logits with
             shape ``[batch, sequence, vocab]`` and labels.
         **kwargs: Loss inputs. Rank-local tensors keep their existing layout;
             ``grad_reduce_group`` describes the ranks contributing independent
-            fused-loss shards. The caller's mapping and tensors are not mutated.
+            linear-loss shards. The caller's mapping and tensors are not mutated.
 
     Returns:
         Scalar loss tensor that does not alias an input.
     """
     loss_fn_kwargs = {"num_label_tokens": kwargs.pop("num_label_tokens", None)}
-    if isinstance(loss_fn, FusedLinearCrossEntropy):
+    labels = _normalize_loss_labels(kwargs.pop("labels"), _get_loss_ignore_index(loss_fn))
+    loss_weights = kwargs.pop("loss_weights", None)
+    if loss_weights is not None:
+        loss_fn_kwargs["loss_weights"] = loss_weights
+    if isinstance(loss_fn, LinearCrossEntropy):
         model = kwargs.pop("model")
-        labels = kwargs.pop("labels")
         # Reuse a caller-materialized LM head when provided so a single
         # full_tensor() all-gather is shared across the main loss and every MTP
         # depth (see calculate_mtp_loss). Re-gathering the (vocab x hidden) head
@@ -97,7 +194,12 @@ def calculate_loss(loss_fn: nn.Module, **kwargs: Any) -> torch.Tensor:
         # on-device and OOM large-vocab MoE (e.g. Nemotron-Ultra, 256k vocab).
         lm_head = kwargs.pop("lm_weight", None)
         if lm_head is None:
-            lm_head = _get_lm_head_weight(model)
+            lm_head = prepare_lm_weight(loss_fn, model, grad_reduce_group=kwargs.get("grad_reduce_group"))
+        if isinstance(loss_fn, ChunkedCrossEntropy):
+            logits = kwargs.get("logits")
+            loss_fn_kwargs["logits_dtype"] = kwargs.pop(
+                "logits_dtype", logits.dtype if isinstance(logits, torch.Tensor) else None
+            )
         loss_fn_kwargs.update(
             {
                 "hidden_states": kwargs.pop("hidden_states"),
@@ -112,7 +214,7 @@ def calculate_loss(loss_fn: nn.Module, **kwargs: Any) -> torch.Tensor:
         loss_fn_kwargs.update(
             {
                 "logits": kwargs.pop("logits"),
-                "labels": kwargs.pop("labels"),
+                "labels": labels,
             }
         )
 

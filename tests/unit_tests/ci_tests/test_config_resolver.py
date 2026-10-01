@@ -28,6 +28,10 @@ if str(SCRIPTS_DIR) not in sys.path:
 
 import config_resolver  # noqa: E402
 
+# Over the default 5s budget on purpose: this module launches a fresh interpreter, which re-imports torch from scratch.
+# Shrink the work or the process count before raising this further.
+pytestmark = pytest.mark.timeout(60)
+
 yaml = YAML()
 
 
@@ -350,6 +354,39 @@ def test_glm_5_2_checkpoint_robustness_preserves_pipeline_batch_geometry(tmp_pat
     assert robustness["parity_threshold_overrides"] == {"automodel_reload": {"cosine_similarity": 0.985}}
 
 
+def test_nemotron_nano_full_sft_scopes_calibration_to_reload_mean_kl(tmp_path):
+    """Nemotron Nano keeps standard p95/cosine gates while calibrating reload mean KL."""
+    recipe_path = REPO_ROOT / "examples/llm_finetune/nemotron/customizer_nemotron_nano_full_sft.yaml"
+    out = tmp_path / "resolved.yaml"
+    env = {"PIPELINE_DIR": str(tmp_path), "TEST_NAME": recipe_path.stem, "NEMO_CI_PATH": "/mnt/nci"}
+    _run_resolver(
+        ["--base", str(recipe_path), "--phase", "checkpoint_robustness", "--output", str(out)],
+        env=env,
+    )
+
+    robustness = yaml.load(out.open())["ci"]["checkpoint_robustness"]
+    assert robustness["parity_threshold_overrides"] == {"automodel_reload": {"mean_kl": 0.004}}
+    assert "parity_tolerance_profile" not in robustness
+    assert "parity_tolerance_profile_overrides" not in robustness
+
+
+def test_gpt_oss_20b_scopes_relaxed_tolerance_to_resume(tmp_path):
+    """GPT-OSS keeps logit parity standard while allowing measured resume drift."""
+    recipe_path = REPO_ROOT / "examples/llm_finetune/gpt_oss/gpt_oss_20b.yaml"
+    out = tmp_path / "resolved.yaml"
+    env = {"PIPELINE_DIR": str(tmp_path), "TEST_NAME": recipe_path.stem, "NEMO_CI_PATH": "/mnt/nci"}
+    _run_resolver(
+        ["--base", str(recipe_path), "--phase", "checkpoint_robustness", "--output", str(out)],
+        env=env,
+    )
+
+    robustness = yaml.load(out.open())["ci"]["checkpoint_robustness"]
+    assert robustness["resume_tolerance_profile"] == "relaxed"
+    assert "resume_loss_threshold" not in robustness
+    assert "parity_tolerance_profile" not in robustness
+    assert "parity_threshold_overrides" not in robustness
+
+
 @pytest.mark.parametrize(
     "recipe_path",
     [
@@ -597,9 +634,10 @@ def test_vlm_checkpoint_robustness_recipes_resolve(tmp_path, recipe_path):
         assert robustness["hf_device_map_auto"] is True
     if "/mistral4/" in recipe_path:
         assert robustness["hf_source_post_load_dequantize"] is True
+        assert robustness["hf_reference_compute_fp32"] is True
         assert "parity_tolerance_profile" not in robustness
         assert robustness["parity_tolerance_profile_overrides"] == {
-            "automodel_reload": "relaxed",
+            "source_load": "relaxed",
             "hf_reload": "relaxed",
         }
         for key in (

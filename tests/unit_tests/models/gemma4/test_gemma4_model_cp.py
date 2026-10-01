@@ -258,6 +258,34 @@ def test_forward_moe_cp_pixel_values_are_spliced_in_forward():
     assert out.logits.shape == (1, 4, cfg.text_config.vocab_size)
 
 
+def test_forward_moe_cp_accepts_per_image_pooler_output():
+    """transformers >=5.15 returns pooler_output as one tensor per image rather
+    than a single stacked tensor; both forms must splice to the same embeds."""
+    cfg = _cfg()
+    cfg.image_token_id = 2
+    model = Gemma4ForConditionalGeneration(cfg, backend=_backend()).to(torch.bfloat16)
+    model._cp_enabled = True
+    per_image = [torch.full((1, cfg.text_config.hidden_size), i + 1.0, dtype=torch.bfloat16) for i in range(2)]
+    captured = {}
+
+    def fake_lm(*args, **kwargs):
+        captured["inputs_embeds"] = kwargs.get("inputs_embeds")
+        return SimpleNamespace(last_hidden_state=torch.zeros(1, 4, cfg.text_config.hidden_size, dtype=torch.bfloat16))
+
+    with (
+        mock.patch.object(model.model, "get_image_features", return_value=SimpleNamespace(pooler_output=per_image)),
+        mock.patch.object(model.model.language_model, "forward", side_effect=fake_lm),
+    ):
+        out = model(input_ids=torch.tensor([[1, 2, 3, 2]]), pixel_values=torch.randn(2, 3, 8, 8))
+
+    # The two image rows land at the two image_token_id positions, in order.
+    embeds = captured["inputs_embeds"]
+    assert embeds.shape == (1, 4, cfg.text_config.hidden_size)
+    assert torch.equal(embeds[0, 1], per_image[0][0])
+    assert torch.equal(embeds[0, 3], per_image[1][0])
+    assert out.logits.shape == (1, 4, cfg.text_config.vocab_size)
+
+
 # ---------------------------------------------------------------------------
 # forward: dense CP branches
 # ---------------------------------------------------------------------------
@@ -434,8 +462,8 @@ def test_decoder_forward_flex_kernel_options_and_padding_branches():
     b, s = 1, 4
     x = torch.randn(b, s, tc.hidden_size, dtype=torch.bfloat16)
     pos = (
-        torch.randn(b, s, tc.head_dim // 2, dtype=torch.bfloat16),
-        torch.randn(b, s, tc.head_dim // 2, dtype=torch.bfloat16),
+        torch.randn(b, s, tc.per_layer_config[0].head_dim // 2, dtype=torch.bfloat16),
+        torch.randn(b, s, tc.per_layer_config[0].head_dim // 2, dtype=torch.bfloat16),
     )
     padding_mask = torch.tensor([[False, False, True, True]])
     captured = {}
@@ -724,6 +752,10 @@ def test_kv_share_holder_is_cache_free_passthrough():
     assert h.get_seq_length(0, foo=1) == 0
     assert h.get_mask_sizes(13) == (13, 0)
     assert h.get_mask_sizes(7, layer_idx=3) == (7, 0)
+    # transformers >=5.15 calls get_query_offset unguarded from
+    # _preprocess_mask_arguments; no cache -> queries start at 0.
+    assert h.get_query_offset() == 0
+    assert h.get_query_offset(layer_idx=3) == 0
     k = torch.randn(1, 2, 4, 8)
     v = torch.randn(1, 2, 4, 8)
     out_k, out_v = h.update(k, v, layer_idx=0)

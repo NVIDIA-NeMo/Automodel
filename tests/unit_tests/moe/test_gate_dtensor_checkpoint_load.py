@@ -27,6 +27,10 @@ from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_tenso
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import Gate
 
+# Over the default 5s budget on purpose: this module spawns worker processes; every child re-imports torch from scratch.
+# Shrink the work or the process count before raising this further.
+pytestmark = pytest.mark.timeout(60)
+
 
 def _make_gate() -> Gate:
     """Construct a tiny gate with a persistent adaptive routing-bias buffer."""

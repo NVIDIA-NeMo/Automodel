@@ -242,6 +242,19 @@ def test_vlm_adapter_roundtrip_and_naming(vlm_model):
         assert torch.allclose(native[key].float(), back[key].float(), atol=1e-6), key
 
 
+def test_vlm_adapter_delegates_view_loaded_native_keys_without_prefix(vlm_model):
+    adapter = vlm_model.state_dict_adapter
+    adapter.text_adapter._view_loaded_native_keys = {
+        "model.layers.0.mlp.experts.gate_and_up_projs",
+        "model.layers.0.mlp.experts.down_projs",
+    }
+
+    assert adapter.view_loaded_native_keys == {
+        "model.layers.0.mlp.experts.gate_and_up_projs",
+        "model.layers.0.mlp.experts.down_projs",
+    }
+
+
 def test_video_grid_rejected(vlm_model):
     # Image-only support: grid_t beyond vision_segment_max_frames must fail loudly
     # (video temporal segmentation is not implemented).

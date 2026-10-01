@@ -97,7 +97,7 @@ def _load_npz_array(path: Path) -> np.ndarray:
     Returns:
         Loaded numpy array.
     """
-    cached = np.load(path)
+    cached = np.load(path, allow_pickle=False)
     return cached[cached.files[0]]
 
 

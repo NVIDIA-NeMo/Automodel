@@ -78,6 +78,17 @@ class DeepseekV4Config(PretrainedConfig):
         index_head_dim: int = 128,
         index_n_heads: int = 64,
         index_topk: int = 512,
+        # Optional DeepSeek-V4-Flash-Vision-Exp tower and image-token bridge.
+        vision_n_layers: int = 0,
+        vision_dim: int = 1024,
+        vision_n_heads: int = 16,
+        vision_inter_dim: int = 2816,
+        vision_patch_size: int = 14,
+        vision_rope_theta: float = 10000.0,
+        vision_downsample_ratio: int = 3,
+        vision_max_n_token: int = 384,
+        vision_min_pixels: int = 147456,
+        vision_max_wh_ratio: float | None = 8,
         # Multi-token prediction layers appended after the main layers
         num_nextn_predict_layers: int = 1,
         # Standard options
@@ -132,6 +143,16 @@ class DeepseekV4Config(PretrainedConfig):
         self.index_head_dim = index_head_dim
         self.index_n_heads = index_n_heads
         self.index_topk = index_topk
+        self.vision_n_layers = vision_n_layers
+        self.vision_dim = vision_dim
+        self.vision_n_heads = vision_n_heads
+        self.vision_inter_dim = vision_inter_dim
+        self.vision_patch_size = vision_patch_size
+        self.vision_rope_theta = vision_rope_theta
+        self.vision_downsample_ratio = vision_downsample_ratio
+        self.vision_max_n_token = vision_max_n_token
+        self.vision_min_pixels = vision_min_pixels
+        self.vision_max_wh_ratio = vision_max_wh_ratio
         self.num_nextn_predict_layers = num_nextn_predict_layers
         self.rms_norm_eps = rms_norm_eps
         self.attention_bias = attention_bias

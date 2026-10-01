@@ -61,6 +61,7 @@ from nemo_automodel.components.models.qwen3_5.packing import (
     GatedDeltaPackedMetadata,
     prepare_gated_delta_packed_metadata,
 )
+from nemo_automodel.components.models.qwen3_5.parallelization import PARALLELIZER
 from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import CPAwareGatedDeltaNet
 from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextRMSNorm
 from nemo_automodel.components.models.qwen3_next.model import Block
@@ -201,6 +202,8 @@ class Qwen3_5DenseMTPSublayer(Qwen3_5DecoderLayer):
         dtype: torch.dtype = torch.bfloat16,
     ) -> None:
         super().__init__(_make_full_attention_config(config, layer_idx), layer_idx)
+        # Transformers 5.15 renamed this discriminator to ``block_type``.
+        self.layer_type = self.block_type
         self.has_fusion = has_fusion
         self.has_final_norm = has_final_norm
         if has_fusion:
@@ -753,6 +756,7 @@ class Qwen3_5ForCausalLM(HFCheckpointingMixin, nn.Module):
         **kwargs: Any,
     ) -> Qwen3_5CausalLMOutputWithPast:
         del labels
+        kwargs.pop("output_hidden_states", None)
         effective_use_cache = False if use_cache is None else use_cache
         outputs = self.model(
             input_ids=input_ids,
@@ -869,6 +873,14 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
 
     tie_word_embeddings_support: TieSupport = TieSupport.BOTH
     _tied_weights_keys = {"lm_head.weight": "model.language_model.embed_tokens.weight"}
+
+    # ``cast_model_to_dtype`` snapshots/restores matched fp32 buffers around its
+    # bulk cast, and ``cast_frozen_modules_to_compute_dtype`` exempts matched
+    # names, so this keeps the vision tower's rotary ``inv_freq`` buffer at its
+    # exact fp32 values under shared bf16/fp16 casts (including the frozen-vision
+    # recipes' cast). Class-level: ``super().__init__()`` runs ``post_init`` ->
+    # ``initialize_weights`` -> the first cast before the constructor body.
+    _keep_in_fp32_modules: list[str] = ["rotary_pos_emb"]
 
     @dataclass(frozen=True)
     class ModelCapabilities:
@@ -1509,4 +1521,6 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         cast_model_to_dtype(self, dtype, skip_modules=("_fp32_params",))
 
 
+Qwen3_5ForCausalLM.parallelizer = PARALLELIZER
+Qwen3_5ForConditionalGeneration.parallelizer = PARALLELIZER
 ModelClass = Qwen3_5ForCausalLM

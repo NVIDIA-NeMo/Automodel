@@ -1,0 +1,28 @@
+model:
+  pretrained_model_name_or_path: "Qwen/Qwen-Image-2.1"
+  checkpoint: null
+  lora_weights: null
+  lora_scale: 1.0
+
+inference:
+  # Qwen-Image-2.1 is sampled without classifier-free guidance, so no guidance_scale.
+  num_inference_steps: 40
+  height: 1024
+  width: 1024
+  dtype: "bfloat16"
+  max_samples: 10
+  prompts:
+    - "A cat sitting on a windowsill watching the rain"
+  pipeline_kwargs: {}
+
+output:
+  output_dir: "./inference_outputs"
+
+distributed: null
+
+vae:
+  enable_slicing: false
+  enable_tiling: false
+  enable_cpu_offload: true
+
+seed: 42

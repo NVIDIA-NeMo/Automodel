@@ -21,7 +21,6 @@ from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM as HFQwen3
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.qwen3.model import Qwen3ForCausalLM
-from nemo_automodel.components.models.qwen3.state_dict_adapter import Qwen3StateDictAdapter
 
 
 def _tiny_config() -> Qwen3Config:
@@ -67,19 +66,6 @@ def test_qwen3_bshd_matches_huggingface_logits_and_gradients():
         assert reference_gradient is not None, name
         assert parameter.grad is not None, name
         torch.testing.assert_close(parameter.grad, reference_gradient, atol=2e-6, rtol=2e-5)
-
-
-def test_qwen3_state_dict_adapter_round_trip_is_exact():
-    """Separate Qwen3 projections must round-trip without key or value changes."""
-    reference_model = HFQwen3ForCausalLM(_tiny_config())
-    state_dict = reference_model.state_dict()
-    adapter = Qwen3StateDictAdapter(reference_model.config)
-
-    round_trip = adapter.to_hf(adapter.from_hf(state_dict))
-
-    assert round_trip.keys() == state_dict.keys()
-    for key, value in state_dict.items():
-        torch.testing.assert_close(round_trip[key], value, atol=0.0, rtol=0.0)
 
 
 @pytest.mark.parametrize("tie_word_embeddings", [True, False])

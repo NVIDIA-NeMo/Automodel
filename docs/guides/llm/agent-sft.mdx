@@ -83,7 +83,7 @@ export LLAMA_BASE_URL=http://localhost:8080/v1
 
 Disable thinking on the server, as shown above. The generator registers the user model with `reasoning: false` and opens its session with `thinkingLevel: "off"`, so it never sends the control that would turn thinking off at inference time. The packaged GGUF build answers without thinking anyway, which is why llama.cpp needs no flag, but a stock Qwen checkpoint served directly has it enabled by default. Leave it on and every generated user turn arrives wrapped in `</think>` and runs to thousands of characters instead of a short question, which lands in the persisted trace and then in the training data. The thinking block also stays in the message content rather than in a separate reasoning field, because the provider registration declares no reasoning support and the server parses none, so `lastAssistantText()` picks it up along with the question. On SGLang, disable thinking through the equivalent server-side option. As an alternative to the server flag, register the user model with Qwen chat-template compatibility (`reasoning: true` plus `compat.thinkingFormat: "qwen-chat-template"`) and keep the session thinking level off.
 
-Two things to keep aligned. `LOCAL_MODELS` ships GGUF repository ids, which vLLM supports only partially and SGLang does not serve, so replace `LOCAL_MODELS[0]` with the unquantized repository you actually serve. The generator sends that entry as the model id, so the served model name has to match it exactly. The placeholder `apiKey: "no-key"` in the provider registration is harmless, because neither server requires a key by default.
+Keep the following two things aligned. `LOCAL_MODELS` ships GGUF repository ids, which vLLM supports only partially and SGLang does not serve, so replace `LOCAL_MODELS[0]` with the unquantized repository you actually serve. The generator sends that entry as the model id, so the served model name has to match it exactly. The placeholder `apiKey: "no-key"` in the provider registration is harmless, because neither server requires a key by default.
 
 </Tip>
 
@@ -165,7 +165,7 @@ Review the following hardware requirements:
 
 - **Full-parameter SFT**: Both recipes shard across 8 GPUs with FSDP2. Qwen2.5-3B can also train unsharded on a single 80 GB GPU because FSDP2 applies only across multiple GPUs.
 - **PEFT with LoRA**: You can train on a single GPU. See [Use PEFT with LoRA](#use-peft-with-lora).
-- **Dataset size**: Both datasets hold a few thousand traces, so a full pass is fast. SynthTraces traces are long multi-turn coding sessions, so its recipe uses `seq_length: 8192` against `4096` for `glaive_toolcall_en`.
+- **Dataset size**: Both datasets hold a few thousand traces, so a full pass is fast. SynthTraces traces are long multi-turn coding sessions, so its recipe uses `seq_length: 8192` compared to `seq_length: 4096` for `glaive_toolcall_en`.
 
 The rest of this guide walks through the `glaive_toolcall_en` recipe, which pairs a tool schema with a generation-based tool-call accuracy evaluator. The SynthTraces recipe covered in [Train on the Generated Traces](#train-on-the-generated-traces) shares the same adapter and training loop, but supplies no tool schema, so it reports `loss` and `val_loss` only.
 
@@ -312,7 +312,7 @@ I'm looking up Apple's stock price. 🚀
 Instead of a clean `get_stock_price(symbol="AAPL")` tool call, the base model answers in prose and fabricates content. Fine-tuning corrects this failure.
 
 <Note>
-Greedy output is deterministic for a given model snapshot and Transformers version, so you might see slight variation from the trace above.
+Greedy output is deterministic for a given model snapshot and Transformers version. A different snapshot or library version can produce a slightly different trace from the one above.
 
 </Note>
 
@@ -356,16 +356,17 @@ tool_call_eval:
 ```
 
 <Note>
-**Why `answer_only_loss_mask`?** The agent dataset uses `answer_only_loss_mask` to supervise only the tokens that the model must *produce* (assistant text and `tool_calls`). User turns and tool responses are masked to `-100`, so the model is never trained to "predict the environment." This behavior is enabled by default in `make_agent_chat_dataset`.
+**Answer-only loss mask.** The agent dataset uses `answer_only_loss_mask` to supervise only the tokens that the model must produce (assistant text and `tool_calls`). User turns and tool responses are masked to `-100`, so the model is never trained to predict the environment. This behavior is enabled by default in `make_agent_chat_dataset`.
 
 </Note>
 
 <Tip>
-`make_agent_chat_dataset` exposes three flags worth knowing for agent traces:
+`make_agent_chat_dataset` exposes four flags worth knowing for agent traces:
 
 - `train_on_last_turn_only`: Supervises only the final assistant turn (`mask_history`).
 - `mask_reasoning_content`: Renders assistant `reasoning_content` (thinking) into the prompt but excludes it from the loss. Defaults to `false`, so a chat template that emits `reasoning_content` inside its `{% generation %}` block trains the model to reproduce that reasoning. The SynthTraces template does exactly this; see the warning in [Train on the Generated Traces](#train-on-the-generated-traces).
 - `drop_history_reasoning_content`: Strips prior-turn thinking from the prompt entirely to match inference. This option works best with `train_on_last_turn_only=true`.
+- `mask_generation_prompt`: Excludes from the loss the tokens of each assistant turn that the chat template's generation prompt supplies at inference: the role header and any template-inserted empty reasoning block (for example, the `<think></think>` Nemotron templates emit, or the `<think>\n\n</think>\n\n` Qwen3 emits, for turns without `reasoning_content`). The model never generates those tokens, so supervising them only reinforces template boilerplate. Detected by rendering the generation prompt, so no tag strings are configured. Only a generation prompt the template appends to the unchanged conversation prefix, and that the rendered turn reproduces in full, is removed; anything else leaves the turn supervised. Like answer-only masking without `{% generation %}` blocks, it locates turns by rendering conversation prefixes, so multi-turn traces need a template that renders earlier turns the same way as the conversation grows (or a `{% generation %}` template); stock Qwen3 rewrites earlier assistant turns and is single-turn only on this path. Defaults to `false`.
 
 </Tip>
 

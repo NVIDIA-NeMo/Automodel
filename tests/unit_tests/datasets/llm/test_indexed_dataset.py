@@ -26,6 +26,10 @@ from nemo_automodel.components.datasets.llm.megatron.indexed_dataset import (
     get_idx_path,
 )
 
+# Over the default 5s budget on purpose: this module starts DataLoader worker processes.
+# Shrink the work or the process count before raising this further.
+pytestmark = pytest.mark.timeout(60)
+
 
 @pytest.fixture
 def indexed_dataset_prefix(tmp_path):

@@ -521,3 +521,6 @@ class MambaContextParallel:
         C_sliced = C_param[bc_start : bc_start + bc_size]
 
         return torch.cat([x_sliced, B_sliced, C_sliced], dim=0).contiguous()
+
+
+__all__ = ["MambaContextParallel"]

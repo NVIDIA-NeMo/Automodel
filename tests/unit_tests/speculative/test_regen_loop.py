@@ -28,15 +28,19 @@ from dataclasses import asdict
 import pytest
 
 from nemo_automodel.components.speculative.regen_loop import (
-    RegenConfig,
-    RegenRunner,
     _DONE_FILENAME,
     _SHARDS_DIRNAME,
+    RegenConfig,
+    RegenRunner,
     _regenerate_argv,
     _target_server_argv,
     main,
     resolve_regen_config,
 )
+
+# Over the default 5s budget on purpose: this module launches a fresh interpreter, which re-imports torch from scratch.
+# Shrink the work or the process count before raising this further.
+pytestmark = pytest.mark.timeout(60)
 
 _MODULE = "nemo_automodel.components.speculative.regen_loop"
 

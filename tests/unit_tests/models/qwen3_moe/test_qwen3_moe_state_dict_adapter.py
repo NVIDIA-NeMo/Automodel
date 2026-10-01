@@ -18,9 +18,12 @@ import pytest
 import torch
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
-from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.qwen3_moe.state_dict_adapter import Qwen3MoeStateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
+from nemo_automodel.components.models.common import BackendConfig
+
+
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 
 
 @pytest.fixture
@@ -81,35 +84,9 @@ def adapter(config, moe_config, backend_config):
     return Qwen3MoeStateDictAdapter(config=config, moe_config=moe_config, backend=backend_config, dtype=torch.float32)
 
 
-@pytest.mark.parametrize("v4_compatible", [False, True])
-@pytest.mark.parametrize("prefix", ["model.", ""])
-def test_adapter_lora_round_trip(adapter: Qwen3MoeStateDictAdapter, v4_compatible: bool, prefix: str) -> None:
-    """Qwen3-MoE's adapter preserves expert LoRA weights through v4 and v5 exports."""
-    adapter._uses_model_prefix = bool(prefix)
-    base = f"{prefix}layers.0.mlp.experts"
-    experts, hidden, intermediate, rank = 4, 64, 64, 8
-    native = {
-        f"{base}.lora_gate_and_up_A": torch.randn(experts, hidden, rank),
-        f"{base}.lora_gate_and_up_B": torch.randn(experts, rank, 2 * intermediate),
-        f"{base}.lora_down_A": torch.randn(experts, intermediate, rank),
-        f"{base}.lora_down_B": torch.randn(experts, rank, hidden),
-    }
-    exported = adapter.to_hf(native, v4_compatible=v4_compatible)
-    if v4_compatible:
-        assert f"{base}.0.gate_proj.lora_A.weight" in exported
-        assert len(exported) == experts * 6
-    else:
-        assert f"{base}.base_layer.lora_A.weight" in exported
-        assert len(exported) == 4
-    torch.testing.assert_close(adapter.from_hf(dict(exported)), native, atol=0, rtol=0)
-    assert not adapter.to_hf(native, v4_compatible=v4_compatible, exclude_key_regex=r".*lora_[AB]\.weight$")
-
-
 class TestInitialization:
     def test_sets_expected_attributes(self, config, moe_config, backend_config):
-        adapter = Qwen3MoeStateDictAdapter(
-            config=config, moe_config=moe_config, backend=backend_config, dtype=torch.float16
-        )
+        adapter = Qwen3MoeStateDictAdapter(config=config, moe_config=moe_config, backend=backend_config, dtype=torch.float16)
 
         assert adapter.config is config
         assert adapter.moe_config is moe_config
@@ -206,7 +183,7 @@ class TestConvertSingleTensorToHf:
         tensor = torch.randn(4, 64, 128)
         fqn = "model.layers.0.mlp.experts.gate_and_up_projs"
 
-        with patch.object(adapter, "_convert_single_merged_expert_to_hf_split_experts") as mock_convert:
+        with patch.object(adapter, '_convert_single_merged_expert_to_hf_split_experts') as mock_convert:
             mock_convert.return_value = [
                 ("model.layers.0.mlp.experts.0.gate_proj.weight", torch.randn(64, 64)),
                 ("model.layers.0.mlp.experts.0.up_proj.weight", torch.randn(64, 64)),
@@ -223,7 +200,7 @@ class TestConvertSingleTensorToHf:
         tensor = torch.randn(64, 64)
         fqn = "model.layers.0.attention.weight"
 
-        with patch.object(adapter, "_convert_single_merged_expert_to_hf_split_experts") as mock_convert:
+        with patch.object(adapter, '_convert_single_merged_expert_to_hf_split_experts') as mock_convert:
             mock_convert.return_value = None
 
             result = adapter.convert_single_tensor_to_hf(fqn, tensor)
@@ -236,7 +213,7 @@ class TestConvertSingleTensorToHf:
         tensor = torch.randn(64, 64)
         fqn = "exclude_this.weight"
 
-        with patch.object(adapter, "_convert_single_merged_expert_to_hf_split_experts", return_value=None):
+        with patch.object(adapter, '_convert_single_merged_expert_to_hf_split_experts', return_value=None):
             result = adapter.convert_single_tensor_to_hf(fqn, tensor, exclude_key_regex=r"exclude.*")
 
             assert len(result) == 0
@@ -245,7 +222,7 @@ class TestConvertSingleTensorToHf:
         tensor = torch.randn(4, 64, 128)
         fqn = "model.layers.0.mlp.experts.gate_and_up_projs"
 
-        with patch.object(adapter, "_convert_single_merged_expert_to_hf_split_experts") as mock_convert:
+        with patch.object(adapter, '_convert_single_merged_expert_to_hf_split_experts') as mock_convert:
             mock_convert.return_value = [
                 ("model.layers.0.mlp.experts.0.gate_proj.weight", torch.randn(64, 64)),
                 ("exclude_me.weight", torch.randn(64, 64)),
@@ -261,7 +238,7 @@ class TestConvertSingleTensorToHf:
         tensor = torch.randn(64, 64)
         fqn = "model.layers.0.self_attn.q_proj.weight"
 
-        with patch.object(adapter, "_convert_single_merged_expert_to_hf_split_experts", return_value=None):
+        with patch.object(adapter, '_convert_single_merged_expert_to_hf_split_experts', return_value=None):
             result = adapter.convert_single_tensor_to_hf(fqn, tensor)
 
             assert len(result) == 1

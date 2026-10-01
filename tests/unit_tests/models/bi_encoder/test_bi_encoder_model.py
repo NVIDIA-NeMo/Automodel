@@ -18,6 +18,7 @@ import pytest
 import torch
 
 import nemo_automodel._transformers.auto_model as am
+import nemo_automodel.components.models.common.inbatch_neg_utils as inbatch_neg_utils
 import nemo_automodel.recipes.retrieval.train_bi_encoder as tbe
 from nemo_automodel._transformers.retrieval import BiEncoderModel, CrossEncoderModel
 from nemo_automodel.recipes.retrieval.train_bi_encoder import (
@@ -135,6 +136,7 @@ def test_from_pretrained_happy_path(monkeypatch):
         l2_normalize=True,
         do_distributed_inbatch_negative=True,
         detach_distributed_inbatch_negatives=False,
+        is_causal=True,
         use_liger_kernel=True,
         use_sdpa_patching=True,
         sdpa_method=None,
@@ -147,6 +149,7 @@ def test_from_pretrained_happy_path(monkeypatch):
     assert last_kwargs["attn_implementation"] == am.DEFAULT_ATTN_IMPLEMENTATION
     assert last_kwargs["do_distributed_inbatch_negative"] is True
     assert last_kwargs["detach_distributed_inbatch_negatives"] is False
+    assert last_kwargs["is_causal"] is True
     assert last_kwargs["some_other_kwarg"] == "x"
 
 
@@ -170,6 +173,7 @@ def test_from_pretrained_defers_omitted_wrapper_options_to_saved_metadata(monkey
 
     assert last_kwargs["pooling"] is None
     assert last_kwargs["l2_normalize"] is None
+    assert last_kwargs["is_causal"] is None
 
 
 def _assert_retries_without_liger(monkeypatch, build_model_cls, auto_model_cls):
@@ -238,7 +242,8 @@ def test_from_pretrained_retries_without_sdpa(monkeypatch):
     _assert_retries_without_sdpa(monkeypatch, BiEncoderModel, am.NeMoAutoModelBiEncoder)
 
 
-def test_cross_encoder_from_pretrained(monkeypatch):
+@pytest.mark.parametrize("is_causal", [None, False, True], ids=["native", "bidirectional", "causal"])
+def test_cross_encoder_from_pretrained(monkeypatch, is_causal):
     calls = {"build": 0}
     last_kwargs = {}
 
@@ -257,13 +262,16 @@ def test_cross_encoder_from_pretrained(monkeypatch):
     monkeypatch.setattr(am, "_patch_attention", lambda m, _: m)
     monkeypatch.setattr(am, "apply_model_infrastructure", fake_apply_infrastructure)
 
-    model = am.NeMoAutoModelCrossEncoder.from_pretrained("mock-model")
+    policy_kwargs = {} if is_causal is None else {"is_causal": is_causal}
+    model = am.NeMoAutoModelCrossEncoder.from_pretrained("mock-model", "eager", **policy_kwargs)
     assert isinstance(model, DummyModel)
     assert calls["build"] == 1
     # CrossEncoder build should NOT receive pooling or l2_normalize
     assert "pooling" not in last_kwargs
     assert "l2_normalize" not in last_kwargs
     assert last_kwargs["model_name_or_path"] == "mock-model"
+    assert last_kwargs["attn_implementation"] == "eager"
+    assert last_kwargs["is_causal"] is is_causal
 
 
 def test_cross_encoder_retries_without_liger(monkeypatch):
@@ -491,8 +499,6 @@ def test_forward_backward_step_supports_distributed_multi_vector_inbatch_negativ
     detach_distributed_inbatch_negatives,
 ):
     """Exercise the trainer branch that gathers token embeddings across ranks."""
-    import nemo_automodel.components.models.common.inbatch_neg_utils as inbatch_neg_utils
-
     recipe = TrainBiEncoderRecipe.__new__(TrainBiEncoderRecipe)
     recipe.dist_env = SimpleNamespace(device="cpu")
     recipe.distributed_config = SimpleNamespace(defer_fsdp_grad_sync=True)

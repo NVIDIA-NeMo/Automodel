@@ -36,7 +36,12 @@ from nemo_automodel.components.models.kimi_linear.cp import all_gather_sequence,
 # Run only on the GPU job. Each test mp.spawns two gloo worker processes that
 # re-import the full package, and these cover a multi-GPU feature, so they are
 # skipped on the CPU unit-test job.
-pytestmark = pytest.mark.run_only_on("GPU")
+# Over the default 5s budget on purpose: this module spawns worker processes; every child re-imports torch from scratch.
+# Shrink the work or the process count before raising this further.
+pytestmark = [
+    pytest.mark.timeout(60),
+    pytest.mark.run_only_on("GPU"),
+]
 
 WORLD_SIZE = 2
 LOCAL_LEN = 3

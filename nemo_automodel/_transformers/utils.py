@@ -20,7 +20,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from transformers import AutoConfig
+from transformers import AutoConfig, PretrainedConfig
 
 logger = logging.getLogger(__name__)
 
@@ -226,6 +226,28 @@ def apply_cache_compatibility_patches():
     _patch_special_tokens_pattern()
 
     import transformers.cache_utils as cache_utils
+    import transformers.utils.import_utils as import_utils
+
+    # Remote v4 checkpoints still import this predicate; v4 defined it as
+    # is_torch_available(), so retain those semantics on v5.
+    if not hasattr(import_utils, "is_torch_fx_available"):
+        import_utils.is_torch_fx_available = import_utils.is_torch_available
+
+    # v5 moved default RoPE initialization into individual model classes.
+    # Remote v4 models still look it up in this registry using their v4 config.
+    from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+
+    if "default" not in ROPE_INIT_FUNCTIONS:
+
+        def _default_rope_parameters(
+            config: PretrainedConfig, device: torch.device | None = None, seq_len: int | None = None
+        ) -> tuple[torch.Tensor, float]:
+            head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+            dim = int(head_dim * getattr(config, "partial_rotary_factor", 1.0))
+            indices = torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float32)
+            return 1.0 / (config.rope_theta ** (indices / dim)), 1.0
+
+        ROPE_INIT_FUNCTIONS["default"] = _default_rope_parameters
 
     # SlidingWindowCache was removed in transformers v5.x
     if not hasattr(cache_utils, "SlidingWindowCache"):

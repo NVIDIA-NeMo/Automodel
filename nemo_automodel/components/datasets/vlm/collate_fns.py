@@ -1368,14 +1368,17 @@ def _merge_media_values(values: list[Any]) -> torch.Tensor | list[Any]:
         raise ValueError("Media merge requires at least one value.")
     if all(isinstance(value, torch.Tensor) for value in values):
         return torch.cat(values, dim=0).to(torch.bfloat16)
-    if all(isinstance(value, (list, tuple)) for value in values):
-        return [
-            item.to(torch.bfloat16) if isinstance(item, torch.Tensor) else item for value in values for item in value
-        ]
-    raise TypeError(
-        "VLM media values must be consistently tensors or variable-resolution lists, "
-        f"got {[type(value).__name__ for value in values]}."
-    )
+    # At least one pack carries variable-resolution media as a list: flatten
+    # every pack to one tensor per image (a stacked [N, ...] tensor splits along dim 0).
+    flat = []
+    for value in values:
+        if isinstance(value, torch.Tensor):
+            flat.extend(value.to(torch.bfloat16))
+        elif isinstance(value, (list, tuple)):
+            flat.extend(item.to(torch.bfloat16) if isinstance(item, torch.Tensor) else item for item in value)
+        else:
+            raise TypeError(f"VLM media values must be tensors or lists, got {type(value).__name__}.")
+    return flat
 
 
 def pad_collate_fn(
@@ -1766,6 +1769,16 @@ def packed_sequence_thd_vlm_collater(
         tensors = [x[key] for x in batch if key in x and x[key] is not None]
         if tensors:
             result[key] = torch.cat(tensors, dim=0)
+
+    # Preserve the pack-to-media mapping for pipeline-parallel microbatching.
+    # A packed row can contain multiple original image/video samples, so the
+    # flat media tensors cannot be split from the text batch dimension alone.
+    image_counts = [int(x.get("n_images", 0)) for x in batch]
+    video_counts = [int(x.get("n_videos", 0)) for x in batch]
+    if any(count > 0 for count in image_counts):
+        result["n_images_per_sample"] = torch.tensor(image_counts, dtype=torch.long)
+    if any(count > 0 for count in video_counts):
+        result["n_videos_per_sample"] = torch.tensor(video_counts, dtype=torch.long)
 
     return result
 

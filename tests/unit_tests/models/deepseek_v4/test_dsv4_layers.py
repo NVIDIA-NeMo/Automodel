@@ -57,6 +57,10 @@ from nemo_automodel.components.models.deepseek_v4.optimized_kernels import (
     sinkhorn_normalize_torch,
 )
 
+# Over the default 5s budget on purpose: TileLang compilation takes up to about 37s on a cold worker.
+# Reduce cold compiler startup before lowering this further.
+pytestmark = pytest.mark.timeout(60)
+
 _MILES_INDEXER_REQUIRED_DYNAMIC_SMEM_BYTES = 229376
 
 

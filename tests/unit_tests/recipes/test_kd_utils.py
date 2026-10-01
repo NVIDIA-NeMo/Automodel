@@ -22,6 +22,7 @@ import yaml
 
 from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config
 from nemo_automodel.components.loss.kd_loss import KDLoss
+from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.recipes import kd_utils
 from tests.functional_tests.llm_pretrain_and_kd import kd_separate_mesh_test_utils
 from tests.functional_tests.llm_pretrain_and_kd.compare_kd_sep_mesh_losses import _compare_pair
@@ -459,6 +460,7 @@ def test_pp_kd_wrapper_consumes_teacher_microbatches_in_order():
 
     recipe = object.__new__(llm_kd.KnowledgeDistillationRecipeForNextTokenPrediction)
     recipe.kd_ratio = 1.0
+    recipe.loss_fn = MaskedCrossEntropy()
     recipe.kd_loss_fn = KDLoss()
     recipe._kd_loss_buffer = []
     recipe._ce_loss_buffer = []
@@ -479,3 +481,46 @@ def test_pp_kd_wrapper_consumes_teacher_microbatches_in_order():
     torch.testing.assert_close(first, KDLoss()(student_logits, teacher_logits[0], labels, num_batch_labels=1))
     torch.testing.assert_close(second, KDLoss()(student_logits, teacher_logits[1], labels, num_batch_labels=1))
     assert recipe._current_teacher_logits == []
+
+
+def test_pp_kd_wrapper_uses_main_loss_mask():
+    """PP KD uses the same supervised positions as its outer denominator."""
+    from nemo_automodel.recipes.llm import kd as llm_kd
+
+    recipe = object.__new__(llm_kd.KnowledgeDistillationRecipeForNextTokenPrediction)
+    recipe.kd_ratio = 1.0
+    recipe.loss_fn = MaskedCrossEntropy(ignore_index=0)
+    recipe.kd_loss_fn = KDLoss()
+    recipe._kd_loss_buffer = []
+    recipe._ce_loss_buffer = []
+    recipe.separate_meshes = False
+    teacher_logits = torch.tensor(
+        [
+            [[0.8, -0.2, 0.1], [0.1, 0.4, -0.5]],
+            [[0.6, -0.3, 0.2], [-0.1, 0.9, 0.0]],
+        ]
+    )
+    student_values = torch.tensor(
+        [
+            [[0.2, -0.1, 0.4], [0.5, 0.0, -0.3]],
+            [[-0.2, 0.3, 0.1], [0.7, -0.4, 0.2]],
+        ]
+    )
+    labels = torch.tensor([[0, 1], [0, 2]])
+    recipe._current_teacher_logits = teacher_logits
+    loss_fn = recipe._make_pp_kd_loss_wrapper()
+    student_logits = student_values.clone().requires_grad_(True)
+    reference_logits = student_values.clone().requires_grad_(True)
+
+    actual = loss_fn(student_logits, labels)
+    expected = KDLoss()(
+        reference_logits,
+        teacher_logits,
+        labels.masked_fill(labels == 0, -100),
+        num_batch_labels=1,
+    )
+    actual.backward()
+    expected.backward()
+
+    torch.testing.assert_close(actual, expected.detach())
+    torch.testing.assert_close(student_logits.grad, reference_logits.grad)

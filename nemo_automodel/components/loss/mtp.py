@@ -20,12 +20,13 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+from nemo_automodel.components.loss.linear_ce_base import LinearCrossEntropy
 from nemo_automodel.components.loss.utils import (
     _get_final_hidden_states,
     _get_lm_head_module,
-    _get_lm_head_weight,
+    _get_loss_ignore_index,
     calculate_loss,
+    prepare_lm_weight,
 )
 from nemo_automodel.components.models.common.mtp import get_mtp_loss_scaling_factor, roll_tensor
 
@@ -55,11 +56,13 @@ def calculate_mtp_loss(
     model: nn.Module,
     scaling_factor: float = 0.1,
     num_label_tokens: int | None = None,
-    ignore_index: int = -100,
+    ignore_index: int | None = None,
     cu_seqlens: torch.Tensor | None = None,
     seq_idx: torch.Tensor | None = None,
     lm_weight: torch.Tensor | None = None,
+    logits_dtype: torch.dtype | None = None,
     grad_reduce_group: dist.ProcessGroup | None = None,
+    loss_weights: torch.Tensor | None = None,
     return_per_depth: Literal[False] = False,
 ) -> torch.Tensor: ...
 
@@ -75,11 +78,13 @@ def calculate_mtp_loss(
     model: nn.Module,
     scaling_factor: float = 0.1,
     num_label_tokens: int | None = None,
-    ignore_index: int = -100,
+    ignore_index: int | None = None,
     cu_seqlens: torch.Tensor | None = None,
     seq_idx: torch.Tensor | None = None,
     lm_weight: torch.Tensor | None = None,
+    logits_dtype: torch.dtype | None = None,
     grad_reduce_group: dist.ProcessGroup | None = None,
+    loss_weights: torch.Tensor | None = None,
     return_per_depth: Literal[True],
 ) -> MTPLossOutput: ...
 
@@ -95,11 +100,13 @@ def calculate_mtp_loss(
     model: nn.Module,
     scaling_factor: float = 0.1,
     num_label_tokens: int | None = None,
-    ignore_index: int = -100,
+    ignore_index: int | None = None,
     cu_seqlens: torch.Tensor | None = None,
     seq_idx: torch.Tensor | None = None,
     lm_weight: torch.Tensor | None = None,
+    logits_dtype: torch.dtype | None = None,
     grad_reduce_group: dist.ProcessGroup | None = None,
+    loss_weights: torch.Tensor | None = None,
     return_per_depth: bool,
 ) -> torch.Tensor | MTPLossOutput: ...
 
@@ -114,11 +121,13 @@ def calculate_mtp_loss(
     model: nn.Module,
     scaling_factor: float = 0.1,
     num_label_tokens: int | None = None,
-    ignore_index: int = -100,
+    ignore_index: int | None = None,
     cu_seqlens: torch.Tensor | None = None,
     seq_idx: torch.Tensor | None = None,
     lm_weight: torch.Tensor | None = None,
+    logits_dtype: torch.dtype | None = None,
     grad_reduce_group: dist.ProcessGroup | None = None,
+    loss_weights: torch.Tensor | None = None,
     return_per_depth: bool = False,
 ) -> torch.Tensor | MTPLossOutput:
     """Compute the DeepSeek-V3 Multi-Token Prediction auxiliary loss.
@@ -150,7 +159,8 @@ def calculate_mtp_loss(
         num_label_tokens: Total non-ignore label-token count used for
             sum-reduction normalization.
         ignore_index: Label value masked out of the CE loss for the trailing
-            ``k+1`` rolled positions at depth ``k``.
+            ``k+1`` rolled positions at depth ``k``. Defaults to the configured
+            loss's ignore index and must match it when provided.
         cu_seqlens: Optional cumulative sequence lengths ``[num_seqs+1]``
             (THD-pack layout). When supplied and ``seq_idx`` is not, builds
             a per-token sub-sequence index via searchsorted. Without packing
@@ -162,8 +172,11 @@ def calculate_mtp_loss(
         lm_weight: Optional LM-head weight tensor of shape ``[vocab, hidden]``.
             Supplying it lets the main loss and all MTP depths share one DTensor
             ``full_tensor()`` gather on the FusedLinearCrossEntropy path.
+        logits_dtype: Optional model-owned output dtype after linear projection.
         grad_reduce_group: Group that contributes independent loss shards when
             the shared LM-head weight is a DTensor.
+        loss_weights: Optional per-token objective multipliers matching
+            ``labels.shape``.
         return_per_depth: Return the aggregate loss together with the unscaled
             loss for each MTP depth. Defaults to ``False`` to preserve the
             scalar return expected by existing callers.
@@ -173,6 +186,12 @@ def calculate_mtp_loss(
         :class:`MTPLossOutput` containing the scalar aggregate and scalar
         per-depth losses. All returned tensors retain their autograd graphs.
     """
+    loss_ignore_index = _get_loss_ignore_index(loss_fn)
+    if ignore_index is None:
+        ignore_index = loss_ignore_index
+    elif ignore_index != loss_ignore_index:
+        raise ValueError(f"MTP ignore_index must match the configured loss: got {ignore_index} and {loss_ignore_index}")
+
     if mtp_per_depth_logits is not None:
         if mtp_per_depth_h is not None:
             raise ValueError("Provide exactly one of mtp_per_depth_h or mtp_per_depth_logits")
@@ -216,9 +235,10 @@ def calculate_mtp_loss(
     # they accumulate on-device -> OOM for large-vocab MoE. One shared gather is
     # numerically identical (same weight); grads from every depth accumulate into
     # it and collapse to a single reduce-scatter on the sharded parameter.
-    if isinstance(loss_fn, FusedLinearCrossEntropy) and lm_weight is None:
-        lm_weight = loss_fn.materialize_lm_weight(
-            _get_lm_head_weight(model),
+    if isinstance(loss_fn, LinearCrossEntropy) and lm_weight is None:
+        lm_weight = prepare_lm_weight(
+            loss_fn,
+            model,
             grad_reduce_group=grad_reduce_group,
         )
 
@@ -268,24 +288,27 @@ def calculate_mtp_loss(
             masked = mtp_per_depth_targets[k]
 
         if mtp_per_depth_logits is not None:
-            if isinstance(loss_fn, FusedLinearCrossEntropy):
-                raise ValueError("MTP logits are incompatible with FusedLinearCrossEntropy")
+            if isinstance(loss_fn, LinearCrossEntropy):
+                raise ValueError(f"MTP logits are incompatible with {type(loss_fn).__name__}")
             depth_loss = calculate_loss(
                 loss_fn,
                 logits=mtp_output,
                 labels=masked,
                 model=model,
                 num_label_tokens=num_label_tokens,
+                loss_weights=loss_weights,
             )
-        elif isinstance(loss_fn, FusedLinearCrossEntropy):
+        elif isinstance(loss_fn, LinearCrossEntropy):
             depth_loss = calculate_loss(
                 loss_fn,
                 hidden_states=mtp_output,
                 labels=masked,
                 model=model,
                 lm_weight=lm_weight,
+                logits_dtype=logits_dtype,
                 num_label_tokens=num_label_tokens,
                 grad_reduce_group=grad_reduce_group,
+                loss_weights=loss_weights,
             )
         else:
             lm_head = _get_lm_head_module(model)
@@ -297,6 +320,7 @@ def calculate_mtp_loss(
                 labels=masked,
                 model=model,
                 num_label_tokens=num_label_tokens,
+                loss_weights=loss_weights,
             )
         per_depth_losses.append(depth_loss)
         total = total + depth_loss
@@ -323,14 +347,19 @@ class PipelineCausalLMLoss(nn.Module):
         loss_fn: nn.Module,
         model: nn.Module,
         scaling_factor: float | None = None,
-        ignore_index: int = -100,
+        ignore_index: int | None = None,
         grad_reduce_group: dist.ProcessGroup | None = None,
     ):
         super().__init__()
         self.loss_fn = loss_fn
         self.model = model
         self.scaling_factor = scaling_factor
-        self.ignore_index = ignore_index
+        loss_ignore_index = _get_loss_ignore_index(loss_fn)
+        if ignore_index is not None and ignore_index != loss_ignore_index:
+            raise ValueError(
+                f"MTP ignore_index must match the configured loss: got {ignore_index} and {loss_ignore_index}"
+            )
+        self.ignore_index = loss_ignore_index
         self.grad_reduce_group = grad_reduce_group
         # Legacy THD-pack fallback used when the model has no seq_idx tail.
         self.cu_seqlens: torch.Tensor | None = None
@@ -367,8 +396,8 @@ class PipelineCausalLMLoss(nn.Module):
         seq_idx_mb, output = self._extract_seq_idx_tail(output)
 
         if isinstance(output, tuple):
-            if isinstance(self.loss_fn, FusedLinearCrossEntropy):
-                raise ValueError("FusedLinearCrossEntropy is not supported with MTP under pipeline parallelism")
+            if isinstance(self.loss_fn, LinearCrossEntropy):
+                raise ValueError(f"{type(self.loss_fn).__name__} is not supported with MTP under pipeline parallelism")
             logits = output[0]
             hidden_states = None
             mtp_per_depth_h = None
@@ -383,7 +412,7 @@ class PipelineCausalLMLoss(nn.Module):
             mtp_per_depth_h = getattr(output, "mtp_per_depth_h", None)
             mtp_per_depth_logits = getattr(output, "mtp_per_depth_logits", None)
             model_scaling_factor = getattr(output, "mtp_loss_scaling_factor", get_mtp_loss_scaling_factor(self.model))
-            if isinstance(self.loss_fn, FusedLinearCrossEntropy) and isinstance(output, torch.Tensor):
+            if isinstance(self.loss_fn, LinearCrossEntropy) and isinstance(output, torch.Tensor):
                 logits = None
                 hidden_states = output
             else:
@@ -393,11 +422,12 @@ class PipelineCausalLMLoss(nn.Module):
         # Gather the LM head at most once and thread it through the main loss and
         # every MTP depth (avoids redundant per-call full_tensor() gathers).
         shared_lm_weight = (
-            self.loss_fn.materialize_lm_weight(
-                _get_lm_head_weight(self.model),
+            prepare_lm_weight(
+                self.loss_fn,
+                self.model,
                 grad_reduce_group=self.grad_reduce_group,
             )
-            if isinstance(self.loss_fn, FusedLinearCrossEntropy)
+            if isinstance(self.loss_fn, LinearCrossEntropy)
             else None
         )
         loss = calculate_loss(
@@ -434,11 +464,12 @@ class MTPLossConfig:
     MTP is gated on the model emitting per-depth outputs; this config only
     carries its hyperparameters. ``scaling_factor=None`` keeps the
     model-provided value (``out.mtp_loss_scaling_factor`` /
-    ``get_mtp_loss_scaling_factor``); set it to override.
+    ``get_mtp_loss_scaling_factor``); set it to override. ``ignore_index=None``
+    inherits the configured loss's sentinel; an explicit value must match it.
     """
 
     scaling_factor: float | None = None
-    ignore_index: int = -100
+    ignore_index: int | None = None
 
     def build(
         self,

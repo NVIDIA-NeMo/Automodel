@@ -27,7 +27,7 @@ also be weighted by that probability. Without the correction every one of a toke
 top-k expert contributions carries a full, prob-independent down bias, and the
 combine step sums them (~k x bias instead of ~prob x bias). This is a large, silent
 systematic offset that only manifests with ``experts: te`` (``GroupedExpertsTE``)
-under expert parallelism; the non-EP ``GroupedExperts`` and the ``gmm``
+under expert parallelism; the non-EP ``GroupedExperts`` and the ``torch_mm``
 ``GroupedExpertsDeepEP`` paths weight it correctly. On gpt-oss-20b it pushed step-0
 training loss to ~8.2 instead of the correct ~4.5.
 

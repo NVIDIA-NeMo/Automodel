@@ -14,8 +14,9 @@
 
 import sys
 
-import mlflow
 import pytest
+
+mlflow = pytest.importorskip("mlflow")
 import torch
 import torch.distributed as dist
 
@@ -83,7 +84,8 @@ class TestConfigureMlflow:
         monkeypatch.delenv("MLFLOW_RUN_ID", raising=False)
 
         self.tmp_path = tmp_path
-        self.tracking_uri = f"sqlite:///{tmp_path / 'mlflow.db'}"
+        monkeypatch.setenv("MLFLOW_ALLOW_FILE_STORE", "true")
+        self.tracking_uri = (tmp_path / "mlruns").as_uri()
         mlflow.set_tracking_uri(self.tracking_uri)
         if mlflow.active_run() is not None:
             mlflow.end_run()
@@ -155,7 +157,7 @@ class TestConfigureMlflow:
         run2 = configure_mlflow(self._make_cfg(ckpt_dir=ckpt_dir))
         assert run2.info.run_id == run1.info.run_id
         # And mlflow only sees one run, not two
-        runs = mlflow.search_runs(experiment_names=["test-exp"])
+        runs = mlflow.search_runs(experiment_names=["test-exp"], output_format="list")
         assert len(runs) == 1
 
     def test_resumes_from_env_var(self, monkeypatch):
@@ -259,8 +261,9 @@ class TestConfigureMlflow:
 
 class TestEndMlflowActiveRunAsKilled:
     @pytest.fixture(autouse=True)
-    def _setup(self, tmp_path):
-        mlflow.set_tracking_uri(f"sqlite:///{tmp_path / 'mlflow.db'}")
+    def _setup(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("MLFLOW_ALLOW_FILE_STORE", "true")
+        mlflow.set_tracking_uri((tmp_path / "mlruns").as_uri())
         if mlflow.active_run() is not None:
             mlflow.end_run()
         yield
@@ -287,17 +290,23 @@ class TestEndMlflowActiveRunAsKilled:
         # must swallow it so the SIGTERM path doesn't crash.
         mlflow.start_run()
 
+        real_end_run = mlflow.end_run
+
         def _raises(*args, **kwargs):
             raise RuntimeError("simulated reentrancy failure")
 
         monkeypatch.setattr(mlflow, "end_run", _raises)
-        end_mlflow_active_run_as_killed()  # must not raise
+        try:
+            end_mlflow_active_run_as_killed()  # must not raise
+        finally:
+            monkeypatch.setattr(mlflow, "end_run", real_end_run)
 
 
 class TestInstallMlflowFailureHook:
     @pytest.fixture(autouse=True)
-    def _setup(self, tmp_path):
-        mlflow.set_tracking_uri(f"sqlite:///{tmp_path / 'mlflow.db'}")
+    def _setup(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("MLFLOW_ALLOW_FILE_STORE", "true")
+        mlflow.set_tracking_uri((tmp_path / "mlruns").as_uri())
         if mlflow.active_run() is not None:
             mlflow.end_run()
 

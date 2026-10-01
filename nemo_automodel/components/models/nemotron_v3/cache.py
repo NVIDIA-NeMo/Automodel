@@ -61,7 +61,7 @@ class NemotronHybridCache:
         # Identify first attention layer for get_seq_length()
         self._attention_layer_idx = None
         for i, block_type in enumerate(config.layers_block_type):
-            if block_type == "attention":
+            if block_type in ("attention", "full_attention"):
                 self._attention_layer_idx = i
                 break
 

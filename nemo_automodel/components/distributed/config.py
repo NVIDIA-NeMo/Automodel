@@ -37,14 +37,17 @@ Usage:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Tuple, Union
 
 import torch
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
 
 from nemo_automodel.components.distributed.cp_vision_frame_shard import CpVisionFrameShardingConfig
-from nemo_automodel.shared.multimodal_fsdp import FrozenMultimodalSharding, normalize_frozen_multimodal_sharding
+from nemo_automodel.components.distributed.multimodal_fsdp import (
+    FrozenMultimodalSharding,
+    normalize_frozen_multimodal_sharding,
+)
 
 if TYPE_CHECKING:
     from nemo_automodel.components.distributed.mesh import MeshContext, ParallelismSizes
@@ -105,6 +108,21 @@ class DistributedSetup:
     moe_parallel_config: "MoEParallelizerConfig | None" = None
     activation_checkpointing: ActivationCheckpointingMode = False
 
+    def __post_init__(self) -> None:
+        """Keep the compatibility bundle and its MeshContext policy in sync."""
+        if self.strategy_config is None and self.moe_parallel_config is None and not self.activation_checkpointing:
+            return
+        object.__setattr__(
+            self,
+            "mesh_context",
+            replace(
+                self.mesh_context,
+                strategy_config=self.strategy_config,
+                moe_parallel_config=self.moe_parallel_config,
+                activation_checkpointing=self.activation_checkpointing,
+            ),
+        )
+
     @classmethod
     def build(
         cls,
@@ -152,6 +170,8 @@ class DistributedSetup:
         mesh_context = MeshContext.build(
             strategy_config,
             parallelism_sizes=parallelism_sizes,
+            moe_parallel_config=moe_parallel_config,
+            activation_checkpointing=activation_checkpointing,
             world_size=world_size,
             timeout_minutes=timeout_minutes,
             ranks=ranks,
@@ -301,7 +321,7 @@ class FSDP2Config:
     """
 
     sequence_parallel: bool = False
-    tp_plan: dict | None = None
+    tp_plan: dict | str | None = None
     patch_is_packed_sequence: bool = False
     mp_policy: MixedPrecisionPolicy | None = field(
         default_factory=lambda: MixedPrecisionPolicy(

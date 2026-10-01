@@ -215,6 +215,8 @@ def _run(args: argparse.Namespace) -> int:
         split=args.split,
         distributed=False,
         shuffle_seed=args.shuffle_seed,
+        mask_reasoning_content=args.mask_reasoning_content,
+        mask_generation_prompt=args.mask_generation_prompt,
     )
     num_samples = len(dataloader.dataset)
     target_vocab_size = int(target_model.config.vocab_size)
@@ -252,6 +254,10 @@ def _run(args: argparse.Namespace) -> int:
         "input_data": str(args.input_data),
         "split": args.split,
         "shuffle_seed": int(args.shuffle_seed),
+        # These shape the cached loss_mask/position_mask; the trainer refuses a
+        # cache whose values differ from its own settings.
+        "mask_reasoning_content": bool(args.mask_reasoning_content),
+        "mask_generation_prompt": bool(args.mask_generation_prompt),
     }
     if args.resume:
         _ensure_resume_compatible(args.output_dir, manifest, existing)
@@ -338,6 +344,19 @@ def _build_parser() -> argparse.ArgumentParser:
         nargs="+",
         default=None,
         help="Target layers to capture (default: the EAGLE-3 low/mid/high recipe).",
+    )
+    parser.add_argument(
+        "--mask-reasoning-content",
+        action="store_true",
+        help="Exclude rendered reasoning_content tokens from the cached loss mask. Recorded in the manifest; "
+        "the trainer's mask_reasoning_content setting must match it.",
+    )
+    parser.add_argument(
+        "--mask-generation-prompt",
+        action="store_true",
+        help="Exclude the template-supplied prefix of each assistant turn (role header and any empty reasoning "
+        "block) from the cached loss mask. Recorded in the manifest; the trainer's mask_generation_prompt "
+        "setting must match it.",
     )
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--resume", action="store_true", help="Skip shard indices already present in --output-dir.")

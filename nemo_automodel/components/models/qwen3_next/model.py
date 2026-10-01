@@ -133,7 +133,10 @@ class Block(nn.Module):
             linear_list = [self.linear_attn.in_proj_qkvz, self.linear_attn.in_proj_ba, self.linear_attn.out_proj]
             for linear in linear_list:
                 nn.init.trunc_normal_(linear.weight, mean=0.0, std=0.02)
-            self.linear_attn.norm.reset_parameters()
+            # transformers 5.15 dropped the FusedRMSNormGated branch, so this is always
+            # Qwen3NextRMSNormGated, which has no reset_parameters(). Its weight is an
+            # RMSNorm gain, initialized to ones.
+            nn.init.ones_(self.linear_attn.norm.weight)
         self.mlp.init_weights(buffer_device)
 
 

@@ -23,8 +23,10 @@ there is no free builder function — ``config.build(...)`` is the entry point.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import dataclass, field, fields
 from typing import Any
+
+from nemo_automodel.shared.import_utils import safe_import, safe_import_from
 
 
 @dataclass
@@ -84,10 +86,23 @@ class WandbConfig:
         Returns:
             Initialised ``wandb.Run``.
         """
-        import wandb
-        from wandb import Settings
+        _, wandb = safe_import(
+            "wandb",
+            msg="wandb is not installed. To enable W&B experiment tracking, run: uv add nemo-automodel[wandb]",
+        )
+        _, _WandbSettings = safe_import_from(
+            "wandb",
+            "Settings",
+            msg="wandb is not installed. To enable W&B experiment tracking, run: uv add nemo-automodel[wandb]",
+        )
 
-        named = {k: v for k, v in asdict(self).items() if k != "extra" and v is not None}
+        named = {}
+        for config_field in fields(self):
+            if config_field.name == "extra":
+                continue
+            value = getattr(self, config_field.name)
+            if value is not None:
+                named[config_field.name] = value
         # ``extra`` (e.g. mode/dir) is forwarded verbatim; named fields win on collision.
         kwargs = {**self.extra, **named}
         if kwargs.get("name", "") == "" and model_name:
@@ -95,7 +110,7 @@ class WandbConfig:
         return wandb.init(
             **kwargs,
             config=dict(run_config) if run_config is not None else None,
-            settings=Settings(silent=True),
+            settings=_WandbSettings(silent=True),
         )
 
 
@@ -154,10 +169,13 @@ class MLflowConfig:
         if not (dist.is_initialized() and dist.get_rank() == 0):
             return None
 
-        try:
-            import mlflow
-        except ImportError as e:
-            raise ImportError("MLflow is not installed. Please install it with: uv add mlflow") from e
+        _, mlflow = safe_import(
+            "mlflow",
+            msg=(
+                "mlflow is not installed. To enable MLflow experiment tracking, run: uv add nemo-automodel[mlflow]. "
+                "For the full MLflow stack (UI, SQL backend): uv add nemo-automodel[mlflow-full]"
+            ),
+        )
 
         if self.tracking_uri is not None:
             mlflow.set_tracking_uri(self.tracking_uri)

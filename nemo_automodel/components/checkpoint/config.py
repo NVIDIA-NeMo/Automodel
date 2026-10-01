@@ -111,6 +111,7 @@ class CheckpointingConfig:
     cpu_offload: bool = False  # If True, move DCP model and optimizer state dict tensors to CPU before saving.
     # Permit pickle-based loading of legacy training state. Enable only for checkpoints from a trusted source.
     allow_legacy_pickle_restore: bool = False
+    # None or True permits dequantization when the source model config declares quantized weights; False disables it.
     dequantize_base_checkpoint: bool | None = None
     original_model_root_dir: str | None = None
     skip_task_head_prefixes_for_base_model: list[str] | None = (
@@ -122,6 +123,9 @@ class CheckpointingConfig:
     staging_dir: str | None = None
     v4_compatible: bool = False  # If True, save the original pretrained config.json (with quantization_config removed)
     # instead of the in-memory v5 config.  Useful when downstream consumers (e.g. vLLM) expect a v4-format config.
+    legacy_paramwrapper_layout: bool = False  # If True, export fused expert LoRA (PEFT v5 ParamWrapper) weights in
+    # the pre-flip peft <= 0.19.0 layout instead of the corrected peft >= 0.19.1 layout (huggingface/peft#3165).
+    # Only for consumers pinned to an older peft; unrelated to v4_compatible.
     diffusers_compatible: bool = False  # If True, use diffusers-compatible index filename
     # (diffusion_pytorch_model.safetensors.index.json) so checkpoints are loadable via diffusers from_pretrained().
     best_metric_key: str = "default"  # Validation metric key used to select the best checkpoint.
