@@ -27,7 +27,6 @@ import os
 import shutil
 import threading
 from contextlib import contextmanager
-from dataclasses import replace
 from typing import Any
 
 import torch
@@ -72,7 +71,6 @@ from nemo_automodel.components.models.common.gated_delta_net_fp32 import (
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.utils import (
     HUB_LOADING_KWARGS,
-    AttentionBackend,
     BackendConfig,
     initialize_linear_module,
     initialize_rms_norm_module,
@@ -82,34 +80,6 @@ from nemo_automodel.components.utils.model_utils import resolve_trust_remote_cod
 from nemo_automodel.shared.utils import dtype_from_str
 
 logger = logging.getLogger(__name__)
-
-_NATIVE_ATTENTION_BACKENDS: dict[str, AttentionBackend] = {"flash_attention_4": "fa4"}
-
-
-def _resolve_custom_attention_backend(
-    attn_implementation: str | None,
-    backend: BackendConfig,
-    *,
-    uses_native_fa4: bool,
-) -> BackendConfig:
-    """Resolve an HF attention name onto a custom model's typed backend."""
-    if not isinstance(attn_implementation, str):
-        return backend
-    native_backend = _NATIVE_ATTENTION_BACKENDS.get(attn_implementation)
-    if native_backend is None:
-        return backend
-    if not uses_native_fa4:
-        return backend
-    if backend.attn == native_backend:
-        return backend
-    logger.info(
-        "attn_implementation=%r selects the native %r attention backend (was %r).",
-        attn_implementation,
-        native_backend,
-        backend.attn,
-    )
-    return replace(backend, attn=native_backend)
-
 
 # Thread-local: when True, HF's get_init_context must not add torch.device("meta")
 # so that model init runs on real device (used when retrying after "Cannot copy out of meta tensor").
@@ -1398,13 +1368,9 @@ def __init_model(
                     kwargs["backend"] = BackendConfig(**kwargs["backend"])
             uses_native_fa4 = getattr(model_cls, "_uses_native_fa4", False) is True
             if kwargs.get("backend") is None and attn_implementation == "flash_attention_4" and uses_native_fa4:
-                kwargs["backend"] = BackendConfig()
-            if isinstance(kwargs.get("backend"), BackendConfig):
-                kwargs["backend"] = _resolve_custom_attention_backend(
-                    attn_implementation,
-                    kwargs["backend"],
-                    uses_native_fa4=uses_native_fa4,
-                )
+                # The HF alias supplies a default only. An explicit native
+                # backend remains authoritative, including model-specific configs.
+                kwargs["backend"] = BackendConfig(attn="fa4")
             resolved_backend = kwargs.get("backend")
             kwargs = _filter_kwargs_for_init(model_cls, kwargs)
             with local_torch_dtype(torch_dtype, model_cls.__name__):

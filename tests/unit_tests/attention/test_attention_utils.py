@@ -40,6 +40,7 @@ def _reference_varlen_sdpa(
     max_seqlen_k: int,
     softmax_scale: float,
     causal: bool,
+    window_size: tuple[int | None, int | None] = (None, None),
     **kwargs,
 ) -> tuple[torch.Tensor, None]:
     """Evaluate independent per-document SDPA for a fake FA4 varlen kernel.
@@ -54,6 +55,7 @@ def _reference_varlen_sdpa(
         max_seqlen_k: Maximum key/value document length.
         softmax_scale: Attention score scale.
         causal: Whether to apply causal attention.
+        window_size: Inclusive left/right distances in the FA4 kernel convention.
         **kwargs: Unused FA4 options accepted for signature compatibility.
 
     Returns:
@@ -68,11 +70,21 @@ def _reference_varlen_sdpa(
         q_document = q[q_start:q_end].transpose(0, 1).unsqueeze(0)
         k_document = k[k_start:k_end].transpose(0, 1).unsqueeze(0)
         v_document = v[k_start:k_end].transpose(0, 1).unsqueeze(0)
+        local_mask = None
+        if window_size[0] is not None or window_size[1] is not None:
+            q_pos = torch.arange(q_end - q_start, device=q.device)[:, None]
+            k_pos = torch.arange(k_end - k_start, device=q.device)[None, :]
+            local_mask = k_pos <= q_pos if causal else torch.ones_like(q_pos + k_pos, dtype=torch.bool)
+            if window_size[0] is not None:
+                local_mask = local_mask & (k_pos >= q_pos - window_size[0])
+            if window_size[1] is not None:
+                local_mask = local_mask & (k_pos <= q_pos + window_size[1])
         output = F.scaled_dot_product_attention(
             q_document,
             k_document,
             v_document,
-            is_causal=causal,
+            attn_mask=local_mask,
+            is_causal=causal and local_mask is None,
             scale=softmax_scale,
             enable_gqa=True,
         )
@@ -594,7 +606,8 @@ class TestFA4Backend:
         "window_size, expected",
         [
             ((-1, 0), (None, None)),  # codebase's "unbounded causal"
-            ((128, 0), (128, None)),  # sliding window
+            ((128, 0), (127, None)),  # 128 keys including the current token
+            ((1, 0), (0, None)),  # self attention only
             ((None, None), (None, None)),
         ],
     )
@@ -603,6 +616,11 @@ class TestFA4Backend:
         q = k = v = torch.randn(1, 4, 2, 8)
         _, _, _, attn_kwargs = preprocess_args_and_kwargs_for_attn(q, k, v, None, "fa4", window_size=window_size)
         assert attn_kwargs["window_size"] == expected
+
+    def test_fa4_rejects_zero_visible_window(self):
+        q = k = v = torch.randn(1, 4, 2, 8)
+        with pytest.raises(ValueError, match="at least the current token"):
+            preprocess_args_and_kwargs_for_attn(q, k, v, None, "fa4", window_size=(0, 0))
 
     def test_fa4_varlen_from_cu_seqlens(self):
         """Packed batches forward cu_seqlens/max_seqlen to the varlen entry point."""
@@ -654,7 +672,8 @@ class TestFA4Backend:
                 max_seqlen=3,
             )
 
-    def test_fa4_packed_bshd_forward_backward_matches_document_sdpa(self):
+    @pytest.mark.parametrize("window_size", [-1, 1, 2])
+    def test_fa4_packed_bshd_forward_backward_matches_document_sdpa(self, window_size):
         """Packed FA4 preserves MLA value width, outputs, and gradients."""
         from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
 
@@ -717,6 +736,7 @@ class TestFA4Backend:
             cu_seqlens=cu_seqlens,
             max_seqlen=collated["max_seqlen"],
             packed_token_indices=packed_token_indices,
+            window_size=(window_size, 0),
         )
         output = fa4(packed_q, packed_k, packed_v, **fa4_kwargs)
 
@@ -727,11 +747,15 @@ class TestFA4Backend:
                 q_document = q_ref[batch_idx, positions].transpose(0, 1).unsqueeze(0)
                 k_document = k_ref[batch_idx, positions].transpose(0, 1).unsqueeze(0)
                 v_document = v_ref[batch_idx, positions].transpose(0, 1).unsqueeze(0)
+                positions_in_doc = torch.arange(positions.numel())
+                expected_mask = positions_in_doc[None, :] <= positions_in_doc[:, None]
+                if window_size > 0:
+                    expected_mask &= positions_in_doc[None, :] > positions_in_doc[:, None] - window_size
                 document_output = F.scaled_dot_product_attention(
                     q_document,
                     k_document,
                     v_document,
-                    is_causal=True,
+                    attn_mask=expected_mask,
                     scale=0.5,
                 )
                 reference[batch_idx, positions] = document_output.squeeze(0).transpose(0, 1)

@@ -33,6 +33,7 @@ def _packed_sdpa_reference(
     attention_mask: torch.Tensor,
     *,
     scale: float,
+    window_size: int,
 ) -> torch.Tensor:
     """Evaluate packed causal attention independently with PyTorch SDPA.
 
@@ -42,6 +43,7 @@ def _packed_sdpa_reference(
         v: Value tensor of shape [batch, sequence, kv_heads, v_head_dim].
         attention_mask: Indexed document mask of shape [batch, sequence].
         scale: Attention score scale.
+        window_size: Visible keys including the current token, or -1 for unbounded.
 
     Returns:
         Tensor of shape [batch, sequence, heads, v_head_dim], with zeros at
@@ -54,11 +56,15 @@ def _packed_sdpa_reference(
             q_document = q[batch_idx, positions].transpose(0, 1).unsqueeze(0)
             k_document = k[batch_idx, positions].transpose(0, 1).unsqueeze(0)
             v_document = v[batch_idx, positions].transpose(0, 1).unsqueeze(0)
+            local_positions = torch.arange(positions.numel(), device=q.device)
+            allowed = local_positions[None, :] <= local_positions[:, None]
+            if window_size > 0:
+                allowed &= local_positions[None, :] > local_positions[:, None] - window_size
             document_output = F.scaled_dot_product_attention(
                 q_document,
                 k_document,
                 v_document,
-                is_causal=True,
+                attn_mask=allowed,
                 scale=scale,
                 enable_gqa=True,
             )
@@ -67,8 +73,12 @@ def _packed_sdpa_reference(
 
 
 @pytest.mark.parametrize("qk_head_dim,v_head_dim,kv_heads", [(192, 128, 4), (256, 256, 2)])
-def test_native_fa4_packed_forward_backward_matches_sdpa(qk_head_dim: int, v_head_dim: int, kv_heads: int) -> None:
-    """Native packed FA4 matches independent SDPA outputs and input gradients."""
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("window_size", [-1, 16])
+def test_native_fa4_forward_backward_matches_sdpa(
+    qk_head_dim: int, v_head_dim: int, kv_heads: int, packed: bool, window_size: int
+) -> None:
+    """Dense/packed and full/local FA4 match SDPA outputs and input gradients."""
     if not torch.cuda.is_available():
         pytest.skip("FlashAttention-4 parity requires a CUDA device")
     if torch.cuda.get_device_capability()[0] < 10:
@@ -81,7 +91,8 @@ def test_native_fa4_packed_forward_backward_matches_sdpa(qk_head_dim: int, v_hea
         [[1] * 32 + [2] * 48 + [0] * 16, [1] * 24 + [2] * 24 + [3] * 48],
         device=device,
     )
-    packing_metadata = build_packed_sequence_metadata(attention_mask)
+    if not packed:
+        attention_mask = torch.ones_like(attention_mask)
 
     torch.manual_seed(1234)
     q = torch.randn(2, 96, 4, qk_head_dim, device=device, dtype=dtype, requires_grad=True)
@@ -98,25 +109,28 @@ def test_native_fa4_packed_forward_backward_matches_sdpa(qk_head_dim: int, v_hea
         num_v_channels=v_head_dim,
         softmax_scale=scale,
     )
-    packed_token_indices, cu_seqlens = flatten_packed_sequence_metadata(
-        packing_metadata["packed_token_indices"],
-        packing_metadata["cu_seqlens"],
-        batch_size=2,
-        sequence_length=96,
-    )
+    metadata = {}
+    if packed:
+        packing_metadata = build_packed_sequence_metadata(attention_mask)
+        packed_token_indices, cu_seqlens = flatten_packed_sequence_metadata(
+            packing_metadata["packed_token_indices"],
+            packing_metadata["cu_seqlens"],
+            batch_size=2,
+            sequence_length=96,
+        )
+        metadata = dict(
+            packed_token_indices=packed_token_indices,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=packing_metadata["max_seqlen"],
+        )
     packed_q, packed_k, packed_v, fa4_kwargs = preprocess_args_and_kwargs_for_attn(
-        q,
-        k,
-        v,
-        attention_mask,
-        "fa4",
-        packed_token_indices=packed_token_indices,
-        cu_seqlens=cu_seqlens,
-        max_seqlen=packing_metadata["max_seqlen"],
+        q, k, v, attention_mask if packed else None, "fa4", window_size=(window_size, 0), **metadata
     )
     output = fa4(packed_q, packed_k, packed_v, **fa4_kwargs)
-    reference = _packed_sdpa_reference(q_ref, k_ref, v_ref, attention_mask, scale=scale)
+    reference = _packed_sdpa_reference(q_ref, k_ref, v_ref, attention_mask, scale=scale, window_size=window_size)
 
+    # bf16 kernels use different tiled reduction orders; output and gradient
+    # tolerances allow rounding differences while exposing window/layout errors.
     torch.testing.assert_close(output, reference, atol=3e-2, rtol=3e-2)
     output_weight = torch.randn_like(output)
     (output * output_weight).sum().backward()

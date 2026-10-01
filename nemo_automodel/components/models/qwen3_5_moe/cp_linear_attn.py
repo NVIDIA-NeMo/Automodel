@@ -261,6 +261,7 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
                     seq_idx_for_conv = torch.repeat_interleave(
                         torch.arange(lengths.numel(), device=lengths.device, dtype=torch.int32),
                         lengths,
+                        output_size=indices.numel(),
                     ).unsqueeze(0)
                 else:
                     seq_idx_for_conv = attention_mask.to(torch.int32).contiguous()

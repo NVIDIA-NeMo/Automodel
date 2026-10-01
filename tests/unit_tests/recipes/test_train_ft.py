@@ -3646,7 +3646,7 @@ def test_mtp_recipe_preserves_document_targets(recipe_kind, packing_format, batc
     recipe._get_cp_group_size = lambda: 1
     recipe._get_dp_group_size = lambda **kwargs: 1
     recipe._get_dp_group = lambda **kwargs: None
-    # Row 1 is Yuhe's two three-token documents. Row 2 adds unequal lengths,
+    # Row 1 contains two three-token documents. Row 2 adds unequal lengths,
     # an internal padding slot, and document IDs restarting in the next row.
     samples = [
         dict(

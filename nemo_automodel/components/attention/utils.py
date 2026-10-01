@@ -254,6 +254,9 @@ def preprocess_args_and_kwargs_for_attn(
         attn_impl: Attention backend name.
         **kwargs: Backend metadata. Packed FA4 accepts ``cu_seqlens`` of shape
             [documents + 1] and ``packed_token_indices`` of shape [tokens].
+            For SDPA and FA4, a positive left ``window_size`` counts visible
+            keys including the current token; negative/None means unbounded.
+            The legacy TE branch forwards its backend-specific distances unchanged.
 
     Returns:
         Query, key, and value tensors in the backend layout plus its keyword
@@ -340,8 +343,12 @@ def preprocess_args_and_kwargs_for_attn(
         attn_kwargs = {"causal": True}
         window_size = kwargs.get("window_size", (-1, 0))
         left_window, right_window = window_size if isinstance(window_size, tuple) else (window_size, 0)
+        if left_window == 0:
+            raise ValueError("FA4 window_size must include at least the current token (left window >= 1)")
+        # SDPA/native callers count the current token in W. CuTe instead
+        # accepts an inclusive distance into the past, so its left bound is W-1.
         attn_kwargs["window_size"] = (
-            None if left_window is None or left_window < 0 else left_window,
+            None if left_window is None or left_window < 0 else left_window - 1,
             None if right_window is None or right_window <= 0 else right_window,
         )
         for opt in ("softcap", "learnable_sink"):

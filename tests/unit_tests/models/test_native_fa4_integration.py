@@ -79,7 +79,8 @@ def test_backend_dispatched_model_preserves_document_isolation():
     torch.testing.assert_close(v.grad.flatten()[:2], torch.zeros(2))
 
 
-def test_step3p5_model_derived_packing_matches_sdpa_forward_backward():
+@pytest.mark.parametrize("layer_type,window_size", [("full_attention", None), ("sliding_attention", 1)])
+def test_step3p5_model_derived_packing_matches_sdpa_forward_backward(layer_type, window_size):
     from nemo_automodel.components.models.step3p5.model import Step3p5ForCausalLM
 
     torch.manual_seed(7)
@@ -92,7 +93,9 @@ def test_step3p5_model_derived_packing_matches_sdpa_forward_backward():
         experts="torch",
         enable_hf_state_dict_adapter=False,
     )
-    config = MockStep3p5Config(torch_dtype="float32", num_hidden_layers=1, layer_types=["full_attention"])
+    config = MockStep3p5Config(
+        torch_dtype="float32", num_hidden_layers=1, layer_types=[layer_type], sliding_window=window_size
+    )
     fa4 = ModuleType("flash_attn.cute")
     fa4.flash_attn_func = None
     fa4.flash_attn_varlen_func = _reference_varlen_sdpa
@@ -235,24 +238,15 @@ def test_qwen35_hybrid_packed_fa4_matches_sdpa(microbatch_size):
             position_ids=[0, 1, 2, 0, 1, 0],
         ),
     ]
+    from torch.distributed.pipelining.microbatch import split_args_kwargs_into_chunks
+
     outputs = []
     for current in (model, reference):
         contract = configure_packing(get_model_attn_implementation(current), model=current)
         batch = neat_packed_collater(samples, packing=contract)
         batch.pop("labels")
-        outputs.append(
-            torch.cat(
-                [
-                    current(
-                        **{
-                            key: value[start : start + microbatch_size] if isinstance(value, torch.Tensor) else value
-                            for key, value in batch.items()
-                        }
-                    ).logits
-                    for start in range(0, 2, microbatch_size)
-                ]
-            )
-        )
+        _, chunks = split_args_kwargs_into_chunks((), batch, chunks=2 // microbatch_size)
+        outputs.append(torch.cat([current(**chunk).logits for chunk in chunks]))
     valid = torch.tensor([sample["attention_mask"] for sample in samples]) > 0
     torch.testing.assert_close(outputs[0][valid], outputs[1][valid], rtol=1e-4, atol=1e-5)
     upstream = torch.randn_like(outputs[0]) * valid.unsqueeze(-1)

@@ -608,7 +608,7 @@ class TestBackendDictCoercion:
 
     @patch("nemo_automodel._transformers.model_init._download_model_weights")
     @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")
-    def test_flash_attention_4_selects_native_fa4_backend(self, mock_resolve_cls, _mock_download):
+    def test_flash_attention_4_preserves_explicit_native_backend(self, mock_resolve_cls, _mock_download):
         captured = self._run_init_model(
             mock_resolve_cls,
             attn_implementation="flash_attention_4",
@@ -617,7 +617,7 @@ class TestBackendDictCoercion:
         )
 
         assert isinstance(captured["backend"], BackendConfig)
-        assert captured["backend"].attn == "fa4"
+        assert captured["backend"].attn == "sdpa"
 
     @patch("nemo_automodel._transformers.model_init._download_model_weights")
     @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")
@@ -631,8 +631,8 @@ class TestBackendDictCoercion:
                 backend=original,
             )
 
-        assert captured["backend"] is not original
-        assert captured["backend"].attn == "fa4"
+        assert captured["backend"] is original
+        assert captured["backend"].attn == "sdpa"
         assert original.attn == "sdpa"
         assert apply_overrides.call_args.args[1] is captured["backend"]
 
@@ -654,7 +654,7 @@ class TestBackendDictCoercion:
         captured = cfg_model.instantiate()
 
         assert cfg_model.backend.attn == "sdpa"
-        assert captured["backend"].attn == "fa4"
+        assert captured["backend"].attn == "sdpa"
 
     @pytest.mark.parametrize("extra_kwargs", [{}, {"backend": None}])
     @patch("nemo_automodel._transformers.model_init._download_model_weights")

@@ -232,6 +232,15 @@ class TestConfigurePacking:
             _uses_native_fa4 = True
 
             def forward(self, **kwargs):
+                """Return the received model inputs unchanged.
+
+                Args:
+                    **kwargs: Optional cu_seqlens of shape [documents + 1] or
+                        [batch, max_documents + 1], supplied without token indices.
+
+                Returns:
+                    The input mapping, unchanged; the entry hook rejects this call.
+                """
                 return kwargs
 
         model = NativeFA4Model()

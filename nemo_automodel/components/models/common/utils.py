@@ -418,8 +418,8 @@ class BackendConfig:
 
     Attributes:
         attn: Attention backend ("torch", "te", "sdpa", "flex", "eager", "tilelang", "cudnn", "fa4", or "magi").
-            "fa4" selects FlashAttention-4 (CuTe) and is the only backend that reaches the
-            Blackwell FA4 kernels; it requires an INSTALL_FA4=true image. A rank-2 binary
+            "fa4" selects native FlashAttention-4 (CuTe) and requires an
+            INSTALL_FA4=true image. HF-dispatched models use "flash_attention_4". A rank-2 binary
             padding mask is converted to varlen metadata, while dense/block masks and indexed
             document masks without explicit packed metadata are rejected.
             Inputs must use BSHD layout; pre-packed THD is unsupported. Packed
