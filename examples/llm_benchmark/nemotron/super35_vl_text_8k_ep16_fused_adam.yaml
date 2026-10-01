@@ -37,7 +37,8 @@ model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
   config:
     _target_: nemo_automodel.NeMoAutoConfig.from_pretrained
-    pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16
+    # Public Hugging Face model ID; the entropy detector misclassifies it as a credential.
+    pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16  # pragma: allowlist secret
     trust_remote_code: true
   dtype: bfloat16
   num_nextn_predict_layers: 0

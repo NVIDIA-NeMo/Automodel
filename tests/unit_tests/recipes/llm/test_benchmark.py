@@ -223,7 +223,8 @@ class TestBenchmarkingRecipeInitialization:
 
         assert config["model"]["config"]["_target_"] == "nemo_automodel.NeMoAutoConfig.from_pretrained"
         assert config["model"]["config"]["pretrained_model_name_or_path"] == (
-            "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"
+            # Public Hugging Face model ID; the entropy detector misclassifies it as a credential.
+            "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"  # pragma: allowlist secret
         )
         assert config["ci"]["cluster_tag"] == "gb200"
         assert "known_issue_id" not in config["ci"]
