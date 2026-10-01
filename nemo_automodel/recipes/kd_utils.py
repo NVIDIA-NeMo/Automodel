@@ -25,7 +25,6 @@ import torch
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor, Shard
 
-from nemo_automodel.components.datasets.packing import get_unpad_data
 from nemo_automodel.components.distributed.config import DDPConfig, DistributedSetup
 from nemo_automodel.components.distributed.context_parallel.utils import unshard_context_parallel_tensor
 from nemo_automodel.components.models.common.packing import (
@@ -68,8 +67,7 @@ def configure_kd_teacher_packing(
         ValueError: If teacher and student packed mask layouts disagree.
     """
     layouts = [
-        configure_packing(get_model_attn_implementation(part), model=part, unpad_data=get_unpad_data).packed_mask_type
-        for part in teacher_parts
+        configure_packing(get_model_attn_implementation(part), model=part).packed_mask_type for part in teacher_parts
     ]
     layouts.extend(
         get_packing_capabilities(get_model_attn_implementation(part), model=part).packed_mask_type

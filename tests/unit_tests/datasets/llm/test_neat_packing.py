@@ -428,6 +428,18 @@ class TestNeatPackedCollaterContracts:
             }
         ]
 
+    @pytest.mark.parametrize("impl", ["flash_attention_2", "flash_attention_3", "flash_attention_4"])
+    def test_flash_versions_emit_varlen_kwargs_and_no_mask(self, impl):
+        out = neat_packed_collater(self._batch(), attn_implementation=impl)
+        # No attention_mask so HF takes the varlen-kwargs branch (not _upad_input).
+        assert "attention_mask" not in out
+        # cu_seqlens spans the full flattened batch: doc1 (2) + doc2 (2) = 4 tokens.
+        assert out["cu_seq_lens_q"].tolist() == [0, 2, 4]
+        assert torch.equal(out["cu_seq_lens_q"], out["cu_seq_lens_k"])
+        assert out["max_length_q"] == out["max_length_k"] == 2
+        # Per-document ids preserved for loss / context-parallel consumers.
+        assert out["_packed_seq_ids"].tolist() == [[1, 1, 2, 2]]
+
     def test_document_ids_contract_keeps_indexed_2d_mask(self):
         packing = SimpleNamespace(
             packed_mask_type="document_ids",
@@ -478,4 +490,5 @@ class TestNeatPackedCollaterContracts:
                 attn_implementation="flash_attention_2",
             )
 
-        assert out["attention_mask"].tolist() == [[1, 1, 2, 2]]
+        assert "attention_mask" not in out
+        assert out["cu_seq_lens_q"].tolist() == [0, 2, 4]

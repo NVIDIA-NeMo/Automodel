@@ -54,7 +54,7 @@ from nemo_automodel._transformers import (
 )
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches, resolve_get_rope_index
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.components.datasets.packing import DEFAULT_PACKED_SEQUENCE_CONTRACT, get_unpad_data
+from nemo_automodel.components.datasets.packing import DEFAULT_PACKED_SEQUENCE_CONTRACT
 from nemo_automodel.components.datasets.vlm.pp_media import stage_vlm_media_for_pp
 from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config, MegatronFSDPConfig
 from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
@@ -394,7 +394,6 @@ def build_dataloader(
         packing_contract = configure_packing(
             get_model_attn_implementation(model),
             model=model,
-            unpad_data=get_unpad_data,
         )
 
     with ScopedRNG(seed=seed, ranked=True):
@@ -446,7 +445,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         """Configure local model stages before the VLM dataloader is built."""
         from nemo_automodel.components.models.common.packing import configure_packing_for_models
 
-        return configure_packing_for_models(self.model_parts, unpad_data=get_unpad_data)
+        return configure_packing_for_models(self.model_parts)
 
     def setup(self):
         """Builds all components needed for training/validation/logging/checkpointing/etc.

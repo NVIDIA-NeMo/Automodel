@@ -23,7 +23,6 @@ import torch
 import torch.nn.functional as F
 
 from nemo_automodel.components.attention.utils import preprocess_args_and_kwargs_for_attn
-from nemo_automodel.components.datasets.packing import get_unpad_data
 from nemo_automodel.components.datasets.utils import neat_packed_collater
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.packing import configure_packing, get_model_attn_implementation
@@ -65,7 +64,7 @@ def test_backend_dispatched_model_preserves_document_isolation():
     torch.nn.Module.__init__(model)
     model.backend = BackendConfig(attn="sdpa")
     model.config = SimpleNamespace(_attn_implementation="flash_attention_4")
-    contract = configure_packing(get_model_attn_implementation(model), model=model, unpad_data=get_unpad_data)
+    contract = configure_packing(get_model_attn_implementation(model), model=model)
     batch = neat_packed_collater([_packed_sample()], packing=contract)
     q = k = torch.zeros(1, 4, 1, 1)
     v = torch.tensor([10.0, 10.0, 0.0, 0.0]).reshape(1, 4, 1, 1).requires_grad_()
@@ -278,8 +277,42 @@ def test_default_te_qwen3_neat_packing_uses_its_hf_flash_dispatch():
     ):
         model = Qwen3ForCausalLM(config, backend=BackendConfig(attn="te", rope_fusion=False))
     model.config._attn_implementation = "flash_attention_2"
-    contract = configure_packing(get_model_attn_implementation(model), model=model, unpad_data=get_unpad_data)
-    assert contract.packed_mask_type == "document_ids"
-    assert contract.patch_transformers
+    contract = configure_packing(get_model_attn_implementation(model), model=model)
+    assert contract.packed_mask_type == "flash_varlen"
     batch = neat_packed_collater([_packed_sample()], packing=contract)
-    assert batch["attention_mask"].tolist() == [[1, 1, 2, 2]]
+    assert "attention_mask" not in batch
+    assert batch["cu_seq_lens_q"].tolist() == [0, 2, 4]
+    assert batch["_packed_seq_ids"].tolist() == [[1, 1, 2, 2]]
+
+
+@pytest.mark.parametrize("vlm", [False, True])
+def test_hf_and_native_packing_contracts_keep_distinct_offset_layouts(vlm):
+    from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
+    from nemo_automodel.components.models.common.packing import get_packing_capabilities
+
+    samples = [
+        dict(
+            input_ids=[1, 2, 3, 0], labels=[2, -100, -100, -100], position_ids=[0, 1, 0, 0], attention_mask=[1, 1, 2, 0]
+        ),
+        dict(
+            input_ids=[4, 5, 0, 0], labels=[5, -100, -100, -100], position_ids=[0, 1, 0, 0], attention_mask=[1, 1, 0, 0]
+        ),
+    ]
+    collate = neat_packed_vlm_collater if vlm else neat_packed_collater
+    native = torch.nn.Module()
+    native._uses_native_fa4 = True
+    native.backend = BackendConfig(attn="fa4")
+    hf_contract = configure_packing("flash_attention_2")
+    native_contract = get_packing_capabilities(get_model_attn_implementation(native), model=native)
+    hf_batch = collate(samples, packing=hf_contract)
+    native_batch = collate(samples, packing=native_contract)
+
+    assert "attention_mask" not in hf_batch
+    assert "packed_token_indices" not in hf_batch
+    assert hf_batch["cu_seq_lens_q"].tolist() == [0, 2, 3, 4, 6, 8]
+    assert hf_batch["max_length_q"] == hf_batch["max_length_k"] == 2
+    assert native_batch["attention_mask"].tolist() == [[1, 1, 2, 0], [1, 1, 0, 0]]
+    assert native_batch["packed_token_indices"].tolist() == [[0, 1, 2, -1], [0, 1, -1, -1]]
+    assert native_batch["cu_seqlens"].tolist() == [[0, 2, 3], [0, 2, -1]]
+    assert "cu_seq_lens_q" not in native_batch
+    torch.testing.assert_close(hf_batch["_packed_seq_ids"], native_batch["_packed_seq_ids"])

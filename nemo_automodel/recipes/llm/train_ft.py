@@ -66,7 +66,7 @@ from nemo_automodel.components.config._arg_parser import parse_args_and_load_con
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.cuda_graphs import PartialCudaGraphManager
 from nemo_automodel.components.datasets.loader import DataloaderConfig
-from nemo_automodel.components.datasets.packing import DEFAULT_PACKED_SEQUENCE_CONTRACT, get_unpad_data
+from nemo_automodel.components.datasets.packing import DEFAULT_PACKED_SEQUENCE_CONTRACT
 from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config, MegatronFSDPConfig
 from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
 from nemo_automodel.components.distributed.context_parallel.magi import MagiState, setup_magi
@@ -557,7 +557,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         """Configure every local model stage and return its NEAT data requirements."""
         from nemo_automodel.components.models.common.packing import configure_packing_for_models
 
-        return configure_packing_for_models(self.model_parts, unpad_data=get_unpad_data)
+        return configure_packing_for_models(self.model_parts)
 
     def setup(self):
         """Builds all components needed for training/validation/logging/checkpointing/etc.

@@ -25,11 +25,11 @@ description: ""
 - Replace `get_attn_implementation(cfg_model, model)` with
   `get_model_attn_implementation(model)` from
   `nemo_automodel.components.models.common.packing`. For multiple local pipeline
-  stages, use `configure_packing_for_models(model_parts, unpad_data=get_unpad_data)`.
+  stages, use `configure_packing_for_models(model_parts)`.
 - Import `get_unpad_data` and `get_seqlens_in_batch` from
-  `nemo_automodel.components.datasets.packing`. When calling
-  `configure_packing` for HF flash attention, pass the dataset-owned
-  `get_unpad_data` as `unpad_data=`. Pass the returned contract as `packing=` to
+  `nemo_automodel.components.datasets.packing`. HF flash packing uses
+  explicit public varlen kwargs without modifying Transformers globals. Pass the
+  contract returned by `configure_packing` as `packing=` to
   the collater or `packing_contract=` to the dataloader config's `build()`.
 - `VlmDataloaderConfig.resolve_packing_attn_implementation` was removed. Custom
   integrations should configure the built model and supply its packing contract
@@ -38,7 +38,8 @@ description: ""
   packing contract. Qwen3.5, Qwen3.5-MoE, Kimi Linear, and Kimi K3 require the
   resulting dataset metadata alongside indexed masks. Custom loops must pass
   the contract to their collater and forward its metadata; the legacy
-  `attn_implementation=` collater argument only selects a mask layout.
+  `attn_implementation=` collater argument cannot declare model-specific
+  metadata requirements.
 - Qwen3.5 packing with load-balanced context parallelism now raises instead of
   silently losing document isolation. Use `cp_size: 1`, or the supported SDPA
   block-diagonal CP path for Qwen3.5-MoE.

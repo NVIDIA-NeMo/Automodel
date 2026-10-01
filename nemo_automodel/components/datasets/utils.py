@@ -562,6 +562,7 @@ def neat_packed_collater(
     ``document_ids`` keeps the indexed 2D mask ``[B, S]`` and
     ``block_causal`` converts the mask to ``[B, 1, S, S]``. Models may
     independently request flat-token metadata through the same contract.
+    ``flash_varlen`` emits HF varlen kwargs without an attention mask.
 
     Args:
         batch: Sample mappings from ``neat_pack_dataset``. Each holds
@@ -576,8 +577,11 @@ def neat_packed_collater(
         Mapping with ``input_ids``, ``labels``, and ``position_ids`` of shape
         [batch, sequence]. ``attention_mask`` has shape [batch, sequence] for
         document IDs or [batch, 1, sequence, sequence] for block-causal masking.
+        For ``flash_varlen``, the attention mask is omitted; ``cu_seq_lens_q``
+        and ``cu_seq_lens_k`` have shape [segments + 1] and include physical
+        padding runs. ``max_length_q`` and ``max_length_k`` are Python ints.
         Optional ``_packed_seq_ids`` retains the [batch, sequence] document map.
-        Varlen output adds
+        A contract requiring native packed-sequence metadata additionally adds
         int64 ``packed_token_indices`` of shape [batch, sequence], containing
         row-local token positions and -1 padding; int32 ``cu_seqlens`` of shape
         [batch, max_documents + 1], containing row-local cumulative lengths
@@ -596,7 +600,7 @@ def neat_packed_collater(
     attention_mask = batchify(torch.stack([torch.as_tensor(x["attention_mask"]) for x in batch]))
     packed_mask_type = packing.packed_mask_type
 
-    if packed_mask_type == "document_ids":
+    if packed_mask_type in ("document_ids", "flash_varlen"):
         mask_out = attention_mask
     elif packed_mask_type == "block_causal":
         mask_out = _indexed_mask_to_4d_block_causal(attention_mask)
@@ -609,6 +613,16 @@ def neat_packed_collater(
         "position_ids": position_ids,
         "attention_mask": mask_out,
     }
+    if packed_mask_type == "flash_varlen":
+        from nemo_automodel.components.datasets.packed_seq import (
+            packed_seq_params_from_doc_ids,
+            to_flash_attention_kwargs,
+        )
+
+        # HF consumes physical offsets, including padding, without an attention
+        # mask. Native FA4's unpadded offsets below have a different contract.
+        result.pop("attention_mask")
+        result.update(to_flash_attention_kwargs(packed_seq_params_from_doc_ids(attention_mask)))
     if packing.requires_packed_sequence_metadata:
         result.update(build_packed_sequence_metadata(attention_mask))
     if attention_mask.max() > 1 or packing.requires_packed_sequence_metadata:

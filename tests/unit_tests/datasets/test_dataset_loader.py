@@ -307,7 +307,7 @@ def test_packing_config_build_preserves_deprecated_attention_keyword(monkeypatch
     with pytest.warns(FutureWarning, match="attn_implementation is deprecated"):
         _, collate_fn = config.build([], attn_implementation="flash_attention_2")
 
-    assert collate_fn.keywords["packing"].packed_mask_type == "document_ids"
+    assert collate_fn.keywords["packing"].packed_mask_type == "flash_varlen"
 
 
 def test_dataloader_build_preserves_deprecated_attention_keyword(monkeypatch):
@@ -328,7 +328,7 @@ def test_dataloader_build_preserves_deprecated_attention_keyword(monkeypatch):
             attn_implementation="flash_attention_2",
         )
 
-    assert loader.collate_fn.keywords["packing"].packed_mask_type == "document_ids"
+    assert loader.collate_fn.keywords["packing"].packed_mask_type == "flash_varlen"
 
 
 def test_megatron_loader_preserves_schedule_and_sampler_config():

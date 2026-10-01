@@ -316,7 +316,7 @@ def test_vlm_dataloader_preserves_deprecated_python_packing_backend(monkeypatch)
             batch_size=2,
         )
 
-    assert result.dataloader.collate_fn.keywords["packing"].packed_mask_type == "document_ids"
+    assert result.dataloader.collate_fn.keywords["packing"].packed_mask_type == "flash_varlen"
 
 
 def test_vlm_dataloader_skips_dense_neat_packing_mask_under_cp(monkeypatch):

@@ -12,25 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Model-side Flash Attention packing support via monkey-patching.
+"""Model-derived packing contracts and native metadata normalization.
 
-When ``attn_implementation="flash_attention_2"`` and neat packing is enabled,
-the collater produces an **indexed** attention mask ``[B, S]`` where each
-position contains the 1-based document index (0 = padding).  For example::
-
-    [1, 1, 2, 2, 2, 0]   # 2 tokens in doc 1, 3 in doc 2, 1 padding
-
-To make HuggingFace's flash attention path use ``flash_attn_varlen_func``
-with per-document ``cu_seqlens``, we monkey-patch two functions:
-
-1. ``transformers.modeling_flash_attention_utils._get_unpad_data`` — extracts
-   per-document sequence lengths from the indexed mask and builds cu_seqlens.
-2. ``transformers.models.qwen3_vl.modeling_qwen3_vl.create_causal_mask`` —
-   returns the 2D indexed mask as-is, bypassing 4D mask creation.
-
-This is the same approach used by LlamaFactory.
+HF flash attention consumes the public varlen kwargs built by dataset collaters.
+Native FA4 and recurrent consumers use separate unpadded document metadata.
+Neither path modifies Transformers globals.
 """
 
+import inspect
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
@@ -45,7 +34,7 @@ logger = logging.getLogger(__name__)
 
 _FLASH_ATTN_IMPLEMENTATIONS = ("flash_attention_2", "flash_attention_3", "flash_attention_4")
 
-PackedMaskType = Literal["block_causal", "document_ids"]
+PackedMaskType = Literal["block_causal", "document_ids", "flash_varlen"]
 
 
 @dataclass(frozen=True)
@@ -54,7 +43,6 @@ class PackingCapabilities:
 
     packed_mask_type: PackedMaskType
     requires_packed_sequence_metadata: bool = False
-    patch_transformers: bool = False
     uses_native_fa4: bool = False
 
 
@@ -99,24 +87,6 @@ class AttentionBackendSelection(Protocol):
         ...
 
 
-class UnpadData(Protocol):
-    """Dataset-owned mask conversion accepted by the model-side HF adapter."""
-
-    def __call__(self, attention_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, int]:
-        """Convert indexed document masks to unpadded token metadata.
-
-        Args:
-            attention_mask: Tensor of shape [batch, sequence], with positive
-                document IDs and zero for padding.
-
-        Returns:
-            Int64 indices of shape [tokens] into the flattened batch/sequence
-            axis, int32 cumulative lengths of shape [documents + 1], and the
-            maximum document length as a Python int.
-        """
-        ...
-
-
 def get_packing_capabilities(
     attn_implementation: str,
     *,
@@ -150,9 +120,8 @@ def get_packing_capabilities(
         )
     if attn_implementation in _FLASH_ATTN_IMPLEMENTATIONS:
         return PackingCapabilities(
-            packed_mask_type="document_ids",
+            packed_mask_type="flash_varlen",
             requires_packed_sequence_metadata=requires_metadata,
-            patch_transformers=True,
         )
     return PackingCapabilities(
         packed_mask_type=model_mask_type or "block_causal",
@@ -349,44 +318,6 @@ def _install_native_fa4_metadata_hook(model: torch.nn.Module) -> None:
     setattr(model, "_native_fa4_metadata_hook_handle", handle)
 
 
-def _passthrough_create_causal_mask(
-    config=None,
-    input_embeds=None,
-    inputs_embeds=None,
-    attention_mask=None,
-    cache_position=None,
-    past_key_values=None,
-    position_ids=None,
-    **kwargs,
-):
-    """Replacement for ``create_causal_mask`` that passes through packed masks.
-
-    Flash attention (FA2/FA3/FA4) handles masking internally, so always pass
-    through.  For other backends, pass through packed masks but delegate
-    normal 2D masks to HF.
-    """
-    if config is not None and getattr(config, "_attn_implementation", None) in _FLASH_ATTN_IMPLEMENTATIONS:
-        return attention_mask
-
-    if attention_mask is not None:
-        if attention_mask.ndim == 4:
-            return attention_mask
-        if attention_mask.max() > 1:
-            return attention_mask
-
-    from transformers.masking_utils import create_causal_mask
-
-    embeds = inputs_embeds if inputs_embeds is not None else input_embeds
-    return create_causal_mask(
-        config=config,
-        inputs_embeds=embeds,
-        attention_mask=attention_mask,
-        past_key_values=past_key_values,
-        position_ids=position_ids,
-        **kwargs,
-    )
-
-
 def _model_attn_implementation(model: torch.nn.Module) -> str | None:
     """Return the packing-relevant attention backend an already-built model runs with.
 
@@ -443,156 +374,124 @@ def get_model_attn_implementation(model: torch.nn.Module) -> str:
     return hf_implementation or "sdpa"
 
 
-def _patch_preprocess_mask_arguments_for_packing() -> None:
-    """Keep indexed packing masks intact for the supported FA2 path.
+# FlashAttentionKwargs the collater emits and the flash varlen path consumes.
+_PACKED_VARLEN_KWARGS = ("cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k")
 
-    Transformers 5.x preprocesses 2D attention masks before dispatching
-    attention. For flash attention this can coerce integer indexed masks
-    (``1, 2, ...`` per packed document) to bool masks, losing the document
-    boundaries that ``get_unpad_data`` needs. Preserve indexed 2D masks for
-    FA2 so the patched flash-attention path can derive per-document
-    ``cu_seqlens``. Validate the private Transformers contract before installing
-    the shim so an incompatible dependency fails instead of silently enabling
-    cross-document attention.
+
+def validate_flash_packing_support(attn_implementation: str = "sdpa", model: torch.nn.Module | None = None) -> None:
+    """Fail loudly when flash neat packing cannot be consumed by the backend or model.
+
+    Neat packing under flash attention relies on the varlen FlashAttention
+    contract: the collater emits ``FlashAttentionKwargs`` (``cu_seq_lens_q``/
+    ``cu_seq_lens_k``/``max_length_q``/``max_length_k``) which HuggingFace threads
+    into ``flash_attn_varlen_func``. This function verifies, before training
+    starts, that (1) the installed Transformers build exposes that contract and
+    (2) the model's ``forward`` can actually receive it -- either as ``**kwargs``,
+    explicit varlen parameters, or the custom-model ``_packed_seq_ids`` map. Any
+    gap raises here instead of silently dropping the cumulative lengths and
+    enabling cross-document attention.
+
+    Non-flash backends (``sdpa`` / ``eager``) use a 4D block-causal mask built by
+    the collater and need no validation.
+
+    Args:
+        attn_implementation: The attention implementation the model runs with.
+        model: Optional already-built model (or DDP wrapper) to check for the
+            ability to receive the typed packing contract. Skipped when ``None``
+            or when the model's ``forward`` signature cannot be introspected.
+
+    Raises:
+        RuntimeError: If a flash backend is requested but the installed
+            Transformers ``_flash_attention_forward`` does not accept the public
+            varlen kwargs, or the model's ``forward`` can consume neither the
+            varlen kwargs nor ``_packed_seq_ids``.
     """
+    if attn_implementation not in _FLASH_ATTN_IMPLEMENTATIONS:
+        return
+
     import transformers
 
     try:
-        import transformers.masking_utils as masking_utils
+        from transformers.modeling_flash_attention_utils import _flash_attention_forward
     except (ImportError, AttributeError) as exc:
         raise RuntimeError(
-            "Cannot enable FA2 neat packing because transformers.masking_utils is unavailable "
-            f"in transformers {transformers.__version__}. Refusing to continue because losing "
-            "indexed mask values would enable cross-document attention."
+            "Cannot enable flash-attention neat packing: "
+            "transformers.modeling_flash_attention_utils._flash_attention_forward is unavailable in "
+            f"transformers {transformers.__version__}. Upgrade transformers or use sdpa/eager packing."
         ) from exc
 
-    if getattr(masking_utils, "_nemo_automodel_packing_preprocess_patched", False):
+    available = set(inspect.signature(_flash_attention_forward).parameters)
+    missing = set(_PACKED_VARLEN_KWARGS) - available
+    if missing:
+        raise RuntimeError(
+            f"Cannot enable flash-attention neat packing: transformers {transformers.__version__} lacks "
+            f"the varlen FlashAttention kwargs {sorted(missing)}. Upgrade transformers or use sdpa/eager packing."
+        )
+
+    _validate_model_consumes_packed_contract(model)
+
+
+def _validate_model_consumes_packed_contract(model: torch.nn.Module | None) -> None:
+    """Raise if ``model``'s ``forward`` cannot receive the typed packing contract.
+
+    A model consumes the contract when its ``forward`` accepts ``**kwargs`` (HF
+    models thread ``FlashAttentionKwargs`` this way), names ``_packed_seq_ids``
+    (the custom-model document map), or names all four varlen kwargs explicitly.
+    A ``forward`` whose signature cannot be introspected is rejected.
+
+    Args:
+        model: Already-built model, or a DDP wrapper exposing ``.module``.
+    """
+    if model is None:
         return
-
-    original_preprocess = getattr(masking_utils, "_preprocess_mask_arguments", None)
-    if original_preprocess is None:
-        raise RuntimeError(
-            "Cannot enable FA2 neat packing because transformers.masking_utils has no "
-            f"_preprocess_mask_arguments in transformers {transformers.__version__}. Refusing to "
-            "continue because losing indexed mask values would enable cross-document attention."
-        )
-
-    # A 4D mask takes Transformers' immediate pass-through branch, so this
-    # constant-size probe verifies the private call and return contract without
-    # allocating an O(sequence^2) tensor for a real long-context batch.
-    probe_mask = torch.zeros((1, 1, 1, 1), dtype=torch.bool)
+    target = getattr(model, "module", model)
+    forward = getattr(target, "forward", None)
+    if forward is None:
+        return
     try:
-        preprocess_result_template = original_preprocess(
-            config=None,
-            inputs_embeds=torch.zeros((1, 1, 1)),
-            attention_mask=probe_mask,
-            past_key_values=None,
-            position_ids=None,
-            layer_idx=None,
-        )
-    except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+        params = inspect.signature(forward).parameters
+    except (TypeError, ValueError) as exc:
         raise RuntimeError(
-            "Cannot enable FA2 neat packing because transformers "
-            f"{transformers.__version__} has an incompatible _preprocess_mask_arguments signature. "
-            "Refusing to continue because losing indexed mask values would enable cross-document attention."
+            f"Cannot introspect {type(target).__name__}.forward to verify it consumes packed-sequence "
+            "metadata; use sdpa/eager packing or expose **kwargs on the model forward."
         ) from exc
-
-    if (
-        not isinstance(preprocess_result_template, tuple)
-        or len(preprocess_result_template) < 2
-        or preprocess_result_template[0] is not True
-        or preprocess_result_template[1] is not probe_mask
-    ):
-        raise RuntimeError(
-            "Cannot enable FA2 neat packing because transformers "
-            f"{transformers.__version__} returned an incompatible _preprocess_mask_arguments "
-            "early-exit result. Refusing to continue because losing indexed mask values would "
-            "enable cross-document attention."
-        )
-
-    def _patched_preprocess_mask_arguments(*args, **kwargs):
-        """Preserve indexed masks while matching the installed private HF API.
-
-        Args:
-            *args: Positional HF arguments. When present, index 1 is an input
-                tensor of shape [batch, sequence, hidden] and index 2 is an
-                attention mask of shape [batch, sequence].
-            **kwargs: Keyword form of the same HF arguments.
-
-        Returns:
-            Tuple matching the installed Transformers preprocessing result. For
-            indexed FA2 masks, the first entries are ``True`` and the unchanged
-            mask tensor of shape [batch, sequence].
-        """
-        config = kwargs.get("config", args[0] if len(args) > 0 else None)
-        attention_mask = kwargs.get("attention_mask", args[2] if len(args) > 2 else None)
-        attn_impl = getattr(config, "_attn_implementation", None) or getattr(
-            config, "_attn_implementation_internal", None
-        )
-        if attn_impl in _FLASH_ATTN_IMPLEMENTATIONS and is_indexed_packed_mask(attention_mask):
-            return (
-                preprocess_result_template[0],
-                attention_mask,
-                *preprocess_result_template[2:],
-            )
-        return original_preprocess(*args, **kwargs)
-
-    masking_utils._preprocess_mask_arguments = _patched_preprocess_mask_arguments
-    masking_utils._nemo_automodel_packing_preprocess_patched = True
-
-
-# Model modules whose ``create_causal_mask`` must be patched for neat packing.
-# TODO: perhaps its for ALL models.
-_PACKING_PATCH_MODULES = [
-    "transformers.models.llama.modeling_llama",
-    "transformers.models.qwen3.modeling_qwen3",
-    "transformers.models.qwen2.modeling_qwen2",
-    "transformers.models.qwen2_5_vl.modeling_qwen2_5_vl",
-    "transformers.models.qwen2_vl.modeling_qwen2_vl",
-    "transformers.models.qwen3_5.modeling_qwen3_5",
-    "transformers.models.qwen3_vl.modeling_qwen3_vl",
-    "transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe",
-]
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return
+    if "_packed_seq_ids" in params:
+        return
+    # Transformers enters its varlen path only when all four cumulative-length
+    # kwargs are present; a forward exposing only some of them would have the rest
+    # dropped by ``filter_forward_kwargs``, so require the full set here.
+    if set(_PACKED_VARLEN_KWARGS).issubset(params):
+        return
+    raise RuntimeError(
+        f"Cannot enable flash-attention neat packing: {type(target).__name__}.forward accepts neither "
+        "**kwargs, all four varlen FlashAttention kwargs, nor _packed_seq_ids. Add **kwargs to the "
+        "model forward or use sdpa/eager packing."
+    )
 
 
 def configure_packing(
     attn_implementation: str,
     *,
     model: torch.nn.Module | None = None,
-    unpad_data: UnpadData | None = None,
 ) -> PackingCapabilities:
     """Configure the model consumer and return its dataset packing contract.
 
-    Hugging Face flash-attention variants require private Transformers adapters
-    for the indexed document map. Native consumers receive explicit metadata and
-    need no patch. The conversion callable is injected by the recipe so this
-    model component never imports the dataset implementation. Consumers that do
-    not require NEAT metadata strip it at entry, so a shared KD batch cannot
-    accidentally activate their legacy THD dispatch.
-
-    Migration: resolve the backend with ``get_model_attn_implementation(model)``
-    (replacing ``get_attn_implementation(cfg_model, model)``), supply the
-    dataset-owned ``get_unpad_data`` from ``components.datasets.packing`` for
-    HF flash attention, and pass the returned contract as ``packing=`` to the
-    collater or ``packing_contract=`` to the dataloader config's ``build``.
-    ``get_seqlens_in_batch`` also moved to ``components.datasets.packing``.
-    The legacy collater ``attn_implementation=`` argument selects only a mask
-    layout; it cannot supply model-required metadata. Recipe YAML's old
-    ``packed_sequence.attn_implementation`` selector is ignored in favor of
-    the built model's backend.
+    HF flash attention receives public varlen kwargs from the collater, without
+    modifying Transformers globals. Native FA4 receives batch-major metadata
+    flattened at model entry after microbatch splitting. Other consumers strip
+    unused native metadata so it cannot accidentally select their THD path.
 
     Args:
-        attn_implementation: The attention implementation used by the model.
+        attn_implementation: Attention implementation used by the built model.
         model: Optional built model declaring additional packed-metadata needs.
-        unpad_data: Dataset-owned callable that converts an indexed mask of shape
-            [batch, sequence] to flat indices, cumulative lengths, and maximum
-            sequence length.
 
     Returns:
         Structural packed-data requirements for the dataset collater.
 
     Raises:
-        ValueError: If a Transformers adapter is required without ``unpad_data``.
+        RuntimeError: If HF flash attention cannot consume the public varlen contract.
     """
     capabilities = get_packing_capabilities(attn_implementation, model=model)
     if model is not None and not capabilities.requires_packed_sequence_metadata:
@@ -606,41 +505,17 @@ def configure_packing(
             raise ValueError("Native FA4 packing requires the built model")
         _install_native_fa4_metadata_hook(model)
         return capabilities
-    if not capabilities.patch_transformers:
-        return capabilities
-    if unpad_data is None:
-        raise ValueError("Hugging Face flash-attention packing requires a dataset-owned unpad_data callable")
-
-    import sys
-
-    import transformers.modeling_flash_attention_utils
-
-    _patch_preprocess_mask_arguments_for_packing()
-    transformers.modeling_flash_attention_utils._get_unpad_data = unpad_data
-
-    # Each model module imports create_causal_mask into its own namespace at
-    # import time, so we must patch each module individually.
-    for mod_name in _PACKING_PATCH_MODULES:
-        mod = sys.modules.get(mod_name)
-        if mod is not None and hasattr(mod, "create_causal_mask"):
-            mod.create_causal_mask = _passthrough_create_causal_mask
-
-    logger.info(
-        "Configured packing (%s): patched create_causal_mask in %d model modules.",
-        attn_implementation,
-        sum(1 for m in _PACKING_PATCH_MODULES if sys.modules.get(m) is not None),
-    )
+    validate_flash_packing_support(attn_implementation, model=model)
     return capabilities
 
 
 def configure_packing_for_models(
-    models: Sequence[torch.nn.Module], *, unpad_data: UnpadData | None = None
+    models: Sequence[torch.nn.Module],
 ) -> PackingCapabilities:
     """Configure local pipeline stages and combine their dataset requirements.
 
     Args:
         models: Nonempty sequence of built model stages consuming the same batch.
-        unpad_data: Dataset-owned indexed-mask conversion for HF flash attention.
 
     Returns:
         Packing contract with metadata enabled if any stage needs it.
@@ -650,9 +525,7 @@ def configure_packing_for_models(
     """
     if not models:
         raise ValueError("Packing setup requires at least one model")
-    contracts = [
-        configure_packing(get_model_attn_implementation(model), model=model, unpad_data=unpad_data) for model in models
-    ]
+    contracts = [configure_packing(get_model_attn_implementation(model), model=model) for model in models]
     if any(contract.packed_mask_type != contracts[0].packed_mask_type for contract in contracts):
         raise ValueError("Pipeline stages must agree on the NEAT packed mask layout")
     return replace(

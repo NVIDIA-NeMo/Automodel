@@ -3117,6 +3117,16 @@ class TestNeatPackedVlmCollaterPackingContract:
             requires_packed_sequence_metadata=requires_metadata,
         )
 
+    def test_flash_attention_2_emits_varlen_kwargs_instead_of_mask(self):
+        from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
+
+        batch = [self._make_packed_sample(16, 0), self._make_packed_sample(12, 0)]
+        result = neat_packed_vlm_collater(batch, attn_implementation="flash_attention_2")
+        # Dropping the mask is what routes HF to flash_attn_varlen_func; the cumulative
+        # boundaries themselves are checked in test_neat_packing_vlm.py.
+        assert "attention_mask" not in result
+        assert "cu_seq_lens_q" in result
+
     def test_document_ids_contract_returns_2d_mask(self):
         from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
 
@@ -3135,7 +3145,8 @@ class TestNeatPackedVlmCollaterPackingContract:
         with pytest.warns(FutureWarning, match="attn_implementation is deprecated"):
             result = neat_packed_vlm_collater(batch, 0, None, "flash_attention_2")
 
-        assert result["attention_mask"].ndim == 2
+        assert "attention_mask" not in result
+        assert result["cu_seq_lens_q"].tolist() == [0, 8]
 
     def test_block_causal_contract_returns_4d_mask(self):
         from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater

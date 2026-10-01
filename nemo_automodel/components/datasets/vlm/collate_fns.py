@@ -1527,7 +1527,8 @@ def neat_packed_vlm_collater(
     1. Pads all text tensors to a common length.
     2. Converts the indexed ``attention_mask`` to the representation requested
        by ``packing``: a dense block-causal mask, compact document IDs, or
-       document IDs plus explicit varlen metadata.
+       document IDs plus native metadata. ``flash_varlen`` emits HF varlen
+       kwargs without an attention mask.
     3. Concatenates media tensors across the batch dimension.
 
     **No autoregressive shift** — it was already applied during packing.
@@ -1560,12 +1561,15 @@ def neat_packed_vlm_collater(
         Mapping with text IDs, labels, and token types of shape [batch, sequence];
         positions of shape [batch, sequence] or [3, batch, sequence]; and an
         attention mask of shape [batch, sequence] or [batch, 1, sequence, sequence].
+        For ``flash_varlen``, the attention mask is omitted; ``cu_seq_lens_q``
+        and ``cu_seq_lens_k`` have shape [segments + 1] and include physical
+        padding runs. ``max_length_q`` and ``max_length_k`` are Python ints.
         Optional ``_packed_seq_ids`` has shape [batch, sequence]. Media values,
         grids, image positions, and timestamps concatenate their leading axis
         while preserving their trailing axes; variable-resolution media remain
         a flattened list of per-image tensors. Pixel values are cast to bfloat16.
         Optional media counts have shape [batch].
-        Varlen output adds
+        A contract requiring native packed-sequence metadata additionally adds
         int64 ``packed_token_indices`` of shape [batch, sequence], containing
         row-local token positions and -1 padding; int32 ``cu_seqlens`` of shape
         [batch, max_documents + 1], containing row-local cumulative lengths
@@ -1580,7 +1584,7 @@ def neat_packed_vlm_collater(
 
     LABEL_PAD = -100
     packed_mask_type = packing.packed_mask_type
-    if packed_mask_type not in ("block_causal", "document_ids"):
+    if packed_mask_type not in ("block_causal", "document_ids", "flash_varlen"):
         raise ValueError(f"Unsupported packed_mask_type: {packed_mask_type!r}")
 
     # Determine pad target: fixed max_length or batch-dynamic
@@ -1612,9 +1616,8 @@ def neat_packed_vlm_collater(
     mm_token_type_ids = torch.stack([_pad_1d(_get_mm_token_type_ids(x), 0, max_len) for x in batch])
 
     if packed_mask_type != "block_causal" or not materialize_4d_mask:
-        # Keep the compact indexed [B, S] document map. FlashAttention derives
-        # cu_seqlens from it; block-diagonal CP rebuilds its local mask from the
-        # identical _packed_seq_ids emitted below.
+        # Keep the compact indexed [B, S] map for native attention or CP.
+        # The HF varlen path replaces it with explicit cumulative lengths below.
         attention_mask_out = attention_mask
     else:
         from nemo_automodel.components.datasets.utils import _indexed_mask_to_4d_block_causal
@@ -1644,6 +1647,16 @@ def neat_packed_vlm_collater(
         "attention_mask": attention_mask_out,
         "mm_token_type_ids": mm_token_type_ids,
     }
+    if packed_mask_type == "flash_varlen":
+        from nemo_automodel.components.datasets.packed_seq import (
+            packed_seq_params_from_doc_ids,
+            to_flash_attention_kwargs,
+        )
+
+        # HF consumes physical offsets, including padding, without an attention
+        # mask. Native FA4's unpadded offsets below have a different contract.
+        result.pop("attention_mask")
+        result.update(to_flash_attention_kwargs(packed_seq_params_from_doc_ids(attention_mask)))
     if packing.requires_packed_sequence_metadata:
         result.update(build_packed_sequence_metadata(attention_mask))
 

@@ -21,7 +21,7 @@ from typing import Final, Literal, Protocol, TypedDict
 import torch
 import torch.nn.functional as F
 
-PackedMaskType = Literal["block_causal", "document_ids"]
+PackedMaskType = Literal["block_causal", "document_ids", "flash_varlen"]
 
 
 class PackedSequenceContract(Protocol):
@@ -70,7 +70,7 @@ def resolve_packing_contract(
 
     if packing is DEFAULT_PACKED_SEQUENCE_CONTRACT:
         packed_mask_type: PackedMaskType = (
-            "document_ids" if attn_implementation in _LEGACY_FLASH_ATTENTION_IMPLEMENTATIONS else "block_causal"
+            "flash_varlen" if attn_implementation in _LEGACY_FLASH_ATTENTION_IMPLEMENTATIONS else "block_causal"
         )
         packing = _DefaultPackedSequenceContract(packed_mask_type=packed_mask_type)
         message = (
