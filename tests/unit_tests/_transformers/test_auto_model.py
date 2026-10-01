@@ -33,7 +33,10 @@ from nemo_automodel._transformers.auto_model import (
     _patch_remote_code_compat,
     _resolve_distributed_setup,
 )
-from nemo_automodel._transformers.infrastructure import _apply_peft_and_lower_precision, instantiate_infrastructure
+from nemo_automodel._transformers.infrastructure import (
+    _apply_peft_and_lower_precision,
+    instantiate_infrastructure,
+)
 from nemo_automodel._transformers.model_init import (
     _filter_kwargs_for_init,
     _filter_meta_device_from_init_context,
@@ -131,15 +134,16 @@ class TestResolveMeshContext:
         moe_mesh = _FakeMesh({MeshAxisName.EP: 2, MeshAxisName.EP_SHARD: 2})
         mesh = MeshContext.from_meshes(device_mesh, moe_mesh)
 
-        _, _, parallelize_fn, _ = instantiate_infrastructure(
+        context, _, parallelize_fn, _ = instantiate_infrastructure(
             distributed_config=FSDP2Config(multimodal=MultimodalDistributedConfig(frozen_sharding="replicate")),
             moe_parallel_config=MoEParallelizerConfig(),
             activation_checkpointing=False,
             mesh=mesh,
         )
 
+        assert context is not None
         assert parallelize_fn is not None
-        assert parallelize_fn.keywords["frozen_multimodal_sharding"] == "replicate"
+        assert context.strategy_config.multimodal.frozen_sharding == "replicate"
 
 
 class TestFromPretrainedDeviceMesh:
@@ -798,6 +802,58 @@ class TestApplyPeftAndLowerPrecision:
 
             assert mock_peft_config.use_triton is False
             assert "Disabling Triton with Pipeline Parallelism" in caplog.text
+
+    def test_apply_peft_applies_mxfp4_after_lora(self):
+        """MXFP4 expert storage is applied after LoRA module injection."""
+        model = MagicMock()
+        peft_config = MagicMock()
+        peft_config.expert_weight_format = "mxfp4"
+        events = []
+
+        with (
+            patch(
+                "nemo_automodel._transformers.infrastructure.apply_lora_to_linear_modules",
+                side_effect=lambda *args, **kwargs: events.append("lora"),
+            ) as apply_lora,
+            patch(
+                "nemo_automodel._transformers.infrastructure.apply_mxfp4_to_moe_experts",
+                side_effect=lambda model, **kwargs: events.append("mxfp4") or model,
+            ) as apply_mxfp4,
+        ):
+            _apply_peft_and_lower_precision(
+                model,
+                tp_size=1,
+                autopipeline=None,
+                peft_config=peft_config,
+                quantization_config=None,
+                fp8_config=None,
+                qat_quantizer=None,
+            )
+
+        apply_lora.assert_called_once()
+        apply_mxfp4.assert_called_once_with(model)
+        assert events == ["lora", "mxfp4"]
+
+    def test_apply_peft_skips_mxfp4_for_unquantized_experts(self):
+        model = MagicMock()
+        peft_config = MagicMock()
+        peft_config.expert_weight_format = "unquantized"
+
+        with (
+            patch("nemo_automodel._transformers.infrastructure.apply_lora_to_linear_modules"),
+            patch("nemo_automodel._transformers.infrastructure.apply_mxfp4_to_moe_experts") as apply_mxfp4,
+        ):
+            _apply_peft_and_lower_precision(
+                model,
+                tp_size=1,
+                autopipeline=None,
+                peft_config=peft_config,
+                quantization_config=None,
+                fp8_config=None,
+                qat_quantizer=None,
+            )
+
+        apply_mxfp4.assert_not_called()
 
     def test_apply_fp8_when_configured(self):
         """When fp8_config provided, calls apply_fp8_to_model."""
@@ -1710,10 +1766,10 @@ class TestBuildModelRetryDepth:
         """HF meta init errors should retry even when Automodel did not pick meta init."""
         build_kwargs, mock_config = self._make_build_kwargs()
         sentinel_model = MagicMock()
-        dummy_manager_cls = type("DummyManager", (), {})
-        build_kwargs["model_wrapper"] = dummy_manager_cls()
+        from nemo_automodel.components.distributed import MegatronFSDPConfig, MeshContext
+
+        build_kwargs["model_wrapper"] = MeshContext(strategy_config=MegatronFSDPConfig())
         with (
-            patch("nemo_automodel._transformers.auto_model.MegatronFSDPManager", dummy_manager_cls),
             patch("nemo_automodel._transformers.auto_model._apply_preload_overrides", return_value=("eager", False)),
             patch("nemo_automodel._transformers.auto_model._init_model") as mock_init,
             patch("nemo_automodel._transformers.auto_model.get_world_size_safe", return_value=1),
@@ -1766,15 +1822,16 @@ class TestBuildModelRetryDepth:
     def test_custom_model_under_ddp_still_needs_its_checkpoint(self):
         """A MODEL_ARCH_MAPPING model under DDP reaches infrastructure unloaded and off meta.
 
-        ``DDPManager`` is excluded from meta-device init, and custom model constructors
+        DDP is excluded from meta-device init, and custom model constructors
         only build the architecture, so ``apply_model_infrastructure`` has to be told the
         weights are still missing. If either flag is wrong the model enters training
         randomly initialized and nothing is raised.
         """
         build_kwargs, mock_config = self._make_build_kwargs()
         build_kwargs["is_hf_model"] = False
-        dummy_manager_cls = type("DummyManager", (), {})
-        build_kwargs["model_wrapper"] = dummy_manager_cls()
+        from nemo_automodel.components.distributed import DDPConfig, MeshContext
+
+        build_kwargs["model_wrapper"] = MeshContext(strategy_config=DDPConfig())
         sentinel_model = MagicMock()
         captured = {}
 
@@ -1783,7 +1840,6 @@ class TestBuildModelRetryDepth:
             return sentinel_model
 
         with (
-            patch("nemo_automodel._transformers.auto_model.DDPManager", dummy_manager_cls),
             patch("nemo_automodel._transformers.auto_model._init_model", return_value=(True, sentinel_model)),
             patch("nemo_automodel._transformers.auto_model.get_world_size_safe", return_value=1),
             patch(

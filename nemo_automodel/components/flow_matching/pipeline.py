@@ -44,6 +44,7 @@ from .adapters import (
     HunyuanAdapter,
     LTX2Adapter,
     ModelAdapter,
+    QwenImage21Adapter,
     QwenImageAdapter,
     SimpleAdapter,
 )
@@ -631,7 +632,7 @@ def create_adapter(adapter_type: str, **kwargs) -> ModelAdapter:
 
     Args:
         adapter_type: Type of adapter ("hunyuan", "simple", "flux", "flux2", "qwen_image",
-            "qwen_image_edit", "ltx2")
+            "qwen_image_21", "qwen_image_edit", "ltx2")
         **kwargs: Additional arguments passed to the adapter constructor
 
     Returns:
@@ -647,6 +648,7 @@ def create_adapter(adapter_type: str, **kwargs) -> ModelAdapter:
         "flux": FluxAdapter,
         "flux2": Flux2Adapter,
         "qwen_image": QwenImageAdapter,
+        "qwen_image_21": QwenImage21Adapter,
         "qwen_image_edit": QwenImageEditAdapter,
         "ltx2": LTX2Adapter,
     }

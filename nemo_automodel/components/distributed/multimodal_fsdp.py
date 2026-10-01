@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared helpers for FSDP treatment of multimodal submodules."""
+"""FSDP policy helpers for multimodal submodules."""
 
 from collections.abc import Callable, Iterator
 from typing import Literal, cast
@@ -58,6 +58,20 @@ MULTIMODAL_PROJECTOR_NAMES = (
 MULTIMODAL_MODULE_NAMES = MULTIMODAL_TOWER_NAMES + MULTIMODAL_PROJECTOR_NAMES
 
 VALID_FROZEN_MULTIMODAL_SHARDING: tuple[FrozenMultimodalSharding, ...] = ("root", "per_layer", "replicate")
+
+__all__ = [
+    "FrozenMultimodalSharding",
+    "MULTIMODAL_MODULE_NAMES",
+    "MULTIMODAL_PROJECTOR_NAMES",
+    "MULTIMODAL_TOWER_NAMES",
+    "ignored_params_for_root",
+    "is_multimodal_module_name",
+    "iter_multimodal_modules",
+    "module_is_fully_frozen",
+    "module_parameters",
+    "normalize_frozen_multimodal_sharding",
+    "shard_multimodal_module",
+]
 
 
 def normalize_frozen_multimodal_sharding(value: str) -> FrozenMultimodalSharding:

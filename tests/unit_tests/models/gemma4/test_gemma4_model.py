@@ -19,7 +19,6 @@ import torch
 from transformers.models.gemma4.configuration_gemma4 import Gemma4Config, Gemma4TextConfig
 
 from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.gemma4_moe.parallelization import _get_attention_head_counts
 from nemo_automodel.components.models.gemma4_moe.model import (
     Gemma4ForConditionalGeneration,
     Gemma4Gate,
@@ -31,6 +30,7 @@ from nemo_automodel.components.models.gemma4_moe.model import (
     _build_unpacked_gemma4_causal_mask_mapping,
     _derive_padding_mask,
 )
+from nemo_automodel.components.models.gemma4_moe.parallelization import _get_attention_head_counts
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import MoE
 
