@@ -92,7 +92,7 @@ def test_configure_sentence_transformer_export_binds_structured_multimodal_promp
     wrapped = _DDPLikeWrapper(_Model())
     _configure_sentence_transformer_export(wrapped, collator)
 
-    assert captured == {"query_prompt": "query:", "document_prompt": "passage:"}
+    assert captured == {"query_prompt": "query:", "document_prompt": "passage:", "tokenizer": None}
 
 
 def test_configure_sentence_transformer_export_retains_separator_for_text_prompts():
@@ -115,7 +115,7 @@ def test_configure_sentence_transformer_export_retains_separator_for_text_prompt
 
     _configure_sentence_transformer_export(_Model(), collator)
 
-    assert captured == {"query_prompt": "query: ", "document_prompt": "passage: "}
+    assert captured == {"query_prompt": "query: ", "document_prompt": "passage: ", "tokenizer": None}
 
 
 def test_configure_sentence_transformer_export_ignores_collator_when_export_is_disabled():

@@ -283,20 +283,29 @@ def test_mistral3_vlm_config_pooling_round_trips_and_exports():
     assert exported.text_config.pooling == "cls"
 
 
-def test_mistral3_vlm_initializes_parent_once(monkeypatch):
+def test_mistral3_vlm_retains_parent_constructed_towers(monkeypatch):
     config = _tiny_mistral3_bidirectional_vlm_config()
     parent_init = Mistral3Model.__init__
     calls = []
+    parent_towers = {}
 
     def tracking_init(model, model_config):
         calls.append(model_config)
         parent_init(model, model_config)
+        parent_towers.update(
+            vision=model.vision_tower,
+            projector=model.multi_modal_projector,
+            language=model.language_model,
+        )
 
     monkeypatch.setattr(Mistral3Model, "__init__", tracking_init)
 
     model = Mistral3BidirectionalModel(config)
 
     assert calls == [config]
+    assert model.vision_tower is parent_towers["vision"]
+    assert model.multi_modal_projector is parent_towers["projector"]
+    assert model.language_model is parent_towers["language"]
     assert isinstance(model.language_model, Ministral3BidirectionalModel)
 
 
@@ -1449,12 +1458,14 @@ def test_mistral3_vlm_exports_sentence_transformers_checkpoint(tmp_path, monkeyp
     from sentence_transformers import SentenceTransformer
 
     monkeypatch.setattr(Mistral3BiEncoderProcessor, "check_argument_for_proper_class", lambda *args, **kwargs: None)
+    tokenizer = FakePixtralTokenizer()
+    tokenizer.model_max_length = 48
     processor = Mistral3BiEncoderProcessor(
         image_processor=PixtralImageProcessor(size={"longest_edge": 16}),
-        tokenizer=FakePixtralTokenizer(),
+        tokenizer=tokenizer,
         patch_size=4,
-        q_max_length=64,
-        p_max_length=64,
+        q_max_length=16,
+        p_max_length=32,
         padding=True,
         query_prefix="query:",
         passage_prefix="passage:",
@@ -1504,7 +1515,8 @@ def test_mistral3_vlm_exports_sentence_transformers_checkpoint(tmp_path, monkeyp
         "document": "passage:",
     }
     transformer_config = json.loads((tmp_path / "sentence_bert_config.json").read_text())
-    assert transformer_config["max_seq_length"] == 64
+    assert transformer_config["max_seq_length"] == 48
+    assert json.loads((tmp_path / "tokenizer_config.json").read_text())["model_max_length"] == 48
     assert transformer_config["do_lower_case"] is False
     assert transformer_config["module_output_name"] == "token_embeddings"
     assert set(transformer_config["modality_config"]) == {"text", "image", "message"}
@@ -1524,6 +1536,7 @@ def test_mistral3_vlm_exports_sentence_transformers_checkpoint(tmp_path, monkeyp
     reloaded_processor = AutoProcessor.from_pretrained(tmp_path, trust_remote_code=False)
     assert type(reloaded_processor) is PixtralProcessor
     sentence_transformer = SentenceTransformer(str(tmp_path), device="cpu", trust_remote_code=False)
+    assert sentence_transformer.max_seq_length == 48
     assert sentence_transformer.prompts == {"query": "query:", "document": "passage:"}
     assert [type(module).__name__ for module in sentence_transformer] == ["Transformer", "Pooling", "Normalize"]
     assert type(sentence_transformer[0].processor) is PixtralProcessor
@@ -1603,6 +1616,7 @@ def test_mistral3_vlm_exports_sentence_transformers_checkpoint(tmp_path, monkeyp
         device="cpu",
         trust_remote_code=False,
     )
+    assert consolidated.max_seq_length == 48
     consolidated_actual = consolidated.encode_document([message], convert_to_tensor=True)
     assert type(consolidated[0].model) is Mistral3Model
     assert type(consolidated[0].processor) is PixtralProcessor

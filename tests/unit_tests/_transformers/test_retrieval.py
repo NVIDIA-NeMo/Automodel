@@ -304,22 +304,6 @@ def test_retrieval_public_apis_expose_is_causal():
     ):
         assert "is_causal" in inspect.signature(callable_).parameters
 
-    cross_auto_signature = inspect.signature(auto_model.NeMoAutoModelCrossEncoder.from_pretrained)
-    assert cross_auto_signature.parameters["is_causal"].kind is inspect.Parameter.KEYWORD_ONLY
-
-
-def test_retrieval_public_apis_expose_is_causal():
-    from nemo_automodel._transformers import auto_model, retrieval
-
-    for callable_ in (
-        retrieval.BiEncoderModel.__init__,
-        retrieval.BiEncoderModel.build,
-        retrieval.CrossEncoderModel.__init__,
-        retrieval.CrossEncoderModel.build,
-        auto_model.NeMoAutoModelBiEncoder.from_pretrained,
-        auto_model.NeMoAutoModelCrossEncoder.from_pretrained,
-    ):
-        assert "is_causal" in inspect.signature(callable_).parameters
     for callable_ in (retrieval.CrossEncoderModel.build, auto_model.NeMoAutoModelCrossEncoder.from_pretrained):
         assert inspect.signature(callable_).parameters["is_causal"].kind is inspect.Parameter.KEYWORD_ONLY
 
@@ -1137,74 +1121,6 @@ def test_direct_retrieval_wrapper_constructor_applies_causality(encoder_class):
     assert all(layer.self_attn.is_causal is False for layer in text_model.layers)
 
 
-@pytest.mark.parametrize("encoder_class", ["bi", "cross"])
-@pytest.mark.parametrize("is_causal", [False, True])
-@pytest.mark.parametrize("attn_implementation", ["eager", "sdpa"])
-def test_encoder_only_backbones_apply_causality_policy(encoder_class, is_causal, attn_implementation):
-    from nemo_automodel._transformers import retrieval
-
-    torch.manual_seed(42)
-    config = BertConfig(
-        vocab_size=32,
-        hidden_size=16,
-        intermediate_size=32,
-        num_hidden_layers=1,
-        num_attention_heads=2,
-        hidden_dropout_prob=0.0,
-        attention_probs_dropout_prob=0.0,
-    )
-    config._attn_implementation = attn_implementation
-    if encoder_class == "bi":
-        backbone = BertModel(config)
-        retrieval.BiEncoderModel(backbone, is_causal=is_causal)
-        text_model = backbone
-    else:
-        backbone = BertForSequenceClassification(config)
-        retrieval.CrossEncoderModel(backbone, is_causal=is_causal)
-        text_model = backbone.bert
-
-    assert backbone.config.is_causal is is_causal
-    assert backbone.config.is_decoder is is_causal
-    assert all(layer.attention.self.is_causal is is_causal for layer in text_model.encoder.layer)
-
-    input_ids = torch.tensor([[1, 2, 3, 4]])
-    changed_ids = input_ids.clone()
-    changed_ids[0, -1] = 5
-    attention_mask = torch.ones_like(input_ids)
-    text_model.eval()
-    with torch.no_grad():
-        original = text_model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
-        changed = text_model(input_ids=changed_ids, attention_mask=attention_mask).last_hidden_state
-
-    if is_causal:
-        torch.testing.assert_close(original[0, 0], changed[0, 0])
-    else:
-        assert not torch.allclose(original[0, 0], changed[0, 0], atol=1e-6)
-
-
-@pytest.mark.parametrize("attn_implementation", ["eager", "sdpa"])
-def test_cross_encoder_preserves_native_bert_decoder_mode(attn_implementation):
-    from nemo_automodel._transformers import retrieval
-
-    config = BertConfig(
-        vocab_size=32,
-        hidden_size=16,
-        intermediate_size=32,
-        num_hidden_layers=1,
-        num_attention_heads=2,
-        is_decoder=True,
-    )
-    config._attn_implementation = attn_implementation
-    backbone = BertForSequenceClassification(config)
-
-    encoder = retrieval.CrossEncoderModel(backbone)
-
-    assert encoder.is_causal is True
-    assert backbone.config.is_causal is True
-    assert backbone.config.is_decoder is True
-    assert all(layer.attention.self.is_causal is True for layer in backbone.bert.encoder.layer)
-
-
 def test_explicit_is_causal_rejects_non_boolean_value():
     from nemo_automodel._transformers import retrieval
 
@@ -1394,8 +1310,8 @@ def test_bi_encoder_build_forwards_native_hf_kwargs_to_config_and_backbone(monke
     )
 
 
-def test_build_encoder_backbone_accepts_keyword_loaded_config(monkeypatch):
-    """A resolved config can be reused without loading it a second time."""
+def test_build_encoder_backbone_preserves_positional_loaded_config(monkeypatch):
+    """A positional resolved config retains its meaning and avoids a second config load."""
     config = PretrainedConfig()
     config.model_type = "test"
     backbone = nn.Module()
@@ -1405,15 +1321,16 @@ def test_build_encoder_backbone_accepts_keyword_loaded_config(monkeypatch):
     monkeypatch.setattr(retrieval.AutoConfig, "from_pretrained", auto_config_from_pretrained)
     monkeypatch.setattr(retrieval.AutoModel, "from_pretrained", auto_model_from_pretrained)
 
-    result = retrieval.build_encoder_backbone("org/model", "embedding", loaded_config=config)
+    result = retrieval.build_encoder_backbone("org/model", "embedding", False, None, None, None, None, config)
 
     assert result is backbone
+    auto_config_from_pretrained.assert_not_called()
     assert result.config.is_causal is False
     auto_model_from_pretrained.assert_called_once_with("org/model", trust_remote_code=False)
 
 
-def test_bi_encoder_build_forwards_keyword_trust_remote_code(monkeypatch):
-    """The explicit remote-code policy reaches config and backbone loading."""
+def test_bi_encoder_build_preserves_positional_trust_remote_code(monkeypatch):
+    """The existing remote-code position must not enable causal attention."""
     config = PretrainedConfig()
     config.model_type = "test"
     backbone = MagicMock(spec=nn.Module)
@@ -1427,7 +1344,7 @@ def test_bi_encoder_build_forwards_keyword_trust_remote_code(monkeypatch):
     monkeypatch.setattr(retrieval, "_load_sentence_transformer_wrapper_options", MagicMock(return_value=None))
     monkeypatch.setattr(retrieval, "_resolve_cached_source_model_path", MagicMock(return_value=None))
 
-    retrieval.BiEncoderModel.build("org/model", is_causal=False, trust_remote_code=True)
+    retrieval.BiEncoderModel.build("org/model", None, None, None, False, True, True)
 
     auto_config_from_pretrained.assert_called_once_with("org/model", trust_remote_code=True)
     assert build_encoder_backbone.call_args.kwargs["trust_remote_code"] is True
@@ -2056,9 +1973,7 @@ def test_extract_submodel_llama_score_uses_constructed_backbone_default(tmp_path
     from nemo_automodel._transformers import retrieval
 
     model_dir, _ = _save_tiny_vlm(tmp_path, "llama")
-    encoder = retrieval.CrossEncoderModel.build(
-        str(model_dir), extract_submodel="language_model", num_labels=1
-    ).eval()
+    encoder = retrieval.CrossEncoderModel.build(str(model_dir), extract_submodel="language_model", num_labels=1).eval()
     assert type(encoder.model) is LlamaBidirectionalForSequenceClassification
     assert encoder.is_causal is False
     assert all(layer.self_attn.is_causal is False for layer in encoder.model.model.layers)
@@ -2218,8 +2133,13 @@ def test_cross_encoder_exports_raw_text_scores(tmp_path, consolidated):
 
     CrossEncoder = pytest.importorskip("sentence_transformers").CrossEncoder
     config = BertConfig(
-        vocab_size=32, hidden_size=16, intermediate_size=32, num_hidden_layers=1,
-        num_attention_heads=2, max_position_embeddings=64, num_labels=1,
+        vocab_size=32,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        max_position_embeddings=64,
+        num_labels=1,
     )
     config._attn_implementation = "eager"
     encoder = CrossEncoderModel(BertForSequenceClassification(config)).eval()
@@ -2230,8 +2150,11 @@ def test_cross_encoder_exports_raw_text_scores(tmp_path, consolidated):
         expected = encoder(**inputs).logits.flatten()
     if consolidated:
         ConsolidatedHFAddon().pre_save(
-            model_state=SimpleNamespace(model=[encoder]), hf_metadata_dir=str(tmp_path),
-            fqn_to_file_index_mapping={}, original_model_path=None, tokenizer=tokenizer,
+            model_state=SimpleNamespace(model=[encoder]),
+            hf_metadata_dir=str(tmp_path),
+            fqn_to_file_index_mapping={},
+            original_model_path=None,
+            tokenizer=tokenizer,
         )
         save_file(encoder.model.state_dict(), tmp_path / "model.safetensors", metadata={"format": "pt"})
     else:

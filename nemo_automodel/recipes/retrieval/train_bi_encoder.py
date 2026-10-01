@@ -67,8 +67,8 @@ def _unwrap_model_for_attrs(model):
     return getattr(model, "module", model)
 
 
-def _configure_sentence_transformer_export(model, collate_fn) -> None:
-    """Bind the training collator's exact static prompts to bi-encoder export metadata."""
+def _configure_sentence_transformer_export(model, collate_fn, *, tokenizer=None) -> None:
+    """Bind static prompts and validate export against the runtime tokenizer or processor."""
     model = _unwrap_model_for_attrs(model)
     configure_prompts = getattr(model, "configure_sentence_transformer_prompts", None)
     if configure_prompts is None:
@@ -100,7 +100,7 @@ def _configure_sentence_transformer_export(model, collate_fn) -> None:
         query_prompt = f"{collate_fn.query_prefix}{prompt_separator}" if collate_fn.query_prefix else ""
         document_prompt = f"{collate_fn.passage_prefix}{prompt_separator}" if collate_fn.passage_prefix else ""
 
-    configure_prompts(query_prompt=query_prompt, document_prompt=document_prompt)
+    configure_prompts(query_prompt=query_prompt, document_prompt=document_prompt, tokenizer=tokenizer)
 
 
 def _get_autocast_ctx(distributed_config):
@@ -369,7 +369,9 @@ class TrainBiEncoderRecipe(BaseRecipe):
                 )
 
         self.dataloader = materialize_loader(dataloader_config)
-        _configure_sentence_transformer_export(self.model_parts[0], self.dataloader.collate_fn)
+        _configure_sentence_transformer_export(
+            self.model_parts[0], self.dataloader.collate_fn, tokenizer=self.tokenizer
+        )
         self.train_n_passages = getattr(dataloader_config.dataset_config, "n_passages", 1)
 
         self.val_dataloader = None

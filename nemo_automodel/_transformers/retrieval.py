@@ -29,6 +29,8 @@ from transformers import (
     FineGrainedFP8Config,
     PretrainedConfig,
     PreTrainedModel,
+    PreTrainedTokenizerBase,
+    ProcessorMixin,
 )
 from transformers.models.auto.modeling_auto import MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING, MODEL_MAPPING
 from transformers.utils import ModelOutput, logging
@@ -414,8 +416,8 @@ def build_encoder_backbone(
     extract_submodel: str | None = None,
     num_labels: int | None = None,
     temperature: float | None = None,
-    is_causal: bool | None = None,
     loaded_config: PretrainedConfig | None = None,
+    is_causal: bool | None = None,
     *,
     model_args: tuple[Any, ...] = (),
     **hf_kwargs: Any,
@@ -440,9 +442,9 @@ def build_encoder_backbone(
             (e.g. ``"language_model"`` to extract the text backbone from a VLM).
         num_labels: Number of labels for reranking/classification backbones.
         temperature: Optional retrieval score temperature for custom retrieval backbones.
+        loaded_config: A previously loaded config used to keep model and metadata resolution on the same revision.
         is_causal: Whether the retrieval text backbone uses causal self-attention. When omitted, a saved policy is
             restored; otherwise embedding defaults to bidirectional and scoring preserves the backbone's native mode.
-        loaded_config: A previously loaded config used to keep model and metadata resolution on the same revision.
         model_args: Positional arguments forwarded to the backbone model's constructor.
         **hf_kwargs: Extra keyword arguments forwarded to ``from_pretrained``.
 
@@ -726,8 +728,8 @@ class BiEncoderModel(nn.Module):
         l2_normalize: bool | None = None,
         do_distributed_inbatch_negative: bool = False,
         detach_distributed_inbatch_negatives: bool = True,
-        is_causal: bool | None = None,
         trust_remote_code: bool = False,
+        is_causal: bool | None = None,
         **hf_kwargs: Any,
     ) -> "BiEncoderModel":
         """Build bi-encoder model from a pretrained backbone."""
@@ -792,13 +794,30 @@ class BiEncoderModel(nn.Module):
             )
         return encoder
 
-    def configure_sentence_transformer_prompts(self, query_prompt: str, document_prompt: str) -> None:
-        """Set the exact prompts used by the current retrieval pipeline."""
+    def configure_sentence_transformer_prompts(
+        self,
+        query_prompt: str,
+        document_prompt: str,
+        *,
+        tokenizer: PreTrainedTokenizerBase | ProcessorMixin | None = None,
+    ) -> None:
+        """Configure export prompts and validate the runtime processor when available.
+
+        Args:
+            query_prompt: Exact prompt used for queries by the training pipeline.
+            document_prompt: Exact prompt used for documents by the training pipeline.
+            tokenizer: Runtime tokenizer or processor, supplied during recipe setup
+                to validate export prerequisites before training begins.
+        """
         export_config = self.sentence_transformer_export_config
         if export_config is None:
             return
         export_config.query_prompt = query_prompt
         export_config.document_prompt = document_prompt
+        if tokenizer is not None:
+            self._get_consolidated_hf_metadata_exporter(
+                tokenizer=tokenizer, original_model_path=getattr(self, "source_model_path", None)
+            )
 
     def disable_sentence_transformer_export(self) -> None:
         """Disable standard export when runtime behavior cannot be represented faithfully."""

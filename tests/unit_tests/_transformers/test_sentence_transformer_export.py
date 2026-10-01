@@ -64,7 +64,6 @@ def test_multimodal_export_profile_preserves_processor_assets(tmp_path):
     processor.tokenizer = SimpleNamespace(model_max_length=512, pad_token=None)
     processor.image_processor = object()
     processor.chat_template = "{{ messages }}"
-    processor.model_max_length = 512
 
     _save_generated_sentence_transformer_assets(
         model,

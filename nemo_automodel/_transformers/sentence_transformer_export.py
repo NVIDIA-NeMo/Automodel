@@ -503,8 +503,9 @@ def _resolve_sentence_transformer_max_seq_length(
                 raise ValueError("Source Sentence Transformers max_seq_length exceeds max_position_embeddings.")
         return source_max_seq_length
 
+    text_tokenizer = tokenizer.tokenizer if isinstance(tokenizer, ProcessorMixin) else tokenizer
     candidates = [
-        getattr(tokenizer, "model_max_length", None),
+        getattr(text_tokenizer, "model_max_length", None),
         getattr(_resolve_effective_text_config(model_part), "max_position_embeddings", None),
     ]
     finite_candidates = []

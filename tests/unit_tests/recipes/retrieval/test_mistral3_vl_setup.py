@@ -12,18 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Exercise retrieval setup up to the optimizer boundary without GPU infrastructure."""
+"""Exercise retrieval setup validation without GPU infrastructure."""
 
 from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 import torch
+from transformers import BertConfig, BertModel, ProcessorMixin
 
+from nemo_automodel._transformers.retrieval import BiEncoderModel
 from nemo_automodel.components.checkpoint.config import CheckpointingConfig
 from nemo_automodel.components.config.loader import ConfigNode
-from nemo_automodel.components.utils.model_utils import FreezeConfig, apply_parameter_freezing
+from nemo_automodel.components.utils.model_utils import (
+    FreezeConfig,
+    apply_parameter_freezing,
+)
 from nemo_automodel.recipes.retrieval import train_bi_encoder
 from nemo_automodel.recipes.retrieval.train_bi_encoder import TrainBiEncoderRecipe
 from nemo_automodel.recipes.retrieval.train_cross_encoder import TrainCrossEncoderRecipe
@@ -137,3 +143,63 @@ def test_setup_allows_model_owned_temperature(setup_model: _VisualRetriever) -> 
     )
     with pytest.raises(_ReachedOptimizer):
         recipe.setup()
+
+
+@pytest.mark.parametrize("valid_processor", [False, True])
+def test_setup_validates_structured_export_processor(
+    setup_model: _VisualRetriever, monkeypatch: pytest.MonkeyPatch, valid_processor: bool
+) -> None:
+    """Invalid export processors fail during actual setup, before training or saving."""
+    model = BiEncoderModel(
+        BertModel(BertConfig(hidden_size=8, num_hidden_layers=1, num_attention_heads=2, intermediate_size=16))
+    )
+    model.sentence_transformer_export_config.input_mode = "structured_multimodal"
+    tokenizer = SimpleNamespace(pad_token="[PAD]", model_max_length=32)
+    processor = MagicMock(spec=ProcessorMixin)
+    processor.tokenizer = tokenizer
+    processor.image_processor = object()
+    processor.chat_template = "{{ messages }}"
+    runtime_tokenizer = processor if valid_processor else tokenizer
+    config = ConfigNode(
+        {
+            "model": {"_target_": "nemo_automodel._transformers.retrieval.BiEncoderModel"},
+            "tokenizer": {"_target_": "transformers.AutoTokenizer.from_pretrained"},
+            "optimizer": {"_target_": "torch.optim.SGD", "lr": 0.01},
+        }
+    )
+    monkeypatch.setattr(
+        ConfigNode,
+        "instantiate",
+        lambda self, **kwargs: model if self._target_ is BiEncoderModel else runtime_tokenizer,
+    )
+    monkeypatch.setattr(
+        TrainBiEncoderRecipe, "_build_optimizer_param_groups", lambda self: [{"params": model.parameters()}]
+    )
+    monkeypatch.setattr(TrainBiEncoderRecipe, "_get_dp_group_size", lambda *args, **kwargs: 1)
+    loader_config = SimpleNamespace(
+        dataset_builds_on_all_ranks=True,
+        seed=42,
+        build=lambda **kwargs: SimpleNamespace(
+            collate_fn=SimpleNamespace(query_prefix="query:", passage_prefix="passage:")
+        ),
+    )
+    monkeypatch.setattr(train_bi_encoder.RecipeConfig, "dataloader", property(lambda self: loader_config))
+    configure_export = train_bi_encoder._configure_sentence_transformer_export
+
+    class _ReachedExportValidation(Exception):
+        pass
+
+    def validate_and_stop(*args, **kwargs):
+        configure_export(*args, **kwargs)
+        raise _ReachedExportValidation
+
+    monkeypatch.setattr(train_bi_encoder, "_configure_sentence_transformer_export", validate_and_stop)
+    recipe = TrainBiEncoderRecipe(config)
+    if valid_processor:
+        with pytest.raises(_ReachedExportValidation):
+            recipe.setup()
+        assert model.sentence_transformer_export_config.query_prompt == "query:"
+        assert model.sentence_transformer_export_config.document_prompt == "passage:"
+    else:
+        with pytest.raises(ValueError, match="processor with a tokenizer"):
+            recipe.setup()
