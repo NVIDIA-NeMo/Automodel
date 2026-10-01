@@ -120,10 +120,14 @@ multi-node launch. If FlashMLA or cuDNN Frontend is unavailable, change
 
 ### Hugging Face Logit Parity
 
-A four-layer model containing KDA, KDA, KDA, and DSA was compared with the
-Transformers reference at sequence length 4,096 over the full 154,880-token
-vocabulary. All 135 expected tensors loaded with no missing, unexpected, or
-shape-mismatched keys.
+A four-layer model containing KDA, KDA, KDA, and DSA, with
+`vision_config.depth=1`, was compared with the Transformers reference at
+sequence length 4,096 over the full 154,880-token vocabulary. The reference
+side needs a Transformers build that includes `glm5_next` (5.17.0 or later);
+the training path does not. All 135 tensors NeMo AutoModel expects for this
+model (110 language, 25 vision) loaded with no missing, unexpected, or
+shape-mismatched keys. The Transformers-side key count differs, because the
+state-dict adapter changes the parameter layout.
 
 | Metric | Result |
 |---|---:|

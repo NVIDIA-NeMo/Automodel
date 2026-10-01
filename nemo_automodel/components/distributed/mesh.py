@@ -14,8 +14,9 @@
 
 """MeshContext dataclass, construction, and validation.
 
-``MeshContext`` is the single source of truth for distributed topology:
-device meshes, parallelism sizes, and axis names.
+``MeshContext`` is the single runtime input to model parallelization. It owns
+the resolved device meshes, axis names, strategy policy, and optional MoE and
+activation-checkpointing policy.
 
 Parallelism sizes (``tp_size``, ``pp_size``, etc.) are derived at runtime
 from the attached ``DeviceMesh`` objects via ``@property``.  When no mesh
@@ -27,16 +28,20 @@ YAML / dict parsing belongs in the recipe layer — see
 ``nemo_automodel.recipes._dist_utils``.
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Dict, Optional, Sequence, Tuple
 
-from nemo_automodel.components.distributed.config import DistributedStrategyConfig
+from nemo_automodel.components.distributed.config import ActivationCheckpointingMode, DistributedStrategyConfig
 from nemo_automodel.components.distributed.init_utils import get_world_size_safe
 
 if TYPE_CHECKING:
+    from torch import nn
     from torch.distributed import ProcessGroup
     from torch.distributed.device_mesh import DeviceMesh
+
+    from nemo_automodel.components.distributed.config import MoEParallelizerConfig
 
 
 class MeshAxisName(str, Enum):
@@ -80,7 +85,7 @@ class ParallelismSizes:
 
 @dataclass
 class MeshContext:
-    """Runtime distributed topology context.
+    """Resolved runtime context for model parallelization.
 
     Parallelism sizes (``tp_size``, ``pp_size``, etc.) are **not** stored as
     fields; they are ``@property`` accessors that read directly from the
@@ -107,12 +112,32 @@ class MeshContext:
         moe_mesh: MoE-specific device mesh.
         process_group: Optional model-local group for recipe-level collectives
             that must not involve ranks outside this mesh.
+        strategy_config: Resolved DDP, FSDP2, or Megatron-FSDP policy.
+        moe_parallel_config: Optional MoE-specific parallelization policy.
+        activation_checkpointing: Resolved activation-checkpointing mode.
+        reapply_trainability: Optional callback run after model surgery and before
+            distributed wrapping.
+        cp_ring_degree: Ring-attention factor of the context-parallel axis.
+        cp_ulysses_degree: Ulysses factor of the context-parallel axis. ``None``
+            lets the consumer use the full context-parallel axis.
     """
 
-    # runtime mesh references
+    # Runtime topology.
     device_mesh: Optional["DeviceMesh"] = field(default=None, repr=False)
     moe_mesh: Optional["DeviceMesh"] = field(default=None, repr=False)
     process_group: "ProcessGroup | None" = field(default=None, repr=False)
+
+    # Runtime execution policy. Keeping policy beside topology makes this the
+    # sole input to the model parallelizer contract.
+    strategy_config: DistributedStrategyConfig | None = None
+    moe_parallel_config: "MoEParallelizerConfig | None" = None
+    activation_checkpointing: ActivationCheckpointingMode = False
+    reapply_trainability: "Callable[[nn.Module], None] | None" = field(default=None, repr=False)
+
+    # Optional decomposition of the CP axis for runtimes that distinguish ring
+    # and Ulysses dimensions. ``None`` means pure Ulysses over the full CP axis.
+    cp_ring_degree: int = 1
+    cp_ulysses_degree: int | None = None
 
     def __post_init__(self) -> None:
         _validate_mesh_axis_names(self)
@@ -196,17 +221,29 @@ class MeshContext:
         strategy_config: DistributedStrategyConfig,
         parallelism_sizes: ParallelismSizes | None = None,
         *,
+        moe_parallel_config: "MoEParallelizerConfig | None" = None,
+        activation_checkpointing: ActivationCheckpointingMode = False,
+        reapply_trainability: "Callable[[nn.Module], None] | None" = None,
+        cp_ring_degree: int = 1,
+        cp_ulysses_degree: int | None = None,
         world_size: int | None = None,
         timeout_minutes: int | None = None,
         ranks: Sequence[int] | None = None,
     ) -> "MeshContext":
-        """Build a topology-only :class:`MeshContext` from parallelism sizes.
+        """Build a resolved :class:`MeshContext` from sizes and execution policy.
 
         Args:
             strategy_config: Already-instantiated distributed strategy config.
             parallelism_sizes: Requested data, tensor, pipeline, context, and expert
                 parallelism sizes. If ``None``, defaults to no parallelism with
                 DP inferred from ``world_size``.
+            moe_parallel_config: Optional MoE-specific parallelization policy.
+            activation_checkpointing: Activation-checkpointing mode applied by
+                the model sidecar.
+            reapply_trainability: Optional callback run after model surgery and
+                before distributed wrapping.
+            cp_ring_degree: Ring-attention factor of the context-parallel axis.
+            cp_ulysses_degree: Ulysses factor of the context-parallel axis.
             world_size: Total process count. If ``None``, inferred from the
                 distributed environment.
             timeout_minutes: Optional timeout for process groups created by
@@ -228,7 +265,16 @@ class MeshContext:
             timeout_minutes=timeout_minutes,
             ranks=ranks,
         )
-        return cls.from_meshes(device_mesh, moe_mesh)
+        return cls.from_meshes(
+            device_mesh,
+            moe_mesh,
+            strategy_config=strategy_config,
+            moe_parallel_config=moe_parallel_config,
+            activation_checkpointing=activation_checkpointing,
+            reapply_trainability=reapply_trainability,
+            cp_ring_degree=cp_ring_degree,
+            cp_ulysses_degree=cp_ulysses_degree,
+        )
 
     # Convenience constructor
     @classmethod
@@ -236,16 +282,41 @@ class MeshContext:
         cls,
         device_mesh: Optional["DeviceMesh"],
         moe_mesh: Optional["DeviceMesh"] = None,
+        *,
+        strategy_config: DistributedStrategyConfig | None = None,
+        moe_parallel_config: "MoEParallelizerConfig | None" = None,
+        activation_checkpointing: ActivationCheckpointingMode = False,
+        reapply_trainability: "Callable[[nn.Module], None] | None" = None,
+        cp_ring_degree: int = 1,
+        cp_ulysses_degree: int | None = None,
     ) -> "MeshContext":
         """Build a :class:`MeshContext` from ``DeviceMesh`` objects.
 
         This is the entry-point used by ``NeMoAutoModel.from_pretrained`` /
         ``from_config`` where the caller has raw meshes rather than a parsed
         YAML config.
+
+        Args:
+            device_mesh: Primary device mesh.
+            moe_mesh: Optional MoE-specific device mesh.
+            strategy_config: Resolved DDP, FSDP2, or Megatron-FSDP policy.
+            moe_parallel_config: Optional MoE-specific parallelization policy.
+            activation_checkpointing: Activation-checkpointing mode applied by
+                the model sidecar.
+            reapply_trainability: Optional callback run after model surgery and
+                before distributed wrapping.
+            cp_ring_degree: Ring-attention factor of the context-parallel axis.
+            cp_ulysses_degree: Ulysses factor of the context-parallel axis.
         """
         return cls(
             device_mesh=device_mesh,
             moe_mesh=moe_mesh,
+            strategy_config=strategy_config,
+            moe_parallel_config=moe_parallel_config,
+            activation_checkpointing=activation_checkpointing,
+            reapply_trainability=reapply_trainability,
+            cp_ring_degree=cp_ring_degree,
+            cp_ulysses_degree=cp_ulysses_degree,
         )
 
 

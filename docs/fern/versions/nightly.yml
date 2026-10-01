@@ -797,6 +797,8 @@ navigation:
             contents:
               - page: "Qwen-Image"
                 path: ../../model-coverage/diffusion/qwen/qwen-image.mdx
+              - page: "Qwen-Image-2.1"
+                path: ../../model-coverage/diffusion/qwen/qwen-image-2-1.mdx
               - page: "Qwen-Image-Edit-2511"
                 path: ../../model-coverage/diffusion/qwen/qwen-image-edit-2511.mdx
           - section: "Wan AI"
@@ -1037,4 +1039,7 @@ navigation:
     contents:
       - page: "API Reference"
         path: ../../api-reference/index.mdx
+      - page: "Model Parallelizer API"
+        path: ../../api-reference/model-parallelizer.mdx
+        slug: model-parallelizer
       - folder: ../product-docs/nemo-automodel/Full-Library-Reference

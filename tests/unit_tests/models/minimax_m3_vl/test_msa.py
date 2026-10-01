@@ -280,9 +280,9 @@ def test_deterministic_algorithms_are_rejected_before_any_kernel_runs() -> None:
 
 
 @pytest.mark.runtime_budget(
-    15,
+    30,
     hard_timeout=130,
-    reason="Starts a fresh Python process and imports torch plus the full model package.",
+    reason="Starts a fresh Python process and imports torch plus the full model package; CI cold starts reach 16s.",
 )
 def test_optional_dependencies_are_lazy() -> None:
     # Importing the model package and building a microbatch must not touch the msa extra;
