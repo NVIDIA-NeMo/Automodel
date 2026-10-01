@@ -1,4 +1,4 @@
-# HunyuanImage-3.0 text-to-image LoRA finetune (80B-total / 13B-active MoE).
+# HunyuanImage-3.0 text-to-image full finetune (80B-total / 13B-active MoE).
 #
 # The MoE backbone is built natively and sharded with expert parallelism + FSDP2. The image-side modules (VAE, UNet
 # patch embedding / final layer, timestep embedders) are loaded from the checkpoint's own remote code.
@@ -30,21 +30,10 @@ model:
     gate_precision: float32
     enable_hf_state_dict_adapter: true
 
-peft:
-  _target_: nemo_automodel.components._peft.lora.PeftConfig
-  dim: 32
-  alpha: 32
-  dropout: 0.0
-  target_modules:
-    - "*.self_attn.qkv_proj"
-    - "*.self_attn.o_proj"
-    - "*.shared_mlp.gate_and_up_proj"
-    - "*.shared_mlp.down_proj"
-    - "*.mlp.experts"
 
 optimizer:
   _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
-  lr: 5.0e-5
+  lr: 1.0e-5
   weight_decay: 0.01
   betas: [0.9, 0.999]
   master_weights: true
@@ -57,12 +46,12 @@ optimizer:
 lr_scheduler:
   lr_decay_style: cosine
   lr_warmup_steps: 0
-  min_lr: 5.0e-6
+  min_lr: 1.0e-6
 
-# Expert parallelism over the node; adjust dp_size/ep_size to the number of GPUs.
+# 4 nodes x 8 GPUs, two experts per GPU; adjust dp_size/ep_size to the number of GPUs.
 fsdp:
-  dp_size: 8
-  ep_size: 8
+  dp_size: 32
+  ep_size: 32
   tp_size: 1
   cp_size: 1
   pp_size: 1
@@ -90,8 +79,8 @@ flow_matching:
 step_scheduler:
   num_epochs: 100
   max_steps: 600
-  local_batch_size: 2
-  global_batch_size: 16
+  local_batch_size: 1
+  global_batch_size: 32
   ckpt_every_steps: 300
   save_checkpoint_every_epoch: false
   log_remote_every_steps: 1
@@ -111,10 +100,10 @@ checkpoint:
   enabled: true
   checkpoint_dir: PATH_TO_YOUR_CKPT_DIR
   model_save_format: safetensors
-  save_consolidated: false
+  save_consolidated: true
   restore_from: null
 
 ci:
   recipe_owner: HuiyingLi
   time: "01:00:00"
-  nodes: 1
+  nodes: 4
