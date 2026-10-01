@@ -531,7 +531,7 @@ def test_build_diffusion_pipeline_forwards_perf_options(monkeypatch):
     monkeypatch.setattr(diffusion_train.MeshContext, "build", build_mesh)
     monkeypatch.setattr(diffusion_train.torch.cuda, "is_available", lambda: False)
 
-    built_pipe, device_mesh = build_diffusion_pipeline(
+    built_pipe, built_mesh_context = build_diffusion_pipeline(
         model_id="dummy-model",
         finetune_mode=True,
         device=torch.device("cpu"),
@@ -554,6 +554,8 @@ def test_build_diffusion_pipeline_forwards_perf_options(monkeypatch):
         transformer_engine_fp8_safe_only=True,
         fuse_qkv_projections=True,
         compact_fused_qkv_projections=True,
+        native_backend={"attn": "sdpa"},
+        native_config_overrides={"num_hidden_layers": 2},
     )
 
     strategy_config = build_mesh.call_args.kwargs["strategy_config"]
@@ -575,8 +577,12 @@ def test_build_diffusion_pipeline_forwards_perf_options(monkeypatch):
     # set_attention_backend before sharding (required for context parallelism).
     assert calls["attention_backend"] == "flash"
     assert calls["mesh_context"] is mesh_context
+    assert calls["native_backend"] == {"attn": "sdpa"}
+    assert calls["native_config_overrides"] == {"num_hidden_layers": 2}
     assert built_pipe is pipe
-    assert device_mesh == "mesh"
+    # The full MeshContext is returned so the recipe can read both device_mesh and moe_mesh.
+    assert built_mesh_context is mesh_context
+    assert built_mesh_context.device_mesh == "mesh"
 
 
 def test_build_diffusion_pipeline_raises_when_lora_params_missing(monkeypatch):

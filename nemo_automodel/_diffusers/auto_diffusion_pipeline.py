@@ -490,6 +490,94 @@ def _apply_parallelization(
     return pipe
 
 
+def native_transformer_config_dir(model_dir: str, subfolder: str = "transformer") -> str | None:
+    """Return the directory whose ``config.json`` names an architecture with a native Automodel implementation.
+
+    Diffusers repositories (with ``model_index.json``) are checked in ``subfolder``; single-model repositories (for
+    example unified autoregressive image models shipped as one ``transformers`` checkpoint) are checked at the root.
+    Returns ``None`` when the transformer must be loaded through diffusers.
+    """
+    import json
+
+    from nemo_automodel._transformers.registry import MODEL_ARCH_MAPPING
+
+    if os.path.isfile(os.path.join(model_dir, "model_index.json")):
+        candidates = [os.path.join(model_dir, subfolder)]
+    else:
+        candidates = [model_dir]
+    for candidate in candidates:
+        config_path = os.path.join(candidate, "config.json")
+        if not os.path.isfile(config_path):
+            continue
+        with open(config_path) as f:
+            architectures = json.load(f).get("architectures") or []
+        if architectures and architectures[0] in MODEL_ARCH_MAPPING:
+            return candidate
+    return None
+
+
+def _reject_diffusers_only_options(mesh_context: MeshContext | None, **options: Any) -> None:
+    """Native transformers do not support options that call diffusers-specific APIs."""
+    enabled = sorted(name for name, value in options.items() if value)
+    if enabled:
+        raise ValueError(
+            f"These options require a diffusers transformer and are not supported for native ones: {enabled}"
+        )
+    if mesh_context is not None and mesh_context.cp_size > 1:
+        raise ValueError("Context parallelism is not supported for native diffusion transformers yet (cp_size > 1).")
+
+
+def build_native_transformer(
+    config_dir: str,
+    *,
+    mesh_context: MeshContext | None,
+    torch_dtype: torch.dtype,
+    load_base_model: bool,
+    peft_cfg=None,
+    backend: Any = None,
+    config_overrides: Dict[str, Any] | None = None,
+) -> nn.Module:
+    """Build a native Automodel transformer for a diffusion pipeline.
+
+    This reuses the ``transformers`` model infrastructure: meta-device construction, distributed sharding driven by
+    ``mesh_context`` (including expert parallelism for MoE models, which diffusers modules cannot provide), and weight
+    loading through the model's ``state_dict_adapter`` so each rank reads only its shard.
+
+    Args:
+        config_dir: Directory with the model ``config.json`` (and weights when ``load_base_model``).
+        mesh_context: Resolved topology and policy; ``None`` builds an unsharded model.
+        torch_dtype: Parameter dtype.
+        load_base_model: Load the checkpoint weights (finetuning) instead of random initialization.
+        peft_cfg: Optional PEFT config applied by the model infrastructure.
+        backend: ``BackendConfig`` or a dict of its fields.
+        config_overrides: Attributes set on the loaded config before construction.
+    """
+    from transformers import AutoConfig
+
+    from nemo_automodel._transformers.auto_model import NeMoAutoModelForCausalLM
+    from nemo_automodel.components.distributed.config import DistributedSetup
+    from nemo_automodel.components.models.common import BackendConfig
+
+    config = AutoConfig.from_pretrained(config_dir, trust_remote_code=False)
+    for key, value in (config_overrides or {}).items():
+        setattr(config, key, value)
+    if isinstance(backend, dict):
+        backend = BackendConfig(**backend)
+    model_kwargs = {"backend": backend} if backend is not None else {}
+    logger.info("[INFO] Building native transformer %s from %s", config.architectures[0], config_dir)
+    return NeMoAutoModelForCausalLM.from_config(
+        config,
+        distributed_setup=DistributedSetup(mesh_context=mesh_context) if mesh_context is not None else None,
+        load_base_model=load_base_model,
+        torch_dtype=torch_dtype,
+        trust_remote_code=False,
+        use_liger_kernel=False,
+        use_sdpa_patching=False,
+        peft_config=peft_cfg,
+        **model_kwargs,
+    )
+
+
 class NeMoAutoDiffusionPipeline:
     """
     Unified diffusion pipeline wrapper for all model types.
@@ -553,6 +641,8 @@ class NeMoAutoDiffusionPipeline:
         fuse_qkv_projections: bool = False,
         compact_fused_qkv_projections: bool = False,
         attention_backend: str | None = None,
+        native_backend: Any = None,
+        native_config_overrides: Dict[str, Any] | None = None,
         **kwargs,
     ) -> DiffusionPipeline:
         """
@@ -587,6 +677,9 @@ class NeMoAutoDiffusionPipeline:
             compact_fused_qkv_projections: Whether to remove original projection modules after QKV fusion.
             attention_backend: Optional diffusers attention backend name set on the transformer
                 before parallelization (context parallelism validates the backend at enable time).
+            native_backend: ``BackendConfig`` (or dict) for transformers with a native Automodel
+                implementation; see :func:`build_native_transformer`.
+            native_config_overrides: Config attributes overridden before building a native transformer.
             **kwargs: Additional arguments passed to DiffusionPipeline.from_pretrained
 
         Returns:
@@ -602,6 +695,30 @@ class NeMoAutoDiffusionPipeline:
         # Resolve to a local snapshot dir so a warm HF cache is not re-validated
         # (and potentially re-downloaded) over the network on every run.
         model_dir = resolve_diffusion_model_dir(pretrained_model_name_or_path)
+
+        native_dir = native_transformer_config_dir(model_dir)
+        if native_dir is not None:
+            _reject_diffusers_only_options(
+                mesh_context,
+                active_transformer=active_transformer,
+                transformer_engine_linear=transformer_engine_linear,
+                fuse_qkv_projections=fuse_qkv_projections,
+                attention_backend=attention_backend,
+            )
+            if components_to_load is not None and set(components_to_load) - {"transformer"}:
+                raise ValueError("Native diffusion transformers load only the `transformer` component.")
+            transformer = build_native_transformer(
+                native_dir,
+                mesh_context=mesh_context,
+                torch_dtype=torch_dtype,
+                load_base_model=True,
+                peft_cfg=peft_cfg,
+                backend=native_backend,
+                config_overrides=native_config_overrides,
+            )
+            if load_for_training and peft_cfg is None:
+                _ensure_params_trainable(transformer, "transformer")
+            return cls(transformer=transformer)
 
         # Use DiffusionPipeline.from_pretrained for auto-detection
         pipe: DiffusionPipeline = DiffusionPipeline.from_pretrained(
@@ -751,6 +868,8 @@ class NeMoAutoDiffusionPipeline:
         fuse_qkv_projections: bool = False,
         compact_fused_qkv_projections: bool = False,
         attention_backend: str | None = None,
+        native_backend: Any = None,
+        native_config_overrides: Dict[str, Any] | None = None,
         **kwargs,
     ) -> "NeMoAutoDiffusionPipeline | DiffusionPipeline":
         """
@@ -790,6 +909,24 @@ class NeMoAutoDiffusionPipeline:
             )
         # Parse and validate pipeline spec
         spec = PipelineSpec.from_dict(pipeline_spec)
+        native_dir = native_transformer_config_dir(resolve_diffusion_model_dir(model_id), spec.subfolder)
+        if native_dir is not None:
+            _reject_diffusers_only_options(
+                mesh_context,
+                transformer_engine_linear=transformer_engine_linear,
+                fuse_qkv_projections=fuse_qkv_projections,
+                attention_backend=attention_backend,
+            )
+            transformer = build_native_transformer(
+                native_dir,
+                mesh_context=mesh_context,
+                torch_dtype=torch_dtype,
+                load_base_model=False,
+                backend=native_backend,
+                config_overrides=native_config_overrides,
+            )
+            _ensure_params_trainable(transformer, "transformer")
+            return cls(transformer=transformer)
         spec.validate_for_from_config()
 
         logger.info("[INFO] Initializing pipeline from config with random weights")
