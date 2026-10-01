@@ -49,10 +49,12 @@ downstream consumers use it:
 The model is auto-discovered by ``ModelRegistry`` via the ``ModelClass`` export.
 """
 
+from copy import deepcopy
 from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
+from transformers import PretrainedConfig
 from transformers.modeling_outputs import SequenceClassifierOutputWithPast
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
@@ -60,6 +62,7 @@ from transformers.utils import can_return_tuple, logging
 
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
+    reject_tie_word_embeddings_flip,
     reject_unsupported_tie_word_embeddings,
 )
 
@@ -219,30 +222,63 @@ class Qwen3RerankerForCausalReranking(Qwen3ForCausalLM):
         supports_ep: bool = False
 
     @classmethod
+    def supports_config(cls, config: PretrainedConfig) -> bool:
+        """Use causal reranking only for checkpoints declaring a compatible LM head."""
+        return bool(set(config.architectures or ()) & {"Qwen3ForCausalLM", cls.__name__})
+
+    @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *args, **kwargs):
         """Load weights and resolve the "yes"/"no" token ids if not already set.
 
         Explicit ``yes_token_id``/``no_token_id`` (e.g. from the recipe YAML or a
         saved config) take precedence; otherwise they are resolved from the
         tokenizer of ``pretrained_model_name_or_path``.
+
+        In-memory loads use ``config.name_or_path`` to locate the tokenizer.
+        A checkpoint's saved embedding ties cannot be overridden in either direction.
         """
-        model = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
-        # Use getattr so this works whether model.config is Qwen3RerankerConfig
-        # (fresh base model) or a plain Qwen3Config with yes/no ids stored as
-        # extra attributes (checkpoint saved with the vLLM-compatible format).
-        if getattr(model.config, "yes_token_id", None) is None or getattr(model.config, "no_token_id", None) is None:
+        hub_kwargs = {
+            key: kwargs[key]
+            for key in ("cache_dir", "force_download", "local_files_only", "token", "revision", "subfolder")
+            if key in kwargs
+        }
+        trust_remote_code = kwargs.get("trust_remote_code", False)
+        checkpoint_config = None
+        if pretrained_model_name_or_path is not None:
+            checkpoint_config = cls.config_class.from_pretrained(pretrained_model_name_or_path, **hub_kwargs)
+
+        config = kwargs.pop("config", None)
+        if isinstance(config, PretrainedConfig):
+            config = deepcopy(config)
+        else:
+            config, kwargs = cls.config_class.from_pretrained(
+                config or pretrained_model_name_or_path, return_unused_kwargs=True, **kwargs
+            )
+        for name in ("tie_word_embeddings", "yes_token_id", "no_token_id"):
+            if name in kwargs:
+                setattr(config, name, kwargs.pop(name))
+        if checkpoint_config is not None:
+            reject_tie_word_embeddings_flip(checkpoint_config, config, cls.__name__)
+
+        if getattr(config, "yes_token_id", None) is None or getattr(config, "no_token_id", None) is None:
             from transformers import AutoTokenizer
 
-            tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path)
-            if getattr(model.config, "yes_token_id", None) is None:
-                model.config.yes_token_id = tokenizer.convert_tokens_to_ids("yes")
-            if getattr(model.config, "no_token_id", None) is None:
-                model.config.no_token_id = tokenizer.convert_tokens_to_ids("no")
-            logger.info(
-                f"Resolved reranker tokens: yes_token_id={model.config.yes_token_id}, "
-                f"no_token_id={model.config.no_token_id}"
+            tokenizer_source = pretrained_model_name_or_path or config.name_or_path
+            if not tokenizer_source:
+                raise ValueError("Set yes_token_id/no_token_id or config.name_or_path for in-memory reranker loading.")
+            tokenizer = AutoTokenizer.from_pretrained(
+                tokenizer_source, trust_remote_code=trust_remote_code, **hub_kwargs
             )
-        return model
+            if getattr(config, "yes_token_id", None) is None:
+                config.yes_token_id = tokenizer.convert_tokens_to_ids("yes")
+            if getattr(config, "no_token_id", None) is None:
+                config.no_token_id = tokenizer.convert_tokens_to_ids("no")
+            logger.info(
+                "Resolved reranker tokens: yes_token_id=%s, no_token_id=%s", config.yes_token_id, config.no_token_id
+            )
+        # Config loading consumes Hub options that the weight loader still needs.
+        kwargs.update(hub_kwargs)
+        return super().from_pretrained(pretrained_model_name_or_path, *args, config=config, **kwargs)
 
     def tie_weights(self, *_args: object, **_kwargs: object) -> None:
         """Alias ``lm_head`` to the input embeddings when the config asks for it.

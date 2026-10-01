@@ -15,7 +15,7 @@ For first-stage dense retrieval, see [Embedding Models](/model-coverage/embeddin
 | Owner | Model | Architecture | Wrapper Class | Tasks |
 |---|---|---|---|---|
 | NVIDIA | [llama-nemotron-rerank-1b-v2](/model-coverage/reranking-models/nvidia/llama-nemotron-rerank-1b-v2) | `LlamaBidirectionalForSequenceClassification` | `NeMoAutoModelCrossEncoder` | Reranking |
-| Qwen | [Qwen3-Reranker-4B](https://huggingface.co/Qwen/Qwen3-Reranker-4B) | `Qwen3RerankerForCausalReranking` | `NeMoAutoModelCrossEncoder` | Reranking |
+| Qwen | [Qwen3-Reranker-4B](/model-coverage/reranking-models/qwen/Qwen3-Reranker-4B) | `Qwen3RerankerForCausalReranking` | `NeMoAutoModelCrossEncoder` | Reranking |
 
 The Llama backbones convert to bidirectional attention. `Qwen3RerankerForCausalReranking` stays causal: it reuses the pretrained `lm_head` and scores a pair as `logit("yes") - logit("no")` at the final non-padding token, adding no parameters. Its checkpoints serialize as a plain `Qwen3ForCausalLM`, so they load in stock Transformers and vLLM without custom code.
 

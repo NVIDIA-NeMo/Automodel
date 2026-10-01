@@ -1,0 +1,27 @@
+---
+title: "Qwen3-Reranker-4B"
+description: "Train Qwen3-Reranker-4B with NeMo AutoModel using context-aware query-document scoring, compatible checkpoint loading, and the retrieval training recipe."
+slug: model-coverage/reranking-models/qwen/Qwen3-Reranker-4B
+---
+
+[Qwen3-Reranker-4B](https://huggingface.co/Qwen/Qwen3-Reranker-4B) scores query-document pairs with its pretrained language-model head. NeMo AutoModel loads it through `NeMoAutoModelCrossEncoder` using `Qwen3RerankerForCausalReranking`.
+
+| Property | Value |
+| --- | --- |
+| **Architecture** | `Qwen3RerankerForCausalReranking` |
+| Task | Reranking |
+| Wrapper | `NeMoAutoModelCrossEncoder` |
+
+## Scoring and training
+
+The model uses causal attention by default and returns `logit("yes") - logit("no")` at the final non-padding token. It adds no classification parameters. The [context-aware training example](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/cross_encoder/qwen3_4b_reranker_agentir.yaml) includes optional reasoning and question context, per-field context dropout, and listwise training over positive and negative passages.
+
+## Checkpoint compatibility
+
+Saved checkpoints identify as standard `Qwen3ForCausalLM` models for loading in stock Transformers or vLLM. The checkpoint's `tie_word_embeddings` setting is preserved; loading with a conflicting override raises an error.
+
+Qwen3 sequence-classification checkpoints retain the Hugging Face classification loading path. Extracting a complete causal language model resolves missing yes/no token IDs from the source checkpoint's tokenizer. Extracting a bare decoder retains the classification fallback because it has no trained language-model head.
+
+## Parallelism
+
+The reranker does not declare support for tensor, context, pipeline, or expert parallelism. See the [example configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/cross_encoder/qwen3_4b_reranker_agentir.yaml) for its distributed training settings and the [retrieval fine-tuning guide](/recipes-e2e-examples/retrieval-finetune) for the training workflow.
