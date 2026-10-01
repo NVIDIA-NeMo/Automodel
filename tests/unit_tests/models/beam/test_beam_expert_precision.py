@@ -67,11 +67,21 @@ def _within_one_ulp_fraction(a, ref, max_fraction):
 
 class TestSharedExpertActivationBoundary:
     @pytest.fixture(autouse=True)
+    def _eager_moe_swiglu(self):
+        """Override the package-wide eager fixture: this class pins the compiled kernel itself."""
+        yield
+
+    @pytest.fixture(autouse=True)
     def _fresh_dynamo_state(self):
         """Keep this compiled-kernel test independent of earlier tests' Dynamo recompile counts."""
         torch.compiler.reset()
         yield
 
+    @pytest.mark.runtime_budget(
+        60,
+        reason="Compiles the shared weighted SwiGLU forward/backward kernels from a reset Dynamo state "
+        "(cold Inductor C++/Triton build).",
+    )
     @pytest.mark.parametrize("device", DEVICES)
     @pytest.mark.parametrize("n,inter", [(4096, 64), (1000, 24)])
     def test_compiled_kernel_meets_fp32_boundary(self, device, n, inter):

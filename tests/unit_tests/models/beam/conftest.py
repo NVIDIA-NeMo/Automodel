@@ -24,7 +24,38 @@ import torch
 from nemo_automodel.components.models.common import BackendConfig
 
 transformers = pytest.importorskip("transformers")
-pytest.importorskip("transformers.models.beam")
+# Load the HF Beam config and modeling modules at collection time: the first import pays transformers' package metadata
+# scan (~5 s cold), which would otherwise count against the runtime budget of whichever test runs first.
+pytest.importorskip("transformers.models.beam.configuration_beam")
+pytest.importorskip("transformers.models.beam.modeling_beam")
+
+
+@pytest.fixture(autouse=True)
+def _bounded_cpu_threads():
+    """Cap intra-op CPU threads for the tiny models used here.
+
+    With one thread per core, the CPU variants spend most of their time scheduling threads on large hosts (5-6 s per
+    dropout test on a 104-core node versus 0.2-0.9 s with 4 threads), which breaks the unit-test runtime budget.
+    """
+    previous = torch.get_num_threads()
+    torch.set_num_threads(min(previous, 4))
+    yield
+    torch.set_num_threads(previous)
+
+
+@pytest.fixture(autouse=True)
+def _eager_moe_swiglu(monkeypatch):
+    """Run the shared ``torch.compile``d MoE SwiGLU forward/backward helpers eagerly.
+
+    These tests check Beam semantics (dropout, checkpointing, HF parity, FSDP/RoPE precision), not kernel compilation.
+    Compiling the helpers on first use costs a cold Inductor build that lands on whichever test runs first in a
+    process. ``weighted_bias_swiglu_impl`` resolves them through the module globals patched here; FlexAttention keeps
+    its own compilation. ``TestSharedExpertActivationBoundary`` overrides this fixture to pin the compiled kernel.
+    """
+    from nemo_automodel.components.moe.megatron import moe_utils
+
+    for name in ("swiglu", "weighted_swiglu", "swiglu_back", "weighted_swiglu_back"):
+        monkeypatch.setattr(moe_utils, name, getattr(moe_utils, name)._torchdynamo_orig_callable)
 
 
 @pytest.fixture

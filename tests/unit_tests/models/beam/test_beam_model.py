@@ -125,7 +125,19 @@ class TestParityWithHF:
         [
             ("backend_config", "cpu", 2, True, 0.0),
             pytest.param("backend_config", "cuda", 2, True, 0.0, marks=requires_cuda),
-            pytest.param("flex_backend_config", "cuda", 2, True, 0.0, marks=requires_cuda),
+            pytest.param(
+                "flex_backend_config",
+                "cuda",
+                2,
+                True,
+                0.0,
+                marks=[
+                    requires_cuda,
+                    pytest.mark.runtime_budget(
+                        30, reason="Cold CUDA FlexAttention forward compilation (12-20 s measured on H200)."
+                    ),
+                ],
+            ),
             pytest.param("te_backend_config", "cuda", 2, True, 0.0, marks=requires_cuda),
             pytest.param("te_full_backend_config", "cuda", 2, True, 0.0, marks=requires_cuda),
             ("backend_config", "cpu", 1, True, 0.0),

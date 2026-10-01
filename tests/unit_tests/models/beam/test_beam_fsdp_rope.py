@@ -30,6 +30,12 @@ from .utils import capture_rope_calls, hf_model_and_checkpoint, native_from_hf
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="FSDP2 needs a CUDA device")
 
+# Whichever FSDP test runs first in a process (pytest-shard picks an arbitrary subset) creates the single-rank NCCL
+# communicator on its first collective; measured up to 6.5 s on H200, the warm tests take 0.2-1.4 s.
+first_nccl_collective = pytest.mark.runtime_budget(
+    20, reason="The first FSDP test in a process creates the NCCL communicator on its first collective."
+)
+
 
 @pytest.fixture(scope="module")
 def mesh():
@@ -88,6 +94,7 @@ def _run(model, ids):
     return out.detach(), calls, n_forward
 
 
+@first_nccl_collective
 @pytest.mark.parametrize("storage", [torch.bfloat16, torch.float32], ids=["bf16_storage", "fp32_master_weights"])
 @pytest.mark.parametrize("ac", [False, True], ids=["no_ac", "ac"])
 def test_tables_stay_fp32_shared_and_exact_across_fsdp_boundary(beam_config, backend_config, mesh, storage, ac):
@@ -110,6 +117,7 @@ def test_tables_stay_fp32_shared_and_exact_across_fsdp_boundary(beam_config, bac
     assert torch.isfinite(out).all()
 
 
+@first_nccl_collective
 def test_fsdp_logits_equal_the_unsharded_bf16_model(beam_config, backend_config, mesh):
     """Single-rank FSDP with the Beam units computes the same numbers as the plain bf16 model (bit-exact)."""
     ref = _build(beam_config, backend_config, torch.bfloat16, False).eval()
@@ -119,6 +127,7 @@ def test_fsdp_logits_equal_the_unsharded_bf16_model(beam_config, backend_config,
         assert torch.equal(model(ids).logits.float(), ref(ids).logits.float())
 
 
+@first_nccl_collective
 def test_no_policy_means_no_cast(beam_config, backend_config, mesh):
     """Without mixed precision FSDP casts nothing and the block records no compute dtype (uniform fp32 storage, so the
     blocks are plain units; the dtype-aware helper itself requires a policy and is never called without one by the
