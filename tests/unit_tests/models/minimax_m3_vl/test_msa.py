@@ -101,30 +101,47 @@ def test_the_microbatch_exposes_the_packed_document_geometry() -> None:
     )
 
 
-def test_selection_keeps_the_16k_caller_buffer_across_checkpoint_recompute(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_checkpoint_recompute_rebuilds_a_stale_selection_plan(monkeypatch: pytest.MonkeyPatch) -> None:
     tokens, blocks = 16_384, 128
-    plan = msa._SelectionPlan(
+    microbatch = msa.MSAMicrobatch.from_document_map(torch.ones(4, 4096, dtype=torch.int64), forced_blocks=_FORCED)
+    current_plan = msa._SelectionPlan(
         plan=object(),
         score_shape=(msa.NUM_INDEX_HEADS, blocks, tokens),
         num_blocks=blocks,
         candidate=torch.ones(tokens, blocks, dtype=torch.bool),
         forced=torch.zeros(tokens, blocks, dtype=torch.bool),
     )
+    stale_plan = msa._SelectionPlan(
+        plan=object(),
+        score_shape=(msa.NUM_INDEX_HEADS, 1, 16),
+        num_blocks=1,
+        candidate=torch.ones(16, 1, dtype=torch.bool),
+        forced=torch.zeros(16, 1, dtype=torch.bool),
+    )
 
     def score(*args: object, max_score: torch.Tensor, **kwargs: object) -> tuple[None, torch.Tensor]:
         max_score.zero_()
-        # The dependency's return value is not its caller-owned output contract. A stale returned
-        # view must not shrink selection during activation-checkpoint recomputation.
-        return None, max_score[:, :16, :16]
+        return None, max_score
 
     monkeypatch.setattr(msa.msa_bindings, "kernels", lambda: SimpleNamespace(fmha_sm100=score))
+    monkeypatch.setattr(msa._SelectionPlan, "build", classmethod(lambda cls, owner: current_plan))
     msa._SCORE_SCRATCH.clear()
     index_q = torch.empty(tokens, msa.NUM_INDEX_HEADS, msa.INDEX_DIM, dtype=torch.bfloat16)
     index_k = torch.empty(tokens, 1, msa.INDEX_DIM, dtype=torch.bfloat16)
+    microbatch.__dict__["_plan"] = current_plan
+    seen: list[tuple[int, ...]] = []
 
-    for _ in range(2):
-        selected = plan.select(index_q, index_k)
-        assert selected.shape == (msa.NUM_KV_HEADS, tokens, msa.TOPK_BLOCKS)
+    def checkpointed(value: torch.Tensor) -> torch.Tensor:
+        seen.append(tuple(microbatch.select_blocks(index_q, index_k).shape))
+        return value.sin() * value
+
+    value = torch.ones((), requires_grad=True)
+    output = torch.utils.checkpoint.checkpoint(checkpointed, value, use_reentrant=False)
+    microbatch.__dict__["_plan"] = stale_plan
+    output.backward()
+
+    assert seen == [(msa.NUM_KV_HEADS, tokens, msa.TOPK_BLOCKS)] * 2
+    assert microbatch._plan is current_plan
 
 
 def test_sparse_attention_rejects_selection_for_another_microbatch() -> None:

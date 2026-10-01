@@ -472,7 +472,19 @@ class MSAMicrobatch:
         Returns:
             int32 ``[4, tokens, 16]`` document-local block ids, padded with -1: the canonical support.
         """
-        return self._plan.select(index_q, index_k)
+        plan = self._plan
+        if plan.score_shape[2] != index_q.shape[0]:
+            # Non-reentrant activation checkpointing can replay with a cached plan whose packed-token
+            # geometry is stale. Bind the runtime plan to the projections being replayed instead of
+            # sending stale support into the CSR builder.
+            plan = _SelectionPlan.build(self)
+            self.__dict__["_plan"] = plan
+        if plan.score_shape[2] != index_q.shape[0]:
+            raise ValueError(
+                f"MiniMax M3 MSA selection plan has {plan.score_shape[2]} tokens, but the index projections "
+                f"have {index_q.shape[0]}."
+            )
+        return plan.select(index_q, index_k)
 
 
 @dataclass(frozen=True, slots=True)
@@ -530,13 +542,12 @@ class _SelectionPlan:
         """Score bf16 index_q[tokens, 4, 128] against index_k[tokens, 1, 128] -> int32 [4, tokens, 16] block ids."""
         # The score buffer is reused across layers, so tiles the kernel does not write hold the previous
         # layer's values; the selection rule rejects exactly those. v is never read with output_o=False.
-        max_score = _score_scratch(index_q.device, self.score_shape)
-        msa_bindings.kernels().fmha_sm100(
+        _, max_score = msa_bindings.kernels().fmha_sm100(
             index_q,
             index_k,
             index_k,
             self.plan,
-            max_score=max_score,
+            max_score=_score_scratch(index_q.device, self.score_shape),
             output_o=False,
             output_maxscore=True,
         )
