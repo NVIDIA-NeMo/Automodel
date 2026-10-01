@@ -7,9 +7,9 @@ position: 3
 
 As large language models continue to grow in size, training and fine-tuning them efficiently across multiple GPUs has become increasingly challenging. While data parallelism works well for smaller models, models with billions of parameters require more sophisticated parallelization strategies to overcome memory constraints and communication overhead.
 
-Pipeline parallelism addresses these challenges by splitting a model's layers across different devices and processing them in a pipelined fashion. Each device processes a different stage of the model, enabling training of models that would not fit on a single device while maintaining high GPU utilization through overlapped computation.
+Pipeline parallelism addresses these challenges by splitting a model's layers across different devices and processing them in a pipelined fashion. Each device processes a different stage of the model, so you can train models that would not fit on a single device while maintaining high GPU utilization through overlapped computation.
 
-AutoPipeline is NeMo AutoModel's high-level pipeline parallelism interface for Hugging Face-compatible models. Built on PyTorch's native `torch.distributed.pipelining`, it expects a Hugging Face-style model with a `config`, a supported decoder-layer layout, and pipeline-compatible forwards. Recipe-driven pipeline parallelism also requires the selected model implementation to advertise a `_pp_plan` (or use the supported MoE path) and pass the repository's pipeline validation; encoder-decoder models and models with actually tied input/output embedding weights are rejected.
+AutoPipeline is NeMo AutoModel's high-level pipeline parallelism interface for Hugging Face-compatible models. Built on PyTorch's native `torch.distributed.pipelining`, it expects a Hugging Face-style model with a `config`, a supported decoder-layer layout, and pipeline-compatible forwards. Recipe-driven pipeline parallelism also requires the selected model implementation to advertise a `_pp_plan` (or use the supported MoE path) and pass the repository's pipeline validation; encoder-decoder models and models with actually tied input and output embedding weights are rejected.
 
 The functional module at `nemo_automodel.components.distributed.pipelining.functional` exposes the same Hugging Face-specific `pipeline_model()` splitter plus lower-level stage and schedule helpers. Custom PyTorch architectures can reuse helpers such as `stage_ids_this_rank()`, `calculate_virtual_stages()`, and `build_pipeline_schedule()` after their own code constructs valid `PipelineStage` objects; `pipeline_model()` is not a generic `nn.Module` splitter.
 
@@ -47,7 +47,7 @@ AutoPipeline provides the following capabilities:
 
 ## Quickstart with AutoPipeline (Hugging Face Models)
 
-Here's a minimal example to get started with AutoPipeline using 2 pipeline stages with a Hugging Face model:
+Here is a minimal example to get started with AutoPipeline using 2 pipeline stages with a Hugging Face model:
 
 ```python
 import torch
@@ -139,11 +139,11 @@ ap = AutoPipeline(
 
 `torch.distributed.pipelining` pre-allocates one receive buffer per microbatch and
 per direction (activations forward, gradients backward). With many microbatches and
-wide stage inputs those buffers can exceed the activations themselves — Kimi-K3 at
+wide stage inputs, those buffers can exceed the activations themselves. Kimi-K3 at
 2k-token rows with 64 microbatches needs ~52 GiB of them on middle stages.
 
 Under the 1F1B schedule only `num_stages - stage_index` microbatches are ever in
-flight on a stage, so AutoModel automatically rebinds the per-microbatch
+flight on a stage, so NeMo AutoModel automatically rebinds the per-microbatch
 receive slots onto a ring of `(num_stages - stage_index) + pp_recv_buffer_pool_slack`
 real buffer sets (default slack 2). The values flowing through the schedule are
 unchanged; only which buffer object receives each chunk differs.
@@ -157,7 +157,7 @@ distributed:
 
 Pooling applies only to schedules with a bounded in-flight depth (currently
 `1f1b`); other schedules keep the stock allocation. If the installed
-torch exposes neither of the two known `PipelineStage` layouts, the pool is not
+`torch` package exposes neither of the two known `PipelineStage` layouts, the pool is not
 installed and stock behavior is kept (logged at install time). The default
 `pp_recv_buffer_pool_slack` is 2 extra buffer sets beyond the in-flight depth.
 
@@ -179,17 +179,20 @@ These two flags switch AutoPipeline to lightweight, pipeline-friendly `forward()
   - Returns **logits** when `lm_head` is present (typically only the last stage).
   - Supports `logits_to_keep` to compute logits for only the last `k` tokens.
   
-  Note: this is only used when the module you pipeline is a `...ForCausalLM`-style wrapper (i.e., it has a `.model` attribute). If you pass a base decoder module directly, `patch_causal_lm_model` typically has no effect.
+<Note>
+`patch_causal_lm_model` is used only when the module you pipeline is a `...ForCausalLM`-style wrapper (that is, it has a `.model` attribute). If you pass a base decoder module directly, `patch_causal_lm_model` typically has no effect.
+
+</Note>
 
 #### When to Change These Flags
 
-- **Leave both `True` (default)** for standard Hugging Face `AutoModelForCausalLM` / `...ForCausalLM` models. This is the common case and gives the expected behavior: token IDs to hidden states to logits across stages.
+- **Leave both `True` (default)** for standard Hugging Face `AutoModelForCausalLM` or `...ForCausalLM` models. This is the common case and gives the expected behavior: token IDs to hidden states to logits across stages.
 - **Set both `False`** when your model already has a pipeline-friendly forward. That forward returns tensors and can accept hidden states when embeddings are absent. Set both to `False` when the model needs custom kwargs or paths that the Hugging Face patch does not preserve. That case is common for NeMo AutoModel-native implementations, packed-sequence/`thd` paths, and extra arguments such as `padding_mask`. Many benchmark configs for NeMo-native models do this (for example, `examples/llm_benchmark/qwen/qwen3_moe_30b_torch.yaml`).
 - **Set `patch_inner_model=False, patch_causal_lm_model=True`** when your inner model is already stage-friendly, but the wrapper forward still returns a `ModelOutput` and you only want the wrapper simplified to “hidden states or logits”.
 
 If you disable `patch_causal_lm_model`, your last stage will typically output hidden states instead of logits; in that case, make sure your `loss_fn` (or your last-stage module) applies the LM head explicitly.
 
-### Automatic Compared to Manual Layer Distribution
+### Automatic and Manual Layer Distribution
 
 AutoPipeline offers flexible control over how your model is split across pipeline stages:
 
@@ -249,7 +252,7 @@ ap = AutoPipeline(
 
 When AutoPipeline splits your model, it distributes components across pipeline stages. A typical split looks like this:
 
-### Example: 32-Layer Model Across 2 Stages
+### Example of a 32-Layer Model Across 2 Stages
 
 ```python
 # Stage 0 (Rank 0): Input processing + first half
@@ -268,7 +271,7 @@ stage_1_modules = [
 ]
 ```
 
-### Example: 32-Layer Model Across 4 Stages
+### Example of a 32-Layer Model Across 4 Stages
 
 ```python
 # Stage 0 (Rank 0): Input processing
@@ -374,7 +377,7 @@ schedule = build_pipeline_schedule(
 )
 ```
 
-### Pseudocode: Pipeline Parallelism for Custom Models
+### Pipeline Parallelism Pseudocode for Custom Models
 
 The following fence is intentionally non-runnable pseudocode. A real custom model must provide model-owned
 `create_stage_model` splitting, a `dataloader`, pipeline-compatible stage input/output contracts, and process-group
