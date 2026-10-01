@@ -530,12 +530,13 @@ class _SelectionPlan:
         """Score bf16 index_q[tokens, 4, 128] against index_k[tokens, 1, 128] -> int32 [4, tokens, 16] block ids."""
         # The score buffer is reused across layers, so tiles the kernel does not write hold the previous
         # layer's values; the selection rule rejects exactly those. v is never read with output_o=False.
-        _, max_score = msa_bindings.kernels().fmha_sm100(
+        max_score = _score_scratch(index_q.device, self.score_shape)
+        msa_bindings.kernels().fmha_sm100(
             index_q,
             index_k,
             index_k,
             self.plan,
-            max_score=_score_scratch(index_q.device, self.score_shape),
+            max_score=max_score,
             output_o=False,
             output_maxscore=True,
         )
@@ -609,6 +610,12 @@ def sparse_attention(
         )
     if q.dtype != torch.bfloat16 or k.dtype != torch.bfloat16 or v.dtype != torch.bfloat16:
         raise ValueError(f"MiniMax M3 MSA first supports BF16 q/k/v only; got q={q.dtype}, k={k.dtype}, v={v.dtype}.")
+    expected_q2k = (NUM_KV_HEADS, q.shape[0], TOPK_BLOCKS)
+    if q2k.shape != expected_q2k:
+        raise ValueError(
+            f"MiniMax M3 MSA block selection must have shape {expected_q2k} for q with {q.shape[0]} tokens; "
+            f"got {tuple(q2k.shape)}."
+        )
     return _SparseAttention.apply(q, k, v, q2k, msa)
 
 

@@ -18,6 +18,7 @@ import copy
 import subprocess
 import sys
 import weakref
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -98,6 +99,42 @@ def test_the_microbatch_exposes_the_packed_document_geometry() -> None:
     assert torch.equal(
         microbatch.workspace_positions, microbatch.document_positions + torch.tensor([0] * 3 + [128] * 2 + [256] * 4)
     )
+
+
+def test_selection_keeps_the_16k_caller_buffer_across_checkpoint_recompute(monkeypatch: pytest.MonkeyPatch) -> None:
+    tokens, blocks = 16_384, 128
+    plan = msa._SelectionPlan(
+        plan=object(),
+        score_shape=(msa.NUM_INDEX_HEADS, blocks, tokens),
+        num_blocks=blocks,
+        candidate=torch.ones(tokens, blocks, dtype=torch.bool),
+        forced=torch.zeros(tokens, blocks, dtype=torch.bool),
+    )
+
+    def score(*args: object, max_score: torch.Tensor, **kwargs: object) -> tuple[None, torch.Tensor]:
+        max_score.zero_()
+        # The dependency's return value is not its caller-owned output contract. A stale returned
+        # view must not shrink selection during activation-checkpoint recomputation.
+        return None, max_score[:, :16, :16]
+
+    monkeypatch.setattr(msa.msa_bindings, "kernels", lambda: SimpleNamespace(fmha_sm100=score))
+    msa._SCORE_SCRATCH.clear()
+    index_q = torch.empty(tokens, msa.NUM_INDEX_HEADS, msa.INDEX_DIM, dtype=torch.bfloat16)
+    index_k = torch.empty(tokens, 1, msa.INDEX_DIM, dtype=torch.bfloat16)
+
+    for _ in range(2):
+        selected = plan.select(index_q, index_k)
+        assert selected.shape == (msa.NUM_KV_HEADS, tokens, msa.TOPK_BLOCKS)
+
+
+def test_sparse_attention_rejects_selection_for_another_microbatch() -> None:
+    tokens = 16_384
+    q = torch.empty(tokens, msa.NUM_Q_HEADS, msa.HEAD_DIM, dtype=torch.bfloat16)
+    k = v = torch.empty(tokens, msa.NUM_KV_HEADS, msa.HEAD_DIM, dtype=torch.bfloat16)
+    stale = torch.empty(msa.NUM_KV_HEADS, 16, msa.TOPK_BLOCKS, dtype=torch.int32)
+
+    with pytest.raises(ValueError, match=r"shape \(4, 16384, 16\).+got \(4, 16, 16\)"):
+        msa.sparse_attention(q, k, v, stale, object())
 
 
 def test_document_map_sources_and_precedence() -> None:
