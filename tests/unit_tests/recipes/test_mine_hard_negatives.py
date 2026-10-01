@@ -226,7 +226,8 @@ def test_multimodal_scratch_does_not_overwrite_or_read_text_chunk_cache(tmp_path
     actual = recipe._encode_all_documents()
 
     np.testing.assert_array_equal(actual, np.array([[0.8, 0.2]], dtype=np.float32))
-    np.testing.assert_array_equal(np.load(text_chunk_dir / "chunk_0000.npz")["arr_0"], text_embedding)
+    with np.load(text_chunk_dir / "chunk_0000.npz", allow_pickle=False) as cached:
+        np.testing.assert_array_equal(cached["arr_0"], text_embedding)
     assert (tmp_path / "multimodal_scratch" / "corpus_chunks" / "chunk_0000.npz").exists()
 
 
