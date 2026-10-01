@@ -114,20 +114,42 @@ class HunyuanImage3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdap
             out = [(k, v) for k, v in out if not re.match(exclude_key_regex, k)]
         return out
 
-    @staticmethod
-    def _no_inplace_views(kwargs: dict[str, Any]) -> dict[str, Any]:
-        # The release stores each expert's projections fused and half-swapped ([up; gate]), which cannot be expressed
-        # as a view of the grouped [gate | up] storage. Checkpoint loads therefore read into temporaries that
-        # ``from_hf`` splits and merges, instead of DCP writing through views that this adapter would re-fuse into a
-        # copy (leaving the model's gate/up storage unloaded).
-        return {**kwargs, "for_checkpoint_load": False}
+    def _fused_gate_up_load_destinations(self, fqn: str, tensor: Any) -> list[tuple[str, Any]]:
+        """Checkpoint-load destinations for one layer's grouped ``gate_and_up_projs``.
+
+        The release stores each expert's projections fused and half-swapped (``[up; gate]``), which cannot be a view
+        of the grouped ``[gate | up]`` storage. DCP therefore reads them into empty host tensors (one per local
+        expert, so no extra GPU memory), and ``from_hf`` splits and merges them into the model. The key is not marked
+        as loaded in place, so the merge runs.
+        """
+        self._split_experts_weights(tensor, self.moe_config.n_routed_experts)
+        dim = self.moe_config.dim
+        inter = self.moe_config.moe_inter_dim
+        base = fqn[: -len("gate_and_up_projs")]
+        dtype = tensor.dtype
+        return [
+            (f"{base}{expert_id}.gate_and_up_proj.weight", torch.empty(2 * inter, dim, dtype=dtype, device="cpu"))
+            for expert_id in self._last_expert_ids
+        ]
 
     def to_hf(self, state_dict: dict[str, Any], exclude_key_regex: str | None = None, **kwargs) -> dict[str, Any]:
-        split = self._to_hf_w_split_experts(state_dict, **self._no_inplace_views(kwargs))
-        return dict(self._fuse_and_rename(list(split.items()), exclude_key_regex))
+        out: dict[str, Any] = {}
+        for fqn, tensor in state_dict.items():
+            for key, value in self.convert_single_tensor_to_hf(
+                fqn, tensor, exclude_key_regex=exclude_key_regex, **kwargs
+            ):
+                out[key] = value
+        return out
 
     def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
-        pairs = self._convert_single_merged_expert_to_hf_split_experts(fqn, tensor, **self._no_inplace_views(kwargs))
+        exclude_key_regex = kwargs.get("exclude_key_regex")
+        if kwargs.get("for_checkpoint_load") and fqn.endswith(".mlp.experts.gate_and_up_projs"):
+            pairs = self._fused_gate_up_load_destinations(fqn, tensor)
+            if exclude_key_regex:
+                pairs = [(k, v) for k, v in pairs if not re.match(exclude_key_regex, k)]
+            return pairs
+        # down_projs keep the release layout, so the mixin can still load them through in-place views.
+        pairs = self._convert_single_merged_expert_to_hf_split_experts(fqn, tensor, **kwargs)
         if pairs is None:
             pairs = [(fqn, tensor)]
-        return self._fuse_and_rename(pairs, kwargs.get("exclude_key_regex"))
+        return self._fuse_and_rename(pairs, exclude_key_regex)

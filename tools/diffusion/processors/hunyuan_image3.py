@@ -51,25 +51,25 @@ class HunyuanImage3Processor(BaseModelProcessor):
 
     def load_models(self, model_name: str, device: str) -> Dict[str, Any]:
         """Load the release model without decoder layers: only the VAE, tokenizer and input builder are needed."""
-        from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+        from transformers import AutoTokenizer
 
         from nemo_automodel._diffusers._hf_cache import resolve_diffusion_model_dir
 
         model_dir = resolve_diffusion_model_dir(model_name)
         logger.info("[HunyuanImage-3.0] Loading VAE and input builder from %s", model_dir)
-        config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
+        from transformers.dynamic_module_utils import get_class_from_dynamic_module
+
+        # Use the release classes directly: once nemo_automodel registers its native config for this model_type,
+        # the Auto factories resolve to it, and it lacks the release's image/tokenizer defaults.
+        release_cls = get_class_from_dynamic_module("hunyuan.HunyuanImage3ForCausalMM", model_dir)
+        config = release_cls.config_class.from_pretrained(model_dir)
         config.num_hidden_layers = 0
         for key in ("moe_topk", "moe_intermediate_size", "num_shared_expert"):
             if isinstance(getattr(config, key, None), list):
                 setattr(config, key, [])
         config.moe_impl = "eager"
-        model = AutoModelForCausalLM.from_pretrained(
-            model_dir,
-            config=config,
-            trust_remote_code=True,
-            torch_dtype=torch.bfloat16,
-            attn_implementation="sdpa",
-            device_map={"": device},
+        model = release_cls.from_pretrained(
+            model_dir, config=config, torch_dtype=torch.bfloat16, attn_implementation="sdpa", device_map={"": device}
         ).eval()
         # Pass a tokenizer object so the release wrapper does not prompt for remote code interactively.
         model.load_tokenizer(AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True))
