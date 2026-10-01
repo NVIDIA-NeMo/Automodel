@@ -204,4 +204,5 @@ wandb:
 ci:
   recipe_owner: huiyingl
   nodes: 8
+  cluster_tag: gb200
   time: "01:00:00"
