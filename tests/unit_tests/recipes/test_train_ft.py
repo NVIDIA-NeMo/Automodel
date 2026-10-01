@@ -34,6 +34,7 @@ from torch.utils.data import IterableDataset
 
 from nemo_automodel._transformers.mfu import MFUConfig
 from nemo_automodel._transformers.model_init import resolve_sdpa_method
+from nemo_automodel.components._peft.lora import PeftConfig
 from nemo_automodel.components.datasets.loader import (
     DataloaderConfig,
 )
@@ -513,16 +514,6 @@ class DummyModel(nn.Module):
         return x
 
 
-class DummyPeftConfig:
-    """Mock PEFT config"""
-
-    def __init__(self):
-        self.use_triton = True
-        self.dim = 8
-        self.alpha = 32
-        self.match_all_linear = True
-
-
 class DummyOptConfig:
     """Mock optimizer config"""
 
@@ -563,7 +554,7 @@ def test_peft_with_pipeline_parallelism_enabled(caplog):
     """Test that _apply_peft_and_lower_precision disables triton with PP."""
     from nemo_automodel._transformers.infrastructure import _apply_peft_and_lower_precision
 
-    cfg_peft = DummyPeftConfig()
+    cfg_peft = PeftConfig(use_triton=True, dim=8, alpha=32, match_all_linear=True)
     model = DummyModel()
     mock_autopipeline = MagicMock()
 
@@ -591,7 +582,7 @@ def test_peft_without_pipeline_parallelism(caplog):
     # Create mock configs
     cfg_model = DummyModelConfig()
     cfg_opt = DummyOptConfig()
-    cfg_peft = DummyPeftConfig()
+    cfg_peft = PeftConfig(use_triton=True, dim=8, alpha=32, match_all_linear=True)
 
     # Mock the apply_lora_to_linear_modules function (now inside apply_model_infrastructure)
     with patch("nemo_automodel._transformers.infrastructure.apply_lora_to_linear_modules") as mock_apply_lora:
@@ -628,7 +619,7 @@ def test_peft_with_tp_disables_triton(caplog):
     """Test that _apply_peft_and_lower_precision disables triton with TP."""
     from nemo_automodel._transformers.infrastructure import _apply_peft_and_lower_precision
 
-    cfg_peft = DummyPeftConfig()
+    cfg_peft = PeftConfig(use_triton=True, dim=8, alpha=32, match_all_linear=True)
     model = DummyModel()
 
     with patch("nemo_automodel._transformers.infrastructure.apply_lora_to_linear_modules"):
