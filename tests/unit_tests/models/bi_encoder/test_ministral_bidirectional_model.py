@@ -725,8 +725,9 @@ def test_ministral3_biencoder_processor_matches_real_checkpoint_pixtral_ids(tmp_
     _configure_sentence_transformer_export(
         _ExportModel(),
         SimpleNamespace(query_prefix="query:", passage_prefix="passage:", use_dataset_instruction=False),
+        tokenizer=processor,
     )
-    assert export_prompts == {"query_prompt": "query:", "document_prompt": "passage:"}
+    assert export_prompts == {"query_prompt": "query:", "document_prompt": "passage:", "tokenizer": processor}
 
     actual = processor.process_documents({"images": [image], "texts": ["ordinary document"]}, padding=False)
     expected = reference(

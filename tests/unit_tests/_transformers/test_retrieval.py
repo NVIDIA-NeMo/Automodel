@@ -1418,26 +1418,6 @@ def test_invalid_composite_decoder_fails_before_mutating_attention(decoder_contr
 def test_bi_encoder_scopes_is_causal_to_composite_text_tower(is_causal):
     """Composite bi-encoders update text attention without changing vision attention."""
 
-    class CompositeConfig:
-        is_composition = True
-        name_or_path = ""
-
-        def __init__(self):
-            self.text_config = PretrainedConfig(hidden_size=16)
-
-        def get_text_config(self, decoder=None, encoder=None):
-            return self.text_config if decoder else self
-
-        def to_dict(self):
-            return {"text_config": self.text_config.to_dict()}
-
-    class Tower(nn.Module):
-        def __init__(self, config=None):
-            super().__init__()
-            self.config = config
-            self.attention = nn.Module()
-            self.attention.is_causal = True
-
     class CompositeConfig(PretrainedConfig):
         is_composition = True
 
@@ -1456,12 +1436,25 @@ def test_bi_encoder_scopes_is_causal_to_composite_text_tower(is_causal):
             super().__init__()
             self.config = CompositeConfig()
             self.config.name_or_path = ""
-            self.decoder_tower = _CausalityModule(self.config.llm_config, True)
+            self.decoder_tower = _CausalityModule(self.config.llm_config, not is_causal)
+            self.decoder_tower.attention = _CausalityModule(self.config.llm_config, not is_causal)
+            vision_config = PretrainedConfig(is_causal=True)
+            self.vision_tower = _CausalityModule(vision_config, True)
+            self.vision_tower.attention = _CausalityModule(vision_config, True)
 
         def get_decoder(self):
             return self.decoder_tower
 
-    encoder = retrieval.BiEncoderModel(CompositeBackbone(), pooling="last", l2_normalize=True)
+    backbone = CompositeBackbone()
+    encoder = retrieval.BiEncoderModel(backbone, pooling="last", l2_normalize=True, is_causal=is_causal)
+
+    assert encoder.is_causal is is_causal
+    assert backbone.config.llm_config.is_causal is is_causal
+    assert backbone.decoder_tower.is_causal is is_causal
+    assert backbone.decoder_tower.attention.is_causal is is_causal
+    assert backbone.vision_tower.config.is_causal is True
+    assert backbone.vision_tower.is_causal is True
+    assert backbone.vision_tower.attention.is_causal is True
 
     assert encoder.sentence_transformer_export_config is None
     encoder.configure_sentence_transformer_prompts(query_prompt="query: ", document_prompt="passage: ")
