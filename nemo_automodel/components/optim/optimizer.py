@@ -334,8 +334,10 @@ def _avoid_redundant_te_master_weights_for_fp32_params(optimizer: torch.optim.Op
     Transformer Engine's FusedAdam has one optimizer-wide ``master_weights``
     switch. Mixed BF16/FP32 models need it for BF16 parameters, but its FP32
     update path operates directly on the resident parameter and never consumes
-    ``master_param``. Pre-initializing only the two moments for resident FP32
-    parameters makes TE skip its generic three-state initializer. A pre-load
+    ``master_param``. Initializing only the two moments for resident FP32
+    parameters immediately before a step makes TE skip its generic three-state
+    initializer. Construction leaves all state empty so DCP can initialize a
+    complete BF16/FP32 read template when resuming a fresh optimizer. A pre-load
     hook removes legacy redundant masters from the nested checkpoint state
     before TE rebuilds its optimizer-owned state after PyTorch's loader returns.
 
@@ -396,7 +398,10 @@ def _avoid_redundant_te_master_weights_for_fp32_params(optimizer: torch.optim.Op
                 if local_parameter.dtype is torch.float32:
                     saved_state.get(saved_id, {}).pop("master_param", None)
 
-    enforce_fp32_ownership(optimizer)
+    def prepare_step(loaded_optimizer: torch.optim.Optimizer, _args: tuple, _kwargs: dict) -> None:
+        enforce_fp32_ownership(loaded_optimizer)
+
+    optimizer.register_step_pre_hook(prepare_step)
     optimizer.register_load_state_dict_pre_hook(remove_legacy_fp32_masters)
 
 
@@ -632,7 +637,7 @@ class OptimizerFromFactoryConfig(OptimizerConfig):
         # Only inject ``foreach`` for factories that actually accept it. The TP>1 path sets
         # ``foreach=False`` via ``_foreach_for_mesh``; passing it to a factory that does not take
         # ``foreach`` (e.g. TE ``FusedAdam``) would raise.  Honour an explicit user-provided value.
-        if foreach is not None and "foreach" not in kwargs and _accepts_foreach(self.factory):
+        if foreach is not None and "foreach" not in kwargs and _factory_accepts_foreach(self.factory):
             kwargs["foreach"] = foreach
 
         optimizers: list[torch.optim.Optimizer] = []
@@ -664,7 +669,7 @@ class OptimizerFromFactoryConfig(OptimizerConfig):
         kwargs = dict(self.kwargs)
         is_te_fused_adam = _is_te_fused_adam(self.factory)
         _normalize_optional_dtype_kwargs(kwargs, omit_none=is_te_fused_adam)
-        if foreach is not None and "foreach" not in kwargs and _accepts_foreach(self.factory):
+        if foreach is not None and "foreach" not in kwargs and _factory_accepts_foreach(self.factory):
             kwargs["foreach"] = foreach
 
         if is_te_fused_adam:
@@ -903,7 +908,7 @@ def _is_te_fused_adam(factory: Callable[..., Any]) -> bool:
     return isinstance(te_fused_adam, type) and isinstance(factory, type) and issubclass(factory, te_fused_adam)
 
 
-def _accepts_foreach(factory: Callable[..., Any]) -> bool:
+def _factory_accepts_foreach(factory: Callable[..., Any]) -> bool:
     """Return ``True`` if ``factory`` accepts a ``foreach`` kwarg.
 
     ``torch.optim`` optimizers take ``foreach``; external factories such as TE

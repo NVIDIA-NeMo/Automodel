@@ -168,7 +168,9 @@ class TestOptimizerConfigBase:
         assert opt.param_groups[1]["weight_decay"] == 0.0
 
 
-def test_te_master_ownership_uses_resident_fp32_parameter_directly_after_resume():
+def test_te_master_ownership_uses_resident_fp32_parameter_directly_after_resume(tmp_path):
+    from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
+
     fp32_param = nn.Parameter(torch.ones(4, dtype=torch.float32))
     bf16_param = nn.Parameter(torch.ones(4, dtype=torch.bfloat16))
 
@@ -180,8 +182,18 @@ def test_te_master_ownership_uses_resident_fp32_parameter_directly_after_resume(
 
         def _initialize_state(self, parameter, state_name, zero_buffer):
             """Create one FP32 optimizer-state tensor matching ``parameter`` shape."""
-            assert zero_buffer
-            self.state[parameter][state_name] = torch.zeros_like(parameter, dtype=torch.float32)
+            self.state[parameter][state_name] = (
+                torch.zeros_like(parameter, dtype=torch.float32) if zero_buffer else parameter.detach().float().clone()
+            )
+
+        def step(self, closure=None):
+            """Mirror TE's lazy per-parameter initialization used by DCP's dummy step."""
+            for group in self.param_groups:
+                for parameter in group["params"]:
+                    if not self.state[parameter]:
+                        self._initialize_state(parameter, "exp_avg", True)
+                        self._initialize_state(parameter, "exp_avg_sq", True)
+                        self._initialize_state(parameter, "master_param", False)
 
         def load_state_dict(self, state_dict):
             """Mirror TE's second state rebuild after PyTorch's loader returns."""
@@ -193,8 +205,10 @@ def test_te_master_ownership_uses_resident_fp32_parameter_directly_after_resume(
     optimizer = FakeFusedAdam()
     _avoid_redundant_te_master_weights_for_fp32_params(optimizer)
 
+    assert not optimizer.state
+    optimizer.step()
     assert set(optimizer.state[fp32_param]) == {"exp_avg", "exp_avg_sq"}
-    assert optimizer.state[bf16_param] == {}
+    assert "master_param" in optimizer.state[bf16_param]
 
     optimizer.state[fp32_param]["master_param"] = fp32_param.detach().clone()
     optimizer.state[bf16_param]["master_param"] = bf16_param.detach().float().clone()
@@ -203,6 +217,30 @@ def test_te_master_ownership_uses_resident_fp32_parameter_directly_after_resume(
 
     assert set(optimizer.state[fp32_param]) == {"exp_avg", "exp_avg_sq"}
     assert "master_param" in optimizer.state[bf16_param]
+
+    # Use the actual Checkpointer/DCP fresh-optimizer read-template path.
+    # DCP skips its dummy initialization when any state already exists.
+    model = nn.Module()
+    model.fp32_weight, model.bf16_weight = fp32_param, bf16_param
+    optimizer.state[bf16_param]["master_param"].fill_(1.000123)
+    optimizer.state[bf16_param]["exp_avg"].fill_(0.12345)
+    optimizer.state[bf16_param]["exp_avg_sq"].fill_(0.23456)
+    expected = {name: value.clone() for name, value in optimizer.state[bf16_param].items()}
+    optimizer.zero_grad(set_to_none=True)
+    checkpointer = Checkpointer(
+        CheckpointingConfig(checkpoint_dir=str(tmp_path), is_async=False), dp_rank=0, tp_rank=0, pp_rank=0
+    )
+    try:
+        checkpointer.save_optimizer(optimizer, model, str(tmp_path))
+        fresh_optimizer = FakeFusedAdam()
+        _avoid_redundant_te_master_weights_for_fp32_params(fresh_optimizer)
+        assert not fresh_optimizer.state
+        checkpointer.load_optimizer(fresh_optimizer, model, str(tmp_path))
+        for name, expected_value in expected.items():
+            torch.testing.assert_close(fresh_optimizer.state[bf16_param][name], expected_value, rtol=0, atol=0)
+        assert "master_param" not in fresh_optimizer.state[fp32_param]
+    finally:
+        checkpointer.close()
 
 
 # ---------------------------------------------------------------------------

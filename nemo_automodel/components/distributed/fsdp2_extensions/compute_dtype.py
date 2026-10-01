@@ -140,7 +140,9 @@ def _fsdp_pre_all_gather_in_compute_dtype(
     """Create a transient compute-precision all-gather input from an FP32 master shard.
 
     Args:
-        tensor: Per-rank local parameter shard of shape ``[local_shard_numel]``.
+        tensor: FP32 local shard of shape ``[local_dim0, *trailing]``, where
+            ``local_dim0 = outer_size[0] // mesh.size()`` and
+            ``trailing = outer_size[1:]``. Storage is not mutated.
         mesh: FSDP device mesh that shards the parameter on mesh dimension 0.
         outer_size: Global unsharded parameter shape.
         outer_stride: Global unsharded parameter stride.
@@ -150,7 +152,8 @@ def _fsdp_pre_all_gather_in_compute_dtype(
 
     Returns:
         A one-element tuple containing the local gather input of shape
-        ``[local_shard_numel]`` and metadata describing the global parameter.
+        ``[local_dim0, *trailing]`` in compute dtype and global metadata.
+        The gather input aliases ``tensor`` when their dtypes match.
     """
     del module, mp_policy
     compute_dtype = tensor._compute_dtype
@@ -178,7 +181,7 @@ def _fsdp_post_all_gather_in_compute_dtype(
     """Expose one gathered parameter in its checkpoint-defined compute dtype.
 
     Args:
-        tensor: Per-rank local FP32 master shard of shape ``[local_shard_numel]``;
+        tensor: Per-rank local FP32 master shard of shape ``[local_dim0, *trailing]``;
             unused after the all-gather.
         all_gather_outputs: One-element tuple containing the flattened global
             parameter of shape ``[global_numel]`` in its compute dtype.
@@ -262,11 +265,20 @@ def _fully_shard_with_plan(
             patch_fsdp_uniform_reduce_dtype()
 
     install_extensions()
+
+    # Meta initialization replaces the shard tensor without loading a state
+    # dict. Reinstall before FSDP's first lazy initialization, after those
+    # replacements have completed.
+    def install_after_materialization(_module: nn.Module, _inputs: tuple) -> None:
+        install_extensions()
+        materialization_hook.remove()
+
+    materialization_hook = module.register_forward_pre_hook(install_after_materialization, prepend=True)
     module.register_load_state_dict_post_hook(install_extensions)
     return wrapped
 
 
-def fully_shard_with_per_param_compute_dtypes(
+def _fully_shard_with_per_param_compute_dtypes(
     module: nn.Module,
     *,
     fp32_compute_module_names: tuple[str, ...],

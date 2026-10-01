@@ -1135,6 +1135,25 @@ class TestQwen3_5ModelParallelizer:
         Qwen3_5ModelParallelizer()._apply(model, mesh, reapply_trainability=reapply, enable_fsdp2_prefetch=False)
         assert events == ["trainability", "selection"]
 
+    def test_cpu_offload_keeps_sensitive_parameters_sharded(self, mock_device_mesh, monkeypatch):
+        from torch.distributed.fsdp import CPUOffloadPolicy
+
+        mesh, _, _, _ = mock_device_mesh
+        model = _MockQwen35Model()
+        model.model.layers[0]._fp32_params = nn.Linear(4, 4, bias=False)
+        make_sync = MagicMock()
+        select = MagicMock()
+        monkeypatch.setattr(qwen3_5_parallelization, "make_fully_shard_with_replicated_parameter_grad_sync", make_sync)
+        monkeypatch.setattr(qwen3_5_parallelization, "select_small_fp32_parameters", select)
+        monkeypatch.setattr(
+            qwen3_5_parallelization,
+            "fully_shard_with_compute_dtype_fallback",
+            lambda module, **_kwargs: module,
+        )
+        Qwen3_5ModelParallelizer()._apply(model, mesh, offload_policy=CPUOffloadPolicy(), enable_fsdp2_prefetch=False)
+        select.assert_not_called()
+        make_sync.assert_not_called()
+
 
 class TestModelSidecars:
     """Model-specific parallelizers are owned by their model classes."""

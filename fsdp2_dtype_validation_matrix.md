@@ -31,7 +31,7 @@ checkpoint configuration, compute-dtype metadata, or optimizer settings.
 | D2 | FP32 | FP32 | FP32 | FP32 | No or irrelevant | Ordinary uniform FSDP | No per-parameter dtype extension or transient casts; one FSDP unit |
 | D3 | BF16 | FP32 | BF16 | FP32 | Yes, optimizer-owned | Bounded replication when sensitive bytes fit; dtype-split fallback otherwise | Preserve BF16 sharded bulk storage and its optimizer-owned FP32 masters; update replicated sensitive FP32 weights directly without downcasting their communication |
 | D4 | BF16 | FP32 | BF16 | FP32 | No | Bounded replication when sensitive bytes fit; dtype-split fallback otherwise | Preserve BF16 sharded bulk storage; the optimizer directly updates both bulk resident weights and replicated FP32 sensitive weights |
-| D5 | BF16 | BF16 | BF16 | BF16 | Yes or no | Ordinary uniform FSDP | Technically valid as a generic FSDP configuration, but reject or warn for a model whose sensitive parameters must remain FP32 |
+| D5 | BF16 | BF16 | BF16 | FP32 pin | Yes or no | Dtype-split fallback | A pinned holder still computes in FP32, but its BF16 residency is numerically unsupported for Qwen; warn rather than replicate |
 | D6 | FP32 | BF16 | BF16 | BF16 | No | Dtype-split fallback | Support an unusual checkpoint layout without entering the FP32-resident-only optimized path |
 | D7 | BF16 | FP32 | BF16 | BF16 | Yes or no | Dtype-split fallback | Split by storage dtype even though both groups compute in BF16; treat this as an invalid numerical policy when the sensitive parameters require FP32 compute |
 | D8 | BF16, FP16, and FP32 mixed | Mixed | Mixed | Mixed | Any | Multi-group dtype-split path or clear error | Isolate every storage/compute group, or fail clearly when the parameters cannot be isolated into distinct owning modules |
@@ -64,26 +64,12 @@ policy.
 ## Replication Limit Rationale
 
 The Qwen3.5 model-owned policy uses an internal **8 MiB per managed module**
-limit, not a generic distributed-config setting or a model-wide budget. The
-repository currently contains 131
-example PEFT configurations with the following LoRA rank distribution:
-
-| LoRA rank (`peft.dim`) | Example count |
-|---:|---:|
-| 4 | 1 |
-| 8 | 64 |
-| 16 | 39 |
-| 32 | 19 |
-| 64 | 8 |
-
-For an FP32 LoRA pair on a linear projection, the logical adapter size is
-`4 * rank * (in_features + out_features)` bytes. At the largest rank present in
-the examples (`64`), 8 MiB covers both adapter matrices for a square projection
-up to hidden size 16,384. It also covers rank 128 at hidden size 8,192. The cap
-therefore includes the repository's common adapter dimensions while preventing
-a genuinely large managed module from being replicated merely because other
-managed modules are small. Oversized modules independently retain sharded
-ownership; eligible siblings may still replicate.
+limit, not a generic distributed-config setting or a model-wide budget.
+The current `A_log` and `dt_bias` holders normally consume only a few KiB;
+they do not contain LoRA adapters. The cap is a defensive bound if managed
+holders grow. Oversized modules independently retain sharded ownership while
+eligible siblings may still replicate. The per-tensor compute extension is a
+fallback capability, not the selected path for the current small Qwen holders.
 
 ## Ownership and Feature Compatibility
 
@@ -123,6 +109,12 @@ The following cases should be crossed with at least D1 and D3.
 | All paths | Match an independent FP32 reference for forward output, loss, and gradients within dtype-appropriate tolerances |
 | All paths | Preserve resident dtypes and compute metadata across a checkpoint round trip |
 
+Replicated parameter values are broadcast once across each DP mesh dimension
+at the first root forward, after meta materialization, initialization, and any
+checkpoint load. This includes frozen holders and makes rank-seeded from-config
+initialization consistent. These startup broadcasts are excluded from the
+per-step profiler counts. CPU offload keeps holders sharded so FSDP stages them.
+
 The replicated-gradient collective is installed by the `fully_shard` wrapper on
 FSDP's root post-backward callback. It follows FSDP's own
 `set_requires_gradient_sync` lifecycle, so deferred backward passes accumulate
@@ -136,7 +128,8 @@ local-use value per managed parameter. Those values add only
 a parameter used on only some ranks receives the missing ranks' zero
 contributions and is divided by the full DP world size. A parameter unused on
 all ranks retains `grad=None`. This suppresses its parameter update, weight
-decay, and per-parameter moment initialization. It does not promise that an
+decay, and moment updates. TE may still allocate zero moment buffers for unused
+parameters when it initializes a group. It does not promise that an
 optimizer-wide or parameter-group step counter remains unchanged; TE FusedAdam
 uses such a group-level counter for bias correction.
 
@@ -150,9 +143,9 @@ uses such a group-level counter for bias correction.
 | D5-D8 and F9-F12 | `test_parallelizer_utils.py` | Unit-local selection chooses ordinary, optimized single-owner, or dtype-split fallback before wrapping |
 | F1, F4, and F5 | `test_parallelization_strategies.py` plus the functional root-after-child case | Ignored, replicated, frozen, and already child-owned parameters are not recaptured |
 | F6 and gradient accumulation | Functional activation-checkpoint and two-microbatch cases | Recompute and deferred synchronization preserve numerical parity |
-| F14-F15 | Functional model and optimizer state reloads | Extension metadata and optimizer master ownership are restored without duplicate state |
+| F14-F15 | In-memory model reloads, meta materialization without a checkpoint, and the TE probe's fresh Checkpointer/DCP resume | Extensions survive shard replacement; BF16 masters and moments are restored, with next-step parity and no redundant FP32 master |
 | F16 | Unit tests with globally and rank-locally unused parameters | Globally unused parameters retain `grad=None`; rank-local gaps receive the peer contribution without an extra collective |
-| F17 | Four-rank invocation of `run_fsdp_casting_ownership.py` | HSDP matches a global reference and reduces one coalesced FP32 payload over each mesh dimension |
+| F17 | Two-rank 2x1 HSDP in PR CI; standalone four-rank 2x2 invocation | The two-rank case exercises replication; the four-rank case covers both nontrivial dimensions and requires four visible GPUs |
 
 ## PEFT Matrix
 

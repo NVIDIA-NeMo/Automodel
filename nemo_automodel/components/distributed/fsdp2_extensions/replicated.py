@@ -28,10 +28,8 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import FSDPModule
 from torch.distributed.tensor import DTensor
 
-# Repository PEFT recipes use ranks 4-64 (79% use rank 8 or 16). For an FP32
-# LoRA A+B pair, bytes = 4 * rank * (in_features + out_features), so 8 MiB
-# covers rank 64 on a square 16K-wide projection while still bounding each
-# independently managed module.
+# A fixed per-module cap bounds replication independently of model size.
+# Qwen3.5's A_log/dt_bias holders normally consume only a few KiB.
 DEFAULT_MAX_REPLICATED_PARAM_BYTES_PER_MODULE = 8 * 1024 * 1024
 _GRAD_SYNC_ATTR = "_nemo_fsdp2_replicated_grad_sync"
 _ShardedReason = Literal["size_limit", "non_fp32_residency"]
@@ -345,30 +343,45 @@ def make_fully_shard_with_replicated_parameter_grad_sync(
         A ``fully_shard``-compatible callable that installs synchronization when
         ``root_module`` is wrapped.
     """
-    trainable_ids = {id(parameter) for parameter in parameters if parameter.requires_grad}
+    parameter_ids = {id(parameter) for parameter in parameters}
     parameter_slots: list[_ParameterSlot] = []
     found_ids: set[int] = set()
     for owner in root_module.modules():
         for name, parameter in owner.named_parameters(recurse=False):
             parameter_id = id(parameter)
-            if parameter_id in trainable_ids and parameter_id not in found_ids:
+            if parameter_id in parameter_ids and parameter_id not in found_ids:
                 parameter_slots.append(_ParameterSlot(owner, name))
                 found_ids.add(parameter_id)
-    missing_ids = trainable_ids - found_ids
+    missing_ids = parameter_ids - found_ids
     if missing_ids:
-        raise ValueError(f"{len(missing_ids)} replicated trainable parameter(s) are not owned by root_module")
+        raise ValueError(f"{len(missing_ids)} replicated parameter(s) are not owned by root_module")
 
-    grad_sync = _ReplicatedGradSync(tuple(parameter_slots), mesh)
+    grad_sync = _ReplicatedGradSync(tuple(slot for slot in parameter_slots if slot.resolve().requires_grad), mesh)
     installed = False
+    initialization_hook: torch.utils.hooks.RemovableHandle | None = None
+
+    @torch.no_grad()
+    def initialize_replicated_parameters(module: nn.Module, _inputs: tuple) -> None:
+        # Sharding precedes meta materialization and rank-seeded initialization.
+        # Resolve the final tensors at first forward and align every replica,
+        # including frozen holders, across each orthogonal DP dimension.
+        for slot in parameter_slots:
+            local_parameter = _local_tensor(slot.resolve())
+            for group in mesh.get_all_groups():
+                if dist.get_world_size(group=group) > 1:
+                    dist.broadcast(local_parameter, src=dist.get_global_rank(group, 0), group=group)
+        assert initialization_hook is not None
+        initialization_hook.remove()
 
     @wraps(fully_shard_fn)
     def fully_shard_with_grad_sync(module: nn.Module, **kwargs) -> nn.Module:
-        nonlocal installed
+        nonlocal installed, initialization_hook
         wrapped = fully_shard_fn(module, **kwargs)
         if module is root_module:
             if installed:
                 raise RuntimeError("replicated FSDP2 gradient synchronization root was fully sharded more than once")
             _install_fsdp_post_backward_grad_sync(wrapped, grad_sync)
+            initialization_hook = wrapped.register_forward_pre_hook(initialize_replicated_parameters, prepend=True)
             installed = True
         return wrapped
 

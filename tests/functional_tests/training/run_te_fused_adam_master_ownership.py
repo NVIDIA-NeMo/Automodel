@@ -15,10 +15,13 @@
 
 """Validate dtype-aware Transformer Engine FusedAdam master ownership."""
 
+import tempfile
+
 import torch
 import torch.nn as nn
 from transformer_engine.pytorch.optimizers import FusedAdam
 
+from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 from nemo_automodel.components.optim.optimizer import FusedAdamConfig, OptimizerFromFactoryConfig
 
 
@@ -31,10 +34,8 @@ def main() -> None:
     model.bf16_weight = nn.Parameter(torch.ones(8, device="cuda", dtype=torch.bfloat16))
     optimizer = FusedAdamConfig(lr=1e-3, master_weights=True).build(model)[0]
 
-    if set(optimizer.state[model.fp32_weight]) != {"exp_avg", "exp_avg_sq"}:
-        raise AssertionError("resident FP32 parameter should own moments without a redundant master_param")
-    if optimizer.state[model.bf16_weight]:
-        raise AssertionError("BF16 optimizer state should remain lazy before the first step")
+    if optimizer.state:
+        raise AssertionError("fresh TE optimizer must remain empty for DCP read-template initialization")
 
     (model.fp32_weight.sum() + model.bf16_weight.float().sum()).backward()
     optimizer.step()
@@ -54,6 +55,35 @@ def main() -> None:
     if "master_param" not in optimizer.state[model.bf16_weight]:
         raise AssertionError("optimizer resume dropped the BF16 parameter's FP32 master_param")
 
+    # Resume through the real Checkpointer/DCP path into a fresh optimizer.
+    # The saved FP32 master contains bits absent from BF16 resident weights.
+    resumed_model = nn.Module().cuda()
+    resumed_model.fp32_weight = nn.Parameter(model.fp32_weight.detach().clone())
+    resumed_model.bf16_weight = nn.Parameter(model.bf16_weight.detach().clone())
+    resumed_optimizer = FusedAdamConfig(lr=1e-3, master_weights=True).build(resumed_model)[0]
+    with tempfile.TemporaryDirectory(prefix="te-master-resume-") as checkpoint_dir:
+        checkpointer = Checkpointer(
+            CheckpointingConfig(checkpoint_dir=checkpoint_dir, is_async=False), dp_rank=0, tp_rank=0, pp_rank=0
+        )
+        try:
+            checkpointer.save_optimizer(optimizer, model, checkpoint_dir)
+            checkpointer.load_optimizer(resumed_optimizer, resumed_model, checkpoint_dir)
+        finally:
+            checkpointer.close()
+    for name, parameter in model.named_parameters():
+        resumed_parameter = dict(resumed_model.named_parameters())[name]
+        for state_name, expected in optimizer.state[parameter].items():
+            torch.testing.assert_close(resumed_optimizer.state[resumed_parameter][state_name], expected, rtol=0, atol=0)
+    for current_model, current_optimizer in ((model, optimizer), (resumed_model, resumed_optimizer)):
+        current_optimizer.zero_grad(set_to_none=True)
+        (current_model.fp32_weight.sum() + current_model.bf16_weight.float().sum()).backward()
+        current_optimizer.step()
+    for name, parameter in model.named_parameters():
+        resumed_parameter = dict(resumed_model.named_parameters())[name]
+        torch.testing.assert_close(resumed_parameter, parameter, rtol=0, atol=0)
+        for state_name, expected in optimizer.state[parameter].items():
+            torch.testing.assert_close(resumed_optimizer.state[resumed_parameter][state_name], expected, rtol=0, atol=0)
+
     # Hydra/factory configs may materialize an unset optional dtype as None.
     # Construction must preserve TE's omission-based default instead of passing
     # None, which TE rejects.
@@ -63,7 +93,7 @@ def main() -> None:
         kwargs={"lr": 1e-3, "master_weights": True, "master_weight_dtype": None},
     ).build(factory_model)
 
-    print("PASS: TE dtype-aware master ownership, resume, and factory defaults")
+    print("PASS: TE dtype-aware master ownership, fresh DCP resume/next-step parity, and factory defaults")
 
 
 if __name__ == "__main__":

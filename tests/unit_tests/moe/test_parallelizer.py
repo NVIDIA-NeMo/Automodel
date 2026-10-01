@@ -476,7 +476,7 @@ def _import_parallelizer_with_stubs(monkeypatch):
     fsdp2_extensions_stub = types.ModuleType("nemo_automodel.components.distributed.fsdp2_extensions")
     fsdp2_extensions_stub.__path__ = []
     fsdp2_extensions_stub.compat = fsdp2_compat_stub
-    fsdp2_extensions_stub.parallelize = parallelizer_utils_stub
+    fsdp2_extensions_stub.utils = parallelizer_utils_stub
     monkeypatch.setitem(
         sys.modules,
         "nemo_automodel.components.distributed.fsdp2_extensions.compat",

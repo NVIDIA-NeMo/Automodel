@@ -23,7 +23,7 @@ from collections.abc import Callable
 import torch
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.fsdp import MixedPrecisionPolicy, OffloadPolicy, fully_shard
+from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy, OffloadPolicy, fully_shard
 
 from nemo_automodel.components.distributed import ModelParallelizer
 from nemo_automodel.components.distributed.fsdp2_extensions.compute_dtype import fully_shard_with_compute_dtype_fallback
@@ -90,7 +90,9 @@ class Qwen3_5ModelParallelizer(ModelParallelizer):
                 name_fragments=_FP32_COMPUTE_MODULE_NAMES,
                 max_bytes_per_module=_MAX_REPLICATED_FP32_BYTES_PER_MODULE,
             )
-            if mp_policy is not None and mp_policy.param_dtype not in (None, torch.float32)
+            if mp_policy is not None
+            and mp_policy.param_dtype not in (None, torch.float32)
+            and not isinstance(offload_policy, CPUOffloadPolicy)
             else ()
         )
         parameters = replicated_parameters(selections)

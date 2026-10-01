@@ -32,8 +32,8 @@ from nemo_automodel.components.distributed.fsdp2_extensions.compat import (
 from nemo_automodel.components.distributed.fsdp2_extensions.compute_dtype import (
     _fsdp_post_all_gather_in_compute_dtype,
     _fsdp_pre_all_gather_in_compute_dtype,
+    _fully_shard_with_per_param_compute_dtypes,
     fully_shard_with_compute_dtype_fallback,
-    fully_shard_with_per_param_compute_dtypes,
 )
 from nemo_automodel.components.distributed.fsdp2_extensions.utils import (
     _fully_shard,
@@ -965,7 +965,7 @@ def test_per_param_compute_casting_keeps_one_fsdp_owner(monkeypatch):
     monkeypatch.setattr(compute_dtype, "_install_per_param_compute_dtypes", fake_install)
     monkeypatch.setattr(compute_dtype, "patch_fsdp_uniform_reduce_dtype", lambda: reduce_patch_calls.append(1))
 
-    result = fully_shard_with_per_param_compute_dtypes(
+    result = _fully_shard_with_per_param_compute_dtypes(
         mixer,
         fp32_compute_module_names=("_fp32_params",),
         fully_shard_fn=fake_fully_shard,
@@ -996,7 +996,7 @@ def test_per_param_compute_casting_rejects_compiled_autograd(monkeypatch, active
         monkeypatch.setattr(compiled_autograd, state, state == active_state)
 
     with pytest.raises(NotImplementedError, match="incompatible with compiled autograd"):
-        fully_shard_with_per_param_compute_dtypes(
+        _fully_shard_with_per_param_compute_dtypes(
             nn.Linear(4, 4, bias=False),
             fp32_compute_module_names=(),
             fully_shard_fn=lambda module, **kwargs: module,
@@ -1010,7 +1010,7 @@ def test_per_param_compute_casting_rejects_non_fp32_master():
     mixer = nn.Linear(4, 4, bias=False, dtype=torch.bfloat16)
 
     with pytest.raises(ValueError, match="requires FP32 resident/master weights"):
-        fully_shard_with_per_param_compute_dtypes(
+        _fully_shard_with_per_param_compute_dtypes(
             mixer,
             fp32_compute_module_names=(),
             fully_shard_fn=lambda module, **kwargs: module,
@@ -1512,3 +1512,21 @@ def test_compute_dtype_pins_logical_names_through_activation_checkpointing():
     assert compute_dtype_of(attention.sinks_param.weight) == torch.float32
     assert compute_dtype_of(attention.sinks_param.scale) == torch.float32
     assert compute_dtype_of(attention.proj.weight) == torch.bfloat16
+
+
+@pytest.mark.parametrize(
+    "old_name,new_name",
+    [("parallelizer_utils", "utils"), ("fsdp_patches", "compat")],
+)
+def test_deprecated_public_import_paths_preserve_exports(old_name, new_name):
+    import importlib
+    import sys
+
+    old_path = f"nemo_automodel.components.distributed.{old_name}"
+    # Import afresh so the compatibility warning is part of the contract.
+    sys.modules.pop(old_path, None)
+    with pytest.warns(DeprecationWarning, match="moved to distributed.fsdp2_extensions"):
+        compatibility = importlib.import_module(old_path)
+    canonical = importlib.import_module(f"nemo_automodel.components.distributed.fsdp2_extensions.{new_name}")
+    for name in compatibility.__all__:
+        assert getattr(compatibility, name) is getattr(canonical, name)

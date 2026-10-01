@@ -23,6 +23,7 @@ Usage:
 from __future__ import annotations
 
 import os
+import tempfile
 from collections import Counter
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -36,6 +37,11 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy, fully_shard
 from torch.distributed.tensor import DTensor
 
+from nemo_automodel.components.checkpoint.checkpointing import (
+    Checkpointer,
+    CheckpointingConfig,
+    to_empty_parameters_only,
+)
 from nemo_automodel.components.distributed.fsdp2_extensions.compute_dtype import (
     fully_shard_with_compute_dtype_fallback,
 )
@@ -175,6 +181,7 @@ class _Scenario:
     rank_asymmetric_use: bool = False
     model_sidecar: bool = False
     clip: bool = False
+    materialize_after_shard: bool = False
 
 
 def _input_for_rank(
@@ -201,13 +208,15 @@ def _run_scenario(
         compute_dtype=scenario.compute_dtype,
         conditional_parameter=scenario.conditional_parameter,
     ).to(device=device)
-    layer = _Layer(
-        bulk_dtype=scenario.bulk_dtype,
-        compute_dtype=scenario.compute_dtype,
-        conditional_parameter=scenario.conditional_parameter,
-        use_conditional=scenario.rank_asymmetric_use and rank == 0,
-    ).to(device=device)
-    layer.load_state_dict(reference_layer.state_dict())
+    with torch.device("meta" if scenario.materialize_after_shard else device):
+        layer = _Layer(
+            bulk_dtype=scenario.bulk_dtype,
+            compute_dtype=scenario.compute_dtype,
+            conditional_parameter=scenario.conditional_parameter,
+            use_conditional=scenario.rank_asymmetric_use and rank == 0,
+        )
+    if not scenario.materialize_after_shard:
+        layer.load_state_dict(reference_layer.state_dict())
     if scenario.activation_checkpointing:
         layer._fp32_params = checkpoint_wrapper(layer._fp32_params)
     reference = _Root(reference_layer) if scenario.root_boundary else reference_layer
@@ -237,7 +246,9 @@ def _run_scenario(
     )
     if scenario.model_sidecar:
         sidecar_mesh = init_device_mesh(
-            "cuda", (world_size // 2, 2, 1), mesh_dim_names=("dp_replicate", "dp_shard_cp", "tp")
+            "cuda",
+            (world_size // mesh.shape[-1], mesh.shape[-1], 1),
+            mesh_dim_names=("dp_replicate", "dp_shard_cp", "tp"),
         )
         previous_limit = qwen_parallelization._MAX_REPLICATED_FP32_BYTES_PER_MODULE
         try:
@@ -262,7 +273,27 @@ def _run_scenario(
         raise AssertionError(
             f"{scenario.name}: expected {scenario.expected_fsdp_units} FSDP unit(s), got {len(fsdp_units)}"
         )
-    model.load_state_dict(model.state_dict())
+    if scenario.materialize_after_shard:
+        # The production from_config path replaces meta shards, then initializes
+        # them, without any load_state_dict post-hook to reinstall extensions.
+        to_empty_parameters_only(model, device=device)
+        reference_params = dict(reference.named_parameters())
+        shard_rank = mesh.get_local_rank(mesh_dim="dp_shard") if mesh.ndim == 2 else rank
+        shard_size = mesh.shape[-1]
+        for name, parameter in model.named_parameters():
+            source = reference_params[name]
+            local = parameter.to_local() if isinstance(parameter, DTensor) else parameter
+            if isinstance(parameter, DTensor):
+                source = source.chunk(shard_size, dim=0)[shard_rank]
+            with torch.no_grad():
+                local.copy_(source)
+                if "_fp32_params" in name and not isinstance(parameter, DTensor):
+                    generator = torch.Generator(device=device).manual_seed(4521 + rank)
+                    local.copy_(torch.rand(local.shape, generator=generator, device=device))
+                    reference_generator = torch.Generator(device=device).manual_seed(4521)
+                    reference_params[name].copy_(torch.rand(local.shape, generator=reference_generator, device=device))
+    else:
+        model.load_state_dict(model.state_dict())
     for name, parameter in model.named_parameters():
         expected_dtype = torch.float32 if "_fp32_params" in name else scenario.bulk_dtype
         if parameter.dtype is not expected_dtype:
@@ -336,6 +367,12 @@ def _run_scenario(
             )
             (reference(global_inputs).square().mean() / scenario.accumulation_steps).backward()
 
+    # Exclude the one-time initialization broadcast from per-step collective
+    # counts, and verify rank-seeded replicas agree before their first backward.
+    with torch.no_grad():
+        reference_layer.use_conditional = scenario.rank_asymmetric_use and rank == 0
+        inputs = _input_for_rank(rank, 0, device, scenario.compute_dtype)
+        torch.testing.assert_close(model(inputs), reference(inputs), rtol=0, atol=0)
     nccl_kernel_counts = Counter()
     dist.barrier()
     torch.cuda.synchronize(device)
@@ -359,8 +396,8 @@ def _run_scenario(
         backward_all_microbatches()
 
     reference_params = dict(reference.named_parameters())
-    shard_world_size = mesh["dp_shard"].size() if world_size == 4 else world_size
-    shard_rank = mesh.get_local_rank(mesh_dim="dp_shard") if world_size == 4 else rank
+    shard_world_size = mesh.shape[-1]
+    shard_rank = mesh.get_local_rank(mesh_dim="dp_shard") if mesh.ndim == 2 else rank
 
     def assert_gradient_parity(*, clipped: bool = False) -> None:
         """Compare local gradient tensors against slices of the global-batch reference."""
@@ -396,6 +433,35 @@ def _run_scenario(
     optimizer.load_state_dict(optimizer.state_dict())
     assert_te_master_ownership()
 
+    if scenario.te_optimizer:
+        # Validate the distributed fresh-optimizer read template, including
+        # sharded BF16 masters/moments and replicated FP32 moments.
+        with tempfile.TemporaryDirectory(prefix="fsdp-te-resume-") as local_checkpoint_dir:
+            directories = [local_checkpoint_dir if rank == 0 else None]
+            dist.broadcast_object_list(directories, src=0, device=device)
+            checkpoint_dir = directories[0]
+            checkpointer = Checkpointer(
+                CheckpointingConfig(checkpoint_dir=checkpoint_dir, is_async=False),
+                dp_rank=rank,
+                tp_rank=0,
+                pp_rank=0,
+                process_group=dist.group.WORLD,
+            )
+            try:
+                checkpointer.save_optimizer(optimizer, model, checkpoint_dir)
+                optimizer.zero_grad(set_to_none=True)
+                resumed_optimizer = optimizer_config.build(model, device_mesh=mesh)[0]
+                checkpointer.load_optimizer(resumed_optimizer, model, checkpoint_dir)
+                for parameter in model.parameters():
+                    if set(resumed_optimizer.state[parameter]) != set(optimizer.state[parameter]):
+                        raise AssertionError(f"{scenario.name}: optimizer resume changed state ownership")
+                    for state_name, expected in optimizer.state[parameter].items():
+                        actual = resumed_optimizer.state[parameter][state_name]
+                        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            finally:
+                checkpointer.close()
+            dist.barrier()
+
     for name, parameter in model.named_parameters():
         reference_name = name.replace("._checkpoint_wrapped_module", "")
         reference_parameter = reference_params[reference_name]
@@ -423,10 +489,11 @@ def main() -> None:
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
 
-    if world_size == 4:
+    replicate_only = os.getenv("HSDP_REPLICATE_ONLY") == "1"
+    if world_size == 4 or replicate_only:
         mesh = init_device_mesh(
             "cuda",
-            (2, 2),
+            (world_size, 1) if replicate_only else (2, 2),
             mesh_dim_names=("dp_replicate", "dp_shard"),
         )
     else:
@@ -466,6 +533,20 @@ def main() -> None:
         for dtype in (torch.float32, torch.bfloat16)
         for limit in (64, 0)
     )
+    scenarios.extend(
+        _Scenario(
+            f"sidecar-meta-limit-{limit}",
+            torch.float32,
+            torch.bfloat16,
+            limit,
+            2,
+            accumulation_steps=2,
+            model_sidecar=True,
+            clip=True,
+            materialize_after_shard=True,
+        )
+        for limit in (64, 0)
+    )
     if os.getenv("RUN_TE_FSDP_CASE") == "1":
         scenarios.append(_Scenario("D3-te-master", torch.bfloat16, torch.bfloat16, 64, 1, te_optimizer=True))
     profiled_counts = Counter()
@@ -475,7 +556,9 @@ def main() -> None:
             profiled_counts = counts
 
     expected_nccl_kernel_counts = (
-        Counter({"all_gather": 2, "reduce_scatter": 1, "all_reduce": 3})
+        Counter({"all_reduce": 2})
+        if replicate_only
+        else Counter({"all_gather": 2, "reduce_scatter": 1, "all_reduce": 3})
         if world_size == 4
         else Counter({"all_gather": 2, "reduce_scatter": 1, "all_reduce": 1})
     )
@@ -485,7 +568,7 @@ def main() -> None:
         )
 
     if rank == 0:
-        mode = "HSDP" if world_size == 4 else "FSDP"
+        mode = "HSDP" if mesh.ndim == 2 else "FSDP"
         print(
             f"PASS: {len(scenarios)} {mode} dtype/ownership cases, "
             f"{sum(expected_nccl_kernel_counts.values())} profiled NCCL kernels, optimizer parity"
