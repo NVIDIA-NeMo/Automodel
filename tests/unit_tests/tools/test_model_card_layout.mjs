@@ -116,6 +116,11 @@ test("copying template placeholders cannot pass content validation", () => {
   assert.ok(check(template).length > 0);
 });
 
+test("architecture comes before free context", () => {
+  const source = validCard.replace("## Model Context\n", "## Model Context\n\nSetup notes before architecture.\n");
+  assert.ok(check(source).some(({ message }) => message.includes("must start with the architecture table")));
+});
+
 test("free context accepts custom subsections, tables, code and callouts", () => {
   const notes = `### Packed Sequences
 

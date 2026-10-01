@@ -158,6 +158,9 @@ export function validateModelCard(source, template, format = "mdx", recipes = ne
     }
     if (["Model Context", "Available Models"].includes(name)) {
       const table = content.find((node) => node.type === "table");
+      if (name === "Model Context" && content[0]?.type !== "table") {
+        report(heading, "Model Context must start with the architecture table; put free context after it");
+      }
       if (!table || table.children.length < 2) {
         report(heading, `${name} requires a direct table with at least one data row`);
       } else if (name === "Model Context") {
