@@ -16,8 +16,22 @@
 set -xeuo pipefail
 
 export PYTHONPATH=$(pwd):${PYTHONPATH:-}
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3}
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1}
 export RUN_TE_FSDP_CASE=1
 
-torchrun --nproc_per_node=4 --nnodes=1 \
+IFS=, read -r -a visible_devices <<< "$CUDA_VISIBLE_DEVICES"
+if (( ${#visible_devices[@]} >= 4 )); then
+    export HSDP_MESH_SHAPE=2,2
+    nproc=4
+elif (( ${#visible_devices[@]} == 2 )); then
+    # The CI runners expose two GPUs. Exercise the replicate dimension here;
+    # the companion FSDP test exercises sharding on the same runners.
+    export HSDP_MESH_SHAPE=2,1
+    nproc=2
+else
+    echo "HSDP casting ownership requires at least two visible GPUs" >&2
+    exit 1
+fi
+
+torchrun --nproc_per_node="$nproc" --nnodes=1 \
     tests/functional_tests/training/run_fsdp_casting_ownership.py

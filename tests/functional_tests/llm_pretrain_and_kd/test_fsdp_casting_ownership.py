@@ -12,9 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import pytest
-import torch
-
 from tests.utils.test_utils import run_test_script
 
 
@@ -23,9 +20,6 @@ def test_fsdp_casting_ownership_profiles_expected_nccl_count() -> None:
     run_test_script("llm_pretrain_and_kd", "L2_FSDP_Casting_Ownership.sh")
 
 
-# A nontrivial 2x2 HSDP mesh needs four devices; PR runners expose two.
-# Keep this scenario executable on four-GPU validation/scheduled allocations.
-@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="2x2 HSDP requires four visible CUDA devices")
-def test_hsdp_replicated_fp32_gradients_cover_both_mesh_dimensions() -> None:
-    """HSDP must synchronize replicated FP32 gradients over shard and replicate dimensions."""
+def test_hsdp_replicated_fp32_gradients_on_available_mesh() -> None:
+    """Check the replication dimension on two GPUs and both dimensions on four."""
     run_test_script("llm_pretrain_and_kd", "L2_HSDP_Casting_Ownership.sh")

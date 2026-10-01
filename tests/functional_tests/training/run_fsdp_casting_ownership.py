@@ -489,13 +489,14 @@ def main() -> None:
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
 
-    replicate_only = os.getenv("HSDP_REPLICATE_ONLY") == "1"
-    if world_size == 4 or replicate_only:
-        mesh = init_device_mesh(
-            "cuda",
-            (world_size, 1) if replicate_only else (2, 2),
-            mesh_dim_names=("dp_replicate", "dp_shard"),
-        )
+    hsdp_mesh_shape = os.getenv("HSDP_MESH_SHAPE")
+    if hsdp_mesh_shape:
+        mesh_shape = tuple(int(size) for size in hsdp_mesh_shape.split(","))
+        if len(mesh_shape) != 2 or min(mesh_shape) < 1 or mesh_shape[0] * mesh_shape[1] != world_size:
+            raise AssertionError(f"HSDP mesh shape {mesh_shape} does not match world_size={world_size}")
+        mesh = init_device_mesh("cuda", mesh_shape, mesh_dim_names=("dp_replicate", "dp_shard"))
+    elif world_size == 4:
+        mesh = init_device_mesh("cuda", (2, 2), mesh_dim_names=("dp_replicate", "dp_shard"))
     else:
         mesh = init_device_mesh("cuda", (world_size,), mesh_dim_names=("dp",))
 
@@ -557,7 +558,7 @@ def main() -> None:
 
     expected_nccl_kernel_counts = (
         Counter({"all_reduce": 2})
-        if replicate_only
+        if mesh.ndim == 2 and mesh.shape[-1] == 1
         else Counter({"all_gather": 2, "reduce_scatter": 1, "all_reduce": 3})
         if world_size == 4
         else Counter({"all_gather": 2, "reduce_scatter": 1, "all_reduce": 1})

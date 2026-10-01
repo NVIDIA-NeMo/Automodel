@@ -23,8 +23,3 @@ python tests/functional_tests/training/run_te_fused_adam_master_ownership.py
 
 torchrun --nproc_per_node=2 --nnodes=1 \
     tests/functional_tests/training/run_fsdp_casting_ownership.py
-
-# PR runners have two GPUs. A 2x1 HSDP mesh exercises the replicate dimension
-# there; the separate four-rank entrypoint covers a nontrivial shard dimension.
-HSDP_REPLICATE_ONLY=1 torchrun --nproc_per_node=2 --nnodes=1 \
-    tests/functional_tests/training/run_fsdp_casting_ownership.py
