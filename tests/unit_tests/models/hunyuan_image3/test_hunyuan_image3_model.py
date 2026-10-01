@@ -36,7 +36,11 @@ from nemo_automodel.components.models.hunyuan_image3.layers import (
     HunyuanImage3MLP,
     HunyuanImage3RMSNorm,
 )
-from nemo_automodel.components.models.hunyuan_image3.model import HunyuanImage3ForCausalMM, ModelClass
+from nemo_automodel.components.models.hunyuan_image3.model import (
+    HunyuanImage3ForCausalMM,
+    ModelClass,
+    _remote_code_source,
+)
 from nemo_automodel.components.models.hunyuan_image3.rope import build_2d_positions, build_2d_rope_cos_sin
 from nemo_automodel.components.moe.layers import MoE
 
@@ -299,3 +303,19 @@ class TestModel:
         assert restored.keys() == native.keys()
         for key, value in native.items():
             torch.testing.assert_close(restored[key], value, msg=key)
+
+
+@pytest.mark.parametrize(
+    "path, expected",
+    [
+        ("/ckpts/HunyuanImage-3.0", ("/ckpts/HunyuanImage-3.0", None)),
+        ("tencent/HunyuanImage-3.0", ("tencent/HunyuanImage-3.0", None)),
+        (
+            "/hf/hub/models--tencent--HunyuanImage-3.0/snapshots/36f21fe7/",
+            ("tencent/HunyuanImage-3.0", "36f21fe7"),
+        ),
+    ],
+)
+def test_remote_code_source_maps_hf_cache_snapshots_to_repo_and_revision(path, expected):
+    config = HunyuanImage3Config(remote_code_dir=path)
+    assert _remote_code_source(config) == expected

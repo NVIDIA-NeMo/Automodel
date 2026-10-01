@@ -28,6 +28,7 @@ Two forward modes mirror the release:
   ``final_layer`` into a latent-space prediction.
 """
 
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -73,14 +74,32 @@ def _remote_code_dir(config: Any) -> str:
     return path
 
 
+# Hugging Face cache snapshot: .../models--{org}--{name}/snapshots/{revision}
+_HF_SNAPSHOT_RE = re.compile(r"models--(?P<org>[^/]+?)--(?P<name>[^/]+)/snapshots/(?P<revision>[^/]+)/*$")
+
+
+def _remote_code_source(config: Any) -> tuple[str, str | None]:
+    """Repository (and revision) to load the release image modules from.
+
+    transformers resolves the relative imports of remote code next to the real file, which for an HF cache snapshot is
+    the ``blobs/`` directory, so loading from a snapshot path fails. Such paths are mapped back to the repo id and the
+    snapshot revision, which loads the same files from the cache.
+    """
+    path = str(_remote_code_dir(config))
+    m = _HF_SNAPSHOT_RE.search(path)
+    if m:
+        return f"{m['org']}/{m['name']}", m["revision"]
+    return path, None
+
+
 def build_image_modules(config: Any, include_extra: bool) -> dict[str, nn.Module]:
     """Instantiate the release's image modules from the checkpoint's remote code."""
     from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
-    path = _remote_code_dir(config)
+    repo, revision = _remote_code_source(config)
 
     def cls(name: str):
-        return get_class_from_dynamic_module(name, path)
+        return get_class_from_dynamic_module(name, repo, revision=revision)
 
     hidden = config.hidden_size
     latent_channels = config.vae["latent_channels"]
