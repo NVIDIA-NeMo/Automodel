@@ -744,22 +744,9 @@ class Checkpointer:
         # MoE adapters return non-contiguous views; safetensors.save rejects those.
         _materialize_to_hf_views_for_save(state_dict)
         # Build the consolidated model.safetensors.index.json if needed
-        if quantization:
-            # Packing changes both names and sizes. Pre-shard HF keys describe
-            # the floating-point model, so rebuild the index from the actual
-            # exported tensors across the same rank group that DCP saves.
-            group = self.process_group
-            if group is None and torch.distributed.is_initialized():
-                group = torch.distributed.group.WORLD
-            exported_sizes = _collect_global_tensor_sizes(state_dict, group)
-            fqn_to_file_index_mapping = _divide_keys_by_size(
-                list(exported_sizes),
-                state_dict,
-                _DEFAULT_HF_CONSOLIDATED_SHARD_SIZE_BYTES,
-                key_size_mapping=exported_sizes,
-            )
-        else:
-            fqn_to_file_index_mapping = self._maybe_build_consolidated_index(model_state, state_dict)
+        fqn_to_file_index_mapping = self._maybe_build_consolidated_index(
+            model_state, state_dict, quantization=quantization
+        )
         fqn_to_dtype_mapping = self._maybe_build_original_dtype_mapping(model_state, state_dict)
         _warn_if_large_inline_consolidation(
             self.config,
@@ -2071,24 +2058,42 @@ fi
         )
 
     def _maybe_build_consolidated_index(
-        self, model_state: ModelState, state_dict: dict[str, torch.Tensor]
+        self, model_state: ModelState, state_dict: dict[str, torch.Tensor], *, quantization: bool = False
     ) -> dict[str, int] | None:
         """
         Build FQN to shard index mapping for consolidated HF export.
 
         Uses the base checkpoint index (if present), removes non-persistent keys,
-        and assigns new keys to the last shard by default.
+        and assigns new keys to the last shard by default. Quantized export instead
+        builds size-based shards from the actual exported tensors.
 
         Args:
             model_state: Wrapper exposing the primary model part.
-            state_dict: Current pipeline stage's subset of the exported state dict. Each value is a tensor of
+            state_dict: Current rank's pipeline/expert subset of the exported state dict. Each value is a tensor of
                 arbitrary shape representing its full logical tensor, including when its per-rank storage is sharded.
+            quantization: Rebuild the index from packed keys and sizes across the DCP save process group,
+                ignoring the original checkpoint index and floating-point pre-shard keys.
 
         Returns:
-            Mapping from FQN to shard index, or None when not consolidating.
+            Mapping from FQN to shard index, or None when HF metadata is not needed.
         """
         if not _should_write_hf_metadata(self.config):
             return None
+        if quantization:
+            # Packing changes both names and sizes. Pre-shard HF keys describe
+            # the floating-point model, so rebuild the index from the actual
+            # exported tensors across the same rank group that DCP saves.
+            group = self.process_group
+            if group is None and torch.distributed.is_initialized():
+                group = torch.distributed.group.WORLD
+            exported_sizes = _collect_global_tensor_sizes(state_dict, group)
+            return _divide_keys_by_size(
+                list(exported_sizes),
+                state_dict,
+                _DEFAULT_HF_CONSOLIDATED_SHARD_SIZE_BYTES,
+                key_size_mapping=exported_sizes,
+            )
+
         model = model_state.model[0]
         excluded_keys: set[str] = set()
         # we first need to find the FQN -> .safetensors mapping

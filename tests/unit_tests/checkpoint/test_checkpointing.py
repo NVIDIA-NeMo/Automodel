@@ -3576,6 +3576,32 @@ class TestSkipInitWeightsOnLoadGate:
         model.initialize_weights.assert_called_once()
 
 
+def test_quantized_consolidated_index_uses_exported_keys_and_sizes(tmp_path):
+    """Packed keys replace stale float keys and are sharded by their actual byte sizes."""
+    checkpointer = CheckpointingConfig(checkpoint_dir=str(tmp_path)).build(dp_rank=0, tp_rank=0, pp_rank=0)
+    model = torch.nn.Linear(4, 4)
+    model._pre_shard_hf_state_dict_keys = ["expert.weight", "dense.weight"]
+    model_state = SimpleNamespace(model=[model])
+    state_dict = {
+        "expert.weight_packed": torch.zeros(4, 16, dtype=torch.uint8),  # 64 bytes: shard 1
+        "expert.weight_scale": torch.zeros(4, 1, dtype=torch.uint8),  # 4 bytes: shard 2
+        "dense.weight": torch.zeros(4, 4, dtype=torch.bfloat16),  # 32 bytes: still shard 2
+    }
+    try:
+        with (
+            patch("nemo_automodel.components.checkpoint.checkpointing._DEFAULT_HF_CONSOLIDATED_SHARD_SIZE_BYTES", 64),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._get_hf_safetensors_reference_path",
+                side_effect=AssertionError("Quantized indexing must not use the source checkpoint index"),
+            ),
+        ):
+            mapping = checkpointer._maybe_build_consolidated_index(model_state, state_dict, quantization=True)
+        assert mapping == {"expert.weight_packed": 1, "expert.weight_scale": 2, "dense.weight": 2}
+        assert model._pre_shard_hf_state_dict_keys == ["expert.weight", "dense.weight"]
+    finally:
+        checkpointer.close()
+
+
 class TestConsolidatedIndexUnderPP:
     """Global consolidated-index construction under pipeline parallelism."""
 
