@@ -221,6 +221,13 @@ peft:
 
 Including a `peft:` section enables LoRA fine-tuning. Remove it entirely to run SFT instead. See [Switch Between SFT and PEFT](#switch-between-sft-and-peft).
 
+When targeting grouped MoE experts with LoRA, `experts="torch_mm_mxfp8"` is not
+supported. Both the standard and DeepEP expert LoRA wrappers raise `ValueError`
+at construction rather than silently replacing MXFP8 with native grouped GEMMs.
+Set the model backend's `experts` option to `"torch_mm"` explicitly, or use
+`"torch"` with the standard dispatcher. This restriction does not change MXFP8
+support for experts that are not wrapped with LoRA.
+
 #### QLoRA for Quantized Low-Rank Adaptation
 
 If GPU memory is a constraint, [QLoRA](https://arxiv.org/abs/2305.14314) combines LoRA with 4-bit NormalFloat (NF4) quantization to reduce memory usage by up to 75% compared to full-parameter SFT in 16-bit precision, while maintaining comparable quality to standard LoRA.

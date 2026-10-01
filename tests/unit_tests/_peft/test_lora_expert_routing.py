@@ -27,6 +27,7 @@ import torch.nn.functional as F
 
 from nemo_automodel.components._peft import lora_experts
 from nemo_automodel.components._peft.lora import patch_moe_module
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.experts import GroupedExperts, GroupedExpertsDeepEP
 
@@ -244,11 +245,9 @@ def _dense_reference(
 @pytest.mark.parametrize("backend", _BACKENDS)
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("lora_dtype", [None, "float32"])
-@pytest.mark.parametrize("use_mxfp8", [False, True])
-def test_wrapper_preserves_storage_flags_and_parameter_paths(backend, dtype, lora_dtype, use_mxfp8):
+def test_wrapper_preserves_storage_flags_and_parameter_paths(backend, dtype, lora_dtype):
     """Wrapping preserves source storage and paths while freezing only base parameters."""
     source = _source(backend=backend, after_down=True, bias=True, dtype=dtype)
-    source.use_mxfp8 = use_mxfp8
     before = deepcopy(source.state_dict())
     wrapped = _wrap(source, lora_dtype=lora_dtype)
     assert wrapped.config is source.config
@@ -286,6 +285,29 @@ def test_wrapper_preserves_storage_flags_and_parameter_paths(backend, dtype, lor
     clone.load_state_dict(wrapped.state_dict(), strict=True)
     for name, value in clone.state_dict().items():
         torch.testing.assert_close(value, wrapped.state_dict()[name], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("expert_cls", [GroupedExperts, GroupedExpertsDeepEP])
+@pytest.mark.parametrize("entry", [_wrap, patch_moe_module])
+def test_mxfp8_expert_lora_rejected_before_source_mutation(expert_cls, entry):
+    """Unsupported MXFP8 must fail at construction, not silently run native GEMMs."""
+    config = _source(backend="loop", after_down=True, bias=True, dtype=torch.float32).config
+    source = expert_cls(config, backend=BackendConfig(experts="torch_mm_mxfp8", dispatcher="torch"))
+    with torch.no_grad():
+        for parameter in source.parameters():
+            parameter.fill_(0.125)
+    parameters_before = dict(source.named_parameters())
+    state_before = deepcopy(source.state_dict())
+
+    with pytest.raises(ValueError, match="Expert LoRA does not support.*torch_mm_mxfp8"):
+        entry(source)
+
+    assert source.use_mxfp8
+    assert set(dict(source.named_parameters())) == set(parameters_before)
+    for name, parameter in source.named_parameters():
+        assert parameter is parameters_before[name]
+        assert parameter.requires_grad
+        torch.testing.assert_close(parameter, state_before[name], rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("backend", ["loop", "deepep_torch"])

@@ -57,6 +57,8 @@ class GroupedExpertsLoRA(GroupedExperts):
     GroupedExperts + LoRA.
 
     This class wraps `GroupedExperts` to apply LoRA to the expert weights.
+    MXFP8 experts are rejected: the additive adapter GEMMs do not implement
+    that backend. Select ``experts="torch_mm"`` or ``experts="torch"`` explicitly.
 
     Attributes:
         lora_dim (int): Rank of the LoRA adapter.
@@ -68,6 +70,11 @@ class GroupedExpertsLoRA(GroupedExperts):
     """
 
     def __init__(self, orig_module: GroupedExperts, lora_dim=8, alpha=32, lora_A_init_method="xavier", lora_dtype=None):
+        if orig_module.use_mxfp8:
+            raise ValueError(
+                "Expert LoRA does not support experts='torch_mm_mxfp8'; "
+                "select experts='torch_mm' or experts='torch' explicitly."
+            )
         super().__init__(orig_module.config)
         self.to(device=orig_module.gate_and_up_projs.device, dtype=orig_module.gate_and_up_projs.dtype)
 
@@ -80,7 +87,6 @@ class GroupedExpertsLoRA(GroupedExperts):
 
         # Copy backend setting from original (super().__init__ defaults to False without backend)
         self.use_torch_mm = orig_module.use_torch_mm
-        self.use_mxfp8 = orig_module.use_mxfp8
 
         GroupedExpertsLoRA._init_adapter(
             self,
@@ -504,6 +510,8 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
     GroupedExpertsDeepEP + LoRA.
 
     This class wraps `GroupedExpertsDeepEP` to apply LoRA to the expert weights using DeepEP kernels.
+    MXFP8 experts are rejected because the additive adapter GEMMs do not
+    implement that backend. Select ``experts="torch_mm"`` explicitly.
 
     Attributes:
         lora_dim (int): Rank of the LoRA adapter.
@@ -517,6 +525,10 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
     def __init__(
         self, orig_module: GroupedExpertsDeepEP, lora_dim=8, alpha=32, lora_A_init_method="xavier", lora_dtype=None
     ):
+        if orig_module.use_mxfp8:
+            raise ValueError(
+                "Expert LoRA does not support experts='torch_mm_mxfp8'; select experts='torch_mm' explicitly."
+            )
         super().__init__(
             orig_module.config,
             dispatcher_backend=orig_module.dispatcher_backend,
@@ -538,7 +550,6 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         self.ep_size = getattr(orig_module, "ep_size", 1)
         self.ep_rank = getattr(orig_module, "ep_rank", 0)
         self.token_dispatcher = getattr(orig_module, "token_dispatcher", None)
-        self.use_mxfp8 = getattr(orig_module, "use_mxfp8", False)
 
         GroupedExpertsDeepEPLoRA._init_adapter(
             self,
