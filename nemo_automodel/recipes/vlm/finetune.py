@@ -871,6 +871,19 @@ class FinetuneRecipeForVLM(BaseRecipe):
         num_batches,
         is_train: bool = True,
     ):
+        """Run one local batch and accumulate its loss and optional gradients.
+
+        Args:
+            idx: Microbatch index in the accumulation window.
+            batch: Input mapping with token IDs, labels, and physical NEAT
+                document IDs of shape [batch, sequence]. NEAT attention metadata
+                is batch-major; legacy THD inputs are flattened by the sharder.
+                VLM media and position tensors retain the model's input layout.
+            loss_buffer: List receiving the detached scalar loss.
+            num_label_tokens: Global supervised-token count for loss normalization.
+            num_batches: Number of microbatches in the accumulation window.
+            is_train: Whether to backpropagate the combined main and MTP loss.
+        """
         batch = {k: _move_to_device(v, self.dist_env.device) for k, v in batch.items()}
 
         # Single CP dispatch (magi / model-owned / generic). The pre-embed hook is
@@ -949,6 +962,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 cp_sharder.shard_token_tensor(targets, seq_dim=1, fill=ignore_index)
                 for targets in mtp_cp_inputs.targets
             )
+        # Preserve physical NEAT document IDs before model-kwarg filtering. The
+        # loss needs these even when the forward does not accept packing metadata.
+        mtp_seq_idx = batch.get("_packed_seq_ids") if mtp_per_depth_targets is None else None
         labels = batch.pop("labels")
 
         if self.pp_enabled:
@@ -1038,6 +1054,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                         mtp_per_depth_h=mtp_per_depth_h,
                         mtp_per_depth_logits=mtp_per_depth_logits,
                         mtp_per_depth_targets=mtp_per_depth_targets,
+                        seq_idx=mtp_seq_idx,
                         labels=labels,
                         model=model,
                         scaling_factor=scaling_factor,

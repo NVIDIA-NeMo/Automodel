@@ -1207,6 +1207,18 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         num_batches,
         is_train: bool = True,
     ):
+        """Run one local batch and accumulate its loss and optional gradients.
+
+        Args:
+            idx: Microbatch index in the accumulation window.
+            batch: Input mapping with token IDs, labels, and physical NEAT
+                document IDs of shape [batch, sequence]. NEAT attention metadata
+                is batch-major; legacy THD inputs are flattened by the sharder.
+            loss_buffer: List receiving the detached scalar loss.
+            num_label_tokens: Global supervised-token count for loss normalization.
+            num_batches: Number of microbatches in the accumulation window.
+            is_train: Whether to backpropagate the combined main and MTP loss.
+        """
         # Move batch to device (handle both tensors and dicts of tensors like causal_mask_mapping)
         batch = {
             k: (
@@ -1250,6 +1262,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 cp_sharder.shard_token_tensor(targets, seq_dim=1, fill=ignore_index)
                 for targets in mtp_cp_inputs.targets
             )
+        # Preserve physical NEAT document IDs before model-kwarg filtering. The
+        # loss needs these even when the forward does not accept packing metadata.
+        mtp_seq_idx = batch.get("_packed_seq_ids") if mtp_per_depth_targets is None else None
         labels = batch.pop("labels")
         dataset_ids = batch.pop("dataset_id", None)
         loss_weights = None
@@ -1388,12 +1403,13 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         mtp_per_depth_h=mtp_per_depth_h,
                         mtp_per_depth_logits=mtp_per_depth_logits,
                         mtp_per_depth_targets=mtp_per_depth_targets,
+                        seq_idx=mtp_seq_idx,
                         labels=labels,
                         model=model,
                         scaling_factor=scaling_factor,
                         num_label_tokens=num_label_tokens,
                         ignore_index=ignore_index,
-                        # mask cross-boundary MTP label rolls in THD packing (matches the PP path)
+                        # NEAT uses physical document IDs; cu_seqlens is the legacy THD fallback.
                         cu_seqlens=(
                             None
                             if mtp_per_depth_targets is not None or "packed_token_indices" in batch

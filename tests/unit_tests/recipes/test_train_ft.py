@@ -3583,67 +3583,118 @@ def test_chunked_ce_gemma4_post_projection_contract(implementation, softcap):
         assert abs(raw_loss.item() - expected.item()) > 0.01
 
 
-@pytest.mark.parametrize("packing_format,batch_size", [("neat", 1), ("neat", 2), ("thd", 1)])
-def test_mtp_recipe_distinguishes_neat_metadata_from_thd_offsets(monkeypatch, packing_format, batch_size):
-    from contextlib import nullcontext
-    from types import SimpleNamespace
-
+@pytest.mark.parametrize("recipe_kind", ["llm", "vlm"])
+@pytest.mark.parametrize(
+    "packing_format,batch_size,filter_metadata",
+    [(fmt, size, filtered) for fmt in ("neat", "neat_varlen") for size in (1, 2) for filtered in (False, True)]
+    + [("thd", 1, False)],
+)
+def test_mtp_recipe_preserves_document_targets(recipe_kind, packing_format, batch_size, filter_metadata):
     from nemo_automodel.components.datasets.utils import neat_packed_collater
     from nemo_automodel.components.models.common.packing import PackingCapabilities
     from nemo_automodel.recipes.llm import train_ft
+    from nemo_automodel.recipes.vlm import finetune
 
     class Model(torch.nn.Module):
-        def forward(self, input_ids, **kwargs):
-            """Return base and MTP logits for the supplied token layout.
+        def __init__(self):
+            super().__init__()
+            self.logits = torch.nn.Parameter(torch.randn(3, batch_size, 8, 16))
+
+        def forward(self, input_ids: torch.Tensor) -> SimpleNamespace:
+            """Return differentiable base and two-depth MTP logits.
 
             Args:
-                input_ids: Tokens of shape [batch, sequence].
-                **kwargs: Unused collated mask and metadata fields.
+                input_ids: Packed tokens of shape [batch, sequence].
 
             Returns:
-                Base logits and one MTP logit tensor of shape [batch, sequence, 8].
+                Base logits and two MTP logits, each [batch, sequence, vocab].
             """
-            logits = torch.zeros(*input_ids.shape, 8)
-            return SimpleNamespace(logits=logits, mtp_per_depth_logits=[logits], mtp_loss_scaling_factor=1.0)
+            assert input_ids.shape == self.logits.shape[1:3]
+            return SimpleNamespace(
+                logits=self.logits[0], mtp_per_depth_logits=list(self.logits[1:]), mtp_loss_scaling_factor=0.3
+            )
 
-    recipe = object.__new__(train_ft.TrainFinetuneRecipeForNextTokenPrediction)
-    recipe.cfg = SimpleNamespace(mtp=SimpleNamespace(scaling_factor=1.0))
+    class MetadataModel(Model):
+        def forward(self, input_ids: torch.Tensor, **kwargs: object) -> SimpleNamespace:
+            """Accept collator metadata as a production packing-aware model would.
+
+            Args:
+                input_ids: Packed tokens of shape [batch, sequence].
+                **kwargs: Collator metadata including document IDs [batch, sequence]
+                    and a block-causal attention mask [batch, 1, sequence, sequence].
+
+            Returns:
+                Base logits and two MTP logits, each [batch, sequence, vocab].
+            """
+            return super().forward(input_ids)
+
+    torch.manual_seed(3734)
+    model = Model() if filter_metadata else MetadataModel()
+    cls = train_ft.TrainFinetuneRecipeForNextTokenPrediction if recipe_kind == "llm" else finetune.FinetuneRecipeForVLM
+    recipe = object.__new__(cls)
+    recipe.cfg = SimpleNamespace(mtp=SimpleNamespace(scaling_factor=None))
     recipe.dist_env = SimpleNamespace(device="cpu")
     recipe.device_mesh = None
     recipe.pp_enabled = False
     recipe.tokenizer = None
     recipe.te_fp8 = None
-    recipe.model_parts = [Model()]
-    recipe.loss_fn = object()
+    recipe.domain_mixture = None
+    recipe.distributed_config = None
+    recipe.step_scheduler = SimpleNamespace(is_remote_logging_step=False)
+    recipe.model_parts = [model]
+    recipe.loss_fn = MaskedCrossEntropy()
     recipe._get_cp_group_size = lambda: 1
     recipe._get_dp_group_size = lambda **kwargs: 1
-    sample = dict(
-        input_ids=[1, 2, 3, 4, 0],
-        labels=[2, -100, 4, -100, -100],
-        position_ids=[0, 1, 0, 1, 0],
-        attention_mask=[1, 1, 2, 2, 0],
-    )
+    recipe._get_dp_group = lambda **kwargs: None
+    # Row 1 is Yuhe's two three-token documents. Row 2 adds unequal lengths,
+    # an internal padding slot, and document IDs restarting in the next row.
+    samples = [
+        dict(
+            input_ids=[1, 2, 3, 4, 5, 6, 0, 0],
+            labels=[2, 3, -100, 5, 6, -100, -100, -100],
+            position_ids=[0, 1, 2, 0, 1, 2, 0, 0],
+            attention_mask=[1, 1, 1, 2, 2, 2, 0, 0],
+        ),
+        dict(
+            input_ids=[7, 8, 9, 10, 0, 11, 12, 13],
+            labels=[8, 9, 10, -100, -100, 12, 13, -100],
+            position_ids=[0, 1, 2, 3, 0, 0, 1, 2],
+            attention_mask=[1, 1, 1, 1, 0, 2, 2, 2],
+        ),
+    ][:batch_size]
     batch = neat_packed_collater(
-        [sample] * batch_size, packing=PackingCapabilities("block_causal", requires_packed_sequence_metadata=True)
+        samples,
+        packing=PackingCapabilities("block_causal", requires_packed_sequence_metadata=packing_format == "neat_varlen"),
     )
     if packing_format == "thd":
-        batch.pop("packed_token_indices")
-        batch["cu_seqlens"] = torch.tensor([0, 2, 4, 5])
-    expected = None if packing_format == "neat" else batch["cu_seqlens"]
-    captured = {}
-
-    def mtp_loss(*args, **kwargs):
-        captured.update(kwargs)
-        return torch.tensor(0.0)
-
-    monkeypatch.setattr(
-        train_ft,
-        "ContextParallelSharder",
-        lambda *args, **kwargs: SimpleNamespace(shard=lambda actual: (nullcontext, actual)),
-    )
-    monkeypatch.setattr(train_ft, "calculate_loss", lambda *args, **kwargs: torch.tensor(0.0))
-    monkeypatch.setattr(train_ft, "calculate_mtp_loss", mtp_loss)
+        # Exercise the legacy physical-offset fallback without NEAT document IDs.
+        batch.pop("_packed_seq_ids")
+        batch["cu_seqlens"] = torch.tensor([0, 3, 6, 8], dtype=torch.int32)
+    labels = batch["labels"].clone()
+    num_tokens = int((labels != -100).sum())
+    # Explicit document-isolated targets are independent of the production
+    # rolling/masking implementation, including the all-ignored depth in row 1.
+    targets = [
+        labels,
+        torch.tensor([[3, -100, -100, 6, -100, -100, -100, -100], [9, 10, -100, -100, -100, 13, -100, -100]])[
+            :batch_size
+        ],
+        torch.tensor(
+            [[-100, -100, -100, -100, -100, -100, -100, -100], [10, -100, -100, -100, -100, -100, -100, -100]]
+        )[:batch_size],
+    ]
+    reference_logits = model.logits.detach().clone().requires_grad_()
+    reference_losses = [
+        torch.nn.functional.cross_entropy(logits.flatten(0, 1), target.flatten(), reduction="sum") / num_tokens
+        for logits, target in zip(reference_logits, targets)
+    ]
+    expected = reference_losses[0] + 0.15 * (reference_losses[1] + reference_losses[2])
+    expected.backward()
+    losses = []
     recipe._forward_backward_step(
-        0, batch, loss_buffer=[], num_label_tokens=2 * batch_size, num_batches=1, is_train=False
+        0, batch, loss_buffer=losses, num_label_tokens=num_tokens, num_batches=1, is_train=True
     )
-    assert captured["cu_seqlens"] is expected
+    torch.testing.assert_close(losses[0], expected.detach())
+    torch.testing.assert_close(model.logits.grad, reference_logits.grad)
+    # The last token of document A must receive no cross-document MTP gradient.
+    assert torch.count_nonzero(model.logits.grad[1:, 0, 2]) == 0
