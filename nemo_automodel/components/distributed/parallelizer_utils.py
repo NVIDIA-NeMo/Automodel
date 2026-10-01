@@ -17,9 +17,21 @@
 import warnings
 
 from nemo_automodel.components.distributed.fsdp2_extensions.utils import (
+    UniformSubtreeItem as UniformSubtreeItem,
+)
+from nemo_automodel.components.distributed.fsdp2_extensions.utils import (
+    configure_fsdp_unused_param_reduction as configure_fsdp_unused_param_reduction,
+)
+from nemo_automodel.components.distributed.fsdp2_extensions.utils import (
     fully_shard_by_dtype,
     reject_unsupported_mtp_cp,
     reject_unsupported_mtp_cp_pp,
+)
+from nemo_automodel.components.distributed.fsdp2_extensions.utils import (
+    get_internal_fsdp_mp_policy as get_internal_fsdp_mp_policy,
+)
+from nemo_automodel.components.distributed.fsdp2_extensions.utils import (
+    iter_maximal_uniform_dtype_subtrees as iter_maximal_uniform_dtype_subtrees,
 )
 
 warnings.warn(

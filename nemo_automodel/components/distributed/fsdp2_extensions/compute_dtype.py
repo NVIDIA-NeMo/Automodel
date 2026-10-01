@@ -232,6 +232,15 @@ def _install_per_param_compute_dtypes(
         if not _overrides_unit_policy(fsdp_param.sharded_param.dtype, compute_dtype, mp_policy):
             continue
         local_tensor = fsdp_param._sharded_local_tensor
+        if (
+            getattr(local_tensor, "_compute_dtype", None) is compute_dtype
+            and getattr(getattr(local_tensor, "fsdp_pre_all_gather", None), "__func__", None)
+            is _fsdp_pre_all_gather_in_compute_dtype
+        ):
+            # A sibling may already have prefetched this parameter. Preserve
+            # its in-flight extension metadata rather than resetting it.
+            installed += 1
+            continue
         local_tensor._compute_dtype = compute_dtype
         local_tensor.fsdp_pre_all_gather = MethodType(_fsdp_pre_all_gather_in_compute_dtype, local_tensor)
         local_tensor.fsdp_post_all_gather = MethodType(_fsdp_post_all_gather_in_compute_dtype, local_tensor)
@@ -254,7 +263,8 @@ def _fully_shard_with_plan(
     ``fully_shard_kwargs`` (mesh, offload and reshard policies) pass straight to
     ``fully_shard_fn``. The extensions live on the sharded local tensors, which
     checkpoint loading may replace, so they are reinstalled from a
-    ``load_state_dict`` post-hook.
+    ``load_state_dict`` post-hook. Group lazy initialization also restores meta
+    replacements before the root can start forward prefetch.
     """
     compute_dtypes = {key: compute_dtype for key, (_, compute_dtype) in plan.items()}
     wrapped = fully_shard_fn(module, mp_policy=mp_policy, ignored_params=ignored_params or None, **fully_shard_kwargs)
@@ -266,14 +276,18 @@ def _fully_shard_with_plan(
 
     install_extensions()
 
-    # Meta initialization replaces the shard tensor without loading a state
-    # dict. Reinstall before FSDP's first lazy initialization, after those
-    # replacements have completed.
-    def install_after_materialization(_module: nn.Module, _inputs: tuple) -> None:
-        install_extensions()
-        materialization_hook.remove()
+    # Root lazy init visits every group before any forward prefetch/unshard.
+    # Restore replaced meta shards there, before siblings can gather them.
+    param_group = module._get_fsdp_state()._fsdp_param_group
+    if param_group is not None:
+        original_lazy_init = param_group.lazy_init
 
-    materialization_hook = module.register_forward_pre_hook(install_after_materialization, prepend=True)
+        def lazy_init_with_compute_extensions() -> None:
+            """Restore extensions after group initialization, before any unshard."""
+            original_lazy_init()
+            install_extensions()
+
+        param_group.lazy_init = lazy_init_with_compute_extensions
     module.register_load_state_dict_post_hook(install_extensions)
     return wrapped
 

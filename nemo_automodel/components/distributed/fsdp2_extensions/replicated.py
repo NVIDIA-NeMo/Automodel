@@ -362,6 +362,13 @@ def make_fully_shard_with_replicated_parameter_grad_sync(
 
     @torch.no_grad()
     def initialize_replicated_parameters(module: nn.Module, _inputs: tuple) -> None:
+        """Align materialized replicas before the first root forward.
+
+        Args:
+            module: Root module; parameter slots resolve their current tensors.
+            _inputs: Unused forward-argument tuple containing tensors of arbitrary
+                shape/layout. Its elements are not read or mutated.
+        """
         # Sharding precedes meta materialization and rank-seeded initialization.
         # Resolve the final tensors at first forward and align every replica,
         # including frozen holders, across each orthogonal DP dimension.

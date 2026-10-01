@@ -950,6 +950,7 @@ def test_per_param_compute_casting_keeps_one_fsdp_owner(monkeypatch):
 
     mixer = Mixer()
     mixer.projection.weight._hf_compute_dtype = torch.float16
+    mixer._get_fsdp_state = lambda: SimpleNamespace(_fsdp_param_group=SimpleNamespace(lazy_init=lambda: None))
     fully_shard_calls = []
     installed_mappings = []
     reduce_patch_calls = []
@@ -1528,5 +1529,15 @@ def test_deprecated_public_import_paths_preserve_exports(old_name, new_name):
     with pytest.warns(DeprecationWarning, match="moved to distributed.fsdp2_extensions"):
         compatibility = importlib.import_module(old_path)
     canonical = importlib.import_module(f"nemo_automodel.components.distributed.fsdp2_extensions.{new_name}")
-    for name in compatibility.__all__:
+    explicit_exports = (
+        [
+            "UniformSubtreeItem",
+            "configure_fsdp_unused_param_reduction",
+            "get_internal_fsdp_mp_policy",
+            "iter_maximal_uniform_dtype_subtrees",
+        ]
+        if old_name == "parallelizer_utils"
+        else []
+    )
+    for name in [*compatibility.__all__, *explicit_exports]:
         assert getattr(compatibility, name) is getattr(canonical, name)

@@ -913,6 +913,9 @@ def _factory_accepts_foreach(factory: Callable[..., Any]) -> bool:
 
     ``torch.optim`` optimizers take ``foreach``; external factories such as TE
     ``FusedAdam`` do not, so passing it would raise ``TypeError``.
+    ``**kwargs`` wrappers retain the standard torch-factory contract. A wrapper
+    around a constructor without ``foreach`` must consume the keyword or expose
+    that constructor directly (possibly through ``functools.partial``).
     """
     try:
         sig = inspect.signature(factory)

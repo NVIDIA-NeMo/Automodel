@@ -22,6 +22,7 @@ Usage:
 
 from __future__ import annotations
 
+import copy
 import os
 import tempfile
 from collections import Counter
@@ -155,14 +156,23 @@ class _Root(nn.Module):
 class _SidecarRoot(nn.Module):
     """Root exposing the layer structure consumed by the model-owned sidecar."""
 
-    def __init__(self, layer: nn.Module):
+    def __init__(self, layer: nn.Module, second_layer: nn.Module | None = None):
         super().__init__()
-        self.layers = nn.ModuleList([layer])
+        self.layers = nn.ModuleList([layer] if second_layer is None else [layer, second_layer])
         self.config = SimpleNamespace(num_attention_heads=8, num_key_value_heads=8, hidden_size=8)
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        """Map BF16 inputs of shape ``[batch, 8]`` to FP32 outputs of the same shape."""
-        return self.layers[0](inputs)
+        """Run the layer sequence with explicit casts at each compute boundary.
+
+        Args:
+            inputs: Tensor of shape ``[batch, hidden]`` in BF16.
+
+        Returns:
+            Tensor of shape ``[batch, hidden]`` in FP32.
+        """
+        for layer in self.layers:
+            inputs = layer(inputs.to(layer.compute_dtype))
+        return inputs
 
 
 @dataclass(frozen=True)
@@ -182,6 +192,8 @@ class _Scenario:
     model_sidecar: bool = False
     clip: bool = False
     materialize_after_shard: bool = False
+    prefetch: bool = False
+    freeze_dt_bias: bool = False
 
 
 def _input_for_rank(
@@ -217,12 +229,16 @@ def _run_scenario(
         )
     if not scenario.materialize_after_shard:
         layer.load_state_dict(reference_layer.state_dict())
+    if scenario.freeze_dt_bias:
+        layer._fp32_params.dt_bias.requires_grad_(False)
+        reference_layer._fp32_params.dt_bias.requires_grad_(False)
     if scenario.activation_checkpointing:
         layer._fp32_params = checkpoint_wrapper(layer._fp32_params)
     reference = _Root(reference_layer) if scenario.root_boundary else reference_layer
     model = _Root(layer) if scenario.root_boundary else layer
     if scenario.model_sidecar:
-        reference, model = _SidecarRoot(reference_layer), _SidecarRoot(layer)
+        reference = _SidecarRoot(reference_layer, copy.deepcopy(reference_layer) if scenario.prefetch else None)
+        model = _SidecarRoot(layer, copy.deepcopy(layer) if scenario.prefetch else None)
 
     replicated_params = replicated_parameters(
         select_small_fp32_parameters(
@@ -268,6 +284,10 @@ def _run_scenario(
                 ignored_params=set(replicated_params),
                 fully_shard_fn=fully_shard_fn,
             )
+    if scenario.prefetch:
+        prefetched = model.layers[0]._get_fsdp_state()._states_to_forward_prefetch
+        if model.layers[1]._get_fsdp_state() not in prefetched:
+            raise AssertionError(f"{scenario.name}: second layer was not configured as a forward-prefetch target")
     fsdp_units = [module for module in model.modules() if isinstance(module, FSDPModule)]
     if len(fsdp_units) != scenario.expected_fsdp_units:
         raise AssertionError(
@@ -373,6 +393,11 @@ def _run_scenario(
         reference_layer.use_conditional = scenario.rank_asymmetric_use and rank == 0
         inputs = _input_for_rank(rank, 0, device, scenario.compute_dtype)
         torch.testing.assert_close(model(inputs), reference(inputs), rtol=0, atol=0)
+    if scenario.freeze_dt_bias:
+        reference_params = dict(reference.named_parameters())
+        for name, parameter in model.named_parameters():
+            if name.endswith("_fp32_params.dt_bias"):
+                torch.testing.assert_close(parameter, reference_params[name], rtol=0, atol=0)
     nccl_kernel_counts = Counter()
     dist.barrier()
     torch.cuda.synchronize(device)
@@ -545,8 +570,24 @@ def main() -> None:
             model_sidecar=True,
             clip=True,
             materialize_after_shard=True,
+            freeze_dt_bias=limit == 64,
         )
         for limit in (64, 0)
+    )
+    scenarios.extend(
+        _Scenario(
+            f"sidecar-prefetch-{'meta' if materialize else 'eager'}",
+            torch.float32,
+            torch.bfloat16,
+            0,
+            3,
+            accumulation_steps=2,
+            model_sidecar=True,
+            clip=True,
+            materialize_after_shard=materialize,
+            prefetch=True,
+        )
+        for materialize in (False, True)
     )
     if os.getenv("RUN_TE_FSDP_CASE") == "1":
         scenarios.append(_Scenario("D3-te-master", torch.bfloat16, torch.bfloat16, 64, 1, te_optimizer=True))
