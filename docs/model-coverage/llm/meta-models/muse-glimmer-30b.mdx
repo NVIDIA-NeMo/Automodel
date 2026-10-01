@@ -1,5 +1,5 @@
 ---
-title: "Muse-Glimmer-30B"
+title: "meta-models/Muse-Glimmer-30B"
 description: "Use NeMo AutoModel to fine-tune Muse-Glimmer-30B for LLM workflows with checked-in text generation recipes and documented distributed settings."
 slug: model-coverage/large-language-models/meta-models/Muse-Glimmer-30B
 ---
@@ -8,8 +8,6 @@ slug: model-coverage/large-language-models/meta-models/Muse-Glimmer-30B
 The Hugging Face configuration declares the `MuseGlimmerForConditionalGeneration` architecture.
 
 ## Quick Start
-
-### Fine-Tune Muse-Glimmer-30B
 
 Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
 
@@ -28,6 +26,18 @@ automodel \
 
 ## Model Context
 
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| Architecture | `MuseGlimmerForConditionalGeneration` |
+| Parameters | 29.78B checkpoint parameters |
+| Decoder Layers | 52 |
+| Hidden Size | 6,656 |
+| Attention | 32 attention heads / 2 key-value heads |
+| Context Length | 131,072 tokens (checkpoint configuration) |
+| Vocabulary Size | 202,048 |
+| Configured Dtype | `bfloat16` |
+
 ### Configuration
 
 | Setting | Configuration |
@@ -38,16 +48,7 @@ automodel \
 | Features | Activation checkpointing (activation_checkpointing=true), Packed sequences (packed_sequence_size=16384), Transformer Engine |
 | Advanced | bfloat16, attention=te, sequence length 1024 |
 
-## Model Reference
-
-### Model Architecture
-
-| Property | Value |
-| --- | --- |
-| Task | Text generation |
-| Architecture | `MuseGlimmerForConditionalGeneration` |
-
-### Available Models
+## Available Models
 
 - [`meta-models/Muse-Glimmer-30B`](https://huggingface.co/meta-models/Muse-Glimmer-30B)
 
@@ -59,3 +60,5 @@ automodel \
 ## Related Resources
 
 - [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/meta-models/Muse-Glimmer-30B/blob/a4e59da52a7bc87ae7251dd5545c0dd437c44b68/config.json)

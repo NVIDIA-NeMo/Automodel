@@ -1,0 +1,86 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# LoRA fine-tuning example; validate training and memory on your hardware.
+# Run from the repository root:
+#   uv run automodel examples/vlm_finetune/meta_llama/llama_4_scout_17b_16e_instruct_medpix_peft.yaml --nproc-per-node 8
+# Checkpoint configuration inspected at Hugging Face revision: 92f3b1597a195b523d8d9e5700e57e4fbb8f20d3
+
+recipe: FinetuneRecipeForVLM
+step_scheduler:
+  global_batch_size: 8
+  local_batch_size: 1
+  ckpt_every_steps: 50
+  val_every_steps: 50
+  max_steps: 100
+dist_env:
+  backend: nccl
+  timeout_minutes: 10
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 42
+  ranked: true
+model:
+  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
+  pretrained_model_name_or_path: meta-llama/Llama-4-Scout-17B-16E-Instruct
+  use_liger_kernel: false
+  attn_implementation: eager
+  trust_remote_code: false
+  dtype: bfloat16
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  match_all_linear: false
+  exclude_modules:
+  - "*router*"
+  - "*.gate"
+  - '*vision_tower*'
+  - '*vision*'
+  - '*visual*'
+  - '*image_encoder*'
+  - '*lm_head*'
+  dim: 8
+  alpha: 32
+  use_triton: false
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints/llama_4_scout_17b_16e_instruct
+  model_save_format: safetensors
+  save_consolidated: false
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 1
+  cp_size: 1
+  sequence_parallel: false
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
+  path_or_dataset: mmoukouba/MedPix-VQA
+  split: train[:1000]
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 0
+  pin_memory: true
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
+  path_or_dataset: mmoukouba/MedPix-VQA
+  split: validation[:100]
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn
+optimizer:
+  _target_: torch.optim.Adam
+  lr: 1e-5
+  weight_decay: 0.01
+  betas:
+  - 0.9
+  - 0.95
+freeze_config:
+  freeze_vision_tower: true
+  freeze_language_model: false
+ci:
+  recipe_owner: akoumpa

@@ -1,5 +1,5 @@
 ---
-title: "Mistral-Medium-3.5-128B"
+title: "mistralai/Mistral-Medium-3.5-128B"
 description: "Use NeMo AutoModel to fine-tune Mistral-Medium-3.5-128B for VLM workflows with checked-in image-text-to-text recipes and documented distributed settings."
 slug: model-coverage/vision-language-models/mistralai/Mistral-Medium-3.5-128B
 ---
@@ -9,21 +9,35 @@ The Hugging Face configuration declares the `Mistral3ForConditionalGeneration` a
 
 ## Quick Start
 
-### Fine-Tune Mistral-Medium-3.5-128B
+Follow the [installation instructions](/get-started/installation). Allocate 8 nodes with 8 GPUs each; run on every node with `NODE_RANK` and `MASTER_ADDR` set. Complete the [recipe setup](#recipe-setup) before launching.
 
-Follow the [installation instructions](/get-started/installation), then review the checked-in recipe and
-its declared topology below before choosing a local or cluster launcher.
-
-Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node run.
+```bash
+uv run torchrun --nnodes 8 --nproc-per-node 8 \
+  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
+  -m nemo_automodel.cli.app examples/vlm_finetune/mistral3p5/mistral3p5_128b_medpix.yaml
+```
 
 ## Choose a Workflow
 
 | Goal | Start Here |
 | --- | --- |
-| Run the primary recipe for this model | Use the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mistral3p5/mistral3p5_128b_medpix.yaml). |
+| Fine-tune mistralai/Mistral-Medium-3.5-128B | [mistral3p5_128b_medpix.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mistral3p5/mistral3p5_128b_medpix.yaml). 8 nodes, 8 GPUs per node; see [Recipe Setup](#recipe-setup). |
 | Try another checked-in recipe for this model | Use the [alternate recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mistral3p5/mistral3p5_128b_medpix_lora.yaml). |
 
 ## Model Context
+
+| Property | Value |
+| --- | --- |
+| Task | Image-text-to-text |
+| Architecture | `Mistral3ForConditionalGeneration` |
+| NeMo AutoModel FP8 Architecture | `Mistral3FP8VLMForConditionalGeneration` |
+| Parameters | 127.70B checkpoint parameters |
+| Decoder Layers | 88 |
+| Hidden Size | 12,288 |
+| Attention | 96 attention heads / 8 key-value heads |
+| Context Length | 262,144 tokens (checkpoint configuration) |
+| Vocabulary Size | 131,072 |
+| Configured Dtype | `bfloat16` |
 
 ### Configuration
 
@@ -39,17 +53,18 @@ Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node 
 
 - [`mistral3p5_128b_medpix_lora.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mistral3p5/mistral3p5_128b_medpix_lora.yaml)
 
-## Model Reference
+### Setup and Additional Examples
 
-### Model Architecture
+Follow the [installation instructions](/get-started/installation), then review the checked-in recipe and
+its declared topology below before choosing a local or cluster launcher.
 
-| Property | Value |
-| --- | --- |
-| Task | Image-text-to-text |
-| Architecture | `Mistral3ForConditionalGeneration` |
-| NeMo AutoModel FP8 Architecture | `Mistral3FP8VLMForConditionalGeneration` |
+Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node run.
 
-### Available Models
+### Recipe Setup
+
+Read [mistral3p5_128b_medpix.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mistral3p5/mistral3p5_128b_medpix.yaml) for checkpoint access, data paths, and backend dependencies. Use the [Slurm launcher guide](/job-launchers/slurm-cluster) to prepare the distributed allocation.
+
+## Available Models
 
 - [`mistralai/Mistral-Medium-3.5-128B`](https://huggingface.co/mistralai/Mistral-Medium-3.5-128B)
 
@@ -61,3 +76,5 @@ Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node 
 ## Related Resources
 
 - [Vision-language model fine-tuning guide](/recipes-e2e-examples/gemma-3-3n)
+
+- [Checkpoint Configuration](https://huggingface.co/mistralai/Mistral-Medium-3.5-128B/blob/22b2b868a15677cfa6061277ed2f653d1349a9ab/config.json)

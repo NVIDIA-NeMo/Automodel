@@ -1,5 +1,5 @@
 ---
-title: "Qwen3-Omni-30B-A3B-Instruct"
+title: "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 description: "Use Qwen3-Omni-30B-A3B-Instruct with NeMo AutoModel for multimodal fine-tuning, with documented checkpoints, runnable recipes, setup, and model reference details."
 slug: model-coverage/omni/qwen/Qwen3-Omni-30B-A3B-Instruct
 ---
@@ -9,8 +9,6 @@ slug: model-coverage/omni/qwen/Qwen3-Omni-30B-A3B-Instruct
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
 ## Quick Start
-
-### Fine-Tune Qwen3-Omni-30B-A3B-Instruct
 
 From the repository root, run:
 
@@ -28,23 +26,26 @@ uv run automodel --nproc-per-node=8 examples/vlm_finetune/qwen3/qwen3_omni_moe_3
 
 ## Model Context
 
-### Fine-Tuning
-
-See the [VLM / Omni Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n) and
-[Qwen3-Omni ASR Fine-Tuning Guide](/recipes-e2e-examples/qwen3-omni-asr).
-
-## Model Reference
-
-### Model Architecture
-
 | Property | Value |
 | --- | --- |
 | Task | Omnimodal (Text/Image/Audio/Video) |
 | Architecture | `Qwen3OmniForConditionalGeneration` |
 | Parameters | 30B total / 3B active |
 | Hugging Face Organization | [Qwen](https://huggingface.co/Qwen) |
+| Decoder Layers | 48 |
+| Hidden Size | 2,048 |
+| Attention | 32 attention heads / 4 key-value heads |
+| Context Length | 65,536 tokens (checkpoint configuration) |
+| Vocabulary Size | 152,064 |
+| Experts | 128 routed / 8 selected per token |
+| Configured Dtype | `bfloat16` |
 
-### Available Models
+### Fine-Tuning
+
+See the [VLM / Omni Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n) and
+[Qwen3-Omni ASR Fine-Tuning Guide](/recipes-e2e-examples/qwen3-omni-asr).
+
+## Available Models
 
 | Model | HF ID |
 |---|---|
@@ -53,3 +54,5 @@ See the [VLM / Omni Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n) and
 ## Related Resources
 
 - [VLM Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n)
+
+- [Checkpoint Configuration](https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct/blob/26291f793822fb6be9555850f06dfe95f2d7e695/config.json)

@@ -1,5 +1,5 @@
 ---
-title: "Ling-1T"
+title: "inclusionAI/Ling-1T"
 description: "Use NeMo AutoModel to fine-tune Ling-1T for LLM workflows with checked-in text generation recipes and documented distributed settings."
 slug: model-coverage/large-language-models/inclusionai/Ling-1T
 ---
@@ -9,15 +9,13 @@ The Hugging Face configuration declares the `BailingMoeV2ForCausalLM` architectu
 
 ## Quick Start
 
-### Fine-Tune Ling-1T
-
-Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+Allocate 32 nodes with 8 GPUs each. Set `NODE_RANK` and `MASTER_ADDR` on every node; complete the recipe prerequisites in Model Context before launching.
 
 ```bash
-automodel examples/llm_finetune/ling/ling_1t_sft.yaml --nproc-per-node 8
+uv run torchrun --nnodes 32 --nproc-per-node 8 \
+  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
+  -m nemo_automodel.cli.app examples/llm_finetune/ling/ling_1t_sft.yaml
 ```
-
-Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node run.
 
 ## Choose a Workflow
 
@@ -27,6 +25,19 @@ Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node 
 | Try another checked-in recipe for this model | Use the [alternate recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/ling/ling_1t_lora_pp.yaml). |
 
 ## Model Context
+
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| Architecture | `BailingMoeV2ForCausalLM` |
+| Parameters | 999.71B checkpoint parameters |
+| Decoder Layers | 80 |
+| Hidden Size | 8,192 |
+| Attention | 64 attention heads / 8 key-value heads |
+| Context Length | 32,768 tokens (checkpoint configuration) |
+| Vocabulary Size | 157,184 |
+| Experts | 256 routed / 1 shared / 8 selected per token |
+| Configured Dtype | `bfloat16` |
 
 ### Configuration
 
@@ -42,16 +53,7 @@ Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node 
 
 - [`ling_1t_lora_pp.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/ling/ling_1t_lora_pp.yaml)
 
-## Model Reference
-
-### Model Architecture
-
-| Property | Value |
-| --- | --- |
-| Task | Text generation |
-| Architecture | `BailingMoeV2ForCausalLM` |
-
-### Available Models
+## Available Models
 
 - [`inclusionAI/Ling-1T`](https://huggingface.co/inclusionAI/Ling-1T)
 
@@ -63,3 +65,5 @@ Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node 
 ## Related Resources
 
 - [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/inclusionAI/Ling-1T/blob/9fd8c406bbd60bdad34dcd8be6af6f1896d7e8da/config.json)

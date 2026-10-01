@@ -1,5 +1,5 @@
 ---
-title: "FLUX.2-dev"
+title: "black-forest-labs/FLUX.2-dev"
 description: "Fine-tune FLUX.2-dev for text-to-image generation with NeMo AutoModel using checked-in full-parameter and LoRA flow-matching recipes."
 slug: model-coverage/diffusion/black-forest-labs/FLUX.2-dev
 ---
@@ -9,8 +9,6 @@ slug: model-coverage/diffusion/black-forest-labs/FLUX.2-dev
 NeMo AutoModel includes full-parameter and Low-Rank Adaptation (LoRA) text-to-image fine-tuning recipes for this checkpoint.
 
 ## Quick Start
-
-### Fine-Tune FLUX.2-dev
 
 From the repository root, run:
 
@@ -28,16 +26,9 @@ uv run torchrun --nproc-per-node=8 examples/diffusion/finetune/finetune.py \
 
 ## Model Context
 
-### Recipe Notes
-
-See the [Diffusion Fine-Tuning Guide](/recipes-e2e-examples/diffusion-fine-tuning).
-
-## Model Reference
-
-### Model Architecture
-
 | Property | Value |
 |---|---|
+| Task | Diffusion Generation |
 | Upstream Tasks | Text-to-image generation; single- and multi-reference image editing |
 | Model Type | Rectified flow transformer |
 | Parameters | 32B |
@@ -52,9 +43,14 @@ See the [Diffusion Fine-Tuning Guide](/recipes-e2e-examples/diffusion-fine-tunin
 | Position Axes | 4 axes with 32 dimensions each |
 | Rotary Position Embedding Theta | 2,000 |
 | Guidance | Guidance-distilled with guidance embedding enabled |
-| Weight Dtype | `BF16` |
+| Configured Dtype | `BF16` |
+| Architecture | `Flux2` |
 
-### Available Models
+### Recipe Notes
+
+See the [Diffusion Fine-Tuning Guide](/recipes-e2e-examples/diffusion-fine-tuning).
+
+## Available Models
 
 | Checkpoint | Type |
 | --- | --- |

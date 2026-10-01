@@ -1,6 +1,6 @@
 ---
-title: "OLMo2-7B-1124"
-description: "Reference OLMo2-7B-1124 checkpoint and architecture details for NeMo AutoModel, with model-family information, setup guidance, and upstream resources."
+title: "allenai/OLMo2-7B-1124"
+description: "Fine-tune allenai/OLMo2-7B-1124 with NeMo AutoModel using a checked-in LoRA recipe, with checkpoint and architecture details."
 slug: model-coverage/large-language-models/allenai/OLMo2-7B-1124
 ---
 
@@ -10,22 +10,19 @@ Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com
 
 ## Quick Start
 
-This page provides checkpoint and architecture reference information rather
-than a model-specific launch command. Follow the
-[installation instructions](/get-started/installation) to set up NeMo AutoModel.
+Follow the [installation instructions](/get-started/installation). From the repository root, use 8 GPUs. This is an example configuration; GPU training and memory use still require validation.
+
+```bash
+uv run automodel examples/llm_finetune/allenai/olmo2_7b_1124_squad_peft.yaml --nproc-per-node 8
+```
 
 ## Choose a Workflow
 
 | Goal | Start Here |
 | --- | --- |
-| Explore checkpoints | See [Available Models](#available-models). |
-| Configure NeMo AutoModel | Follow the [installation instructions](/get-started/installation). |
+| Fine-tune allenai/OLMo2-7B-1124 | [olmo2_7b_1124_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/allenai/olmo2_7b_1124_squad_peft.yaml). Example LoRA configuration; validate GPU training. |
 
 ## Model Context
-
-## Model Reference
-
-### Model Architecture
 
 | Property | Value |
 | --- | --- |
@@ -33,8 +30,18 @@ than a model-specific launch command. Follow the
 | Architecture | `OLMo2ForCausalLM` |
 | Parameters | 7B |
 | Hugging Face Organization | [allenai](https://huggingface.co/allenai) |
+| Decoder Layers | 32 |
+| Hidden Size | 4,096 |
+| Attention | 32 attention heads / 32 key-value heads |
+| Context Length | 4,096 tokens (checkpoint configuration) |
+| Vocabulary Size | 100,352 |
+| Configured Dtype | `float32` |
 
-### Available Models
+### Recipe Setup
+
+Read [olmo2_7b_1124_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/allenai/olmo2_7b_1124_squad_peft.yaml) for checkpoint access, data paths, and backend dependencies. It provides a small LoRA fine-tuning example.
+
+## Available Models
 
 | Model | HF ID |
 |---|---|
@@ -43,3 +50,5 @@ than a model-specific launch command. Follow the
 ## Related Resources
 
 - [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/allenai/OLMo2-7B-1124/blob/7df9a82518afdecae4e8c026b27adccc8c1f0032/config.json)

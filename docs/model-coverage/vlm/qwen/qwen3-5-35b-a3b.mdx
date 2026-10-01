@@ -1,5 +1,5 @@
 ---
-title: "Qwen3.5-35B-A3B"
+title: "Qwen/Qwen3.5-35B-A3B"
 description: "Use NeMo AutoModel to fine-tune Qwen3.5-35B-A3B for VLM workflows with checked-in image-text-to-text recipes and documented distributed settings."
 slug: model-coverage/vision-language-models/qwen/Qwen3.5-35B-A3B
 ---
@@ -8,8 +8,6 @@ slug: model-coverage/vision-language-models/qwen/Qwen3.5-35B-A3B
 The Hugging Face configuration declares the `Qwen3_5MoeForConditionalGeneration` architecture.
 
 ## Quick Start
-
-### Fine-Tune Qwen3.5-35B-A3B
 
 Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
 
@@ -26,6 +24,18 @@ automodel examples/vlm_finetune/qwen3_5_moe/qwen3_5_35b.yaml --nproc-per-node 8
 
 ## Model Context
 
+| Property | Value |
+| --- | --- |
+| Task | Image-text-to-text |
+| Architecture | `Qwen3_5MoeForConditionalGeneration` |
+| Parameters | 35.95B checkpoint parameters |
+| Decoder Layers | 40 |
+| Hidden Size | 2,048 |
+| Attention | 16 attention heads / 2 key-value heads |
+| Context Length | 262,144 tokens (checkpoint configuration) |
+| Vocabulary Size | 248,320 |
+| Experts | 256 routed / 8 selected per token |
+
 ### Configuration
 
 | Setting | Configuration |
@@ -40,16 +50,7 @@ automodel examples/vlm_finetune/qwen3_5_moe/qwen3_5_35b.yaml --nproc-per-node 8
 
 - [`qwen3_5_35b_neat_packing.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5_moe/qwen3_5_35b_neat_packing.yaml)
 
-## Model Reference
-
-### Model Architecture
-
-| Property | Value |
-| --- | --- |
-| Task | Image-text-to-text |
-| Architecture | `Qwen3_5MoeForConditionalGeneration` |
-
-### Available Models
+## Available Models
 
 - [`Qwen/Qwen3.5-35B-A3B`](https://huggingface.co/Qwen/Qwen3.5-35B-A3B)
 
@@ -61,3 +62,5 @@ automodel examples/vlm_finetune/qwen3_5_moe/qwen3_5_35b.yaml --nproc-per-node 8
 ## Related Resources
 
 - [Vision-language model fine-tuning guide](/recipes-e2e-examples/gemma-3-3n)
+
+- [Checkpoint Configuration](https://huggingface.co/Qwen/Qwen3.5-35B-A3B/blob/59d61f3ce65a6d9863b86d2e96597125219dc754/config.json)

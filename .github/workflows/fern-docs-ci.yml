@@ -74,10 +74,10 @@ jobs:
           npm --prefix "$mdx_lint_dir" install --silent --ignore-scripts --no-audit --no-fund @mdx-js/mdx@3 remark-frontmatter@5 remark-math@6 remark-gfm@4 yaml@2 >/dev/null
           echo "MDX_LINT_PREFIX=$mdx_lint_dir" >> "$GITHUB_ENV"
 
-      - name: Test model card layout validator
+      - name: Test model card contract validator
         run: node --test tests/unit_tests/tools/test_model_card_layout.mjs
 
-      - name: Validate every model card layout
+      - name: Validate every model card layout, recipe, and content limit
         run: node tools/validate_model_cards.mjs
 
       - name: Apply Fern code styles

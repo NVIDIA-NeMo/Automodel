@@ -1,5 +1,5 @@
 ---
-title: "Qwen3.8-2.4T-A95B"
+title: "Qwen/Qwen3.8-2.4T-A95B"
 description: "Fine-tune Qwen3.8-2.4T-A95B for text generation with NeMo AutoModel using checked-in multi-node expert- and pipeline-parallel recipes."
 slug: model-coverage/large-language-models/qwen/Qwen3.8-2.4T-A95B
 ---
@@ -8,15 +8,13 @@ slug: model-coverage/large-language-models/qwen/Qwen3.8-2.4T-A95B
 
 ## Quick Start
 
-### Fine-Tune Qwen3.8-2.4T-A95B
-
-Allocate 64 GB200 nodes with four GPUs per node through your cluster launcher, then run:
+Allocate 64 nodes with 4 GPUs each. Set `NODE_RANK` and `MASTER_ADDR` on every node; complete the recipe prerequisites in Model Context before launching.
 
 ```bash
-uv run automodel --nproc-per-node=4 examples/llm_finetune/qwen/qwen3_8_2_4t_a95b_hellaswag_ep32_pp8.yaml
+uv run torchrun --nnodes 64 --nproc-per-node 4 \
+  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
+  -m nemo_automodel.cli.app examples/llm_finetune/qwen/qwen3_8_2_4t_a95b_hellaswag_ep32_pp8.yaml
 ```
-
-See the [Slurm Launcher Guide](/job-launchers/slurm-cluster) for multi-node setup and the [Large MoE Fine-Tuning Guide](/recipes-e2e-examples/large-moe-fine-tuning) for distributed MoE configuration.
 
 ## Choose a Workflow
 
@@ -25,6 +23,20 @@ See the [Slurm Launcher Guide](/job-launchers/slurm-cluster) for multi-node setu
 | 100-step full-parameter SFT on HellaSwag with FSDP2, EP32, and PP8 | [qwen3_8_2_4t_a95b_hellaswag_ep32_pp8.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen3_8_2_4t_a95b_hellaswag_ep32_pp8.yaml) |
 
 ## Model Context
+
+| Property | Value |
+|---|---|
+| **Task** | Text Generation (MoE, hybrid attention) |
+| **Architecture** | Qwen3.8-2.4T-A95B CausalLM |
+| **Parameters** | 2.4T total |
+| **Layers** | 92 |
+| **Experts** | 512 routed experts, top-10 routing |
+| **Context Length** | 262,144 tokens |
+| **HF Org** | [Qwen](https://huggingface.co/Qwen) |
+| Hidden Size | 8,192 |
+| Attention | 64 attention heads / 4 key-value heads |
+| Vocabulary Size | 248,320 |
+| Configured Dtype | `bfloat16` |
 
 ### Architecture
 
@@ -46,21 +58,7 @@ See the [Slurm Launcher Guide](/job-launchers/slurm-cluster) for multi-node setu
 
 The validated 64-node run loaded the public split-FP8 checkpoint and completed a full-model HellaSwag SFT run. This validates the training mechanics and checkpoint layout, not model convergence.
 
-## Model Reference
-
-### Model Architecture
-
-| Property | Value |
-|---|---|
-| **Task** | Text Generation (MoE, hybrid attention) |
-| **Architecture** | Qwen3.8-2.4T-A95B CausalLM |
-| **Parameters** | 2.4T total |
-| **Layers** | 92 |
-| **Experts** | 512 routed experts, top-10 routing |
-| **Context Length** | 262,144 tokens |
-| **HF Org** | [Qwen](https://huggingface.co/Qwen) |
-
-### Available Models
+## Available Models
 
 | Checkpoint | Type |
 | --- | --- |
@@ -71,3 +69,5 @@ The validated 64-node run loaded the public split-FP8 checkpoint and completed a
 
 - [Qwen3.8-2.4T-A95B model card](https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B)
 - [Qwen3.8-2.4T-A95B announcement](https://qwen.ai/blog?id=qwen3.8)
+
+- [Checkpoint Configuration](https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B/blob/207bd685a7e3696cfaff12ded7c6a7ea0f88c996/config.json)

@@ -1,5 +1,5 @@
 ---
-title: "ERNIE-4.5-0.3B-PT"
+title: "baidu/ERNIE-4.5-0.3B-PT"
 description: "Use ERNIE-4.5-0.3B-PT with NeMo AutoModel for language model fine-tuning, with documented checkpoints, runnable recipes, setup guidance, and model reference details."
 slug: model-coverage/large-language-models/baidu/ERNIE-4.5-0.3B-PT
 ---
@@ -9,8 +9,6 @@ slug: model-coverage/large-language-models/baidu/ERNIE-4.5-0.3B-PT
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
 ## Quick Start
-
-### Fine-Tune ERNIE-4.5-0.3B-PT
 
 From the repository root, run:
 
@@ -26,10 +24,6 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/ernie4_5/ernie4_5_0p3b
 
 ## Model Context
 
-## Model Reference
-
-### Model Architecture
-
 | Property | Value |
 | --- | --- |
 | Task | Text Generation |
@@ -37,11 +31,17 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/ernie4_5/ernie4_5_0p3b
 | Parameters | 0.36B |
 | Context Length | 131,072 tokens |
 | Hugging Face Organization | [baidu](https://huggingface.co/baidu) |
+| Architecture | `Ernie4_5ForCausalLM` |
+| Decoder Layers | 18 |
+| Hidden Size | 1,024 |
+| Attention | 16 attention heads / 2 key-value heads |
+| Vocabulary Size | 103,424 |
+| Configured Dtype | `bfloat16` |
 
 - `Ernie4_5ForCausalLM`: dense Hugging Face implementation path.
 - `Ernie4_5_MoeForCausalLM`: custom NeMo AutoModel implementation with expert parallelism support.
 
-### Available Models
+## Available Models
 
 | Model | HF ID |
 |---|---|
@@ -51,3 +51,5 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/ernie4_5/ernie4_5_0p3b
 
 - [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
 - [Large MoE Fine-Tuning Guide](/recipes-e2e-examples/large-moe-fine-tuning)
+
+- [Checkpoint Configuration](https://huggingface.co/baidu/ERNIE-4.5-0.3B-PT/blob/b565cf6caebdb7a1eadf00100857b1ed5e044f12/config.json)

@@ -1,5 +1,5 @@
 ---
-title: "Llama-3.2-1B"
+title: "meta-llama/Llama-3.2-1B"
 description: "Use NeMo AutoModel to fine-tune Llama-3.2-1B for Embedding workflows with checked-in feature extraction recipes and documented distributed settings."
 slug: model-coverage/embedding-models/meta/Llama-3.2-1B
 ---
@@ -8,8 +8,6 @@ slug: model-coverage/embedding-models/meta/Llama-3.2-1B
 The Hugging Face configuration declares the `LlamaForCausalLM` architecture.
 
 ## Quick Start
-
-### Fine-Tune Llama-3.2-1B
 
 Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
 
@@ -26,6 +24,18 @@ uv run automodel examples/retrieval/bi_encoder/llama3_2_1b.yaml --nproc-per-node
 
 ## Model Context
 
+| Property | Value |
+| --- | --- |
+| Task | Feature extraction |
+| Architecture | `LlamaForCausalLM` |
+| Parameters | 1.24B checkpoint parameters |
+| Decoder Layers | 16 |
+| Hidden Size | 2,048 |
+| Attention | 32 attention heads / 8 key-value heads |
+| Context Length | 131,072 tokens (checkpoint configuration) |
+| Vocabulary Size | 128,256 |
+| Configured Dtype | `bfloat16` |
+
 ### Configuration
 
 | Setting | Configuration |
@@ -36,16 +46,7 @@ uv run automodel examples/retrieval/bi_encoder/llama3_2_1b.yaml --nproc-per-node
 | Features | Checkpointing (enabled=true) |
 | Advanced | bfloat16 |
 
-## Model Reference
-
-### Model Architecture
-
-| Property | Value |
-| --- | --- |
-| Task | Feature extraction |
-| Architecture | `LlamaForCausalLM` |
-
-### Available Models
+## Available Models
 
 - [`meta-llama/Llama-3.2-1B`](https://huggingface.co/meta-llama/Llama-3.2-1B)
 
@@ -57,3 +58,5 @@ uv run automodel examples/retrieval/bi_encoder/llama3_2_1b.yaml --nproc-per-node
 ## Related Resources
 
 - [Installation instructions](/get-started/installation)
+
+- [Checkpoint Configuration](https://huggingface.co/meta-llama/Llama-3.2-1B/blob/4e20de362430cd3b72f300e6b0f18e50e7166e08/config.json)

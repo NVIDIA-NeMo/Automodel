@@ -1,5 +1,5 @@
 ---
-title: "Qwen-Image"
+title: "Qwen/Qwen-Image"
 description: "Train Qwen-Image text-to-image and image-editing checkpoints with NeMo AutoModel using checked-in flow-matching and generation recipes."
 slug: model-coverage/diffusion/qwen/Qwen-Image
 ---
@@ -8,19 +8,32 @@ slug: model-coverage/diffusion/qwen/Qwen-Image
 
 ## Quick Start
 
-Review the recipes in [Choose a Workflow](#choose-a-workflow), including their
-hardware and data requirements. Follow the [installation instructions](/get-started/installation)
-before launching a recipe.
+Follow the [installation instructions](/get-started/installation). From the repository root, use 8 GPUs. Complete the [recipe setup](#recipe-setup) before launching.
+
+```bash
+uv run torchrun --nproc-per-node 8 \
+  examples/diffusion/finetune/finetune.py -c examples/diffusion/finetune/qwen_image_t2i_flow.yaml
+```
 
 ## Choose a Workflow
 
 | Goal | Start Here |
 | --- | --- |
 | 8-GPU BF16 FSDP2 baseline for full-parameter Qwen-Image-Edit-2511 training | [qwen_image_edit_2511_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/qwen_image_edit_2511_flow.yaml) |
-| Fine-tune Qwen-Image with flow matching | [qwen_image_t2i_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/qwen_image_t2i_flow.yaml) |
+| Fine-tune Qwen/Qwen-Image | [qwen_image_t2i_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/qwen_image_t2i_flow.yaml). 1 node, 8 GPUs per node; see [Recipe Setup](#recipe-setup). |
 | Pretrain Qwen-Image with flow matching | [qwen_image_t2i_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/pretrain/qwen_image_t2i_flow.yaml) |
 
 ## Model Context
+
+| Property | Value |
+|---|---|
+| **Tasks** | Text-to-Image, Instruction-Based Image Editing |
+| **Architecture** | Diffusion Transformer (Flow Matching) |
+| **HF Org** | [Qwen](https://huggingface.co/Qwen) |
+| Parameters | 20.43B checkpoint parameters |
+| Transformer Blocks | 60 |
+| Hidden Size | 3,072 |
+| Attention | 24 attention heads |
 
 ### Prepare MagicBrush
 
@@ -162,17 +175,17 @@ uv sync --locked --all-groups --extra all --extra diffusion-media
 
 See the [Installation Guide](/get-started/installation) and [Diffusion Training and Fine-Tuning Guide](/recipes-e2e-examples/diffusion-fine-tuning).
 
-## Model Reference
+### Setup and Additional Examples
 
-### Model Architecture
+Review the recipes in [Choose a Workflow](#choose-a-workflow), including their
+hardware and data requirements. Follow the [installation instructions](/get-started/installation)
+before launching a recipe.
 
-| Property | Value |
-|---|---|
-| **Tasks** | Text-to-Image, Instruction-Based Image Editing |
-| **Architecture** | Diffusion Transformer (Flow Matching) |
-| **HF Org** | [Qwen](https://huggingface.co/Qwen) |
+### Recipe Setup
 
-### Available Models
+Read [qwen_image_t2i_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/qwen_image_t2i_flow.yaml) for checkpoint access, data paths, and backend dependencies.
+
+## Available Models
 
 | Model | HF ID | Training Scope |
 |---|---|---|
@@ -184,3 +197,5 @@ Qwen-Image-Edit-2511 training is intentionally limited to cached target latents,
 ## Related Resources
 
 - [Installation Instructions](/get-started/installation)
+
+- [Checkpoint Configuration](https://huggingface.co/Qwen/Qwen-Image/blob/75e0b4be04f60ec59a75f475837eced720f823b6/transformer/config.json)

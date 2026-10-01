@@ -1,5 +1,5 @@
 ---
-title: "Qwen2.5-Omni-7B"
+title: "Qwen/Qwen2.5-Omni-7B"
 description: "Use NeMo AutoModel to fine-tune Qwen2.5-Omni-7B for Omni workflows with checked-in any to any recipes and documented distributed settings."
 slug: model-coverage/omni/qwen/Qwen2.5-Omni-7B
 ---
@@ -9,19 +9,32 @@ The Hugging Face configuration declares the `Qwen2_5OmniModel` architecture.
 
 ## Quick Start
 
-### Fine-Tune Qwen2.5-Omni-7B
+Follow the [installation instructions](/get-started/installation). From the repository root, use 8 GPUs. Complete the [recipe setup](#recipe-setup) before launching.
 
-Follow the [installation instructions](/get-started/installation), then review the checked-in recipe and
-its declared topology below before choosing a local or cluster launcher.
+```bash
+uv run automodel examples/audio_finetune/qwen2_5_omni_asr/ami_sft_7b.yaml --nproc-per-node 8
+```
 
 ## Choose a Workflow
 
 | Goal | Start Here |
 | --- | --- |
-| Run the primary recipe for this model | Use the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/audio_finetune/qwen2_5_omni_asr/ami_sft_7b.yaml). |
+| Fine-tune Qwen/Qwen2.5-Omni-7B | [ami_sft_7b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/audio_finetune/qwen2_5_omni_asr/ami_sft_7b.yaml). 1 node, 8 GPUs per node; see [Recipe Setup](#recipe-setup). |
 | Prepare your environment | Follow the [installation instructions](/get-started/installation). |
 
 ## Model Context
+
+| Property | Value |
+| --- | --- |
+| Task | Any to any |
+| Architecture | `Qwen2_5OmniModel` |
+| Parameters | 10.73B checkpoint parameters |
+| Decoder Layers | 28 |
+| Hidden Size | 3,584 |
+| Attention | 28 attention heads / 4 key-value heads |
+| Context Length | 32,768 tokens (checkpoint configuration) |
+| Vocabulary Size | 152,064 |
+| Configured Dtype | `bfloat16` |
 
 ### Configuration
 
@@ -33,16 +46,16 @@ its declared topology below before choosing a local or cluster launcher.
 | Features | Checkpointing (enabled=true), Activation checkpointing (activation_checkpointing=true), Transformer Engine |
 | Advanced | attention=sdpa, linear=te |
 
-## Model Reference
+### Setup and Additional Examples
 
-### Model Architecture
+Follow the [installation instructions](/get-started/installation), then review the checked-in recipe and
+its declared topology below before choosing a local or cluster launcher.
 
-| Property | Value |
-| --- | --- |
-| Task | Any to any |
-| Architecture | `Qwen2_5OmniModel` |
+### Recipe Setup
 
-### Available Models
+Read [ami_sft_7b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/audio_finetune/qwen2_5_omni_asr/ami_sft_7b.yaml) for checkpoint access, data paths, and backend dependencies.
+
+## Available Models
 
 - [`Qwen/Qwen2.5-Omni-7B`](https://huggingface.co/Qwen/Qwen2.5-Omni-7B)
 
@@ -54,3 +67,5 @@ its declared topology below before choosing a local or cluster launcher.
 ## Related Resources
 
 - [Multimodal fine-tuning guide](/recipes-e2e-examples/gemma-3-3n)
+
+- [Checkpoint Configuration](https://huggingface.co/Qwen/Qwen2.5-Omni-7B/blob/ae9e1690543ffd5c0221dc27f79834d0294cba00/config.json)

@@ -1,5 +1,5 @@
 ---
-title: "llama-nemotron-embed-vl-1b-v2"
+title: "nvidia/llama-nemotron-embed-vl-1b-v2"
 description: "Extract multimodal embeddings with llama-nemotron-embed-vl-1b-v2 in NeMo AutoModel using the checked-in bi-encoder recipe and DDP."
 slug: model-coverage/embedding-models/nvidia/llama-nemotron-embed-vl-1b-v2
 ---
@@ -8,8 +8,6 @@ slug: model-coverage/embedding-models/nvidia/llama-nemotron-embed-vl-1b-v2
 The Hugging Face configuration declares the `LlamaNemotronVLModel` architecture.
 
 ## Quick Start
-
-### Fine-Tune Llama-nemotron-embed-VL-1B-v2
 
 Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
 
@@ -26,6 +24,18 @@ automodel examples/retrieval/bi_encoder/nemotron_vl_1b/nemotron_vl_1b_example.ya
 
 ## Model Context
 
+| Property | Value |
+| --- | --- |
+| Task | Feature extraction |
+| Architecture | `LlamaNemotronVLModel` |
+| Parameters | 1.68B checkpoint parameters |
+| Decoder Layers | 16 |
+| Hidden Size | 2,048 |
+| Attention | 32 attention heads / 8 key-value heads |
+| Context Length | 131,072 tokens (checkpoint configuration) |
+| Vocabulary Size | 128,266 |
+| Configured Dtype | `bfloat16` |
+
 ### Configuration
 
 | Setting | Configuration |
@@ -36,16 +46,7 @@ automodel examples/retrieval/bi_encoder/nemotron_vl_1b/nemotron_vl_1b_example.ya
 | Features | Checkpointing (enabled=true) |
 | Advanced | bfloat16 |
 
-## Model Reference
-
-### Model Architecture
-
-| Property | Value |
-| --- | --- |
-| Task | Feature extraction |
-| Architecture | `LlamaNemotronVLModel` |
-
-### Available Models
+## Available Models
 
 - [`nvidia/llama-nemotron-embed-vl-1b-v2`](https://huggingface.co/nvidia/llama-nemotron-embed-vl-1b-v2)
 
@@ -57,3 +58,5 @@ automodel examples/retrieval/bi_encoder/nemotron_vl_1b/nemotron_vl_1b_example.ya
 ## Related Resources
 
 - [Installation instructions](/get-started/installation)
+
+- [Checkpoint Configuration](https://huggingface.co/nvidia/llama-nemotron-embed-vl-1b-v2/blob/582e3bf72aee355e3c59ed89de53543c5b0657ee/config.json)

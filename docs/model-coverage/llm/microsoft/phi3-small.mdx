@@ -1,33 +1,30 @@
 ---
-title: "Phi-3-small-8k-instruct"
-description: "Reference Phi-3-small-8k-instruct checkpoint and architecture details for NeMo AutoModel, with model-family information, setup guidance, and upstream resources."
+title: "microsoft/Phi-3-small-8k-instruct"
+description: "Fine-tune microsoft/Phi-3-small-8k-instruct with NeMo AutoModel using a checked-in LoRA recipe, with checkpoint and architecture details."
 slug: model-coverage/large-language-models/microsoft/Phi-3-small-8k-instruct
 ---
 
 [Phi-3-Small](https://azure.microsoft.com/en-us/products/phi) is Microsoft's 7B model using a distinct `Phi3SmallForCausalLM` architecture with blocksparse attention, separate from the standard Phi-3 family.
 
-Use this page as a checkpoint and architecture reference. Set up NeMo AutoModel with the
+Set up NeMo AutoModel with the
 [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the
 [installation instructions](/get-started/installation).
 
 ## Quick Start
 
-This page provides checkpoint and architecture reference information rather
-than a model-specific launch command. Follow the
-[installation instructions](/get-started/installation) to set up NeMo AutoModel.
+Follow the [installation instructions](/get-started/installation). From the repository root, use 8 GPUs. This is an example configuration; GPU training and memory use still require validation.
+
+```bash
+uv run automodel examples/llm_finetune/microsoft/phi_3_small_8k_instruct_squad_peft.yaml --nproc-per-node 8
+```
 
 ## Choose a Workflow
 
 | Goal | Start Here |
 | --- | --- |
-| Explore checkpoints | See [Available Models](#available-models). |
-| Configure NeMo AutoModel | Follow the [installation instructions](/get-started/installation). |
+| Fine-tune microsoft/Phi-3-small-8k-instruct | [phi_3_small_8k_instruct_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/microsoft/phi_3_small_8k_instruct_squad_peft.yaml). Example LoRA configuration; validate GPU training. |
 
 ## Model Context
-
-## Model Reference
-
-### Model Architecture
 
 | Property | Value |
 | --- | --- |
@@ -35,8 +32,22 @@ than a model-specific launch command. Follow the
 | Architecture | `Phi3SmallForCausalLM` |
 | Parameters | 7B |
 | Hugging Face Organization | [microsoft](https://huggingface.co/microsoft) |
+| Decoder Layers | 32 |
+| Hidden Size | 4,096 |
+| Attention | 32 attention heads / 8 key-value heads |
+| Context Length | 8,192 tokens (checkpoint configuration) |
+| Vocabulary Size | 100,352 |
+| Configured Dtype | `bfloat16` |
 
-### Available Models
+### Recipe Setup
+
+Read [phi_3_small_8k_instruct_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/microsoft/phi_3_small_8k_instruct_squad_peft.yaml) for checkpoint access, data paths, and backend dependencies. It provides a small LoRA fine-tuning example.
+
+### Flash Attention Requirement
+
+Install the FlashAttention dependency from the [installation guide](/get-started/installation) before using this recipe. The checkpoint implementation requires FlashAttention for its dense attention layers.
+
+## Available Models
 
 | Model | HF ID |
 |---|---|
@@ -45,3 +56,5 @@ than a model-specific launch command. Follow the
 ## Related Resources
 
 - [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/microsoft/Phi-3-small-8k-instruct/blob/188b876e997ee4055df01afe46274c14c400fe40/config.json)

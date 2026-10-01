@@ -1,5 +1,5 @@
 ---
-title: "MiniMax-M2.1"
+title: "MiniMaxAI/MiniMax-M2.1"
 description: "Use MiniMax-M2.1 with NeMo AutoModel for language model fine-tuning, with documented checkpoints, runnable recipes, setup guidance, and model reference details."
 slug: model-coverage/large-language-models/minimax/MiniMax-M2.1
 ---
@@ -10,17 +10,12 @@ Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com
 
 ## Quick Start
 
-### Fine-Tune MiniMax-M2.1
-
-<Note>
-This recipe was validated on **8 nodes x 8 GPUs (64 H100s)**. See the [Launcher Guide](/job-launchers/slurm-cluster) for multi-node setup.
-
-</Note>
-
-From the repository root, run:
+Allocate 8 nodes with 8 GPUs each. Set `NODE_RANK` and `MASTER_ADDR` on every node; complete the recipe prerequisites in Model Context before launching.
 
 ```bash
-uv run automodel --nproc-per-node=8 examples/llm_finetune/minimax_m2/minimax_m2.1_hellaswag_pp.yaml
+uv run torchrun --nnodes 8 --nproc-per-node 8 \
+  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
+  -m nemo_automodel.cli.app examples/llm_finetune/minimax_m2/minimax_m2.1_hellaswag_pp.yaml
 ```
 
 ## Choose a Workflow
@@ -31,18 +26,20 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/minimax_m2/minimax_m2.
 
 ## Model Context
 
-## Model Reference
-
-### Model Architecture
-
 | Property | Value |
 | --- | --- |
 | Task | Text Generation (MoE) |
 | Architecture | `MiniMaxM2ForCausalLM` |
 | Parameters | 229B total |
 | Hugging Face Organization | [MiniMaxAI](https://huggingface.co/MiniMaxAI) |
+| Decoder Layers | 62 |
+| Hidden Size | 3,072 |
+| Attention | 48 attention heads / 8 key-value heads |
+| Context Length | 196,608 tokens (checkpoint configuration) |
+| Vocabulary Size | 200,064 |
+| Experts | 256 routed / 8 selected per token |
 
-### Available Models
+## Available Models
 
 | Model | HF ID |
 |---|---|
@@ -52,3 +49,5 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/minimax_m2/minimax_m2.
 
 - [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
 - [Large MoE Fine-Tuning Guide](/recipes-e2e-examples/large-moe-fine-tuning)
+
+- [Checkpoint Configuration](https://huggingface.co/MiniMaxAI/MiniMax-M2.1/blob/cd97f59135f37b2a6bf09356e485d5e4aeb7dc9c/config.json)

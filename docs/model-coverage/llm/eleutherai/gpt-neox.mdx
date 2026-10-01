@@ -1,33 +1,30 @@
 ---
-title: "gpt-neox-20b"
-description: "Reference gpt-neox-20b checkpoint and architecture details for NeMo AutoModel, with model-family information, setup guidance, and upstream resources."
+title: "EleutherAI/gpt-neox-20b"
+description: "Fine-tune EleutherAI/gpt-neox-20b with NeMo AutoModel using a checked-in LoRA recipe, with checkpoint and architecture details."
 slug: model-coverage/large-language-models/eleutherai/gpt-neox-20b
 ---
 
 [GPT-NeoX](https://github.com/EleutherAI/gpt-neox) is EleutherAI's large-scale language model architecture. The same `GPTNeoXForCausalLM` architecture is used by the Pythia scaling suite, OpenAssistant, Databricks Dolly, and StableLM models.
 
-Use this page as a checkpoint and architecture reference. Set up NeMo AutoModel with the
+Set up NeMo AutoModel with the
 [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the
 [installation instructions](/get-started/installation).
 
 ## Quick Start
 
-This page provides checkpoint and architecture reference information rather
-than a model-specific launch command. Follow the
-[installation instructions](/get-started/installation) to set up NeMo AutoModel.
+Follow the [installation instructions](/get-started/installation). From the repository root, use 8 GPUs. This is an example configuration; GPU training and memory use still require validation.
+
+```bash
+uv run automodel examples/llm_finetune/eleutherai/gpt_neox_20b_squad_peft.yaml --nproc-per-node 8
+```
 
 ## Choose a Workflow
 
 | Goal | Start Here |
 | --- | --- |
-| Explore checkpoints | See [Available Models](#available-models). |
-| Configure NeMo AutoModel | Follow the [installation instructions](/get-started/installation). |
+| Fine-tune EleutherAI/gpt-neox-20b | [gpt_neox_20b_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/eleutherai/gpt_neox_20b_squad_peft.yaml). Example LoRA configuration; validate GPU training. |
 
 ## Model Context
-
-## Model Reference
-
-### Model Architecture
 
 | Property | Value |
 | --- | --- |
@@ -35,8 +32,18 @@ than a model-specific launch command. Follow the
 | Architecture | `GPTNeoXForCausalLM` |
 | Parameters | 20B |
 | Hugging Face Organization | [EleutherAI](https://huggingface.co/EleutherAI) |
+| Decoder Layers | 44 |
+| Hidden Size | 6,144 |
+| Attention | 64 attention heads |
+| Context Length | 2,048 tokens (checkpoint configuration) |
+| Vocabulary Size | 50,432 |
+| Configured Dtype | `float16` |
 
-### Available Models
+### Recipe Setup
+
+Read [gpt_neox_20b_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/eleutherai/gpt_neox_20b_squad_peft.yaml) for checkpoint access, data paths, and backend dependencies. It provides a small LoRA fine-tuning example.
+
+## Available Models
 
 | Model | HF ID |
 |---|---|
@@ -45,3 +52,5 @@ than a model-specific launch command. Follow the
 ## Related Resources
 
 - [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/EleutherAI/gpt-neox-20b/blob/c292233c833e336628618a88a648727eb3dff0a7/config.json)

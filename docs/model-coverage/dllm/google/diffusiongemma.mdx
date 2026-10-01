@@ -1,5 +1,5 @@
 ---
-title: "diffusiongemma-26B-A4B-it"
+title: "google/diffusiongemma-26B-A4B-it"
 description: "Use diffusiongemma-26B-A4B-it with NeMo AutoModel for diffusion language model fine-tuning, including checkpoints, runnable recipes, setup, and reference details."
 slug: model-coverage/dllm/google/diffusiongemma-26B-A4B-it
 ---
@@ -10,7 +10,38 @@ Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com
 
 ## Quick Start
 
-### Fine-Tune diffusiongemma-26B-A4B-it
+Follow the [installation instructions](/get-started/installation). From the repository root, use 8 GPUs. Complete the [recipe setup](#recipe-setup) before launching.
+
+```bash
+uv run automodel examples/dllm_sft/diffusion_gemma_sft.yaml --nproc-per-node 8
+```
+
+## Choose a Workflow
+
+| Goal | Start Here |
+| --- | --- |
+| Fine-tune google/diffusiongemma-26B-A4B-it | [diffusion_gemma_sft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/diffusion_gemma_sft.yaml). 1 node, 8 GPUs per node; see [Recipe Setup](#recipe-setup). |
+| Low-rank adaptation (LoRA) SFT - DiffusionGemma 26B-A4B with FSDP2 + Expert Parallelism | Use [diffusion_gemma_lora.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/diffusion_gemma_lora.yaml). |
+
+## Model Context
+
+| Property | Value |
+| --- | --- |
+| Task | Text Generation (Block Diffusion, MoE) |
+| Architecture | `DiffusionGemmaForBlockDiffusion` |
+| Parameters | 26B total / ~4B active |
+| Hugging Face Organization | [google](https://huggingface.co/google) |
+| Decoder Layers | 30 |
+| Hidden Size | 2,816 |
+| Attention | 16 attention heads; 8 key-value heads in sliding layers / 2 in global layers |
+| Context Length | 262,144 tokens (checkpoint configuration) |
+| Vocabulary Size | 262,144 |
+| Experts | 128 routed |
+| Configured Dtype | `bfloat16` |
+
+- `DiffusionGemmaForBlockDiffusion` - block-diffusion MoE (causal prompt encoder + bidirectional canvas decoder).
+
+### Setup and Additional Examples
 
 Install the repository's locked environment:
 
@@ -40,29 +71,11 @@ uv run automodel examples/dllm_sft/diffusion_gemma_sft.yaml --nproc-per-node 8
 uv run automodel examples/dllm_sft/diffusion_gemma_lora.yaml --nproc-per-node 8
 ```
 
-## Choose a Workflow
+### Recipe Setup
 
-| Goal | Start Here |
-| --- | --- |
-| Full SFT - DiffusionGemma 26B-A4B with FSDP2 + Expert Parallelism | Use [diffusion_gemma_sft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/diffusion_gemma_sft.yaml). |
-| Low-rank adaptation (LoRA) SFT - DiffusionGemma 26B-A4B with FSDP2 + Expert Parallelism | Use [diffusion_gemma_lora.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/diffusion_gemma_lora.yaml). |
+Read [diffusion_gemma_sft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/diffusion_gemma_sft.yaml) for checkpoint access, data paths, and backend dependencies.
 
-## Model Context
-
-## Model Reference
-
-### Model Architecture
-
-| Property | Value |
-| --- | --- |
-| Task | Text Generation (Block Diffusion, MoE) |
-| Architecture | `DiffusionGemmaForBlockDiffusion` |
-| Parameters | 26B total / ~4B active |
-| Hugging Face Organization | [google](https://huggingface.co/google) |
-
-- `DiffusionGemmaForBlockDiffusion` - block-diffusion MoE (causal prompt encoder + bidirectional canvas decoder).
-
-### Available Models
+## Available Models
 
 | Model | HF ID |
 |---|---|
@@ -71,3 +84,5 @@ uv run automodel examples/dllm_sft/diffusion_gemma_lora.yaml --nproc-per-node 8
 ## Related Resources
 
 - [DiffusionGemma Fine-Tuning Guide](/recipes-e2e-examples/diffusiongemma)
+
+- [Checkpoint Configuration](https://huggingface.co/google/diffusiongemma-26B-A4B-it/blob/f7f5b7f5fa82ffc52addd066915886d497f5517b/config.json)

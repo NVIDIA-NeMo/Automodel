@@ -1,5 +1,5 @@
 ---
-title: "ERNIE-4.5-21B-A3B-PT"
+title: "baidu/ERNIE-4.5-21B-A3B-PT"
 description: "Use NeMo AutoModel to fine-tune ERNIE-4.5-21B-A3B-PT for LLM workflows with checked-in text generation recipes and documented distributed settings."
 slug: model-coverage/large-language-models/baidu/ERNIE-4.5-21B-A3B-PT
 ---
@@ -8,8 +8,6 @@ slug: model-coverage/large-language-models/baidu/ERNIE-4.5-21B-A3B-PT
 The Hugging Face configuration declares the `Ernie4_5_MoeForCausalLM` architecture.
 
 ## Quick Start
-
-### Fine-Tune ERNIE-4.5-21B-A3B-PT
 
 Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
 
@@ -26,6 +24,18 @@ automodel examples/llm_finetune/ernie4_5/ernie4_5_21b_a3b_hellaswag.yaml --nproc
 
 ## Model Context
 
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| Architecture | `Ernie4_5_MoeForCausalLM` |
+| Parameters | 21.95B checkpoint parameters |
+| Decoder Layers | 28 |
+| Hidden Size | 2,560 |
+| Attention | 20 attention heads / 4 key-value heads |
+| Context Length | 131,072 tokens (checkpoint configuration) |
+| Vocabulary Size | 103,424 |
+| Configured Dtype | `bfloat16` |
+
 ### Configuration
 
 | Setting | Configuration |
@@ -36,16 +46,7 @@ automodel examples/llm_finetune/ernie4_5/ernie4_5_21b_a3b_hellaswag.yaml --nproc
 | Features | Checkpointing (enabled=true), Activation checkpointing (activation_checkpointing=true), Transformer Engine, DeepEP (dispatcher=deepep) |
 | Advanced | bfloat16, attention=te, linear=torch, experts=torch_mm, dispatcher=deepep |
 
-## Model Reference
-
-### Model Architecture
-
-| Property | Value |
-| --- | --- |
-| Task | Text generation |
-| Architecture | `Ernie4_5_MoeForCausalLM` |
-
-### Available Models
+## Available Models
 
 - [`baidu/ERNIE-4.5-21B-A3B-PT`](https://huggingface.co/baidu/ERNIE-4.5-21B-A3B-PT)
 
@@ -57,3 +58,5 @@ automodel examples/llm_finetune/ernie4_5/ernie4_5_21b_a3b_hellaswag.yaml --nproc
 ## Related Resources
 
 - [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/baidu/ERNIE-4.5-21B-A3B-PT/blob/87db95487941cb39592ee0abca3b9155a6d19c5c/config.json)

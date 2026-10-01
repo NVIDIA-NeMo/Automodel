@@ -1,5 +1,5 @@
 ---
-title: "LLaVA-OneVision-1.5-8B-Instruct"
+title: "lmms-lab/LLaVA-OneVision-1.5-8B-Instruct"
 description: "Use NeMo AutoModel to fine-tune LLaVA-OneVision-1.5-8B-Instruct for VLM workflows with checked-in image-text-to-text recipes and documented distributed settings."
 slug: model-coverage/vision-language-models/lmms-lab/LLaVA-OneVision-1.5-8B-Instruct
 ---
@@ -8,8 +8,6 @@ slug: model-coverage/vision-language-models/lmms-lab/LLaVA-OneVision-1.5-8B-Inst
 The Hugging Face configuration declares the `LLaVAOneVision1_5_ForConditionalGeneration` architecture.
 
 ## Quick Start
-
-### Fine-Tune LLaVA-OneVision-1.5-8B-Instruct
 
 Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
 
@@ -26,6 +24,18 @@ automodel examples/vlm_finetune/llava_onevision/llava_ov_1_5_8b_lora.yaml --npro
 
 ## Model Context
 
+| Property | Value |
+| --- | --- |
+| Task | Image-text-to-text |
+| Architecture | `LLaVAOneVision1_5_ForConditionalGeneration` |
+| Parameters | 8.53B checkpoint parameters |
+| Decoder Layers | 36 |
+| Hidden Size | 4,096 |
+| Attention | 32 attention heads / 8 key-value heads |
+| Context Length | 32,768 tokens (checkpoint configuration) |
+| Vocabulary Size | 151,936 |
+| Configured Dtype | `bfloat16` |
+
 ### Configuration
 
 | Setting | Configuration |
@@ -36,16 +46,7 @@ automodel examples/vlm_finetune/llava_onevision/llava_ov_1_5_8b_lora.yaml --npro
 | Features | Checkpointing (enabled=true), LoRA |
 | Advanced | - |
 
-## Model Reference
-
-### Model Architecture
-
-| Property | Value |
-| --- | --- |
-| Task | Image-text-to-text |
-| Architecture | `LLaVAOneVision1_5_ForConditionalGeneration` |
-
-### Available Models
+## Available Models
 
 - [`lmms-lab/LLaVA-OneVision-1.5-8B-Instruct`](https://huggingface.co/lmms-lab/LLaVA-OneVision-1.5-8B-Instruct)
 
@@ -57,3 +58,5 @@ automodel examples/vlm_finetune/llava_onevision/llava_ov_1_5_8b_lora.yaml --npro
 ## Related Resources
 
 - [Vision-language model fine-tuning guide](/recipes-e2e-examples/gemma-3-3n)
+
+- [Checkpoint Configuration](https://huggingface.co/lmms-lab/LLaVA-OneVision-1.5-8B-Instruct/blob/e137910552d616eb0f7305147ca054311a90c542/config.json)

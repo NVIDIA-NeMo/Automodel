@@ -1,5 +1,5 @@
 ---
-title: "Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16"
+title: "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16"
 description: "Use Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16 with NeMo AutoModel for multimodal fine-tuning, including checkpoints, runnable recipes, setup, and reference details."
 slug: model-coverage/omni/nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16
 ---
@@ -13,17 +13,15 @@ Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com
 
 ## Quick Start
 
-### Fine-Tune Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16
-
 From the repository root, run:
-
-```bash
-uv run automodel examples/vlm_finetune/nemotron_omni/nemotron_omni_cord_v2.yaml --nproc-per-node 8
-```
 
 For a full walkthrough - dataset preparation, SFT vs. LoRA configs, and
 post-training inference - see the
 [Nemotron-Omni guide](/recipes-e2e-examples/nemotron-omni).
+
+```bash
+uv run automodel examples/vlm_finetune/nemotron_omni/nemotron_omni_cord_v2.yaml --nproc-per-node 8
+```
 
 ## Choose a Workflow
 
@@ -34,18 +32,21 @@ post-training inference - see the
 
 ## Model Context
 
-## Model Reference
-
-### Model Architecture
-
 | Property | Value |
 | --- | --- |
 | Task | Omnimodal (Text/Image/Audio) |
 | Architecture | `NemotronH_Nano_Omni_Reasoning_V3` |
 | Parameters | 30B total / 3B active |
 | Hugging Face Organization | [nvidia](https://huggingface.co/nvidia) |
+| Decoder Layers | 52 |
+| Hidden Size | 2,688 |
+| Attention | 32 attention heads / 2 key-value heads |
+| Context Length | 262,144 tokens (checkpoint configuration) |
+| Vocabulary Size | 131,072 |
+| Experts | 128 routed / 1 shared / 6 selected per token |
+| Configured Dtype | `bfloat16` |
 
-### Available Models
+## Available Models
 
 - **Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16**: 30B total, 3B activated (MoE)
 
@@ -56,3 +57,5 @@ post-training inference - see the
 ## Related Resources
 
 - [VLM Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n)
+
+- [Checkpoint Configuration](https://huggingface.co/nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16/blob/e5e9932441de940c9a62185c870ea5bcd4cd24e2/config.json)

@@ -1,5 +1,5 @@
 ---
-title: "NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16"
+title: "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16"
 description: "Use NeMo AutoModel to fine-tune NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16 for LLM workflows with checked-in text generation recipes and documented distributed settings."
 slug: model-coverage/large-language-models/nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16
 ---
@@ -9,21 +9,34 @@ The Hugging Face configuration declares the `NemotronHForCausalLM` architecture.
 
 ## Quick Start
 
-### Fine-Tune NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16
+Follow the [installation instructions](/get-started/installation). Allocate 32 nodes with 8 GPUs each; run on every node with `NODE_RANK` and `MASTER_ADDR` set. Complete the [recipe setup](#recipe-setup) before launching.
 
-Follow the [installation instructions](/get-started/installation), then review the checked-in recipe and
-its declared topology below before choosing a local or cluster launcher.
-
-Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node run.
+```bash
+uv run torchrun --nnodes 32 --nproc-per-node 8 \
+  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
+  -m nemo_automodel.cli.app examples/llm_finetune/nemotron/nemotron_ultra_v3_squad.yaml
+```
 
 ## Choose a Workflow
 
 | Goal | Start Here |
 | --- | --- |
-| Run the primary recipe for this model | Use the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_ultra_v3_squad.yaml). |
+| Fine-tune nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16 | [nemotron_ultra_v3_squad.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_ultra_v3_squad.yaml). 32 nodes, 8 GPUs per node; see [Recipe Setup](#recipe-setup). |
 | Try another checked-in recipe for this model | Use the [alternate recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/nemotron/nemotron_ultra_v3_te_deepep.yaml). |
 
 ## Model Context
+
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| Architecture | `NemotronHForCausalLM` |
+| Parameters | 560.52B checkpoint parameters |
+| Hidden Size | 8,192 |
+| Attention | 64 attention heads / 2 key-value heads |
+| Context Length | 262,144 tokens (checkpoint configuration) |
+| Vocabulary Size | 131,072 |
+| Experts | 512 routed / 1 shared / 22 selected per token |
+| Configured Dtype | `bfloat16` |
 
 ### Configuration
 
@@ -41,16 +54,18 @@ Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node 
 - [`nemotron_ultra_v3_hellaswag_peft.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_ultra_v3_hellaswag_peft.yaml)
 - [`nemotron_ultra_v3_hellaswag_peft_gb200.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_ultra_v3_hellaswag_peft_gb200.yaml)
 
-## Model Reference
+### Setup and Additional Examples
 
-### Model Architecture
+Follow the [installation instructions](/get-started/installation), then review the checked-in recipe and
+its declared topology below before choosing a local or cluster launcher.
 
-| Property | Value |
-| --- | --- |
-| Task | Text generation |
-| Architecture | `NemotronHForCausalLM` |
+Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node run.
 
-### Available Models
+### Recipe Setup
+
+Read [nemotron_ultra_v3_squad.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_ultra_v3_squad.yaml) for checkpoint access, data paths, and backend dependencies. Use the [Slurm launcher guide](/job-launchers/slurm-cluster) to prepare the distributed allocation.
+
+## Available Models
 
 - [`nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16`](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16)
 
@@ -62,3 +77,5 @@ Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node 
 ## Related Resources
 
 - [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16/blob/77df655d5e9f8362164ed14dd8b48f8bce657498/config.json)

@@ -1,5 +1,5 @@
 ---
-title: "Nemotron-Labs-Diffusion-8B-Base"
+title: "nvidia/Nemotron-Labs-Diffusion-8B-Base"
 description: "Fine-tune Nemotron-Labs-Diffusion-8B-Base with NeMo AutoModel using checked-in full-parameter and LoRA diffusion language model recipes."
 slug: model-coverage/dllm/nvidia/Nemotron-Labs-Diffusion-8B-Base
 ---
@@ -7,8 +7,6 @@ slug: model-coverage/dllm/nvidia/Nemotron-Labs-Diffusion-8B-Base
 [Nemotron-Labs-Diffusion](https://huggingface.co/nvidia/Nemotron-Labs-Diffusion-8B-Base) is NVIDIA's 8B diffusion language model.
 
 ## Quick Start
-
-### Fine-Tune Nemotron-Labs-Diffusion-8B-Base
 
 From the repository root, run:
 
@@ -25,22 +23,24 @@ uv run automodel --nproc-per-node=8 examples/dllm_sft/nemotron_labs_diffusion_sf
 
 ## Model Context
 
-### Recipe Notes
-
-See the [dLLM Fine-Tuning Guide](/recipes-e2e-examples/dllm-fine-tuning).
-
-## Model Reference
-
-### Model Architecture
-
 | Property | Value |
 |---|---|
 | **Task** | Diffusion Language Modeling |
 | **Architecture** | `NemotronLabsDiffusionModel` with Hugging Face `trust_remote_code` |
 | **Parameters** | 8B |
 | **HF Org** | [nvidia](https://huggingface.co/nvidia) |
+| Decoder Layers | 34 |
+| Hidden Size | 4,096 |
+| Attention | 32 attention heads / 8 key-value heads |
+| Context Length | 4,096 tokens (checkpoint configuration) |
+| Vocabulary Size | 131,072 |
+| Configured Dtype | `bfloat16` |
 
-### Available Models
+### Recipe Notes
+
+See the [dLLM Fine-Tuning Guide](/recipes-e2e-examples/dllm-fine-tuning).
+
+## Available Models
 
 | Checkpoint | Type |
 | --- | --- |
@@ -49,3 +49,5 @@ See the [dLLM Fine-Tuning Guide](/recipes-e2e-examples/dllm-fine-tuning).
 ## Related Resources
 
 - [Installation Instructions](/get-started/installation)
+
+- [Checkpoint Configuration](https://huggingface.co/nvidia/Nemotron-Labs-Diffusion-8B-Base/blob/59ff0ffee284112fc6ccf37493ced41a11031434/config.json)

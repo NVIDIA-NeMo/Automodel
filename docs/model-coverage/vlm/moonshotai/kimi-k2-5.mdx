@@ -1,5 +1,5 @@
 ---
-title: "Kimi-K2.5"
+title: "moonshotai/Kimi-K2.5"
 description: "Use NeMo AutoModel to fine-tune Kimi-K2.5 for VLM workflows with checked-in image-text-to-text recipes and documented distributed settings."
 slug: model-coverage/vision-language-models/moonshotai/Kimi-K2.5
 ---
@@ -9,15 +9,13 @@ The Hugging Face configuration declares the `KimiK25ForConditionalGeneration` ar
 
 ## Quick Start
 
-### Fine-Tune Kimi-K2.5
-
-Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+Allocate 32 nodes with 8 GPUs each. Set `NODE_RANK` and `MASTER_ADDR` on every node; complete the recipe prerequisites in Model Context before launching.
 
 ```bash
-automodel examples/vlm_finetune/kimi/kimi25vl_medpix.yaml --nproc-per-node 8
+uv run torchrun --nnodes 32 --nproc-per-node 8 \
+  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
+  -m nemo_automodel.cli.app examples/vlm_finetune/kimi/kimi25vl_medpix.yaml
 ```
-
-Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node run.
 
 ## Choose a Workflow
 
@@ -27,6 +25,19 @@ Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node 
 | Try another checked-in recipe for this model | Use the [alternate recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_benchmark/kimi/kimi25vl_lora.yaml). |
 
 ## Model Context
+
+| Property | Value |
+| --- | --- |
+| Task | Image-text-to-text |
+| Architecture | `KimiK25ForConditionalGeneration` |
+| Parameters | 1T total / 32B activated |
+| Decoder Layers | 61 |
+| Hidden Size | 7,168 |
+| Attention | 64 attention heads / 64 key-value heads |
+| Context Length | 262,144 tokens (checkpoint configuration) |
+| Vocabulary Size | 163,840 |
+| Experts | 384 routed / 1 shared / 8 selected per token |
+| Configured Dtype | `bfloat16` |
 
 ### Configuration
 
@@ -42,16 +53,7 @@ Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node 
 
 - [`kimi25vl_lora.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_benchmark/kimi/kimi25vl_lora.yaml)
 
-## Model Reference
-
-### Model Architecture
-
-| Property | Value |
-| --- | --- |
-| Task | Image-text-to-text |
-| Architecture | `KimiK25ForConditionalGeneration` |
-
-### Available Models
+## Available Models
 
 - [`moonshotai/Kimi-K2.5`](https://huggingface.co/moonshotai/Kimi-K2.5)
 
@@ -63,3 +65,5 @@ Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node 
 ## Related Resources
 
 - [Vision-language model fine-tuning guide](/recipes-e2e-examples/gemma-3-3n)
+
+- [Checkpoint Configuration](https://huggingface.co/moonshotai/Kimi-K2.5/blob/4d01dfe0332d63057c186e0b262165819efb6611/config.json)

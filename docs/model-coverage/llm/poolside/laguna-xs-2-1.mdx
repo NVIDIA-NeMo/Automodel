@@ -1,5 +1,5 @@
 ---
-title: "Laguna-XS-2.1"
+title: "poolside/Laguna-XS-2.1"
 description: "Use NeMo AutoModel to fine-tune Laguna-XS-2.1 for LLM workflows with checked-in text generation recipes and documented distributed settings."
 slug: model-coverage/large-language-models/poolside/Laguna-XS-2.1
 ---
@@ -8,8 +8,6 @@ slug: model-coverage/large-language-models/poolside/Laguna-XS-2.1
 The Hugging Face configuration declares the `LagunaForCausalLM` architecture.
 
 ## Quick Start
-
-### Fine-Tune Laguna-XS-2.1
 
 Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
 
@@ -26,6 +24,19 @@ automodel examples/llm_finetune/laguna/laguna_xs_2p1_hellaswag_ep8.yaml --nproc-
 
 ## Model Context
 
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| Architecture | `LagunaForCausalLM` |
+| Parameters | 33.44B checkpoint parameters |
+| Decoder Layers | 40 |
+| Hidden Size | 2,048 |
+| Attention | 48 attention heads / 8 key-value heads |
+| Context Length | 262,144 tokens (checkpoint configuration) |
+| Vocabulary Size | 100,352 |
+| Experts | 256 routed / 8 selected per token |
+| Configured Dtype | `bfloat16` |
+
 ### Configuration
 
 | Setting | Configuration |
@@ -36,16 +47,7 @@ automodel examples/llm_finetune/laguna/laguna_xs_2p1_hellaswag_ep8.yaml --nproc-
 | Features | Activation checkpointing (activation_checkpointing=true), Packed sequences (packed_sequence_size=1024) |
 | Advanced | bfloat16, attention=sdpa, linear=torch, experts=torch_mm, dispatcher=torch |
 
-## Model Reference
-
-### Model Architecture
-
-| Property | Value |
-| --- | --- |
-| Task | Text generation |
-| Architecture | `LagunaForCausalLM` |
-
-### Available Models
+## Available Models
 
 - [`poolside/Laguna-XS-2.1`](https://huggingface.co/poolside/Laguna-XS-2.1)
 
@@ -57,3 +59,5 @@ automodel examples/llm_finetune/laguna/laguna_xs_2p1_hellaswag_ep8.yaml --nproc-
 ## Related Resources
 
 - [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/poolside/Laguna-XS-2.1/blob/c5f36269bbdbd3f27fddc9a9f9dbae0cf2cf57db/config.json)

@@ -1,33 +1,30 @@
 ---
-title: "GritLM-7B-vllm"
-description: "Reference GritLM-7B-vllm checkpoint and architecture details for NeMo AutoModel, with model-family information, setup guidance, and upstream resources."
+title: "parasail-ai/GritLM-7B-vllm"
+description: "Fine-tune parasail-ai/GritLM-7B-vllm with NeMo AutoModel using a checked-in LoRA recipe, with checkpoint and architecture details."
 slug: model-coverage/large-language-models/parasail-ai/GritLM-7B-vllm
 ---
 
 [GritLM](https://github.com/ContextualAI/gritlm) (Generative Representational Instruction Tuning) is a unified model that performs both generative language modeling and text embedding in a single model, from Parasail AI.
 
-Use this page as a checkpoint and architecture reference. Set up NeMo AutoModel with the
+Set up NeMo AutoModel with the
 [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the
 [installation instructions](/get-started/installation).
 
 ## Quick Start
 
-This page provides checkpoint and architecture reference information rather
-than a model-specific launch command. Follow the
-[installation instructions](/get-started/installation) to set up NeMo AutoModel.
+Follow the [installation instructions](/get-started/installation). From the repository root, use 8 GPUs. This is an example configuration; GPU training and memory use still require validation.
+
+```bash
+uv run automodel examples/llm_finetune/parasail_ai/gritlm_7b_vllm_squad_peft.yaml --nproc-per-node 8
+```
 
 ## Choose a Workflow
 
 | Goal | Start Here |
 | --- | --- |
-| Explore checkpoints | See [Available Models](#available-models). |
-| Configure NeMo AutoModel | Follow the [installation instructions](/get-started/installation). |
+| Fine-tune parasail-ai/GritLM-7B-vllm | [gritlm_7b_vllm_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/parasail_ai/gritlm_7b_vllm_squad_peft.yaml). Example LoRA configuration; validate GPU training. |
 
 ## Model Context
-
-## Model Reference
-
-### Model Architecture
 
 | Property | Value |
 | --- | --- |
@@ -35,8 +32,18 @@ than a model-specific launch command. Follow the
 | Architecture | `GritLM` |
 | Parameters | 7B |
 | Hugging Face Organization | [parasail-ai](https://huggingface.co/parasail-ai) |
+| Decoder Layers | 32 |
+| Hidden Size | 4,096 |
+| Attention | 32 attention heads / 8 key-value heads |
+| Context Length | 32,768 tokens (checkpoint configuration) |
+| Vocabulary Size | 32,000 |
+| Configured Dtype | `bfloat16` |
 
-### Available Models
+### Recipe Setup
+
+Read [gritlm_7b_vllm_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/parasail_ai/gritlm_7b_vllm_squad_peft.yaml) for checkpoint access, data paths, and backend dependencies. It provides a small LoRA fine-tuning example.
+
+## Available Models
 
 | Model | HF ID |
 |---|---|
@@ -45,3 +52,5 @@ than a model-specific launch command. Follow the
 ## Related Resources
 
 - [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/parasail-ai/GritLM-7B-vllm/blob/d6ec7afefec5032020b47db967a86e556312c957/config.json)

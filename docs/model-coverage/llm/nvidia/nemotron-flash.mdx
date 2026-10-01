@@ -1,5 +1,5 @@
 ---
-title: "Nemotron-Flash-1B"
+title: "nvidia/Nemotron-Flash-1B"
 description: "Use Nemotron-Flash-1B with NeMo AutoModel for language model fine-tuning, with documented checkpoints, runnable recipes, setup guidance, and model reference details."
 slug: model-coverage/large-language-models/nvidia/Nemotron-Flash-1B
 ---
@@ -14,8 +14,6 @@ This model requires `trust_remote_code: true` in your recipe YAML.
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
 ## Quick Start
-
-### Fine-Tune Nemotron-Flash-1B
 
 From the repository root, run:
 
@@ -32,18 +30,21 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/nemotron_flash/nemotro
 
 ## Model Context
 
-## Model Reference
-
-### Model Architecture
-
 | Property | Value |
 | --- | --- |
 | Task | Text Generation |
 | Architecture | `NemotronFlashForCausalLM` |
 | Parameters | 1B |
 | Hugging Face Organization | [nvidia](https://huggingface.co/nvidia) |
+| Decoder Layers | 24 |
+| Hidden Size | 2,048 |
+| Attention | 16 attention heads / 4 key-value heads |
+| Context Length | 36,000 tokens (checkpoint configuration) |
+| Vocabulary Size | 131,072 |
+| Experts | 1 routed / 1 selected per token |
+| Configured Dtype | `bfloat16` |
 
-### Available Models
+## Available Models
 
 | Model | HF ID |
 |---|---|
@@ -52,3 +53,5 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/nemotron_flash/nemotro
 ## Related Resources
 
 - [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/nvidia/Nemotron-Flash-1B/blob/da87f707f678b5936e67fdcfe598f76ebcc5fdbc/config.json)

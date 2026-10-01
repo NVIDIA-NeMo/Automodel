@@ -1,5 +1,5 @@
 ---
-title: "phi-2"
+title: "microsoft/phi-2"
 description: "Use phi-2 with NeMo AutoModel for language model fine-tuning, with documented checkpoints, runnable recipes, setup guidance, and model reference details."
 slug: model-coverage/large-language-models/microsoft/phi-2
 ---
@@ -9,8 +9,6 @@ slug: model-coverage/large-language-models/microsoft/phi-2
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
 ## Quick Start
-
-### Fine-Tune phi-2
 
 From the repository root, run:
 
@@ -27,18 +25,20 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/phi/phi_2_squad.yaml
 
 ## Model Context
 
-## Model Reference
-
-### Model Architecture
-
 | Property | Value |
 | --- | --- |
 | Task | Text Generation |
 | Architecture | `PhiForCausalLM` |
 | Parameters | 2.7B |
 | Hugging Face Organization | [microsoft](https://huggingface.co/microsoft) |
+| Decoder Layers | 32 |
+| Hidden Size | 2,560 |
+| Attention | 32 attention heads / 32 key-value heads |
+| Context Length | 2,048 tokens (checkpoint configuration) |
+| Vocabulary Size | 51,200 |
+| Configured Dtype | `float16` |
 
-### Available Models
+## Available Models
 
 | Model | HF ID |
 |---|---|
@@ -47,3 +47,5 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/phi/phi_2_squad.yaml
 ## Related Resources
 
 - [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/microsoft/phi-2/blob/810d367871c1d460086d9f82db8696f2e0a0fcd0/config.json)

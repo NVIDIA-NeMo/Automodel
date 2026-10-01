@@ -1,5 +1,5 @@
 ---
-title: "Mixtral-8x7B-v0.1"
+title: "mistralai/Mixtral-8x7B-v0.1"
 description: "Use Mixtral-8x7B-v0.1 with NeMo AutoModel for language model fine-tuning, with documented checkpoints, runnable recipes, setup guidance, and model reference details."
 slug: model-coverage/large-language-models/mistralai/Mixtral-8x7B-v0.1
 ---
@@ -10,12 +10,12 @@ Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com
 
 ## Quick Start
 
-### Fine-Tune Mixtral-8x7B-v0.1
-
-From the repository root, run:
+Allocate 2 nodes with 8 GPUs each. Set `NODE_RANK` and `MASTER_ADDR` on every node; complete the recipe prerequisites in Model Context before launching.
 
 ```bash
-uv run automodel --nproc-per-node=8 examples/llm_finetune/mistral/mixtral-8x7b-v0-1_squad.yaml
+uv run torchrun --nnodes 2 --nproc-per-node 8 \
+  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
+  -m nemo_automodel.cli.app examples/llm_finetune/mistral/mixtral-8x7b-v0-1_squad.yaml
 ```
 
 ## Choose a Workflow
@@ -26,18 +26,21 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/mistral/mixtral-8x7b-v
 
 ## Model Context
 
-## Model Reference
-
-### Model Architecture
-
 | Property | Value |
 | --- | --- |
 | Task | Text Generation (MoE) |
 | Architecture | `MixtralForCausalLM` |
 | Parameters | 47B total / 13B active |
 | Hugging Face Organization | [mistralai](https://huggingface.co/mistralai) |
+| Decoder Layers | 32 |
+| Hidden Size | 4,096 |
+| Attention | 32 attention heads / 8 key-value heads |
+| Context Length | 32,768 tokens (checkpoint configuration) |
+| Vocabulary Size | 32,000 |
+| Experts | 8 routed / 2 selected per token |
+| Configured Dtype | `bfloat16` |
 
-### Available Models
+## Available Models
 
 | Model | HF ID |
 |---|---|
@@ -47,3 +50,5 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/mistral/mixtral-8x7b-v
 
 - [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
 - [Large MoE Fine-Tuning Guide](/recipes-e2e-examples/large-moe-fine-tuning)
+
+- [Checkpoint Configuration](https://huggingface.co/mistralai/Mixtral-8x7B-v0.1/blob/fc7ac94680e38d7348cfa806e51218e6273104b0/config.json)

@@ -1,33 +1,30 @@
 ---
-title: "solar-pro-preview-instruct"
-description: "Reference solar-pro-preview-instruct checkpoint and architecture details for NeMo AutoModel, with model-family information, setup guidance, and upstream resources."
+title: "upstage/solar-pro-preview-instruct"
+description: "Fine-tune upstage/solar-pro-preview-instruct with NeMo AutoModel using a checked-in LoRA recipe, with checkpoint and architecture details."
 slug: model-coverage/large-language-models/upstage/solar-pro-preview-instruct
 ---
 
 [Solar Pro](https://huggingface.co/upstage/solar-pro-preview-instruct) is an enterprise language model from Upstage, built on a depth up-scaling technique applied to Llama-based architectures.
 
-Use this page as a checkpoint and architecture reference. Set up NeMo AutoModel with the
+Set up NeMo AutoModel with the
 [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the
 [installation instructions](/get-started/installation).
 
 ## Quick Start
 
-This page provides checkpoint and architecture reference information rather
-than a model-specific launch command. Follow the
-[installation instructions](/get-started/installation) to set up NeMo AutoModel.
+Follow the [installation instructions](/get-started/installation). From the repository root, use 8 GPUs. This is an example configuration; GPU training and memory use still require validation.
+
+```bash
+uv run automodel examples/llm_finetune/upstage/solar_pro_preview_instruct_squad_peft.yaml --nproc-per-node 8
+```
 
 ## Choose a Workflow
 
 | Goal | Start Here |
 | --- | --- |
-| Explore checkpoints | See [Available Models](#available-models). |
-| Configure NeMo AutoModel | Follow the [installation instructions](/get-started/installation). |
+| Fine-tune upstage/solar-pro-preview-instruct | [solar_pro_preview_instruct_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/upstage/solar_pro_preview_instruct_squad_peft.yaml). Example LoRA configuration; validate GPU training. |
 
 ## Model Context
-
-## Model Reference
-
-### Model Architecture
 
 | Property | Value |
 | --- | --- |
@@ -35,8 +32,18 @@ than a model-specific launch command. Follow the
 | Architecture | `SolarForCausalLM` |
 | Parameters | 22B |
 | Hugging Face Organization | [upstage](https://huggingface.co/upstage) |
+| Decoder Layers | 64 |
+| Hidden Size | 5,120 |
+| Attention | 40 attention heads / 10 key-value heads |
+| Context Length | 4,096 tokens (checkpoint configuration) |
+| Vocabulary Size | 32,128 |
+| Configured Dtype | `bfloat16` |
 
-### Available Models
+### Recipe Setup
+
+Read [solar_pro_preview_instruct_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/upstage/solar_pro_preview_instruct_squad_peft.yaml) for checkpoint access, data paths, and backend dependencies. It provides a small LoRA fine-tuning example.
+
+## Available Models
 
 | Model | HF ID |
 |---|---|
@@ -45,3 +52,5 @@ than a model-specific launch command. Follow the
 ## Related Resources
 
 - [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/upstage/solar-pro-preview-instruct/blob/dd4bcf7006df9b1ce3f87711e702e4063832aae3/config.json)

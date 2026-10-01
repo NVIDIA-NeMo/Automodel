@@ -1,5 +1,5 @@
 ---
-title: "NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
+title: "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
 description: "Use NeMo AutoModel to fine-tune NVIDIA-Nemotron-3-Nano-30B-A3B-BF16 for LLM workflows with checked-in text generation recipes and documented distributed settings."
 slug: model-coverage/large-language-models/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
 ---
@@ -8,8 +8,6 @@ slug: model-coverage/large-language-models/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B
 The Hugging Face configuration declares the `NemotronHForCausalLM` architecture.
 
 ## Quick Start
-
-### Fine-Tune NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
 
 Follow the [installation instructions](/get-started/installation), then review the checked-in recipe and
 its declared topology below before choosing a local or cluster launcher.
@@ -27,6 +25,19 @@ uv run automodel examples/llm_finetune/nemotron/nemotron_nano_v3_cp_test.yaml \
 | Try another checked-in recipe for this model | Use the [alternate recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/nemotron/nemotron_nano_v3_te_deepep.yaml). |
 
 ## Model Context
+
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| Architecture | `NemotronHForCausalLM` |
+| Parameters | 31.58B checkpoint parameters |
+| Decoder Layers | 52 |
+| Hidden Size | 2,688 |
+| Attention | 32 attention heads / 2 key-value heads |
+| Context Length | 262,144 tokens (checkpoint configuration) |
+| Vocabulary Size | 131,072 |
+| Experts | 128 routed / 1 shared / 6 selected per token |
+| Configured Dtype | `bfloat16` |
 
 ### Configuration
 
@@ -50,16 +61,7 @@ uv run automodel examples/llm_finetune/nemotron/nemotron_nano_v3_cp_test.yaml \
 - [`nemotron_nano_v3_hellaswag_peft_te.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_nano_v3_hellaswag_peft_te.yaml)
 - [`nemotron_nano_v3_singlegpu_lora.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_nano_v3_singlegpu_lora.yaml)
 
-## Model Reference
-
-### Model Architecture
-
-| Property | Value |
-| --- | --- |
-| Task | Text generation |
-| Architecture | `NemotronHForCausalLM` |
-
-### Available Models
+## Available Models
 
 - [`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16`](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16)
 
@@ -71,3 +73,5 @@ uv run automodel examples/llm_finetune/nemotron/nemotron_nano_v3_cp_test.yaml \
 ## Related Resources
 
 - [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16/blob/bf77c3174f68ad409e1c2aa60daeb46e32d1c606/config.json)

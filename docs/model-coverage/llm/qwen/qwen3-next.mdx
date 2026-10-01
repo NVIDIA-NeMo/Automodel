@@ -1,5 +1,5 @@
 ---
-title: "Qwen3-Next-80B-A3B-Instruct"
+title: "Qwen/Qwen3-Next-80B-A3B-Instruct"
 description: "Use Qwen3-Next-80B-A3B-Instruct with NeMo AutoModel for language model fine-tuning, with documented checkpoints, runnable recipes, setup, and model reference details."
 slug: model-coverage/large-language-models/qwen/Qwen3-Next-80B-A3B-Instruct
 ---
@@ -10,17 +10,12 @@ Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com
 
 ## Quick Start
 
-### Fine-Tune Qwen3-Next-80B-A3B-Instruct
-
-<Note>
-This recipe was validated on **4 nodes x 8 GPUs (32 H100s)**. See the [Launcher Guide](/job-launchers/slurm-cluster) for multi-node setup.
-
-</Note>
-
-From the repository root, run:
+Allocate 4 nodes with 8 GPUs each. Set `NODE_RANK` and `MASTER_ADDR` on every node; complete the recipe prerequisites in Model Context before launching.
 
 ```bash
-uv run automodel --nproc-per-node=8 examples/llm_finetune/qwen/qwen3_next_te_deepep.yaml
+uv run torchrun --nnodes 4 --nproc-per-node 8 \
+  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
+  -m nemo_automodel.cli.app examples/llm_finetune/qwen/qwen3_next_te_deepep.yaml
 ```
 
 ## Choose a Workflow
@@ -31,18 +26,21 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/qwen/qwen3_next_te_dee
 
 ## Model Context
 
-## Model Reference
-
-### Model Architecture
-
 | Property | Value |
 | --- | --- |
 | Task | Text Generation (MoE) |
 | Architecture | `Qwen3NextForCausalLM` |
 | Parameters | 80B total / 3B active |
 | Hugging Face Organization | [Qwen](https://huggingface.co/Qwen) |
+| Decoder Layers | 48 |
+| Hidden Size | 2,048 |
+| Attention | 16 attention heads / 2 key-value heads |
+| Context Length | 262,144 tokens (checkpoint configuration) |
+| Vocabulary Size | 151,936 |
+| Experts | 512 routed / 10 selected per token |
+| Configured Dtype | `bfloat16` |
 
-### Available Models
+## Available Models
 
 | Model | HF ID |
 |---|---|
@@ -52,3 +50,5 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/qwen/qwen3_next_te_dee
 
 - [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
 - [Large MoE Fine-Tuning Guide](/recipes-e2e-examples/large-moe-fine-tuning)
+
+- [Checkpoint Configuration](https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Instruct/blob/9c7f2fbe84465e40164a94cc16cd30b6999b0cc7/config.json)

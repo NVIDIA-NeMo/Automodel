@@ -1,5 +1,5 @@
 ---
-title: "Llama-3.1-70B"
+title: "meta-llama/Llama-3.1-70B"
 description: "Use NeMo AutoModel to fine-tune Llama-3.1-70B for LLM workflows with checked-in text generation recipes and documented distributed settings."
 slug: model-coverage/large-language-models/meta/Llama-3.1-70B
 ---
@@ -9,19 +9,32 @@ The Hugging Face configuration declares the `LlamaForCausalLM` architecture.
 
 ## Quick Start
 
-### Fine-Tune Llama-3.1-70B
+Follow the [installation instructions](/get-started/installation). From the repository root, use 8 GPUs. Complete the [recipe setup](#recipe-setup) before launching.
 
-Follow the [installation instructions](/get-started/installation), then review the checked-in recipe and
-its declared topology below before choosing a local or cluster launcher.
+```bash
+uv run automodel examples/llm_pretrain/llama3_70b_pretrain.yaml --nproc-per-node 8
+```
 
 ## Choose a Workflow
 
 | Goal | Start Here |
 | --- | --- |
-| Run the primary recipe for this model | Use the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/llama3_70b_pretrain.yaml). |
+| Pretrain meta-llama/Llama-3.1-70B | [llama3_70b_pretrain.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/llama3_70b_pretrain.yaml). 1 node, 8 GPUs per node; see [Recipe Setup](#recipe-setup). |
 | Try another checked-in recipe for this model | Use the [alternate recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/llama3_3/custom_llama3_1_70b_pretrain_benchmark_8nodes.yaml). |
 
 ## Model Context
+
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| Architecture | `LlamaForCausalLM` |
+| Parameters | 70.55B checkpoint parameters |
+| Decoder Layers | 80 |
+| Hidden Size | 8,192 |
+| Attention | 64 attention heads / 8 key-value heads |
+| Context Length | 131,072 tokens (checkpoint configuration) |
+| Vocabulary Size | 128,256 |
+| Configured Dtype | `bfloat16` |
 
 ### Configuration
 
@@ -37,16 +50,16 @@ its declared topology below before choosing a local or cluster launcher.
 
 - [`custom_llama3_1_70b_pretrain_benchmark_8nodes.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/llama3_3/custom_llama3_1_70b_pretrain_benchmark_8nodes.yaml)
 
-## Model Reference
+### Setup and Additional Examples
 
-### Model Architecture
+Follow the [installation instructions](/get-started/installation), then review the checked-in recipe and
+its declared topology below before choosing a local or cluster launcher.
 
-| Property | Value |
-| --- | --- |
-| Task | Text generation |
-| Architecture | `LlamaForCausalLM` |
+### Recipe Setup
 
-### Available Models
+Read [llama3_70b_pretrain.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/llama3_70b_pretrain.yaml) for checkpoint access, data paths, and backend dependencies.
+
+## Available Models
 
 - [`meta-llama/Llama-3.1-70B`](https://huggingface.co/meta-llama/Llama-3.1-70B)
 
@@ -58,3 +71,5 @@ its declared topology below before choosing a local or cluster launcher.
 ## Related Resources
 
 - [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/meta-llama/Llama-3.1-70B/blob/349b2ddb53ce8f2849a6c168a81980ab25258dac/config.json)

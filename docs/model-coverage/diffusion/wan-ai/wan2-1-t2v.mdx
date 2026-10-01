@@ -1,6 +1,6 @@
 ---
-title: "Wan2.1-T2V-1.3B-Diffusers"
-description: "Reference Wan2.1-T2V-1.3B-Diffusers checkpoint and architecture details for NeMo AutoModel, with setup guidance and related training recipes."
+title: "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
+description: "Fine-tune Wan-AI/Wan2.1-T2V-1.3B-Diffusers with NeMo AutoModel using the checked-in recipe, launch command, architecture details, and checkpoint references."
 slug: model-coverage/diffusion/wan-ai/Wan2.1-T2V-1.3B-Diffusers
 ---
 
@@ -13,12 +13,12 @@ The 1.3B fine-tuning configuration uses 16 data-parallel ranks. Use the
 
 ## Quick Start
 
-### Fine-Tune Wan2.1-T2V-1.3B-Diffusers
-
-From the repository root, run:
+Allocate 2 nodes with 8 GPUs each. Set `NODE_RANK` and `MASTER_ADDR` on each node, configure data paths, and run:
 
 ```bash
-uv run automodel examples/diffusion/finetune/wan2_1_t2v_flow_multinode.yaml --nproc-per-node 8
+uv run torchrun --nnodes 2 --nproc-per-node 8 \
+  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
+  examples/diffusion/finetune/finetune.py -c examples/diffusion/finetune/wan2_1_t2v_flow_multinode.yaml
 ```
 
 ## Choose a Workflow
@@ -30,22 +30,21 @@ uv run automodel examples/diffusion/finetune/wan2_1_t2v_flow_multinode.yaml --np
 
 ## Model Context
 
-### Task
-
-- Text-to-Video (T2V)
-
-## Model Reference
-
-### Model Architecture
-
 | Property | Value |
 | --- | --- |
 | Task | Text-to-Video |
 | Architecture | DiT (Flow Matching) |
 | Parameters | 1.3B |
 | Hugging Face Organization | [Wan-AI](https://huggingface.co/Wan-AI) |
+| Transformer Blocks | 30 |
+| Hidden Size | 1,536 |
+| Attention | 12 attention heads |
 
-### Available Models
+### Task
+
+- Text-to-Video (T2V)
+
+## Available Models
 
 | Model | HF ID |
 |---|---|
@@ -55,3 +54,5 @@ uv run automodel examples/diffusion/finetune/wan2_1_t2v_flow_multinode.yaml --np
 
 - [Diffusion Fine-Tuning Guide](/recipes-e2e-examples/diffusion-fine-tuning)
 - [Dataset Preparation](/datasets/diffusion-dataset)
+
+- [Checkpoint Configuration](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B-Diffusers/blob/0fad780a534b6463e45facd96134c9f345acfa5b/transformer/config.json)

@@ -1,5 +1,5 @@
 ---
-title: "QwQ-32B"
+title: "Qwen/QwQ-32B"
 description: "Use NeMo AutoModel to fine-tune QwQ-32B for LLM workflows with checked-in text generation recipes and documented distributed settings."
 slug: model-coverage/large-language-models/qwen/QwQ-32B
 ---
@@ -9,15 +9,13 @@ The Hugging Face configuration declares the `Qwen2ForCausalLM` architecture.
 
 ## Quick Start
 
-### Fine-Tune QwQ-32B
-
-Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+Allocate 2 nodes with 8 GPUs each. Set `NODE_RANK` and `MASTER_ADDR` on every node; complete the recipe prerequisites in Model Context before launching.
 
 ```bash
-automodel examples/llm_finetune/qwen/qwq_32b_squad.yaml --nproc-per-node 8
+uv run torchrun --nnodes 2 --nproc-per-node 8 \
+  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
+  -m nemo_automodel.cli.app examples/llm_finetune/qwen/qwq_32b_squad.yaml
 ```
-
-Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node run.
 
 ## Choose a Workflow
 
@@ -27,6 +25,18 @@ Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node 
 | Try another checked-in recipe for this model | Use the [alternate recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwq_32b_squad_peft.yaml). |
 
 ## Model Context
+
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| Architecture | `Qwen2ForCausalLM` |
+| Parameters | 32.76B checkpoint parameters |
+| Decoder Layers | 64 |
+| Hidden Size | 5,120 |
+| Attention | 40 attention heads / 8 key-value heads |
+| Context Length | 40,960 tokens (checkpoint configuration) |
+| Vocabulary Size | 152,064 |
+| Configured Dtype | `bfloat16` |
 
 ### Configuration
 
@@ -42,16 +52,7 @@ Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node 
 
 - [`qwq_32b_squad_peft.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwq_32b_squad_peft.yaml)
 
-## Model Reference
-
-### Model Architecture
-
-| Property | Value |
-| --- | --- |
-| Task | Text generation |
-| Architecture | `Qwen2ForCausalLM` |
-
-### Available Models
+## Available Models
 
 - [`Qwen/QwQ-32B`](https://huggingface.co/Qwen/QwQ-32B)
 
@@ -63,3 +64,5 @@ Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node 
 ## Related Resources
 
 - [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/Qwen/QwQ-32B/blob/976055f8c83f394f35dbd3ab09a285a984907bd0/config.json)

@@ -1,5 +1,5 @@
 ---
-title: "FLUX.1-dev"
+title: "black-forest-labs/FLUX.1-dev"
 description: "Use FLUX.1-dev with NeMo AutoModel for diffusion training and fine-tuning, with documented checkpoints, runnable recipes, setup guidance, and model reference details."
 slug: model-coverage/diffusion/black-forest-labs/FLUX.1-dev
 ---
@@ -9,8 +9,6 @@ slug: model-coverage/diffusion/black-forest-labs/FLUX.1-dev
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
 ## Quick Start
-
-### Fine-Tune FLUX.1-dev
 
 From the repository root, run:
 
@@ -29,22 +27,21 @@ uv run torchrun --nproc-per-node=8 \
 
 ## Model Context
 
-### Task
-
-- Text-to-Image (T2I)
-
-## Model Reference
-
-### Model Architecture
-
 | Property | Value |
 | --- | --- |
 | Task | Text-to-Image |
 | Architecture | DiT (Flow Matching) |
 | Parameters | 12B |
 | Hugging Face Organization | [black-forest-labs](https://huggingface.co/black-forest-labs) |
+| Transformer Blocks | 19 dual-stream / 38 single-stream |
+| Hidden Size | 3,072 |
+| Attention | 24 attention heads |
 
-### Available Models
+### Task
+
+- Text-to-Image (T2I)
+
+## Available Models
 
 | Model | HF ID |
 |---|---|
@@ -54,3 +51,5 @@ uv run torchrun --nproc-per-node=8 \
 
 - [Diffusion Fine-Tuning Guide](/recipes-e2e-examples/diffusion-fine-tuning)
 - [Dataset Preparation](/datasets/diffusion-dataset)
+
+- [Upstream Architecture Configuration](https://github.com/black-forest-labs/flux/blob/802fb4713906133fcbd0d8dc5351620ca4773036/src/flux/util.py)

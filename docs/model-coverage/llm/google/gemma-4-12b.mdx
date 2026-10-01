@@ -1,5 +1,5 @@
 ---
-title: "gemma-4-12B"
+title: "google/gemma-4-12B"
 description: "Fine-tune gemma-4-12B for text generation with NeMo AutoModel using checked-in recipes and documented distributed settings."
 slug: model-coverage/large-language-models/google/gemma-4-12B
 ---
@@ -8,8 +8,6 @@ slug: model-coverage/large-language-models/google/gemma-4-12B
 The Hugging Face configuration declares the `Gemma4UnifiedForConditionalGeneration` architecture.
 
 ## Quick Start
-
-### Fine-Tune Gemma-4-12B
 
 Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
 
@@ -26,6 +24,18 @@ automodel examples/llm_finetune/gemma/gemma_4_12b_hellaswag.yaml --nproc-per-nod
 
 ## Model Context
 
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| Architecture | `Gemma4UnifiedForConditionalGeneration` |
+| Parameters | 11.96B checkpoint parameters |
+| Decoder Layers | 48 |
+| Hidden Size | 3,840 |
+| Attention | 16 attention heads; 8 key-value heads in sliding layers / 1 in global layers |
+| Context Length | 262,144 tokens (checkpoint configuration) |
+| Vocabulary Size | 262,144 |
+| Configured Dtype | `bfloat16` |
+
 ### Configuration
 
 | Setting | Configuration |
@@ -36,16 +46,7 @@ automodel examples/llm_finetune/gemma/gemma_4_12b_hellaswag.yaml --nproc-per-nod
 | Features | Checkpointing (enabled=true) |
 | Advanced | bf16 |
 
-## Model Reference
-
-### Model Architecture
-
-| Property | Value |
-| --- | --- |
-| Task | Text generation |
-| Architecture | `Gemma4UnifiedForConditionalGeneration` |
-
-### Available Models
+## Available Models
 
 - [`google/gemma-4-12B`](https://huggingface.co/google/gemma-4-12B)
 
@@ -57,3 +58,5 @@ automodel examples/llm_finetune/gemma/gemma_4_12b_hellaswag.yaml --nproc-per-nod
 ## Related Resources
 
 - [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/google/gemma-4-12B/blob/023679ed352de9bb66cc873c9009ce3482585c08/config.json)

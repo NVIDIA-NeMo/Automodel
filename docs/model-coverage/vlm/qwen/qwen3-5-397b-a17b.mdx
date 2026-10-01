@@ -1,5 +1,5 @@
 ---
-title: "Qwen3.5-397B-A17B"
+title: "Qwen/Qwen3.5-397B-A17B"
 description: "Use NeMo AutoModel to fine-tune Qwen3.5-397B-A17B for VLM workflows with checked-in image-text-to-text recipes and documented distributed settings."
 slug: model-coverage/vision-language-models/qwen/Qwen3.5-397B-A17B
 ---
@@ -9,15 +9,13 @@ The Hugging Face configuration declares the `Qwen3_5MoeForConditionalGeneration`
 
 ## Quick Start
 
-### Fine-Tune Qwen3.5-397B-A17B
-
-Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+Allocate 32 nodes with 8 GPUs each. Set `NODE_RANK` and `MASTER_ADDR` on every node; complete the recipe prerequisites in Model Context before launching.
 
 ```bash
-automodel examples/vlm_finetune/qwen3_5_moe/qwen3_5_moe_medpix.yaml --nproc-per-node 8
+uv run torchrun --nnodes 32 --nproc-per-node 8 \
+  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
+  -m nemo_automodel.cli.app examples/vlm_finetune/qwen3_5_moe/qwen3_5_moe_medpix.yaml
 ```
-
-Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node run.
 
 ## Choose a Workflow
 
@@ -27,6 +25,18 @@ Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node 
 | Prepare your environment | Follow the [installation instructions](/get-started/installation). |
 
 ## Model Context
+
+| Property | Value |
+| --- | --- |
+| Task | Image-text-to-text |
+| Architecture | `Qwen3_5MoeForConditionalGeneration` |
+| Parameters | 403.40B checkpoint parameters |
+| Decoder Layers | 60 |
+| Hidden Size | 4,096 |
+| Attention | 32 attention heads / 2 key-value heads |
+| Context Length | 262,144 tokens (checkpoint configuration) |
+| Vocabulary Size | 248,320 |
+| Experts | 512 routed / 10 selected per token |
 
 ### Configuration
 
@@ -38,16 +48,7 @@ Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node 
 | Features | HybridEP (dispatcher=hybridep) |
 | Advanced | attention=sdpa, linear=torch, experts=gmm, dispatcher=hybridep |
 
-## Model Reference
-
-### Model Architecture
-
-| Property | Value |
-| --- | --- |
-| Task | Image-text-to-text |
-| Architecture | `Qwen3_5MoeForConditionalGeneration` |
-
-### Available Models
+## Available Models
 
 - [`Qwen/Qwen3.5-397B-A17B`](https://huggingface.co/Qwen/Qwen3.5-397B-A17B)
 
@@ -59,3 +60,5 @@ Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node 
 ## Related Resources
 
 - [Vision-language model fine-tuning guide](/recipes-e2e-examples/gemma-3-3n)
+
+- [Checkpoint Configuration](https://huggingface.co/Qwen/Qwen3.5-397B-A17B/blob/8472618112abcbd45acbcdc58436aff4233c23f7/config.json)

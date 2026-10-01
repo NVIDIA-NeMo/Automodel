@@ -1,5 +1,5 @@
 ---
-title: "MiMo-V2-Flash"
+title: "XiaomiMiMo/MiMo-V2-Flash"
 description: "Fine-tune MiMo-V2-Flash and explore MiMo-V2.6-Flash-RL language and vision-language recipes, checkpoints, and settings with NeMo AutoModel."
 slug: model-coverage/large-language-models/xiaomimimo/MiMo-V2-Flash
 ---
@@ -12,36 +12,50 @@ Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com
 
 ## Quick Start
 
-### Fine-Tune MiMo-V2-Flash
+Follow the [installation instructions](/get-started/installation). Allocate 16 nodes with 8 GPUs each; run on every node with `NODE_RANK` and `MASTER_ADDR` set. Complete the [recipe setup](#recipe-setup) before launching.
 
-Use the checked-in recipes to fine-tune either supported checkpoint.
+```bash
+uv run torchrun --nnodes 16 --nproc-per-node 8 \
+  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
+  -m nemo_automodel.cli.app examples/llm_finetune/mimo_v2_flash/mimo_v2_flash_hellaswag.yaml
+```
 
 ## Choose a Workflow
 
-Choose a recipe for your checkpoint and workload. The MiMo-V2-Flash recipe is configured for 16 nodes with 8 H100 GPUs per node. The MiMo-V2.6-Flash-RL recipes target 8 nodes with 8 H100 GPUs per node.
-
 | Goal | Start Here |
 | --- | --- |
-| Fine-tune MiMo-V2-Flash on HellaSwag | Use [mimo_v2_flash_hellaswag.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mimo_v2_flash/mimo_v2_flash_hellaswag.yaml). |
+| Fine-tune XiaomiMiMo/MiMo-V2-Flash | [mimo_v2_flash_hellaswag.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mimo_v2_flash/mimo_v2_flash_hellaswag.yaml). 16 nodes, 8 GPUs per node; see [Recipe Setup](#recipe-setup). |
 | Fine-tune MiMo-V2.6-Flash-RL on packed Tulu3 text | Use [mimo_v2_6_flash_rl_tulu3_packed4k_ep64_cp2_100steps.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mimo_v2_flash/mimo_v2_6_flash_rl_tulu3_packed4k_ep64_cp2_100steps.yaml). |
 | Fine-tune MiMo-V2.6-Flash-RL on MedPix-VQA | Use [mimo_v2_6_flash_rl_medpix_nonpacked4k_ep64_100steps.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mimo_v2_flash/mimo_v2_6_flash_rl_medpix_nonpacked4k_ep64_100steps.yaml). |
 
-Follow the [launcher guide](/job-launchers/overview) to run a multi-node recipe.
-
 ## Model Context
-
-## Model Reference
-
-### Model Architecture
 
 | Property | Value |
 | --- | --- |
+| Task | Text Generation |
 | Model Implementation | `MiMoV2FlashForCausalLM` backs MiMo-V2-Flash. |
 | Model Implementation | `MiMoV2ForCausalLM` backs MiMo-V2.6-Flash-RL. |
 | Sliding-Window Attention | Sliding-window attention uses the `MiMoV2FlashAttention(is_swa=True)` path. |
 | Expert Routing | Expert routing maps `scoring_func="sigmoid"` to `score_func="sigmoid_with_bias"`; the recipes set `gate_precision=float32`. |
+| Architecture | `MiMoV2FlashForCausalLM` |
+| Parameters | 309.79B checkpoint parameters |
+| Decoder Layers | 48 |
+| Hidden Size | 4,096 |
+| Attention | 64 attention heads / 4 key-value heads |
+| Context Length | 262,144 tokens (checkpoint configuration) |
+| Vocabulary Size | 152,576 |
+| Experts | 256 routed / 8 selected per token |
+| Configured Dtype | `bfloat16` |
 
-### Available Models
+### Setup and Additional Examples
+
+Use the checked-in recipes to fine-tune either supported checkpoint.
+
+### Recipe Setup
+
+Read [mimo_v2_flash_hellaswag.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mimo_v2_flash/mimo_v2_flash_hellaswag.yaml) for checkpoint access, data paths, and backend dependencies. Use the [Slurm launcher guide](/job-launchers/slurm-cluster) to prepare the distributed allocation.
+
+## Available Models
 
 | Model | Hugging Face ID |
 | --- | --- |
@@ -52,3 +66,5 @@ Follow the [launcher guide](/job-launchers/overview) to run a multi-node recipe.
 
 - [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
 - [Launcher Guide](/job-launchers/overview)
+
+- [Checkpoint Configuration](https://huggingface.co/XiaomiMiMo/MiMo-V2-Flash/blob/1afd314a2406c282e0956375c34a676501c78649/config.json)

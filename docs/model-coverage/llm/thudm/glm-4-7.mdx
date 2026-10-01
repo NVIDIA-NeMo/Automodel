@@ -1,5 +1,5 @@
 ---
-title: "GLM-4.7"
+title: "zai-org/GLM-4.7"
 description: "Use NeMo AutoModel to fine-tune GLM-4.7 for LLM workflows with checked-in text generation recipes and documented distributed settings."
 slug: model-coverage/large-language-models/thudm/GLM-4.7
 ---
@@ -9,15 +9,13 @@ The Hugging Face configuration declares the `Glm4MoeForCausalLM` architecture.
 
 ## Quick Start
 
-### Fine-Tune GLM-4.7
-
-Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+Allocate 16 nodes with 8 GPUs each. Set `NODE_RANK` and `MASTER_ADDR` on every node; complete the recipe prerequisites in Model Context before launching.
 
 ```bash
-automodel examples/llm_finetune/glm/glm_4.7_te_deepep.yaml --nproc-per-node 8
+uv run torchrun --nnodes 16 --nproc-per-node 8 \
+  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
+  -m nemo_automodel.cli.app examples/llm_finetune/glm/glm_4.7_te_deepep.yaml
 ```
-
-Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node run.
 
 ## Choose a Workflow
 
@@ -27,6 +25,19 @@ Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node 
 | Try another checked-in recipe for this model | Use the [alternate recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/glm/glm47_lora.yaml). |
 
 ## Model Context
+
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| Architecture | `Glm4MoeForCausalLM` |
+| Parameters | 358.34B checkpoint parameters |
+| Decoder Layers | 92 |
+| Hidden Size | 5,120 |
+| Attention | 96 attention heads / 8 key-value heads |
+| Context Length | 202,752 tokens (checkpoint configuration) |
+| Vocabulary Size | 151,552 |
+| Experts | 160 routed / 1 shared / 8 selected per token |
+| Configured Dtype | `bfloat16` |
 
 ### Configuration
 
@@ -48,16 +59,7 @@ Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node 
 - [`glm_4.7_flash_te_deepep.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_4.7_flash_te_deepep.yaml)
 - [`glm_4.7_flash_te_packed_sequence.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_4.7_flash_te_packed_sequence.yaml)
 
-## Model Reference
-
-### Model Architecture
-
-| Property | Value |
-| --- | --- |
-| Task | Text generation |
-| Architecture | `Glm4MoeForCausalLM` |
-
-### Available Models
+## Available Models
 
 - [`zai-org/GLM-4.7`](https://huggingface.co/zai-org/GLM-4.7)
 - [`zai-org/GLM-4.7-Flash`](https://huggingface.co/zai-org/GLM-4.7-Flash)
@@ -71,3 +73,5 @@ Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node 
 ## Related Resources
 
 - [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/zai-org/GLM-4.7/blob/602d01efcdd332c5238ca4bcede555defbe83eb7/config.json)

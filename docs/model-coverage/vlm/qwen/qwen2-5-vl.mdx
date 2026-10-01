@@ -1,5 +1,5 @@
 ---
-title: "Qwen2.5-VL-3B-Instruct"
+title: "Qwen/Qwen2.5-VL-3B-Instruct"
 description: "Use Qwen2.5-VL-3B-Instruct with NeMo AutoModel for vision-language fine-tuning, with documented checkpoints, runnable recipes, setup, and model reference details."
 slug: model-coverage/vision-language-models/qwen/Qwen2.5-VL-3B-Instruct
 ---
@@ -9,8 +9,6 @@ slug: model-coverage/vision-language-models/qwen/Qwen2.5-VL-3B-Instruct
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
 ## Quick Start
-
-### Fine-Tune Qwen2.5-VL-3B-Instruct
 
 From the repository root, run:
 
@@ -26,21 +24,23 @@ uv run automodel --nproc-per-node=8 examples/vlm_finetune/qwen2_5/qwen2_5_vl_3b_
 
 ## Model Context
 
-## Model Reference
-
-### Model Architecture
-
 | Property | Value |
 | --- | --- |
 | Task | Image-Text-to-Text |
 | Architecture | `Qwen2_5VLForConditionalGeneration` |
 | Parameters | 3B |
 | Hugging Face Organization | [Qwen](https://huggingface.co/Qwen) |
+| Decoder Layers | 36 |
+| Hidden Size | 2,048 |
+| Attention | 16 attention heads / 2 key-value heads |
+| Context Length | 128,000 tokens (checkpoint configuration) |
+| Vocabulary Size | 151,936 |
+| Configured Dtype | `bfloat16` |
 
 - `Qwen2_5VLForConditionalGeneration` - Qwen2.5-VL
 - `Qwen2VLForConditionalGeneration` - Qwen2-VL
 
-### Available Models
+## Available Models
 
 | Model | HF ID |
 |---|---|
@@ -49,3 +49,5 @@ uv run automodel --nproc-per-node=8 examples/vlm_finetune/qwen2_5/qwen2_5_vl_3b_
 ## Related Resources
 
 - [VLM Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n)
+
+- [Checkpoint Configuration](https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct/blob/66285546d2b821cf421d4f5eb2576359d3770cd3/config.json)

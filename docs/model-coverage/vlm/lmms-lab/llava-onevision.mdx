@@ -1,5 +1,5 @@
 ---
-title: "LLaVA-OneVision-1.5-4B-Instruct"
+title: "lmms-lab/LLaVA-OneVision-1.5-4B-Instruct"
 description: "Use LLaVA-OneVision-1.5-4B-Instruct with NeMo AutoModel for vision-language fine-tuning, including checkpoints, runnable recipes, setup, and reference details."
 slug: model-coverage/vision-language-models/lmms-lab/LLaVA-OneVision-1.5-4B-Instruct
 ---
@@ -9,8 +9,6 @@ slug: model-coverage/vision-language-models/lmms-lab/LLaVA-OneVision-1.5-4B-Inst
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
 ## Quick Start
-
-### Fine-Tune LLaVA-OneVision-1.5-4B-Instruct
 
 From the repository root, run:
 
@@ -26,22 +24,24 @@ uv run automodel --nproc-per-node=8 examples/vlm_finetune/llava_onevision/llava_
 
 ## Model Context
 
-## Model Reference
-
-### Model Architecture
-
 | Property | Value |
 | --- | --- |
 | Task | Image-Text-to-Text |
 | Architecture | `LlavaOneVisionForConditionalGeneration` |
 | Parameters | 4B |
 | Hugging Face Organization | [lmms-lab](https://huggingface.co/lmms-lab) |
+| Decoder Layers | 36 |
+| Hidden Size | 2,560 |
+| Attention | 32 attention heads / 8 key-value heads |
+| Context Length | 262,144 tokens (checkpoint configuration) |
+| Vocabulary Size | 151,936 |
+| Configured Dtype | `bfloat16` |
 
 - `LlavaOneVisionForConditionalGeneration`
 
 Vision tower is the **Rice Transformer**: 14x14 patch embed with 2D RoPE, standard Transformer blocks (LayerNorm + Attention + MLP), and a 2x2 spatial Patch Merger that projects to the language-model hidden size.
 
-### Available Models
+## Available Models
 
 | Model | HF ID |
 |---|---|
@@ -50,3 +50,5 @@ Vision tower is the **Rice Transformer**: 14x14 patch embed with 2D RoPE, standa
 ## Related Resources
 
 - [VLM Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n)
+
+- [Checkpoint Configuration](https://huggingface.co/lmms-lab/LLaVA-OneVision-1.5-4B-Instruct/blob/ae6819dedee37f667accb33cd4bed14a14eec147/config.json)

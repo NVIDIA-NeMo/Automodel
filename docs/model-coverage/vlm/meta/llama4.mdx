@@ -1,33 +1,30 @@
 ---
-title: "Llama-4-Scout-17B-16E-Instruct"
-description: "Reference Llama-4-Scout-17B-16E-Instruct checkpoint and architecture details for NeMo AutoModel, with model-family information, setup guidance, and upstream resources."
+title: "meta-llama/Llama-4-Scout-17B-16E-Instruct"
+description: "Fine-tune meta-llama/Llama-4-Scout-17B-16E-Instruct with NeMo AutoModel using a checked-in LoRA recipe, with checkpoint and architecture details."
 slug: model-coverage/vision-language-models/meta/Llama-4-Scout-17B-16E-Instruct
 ---
 
 [Llama 4](https://ai.meta.com/blog/llama-4-multimodal-intelligence/) is Meta's first natively multimodal model family. Llama 4 Scout and Maverick are MoE models supporting interleaved image and text inputs.
 
-Use this page as a checkpoint and architecture reference. Set up NeMo AutoModel with the
+Set up NeMo AutoModel with the
 [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the
 [installation instructions](/get-started/installation).
 
 ## Quick Start
 
-This page provides checkpoint and architecture reference information rather
-than a model-specific launch command. Follow the
-[installation instructions](/get-started/installation) to set up NeMo AutoModel.
+Follow the [installation instructions](/get-started/installation). From the repository root, use 8 GPUs. This is an example configuration; GPU training and memory use still require validation.
+
+```bash
+uv run automodel examples/vlm_finetune/meta_llama/llama_4_scout_17b_16e_instruct_medpix_peft.yaml --nproc-per-node 8
+```
 
 ## Choose a Workflow
 
 | Goal | Start Here |
 | --- | --- |
-| Explore checkpoints | See [Available Models](#available-models). |
-| Configure NeMo AutoModel | Follow the [installation instructions](/get-started/installation). |
+| Fine-tune meta-llama/Llama-4-Scout-17B-16E-Instruct | [llama_4_scout_17b_16e_instruct_medpix_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/meta_llama/llama_4_scout_17b_16e_instruct_medpix_peft.yaml). Example LoRA configuration; validate GPU training. |
 
 ## Model Context
-
-## Model Reference
-
-### Model Architecture
 
 | Property | Value |
 | --- | --- |
@@ -35,8 +32,19 @@ than a model-specific launch command. Follow the
 | Architecture | `Llama4ForConditionalGeneration` |
 | Parameters | 17B active (MoE) |
 | Hugging Face Organization | [meta-llama](https://huggingface.co/meta-llama) |
+| Decoder Layers | 48 |
+| Hidden Size | 5,120 |
+| Attention | 40 attention heads / 8 key-value heads |
+| Context Length | 10,485,760 tokens (checkpoint configuration) |
+| Vocabulary Size | 202,048 |
+| Experts | 16 routed / 1 selected per token |
+| Configured Dtype | `bfloat16` |
 
-### Available Models
+### Recipe Setup
+
+Read [llama_4_scout_17b_16e_instruct_medpix_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/meta_llama/llama_4_scout_17b_16e_instruct_medpix_peft.yaml) for checkpoint access, data paths, and backend dependencies. It provides a small LoRA fine-tuning example.
+
+## Available Models
 
 | Model | HF ID |
 |---|---|
@@ -45,3 +53,5 @@ than a model-specific launch command. Follow the
 ## Related Resources
 
 - [VLM Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n)
+
+- [Checkpoint Configuration](https://huggingface.co/meta-llama/Llama-4-Scout-17B-16E-Instruct/blob/92f3b1597a195b523d8d9e5700e57e4fbb8f20d3/config.json)

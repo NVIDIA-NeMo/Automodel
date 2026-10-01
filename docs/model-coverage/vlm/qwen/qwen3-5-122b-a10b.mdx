@@ -1,5 +1,5 @@
 ---
-title: "Qwen3.5-122B-A10B"
+title: "Qwen/Qwen3.5-122B-A10B"
 description: "Use NeMo AutoModel to fine-tune Qwen3.5-122B-A10B for VLM workflows with checked-in image-text-to-text recipes and documented distributed settings."
 slug: model-coverage/vision-language-models/qwen/Qwen3.5-122B-A10B
 ---
@@ -9,21 +9,34 @@ The Hugging Face configuration declares the `Qwen3_5MoeForConditionalGeneration`
 
 ## Quick Start
 
-### Fine-Tune Qwen3.5-122B-A10B
+Follow the [installation instructions](/get-started/installation). Allocate 16 nodes with 8 GPUs each; run on every node with `NODE_RANK` and `MASTER_ADDR` set. Complete the [recipe setup](#recipe-setup) before launching.
 
-Follow the [installation instructions](/get-started/installation), then review the checked-in recipe and
-its declared topology below before choosing a local or cluster launcher.
-
-Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node run.
+```bash
+uv run torchrun --nnodes 16 --nproc-per-node 8 \
+  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
+  -m nemo_automodel.cli.app examples/vlm_finetune/qwen3_5_moe/qwen3_5_122b_128k_ep8cp32.yaml
+```
 
 ## Choose a Workflow
 
 | Goal | Start Here |
 | --- | --- |
-| Run the primary recipe for this model | Use the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5_moe/qwen3_5_122b_128k_ep8cp32.yaml). |
+| Fine-tune Qwen/Qwen3.5-122B-A10B | [qwen3_5_122b_128k_ep8cp32.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5_moe/qwen3_5_122b_128k_ep8cp32.yaml). 16 nodes, 8 GPUs per node; see [Recipe Setup](#recipe-setup). |
 | Prepare your environment | Follow the [installation instructions](/get-started/installation). |
 
 ## Model Context
+
+| Property | Value |
+| --- | --- |
+| Task | Image-text-to-text |
+| Architecture | `Qwen3_5MoeForConditionalGeneration` |
+| Parameters | 125.09B checkpoint parameters |
+| Decoder Layers | 48 |
+| Hidden Size | 3,072 |
+| Attention | 32 attention heads / 2 key-value heads |
+| Context Length | 262,144 tokens (checkpoint configuration) |
+| Vocabulary Size | 248,320 |
+| Experts | 256 routed / 8 selected per token |
 
 ### Configuration
 
@@ -35,16 +48,18 @@ Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node 
 | Features | Activation checkpointing (activation_checkpointing=true), HybridEP (dispatcher=hybridep) |
 | Advanced | torch.bfloat16, attention=sdpa, linear=torch, experts=torch_mm, dispatcher=hybridep |
 
-## Model Reference
+### Setup and Additional Examples
 
-### Model Architecture
+Follow the [installation instructions](/get-started/installation), then review the checked-in recipe and
+its declared topology below before choosing a local or cluster launcher.
 
-| Property | Value |
-| --- | --- |
-| Task | Image-text-to-text |
-| Architecture | `Qwen3_5MoeForConditionalGeneration` |
+Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node run.
 
-### Available Models
+### Recipe Setup
+
+Read [qwen3_5_122b_128k_ep8cp32.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5_moe/qwen3_5_122b_128k_ep8cp32.yaml) for checkpoint access, data paths, and backend dependencies. Use the [Slurm launcher guide](/job-launchers/slurm-cluster) to prepare the distributed allocation.
+
+## Available Models
 
 - [`Qwen/Qwen3.5-122B-A10B`](https://huggingface.co/Qwen/Qwen3.5-122B-A10B)
 
@@ -56,3 +71,5 @@ Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node 
 ## Related Resources
 
 - [Vision-language model fine-tuning guide](/recipes-e2e-examples/gemma-3-3n)
+
+- [Checkpoint Configuration](https://huggingface.co/Qwen/Qwen3.5-122B-A10B/blob/dc4d348443bc740c68e2d77492492c11606384d5/config.json)

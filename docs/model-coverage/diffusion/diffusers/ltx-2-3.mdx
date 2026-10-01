@@ -1,5 +1,5 @@
 ---
-title: "LTX-2.3-Diffusers"
+title: "diffusers/LTX-2.3-Diffusers"
 description: "Fine-tune LTX-2.3-Diffusers for text-to-video generation with NeMo AutoModel using checked-in full-parameter and LoRA flow-matching recipes."
 slug: model-coverage/diffusion/diffusers/LTX-2.3-Diffusers
 ---
@@ -7,8 +7,6 @@ slug: model-coverage/diffusion/diffusers/LTX-2.3-Diffusers
 [LTX-2.3](https://huggingface.co/diffusers/LTX-2.3-Diffusers) is a text-to-video diffusion model supported by NeMo AutoModel's flow-matching training recipe.
 
 ## Quick Start
-
-### Fine-Tune LTX-2.3-Diffusers
 
 From the repository root, run:
 
@@ -26,21 +24,21 @@ uv run torchrun --nproc-per-node=8 examples/diffusion/finetune/finetune.py \
 
 ## Model Context
 
-### Recipe Notes
-
-See the [Diffusion Fine-Tuning Guide](/recipes-e2e-examples/diffusion-fine-tuning).
-
-## Model Reference
-
-### Model Architecture
-
 | Property | Value |
 |---|---|
 | **Task** | Text-to-Video |
 | **Architecture** | Diffusion Transformer (Flow Matching) |
 | **HF Org** | [diffusers](https://huggingface.co/diffusers) |
+| Parameters | 18.99B checkpoint parameters |
+| Transformer Blocks | 48 |
+| Hidden Size | 4,096 |
+| Attention | 32 attention heads |
 
-### Available Models
+### Recipe Notes
+
+See the [Diffusion Fine-Tuning Guide](/recipes-e2e-examples/diffusion-fine-tuning).
+
+## Available Models
 
 | Checkpoint | Type |
 | --- | --- |
@@ -49,3 +47,5 @@ See the [Diffusion Fine-Tuning Guide](/recipes-e2e-examples/diffusion-fine-tunin
 ## Related Resources
 
 - [Installation Instructions](/get-started/installation)
+
+- [Checkpoint Configuration](https://huggingface.co/diffusers/LTX-2.3-Diffusers/blob/8eee8edcf067e838b843f926ec4d4cc9b2be1aaf/transformer/config.json)

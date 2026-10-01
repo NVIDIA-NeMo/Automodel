@@ -1,5 +1,5 @@
 ---
-title: "InternVL3_5-4B"
+title: "OpenGVLab/InternVL3_5-4B"
 description: "Use InternVL3_5-4B with NeMo AutoModel for vision-language fine-tuning, with documented checkpoints, runnable recipes, setup guidance, and model reference details."
 slug: model-coverage/vision-language-models/opengvlab/InternVL3_5-4B
 ---
@@ -9,8 +9,6 @@ slug: model-coverage/vision-language-models/opengvlab/InternVL3_5-4B
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
 ## Quick Start
-
-### Fine-Tune InternVL3_5-4B
 
 From the repository root, run:
 
@@ -26,18 +24,23 @@ uv run automodel --nproc-per-node=8 examples/vlm_finetune/internvl/internvl_3_5_
 
 ## Model Context
 
-## Model Reference
-
-### Model Architecture
-
 | Property | Value |
 | --- | --- |
+| Recipe Checkpoint | [OpenGVLab/InternVL3_5-4B-hf](https://huggingface.co/OpenGVLab/InternVL3_5-4B-hf) |
 | Task | Image-Text-to-Text |
 | Architecture | `InternVLForConditionalGeneration` |
 | Parameters | 4B |
 | Hugging Face Organization | [OpenGVLab](https://huggingface.co/OpenGVLab) |
+| Decoder Layers | 36 |
+| Hidden Size | 2,560 |
+| Attention | 32 attention heads / 8 key-value heads |
+| Context Length | 40,960 tokens (checkpoint configuration) |
+| Vocabulary Size | 151,936 |
+| Configured Dtype | `bfloat16` |
 
-### Available Models
+The recipe loads `OpenGVLab/InternVL3_5-4B-hf`, the Hugging Face-compatible checkpoint for `OpenGVLab/InternVL3_5-4B`.
+
+## Available Models
 
 | Model | HF ID |
 |---|---|
@@ -47,3 +50,5 @@ uv run automodel --nproc-per-node=8 examples/vlm_finetune/internvl/internvl_3_5_
 ## Related Resources
 
 - [VLM Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n)
+
+- [Checkpoint Configuration](https://huggingface.co/OpenGVLab/InternVL3_5-4B/blob/481f6e32467eab4e922ccd7fd6cf420441a62331/config.json)

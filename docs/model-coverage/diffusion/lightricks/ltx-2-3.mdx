@@ -1,5 +1,5 @@
 ---
-title: "LTX-2.3"
+title: "Lightricks/LTX-2.3"
 description: "Fine-tune LTX-2.3 for synchronized video and audio generation with NeMo AutoModel using full-parameter, LoRA, and generation recipes."
 slug: model-coverage/diffusion/lightricks/LTX-2.3
 ---
@@ -8,35 +8,33 @@ slug: model-coverage/diffusion/lightricks/LTX-2.3
 
 ## Quick Start
 
-### Fine-Tune LTX-2.3
-
-Set `data.dataloader.cache_dir` and `checkpoint.checkpoint_dir` in the selected recipe, then launch one process per GPU.
+Follow the [installation instructions](/get-started/installation). From the repository root, use 8 GPUs. Complete the [recipe setup](#recipe-setup) before launching.
 
 ```bash
-uv run torchrun --nproc-per-node=8 \
-  examples/diffusion/finetune/finetune.py \
-  -c examples/diffusion/finetune/ltx2_3_t2v_flow.yaml
+uv run torchrun --nproc-per-node 8 \
+  examples/diffusion/finetune/finetune.py -c examples/diffusion/finetune/ltx2_3_t2v_flow.yaml
 ```
-
-For LoRA, use the LoRA recipe instead:
-
-```bash
-uv run torchrun --nproc-per-node=8 \
-  examples/diffusion/finetune/finetune.py \
-  -c examples/diffusion/finetune/ltx2_3_t2v_flow_lora.yaml
-```
-
-Both recipes use `flow_matching.adapter_type: ltx2`. The adapter applies the same sampled noise level to the video and audio streams and combines their flow-matching losses.
 
 ## Choose a Workflow
 
 | Goal | Start Here |
 | --- | --- |
-| Full fine-tuning with flow matching | [ltx2_3_t2v_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/ltx2_3_t2v_flow.yaml) |
+| Fine-tune diffusers/LTX-2.3-Diffusers | [ltx2_3_t2v_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/ltx2_3_t2v_flow.yaml). 1 node, 8 GPUs per node; see [Recipe Setup](#recipe-setup). |
 | Parameter-efficient LoRA fine-tuning | [ltx2_3_t2v_flow_lora.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/ltx2_3_t2v_flow_lora.yaml) |
 | Generate video and mux the model's audio into the output | [generate_ltx2.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/generate/configs/generate_ltx2.yaml) |
 
 ## Model Context
+
+| Property | Value |
+|---|---|
+| Recipe Checkpoint | [diffusers/LTX-2.3-Diffusers](https://huggingface.co/diffusers/LTX-2.3-Diffusers) |
+| **Task** | Text-to-Video with Audio |
+| **Architecture** | Dual-stream DiT (Flow Matching) |
+| **HF Org** | [Lightricks](https://huggingface.co/Lightricks) |
+| Parameters | 18.99B in the Diffusers recipe checkpoint |
+| Transformer Blocks | 48 |
+| Hidden Size | 4,096 |
+| Attention | 32 attention heads |
 
 ### Prepare Video and Audio Data
 
@@ -68,17 +66,33 @@ uv run python examples/diffusion/generate/generate.py \
 
 The generation command writes an MP4 and muxes the generated waveform into it. See the [Diffusion Fine-Tuning Guide](/recipes-e2e-examples/diffusion-fine-tuning) and [Diffusion Dataset Preparation](/datasets/diffusion-dataset) guide for shared training and dataset options.
 
-## Model Reference
+### Setup and Additional Examples
 
-### Model Architecture
+Set `data.dataloader.cache_dir` and `checkpoint.checkpoint_dir` in the selected recipe, then launch one process per GPU.
 
-| Property | Value |
-|---|---|
-| **Task** | Text-to-Video with Audio |
-| **Architecture** | Dual-stream DiT (Flow Matching) |
-| **HF Org** | [Lightricks](https://huggingface.co/Lightricks) |
+```bash
+uv run torchrun --nproc-per-node=8 \
+  examples/diffusion/finetune/finetune.py \
+  -c examples/diffusion/finetune/ltx2_3_t2v_flow.yaml
+```
 
-### Available Models
+For LoRA, use the LoRA recipe instead:
+
+```bash
+uv run torchrun --nproc-per-node=8 \
+  examples/diffusion/finetune/finetune.py \
+  -c examples/diffusion/finetune/ltx2_3_t2v_flow_lora.yaml
+```
+
+Both recipes use `flow_matching.adapter_type: ltx2`. The adapter applies the same sampled noise level to the video and audio streams and combines their flow-matching losses.
+
+### Recipe Setup
+
+Read [ltx2_3_t2v_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/ltx2_3_t2v_flow.yaml) for checkpoint access, data paths, and backend dependencies.
+
+The recipe loads `diffusers/LTX-2.3-Diffusers`, the Hugging Face-compatible checkpoint for `Lightricks/LTX-2.3`.
+
+## Available Models
 
 LTX-2.3 supports full-parameter and LoRA fine-tuning with synchronized video and audio.
 

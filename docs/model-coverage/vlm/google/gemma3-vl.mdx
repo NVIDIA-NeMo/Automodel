@@ -1,5 +1,5 @@
 ---
-title: "gemma-3-4b-it"
+title: "google/gemma-3-4b-it"
 description: "Fine-tune gemma-3-4b-it for image-text tasks with NeMo AutoModel using checked-in full-parameter, LoRA, and distributed recipes."
 slug: model-coverage/vision-language-models/google/gemma-3-4b-it
 ---
@@ -9,8 +9,6 @@ slug: model-coverage/vision-language-models/google/gemma-3-4b-it
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
 ## Quick Start
-
-### Fine-Tune gemma-3-4b-it
 
 From the repository root, run:
 
@@ -29,17 +27,17 @@ uv run automodel examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2.yaml --nproc-
 
 ## Model Context
 
-## Model Reference
-
-### Model Architecture
-
 | Property | Value |
 | --- | --- |
 | Task | Image-text-to-text |
 | Hugging Face Architecture | `Gemma3ForConditionalGeneration` |
 | Checkpoint | [`google/gemma-3-4b-it`](https://huggingface.co/google/gemma-3-4b-it) |
+| Parameters | 4.30B checkpoint parameters |
+| Decoder Layers | 34 |
+| Hidden Size | 2,560 |
+| Configured Dtype | `bfloat16` |
 
-### Available Models
+## Available Models
 
 | Checkpoint | Type |
 | --- | --- |
@@ -49,3 +47,5 @@ uv run automodel examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2.yaml --nproc-
 ## Related Resources
 
 - [Gemma 3 and Gemma 3n Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n)
+
+- [Checkpoint Configuration](https://huggingface.co/google/gemma-3-4b-it/blob/093f9f388b31de276ce2de164bdc2081324b9767/config.json)

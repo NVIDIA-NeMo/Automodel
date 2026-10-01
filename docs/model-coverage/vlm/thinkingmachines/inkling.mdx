@@ -1,5 +1,5 @@
 ---
-title: "Inkling"
+title: "thinkingmachines/Inkling"
 description: "Fine-tune Inkling vision-language checkpoints with NeMo AutoModel using checked-in multi-node recipes with expert and pipeline parallelism."
 slug: model-coverage/vision-language-models/thinkingmachines/Inkling
 ---
@@ -8,18 +8,35 @@ slug: model-coverage/vision-language-models/thinkingmachines/Inkling
 
 ## Quick Start
 
-Review the recipes in [Choose a Workflow](#choose-a-workflow), including their
-hardware and data requirements. Follow the [installation instructions](/get-started/installation)
-before launching a recipe.
+Follow the [installation instructions](/get-started/installation). Allocate 32 nodes with 8 GPUs each; run on every node with `NODE_RANK` and `MASTER_ADDR` set. Complete the [recipe setup](#recipe-setup) before launching.
+
+```bash
+uv run torchrun --nnodes 32 --nproc-per-node 8 \
+  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
+  -m nemo_automodel.cli.app examples/vlm_finetune/inkling/inkling_medpix.yaml
+```
 
 ## Choose a Workflow
 
 | Goal | Start Here |
 | --- | --- |
-| MedPix-VQA; Full SFT with PP8 and EP32 | [inkling_medpix.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/inkling/inkling_medpix.yaml) |
+| Fine-tune thinkingmachines/Inkling | [inkling_medpix.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/inkling/inkling_medpix.yaml). 32 nodes, 8 GPUs per node; see [Recipe Setup](#recipe-setup). |
 | MedPix-VQA; Full SFT with EP64 on 64 H100 GPUs | [Inkling_small_medpix_ep64.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/inkling/Inkling_small_medpix_ep64.yaml) |
 
 ## Model Context
+
+| Property | Value |
+|---|---|
+| **Task** | Image-Text-to-Text / Audio-Text-to-Text |
+| **Architecture** | `InklingForConditionalGeneration` |
+| **Parameters** | Inkling: 975B total / 41B active; Inkling-Small: 276B total / 12B active |
+| **Precision** | BF16 |
+| **HF Org** | [thinkingmachines](https://huggingface.co/thinkingmachines) |
+| Decoder Layers | 66 |
+| Hidden Size | 6,144 |
+| Attention | 64 attention heads / 8 key-value heads |
+| Vocabulary Size | 201,024 |
+| Experts | 256 routed / 2 shared / 6 selected per token |
 
 ### Architecture
 
@@ -35,19 +52,17 @@ Both recipes require a multi-node launch. Adjust the data and parallel dimension
 
 The Inkling-Small EP64 recipe completed 100 training steps on 64 H100 GPUs with microbatch size 1, global batch size 64, and 512-token MedPix samples. It uses FSDP2, activation checkpointing, HybridEP dispatch, and no context or pipeline parallelism.
 
-## Model Reference
+### Setup and Additional Examples
 
-### Model Architecture
+Review the recipes in [Choose a Workflow](#choose-a-workflow), including their
+hardware and data requirements. Follow the [installation instructions](/get-started/installation)
+before launching a recipe.
 
-| Property | Value |
-|---|---|
-| **Task** | Image-Text-to-Text / Audio-Text-to-Text |
-| **Architecture** | `InklingForConditionalGeneration` |
-| **Parameters** | Inkling: 975B total / 41B active; Inkling-Small: 276B total / 12B active |
-| **Precision** | BF16 |
-| **HF Org** | [thinkingmachines](https://huggingface.co/thinkingmachines) |
+### Recipe Setup
 
-### Available Models
+Read [inkling_medpix.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/inkling/inkling_medpix.yaml) for checkpoint access, data paths, and backend dependencies. Use the [Slurm launcher guide](/job-launchers/slurm-cluster) to prepare the distributed allocation.
+
+## Available Models
 
 | Model | HF ID |
 |---|---|
@@ -58,3 +73,5 @@ The Inkling-Small EP64 recipe completed 100 training steps on 64 H100 GPUs with 
 
 - [thinkingmachines/Inkling](https://huggingface.co/thinkingmachines/Inkling)
 - [thinkingmachines/Inkling-Small](https://huggingface.co/thinkingmachines/Inkling-Small)
+
+- [Checkpoint Configuration](https://huggingface.co/thinkingmachines/Inkling/blob/828496eeae4c243ff1a22f7f28ff83694f2f7bc9/config.json)
