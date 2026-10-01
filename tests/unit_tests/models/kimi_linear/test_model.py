@@ -7,7 +7,7 @@ import torch
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.kimi_linear.config import KimiLinear48BConfig
-from nemo_automodel.components.models.kimi_linear.model import KimiLinear48BForCausalLM
+from nemo_automodel.components.models.kimi_linear.model import KimiDeltaAttention, KimiLinear48BForCausalLM
 from tests.unit_tests.models.kimi_linear.test_cp import _FakeCPMesh
 
 
@@ -288,3 +288,16 @@ def test_thd_packed_inputs_run_through_the_batched_layers():
     assert torch.isfinite(thd).all()
     # Both routes describe the same two documents, so they must agree.
     torch.testing.assert_close(thd, bshd, rtol=1e-5, atol=1e-6)
+
+
+def test_kda_short_sequences_use_recurrent_kernel_only_without_gradients():
+    _require_fla()
+    attn = KimiDeltaAttention(_tiny_kimi_config(use_kda=True), layer_idx=1)
+
+    attn.train()
+    assert attn._resolve_mode(32) == "chunk"
+    attn.eval()
+    assert attn._resolve_mode(32) == "chunk"
+    with torch.no_grad():
+        assert attn._resolve_mode(32) == "fused_recurrent"
+        assert attn._resolve_mode(128) == "chunk"

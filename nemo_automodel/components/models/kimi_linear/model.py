@@ -723,8 +723,14 @@ class KimiDeltaAttention(nn.Module):
         return self.o_proj(o)
 
     def _resolve_mode(self, seq_len: int) -> str:
-        """Return the KDA kernel to use for a sequence of ``seq_len`` tokens."""
-        return "fused_recurrent" if seq_len <= 64 else self.mode
+        """Return the KDA kernel to use for a sequence of ``seq_len`` tokens.
+
+        ``fused_recurrent_kda`` implements only the forward pass, so it is chosen for short
+        sequences only outside training with gradients disabled, as in FLA's own KDA layer.
+        """
+        if seq_len <= 64 and not self.training and not torch.is_grad_enabled():
+            return "fused_recurrent"
+        return self.mode
 
     @torch.no_grad()
     def init_weights(self, buffer_device: torch.device, init_std: float) -> None:

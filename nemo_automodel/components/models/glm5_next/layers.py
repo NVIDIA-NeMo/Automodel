@@ -252,6 +252,18 @@ class Glm5NextKDAFp32Params(nn.Module):
         return lower_bound * torch.sigmoid(decay * gate) if lower_bound is not None else -decay * F.softplus(gate)
 
 
+def _use_recurrent_kda(seq_len: int, cp_context: Any, training: bool) -> bool:
+    """Return whether FLA's ``fused_recurrent_kda`` may run instead of ``chunk_kda``.
+
+    ``fused_recurrent_kda`` implements only the forward pass, so its output carries no
+    autograd graph and the projections feeding it receive no gradient. FLA's own KDA layer
+    uses it only for short sequences outside training with gradients disabled, and requires
+    the chunk kernel in training. The same conditions apply here; context parallelism always
+    takes the chunk kernel, which owns the rank-to-rank state handoff.
+    """
+    return cp_context is None and seq_len <= 64 and not training and not torch.is_grad_enabled()
+
+
 def _torch_recurrent_kda(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -376,7 +388,8 @@ class Glm5NextLinearAttention(nn.Module):
         gate = self._fp32_params(gate, self.head_dim, self.config.linear_lower_bound).contiguous()
         beta = self.b_proj(hidden_states).float().sigmoid().contiguous()
         if _CHUNK_KDA_OK and hidden_states.is_cuda:
-            kernel = _chunk_kda if cp_context is not None or hidden_states.shape[1] > 64 else _recurrent_kda
+            use_recurrent = _use_recurrent_kda(hidden_states.shape[1], cp_context, self.training)
+            kernel = _recurrent_kda if use_recurrent else _chunk_kda
             kernel_options: dict[str, Any] = {
                 "use_qk_l2norm_in_kernel": True,
                 "transpose_state_layout": True,
