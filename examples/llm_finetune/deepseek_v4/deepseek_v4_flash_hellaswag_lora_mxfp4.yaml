@@ -14,15 +14,22 @@
 
 # LoRA fine-tuning of deepseek-ai/DeepSeek-V4-Flash on HellaSwag with the frozen
 # routed experts kept resident in mxfp4 (fp4-e2m1 + e8m0 block scales) and
-# dequantized on the fly in the grouped-GEMM forward/backward.
+# dequantized on the fly in the grouped-GEMM forward/backward, dispatched with HybridEP.
+#
+# mxfp4 quantizes only the expert *weights* (local to each EP rank); HybridEP only
+# governs token *dispatch/combine* (fused all-to-all of bf16 activations + fp32 probs).
+# They intersect only at the two post-dispatch grouped GEMMs, which read the packed
+# weights via MXFP4GroupedMM. Unlike the torch dispatcher (which all-gathers every
+# token to every rank), HybridEP routes each rank only the tokens for its local experts,
+# so this is the scalable EP path for DSV4 at EP=8/64.
+# On an 8-GPU NVLink node, set NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=8.
 #
 # Routed experts stay packed; other weights use their model-defined floating-point
 # dtypes, including the FP32 lm_head. The routed experts are ~90%+ of the
 # parameters, so packing them to ~4 bits cuts steady-state base-weight memory by
 # roughly 4x relative to the bf16 LoRA recipe.
 #
-# v1 constraint: mxfp4 experts require the torch_mm GroupedExperts backend, so
-# this recipe uses dispatcher=torch (NOT deepep). DeepEP + mxfp4 is a follow-up.
+# HybridEP handles token dispatch; torch_mm runs the local expert GEMMs.
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
@@ -73,8 +80,8 @@ model:
     linear: torch
     rms_norm: torch_fp32
     rope_fusion: false
-    # mxfp4 experts run on the torch_mm grouped-GEMM path (DeepEP not yet supported).
-    dispatcher: torch
+    # mxfp4 experts run on the torch_mm grouped-GEMM path, dispatched with HybridEP.
+    dispatcher: hybridep
     experts: torch_mm
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
@@ -82,12 +89,13 @@ model:
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
   target_modules:
-    # attention
+    # Direct attention projections only. The more permissive "*wkv"/"*wq_b"
+    # patterns also match the FP32 HCA compressor/indexer projections.
     - "*.self_attn.wq_a"
     - "*.self_attn.wq_b"
     - "*.self_attn.wkv"
     - "*.self_attn.wo_b"
-    # routed experts: GroupedExperts -> GroupedExpertsLoRAMXFP4
+    # routed experts: GroupedExpertsDeepEP -> GroupedExpertsDeepEPLoRAMXFP4
     # (frozen base stays mxfp4-packed; only the LoRA adapters train)
     - "*mlp.experts"
     # shared experts: dense MLP nn.Linear (base stays bf16, LoRA adapters bf16)
@@ -97,8 +105,9 @@ peft:
   dim: 8
   alpha: 32
   use_triton: True
-  # BF16 adapters match the BF16 base weights within FSDP-owned modules.
-  # FusedAdam below retains FP32 master-weight precision and optimizer states.
+  # BF16 adapters match the base compute dtype and keep every patched linear's
+  # FSDP2 storage dtype uniform. FP32 adapters would require separate parameter-owning
+  # modules for the adapter weights under the current FSDP2 dtype isolation rules.
   lora_dtype: bfloat16
   # Keep the frozen routed experts packed as mxfp4 and dequantize on the fly.
   expert_weight_format: mxfp4
@@ -164,6 +173,14 @@ optimizer:
   store_param_remainders: true
   exp_avg_dtype: torch.float32
   exp_avg_sq_dtype: torch.float32
+
+wandb:
+  enable: false
+  project: automodel-dsv4
+  name: deepseek-v4-flash-mxfp4-lora-hybridep-te-fusedadam
+  group: pr-2548
+  tags: [deepseek-v4-flash, mxfp4, lora, hybridep, te-fusedadam]
+  mode: online
 
 ci:
   # EP8 fits one CI node with 8 H100 GPUs.
