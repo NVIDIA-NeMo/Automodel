@@ -2424,6 +2424,17 @@ class TestBuildLabelsFromTemplate:
         expected[0, 13] = _IM_END  # stop token
         assert torch.equal(labels, expected)
 
+    def test_assistant_turn_without_closing_token(self, collate_mod):
+        """An unfinished assistant turn labels its content through the row end."""
+        complete = _make_qwen_input_ids(("user", [10, 11, 12]), ("assistant", [20, 21]))
+        input_ids = complete[:, :-2]  # Remove the assistant <|im_end|> and newline.
+
+        labels = collate_mod.build_labels_from_template(input_ids, [[]], Qwen3VLProcessor())
+
+        expected = torch.full_like(input_ids, -100)
+        expected[0, -2:] = torch.tensor([20, 21])
+        assert torch.equal(labels, expected)
+
     def test_multi_turn(self, collate_mod):
         """Both assistant turns get labels."""
         input_ids = _make_qwen_input_ids(

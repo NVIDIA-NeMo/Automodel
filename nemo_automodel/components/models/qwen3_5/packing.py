@@ -89,10 +89,8 @@ def prepare_gated_delta_packed_metadata(
     num_indices = indices_cpu.numel()
     device_metadata_cpu = torch.cat((indices_cpu, cu_seqlens_cpu))
     if document_ids.is_cuda:
-        # A pageable H2D transfer calls cudaStreamSynchronize before staging the
-        # copy.  This function also runs during activation-checkpoint recompute,
-        # where that wait can serialize behind most of the layer's GPU work.
-        # Pin the tiny coalesced buffer so the transfer remains asynchronous.
+        # Pin the coalesced buffer to avoid an additional synchronization when
+        # transferring this metadata back to the compute device.
         device_metadata_cpu = device_metadata_cpu.pin_memory()
     device_metadata = device_metadata_cpu.to(device=document_ids.device, non_blocking=document_ids.is_cuda)
     return GatedDeltaPackedMetadata(

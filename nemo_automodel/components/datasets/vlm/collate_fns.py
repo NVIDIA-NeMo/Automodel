@@ -96,6 +96,18 @@ def make_robust_collate(dataset, collate_fn, max_retries=10):
 
 
 def _find_pattern_indices(template, pattern, search_start_index=0, allow_first_token_mismatch=False):
+    """Find the first token-pattern match in a one-dimensional sequence.
+
+    Args:
+        template: Token IDs with shape ``[sequence]``.
+        pattern: Token IDs with shape ``[pattern_tokens]`` on the same device.
+        search_start_index: Nonnegative first start offset to consider.
+        allow_first_token_mismatch: Match only ``pattern[1:]`` at each start.
+
+    Returns:
+        The first half-open ``(start, end)`` span, or ``(-1, -1)``. An empty
+        pattern matches at ``search_start_index`` when it is in range.
+    """
     template_len = len(template)
     pattern_len = len(pattern)
     search_stop_index = template_len - pattern_len + 1
@@ -380,6 +392,10 @@ def _build_labels_from_markers(
     stop_id:
         Single token id that closes a turn (e.g. ``<|im_end|>`` or
         ``<end_of_turn>``).
+
+    Returns:
+        Labels with shape ``(B, L)`` on the same device and with the same dtype
+        as ``input_ids_batch``.
     """
     marker_len = len(assistant_marker)
     marker_tensor = torch.tensor(assistant_marker, dtype=input_ids_batch.dtype, device=input_ids_batch.device)
