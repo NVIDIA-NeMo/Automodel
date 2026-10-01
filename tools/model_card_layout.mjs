@@ -109,8 +109,8 @@ export function validateModelCard(source, template, format = "mdx", recipes = ne
     metadata?.type === "yaml" ? 1 : 0,
     firstHeading === -1 ? nodes.length : firstHeading,
   );
-  if (!hasContent(introduction)) {
-    report(actualHeadings[0], "missing introduction before Quick Start");
+  if (!introduction.some((node) => node.type === "paragraph" && textContent(node).trim().split(/\s+/).length >= 8)) {
+    report(actualHeadings[0], "missing introduction paragraph of at least eight words before Quick Start; tables, lists, and code do not introduce the model");
   }
 
   const checkHtmlHeadings = (node) => {
@@ -158,8 +158,20 @@ export function validateModelCard(source, template, format = "mdx", recipes = ne
     }
     if (["Model Context", "Available Models"].includes(name)) {
       const table = content.find((node) => node.type === "table");
-      if (name === "Model Context" && content[0]?.type !== "table") {
-        report(heading, "Model Context must start with the architecture table; put free context after it");
+      if (name === "Model Context" && (content[0]?.type !== "paragraph" || !/[A-Za-z]/.test(textContent(content[0])))) {
+        report(heading, "Model Context must start with an introduction paragraph followed by the architecture table");
+      }
+      if (name === "Model Context" && content[1]?.type !== "table") {
+        report(heading, "Model Context introduction must be followed by the architecture table; put free context after it");
+      }
+      if (name === "Model Context" && content[0]?.type === "paragraph") {
+        const prose = textContent(content[0]).trim();
+        if (prose.split(/\s+/).length < 8) {
+          report(content[0], "Model Context introduction requires at least eight words of model context");
+        }
+        if (prose.split(/\s+/).length > 40 || prose.length > 400) {
+          report(content[0], "Model Context introduction exceeds 40 words or 400 characters; move details after the table");
+        }
       }
       if (!table || table.children.length < 2) {
         report(heading, `${name} requires a direct table with at least one data row`);
@@ -429,7 +441,7 @@ function validateRecipes(nodes, headings, modelId, recipes, report) {
   if (![...workflowRecipes.keys()].some((file) => sameId(effectiveModel(recipes.get(file), ""), quickModel))) {
     report(
       workflow,
-      `every model card must link at least one checked-in recipe configured for ${quickModel} without checkpoint overrides`,
+      `every model card must link at least one checked-in recipe configured for ${quickModel} without checkpoint overrides; if its last recipe is deleted, remove the card and its navigation entry`,
     );
   }
 }

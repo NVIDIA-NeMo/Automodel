@@ -22,10 +22,11 @@ uv run torchrun --nnodes 4 --nproc-per-node 8 \
 | Goal | Start Here |
 | --- | --- |
 | Fine-tune mistralai/Mistral-Small-4-119B-2603 | [mistral4_medpix.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mistral4/mistral4_medpix.yaml). 4 nodes, 8 GPUs per node; see [Recipe Setup](#recipe-setup). |
-| Run the primary recipe for this model | Use the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/mistral/mistral_small_4_te_deepep.yaml). |
 | Prepare your environment | Follow the [installation instructions](/get-started/installation). |
 
 ## Model Context
+
+Mistral-Small-4-119B-2603 is used for text generation. Its model size is 119.40B checkpoint parameters.
 
 | Property | Value |
 | --- | --- |
@@ -39,26 +40,6 @@ uv run torchrun --nnodes 4 --nproc-per-node 8 \
 | Vocabulary Size | 131,072 |
 | Experts | 128 routed / 1 shared / 4 selected per token |
 | Configured Dtype | `bfloat16` |
-
-### Configuration
-
-| Setting | Configuration |
-| --- | --- |
-| Hardware | - |
-| Strategy | FSDP2; tp_size=1, pp_size=1, cp_size=1, ep_size=64 |
-| Nodes | 8 |
-| Features | Activation checkpointing (activation_checkpointing=true), Transformer Engine, HybridEP (dispatcher=hybridep) |
-| Advanced | attention=te, linear=te, experts=torch_mm, dispatcher=hybridep |
-
-### Setup and Additional Examples
-
-Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
-
-```bash
-automodel examples/llm_benchmark/mistral/mistral_small_4_te_deepep.yaml --nproc-per-node 8
-```
-
-Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node run.
 
 ### Recipe Setup
 

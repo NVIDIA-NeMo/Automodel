@@ -15,11 +15,13 @@ Use these H2 headings in this exact order:
 5. Related Resources
 
 Every area must have content. Do not add a body H1, another H2, or the old
-Model Reference wrapper. Model Context contains the architecture table followed
+Model Reference wrapper. Model Context contains a brief introduction, the architecture table, then
 by free-form prose, custom H3 or deeper headings, tables, code, and callouts.
 
 ## Required Content
 
+- A readable introduction paragraph of at least eight words appears before Quick Start. Introduce the model
+  and what readers can do with its recipes; tables, lists, and code do not qualify.
 - Frontmatter has a full Hugging Face `organization/checkpoint` title, a nonempty
   description, and a slug whose checkpoint matches the title. Existing provider
   route aliases remain valid. Fern uses the full title in the browser title.
@@ -38,7 +40,9 @@ by free-form prose, custom H3 or deeper headings, tables, code, and callouts.
   are read from YAML contents, including nested `model.config` fields, rather
   than inferred from filenames. Tokenizer and processor IDs must agree with
   the command's model ID.
-- Model Context starts with a direct `Property | Value` architecture table.
+- Quick Start explains the command's operation and dataset when applicable.
+- Model Context starts with a short introduction paragraph followed immediately
+  by a direct `Property | Value` architecture table.
   Require Task, Architecture, a numeric Parameters row, at least five properties,
   and two numeric dimension rows. Document layers, hidden size, attention,
   context length, vocabulary, experts, and vision dimensions when available.
@@ -54,10 +58,11 @@ by free-form prose, custom H3 or deeper headings, tables, code, and callouts.
 
 | Area | CI Limit |
 | --- | --- |
-| Introduction | 80 prose words and 800 visible characters |
+| Introduction | At least eight words; at most 80 prose words and 800 visible characters |
 | Quick Start | 60 prose words and 600 visible characters |
 | Quick Start command | One code block, at most 12 lines |
 | Choose a Workflow | 160 prose words, 1,600 visible characters, and six data rows |
+| Model Context introduction | 8-40 words and at most 400 visible characters |
 | Model Context | Free-form; no length limit |
 
 Counts exclude code blocks, headings, frontmatter, comments, and link destinations.
@@ -71,6 +76,20 @@ example YAMLs. `tools/model_card_layout.mjs` enforces layout, required content,
 recipe identity, filenames, and length limits. Unit tests include wrong-checkpoint recipes,
 missing commands, thin architecture tables, long sections, and newly added cards.
 Failures report the file path and line number and exit nonzero.
+
+### Recipe Removal
+
+When removing a recipe, update cards that reference it in the same PR. If another
+checked-in recipe still targets that exact checkpoint, update Quick Start and
+Choose a Workflow to use it. If the deleted recipe was the checkpoint's last
+recipe, delete its model card, remove its nightly navigation and provider-index
+entries, and repair incoming links. Remove cards for converted checkpoints when
+their last execution recipe is deleted as well.
+
+CI rejects cards whose launch or workflow links reference deleted YAMLs and cards
+without a remaining matching recipe. Deleting one workflow does not require
+removing a card that still has another recipe for the same checkpoint. Archived
+release cards stay with their corresponding release recipes.
 
 The Fern docs check runs on every copied PR branch push, including PRs with
 `docs-only`. There are no label or path exclusions on this workflow. Trigger the

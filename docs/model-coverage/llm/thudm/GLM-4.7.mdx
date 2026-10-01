@@ -26,6 +26,8 @@ uv run torchrun --nnodes 16 --nproc-per-node 8 \
 
 ## Model Context
 
+GLM-4.7 is used for text generation. Its model size is 358.34B checkpoint parameters.
+
 | Property | Value |
 | --- | --- |
 | Task | Text generation |
@@ -48,6 +50,10 @@ uv run torchrun --nnodes 16 --nproc-per-node 8 \
 | Nodes | 16 |
 | Features | HybridEP (dispatcher=hybridep) |
 | Advanced | dispatcher=hybridep |
+
+### GLM-4.7-Flash
+
+The GLM-4.7-Flash recipes use the native `Glm4MoeLiteForCausalLM` implementation. Choose a Flash recipe below when adapting that checkpoint rather than the full GLM-4.7 checkpoint.
 
 ### More Recipes for This Model
 

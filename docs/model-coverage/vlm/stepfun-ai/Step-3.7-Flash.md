@@ -25,6 +25,8 @@ uv run torchrun --nnodes 16 --nproc-per-node 8 \
 
 ## Model Context
 
+Step-3.7-Flash is used for image-text-to-text / video-text-to-text. Its model size is 201.37B checkpoint parameters.
+
 | Property | Value |
 |---|---|
 | **Task** | Image-Text-to-Text / Video-Text-to-Text |

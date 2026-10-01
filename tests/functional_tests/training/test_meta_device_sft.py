@@ -15,11 +15,12 @@
 # pylint: disable=line-too-long
 """Tests for consolidated HF safetensors checkpointing for LLM."""
 
-from pathlib import Path
 import sys
 from contextlib import nullcontext
+from pathlib import Path
 from unittest.mock import patch
 
+import datasets
 import torch
 import torch.distributed.tensor
 
@@ -27,7 +28,6 @@ from nemo_automodel.components.config._arg_parser import parse_args_and_load_con
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
 from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM
 
-import datasets
 datasets.disable_caching()
 
 
@@ -58,6 +58,7 @@ def get_cfg_path() -> str:
 
         i += 1
 
+
 def test_consolidated_llm_checkpoint():
     """
     Tests HF consolidated checkpoint for LLM.
@@ -65,10 +66,12 @@ def test_consolidated_llm_checkpoint():
     cfg_path = get_cfg_path()
     if "llm" in cfg_path:
         recipe_cls = TrainFinetuneRecipeForNextTokenPrediction
-        default_cfg_path = Path(__file__).parents[3] / "examples" / "llm_finetune" / "llama3_2" / "llama3_2_1b_hellaswag.yaml"
+        default_cfg_path = (
+            Path(__file__).parents[3] / "examples" / "llm_finetune" / "llama3_2" / "llama3_2_1b_hellaswag.yaml"
+        )
     elif "vlm" in cfg_path:
         recipe_cls = FinetuneRecipeForVLM
-        default_cfg_path = Path(__file__).parents[3] / "examples" / "vlm_finetune" / "gemma3" / "gemma3_vl_4b_cord_v2.yaml"
+        default_cfg_path = Path(__file__).parents[1] / "hf_transformer_vlm" / "configs" / "gemma3_vl_4b_cord_v2.yaml"
     else:
         raise ValueError(f"Unable to infer trainer from config path: {cfg_path}")
 
@@ -84,7 +87,9 @@ def test_consolidated_llm_checkpoint():
     meta_trainer.setup()
 
     trainer_model_parts = trainer.model_parts if hasattr(trainer, "model_parts") else [trainer.model]
-    meta_trainer_model_parts = meta_trainer.model_parts if hasattr(meta_trainer, "model_parts") else [meta_trainer.model]
+    meta_trainer_model_parts = (
+        meta_trainer.model_parts if hasattr(meta_trainer, "model_parts") else [meta_trainer.model]
+    )
     for model, meta_model in zip(trainer_model_parts, meta_trainer_model_parts):
         for (n, p), (meta_n, meta_p) in zip(model.named_parameters(), meta_model.named_parameters()):
             assert n == meta_n

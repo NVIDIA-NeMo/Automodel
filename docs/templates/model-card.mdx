@@ -4,13 +4,14 @@ description: "Describe the model and the NeMo AutoModel workflows documented on 
 slug: model-coverage/CATEGORY/PROVIDER/MODEL-CHECKPOINT-NAME
 ---
 
-Introduce the upstream model, link its exact Hugging Face checkpoint, and explain
-the NeMo AutoModel workflows documented below.
+Write a short, welcoming paragraph that introduces the upstream model, links its
+exact Hugging Face checkpoint, and explains what readers can do with the recipes.
 
 ## Quick Start
 
-State installation, hardware, checkpoint access, and data requirements. From the
-repository root, launch at least one checked-in recipe for this checkpoint:
+Explain what the command does (for example, full supervised fine-tuning or LoRA)
+and name its dataset when applicable. State required hardware and prerequisites.
+From the repository root, launch at least one checked-in recipe for this checkpoint:
 
 ```bash
 uv run automodel examples/llm_finetune/MODEL/MODEL_squad.yaml --nproc-per-node 8
@@ -31,6 +32,9 @@ recipes for this model, such as LoRA, packed sequences, or pretraining, when the
 exist. Keep the initial command and its corresponding table row consistent.
 
 ## Model Context
+
+Introduce this model's purpose and architecture in a short paragraph before the
+table. Give readers context for the dimensions rather than opening with a table.
 
 | Property | Value |
 | --- | --- |
