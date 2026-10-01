@@ -114,12 +114,20 @@ class HunyuanImage3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdap
             out = [(k, v) for k, v in out if not re.match(exclude_key_regex, k)]
         return out
 
+    @staticmethod
+    def _no_inplace_views(kwargs: dict[str, Any]) -> dict[str, Any]:
+        # The release stores each expert's projections fused and half-swapped ([up; gate]), which cannot be expressed
+        # as a view of the grouped [gate | up] storage. Checkpoint loads therefore read into temporaries that
+        # ``from_hf`` splits and merges, instead of DCP writing through views that this adapter would re-fuse into a
+        # copy (leaving the model's gate/up storage unloaded).
+        return {**kwargs, "for_checkpoint_load": False}
+
     def to_hf(self, state_dict: dict[str, Any], exclude_key_regex: str | None = None, **kwargs) -> dict[str, Any]:
-        split = self._to_hf_w_split_experts(state_dict, **kwargs)
+        split = self._to_hf_w_split_experts(state_dict, **self._no_inplace_views(kwargs))
         return dict(self._fuse_and_rename(list(split.items()), exclude_key_regex))
 
     def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
-        pairs = self._convert_single_merged_expert_to_hf_split_experts(fqn, tensor, **kwargs)
+        pairs = self._convert_single_merged_expert_to_hf_split_experts(fqn, tensor, **self._no_inplace_views(kwargs))
         if pairs is None:
             pairs = [(fqn, tensor)]
         return self._fuse_and_rename(pairs, kwargs.get("exclude_key_regex"))
