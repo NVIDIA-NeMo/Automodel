@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import re
+from copy import deepcopy
 from typing import Any
 
 import torch
@@ -64,6 +65,63 @@ _MXFP4_VALUES = (
     -4.0,
     -6.0,
 )
+
+
+@torch.no_grad()
+def quantize_mxfp4(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pack a local floating-point ``[out, in]`` expert into MXFP4.
+
+    Each block uses ``2 ** ceil(log2(amax / 6))``, clamped to the E8M0 range,
+    and round-to-nearest, ties-to-even E2M1. Zero blocks use scale 1.
+    Scratch space is bounded to 128 output rows.
+
+    The caller must split distributed grouped weights into complete local
+    experts first. Shards within an expert and nonfinite weights are rejected.
+
+    Args:
+        weight: Local tensor of shape [out, in], with in divisible by 32.
+            Supports float32, float16, and bfloat16 on CPU or CUDA, including
+            noncontiguous views. The input is not modified.
+
+    Returns:
+        Independent uint8 tensors on the input device: packed E2M1 bytes of
+        shape [out, in / 2] (even element in the low nibble), and biased E8M0
+        scales of shape [out, in / 32].
+    """
+    from torch.distributed.tensor import DTensor
+
+    if isinstance(weight, DTensor):
+        raise ValueError("MXFP4 export requires complete local expert weights, not within-expert DTensor shards.")
+    if weight.ndim != 2 or not weight.shape[1] or weight.shape[1] % 32:
+        raise ValueError(f"MXFP4 requires [out, in] weights with in divisible by 32, got {weight.shape}.")
+    if weight.dtype not in (torch.float32, torch.float16, torch.bfloat16) or weight.is_meta:
+        raise ValueError("MXFP4 export requires materialized float32, float16, or bfloat16 weights.")
+    rows, columns = weight.shape
+    packed = torch.empty((rows, columns // 2), dtype=torch.uint8, device=weight.device)
+    scales = torch.empty((rows, columns // 32), dtype=torch.uint8, device=weight.device)
+    midpoints = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0], device=weight.device)
+    finite = torch.ones((), dtype=torch.bool, device=weight.device)
+    for start in range(0, rows, 128):
+        blocks = weight[start : start + 128].float().reshape(-1, columns // 32, 32)
+        finite &= torch.isfinite(blocks).all()
+        amax = blocks.abs().amax(dim=-1)
+        # frexp avoids log2 rounding at exact scale boundaries and underflow
+        # for tiny weights: amax = mantissa * 2**exponent, 0.5 <= mantissa < 1.
+        mantissa, exponent = torch.frexp(amax)
+        exponent = (exponent - 3 + (mantissa > 0.75).to(torch.int32)).clamp(-127, 127)
+        exponent = torch.where(amax == 0, 0, exponent).to(torch.int32)
+        normalized = torch.ldexp(blocks, -exponent.unsqueeze(-1))
+        magnitude = normalized.abs().contiguous()
+        codes = torch.bucketize(magnitude, midpoints)
+        # bucketize selects the lower neighbor at a tie; choose the even code.
+        ties = magnitude == midpoints[codes.clamp_max(6)]
+        codes += (ties & (codes % 2 == 1)).to(codes.dtype)
+        codes = codes.to(torch.uint8) | (torch.signbit(normalized).to(torch.uint8) << 3)
+        packed[start : start + 128] = (codes[..., 0::2] | (codes[..., 1::2] << 4)).flatten(1)
+        scales[start : start + 128] = (exponent + 127).to(torch.uint8)
+    if not finite.item():
+        raise ValueError("Cannot export nonfinite expert weights to MXFP4.")
+    return packed, scales
 
 
 def dequantize_mxfp4(
@@ -246,10 +304,31 @@ class KimiK3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
         quantization: bool = False,
         **kwargs: Any,
     ) -> dict[str, Any]:
-        """Convert Automodel native tensors to Kimi HF checkpoint keys."""
+        """Convert native weights to HF, optionally packing routed experts as MXFP4.
+
+        ``quantization=True`` encodes trained weights for export. Only when
+        ``for_checkpoint_load=True`` does it allocate empty packed destinations
+        and retain floating-point model views for subsequent dequantization.
+
+        Args:
+            state_dict: Native names to tensors. Routed experts have global
+                shapes [experts, hidden, 2 * inter] for gate/up and
+                [experts, inter, hidden] for down. Other tensors retain their
+                model-defined layouts. Quantized export supports expert-axis
+                sharding with complete local experts, not within-expert shards.
+            exclude_key_regex: Optional regex for omitted HF keys.
+            quantization: Whether to emit packed MXFP4 routed experts.
+            **kwargs: Checkpoint options including for_checkpoint_load and device_mesh.
+
+        Returns:
+            HF names to tensors. Plain experts have shapes [inter, hidden] or
+            [hidden, inter]. MXFP4 tensors use uint8 [out, in / 2] packed bytes
+            and [out, in / 32] scales. Non-expert tensors retain their dtypes
+            and may alias inputs. Conversion does not modify model weights.
+        """
         previous_device_mesh = getattr(self, "_active_device_mesh", None)
         self._active_device_mesh = kwargs.get("device_mesh")
-        if quantization:
+        if quantization and kwargs.get("for_checkpoint_load", False):
             self._mxfp4_load_views: dict[str, torch.Tensor] = {}
         hf_state_dict: dict[str, Any] = {}
         try:
@@ -273,15 +352,27 @@ class KimiK3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
         Args:
             fqn: Fully qualified native tensor name.
             tensor: Native tensor. Grouped routed expert tensors use [experts, hidden, 2 * inter]
-                for gate/up and [experts, inter, hidden] for down.
+                for gate/up and [experts, inter, hidden] for down. Expert-axis
+                DTensor sharding is supported for export, with complete local experts.
             **kwargs: Adapter options forwarded by checkpoint save/load.
 
         Returns:
-            HF key/tensor pairs. Split expert tensors use Kimi ``w1``/``w2``/``w3`` names.
+            HF key/tensor pairs, with the layouts, dtypes, and aliasing contract
+            documented in :meth:`to_hf`. Split experts use Kimi w1/w2/w3 names.
         """
         exclude_key_regex = kwargs.get("exclude_key_regex", None)
         split_kwargs = kwargs
         if kwargs.get("quantization", False):
+            if not kwargs.get("for_checkpoint_load", False):
+                from torch.distributed.tensor import DTensor, Replicate, Shard
+
+                if isinstance(tensor, DTensor) and ".mlp.experts." in fqn:
+                    if any(
+                        not isinstance(placement, Replicate)
+                        and not (isinstance(placement, Shard) and placement.dim == 0)
+                        for placement in tensor.placements
+                    ):
+                        raise ValueError("MXFP4 export supports expert-axis sharding, not within-expert shards.")
             # K3's packed checkpoint must first load into compact uint8 buffers,
             # but the eventual BF16 values can still be written through views
             # into the model's grouped expert storage. Tell the generic splitter
@@ -299,16 +390,64 @@ class KimiK3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
             packed_result: list[tuple[str, Any]] = []
             for key, value in result:
                 if re.search(r"\.block_sparse_moe\.experts\.\d+\.w[123]\.weight$", key):
-                    load_views = getattr(self, "_mxfp4_load_views", None)
-                    if load_views is not None:
-                        load_views[self._strip_hf_text_prefix(key)] = value
-                    packed_result.extend(self._make_mxfp4_load_destinations(key, value))
+                    if kwargs.get("for_checkpoint_load", False):
+                        load_views = getattr(self, "_mxfp4_load_views", None)
+                        if load_views is not None:
+                            load_views[self._strip_hf_text_prefix(key)] = value
+                        packed_result.extend(self._make_mxfp4_load_destinations(key, value))
+                    else:
+                        packed, scales = quantize_mxfp4(value)
+                        packed_result.extend([(f"{key}_packed", packed), (f"{key}_scale", scales)])
                 else:
                     packed_result.append((key, value))
             result = packed_result
         if exclude_key_regex:
             result = [(key, value) for key, value in result if not re.match(exclude_key_regex, key)]
         return result
+
+    def adapt_hf_config_for_save(self, config: dict[str, Any], *, quantization: bool = False) -> dict[str, Any]:
+        """Match serialized HF metadata to routed-expert export, without mutating the input.
+
+        K3 stores its compressed-tensors scheme inside ``text_config`` for the
+        multimodal checkpoint, or at the root for a text-only config. Remove
+        stale source quantization metadata from ordinary floating-point saves.
+
+        Args:
+            config: Serialized HF config dictionary.
+            quantization: Whether routed expert weights are exported as MXFP4.
+
+        Returns:
+            An independent config dictionary with matching quantization metadata.
+        """
+        config = deepcopy(config)
+        config.pop("quantization_config", None)
+        text_config = config.get("text_config", config)
+        text_config.pop("quantization_config", None)
+        if quantization:
+            text_config["quantization_config"] = {
+                "quant_method": "compressed-tensors",
+                "format": "mxfp4-pack-quantized",
+                "quantization_status": "compressed",
+                "config_groups": {
+                    "group_0": {
+                        "format": "mxfp4-pack-quantized",
+                        "targets": [r"re:.*block_sparse_moe\.experts\.\d+\.w[123]$"],
+                        "weights": {
+                            "num_bits": 4,
+                            "type": "float",
+                            "symmetric": True,
+                            "strategy": "group",
+                            "group_size": 32,
+                            "dynamic": False,
+                            "scale_dtype": "torch.uint8",
+                        },
+                        "input_activations": None,
+                        "output_activations": None,
+                    }
+                },
+                "ignore": [],
+            }
+        return config
 
     def from_hf(
         self,

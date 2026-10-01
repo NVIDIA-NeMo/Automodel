@@ -69,7 +69,8 @@ class HFCheckpointingMixin:
             checkpointer: Checkpointer instance. Uses self._checkpointer if not provided.
             tokenizer: Optional tokenizer to save alongside model
             **kwargs: Additional arguments, including ``peft_config`` and
-                ``is_final_checkpoint``. Direct callers that do not have recipe
+                ``is_final_checkpoint`` and ``quantization`` (opt-in deployment export).
+                Direct callers that do not have recipe
                 step-scheduler context default ``is_final_checkpoint`` to
                 ``False``.
         """
@@ -88,4 +89,5 @@ class HFCheckpointingMixin:
             peft_config=kwargs.get("peft_config", None),
             tokenizer=tokenizer,
             is_final_checkpoint=kwargs.get("is_final_checkpoint", False),
+            quantization=kwargs.get("quantization", False),
         )

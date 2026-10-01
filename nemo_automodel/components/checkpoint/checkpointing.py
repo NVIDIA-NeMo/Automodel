@@ -660,11 +660,13 @@ class Checkpointer:
     @torch.no_grad()
     def save_model(
         self,
-        model: nn.Module,
+        model: nn.Module | list[nn.Module],
         weights_path: str,
-        peft_config: Optional["PeftConfig"] = None,
-        tokenizer: Optional["PreTrainedTokenizerBase"] = None,
+        peft_config: "PeftConfig | None" = None,
+        tokenizer: "PreTrainedTokenizerBase | None" = None,
         is_final_checkpoint: bool = False,
+        *,
+        quantization: bool = False,
     ) -> None:
         """
         Save model weights to `weights_path/model`.
@@ -681,7 +683,21 @@ class Checkpointer:
             peft_config: Optional PEFT configuration when saving adapters.
             tokenizer: Optional tokenizer to save with consolidated artifacts.
             is_final_checkpoint: Whether this save is the final scheduled training checkpoint.
+            quantization: Explicit post-training quantized HF export, supported only by adapters that implement it.
+                Keep false for resumable training checkpoints. Requires full-model safetensors saving.
         """
+        if quantization:
+            if self.config.is_peft or peft_config is not None:
+                raise ValueError("Quantized export requires full model weights, not PEFT adapters.")
+            if self.config.model_save_format != SerializationFormat.SAFETENSORS:
+                raise ValueError("Quantized export requires safetensors; keep training checkpoints unquantized.")
+            model_part = model[0] if isinstance(model, list) else model
+            adapter = getattr(_unwrap_ddp_model(model_part), "state_dict_adapter", None)
+            if not isinstance(adapter, StateDictAdapter):
+                raise ValueError("Quantized export requires a supporting state-dict adapter.")
+            # Fail before allocating or writing anything for load-only adapters.
+            adapter.adapt_hf_config_for_save({}, quantization=True)
+
         # Create the model directories
         model_dir = os.path.join(weights_path, "model")
         should_write_consolidated = _should_write_consolidated_safetensors(self.config, is_final_checkpoint)
@@ -717,7 +733,7 @@ class Checkpointer:
         state_dict = _maybe_adapt_state_dict_to_hf(
             model_state.model[0],
             state_dict,
-            quantization=False,
+            quantization=quantization,
             device_mesh=self.moe_mesh,
             v4_compatible=self.config.v4_compatible,
             legacy_paramwrapper_layout=self.config.legacy_paramwrapper_layout,
@@ -728,7 +744,22 @@ class Checkpointer:
         # MoE adapters return non-contiguous views; safetensors.save rejects those.
         _materialize_to_hf_views_for_save(state_dict)
         # Build the consolidated model.safetensors.index.json if needed
-        fqn_to_file_index_mapping = self._maybe_build_consolidated_index(model_state, state_dict)
+        if quantization:
+            # Packing changes both names and sizes. Pre-shard HF keys describe
+            # the floating-point model, so rebuild the index from the actual
+            # exported tensors across the same rank group that DCP saves.
+            group = self.process_group
+            if group is None and torch.distributed.is_initialized():
+                group = torch.distributed.group.WORLD
+            exported_sizes = _collect_global_tensor_sizes(state_dict, group)
+            fqn_to_file_index_mapping = _divide_keys_by_size(
+                list(exported_sizes),
+                state_dict,
+                _DEFAULT_HF_CONSOLIDATED_SHARD_SIZE_BYTES,
+                key_size_mapping=exported_sizes,
+            )
+        else:
+            fqn_to_file_index_mapping = self._maybe_build_consolidated_index(model_state, state_dict)
         fqn_to_dtype_mapping = self._maybe_build_original_dtype_mapping(model_state, state_dict)
         _warn_if_large_inline_consolidation(
             self.config,
@@ -751,6 +782,7 @@ class Checkpointer:
                 original_model_path=self._get_original_model_path(model_state),
                 v4_compatible=self.config.v4_compatible,
                 legacy_paramwrapper_layout=self.config.legacy_paramwrapper_layout,
+                quantization=quantization,
                 process_group=consolidation_process_group,
             )
         self._maybe_write_offline_consolidation_script(model_dir)

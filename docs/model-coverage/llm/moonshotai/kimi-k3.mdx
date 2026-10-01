@@ -39,6 +39,41 @@ See the [Slurm Launcher Guide](/job-launchers/slurm-cluster) for multi-node setu
 - Stable LatentMoE routes each token to 16 of 896 routed experts and includes two shared experts. The expert MLPs use SiTU-GLU.
 - The released checkpoint uses MXFP4 weights. The example recipe dequantizes the base checkpoint while loading it for BF16 training.
 
+## Export Trained Experts to MXFP4
+
+The state-dict adapter supports post-training MXFP4 export of routed expert
+`w1`, `w2`, and `w3` weights. It writes packed E2M1 bytes and one E8M0 scale
+per 32 input-channel values, together with matching compressed-tensors metadata.
+Shared experts, latent projections, routers, attention, vision, and other weights
+retain their existing export precision.
+
+Use the existing DCP-to-HF exporter with the same distributed topology as the
+training checkpoint, adding `--quantization` on each rank:
+
+```bash
+torchrun --nproc-per-node=4 scripts/export_llm_dcp_to_hf.py \
+    --checkpoint-dir /checkpoints/epoch_0_step_99 \
+    --output-dir /exports/kimi-k3-mxfp4 \
+    --quantization
+```
+
+For multi-node checkpoints, also supply the matching `torchrun` rendezvous and
+node arguments through your cluster launcher. The script rebuilds the model
+using the saved recipe; it does not reduce the number of required training ranks.
+Output is under `/exports/kimi-k3-mxfp4/epoch_0_step_99/model/consolidated`.
+Programmatic callers can pass `quantization=True` to
+`Checkpointer.save_model(...)` or `model.save_pretrained(..., checkpointer=...)`
+with safetensors saving enabled.
+
+<Note>
+This is weight-only post-training quantization, not Kimi K3 QAT or native MXFP4
+training. It uses power-of-two scales rounded up to cover each block maximum
+and nearest-even E2M1 rounding, without calibration. Evaluate downstream quality
+before deployment. Regular training checkpoints remain unquantized by default;
+keep them for training resume. PEFT adapters must be merged into full weights
+before quantized export.
+</Note>
+
 ## Parallelism
 
 | Parallelism | Validated Configuration |
