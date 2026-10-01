@@ -18,7 +18,6 @@ import copy
 import subprocess
 import sys
 import weakref
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -99,51 +98,6 @@ def test_the_microbatch_exposes_the_packed_document_geometry() -> None:
     assert torch.equal(
         microbatch.workspace_positions, microbatch.document_positions + torch.tensor([0] * 3 + [128] * 2 + [256] * 4)
     )
-
-
-def test_checkpoint_recompute_rebuilds_stale_selection_state(monkeypatch: pytest.MonkeyPatch) -> None:
-    tokens, blocks = 16_384, 128
-    microbatch = msa.MSAMicrobatch.from_document_map(torch.ones(4, 4096, dtype=torch.int64), forced_blocks=_FORCED)
-    current_plan = msa._SelectionPlan(
-        plan=object(),
-        score_shape=(msa.NUM_INDEX_HEADS, blocks, tokens),
-        num_blocks=blocks,
-        candidate=torch.ones(tokens, blocks, dtype=torch.bool),
-        forced=torch.zeros(tokens, blocks, dtype=torch.bool),
-    )
-    stale_plan = msa._SelectionPlan(
-        plan=object(),
-        score_shape=(msa.NUM_INDEX_HEADS, 1, 16),
-        num_blocks=1,
-        candidate=torch.ones(16, 1, dtype=torch.bool),
-        forced=torch.zeros(16, 1, dtype=torch.bool),
-    )
-
-    stale_kernel_output = torch.empty(msa.NUM_INDEX_HEADS, 1, 16)
-
-    def score(*args: object, max_score: torch.Tensor, **kwargs: object) -> tuple[None, torch.Tensor]:
-        max_score.zero_()
-        return None, stale_kernel_output
-
-    monkeypatch.setattr(msa.msa_bindings, "kernels", lambda: SimpleNamespace(fmha_sm100=score))
-    monkeypatch.setattr(msa._SelectionPlan, "build", classmethod(lambda cls, owner: current_plan))
-    msa._SCORE_SCRATCH.clear()
-    index_q = torch.empty(tokens, msa.NUM_INDEX_HEADS, msa.INDEX_DIM, dtype=torch.bfloat16)
-    index_k = torch.empty(tokens, 1, msa.INDEX_DIM, dtype=torch.bfloat16)
-    microbatch.__dict__["_plan"] = current_plan
-    seen: list[tuple[int, ...]] = []
-
-    def checkpointed(value: torch.Tensor) -> torch.Tensor:
-        seen.append(tuple(microbatch.select_blocks(index_q, index_k).shape))
-        return value.sin() * value
-
-    value = torch.ones((), requires_grad=True)
-    output = torch.utils.checkpoint.checkpoint(checkpointed, value, use_reentrant=False)
-    microbatch.__dict__["_plan"] = stale_plan
-    output.backward()
-
-    assert seen == [(msa.NUM_KV_HEADS, tokens, msa.TOPK_BLOCKS)] * 2
-    assert microbatch._plan is current_plan
 
 
 def test_sparse_attention_rejects_selection_for_another_microbatch() -> None:
@@ -392,6 +346,16 @@ def test_the_model_declares_whether_it_consumes_packed_seq_ids(sparse_attn: str,
     stage = copy.deepcopy(model)
     stage.model.layers["1"] = None
     assert stage.consumes_packed_seq_ids is declared
+
+
+def test_msa_blocks_opt_out_of_whole_block_activation_checkpointing() -> None:
+    text = _config(sparse_attention_freq=[1, 1], sparse_disable_index_value=[1, 1])
+    with torch.device("meta"):
+        msa_model = MiniMaxM3SparseForCausalLM(text, backend=_backend("msa", attn="sdpa"))
+        generic_model = MiniMaxM3SparseForCausalLM(text, backend=_backend("generic", attn="sdpa"))
+
+    assert all(block._nemo_disable_activation_checkpointing for block in msa_model.model.layers.values())
+    assert all(not block._nemo_disable_activation_checkpointing for block in generic_model.model.layers.values())
 
 
 def test_msa_with_dense_layers_requires_a_varlen_attention_backend() -> None:
