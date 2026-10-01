@@ -1,0 +1,56 @@
+---
+title: "Qwen/Qwen2.5-Omni-3B"
+description: "Use Qwen/Qwen2.5-Omni-3B with NeMo AutoModel for multimodal fine-tuning, with documented checkpoints, runnable recipes, setup guidance, and model reference details."
+slug: model-coverage/omni/qwen/Qwen2.5-Omni-3B
+---
+
+[Qwen2.5-Omni](https://qwenlm.github.io/blog/qwen2.5-omni/) is Alibaba Cloud's omnimodal model supporting text, image, audio, and video inputs in a single unified architecture with a dense language backbone. NeMo AutoModel onboards the **Thinker** stack for audio understanding tasks such as automatic speech recognition (ASR).
+
+Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
+
+## Quick Start
+
+From the repository root, run:
+
+```bash
+uv run automodel --nproc-per-node=8 examples/audio_finetune/qwen2_5_omni_asr/ami_sft_3b.yaml
+```
+
+## Choose a Workflow
+
+| Goal | Start Here |
+| --- | --- |
+| ASR SFT - Qwen2.5-Omni 3B on the AMI meeting corpus | Use [ami_sft_3b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/audio_finetune/qwen2_5_omni_asr/ami_sft_3b.yaml). Dataset: AMI. |
+
+## Model Context
+
+| Property | Value |
+| --- | --- |
+| Task | Omnimodal (Text/Image/Audio/Video) |
+| **Architecture** | `Qwen2_5OmniForConditionalGeneration` |
+| Parameters | 3B |
+| Hugging Face Organization | [Qwen](https://huggingface.co/Qwen) |
+| Decoder Layers | 36 |
+| Hidden Size | 2,048 |
+| Attention | 16 attention heads / 2 key-value heads |
+| Context Length | 32,768 tokens (checkpoint configuration) |
+| Vocabulary Size | 151,936 |
+| Configured Dtype | `bfloat16` |
+
+The registry wires the Qwen2.5-Omni Thinker backbone under the following architecture keys:
+
+- `Qwen2_5OmniForConditionalGeneration`
+- `Qwen2_5OmniModel`
+- `Qwen2_5OmniThinkerForConditionalGeneration`
+
+## Available Models
+
+| Model | HF ID |
+|---|---|
+| Qwen2.5-Omni 3B | [`Qwen/Qwen2.5-Omni-3B`](https://huggingface.co/Qwen/Qwen2.5-Omni-3B) |
+
+## Related Resources
+
+- [VLM Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n)
+
+- [Checkpoint Configuration](https://huggingface.co/Qwen/Qwen2.5-Omni-3B/blob/f75b40e3da2003cdd6e1829b1f420ca70797c34e/config.json)

@@ -18,7 +18,13 @@ if (files.length === 0) {
 
 let failures = 0;
 for (const file of files) {
-  const errors = validateModelCard(await fs.readFile(file, "utf8"), template, path.extname(file).slice(1), recipes);
+  const errors = validateModelCard(
+    await fs.readFile(file, "utf8"),
+    template,
+    path.extname(file).slice(1),
+    recipes,
+    path.basename(file),
+  );
   for (const { line, message } of errors) {
     console.error(`${path.relative(repoRoot, file)}:${line}: ${message}`);
   }

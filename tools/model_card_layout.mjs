@@ -50,7 +50,7 @@ function section(nodes, heading) {
 }
 
 /** Validate a parsed card against the section structure in the authoring template. */
-export function validateModelCard(source, template, format = "mdx", recipes = new Map()) {
+export function validateModelCard(source, template, format = "mdx", recipes = new Map(), filename) {
   const errors = [];
   const report = (node, message) => errors.push({ line: node?.position?.start?.line ?? 1, message });
   let tree;
@@ -86,6 +86,12 @@ export function validateModelCard(source, template, format = "mdx", recipes = ne
       modelId = document.get("title");
       if (typeof modelId === "string" && !/^[\w.-]+\/[\w.-]+$/.test(modelId)) {
         report(metadata, "frontmatter title must be the full Hugging Face organization/model ID");
+      }
+      if (typeof modelId === "string" && filename !== undefined) {
+        const expectedFilename = `${modelId.split("/").at(-1)}.${format}`;
+        if (path.basename(filename) !== expectedFilename) {
+          report(metadata, `model card filename must be ${expectedFilename} (match checkpoint case and punctuation)`);
+        }
       }
       const slug = document.get("slug");
       if (

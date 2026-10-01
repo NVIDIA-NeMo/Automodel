@@ -1,0 +1,62 @@
+---
+title: "tiiuae/Falcon-H1-1.5B-Deep-Instruct"
+description: "Use NeMo AutoModel to fine-tune tiiuae/Falcon-H1-1.5B-Deep-Instruct for LLM workflows with checked-in text generation recipes and documented distributed settings."
+slug: model-coverage/large-language-models/tiiuae/Falcon-H1-1.5B-Deep-Instruct
+---
+
+[Falcon-H1-1.5B-Deep-Instruct](https://huggingface.co/tiiuae/Falcon-H1-1.5B-Deep-Instruct) has a checked-in NeMo AutoModel recipe for text generation.
+The Hugging Face configuration declares the `FalconH1ForCausalLM` architecture.
+
+## Quick Start
+
+Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+
+```bash
+automodel examples/llm_finetune/falcon/falcon_h1_1p5b_instruct_squad.yaml --nproc-per-node 8
+```
+
+## Choose a Workflow
+
+| Goal | Start Here |
+| --- | --- |
+| Run the primary recipe for this model | Use the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/falcon/falcon_h1_1p5b_instruct_squad.yaml). |
+| Prepare your environment | Follow the [installation instructions](/get-started/installation). |
+
+## Model Context
+
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| **Architecture** | `FalconH1ForCausalLM` |
+| Parameters | 1.55B checkpoint parameters |
+| Decoder Layers | 66 |
+| Hidden Size | 1,280 |
+| Attention | 6 attention heads / 2 key-value heads |
+| Context Length | 131,072 tokens (checkpoint configuration) |
+| Vocabulary Size | 65,537 |
+| Configured Dtype | `bfloat16` |
+
+### Configuration
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | - |
+| Strategy | FSDP2; tp_size=1, cp_size=1 |
+| Nodes | 1 |
+| Features | - |
+| Advanced | bf16 |
+
+## Available Models
+
+- [`tiiuae/Falcon-H1-1.5B-Deep-Instruct`](https://huggingface.co/tiiuae/Falcon-H1-1.5B-Deep-Instruct)
+
+| Checkpoint | Type |
+| --- | --- |
+| [Falcon-H1-1.5B-Deep-Instruct](https://huggingface.co/tiiuae/Falcon-H1-1.5B-Deep-Instruct) | Checkpoint documented on this page |
+| [`tiiuae/Falcon-H1-1.5B-Deep-Instruct`](https://huggingface.co/tiiuae/Falcon-H1-1.5B-Deep-Instruct) | Checkpoint documented on this page |
+
+## Related Resources
+
+- [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/tiiuae/Falcon-H1-1.5B-Deep-Instruct/blob/b6648636ddc906688974282de6e7a243395f5423/config.json)

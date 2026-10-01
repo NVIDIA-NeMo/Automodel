@@ -1,0 +1,57 @@
+---
+title: "nvidia/Nemotron-Flash-1B"
+description: "Fine-tune nvidia/Nemotron-Flash-1B with NeMo AutoModel: checked-in recipe, launch command, architecture, and model context."
+slug: model-coverage/large-language-models/nvidia/Nemotron-Flash-1B
+---
+
+[NVIDIA Nemotron-Flash](https://huggingface.co/nvidia/Nemotron-Flash-1B) is a compact, fast language model designed for low-latency inference workloads.
+
+<Note>
+This model requires `trust_remote_code: true` in your recipe YAML.
+
+</Note>
+
+Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
+
+## Quick Start
+
+From the repository root, run:
+
+```bash
+uv run automodel --nproc-per-node=8 examples/llm_finetune/nemotron_flash/nemotron_flash_1b_squad.yaml
+```
+
+## Choose a Workflow
+
+| Goal | Start Here |
+| --- | --- |
+| Supervised fine-tuning (SFT) - Nemotron-Flash 1B on SQuAD | Use [nemotron_flash_1b_squad.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron_flash/nemotron_flash_1b_squad.yaml). |
+| Low-rank adaptation (LoRA) - Nemotron-Flash 1B on SQuAD | Use [nemotron_flash_1b_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron_flash/nemotron_flash_1b_squad_peft.yaml). |
+
+## Model Context
+
+| Property | Value |
+| --- | --- |
+| Task | Text Generation |
+| **Architecture** | `NemotronFlashForCausalLM` |
+| Parameters | 1B |
+| Hugging Face Organization | [nvidia](https://huggingface.co/nvidia) |
+| Decoder Layers | 24 |
+| Hidden Size | 2,048 |
+| Attention | 16 attention heads / 4 key-value heads |
+| Context Length | 36,000 tokens (checkpoint configuration) |
+| Vocabulary Size | 131,072 |
+| Experts | 1 routed / 1 selected per token |
+| Configured Dtype | `bfloat16` |
+
+## Available Models
+
+| Model | HF ID |
+|---|---|
+| Nemotron-Flash 1B | [`nvidia/Nemotron-Flash-1B`](https://huggingface.co/nvidia/Nemotron-Flash-1B) |
+
+## Related Resources
+
+- [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/nvidia/Nemotron-Flash-1B/blob/da87f707f678b5936e67fdcfe598f76ebcc5fdbc/config.json)

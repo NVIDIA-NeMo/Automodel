@@ -57,7 +57,7 @@ configure_diffusion_finetune_recipe() {
         qwen_image_edit_2511_flow*)
             # Image-edit training consumes source->target pairs, not the tuxemon
             # T2I set; MagicBrush is the dataset documented for this recipe
-            # (docs/model-coverage/diffusion/qwen/qwen-image.mdx).
+            # (docs/model-coverage/diffusion/qwen/Qwen-Image.mdx).
             MEDIA_TYPE="image_edit"
             PROCESSOR="qwen_image_edit"
             GENERATE_CONFIG="examples/diffusion/generate/configs/generate_qwen_image_edit.yaml"

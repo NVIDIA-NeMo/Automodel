@@ -71,13 +71,38 @@ test("the independent fixture conforms in Markdown and MDX", () => {
   assert.deepEqual(check(validCard, recipes, "md"), []);
 });
 
+test("filenames match checkpoint case, punctuation, and version in both formats", () => {
+  const source = validCard.replaceAll("Test-Model", "FLUX.1-dev");
+  const catalog = new Map([
+    [
+      recipe,
+      {
+        recipe: "TrainFinetuneRecipeForNextTokenPrediction",
+        model: {
+          pretrained_model_name_or_path: "provider/FLUX.1-dev",
+        },
+      },
+    ],
+  ]);
+  for (const format of ["md", "mdx"]) {
+    assert.deepEqual(validateModelCard(source, template, format, catalog, `FLUX.1-dev.${format}`), []);
+    for (const filename of ["flux", "flux.1-dev", "FLUX-1-dev", "FLUX.1"]) {
+      assert.ok(
+        validateModelCard(source, template, format, catalog, `${filename}.${format}`).some(({ message }) =>
+          message.includes(`filename must be FLUX.1-dev.${format}`),
+        ),
+      );
+    }
+  }
+});
+
 test("Moonlight, Aquila, North Micro, and DeepSeek Vision meet the real contract", async () => {
   const catalog = await loadRecipeCatalog(repoRoot);
   for (const file of [
-    "llm/moonshotai/moonlight.mdx",
-    "llm/baai/aquila.mdx",
-    "vlm/coherelabs/north-micro-vision.mdx",
-    "vlm/deepseek-ai/deepseek-v4-flash-vision-exp.mdx",
+    "llm/moonshotai/Moonlight-16B-A3B.mdx",
+    "llm/baai/Aquila-7B.mdx",
+    "vlm/coherelabs/North-Micro-Vision-Instruct.mdx",
+    "vlm/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp.mdx",
   ]) {
     assert.deepEqual(
       check(await fs.readFile(path.join(repoRoot, "docs/model-coverage", file), "utf8"), catalog),
@@ -382,7 +407,7 @@ test("the CI command fails for bad content and newly added Markdown cards", asyn
     for (const directory of ["docs/templates", "docs/model-coverage/provider", path.dirname(recipe)])
       await fs.mkdir(path.join(root, directory), { recursive: true });
     await fs.writeFile(path.join(root, "docs/templates/model-card.mdx"), template);
-    const card = path.join(root, "docs/model-coverage/provider/model.md");
+    const card = path.join(root, "docs/model-coverage/provider/Test-Model.md");
     await fs.writeFile(card, validCard);
     await fs.writeFile(
       path.join(root, recipe),
@@ -394,8 +419,14 @@ test("the CI command fails for bad content and newly added Markdown cards", asyn
         env: { ...process.env, MDX_LINT_REPO_ROOT: root },
       });
     assert.equal(run().status, 0);
-    await fs.writeFile(card, validCard.replace(launch, "Read the guide."));
+    const wrongName = path.join(root, "docs/model-coverage/provider/test-model.md");
+    await fs.rename(card, wrongName);
     let result = run();
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /test-model.md:1: model card filename must be Test-Model.md/);
+    await fs.rename(wrongName, card);
+    await fs.writeFile(card, validCard.replace(launch, "Read the guide."));
+    result = run();
     assert.equal(result.status, 1);
     assert.match(result.stderr, /Quick Start requires a shell/);
     await fs.writeFile(card, validCard);

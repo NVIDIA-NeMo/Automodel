@@ -1,0 +1,53 @@
+---
+title: "nvidia/Nemotron-Labs-Diffusion-8B-Base"
+description: "Fine-tune nvidia/Nemotron-Labs-Diffusion-8B-Base with NeMo AutoModel using checked-in full-parameter and LoRA diffusion language model recipes."
+slug: model-coverage/dllm/nvidia/Nemotron-Labs-Diffusion-8B-Base
+---
+
+[Nemotron-Labs-Diffusion](https://huggingface.co/nvidia/Nemotron-Labs-Diffusion-8B-Base) is NVIDIA's 8B diffusion language model.
+
+## Quick Start
+
+From the repository root, run:
+
+```bash
+uv run automodel --nproc-per-node=8 examples/dllm_sft/nemotron_labs_diffusion_sft.yaml
+```
+
+## Choose a Workflow
+
+| Goal | Start Here |
+| --- | --- |
+| [`nvidia/Nemotron-Labs-Diffusion-8B-Base`](https://huggingface.co/nvidia/Nemotron-Labs-Diffusion-8B-Base) | [Full SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/nemotron_labs_diffusion_sft.yaml) |
+| [`nvidia/Nemotron-Labs-Diffusion-8B-Base`](https://huggingface.co/nvidia/Nemotron-Labs-Diffusion-8B-Base) | [LoRA](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/nemotron_labs_diffusion_lora.yaml) |
+
+## Model Context
+
+| Property | Value |
+|---|---|
+| **Task** | Diffusion Language Modeling |
+| **Architecture** | `NemotronLabsDiffusionModel` with Hugging Face `trust_remote_code` |
+| **Parameters** | 8B |
+| **HF Org** | [nvidia](https://huggingface.co/nvidia) |
+| Decoder Layers | 34 |
+| Hidden Size | 4,096 |
+| Attention | 32 attention heads / 8 key-value heads |
+| Context Length | 4,096 tokens (checkpoint configuration) |
+| Vocabulary Size | 131,072 |
+| Configured Dtype | `bfloat16` |
+
+### Recipe Notes
+
+See the [dLLM Fine-Tuning Guide](/recipes-e2e-examples/dllm-fine-tuning).
+
+## Available Models
+
+| Checkpoint | Type |
+| --- | --- |
+| [`nvidia/Nemotron-Labs-Diffusion-8B-Base`](https://huggingface.co/nvidia/Nemotron-Labs-Diffusion-8B-Base) | Checkpoint linked by the example recipe |
+
+## Related Resources
+
+- [Installation Instructions](/get-started/installation)
+
+- [Checkpoint Configuration](https://huggingface.co/nvidia/Nemotron-Labs-Diffusion-8B-Base/blob/59ff0ffee284112fc6ccf37493ced41a11031434/config.json)

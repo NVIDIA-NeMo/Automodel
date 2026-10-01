@@ -1,0 +1,76 @@
+---
+title: "zai-org/GLM-5.3"
+description: "Use NeMo AutoModel to fine-tune zai-org/GLM-5.3 for LLM workflows with checked-in text generation recipes and documented distributed settings."
+slug: model-coverage/large-language-models/thudm/GLM-5.3
+---
+
+[GLM-5.3](https://huggingface.co/zai-org/GLM-5.3) has a checked-in NeMo AutoModel recipe for text generation.
+The Hugging Face configuration declares the `GlmMoeDsaForCausalLM` architecture.
+
+## Quick Start
+
+Follow the [installation instructions](/get-started/installation). Allocate 32 nodes with 8 GPUs each; run on every node with `NODE_RANK` and `MASTER_ADDR` set. Complete the [recipe setup](#recipe-setup) before launching.
+
+```bash
+uv run torchrun --nnodes 32 --nproc-per-node 8 \
+  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
+  -m nemo_automodel.cli.app examples/llm_finetune/glm/glm_5.3_tulu3_4k_cudnn_100step.yaml
+```
+
+## Choose a Workflow
+
+| Goal | Start Here |
+| --- | --- |
+| Fine-tune zai-org/GLM-5.3 | [glm_5.3_tulu3_4k_cudnn_100step.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.3_tulu3_4k_cudnn_100step.yaml). 32 nodes, 8 GPUs per node; see [Recipe Setup](#recipe-setup). |
+| Prepare your environment | Follow the [installation instructions](/get-started/installation). |
+
+## Model Context
+
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| **Architecture** | `GlmMoeDsaForCausalLM` |
+| Parameters | 753.33B checkpoint parameters |
+| Decoder Layers | 78 |
+| Hidden Size | 6,144 |
+| Attention | 64 attention heads / 64 key-value heads |
+| Context Length | 1,048,576 tokens (checkpoint configuration) |
+| Vocabulary Size | 154,880 |
+| Experts | 256 routed / 1 shared / 8 selected per token |
+| Configured Dtype | `bfloat16` |
+
+### Configuration
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | - |
+| Strategy | FSDP2; tp_size=1, pp_size=4, cp_size=1, ep_size=64 |
+| Nodes | 32 |
+| Features | Activation checkpointing (activation_checkpointing=true), Packed sequences (packed_sequence_size=4096), HybridEP (dispatcher=hybridep) |
+| Advanced | attention=cudnn, linear=torch, dispatcher=hybridep, sequence length 4096 |
+
+### Setup and Additional Examples
+
+Follow the [installation instructions](/get-started/installation), then review the checked-in recipe and
+its declared topology below before choosing a local or cluster launcher.
+
+Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node run.
+
+### Recipe Setup
+
+Read [glm_5.3_tulu3_4k_cudnn_100step.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.3_tulu3_4k_cudnn_100step.yaml) for checkpoint access, data paths, and backend dependencies. Use the [Slurm launcher guide](/job-launchers/slurm-cluster) to prepare the distributed allocation.
+
+## Available Models
+
+- [`zai-org/GLM-5.3`](https://huggingface.co/zai-org/GLM-5.3)
+
+| Checkpoint | Type |
+| --- | --- |
+| [GLM-5.3](https://huggingface.co/zai-org/GLM-5.3) | Checkpoint documented on this page |
+| [`zai-org/GLM-5.3`](https://huggingface.co/zai-org/GLM-5.3) | Checkpoint documented on this page |
+
+## Related Resources
+
+- [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/zai-org/GLM-5.3/blob/aca966e4e02791568aa6a4ced368624b3d897f42/config.json)

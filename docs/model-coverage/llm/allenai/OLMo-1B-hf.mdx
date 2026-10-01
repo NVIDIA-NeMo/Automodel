@@ -1,0 +1,56 @@
+---
+title: "allenai/OLMo-1B-hf"
+description: "Fine-tune allenai/OLMo-1B-hf with NeMo AutoModel using a checked-in LoRA recipe, with checkpoint and architecture details."
+slug: model-coverage/large-language-models/allenai/OLMo-1B-hf
+---
+
+[OLMo](https://allenai.org/olmo) (Open Language Model) is Allen AI's fully open language model - open weights, open training data, and open training code. OLMo-1B and OLMo-7B are trained on Dolma.
+
+Set up NeMo AutoModel with the
+[latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the
+[installation instructions](/get-started/installation).
+
+## Quick Start
+
+Follow the [installation instructions](/get-started/installation). From the repository root, use 8 GPUs. This is an example configuration; GPU training and memory use still require validation.
+
+```bash
+uv run automodel examples/llm_finetune/allenai/olmo_1b_hf_squad_peft.yaml --nproc-per-node 8
+```
+
+## Choose a Workflow
+
+| Goal | Start Here |
+| --- | --- |
+| Fine-tune allenai/OLMo-1B-hf | [olmo_1b_hf_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/allenai/olmo_1b_hf_squad_peft.yaml). Example LoRA configuration; validate GPU training. |
+
+## Model Context
+
+| Property | Value |
+| --- | --- |
+| Task | Text Generation |
+| **Architecture** | `OLMoForCausalLM` |
+| Parameters | 1B |
+| Hugging Face Organization | [allenai](https://huggingface.co/allenai) |
+| Decoder Layers | 16 |
+| Hidden Size | 2,048 |
+| Attention | 16 attention heads / 16 key-value heads |
+| Context Length | 2,048 tokens (checkpoint configuration) |
+| Vocabulary Size | 50,304 |
+| Configured Dtype | `float32` |
+
+### Recipe Setup
+
+Read [olmo_1b_hf_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/allenai/olmo_1b_hf_squad_peft.yaml) for checkpoint access, data paths, and backend dependencies. It provides a small LoRA fine-tuning example.
+
+## Available Models
+
+| Model | HF ID |
+|---|---|
+| OLMo 1B | [`allenai/OLMo-1B-hf`](https://huggingface.co/allenai/OLMo-1B-hf) |
+
+## Related Resources
+
+- [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/allenai/OLMo-1B-hf/blob/aee7752d9c08ee4775e9b0091426d8410e8f6a89/config.json)

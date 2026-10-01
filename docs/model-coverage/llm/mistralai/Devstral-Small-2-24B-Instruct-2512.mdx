@@ -1,0 +1,66 @@
+---
+title: "mistralai/Devstral-Small-2-24B-Instruct-2512"
+description: "Fine-tune mistralai/Devstral-Small-2-24B-Instruct-2512 with NeMo AutoModel: checked-in recipe, launch command, architecture, and model context."
+slug: model-coverage/large-language-models/mistralai/Devstral-Small-2-24B-Instruct-2512
+---
+
+[Devstral-Small-2-24B-Instruct-2512](https://huggingface.co/mistralai/Devstral-Small-2-24B-Instruct-2512) has a checked-in NeMo AutoModel recipe for text generation.
+The Hugging Face configuration declares the `Mistral3ForConditionalGeneration` architecture.
+
+## Quick Start
+
+Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+
+```bash
+automodel examples/llm_finetune/devstral/devstral2_small_2512_squad.yaml --nproc-per-node 8
+```
+
+## Choose a Workflow
+
+| Goal | Start Here |
+| --- | --- |
+| Run the primary recipe for this model | Use the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/devstral/devstral2_small_2512_squad.yaml). |
+| Try another checked-in recipe for this model | Use the [alternate recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/devstral/devstral2_small_2512_squad_peft.yaml). |
+
+## Model Context
+
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| **Architecture** | `Mistral3ForConditionalGeneration` |
+| Parameters | 24.01B checkpoint parameters |
+| Decoder Layers | 40 |
+| Hidden Size | 5,120 |
+| Attention | 32 attention heads / 8 key-value heads |
+| Context Length | 393,216 tokens (checkpoint configuration) |
+| Vocabulary Size | 131,072 |
+| Configured Dtype | `bfloat16` |
+
+### Configuration
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | - |
+| Strategy | FSDP2; tp_size=1, cp_size=1 |
+| Nodes | - |
+| Features | Checkpointing (enabled=true) |
+| Advanced | - |
+
+### More Recipes for This Model
+
+- [`devstral2_small_2512_squad_peft.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/devstral/devstral2_small_2512_squad_peft.yaml)
+
+## Available Models
+
+- [`mistralai/Devstral-Small-2-24B-Instruct-2512`](https://huggingface.co/mistralai/Devstral-Small-2-24B-Instruct-2512)
+
+| Checkpoint | Type |
+| --- | --- |
+| [Devstral-Small-2-24B-Instruct-2512](https://huggingface.co/mistralai/Devstral-Small-2-24B-Instruct-2512) | Checkpoint documented on this page |
+| [`mistralai/Devstral-Small-2-24B-Instruct-2512`](https://huggingface.co/mistralai/Devstral-Small-2-24B-Instruct-2512) | Checkpoint documented on this page |
+
+## Related Resources
+
+- [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/mistralai/Devstral-Small-2-24B-Instruct-2512/blob/55c5b41e98c2dbd21b0c8afffc540dcfc9eb5128/config.json)

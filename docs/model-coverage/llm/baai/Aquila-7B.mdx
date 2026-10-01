@@ -1,0 +1,56 @@
+---
+title: "BAAI/Aquila-7B"
+description: "Fine-tune BAAI/Aquila-7B with NeMo AutoModel: checked-in recipe, launch command, architecture, and model context, with setup guidance."
+slug: model-coverage/large-language-models/baai/Aquila-7B
+---
+
+[Aquila](https://huggingface.co/BAAI/Aquila-7B) is a Chinese-English bilingual language model from the Beijing Academy of Artificial Intelligence (BAAI).
+
+Set up NeMo AutoModel with the
+[latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the
+[installation instructions](/get-started/installation).
+
+## Quick Start
+
+Follow the [installation instructions](/get-started/installation). From the repository root, use 8 GPUs. This is an example configuration; GPU training and memory use still require validation.
+
+```bash
+uv run automodel examples/llm_finetune/baai/aquila_7b_squad_peft.yaml --nproc-per-node 8
+```
+
+## Choose a Workflow
+
+| Goal | Start Here |
+| --- | --- |
+| Fine-tune BAAI/Aquila-7B | [aquila_7b_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/baai/aquila_7b_squad_peft.yaml). Example LoRA configuration; validate GPU training. |
+
+## Model Context
+
+| Property | Value |
+| --- | --- |
+| Task | Text Generation |
+| **Architecture** | `AquilaForCausalLM` |
+| Parameters | 7B |
+| Hugging Face Organization | [BAAI](https://huggingface.co/BAAI) |
+| Decoder Layers | 32 |
+| Hidden Size | 4,096 |
+| Attention | 32 attention heads |
+| Context Length | 2,048 tokens (checkpoint configuration) |
+| Vocabulary Size | 100,008 |
+| Configured Dtype | `float16` |
+
+### Recipe Setup
+
+Read [aquila_7b_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/baai/aquila_7b_squad_peft.yaml) for checkpoint access, data paths, and backend dependencies. It provides a small LoRA fine-tuning example.
+
+## Available Models
+
+| Model | HF ID |
+|---|---|
+| Aquila 7B | [`BAAI/Aquila-7B`](https://huggingface.co/BAAI/Aquila-7B) |
+
+## Related Resources
+
+- [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/BAAI/Aquila-7B/blob/24caff099d1ed30850b0e8e3a40250af73f93346/config.json)

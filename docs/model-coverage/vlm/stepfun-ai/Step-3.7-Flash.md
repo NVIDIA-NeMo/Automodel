@@ -1,0 +1,94 @@
+---
+title: "stepfun-ai/Step-3.7-Flash"
+description: "Fine-tune stepfun-ai/Step-3.7-Flash on MedPix with full or LoRA vision-language recipes in NeMo AutoModel for supervised image-text training."
+slug: model-coverage/vision-language-models/stepfun-ai/Step-3.7-Flash
+---
+
+[Step-3.7-Flash](https://huggingface.co/stepfun-ai/Step-3.7-Flash) is Stepfun AI's 198B-A13B Mixture-of-Experts vision-language model. It extends the Step-3.5-Flash language architecture with native vision support for image and video understanding, with an emphasis on agentic developer workflows and stable tool calling.
+
+## Quick Start
+
+Follow the [installation instructions](/get-started/installation). Allocate 16 nodes with 8 GPUs each; run on every node with `NODE_RANK` and `MASTER_ADDR` set. Complete the [recipe setup](#recipe-setup) before launching.
+
+```bash
+uv run torchrun --nnodes 16 --nproc-per-node 8 \
+  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
+  -m nemo_automodel.cli.app examples/vlm_finetune/stepfun/step3p7_medpix_200b_ep32pp4.yaml
+```
+
+## Choose a Workflow
+
+| Goal | Start Here |
+| --- | --- |
+| Fine-tune stepfun-ai/Step-3.7-Flash | [step3p7_medpix_200b_ep32pp4.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/stepfun/step3p7_medpix_200b_ep32pp4.yaml). 16 nodes, 8 GPUs per node; see [Recipe Setup](#recipe-setup). |
+| LoRA — MedPix, PP8 + EP8 | [LoRA — MedPix, PP8 + EP8](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/stepfun/step3p7_medpix_200b_lora_pp8ep8_8node.yaml) |
+
+## Model Context
+
+| Property | Value |
+|---|---|
+| **Task** | Image-Text-to-Text / Video-Text-to-Text |
+| **Architecture** | `Step3p7ForConditionalGeneration` — 198B total / 13B active MoE VLM |
+| **Language Module** | Step-3.5-Flash-derived backbone, 45 layers, 288 experts, top-8 routing |
+| **Vision Module** | 1.8B ViT, 47 layers, 728x728 image size |
+| **Context Window** | 256k tokens |
+| **Precision** | BF16 and FP8 planned for Day 0; NVFP4 best effort |
+| **HF Org** | [stepfun-ai](https://huggingface.co/stepfun-ai) |
+| Parameters | 201.37B checkpoint parameters |
+| Decoder Layers | 45 |
+| Hidden Size | 4,096 |
+| Attention | 64 attention heads |
+| Context Length | 262,144 tokens (checkpoint configuration) |
+| Vocabulary Size | 128,896 |
+
+### Positioning
+
+Step-3.7-Flash is positioned as a multimodal foundation model for agents and agentic applications. The model targets high-throughput, low-latency inference so developer workflows can use image and video context without relying on text-only requirement descriptions.
+
+### Architecture
+
+- **Language backbone:** derived from Step-3.5-Flash with 45 layers, 288 experts, 8 activated experts per token, and a 256k context length.
+- **Vision backbone:** 1.8B-parameter ViT with 47 layers and 728x728 image inputs.
+- **Optimization target:** trained on Hopper GPUs, with BF16 and FP8 support planned on Day 0 and NVFP4 listed as best effort.
+
+### Key Strengths
+
+- **Native multimodal input.** Designed for image and video understanding on top of a large sparse language backbone.
+- **Agentic stability.** Focused on tool-call stability for agent frameworks and bounded task execution.
+- **Developer workflow fit.** Targets frontend generation from mockups, data-processing tasks, and screenshot-based debugging.
+- **Fast serving path.** Intended for high throughput and fast inference in real-time developer loops.
+
+### Example Recipes
+
+- [Full SFT — MedPix, EP32 + PP4](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/stepfun/step3p7_medpix_200b_ep32pp4.yaml)
+- [LoRA — MedPix, PP8 + EP8](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/stepfun/step3p7_medpix_200b_lora_pp8ep8_8node.yaml)
+
+See the [Step-3.7-Flash fine-tuning guide](../../../guides/vlm/step-3-7.md) for the expected training setup and launch notes.
+
+### Agent Frameworks
+
+Step-3.7-Flash continues support for agent integrations such as OpenClaw, HermesAgent, and KiloClaw.
+
+### Setup and Additional Examples
+
+Review the recipes in [Choose a Workflow](#choose-a-workflow), including their
+hardware and data requirements. Follow the [installation instructions](/get-started/installation)
+before launching a recipe.
+
+### Recipe Setup
+
+Read [step3p7_medpix_200b_ep32pp4.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/stepfun/step3p7_medpix_200b_ep32pp4.yaml) for checkpoint access, data paths, and backend dependencies. Use the [Slurm launcher guide](/job-launchers/slurm-cluster) to prepare the distributed allocation.
+
+## Available Models
+
+- **Step-3.7-Flash** — registered as `Step3p7ForConditionalGeneration`, with the checkpoint-facing alias `Step3p6ForConditionalGeneration` mapping to the same model class.
+
+| Model | HF ID |
+|---|---|
+| Step-3.7-Flash | [`stepfun-ai/Step-3.7-Flash`](https://huggingface.co/stepfun-ai/Step-3.7-Flash) |
+
+## Related Resources
+
+- [stepfun-ai/Step-3.7-Flash](https://huggingface.co/stepfun-ai/Step-3.7-Flash)
+
+- [Checkpoint Configuration](https://huggingface.co/stepfun-ai/Step-3.7-Flash/blob/5f6244077ac62e04eec3f320501ff8c2b293373a/config.json)
