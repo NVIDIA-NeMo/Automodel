@@ -43,6 +43,22 @@ RUN apt-get update && apt-get install -y --only-upgrade gnupg && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
+# Replace bundled Nsight Systems binaries built with a vulnerable Go toolchain.
+# Match the pinned devtools release used by NVIDIA-NeMo/RL#4343.
+RUN rm -rf /usr/local/cuda*/NsightSystems-cli-* /opt/nvidia/nsight-systems* && \
+    (apt-get remove --purge -y --allow-change-held-packages 'nsight-systems*' || true) && \
+    NSYS_VERSION="2026.5.1.161-265138896106v0" && \
+    NSYS_RELEASE=$(echo "${NSYS_VERSION}" | cut -d. -f1-3) && \
+    NSYS_REPO="https://developer.download.nvidia.com/devtools/repos/ubuntu$(. /etc/lsb-release; echo "${DISTRIB_RELEASE}" | tr -d .)/$(dpkg --print-architecture)" && \
+    curl -fsSL "${NSYS_REPO}/nvidia.pub" -o /usr/share/keyrings/nvidia-devtools.asc && \
+    echo "deb [signed-by=/usr/share/keyrings/nvidia-devtools.asc] ${NSYS_REPO}/ /" \
+        > /etc/apt/sources.list.d/nvidia-devtools.list && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends "nsight-systems-cli-${NSYS_RELEASE}=${NSYS_VERSION}" && \
+    rm -f /etc/apt/sources.list.d/nvidia-devtools.list /usr/share/keyrings/nvidia-devtools.asc && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
 # Pin uv and uvx with patched quinn-proto (GHSA-4w2j-m93h-cj5j) on the system path.
 # Remove the base image's root-local copies so stale vulnerable binaries are not shipped.
 ENV UV_VERSION="0.11.26"
