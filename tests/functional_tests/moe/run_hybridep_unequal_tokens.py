@@ -17,9 +17,9 @@
 Every rank in a HybridEP group must dispatch the same token extent; the
 dispatcher now pads shorter ranks up to the group maximum. With distinct
 linear expert scales, each token's combined output depends only on its own routing, so
-running the same data once with equal counts (no padding path) and once with
-rank 1 truncated (padding path) must produce identical outputs for the common
-tokens.
+running the same data once with equal unaligned counts and once with rank 1
+truncated must produce identical outputs for the common tokens. Both runs
+exercise alignment padding, and truncation additionally exercises unequal counts.
 
 Run:
     torchrun --standalone --nproc_per_node=2 \
@@ -27,19 +27,24 @@ Run:
 
 Repeat with --compact-routing, --permute-fusion, and both flags to exercise
 all routing/fusion combinations. Each variant checks a local reference with
-different expert scales and compares equal and unequal token extents.
+different expert scales and compares equal and unequal token extents. Add
+--activation-checkpointing to compare checkpoint replay with the same unequal
+computation without checkpointing. The pytest launcher runs this matrix in CI.
 """
 
 import argparse
 import os
+from contextlib import nullcontext
 
 import torch
 import torch.distributed as dist
+from torch.utils.checkpoint import checkpoint
 
 from nemo_automodel.components.moe.megatron.token_dispatcher import (
     MoEFlexTokenDispatcher,
     TokenDispatcherConfig,
 )
+from nemo_automodel.components.moe.parallelizer import _replay_hybridep_dispatch_on_recompute
 
 HIDDEN = 256
 NUM_EXPERTS = 4
@@ -53,6 +58,8 @@ def run_dispatch_combine(
     hidden: torch.Tensor,
     indices: torch.Tensor,
     probs: torch.Tensor,
+    *,
+    activation_checkpointing: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Execute distinctly scaled experts and return output and input gradients.
 
@@ -61,6 +68,7 @@ def run_dispatch_combine(
         hidden: Hidden states with shape [tokens, hidden].
         indices: Global expert IDs with shape [tokens, top_k], with -1 for masked slots.
         probs: Routing probabilities with shape [tokens, top_k].
+        activation_checkpointing: Whether to replay the forward dispatch layout during recomputation.
 
     Returns:
         Combined output and hidden-state gradient, both with shape [tokens, hidden],
@@ -68,18 +76,40 @@ def run_dispatch_combine(
     """
     hidden = hidden.detach().requires_grad_(True)
     probs = probs.detach().requires_grad_(True)
-    out, tokens_per_expert, permuted_probs = dispatcher.token_permutation2(
-        hidden_states=hidden,
-        num_local_tokens=hidden.shape[0],
-        token_probs=probs,
-        token_indices=indices,
-    )
-    # Give expert e the scale e+1, so a wrong destination or expert grouping
-    # changes the output rather than being hidden by identical experts.
-    expert_scales = torch.tensor(dispatcher.local_expert_indices, device=out.device, dtype=out.dtype) + 1
-    row_scales = expert_scales.repeat_interleave(tokens_per_expert.to(device=out.device, dtype=torch.int64))
-    combined = dispatcher.token_unpermutation(out * (permuted_probs * row_scales.float()).unsqueeze(-1).to(out.dtype))
+    dispatch_handles: list[object] = []
+
+    def dispatch_combine(hidden_states: torch.Tensor, token_probs: torch.Tensor) -> torch.Tensor:
+        """Dispatch, scale each expert's rows, and combine on this EP rank.
+
+        Args:
+            hidden_states: Per-rank hidden states with shape [tokens, hidden].
+            token_probs: Per-rank routing probabilities with shape [tokens, top_k].
+
+        Returns:
+            Combined per-rank hidden states with shape [tokens, hidden].
+        """
+        out, tokens_per_expert, permuted_probs = dispatcher.token_permutation2(
+            hidden_states=hidden_states,
+            num_local_tokens=hidden_states.shape[0],
+            token_probs=token_probs,
+            token_indices=indices,
+        )
+        dispatch_handles.append(dispatcher._comm_manager.handle)
+        # Give expert e the scale e+1, so a wrong destination or expert grouping
+        # changes the output rather than being hidden by identical experts.
+        expert_scales = torch.tensor(dispatcher.local_expert_indices, device=out.device, dtype=out.dtype) + 1
+        row_scales = expert_scales.repeat_interleave(tokens_per_expert.to(device=out.device, dtype=torch.int64))
+        return dispatcher.token_unpermutation(out * (permuted_probs * row_scales.float()).unsqueeze(-1).to(out.dtype))
+
+    if activation_checkpointing:
+        context_fn = _replay_hybridep_dispatch_on_recompute(lambda: (nullcontext(), nullcontext()))
+        combined = checkpoint(dispatch_combine, hidden, probs, use_reentrant=False, context_fn=context_fn)
+    else:
+        combined = dispatch_combine(hidden, probs)
     combined.float().square().sum().backward()
+    if activation_checkpointing:
+        assert len(dispatch_handles) == 2, "checkpoint backward must recompute the dispatch"
+        assert dispatch_handles[1] is dispatch_handles[0], "recompute must reuse the checkpoint-forward layout"
     # BF16 dispatch rounds each expert's weighted copy before summing. Compare
     # with a local FP32 oracle using tolerances that allow this rounding.
     reference_hidden = hidden.detach().float().requires_grad_(True)
@@ -93,10 +123,11 @@ def run_dispatch_combine(
     return combined.detach(), hidden.grad, probs.grad
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--compact-routing", action="store_true")
     parser.add_argument("--permute-fusion", action="store_true")
+    parser.add_argument("--activation-checkpointing", action="store_true")
     args = parser.parse_args()
     rank = int(os.environ["RANK"])
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
@@ -128,7 +159,7 @@ def main():
     probs = torch.rand(FULL_TOKENS, TOPK, dtype=torch.float32, device="cuda")
     probs = probs / probs.sum(dim=-1, keepdim=True)
 
-    # Reference: every rank dispatches FULL_TOKENS (equal counts).
+    # Reference: every rank dispatches FULL_TOKENS (equal, unaligned counts by default).
     reference, reference_grad, reference_prob_grad = run_dispatch_combine(dispatcher, hidden.clone(), indices, probs)
 
     # Unequal: rank 1 truncates to SHORT_TOKENS, forcing the padding path.
@@ -145,6 +176,17 @@ def main():
         f"[rank {rank}] OK: compact={args.compact_routing}, fusion={args.permute_fusion}; "
         "output, hidden gradient, and router gradient match the local oracle and equal-count run"
     )
+    if args.activation_checkpointing:
+        checkpointed, checkpointed_grad, checkpointed_prob_grad = run_dispatch_combine(
+            dispatcher, hidden[:keep], indices[:keep], probs[:keep], activation_checkpointing=True
+        )
+        torch.testing.assert_close(checkpointed, unequal, rtol=0, atol=0)
+        torch.testing.assert_close(checkpointed_grad, unequal_grad, rtol=0, atol=0)
+        torch.testing.assert_close(checkpointed_prob_grad, unequal_prob_grad, rtol=0, atol=0)
+        print(
+            f"[rank {rank}] OK: checkpoint replay reuses the forward layout; "
+            "output, hidden gradient, and router gradient match without checkpointing"
+        )
     dist.destroy_process_group()
 
 
