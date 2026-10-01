@@ -726,8 +726,9 @@ class LoRATritonFunction(torch.autograd.Function):
         """
         Forward method for memory-efficient LoRA.
 
-        Reshapes 3D tensors into 2D and then calls either Triton kernels or PyTorch matmuls. When ``res`` is
-        provided, the residual is added in-place into the LoRA output to avoid allocating a separate add result.
+        Reshapes 3D tensors into 2D and then calls either Triton kernels or PyTorch matmuls. The Triton path
+        folds ``res`` in place; the PyTorch fallback uses an out-of-place add because selective activation
+        checkpointing can cache the preceding matmul output.
 
         Always returns a **2D** tensor; the caller restores the original leading dimensions. Keeping the
         ``(N, out) -> (bs, seq, out)`` reshape *outside* this ``autograd.Function`` means the Function's output
@@ -745,7 +746,10 @@ class LoRATritonFunction(torch.autograd.Function):
             lora_res = F.linear(F.linear(x, lora_A) * scale, lora_B)
 
         if res is not None:
-            lora_res.add_(res)
+            if use_triton_kernel:
+                lora_res.add_(res)
+            else:
+                lora_res = lora_res + res
 
         return lora_res
 
