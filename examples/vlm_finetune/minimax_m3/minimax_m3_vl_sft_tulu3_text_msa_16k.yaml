@@ -47,9 +47,10 @@ distributed:
   ep_size: 32
   activation_checkpointing: true
   pipeline:
-    pp_schedule: interleaved1f1b
-    layers_per_stage: 2
-    round_virtual_stages_to_pp_multiple: down
+    # Four local microbatches cannot fill the seven virtual stages created by
+    # layers_per_stage=2. Use one stage per PP rank to preserve the effective
+    # global batch without deadlocking the interleaved backward schedule.
+    pp_schedule: 1f1b
     patch_inner_model: false
     patch_causal_lm_model: false
 freeze_config:
