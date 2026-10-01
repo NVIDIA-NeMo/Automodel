@@ -13,16 +13,20 @@ Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com
 This page provides checkpoint and architecture details. Use the available checkpoint table below to
 choose the base or instruct variant.
 
-## Model Reference
+## Quick Start
 
-### Model Architecture
+This page provides checkpoint and architecture reference information rather
+than a model-specific launch command. Follow the
+[installation instructions](/get-started/installation) to set up NeMo AutoModel.
 
-| Property | Value |
+## Choose a Workflow
+
+| Goal | Start Here |
 | --- | --- |
-| Tasks | Embedding, Dense Retrieval |
-| Architecture | `Ministral3Model` with configurable attention (preferred); `Ministral3BidirectionalModel` (legacy) |
-| Parameters | 3B |
-| Hugging Face Organization | [mistralai](https://huggingface.co/mistralai) |
+| Explore checkpoints | See [Available Models](#available-models). |
+| Configure NeMo AutoModel | Follow the [installation instructions](/get-started/installation). |
+
+## Model Context
 
 ### Embedding Models
 
@@ -52,6 +56,17 @@ The bi-encoder supports multiple pooling strategies to aggregate token represent
 | `cls` | First token hidden state |
 | `last` | Last non-padding token hidden state |
 | `weighted_avg` | Weighted average of token hidden states |
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+| --- | --- |
+| Tasks | Embedding, Dense Retrieval |
+| Architecture | `Ministral3Model` with configurable attention (preferred); `Ministral3BidirectionalModel` (legacy) |
+| Parameters | 3B |
+| Hugging Face Organization | [mistralai](https://huggingface.co/mistralai) |
 
 ### Available Models
 

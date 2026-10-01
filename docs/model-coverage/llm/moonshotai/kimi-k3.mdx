@@ -3,9 +3,12 @@ title: "Kimi-K3"
 description: "Fine-tune Kimi-K3 for text generation with NeMo AutoModel using checked-in multi-node recipes with expert, pipeline, and context parallelism."
 slug: model-coverage/large-language-models/moonshotai/Kimi-K3
 ---
+
 [Kimi K3](https://huggingface.co/moonshotai/Kimi-K3) is Moonshot AI's 2.8T-parameter, 104B-active Mixture-of-Experts model. NeMo AutoModel provides a native implementation of the text model and loads its public checkpoint without `trust_remote_code`.
 
-## Fine-Tune Kimi-K3
+## Quick Start
+
+### Fine-Tune Kimi-K3
 
 <Warning>
 Kimi K3 training in NeMo AutoModel is currently validated only on NVIDIA GB200 systems.
@@ -18,6 +21,32 @@ uv run automodel --nproc-per-node=4 examples/llm_finetune/kimi/k3_hellaswag.yaml
 ```
 
 See the [Slurm Launcher Guide](/job-launchers/slurm-cluster) for multi-node setup and the [Large MoE Fine-Tuning Guide](/recipes-e2e-examples/large-moe-fine-tuning) for distributed MoE configuration.
+
+## Choose a Workflow
+
+| Goal | Start Here |
+| --- | --- |
+| 100-step full-parameter SFT on HellaSwag with FSDP2, EP32, and PP8 | [k3_hellaswag.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/kimi/k3_hellaswag.yaml) |
+
+## Model Context
+
+### Architecture
+
+- Hybrid attention alternates groups of three Kimi Delta Attention (KDA) layers with a Gated Multi-head Latent Attention (MLA) layer.
+- Attention Residuals operate over 12-layer blocks. Pipeline stages preserve these block boundaries and carry the residual state between stages.
+- Stable LatentMoE routes each token to 16 of 896 routed experts and includes two shared experts. The expert MLPs use SiTU-GLU.
+- The released checkpoint uses MXFP4 weights. The example recipe dequantizes the base checkpoint while loading it for BF16 training.
+
+### Parallelism
+
+| Parallelism | Validated Configuration |
+|---|---|
+| FSDP2 | Full-parameter training |
+| Expert Parallelism | EP32 |
+| Pipeline Parallelism | PP8 with Attention Residual block-aligned stages |
+| Context Parallelism | CP2 full-model loss parity at 2K sequence length |
+
+The combined EP32 and PP8 configuration is validated on 256 GB200 GPUs.
 
 ## Model Reference
 
@@ -32,31 +61,14 @@ See the [Slurm Launcher Guide](/job-launchers/slurm-cluster) for multi-node setu
 | **Context Length** | 1,048,576 tokens |
 | **HF Org** | [moonshotai](https://huggingface.co/moonshotai) |
 
-## Architecture
+### Available Models
 
-- Hybrid attention alternates groups of three Kimi Delta Attention (KDA) layers with a Gated Multi-head Latent Attention (MLA) layer.
-- Attention Residuals operate over 12-layer blocks. Pipeline stages preserve these block boundaries and carry the residual state between stages.
-- Stable LatentMoE routes each token to 16 of 896 routed experts and includes two shared experts. The expert MLPs use SiTU-GLU.
-- The released checkpoint uses MXFP4 weights. The example recipe dequantizes the base checkpoint while loading it for BF16 training.
+| Checkpoint | Type |
+| --- | --- |
+| [Kimi K3](https://huggingface.co/moonshotai/Kimi-K3) | Checkpoint documented on this page |
+| [Kimi K3 model card](https://huggingface.co/moonshotai/Kimi-K3) | Checkpoint documented on this page |
 
-## Parallelism
-
-| Parallelism | Validated Configuration |
-|---|---|
-| FSDP2 | Full-parameter training |
-| Expert Parallelism | EP32 |
-| Pipeline Parallelism | PP8 with Attention Residual block-aligned stages |
-| Context Parallelism | CP2 full-model loss parity at 2K sequence length |
-
-The combined EP32 and PP8 configuration is validated on 256 GB200 GPUs.
-
-## Example Recipe
-
-| Recipe | Description |
-|---|---|
-| [k3_hellaswag.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/kimi/k3_hellaswag.yaml) | 100-step full-parameter SFT on HellaSwag with FSDP2, EP32, and PP8 |
-
-## References
+## Related Resources
 
 - [Kimi K3 model card](https://huggingface.co/moonshotai/Kimi-K3)
 - [Kimi K3 technical report](https://github.com/MoonshotAI/Kimi-K3/blob/main/k3_tech_report.pdf)

@@ -12,18 +12,27 @@ Single-pass mHC carries four residual streams, and two trainable Engram tables
 at layers 1 and 14 provide tokenizer-dependent N-gram memory. The approximately
 552B backbone is accompanied by 196B Engram parameters.
 
-## Model Reference
+## Quick Start
 
-### Model Architecture
+Review the recipes in [Choose a Workflow](#choose-a-workflow), including their
+hardware and data requirements. Follow the [installation instructions](/get-started/installation)
+before launching a recipe.
 
-| Property | Value |
-|---|---|
-| Architecture | `DeepseekV41ForCausalLM` |
-| Model ID | `deepseek-ai/DeepSeek-V4.1-Flash` |
-| Reference revision | `df42c109f1defefcbfcedbe7d905718a12266e40` |
-| Configuration | `DeepseekV41Config` with typed `text_config` and `vision_config` |
+## Choose a Workflow
 
-## Fine-Tuning
+| Goal | Start Here |
+| --- | --- |
+| Review the recipe requirements | [HellaSwag EP64](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_hellaswag_ep64_16nodes.yaml) |
+| Review the recipe requirements | [HellaSwag EP64, H100](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_hellaswag_ep64_h100_16nodes.yaml) |
+| Review the recipe requirements | [Tulu3 CP recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_tulu3_cp.yaml) |
+| Review the recipe requirements | [HellaSwag LoRA, H100](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_hellaswag_lora_h100_8nodes.yaml) |
+| Review the recipe requirements | [Tulu3 CP8, H100](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_tulu3_cp8_h100_32nodes.yaml) |
+| Review the recipe requirements | [Tulu3 packed CP8 32k, H100](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_tulu3_packed_cp8_32k_h100_64nodes.yaml) |
+| Review the recipe requirements | [prepare_tulu3_data.py](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/prepare_tulu3_data.py) |
+
+## Model Context
+
+### Fine-Tuning
 
 The recipe trains all 40 text-backbone layers and both Engram tables. Dense
 parameters use generic FSDP2; routed experts use the shared NeMo AutoModel MoE
@@ -72,7 +81,7 @@ See the [Slurm Launcher Guide](/job-launchers/slurm-cluster) and
 and communication prewarming must match the backend, topology, and local
 input shapes.
 
-## Context Parallelism
+### Context Parallelism
 
 Unpacked, right-padded text supports context parallelism with contiguous sequence
 shards. Set `distributed.cp_size` and retain the same global batch size when
@@ -100,7 +109,7 @@ This uses the shared fused FP64 gradient-norm reduction from main and avoids
 gradient-sized norm temporaries for contiguous CUDA owner shards. Set
 `clip_grad_norm.backend: te` to select the shared Transformer Engine reducer.
 
-## H100 80 GB Systems
+### H100 80 GB Systems
 
 The GB200 recipes place 748B trainable parameters on 64 GPUs, about 117 GB per
 GPU for BF16 weights, BF16 gradients, BF16 moments, and int16 master
@@ -157,7 +166,7 @@ took 2.5 minutes to write from 512 ranks; reaching `max_steps` triggers a final
 save regardless of `ckpt_every_steps`. Resuming with
 `checkpoint.restore_from: LATEST` was verified to continue the loss curve.
 
-## Loading and Inputs
+### Loading and Inputs
 
 The recipes load revision `df42c109f1defefcbfcedbe7d905718a12266e40` from the
 Hugging Face Hub. To use a shared local snapshot of that revision instead, with
@@ -203,7 +212,7 @@ The image encoder and projector reuse DeepSeek V4 modules; image delimiters
 and visual router bias are retained. Specialized tool and reasoning formatting
 should be rendered with the official encoder before processing.
 
-## Numerical Validation
+### Numerical Validation
 
 At PR commit `d5c8b5e45176bd6de54c139b311937516be4e0d2`, a real-weight comparison
 covered all 40 layers, 4,096 positions, and all 129,280 vocabulary entries
@@ -245,7 +254,7 @@ that has since been removed. These records identify the tested commits; they
 do not claim a new GPU run after removing that loader or the custom combine
 code, or full-resident 40-layer PR training.
 
-## Original Implementation Training Result
+### Original Implementation Training Result
 
 The original implementation at `0d5919a5a506dd35dc4f55769410feb98ae854b8`
 completed 100 HellaSwag optimizer updates on 16 nodes x 4 GB200 with EP64,
@@ -259,7 +268,7 @@ This full-resident training result belongs to the original commit and does
 not establish training behavior for native HybridEP combine, checkpoint
 restoration, or full-model convergence.
 
-## Current Scope
+### Current Scope
 
 THD packing, TP, PP, incremental generation caches, bounded decoder replay,
 and million-token training are unsupported. Image inputs also require
@@ -271,3 +280,24 @@ the target frozen and DSpark gradients isolated from the target backbone.
 Fine-tuning does not reproduce the report's
 Engram pretraining optimizer. Bitwise training continuation is not established
 for the TileLang backward kernels.
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+|---|---|
+| Architecture | `DeepseekV41ForCausalLM` |
+| Model ID | `deepseek-ai/DeepSeek-V4.1-Flash` |
+| Reference revision | `df42c109f1defefcbfcedbe7d905718a12266e40` |
+| Configuration | `DeepseekV41Config` with typed `text_config` and `vision_config` |
+
+### Available Models
+
+| Checkpoint | Type |
+| --- | --- |
+| [DeepSeek-V4.1 Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) | Checkpoint documented on this page |
+
+## Related Resources
+
+- [Installation Instructions](/get-started/installation)

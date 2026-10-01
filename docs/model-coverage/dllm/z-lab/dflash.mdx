@@ -6,7 +6,9 @@ slug: model-coverage/dllm/z-lab/Qwen3-4B-DFlash-b16
 
 [Qwen3-4B-DFlash-b16](https://huggingface.co/z-lab/Qwen3-4B-DFlash-b16) is a diffusion draft model trained against a frozen Qwen3 target for speculative decoding.
 
-## Train Qwen3-4B-DFlash-b16
+## Quick Start
+
+### Train Qwen3-4B-DFlash-b16
 
 From the repository root, run:
 
@@ -14,6 +16,18 @@ From the repository root, run:
 uv run torchrun --nproc-per-node=8 nemo_automodel/recipes/dllm/train_ft.py \
   -c examples/dllm_sft/dflash_sft.yaml
 ```
+
+## Choose a Workflow
+
+| Goal | Start Here |
+| --- | --- |
+| [`z-lab/Qwen3-4B-DFlash-b16`](https://huggingface.co/z-lab/Qwen3-4B-DFlash-b16) | [DFlash SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/dflash_sft.yaml) |
+
+## Model Context
+
+### Recipe Notes
+
+See the [dLLM Fine-Tuning Guide](/recipes-e2e-examples/dllm-fine-tuning).
 
 ## Model Reference
 
@@ -26,10 +40,12 @@ uv run torchrun --nproc-per-node=8 nemo_automodel/recipes/dllm/train_ft.py \
 | **Target** | `Qwen/Qwen3-4B` |
 | **HF Org** | [z-lab](https://huggingface.co/z-lab) |
 
-## Example Model and Recipe
+### Available Models
 
-| Model | Recipe |
-|---|---|
-| [`z-lab/Qwen3-4B-DFlash-b16`](https://huggingface.co/z-lab/Qwen3-4B-DFlash-b16) | [DFlash SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/dflash_sft.yaml) |
+| Checkpoint | Type |
+| --- | --- |
+| [`z-lab/Qwen3-4B-DFlash-b16`](https://huggingface.co/z-lab/Qwen3-4B-DFlash-b16) | Checkpoint linked by the example recipe |
 
-See the [dLLM Fine-Tuning Guide](/recipes-e2e-examples/dllm-fine-tuning).
+## Related Resources
+
+- [Installation Instructions](/get-started/installation)

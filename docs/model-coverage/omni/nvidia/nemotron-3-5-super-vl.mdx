@@ -12,7 +12,9 @@ The BF16 checkpoint has no audio encoder, so audio inputs are not supported.
 
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
-## Fine-Tune NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16
+## Quick Start
+
+### Fine-Tune NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16
 
 From the repository root, run:
 
@@ -33,6 +35,8 @@ uv run automodel examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_
 | Full SFT, text-only (vision/audio towers frozen and unused) | Use [nemotron_3_5_super_vl_tulu3_text_100steps.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_tulu3_text_100steps.yaml). Dataset: Tulu-3. |
 | Context-parallel parity test, `cp_size=8`; text-only packs (`inject_fake_images: false`) | Use [nemotron_3_5_super_vl_tulu3_packed_cp8_100steps.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_tulu3_packed_cp8_100steps.yaml). Dataset: Tulu-3 (packed, THD). |
 | Low-rank adaptation (LoRA) (rank 64) on the LLM linear projections, base model frozen; receipt image to structured field tokens; single node | Use [nemotron_3_5_super_vl_cord_v2_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_cord_v2_peft.yaml). Dataset: CORD-v2. |
+
+## Model Context
 
 ### LoRA on CORD-v2
 
@@ -73,6 +77,11 @@ states for them, so the 121B model trains on a single node of 8 H100 (`cp_size 1
 
 - **NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16**: 121B total (MoE), post-trained, no audio encoder
 - **[NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-Base-BF16](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-Base-BF16)**: 121B total (MoE), pretrained only, no audio encoder
+
+| Checkpoint | Type |
+| --- | --- |
+| [NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16) | Checkpoint documented on this page |
+| [NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-Base-BF16](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-Base-BF16) | Checkpoint documented on this page |
 
 ## Related Resources
 

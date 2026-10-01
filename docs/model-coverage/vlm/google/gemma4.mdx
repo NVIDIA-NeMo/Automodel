@@ -8,7 +8,9 @@ slug: model-coverage/vision-language-models/google/gemma-4-31B-it
 
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
-## Fine-Tune gemma-4-31B-it
+## Quick Start
+
+### Fine-Tune gemma-4-31B-it
 
 From the repository root, run the 8-GPU recipe:
 
@@ -25,6 +27,8 @@ uv run automodel examples/vlm_finetune/gemma4/gemma4_31b.yaml --nproc-per-node 8
 | Fine-tune with tensor parallelism | Use [gemma4_31b_tp4.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_31b_tp4.yaml). |
 | Fine-tune with tensor and pipeline parallelism | Use [gemma4_31b_tp4_pp2.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_31b_tp4_pp2.yaml) or the [multi-node PP4 recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_31b_tp4_pp4.yaml). |
 
+## Model Context
+
 ## Model Reference
 
 ### Model Architecture
@@ -34,6 +38,13 @@ uv run automodel examples/vlm_finetune/gemma4/gemma4_31b.yaml --nproc-per-node 8
 | Task | Image-text-to-text |
 | Hugging Face Architecture | `Gemma4ForConditionalGeneration` |
 | Checkpoint | [`google/gemma-4-31B-it`](https://huggingface.co/google/gemma-4-31B-it) |
+
+### Available Models
+
+| Checkpoint | Type |
+| --- | --- |
+| [gemma-4-31B-it](https://huggingface.co/google/gemma-4-31B-it) | Checkpoint documented on this page |
+| [`google/gemma-4-31B-it`](https://huggingface.co/google/gemma-4-31B-it) | Checkpoint documented on this page |
 
 ## Related Resources
 

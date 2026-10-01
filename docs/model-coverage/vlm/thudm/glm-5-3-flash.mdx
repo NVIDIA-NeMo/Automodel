@@ -10,78 +10,9 @@ backbone combines Kimi Delta Attention (KDA), KPool-indexed DeepSeek Sparse
 Attention (DSA), Mixture-of-Experts (MoE) layers, and four-stream
 Manifold-Constrained Hyper-Connections (mHC).
 
-## Model Reference
+## Quick Start
 
-### Model Architecture
-
-| Property | Value |
-|---|---|
-| **Task** | Image-Text-to-Text |
-| **Architecture** | `Glm5NextForConditionalGeneration` |
-| **Parameters** | 320B total, 18B active |
-| **Decoder** | 45 layers: 34 KDA and 11 KPool-DSA layers |
-| **Experts** | 288 routed experts, top-8 routing, plus one shared expert |
-| **Context Length** | 1,048,576 in the checkpoint configuration; validated here at 2,048 and 4,096 tokens |
-| **Training Precision** | BF16 after FP8 checkpoint dequantization |
-| **HF Org** | [zai-org](https://huggingface.co/zai-org) |
-
-## Architecture
-
-- A 24-block vision encoder and patch merger project image features into the
-  4,096-wide language hidden state.
-- The 45-layer decoder repeats three KDA layers followed by one KPool-DSA layer,
-  with a final KDA layer. Four persistent mHC streams wrap attention and
-  feed-forward sublayers.
-- The first three decoder layers use dense feed-forward networks. The remaining
-  42 layers use 288 routed experts with top-8 routing and one shared expert.
-- KPool-DSA selects up to 2,048 token positions through four-token pools before
-  running sparse latent attention over a shared 512-wide K/V representation.
-
-## Supported Training Path
-
-NeMo AutoModel provides a native configuration, image processor, vision tower,
-language model, and Hugging Face state-dict adapter. The implementation runs on
-the repository's pinned `transformers==5.15.1`; users do not need Transformers
-5.16, a nightly Transformers build, or `trust_remote_code`.
-
-The supported base-checkpoint initialization path uses distributed checkpoint
-loading and dequantizes the released FP8 weights for BF16 training. Full-model
-single-GPU checkpoint loading and training are not supported.
-
-The current path supports image training with FSDP2, activation checkpointing,
-expert parallelism, and contiguous packed context parallelism. Tensor
-parallelism, pipeline parallelism, and video training are not enabled. An EP
-size must evenly divide the model's 288 routed experts and fit the available GPU
-memory; EP72 is the published validated topology, not a model requirement.
-
-## Attention Backends
-
-- KDA layers use Flash Linear Attention (FLA) kernels. For CP, FLA carries the
-  recurrent state across contiguous sequence shards while preserving packed
-  document boundaries.
-- Sparse DSA layers support an SDPA numerical-reference path.
-- On SM90 or later, `backend.attn: cudnn` uses FlashMLA for the sparse forward
-  pass and cuDNN Frontend for backward. This is the backend selected by the
-  published recipe.
-
-## Validated Configuration
-
-| Area | Validated Configuration |
-|---|---|
-| Training | FSDP2 with whole-layer activation checkpointing; language backbone trainable; embeddings and vision tower frozen |
-| Parallelism | TP1 / PP1 / EP72 / CP2; HybridEP dispatch; four routed experts per GPU |
-| Workload | `mmoukouba/MedPix-VQA`, packed THD sequences of 2,048 tokens |
-| Batch | Local batch size 1, global batch size 144, four gradient-accumulation microsteps |
-| Scale | 9 nodes / 72 H100 GPUs |
-| Duration | 100 optimizer steps |
-
-## Example Recipe
-
-| Recipe | Dataset | Description |
-|---|---|---|
-| [glm5_3_flash_medpix_packed2k_ep72_cp2_100steps.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/glm5_next/glm5_3_flash_medpix_packed2k_ep72_cp2_100steps.yaml) | MedPix-VQA | Language-backbone SFT with packed 2K sequences, EP72, and CP2 |
-
-## Install and Run
+### Install and Run
 
 Clone and install NeMo AutoModel from source:
 
@@ -116,9 +47,67 @@ multi-node launch. If FlashMLA or cuDNN Frontend is unavailable, change
 
 </Note>
 
-## Numerical Validation
+## Choose a Workflow
 
-### Hugging Face Logit Parity
+| Goal | Start Here |
+| --- | --- |
+| MedPix-VQA; Language-backbone SFT with packed 2K sequences, EP72, and CP2 | [glm5_3_flash_medpix_packed2k_ep72_cp2_100steps.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/glm5_next/glm5_3_flash_medpix_packed2k_ep72_cp2_100steps.yaml) |
+
+## Model Context
+
+### Architecture
+
+- A 24-block vision encoder and patch merger project image features into the
+  4,096-wide language hidden state.
+- The 45-layer decoder repeats three KDA layers followed by one KPool-DSA layer,
+  with a final KDA layer. Four persistent mHC streams wrap attention and
+  feed-forward sublayers.
+- The first three decoder layers use dense feed-forward networks. The remaining
+  42 layers use 288 routed experts with top-8 routing and one shared expert.
+- KPool-DSA selects up to 2,048 token positions through four-token pools before
+  running sparse latent attention over a shared 512-wide K/V representation.
+
+### Supported Training Path
+
+NeMo AutoModel provides a native configuration, image processor, vision tower,
+language model, and Hugging Face state-dict adapter. The implementation runs on
+the repository's pinned `transformers==5.15.1`; users do not need Transformers
+5.16, a nightly Transformers build, or `trust_remote_code`.
+
+The supported base-checkpoint initialization path uses distributed checkpoint
+loading and dequantizes the released FP8 weights for BF16 training. Full-model
+single-GPU checkpoint loading and training are not supported.
+
+The current path supports image training with FSDP2, activation checkpointing,
+expert parallelism, and contiguous packed context parallelism. Tensor
+parallelism, pipeline parallelism, and video training are not enabled. An EP
+size must evenly divide the model's 288 routed experts and fit the available GPU
+memory; EP72 is the published validated topology, not a model requirement.
+
+### Attention Backends
+
+- KDA layers use Flash Linear Attention (FLA) kernels. For CP, FLA carries the
+  recurrent state across contiguous sequence shards while preserving packed
+  document boundaries.
+- Sparse DSA layers support an SDPA numerical-reference path.
+- On SM90 or later, `backend.attn: cudnn` uses FlashMLA for the sparse forward
+  pass and cuDNN Frontend for backward. This is the backend selected by the
+  published recipe.
+
+### Validated Configuration
+
+| Area | Validated Configuration |
+|---|---|
+| Training | FSDP2 with whole-layer activation checkpointing; language backbone trainable; embeddings and vision tower frozen |
+| Parallelism | TP1 / PP1 / EP72 / CP2; HybridEP dispatch; four routed experts per GPU |
+| Workload | `mmoukouba/MedPix-VQA`, packed THD sequences of 2,048 tokens |
+| Batch | Local batch size 1, global batch size 144, four gradient-accumulation microsteps |
+| Scale | 9 nodes / 72 H100 GPUs |
+| Duration | 100 optimizer steps |
+
+### Numerical Validation
+
+#### Hugging Face Logit Parity
 
 A four-layer model containing KDA, KDA, KDA, and DSA, with
 `vision_config.depth=1`, was compared with the Transformers reference at
@@ -137,7 +126,7 @@ state-dict adapter changes the parameter layout.
 | Logits cosine similarity | 0.9999251899 |
 | Top-1 token agreement | 98.33984375% |
 
-### Packed CP1 / CP8 Training Parity
+#### Packed CP1 / CP8 Training Parity
 
 The full model trained for 100 steps with the same MedPix packed-2K workload,
 global batch size 144, EP144, TP1, PP1, and the SDPA DSA reference backend.
@@ -150,7 +139,7 @@ global batch size 144, EP144, TP1, PP1, and the SDPA DSA reference backend.
 Across all 100 matched steps, the loss curves had mean absolute difference
 0.001879, RMSE 0.002800, and maximum absolute difference 0.0130.
 
-### cuDNN Sparse Attention Performance
+#### cuDNN Sparse Attention Performance
 
 The SDPA and cuDNN backends were compared end to end with the published EP72 / CP2
 topology. Both trained for 100 steps on the same MedPix packed-2K workload; the
@@ -166,7 +155,7 @@ The cuDNN path improved mean throughput by 13.26% and median throughput by
 had mean absolute difference 0.002648, RMSE 0.003076, and final losses 1.2359
 for SDPA and 1.2337 for cuDNN.
 
-## Current Scope
+### Current Scope
 
 - Image training is supported; video training is not.
 - TP and PP are not supported for this model. Packed contiguous CP and EP are
@@ -178,7 +167,29 @@ for SDPA and 1.2337 for cuDNN.
 - The cuDNN sparse-attention path requires SM90 or later, cuDNN Frontend, and
   FlashMLA. Use `backend.attn: sdpa` as the portable reference path.
 
-## References
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+|---|---|
+| **Task** | Image-Text-to-Text |
+| **Architecture** | `Glm5NextForConditionalGeneration` |
+| **Parameters** | 320B total, 18B active |
+| **Decoder** | 45 layers: 34 KDA and 11 KPool-DSA layers |
+| **Experts** | 288 routed experts, top-8 routing, plus one shared expert |
+| **Context Length** | 1,048,576 in the checkpoint configuration; validated here at 2,048 and 4,096 tokens |
+| **Training Precision** | BF16 after FP8 checkpoint dequantization |
+| **HF Org** | [zai-org](https://huggingface.co/zai-org) |
+
+### Available Models
+
+| Checkpoint | Type |
+| --- | --- |
+| [GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) | Checkpoint documented on this page |
+| [zai-org/GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) | Checkpoint documented on this page |
+
+## Related Resources
 
 - [zai-org/GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash)
 - [GLM-5 technical report](https://arxiv.org/abs/2602.15763)

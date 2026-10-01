@@ -8,13 +8,11 @@ slug: model-coverage/multimodal/bytedance-seed/BAGEL-7B-MoT
 
 Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
 
-## Pretrain BAGEL-7B-MoT
+## Quick Start
 
-From the repository root, run:
-
-```bash
-uv run automodel --nproc-per-node=8 examples/multimodal_pretrain/bagel/bagel_pretrain.yaml
-```
+Review the recipes in [Choose a Workflow](#choose-a-workflow), including their
+hardware and data requirements. Follow the [installation instructions](/get-started/installation)
+before launching a recipe.
 
 ## Choose a Workflow
 
@@ -22,6 +20,16 @@ uv run automodel --nproc-per-node=8 examples/multimodal_pretrain/bagel/bagel_pre
 | --- | --- |
 | Joint text-understanding and image-generation pretraining | Use [bagel_pretrain.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/multimodal_pretrain/bagel/bagel_pretrain.yaml). Dataset: BAGEL-style packed multimodal data. |
 | Joint understanding + generation fine-tuning | Use [bagel_sft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/multimodal_finetune/bagel/bagel_sft.yaml). Dataset: BAGEL-style packed multimodal data. |
+
+## Model Context
+
+### Pretrain BAGEL-7B-MoT
+
+From the repository root, run:
+
+```bash
+uv run automodel --nproc-per-node=8 examples/multimodal_pretrain/bagel/bagel_pretrain.yaml
+```
 
 ## Model Reference
 

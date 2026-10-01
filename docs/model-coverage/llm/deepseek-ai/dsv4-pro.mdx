@@ -6,7 +6,9 @@ slug: model-coverage/large-language-models/deepseek-ai/DeepSeek-V4-Pro
 
 [DeepSeek-V4 Pro](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro) is a fine-grained mixture-of-experts language model supported by NeMo AutoModel's native DeepSeek-V4 implementation.
 
-## Fine-Tune DeepSeek-V4-Pro
+## Quick Start
+
+### Fine-Tune DeepSeek-V4-Pro
 
 This configuration uses PP8 and EP64 across 512 GPUs (64 nodes with 8 H100 GPUs
 per node), so it is not a single-node example. Launch it through Slurm or an
@@ -26,6 +28,14 @@ See the [Launcher Guide](/job-launchers/slurm-cluster) for cluster-specific
 setup and the [Large MoE Fine-Tuning Guide](/recipes-e2e-examples/large-moe-fine-tuning)
 for the full multi-node environment setup.
 
+## Choose a Workflow
+
+| Goal | Start Here |
+| --- | --- |
+| [`deepseek-ai/DeepSeek-V4-Pro`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro) | [TileLang PP8/EP64 HellaSwag](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v4/deepseek_v4_pro_hellaswag_all_tilelang_pp8_ep64_20steps.yaml) |
+
+## Model Context
+
 ## Model Reference
 
 ### Model Architecture
@@ -37,8 +47,12 @@ for the full multi-node environment setup.
 | **Experts** | 384 routed, 1 shared; 6 routed experts per token |
 | **HF Org** | [deepseek-ai](https://huggingface.co/deepseek-ai) |
 
-## Example Model and Recipe
+### Available Models
 
-| Model | Recipe |
-|---|---|
-| [`deepseek-ai/DeepSeek-V4-Pro`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro) | [TileLang PP8/EP64 HellaSwag](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v4/deepseek_v4_pro_hellaswag_all_tilelang_pp8_ep64_20steps.yaml) |
+| Checkpoint | Type |
+| --- | --- |
+| [`deepseek-ai/DeepSeek-V4-Pro`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro) | Checkpoint linked by the example recipe |
+
+## Related Resources
+
+- [Installation Instructions](/get-started/installation)
