@@ -1,0 +1,54 @@
+---
+title: "google/gemma-2-9b-it"
+description: "Use google/gemma-2-9b-it with NeMo AutoModel for text generation, with supported architecture details, canonical checkpoints, and recipe references."
+slug: model-coverage/large-language-models/google/gemma-2-9b-it
+---
+
+[Gemma 2](https://huggingface.co/google/gemma-2-9b-it) is Google's second-generation Gemma language model family.
+
+## Quick Start
+
+From the repository root, run:
+
+```bash
+uv run automodel --nproc-per-node=8 examples/llm_finetune/gemma/gemma_2_9b_it_squad.yaml
+```
+
+## Choose a Workflow
+
+| Goal | Start Here |
+| --- | --- |
+| [`google/gemma-2-9b-it`](https://huggingface.co/google/gemma-2-9b-it) | [Full SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gemma/gemma_2_9b_it_squad.yaml) |
+| [`google/gemma-2-9b-it`](https://huggingface.co/google/gemma-2-9b-it) | [LoRA](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gemma/gemma_2_9b_it_squad_peft.yaml) |
+| [`google/gemma-2-9b-it`](https://huggingface.co/google/gemma-2-9b-it) | [FP8 HellaSwag](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gemma/gemma_2_9b_it_hellaswag_fp8.yaml) |
+
+## Model Context
+
+| Property | Value |
+|---|---|
+| **Task** | Text Generation |
+| **Architecture** | `Gemma2ForCausalLM` |
+| **Parameters** | 2B, 9B, 27B |
+| **HF Org** | [google](https://huggingface.co/google) |
+| Decoder Layers | 42 |
+| Hidden Size | 3,584 |
+| Attention | 16 attention heads / 8 key-value heads |
+| Context Length | 8,192 tokens (checkpoint configuration) |
+| Vocabulary Size | 256,000 |
+| Configured Dtype | `bfloat16` |
+
+### Recipe Notes
+
+See the [Installation Guide](/get-started/installation) and [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).
+
+## Available Models
+
+| Checkpoint | Type |
+| --- | --- |
+| [`google/gemma-2-9b-it`](https://huggingface.co/google/gemma-2-9b-it) | Checkpoint linked by the example recipe |
+
+## Related Resources
+
+- [Installation Instructions](/get-started/installation)
+
+- [Checkpoint Configuration](https://huggingface.co/google/gemma-2-9b-it/blob/11c9b309abf73637e4b6f9a3fa1e92e615547819/config.json)

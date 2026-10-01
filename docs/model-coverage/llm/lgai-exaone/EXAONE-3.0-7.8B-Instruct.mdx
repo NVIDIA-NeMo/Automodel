@@ -1,0 +1,56 @@
+---
+title: "LGAI-EXAONE/EXAONE-3.0-7.8B-Instruct"
+description: "Fine-tune LGAI-EXAONE/EXAONE-3.0-7.8B-Instruct with NeMo AutoModel using a checked-in LoRA recipe, with checkpoint and architecture details."
+slug: model-coverage/large-language-models/lgai-exaone/EXAONE-3.0-7.8B-Instruct
+---
+
+EXAONE is a bilingual (Korean-English) language model series from LG AI Research, with strong performance on Korean-language benchmarks.
+
+Set up NeMo AutoModel with the
+[latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the
+[installation instructions](/get-started/installation).
+
+## Quick Start
+
+Follow the [installation instructions](/get-started/installation). From the repository root, use 8 GPUs. This is an example configuration; GPU training and memory use still require validation.
+
+```bash
+uv run automodel examples/llm_finetune/lgai_exaone/exaone_3_0_7_8b_instruct_squad_peft.yaml --nproc-per-node 8
+```
+
+## Choose a Workflow
+
+| Goal | Start Here |
+| --- | --- |
+| Fine-tune LGAI-EXAONE/EXAONE-3.0-7.8B-Instruct | [exaone_3_0_7_8b_instruct_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/lgai_exaone/exaone_3_0_7_8b_instruct_squad_peft.yaml). Example LoRA configuration; validate GPU training. |
+
+## Model Context
+
+| Property | Value |
+| --- | --- |
+| Task | Text Generation |
+| **Architecture** | `ExaoneForCausalLM` |
+| Parameters | 7.8B |
+| Hugging Face Organization | [LGAI-EXAONE](https://huggingface.co/LGAI-EXAONE) |
+| Decoder Layers | 32 |
+| Hidden Size | 4,096 |
+| Attention | 32 attention heads / 8 key-value heads |
+| Context Length | 4,096 tokens (checkpoint configuration) |
+| Vocabulary Size | 102,400 |
+| Configured Dtype | `float32` |
+
+### Recipe Setup
+
+Read [exaone_3_0_7_8b_instruct_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/lgai_exaone/exaone_3_0_7_8b_instruct_squad_peft.yaml) for checkpoint access, data paths, and backend dependencies. It provides a small LoRA fine-tuning example.
+
+## Available Models
+
+| Model | HF ID |
+|---|---|
+| EXAONE 3.0 7.8B Instruct | [`LGAI-EXAONE/EXAONE-3.0-7.8B-Instruct`](https://huggingface.co/LGAI-EXAONE/EXAONE-3.0-7.8B-Instruct) |
+
+## Related Resources
+
+- [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/LGAI-EXAONE/EXAONE-3.0-7.8B-Instruct/blob/7f15baedd46858153d817445aff032f4d6cf4939/config.json)

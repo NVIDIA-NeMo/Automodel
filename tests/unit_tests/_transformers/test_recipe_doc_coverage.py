@@ -239,6 +239,7 @@ _HF_ORG_TO_DOC_SLUG = {
     "ibm-granite": "ibm",
     "meta-llama": "meta",
     "MiniMaxAI": "minimax",
+    "OrionStarAI": "orionstar",  # Existing provider URL uses the shortened organization name.
     "zai-org": "thudm",  # zai-org (née THUDM) publishes GLM-4+
 }
 

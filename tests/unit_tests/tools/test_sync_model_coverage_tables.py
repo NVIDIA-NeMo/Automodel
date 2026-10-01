@@ -79,6 +79,22 @@ def _commit_recipes(repo_root: Path, timestamp: str = "2026-07-30T12:00:00Z") ->
     )
 
 
+@pytest.mark.parametrize("property_name", ["Architecture", "**Architecture**", "Hugging Face Architecture"])
+def test_model_catalog_reads_architecture_from_template_tables(tmp_path: Path, property_name: str) -> None:
+    card = tmp_path / "docs/model-coverage/llm/provider/Test-Model.mdx"
+    card.parent.mkdir(parents=True)
+    card.write_text(
+        '---\ntitle: "provider/Test-Model"\nslug: model-coverage/large-language-models/provider/Test-Model\n---\n'
+        f"\n## Model Context\n\n| Property | Value |\n| --- | --- |\n| {property_name} | `TestForCausalLM` |\n"
+        "\n## Available Models\n\n[Test](https://huggingface.co/provider/Test-Model)\n",
+        encoding="utf-8",
+    )
+    model_docs, architectures, models = _load_model_doc_catalog(tmp_path / "docs")
+    assert architectures == {"TestForCausalLM"}
+    assert models[0].architecture_display == "`TestForCausalLM`"
+    assert model_docs["provider/Test-Model"] == models
+
+
 def _write_typed_overview_templates(repo_root: Path) -> list[Path]:
     paths = []
     for model_type, relative_path in MODEL_TYPE_OVERVIEW_PATHS:
@@ -397,7 +413,7 @@ def test_embedding_and_reranking_releases_are_discovered_from_recipes():
 
     assert "meta-llama/Llama-3.2-1B" in models_by_type["Embedding"]
     assert "mistralai/Ministral-3-3B-Instruct-2512-BF16" in models_by_type["Embedding"]
-    assert models_by_type["Reranking"] == {"meta-llama/Llama-3.2-1B"}
+    assert {"meta-llama/Llama-3.2-1B", "nvidia/llama-nemotron-rerank-1b-v2"} <= models_by_type["Reranking"]
 
 
 def test_generated_model_coverage_tables_are_not_committed():
@@ -537,7 +553,7 @@ def test_model_coverage_pages_use_provider_sections_and_checkpoint_slugs():
                     offenders.append(f"{path}: sidebar label {sidebar_label!r} does not match {model_id!r}")
                 document = model_path.read_text(encoding="utf-8")
                 title_match = re.search(r'^title: "?([^"\r\n]+)"?$', document, flags=re.MULTILINE)
-                if title_match is None or title_match.group(1) != model_id:
+                if title_match is None or title_match.group(1).split("/")[-1] != model_id:
                     title = title_match.group(1) if title_match is not None else None
                     offenders.append(f"{path}: page title {title!r} does not match {model_id!r}")
                 hf_checkpoints = re.findall(

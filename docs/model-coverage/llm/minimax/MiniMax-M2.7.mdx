@@ -1,0 +1,69 @@
+---
+title: "MiniMaxAI/MiniMax-M2.7"
+description: "Use NeMo AutoModel to fine-tune MiniMaxAI/MiniMax-M2.7 for LLM workflows with checked-in text generation recipes and documented distributed settings."
+slug: model-coverage/large-language-models/minimax/MiniMax-M2.7
+---
+
+[MiniMax-M2.7](https://huggingface.co/MiniMaxAI/MiniMax-M2.7) has a checked-in NeMo AutoModel recipe for text generation.
+The Hugging Face configuration declares the `MiniMaxM2ForCausalLM` architecture.
+
+## Quick Start
+
+Allocate 8 nodes with 8 GPUs each. Set `NODE_RANK` and `MASTER_ADDR` on every node; complete the recipe prerequisites in Model Context before launching.
+
+```bash
+uv run torchrun --nnodes 8 --nproc-per-node 8 \
+  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
+  -m nemo_automodel.cli.app examples/llm_finetune/minimax_m2/minimax_m2.7_hellaswag_pp.yaml
+```
+
+## Choose a Workflow
+
+| Goal | Start Here |
+| --- | --- |
+| Run the primary recipe for this model | Use the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/minimax_m2/minimax_m2.7_hellaswag_pp.yaml). |
+| Try another checked-in recipe for this model | Use the [alternate recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/minimax_m2/minimax_m2.7_hellaswag_lora.yaml). |
+
+## Model Context
+
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| **Architecture** | `MiniMaxM2ForCausalLM` |
+| Parameters | 228.69B checkpoint parameters |
+| Decoder Layers | 62 |
+| Hidden Size | 3,072 |
+| Attention | 48 attention heads / 8 key-value heads |
+| Context Length | 204,800 tokens (checkpoint configuration) |
+| Vocabulary Size | 200,064 |
+| Experts | 256 routed / 8 selected per token |
+| Configured Dtype | `bfloat16` |
+
+### Configuration
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | - |
+| Strategy | FSDP2; tp_size=1, pp_size=2, cp_size=1, ep_size=16 |
+| Nodes | 8 |
+| Features | Activation checkpointing (activation_checkpointing=true), Transformer Engine, HybridEP (dispatcher=hybridep) |
+| Advanced | attention=te, linear=te, experts=torch_mm, dispatcher=hybridep |
+
+### More Recipes for This Model
+
+- [`minimax_m2.7_hellaswag_lora.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/minimax_m2/minimax_m2.7_hellaswag_lora.yaml)
+
+## Available Models
+
+- [`MiniMaxAI/MiniMax-M2.7`](https://huggingface.co/MiniMaxAI/MiniMax-M2.7)
+
+| Checkpoint | Type |
+| --- | --- |
+| [MiniMax-M2.7](https://huggingface.co/MiniMaxAI/MiniMax-M2.7) | Checkpoint documented on this page |
+| [`MiniMaxAI/MiniMax-M2.7`](https://huggingface.co/MiniMaxAI/MiniMax-M2.7) | Checkpoint documented on this page |
+
+## Related Resources
+
+- [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/MiniMaxAI/MiniMax-M2.7/blob/d494266a4affc0d2995ba1fa35c8481cbd84294b/config.json)

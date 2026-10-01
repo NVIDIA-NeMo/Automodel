@@ -1,0 +1,56 @@
+---
+title: "nvidia/Minitron-8B-Base"
+description: "Fine-tune nvidia/Minitron-8B-Base with NeMo AutoModel using a checked-in LoRA recipe, with checkpoint and architecture details."
+slug: model-coverage/large-language-models/nvidia/Minitron-8B-Base
+---
+
+[NVIDIA Nemotron](https://www.nvidia.com/en-us/ai-data-science/foundation-models/) and [Minitron](https://developer.nvidia.com/blog/how-to-prune-and-distill-llama-3-1-8b-to-an-nvidia-llama-3-1-minitron-4b-model/) are NVIDIA's family of language models. Minitron models are produced by pruning and distilling larger Llama/Nemotron models into compact, high-performance checkpoints.
+
+Set up NeMo AutoModel with the
+[latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the
+[installation instructions](/get-started/installation).
+
+## Quick Start
+
+Follow the [installation instructions](/get-started/installation). From the repository root, use 8 GPUs. This is an example configuration; GPU training and memory use still require validation.
+
+```bash
+uv run automodel examples/llm_finetune/nvidia/minitron_8b_base_squad_peft.yaml --nproc-per-node 8
+```
+
+## Choose a Workflow
+
+| Goal | Start Here |
+| --- | --- |
+| Fine-tune nvidia/Minitron-8B-Base | [minitron_8b_base_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nvidia/minitron_8b_base_squad_peft.yaml). Example LoRA configuration; validate GPU training. |
+
+## Model Context
+
+| Property | Value |
+| --- | --- |
+| Task | Text Generation |
+| **Architecture** | `NemotronForCausalLM` |
+| Parameters | 8B |
+| Hugging Face Organization | [nvidia](https://huggingface.co/nvidia) |
+| Decoder Layers | 32 |
+| Hidden Size | 4,096 |
+| Attention | 48 attention heads / 8 key-value heads |
+| Context Length | 4,096 tokens (checkpoint configuration) |
+| Vocabulary Size | 256,000 |
+| Configured Dtype | `bfloat16` |
+
+### Recipe Setup
+
+Read [minitron_8b_base_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nvidia/minitron_8b_base_squad_peft.yaml) for checkpoint access, data paths, and backend dependencies. It provides a small LoRA fine-tuning example.
+
+## Available Models
+
+| Model | HF ID |
+|---|---|
+| Minitron 8B Base | [`nvidia/Minitron-8B-Base`](https://huggingface.co/nvidia/Minitron-8B-Base) |
+
+## Related Resources
+
+- [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/nvidia/Minitron-8B-Base/blob/e2c30f2d4c8751f21b33be2b403d10d5f373ffc1/config.json)

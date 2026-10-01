@@ -1,0 +1,57 @@
+---
+title: "zai-org/GLM-4.5-Air"
+description: "Use zai-org/GLM-4.5-Air with NeMo AutoModel for language model fine-tuning, with documented checkpoints, runnable recipes, setup guidance, and model reference details."
+slug: model-coverage/large-language-models/thudm/GLM-4.5-Air
+---
+
+[GLM-4.5 and GLM-4.7](https://huggingface.co/zai-org) are Mixture-of-Experts variants of the GLM family released under the `zai-org` HuggingFace organization. GLM-4.7-Flash is a lighter variant with fewer active parameters.
+
+Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
+
+## Quick Start
+
+Allocate 8 nodes with 8 GPUs each. Set `NODE_RANK` and `MASTER_ADDR` on every node; complete the recipe prerequisites in Model Context before launching.
+
+```bash
+uv run torchrun --nnodes 8 --nproc-per-node 8 \
+  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
+  -m nemo_automodel.cli.app examples/llm_finetune/glm/glm_4.5_air_te_deepep.yaml
+```
+
+## Choose a Workflow
+
+| Goal | Start Here |
+| --- | --- |
+| Supervised fine-tuning (SFT) - GLM-4.5-Air with TE + DeepEP | Use [glm_4.5_air_te_deepep.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_4.5_air_te_deepep.yaml). |
+
+## Model Context
+
+| Property | Value |
+| --- | --- |
+| Task | Text Generation (MoE) |
+| **Architecture** | `Glm4MoeForCausalLM` / `Glm4MoeLiteForCausalLM` |
+| Parameters | 106B total / 12B active |
+| Hugging Face Organization | [zai-org](https://huggingface.co/zai-org) |
+| Decoder Layers | 46 |
+| Hidden Size | 4,096 |
+| Attention | 96 attention heads / 8 key-value heads |
+| Context Length | 131,072 tokens (checkpoint configuration) |
+| Vocabulary Size | 151,552 |
+| Experts | 128 routed / 1 shared / 8 selected per token |
+| Configured Dtype | `bfloat16` |
+
+- `Glm4MoeForCausalLM` - GLM-4.5, GLM-4.7
+- `Glm4MoeLiteForCausalLM` - GLM-4.7-Flash
+
+## Available Models
+
+| Model | HF ID |
+|---|---|
+| GLM-4.5-Air | [`zai-org/GLM-4.5-Air`](https://huggingface.co/zai-org/GLM-4.5-Air) |
+
+## Related Resources
+
+- [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
+- [Large MoE Fine-Tuning Guide](/recipes-e2e-examples/large-moe-fine-tuning)
+
+- [Checkpoint Configuration](https://huggingface.co/zai-org/GLM-4.5-Air/blob/a24ceef6ce4f3536971efe9b778bdaa1bab18daa/config.json)

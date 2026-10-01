@@ -1,0 +1,76 @@
+---
+title: "deepseek-ai/DeepSeek-V4.1-Flash"
+description: "Use NeMo AutoModel to fine-tune deepseek-ai/DeepSeek-V4.1-Flash for VLM workflows with checked-in image-text-to-text recipes and documented distributed settings."
+slug: model-coverage/vision-language-models/deepseek-ai/DeepSeek-V4.1-Flash
+---
+
+[DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) has a checked-in NeMo AutoModel recipe for image-text-to-text.
+The Hugging Face configuration declares the `DeepseekV41ForCausalLM` architecture.
+
+## Quick Start
+
+Follow the [installation instructions](/get-started/installation). Allocate 16 nodes with 8 GPUs each; run on every node with `NODE_RANK` and `MASTER_ADDR` set. Complete the [recipe setup](#recipe-setup) before launching.
+
+```bash
+uv run torchrun --nnodes 16 --nproc-per-node 8 \
+  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
+  -m nemo_automodel.cli.app examples/vlm_finetune/deepseek_v41/deepseek_v41_flash_medpix_4k_ep64.yaml
+```
+
+## Choose a Workflow
+
+| Goal | Start Here |
+| --- | --- |
+| Fine-tune deepseek-ai/DeepSeek-V4.1-Flash | [deepseek_v41_flash_medpix_4k_ep64.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/deepseek_v41/deepseek_v41_flash_medpix_4k_ep64.yaml). 16 nodes, 8 GPUs per node; see [Recipe Setup](#recipe-setup). |
+| Prepare your environment | Follow the [installation instructions](/get-started/installation). |
+
+## Model Context
+
+| Property | Value |
+| --- | --- |
+| Task | Image-text-to-text |
+| **Architecture** | `DeepseekV41ForCausalLM` |
+| Decoder Layers | 40 |
+| Hidden Size | 5,120 |
+| Attention | 64 attention heads / 1 key-value heads |
+| Context Length | 1,048,576 tokens (checkpoint configuration) |
+| Vocabulary Size | 129,280 |
+| Experts | 384 routed / 1 shared / 6 selected per token |
+| Configured Dtype | `bfloat16` |
+| Parameters | Approximately 749B native backbone, including Engram and vision; excludes auxiliary prediction modules |
+
+### Configuration
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | - |
+| Strategy | FSDP2; tp_size=1, pp_size=1, cp_size=1, ep_size=64 |
+| Nodes | 16 |
+| Features | Activation checkpointing (activation_checkpointing=true), HybridEP (dispatcher=hybridep) |
+| Advanced | bfloat16, attention=tilelang, linear=torch, experts=torch_mm, dispatcher=hybridep |
+
+### Setup and Additional Examples
+
+Follow the [installation instructions](/get-started/installation), then review the checked-in recipe and
+its declared topology below before choosing a local or cluster launcher.
+
+Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node run.
+
+### Recipe Setup
+
+Read [deepseek_v41_flash_medpix_4k_ep64.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/deepseek_v41/deepseek_v41_flash_medpix_4k_ep64.yaml) for checkpoint access, data paths, and backend dependencies. Use the [Slurm launcher guide](/job-launchers/slurm-cluster) to prepare the distributed allocation.
+
+## Available Models
+
+- [`deepseek-ai/DeepSeek-V4.1-Flash`](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash)
+
+| Checkpoint | Type |
+| --- | --- |
+| [DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) | Checkpoint documented on this page |
+| [`deepseek-ai/DeepSeek-V4.1-Flash`](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) | Checkpoint documented on this page |
+
+## Related Resources
+
+- [Vision-language model fine-tuning guide](/recipes-e2e-examples/gemma-3-3n)
+
+- [Checkpoint Configuration](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/2cba9e42aa026125f3ed06c6d98c1db82f7ca027/config.json)

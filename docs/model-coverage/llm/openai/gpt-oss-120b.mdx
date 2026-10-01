@@ -1,6 +1,6 @@
 ---
 title: "openai/gpt-oss-120b"
-description: "Fine-tune gpt-oss-120b for text generation with NeMo AutoModel using checked-in recipes and documented distributed settings."
+description: "Fine-tune openai/gpt-oss-120b for text generation with NeMo AutoModel using checked-in recipes and documented distributed settings."
 slug: model-coverage/large-language-models/openai/gpt-oss-120b
 ---
 
@@ -29,7 +29,7 @@ uv run torchrun --nnodes 8 --nproc-per-node 8 \
 | Property | Value |
 | --- | --- |
 | Task | Text generation |
-| Architecture | `GptOssForCausalLM` |
+| **Architecture** | `GptOssForCausalLM` |
 | Decoder Layers | 36 |
 | Hidden Size | 2,880 |
 | Attention | 64 attention heads / 8 key-value heads |

@@ -173,6 +173,45 @@ jobs:
           printf '%s\n' '{"organization":"nvidia","version":"5.139.0"}' \
             > "$RUNNER_TEMP/fern-preview/docs/fern/fern.config.json"
 
+      - name: Resolve renamed model cards in trusted navigation
+        run: |
+          python3 -I - <<'PY'
+          import os
+          import re
+          import shutil
+          from pathlib import Path
+
+          import yaml
+
+          trusted = Path("trusted-source")
+          preview = Path(os.environ["RUNNER_TEMP"]) / "fern-preview"
+          # Navigation stays trusted. Supply build-only aliases when a card was
+          # renamed to its exact checkpoint but main still references the old file.
+          for original in (trusted / "docs/model-coverage").rglob("*"):
+              if original.suffix not in {".md", ".mdx"}:
+                  continue
+              destination = preview / original.relative_to(trusted)
+              if destination.exists():
+                  continue
+              content = original.read_text(encoding="utf-8")
+              if not content.startswith("---\n"):
+                  continue
+              frontmatter = content.split("---", 2)
+              if len(frontmatter) != 3:
+                  continue
+              slug = yaml.safe_load(frontmatter[1]).get("slug", "")
+              checkpoint = slug.rsplit("/", 1)[-1]
+              if not re.fullmatch(r"[\w.-]+", checkpoint):
+                  continue
+              renamed = destination.with_name(checkpoint + original.suffix)
+              if not renamed.is_file():
+                  continue
+              metadata = yaml.safe_load(renamed.read_text(encoding="utf-8").split("---", 2)[1])
+              if metadata.get("slug") != slug:
+                  raise ValueError(f"Renamed card changed its public URL: {renamed}")
+              shutil.copyfile(renamed, destination)
+          PY
+
       - name: Setup Node.js
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:

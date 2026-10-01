@@ -1,0 +1,55 @@
+---
+title: "nvidia/NVIDIA-Nemotron-Parse-v1.1"
+description: "Fine-tune nvidia/NVIDIA-Nemotron-Parse-v1.1 with NeMo AutoModel: checked-in recipe, launch command, architecture, and model context."
+slug: model-coverage/vision-language-models/nvidia/NVIDIA-Nemotron-Parse-v1.1
+---
+
+[Nemotron-Parse-v1.1](https://huggingface.co/nvidia/NVIDIA-Nemotron-Parse-v1.1) is NVIDIA's document parsing VLM, specializing in extracting structured information from complex documents including tables, forms, and mixed-content PDFs.
+
+Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
+
+## Quick Start
+
+From the repository root, run:
+
+```bash
+uv run automodel --nproc-per-node=8 examples/vlm_finetune/nemotron/nemotron_parse_v1_1.yaml
+```
+
+## Choose a Workflow
+
+| Goal | Start Here |
+| --- | --- |
+| Supervised fine-tuning (SFT) - Nemotron-Parse on CORD-v2 | Use [nemotron_parse_v1_1.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/nemotron/nemotron_parse_v1_1.yaml). Dataset: cord-v2. [![Launch on Brev](https://brev-assets.s3.us-west-1.amazonaws.com/nv-lb-dark.svg)](https://brev.nvidia.com/launchable/deploy/now?launchableID=env-3C6LDKU2DfOvpVTFhjw3YQ4djPM) |
+
+## Model Context
+
+| Property | Value |
+| --- | --- |
+| Task | Document Parsing |
+| **Architecture** | `NemotronParseForConditionalGeneration` |
+| Parameters | < 1B |
+| Hugging Face Organization | [nvidia](https://huggingface.co/nvidia) |
+| Context Length | 9,000 tokens (checkpoint configuration) |
+| Vocabulary Size | 52,327 |
+| Configured Dtype | `bfloat16` |
+
+### Fine-Tuning Tutorial on Brev
+
+Launch the end-to-end Nemotron Parse fine-tuning tutorial on Brev with a single click:
+
+[![Launch on Brev](https://brev-assets.s3.us-west-1.amazonaws.com/nv-lb-dark.svg)](https://brev.nvidia.com/launchable/deploy/now?launchableID=env-3C6LDKU2DfOvpVTFhjw3YQ4djPM)
+
+See also the [tutorial notebook](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tutorials/nemotron-parse/finetune.ipynb) and the [VLM Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n).
+
+## Available Models
+
+| Model | HF ID |
+|---|---|
+| Nemotron-Parse v1.1 | [`nvidia/NVIDIA-Nemotron-Parse-v1.1`](https://huggingface.co/nvidia/NVIDIA-Nemotron-Parse-v1.1) |
+
+## Related Resources
+
+- [VLM Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n)
+
+- [Checkpoint Configuration](https://huggingface.co/nvidia/NVIDIA-Nemotron-Parse-v1.1/blob/fd1e3c6ba0b61a6dcab5a905f0ff92c5b19f14a4/config.json)

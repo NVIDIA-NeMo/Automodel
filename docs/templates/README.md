@@ -23,6 +23,10 @@ by free-form prose, custom H3 or deeper headings, tables, code, and callouts.
 - Frontmatter has a full Hugging Face `organization/checkpoint` title, a nonempty
   description, and a slug whose checkpoint matches the title. Existing provider
   route aliases remain valid. Fern uses the full title in the browser title.
+- The filename is the exact checkpoint name with its `.md` or `.mdx` extension,
+  including case, punctuation, and version suffixes. For example,
+  `black-forest-labs/FLUX.1-dev` uses `FLUX.1-dev.mdx`, and
+  `moonshotai/Moonlight-16B-A3B` uses `Moonlight-16B-A3B.mdx`.
 - Every card links at least one **checked-in recipe configured for its model**.
   A generic configuration with a checkpoint override cannot replace that recipe.
 - Quick Start contains exactly one shell command block launching an existing
@@ -64,7 +68,7 @@ first three sections stay near the top of the page.
 
 `tools/validate_model_cards.mjs` parses Markdown/MDX and loads the checked-in
 example YAMLs. `tools/model_card_layout.mjs` enforces layout, required content,
-recipe identity, and length limits. Unit tests include wrong-checkpoint recipes,
+recipe identity, filenames, and length limits. Unit tests include wrong-checkpoint recipes,
 missing commands, thin architecture tables, long sections, and newly added cards.
 Failures report the file path and line number and exit nonzero.
 

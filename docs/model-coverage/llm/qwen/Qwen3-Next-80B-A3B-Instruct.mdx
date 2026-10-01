@@ -1,0 +1,54 @@
+---
+title: "Qwen/Qwen3-Next-80B-A3B-Instruct"
+description: "Fine-tune Qwen/Qwen3-Next-80B-A3B-Instruct with NeMo AutoModel: checked-in recipe, launch command, architecture, and model context."
+slug: model-coverage/large-language-models/qwen/Qwen3-Next-80B-A3B-Instruct
+---
+
+Qwen3-Next is an advanced MoE language model from Alibaba Cloud's Qwen team designed for high-throughput inference with large total parameter counts and efficient per-token activation.
+
+Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
+
+## Quick Start
+
+Allocate 4 nodes with 8 GPUs each. Set `NODE_RANK` and `MASTER_ADDR` on every node; complete the recipe prerequisites in Model Context before launching.
+
+```bash
+uv run torchrun --nnodes 4 --nproc-per-node 8 \
+  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
+  -m nemo_automodel.cli.app examples/llm_finetune/qwen/qwen3_next_te_deepep.yaml
+```
+
+## Choose a Workflow
+
+| Goal | Start Here |
+| --- | --- |
+| Supervised fine-tuning (SFT) - Qwen3-Next with TE + DeepEP | Use [qwen3_next_te_deepep.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen3_next_te_deepep.yaml). |
+
+## Model Context
+
+| Property | Value |
+| --- | --- |
+| Task | Text Generation (MoE) |
+| **Architecture** | `Qwen3NextForCausalLM` |
+| Parameters | 80B total / 3B active |
+| Hugging Face Organization | [Qwen](https://huggingface.co/Qwen) |
+| Decoder Layers | 48 |
+| Hidden Size | 2,048 |
+| Attention | 16 attention heads / 2 key-value heads |
+| Context Length | 262,144 tokens (checkpoint configuration) |
+| Vocabulary Size | 151,936 |
+| Experts | 512 routed / 10 selected per token |
+| Configured Dtype | `bfloat16` |
+
+## Available Models
+
+| Model | HF ID |
+|---|---|
+| Qwen3-Next 80B A3B Instruct | [`Qwen/Qwen3-Next-80B-A3B-Instruct`](https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Instruct) |
+
+## Related Resources
+
+- [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
+- [Large MoE Fine-Tuning Guide](/recipes-e2e-examples/large-moe-fine-tuning)
+
+- [Checkpoint Configuration](https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Instruct/blob/9c7f2fbe84465e40164a94cc16cd30b6999b0cc7/config.json)

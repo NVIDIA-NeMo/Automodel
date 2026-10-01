@@ -1,0 +1,62 @@
+---
+title: "mistralai/Ministral-3-14B-Reasoning-2512"
+description: "Use NeMo AutoModel to fine-tune mistralai/Ministral-3-14B-Reasoning-2512 for VLM workflows with checked-in image-text-to-text recipes and documented distributed settings."
+slug: model-coverage/vision-language-models/mistralai/Ministral-3-14B-Reasoning-2512
+---
+
+[Ministral-3-14B-Reasoning-2512](https://huggingface.co/mistralai/Ministral-3-14B-Reasoning-2512) has a checked-in NeMo AutoModel recipe for image-text-to-text.
+The Hugging Face configuration declares the `Mistral3ForConditionalGeneration` architecture.
+
+## Quick Start
+
+Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+
+```bash
+automodel examples/vlm_finetune/mistral/ministral3_14b_medpix.yaml --nproc-per-node 8
+```
+
+## Choose a Workflow
+
+| Goal | Start Here |
+| --- | --- |
+| Run the primary recipe for this model | Use the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mistral/ministral3_14b_medpix.yaml). |
+| Prepare your environment | Follow the [installation instructions](/get-started/installation). |
+
+## Model Context
+
+| Property | Value |
+| --- | --- |
+| Task | Image-text-to-text |
+| **Architecture** | `Mistral3ForConditionalGeneration` |
+| Parameters | 13.95B checkpoint parameters |
+| Decoder Layers | 40 |
+| Hidden Size | 5,120 |
+| Attention | 32 attention heads / 8 key-value heads |
+| Context Length | 262,144 tokens (checkpoint configuration) |
+| Vocabulary Size | 131,072 |
+| Configured Dtype | `bfloat16` |
+
+### Configuration
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | - |
+| Strategy | FSDP2; tp_size=1, cp_size=1 |
+| Nodes | - |
+| Features | Checkpointing (enabled=true) |
+| Advanced | torch.bfloat16 |
+
+## Available Models
+
+- [`mistralai/Ministral-3-14B-Reasoning-2512`](https://huggingface.co/mistralai/Ministral-3-14B-Reasoning-2512)
+
+| Checkpoint | Type |
+| --- | --- |
+| [Ministral-3-14B-Reasoning-2512](https://huggingface.co/mistralai/Ministral-3-14B-Reasoning-2512) | Checkpoint documented on this page |
+| [`mistralai/Ministral-3-14B-Reasoning-2512`](https://huggingface.co/mistralai/Ministral-3-14B-Reasoning-2512) | Checkpoint documented on this page |
+
+## Related Resources
+
+- [Vision-language model fine-tuning guide](/recipes-e2e-examples/gemma-3-3n)
+
+- [Checkpoint Configuration](https://huggingface.co/mistralai/Ministral-3-14B-Reasoning-2512/blob/51f9210f3cd20f3452a80d5819d15dc61cc50630/config.json)

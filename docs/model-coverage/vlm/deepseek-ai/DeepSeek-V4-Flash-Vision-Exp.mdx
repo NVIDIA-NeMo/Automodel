@@ -1,0 +1,81 @@
+---
+title: "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp"
+description: "Use NeMo AutoModel to fine-tune deepseek-ai/DeepSeek-V4-Flash-Vision-Exp for VLM workflows with checked-in image-text-to-text recipes and documented distributed settings."
+slug: model-coverage/vision-language-models/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp
+---
+
+[DeepSeek-V4-Flash-Vision-Exp](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp) has a checked-in NeMo AutoModel recipe for image-text-to-text.
+The Hugging Face configuration declares the `DeepseekV4ForCausalLM` architecture.
+
+## Quick Start
+
+Follow the [installation instructions](/get-started/installation). Allocate 16 nodes with 8 GPUs each; run on every node with `NODE_RANK` and `MASTER_ADDR` set. Complete the [recipe setup](#recipe-setup) before launching.
+
+```bash
+uv run torchrun --nnodes 16 --nproc-per-node 8 \
+  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
+  -m nemo_automodel.cli.app examples/vlm_finetune/deepseek_v4/deepseek_v4_flash_vision_medpix_4k_ep32pp4_100steps.yaml
+```
+
+## Choose a Workflow
+
+| Goal | Start Here |
+| --- | --- |
+| Fine-tune deepseek-ai/DeepSeek-V4-Flash-Vision-Exp | [deepseek_v4_flash_vision_medpix_4k_ep32pp4_100steps.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/deepseek_v4/deepseek_v4_flash_vision_medpix_4k_ep32pp4_100steps.yaml). 16 nodes, 8 GPUs per node; see [Recipe Setup](#recipe-setup). |
+| Prepare your environment | Follow the [installation instructions](/get-started/installation). |
+
+## Model Context
+
+| Property | Value |
+| --- | --- |
+| Task | Image-text-to-text |
+| **Architecture** | `DeepseekV4ForCausalLM` |
+| Decoder Layers | 43 |
+| Hidden Size | 4,096 |
+| Attention | 64 attention heads / 1 key-value heads |
+| Context Length | 1,048,576 tokens (checkpoint configuration) |
+| Vocabulary Size | 129,280 |
+| Experts | 256 routed / 1 shared / 6 selected per token |
+| Vision Encoder | 32 layers / 1,024 hidden size / 16 attention heads / 14 x 14 patches |
+| Configured Dtype | `bfloat16` |
+| Parameters | 304.6B native parameters: 284.3B language backbone / 0.47B vision / 19.83B auxiliary MTP |
+
+The parameter split includes three auxiliary prediction modules; the fine-tuning recipe sets `num_nextn_predict_layers: 0` and trains the language and vision backbone.
+
+### Configuration
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | - |
+| Strategy | FSDP2; tp_size=1, pp_size=4, cp_size=1, ep_size=32 |
+| Nodes | 16 |
+| Features | Activation checkpointing (activation_checkpointing=true), HybridEP (dispatcher=hybridep) |
+| Advanced | bfloat16, attention=tilelang, linear=torch, experts=torch_mm, dispatcher=hybridep |
+
+### Setup and Additional Examples
+
+Follow the [installation instructions](/get-started/installation), then review the checked-in recipe and
+its declared topology below before choosing a local or cluster launcher.
+
+Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node run.
+
+### Recipe Setup
+
+Read [deepseek_v4_flash_vision_medpix_4k_ep32pp4_100steps.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/deepseek_v4/deepseek_v4_flash_vision_medpix_4k_ep32pp4_100steps.yaml) for checkpoint access, data paths, and backend dependencies. Use the [Slurm launcher guide](/job-launchers/slurm-cluster) to prepare the distributed allocation.
+
+## Available Models
+
+- [`deepseek-ai/DeepSeek-V4-Flash-Vision-Exp`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp)
+
+| Checkpoint | Type |
+| --- | --- |
+| [DeepSeek-V4-Flash-Vision-Exp](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp) | Checkpoint documented on this page |
+| [`deepseek-ai/DeepSeek-V4-Flash-Vision-Exp`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp) | Checkpoint documented on this page |
+
+## Related Resources
+
+- [Vision-language model fine-tuning guide](/recipes-e2e-examples/gemma-3-3n)
+
+- [Checkpoint Configuration](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp/blob/6821d6ad3681a4b137b066b76094fa82ebd0a380/config.json)
+
+- [Native Model Implementation](https://github.com/NVIDIA-NeMo/Automodel/blob/5c6b0d40b0a8edadfe7152d8b6025ddbbd3be94d/nemo_automodel/components/models/deepseek_v4/model.py)

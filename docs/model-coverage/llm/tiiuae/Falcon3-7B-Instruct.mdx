@@ -1,0 +1,67 @@
+---
+title: "tiiuae/Falcon3-7B-Instruct"
+description: "Use NeMo AutoModel to fine-tune tiiuae/Falcon3-7B-Instruct for LLM workflows with checked-in text generation recipes and documented distributed settings."
+slug: model-coverage/large-language-models/tiiuae/Falcon3-7B-Instruct
+---
+
+[Falcon3-7B-Instruct](https://huggingface.co/tiiuae/Falcon3-7B-Instruct) has a checked-in NeMo AutoModel recipe for text generation.
+The Hugging Face configuration declares the `LlamaForCausalLM` architecture.
+
+## Quick Start
+
+Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+
+```bash
+automodel examples/llm_finetune/falcon/falcon3_7b_instruct_squad.yaml --nproc-per-node 8
+```
+
+## Choose a Workflow
+
+| Goal | Start Here |
+| --- | --- |
+| Run the primary recipe for this model | Use the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/falcon/falcon3_7b_instruct_squad.yaml). |
+| Try another checked-in recipe for this model | Use the [alternate recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/falcon/falcon3_7b_instruct_hellaswag_fp8.yaml). |
+
+## Model Context
+
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| **Architecture** | `LlamaForCausalLM` |
+| Parameters | 7.46B checkpoint parameters |
+| Decoder Layers | 28 |
+| Hidden Size | 3,072 |
+| Attention | 12 attention heads / 4 key-value heads |
+| Context Length | 32,768 tokens (checkpoint configuration) |
+| Vocabulary Size | 131,072 |
+| Configured Dtype | `bfloat16` |
+
+### Configuration
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | - |
+| Strategy | FSDP2; tp_size=1, cp_size=1 |
+| Nodes | - |
+| Features | - |
+| Advanced | - |
+
+### More Recipes for This Model
+
+- [`falcon3_7b_instruct_hellaswag_fp8.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/falcon/falcon3_7b_instruct_hellaswag_fp8.yaml)
+- [`falcon3_7b_instruct_squad_peft.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/falcon/falcon3_7b_instruct_squad_peft.yaml)
+
+## Available Models
+
+- [`tiiuae/Falcon3-7B-Instruct`](https://huggingface.co/tiiuae/Falcon3-7B-Instruct)
+
+| Checkpoint | Type |
+| --- | --- |
+| [Falcon3-7B-Instruct](https://huggingface.co/tiiuae/Falcon3-7B-Instruct) | Checkpoint documented on this page |
+| [`tiiuae/Falcon3-7B-Instruct`](https://huggingface.co/tiiuae/Falcon3-7B-Instruct) | Checkpoint documented on this page |
+
+## Related Resources
+
+- [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/tiiuae/Falcon3-7B-Instruct/blob/1e57a0ecd176c7c139f289c60a74e57f887c3dfb/config.json)
