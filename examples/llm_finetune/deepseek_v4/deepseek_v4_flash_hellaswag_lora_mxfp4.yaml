@@ -186,4 +186,5 @@ ci:
   # EP8 fits one CI node with 8 H100 GPUs.
   recipe_owner: excepshenal
   nodes: 1
+  max_steps: 10
   time: "00:30:00"
