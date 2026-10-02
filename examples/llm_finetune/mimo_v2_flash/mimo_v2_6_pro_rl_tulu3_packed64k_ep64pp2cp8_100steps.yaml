@@ -18,9 +18,8 @@
 # DP = 128 / (PP2 * CP8) = 8; EP64 spans DP8 * CP8.
 # Keep each 64-GPU EP group within one NVLink domain.
 #
-# Requires Transformer Engine >= 2.16, cuDNN >= 9.26 and HybridEP with MNNVL.
-# Native QK192/V128 CP is required on GB200. AutoModel patches TE 2.16/2.17
-# THD reordering; TE >= 2.18 uses its upstream implementation.
+# Requires Transformer Engine >= 2.19, cuDNN >= 9.26 and HybridEP with MNNVL.
+# Uses TE's native QK192/V128 CP and CUDA THD reordering on GB200.
 # Set these in the launch environment for a direct run (ci.env_vars is CI-only):
 #   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 #   USE_MNNVL=1 NVTE_FUSED_ATTN=1 NVTE_FLASH_ATTN=0 NVTE_UNFUSED_ATTN=0
