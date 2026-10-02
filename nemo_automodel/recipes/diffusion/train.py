@@ -31,6 +31,7 @@ _HAS_WANDB, wandb = safe_import(
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
 
 from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
+from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.distributed import MeshContext, ParallelismSizes
 from nemo_automodel.components.distributed.fsdp2 import fsdp2_sharding_enabled
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
@@ -689,8 +690,13 @@ class TrainDiffusionRecipe(BaseRecipe):
         )
         logging.info(f"[INFO] LoRA: {lora_status}")
 
+        # ConfigNode lives at the recipe boundary; the pipeline takes plain mappings.
         backend = self.cfg.get("model.backend", None)
+        if isinstance(backend, ConfigNode):
+            backend = backend.to_dict()
         config_overrides = self.cfg.get("model.config_overrides", None)
+        if isinstance(config_overrides, ConfigNode):
+            config_overrides = config_overrides.to_dict()
         self.pipe, mesh_context = build_diffusion_pipeline(
             model_id=self.model_id,
             finetune_mode=self.cfg.get("model.mode", "finetune").lower() == "finetune",
@@ -709,12 +715,12 @@ class TrainDiffusionRecipe(BaseRecipe):
             peft_cfg=self.peft_cfg,
             model_type=self.model_type,
             active_transformer=self.active_transformer,
-            backend=backend.to_dict() if hasattr(backend, "to_dict") else backend,
-            config_overrides=(config_overrides.to_dict() if hasattr(config_overrides, "to_dict") else config_overrides),
+            backend=backend,
+            config_overrides=config_overrides,
         )
-        self.device_mesh = getattr(mesh_context, "device_mesh", None)
-        # Expert-parallel mesh of MoE transformers; None for dense models.
-        self.moe_mesh = getattr(mesh_context, "moe_mesh", None)
+        self.device_mesh = mesh_context.device_mesh
+        # Expert-parallel mesh; None unless ep_size > 1.
+        self.moe_mesh = mesh_context.moe_mesh
         self.pp_enabled = False
 
         self.model = self.pipe.transformer
@@ -1049,7 +1055,7 @@ class TrainDiffusionRecipe(BaseRecipe):
                 micro_losses = []
                 prepare_for_grad_accumulation([self.model], pp_enabled=False)
                 num_microbatches = len(batch_group)
-                if getattr(self, "moe_mesh", None) is not None:
+                if self.moe_mesh is not None:
                     # Router auxiliary losses are injected in backward; average them like the main loss.
                     self._set_moe_aux_loss_backward_scale(num_batches=num_microbatches, num_label_tokens=0)
                 for microbatch_idx, micro_batch in enumerate(batch_group):
@@ -1095,7 +1101,7 @@ class TrainDiffusionRecipe(BaseRecipe):
                         prepare_after_first_microbatch()
 
                 synchronize_tp_replica_gradients([self.model], getattr(self, "device_mesh", None))
-                if getattr(self, "moe_mesh", None) is not None:
+                if self.moe_mesh is not None:
                     # Expert gradients are reduced over the EP-shard group only; rescale them to the
                     # dense DP mean before clipping with an EP-aware norm (same as the LLM recipe).
                     grad_norm = scale_grads_and_clip_grad_norm(
@@ -1112,7 +1118,7 @@ class TrainDiffusionRecipe(BaseRecipe):
                     grad_norm = clip_grad_norm(
                         self.clip_grad_max_norm,
                         [self.model],
-                        device_mesh=getattr(self, "device_mesh", None),
+                        device_mesh=self.device_mesh,
                         foreach=self.grad_clip_foreach,
                     )
                 grad_norm = float(grad_norm) if torch.is_tensor(grad_norm) else grad_norm
@@ -1132,6 +1138,7 @@ class TrainDiffusionRecipe(BaseRecipe):
 
                 for optimizer in self.optimizer:
                     optimizer.step()
+                # Same guard as the LLM recipe: diffusers transformers have no router bias to update.
                 if hasattr(self.model, "update_moe_gate_bias"):
                     self.model.update_moe_gate_bias()
                 if self.lr_scheduler is not None:

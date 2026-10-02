@@ -158,7 +158,7 @@ def _expert_layout(model) -> list[dict]:
                 entry["mesh_dim_names"] = list(param.device_mesh.mesh_dim_names or ())
                 entry["mesh_shape"] = list(param.device_mesh.shape)
                 entry["placements"] = [
-                    {"type": type(placement).__name__, "dim": getattr(placement, "dim", None)}
+                    {"type": type(placement).__name__, "dim": placement.dim if placement.is_shard() else None}
                     for placement in param.placements
                 ]
                 entry["local_shape"] = list(param.to_local().shape)
@@ -176,7 +176,7 @@ def _gate_correction_bias_abs_max(model) -> float | None:
 
     values = []
     for module in model.modules():
-        if isinstance(module, MoE) and getattr(module.gate, "e_score_correction_bias", None) is not None:
+        if isinstance(module, MoE) and module.gate.e_score_correction_bias is not None:
             bias = module.gate.e_score_correction_bias
             bias = bias.full_tensor() if isinstance(bias, DTensor) else bias
             values.append(float(bias.detach().abs().max()))
@@ -269,7 +269,7 @@ def train(args: argparse.Namespace) -> None:
     recipe = diffusion_train.TrainDiffusionRecipe(cfg)
     recipe.setup()
     for key, value in (config_overrides or {}).items():
-        assert getattr(recipe.model.config, key) == value, f"model.config_overrides not applied: {key}"
+        assert recipe.model.config.to_dict()[key] == value, f"model.config_overrides not applied: {key}"
 
     # Model construction consumes RNG differently with and without EP (rank-local expert
     # shapes differ), so re-seed before training: both legs then draw identical mock data,
@@ -289,18 +289,17 @@ def train(args: argparse.Namespace) -> None:
     recipe.flow_matching_pipeline.step = step_wrapper
 
     gate_bias_updates = []
-    real_update = getattr(recipe.model, "update_moe_gate_bias", None)
-    if real_update is not None:
+    real_update = recipe.model.update_moe_gate_bias
 
-        def update_wrapper():
-            gate_bias_updates.append(1)
-            return real_update()
+    def update_wrapper():
+        gate_bias_updates.append(1)
+        return real_update()
 
-        recipe.model.update_moe_gate_bias = update_wrapper
+    recipe.model.update_moe_gate_bias = update_wrapper
 
     moe_mesh = recipe.moe_mesh
     layout = _expert_layout(recipe.model)
-    checkpointer_moe_mesh = getattr(recipe.checkpointer, "moe_mesh", None)
+    checkpointer_moe_mesh = recipe.checkpointer.moe_mesh
     max_abs_diff_vs_checkpoint = _max_abs_diff_vs_checkpoint(recipe.model, args.model_dir)
 
     recipe.run_train_validation_loop()

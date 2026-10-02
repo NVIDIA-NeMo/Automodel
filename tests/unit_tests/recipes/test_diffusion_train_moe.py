@@ -300,4 +300,3 @@ def test_train_step_skips_gate_bias_update_for_models_without_it(monkeypatch):
     recipe.run_train_validation_loop()
 
     recipe.optimizer[0].step.assert_called_once_with()
-    assert not hasattr(model, "update_moe_gate_bias")

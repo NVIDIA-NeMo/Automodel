@@ -27,13 +27,11 @@ from nemo_automodel._diffusers import auto_diffusion_pipeline as adp
 from nemo_automodel._diffusers.auto_diffusion_pipeline import (
     NeMoAutoDiffusionPipeline,
     _has_custom_model,
-    _validate_custom_model_options,
     _transformer_dir,
+    _validate_custom_model_options,
 )
 from nemo_automodel._transformers.registry import MODEL_ARCH_MAPPING, ModelRegistry, register_architecture
-from nemo_automodel.components.models.common import BackendConfig
 from tests.functional_tests.diffusion.toy_moe_dit import (
-    TOY_MOE_DIT_ARCHITECTURE,
     ToyMoEDiTConfig,
     ToyMoEDiTForDiffusion,
     register_toy_moe_dit,

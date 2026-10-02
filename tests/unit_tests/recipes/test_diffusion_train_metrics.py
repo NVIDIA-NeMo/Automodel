@@ -291,7 +291,7 @@ def test_diffusion_recipe_raises_when_hunyuan_flash_varlen_mask_optimization_fai
     monkeypatch.setattr(
         diffusion_train,
         "build_diffusion_pipeline",
-        MagicMock(return_value=(SimpleNamespace(transformer=nn.Linear(1, 1)), None)),
+        MagicMock(return_value=(SimpleNamespace(transformer=nn.Linear(1, 1)), diffusion_train.MeshContext())),
     )
 
     from nemo_automodel.components.flow_matching.adapters import hunyuan as hunyuan_module
@@ -312,7 +312,7 @@ def test_diffusion_recipe_enables_hunyuan_flash_varlen_mask_optimization_before_
     monkeypatch.setattr(
         diffusion_train,
         "build_diffusion_pipeline",
-        MagicMock(return_value=(SimpleNamespace(transformer=nn.Linear(1, 1)), None)),
+        MagicMock(return_value=(SimpleNamespace(transformer=nn.Linear(1, 1)), diffusion_train.MeshContext())),
     )
 
     from nemo_automodel.components.flow_matching.adapters import hunyuan as hunyuan_module
@@ -336,7 +336,7 @@ def test_diffusion_recipe_reseeds_rng_by_dp_rank_when_cp_enabled(monkeypatch):
     monkeypatch.setattr(
         diffusion_train,
         "build_diffusion_pipeline",
-        MagicMock(return_value=(SimpleNamespace(transformer=nn.Linear(1, 1)), None)),
+        MagicMock(return_value=(SimpleNamespace(transformer=nn.Linear(1, 1)), diffusion_train.MeshContext())),
     )
     init_all_rng = MagicMock()
     monkeypatch.setattr(diffusion_train, "init_all_rng", init_all_rng)
@@ -363,7 +363,7 @@ def test_diffusion_recipe_does_not_reseed_rng_without_cp(monkeypatch):
     monkeypatch.setattr(
         diffusion_train,
         "build_diffusion_pipeline",
-        MagicMock(return_value=(SimpleNamespace(transformer=nn.Linear(1, 1)), None)),
+        MagicMock(return_value=(SimpleNamespace(transformer=nn.Linear(1, 1)), diffusion_train.MeshContext())),
     )
     init_all_rng = MagicMock()
     monkeypatch.setattr(diffusion_train, "init_all_rng", init_all_rng)
@@ -390,7 +390,7 @@ def test_diffusion_recipe_broadcasts_tp_replicas_before_optimizer_setup(monkeypa
     monkeypatch.setattr(
         diffusion_train,
         "build_diffusion_pipeline",
-        MagicMock(return_value=(SimpleNamespace(transformer=transformer), None)),
+        MagicMock(return_value=(SimpleNamespace(transformer=transformer), diffusion_train.MeshContext())),
     )
     broadcast = MagicMock()
     monkeypatch.setattr(diffusion_train, "broadcast_tp_replicas", broadcast)
@@ -754,6 +754,7 @@ def test_run_train_validation_loop_uses_hot_path_and_logs_perf_metrics(monkeypat
     recipe.lr_scheduler = [SimpleNamespace(step=MagicMock())]
     recipe.model = model
     recipe.device_mesh = object()
+    recipe.moe_mesh = None
     recipe.device = torch.device("cpu")
     recipe.compute_dtype = torch.float32
     recipe.check_loss = True
@@ -867,7 +868,7 @@ def _patch_setup_dataloaders(monkeypatch, *, validation_batches=1, with_validati
     monkeypatch.setattr(
         diffusion_train,
         "build_diffusion_pipeline",
-        MagicMock(return_value=(SimpleNamespace(transformer=nn.Linear(1, 1)), None)),
+        MagicMock(return_value=(SimpleNamespace(transformer=nn.Linear(1, 1)), diffusion_train.MeshContext())),
     )
 
     validation_config = None
@@ -1072,6 +1073,8 @@ def test_run_train_validation_loop_validates_only_with_a_val_dataloader(monkeypa
     recipe.optimizer = [SimpleNamespace(zero_grad=MagicMock(), step=MagicMock(), param_groups=[{"lr": 0.01}])]
     recipe.lr_scheduler = None
     recipe.model = nn.Linear(1, 1)
+    recipe.device_mesh = None
+    recipe.moe_mesh = None
     recipe.device = torch.device("cpu")
     recipe.compute_dtype = torch.float32
     recipe.check_loss = False

@@ -106,7 +106,7 @@ class ToyMoEDiTConfig(PretrainedConfig):
 
 
 def _model_dtype(config: ToyMoEDiTConfig) -> torch.dtype:
-    return dtype_from_str(getattr(config, "torch_dtype", None), default=torch.bfloat16)
+    return dtype_from_str(config.torch_dtype, default=torch.bfloat16)
 
 
 def _timestep_embedding(timestep: torch.Tensor, dim: int) -> torch.Tensor:
