@@ -1024,8 +1024,8 @@ class Qwen3_5ForCausalLM(HFCheckpointingMixin, nn.Module):
 class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditionalGeneration):
     """Qwen3.5/Qwen3.6 dense VLM with optional Megatron-style MTP head.
 
-    The base VLM stays on the upstream HF implementation so image/video feature
-    insertion, M-RoPE position handling, and generation helpers remain intact.
+    The base VLM retains upstream image/video and M-RoPE semantics, with
+    model-owned host metadata and media insertion paths to avoid CUDA syncs.
     MTP is added as an auxiliary train-time module over the final language
     hidden states, matching the dense text-only MTP architecture.
     """
@@ -1033,6 +1033,9 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
     # forward() pulls per-microbatch pixel_values from _vlm_pixel_values_chunks;
     # patch_hf_model_for_pp must not replace it under PP.
     _pp_keep_self_forward: bool = True
+    # Vision grids are host-readable shape metadata. The vision encoder moves
+    # derived position and interpolation tensors to the patch device as needed.
+    host_batch_keys: frozenset[str] = frozenset({"image_grid_thw", "video_grid_thw", "image_grid_hws"})
     # CP submesh, installed by the parallelizer's apply_cp when context parallelism
     # is active; None means the forward embeds and shards nothing for CP.
     cp_mesh = None

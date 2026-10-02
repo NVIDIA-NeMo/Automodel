@@ -2324,6 +2324,35 @@ class _CPPreEmbedStop(RuntimeError):
 class TestForwardBackwardStepNonPP:
     """Tests for _forward_backward_step without pipeline parallelism."""
 
+    def test_model_host_metadata_stays_on_cpu_before_cp_sharding(self, monkeypatch):
+        model = _CPPreEmbedModel()
+        model.host_batch_keys = frozenset({"image_grid_thw"})
+        recipe = _create_non_pp_recipe(model)
+        recipe.__dict__["device_mesh"] = _DummyCPDeviceMesh(cp_size=2)
+        grid = torch.tensor([[1, 2, 2]])
+        moved = []
+
+        def record_move(value, device):
+            moved.append(value)
+            return value
+
+        def check_batch(sharder, batch):
+            assert batch["image_grid_thw"] is grid
+            assert all(value is not grid for value in moved)
+            raise _CPPreEmbedStop
+
+        monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune._move_to_device", record_move)
+        monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.ContextParallelSharder.shard", check_batch)
+        with pytest.raises(_CPPreEmbedStop):
+            recipe._forward_backward_step(
+                idx=0,
+                batch={"input_ids": torch.ones(1, 4, dtype=torch.long), "image_grid_thw": grid},
+                loss_buffer=[],
+                num_label_tokens=4,
+                num_batches=1,
+                is_train=False,
+            )
+
     def test_non_pp_cp_invokes_sharder_only_hook_and_keeps_inputs(self, monkeypatch):
         # Sunk contract: the non-PP CP path invokes the sharder-only hook, which
         # consumes nothing, so input_ids / pixel_values / mm_token_type_ids all

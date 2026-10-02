@@ -853,7 +853,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
         num_batches,
         is_train: bool = True,
     ):
-        batch = {k: _move_to_device(v, self.dist_env.device) for k, v in batch.items()}
+        host_batch_keys = getattr(self.model_parts[0], "host_batch_keys", ())
+        batch = {k: v if k in host_batch_keys else _move_to_device(v, self.dist_env.device) for k, v in batch.items()}
 
         # Single CP dispatch (magi / model-owned / generic). The pre-embed hook is
         # a plain method call (prepare_model_inputs_for_cp): sharder-only, it
