@@ -21,6 +21,7 @@ TEST_NAME=""
 ADDITIONAL_ARGS=""
 SHARD_ID=""
 NUM_SHARDS=""
+GPU_COUNT=2
 
 for i in "$@"; do
     case $i in
@@ -29,6 +30,7 @@ for i in "$@"; do
         --TEST_NAME=?*) TEST_NAME="${i#*=}";;
         --SHARD_ID=?*) SHARD_ID="${i#*=}";;
         --NUM_SHARDS=?*) NUM_SHARDS="${i#*=}";;
+        --GPU_COUNT=?*) GPU_COUNT="${i#*=}";;
         *) ;;
     esac
     shift
@@ -43,7 +45,11 @@ if [[ -n "$NUM_SHARDS" && "$NUM_SHARDS" -gt 1 && -n "$SHARD_ID" ]]; then
 fi
 
 if [[ "$CPU" == "false" ]]; then
-    export CUDA_VISIBLE_DEVICES="0,1"
+    if [[ ! "$GPU_COUNT" =~ ^[1-9][0-9]*$ ]]; then
+        echo "GPU_COUNT must be a positive integer" >&2
+        exit 2
+    fi
+    export CUDA_VISIBLE_DEVICES=$(seq -s, 0 "$((GPU_COUNT - 1))")
 else
     export ADDITIONAL_ARGS="--cpu --with_downloads"
 fi

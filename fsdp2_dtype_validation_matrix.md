@@ -146,7 +146,24 @@ uses such a group-level counter for bias correction.
 | F6 and gradient accumulation | Functional activation-checkpoint and two-microbatch cases | Recompute and deferred synchronization preserve numerical parity |
 | F14-F15 | In-memory model reloads, meta materialization without a checkpoint, and the TE probe's fresh Checkpointer/DCP resume | Extensions survive shard replacement; BF16 masters and moments are restored, with next-step parity and no redundant FP32 master |
 | F16 | Unit tests with globally and rank-locally unused parameters | Globally unused parameters retain `grad=None`; rank-local gaps receive the peer contribution without an extra collective |
-| F17 | Two-rank 2x1 HSDP in PR CI; standalone four-rank 2x2 invocation | The two-rank case exercises replication; the four-rank case covers both nontrivial dimensions and requires four visible GPUs |
+| F17 | Two-rank 2x1 HSDP plus dedicated four-GPU 2x2 HSDP in PR CI | The four-rank case covers both nontrivial dimensions, including accumulation, clipping, unused parameters, and TE optimizer updates |
+| D1/D3, F6, F14-F15 with packed dense Qwen3.5 | `fsdp2_ownership/test_four_gpu.py` | Alternating real GatedDeltaNet/full-attention layers, frozen vision parameters, two packed documents, deferred synchronization, model/optimizer DCP resume, and next-step parity |
+| F7 with CP2/FSDP2 and BF16 reduction | `fsdp2_ownership/test_four_gpu.py` | Per-parameter FP32-sensitive gradients, loss, global norm, and optimizer updates match an unsharded reference |
+| F8 with TP2/FSDP2 | `fsdp2_ownership/test_four_gpu.py` | Per-parameter parity includes FP32 gate ownership alongside TP-sharded bulk and replicated parameters |
+| Separate KD meshes: student DP2, teacher DP2/TP2/CP2 | `fsdp2_ownership/test_four_gpu.py` | Real KD bridge routing and teacher logits, student gradients, clipping, and optimizer updates match the reference |
+| TP2/PP2/FSDP2 | `fsdp2_ownership/test_eight_gpu.py` | All three dimensions are nontrivial; every stage's gradients and updates, pipeline loss, and global norm match the unsharded reference |
+
+The dedicated suite runs on `nemo-ci-aws-gpu-x4`, `nemo-ci-aws-gpu-x8`,
+and, when GCP testing is enabled, `nemo-ci-gcp-gpu-x4`. These member-PR
+jobs expose four/eight GPUs explicitly; the existing suites retain their
+two-GPU default. Insufficient visible GPUs fail the dedicated suite rather
+than skipping it. The final CI result waits for these jobs.
+
+These tests use small dense Qwen3.5 VLMs and synthetic text, without downloads.
+They cover production parallelization, losses, clipping, optimizers, and
+checkpoint paths. They do not execute the vision tower, the complete training
+recipe, or a full-size model's memory workload. TP4/PP4 requires at least
+16 GPUs; the eight-GPU test instead covers the interaction at TP2/PP2/DP2.
 
 ## PEFT Matrix
 
