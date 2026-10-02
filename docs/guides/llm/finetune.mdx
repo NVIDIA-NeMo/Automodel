@@ -221,8 +221,9 @@ peft:
 
 Including a `peft:` section enables LoRA fine-tuning. Remove it entirely to run SFT instead. See [Switch Between SFT and PEFT](#switch-between-sft-and-peft).
 
-For MoE models with adaptive router correction biases, freeze updates while
-preserving the pretrained values before using adapter-only checkpoints. See
+For MoE models with adaptive router correction biases, freeze those updates as
+well as the base parameters. This preserves routing when reloading the saved
+adapters; see
 [Router Correction Biases in MoE Models](/development/checkpointing#router-correction-biases-in-moe-models)
 for the recipe settings.
 

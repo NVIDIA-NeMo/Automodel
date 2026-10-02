@@ -406,10 +406,16 @@ from nemo_automodel.components.moe.experts import GroupedExperts
 
 LoRA on MoE typically targets the gate/up/down projections within experts, as well as attention projections (q, k, v, o).
 
-### Router correction biases with adapter-only checkpoints
+### Preserve router state during LoRA
 
-Adapter-only checkpoints require fixed router correction biases. For PEFT
-recipes using the shared `Gate` with a pretrained `e_score_correction_bias`, use:
+LoRA trains adapter weights while freezing the base model's parameters. Some
+MoE routers also update correction-bias buffers outside the optimizer; freezing
+parameters does not stop those updates.
+
+NeMo AutoModel's PEFT checkpoints save only adapter weights, so reloading the
+base model plus adapters would lose any bias changes. Keep these pretrained
+biases fixed during LoRA training. For the shared `Gate` with a pretrained
+`e_score_correction_bias`, use:
 
 ```yaml
 model:
@@ -418,10 +424,10 @@ model:
     force_e_score_correction_bias: true
 ```
 
-Preserve pretrained bias values; do not add a correction bias to architectures
-whose base checkpoint has none. Keep full-training defaults unchanged. See the
+Do not add a correction bias to architectures whose base checkpoint has none.
+Keep full-training defaults unchanged. See the
 [checkpointing guide](../../docs/guides/checkpointing.mdx#router-correction-biases-in-moe-models)
-for the rationale and limitations.
+for checkpoint limitations.
 
 Before advertising MoE PEFT support, verify:
 

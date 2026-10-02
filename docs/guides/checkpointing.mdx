@@ -230,7 +230,10 @@ Although this example uses the Hugging Face Transformers API, the `consolidated/
 
 ## PEFT
 
-When training with Parameter-Efficient Fine-Tuning (PEFT) techniques, only a small subset of model weights is updated. Adapter-only checkpointing assumes the remaining model state stays unchanged. This dramatically reduces the size of the checkpoint, often to just a few megabytes.
+For Parameter-Efficient Fine-Tuning (PEFT), NeMo AutoModel saves the trained
+adapters instead of the full model, often reducing checkpoints to just a few
+megabytes. Reloading combines those adapters with the original base model, so
+adapter-only saving assumes the base model's weights and buffers stay unchanged.
 
 PEFT checkpoints save adapter files directly under `model/` and do not generate or need `model/consolidate.sh`.
 
