@@ -528,68 +528,6 @@ def _validate_custom_model_options(mesh_context: MeshContext | None, **options: 
         raise ValueError("Context parallelism is not supported for custom models yet (cp_size > 1).")
 
 
-def build_custom_transformer(
-    transformer_dir: str,
-    *,
-    mesh_context: MeshContext | None,
-    torch_dtype: torch.dtype,
-    load_base_model: bool,
-    peft_cfg=None,
-    backend: Any = None,
-    config_overrides: Dict[str, Any] | None = None,
-) -> nn.Module:
-    """Build a transformer from its Automodel custom implementation.
-
-    Custom models take the same path as LLMs: ``NeMoAutoModelForCausalLM.from_config`` with a ``DistributedSetup``
-    derived from ``mesh_context``. That gives them FSDP2, expert parallelism and sharded checkpoint loading, which
-    diffusers modules do not provide.
-
-    Args:
-        transformer_dir: Directory with the transformer ``config.json`` (and weights when ``load_base_model``).
-        mesh_context: Resolved topology and policy; ``None`` builds an unsharded model.
-        torch_dtype: Parameter dtype.
-        load_base_model: Load the checkpoint weights instead of initializing randomly.
-        peft_cfg: Optional PEFT config.
-        backend: ``BackendConfig`` or a dict of its fields.
-        config_overrides: Attributes set on the loaded config before construction.
-    """
-    from transformers import AutoConfig
-
-    from nemo_automodel._transformers.auto_model import NeMoAutoModelForCausalLM
-    from nemo_automodel.components.distributed.config import DistributedSetup
-    from nemo_automodel.components.models.common import BackendConfig
-
-    config = AutoConfig.from_pretrained(transformer_dir, trust_remote_code=False)
-    for key, value in (config_overrides or {}).items():
-        setattr(config, key, value)
-
-    model_kwargs = {}
-    if backend is not None:
-        model_kwargs["backend"] = BackendConfig(**backend) if isinstance(backend, dict) else backend
-
-    distributed_setup = None
-    if mesh_context is not None:
-        distributed_setup = DistributedSetup(
-            mesh_context=mesh_context,
-            strategy_config=mesh_context.strategy_config,
-            moe_parallel_config=mesh_context.moe_parallel_config,
-            activation_checkpointing=mesh_context.activation_checkpointing,
-        )
-
-    logger.info("[INFO] Building custom model %s from %s", config.architectures[0], transformer_dir)
-    return NeMoAutoModelForCausalLM.from_config(
-        config,
-        distributed_setup=distributed_setup,
-        load_base_model=load_base_model,
-        torch_dtype=torch_dtype,
-        trust_remote_code=False,
-        use_liger_kernel=False,
-        use_sdpa_patching=False,
-        peft_config=peft_cfg,
-        **model_kwargs,
-    )
-
-
 class NeMoAutoDiffusionPipeline:
     """
     Unified diffusion pipeline wrapper for all model types.
@@ -690,7 +628,7 @@ class NeMoAutoDiffusionPipeline:
             attention_backend: Optional diffusers attention backend name set on the transformer
                 before parallelization (context parallelism validates the backend at enable time).
             backend: ``BackendConfig`` (or dict) for transformers with a custom Automodel
-                implementation; see :func:`build_custom_transformer`.
+                implementation; see :meth:`_from_custom_model`.
             config_overrides: Config attributes overridden before building a custom-model transformer.
             **kwargs: Additional arguments passed to DiffusionPipeline.from_pretrained
 
@@ -877,15 +815,38 @@ class NeMoAutoDiffusionPipeline:
         backend: Any = None,
         config_overrides: Dict[str, Any] | None = None,
     ) -> "NeMoAutoDiffusionPipeline":
-        """Pipeline holding only a transformer built from its Automodel custom implementation."""
-        transformer = build_custom_transformer(
+        """Pipeline around a transformer built from its custom Automodel implementation.
+
+        Same as the LLM recipe's ``build_model``: ``NeMoAutoModelForDiffusion.from_config`` with a ``DistributedSetup``
+        does the sharding (FSDP2, expert parallelism), PEFT and sharded weight loading. ``backend`` (``BackendConfig``
+        or dict) and ``config_overrides`` are passed as model kwargs, as in an LLM ``model:`` YAML section.
+        """
+        from nemo_automodel._transformers.auto_model import NeMoAutoModelForDiffusion
+        from nemo_automodel.components.distributed.config import DistributedSetup
+
+        distributed_setup = None
+        if mesh_context is not None:
+            distributed_setup = DistributedSetup(
+                mesh_context=mesh_context,
+                strategy_config=mesh_context.strategy_config,
+                moe_parallel_config=mesh_context.moe_parallel_config,
+                activation_checkpointing=mesh_context.activation_checkpointing,
+            )
+        model_kwargs = dict(config_overrides or {})
+        if backend is not None:
+            model_kwargs["backend"] = backend
+
+        logger.info("[INFO] Building custom-model transformer from %s", transformer_dir)
+        transformer = NeMoAutoModelForDiffusion.from_config(
             transformer_dir,
-            mesh_context=mesh_context,
-            torch_dtype=torch_dtype,
+            distributed_setup=distributed_setup,
             load_base_model=load_base_model,
-            peft_cfg=peft_cfg,
-            backend=backend,
-            config_overrides=config_overrides,
+            torch_dtype=torch_dtype,
+            trust_remote_code=False,
+            use_liger_kernel=False,
+            use_sdpa_patching=False,
+            peft_config=peft_cfg,
+            **model_kwargs,
         )
         if load_for_training and peft_cfg is None:
             _ensure_params_trainable(transformer, "transformer")

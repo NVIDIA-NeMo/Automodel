@@ -29,7 +29,6 @@ from nemo_automodel._diffusers.auto_diffusion_pipeline import (
     _has_custom_model,
     _validate_custom_model_options,
     _transformer_dir,
-    build_custom_transformer,
 )
 from nemo_automodel._transformers.registry import MODEL_ARCH_MAPPING, ModelRegistry, register_architecture
 from nemo_automodel.components.models.common import BackendConfig
@@ -206,7 +205,7 @@ def test_validate_options_rejects_context_parallelism():
 
 
 # =============================================================================
-# build_custom_transformer
+# NeMoAutoDiffusionPipeline._from_custom_model -> NeMoAutoModelForDiffusion.from_config
 # =============================================================================
 
 
@@ -222,11 +221,11 @@ def _patch_from_config(monkeypatch):
 
     sentinel = nn.Linear(1, 1)
     from_config = MagicMock(return_value=sentinel)
-    monkeypatch.setattr(auto_model.NeMoAutoModelForCausalLM, "from_config", from_config)
+    monkeypatch.setattr(auto_model.NeMoAutoModelForDiffusion, "from_config", from_config)
     return from_config, sentinel
 
 
-def test_build_custom_transformer_forwards_mesh_overrides_and_backend(monkeypatch, toy_config_dir):
+def test_from_custom_model_forwards_mesh_overrides_and_backend(monkeypatch, toy_config_dir):
     from nemo_automodel.components.distributed import config as distributed_config
 
     from_config, sentinel = _patch_from_config(monkeypatch)
@@ -240,23 +239,22 @@ def test_build_custom_transformer_forwards_mesh_overrides_and_backend(monkeypatc
         activation_checkpointing=True,
     )
     peft_cfg = object()
+    backend = {"experts": "torch", "dispatcher": "torch", "linear": "torch"}
 
-    model = build_custom_transformer(
+    pipe = NeMoAutoDiffusionPipeline._from_custom_model(
         toy_config_dir,
         mesh_context=mesh_context,
         torch_dtype=torch.float32,
         load_base_model=True,
+        load_for_training=True,
         peft_cfg=peft_cfg,
-        backend={"experts": "torch", "dispatcher": "torch", "linear": "torch"},
+        backend=backend,
         config_overrides={"num_hidden_layers": 1, "router_aux_loss_coef": 0.5},
     )
 
-    assert model is sentinel
-    (config,), kwargs = from_config.call_args
-    assert isinstance(config, ToyMoEDiTConfig)
-    assert config.architectures == [TOY_MOE_DIT_ARCHITECTURE]
-    assert config.num_hidden_layers == 1
-    assert config.router_aux_loss_coef == 0.5
+    assert pipe.transformer is sentinel
+    (path,), kwargs = from_config.call_args
+    assert path == toy_config_dir
     # The MeshContext policy is lifted onto the DistributedSetup so the model infrastructure
     # (FSDP / EP sharding, meta-device init, checkpoint loading) is instantiated.
     setup_cls.assert_called_once_with(
@@ -272,30 +270,39 @@ def test_build_custom_transformer_forwards_mesh_overrides_and_backend(monkeypatc
     assert kwargs["trust_remote_code"] is False
     assert kwargs["use_liger_kernel"] is False
     assert kwargs["use_sdpa_patching"] is False
-    assert isinstance(kwargs["backend"], BackendConfig)
-    assert kwargs["backend"].experts == "torch"
-    assert kwargs["backend"].dispatcher == "torch"
+    # Config overrides and the backend travel as model kwargs, like an LLM `model:` section.
+    assert kwargs["num_hidden_layers"] == 1
+    assert kwargs["router_aux_loss_coef"] == 0.5
+    assert kwargs["backend"] is backend
 
 
-def test_build_custom_transformer_without_mesh_or_backend(monkeypatch, toy_config_dir):
+def test_from_custom_model_without_mesh_or_backend(monkeypatch, toy_config_dir):
     from_config, _ = _patch_from_config(monkeypatch)
 
-    build_custom_transformer(toy_config_dir, mesh_context=None, torch_dtype=torch.bfloat16, load_base_model=False)
+    NeMoAutoDiffusionPipeline._from_custom_model(
+        toy_config_dir, mesh_context=None, torch_dtype=torch.bfloat16, load_base_model=False, load_for_training=False
+    )
 
-    (config,), kwargs = from_config.call_args
-    assert config.num_hidden_layers == 2
+    (path,), kwargs = from_config.call_args
+    assert path == toy_config_dir
     assert kwargs["distributed_setup"] is None
     assert kwargs["load_base_model"] is False
     assert kwargs["peft_config"] is None
     assert "backend" not in kwargs
+    assert "num_hidden_layers" not in kwargs
 
 
-def test_build_custom_transformer_passes_backend_config_through(monkeypatch, toy_config_dir):
+def test_from_custom_model_passes_backend_config_through(monkeypatch, toy_config_dir):
     from_config, _ = _patch_from_config(monkeypatch)
     backend = toy_backend()
 
-    build_custom_transformer(
-        toy_config_dir, mesh_context=None, torch_dtype=torch.float32, load_base_model=False, backend=backend
+    NeMoAutoDiffusionPipeline._from_custom_model(
+        toy_config_dir,
+        mesh_context=None,
+        torch_dtype=torch.float32,
+        load_base_model=False,
+        load_for_training=False,
+        backend=backend,
     )
 
     assert from_config.call_args.kwargs["backend"] is backend
@@ -313,10 +320,12 @@ def custom_repo(tmp_path):
 
 @pytest.fixture
 def patched_custom_build(monkeypatch):
-    """Replace the custom-model build and make any fallback to diffusers loading fail loudly."""
+    """Mock the custom-model build and make any fallback to diffusers loading fail loudly."""
+    from nemo_automodel._transformers import auto_model
+
     transformer = _FrozenTransformer()
     build = MagicMock(return_value=transformer)
-    monkeypatch.setattr(adp, "build_custom_transformer", build)
+    monkeypatch.setattr(auto_model.NeMoAutoModelForDiffusion, "from_config", build)
     monkeypatch.setattr(adp, "DIFFUSERS_AVAILABLE", True)
     diffusion_pipeline = SimpleNamespace(
         from_pretrained=MagicMock(side_effect=AssertionError("diffusers loading must not be used"))
@@ -329,7 +338,9 @@ def patched_custom_build(monkeypatch):
 
 
 def test_from_pretrained_dispatches_to_custom_transformer(custom_repo, patched_custom_build):
-    mesh_context = SimpleNamespace(cp_size=1)
+    mesh_context = SimpleNamespace(
+        cp_size=1, strategy_config=None, moe_parallel_config=None, activation_checkpointing=False
+    )
     backend = {"experts": "torch"}
     overrides = {"num_hidden_layers": 1}
 
@@ -345,15 +356,14 @@ def test_from_pretrained_dispatches_to_custom_transformer(custom_repo, patched_c
 
     assert isinstance(pipe, NeMoAutoDiffusionPipeline)
     assert pipe.transformer is patched_custom_build.transformer
-    patched_custom_build.build.assert_called_once_with(
-        os.path.join(custom_repo, "transformer"),
-        mesh_context=mesh_context,
-        torch_dtype=torch.float32,
-        load_base_model=True,
-        peft_cfg=None,
-        backend=backend,
-        config_overrides=overrides,
-    )
+    (path,), kwargs = patched_custom_build.build.call_args
+    assert path == os.path.join(custom_repo, "transformer")
+    assert kwargs["distributed_setup"].mesh_context is mesh_context
+    assert kwargs["torch_dtype"] == torch.float32
+    assert kwargs["load_base_model"] is True
+    assert kwargs["peft_config"] is None
+    assert kwargs["backend"] is backend
+    assert kwargs["num_hidden_layers"] == 1
     # Full finetuning: base weights are made trainable.
     assert all(param.requires_grad for param in pipe.transformer.parameters())
 
@@ -363,7 +373,7 @@ def test_from_pretrained_custom_keeps_base_weights_frozen_with_peft(custom_repo,
 
     pipe = NeMoAutoDiffusionPipeline.from_pretrained(custom_repo, load_for_training=True, peft_cfg=peft_cfg)
 
-    assert patched_custom_build.build.call_args.kwargs["peft_cfg"] is peft_cfg
+    assert patched_custom_build.build.call_args.kwargs["peft_config"] is peft_cfg
     assert not any(param.requires_grad for param in pipe.transformer.parameters())
 
 
@@ -415,7 +425,9 @@ def test_from_pretrained_unregistered_architecture_uses_diffusers(tmp_path, patc
 
 def test_from_config_dispatches_to_custom_transformer_with_random_init(tmp_path, patched_custom_build):
     root = _diffusers_repo(tmp_path, [CUSTOM_ARCH], subfolder="dit")
-    mesh_context = SimpleNamespace(cp_size=1)
+    mesh_context = SimpleNamespace(
+        cp_size=1, strategy_config=None, moe_parallel_config=None, activation_checkpointing=False
+    )
 
     pipe = NeMoAutoDiffusionPipeline.from_config(
         root,
@@ -428,15 +440,14 @@ def test_from_config_dispatches_to_custom_transformer_with_random_init(tmp_path,
     )
 
     assert isinstance(pipe, NeMoAutoDiffusionPipeline)
-    patched_custom_build.build.assert_called_once_with(
-        os.path.join(root, "dit"),
-        mesh_context=mesh_context,
-        torch_dtype=torch.float32,
-        load_base_model=False,
-        peft_cfg=None,
-        backend={"experts": "torch"},
-        config_overrides={"num_hidden_layers": 1},
-    )
+    (path,), kwargs = patched_custom_build.build.call_args
+    assert path == os.path.join(root, "dit")
+    assert kwargs["distributed_setup"].mesh_context is mesh_context
+    assert kwargs["torch_dtype"] == torch.float32
+    assert kwargs["load_base_model"] is False
+    assert kwargs["peft_config"] is None
+    assert kwargs["backend"] == {"experts": "torch"}
+    assert kwargs["num_hidden_layers"] == 1
     # Pretraining always trains every parameter.
     assert all(param.requires_grad for param in pipe.transformer.parameters())
 
