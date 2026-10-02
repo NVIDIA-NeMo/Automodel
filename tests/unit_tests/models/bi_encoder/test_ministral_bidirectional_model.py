@@ -1933,8 +1933,8 @@ def test_mistral3_corpus_image_caption_policy_reaches_processor(
 
 
 @pytest.mark.runtime_budget(
-    15,
-    reason="checks both export paths in one isolated Python subprocess",
+    20,
+    reason="isolated Transformers startup and two export round trips took 15.6s on CI; allow runner variance",
 )
 def test_mistral3_reranker_export_reloads_without_repository(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Both export paths include standalone code and preserve default CrossEncoder text/image scores."""
