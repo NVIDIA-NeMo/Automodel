@@ -14,12 +14,15 @@
 
 """Tests for nemo_automodel.components.optim.optimizer — typed configs + builders."""
 
+import math
 from unittest.mock import MagicMock
 
 import pytest
 import torch
 import torch.nn as nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import DTensor, Replicate, Shard
 
 from nemo_automodel.components.optim.optimizer import (
     AdamConfig,
@@ -294,8 +297,37 @@ class TestBuildOptimizerTuple:
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture
+def fake_world():
+    """Single-process fake 4-rank world for building DTensor meshes on CPU."""
+    import torch.distributed as dist
+    from torch.testing._internal.distributed.fake_pg import FakeStore
+
+    dist.init_process_group(backend="fake", rank=0, world_size=4, store=FakeStore())
+    yield
+    dist.destroy_process_group()
+
+
 def _dion_test_model():
     return nn.Sequential(nn.Embedding(8, 16), nn.Linear(16, 16, bias=False), nn.Linear(16, 8, bias=False))
+
+
+class _TransposedExperts(nn.Module):
+    """Grouped experts with ``[expert, in, out]`` storage: one tall and one wide matrix shape."""
+
+    _nemo_transposed_matrix_parameters = ("gate_and_up_projs", "down_projs")
+
+    def __init__(self):
+        super().__init__()
+        self.gate_and_up_projs = nn.Parameter(torch.randn(3, 8, 24))
+        self.down_projs = nn.Parameter(torch.randn(3, 12, 8))
+
+
+class _TransposedExpertsModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.proj = nn.Linear(8, 8, bias=False)
+        self.experts = _TransposedExperts()
 
 
 class TestDionFamilyConfigs:
@@ -355,17 +387,114 @@ class TestDionFamilyConfigs:
         assert type(opt).__name__ == "Muon"
         assert len(opt.param_groups) >= 2  # matrix group + scalar/embed group(s)
 
-    def test_muon_keeps_grouped_experts_on_the_scalar_optimizer(self):
-        # dion.Muon reads the last two dims as [out, in] for its spectral-norm LR scale, but grouped experts store
-        # [expert, in, out]; until Muon honors that layout, 3D expert weights stay on the scalar optimizer.
+    @pytest.mark.parametrize("adjust_lr", ["spectral_norm", "rms_norm"])
+    def test_muon_transposed_experts_match_independent_matrices(self, adjust_lr):
+        # Grouped experts store [expert, in, out]; Muon must update each expert like plain dion.Muon on its
+        # [out, in] transpose, including the shape-dependent LR scale and decoupled weight decay.
+        dion = pytest.importorskip("dion")
+        from nemo_automodel.components.optim.optimizer import MuonConfig
+
+        torch.manual_seed(3)
+        model = _TransposedExpertsModel()
+        lr, weight_decay = 0.02, 0.1
+        opt = MuonConfig(lr=lr, weight_decay=weight_decay, adjust_lr=adjust_lr).build(model)[0]
+        experts = (model.experts.gate_and_up_projs, model.experts.down_projs)
+        for param in experts:
+            (group,) = [g for g in opt.param_groups if any(p is param for p in g["params"])]
+            assert group["algorithm"] == "muon"
+            if adjust_lr == "spectral_norm":
+                fan_in, fan_out = param.shape[-2:]
+                assert len(group["params"]) == 1
+                assert group["adjust_lr"] is None
+                assert group["lr"] == pytest.approx(lr * math.sqrt(fan_out / fan_in))
+                assert group["lr"] * group["weight_decay"] == pytest.approx(lr * weight_decay)
+            else:
+                assert group["adjust_lr"] == adjust_lr
+
+        initial = [param.detach().clone() for param in experts]
+        references = [[nn.Parameter(matrix.detach().mT.clone()) for matrix in param] for param in experts]
+        reference_opt = dion.Muon(
+            [matrix for matrices in references for matrix in matrices],
+            lr=lr,
+            weight_decay=weight_decay,
+            adjust_lr=adjust_lr,
+            mu=0.95,
+            nesterov=False,
+            epsilon=1e-8,
+        )
+        with torch.compiler.set_stance("force_eager"):
+            for _ in range(3):
+                for param, matrices in zip(experts, references):
+                    param.grad = torch.randn_like(param)
+                    for matrix, grad in zip(matrices, param.grad):
+                        matrix.grad = grad.mT.clone()
+                opt.step()
+                reference_opt.step()
+        for param, before, matrices in zip(experts, initial, references):
+            assert not torch.allclose(param.detach(), before)
+            torch.testing.assert_close(param.detach(), torch.stack([m.detach().mT for m in matrices]))
+
+    def test_muon_expert_lr_scale_survives_scheduler(self):
+        pytest.importorskip("dion")
+        from types import SimpleNamespace
+
+        from nemo_automodel.components.optim.optimizer import MuonConfig
+
+        model = _TransposedExpertsModel()
+        opt = MuonConfig(lr=1e-3, weight_decay=0.1).build(model)[0]
+        schedule = LRSchedulerConfig(lr_warmup_steps=2, init_lr=0.0, min_lr=1e-4).build(
+            opt, SimpleNamespace(epoch_len=10, num_epochs=1, max_steps=10)
+        )[0]
+        for step in range(5):
+            if step:
+                schedule.step(1)
+            base_lr, base_wd = opt.param_groups[0]["lr"], opt.param_groups[0]["weight_decay"]
+            assert base_wd == pytest.approx(0.1)
+            for param in (model.experts.gate_and_up_projs, model.experts.down_projs):
+                (group,) = [g for g in opt.param_groups if any(p is param for p in g["params"])]
+                scale = math.sqrt(param.shape[-1] / param.shape[-2])
+                assert group["lr"] == pytest.approx(base_lr * scale)
+                assert group["weight_decay"] == pytest.approx(base_wd / scale)
+
+    @pytest.mark.parametrize(
+        ("placements", "raises"),
+        [((Replicate(), Shard(0)), False), ((Shard(1), Shard(0)), True)],
+        ids=["ep_equals_dp", "ep_below_dp"],
+    )
+    def test_muon_rejects_experts_sharded_off_its_mesh(self, fake_world, placements, raises):
+        # dion.Muon only gathers matrix shards over its DP mesh. Experts sharded only along the expert axis are
+        # updated locally; experts whose matrix axis is FSDP-sharded on ep_shard (1 < EP < DP) must fail at build.
         pytest.importorskip("dion")
         from nemo_automodel.components.optim.optimizer import MuonConfig
 
-        model = torch.nn.Module()
-        model.experts = torch.nn.Parameter(torch.randn(4, 8, 16))
-        opt = MuonConfig(lr=1e-3).build(model)[0]
+        dp_mesh = init_device_mesh("cpu", (4,), mesh_dim_names=("dp_shard",))
+        moe_mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("ep_shard", "ep"))
+        model = _TransposedExpertsModel()
+        for name in ("gate_and_up_projs", "down_projs"):
+            full = getattr(model.experts, name).detach()
+            local = full.tensor_split(2, 0)[0]
+            if placements[0].is_shard():
+                local = local.tensor_split(2, 1)[0]
+            dtensor = DTensor.from_local(
+                local, moe_mesh, placements, run_check=False, shape=full.shape, stride=full.stride()
+            )
+            setattr(model.experts, name, nn.Parameter(dtensor))
+        config = MuonConfig(lr=1e-3)
+        if raises:
+            with pytest.raises(ValueError, match=r"experts\.gate_and_up_projs.*ep_size equal to the data-parallel"):
+                config.build(model, device_mesh=dp_mesh)
+        else:
+            (opt,) = config.build(model, device_mesh=dp_mesh)
+            assert {g["algorithm"] for g in opt.param_groups if g.get("matrix_transposed")} == {"muon"}
 
-        (group,) = [g for g in opt.param_groups if any(p is model.experts for p in g["params"])]
+    def test_muon_flatten_keeps_grouped_experts_on_the_scalar_optimizer(self):
+        # flatten=True would merge the expert axis into one matrix, so 3D experts stay on the scalar optimizer.
+        pytest.importorskip("dion")
+        from nemo_automodel.components.optim.optimizer import MuonConfig
+
+        model = _TransposedExpertsModel()
+        opt = MuonConfig(lr=1e-3, flatten=True).build(model)[0]
+        (group,) = [g for g in opt.param_groups if any(p is model.experts.down_projs for p in g["params"])]
         assert group["algorithm"] == "adamw"
 
     @pytest.mark.parametrize("cls_name", ["Muon", "NorMuon", "Dion2", "Dion"])
