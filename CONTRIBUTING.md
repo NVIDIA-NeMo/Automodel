@@ -74,6 +74,10 @@ For developers building a custom docker container with Automodel, please refer t
 
 If [Nvidia PyTorch](https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/index.html) container is used as a base image, please review [Developing with Automodel container](#1-developing-with-automodel-container).
 
+The image includes a pinned [Mixture-of-Kittens](https://github.com/cursor/mixture-of-kittens)
+build for GB200 (SM100). Pass `--build-arg MOK_ARCH=SM103` when building for
+GB300. MoK recipes require Blackwell GPUs; H100 GPUs are unsupported.
+
 Command to build Automodel's Dockerfile:
 
 ```bash

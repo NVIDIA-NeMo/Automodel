@@ -218,6 +218,21 @@ RUN if [ "$INSTALL_UCCL_EP" = "True" ]; then \
 # Build torchao, FlashMLA, then FA3/FA4 sequentially and cap compiler parallelism to stay within CI memory limits.
 FROM automodel_dep AS wheel_builder
 
+# Mixture-of-Kittens is required by dispatcher='mok'. Build for GB200 (SM100)
+# by default; GB300 images can select SM103 with --build-arg MOK_ARCH=SM103.
+# Upstream supports Blackwell only, so these recipes cannot run on H100.
+ARG MOK_REF=f3a8bd2432457c5a2a2ea13915f0dcd0224581e4
+ARG MOK_ARCH=SM100
+RUN mkdir -p /wheels && \
+    git clone --filter=blob:none --no-checkout \
+        https://github.com/cursor/mixture-of-kittens.git /tmp/mixture-of-kittens && \
+    git -C /tmp/mixture-of-kittens checkout "${MOK_REF}" && \
+    git -C /tmp/mixture-of-kittens submodule update --init --recursive && \
+    CPLUS_INCLUDE_PATH=/usr/local/cuda/include/cccl \
+        LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LIBRARY_PATH} MOK_ARCH=${MOK_ARCH} \
+        pip wheel --no-cache-dir --no-build-isolation --no-deps -w /wheels /tmp/mixture-of-kittens && \
+    rm -rf /tmp/mixture-of-kittens
+
 # torchao MXFP8: build w/ submodules (PyPI wheels omit mxfp8 CUDA kernels on aarch64); pin v0.17.0 (v0.14.1 ~2.5x slower; main needs nvidia-cutlass-dsl).
 ARG TORCHAO_REF=v0.17.0
 RUN mkdir -p /wheels && \
@@ -269,7 +284,7 @@ FROM automodel_dep AS automodel_final
 
 WORKDIR /opt/Automodel
 
-# torchao MXFP8 + FlashMLA + FA3/FA4: prebuilt wheels from the wheel_builder stage, installed into system site-packages
+# MoK + torchao MXFP8 + FlashMLA + FA3/FA4: prebuilt wheels from the wheel_builder stage, installed into system site-packages
 # before uv sync — pip targets system deps, uv the venv (torchao/FA gated `never`, FlashMLA absent from the lock),
 # so uv sync won't prune or shadow them.
 COPY --from=wheel_builder /wheels /tmp/wheels/
@@ -352,8 +367,13 @@ RUN if [ "$BASE_IMAGE" = "pytorch" ]; then \
 
 # Fail the image build before publication if PyTorch headers cannot compile as
 # C++20, torch._grouped_mm is unavailable, or a bundled native extension has
-# unresolved PyTorch/CUDA symbols.
-RUN MAX_JOBS=2 python docker/common/verify_native_runtime.py
+# unresolved PyTorch/CUDA symbols. MoK links libcuda directly; use the toolkit's
+# stub only for this import check on builders without an NVIDIA driver.
+RUN mkdir -p /tmp/cuda-driver-stubs && \
+    ln -s /usr/local/cuda/lib64/stubs/libcuda.so /tmp/cuda-driver-stubs/libcuda.so.1 && \
+    LD_LIBRARY_PATH=/tmp/cuda-driver-stubs:${LD_LIBRARY_PATH} \
+        MAX_JOBS=2 python docker/common/verify_native_runtime.py && \
+    rm -rf /tmp/cuda-driver-stubs
 
 WORKDIR /opt/Automodel
 
