@@ -472,7 +472,15 @@ class _DionConfigBase(OptimizerConfig):
 
 @dataclass
 class MuonConfig(_DionConfigBase):
-    """``dion.Muon`` — matrix-aware update for 2D+ params, scalar fallback for 1D."""
+    """``dion.Muon`` — matrix-aware update for 2D+ params, scalar fallback for 1D.
+
+    Grouped MoE experts are trained as batches of matrices. Their ``[expert, in, out]``
+    storage is orthogonalized as is (Newton–Schulz is transpose-equivariant), but
+    dion.Muon's spectral-norm LR scale reads the last two dims as ``[out, in]``, so
+    :meth:`_make_optimizer` folds the correct per-shape scale into those groups.
+    """
+
+    use_matrix_layout: ClassVar[bool] = True
 
     mu: float = 0.95
     betas: tuple[float, float] = (0.9, 0.95)
@@ -482,10 +490,56 @@ class MuonConfig(_DionConfigBase):
     flatten: bool = False
     use_triton: bool = False
 
+    @property
+    def supports_batched_matrices(self) -> bool:
+        """Route 3D+ weights to Muon unless ``flatten`` would merge their batch axis into each matrix."""
+        return not self.flatten
+
     def _make_optimizer(self, param_groups, ctor_kwargs):
         from dion import Muon
 
+        if self.adjust_lr == "spectral_norm":
+            param_groups = [split for group in param_groups for split in self._spectral_norm_groups(group)]
         return Muon(param_groups, **ctor_kwargs)
+
+    def _spectral_norm_groups(self, group: dict[str, Any]) -> list[dict[str, Any]]:
+        """Split a transposed ``[..., in, out]`` matrix group by shape and fold the spectral-norm scale into its LR.
+
+        dion.Muon would scale by ``sqrt(shape[-2] / shape[-1])``, the inverse of the correct ``sqrt(out / in)`` for
+        this layout. Each shape gets ``adjust_lr=None`` with ``lr`` (and any ``lr_mult``) multiplied by the correct
+        scale; ``weight_decay`` (and any ``wd_mult``) is divided by it because Muon decays with ``lr * weight_decay``.
+
+        Args:
+            group: Dion param group. When ``matrix_transposed`` is set, ``params`` are tensors of shape
+                ``[..., in, out]`` with arbitrary leading batch (expert) dimensions; DTensor shapes are global.
+
+        Returns:
+            ``[group]`` unchanged when it is not a transposed matrix group, otherwise one group per distinct
+            ``(in, out)`` with the same parameter objects (no copies).
+        """
+        if not group.get("matrix_transposed"):
+            return [group]
+        by_shape: dict[tuple[int, int], list[torch.Tensor]] = {}
+        for param in group["params"]:
+            by_shape.setdefault(tuple(param.shape[-2:]), []).append(param)
+        lr = group.get("lr", self.lr)
+        weight_decay = group.get("weight_decay", self.weight_decay)
+        splits = []
+        for (fan_in, fan_out), params in by_shape.items():
+            scale = math.sqrt(fan_out / fan_in)
+            split = {
+                **group,
+                "params": params,
+                "adjust_lr": None,
+                "lr": lr * scale,
+                "weight_decay": weight_decay / scale,
+            }
+            if "lr_mult" in group:
+                split["lr_mult"] = group["lr_mult"] * scale
+            if "wd_mult" in group:
+                split["wd_mult"] = group["wd_mult"] / scale
+            splits.append(split)
+        return splits
 
 
 @dataclass
