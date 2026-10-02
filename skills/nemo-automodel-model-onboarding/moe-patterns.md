@@ -230,13 +230,15 @@ class NewMoEModel(nn.Module):
 
 ### Gate bias update
 
-MoE models with trainable gate bias need a `update_moe_gate_bias()` method:
+MoE models with adaptive router correction-bias buffers need an
+`update_moe_gate_bias()` method. The update must honor a zero
+`gate_bias_update_factor`, including when PEFT freezes bias adaptation:
 
 ```python
 def update_moe_gate_bias(self) -> None:
     with torch.no_grad():
         for _, block in self.layers.named_children():
-            if isinstance(block.mlp, MoE):
+            if isinstance(block.mlp, MoE) and block.mlp.gate.bias_update_factor > 0:
                 block.mlp.gate.update_bias()
 ```
 
@@ -297,7 +299,7 @@ class NewMoEForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     def update_moe_gate_bias(self) -> None:
         with torch.no_grad():
             for _, block in self.model.layers.named_children():
-                if isinstance(block.mlp, MoE):
+                if isinstance(block.mlp, MoE) and block.mlp.gate.bias_update_factor > 0:
                     block.mlp.gate.update_bias()
 
     @torch.no_grad()
@@ -403,6 +405,40 @@ from nemo_automodel.components.moe.experts import GroupedExperts
 ```
 
 LoRA on MoE typically targets the gate/up/down projections within experts, as well as attention projections (q, k, v, o).
+
+### Router correction biases with adapter-only checkpoints
+
+Some routers update a correction-bias buffer outside the optimizer to balance
+expert use. LoRA's frozen parameters do not prevent these updates, and the
+adapter-only save path omits this buffer. Reloading the original base model plus
+the adapter would then discard the updated routing state.
+
+For PEFT recipes using the shared `Gate` with a pretrained
+`e_score_correction_bias` (for example, DeepSeek V3/V3.2 and GLM MoE DSA), use:
+
+```yaml
+model:
+  moe_overrides:
+    gate_bias_update_factor: 0.0
+    force_e_score_correction_bias: true
+```
+
+The first setting disables adaptation; the second retains the buffer so the
+pretrained values still load and influence routing. Do not remove or zero that
+buffer to freeze it. Do not add a correction bias to architectures whose base
+checkpoint has none; audit their model-specific routing state instead. This is
+an explicit PEFT recipe policy, not a change to full-training defaults.
+
+Before advertising PEFT support, use real routing and nonzero pretrained bias
+values to verify that adapters change while the bias stays fixed. Exercise both
+backbone and outer-model update hooks, save/reload through the actual adapter
+checkpointer, and compare resumed losses, model buffers, and optimizer state
+against uninterrupted training. Fake balanced routing can hide this failure.
+
+If a recipe intentionally adapts router biases, first implement and validate
+their persistence for native reload/resume and the intended export consumer.
+Adapter-only checkpoints do not currently provide that contract; see
+[issue #4075](https://github.com/NVIDIA-NeMo/Automodel/issues/4075).
 
 ---
 
