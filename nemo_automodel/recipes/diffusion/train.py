@@ -18,7 +18,7 @@ import logging
 import os
 import time
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, Any, Dict, Mapping
+from typing import TYPE_CHECKING, Any, Dict
 
 import torch
 import torch.distributed as dist
@@ -330,8 +330,8 @@ def build_diffusion_pipeline(
     peft_cfg=None,
     model_type=None,
     active_transformer: str | None = None,
-    backend: "BackendConfig | Mapping[str, Any] | None" = None,
-    config_overrides: Dict[str, Any] | None = None,
+    backend: "BackendConfig | dict[str, Any] | None" = None,
+    config_overrides: dict[str, Any] | None = None,
 ) -> tuple[NeMoAutoDiffusionPipeline, MeshContext]:
     """Build the sharded diffusion pipeline (model + parallel scheme).
 
