@@ -820,7 +820,7 @@ class TestProCheckpointQKV:
 
     @pytest.mark.parametrize(
         ("metadata", "configured", "expected"),
-        [({"save_format": "mxfp4"}, 8, 8), ({"save_format": "mxfp4"}, None, 4), ({"tp_size": 8}, 8, 8)],
+        [({"save_format": "mxfp4"}, 8, 8), ({"tp_size": 8}, 8, 8)],
     )
     def test_missing_index_tp_size_falls_back_to_config(
         self, tmp_path, moe_config, backend_config, metadata, configured, expected
@@ -830,6 +830,12 @@ class TestProCheckpointQKV:
         )
         adapter = MiMoV2FlashStateDictAdapter(config, moe_config, backend_config, dtype=torch.float32)
         assert adapter.checkpoint_tp_size == expected
+
+    def test_unknown_tp_size_raises_instead_of_guessing(self, tmp_path, moe_config, backend_config):
+        config = _pro_full_attention_config(name_or_path=_write_index(tmp_path, {"save_format": "mxfp4"}))
+        adapter = MiMoV2FlashStateDictAdapter(config, moe_config, backend_config, dtype=torch.float32)
+        with pytest.raises(ValueError, match="Cannot determine the fused-QKV checkpoint TP degree"):
+            adapter.checkpoint_tp_size
 
     def test_config_and_index_tp_size_disagreement_raises(self, tmp_path, moe_config, backend_config):
         config = _pro_full_attention_config(name_or_path=_write_index(tmp_path, {"tp_size": 8}), checkpoint_tp_size=4)
@@ -843,10 +849,10 @@ class TestProCheckpointQKV:
 
     def test_wrong_tp_size_shape_error_names_tp_source(self, moe_config, backend_config):
         adapter = MiMoV2FlashStateDictAdapter(
-            _pro_full_attention_config(), moe_config, backend_config, dtype=torch.float32
+            _pro_full_attention_config(checkpoint_tp_size=4), moe_config, backend_config, dtype=torch.float32
         )
         key = "model.layers.0.self_attn.qkv_proj.weight"
-        # TP8-interleaved rows/scales loaded with the TP4 fallback.
+        # TP8-interleaved rows/scales loaded with an explicit, wrong TP4 setting.
         with pytest.raises(ValueError, match=r"weight_scale_inv has shape \(216, 1\).*checkpoint_tp_size=4"):
             adapter.from_hf(
                 {key: torch.zeros(27136, 128, dtype=torch.float8_e4m3fn), f"{key}_scale_inv": torch.ones(216, 1)}

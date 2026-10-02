@@ -60,8 +60,6 @@ model:
     use_cache: false
     output_hidden_states: true
     num_nextn_predict_layers: 0
-    # Fused QKV storage layout (independent of runtime TP); must match the index metadata.tp_size.
-    checkpoint_tp_size: 8
   trust_remote_code: false
   load_base_model: true
   torch_dtype: bfloat16

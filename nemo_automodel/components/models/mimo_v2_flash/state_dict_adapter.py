@@ -39,7 +39,6 @@ _MXFP4_BLOCK_SIZE = 32
 _SAFETENSORS_INDEX = "model.safetensors.index.json"
 # MiMo-V2.5/V2.6-Flash fused-QKV storage degree, used when neither the
 # checkpoint index nor the config records one.
-_DEFAULT_CHECKPOINT_TP_SIZE = 4
 _FUSED_QKV_WEIGHT = re.compile(r"^(.*\.layers\.(\d+)\.self_attn)\.qkv_proj\.weight$")
 _SPLIT_Q_WEIGHT = re.compile(r"^(.*\.layers\.(\d+)\.self_attn)\.q_proj\.weight$")
 _E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
@@ -148,11 +147,11 @@ def _resolve_checkpoint_tp_size(config: Any) -> int:
             explicit override and ``_name_or_path`` locates the checkpoint index.
 
     Returns:
-        The index ``metadata.tp_size`` when present, else ``config.checkpoint_tp_size``,
-        else the MiMo-V2.6-Flash default of 4.
+        The index ``metadata.tp_size`` when present, else an explicit ``config.checkpoint_tp_size``.
 
     Raises:
-        ValueError: If the config and the checkpoint index disagree.
+        ValueError: If the config and the checkpoint index disagree, or if neither provides the TP degree: a guessed
+            value would silently permute Q/K/V rows for checkpoints whose fused shapes match several TP degrees.
     """
     configured = getattr(config, "checkpoint_tp_size", None)
     model_path = getattr(config, "_name_or_path", None) or getattr(config, "name_or_path", None)
@@ -164,7 +163,12 @@ def _resolve_checkpoint_tp_size(config: Any) -> int:
         )
     if recorded is not None:
         return recorded
-    return configured if configured is not None else _DEFAULT_CHECKPOINT_TP_SIZE
+    if configured is None:
+        raise ValueError(
+            f"Cannot determine the fused-QKV checkpoint TP degree: no metadata.tp_size found in {_SAFETENSORS_INDEX} "
+            f"for {model_path!r}. Set config.checkpoint_tp_size to the TP degree the checkpoint was saved with."
+        )
+    return configured
 
 
 def _fused_qkv_sizes(config: Any, layer_idx: int, checkpoint_tp_size: int) -> tuple[int, int, int]:
@@ -223,7 +227,7 @@ def _split_fused_qkv(
     expected_rows = checkpoint_tp_size * rows_per_shard
     hidden_size = int(config.hidden_size)
     tp_hint = (
-        f"checkpoint_tp_size={checkpoint_tp_size} (from {_SAFETENSORS_INDEX} metadata.tp_size, else "
+        f"checkpoint_tp_size={checkpoint_tp_size} (from {_SAFETENSORS_INDEX} metadata.tp_size or "
         "config.checkpoint_tp_size); a wrong value changes this shape"
     )
     if weight.ndim != 2 or tuple(weight.shape) != (expected_rows, hidden_size):
