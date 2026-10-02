@@ -221,11 +221,10 @@ peft:
 
 Including a `peft:` section enables LoRA fine-tuning. Remove it entirely to run SFT instead. See [Switch Between SFT and PEFT](#switch-between-sft-and-peft).
 
-For MoE models with adaptive router correction-bias buffers, also disable bias
-updates while preserving the pretrained buffer. LoRA freezes parameters but
-does not stop these buffer updates, which adapter-only checkpoints omit. See
+For MoE models with adaptive router correction biases, freeze updates while
+preserving the pretrained values before using adapter-only checkpoints. See
 [Router Correction Biases in MoE Models](/development/checkpointing#router-correction-biases-in-moe-models)
-for the recipe settings and save/reload requirements.
+for the recipe settings.
 
 #### QLoRA for Quantized Low-Rank Adaptation
 

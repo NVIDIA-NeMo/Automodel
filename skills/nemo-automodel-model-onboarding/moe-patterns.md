@@ -408,13 +408,8 @@ LoRA on MoE typically targets the gate/up/down projections within experts, as we
 
 ### Router correction biases with adapter-only checkpoints
 
-Some routers update a correction-bias buffer outside the optimizer to balance
-expert use. LoRA's frozen parameters do not prevent these updates, and the
-adapter-only save path omits this buffer. Reloading the original base model plus
-the adapter would then discard the updated routing state.
-
-For PEFT recipes using the shared `Gate` with a pretrained
-`e_score_correction_bias` (for example, DeepSeek V3/V3.2 and GLM MoE DSA), use:
+Adapter-only checkpoints require fixed router correction biases. For PEFT
+recipes using the shared `Gate` with a pretrained `e_score_correction_bias`, use:
 
 ```yaml
 model:
@@ -423,22 +418,18 @@ model:
     force_e_score_correction_bias: true
 ```
 
-The first setting disables adaptation; the second retains the buffer so the
-pretrained values still load and influence routing. Do not remove or zero that
-buffer to freeze it. Do not add a correction bias to architectures whose base
-checkpoint has none; audit their model-specific routing state instead. This is
-an explicit PEFT recipe policy, not a change to full-training defaults.
+Preserve pretrained bias values; do not add a correction bias to architectures
+whose base checkpoint has none. Keep full-training defaults unchanged. See the
+[checkpointing guide](../../docs/guides/checkpointing.mdx#router-correction-biases-in-moe-models)
+for the rationale and limitations.
 
-Before advertising PEFT support, use real routing and nonzero pretrained bias
-values to verify that adapters change while the bias stays fixed. Exercise both
-backbone and outer-model update hooks, save/reload through the actual adapter
-checkpointer, and compare resumed losses, model buffers, and optimizer state
-against uninterrupted training. Fake balanced routing can hide this failure.
+Before advertising MoE PEFT support, verify:
 
-If a recipe intentionally adapts router biases, first implement and validate
-their persistence for native reload/resume and the intended export consumer.
-Adapter-only checkpoints do not currently provide that contract; see
-[issue #4075](https://github.com/NVIDIA-NeMo/Automodel/issues/4075).
+- Both backbone and outer-model update hooks honor disabled adaptation.
+- With real routing and nonzero pretrained biases, adapters change while the
+  biases stay fixed; fake balanced routing can hide this failure.
+- Actual adapter checkpoint save/reload/resume matches uninterrupted losses,
+  model parameters and buffers, and optimizer state.
 
 ---
 

@@ -236,15 +236,10 @@ PEFT checkpoints save adapter files directly under `model/` and do not generate 
 
 ### Router Correction Biases in MoE Models
 
-For Mixture-of-Experts (MoE) models, the router selects which experts process
-each token. Some routers use a correction-bias buffer that updates during
-training to balance expert use. Freezing model parameters with LoRA or
-`requires_grad=False` does not stop this separate buffer-update mechanism.
-
-Disable these updates when using adapter-only checkpoints. Otherwise, reloading
-the original base model plus the saved adapter loses the changed routing state
-and can produce different outputs or resumed training. Enabling checkpointing
-alone does not include the buffer in the adapter files.
+Some Mixture-of-Experts (MoE) routers update a correction-bias buffer during
+training to balance which experts process tokens. LoRA freezes parameters but
+does not stop these buffer updates. Adapter-only checkpoints omit the buffer,
+so reloading can change expert selection and resumed training.
 
 For models using the shared gate with a pretrained `e_score_correction_bias`,
 such as DeepSeek V3/V3.2 and GLM MoE DSA (including GLM-5.1), add these settings
@@ -257,15 +252,13 @@ model:
     force_e_score_correction_bias: true
 ```
 
-This freezes adaptation while preserving the pretrained bias and its effect on
-expert selection. Do not remove or zero the pretrained buffer. These settings
-are specific to models using this correction-bias mechanism; a router having a
-bias parameter alone does not imply it needs them.
+The zero update factor freezes adaptation; `force_e_score_correction_bias`
+retains the pretrained buffer and its effect on routing. Do not remove or zero
+the buffer. These settings apply to this correction-bias mechanism, not ordinary
+router bias parameters.
 
-For a new model or custom recipe, verify with real routing that the bias stays
-fixed during training and that adapter reload/resume reproduces the trained
-state. Intentional router-bias adaptation requires additional save/restore and
-export support, tracked in [issue #4075](https://github.com/NVIDIA-NeMo/Automodel/issues/4075).
+Intentional router-bias adaptation requires additional save/restore and export
+support, tracked in [issue #4075](https://github.com/NVIDIA-NeMo/Automodel/issues/4075).
 
 ### Benefits of Consolidated Adapter Checkpoints
 

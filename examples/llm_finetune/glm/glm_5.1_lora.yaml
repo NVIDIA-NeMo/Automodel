@@ -116,8 +116,6 @@ ci:
   nodes: 16
   time: "00:35:00"
   env_vars:
-    # Native adapter/optimizer restart coverage; HF consumer coverage is tracked in #3867.
-    CHECKPOINT_ROBUSTNESS_PHASES: train_and_save automodel_reload resume
     REQUIRE_FINITE_METRICS: 'true'
   release:
     step_scheduler.max_steps: 2
@@ -125,6 +123,9 @@ ci:
     step_scheduler.val_every_steps: 1000
     dataset.num_samples_limit: 4096
   checkpoint_robustness:
+    # Native adapter/optimizer restart coverage; HF consumer coverage is tracked in #3867.
+    skip_source_load_parity: true
+    skip_hf_reload: true
     tokenizer_name: zai-org/GLM-5.1
     step_scheduler.max_steps: 2
     step_scheduler.ckpt_every_steps: 2
