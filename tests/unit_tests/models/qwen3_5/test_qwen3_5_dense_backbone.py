@@ -260,6 +260,21 @@ class TestDenseTextBackbone:
         assert metadata.cu_seqlens_cpu.tolist() == [0, 2, 4]
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_packed_metadata_accepts_host_ids_for_cuda_decoder(self):
+        packed_seq_ids = torch.tensor([[1, 1, 2, 2, 0]], dtype=torch.long)
+
+        metadata = qwen3_5_packing.prepare_gated_delta_packed_metadata(
+            None, packed_seq_ids, compute_device=torch.device("cuda")
+        )
+
+        assert metadata is not None
+        assert metadata.document_ids.is_cuda
+        assert metadata.indices.is_cuda
+        assert metadata.cu_seqlens.is_cuda
+        torch.testing.assert_close(metadata.document_ids.cpu(), packed_seq_ids)
+        assert metadata.cu_seqlens_cpu.tolist() == [0, 2, 4]
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_packed_metadata_uses_pinned_h2d_transfer(self, monkeypatch):
         packed_seq_ids = torch.tensor([[1, 1, 2, 2, 0]], dtype=torch.long, device="cuda")
         pinned_buffers = []

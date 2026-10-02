@@ -47,6 +47,7 @@ class GatedDeltaPackedMetadata:
 def prepare_gated_delta_packed_metadata(
     attention_mask: torch.Tensor | None,
     packed_seq_ids: torch.Tensor | None,
+    compute_device: torch.device | None = None,
 ) -> GatedDeltaPackedMetadata | None:
     """Build shared GatedDeltaNet metadata once for a model forward.
 
@@ -55,6 +56,8 @@ def prepare_gated_delta_packed_metadata(
             sequence] or a backend-specific attention mask.
         packed_seq_ids: Optional indexed document IDs of shape [batch,
             sequence] supplied beside a backend-specific attention mask.
+        compute_device: Device used by the decoder. Host document IDs are
+            transferred there after their dynamic metadata is prepared.
 
     Returns:
         Device and CPU packed-sequence metadata whose tensor layouts are
@@ -88,6 +91,10 @@ def prepare_gated_delta_packed_metadata(
     cu_seqlens_cpu = cu_seqlens_cpu.to(torch.long)
     num_indices = indices_cpu.numel()
     device_metadata_cpu = torch.cat((indices_cpu, cu_seqlens_cpu))
+    if compute_device is not None and document_ids.device != compute_device:
+        if document_ids.device.type == "cpu" and compute_device.type == "cuda":
+            document_ids = document_ids.pin_memory()
+        document_ids = document_ids.to(device=compute_device, non_blocking=True)
     if document_ids.is_cuda:
         # Pin the coalesced buffer to avoid an additional synchronization when
         # transferring this metadata back to the compute device.

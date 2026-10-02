@@ -397,6 +397,7 @@ class Qwen3_5DenseBlock(Block):
             packed_gdn_metadata = prepare_gated_delta_packed_metadata(
                 attention_mask,
                 attn_kwargs.get("_packed_seq_ids"),
+                compute_device=x.device,
             )
 
         if packed_gdn_metadata is not None:
@@ -538,6 +539,7 @@ class Qwen3_5DenseTextBackbone(nn.Module):
             packed_gdn_metadata = prepare_gated_delta_packed_metadata(
                 attention_mask,
                 attn_kwargs.get("_packed_seq_ids"),
+                compute_device=inputs_embeds.device,
             )
 
         for decoder_layer in self.layers.values():
@@ -1035,7 +1037,9 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
     _pp_keep_self_forward: bool = True
     # Vision grids are host-readable shape metadata. The vision encoder moves
     # derived position and interpolation tensors to the patch device as needed.
-    host_batch_keys: frozenset[str] = frozenset({"image_grid_thw", "video_grid_thw", "image_grid_hws"})
+    host_batch_keys: frozenset[str] = frozenset(
+        {"image_grid_thw", "video_grid_thw", "image_grid_hws", "_packed_seq_ids", "_vlm_token_presence"}
+    )
     # CP submesh, installed by the parallelizer's apply_cp when context parallelism
     # is active; None means the forward embeds and shards nothing for CP.
     cp_mesh = None
@@ -1141,6 +1145,22 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         if getattr(self.config, "tie_word_embeddings", False):
             self.lm_head.weight = self.model.language_model.embed_tokens.weight
 
+    def prepare_host_batch_metadata(self, batch: dict[str, Any]) -> dict[str, tuple[bool, bool, bool]]:
+        """Read media-token presence before the recipe moves input IDs to CUDA."""
+        input_ids = batch.get("input_ids")
+        if (
+            not isinstance(input_ids, torch.Tensor)
+            or input_ids.device.type != "cpu"
+            or torch.is_floating_point(input_ids)
+        ):
+            return {}
+        token_ids = (self.config.image_token_id, self.config.video_token_id, self.config.vision_start_token_id)
+        return {
+            "_vlm_token_presence": tuple(
+                bool((input_ids == token_id).any()) if token_id is not None else False for token_id in token_ids
+            )
+        }
+
     def _pop_staged_vlm_media(
         self,
         input_ids: torch.Tensor | None,
@@ -1167,7 +1187,8 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         video_token_id = self.config.video_token_id
         vision_start_token_id = self.config.vision_start_token_id
         has_image_tokens = has_video_tokens = has_vision_start_tokens = False
-        if input_ids is not None:
+        token_presence = kwargs.pop("_vlm_token_presence", None)
+        if input_ids is not None and token_presence is None:
             # The staged-media decision needs host booleans. Transfer the three
             # results together so it has one CUDA synchronization per forward.
             token_presence = torch.stack(
@@ -1176,6 +1197,7 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
                     for token_id in (image_token_id, video_token_id, vision_start_token_id)
                 ]
             ).tolist()
+        if input_ids is not None:
             has_image_tokens, has_video_tokens, has_vision_start_tokens = token_presence
         has_media_tokens = input_ids is not None and (has_image_tokens or has_video_tokens or has_vision_start_tokens)
         if input_ids is not None:

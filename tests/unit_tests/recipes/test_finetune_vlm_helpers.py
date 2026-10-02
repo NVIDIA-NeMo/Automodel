@@ -2353,6 +2353,38 @@ class TestForwardBackwardStepNonPP:
                 is_train=False,
             )
 
+    @pytest.mark.parametrize("cp_size, expected_move", [(1, False), (2, True)])
+    def test_packed_document_ids_stay_host_only_without_cp(self, monkeypatch, cp_size, expected_move):
+        model = _CPPreEmbedModel()
+        model.host_batch_keys = frozenset({"_packed_seq_ids"})
+        model.prepare_host_batch_metadata = lambda batch: {"_vlm_token_presence": (True, False, False)}
+        recipe = _create_non_pp_recipe(model)
+        recipe.__dict__["device_mesh"] = _DummyCPDeviceMesh(cp_size=cp_size)
+        packed_ids = torch.tensor([[1, 1, 2, 2]])
+        moved = []
+
+        def record_move(value, device):
+            moved.append(value)
+            return value
+
+        def check_batch(sharder, batch):
+            assert batch["_packed_seq_ids"] is packed_ids
+            assert any(value is packed_ids for value in moved) is expected_move
+            assert ("_vlm_token_presence" in batch) is (not expected_move)
+            raise _CPPreEmbedStop
+
+        monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune._move_to_device", record_move)
+        monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.ContextParallelSharder.shard", check_batch)
+        with pytest.raises(_CPPreEmbedStop):
+            recipe._forward_backward_step(
+                idx=0,
+                batch={"input_ids": torch.ones(1, 4, dtype=torch.long), "_packed_seq_ids": packed_ids},
+                loss_buffer=[],
+                num_label_tokens=4,
+                num_batches=1,
+                is_train=False,
+            )
+
     def test_non_pp_cp_invokes_sharder_only_hook_and_keeps_inputs(self, monkeypatch):
         # Sunk contract: the non-PP CP path invokes the sharder-only hook, which
         # consumes nothing, so input_ids / pixel_values / mm_token_type_ids all

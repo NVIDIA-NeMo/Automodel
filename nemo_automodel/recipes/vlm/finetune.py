@@ -853,9 +853,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
         num_batches,
         is_train: bool = True,
     ):
-        host_batch_keys = getattr(self.model_parts[0], "host_batch_keys", ())
-        batch = {k: v if k in host_batch_keys else _move_to_device(v, self.dist_env.device) for k, v in batch.items()}
-
         # Single CP dispatch (magi / model-owned / generic). The pre-embed hook is
         # a plain method call (prepare_model_inputs_for_cp): sharder-only, it
         # touches no weights and consumes nothing. Invoke it on EVERY pp stage so
@@ -870,6 +867,17 @@ class FinetuneRecipeForVLM(BaseRecipe):
             and "cp" in getattr(self.device_mesh, "mesh_dim_names", ())
             and self.device_mesh["cp"].size() > 1
         )
+        if not _cp_active and not self.pp_enabled:
+            prepare_host_metadata = getattr(self.model_parts[0], "prepare_host_batch_metadata", None)
+            if prepare_host_metadata is not None:
+                batch = {**batch, **prepare_host_metadata(batch)}
+        host_batch_keys = frozenset(getattr(self.model_parts[0], "host_batch_keys", ()))
+        # CP and PP transport the packed document map as model input; keep it
+        # device-resident there. Plain DP can derive its dynamic metadata from
+        # the collator's CPU map without copying it back from the GPU.
+        if _cp_active or self.pp_enabled:
+            host_batch_keys = host_batch_keys - {"_packed_seq_ids"}
+        batch = {k: v if k in host_batch_keys else _move_to_device(v, self.dist_env.device) for k, v in batch.items()}
         if _cp_active and not _is_first_or_no_pp and hasattr(self.model_parts[0], "prepare_model_inputs_for_cp"):
             # Non-first PP stages don't embed; drop raw multimodal inputs so their
             # forwards see only text.
@@ -1077,22 +1085,21 @@ class FinetuneRecipeForVLM(BaseRecipe):
             max_grad_norm: Gradient clipping norm. Optional, if None will not clip gradients.
         """
         ignore_index = _get_loss_ignore_index(getattr(self, "loss_fn", None))
-        num_label_tokens = torch.tensor(
-            sum(_count_label_tokens(batch["labels"], ignore_index) for batch in batches), dtype=torch.long
+        # Both counts are needed as Python integers. Reduce and read them in one
+        # transfer so the second count does not introduce another device sync.
+        token_counts = torch.tensor(
+            [
+                sum(_count_label_tokens(batch["labels"], ignore_index) for batch in batches),
+                sum(batch["labels"].numel() - count_tail_padding(batch["labels"]) for batch in batches),
+            ],
+            dtype=torch.long,
         )
-        num_label_tokens = self._dp_allreduce(num_label_tokens).item()
+        num_label_tokens, num_tokens_in_batch = self._dp_allreduce(token_counts).tolist()
 
         num_batches = len(batches)
         self._set_moe_aux_loss_backward_scale(num_batches=num_batches, num_label_tokens=num_label_tokens)
 
         loss_buffer = []
-
-        # number of tokens in the batch, excluding any tail padding.
-        num_tokens_in_batch = torch.tensor(
-            sum(batch["labels"].numel() - count_tail_padding(batch["labels"]) for batch in batches),
-            dtype=torch.long,
-        )
-        num_tokens_in_batch = self._dp_allreduce(num_tokens_in_batch).item()
 
         prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
 
