@@ -25,23 +25,7 @@ if [[ -z "${NEMO_HYBRIDEP_JIT_CACHE:-}" ]]; then
     export NEMO_HYBRIDEP_JIT_CACHE="$hybridep_jit_cache"
 fi
 
-for compact in 0 1; do
-    for fusion in 0 1; do
-        args=()
-        if [[ "$compact" == 1 ]]; then
-            args+=(--compact-routing)
-        fi
-        if [[ "$fusion" == 1 ]]; then
-            args+=(--permute-fusion)
-        fi
-        if [[ "$compact" == 1 && "$fusion" == 1 ]]; then
-            args+=(--activation-checkpointing)
-        fi
-        variant_start=$SECONDS
-        TRANSFORMERS_OFFLINE=1 python3 \
-            -m torch.distributed.run --standalone --nproc_per_node=2 --nnodes=1 \
-            -m coverage run \
-            tests/functional_tests/moe/run_hybridep_unequal_tokens.py "${args[@]}"
-        echo "HybridEP parity: compact=$compact fusion=$fusion elapsed=$((SECONDS - variant_start))s"
-    done
-done
+TRANSFORMERS_OFFLINE=1 python3 \
+    -m torch.distributed.run --standalone --nproc_per_node=2 --nnodes=1 \
+    -m coverage run \
+    tests/functional_tests/moe/run_hybridep_unequal_tokens.py --all-variants

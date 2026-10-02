@@ -577,6 +577,7 @@ jobs:
         with:
           test-folder: ${{ matrix.test-folder }}
           timeout: ${{ matrix.timeout }}
+          full-moe-matrix: ${{ github.event_name == 'schedule' || needs.pre-flight.outputs.is_ci_workload == 'true' }}
           is_unit_test: "false"
           PAT: ${{ steps.app-token.outputs.token }}
           test-data-path: ${{ matrix.test-data-path }}
@@ -656,6 +657,7 @@ jobs:
         with:
           test-folder: ${{ matrix.test-folder }}
           timeout: ${{ matrix.timeout }}
+          full-moe-matrix: ${{ github.event_name == 'schedule' || needs.pre-flight.outputs.is_ci_workload == 'true' }}
           is-optional: ${{ matrix.is-optional || 'false' }}
           is_unit_test: "false"
           PAT: ${{ steps.app-token.outputs.token }}

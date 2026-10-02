@@ -29,24 +29,28 @@ Repeat with --compact-routing, --permute-fusion, and both flags to exercise
 all routing/fusion combinations. Each variant checks a local reference with
 different expert scales and compares equal and unequal token extents. Add
 --activation-checkpointing to compare checkpoint replay with the same unequal
-computation without checkpointing. The pytest launcher runs this matrix in CI.
+computation without checkpointing. The pytest launcher uses --all-variants to
+run the complete matrix in one worker launch and process group.
 """
 
 import argparse
 import os
+import time
 from contextlib import nullcontext
 
 import torch
 import torch.distributed as dist
 from torch.utils.checkpoint import checkpoint
 
+from nemo_automodel.components.moe.megatron.fused_a2a import reset_hybrid_ep_buffer, store_hybrid_ep_jit_cache
 from nemo_automodel.components.moe.megatron.token_dispatcher import (
     MoEFlexTokenDispatcher,
     TokenDispatcherConfig,
 )
 from nemo_automodel.components.moe.parallelizer import _replay_hybridep_dispatch_on_recompute
 
-HIDDEN = 256
+# Match the MXFP4 EP fixture so both groups can reuse dispatch/combine kernels.
+HIDDEN = 512
 NUM_EXPERTS = 4
 TOPK = 2
 FULL_TOKENS = int(os.environ.get("FULL_TOKENS", "5"))
@@ -123,25 +127,19 @@ def run_dispatch_combine(
     return combined.detach(), hidden.grad, probs.grad
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--compact-routing", action="store_true")
-    parser.add_argument("--permute-fusion", action="store_true")
-    parser.add_argument("--activation-checkpointing", action="store_true")
-    args = parser.parse_args()
-    rank = int(os.environ["RANK"])
-    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
-    dist.init_process_group("nccl")
+def _run_variant(
+    ep_group: dist.ProcessGroup, *, compact_routing: bool, permute_fusion: bool, activation_checkpointing: bool
+) -> None:
+    """Check one routing/fusion variant using the existing two-rank process group."""
+    rank = dist.get_rank()
     torch.manual_seed(1234 + rank)
-
-    ep_group = dist.new_group(ranks=list(range(dist.get_world_size())))
     config = TokenDispatcherConfig(
         moe_flex_dispatcher_backend="hybridep",
         num_moe_experts=NUM_EXPERTS,
         moe_router_topk=TOPK,
         moe_share_token_dispatcher=False,
-        moe_hybridep_compact_routing=args.compact_routing,
-        moe_hybridep_permute_fusion=args.permute_fusion,
+        moe_hybridep_compact_routing=compact_routing,
+        moe_hybridep_permute_fusion=permute_fusion,
     )
     num_local = NUM_EXPERTS // dist.get_world_size()
     dispatcher = MoEFlexTokenDispatcher(
@@ -150,9 +148,8 @@ def main() -> None:
         config=config,
         ep_group=ep_group,
     )
-    for initializer in dispatcher.get_pipeline_runtime_initializers(hidden_dim=HIDDEN, dtype=torch.bfloat16):
-        initializer.prepare(num_tokens=FULL_TOKENS, device=torch.device("cuda", int(os.environ["LOCAL_RANK"])))
-
+    # These direct EP calls use lazy initialization, sharing one buffer across
+    # per-call routing/fusion options. PP resource-signature validation is tested separately.
     hidden = torch.randn(FULL_TOKENS, HIDDEN, dtype=torch.bfloat16, device="cuda")
     indices = torch.stack([torch.randperm(NUM_EXPERTS, device="cuda")[:TOPK] for _ in range(FULL_TOKENS)])
     indices[0] = -1
@@ -173,10 +170,11 @@ def main() -> None:
     torch.testing.assert_close(unequal_grad, reference_grad[:keep], rtol=0, atol=0)
     torch.testing.assert_close(unequal_prob_grad, reference_prob_grad[:keep], rtol=0, atol=0)
     print(
-        f"[rank {rank}] OK: compact={args.compact_routing}, fusion={args.permute_fusion}; "
-        "output, hidden gradient, and router gradient match the local oracle and equal-count run"
+        f"[rank {rank}] OK: compact={compact_routing}, fusion={permute_fusion}; "
+        "output, hidden gradient, and router gradient match the local oracle and equal-count run",
+        flush=True,
     )
-    if args.activation_checkpointing:
+    if activation_checkpointing:
         checkpointed, checkpointed_grad, checkpointed_prob_grad = run_dispatch_combine(
             dispatcher, hidden[:keep], indices[:keep], probs[:keep], activation_checkpointing=True
         )
@@ -185,9 +183,48 @@ def main() -> None:
         torch.testing.assert_close(checkpointed_prob_grad, unequal_prob_grad, rtol=0, atol=0)
         print(
             f"[rank {rank}] OK: checkpoint replay reuses the forward layout; "
-            "output, hidden gradient, and router gradient match without checkpointing"
+            "output, hidden gradient, and router gradient match without checkpointing",
+            flush=True,
         )
-    dist.destroy_process_group()
+
+
+def main() -> None:
+    """Run individual diagnostics or the complete CI matrix in one worker launch."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--compact-routing", action="store_true")
+    parser.add_argument("--permute-fusion", action="store_true")
+    parser.add_argument("--activation-checkpointing", action="store_true")
+    parser.add_argument("--all-variants", action="store_true")
+    args = parser.parse_args()
+    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    dist.init_process_group("nccl")
+    ep_group = dist.new_group(ranks=list(range(dist.get_world_size())))
+    variants = (
+        [(compact, fusion, compact and fusion) for compact in (False, True) for fusion in (False, True)]
+        if args.all_variants
+        else [(args.compact_routing, args.permute_fusion, args.activation_checkpointing)]
+    )
+    try:
+        for compact, fusion, activation_checkpointing in variants:
+            start = time.perf_counter()
+            _run_variant(
+                ep_group,
+                compact_routing=compact,
+                permute_fusion=fusion,
+                activation_checkpointing=activation_checkpointing,
+            )
+            # Reuse the buffer: routing/fusion are per-call options, and all variants share its shape.
+            # Keep the native buffer and loaded kernels alive until all variants finish.
+            torch.cuda.synchronize()
+            dist.barrier(group=ep_group)
+            store_hybrid_ep_jit_cache()
+            print(
+                f"HybridEP parity: compact={compact} fusion={fusion} elapsed={time.perf_counter() - start:.2f}s",
+                flush=True,
+            )
+    finally:
+        reset_hybrid_ep_buffer()
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
