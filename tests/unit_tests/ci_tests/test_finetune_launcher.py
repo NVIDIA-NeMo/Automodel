@@ -12,16 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib
 import os
 import subprocess
+import sys
 from datetime import timedelta
 from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
-from torch.distributed.elastic.rendezvous import RendezvousParameters
-from torch.distributed.elastic.rendezvous import c10d_rendezvous_backend
-from torch.distributed.run import config_from_args, get_args_parser
+import torch.distributed
+from torch.distributed.elastic.rendezvous import RendezvousParameters, c10d_rendezvous_backend
 
 
 @pytest.mark.parametrize("timeout", ["", "37"])
@@ -29,11 +30,18 @@ def test_finetune_and_checkpoint_launches_apply_connection_timeout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, timeout: str
 ) -> None:
     """Exercise shell command generation and the actual C10d timeout consumer."""
+    # CLI tests replace this module during collection. Import the real parser
+    # within the test and restore the prior module/attribute during teardown.
+    monkeypatch.delitem(sys.modules, "torch.distributed.run", raising=False)
+    monkeypatch.delattr(torch.distributed, "run", raising=False)
+    torch_run = importlib.import_module("torch.distributed.run")
+    monkeypatch.setenv("OMP_NUM_THREADS", "1")
+
     launcher = Path(__file__).resolve().parents[3] / "tests/ci_tests/scripts/finetune_launcher.sh"
     argv_log = tmp_path / "torchrun.argv"
     stubs = tmp_path / "stubs.sh"
     stubs.write_text(
-        'cd() { return 0; }\n'
+        "cd() { return 0; }\n"
         'python3() { printf "%s\\n" "$TEST_CONFIG"; }\n'
         'torchrun() { printf "%s\\0" "$@" >> "$TEST_ARGV"; printf "\\0" >> "$TEST_ARGV"; }\n'
     )
@@ -68,8 +76,8 @@ def test_finetune_and_checkpoint_launches_apply_connection_timeout(
     tcp_store = Mock()
     monkeypatch.setattr(c10d_rendezvous_backend, "TCPStore", tcp_store)
     for command in commands:
-        args = get_args_parser().parse_args(command.decode().split("\0"))
-        config, _, _ = config_from_args(args)
+        args = torch_run.get_args_parser().parse_args(command.decode().split("\0"))
+        config, _, _ = torch_run.config_from_args(args)
         parameters = RendezvousParameters(
             backend=config.rdzv_backend,
             endpoint=config.rdzv_endpoint,
