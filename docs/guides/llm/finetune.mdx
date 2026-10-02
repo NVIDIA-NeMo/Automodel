@@ -945,7 +945,7 @@ param_group_overrides:
 
 This optional rule matches modules named `gate` or `router` without matching expert `gate_proj` projections. Newly routed matrices inherit `scalar_lr`, `scalar_betas` and `scalar_eps`; `lr_mult` and `wd_mult` can further scale that group. Existing embedding/head settings are preserved, and frozen parameters are excluded.
 
-Grouped expert tensors are treated as batches of independent matrices. AutoModel's grouped GEMM experts declare their `[expert, input, output]` storage layout so magnitude normalization follows output neurons. Linear weights use `[output, input]`. Embeddings, output heads, normalization parameters, and biases use the scalar optimizer. These groups also apply to `MuonConfig`, except that Muon does not learn neuron magnitudes.
+Grouped expert tensors are treated as batches of independent matrices. AutoModel's grouped GEMM experts declare their `[expert, input, output]` storage layout so magnitude normalization follows output neurons. Linear weights use `[output, input]`. Embeddings, output heads, normalization parameters, and biases use the scalar optimizer. `MuonConfig` keeps grouped expert tensors on the scalar optimizer.
 
 Muown selects communication groups from each parameter's DTensor placements, allowing dense FSDP weights and EP weights with a different FSDP mesh in one optimizer. A matrix can have one evenly sharded matrix axis plus sharded expert or batch axes. Sharding both matrix axes is unsupported. EP-local complete matrices are updated locally. Magnitude and direction states use the normal optimizer checkpoint path; FP32 master parameters are recommended.
 

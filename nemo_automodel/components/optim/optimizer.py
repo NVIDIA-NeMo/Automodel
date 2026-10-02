@@ -474,8 +474,6 @@ class _DionConfigBase(OptimizerConfig):
 class MuonConfig(_DionConfigBase):
     """``dion.Muon`` — matrix-aware update for 2D+ params, scalar fallback for 1D."""
 
-    supports_batched_matrices: ClassVar[bool] = True
-
     mu: float = 0.95
     betas: tuple[float, float] = (0.9, 0.95)
     epsilon: float = 1e-8

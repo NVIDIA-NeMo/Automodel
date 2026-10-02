@@ -41,6 +41,11 @@ if _HAS_DION:
 
 _MuonBase = _dion.Muon if _HAS_DION else Optimizer
 
+# Muown overrides these private ``dion.Muon`` hooks and relies on ``dion.Muon.step`` to call them. They match the
+# Dion revision pinned in pyproject.toml; later Dion releases rebuilt Muon on ``DistributedOrthoBase`` without them,
+# where Muown would either fail or silently run plain Muon.
+_DION_MUON_HOOKS = ("_create_muon_tasks", "_create_adamw_tasks", "_get_or_initialize_state")
+
 
 def _row_sum(value: Tensor, axis: int) -> Tensor:
     """Reduce an input-feature axis and resolve DTensor partial sums.
@@ -284,6 +289,12 @@ class Muown(_MuonBase):
         if not _HAS_DION:
             raise ImportError(
                 "Muown requires the optional Dion dependency. Install the existing optional dependency with uv sync --extra dev."
+            )
+        missing_hooks = [name for name in _DION_MUON_HOOKS if not hasattr(_MuonBase, name)]
+        if missing_hooks:
+            raise ImportError(
+                f"Muown requires the Dion revision pinned in pyproject.toml; the installed dion.Muon lacks "
+                f"{', '.join(missing_hooks)}. Reinstall with uv sync so uv.lock pins Dion."
             )
         if use_triton and not muown_triton.HAVE_TRITON:
             raise ImportError("use_triton=True requires Triton.")

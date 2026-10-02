@@ -110,6 +110,15 @@ def test_invalid_hyperparameters(kwargs):
         Muown([nn.Parameter(torch.randn(8, 12))], **kwargs)
 
 
+def test_unsupported_dion_revision_is_rejected(monkeypatch):
+    # A Dion release without the private Muon hooks Muown overrides must fail loudly instead of running plain Muon.
+    from nemo_automodel.components.optim import muown
+
+    monkeypatch.setattr(muown, "_DION_MUON_HOOKS", (*muown._DION_MUON_HOOKS, "_hook_removed_upstream"))
+    with pytest.raises(ImportError, match="_hook_removed_upstream"):
+        Muown([nn.Parameter(torch.randn(4, 4))])
+
+
 def test_typed_config_layout_and_scalar_groups():
     class Experts(nn.Module):
         _nemo_transposed_matrix_parameters = ("projection",)
