@@ -22,11 +22,6 @@ include-package-data = true
 [tool.setuptools.packages.find]
 include = ["nemo_automodel", "nemo_automodel.*"]
 
-[tool.setuptools.package-data]
-nemo_automodel = [
-    "components/datasets/llm/megatron/Makefile",
-]
-
 [tool.setuptools.dynamic]
 version = { attr = "nemo_automodel.package_info.__version__" } # any module attribute compatible with ast.literal_eval
 readme = { file = "README.md", content-type = "text/markdown" }
@@ -81,7 +76,7 @@ dependencies = [
     "datasets>=4.0.0",
     "megatron-fsdp==0.5.0",
     "mistral-common[audio,hf-hub,sentencepiece]",
-    "pybind11",
+    "ninja",
     "pyyaml",
     "tiktoken",
     "torch>=2.6.0",
@@ -195,14 +190,14 @@ mlflow = [
     # mlflow-skinny: same Python tracking API, no server/UI/pyarrow/scipy/etc.
     # Avoids the mlflow vs mlflow-skinny mutual-exclusion conflict that breaks
     # environments using sagemaker-mlflow, kedro-mlflow, and managed ML platforms.
-    "mlflow-skinny",
+    "mlflow-skinny>=3.16.1",
 ]
 mlflow-full = [
     # Full mlflow stack: tracking server, UI, SQL backend, pyarrow, etc.
     # Use when you need the MLflow UI or sql:// artifact stores.
-    "mlflow",
+    "mlflow>=3.16.1",
 ]
-wandb = ["wandb>=0.28.0"]
+wandb = ["wandb>=0.30.0"]
 tracking = [
     # Convenience meta-extra: installs both experiment-tracking backends.
     "nemo-automodel[mlflow]",
@@ -286,10 +281,11 @@ no-build-isolation-package = [
     "transformer-engine-torch",
 ]
 constraint-dependencies = [
+    "anyio>=4.14.2", # Security floor requested by AUT-2465
     "aiohttp>=3.14.3", # Address aiohttp security fixes through CVE-2026-69244
     "cryptography>=48.0.1", # Address CVE GHSA-537c-gmf6-5ccf
     "diffusers>=0.38.0",
-    "gitpython>=3.1.59",
+    "gitpython>=3.1.60",
     "jaraco-context>=6.1.0", # Address CVE GHSA-58pv-8j8x-9vj2
     "mako>=1.3.11",
     "msgpack>=1.2.1", # Address CVE GHSA-6v7p-g79w-8964
@@ -301,16 +297,18 @@ constraint-dependencies = [
     "starlette>=1.3.1", # Address GHSA-wqp7-x3pw-xc5r and later Starlette security fixes
     "setuptools>=80.10.2",
     "soupsieve>=2.8.4", # Address GHSA-836r-79rf-4m37 and GHSA-2wc2-fm75-p42x
-    "urllib3>=2.7.0", # Address CVE GHSA-gm62-xv2j-4w53
-    "wandb>=0.28.2", # Address GO-2026-5970 in the golang.org/x/text bundled by wandb-core
+    "sqlparse>=0.6.0", # Security floor requested by AUT-2465
+    "urllib3>=2.8.0", # Address CVE GHSA-gm62-xv2j-4w53
+    "wandb>=0.30.0", # Address GO-2026-5970 in the golang.org/x/text bundled by wandb-core
     "wheel>=0.46.2", # Address CVE GHSA-8rrh-rw8j-w5fx
     "fonttools>=4.60.2", # Address CVE-2025-66034
-    "mlflow>=3.15.1", # No published security fix; advance past the reported 3.15.0
+    "mlflow>=3.16.1", # Security floor requested by AUT-2465
+    "mlflow-skinny>=3.16.1", # Keep the tracking-only extra on the same security floor
     "thrift>=0.24.0", # Address CVE-2026-41608 and related Thrift 0.24.0 fixes
     "tornado>=6.5.5",
     "onnx>=1.21.0",
     "onnx-ir>=0.1.16", # PyTorch 26.04 needs onnx_ir.schemas
-    "pyjwt>=2.12.0",
+    "pyjwt>=2.14.0",
     "pytest>=8.4.3",
     "pygments>=2.20.0",
     # tilelang 0.1.11 bundles its own TVM but leaves apache-tvm-ffi unpinned, so it
@@ -320,11 +318,13 @@ constraint-dependencies = [
     "apache-tvm-ffi<=0.1.11",
 ]
 override-dependencies = [
+    # leptonai (via nemo-run) caps anyio<=4.9.0; override to keep the security floor
+    "anyio>=4.14.2",
     "nvidia-cublas==13.4.1.1; sys_platform == 'linux'",
     # leptonai pins 7.0.0, which caps Starlette below its security-fixed 1.x releases
     "prometheus-fastapi-instrumentator>=8.1.0",
     # torchx (via nemo-run) caps urllib3<1.27; override to keep the CVE pin
-    "urllib3>=2.7.0",
+    "urllib3>=2.8.0",
 ]
 prerelease = "allow"
 
@@ -562,6 +562,17 @@ ignore_imports = [
     "nemo_automodel.components.training.utils -> nemo_automodel.components.distributed.mesh_utils",
 ]
 
+[[tool.importlinter.contracts]]
+name = "Distributed infrastructure must not import model implementations"
+type = "forbidden"
+source_modules = ["nemo_automodel.components.distributed"]
+forbidden_modules = [
+    "nemo_automodel.components.models",
+    "nemo_automodel._diffusers",
+    "nemo_automodel._transformers",
+]
+allow_indirect_imports = true
+
 # ty: type checking (https://github.com/astral-sh/ty)
 # Default: permissive. Strict checks are opt-in per-file via overrides below.
 # Phase 1 modules: launcher, attention, config, optim, loggers
@@ -604,7 +615,6 @@ allowed-unresolved-imports = [
     "megatron.**",
     "mlflow",
     "mlflow.**",
-    "nemo_automodel.components.datasets.llm.megatron.helpers_cpp",
     "nemo_run",
     "pynvml",
     "sky",

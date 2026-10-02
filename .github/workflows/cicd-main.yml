@@ -103,6 +103,10 @@ jobs:
         run: |
           source ./venv/bin/activate
           uv run --active python tools/lint_no_globals.py
+      - name: Enforce model parallelizer contract
+        run: |
+          source ./venv/bin/activate
+          uv run --active python tools/lint_model_parallelizer_contract.py
 
   import_linting:
     runs-on: ${{ vars.LINT_AND_INSTALL_TEST_RUNNER || 'ubuntu-latest' }}

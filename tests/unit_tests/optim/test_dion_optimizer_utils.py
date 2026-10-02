@@ -18,6 +18,8 @@ import pytest
 import torch
 import torch.nn as nn
 
+from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -219,6 +221,36 @@ class TestSeparateParamGroups:
         # vector group should have the bias param (1D)
         vector_shapes = [p.shape for p in groups[1]["params"]]
         assert any(len(s) == 1 for s in vector_shapes)
+
+    def test_group_lrs_and_weight_decay_survive_lr_scheduler(self):
+        groups = self._call(
+            model=TinyModel(with_bias=True),
+            base_lr=1e-3,
+            scalar_opt="adamw",
+            weight_decay=0.1,
+            scalar_lr=5e-4,
+            embed_lr=2e-4,
+            lm_head_lr=1e-4,
+        )
+        # torch AdamW holds the groups in place of the optional dion optimizers.
+        optimizer = torch.optim.AdamW(groups, lr=1e-3, weight_decay=0.1)
+        OptimizerParamScheduler(
+            optimizer=optimizer,
+            init_lr=1e-3,
+            max_lr=1e-3,
+            min_lr=1e-3,
+            lr_warmup_steps=0,
+            lr_decay_steps=10,
+            lr_decay_style="constant",
+            start_wd=0.1,
+            end_wd=0.1,
+            wd_incr_steps=10,
+            wd_incr_style="constant",
+        )
+
+        # matrix, vector (scalar_lr), embedding (embed_lr), lm_head (lm_head_lr)
+        assert [g["lr"] for g in optimizer.param_groups] == pytest.approx([1e-3, 5e-4, 2e-4, 1e-4])
+        assert [g["weight_decay"] for g in optimizer.param_groups] == pytest.approx([0.1, 0.1, 0.0, 0.0])
 
 
 # ---------------------------------------------------------------------------

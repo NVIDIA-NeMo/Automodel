@@ -105,8 +105,9 @@ def _install_torch_and_layers_stubs(monkeypatch):
     nn_stub = types.ModuleType("torch.nn")
 
     class Parameter:
-        def __init__(self, data=None):
+        def __init__(self, data=None, requires_grad=True):
             self.data = data
+            self.requires_grad = requires_grad
 
     class Module:
         pass
@@ -425,7 +426,7 @@ def _import_parallelizer_with_stubs(monkeypatch):
         fp32_compute_module_names=(),
         reshard_after_forward=None,
         ignored_params=None,
-        fully_shard_fn=None,
+        model_parallelizer=None,
     ):
         kwargs = {
             "mesh": mesh,
@@ -436,7 +437,12 @@ def _import_parallelizer_with_stubs(monkeypatch):
             kwargs["reshard_after_forward"] = reshard_after_forward
         if ignored_params:
             kwargs["ignored_params"] = ignored_params
-        fully_shard_fn(module, **kwargs)
+        shard_module = (
+            sys.modules["nemo_automodel.components.moe.parallelizer"].fully_shard
+            if model_parallelizer is None
+            else model_parallelizer._fully_shard_module
+        )
+        shard_module(module, **kwargs)
 
     parallelizer_utils_stub.fully_shard_by_dtype = fully_shard_by_dtype
     parallelizer_utils_stub.get_internal_fsdp_mp_policy = lambda mp_policy: ("INTERNAL_MP_POLICY", mp_policy)
@@ -1088,7 +1094,7 @@ def test_apply_fsdp_routes_strict_fp32_contract_and_expert_exclusions_to_shared_
         ),
         reshard_after_forward=True,
         ignored_params=set(block.mlp.experts.parameters()),
-        fully_shard_fn=fully_shard_mock,
+        model_parallelizer=None,
     )
 
 
@@ -2061,8 +2067,10 @@ def test_apply_fsdp_without_lm_head_precision_uses_default_policy(monkeypatch):
 
 
 @pytest.mark.parametrize("model_owned_sharding", [False, True])
-def test_apply_fsdp_uses_model_wrapper_or_default(monkeypatch: pytest.MonkeyPatch, model_owned_sharding: bool) -> None:
-    """Language and multimodal units share one model-selected FSDP callback."""
+def test_apply_fsdp_uses_sidecar_sharder_or_default(
+    monkeypatch: pytest.MonkeyPatch, model_owned_sharding: bool
+) -> None:
+    """Language and multimodal units share the sidecar-selected FSDP primitive."""
     P = _import_parallelizer_with_stubs(monkeypatch)
     monkeypatch.setattr(P, "MoE", DummyMoE)
     default_shard = MagicMock()
@@ -2071,8 +2079,11 @@ def test_apply_fsdp_uses_model_wrapper_or_default(monkeypatch: pytest.MonkeyPatc
     block = DummyBlock(mlp=DummyMoE())
     model = DummyModel([block])
     model.visual = DummyExperts()
+    model_parallelizer = None
     if model_owned_sharding:
-        model._nemo_fully_shard = model_shard
+        model_parallelizer = types.SimpleNamespace(
+            _fully_shard_module=model_shard,
+        )
 
     P.apply_fsdp(
         model=model,
@@ -2080,6 +2091,7 @@ def test_apply_fsdp_uses_model_wrapper_or_default(monkeypatch: pytest.MonkeyPatc
         ep_enabled=False,
         ep_shard_enabled=False,
         lm_head_precision=None,
+        model_parallelizer=model_parallelizer,
     )
 
     selected = model_shard if model_owned_sharding else default_shard
