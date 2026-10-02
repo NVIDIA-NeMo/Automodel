@@ -48,7 +48,8 @@ UNKNOWN_ARCH = "NotARegisteredDiffusionTransformer"
 
 def _write_config(directory, architectures):
     os.makedirs(directory, exist_ok=True)
-    config = {"model_type": "dummy"}
+    # A real model_type so the config loads like an LLM config; the custom-model decision is on `architectures`.
+    config = {"model_type": "qwen3_moe"}
     if architectures is not None:
         config["architectures"] = architectures
     with open(os.path.join(directory, "config.json"), "w") as f:

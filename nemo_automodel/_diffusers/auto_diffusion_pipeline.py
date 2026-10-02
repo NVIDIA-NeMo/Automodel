@@ -503,15 +503,22 @@ def _transformer_dir(model_dir: str, subfolder: str = "transformer") -> str:
 
 
 def _has_custom_model(transformer_dir: str) -> bool:
-    """Whether the transformer's architecture has an Automodel custom implementation (see ``ModelRegistry``)."""
-    from nemo_automodel._transformers.registry import ModelRegistry
+    """Whether the transformer has a custom Automodel implementation.
+
+    This is the decision ``NeMoAutoModel.from_pretrained`` makes for LLMs and VLMs (``get_is_hf_model``): load the
+    config the same way and resolve it against ``ModelRegistry``. Diffusers transformer configs have no
+    ``architectures`` and are skipped before loading.
+    """
+    from nemo_automodel._transformers.model_init import get_hf_config, get_is_hf_model
 
     config_path = os.path.join(transformer_dir, "config.json")
     if not os.path.isfile(config_path):
         return False
     with open(config_path) as f:
-        architectures = json.load(f).get("architectures") or []
-    return bool(architectures) and ModelRegistry.has_custom_model(architectures[0])
+        if not json.load(f).get("architectures"):
+            return False
+    config = get_hf_config(transformer_dir, attn_implementation=None, trust_remote_code=False)
+    return not get_is_hf_model(config, force_hf=False)
 
 
 def _validate_custom_model_options(mesh_context: MeshContext | None, **options: Any) -> None:
