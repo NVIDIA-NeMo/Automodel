@@ -367,6 +367,32 @@ class TestNeatPackedVlmCollater:
         # n_images_per_sample
         assert result["n_images_per_sample"].tolist() == [1, 2]
 
+    def test_flash_emits_varlen_kwargs_and_no_mask(self):
+        batch = [
+            {
+                "input_ids": torch.tensor([1, 2, 3, 0]),
+                "labels": torch.tensor([10, 20, 30, -100]),
+                "attention_mask": torch.tensor([1, 1, 2, 0]),
+                "position_ids": torch.tensor([0, 1, 0, 0]),
+            },
+            {
+                "input_ids": torch.tensor([4, 5, 6, 7]),
+                "labels": torch.tensor([40, 50, 60, 70]),
+                "attention_mask": torch.tensor([1, 1, 1, 1]),
+                "position_ids": torch.tensor([0, 1, 2, 3]),
+            },
+        ]
+        result = neat_packed_vlm_collater(batch, attn_implementation="flash_attention_2")
+
+        # No attention_mask so HF takes the varlen-kwargs branch (not _upad_input).
+        assert "attention_mask" not in result
+        # row0: doc1(2), doc2(1), pad(1); row1: doc1(4) over the flattened 8 tokens.
+        assert result["cu_seq_lens_q"].tolist() == [0, 2, 3, 4, 8]
+        assert torch.equal(result["cu_seq_lens_q"], result["cu_seq_lens_k"])
+        assert result["max_length_q"] == result["max_length_k"] == 4
+        # Per-document ids preserved for loss / context-parallel consumers.
+        assert result["_packed_seq_ids"].tolist() == [[1, 1, 2, 0], [1, 1, 1, 1]]
+
 
 class TestMRoPESupport:
     """Tests for mRoPE (multi-resolution RoPE) position_ids handling."""
