@@ -89,7 +89,7 @@ class PipelineConfig:
             memory roughly by num_microbatches / (num_stages - stage_index + slack)
             on early/middle stages. Only applied for schedules with a bounded
             in-flight depth (currently "1f1b"); ignored with a warning otherwise.
-            Defaults to False.
+            Defaults to True; set False to disable pooling.
         pp_recv_buffer_pool_slack (int): Extra buffer sets beyond the 1F1B
             in-flight depth when pp_recv_buffer_pool is enabled. Defaults to 2.
     """
@@ -108,7 +108,7 @@ class PipelineConfig:
     scale_grads_in_schedule: bool = False
     loss_fn: Callable | None = None
     pp_seq_len: int | None = None
-    pp_recv_buffer_pool: bool = False
+    pp_recv_buffer_pool: bool = True
     pp_recv_buffer_pool_slack: int = 2
 
     def __post_init__(self) -> None:
