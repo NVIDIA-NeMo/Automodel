@@ -647,7 +647,7 @@ def test_balanced_inkling_dispatch_retains_learned_gate_gradients():
         rms_norm="torch",
         experts="torch",
         dispatcher="torch",
-        force_balanced_routing=True,
+        fake_balanced_gate=True,
     )
     moe = InklingMoE(cfg, backend)
     moe.init_weights(torch.device("cpu"))

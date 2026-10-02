@@ -160,7 +160,7 @@ def test_balanced_gemma4_dispatch_retains_learned_gate_gradients():
     torch.manual_seed(123)
     cfg = _make_text_config(torch_dtype="float32")
     backend = _make_cpu_backend()
-    backend.force_balanced_routing = True
+    backend.fake_balanced_gate = True
     model = Gemma4MoETextModelBackend(cfg, backend)
     moe = model.layers["0"].moe
     with torch.no_grad():

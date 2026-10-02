@@ -341,12 +341,11 @@ set these fields in an existing MoE recipe's `model` configuration:
 ```yaml
 model:
   backend:
-    force_balanced_routing: true
-    fake_balanced_gate: false
+    fake_balanced_gate: true
     fake_gate_noise: 0.0
 ```
 
-`force_balanced_routing` executes the model's learned gate, including its projection,
+`fake_balanced_gate: true` executes the model's learned gate, including its projection,
 scoring, and expert selection, then replaces only the expert indices with cyclic
 assignments. Learned routing weights and their backward graph remain intact. For
 `tokens * activated_experts` assignments on each rank, expert counts differ by at
@@ -359,8 +358,9 @@ weights are applied to synthetic expert assignments. Auxiliary losses, bias upda
 and router load diagnostics still reflect the original learned selection. It
 introduces a small amount of index-generation work after the learned gate.
 
-`fake_balanced_gate: true` instead replaces the gate entirely, omitting learned
-router forward and backward computation. Use that option when intentionally
-measuring performance without learned router work. The two options are mutually
-exclusive. `force_balanced_routing` requires zero `fake_gate_noise` and does not
-support `benchmark_static_routing`, which remains restricted to the fake gate.
+This changes the previous behavior of `fake_balanced_gate`, which omitted learned
+router computation. The option now retains the model's gate and uses
+`FakeBalancedGate` only to generate synthetic expert indices. No separate routing
+flag is needed. `fake_gate_noise` adds input-seeded imbalance to the synthetic
+assignments while preserving learned weights. `benchmark_static_routing` remains
+supported with zero noise because the synthetic assignments stay constant.

@@ -460,7 +460,7 @@ class InklingMoE(MoE):
             token_mask = torch.ones(x.size(0), dtype=torch.bool, device=x.device)
 
         topk_weights, topk_indices, shared_gammas = self.gate(x)
-        topk_indices = self._maybe_balance_routing(topk_indices)
+        topk_indices = self._maybe_balance_routing(topk_indices, x)
         routed = self.experts(x, token_mask, topk_weights, topk_indices)
         shared = self.shared_experts(x, shared_gammas)
         return (routed + shared).view(shape)

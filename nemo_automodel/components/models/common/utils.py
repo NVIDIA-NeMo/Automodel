@@ -444,18 +444,14 @@ class BackendConfig:
             asynchronously and allocate their outputs on the communication stream.
         enable_deepep: Removed and ignored. Logs a warning if set; configure "dispatcher"
             and "experts" explicitly instead.
-        fake_balanced_gate: If True, replace the learned Gate with FakeBalancedGate
-            that assigns tokens to experts without learned routing weights. This
-            omits learned router forward and backward computation.
-        force_balanced_routing: Benchmark-only. Execute the learned gate normally,
-            then replace expert indices with balanced cyclic assignments. Retains
-            learned routing weights, gradients, auxiliary losses, and gate statistics.
-            Mutually exclusive with fake_balanced_gate; fake_gate_noise must be zero.
-        fake_gate_noise: Noise level [0, 1] for FakeBalancedGate. When > 0, uses
-            biased topk selection seeded from the input content so routing varies
-            dynamically across training steps (like real Gate) while remaining
-            deterministic for activation checkpointing recompute (same input = same
-            routing). Only used when fake_balanced_gate=True.
+        fake_balanced_gate: Benchmark-only. Execute the model's gate normally, then
+            replace expert indices with synthetic assignments from FakeBalancedGate.
+            Retains learned routing weights, gradients, auxiliary losses, and gate
+            statistics. With fake_gate_noise=0.0, assignments are balanced cyclically.
+        fake_gate_noise: Noise level [0, 1] for synthetic expert assignments. When > 0,
+            uses biased topk selection seeded from input content so routing varies
+            dynamically across training steps. Learned routing weights are unchanged.
+            Only used when fake_balanced_gate=True.
         enable_hf_state_dict_adapter: Whether to enable HuggingFace state dict adapter.
         enable_fsdp_optimizations: Whether to enable FSDP2 optimizations.
         gate_precision: Optional dtype override for the gate computation. Accepts
@@ -487,7 +483,7 @@ class BackendConfig:
             per-microbatch device-to-host reads of that metadata (`.tolist()` /
             `count_nonzero` / dispatcher size checks) by caching the first
             microbatch's values, removing recurring host-sync stalls on the hot
-            path. Never enable with a learned gate: cached metadata would go
+            path. Never enable with learned expert assignments: cached metadata would go
             stale and silently corrupt expert dispatch.
         cuda_graph: Scoped partial CUDA-graph configuration.
     """
@@ -516,7 +512,6 @@ class BackendConfig:
     mok: MoKBackendConfig = field(default_factory=MoKBackendConfig)
     enable_deepep: bool | None = None  # Removed: ignored with a warning; set dispatcher/experts explicitly
     fake_balanced_gate: bool = False
-    force_balanced_routing: bool = False
     # Approximate max/mean load ratios (64 experts, top-8, 4096 tokens):
     # 0.0→1.00x, 0.1→~1.2x, 0.3→~1.6x, 0.5→~2.0x, 1.0→~2.8x.
     fake_gate_noise: float = 0.0
@@ -556,11 +551,6 @@ class BackendConfig:
     cuda_graph: CudaGraphConfig = field(default_factory=CudaGraphConfig)
 
     def __post_init__(self) -> None:
-        if self.force_balanced_routing and self.fake_balanced_gate:
-            raise ValueError("force_balanced_routing and fake_balanced_gate are mutually exclusive")
-        if self.force_balanced_routing and self.fake_gate_noise != 0.0:
-            raise ValueError("force_balanced_routing requires fake_gate_noise=0.0")
-
         # benchmark_static_routing caches routing metadata across microbatches, which is
         # only sound when routing is constant by construction (forced balance, no noise).
         if self.benchmark_static_routing and not (self.fake_balanced_gate and self.fake_gate_noise == 0.0):
@@ -657,8 +647,6 @@ class BackendConfig:
                     f"{sorted(attention_graph_modules)} in cuda_graph.modules requires BF16 dot-product attention "
                     "(fp8_dpa=False)"
                 )
-        if "moe_router" in graph_modules and self.fake_balanced_gate:
-            raise ValueError("'moe_router' in cuda_graph.modules requires the learned Gate (fake_balanced_gate=False)")
         if "moe_preprocess" in graph_modules and self.dispatcher != "hybridep":
             raise ValueError("'moe_preprocess' in cuda_graph.modules requires dispatcher='hybridep'")
         # FP8 requires at least one TE backend (applies to all TE modules: Linear, GroupedLinear, RMSNorm)

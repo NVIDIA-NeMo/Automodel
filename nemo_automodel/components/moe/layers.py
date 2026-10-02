@@ -128,8 +128,9 @@ class FakeBalancedGate(nn.Module):
     Load balanced gate implementation, spreads tokens uniformly across all experts.
     The rationale for this class is to do performance experiments to understand
     how the load imbalance with real data is impacting end-to-end performance.
-    This implementation omits learned router forward and backward computation;
-    use ``backend.force_balanced_routing`` to retain that work in a benchmark.
+    MoE uses this module only for synthetic expert indices when
+    ``backend.fake_balanced_gate`` is enabled; its learned gate still computes
+    routing weights and retains forward and backward computation.
 
     When ``noise > 0``, random perturbation is added to mimic realistic routing
     imbalance.  A noise value of 0.0 gives perfectly balanced assignment, while
@@ -147,21 +148,21 @@ class FakeBalancedGate(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        token_mask: torch.Tensor,
+        token_mask: torch.Tensor | None,
         cp_mesh: DeviceMesh | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """
         Forward pass for the gating mechanism.
 
         Args:
-            x (torch.Tensor): Input tensor.
-            token_mask (torch.Tensor): Boolean mask indicating valid tokens.
-            cp_mesh (Optional[DeviceMesh]): Device mesh for context parallel computation.
+            x: Local input tensor of shape [tokens, hidden].
+            token_mask: Optional boolean mask of shape [tokens]; ignored.
+            cp_mesh: Optional context-parallel mesh; ignored.
 
         Returns:
-            weights (torch.Tensor): Routing weights for the selected experts.
-            indices (torch.Tensor): Indices of the selected experts.
-            aux_loss (Optional[torch.Tensor]): Auxiliary loss for load balancing.
+            weights: Synthetic routing weights of shape [tokens, activated_experts].
+            indices: Expert IDs of shape [tokens, activated_experts].
+            aux_loss: None; synthetic routing has no auxiliary loss.
         """
         del token_mask
         del cp_mesh
@@ -772,11 +773,11 @@ class MoE(nn.Module):
         self.n_routed_experts = config.n_routed_experts
         self.n_activated_experts = config.n_activated_experts
 
-        if backend.fake_balanced_gate:
-            self.gate = FakeBalancedGate(config, noise=backend.fake_gate_noise)
-        else:
-            self.gate = Gate(config, gate_precision=backend.gate_precision)
-            self.gate.use_routing_core = "moe_router" in backend.cuda_graph.modules
+        self.gate = Gate(config, gate_precision=backend.gate_precision)
+        self.gate.use_routing_core = "moe_router" in backend.cuda_graph.modules
+        self.balanced_gate = (
+            FakeBalancedGate(config, noise=backend.fake_gate_noise) if backend.fake_balanced_gate else None
+        )
         if backend.dispatcher == "mok":
             world_size = get_world_size_safe()
             if world_size % 4 != 0:
@@ -849,27 +850,25 @@ class MoE(nn.Module):
         # Set during model parallelization (see parallelizer.apply_cp)
         self.cp_mesh: DeviceMesh | None = None
 
-    def _maybe_balance_routing(self, indices: torch.Tensor) -> torch.Tensor:
+    def _maybe_balance_routing(self, indices: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         """Override expert assignments after learned gating for benchmarking.
 
         Args:
             indices: Local expert indices of shape [tokens, activated_experts].
+            x: Local router inputs of shape [tokens, hidden], used to seed noisy assignments.
 
         Returns:
             Indices with the same shape, dtype, and device. When forced balance is
-            enabled, each token selects distinct experts and per-rank assignment
-            counts differ by at most one. Counts include padding rows. Otherwise
+            enabled with zero noise, each token selects distinct experts and per-rank
+            assignment counts differ by at most one. Counts include padding rows. Otherwise
             returns the input unchanged. Learned weights and their autograd graph
             are untouched; gate statistics and auxiliary losses describe the
             original learned selection.
         """
-        if not self.backend.force_balanced_routing:
+        if self.balanced_gate is None:
             return indices
-        return (
-            torch.arange(indices.numel(), device=indices.device, dtype=indices.dtype)
-            .view_as(indices)
-            .remainder(self.n_routed_experts)
-        )
+        _, balanced_indices, _ = self.balanced_gate(x, None, None)
+        return balanced_indices.to(dtype=indices.dtype)
 
     def forward(
         self,
@@ -906,7 +905,7 @@ class MoE(nn.Module):
             x_latent = x
 
         weights, indices, aux_loss = self.gate(x, token_mask, cp_mesh)
-        indices = self._maybe_balance_routing(indices)
+        indices = self._maybe_balance_routing(indices, x)
 
         if isinstance(self.experts, GroupedExpertsMoK):
             # MoK requires every EP rank to dispatch the same pre-aligned physical

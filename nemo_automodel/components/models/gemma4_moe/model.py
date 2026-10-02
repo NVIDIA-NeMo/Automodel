@@ -323,7 +323,7 @@ class Gemma4MoE(MoE):
         # Use separate gate_input for routing when provided (fixes double-norm)
         g = gate_input.view(-1, self.dim) if gate_input is not None else x
         weights, indices, aux_loss = self.gate(g, token_mask, cp_mesh)
-        indices = self._maybe_balance_routing(indices)
+        indices = self._maybe_balance_routing(indices, g)
 
         x_latent = self.fc1_latent_proj(x) if self.fc1_latent_proj is not None else x
         y = self.experts(x_latent, token_mask, weights, indices)

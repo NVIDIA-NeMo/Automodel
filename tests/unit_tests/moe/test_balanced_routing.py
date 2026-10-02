@@ -32,7 +32,7 @@ def _eager_cpu_kernels():
         yield
 
 
-def _build_moe(*, score_func="softmax", dtype=torch.float32, force_balance=True, topk=2):
+def _build_moe(*, score_func="softmax", dtype=torch.float32, force_balance=True, topk=2, noise=0.0, static=False):
     config = MoEConfig(
         n_routed_experts=4,
         n_shared_experts=0,
@@ -58,7 +58,9 @@ def _build_moe(*, score_func="softmax", dtype=torch.float32, force_balance=True,
         rms_norm="torch",
         experts="torch",
         dispatcher="torch",
-        force_balanced_routing=force_balance,
+        fake_balanced_gate=force_balance,
+        fake_gate_noise=noise,
+        benchmark_static_routing=static,
     )
     moe = MoE(config, backend)
     with torch.no_grad():
@@ -87,7 +89,7 @@ def _assert_balanced(indices: torch.Tensor, n_experts: int):
 def test_assignments_are_balanced_and_distinct(n_tokens, topk):
     moe = _build_moe(topk=topk)
     indices = torch.zeros(n_tokens, topk, dtype=torch.int64)
-    actual = moe._maybe_balance_routing(indices)
+    actual = moe._maybe_balance_routing(indices, torch.randn(n_tokens, moe.dim))
     assert actual.shape == indices.shape
     assert actual.dtype == indices.dtype
     _assert_balanced(actual, moe.n_routed_experts)
@@ -96,15 +98,16 @@ def test_assignments_are_balanced_and_distinct(n_tokens, topk):
 def test_default_routing_is_unchanged():
     moe = _build_moe(force_balance=False)
     indices = torch.tensor([[3, 1], [2, 0]])
-    assert moe._maybe_balance_routing(indices) is indices
+    assert moe._maybe_balance_routing(indices, torch.randn(2, moe.dim)) is indices
     assert isinstance(moe.gate, Gate)
 
 
 @pytest.mark.parametrize("score_func", ["softmax", "sigmoid", "sigmoid_with_bias", "softmax_with_bias", "sqrtsoftplus"])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_real_expert_dispatch_retains_learned_weights_and_gate_gradients(score_func, dtype):
+@pytest.mark.parametrize("noise", [0.0, 0.3])
+def test_real_expert_dispatch_retains_learned_weights_and_gate_gradients(score_func, dtype, noise):
     torch.manual_seed(123)
-    moe = _build_moe(score_func=score_func, dtype=dtype)
+    moe = _build_moe(score_func=score_func, dtype=dtype, noise=noise)
     reference_gate = copy.deepcopy(moe.gate)
     hidden_states = torch.randn(1, 7, moe.dim, dtype=dtype, requires_grad=True)
     reference_weights, _, _ = reference_gate(
@@ -127,7 +130,10 @@ def test_real_expert_dispatch_retains_learned_weights_and_gate_gradients(score_f
         handle.remove()
     assert torch.isfinite(output).all()
     assert torch.equal(dispatch["weights"], reference_weights)
-    _assert_balanced(dispatch["indices"], moe.n_routed_experts)
+    if noise == 0.0:
+        _assert_balanced(dispatch["indices"], moe.n_routed_experts)
+    else:
+        assert (dispatch["indices"].sort(dim=-1).values.diff(dim=-1) > 0).all()
     output.backward(torch.randn_like(output))
     reference_weights.backward(dispatch["weights"].grad)
     for name, parameter in moe.gate.named_parameters():
@@ -140,9 +146,10 @@ def test_real_expert_dispatch_retains_learned_weights_and_gate_gradients(score_f
     assert torch.isfinite(hidden_states.grad).all()
 
 
-def test_activation_checkpointing_preserves_outputs_and_gradients():
+@pytest.mark.parametrize("noise", [0.0, 0.3])
+def test_activation_checkpointing_preserves_outputs_and_gradients(noise):
     torch.manual_seed(42)
-    eager = _build_moe()
+    eager = _build_moe(noise=noise)
     recomputed = copy.deepcopy(eager)
     hidden_states = torch.randn(1, 6, eager.dim)
     x_eager = hidden_states.clone().requires_grad_()
@@ -158,21 +165,28 @@ def test_activation_checkpointing_preserves_outputs_and_gradients():
         torch.testing.assert_close(actual_parameter.grad, expected_parameter.grad, rtol=0, atol=0)
 
 
-def test_fake_gate_still_omits_learned_router():
-    moe = _build_moe()
-    fake = MoE(moe.experts.config, BackendConfig(fake_balanced_gate=True, experts="torch", dispatcher="torch"))
-    assert isinstance(fake.gate, FakeBalancedGate)
-    assert not list(fake.gate.parameters())
+def test_balanced_gate_preserves_learned_router_state_dict():
+    balanced = _build_moe()
+    learned = _build_moe(force_balance=False)
+    assert isinstance(balanced.gate, Gate)
+    assert isinstance(balanced.balanced_gate, FakeBalancedGate)
+    assert not list(balanced.balanced_gate.parameters())
+    assert balanced.state_dict().keys() == learned.state_dict().keys()
+    balanced.load_state_dict(learned.state_dict(), strict=True)
 
 
-@pytest.mark.parametrize(
-    "overrides,match",
-    [
-        ({"fake_balanced_gate": True}, "mutually exclusive"),
-        ({"fake_gate_noise": 0.1}, "fake_gate_noise=0.0"),
-        ({"benchmark_static_routing": True}, "requires fake_balanced_gate=True"),
-    ],
-)
-def test_incompatible_benchmark_settings_are_rejected(overrides, match):
-    with pytest.raises(ValueError, match=match):
-        BackendConfig(force_balanced_routing=True, **overrides)
+def test_static_balanced_dispatch_retains_gate_gradients():
+    moe = _build_moe(static=True)
+    for _ in range(2):
+        output = moe(torch.randn(1, 8, moe.dim))
+        output.backward(torch.randn_like(output))
+        assert torch.isfinite(moe.gate.weight.grad).all()
+        assert moe.gate.weight.grad.abs().sum() > 0
+        moe.zero_grad(set_to_none=True)
+
+
+@pytest.mark.parametrize("overrides", [{"fake_balanced_gate": False}, {"fake_gate_noise": 0.1}])
+def test_incompatible_static_routing_settings_are_rejected(overrides):
+    settings = {"fake_balanced_gate": True, "benchmark_static_routing": True, **overrides}
+    with pytest.raises(ValueError, match="requires fake_balanced_gate=True"):
+        BackendConfig(**settings)

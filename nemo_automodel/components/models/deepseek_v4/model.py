@@ -230,14 +230,14 @@ class DeepseekV4Block(nn.Module):
         # experts, etc.) keeps its standard layout.
         self.is_hash_routing_layer = layer_idx < int(getattr(config, "num_hash_layers", 0) or 0)
         self.is_vision_routing = int(getattr(config, "vision_n_layers", 0) or 0) > 0
-        if self.is_vision_routing and not backend.fake_balanced_gate:
+        if self.is_vision_routing:
             self.mlp.gate = DeepseekV4VisionGate(
                 config,
                 moe_config,
                 gate_precision=backend.gate_precision,
                 hash_routing=self.is_hash_routing_layer,
             )
-        elif self.is_hash_routing_layer and not backend.fake_balanced_gate:
+        elif self.is_hash_routing_layer:
             self.mlp.gate = DeepseekV4HashGate(config, moe_config)
         self.input_layernorm = initialize_rms_norm_module(
             backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, dtype=model_dtype

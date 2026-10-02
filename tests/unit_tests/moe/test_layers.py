@@ -1336,7 +1336,8 @@ class TestMoE:
         backend_config.fake_balanced_gate = True
         moe = MoE(moe_config, backend_config)
 
-        assert isinstance(moe.gate, FakeBalancedGate)
+        assert isinstance(moe.gate, Gate)
+        assert isinstance(moe.balanced_gate, FakeBalancedGate)
         assert isinstance(moe.experts, GroupedExperts)
 
     def test_moe_init_fake_gate_noise_passed_through(self, moe_config, backend_config):
@@ -1345,8 +1346,9 @@ class TestMoE:
         backend_config.fake_gate_noise = 0.5
         moe = MoE(moe_config, backend_config)
 
-        assert isinstance(moe.gate, FakeBalancedGate)
-        assert moe.gate.noise == 0.5
+        assert isinstance(moe.gate, Gate)
+        assert isinstance(moe.balanced_gate, FakeBalancedGate)
+        assert moe.balanced_gate.noise == 0.5
 
     def test_moe_init_with_deepep_single_device(self, moe_config, backend_config):
         """DeepEP dispatcher enabled but world size == 1 should fall back to GroupedExperts."""

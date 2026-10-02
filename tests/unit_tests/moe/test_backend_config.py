@@ -402,6 +402,10 @@ class TestBackendConfigRopeFusionDisabled:
 
 
 class TestBackendConfigPartialCudaGraphs:
+    def test_balanced_routing_keeps_learned_router_graph_available(self):
+        config = BackendConfig(fake_balanced_gate=True, cuda_graph=CudaGraphConfig(modules=["moe_router"]))
+        assert config.cuda_graph.modules == ["moe_router"]
+
     def test_empty_module_list_disables_cuda_graphs(self):
         assert BackendConfig().cuda_graph.modules == []
 
