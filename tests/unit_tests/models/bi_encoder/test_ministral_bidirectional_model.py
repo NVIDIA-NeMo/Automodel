@@ -2006,7 +2006,6 @@ import torch
 torch.set_num_threads(1)
 from PIL import Image
 from transformers import AutoModelForSequenceClassification, AutoProcessor
-from sentence_transformers import CrossEncoder
 directories = sys.argv[1:]
 for directory in directories:
     expected = torch.load(directory + ".pt", weights_only=True)
@@ -2025,15 +2024,6 @@ for directory in directories:
         torch.testing.assert_close(value, expected["state"][key], rtol=0, atol=0)
     with torch.no_grad():
         torch.testing.assert_close(model(**inputs).logits, expected["logits"], rtol=1e-6, atol=1e-6)
-    cross_encoder = CrossEncoder(directory, trust_remote_code=True, device="cpu", model_kwargs={"attn_implementation": "eager"})
-    assert isinstance(cross_encoder.activation_fn, torch.nn.Identity)
-    assert cross_encoder[0].processing_kwargs == {}
-    pairs = [("What is shown?", "literal"), ("What is shown?", {"text": "Image doc", "image": Image.new("RGB", (16, 16), (255, 0, 0))})]
-    standard_inputs = cross_encoder[0].preprocess(pairs)
-    for key, value in expected["inputs"].items():
-        torch.testing.assert_close(standard_inputs[key], value, rtol=0, atol=0)
-    scores = cross_encoder.predict(pairs, batch_size=2, convert_to_tensor=True, show_progress_bar=False)
-    torch.testing.assert_close(scores.reshape(-1, 1), expected["logits"], rtol=1e-5, atol=1e-7)
 assert not any(name == "nemo_automodel" or name.startswith("nemo_automodel.") for name in sys.modules)
 """
     result = subprocess.run(
@@ -2045,6 +2035,28 @@ assert not any(name == "nemo_automodel" or name.startswith("nemo_automodel.") fo
         check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+    # The child proves that exported model/processor code works without AutoModel.
+    # Check ST interoperability here to avoid importing its training dependencies
+    # again in the child; retain token and score parity for both export paths.
+    from sentence_transformers import CrossEncoder
+
+    pairs = [
+        ("What is shown?", "literal"),
+        ("What is shown?", {"text": "Image doc", "image": Image.new("RGB", (16, 16), (255, 0, 0))}),
+    ]
+    for export_dir in export_dirs:
+        expected = torch.load(export_dir.with_suffix(".pt"), weights_only=True)
+        cross_encoder = CrossEncoder(
+            str(export_dir), trust_remote_code=True, device="cpu", model_kwargs={"attn_implementation": "eager"}
+        )
+        assert isinstance(cross_encoder.activation_fn, torch.nn.Identity)
+        assert cross_encoder[0].processing_kwargs == {}
+        standard_inputs = cross_encoder[0].preprocess(pairs)
+        for key, value in expected["inputs"].items():
+            torch.testing.assert_close(standard_inputs[key], value, rtol=0, atol=0)
+        scores = cross_encoder.predict(pairs, batch_size=2, convert_to_tensor=True, show_progress_bar=False)
+        torch.testing.assert_close(scores.reshape(-1, 1), expected["logits"], rtol=1e-5, atol=1e-7)
 
 
 @pytest.mark.parametrize("use_prompt_template", [False, True])
