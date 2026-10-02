@@ -45,15 +45,29 @@ def test_llm_benchmark_configs_define_required_benchmark_fields():
     assert not violations, "Benchmark configs are missing required fields:\n" + "\n".join(violations)
 
 
-def test_super35_vl_benchmark_waits_for_public_checkpoint():
+def test_super35_vl_benchmark_uses_accessible_shared_ci_inputs():
     config = Path("examples/llm_benchmark/nemotron/super35_vl_text_8k_ep16_fused_adam.yaml")
     recipe = YAML(typ="safe").load(config)
 
+    assert recipe["model"]["config"]["_target_"] == "nemo_automodel.NeMoAutoConfig.from_pretrained"
     assert recipe["model"]["config"]["pretrained_model_name_or_path"] == (
-        "nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16"
+        # Public Hugging Face model ID; the entropy detector misclassifies it as a credential.
+        "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"  # pragma: allowlist secret
     )
-    assert recipe["ci"]["known_issue_id"] == "AMINT-383"
-    assert generate_job(config, {}, "performance", "llm_benchmark", ".") == []
+    assert recipe["step_scheduler"]["local_batch_size"] == 2
+    assert "known_issue_id" not in recipe["ci"]
+
+    jobs = generate_job(config, {}, "performance", "llm_benchmark", ".")
+
+    assert len(jobs) == 1
+    job_name, job = jobs[0]
+    assert job_name == ""
+    assert job["extends"] == ".llm_benchmark_test"
+    assert job["stage"] == "performance"
+    assert job["variables"]["TEST_NODE_COUNT"] == 4
+    assert job["variables"]["CONFIG_NPROC_PER_NODE"] == 4
+    assert job["variables"]["RESERVED_CLUSTER_TAG"] == "/gb200/"
+    assert job["variables"]["CUDA_VISIBLE_DEVICES"] == "0,1,2,3"
 
 
 def test_qwen35_moe_lora_benchmark_disables_mtp():
