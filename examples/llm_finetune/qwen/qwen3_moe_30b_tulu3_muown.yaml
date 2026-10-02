@@ -95,21 +95,35 @@ dataloader:
 
 optimizer:
   _target_: nemo_automodel.components.optim.optimizer.MuownConfig
+  # Matrix parameters: Muown direction and per-neuron magnitude updates.
   lr: 3.0e-4
+  weight_decay: 0.1
   mu: 0.95
   nesterov: true
-  betas: [0.9, 0.95]
-  epsilon: 1.0e-8
   ns_steps: 5
   ns_epsilon: 1.0e-7
-  weight_decay: 0.0
-  # Embeddings, output head, normalization weights and biases use AdamW.
+  muon_update_scale: 1.0
+  betas: [0.9, 0.95]
+  epsilon: 1.0e-8
+  use_triton: false
+
+  # Auxiliary AdamW for embeddings, output head, normalization weights and biases.
   scalar_opt: adamw
-  scalar_lr: 3.0e-5
-  embed_lr: 3.0e-5
-  lm_head_lr: 3.0e-5
+  scalar_lr: 1.0e-4
   scalar_betas: [0.9, 0.95]
   scalar_eps: 1.0e-8
+  embed_lr: 1.0e-4
+  lm_head_lr: 1.0e-4
+
+  # Qwen3 MoE routers are named mlp.gate; expert gate_proj weights do not match.
+  adamw_param_patterns:
+    - '(^|\.)(gate|router)\.weight$'
+
+  # Independently scale router LR/WD: effective LR = 5e-5, weight decay = 0.
+  param_group_overrides:
+    - pattern: '(^|\.)(gate|router)\.weight$'
+      lr_mult: 0.5
+      wd_mult: 0.0
 
 # wandb:
 #   project: automodel-muown
