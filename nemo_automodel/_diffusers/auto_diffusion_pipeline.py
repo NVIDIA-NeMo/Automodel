@@ -40,6 +40,7 @@ Usage:
     )
 """
 
+import json
 import logging
 import os
 from dataclasses import dataclass
@@ -490,48 +491,40 @@ def _apply_parallelization(
     return pipe
 
 
-def custom_transformer_config_dir(model_dir: str, subfolder: str = "transformer") -> str | None:
-    """Return the directory whose ``config.json`` names an architecture with a custom model implementation.
+def _transformer_dir(model_dir: str, subfolder: str = "transformer") -> str:
+    """Directory that holds the transformer's ``config.json``.
 
-    Diffusers repositories (with ``model_index.json``) are checked in ``subfolder``; single-model repositories (for
-    example unified autoregressive image models shipped as one ``transformers`` checkpoint) are checked at the root.
-    Returns ``None`` when the transformer must be loaded through diffusers.
+    Diffusers repositories (those with a ``model_index.json``) keep it in ``subfolder``; single-model checkpoints
+    keep it at the root.
     """
-    import json
+    if os.path.isfile(os.path.join(model_dir, "model_index.json")):
+        return os.path.join(model_dir, subfolder)
+    return model_dir
 
+
+def _has_custom_model(transformer_dir: str) -> bool:
+    """Whether the transformer's architecture has an Automodel custom implementation (see ``ModelRegistry``)."""
     from nemo_automodel._transformers.registry import ModelRegistry
 
-    if os.path.isfile(os.path.join(model_dir, "model_index.json")):
-        candidates = [os.path.join(model_dir, subfolder)]
-    else:
-        candidates = [model_dir]
-    for candidate in candidates:
-        config_path = os.path.join(candidate, "config.json")
-        if not os.path.isfile(config_path):
-            continue
-        with open(config_path) as f:
-            architectures = json.load(f).get("architectures") or []
-        # The live registry also covers architectures registered at runtime or through entry points.
-        if architectures and ModelRegistry.has_custom_model(architectures[0]):
-            return candidate
-    return None
+    config_path = os.path.join(transformer_dir, "config.json")
+    if not os.path.isfile(config_path):
+        return False
+    with open(config_path) as f:
+        architectures = json.load(f).get("architectures") or []
+    return bool(architectures) and ModelRegistry.has_custom_model(architectures[0])
 
 
 def _reject_diffusers_only_options(mesh_context: MeshContext | None, **options: Any) -> None:
-    """Custom-model transformers do not support options that call diffusers-specific APIs."""
+    """Raise if an option that needs a diffusers transformer is set for a custom model."""
     enabled = sorted(name for name, value in options.items() if value)
     if enabled:
-        raise ValueError(
-            f"These options require a diffusers transformer and are not supported for custom-model ones: {enabled}"
-        )
+        raise ValueError(f"{enabled} need a diffusers transformer; this checkpoint uses an Automodel custom model.")
     if mesh_context is not None and mesh_context.cp_size > 1:
-        raise ValueError(
-            "Context parallelism is not supported for custom-model diffusion transformers yet (cp_size > 1)."
-        )
+        raise ValueError("Context parallelism is not supported for custom-model transformers yet (cp_size > 1).")
 
 
 def build_custom_transformer(
-    config_dir: str,
+    transformer_dir: str,
     *,
     mesh_context: MeshContext | None,
     torch_dtype: torch.dtype,
@@ -540,18 +533,18 @@ def build_custom_transformer(
     backend: Any = None,
     config_overrides: Dict[str, Any] | None = None,
 ) -> nn.Module:
-    """Build a custom-model transformer for a diffusion pipeline.
+    """Build a transformer from its Automodel custom implementation.
 
-    This reuses the ``transformers`` model infrastructure: meta-device construction, distributed sharding driven by
-    ``mesh_context`` (including expert parallelism for MoE models, which diffusers modules cannot provide), and weight
-    loading through the model's ``state_dict_adapter`` so each rank reads only its shard.
+    Custom models take the same path as LLMs: ``NeMoAutoModelForCausalLM.from_config`` with a ``DistributedSetup``
+    derived from ``mesh_context``. That gives them FSDP2, expert parallelism and sharded checkpoint loading, which
+    diffusers modules do not provide.
 
     Args:
-        config_dir: Directory with the model ``config.json`` (and weights when ``load_base_model``).
+        transformer_dir: Directory with the transformer ``config.json`` (and weights when ``load_base_model``).
         mesh_context: Resolved topology and policy; ``None`` builds an unsharded model.
         torch_dtype: Parameter dtype.
-        load_base_model: Load the checkpoint weights (finetuning) instead of random initialization.
-        peft_cfg: Optional PEFT config applied by the model infrastructure.
+        load_base_model: Load the checkpoint weights instead of initializing randomly.
+        peft_cfg: Optional PEFT config.
         backend: ``BackendConfig`` or a dict of its fields.
         config_overrides: Attributes set on the loaded config before construction.
     """
@@ -561,23 +554,24 @@ def build_custom_transformer(
     from nemo_automodel.components.distributed.config import DistributedSetup
     from nemo_automodel.components.models.common import BackendConfig
 
-    config = AutoConfig.from_pretrained(config_dir, trust_remote_code=False)
+    config = AutoConfig.from_pretrained(transformer_dir, trust_remote_code=False)
     for key, value in (config_overrides or {}).items():
         setattr(config, key, value)
-    if isinstance(backend, dict):
-        backend = BackendConfig(**backend)
-    model_kwargs = {"backend": backend} if backend is not None else {}
+
+    model_kwargs = {}
+    if backend is not None:
+        model_kwargs["backend"] = BackendConfig(**backend) if isinstance(backend, dict) else backend
+
     distributed_setup = None
     if mesh_context is not None:
-        # The model infrastructure (sharding, meta-device materialization, checkpoint loading) is only built when
-        # the setup carries a strategy, so lift the MeshContext policy onto the DistributedSetup.
         distributed_setup = DistributedSetup(
             mesh_context=mesh_context,
             strategy_config=mesh_context.strategy_config,
             moe_parallel_config=mesh_context.moe_parallel_config,
             activation_checkpointing=mesh_context.activation_checkpointing,
         )
-    logger.info("[INFO] Building custom-model transformer %s from %s", config.architectures[0], config_dir)
+
+    logger.info("[INFO] Building custom model %s from %s", config.architectures[0], transformer_dir)
     return NeMoAutoModelForCausalLM.from_config(
         config,
         distributed_setup=distributed_setup,
@@ -704,8 +698,10 @@ class NeMoAutoDiffusionPipeline:
         # (and potentially re-downloaded) over the network on every run.
         model_dir = resolve_diffusion_model_dir(pretrained_model_name_or_path)
 
-        custom_dir = custom_transformer_config_dir(model_dir)
-        if custom_dir is not None:
+        transformer_dir = _transformer_dir(model_dir)
+        if _has_custom_model(transformer_dir):
+            if components_to_load is not None and set(components_to_load) - {"transformer"}:
+                raise ValueError("Custom-model pipelines load only the `transformer` component.")
             _reject_diffusers_only_options(
                 mesh_context,
                 active_transformer=active_transformer,
@@ -713,25 +709,16 @@ class NeMoAutoDiffusionPipeline:
                 fuse_qkv_projections=fuse_qkv_projections,
                 attention_backend=attention_backend,
             )
-            if components_to_load is not None and set(components_to_load) - {"transformer"}:
-                raise ValueError("Custom-model diffusion transformers load only the `transformer` component.")
-            transformer = build_custom_transformer(
-                custom_dir,
+            return cls._from_custom_model(
+                transformer_dir,
                 mesh_context=mesh_context,
                 torch_dtype=torch_dtype,
                 load_base_model=True,
+                load_for_training=load_for_training,
                 peft_cfg=peft_cfg,
                 backend=backend,
                 config_overrides=config_overrides,
             )
-            if load_for_training and peft_cfg is None:
-                _ensure_params_trainable(transformer, "transformer")
-            pipe = cls(transformer=transformer)
-            if peft_cfg is not None:
-                # Same contract as the diffusers path: the recipe hands this to the checkpointer.
-                pipe._peft_config = peft_cfg
-                pipe._lora_params = [p for n, p in transformer.named_parameters() if "lora_" in n and p.requires_grad]
-            return pipe
 
         if not DIFFUSERS_AVAILABLE:
             raise RuntimeError(
@@ -873,6 +860,38 @@ class NeMoAutoDiffusionPipeline:
         return pipe
 
     @classmethod
+    def _from_custom_model(
+        cls,
+        transformer_dir: str,
+        *,
+        mesh_context: MeshContext | None,
+        torch_dtype: torch.dtype,
+        load_base_model: bool,
+        load_for_training: bool,
+        peft_cfg=None,
+        backend: Any = None,
+        config_overrides: Dict[str, Any] | None = None,
+    ) -> "NeMoAutoDiffusionPipeline":
+        """Pipeline holding only a transformer built from its Automodel custom implementation."""
+        transformer = build_custom_transformer(
+            transformer_dir,
+            mesh_context=mesh_context,
+            torch_dtype=torch_dtype,
+            load_base_model=load_base_model,
+            peft_cfg=peft_cfg,
+            backend=backend,
+            config_overrides=config_overrides,
+        )
+        if load_for_training and peft_cfg is None:
+            _ensure_params_trainable(transformer, "transformer")
+        pipe = cls(transformer=transformer)
+        if peft_cfg is not None:
+            # Same contract as the diffusers path: the recipe hands these to the checkpointer.
+            pipe._peft_config = peft_cfg
+            pipe._lora_params = [p for n, p in transformer.named_parameters() if "lora_" in n and p.requires_grad]
+        return pipe
+
+    @classmethod
     def from_config(
         cls,
         model_id: str,
@@ -923,24 +942,23 @@ class NeMoAutoDiffusionPipeline:
         """
         # Parse and validate pipeline spec
         spec = PipelineSpec.from_dict(pipeline_spec)
-        custom_dir = custom_transformer_config_dir(resolve_diffusion_model_dir(model_id), spec.subfolder)
-        if custom_dir is not None:
+        transformer_dir = _transformer_dir(resolve_diffusion_model_dir(model_id), spec.subfolder)
+        if _has_custom_model(transformer_dir):
             _reject_diffusers_only_options(
                 mesh_context,
                 transformer_engine_linear=transformer_engine_linear,
                 fuse_qkv_projections=fuse_qkv_projections,
                 attention_backend=attention_backend,
             )
-            transformer = build_custom_transformer(
-                custom_dir,
+            return cls._from_custom_model(
+                transformer_dir,
                 mesh_context=mesh_context,
                 torch_dtype=torch_dtype,
                 load_base_model=False,
+                load_for_training=True,
                 backend=backend,
                 config_overrides=config_overrides,
             )
-            _ensure_params_trainable(transformer, "transformer")
-            return cls(transformer=transformer)
         if not DIFFUSERS_AVAILABLE:
             raise RuntimeError(
                 "diffusers is required for NeMoAutoDiffusionPipeline.from_config. "

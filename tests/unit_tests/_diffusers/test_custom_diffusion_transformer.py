@@ -26,9 +26,10 @@ import torch.nn as nn
 from nemo_automodel._diffusers import auto_diffusion_pipeline as adp
 from nemo_automodel._diffusers.auto_diffusion_pipeline import (
     NeMoAutoDiffusionPipeline,
+    _has_custom_model,
     _reject_diffusers_only_options,
+    _transformer_dir,
     build_custom_transformer,
-    custom_transformer_config_dir,
 )
 from nemo_automodel._transformers.registry import MODEL_ARCH_MAPPING, ModelRegistry, register_architecture
 from nemo_automodel.components.models.common import BackendConfig
@@ -42,7 +43,7 @@ from tests.functional_tests.diffusion.toy_moe_dit import (
 )
 
 # A built-in architecture of the static registry; detection only reads the name.
-NATIVE_ARCH = "Qwen3MoeForCausalLM"
+CUSTOM_ARCH = "Qwen3MoeForCausalLM"
 UNKNOWN_ARCH = "NotARegisteredDiffusionTransformer"
 
 
@@ -77,44 +78,50 @@ class _FrozenTransformer(nn.Module):
 
 
 def test_custom_arch_fixture_is_in_static_registry():
-    assert NATIVE_ARCH in MODEL_ARCH_MAPPING
+    assert CUSTOM_ARCH in MODEL_ARCH_MAPPING
     assert UNKNOWN_ARCH not in MODEL_ARCH_MAPPING
 
 
 # =============================================================================
-# custom_transformer_config_dir
+# _transformer_dir / _has_custom_model
 # =============================================================================
 
 
 def test_config_dir_detects_transformer_subfolder_of_diffusers_repo(tmp_path):
-    root = _diffusers_repo(tmp_path, [NATIVE_ARCH])
+    root = _diffusers_repo(tmp_path, [CUSTOM_ARCH])
 
-    assert custom_transformer_config_dir(root) == os.path.join(root, "transformer")
+    assert _transformer_dir(root) == os.path.join(root, "transformer")
+
+    assert _has_custom_model(os.path.join(root, "transformer"))
 
 
 def test_config_dir_honors_custom_subfolder(tmp_path):
-    root = _diffusers_repo(tmp_path, [NATIVE_ARCH], subfolder="dit")
+    root = _diffusers_repo(tmp_path, [CUSTOM_ARCH], subfolder="dit")
 
-    assert custom_transformer_config_dir(root, subfolder="dit") == os.path.join(root, "dit")
-    assert custom_transformer_config_dir(root) is None
+    assert _transformer_dir(root, subfolder="dit") == os.path.join(root, "dit")
+
+    assert _has_custom_model(os.path.join(root, "dit"))
+    assert not _has_custom_model(_transformer_dir(root))
 
 
 def test_config_dir_ignores_root_config_of_diffusers_repo(tmp_path):
     """With model_index.json only the transformer subfolder is consulted, never the repo root."""
     root = str(tmp_path / "repo")
     _write_model_index(root)
-    _write_config(root, [NATIVE_ARCH])
+    _write_config(root, [CUSTOM_ARCH])
 
-    assert custom_transformer_config_dir(root) is None
+    assert not _has_custom_model(_transformer_dir(root))
 
 
 def test_config_dir_detects_single_model_repo_at_root(tmp_path):
     root = str(tmp_path / "single")
-    _write_config(root, [NATIVE_ARCH])
+    _write_config(root, [CUSTOM_ARCH])
     # A transformer/ subfolder is irrelevant without model_index.json.
     _write_config(os.path.join(root, "transformer"), [UNKNOWN_ARCH])
 
-    assert custom_transformer_config_dir(root) == root
+    assert _transformer_dir(root) == root
+
+    assert _has_custom_model(root)
 
 
 @pytest.mark.parametrize("diffusers_layout", [True, False])
@@ -125,7 +132,7 @@ def test_config_dir_returns_none_for_unregistered_architecture(tmp_path, diffuse
         root = str(tmp_path / "single")
         _write_config(root, [UNKNOWN_ARCH])
 
-    assert custom_transformer_config_dir(root) is None
+    assert not _has_custom_model(_transformer_dir(root))
 
 
 @pytest.mark.parametrize("architectures", [None, []])
@@ -133,21 +140,21 @@ def test_config_dir_returns_none_without_architectures(tmp_path, architectures):
     """Diffusers transformer configs carry ``_class_name`` and no ``architectures``."""
     root = _diffusers_repo(tmp_path, architectures)
 
-    assert custom_transformer_config_dir(root) is None
+    assert not _has_custom_model(_transformer_dir(root))
 
 
 def test_config_dir_returns_none_without_config(tmp_path):
     root = str(tmp_path / "repo")
     _write_model_index(root)
 
-    assert custom_transformer_config_dir(root) is None
-    assert custom_transformer_config_dir(str(tmp_path / "empty_dir")) is None
+    assert not _has_custom_model(_transformer_dir(root))
+    assert not _has_custom_model(_transformer_dir(str(tmp_path / "empty_dir")))
 
 
 def test_config_dir_only_considers_first_architecture(tmp_path):
-    root = _diffusers_repo(tmp_path, [UNKNOWN_ARCH, NATIVE_ARCH])
+    root = _diffusers_repo(tmp_path, [UNKNOWN_ARCH, CUSTOM_ARCH])
 
-    assert custom_transformer_config_dir(root) is None
+    assert not _has_custom_model(_transformer_dir(root))
 
 
 @pytest.mark.parametrize("diffusers_layout", [True, False])
@@ -156,7 +163,8 @@ def test_config_dir_detects_registered_toy_moe_dit_checkpoint(tmp_path, diffuser
     root = write_toy_moe_dit_checkpoint(str(tmp_path / "toy"), diffusers_layout=diffusers_layout)
 
     expected = os.path.join(root, "transformer") if diffusers_layout else root
-    assert custom_transformer_config_dir(root) == expected
+    assert _transformer_dir(root) == expected
+    assert _has_custom_model(expected)
 
 
 def test_config_dir_detects_runtime_registered_architecture(tmp_path):
@@ -165,7 +173,8 @@ def test_config_dir_detects_runtime_registered_architecture(tmp_path):
     try:
         assert ModelRegistry.has_custom_model(arch)
         root = _diffusers_repo(tmp_path, [arch])
-        assert custom_transformer_config_dir(root) == os.path.join(root, "transformer")
+        assert _transformer_dir(root) == os.path.join(root, "transformer")
+        assert _has_custom_model(os.path.join(root, "transformer"))
     finally:
         ModelRegistry.model_arch_name_to_cls._extra.pop(arch, None)
 
@@ -299,7 +308,7 @@ def test_build_custom_transformer_passes_backend_config_through(monkeypatch, toy
 
 @pytest.fixture
 def custom_repo(tmp_path):
-    return _diffusers_repo(tmp_path, [NATIVE_ARCH])
+    return _diffusers_repo(tmp_path, [CUSTOM_ARCH])
 
 
 @pytest.fixture
@@ -405,7 +414,7 @@ def test_from_pretrained_unregistered_architecture_uses_diffusers(tmp_path, patc
 
 
 def test_from_config_dispatches_to_custom_transformer_with_random_init(tmp_path, patched_custom_build):
-    root = _diffusers_repo(tmp_path, [NATIVE_ARCH], subfolder="dit")
+    root = _diffusers_repo(tmp_path, [CUSTOM_ARCH], subfolder="dit")
     mesh_context = SimpleNamespace(cp_size=1)
 
     pipe = NeMoAutoDiffusionPipeline.from_config(
@@ -424,6 +433,7 @@ def test_from_config_dispatches_to_custom_transformer_with_random_init(tmp_path,
         mesh_context=mesh_context,
         torch_dtype=torch.float32,
         load_base_model=False,
+        peft_cfg=None,
         backend={"experts": "torch"},
         config_overrides={"num_hidden_layers": 1},
     )
