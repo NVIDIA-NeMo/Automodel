@@ -728,6 +728,9 @@ class _CrossEncoderMetadataExporter:
         }
         if self.model_part._sentence_transformer_input_mode == "structured_multimodal":
             transformer_config["modality_config"]["message"] = {**forward_output, "format": "structured"}
+        elif isinstance(getattr(tokenizer, "chat_template", None), dict) and "reranking" in tokenizer.chat_template:
+            transformer_config["modality_config"]["message"] = {**forward_output, "format": "flat"}
+            transformer_config["processing_kwargs"] = {"chat_template": {"chat_template": "reranking"}}
         _write_json(
             os.path.join(hf_metadata_dir, "modules.json"),
             [{"idx": 0, "name": "0", "path": "", "type": _SENTENCE_TRANSFORMER_EXPORT_MODULE_TYPES["transformer"]}],

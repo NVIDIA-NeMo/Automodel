@@ -27,6 +27,7 @@ from transformers import ProcessorMixin
 
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.datasets.llm.retrieval_collator import CrossEncoderCollator
 from nemo_automodel.components.distributed.config import DDPConfig
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.tp_replicas import synchronize_tp_replica_gradients
@@ -70,6 +71,9 @@ def _unwrap_model_for_attrs(model):
 def _configure_sentence_transformer_export(model, collate_fn, *, tokenizer=None) -> None:
     """Bind static prompts and validate export against the runtime tokenizer or processor."""
     model = _unwrap_model_for_attrs(model)
+    if isinstance(collate_fn, CrossEncoderCollator):
+        collate_fn.configure_tokenizer_for_export()
+        return
     configure_prompts = getattr(model, "configure_sentence_transformer_prompts", None)
     if configure_prompts is None:
         return

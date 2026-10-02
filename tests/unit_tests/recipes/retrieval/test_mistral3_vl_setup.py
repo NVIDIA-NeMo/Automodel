@@ -203,3 +203,62 @@ def test_setup_validates_structured_export_processor(
     else:
         with pytest.raises(ValueError, match="processor with a tokenizer"):
             recipe.setup()
+
+
+def test_cross_encoder_setup_saves_text_training_template(setup_model, monkeypatch):
+    """Actual text recipe setup binds the configured collator format to its tokenizer."""
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from transformers import PreTrainedTokenizerFast
+
+    from nemo_automodel.components.datasets.llm.retrieval_collator import CrossEncoderCollator
+
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=Tokenizer(WordLevel({"[UNK]": 0, "[PAD]": 1}, unk_token="[UNK]")),
+        unk_token="[UNK]",
+        pad_token="[PAD]",
+        model_max_length=32,
+    )
+    collator = CrossEncoderCollator(
+        tokenizer=tokenizer, rerank_max_length=8, prompt_template="passage:{passage} query:{query}"
+    )
+    config = ConfigNode(
+        {
+            "model": {"_target_": "nemo_automodel._transformers.retrieval.CrossEncoderModel"},
+            "tokenizer": {"_target_": "transformers.AutoTokenizer.from_pretrained"},
+            "optimizer": {"_target_": "torch.optim.SGD", "lr": 0.01},
+        }
+    )
+    monkeypatch.setattr(
+        ConfigNode,
+        "instantiate",
+        lambda self, **kwargs: tokenizer if "AutoTokenizer" in str(self._target_) else setup_model,
+    )
+    monkeypatch.setattr(
+        TrainBiEncoderRecipe, "_build_optimizer_param_groups", lambda self: [{"params": setup_model.parameters()}]
+    )
+    monkeypatch.setattr(TrainBiEncoderRecipe, "_get_dp_group_size", lambda *args, **kwargs: 1)
+    loader_config = SimpleNamespace(
+        dataset_builds_on_all_ranks=True,
+        seed=42,
+        dataset_config=SimpleNamespace(n_passages=2),
+        build=lambda **kwargs: SimpleNamespace(collate_fn=collator),
+    )
+    monkeypatch.setattr(train_bi_encoder.RecipeConfig, "dataloader", property(lambda self: loader_config))
+
+    class _ReachedValidationLoader(Exception):
+        pass
+
+    def stop(self):
+        raise _ReachedValidationLoader
+
+    monkeypatch.setattr(train_bi_encoder.RecipeConfig, "validation_dataloaders", property(stop))
+    with pytest.raises(_ReachedValidationLoader):
+        TrainCrossEncoderRecipe(config).setup()
+    rendered = tokenizer.apply_chat_template(
+        [{"role": "query", "content": "hello"}, {"role": "document", "content": "world"}],
+        chat_template="reranking",
+        tokenize=False,
+    )
+    assert rendered == "passage:world query:hello"
+    assert tokenizer.model_max_length == 32  # Training's shorter limit must not leak into export.

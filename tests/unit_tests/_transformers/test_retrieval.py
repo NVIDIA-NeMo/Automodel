@@ -2159,3 +2159,118 @@ def test_cross_encoder_exports_raw_text_scores(tmp_path, consolidated):
     actual = reloaded.predict(pairs, batch_size=2, convert_to_tensor=True, show_progress_bar=False)
     # The reloaded inference stack may select a different CPU reduction order.
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-7)
+
+
+@pytest.mark.parametrize("consolidated", [False, True])
+@pytest.mark.parametrize("special_tokens", ["none", "bert", "bos_eos", "nemo_bos_eos", "byte_bpe"])
+@pytest.mark.parametrize("custom_prompt", [False, True])
+def test_text_reranker_training_format_survives_export(tmp_path, consolidated, special_tokens, custom_prompt):
+    """Standard ST inference reproduces collator tokens and scores, including truncation."""
+    from safetensors.torch import save_file
+    from sentence_transformers import CrossEncoder
+    from tokenizers.processors import TemplateProcessing
+
+    from nemo_automodel.components.checkpoint.addons import ConsolidatedHFAddon
+    from nemo_automodel.components.datasets.llm.retrieval_collator import CrossEncoderCollator
+    from nemo_automodel.recipes.retrieval.train_bi_encoder import _configure_sentence_transformer_export
+
+    tokenizer = _tiny_tokenizer()
+    if special_tokens == "byte_bpe":
+        from tokenizers.models import BPE
+        from tokenizers.pre_tokenizers import ByteLevel
+        from tokenizers.trainers import BpeTrainer
+
+        backend = Tokenizer(BPE(unk_token="[UNK]"))
+        backend.pre_tokenizer = ByteLevel(add_prefix_space=True)
+        backend.train_from_iterator(
+            ["hello world question passage 0 1 2 3 4"],
+            trainer=BpeTrainer(
+                vocab_size=280, special_tokens=["[UNK]", "[PAD]"], initial_alphabet=ByteLevel.alphabet()
+            ),
+        )
+        tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="[UNK]", pad_token="[PAD]")
+    # ST's standard suffix detection uses distinct numeric fillers.
+    tokenizer.add_tokens(["0", "1", "2", "3", "4", "question", "passage", ":"])
+    tokenizer.model_max_length = 16
+    if special_tokens != "none":
+        first, last = ("[CLS]", "[SEP]") if special_tokens == "bert" else ("<s>", "</s>")
+        tokenizer.add_special_tokens({"bos_token": first, "eos_token": last})
+        tokenizer.backend_tokenizer.post_processor = TemplateProcessing(
+            single=f"{first} $A {last}",
+            special_tokens=[(first, tokenizer.bos_token_id), (last, tokenizer.eos_token_id)],
+        )
+    tokenizer.chat_template = "original chat template"
+    if special_tokens == "nemo_bos_eos":
+        from nemo_automodel import NeMoAutoTokenizer
+
+        source = tmp_path / "source_tokenizer"
+        tokenizer.save_pretrained(source)
+        tokenizer = NeMoAutoTokenizer.from_pretrained(source)
+    config = BertConfig(
+        vocab_size=len(tokenizer),
+        hidden_size=8,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        intermediate_size=16,
+        max_position_embeddings=64,
+        num_labels=1,
+    )
+    config._attn_implementation = "eager"
+    encoder = retrieval.CrossEncoderModel(BertForSequenceClassification(config)).eval()
+    options = {"prompt_template": 'passage: {passage} \n "question 🦙": {query}'} if custom_prompt else {}
+    collator = CrossEncoderCollator(tokenizer=tokenizer, rerank_max_length=16, **options)
+    _configure_sentence_transformer_export(encoder, collator, tokenizer=tokenizer)
+    pairs = [("hello", "world"), ("hello world " * 30, "world " * 30)]
+    inputs = collator([{"question": q, "doc_text": d} for q, d in pairs])
+    with torch.no_grad():
+        expected = encoder(**inputs).logits.flatten()
+    if consolidated:
+        ConsolidatedHFAddon().pre_save(
+            model_state=SimpleNamespace(model=[encoder]),
+            hf_metadata_dir=str(tmp_path),
+            fqn_to_file_index_mapping={},
+            original_model_path=None,
+            tokenizer=tokenizer,
+        )
+        save_file(encoder.model.state_dict(), tmp_path / "model.safetensors", metadata={"format": "pt"})
+    else:
+        encoder.save_pretrained(str(tmp_path), tokenizer=tokenizer)
+
+    reloaded = CrossEncoder(
+        str(tmp_path), device="cpu", trust_remote_code=False, model_kwargs={"attn_implementation": "eager"}
+    )
+    assert reloaded.tokenizer.chat_template["default"] == "original chat template"
+    assert reloaded[0].max_seq_length == 16
+    assert not list(tmp_path.glob("*.py"))
+    assert "max_seq_length" not in json.loads((tmp_path / "sentence_bert_config.json").read_text())
+    actual_inputs = reloaded[0].preprocess(pairs)
+    for key, value in inputs.items():
+        torch.testing.assert_close(actual_inputs[key], value, rtol=0, atol=0)
+    actual = reloaded.predict(pairs, batch_size=2, convert_to_tensor=True, show_progress_bar=False)
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-7)
+
+    # The saved Jinja preserves the exact Python training format and literal input content.
+    messages = [{"role": "query", "content": "  hello {{ world }}  "}, {"role": "document", "content": "world\nworld"}]
+    rendered = reloaded.tokenizer.apply_chat_template(messages, chat_template="reranking", tokenize=False)
+    formatted = collator.prompt_template.format(query=messages[0]["content"], passage=messages[1]["content"])
+    assert rendered == (formatted if special_tokens == "none" else first + formatted + last)
+
+
+def test_text_reranker_export_rejects_fixed_prompt_suffix():
+    from nemo_automodel.components.datasets.llm.retrieval_collator import CrossEncoderCollator
+
+    collator = CrossEncoderCollator(
+        tokenizer=_tiny_tokenizer(), rerank_max_length=16, prompt_template="{query} {passage} relevance:"
+    )
+    with pytest.raises(ValueError, match="fixed trailing text"):
+        collator.configure_tokenizer_for_export()
+
+
+def test_text_reranker_export_rejects_left_truncation():
+    from nemo_automodel.components.datasets.llm.retrieval_collator import CrossEncoderCollator
+
+    tokenizer = _tiny_tokenizer()
+    tokenizer.truncation_side = "left"
+    collator = CrossEncoderCollator(tokenizer=tokenizer, rerank_max_length=16)
+    with pytest.raises(ValueError, match="right truncation"):
+        collator.configure_tokenizer_for_export()
