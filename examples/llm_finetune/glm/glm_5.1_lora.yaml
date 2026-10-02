@@ -114,7 +114,7 @@ ci:
   # pp_size(4) * ep_size(32) = 128 GPUs => 16 nodes (8 H100/node).
   recipe_owner: hemildesai
   nodes: 16
-  time: "00:45:00"
+  time: "00:35:00"
   env_vars:
     # Native adapter/optimizer restart coverage; HF consumer coverage is tracked in #3867.
     CHECKPOINT_ROBUSTNESS_PHASES: train_and_save automodel_reload resume

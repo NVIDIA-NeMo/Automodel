@@ -410,7 +410,7 @@ def test_generate_glm51_lora_includes_native_checkpoint_validation():
     assert variables["CHECKPOINT_ROBUSTNESS_PROCESS_ISOLATION"] == "true"
     assert variables["CHECKPOINT_ROBUSTNESS_PHASES"] == "train_and_save automodel_reload resume"
     assert variables["TEST_NODE_COUNT"] == 16
-    assert variables["TIME"] == "00:45:00"
+    assert variables["TIME"] == "00:35:00"
     assert variables["REQUIRE_FINITE_METRICS"] == "true"
 
 
