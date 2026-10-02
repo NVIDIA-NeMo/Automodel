@@ -725,11 +725,10 @@ class KimiDeltaAttention(nn.Module):
     def _resolve_mode(self, seq_len: int) -> str:
         """Return the KDA kernel to use for a sequence of ``seq_len`` tokens.
 
-        ``fused_recurrent_kda`` implements only the forward pass, so it is chosen for short
-        sequences only outside training with gradients disabled, as in FLA's own KDA layer.
+        This is the configured ``kda_mode`` at every length: ``fused_recurrent_kda``
+        implements only the forward pass, so selecting it for short sequences would drop the
+        KDA parameters from the autograd graph.
         """
-        if seq_len <= 64 and not self.training and not torch.is_grad_enabled():
-            return "fused_recurrent"
         return self.mode
 
     @torch.no_grad()

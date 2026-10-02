@@ -258,25 +258,20 @@ def test_moe_router_correction_bias_only_controls_expert_selection():
     assert not config.router_weight_uses_score_correction_bias
 
 
-@pytest.mark.parametrize(
-    ("seq_len", "cp_context", "training", "grad_enabled", "expected"),
-    [
-        (32, None, False, False, True),
-        (32, None, True, True, False),
-        (32, None, True, False, False),
-        (32, None, False, True, False),
-        (128, None, False, False, False),
-        (32, object(), False, False, False),
-    ],
-)
-def test_recurrent_kda_runs_only_for_short_gradient_free_calls(seq_len, cp_context, training, grad_enabled, expected):
-    with torch.set_grad_enabled(grad_enabled):
-        assert glm5_next_layers._use_recurrent_kda(seq_len, cp_context, training) is expected
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the FLA kernel branch runs only for CUDA tensors")
+def test_short_sequence_training_uses_chunk_kda_and_reaches_kda_parameters(monkeypatch):
+    calls = []
 
+    def fake_chunk_kda(q, k, v, g, beta, **kwargs):
+        calls.append(q.shape[1])
+        output = (q * k + v) * beta.unsqueeze(-1).to(v.dtype) + g.float().mean().to(v.dtype)
+        return output, None
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="FLA KDA kernels require CUDA")
-def test_short_sequence_training_backward_reaches_kda_parameters():
-    pytest.importorskip("fla.ops.kda")
+    monkeypatch.setattr(glm5_next_layers, "_CHUNK_KDA_OK", True)
+    monkeypatch.setattr(glm5_next_layers, "_chunk_kda", fake_chunk_kda)
+    # PyTorch short convolution and gate keep the test free of Triton compilation.
+    monkeypatch.setattr(glm5_next_layers, "_SHORT_CONV_OK", False)
+    monkeypatch.setattr(glm5_next_layers, "_KDA_GATE_OK", False)
     config = tiny_glm5_next_config().text_config
     config.hidden_size, config.linear_head_dim, config.linear_num_heads = 128, 64, 2
     config.linear_conv_kernel_dim = 4
@@ -287,5 +282,6 @@ def test_short_sequence_training_backward_reaches_kda_parameters():
 
     layer(hidden_states).float().sum().backward()
 
+    assert calls == [32]
     missing = [name for name, param in layer.named_parameters() if param.grad is None]
     assert missing == []

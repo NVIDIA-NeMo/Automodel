@@ -290,14 +290,13 @@ def test_thd_packed_inputs_run_through_the_batched_layers():
     torch.testing.assert_close(thd, bshd, rtol=1e-5, atol=1e-6)
 
 
-def test_kda_short_sequences_use_recurrent_kernel_only_without_gradients():
+def test_kda_short_sequences_use_the_configured_chunk_kernel():
     _require_fla()
     attn = KimiDeltaAttention(_tiny_kimi_config(use_kda=True), layer_idx=1)
 
-    attn.train()
-    assert attn._resolve_mode(32) == "chunk"
-    attn.eval()
-    assert attn._resolve_mode(32) == "chunk"
-    with torch.no_grad():
-        assert attn._resolve_mode(32) == "fused_recurrent"
+    for training in (True, False):
+        attn.train(training)
+        with torch.no_grad():
+            assert attn._resolve_mode(32) == "chunk"
+        assert attn._resolve_mode(32) == "chunk"
         assert attn._resolve_mode(128) == "chunk"
