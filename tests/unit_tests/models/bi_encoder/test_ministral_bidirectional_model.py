@@ -46,7 +46,6 @@ pytest.importorskip("transformers.models.ministral3", reason="Ministral3 not ava
 from transformers.models.ministral3.modeling_ministral3 import Ministral3Model as HFMinistral3Model
 from transformers.models.mistral3.modeling_mistral3 import Mistral3Model
 
-from nemo_automodel.recipes.retrieval.mining_encoder import CheckpointMiningEncoder, CheckpointMiningEncoderConfig
 from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel._transformers.retrieval import (
     BiEncoderModel,
@@ -72,6 +71,7 @@ from nemo_automodel.components.models.ministral_bidirectional.processor import (
     PassageModality,
     load_image,
 )
+from nemo_automodel.recipes.retrieval.mining_encoder import CheckpointMiningEncoder, CheckpointMiningEncoderConfig
 from nemo_automodel.recipes.retrieval.train_bi_encoder import _configure_sentence_transformer_export
 
 # Over the default 5s budget on purpose: this module launches a fresh interpreter, which re-imports torch from scratch.
@@ -1934,103 +1934,110 @@ def test_mistral3_corpus_image_caption_policy_reaches_processor(
 
 @pytest.mark.runtime_budget(
     15,
-    reason="reloads an exported model and processor in an isolated Python subprocess",
+    reason="checks both export paths in one isolated Python subprocess",
 )
-@pytest.mark.parametrize("consolidated", [False, True])
-def test_mistral3_reranker_export_reloads_without_repository(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, consolidated: bool
-) -> None:
+def test_mistral3_reranker_export_reloads_without_repository(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Both export paths include standalone code and preserve default CrossEncoder text/image scores."""
     monkeypatch.setattr(Mistral3BiEncoderProcessor, "check_argument_for_proper_class", lambda *args, **kwargs: None)
-    tokenizer = FakePixtralTokenizer()
-    tokenizer.model_max_length = 64
-    processor = Mistral3BiEncoderProcessor(
-        image_processor=PixtralImageProcessor(size={"longest_edge": 16}),
-        tokenizer=tokenizer,
-        patch_size=4,
-        padding=True,
-        rerank_max_length=32,
-        use_prompt_template=True,
-        export_as_stock_processor=False,
-    )
-    config = _tiny_mistral3_bidirectional_vlm_config()
-    config.image_token_id = processor.image_token_id
-    config.num_labels = 1
-    config.temperature = 0.02
-    encoder = CrossEncoderModel(Mistral3VLBidirectionalForSequenceClassification(config)).eval()
-    features = [
-        {"question": "What is shown?", "doc_text": "literal", "doc_image": ""},
-        {"question": "What is shown?", "doc_text": "Image doc", "doc_image": Image.new("RGB", (16, 16), (255, 0, 0))},
-    ]
-    batch = processor.process_queries_documents_crossencoder(features)
-    model_inputs = {key: value for key, value in batch.items() if key != "labels"}
-    with torch.no_grad():
-        expected = encoder.model(**model_inputs).logits
-    export_dir = tmp_path / "export"
-    if consolidated:
-        from safetensors.torch import save_file
-
-        export_dir.mkdir()
-        ConsolidatedHFAddon().pre_save(
-            model_state=SimpleNamespace(model=[encoder]),
-            hf_metadata_dir=str(export_dir),
-            fqn_to_file_index_mapping={},
-            original_model_path=None,
-            tokenizer=processor,
+    # Share interpreter/import startup, but build and verify each export independently.
+    export_dirs = [tmp_path / "direct", tmp_path / "consolidated"]
+    for consolidated, export_dir in zip((False, True), export_dirs):
+        tokenizer = FakePixtralTokenizer()
+        tokenizer.model_max_length = 64
+        processor = Mistral3BiEncoderProcessor(
+            image_processor=PixtralImageProcessor(size={"longest_edge": 16}),
+            tokenizer=tokenizer,
+            patch_size=4,
+            padding=True,
+            rerank_max_length=32,
+            use_prompt_template=True,
+            export_as_stock_processor=False,
         )
-        save_file(encoder.model.state_dict(), export_dir / "model.safetensors", metadata={"format": "pt"})
-    else:
-        encoder.save_pretrained(str(export_dir), tokenizer=processor)
-    metadata = json.loads((export_dir / "config_sentence_transformers.json").read_text())
-    assert metadata["model_type"] == "CrossEncoder"
-    assert metadata["activation_fn"] == "torch.nn.modules.linear.Identity"
-    transformer_config = json.loads((export_dir / "sentence_bert_config.json").read_text())
-    assert "processing_kwargs" not in transformer_config
-    assert "max_seq_length" not in transformer_config
-    tokenizer_config = json.loads((export_dir / "tokenizer_config.json").read_text())
-    assert tokenizer_config["model_max_length"] == 64
-    assert "max_length" not in tokenizer_config
-    assert (export_dir / "model.py").is_file()
-    assert (export_dir / "processor.py").is_file()
-    torch.save(
-        {"inputs": model_inputs, "logits": expected, "state": encoder.model.state_dict()}, tmp_path / "expected.pt"
-    )
+        config = _tiny_mistral3_bidirectional_vlm_config()
+        config.image_token_id = processor.image_token_id
+        config.num_labels = 1
+        config.temperature = 0.02
+        encoder = CrossEncoderModel(Mistral3VLBidirectionalForSequenceClassification(config)).eval()
+        features = [
+            {"question": "What is shown?", "doc_text": "literal", "doc_image": ""},
+            {
+                "question": "What is shown?",
+                "doc_text": "Image doc",
+                "doc_image": Image.new("RGB", (16, 16), (255, 0, 0)),
+            },
+        ]
+        batch = processor.process_queries_documents_crossencoder(features)
+        model_inputs = {key: value for key, value in batch.items() if key != "labels"}
+        with torch.no_grad():
+            expected = encoder.model(**model_inputs).logits
+        if consolidated:
+            from safetensors.torch import save_file
+
+            export_dir.mkdir()
+            ConsolidatedHFAddon().pre_save(
+                model_state=SimpleNamespace(model=[encoder]),
+                hf_metadata_dir=str(export_dir),
+                fqn_to_file_index_mapping={},
+                original_model_path=None,
+                tokenizer=processor,
+            )
+            save_file(encoder.model.state_dict(), export_dir / "model.safetensors", metadata={"format": "pt"})
+        else:
+            encoder.save_pretrained(str(export_dir), tokenizer=processor)
+        metadata = json.loads((export_dir / "config_sentence_transformers.json").read_text())
+        assert metadata["model_type"] == "CrossEncoder"
+        assert metadata["activation_fn"] == "torch.nn.modules.linear.Identity"
+        transformer_config = json.loads((export_dir / "sentence_bert_config.json").read_text())
+        assert "processing_kwargs" not in transformer_config
+        assert "max_seq_length" not in transformer_config
+        tokenizer_config = json.loads((export_dir / "tokenizer_config.json").read_text())
+        assert tokenizer_config["model_max_length"] == 64
+        assert "max_length" not in tokenizer_config
+        assert (export_dir / "model.py").is_file()
+        assert (export_dir / "processor.py").is_file()
+        torch.save(
+            {"inputs": model_inputs, "logits": expected, "state": encoder.model.state_dict()},
+            export_dir.with_suffix(".pt"),
+        )
     code = """
 import sys
 import torch
+# Tiny CPU forwards are faster without thread-pool scheduling overhead.
+torch.set_num_threads(1)
 from PIL import Image
 from transformers import AutoModelForSequenceClassification, AutoProcessor
 from sentence_transformers import CrossEncoder
-directory, expected_path = sys.argv[1:]
-model = AutoModelForSequenceClassification.from_pretrained(directory, trust_remote_code=True, attn_implementation="eager").eval()
-processor = AutoProcessor.from_pretrained(directory, trust_remote_code=True)
-batch = processor.process_queries_documents_crossencoder([
-    {"question": "What is shown?", "doc_text": "literal", "doc_image": ""},
-    {"question": "What is shown?", "doc_text": "Image doc", "doc_image": Image.new("RGB", (16, 16), (255, 0, 0))},
-])
-inputs = {key: value for key, value in batch.items() if key != "labels"}
-expected = torch.load(expected_path, weights_only=True)
-assert set(inputs) == set(expected["inputs"])
-for key, value in inputs.items():
-    torch.testing.assert_close(value, expected["inputs"][key], rtol=0, atol=0)
-assert model.state_dict().keys() == expected["state"].keys()
-for key, value in model.state_dict().items():
-    torch.testing.assert_close(value, expected["state"][key], rtol=0, atol=0)
-with torch.no_grad():
-    torch.testing.assert_close(model(**inputs).logits, expected["logits"], rtol=1e-6, atol=1e-6)
-cross_encoder = CrossEncoder(directory, trust_remote_code=True, device="cpu", model_kwargs={"attn_implementation": "eager"})
-assert isinstance(cross_encoder.activation_fn, torch.nn.Identity)
-assert cross_encoder[0].processing_kwargs == {}
-pairs = [("What is shown?", "literal"), ("What is shown?", {"text": "Image doc", "image": Image.new("RGB", (16, 16), (255, 0, 0))})]
-standard_inputs = cross_encoder[0].preprocess(pairs)
-for key, value in expected["inputs"].items():
-    torch.testing.assert_close(standard_inputs[key], value, rtol=0, atol=0)
-scores = cross_encoder.predict(pairs, batch_size=2, convert_to_tensor=True, show_progress_bar=False)
-torch.testing.assert_close(scores.reshape(-1, 1), expected["logits"], rtol=1e-5, atol=1e-7)
+directories = sys.argv[1:]
+for directory in directories:
+    expected = torch.load(directory + ".pt", weights_only=True)
+    model = AutoModelForSequenceClassification.from_pretrained(directory, trust_remote_code=True, attn_implementation="eager").eval()
+    processor = AutoProcessor.from_pretrained(directory, trust_remote_code=True)
+    batch = processor.process_queries_documents_crossencoder([
+        {"question": "What is shown?", "doc_text": "literal", "doc_image": ""},
+        {"question": "What is shown?", "doc_text": "Image doc", "doc_image": Image.new("RGB", (16, 16), (255, 0, 0))},
+    ])
+    inputs = {key: value for key, value in batch.items() if key != "labels"}
+    assert set(inputs) == set(expected["inputs"])
+    for key, value in inputs.items():
+        torch.testing.assert_close(value, expected["inputs"][key], rtol=0, atol=0)
+    assert model.state_dict().keys() == expected["state"].keys()
+    for key, value in model.state_dict().items():
+        torch.testing.assert_close(value, expected["state"][key], rtol=0, atol=0)
+    with torch.no_grad():
+        torch.testing.assert_close(model(**inputs).logits, expected["logits"], rtol=1e-6, atol=1e-6)
+    cross_encoder = CrossEncoder(directory, trust_remote_code=True, device="cpu", model_kwargs={"attn_implementation": "eager"})
+    assert isinstance(cross_encoder.activation_fn, torch.nn.Identity)
+    assert cross_encoder[0].processing_kwargs == {}
+    pairs = [("What is shown?", "literal"), ("What is shown?", {"text": "Image doc", "image": Image.new("RGB", (16, 16), (255, 0, 0))})]
+    standard_inputs = cross_encoder[0].preprocess(pairs)
+    for key, value in expected["inputs"].items():
+        torch.testing.assert_close(standard_inputs[key], value, rtol=0, atol=0)
+    scores = cross_encoder.predict(pairs, batch_size=2, convert_to_tensor=True, show_progress_bar=False)
+    torch.testing.assert_close(scores.reshape(-1, 1), expected["logits"], rtol=1e-5, atol=1e-7)
 assert not any(name == "nemo_automodel" or name.startswith("nemo_automodel.") for name in sys.modules)
 """
     result = subprocess.run(
-        [sys.executable, "-I", "-c", code, str(export_dir), str(tmp_path / "expected.pt")],
+        [sys.executable, "-I", "-c", code, *map(str, export_dirs)],
         cwd=tmp_path,
         capture_output=True,
         text=True,
