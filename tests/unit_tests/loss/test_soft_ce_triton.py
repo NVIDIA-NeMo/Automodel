@@ -156,3 +156,38 @@ def test_unnormalized_target_forward_and_backward():
 
     torch.testing.assert_close(tri_loss, ref_loss, rtol=1e-4, atol=1e-4)
     torch.testing.assert_close(logits_tri.grad, logits_ref.grad, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize(
+    "layout",
+    ["logits_slice", "targets_slice", "logits_transpose", "targets_transpose", "logits_expand", "mask_slice", "mask_expand"],
+)
+def test_strided_inputs_match_pytorch(dtype, layout):
+    """Sequence views and broadcast masks preserve the soft-label objective."""
+    torch.manual_seed(123)
+    logits, targets, mask = _make_inputs(2, 8, 17, dtype=dtype)
+    if layout == "logits_slice":
+        logits = torch.randn(2, 16, 17, dtype=dtype, device="cuda")[:, :8]
+    elif layout == "targets_slice":
+        targets = torch.softmax(torch.randn(2, 16, 17, device="cuda"), dim=-1).to(dtype)[:, :8]
+    elif layout == "logits_transpose":
+        logits = torch.randn(8, 2, 17, dtype=dtype, device="cuda").transpose(0, 1)
+    elif layout == "targets_transpose":
+        targets = torch.softmax(torch.randn(8, 2, 17, device="cuda"), dim=-1).to(dtype).transpose(0, 1)
+    elif layout == "logits_expand":
+        logits = torch.randn(1, 1, 17, dtype=dtype, device="cuda").expand(2, 8, 17)
+    elif layout == "mask_slice":
+        storage = torch.ones(2, 16, 1, device="cuda")
+        storage[:, ::4] = 0
+        mask = storage[:, ::2]
+    else:
+        mask = torch.tensor([0.0, 1.0], device="cuda").reshape(2, 1, 1).expand(2, 8, 1)
+    logits.requires_grad_(True)
+    reference = logits.detach().clone().requires_grad_(True)
+    expected = _pytorch_reference(reference, targets, mask)
+    expected.backward()
+    actual = fused_soft_cross_entropy(logits, targets, mask)
+    actual.backward()
+    torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(logits.grad, reference.grad, rtol=1e-3, atol=1e-3)
