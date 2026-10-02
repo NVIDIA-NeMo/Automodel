@@ -676,6 +676,31 @@ class Qwen3_5Model(HFQwen3_5Model):
             )
         return image_mask.unsqueeze(-1).to(inputs_embeds.device), video_mask.unsqueeze(-1).to(inputs_embeds.device)
 
+    @staticmethod
+    def _scatter_media_embeddings(
+        inputs_embeds: torch.Tensor,
+        media_embeds: torch.Tensor,
+        media_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Replace selected token embeddings without dynamic-size backward ops.
+
+        Args:
+            inputs_embeds: Token embeddings of shape [batch, sequence, hidden].
+            media_embeds: Media embeddings of shape [media_tokens, hidden], in
+                the order of true entries in ``media_mask``.
+            media_mask: Boolean mask of shape [batch, sequence, 1].
+
+        Returns:
+            Combined token embeddings of shape [batch, sequence, hidden].
+        """
+        if media_embeds.numel() == 0:
+            return inputs_embeds
+        expanded_mask = media_mask.expand_as(inputs_embeds).reshape(-1)
+        source = media_embeds.reshape(-1)
+        source_indices = (expanded_mask.to(torch.long).cumsum(0) - 1).clamp_min_(0)
+        selected = source.index_select(0, source_indices)
+        return torch.where(expanded_mask, selected, inputs_embeds.reshape(-1)).reshape_as(inputs_embeds)
+
     def forward(
         self,
         input_ids=None,
@@ -690,6 +715,26 @@ class Qwen3_5Model(HFQwen3_5Model):
         cache_position=None,
         **kwargs,
     ):
+        """Encode media, splice its tokens, and run the text backbone.
+
+        Args:
+            input_ids: Token IDs of shape [batch, sequence], or first-stage
+                embeddings of shape [batch, sequence, hidden] under pipeline parallelism.
+            attention_mask: Mask of shape [batch, sequence] or a packed mask.
+            position_ids: Optional positions of shape [3, batch, sequence].
+            past_key_values: Optional attention cache with per-layer sequence state.
+            inputs_embeds: Optional embeddings of shape [batch, sequence, hidden].
+            pixel_values: Optional image patches of shape [patches, patch_features].
+            pixel_values_videos: Optional video patches of shape [patches, patch_features].
+            image_grid_thw: Optional image grid of shape [images, 3].
+            video_grid_thw: Optional video grid of shape [videos, 3].
+            cache_position: Optional cache positions of shape [sequence].
+            **kwargs: Additional text and multimodal forward arguments.
+
+        Returns:
+            Model output with hidden states of shape [batch, sequence, hidden]
+            and optional cached attention state.
+        """
         # Media present + vision encoder: full HF VL forward (vision encode +
         # multimodal scatter), which then calls self.language_model (NeMo backbone).
         if (pixel_values is not None or pixel_values_videos is not None) and self.visual is not None:
@@ -707,16 +752,49 @@ class Qwen3_5Model(HFQwen3_5Model):
             media_tensor = pixel_values if pixel_values is not None else pixel_values_videos
             if isinstance(media_tensor, torch.Tensor) and hasattr(self.visual, "rotary_pos_emb"):
                 self.visual.rotary_pos_emb.to(media_tensor.device)
+            if inputs_embeds_for_super is None:
+                inputs_embeds_for_super = embed_tokens(input_ids_for_super)
+
+            if pixel_values is not None:
+                image_outputs = self.get_image_features(pixel_values, image_grid_thw, return_dict=True, **kwargs)
+                image_embeds = torch.cat(image_outputs.pooler_output, dim=0).to(
+                    inputs_embeds_for_super.device, inputs_embeds_for_super.dtype
+                )
+                image_mask, _ = self.get_placeholder_mask(input_ids_for_super, inputs_embeds_for_super, image_embeds)
+                inputs_embeds_for_super = self._scatter_media_embeddings(
+                    inputs_embeds_for_super, image_embeds, image_mask
+                )
+            if pixel_values_videos is not None:
+                video_outputs = self.get_video_features(pixel_values_videos, video_grid_thw, return_dict=True, **kwargs)
+                video_embeds = torch.cat(video_outputs.pooler_output, dim=0).to(
+                    inputs_embeds_for_super.device, inputs_embeds_for_super.dtype
+                )
+                _, video_mask = self.get_placeholder_mask(
+                    input_ids_for_super, inputs_embeds_for_super, video_features=video_embeds
+                )
+                inputs_embeds_for_super = self._scatter_media_embeddings(
+                    inputs_embeds_for_super, video_embeds, video_mask
+                )
+            if position_ids is None:
+                position_ids = self.compute_3d_position_ids(
+                    input_ids=input_ids_for_super,
+                    image_grid_thw=image_grid_thw,
+                    video_grid_thw=video_grid_thw,
+                    inputs_embeds=inputs_embeds_for_super,
+                    attention_mask=attention_mask,
+                    past_key_values=past_key_values,
+                    mm_token_type_ids=kwargs.get("mm_token_type_ids"),
+                )
             return super().forward(
-                input_ids=input_ids_for_super,
+                input_ids=None,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
                 inputs_embeds=inputs_embeds_for_super,
-                pixel_values=pixel_values,
-                pixel_values_videos=pixel_values_videos,
-                image_grid_thw=image_grid_thw,
-                video_grid_thw=video_grid_thw,
+                pixel_values=None,
+                pixel_values_videos=None,
+                image_grid_thw=None,
+                video_grid_thw=None,
                 cache_position=cache_position,
                 **kwargs,
             )

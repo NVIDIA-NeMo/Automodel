@@ -104,3 +104,64 @@ def test_placeholder_masks_match_hf_and_reject_mismatched_features() -> None:
 
     with pytest.raises(RuntimeError, match="Image features and image tokens do not match"):
         model.get_placeholder_mask(input_ids, embeds, image_features[:1], video_features)
+
+
+def test_media_scatter_matches_masked_scatter_forward_and_backward() -> None:
+    torch.manual_seed(13)
+    model = _tiny_model().model
+    mask = torch.tensor([[[False], [True], [False], [True], [True]]])
+    base = torch.randn(1, 5, 16)
+    media = torch.randn(3, 16)
+
+    def run(reference: bool):
+        inputs = base.clone().requires_grad_()
+        features = media.clone().requires_grad_()
+        if reference:
+            output = inputs.masked_scatter(mask, features)
+        else:
+            output = model._scatter_media_embeddings(inputs, features, mask)
+        output.square().sum().backward()
+        return output.detach(), inputs.grad.detach(), features.grad.detach()
+
+    for actual, expected in zip(run(reference=False), run(reference=True)):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("is_video", [False, True])
+@pytest.mark.parametrize("text_mode", ["input_ids", "inputs_embeds", "hidden_ids"])
+def test_model_media_forward_and_backward_matches_hf_scatter(is_video: bool, text_mode: str) -> None:
+    torch.manual_seed(19)
+    model = _tiny_model().model
+    input_ids = torch.tensor([[1, *([61 if is_video else 60] * 4), 2]])
+    grid = torch.tensor([[1, 2, 2]], dtype=torch.long)
+    pixels = torch.randn(4, 12)
+    position_ids = torch.arange(input_ids.shape[-1]).view(1, 1, -1).expand(3, 1, -1)
+
+    def run(reference: bool):
+        model.zero_grad(set_to_none=True)
+        patches = pixels.clone().requires_grad_()
+        call = HFQwen3_5Model.forward if reference else type(model).forward
+        media_kwargs = (
+            {"pixel_values_videos": patches, "video_grid_thw": grid}
+            if is_video
+            else {"pixel_values": patches, "image_grid_thw": grid}
+        )
+        if text_mode == "input_ids":
+            text_kwargs = {"input_ids": input_ids}
+        else:
+            embeds = model.get_input_embeddings()(input_ids)
+            text_kwargs = (
+                {"input_ids": embeds} if text_mode == "hidden_ids" and not reference else {"inputs_embeds": embeds}
+            )
+        output = call(model, position_ids=position_ids, **text_kwargs, **media_kwargs)
+        hidden = output.last_hidden_state
+        hidden.square().sum().backward()
+        return (
+            hidden.detach().clone(),
+            patches.grad.detach().clone(),
+            model.get_input_embeddings().weight.grad.detach().clone(),
+            model.visual.blocks[0].attn.qkv.weight.grad.detach().clone(),
+        )
+
+    for actual, expected in zip(run(reference=False), run(reference=True)):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
