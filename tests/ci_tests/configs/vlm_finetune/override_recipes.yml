@@ -21,11 +21,11 @@ exempt_models:
   - cohere_micro_vision
 
 exempt_configs:
-  # Model-card examples need GPU validation before automatic CI enrollment.
+  # Additional model-card examples require GPU validation or are age-deprecated.
   smolvlm_instruct_medpix_peft:
     reason: "Model-card example; GPU training is not validated for CI enrollment"
   llava_1_5_7b_hf_medpix_peft:
-    reason: "Model-card example; GPU training is not validated for CI enrollment"
+    reason: "Deprecated checkpoint (2026-10-01 age review); exempt until recipe removal"
   llama_4_scout_17b_16e_instruct_medpix_peft:
     reason: "Model-card example; GPU training is not validated for CI enrollment"
   qwen3_vl_4b_instruct_medpix_peft:

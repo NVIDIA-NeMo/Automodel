@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -185,6 +187,81 @@ def test_model_card_examples_do_not_expand_release_gpu_ci(
     # The examples remain available to readers and to CPU documentation checks.
     available_recipes = {path.stem for path in (Path("examples") / test_folder).rglob("*.yaml")}
     assert example_recipes <= available_recipes
+
+
+@pytest.mark.parametrize("scope", ["test", "nightly", "release", "performance"])
+@pytest.mark.parametrize(
+    "test_folder",
+    [
+        "llm_finetune",
+        "vlm_finetune",
+        "llm_benchmark",
+        "llm_pretrain",
+        "retrieval_bi_encoder",
+        "retrieval_cross_encoder",
+    ],
+)
+def test_age_deprecated_recipes_are_exempt_from_gpu_ci(scope: str, test_folder: str) -> None:
+    from nemo_automodel.components.models.deprecation import _DEPRECATED_CHECKPOINT_YAMLS
+
+    deprecated_paths = {
+        path
+        for paths in _DEPRECATED_CHECKPOINT_YAMLS.values()
+        for path in paths
+        if not path.startswith("examples/diffusion/")
+    }
+    pipeline = generate_pipeline(".", scope, test_folder)
+    scheduled_paths = {
+        job["variables"]["CONFIG_PATH"]
+        for job in pipeline.values()
+        if isinstance(job, dict) and "CONFIG_PATH" in job.get("variables", {})
+    }
+
+    assert not deprecated_paths.intersection(scheduled_paths)
+
+
+@pytest.mark.parametrize("scope", ["nightly", "release"])
+def test_flux_recipes_remain_enrolled_after_age_deprecation(scope: str) -> None:
+    pipeline = generate_pipeline(".", scope, "diffusion_finetune")
+
+    assert "flux_t2i_flow" in pipeline
+    assert pipeline["flux_t2i_flow"]["variables"]["CONFIG_PATH"] == "examples/diffusion/finetune/flux_t2i_flow.yaml"
+    assert "flux_t2i_flow_lora" in pipeline
+
+
+def test_fully_exempt_nightly_retrieval_has_a_completion_job_without_gpu_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tests.ci_tests.utils.generate_ci_tests import main
+
+    repo_root = Path.cwd()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "generate_ci_tests.py",
+            "--automodel-dir",
+            str(repo_root),
+            "--scope",
+            "nightly",
+            "--test-folder",
+            "retrieval_cross_encoder",
+        ],
+    )
+    main()
+    pipeline = YAML(typ="safe").load(tmp_path / "generated_automodel_retrieval_cross_encoder_tests.yml")
+    jobs = {name: job for name, job in pipeline.items() if name != "include"}
+
+    assert len(jobs) == 1
+    job = jobs["no_enrolled_retrieval_cross_encoder_tests"]
+    assert job["stage"] == "functional_test"
+    assert job["rules"] == [{"when": "always"}]
+    result = subprocess.run(["bash", "-c", "\n".join(job["script"])], capture_output=True, text=True, check=True)
+    assert "No enrolled AutoModel recipes remain" in result.stdout
+    assert job["variables"] == {"GIT_STRATEGY": "none"}
+    assert "extends" not in job
+    assert "parallel" not in job
 
 
 @pytest.mark.parametrize(
