@@ -67,7 +67,7 @@ def roll_tensor(t: torch.Tensor, shifts: int = -1, dim: int = -1) -> torch.Tenso
     rolled = torch.roll(t, shifts=shifts, dims=dim)
     if shifts == 0 or t.shape[dim] == 0:
         return rolled
-    n = abs(shifts)
+    n = min(abs(shifts), t.shape[dim])
     if shifts < 0:
         idx = torch.arange(t.shape[dim] - n, t.shape[dim], device=t.device)
     else:
