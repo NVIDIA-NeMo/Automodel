@@ -33,7 +33,6 @@ import math
 import os
 import re
 from dataclasses import dataclass
-from typing import Any
 
 import torch
 import torch.nn as nn
@@ -53,7 +52,7 @@ TOY_MOE_DIT_MODEL_TYPE = "toy_moe_dit"
 TOY_MOE_DIT_ARCHITECTURE = "ToyMoEDiTForDiffusion"
 
 
-def toy_backend(**overrides: Any) -> BackendConfig:
+def toy_backend(**overrides: str | bool) -> BackendConfig:
     """Return a pure-PyTorch backend (no TE / DeepEP) that runs on CPU and GPU."""
     fields = {
         "attn": "sdpa",
@@ -87,7 +86,7 @@ class ToyMoEDiTConfig(PretrainedConfig):
         score_func: str = "softmax",
         gate_bias_update_factor: float = 0.0,
         norm_eps: float = 1e-6,
-        **kwargs: Any,
+        **kwargs: object,
     ):
         self.in_channels = in_channels
         self.hidden_size = hidden_size
@@ -300,7 +299,7 @@ class ToyMoEDiTForDiffusion(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         config: ToyMoEDiTConfig,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
-        **kwargs: Any,
+        **kwargs: object,
     ):
         super().__init__()
         self.config = config
@@ -318,7 +317,7 @@ class ToyMoEDiTForDiffusion(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         encoder_hidden_states: torch.Tensor,
         attention_kwargs: dict | None = None,
         return_dict: bool = False,
-        **kwargs: Any,
+        **kwargs: object,
     ):
         """Diffusers-style forward used by ``SimpleAdapter``.
 
