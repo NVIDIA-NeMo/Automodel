@@ -6,7 +6,7 @@ recipe: TrainFinetuneRecipeForNextTokenPrediction
 step_scheduler:
   global_batch_size: 512
   local_batch_size: 8
-  ckpt_every_steps: 50
+  ckpt_every_steps: 500
   val_every_steps: 100
   max_steps: 100
 
