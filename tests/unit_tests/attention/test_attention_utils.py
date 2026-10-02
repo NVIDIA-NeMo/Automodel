@@ -590,6 +590,23 @@ class TestEndToEndWorkflow:
 class TestFA4Backend:
     """Tests for the FlashAttention-4 (CuTe) backend branch."""
 
+    @pytest.mark.parametrize("capability", [(10, 0), (11, 0)])
+    @pytest.mark.parametrize("varlen", [False, True])
+    def test_fa4_hd256_local_attention_fails_before_kernel(self, capability, varlen):
+        """Blackwell HD256 windows fail clearly without launching a CUDA kernel."""
+        from torch._subclasses.fake_tensor import FakeTensorMode
+
+        flash_attn_cute = mock.MagicMock()
+        with mock.patch.dict(sys.modules, {"flash_attn.cute": flash_attn_cute}):
+            _, fa4 = initialize_attn_module_and_func("fa4", 4, 256, 256, 256**-0.5)
+        with FakeTensorMode(), mock.patch("torch.cuda.get_device_capability", return_value=capability):
+            q = k = v = torch.empty(1, 8, 4, 256, device="cuda")
+            metadata = {"cu_seqlens_q": torch.tensor([0, 8], device="cuda", dtype=torch.int32)} if varlen else {}
+            with pytest.raises(ValueError, match="use attn_impl='sdpa'"):
+                fa4(q, k, v, window_size=(15, None), **metadata)
+        flash_attn_cute.flash_attn_func.assert_not_called()
+        flash_attn_cute.flash_attn_varlen_func.assert_not_called()
+
     def test_fa4_causal_defaults_without_mask(self):
         """No mask -> plain causal, unbounded window, and no transpose."""
         q = torch.randn(2, 8, 4, 16)

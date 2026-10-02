@@ -166,6 +166,20 @@ def initialize_attn_module_and_func(
                 "causal": cast(bool, call_kwargs.get("causal", default_causal)),
                 "window_size": call_kwargs.get("window_size", (None, None)),
             }
+            # The pinned FA4 SM100/SM110 dedicated HD256 forward kernel has no
+            # local-attention implementation. Remove this guard when that pin
+            # supports local HD256 and the Blackwell parity matrix passes.
+            if (
+                q.shape[-1] == 256
+                and v.shape[-1] == 256
+                and any(bound is not None for bound in common["window_size"])
+                and q.is_cuda
+                and torch.cuda.get_device_capability(q.device)[0] in (10, 11)
+            ):
+                raise ValueError(
+                    "attn_impl='fa4' with head_dim=256 does not support local attention on SM100/SM110 "
+                    "in the pinned FlashAttention version; use attn_impl='sdpa' for this window."
+                )
             for opt in ("softcap", "learnable_sink"):
                 if call_kwargs.get(opt) is not None:
                     common[opt] = call_kwargs[opt]

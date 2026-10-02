@@ -17,6 +17,7 @@
 import pytest
 import torch
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from nemo_automodel.components.attention.utils import (
     initialize_attn_module_and_func,
@@ -60,14 +61,15 @@ def _packed_sdpa_reference(
             allowed = local_positions[None, :] <= local_positions[:, None]
             if window_size > 0:
                 allowed &= local_positions[None, :] > local_positions[:, None] - window_size
-            document_output = F.scaled_dot_product_attention(
-                q_document,
-                k_document,
-                v_document,
-                attn_mask=allowed,
-                scale=scale,
-                enable_gqa=True,
-            )
+            with sdpa_kernel(SDPBackend.MATH):
+                document_output = F.scaled_dot_product_attention(
+                    q_document,
+                    k_document,
+                    v_document,
+                    attn_mask=allowed,
+                    scale=scale,
+                    enable_gqa=True,
+                )
             output[batch_idx, positions] = document_output.squeeze(0).transpose(0, 1)
     return output
 
@@ -98,9 +100,10 @@ def test_native_fa4_forward_backward_matches_sdpa(
     q = torch.randn(2, 96, 4, qk_head_dim, device=device, dtype=dtype, requires_grad=True)
     k = torch.randn(2, 96, kv_heads, qk_head_dim, device=device, dtype=dtype, requires_grad=True)
     v = torch.randn(2, 96, kv_heads, v_head_dim, device=device, dtype=dtype, requires_grad=True)
-    q_ref = q.detach().clone().requires_grad_()
-    k_ref = k.detach().clone().requires_grad_()
-    v_ref = v.detach().clone().requires_grad_()
+    # Use a float32 math reference, independently of GPU fused-kernel dispatch.
+    q_ref = q.detach().float().requires_grad_()
+    k_ref = k.detach().float().requires_grad_()
+    v_ref = v.detach().float().requires_grad_()
 
     _, fa4 = initialize_attn_module_and_func(
         attn_impl="fa4",
@@ -126,15 +129,23 @@ def test_native_fa4_forward_backward_matches_sdpa(
     packed_q, packed_k, packed_v, fa4_kwargs = preprocess_args_and_kwargs_for_attn(
         q, k, v, attention_mask if packed else None, "fa4", window_size=(window_size, 0), **metadata
     )
+    if qk_head_dim == v_head_dim == 256 and window_size > 0:
+        # The pinned SM100/SM110 HD256 kernel explicitly rejects local attention.
+        # Turn this into parity coverage when the upstream pin supports it.
+        with pytest.raises(ValueError, match="head_dim=256 does not support local attention"):
+            fa4(packed_q, packed_k, packed_v, **fa4_kwargs)
+        return
     output = fa4(packed_q, packed_k, packed_v, **fa4_kwargs)
     reference = _packed_sdpa_reference(q_ref, k_ref, v_ref, attention_mask, scale=scale, window_size=window_size)
 
     # bf16 kernels use different tiled reduction orders; output and gradient
     # tolerances allow rounding differences while exposing window/layout errors.
-    torch.testing.assert_close(output, reference, atol=3e-2, rtol=3e-2)
+    assert torch.isfinite(output).all(), "FA4 output contains nonfinite values"
+    torch.testing.assert_close(output.float(), reference, atol=3e-2, rtol=3e-2)
     output_weight = torch.randn_like(output)
     (output * output_weight).sum().backward()
     (reference * output_weight).sum().backward()
-    torch.testing.assert_close(q.grad, q_ref.grad, atol=5e-2, rtol=5e-2)
-    torch.testing.assert_close(k.grad, k_ref.grad, atol=5e-2, rtol=5e-2)
-    torch.testing.assert_close(v.grad, v_ref.grad, atol=5e-2, rtol=5e-2)
+    for name, actual, expected in (("q", q.grad, q_ref.grad), ("k", k.grad, k_ref.grad), ("v", v.grad, v_ref.grad)):
+        assert torch.isfinite(actual).all(), f"FA4 {name} gradient contains nonfinite values"
+        assert torch.isfinite(expected).all(), f"SDPA reference {name} gradient contains nonfinite values"
+        torch.testing.assert_close(actual.float(), expected, atol=5e-2, rtol=5e-2)

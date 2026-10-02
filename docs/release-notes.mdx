@@ -16,7 +16,9 @@ description: ""
   attention masks are unsupported. Packed Qwen3Next recurrent attention and
   DeepSeek V3.2 sparse attention are also unsupported by this backend.
 - Finite native FA4 windows count visible keys including the current token,
-  matching the SDPA window convention.
+  matching the SDPA window convention. The pinned SM100/SM110 FA4 kernel does
+  not support local attention with 256-wide query/key and value heads; select
+  `model.backend.attn: sdpa` for that combination.
 
 ### NEAT packing API migration
 
