@@ -492,6 +492,9 @@ def _apply_parallelization(
 
 
 if TYPE_CHECKING:
+    from transformers import PretrainedConfig
+
+    from nemo_automodel.components._peft.lora import PeftConfig
     from nemo_automodel.components.models.common import BackendConfig
 
 # A value a YAML / CLI override can assign to a model config field.
@@ -542,7 +545,7 @@ def _validate_custom_model_options(mesh_context: MeshContext | None, **options: 
         raise ValueError("Context parallelism is not supported for custom models yet (cp_size > 1).")
 
 
-def _apply_config_overrides(config, config_overrides: dict[str, ConfigFieldValue]) -> None:
+def _apply_config_overrides(config: "PretrainedConfig", config_overrides: dict[str, ConfigFieldValue]) -> None:
     """Set ``config_overrides`` on the loaded model config. Unknown fields are an error, so typos cannot pass silently."""
     unknown = sorted(set(config_overrides) - set(config.to_dict()))
     if unknown:
@@ -839,7 +842,7 @@ class NeMoAutoDiffusionPipeline:
         torch_dtype: torch.dtype,
         load_base_model: bool,
         load_for_training: bool,
-        peft_cfg=None,
+        peft_cfg: "PeftConfig | None" = None,
         backend: "BackendConfig | None" = None,
         config_overrides: dict[str, ConfigFieldValue] | None = None,
     ) -> "NeMoAutoDiffusionPipeline":

@@ -37,6 +37,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributed.device_mesh import DeviceMesh
 from transformers import PretrainedConfig
 
 from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
@@ -245,7 +246,9 @@ class ToyMoEDiTStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
         self.dtype = dtype
         self._uses_model_prefix = True
 
-    def from_hf(self, hf_state_dict: dict[str, torch.Tensor], device_mesh=None, **kwargs) -> dict[str, torch.Tensor]:
+    def from_hf(
+        self, hf_state_dict: dict[str, torch.Tensor], device_mesh: DeviceMesh | None = None, **kwargs: object
+    ) -> dict[str, torch.Tensor]:
         for key in hf_state_dict:
             if ".mlp.experts." in key and key.endswith(".weight"):
                 self._uses_model_prefix = key.startswith("model.")
@@ -253,7 +256,7 @@ class ToyMoEDiTStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
         return self._from_hf_w_merged_experts(hf_state_dict, device_mesh)
 
     def to_hf(
-        self, state_dict: dict[str, torch.Tensor], exclude_key_regex: str | None = None, **kwargs
+        self, state_dict: dict[str, torch.Tensor], exclude_key_regex: str | None = None, **kwargs: object
     ) -> dict[str, torch.Tensor]:
         hf_state_dict: dict[str, torch.Tensor] = {}
         for fqn, tensor in state_dict.items():
@@ -263,7 +266,9 @@ class ToyMoEDiTStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
                 hf_state_dict[key] = value
         return hf_state_dict
 
-    def convert_single_tensor_to_hf(self, fqn: str, tensor: torch.Tensor, **kwargs) -> list[tuple[str, torch.Tensor]]:
+    def convert_single_tensor_to_hf(
+        self, fqn: str, tensor: torch.Tensor, **kwargs: object
+    ) -> list[tuple[str, torch.Tensor]]:
         exclude_key_regex = kwargs.get("exclude_key_regex", None)
         pairs = self._convert_single_merged_expert_to_hf_split_experts(fqn, tensor, **kwargs)
         if pairs is None:
@@ -286,11 +291,19 @@ class ToyMoEDiTForDiffusion(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         supports_ep: bool = True
 
     @classmethod
-    def from_config(cls, config: ToyMoEDiTConfig, moe_config: MoEConfig | None = None, backend=None, **kwargs):
+    def from_config(
+        cls,
+        config: ToyMoEDiTConfig,
+        moe_config: MoEConfig | None = None,
+        backend: BackendConfig | None = None,
+        **kwargs: object,
+    ) -> ToyMoEDiTForDiffusion:
         return cls(config, moe_config, backend, **kwargs)
 
     @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path: str, *model_args, **kwargs):
+    def from_pretrained(
+        cls, pretrained_model_name_or_path: str, *model_args: object, **kwargs: object
+    ) -> ToyMoEDiTForDiffusion:
         config = ToyMoEDiTConfig.from_pretrained(pretrained_model_name_or_path)
         return cls.from_config(config, *model_args, **kwargs)
 
@@ -315,10 +328,10 @@ class ToyMoEDiTForDiffusion(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         hidden_states: torch.Tensor,
         timestep: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
-        attention_kwargs: dict | None = None,
+        attention_kwargs: dict[str, object] | None = None,
         return_dict: bool = False,
         **kwargs: object,
-    ):
+    ) -> tuple[torch.Tensor] | dict[str, torch.Tensor]:
         """Diffusers-style forward used by ``SimpleAdapter``.
 
         Args:

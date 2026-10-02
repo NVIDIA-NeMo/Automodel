@@ -33,6 +33,7 @@ import json
 import math
 import os
 import sys
+from typing import TYPE_CHECKING, Callable
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 if _REPO_ROOT not in sys.path:
@@ -42,6 +43,12 @@ from tests.functional_tests.diffusion.toy_moe_dit import (  # noqa: E402
     register_toy_moe_dit,
     write_toy_moe_dit_checkpoint,
 )
+
+if TYPE_CHECKING:
+    import torch
+    import torch.nn as nn
+
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import ConfigFieldValue
 
 SEED = 1234
 NUM_EXPERTS = 8
@@ -56,11 +63,11 @@ def _recipe_config(
     max_steps: int,
     checkpoint_dir: str,
     world_size: int,
-    config_overrides: dict | None,
+    config_overrides: dict[str, ConfigFieldValue] | None,
     save_checkpoint: bool = False,
     accumulation_steps: int = 1,
     strategy: str = "fsdp",
-) -> dict:
+) -> dict[str, object]:
     # Pure-PyTorch MoE backend (same knobs as ``toy_backend``) passed through ``model.backend``.
     backend = {
         "attn": "sdpa",
@@ -149,7 +156,7 @@ def _recipe_config(
     }
 
 
-def _expert_layout(model) -> list[dict]:
+def _expert_layout(model: nn.Module) -> list[dict[str, object]]:
     """Describe every MoE ``experts`` parameter: DTensor mesh axes, placements, local/global shapes."""
     from torch.distributed.tensor import DTensor
 
@@ -179,7 +186,7 @@ def _expert_layout(model) -> list[dict]:
     return layout
 
 
-def _gate_correction_bias_abs_max(model) -> float | None:
+def _gate_correction_bias_abs_max(model: nn.Module) -> float | None:
     """Largest |e_score_correction_bias| over all MoE gates (``None`` when gates have no correction bias)."""
     from torch.distributed.tensor import DTensor
 
@@ -194,7 +201,7 @@ def _gate_correction_bias_abs_max(model) -> float | None:
     return max(values) if values else None
 
 
-def _model_hf_state_dict(model) -> dict:
+def _model_hf_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
     """Gather sharded parameters and buffers (collective) and convert them to HF checkpoint keys."""
     from torch.distributed.tensor import DTensor
 
@@ -206,12 +213,12 @@ def _model_hf_state_dict(model) -> dict:
     return model.state_dict_adapter.to_hf(full)
 
 
-def _max_abs_diff(hf_state_dict: dict, reference: dict) -> float:
+def _max_abs_diff(hf_state_dict: dict[str, torch.Tensor], reference: dict[str, torch.Tensor]) -> float:
     assert set(hf_state_dict) == set(reference), sorted(set(hf_state_dict) ^ set(reference))
     return max(float((hf_state_dict[key] - reference[key].float()).abs().max()) for key in reference)
 
 
-def _max_abs_diff_vs_checkpoint(model, model_dir: str) -> float:
+def _max_abs_diff_vs_checkpoint(model: nn.Module, model_dir: str) -> float:
     """Diff the live (sharded) model against the HF safetensors it was loaded from."""
     from safetensors.torch import load_file
 
@@ -219,7 +226,7 @@ def _max_abs_diff_vs_checkpoint(model, model_dir: str) -> float:
     return _max_abs_diff(_model_hf_state_dict(model), reference)
 
 
-def _per_param_update_norms(model, model_dir: str) -> dict[str, float]:
+def _per_param_update_norms(model: nn.Module, model_dir: str) -> dict[str, float]:
     """L2 norm of (live weight - checkpoint weight) per HF tensor; isolates scaling errors in a parameter subset."""
     from safetensors.torch import load_file
 
@@ -228,7 +235,7 @@ def _per_param_update_norms(model, model_dir: str) -> dict[str, float]:
     return {key: float((live[key] - reference[key].float()).norm()) for key in sorted(reference)}
 
 
-def _max_abs_diff_vs_saved_checkpoint(model, checkpoint_dir: str) -> tuple[float, list[str]]:
+def _max_abs_diff_vs_saved_checkpoint(model: nn.Module, checkpoint_dir: str) -> tuple[float, list[str]]:
     """Diff the trained model against the checkpoint the recipe saved (all ranks' safetensors shards)."""
     import glob
 
@@ -274,8 +281,8 @@ def train(args: argparse.Namespace) -> None:
     real_scale_and_clip = diffusion_train.scale_grads_and_clip_grad_norm
     real_clip = diffusion_train.clip_grad_norm
 
-    def _record(name, fn):
-        def wrapper(*fn_args, **fn_kwargs):
+    def _record(name: str, fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
+        def wrapper(*fn_args: object, **fn_kwargs: object) -> torch.Tensor:
             clip_calls.append(name)
             if name == "scale_grads_and_clip_grad_norm":
                 clip_calls.append(f"ep_axis_name={fn_kwargs.get('ep_axis_name')}")
@@ -308,7 +315,7 @@ def train(args: argparse.Namespace) -> None:
     losses: list[float] = []
     real_step = recipe.flow_matching_pipeline.step
 
-    def step_wrapper(*step_args, **step_kwargs):
+    def step_wrapper(*step_args: object, **step_kwargs: object) -> tuple[object, ...]:
         result = real_step(*step_args, **step_kwargs)
         losses.append(float(result[1].detach().float()))
         return result
@@ -318,7 +325,7 @@ def train(args: argparse.Namespace) -> None:
     gate_bias_updates = []
     real_update = model.update_moe_gate_bias
 
-    def update_wrapper():
+    def update_wrapper() -> None:
         gate_bias_updates.append(1)
         return real_update()
 
@@ -329,7 +336,7 @@ def train(args: argparse.Namespace) -> None:
     first_step_update_norms: dict[str, float] = {}
     real_opt_step = recipe.optimizer[0].step
 
-    def opt_step_wrapper(*step_args, **step_kwargs):
+    def opt_step_wrapper(*step_args: object, **step_kwargs: object) -> object:
         out = real_opt_step(*step_args, **step_kwargs)
         if not first_step_update_norms:
             first_step_update_norms.update(_per_param_update_norms(model, args.model_dir))
