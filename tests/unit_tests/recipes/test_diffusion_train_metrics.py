@@ -755,6 +755,8 @@ def test_run_train_validation_loop_uses_hot_path_and_logs_perf_metrics(monkeypat
     recipe.model = model
     recipe.device_mesh = object()
     recipe.moe_mesh = None
+    recipe._get_cp_group_size = MagicMock(return_value=1)
+    recipe.pp_enabled = False
     recipe.device = torch.device("cpu")
     recipe.compute_dtype = torch.float32
     recipe.check_loss = True
@@ -1075,6 +1077,8 @@ def test_run_train_validation_loop_validates_only_with_a_val_dataloader(monkeypa
     recipe.model = nn.Linear(1, 1)
     recipe.device_mesh = None
     recipe.moe_mesh = None
+    recipe._get_cp_group_size = MagicMock(return_value=1)
+    recipe.pp_enabled = False
     recipe.device = torch.device("cpu")
     recipe.compute_dtype = torch.float32
     recipe.check_loss = False

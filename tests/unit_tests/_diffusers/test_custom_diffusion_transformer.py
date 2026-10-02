@@ -252,8 +252,9 @@ def test_from_custom_model_forwards_mesh_overrides_and_backend(monkeypatch, toy_
     )
 
     assert pipe.transformer is sentinel
-    (path,), kwargs = from_config.call_args
-    assert path == toy_config_dir
+    (config,), kwargs = from_config.call_args
+    assert isinstance(config, ToyMoEDiTConfig)
+    assert config._name_or_path == toy_config_dir
     # The MeshContext policy is lifted onto the DistributedSetup so the model infrastructure
     # (FSDP / EP sharding, meta-device init, checkpoint loading) is instantiated.
     setup_cls.assert_called_once_with(
@@ -269,10 +270,26 @@ def test_from_custom_model_forwards_mesh_overrides_and_backend(monkeypatch, toy_
     assert kwargs["trust_remote_code"] is False
     assert kwargs["use_liger_kernel"] is False
     assert kwargs["use_sdpa_patching"] is False
-    # Config overrides and the backend travel as model kwargs, like an LLM `model:` section.
-    assert kwargs["num_hidden_layers"] == 1
-    assert kwargs["router_aux_loss_coef"] == 0.5
+    # Config overrides are applied to the loaded config; the backend travels as a model kwarg.
+    assert config.num_hidden_layers == 1
+    assert config.router_aux_loss_coef == 0.5
+    assert "num_hidden_layers" not in kwargs
     assert kwargs["backend"] is backend
+
+
+def test_from_custom_model_rejects_unknown_config_override(monkeypatch, toy_config_dir):
+    from_config, _ = _patch_from_config(monkeypatch)
+
+    with pytest.raises(ValueError, match="num_hidden_layerz"):
+        NeMoAutoDiffusionPipeline._from_custom_model(
+            toy_config_dir,
+            mesh_context=None,
+            torch_dtype=torch.float32,
+            load_base_model=False,
+            load_for_training=False,
+            config_overrides={"num_hidden_layerz": 1},
+        )
+    from_config.assert_not_called()
 
 
 def test_from_custom_model_without_mesh_or_backend(monkeypatch, toy_config_dir):
@@ -282,13 +299,12 @@ def test_from_custom_model_without_mesh_or_backend(monkeypatch, toy_config_dir):
         toy_config_dir, mesh_context=None, torch_dtype=torch.bfloat16, load_base_model=False, load_for_training=False
     )
 
-    (path,), kwargs = from_config.call_args
-    assert path == toy_config_dir
+    (config,), kwargs = from_config.call_args
+    assert config.num_hidden_layers == 2
     assert kwargs["distributed_setup"] is None
     assert kwargs["load_base_model"] is False
     assert kwargs["peft_config"] is None
     assert "backend" not in kwargs
-    assert "num_hidden_layers" not in kwargs
 
 
 def test_from_custom_model_passes_backend_config_through(monkeypatch, toy_config_dir):
@@ -355,14 +371,15 @@ def test_from_pretrained_dispatches_to_custom_transformer(custom_repo, patched_c
 
     assert isinstance(pipe, NeMoAutoDiffusionPipeline)
     assert pipe.transformer is patched_custom_build.transformer
-    (path,), kwargs = patched_custom_build.build.call_args
-    assert path == os.path.join(custom_repo, "transformer")
+    (config,), kwargs = patched_custom_build.build.call_args
+    assert config._name_or_path == os.path.join(custom_repo, "transformer")
+    assert config.architectures == [CUSTOM_ARCH]
+    assert config.num_hidden_layers == 1
     assert kwargs["distributed_setup"].mesh_context is mesh_context
     assert kwargs["torch_dtype"] == torch.float32
     assert kwargs["load_base_model"] is True
     assert kwargs["peft_config"] is None
     assert kwargs["backend"] is backend
-    assert kwargs["num_hidden_layers"] == 1
     # Full finetuning: base weights are made trainable.
     assert all(param.requires_grad for param in pipe.transformer.parameters())
 
@@ -439,14 +456,14 @@ def test_from_config_dispatches_to_custom_transformer_with_random_init(tmp_path,
     )
 
     assert isinstance(pipe, NeMoAutoDiffusionPipeline)
-    (path,), kwargs = patched_custom_build.build.call_args
-    assert path == os.path.join(root, "dit")
+    (config,), kwargs = patched_custom_build.build.call_args
+    assert config._name_or_path == os.path.join(root, "dit")
+    assert config.num_hidden_layers == 1
     assert kwargs["distributed_setup"].mesh_context is mesh_context
     assert kwargs["torch_dtype"] == torch.float32
     assert kwargs["load_base_model"] is False
     assert kwargs["peft_config"] is None
     assert kwargs["backend"] == {"experts": "torch"}
-    assert kwargs["num_hidden_layers"] == 1
     # Pretraining always trains every parameter.
     assert all(param.requires_grad for param in pipe.transformer.parameters())
 

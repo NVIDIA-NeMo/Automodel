@@ -29,6 +29,11 @@
 # the bias, and both legs pass model.config_overrides, which must reach the model config.
 # The EP leg also saves a checkpoint through the MoE-mesh-aware checkpointer and checks
 # that the saved safetensors shards reproduce the trained weights exactly.
+#
+# A second EP1/EP2 pair accumulates 2 microbatches per step and compares per-parameter
+# first-step updates, which catches scaling errors confined to a parameter subset (e.g.
+# experts or the auxiliary-loss scale). A DDP run checks that the gate-bias hook is
+# still executed when DistributedDataParallel hides it behind .module.
 
 set -xeuo pipefail
 
@@ -70,3 +75,35 @@ timeout 600 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 --mast
 python "$RUNNER" compare "$RUN_DIR/dp2.json" "$RUN_DIR/ep2.json" \
     --loss-rtol 0.02 \
     --grad-norm-rtol 0.05
+
+# --- Gradient accumulation: 2 microbatches per optimizer step, EP1 vs EP2 ---
+for EP in 1 2; do
+    timeout 600 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 --master_port="$((MASTER_PORT + 1 + EP))" \
+        "$RUNNER" train \
+        --model-dir "$RUN_DIR/model" \
+        --checkpoint-dir "$RUN_DIR/accum_ep$EP" \
+        --ep-size "$EP" \
+        --accumulation-steps 2 \
+        --max-steps 3 \
+        --config-overrides "$CONFIG_OVERRIDES" \
+        --out "$RUN_DIR/accum_ep$EP.json"
+done
+
+python "$RUNNER" compare "$RUN_DIR/accum_ep1.json" "$RUN_DIR/accum_ep2.json" \
+    --accumulation-steps 2 \
+    --loss-rtol 0.02 \
+    --grad-norm-rtol 0.05 \
+    --update-rtol 0.05
+
+# --- DDP: the gate-bias hook lives on the wrapped module ---
+timeout 600 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 --master_port="$((MASTER_PORT + 4))" \
+    "$RUNNER" train \
+    --model-dir "$RUN_DIR/model" \
+    --checkpoint-dir "$RUN_DIR/ddp" \
+    --ep-size 1 \
+    --strategy ddp \
+    --max-steps 3 \
+    --config-overrides "$CONFIG_OVERRIDES" \
+    --out "$RUN_DIR/ddp.json"
+
+python "$RUNNER" check-ddp "$RUN_DIR/ddp.json"

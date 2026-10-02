@@ -18,7 +18,7 @@ import logging
 import os
 import time
 from contextlib import nullcontext
-from typing import Any, Dict
+from typing import TYPE_CHECKING, Any, Dict, Mapping
 
 import torch
 import torch.distributed as dist
@@ -29,6 +29,7 @@ _HAS_WANDB, wandb = safe_import(
     "wandb", msg="wandb is not installed. To enable W&B experiment tracking, run: uv add nemo-automodel[wandb]"
 )
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
+from torch.nn.parallel import DistributedDataParallel
 
 from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
 from nemo_automodel.components.config.loader import ConfigNode
@@ -162,6 +163,10 @@ def _calculate_throughput_metrics(
         "log_window_steps": float(optimizer_steps),
         "log_window_samples": float(global_samples),
     }
+
+
+if TYPE_CHECKING:
+    from nemo_automodel.components.models.common import BackendConfig
 
 
 def _build_diffusion_mesh_context(
@@ -325,9 +330,9 @@ def build_diffusion_pipeline(
     peft_cfg=None,
     model_type=None,
     active_transformer: str | None = None,
-    backend: Any = None,
+    backend: "BackendConfig | Mapping[str, Any] | None" = None,
     config_overrides: Dict[str, Any] | None = None,
-) -> tuple[NeMoAutoDiffusionPipeline, Any]:
+) -> tuple[NeMoAutoDiffusionPipeline, MeshContext]:
     """Build the sharded diffusion pipeline (model + parallel scheme).
 
     The optimizer is built separately by the recipe via
@@ -1055,9 +1060,9 @@ class TrainDiffusionRecipe(BaseRecipe):
                 micro_losses = []
                 prepare_for_grad_accumulation([self.model], pp_enabled=False)
                 num_microbatches = len(batch_group)
-                if self.moe_mesh is not None:
-                    # Router auxiliary losses are injected in backward; average them like the main loss.
-                    self._set_moe_aux_loss_backward_scale(num_batches=num_microbatches, num_label_tokens=0)
+                # Router auxiliary losses are injected in backward by MoEAuxLossAutoScaler regardless of EP;
+                # average them over the accumulation microbatches like the main loss (as the LLM recipe does).
+                self._set_moe_aux_loss_backward_scale(num_batches=num_microbatches, num_label_tokens=0)
                 for microbatch_idx, micro_batch in enumerate(batch_group):
                     is_final_microbatch = microbatch_idx == num_microbatches - 1
                     if is_final_microbatch:
@@ -1138,9 +1143,11 @@ class TrainDiffusionRecipe(BaseRecipe):
 
                 for optimizer in self.optimizer:
                     optimizer.step()
-                # Same guard as the LLM recipe: diffusers transformers have no router bias to update.
-                if hasattr(self.model, "update_moe_gate_bias"):
-                    self.model.update_moe_gate_bias()
+                # Same guard as the LLM recipe: diffusers transformers have no router bias to update. DDP hides
+                # the model's hook behind .module, so look at the wrapped model.
+                model = self.model.module if isinstance(self.model, DistributedDataParallel) else self.model
+                if hasattr(model, "update_moe_gate_bias"):
+                    model.update_moe_gate_bias()
                 if self.lr_scheduler is not None:
                     self.lr_scheduler[0].step(1)
 

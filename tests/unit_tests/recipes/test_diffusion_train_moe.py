@@ -158,21 +158,36 @@ class _GateBiasModel(nn.Linear):
 
 
 class _StepScheduler:
-    def __init__(self, batch_group):
+    """Yields one accumulation window (list of microbatches) per optimizer step."""
+
+    def __init__(self, batch_groups):
         self.step = 0
         self.epochs = [0]
         self.dataloader = None
         self.is_ckpt_step = False
         self.is_val_step = False
         self.log_remote_every_steps = 0
-        self._batch_group = batch_group
+        self._batch_groups = batch_groups
 
     def __iter__(self):
-        self.step = 1
-        yield self._batch_group
+        for group in self._batch_groups:
+            self.step += 1
+            yield group
 
 
-def _loop_recipe(monkeypatch, *, model, moe_mesh):
+class _FakeDDP(nn.Module):
+    """Stands in for DistributedDataParallel: the recipe must look through ``.module``."""
+
+    def __init__(self, module):
+        super().__init__()
+        self.module = module
+
+
+def _microbatch():
+    return {"video_latents": torch.zeros(1, 1), "text_embeddings": torch.zeros(1, 1)}
+
+
+def _loop_recipe(monkeypatch, *, model, moe_mesh, microbatches_per_step=(2,)):
     monkeypatch.setitem(sys.modules, "tqdm", SimpleNamespace(tqdm=lambda iterable, desc: iterable))
     for name in (
         "prepare_for_grad_accumulation",
@@ -188,10 +203,7 @@ def _loop_recipe(monkeypatch, *, model, moe_mesh):
     monkeypatch.setattr(diffusion_train.wandb, "run", None, raising=False)
 
     recipe = object.__new__(TrainDiffusionRecipe)
-    batch_group = [
-        {"video_latents": torch.zeros(1, 1), "text_embeddings": torch.zeros(1, 1)},
-        {"video_latents": torch.zeros(1, 1), "text_embeddings": torch.zeros(1, 1)},
-    ]
+    batch_groups = [[_microbatch() for _ in range(n)] for n in microbatches_per_step]
     recipe.dist_env = SimpleNamespace(is_main=False)
     recipe.global_batch_size = 2
     recipe.local_batch_size = 1
@@ -202,7 +214,7 @@ def _loop_recipe(monkeypatch, *, model, moe_mesh):
     recipe.num_epochs = 1
     recipe.sampler = None
     recipe.dataloader = [object()]
-    recipe.step_scheduler = _StepScheduler(batch_group)
+    recipe.step_scheduler = _StepScheduler(batch_groups)
     recipe.val_dataloader = None
     recipe.optimizer = [SimpleNamespace(zero_grad=MagicMock(), step=MagicMock(), param_groups=[{"lr": 0.01}])]
     recipe.lr_scheduler = None
@@ -223,14 +235,15 @@ def _loop_recipe(monkeypatch, *, model, moe_mesh):
     recipe._get_cp_group_size = MagicMock(return_value=1)
     recipe.save_checkpoint = MagicMock()
     recipe._finalize_and_close_checkpointer = MagicMock()
-    recipe.flow_matching_pipeline = SimpleNamespace(
-        step=MagicMock(
-            side_effect=[
-                (None, torch.tensor(1.0, requires_grad=True), None, {}),
-                (None, torch.tensor(3.0, requires_grad=True), None, {}),
-            ]
-        )
-    )
+    aux_scales = []
+
+    def step(*args, **kwargs):
+        # Record the auxiliary-loss scale in effect for every microbatch's backward.
+        aux_scales.append(MoEAuxLossAutoScaler.main_loss_backward_scale.item())
+        return (None, torch.tensor(float(len(aux_scales)), requires_grad=True), None, {})
+
+    recipe.flow_matching_pipeline = SimpleNamespace(step=MagicMock(side_effect=step))
+    recipe.aux_scales_seen = aux_scales
     return recipe
 
 
@@ -276,7 +289,6 @@ def test_train_step_without_moe_mesh_uses_dense_clipping(monkeypatch):
     monkeypatch.setattr(MoEAuxLossAutoScaler, "main_loss_backward_scale", torch.tensor(1.0))
     model = _GateBiasModel()
     recipe = _loop_recipe(monkeypatch, model=model, moe_mesh=None)
-    recipe._set_moe_aux_loss_backward_scale = MagicMock()
 
     recipe.run_train_validation_loop()
 
@@ -287,9 +299,33 @@ def test_train_step_without_moe_mesh_uses_dense_clipping(monkeypatch):
         foreach=True,
     )
     diffusion_train.scale_grads_and_clip_grad_norm.assert_not_called()
-    recipe._set_moe_aux_loss_backward_scale.assert_not_called()
-    # Dense custom-model MoE models (EP disabled) may still balance routers with gate biases.
+    # Routers inject auxiliary gradients at EP=1 too: the scale averages the 2 microbatches regardless of EP.
+    assert recipe.aux_scales_seen == pytest.approx([0.5, 0.5])
+    # Custom MoE models without EP still balance routers with gate biases.
     model.update_moe_gate_bias.assert_called_once_with()
+
+
+@pytest.mark.parametrize("moe_mesh", [None, SimpleNamespace(mesh_dim_names=("ep_shard", "ep"))])
+def test_aux_loss_scale_follows_each_accumulation_window(monkeypatch, moe_mesh):
+    """Scale = 1 / microbatches of the current window, including a shorter final window."""
+    monkeypatch.setattr(MoEAuxLossAutoScaler, "main_loss_backward_scale", torch.tensor(1.0))
+    recipe = _loop_recipe(monkeypatch, model=_GateBiasModel(), moe_mesh=moe_mesh, microbatches_per_step=(3, 2, 1))
+
+    recipe.run_train_validation_loop()
+
+    assert recipe.aux_scales_seen == pytest.approx([1 / 3, 1 / 3, 1 / 3, 0.5, 0.5, 1.0])
+    assert recipe.optimizer[0].step.call_count == 3
+
+
+def test_train_step_updates_gate_bias_through_ddp_wrapper(monkeypatch):
+    monkeypatch.setattr(MoEAuxLossAutoScaler, "main_loss_backward_scale", torch.tensor(1.0))
+    monkeypatch.setattr(diffusion_train, "DistributedDataParallel", _FakeDDP)
+    inner = _GateBiasModel()
+    recipe = _loop_recipe(monkeypatch, model=_FakeDDP(inner), moe_mesh=None)
+
+    recipe.run_train_validation_loop()
+
+    inner.update_moe_gate_bias.assert_called_once_with()
 
 
 def test_train_step_skips_gate_bias_update_for_models_without_it(monkeypatch):

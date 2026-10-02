@@ -131,6 +131,15 @@ class ToyMoEDiTBlock(nn.Module):
         self.mlp = MoE(moe_config, backend)
 
     def forward(self, x: torch.Tensor, temb: torch.Tensor) -> torch.Tensor:
+        """Run one block.
+
+        Args:
+            x: ``[batch, tokens, hidden]`` joint sequence; text tokens come first, latent tokens after them.
+            temb: ``[batch, hidden]`` timestep embedding added to every token before attention.
+
+        Returns:
+            ``[batch, tokens, hidden]`` updated sequence.
+        """
         batch, seq, dim = x.shape
         h = self.norm1(x) + temb[:, None, :]
         q, k, v = self.qkv(h).view(batch, seq, 3, self.num_heads, dim // self.num_heads).unbind(2)
@@ -190,6 +199,16 @@ class ToyMoEDiTModel(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, timestep: torch.Tensor, encoder_hidden_states: torch.Tensor
     ) -> torch.Tensor:
+        """Predict the flow velocity of the latents.
+
+        Args:
+            hidden_states: ``[batch, channels, *spatial]`` noisy latents; any number of trailing spatial dims.
+            timestep: ``[batch]`` diffusion timesteps.
+            encoder_hidden_states: ``[batch, text_sequence, text_embed_dim]`` text conditioning.
+
+        Returns:
+            ``[batch, channels, *spatial]`` prediction with the layout of ``hidden_states``.
+        """
         latent_shape = hidden_states.shape
         batch, channels = latent_shape[:2]
         # [B, C, *spatial] -> [B, N, C] latent tokens.
@@ -299,6 +318,19 @@ class ToyMoEDiTForDiffusion(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         return_dict: bool = False,
         **kwargs: Any,
     ):
+        """Diffusers-style forward used by ``SimpleAdapter``.
+
+        Args:
+            hidden_states: ``[batch, channels, *spatial]`` noisy latents.
+            timestep: ``[batch]`` diffusion timesteps.
+            encoder_hidden_states: ``[batch, text_sequence, text_embed_dim]`` text conditioning.
+            attention_kwargs: Ignored; accepted for interface compatibility.
+            return_dict: Return ``{"sample": prediction}`` instead of ``(prediction,)``.
+
+        Returns:
+            A one-element tuple or a dict with ``sample``: ``[batch, channels, *spatial]`` prediction with the layout
+            of ``hidden_states``.
+        """
         sample = self.model(hidden_states, timestep, encoder_hidden_states)
         return {"sample": sample} if return_dict else (sample,)
 

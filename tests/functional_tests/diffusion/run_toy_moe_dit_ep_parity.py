@@ -58,6 +58,8 @@ def _recipe_config(
     world_size: int,
     config_overrides: dict | None,
     save_checkpoint: bool = False,
+    accumulation_steps: int = 1,
+    strategy: str = "fsdp",
 ) -> dict:
     # Pure-PyTorch MoE backend (same knobs as ``toy_backend``) passed through ``model.backend``.
     backend = {
@@ -69,30 +71,38 @@ def _recipe_config(
         "dispatcher": "torch",
     }
     local_batch_size = 2
+    if strategy == "fsdp":
+        distributed = {
+            "fsdp": {
+                "tp_size": 1,
+                "cp_size": 1,
+                "pp_size": 1,
+                "dp_replicate_size": 1,
+                "ep_size": ep_size,
+                "activation_checkpointing": False,
+                "reduce_dtype": "float32",
+                "enable_fsdp2_prefetch": False,
+            }
+        }
+    else:
+        assert ep_size == 1, "DDP has no expert parallelism"
+        distributed = {"ddp": {}}
     return {
         "seed": SEED,
         "dist_env": {"backend": "nccl", "timeout_minutes": 2},
         "model": {
             "pretrained_model_name_or_path": model_dir,
             "mode": "finetune",
-            # fp32 master weights, bf16 compute (FSDP MixedPrecisionPolicy casts parameters).
+            # fp32 master weights, bf16 compute (FSDP MixedPrecisionPolicy casts parameters). DDP has no such
+            # cast and requires matching dtypes.
             "torch_dtype": "float32",
-            "compute_dtype": "bfloat16",
+            "compute_dtype": "bfloat16" if strategy == "fsdp" else "float32",
             "backend": backend,
             "config_overrides": config_overrides or {},
         },
         "optimizer": {"_target_": "torch.optim.AdamW", "lr": 1.0e-3, "weight_decay": 0.0},
         "clip_grad_norm": {"max_norm": 1.0},
-        "fsdp": {
-            "tp_size": 1,
-            "cp_size": 1,
-            "pp_size": 1,
-            "dp_replicate_size": 1,
-            "ep_size": ep_size,
-            "activation_checkpointing": False,
-            "reduce_dtype": "float32",
-            "enable_fsdp2_prefetch": False,
-        },
+        **distributed,
         "flow_matching": {
             "adapter_type": "simple",
             "adapter_kwargs": {},
@@ -106,7 +116,8 @@ def _recipe_config(
             "summary_log_interval": 1000,
         },
         "step_scheduler": {
-            "global_batch_size": local_batch_size * world_size,
+            # accumulation_steps > 1 makes every optimizer step accumulate several microbatches.
+            "global_batch_size": local_batch_size * world_size * accumulation_steps,
             "local_batch_size": local_batch_size,
             "ckpt_every_steps": max_steps if save_checkpoint else 100000,
             "num_epochs": 1,
@@ -208,6 +219,15 @@ def _max_abs_diff_vs_checkpoint(model, model_dir: str) -> float:
     return _max_abs_diff(_model_hf_state_dict(model), reference)
 
 
+def _per_param_update_norms(model, model_dir: str) -> dict[str, float]:
+    """L2 norm of (live weight - checkpoint weight) per HF tensor; isolates scaling errors in a parameter subset."""
+    from safetensors.torch import load_file
+
+    reference = load_file(os.path.join(model_dir, "transformer", "model.safetensors"))
+    live = _model_hf_state_dict(model)
+    return {key: float((live[key] - reference[key].float()).norm()) for key in sorted(reference)}
+
+
 def _max_abs_diff_vs_saved_checkpoint(model, checkpoint_dir: str) -> tuple[float, list[str]]:
     """Diff the trained model against the checkpoint the recipe saved (all ranks' safetensors shards)."""
     import glob
@@ -244,6 +264,8 @@ def train(args: argparse.Namespace) -> None:
             world_size,
             config_overrides,
             save_checkpoint=args.save_checkpoint,
+            accumulation_steps=args.accumulation_steps,
+            strategy=args.strategy,
         )
     )
 
@@ -268,8 +290,13 @@ def train(args: argparse.Namespace) -> None:
 
     recipe = diffusion_train.TrainDiffusionRecipe(cfg)
     recipe.setup()
+    from torch.nn.parallel import DistributedDataParallel
+
+    is_ddp = isinstance(recipe.model, DistributedDataParallel)
+    # The model that owns the config, the MoE layers and the gate-bias hook (DDP hides it behind .module).
+    model = recipe.model.module if is_ddp else recipe.model
     for key, value in (config_overrides or {}).items():
-        assert recipe.model.config.to_dict()[key] == value, f"model.config_overrides not applied: {key}"
+        assert model.config.to_dict()[key] == value, f"model.config_overrides not applied: {key}"
 
     # Model construction consumes RNG differently with and without EP (rank-local expert
     # shapes differ), so re-seed before training: both legs then draw identical mock data,
@@ -289,26 +316,57 @@ def train(args: argparse.Namespace) -> None:
     recipe.flow_matching_pipeline.step = step_wrapper
 
     gate_bias_updates = []
-    real_update = recipe.model.update_moe_gate_bias
+    real_update = model.update_moe_gate_bias
 
     def update_wrapper():
         gate_bias_updates.append(1)
         return real_update()
 
-    recipe.model.update_moe_gate_bias = update_wrapper
+    model.update_moe_gate_bias = update_wrapper
+
+    # Per-parameter update norms after the first optimizer step: aggregate metrics (loss, global grad norm)
+    # can hide a scaling error confined to a subset of parameters, e.g. the experts.
+    first_step_update_norms: dict[str, float] = {}
+    real_opt_step = recipe.optimizer[0].step
+
+    def opt_step_wrapper(*step_args, **step_kwargs):
+        out = real_opt_step(*step_args, **step_kwargs)
+        if not first_step_update_norms:
+            first_step_update_norms.update(_per_param_update_norms(model, args.model_dir))
+        return out
+
+    recipe.optimizer[0].step = opt_step_wrapper
 
     moe_mesh = recipe.moe_mesh
-    layout = _expert_layout(recipe.model)
+    layout = _expert_layout(model)
     checkpointer_moe_mesh = recipe.checkpointer.moe_mesh
-    max_abs_diff_vs_checkpoint = _max_abs_diff_vs_checkpoint(recipe.model, args.model_dir)
+    max_abs_diff_vs_checkpoint = _max_abs_diff_vs_checkpoint(model, args.model_dir)
 
     recipe.run_train_validation_loop()
 
-    gate_bias_abs_max = _gate_correction_bias_abs_max(recipe.model)
-    trained_vs_initial = _max_abs_diff_vs_checkpoint(recipe.model, args.model_dir)
+    gate_bias_abs_max = _gate_correction_bias_abs_max(model)
+    trained_vs_initial = _max_abs_diff_vs_checkpoint(model, args.model_dir)
     saved_vs_trained, saved_files = (
-        _max_abs_diff_vs_saved_checkpoint(recipe.model, args.checkpoint_dir) if args.save_checkpoint else (None, None)
+        _max_abs_diff_vs_saved_checkpoint(model, args.checkpoint_dir) if args.save_checkpoint else (None, None)
     )
+    # Routing state after the last gate-bias update: accumulated expert loads must be consumed, and every rank
+    # must hold the same correction bias.
+    from torch.distributed.tensor import DTensor
+
+    from nemo_automodel.components.moe.layers import MoE
+
+    gates = [m.gate for m in model.modules() if isinstance(m, MoE)]
+    routing_counts_cleared = all(gate._cumulative_expert_load is None for gate in gates)
+    local_bias = []
+    for gate in gates:
+        bias = gate.e_score_correction_bias
+        if bias is None:
+            continue
+        bias = bias.full_tensor() if isinstance(bias, DTensor) else bias
+        local_bias.append(bias.detach().float().cpu().tolist())
+    all_bias = [None] * dist.get_world_size()
+    dist.all_gather_object(all_bias, local_bias)
+    gate_bias_consistent_across_ranks = all(b == all_bias[0] for b in all_bias)
 
     # Data-parallel mean of the per-rank losses (each rank sees a different shard).
     loss_tensor = torch.tensor(losses, dtype=torch.float64, device=recipe.device)
@@ -325,6 +383,11 @@ def train(args: argparse.Namespace) -> None:
             "clip_calls": sorted(set(clip_calls)),
             "gate_bias_update_calls": len(gate_bias_updates),
             "gate_correction_bias_abs_max": gate_bias_abs_max,
+            "routing_counts_cleared": routing_counts_cleared,
+            "gate_bias_consistent_across_ranks": gate_bias_consistent_across_ranks,
+            "is_ddp": is_ddp,
+            "accumulation_steps": args.accumulation_steps,
+            "first_step_update_norms": first_step_update_norms,
             "moe_mesh_dim_names": list(moe_mesh.mesh_dim_names) if moe_mesh is not None else None,
             "moe_mesh_shape": list(moe_mesh.shape) if moe_mesh is not None else None,
             "checkpointer_has_moe_mesh": checkpointer_moe_mesh is not None and checkpointer_moe_mesh is moe_mesh,
@@ -336,7 +399,11 @@ def train(args: argparse.Namespace) -> None:
         }
         with open(args.out, "w") as f:
             json.dump(result, f, indent=2)
-        print(json.dumps({k: v for k, v in result.items() if k != "expert_layout"}, indent=2))
+        print(
+            json.dumps(
+                {k: v for k, v in result.items() if k not in ("expert_layout", "first_step_update_norms")}, indent=2
+            )
+        )
     dist.barrier()
     dist.destroy_process_group()
 
@@ -394,11 +461,50 @@ def compare(args: argparse.Namespace) -> None:
             # The EP-sharded save (checkpointer built with the MoE mesh) round-trips the trained weights.
             assert run["saved_vs_trained_max_abs_diff"] == 0.0, run["saved_vs_trained_max_abs_diff"]
 
+    assert ref["accumulation_steps"] == ep["accumulation_steps"] == args.accumulation_steps, (
+        ref["accumulation_steps"],
+        ep["accumulation_steps"],
+    )
+    for run in (ref, ep):
+        assert run["routing_counts_cleared"], "gate-bias update left accumulated expert loads behind"
+    # With EP the MoE parallelizer replicates e_score_correction_bias over the DP mesh, so update_bias sums the
+    # expert load of every rank. Without EP (ep_size=1 or DDP) the shared ModelParallelizer takes the generic FSDP2 /
+    # DDP path, which leaves the buffer a plain tensor: each rank then updates it from its own expert load only. That
+    # is pre-existing Automodel behavior (the LLM path at ep_size=1 behaves the same), so it is reported, not asserted.
+    assert ep["gate_bias_consistent_across_ranks"], "correction bias differs across ranks on the EP leg"
+    print(f"EP1 leg gate bias consistent across ranks: {ref['gate_bias_consistent_across_ranks']}")
+
     _assert_close("loss", ref["losses"], ep["losses"], args.loss_rtol)
     _assert_close("grad_norm", ref["grad_norms"], ep["grad_norms"], args.grad_norm_rtol)
+    # Per-parameter first-step updates (experts included) must match between the EP legs.
+    assert set(ref["first_step_update_norms"]) == set(ep["first_step_update_norms"])
+    mismatched = []
+    for key, ref_norm in ref["first_step_update_norms"].items():
+        ep_norm = ep["first_step_update_norms"][key]
+        if abs(ref_norm - ep_norm) > args.update_rtol * max(abs(ref_norm), 1e-8) + 1e-6:
+            mismatched.append((key, ref_norm, ep_norm))
+    assert not mismatched, f"first-step update norms differ: {mismatched[:5]}"
+    not_updated = sorted(key for key, value in ref["first_step_update_norms"].items() if value == 0)
+    # The correction bias is a buffer moved by update_moe_gate_bias after the optimizer step, not by the optimizer.
+    assert all("e_score_correction_bias" in key for key in not_updated), f"not updated by step 1: {not_updated}"
     # Training must actually move the model (the loss trajectory is not constant).
     assert len(set(round(x, 6) for x in ref["losses"])) > 1, ref["losses"]
-    print("PASSED: EP parity on toy custom-model MoE DiT")
+    print(f"PASSED: EP parity on toy custom-model MoE DiT (accumulation_steps={args.accumulation_steps})")
+
+
+def check_ddp(args: argparse.Namespace) -> None:
+    """A DDP run of the custom MoE DiT must still execute the gate-bias hook hidden behind DDP's .module."""
+    with open(args.result) as f:
+        run = json.load(f)
+    assert run["is_ddp"], "model was not wrapped in DistributedDataParallel"
+    assert run["moe_mesh_dim_names"] is None, run["moe_mesh_dim_names"]
+    assert run["gate_bias_update_calls"] == len(run["grad_norms"]), run["gate_bias_update_calls"]
+    assert run["gate_correction_bias_abs_max"], "gate-bias hook did not move the correction bias under DDP"
+    assert run["routing_counts_cleared"], "gate-bias update left accumulated expert loads behind"
+    assert run["trained_vs_initial_max_abs_diff"] > 0.0, "optimizer did not update the model"
+    # See compare(): without EP the bias is a plain tensor and is updated from rank-local expert load.
+    print(f"DDP gate bias consistent across ranks: {run['gate_bias_consistent_across_ranks']}")
+    print("PASSED: DDP gate-bias update on toy custom-model MoE DiT")
 
 
 def main() -> None:
@@ -418,11 +524,17 @@ def main() -> None:
     p_train.add_argument(
         "--config-overrides", default=None, help="JSON dict applied to the toy config (model.config_overrides)"
     )
+    p_train.add_argument("--accumulation-steps", type=int, default=1, help="Microbatches per optimizer step")
+    p_train.add_argument("--strategy", choices=("fsdp", "ddp"), default="fsdp")
     p_cmp = sub.add_parser("compare")
     p_cmp.add_argument("reference")
     p_cmp.add_argument("candidate")
     p_cmp.add_argument("--loss-rtol", type=float, default=2e-2)
     p_cmp.add_argument("--grad-norm-rtol", type=float, default=5e-2)
+    p_cmp.add_argument("--update-rtol", type=float, default=5e-2)
+    p_cmp.add_argument("--accumulation-steps", type=int, default=1)
+    p_ddp = sub.add_parser("check-ddp")
+    p_ddp.add_argument("result")
     args = parser.parse_args()
 
     if args.mode == "write-checkpoint":
@@ -440,6 +552,8 @@ def main() -> None:
         print(f"wrote toy checkpoint to {args.path}")
     elif args.mode == "train":
         train(args)
+    elif args.mode == "check-ddp":
+        check_ddp(args)
     else:
         compare(args)
 
