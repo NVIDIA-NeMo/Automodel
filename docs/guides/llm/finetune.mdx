@@ -910,7 +910,7 @@ optimizer:
       wd_mult: 1.0          # (optional) multiplier for weight decay; defaults to 1.0
 ```
 
-Each parameter joins the group of the **first** override whose `pattern` matches its name; parameters matching no pattern keep the base learning rate. A pattern that matches nothing is skipped with a warning. Standard optimizers support LR/WD overrides. Dion-family configs also support `algorithm: adamw` to route matching matrices to auxiliary AdamW. Their LR/WD multipliers apply to the selected group's base settings, including when no LR scheduler is configured; matrix layout groups remain separate. Only Dion-family configs accept the `algorithm` field.
+Each parameter joins the group of the **first** override whose `pattern` matches its name; parameters matching no pattern keep the base learning rate. A pattern that matches nothing is skipped with a warning. Standard optimizers apply `lr_mult` and `wd_mult`. Dion-family configs (Muon, NorMuon, Dion, Dion2, Muown) now apply `lr_mult` and `wd_mult` as well; previously they ignored `param_group_overrides` with a warning. They additionally accept `algorithm: adamw` to route matching matrices to the auxiliary AdamW. Their LR/WD multipliers apply to the selected group's base settings, including when no LR scheduler is configured; matrix layout groups remain separate. Only Dion-family configs accept the `algorithm` field.
 
 ### Muown for Dense and MoE Weights
 
@@ -951,7 +951,7 @@ Muown selects communication groups from each parameter's DTensor placements, all
 
 Set `optimizer.use_triton: true` to fuse Muown's direction preparation, momentum, magnitude Adam update, and weight recomposition on CUDA. This optional path requires Triton and contiguous FP32 local weights, gradients, and states. It supports complete input-feature axes up to 16384 elements for ordinary matrices and 8192 for transposed expert storage; wider, strided, other-dtype, and input-sharded tensors use the Torch path. Newton–Schulz arithmetic and FSDP communication are unchanged. The default is `false`.
 
-The default Newton–Schulz update uses five BF16 polynomial iterations and the reference implementation's shape-based QKV convention: a logical `[3d, d]` matrix is split into three `[d, d]` matrices. This rule follows shape, rather than inspecting module identity.
+The default Newton–Schulz update uses five BF16 polynomial iterations and the reference implementation's shape-based QKV convention: any logical matrix with `rows == 3 * cols` is split into three `[d, d]` blocks, mirroring the authors' reference. The rule is purely shape-based and does not inspect module identity: it does not fire for GQA fused QKV weights (where `q + 2 * kv != 3 * hidden`), and it does fire for any other weight with that shape, such as an MLP projection with intermediate size `3 × hidden`.
 
 See the [Qwen3-30B-A3B Muown recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen3_moe_30b_tulu3_muown.yaml) for real Tulu3 training with EP8, non-packed 4K sequences, and FP32 master weights on 8 GPUs. It runs a 30-step smoke test; tune learning rates and training duration for your workload.
 
