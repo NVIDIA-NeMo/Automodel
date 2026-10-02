@@ -13,9 +13,9 @@
 # limitations under the License.
 
 #!/bin/bash
-# Expert-parallel parity for native MoE diffusion transformers in the diffusion recipe.
+# Expert-parallel parity for custom-model MoE diffusion transformers in the diffusion recipe.
 #
-# A seeded toy native MoE DiT checkpoint (diffusers layout, HF per-expert keys) is
+# A seeded toy custom-model MoE DiT checkpoint (diffusers layout, HF per-expert keys) is
 # finetuned by TrainDiffusionRecipe with the mock video dataloader and SimpleAdapter.
 # Both legs run on 2 ranks with dp_size=2 and differ only in fsdp.ep_size, so data
 # sharding and FSDP wrapping match and the comparison isolates expert parallelism.

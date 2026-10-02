@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Expert-parallel parity of a native MoE diffusion transformer trained by the diffusion recipe.
+"""Expert-parallel parity of a custom-model MoE diffusion transformer trained by the diffusion recipe.
 
-See ``L2_Diffusion_ToyMoEDiT_EP2_Parity.sh``: a toy native MoE DiT is finetuned with
+See ``L2_Diffusion_ToyMoEDiT_EP2_Parity.sh``: a toy custom-model MoE DiT is finetuned with
 ``fsdp.ep_size=1`` and ``fsdp.ep_size=2`` on the same 2 ranks; per-step loss and grad norm
 must match and the EP leg must really shard its experts over the ``ep`` mesh axis.
 """

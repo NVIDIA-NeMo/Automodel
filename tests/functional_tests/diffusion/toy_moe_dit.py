@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Test-only native MoE diffusion transformer ("toy MoE DiT").
+"""Test-only custom-model MoE diffusion transformer ("toy MoE DiT").
 
-The model follows the native Automodel model contract (``HFCheckpointingMixin``,
+The model follows the custom-model contract (``HFCheckpointingMixin``,
 ``MoEFSDPSyncMixin``, ``ModelCapabilities``, ``state_dict_adapter``, ``ModelClass``)
 and places an Automodel :class:`~nemo_automodel.components.moe.layers.MoE` in
 ``model.model.layers[*].mlp`` so the MoE parallelizer applies expert parallelism.
@@ -254,7 +254,7 @@ class ToyMoEDiTStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
 
 
 class ToyMoEDiTForDiffusion(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
-    """Native MoE diffusion transformer with the ``SimpleAdapter`` forward signature."""
+    """Custom-model MoE diffusion transformer with the ``SimpleAdapter`` forward signature."""
 
     @dataclass(frozen=True)
     class ModelCapabilities:

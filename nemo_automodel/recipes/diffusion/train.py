@@ -324,8 +324,8 @@ def build_diffusion_pipeline(
     peft_cfg=None,
     model_type=None,
     active_transformer: str | None = None,
-    native_backend: Any = None,
-    native_config_overrides: Dict[str, Any] | None = None,
+    backend: Any = None,
+    config_overrides: Dict[str, Any] | None = None,
 ) -> tuple[NeMoAutoDiffusionPipeline, Any]:
     """Build the sharded diffusion pipeline (model + parallel scheme).
 
@@ -359,9 +359,9 @@ def build_diffusion_pipeline(
             transformer to finetune. ``"transformer"`` (default for Wan2.2 = high-noise)
             or ``"transformer_2"`` (low-noise). The unused transformer is dropped
             before device placement so only one transformer lives on GPU.
-        native_backend: ``BackendConfig`` fields for a transformer with a native Automodel
+        backend: ``BackendConfig`` fields for a transformer with a custom Automodel
             implementation (for example MoE diffusion transformers that need expert parallelism).
-        native_config_overrides: Config attributes overridden before building a native transformer.
+        config_overrides: Config attributes overridden before building a custom-model transformer.
 
     Returns:
         Tuple of (pipeline, resolved MeshContext). The mesh context carries both the
@@ -417,8 +417,8 @@ def build_diffusion_pipeline(
             fuse_qkv_projections=fuse_qkv_projections,
             compact_fused_qkv_projections=compact_fused_qkv_projections,
             attention_backend=attention_backend,
-            native_backend=native_backend,
-            native_config_overrides=native_config_overrides,
+            backend=backend,
+            config_overrides=config_overrides,
         )
     else:
         # Pretraining: initialize with random weights using pipeline_spec
@@ -443,8 +443,8 @@ def build_diffusion_pipeline(
             fuse_qkv_projections=fuse_qkv_projections,
             compact_fused_qkv_projections=compact_fused_qkv_projections,
             attention_backend=attention_backend,
-            native_backend=native_backend,
-            native_config_overrides=native_config_overrides,
+            backend=backend,
+            config_overrides=config_overrides,
         )
     transformer_module = pipe.transformer
 
@@ -689,8 +689,8 @@ class TrainDiffusionRecipe(BaseRecipe):
         )
         logging.info(f"[INFO] LoRA: {lora_status}")
 
-        native_backend = self.cfg.get("model.backend", None)
-        native_config_overrides = self.cfg.get("model.config_overrides", None)
+        backend = self.cfg.get("model.backend", None)
+        config_overrides = self.cfg.get("model.config_overrides", None)
         self.pipe, mesh_context = build_diffusion_pipeline(
             model_id=self.model_id,
             finetune_mode=self.cfg.get("model.mode", "finetune").lower() == "finetune",
@@ -709,12 +709,8 @@ class TrainDiffusionRecipe(BaseRecipe):
             peft_cfg=self.peft_cfg,
             model_type=self.model_type,
             active_transformer=self.active_transformer,
-            native_backend=native_backend.to_dict() if hasattr(native_backend, "to_dict") else native_backend,
-            native_config_overrides=(
-                native_config_overrides.to_dict()
-                if hasattr(native_config_overrides, "to_dict")
-                else native_config_overrides
-            ),
+            backend=backend.to_dict() if hasattr(backend, "to_dict") else backend,
+            config_overrides=(config_overrides.to_dict() if hasattr(config_overrides, "to_dict") else config_overrides),
         )
         self.device_mesh = getattr(mesh_context, "device_mesh", None)
         # Expert-parallel mesh of MoE transformers; None for dense models.

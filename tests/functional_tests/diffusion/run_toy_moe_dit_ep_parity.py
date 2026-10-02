@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Drive the diffusion recipe on the toy native MoE DiT and record per-step metrics.
+"""Drive the diffusion recipe on the toy custom-model MoE DiT and record per-step metrics.
 
 Three modes:
 
@@ -399,7 +399,7 @@ def compare(args: argparse.Namespace) -> None:
     _assert_close("grad_norm", ref["grad_norms"], ep["grad_norms"], args.grad_norm_rtol)
     # Training must actually move the model (the loss trajectory is not constant).
     assert len(set(round(x, 6) for x in ref["losses"])) > 1, ref["losses"]
-    print("PASSED: EP parity on toy native MoE DiT")
+    print("PASSED: EP parity on toy custom-model MoE DiT")
 
 
 def main() -> None:

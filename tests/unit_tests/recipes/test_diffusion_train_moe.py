@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Diffusion recipe wiring for native MoE transformers with expert parallelism."""
+"""Diffusion recipe wiring for custom-model MoE transformers with expert parallelism."""
 
 import sys
 from types import SimpleNamespace
@@ -76,7 +76,7 @@ class _StopAfterCheckpointer(Exception):
 
 
 def _moe_recipe_cfg(**model_overrides):
-    model = {"pretrained_model_name_or_path": "dummy-native-moe", "mode": "finetune", **model_overrides}
+    model = {"pretrained_model_name_or_path": "dummy-custom-moe", "mode": "finetune", **model_overrides}
     return ConfigNode(
         {
             "model": model,
@@ -121,18 +121,18 @@ def test_setup_keeps_moe_mesh_and_passes_it_to_the_checkpointer(monkeypatch):
         recipe.setup()
 
     pipeline_kwargs = build_pipeline.call_args.kwargs
-    # YAML ConfigNodes are converted to plain dicts for the native model builder.
-    assert pipeline_kwargs["native_backend"] == {"experts": "torch", "dispatcher": "torch"}
-    assert type(pipeline_kwargs["native_backend"]) is dict
-    assert pipeline_kwargs["native_config_overrides"] == {"num_hidden_layers": 2}
-    assert type(pipeline_kwargs["native_config_overrides"]) is dict
+    # YAML ConfigNodes are converted to plain dicts for the custom model builder.
+    assert pipeline_kwargs["backend"] == {"experts": "torch", "dispatcher": "torch"}
+    assert type(pipeline_kwargs["backend"]) is dict
+    assert pipeline_kwargs["config_overrides"] == {"num_hidden_layers": 2}
+    assert type(pipeline_kwargs["config_overrides"]) is dict
     assert recipe.moe_mesh is moe_mesh
     assert recipe.device_mesh is None
     assert recipe.pp_enabled is False
     assert checkpointer_build.call_args.kwargs["moe_mesh"] is moe_mesh
 
 
-def test_setup_without_native_options_or_moe_mesh(monkeypatch):
+def test_setup_without_custom_options_or_moe_mesh(monkeypatch):
     mesh_context = SimpleNamespace(device_mesh=None, moe_mesh=None)
     build_pipeline, checkpointer_build = _patch_setup_until_checkpointer(monkeypatch, mesh_context)
 
@@ -140,8 +140,8 @@ def test_setup_without_native_options_or_moe_mesh(monkeypatch):
     with pytest.raises(_StopAfterCheckpointer):
         recipe.setup()
 
-    assert build_pipeline.call_args.kwargs["native_backend"] is None
-    assert build_pipeline.call_args.kwargs["native_config_overrides"] is None
+    assert build_pipeline.call_args.kwargs["backend"] is None
+    assert build_pipeline.call_args.kwargs["config_overrides"] is None
     assert recipe.moe_mesh is None
     assert checkpointer_build.call_args.kwargs["moe_mesh"] is None
 
@@ -288,7 +288,7 @@ def test_train_step_without_moe_mesh_uses_dense_clipping(monkeypatch):
     )
     diffusion_train.scale_grads_and_clip_grad_norm.assert_not_called()
     recipe._set_moe_aux_loss_backward_scale.assert_not_called()
-    # Dense native MoE models (EP disabled) may still balance routers with gate biases.
+    # Dense custom-model MoE models (EP disabled) may still balance routers with gate biases.
     model.update_moe_gate_bias.assert_called_once_with()
 
 

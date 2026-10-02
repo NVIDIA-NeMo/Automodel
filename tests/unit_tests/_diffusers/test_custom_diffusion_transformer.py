@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Native (Automodel) diffusion transformers: detection, dispatch and option validation."""
+"""Custom-model (Automodel) diffusion transformers: detection, dispatch and option validation."""
 
 import json
 import os
@@ -27,8 +27,8 @@ from nemo_automodel._diffusers import auto_diffusion_pipeline as adp
 from nemo_automodel._diffusers.auto_diffusion_pipeline import (
     NeMoAutoDiffusionPipeline,
     _reject_diffusers_only_options,
-    build_native_transformer,
-    native_transformer_config_dir,
+    build_custom_transformer,
+    custom_transformer_config_dir,
 )
 from nemo_automodel._transformers.registry import MODEL_ARCH_MAPPING, ModelRegistry, register_architecture
 from nemo_automodel.components.models.common import BackendConfig
@@ -76,27 +76,27 @@ class _FrozenTransformer(nn.Module):
             param.requires_grad_(False)
 
 
-def test_native_arch_fixture_is_in_static_registry():
+def test_custom_arch_fixture_is_in_static_registry():
     assert NATIVE_ARCH in MODEL_ARCH_MAPPING
     assert UNKNOWN_ARCH not in MODEL_ARCH_MAPPING
 
 
 # =============================================================================
-# native_transformer_config_dir
+# custom_transformer_config_dir
 # =============================================================================
 
 
 def test_config_dir_detects_transformer_subfolder_of_diffusers_repo(tmp_path):
     root = _diffusers_repo(tmp_path, [NATIVE_ARCH])
 
-    assert native_transformer_config_dir(root) == os.path.join(root, "transformer")
+    assert custom_transformer_config_dir(root) == os.path.join(root, "transformer")
 
 
 def test_config_dir_honors_custom_subfolder(tmp_path):
     root = _diffusers_repo(tmp_path, [NATIVE_ARCH], subfolder="dit")
 
-    assert native_transformer_config_dir(root, subfolder="dit") == os.path.join(root, "dit")
-    assert native_transformer_config_dir(root) is None
+    assert custom_transformer_config_dir(root, subfolder="dit") == os.path.join(root, "dit")
+    assert custom_transformer_config_dir(root) is None
 
 
 def test_config_dir_ignores_root_config_of_diffusers_repo(tmp_path):
@@ -105,7 +105,7 @@ def test_config_dir_ignores_root_config_of_diffusers_repo(tmp_path):
     _write_model_index(root)
     _write_config(root, [NATIVE_ARCH])
 
-    assert native_transformer_config_dir(root) is None
+    assert custom_transformer_config_dir(root) is None
 
 
 def test_config_dir_detects_single_model_repo_at_root(tmp_path):
@@ -114,7 +114,7 @@ def test_config_dir_detects_single_model_repo_at_root(tmp_path):
     # A transformer/ subfolder is irrelevant without model_index.json.
     _write_config(os.path.join(root, "transformer"), [UNKNOWN_ARCH])
 
-    assert native_transformer_config_dir(root) == root
+    assert custom_transformer_config_dir(root) == root
 
 
 @pytest.mark.parametrize("diffusers_layout", [True, False])
@@ -125,7 +125,7 @@ def test_config_dir_returns_none_for_unregistered_architecture(tmp_path, diffuse
         root = str(tmp_path / "single")
         _write_config(root, [UNKNOWN_ARCH])
 
-    assert native_transformer_config_dir(root) is None
+    assert custom_transformer_config_dir(root) is None
 
 
 @pytest.mark.parametrize("architectures", [None, []])
@@ -133,21 +133,21 @@ def test_config_dir_returns_none_without_architectures(tmp_path, architectures):
     """Diffusers transformer configs carry ``_class_name`` and no ``architectures``."""
     root = _diffusers_repo(tmp_path, architectures)
 
-    assert native_transformer_config_dir(root) is None
+    assert custom_transformer_config_dir(root) is None
 
 
 def test_config_dir_returns_none_without_config(tmp_path):
     root = str(tmp_path / "repo")
     _write_model_index(root)
 
-    assert native_transformer_config_dir(root) is None
-    assert native_transformer_config_dir(str(tmp_path / "empty_dir")) is None
+    assert custom_transformer_config_dir(root) is None
+    assert custom_transformer_config_dir(str(tmp_path / "empty_dir")) is None
 
 
 def test_config_dir_only_considers_first_architecture(tmp_path):
     root = _diffusers_repo(tmp_path, [UNKNOWN_ARCH, NATIVE_ARCH])
 
-    assert native_transformer_config_dir(root) is None
+    assert custom_transformer_config_dir(root) is None
 
 
 @pytest.mark.parametrize("diffusers_layout", [True, False])
@@ -156,16 +156,16 @@ def test_config_dir_detects_registered_toy_moe_dit_checkpoint(tmp_path, diffuser
     root = write_toy_moe_dit_checkpoint(str(tmp_path / "toy"), diffusers_layout=diffusers_layout)
 
     expected = os.path.join(root, "transformer") if diffusers_layout else root
-    assert native_transformer_config_dir(root) == expected
+    assert custom_transformer_config_dir(root) == expected
 
 
 def test_config_dir_detects_runtime_registered_architecture(tmp_path):
-    arch = "RuntimeOnlyNativeDiffusionTransformer"
+    arch = "RuntimeOnlyCustomDiffusionTransformer"
     register_architecture(arch, ToyMoEDiTForDiffusion, exist_ok=True)
     try:
         assert ModelRegistry.has_custom_model(arch)
         root = _diffusers_repo(tmp_path, [arch])
-        assert native_transformer_config_dir(root) == os.path.join(root, "transformer")
+        assert custom_transformer_config_dir(root) == os.path.join(root, "transformer")
     finally:
         ModelRegistry.model_arch_name_to_cls._extra.pop(arch, None)
 
@@ -197,7 +197,7 @@ def test_reject_options_rejects_context_parallelism():
 
 
 # =============================================================================
-# build_native_transformer
+# build_custom_transformer
 # =============================================================================
 
 
@@ -217,7 +217,7 @@ def _patch_from_config(monkeypatch):
     return from_config, sentinel
 
 
-def test_build_native_transformer_forwards_mesh_overrides_and_backend(monkeypatch, toy_config_dir):
+def test_build_custom_transformer_forwards_mesh_overrides_and_backend(monkeypatch, toy_config_dir):
     from nemo_automodel.components.distributed import config as distributed_config
 
     from_config, sentinel = _patch_from_config(monkeypatch)
@@ -232,7 +232,7 @@ def test_build_native_transformer_forwards_mesh_overrides_and_backend(monkeypatc
     )
     peft_cfg = object()
 
-    model = build_native_transformer(
+    model = build_custom_transformer(
         toy_config_dir,
         mesh_context=mesh_context,
         torch_dtype=torch.float32,
@@ -268,10 +268,10 @@ def test_build_native_transformer_forwards_mesh_overrides_and_backend(monkeypatc
     assert kwargs["backend"].dispatcher == "torch"
 
 
-def test_build_native_transformer_without_mesh_or_backend(monkeypatch, toy_config_dir):
+def test_build_custom_transformer_without_mesh_or_backend(monkeypatch, toy_config_dir):
     from_config, _ = _patch_from_config(monkeypatch)
 
-    build_native_transformer(toy_config_dir, mesh_context=None, torch_dtype=torch.bfloat16, load_base_model=False)
+    build_custom_transformer(toy_config_dir, mesh_context=None, torch_dtype=torch.bfloat16, load_base_model=False)
 
     (config,), kwargs = from_config.call_args
     assert config.num_hidden_layers == 2
@@ -281,11 +281,11 @@ def test_build_native_transformer_without_mesh_or_backend(monkeypatch, toy_confi
     assert "backend" not in kwargs
 
 
-def test_build_native_transformer_passes_backend_config_through(monkeypatch, toy_config_dir):
+def test_build_custom_transformer_passes_backend_config_through(monkeypatch, toy_config_dir):
     from_config, _ = _patch_from_config(monkeypatch)
     backend = toy_backend()
 
-    build_native_transformer(
+    build_custom_transformer(
         toy_config_dir, mesh_context=None, torch_dtype=torch.float32, load_base_model=False, backend=backend
     )
 
@@ -293,21 +293,21 @@ def test_build_native_transformer_passes_backend_config_through(monkeypatch, toy
 
 
 # =============================================================================
-# NeMoAutoDiffusionPipeline.from_pretrained / from_config native branch
+# NeMoAutoDiffusionPipeline.from_pretrained / from_config custom-model branch
 # =============================================================================
 
 
 @pytest.fixture
-def native_repo(tmp_path):
+def custom_repo(tmp_path):
     return _diffusers_repo(tmp_path, [NATIVE_ARCH])
 
 
 @pytest.fixture
-def patched_native_build(monkeypatch):
-    """Replace the native build and make any fallback to diffusers loading fail loudly."""
+def patched_custom_build(monkeypatch):
+    """Replace the custom-model build and make any fallback to diffusers loading fail loudly."""
     transformer = _FrozenTransformer()
     build = MagicMock(return_value=transformer)
-    monkeypatch.setattr(adp, "build_native_transformer", build)
+    monkeypatch.setattr(adp, "build_custom_transformer", build)
     monkeypatch.setattr(adp, "DIFFUSERS_AVAILABLE", True)
     diffusion_pipeline = SimpleNamespace(
         from_pretrained=MagicMock(side_effect=AssertionError("diffusers loading must not be used"))
@@ -319,25 +319,25 @@ def patched_native_build(monkeypatch):
     return SimpleNamespace(build=build, transformer=transformer, diffusion_pipeline=diffusion_pipeline)
 
 
-def test_from_pretrained_dispatches_to_native_transformer(native_repo, patched_native_build):
+def test_from_pretrained_dispatches_to_custom_transformer(custom_repo, patched_custom_build):
     mesh_context = SimpleNamespace(cp_size=1)
     backend = {"experts": "torch"}
     overrides = {"num_hidden_layers": 1}
 
     pipe = NeMoAutoDiffusionPipeline.from_pretrained(
-        native_repo,
+        custom_repo,
         torch_dtype=torch.float32,
         mesh_context=mesh_context,
         components_to_load=["transformer"],
         load_for_training=True,
-        native_backend=backend,
-        native_config_overrides=overrides,
+        backend=backend,
+        config_overrides=overrides,
     )
 
     assert isinstance(pipe, NeMoAutoDiffusionPipeline)
-    assert pipe.transformer is patched_native_build.transformer
-    patched_native_build.build.assert_called_once_with(
-        os.path.join(native_repo, "transformer"),
+    assert pipe.transformer is patched_custom_build.transformer
+    patched_custom_build.build.assert_called_once_with(
+        os.path.join(custom_repo, "transformer"),
         mesh_context=mesh_context,
         torch_dtype=torch.float32,
         load_base_model=True,
@@ -349,17 +349,17 @@ def test_from_pretrained_dispatches_to_native_transformer(native_repo, patched_n
     assert all(param.requires_grad for param in pipe.transformer.parameters())
 
 
-def test_from_pretrained_native_keeps_base_weights_frozen_with_peft(native_repo, patched_native_build):
+def test_from_pretrained_custom_keeps_base_weights_frozen_with_peft(custom_repo, patched_custom_build):
     peft_cfg = object()
 
-    pipe = NeMoAutoDiffusionPipeline.from_pretrained(native_repo, load_for_training=True, peft_cfg=peft_cfg)
+    pipe = NeMoAutoDiffusionPipeline.from_pretrained(custom_repo, load_for_training=True, peft_cfg=peft_cfg)
 
-    assert patched_native_build.build.call_args.kwargs["peft_cfg"] is peft_cfg
+    assert patched_custom_build.build.call_args.kwargs["peft_cfg"] is peft_cfg
     assert not any(param.requires_grad for param in pipe.transformer.parameters())
 
 
-def test_from_pretrained_native_without_training_keeps_params_frozen(native_repo, patched_native_build):
-    pipe = NeMoAutoDiffusionPipeline.from_pretrained(native_repo, load_for_training=False)
+def test_from_pretrained_custom_without_training_keeps_params_frozen(custom_repo, patched_custom_build):
+    pipe = NeMoAutoDiffusionPipeline.from_pretrained(custom_repo, load_for_training=False)
 
     assert not any(param.requires_grad for param in pipe.transformer.parameters())
 
@@ -373,53 +373,53 @@ def test_from_pretrained_native_without_training_keeps_params_frozen(native_repo
         ("attention_backend", "flash"),
     ],
 )
-def test_from_pretrained_native_rejects_diffusers_only_options(native_repo, patched_native_build, option, value):
+def test_from_pretrained_custom_rejects_diffusers_only_options(custom_repo, patched_custom_build, option, value):
     with pytest.raises(ValueError, match=option):
-        NeMoAutoDiffusionPipeline.from_pretrained(native_repo, **{option: value})
+        NeMoAutoDiffusionPipeline.from_pretrained(custom_repo, **{option: value})
 
-    patched_native_build.build.assert_not_called()
+    patched_custom_build.build.assert_not_called()
 
 
-def test_from_pretrained_native_rejects_context_parallelism(native_repo, patched_native_build):
+def test_from_pretrained_custom_rejects_context_parallelism(custom_repo, patched_custom_build):
     with pytest.raises(ValueError, match="Context parallelism"):
-        NeMoAutoDiffusionPipeline.from_pretrained(native_repo, mesh_context=SimpleNamespace(cp_size=2))
+        NeMoAutoDiffusionPipeline.from_pretrained(custom_repo, mesh_context=SimpleNamespace(cp_size=2))
 
-    patched_native_build.build.assert_not_called()
+    patched_custom_build.build.assert_not_called()
 
 
-def test_from_pretrained_native_rejects_non_transformer_components(native_repo, patched_native_build):
+def test_from_pretrained_custom_rejects_non_transformer_components(custom_repo, patched_custom_build):
     with pytest.raises(ValueError, match="only the `transformer` component"):
-        NeMoAutoDiffusionPipeline.from_pretrained(native_repo, components_to_load=["transformer", "vae"])
+        NeMoAutoDiffusionPipeline.from_pretrained(custom_repo, components_to_load=["transformer", "vae"])
 
-    patched_native_build.build.assert_not_called()
+    patched_custom_build.build.assert_not_called()
 
 
-def test_from_pretrained_unregistered_architecture_uses_diffusers(tmp_path, patched_native_build):
+def test_from_pretrained_unregistered_architecture_uses_diffusers(tmp_path, patched_custom_build):
     root = _diffusers_repo(tmp_path, [UNKNOWN_ARCH])
 
     with pytest.raises(AssertionError, match="diffusers loading must not be used"):
         NeMoAutoDiffusionPipeline.from_pretrained(root)
 
-    patched_native_build.build.assert_not_called()
-    patched_native_build.diffusion_pipeline.from_pretrained.assert_called_once()
+    patched_custom_build.build.assert_not_called()
+    patched_custom_build.diffusion_pipeline.from_pretrained.assert_called_once()
 
 
-def test_from_config_dispatches_to_native_transformer_with_random_init(tmp_path, patched_native_build):
+def test_from_config_dispatches_to_custom_transformer_with_random_init(tmp_path, patched_custom_build):
     root = _diffusers_repo(tmp_path, [NATIVE_ARCH], subfolder="dit")
     mesh_context = SimpleNamespace(cp_size=1)
 
     pipe = NeMoAutoDiffusionPipeline.from_config(
         root,
-        # transformer_cls is a diffusers class name and is not needed for native transformers.
+        # transformer_cls is a diffusers class name and is not needed for custom-model transformers.
         pipeline_spec={"subfolder": "dit"},
         torch_dtype=torch.float32,
         mesh_context=mesh_context,
-        native_backend={"experts": "torch"},
-        native_config_overrides={"num_hidden_layers": 1},
+        backend={"experts": "torch"},
+        config_overrides={"num_hidden_layers": 1},
     )
 
     assert isinstance(pipe, NeMoAutoDiffusionPipeline)
-    patched_native_build.build.assert_called_once_with(
+    patched_custom_build.build.assert_called_once_with(
         os.path.join(root, "dit"),
         mesh_context=mesh_context,
         torch_dtype=torch.float32,
@@ -440,11 +440,11 @@ def test_from_config_dispatches_to_native_transformer_with_random_init(tmp_path,
         ({"mesh_context": SimpleNamespace(cp_size=2)}, "Context parallelism"),
     ],
 )
-def test_from_config_native_rejects_unsupported_options(native_repo, patched_native_build, kwargs, match):
+def test_from_config_custom_rejects_unsupported_options(custom_repo, patched_custom_build, kwargs, match):
     with pytest.raises(ValueError, match=match):
-        NeMoAutoDiffusionPipeline.from_config(native_repo, pipeline_spec={"subfolder": "transformer"}, **kwargs)
+        NeMoAutoDiffusionPipeline.from_config(custom_repo, pipeline_spec={"subfolder": "transformer"}, **kwargs)
 
-    patched_native_build.build.assert_not_called()
+    patched_custom_build.build.assert_not_called()
 
 
 # =============================================================================
