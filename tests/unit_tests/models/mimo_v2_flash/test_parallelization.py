@@ -77,7 +77,8 @@ def _setup_patches(stream):
     )
 
 
-def test_setup_mimo_te_cp_forces_a2a_on_every_attention():
+@pytest.mark.parametrize(("native_cp", "value_dim"), [(False, 192), (True, 128)])
+def test_setup_mimo_te_cp_forces_a2a_on_every_attention(native_cp, value_dim):
     dpa0 = _FakeDotProductAttention()
     dpa1 = _FakeDotProductAttention()
     model = _Model([_mimo_attention(dpa0), _mimo_attention(dpa1)])
@@ -85,13 +86,17 @@ def test_setup_mimo_te_cp_forces_a2a_on_every_attention():
     stream = object()
     ranks_patch, stream_patch = _setup_patches(stream)
 
-    with ranks_patch, stream_patch:
+    with (
+        ranks_patch,
+        stream_patch,
+        patch("nemo_automodel.components.models.mimo_v2_flash.model.is_te_min_version", return_value=native_cp),
+    ):
         result = setup_mimo_te_context_parallel(model, mesh)
 
     assert result is None
     assert model._mimo_te_cp_configured_group is mesh.get_group()
     for dpa in (dpa0, dpa1):
-        assert dpa.hidden_size_per_attention_head_v == 192
+        assert dpa.hidden_size_per_attention_head_v == value_dim
         assert len(dpa.calls) == 1
         args, kwargs = dpa.calls[0]
         assert args == (mesh.get_group.return_value, [0, 1], stream)

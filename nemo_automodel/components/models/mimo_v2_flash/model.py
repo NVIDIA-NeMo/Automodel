@@ -55,6 +55,7 @@ from nemo_automodel.components.models.mimo_v2_flash.vision import MiMoVisionTran
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MLP, MoE
+from nemo_automodel.shared.import_utils import is_te_min_version
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
@@ -448,10 +449,10 @@ class MiMoV2FlashAttention(nn.Module):
         self._validate_a2a_cp_size(cp_size)
         if cp_size <= 1:
             return
-        # TE a2a CP with sliding/sink attention requires equal QK/V dimensions.
-        # DotProductAttention uses this public dimension attribute to validate V;
-        # its fused kernels otherwise derive the dimensions from the input tensors.
-        self._te_v_head_dim = self.head_dim
+        # TE >= 2.16 supports native unequal QK/V dimensions with a2a CP.
+        # Keep the padded path for older TE on Hopper; Blackwell training
+        # needs native 192/128 because its fused kernel rejects V=192.
+        self._te_v_head_dim = self.v_head_dim if is_te_min_version("2.16") else self.head_dim
         self.attn_module.hidden_size_per_attention_head_v = self._te_v_head_dim
         cp_stream = cp_stream if cp_stream is not None else torch.cuda.Stream()
         cp_group = cp_mesh.get_group()
@@ -495,7 +496,7 @@ class MiMoV2FlashAttention(nn.Module):
         attention_mask: torch.Tensor | None,
         **kwargs: Any,
     ) -> torch.Tensor:
-        """Run TE attention with native V dimensions, padding only for a2a CP.
+        """Run TE attention with native V dimensions, padding for legacy TE a2a CP.
 
         Args:
             hidden_states: Tensor of shape [batch, sequence, hidden] for BSHD,

@@ -120,7 +120,8 @@ class TestMiMoV2FlashAttention:
         )
 
     @pytest.mark.parametrize("cp_enabled", [False, True])
-    def test_te_unequal_value_dimension_matches_sdpa(self, tiny_config, backend_config, cp_enabled):
+    @pytest.mark.parametrize("native_cp", [False, True])
+    def test_te_unequal_value_dimension_matches_sdpa(self, tiny_config, backend_config, cp_enabled, native_cp):
         """Native and CP-padded V preserve attention outputs and gradients."""
         tiny_config.v_head_dim = 4
         backend_config.attn = "te"
@@ -151,7 +152,10 @@ class TestMiMoV2FlashAttention:
             mesh = Mock()
             mesh.size.return_value = 2
             model.attn_module.set_context_parallel_group = Mock()
-            with patch("torch.distributed.get_process_group_ranks", return_value=[0, 1]):
+            with (
+                patch("torch.distributed.get_process_group_ranks", return_value=[0, 1]),
+                patch("nemo_automodel.components.models.mimo_v2_flash.model.is_te_min_version", return_value=native_cp),
+            ):
                 model.setup_cp_attention(mesh, cp_stream=object())
         hidden = torch.randn(1, 5, 32, requires_grad=True)
         reference_hidden = hidden.detach().clone().requires_grad_(True)
@@ -159,7 +163,7 @@ class TestMiMoV2FlashAttention:
         actual = model._forward_te(hidden, rope, attention_mask=None)
         causal_mask = torch.full((1, 1, 5, 5), float("-inf")).triu(1)
         expected = reference(reference_hidden, position_embeddings=rope, attention_mask=causal_mask)[0]
-        assert captured["v_dim"] == (8 if cp_enabled else 4)
+        assert captured["v_dim"] == (8 if cp_enabled and not native_cp else 4)
         torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
         actual.square().sum().backward()
         expected.square().sum().backward()
