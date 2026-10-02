@@ -62,11 +62,14 @@ def _repo_root() -> pathlib.Path:
 
 def test_deprecation_warnings_reference_existing_recipes():
     """Keep the legacy configs explicitly referenced by runtime deprecation warnings."""
-    from nemo_automodel.components.models.deprecation import _DEPRECATED_MODEL_YAMLS
+    from nemo_automodel.components.models.deprecation import _DEPRECATED_CHECKPOINT_YAMLS, _DEPRECATED_MODEL_YAMLS
 
     root = _repo_root()
     missing = sorted(
-        path for paths in _DEPRECATED_MODEL_YAMLS.values() for path in paths if not (root / path).is_file()
+        path
+        for paths in (*_DEPRECATED_MODEL_YAMLS.values(), *_DEPRECATED_CHECKPOINT_YAMLS.values())
+        for path in paths
+        if not (root / path).is_file()
     )
     assert not missing, "Recipes referenced by deprecation.py must remain available:\n" + "\n".join(missing)
 

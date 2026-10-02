@@ -79,6 +79,15 @@ Failures report the file path and line number and exit nonzero.
 
 ### Recipe Removal
 
+Check `nemo_automodel/components/models/deprecation.py` before removing recipes.
+Keep files listed in `_DEPRECATED_MODEL_YAMLS` or `_DEPRECATED_CHECKPOINT_YAMLS`
+and their matching cards until the planned removal. The checkpoint list records
+the approved October 1, 2026 age review: 32 checkpoints dated before October 1,
+2024, including nine dated before October 1, 2023. Dates and sources are recorded
+beside each entry. Checkpoint deprecations do not deprecate newer models sharing
+an architecture, or models using an older checkpoint as a teacher or tokenizer.
+CI checks that every recipe referenced by either list still exists.
+
 When removing a recipe, update cards that reference it in the same PR. If another
 checked-in recipe still targets that exact checkpoint, update Quick Start and
 Choose a Workflow to use it. If the deleted recipe was the checkpoint's last
