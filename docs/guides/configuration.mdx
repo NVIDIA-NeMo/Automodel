@@ -22,7 +22,7 @@ A `ConfigNode` handles values as follows:
 
 ### Typed Scalar Translation (`translate_value`)
 
-Only **strings** are translated:
+Only strings are translated:
 
 - `"123"` → `123`
 - `"3.14"` → `3.14`
@@ -91,7 +91,7 @@ Only load configuration files and `_target_` values from trusted sources. A YAML
 
 ## Distributed Section (Strategy-Based)
 
-The `distributed:` section is **not** instantiated using `_target_`. Recipes parse it with a fixed schema. Use `strategy: fsdp2`, `strategy: ddp`, or `strategy: megatron_fsdp`. You can also configure parallelism sizes, such as `dp_size`, `tp_size`, and `pp_size`, and strategy-specific options. When pipeline parallelism is enabled (`pp_size > 1`), add a `pipeline:` subsection with options such as `pp_schedule`, `pp_microbatch_size`, and `layers_per_stage`. For examples, see the [Pipeline Parallelism with AutoPipeline](/development/pipeline-parallelism) guide and the recipe configs.
+The `distributed:` section is not instantiated using `_target_`. Recipes parse it with a fixed schema. Use `strategy: fsdp2`, `strategy: ddp`, or `strategy: megatron_fsdp`. You can also configure parallelism sizes, such as `dp_size`, `tp_size`, and `pp_size`, and strategy-specific options. When pipeline parallelism is enabled (`pp_size > 1`), add a `pipeline:` subsection with options such as `pp_schedule`, `pp_microbatch_size`, and `layers_per_stage`. For examples, see the [Pipeline Parallelism with AutoPipeline](/development/pipeline-parallelism) guide and the recipe configs.
 
 ## Select Trainable Modules
 
@@ -109,7 +109,7 @@ freeze_config:
 
 Each selector is a mapping with exactly one key. `path` matches one module by its exact fully qualified name, while `glob` matches module names with `fnmatch`-style wildcards (`*` crosses `.` separators, so `*_proj` matches projection modules at any depth). List entries are additive: repeat `path` or `glob` entries to select several modules, and a single entry combining both keys is rejected. Matching is recursive: a selected module's entire subtree is frozen or unfrozen. Bare strings are rejected; unknown options and selectors that match no parameters raise an error before training starts.
 
-Trainability is resolved in a fixed order. Full fine-tuning preserves the model's existing `requires_grad` state, including intentionally frozen model-owned parameters. PEFT establishes a LoRA-trainable, base-frozen baseline. `freeze_modules` selectors then freeze their modules, and `unfreeze_modules` selectors unfreeze theirs, winning on overlap. This makes combinations such as LoRA plus a fully trainable multimodal projector a two-line configuration. Freezing only controls `requires_grad`; it never changes a parameter's storage dtype. The policy is validated on the complete model, re-resolved after tensor/expert parallel and activation-checkpointing surgery immediately before DDP/FSDP construction, and resolved once more after checkpoint loading before optimizer construction.
+Trainability is resolved in a fixed order. Full fine-tuning preserves the model's existing `requires_grad` state, including intentionally frozen model-owned parameters. PEFT establishes a LoRA-trainable, base-frozen baseline. `freeze_modules` selectors then freeze their modules, and `unfreeze_modules` selectors unfreeze theirs, winning on overlap. This makes combinations such as LoRA plus a fully trainable multimodal projector a two-line configuration. Freezing only controls `requires_grad`; it never changes a parameter's storage dtype. The policy is validated on the complete model, re-resolved after tensor parallel, expert parallel, and activation-checkpointing surgery immediately before DDP/FSDP construction, and resolved once more after checkpoint loading before optimizer construction.
 
 The modality-specific booleans `freeze_vision_tower`, `freeze_audio_tower`, `freeze_language_model`, and `freeze_video_embedder` remain supported and keep their established attribute and substring matching, applied before `unfreeze_modules`:
 
@@ -177,11 +177,11 @@ not reduce steady-state memory. The option defaults to `false`; without pipeline
 or for a stage without static input metadata, the warmup is skipped. The separate VLM
 fine-tuning recipe does not supply pipeline stages to this warmup.
 
-Check the `Pipeline-stage compile prewarm` log entries for per-stage forward/backward
-times and total warmup time. Compare **setup plus the first training iteration** across
+Check the `Pipeline-stage compile prewarm` log entries for per-stage forward and backward
+times and total warmup time. Compare setup plus the first training iteration across
 runs: moving work into setup makes iteration 0 shorter, but setup time still counts.
 This option targets startup latency; it does not change the kernels used in subsequent
-training steps or promise higher steady-state throughput or MFU. See
+training steps or promise higher steady-state throughput or model FLOP utilization (MFU). See
 [Pipeline Parallelism](/development/pipeline-parallelism) for the pipeline configuration.
 
 ### Reuse HybridEP JIT Kernels Across Jobs
@@ -254,7 +254,7 @@ For diagnosis, safety behavior, verification steps, and performance impact, see 
 
 ## Frozen Multimodal FSDP Policy
 
-FSDP2 uses the correctness-first `root` policy for fully frozen vision/audio towers and multimodal projectors.
+FSDP2 uses the correctness-first `root` policy for fully frozen vision and audio towers and multimodal projectors.
 
 ```yaml
 distributed:
@@ -273,7 +273,7 @@ This setting does not change modules that contain any trainable parameters. For 
 
 ## Interpolate Environment Variables in YAML
 
-NeMo AutoModel supports env var interpolation inside YAML **string values**.
+NeMo AutoModel supports env var interpolation inside YAML string values.
 
 ### Supported Forms
 
@@ -291,7 +291,7 @@ NeMo AutoModel supports env var interpolation inside YAML **string values**.
 ### Interpolation Behavior
 
 - Interpolation occurs when values are wrapped into a `ConfigNode`.
-- If a referenced env var is **missing** and **no default** is provided, config loading raises a `KeyError`.
+- If a referenced env var is missing and no default is provided, config loading raises a `KeyError`.
 - Defaults are supported only for braced forms using the first comma: `${VAR,default_value}`.
 
 ### Example (Databricks Delta)
@@ -310,13 +310,13 @@ dataset:
 
 ## Prevent Secret Leakage in Logs
 
-When an env var placeholder is resolved, the config keeps the original placeholder in an internal `._orig_value` field for **safe printing**.
+When an env var placeholder is resolved, the config keeps the original placeholder in an internal `._orig_value` field for safe printing.
 
 - `str(cfg)` or `repr(cfg)` prints placeholders (for example, `${DATABRICKS_TOKEN}`), not resolved secrets.
 - `cfg.to_yaml_dict(use_orig_values=True, redact_sensitive=True)` is the recommended way to produce a loggable YAML dict.
 
 <Info>
-Printing a **leaf value** (for example, `print(cfg.dataset.delta_storage_options.DATABRICKS_TOKEN)`) outputs the resolved secret. Instead, print the full config or use a redacted YAML dict.
+Printing a leaf value (for example, `print(cfg.dataset.delta_storage_options.DATABRICKS_TOKEN)`) outputs the resolved secret. Instead, print the full config or use a redacted YAML dict.
 
 </Info>
 
@@ -351,7 +351,7 @@ assignments. Learned routing weights and their backward graph remain intact. For
 `tokens * activated_experts` assignments on each rank, expert counts differ by at
 most one and are exactly equal when the assignment count is divisible by the
 number of experts. Each token selects distinct experts. Assignment counts include
-padding rows; dispatchers that exclude padding may have uneven valid-token counts.
+padding rows; dispatchers that exclude padding might have uneven valid-token counts.
 
 This is a performance benchmark mode, not a training-quality setting: learned
 weights are applied to synthetic expert assignments. Auxiliary losses, bias updates,
