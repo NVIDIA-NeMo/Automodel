@@ -85,6 +85,17 @@ def _separate_param_groups(
     matrix_params = []
     transposed_matrix_params = []
     modules = dict(model.named_modules())
+    if use_matrix_layout:
+        # A stale declaration (e.g. a renamed projection) would silently treat [..., input, output] storage as
+        # [..., output, input], so every declared name must be one of the module's own parameters.
+        for module_name, module in modules.items():
+            declared = getattr(module, "_nemo_transposed_matrix_parameters", ())
+            missing = [parameter_name for parameter_name in declared if parameter_name not in module._parameters]
+            if missing:
+                raise ValueError(
+                    f"{type(module).__name__} at {module_name or '<root>'!r} lists {missing} in "
+                    "_nemo_transposed_matrix_parameters, but has no parameters with those names."
+                )
     vector_params = []
     embed_params = []
     lm_head_params = []

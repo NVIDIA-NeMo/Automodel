@@ -125,6 +125,62 @@ class TestSeparateParamGroups:
         assert groups[3]["algorithm"] == "adamw"
         assert groups[3]["weight_decay"] == 0.0
 
+    @pytest.mark.parametrize("use_matrix_layout", [False, True])
+    def test_stale_transposed_parameter_declaration_is_rejected(self, use_matrix_layout):
+        class RenamedExperts(nn.Module):
+            _nemo_transposed_matrix_parameters = ("gate_and_up_projs", "down_projs")
+
+            def __init__(self):
+                super().__init__()
+                self.gate_and_up_projs = nn.Parameter(torch.randn(2, 4, 8))
+                self.renamed_down_projs = nn.Parameter(torch.randn(2, 4, 4))
+
+        model = TinyModel(with_bias=True)
+        model.experts = RenamedExperts()
+        kwargs = dict(
+            model=model,
+            base_lr=1e-3,
+            scalar_opt="adamw",
+            weight_decay=0.0,
+            supports_batched_matrices=True,
+            use_matrix_layout=use_matrix_layout,
+        )
+        if use_matrix_layout:
+            with pytest.raises(ValueError, match=r"RenamedExperts at 'experts' lists \['down_projs'\]"):
+                self._call(**kwargs)
+        else:
+            self._call(**kwargs)
+
+    def test_grouped_expert_declarations_name_real_parameters(self):
+        from nemo_automodel.components.moe.config import MoEConfig
+        from nemo_automodel.components.moe.experts import GroupedExperts, GroupedExpertsDeepEP
+        from nemo_automodel.components.moe.quantized_experts import MXFP4ExpertStorageMixin
+
+        config = MoEConfig(
+            n_routed_experts=4,
+            n_shared_experts=0,
+            n_activated_experts=2,
+            n_expert_groups=1,
+            n_limited_groups=1,
+            train_gate=True,
+            gate_bias_update_factor=0.0,
+            aux_loss_coeff=0.0,
+            score_func="softmax",
+            route_scale=1.0,
+            dim=16,
+            inter_dim=32,
+            moe_inter_dim=32,
+            norm_topk_prob=False,
+            expert_activation="swiglu",
+            dtype=torch.float32,
+        )
+        for experts_cls in (GroupedExperts, GroupedExpertsDeepEP):
+            experts = experts_cls(config)
+            assert experts._nemo_transposed_matrix_parameters
+            assert all(name in experts._parameters for name in experts._nemo_transposed_matrix_parameters)
+        # MXFP4 experts drop the float projections for frozen [experts, out, in] packed storage.
+        assert MXFP4ExpertStorageMixin._nemo_transposed_matrix_parameters == ()
+
     @pytest.mark.parametrize("supports_batched_matrices", [False, True])
     def test_2d_bias_routing_follows_optimizer_capability(self, supports_batched_matrices):
         model = TinyModel(with_bias=True)
