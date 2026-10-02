@@ -145,7 +145,7 @@ def test_warmup_cosine_schedule_clamps_past_the_end():
 
 # ---------------------------------------------------------------------------
 # apply_draft_activation_checkpointing (recipes that DDP/fully_shard the draft
-# directly bypass FSDP2Manager/DDPManager's own AC wiring, so this must be
+# directly bypass ModelParallelizer's AC wiring, so this must be
 # called explicitly)
 # ---------------------------------------------------------------------------
 

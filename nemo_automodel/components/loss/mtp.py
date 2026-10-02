@@ -20,13 +20,13 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+from nemo_automodel.components.loss.linear_ce_base import LinearCrossEntropy
 from nemo_automodel.components.loss.utils import (
     _get_final_hidden_states,
     _get_lm_head_module,
-    _get_lm_head_weight,
     _get_loss_ignore_index,
     calculate_loss,
+    prepare_lm_weight,
 )
 from nemo_automodel.components.models.common.mtp import get_mtp_loss_scaling_factor, roll_tensor
 
@@ -60,6 +60,7 @@ def calculate_mtp_loss(
     cu_seqlens: torch.Tensor | None = None,
     seq_idx: torch.Tensor | None = None,
     lm_weight: torch.Tensor | None = None,
+    logits_dtype: torch.dtype | None = None,
     grad_reduce_group: dist.ProcessGroup | None = None,
     loss_weights: torch.Tensor | None = None,
     return_per_depth: Literal[False] = False,
@@ -81,6 +82,7 @@ def calculate_mtp_loss(
     cu_seqlens: torch.Tensor | None = None,
     seq_idx: torch.Tensor | None = None,
     lm_weight: torch.Tensor | None = None,
+    logits_dtype: torch.dtype | None = None,
     grad_reduce_group: dist.ProcessGroup | None = None,
     loss_weights: torch.Tensor | None = None,
     return_per_depth: Literal[True],
@@ -102,6 +104,7 @@ def calculate_mtp_loss(
     cu_seqlens: torch.Tensor | None = None,
     seq_idx: torch.Tensor | None = None,
     lm_weight: torch.Tensor | None = None,
+    logits_dtype: torch.dtype | None = None,
     grad_reduce_group: dist.ProcessGroup | None = None,
     loss_weights: torch.Tensor | None = None,
     return_per_depth: bool,
@@ -122,6 +125,7 @@ def calculate_mtp_loss(
     cu_seqlens: torch.Tensor | None = None,
     seq_idx: torch.Tensor | None = None,
     lm_weight: torch.Tensor | None = None,
+    logits_dtype: torch.dtype | None = None,
     grad_reduce_group: dist.ProcessGroup | None = None,
     loss_weights: torch.Tensor | None = None,
     return_per_depth: bool = False,
@@ -168,6 +172,7 @@ def calculate_mtp_loss(
         lm_weight: Optional LM-head weight tensor of shape ``[vocab, hidden]``.
             Supplying it lets the main loss and all MTP depths share one DTensor
             ``full_tensor()`` gather on the FusedLinearCrossEntropy path.
+        logits_dtype: Optional model-owned output dtype after linear projection.
         grad_reduce_group: Group that contributes independent loss shards when
             the shared LM-head weight is a DTensor.
         loss_weights: Optional per-token objective multipliers matching
@@ -230,9 +235,10 @@ def calculate_mtp_loss(
     # they accumulate on-device -> OOM for large-vocab MoE. One shared gather is
     # numerically identical (same weight); grads from every depth accumulate into
     # it and collapse to a single reduce-scatter on the sharded parameter.
-    if isinstance(loss_fn, FusedLinearCrossEntropy) and lm_weight is None:
-        lm_weight = loss_fn.materialize_lm_weight(
-            _get_lm_head_weight(model),
+    if isinstance(loss_fn, LinearCrossEntropy) and lm_weight is None:
+        lm_weight = prepare_lm_weight(
+            loss_fn,
+            model,
             grad_reduce_group=grad_reduce_group,
         )
 
@@ -282,8 +288,8 @@ def calculate_mtp_loss(
             masked = mtp_per_depth_targets[k]
 
         if mtp_per_depth_logits is not None:
-            if isinstance(loss_fn, FusedLinearCrossEntropy):
-                raise ValueError("MTP logits are incompatible with FusedLinearCrossEntropy")
+            if isinstance(loss_fn, LinearCrossEntropy):
+                raise ValueError(f"MTP logits are incompatible with {type(loss_fn).__name__}")
             depth_loss = calculate_loss(
                 loss_fn,
                 logits=mtp_output,
@@ -292,13 +298,14 @@ def calculate_mtp_loss(
                 num_label_tokens=num_label_tokens,
                 loss_weights=loss_weights,
             )
-        elif isinstance(loss_fn, FusedLinearCrossEntropy):
+        elif isinstance(loss_fn, LinearCrossEntropy):
             depth_loss = calculate_loss(
                 loss_fn,
                 hidden_states=mtp_output,
                 labels=masked,
                 model=model,
                 lm_weight=lm_weight,
+                logits_dtype=logits_dtype,
                 num_label_tokens=num_label_tokens,
                 grad_reduce_group=grad_reduce_group,
                 loss_weights=loss_weights,
@@ -389,8 +396,8 @@ class PipelineCausalLMLoss(nn.Module):
         seq_idx_mb, output = self._extract_seq_idx_tail(output)
 
         if isinstance(output, tuple):
-            if isinstance(self.loss_fn, FusedLinearCrossEntropy):
-                raise ValueError("FusedLinearCrossEntropy is not supported with MTP under pipeline parallelism")
+            if isinstance(self.loss_fn, LinearCrossEntropy):
+                raise ValueError(f"{type(self.loss_fn).__name__} is not supported with MTP under pipeline parallelism")
             logits = output[0]
             hidden_states = None
             mtp_per_depth_h = None
@@ -405,7 +412,7 @@ class PipelineCausalLMLoss(nn.Module):
             mtp_per_depth_h = getattr(output, "mtp_per_depth_h", None)
             mtp_per_depth_logits = getattr(output, "mtp_per_depth_logits", None)
             model_scaling_factor = getattr(output, "mtp_loss_scaling_factor", get_mtp_loss_scaling_factor(self.model))
-            if isinstance(self.loss_fn, FusedLinearCrossEntropy) and isinstance(output, torch.Tensor):
+            if isinstance(self.loss_fn, LinearCrossEntropy) and isinstance(output, torch.Tensor):
                 logits = None
                 hidden_states = output
             else:
@@ -415,11 +422,12 @@ class PipelineCausalLMLoss(nn.Module):
         # Gather the LM head at most once and thread it through the main loss and
         # every MTP depth (avoids redundant per-call full_tensor() gathers).
         shared_lm_weight = (
-            self.loss_fn.materialize_lm_weight(
-                _get_lm_head_weight(self.model),
+            prepare_lm_weight(
+                self.loss_fn,
+                self.model,
                 grad_reduce_group=self.grad_reduce_group,
             )
-            if isinstance(self.loss_fn, FusedLinearCrossEntropy)
+            if isinstance(self.loss_fn, LinearCrossEntropy)
             else None
         )
         loss = calculate_loss(
