@@ -18,6 +18,13 @@ set -xeuo pipefail
 export PYTHONPATH=${PYTHONPATH:-}:$(pwd)
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 
+# Reuse compiled kernels across variants, with a private cache by default.
+if [[ -z "${NEMO_HYBRIDEP_JIT_CACHE:-}" ]]; then
+    hybridep_jit_cache=$(mktemp -d)
+    trap 'rm -rf "$hybridep_jit_cache"' EXIT
+    export NEMO_HYBRIDEP_JIT_CACHE="$hybridep_jit_cache"
+fi
+
 for compact in 0 1; do
     for fusion in 0 1; do
         args=()
@@ -30,9 +37,11 @@ for compact in 0 1; do
         if [[ "$compact" == 1 && "$fusion" == 1 ]]; then
             args+=(--activation-checkpointing)
         fi
+        variant_start=$SECONDS
         TRANSFORMERS_OFFLINE=1 python3 \
             -m torch.distributed.run --standalone --nproc_per_node=2 --nnodes=1 \
             -m coverage run \
             tests/functional_tests/moe/run_hybridep_unequal_tokens.py "${args[@]}"
+        echo "HybridEP parity: compact=$compact fusion=$fusion elapsed=$((SECONDS - variant_start))s"
     done
 done
