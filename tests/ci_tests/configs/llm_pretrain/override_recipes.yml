@@ -15,5 +15,12 @@
 exempt_models:
 
 exempt_configs:
+  # Age-deprecated examples remain available outside GPU CI.
+  llama3_70b_pretrain:
+    reason: "Deprecated checkpoint (2026-10-01 age review); exempt until recipe removal"
+  megatron_pretrain_gpt2:
+    reason: "Deprecated checkpoint (2026-10-01 age review); exempt until recipe removal"
+  megatron_pretrain_gpt2_domain_mixture:
+    reason: "Deprecated checkpoint (2026-10-01 age review); exempt until recipe removal"
 
 known_issue:

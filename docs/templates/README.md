@@ -121,6 +121,12 @@ PR and nightly recipe scopes use explicit recipe lists. Enroll a validated recip
 removing its exemption and adding it to the intended lists as needed. Keep the
 recipe's owner and resource metadata so that enrollment is reviewable.
 
+Recipes for the age-deprecated checkpoints in `deprecation.py` are exempt through
+the existing `override_recipes.yml` files in every CI scope. Keep those exemptions
+until the recipes are removed. Diffusion recipes retain their existing CI coverage.
+When exemptions remove every recipe from an enrolled scope, the generated child
+pipeline emits a short completion job without a GPU launch.
+
 CI verifies these deterministic contracts. Authors must also verify source facts,
 backend dependencies, data preparation, and GPU training before claiming a recipe
 has been validated on particular hardware.
