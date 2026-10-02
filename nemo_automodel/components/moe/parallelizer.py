@@ -33,11 +33,11 @@ from torch.distributed.tensor import Replicate, Shard, distribute_module, distri
 from torch.distributed.tensor.parallel import ParallelStyle, parallelize_module
 from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts
 
-from nemo_automodel.components.distributed import parallelizer_utils
-from nemo_automodel.components.distributed.fsdp_patches import (
+import nemo_automodel.components.distributed.fsdp2_extensions.utils as parallelizer_utils
+from nemo_automodel.components.distributed.fsdp2_extensions.compat import (
     patch_fsdp_accumulated_grad_guard as _patch_fsdp_accumulated_grad_guard,
 )
-from nemo_automodel.components.distributed.fsdp_patches import (
+from nemo_automodel.components.distributed.fsdp2_extensions.compat import (
     patch_fsdp_uniform_reduce_dtype as _patch_fsdp_uniform_reduce_dtype,
 )
 from nemo_automodel.components.distributed.multimodal_fsdp import (

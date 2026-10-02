@@ -12,20 +12,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Deprecated compatibility imports for the FSDP2 extension helpers."""
-
-import warnings
-
-from nemo_automodel.components.distributed.fsdp2_extensions.compat import (
-    patch_fsdp_accumulated_grad_guard,
-    patch_fsdp_uniform_reduce_dtype,
-    patch_fsdp_unused_param_reduction,
-)
-
-warnings.warn(
-    "fsdp_patches moved to distributed.fsdp2_extensions.compat; update imports before the next major release.",
-    DeprecationWarning,
-    stacklevel=2,
-)
-
-__all__ = ["patch_fsdp_accumulated_grad_guard", "patch_fsdp_uniform_reduce_dtype", "patch_fsdp_unused_param_reduction"]
+"""NeMo AutoModel's reusable FSDP2 extensions."""

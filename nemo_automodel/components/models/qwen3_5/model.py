@@ -1610,7 +1610,7 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
                 for sublayer in mtp.layers:
                     sublayer.init_weights(buffer_device=buffer_device)
         # Keep the fp32 SSM-gating params fp32 (skip them in the dtype cast); each
-        # ``_fp32_params`` holder is sharded as its own fp32 FSDP group.
+        # ``_fp32_params`` holder retains FP32 compute under the model-owned FSDP policy.
         cast_model_to_dtype(self, dtype, skip_modules=("_fp32_params",))
 
 

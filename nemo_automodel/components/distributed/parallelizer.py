@@ -56,7 +56,7 @@ from nemo_automodel.components.distributed.config import (
     ActivationCheckpointingScope,
     normalize_activation_checkpointing_scope,
 )
-from nemo_automodel.components.distributed.fsdp_patches import (
+from nemo_automodel.components.distributed.fsdp2_extensions.compat import (
     patch_fsdp_accumulated_grad_guard as _patch_fsdp_accumulated_grad_guard,
 )
 from nemo_automodel.components.distributed.mesh_utils import get_fsdp_dp_mesh
@@ -123,8 +123,8 @@ except (ImportError, FileNotFoundError, OSError):
         "MixedPrecisionPolicy", (), {"_msg": _MEGATRON_FSDP_050_REQUIRED_MSG}
     )
 
-# Import as module so tests can patch nemo_automodel.components.distributed.parallelizer_utils.fully_shard_by_dtype
-import nemo_automodel.components.distributed.parallelizer_utils as parallelizer_utils
+# Import as module so tests can patch nemo_automodel.components.distributed.fsdp2_extensions.utils.fully_shard_by_dtype
+import nemo_automodel.components.distributed.fsdp2_extensions.utils as parallelizer_utils
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -743,13 +743,16 @@ def apply_fsdp2_sharding_recursively(
                 layer_reshard_after_forward = False
             else:
                 layer_reshard_after_forward = enum_id < len(flat_layer_items) - 1
-            shard_module(
-                child_module,
-                mesh=mesh,
-                mp_policy=mp_policy,
-                reshard_after_forward=layer_reshard_after_forward,
-                offload_policy=offload_policy,
-            )
+            layer_kwargs = {
+                "mesh": mesh,
+                "mp_policy": mp_policy,
+                "reshard_after_forward": layer_reshard_after_forward,
+                "offload_policy": offload_policy,
+            }
+            layer_ignored_params = ignored_params_for_root(child_module, ignored_multimodal_params or set())
+            if layer_ignored_params is not None:
+                layer_kwargs["ignored_params"] = layer_ignored_params
+            shard_module(child_module, **layer_kwargs)
             module[layer_key] = child_module
 
         # Set up explicit forward/backward prefetch chains when layers are being resharded.

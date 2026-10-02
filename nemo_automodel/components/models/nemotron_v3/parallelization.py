@@ -27,13 +27,13 @@ from torch.distributed.tensor.parallel import ColwiseParallel, ParallelStyle, Ro
 from torch.distributed.tensor.placement_types import Shard
 
 from nemo_automodel.components.distributed import ModelParallelizer
-from nemo_automodel.components.distributed.mesh_utils import get_fsdp_dp_mesh
-from nemo_automodel.components.distributed.parallel_styles import translate_to_lora
-from nemo_automodel.components.distributed.parallelizer_utils import (
+from nemo_automodel.components.distributed.fsdp2_extensions.utils import (
     fully_shard_by_dtype,
     reject_unsupported_mtp_cp,
     reject_unsupported_mtp_cp_pp,
 )
+from nemo_automodel.components.distributed.mesh_utils import get_fsdp_dp_mesh
+from nemo_automodel.components.distributed.parallel_styles import translate_to_lora
 
 logger = logging.getLogger(__name__)
 

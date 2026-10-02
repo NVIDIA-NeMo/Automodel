@@ -28,7 +28,9 @@ from nemo_automodel.components.optim.optimizer import (
     OptimizerConfig,
     OptimizerFromFactoryConfig,
     ParamGroupOverride,
+    _avoid_redundant_te_master_weights_for_fp32_params,
     _drop_empty_local_shards,
+    _split_dtensor_and_plain_params,
     build_optimizer,
     build_optimizer_config,
 )
@@ -106,6 +108,47 @@ class TestAdamWConfig:
 
 
 class TestOptimizerConfigBase:
+    @pytest.mark.parametrize("factory_config", [False, True])
+    def test_explicit_mixed_groups_preserve_options(self, monkeypatch, factory_config):
+        import nemo_automodel.components.optim.optimizer as optimizer_module
+
+        class FakeDTensor:
+            pass
+
+        sharded, plain = FakeDTensor(), object()
+        monkeypatch.setattr(optimizer_module, "DTensor", FakeDTensor)
+        captured = []
+
+        def factory(params, **kwargs):
+            captured.extend(params)
+            return MagicMock()
+
+        if factory_config:
+            config = OptimizerFromFactoryConfig(factory=factory)
+        else:
+            config = OptimizerConfig()
+            monkeypatch.setattr(config, "_build_optimizer", factory)
+        original = [{"params": [plain, sharded], "lr": 0.02, "weight_decay": 0.0, "lr_mult": 2.0}]
+        config.build_from_param_groups(original)
+
+        options = {"lr": 0.02, "weight_decay": 0.0, "lr_mult": 2.0}
+        assert captured == [{"params": [sharded], **options}, {"params": [plain], **options}]
+        assert original[0]["params"] == [plain, sharded]
+
+    def test_isolates_plain_params_from_dtensor_foreach_group(self, monkeypatch):
+        import nemo_automodel.components.optim.optimizer as optimizer_module
+
+        class FakeDTensor:
+            pass
+
+        sharded = FakeDTensor()
+        plain = object()
+        monkeypatch.setattr(optimizer_module, "DTensor", FakeDTensor)
+
+        groups = _split_dtensor_and_plain_params([sharded, plain])
+
+        assert groups == [{"params": [sharded]}, {"params": [plain]}]
+
     def test_base_build_not_implemented(self):
         with pytest.raises(NotImplementedError):
             OptimizerConfig()._build_optimizer(_params())
@@ -123,6 +166,81 @@ class TestOptimizerConfigBase:
         assert isinstance(opt, torch.optim.AdamW)
         assert opt.param_groups[0]["weight_decay"] == 0.1
         assert opt.param_groups[1]["weight_decay"] == 0.0
+
+
+def test_te_master_ownership_uses_resident_fp32_parameter_directly_after_resume(tmp_path):
+    from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
+
+    fp32_param = nn.Parameter(torch.ones(4, dtype=torch.float32))
+    bf16_param = nn.Parameter(torch.ones(4, dtype=torch.bfloat16))
+
+    class FakeFusedAdam(torch.optim.Optimizer):
+        def __init__(self):
+            super().__init__([fp32_param, bf16_param], {"lr": 1e-3})
+            self.master_weights = True
+            self._scales = {}
+
+        def _initialize_state(self, parameter, state_name, zero_buffer):
+            """Create one FP32 optimizer-state tensor matching ``parameter`` shape."""
+            self.state[parameter][state_name] = (
+                torch.zeros_like(parameter, dtype=torch.float32) if zero_buffer else parameter.detach().float().clone()
+            )
+
+        def step(self, closure=None):
+            """Mirror TE's lazy per-parameter initialization used by DCP's dummy step."""
+            for group in self.param_groups:
+                for parameter in group["params"]:
+                    if not self.state[parameter]:
+                        self._initialize_state(parameter, "exp_avg", True)
+                        self._initialize_state(parameter, "exp_avg_sq", True)
+                        self._initialize_state(parameter, "master_param", False)
+
+        def load_state_dict(self, state_dict):
+            """Mirror TE's second state rebuild after PyTorch's loader returns."""
+            super().load_state_dict(state_dict)
+            for saved_group, live_group in zip(state_dict["param_groups"], self.param_groups, strict=True):
+                for saved_id, parameter in zip(saved_group["params"], live_group["params"], strict=True):
+                    self.state[parameter] = dict(state_dict["state"].get(saved_id, {}))
+
+    optimizer = FakeFusedAdam()
+    _avoid_redundant_te_master_weights_for_fp32_params(optimizer)
+
+    assert not optimizer.state
+    optimizer.step()
+    assert set(optimizer.state[fp32_param]) == {"exp_avg", "exp_avg_sq"}
+    assert "master_param" in optimizer.state[bf16_param]
+
+    optimizer.state[fp32_param]["master_param"] = fp32_param.detach().clone()
+    optimizer.state[bf16_param]["master_param"] = bf16_param.detach().float().clone()
+    checkpoint = optimizer.state_dict()
+    optimizer.load_state_dict(checkpoint)
+
+    assert set(optimizer.state[fp32_param]) == {"exp_avg", "exp_avg_sq"}
+    assert "master_param" in optimizer.state[bf16_param]
+
+    # Use the actual Checkpointer/DCP fresh-optimizer read-template path.
+    # DCP skips its dummy initialization when any state already exists.
+    model = nn.Module()
+    model.fp32_weight, model.bf16_weight = fp32_param, bf16_param
+    optimizer.state[bf16_param]["master_param"].fill_(1.000123)
+    optimizer.state[bf16_param]["exp_avg"].fill_(0.12345)
+    optimizer.state[bf16_param]["exp_avg_sq"].fill_(0.23456)
+    expected = {name: value.clone() for name, value in optimizer.state[bf16_param].items()}
+    optimizer.zero_grad(set_to_none=True)
+    checkpointer = Checkpointer(
+        CheckpointingConfig(checkpoint_dir=str(tmp_path), is_async=False), dp_rank=0, tp_rank=0, pp_rank=0
+    )
+    try:
+        checkpointer.save_optimizer(optimizer, model, str(tmp_path))
+        fresh_optimizer = FakeFusedAdam()
+        _avoid_redundant_te_master_weights_for_fp32_params(fresh_optimizer)
+        assert not fresh_optimizer.state
+        checkpointer.load_optimizer(fresh_optimizer, model, str(tmp_path))
+        for name, expected_value in expected.items():
+            torch.testing.assert_close(fresh_optimizer.state[bf16_param][name], expected_value, rtol=0, atol=0)
+        assert "master_param" not in fresh_optimizer.state[fp32_param]
+    finally:
+        checkpointer.close()
 
 
 # ---------------------------------------------------------------------------
@@ -196,6 +314,21 @@ class TestOptimizerFromFactoryConfig:
         ).build(_model())
         assert captured["master_weight_dtype"] is torch.bfloat16
 
+    def test_non_te_factory_preserves_explicit_none_dtype_kwarg(self):
+        captured = {}
+
+        def fake_factory(params, **kwargs):
+            captured.update(kwargs)
+            return torch.optim.SGD(params, lr=0.01)
+
+        OptimizerFromFactoryConfig(
+            factory=fake_factory,
+            kwargs={"master_weight_dtype": None},
+        ).build(_model())
+
+        assert "master_weight_dtype" in captured
+        assert captured["master_weight_dtype"] is None
+
     def test_build_requires_callable_factory(self):
         with pytest.raises(AssertionError, match="must be a callable"):
             OptimizerFromFactoryConfig(factory=None).build(_model())
@@ -216,6 +349,27 @@ class TestOptimizerFromFactoryConfig:
 # ---------------------------------------------------------------------------
 # build_optimizer — (name_or_path, kwargs) tuple form
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("explicit_groups", [False, True])
+def test_tp_foreach_reaches_kwargs_factory(explicit_groups):
+    captured = {}
+
+    def factory(params, **kwargs):
+        captured.update(kwargs)
+        return torch.optim.SGD(params, **kwargs)
+
+    mesh = MagicMock()
+    mesh.mesh_dim_names = ("tp",)
+    mesh["tp"].size.return_value = 2
+    config = OptimizerFromFactoryConfig(factory=factory, kwargs={"lr": 0.01})
+    model = _model()
+    if explicit_groups:
+        config.build_from_param_groups([{"params": list(model.parameters())}], device_mesh=mesh)
+    else:
+        config.build(model, device_mesh=mesh)
+
+    assert captured["foreach"] is False
 
 
 class TestBuildOptimizerTuple:

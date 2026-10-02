@@ -20,6 +20,7 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import pytest
+import torch
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor.parallel import ColwiseParallel
@@ -970,8 +971,8 @@ class TestQwen3_5ModelParallelizer:
             ("replicate", True, False),
         ],
     )
-    @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
-    @patch("nemo_automodel.components.models.qwen3_5.parallelization.fully_shard_by_dtype")
+    @patch("nemo_automodel.components.models.qwen3_5.parallelization.fully_shard")
+    @patch("nemo_automodel.components.models.qwen3_5.parallelization.fully_shard_with_compute_dtype_fallback")
     def test_frozen_multimodal_modules_are_not_separately_sharded(
         self,
         fully_shard_by_dtype,
@@ -1003,12 +1004,15 @@ class TestQwen3_5ModelParallelizer:
             param.requires_grad_(False)
         frozen_vision_params = set(model.model.vision_tower.parameters())
         fully_shard.side_effect = lambda model, **kwargs: model
-        fully_shard_by_dtype.side_effect = lambda model, *args, **kwargs: model
+        fully_shard_by_dtype.side_effect = lambda model, *args, fully_shard_fn, **kwargs: fully_shard_fn(
+            model, **kwargs
+        )
 
         result = strategy._apply(
             model=model,
             device_mesh=mesh,
             frozen_multimodal_sharding=frozen_multimodal_sharding,
+            enable_fsdp2_prefetch=False,
         )
 
         sharded_by_dtype = [call_args.args[0] for call_args in fully_shard_by_dtype.call_args_list]
@@ -1021,8 +1025,8 @@ class TestQwen3_5ModelParallelizer:
         else:
             assert "ignored_params" not in root_kwargs
 
-    @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
-    @patch("nemo_automodel.components.models.qwen3_5.parallelization.fully_shard_by_dtype")
+    @patch("nemo_automodel.components.models.qwen3_5.parallelization.fully_shard")
+    @patch("nemo_automodel.components.models.qwen3_5.parallelization.fully_shard_with_compute_dtype_fallback")
     def test_dtype_sharding_does_not_mutate_module_globals(
         self,
         fully_shard_by_dtype,
@@ -1048,7 +1052,7 @@ class TestQwen3_5ModelParallelizer:
         fully_shard.side_effect = lambda model, **kwargs: model
         fully_shard_by_dtype.side_effect = record
 
-        strategy._apply(model=_MockQwen35Model(), device_mesh=mesh)
+        strategy._apply(model=_MockQwen35Model(), device_mesh=mesh, enable_fsdp2_prefetch=False)
 
         assert observed, "expected the dtype-aware sharder to run"
         assert all(fn is default_walk for fn in observed)
@@ -1059,17 +1063,96 @@ class TestQwen3_5ModelParallelizer:
         mesh, _, _, _ = mock_device_mesh
         model = _MockQwen35Model()
         custom_fully_shard = MagicMock(side_effect=lambda module, **_kwargs: module)
-        fully_shard_by_dtype = MagicMock(side_effect=lambda module, *_args, **_kwargs: module)
         monkeypatch.setattr(strategy, "_fully_shard_module", custom_fully_shard)
-        monkeypatch.setattr(qwen3_5_parallelization, "fully_shard_by_dtype", fully_shard_by_dtype)
 
-        result = strategy._apply(model=model, device_mesh=mesh)
+        result = strategy._apply(model=model, device_mesh=mesh, enable_fsdp2_prefetch=False)
 
         assert result is model
-        layer_calls = fully_shard_by_dtype.call_args_list
-        assert [call.args[0] for call in layer_calls] == list(model.model.layers)
-        assert all(call.kwargs["model_parallelizer"] is strategy for call in layer_calls)
-        assert custom_fully_shard.call_args_list[-1].args[0] is model
+        assert [call.args[0] for call in custom_fully_shard.call_args_list] == [*model.model.layers, model]
+
+    @pytest.mark.parametrize("limit, expected", [(64, True), (0, False)])
+    def test_replication_is_bounded_and_local_to_each_model(self, mock_device_mesh, monkeypatch, limit, expected):
+        """One sidecar must never reuse another model's replicated parameter identities."""
+        mesh, _, _, _ = mock_device_mesh
+        sidecar = Qwen3_5ModelParallelizer()
+        roots = []
+        sharded = []
+
+        def fake_shard(module, **kwargs):
+            sharded.append((module, kwargs))
+            return module
+
+        def make_sync(root, parameters, mesh, *, fully_shard_fn):
+            roots.append((root, tuple(parameters)))
+            return fully_shard_fn
+
+        monkeypatch.setattr(qwen3_5_parallelization, "fully_shard", fake_shard)
+        monkeypatch.setattr(qwen3_5_parallelization, "make_fully_shard_with_replicated_parameter_grad_sync", make_sync)
+        monkeypatch.setattr(qwen3_5_parallelization, "_MAX_REPLICATED_FP32_BYTES_PER_MODULE", limit)
+        for _ in range(2):
+            model = _MockQwen35Model()
+            layer = nn.Module()
+            layer.projection = model.model.layers[0]
+            model.model.layers[0] = layer
+            holder = nn.Module()
+            holder.A_log = nn.Parameter(torch.zeros(4))
+            holder.dt_bias = nn.Parameter(torch.zeros(4))
+            model.model.layers[0]._fp32_params = holder
+            parameters = set(holder.parameters())
+            sidecar._apply(model, mesh, enable_fsdp2_prefetch=False)
+            root_kwargs = next(kwargs for module, kwargs in reversed(sharded) if module is model)
+            assert (parameters <= set(root_kwargs.get("ignored_params") or ())) is expected
+        assert sidecar._shard_module is None
+        assert len(roots) == (2 if expected else 0)
+        if expected:
+            assert roots[0][0] is not roots[1][0]
+            assert not {id(p) for p in roots[0][1]} & {id(p) for p in roots[1][1]}
+
+    def test_replication_selection_runs_after_trainability_reapplication(self, mock_device_mesh, monkeypatch):
+        """Selection must see parameters after the production trainability callback."""
+        mesh, _, _, _ = mock_device_mesh
+        model = _MockQwen35Model()
+        model.model.layers[0]._fp32_params = nn.Linear(4, 4, bias=False)
+        events = []
+        original_select = qwen3_5_parallelization.select_small_fp32_parameters
+
+        def reapply(model):
+            events.append("trainability")
+            model.model.layers[0]._fp32_params.requires_grad_(False)
+
+        def select(model, **kwargs):
+            events.append("selection")
+            assert not model.model.layers[0]._fp32_params.weight.requires_grad
+            return original_select(model, **kwargs)
+
+        monkeypatch.setattr(qwen3_5_parallelization, "select_small_fp32_parameters", select)
+        monkeypatch.setattr(qwen3_5_parallelization, "fully_shard", lambda module, **kwargs: module)
+        monkeypatch.setattr(
+            qwen3_5_parallelization,
+            "make_fully_shard_with_replicated_parameter_grad_sync",
+            lambda root, parameters, mesh, *, fully_shard_fn: fully_shard_fn,
+        )
+        Qwen3_5ModelParallelizer()._apply(model, mesh, reapply_trainability=reapply, enable_fsdp2_prefetch=False)
+        assert events == ["trainability", "selection"]
+
+    def test_cpu_offload_keeps_sensitive_parameters_sharded(self, mock_device_mesh, monkeypatch):
+        from torch.distributed.fsdp import CPUOffloadPolicy
+
+        mesh, _, _, _ = mock_device_mesh
+        model = _MockQwen35Model()
+        model.model.layers[0]._fp32_params = nn.Linear(4, 4, bias=False)
+        make_sync = MagicMock()
+        select = MagicMock()
+        monkeypatch.setattr(qwen3_5_parallelization, "make_fully_shard_with_replicated_parameter_grad_sync", make_sync)
+        monkeypatch.setattr(qwen3_5_parallelization, "select_small_fp32_parameters", select)
+        monkeypatch.setattr(
+            qwen3_5_parallelization,
+            "fully_shard_with_compute_dtype_fallback",
+            lambda module, **_kwargs: module,
+        )
+        Qwen3_5ModelParallelizer()._apply(model, mesh, offload_policy=CPUOffloadPolicy(), enable_fsdp2_prefetch=False)
+        select.assert_not_called()
+        make_sync.assert_not_called()
 
 
 class TestModelSidecars:

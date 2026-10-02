@@ -28,7 +28,7 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from torch.distributed.tensor import DTensor, Shard, distribute_tensor
 
-from nemo_automodel.components.distributed.parallelizer_utils import configure_fsdp_unused_param_reduction
+from nemo_automodel.components.distributed.fsdp2_extensions.utils import configure_fsdp_unused_param_reduction
 from nemo_automodel.components.loss.linear_ce import HAVE_CUT_CROSS_ENTROPY, FusedLinearCrossEntropy
 
 _RESULT_PREFIX = "CP_FLCE_FSDP_CORRECTNESS_RESULT "

@@ -12,20 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Deprecated compatibility imports for the FSDP2 extension helpers."""
+"""TP, PP, and FSDP must all be nontrivial to cover their interaction."""
 
-import warnings
+from tests.functional_tests.fsdp2_ownership.launch import run_distributed
 
-from nemo_automodel.components.distributed.fsdp2_extensions.compat import (
-    patch_fsdp_accumulated_grad_guard,
-    patch_fsdp_uniform_reduce_dtype,
-    patch_fsdp_unused_param_reduction,
-)
 
-warnings.warn(
-    "fsdp_patches moved to distributed.fsdp2_extensions.compat; update imports before the next major release.",
-    DeprecationWarning,
-    stacklevel=2,
-)
-
-__all__ = ["patch_fsdp_accumulated_grad_guard", "patch_fsdp_uniform_reduce_dtype", "patch_fsdp_unused_param_reduction"]
+def test_qwen_tp2_pp2_fsdp2_gradient_and_optimizer_parity() -> None:
+    run_distributed(8, "tests/functional_tests/fsdp2_ownership/run_qwen3_5_ownership.py", "--case", "pp-tp")

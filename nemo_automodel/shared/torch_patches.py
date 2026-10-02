@@ -19,8 +19,6 @@ tokenizer-only imports lightweight. Call `apply_torch_patches()` from code paths
 that already depend on torch (training / distributed / dataloading).
 """
 
-from __future__ import annotations
-
 import logging
 
 _logger = logging.getLogger(__name__)

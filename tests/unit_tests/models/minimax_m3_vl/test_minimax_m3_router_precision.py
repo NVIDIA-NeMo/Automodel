@@ -81,10 +81,10 @@ def test_gate_is_fp32_at_construction_for_fsdp_dtype_grouping(monkeypatch):
     """
     import torch.distributed.fsdp as fsdp
 
-    from nemo_automodel.components.distributed.parallelizer_utils import fully_shard_by_dtype
+    from nemo_automodel.components.distributed.fsdp2_extensions.utils import fully_shard_by_dtype
 
     monkeypatch.setattr(
-        "nemo_automodel.components.distributed.parallelizer_utils.fully_shard",
+        "nemo_automodel.components.distributed.fsdp2_extensions.utils.fully_shard",
         lambda *_args, **_kwargs: None,
     )
 

@@ -60,9 +60,9 @@ from nemo_automodel.components.datasets.llm.eagle3 import build_eagle3_dataloade
 from nemo_automodel.components.datasets.llm.offline_cache import ensure_supervision_options_match
 from nemo_automodel.components.datasets.vlm.dspark_collate import build_dspark_vlm_dataloader
 from nemo_automodel.components.distributed.config import FSDP2Config
+from nemo_automodel.components.distributed.fsdp2_extensions.utils import fully_shard_by_dtype
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
-from nemo_automodel.components.distributed.parallelizer_utils import fully_shard_by_dtype
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger

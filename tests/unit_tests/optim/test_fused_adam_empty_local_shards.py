@@ -110,7 +110,15 @@ class TestFusedAdamConfigDropsEmptyLocalShards:
 
         assert stub_te_fused_adam.last_params == [kept]
         assert stub_te_fused_adam.last_kwargs["lr"] == 1e-3
+        assert "master_weight_dtype" not in stub_te_fused_adam.last_kwargs
         assert "zero-numel local shards" in caplog.text
+
+    def test_explicit_master_weight_dtype_is_forwarded(self, stub_te_fused_adam):
+        kept = nn.Parameter(torch.ones(3))
+
+        FusedAdamConfig(master_weight_dtype="torch.float16")._build_optimizer([kept])
+
+        assert stub_te_fused_adam.last_kwargs["master_weight_dtype"] is torch.float16
 
     def test_flat_params_all_empty_raises(self, stub_te_fused_adam):
         with pytest.raises(ValueError, match="zero-numel local shard"):
@@ -185,6 +193,24 @@ class _OnlyEmptyTrainableModel(nn.Module):
 
 
 class TestFactoryEscapeHatchDropsEmptyLocalShards:
+    @pytest.mark.parametrize("build_from_groups", [False, True])
+    def test_te_fused_adam_factory_omits_none_master_weight_dtype(
+        self,
+        stub_te_fused_adam,
+        build_from_groups,
+    ):
+        cfg = OptimizerFromFactoryConfig(
+            factory=stub_te_fused_adam,
+            kwargs={"lr": 1e-3, "master_weight_dtype": None},
+        )
+
+        if build_from_groups:
+            cfg.build_from_param_groups([{"params": [nn.Parameter(torch.ones(3))]}])
+        else:
+            cfg.build(_TinyModel())
+
+        assert "master_weight_dtype" not in stub_te_fused_adam.last_kwargs
+
     def test_te_fused_adam_factory_drops_empty(self, stub_te_fused_adam):
         cfg = OptimizerFromFactoryConfig(factory=stub_te_fused_adam, kwargs={"lr": 1e-3})
 

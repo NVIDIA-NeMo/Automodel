@@ -30,7 +30,7 @@ from torch.distributed.tensor import DTensor
 
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 from nemo_automodel.components.distributed.activation_checkpointing import apply_submodule_checkpointing
-from nemo_automodel.components.distributed.parallelizer_utils import fully_shard_by_dtype
+from nemo_automodel.components.distributed.fsdp2_extensions.utils import fully_shard_by_dtype
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41TextConfig

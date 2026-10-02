@@ -247,6 +247,7 @@ jobs:
       && !cancelled()
     outputs:
       matrix: ${{ steps.compute.outputs.matrix }}
+      ownership-matrix: ${{ steps.compute.outputs.ownership-matrix }}
     steps:
       - name: Compute build matrix
         id: compute
@@ -259,15 +260,24 @@ jobs:
         run: |
           AWS_ENTRY=$(jq -nc --arg registry "$REGISTRY_AWS" --arg runner "${RUNNER_PREFIX}" \
             '{"cloud": "aws", "registry": $registry, "runner": $runner}')
+          OWNERSHIP_MATRIX=$(jq -nc --arg registry "$REGISTRY_AWS" \
+            '{"include": [
+              {"runner": "nemo-ci-aws-gpu-x4", "registry": $registry, "gpus": 4, "test-file": "test_four_gpu.py", "timeout": 40},
+              {"runner": "nemo-ci-aws-gpu-x8", "registry": $registry, "gpus": 8, "test-file": "test_eight_gpu.py", "timeout": 20}
+            ]}')
           if [[ "$IS_MEMBER" == "true" && "$DISABLE_GB200_TESTS" != "true" ]]; then
             GCP_ENTRY=$(jq -nc --arg registry "$REGISTRY_GCP" --arg runner "nemo-ci-gcp-gpu-x2" \
               '{"cloud": "gcp", "registry": $registry, "runner": $runner}')
             MATRIX=$(jq -nc --argjson aws "$AWS_ENTRY" --argjson gcp "$GCP_ENTRY" \
               '{"include": [$aws, $gcp]}')
+            OWNERSHIP_MATRIX=$(jq -c --arg registry "$REGISTRY_GCP" \
+              '.include += [{"runner": "nemo-ci-gcp-gpu-x4", "registry": $registry, "gpus": 4, "test-file": "test_four_gpu.py", "timeout": 40}]' \
+              <<< "$OWNERSHIP_MATRIX")
           else
             MATRIX=$(jq -nc --argjson aws "$AWS_ENTRY" '{"include": [$aws]}')
           fi
           echo "matrix=$MATRIX" | tee -a "$GITHUB_OUTPUT"
+          echo "ownership-matrix=$OWNERSHIP_MATRIX" | tee -a "$GITHUB_OUTPUT"
 
   cicd-container-build:
     needs: [pre-flight, cicd-wait-in-queue, cicd-compute-build-matrix]
@@ -577,7 +587,7 @@ jobs:
         with:
           test-folder: ${{ matrix.test-folder }}
           timeout: ${{ matrix.timeout }}
-          is_unit_test: "false"
+          is-unit-test: "false"
           PAT: ${{ steps.app-token.outputs.token }}
           test-data-path: ${{ matrix.test-data-path }}
           container-image: ${{ env.container-registry }}/${{ vars.CI_CONTAINER_NAME || 'automodel' }}:${{ github.sha }}
@@ -657,11 +667,43 @@ jobs:
           test-folder: ${{ matrix.test-folder }}
           timeout: ${{ matrix.timeout }}
           is-optional: ${{ matrix.is-optional || 'false' }}
-          is_unit_test: "false"
+          is-unit-test: "false"
           PAT: ${{ steps.app-token.outputs.token }}
           test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           container-image: ${{ env.container-registry-gb200 }}/automodel:${{ github.sha }}
           runner: ${{ startsWith(matrix.runner || 'nemo-ci-gcp-gpu-x2', 'ephe-v2-') && format('{0}-a{1}', matrix.runner || 'nemo-ci-gcp-gpu-x2', github.run_attempt) || matrix.runner || 'nemo-ci-gcp-gpu-x2' }}
+
+  cicd-fsdp-ownership-tests:
+    needs: [pre-flight, cicd-unit-tests, cicd-container-build, cicd-compute-build-matrix]
+    if: |
+      !cancelled()
+      && needs.pre-flight.outputs.is_member == 'true'
+      && (success() || needs.pre-flight.outputs.is_ci_workload == 'true' || needs.pre-flight.outputs.force_run_all == 'true')
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.cicd-compute-build-matrix.outputs.ownership-matrix) }}
+    runs-on: ${{ matrix.runner }}
+    name: L2_FSDP_Ownership_${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.BOT_ID }}
+          private-key: ${{ secrets.BOT_KEY }}
+      - name: main
+        uses: ./.github/actions/test-template
+        with:
+          test-folder: fsdp2_ownership/${{ matrix.test-file }}
+          gpu-count: ${{ matrix.gpus }}
+          timeout: ${{ matrix.timeout }}
+          max-attempts: "1"
+          PAT: ${{ steps.app-token.outputs.token }}
+          test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
+          container-image: ${{ matrix.registry }}/${{ vars.CI_CONTAINER_NAME || 'automodel' }}:${{ github.sha }}
+          runner: ${{ matrix.runner }}
 
   Nemo_CICD_Test:
     needs:
@@ -669,6 +711,7 @@ jobs:
       - cicd-unit-tests
       - cicd-e2e-tests
       - cicd-e2e-tests-gb200
+      - cicd-fsdp-ownership-tests
     if: |
       (
         needs.pre-flight.outputs.docs_only == 'true'
@@ -695,7 +738,10 @@ jobs:
           if [[ "$IS_MEMBER" == "true" && "$DISABLE_GB200_TESTS" != "true" ]]; then
             FAILED_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs --jq '[.jobs[] | select(.status == "completed" and .conclusion != "success")] | length') || echo 0
           else
-            FAILED_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs --jq '[.jobs[] | select(.status == "completed" and .conclusion != "success" and (.name | startswith("gb200_") | not))] | length') || echo 0
+            FAILED_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs | jq --arg member "$IS_MEMBER" \
+              '[.jobs[] | select(.status == "completed" and .conclusion != "success"
+                and (.name | startswith("gb200_") | not)
+                and ($member == "true" or .conclusion != "skipped" or (.name | startswith("L2_FSDP_Ownership_") | not)))] | length') || echo 0
           fi
 
           if [ "${FAILED_JOBS:-0}" -eq 0 ] || [ "$SKIPPING_IS_ALLOWED" == "true" ]; then

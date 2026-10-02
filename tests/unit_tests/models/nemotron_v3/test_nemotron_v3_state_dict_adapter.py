@@ -221,7 +221,9 @@ class TestNemotronV3AdapterDense:
         assert not any(k.endswith("norm_f.weight") for k in native)
         assert adapter._uses_model_prefix is False
 
-    @pytest.mark.parametrize("embed_key", ["backbone.embedding.weight", "backbone.embeddings.weight", "model.embedding.weight"])
+    @pytest.mark.parametrize(
+        "embed_key", ["backbone.embedding.weight", "backbone.embeddings.weight", "model.embedding.weight"]
+    )
     def test_from_hf_accepts_singular_or_plural_embedding(self, adapter, embed_key):
         """RL#4211: transformers save_pretrained may emit singular ``embedding``."""
         tensor = torch.randn(100, 256)

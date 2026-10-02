@@ -12,20 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Deprecated compatibility imports for the FSDP2 extension helpers."""
+from tests.utils.test_utils import run_test_script
 
-import warnings
 
-from nemo_automodel.components.distributed.fsdp2_extensions.compat import (
-    patch_fsdp_accumulated_grad_guard,
-    patch_fsdp_uniform_reduce_dtype,
-    patch_fsdp_unused_param_reduction,
-)
+def test_fsdp_casting_ownership_profiles_expected_nccl_count() -> None:
+    """One mixed-compute FSDP unit must not create dtype-only collectives."""
+    run_test_script("llm_pretrain_and_kd", "L2_FSDP_Casting_Ownership.sh")
 
-warnings.warn(
-    "fsdp_patches moved to distributed.fsdp2_extensions.compat; update imports before the next major release.",
-    DeprecationWarning,
-    stacklevel=2,
-)
 
-__all__ = ["patch_fsdp_accumulated_grad_guard", "patch_fsdp_uniform_reduce_dtype", "patch_fsdp_unused_param_reduction"]
+def test_hsdp_replicated_fp32_gradients_on_available_mesh() -> None:
+    """Check the replication dimension on two GPUs and both dimensions on four."""
+    run_test_script("llm_pretrain_and_kd", "L2_HSDP_Casting_Ownership.sh")

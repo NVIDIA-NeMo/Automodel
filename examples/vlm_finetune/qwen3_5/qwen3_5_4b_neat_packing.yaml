@@ -37,6 +37,9 @@ rng:
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
   pretrained_model_name_or_path: Qwen/Qwen3.5-4B
+  # Keep one fp32 resident/master copy. FSDP's mixed-precision policy casts the
+  # enclosing layer to the checkpoint compute precision for forward/backward.
+  torch_dtype: float32
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: sdpa
