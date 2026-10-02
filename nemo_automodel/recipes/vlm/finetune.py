@@ -174,16 +174,36 @@ def _validate_cp_packing_support(
     )
 
 
+def _masked_ce_fallback(loss_fn: nn.Module, probe_module: nn.Module) -> nn.Module:
+    """Return the MaskedCrossEntropy that replaces ``loss_fn`` on the model's logits.
+
+    MaskedCrossEntropy has no softcap: it reproduces a loss's ``logit_softcapping`` only when the model already
+    applies the same ``final_logit_softcapping`` to its logits, so any other softcap raises instead of silently
+    changing the training objective.
+    """
+    softcap = getattr(loss_fn, "logit_softcapping", 0) or 0
+    if softcap:
+        config = getattr(probe_module, "config", None)
+        text_config = config.get_text_config() if hasattr(config, "get_text_config") else config
+        model_softcap = getattr(text_config, "final_logit_softcapping", None)
+        if model_softcap != softcap:
+            raise ValueError(
+                f"{type(loss_fn).__name__}(logit_softcapping={softcap}) cannot fall back to MaskedCrossEntropy: "
+                f"the model's logits use final_logit_softcapping={model_softcap}"
+            )
+    return MaskedCrossEntropy(
+        ignore_index=_get_loss_ignore_index(loss_fn),
+        reduction=getattr(loss_fn, "reduction", "sum"),
+    )
+
+
 def _maybe_downgrade_loss_fn(loss_fn: nn.Module, probe_module: nn.Module, pp_enabled: bool) -> nn.Module:
     """Downgrade to MaskedCrossEntropy when the requested loss cannot run."""
     if not _supports_logits_to_keep(probe_module) and not isinstance(loss_fn, MaskedCrossEntropy):
         if isinstance(loss_fn, ChunkedCrossEntropy):
             raise ValueError("ChunkedCrossEntropy requires a model supporting logits_to_keep to avoid full logits")
         logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
-        return MaskedCrossEntropy(
-            ignore_index=_get_loss_ignore_index(loss_fn),
-            reduction=getattr(loss_fn, "reduction", "sum"),
-        )
+        return _masked_ce_fallback(loss_fn, probe_module)
     if (
         pp_enabled
         and isinstance(loss_fn, LinearCrossEntropy)
@@ -195,10 +215,7 @@ def _maybe_downgrade_loss_fn(loss_fn: nn.Module, probe_module: nn.Module, pp_ena
             "FusedLinearCrossEntropy is not supported under pipeline parallelism for this "
             "model. Using MaskedCrossEntropy instead."
         )
-        return MaskedCrossEntropy(
-            ignore_index=_get_loss_ignore_index(loss_fn),
-            reduction=getattr(loss_fn, "reduction", "sum"),
-        )
+        return _masked_ce_fallback(loss_fn, probe_module)
     if isinstance(loss_fn, ChunkedCrossEntropy):
         lm_head = _get_lm_head_module(probe_module)
         if lm_head is not None or not pp_enabled:

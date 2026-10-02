@@ -1650,6 +1650,28 @@ def test_maybe_downgrade_loss_fn(has_logits_to_keep, has_marker, pp_enabled, exp
         assert result.ignore_index == 0
 
 
+@pytest.mark.parametrize(
+    ("loss_softcap", "model_softcap", "expect_error"),
+    [(0, None, False), (30.0, 30.0, False), (30.0, None, True), (30.0, 50.0, True)],
+)
+def test_maybe_downgrade_loss_fn_keeps_softcap_or_raises(loss_softcap, model_softcap, expect_error):
+    """MaskedCrossEntropy has no softcap: a fallback is allowed only when the model's logits already carry the same
+    final_logit_softcapping; otherwise it would silently change the training objective."""
+    from transformers import PretrainedConfig
+
+    from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+
+    probe = _StageNoLogitsToKeep()
+    probe.config = PretrainedConfig(final_logit_softcapping=model_softcap)
+    loss_fn = FusedLinearCrossEntropy(ignore_index=0, logit_softcapping=loss_softcap)
+
+    if expect_error:
+        with pytest.raises(ValueError, match="cannot fall back to MaskedCrossEntropy"):
+            _maybe_downgrade_loss_fn(loss_fn, probe, pp_enabled=False)
+    else:
+        assert isinstance(_maybe_downgrade_loss_fn(loss_fn, probe, pp_enabled=False), MaskedCrossEntropy)
+
+
 def test_vlm_maybe_downgrade_keeps_masked_ce_object():
     from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 
