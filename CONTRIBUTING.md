@@ -77,6 +77,9 @@ If [Nvidia PyTorch](https://docs.nvidia.com/deeplearning/frameworks/pytorch-rele
 The image includes a pinned [Mixture-of-Kittens](https://github.com/cursor/mixture-of-kittens)
 build for GB200 (SM100). Pass `--build-arg MOK_ARCH=SM103` when building for
 GB300. MoK recipes require Blackwell GPUs; H100 GPUs are unsupported.
+Outside the image, install it with `MOK_ARCH=SM100 uv sync --extra mok` on Linux
+with Python 3.12+, CUDA-enabled PyTorch 2.10+ and the matching CUDA 13 toolkit.
+Use `MOK_ARCH=SM103` for GB300.
 
 Command to build Automodel's Dockerfile:
 

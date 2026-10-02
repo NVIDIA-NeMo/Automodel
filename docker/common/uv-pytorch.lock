@@ -3633,6 +3633,11 @@ sentencepiece = [
 ]
 
 [[package]]
+name = "mixture-of-kittens"
+version = "0.1.0"
+source = { git = "https://github.com/cursor/mixture-of-kittens.git?rev=f3a8bd2432457c5a2a2ea13915f0dcd0224581e4#f3a8bd2432457c5a2a2ea13915f0dcd0224581e4" }
+
+[[package]]
 name = "ml-dtypes"
 version = "0.5.4"
 source = { registry = "https://pypi.org/simple" }
@@ -4194,6 +4199,9 @@ moe = [
     { name = "tilelang" },
     { name = "transformer-engine", marker = "sys_platform == 'never'" },
 ]
+mok = [
+    { name = "mixture-of-kittens", marker = "python_full_version >= '3.12' and sys_platform == 'linux'" },
+]
 msa = [
     { name = "fmha-sm100", marker = "sys_platform == 'linux'" },
     { name = "nvidia-cutlass-dsl", marker = "sys_platform == 'linux'" },
@@ -4304,6 +4312,7 @@ requires-dist = [
     { name = "megatron-fsdp", git = "https://github.com/yuhezhang-ai/Megatron-LM.git?subdirectory=megatron%2Fcore%2Fdistributed%2Ffsdp%2Fsrc&rev=455389c480af6b3acdca74c7830c68b3274eb083" },
     { name = "mistral-common", marker = "extra == 'vlm'", specifier = ">=1.11.0" },
     { name = "mistral-common", extras = ["audio", "hf-hub", "sentencepiece"] },
+    { name = "mixture-of-kittens", marker = "python_full_version >= '3.12' and sys_platform == 'linux' and extra == 'mok'", git = "https://github.com/cursor/mixture-of-kittens.git?rev=f3a8bd2432457c5a2a2ea13915f0dcd0224581e4" },
     { name = "mlflow", marker = "extra == 'mlflow-full'", specifier = ">=3.16.1" },
     { name = "mlflow-skinny", marker = "extra == 'mlflow'", specifier = ">=3.16.1" },
     { name = "multi-storage-client", marker = "extra == 'msc'", specifier = ">=0.13" },
@@ -4359,7 +4368,7 @@ requires-dist = [
     { name = "transformers", specifier = "==5.15.1" },
     { name = "wandb", marker = "extra == 'wandb'", specifier = ">=0.30.0" },
 ]
-provides-extras = ["diffusion", "diffusion-kernels", "cuda", "cuda-source", "extra", "fa", "ffpa", "fla", "delta-databricks", "moe", "vlm", "cli", "s3", "msc", "vlm-media", "diffusion-media", "media", "mlflow", "mlflow-full", "wandb", "tracking", "msa", "all"]
+provides-extras = ["diffusion", "diffusion-kernels", "cuda", "cuda-source", "extra", "fa", "ffpa", "fla", "delta-databricks", "moe", "mok", "vlm", "cli", "s3", "msc", "vlm-media", "diffusion-media", "media", "mlflow", "mlflow-full", "wandb", "tracking", "msa", "all"]
 
 [package.metadata.requires-dev]
 build = [

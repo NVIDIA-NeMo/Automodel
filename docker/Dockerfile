@@ -218,21 +218,6 @@ RUN if [ "$INSTALL_UCCL_EP" = "True" ]; then \
 # Build torchao, FlashMLA, then FA3/FA4 sequentially and cap compiler parallelism to stay within CI memory limits.
 FROM automodel_dep AS wheel_builder
 
-# Mixture-of-Kittens is required by dispatcher='mok'. Build for GB200 (SM100)
-# by default; GB300 images can select SM103 with --build-arg MOK_ARCH=SM103.
-# Upstream supports Blackwell only, so these recipes cannot run on H100.
-ARG MOK_REF=f3a8bd2432457c5a2a2ea13915f0dcd0224581e4
-ARG MOK_ARCH=SM100
-RUN mkdir -p /wheels && \
-    git clone --filter=blob:none --no-checkout \
-        https://github.com/cursor/mixture-of-kittens.git /tmp/mixture-of-kittens && \
-    git -C /tmp/mixture-of-kittens checkout "${MOK_REF}" && \
-    git -C /tmp/mixture-of-kittens submodule update --init --recursive && \
-    CPLUS_INCLUDE_PATH=/usr/local/cuda/include/cccl \
-        LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LIBRARY_PATH} MOK_ARCH=${MOK_ARCH} \
-        pip wheel --no-cache-dir --no-build-isolation --no-deps -w /wheels /tmp/mixture-of-kittens && \
-    rm -rf /tmp/mixture-of-kittens
-
 # torchao MXFP8: build w/ submodules (PyPI wheels omit mxfp8 CUDA kernels on aarch64); pin v0.17.0 (v0.14.1 ~2.5x slower; main needs nvidia-cutlass-dsl).
 ARG TORCHAO_REF=v0.17.0
 RUN mkdir -p /wheels && \
@@ -284,7 +269,7 @@ FROM automodel_dep AS automodel_final
 
 WORKDIR /opt/Automodel
 
-# MoK + torchao MXFP8 + FlashMLA + FA3/FA4: prebuilt wheels from the wheel_builder stage, installed into system site-packages
+# torchao MXFP8 + FlashMLA + FA3/FA4: prebuilt wheels from the wheel_builder stage, installed into system site-packages
 # before uv sync — pip targets system deps, uv the venv (torchao/FA gated `never`, FlashMLA absent from the lock),
 # so uv sync won't prune or shadow them.
 COPY --from=wheel_builder /wheels /tmp/wheels/
@@ -327,6 +312,7 @@ COPY --chown=${RUNTIME_UID}:${RUNTIME_GID} docker/common/update_pyproject_pytorc
 # Install Automodel
 ARG BASE_IMAGE=cuda
 ARG AUTOMODEL_INSTALL=all
+ARG MOK_ARCH=SM100
 # `msa` is SM100-only so it stays out of `all`, but the image needs it: the MiniMax M3 MSA
 # recipe under examples/vlm_finetune/ is auto-discovered into release CI.
 ARG UV_SYNC_ARGS="--locked"
@@ -345,7 +331,8 @@ RUN --mount=type=cache,target=/opt/uv_cache,sharing=locked \
         MAGI_ATTENTION_PREBUILD_FFA=0 \
         MAX_JOBS=${UV_SYNC_MAX_JOBS} \
         UV_CONCURRENT_INSTALLS=8 \
-        uv sync --extra $AUTOMODEL_INSTALL --extra msa --all-groups $UV_SYNC_ARGS && \
+        MOK_ARCH=${MOK_ARCH} \
+        uv sync --extra $AUTOMODEL_INSTALL --extra msa --extra mok --all-groups $UV_SYNC_ARGS && \
     python -c "import importlib.metadata as m; import magi_attention; print('magi-attention', m.version('magi-attention'))" && \
     rm -rf ${UV_PROJECT_ENVIRONMENT}/lib/python*/site-packages/ray/jars && \
     chown -R "${RUNTIME_UID}:${RUNTIME_GID}" ${UV_PROJECT_ENVIRONMENT}
