@@ -400,6 +400,20 @@ def test_generate_qwen3_moe_lora_uses_all_isolated_checkpoint_phases():
         assert key not in robustness
 
 
+def test_generate_glm51_lora_includes_native_checkpoint_validation():
+    config = Path("examples/llm_finetune/glm/glm_5.1_lora.yaml")
+    job = dict(generate_job(config, {}, "release", "llm_finetune", "."))[""]
+    variables = job["variables"]
+
+    assert job.get("allow_failure") is None
+    assert variables["HAS_ROBUSTNESS"] == "true"
+    assert variables["CHECKPOINT_ROBUSTNESS_PROCESS_ISOLATION"] == "true"
+    assert variables["CHECKPOINT_ROBUSTNESS_PHASES"] == "train_and_save automodel_reload resume"
+    assert variables["TEST_NODE_COUNT"] == 16
+    assert variables["TIME"] == "00:45:00"
+    assert variables["REQUIRE_FINITE_METRICS"] == "true"
+
+
 def test_generate_nemotron_resume_cohort_preserves_known_issue_gating():
     expected_times = {
         "customizer_nemotron_nano_peft": "00:30:00",
