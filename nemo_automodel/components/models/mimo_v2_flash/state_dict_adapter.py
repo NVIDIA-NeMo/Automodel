@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import re
+from functools import cached_property
 from typing import Any
 
 import torch
@@ -104,71 +105,48 @@ def _dequantize_mxfp4(
     return (values * scales).to(dtype)
 
 
-def _read_index_tp_size(model_path: str | None, revision: str | None = None) -> int | None:
-    """Read the fused-QKV storage TP degree recorded in a safetensors index.
+def _read_index_tp_size(model_path: str | None, revision: str | None = None) -> int:
+    """Read the fused-QKV storage TP degree recorded in a checkpoint's safetensors index.
 
-    MiMo-V2.6 checkpoints record it as ``metadata.tp_size`` in
-    ``model.safetensors.index.json``. Local directories are read directly;
-    Hub repository IDs are resolved from the local Hugging Face cache only.
+    MiMo-V2.6 checkpoints record it as ``metadata.tp_size`` in ``model.safetensors.index.json``; an index without
+    the field describes a checkpoint saved without TP interleaving. Local directories are read directly; Hugging Face
+    repository IDs are resolved from the local cache only.
 
     Args:
         model_path: Local checkpoint directory or Hugging Face repository ID.
-        revision: Optional Hub revision or commit hash for cache lookup.
+        revision: Optional Hub revision or commit hash for the cache lookup.
 
     Returns:
-        The recorded TP degree, or None when the index or field is unavailable.
+        ``metadata.tp_size``, or 1 when the index records none.
+
+    Raises:
+        ValueError: If the index cannot be found or records an invalid TP degree.
     """
-    if not model_path:
-        return None
-    if os.path.isdir(model_path):
+    index_path = None
+    if model_path and os.path.isdir(model_path):
         index_path = os.path.join(model_path, _SAFETENSORS_INDEX)
-    else:
+    elif model_path:
         try:
             index_path = try_to_load_from_cache(model_path, _SAFETENSORS_INDEX, revision=revision)
         except ValueError:  # Not a valid repository ID.
-            return None
+            index_path = None
     if not isinstance(index_path, str) or not os.path.isfile(index_path):
-        return None
+        raise ValueError(
+            f"Cannot read {_SAFETENSORS_INDEX} for {model_path!r}; its metadata.tp_size gives the TP degree "
+            "that interleaves the checkpoint's fused QKV rows"
+        )
     with open(index_path, encoding="utf-8") as index_file:
         metadata = json.load(index_file).get("metadata") or {}
-    tp_size = metadata.get("tp_size")
-    if tp_size is None:
-        return None
+    tp_size = metadata.get("tp_size", 1)
     if isinstance(tp_size, bool) or not isinstance(tp_size, int) or tp_size < 1:
         raise ValueError(f"{index_path} has invalid metadata.tp_size {tp_size!r}; expected a positive integer")
     return tp_size
 
 
 def _resolve_checkpoint_tp_size(config: Any) -> int:
-    """Resolve the TP degree used to interleave fused QKV rows in the checkpoint.
-
-    Args:
-        config: MiMo model configuration. ``checkpoint_tp_size`` is an optional
-            explicit override and ``_name_or_path`` locates the checkpoint index.
-
-    Returns:
-        The index ``metadata.tp_size`` when present, else an explicit ``config.checkpoint_tp_size``.
-
-    Raises:
-        ValueError: If the config and the checkpoint index disagree, or if neither provides the TP degree: a guessed
-            value would silently permute Q/K/V rows for checkpoints whose fused shapes match several TP degrees.
-    """
-    configured = getattr(config, "checkpoint_tp_size", None)
+    """Return the fused-QKV checkpoint TP degree from the index of the checkpoint ``config`` was loaded from."""
     model_path = getattr(config, "_name_or_path", None) or getattr(config, "name_or_path", None)
-    recorded = _read_index_tp_size(model_path, getattr(config, "_commit_hash", None))
-    if recorded is not None and configured is not None and recorded != configured:
-        raise ValueError(
-            f"config.checkpoint_tp_size={configured} disagrees with metadata.tp_size={recorded} in "
-            f"{model_path}/{_SAFETENSORS_INDEX}; remove the checkpoint_tp_size override or set it to {recorded}"
-        )
-    if recorded is not None:
-        return recorded
-    if configured is None:
-        raise ValueError(
-            f"Cannot determine the fused-QKV checkpoint TP degree: no metadata.tp_size found in {_SAFETENSORS_INDEX} "
-            f"for {model_path!r}. Set config.checkpoint_tp_size to the TP degree the checkpoint was saved with."
-        )
-    return configured
+    return _read_index_tp_size(model_path, getattr(config, "_commit_hash", None))
 
 
 def _fused_qkv_sizes(config: Any, layer_idx: int, checkpoint_tp_size: int) -> tuple[int, int, int]:
@@ -227,8 +205,8 @@ def _split_fused_qkv(
     expected_rows = checkpoint_tp_size * rows_per_shard
     hidden_size = int(config.hidden_size)
     tp_hint = (
-        f"checkpoint_tp_size={checkpoint_tp_size} (from {_SAFETENSORS_INDEX} metadata.tp_size or "
-        "config.checkpoint_tp_size); a wrong value changes this shape"
+        f"checkpoint_tp_size={checkpoint_tp_size} (from {_SAFETENSORS_INDEX} metadata.tp_size); "
+        "a wrong value changes this shape"
     )
     if weight.ndim != 2 or tuple(weight.shape) != (expected_rows, hidden_size):
         raise ValueError(
@@ -288,7 +266,6 @@ class MiMoV2FlashStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
         self.backend = backend
         self.dtype = dtype
         self._uses_model_prefix = True
-        self._checkpoint_tp_size: int | None = None
         self.hf_to_internal_map: dict[str, str] = {}
         if self.backend.attn == "te":
             self.hf_to_internal_map["self_attn.attention_sink_bias"] = "self_attn.attn_module.softmax_offset"
@@ -320,12 +297,10 @@ class MiMoV2FlashStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
         """Whether checkpoint tensors use MiMo-V2.6 fused QKV and MXFP4 experts."""
         return getattr(self.config, "attention_projection_layout", "split") == "fused_qkv"
 
-    @property
+    @cached_property
     def checkpoint_tp_size(self) -> int:
         """TP degree interleaving fused QKV rows in the source checkpoint, resolved once."""
-        if self._checkpoint_tp_size is None:
-            self._checkpoint_tp_size = _resolve_checkpoint_tp_size(self.config)
-        return self._checkpoint_tp_size
+        return _resolve_checkpoint_tp_size(self.config)
 
     def from_hf(
         self,
