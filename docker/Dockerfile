@@ -312,7 +312,8 @@ COPY --chown=${RUNTIME_UID}:${RUNTIME_GID} docker/common/update_pyproject_pytorc
 # Install Automodel
 ARG BASE_IMAGE=cuda
 ARG AUTOMODEL_INSTALL=all
-ARG MOK_ARCH=SM100
+# Include both Blackwell targets supported by the pinned MoK source.
+ARG MOK_ARCH=ALL
 # `msa` is SM100-only so it stays out of `all`, but the image needs it: the MiniMax M3 MSA
 # recipe under examples/vlm_finetune/ is auto-discovered into release CI.
 ARG UV_SYNC_ARGS="--locked"
