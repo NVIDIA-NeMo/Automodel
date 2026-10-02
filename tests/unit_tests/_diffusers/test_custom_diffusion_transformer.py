@@ -27,7 +27,7 @@ from nemo_automodel._diffusers import auto_diffusion_pipeline as adp
 from nemo_automodel._diffusers.auto_diffusion_pipeline import (
     NeMoAutoDiffusionPipeline,
     _has_custom_model,
-    _reject_diffusers_only_options,
+    _validate_custom_model_options,
     _transformer_dir,
     build_custom_transformer,
 )
@@ -180,17 +180,17 @@ def test_config_dir_detects_runtime_registered_architecture(tmp_path):
 
 
 # =============================================================================
-# _reject_diffusers_only_options
+# _validate_custom_model_options
 # =============================================================================
 
 
-def test_reject_options_accepts_disabled_options_without_mesh():
-    _reject_diffusers_only_options(None, transformer_engine_linear=False, attention_backend=None, active_transformer="")
+def test_validate_options_accepts_disabled_options_without_mesh():
+    _validate_custom_model_options(None, transformer_engine_linear=False, attention_backend=None, active_transformer="")
 
 
-def test_reject_options_lists_every_enabled_option():
+def test_validate_options_lists_every_enabled_option():
     with pytest.raises(ValueError) as excinfo:
-        _reject_diffusers_only_options(
+        _validate_custom_model_options(
             None, transformer_engine_linear=True, fuse_qkv_projections=False, attention_backend="flash"
         )
 
@@ -199,10 +199,10 @@ def test_reject_options_lists_every_enabled_option():
     assert "fuse_qkv_projections" not in message
 
 
-def test_reject_options_rejects_context_parallelism():
-    _reject_diffusers_only_options(SimpleNamespace(cp_size=1))
+def test_validate_options_rejects_context_parallelism():
+    _validate_custom_model_options(SimpleNamespace(cp_size=1))
     with pytest.raises(ValueError, match="cp_size > 1"):
-        _reject_diffusers_only_options(SimpleNamespace(cp_size=2))
+        _validate_custom_model_options(SimpleNamespace(cp_size=2))
 
 
 # =============================================================================

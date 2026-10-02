@@ -514,13 +514,18 @@ def _has_custom_model(transformer_dir: str) -> bool:
     return bool(architectures) and ModelRegistry.has_custom_model(architectures[0])
 
 
-def _reject_diffusers_only_options(mesh_context: MeshContext | None, **options: Any) -> None:
-    """Raise if an option that needs a diffusers transformer is set for a custom model."""
-    enabled = sorted(name for name, value in options.items() if value)
-    if enabled:
-        raise ValueError(f"{enabled} need a diffusers transformer; this checkpoint uses an Automodel custom model.")
+def _validate_custom_model_options(mesh_context: MeshContext | None, **options: Any) -> None:
+    """Check that no option a custom model cannot honor was requested.
+
+    ``options`` are the pipeline arguments that only work with a diffusers transformer because they call diffusers
+    APIs (``transformer_engine_linear``, ``fuse_qkv_projections``, ``attention_backend``, ...). Context parallelism
+    is not supported for custom models yet either.
+    """
+    requested = sorted(name for name, value in options.items() if value)
+    if requested:
+        raise ValueError(f"{requested} only work with a diffusers transformer; this checkpoint uses a custom model.")
     if mesh_context is not None and mesh_context.cp_size > 1:
-        raise ValueError("Context parallelism is not supported for custom-model transformers yet (cp_size > 1).")
+        raise ValueError("Context parallelism is not supported for custom models yet (cp_size > 1).")
 
 
 def build_custom_transformer(
@@ -702,7 +707,7 @@ class NeMoAutoDiffusionPipeline:
         if _has_custom_model(transformer_dir):
             if components_to_load is not None and set(components_to_load) - {"transformer"}:
                 raise ValueError("Custom-model pipelines load only the `transformer` component.")
-            _reject_diffusers_only_options(
+            _validate_custom_model_options(
                 mesh_context,
                 active_transformer=active_transformer,
                 transformer_engine_linear=transformer_engine_linear,
@@ -944,7 +949,7 @@ class NeMoAutoDiffusionPipeline:
         spec = PipelineSpec.from_dict(pipeline_spec)
         transformer_dir = _transformer_dir(resolve_diffusion_model_dir(model_id), spec.subfolder)
         if _has_custom_model(transformer_dir):
-            _reject_diffusers_only_options(
+            _validate_custom_model_options(
                 mesh_context,
                 transformer_engine_linear=transformer_engine_linear,
                 fuse_qkv_projections=fuse_qkv_projections,
