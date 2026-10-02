@@ -44,6 +44,9 @@ concurrency:
   group: fern-publish
   cancel-in-progress: true
 
+env:
+  FERN_NO_VERSION_REDIRECTION: "true"
+
 jobs:
   publish:
     runs-on: ubuntu-latest
@@ -74,6 +77,7 @@ jobs:
       - name: Publish Docs
         env:
           FERN_TOKEN: ${{ secrets.DOCS_FERN_TOKEN }}
+          FERN_DOCS_DEPLOY_MODE: ledger
         working-directory: ./docs/fern
         run: |
           # Pin the Fern CLI to the version in fern.config.json so production

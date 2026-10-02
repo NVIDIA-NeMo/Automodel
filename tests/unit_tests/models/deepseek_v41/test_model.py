@@ -30,10 +30,8 @@ from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy, fully_shard
 from torch.distributed.tensor import DTensor, Shard, distribute_tensor
 
 from nemo_automodel._transformers.capabilities import _is_deepseek_v4
-from nemo_automodel.components.distributed.parallelizer import (
-    DefaultParallelizationStrategy,
-    get_parallelization_strategy,
-)
+from nemo_automodel.components.distributed import ModelParallelizer
+from nemo_automodel.components.distributed.model_parallelizer import get_model_parallelizer
 from nemo_automodel.components.distributed.parallelizer_utils import fully_shard_by_dtype
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
@@ -397,10 +395,10 @@ def test_indexers_are_frozen_by_the_model_constructor() -> None:
     assert expected and frozen == expected
 
 
-def test_v41_uses_generic_moe_parallelization() -> None:
+def test_v41_uses_unified_moe_parallelization() -> None:
     model = DeepseekV41ForCausalLM(_tiny_config(), backend=_backend())
     assert not _is_deepseek_v4_model(model)
-    assert type(get_parallelization_strategy(model)) is DefaultParallelizationStrategy
+    assert isinstance(get_model_parallelizer(model), ModelParallelizer)
     assert not dsv4_fsdp._is_deepseek_v4_module(model)
     assert not _is_deepseek_v4(model)
     assert _is_deepseek_v4(SimpleNamespace(config=SimpleNamespace(model_type="deepseek_v4")))

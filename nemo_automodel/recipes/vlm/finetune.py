@@ -74,14 +74,16 @@ from nemo_automodel.components.loggers.mlflow_utils import (
     to_float_metrics,
 )
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
-from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy
+from nemo_automodel.components.loss.linear_ce_base import LinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.loss.mtp import calculate_mtp_loss
 from nemo_automodel.components.loss.utils import (
     _count_label_tokens,
-    _get_lm_head_weight,
+    _get_lm_head_module,
     _get_loss_ignore_index,
     calculate_loss,
+    prepare_lm_weight,
 )
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
@@ -175,6 +177,8 @@ def _validate_cp_packing_support(
 def _maybe_downgrade_loss_fn(loss_fn: nn.Module, probe_module: nn.Module, pp_enabled: bool) -> nn.Module:
     """Downgrade to MaskedCrossEntropy when the requested loss cannot run."""
     if not _supports_logits_to_keep(probe_module) and not isinstance(loss_fn, MaskedCrossEntropy):
+        if isinstance(loss_fn, ChunkedCrossEntropy):
+            raise ValueError("ChunkedCrossEntropy requires a model supporting logits_to_keep to avoid full logits")
         logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
         return MaskedCrossEntropy(
             ignore_index=_get_loss_ignore_index(loss_fn),
@@ -182,9 +186,11 @@ def _maybe_downgrade_loss_fn(loss_fn: nn.Module, probe_module: nn.Module, pp_ena
         )
     if (
         pp_enabled
-        and isinstance(loss_fn, FusedLinearCrossEntropy)
+        and isinstance(loss_fn, LinearCrossEntropy)
         and not getattr(probe_module, "_pp_return_hidden_states_supported", False)
     ):
+        if isinstance(loss_fn, ChunkedCrossEntropy):
+            raise ValueError("ChunkedCrossEntropy requires pipeline stages that can return hidden states")
         logger.warning(
             "FusedLinearCrossEntropy is not supported under pipeline parallelism for this "
             "model. Using MaskedCrossEntropy instead."
@@ -193,6 +199,10 @@ def _maybe_downgrade_loss_fn(loss_fn: nn.Module, probe_module: nn.Module, pp_ena
             ignore_index=_get_loss_ignore_index(loss_fn),
             reduction=getattr(loss_fn, "reduction", "sum"),
         )
+    if isinstance(loss_fn, ChunkedCrossEntropy):
+        lm_head = _get_lm_head_module(probe_module)
+        if lm_head is not None or not pp_enabled:
+            loss_fn.validate_lm_head(lm_head, model_config=getattr(probe_module, "config", None))
     return loss_fn
 
 
@@ -403,14 +413,17 @@ def build_dataloader(
         if "cp" in getattr(device_mesh, "mesh_dim_names", ()):
             cp_size = device_mesh["cp"].size()
 
-    from nemo_automodel.components.models.common.packing import configure_packing, get_attn_implementation
+    from nemo_automodel.components.models.common.packing import (
+        get_attn_implementation,
+        validate_flash_packing_support,
+    )
 
     packing_attn_implementation = config.resolve_packing_attn_implementation(
         model_attn_implementation=get_attn_implementation(cfg_model),
         cp_size=cp_size,
     )
     if config.packing is not None and config.packing.packing_format != "thd":
-        configure_packing(attn_implementation=packing_attn_implementation)
+        validate_flash_packing_support(attn_implementation=packing_attn_implementation)
 
     with ScopedRNG(seed=seed, ranked=True):
         result = config.build(
@@ -638,14 +651,17 @@ class FinetuneRecipeForVLM(BaseRecipe):
             packing_enabled=dataloader_config.packing is not None,
             cp_size=self.mesh_context.cp_size,
         )
-        from nemo_automodel.components.models.common.packing import configure_packing, get_attn_implementation
+        from nemo_automodel.components.models.common.packing import (
+            get_attn_implementation,
+            validate_flash_packing_support,
+        )
 
         packing_attn_implementation = dataloader_config.resolve_packing_attn_implementation(
             model_attn_implementation=get_attn_implementation(self.cfg.model, model=self.model_parts[0]),
             cp_size=self.mesh_context.cp_size,
         )
         if dataloader_config.packing is not None and dataloader_config.packing.packing_format != "thd":
-            configure_packing(attn_implementation=packing_attn_implementation)
+            validate_flash_packing_support(attn_implementation=packing_attn_implementation, model=self.model_parts[0])
         process_group = getattr(self.mesh_context, "process_group", None)
         dataset_build_context = FirstRankPerNode(group=process_group)
         with ScopedRNG(seed=self.cfg.get("seed", 42), ranked=True):
@@ -994,12 +1010,12 @@ class FinetuneRecipeForVLM(BaseRecipe):
             )
             with sync_ctx, self._cp_vision_frame_sharding_context(), train_ctx():
                 batch = filter_forward_kwargs(model, batch)
-                if isinstance(self.loss_fn, FusedLinearCrossEntropy):
+                if isinstance(self.loss_fn, LinearCrossEntropy):
                     # use num_logits_to_keep to avoid full logits matrix in memory
-                    out = model(logits_to_keep=1, **batch)
+                    out = model(**{**batch, "logits_to_keep": 1, "output_hidden_states": True})
                     if "hidden_states" not in out:
                         raise ValueError(
-                            "FusedLinearCrossEntropy requires the model to output hidden states. "
+                            f"{type(self.loss_fn).__name__} requires the model to output hidden states. "
                             "Set `model.text_config.output_hidden_states=True` in the config."
                         )
                 else:
@@ -1007,11 +1023,12 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
                 grad_reduce_group = self._get_dp_group(include_cp=True) if is_train else None
                 shared_lm_weight = (
-                    self.loss_fn.materialize_lm_weight(
-                        _get_lm_head_weight(model),
+                    prepare_lm_weight(
+                        self.loss_fn,
+                        model,
                         grad_reduce_group=grad_reduce_group,
                     )
-                    if isinstance(self.loss_fn, FusedLinearCrossEntropy)
+                    if isinstance(self.loss_fn, LinearCrossEntropy)
                     else None
                 )
                 local_loss = calculate_loss(
@@ -1046,6 +1063,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                         num_label_tokens=num_label_tokens,
                         ignore_index=ignore_index,
                         lm_weight=shared_lm_weight,
+                        logits_dtype=out.logits.dtype,
                         grad_reduce_group=grad_reduce_group,
                         cu_seqlens=None if mtp_per_depth_targets is not None else batch.get("cu_seqlens"),
                     )
@@ -1084,8 +1102,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
         if last_stage_model is None:
             raise RuntimeError("Pipeline reports a last stage, but no last-stage model part was found")
 
-        # FusedLinearCrossEntropy consumes hidden states: flag the last stage to emit them
-        if isinstance(self.loss_fn, FusedLinearCrossEntropy):
+        # Linear CE consumes hidden states: flag the last stage to emit them
+        if isinstance(self.loss_fn, LinearCrossEntropy):
             last_stage_model._pp_return_hidden_states = True
 
         self.pp.info.schedule._loss_fn = self.cfg.mtp.build(
@@ -1257,8 +1275,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 labels = batch.pop("labels")
                 with self._cp_vision_frame_sharding_context(), train_ctx():
                     batch = filter_forward_kwargs(self.model_parts[0], batch)
-                    if isinstance(self.loss_fn, FusedLinearCrossEntropy):
-                        out = self.model_parts[0](logits_to_keep=1, **batch)
+                    if isinstance(self.loss_fn, LinearCrossEntropy):
+                        out = self.model_parts[0](**{**batch, "logits_to_keep": 1, "output_hidden_states": True})
                     else:
                         out = self.model_parts[0](**batch)
                     local_loss = calculate_loss(

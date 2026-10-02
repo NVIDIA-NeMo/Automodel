@@ -95,10 +95,18 @@ jobs:
         run: |
           source ./venv/bin/activate
           uv run --active bandit -r app.py nemo_automodel examples scripts tools tutorials -t B614
+      - name: Reject unsafe NumPy load/save calls
+        run: |
+          source ./venv/bin/activate
+          uv run --active python tools/lint_numpy_pickle.py
       - name: Reject globals()
         run: |
           source ./venv/bin/activate
           uv run --active python tools/lint_no_globals.py
+      - name: Enforce model parallelizer contract
+        run: |
+          source ./venv/bin/activate
+          uv run --active python tools/lint_model_parallelizer_contract.py
 
   import_linting:
     runs-on: ${{ vars.LINT_AND_INSTALL_TEST_RUNNER || 'ubuntu-latest' }}
@@ -400,8 +408,15 @@ jobs:
           push: true
           context: .
           platforms: ${{ steps.platform.outputs.platforms }}
+          # Opt-in build parallelism (Dockerfile defaults keep the serial/lower values). Any
+          # consumer sharing this BuildKit cache must pass identical values to hit the same layers.
+          # Keep comments out of the block below: build-push-action passes `#` lines through.
           build-args: |
             BASE_IMAGE=pytorch
+            FA3_MAX_JOBS=24
+            UV_SYNC_MAX_JOBS=24
+            BNB_BUILD_MAX_JOBS=8
+            BNB_BUILD_THREADS_PER_JOB=8
           cache-from: type=registry,ref=${{ steps.cache_from.outputs.donor }},mode=max
           cache-to: ${{ steps.cache_keys.outputs.cache-to }}
           no-cache: false
