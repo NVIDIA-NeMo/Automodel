@@ -1,0 +1,187 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Full-parameter MiMo-V2.6-Pro-RL text SFT on real Tulu3, all 70 decoder layers.
+# Packed THD sequences of 65536 tokens, 100 steps, LBS2 / GBS16 / GA1.
+# Hardware target: 32 nodes x 4 GB200 GPUs, EP64 / PP2 / CP8 / TP1.
+# DP = 128 / (PP2 * CP8) = 8; EP64 spans DP8 * CP8.
+# Keep each 64-GPU EP group within one NVLink domain.
+#
+# Requires Transformer Engine >= 2.16, cuDNN >= 9.26 and HybridEP with MNNVL.
+# Native QK192/V128 CP is required on GB200. AutoModel patches TE 2.16/2.17
+# THD reordering; TE >= 2.18 uses its upstream implementation.
+# Set these in the launch environment for a direct run (ci.env_vars is CI-only):
+#   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+#   USE_MNNVL=1 NVTE_FUSED_ATTN=1 NVTE_FLASH_ATTN=0 NVTE_UNFUSED_ATTN=0
+# Launch through the standard multi-node AutoModel launcher, with four ranks/node.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
+seed: 1234
+
+step_scheduler:
+  global_batch_size: 16
+  local_batch_size: 2
+  ckpt_every_steps: 1000
+  save_checkpoint_every_epoch: false
+  val_every_steps: 1000
+  log_remote_every_steps: 1
+  gc_every_steps: 5
+  num_epochs: 100
+  max_steps: 100
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 120
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1234
+  ranked: true
+  deterministic: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  config:
+    _target_: nemo_automodel.components.models.mimo_v2_flash.config.MiMoV2Config.from_pretrained
+    pretrained_model_name_or_path: XiaomiMiMo/MiMo-V2.6-Pro-RL
+    name_or_path: XiaomiMiMo/MiMo-V2.6-Pro-RL
+    use_cache: false
+    output_hidden_states: true
+    num_nextn_predict_layers: 0
+    # Fused QKV checkpoint layout; independent of runtime TP1.
+    checkpoint_tp_size: 8
+  trust_remote_code: false
+  load_base_model: true
+  torch_dtype: bfloat16
+  use_liger_kernel: false
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: te
+    linear: te
+    rms_norm: te
+    experts: torch_mm
+    dispatcher: hybridep
+    rope_fusion: false
+    gate_precision: float32
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+  use_sdpa_patching: false
+
+checkpoint:
+  enabled: false
+  checkpoint_dir: checkpoints/mimo_v2_6_pro_rl_tulu3_packed64k_ep64pp2cp8_100steps
+  model_save_format: safetensors
+  save_consolidated: false
+  dequantize_base_checkpoint: true
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 8
+  pp_size: 2
+  ep_size: 64
+  sequence_parallel: false
+  activation_checkpointing: true
+  reshard_after_forward: true
+  defer_fsdp_grad_sync: false
+  moe:
+    reshard_after_forward: true
+    wrap_outer_model: true
+    ignore_router_for_ac: true
+  pipeline:
+    pp_schedule: 1f1b
+    pp_microbatch_size: 1
+    layers_per_stage: 35
+    scale_grads_in_schedule: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
+  path_or_dataset_id: allenai/tulu-3-sft-mixture
+  split: train
+  seq_length: 65536
+  truncation: true
+  padding: false
+  chat_template: examples/llm_finetune/qwen/qwen3_tulu3_chat_template.jinja
+  shuffle_seed: 1234
+
+packed_sequence:
+  packing_strategy: thd
+  packed_sequence_size: 65536
+  # Every packed document must be aligned to 2 * CP8.
+  pad_to_multiple_of: 16
+  max_packs: 1600
+  num_proc: 1
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
+  num_workers: 4
+  persistent_workers: true
+  pin_memory: true
+  prefetch_factor: 2
+  shuffle: false
+  drop_last: true
+
+validation_dataset: none
+validation_dataloader: none
+
+optimizer:
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+  betas: [0.9, 0.95]
+  eps: 1.0e-08
+  lr: 5.0e-06
+  weight_decay: 0.1
+  master_weights: true
+  master_weight_dtype: torch.float32
+  exp_avg_dtype: torch.bfloat16
+  exp_avg_sq_dtype: torch.bfloat16
+  adam_w_mode: true
+  # Preserve FP32 master values using BF16 parameters and int16 remainders.
+  store_param_remainders: true
+
+lr_scheduler:
+  lr_decay_style: constant
+
+clip_grad_norm:
+  max_norm: 1.0
+  backend: te
+
+# wandb:
+#   enable: true
+#   entity: <your_wandb_entity>
+#   project: automodel-mimo-v26-pro
+#   name: mimo_v2_6_pro_rl_tulu3_packed64k_ep64pp2cp8_100steps
+#   tags: [mimo-v2.6-pro, gb200, sft, tulu3, packed64k, ep64, pp2, cp8]
+#   mode: online
+#   dir: logs/mimo_v2_6_pro_rl_tulu3_packed64k_ep64pp2cp8_100steps/wandb
+
+ci:
+  recipe_owner: huiyingl
+  nodes: 32
+  nproc_per_node: 4
+  cluster_tag: gb200
+  time: "01:00:00"
+  max_steps: 5
+  local_batch_size: 2
+  env_vars:
+    PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+    USE_MNNVL: "1"
+    NVTE_FUSED_ATTN: "1"
+    NVTE_FLASH_ATTN: "0"
+    NVTE_UNFUSED_ATTN: "0"
