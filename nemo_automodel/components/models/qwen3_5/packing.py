@@ -24,6 +24,13 @@ from nemo_automodel.components.models.common.packing import get_unpad_data, is_i
 
 
 @dataclass(frozen=True)
+class HostTensor:
+    """Keep a CPU metadata tensor outside distributed input device transfers."""
+
+    tensor: torch.Tensor
+
+
+@dataclass(frozen=True)
 class GatedDeltaPackedMetadata:
     """Packed-sequence metadata shared by every GatedDeltaNet layer.
 
@@ -48,6 +55,7 @@ def prepare_gated_delta_packed_metadata(
     attention_mask: torch.Tensor | None,
     packed_seq_ids: torch.Tensor | None,
     compute_device: torch.device | None = None,
+    host_packed_seq_ids: HostTensor | None = None,
 ) -> GatedDeltaPackedMetadata | None:
     """Build shared GatedDeltaNet metadata once for a model forward.
 
@@ -58,6 +66,8 @@ def prepare_gated_delta_packed_metadata(
             sequence] supplied beside a backend-specific attention mask.
         compute_device: Device used by the decoder. Host document IDs are
             transferred there after their dynamic metadata is prepared.
+        host_packed_seq_ids: CPU mirror retained through distributed forward
+            input transfer; it must match ``packed_seq_ids``.
 
     Returns:
         Device and CPU packed-sequence metadata whose tensor layouts are
@@ -73,7 +83,11 @@ def prepare_gated_delta_packed_metadata(
     for candidate in (packed_seq_ids, attention_mask):
         if candidate is None or candidate.dtype == torch.bool or candidate.dim() != 2:
             continue
-        candidate_cpu = candidate.detach().to(device="cpu")
+        candidate_cpu = (
+            host_packed_seq_ids.tensor
+            if candidate is packed_seq_ids and host_packed_seq_ids is not None
+            else candidate.detach().to(device="cpu")
+        )
         if is_indexed_packed_mask(candidate_cpu):
             document_ids = candidate
             document_ids_cpu = candidate_cpu

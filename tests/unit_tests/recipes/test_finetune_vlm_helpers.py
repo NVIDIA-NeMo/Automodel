@@ -31,6 +31,7 @@ from nemo_automodel.components.datasets.vlm.pp_media import (
 )
 from nemo_automodel.components.distributed.cp_vision_frame_shard import CpVisionFrameShardingConfig
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
+from nemo_automodel.components.models.qwen3_5.packing import HostTensor
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.components.optim.optimizer import LRSchedulerConfig, build_optimizer_config
 from nemo_automodel.components.training.step_scheduler import StepSchedulerConfig
@@ -2324,11 +2325,16 @@ class _CPPreEmbedStop(RuntimeError):
 class TestForwardBackwardStepNonPP:
     """Tests for _forward_backward_step without pipeline parallelism."""
 
-    def test_model_host_metadata_stays_on_cpu_before_cp_sharding(self, monkeypatch):
+    @pytest.mark.parametrize("cp_size, expect_host_mirror", [(1, True), (2, False)])
+    def test_model_host_metadata_is_added_only_without_cp(self, monkeypatch, cp_size, expect_host_mirror):
         model = _CPPreEmbedModel()
-        model.host_batch_keys = frozenset({"image_grid_thw"})
+        model.prepare_host_batch_metadata = lambda batch: {
+            "_host_image_grid_thw": HostTensor(batch["image_grid_thw"]),
+            "_host_packed_seq_ids": HostTensor(batch["_packed_seq_ids"]),
+        }
         recipe = _create_non_pp_recipe(model)
-        recipe.__dict__["device_mesh"] = _DummyCPDeviceMesh(cp_size=2)
+        recipe.__dict__["device_mesh"] = _DummyCPDeviceMesh(cp_size=cp_size)
+        packed_ids = torch.tensor([[1, 1, 2, 2]])
         grid = torch.tensor([[1, 2, 2]])
         moved = []
 
@@ -2337,40 +2343,13 @@ class TestForwardBackwardStepNonPP:
             return value
 
         def check_batch(sharder, batch):
-            assert batch["image_grid_thw"] is grid
-            assert all(value is not grid for value in moved)
-            raise _CPPreEmbedStop
-
-        monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune._move_to_device", record_move)
-        monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.ContextParallelSharder.shard", check_batch)
-        with pytest.raises(_CPPreEmbedStop):
-            recipe._forward_backward_step(
-                idx=0,
-                batch={"input_ids": torch.ones(1, 4, dtype=torch.long), "image_grid_thw": grid},
-                loss_buffer=[],
-                num_label_tokens=4,
-                num_batches=1,
-                is_train=False,
-            )
-
-    @pytest.mark.parametrize("cp_size, expected_move", [(1, False), (2, True)])
-    def test_packed_document_ids_stay_host_only_without_cp(self, monkeypatch, cp_size, expected_move):
-        model = _CPPreEmbedModel()
-        model.host_batch_keys = frozenset({"_packed_seq_ids"})
-        model.prepare_host_batch_metadata = lambda batch: {"_vlm_token_presence": (True, False, False)}
-        recipe = _create_non_pp_recipe(model)
-        recipe.__dict__["device_mesh"] = _DummyCPDeviceMesh(cp_size=cp_size)
-        packed_ids = torch.tensor([[1, 1, 2, 2]])
-        moved = []
-
-        def record_move(value, device):
-            moved.append(value)
-            return value
-
-        def check_batch(sharder, batch):
             assert batch["_packed_seq_ids"] is packed_ids
-            assert any(value is packed_ids for value in moved) is expected_move
-            assert ("_vlm_token_presence" in batch) is (not expected_move)
+            assert any(value is packed_ids for value in moved)
+            assert any(value is grid for value in moved)
+            assert ("_host_packed_seq_ids" in batch) is expect_host_mirror
+            if expect_host_mirror:
+                assert batch["_host_packed_seq_ids"].tensor is packed_ids
+                assert batch["_host_image_grid_thw"].tensor is grid
             raise _CPPreEmbedStop
 
         monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune._move_to_device", record_move)
@@ -2378,7 +2357,11 @@ class TestForwardBackwardStepNonPP:
         with pytest.raises(_CPPreEmbedStop):
             recipe._forward_backward_step(
                 idx=0,
-                batch={"input_ids": torch.ones(1, 4, dtype=torch.long), "_packed_seq_ids": packed_ids},
+                batch={
+                    "input_ids": torch.ones(1, 4, dtype=torch.long),
+                    "_packed_seq_ids": packed_ids,
+                    "image_grid_thw": grid,
+                },
                 loss_buffer=[],
                 num_label_tokens=4,
                 num_batches=1,

@@ -64,6 +64,7 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.qwen3_5.packing import (
     GatedDeltaPackedMetadata,
+    HostTensor,
     prepare_gated_delta_packed_metadata,
 )
 from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import CPAwareGatedDeltaNet
@@ -536,10 +537,12 @@ class Qwen3_5DenseTextBackbone(nn.Module):
         freqs_cis = torch.cat((cos[..., :head_dim], sin[..., :head_dim]), dim=-1)
         packed_gdn_metadata = None
         if not getattr(self, "_cp_enabled", False):
+            host_packed_seq_ids = attn_kwargs.pop("_host_packed_seq_ids", None)
             packed_gdn_metadata = prepare_gated_delta_packed_metadata(
                 attention_mask,
                 attn_kwargs.get("_packed_seq_ids"),
                 compute_device=inputs_embeds.device,
+                host_packed_seq_ids=host_packed_seq_ids,
             )
 
         for decoder_layer in self.layers.values():
@@ -597,6 +600,7 @@ class Qwen3_5Model(HFQwen3_5Model):
         self,
         pixel_values: torch.Tensor,
         image_grid_thw: torch.Tensor | None = None,
+        host_image_grid_thw: HostTensor | None = None,
         **kwargs: Any,
     ) -> tuple | BaseModelOutputWithPooling:
         """Encode image patches, keeping SDPA segment lengths on the host.
@@ -605,6 +609,8 @@ class Qwen3_5Model(HFQwen3_5Model):
             pixel_values: Tensor of shape [patches, patch_features], in image order.
             image_grid_thw: Integer tensor of shape [images, 3], with temporal,
                 height, and width grid sizes in that order.
+            host_image_grid_thw: Matching CPU grid retained before the
+                distributed wrapper moves tensor inputs to CUDA.
             **kwargs: Additional Hugging Face vision-forward arguments.
 
         Returns:
@@ -617,7 +623,11 @@ class Qwen3_5Model(HFQwen3_5Model):
             # HF's vision helpers use host lengths for attention, interpolation,
             # positions, and output splitting. Compute them from one host grid
             # rather than reading CUDA scalars repeatedly in each helper/block.
-            grid_cpu = image_grid_thw.detach().to(device="cpu")
+            grid_cpu = (
+                host_image_grid_thw.tensor
+                if host_image_grid_thw is not None
+                else image_grid_thw.detach().to(device="cpu")
+            )
             kwargs["cu_seqlens"] = get_vision_cu_seqlens(grid_cpu)
             interp_indices, interp_weights = get_vision_interpolation_indices_and_weights(
                 grid_cpu,
@@ -737,6 +747,7 @@ class Qwen3_5Model(HFQwen3_5Model):
             Model output with hidden states of shape [batch, sequence, hidden]
             and optional cached attention state.
         """
+        host_image_grid_thw = kwargs.pop("_host_image_grid_thw", None)
         # Media present + vision encoder: full HF VL forward (vision encode +
         # multimodal scatter), which then calls self.language_model (NeMo backbone).
         if (pixel_values is not None or pixel_values_videos is not None) and self.visual is not None:
@@ -757,8 +768,15 @@ class Qwen3_5Model(HFQwen3_5Model):
             if inputs_embeds_for_super is None:
                 inputs_embeds_for_super = embed_tokens(input_ids_for_super)
 
+            vision_kwargs = {key: value for key, value in kwargs.items() if key != "_host_packed_seq_ids"}
             if pixel_values is not None:
-                image_outputs = self.get_image_features(pixel_values, image_grid_thw, return_dict=True, **kwargs)
+                image_outputs = self.get_image_features(
+                    pixel_values,
+                    image_grid_thw,
+                    host_image_grid_thw=host_image_grid_thw,
+                    return_dict=True,
+                    **vision_kwargs,
+                )
                 image_embeds = torch.cat(image_outputs.pooler_output, dim=0).to(
                     inputs_embeds_for_super.device, inputs_embeds_for_super.dtype
                 )
@@ -767,7 +785,9 @@ class Qwen3_5Model(HFQwen3_5Model):
                     inputs_embeds_for_super, image_embeds, image_mask
                 )
             if pixel_values_videos is not None:
-                video_outputs = self.get_video_features(pixel_values_videos, video_grid_thw, return_dict=True, **kwargs)
+                video_outputs = self.get_video_features(
+                    pixel_values_videos, video_grid_thw, return_dict=True, **vision_kwargs
+                )
                 video_embeds = torch.cat(video_outputs.pooler_output, dim=0).to(
                     inputs_embeds_for_super.device, inputs_embeds_for_super.dtype
                 )
@@ -1035,11 +1055,6 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
     # forward() pulls per-microbatch pixel_values from _vlm_pixel_values_chunks;
     # patch_hf_model_for_pp must not replace it under PP.
     _pp_keep_self_forward: bool = True
-    # Vision grids are host-readable shape metadata. The vision encoder moves
-    # derived position and interpolation tensors to the patch device as needed.
-    host_batch_keys: frozenset[str] = frozenset(
-        {"image_grid_thw", "video_grid_thw", "image_grid_hws", "_packed_seq_ids", "_vlm_token_presence"}
-    )
     # CP submesh, installed by the parallelizer's apply_cp when context parallelism
     # is active; None means the forward embeds and shards nothing for CP.
     cp_mesh = None
@@ -1145,21 +1160,28 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         if getattr(self.config, "tie_word_embeddings", False):
             self.lm_head.weight = self.model.language_model.embed_tokens.weight
 
-    def prepare_host_batch_metadata(self, batch: dict[str, Any]) -> dict[str, tuple[bool, bool, bool]]:
-        """Read media-token presence before the recipe moves input IDs to CUDA."""
+    def prepare_host_batch_metadata(self, batch: dict[str, Any]) -> dict[str, Any]:
+        """Retain host metadata outside distributed tensor input transfers."""
+        metadata: dict[str, Any] = {}
+        for key, host_key in (
+            ("image_grid_thw", "_host_image_grid_thw"),
+            ("_packed_seq_ids", "_host_packed_seq_ids"),
+        ):
+            value = batch.get(key)
+            if isinstance(value, torch.Tensor) and value.device.type == "cpu":
+                metadata[host_key] = HostTensor(value)
         input_ids = batch.get("input_ids")
         if (
             not isinstance(input_ids, torch.Tensor)
             or input_ids.device.type != "cpu"
             or torch.is_floating_point(input_ids)
         ):
-            return {}
+            return metadata
         token_ids = (self.config.image_token_id, self.config.video_token_id, self.config.vision_start_token_id)
-        return {
-            "_vlm_token_presence": tuple(
-                bool((input_ids == token_id).any()) if token_id is not None else False for token_id in token_ids
-            )
-        }
+        metadata["_vlm_token_presence"] = tuple(
+            bool((input_ids == token_id).any()) if token_id is not None else False for token_id in token_ids
+        )
+        return metadata
 
     def _pop_staged_vlm_media(
         self,
@@ -1656,6 +1678,7 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
                     "cu_seqlens_padded",
                     "max_seqlen",
                     "mm_token_type_ids",
+                    "_host_packed_seq_ids",
                     "padding_mask",
                     "qkv_format",
                 }

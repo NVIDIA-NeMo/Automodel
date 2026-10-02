@@ -260,6 +260,29 @@ class TestDenseTextBackbone:
         assert metadata.cu_seqlens_cpu.tolist() == [0, 2, 4]
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_packed_metadata_uses_host_mirror_without_cuda_readback(self, monkeypatch):
+        host_ids = torch.tensor([[1, 1, 2, 2, 0]], dtype=torch.long)
+        device_ids = host_ids.to("cuda")
+        original_to = torch.Tensor.to
+
+        def reject_document_readback(tensor, *args, **kwargs):
+            if tensor.is_cuda and tensor.data_ptr() == device_ids.data_ptr() and kwargs.get("device") == "cpu":
+                raise AssertionError("packed document IDs were copied back to the host")
+            return original_to(tensor, *args, **kwargs)
+
+        monkeypatch.setattr(torch.Tensor, "to", reject_document_readback)
+        metadata = qwen3_5_packing.prepare_gated_delta_packed_metadata(
+            None,
+            device_ids,
+            compute_device=device_ids.device,
+            host_packed_seq_ids=qwen3_5_packing.HostTensor(host_ids),
+        )
+
+        assert metadata is not None
+        assert metadata.document_ids is device_ids
+        assert metadata.cu_seqlens_cpu.tolist() == [0, 2, 4]
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_packed_metadata_accepts_host_ids_for_cuda_decoder(self):
         packed_seq_ids = torch.tensor([[1, 1, 2, 2, 0]], dtype=torch.long)
 

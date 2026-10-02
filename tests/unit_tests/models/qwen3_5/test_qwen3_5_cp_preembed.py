@@ -170,15 +170,20 @@ class TestPopStagedVlmMedia:
     def test_prepared_host_token_presence_matches_media_routing(self):
         model = _build_model(image_token_id=99, video_token_id=98, vision_start_token_id=97)
         input_ids = torch.tensor([[10, 99, 12]])
-        host_metadata = model.prepare_host_batch_metadata({"input_ids": input_ids})
+        packed_ids = torch.tensor([[1, 1, 2]])
         image = torch.randn(4, 8)
         grid = torch.tensor([[1, 4, 4]])
+        host_metadata = model.prepare_host_batch_metadata(
+            {"input_ids": input_ids, "image_grid_thw": grid, "_packed_seq_ids": packed_ids}
+        )
         kwargs = {"pixel_values": image, "image_grid_thw": grid, **host_metadata}
 
         actual = model._pop_staged_vlm_media(input_ids, kwargs)
         expected = model._pop_staged_vlm_media(input_ids, {"pixel_values": image, "image_grid_thw": grid})
 
-        assert host_metadata == {"_vlm_token_presence": (True, False, False)}
+        assert host_metadata["_vlm_token_presence"] == (True, False, False)
+        assert host_metadata["_host_image_grid_thw"].tensor is grid
+        assert host_metadata["_host_packed_seq_ids"].tensor is packed_ids
         assert actual[0] is expected[0] is image
         assert actual[2] is expected[2] is grid
         assert "_vlm_token_presence" not in kwargs

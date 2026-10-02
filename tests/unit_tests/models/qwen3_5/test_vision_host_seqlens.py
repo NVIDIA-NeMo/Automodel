@@ -21,6 +21,7 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5Model as HFQwen3
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.qwen3_5.model import Qwen3_5ForConditionalGeneration
+from nemo_automodel.components.models.qwen3_5.packing import HostTensor
 
 
 def _tiny_model() -> Qwen3_5ForConditionalGeneration:
@@ -70,7 +71,7 @@ def test_sdpa_host_seqlens_matches_hf_vision_forward_and_backward() -> None:
         if reference:
             output = HFQwen3_5Model.get_image_features(model, patches, grid, return_dict=True)
         else:
-            output = model.get_image_features(patches, grid, return_dict=True)
+            output = model.get_image_features(patches, grid, host_image_grid_thw=HostTensor(grid), return_dict=True)
         features = tuple(value.detach().clone() for value in output.pooler_output)
         sum(value.square().sum() for value in output.pooler_output).backward()
         return (
@@ -146,6 +147,8 @@ def test_model_media_forward_and_backward_matches_hf_scatter(is_video: bool, tex
             if is_video
             else {"pixel_values": patches, "image_grid_thw": grid}
         )
+        if not reference and not is_video:
+            media_kwargs["_host_image_grid_thw"] = HostTensor(grid)
         if text_mode == "input_ids":
             text_kwargs = {"input_ids": input_ids}
         else:
