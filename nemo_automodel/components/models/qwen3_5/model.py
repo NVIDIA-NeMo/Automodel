@@ -37,7 +37,11 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
 from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5Model as HFQwen3_5Model,
 )
-from transformers.vision_utils import get_vision_cu_seqlens
+from transformers.vision_utils import (
+    get_vision_cu_seqlens,
+    get_vision_interpolation_indices_and_weights,
+    get_vision_position_ids,
+)
 
 from nemo_automodel.components.distributed.context_parallel.sharder import (
     ContextParallelSharder,
@@ -608,12 +612,69 @@ class Qwen3_5Model(HFQwen3_5Model):
             ``return_dict=False``. The return contract matches the HF method.
         """
         if self.visual.config._attn_implementation == "sdpa" and image_grid_thw is not None:
-            # HF's SDPA vision attention calls lengths.tolist() separately for Q,
-            # K, and V in every block. A single CPU grid mirror lets all blocks
-            # consume host cu_seqlens without repeating the device-to-host copy.
+            # HF's vision helpers use host lengths for attention, interpolation,
+            # positions, and output splitting. Compute them from one host grid
+            # rather than reading CUDA scalars repeatedly in each helper/block.
             grid_cpu = image_grid_thw.detach().to(device="cpu")
             kwargs["cu_seqlens"] = get_vision_cu_seqlens(grid_cpu)
+            interp_indices, interp_weights = get_vision_interpolation_indices_and_weights(
+                grid_cpu,
+                num_grid_per_side=self.visual.num_grid_per_side,
+                mode=self.visual.interpolation_mode,
+                align_corners=self.visual.interpolation_align_corners,
+                spatial_merge_size=self.visual.config.spatial_merge_size,
+            )
+            position_ids = get_vision_position_ids(grid_cpu, self.visual.spatial_merge_size)
+            device = pixel_values.device
+            if pixel_values.is_cuda:
+                interp_indices = interp_indices.pin_memory()
+                interp_weights = interp_weights.pin_memory()
+                position_ids = position_ids.pin_memory()
+            kwargs["interp_indices"] = interp_indices.to(device=device, non_blocking=True)
+            kwargs["interp_weights"] = interp_weights.to(device=device, non_blocking=True)
+            kwargs["position_ids"] = position_ids.to(device=device, non_blocking=True)
+            image_grid_thw = grid_cpu
         return super().get_image_features(pixel_values, image_grid_thw, **kwargs)
+
+    def get_placeholder_mask(
+        self,
+        input_ids: torch.Tensor | None,
+        inputs_embeds: torch.Tensor,
+        image_features: torch.Tensor | None = None,
+        video_features: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return image and video masks while checking token counts on device.
+
+        Args:
+            input_ids: Token IDs of shape [batch, sequence], or ``None`` when
+                only embeddings are available.
+            inputs_embeds: Token embeddings of shape [batch, sequence, hidden].
+            image_features: Optional image features of shape [image_tokens, hidden].
+            video_features: Optional video features of shape [video_tokens, hidden].
+
+        Returns:
+            Image and video boolean masks, each of shape [batch, sequence, 1].
+        """
+        if input_ids is None:
+            image_token = torch.full((), self.config.image_token_id, dtype=torch.long, device=inputs_embeds.device)
+            video_token = torch.full((), self.config.video_token_id, dtype=torch.long, device=inputs_embeds.device)
+            image_mask = (inputs_embeds == self.get_input_embeddings()(image_token)).all(-1)
+            video_mask = (inputs_embeds == self.get_input_embeddings()(video_token)).all(-1)
+        else:
+            image_mask = input_ids == self.config.image_token_id
+            video_mask = input_ids == self.config.video_token_id
+
+        if image_features is not None:
+            torch._assert_async(
+                image_mask.sum() * inputs_embeds.shape[-1] == image_features.numel(),
+                "Image features and image tokens do not match",
+            )
+        if video_features is not None:
+            torch._assert_async(
+                video_mask.sum() * inputs_embeds.shape[-1] == video_features.numel(),
+                "Video features and video tokens do not match",
+            )
+        return image_mask.unsqueeze(-1).to(inputs_embeds.device), video_mask.unsqueeze(-1).to(inputs_embeds.device)
 
     def forward(
         self,
@@ -1004,6 +1065,18 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         input_ids: torch.Tensor | None,
         kwargs: dict[str, Any],
     ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+        """Resolve media for the current sequence and pipeline chunk.
+
+        Args:
+            input_ids: Token IDs of shape [batch, sequence], or ``None``.
+            kwargs: Forward arguments with optional image and video patch tensors
+                of shape [patches, patch_features] and grids of shape [entries, 3].
+
+        Returns:
+            Image patches [image_patches, patch_features], video patches
+            [video_patches, patch_features], image grid [images, 3], and video
+            grid [videos, 3], each optionally ``None``.
+        """
         pixel_values = kwargs.get("pixel_values", None)
         pixel_values_videos = kwargs.get("pixel_values_videos", None)
         image_grid_thw = kwargs.get("image_grid_thw", None)
@@ -1012,21 +1085,17 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         image_token_id = self.config.image_token_id
         video_token_id = self.config.video_token_id
         vision_start_token_id = self.config.vision_start_token_id
-        has_image_tokens = (
-            bool((input_ids == image_token_id).any().item())
-            if input_ids is not None and image_token_id is not None
-            else False
-        )
-        has_video_tokens = (
-            bool((input_ids == video_token_id).any().item())
-            if input_ids is not None and video_token_id is not None
-            else False
-        )
-        has_vision_start_tokens = (
-            bool((input_ids == vision_start_token_id).any().item())
-            if input_ids is not None and vision_start_token_id is not None
-            else False
-        )
+        has_image_tokens = has_video_tokens = has_vision_start_tokens = False
+        if input_ids is not None:
+            # The staged-media decision needs host booleans. Transfer the three
+            # results together so it has one CUDA synchronization per forward.
+            token_presence = torch.stack(
+                [
+                    (input_ids == token_id).any() if token_id is not None else input_ids.new_zeros((), dtype=torch.bool)
+                    for token_id in (image_token_id, video_token_id, vision_start_token_id)
+                ]
+            ).tolist()
+            has_image_tokens, has_video_tokens, has_vision_start_tokens = token_presence
         has_media_tokens = input_ids is not None and (has_image_tokens or has_video_tokens or has_vision_start_tokens)
         if input_ids is not None:
             if pixel_values is not None and image_token_id is not None and not has_image_tokens:

@@ -14,6 +14,7 @@
 
 """Qwen3.5 SDPA vision outputs and gradients with host sequence metadata."""
 
+import pytest
 import torch
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config, Qwen3_5TextConfig, Qwen3_5VisionConfig
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5Model as HFQwen3_5Model
@@ -87,3 +88,19 @@ def test_sdpa_host_seqlens_matches_hf_vision_forward_and_backward() -> None:
     torch.testing.assert_close(actual_input_grad, reference_input_grad, rtol=0, atol=0)
     for reference, actual in zip(reference_weight_grads, actual_weight_grads):
         torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+
+
+def test_placeholder_masks_match_hf_and_reject_mismatched_features() -> None:
+    model = _tiny_model().model
+    input_ids = torch.tensor([[1, 60, 2, 61, 60]])
+    embeds = model.get_input_embeddings()(input_ids)
+    image_features = torch.randn(2, embeds.shape[-1])
+    video_features = torch.randn(1, embeds.shape[-1])
+
+    expected = HFQwen3_5Model.get_placeholder_mask(model, input_ids, embeds, image_features, video_features)
+    actual = model.get_placeholder_mask(input_ids, embeds, image_features, video_features)
+    for expected_mask, actual_mask in zip(expected, actual):
+        torch.testing.assert_close(actual_mask, expected_mask, rtol=0, atol=0)
+
+    with pytest.raises(RuntimeError, match="Image features and image tokens do not match"):
+        model.get_placeholder_mask(input_ids, embeds, image_features[:1], video_features)
