@@ -70,8 +70,7 @@ class SkyPilotLauncher(Launcher):
             parts += [
                 "--nnodes=$SKYPILOT_NUM_NODES",
                 "--node_rank=$SKYPILOT_NODE_RANK",
-                "--rdzv_backend=c10d",
-                "--master_addr=$(echo $SKYPILOT_NODE_IPS | head -n1)",
+                '--master_addr="$(echo "$SKYPILOT_NODE_IPS" | head -n1)"',
                 "--master_port=12375",
             ]
 

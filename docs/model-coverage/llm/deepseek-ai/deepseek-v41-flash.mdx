@@ -118,10 +118,12 @@ repository at `e2c47c5b` (torch 2.13, NCCL 2.30.5).
 | [Tulu3 CP8, H100](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_tulu3_cp8_h100_32nodes.yaml) | 32 x 8 H100; EP64, ep_shard4, CP8; GBS 64, LBS 1, two microbatches | `defer_fsdp_grad_sync: false`, `moe.reshard_after_forward: false` | 65.7 GiB; validation 0.5541 / 0.5444 (CP1 reference at 16 nodes, GBS 128: 0.5477 / 0.5384) |
 | [Tulu3 packed CP8 32k, H100](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_tulu3_packed_cp8_32k_h100_64nodes.yaml) | 64 x 8 H100; EP64, ep_shard8, CP8; GBS 64, LBS 1, one microbatch | `moe.reshard_after_forward: false` | 62.5 GiB; validation 0.5853 / 0.5778; one checkpoint about 8.2 TB |
 
-Prepare `DS41_DATA_ROOT` for the two Tulu3 variants with
-[prepare_tulu3_data.py](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/prepare_tulu3_data.py), which materializes
-`ChatDataset` with `tulu3_chat_template.jinja` into the padded 4,096-token
-layout and the prepacked 32,768-token THD layout.
+The Tulu3 variants load `allenai/tulu-3-sft-mixture` from the Hugging Face Hub
+through `ChatDataset` with `tulu3_chat_template.jinja`: padded 4,096-token rows
+for CP8 and 32,768-token THD packs, built at startup, for the packed recipe.
+For offline runs,
+[prepare_tulu3_data.py](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/prepare_tulu3_data.py)
+writes the same padded and prepacked layouts to disk.
 
 Three points apply to every H100 variant:
 
@@ -157,9 +159,10 @@ save regardless of `ckpt_every_steps`. Resuming with
 
 ## Loading and Inputs
 
-Set `DS41_CHECKPOINT` to the shared local Hugging Face snapshot of revision
-`df42c109f1defefcbfcedbe7d905718a12266e40`, using the same directory for parity
-and training. Pass both overrides to the recipe launcher:
+The recipes load revision `df42c109f1defefcbfcedbe7d905718a12266e40` from the
+Hugging Face Hub. To use a shared local snapshot of that revision instead, with
+the same directory for parity and training, set `DS41_CHECKPOINT` to it and pass
+both overrides to the recipe launcher:
 
 ```bash
 --model.config.pretrained_model_name_or_path="$DS41_CHECKPOINT" \
