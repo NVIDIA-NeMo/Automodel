@@ -24,14 +24,14 @@ uv run torchrun --nnodes 16 --nproc-per-node 4 \
 
 ## Choose a Workflow
 
-| Goal | Start Here |
-| --- | --- |
-| Fine-tune deepseek-ai/DeepSeek-V4.1-Flash | [deepseek_v41_flash_hellaswag_ep64_16nodes.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_hellaswag_ep64_16nodes.yaml). 16 nodes, 4 GPUs per node; see [Recipe Setup](#recipe-setup). |
-| Review the recipe requirements | [HellaSwag EP64, H100](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_hellaswag_ep64_h100_16nodes.yaml) |
-| Review the recipe requirements | [Tulu3 CP recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_tulu3_cp.yaml) |
-| Review the recipe requirements | [HellaSwag LoRA, H100](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_hellaswag_lora_h100_8nodes.yaml) |
-| Review the recipe requirements | [Tulu3 CP8, H100](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_tulu3_cp8_h100_32nodes.yaml) |
-| Review the recipe requirements | [Tulu3 packed CP8 32k, H100](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_tulu3_packed_cp8_32k_h100_64nodes.yaml) |
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Full Fine-Tuning | HellaSwag; 16 nodes; EP64; GB200 cluster | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_hellaswag_ep64_16nodes.yaml) |
+| Full Fine-Tuning | HellaSwag; 16 nodes; EP64; H100 cluster | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_hellaswag_ep64_h100_16nodes.yaml) |
+| Full Fine-Tuning | Tulu-3; 16 nodes; CP8; EP64 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_tulu3_cp.yaml) |
+| LoRA Fine-Tuning | HellaSwag; 8 nodes; EP32 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_hellaswag_lora_h100_8nodes.yaml) |
+| Full Fine-Tuning | Tulu-3; 32 nodes; CP8; EP64 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_tulu3_cp8_h100_32nodes.yaml) |
+| Full Fine-Tuning (Packed Sequences) | Tulu-3; 64 nodes; CP8; EP64; 32,768-token packs | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_tulu3_packed_cp8_32k_h100_64nodes.yaml) |
 
 ## Model Context
 
@@ -317,6 +317,10 @@ Read [deepseek_v41_flash_hellaswag_ep64_16nodes.yaml](https://github.com/NVIDIA-
 | Goal | Start Here |
 | --- | --- |
 | Review the recipe requirements | [prepare_tulu3_data.py](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/prepare_tulu3_data.py) |
+
+### Workflow Notes
+
+Fine-tune deepseek-ai/DeepSeek-V4.1-Flash: [deepseek_v41_flash_hellaswag_ep64_16nodes.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_hellaswag_ep64_16nodes.yaml). 16 nodes, 4 GPUs per node; see [Recipe Setup](#recipe-setup).
 
 ## Available Models
 

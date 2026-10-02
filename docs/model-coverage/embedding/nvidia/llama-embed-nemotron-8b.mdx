@@ -20,10 +20,10 @@ uv run automodel examples/retrieval/bi_encoder/llama_embed_nemotron_8b_finetune.
 
 ## Choose a Workflow
 
-| Goal | Start Here |
-| --- | --- |
-| Fine-tune nvidia/llama-embed-nemotron-8b | [llama_embed_nemotron_8b_finetune.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/538848ea2e2dcc6f80a6eb8899fef72ede173ca5/examples/retrieval/bi_encoder/llama_embed_nemotron_8b_finetune.yaml). Example configuration; validate GPU training. |
-| Bi-encoder - reproduction recipe for [`nvidia/llama-embed-nemotron-8b`](https://huggingface.co/nvidia/llama-embed-nemotron-8b) (uses [`nvidia/embed-nemotron-dataset-v1`](https://huggingface.co/datasets/nvidia/embed-nemotron-dataset-v1)) | Use [llama_embed_nemotron_8b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/bi_encoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml). |
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Embedding Fine-Tuning | FEVER and synthetic classification data; 1 node | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/538848ea2e2dcc6f80a6eb8899fef72ede173ca5/examples/retrieval/bi_encoder/llama_embed_nemotron_8b_finetune.yaml) |
+| Embedding Fine-Tuning (Llama-3.1-8B) | Prepared Nemotron retrieval data | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/bi_encoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml) |
 
 ## Model Context
 
@@ -90,6 +90,10 @@ uv run automodel \
 ### Recipe Setup
 
 Read [llama_embed_nemotron_8b_finetune.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/538848ea2e2dcc6f80a6eb8899fef72ede173ca5/examples/retrieval/bi_encoder/llama_embed_nemotron_8b_finetune.yaml) for checkpoint access, data paths, and backend dependencies. It provides a small fine-tuning example.
+
+### Workflow Notes
+
+Dataset: [`nvidia/embed-nemotron-dataset-v1`](https://huggingface.co/datasets/nvidia/embed-nemotron-dataset-v1).
 
 ## Available Models
 

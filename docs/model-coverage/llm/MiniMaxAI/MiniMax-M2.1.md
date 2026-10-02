@@ -18,11 +18,11 @@ uv run torchrun --nnodes 8 --nproc-per-node 8 \
 
 ## Choose a Workflow
 
-| Goal | Start Here |
-| --- | --- |
-| Fine-tune MiniMaxAI/MiniMax-M2.1 | [minimax_m2.1_hellaswag_pp.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/minimax_m2/minimax_m2.1_hellaswag_pp.yaml). 8 nodes, 8 GPUs per node; see [Recipe Setup](#recipe-setup). |
-| SFT — MiniMax-M2.5 on HellaSwag with pipeline parallelism | [minimax_m2.5_hellaswag_pp.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/minimax_m2/minimax_m2.5_hellaswag_pp.yaml) |
-| SFT — MiniMax-M2.7 on HellaSwag with pipeline parallelism | [minimax_m2.7_hellaswag_pp.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/minimax_m2/minimax_m2.7_hellaswag_pp.yaml) |
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Full Fine-Tuning | HellaSwag; 8 nodes; PP2; EP32 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/minimax_m2/minimax_m2.1_hellaswag_pp.yaml) |
+| Full Fine-Tuning (MiniMax-M2.5) | HellaSwag; 8 nodes; PP2; EP32 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/minimax_m2/minimax_m2.5_hellaswag_pp.yaml) |
+| Full Fine-Tuning (MiniMax-M2.7) | HellaSwag; 8 nodes; PP2; EP16 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/minimax_m2/minimax_m2.7_hellaswag_pp.yaml) |
 
 ## Model Context
 
@@ -98,6 +98,10 @@ See the [Installation Guide](../../../guides/installation.mdx) and [LLM Fine-Tun
 ### Recipe Setup
 
 Read [minimax_m2.1_hellaswag_pp.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/minimax_m2/minimax_m2.1_hellaswag_pp.yaml) for checkpoint access, data paths, and backend dependencies. Use the [Slurm launcher guide](/job-launchers/slurm-cluster) to prepare the distributed allocation.
+
+### Workflow Notes
+
+Fine-tune MiniMaxAI/MiniMax-M2.1: [minimax_m2.1_hellaswag_pp.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/minimax_m2/minimax_m2.1_hellaswag_pp.yaml). 8 nodes, 8 GPUs per node; see [Recipe Setup](#recipe-setup).
 
 ## Available Models
 

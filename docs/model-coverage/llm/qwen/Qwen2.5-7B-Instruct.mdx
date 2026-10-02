@@ -18,10 +18,10 @@ uv run automodel examples/llm_finetune/qwen/qwen2_5_7b_instruct_chat.yaml --npro
 
 ## Choose a Workflow
 
-| Goal | Start Here |
-| --- | --- |
-| Fine-tune Qwen/Qwen2.5-7B-Instruct | [qwen2_5_7b_instruct_chat.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen2_5_7b_instruct_chat.yaml). 1 node, 8 GPUs per node; see [Recipe Setup](#recipe-setup). |
-| Supervised fine-tuning (SFT) - Qwen2.5 7B on SQuAD | Use [qwen2_5_7b_squad.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen2_5_7b_squad.yaml). |
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| LoRA Fine-Tuning | Prepared chat JSONL | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen2_5_7b_instruct_chat.yaml) |
+| Full Fine-Tuning (Qwen2.5-7B) | SQuAD | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen2_5_7b_squad.yaml) |
 
 ## Model Context
 
@@ -51,6 +51,10 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/qwen/qwen2_5_7b_squad.
 ### Recipe Setup
 
 Read [qwen2_5_7b_instruct_chat.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen2_5_7b_instruct_chat.yaml) for checkpoint access, data paths, and backend dependencies.
+
+### Workflow Notes
+
+Fine-tune Qwen/Qwen2.5-7B-Instruct: [qwen2_5_7b_instruct_chat.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen2_5_7b_instruct_chat.yaml). 1 node, 8 GPUs per node; see [Recipe Setup](#recipe-setup).
 
 ## Available Models
 

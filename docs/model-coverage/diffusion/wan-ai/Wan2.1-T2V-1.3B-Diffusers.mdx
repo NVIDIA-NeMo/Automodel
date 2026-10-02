@@ -23,10 +23,10 @@ uv run torchrun --nnodes 2 --nproc-per-node 8 \
 
 ## Choose a Workflow
 
-| Goal | Start Here |
-| --- | --- |
-| Fine-tune - Wan 2.1 T2V 1.3B with flow matching | Use [wan2_1_t2v_flow_multinode.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/wan2_1_t2v_flow_multinode.yaml). |
-| Pretrain - Wan 2.1 T2V with flow matching | Use [wan2_1_t2v_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/pretrain/wan2_1_t2v_flow.yaml). |
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Full Fine-Tuning | Prepared video cache; DP16 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/wan2_1_t2v_flow_multinode.yaml) |
+| Pretraining | Prepared video cache | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/pretrain/wan2_1_t2v_flow.yaml) |
 
 ## Model Context
 

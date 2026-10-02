@@ -22,9 +22,9 @@ uv run torchrun --nnodes 9 --nproc-per-node 8 \
 
 ## Choose a Workflow
 
-| Goal | Start Here |
-| --- | --- |
-| Fine-tune zai-org/GLM-5.3-Flash | [glm5_3_flash_medpix_packed2k_ep72_cp2_100steps.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/glm5_next/glm5_3_flash_medpix_packed2k_ep72_cp2_100steps.yaml). 9 nodes, 8 GPUs per node; see [Recipe Setup](#recipe-setup). |
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Vision-Language Fine-Tuning | MedPix-VQA; 9 nodes; CP2; EP72 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/glm5_next/glm5_3_flash_medpix_packed2k_ep72_cp2_100steps.yaml) |
 
 ## Model Context
 
@@ -195,6 +195,10 @@ multi-node launch. If FlashMLA or cuDNN Frontend is unavailable, change
 ### Recipe Setup
 
 Read [glm5_3_flash_medpix_packed2k_ep72_cp2_100steps.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/glm5_next/glm5_3_flash_medpix_packed2k_ep72_cp2_100steps.yaml) for checkpoint access, data paths, and backend dependencies. Use the [Slurm launcher guide](/job-launchers/slurm-cluster) to prepare the distributed allocation.
+
+### Workflow Notes
+
+Fine-tune zai-org/GLM-5.3-Flash: [glm5_3_flash_medpix_packed2k_ep72_cp2_100steps.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/glm5_next/glm5_3_flash_medpix_packed2k_ep72_cp2_100steps.yaml). 9 nodes, 8 GPUs per node; see [Recipe Setup](#recipe-setup).
 
 ## Available Models
 

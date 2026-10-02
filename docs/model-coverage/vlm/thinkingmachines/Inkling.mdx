@@ -18,10 +18,10 @@ uv run torchrun --nnodes 32 --nproc-per-node 8 \
 
 ## Choose a Workflow
 
-| Goal | Start Here |
-| --- | --- |
-| Fine-tune thinkingmachines/Inkling | [inkling_medpix.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/inkling/inkling_medpix.yaml). 32 nodes, 8 GPUs per node; see [Recipe Setup](#recipe-setup). |
-| MedPix-VQA; Full SFT with EP64 on 64 H100 GPUs | [Inkling_small_medpix_ep64.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/inkling/Inkling_small_medpix_ep64.yaml) |
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Vision-Language Fine-Tuning | MedPix-VQA; 32 nodes; PP8; EP32 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/inkling/inkling_medpix.yaml) |
+| Vision-Language Fine-Tuning (Inkling-Small) | MedPix-VQA; 8 nodes; EP64 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/inkling/Inkling_small_medpix_ep64.yaml) |
 
 ## Model Context
 
@@ -63,6 +63,10 @@ before launching a recipe.
 ### Recipe Setup
 
 Read [inkling_medpix.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/inkling/inkling_medpix.yaml) for checkpoint access, data paths, and backend dependencies. Use the [Slurm launcher guide](/job-launchers/slurm-cluster) to prepare the distributed allocation.
+
+### Workflow Notes
+
+Fine-tune thinkingmachines/Inkling: [inkling_medpix.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/inkling/inkling_medpix.yaml). 32 nodes, 8 GPUs per node; see [Recipe Setup](#recipe-setup).
 
 ## Available Models
 

@@ -18,9 +18,9 @@ uv run torchrun --nnodes 18 --nproc-per-node 8 \
 
 ## Choose a Workflow
 
-| Goal | Start Here |
-| --- | --- |
-| Fine-tune XiaomiMiMo/MiMo-V2.5-Pro | [mimo_v25_pro_hellaswag.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mimo_v25/mimo_v25_pro_hellaswag.yaml). 18 nodes, 8 GPUs per node; see [Recipe Setup](#recipe-setup). |
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Full Fine-Tuning | HellaSwag; 18 nodes; PP18; EP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mimo_v25/mimo_v25_pro_hellaswag.yaml) |
 
 ## Model Context
 
@@ -76,6 +76,10 @@ See the [Installation Guide](/get-started/installation) and [LLM Fine-Tuning Gui
 ### Recipe Setup
 
 Read [mimo_v25_pro_hellaswag.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mimo_v25/mimo_v25_pro_hellaswag.yaml) for checkpoint access, data paths, and backend dependencies. Use the [Slurm launcher guide](/job-launchers/slurm-cluster) to prepare the distributed allocation.
+
+### Workflow Notes
+
+Fine-tune XiaomiMiMo/MiMo-V2.5-Pro: [mimo_v25_pro_hellaswag.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mimo_v25/mimo_v25_pro_hellaswag.yaml). 18 nodes, 8 GPUs per node; see [Recipe Setup](#recipe-setup).
 
 ## Available Models
 

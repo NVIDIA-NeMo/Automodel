@@ -23,12 +23,12 @@ uv run automodel examples/llm_finetune/moonlight/moonlight_16b_te.yaml \
 
 ## Choose a Workflow
 
-| Goal | Start Here |
-| --- | --- |
-| Fine-tune the base checkpoint | Use [`moonlight_16b_te.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/moonlight/moonlight_16b_te.yaml). It fine-tunes on HellaSwag for two epochs with FSDP2 and eight-way expert parallelism. |
-| Fine-tune with packed sequences | Use [`moonlight_16b_te_packed_sequence.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/moonlight/moonlight_16b_te_packed_sequence.yaml). It packs sequences to 1,024 tokens and uses `torch_mm` experts. |
-| Pretrain from configuration | Customize the [pretraining template](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/megatron_pretrain_moonlight_16b_te_slurm.yaml). Replace the data paths, configure Slurm, and submit it on one 8-GPU node. |
-| Reproduce the Tulu-3 workflow | Follow the [Tulu-3 run instructions](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/convergence/tulu3/models/moonlight-16b). Prefilter the data to 2,048 tokens and launch the fine-tuning script with `torchrun`. |
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Full Fine-Tuning | HellaSwag; EP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/moonlight/moonlight_16b_te.yaml) |
+| Full Fine-Tuning (Packed Sequences) | HellaSwag; EP8; 1,024-token packs | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/moonlight/moonlight_16b_te_packed_sequence.yaml) |
+| Pretraining | Prepared Megatron data; EP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/megatron_pretrain_moonlight_16b_te_slurm.yaml) |
+| Full Fine-Tuning | Tulu-3; EP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/convergence/tulu3/models/moonlight-16b/moonlight_16b_ep8_flashoptim.yaml) |
 
 ## Model Context
 
@@ -48,6 +48,16 @@ Moonlight-16B-A3B is used for text generation. Its model size is 16B total / 3B 
 | Vocabulary Size | 163,840 |
 | Configured Dtype | `bfloat16` |
 | Upstream Training | 5.7T tokens with Muon |
+
+### Workflow Notes
+
+Fine-tune the base checkpoint: Use [`moonlight_16b_te.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/moonlight/moonlight_16b_te.yaml). It fine-tunes on HellaSwag for two epochs with FSDP2 and eight-way expert parallelism.
+
+Fine-tune with packed sequences: Use [`moonlight_16b_te_packed_sequence.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/moonlight/moonlight_16b_te_packed_sequence.yaml). It packs sequences to 1,024 tokens and uses `torch_mm` experts.
+
+Pretrain from configuration: Customize the [pretraining template](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/megatron_pretrain_moonlight_16b_te_slurm.yaml). Replace the data paths, configure Slurm, and submit it on one 8-GPU node.
+
+Reproduce the Tulu-3 workflow: Follow the [Tulu-3 run instructions](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/convergence/tulu3/models/moonlight-16b). Prefilter the data to 2,048 tokens and launch the fine-tuning script with `torchrun`.
 
 ## Available Models
 

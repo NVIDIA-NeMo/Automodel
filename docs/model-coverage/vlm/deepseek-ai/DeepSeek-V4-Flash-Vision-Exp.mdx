@@ -19,10 +19,9 @@ uv run torchrun --nnodes 16 --nproc-per-node 8 \
 
 ## Choose a Workflow
 
-| Goal | Start Here |
-| --- | --- |
-| Fine-tune deepseek-ai/DeepSeek-V4-Flash-Vision-Exp | [deepseek_v4_flash_vision_medpix_4k_ep32pp4_100steps.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/deepseek_v4/deepseek_v4_flash_vision_medpix_4k_ep32pp4_100steps.yaml). 16 nodes, 8 GPUs per node; see [Recipe Setup](#recipe-setup). |
-| Prepare your environment | Follow the [installation instructions](/get-started/installation). |
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Vision-Language Fine-Tuning | MedPix-VQA; 16 nodes; PP4; EP32 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/deepseek_v4/deepseek_v4_flash_vision_medpix_4k_ep32pp4_100steps.yaml) |
 
 ## Model Context
 
@@ -64,6 +63,12 @@ Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node 
 ### Recipe Setup
 
 Read [deepseek_v4_flash_vision_medpix_4k_ep32pp4_100steps.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/deepseek_v4/deepseek_v4_flash_vision_medpix_4k_ep32pp4_100steps.yaml) for checkpoint access, data paths, and backend dependencies. Use the [Slurm launcher guide](/job-launchers/slurm-cluster) to prepare the distributed allocation.
+
+### Workflow Notes
+
+Fine-tune deepseek-ai/DeepSeek-V4-Flash-Vision-Exp: [deepseek_v4_flash_vision_medpix_4k_ep32pp4_100steps.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/deepseek_v4/deepseek_v4_flash_vision_medpix_4k_ep32pp4_100steps.yaml). 16 nodes, 8 GPUs per node; see [Recipe Setup](#recipe-setup).
+
+Follow the [installation instructions](/get-started/installation).
 
 ## Available Models
 

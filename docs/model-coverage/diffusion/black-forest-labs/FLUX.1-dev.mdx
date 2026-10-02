@@ -20,10 +20,10 @@ uv run torchrun --nproc-per-node=8 \
 
 ## Choose a Workflow
 
-| Goal | Start Here |
-| --- | --- |
-| Fine-tune - FLUX.1-dev with flow matching | Use [flux_t2i_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/flux_t2i_flow.yaml). |
-| Pretrain - FLUX.1-dev with flow matching | Use [flux_t2i_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/pretrain/flux_t2i_flow.yaml). |
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Full Fine-Tuning | Prepared image-text cache; DP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/flux_t2i_flow.yaml) |
+| Pretraining | Prepared image-text cache; DP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/pretrain/flux_t2i_flow.yaml) |
 
 ## Model Context
 

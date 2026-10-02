@@ -25,13 +25,13 @@ uv run torchrun --nnodes 32 --nproc-per-node 8 \
 
 ## Choose a Workflow
 
-| Goal | Start Here |
-| --- | --- |
-| Fine-tune zai-org/GLM-5 | [glm_5_hellaswag_pp.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5_hellaswag_pp.yaml). 32 nodes, 8 GPUs per node; see [Recipe Setup](#recipe-setup). |
-| Full-parameter GLM-5.3 SFT on Tulu3 with packed 4K sequences, cuDNN DSA, HybridEP, and EP64 | [glm_5.3_tulu3_4k_cudnn_100step.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.3_tulu3_4k_cudnn_100step.yaml) |
-| GLM-5.2 SFT on Tulu3 with packed 32K sequences, CP8, TileLang DSA, and EP64 | [glm_5.2_tulu3_32k_tilelang_cp8.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.2_tulu3_32k_tilelang_cp8.yaml) |
-| GLM-5.2 SFT on Tulu3 with packed 4K sequences and TileLang DSA | [glm_5.2_tulu3_4k_tilelang_100k.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.2_tulu3_4k_tilelang_100k.yaml) |
-| GLM-5.2 SFT on Tulu3 with packed 4K sequences and cuDNN DSA + FlashMLA | [glm_5.2_tulu3_4k_cudnn_100k.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.2_tulu3_4k_cudnn_100k.yaml) |
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Full Fine-Tuning | HellaSwag; 32 nodes; PP4; EP64 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5_hellaswag_pp.yaml) |
+| Full Fine-Tuning (Packed Sequences) (GLM-5.3) | Tulu-3; 32 nodes; PP4; EP64; 4,096-token packs | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.3_tulu3_4k_cudnn_100step.yaml) |
+| Full Fine-Tuning (Packed Sequences) (GLM-5.2) | Tulu-3; 64 nodes; PP4; CP8; EP64; 32,768-token packs | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.2_tulu3_32k_tilelang_cp8.yaml) |
+| Full Fine-Tuning (Packed Sequences) (GLM-5.2) | Tulu-3; 32 nodes; PP4; EP64; 4,096-token packs; TileLang attention | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.2_tulu3_4k_tilelang_100k.yaml) |
+| Full Fine-Tuning (Packed Sequences) (GLM-5.2) | Tulu-3; 32 nodes; PP4; EP64; 4,096-token packs; cuDNN attention | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.2_tulu3_4k_cudnn_100k.yaml) |
 
 ## Model Context
 
@@ -181,6 +181,10 @@ multi-node launch. The published recipe is a distributed full-model workflow.
 ### Recipe Setup
 
 Read [glm_5_hellaswag_pp.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5_hellaswag_pp.yaml) for checkpoint access, data paths, and backend dependencies. Use the [Slurm launcher guide](/job-launchers/slurm-cluster) to prepare the distributed allocation.
+
+### Workflow Notes
+
+Fine-tune zai-org/GLM-5: [glm_5_hellaswag_pp.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5_hellaswag_pp.yaml). 32 nodes, 8 GPUs per node; see [Recipe Setup](#recipe-setup).
 
 ## Available Models
 

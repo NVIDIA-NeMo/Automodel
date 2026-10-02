@@ -22,11 +22,9 @@ uv run torchrun --nnodes 128 --nproc-per-node 8 \
 
 ## Choose a Workflow
 
-| Goal | Start Here |
-| --- | --- |
-| Benchmark deepseek-ai/DeepSeek-V3 | [deepseek_v3_te_deepep_1024.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/deepseek/deepseek_v3_te_deepep_1024.yaml). 128 nodes, 8 GPUs per node; see [Recipe Setup](#recipe-setup). |
-| Explore checkpoints | See [Available Models](#available-models). |
-| Configure NeMo AutoModel | Follow the [installation instructions](/get-started/installation). |
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Training Benchmark | Synthetic data; 128 nodes; PP4; EP64 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/deepseek/deepseek_v3_te_deepep_1024.yaml) |
 
 ## Model Context
 
@@ -49,6 +47,14 @@ DeepSeek-V3 is used for text generation (moe). Its model size is 671B total / 37
 ### Recipe Setup
 
 Read [deepseek_v3_te_deepep_1024.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/deepseek/deepseek_v3_te_deepep_1024.yaml) for checkpoint access, data paths, and backend dependencies. Use the [Slurm launcher guide](/job-launchers/slurm-cluster) to prepare the distributed allocation.
+
+### Workflow Notes
+
+Benchmark deepseek-ai/DeepSeek-V3: [deepseek_v3_te_deepep_1024.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/deepseek/deepseek_v3_te_deepep_1024.yaml). 128 nodes, 8 GPUs per node; see [Recipe Setup](#recipe-setup).
+
+See [Available Models](#available-models).
+
+Follow the [installation instructions](/get-started/installation).
 
 ## Available Models
 

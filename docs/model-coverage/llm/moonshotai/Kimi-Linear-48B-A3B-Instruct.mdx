@@ -18,10 +18,10 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/kimi/kimi_linear_48b_a
 
 ## Choose a Workflow
 
-| Goal | Start Here |
-| --- | --- |
-| Supervised fine-tuning (SFT): Kimi Linear 48B A3B on HellaSwag with EP=8 | Use [kimi_linear_48b_a3b_hellaswag.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/kimi/kimi_linear_48b_a3b_hellaswag.yaml). |
-| Supervised fine-tuning (SFT): 32k packed sequences with CP=8 and EP=8 | Use [kimi_linear_48b_a3b_longcontext_cp8.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/kimi/kimi_linear_48b_a3b_longcontext_cp8.yaml). |
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Full Fine-Tuning | HellaSwag; 1 node; EP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/kimi/kimi_linear_48b_a3b_hellaswag.yaml) |
+| Full Fine-Tuning (Packed Sequences) | HellaSwag; 1 node; CP8; EP8; 32,768-token packs | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/kimi/kimi_linear_48b_a3b_longcontext_cp8.yaml) |
 
 ## Model Context
 

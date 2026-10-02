@@ -19,10 +19,9 @@ uv run torchrun --nnodes 4 --nproc-per-node 8 \
 
 ## Choose a Workflow
 
-| Goal | Start Here |
-| --- | --- |
-| Fine-tune mistralai/Mistral-Small-4-119B-2603 | [mistral4_medpix.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mistral4/mistral4_medpix.yaml). 4 nodes, 8 GPUs per node; see [Recipe Setup](#recipe-setup). |
-| Prepare your environment | Follow the [installation instructions](/get-started/installation). |
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Vision-Language Fine-Tuning | MedPix-VQA; 4 nodes; PP4; EP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mistral4/mistral4_medpix.yaml) |
 
 ## Model Context
 
@@ -44,6 +43,12 @@ Mistral-Small-4-119B-2603 is used for text generation. Its model size is 119.40B
 ### Recipe Setup
 
 Read [mistral4_medpix.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mistral4/mistral4_medpix.yaml) for checkpoint access, data paths, and backend dependencies. Use the [Slurm launcher guide](/job-launchers/slurm-cluster) to prepare the distributed allocation.
+
+### Workflow Notes
+
+Fine-tune mistralai/Mistral-Small-4-119B-2603: [mistral4_medpix.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mistral4/mistral4_medpix.yaml). 4 nodes, 8 GPUs per node; see [Recipe Setup](#recipe-setup).
+
+Follow the [installation instructions](/get-started/installation).
 
 ## Available Models
 

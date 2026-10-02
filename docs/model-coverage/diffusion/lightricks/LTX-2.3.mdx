@@ -17,11 +17,11 @@ uv run torchrun --nproc-per-node 8 \
 
 ## Choose a Workflow
 
-| Goal | Start Here |
-| --- | --- |
-| Fine-tune diffusers/LTX-2.3-Diffusers | [ltx2_3_t2v_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/ltx2_3_t2v_flow.yaml). 1 node, 8 GPUs per node; see [Recipe Setup](#recipe-setup). |
-| Parameter-efficient LoRA fine-tuning | [ltx2_3_t2v_flow_lora.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/ltx2_3_t2v_flow_lora.yaml) |
-| Generate video and mux the model's audio into the output | [generate_ltx2.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/generate/configs/generate_ltx2.yaml) |
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Full Fine-Tuning | Prepared video cache; 1 node; DP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/ltx2_3_t2v_flow.yaml) |
+| LoRA Fine-Tuning | Prepared video cache; 1 node; DP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/ltx2_3_t2v_flow_lora.yaml) |
+| Video Generation | Text prompts | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/generate/configs/generate_ltx2.yaml) |
 
 ## Model Context
 
@@ -93,6 +93,10 @@ Both recipes use `flow_matching.adapter_type: ltx2`. The adapter applies the sam
 Read [ltx2_3_t2v_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/ltx2_3_t2v_flow.yaml) for checkpoint access, data paths, and backend dependencies.
 
 The recipe loads `diffusers/LTX-2.3-Diffusers`, the Hugging Face-compatible checkpoint for `Lightricks/LTX-2.3`.
+
+### Workflow Notes
+
+Fine-tune diffusers/LTX-2.3-Diffusers: [ltx2_3_t2v_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/ltx2_3_t2v_flow.yaml). 1 node, 8 GPUs per node; see [Recipe Setup](#recipe-setup).
 
 ## Available Models
 

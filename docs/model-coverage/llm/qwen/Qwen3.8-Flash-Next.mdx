@@ -24,9 +24,9 @@ uv run torchrun --nnodes 8 --nproc-per-node 8 \
 
 ## Choose a Workflow
 
-| Goal | Start Here |
-| --- | --- |
-| Fine-tune Qwen/Qwen3.8-Flash-Next | [qwen3_8_flash_next_180b_hellaswag_ep64.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen3_8_flash_next_180b_hellaswag_ep64.yaml). 8 nodes, 8 GPUs per node; see [Recipe Setup](#recipe-setup). |
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Full Fine-Tuning | HellaSwag; 8 nodes; EP64 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen3_8_flash_next_180b_hellaswag_ep64.yaml) |
 
 ## Model Context
 
@@ -179,6 +179,10 @@ before launching a recipe.
 ### Recipe Setup
 
 Read [qwen3_8_flash_next_180b_hellaswag_ep64.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen3_8_flash_next_180b_hellaswag_ep64.yaml) for checkpoint access, data paths, and backend dependencies. Use the [Slurm launcher guide](/job-launchers/slurm-cluster) to prepare the distributed allocation.
+
+### Workflow Notes
+
+Fine-tune Qwen/Qwen3.8-Flash-Next: [qwen3_8_flash_next_180b_hellaswag_ep64.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen3_8_flash_next_180b_hellaswag_ep64.yaml). 8 nodes, 8 GPUs per node; see [Recipe Setup](#recipe-setup).
 
 ## Available Models
 

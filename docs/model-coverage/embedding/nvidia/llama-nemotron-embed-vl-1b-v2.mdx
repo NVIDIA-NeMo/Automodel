@@ -17,10 +17,9 @@ automodel examples/retrieval/bi_encoder/nemotron_vl_1b/nemotron_vl_1b_example.ya
 
 ## Choose a Workflow
 
-| Goal | Start Here |
-| --- | --- |
-| Run the primary recipe for this model | Use the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/bi_encoder/nemotron_vl_1b/nemotron_vl_1b_example.yaml). |
-| Prepare your environment | Follow the [installation instructions](/get-started/installation). |
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Embedding Fine-Tuning | Prepared ColPali and MIRACL data; 1 node | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/bi_encoder/nemotron_vl_1b/nemotron_vl_1b_example.yaml) |
 
 ## Model Context
 
@@ -47,6 +46,10 @@ llama-nemotron-embed-vl-1b-v2 is used for feature extraction. Its model size is 
 | Nodes | 1 |
 | Features | Checkpointing (enabled=true) |
 | Advanced | bfloat16 |
+
+### Workflow Notes
+
+Follow the [installation instructions](/get-started/installation).
 
 ## Available Models
 

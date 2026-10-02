@@ -18,10 +18,10 @@ uv run automodel examples/dllm_sft/diffusion_gemma_sft.yaml --nproc-per-node 8
 
 ## Choose a Workflow
 
-| Goal | Start Here |
-| --- | --- |
-| Fine-tune google/diffusiongemma-26B-A4B-it | [diffusion_gemma_sft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/diffusion_gemma_sft.yaml). 1 node, 8 GPUs per node; see [Recipe Setup](#recipe-setup). |
-| Low-rank adaptation (LoRA) SFT - DiffusionGemma 26B-A4B with FSDP2 + Expert Parallelism | Use [diffusion_gemma_lora.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/diffusion_gemma_lora.yaml). |
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Full Fine-Tuning | Prepared GSM8K chat data; 1 node; EP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/diffusion_gemma_sft.yaml) |
+| LoRA Fine-Tuning | Prepared GSM8K chat data; EP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/diffusion_gemma_lora.yaml) |
 
 ## Model Context
 
@@ -76,6 +76,10 @@ uv run automodel examples/dllm_sft/diffusion_gemma_lora.yaml --nproc-per-node 8
 ### Recipe Setup
 
 Read [diffusion_gemma_sft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/diffusion_gemma_sft.yaml) for checkpoint access, data paths, and backend dependencies.
+
+### Workflow Notes
+
+Fine-tune google/diffusiongemma-26B-A4B-it: [diffusion_gemma_sft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/diffusion_gemma_sft.yaml). 1 node, 8 GPUs per node; see [Recipe Setup](#recipe-setup).
 
 ## Available Models
 
