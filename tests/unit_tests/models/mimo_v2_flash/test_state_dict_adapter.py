@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -268,6 +269,7 @@ class TestMiMoV26CheckpointLayouts:
             None,
             config=config,
             layer_idx=0,
+            checkpoint_tp_size=checkpoint_tp_size,
             dtype=torch.float32,
             name="model.layers.0.self_attn.qkv_proj.weight",
         )
@@ -432,6 +434,7 @@ class TestMiMoV26CheckpointLayouts:
                 None,
                 config=v26_adapter.config,
                 layer_idx=0,
+                checkpoint_tp_size=v26_adapter.checkpoint_tp_size,
                 dtype=torch.float32,
                 name="model.layers.0.self_attn.qkv_proj.weight",
             )
@@ -736,21 +739,33 @@ class TestRoundTrip:
             )
 
 
+def _pro_full_attention_config(**overrides):
+    """Build MiMo-V2.6-Pro full-attention QKV geometry with a small hidden size."""
+    from nemo_automodel.components.models.mimo_v2_flash.config import MiMoV2Config
+
+    return MiMoV2Config(
+        hidden_size=128,
+        num_hidden_layers=1,
+        num_attention_heads=128,
+        num_key_value_heads=8,
+        head_dim=192,
+        v_head_dim=128,
+        hybrid_layer_pattern=[0],
+        moe_layer_freq=[0],
+        **overrides,
+    )
+
+
+def _write_index(directory, metadata):
+    """Write a minimal safetensors index carrying ``metadata``."""
+    index = {"metadata": metadata, "weight_map": {"model.layers.0.self_attn.qkv_proj.weight": "model.safetensors"}}
+    (directory / "model.safetensors.index.json").write_text(json.dumps(index))
+    return str(directory)
+
+
 class TestProCheckpointQKV:
     def test_tp8_fp8_partial_blocks_and_native_destinations(self, moe_config, backend_config):
-        from nemo_automodel.components.models.mimo_v2_flash.config import MiMoV2Config
-
-        config = MiMoV2Config(
-            hidden_size=128,
-            num_hidden_layers=1,
-            num_attention_heads=128,
-            num_key_value_heads=8,
-            head_dim=192,
-            v_head_dim=128,
-            hybrid_layer_pattern=[0],
-            moe_layer_freq=[0],
-            checkpoint_tp_size=8,
-        )
+        config = _pro_full_attention_config(checkpoint_tp_size=8)
         adapter = MiMoV2FlashStateDictAdapter(config, moe_config, backend_config, dtype=torch.float32)
         prefix = "model.layers.0.self_attn"
         native = {
@@ -781,12 +796,68 @@ class TestProCheckpointQKV:
         assert torch.all(v[128] == 53)
         assert torch.all(v[-1] == 216)
 
+    def test_index_tp_size_drives_tp8_deinterleave_without_config_override(self, tmp_path, moe_config, backend_config):
+        config = _pro_full_attention_config(
+            name_or_path=_write_index(tmp_path, {"save_format": "mxfp4", "total_size": 1, "tp_size": 8})
+        )
+        assert config.checkpoint_tp_size is None
+        adapter = MiMoV2FlashStateDictAdapter(config, moe_config, backend_config, dtype=torch.float32)
+        prefix = "model.layers.0.self_attn"
+        # Each TP8 storage shard holds Q=3072, K=192, V=128 rows; tag rows by shard.
+        shard_rows = (3072, 192, 128)
+        shards = [
+            torch.cat([torch.full((rows, 128), float(10 * part + shard)) for part, rows in enumerate(shard_rows)])
+            for shard in range(8)
+        ]
+        restored = adapter.from_hf({f"{prefix}.qkv_proj.weight": torch.cat(shards)})
+
+        assert adapter.checkpoint_tp_size == 8
+        for part, (name, rows) in enumerate(zip(("q", "k", "v"), shard_rows)):
+            weight = restored[f"{prefix}.{name}_proj.weight"]
+            assert weight.shape == (8 * rows, 128)
+            for shard in range(8):
+                assert torch.all(weight[shard * rows : (shard + 1) * rows] == 10 * part + shard)
+
+    @pytest.mark.parametrize(
+        ("metadata", "configured", "expected"),
+        [({"save_format": "mxfp4"}, 8, 8), ({"save_format": "mxfp4"}, None, 4), ({"tp_size": 8}, 8, 8)],
+    )
+    def test_missing_index_tp_size_falls_back_to_config(
+        self, tmp_path, moe_config, backend_config, metadata, configured, expected
+    ):
+        config = _pro_full_attention_config(
+            name_or_path=_write_index(tmp_path, metadata), checkpoint_tp_size=configured
+        )
+        adapter = MiMoV2FlashStateDictAdapter(config, moe_config, backend_config, dtype=torch.float32)
+        assert adapter.checkpoint_tp_size == expected
+
+    def test_config_and_index_tp_size_disagreement_raises(self, tmp_path, moe_config, backend_config):
+        config = _pro_full_attention_config(name_or_path=_write_index(tmp_path, {"tp_size": 8}), checkpoint_tp_size=4)
+        adapter = MiMoV2FlashStateDictAdapter(config, moe_config, backend_config, dtype=torch.float32)
+        native = {
+            f"model.layers.0.self_attn.{name}_proj.weight": torch.zeros(rows, 128)
+            for name, rows in (("q", 24576), ("k", 1536), ("v", 1024))
+        }
+        with pytest.raises(ValueError, match=r"checkpoint_tp_size=4 disagrees with metadata.tp_size=8"):
+            adapter.to_hf(native, quantization=True, for_checkpoint_load=True)
+
+    def test_wrong_tp_size_shape_error_names_tp_source(self, moe_config, backend_config):
+        adapter = MiMoV2FlashStateDictAdapter(
+            _pro_full_attention_config(), moe_config, backend_config, dtype=torch.float32
+        )
+        key = "model.layers.0.self_attn.qkv_proj.weight"
+        # TP8-interleaved rows/scales loaded with the TP4 fallback.
+        with pytest.raises(ValueError, match=r"weight_scale_inv has shape \(216, 1\).*checkpoint_tp_size=4"):
+            adapter.from_hf(
+                {key: torch.zeros(27136, 128, dtype=torch.float8_e4m3fn), f"{key}_scale_inv": torch.ones(216, 1)}
+            )
+
     def test_checkpoint_tp_config_roundtrip(self, tmp_path):
         from nemo_automodel.components.models.mimo_v2_flash.config import MiMoV2Config
 
         config = MiMoV2Config(checkpoint_tp_size=8)
         config.save_pretrained(tmp_path)
         assert MiMoV2Config.from_pretrained(tmp_path).checkpoint_tp_size == 8
-        assert MiMoV2Config().checkpoint_tp_size == 4
+        assert MiMoV2Config().checkpoint_tp_size is None
         with pytest.raises(ValueError, match="checkpoint_tp_size must be positive"):
             MiMoV2Config(checkpoint_tp_size=0)

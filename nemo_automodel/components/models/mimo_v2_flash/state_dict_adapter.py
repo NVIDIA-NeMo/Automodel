@@ -14,11 +14,14 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import re
 from typing import Any
 
 import torch
+from huggingface_hub import try_to_load_from_cache
 from torch.distributed.device_mesh import DeviceMesh
 
 from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
@@ -33,6 +36,10 @@ from nemo_automodel.components.moe.state_dict_mixin import MoESplitExpertsStateD
 logger = logging.getLogger(__name__)
 
 _MXFP4_BLOCK_SIZE = 32
+_SAFETENSORS_INDEX = "model.safetensors.index.json"
+# MiMo-V2.5/V2.6-Flash fused-QKV storage degree, used when neither the
+# checkpoint index nor the config records one.
+_DEFAULT_CHECKPOINT_TP_SIZE = 4
 _FUSED_QKV_WEIGHT = re.compile(r"^(.*\.layers\.(\d+)\.self_attn)\.qkv_proj\.weight$")
 _SPLIT_Q_WEIGHT = re.compile(r"^(.*\.layers\.(\d+)\.self_attn)\.q_proj\.weight$")
 _E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
@@ -98,9 +105,70 @@ def _dequantize_mxfp4(
     return (values * scales).to(dtype)
 
 
-def _fused_qkv_sizes(config: Any, layer_idx: int) -> tuple[int, int, int]:
+def _read_index_tp_size(model_path: str | None, revision: str | None = None) -> int | None:
+    """Read the fused-QKV storage TP degree recorded in a safetensors index.
+
+    MiMo-V2.6 checkpoints record it as ``metadata.tp_size`` in
+    ``model.safetensors.index.json``. Local directories are read directly;
+    Hub repository IDs are resolved from the local Hugging Face cache only.
+
+    Args:
+        model_path: Local checkpoint directory or Hugging Face repository ID.
+        revision: Optional Hub revision or commit hash for cache lookup.
+
+    Returns:
+        The recorded TP degree, or None when the index or field is unavailable.
+    """
+    if not model_path:
+        return None
+    if os.path.isdir(model_path):
+        index_path = os.path.join(model_path, _SAFETENSORS_INDEX)
+    else:
+        try:
+            index_path = try_to_load_from_cache(model_path, _SAFETENSORS_INDEX, revision=revision)
+        except ValueError:  # Not a valid repository ID.
+            return None
+    if not isinstance(index_path, str) or not os.path.isfile(index_path):
+        return None
+    with open(index_path, encoding="utf-8") as index_file:
+        metadata = json.load(index_file).get("metadata") or {}
+    tp_size = metadata.get("tp_size")
+    if tp_size is None:
+        return None
+    if isinstance(tp_size, bool) or not isinstance(tp_size, int) or tp_size < 1:
+        raise ValueError(f"{index_path} has invalid metadata.tp_size {tp_size!r}; expected a positive integer")
+    return tp_size
+
+
+def _resolve_checkpoint_tp_size(config: Any) -> int:
+    """Resolve the TP degree used to interleave fused QKV rows in the checkpoint.
+
+    Args:
+        config: MiMo model configuration. ``checkpoint_tp_size`` is an optional
+            explicit override and ``_name_or_path`` locates the checkpoint index.
+
+    Returns:
+        The index ``metadata.tp_size`` when present, else ``config.checkpoint_tp_size``,
+        else the MiMo-V2.6-Flash default of 4.
+
+    Raises:
+        ValueError: If the config and the checkpoint index disagree.
+    """
+    configured = getattr(config, "checkpoint_tp_size", None)
+    model_path = getattr(config, "_name_or_path", None) or getattr(config, "name_or_path", None)
+    recorded = _read_index_tp_size(model_path, getattr(config, "_commit_hash", None))
+    if recorded is not None and configured is not None and recorded != configured:
+        raise ValueError(
+            f"config.checkpoint_tp_size={configured} disagrees with metadata.tp_size={recorded} in "
+            f"{model_path}/{_SAFETENSORS_INDEX}; remove the checkpoint_tp_size override or set it to {recorded}"
+        )
+    if recorded is not None:
+        return recorded
+    return configured if configured is not None else _DEFAULT_CHECKPOINT_TP_SIZE
+
+
+def _fused_qkv_sizes(config: Any, layer_idx: int, checkpoint_tp_size: int) -> tuple[int, int, int]:
     """Return per-checkpoint-shard Q, K, and V row counts for one layer."""
-    checkpoint_tp_size = config.checkpoint_tp_size
     is_swa = bool(config.hybrid_layer_pattern[layer_idx])
     if is_swa:
         query_heads = int(config.swa_num_attention_heads)
@@ -130,6 +198,7 @@ def _split_fused_qkv(
     *,
     config: Any,
     layer_idx: int,
+    checkpoint_tp_size: int,
     dtype: torch.dtype,
     name: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -141,6 +210,7 @@ def _split_fused_qkv(
             [checkpoint_tp_size * ceil((q_rows + k_rows + v_rows) / 128), ceil(hidden / 128)].
         config: MiMo model configuration.
         layer_idx: Decoder layer index used to select full or sliding dimensions.
+        checkpoint_tp_size: TP degree whose shards are interleaved in ``weight``.
         dtype: Floating-point dtype for dequantized weights.
         name: Checkpoint key used in diagnostics.
 
@@ -148,15 +218,18 @@ def _split_fused_qkv(
         Query, key, and value weights with shapes [q_total, hidden],
         [k_total, hidden], and [v_total, hidden].
     """
-    checkpoint_tp_size = config.checkpoint_tp_size
-    q_rows, k_rows, v_rows = _fused_qkv_sizes(config, layer_idx)
+    q_rows, k_rows, v_rows = _fused_qkv_sizes(config, layer_idx, checkpoint_tp_size)
     rows_per_shard = q_rows + k_rows + v_rows
     expected_rows = checkpoint_tp_size * rows_per_shard
     hidden_size = int(config.hidden_size)
+    tp_hint = (
+        f"checkpoint_tp_size={checkpoint_tp_size} (from {_SAFETENSORS_INDEX} metadata.tp_size, else "
+        "config.checkpoint_tp_size); a wrong value changes this shape"
+    )
     if weight.ndim != 2 or tuple(weight.shape) != (expected_rows, hidden_size):
         raise ValueError(
             f"{name} has shape {tuple(weight.shape)}; expected "
-            f"[{expected_rows}, {hidden_size}] for TP{checkpoint_tp_size}-interleaved QKV"
+            f"[{expected_rows}, {hidden_size}] for TP{checkpoint_tp_size}-interleaved QKV; {tp_hint}"
         )
 
     weight_shards = weight.split(rows_per_shard, dim=0)
@@ -173,7 +246,7 @@ def _split_fused_qkv(
         if scale_inv.ndim != 2 or tuple(scale_inv.shape) != (expected_scale_rows, expected_scale_columns):
             raise ValueError(
                 f"{name}_scale_inv has shape {tuple(scale_inv.shape)}; expected "
-                f"[{expected_scale_rows}, {expected_scale_columns}]"
+                f"[{expected_scale_rows}, {expected_scale_columns}]; {tp_hint}"
             )
         scale_shards = scale_inv.split(scale_rows_per_shard, dim=0)
         dequantized_shards = tuple(
@@ -211,6 +284,7 @@ class MiMoV2FlashStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
         self.backend = backend
         self.dtype = dtype
         self._uses_model_prefix = True
+        self._checkpoint_tp_size: int | None = None
         self.hf_to_internal_map: dict[str, str] = {}
         if self.backend.attn == "te":
             self.hf_to_internal_map["self_attn.attention_sink_bias"] = "self_attn.attn_module.softmax_offset"
@@ -241,6 +315,13 @@ class MiMoV2FlashStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
     def _uses_fused_qkv_checkpoint(self) -> bool:
         """Whether checkpoint tensors use MiMo-V2.6 fused QKV and MXFP4 experts."""
         return getattr(self.config, "attention_projection_layout", "split") == "fused_qkv"
+
+    @property
+    def checkpoint_tp_size(self) -> int:
+        """TP degree interleaving fused QKV rows in the source checkpoint, resolved once."""
+        if self._checkpoint_tp_size is None:
+            self._checkpoint_tp_size = _resolve_checkpoint_tp_size(self.config)
+        return self._checkpoint_tp_size
 
     def from_hf(
         self,
@@ -281,6 +362,7 @@ class MiMoV2FlashStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
                 scale_inv,
                 config=self.config,
                 layer_idx=int(match.group(2)),
+                checkpoint_tp_size=self.checkpoint_tp_size,
                 dtype=self.dtype,
                 name=key,
             )
@@ -469,8 +551,8 @@ class MiMoV2FlashStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
             checkpoint names and shapes.
         """
         local_views = tuple(self._local_tensor(tensor) for tensor in (query, key, value))
-        checkpoint_tp_size = self.config.checkpoint_tp_size
-        q_rows, k_rows, v_rows = _fused_qkv_sizes(self.config, layer_idx)
+        checkpoint_tp_size = self.checkpoint_tp_size
+        q_rows, k_rows, v_rows = _fused_qkv_sizes(self.config, layer_idx, checkpoint_tp_size)
         expected_shapes = (
             (checkpoint_tp_size * q_rows, int(self.config.hidden_size)),
             (checkpoint_tp_size * k_rows, int(self.config.hidden_size)),
