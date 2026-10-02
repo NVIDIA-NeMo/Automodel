@@ -320,7 +320,8 @@ ARG UV_SYNC_ARGS="--locked"
 # behavior, upstream CI passes a higher value.
 ARG UV_SYNC_MAX_JOBS=8
 # Preserve locally built wheels for source-only CUDA packages such as flash-attn,
-# causal-conv1d and mamba-ssm across BuildKit builds.
+# causal-conv1d and mamba-ssm across BuildKit builds. Separate GPU targets so
+# switching MOK_ARCH cannot reuse a wheel compiled for the other architecture.
 # ray/jars/ray_dist.jar vendors a flagged jackson (GHSA-r7wm-3cxj-wff9) that upstream
 # has not bumped; Automodel uses Ray from Python only, so drop the Java worker jars.
 RUN --mount=type=cache,target=/opt/uv_cache,sharing=locked \
@@ -331,6 +332,7 @@ RUN --mount=type=cache,target=/opt/uv_cache,sharing=locked \
         MAGI_ATTENTION_PREBUILD_FFA=0 \
         MAX_JOBS=${UV_SYNC_MAX_JOBS} \
         UV_CONCURRENT_INSTALLS=8 \
+        UV_CACHE_DIR=${UV_CACHE_DIR}/${MOK_ARCH} \
         MOK_ARCH=${MOK_ARCH} \
         uv sync --extra $AUTOMODEL_INSTALL --extra msa --extra mok --all-groups $UV_SYNC_ARGS && \
     python -c "import importlib.metadata as m; import magi_attention; print('magi-attention', m.version('magi-attention'))" && \
