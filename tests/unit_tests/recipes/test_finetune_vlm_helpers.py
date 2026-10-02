@@ -1694,12 +1694,13 @@ def test_vlm_maybe_downgrade_reads_class_level_marker(supported):
     assert isinstance(result, FusedLinearCrossEntropy) is supported
 
 
-def test_vlm_maybe_downgrade_keeps_logit_losses_under_pp():
-    """Logit-based losses no longer fall back under PP once the stage forward accepts logits_to_keep."""
+@pytest.mark.parametrize("pp_enabled", [False, True])
+def test_chunked_ce_never_silently_falls_back_to_full_logits(pp_enabled):
     from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy
 
-    loss_fn = ChunkedCrossEntropy()
-    assert _maybe_downgrade_loss_fn(loss_fn, _StageWithLogitsToKeep(), pp_enabled=True) is loss_fn
+    probe = _StageWithLogitsToKeep() if pp_enabled else _StageNoLogitsToKeep()
+    with pytest.raises(ValueError, match="ChunkedCrossEntropy requires"):
+        _maybe_downgrade_loss_fn(ChunkedCrossEntropy(compile=False), probe, pp_enabled)
 
 
 def test_configure_pipeline_fused_ce_requests_hidden_states():
@@ -1729,6 +1730,24 @@ def test_configure_pipeline_fused_ce_requests_hidden_states():
         last_stage_model,
         grad_reduce_group=reduce_group,
     )
+
+
+def test_configure_pipeline_chunked_ce_requests_hidden_states():
+    from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy
+
+    last_stage_model = nn.Linear(2, 2)
+    recipe = _create_pp_recipe(last_stage_model)
+    recipe.__dict__["model_parts"] = [last_stage_model]
+    recipe.__dict__["loss_fn"] = ChunkedCrossEntropy(compile=False)
+    recipe.__dict__["cfg"] = SimpleNamespace(mtp=SimpleNamespace(build=MagicMock(return_value=object())))
+    recipe.__dict__["_get_dp_group"] = lambda include_cp=True: object()
+    pp = _MockAutoPipeline(has_first_stage=True, has_last_stage=True)
+    pp.info.stages = [SimpleNamespace(is_last=True)]
+    recipe.__dict__["pp"] = pp
+
+    recipe._configure_pipeline_loss_fn()
+
+    assert last_stage_model._pp_return_hidden_states is True
 
 
 def test_configure_pipeline_masked_ce_keeps_logits_output():
