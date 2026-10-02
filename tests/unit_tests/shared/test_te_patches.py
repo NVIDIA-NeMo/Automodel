@@ -74,8 +74,11 @@ def _install_patch_and_get_fn(fused_adam_cls, sys_modules):
 class TestApplyTePatchesIdempotent:
     def setup_method(self):
         te_patches_module._TE_PATCHES_APPLIED = False
+        self.thd_patch = patch.object(te_patches_module, "_apply_thd_a2a_reorder_patch")
+        self.mock_thd_patch = self.thd_patch.start()
 
     def teardown_method(self):
+        self.thd_patch.stop()
         te_patches_module._TE_PATCHES_APPLIED = False
 
     @patch.object(te_patches_module, "_apply_fused_adam_quantized_tensor_patch")
@@ -84,6 +87,7 @@ class TestApplyTePatchesIdempotent:
         apply_te_patches()
         mock_patch_fn.assert_called_once()
         mock_empty_patch.assert_called_once()
+        self.mock_thd_patch.assert_called_once()
 
     @patch.object(te_patches_module, "_apply_fused_adam_quantized_tensor_patch")
     @patch.object(te_patches_module, "_apply_fused_adam_empty_shard_patch")
@@ -92,6 +96,7 @@ class TestApplyTePatchesIdempotent:
         apply_te_patches()
         mock_patch_fn.assert_called_once()
         mock_empty_patch.assert_called_once()
+        self.mock_thd_patch.assert_called_once()
 
     @patch.object(te_patches_module, "_apply_fused_adam_quantized_tensor_patch")
     @patch.object(te_patches_module, "_apply_fused_adam_empty_shard_patch")
