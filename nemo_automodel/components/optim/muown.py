@@ -28,7 +28,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 from torch import Tensor
-from torch.distributed.tensor import DeviceMesh, DTensor, Replicate
+from torch.distributed.tensor import DeviceMesh, DTensor, Replicate, Shard
 from torch.optim import Optimizer
 from torch.optim.optimizer import ParamsT
 
@@ -78,7 +78,9 @@ def _row_norm(value: Tensor, axis: int, epsilon: float) -> Tensor:
     # A complete input-feature axis can use the reference norm kernel directly.
     # Input-sharded matrices need a global sum of squared local contributions.
     input_sharded = isinstance(value, DTensor) and any(
-        placement.is_shard() and placement.dim % value.ndim == axis % value.ndim and value.device_mesh.size(i) > 1
+        isinstance(placement, Shard)
+        and placement.dim % value.ndim == axis % value.ndim
+        and value.device_mesh.size(i) > 1
         for i, placement in enumerate(value.placements)
     )
     norm = _row_sum(norm_input.square(), axis).sqrt() if input_sharded else norm_input.norm(dim=axis, keepdim=True)
@@ -125,7 +127,7 @@ def _matrix_sharding(param: Tensor) -> tuple[int | None, dist.ProcessGroup | Non
     shards = [
         (i, p.dim % param.ndim)
         for i, p in enumerate(param.placements)
-        if p.is_shard() and p.dim % param.ndim in matrix_axes and param.device_mesh.size(i) > 1
+        if isinstance(p, Shard) and p.dim % param.ndim in matrix_axes and param.device_mesh.size(i) > 1
     ]
     if len(shards) > 1:
         raise NotImplementedError(

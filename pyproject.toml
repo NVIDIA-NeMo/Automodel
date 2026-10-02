@@ -592,6 +592,7 @@ allowed-unresolved-imports = [
     "deep_ep",
     "deep_ep.**",
     "dion",
+    "dion.**",
     "fast_hadamard_transform",
     "ffpa_attn",
     "ffpa_attn.**",
