@@ -128,6 +128,47 @@ def test_media_scatter_matches_masked_scatter_forward_and_backward() -> None:
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+def test_media_scatter_saves_indices_per_token() -> None:
+    model = _tiny_model().model
+    mask = torch.tensor([[[False], [True], [True]], [[True], [False], [True]]])
+    inputs = torch.randn(2, 3, 256, requires_grad=True)
+    media = torch.randn(4, 256, requires_grad=True)
+    saved_indices = []
+
+    def pack(tensor: torch.Tensor) -> torch.Tensor:
+        if tensor.dtype in (torch.bool, torch.long):
+            saved_indices.append(tensor.numel())
+        return tensor
+
+    with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+        model._scatter_media_embeddings(inputs, media, mask).sum().backward()
+
+    assert saved_indices
+    assert sum(saved_indices) <= 2 * mask.numel()
+
+
+@pytest.mark.parametrize("is_video", [False, True])
+@pytest.mark.parametrize("return_dict", [False, True])
+def test_model_media_forward_accepts_return_dict(is_video: bool, return_dict: bool) -> None:
+    model = _tiny_model().model
+    input_ids = torch.tensor([[1, *([61 if is_video else 60] * 4), 2]])
+    grid = torch.tensor([[1, 2, 2]], dtype=torch.long)
+    pixels = torch.randn(4, 12)
+    position_ids = torch.arange(input_ids.shape[-1]).view(1, 1, -1).expand(3, 1, -1)
+    media_kwargs = (
+        {"pixel_values_videos": pixels, "video_grid_thw": grid}
+        if is_video
+        else {"pixel_values": pixels, "image_grid_thw": grid}
+    )
+
+    output = model(input_ids=input_ids, position_ids=position_ids, return_dict=return_dict, **media_kwargs)
+
+    if return_dict:
+        assert output.last_hidden_state.shape == (1, 6, 16)
+    else:
+        assert output[0].shape == (1, 6, 16)
+
+
 @pytest.mark.parametrize("is_video", [False, True])
 @pytest.mark.parametrize("text_mode", ["input_ids", "inputs_embeds", "hidden_ids"])
 def test_model_media_forward_and_backward_matches_hf_scatter(is_video: bool, text_mode: str) -> None:

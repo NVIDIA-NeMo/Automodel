@@ -707,11 +707,10 @@ class Qwen3_5Model(HFQwen3_5Model):
         """
         if media_embeds.numel() == 0:
             return inputs_embeds
-        expanded_mask = media_mask.expand_as(inputs_embeds).reshape(-1)
-        source = media_embeds.reshape(-1)
-        source_indices = (expanded_mask.to(torch.long).cumsum(0) - 1).clamp_min_(0)
-        selected = source.index_select(0, source_indices)
-        return torch.where(expanded_mask, selected, inputs_embeds.reshape(-1)).reshape_as(inputs_embeds)
+        token_mask = media_mask.reshape(-1)
+        source_indices = (token_mask.to(torch.long).cumsum(0) - 1).clamp_min_(0)
+        selected = media_embeds.index_select(0, source_indices).reshape_as(inputs_embeds)
+        return torch.where(media_mask, selected, inputs_embeds)
 
     def forward(
         self,
@@ -768,7 +767,9 @@ class Qwen3_5Model(HFQwen3_5Model):
             if inputs_embeds_for_super is None:
                 inputs_embeds_for_super = embed_tokens(input_ids_for_super)
 
-            vision_kwargs = {key: value for key, value in kwargs.items() if key != "_host_packed_seq_ids"}
+            vision_kwargs = {
+                key: value for key, value in kwargs.items() if key not in {"_host_packed_seq_ids", "return_dict"}
+            }
             if pixel_values is not None:
                 image_outputs = self.get_image_features(
                     pixel_values,

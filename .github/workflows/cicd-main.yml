@@ -420,7 +420,8 @@ jobs:
           - test-name: L0_Unit_Tests_GPU_1_of_2
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             cpu-only: false
-            timeout: 30
+            # This shard reached 91-93% before both 30-minute attempts timed out.
+            timeout: 40
             shard-id: 0
             num-shards: 2
           - test-name: L0_Unit_Tests_GPU_2_of_2
