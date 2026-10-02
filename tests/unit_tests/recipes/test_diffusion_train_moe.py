@@ -25,6 +25,7 @@ import torch.nn as nn
 from nemo_automodel.components.checkpoint.config import CheckpointingConfig
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.distributed.config import MoEParallelizerConfig
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.recipes.diffusion import train as diffusion_train
 from nemo_automodel.recipes.diffusion.train import TrainDiffusionRecipe, _build_diffusion_mesh_context
@@ -121,9 +122,8 @@ def test_setup_keeps_moe_mesh_and_passes_it_to_the_checkpointer(monkeypatch):
         recipe.setup()
 
     pipeline_kwargs = build_pipeline.call_args.kwargs
-    # YAML ConfigNodes are converted to plain dicts for the custom model builder.
-    assert pipeline_kwargs["backend"] == {"experts": "torch", "dispatcher": "torch"}
-    assert type(pipeline_kwargs["backend"]) is dict
+    # The YAML backend section becomes a BackendConfig at the recipe boundary; overrides stay a plain dict.
+    assert pipeline_kwargs["backend"] == BackendConfig(experts="torch", dispatcher="torch")
     assert pipeline_kwargs["config_overrides"] == {"num_hidden_layers": 2}
     assert type(pipeline_kwargs["config_overrides"]) is dict
     assert recipe.moe_mesh is moe_mesh

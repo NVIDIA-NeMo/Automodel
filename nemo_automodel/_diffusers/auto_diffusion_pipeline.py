@@ -494,6 +494,9 @@ def _apply_parallelization(
 if TYPE_CHECKING:
     from nemo_automodel.components.models.common import BackendConfig
 
+# A value a YAML / CLI override can assign to a model config field.
+ConfigFieldValue = bool | int | float | str | list[bool | int | float | str] | None
+
 
 def _transformer_dir(model_dir: str, subfolder: str = "transformer") -> str:
     """Directory that holds the transformer's ``config.json``.
@@ -525,7 +528,7 @@ def _has_custom_model(transformer_dir: str) -> bool:
     return not get_is_hf_model(config, force_hf=False)
 
 
-def _validate_custom_model_options(mesh_context: MeshContext | None, **options: Any) -> None:
+def _validate_custom_model_options(mesh_context: MeshContext | None, **options: bool | str | None) -> None:
     """Check that no option a custom model cannot honor was requested.
 
     ``options`` are the pipeline arguments that only work with a diffusers transformer because they call diffusers
@@ -539,7 +542,7 @@ def _validate_custom_model_options(mesh_context: MeshContext | None, **options: 
         raise ValueError("Context parallelism is not supported for custom models yet (cp_size > 1).")
 
 
-def _apply_config_overrides(config, config_overrides: dict[str, Any]) -> None:
+def _apply_config_overrides(config, config_overrides: dict[str, ConfigFieldValue]) -> None:
     """Set ``config_overrides`` on the loaded model config. Unknown fields are an error, so typos cannot pass silently."""
     unknown = sorted(set(config_overrides) - set(config.to_dict()))
     if unknown:
@@ -611,8 +614,8 @@ class NeMoAutoDiffusionPipeline:
         fuse_qkv_projections: bool = False,
         compact_fused_qkv_projections: bool = False,
         attention_backend: str | None = None,
-        backend: "BackendConfig | dict[str, Any] | None" = None,
-        config_overrides: dict[str, Any] | None = None,
+        backend: "BackendConfig | None" = None,
+        config_overrides: dict[str, ConfigFieldValue] | None = None,
         **kwargs,
     ) -> "DiffusionPipeline | NeMoAutoDiffusionPipeline":
         """
@@ -651,7 +654,7 @@ class NeMoAutoDiffusionPipeline:
             compact_fused_qkv_projections: Whether to remove original projection modules after QKV fusion.
             attention_backend: Optional diffusers attention backend name set on the transformer
                 before parallelization (context parallelism validates the backend at enable time).
-            backend: ``BackendConfig`` (or its fields as a dict) for a custom-model transformer.
+            backend: ``BackendConfig`` of a custom-model transformer.
             config_overrides: Fields set on the custom-model transformer's config before it is built; every key
                 must be a field of that config.
             **kwargs: Additional arguments passed to DiffusionPipeline.from_pretrained
@@ -837,14 +840,14 @@ class NeMoAutoDiffusionPipeline:
         load_base_model: bool,
         load_for_training: bool,
         peft_cfg=None,
-        backend: "BackendConfig | dict[str, Any] | None" = None,
-        config_overrides: dict[str, Any] | None = None,
+        backend: "BackendConfig | None" = None,
+        config_overrides: dict[str, ConfigFieldValue] | None = None,
     ) -> "NeMoAutoDiffusionPipeline":
         """Pipeline around a transformer built from its custom Automodel implementation.
 
         Same as the LLM recipe's ``build_model``: ``NeMoAutoModelForDiffusion.from_config`` with a ``DistributedSetup``
         does the sharding (FSDP2, expert parallelism), PEFT and sharded weight loading. ``config_overrides`` are
-        applied to the loaded model config (fields must exist on it); ``backend`` is the model's ``BackendConfig``.
+        applied to the loaded model config (fields must exist on it).
         """
         from nemo_automodel._transformers.auto_model import NeMoAutoModelForDiffusion
         from nemo_automodel._transformers.model_init import get_hf_config
@@ -899,8 +902,8 @@ class NeMoAutoDiffusionPipeline:
         fuse_qkv_projections: bool = False,
         compact_fused_qkv_projections: bool = False,
         attention_backend: str | None = None,
-        backend: "BackendConfig | dict[str, Any] | None" = None,
-        config_overrides: dict[str, Any] | None = None,
+        backend: "BackendConfig | None" = None,
+        config_overrides: dict[str, ConfigFieldValue] | None = None,
         **kwargs,
     ) -> "NeMoAutoDiffusionPipeline | DiffusionPipeline":
         """
@@ -932,7 +935,7 @@ class NeMoAutoDiffusionPipeline:
             compact_fused_qkv_projections: Whether to remove original projection modules after QKV fusion.
             attention_backend: Optional diffusers attention backend name set on the transformer
                 before parallelization (context parallelism validates the backend at enable time).
-            backend: ``BackendConfig`` (or its fields as a dict) for a custom-model transformer.
+            backend: ``BackendConfig`` of a custom-model transformer.
             config_overrides: Fields set on the custom-model transformer's config before it is built; every key
                 must be a field of that config.
             **kwargs: Additional arguments

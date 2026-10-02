@@ -238,7 +238,7 @@ def test_from_custom_model_forwards_mesh_overrides_and_backend(monkeypatch, toy_
         activation_checkpointing=True,
     )
     peft_cfg = object()
-    backend = {"experts": "torch", "dispatcher": "torch", "linear": "torch"}
+    backend = toy_backend()
 
     pipe = NeMoAutoDiffusionPipeline._from_custom_model(
         toy_config_dir,
@@ -356,7 +356,7 @@ def test_from_pretrained_dispatches_to_custom_transformer(custom_repo, patched_c
     mesh_context = SimpleNamespace(
         cp_size=1, strategy_config=None, moe_parallel_config=None, activation_checkpointing=False
     )
-    backend = {"experts": "torch"}
+    backend = toy_backend()
     overrides = {"num_hidden_layers": 1}
 
     pipe = NeMoAutoDiffusionPipeline.from_pretrained(
@@ -451,7 +451,7 @@ def test_from_config_dispatches_to_custom_transformer_with_random_init(tmp_path,
         pipeline_spec={"subfolder": "dit"},
         torch_dtype=torch.float32,
         mesh_context=mesh_context,
-        backend={"experts": "torch"},
+        backend=toy_backend(),
         config_overrides={"num_hidden_layers": 1},
     )
 
@@ -463,7 +463,7 @@ def test_from_config_dispatches_to_custom_transformer_with_random_init(tmp_path,
     assert kwargs["torch_dtype"] == torch.float32
     assert kwargs["load_base_model"] is False
     assert kwargs["peft_config"] is None
-    assert kwargs["backend"] == {"experts": "torch"}
+    assert kwargs["backend"] == toy_backend()
     # Pretraining always trains every parameter.
     assert all(param.requires_grad for param in pipe.transformer.parameters())
 

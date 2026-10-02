@@ -18,7 +18,7 @@ import logging
 import os
 import time
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, Any, Dict
+from typing import Any, Dict
 
 import torch
 import torch.distributed as dist
@@ -31,7 +31,7 @@ _HAS_WANDB, wandb = safe_import(
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
 from torch.nn.parallel import DistributedDataParallel
 
-from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
+from nemo_automodel._diffusers.auto_diffusion_pipeline import ConfigFieldValue, NeMoAutoDiffusionPipeline
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.distributed import MeshContext, ParallelismSizes
 from nemo_automodel.components.distributed.fsdp2 import fsdp2_sharding_enabled
@@ -41,6 +41,7 @@ from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.flow_matching.pipeline import FlowMatchingPipeline, create_adapter
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG, init_all_rng
 from nemo_automodel.components.training.utils import (
     clip_grad_norm,
@@ -163,10 +164,6 @@ def _calculate_throughput_metrics(
         "log_window_steps": float(optimizer_steps),
         "log_window_samples": float(global_samples),
     }
-
-
-if TYPE_CHECKING:
-    from nemo_automodel.components.models.common import BackendConfig
 
 
 def _build_diffusion_mesh_context(
@@ -330,8 +327,8 @@ def build_diffusion_pipeline(
     peft_cfg=None,
     model_type=None,
     active_transformer: str | None = None,
-    backend: "BackendConfig | dict[str, Any] | None" = None,
-    config_overrides: dict[str, Any] | None = None,
+    backend: BackendConfig | None = None,
+    config_overrides: dict[str, ConfigFieldValue] | None = None,
 ) -> tuple[NeMoAutoDiffusionPipeline, MeshContext]:
     """Build the sharded diffusion pipeline (model + parallel scheme).
 
@@ -365,7 +362,7 @@ def build_diffusion_pipeline(
             transformer to finetune. ``"transformer"`` (default for Wan2.2 = high-noise)
             or ``"transformer_2"`` (low-noise). The unused transformer is dropped
             before device placement so only one transformer lives on GPU.
-        backend: ``BackendConfig`` fields for a transformer with a custom Automodel
+        backend: ``BackendConfig`` for a transformer with a custom Automodel
             implementation (for example MoE diffusion transformers that need expert parallelism).
         config_overrides: Config attributes overridden before building a custom-model transformer.
 
@@ -695,10 +692,11 @@ class TrainDiffusionRecipe(BaseRecipe):
         )
         logging.info(f"[INFO] LoRA: {lora_status}")
 
-        # ConfigNode lives at the recipe boundary; the pipeline takes plain mappings.
+        # ConfigNode lives at the recipe boundary; the pipeline takes a BackendConfig and plain config values.
         backend = self.cfg.get("model.backend", None)
         if isinstance(backend, ConfigNode):
-            backend = backend.to_dict()
+            # A `_target_` selects a model-specific BackendConfig subclass; otherwise the keys are its fields.
+            backend = backend.instantiate() if "_target_" in backend.to_dict() else BackendConfig(**backend.to_dict())
         config_overrides = self.cfg.get("model.config_overrides", None)
         if isinstance(config_overrides, ConfigNode):
             config_overrides = config_overrides.to_dict()

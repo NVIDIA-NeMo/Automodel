@@ -239,22 +239,24 @@ class ToyMoEDiTStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
 
     _supports_low_memory_dcp_load = True
 
-    def __init__(self, config: Any, moe_config: MoEConfig, backend: BackendConfig, dtype: torch.dtype):
+    def __init__(self, config: ToyMoEDiTConfig, moe_config: MoEConfig, backend: BackendConfig, dtype: torch.dtype):
         self.config = config
         self.moe_config = moe_config
         self.backend = backend
         self.dtype = dtype
         self._uses_model_prefix = True
 
-    def from_hf(self, hf_state_dict: dict[str, Any], device_mesh=None, **kwargs) -> dict[str, Any]:
+    def from_hf(self, hf_state_dict: dict[str, torch.Tensor], device_mesh=None, **kwargs) -> dict[str, torch.Tensor]:
         for key in hf_state_dict:
             if ".mlp.experts." in key and key.endswith(".weight"):
                 self._uses_model_prefix = key.startswith("model.")
                 break
         return self._from_hf_w_merged_experts(hf_state_dict, device_mesh)
 
-    def to_hf(self, state_dict: dict[str, Any], exclude_key_regex: str | None = None, **kwargs) -> dict[str, Any]:
-        hf_state_dict: dict[str, Any] = {}
+    def to_hf(
+        self, state_dict: dict[str, torch.Tensor], exclude_key_regex: str | None = None, **kwargs
+    ) -> dict[str, torch.Tensor]:
+        hf_state_dict: dict[str, torch.Tensor] = {}
         for fqn, tensor in state_dict.items():
             for key, value in self.convert_single_tensor_to_hf(
                 fqn, tensor, exclude_key_regex=exclude_key_regex, **kwargs
@@ -262,7 +264,7 @@ class ToyMoEDiTStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
                 hf_state_dict[key] = value
         return hf_state_dict
 
-    def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
+    def convert_single_tensor_to_hf(self, fqn: str, tensor: torch.Tensor, **kwargs) -> list[tuple[str, torch.Tensor]]:
         exclude_key_regex = kwargs.get("exclude_key_regex", None)
         pairs = self._convert_single_merged_expert_to_hf_split_experts(fqn, tensor, **kwargs)
         if pairs is None:
@@ -376,7 +378,7 @@ def write_toy_moe_dit_checkpoint(
     seed: int = 1234,
     diffusers_layout: bool = True,
     dtype: torch.dtype = torch.float32,
-    **config_kwargs: Any,
+    **config_kwargs: bool | int | float | str,
 ) -> str:
     """Write an HF-format toy checkpoint (config.json + model.safetensors) from a seeded random init.
 
