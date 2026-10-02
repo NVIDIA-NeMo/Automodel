@@ -52,7 +52,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import torch
 from torch.distributed.tensor import DTensor
 
-from nemo_automodel.components.optim.dion import build_dion_optimizer, is_dion_optimizer
+from nemo_automodel.components.optim.dion import _get_dion_mesh, build_dion_optimizer, is_dion_optimizer
 from nemo_automodel.components.optim.precision_warnings import warn_if_torch_adam_with_bf16_params
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
@@ -494,6 +494,52 @@ class MuonConfig(_DionConfigBase):
     def supports_batched_matrices(self) -> bool:
         """Route 3D+ weights to Muon unless ``flatten`` would merge their batch axis into each matrix."""
         return not self.flatten
+
+    def build(
+        self,
+        model: torch.nn.Module,
+        *,
+        device_mesh: DeviceMesh | None = None,
+        is_peft: bool = False,
+    ) -> list[torch.optim.Optimizer]:
+        """Build dion.Muon per model part and reject batched matrices it cannot update.
+
+        dion.Muon gathers sharded matrix axes only over its own data-parallel mesh. A 3D+ weight (for example grouped
+        experts with ``1 < ep_size < dp_size``) whose matrix axis is sharded over another mesh fails at the first
+        step, so this raises at build time instead.
+
+        Raises:
+            ValueError: If a Muon-updated 3D+ DTensor has a matrix axis sharded over a mesh other than Muon's.
+        """
+        optimizers = super().build(model, device_mesh=device_mesh, is_peft=is_peft)
+        dion_mesh = _get_dion_mesh(device_mesh)
+        process_group = dion_mesh.get_group() if dion_mesh is not None else None
+        names = {id(p): n for part in getattr(model, "parts", [model]) for n, p in part.named_parameters()}
+        muon_params = [
+            param
+            for optimizer in optimizers
+            for group in optimizer.param_groups
+            if group["algorithm"] == "muon"
+            for param in group["params"]
+            if param.ndim > 2 and isinstance(param, DTensor)
+        ]
+        for param in muon_params:
+            foreign_matrix_shards = [
+                placement.dim
+                for i, placement in enumerate(param.placements)
+                if placement.is_shard()
+                and placement.dim % param.ndim >= param.ndim - 2
+                and param.device_mesh.size(i) > 1
+                and param.device_mesh.get_group(i) != process_group
+            ]
+            if foreign_matrix_shards:
+                raise ValueError(
+                    f"MuonConfig cannot update {names.get(id(param), 'a 3D parameter')}: its matrix axis "
+                    f"{foreign_matrix_shards[0]} is sharded over mesh {param.device_mesh} (placements "
+                    f"{param.placements}), not dion.Muon's data-parallel mesh. For grouped experts use ep_size equal "
+                    "to the data-parallel size, ep_size 1, or MuownConfig, which handles per-parameter meshes."
+                )
+        return optimizers
 
     def _make_optimizer(self, param_groups, ctor_kwargs):
         from dion import Muon

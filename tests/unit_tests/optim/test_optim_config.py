@@ -21,6 +21,8 @@ import pytest
 import torch
 import torch.nn as nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import DTensor, Replicate, Shard
 
 from nemo_automodel.components.optim.optimizer import (
     AdamConfig,
@@ -295,6 +297,17 @@ class TestBuildOptimizerTuple:
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture
+def fake_world():
+    """Single-process fake 4-rank world for building DTensor meshes on CPU."""
+    import torch.distributed as dist
+    from torch.testing._internal.distributed.fake_pg import FakeStore
+
+    dist.init_process_group(backend="fake", rank=0, world_size=4, store=FakeStore())
+    yield
+    dist.destroy_process_group()
+
+
 def _dion_test_model():
     return nn.Sequential(nn.Embedding(8, 16), nn.Linear(16, 16, bias=False), nn.Linear(16, 8, bias=False))
 
@@ -442,6 +455,37 @@ class TestDionFamilyConfigs:
                 scale = math.sqrt(param.shape[-1] / param.shape[-2])
                 assert group["lr"] == pytest.approx(base_lr * scale)
                 assert group["weight_decay"] == pytest.approx(base_wd / scale)
+
+    @pytest.mark.parametrize(
+        ("placements", "raises"),
+        [((Replicate(), Shard(0)), False), ((Shard(1), Shard(0)), True)],
+        ids=["ep_equals_dp", "ep_below_dp"],
+    )
+    def test_muon_rejects_experts_sharded_off_its_mesh(self, fake_world, placements, raises):
+        # dion.Muon only gathers matrix shards over its DP mesh. Experts sharded only along the expert axis are
+        # updated locally; experts whose matrix axis is FSDP-sharded on ep_shard (1 < EP < DP) must fail at build.
+        pytest.importorskip("dion")
+        from nemo_automodel.components.optim.optimizer import MuonConfig
+
+        dp_mesh = init_device_mesh("cpu", (4,), mesh_dim_names=("dp_shard",))
+        moe_mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("ep_shard", "ep"))
+        model = _TransposedExpertsModel()
+        for name in ("gate_and_up_projs", "down_projs"):
+            full = getattr(model.experts, name).detach()
+            local = full.tensor_split(2, 0)[0]
+            if placements[0].is_shard():
+                local = local.tensor_split(2, 1)[0]
+            dtensor = DTensor.from_local(
+                local, moe_mesh, placements, run_check=False, shape=full.shape, stride=full.stride()
+            )
+            setattr(model.experts, name, nn.Parameter(dtensor))
+        config = MuonConfig(lr=1e-3)
+        if raises:
+            with pytest.raises(ValueError, match=r"experts\.gate_and_up_projs.*ep_size equal to the data-parallel"):
+                config.build(model, device_mesh=dp_mesh)
+        else:
+            (opt,) = config.build(model, device_mesh=dp_mesh)
+            assert {g["algorithm"] for g in opt.param_groups if g.get("matrix_transposed")} == {"muon"}
 
     def test_muon_flatten_keeps_grouped_experts_on_the_scalar_optimizer(self):
         # flatten=True would merge the expert axis into one matrix, so 3D experts stay on the scalar optimizer.
