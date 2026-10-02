@@ -253,9 +253,10 @@ def test_router_override_matches_adamw_and_preserves_matrix_groups(update_scale)
         scalar_betas=(0.8, 0.9),
         scalar_eps=1e-6,
         muon_update_scale=update_scale,
+        adamw_param_patterns=[r"^router\.weight$"],
         param_group_overrides=[
-            {"pattern": r"^router\.weight$", "algorithm": "adamw", "lr_mult": 0.5, "wd_mult": 0.2},
-            # First match wins; this must not send attention matrices to AdamW.
+            {"pattern": r"^router\.weight$", "lr_mult": 0.5, "wd_mult": 0.2},
+            # First LR/WD match wins; algorithm selection is independent.
             {"pattern": "weight", "lr_mult": 1.0},
         ],
     )
@@ -292,15 +293,14 @@ def test_router_override_matches_adamw_and_preserves_matrix_groups(update_scale)
         torch.testing.assert_close(model["router"].weight, expected_router, rtol=0, atol=0)
 
 
-def test_algorithm_override_rejected_by_standard_optimizer():
-    config = AdamWConfig(param_group_overrides=[{"pattern": "weight", "algorithm": "adamw"}])
-    with pytest.raises(ValueError, match="Dion-family"):
-        config.build(nn.Linear(2, 2))
+def test_adamw_patterns_rejected_by_standard_optimizer():
+    with pytest.raises(TypeError, match="adamw_param_patterns"):
+        AdamWConfig(adamw_param_patterns=["weight"])
 
 
-def test_invalid_algorithm_override():
-    with pytest.raises(ValueError, match="algorithm"):
-        ParamGroupOverride(pattern="router", algorithm="typo")
+def test_algorithm_override_is_not_a_generic_group_option():
+    with pytest.raises(TypeError, match="algorithm"):
+        ParamGroupOverride(pattern="router", algorithm="adamw")
 
 
 def test_override_preserves_transposed_experts_and_ignores_frozen_parameters(caplog):
@@ -314,10 +314,8 @@ def test_override_preserves_transposed_experts_and_ignores_frozen_parameters(cap
     model = nn.ModuleDict({"experts": Experts(), "router": nn.Linear(8, 4, bias=False)})
     model["router"].requires_grad_(False)
     config = MuownConfig(
-        param_group_overrides=[
-            {"pattern": "router", "algorithm": "adamw"},
-            {"pattern": "experts", "lr_mult": 0.5},
-        ]
+        adamw_param_patterns=["router"],
+        param_group_overrides=[{"pattern": "experts", "lr_mult": 0.5}],
     )
     optimizer = config.build(model)[0]
     groups = [g for g in optimizer.param_groups if g["params"]]
@@ -335,7 +333,8 @@ def test_all_matrix_parameters_can_use_adamw_without_changing_scheduler_base():
         lr=0.003,
         scalar_lr=0.001,
         weight_decay=0.1,
-        param_group_overrides=[{"pattern": "weight", "algorithm": "adamw", "lr_mult": 0.5, "wd_mult": 0.0}],
+        adamw_param_patterns=["weight"],
+        param_group_overrides=[{"pattern": "weight", "lr_mult": 0.5, "wd_mult": 0.0}],
     )
     optimizer = config.build(model)[0]
     assert len(optimizer.param_groups) == 1
@@ -350,7 +349,7 @@ def test_all_matrix_parameters_can_use_adamw_without_changing_scheduler_base():
 
 def test_optional_router_rule_excludes_expert_gate_proj():
     config = MuownConfig(
-        param_group_overrides=[{"pattern": r"(^|\.)(gate|router)\.weight$", "algorithm": "adamw"}],
+        adamw_param_patterns=[r"(^|\.)(gate|router)\.weight$"],
         scalar_lr=1e-4,
     )
     model = nn.ModuleDict(
@@ -369,3 +368,89 @@ def test_optional_router_rule_excludes_expert_gate_proj():
     assert groups[id(model["mlp"]["gate"].weight)]["algorithm"] == "adamw"
     assert groups[id(model["mlp"]["gate"].weight)]["lr"] == config.scalar_lr
     assert groups[id(model["mlp"]["gate_proj"].weight)]["algorithm"] == "muon"
+
+
+@pytest.mark.parametrize("scalar_opt", ["adamw", "lion"])
+@pytest.mark.parametrize("with_overrides", [False, True])
+def test_adamw_patterns_work_independently_of_lr_overrides(scalar_opt, with_overrides):
+    torch.manual_seed(117)
+    model = nn.ModuleDict(
+        {
+            "attn": nn.Linear(8, 12),
+            "router": nn.Linear(8, 4, bias=False),
+            "embed": nn.Embedding(16, 8),
+            "lm_head": nn.Linear(8, 16, bias=False),
+        }
+    )
+    multiplier = 0.5 if with_overrides else 1.0
+    config = MuownConfig(
+        lr=3e-4,
+        weight_decay=0.1,
+        scalar_opt=scalar_opt,
+        scalar_lr=1e-4,
+        scalar_betas=(0.8, 0.9),
+        scalar_eps=1e-6,
+        embed_lr=2e-5,
+        lm_head_lr=3e-5,
+        # Overlapping patterns select a parameter once. Existing auxiliary
+        # groups keep their LR/WD even when explicitly selected for AdamW.
+        adamw_param_patterns=["router", r"router\.weight$", "embed", "lm_head"],
+        param_group_overrides=[{"pattern": "weight", "lr_mult": 0.5}] if with_overrides else [],
+    )
+    opt = config.build(model)[0]
+    parameters = [p for group in opt.param_groups for p in group["params"]]
+    assert len(parameters) == len({id(p) for p in parameters}) == len(list(model.parameters()))
+    groups = {id(p): group for group in opt.param_groups for p in group["params"]}
+    assert groups[id(model["attn"].weight)]["algorithm"] == "muon"
+    assert groups[id(model["attn"].bias)]["algorithm"] == scalar_opt
+    assert groups[id(model["router"].weight)]["lr"] == pytest.approx(1e-4 * multiplier)
+    for name, lr in [("embed", 2e-5), ("lm_head", 3e-5)]:
+        group = groups[id(model[name].weight)]
+        assert group["algorithm"] == "adamw"
+        assert group["lr"] == pytest.approx(lr * multiplier)
+        assert group["weight_decay"] == 0.0
+
+    expected = nn.Parameter(model["router"].weight.detach().clone())
+    reference = torch.optim.AdamW(
+        [expected], lr=1e-4 * multiplier, betas=(0.8, 0.9), eps=1e-6, weight_decay=0.1, fused=True
+    )
+    for step in range(3):
+        for parameter in model.parameters():
+            parameter.grad = torch.randn_like(parameter)
+        expected.grad = model["router"].weight.grad.clone()
+        opt.step()
+        reference.step()
+        torch.testing.assert_close(model["router"].weight, expected, rtol=0, atol=0)
+        if step == 1:
+            state = copy.deepcopy(opt.state_dict())
+            opt = config.build(model)[0]
+            opt.load_state_dict(state)
+
+
+def test_adamw_patterns_split_transposed_expert_groups():
+    class Experts(nn.Module):
+        _nemo_transposed_matrix_parameters = ("selected", "remaining")
+
+        def __init__(self):
+            super().__init__()
+            self.selected = nn.Parameter(torch.randn(2, 8, 12))
+            self.remaining = nn.Parameter(torch.randn(2, 8, 12))
+
+    torch.manual_seed(118)
+    model = Experts()
+    config = MuownConfig(adamw_param_patterns=["selected"], scalar_lr=1e-4)
+    optimizer = config.build(model)[0]
+    groups = {id(p): group for group in optimizer.param_groups for p in group["params"]}
+    assert groups[id(model.selected)]["algorithm"] == "adamw"
+    assert not groups[id(model.selected)].get("matrix_transposed", False)
+    assert groups[id(model.remaining)]["algorithm"] == "muon"
+    assert groups[id(model.remaining)]["matrix_transposed"]
+    expected = nn.Parameter(model.selected.detach().clone())
+    reference = torch.optim.AdamW([expected], lr=1e-4, weight_decay=0.0, fused=True)
+    for _ in range(3):
+        model.selected.grad = torch.randn_like(model.selected)
+        model.remaining.grad = torch.randn_like(model.remaining)
+        expected.grad = model.selected.grad.clone()
+        optimizer.step()
+        reference.step()
+        torch.testing.assert_close(model.selected, expected, rtol=0, atol=0)

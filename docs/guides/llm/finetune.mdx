@@ -910,7 +910,7 @@ optimizer:
       wd_mult: 1.0          # (optional) multiplier for weight decay; defaults to 1.0
 ```
 
-Each parameter joins the group of the **first** override whose `pattern` matches its name; parameters matching no pattern keep the base learning rate. A pattern that matches nothing is skipped with a warning. Standard optimizers apply `lr_mult` and `wd_mult`. Dion-family configs (Muon, NorMuon, Dion, Dion2, Muown) now apply `lr_mult` and `wd_mult` as well; previously they ignored `param_group_overrides` with a warning. They additionally accept `algorithm: adamw` to route matching matrices to the auxiliary AdamW. Their LR/WD multipliers apply to the selected group's base settings, including when no LR scheduler is configured; matrix layout groups remain separate. Only Dion-family configs accept the `algorithm` field.
+Each parameter joins the group of the **first** override whose `pattern` matches its name; parameters matching no pattern keep the base learning rate. A pattern that matches nothing is skipped with a warning. Standard optimizers apply `lr_mult` and `wd_mult`. Dion-family configs (Muon, NorMuon, Dion, Dion2, Muown) now apply `lr_mult` and `wd_mult` as well; previously they ignored `param_group_overrides` with a warning. Their LR/WD multipliers apply to each group's base settings, including when no LR scheduler is configured; matrix layout groups remain separate. Dion-family configs separately expose `adamw_param_patterns` to select parameters for auxiliary AdamW before applying these multipliers.
 
 ### Muown for Dense and MoE Weights
 
@@ -936,14 +936,17 @@ Optionally set `optimizer.muon_update_scale` to multiply the shape-scaled Muon d
 Router matrices keep the default Muown grouping unless you explicitly select AdamW. To opt in, add this to the optimizer block:
 
 ```yaml
+adamw_param_patterns:
+  - '(^|\.)(gate|router)\.weight$'
+
+# Optional: adjust LR/WD independently of the AdamW selection above.
 param_group_overrides:
   - pattern: '(^|\.)(gate|router)\.weight$'
-    algorithm: adamw
-    lr_mult: 1.0
-    wd_mult: 1.0
+    lr_mult: 0.5
+    wd_mult: 0.0
 ```
 
-This optional rule matches modules named `gate` or `router` without matching expert `gate_proj` projections. Newly routed matrices inherit `scalar_lr`, `scalar_betas` and `scalar_eps`; `lr_mult` and `wd_mult` can further scale that group. Existing embedding/head settings are preserved, and frozen parameters are excluded.
+The optional `adamw_param_patterns` list matches canonical parameter names with Python `re.search`; matching any pattern selects auxiliary AdamW, even when `scalar_opt` is `lion`. It defaults to an empty list. The example selects modules named `gate` or `router` without matching expert `gate_proj` projections. Newly routed matrices inherit `scalar_lr` (or `lr` if unset), `scalar_betas` and `scalar_eps`. The independent LR/WD rule then gives those parameters half the auxiliary learning rate and zero weight decay. Existing embedding/head LR/WD settings are preserved before overrides, frozen parameters are excluded, and a pattern matching no trainable parameters is skipped with a warning. `adamw_param_patterns` works without `param_group_overrides`, and ordinary LR/WD overrides do not change the selected optimizer algorithm.
 
 Grouped expert tensors are treated as batches of independent matrices. AutoModel's grouped GEMM experts declare their `[expert, input, output]` storage layout so magnitude normalization follows output neurons. Linear weights use `[output, input]`. Embeddings, output heads, normalization parameters, and biases use the scalar optimizer. `MuonConfig` keeps grouped expert tensors on the scalar optimizer.
 

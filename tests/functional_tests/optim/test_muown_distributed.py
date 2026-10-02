@@ -203,7 +203,7 @@ def _check_fsdp_training(use_triton=False, checkpoint_dir=None):
         use_triton=use_triton,
         muon_update_scale=0.5,
         scalar_lr=1e-4,
-        param_group_overrides=[{"pattern": r"^router\.weight$", "algorithm": "adamw"}],
+        adamw_param_patterns=[r"^router\.weight$"],
     )
     optimizer = config.build(model, device_mesh=mesh)[0]
     reference_optimizer = config.build(reference)[0]

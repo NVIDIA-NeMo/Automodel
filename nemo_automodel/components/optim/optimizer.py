@@ -80,7 +80,7 @@ _NON_CONSTRUCTOR_FIELDS = frozenset({"param_group_overrides"})
 
 @dataclass
 class ParamGroupOverride:
-    """Per-parameter-group learning-rate, weight-decay and algorithm override.
+    """Per-parameter-group learning-rate and weight-decay override.
 
     Parameters whose (module-qualified) name matches :attr:`pattern` are placed
     in their own optimizer parameter group carrying :attr:`lr_mult` /
@@ -95,18 +95,13 @@ class ParamGroupOverride:
             works).
         lr_mult: Multiplier applied to this group's learning rate.
         wd_mult: Multiplier applied to this group's weight decay.
-        algorithm: Set to adamw to route matching Dion-family parameters
-            to the auxiliary AdamW optimizer. None keeps their default algorithm.
     """
 
     pattern: str
     lr_mult: float = 1.0
     wd_mult: float = 1.0
-    algorithm: str | None = None
 
     def __post_init__(self) -> None:
-        if self.algorithm not in (None, "adamw"):
-            raise ValueError("param_group_overrides.algorithm must be 'adamw' or None.")
         if any(not math.isfinite(value) or value < 0 for value in (self.lr_mult, self.wd_mult)):
             raise ValueError("param_group_overrides LR/WD multipliers must be finite and nonnegative.")
 
@@ -149,8 +144,6 @@ def _build_param_groups(
         A list of parameter-group dicts suitable for a torch optimizer, default
         (unmatched) group first.
     """
-    if any(override.algorithm is not None for override in overrides):
-        raise ValueError("param_group_overrides.algorithm requires a Dion-family optimizer config.")
     compiled = [re.compile(override.pattern) for override in overrides]
     default_params: list[torch.nn.Parameter] = []
     matched_params: list[list[torch.nn.Parameter]] = [[] for _ in overrides]
@@ -209,8 +202,7 @@ class OptimizerConfig:
 
     # Per-group LR/WD overrides matched by parameter name. Empty = single group
     # (unchanged behavior). Honored by the standard torch optimizers (typed configs
-    # and the factory path). Dion-family configs preserve their layout groups and
-    # additionally support selecting auxiliary AdamW by name.
+    # and the factory path). Dion-family configs preserve their layout groups.
     param_group_overrides: list[ParamGroupOverride] = field(default_factory=list)
 
     def __post_init__(self) -> None:
@@ -344,20 +336,25 @@ class FlashAdamWConfig(OptimizerConfig):
         return FlashAdamW(params, **self._constructor_kwargs())
 
 
-# Fields consumed by build_dion_optimizer for parameter grouping; these are NOT dion
+# Fields used only for Dion-family parameter grouping; these are NOT dion
 # constructor kwargs, so they are stripped from asdict(self) before instantiating the optimizer.
-_DION_GROUPING_FIELDS = frozenset({"scalar_opt", "scalar_betas", "scalar_eps", "scalar_lr", "embed_lr", "lm_head_lr"})
+_DION_GROUPING_FIELDS = frozenset(
+    {"scalar_opt", "scalar_betas", "scalar_eps", "scalar_lr", "embed_lr", "lm_head_lr", "adamw_param_patterns"}
+)
 
 
 @dataclass
 class _DionConfigBase(OptimizerConfig):
-    """Shared base for the dion-family typed configs (Muon / NorMuon / Dion2 / Dion).
+    """Shared base for the dion-family typed configs (Muon / Muown / NorMuon / Dion2 / Dion).
 
     Dion optimizers need Dion's parameter grouping (built from the model) and the
     device mesh rather than a flat parameter list, so :meth:`build` runs grouping
-    per model part.  The grouping-only fields below (``scalar_*`` / ``*_lr``) are
-    consumed by :func:`build_dion_optimizer` and stripped from the constructor
-    kwargs.  Dion is incompatible with Megatron-FSDP optimizer sharding; this is
+    per model part. Grouping-only fields (``scalar_*`` / ``*_lr`` and
+    ``adamw_param_patterns``) are stripped from the constructor kwargs.
+    ``adamw_param_patterns`` selects trainable parameters for auxiliary AdamW
+    by regex on canonical parameter names; an empty list keeps default routing.
+    LR/WD overrides apply after this selection.
+    Dion is incompatible with Megatron-FSDP optimizer sharding; this is
     enforced at the recipe layer (``supports_megatron_fsdp_sharding = False``
     drives an ``allow=False`` sharding call that asserts rather than silently
     returning an unsharded optimizer).
@@ -365,6 +362,7 @@ class _DionConfigBase(OptimizerConfig):
 
     # Dion optimizers are incompatible with Megatron-FSDP optimizer sharding.
     supports_megatron_fsdp_sharding: ClassVar[bool] = False
+    supports_batched_matrices: ClassVar[bool] = False
 
     lr: float = 5e-4
     weight_decay: float = 0.0
@@ -374,6 +372,7 @@ class _DionConfigBase(OptimizerConfig):
     scalar_lr: float | None = None
     embed_lr: float | None = None
     lm_head_lr: float | None = None
+    adamw_param_patterns: list[str] = field(default_factory=list)
 
     # Name of the dion constructor argument that receives the resolved device mesh.
     _mesh_kwarg: ClassVar[str] = "distributed_mesh"
@@ -394,7 +393,9 @@ class _DionConfigBase(OptimizerConfig):
             param_groups, mesh_kwargs = build_dion_optimizer(
                 self, part, device_mesh=device_mesh, mesh_kwarg=self._mesh_kwarg
             )
-            if self.param_group_overrides:
+            if self.adamw_param_patterns:
+                param_groups = self._apply_adamw_param_patterns(part, param_groups)
+            if self.param_group_overrides or self.adamw_param_patterns:
                 param_groups = self._apply_param_group_overrides(part, param_groups)
             ctor_kwargs = {
                 k: v
@@ -404,6 +405,57 @@ class _DionConfigBase(OptimizerConfig):
             opt = self._make_optimizer(param_groups, {**ctor_kwargs, **mesh_kwargs})
             optimizers.append(opt)
         return optimizers
+
+    def _apply_adamw_param_patterns(self, model: torch.nn.Module, groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Route matching trainable parameters to Dion's auxiliary AdamW.
+
+        Args:
+            model: Model whose canonical parameter names are matched by regex.
+            groups: Dion parameter-group dictionaries. Each ``params`` list
+                contains parameters of arbitrary shape, including DTensors whose
+                global shapes and placements are preserved.
+
+        Returns:
+            Split parameter-group dictionaries containing the original parameters,
+            without copying or modifying their tensors. Existing auxiliary LR/WD
+            settings are preserved; newly selected matrices use ``scalar_lr``.
+        """
+        patterns = [re.compile(pattern) for pattern in self.adamw_param_patterns]
+        selected: set[int] = set()
+        matched: set[int] = set()
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            name = canonical_parameter_fqn(name)
+            for index, pattern in enumerate(patterns):
+                if pattern.search(name):
+                    selected.add(id(param))
+                    matched.add(index)
+        for index, pattern in enumerate(self.adamw_param_patterns):
+            if index not in matched:
+                logger.warning("adamw_param_patterns pattern %r matched no parameters; skipping", pattern)
+
+        result = []
+        for source in groups:
+            remaining, adamw_params = [], []
+            for param in source["params"]:
+                (adamw_params if id(param) in selected else remaining).append(param)
+            if remaining:
+                result.append({**source, "params": remaining})
+            if adamw_params:
+                group = dict(
+                    source,
+                    params=adamw_params,
+                    algorithm="adamw",
+                    beta1=self.scalar_betas[0],
+                    beta2=self.scalar_betas[1],
+                    epsilon=self.scalar_eps,
+                )
+                if "algorithm" not in source:
+                    group["lr"] = self.scalar_lr if self.scalar_lr is not None else self.lr
+                group.pop("matrix_transposed", None)
+                result.append(group)
+        return result
 
     def _apply_param_group_overrides(
         self, model: torch.nn.Module, groups: list[dict[str, Any]]
@@ -444,18 +496,6 @@ class _DionConfigBase(OptimizerConfig):
                 if index is not None:
                     override = self.param_group_overrides[index]
                     lr_mult, wd_mult = override.lr_mult, override.wd_mult
-                    if override.algorithm is not None:
-                        # New auxiliary matrix groups use scalar optimizer
-                        # settings; existing embedding/head LR/WD stay intact.
-                        if "algorithm" not in source:
-                            lr = self.scalar_lr if self.scalar_lr is not None else self.lr
-                        group.update(
-                            algorithm=override.algorithm,
-                            beta1=self.scalar_betas[0],
-                            beta2=self.scalar_betas[1],
-                            epsilon=self.scalar_eps,
-                        )
-                        group.pop("matrix_transposed", None)
                 if self.lr == 0 and lr * lr_mult != 0:
                     raise ValueError("Dion param_group_overrides requires positive base lr for nonzero auxiliary LR.")
                 group.update(

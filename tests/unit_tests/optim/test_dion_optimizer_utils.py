@@ -407,6 +407,8 @@ class FakeDionConfig:
     so any object exposing the same attributes works.
     """
 
+    supports_batched_matrices = False
+
     def __init__(
         self,
         *,

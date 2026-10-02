@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import Any, Protocol
+from typing import Any, ClassVar, Protocol
 
 import torch.nn as nn
 
@@ -31,6 +31,7 @@ class _DionFamilyConfig(Protocol):
     scalar_opt: str
     scalar_betas: tuple[float, float]
     scalar_eps: float
+    supports_batched_matrices: ClassVar[bool]
 
 
 _import_error: Exception | None = None
@@ -246,7 +247,7 @@ def build_dion_optimizer(
         scalar_lr=getattr(config, "scalar_lr", None),
         embed_lr=getattr(config, "embed_lr", None),
         lm_head_lr=getattr(config, "lm_head_lr", None),
-        supports_batched_matrices=getattr(config, "supports_batched_matrices", False),
+        supports_batched_matrices=config.supports_batched_matrices,
         use_matrix_layout=getattr(config, "use_matrix_layout", False),
     )
 

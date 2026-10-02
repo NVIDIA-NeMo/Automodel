@@ -379,8 +379,12 @@ class TestDionFamilyConfigs:
             "Dion2": opt_mod.Dion2Config,
             "Dion": opt_mod.DionConfig,
         }[cls_name]
-        opt = cfg_cls(lr=5e-4).build(_dion_test_model())[0]
+        model = _dion_test_model()
+        opt = cfg_cls(lr=5e-4, scalar_lr=1e-4, adamw_param_patterns=[r"^1\.weight$"]).build(model)[0]
         assert type(opt).__name__ == cls_name
+        (group,) = [g for g in opt.param_groups if any(p is model[1].weight for p in g["params"])]
+        assert group["algorithm"] == "adamw"
+        assert group["lr"] == pytest.approx(1e-4)
 
 
 # ---------------------------------------------------------------------------
