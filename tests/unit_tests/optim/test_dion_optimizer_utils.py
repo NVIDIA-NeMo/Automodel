@@ -126,6 +126,23 @@ class TestSeparateParamGroups:
         assert groups[3]["weight_decay"] == 0.0
 
     @pytest.mark.parametrize("supports_batched_matrices", [False, True])
+    def test_2d_bias_routing_follows_optimizer_capability(self, supports_batched_matrices):
+        model = TinyModel(with_bias=True)
+        model.score_bias = nn.Parameter(torch.randn(4, 8))
+        groups = self._call(
+            model=model,
+            base_lr=1e-3,
+            scalar_opt="adamw",
+            weight_decay=0.0,
+            supports_batched_matrices=supports_batched_matrices,
+        )
+        matrix_ids = {id(p) for p in groups[0]["params"]}
+        scalar_ids = {id(p) for p in groups[1]["params"]}
+        # Without batched-matrix support the grouping is the plain ndim == 2 rule, so a 2D bias stays a matrix.
+        assert (id(model.score_bias) in matrix_ids) != supports_batched_matrices
+        assert (id(model.score_bias) in scalar_ids) == supports_batched_matrices
+
+    @pytest.mark.parametrize("supports_batched_matrices", [False, True])
     def test_grouped_experts_follow_optimizer_capability(self, supports_batched_matrices):
         model = TinyModel(with_bias=True)
         model.experts = nn.Parameter(torch.randn(4, 8, 16))

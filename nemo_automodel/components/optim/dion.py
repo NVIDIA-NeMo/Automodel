@@ -104,8 +104,10 @@ def _separate_param_groups(
             lm_head_params.append(param)
             continue
 
+        is_matrix = param.ndim == 2 or (supports_batched_matrices and param.ndim > 2)
+        # Batched-matrix optimizers keep 2D biases on the scalar optimizer; others keep main's ndim == 2 rule.
         is_bias = parameter_name == "bias" or parameter_name.endswith("_bias")
-        if not is_bias and (param.ndim == 2 or (supports_batched_matrices and param.ndim > 2)):
+        if is_matrix and not (supports_batched_matrices and is_bias):
             transposed_names = getattr(module, "_nemo_transposed_matrix_parameters", ())
             if use_matrix_layout and parameter_name in transposed_names:
                 transposed_matrix_params.append(param)
