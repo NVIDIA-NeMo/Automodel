@@ -19,10 +19,10 @@ uv run torchrun --nnodes 32 --nproc-per-node 8 \
 
 ## Choose a Workflow
 
-| Goal | Start Here |
-| --- | --- |
-| Fine-tune nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16 | [nemotron_ultra_v3_squad.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_ultra_v3_squad.yaml). 32 nodes, 8 GPUs per node; see [Recipe Setup](#recipe-setup). |
-| Try another checked-in recipe for this model | Use the [alternate recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/nemotron/nemotron_ultra_v3_te_deepep.yaml). |
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Full Fine-Tuning (Packed Sequences) | SQuAD; 32 nodes; PP4; EP64; 4,096-token packs | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_ultra_v3_squad.yaml) |
+| Training Benchmark | Synthetic data; 16 nodes; EP64 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/nemotron/nemotron_ultra_v3_te_deepep.yaml) |
 
 ## Model Context
 
@@ -66,6 +66,10 @@ Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node 
 ### Recipe Setup
 
 Read [nemotron_ultra_v3_squad.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_ultra_v3_squad.yaml) for checkpoint access, data paths, and backend dependencies. Use the [Slurm launcher guide](/job-launchers/slurm-cluster) to prepare the distributed allocation.
+
+### Workflow Notes
+
+Fine-tune nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16: [nemotron_ultra_v3_squad.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_ultra_v3_squad.yaml). 32 nodes, 8 GPUs per node; see [Recipe Setup](#recipe-setup).
 
 ## Available Models
 

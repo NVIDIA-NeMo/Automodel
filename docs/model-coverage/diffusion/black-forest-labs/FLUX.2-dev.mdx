@@ -19,10 +19,10 @@ uv run torchrun --nproc-per-node=8 examples/diffusion/finetune/finetune.py \
 
 ## Choose a Workflow
 
-| Goal | Start Here |
-| --- | --- |
-| [`black-forest-labs/FLUX.2-dev`](https://huggingface.co/black-forest-labs/FLUX.2-dev) | [Full fine-tuning](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/flux2_t2i_flow.yaml) |
-| [`black-forest-labs/FLUX.2-dev`](https://huggingface.co/black-forest-labs/FLUX.2-dev) | [LoRA](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/flux2_t2i_flow_lora.yaml) |
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Full Fine-Tuning | Prepared image-text cache; DP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/flux2_t2i_flow.yaml) |
+| LoRA Fine-Tuning | Prepared image-text cache; DP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/flux2_t2i_flow_lora.yaml) |
 
 ## Model Context
 

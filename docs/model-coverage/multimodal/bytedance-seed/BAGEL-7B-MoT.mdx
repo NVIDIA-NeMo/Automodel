@@ -18,10 +18,10 @@ uv run automodel examples/multimodal_finetune/bagel/bagel_sft.yaml --nproc-per-n
 
 ## Choose a Workflow
 
-| Goal | Start Here |
-| --- | --- |
-| Joint text-understanding and image-generation pretraining | Use [bagel_pretrain.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/multimodal_pretrain/bagel/bagel_pretrain.yaml). Dataset: BAGEL-style packed multimodal data. |
-| Fine-tune ByteDance-Seed/BAGEL-7B-MoT | [bagel_sft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/multimodal_finetune/bagel/bagel_sft.yaml). 1 node, 8 GPUs per node; see [Recipe Setup](#recipe-setup). |
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Multimodal Pretraining | Prepared image, editing, and VLM data | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/multimodal_pretrain/bagel/bagel_pretrain.yaml) |
+| Multimodal Fine-Tuning | Prepared image, editing, and VLM data | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/multimodal_finetune/bagel/bagel_sft.yaml) |
 
 ## Model Context
 
@@ -57,6 +57,10 @@ before launching a recipe.
 ### Recipe Setup
 
 Read [bagel_sft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/multimodal_finetune/bagel/bagel_sft.yaml) for checkpoint access, data paths, and backend dependencies.
+
+### Workflow Notes
+
+Fine-tune ByteDance-Seed/BAGEL-7B-MoT: [bagel_sft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/multimodal_finetune/bagel/bagel_sft.yaml). 1 node, 8 GPUs per node; see [Recipe Setup](#recipe-setup).
 
 ## Available Models
 

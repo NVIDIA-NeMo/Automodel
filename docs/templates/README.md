@@ -35,8 +35,15 @@ by free-form prose, custom H3 or deeper headings, tables, code, and callouts.
   example YAML. Use `automodel` only when the YAML has a `recipe` target; use
   the documented Python entry point otherwise. Include the required distributed
   launch for multiple nodes. Put preparation and alternate commands in context.
-- Choose a Workflow has a direct `Goal | Start Here` table and links the same
-  recipe and checkpoint as Quick Start. Each row has a link. Recipe identities
+- Choose a Workflow contains only a direct `Workflow | Example Setup | Recipe`
+  table and links the same recipe and checkpoint as Quick Start. Workflow names
+  the operation, such as full fine-tuning, LoRA, pretraining, or benchmarking.
+  Example Setup gives the dataset and essential requirements. Recipe contains
+  only one direct checked-in YAML link labeled `View YAML`. Each YAML appears
+  once, and each row differs in Workflow or Example Setup. Setup guides and
+  longer operational notes belong in Model Context.
+  Workflow and Example Setup must be nonempty, without placeholders or links.
+  Generic primary/alternate recipe labels fail. Recipe identities
   are read from YAML contents, including nested `model.config` fields, rather
   than inferred from filenames. Tokenizer and processor IDs must agree with
   the command's model ID.
@@ -62,6 +69,9 @@ by free-form prose, custom H3 or deeper headings, tables, code, and callouts.
 | Quick Start | 60 prose words and 600 visible characters |
 | Quick Start command | One code block, at most 12 lines |
 | Choose a Workflow | 160 prose words, 1,600 visible characters, and six data rows |
+| Workflow cell | Eight words and 80 visible characters |
+| Example Setup cell | 12 words and 120 visible characters |
+| Recipe cell | One direct YAML link labeled `View YAML`; no extra prose |
 | Model Context introduction | 8-40 words and at most 400 visible characters |
 | Model Context | Free-form; no length limit |
 

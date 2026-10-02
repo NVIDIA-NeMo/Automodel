@@ -38,9 +38,9 @@ uv run automodel ${recipe} --nproc-per-node 8
 
 ## Choose a Workflow
 
-| Goal | Start Here |
-| --- | --- |
-| Fine-tune | [Recipe](${recipeUrl}) |
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Fine-tune | SQuAD; eight GPUs | [View YAML](${recipeUrl}) |
 
 ## Model Context
 
@@ -66,7 +66,7 @@ This model provides a compact decoder for text generation and fine-tuning.
 `;
 const check = (source, catalog = recipes, format = "mdx") => validateModelCard(source, template, format, catalog);
 const launch = `\`\`\`bash\nuv run automodel ${recipe} --nproc-per-node 8\n\`\`\``;
-const workflowRow = `| Fine-tune | [Recipe](${recipeUrl}) |`;
+const workflowRow = `| Fine-tune | SQuAD; eight GPUs | [View YAML](${recipeUrl}) |`;
 
 test("the independent fixture conforms in Markdown and MDX", () => {
   assert.deepEqual(check(validCard), []);
@@ -213,19 +213,97 @@ for (const [name, source, diagnostic] of [
   ["empty workflow table", validCard.replace(workflowRow, ""), "at least one data row"],
   [
     "wrong workflow columns",
-    validCard.replace("| Goal | Start Here |", "| Task | Configuration |"),
-    "Goal | Start Here",
+    validCard.replace("| Workflow | Example Setup | Recipe |", "| Task | Setup | Configuration |"),
+    "Workflow | Example Setup | Recipe",
   ],
-  ["blank workflow row", validCard.replace(workflowRow, "| | |"), "table data rows must contain content"],
+  [
+    "legacy two-column chooser",
+    validCard
+      .replace("| Workflow | Example Setup | Recipe |", "| Goal | Start Here |")
+      .replace("| --- | --- | --- |", "| --- | --- |")
+      .replace(workflowRow, `| Fine-tune | [Recipe](${recipeUrl}) |`),
+    "Workflow | Example Setup | Recipe",
+  ],
+  [
+    "empty setup cell",
+    validCard.replace("SQuAD; eight GPUs", ""),
+    "Example Setup must contain a meaningful value",
+  ],
+  [
+    "placeholder setup cell",
+    validCard.replace("SQuAD; eight GPUs", "TBD"),
+    "Example Setup must contain a meaningful value",
+  ],
+  [
+    "generic workflow name",
+    validCard.replace("| Fine-tune |", "| Run the primary recipe for this model |"),
+    "Workflow must name an operation",
+  ],
+  [
+    "long setup cell",
+    validCard.replace("SQuAD; eight GPUs", "word ".repeat(13)),
+    "Example Setup exceeds 12 words",
+  ],
+  [
+    "long unbroken setup cell",
+    validCard.replace("SQuAD; eight GPUs", "x".repeat(121)),
+    "Example Setup exceeds 12 words or 120 characters",
+  ],
+  [
+    "long workflow name",
+    validCard.replace("| Fine-tune |", "| " + "word ".repeat(9) + " |"),
+    "Workflow exceeds 8 words",
+  ],
+  [
+    "link in setup cell",
+    validCard.replace("SQuAD; eight GPUs", "[SQuAD](https://example.com/data)"),
+    "Example Setup must describe the choice",
+  ],
+  [
+    "recipe cell prose",
+    validCard.replace(`[View YAML](${recipeUrl})`, `[View YAML](${recipeUrl}). Configure your hardware first.`),
+    'Recipe must contain only one direct YAML link labeled "View YAML"',
+  ],
+  [
+    "generic recipe link label",
+    validCard.replace("[View YAML]", "[Model-specific recipe]"),
+    'Recipe must contain only one direct YAML link labeled "View YAML"',
+  ],
+  [
+    "recipe directory link",
+    validCard.replace(recipeUrl, recipeUrl.replace("/test_model.yaml", "")),
+    "each Recipe cell must link directly to one checked-in examples YAML",
+  ],
+  [
+    "two recipes in one cell",
+    validCard.replace(`[View YAML](${recipeUrl})`, `[View YAML](${recipeUrl}) or [View YAML](${recipeUrl})`),
+    'Recipe must contain only one direct YAML link labeled "View YAML"',
+  ],
+  [
+    "repeated recipe row",
+    validCard.replace(workflowRow, `${workflowRow}\n${workflowRow}`),
+    "workflow recipe is listed more than once",
+  ],
+  [
+    "indistinguishable workflow choices",
+    validCard.replace(workflowRow, `${workflowRow}\n${workflowRow.replace("test_model.yaml", "second_model.yaml")}`),
+    "workflow choices must differ in Workflow or Example Setup",
+  ],
+  [
+    "chooser prose outside the table",
+    validCard.replace("\n## Model Context", "\nConfigure more settings here.\n\n## Model Context"),
+    "Choose a Workflow must contain only one direct workflow table",
+  ],
+  ["blank workflow row", validCard.replace(workflowRow, "| | | |"), "table data rows must contain content"],
   [
     "generic workflow guides",
-    validCard.replace(workflowRow, "| Set up | [Installation](/get-started/installation) |"),
+    validCard.replace(workflowRow, "| Set up | Follow installation | [View YAML](/get-started/installation) |"),
     "must link Quick Start recipe",
   ],
   [
     "workflow without links",
-    validCard.replace(workflowRow, "| Fine-tune | Read the guide. |"),
-    "each workflow row must contain a link",
+    validCard.replace(workflowRow, "| Fine-tune | SQuAD | Read the guide. |"),
+    "each Recipe cell must link directly",
   ],
   [
     "prose-only Quick Start",
@@ -380,7 +458,7 @@ test("defined reference links work in both Markdown formats", () => {
   const source = validCard.replace(
     "[Training guide](https://example.com/guide)",
     "[Training guide][guide]\n\n[guide]: https://example.com/guide",
-  );
+  ).replace(`[View YAML](${recipeUrl})`, "[View YAML][config]") + `\n[config]: ${recipeUrl}\n`;
   assert.deepEqual(check(source), []);
   assert.deepEqual(check(source, recipes, "md"), []);
 });

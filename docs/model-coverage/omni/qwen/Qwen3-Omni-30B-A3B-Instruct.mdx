@@ -18,11 +18,11 @@ uv run automodel --nproc-per-node=8 examples/vlm_finetune/qwen3/qwen3_omni_moe_3
 
 ## Choose a Workflow
 
-| Goal | Start Here |
-| --- | --- |
-| Supervised fine-tuning (SFT) - Qwen3-Omni 30B with TE + DeepEP | Use [qwen3_omni_moe_30b_te_deepep.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3/qwen3_omni_moe_30b_te_deepep.yaml). Dataset: MedPix-VQA. |
-| ASR SFT - Qwen3-Omni 30B-A3B | Use [ami_sft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/audio_finetune/qwen3_omni_asr/ami_sft.yaml). Dataset: AMI. |
-| ASR SFT - Qwen3-Omni 30B-A3B | Use [multi_en_sft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/audio_finetune/qwen3_omni_asr/multi_en_sft.yaml). Dataset: Multi-corpus English mixture. |
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Vision-Language Fine-Tuning | MedPix-VQA; EP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3/qwen3_omni_moe_30b_te_deepep.yaml) |
+| Speech Recognition Fine-Tuning | AMI meeting corpus; EP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/audio_finetune/qwen3_omni_asr/ami_sft.yaml) |
+| Speech Recognition Fine-Tuning | English ASR mixture; EP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/audio_finetune/qwen3_omni_asr/multi_en_sft.yaml) |
 
 ## Model Context
 

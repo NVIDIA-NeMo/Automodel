@@ -22,10 +22,10 @@ uv run torchrun --nproc-per-node=8 \
 
 ## Choose a Workflow
 
-| Goal | Start Here |
-| --- | --- |
-| Fine-tune - two-stage with `model.stage` knob | Use [wan2_2_t2v_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/wan2_2_t2v_flow.yaml). |
-| Inference - loads both stage checkpoints | Use [generate_wan22.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/generate/configs/generate_wan22.yaml). |
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Full Fine-Tuning | Prepared video cache; DP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/wan2_2_t2v_flow.yaml) |
+| Video Generation | Text prompts | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/generate/configs/generate_wan22.yaml) |
 
 ## Model Context
 

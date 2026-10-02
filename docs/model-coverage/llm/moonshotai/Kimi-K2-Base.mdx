@@ -19,10 +19,9 @@ uv run torchrun --nnodes 32 --nproc-per-node 8 \
 
 ## Choose a Workflow
 
-| Goal | Start Here |
-| --- | --- |
-| Run the primary recipe for this model | Use the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/kimi/kimi_k2_te_deepep.yaml). |
-| Prepare your environment | Follow the [installation instructions](/get-started/installation). |
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Training Benchmark | Synthetic data; 32 nodes; PP8; EP32 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/kimi/kimi_k2_te_deepep.yaml) |
 
 ## Model Context
 
@@ -50,6 +49,10 @@ Kimi-K2-Base is used for text generation. Its model size is 1026.47B checkpoint 
 | Nodes | 32 |
 | Features | Activation checkpointing (activation_checkpointing=true), Transformer Engine, DeepEP (dispatcher=deepep) |
 | Advanced | attention=te, linear=te, experts=gmm, dispatcher=deepep |
+
+### Workflow Notes
+
+Follow the [installation instructions](/get-started/installation).
 
 ## Available Models
 

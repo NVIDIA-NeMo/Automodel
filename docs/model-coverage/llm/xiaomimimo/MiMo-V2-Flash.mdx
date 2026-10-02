@@ -22,11 +22,11 @@ uv run torchrun --nnodes 16 --nproc-per-node 8 \
 
 ## Choose a Workflow
 
-| Goal | Start Here |
-| --- | --- |
-| Fine-tune XiaomiMiMo/MiMo-V2-Flash | [mimo_v2_flash_hellaswag.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mimo_v2_flash/mimo_v2_flash_hellaswag.yaml). 16 nodes, 8 GPUs per node; see [Recipe Setup](#recipe-setup). |
-| Fine-tune MiMo-V2.6-Flash-RL on packed Tulu3 text | Use [mimo_v2_6_flash_rl_tulu3_packed4k_ep64_cp2_100steps.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mimo_v2_flash/mimo_v2_6_flash_rl_tulu3_packed4k_ep64_cp2_100steps.yaml). |
-| Fine-tune MiMo-V2.6-Flash-RL on MedPix-VQA | Use [mimo_v2_6_flash_rl_medpix_nonpacked4k_ep64_100steps.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mimo_v2_flash/mimo_v2_6_flash_rl_medpix_nonpacked4k_ep64_100steps.yaml). |
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Full Fine-Tuning | HellaSwag; 16 nodes; PP4; EP32 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mimo_v2_flash/mimo_v2_flash_hellaswag.yaml) |
+| Full Fine-Tuning (Packed Sequences) (MiMo-V2.6-Flash-RL) | Tulu-3; 8 nodes; CP2; EP64; 4,096-token packs | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mimo_v2_flash/mimo_v2_6_flash_rl_tulu3_packed4k_ep64_cp2_100steps.yaml) |
+| Vision-Language Fine-Tuning (MiMo-V2.6-Flash-RL) | MedPix-VQA; 8 nodes; EP64 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mimo_v2_flash/mimo_v2_6_flash_rl_medpix_nonpacked4k_ep64_100steps.yaml) |
 
 ## Model Context
 
@@ -56,6 +56,10 @@ Use the checked-in recipes to fine-tune either supported checkpoint.
 ### Recipe Setup
 
 Read [mimo_v2_flash_hellaswag.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mimo_v2_flash/mimo_v2_flash_hellaswag.yaml) for checkpoint access, data paths, and backend dependencies. Use the [Slurm launcher guide](/job-launchers/slurm-cluster) to prepare the distributed allocation.
+
+### Workflow Notes
+
+Fine-tune XiaomiMiMo/MiMo-V2-Flash: [mimo_v2_flash_hellaswag.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mimo_v2_flash/mimo_v2_flash_hellaswag.yaml). 16 nodes, 8 GPUs per node; see [Recipe Setup](#recipe-setup).
 
 ## Available Models
 

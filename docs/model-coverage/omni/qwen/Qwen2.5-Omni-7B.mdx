@@ -17,10 +17,9 @@ uv run automodel examples/audio_finetune/qwen2_5_omni_asr/ami_sft_7b.yaml --npro
 
 ## Choose a Workflow
 
-| Goal | Start Here |
-| --- | --- |
-| Fine-tune Qwen/Qwen2.5-Omni-7B | [ami_sft_7b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/audio_finetune/qwen2_5_omni_asr/ami_sft_7b.yaml). 1 node, 8 GPUs per node; see [Recipe Setup](#recipe-setup). |
-| Prepare your environment | Follow the [installation instructions](/get-started/installation). |
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Speech Recognition Fine-Tuning | AMI meeting corpus | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/audio_finetune/qwen2_5_omni_asr/ami_sft_7b.yaml) |
 
 ## Model Context
 
@@ -56,6 +55,12 @@ its declared topology below before choosing a local or cluster launcher.
 ### Recipe Setup
 
 Read [ami_sft_7b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/audio_finetune/qwen2_5_omni_asr/ami_sft_7b.yaml) for checkpoint access, data paths, and backend dependencies.
+
+### Workflow Notes
+
+Fine-tune Qwen/Qwen2.5-Omni-7B: [ami_sft_7b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/audio_finetune/qwen2_5_omni_asr/ami_sft_7b.yaml). 1 node, 8 GPUs per node; see [Recipe Setup](#recipe-setup).
+
+Follow the [installation instructions](/get-started/installation).
 
 ## Available Models
 

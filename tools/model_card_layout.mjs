@@ -149,11 +149,50 @@ export function validateModelCard(source, template, format = "mdx", recipes = ne
       const table = content.find((node) => node.type === "table");
       if (
         !table ||
-        JSON.stringify(table.children[0].children.map(textContent)) !== JSON.stringify(["Goal", "Start Here"])
+        JSON.stringify(table.children[0].children.map(textContent)) !== JSON.stringify(["Workflow", "Example Setup", "Recipe"])
       ) {
-        report(heading, "Choose a Workflow requires a direct Goal | Start Here table");
+        report(heading, "Choose a Workflow requires a direct Workflow | Example Setup | Recipe table");
       } else if (table.children.length < 2) {
         report(table, "Choose a Workflow requires at least one data row");
+      }
+      if (content.filter((node) => hasContent([node])).length !== 1 || !table) {
+        report(heading, "Choose a Workflow must contain only one direct workflow table; move notes to Model Context");
+      }
+      const choices = new Set();
+      for (const row of table?.children.slice(1) ?? []) {
+        if (row.children.length !== 3) {
+          report(row, "each workflow row requires exactly three cells: Workflow, Example Setup, Recipe");
+        }
+        for (const [index, label, maxWords, maxCharacters] of [
+          [0, "Workflow", 8, 80],
+          [1, "Example Setup", 12, 120],
+        ]) {
+          const cell = row.children[index];
+          const value = cell ? textContent(cell).trim() : "";
+          if (!value || /^(?:-|n\/a|tbd|unknown|none|\?)$/i.test(value)) {
+            report(row, `${label} must contain a meaningful value, not a placeholder`);
+          }
+          if (value.split(/\s+/).length > maxWords || value.length > maxCharacters) {
+            report(row, `${label} exceeds ${maxWords} words or ${maxCharacters} characters; move details to Model Context`);
+          }
+          if (cell && (descendants(cell, "link").length || descendants(cell, "linkReference").length)) {
+            report(row, `${label} must describe the choice; put links in Recipe or Model Context`);
+          }
+        }
+        if (/primary recipe|alternate recipe|another checked-in recipe|model-specific recipe|prepare your environment|explore checkpoints|configure nemo automodel/i.test(textContent(row.children[0] ?? {}))) {
+          report(row, "Workflow must name an operation such as fine-tuning, pretraining, generation, or benchmarking");
+        }
+        const choice = row.children.slice(0, 2).map((cell) => textContent(cell).trim().toLowerCase()).join("\0");
+        if (choices.has(choice)) report(row, "workflow choices must differ in Workflow or Example Setup");
+        choices.add(choice);
+        const recipeCell = row.children[2];
+        if (
+          recipeCell?.children.length !== 1 ||
+          !["link", "linkReference"].includes(recipeCell.children[0].type) ||
+          textContent(recipeCell) !== "View YAML"
+        ) {
+          report(row, 'Recipe must contain only one direct YAML link labeled "View YAML"');
+        }
       }
     }
     if (["Model Context", "Available Models"].includes(name)) {
@@ -413,22 +452,27 @@ function validateRecipes(nodes, headings, modelId, recipes, report) {
   const workflow = area("Choose a Workflow").find((node) => node.type === "table");
   const workflowRecipes = new Map();
   for (const row of workflow?.children.slice(1) ?? []) {
-    const recipeLinks = links([row], definitions)
+    const cellLinks = links(row.children[2] ? [row.children[2]] : [], definitions);
+    const recipeLinks = cellLinks
       .map((link) => recipePath(link.url))
-      .filter(Boolean);
-    if (!links([row], definitions).length) report(row, "each workflow row must contain a link");
+      .filter((file) => file && /\.ya?ml$/.test(file));
+    if (cellLinks.length !== 1 || recipeLinks.length !== 1) {
+      report(row, "each Recipe cell must link directly to one checked-in examples YAML; move guides to Model Context");
+    }
     for (const file of recipeLinks) {
-      const matches = [...recipes].filter(([name]) => name === file || name.startsWith(file.replace(/\/$/, "") + "/"));
-      if (!matches.length) report(row, `workflow recipe path does not exist: ${file}`);
-      for (const [name, config] of matches) {
-        const id = effectiveModel(config, textContent(row));
-        if (!listed(id))
-          report(
-            row,
-            `workflow recipe targets ${id ?? "an unspecified model"}, which is absent from Available Models: ${name}`,
-          );
-        workflowRecipes.set(name, id);
+      const config = recipes.get(file);
+      if (!config) {
+        report(row, `workflow recipe path does not exist: ${file}`);
+        continue;
       }
+      if (workflowRecipes.has(file)) report(row, `workflow recipe is listed more than once: ${file}`);
+      const id = effectiveModel(config, textContent(row));
+      if (!listed(id))
+        report(
+          row,
+          `workflow recipe targets ${id ?? "an unspecified model"}, which is absent from Available Models: ${file}`,
+        );
+      workflowRecipes.set(file, id);
     }
   }
   for (const [file, id] of quickRecipes) {

@@ -19,10 +19,9 @@ uv run torchrun --nnodes 2 --nproc-per-node 8 \
 
 ## Choose a Workflow
 
-| Goal | Start Here |
-| --- | --- |
-| Fine-tune Qwen/Qwen3.5-27B | [qwen3_5_27b_tp4pp4.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5/qwen3_5_27b_tp4pp4.yaml). 2 nodes, 8 GPUs per node; see [Recipe Setup](#recipe-setup). |
-| Prepare your environment | Follow the [installation instructions](/get-started/installation). |
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Vision-Language Fine-Tuning | MedPix-VQA; 2 nodes; TP4; PP4 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5/qwen3_5_27b_tp4pp4.yaml) |
 
 ## Model Context
 
@@ -59,6 +58,12 @@ Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node 
 ### Recipe Setup
 
 Read [qwen3_5_27b_tp4pp4.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5/qwen3_5_27b_tp4pp4.yaml) for checkpoint access, data paths, and backend dependencies. Use the [Slurm launcher guide](/job-launchers/slurm-cluster) to prepare the distributed allocation.
+
+### Workflow Notes
+
+Fine-tune Qwen/Qwen3.5-27B: [qwen3_5_27b_tp4pp4.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5/qwen3_5_27b_tp4pp4.yaml). 2 nodes, 8 GPUs per node; see [Recipe Setup](#recipe-setup).
+
+Follow the [installation instructions](/get-started/installation).
 
 ## Available Models
 

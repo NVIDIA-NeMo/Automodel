@@ -18,10 +18,10 @@ uv run torchrun --nnodes 2 --nproc-per-node 8 \
 
 ## Choose a Workflow
 
-| Goal | Start Here |
-| --- | --- |
-| Fine-tune poolside/Laguna-S-2.1 | [laguna_s_2p1_hellaswag_ep16.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/laguna/laguna_s_2p1_hellaswag_ep16.yaml). 2 nodes, 8 GPUs per node; see [Recipe Setup](#recipe-setup). |
-| SFT - Laguna XS 2.1 on HellaSwag with EP8 and 1K NEAT sequence packing | [laguna_xs_2p1_hellaswag_ep8.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/laguna/laguna_xs_2p1_hellaswag_ep8.yaml) |
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Full Fine-Tuning | HellaSwag; 2 nodes; EP16 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/laguna/laguna_s_2p1_hellaswag_ep16.yaml) |
+| Full Fine-Tuning (Packed Sequences) (Laguna-XS-2.1) | HellaSwag; 1 node; EP8; 1,024-token packs | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/laguna/laguna_xs_2p1_hellaswag_ep8.yaml) |
 
 ## Model Context
 
@@ -64,6 +64,10 @@ The Laguna XS 2.1 recipe uses `ep_size: 8` on one 8-GPU node and packs documents
 ### Recipe Setup
 
 Read [laguna_s_2p1_hellaswag_ep16.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/laguna/laguna_s_2p1_hellaswag_ep16.yaml) for checkpoint access, data paths, and backend dependencies. Use the [Slurm launcher guide](/job-launchers/slurm-cluster) to prepare the distributed allocation.
+
+### Workflow Notes
+
+Fine-tune poolside/Laguna-S-2.1: [laguna_s_2p1_hellaswag_ep16.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/laguna/laguna_s_2p1_hellaswag_ep16.yaml). 2 nodes, 8 GPUs per node; see [Recipe Setup](#recipe-setup).
 
 ## Available Models
 

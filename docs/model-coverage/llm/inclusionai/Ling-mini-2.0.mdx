@@ -20,11 +20,11 @@ automodel examples/llm_finetune/ling/ling_mini_2_0_squad.yaml --nproc-per-node 1
 
 ## Choose a Workflow
 
-| Goal | Start Here |
-| --- | --- |
-| Low-rank adaptation (LoRA) SFT - Ling-mini-2.0 on SQuAD | Use [ling_mini_2_0_squad.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/ling/ling_mini_2_0_squad.yaml). Minimum hardware: 2x H100 80GB. |
-| Low-rank adaptation (LoRA) SFT - Ling-mini-2.0 on HellaSwag | Use [ling_mini_2_0_hellaswag.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/ling/ling_mini_2_0_hellaswag.yaml). Minimum hardware: 2x H100 80GB. |
-| Full SFT - Ling-mini-2.0 on HellaSwag, FSDP2 + EP=8 | Use [ling_mini_2_0_sft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/ling/ling_mini_2_0_sft.yaml). Minimum hardware: 8x H100 80GB. |
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| LoRA Fine-Tuning | SQuAD; EP4 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/ling/ling_mini_2_0_squad.yaml) |
+| LoRA Fine-Tuning | HellaSwag; EP4 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/ling/ling_mini_2_0_hellaswag.yaml) |
+| Full Fine-Tuning | HellaSwag; 1 node; EP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/ling/ling_mini_2_0_sft.yaml) |
 
 ## Model Context
 

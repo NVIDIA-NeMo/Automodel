@@ -21,11 +21,9 @@ uv run automodel examples/llm_finetune/mistral/ministral3_3b_squad.yaml \
 
 ## Choose a Workflow
 
-| Goal | Start Here |
-| --- | --- |
-| Fine-tune mistralai/Ministral-3-3B-Instruct-2512 | [ministral3_3b_squad.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mistral/ministral3_3b_squad.yaml). Use the Quick Start command above. |
-| Explore checkpoints | See [Available Models](#available-models). |
-| Configure NeMo AutoModel | Follow the [installation instructions](/get-started/installation). |
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Full Fine-Tuning | SQuAD | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mistral/ministral3_3b_squad.yaml) |
 
 ## Model Context
 
@@ -43,6 +41,12 @@ Ministral-3-3B-Instruct-2512 is used for text generation. Its model size is 3B p
 | Context Length | 262,144 tokens (checkpoint configuration) |
 | Vocabulary Size | 131,072 |
 | Configured Dtype | `bfloat16` |
+
+### Workflow Notes
+
+See [Available Models](#available-models).
+
+Follow the [installation instructions](/get-started/installation).
 
 ## Available Models
 

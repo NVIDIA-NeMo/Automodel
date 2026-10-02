@@ -20,10 +20,10 @@ uv run torchrun --nnodes 4 --nproc-per-node 8 \
 
 ## Choose a Workflow
 
-| Goal | Start Here |
-| --- | --- |
-| Fine-tune nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16 | [nemotron_super_v3_hellaswag.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_super_v3_hellaswag.yaml). 4 nodes, 8 GPUs per node; see [Recipe Setup](#recipe-setup). |
-| Try another checked-in recipe for this model | Use the [alternate recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/nemotron/nemotron_super_v3_lora.yaml). |
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Full Fine-Tuning | HellaSwag; 4 nodes; EP32 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_super_v3_hellaswag.yaml) |
+| LoRA Training Benchmark | Synthetic data; 8 nodes; EP64 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/nemotron/nemotron_super_v3_lora.yaml) |
 
 ## Model Context
 
@@ -68,6 +68,10 @@ Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node 
 ### Recipe Setup
 
 Read [nemotron_super_v3_hellaswag.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_super_v3_hellaswag.yaml) for checkpoint access, data paths, and backend dependencies. Use the [Slurm launcher guide](/job-launchers/slurm-cluster) to prepare the distributed allocation.
+
+### Workflow Notes
+
+Fine-tune nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16: [nemotron_super_v3_hellaswag.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_super_v3_hellaswag.yaml). 4 nodes, 8 GPUs per node; see [Recipe Setup](#recipe-setup).
 
 ## Available Models
 

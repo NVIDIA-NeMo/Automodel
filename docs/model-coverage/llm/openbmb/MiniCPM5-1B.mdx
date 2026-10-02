@@ -22,12 +22,10 @@ uv run automodel examples/llm_finetune/minicpm/minicpm5_1b_squad_peft.yaml --npr
 
 ## Choose a Workflow
 
-| Goal | Start Here |
-| --- | --- |
-| Fine-tune openbmb/MiniCPM5-1B | [minicpm5_1b_squad.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/minicpm/minicpm5_1b_squad.yaml). Use the Quick Start command above. |
-| Explore checkpoints | See [Available Models](#available-models). |
-| Configure NeMo AutoModel | Follow the [installation instructions](/get-started/installation). |
-| Fine-tune with LoRA | [minicpm5_1b_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/minicpm/minicpm5_1b_squad_peft.yaml) |
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Full Fine-Tuning | SQuAD; 1 node | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/minicpm/minicpm5_1b_squad.yaml) |
+| LoRA Fine-Tuning | SQuAD; 1 node | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/minicpm/minicpm5_1b_squad_peft.yaml) |
 
 ## Model Context
 
@@ -49,6 +47,12 @@ MiniCPM5-1B is used for text generation. Its model size is 1B parameters.
 - `MiniCPMForCausalLM` - MiniCPM v1/v2
 - `MiniCPM3ForCausalLM` - MiniCPM3
 - `MiniCPM5ForCausalLM` - MiniCPM5
+
+### Workflow Notes
+
+See [Available Models](#available-models).
+
+Follow the [installation instructions](/get-started/installation).
 
 ## Available Models
 

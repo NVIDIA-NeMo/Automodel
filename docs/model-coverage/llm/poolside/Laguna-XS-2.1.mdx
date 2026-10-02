@@ -17,10 +17,9 @@ automodel examples/llm_finetune/laguna/laguna_xs_2p1_hellaswag_ep8.yaml --nproc-
 
 ## Choose a Workflow
 
-| Goal | Start Here |
-| --- | --- |
-| Run the primary recipe for this model | Use the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/laguna/laguna_xs_2p1_hellaswag_ep8.yaml). |
-| Prepare your environment | Follow the [installation instructions](/get-started/installation). |
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Full Fine-Tuning (Packed Sequences) | HellaSwag; 1 node; EP8; 1,024-token packs | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/laguna/laguna_xs_2p1_hellaswag_ep8.yaml) |
 
 ## Model Context
 
@@ -48,6 +47,10 @@ Laguna-XS-2.1 is used for text generation. Its model size is 33.44B checkpoint p
 | Nodes | 1 |
 | Features | Activation checkpointing (activation_checkpointing=true), Packed sequences (packed_sequence_size=1024) |
 | Advanced | bfloat16, attention=sdpa, linear=torch, experts=torch_mm, dispatcher=torch |
+
+### Workflow Notes
+
+Follow the [installation instructions](/get-started/installation).
 
 ## Available Models
 

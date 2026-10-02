@@ -18,12 +18,12 @@ uv run torchrun --nnodes 16 --nproc-per-node 8 \
 
 ## Choose a Workflow
 
-| Goal | Start Here |
-| --- | --- |
-| Fine-tune MiniMaxAI/MiniMax-M3 | [minimax_m3_vl_sft_ep32pp4.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/minimax_m3/minimax_m3_vl_sft_ep32pp4.yaml). 16 nodes, 8 GPUs per node; see [Recipe Setup](#recipe-setup). |
-| Full SFT - MedPix CP2 comparison | [Full SFT - MedPix CP2 comparison](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/minimax_m3/minimax_m3_vl_sft_cp2_medpix_2k.yaml) |
-| Full SFT - Tulu 3 text, CP8 | [Full SFT - Tulu 3 text, CP8](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/minimax_m3/minimax_m3_vl_sft_tulu3_text_cp8_16k.yaml) |
-| LoRA - MedPix, PP4 + EP8 | [LoRA - MedPix, PP4 + EP8](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/minimax_m3/minimax_m3_vl_lora_pp4ep8_8node.yaml) |
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Vision-Language Fine-Tuning | MedPix-VQA; 16 nodes; PP4; EP32 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/minimax_m3/minimax_m3_vl_sft_ep32pp4.yaml) |
+| Vision-Language Fine-Tuning | MedPix-VQA; 16 nodes; PP4; CP2; EP32 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/minimax_m3/minimax_m3_vl_sft_cp2_medpix_2k.yaml) |
+| Text Fine-Tuning | Tulu-3; 16 nodes; PP4; CP8; EP32 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/minimax_m3/minimax_m3_vl_sft_tulu3_text_cp8_16k.yaml) |
+| LoRA Fine-Tuning | MedPix-VQA; 8 nodes; PP4; EP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/minimax_m3/minimax_m3_vl_lora_pp4ep8_8node.yaml) |
 
 ## Model Context
 
@@ -82,6 +82,10 @@ before launching a recipe.
 ### Recipe Setup
 
 Read [minimax_m3_vl_sft_ep32pp4.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/minimax_m3/minimax_m3_vl_sft_ep32pp4.yaml) for checkpoint access, data paths, and backend dependencies. Use the [Slurm launcher guide](/job-launchers/slurm-cluster) to prepare the distributed allocation.
+
+### Workflow Notes
+
+Fine-tune MiniMaxAI/MiniMax-M3: [minimax_m3_vl_sft_ep32pp4.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/minimax_m3/minimax_m3_vl_sft_ep32pp4.yaml). 16 nodes, 8 GPUs per node; see [Recipe Setup](#recipe-setup).
 
 ## Available Models
 

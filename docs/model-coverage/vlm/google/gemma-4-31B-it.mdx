@@ -18,12 +18,13 @@ uv run automodel examples/vlm_finetune/gemma4/gemma4_31b.yaml --nproc-per-node 8
 
 ## Choose a Workflow
 
-| Goal | Start Here |
-| --- | --- |
-| Fine-tune on MedPix-VQA | Use [gemma4_31b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_31b.yaml). |
-| Fine-tune with LoRA | Use [gemma4_31b_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_31b_peft.yaml). |
-| Fine-tune with tensor parallelism | Use [gemma4_31b_tp4.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_31b_tp4.yaml). |
-| Fine-tune with tensor and pipeline parallelism | Use [gemma4_31b_tp4_pp2.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_31b_tp4_pp2.yaml) or the [multi-node PP4 recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_31b_tp4_pp4.yaml). |
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Vision-Language Fine-Tuning | MedPix-VQA | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_31b.yaml) |
+| LoRA Fine-Tuning | MedPix-VQA | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_31b_peft.yaml) |
+| Vision-Language Fine-Tuning | MedPix-VQA; TP4 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_31b_tp4.yaml) |
+| Vision-Language Fine-Tuning | MedPix-VQA; TP4; PP2 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_31b_tp4_pp2.yaml) |
+| Vision-Language Fine-Tuning | MedPix-VQA; 4 nodes; TP4; PP4 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_31b_tp4_pp4.yaml) |
 
 ## Model Context
 

@@ -20,12 +20,12 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/gpt_oss/gpt_oss_20b.ya
 
 ## Choose a Workflow
 
-| Goal | Start Here |
-| --- | --- |
-| Full-parameter fine-tuning | Use the [full-parameter recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gpt_oss/gpt_oss_20b.yaml). |
-| LoRA fine-tuning | Use the [LoRA recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gpt_oss/gpt_oss_20b_peft.yaml). |
-| Fine-tuning with 1,024-token packed sequences | Use the [packed-sequence recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gpt_oss/gpt_oss_20b_te_packed_sequence.yaml). |
-| LoRA fine-tuning on DGX Spark | Use the [DGX Spark recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gpt_oss/gpt_oss_20b_single_gpu_peft.yaml). |
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Full Fine-Tuning | HellaSwag; EP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gpt_oss/gpt_oss_20b.yaml) |
+| LoRA Fine-Tuning | HellaSwag; EP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gpt_oss/gpt_oss_20b_peft.yaml) |
+| Full Fine-Tuning (Packed Sequences) | HellaSwag; EP8; 1,024-token packs | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gpt_oss/gpt_oss_20b_te_packed_sequence.yaml) |
+| LoRA Fine-Tuning | HellaSwag; DGX Spark | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gpt_oss/gpt_oss_20b_single_gpu_peft.yaml) |
 
 ## Model Context
 

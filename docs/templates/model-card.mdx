@@ -23,13 +23,17 @@ Every card must have a recipe; setup prose alone does not satisfy Quick Start.
 
 ## Choose a Workflow
 
-| Goal | Start Here |
-| --- | --- |
-| Fine-tune this checkpoint | Link the same checked-in YAML as Quick Start and describe its hardware and data requirements. |
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Full Fine-Tuning | SQuAD; 8-GPU launch | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/MODEL/MODEL_squad.yaml) |
 
 Each recipe must load a checkpoint listed in Available Models. Link additional
 recipes for this model, such as LoRA, packed sequences, or pretraining, when they
 exist. Keep the initial command and its corresponding table row consistent.
+Name the operation in Workflow (at most eight words). Put the dataset and key
+requirements in Example Setup (at most 12 words). Use one direct, checked-in
+YAML link labeled "View YAML" in Recipe. Each recipe appears once. Move setup
+guides, extra commands, and detailed settings to Model Context.
 
 ## Model Context
 
