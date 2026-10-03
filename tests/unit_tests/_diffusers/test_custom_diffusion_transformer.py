@@ -511,15 +511,18 @@ def test_toy_moe_dit_matches_simple_adapter_contract_and_round_trips_hf_keys(tmp
 
     latents = torch.randn(2, config.in_channels, 2, 4, 4)
     adapter = SimpleAdapter()
-    prediction = adapter.forward(
-        model,
-        {
-            "hidden_states": latents,
-            "timestep": torch.tensor([10.0, 900.0]),
-            "encoder_hidden_states": torch.randn(2, 8, config.text_embed_dim),
-            "attention_kwargs": {"scale": 1.0},
-        },
-    )
-    assert prediction.shape == latents.shape
-    prediction.float().pow(2).mean().backward()
+    # The contract does not depend on kernel fusion: eager mode skips the CPU inductor build of the
+    # compiled MoE/norm helpers, which alone exceeds this test's runtime budget.
+    with torch.compiler.set_stance("force_eager"):
+        prediction = adapter.forward(
+            model,
+            {
+                "hidden_states": latents,
+                "timestep": torch.tensor([10.0, 900.0]),
+                "encoder_hidden_states": torch.randn(2, 8, config.text_embed_dim),
+                "attention_kwargs": {"scale": 1.0},
+            },
+        )
+        assert prediction.shape == latents.shape
+        prediction.float().pow(2).mean().backward()
     assert model.model.layers["0"].mlp.experts.gate_and_up_projs.grad is not None
