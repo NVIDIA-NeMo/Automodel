@@ -1112,12 +1112,11 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         """
         for mp in self.model_parts:
             mp.train()
-        self.timestamp = time.perf_counter()
-
         pbar = self._make_progress_bar()
         try:
             for epoch in self.step_scheduler.epochs:
                 self.step_scheduler.set_epoch(epoch)
+                self.timestamp = time.perf_counter()
                 # The step scheduler yields a list of batches with the following properties:
                 # 1. len(batches) == grad_acc_steps
                 # 2. len(batches[0]) == batch_size
@@ -1177,6 +1176,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                             best_metric_key=self.best_metric_key,
                         )
                     self._maybe_collect_garbage()
+                    # Exclude host time spent between steps. Let asynchronous work
+                    # overlap the next step rather than draining all CUDA streams.
+                    self.timestamp = time.perf_counter()
         finally:
             if pbar is not None:
                 pbar.close()
@@ -1551,37 +1553,27 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # self.model_parts[0].install_optimized_model_weights()
         # self.model_parts[0].zero_grad_buffer()
 
-        t = time.perf_counter()
-        time_delta = t - self.timestamp
-        self.timestamp = t
-        tps = num_tokens_in_batch / time_delta
-
-        mfu = None
+        step_flops = None
         mfu_calculator = getattr(self, "mfu_calculator", None)
         if batches and mfu_calculator is not None:
             step_flops = 0.0
-            flops_supported = True
             for batch in batches:
                 input_ids = batch.get("input_ids")
                 if input_ids is None:
-                    flops_supported = False
+                    step_flops = None
                     break
                 batch_flops = mfu_calculator.get_flops(input_ids)
                 if batch_flops is None:
-                    flops_supported = False
+                    step_flops = None
                     break
                 step_flops += float(batch_flops)
 
-            if flops_supported:
+            if step_flops is not None:
+                # These are full input shapes before CP sharding. Only DP ranks
+                # consume distinct batches; reducing over CP would count them twice.
                 step_flops = self._dp_allreduce(
-                    torch.tensor(step_flops, dtype=torch.float64, device=self.dist_env.device), include_cp=True
+                    torch.tensor(step_flops, dtype=torch.float64, device=self.dist_env.device)
                 ).item()
-                mfu = calculate_mfu(
-                    step_flops / 1e12,
-                    self.dist_env.world_size,
-                    time_delta,
-                    reference_mfu=mfu_calculator.reference_mfu,
-                )
 
         reporting_loss = torch.sum(torch.stack(loss_buffer))
         reporting_loss = self._dp_allreduce(reporting_loss, include_cp=True)
@@ -1591,7 +1583,23 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             reporting_loss = self._broadcast_from_last_pp_stage(reporting_loss)
 
         reporting_loss = reporting_loss.cpu().item()
-        # fix reporting_loss, tps across ranks
+        # Like TorchTitan, time after the existing loss readback rather than
+        # adding a device-wide synchronization for throughput measurement.
+        # Include data loading and metric reductions in the same step window.
+        time_delta = time.perf_counter() - self.timestamp
+        tps = num_tokens_in_batch / time_delta
+        tflops_per_sec = None
+        tflops_per_sec_per_gpu = None
+        mfu = None
+        if step_flops is not None:
+            tflops_per_sec = step_flops / time_delta / 1e12
+            tflops_per_sec_per_gpu = tflops_per_sec / self.dist_env.world_size
+            mfu = calculate_mfu(
+                step_flops / 1e12,
+                self.dist_env.world_size,
+                time_delta,
+                reference_mfu=mfu_calculator.reference_mfu,
+            )
 
         metrics = {
             "loss": reporting_loss,
@@ -1603,6 +1611,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             # the DP group), so per-GPU must divide by the full world size.
             # Dividing by dp*cp alone inflates it by the pp (and tp) factor.
             "tps_per_gpu": tps / max(self.dist_env.world_size, 1),
+            "step_time": time_delta,
+            "tflops_per_sec": tflops_per_sec,
+            "tflops_per_sec_per_gpu": tflops_per_sec_per_gpu,
             "mfu": mfu,
             "num_tokens_per_step": num_tokens_in_batch,
             "num_label_tokens": num_label_tokens,
@@ -1820,6 +1831,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     "mem": Memory allocated.
                     "tps": Tokens per second.
                     "tps_per_gpu": Tokens per second per GPU.
+                    "step_time": Training wall time including data loading and metric reductions.
+                    "tflops_per_sec": Estimated model TFLOPs/s across all GPUs.
+                    "tflops_per_sec_per_gpu": Estimated model TFLOPs/s per GPU.
                     "num_label_tokens": Number of label tokens.
         """
         if not self.dist_env.is_main:
@@ -1849,19 +1863,22 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         # JSONL training log (always log for detailed local records)
         self.metric_logger_train.log(log_data)
-        logging.info(
-            "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | tps {:.2f}({:.2f}/gpu) | num_label_tokens {}".format(
-                log_data.step,
-                log_data.epoch,
-                log_data.metrics["loss"],
-                log_data.metrics["grad_norm"],
-                log_data.metrics["lr"],
-                log_data.metrics["mem"],
-                log_data.metrics["tps"],
-                log_data.metrics["tps_per_gpu"],
-                log_data.metrics["num_label_tokens"],
-            )
+        message = "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | tps {:.2f}({:.2f}/gpu) | num_label_tokens {}".format(
+            log_data.step,
+            log_data.epoch,
+            log_data.metrics["loss"],
+            log_data.metrics["grad_norm"],
+            log_data.metrics["lr"],
+            log_data.metrics["mem"],
+            log_data.metrics["tps"],
+            log_data.metrics["tps_per_gpu"],
+            log_data.metrics["num_label_tokens"],
         )
+        if log_data.metrics.get("tflops_per_sec") is not None:
+            message += " | model TFLOPs/s {:.2f}({:.2f}/gpu)".format(
+                log_data.metrics["tflops_per_sec"], log_data.metrics["tflops_per_sec_per_gpu"]
+            )
+        logging.info(message)
         torch.cuda.reset_peak_memory_stats()
 
 
