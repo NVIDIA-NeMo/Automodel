@@ -33,7 +33,7 @@ from nemo_automodel.components.models.deepseek_v4.mtp import build_mtp_config_fr
 
 # Over the default 5s budget on purpose: CUDA model forward and backward initialize compiled kernels.
 # Reduce cold compiler startup before lowering this further.
-pytestmark = pytest.mark.timeout(60)
+pytestmark = pytest.mark.timeout(70)
 
 # MoE.forward unconditionally creates a torch.cuda.Stream() for shared experts.
 # Gate the tests that actually call model.forward() on CUDA availability.

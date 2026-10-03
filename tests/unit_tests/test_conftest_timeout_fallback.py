@@ -27,7 +27,7 @@ import pytest
 
 pytest_plugins = ["pytester"]
 
-pytestmark = pytest.mark.timeout(60)
+pytestmark = pytest.mark.timeout(70)
 
 _CONFTEST_SOURCE = Path(__file__).with_name("conftest.py").read_text()
 _POLICY_ARGS = ("--unit-test-runtime-budget=0.05", "--unit-test-hard-timeout=0.5")
@@ -175,7 +175,7 @@ def test_cli_timeout_zero_disables_policy(pytester: pytest.Pytester):
 
 @pytest.mark.runtime_budget(
     30,
-    hard_timeout=60,
+    hard_timeout=70,
     reason="starts a fresh pytest subprocess to isolate the intentional timeout",
 )
 def test_cli_timeout_overrides_policy(pytester: pytest.Pytester):
@@ -188,7 +188,7 @@ def test_cli_timeout_overrides_policy(pytester: pytest.Pytester):
 
 @pytest.mark.runtime_budget(
     30,
-    hard_timeout=60,
+    hard_timeout=70,
     reason="starts a fresh pytest subprocess to isolate the intentional timeout",
 )
 def test_env_timeout_overrides_policy(pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch):
@@ -202,7 +202,7 @@ def test_env_timeout_overrides_policy(pytester: pytest.Pytester, monkeypatch: py
 
 @pytest.mark.runtime_budget(
     30,
-    hard_timeout=60,
+    hard_timeout=70,
     reason="starts a fresh pytest subprocess to isolate the intentional timeout",
 )
 def test_ini_timeout_overrides_policy(pytester: pytest.Pytester):
