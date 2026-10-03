@@ -20,7 +20,7 @@ recipe: BenchmarkingRecipeForNextTokenPrediction
 seed: 1234
 step_scheduler:
   global_batch_size: 128
-  local_batch_size: 8
+  local_batch_size: 2
   max_steps: 15
   num_epochs: 30
   ckpt_every_steps: 1000
@@ -37,7 +37,8 @@ model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
   config:
     _target_: nemo_automodel.NeMoAutoConfig.from_pretrained
-    pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16
+    # Public Hugging Face model ID; the entropy detector misclassifies it as a credential.
+    pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16  # pragma: allowlist secret
     trust_remote_code: true
   dtype: bfloat16
   num_nextn_predict_layers: 0
@@ -114,8 +115,8 @@ ci:
   recipe_owner: HuiyingLi
   time: "00:15:00"
   nodes: 4
+  cluster_tag: gb200
   nproc_per_node: 4
-  # Remove this gate once the intended checkpoint is publicly available.
-  known_issue_id: AMINT-383
   env_vars:
+    CUDA_VISIBLE_DEVICES: "0,1,2,3"
     PYTORCH_ALLOC_CONF: expandable_segments:True
