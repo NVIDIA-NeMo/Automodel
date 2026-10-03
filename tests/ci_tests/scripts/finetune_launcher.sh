@@ -56,12 +56,14 @@ fi
 
 # --- Pick executor ---
 NPROC_PER_NODE=${CONFIG_NPROC_PER_NODE:-$NPROC_PER_NODE}
+# C10d uses read_timeout for the initial TCPStore connection; "timeout" leaves
+# that at 60 seconds, which can expire while other nodes import the container.
 CMD="torchrun --nproc-per-node=${NPROC_PER_NODE} \
               --nnodes=${TEST_NODE_COUNT} \
               --rdzv_backend=c10d \
               --rdzv_endpoint=${MASTER_ADDR}:${MASTER_PORT} \
               --rdzv_id=${SLURM_JOB_ID} \
-              --rdzv_conf=timeout=${RDZV_TIMEOUT:-600}"
+              --rdzv_conf=read_timeout=${RDZV_TIMEOUT:-600},join_timeout=${RDZV_TIMEOUT:-600}"
 if [ "$EXEC_CMD" = "python" ]; then CMD="python"; fi
 if [ "$EXEC_CMD" = "uv_python" ]; then CMD="uv run python"; fi
 
