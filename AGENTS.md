@@ -32,10 +32,10 @@ covers; skills are mandatory context, not optional background reading.
 
 ## Development Review Policy
 
-`.github/workflows/claude-review.yml` is mandatory development guidance, not
-only configuration for the automated reviewer. For every repository change,
+`skills/pr-review/SKILL.md` is mandatory development guidance, not
+only guidance for the automated reviewer. For every repository change,
 after reading the relevant skills and before planning or editing, read
-`jobs.claude-review.with.prompt` from the trusted checkout. Apply every relevant
+the repository policy from the trusted checkout. Apply every relevant
 review criterion proactively while designing, implementing, and testing the
 change; do not wait for the review bot to identify violations.
 
@@ -288,7 +288,7 @@ skills are mandatory context, not optional background reading.**
 2. **Select and invoke the skill.** Based on what you just read, identify
    the relevant skill and invoke it before forming any answer or plan.
 3. **Load development review guidance.** For repository changes, read
-   `jobs.claude-review.with.prompt` in `.github/workflows/claude-review.yml` and
+   `skills/pr-review/SKILL.md` and
    apply the relevant criteria as a pre-implementation checklist.
 4. **Answer or implement.** Only after the skill and review guidance are loaded,
    use their context to reason, diagnose, or write code.

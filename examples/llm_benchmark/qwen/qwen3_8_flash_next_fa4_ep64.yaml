@@ -39,6 +39,15 @@ recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 seed: 1234
 
+benchmark:
+  warmup_steps: 20
+  peak_tflops: 989  # H100 BF16 dense peak TFLOPs
+  nsys_start: -1
+  nsys_end: -1
+  nsys_ranks: []
+  num_nodes: 8
+  json_output_path: training_logs/qwen3_8_flash_next_fa4_ep64.json
+
 step_scheduler:
   global_batch_size: 64
   local_batch_size: 1
@@ -210,3 +219,8 @@ ci:
   recipe_owner: huiyingl
   nodes: 8
   time: "00:35:00"
+  # The image's injected NCCL network provider corrupts cross-node Engram
+  # payloads on H100 + InfiniBand; use NCCL's internal IB path (issue #3959).
+  env_vars:
+    NCCL_NET_PLUGIN: none
+    NCCL_NET: IB

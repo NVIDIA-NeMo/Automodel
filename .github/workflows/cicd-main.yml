@@ -95,10 +95,18 @@ jobs:
         run: |
           source ./venv/bin/activate
           uv run --active bandit -r app.py nemo_automodel examples scripts tools tutorials -t B614
+      - name: Reject unsafe NumPy load/save calls
+        run: |
+          source ./venv/bin/activate
+          uv run --active python tools/lint_numpy_pickle.py
       - name: Reject globals()
         run: |
           source ./venv/bin/activate
           uv run --active python tools/lint_no_globals.py
+      - name: Enforce model parallelizer contract
+        run: |
+          source ./venv/bin/activate
+          uv run --active python tools/lint_model_parallelizer_contract.py
 
   import_linting:
     runs-on: ${{ vars.LINT_AND_INSTALL_TEST_RUNNER || 'ubuntu-latest' }}
@@ -402,9 +410,12 @@ jobs:
           platforms: ${{ steps.platform.outputs.platforms }}
           # Opt-in build parallelism (Dockerfile defaults keep the serial/lower values). Any
           # consumer sharing this BuildKit cache must pass identical values to hit the same layers.
+          # Bake VLM media dependencies into CI images so tests do not install packages.
+          # Media remains opt-in for builds outside this workflow.
           # Keep comments out of the block below: build-push-action passes `#` lines through.
           build-args: |
             BASE_IMAGE=pytorch
+            UV_SYNC_ARGS=--locked --extra vlm-media
             FA3_MAX_JOBS=24
             UV_SYNC_MAX_JOBS=24
             BNB_BUILD_MAX_JOBS=8
