@@ -144,8 +144,7 @@ def test_moe_config_rejects_unsupported_layouts(overrides, message):
 
 def test_checkpoint_config_resolves_to_local_class(tmp_path):
     """The release config.json (with remote-code auto_map) loads without trust_remote_code."""
-    from nemo_automodel._diffusers.auto_diffusion_pipeline import _has_custom_model
-    from nemo_automodel._transformers.model_init import get_hf_config
+    from nemo_automodel._transformers.model_init import get_hf_config, get_is_hf_model
 
     config = {
         "architectures": ["HunyuanImage3ForCausalMM"],
@@ -161,7 +160,8 @@ def test_checkpoint_config_resolves_to_local_class(tmp_path):
     assert isinstance(resolved, HunyuanImage3Config)
     assert resolved.moe_topk == [8, 8] and resolved.head_dim == 128
     assert _model_dtype(resolved) == torch.bfloat16
-    assert _has_custom_model(str(tmp_path))
+    # The diffusion pipeline builds the transformer from the custom implementation when this is False.
+    assert not get_is_hf_model(resolved, force_hf=False)
 
 
 def test_tied_embeddings_are_rejected():
