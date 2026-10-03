@@ -486,6 +486,42 @@ class TestQwen3_5MoeModel:
         with pytest.raises(ValueError, match="Either input_ids or inputs_embeds"):
             core.forward()
 
+    def test_forward_with_image_builds_mrope_position_ids(self, vl_config, backend_config, moe_config, device):
+        """With media, the HF VL forward is called with input_ids=None and cannot build
+        M-RoPE positions itself, so they must be computed before the hand-off; otherwise
+        image tokens get 1-D sequential positions instead of their 2-D layout."""
+        vl_config.image_token_id, vl_config.video_token_id = 5, 6
+        vl_config.vision_start_token_id, vl_config.vision_end_token_id = 7, 8
+        model = Qwen3_5MoeForConditionalGeneration(vl_config, backend=backend_config, moe_config=moe_config).to(device)
+        core = model.model
+        dtype = next(model.parameters()).dtype
+
+        grid_h, grid_w = 3, 4  # spatial_merge_size=1: one image token per patch
+        input_ids = torch.tensor([[1, 7] + [5] * (grid_h * grid_w) + [8, 2, 3]], device=device)
+        vision = vl_config.vision_config
+        patch_dim = vision.in_channels * vision.temporal_patch_size * vision.patch_size**2
+        pixel_values = torch.randn(grid_h * grid_w, patch_dim, device=device, dtype=dtype)
+        image_grid_thw = torch.tensor([[1, grid_h, grid_w]], device=device)
+
+        with patch.object(core.language_model, "forward") as mock_lang_forward:
+            mock_lang_forward.return_value = MagicMock(
+                last_hidden_state=torch.zeros(
+                    1, input_ids.shape[1], vl_config.text_config.hidden_size, device=device, dtype=dtype
+                )
+            )
+            core.forward(
+                input_ids=input_ids,
+                pixel_values=pixel_values,
+                image_grid_thw=image_grid_thw,
+                mm_token_type_ids=(input_ids == 5).long(),
+            )
+
+        position_ids = mock_lang_forward.call_args.kwargs["position_ids"]
+        assert position_ids is not None, "no M-RoPE positions: image tokens fall back to 1-D positions"
+        image = input_ids[0] == 5
+        assert position_ids[1][0][image].unique().numel() == grid_h
+        assert position_ids[2][0][image].unique().numel() == grid_w
+
 
 # ---------------------------------------------------------------------------
 # Top-level conditional generation model tests
