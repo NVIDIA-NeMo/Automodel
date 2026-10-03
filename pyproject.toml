@@ -22,11 +22,6 @@ include-package-data = true
 [tool.setuptools.packages.find]
 include = ["nemo_automodel", "nemo_automodel.*"]
 
-[tool.setuptools.package-data]
-nemo_automodel = [
-    "components/datasets/llm/megatron/Makefile",
-]
-
 [tool.setuptools.dynamic]
 version = { attr = "nemo_automodel.package_info.__version__" } # any module attribute compatible with ast.literal_eval
 readme = { file = "README.md", content-type = "text/markdown" }
@@ -81,7 +76,7 @@ dependencies = [
     "datasets>=4.0.0",
     "megatron-fsdp==0.5.0",
     "mistral-common[audio,hf-hub,sentencepiece]",
-    "pybind11",
+    "ninja",
     "pyyaml",
     "tiktoken",
     "torch>=2.6.0",
@@ -117,10 +112,9 @@ cuda = [
     "causal-conv1d",
     "mamba-ssm",
     "nvidia-cudnn-frontend[cutedsl]>=1.27.0",
-    "nv-grouped-gemm",
     # This is required to prevent ONNX errors arising from TE
     "onnxscript>=0.5.6",
-    "transformer-engine[pytorch]>=2.14.1",
+    "transformer-engine[pytorch]>=2.19.0",
     # DeepSeek-V4 TileLang kernels (enable backend.attn="tilelang": sparse MLA
     # attention, lightning indexer, and the external TileKernels MHC sinkhorn).
     "tilelang>=0.1.11",
@@ -158,6 +152,11 @@ moe = [
     "nemo-automodel[cuda]",
     "nemo-automodel[fla]",
     "deep_ep",
+]
+# MoK is Blackwell-only and requires Python 3.12+ and a matching CUDA 13 toolkit.
+# Keep it opt-in, like msa, instead of adding hardware-specific builds to all.
+mok = [
+    "mixture-of-kittens; sys_platform == 'linux' and python_version >= '3.12'",
 ]
 vlm = [
     "backoff",
@@ -199,14 +198,14 @@ mlflow = [
     # mlflow-skinny: same Python tracking API, no server/UI/pyarrow/scipy/etc.
     # Avoids the mlflow vs mlflow-skinny mutual-exclusion conflict that breaks
     # environments using sagemaker-mlflow, kedro-mlflow, and managed ML platforms.
-    "mlflow-skinny",
+    "mlflow-skinny>=3.16.1",
 ]
 mlflow-full = [
     # Full mlflow stack: tracking server, UI, SQL backend, pyarrow, etc.
     # Use when you need the MLflow UI or sql:// artifact stores.
-    "mlflow",
+    "mlflow>=3.16.1",
 ]
-wandb = ["wandb>=0.28.0"]
+wandb = ["wandb>=0.30.0"]
 tracking = [
     # Convenience meta-extra: installs both experiment-tracking backends.
     "nemo-automodel[mlflow]",
@@ -261,7 +260,7 @@ test = [
     "pytest",
     "pytest-shard",
     "pytest-timeout",
-    "peft>=0.19.1",
+    "peft>=0.20.0",
     "ruamel.yaml",
     "onnxruntime-gpu; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
     "sentence-transformers>=5.6.0",
@@ -286,15 +285,16 @@ no-build-isolation-package = [
     "flash-attn-3",  # FA3: source build from Dao-AILab/flash-attention hopper/ (needs image torch)
     "magi_attention",
     "mamba-ssm",
-    "nv-grouped-gemm",
+    "mixture-of-kittens",
     "transformer-engine",
     "transformer-engine-torch",
 ]
 constraint-dependencies = [
+    "anyio>=4.14.2", # Security floor requested by AUT-2465
     "aiohttp>=3.14.3", # Address aiohttp security fixes through CVE-2026-69244
     "cryptography>=48.0.1", # Address CVE GHSA-537c-gmf6-5ccf
     "diffusers>=0.38.0",
-    "gitpython>=3.1.59",
+    "gitpython>=3.1.60",
     "jaraco-context>=6.1.0", # Address CVE GHSA-58pv-8j8x-9vj2
     "mako>=1.3.11",
     "msgpack>=1.2.1", # Address CVE GHSA-6v7p-g79w-8964
@@ -306,16 +306,18 @@ constraint-dependencies = [
     "starlette>=1.3.1", # Address GHSA-wqp7-x3pw-xc5r and later Starlette security fixes
     "setuptools>=80.10.2",
     "soupsieve>=2.8.4", # Address GHSA-836r-79rf-4m37 and GHSA-2wc2-fm75-p42x
-    "urllib3>=2.7.0", # Address CVE GHSA-gm62-xv2j-4w53
-    "wandb>=0.28.2", # Address GO-2026-5970 in the golang.org/x/text bundled by wandb-core
+    "sqlparse>=0.6.0", # Security floor requested by AUT-2465
+    "urllib3>=2.8.0", # Address CVE GHSA-gm62-xv2j-4w53
+    "wandb>=0.30.0", # Address GO-2026-5970 in the golang.org/x/text bundled by wandb-core
     "wheel>=0.46.2", # Address CVE GHSA-8rrh-rw8j-w5fx
     "fonttools>=4.60.2", # Address CVE-2025-66034
-    "mlflow>=3.15.1", # No published security fix; advance past the reported 3.15.0
+    "mlflow>=3.16.1", # Security floor requested by AUT-2465
+    "mlflow-skinny>=3.16.1", # Keep the tracking-only extra on the same security floor
     "thrift>=0.24.0", # Address CVE-2026-41608 and related Thrift 0.24.0 fixes
     "tornado>=6.5.5",
     "onnx>=1.21.0",
     "onnx-ir>=0.1.16", # PyTorch 26.04 needs onnx_ir.schemas
-    "pyjwt>=2.12.0",
+    "pyjwt>=2.14.0",
     "pytest>=8.4.3",
     "pygments>=2.20.0",
     # tilelang 0.1.11 bundles its own TVM but leaves apache-tvm-ffi unpinned, so it
@@ -325,17 +327,34 @@ constraint-dependencies = [
     "apache-tvm-ffi<=0.1.11",
 ]
 override-dependencies = [
+    # leptonai (via nemo-run) caps anyio<=4.9.0; override to keep the security floor
+    "anyio>=4.14.2",
     "nvidia-cublas==13.4.1.1; sys_platform == 'linux'",
     # leptonai pins 7.0.0, which caps Starlette below its security-fixed 1.x releases
     "prometheus-fastapi-instrumentator>=8.1.0",
     # torchx (via nemo-run) caps urllib3<1.27; override to keep the CVE pin
-    "urllib3>=2.7.0",
+    "urllib3>=2.8.0",
 ]
 prerelease = "allow"
 
+[tool.uv.extra-build-variables.deep-ep]
+CPLUS_INCLUDE_PATH = "/usr/local/cuda/include/cccl"
+
+[tool.uv.extra-build-variables.mixture-of-kittens]
+CPLUS_INCLUDE_PATH = "/usr/local/cuda/include/cccl"
+LIBRARY_PATH = "/usr/local/cuda/lib64/stubs"
+
+[tool.uv.extra-build-variables.transformer-engine-torch]
+CPLUS_INCLUDE_PATH = "/usr/local/cuda/include:/usr/local/cuda/include/cccl"
+NVTE_BUILD_USE_NVIDIA_WHEELS = "1"
+NVTE_WITH_NCCL_EP = "0"
+
 [tool.uv.sources]
 megatron-fsdp = { git = "https://github.com/yuhezhang-ai/Megatron-LM.git", rev = "455389c480af6b3acdca74c7830c68b3274eb083", subdirectory = "megatron/core/distributed/fsdp/src" }
-deep_ep = { git = "https://github.com/deepseek-ai/DeepEP.git", rev = "42144303752422ade37f24bca9e2dde12df70e09" }
+deep_ep = { git = "https://github.com/deepseek-ai/DeepEP.git", rev = "10d4dd7377d5bce900fbb4b80cce863764892b95" }
+# cursor/mixture-of-kittens#18: qualify the ThunderKittens namespace and support both Blackwell targets.
+# Use the PR author's fork until merged so uv can fetch this revision without GitHub's PR-only refs.
+mixture-of-kittens = { git = "https://github.com/balasaajay/mixture-of-kittens.git", rev = "5c8c32e23d71d88a851ff90dcb6c0b663e445cad" }
 cut-cross-entropy = { git = "https://github.com/apple/ml-cross-entropy.git", rev = "87a86aba72cfd2f0d8abecaf81c13c4528ea07d8" }
 magi_attention = { git = "https://github.com/SandAI-org/MagiAttention.git", rev = "d7ea8afd44c790b65fab68a04a6a0fdd5adbf182" }
 liger-kernel = { git = "https://github.com/linkedin/Liger-Kernel.git", rev = "1f1a4b8d6a6c3c1ddb3573a46480c41cef25bde6" }
@@ -389,25 +408,18 @@ magi_attention = [
 ]
 transformer-engine = [{ requirement = "torch", match-runtime = true }]
 transformer-engine-torch = [{ requirement = "torch", match-runtime = true }]
-nv_grouped_gemm = ["setuptools"]
 
 # Needed when building from source
 [[tool.uv.dependency-metadata]]
 name = "deep_ep"
 # This version has to match the version in the commit/rev/tag used
-version = "v1.2.1+4214430"
+version = "v1.2.1+10d4dd7"
 requires-dist = ["torch", "packaging", "ninja"]
 
 [[tool.uv.dependency-metadata]]
 name = "magi_attention"
 version = "1.1.1"
 requires-dist = []
-
-[[tool.uv.dependency-metadata]]
-name = "nv_grouped_gemm"
-# This version has to match the version in the commit/rev/tag used
-version = "1.1.4.post8"
-requires-dist = ["torch", "packaging", "ninja", "setuptools"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
@@ -420,11 +432,16 @@ source = ["nemo_automodel"]
 parallel = true
 concurrency = ["thread", "multiprocessing"]
 omit = [
+    "nemo_automodel/components/models/kimi_k3/kda_fused/chunk_kda_bwd_triton.py",
     "nemo_automodel/components/checkpoint/_backports/*.py",
     "tests/*",
     "nemo_automodel/components/_peft/lora_kernel.py",
     "nemo_automodel/components/loss/triton/te_cross_entropy.py",
     "nemo_automodel/components/moe/megatron/*.py",
+    # Kimi-K3 Triton kernels: coverage.py cannot trace @triton.jit bodies; the Python wrappers
+    # are exercised by tests/unit_tests/models/kimi_k3/test_situ_triton.py and test_attn_res_triton.py
+    "nemo_automodel/components/models/kimi_k3/situ_triton.py",
+    "nemo_automodel/components/models/kimi_k3/attn_res_triton.py",
     # Vendored from https://github.com/uccl-project/uccl/tree/main/ep/deep_ep_wrapper
     "nemo_automodel/components/moe/uccl_ep/_buffer.py",
     "nemo_automodel/components/moe/uccl_ep/_utils.py",
@@ -509,6 +526,8 @@ convention = "google"
 "nemo_automodel/components/models/llama_bidirectional/export_onnx.py" = ["D103"]
 "nemo_automodel/components/models/llava_onevision/rice_vit.py" = ["D101", "D103"]
 "nemo_automodel/components/models/llava_onevision/state_dict_adapter.py" = ["D101"]
+"nemo_automodel/components/models/mimo_v25/model.py" = ["D101", "D103"]
+"nemo_automodel/components/models/mimo_v25/state_dict_adapter.py" = ["D101"]
 "nemo_automodel/components/models/minimax_m2/model.py" = ["D101"]
 "nemo_automodel/components/models/minimax_m2/state_dict_adapter.py" = ["D103"]
 "nemo_automodel/components/models/mistral3/model.py" = ["D101", "D103"]
@@ -554,7 +573,21 @@ modules = [
 ignore_imports = [
     # Dion needs the FSDP DP mesh resolver so its optimizer mesh matches parameter sharding.
     "nemo_automodel.components.optim.dion -> nemo_automodel.components.distributed.mesh_utils",
+    # Grad clipping needs the same resolver to find the EP process group, because a
+    # flattened ep axis is absent from mesh_dim_names and cannot be indexed directly.
+    "nemo_automodel.components.training.utils -> nemo_automodel.components.distributed.mesh_utils",
 ]
+
+[[tool.importlinter.contracts]]
+name = "Distributed infrastructure must not import model implementations"
+type = "forbidden"
+source_modules = ["nemo_automodel.components.distributed"]
+forbidden_modules = [
+    "nemo_automodel.components.models",
+    "nemo_automodel._diffusers",
+    "nemo_automodel._transformers",
+]
+allow_indirect_imports = true
 
 # ty: type checking (https://github.com/astral-sh/ty)
 # Default: permissive. Strict checks are opt-in per-file via overrides below.
@@ -591,14 +624,12 @@ allowed-unresolved-imports = [
     "ffpa_attn.**",
     "fla.**",
     "flash_attn",
-    "grouped_gemm",
     "liger_kernel.**",
     "lmdb",
     "mamba_ssm.**",
     "megatron.**",
     "mlflow",
     "mlflow.**",
-    "nemo_automodel.components.datasets.llm.megatron.helpers_cpp",
     "nemo_run",
     "pynvml",
     "sky",

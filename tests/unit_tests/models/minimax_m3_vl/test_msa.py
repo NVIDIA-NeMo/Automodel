@@ -15,13 +15,16 @@
 """CPU contracts of the MSA microbatch, the construction-time gates and the packed-loader declaration."""
 
 import copy
+import dataclasses
 import subprocess
 import sys
 import weakref
 
 import pytest
 import torch
+from torch.utils.checkpoint import CheckpointPolicy, checkpoint, create_selective_checkpoint_contexts
 
+from nemo_automodel.components.distributed.activation_checkpointing import make_selective_checkpoint_context_fn
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.utils import TEFp8Config
 from nemo_automodel.components.models.minimax_m3_vl import msa
@@ -279,21 +282,27 @@ def test_deterministic_algorithms_are_rejected_before_any_kernel_runs() -> None:
         torch.use_deterministic_algorithms(False)
 
 
-@pytest.mark.timeout(130)
+@pytest.mark.runtime_budget(
+    30,
+    hard_timeout=130,
+    reason="Starts a fresh Python process and imports torch plus the full model package; CI cold starts reach 16s.",
+)
 def test_optional_dependencies_are_lazy() -> None:
     # Importing the model package and building a microbatch must not touch the msa extra;
     # test_msa_import_guard covers the error a host without the extra gets at the first kernel call.
+    # Do not reject cutlass or quack here: TE 2.19 imports its FA4 backend when FA4 is installed,
+    # and that backend legitimately imports both without loading any model-private MSA kernels.
     # A fresh child must import torch and Automodel; revisit this exception when that cold start
-    # reliably fits the default 5s unit-test timeout in the CI container. The pytest budget must
+    # reliably fits the default 5s unit-test budget in the CI container. The hard timeout must
     # exceed subprocess.run's 120s limit so it can terminate the child first.
     script = """
 import sys
 import torch
-class RejectGpuImports:
+class RejectMsaImports:
     def find_spec(self, fullname, path=None, target=None):
-        if fullname.split(".")[0] in {"fmha_sm100", "cutlass", "quack"}:
+        if fullname.split(".")[0] == "fmha_sm100":
             raise AssertionError(fullname)
-sys.meta_path.insert(0, RejectGpuImports())
+sys.meta_path.insert(0, RejectMsaImports())
 from nemo_automodel.components.models.minimax_m3_vl import model, msa
 microbatch = msa.MSAMicrobatch.from_document_map(torch.ones(1, 8, dtype=torch.int64), forced_blocks=(0, 1))
 assert microbatch.cu_seqlens.tolist() == [0, 8]
@@ -339,3 +348,130 @@ def test_msa_with_dense_layers_requires_a_varlen_attention_backend() -> None:
         with pytest.raises(NotImplementedError, match="backend.attn='te'"):
             MiniMaxM3TextModel(_config(), _backend(attn="sdpa"))
         MiniMaxM3TextModel(_config(), _backend("generic", attn="sdpa"))
+
+
+class _CpuSelectionPlan:
+    """A CPU stand-in for ``_SelectionPlan``: a top-16 block selection, int32 ``[4, tokens, 16]``."""
+
+    def select(self, index_q: torch.Tensor, index_k: torch.Tensor) -> torch.Tensor:
+        scores = torch.arange(20.0).expand(4, index_q.shape[0], 20) + index_q.float().sum(-1).T[..., None]
+        return scores.topk(16, dim=-1).indices.to(torch.int32)
+
+
+def _cpu_selection(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
+    """Plan selection on the CPU; like the real warm-up, the fake one selects blocks for a 16-token document."""
+    calls = {"warm": 0, "build": 0}
+
+    def warm(device: torch.device, forced_blocks: tuple[int, int]) -> None:
+        calls["warm"] += 1
+        _CpuSelectionPlan().select(torch.zeros(16, 4, 8), torch.zeros(16, 1, 8))
+
+    def build(microbatch: msa.MSAMicrobatch) -> _CpuSelectionPlan:
+        calls["build"] += 1
+        return _CpuSelectionPlan()
+
+    monkeypatch.setattr(msa, "require_sm100", lambda device: None)
+    monkeypatch.setattr(msa, "_warm_scorer", warm)
+    monkeypatch.setattr(msa._SelectionPlan, "build", staticmethod(build))
+    return calls
+
+
+def test_prepare_selection_builds_the_plan_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = _cpu_selection(monkeypatch)
+    microbatch = msa.MSAMicrobatch.from_document_map(torch.ones(1, 24, dtype=torch.int64), forced_blocks=_FORCED)
+    microbatch.prepare_selection()
+    microbatch.prepare_selection()
+    assert microbatch.select_blocks(torch.zeros(24, 4, 8), torch.zeros(24, 1, 8)).shape == (4, 24, 16)
+    assert calls == {"warm": 1, "build": 1}
+
+
+def test_copies_of_a_microbatch_share_one_plan(monkeypatch: pytest.MonkeyPatch) -> None:
+    # FSDP2's forward-input cast hands every decoder block a dataclasses.replace copy of the microbatch
+    # (torch.distributed.utils._apply_to_tensors); each copy must reuse the plan rather than plan again.
+    calls = _cpu_selection(monkeypatch)
+    microbatch = msa.MSAMicrobatch.from_document_map(torch.ones(1, 24, dtype=torch.int64), forced_blocks=_FORCED)
+    microbatch.prepare_selection()
+    for _ in range(3):
+        dataclasses.replace(microbatch).select_blocks(torch.zeros(24, 4, 8), torch.zeros(24, 1, 8))
+    assert calls == {"warm": 1, "build": 1}
+    # Another forced-block rule (a KD teacher sharing the batch) gets its own plan.
+    dataclasses.replace(microbatch, forced_blocks=(1, 1)).prepare_selection()
+    assert calls == {"warm": 2, "build": 2}
+
+
+def test_a_plan_does_not_outlive_its_microbatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The plans are keyed weakly on cu_seqlens, so a long run holds no plan past its microbatch.
+    _cpu_selection(monkeypatch)
+    microbatch = msa.MSAMicrobatch.from_document_map(torch.ones(1, 24, dtype=torch.int64), forced_blocks=_FORCED)
+    microbatch.prepare_selection()
+    cu_seqlens = weakref.ref(microbatch.cu_seqlens)
+    assert cu_seqlens() in msa._PLANS
+    del microbatch
+    assert cu_seqlens() is None
+
+
+def _saves_topk(ctx: object, func: object, *args: object, **kwargs: object) -> CheckpointPolicy:
+    # The top-k rule of the MoE ignore_router_for_ac checkpoint policy (moe/parallelizer.py, apply_ac).
+    return CheckpointPolicy.MUST_SAVE if func == torch.ops.aten.topk.default else CheckpointPolicy.PREFER_RECOMPUTE
+
+
+@pytest.mark.parametrize("policy", ["ignore_router_for_ac", "selective"])
+@pytest.mark.parametrize("prepared", [True, False], ids=["prepared", "lazy"])
+def test_selection_planned_inside_a_checkpointed_block_is_replayed_out_of_order(
+    monkeypatch: pytest.MonkeyPatch, policy: str, prepared: bool
+) -> None:
+    # Both policies save aten.topk outputs in the checkpoint forward and hand them back, in order, to the
+    # recompute's topk calls. A plan built lazily inside the block runs the warm-up's topk only in the
+    # forward (the plan is cached by the recompute), so the layer's own selection gets the warm-up's
+    # 16-token output: on the GPU MSA rejects it with "k2q_q_indices.shape[1] (256) must be >= ...".
+    _cpu_selection(monkeypatch)
+    if policy == "selective":
+        context_fn = make_selective_checkpoint_context_fn()
+    else:
+
+        def context_fn():
+            return create_selective_checkpoint_contexts(_saves_topk)
+
+    microbatch = msa.MSAMicrobatch.from_document_map(torch.ones(1, 24, dtype=torch.int64), forced_blocks=_FORCED)
+    if prepared:
+        microbatch.prepare_selection()
+
+    def block(x: torch.Tensor) -> torch.Tensor:
+        q2k = microbatch.select_blocks(x.detach()[:, None].expand(-1, 4, -1), x.detach()[:, None])
+        # Consume the selection per token, as MSA's CSR build does.
+        return x * q2k.float().mean(dim=(0, 2))[:, None]
+
+    x = torch.randn(24, 8, requires_grad=True)
+    loss = checkpoint(block, x, use_reentrant=False, context_fn=context_fn).sum()
+    if prepared:
+        loss.backward()
+        assert x.grad is not None and x.grad.shape == x.shape
+    else:
+        with pytest.raises(RuntimeError):
+            loss.backward()
+
+
+def test_the_model_plans_selection_before_its_decoder_blocks(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The decoder blocks are the activation-checkpointed regions, so the plan must exist before the first one runs.
+    text = _config(sparse_attention_freq=[1, 1], sparse_disable_index_value=[1, 1])
+    with torch.device("meta"):
+        model = MiniMaxM3TextModel(text, _backend(attn="sdpa"))
+    events = []
+
+    class _Microbatch:
+        cu_seqlens, max_seqlen, padding_mask = torch.tensor([0, 8]), 8, torch.ones(1, 8, dtype=torch.bool)
+
+        def prepare_selection(self) -> None:
+            events.append("prepare")
+
+    class _Block(torch.nn.Module):
+        def forward(self, x: torch.Tensor, **kwargs: object) -> torch.Tensor:
+            events.append("block")
+            return x
+
+    monkeypatch.setattr(msa.MSAMicrobatch, "build", classmethod(lambda cls, *args, **kwargs: _Microbatch()))
+    monkeypatch.setattr(model, "make_freqs_cis", lambda *args, **kwargs: None)
+    model.layers = torch.nn.ModuleDict({"0": _Block(), "1": _Block()})
+    model.norm = None
+    model(None, inputs_embeds=torch.zeros(1, 8, 32))
+    assert events == ["prepare", "block", "block"]

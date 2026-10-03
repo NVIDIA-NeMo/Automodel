@@ -69,7 +69,7 @@ dist_env:
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
   config:
-    _target_: transformers.AutoConfig.from_pretrained
+    _target_: nemo_automodel.NeMoAutoConfig.from_pretrained
     pretrained_model_name_or_path: Qwen/Qwen3-235B-A22B
   trust_remote_code: true
   backend:
@@ -78,8 +78,8 @@ model:
     linear: te
     rms_norm: te
     rope_fusion: true
-    experts: gmm
-    dispatcher: deepep
+    experts: torch_mm
+    dispatcher: hybridep  # DeepEP times out in multi-node EP32 CI.
     fake_balanced_gate: true
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true

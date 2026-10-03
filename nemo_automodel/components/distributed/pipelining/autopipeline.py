@@ -33,6 +33,10 @@ from nemo_automodel.components.distributed.pipelining.functional import (
 from nemo_automodel.components.distributed.pipelining.hf_utils import (
     validate_hf_model_for_pipeline_support,
 )
+from nemo_automodel.components.distributed.pipelining.runtime import (
+    PipelineRuntimeInitializer,
+    collect_pipeline_runtime_initializers,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -133,6 +137,7 @@ class AutoPipeline:
         )
         self._model_config = None
         self._pp_current_seq_len: int | None = None
+        self._runtime_initializers: list[PipelineRuntimeInitializer] = []
 
     def build(
         self,
@@ -202,6 +207,8 @@ class AutoPipeline:
         self._info.model_parts = model_parts
         self._info.stages = stages
 
+        self._runtime_initializers = collect_pipeline_runtime_initializers(model_parts)
+
         # Store model config for runtime shape updates
         self._model_config = model.config
 
@@ -220,25 +227,31 @@ class AutoPipeline:
         with different seq_lens.
 
         Call this before every ``schedule.step()`` to update the stage shapes without
-        running an expensive forward pass.  A no-op when seq_len has not changed.
+        running an expensive forward pass.  Stage reset is a no-op when ``seq_len``
+        has not changed; model-owned runtime initializers are still prepared.
 
         Args:
             seq_len: Sequence length of the upcoming batch (``input_ids.shape[1]``).
         """
-        if seq_len == self._pp_current_seq_len:
-            return
-        if self._model_config is None:
-            raise RuntimeError("AutoPipeline.build() must be called before update_seq_len()")
-        reset_pp_stage_shapes(
-            self._info.schedule,
-            self._info.stages,
-            self._model_config,
-            self.pp_microbatch_size,
-            seq_len,
-            tensor_dtype=self.dtype,
-        )
-        self._pp_current_seq_len = seq_len
-        logger.debug(f"PP stage shapes updated for seq_len={seq_len}")
+        if seq_len != self._pp_current_seq_len:
+            if self._model_config is None:
+                raise RuntimeError("AutoPipeline.build() must be called before update_seq_len()")
+            reset_pp_stage_shapes(
+                self._info.schedule,
+                self._info.stages,
+                self._model_config,
+                self.pp_microbatch_size,
+                seq_len,
+                tensor_dtype=self.dtype,
+            )
+            self._pp_current_seq_len = seq_len
+            logger.debug(f"PP stage shapes updated for seq_len={seq_len}")
+
+        for initializer in self._runtime_initializers:
+            initializer.prepare(
+                num_tokens=self.pp_microbatch_size * seq_len,
+                device=self.device,
+            )
 
     def _get_schedule_kwargs_chunk_spec(self, kwargs: dict[str, Any]) -> dict[str, Any] | None:
         """Build pipeline microbatch chunking metadata for keyword inputs.
