@@ -225,5 +225,5 @@ def test_hard_watchdog_is_scoped_to_the_conftest_tree(pytester: pytest.Pytester)
     items, _ = pytester.inline_genitems("unit_tests", "other")
     markers = {item.name: item.get_closest_marker("timeout") for item in items}
 
-    assert markers["test_inside"].args == (60.0,)
+    assert markers["test_inside"].args == (70.0,)
     assert markers["test_outside"] is None
