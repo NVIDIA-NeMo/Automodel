@@ -342,7 +342,9 @@ def test_cross_encoder_model_args_reach_backbone_constructor(tmp_path, monkeypat
             super().__init__(config)
             self.option = option
 
-    monkeypatch.setattr(retrieval, "_get_supported_backbone_class", lambda model_type, task: BertWithConstructorOption)
+    monkeypatch.setattr(
+        retrieval, "_get_supported_backbone_class", lambda model_type, task, config=None: BertWithConstructorOption
+    )
     encoder = retrieval.CrossEncoderModel.build(str(model_dir), True, model_args=("constructor-option",))
     assert encoder.model.option == "constructor-option"
 
