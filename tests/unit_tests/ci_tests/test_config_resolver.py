@@ -398,7 +398,6 @@ def test_gpt_oss_20b_scopes_relaxed_tolerance_to_resume(tmp_path):
         "examples/llm_finetune/llama3_1/customizer_llama_3_1_8b_full_sft_tp.yaml",
         "examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag.yaml",
         "examples/llm_finetune/minimax_m2/minimax_m2.7_hellaswag_lora.yaml",
-        "examples/llm_finetune/mistral/mistral_7b_hellaswag_fp8.yaml",
         "examples/llm_finetune/nemotron/nemotron_nano_v3_hellaswag.yaml",
         "examples/llm_finetune/nemotron/nemotron_super_v3_hellaswag.yaml",
         "examples/llm_finetune/nemotron_flash/nemotron_flash_1b_squad.yaml",

@@ -1,0 +1,75 @@
+---
+title: "zai-org/GLM-5.2"
+description: "Use NeMo AutoModel to fine-tune zai-org/GLM-5.2 for LLM workflows with checked-in text generation recipes and documented distributed settings."
+slug: model-coverage/large-language-models/thudm/GLM-5.2
+---
+
+[GLM-5.2](https://huggingface.co/zai-org/GLM-5.2) has a checked-in NeMo AutoModel recipe for text generation.
+The Hugging Face configuration declares the `GlmMoeDsaForCausalLM` architecture.
+
+## Quick Start
+
+Allocate 16 nodes with 8 GPUs each. Set `NODE_RANK` and `MASTER_ADDR` on every node; complete the recipe prerequisites in Model Context before launching.
+
+```bash
+uv run torchrun --nnodes 16 --nproc-per-node 8 \
+  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
+  -m nemo_automodel.cli.app examples/llm_finetune/glm/glm_5.2_lora.yaml
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| LoRA Fine-Tuning (Packed Sequences) | Tulu-3; 16 nodes; EP128; 4,096-token packs | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.2_lora.yaml) |
+| Full Fine-Tuning | HellaSwag; 32 nodes; PP4; EP64 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.2_hellaswag_pp.yaml) |
+
+## Model Context
+
+GLM-5.2 is used for text generation. Its model size is 753.33B checkpoint parameters.
+
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| **Architecture** | `GlmMoeDsaForCausalLM` |
+| Parameters | 753.33B checkpoint parameters |
+| Decoder Layers | 78 |
+| Hidden Size | 6,144 |
+| Attention | 64 attention heads / 64 key-value heads |
+| Context Length | 1,048,576 tokens (checkpoint configuration) |
+| Vocabulary Size | 154,880 |
+| Experts | 256 routed / 1 shared / 8 selected per token |
+| Configured Dtype | `bfloat16` |
+
+### Configuration
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | - |
+| Strategy | FSDP2; tp_size=1, pp_size=1, cp_size=1, ep_size=128 |
+| Nodes | 16 |
+| Features | Activation checkpointing (activation_checkpointing=true), Packed sequences (packed_sequence_size=4096), LoRA, HybridEP (dispatcher=hybridep) |
+| Advanced | attention=tilelang, linear=torch, experts=torch_mm, dispatcher=hybridep, sequence length 4096 |
+
+### More Recipes for This Model
+
+- [`glm_5.2_hellaswag_pp.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.2_hellaswag_pp.yaml)
+- [`glm_5.2_tulu3_32k_tilelang_cp8.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.2_tulu3_32k_tilelang_cp8.yaml)
+- [`glm_5.2_tulu3_4k_cudnn_100k.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.2_tulu3_4k_cudnn_100k.yaml)
+- [`glm_5.2_tulu3_4k_tilelang_100k.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.2_tulu3_4k_tilelang_100k.yaml)
+- [`glm_5.2_mok_mxfp8_fineweb_8k.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/glm/glm_5.2_mok_mxfp8_fineweb_8k.yaml)
+
+## Available Models
+
+- [`zai-org/GLM-5.2`](https://huggingface.co/zai-org/GLM-5.2)
+
+| Checkpoint | Type |
+| --- | --- |
+| [GLM-5.2](https://huggingface.co/zai-org/GLM-5.2) | Checkpoint documented on this page |
+| [`zai-org/GLM-5.2`](https://huggingface.co/zai-org/GLM-5.2) | Checkpoint documented on this page |
+
+## Related Resources
+
+- [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/zai-org/GLM-5.2/blob/cf457fa734ab149ffef225f80893eb38c6ff5cdc/config.json)

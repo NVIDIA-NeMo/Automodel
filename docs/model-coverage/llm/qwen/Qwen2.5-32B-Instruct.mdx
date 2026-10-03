@@ -1,0 +1,69 @@
+---
+title: "Qwen/Qwen2.5-32B-Instruct"
+description: "Use NeMo AutoModel to fine-tune Qwen/Qwen2.5-32B-Instruct for LLM workflows with checked-in text generation recipes and documented distributed settings."
+slug: model-coverage/large-language-models/qwen/Qwen2.5-32B-Instruct
+---
+
+[Qwen2.5-32B-Instruct](https://huggingface.co/Qwen/Qwen2.5-32B-Instruct) has a checked-in NeMo AutoModel recipe for text generation.
+The Hugging Face configuration declares the `Qwen2ForCausalLM` architecture.
+
+## Quick Start
+
+Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+
+```bash
+automodel examples/llm_finetune/qwen/qwen2_5_32b_peft_benchmark.yaml --nproc-per-node 8
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| LoRA Fine-Tuning | Synthetic data; PP4 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen2_5_32b_peft_benchmark.yaml) |
+| LoRA Fine-Tuning | Synthetic data; TP2 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/qwen/custom_qwen2_5_32b_peft_benchmark.yaml) |
+
+## Model Context
+
+Qwen2.5-32B-Instruct is used for text generation. Its model size is 32.76B checkpoint parameters.
+
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| **Architecture** | `Qwen2ForCausalLM` |
+| Parameters | 32.76B checkpoint parameters |
+| Decoder Layers | 64 |
+| Hidden Size | 5,120 |
+| Attention | 40 attention heads / 8 key-value heads |
+| Context Length | 32,768 tokens (checkpoint configuration) |
+| Vocabulary Size | 152,064 |
+| Configured Dtype | `bfloat16` |
+
+### Configuration
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | - |
+| Strategy | FSDP2; tp_size=1, pp_size=4, cp_size=1 |
+| Nodes | - |
+| Features | Activation checkpointing (activation_checkpointing=true), LoRA |
+| Advanced | bf16 |
+
+### More Recipes for This Model
+
+- [`custom_qwen2_5_32b_peft_benchmark.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/qwen/custom_qwen2_5_32b_peft_benchmark.yaml)
+- [`custom_qwen2_5_32b_peft_benchmark_2nodes.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/qwen/custom_qwen2_5_32b_peft_benchmark_2nodes.yaml)
+
+## Available Models
+
+- [`Qwen/Qwen2.5-32B-Instruct`](https://huggingface.co/Qwen/Qwen2.5-32B-Instruct)
+
+| Checkpoint | Type |
+| --- | --- |
+| [Qwen2.5-32B-Instruct](https://huggingface.co/Qwen/Qwen2.5-32B-Instruct) | Checkpoint documented on this page |
+| [`Qwen/Qwen2.5-32B-Instruct`](https://huggingface.co/Qwen/Qwen2.5-32B-Instruct) | Checkpoint documented on this page |
+
+## Related Resources
+
+- [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/Qwen/Qwen2.5-32B-Instruct/blob/5ede1c97bbab6ce5cda5812749b4c0bdf79b18dd/config.json)

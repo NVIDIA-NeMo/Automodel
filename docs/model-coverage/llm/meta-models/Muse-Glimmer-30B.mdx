@@ -1,0 +1,69 @@
+---
+title: "meta-models/Muse-Glimmer-30B"
+description: "Use NeMo AutoModel to fine-tune meta-models/Muse-Glimmer-30B for LLM workflows with checked-in text generation recipes and documented distributed settings."
+slug: model-coverage/large-language-models/meta-models/Muse-Glimmer-30B
+---
+
+[Muse-Glimmer-30B](https://huggingface.co/meta-models/Muse-Glimmer-30B) has a checked-in NeMo AutoModel recipe for text generation.
+The Hugging Face configuration declares the `MuseGlimmerForConditionalGeneration` architecture.
+
+## Quick Start
+
+Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+
+```bash
+automodel \
+  examples/llm_finetune/muse_glimmer/muse_glimmer_30b_tulu3_te_tp2_cp4_packed_16k.yaml \
+  --nproc-per-node 8
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Full Fine-Tuning (Packed Sequences) | Tulu-3; 1 node; TP2; CP4; 16,384-token packs | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/muse_glimmer/muse_glimmer_30b_tulu3_te_tp2_cp4_packed_16k.yaml) |
+
+## Model Context
+
+Muse-Glimmer-30B is used for text generation. Its model size is 29.78B checkpoint parameters.
+
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| **Architecture** | `MuseGlimmerForConditionalGeneration` |
+| Parameters | 29.78B checkpoint parameters |
+| Decoder Layers | 52 |
+| Hidden Size | 6,656 |
+| Attention | 32 attention heads / 2 key-value heads |
+| Context Length | 131,072 tokens (checkpoint configuration) |
+| Vocabulary Size | 202,048 |
+| Configured Dtype | `bfloat16` |
+
+### Configuration
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | - |
+| Strategy | FSDP2; tp_size=2, pp_size=1, cp_size=4, ep_size=1 |
+| Nodes | 1 |
+| Features | Activation checkpointing (activation_checkpointing=true), Packed sequences (packed_sequence_size=16384), Transformer Engine |
+| Advanced | bfloat16, attention=te, sequence length 1024 |
+
+### Workflow Notes
+
+Follow the [installation instructions](/get-started/installation).
+
+## Available Models
+
+- [`meta-models/Muse-Glimmer-30B`](https://huggingface.co/meta-models/Muse-Glimmer-30B)
+
+| Checkpoint | Type |
+| --- | --- |
+| [Muse-Glimmer-30B](https://huggingface.co/meta-models/Muse-Glimmer-30B) | Checkpoint documented on this page |
+| [`meta-models/Muse-Glimmer-30B`](https://huggingface.co/meta-models/Muse-Glimmer-30B) | Checkpoint documented on this page |
+
+## Related Resources
+
+- [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/meta-models/Muse-Glimmer-30B/blob/a4e59da52a7bc87ae7251dd5545c0dd437c44b68/config.json)

@@ -33,9 +33,6 @@ import pathlib
 # ready-to-run architecture table, and ``test_recipe_doc_coverage.py`` (arches
 # resolved from example YAMLs).
 _DOC_ARCH_ALIASES = {
-    # HF ships the class as ``BaiChuanForCausalLM`` (CamelCase) — registry
-    # uses ``BaichuanForCausalLM``. Documented on the Baichuan page.
-    "BaichuanForCausalLM": "BaiChuanForCausalLM",
     # HF upstream renamed ``Gemma3nForConditionalGeneration`` between releases;
     # the "Gemma 3n" variant is covered on the Gemma 3 VL page.
     "Gemma3nForConditionalGeneration": "Gemma 3n",
@@ -65,13 +62,6 @@ _DOC_ARCH_ALIASES = {
     # Mistral4 text model is the backbone of Mistral-Small-4 VLM; documented
     # on the Mistral-Small-4 page via the recipe path ``mistral4``.
     "Mistral4ForCausalLM": "mistral4",
-    # OLMo2 page uses the vendor-branded spelling ``OLMo2`` (all caps "OLM");
-    # HF normalized the class name to ``Olmo2``.
-    "Olmo2ForCausalLM": "OLMo2ForCausalLM",
-    # HF upstream added an extra underscore between "5" and "VL"
-    # (``Qwen2_5_VLForConditionalGeneration``); the Qwen2.5-VL page still uses
-    # the pre-rename spelling.
-    "Qwen2_5_VLForConditionalGeneration": "Qwen2_5VLForConditionalGeneration",
     # Qwen3-Omni and Qwen3-VL are documented with the VL-facing arch name; the
     # registry wires their MoE backbones under these keys.
     "Qwen3OmniMoeForConditionalGeneration": "Qwen3OmniForConditionalGeneration",
@@ -129,15 +119,15 @@ def test_every_model_card_has_architecture_reference_table():
     invalid = []
     for path, content in documents:
         reasons = []
-        if "## Model Reference" not in content:
-            reasons.append("missing '## Model Reference'")
-        if "### Model Architecture" not in content:
-            reasons.append("missing '### Model Architecture'")
+        if "## Model Context" not in content:
+            reasons.append("missing '## Model Context'")
         else:
-            architecture_section = content.split("### Model Architecture", maxsplit=1)[1]
-            architecture_section = architecture_section.split("\n##", maxsplit=1)[0]
+            architecture_section = content.split("## Model Context", maxsplit=1)[1]
+            architecture_section = architecture_section.split("\n## ", maxsplit=1)[0]
             if "| Property | Value |" not in architecture_section:
                 reasons.append("missing architecture Property/Value table")
+        if "## Model Reference" in content or "### Model Architecture" in content:
+            reasons.append("uses legacy nested Model Reference headings")
         if "### Model Summary" in content:
             reasons.append("uses legacy '### Model Summary' heading")
         if "### Available Checkpoints" in content:
@@ -180,7 +170,7 @@ def test_every_registered_arch_has_model_coverage_doc():
             f"{details}\n\n"
             "Fix by either:\n"
             "  1. Adding a new .mdx file under docs/model-coverage/ (preferred for "
-            "new architectures — e.g., docs/model-coverage/vlm/google/gemma4.mdx), or\n"
+            "new architectures — e.g., docs/model-coverage/vlm/google/gemma-4-31B-it.mdx), or\n"
             "  2. Updating an existing .mdx file to mention the arch name, or\n"
             "  3. Adding an entry to _DOC_ARCH_ALIASES in this test file with a "
             "comment explaining the mismatch."

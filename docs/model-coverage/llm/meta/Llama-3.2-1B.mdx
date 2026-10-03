@@ -1,0 +1,52 @@
+---
+title: "meta-llama/Llama-3.2-1B"
+description: "Fine-tune meta-llama/Llama-3.2-1B with NeMo AutoModel: checked-in recipe, launch command, architecture, and model context."
+slug: model-coverage/large-language-models/meta/Llama-3.2-1B
+---
+
+[Meta's Llama](https://www.llama.com/) is a family of open-weight autoregressive language models built on the transformer decoder architecture. Key design choices include pre-normalization with RMSNorm, SwiGLU activations, and Rotary Positional Embeddings (RoPE). Llama 3+ models add Grouped Query Attention (GQA) for memory-efficient inference at larger scales.
+
+Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
+
+## Quick Start
+
+From the repository root, run:
+
+```bash
+uv run automodel --nproc-per-node=8 examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Full Fine-Tuning | SQuAD | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml) |
+
+## Model Context
+
+Llama-3.2-1B is used for text generation. Its model size is 1B parameters.
+
+| Property | Value |
+| --- | --- |
+| Task | Text Generation |
+| **Architecture** | `LlamaForCausalLM` |
+| Parameters | 1B |
+| Hugging Face Organization | [meta-llama](https://huggingface.co/meta-llama) |
+| Decoder Layers | 16 |
+| Hidden Size | 2,048 |
+| Attention | 32 attention heads / 8 key-value heads |
+| Context Length | 131,072 tokens (checkpoint configuration) |
+| Vocabulary Size | 128,256 |
+| Configured Dtype | `bfloat16` |
+
+## Available Models
+
+| Model | HF ID |
+|---|---|
+| Llama 3.2 1B | [`meta-llama/Llama-3.2-1B`](https://huggingface.co/meta-llama/Llama-3.2-1B) |
+
+## Related Resources
+
+- [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/meta-llama/Llama-3.2-1B/blob/4e20de362430cd3b72f300e6b0f18e50e7166e08/config.json)

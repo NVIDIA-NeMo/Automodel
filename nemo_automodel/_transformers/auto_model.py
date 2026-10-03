@@ -103,6 +103,7 @@ from nemo_automodel._transformers.model_init import (
     resolve_sdpa_method,
 )
 from nemo_automodel.components.models.common.tie_word_embeddings import reject_tie_word_embeddings_flip
+from nemo_automodel.components.models.deprecation import warn_deprecated_checkpoint
 
 if not hasattr(_gen_utils, "NEED_SETUP_CACHE_CLASSES_MAPPING"):
     from transformers.cache_utils import StaticCache
@@ -741,6 +742,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             model instance with all infrastructure applied.
         """
         _reject_separate_distributed_kwargs(kwargs)
+        warn_deprecated_checkpoint(pretrained_model_name_or_path)
         # Resolve HF's dtype alias before config overrides or model construction
         # can consume it independently of AutoModel's storage-dtype handling.
         if (dtype := kwargs.pop("dtype", None)) is not None:
@@ -878,6 +880,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
 
         torch_dtype = dtype_from_str(torch_dtype) if torch_dtype != "auto" else torch.bfloat16
         name_or_path = config if isinstance(config, str) else getattr(config, "name_or_path", None)
+        if name_or_path:
+            warn_deprecated_checkpoint(name_or_path)
         kwargs["trust_remote_code"] = kwargs.get(
             "trust_remote_code", resolve_trust_remote_code(name_or_path) if name_or_path else False
         )
@@ -1143,6 +1147,7 @@ class _NeMoAutoModelForRetrievalBase:
             If kernel patching fails, the method retries with adjusted parameters.
         """
         _reject_separate_distributed_kwargs(kwargs)
+        warn_deprecated_checkpoint(pretrained_model_name_or_path)
         if (dtype := kwargs.pop("dtype", None)) is not None:
             torch_dtype = dtype
         torch_dtype = dtype_from_str(torch_dtype) if torch_dtype != "auto" else torch_dtype

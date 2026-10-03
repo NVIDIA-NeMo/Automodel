@@ -349,7 +349,11 @@ def _load_model_doc_catalog(
             docs_page = f"/{slug_match.group(1)}"
             if not DOCS_PAGE_PATTERN.fullmatch(docs_page):
                 raise ValueError(f"Model coverage page has an invalid slug: {path}")
-            architecture_match = re.search(r"^\| \*\*Architecture\*\* \| ([^|]+) \|$", document, flags=re.MULTILINE)
+            architecture_match = re.search(
+                r"^\| (?:\*\*)?(?:Hugging Face )?Architecture(?:\*\*)? \| ([^|]+) \|$",
+                document,
+                flags=re.MULTILINE,
+            )
             architecture_display = architecture_match.group(1).strip() if architecture_match else ""
             page_architectures = (
                 tuple(re.findall(r"`([A-Za-z_][A-Za-z0-9_]*)`", architecture_match.group(1)))

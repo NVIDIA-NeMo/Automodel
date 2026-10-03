@@ -1,0 +1,60 @@
+---
+title: "llava-hf/llava-1.5-7b-hf"
+description: "Fine-tune llava-hf/llava-1.5-7b-hf with NeMo AutoModel using a checked-in LoRA recipe, with checkpoint and architecture details."
+slug: model-coverage/vision-language-models/llava-hf/llava-1.5-7b-hf
+---
+
+[LLaVA](https://llava-vl.github.io/) (Large Language and Vision Assistant) is a pioneering open-source multimodal model connecting a vision encoder to a language model via a projection layer. Multiple versions and variants are supported via the `llava-hf` organization on Hugging Face.
+
+Set up NeMo AutoModel with the
+[latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the
+[installation instructions](/get-started/installation).
+
+## Quick Start
+
+Follow the [installation instructions](/get-started/installation). From the repository root, use 8 GPUs. This is an example configuration; GPU training and memory use still require validation.
+
+```bash
+uv run automodel examples/vlm_finetune/llava_hf/llava_1_5_7b_hf_medpix_peft.yaml --nproc-per-node 8
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| LoRA Fine-Tuning | MedPix-VQA; 1 node | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/538848ea2e2dcc6f80a6eb8899fef72ede173ca5/examples/vlm_finetune/llava_hf/llava_1_5_7b_hf_medpix_peft.yaml) |
+
+## Model Context
+
+llava-1.5-7b-hf is used for image-text-to-text. Its model size is 7B parameters.
+
+| Property | Value |
+| --- | --- |
+| Task | Image-Text-to-Text |
+| **Architecture** | `LlavaForConditionalGeneration` / `LlavaNextForConditionalGeneration` |
+| Parameters | 7B |
+| Hugging Face Organization | [llava-hf](https://huggingface.co/llava-hf) |
+| Context Length | 4,096 tokens (checkpoint configuration) |
+| Vocabulary Size | 32,064 |
+| Configured Dtype | `float16` |
+
+- `LlavaForConditionalGeneration` - LLaVA 1.5
+- `LlavaNextForConditionalGeneration` - LLaVA-NeXT / 1.6
+- `LlavaNextVideoForConditionalGeneration` - LLaVA-NeXT-Video
+- `LlavaOnevisionForConditionalGeneration` - LLaVA-OneVision
+
+### Recipe Setup
+
+Read [llava_1_5_7b_hf_medpix_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/538848ea2e2dcc6f80a6eb8899fef72ede173ca5/examples/vlm_finetune/llava_hf/llava_1_5_7b_hf_medpix_peft.yaml) for checkpoint access, data paths, and backend dependencies. It provides a small LoRA fine-tuning example.
+
+## Available Models
+
+| Model | HF ID |
+|---|---|
+| LLaVA 1.5 7B | [`llava-hf/llava-1.5-7b-hf`](https://huggingface.co/llava-hf/llava-1.5-7b-hf) |
+
+## Related Resources
+
+- [VLM Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n)
+
+- [Checkpoint Configuration](https://huggingface.co/llava-hf/llava-1.5-7b-hf/blob/b234b804b114d9e37bb655e11cbbb5f5e971b7a9/config.json)

@@ -1,0 +1,60 @@
+---
+title: "deepseek-ai/deepseek-llm-7b-chat"
+description: "Fine-tune deepseek-ai/deepseek-llm-7b-chat with NeMo AutoModel using a checked-in LoRA recipe, with checkpoint and architecture details."
+slug: model-coverage/large-language-models/deepseek-ai/deepseek-llm-7b-chat
+---
+
+[DeepSeek](https://github.com/deepseek-ai) is a series of open-weight language models from DeepSeek AI. The first-generation models (V1/V2) use standard transformer decoder and Multi-head Latent Attention architectures.
+
+Set up NeMo AutoModel with the
+[latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the
+[installation instructions](/get-started/installation).
+
+## Quick Start
+
+Follow the [installation instructions](/get-started/installation). From the repository root, use 8 GPUs. This is an example configuration; GPU training and memory use still require validation.
+
+```bash
+uv run automodel examples/llm_finetune/deepseek_ai/deepseek_llm_7b_chat_squad_peft.yaml --nproc-per-node 8
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| LoRA Fine-Tuning | SQuAD; 1 node | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/538848ea2e2dcc6f80a6eb8899fef72ede173ca5/examples/llm_finetune/deepseek_ai/deepseek_llm_7b_chat_squad_peft.yaml) |
+
+## Model Context
+
+deepseek-llm-7b-chat is used for text generation. Its model size is 7B parameters.
+
+| Property | Value |
+| --- | --- |
+| Task | Text Generation |
+| **Architecture** | `DeepseekForCausalLM` |
+| Parameters | 7B |
+| Hugging Face Organization | [deepseek-ai](https://huggingface.co/deepseek-ai) |
+| Decoder Layers | 30 |
+| Hidden Size | 4,096 |
+| Attention | 32 attention heads / 32 key-value heads |
+| Context Length | 4,096 tokens (checkpoint configuration) |
+| Vocabulary Size | 102,400 |
+| Configured Dtype | `bfloat16` |
+
+- `DeepseekForCausalLM` - DeepSeek v1/v2 dense models
+
+### Recipe Setup
+
+Read [deepseek_llm_7b_chat_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/538848ea2e2dcc6f80a6eb8899fef72ede173ca5/examples/llm_finetune/deepseek_ai/deepseek_llm_7b_chat_squad_peft.yaml) for checkpoint access, data paths, and backend dependencies. It provides a small LoRA fine-tuning example.
+
+## Available Models
+
+| Model | HF ID |
+|---|---|
+| DeepSeek LLM 7B Chat | [`deepseek-ai/deepseek-llm-7b-chat`](https://huggingface.co/deepseek-ai/deepseek-llm-7b-chat) |
+
+## Related Resources
+
+- [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/deepseek-ai/deepseek-llm-7b-chat/blob/afbda8b347ec881666061fa67447046fc5164ec8/config.json)

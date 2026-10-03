@@ -1,0 +1,59 @@
+---
+title: "OrionStarAI/Orion-14B-Base"
+description: "Fine-tune OrionStarAI/Orion-14B-Base with NeMo AutoModel using a checked-in LoRA recipe, with checkpoint and architecture details."
+slug: model-coverage/large-language-models/orionstar/Orion-14B-Base
+---
+
+[Orion](https://github.com/OrionStarAI/Orion) is a bilingual (Chinese-English) language model from OrionStar AI, with 14B parameters and strong performance on Chinese benchmarks.
+
+Set up NeMo AutoModel with the
+[latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the
+[installation instructions](/get-started/installation).
+
+## Quick Start
+
+Follow the [installation instructions](/get-started/installation). From the repository root, use 8 GPUs. This is an example configuration; GPU training and memory use still require validation.
+
+```bash
+uv run automodel examples/llm_finetune/orionstarai/orion_14b_base_squad_peft.yaml --nproc-per-node 8
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| LoRA Fine-Tuning | SQuAD; 1 node | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/538848ea2e2dcc6f80a6eb8899fef72ede173ca5/examples/llm_finetune/orionstarai/orion_14b_base_squad_peft.yaml) |
+
+## Model Context
+
+Orion-14B-Base is used for text generation. Its model size is 14B parameters.
+
+| Property | Value |
+| --- | --- |
+| Task | Text Generation |
+| **Architecture** | `OrionForCausalLM` |
+| Parameters | 14B |
+| Hugging Face Organization | [OrionStarAI](https://huggingface.co/OrionStarAI) |
+| Decoder Layers | 40 |
+| Hidden Size | 5,120 |
+| Attention | 40 attention heads / 40 key-value heads |
+| Context Length | 4,096 tokens (checkpoint configuration) |
+| Vocabulary Size | 84,608 |
+| Configured Dtype | `bfloat16` |
+
+### Recipe Setup
+
+Read [orion_14b_base_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/538848ea2e2dcc6f80a6eb8899fef72ede173ca5/examples/llm_finetune/orionstarai/orion_14b_base_squad_peft.yaml) for checkpoint access, data paths, and backend dependencies. It provides a small LoRA fine-tuning example.
+
+## Available Models
+
+| Model | HF ID |
+|---|---|
+| Orion 14B Base | [`OrionStarAI/Orion-14B-Base`](https://huggingface.co/OrionStarAI/Orion-14B-Base) |
+| Orion 14B Chat | [`OrionStarAI/Orion-14B-Chat`](https://huggingface.co/OrionStarAI/Orion-14B-Chat) |
+
+## Related Resources
+
+- [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/OrionStarAI/Orion-14B-Base/blob/b988a511e9c880a465e704c57e3f297a3e7ef282/config.json)

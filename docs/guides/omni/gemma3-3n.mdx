@@ -1,9 +1,9 @@
 ---
-title: "Fine-Tune Gemma 3 and Gemma 3n"
+title: "Fine-Tune Gemma 3n"
 description: ""
 position: 11
 ---
-This document explains how to fine-tune Gemma 3 and Gemma 3n using NeMo AutoModel. It outlines key operations, including initiating SFT and PEFT-LoRA runs and managing experiment configurations using YAML.
+This document explains how to fine-tune Gemma 3n using NeMo AutoModel. It outlines key operations, including initiating SFT and PEFT-LoRA runs and managing experiment configurations using YAML.
 
 To set up your environment to run NeMo AutoModel, follow the [Installation Guide](/get-started/installation).
 
@@ -59,17 +59,15 @@ conversation = [
 
 NeMo AutoModel provides specialized collate functions for different VLM processors. The collate function is responsible for batching examples and preparing them for model input.
 
-Both Gemma 3 and Gemma 3n models work seamlessly with the Hugging Face `AutoProcessor` and use the default collate function:
+Gemma 3n models work seamlessly with the Hugging Face `AutoProcessor` and use the default collate function:
 
 ```python
 from nemo_automodel.components.datasets.vlm.collate_fns import default_collate_fn
 from transformers import AutoProcessor
 
-processor = AutoProcessor.from_pretrained("google/gemma-3-4b-it")
-# For Gemma 3n, get processor:
-# processor = AutoProcessor.from_pretrained("google/gemma-3n-e4b-it")
+processor = AutoProcessor.from_pretrained("google/gemma-3n-e4b-it")
 
-# For Gemma 3 and Gemma 3n, call the maintained default collate function.
+# For Gemma 3n, call the maintained default collate function.
 batch = default_collate_fn([dataset[0]], processor)
 ```
 
@@ -118,7 +116,7 @@ Use the `automodel` CLI to launch fine-tuning with a YAML configuration file.
 
 NeMo AutoModel uses a flexible configuration system that combines YAML configuration files with command-line overrides. This allows you to maintain base configurations while easily experimenting with different parameters.
 
-The simplest way to run fine-tuning is with a YAML configuration file. We provide configs for both Gemma 3 and Gemma 3n.
+The simplest way to run fine-tuning is with a YAML configuration file. We provide configs for Gemma 3n.
 
 <Note>
 These VLM recipes require the optional `vlm` dependency set, plus `vlm-media` for Qwen vision preprocessing (`qwen_vl_utils`). If you see `ImportError: qwen_vl_utils is not installed`, install both first:
@@ -130,20 +128,6 @@ uv sync --frozen --extra vlm --extra vlm-media
 (If you're using pip: `pip3 install "nemo-automodel[vlm,vlm-media]"`.)
 
 </Note>
-
-#### Run Gemma 3 Fine-Tuning
-
-* **Single-GPU**
-
-```bash
-automodel examples/vlm_finetune/gemma3/gemma3_vl_4b_medpix.yaml
-```
-
-* **Multi-GPU**
-
-```bash
-automodel --nproc-per-node=2 examples/vlm_finetune/gemma3/gemma3_vl_4b_medpix.yaml
-```
 
 #### Run Gemma 3n Fine-Tuning
 
@@ -164,7 +148,7 @@ automodel --nproc-per-node=2 examples/vlm_finetune/gemma3n/gemma3n_vl_4b_medpix.
 You can override any configuration parameter using dot-notation without modifying the YAML file:
 
 ```bash
-automodel examples/vlm_finetune/gemma3/gemma3_vl_4b_medpix.yaml \
+automodel examples/vlm_finetune/gemma3n/gemma3n_vl_4b_medpix.yaml \
     --step_scheduler.ckpt_every_steps 100 \
     --step_scheduler.max_steps 1000 \
     --optimizer.lr 2e-5 \
@@ -186,12 +170,12 @@ freeze_config:
 
 ### Run Parameter-Efficient Fine-Tuning
 
-For memory-efficient training, you can use Low-Rank Adaptation (LoRA) instead of full fine-tuning. NeMo AutoModel provides a dedicated PEFT recipe for Gemma 3:
+For memory-efficient training, you can use Low-Rank Adaptation (LoRA) instead of full fine-tuning. NeMo AutoModel provides a dedicated PEFT recipe for Gemma 3n:
 
-To run PEFT with Gemma 3:
+To run PEFT with Gemma 3n:
 
 ```bash
-automodel examples/vlm_finetune/gemma3/gemma3_vl_4b_medpix_peft.yaml
+automodel examples/vlm_finetune/gemma3n/gemma3n_vl_4b_medpix_peft.yaml
 ```
 
 The LoRA configuration excludes vision components and the language-model head from adaptation to preserve pre-trained visual representations:
@@ -211,10 +195,6 @@ peft:
   alpha: 32
   use_triton: True
 ```
-
-The training loss should look similar to the example below:
-
-![Training Loss Curve](./medpix_peft.jpg)
 
 ### Checkpointing
 
@@ -242,13 +222,13 @@ Then, add the W&B configuration to your YAML file:
 wandb:
   project: nemo_automodel_vlm
   entity: your_entity
-  name: gemma3_medpix_vqa_experiment
+  name: gemma3n_medpix_vqa_experiment
   dir: ./wandb_logs
 ```
 
 ## Run Inference
 
-After fine-tuning your Gemma 3 or Gemma 3n model, you can use it for inference on new image-text tasks.
+After fine-tuning your Gemma 3n model, you can use it for inference on new image-text tasks.
 
 ### Generation Script
 
@@ -260,7 +240,7 @@ The inference functionality is provided through [`examples/vlm_generate/generate
 uv run examples/vlm_generate/generate.py \
     --checkpoint-path /path/to/checkpoint \
     --prompt "Describe this image." \
-    --base-model-path google/gemma-3-4b-it \
+    --base-model-path google/gemma-3n-e4b-it \
     --image /path/to/image.jpg
 ```
 
@@ -272,7 +252,7 @@ For models trained on MedPix-VQA, load the trained checkpoint and generate outpu
 uv run examples/vlm_generate/generate.py \
     --checkpoint-path vlm_checkpoints/epoch_0_step_200 \
     --prompt "What medical condition is shown in this image?" \
-    --base-model-path google/gemma-3-4b-it \
+    --base-model-path google/gemma-3n-e4b-it \
     --image medical_image.jpg
 ```
 
@@ -285,7 +265,7 @@ uv run examples/vlm_generate/generate.py \
     --checkpoint-path peft_vlm_checkpoints/epoch_0_step_200/ \
     --prompt "What medical condition is shown in this image?" \
     --image-url medical_image.jpg \
-    --base-model-path google/gemma-3-4b-it
+    --base-model-path google/gemma-3n-e4b-it
 ```
 
 Given the following image:

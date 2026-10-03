@@ -1,0 +1,70 @@
+---
+title: "deepseek-ai/DeepSeek-V3.2"
+description: "Use NeMo AutoModel to fine-tune deepseek-ai/DeepSeek-V3.2 for LLM workflows with checked-in text generation recipes and documented distributed settings."
+slug: model-coverage/large-language-models/deepseek-ai/DeepSeek-V3.2
+---
+
+[DeepSeek-V3.2](https://huggingface.co/deepseek-ai/DeepSeek-V3.2) has a checked-in NeMo AutoModel recipe for text generation.
+The Hugging Face configuration declares the `DeepseekV32ForCausalLM` architecture.
+
+## Quick Start
+
+Allocate 16 nodes with 8 GPUs each. Set `NODE_RANK` and `MASTER_ADDR` on every node; complete the recipe prerequisites in Model Context before launching.
+
+```bash
+uv run torchrun --nnodes 16 --nproc-per-node 8 \
+  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
+  -m nemo_automodel.cli.app examples/llm_benchmark/deepseek/dsv32_lora.yaml
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| LoRA Training Benchmark | Synthetic data; 16 nodes; PP4; EP32 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/deepseek/dsv32_lora.yaml) |
+
+## Model Context
+
+DeepSeek-V3.2 is used for text generation. Its model size is 685.36B checkpoint parameters.
+
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| **Architecture** | `DeepseekV32ForCausalLM` |
+| Parameters | 685.36B checkpoint parameters |
+| Decoder Layers | 61 |
+| Hidden Size | 7,168 |
+| Attention | 128 attention heads / 128 key-value heads |
+| Context Length | 163,840 tokens (checkpoint configuration) |
+| Vocabulary Size | 129,280 |
+| Experts | 256 routed / 1 shared / 8 selected per token |
+| Configured Dtype | `bfloat16` |
+
+### Configuration
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | - |
+| Strategy | FSDP2; tp_size=1, pp_size=4, cp_size=1, ep_size=32 |
+| Nodes | 16 |
+| Features | Activation checkpointing (activation_checkpointing=true), LoRA, Transformer Engine, DeepEP (dispatcher=deepep) |
+| Advanced | attention=te, linear=te, experts=gmm, dispatcher=deepep |
+
+### Workflow Notes
+
+Follow the [installation instructions](/get-started/installation).
+
+## Available Models
+
+- [`deepseek-ai/DeepSeek-V3.2`](https://huggingface.co/deepseek-ai/DeepSeek-V3.2)
+
+| Checkpoint | Type |
+| --- | --- |
+| [DeepSeek-V3.2](https://huggingface.co/deepseek-ai/DeepSeek-V3.2) | Checkpoint documented on this page |
+| [`deepseek-ai/DeepSeek-V3.2`](https://huggingface.co/deepseek-ai/DeepSeek-V3.2) | Checkpoint documented on this page |
+
+## Related Resources
+
+- [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/deepseek-ai/DeepSeek-V3.2/blob/a7e62ac04ecb2c0a54d736dc46601c5606cf10a6/config.json)

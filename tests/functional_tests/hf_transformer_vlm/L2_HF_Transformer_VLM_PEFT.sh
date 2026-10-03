@@ -17,7 +17,7 @@ set -xeuo pipefail # Exit immediately if a command exits with a non-zero status
 
 TRANSFORMERS_OFFLINE=1 coverage run \
 examples/vlm_finetune/finetune.py \
-  --config examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2_peft.yaml \
+  --config tests/functional_tests/hf_transformer_vlm/configs/gemma3_vl_4b_cord_v2_peft.yaml \
   --model.pretrained_model_name_or_path $TEST_DATA_DIR/hf_gemma3_2l/ \
   --step_scheduler.max_steps 3 \
   --step_scheduler.global_batch_size 1 \

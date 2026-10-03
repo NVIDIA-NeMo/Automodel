@@ -1,0 +1,60 @@
+---
+title: "zai-org/chatglm3-6b"
+description: "Fine-tune zai-org/chatglm3-6b with NeMo AutoModel using a checked-in LoRA recipe, with checkpoint and architecture details."
+slug: model-coverage/large-language-models/thudm/chatglm3-6b
+---
+
+[ChatGLM](https://github.com/zai-org/ChatGLM-6B) is a bilingual (Chinese-English) conversational language model from Zhipu AI. ChatGLM2 and ChatGLM3 extend the original with improved performance, longer context, and more efficient attention.
+
+Set up NeMo AutoModel with the
+[latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the
+[installation instructions](/get-started/installation).
+
+## Quick Start
+
+Follow the [installation instructions](/get-started/installation). From the repository root, use 8 GPUs. This is an example configuration; GPU training and memory use still require validation.
+
+```bash
+uv run automodel examples/llm_finetune/zai_org/chatglm3_6b_squad_peft.yaml --nproc-per-node 8
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| LoRA Fine-Tuning | SQuAD; 1 node | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/538848ea2e2dcc6f80a6eb8899fef72ede173ca5/examples/llm_finetune/zai_org/chatglm3_6b_squad_peft.yaml) |
+
+## Model Context
+
+chatglm3-6b is used for text generation. Its model size is 6B parameters.
+
+| Property | Value |
+| --- | --- |
+| Task | Text Generation |
+| **Architecture** | `ChatGLMModel` |
+| Parameters | 6B |
+| Hugging Face Organization | [zai-org](https://huggingface.co/zai-org) |
+| Decoder Layers | 28 |
+| Hidden Size | 4,096 |
+| Attention | 32 attention heads / 2 key-value heads |
+| Context Length | 8,192 tokens (checkpoint configuration) |
+| Vocabulary Size | 65,024 |
+| Configured Dtype | `float16` |
+
+- `ChatGLMModel` / `ChatGLMForConditionalGeneration`
+
+### Recipe Setup
+
+Read [chatglm3_6b_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/538848ea2e2dcc6f80a6eb8899fef72ede173ca5/examples/llm_finetune/zai_org/chatglm3_6b_squad_peft.yaml) for checkpoint access, data paths, and backend dependencies. It provides a small LoRA fine-tuning example.
+
+## Available Models
+
+| Model | HF ID |
+|---|---|
+| ChatGLM3 6B | [`zai-org/chatglm3-6b`](https://huggingface.co/zai-org/chatglm3-6b) |
+
+## Related Resources
+
+- [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/zai-org/chatglm3-6b/blob/e9e0406d062cdb887444fe5bd546833920abd4ac/config.json)

@@ -1,0 +1,84 @@
+---
+title: "deepseek-ai/DeepSeek-V4-Pro"
+description: "Fine-tune deepseek-ai/DeepSeek-V4-Pro with NeMo AutoModel using the checked-in multi-node recipe with pipeline and expert parallelism."
+slug: model-coverage/large-language-models/deepseek-ai/DeepSeek-V4-Pro
+---
+
+[DeepSeek-V4 Pro](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro) is a fine-grained mixture-of-experts language model supported by NeMo AutoModel's native DeepSeek-V4 implementation.
+
+## Quick Start
+
+Follow the [installation instructions](/get-started/installation). Allocate 64 nodes with 8 GPUs each; run on every node with `NODE_RANK` and `MASTER_ADDR` set. Complete the [recipe setup](#recipe-setup) before launching.
+
+```bash
+torchrun --nproc-per-node=8 \
+  --nnodes=64 \
+  --rdzv-backend=c10d \
+  --rdzv-endpoint="${MASTER_ADDR}:${MASTER_PORT}" \
+  -m nemo_automodel.recipes.llm.train_ft \
+  -c examples/llm_finetune/deepseek_v4/deepseek_v4_pro_hellaswag_all_tilelang_pp8_ep64_20steps.yaml
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Full Fine-Tuning | HellaSwag; 64 nodes; PP8; EP64 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v4/deepseek_v4_pro_hellaswag_all_tilelang_pp8_ep64_20steps.yaml) |
+
+## Model Context
+
+DeepSeek-V4-Pro is used for text generation (moe). Its model size is 1.573T language backbone / 1.599T including the auxiliary MTP module parameters.
+
+| Property | Value |
+|---|---|
+| **Task** | Text Generation (MoE) |
+| **Architecture** | `DeepseekV4ForCausalLM` |
+| **Experts** | 384 routed, 1 shared; 6 routed experts per token |
+| **HF Org** | [deepseek-ai](https://huggingface.co/deepseek-ai) |
+| Decoder Layers | 61 |
+| Hidden Size | 7,168 |
+| Attention | 128 attention heads / 1 key-value heads |
+| Context Length | 1,048,576 tokens (checkpoint configuration) |
+| Vocabulary Size | 129,280 |
+| Configured Dtype | `bfloat16` |
+| Parameters | 1.573T language backbone / 1.599T including the auxiliary MTP module |
+
+### Setup and Additional Examples
+
+This configuration uses PP8 and EP64 across 512 GPUs (64 nodes with 8 H100 GPUs
+per node), so it is not a single-node example. Launch it through Slurm or an
+external `torchrun` environment using the topology declared in the recipe. For
+example, after setting the rendezvous host and port for your cluster:
+
+```bash
+torchrun --nproc-per-node=8 \
+  --nnodes=64 \
+  --rdzv-backend=c10d \
+  --rdzv-endpoint="${MASTER_ADDR}:${MASTER_PORT}" \
+  -m nemo_automodel.recipes.llm.train_ft \
+  -c examples/llm_finetune/deepseek_v4/deepseek_v4_pro_hellaswag_all_tilelang_pp8_ep64_20steps.yaml
+```
+
+See the [Launcher Guide](/job-launchers/slurm-cluster) for cluster-specific
+setup and the [Large MoE Fine-Tuning Guide](/recipes-e2e-examples/large-moe-fine-tuning)
+for the full multi-node environment setup.
+
+### Recipe Setup
+
+Read [deepseek_v4_pro_hellaswag_all_tilelang_pp8_ep64_20steps.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v4/deepseek_v4_pro_hellaswag_all_tilelang_pp8_ep64_20steps.yaml) for checkpoint access, data paths, and backend dependencies. Use the [Slurm launcher guide](/job-launchers/slurm-cluster) to prepare the distributed allocation.
+
+### Workflow Notes
+
+Fine-tune deepseek-ai/DeepSeek-V4-Pro: [deepseek_v4_pro_hellaswag_all_tilelang_pp8_ep64_20steps.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v4/deepseek_v4_pro_hellaswag_all_tilelang_pp8_ep64_20steps.yaml). 64 nodes, 8 GPUs per node; see [Recipe Setup](#recipe-setup).
+
+## Available Models
+
+| Checkpoint | Type |
+| --- | --- |
+| [`deepseek-ai/DeepSeek-V4-Pro`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro) | Checkpoint linked by the example recipe |
+
+## Related Resources
+
+- [Installation Instructions](/get-started/installation)
+
+- [Checkpoint Configuration](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/blob/b5968e9190ef611bbf34a7229255be88a0e937c1/config.json)

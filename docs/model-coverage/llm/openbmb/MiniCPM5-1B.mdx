@@ -1,0 +1,67 @@
+---
+title: "openbmb/MiniCPM5-1B"
+description: "Fine-tune openbmb/MiniCPM5-1B with NeMo AutoModel: checked-in recipe, launch command, architecture, and model context, with setup guidance."
+slug: model-coverage/large-language-models/openbmb/MiniCPM5-1B
+---
+
+[MiniCPM](https://github.com/OpenBMB/MiniCPM) is a compact language model series from OpenBMB and Tsinghua University, designed to deliver strong performance at small parameter counts using model merging and continuous training techniques.
+
+Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
+
+## Quick Start
+
+From the repository root, run:
+
+```bash
+# Full fine-tuning
+uv run automodel examples/llm_finetune/minicpm/minicpm5_1b_squad.yaml --nproc-per-node 8
+
+# LoRA fine-tuning
+uv run automodel examples/llm_finetune/minicpm/minicpm5_1b_squad_peft.yaml --nproc-per-node 8
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Full Fine-Tuning | SQuAD; 1 node | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/minicpm/minicpm5_1b_squad.yaml) |
+| LoRA Fine-Tuning | SQuAD; 1 node | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/minicpm/minicpm5_1b_squad_peft.yaml) |
+
+## Model Context
+
+MiniCPM5-1B is used for text generation. Its model size is 1B parameters.
+
+| Property | Value |
+| --- | --- |
+| Task | Text Generation |
+| **Architecture** | `MiniCPMForCausalLM` / `MiniCPM3ForCausalLM` / `MiniCPM5ForCausalLM` |
+| Parameters | 1B |
+| Hugging Face Organization | [openbmb](https://huggingface.co/openbmb) |
+| Decoder Layers | 24 |
+| Hidden Size | 1,536 |
+| Attention | 16 attention heads / 2 key-value heads |
+| Context Length | 131,072 tokens (checkpoint configuration) |
+| Vocabulary Size | 130,560 |
+| Configured Dtype | `bfloat16` |
+
+- `MiniCPMForCausalLM` - MiniCPM v1/v2
+- `MiniCPM3ForCausalLM` - MiniCPM3
+- `MiniCPM5ForCausalLM` - MiniCPM5
+
+### Workflow Notes
+
+See [Available Models](#available-models).
+
+Follow the [installation instructions](/get-started/installation).
+
+## Available Models
+
+| Model | HF ID |
+|---|---|
+| MiniCPM5 1B | [`openbmb/MiniCPM5-1B`](https://huggingface.co/openbmb/MiniCPM5-1B) |
+
+## Related Resources
+
+- [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/openbmb/MiniCPM5-1B/blob/87179e5c1f455ef22e6223592d2d61351b525bfc/config.json)

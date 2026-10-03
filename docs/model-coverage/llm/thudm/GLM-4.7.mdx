@@ -1,0 +1,83 @@
+---
+title: "zai-org/GLM-4.7"
+description: "Use NeMo AutoModel to fine-tune zai-org/GLM-4.7 for LLM workflows with checked-in text generation recipes and documented distributed settings."
+slug: model-coverage/large-language-models/thudm/GLM-4.7
+---
+
+[GLM-4.7](https://huggingface.co/zai-org/GLM-4.7) has a checked-in NeMo AutoModel recipe for text generation.
+The Hugging Face configuration declares the `Glm4MoeForCausalLM` architecture.
+
+## Quick Start
+
+Allocate 16 nodes with 8 GPUs each. Set `NODE_RANK` and `MASTER_ADDR` on every node; complete the recipe prerequisites in Model Context before launching.
+
+```bash
+uv run torchrun --nnodes 16 --nproc-per-node 8 \
+  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
+  -m nemo_automodel.cli.app examples/llm_finetune/glm/glm_4.7_te_deepep.yaml
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Full Fine-Tuning | HellaSwag; 16 nodes; PP4; EP32 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_4.7_te_deepep.yaml) |
+| LoRA Training Benchmark | Synthetic data; 8 nodes; PP2; EP32 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/glm/glm47_lora.yaml) |
+
+## Model Context
+
+GLM-4.7 is used for text generation. Its model size is 358.34B checkpoint parameters.
+
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| **Architecture** | `Glm4MoeForCausalLM` |
+| Parameters | 358.34B checkpoint parameters |
+| Decoder Layers | 92 |
+| Hidden Size | 5,120 |
+| Attention | 96 attention heads / 8 key-value heads |
+| Context Length | 202,752 tokens (checkpoint configuration) |
+| Vocabulary Size | 151,552 |
+| Experts | 160 routed / 1 shared / 8 selected per token |
+| Configured Dtype | `bfloat16` |
+
+### Configuration
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | - |
+| Strategy | FSDP2; tp_size=1, pp_size=4, cp_size=1, ep_size=32 |
+| Nodes | 16 |
+| Features | HybridEP (dispatcher=hybridep) |
+| Advanced | dispatcher=hybridep |
+
+### GLM-4.7-Flash
+
+The GLM-4.7-Flash recipes use the native `Glm4MoeLiteForCausalLM` implementation. Choose a Flash recipe below when adapting that checkpoint rather than the full GLM-4.7 checkpoint.
+
+### More Recipes for This Model
+
+- [`glm47_lora.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/glm/glm47_lora.yaml)
+- [`glm_4.7_flash_lora.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/glm/glm_4.7_flash_lora.yaml)
+- [`glm_4.7_flash_te_deepep.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/glm/glm_4.7_flash_te_deepep.yaml)
+- [`glm_4.7_flash_te_deepep_lora.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/glm/glm_4.7_flash_te_deepep_lora.yaml)
+- [`glm_4.7_te_deepep.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/glm/glm_4.7_te_deepep.yaml)
+- [`glm_4.7_flash_te_deepep.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_4.7_flash_te_deepep.yaml)
+- [`glm_4.7_flash_te_packed_sequence.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_4.7_flash_te_packed_sequence.yaml)
+
+## Available Models
+
+- [`zai-org/GLM-4.7`](https://huggingface.co/zai-org/GLM-4.7)
+- [`zai-org/GLM-4.7-Flash`](https://huggingface.co/zai-org/GLM-4.7-Flash)
+
+| Checkpoint | Type |
+| --- | --- |
+| [GLM-4.7](https://huggingface.co/zai-org/GLM-4.7) | Checkpoint documented on this page |
+| [`zai-org/GLM-4.7`](https://huggingface.co/zai-org/GLM-4.7) | Checkpoint documented on this page |
+| [`zai-org/GLM-4.7-Flash`](https://huggingface.co/zai-org/GLM-4.7-Flash) | Checkpoint documented on this page |
+
+## Related Resources
+
+- [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/zai-org/GLM-4.7/blob/602d01efcdd332c5238ca4bcede555defbe83eb7/config.json)

@@ -1,0 +1,74 @@
+---
+title: "Qwen/Qwen2.5-0.5B"
+description: "Use NeMo AutoModel to fine-tune Qwen/Qwen2.5-0.5B for LLM workflows with checked-in text generation recipes and documented distributed settings."
+slug: model-coverage/large-language-models/qwen/Qwen2.5-0.5B
+---
+
+[Qwen2.5-0.5B](https://huggingface.co/Qwen/Qwen2.5-0.5B) has a checked-in NeMo AutoModel recipe for text generation.
+The Hugging Face configuration declares the `Qwen2ForCausalLM` architecture.
+
+## Quick Start
+
+Follow the [installation instructions](/get-started/installation), including MagiAttention dependencies. From the repository root, run the mock prefix-tree rollout example on one GPU:
+
+```bash
+automodel examples/llm_finetune/qwen/qwen25_magi_prefix_tree_rollouts.yaml --nproc-per-node 1
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Shared-Prefix Training Check | Synthetic data | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen25_magi_prefix_tree_rollouts.yaml) |
+
+## Model Context
+
+Qwen2.5-0.5B is used for text generation. Its model size is 494.0M checkpoint parameters.
+
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| **Architecture** | `Qwen2ForCausalLM` |
+| Parameters | 494.0M checkpoint parameters |
+| Decoder Layers | 24 |
+| Hidden Size | 896 |
+| Attention | 14 attention heads / 2 key-value heads |
+| Context Length | 32,768 tokens (checkpoint configuration) |
+| Vocabulary Size | 151,936 |
+| Configured Dtype | `bfloat16` |
+
+### Configuration
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | - |
+| Strategy | FSDP2; tp_size=1, pp_size=1, cp_size=1, ep_size=1 |
+| Nodes | - |
+| Features | Shared-prefix rollout groups, MagiAttention |
+| Advanced | local_batch_size=1, rope_fusion=false, linear=torch |
+
+### More Recipes for This Model
+
+- [`qwen25_magi_prefix_tree_rollouts.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen25_magi_prefix_tree_rollouts.yaml)
+- [`qwen2_5_0p5b_instruct_fineproofs_chat.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen2_5_0p5b_instruct_fineproofs_chat.yaml)
+
+### Workflow Notes
+
+Fine-tune with shared-prefix rollouts: Use the [MagiAttention recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen25_magi_prefix_tree_rollouts.yaml). Mock rollout groups; context parallelism is disabled.
+
+## Available Models
+
+- [`Qwen/Qwen2.5-0.5B`](https://huggingface.co/Qwen/Qwen2.5-0.5B)
+- [`Qwen/Qwen2.5-0.5B-Instruct`](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct)
+
+| Checkpoint | Type |
+| --- | --- |
+| [Qwen2.5-0.5B](https://huggingface.co/Qwen/Qwen2.5-0.5B) | Checkpoint documented on this page |
+| [`Qwen/Qwen2.5-0.5B`](https://huggingface.co/Qwen/Qwen2.5-0.5B) | Checkpoint documented on this page |
+| [`Qwen/Qwen2.5-0.5B-Instruct`](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct) | Checkpoint documented on this page |
+
+## Related Resources
+
+- [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/Qwen/Qwen2.5-0.5B/blob/060db6499f32faf8b98477b0a26969ef7d8b9987/config.json)

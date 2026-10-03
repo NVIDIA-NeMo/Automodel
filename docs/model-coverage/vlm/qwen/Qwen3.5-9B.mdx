@@ -1,0 +1,68 @@
+---
+title: "Qwen/Qwen3.5-9B"
+description: "Use NeMo AutoModel to fine-tune Qwen/Qwen3.5-9B for VLM workflows with checked-in image-text-to-text recipes and documented distributed settings."
+slug: model-coverage/vision-language-models/qwen/Qwen3.5-9B
+---
+
+[Qwen3.5-9B](https://huggingface.co/Qwen/Qwen3.5-9B) has a checked-in NeMo AutoModel recipe for image-text-to-text.
+The Hugging Face configuration declares the `Qwen3_5ForConditionalGeneration` architecture.
+
+## Quick Start
+
+Follow the [installation instructions](/get-started/installation), then review the checked-in recipe and
+its declared topology below before choosing a local or cluster launcher.
+
+```bash
+uv run automodel examples/vlm_finetune/qwen3_5/qwen3_5_9b.yaml \
+  --nproc-per-node 8
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Vision-Language Fine-Tuning | MedPix-VQA | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5/qwen3_5_9b.yaml) |
+
+## Model Context
+
+Qwen3.5-9B is used for image-text-to-text. Its model size is 9.65B checkpoint parameters.
+
+| Property | Value |
+| --- | --- |
+| Task | Image-text-to-text |
+| **Architecture** | `Qwen3_5ForConditionalGeneration` |
+| Parameters | 9.65B checkpoint parameters |
+| Decoder Layers | 32 |
+| Hidden Size | 4,096 |
+| Attention | 16 attention heads / 4 key-value heads |
+| Context Length | 262,144 tokens (checkpoint configuration) |
+| Vocabulary Size | 248,320 |
+
+### Configuration
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | - |
+| Strategy | tp_size=1; pp_size=1, cp_size=1, ep_size=1 |
+| Nodes | - |
+| Features | Checkpointing (enabled=true) |
+| Advanced | attention=sdpa, linear=torch |
+
+### Workflow Notes
+
+Follow the [installation instructions](/get-started/installation).
+
+## Available Models
+
+- [`Qwen/Qwen3.5-9B`](https://huggingface.co/Qwen/Qwen3.5-9B)
+
+| Checkpoint | Type |
+| --- | --- |
+| [Qwen3.5-9B](https://huggingface.co/Qwen/Qwen3.5-9B) | Checkpoint documented on this page |
+| [`Qwen/Qwen3.5-9B`](https://huggingface.co/Qwen/Qwen3.5-9B) | Checkpoint documented on this page |
+
+## Related Resources
+
+- [Vision-language model fine-tuning guide](/recipes-e2e-examples/gemma-3-3n)
+
+- [Checkpoint Configuration](https://huggingface.co/Qwen/Qwen3.5-9B/blob/c202236235762e1c871ad0ccb60c8ee5ba337b9a/config.json)

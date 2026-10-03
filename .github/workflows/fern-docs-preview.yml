@@ -130,6 +130,25 @@ jobs:
             cp -R "archived-source/$ROOT" "pr-source/$ROOT"
           done
 
+          # Pin links to retired recipes without changing archived prose/layout.
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          import subprocess
+
+          snapshot = "291a8f21681d86f0dbb4f91fb906d5219ea0d07a"
+          source = Path("pr-source")
+          pattern = re.compile(r"https://github\.com/NVIDIA-NeMo/Automodel/blob/main/(examples/[^\s)#]+\.ya?ml)")
+          for page in (source / "docs/fern/versions").glob("v*/pages/**/*"):
+              if not page.is_file() or page.suffix not in {".md", ".mdx"}:
+                  continue
+              def pin(match):
+                  recipe = match.group(1)
+                  exists = subprocess.run(["git", "-C", str(source), "cat-file", "-e", f"{snapshot}:{recipe}"], capture_output=True).returncode == 0
+                  return match.group(0).replace("/blob/main/", f"/blob/{snapshot}/") if not (source / recipe).is_file() and exists else match.group(0)
+              page.write_text(pattern.sub(pin, page.read_text()))
+          PY
+
       - name: Generate model coverage tables with trusted tooling
         run: |
           set -euo pipefail
@@ -172,6 +191,88 @@ jobs:
           done
           printf '%s\n' '{"organization":"nvidia","version":"5.139.0"}' \
             > "$RUNNER_TEMP/fern-preview/docs/fern/fern.config.json"
+
+      - name: Resolve model card paths in trusted navigation
+        run: |
+          python3 -I - <<'PYCODE'
+          import copy
+          import os
+          import re
+          from pathlib import Path
+
+          import yaml
+
+          preview = Path(os.environ["RUNNER_TEMP"]) / "fern-preview"
+          navigation_file = preview / "docs/fern/versions/nightly.yml"
+          navigation = yaml.safe_load(navigation_file.read_text(encoding="utf-8"))
+          coverage = next(item for item in navigation["navigation"] if item.get("section") == "Model Coverage")
+          categories = {item["slug"]: item for item in coverage["contents"] if "section" in item}
+          providers = {
+              item["slug"]: item
+              for category in categories.values()
+              for item in category["contents"]
+              if "section" in item
+          }
+          directories = {
+              "llm": "large-language-models", "vlm": "vision-language-models",
+              "multimodal": "multimodal", "omni": "omni", "dllm": "dllm",
+              "diffusion": "diffusion", "embedding": "embedding-models", "reranker": "reranking-models",
+          }
+          canonical_routes = set()
+          # Derive only card entries from content. Components, tooling, and all
+          # other navigation/configuration remain from the trusted checkout.
+          for directory, category_slug in directories.items():
+              category = categories[category_slug]
+              for card in sorted((preview / "docs/model-coverage" / directory).glob("*/*.mdx")):
+                  if card.stem == "index":
+                      continue
+                  provider_slug = card.parent.name
+                  if not all(re.fullmatch(r"[\w.-]+", name) for name in (provider_slug, card.stem)):
+                      raise ValueError(f"Invalid model card path: {card}")
+                  metadata = yaml.safe_load(card.read_text(encoding="utf-8").split("---", 2)[1])
+                  expected_slug = f"model-coverage/{category_slug}/{provider_slug}/{card.stem}"
+                  if metadata.get("slug") != expected_slug:
+                      raise ValueError(f"Model card filename must match its public checkpoint URL: {card}")
+                  canonical_routes.add("/" + expected_slug.casefold())
+                  provider = next((item for item in category["contents"] if item.get("slug") == provider_slug), None)
+                  if provider is None:
+                      # Reuse an existing trusted provider's name and icon.
+                      trusted_provider = providers[provider_slug]
+                      provider = {key: copy.deepcopy(trusted_provider[key]) for key in ("section", "slug", "icon")}
+                      provider["path"] = f"../../model-coverage/{directory}/{provider_slug}/index.mdx"
+                      provider["contents"] = []
+                      category["contents"].append(provider)
+                  page = next((item for item in provider["contents"] if item.get("page") == card.stem), None)
+                  if page is None:
+                      page = {"page": card.stem}
+                      provider["contents"].append(page)
+                  page["path"] = "../../" + card.relative_to(preview / "docs").as_posix()
+                  provider["contents"].sort(key=lambda item: item["page"].casefold())
+              overview = [item for item in category["contents"] if "section" not in item]
+              sections = []
+              for provider in (item for item in category["contents"] if "section" in item):
+                  # Explicit PR deletions remove the page and its trusted-main
+                  # navigation entry. Keep providers with surviving cards.
+                  provider["contents"] = [
+                      page for page in provider["contents"]
+                      if (navigation_file.parent / page["path"]).is_file()
+                  ]
+                  if provider["contents"]:
+                      sections.append(provider)
+              sections.sort(key=lambda item: item["section"].casefold())
+              category["contents"] = overview + sections
+          navigation_file.write_text(yaml.safe_dump(navigation, sort_keys=False), encoding="utf-8")
+
+          config_file = preview / "docs/fern/docs.yml"
+          config = yaml.safe_load(config_file.read_text(encoding="utf-8"))
+          # A newly restored canonical card supersedes main's retired-page alias.
+          config["redirects"] = [
+              item for item in config["redirects"]
+              if item["source"].removeprefix("/nemo/automodel/nightly").removeprefix("/nemo/automodel").casefold()
+              not in canonical_routes
+          ]
+          config_file.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+          PYCODE
 
       - name: Setup Node.js
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6

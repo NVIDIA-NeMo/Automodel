@@ -1,0 +1,55 @@
+---
+title: "Qwen/Qwen3-8B"
+description: "Convert and fine-tune Qwen/Qwen3-8B as a diffusion language model with NeMo AutoModel using the checked-in I-DLM recipe and text checkpoint."
+slug: model-coverage/dllm/qwen/Qwen3-8B
+---
+
+The I-DLM recipe converts the autoregressive [`Qwen/Qwen3-8B`](https://huggingface.co/Qwen/Qwen3-8B) checkpoint into a diffusion language model using an all-masked block-diffusion objective.
+
+## Quick Start
+
+From the repository root, run:
+
+```bash
+uv run torchrun --nproc-per-node=8 nemo_automodel/recipes/dllm/train_ft.py \
+  -c examples/dllm_sft/qwen3_8b_idlm.yaml
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| I-DLM Fine-Tuning | Nemotron post-training data | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/qwen3_8b_idlm.yaml) |
+
+## Model Context
+
+Qwen3-8B is used for diffusion language modeling. Its model size is 8B parameters.
+
+| Property | Value |
+|---|---|
+| **Task** | Diffusion Language Modeling |
+| **Architecture** | `Qwen3ForCausalLM` with the I-DLM objective |
+| **Parameters** | 8B |
+| **HF Org** | [Qwen](https://huggingface.co/Qwen) |
+| Decoder Layers | 36 |
+| Hidden Size | 4,096 |
+| Attention | 32 attention heads / 8 key-value heads |
+| Context Length | 40,960 tokens (checkpoint configuration) |
+| Vocabulary Size | 151,936 |
+| Configured Dtype | `bfloat16` |
+
+### Recipe Notes
+
+See the [dLLM Fine-Tuning Guide](/recipes-e2e-examples/dllm-fine-tuning).
+
+## Available Models
+
+| Checkpoint | Type |
+| --- | --- |
+| [`Qwen/Qwen3-8B`](https://huggingface.co/Qwen/Qwen3-8B) | Checkpoint linked by the example recipe |
+
+## Related Resources
+
+- [Installation Instructions](/get-started/installation)
+
+- [Checkpoint Configuration](https://huggingface.co/Qwen/Qwen3-8B/blob/b968826d9c46dd6066d109eabc6255188de91218/config.json)

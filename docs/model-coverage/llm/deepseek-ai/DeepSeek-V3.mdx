@@ -1,0 +1,71 @@
+---
+title: "deepseek-ai/DeepSeek-V3"
+description: "Benchmark deepseek-ai/DeepSeek-V3 with NeMo AutoModel using the checked-in recipe, launch command, architecture details, and checkpoint references."
+slug: model-coverage/large-language-models/deepseek-ai/DeepSeek-V3
+---
+
+[DeepSeek-V3](https://github.com/deepseek-ai/DeepSeek-V3) is a large-scale Mixture-of-Experts model with 671B total parameters and 37B activated per token. It features Multi-head Latent Attention (MLA), innovative load balancing, and Multi-Token Prediction (MTP). DeepSeek-V3.2 is an updated release with further improvements.
+
+[Moonlight](https://huggingface.co/moonshotai/Moonlight-16B-A3B) by Moonshot AI also uses this architecture with 16B total / 3B activated parameters.
+
+Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
+
+## Quick Start
+
+Follow the [installation instructions](/get-started/installation). Allocate 128 nodes with 8 GPUs each; run on every node with `NODE_RANK` and `MASTER_ADDR` set. Complete the [recipe setup](#recipe-setup) before launching.
+
+```bash
+uv run torchrun --nnodes 128 --nproc-per-node 8 \
+  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
+  -m nemo_automodel.cli.app examples/llm_benchmark/deepseek/deepseek_v3_te_deepep_1024.yaml
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Training Benchmark | Synthetic data; 128 nodes; PP4; EP64 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/deepseek/deepseek_v3_te_deepep_1024.yaml) |
+
+## Model Context
+
+DeepSeek-V3 is used for text generation (moe). Its model size is 671B total / 37B active parameters.
+
+| Property | Value |
+| --- | --- |
+| Task | Text Generation (MoE) |
+| **Architecture** | `DeepseekV3ForCausalLM` / `DeepseekV32ForCausalLM` |
+| Parameters | 671B total / 37B active |
+| Hugging Face Organization | [deepseek-ai](https://huggingface.co/deepseek-ai) |
+| Decoder Layers | 61 |
+| Hidden Size | 7,168 |
+| Attention | 128 attention heads / 128 key-value heads |
+| Context Length | 163,840 tokens (checkpoint configuration) |
+| Vocabulary Size | 129,280 |
+| Experts | 256 routed / 1 shared / 8 selected per token |
+| Configured Dtype | `bfloat16` |
+
+### Recipe Setup
+
+Read [deepseek_v3_te_deepep_1024.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/deepseek/deepseek_v3_te_deepep_1024.yaml) for checkpoint access, data paths, and backend dependencies. Use the [Slurm launcher guide](/job-launchers/slurm-cluster) to prepare the distributed allocation.
+
+### Workflow Notes
+
+Benchmark deepseek-ai/DeepSeek-V3: [deepseek_v3_te_deepep_1024.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/deepseek/deepseek_v3_te_deepep_1024.yaml). 128 nodes, 8 GPUs per node; see [Recipe Setup](#recipe-setup).
+
+See [Available Models](#available-models).
+
+Follow the [installation instructions](/get-started/installation).
+
+## Available Models
+
+| Model | HF ID |
+|---|---|
+| DeepSeek-V3 | [`deepseek-ai/DeepSeek-V3`](https://huggingface.co/deepseek-ai/DeepSeek-V3) |
+| DeepSeek-V3-Base | [`deepseek-ai/DeepSeek-V3-Base`](https://huggingface.co/deepseek-ai/DeepSeek-V3-Base) |
+
+## Related Resources
+
+- [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
+- [Large MoE Fine-Tuning Guide](/recipes-e2e-examples/large-moe-fine-tuning)
+
+- [Checkpoint Configuration](https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/e815299b0bcbac849fa540c768ef21845365c9eb/config.json)

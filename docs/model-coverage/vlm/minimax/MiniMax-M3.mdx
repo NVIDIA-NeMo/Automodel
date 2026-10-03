@@ -1,0 +1,102 @@
+---
+title: "MiniMaxAI/MiniMax-M3"
+description: "Fine-tune MiniMaxAI/MiniMax-M3 text-only on Tulu-3 or with MedPix vision-language data using NeMo AutoModel supervised fine-tuning recipes."
+slug: model-coverage/vision-language-models/minimax/MiniMax-M3
+---
+
+[MiniMaxAI/MiniMax-M3](https://huggingface.co/MiniMaxAI/MiniMax-M3) is MiniMaxAI's 428B A22B Mixture-of-Experts first vision-language model combining long-context reasoning, agentic workflows, and creative capabilities in a single platform.
+
+## Quick Start
+
+Follow the [installation instructions](/get-started/installation). Allocate 16 nodes with 8 GPUs each; run on every node with `NODE_RANK` and `MASTER_ADDR` set. Complete the [recipe setup](#recipe-setup) before launching.
+
+```bash
+uv run torchrun --nnodes 16 --nproc-per-node 8 \
+  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
+  -m nemo_automodel.cli.app examples/vlm_finetune/minimax_m3/minimax_m3_vl_sft_ep32pp4.yaml
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Vision-Language Fine-Tuning | MedPix-VQA; 16 nodes; PP4; EP32 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/minimax_m3/minimax_m3_vl_sft_ep32pp4.yaml) |
+| Vision-Language Fine-Tuning | MedPix-VQA; 16 nodes; PP4; CP2; EP32 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/minimax_m3/minimax_m3_vl_sft_cp2_medpix_2k.yaml) |
+| Text Fine-Tuning | Tulu-3; 16 nodes; PP4; CP8; EP32 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/minimax_m3/minimax_m3_vl_sft_tulu3_text_cp8_16k.yaml) |
+| LoRA Fine-Tuning | MedPix-VQA; 8 nodes; PP4; EP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/minimax_m3/minimax_m3_vl_lora_pp4ep8_8node.yaml) |
+
+## Model Context
+
+MiniMax-M3 is used for image-text-to-text / video-text-to-text. Its model size is 427.04B checkpoint parameters.
+
+| Property | Value |
+|---|---|
+| **Task** | Image-Text-to-Text / Video-Text-to-Text |
+| **Architecture** | `MiniMaxM3SparseForConditionalGeneration` - 428B total / 22B active MoE VLM |
+| **Language Module** | MiniMax-M2.7 backbone, 60 layers, 128 experts, MiniMax Sparse Attention (MSA) |
+| **Vision Module** |  CLIP-style ViT, 32 layers, image size 336x336 up to 2016x2016 |
+| **Context Window** | 512k tokens |
+| **Precision** | BF16 and MXFP8 |
+| **HF Org** | [MiniMaxAI](https://huggingface.co/MiniMaxAI) |
+| Parameters | 427.04B checkpoint parameters |
+| Decoder Layers | 60 |
+| Hidden Size | 6,144 |
+| Attention | 64 attention heads / 4 key-value heads |
+| Context Length | 1,048,576 tokens (checkpoint configuration) |
+| Vocabulary Size | 200,064 |
+| Experts | 128 routed / 1 shared / 4 selected per token |
+| Configured Dtype | `bfloat16` |
+
+### Positioning
+
+MiniMax-M3 targets advanced use cases such as long-form video understanding, extended coding tasks (8+ hours), and high-quality design workflows supporting upto 1M context length.
+
+### Architecture
+
+- **Language backbone:** derived from  MiniMax-M2.7 with 60 layers (3 dense + 57 MoE), 64 attention heads, 128 experts, block-sparse attention called MiniMax Sparse Attention (MSA) on the MoE layers and a 512k context length.
+- **Vision backbone:** CLIP-style ViT with 32 layers and dynamic resolution image input from 336x336 up to 2016x2016.
+- **Optimization target:** trained on Hopper GPUs, with BF16 and FP8 support.
+
+### Key Strengths
+
+- **Ultra-long context via MSA (MiniMax Sparse Attention).** A block-sparse attention design that avoids full attention's quadratic cost enabling up to 1M-token context.
+- **Frontier coding and agentic performance.** Positioned as a coding and agent-first model, with strong benchmark numbers and good at multi-turn, collaborative agent behavior.
+- **Native multimodality (image, video, desktop use).** It supports image and video input and can operate a desktop computer.
+- **Long-horizon autonomous execution on complex real-world tasks.** Can work over hours to a full day without human intervention.
+
+### Example Recipes
+
+- [Full SFT - MedPix, EP32 + PP4](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/minimax_m3/minimax_m3_vl_sft_ep32pp4.yaml)
+- [Full SFT - MedPix CP2 comparison](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/minimax_m3/minimax_m3_vl_sft_cp2_medpix_2k.yaml)
+- [Full SFT - Tulu 3 text, CP8](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/minimax_m3/minimax_m3_vl_sft_tulu3_text_cp8_16k.yaml)
+- [LoRA - MedPix, PP4 + EP8](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/minimax_m3/minimax_m3_vl_lora_pp4ep8_8node.yaml)
+
+See the [MiniMax-M3 fine-tuning guide](/recipes-e2e-examples/minimax-m3) for the training setup and launch notes.
+
+### Setup and Additional Examples
+
+Review the recipes in [Choose a Workflow](#choose-a-workflow), including their
+hardware and data requirements. Follow the [installation instructions](/get-started/installation)
+before launching a recipe.
+
+### Recipe Setup
+
+Read [minimax_m3_vl_sft_ep32pp4.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/minimax_m3/minimax_m3_vl_sft_ep32pp4.yaml) for checkpoint access, data paths, and backend dependencies. Use the [Slurm launcher guide](/job-launchers/slurm-cluster) to prepare the distributed allocation.
+
+### Workflow Notes
+
+Fine-tune MiniMaxAI/MiniMax-M3: [minimax_m3_vl_sft_ep32pp4.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/minimax_m3/minimax_m3_vl_sft_ep32pp4.yaml). 16 nodes, 8 GPUs per node; see [Recipe Setup](#recipe-setup).
+
+## Available Models
+
+- **MiniMax-M3** - registered as `MiniMaxM3SparseForConditionalGeneration` model class.
+
+| Model | HF ID |
+|---|---|
+| MiniMax-M3 | [`MiniMaxAI/MiniMax-M3`](https://huggingface.co/MiniMaxAI/MiniMax-M3) |
+
+## Related Resources
+
+- [MiniMaxAI/MiniMax-M3](https://huggingface.co/MiniMaxAI/MiniMax-M3)
+
+- [Checkpoint Configuration](https://huggingface.co/MiniMaxAI/MiniMax-M3/blob/f0e1c1e04d40177e4673a22097036854f536e9c0/config.json)

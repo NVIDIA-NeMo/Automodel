@@ -1,0 +1,76 @@
+---
+title: "ByteDance-Seed/BAGEL-7B-MoT"
+description: "Fine-tune ByteDance-Seed/BAGEL-7B-MoT with NeMo AutoModel: checked-in recipe, launch command, architecture, and model context."
+slug: model-coverage/multimodal/bytedance-seed/BAGEL-7B-MoT
+---
+
+[BAGEL-7B-MoT](https://huggingface.co/ByteDance-Seed/BAGEL-7B-MoT) is a unified multimodal model from ByteDance Seed. It combines a Qwen2 language backbone, a SigLIP-NaViT vision encoder, and mixture-of-transformations layers for mixed understanding and visual-generation training.
+
+Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
+
+## Quick Start
+
+Follow the [installation instructions](/get-started/installation). From the repository root, use 8 GPUs. Complete the [recipe setup](#recipe-setup) before launching.
+
+```bash
+uv run automodel examples/multimodal_finetune/bagel/bagel_sft.yaml --nproc-per-node 8
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Multimodal Pretraining | Prepared image, editing, and VLM data | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/multimodal_pretrain/bagel/bagel_pretrain.yaml) |
+| Multimodal Fine-Tuning | Prepared image, editing, and VLM data | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/multimodal_finetune/bagel/bagel_sft.yaml) |
+
+## Model Context
+
+BAGEL-7B-MoT is used for multimodal input/output. Its model size is 14B (two 7B towers) parameters.
+
+| Property | Value |
+| --- | --- |
+| Task | Multimodal Input/Output |
+| **Architecture** | `BagelForUnifiedMultimodal`, `BagelForConditionalGeneration` |
+| Parameters | 14B (two 7B towers) |
+| Hugging Face Organization | [ByteDance-Seed](https://huggingface.co/ByteDance-Seed) |
+| Decoder Layers | 28 |
+| Hidden Size | 3,584 |
+| Attention | 28 attention heads / 4 key-value heads |
+| Context Length | 32,768 tokens (checkpoint configuration) |
+| Vocabulary Size | 152,064 |
+| Configured Dtype | `bfloat16` |
+
+### Pretrain BAGEL-7B-MoT
+
+From the repository root, run:
+
+```bash
+uv run automodel --nproc-per-node=8 examples/multimodal_pretrain/bagel/bagel_pretrain.yaml
+```
+
+### Setup and Additional Examples
+
+Review the recipes in [Choose a Workflow](#choose-a-workflow), including their
+hardware and data requirements. Follow the [installation instructions](/get-started/installation)
+before launching a recipe.
+
+### Recipe Setup
+
+Read [bagel_sft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/multimodal_finetune/bagel/bagel_sft.yaml) for checkpoint access, data paths, and backend dependencies.
+
+### Workflow Notes
+
+Fine-tune ByteDance-Seed/BAGEL-7B-MoT: [bagel_sft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/multimodal_finetune/bagel/bagel_sft.yaml). 1 node, 8 GPUs per node; see [Recipe Setup](#recipe-setup).
+
+## Available Models
+
+| Model | HF ID |
+|---|---|
+| BAGEL-7B-MoT | [`ByteDance-Seed/BAGEL-7B-MoT`](https://huggingface.co/ByteDance-Seed/BAGEL-7B-MoT) |
+| [Qwen/Qwen2.5-7B-Instruct](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct) | Language initializer for BAGEL pretraining |
+
+## Related Resources
+
+- [Pretraining Guide](/recipes-e2e-examples/pretraining)
+
+- [Checkpoint Configuration](https://huggingface.co/ByteDance-Seed/BAGEL-7B-MoT/blob/5019f57d168e5816e8f3f701b17cc816bb7cf24b/config.json)

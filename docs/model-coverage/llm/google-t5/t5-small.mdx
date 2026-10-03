@@ -1,0 +1,53 @@
+---
+title: "google-t5/t5-small"
+description: "Use google-t5/t5-small with NeMo AutoModel for text-to-text generation, with supported architecture details, canonical checkpoints, and recipe references."
+slug: model-coverage/large-language-models/google-t5/t5-small
+---
+
+[T5](https://huggingface.co/google-t5/t5-small) is a compact member of Google's encoder-decoder text-to-text transformer family.
+
+## Quick Start
+
+From the repository root, run:
+
+```bash
+uv run automodel --nproc-per-node=8 examples/llm_finetune/t5/t5_small_squad.yaml
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Full Fine-Tuning | SQuAD; 1 node | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/t5/t5_small_squad.yaml) |
+
+## Model Context
+
+t5-small is used for text-to-text generation. Its model size is 60.5M checkpoint parameters.
+
+| Property | Value |
+|---|---|
+| **Task** | Text-to-Text Generation |
+| **Architecture** | `T5ForConditionalGeneration` |
+| **HF Org** | [google-t5](https://huggingface.co/google-t5) |
+| Parameters | 60.5M checkpoint parameters |
+| Decoder Layers | 6 |
+| Hidden Size | 512 |
+| Attention | 8 attention heads |
+| Context Length | 512 tokens (checkpoint configuration) |
+| Vocabulary Size | 32,128 |
+
+### Recipe Notes
+
+See the [Installation Guide](/get-started/installation) and [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).
+
+## Available Models
+
+| Checkpoint | Type |
+| --- | --- |
+| [`google-t5/t5-small`](https://huggingface.co/google-t5/t5-small) | Checkpoint linked by the example recipe |
+
+## Related Resources
+
+- [Installation Instructions](/get-started/installation)
+
+- [Checkpoint Configuration](https://huggingface.co/google-t5/t5-small/blob/df1b051c49625cf57a3d0d8d3863ed4d13564fe4/config.json)

@@ -1,0 +1,90 @@
+---
+title: "meta-llama/Llama-3.1-70B"
+description: "Use NeMo AutoModel to fine-tune meta-llama/Llama-3.1-70B for LLM workflows with checked-in text generation recipes and documented distributed settings."
+slug: model-coverage/large-language-models/meta/Llama-3.1-70B
+---
+
+[Llama-3.1-70B](https://huggingface.co/meta-llama/Llama-3.1-70B) has a checked-in NeMo AutoModel recipe for text generation.
+The Hugging Face configuration declares the `LlamaForCausalLM` architecture.
+
+## Quick Start
+
+
+This launches packed-sequence fine-tuning on SQuAD across four nodes with eight
+GPUs each. Follow the [installation instructions](/get-started/installation)
+and complete [recipe setup](#recipe-setup). From the repository root, run on
+each node with `MASTER_ADDR` and `NODE_RANK` set:
+
+```bash
+uv run torchrun --nnodes 4 --nproc-per-node 8 \
+  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" \
+  --master-port 29500 \
+  -m nemo_automodel.cli.app examples/llm_pretrain/llama3_70b_pretrain.yaml
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Full Fine-Tuning (Packed Sequences) | SQuAD; 4 nodes x 8 GPUs; TP4; PP4; 4,096-token packs | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/llama3_70b_pretrain.yaml) |
+| Training Benchmark | Synthetic data; 8 nodes; CP2 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/llama3_3/custom_llama3_1_70b_pretrain_benchmark_8nodes.yaml) |
+
+## Model Context
+
+Llama-3.1-70B is used for text generation. Its model size is 70.55B checkpoint parameters.
+
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| **Architecture** | `LlamaForCausalLM` |
+| Parameters | 70.55B checkpoint parameters |
+| Decoder Layers | 80 |
+| Hidden Size | 8,192 |
+| Attention | 64 attention heads / 8 key-value heads |
+| Context Length | 131,072 tokens (checkpoint configuration) |
+| Vocabulary Size | 128,256 |
+| Configured Dtype | `bfloat16` |
+
+### Configuration
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | - |
+| Strategy | FSDP2; tp_size=4, pp_size=4, cp_size=1 |
+| Nodes | - |
+| Features | Activation checkpointing (activation_checkpointing=true), Packed sequences (packed_sequence_size=4096) |
+| Advanced | bfloat16 |
+
+### More Recipes for This Model
+
+- [`custom_llama3_1_70b_pretrain_benchmark_8nodes.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/llama3_3/custom_llama3_1_70b_pretrain_benchmark_8nodes.yaml)
+
+### Setup and Additional Examples
+
+Follow the [installation instructions](/get-started/installation), then review the checked-in recipe and
+its declared topology below before choosing a local or cluster launcher.
+
+### Recipe Setup
+
+Set `MASTER_ADDR` to the first node hostname and give each node its own `NODE_RANK` from 0 to 3. The recipe configures DP2, TP4, and PP4 for 32 GPU processes.
+
+Read [llama3_70b_pretrain.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/llama3_70b_pretrain.yaml) for checkpoint access, data paths, and backend dependencies.
+
+### Workflow Notes
+
+Packed-sequence fine-tuning: [llama3_70b_pretrain.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/llama3_70b_pretrain.yaml). 4 nodes, 8 GPUs per node; see [Recipe Setup](#recipe-setup).
+
+## Available Models
+
+- [`meta-llama/Llama-3.1-70B`](https://huggingface.co/meta-llama/Llama-3.1-70B)
+
+| Checkpoint | Type |
+| --- | --- |
+| [Llama-3.1-70B](https://huggingface.co/meta-llama/Llama-3.1-70B) | Checkpoint documented on this page |
+| [`meta-llama/Llama-3.1-70B`](https://huggingface.co/meta-llama/Llama-3.1-70B) | Checkpoint documented on this page |
+
+## Related Resources
+
+- [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/meta-llama/Llama-3.1-70B/blob/349b2ddb53ce8f2849a6c168a81980ab25258dac/config.json)

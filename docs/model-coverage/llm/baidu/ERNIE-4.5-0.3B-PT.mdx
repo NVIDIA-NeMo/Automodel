@@ -1,0 +1,57 @@
+---
+title: "baidu/ERNIE-4.5-0.3B-PT"
+description: "Fine-tune baidu/ERNIE-4.5-0.3B-PT with NeMo AutoModel: checked-in recipe, launch command, architecture, and model context."
+slug: model-coverage/large-language-models/baidu/ERNIE-4.5-0.3B-PT
+---
+
+[ERNIE 4.5](https://huggingface.co/baidu) is Baidu's dense and Mixture-of-Experts language model family with long-context text checkpoints on Hugging Face.
+
+Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
+
+## Quick Start
+
+From the repository root, run:
+
+```bash
+uv run automodel --nproc-per-node=8 examples/llm_finetune/ernie4_5/ernie4_5_0p3b_hellaswag.yaml
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Full Fine-Tuning | HellaSwag | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/ernie4_5/ernie4_5_0p3b_hellaswag.yaml) |
+
+## Model Context
+
+ERNIE-4.5-0.3B-PT is used for text generation. Its model size is 0.36B parameters.
+
+| Property | Value |
+| --- | --- |
+| Task | Text Generation |
+| Architectures | `Ernie4_5ForCausalLM`, `Ernie4_5_MoeForCausalLM` |
+| Parameters | 0.36B |
+| Context Length | 131,072 tokens |
+| Hugging Face Organization | [baidu](https://huggingface.co/baidu) |
+| **Architecture** | `Ernie4_5ForCausalLM` |
+| Decoder Layers | 18 |
+| Hidden Size | 1,024 |
+| Attention | 16 attention heads / 2 key-value heads |
+| Vocabulary Size | 103,424 |
+| Configured Dtype | `bfloat16` |
+
+- `Ernie4_5ForCausalLM`: dense Hugging Face implementation path.
+- `Ernie4_5_MoeForCausalLM`: custom NeMo AutoModel implementation with expert parallelism support.
+
+## Available Models
+
+| Model | HF ID |
+|---|---|
+| ERNIE 4.5 0.3B PT | [`baidu/ERNIE-4.5-0.3B-PT`](https://huggingface.co/baidu/ERNIE-4.5-0.3B-PT) |
+
+## Related Resources
+
+- [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft)
+- [Large MoE Fine-Tuning Guide](/recipes-e2e-examples/large-moe-fine-tuning)
+
+- [Checkpoint Configuration](https://huggingface.co/baidu/ERNIE-4.5-0.3B-PT/blob/b565cf6caebdb7a1eadf00100857b1ed5e044f12/config.json)

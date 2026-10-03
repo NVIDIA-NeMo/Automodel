@@ -1,0 +1,71 @@
+---
+title: "moonshotai/Kimi-K2.5"
+description: "Use NeMo AutoModel to fine-tune moonshotai/Kimi-K2.5 for VLM workflows with checked-in image-text-to-text recipes and documented distributed settings."
+slug: model-coverage/vision-language-models/moonshotai/Kimi-K2.5
+---
+
+[Kimi-K2.5](https://huggingface.co/moonshotai/Kimi-K2.5) has a checked-in NeMo AutoModel recipe for image-text-to-text.
+The Hugging Face configuration declares the `KimiK25ForConditionalGeneration` architecture.
+
+## Quick Start
+
+Allocate 32 nodes with 8 GPUs each. Set `NODE_RANK` and `MASTER_ADDR` on every node; complete the recipe prerequisites in Model Context before launching.
+
+```bash
+uv run torchrun --nnodes 32 --nproc-per-node 8 \
+  --node-rank "$NODE_RANK" --master-addr "$MASTER_ADDR" --master-port 29500 \
+  -m nemo_automodel.cli.app examples/vlm_finetune/kimi/kimi25vl_medpix.yaml
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| Vision-Language Fine-Tuning | MedPix-VQA; 32 nodes; PP8; EP32 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/kimi/kimi25vl_medpix.yaml) |
+| LoRA Training Benchmark | Synthetic data; 16 nodes; PP4; EP32 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_benchmark/kimi/kimi25vl_lora.yaml) |
+
+## Model Context
+
+Kimi-K2.5 is used for image-text-to-text. Its model size is 1T total / 32B activated parameters.
+
+| Property | Value |
+| --- | --- |
+| Task | Image-text-to-text |
+| **Architecture** | `KimiK25ForConditionalGeneration` |
+| Parameters | 1T total / 32B activated |
+| Decoder Layers | 61 |
+| Hidden Size | 7,168 |
+| Attention | 64 attention heads / 64 key-value heads |
+| Context Length | 262,144 tokens (checkpoint configuration) |
+| Vocabulary Size | 163,840 |
+| Experts | 384 routed / 1 shared / 8 selected per token |
+| Configured Dtype | `bfloat16` |
+
+### Configuration
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | - |
+| Strategy | FSDP2; tp_size=1, pp_size=8, cp_size=1, ep_size=32 |
+| Nodes | 32 |
+| Features | Transformer Engine, DeepEP (dispatcher=deepep) |
+| Advanced | bfloat16, attention=te, linear=torch, experts=gmm, dispatcher=deepep |
+
+### More Recipes for This Model
+
+- [`kimi25vl_lora.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_benchmark/kimi/kimi25vl_lora.yaml)
+
+## Available Models
+
+- [`moonshotai/Kimi-K2.5`](https://huggingface.co/moonshotai/Kimi-K2.5)
+
+| Checkpoint | Type |
+| --- | --- |
+| [Kimi-K2.5](https://huggingface.co/moonshotai/Kimi-K2.5) | Checkpoint documented on this page |
+| [`moonshotai/Kimi-K2.5`](https://huggingface.co/moonshotai/Kimi-K2.5) | Checkpoint documented on this page |
+
+## Related Resources
+
+- [Vision-language model fine-tuning guide](/recipes-e2e-examples/gemma-3-3n)
+
+- [Checkpoint Configuration](https://huggingface.co/moonshotai/Kimi-K2.5/blob/4d01dfe0332d63057c186e0b262165819efb6611/config.json)

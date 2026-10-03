@@ -1,0 +1,67 @@
+---
+title: "mistralai/Devstral-2-123B-Instruct-2512"
+description: "Use NeMo AutoModel to fine-tune mistralai/Devstral-2-123B-Instruct-2512 for LLM workflows with checked-in text generation recipes and documented distributed settings."
+slug: model-coverage/large-language-models/mistralai/Devstral-2-123B-Instruct-2512
+---
+
+[Devstral-2-123B-Instruct-2512](https://huggingface.co/mistralai/Devstral-2-123B-Instruct-2512) has a checked-in NeMo AutoModel recipe for text generation.
+The Hugging Face configuration declares the `Ministral3ForCausalLM` architecture.
+
+## Quick Start
+
+Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+
+```bash
+automodel examples/llm_finetune/devstral/devstral2_123b_2512_squad_peft.yaml --nproc-per-node 8
+```
+
+## Choose a Workflow
+
+| Workflow | Example Setup | Recipe |
+| --- | --- | --- |
+| LoRA Fine-Tuning | SQuAD; 1 node; TP8 | [View YAML](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/devstral/devstral2_123b_2512_squad_peft.yaml) |
+
+## Model Context
+
+Devstral-2-123B-Instruct-2512 is used for text generation. Its model size is 125.03B checkpoint parameters.
+
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| **Architecture** | `Ministral3ForCausalLM` |
+| Parameters | 125.03B checkpoint parameters |
+| Decoder Layers | 88 |
+| Hidden Size | 12,288 |
+| Attention | 96 attention heads / 8 key-value heads |
+| Context Length | 262,144 tokens (checkpoint configuration) |
+| Vocabulary Size | 131,072 |
+| Configured Dtype | `bfloat16` |
+
+### Configuration
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | - |
+| Strategy | FSDP2; tp_size=8, pp_size=1, cp_size=1, ep_size=1 |
+| Nodes | 1 |
+| Features | Checkpointing (enabled=true), Activation checkpointing (activation_checkpointing=true), LoRA |
+| Advanced | bfloat16 |
+
+### Workflow Notes
+
+Follow the [installation instructions](/get-started/installation).
+
+## Available Models
+
+- [`mistralai/Devstral-2-123B-Instruct-2512`](https://huggingface.co/mistralai/Devstral-2-123B-Instruct-2512)
+
+| Checkpoint | Type |
+| --- | --- |
+| [Devstral-2-123B-Instruct-2512](https://huggingface.co/mistralai/Devstral-2-123B-Instruct-2512) | Checkpoint documented on this page |
+| [`mistralai/Devstral-2-123B-Instruct-2512`](https://huggingface.co/mistralai/Devstral-2-123B-Instruct-2512) | Checkpoint documented on this page |
+
+## Related Resources
+
+- [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)
+
+- [Checkpoint Configuration](https://huggingface.co/mistralai/Devstral-2-123B-Instruct-2512/blob/1613bf01adb5e1c6fdc196b46e6b173eae75eb4a/config.json)
