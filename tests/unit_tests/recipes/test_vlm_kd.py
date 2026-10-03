@@ -133,9 +133,7 @@ class _Cfg:
         ({"offload_teacher_model": True}, True, "cpu"),
     ],
 )
-def test_setup_sets_offload_flag_and_teacher_device(
-    monkeypatch, cfg_overrides, expected_offload, expected_device
-):
+def test_setup_sets_offload_flag_and_teacher_device(monkeypatch, cfg_overrides, expected_offload, expected_device):
     captured = {}
 
     def fake_build_teacher_model(**kwargs):
