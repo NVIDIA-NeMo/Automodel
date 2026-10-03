@@ -367,7 +367,8 @@ class TestNeatPackedVlmCollater:
         # n_images_per_sample
         assert result["n_images_per_sample"].tolist() == [1, 2]
 
-    def test_flash_emits_varlen_kwargs_and_no_mask(self):
+    @pytest.mark.parametrize("attn_implementation", ["flash_attention_2", "flash_attention_3", "flash_attention_4"])
+    def test_flash_emits_varlen_kwargs_and_no_mask(self, attn_implementation):
         batch = [
             {
                 "input_ids": torch.tensor([1, 2, 3, 0]),
@@ -382,7 +383,7 @@ class TestNeatPackedVlmCollater:
                 "position_ids": torch.tensor([0, 1, 2, 3]),
             },
         ]
-        result = neat_packed_vlm_collater(batch, attn_implementation="flash_attention_2")
+        result = neat_packed_vlm_collater(batch, attn_implementation=attn_implementation)
 
         # No attention_mask so HF takes the varlen-kwargs branch (not _upad_input).
         assert "attention_mask" not in result
