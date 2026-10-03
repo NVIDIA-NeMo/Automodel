@@ -214,6 +214,40 @@ def test_apply_mxfp4_to_moe_experts_handles_deepep(moe_config):
     assert model.experts is converted
 
 
+@pytest.mark.parametrize("device", ("cpu", "meta"))
+def test_frozen_mxfp4_conversion_preserves_hybridep_settings(moe_config: MoEConfig, device: str) -> None:
+    """Non-LoRA expert conversion retains the configured HybridEP routing and tuning."""
+    backend = BackendConfig(
+        experts="torch_mm",
+        dispatcher="hybridep",
+        dispatcher_hybridep_permute_fusion=True,
+        dispatcher_hybridep_compact_routing=True,
+        dispatcher_hybridep_num_sms_preprocessing=12,
+        dispatcher_hybridep_num_blocks_permute=16,
+        dispatcher_hybridep_num_blocks_unpermute=20,
+    )
+    with torch.device(device), torch.no_grad():
+        original = GroupedExpertsDeepEP(moe_config, backend, dispatcher_backend=backend.dispatcher)
+        original.init_weights(torch.device(device))
+    model = torch.nn.Module()
+    model.add_module("experts", original)
+    if device == "meta":
+        model.state_dict_adapter = MagicMock()
+
+    apply_mxfp4_to_moe_experts(model)
+
+    converted = model.experts
+    assert isinstance(converted, GroupedExpertsDeepEPMXFP4)
+    assert converted.dispatcher_backend == "hybridep"
+    assert converted.dispatcher_hybridep_permute_fusion is True
+    assert converted.dispatcher_hybridep_compact_routing is True
+    assert converted.dispatcher_hybridep_num_sms_preprocessing == 12
+    assert converted.dispatcher_hybridep_num_blocks_permute == 16
+    assert converted.dispatcher_hybridep_num_blocks_unpermute == 20
+    assert all(not param.requires_grad for param in converted.parameters())
+    assert converted.gate_and_up_projs_packed.is_meta == (device == "meta")
+
+
 # --- forward numerics (mock dispatcher) ---------------------------------------
 
 

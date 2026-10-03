@@ -1258,7 +1258,7 @@ def __init_model(
     ):
         try:
             logger.info("Using streaming BnB quantization for memory-efficient loading")
-            return _init_model_bnb_streaming(
+            _, model = _init_model_bnb_streaming(
                 cls,
                 pretrained_model_name_or_path,
                 hf_config,
@@ -1267,6 +1267,7 @@ def __init_model(
                 quantization_config,
                 **kwargs,
             )
+            return False, model, None
         except FileNotFoundError:
             logger.warning(
                 "Streaming BnB loading unavailable (no safetensors checkpoint); falling back to standard HF loading."
@@ -1325,7 +1326,7 @@ def __init_model(
         except KeyError:
             pass  # fallback to use the model class from the model object
         model.__class__ = _get_mixin_wrapped_class(hf_model_cls)
-        return False, model
+        return False, model, None
 
     # 2. If we have a custom model implementation available, we prioritize that over HF
     model_cls = _resolve_custom_model_cls_for_config(hf_config)
@@ -1358,16 +1359,20 @@ def __init_model(
             config_overrides = dict_config_overrides | _consume_config_overrides(
                 hf_config, kwargs, init_param_names=init_param_names
             )
-            kwargs = _filter_kwargs_for_init(model_cls, kwargs)
             # Coerce plain-dict backend (e.g. from CLI --model.backend.attn sdpa) to BackendConfig
             if "backend" in kwargs and isinstance(kwargs["backend"], dict):
                 backend_config_resolver = getattr(model_cls, "backend_config_resolver", None)
                 if backend_config_resolver is not None:
                     kwargs["backend"] = backend_config_resolver(kwargs["backend"])
                 else:
-                    from nemo_automodel.components.models.common.utils import BackendConfig
-
                     kwargs["backend"] = BackendConfig(**kwargs["backend"])
+            uses_native_fa4 = getattr(model_cls, "_uses_native_fa4", False) is True
+            if kwargs.get("backend") is None and attn_implementation == "flash_attention_4" and uses_native_fa4:
+                # The HF alias supplies a default only. An explicit native
+                # backend remains authoritative, including model-specific configs.
+                kwargs["backend"] = BackendConfig(attn="fa4")
+            resolved_backend = kwargs.get("backend")
+            kwargs = _filter_kwargs_for_init(model_cls, kwargs)
             with local_torch_dtype(torch_dtype, model_cls.__name__):
                 model = model_cls(hf_config, *model_args, **kwargs)
             if is_pretrained_init:
@@ -1379,7 +1384,7 @@ def __init_model(
                 restore_pretrained_generation_config(
                     model, pretrained_model_name_or_path, config_overrides=config_overrides, **loading_kwargs
                 )
-            return True, model
+            return True, model, resolved_backend
 
     # 3. fallback to HF model class wrapped with mixin
     model = None
@@ -1452,7 +1457,7 @@ def __init_model(
     except KeyError:
         pass  # fallback to use the model class from the model object
     model.__class__ = _get_mixin_wrapped_class(hf_model_cls)
-    return False, model
+    return False, model, None
 
 
 def _tie_weights_nemo(model):
@@ -1550,11 +1555,7 @@ def _init_model(
     *model_args,
     **kwargs,
 ):
-    requested_backend = kwargs.get("backend")
-    if isinstance(requested_backend, dict):
-        requested_backend = BackendConfig(**requested_backend)
-
-    is_custom_model, model = __init_model(
+    is_custom_model, model, resolved_backend = __init_model(
         cls,
         pretrained_model_name_or_path_or_config,
         attn_implementation,
@@ -1564,10 +1565,13 @@ def _init_model(
         *model_args,
         **kwargs,
     )
-    if is_custom_model and requested_backend is not None:
-        _apply_backend_module_overrides(model, requested_backend)
+    if is_custom_model and isinstance(resolved_backend, BackendConfig):
+        model_backend = getattr(model, "backend", None)
+        if isinstance(model_backend, BackendConfig):
+            resolved_backend = model_backend
+        _apply_backend_module_overrides(model, resolved_backend)
         if not hasattr(model, "backend"):
-            model.backend = requested_backend
+            model.backend = resolved_backend
 
     # https://github.com/NVIDIA-NeMo/Automodel/blob/a3a57176f68add7917faaa32f19228f49fcbb1ba/examples/llm_finetune/nemotron_flash/nemotron_flash_1b_squad.yaml#L41
     # this happens in nemotron_flash, where we load using force_hf, and the model is pre 5.x
