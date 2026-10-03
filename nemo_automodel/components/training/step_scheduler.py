@@ -218,9 +218,16 @@ class StepScheduler(Stateful):
     def set_epoch(self, epoch: int):
         """
         Set the epoch for the sampler.
+
+        Delegates to the dataloader when it owns the choice of sampler, which is what
+        keeps a ``batch_sampler``-based loader reshuffling per epoch.
         """
         self.epoch = epoch
-        if hasattr(getattr(self.dataloader, "sampler", None), "set_epoch"):
+        # ParallelAwareDataloader knows which sampler it built; fall back to .sampler for
+        # a plain DataLoader that does not expose set_epoch itself.
+        if hasattr(self.dataloader, "set_epoch"):
+            self.dataloader.set_epoch(epoch)
+        elif hasattr(getattr(self.dataloader, "sampler", None), "set_epoch"):
             self.dataloader.sampler.set_epoch(epoch)
 
     @property
