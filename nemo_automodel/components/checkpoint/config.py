@@ -133,6 +133,9 @@ class CheckpointingConfig:
     # Retain this many recent checkpoint directories. Preserve checkpoints targeted by checkpoint-root pointers,
     # such as `LATEST` and `LOWEST_VAL`, in addition to the recent window. `None` keeps all checkpoints.
     max_recent_checkpoints: int | None = None
+    # Recipes quantize only the final scheduled model save; intermediate checkpoints stay resumable.
+    # Requires a supporting model adapter. Independent of when HF files are consolidated.
+    quantization: bool = False
 
     def __post_init__(self):
         """Resolve the cache dir, enforce PEFT constraints, and coerce the save format/mode."""
@@ -140,6 +143,10 @@ class CheckpointingConfig:
             raise ValueError("checkpoint.consolidation_timeout_minutes must be greater than 0")
         if not isinstance(self.allow_legacy_pickle_restore, bool):
             raise ValueError("checkpoint.allow_legacy_pickle_restore must be a boolean")
+        if not isinstance(self.quantization, bool):
+            raise ValueError("checkpoint.quantization must be a boolean")
+        if self.quantization and (self.is_peft or self.model_save_format != "safetensors"):
+            raise ValueError("checkpoint.quantization requires full-model safetensors saving, not PEFT or torch_save")
 
         if self.model_cache_dir is None:
             self.model_cache_dir = hf_constants.HF_HUB_CACHE

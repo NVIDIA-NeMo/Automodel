@@ -16,6 +16,7 @@ import glob
 import json
 import os
 import shutil
+from copy import deepcopy
 from typing import TYPE_CHECKING, Protocol
 
 import torch
@@ -68,6 +69,8 @@ def _save_generated_hf_assets(
     v4_compatible: bool,
     model_config=None,
     save_custom_model_code: bool = True,
+    *,
+    quantization: bool = False,
 ) -> None:
     """Run the existing generated Hugging Face metadata export path."""
     if save_custom_model_code:
@@ -75,6 +78,8 @@ def _save_generated_hf_assets(
 
     config = model_config if model_config is not None else getattr(model_part, "config", None)
     if config is not None:
+        # Metadata cleanup is an export operation, not a change to the live model.
+        config = deepcopy(config)
         config_name = "config.json"
         if v4_compatible and _config_exists(metadata_reference_path, config_name):
             _save_original_config_json(metadata_reference_path, hf_metadata_dir, config_name)
@@ -101,6 +106,18 @@ def _save_generated_hf_assets(
             else:
                 # Diffusers models use FrozenDict for config instead of PretrainedConfig
                 json.dump(dict(config), f, indent=2, default=str)
+
+    adapter = getattr(_unwrap_ddp_model(model_part), "state_dict_adapter", None)
+    if isinstance(adapter, StateDictAdapter):
+        # Adapt both the original v4 config and the generated config, preserving
+        # unrelated HF metadata. The adapter owns model-specific nesting/targets.
+        for config_name in ("config.json", "config.v5.json"):
+            config_path = os.path.join(hf_metadata_dir, config_name)
+            if os.path.isfile(config_path):
+                with open(config_path) as f:
+                    export_config = adapter.adapt_hf_config_for_save(json.load(f), quantization=quantization)
+                with open(config_path, "w") as f:
+                    json.dump(export_config, f, indent=2)
 
     if getattr(model_part, "generation_config", None) is not None:
         config_name = "generation_config.json"
@@ -202,6 +219,7 @@ class ConsolidatedHFAddon:
                     hf_metadata_dir,
                     tokenizer,
                     v4_compatible=kwargs.get("v4_compatible", False),
+                    quantization=kwargs.get("quantization", False),
                 )
 
             # save the fqn_to_file_index_mapping file

@@ -59,6 +59,24 @@ class StateDictAdapter(ABC):
 
     _supports_low_memory_dcp_load: bool = False
 
+    def adapt_hf_config_for_save(self, config: dict[str, Any], *, quantization: bool = False) -> dict[str, Any]:
+        """Return HF metadata matching this adapter's exported tensor format.
+
+        Quantized export is opt-in: adapters must implement both real weight
+        encoding and matching metadata. Load-only packed-buffer implementations
+        must not be used to export trained weights. The input must not be mutated.
+
+        Args:
+            config: Serialized HF config dictionary at the metadata-writing boundary.
+            quantization: Whether the save requests model-specific quantized weights.
+
+        Returns:
+            HF config dictionary matching the adapter's tensor representation.
+        """
+        if quantization:
+            raise NotImplementedError(f"{type(self).__name__} does not support quantized checkpoint export.")
+        return config
+
     @property
     def supports_low_memory_dcp_load(self) -> bool:
         """Whether DCP can load the checkpoint with zero or small temporary tensors.

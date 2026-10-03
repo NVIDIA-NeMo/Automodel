@@ -242,6 +242,8 @@ class BaseRecipe:
         Save the current training state as a checkpoint.
 
         As long as the object has a 'load_state_dict' and 'state_dict' function, it will be saved.
+        With ``checkpoint.quantization=True``, only the final scheduled model save is quantized
+        for deployment. Intermediate checkpoints remain unquantized for training resume.
 
         Args:
             epoch (int): The current epoch.
@@ -300,6 +302,7 @@ class BaseRecipe:
         model, optimizer, scheduler, tokenizer, config = None, None, None, None, None
         step_scheduler = getattr(self, "step_scheduler", None)
         is_final_checkpoint = bool(getattr(step_scheduler, "is_last_step", False))
+        quantization = self.checkpointer.config.quantization and is_final_checkpoint
 
         for key in sorted(self.__dict__["__state_tracked"]):
             if is_model(getattr(self, key)):
@@ -342,6 +345,7 @@ class BaseRecipe:
                 peft_config=self.peft_config,
                 tokenizer=tokenizer,
                 is_final_checkpoint=is_final_checkpoint,
+                quantization=quantization,
             )
         else:
             unwrapped_model = model[0] if isinstance(model, list) else model
@@ -361,6 +365,7 @@ class BaseRecipe:
                         tokenizer=tokenizer,
                         peft_config=self.peft_config,
                         is_final_checkpoint=is_final_checkpoint,
+                        quantization=quantization,
                     )
                 else:
                     self.checkpointer.save_model(
@@ -369,6 +374,7 @@ class BaseRecipe:
                         peft_config=self.peft_config,
                         tokenizer=tokenizer,
                         is_final_checkpoint=is_final_checkpoint,
+                        quantization=quantization,
                     )
             else:
                 self.checkpointer.save_model(
@@ -377,6 +383,7 @@ class BaseRecipe:
                     peft_config=self.peft_config,
                     tokenizer=tokenizer,
                     is_final_checkpoint=is_final_checkpoint,
+                    quantization=quantization,
                 )
 
         # Sync before checkpointing for Dion

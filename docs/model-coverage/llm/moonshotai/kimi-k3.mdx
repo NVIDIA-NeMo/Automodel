@@ -39,6 +39,64 @@ See the [Slurm Launcher Guide](/job-launchers/slurm-cluster) for multi-node setu
 - Stable LatentMoE routes each token to 16 of 896 routed experts and includes two shared experts. The expert MLPs use SiTU-GLU.
 - The released checkpoint uses MXFP4 weights. The example recipe dequantizes the base checkpoint while loading it for BF16 training.
 
+## Export Trained Experts to MXFP4
+
+The state-dict adapter supports post-training MXFP4 export of routed expert
+`w1`, `w2`, and `w3` weights. It writes packed E2M1 bytes and one E8M0 scale
+per 32 input-channel values, together with matching compressed-tensors metadata.
+Shared experts, latent projections, routers, attention, vision, and other weights
+retain their existing export precision.
+
+For automatic final-step quantization in the training recipe, add:
+
+```yaml
+step_scheduler:
+  ckpt_every_steps: 50
+
+checkpoint:
+  enabled: true
+  model_save_format: safetensors
+  save_consolidated: final
+  quantization: true
+```
+
+Intermediate checkpoints keep floating-point weights for resume. Only the final
+scheduled save quantizes routed experts to MXFP4, with HF output under
+`<checkpoint_dir>/epoch_<epoch>_step_<step>/model/consolidated`.
+`save_consolidated` controls file consolidation, not quantization. The quantized
+final checkpoint is a deployment artifact, not a lossless training-resume
+checkpoint; to resume, set `restore_from.path` to an earlier unquantized checkpoint
+rather than `LATEST` after training completes. Keep that checkpoint when configuring
+retention. Omitting `checkpoint.quantization` preserves unquantized saves at every step.
+
+Save the in-memory trained model with `quantization=True` on every rank, using
+the existing checkpointer configured for safetensors and consolidated output:
+
+```python
+model.save_pretrained(
+    "/exports/kimi-k3-mxfp4",
+    checkpointer=checkpointer,
+    tokenizer=tokenizer,
+    quantization=True,
+    is_final_checkpoint=True,
+)
+```
+
+Output is under `/exports/kimi-k3-mxfp4/model/consolidated`. The same keyword
+is available on `Checkpointer.save_model(...)`; no prior checkpoint or separate
+conversion script is required. Expert-parallel export supports complete local
+experts, not shards within an expert. Omitting the flag keeps the existing
+unquantized save behavior. Kimi K2.5 uses the same flag for its INT4 format.
+
+<Note>
+This is weight-only post-training quantization, not Kimi K3 QAT or native MXFP4
+training. It uses power-of-two scales rounded up to cover each block maximum
+and nearest-even E2M1 rounding, without calibration. Evaluate downstream quality
+before deployment. Regular training checkpoints remain unquantized by default;
+keep them for training resume. PEFT adapters must be merged into full weights
+before quantized export.
+</Note>
+
 ## Parallelism
 
 | Parallelism | Validated Configuration |

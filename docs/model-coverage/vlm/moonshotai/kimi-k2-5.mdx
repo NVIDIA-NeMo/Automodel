@@ -17,6 +17,58 @@ automodel examples/vlm_finetune/kimi/kimi25vl_medpix.yaml --nproc-per-node 8
 
 Use the [Slurm launcher guide](/job-launchers/slurm-cluster) for the multi-node run.
 
+## Save Trained Experts as INT4
+
+For automatic final-step quantization in the training recipe, add:
+
+```yaml
+step_scheduler:
+  ckpt_every_steps: 50
+
+checkpoint:
+  enabled: true
+  model_save_format: safetensors
+  save_consolidated: final
+  quantization: true
+```
+
+Intermediate checkpoints keep floating-point weights for resume. Only the final
+scheduled save quantizes routed experts to INT4, with HF output under
+`<checkpoint_dir>/epoch_<epoch>_step_<step>/model/consolidated`.
+`save_consolidated` controls file consolidation, not quantization. The quantized
+final checkpoint is a deployment artifact, not a lossless training-resume
+checkpoint; to resume, set `restore_from.path` to an earlier unquantized checkpoint
+rather than `LATEST` after training completes. Keep that checkpoint when configuring
+retention. Omitting `checkpoint.quantization` preserves unquantized saves at every step.
+
+Pass `quantization=True` when saving the in-memory trained model. Kimi K2.5
+reuses its group-32 INT4 encoder for routed experts; shared experts, attention,
+vision, and other weights retain their existing precision. Use a checkpointer
+configured with `model_save_format="safetensors"` and `save_consolidated=True`:
+
+```python
+model.save_pretrained(
+    "/exports/kimi-k25-int4",
+    checkpointer=checkpointer,
+    tokenizer=tokenizer,
+    quantization=True,
+    is_final_checkpoint=True,
+)
+```
+
+Call this on every distributed rank. The consolidated checkpoint is written to
+`/exports/kimi-k25-int4/model/consolidated`, with matching compressed-tensors
+metadata. `Checkpointer.save_model(..., quantization=True)` provides the same
+option. No old checkpoint or separate conversion script is needed.
+
+<Note>
+The default remains `quantization=False` for ordinary training saves. This is
+post-training weight quantization, not QAT; evaluate quality before deployment
+and keep an unquantized checkpoint for training resume. Merge PEFT adapters into
+full weights before requesting quantized export. Kimi K3 uses the same save
+flag for MXFP4 rather than INT4.
+</Note>
+
 ## Choose a Workflow
 
 | Goal | Start Here |

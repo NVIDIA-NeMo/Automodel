@@ -56,6 +56,7 @@ class TestHFCheckpointingMixinSavePretrained:
             peft_config=None,
             tokenizer=None,
             is_final_checkpoint=False,
+            quantization=False,
         )
 
     def test_save_pretrained_passes_peft_config(self):
@@ -72,6 +73,7 @@ class TestHFCheckpointingMixinSavePretrained:
             peft_config=peft_config,
             tokenizer=None,
             is_final_checkpoint=False,
+            quantization=False,
         )
 
     def test_save_pretrained_passes_tokenizer(self):
@@ -88,6 +90,7 @@ class TestHFCheckpointingMixinSavePretrained:
             peft_config=None,
             tokenizer=mock_tokenizer,
             is_final_checkpoint=False,
+            quantization=False,
         )
 
     def test_save_pretrained_passes_is_final_checkpoint(self):
@@ -103,7 +106,14 @@ class TestHFCheckpointingMixinSavePretrained:
             peft_config=None,
             tokenizer=None,
             is_final_checkpoint=True,
+            quantization=False,
         )
+
+    def test_save_pretrained_passes_quantization(self):
+        model = SimpleModelWithMixin()
+        checkpointer = MagicMock()
+        model.save_pretrained("/tmp/export", checkpointer=checkpointer, quantization=True)
+        assert checkpointer.save_model.call_args.kwargs["quantization"] is True
 
 
 if __name__ == "__main__":
