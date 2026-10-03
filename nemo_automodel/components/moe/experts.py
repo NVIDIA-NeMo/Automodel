@@ -1154,6 +1154,9 @@ def _checkpointed_chunked_expert_mlp(
     is allocated once and populated by slice assignment; no concatenation or
     stateful scratch buffer is used.
 
+    The checkpoint callback captures the input dtype rather than the routed
+    tensor so an enclosing activation checkpoint can release that tensor.
+
     This helper is for the plain ``torch._grouped_mm`` path. MXFP8 uses a
     different quantization contract and remains on its existing whole-dispatch
     implementation.
@@ -1192,6 +1195,8 @@ def _checkpointed_chunked_expert_mlp(
     if down_proj_bias is not None and down_proj_bias.dtype in (torch.float16, torch.bfloat16):
         down_proj_bias = down_proj_bias.float()
 
+    hidden_dtype = hidden_states.dtype
+
     def run_chunk(
         chunk_hidden,
         chunk_probs,
@@ -1229,7 +1234,7 @@ def _checkpointed_chunked_expert_mlp(
             None if apply_router_weight_after_down else chunk_probs,
         )
         if apply_router_weight_after_down:
-            expert_output = _apply_router_weight_fp32(expert_output, chunk_probs, hidden_states.dtype)
+            expert_output = _apply_router_weight_fp32(expert_output, chunk_probs, hidden_dtype)
         return expert_output
 
     for chunk_start in range(0, hidden_states.shape[0], _BIAS_CHUNK_ROWS):
