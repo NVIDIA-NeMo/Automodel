@@ -55,6 +55,7 @@ from nemo_automodel.components.models.mimo_v2_flash.vision import MiMoVisionTran
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MLP, MoE
+from nemo_automodel.shared.import_utils import is_te_min_version
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
@@ -385,6 +386,7 @@ class MiMoV2FlashAttention(nn.Module):
         )
         self.attn_module = None
         self.attn_func = None
+        self._te_v_head_dim = self.v_head_dim
         if backend.attn == "te":
             if self.v_head_dim > self.head_dim:
                 raise ValueError(
@@ -395,10 +397,9 @@ class MiMoV2FlashAttention(nn.Module):
                 attn_impl="te",
                 num_attention_heads=self.num_attention_heads,
                 num_qk_channels=self.head_dim,
-                # TE a2a CP cannot combine sliding/sink attention with unequal QK/V
-                # dimensions. Padding V is mathematically exact because the padded
-                # output channels are cropped before o_proj.
-                num_v_channels=self.head_dim,
+                # Preserve native QK/V dimensions for CP1. Blackwell training
+                # supports 192/128, while padding V to 192 disables fused attention.
+                num_v_channels=self.v_head_dim,
                 softmax_scale=self.scaling,
                 attn_mask_type="causal",
                 qkv_format="bshd",
@@ -448,6 +449,11 @@ class MiMoV2FlashAttention(nn.Module):
         self._validate_a2a_cp_size(cp_size)
         if cp_size <= 1:
             return
+        # TE >= 2.16 supports native unequal QK/V dimensions with a2a CP.
+        # Keep the padded path for older TE on Hopper; Blackwell training
+        # needs native 192/128 because its fused kernel rejects V=192.
+        self._te_v_head_dim = self.v_head_dim if is_te_min_version("2.16") else self.head_dim
+        self.attn_module.hidden_size_per_attention_head_v = self._te_v_head_dim
         cp_stream = cp_stream if cp_stream is not None else torch.cuda.Stream()
         cp_group = cp_mesh.get_group()
         cp_ranks = torch.distributed.get_process_group_ranks(cp_group)
@@ -490,7 +496,20 @@ class MiMoV2FlashAttention(nn.Module):
         attention_mask: torch.Tensor | None,
         **kwargs: Any,
     ) -> torch.Tensor:
-        """Run TE attention, zero-padding V for the exact MiMo a2a kernel path."""
+        """Run TE attention with native V dimensions, padding for legacy TE a2a CP.
+
+        Args:
+            hidden_states: Tensor of shape [batch, sequence, hidden] for BSHD,
+                or [tokens, hidden] for THD; a singleton batch is also accepted.
+            position_embeddings: Cosine and sine tensors aligned to the input
+                sequence, each ending in the rotary feature dimension.
+            attention_mask: Optional mask of shape [batch, sequence] for BSHD.
+            **kwargs: TE attention metadata, including one-dimensional cumulative
+                sequence-length tensors for THD inputs.
+
+        Returns:
+            Attention output with the same shape as hidden_states.
+        """
         explicit_thd = kwargs.get("qkv_format") == "thd" or kwargs.get("cu_seqlens") is not None
         qkv_format = "thd" if explicit_thd else "bshd"
         restore_batch_dim = False
@@ -520,7 +539,8 @@ class MiMoV2FlashAttention(nn.Module):
         query_rope, key_rope = self._apply_te_rope(query_rope, key_rope, cos, sin, qkv_format=qkv_format)
         query_states = torch.cat((query_rope, query_nope), dim=-1)
         key_states = torch.cat((key_rope, key_nope), dim=-1)
-        value_states = F.pad(value_states, (0, self.head_dim - self.v_head_dim))
+        if self._te_v_head_dim != self.v_head_dim:
+            value_states = F.pad(value_states, (0, self._te_v_head_dim - self.v_head_dim))
 
         if (
             qkv_format == "thd"
@@ -544,7 +564,7 @@ class MiMoV2FlashAttention(nn.Module):
         assert self.attn_func is not None
         output = self.attn_func(query_states, key_states, value_states, **attn_kwargs)
         output = postprocess_output_for_attn(output, "te")
-        output = output.view(*prefix, self.num_attention_heads, self.head_dim)[..., : self.v_head_dim]
+        output = output.view(*prefix, self.num_attention_heads, self._te_v_head_dim)[..., : self.v_head_dim]
         output = self.o_proj(output.flatten(-2))
         return output.unsqueeze(0) if restore_batch_dim else output
 
