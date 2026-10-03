@@ -87,7 +87,7 @@ class DeepseekV4MTPBlock(nn.Module):
             mtp_attn_cfg.compress_ratios = ratios
         self.self_attn = DeepseekV4Attention(mtp_attn_cfg, layer_idx=layer_idx, backend=backend)
         self.mlp = MoE(moe_config, backend)
-        if int(getattr(config, "vision_n_layers", 0) or 0) > 0 and not backend.fake_balanced_gate:
+        if int(getattr(config, "vision_n_layers", 0) or 0) > 0:
             # Imported lazily because model.py imports this module lazily for the
             # same circular-dependency reason. Released vision checkpoints carry
             # ``bias_vl`` for every MTP gate even though MTP is inference-only in

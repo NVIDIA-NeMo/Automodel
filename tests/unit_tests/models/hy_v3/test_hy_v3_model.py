@@ -29,7 +29,7 @@ from nemo_automodel.components.models.hy_v3.model import (
     ModelClass,
 )
 from nemo_automodel.components.moe.config import MoEConfig
-from nemo_automodel.components.moe.layers import MLP, FakeBalancedGate, MoE
+from nemo_automodel.components.moe.layers import MLP, Gate, MoE
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 
@@ -361,7 +361,7 @@ class TestHYV3ForCausalLM:
                     model.update_moe_gate_bias()
                     mock.assert_not_called()
 
-    def test_update_moe_gate_bias_no_op_with_fake_balanced_gate(self, config, backend_config, device):
+    def test_update_moe_gate_bias_keeps_learned_gate_with_fake_balanced_gate(self, config, backend_config, device):
         config.num_hidden_layers = 4
         backend_config.fake_balanced_gate = True
         model = HYV3ForCausalLM(config, backend=backend_config).to(device)
@@ -370,7 +370,7 @@ class TestHYV3ForCausalLM:
         assert len(model.model.layers) == 4
         assert moe_layers
         for layer in moe_layers:
-            assert isinstance(layer.mlp.gate, FakeBalancedGate)
+            assert isinstance(layer.mlp.gate, Gate)
             assert layer.mlp.gate.bias_update_factor == 0.0
 
         with ExitStack() as stack:

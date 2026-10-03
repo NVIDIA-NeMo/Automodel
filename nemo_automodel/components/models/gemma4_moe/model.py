@@ -300,6 +300,15 @@ class Gemma4MoE(MoE):
         input to the experts.  The decoder layer calls this with
         ``gate_input=x`` (raw residual) so the gate receives unnormalized
         input while experts receive ``pre_feedforward_layernorm_2(x)``.
+
+        Args:
+            x: Local expert inputs of shape [..., hidden], with arbitrary leading dimensions.
+            padding_mask: Optional boolean mask of shape x.shape[:-1], true for padding.
+            cp_mesh: Optional context-parallel mesh for the gate.
+            gate_input: Optional local router inputs with the same shape as x.
+
+        Returns:
+            Tensor with the same shape as x.
         """
         if cp_mesh is None:
             cp_mesh = self.cp_mesh
@@ -314,6 +323,7 @@ class Gemma4MoE(MoE):
         # Use separate gate_input for routing when provided (fixes double-norm)
         g = gate_input.view(-1, self.dim) if gate_input is not None else x
         weights, indices, aux_loss = self.gate(g, token_mask, cp_mesh)
+        indices = self._maybe_balance_routing(indices, g)
 
         x_latent = self.fc1_latent_proj(x) if self.fc1_latent_proj is not None else x
         y = self.experts(x_latent, token_mask, weights, indices)

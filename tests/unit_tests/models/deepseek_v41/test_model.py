@@ -117,22 +117,26 @@ def test_full_tiny_ced_model_trains_after_meta_initialization() -> None:
 
 
 def test_fake_balanced_gate_is_honored() -> None:
-    """With ``BackendConfig.fake_balanced_gate`` every MoE layer routes through the ``FakeBalancedGate`` that
-    ``MoE`` builds (forced balance for benchmarks, as in DeepSeek-V4); weight init and a forward/backward run on
-    it, and the default backend still installs the learned ``DeepseekV4VisionGate``."""
+    """Synthetic assignments retain the model's modality-aware gate and its gradients."""
     torch.manual_seed(8)
     backend = replace(_backend(), fake_balanced_gate=True)
     with torch.device("meta"):
         model = DeepseekV41ForCausalLM(_tiny_config(), backend=backend)
     gates = [layer.ffn.gate for layer in model.model.layers.values()]
-    assert gates and all(isinstance(gate, FakeBalancedGate) for gate in gates)
+    assert gates and all(isinstance(gate, DeepseekV4VisionGate) for gate in gates)
+    assert all(isinstance(layer.ffn.balanced_gate, FakeBalancedGate) for layer in model.model.layers.values())
     model.to_empty(device="cpu")
     model.initialize_weights(torch.device("cpu"), dtype=torch.float32)  # pre-fix: dereferenced gate.bias_vl
     inputs = torch.randint(0, 64, (2, 12))
-    out = model(inputs, labels=inputs)  # pre-fix: called gate.set_routing_context unconditionally
-    assert out.logits.shape == (2, 12, 64) and torch.isfinite(out.loss)
-    out.loss.backward()
+    with torch.compiler.set_stance("force_eager"):
+        out = model(inputs, labels=inputs)
+        assert out.logits.shape == (2, 12, 64) and torch.isfinite(out.loss)
+        out.loss.backward()
     assert all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)
+    for gate in gates:
+        assert gate.weight.grad is not None
+        assert torch.isfinite(gate.weight.grad).all()
+        assert gate.weight.grad.abs().sum() > 0
     with torch.device("meta"):
         learned = DeepseekV41ForCausalLM(_tiny_config(), backend=_backend())
     assert all(isinstance(layer.ffn.gate, DeepseekV4VisionGate) for layer in learned.model.layers.values())

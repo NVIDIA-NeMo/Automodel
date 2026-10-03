@@ -117,15 +117,12 @@ class DeepseekV41Block(nn.Module):
         self.ffn = MoE(moe_config, backend)
         # V4.1 uses exactly V4's modality-aware score routing with hash routing
         # disabled. The shared MoE keeps ownership of gate, experts and dispatch.
-        # As in DeepSeek-V4, BackendConfig.fake_balanced_gate keeps the
-        # FakeBalancedGate that MoE built (benchmark forced balance).
-        if not backend.fake_balanced_gate:
-            self.ffn.gate = DeepseekV4VisionGate(
-                DeepseekV4Config(vocab_size=config.vocab_size),
-                moe_config,
-                gate_precision=torch.float32,
-                hash_routing=False,
-            )
+        self.ffn.gate = DeepseekV4VisionGate(
+            DeepseekV4Config(vocab_size=config.vocab_size),
+            moe_config,
+            gate_precision=torch.float32,
+            hash_routing=False,
+        )
         norm = (
             partial(initialize_rms_norm_module, "te", device=self.attn.wq_a.weight.device)
             if backend.rms_norm == "te"
