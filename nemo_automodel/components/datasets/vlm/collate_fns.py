@@ -55,7 +55,10 @@ from nemo_automodel.components.datasets.vlm.fake_image import (  # noqa: F401
     inject_fake_image_into_conversation,
     mask_fake_vision_tokens_batch,
 )
-from nemo_automodel.components.datasets.vlm.samplers import _smart_resize_image
+from nemo_automodel.components.datasets.vlm.media_token_estimation import (
+    _extract_image_geometry,
+    _smart_resize_image,
+)
 from nemo_automodel.components.datasets.vlm.utils import default_stop_tokens
 
 # ---------------------------------------------------------------------------
@@ -1134,29 +1137,6 @@ def _ensure_rgb(conversations):
     return conversations
 
 
-def _extract_image_config(processor):
-    """Extract image processing config from processor for token estimation."""
-    ip = getattr(processor, "image_processor", None)
-    if ip is None:
-        return None
-    patch_size = getattr(ip, "patch_size", 14)
-    merge_size = getattr(ip, "merge_size", 2)
-    # Qwen2VL/Qwen3VL store min/max_pixels as direct attributes;
-    # fall back to ip.size dict with both Qwen-style and HF-style keys.
-    size = getattr(ip, "size", {}) or {}
-    min_pixels = getattr(ip, "min_pixels", None) or size.get("min_pixels") or size.get("shortest_edge") or 56 * 56
-    max_pixels = (
-        getattr(ip, "max_pixels", None) or size.get("max_pixels") or size.get("longest_edge") or 14 * 14 * 4 * 1280
-    )
-    return {
-        "patch_size": patch_size,
-        "merge_size": merge_size,
-        "factor": patch_size * merge_size,
-        "min_pixels": min_pixels,
-        "max_pixels": max_pixels,
-    }
-
-
 def _estimate_media_tokens(conversation, processor):
     """Estimate expanded media token count from image/video dimensions.
 
@@ -1165,8 +1145,8 @@ def _estimate_media_tokens(conversation, processor):
     objects or loadable paths) are estimated; unknown media items contribute 0
     extra tokens (the placeholder is still counted in the base tokenization).
     """
-    image_cfg = _extract_image_config(processor)
-    if image_cfg is None:
+    image_geometry = _extract_image_geometry(processor)
+    if image_geometry is None:
         return 0
 
     extra = 0
@@ -1193,13 +1173,13 @@ def _estimate_media_tokens(conversation, processor):
             resized_h, resized_w = _smart_resize_image(
                 height,
                 width,
-                factor=image_cfg["factor"],
-                min_pixels=image_cfg["min_pixels"],
-                max_pixels=image_cfg["max_pixels"],
+                factor=image_geometry.factor,
+                min_pixels=image_geometry.min_pixels,
+                max_pixels=image_geometry.max_pixels,
             )
-            merge_length = image_cfg["merge_size"] ** 2
+            merge_length = image_geometry.merge_size**2
             image_seq_len = (
-                (resized_h // image_cfg["patch_size"]) * (resized_w // image_cfg["patch_size"]) // merge_length
+                (resized_h // image_geometry.patch_size) * (resized_w // image_geometry.patch_size) // merge_length
             )
             extra += image_seq_len - 1  # -1: placeholder already counted in base tokenization
 
