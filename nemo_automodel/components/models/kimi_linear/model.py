@@ -700,8 +700,9 @@ class KimiDeltaAttention(nn.Module):
             k = F.normalize(k.float(), p=2, dim=-1, eps=1e-6).to(k.dtype)
 
         # The recurrent kernel cannot pass state across ranks, so context parallelism
-        # always runs the chunked kernel.
-        mode = "chunk" if cp_context is not None else self._resolve_mode(hidden_states.shape[1])
+        # always runs the chunked kernel. The configured kda_mode applies at every sequence
+        # length: fused_recurrent_kda implements only the forward pass.
+        mode = "chunk" if cp_context is not None else self.mode
         kernel = chunk_kda if mode == "chunk" else fused_recurrent_kda
         o, _ = kernel(
             q=q,
@@ -721,10 +722,6 @@ class KimiDeltaAttention(nn.Module):
         o = self.o_norm(o, gate)
         o = o.reshape(o.shape[0], o.shape[1], -1).contiguous()
         return self.o_proj(o)
-
-    def _resolve_mode(self, seq_len: int) -> str:
-        """Return the KDA kernel to use for a sequence of ``seq_len`` tokens."""
-        return "fused_recurrent" if seq_len <= 64 else self.mode
 
     @torch.no_grad()
     def init_weights(self, buffer_device: torch.device, init_std: float) -> None:
