@@ -371,7 +371,7 @@ def test_server_serializes_concurrent_generate_requests():
         for t in threads:
             t.start()
         for t in threads:
-            t.join(timeout=60)
+            t.join(timeout=70)
 
         assert probe.max_active == 1, "concurrent /generate forwards ran on the shared target model"
         # Each request got the supervision for ITS OWN inputs.

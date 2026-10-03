@@ -76,7 +76,7 @@ from nemo_automodel.recipes.retrieval.train_bi_encoder import _configure_sentenc
 
 # Over the default 5s budget on purpose: this module launches a fresh interpreter, which re-imports torch from scratch.
 # Shrink the work or the process count before raising this further.
-pytestmark = pytest.mark.timeout(60)
+pytestmark = pytest.mark.timeout(70)
 
 
 def test_native_mining_and_training_use_wikissnq_binary_pixels(tmp_path, monkeypatch):

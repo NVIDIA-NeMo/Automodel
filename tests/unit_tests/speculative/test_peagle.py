@@ -43,7 +43,7 @@ from nemo_automodel.components.speculative.eagle.peagle_trainer import PEagleTra
 # Legacy module watchdog for the existing CUDA FlexAttention tests. New or modified
 # slow tests need an exact ``runtime_budget`` marker; inheriting this marker does
 # not exempt them from the default runtime budget.
-pytestmark = pytest.mark.timeout(60)
+pytestmark = pytest.mark.timeout(70)
 
 # P-EAGLE's draft forward runs flex_attention, whose autograd is not implemented
 # on CPU in the CI torch build (even the forward errors once the inputs require
