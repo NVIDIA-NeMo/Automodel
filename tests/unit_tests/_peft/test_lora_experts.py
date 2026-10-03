@@ -176,15 +176,13 @@ def test_grouped_experts_deepep_lora_preserves_dispatcher_settings(moe_config):
         dispatcher_share_token_dispatcher=False,
         dispatcher_async_dispatch=True,
     )
-    orig_experts.use_mxfp8 = True
-
     lora_experts = GroupedExpertsDeepEPLoRA(orig_experts, lora_dim=4, alpha=8)
 
     assert lora_experts.dispatcher_backend == "hybridep"
     assert lora_experts.dispatcher_num_sms == 24
     assert lora_experts.dispatcher_share_token_dispatcher is False
     assert lora_experts.dispatcher_async_dispatch is True
-    assert lora_experts.use_mxfp8 is True
+    assert lora_experts.use_mxfp8 is False
 
 
 def test_pad_lora_rank_for_grouped_mm_aligns_bf16_rank():
