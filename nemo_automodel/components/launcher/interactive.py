@@ -121,14 +121,22 @@ class InteractiveLauncher(Launcher):
         repo_root = _get_repo_root()
         script_path = _recipe_module_path(recipe_target, repo_root)
 
-        num_devices = determine_local_world_size(nproc_per_node="gpu")
-        assert num_devices > 0, "Expected num-devices to be > 0"
+        # Only probe the local device count when no worker count was requested.
+        # ``determine_local_world_size(nproc_per_node="gpu")`` raises when no CUDA
+        # device is visible, and an explicit ``--nproc-per-node`` already says how
+        # many workers to start -- including ``1``, which runs in-process here and
+        # never needs a device count.
+        if nproc_per_node is None:
+            num_devices = determine_local_world_size(nproc_per_node="gpu")
+            assert num_devices > 0, "Expected num-devices to be > 0"
+            effective_nproc = num_devices
+        else:
+            effective_nproc = nproc_per_node
 
-        if nproc_per_node == 1 or num_devices == 1:
+        if effective_nproc == 1:
             logger.info("Launching job locally on a single device")
             return self._run_recipe_in_process(recipe_target, config)
         else:
-            effective_nproc = nproc_per_node if nproc_per_node is not None else num_devices
             logger.info("Launching job locally on %d devices", effective_nproc)
 
             torchrun_parser = get_args_parser()
