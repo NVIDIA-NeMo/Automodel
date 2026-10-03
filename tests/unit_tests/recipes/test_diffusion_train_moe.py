@@ -196,7 +196,6 @@ def _loop_recipe(monkeypatch, *, model, moe_mesh, microbatches_per_step=(2,)):
         "synchronize_tp_replica_gradients",
     ):
         monkeypatch.setattr(diffusion_train, name, MagicMock())
-    monkeypatch.setattr(diffusion_train, "clip_grad_norm", MagicMock(return_value=torch.tensor(0.25)))
     monkeypatch.setattr(diffusion_train, "scale_grads_and_clip_grad_norm", MagicMock(return_value=torch.tensor(0.5)))
     monkeypatch.setattr(diffusion_train, "get_expert_tp_replication_factor", MagicMock(return_value=1))
     monkeypatch.setattr(diffusion_train.torch.cuda, "is_available", lambda: False)
@@ -270,7 +269,6 @@ def test_train_step_with_moe_mesh_uses_ep_aware_clipping_and_updates_gate_bias(m
     )
     recipe._get_dp_group_size.assert_called_with(include_cp=True)
     diffusion_train.get_expert_tp_replication_factor.assert_called_once_with([model], recipe.device_mesh)
-    diffusion_train.clip_grad_norm.assert_not_called()
     # Router aux losses are averaged over the 2 accumulation microbatches (cp_size 1, no PP).
     assert MoEAuxLossAutoScaler.main_loss_backward_scale.item() == pytest.approx(0.5)
     assert order.mock_calls == [call.optimizer_step(), call.update_moe_gate_bias()]
@@ -285,20 +283,24 @@ def test_train_step_with_moe_mesh_without_ep_axis_passes_no_axis_name(monkeypatc
     assert diffusion_train.scale_grads_and_clip_grad_norm.call_args.kwargs["ep_axis_name"] is None
 
 
-def test_train_step_without_moe_mesh_uses_dense_clipping(monkeypatch):
+def test_train_step_without_moe_mesh_clips_without_ep_scaling(monkeypatch):
     monkeypatch.setattr(MoEAuxLossAutoScaler, "main_loss_backward_scale", torch.tensor(1.0))
     model = _GateBiasModel()
     recipe = _loop_recipe(monkeypatch, model=model, moe_mesh=None)
 
     recipe.run_train_validation_loop()
 
-    diffusion_train.clip_grad_norm.assert_called_once_with(
+    # One clipping path for every model (as in the LLM recipe): no EP mesh means no expert rescaling.
+    diffusion_train.scale_grads_and_clip_grad_norm.assert_called_once_with(
         1.0,
         [model],
         device_mesh=recipe.device_mesh,
+        moe_mesh=None,
+        ep_axis_name=None,
         foreach=True,
+        dp_group_size=4,
+        expert_tp_replication_factor=1,
     )
-    diffusion_train.scale_grads_and_clip_grad_norm.assert_not_called()
     # Routers inject auxiliary gradients at EP=1 too: the scale averages the 2 microbatches regardless of EP.
     assert recipe.aux_scales_seen == pytest.approx([0.5, 0.5])
     # Custom MoE models without EP still balance routers with gate biases.

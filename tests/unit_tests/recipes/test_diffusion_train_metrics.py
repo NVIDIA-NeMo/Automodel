@@ -726,7 +726,8 @@ def test_run_train_validation_loop_uses_hot_path_and_logs_perf_metrics(monkeypat
     monkeypatch.setattr(diffusion_train, "prepare_for_final_backward", MagicMock())
     monkeypatch.setattr(diffusion_train, "prepare_after_first_microbatch", MagicMock())
     monkeypatch.setattr(diffusion_train, "synchronize_tp_replica_gradients", MagicMock())
-    monkeypatch.setattr(diffusion_train, "clip_grad_norm", MagicMock(return_value=torch.tensor(0.25)))
+    monkeypatch.setattr(diffusion_train, "scale_grads_and_clip_grad_norm", MagicMock(return_value=torch.tensor(0.25)))
+    monkeypatch.setattr(diffusion_train, "get_expert_tp_replication_factor", MagicMock(return_value=1))
     sync_ctx_mock = MagicMock(wraps=diffusion_train.get_sync_ctx)
     monkeypatch.setattr(diffusion_train, "get_sync_ctx", sync_ctx_mock)
     monkeypatch.setattr(diffusion_train.torch.cuda, "is_available", lambda: False)
@@ -756,6 +757,7 @@ def test_run_train_validation_loop_uses_hot_path_and_logs_perf_metrics(monkeypat
     recipe.device_mesh = object()
     recipe.moe_mesh = None
     recipe._get_cp_group_size = MagicMock(return_value=1)
+    recipe._get_dp_group_size = MagicMock(return_value=1)
     recipe.pp_enabled = False
     recipe.device = torch.device("cpu")
     recipe.compute_dtype = torch.float32
@@ -797,11 +799,15 @@ def test_run_train_validation_loop_uses_hot_path_and_logs_perf_metrics(monkeypat
         call(model, False, defer_fsdp_grad_sync=True),
         call(model, True, defer_fsdp_grad_sync=True),
     ]
-    diffusion_train.clip_grad_norm.assert_called_once_with(
+    diffusion_train.scale_grads_and_clip_grad_norm.assert_called_once_with(
         0.5,
         [model],
         device_mesh=recipe.device_mesh,
+        moe_mesh=None,
+        ep_axis_name=None,
         foreach=False,
+        dp_group_size=1,
+        expert_tp_replication_factor=1,
     )
     recipe.optimizer[0].zero_grad.assert_called_once_with(set_to_none=True)
     recipe.optimizer[0].step.assert_called_once()
@@ -1054,7 +1060,8 @@ def test_run_train_validation_loop_validates_only_with_a_val_dataloader(monkeypa
     monkeypatch.setattr(diffusion_train, "prepare_for_final_backward", MagicMock())
     monkeypatch.setattr(diffusion_train, "prepare_after_first_microbatch", MagicMock())
     monkeypatch.setattr(diffusion_train, "synchronize_tp_replica_gradients", MagicMock())
-    monkeypatch.setattr(diffusion_train, "clip_grad_norm", MagicMock(return_value=torch.tensor(0.25)))
+    monkeypatch.setattr(diffusion_train, "scale_grads_and_clip_grad_norm", MagicMock(return_value=torch.tensor(0.25)))
+    monkeypatch.setattr(diffusion_train, "get_expert_tp_replication_factor", MagicMock(return_value=1))
     monkeypatch.setattr(diffusion_train.torch.cuda, "is_available", lambda: False)
     wandb_log = MagicMock()
     monkeypatch.setattr(diffusion_train.wandb, "run", MagicMock(), raising=False)
@@ -1078,6 +1085,7 @@ def test_run_train_validation_loop_validates_only_with_a_val_dataloader(monkeypa
     recipe.device_mesh = None
     recipe.moe_mesh = None
     recipe._get_cp_group_size = MagicMock(return_value=1)
+    recipe._get_dp_group_size = MagicMock(return_value=1)
     recipe.pp_enabled = False
     recipe.device = torch.device("cpu")
     recipe.compute_dtype = torch.float32

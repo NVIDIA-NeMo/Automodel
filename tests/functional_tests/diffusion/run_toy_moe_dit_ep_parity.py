@@ -279,7 +279,6 @@ def train(args: argparse.Namespace) -> None:
     grad_norms: list[float] = []
     clip_calls: list[str] = []
     real_scale_and_clip = diffusion_train.scale_grads_and_clip_grad_norm
-    real_clip = diffusion_train.clip_grad_norm
 
     def _record(name: str, fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
         def wrapper(*fn_args: object, **fn_kwargs: object) -> torch.Tensor:
@@ -293,7 +292,6 @@ def train(args: argparse.Namespace) -> None:
         return wrapper
 
     diffusion_train.scale_grads_and_clip_grad_norm = _record("scale_grads_and_clip_grad_norm", real_scale_and_clip)
-    diffusion_train.clip_grad_norm = _record("clip_grad_norm", real_clip)
 
     recipe = diffusion_train.TrainDiffusionRecipe(cfg)
     recipe.setup()
@@ -433,9 +431,9 @@ def compare(args: argparse.Namespace) -> None:
     for i, (la, lb, ga, gb) in enumerate(zip(ref["losses"], ep["losses"], ref["grad_norms"], ep["grad_norms"]), 1):
         print(f"{i:>4} {la:>12.6f} {lb:>12.6f} {ga:>12.6f} {gb:>12.6f}")
 
-    # The reference leg is plain FSDP: no MoE mesh, dense clipping path.
+    # The reference leg is plain FSDP: no MoE mesh, so the shared clipping runs without an expert axis.
     assert ref["moe_mesh_dim_names"] is None, ref["moe_mesh_dim_names"]
-    assert ref["clip_calls"] == ["clip_grad_norm"], ref["clip_calls"]
+    assert ref["clip_calls"] == ["ep_axis_name=None", "scale_grads_and_clip_grad_norm"], ref["clip_calls"]
 
     # The EP leg must really shard experts over an "ep" axis (guards against EP silently not applying).
     ep_size = ep["ep_size"]

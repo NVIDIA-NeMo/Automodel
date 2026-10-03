@@ -44,7 +44,6 @@ from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_mes
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG, init_all_rng
 from nemo_automodel.components.training.utils import (
-    clip_grad_norm,
     get_expert_tp_replication_factor,
     prepare_after_first_microbatch,
     prepare_for_final_backward,
@@ -1104,26 +1103,20 @@ class TrainDiffusionRecipe(BaseRecipe):
                         prepare_after_first_microbatch()
 
                 synchronize_tp_replica_gradients([self.model], getattr(self, "device_mesh", None))
-                if self.moe_mesh is not None:
-                    # Expert gradients are reduced over the EP-shard group only; rescale them to the
-                    # dense DP mean before clipping with an EP-aware norm (same as the LLM recipe).
-                    grad_norm = scale_grads_and_clip_grad_norm(
-                        self.clip_grad_max_norm,
-                        [self.model],
-                        device_mesh=self.device_mesh,
-                        moe_mesh=self.moe_mesh,
-                        ep_axis_name="ep" if "ep" in (self.moe_mesh.mesh_dim_names or ()) else None,
-                        foreach=self.grad_clip_foreach,
-                        dp_group_size=self._get_dp_group_size(include_cp=True),
-                        expert_tp_replication_factor=get_expert_tp_replication_factor([self.model], self.device_mesh),
-                    )
-                else:
-                    grad_norm = clip_grad_norm(
-                        self.clip_grad_max_norm,
-                        [self.model],
-                        device_mesh=self.device_mesh,
-                        foreach=self.grad_clip_foreach,
-                    )
+                # Same clipping as the LLM recipe. With an EP mesh, expert gradients (reduced over the EP-shard
+                # group only) are first rescaled to the dense DP mean and the norm is EP-aware; without one, this is
+                # plain gradient clipping.
+                moe_mesh_axes = self.moe_mesh.mesh_dim_names or () if self.moe_mesh is not None else ()
+                grad_norm = scale_grads_and_clip_grad_norm(
+                    self.clip_grad_max_norm,
+                    [self.model],
+                    device_mesh=self.device_mesh,
+                    moe_mesh=self.moe_mesh,
+                    ep_axis_name="ep" if "ep" in moe_mesh_axes else None,
+                    foreach=self.grad_clip_foreach,
+                    dp_group_size=self._get_dp_group_size(include_cp=True),
+                    expert_tp_replication_factor=get_expert_tp_replication_factor([self.model], self.device_mesh),
+                )
                 grad_norm = float(grad_norm) if torch.is_tensor(grad_norm) else grad_norm
 
                 # ── LoRA gradient diagnostic (step 1 only) ───────────────────
