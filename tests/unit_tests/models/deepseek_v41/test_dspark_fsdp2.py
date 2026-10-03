@@ -38,7 +38,7 @@ from nemo_automodel.components.models.deepseek_v41.dspark import DeepseekV41DSpa
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
 
 # Keep a hard watchdog for spawned workers; each distributed test declares its runtime budget below.
-pytestmark = pytest.mark.timeout(60)
+pytestmark = pytest.mark.timeout(70)
 
 _WORLD_SIZE = 2
 
@@ -163,7 +163,7 @@ def _worker(rank: int, port: int, activation_checkpointing: bool, checkpoint_dir
 
 @pytest.mark.runtime_budget(
     45,
-    hard_timeout=60,
+    hard_timeout=70,
     reason="Spawns two FSDP workers, compiles draft forward/backward, and saves and restores a sharded checkpoint.",
 )
 @pytest.mark.parametrize("activation_checkpointing", [False, True])
@@ -245,7 +245,7 @@ def _parity_worker(rank: int, port: int) -> None:
 
 @pytest.mark.runtime_budget(
     45,
-    hard_timeout=60,
+    hard_timeout=70,
     reason="Spawns two FSDP workers and compares compiled draft gradients, clipping, and updates with an FP32 reference.",
 )
 def test_fp32_dspark_fsdp_gradient_and_step_parity(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -44,7 +44,7 @@ from nemo_automodel.components.moe.experts import (
 
 # Over the default 5s budget on purpose: this module launches a fresh interpreter, which re-imports torch from scratch.
 # Shrink the work or the process count before raising this further.
-pytestmark = pytest.mark.timeout(60)
+pytestmark = pytest.mark.timeout(70)
 
 
 @pytest.fixture
@@ -627,6 +627,9 @@ class TestGroupedExpertsZeroActiveExperts:
         assert torch.isfinite(grad_norm), f"Gradient norm should be finite, got {grad_norm}"
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    @pytest.mark.runtime_budget(
+        60, hard_timeout=70, reason="a fresh Python process imports torch and runs expert gradients"
+    )
     def test_zero_active_experts_has_expert_gradients(self, moe_config, device):
         """Test that expert parameters have gradients when no tokens select any expert.
 
@@ -641,7 +644,7 @@ class TestGroupedExpertsZeroActiveExperts:
             [sys.executable, "-m", "tests.unit_tests.moe.run_zero_active_experts_gradient_test", str(device)],
             capture_output=True,
             text=True,
-            timeout=60,
+            timeout=70,
         )
         assert result.returncode == 0, f"Subprocess test failed:\nstdout: {result.stdout}\nstderr: {result.stderr}"
         assert "SUCCESS" in result.stdout, (

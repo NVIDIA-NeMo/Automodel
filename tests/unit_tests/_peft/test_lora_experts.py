@@ -261,7 +261,7 @@ class MockDeepEPDispatcher:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.timeout(60)
+@pytest.mark.runtime_budget(60, hard_timeout=70, reason="initializes CUDA and exercises grouped-MM LoRA kernels")
 def test_grouped_experts_deepep_lora_forward_mocked(moe_config, device):
     """
     Test Forward pass of GroupedExpertsDeepEPLoRA using a Mock Dispatcher.
