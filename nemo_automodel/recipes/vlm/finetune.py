@@ -174,6 +174,55 @@ def _validate_cp_packing_support(
     )
 
 
+def _masked_ce_fallback(loss_fn: nn.Module, probe_module: nn.Module) -> nn.Module:
+    """Return the MaskedCrossEntropy that replaces ``loss_fn`` on the model's logits.
+
+    MaskedCrossEntropy has no softcap: it reproduces a loss's ``logit_softcapping`` only when the model already
+    applies the same ``final_logit_softcapping`` to its logits, so any other softcap raises instead of silently
+    changing the training objective.
+    """
+    softcap = getattr(loss_fn, "logit_softcapping", 0) or 0
+    if softcap:
+        config = getattr(probe_module, "config", None)
+        text_config = config.get_text_config() if hasattr(config, "get_text_config") else config
+        model_softcap = getattr(text_config, "final_logit_softcapping", None)
+        if model_softcap != softcap:
+            raise ValueError(
+                f"{type(loss_fn).__name__}(logit_softcapping={softcap}) cannot fall back to MaskedCrossEntropy: "
+                f"the model's logits use final_logit_softcapping={model_softcap}"
+            )
+    return MaskedCrossEntropy(
+        ignore_index=_get_loss_ignore_index(loss_fn),
+        reduction=getattr(loss_fn, "reduction", "sum"),
+    )
+
+
+def _maybe_downgrade_loss_fn(loss_fn: nn.Module, probe_module: nn.Module, pp_enabled: bool) -> nn.Module:
+    """Downgrade to MaskedCrossEntropy when the requested loss cannot run."""
+    if not _supports_logits_to_keep(probe_module) and not isinstance(loss_fn, MaskedCrossEntropy):
+        if isinstance(loss_fn, ChunkedCrossEntropy):
+            raise ValueError("ChunkedCrossEntropy requires a model supporting logits_to_keep to avoid full logits")
+        logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
+        return _masked_ce_fallback(loss_fn, probe_module)
+    if (
+        pp_enabled
+        and isinstance(loss_fn, LinearCrossEntropy)
+        and not getattr(probe_module, "_pp_return_hidden_states_supported", False)
+    ):
+        if isinstance(loss_fn, ChunkedCrossEntropy):
+            raise ValueError("ChunkedCrossEntropy requires pipeline stages that can return hidden states")
+        logger.warning(
+            "FusedLinearCrossEntropy is not supported under pipeline parallelism for this "
+            "model. Using MaskedCrossEntropy instead."
+        )
+        return _masked_ce_fallback(loss_fn, probe_module)
+    if isinstance(loss_fn, ChunkedCrossEntropy):
+        lm_head = _get_lm_head_module(probe_module)
+        if lm_head is not None or not pp_enabled:
+            loss_fn.validate_lm_head(lm_head, model_config=getattr(probe_module, "config", None))
+    return loss_fn
+
+
 def _get_model_name(cfg_model):
     if cfg_model.get("pretrained_model_name_or_path", None) is not None:
         return cfg_model.pretrained_model_name_or_path
@@ -570,26 +619,16 @@ class FinetuneRecipeForVLM(BaseRecipe):
             model, optimizer, self.distributed_config, allow=allow_megatron_fsdp_sharding
         )
 
-        if not _supports_logits_to_keep(model) and not isinstance(self.loss_fn, MaskedCrossEntropy):
-            if isinstance(self.loss_fn, ChunkedCrossEntropy):
-                raise ValueError("ChunkedCrossEntropy requires a model supporting logits_to_keep to avoid full logits")
-            logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
-            self.loss_fn = MaskedCrossEntropy(
-                ignore_index=_get_loss_ignore_index(self.loss_fn),
-                reduction=getattr(self.loss_fn, "reduction", "sum"),
-            )
-
-        if isinstance(self.loss_fn, ChunkedCrossEntropy):
-            self.loss_fn.validate_lm_head(
-                _get_lm_head_module(capability_model), model_config=getattr(capability_model, "config", None)
-            )
-
         if isinstance(model, AutoPipeline):
             self.model_parts = model.parts
             self.pp = model
         else:
             self.model_parts = [model]
             self.pp = None
+
+        # Loss-function capability check
+        self.loss_fn = _maybe_downgrade_loss_fn(self.loss_fn, self.model_parts[0], self.pp is not None)
+
         if self.pp_enabled:
             self._configure_pipeline_loss_fn()
 
@@ -1079,6 +1118,10 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 break
         if last_stage_model is None:
             raise RuntimeError("Pipeline reports a last stage, but no last-stage model part was found")
+
+        # Linear CE consumes hidden states: flag the last stage to emit them
+        if isinstance(self.loss_fn, LinearCrossEntropy):
+            last_stage_model._pp_return_hidden_states = True
 
         self.pp.info.schedule._loss_fn = self.cfg.mtp.build(
             self.loss_fn,

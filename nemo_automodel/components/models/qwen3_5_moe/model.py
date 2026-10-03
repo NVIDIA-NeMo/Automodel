@@ -1146,6 +1146,17 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
     # parallelism is active; None means the forward embeds and shards nothing for CP.
     cp_mesh = None
 
+    @property
+    def _pp_return_hidden_states_supported(self) -> bool:
+        """Whether the last PP stage can hand hidden states to FusedLinearCrossEntropy.
+
+        With MTP the stage output is a ``(logits, *mtp_per_depth_h)`` tuple, so the
+        recipe must keep a logit-based loss. Read the config, not ``self.mtp``: PP
+        stage splitting drops the MTP module from every stage but the last one, and
+        the recipe probes the first stage.
+        """
+        return not self.mtp_config.enabled
+
     @dataclass(frozen=True)
     class ModelCapabilities:
         """Declared parallelism capabilities for this model class."""
@@ -1781,6 +1792,9 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         )
 
         hidden_states = outputs.last_hidden_state
+        # Last PP stage under FusedLinearCrossEntropy: the loss applies lm_head itself.
+        if getattr(self, "_pp_return_hidden_states", False) is True:
+            return hidden_states
 
         lm_output = compute_lm_head_logits(
             self.lm_head, hidden_states, logits_to_keep, output_hidden_states=output_hidden_states
