@@ -60,6 +60,33 @@ def image_grid_positions(
     return torch.stack([y, x], dim=-1).long()
 
 
+def image_grid_positions_batched(seq_len: int, image_starts: torch.Tensor, token_h: int, token_w: int) -> torch.Tensor:
+    """Batched :func:`image_grid_positions`, computed without host synchronization.
+
+    Args:
+        seq_len: Padded sequence length.
+        image_starts: Long tensor of shape [batch], index of the first image token of every sample; every image
+            span must fit in ``seq_len``.
+        token_h: Image height in tokens.
+        token_w: Image width in tokens.
+
+    Returns:
+        Long tensor of shape [batch, seq_len, 2] with the (y, x) position of every token.
+    """
+    num_image = token_h * token_w
+    index = torch.arange(seq_len, device=image_starts.device, dtype=torch.float32)[None]
+    start = image_starts[:, None].float()
+    offset = index - start
+    in_image = (offset >= 0) & (offset < num_image)
+    offset = offset.clamp(min=0)
+    row = torch.div(offset, token_w, rounding_mode="floor")
+    col = offset - row * token_w
+    y = torch.where(in_image, start + (num_image - token_h) / 2 + row, index)
+    x = torch.where(in_image, start + (num_image - token_w) / 2 + col, index)
+    # Truncate toward zero like the reference (half-integer grid offsets occur for odd spans).
+    return torch.stack([y, x], dim=-1).long()
+
+
 def text_positions(seq_len: int, device: torch.device | None = None) -> torch.Tensor:
     """Return ``[seq_len, 2]`` positions of a text-only sequence (y = x = index)."""
     index = torch.arange(seq_len, device=device)

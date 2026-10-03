@@ -74,6 +74,7 @@ class HunyuanImage3Config(PretrainedConfig):
         patch_embed_hidden_dim: int = 1024,
         image_base_size: int = 1024,
         image_token_id: int = 128006,
+        timestep_token_id: int = 128017,
         vae: dict[str, Any] | None = None,
         pad_token_id: int | None = 128009,
         bos_token_id: int | None = 127958,
@@ -108,6 +109,7 @@ class HunyuanImage3Config(PretrainedConfig):
         self.patch_embed_hidden_dim = patch_embed_hidden_dim
         self.image_base_size = image_base_size
         self.image_token_id = image_token_id
+        self.timestep_token_id = timestep_token_id
         self.vae = vae if vae is not None else {"latent_channels": 32}
         kwargs.pop("head_dim", None)
         # Let PretrainedConfig own the dtype (transformers 5 stores it as ``dtype``, 4.x as ``torch_dtype``).

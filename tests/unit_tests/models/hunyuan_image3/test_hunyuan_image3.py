@@ -34,6 +34,7 @@ from nemo_automodel.components.models.hunyuan_image3.model import (
 from nemo_automodel.components.models.hunyuan_image3.rope import (
     apply_rope,
     image_grid_positions,
+    image_grid_positions_batched,
     rope_cos_sin,
     text_positions,
 )
@@ -75,6 +76,7 @@ def _config(**overrides) -> HunyuanImage3Config:
         num_shared_expert=[1, 1],
         patch_embed_hidden_dim=32,
         image_token_id=IMAGE_ID,
+        timestep_token_id=TIMESTEP_ID,
         pad_token_id=PAD_ID,
         vae={"latent_channels": 4},
         torch_dtype="float32",
@@ -215,6 +217,13 @@ def test_text_rope_equals_standard_1d_rope():
     torch.testing.assert_close(sin[0], angles.sin())
 
 
+def test_batched_image_positions_match_per_sample():
+    starts = torch.tensor([2, 0, 5])
+    batched = image_grid_positions_batched(seq_len=13, image_starts=starts, token_h=2, token_w=3)
+    expected = torch.stack([image_grid_positions(13, int(s), 2, 3) for s in starts])
+    assert torch.equal(batched, expected)
+
+
 def test_image_grid_positions_center_the_image():
     # 2 text tokens, a 2x3 image, 1 trailing token.
     pos = image_grid_positions(seq_len=9, image_start=2, token_h=2, token_w=3)
@@ -281,6 +290,21 @@ def test_forward_is_invariant_to_right_padding_and_batching(model):
 def test_forward_rejects_wrong_image_token_count(model):
     with pytest.raises(ValueError, match="image tokens"):
         model(_sequence(3, 5)[None], torch.randn(1, 4, 2, 3), torch.tensor([1.0]))
+
+
+def test_forward_rejects_malformed_image_spans(model):
+    latents, t = torch.randn(1, 4, 2, 3), torch.tensor([1.0])
+    no_timestep = _sequence(3, 6)
+    no_timestep[3] = 7  # the slot before the image is not <timestep>
+    with pytest.raises(ValueError, match="<timestep>"):
+        model(no_timestep[None], latents, t)
+    at_start = torch.cat([torch.full((6,), IMAGE_ID), torch.tensor([3, 3])])  # nothing before the image
+    with pytest.raises(ValueError, match="contiguous span preceded"):
+        model(at_start[None], latents, t)
+    split = _sequence(3, 6)
+    split[6], split[11] = 5, IMAGE_ID  # six image tokens, but not contiguous
+    with pytest.raises(ValueError, match="contiguous span"):
+        model(split[None], latents, t)
 
 
 def test_timestep_changes_prediction(model):
@@ -412,6 +436,119 @@ def test_loaded_release_weights_reproduce_outputs():
     torch.testing.assert_close(target(ids, latents, t)[0], source(ids, latents, t)[0])
 
 
+@pytest.mark.parametrize("v4_compatible", [False, True])
+def test_exported_lora_reloads_all_release_projections(tmp_path, v4_compatible):
+    """The exported targets and weights reload into PEFT with the release's module names."""
+    from peft import LoraConfig, PeftModel
+    from safetensors.torch import save_file
+
+    from nemo_automodel.components._peft.lora import PeftConfig, apply_lora_to_linear_modules
+    from nemo_automodel.components.checkpoint.addons import _extract_target_modules
+
+    source = _model()
+    release_layout = _model()
+    # Only exercise projections, using the released shared-expert names and the same base weights.
+    for block in release_layout.model.layers.values():
+        block.mlp.shared_mlp = block.mlp._modules.pop("shared_experts")
+    config = PeftConfig(
+        dim=4,
+        alpha=8,
+        use_memory_efficient_lora=False,
+        target_modules=[
+            "*.self_attn.qkv_proj",
+            "*.self_attn.o_proj",
+            "*.mlp.shared_experts.gate_and_up_proj",
+            "*.mlp.shared_experts.down_proj",
+        ],
+    )
+    assert apply_lora_to_linear_modules(source, config) == 8
+    with torch.no_grad():
+        for name, parameter in source.named_parameters():
+            if "lora_B" in name:
+                parameter.normal_(std=0.1)
+    targets = _extract_target_modules(source, v4_compatible=v4_compatible)
+    expected = {
+        f"model.layers.{layer}.{projection}"
+        for layer in range(2)
+        for projection in (
+            "self_attn.qkv_proj",
+            "self_attn.o_proj",
+            "mlp.shared_mlp.gate_and_up_proj",
+            "mlp.shared_mlp.down_proj",
+        )
+    }
+    assert set(targets) == expected
+    weights = source.state_dict_adapter.to_hf(
+        {f"base_model.model.{key}": value for key, value in source.state_dict().items() if "lora_" in key},
+        v4_compatible=v4_compatible,
+    )
+    save_file(weights, str(tmp_path / "adapter_model.safetensors"))
+    LoraConfig(r=4, lora_alpha=8, target_modules=targets).save_pretrained(tmp_path)
+    restored = PeftModel.from_pretrained(release_layout, tmp_path).eval()
+    source.eval()
+    for target in targets:
+        native_name = target.replace(".shared_mlp.", ".shared_experts.")
+        original = source.get_submodule(native_name)
+        loaded = restored.base_model.model.get_submodule(target)
+        torch.testing.assert_close(loaded.lora_A["default"].weight, original.lora_A.weight)
+        torch.testing.assert_close(loaded.lora_B["default"].weight, original.lora_B.weight)
+        inputs = torch.randn(2, 3, original.in_features)
+        torch.testing.assert_close(loaded(inputs), original(inputs))
+
+
+def _run_sharded_checkpoint_round_trip(rank: int, init_file: str, checkpoint_dir: str) -> None:
+    """Exercise real DCP loading with both expert and inner-dimension sharding on CPU."""
+    import torch.distributed as dist
+    import torch.distributed.checkpoint as dcp
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_tensor
+
+    dist.init_process_group("gloo", init_method=f"file://{init_file}", rank=rank, world_size=4)
+    try:
+        for axis, placement in (("ep_shard", Shard(1)), ("ep_replicate", Replicate())):
+            mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=(axis, "ep"))
+            adapter = _model().state_dict_adapter
+            prefix = "model.layers.0.mlp.experts"
+            native = {
+                f"{prefix}.gate_and_up_projs": torch.arange(4 * 64 * 64).reshape(4, 64, 64).float(),
+                f"{prefix}.down_projs": torch.arange(4 * 32 * 64).reshape(4, 32, 64).float(),
+            }
+            released = adapter.to_hf(native)
+            path = f"{checkpoint_dir}/{axis}"
+            dcp.save(released, checkpoint_id=path)
+            sharded = {
+                key: distribute_tensor(value.clone(), mesh, [placement, Shard(0)]) for key, value in native.items()
+            }
+            exported = adapter.to_hf(sharded)
+            for key, value in exported.items():
+                assert isinstance(value, DTensor)
+                # Both projections transpose the sharded native axis to the final checkpoint axis.
+                assert value.placements == (placement,)
+                torch.testing.assert_close(value.full_tensor(), released[key])
+            destinations = adapter.to_hf(sharded, for_checkpoint_load=True)
+            assert not adapter._fused_load_destinations
+            for value in destinations.values():
+                value.to_local().zero_()
+            dcp.load(destinations, checkpoint_id=path)
+            restored = adapter.from_hf(destinations, device_mesh=mesh)
+            assert set(restored) == set(native)
+            for key, value in restored.items():
+                assert value.placements == (placement, Shard(0))
+                torch.testing.assert_close(value.full_tensor(), native[key])
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.runtime_budget(100, hard_timeout=120, reason="four CPU workers exercise real DCP and DTensor collectives")
+def test_sharded_checkpoint_round_trip(tmp_path):
+    torch.multiprocessing.spawn(
+        _run_sharded_checkpoint_round_trip,
+        args=(str(tmp_path / "rendezvous"), str(tmp_path / "checkpoint")),
+        nprocs=4,
+        join=True,
+    )
+
+
 # ---------------------------------------------------------------------------------------------------------------
 # Flow-matching adapter
 # ---------------------------------------------------------------------------------------------------------------
@@ -457,6 +594,17 @@ def test_adapter_uses_unconditional_prompt_when_dropped():
     ids = adapter.prepare_inputs(_context(cfg_dropout_prob=1.0))["input_ids"]
     assert ids[0, :4].tolist() == [9, 9, 9, TIMESTEP_ID]
     assert ids[1, :2].tolist() == [9, TIMESTEP_ID]
+
+
+def test_adapter_cfg_dropout_follows_torch_seed():
+    adapter = HunyuanImage3Adapter(image_token_id=IMAGE_ID, pad_token_id=PAD_ID)
+
+    def pattern(seed: int) -> list[list[int]]:
+        torch.manual_seed(seed)
+        return [adapter.prepare_inputs(_context(cfg_dropout_prob=0.5))["input_ids"][:, 0].tolist() for _ in range(8)]
+
+    assert pattern(1) == pattern(1)
+    assert pattern(1) != pattern(2)
 
 
 def test_adapter_validates_batch():

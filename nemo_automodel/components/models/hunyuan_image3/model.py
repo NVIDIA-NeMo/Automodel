@@ -54,7 +54,11 @@ from nemo_automodel.components.models.hunyuan_image3.layers import (
     UNetUp,
     init_unet_weights,
 )
-from nemo_automodel.components.models.hunyuan_image3.rope import image_grid_positions, rope_cos_sin, text_positions
+from nemo_automodel.components.models.hunyuan_image3.rope import (
+    image_grid_positions_batched,
+    rope_cos_sin,
+    text_positions,
+)
 from nemo_automodel.components.models.hunyuan_image3.state_dict_adapter import HunyuanImage3StateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
@@ -345,20 +349,26 @@ class HunyuanImage3ForCausalMM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin
         if not bool((counts == num_image).all()):
             raise ValueError(f"Every row needs {num_image} image tokens for {token_h}x{token_w} latents, got {counts}")
         image_starts = is_image.int().argmax(dim=1)
+        rows = torch.arange(batch, device=device)
+        image_index = image_starts[:, None] + torch.arange(num_image, device=device)[None]
+        if int(image_starts.min()) < 1 or not bool(is_image[rows[:, None], image_index].all()):
+            raise ValueError("Image tokens must form one contiguous span preceded by the <timestep> token.")
+        timestep_slots = input_ids[rows, image_starts - 1]
+        if not bool((timestep_slots == self.config.timestep_token_id).all()):
+            raise ValueError(
+                f"Expected the <timestep> token ({self.config.timestep_token_id}) right before the image span, "
+                f"got {timestep_slots.tolist()}"
+            )
         if valid_lengths is None:
             valid_lengths = torch.full((batch,), seq_len, device=device, dtype=torch.long)
 
         embeds = self.model.embed_tokens(input_ids)
         image_tokens = self.patch_embed(latents.to(embeds.dtype), self.time_embed(timestep))
         timestep_tokens = self.timestep_emb(timestep)
-        rows = torch.arange(batch, device=device)
-        image_index = image_starts[:, None] + torch.arange(num_image, device=device)[None]
         embeds = embeds.index_put((rows[:, None], image_index), image_tokens.to(embeds.dtype))
         embeds = embeds.index_put((rows, image_starts - 1), timestep_tokens.to(embeds.dtype))
 
-        positions = torch.stack(
-            [image_grid_positions(seq_len, int(start), token_h, token_w, device=device) for start in image_starts]
-        )
+        positions = image_grid_positions_batched(seq_len, image_starts, token_h, token_w)
         cos, sin = rope_cos_sin(positions, self.config.attention_head_dim, self.config.rope_theta)
         attention_mask = build_joint_attention_mask(seq_len, image_starts, num_image, valid_lengths)
         padding_mask = torch.arange(seq_len, device=device)[None, :] >= valid_lengths[:, None]

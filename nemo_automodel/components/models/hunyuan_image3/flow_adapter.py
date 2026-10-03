@@ -26,17 +26,15 @@ The pipeline's convention already matches the release: ``x_t = (1 - sigma) x_0 +
 
 from __future__ import annotations
 
-import random
 from typing import Any
 
 import torch
 import torch.nn as nn
 
+from nemo_automodel.components.datasets.diffusion.text_to_image_dataset import PROMPT_TOKEN_ID_KEYS
 from nemo_automodel.components.flow_matching.adapters.base import FlowMatchingContext, ModelAdapter
 
-PROMPT_IDS_KEY = "prompt_input_ids"
-UNCOND_PROMPT_IDS_KEY = "uncond_prompt_input_ids"
-SUFFIX_IDS_KEY = "prompt_suffix_ids"
+PROMPT_IDS_KEY, UNCOND_PROMPT_IDS_KEY, SUFFIX_IDS_KEY = PROMPT_TOKEN_ID_KEYS
 
 
 class HunyuanImage3Adapter(ModelAdapter):
@@ -77,7 +75,8 @@ class HunyuanImage3Adapter(ModelAdapter):
 
         rows = []
         for i in range(batch_size):
-            drop = context.cfg_dropout_prob > 0 and random.random() < context.cfg_dropout_prob
+            # torch's CPU generator is seeded by the recipe, so the drop pattern is reproducible.
+            drop = context.cfg_dropout_prob > 0 and torch.rand(()).item() < context.cfg_dropout_prob
             prefix = batch[UNCOND_PROMPT_IDS_KEY if drop else PROMPT_IDS_KEY][i]
             rows.append(torch.cat([prefix.long().cpu(), image_ids, batch[SUFFIX_IDS_KEY][i].long().cpu()]))
         valid_lengths = torch.tensor([len(row) for row in rows], dtype=torch.long)

@@ -74,13 +74,25 @@ def _rename(key: str, renames: tuple[tuple[re.Pattern[str], str], ...]) -> str:
 
 
 def _all_alias(pairs: list[tuple[str, Any]], tensor: Any) -> bool:
-    """Whether every entry is a view into ``tensor``'s (local) storage, i.e. a checkpoint-load view."""
+    """Check whether plain checkpoint destinations alias the grouped model weight.
+
+    Args:
+        pairs: Per-expert entries with tensors of shape [expert_hidden, hidden]. DTensors retain a remaining
+            mesh dimension and must use the distributed conversion path, even when their local storage aliases.
+        tensor: Grouped tensor of shape [experts, hidden, 2 * expert_hidden], possibly a DTensor.
+
+    Returns:
+        Whether every destination is a plain tensor aliasing the source's local storage.
+    """
     local = tensor.to_local() if isinstance(tensor, DTensor) else tensor
     if local.is_meta:
         return False
     storage = local.untyped_storage().data_ptr()
     return all(
-        isinstance(value, torch.Tensor) and not value.is_meta and value.untyped_storage().data_ptr() == storage
+        isinstance(value, torch.Tensor)
+        and not isinstance(value, DTensor)
+        and not value.is_meta
+        and value.untyped_storage().data_ptr() == storage
         for _, value in pairs
     )
 
@@ -126,6 +138,19 @@ class HunyuanImage3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdap
         # Fused checkpoint-load destinations handed to DCP, keyed by released key: (buffer, up view, gate view).
         self._fused_load_destinations: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 
+    def map_peft_target_module_to_hf(self, name: str, *, v4_compatible: bool = False) -> str:
+        """Match PEFT target names to the released fused projections.
+
+        Args:
+            name: Target-module path after the shared exporter expands combined projections.
+            v4_compatible: Legacy export selection; both formats use the same released module names.
+
+        Returns:
+            Released module path, with shared experts renamed and split QKV targets reunited.
+        """
+        name = _rename(name, _NATIVE_TO_HF_RENAMES)
+        return re.sub(r"\.self_attn\.(?:q_proj|k_proj|v_proj)$", ".self_attn.qkv_proj", name)
+
     def _fused_load_destination_pairs(self, fqn: str, pairs: list[tuple[str, Any]]) -> list[tuple[str, Any]]:
         """Replace in-place gate/up views with one fused DCP destination per expert.
 
@@ -158,7 +183,15 @@ class HunyuanImage3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdap
         return out
 
     def to_hf(self, state_dict: dict[str, Any], exclude_key_regex: str | None = None, **kwargs: Any) -> dict[str, Any]:
-        """Convert a native state dict to released checkpoint keys."""
+        """Convert a native state dict to released checkpoint keys.
+
+        With ``for_checkpoint_load=True`` the fused expert entries become host buffers for DCP (one
+        [2 * expert_hidden, hidden] tensor per local expert, 50 MB in bf16 for the release, about 13 GB per rank with
+        8 local experts), kept on the adapter until :meth:`from_hf` consumes them; a new load conversion drops the
+        buffers of an earlier one.
+        """
+        if kwargs.get("for_checkpoint_load"):
+            self._fused_load_destinations = {}
         out: dict[str, Any] = {}
         for fqn, tensor in state_dict.items():
             for key, value in self.convert_single_tensor_to_hf(
@@ -188,7 +221,11 @@ class HunyuanImage3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdap
         pairs = self._convert_single_merged_expert_to_hf_split_experts(fqn, tensor, **kwargs)
         if pairs is None:
             pairs = [(fqn, tensor)]
-        elif fqn.endswith(".gate_and_up_projs") and _all_alias(pairs, tensor):
+        elif (
+            kwargs.get("for_checkpoint_load", False)
+            and fqn.endswith(".gate_and_up_projs")
+            and _all_alias(pairs, tensor)
+        ):
             pairs = self._fused_load_destination_pairs(fqn, pairs)
         else:
             pairs = _fuse_gate_up(pairs)

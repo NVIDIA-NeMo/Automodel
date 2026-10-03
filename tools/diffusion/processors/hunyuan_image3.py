@@ -34,6 +34,8 @@ from typing import TYPE_CHECKING, Any, Dict
 
 import torch
 
+from nemo_automodel.components.datasets.diffusion.text_to_image_dataset import PROMPT_TOKEN_ID_KEYS
+
 from .base import BaseModelProcessor
 from .registry import ProcessorRegistry
 
@@ -157,10 +159,11 @@ class HunyuanImage3Processor(BaseModelProcessor):
         timestep_index = int(out.gen_timestep_scatter_index[0].reshape(-1)[0])
         if timestep_index != span.start - 1:
             raise RuntimeError(f"Expected <timestep> right before the image, got index {timestep_index} vs {span}.")
+        prompt_key, uncond_key, suffix_key = PROMPT_TOKEN_ID_KEYS
         return {
-            "prompt_input_ids": cond[: span.start].clone(),
-            "uncond_prompt_input_ids": uncond[: span.start].clone(),
-            "prompt_suffix_ids": cond[span.stop :].clone(),
+            prompt_key: cond[: span.start].clone(),
+            uncond_key: uncond[: span.start].clone(),
+            suffix_key: cond[span.stop :].clone(),
         }
 
     def verify_latent(self, latent: torch.Tensor, models: Dict[str, Any], device: str) -> bool:
@@ -171,7 +174,7 @@ class HunyuanImage3Processor(BaseModelProcessor):
     ) -> Dict[str, Any]:
         width, height = metadata["bucket_resolution"]
         tokens = self.build_prompt_tokens(text_encodings["prompt"], int(height), int(width))
-        if latent.shape[-2] * latent.shape[-1] != int(height) * int(width) // 256:
+        if tuple(latent.shape[-2:]) != (int(height) // 16, int(width) // 16):
             raise RuntimeError(f"Latent {tuple(latent.shape)} does not match bucket {width}x{height} at 16x.")
         return {
             "latent": latent,

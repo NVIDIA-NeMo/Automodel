@@ -126,6 +126,8 @@ def test_get_cache_data():
     assert cache["prompt_input_ids"][-1].item() == TIMESTEP
     assert cache["prompt_suffix_ids"].tolist() == [EOI]
     assert cache["model_type"] == "hunyuan_image3" and cache["bucket_id"] == 3
+    with pytest.raises(RuntimeError, match="does not match bucket"):  # transposed latent, same token count
+        processor.get_cache_data(torch.randn(32, 4, 2), text, _metadata())
     with pytest.raises(RuntimeError, match="does not match bucket"):
         processor.get_cache_data(torch.randn(32, 3, 3), text, _metadata())
 
