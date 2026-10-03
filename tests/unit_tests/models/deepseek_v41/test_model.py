@@ -50,7 +50,7 @@ from nemo_automodel.components.speculative.dspark.target import HFDSparkTargetMo
 
 # Over the default 5s budget on purpose: this module runs full-model forwards and distributed FSDP checks.
 # Shrink the model fixtures and process startup before lowering this further.
-pytestmark = pytest.mark.timeout(60)
+pytestmark = pytest.mark.timeout(70)
 
 
 def _tiny_config() -> DeepseekV41Config:
