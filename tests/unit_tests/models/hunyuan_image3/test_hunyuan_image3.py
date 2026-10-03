@@ -306,7 +306,7 @@ def test_forward_rejects_malformed_image_spans(model):
     with pytest.raises(ValueError, match="<timestep>"):
         model(no_timestep[None], latents, t)
     at_start = torch.cat([torch.full((6,), IMAGE_ID), torch.tensor([3, 3])])  # nothing before the image
-    with pytest.raises(ValueError, match="contiguous span preceded"):
+    with pytest.raises(ValueError, match="preceded by the <timestep> token"):
         model(at_start[None], latents, t)
     split = _sequence(3, 6)  # [p p p <timestep> img*6 <eoi>]
     split[6], split[10] = 5, IMAGE_ID  # still six image tokens, but not contiguous

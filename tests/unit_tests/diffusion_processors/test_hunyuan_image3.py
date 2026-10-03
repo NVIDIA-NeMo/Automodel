@@ -146,19 +146,16 @@ def test_encode_image_samples_scales_and_drops_frame_axis():
 
 
 def test_target_resolution_uses_release_group_not_generic_buckets():
-    calculator = MagicMock()
+    generic_bucket = {"resolution": (512, 384)}
     processor = _processor()
-    assert processor.target_resolution(1920, 1080, calculator) == (1280, 768)
-    assert processor.target_resolution(500, 500, calculator) == (1024, 1024)
-    calculator.get_bucket_for_image.assert_not_called()
+    assert processor.target_resolution(1920, 1080, generic_bucket) == (1280, 768)
+    assert processor.target_resolution(500, 500, generic_bucket) == (1024, 1024)
 
 
-def test_base_target_resolution_uses_calculator():
+def test_base_target_resolution_uses_bucket():
     from tools.diffusion.processors.qwen_image import QwenImageProcessor
 
-    calculator = MagicMock()
-    calculator.get_bucket_for_image.return_value = {"resolution": (512, 384)}
-    assert QwenImageProcessor().target_resolution(1000, 750, calculator) == (512, 384)
+    assert QwenImageProcessor().target_resolution(1000, 750, {"resolution": [512, 384]}) == (512, 384)
 
 
 def test_verify_latent():
