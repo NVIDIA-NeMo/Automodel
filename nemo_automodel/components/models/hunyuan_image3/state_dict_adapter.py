@@ -39,6 +39,7 @@ from typing import Any
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor import DTensor
 
 from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
 from nemo_automodel.components.models.common import BackendConfig
@@ -70,6 +71,18 @@ def _rename(key: str, renames: tuple[tuple[re.Pattern[str], str], ...]) -> str:
         if count:
             return new_key
     return key
+
+
+def _all_alias(pairs: list[tuple[str, Any]], tensor: Any) -> bool:
+    """Whether every entry is a view into ``tensor``'s (local) storage, i.e. a checkpoint-load view."""
+    local = tensor.to_local() if isinstance(tensor, DTensor) else tensor
+    if local.is_meta:
+        return False
+    storage = local.untyped_storage().data_ptr()
+    return all(
+        isinstance(value, torch.Tensor) and not value.is_meta and value.untyped_storage().data_ptr() == storage
+        for _, value in pairs
+    )
 
 
 def _fuse_gate_up(pairs: list[tuple[str, Any]]) -> list[tuple[str, Any]]:
@@ -110,6 +123,39 @@ class HunyuanImage3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdap
         self.backend = backend
         self.dtype = dtype
         self._uses_model_prefix = True
+        # Fused checkpoint-load destinations handed to DCP, keyed by released key: (buffer, up view, gate view).
+        self._fused_load_destinations: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+
+    def _fused_load_destination_pairs(self, fqn: str, pairs: list[tuple[str, Any]]) -> list[tuple[str, Any]]:
+        """Replace in-place gate/up views with one fused DCP destination per expert.
+
+        The mixin registered ``fqn`` as loaded in place and returned, per local expert, ``gate_proj`` / ``up_proj``
+        views into the model's grouped weight. The checkpoint stores both halves in one ``[2 * expert_hidden,
+        hidden]`` tensor, which DCP cannot write through two separate views, so DCP gets a host buffer of that shape
+        and :meth:`from_hf` copies its halves into the views afterwards.
+
+        Args:
+            fqn: Native name of the grouped ``gate_and_up_projs`` tensor.
+            pairs: Per-expert ``(key, view)`` entries from the mixin; ``gate_proj`` / ``up_proj`` views have shape
+                [expert_hidden, hidden] and alias the model weight.
+
+        Returns:
+            Per expert, one ``(fused key, buffer)`` entry whose buffer has shape [2 * expert_hidden, hidden].
+        """
+        views: dict[str, dict[str, torch.Tensor]] = {}
+        for key, view in pairs:
+            match = _SPLIT_EXPERT_KEY.match(key)
+            if match is None:
+                raise ValueError(f"Unexpected entry {key!r} while splitting {fqn}")
+            views.setdefault(match.group("stem"), {})[match.group("proj")] = view
+        out = []
+        for stem, parts in views.items():
+            up, gate = parts["up_proj"], parts["gate_proj"]
+            buffer = torch.empty((up.shape[0] + gate.shape[0], up.shape[1]), dtype=up.dtype, device="cpu")
+            fused_key = _rename(f"{stem}.gate_and_up_proj.weight", _NATIVE_TO_HF_RENAMES)
+            self._fused_load_destinations[fused_key] = (buffer, up, gate)
+            out.append((fused_key, buffer))
+        return out
 
     def to_hf(self, state_dict: dict[str, Any], exclude_key_regex: str | None = None, **kwargs: Any) -> dict[str, Any]:
         """Convert a native state dict to released checkpoint keys."""
@@ -133,16 +179,17 @@ class HunyuanImage3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdap
 
         Returns:
             ``(key, tensor)`` entries in the released layout: per local expert, ``gate_and_up_proj`` of shape
-            [2 * expert_hidden, hidden] (rows ``[up; gate]``, new storage) and ``down_proj`` of shape
-            [hidden, expert_hidden]; other tensors are renamed only.
+            [2 * expert_hidden, hidden] (rows ``[up; gate]``) and ``down_proj`` of shape [hidden, expert_hidden];
+            other tensors are renamed only. On a checkpoint load the fused entries are host buffers that
+            :meth:`from_hf` copies into the model weight (see :meth:`_fused_load_destination_pairs`); otherwise
+            they are new contiguous tensors.
         """
         exclude_key_regex = kwargs.pop("exclude_key_regex", None)
-        if fqn.endswith(".mlp.experts.gate_and_up_projs"):
-            # The fused output is new storage: never register the grouped tensor as loaded in place.
-            kwargs["for_checkpoint_load"] = False
         pairs = self._convert_single_merged_expert_to_hf_split_experts(fqn, tensor, **kwargs)
         if pairs is None:
             pairs = [(fqn, tensor)]
+        elif fqn.endswith(".gate_and_up_projs") and _all_alias(pairs, tensor):
+            pairs = self._fused_load_destination_pairs(fqn, pairs)
         else:
             pairs = _fuse_gate_up(pairs)
         out = []
@@ -166,15 +213,32 @@ class HunyuanImage3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdap
 
         Returns:
             Native state dict; grouped ``gate_and_up_projs`` of shape [local_experts, hidden, 2 * expert_hidden]
-            (columns ``[gate | up]``) and ``down_projs`` of shape [local_experts, expert_hidden, hidden].
+            (columns ``[gate | up]``) and ``down_projs`` of shape [local_experts, expert_hidden, hidden]. Grouped
+            tensors loaded in place through DCP destinations are absent (see ``view_loaded_native_keys``).
         """
         native: dict[str, Any] = {}
         intermediate = self.moe_config.moe_inter_dim
+        destinations, self._fused_load_destinations = self._fused_load_destinations, {}
         for key in list(hf_state_dict):
             value = hf_state_dict.pop(key)
             if key.startswith(_UNUSED_HF_PREFIXES):
                 continue
             fused = _FUSED_EXPERT_KEY.match(key)
+            if fused is not None and key in destinations:
+                # DCP filled the fused host buffer; move its halves into the model weight and hand the mixin the
+                # split keys it expects for an in-place loaded group.
+                _, up, gate = destinations[key]
+                if value.shape != (up.shape[0] + gate.shape[0], up.shape[1]):
+                    raise ValueError(
+                        f"{key}: expected shape {(up.shape[0] + gate.shape[0], up.shape[1])}, got {tuple(value.shape)}"
+                    )
+                with torch.no_grad():
+                    up.copy_(value[: up.shape[0]])
+                    gate.copy_(value[up.shape[0] :])
+                stem = fused.group("stem")
+                native[f"{stem}.up_proj.weight"] = up
+                native[f"{stem}.gate_proj.weight"] = gate
+                continue
             if fused is not None:
                 if value.shape[0] != 2 * intermediate:
                     raise ValueError(f"{key}: expected {2 * intermediate} rows, got {tuple(value.shape)}")

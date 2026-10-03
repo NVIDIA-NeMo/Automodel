@@ -355,6 +355,47 @@ def test_from_hf_rejects_wrong_expert_shape(model):
         model.state_dict_adapter.from_hf(hf)
 
 
+@pytest.mark.parametrize("registered_in_place", [False, True])
+def test_checkpoint_load_destinations_fill_model_weights(registered_in_place):
+    """DCP writes the released fused expert tensors into host buffers; ``from_hf`` moves them into the weights.
+
+    With ``registered_in_place`` the grouped keys are marked as loaded in place (what the mixin does on CUDA), so
+    ``from_hf`` must leave them out of its result and report them as view-loaded instead of rebuilding them.
+    """
+    target = _model(seed=0)
+    source = _model(seed=1)
+    adapter = target.state_dict_adapter
+    source_hf = source.state_dict_adapter.to_hf(source.state_dict())
+    destinations = adapter.to_hf(target.state_dict(), for_checkpoint_load=True)
+    assert set(destinations) == set(source_hf)
+    weight_storages = {
+        block.mlp.experts.gate_and_up_projs.untyped_storage().data_ptr() for block in target.model.layers.values()
+    }
+    fused_keys = [k for k in destinations if k.endswith(".gate_and_up_proj.weight") and ".experts." in k]
+    assert len(fused_keys) == 2 * 4  # layers x experts
+    for key in fused_keys:
+        buffer = destinations[key]
+        assert buffer.device.type == "cpu" and buffer.shape == (64, 64)  # [2 * expert_hidden, hidden]
+        assert buffer.untyped_storage().data_ptr() not in weight_storages
+    if registered_in_place:
+        for layer in ("0", "1"):
+            adapter._register_inplace_loaded_key(f"model.layers.{layer}.mlp.experts.gate_and_up_projs", None)
+    with torch.no_grad():  # what DCP does: write the checkpoint into the destinations
+        for key, value in destinations.items():
+            value.copy_(source_hf[key])
+    native = adapter.from_hf(destinations)
+    assert not adapter._fused_load_destinations
+    grouped_keys = {f"model.layers.{layer}.mlp.experts.gate_and_up_projs" for layer in ("0", "1")}
+    if registered_in_place:
+        assert not grouped_keys & set(native)
+        assert grouped_keys <= adapter.view_loaded_native_keys
+    else:
+        assert grouped_keys <= set(native)
+    target.load_state_dict(native, strict=False)
+    for key, value in source.state_dict().items():
+        torch.testing.assert_close(target.state_dict()[key], value, msg=key)
+
+
 def test_to_hf_honors_exclude_regex(model):
     hf = model.state_dict_adapter.to_hf(model.state_dict(), exclude_key_regex=r".*experts.*")
     assert not any("experts" in key for key in hf)
