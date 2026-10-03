@@ -171,6 +171,8 @@ def test_grouped_experts_deepep_lora_init(moe_config, device):
 def test_grouped_experts_deepep_lora_preserves_dispatcher_settings(moe_config):
     """Test that LoRA wrapping preserves the source expert dispatcher backend."""
     backend = BackendConfig(
+        experts="torch_mm",
+        dispatcher="hybridep",
         dispatcher_hybridep_permute_fusion=True,
         dispatcher_hybridep_compact_routing=True,
         dispatcher_hybridep_num_sms_preprocessing=132,

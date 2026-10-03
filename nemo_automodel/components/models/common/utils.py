@@ -706,6 +706,19 @@ class BackendConfig:
                 "te_fp8 requires at least one TE backend "
                 f"(linear='te' or experts='te'), but got linear='{self.linear}', experts='{self.experts}'"
             )
+        # The sync-free knobs only mean something to the HybridEP dispatcher; elsewhere the capacity factor
+        # would silently switch off the empty-expert fallback the other dispatchers can hit.
+        sync_free_requested = self.dispatcher_capacity_factor is not None or self.dispatcher_equal_token_counts
+        if sync_free_requested and self.dispatcher != "hybridep":
+            raise ValueError(
+                "dispatcher_capacity_factor and dispatcher_equal_token_counts require dispatcher='hybridep', "
+                f"got dispatcher='{self.dispatcher}'"
+            )
+        if self.dispatcher_capacity_factor is not None and not self.dispatcher_capacity_factor >= 1.0:
+            raise ValueError(
+                f"dispatcher_capacity_factor must be >= 1.0 (a smaller buffer overflows on the first skewed batch), "
+                f"got {self.dispatcher_capacity_factor!r}"
+            )
 
 
 # Keep the forward opaque so grad/no_grad compilation uses the same computation.
