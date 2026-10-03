@@ -37,6 +37,7 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
 from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5Model as HFQwen3_5Model,
 )
+from transformers.utils import torch_compilable_check
 
 from nemo_automodel.components.distributed.context_parallel.sharder import (
     ContextParallelSharder,
@@ -113,6 +114,50 @@ def _qwen3_5_backend(backend: BackendConfig | None = None) -> BackendConfig:
     resolved = copy.copy(backend) if backend is not None else BackendConfig()
     resolved.rope_fusion = False
     return resolved
+
+
+def _splice_multimodal_features(
+    inputs_embeds: torch.Tensor,
+    input_ids: torch.Tensor,
+    features: torch.Tensor,
+    token_id: int,
+    modality: str,
+) -> torch.Tensor:
+    """Replace multimodal placeholder rows without dynamic-size indexing.
+
+    ``masked_scatter`` implements its source gradient through ``masked_select``.
+    On CUDA that dynamic-size selection synchronizes the stream before allocating
+    its result. The feature row count is already known, so use fixed-size
+    ``nonzero_static`` indices and ``index_copy`` instead. Its backward is the
+    asynchronous ``index_fill``/``index_select`` pair.
+
+    Args:
+        inputs_embeds: Tensor of shape [..., hidden], with arbitrary leading token dimensions.
+        input_ids: Tensor of shape [...], matching the leading dimensions of ``inputs_embeds``
+            and on the same device.
+        features: Tensor of shape [num_placeholder_tokens, hidden], with the same device and
+            dtype as ``inputs_embeds``. Rows follow the flattened placeholder order.
+        token_id: Token ID marking the positions to replace.
+        modality: Modality name used in the count-mismatch error.
+
+    Returns:
+        Tensor of shape [..., hidden] with placeholder rows replaced by ``features``.
+
+    Raises:
+        ValueError: The placeholder count differs from ``num_placeholder_tokens``.
+    """
+    token_mask = input_ids.eq(token_id).reshape(-1)
+    num_features = features.shape[0]
+    num_tokens = token_mask.sum()
+    torch_compilable_check(
+        num_tokens.eq(num_features),
+        lambda: (
+            f"{modality} features and placeholder tokens do not match, tokens: {num_tokens}, features: {num_features}"
+        ),
+    )
+    token_indices = torch.nonzero_static(token_mask, size=num_features).squeeze(-1)
+    flat_embeds = inputs_embeds.reshape(-1, inputs_embeds.shape[-1])
+    return flat_embeds.index_copy(0, token_indices, features).view_as(inputs_embeds)
 
 
 def build_mtp_config_from_hf(
@@ -608,8 +653,9 @@ class Qwen3_5DenseTextBackbone(nn.Module):
 
 class Qwen3_5Model(HFQwen3_5Model):
     """Thin VLM wrapper exposing ``language_model`` internals as properties and
-    routing the forward: HF vision+scatter path when media is present, else the
-    NeMo dense backbone directly. Mirrors ``Qwen3_5MoeModel``."""
+    routing the forward: vision encoding and a fixed-size splice when media and
+    token IDs are present, HF fallback for embedded media, and the NeMo dense
+    backbone for text only."""
 
     @property
     def layers(self):
@@ -637,8 +683,8 @@ class Qwen3_5Model(HFQwen3_5Model):
         cache_position=None,
         **kwargs,
     ):
-        # Media present + vision encoder: full HF VL forward (vision encode +
-        # multimodal scatter), which then calls self.language_model (NeMo backbone).
+        # Media present + vision encoder: splice when token IDs are available,
+        # then call the HF forward to reach self.language_model (NeMo backbone).
         if (pixel_values is not None or pixel_values_videos is not None) and self.visual is not None:
             embed_tokens = self.get_input_embeddings()
             input_ids_for_super = input_ids
@@ -654,6 +700,62 @@ class Qwen3_5Model(HFQwen3_5Model):
             media_tensor = pixel_values if pixel_values is not None else pixel_values_videos
             if isinstance(media_tensor, torch.Tensor) and hasattr(self.visual, "rotary_pos_emb"):
                 self.visual.rotary_pos_emb.to(media_tensor.device)
+
+            # With token IDs available, keep the HF vision/position path but
+            # replace its dynamic masked-scatter backward with fixed-size indices.
+            # The inputs-embeds-only generation path retains the upstream fallback.
+            if input_ids_for_super is not None:
+                if inputs_embeds_for_super is None:
+                    inputs_embeds_for_super = embed_tokens(input_ids_for_super)
+                if pixel_values is not None:
+                    image_outputs = self.get_image_features(pixel_values, image_grid_thw, return_dict=True, **kwargs)
+                    image_embeds = torch.cat(image_outputs.pooler_output, dim=0).to(
+                        inputs_embeds_for_super.device, inputs_embeds_for_super.dtype
+                    )
+                    inputs_embeds_for_super = _splice_multimodal_features(
+                        inputs_embeds_for_super,
+                        input_ids_for_super,
+                        image_embeds,
+                        self.config.image_token_id,
+                        "Image",
+                    )
+                if pixel_values_videos is not None:
+                    video_outputs = self.get_video_features(
+                        pixel_values_videos, video_grid_thw, return_dict=True, **kwargs
+                    )
+                    video_embeds = torch.cat(video_outputs.pooler_output, dim=0).to(
+                        inputs_embeds_for_super.device, inputs_embeds_for_super.dtype
+                    )
+                    inputs_embeds_for_super = _splice_multimodal_features(
+                        inputs_embeds_for_super,
+                        input_ids_for_super,
+                        video_embeds,
+                        self.config.video_token_id,
+                        "Video",
+                    )
+                if position_ids is None:
+                    position_ids = self.compute_3d_position_ids(
+                        input_ids=input_ids_for_super,
+                        inputs_embeds=inputs_embeds_for_super,
+                        image_grid_thw=image_grid_thw,
+                        video_grid_thw=video_grid_thw,
+                        attention_mask=attention_mask,
+                        past_key_values=past_key_values,
+                        mm_token_type_ids=kwargs.get("mm_token_type_ids"),
+                    )
+                return super().forward(
+                    input_ids=None,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    inputs_embeds=inputs_embeds_for_super,
+                    pixel_values=None,
+                    pixel_values_videos=None,
+                    image_grid_thw=image_grid_thw,
+                    video_grid_thw=video_grid_thw,
+                    cache_position=cache_position,
+                    **kwargs,
+                )
             return super().forward(
                 input_ids=input_ids_for_super,
                 attention_mask=attention_mask,
@@ -1241,8 +1343,8 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         The VLM->LM multimodal scatter runs on the full (unsharded) sequence
         inside the forward before the CP sequence shard, so it is identical to
         the pre-CP-refactor pre-embed. Vision features may be frame-sharded
-        across the CP group before ``get_placeholder_mask`` scatters them into
-        the full ``input_ids`` sequence.
+        across the CP group before the fixed-size splice inserts them into the
+        full ``input_ids`` sequence.
 
         Args:
             input_ids: Token ids ``[batch, sequence]`` (full, unsharded).
@@ -1274,12 +1376,13 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
                     image_grid_thw,
                     is_video=False,
                 ).to(inputs_embeds.device, inputs_embeds.dtype)
-                image_mask, _ = self.model.get_placeholder_mask(
+                inputs_embeds = _splice_multimodal_features(
+                    inputs_embeds,
                     input_ids,
-                    inputs_embeds=inputs_embeds,
-                    image_features=image_embeds,
+                    image_embeds,
+                    self.config.image_token_id,
+                    "Image",
                 )
-                inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
             if pixel_values_videos is not None:
                 if hasattr(self.model.visual, "rotary_pos_emb"):
@@ -1289,12 +1392,13 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
                     video_grid_thw,
                     is_video=True,
                 ).to(inputs_embeds.device, inputs_embeds.dtype)
-                _, video_mask = self.model.get_placeholder_mask(
+                inputs_embeds = _splice_multimodal_features(
+                    inputs_embeds,
                     input_ids,
-                    inputs_embeds=inputs_embeds,
-                    video_features=video_embeds,
+                    video_embeds,
+                    self.config.video_token_id,
+                    "Video",
                 )
-                inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
 
         return inputs_embeds
 
