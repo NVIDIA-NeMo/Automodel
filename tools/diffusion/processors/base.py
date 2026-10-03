@@ -12,16 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from __future__ import annotations
-
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, Dict
+from typing import Any, Dict
 
 import torch
 from PIL import Image
-
-if TYPE_CHECKING:
-    from nemo_automodel.components.datasets.diffusion.multi_tier_bucketing import MultiTierBucketCalculator
 
 
 class BaseModelProcessor(ABC):
@@ -160,12 +155,13 @@ class BaseModelProcessor(ABC):
         """
         pass
 
-    def target_resolution(self, width: int, height: int, calculator: MultiTierBucketCalculator) -> tuple[int, int]:
+    def target_resolution(self, width: int, height: int, bucket: Dict[str, Any]) -> tuple[int, int]:
         """Return the ``(width, height)`` an image of this size is resized and center-cropped to.
 
-        The default is the calculator's best bucket. Override for models trained on a fixed resolution set.
+        The default is the resolution of ``bucket``, the calculator's best bucket for the image. Override for
+        models trained on a fixed resolution set.
         """
-        return calculator.get_bucket_for_image(width, height)["resolution"]
+        return tuple(bucket["resolution"])
 
     def preprocess_image(self, image: Image.Image) -> torch.Tensor:
         """

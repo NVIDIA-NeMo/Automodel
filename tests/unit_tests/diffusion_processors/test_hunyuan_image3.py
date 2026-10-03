@@ -69,7 +69,7 @@ class _FakeWrapper:
 
 def _processor(**wrapper_kwargs) -> HunyuanImage3Processor:
     processor = HunyuanImage3Processor()
-    processor._config = SimpleNamespace(image_base_size=1024)
+    processor._config = SimpleNamespace(image_base_size=1024, vae={"latent_channels": 32})
     processor._wrapper = _FakeWrapper(**wrapper_kwargs)
     processor._image_processor = _FakeImageProcessor()
     processor._sequence_template = "pretrain"
@@ -162,7 +162,7 @@ def test_base_target_resolution_uses_calculator():
 
 
 def test_verify_latent():
-    processor = HunyuanImage3Processor()
+    processor = _processor()
     assert processor.verify_latent(torch.zeros(32, 2, 2), {}, "cpu")
     assert not processor.verify_latent(torch.full((32, 2, 2), float("nan")), {}, "cpu")
     assert not processor.verify_latent(torch.zeros(16, 2, 2), {}, "cpu")

@@ -22,8 +22,11 @@ import torch
 
 from .base_dataset import BaseMultiresolutionDataset
 
-PROMPT_TOKEN_ID_KEYS = ("prompt_input_ids", "uncond_prompt_input_ids", "prompt_suffix_ids")
-"""Per-sample 1D token-id tensors of models that embed the prompt themselves (e.g. HunyuanImage-3.0)."""
+PROMPT_IDS_KEY = "prompt_input_ids"
+UNCOND_PROMPT_IDS_KEY = "uncond_prompt_input_ids"
+PROMPT_SUFFIX_IDS_KEY = "prompt_suffix_ids"
+PROMPT_TOKEN_ID_KEYS = (PROMPT_IDS_KEY, UNCOND_PROMPT_IDS_KEY, PROMPT_SUFFIX_IDS_KEY)
+"""Optional per-sample 1D token-id tensors of models that embed the prompt themselves (no text encoder)."""
 
 
 @dataclass

@@ -162,9 +162,7 @@ def collate_fn_text_to_image(batch: List[Dict]) -> Dict:
             image_batch["clip_hidden"] = production_batch["clip_hidden"]
     elif PROMPT_TOKEN_ID_KEYS[0] in production_batch:
         # The model embeds the prompt tokens itself.
-        for key in PROMPT_TOKEN_ID_KEYS:
-            if key in production_batch:
-                image_batch[key] = production_batch[key]
+        image_batch.update({key: production_batch[key] for key in PROMPT_TOKEN_ID_KEYS})
     else:
         # Tokenized - need to encode during training (not supported yet)
         image_batch["t5_tokens"] = production_batch["t5_tokens"]

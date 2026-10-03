@@ -114,27 +114,12 @@ class HunyuanImage3Attention(nn.Module):
         q = q.to(v.dtype)
         k = k.to(v.dtype)
 
-        # Query head h uses KV head h // q_per_kv (the fused layout groups query heads by KV head).
-        k = k[:, :, None].expand(batch, self.num_kv_heads, self.q_per_kv, seq, self.head_dim).flatten(1, 2)
-        v = v[:, :, None].expand(batch, self.num_kv_heads, self.q_per_kv, seq, self.head_dim).flatten(1, 2)
-        if attention_mask is None:
-            out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        else:
-            out = F.scaled_dot_product_attention(
-                q.contiguous(), k.contiguous(), v.contiguous(), attn_mask=attention_mask
-            )
+        # enable_gqa pairs query head h with KV head h // q_per_kv, matching the fused layout's grouping.
+        out = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=attention_mask, is_causal=attention_mask is None, enable_gqa=True
+        )
         out = out.transpose(1, 2).reshape(batch, seq, self.num_heads * self.head_dim)
         return self.o_proj(out)
-
-    @torch.no_grad()
-    def init_weights(self, init_std: float = 0.02) -> None:
-        for linear in (self.qkv_proj, self.o_proj):
-            nn.init.normal_(linear.weight, std=init_std)
-            if linear.bias is not None:
-                nn.init.zeros_(linear.bias)
-        if self.use_qk_norm:
-            self.query_layernorm.reset_parameters()
-            self.key_layernorm.reset_parameters()
 
 
 class HunyuanSharedMLP(nn.Module):
@@ -159,13 +144,6 @@ class HunyuanSharedMLP(nn.Module):
         """
         up, gate = self.gate_and_up_proj(x).chunk(2, dim=-1)
         return self.down_proj(up * F.silu(gate))
-
-    @torch.no_grad()
-    def init_weights(self, init_std: float = 0.02) -> None:
-        for linear in (self.gate_and_up_proj, self.down_proj):
-            nn.init.normal_(linear.weight, std=init_std)
-            if linear.bias is not None:
-                nn.init.zeros_(linear.bias)
 
 
 def timestep_embedding(t: torch.Tensor, dim: int, max_period: float = 10000.0) -> torch.Tensor:
@@ -211,12 +189,6 @@ class TimestepEmbedder(nn.Module):
         """
         freq = timestep_embedding(t, self.frequency_embedding_size).to(self.mlp[0].weight.dtype)
         return self.mlp(freq)
-
-    @torch.no_grad()
-    def init_weights(self, init_std: float = 0.02) -> None:
-        for index in (0, 2):
-            nn.init.normal_(self.mlp[index].weight, std=init_std)
-            nn.init.zeros_(self.mlp[index].bias)
 
 
 class GroupNorm32(nn.GroupNorm):
@@ -343,13 +315,22 @@ class UNetUp(nn.Module):
 
 
 @torch.no_grad()
-def init_unet_weights(module: nn.Module, init_std: float = 0.02) -> None:
-    """Default init for the UNet projections: GroupNorm affine = identity, convs / linears normal."""
+def init_leaf_weights(module: nn.Module, init_std: float = 0.02) -> None:
+    """Default init for the non-MoE modules: linears and convs normal, norm affine = identity, biases zero.
+
+    Args:
+        module: Module tree whose leaves hold ``weight`` (and optionally ``bias``) parameters: linears
+            (``[out, in]``), convs (``[out, in, kh, kw]``) and norms (``[hidden]``).
+        init_std: Standard deviation of the normal init for 2-D and 4-D weights.
+    """
     for sub in module.modules():
-        if isinstance(sub, nn.GroupNorm):
-            nn.init.ones_(sub.weight)
-            nn.init.zeros_(sub.bias)
-        elif isinstance(sub, (nn.Conv2d, nn.Linear)):
-            nn.init.normal_(sub.weight, std=init_std)
-            if sub.bias is not None:
-                nn.init.zeros_(sub.bias)
+        weight = getattr(sub, "weight", None)
+        if not isinstance(weight, torch.Tensor):
+            continue
+        if weight.ndim == 1:
+            nn.init.ones_(weight)
+        else:
+            nn.init.normal_(weight, std=init_std)
+        bias = getattr(sub, "bias", None)
+        if isinstance(bias, torch.Tensor):
+            nn.init.zeros_(bias)

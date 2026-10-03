@@ -75,9 +75,6 @@ fsdp:
 
 flow_matching:
   adapter_type: "hunyuan_image3"
-  adapter_kwargs:
-    image_token_id: 128006
-    pad_token_id: 128009
   timestep_sampling: "logit_normal"
   logit_mean: 0.0
   logit_std: 1.0

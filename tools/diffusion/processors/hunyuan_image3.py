@@ -30,17 +30,18 @@ import importlib
 import json
 import logging
 import os
-from typing import TYPE_CHECKING, Any, Dict
+from typing import Any, Dict
 
 import torch
 
-from nemo_automodel.components.datasets.diffusion.text_to_image_dataset import PROMPT_TOKEN_ID_KEYS
+from nemo_automodel.components.datasets.diffusion.text_to_image_dataset import (
+    PROMPT_IDS_KEY,
+    PROMPT_SUFFIX_IDS_KEY,
+    UNCOND_PROMPT_IDS_KEY,
+)
 
 from .base import BaseModelProcessor
 from .registry import ProcessorRegistry
-
-if TYPE_CHECKING:
-    from nemo_automodel.components.datasets.diffusion.multi_tier_bucketing import MultiTierBucketCalculator
 
 logger = logging.getLogger(__name__)
 
@@ -101,13 +102,13 @@ class HunyuanImage3Processor(BaseModelProcessor):
         self._wrapper = wrapper_cls(tokenizer)
         self._image_processor = image_processor_cls(config)
         self._sequence_template = sequence_template
-        return {"vae": _load_vae(model_dir, config, device), "config": config}
+        return {"vae": _load_vae(model_dir, config, device)}
 
-    def target_resolution(self, width: int, height: int, calculator: MultiTierBucketCalculator) -> tuple[int, int]:
+    def target_resolution(self, width: int, height: int, bucket: Dict[str, Any]) -> tuple[int, int]:
         """Snap to the release's resolution group (33 aspect ratios around ``image_base_size``).
 
         The release only generates these sizes, and its ``<img_ratio_*>`` token names one of them; the generic
-        bucket calculator is not used.
+        bucket's resolution is not used.
         """
         target_width, target_height = self._image_processor.reso_group.get_target_size(width, height)
         return int(target_width), int(target_height)
@@ -116,7 +117,7 @@ class HunyuanImage3Processor(BaseModelProcessor):
         vae = models["vae"]
         with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.float16, enabled=device != "cpu"):
             latent = vae.encode(image_tensor.to(device, dtype=torch.float32)).latent_dist.sample()
-        latent = latent.float() * vae.config.scaling_factor
+        latent = latent.float() * self.get_vae_scaling_factor(models)
         if latent.ndim == 5:
             if latent.shape[2] != 1:
                 raise ValueError(f"Expected one latent frame for an image, got {latent.shape[2]}")
@@ -124,8 +125,8 @@ class HunyuanImage3Processor(BaseModelProcessor):
         return latent.squeeze(0).cpu().to(torch.bfloat16)
 
     def encode_text(self, prompt: str, models: Dict[str, Any], device: str) -> Dict[str, Any]:
-        # The token sequence depends on the bucket resolution; it is built in get_cache_data.
-        return {"prompt": prompt}
+        # The token sequence depends on the bucket resolution; get_cache_data builds it from metadata["prompt"].
+        return {}
 
     def build_prompt_tokens(self, prompt: str, height: int, width: int) -> Dict[str, torch.Tensor]:
         """Return the release's token ids around the image span for one prompt and image size.
@@ -159,22 +160,22 @@ class HunyuanImage3Processor(BaseModelProcessor):
         timestep_index = int(out.gen_timestep_scatter_index[0].reshape(-1)[0])
         if timestep_index != span.start - 1:
             raise RuntimeError(f"Expected <timestep> right before the image, got index {timestep_index} vs {span}.")
-        prompt_key, uncond_key, suffix_key = PROMPT_TOKEN_ID_KEYS
         return {
-            prompt_key: cond[: span.start].clone(),
-            uncond_key: uncond[: span.start].clone(),
-            suffix_key: cond[span.stop :].clone(),
+            PROMPT_IDS_KEY: cond[: span.start].clone(),
+            UNCOND_PROMPT_IDS_KEY: uncond[: span.start].clone(),
+            PROMPT_SUFFIX_IDS_KEY: cond[span.stop :].clone(),
         }
 
     def verify_latent(self, latent: torch.Tensor, models: Dict[str, Any], device: str) -> bool:
-        return bool(torch.isfinite(latent).all()) and latent.ndim == 3 and latent.shape[0] == 32
+        channels = int(self._config.vae["latent_channels"])
+        return bool(torch.isfinite(latent).all()) and latent.ndim == 3 and latent.shape[0] == channels
 
     def get_cache_data(
         self, latent: torch.Tensor, text_encodings: Dict[str, Any], metadata: Dict[str, Any]
     ) -> Dict[str, Any]:
-        width, height = metadata["bucket_resolution"]
-        tokens = self.build_prompt_tokens(text_encodings["prompt"], int(height), int(width))
-        if tuple(latent.shape[-2:]) != (int(height) // 16, int(width) // 16):
+        width, height = (int(v) for v in metadata["bucket_resolution"])
+        tokens = self.build_prompt_tokens(metadata["prompt"], height, width)
+        if tuple(latent.shape[-2:]) != (height // 16, width // 16):
             raise RuntimeError(f"Latent {tuple(latent.shape)} does not match bucket {width}x{height} at 16x.")
         return {
             "latent": latent,

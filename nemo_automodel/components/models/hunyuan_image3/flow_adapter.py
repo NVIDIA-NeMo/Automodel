@@ -31,10 +31,13 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from nemo_automodel.components.datasets.diffusion.text_to_image_dataset import PROMPT_TOKEN_ID_KEYS
+from nemo_automodel.components.datasets.diffusion.text_to_image_dataset import (
+    PROMPT_IDS_KEY,
+    PROMPT_SUFFIX_IDS_KEY,
+    PROMPT_TOKEN_ID_KEYS,
+    UNCOND_PROMPT_IDS_KEY,
+)
 from nemo_automodel.components.flow_matching.adapters.base import FlowMatchingContext, ModelAdapter
-
-PROMPT_IDS_KEY, UNCOND_PROMPT_IDS_KEY, SUFFIX_IDS_KEY = PROMPT_TOKEN_ID_KEYS
 
 
 class HunyuanImage3Adapter(ModelAdapter):
@@ -65,7 +68,7 @@ class HunyuanImage3Adapter(ModelAdapter):
         noisy = context.noisy_latents
         if noisy.ndim != 4:
             raise ValueError(f"HunyuanImage3Adapter expects 4D latents [B, C, H, W], got {noisy.ndim}D")
-        for key in (PROMPT_IDS_KEY, UNCOND_PROMPT_IDS_KEY, SUFFIX_IDS_KEY):
+        for key in PROMPT_TOKEN_ID_KEYS:
             if key not in batch:
                 raise KeyError(f"Batch is missing {key!r}; preprocess the data with the 'hunyuan_image3' processor.")
         batch_size, _, height, width = noisy.shape
@@ -78,7 +81,7 @@ class HunyuanImage3Adapter(ModelAdapter):
             # torch's CPU generator is seeded by the recipe, so the drop pattern is reproducible.
             drop = context.cfg_dropout_prob > 0 and torch.rand(()).item() < context.cfg_dropout_prob
             prefix = batch[UNCOND_PROMPT_IDS_KEY if drop else PROMPT_IDS_KEY][i]
-            rows.append(torch.cat([prefix.long().cpu(), image_ids, batch[SUFFIX_IDS_KEY][i].long().cpu()]))
+            rows.append(torch.cat([prefix.long().cpu(), image_ids, batch[PROMPT_SUFFIX_IDS_KEY][i].long().cpu()]))
         valid_lengths = torch.tensor([len(row) for row in rows], dtype=torch.long)
         input_ids = torch.full((batch_size, int(valid_lengths.max())), self.pad_token_id, dtype=torch.long)
         for i, row in enumerate(rows):

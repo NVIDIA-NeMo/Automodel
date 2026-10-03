@@ -28,40 +28,8 @@ from __future__ import annotations
 import torch
 
 
-def image_grid_positions(
-    seq_len: int, image_start: int, token_h: int, token_w: int, device: torch.device | None = None
-) -> torch.Tensor:
-    """Return ``[seq_len, 2]`` integer (y, x) positions for a sequence holding one image.
-
-    Args:
-        seq_len: Total sequence length.
-        image_start: Index of the first image token.
-        token_h: Image height in tokens.
-        token_w: Image width in tokens.
-        device: Device of the returned tensor.
-
-    Returns:
-        Long tensor of shape ``[seq_len, 2]`` with the (y, x) position of every token.
-    """
-    num_image = token_h * token_w
-    if image_start < 0 or image_start + num_image > seq_len:
-        raise ValueError(f"Image span [{image_start}, {image_start + num_image}) does not fit in {seq_len} tokens.")
-    before = torch.arange(image_start, device=device, dtype=torch.float32)
-    beta_y = image_start + (num_image - token_h) / 2
-    beta_x = image_start + (num_image - token_w) / 2
-    rows = torch.arange(token_h, device=device, dtype=torch.float32)
-    cols = torch.arange(token_w, device=device, dtype=torch.float32)
-    grid_y = (beta_y + rows)[:, None].expand(token_h, token_w).reshape(-1)
-    grid_x = (beta_x + cols)[None, :].expand(token_h, token_w).reshape(-1)
-    after = torch.arange(image_start + num_image, seq_len, device=device, dtype=torch.float32)
-    y = torch.cat([before, grid_y, after])
-    x = torch.cat([before, grid_x, after])
-    # Truncate toward zero like the reference (half-integer grid offsets occur for odd spans).
-    return torch.stack([y, x], dim=-1).long()
-
-
 def image_grid_positions_batched(seq_len: int, image_starts: torch.Tensor, token_h: int, token_w: int) -> torch.Tensor:
-    """Batched :func:`image_grid_positions`, computed without host synchronization.
+    """Per-token (y, x) positions of a batch of sequences that each hold one image.
 
     Args:
         seq_len: Padded sequence length.

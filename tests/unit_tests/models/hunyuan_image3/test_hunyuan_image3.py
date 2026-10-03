@@ -33,7 +33,6 @@ from nemo_automodel.components.models.hunyuan_image3.model import (
 )
 from nemo_automodel.components.models.hunyuan_image3.rope import (
     apply_rope,
-    image_grid_positions,
     image_grid_positions_batched,
     rope_cos_sin,
     text_positions,
@@ -217,22 +216,30 @@ def test_text_rope_equals_standard_1d_rope():
     torch.testing.assert_close(sin[0], angles.sin())
 
 
-def test_batched_image_positions_match_per_sample():
+def _reference_positions(seq_len: int, start: int, token_h: int, token_w: int) -> torch.Tensor:
+    """Per-sample (y, x) positions written out the way the release builds them (text, centered grid, text)."""
+    num_image = token_h * token_w
+    beta_y, beta_x = start + (num_image - token_h) / 2, start + (num_image - token_w) / 2
+    positions = [(float(i), float(i)) for i in range(start)]
+    positions += [(beta_y + r, beta_x + c) for r in range(token_h) for c in range(token_w)]
+    positions += [(float(i), float(i)) for i in range(start + num_image, seq_len)]
+    return torch.tensor(positions, dtype=torch.float32).long()
+
+
+def test_batched_image_positions_match_reference():
     starts = torch.tensor([2, 0, 5])
     batched = image_grid_positions_batched(seq_len=13, image_starts=starts, token_h=2, token_w=3)
-    expected = torch.stack([image_grid_positions(13, int(s), 2, 3) for s in starts])
+    expected = torch.stack([_reference_positions(13, int(s), 2, 3) for s in starts])
     assert torch.equal(batched, expected)
 
 
 def test_image_grid_positions_center_the_image():
     # 2 text tokens, a 2x3 image, 1 trailing token.
-    pos = image_grid_positions(seq_len=9, image_start=2, token_h=2, token_w=3)
+    pos = image_grid_positions_batched(seq_len=9, image_starts=torch.tensor([2]), token_h=2, token_w=3)[0]
     assert pos[:2].tolist() == [[0, 0], [1, 1]]
     # beta_y = 2 + (6 - 2) / 2 = 4, beta_x = 2 + (6 - 3) / 2 = 3.5 -> truncated to 3, 4, 5
     assert pos[2:8].tolist() == [[4, 3], [4, 4], [4, 5], [5, 3], [5, 4], [5, 5]]
     assert pos[8].tolist() == [8, 8]
-    with pytest.raises(ValueError, match="does not fit"):
-        image_grid_positions(seq_len=5, image_start=2, token_h=2, token_w=3)
     with pytest.raises(ValueError, match="divisible by 4"):
         rope_cos_sin(pos, head_dim=6)
 

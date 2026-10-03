@@ -203,7 +203,7 @@ def _process_image(args: Tuple) -> Dict | None:
         orig_width, orig_height = image.size
 
         bucket = _worker_calculator.get_bucket_for_image(orig_width, orig_height)
-        target_width, target_height = _worker_processor.target_resolution(orig_width, orig_height, _worker_calculator)
+        target_width, target_height = _worker_processor.target_resolution(orig_width, orig_height, bucket)
 
         resized_image, crop_offset = _worker_calculator.resize_and_crop(
             image, target_width, target_height, crop_mode="center"

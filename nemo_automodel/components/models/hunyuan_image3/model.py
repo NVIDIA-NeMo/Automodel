@@ -52,7 +52,7 @@ from nemo_automodel.components.models.hunyuan_image3.layers import (
     TimestepEmbedder,
     UNetDown,
     UNetUp,
-    init_unet_weights,
+    init_leaf_weights,
 )
 from nemo_automodel.components.models.hunyuan_image3.rope import (
     image_grid_positions_batched,
@@ -67,8 +67,8 @@ from nemo_automodel.shared.utils import dtype_from_str
 
 
 def _model_dtype(config: HunyuanImage3Config) -> torch.dtype:
-    dtype = getattr(config, "dtype", None) or getattr(config, "torch_dtype", None)
-    return dtype if isinstance(dtype, torch.dtype) else dtype_from_str(dtype, default=torch.bfloat16)
+    """Parameter dtype from the config (``dtype`` under transformers 5, ``torch_dtype`` before)."""
+    return dtype_from_str(getattr(config, "dtype", None) or getattr(config, "torch_dtype", None), torch.bfloat16)
 
 
 def build_moe_config(config: HunyuanImage3Config, overrides: dict[str, Any] | None = None) -> MoEConfig:
@@ -115,9 +115,8 @@ def build_moe_config(config: HunyuanImage3Config, overrides: dict[str, Any] | No
 class HunyuanImage3Block(nn.Module):
     """Pre-norm decoder layer: GQA attention and a shared-expert MoE."""
 
-    def __init__(self, config: HunyuanImage3Config, moe_config: MoEConfig, backend: BackendConfig):
+    def __init__(self, config: HunyuanImage3Config, moe_config: MoEConfig, backend: BackendConfig, dtype: torch.dtype):
         super().__init__()
-        dtype = _model_dtype(config)
         self.self_attn = HunyuanImage3Attention(config, backend, dtype)
         self.mlp = MoE(moe_config, backend)
         shared_inter = moe_config.moe_inter_dim * per_layer(config.num_shared_expert, 0)
@@ -153,24 +152,21 @@ class HunyuanImage3Block(nn.Module):
 
     @torch.no_grad()
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
-        self.input_layernorm.reset_parameters()
-        self.post_attention_layernorm.reset_parameters()
-        self.self_attn.init_weights(init_std)
-        self.mlp.init_weights(buffer_device, init_std=init_std)
-        self.mlp.shared_experts.init_weights(init_std)
+        self.mlp.init_weights(buffer_device, init_std=init_std)  # router and routed experts
+        for module in (self.input_layernorm, self.post_attention_layernorm, self.self_attn, self.mlp.shared_experts):
+            init_leaf_weights(module, init_std)
 
 
 class HunyuanImage3Model(nn.Module):
     """Decoder backbone: token embedding, MoE layers and the final norm (``wte`` / ``ln_f`` in the release)."""
 
-    def __init__(self, config: HunyuanImage3Config, backend: BackendConfig, moe_config: MoEConfig):
+    def __init__(self, config: HunyuanImage3Config, backend: BackendConfig, moe_config: MoEConfig, dtype: torch.dtype):
         super().__init__()
-        dtype = _model_dtype(config)
         self.config = config
         self.moe_config = moe_config
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, dtype=dtype)
         self.layers = nn.ModuleDict(
-            {str(i): HunyuanImage3Block(config, moe_config, backend) for i in range(config.num_hidden_layers)}
+            {str(i): HunyuanImage3Block(config, moe_config, backend, dtype) for i in range(config.num_hidden_layers)}
         )
         self.norm = HunyuanRMSNorm(config.hidden_size, eps=config.rms_norm_eps, dtype=dtype)
 
@@ -203,7 +199,7 @@ class HunyuanImage3Model(nn.Module):
     @torch.no_grad()
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
         nn.init.normal_(self.embed_tokens.weight, std=init_std)
-        self.norm.reset_parameters()
+        init_leaf_weights(self.norm, init_std)
         for layer in self.layers.values():
             layer.init_weights(buffer_device, init_std=init_std)
 
@@ -294,7 +290,7 @@ class HunyuanImage3ForCausalMM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin
             raise ValueError("Cannot pass both moe_config and moe_overrides.")
         moe_config = moe_config or build_moe_config(config, moe_overrides)
 
-        self.model = HunyuanImage3Model(config, self.backend, moe_config)
+        self.model = HunyuanImage3Model(config, self.backend, moe_config, dtype)
         self.lm_head = initialize_linear_module(
             self.backend.linear, config.hidden_size, config.vocab_size, bias=False, dtype=dtype
         )
@@ -345,19 +341,21 @@ class HunyuanImage3ForCausalMM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin
         device = input_ids.device
 
         is_image = input_ids == self.config.image_token_id
-        counts = is_image.sum(dim=1)
-        if not bool((counts == num_image).all()):
-            raise ValueError(f"Every row needs {num_image} image tokens for {token_h}x{token_w} latents, got {counts}")
         image_starts = is_image.int().argmax(dim=1)
         rows = torch.arange(batch, device=device)
-        image_index = image_starts[:, None] + torch.arange(num_image, device=device)[None]
-        if int(image_starts.min()) < 1 or not bool(is_image[rows[:, None], image_index].all()):
-            raise ValueError("Image tokens must form one contiguous span preceded by the <timestep> token.")
-        timestep_slots = input_ids[rows, image_starts - 1]
-        if not bool((timestep_slots == self.config.timestep_token_id).all()):
+        image_index = (image_starts[:, None] + torch.arange(num_image, device=device)[None]).clamp(max=seq_len - 1)
+        # One host sync for all layout checks: exactly num_image image tokens, contiguous, preceded by <timestep>.
+        layout_ok = (
+            (is_image.sum(dim=1) == num_image)
+            & is_image[rows[:, None], image_index].all(dim=1)
+            & (image_starts >= 1)
+            & (input_ids[rows, (image_starts - 1).clamp(min=0)] == self.config.timestep_token_id)
+        )
+        if not bool(layout_ok.all()):
             raise ValueError(
-                f"Expected the <timestep> token ({self.config.timestep_token_id}) right before the image span, "
-                f"got {timestep_slots.tolist()}"
+                f"Every row needs one contiguous span of {num_image} image tokens ({token_h}x{token_w} latents) "
+                f"preceded by the <timestep> token ({self.config.timestep_token_id}); rows "
+                f"{(~layout_ok).nonzero().flatten().tolist()} do not."
             )
         if valid_lengths is None:
             valid_lengths = torch.full((batch,), seq_len, device=device, dtype=torch.long)
@@ -413,10 +411,8 @@ class HunyuanImage3ForCausalMM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin
         with buffer_device:
             self.model.init_weights(buffer_device)
             nn.init.normal_(self.lm_head.weight, std=self.config.hidden_size**-0.5)
-            for embedder in (self.timestep_emb, self.time_embed, self.time_embed_2):
-                embedder.init_weights()
-            init_unet_weights(self.patch_embed)
-            init_unet_weights(self.final_layer)
+            for module in (self.timestep_emb, self.time_embed, self.time_embed_2, self.patch_embed, self.final_layer):
+                init_leaf_weights(module)
         cast_model_to_dtype(self, dtype)
 
 
