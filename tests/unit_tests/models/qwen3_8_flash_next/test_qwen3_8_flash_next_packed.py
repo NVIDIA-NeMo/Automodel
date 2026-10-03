@@ -30,7 +30,7 @@ from nemo_automodel.components.models.qwen3_8_flash_next.qsa import Qwen3_8_Flas
 
 # Over the default 5s budget on purpose: this module spawns worker processes; every child re-imports torch from scratch.
 # Shrink the work or the process count before raising this further.
-pytestmark = pytest.mark.timeout(60)
+pytestmark = pytest.mark.timeout(70)
 
 _CU_SEQLENS = (0, 5, 12, 20)
 
@@ -491,6 +491,26 @@ def test_two_rank_packed_qsa_and_sharder_match_packed_cp1(tmp_path) -> None:
     )
 
 
+def test_qsa_route_extents_follow_gathered_keys_under_packed_cp() -> None:
+    """Route width is bounded by the longest document, the mask extent by the global K/V length.
+
+    Regression for the route-replay change picking the local shard length as the flex mask
+    extent under packed CP (``mask=(8, 8)`` versus all-gathered ``tensors=(8, 16)``). The
+    end-to-end two-GPU flex check lives in
+    ``tests/functional_tests/context_parallel/run_qwen3_8_flash_next_packed_cp.py``.
+    """
+    from types import SimpleNamespace
+
+    from nemo_automodel.components.models.qwen3_8_flash_next.layers import _qsa_route_extents
+
+    boundaries = torch.tensor([0, 3, 10])
+    cp_context = SimpleNamespace(global_sequence_length=16)
+    assert _qsa_route_extents(8, packed_cu_seqlens=boundaries, cp_context=cp_context) == (7, 16)
+    assert _qsa_route_extents(16, packed_cu_seqlens=boundaries, cp_context=None) == (7, 16)
+    assert _qsa_route_extents(8, packed_cu_seqlens=None, cp_context=cp_context) == (16, 16)
+    assert _qsa_route_extents(16, packed_cu_seqlens=None, cp_context=None) == (16, 16)
+
+
 def test_gdn_wrapper_synthesizes_document_ids_for_packed_conv(monkeypatch: pytest.MonkeyPatch) -> None:
     """cu_seqlens-only packed batches get per-token document IDs for conv."""
     from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import CPAwareGatedDeltaNet
@@ -544,8 +564,9 @@ def test_packed_boundaries_from_seq_lens_matches_loader_contract() -> None:
         packed_boundaries_from_seq_lens(torch.tensor([5, 7]), total_tokens=10)
 
 
-def test_model_advertises_packed_cp_for_flex_backend() -> None:
-    """The recipe capability gates must admit packed CP on the flex path."""
+@pytest.mark.parametrize("attn_backend", ["flex", "cute"])
+def test_model_advertises_packed_cp_for_sparse_backends(attn_backend: str) -> None:
+    """The recipe capability gates admit both route-indexed CUDA backends."""
     from types import SimpleNamespace
 
     from nemo_automodel._transformers.capabilities import ModelSupports
@@ -553,13 +574,13 @@ def test_model_advertises_packed_cp_for_flex_backend() -> None:
         Qwen3_8_FlashNextForConditionalGeneration,
     )
 
-    assert Qwen3_8_FlashNextForConditionalGeneration._packed_cp_attn_backends == ("flex",)
+    assert Qwen3_8_FlashNextForConditionalGeneration._packed_cp_attn_backends == ("flex", "cute")
 
     class _FakeModel:
         __class__ = Qwen3_8_FlashNextForConditionalGeneration
-        backend = SimpleNamespace(attn="flex")
+        backend = SimpleNamespace(attn=attn_backend)
         _owns_cp_attention = True
-        _packed_cp_attn_backends = ("flex",)
+        _packed_cp_attn_backends = Qwen3_8_FlashNextForConditionalGeneration._packed_cp_attn_backends
 
         def forward(self, input_ids=None, **attn_kwargs):
             pass

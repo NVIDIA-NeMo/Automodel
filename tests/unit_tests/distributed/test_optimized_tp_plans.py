@@ -42,8 +42,10 @@ from nemo_automodel.components.distributed.optimized_tp_plans import (
     _get_class_qualname,
     _parallelize_gemma3,
     _parallelize_llama,
+    _parallelize_phi,
     _parallelize_qwen,
 )
+from nemo_automodel.components.distributed.parallel_styles import ReplicatedWithGradAllReduce
 from nemo_automodel.components.models.qwen2.model import Qwen2ForCausalLM as CustomQwen2ForCausalLM
 from nemo_automodel.components.models.qwen3.model import Qwen3ForCausalLM as CustomQwen3ForCausalLM
 
@@ -220,6 +222,8 @@ class TestParallelizeFunctions:
         # Check parallel styles
         assert isinstance(result["model.layers.*.self_attn.q_proj"], ColwiseParallel)
         assert isinstance(result["model.layers.*.self_attn.o_proj"], RowwiseParallel)
+        assert isinstance(result["model.layers.*.self_attn.q_norm"], ReplicatedWithGradAllReduce)
+        assert isinstance(result["model.layers.*.self_attn.k_norm"], ReplicatedWithGradAllReduce)
 
     def test_parallelize_gemma3_conditional_basic(self):
         """Test _parallelize_gemma3 with Gemma3ForConditionalGeneration."""
@@ -378,10 +382,30 @@ class TestParallelizeFunctions:
 
         result = _parallelize_qwen(model, sequence_parallel=True)
 
-        # Qwen3 has q_norm/k_norm inside attention, but those should remain unwrapped.
-        # Wrapping them with SequenceParallel can incorrectly tag head-sharded activations as sequence-sharded.
-        assert "model.layers.*.self_attn.q_norm" not in result
-        assert "model.layers.*.self_attn.k_norm" not in result
+        # These norms stay local on head-sharded activations, but their replicated
+        # parameters receive partial-head gradients that must be summed.
+        assert isinstance(result["model.layers.*.self_attn.q_norm"], ReplicatedWithGradAllReduce)
+        assert isinstance(result["model.layers.*.self_attn.k_norm"], ReplicatedWithGradAllReduce)
+        q_norm = torch.nn.LayerNorm(4)
+        result["model.layers.*.self_attn.q_norm"]._apply(q_norm, MockDeviceMesh())
+        assert q_norm._nemo_tp_replica_grad_reduction == "sum"
+
+    @pytest.mark.parametrize("qk_layernorm", [False, True])
+    def test_parallelize_phi_marks_optional_qk_layernorms(self, qk_layernorm):
+        """Head-local Phi Q/K norms sum their partial TP gradients when enabled."""
+        model = SimpleNamespace(config=SimpleNamespace(qk_layernorm=qk_layernorm))
+
+        result = _parallelize_phi(model, sequence_parallel=False)
+
+        norm_keys = {
+            "model.layers.*.self_attn.q_layernorm",
+            "model.layers.*.self_attn.k_layernorm",
+        }
+        if qk_layernorm:
+            assert norm_keys <= result.keys()
+            assert all(isinstance(result[key], ReplicatedWithGradAllReduce) for key in norm_keys)
+        else:
+            assert norm_keys.isdisjoint(result)
 
 
 class TestParallelizeFunctionsMapping:
@@ -471,6 +495,7 @@ class TestParallelPlanStructure:
             PrepareModuleInput,
             PrepareModuleOutput,
             RotaryEmbedParallel,
+            ReplicatedWithGradAllReduce,
         )
 
         for model, func in mock_models:

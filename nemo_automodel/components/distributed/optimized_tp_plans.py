@@ -32,6 +32,8 @@ from torch.distributed.tensor.parallel import (
 )
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
+from nemo_automodel.components.distributed.parallel_styles import ReplicatedWithGradAllReduce
+
 # These are needed only for annotations and for PARALLELIZE_FUNCTIONS keys. Importing
 # any one of them at module scope drags in the whole transformers model zoo --
 # transformers.models.gemma3 alone pulls sklearn -> pandas/scipy plus torchvision and
@@ -53,6 +55,51 @@ if TYPE_CHECKING:
     # stack, which reaches sklearn. Only the qualnames are needed at runtime.
     from nemo_automodel.components.models.baichuan.model import BaichuanForCausalLM
     from nemo_automodel.components.models.mistral3.model import Ministral3ForCausalLM
+
+
+def is_nemotron_flash_config(config) -> bool:
+    """Return whether a Transformers config identifies Nemotron-Flash."""
+    if config is None:
+        return False
+    if getattr(config, "model_type", None) == "nemotron_flash":
+        return True
+    if "NemotronFlashForCausalLM" in (getattr(config, "architectures", None) or ()):
+        return True
+    return "nemotron-flash" in (getattr(config, "name_or_path", "") or "").lower()
+
+
+def validate_nemotron_nas_tp_mesh(model, tp_size: int) -> None:
+    """Validate the heterogeneous attention layout of a Nemotron-NAS model."""
+    config = model.config
+    if config.num_attention_heads % tp_size:
+        raise ValueError("num_attention_heads in config does not match the TP size")
+    if len(config.block_configs) < config.num_hidden_layers:
+        raise ValueError("num_hidden_layers in config does not match the number of block configs")
+
+    for index, block in enumerate(config.block_configs[: config.num_hidden_layers]):
+        attention = block.attention
+        if attention.replace_with_linear:
+            continue
+        if attention.n_heads_in_group is not None:
+            num_key_value_heads = config.num_attention_heads // attention.n_heads_in_group
+            if num_key_value_heads % tp_size:
+                raise ValueError(f"layer {index}: num_key_value_heads in config does not match the TP size")
+        elif not attention.no_op:
+            raise ValueError(f"layer {index}: attention must define grouped heads, a linear replacement, or no_op")
+
+
+def validate_optimized_tp_mesh(model, tp_size: int) -> bool:
+    """Run a model-plan-specific TP validator, returning whether one matched."""
+    config = getattr(model, "config", None)
+    architectures = getattr(config, "architectures", None) or ()
+    if (
+        architectures
+        and architectures[0] == "DeciLMForCausalLM"
+        and getattr(config, "model_type", None) == "nemotron-nas"
+    ):
+        validate_nemotron_nas_tp_mesh(model, tp_size)
+        return True
+    return False
 
 
 class SequenceParallelAllGatherActivation(SequenceParallel):
@@ -190,6 +237,8 @@ def _parallelize_gemma3(
         f"{model_prefix}.embed_tokens": VocabParallelEmbedding(input_layouts=Replicate()),
         f"{model_prefix}.layers.*.self_attn.q_proj": ColwiseParallel(),
         f"{model_prefix}.layers.*.self_attn.k_proj": ColwiseParallel(),
+        f"{model_prefix}.layers.*.self_attn.q_norm": ReplicatedWithGradAllReduce(),
+        f"{model_prefix}.layers.*.self_attn.k_norm": ReplicatedWithGradAllReduce(),
         f"{model_prefix}.layers.*.self_attn.v_proj": ColwiseParallel(),
         f"{model_prefix}.layers.*.self_attn.o_proj": RowwiseParallel(),
         f"{model_prefix}.layers.*.mlp.up_proj": ColwiseParallel(),
@@ -516,13 +565,14 @@ def _parallelize_qwen(
             "model.layers.*.input_layernorm": SequenceParallelAllGatherActivation(),
             "model.layers.*.self_attn.q_proj": ColwiseParallel(),
             "model.layers.*.self_attn.k_proj": ColwiseParallel(),
+            "model.layers.*.self_attn.q_norm": ReplicatedWithGradAllReduce(),
+            "model.layers.*.self_attn.k_norm": ReplicatedWithGradAllReduce(),
             "model.layers.*.self_attn.v_proj": ColwiseParallel(),
             "model.layers.*.self_attn.qkv_proj": ColwiseParallel(),
             # Rowwise projections reduce-scatter back to sequence-sharded activations.
             "model.layers.*.self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1), use_local_output=False),
-            # NOTE: Qwen3 has `q_norm`/`k_norm` inside attention. These operate on the
-            # head-sharded outputs of q_proj/k_proj. Do NOT wrap them with SequenceParallel,
-            # which would incorrectly tag head-sharded activations as sequence-sharded.
+            # Qwen3 q_norm/k_norm operate independently on head-sharded Q/K.
+            # Their parameters stay replicated, while partial-head gradients sum.
             "model.layers.*.post_attention_layernorm": SequenceParallelAllGatherActivation(),
             "model.layers.*.mlp.up_proj": ColwiseParallel(),
             "model.layers.*.mlp.gate_proj": ColwiseParallel(),
@@ -538,6 +588,8 @@ def _parallelize_qwen(
             ),
             "model.layers.*.self_attn.q_proj": ColwiseParallel(),
             "model.layers.*.self_attn.k_proj": ColwiseParallel(),
+            "model.layers.*.self_attn.q_norm": ReplicatedWithGradAllReduce(),
+            "model.layers.*.self_attn.k_norm": ReplicatedWithGradAllReduce(),
             "model.layers.*.self_attn.v_proj": ColwiseParallel(),
             "model.layers.*.self_attn.qkv_proj": ColwiseParallel(),
             "model.layers.*.self_attn.o_proj": RowwiseParallel(),
@@ -583,6 +635,14 @@ def _parallelize_phi(
         "model.layers.*.mlp.fc2": RowwiseParallel(),
         "lm_head": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
     }
+
+    if model.config.qk_layernorm:
+        base_model_tp_plan.update(
+            {
+                "model.layers.*.self_attn.q_layernorm": ReplicatedWithGradAllReduce(),
+                "model.layers.*.self_attn.k_layernorm": ReplicatedWithGradAllReduce(),
+            }
+        )
 
     if sequence_parallel:
         base_model_sp_plan: dict[str, ParallelStyle] = {

@@ -95,6 +95,7 @@ class TestNeMoAutoTokenizerFromPretrained:
         completed = subprocess.run(
             [
                 sys.executable,
+                "-S",
                 "-c",
                 (
                     "import sys\n"

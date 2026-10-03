@@ -150,9 +150,9 @@ class VlmDataloaderBuild:
     processor: ProcessorMixin | None
 
 
-# Attention backends the packed collater hands the compact ``[batch, sequence]`` document map instead
-# of a dense block-causal mask: flash attention rebuilds ``cu_seqlens`` from the compact map through the
-# packing patches (``models/common/packing.get_unpad_data``), so the dense mask would never be read.
+# Attention backends that consume varlen metadata instead of a dense block-causal mask. The collater
+# converts the compact document map into FlashAttentionKwargs and omits attention_mask so HuggingFace
+# uses its varlen path. The map remains available as _packed_seq_ids for loss / CP consumers.
 # No other backend name belongs here. Transformer Engine reads any non-None mask as a padding mask and
 # drops ``cu_seqlens`` (``attention/utils.preprocess_args_and_kwargs_for_attn``), and a backend name is
 # not even read by a model whose attention comes from Transformers. A model that rebuilds document

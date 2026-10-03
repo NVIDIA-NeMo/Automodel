@@ -52,6 +52,7 @@ _HAS_WANDB, wandb = safe_import(
 )
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config  # noqa: E402
+from nemo_automodel.components.distributed.tp_replicas import synchronize_tp_replica_gradients  # noqa: E402
 from nemo_automodel.components.loggers.log_utils import setup_logging  # noqa: E402
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger  # noqa: E402
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages  # noqa: E402
@@ -63,6 +64,7 @@ from nemo_automodel.components.models.bagel.hf_backbone_loader import (  # noqa:
 )
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG  # noqa: E402
 from nemo_automodel.components.training.step_scheduler import StepScheduler  # noqa: E402
+from nemo_automodel.components.training.utils import clip_grad_norm  # noqa: E402
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config  # noqa: E402
 from nemo_automodel.recipes._typed_config import RecipeConfig  # noqa: E402
 from nemo_automodel.recipes.base_recipe import BaseRecipe  # noqa: E402
@@ -814,20 +816,16 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
                 num_batches=num_batches,
             )
 
-        # Grad clip + step.
-        # FSDP2 sharded parameters expose ``clip_grad_norm_`` via the manager,
-        # but the simplest cross-wrapper approach is torch.nn.utils.clip_grad_norm_
-        # on trainable params. FSDP2 DTensor params play nice with it in newer
-        # torch versions; for older ones we fall back to the raw compute.
-        if max_grad_norm is not None and max_grad_norm > 0:
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                [p for p in self.model.parameters() if p.requires_grad],
-                max_norm=max_grad_norm,
-                norm_type=2.0,
-                foreach=True,
-            )
-        else:
-            grad_norm = torch.tensor(0.0, device=device)
+        # Synchronize unsharded TP replicas once at the optimizer boundary,
+        # then compute a sharding-aware norm and clip when configured.
+        clip_threshold = max_grad_norm if max_grad_norm is not None and max_grad_norm > 0 else None
+        synchronize_tp_replica_gradients([self.model], self.device_mesh)
+        grad_norm = clip_grad_norm(
+            clip_threshold,
+            [self.model],
+            device_mesh=self.device_mesh,
+            foreach=True,
+        )
 
         # LR warmup (stateless; called before each optimizer.step).
         self._apply_warmup(self.step_scheduler.step)

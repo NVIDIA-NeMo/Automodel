@@ -19,7 +19,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoConfig
-from transformers.generation import GenerationConfig, GenerationMixin
+from transformers.generation import GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel._transformers.model_capabilities import ModelCapabilities
@@ -37,13 +37,19 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
-from nemo_automodel.components.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
+from nemo_automodel.components.models.common.utils import (
+    cast_model_to_dtype,
+    compute_lm_head_logits,
+    generation_config_from_model_config,
+    restore_pretrained_generation_config,
+)
 from nemo_automodel.components.models.nemotron_v3.layers import NemotronV3Block
 from nemo_automodel.components.models.nemotron_v3.mtp import (
     _resolve_block_types_per_sublayer,
     build_mtp_config_from_hf,
     build_nemotron_v3_mtp,
 )
+from nemo_automodel.components.models.nemotron_v3.parallelization import PARALLELIZER
 from nemo_automodel.components.models.nemotron_v3.state_dict_adapter import NemotronV3StateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
@@ -381,7 +387,11 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             NemotronHForCausalLM instance
         """
         config = AutoConfig.from_pretrained(pretrained_model_name_or_path, trust_remote_code=True)
-        return cls.from_config(config, *model_args, **kwargs)
+        model = cls.from_config(config, *model_args, **kwargs)
+        # The checkpoint's own generation settings win over the config-derived
+        # defaults, as in PreTrainedModel.from_pretrained.
+        restore_pretrained_generation_config(model, pretrained_model_name_or_path)
+        return model
 
     def __init__(
         self,
@@ -472,8 +482,11 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
                 dtype=dtype,
             )
 
-        # Required by GenerationMixin.generate().
-        self.generation_config = GenerationConfig()
+        # Required by GenerationMixin.generate(). Seeded from the model config like
+        # PreTrainedModel does, so eos/bos/pad are set: the consolidated export writes
+        # this object to generation_config.json, and a blank one there leaves the
+        # exported model with no stop token.
+        self.generation_config = generation_config_from_model_config(config)
 
     @property
     def device(self) -> torch.device:
@@ -503,7 +516,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         Wraps every decoder block (and MTP block, when present) with a
         non-reentrant checkpoint wrapper so that block activations are recomputed
         during the backward pass instead of being stored. This is the single-GPU
-        entry point: ``FSDP2Manager.parallelize`` calls it when ``world_size == 1``
+        entry point: ``ModelParallelizer.parallelize`` calls it when ``world_size == 1``
         (the expert-parallel path performs the equivalent wrapping inside the MoE
         parallelizer's ``apply_ac``). Without it, the hybrid Mamba2/Attention MoE
         keeps every block's activations live, which is what pushes single-GPU LoRA
@@ -1195,4 +1208,5 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         cast_model_to_dtype(self, dtype, skip_modules=("_fp32_params",))
 
 
+NemotronHForCausalLM.parallelizer = PARALLELIZER
 ModelClass = NemotronHForCausalLM

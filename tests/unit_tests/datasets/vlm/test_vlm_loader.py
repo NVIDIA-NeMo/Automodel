@@ -323,15 +323,14 @@ def test_vlm_dataloader_builds_the_dense_mask_only_for_backends_that_read_it(
 ):
     """Only the flash-attention family, or a model that declares itself a consumer, skips the quadratic mask.
 
-    Flash attention rebuilds ``cu_seqlens`` from the indexed ``[batch, sequence]`` document map, so it
-    never reads the dense ``[batch, 1, sequence, sequence]`` tensor that building it costs. Every other
+    Flash attention receives explicit varlen metadata without an attention mask, so it
+    never reads a dense ``[batch, 1, sequence, sequence]`` tensor. Every other
     name -- ``te`` included, since Transformer Engine reads any non-None mask as a padding mask -- keeps
     the dense mask unless ``consumes_packed_seq_ids`` says the model rebuilds document isolation from
     ``_packed_seq_ids`` itself, in which case the name is irrelevant (such a model may not even read it).
     The one-document pack below also pins the second half of the contract: whenever the dense mask
-    is skipped, the compact map has to reach the model as ``_packed_seq_ids``, because nothing else
-    carries document bounds. What the mask *contains* is the collater's own contract and is pinned
-    by ``test_collate_fns.py``; this test only decides which representation the collater is asked for.
+    is skipped, the compact map also reaches loss / CP and declared consumers as ``_packed_seq_ids``.
+    Flash backends additionally receive explicit cumulative lengths for document isolation.
     """
     result = build_packed_dataloader(
         packing_attn_implementation=attn_implementation,
@@ -352,10 +351,18 @@ def test_vlm_dataloader_builds_the_dense_mask_only_for_backends_that_read_it(
     }
     batch = collate_fn([pack])
 
-    assert batch["attention_mask"].shape == ((1, 1, 8, 8) if expect_dense else (1, 8))
+    if attn_implementation in ("flash_attention_2", "flash_attention_3", "flash_attention_4"):
+        assert "attention_mask" not in batch
+        assert batch["cu_seq_lens_q"].tolist() == [0, 8]
+        assert torch.equal(batch["cu_seq_lens_q"], batch["cu_seq_lens_k"])
+        assert batch["max_length_q"] == batch["max_length_k"] == 8
+    else:
+        assert batch["attention_mask"].shape == ((1, 1, 8, 8) if expect_dense else (1, 8))
     # One document is the case that can see this change: a multi-document pack emits
     # ``_packed_seq_ids`` on either path, so only here does the key track the representation.
     assert ("_packed_seq_ids" in batch) is not expect_dense
+    if not expect_dense:
+        assert batch["_packed_seq_ids"].tolist() == [[1] * 8]
 
 
 def test_compact_mask_backends_covers_every_flash_attention_name():

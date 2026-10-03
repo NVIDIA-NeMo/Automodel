@@ -63,7 +63,7 @@ model:
     attn: te
     linear: te
     rms_norm: te
-    experts: gmm
+    experts: torch_mm
     dispatcher: hybridep
     enable_fsdp_optimizations: false
 

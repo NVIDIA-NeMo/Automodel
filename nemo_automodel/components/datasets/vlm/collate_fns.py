@@ -1516,17 +1516,18 @@ def neat_packed_vlm_collater(
     Packs arrive with **variable lengths** (no pre-padding).  This collater:
 
     1. Pads all text tensors to a common length.
-    2. Converts the indexed ``attention_mask`` to the representation
-       ``materialize_4d_mask`` selects:
-       - True: a 4D block-causal bool mask. SDPA reads it directly;
-         HF eager consumers must convert it to an additive mask.
-       - False: the indexed ``[B, S]`` map itself (values 1, 2, … for
-         documents, 0 for padding), for consumers that recover document
-         bounds from ``_packed_seq_ids`` rather than from a mask.
-       ``attn_implementation="flash_attention_2"`` also keeps the compact map,
-       whatever ``materialize_4d_mask`` says: the monkey-patched
-       ``_get_unpad_data`` converts it to ``cu_seqlens`` for
-       ``flash_attn_varlen_func``.
+    2. Converts the indexed ``attention_mask`` to the appropriate format:
+       - ``flash_attention_2`` / ``flash_attention_3`` / ``flash_attention_4``:
+         emits typed packed-sequence metadata as
+         ``FlashAttentionKwargs`` (``cu_seq_lens_q``/``cu_seq_lens_k``/
+         ``max_length_q``/``max_length_k``) and omits ``attention_mask`` so
+         HuggingFace routes the batch through ``flash_attn_varlen_func``.
+         The indexed ``[B, S]`` document map is preserved as ``_packed_seq_ids``.
+       - Other backends with ``materialize_4d_mask=True``: converts to a 4D
+         block-causal bool mask. SDPA reads it directly; HF eager consumers
+         must convert it to an additive mask.
+       - Other backends with ``materialize_4d_mask=False``: keeps the indexed
+         ``[B, S]`` map for consumers that rebuild masks from ``_packed_seq_ids``.
     3. Concatenates media tensors across the batch dimension.
 
     **No autoregressive shift** — it was already applied during packing.
@@ -1538,16 +1539,16 @@ def neat_packed_vlm_collater(
             If ``None`` (default), pad to the longest pack in the batch.
             A fixed length avoids recompilation with ``torch.compile``
             and ensures uniform tensor shapes across steps.
-        attn_implementation: Attention backend the batch is collated for. Only
-            ``"flash_attention_2"`` changes behaviour here, by keeping the
-            compact map; every other value defers to ``materialize_4d_mask``.
+        attn_implementation: Attention backend the batch is collated for.
+            FlashAttention 2/3/4 emits varlen metadata without an attention mask;
+            every other value defers to ``materialize_4d_mask``.
         materialize_4d_mask: Whether packing should expand the indexed
             ``[B, S]`` document map into a dense ``[B, 1, S, S]`` block-causal
             mask. Callers set this to False when the consumer recovers document
-            boundaries from ``_packed_seq_ids`` instead of from the mask:
-            context-parallel paths rebuild their local mask from it, and flash
-            attention and Transformer Engine cannot use a dense mask at all.
-            False therefore also forces ``_packed_seq_ids`` to be emitted.
+            boundaries from ``_packed_seq_ids`` instead of from the mask, such
+            as context-parallel paths and declared compact-map consumers.
+            FlashAttention always emits varlen metadata regardless of this flag.
+            False also forces ``_packed_seq_ids`` to be emitted for single-document packs.
 
     Returns:
         Dict with batched tensors ready for model forward.
@@ -1556,7 +1557,7 @@ def neat_packed_vlm_collater(
         return {}
 
     LABEL_PAD = -100
-    use_flash = attn_implementation == "flash_attention_2"
+    use_flash = attn_implementation in ("flash_attention_2", "flash_attention_3", "flash_attention_4")
 
     # Determine pad target: fixed max_length or batch-dynamic
     max_len = (
@@ -1586,16 +1587,6 @@ def neat_packed_vlm_collater(
 
     mm_token_type_ids = torch.stack([_pad_1d(_get_mm_token_type_ids(x), 0, max_len) for x in batch])
 
-    if use_flash or not materialize_4d_mask:
-        # Keep the compact indexed [B, S] document map. FlashAttention derives
-        # cu_seqlens from it; block-diagonal CP rebuilds its local mask from the
-        # identical _packed_seq_ids emitted below.
-        attention_mask_out = attention_mask
-    else:
-        from nemo_automodel.components.datasets.utils import _indexed_mask_to_4d_block_causal
-
-        attention_mask_out = _indexed_mask_to_4d_block_causal(attention_mask)
-
     # Handle position_ids: 1D [seq_len] or 3D mRoPE [3, seq_len]
     pos_sample = torch.as_tensor(batch[0]["position_ids"])
     if pos_sample.ndim == 2:
@@ -1616,14 +1607,28 @@ def neat_packed_vlm_collater(
         "input_ids": input_ids,
         "labels": labels,
         "position_ids": position_ids,
-        "attention_mask": attention_mask_out,
         "mm_token_type_ids": mm_token_type_ids,
     }
 
-    # Store indexed attention mask for loss functions that need per-sample
-    # boundaries (e.g. SqrtCrossEntropy).  The indexed mask [B, S] uses
-    # values 1,2,3,... per original sample and 0 for padding.  For SDPA the
-    # ``attention_mask_out`` is already converted to 4D, so keep a copy.
+    if use_flash:
+        # No attention_mask: HF then takes its varlen-kwargs branch, not the binary-mask unpad path.
+        from nemo_automodel.components.datasets.packed_seq import (
+            packed_seq_params_from_doc_ids,
+            to_flash_attention_kwargs,
+        )
+
+        params = packed_seq_params_from_doc_ids(attention_mask)
+        result.update(to_flash_attention_kwargs(params))
+    else:
+        if not materialize_4d_mask:
+            # CP rebuilds its local mask from _packed_seq_ids; keep the compact indexed [B, S] map here.
+            result["attention_mask"] = attention_mask
+        else:
+            from nemo_automodel.components.datasets.utils import _indexed_mask_to_4d_block_causal
+
+            result["attention_mask"] = _indexed_mask_to_4d_block_causal(attention_mask)
+
+    # Preserve document IDs for loss / CP and compact-map consumers, including single-document packs.
     has_multiple_docs = attention_mask.numel() > 0 and bool(attention_mask.max().item() > 1)
     if has_multiple_docs or not materialize_4d_mask:
         result["_packed_seq_ids"] = attention_mask
@@ -1777,6 +1782,16 @@ def packed_sequence_thd_vlm_collater(
         tensors = [x[key] for x in batch if key in x and x[key] is not None]
         if tensors:
             result[key] = torch.cat(tensors, dim=0)
+
+    # Preserve the pack-to-media mapping for pipeline-parallel microbatching.
+    # A packed row can contain multiple original image/video samples, so the
+    # flat media tensors cannot be split from the text batch dimension alone.
+    image_counts = [int(x.get("n_images", 0)) for x in batch]
+    video_counts = [int(x.get("n_videos", 0)) for x in batch]
+    if any(count > 0 for count in image_counts):
+        result["n_images_per_sample"] = torch.tensor(image_counts, dtype=torch.long)
+    if any(count > 0 for count in video_counts):
+        result["n_videos_per_sample"] = torch.tensor(video_counts, dtype=torch.long)
 
     return result
 

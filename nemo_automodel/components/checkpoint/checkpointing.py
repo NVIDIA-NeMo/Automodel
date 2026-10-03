@@ -21,6 +21,7 @@ import pickle
 import threading
 import time
 import uuid
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -51,7 +52,10 @@ from torch import nn
 from torch.distributed.checkpoint.metadata import Metadata, TensorStorageMetadata
 from torch.distributed.checkpoint.storage import StorageReader, StorageWriter
 from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.fsdp import FSDPModule
+from torch.distributed.tensor import DTensor, Replicate, distribute_tensor
 from torch.nn.parallel import DistributedDataParallel
+from torch.overrides import TorchFunctionMode
 from torch.serialization import MAP_LOCATION, FileLike
 
 from nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors import (
@@ -72,7 +76,7 @@ from nemo_automodel.components.checkpoint.conversion_mapping import (
     requires_tensor_merging,
 )
 from nemo_automodel.components.checkpoint.lifecycle import CheckpointLifecycle
-from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
+from nemo_automodel.components.checkpoint.state_dict_adapter import CheckpointLoadPart, StateDictAdapter
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, OptimizerState
 from nemo_automodel.components.checkpoint.utils import (
     ensure_tied_lm_head,
@@ -87,6 +91,7 @@ from nemo_automodel.components.checkpoint.utils import (
     is_rank_0,
     materialize_missing_tied_lm_head,
 )
+from nemo_automodel.shared.embedding_padding import zero_embedding_row_
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 
 if TYPE_CHECKING:
@@ -100,6 +105,48 @@ _CONSOLIDATED_SIZE_WARNING_THRESHOLD_BYTES = 50 * 1024**3
 _DEFAULT_HF_CONSOLIDATED_SHARD_SIZE_BYTES = 5 * 1024**3
 
 logger = logging.getLogger(__name__)
+
+
+class _DTensorInitCopyMode(TorchFunctionMode):
+    """Adapt full-tensor initialization copies to an already-sharded destination."""
+
+    def __torch_function__(
+        self, func: Callable, types: tuple[type, ...], args: tuple = (), kwargs: dict | None = None
+    ) -> Any:
+        """Preserve ``copy_`` semantics while matching the destination's DTensor layout.
+
+        Args:
+            func: Intercepted torch operation.
+            types: Tensor types participating in the operation.
+            args: Operation arguments. For ``copy_``, the destination has arbitrary
+                global shape and the source is broadcastable to that shape. A plain
+                source is privately copied, broadcast from mesh rank zero, and
+                locally sharded to the destination's placements before the in-place
+                copy; existing DTensor sources and plain destinations keep their
+                normal behavior.
+            kwargs: Keyword arguments to the operation, including an optional
+                ``other`` source tensor with the same contract as above.
+
+        Returns:
+            The operation result; ``copy_`` returns and mutates the original
+            destination without replacing its parameter object or local storage.
+        """
+        kwargs = kwargs or {}
+        if func is torch.Tensor.copy_ and isinstance(args[0], DTensor):
+            destination = args[0]
+            source = args[1] if len(args) > 1 else kwargs["other"]
+            if isinstance(source, torch.Tensor) and not isinstance(source, DTensor):
+                # Broadcast then shard locally to avoid persistent NCCL scatter memory.
+                source = distribute_tensor(
+                    source.to(device=destination.device, copy=True).expand(destination.shape),
+                    destination.device_mesh,
+                    [Replicate()] * destination.device_mesh.ndim,
+                ).redistribute(placements=destination.placements)
+                if len(args) > 1:
+                    args = (destination, source, *args[2:])
+                else:
+                    kwargs = {**kwargs, "other": source}
+        return func(*args, **kwargs)
 
 
 def _format_restricted_load_error(f: FileLike) -> str:
@@ -819,6 +866,137 @@ class Checkpointer:
         self._do_load(state_dict, os.path.join(weights_path, "optim"))
         optimizer_state.load_state_dict(state_dict)
 
+    def _load_model_in_parts(
+        self,
+        model_state: ModelState,
+        load_parts: Iterator[CheckpointLoadPart],
+        model_state_dict: dict[str, torch.Tensor],
+        model_path: str,
+        storage_reader: StorageReader,
+    ) -> None:
+        """Load, convert, and release one checkpoint part at a time.
+
+        Args:
+            model_state: Wrapper for the model whose final parameter storage is populated.
+            load_parts: Adapter-owned sequence of checkpoint destinations and finish callbacks.
+            model_state_dict: Native model names mapped to final model tensors. Every key must be completed exactly
+                once across ``load_parts``.
+            model_path: Hugging Face safetensors checkpoint directory.
+            storage_reader: Reader already bound to ``model_path``. Its parsed metadata is reused across parts.
+
+        Raises:
+            RuntimeError: If the checkpoint is missing a requested tensor or the parts do not cover all model tensors.
+            TypeError: If the adapter yields an object other than :class:`CheckpointLoadPart`.
+            ValueError: If a part is empty or repeats checkpoint or model keys.
+        """
+        started = time.monotonic()
+        checkpoint_keys = set(_get_checkpoint_metadata(model_path, storage_reader).state_dict_metadata)
+        metadata_seconds = time.monotonic() - started
+        expected_model_keys = set(model_state_dict)
+        requested_checkpoint_keys: set[str] = set()
+        completed_model_keys: set[str] = set()
+        requested_bytes = 0
+        max_temporary_bytes = 0
+        read_seconds = 0.0
+        finish_seconds = 0.0
+        part_count = 0
+        process_group_kwargs = {"process_group": self.process_group} if self.process_group is not None else {}
+
+        for part in load_parts:
+            if not isinstance(part, CheckpointLoadPart):
+                raise TypeError(f"Checkpoint adapter yielded {type(part).__name__}, expected CheckpointLoadPart")
+            if not part.checkpoint_tensors:
+                raise ValueError("Checkpoint adapter yielded a load part with no checkpoint tensors")
+            if not part.model_keys:
+                raise ValueError("Checkpoint adapter yielded a load part with no completed model tensors")
+
+            part_checkpoint_keys = set(part.checkpoint_tensors)
+            unknown_temporary_keys = sorted(part.temporary_checkpoint_keys - part_checkpoint_keys)
+            if unknown_temporary_keys:
+                raise ValueError(
+                    f"Checkpoint adapter reported {len(unknown_temporary_keys)} temporary tensors absent from its "
+                    f"load destinations (examples={unknown_temporary_keys[:5]})"
+                )
+            duplicate_checkpoint_keys = sorted(part_checkpoint_keys & requested_checkpoint_keys)
+            if duplicate_checkpoint_keys:
+                raise ValueError(
+                    f"Checkpoint adapter requested {len(duplicate_checkpoint_keys)} tensors more than once "
+                    f"(examples={duplicate_checkpoint_keys[:5]})"
+                )
+            missing_checkpoint_keys = sorted(part_checkpoint_keys - checkpoint_keys)
+            if missing_checkpoint_keys:
+                raise RuntimeError(
+                    f"Checkpoint {model_path} is missing {len(missing_checkpoint_keys)} tensors required by load "
+                    f"part {part_count + 1} (examples={missing_checkpoint_keys[:5]})"
+                )
+
+            duplicate_model_keys = sorted(part.model_keys & completed_model_keys)
+            if duplicate_model_keys:
+                raise ValueError(
+                    f"Checkpoint adapter completed {len(duplicate_model_keys)} model tensors more than once "
+                    f"(examples={duplicate_model_keys[:5]})"
+                )
+            unexpected_model_keys = sorted(part.model_keys - expected_model_keys)
+            if unexpected_model_keys:
+                raise ValueError(
+                    f"Checkpoint adapter reported {len(unexpected_model_keys)} unknown model tensors "
+                    f"(examples={unexpected_model_keys[:5]})"
+                )
+
+            part_bytes = sum(estimate_tensor_bytes(tensor) for tensor in part.checkpoint_tensors.values())
+            requested_bytes += part_bytes
+            temporary_bytes = sum(
+                estimate_tensor_bytes(
+                    tensor.to_local() if type(tensor).__name__ == "DTensor" else tensor  # noqa: PLC2801
+                )
+                for checkpoint_key, tensor in part.checkpoint_tensors.items()
+                if checkpoint_key in part.temporary_checkpoint_keys
+            )
+            max_temporary_bytes = max(max_temporary_bytes, temporary_bytes)
+            requested_checkpoint_keys |= part_checkpoint_keys
+
+            read_started = time.monotonic()
+            # The reader already points at model_path. Omitting checkpoint_id avoids resetting it, so safetensors
+            # metadata parsed before the first part can be reused by every subsequent DCP plan.
+            dcp.load(part.checkpoint_tensors, storage_reader=storage_reader, **process_group_kwargs)
+            read_seconds += time.monotonic() - read_started
+
+            finish_started = time.monotonic()
+            part.finish()
+            finish_seconds += time.monotonic() - finish_started
+            completed_model_keys |= part.model_keys
+            part_count += 1
+            del part
+
+        if part_count == 0:
+            raise RuntimeError("Checkpoint adapter returned an empty load-part sequence")
+        missing_model_keys = sorted(expected_model_keys - completed_model_keys)
+        if missing_model_keys:
+            raise RuntimeError(
+                f"Checkpoint load parts omitted {len(missing_model_keys)} model tensors "
+                f"(examples={missing_model_keys[:5]})"
+            )
+
+        if model_state.uses_tied_lm_head and not model_state.is_peft:
+            ensure_tied_lm_head(model_state.model[0])
+
+        total_seconds = time.monotonic() - started
+        requested_gb = requested_bytes / (1 << 30)
+        max_temporary_gb = max_temporary_bytes / (1 << 30)
+        logger.info(
+            "load_model: loaded a %.2f GB checkpoint in %d parts over %.2fs "
+            "(%.2f GB/s overall | largest temporary allocation on this rank %.2f GB, metadata %.2fs, "
+            "storage read %.2fs, finish %.2fs)",
+            requested_gb,
+            part_count,
+            total_seconds,
+            requested_gb / max(total_seconds, 1e-9),
+            max_temporary_gb,
+            metadata_seconds,
+            read_seconds,
+            finish_seconds,
+        )
+
     @torch.no_grad()
     def load_model(
         self,
@@ -826,7 +1004,7 @@ class Checkpointer:
         model_path: str,
         is_init_step: bool = False,
         use_checkpoint_id: bool = True,
-        key_mapping: dict[str, str] | None = None,
+        key_mapping: dict[str, str] | Callable[[str], str] | None = None,
         allow_checkpoint_key_subset: bool = False,
     ) -> None:
         """
@@ -843,7 +1021,8 @@ class Checkpointer:
             model_path: Path to the model checkpoint directory or HF snapshot.
             is_init_step: If True, treat load as initialization from a base checkpoint.
             use_checkpoint_id: Pass `checkpoint_id` to DCP if True; disable when using direct HF paths.
-            key_mapping: Optional key remapping when reading from HF checkpoints.
+            key_mapping: Optional regex mapping or callable renaming HF checkpoint keys.
+                Tensor-merging conversions require a regex mapping.
             allow_checkpoint_key_subset: If True, keep the model's current initialization for
                 parameters that are absent from the checkpoint instead of requiring an exact key match.
         """
@@ -869,6 +1048,8 @@ class Checkpointer:
 
         # For models that need tensor merging and don't have an adapter, try using transformers' conversion
         if is_init_step and model_type and requires_tensor_merging(model_type) and not has_state_dict_adapter:
+            if callable(key_mapping):
+                raise ValueError("Tensor-merging checkpoint loads require a regex key mapping, not a callable.")
             converted_state_dict = _convert_checkpoint_with_transformers(model_state.model[0], model_path, key_mapping)
             if converted_state_dict:
                 materialized_tied_lm_head = materialize_missing_tied_lm_head(
@@ -891,7 +1072,9 @@ class Checkpointer:
         is_custom_model = _is_custom_model(model_state.model[0])
         # Models with standard HF state-dict keys need no conversion, so DCP can load their tensors directly. Custom
         # adapters may also opt in when most tensors load into model weight memory and any temporary tensors are small.
-        # Quantized initialization and other adapter conversions keep the host fallback on one device.
+        # A quantized adapter may instead describe small, self-contained groups that DCP can load and convert in
+        # sequence. Other quantized initialization keeps the existing fallback: full CPU conversion on one device,
+        # or rank-local DCP conversion for a distributed custom model.
         # World size inline (not via components.distributed) so the checkpoint component stays
         # independent per the import-linter contract.
         if torch.distributed.is_initialized():
@@ -904,9 +1087,54 @@ class Checkpointer:
             uses_standard_hf_state_dict
             or (isinstance(state_dict_adapter, StateDictAdapter) and state_dict_adapter.supports_low_memory_dcp_load)
         )
+
+        part_loaded_model_state_dict: dict[str, torch.Tensor] | None = None
+        checkpoint_load_parts: Iterator[CheckpointLoadPart] | None = None
+        # Adapter-owned parts name their DCP destinations with exact checkpoint keys, so any generic Transformers
+        # key_mapping is redundant for this path and must not prevent the adapter from describing bounded groups.
+        if (
+            is_init_step
+            and is_safetensors
+            and should_dequantize_base_checkpoint
+            and isinstance(state_dict_adapter, StateDictAdapter)
+            and len(model_state.model) == 1
+            and not allow_checkpoint_key_subset
+        ):
+            candidate_state_dict = model_state.state_dict()
+            candidate_parts = state_dict_adapter.iter_checkpoint_load_parts(
+                candidate_state_dict,
+                device_mesh=self.moe_mesh,
+            )
+            if candidate_parts is not None:
+                part_loaded_model_state_dict = candidate_state_dict
+                checkpoint_load_parts = candidate_parts
+
         safetensors_requires_full_cpu = (
-            is_safetensors and not can_use_low_memory_dcp and (not is_custom_model or world_size == 1)
+            is_safetensors
+            and not can_use_low_memory_dcp
+            and checkpoint_load_parts is None
+            and (not is_custom_model or world_size == 1)
         )
+        if checkpoint_load_parts is not None and part_loaded_model_state_dict is not None:
+            storage_reader = self._get_storage_reader(
+                model_path,
+                key_mapping=None,
+                is_init_step=True,
+                is_safetensors=True,
+            )
+            if storage_reader is None:
+                raise RuntimeError(
+                    f"No safetensors storage reader is available for part-by-part loading from {model_path}"
+                )
+            self._load_model_in_parts(
+                model_state,
+                checkpoint_load_parts,
+                part_loaded_model_state_dict,
+                model_path,
+                storage_reader,
+            )
+            return
+
         if (
             is_init_step
             and len(model_state.model) == 1
@@ -1190,7 +1418,7 @@ class Checkpointer:
         model_state.load_state_dict(
             state_dict,
             strict=not (len(model_state.model) > 1 or has_state_dict_adapter or allow_checkpoint_key_subset),
-            broadcast_from_rank0=self.process_group is None,
+            broadcast_from_rank0=self.process_group is None and torch.distributed.is_initialized(),
         )
         install_complete = time.monotonic()
         requested_gb = requested_bytes / (1 << 30)
@@ -1278,17 +1506,18 @@ class Checkpointer:
             and getattr(model.config, "n_routed_experts", None)  # is Nemotron V3
             and hasattr(model, "backbone")  # is HF remote code
         )
-        # HF's _init_weights calls init.zeros_(weight[padding_idx]) on
-        # nn.Embedding layers.  When the weight is a DTensor (TP-sharded),
-        # the integer index triggers a redistribute that fails.  Temporarily
-        # clear padding_idx so the zeroing is skipped, then restore it and
-        # zero the row via local-tensor ops instead.
-        has_padding_idx = any(
-            isinstance(mod, nn.Embedding)
-            and type(mod.weight).__name__ == "DTensor"
-            and getattr(mod, "padding_idx", None) is not None
+        # HF's _init_weights calls init.zeros_(weight[padding_idx]) on nn.Embedding
+        # layers. When the weight is a DTensor the integer index triggers a
+        # redistribute (an all-gather of the whole embedding) and fails for TP
+        # shards. Clear padding_idx for the duration of initialize_weights() so
+        # that op is skipped, then zero the row on the rank-local shard. Skipping
+        # the whole initialization instead left every from_config parameter as the
+        # uninitialized memory to_empty() handed out (all-zero or garbage models).
+        padded_embeddings = [
+            mod
             for mod in model.modules()
-        )
+            if isinstance(mod, nn.Embedding) and isinstance(mod.weight, DTensor) and mod.padding_idx is not None
+        ]
         # Models that know the upcoming load will fully populate every tensor
         # (e.g. Devstral FP8 via its state_dict_adapter) can opt out of HF's
         # random init. Skipping also sidesteps stage-divergent DTensor
@@ -1302,7 +1531,6 @@ class Checkpointer:
             ]
             or is_nemotron_v2
             or is_nemotron_v3_hf
-            or has_padding_idx
             or owns_weight_load
         )
         if not skip_initialize_weights:
@@ -1320,14 +1548,37 @@ class Checkpointer:
                     if p.is_floating_point():
                         param_dtype = p.dtype
                         break
+                saved_padding_idx = [(mod, mod.padding_idx) for mod in padded_embeddings]
+                for mod, _ in saved_padding_idx:
+                    mod.padding_idx = None
+                # Newer HF versions classify FSDP's generated class as custom code
+                # and skip container initializers that populate child buffers.
+                # Bind the query to the original model class only during init.
+                bind_original_hf_class = (
+                    isinstance(model, FSDPModule)
+                    and hasattr(model, "is_custom_code")
+                    and "is_custom_code" not in vars(model)
+                )
                 try:
-                    if param_dtype is not None:
-                        model.initialize_weights(dtype=param_dtype)
-                    else:
-                        model.initialize_weights()
-                except TypeError:
-                    # Model's initialize_weights() does not accept a dtype kwarg.
-                    model.initialize_weights()
+                    if bind_original_hf_class:
+                        original_class = next(cls for cls in type(model).__mro__ if not issubclass(cls, FSDPModule))
+                        model.is_custom_code = original_class.is_custom_code
+                    with _DTensorInitCopyMode():
+                        try:
+                            if param_dtype is not None:
+                                model.initialize_weights(dtype=param_dtype)
+                            else:
+                                model.initialize_weights()
+                        except TypeError:
+                            # Model's initialize_weights() does not accept a dtype kwarg.
+                            model.initialize_weights()
+                finally:
+                    if bind_original_hf_class:
+                        del model.is_custom_code
+                    for mod, padding_idx in saved_padding_idx:
+                        mod.padding_idx = padding_idx
+                for mod, padding_idx in saved_padding_idx:
+                    zero_embedding_row_(mod.weight, padding_idx)
             else:
                 logging.warning(
                     "Warning: Model does not have initialize_weights method."
@@ -1367,7 +1618,12 @@ class Checkpointer:
             assert model_name is not None, "model_name is required when loading base model"
             # Get combined key mapping from model attribute and model-type specific conversions
             model_key_mapping = getattr(model, "_checkpoint_conversion_mapping", None)
-            key_mapping = get_combined_key_mapping(model_type, model_key_mapping)
+            # Adapters and tensor converters own their complete conversion. Standard
+            # HF models also need the scoped renames declared by nested submodels.
+            mapping_model = (
+                model if not hasattr(model, "state_dict_adapter") and not requires_tensor_merging(model_type) else None
+            )
+            key_mapping = get_combined_key_mapping(model_type, model_key_mapping, model=mapping_model)
             # NemotronH remote code (trust_remote_code) uses backbone.* params matching checkpoint keys
             # skip backbone.*→model.* conversion to avoid key mismatch
             if model_type == "nemotron_h" and hasattr(model, "backbone"):
@@ -1969,7 +2225,7 @@ fi
     def _get_storage_reader(
         self,
         model_path: str,
-        key_mapping: dict[str, str] | None,
+        key_mapping: dict[str, str] | Callable[[str], str] | None,
         is_init_step: bool = False,
         is_safetensors: bool | None = None,
     ) -> StorageReader | None:
@@ -1984,7 +2240,7 @@ fi
 
         Args:
             model_path: Path to the model checkpoint directory or HF snapshot.
-            key_mapping: Optional key remapping for conversion.
+            key_mapping: Optional regex mapping or callable renaming checkpoint keys.
             is_init_step: If True, always produce a reader for base HF load.
             is_safetensors: Whether `model_path` holds a safetensors checkpoint; computed
                 from the directory contents when not supplied.
@@ -2208,8 +2464,8 @@ def _ensure_shared_dirs(*dirs: str | None, process_group: torch.distributed.Proc
 
 
 def _is_model_checkpoint_path(path: str) -> bool:
-    """Return whether a checkpoint path names the model directory."""
-    return Path(path.rstrip("/")).name == "model"
+    """Return whether a checkpoint path identifies model weights."""
+    return Path(path.rstrip("/")).name == "model" or os.path.isfile(_adapter_path(path))
 
 
 def _init_peft_adapters(model: nn.Module, peft_init_method: str) -> None:
@@ -2230,6 +2486,7 @@ def _init_peft_adapters(model: nn.Module, peft_init_method: str) -> None:
 
 _MODELS_REQUIRING_BUFFER_REINIT: frozenset[str] = frozenset(
     {
+        "bailing_moe",
         "gemma3",
         "nemotron-nas",
     }
@@ -2250,8 +2507,8 @@ def _reinit_non_persistent_buffers(model: nn.Module, device: torch.device, model
 
     Handles four patterns:
 
-    1. **Standard RoPE** — single ``inv_freq`` buffer with ``rope_init_fn`` +
-       ``rope_kwargs`` (e.g. Nemotron-NAS).
+    1. **Standard RoPE** — single ``inv_freq`` buffer with ``rope_init_fn`` and
+       optional legacy ``rope_kwargs`` (e.g. Nemotron-NAS, Ling).
     2. **Per-layer-type RoPE** — ``{layer_type}_inv_freq`` buffers via
        ``compute_default_rope_parameters`` (e.g. Gemma3RotaryEmbedding).
     3. **Scaled embedding** — ``embed_scale`` buffer on ``ScaledWordEmbedding``
@@ -2269,10 +2526,11 @@ def _reinit_non_persistent_buffers(model: nn.Module, device: torch.device, model
         return
 
     for name, module in model.named_modules():
-        # Pattern 1: standard RoPE with rope_init_fn + rope_kwargs (Nemotron-NAS)
-        if hasattr(module, "rope_init_fn") and hasattr(module, "inv_freq") and hasattr(module, "rope_kwargs"):
+        # Pattern 1: legacy standard RoPE. Ling's checkpoint code computes this
+        # buffer only in __init__, so HF meta loading leaves it uninitialized.
+        if hasattr(module, "rope_init_fn") and hasattr(module, "inv_freq"):
             try:
-                inv_freq, _ = module.rope_init_fn(module.config, device, **module.rope_kwargs)
+                inv_freq, _ = module.rope_init_fn(module.config, device, **getattr(module, "rope_kwargs", {}))
                 module.inv_freq = inv_freq
                 if hasattr(module, "original_inv_freq"):
                     module.original_inv_freq = inv_freq.clone()
@@ -2422,10 +2680,10 @@ def _apply(module, fn, recurse=True) -> nn.Module:
 
 def _apply_key_mapping(
     state_dict: dict[str, torch.Tensor],
-    key_mapping: dict[str, str],
+    key_mapping: dict[str, str] | Callable[[str], str],
 ) -> dict[str, torch.Tensor]:
     """
-    Rename state-dict keys using regex-based ``key_mapping``.
+    Rename state-dict keys using a regex mapping or a scoped rename callable.
 
     This mirrors the renaming logic used by the DCP / HuggingFace storage
     reader but operates directly on an in-memory state dict.  It is needed
@@ -2434,11 +2692,13 @@ def _apply_key_mapping(
     parameter FQNs (e.g. ``model.language_model.X``).
 
     Args:
-        state_dict: Original state dict whose keys may need renaming.
-        key_mapping: ``{regex_pattern: replacement}`` pairs applied in order.
+        state_dict: Original state dict mapping keys to tensors of arbitrary shape.
+            Tensor layout, dtype, device, and storage are preserved.
+        key_mapping: First-match ``{regex_pattern: replacement}`` pairs or a
+            callable applying the complete key conversion.
 
     Returns:
-        A new dict with renamed keys.
+        A new dict with renamed keys and the same tensor objects as the input.
     """
     from nemo_automodel.components.checkpoint._backports.hf_storage import (
         _get_key_renaming_mapping,
